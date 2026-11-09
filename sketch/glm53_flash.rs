@@ -1,8 +1,8 @@
 //! GLM-5.3-Flash: KDA linear attention beside full attention. Sketch.
 
 use crate::core::*;
+use crate::delta::{Delta, DeltaShape, delta};
 use crate::glm53::{AttnShape, Indexer, Mla, attention};
-use crate::kda::{Kda, KdaShape, kda};
 use crate::library::{Moe, moe};
 
 pub struct Config {
@@ -11,12 +11,13 @@ pub struct Config {
     pub full: LayerSet,
     pub top_k: usize,
     pub attn: AttnShape,
-    pub kda: KdaShape,
+    /// Kind is `Kda`.
+    pub kda: DeltaShape,
 }
 
 pub enum Mixer {
     Full(Mla, Indexer),
-    Kda(Kda),
+    Kda(Delta),
 }
 
 #[derive(Weights)]
@@ -42,7 +43,7 @@ pub fn forward(m: &mut Model, c: &Config, w: &Flash, tokens: &Tensor) -> Tensor 
         let l = Layer(i);
         let a = match &b.mixer {
             Mixer::Full(f, ix) => attention(m, &c.attn, f, Some(ix), l, &x),
-            Mixer::Kda(k) => kda(m, &c.kda, k, l, &x),
+            Mixer::Kda(k) => delta(m, &c.kda, k, l, &x),
         };
         x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a.reduce()));
         let f = moe(m, &b.moe, &x.rms_norm(&b.mlp_norm), c.top_k, l);

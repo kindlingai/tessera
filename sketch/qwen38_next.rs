@@ -1,6 +1,7 @@
 //! Qwen 3.8 Flash Next: Gated DeltaNet beside gated attention. Sketch.
 
 use crate::core::*;
+use crate::delta::{Delta, DeltaShape, delta};
 use crate::library::{Moe, moe};
 
 pub struct Config {
@@ -13,23 +14,8 @@ pub struct Config {
     pub head_dim: usize,
     /// RoPE covers only part of each head.
     pub rope_dims: usize,
-    pub conv: usize,
-}
-
-#[derive(Weights)]
-pub struct DeltaNet {
-    pub norm: Norm,
-    #[split(heads)]
-    pub qkv: Linear,
-    #[split(heads)]
-    pub conv: Linear,
-    #[split(heads)]
-    pub gates: Linear,
-    #[split(heads)]
-    pub out_gate: Linear,
-    pub out_norm: Norm,
-    #[split(rows)]
-    pub out: Linear,
+    /// Kind is `GatedDelta`, with a zero-centered norm.
+    pub delta: DeltaShape,
 }
 
 #[derive(Weights)]
@@ -49,7 +35,7 @@ pub struct GatedAttn {
 
 pub enum Mixer {
     Attn(GatedAttn),
-    Delta(DeltaNet),
+    Delta(Delta),
 }
 
 #[derive(Weights)]
@@ -75,7 +61,7 @@ pub fn forward(m: &mut Model, c: &Config, w: &Qwen, tokens: &Tensor) -> Tensor {
         let l = Layer(i);
         let a = match &b.mixer {
             Mixer::Attn(g) => gated_attention(m, c, g, l, &x),
-            Mixer::Delta(d) => deltanet(m, c, d, l, &x),
+            Mixer::Delta(d) => delta(m, &c.delta, d, l, &x),
         };
         x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a.reduce()));
         let f = moe(m, &b.moe, &x.rms_norm_zc(&b.mlp_norm), c.top_k, l);
@@ -98,21 +84,4 @@ fn gated_attention(m: &mut Model, c: &Config, w: &GatedAttn, l: Layer, x: &Tenso
     m.attend(kind, Mask::Causal, &q, &kv, &cache, None)
         .gate(Act::Sigmoid, &h.matmul(&w.gate))
         .matmul(&w.o)
-}
-
-fn deltanet(m: &mut Model, c: &Config, w: &DeltaNet, l: Layer, x: &Tensor) -> Tensor {
-    let h = x.rms_norm_zc(&w.norm);
-    let history = m.conv_history(l, c.conv);
-    let qkv = m.recur(
-        RecurRule::Conv { width: c.conv },
-        &h.matmul(&w.qkv),
-        &history,
-    );
-    let state = m.recur_state(l, RecurRule::GatedDelta, c.heads, c.head_dim, c.head_dim);
-    let o = m
-        .recur(RecurRule::GatedDelta, &qkv, &state)
-        .with_gates(&h.matmul(&w.gates));
-    o.rms_norm(&w.out_norm)
-        .gate(Act::Silu, &h.matmul(&w.out_gate))
-        .matmul(&w.out)
 }

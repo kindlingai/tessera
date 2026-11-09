@@ -2,7 +2,7 @@
 
 use crate::core::*;
 use crate::glm53::{self, Glm53};
-use crate::library::{fit_budget, greedy_accept, rejection_accept};
+use crate::library::{greedy_accept, rejection_accept};
 
 /// A drafter names the target sites it reads.
 pub trait Subscriber {
@@ -108,21 +108,19 @@ pub enum Drafter {
     Dspine,
 }
 
-/// Lengths, costs and limits: per-round inputs and tuning data.
-pub struct DraftPolicy {
+/// The graph's own limits; the host picks the drafter.
+pub struct DraftLimits {
     pub max_rounds: usize,
-    pub len: PerDrafter<usize>,
-    pub cost: PerDrafter<f32>,
-    pub min_dwell: usize,
-    pub row_budget: Rows,
+    pub max_len: PerDrafter<usize>,
     pub confidence_floor: f32,
 }
 
-/// Acceptance per drafter, current drafter and dwell, per sequence.
-pub struct SeqStats {
-    pub accept: Tensor,
-    pub drafter: Tensor,
-    pub dwell: Tensor,
+/// The host's side of the drafter choice.
+pub struct DraftPorts {
+    /// Mailbox: each sequence's drafter and draft length.
+    pub choice: Port,
+    /// Stream: acceptance per drafter, each round.
+    pub stats: Port,
 }
 
 pub struct Drafts {
@@ -140,8 +138,8 @@ pub fn decode(
     m: &mut Model,
     t: &Glm53,
     d: &Drafters,
-    p: &DraftPolicy,
-    s: &SeqStats,
+    lim: &DraftLimits,
+    ports: &DraftPorts,
     rule: Rule,
     left: Tensor,
     out: &Port,
@@ -149,11 +147,11 @@ pub fn decode(
     // Every round emits a token, so one left means last.
     let last = |left: &Tensor, _: &Iter| left.compare_scalar(Cmp::Lt, 2.0);
     let until = Until {
-        max: p.max_rounds,
+        max: lim.max_rounds,
         last: Box::new(last),
     };
     m.repeat(until, left, |m, left, it| {
-        let n = round(m, t, d, p, s, &rule, it, &left);
+        let n = round(m, t, d, lim, ports, &rule, it, &left);
         let tokens = m.accepted_tokens(&n);
         m.emit(out, &tokens);
         let left = left.sub(&n.add_one());
@@ -167,17 +165,15 @@ pub fn round(
     r: &mut Model,
     t: &Glm53,
     d: &Drafters,
-    p: &DraftPolicy,
-    s: &SeqStats,
+    lim: &DraftLimits,
+    ports: &DraftPorts,
     rule: &Rule,
     it: &Iter,
     left: &Tensor,
 ) -> Counts {
-    // A row's last round drafts nothing; one verify row suffices.
-    let drafting = it.live.minus(&r.filter(&it.last));
-    let plans = choose_drafter(r, s, p, &drafting, &left.sub_scalar(1.0));
-    let a = draft_mtp(r, &d.mtp.0, d.mtp.1, &plans.part(Drafter::Mtp), p);
-    let b = draft_dflash(r, &d.dflash.0, &d.dflash.1, &plans.part(Drafter::Dflash), p);
+    let plans = apply_choice(r, &r.read(&ports.choice), lim, it, left);
+    let a = draft_mtp(r, &d.mtp.0, d.mtp.1, &plans.part(Drafter::Mtp), lim);
+    let b = draft_dflash(r, &d.dflash.0, &d.dflash.1, &plans.part(Drafter::Dflash));
     let (w, taps, shape) = &d.dspine;
     let c = draft_dspine(r, w, taps, shape, &plans.part(Drafter::Dspine));
     let drafts = a.join(&b).join(&c);
@@ -189,36 +185,33 @@ pub fn round(
             rejection_accept(r, &logits.softmax(), &drafts.logprobs.exp(), &drafts.tokens)
         }
     };
-    r.update_stats(s, &plans, &n);
+    r.emit(&ports.stats, &r.acceptance(&plans, &n));
     r.commit_all(&n);
     // No later round drafts from a last row's taps.
     r.drop_taps(&it.last);
     n
 }
 
-/// Best expected gain per sequence, held for a minimum dwell.
-fn choose_drafter(
+/// The host's choice, clamped by what only the graph knows.
+fn apply_choice(
     r: &mut Model,
-    s: &SeqStats,
-    p: &DraftPolicy,
-    rows: &Plan,
-    max_len: &Tensor,
+    choice: &Tensor,
+    lim: &DraftLimits,
+    it: &Iter,
+    left: &Tensor,
 ) -> Plans<Drafter> {
-    let gains = s
-        .accept
-        .mul_cols(&p.len.as_tensor())
-        .sub_cols(&p.cost.as_tensor());
-    let want = r.sample(&gains, Sampler::Argmax);
-    let stay = s.dwell.compare_scalar(Cmp::Lt, p.min_dwell as f32);
-    let choice = stay.choose_tensor(&s.drafter, &want);
-    let wanted = choice.map_len(&p.len).min(max_len);
-    let lens = fit_budget(r, &wanted, p.row_budget);
-    r.partition_rows(&choice.only(rows), &lens)
+    // A last round drafts nothing; one verify row suffices.
+    let drafting = it.live.minus(&r.filter(&it.last));
+    let len = choice
+        .len()
+        .min(&left.sub_scalar(1.0))
+        .min_each(&lim.max_len);
+    r.partition_rows(&choice.drafter().only(&drafting), &len)
 }
 
 /// Chained drafts as a nested loop; KStop decides who continues.
-fn draft_mtp(r: &mut Model, w: &Mtp, ctx: ResourceId, rows: &Plan, p: &DraftPolicy) -> Drafts {
-    let len = p.len.get(Drafter::Mtp);
+fn draft_mtp(r: &mut Model, w: &Mtp, ctx: ResourceId, rows: &Plan, lim: &DraftLimits) -> Drafts {
+    let len = lim.max_len.get(Drafter::Mtp);
     let start = (r.context(ctx).last(), r.last_tokens(rows), Drafts::empty());
     // The last link's hidden state feeds nothing.
     let last = move |_: &_, it: &Iter| it.step.compare_scalar(Cmp::Gt, len as f32 - 2.0);
@@ -234,7 +227,7 @@ fn draft_mtp(r: &mut Model, w: &Mtp, ctx: ResourceId, rows: &Plan, p: &DraftPoli
         let tok = r.sample(&logits, Sampler::Argmax);
         out.push(&tok, &logits.log_softmax_at(&tok));
         let sure = logits.softmax().max_per_row();
-        let more = sure.compare_scalar(Cmp::Gt, p.confidence_floor);
+        let more = sure.compare_scalar(Cmp::Gt, lim.confidence_floor);
         Next {
             carry: (h, tok, out),
             more,
@@ -244,8 +237,8 @@ fn draft_mtp(r: &mut Model, w: &Mtp, ctx: ResourceId, rows: &Plan, p: &DraftPoli
 }
 
 /// One pass drafts a whole block from the fused taps.
-fn draft_dflash(r: &mut Model, w: &Dflash, t: &TapLayers, rows: &Plan, p: &DraftPolicy) -> Drafts {
-    let len = p.len.get(Drafter::Dflash);
+fn draft_dflash(r: &mut Model, w: &Dflash, t: &TapLayers, rows: &Plan) -> Drafts {
+    let len = rows.max_len();
     let ctx = r.context(t.context).fused(&w.fuse);
     let mut x = r.mask_block(rows, len);
     for b in &w.blocks {
@@ -291,4 +284,41 @@ fn sample_drafts(r: &mut Model, logits: &Tensor) -> Drafts {
         logprobs: logits.log_softmax_at(&tok),
         tokens: tok,
     }
+}
+
+// Host side: plain Rust, not a description.
+
+/// One sequence as the host's policy sees it.
+pub struct SeqView {
+    pub accept: PerDrafter<f32>,
+    pub drafter: Drafter,
+    pub dwell: usize,
+    /// Request facts only the host has, like a code hint.
+    pub hint: Option<Drafter>,
+}
+
+/// The host's costs and limits, from tuning data and load.
+pub struct HostPolicy {
+    pub len: PerDrafter<usize>,
+    pub cost: PerDrafter<f32>,
+    pub min_dwell: usize,
+    pub row_budget: usize,
+}
+
+/// Best expected gain, held for a dwell, within budget.
+pub fn choose(seqs: &mut [SeqView], p: &HostPolicy) -> Vec<(Drafter, usize)> {
+    let mut rows = 0;
+    let mut out = Vec::with_capacity(seqs.len());
+    for s in seqs.iter_mut() {
+        let best = s.hint.unwrap_or_else(|| p.best(&s.accept));
+        if s.dwell >= p.min_dwell && best != s.drafter {
+            s.drafter = best;
+            s.dwell = 0;
+        }
+        s.dwell += 1;
+        let len = p.len.get(s.drafter).min(p.row_budget.saturating_sub(rows));
+        rows += len;
+        out.push((s.drafter, len));
+    }
+    out
 }
