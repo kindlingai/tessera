@@ -11,6 +11,8 @@
 pub mod bf16;
 pub mod block;
 pub mod fp4;
+#[cfg(test)]
+mod fp4_test;
 pub mod layout;
 pub mod nvfp4;
 

@@ -5,7 +5,7 @@
 //! Skips (rather than fails) when no device or NVRTC is found, so the default
 //! macOS test run is unaffected. Run it on a CUDA host with:
 //!
-//!     cargo test -p gpukit --features cuda --test cuda_smoke -- --nocapture
+//!     cargo test -p gpukit --features cuda --test cuda_smoke_test -- --nocapture
 
 #![cfg(feature = "cuda")]
 

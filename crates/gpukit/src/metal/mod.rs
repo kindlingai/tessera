@@ -3,8 +3,12 @@
 mod buffer;
 mod cached;
 mod context;
+#[cfg(test)]
+mod context_test;
 mod dispatch;
 mod expand;
+#[cfg(test)]
+mod expand_test;
 mod pipeline_cache;
 
 pub use buffer::BufferPool;
