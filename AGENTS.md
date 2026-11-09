@@ -23,6 +23,9 @@ refuse them.
   callsites in the crate.
 - Inline tests may fill at most 1% of a file. Put tests in a file whose name ends in `test` (`foo_test.rs`), declared
   with `#[cfg(test)] mod foo_test;`.
+- `#[test]` functions may fill at most 25% of a module plus its tests. `foo_test.rs` pairs with `foo.rs`, or with
+  `foo/mod.rs` beside it. Other test files count against the rest of their crate. Fixtures, helpers and macros in a
+  test file do not count.
 
 Run `scripts/install-hooks.sh` once to check formatting, these rules and commit messages before each commit.
 

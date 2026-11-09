@@ -113,37 +113,37 @@ fn compare(a: &[f32], b: &[f32]) -> (f32, f64) {
     (max, dot / (na.sqrt() * nb.sqrt()))
 }
 
+/// Prints and checks one comparison against the parity tolerance.
+fn close(label: &str, got: &[f32], want: &[f32]) {
+    let (max, cos) = compare(got, want);
+    eprintln!("{label}: max_abs {max:.3e} cos {cos:.9}");
+    assert!(
+        max < 1e-5 && cos > 0.99999,
+        "{label}: max_abs {max:.3e} cos {cos}"
+    );
+}
+
 #[test]
 fn cpu_matches_reference() {
     for (batch, seq) in [(2, 64), (3, 17)] {
         let c = case(batch, seq);
         let want = reference::forward(&c.w, &c.cfg, &c.tokens, c.seq);
-        let (max, cos) = compare(&logits(&c, &mut Cpu), &want);
-        eprintln!("cpu {batch}x{seq}: max_abs {max:.3e} cos {cos:.9}");
-        assert!(max < 1e-5 && cos > 0.99999, "max_abs {max:.3e} cos {cos}");
+        close(&format!("cpu {batch}x{seq}"), &logits(&c, &mut Cpu), &want);
     }
 }
 
 #[test]
 fn gpu_matches_nanogpt() {
     if !gpu_ready() {
-        eprintln!("no GPU here; skipped");
-        return;
+        return eprintln!("no GPU here; skipped");
     }
-    let c = case(2, 64);
-    let mut k = Gpu::default();
+    let (c, mut k) = (case(2, 64), Gpu::default());
     let got = logits(&c, &mut k);
     assert_eq!(k.fallbacks, 0, "every op should have a GPU kernel");
     let ours = gpt::forward(&c.w, &c.cfg, &c.tokens, c.seq).unwrap().logits;
+    close("gpu vs nanogpt gpu", &got, &ours);
     let cpu = reference::forward(&c.w, &c.cfg, &c.tokens, c.seq);
-    for (name, want) in [("nanogpt gpu", &ours), ("cpu reference", &cpu)] {
-        let (max, cos) = compare(&got, want);
-        eprintln!("gpu vs {name}: max_abs {max:.3e} cos {cos:.9}");
-        assert!(
-            max < 1e-5 && cos > 0.99999,
-            "{name}: max_abs {max:.3e} cos {cos}"
-        );
-    }
+    close("gpu vs cpu reference", &got, &cpu);
 }
 
 #[test]
