@@ -8,8 +8,8 @@ description = "Model descriptions, traced into graphs"
 
 [features]
 default = []
-cuda = ["interp/cuda", "nanogpt/cuda"]
-rocm = ["interp/rocm", "nanogpt/rocm"]
+cuda = ["interp/cuda", "nanogpt/cuda", "lower/cuda"]
+rocm = ["interp/rocm", "nanogpt/rocm", "lower/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
