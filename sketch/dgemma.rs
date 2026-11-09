@@ -69,15 +69,21 @@ pub fn denoise(
         .reduce()
         .scale(c.embed_scale)
         .add(&soft);
-    for (l, b) in w.blocks.iter().enumerate() {
-        let mask = match l % c.global_every == c.global_every - 1 {
+    for (i, b) in w.blocks.iter().enumerate() {
+        let l = Layer(i);
+        let mask = match i % c.global_every == c.global_every - 1 {
             true => Mask::BlockCausal { block: c.block },
             false => Mask::Window { size: c.window },
         };
-        let a = attention(m, c, &b.attn, Layer(l), mask, &x.rms_norm(&b.pre_attn));
-        x = x.add(&a.reduce().rms_norm(&b.post_attn));
-        let f = mlp(&b.mlp, &x.rms_norm(&b.pre_mlp));
-        x = x.add(&f.reduce().rms_norm(&b.post_mlp));
+        let a = attention(m, c, &b.attn, l, mask, &x.rms_norm(&b.pre_attn));
+        // The writer is what joins the residual: after its post-norm.
+        let a = a.reduce().rms_norm(&b.post_attn);
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a));
+        let f = mlp(&b.mlp, &x.rms_norm(&b.pre_mlp))
+            .reduce()
+            .rms_norm(&b.post_mlp);
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Mlp), f));
+        x = m.site(Site::Residual(l), x);
     }
     let logits = x
         .rms_norm(&w.norm)

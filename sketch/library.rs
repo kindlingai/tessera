@@ -26,7 +26,7 @@ pub struct Moe<A> {
 }
 
 /// Router top-k, then grouped expert matmuls, then weighted combine.
-pub fn moe<A: Activation>(m: &mut Model, w: &Moe<A>, h: &Tensor, k: usize) -> Tensor {
+pub fn moe<A: Activation>(m: &mut Model, w: &Moe<A>, h: &Tensor, k: usize, l: Layer) -> Tensor {
     let logits = h.matmul(&w.router).f32();
     let picked = m.top_k(&logits.add(&w.router_bias), k);
     let parts = m.partition(&picked.ids, w.experts.len());
@@ -34,7 +34,7 @@ pub fn moe<A: Activation>(m: &mut Model, w: &Moe<A>, h: &Tensor, k: usize) -> Te
     let out = up.matmul_grouped(&w.experts.down, &parts);
     let routed = m.scatter(&out.mul(&picked.weights), &parts);
     match &w.shared {
-        Some(s) => routed.add(&mlp(s, h)),
+        Some(s) => routed.add(&m.site(Site::SharedExpert(l), mlp(s, h))),
         None => routed,
     }
 }

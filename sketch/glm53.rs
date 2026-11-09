@@ -61,32 +61,23 @@ pub struct Glm53 {
     pub head: Linear,
 }
 
-/// Exported for the drafters: last hidden state and chosen layers.
-pub struct Taps {
-    pub last: Tensor,
-    pub layers: Vec<Tensor>,
-}
-
-pub fn forward(m: &mut Model, c: &Config, w: &Glm53, tokens: &Tensor) -> (Tensor, Taps) {
+/// Sites stay identity until a drafter or profile hooks them.
+pub fn forward(m: &mut Model, c: &Config, w: &Glm53, tokens: &Tensor) -> Tensor {
     let mut x = m.embed(tokens, &w.embed).reduce();
-    let mut layers = Vec::new();
-    for (l, b) in w.blocks.iter().enumerate() {
-        let a = attention(m, &c.attn, &b.attn, b.indexer.as_ref(), Layer(l), &x);
-        x = x.add(&a.reduce());
+    for (i, b) in w.blocks.iter().enumerate() {
+        let l = Layer(i);
+        let a = attention(m, &c.attn, &b.attn, b.indexer.as_ref(), l, &x).reduce();
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a));
         let h = x.rms_norm(&b.mlp_norm);
         let f = match &b.ffn {
             Ffn::Dense(d) => mlp(d, &h),
-            Ffn::Moe(e) => moe(m, e, &h, c.top_k),
+            Ffn::Moe(e) => moe(m, e, &h, c.top_k, l),
         };
-        x = x.add(&f.reduce());
-        layers.push(m.tap(&x, Layer(l)));
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Mlp), f.reduce()));
+        x = m.site(Site::Residual(l), x);
     }
-    let h = x.rms_norm(&w.norm);
-    let taps = Taps {
-        last: h.clone(),
-        layers,
-    };
-    (h.matmul(&w.head), taps)
+    let h = m.site(Site::PreHead, x.rms_norm(&w.norm));
+    m.site(Site::Logits, h.matmul(&w.head))
 }
 
 /// MLA, sparse when an indexer is given. GLM-5.3-Flash reuses it.

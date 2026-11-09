@@ -83,22 +83,34 @@ pub fn forward(
         x = m.scatter_rows(&x, &i.rows, &i.at);
     }
     let mut s = x.expand_streams(c.streams);
-    for (l, b) in w.blocks.iter().enumerate() {
+    for (i, b) in w.blocks.iter().enumerate() {
+        let l = Layer(i);
         if let Some(e) = &b.engram {
             s = s.add(&engram(m, c, e, tokens, &s));
         }
-        s = mhc(&b.attn_mhc, &s, |h| attention(m, c, b, Layer(l), h));
-        s = mhc(&b.mlp_mhc, &s, |h| {
-            moe(m, &b.moe, &h.rms_norm(&b.mlp_norm), c.top_k)
+        let attn = Site::Writer(l, Sublayer::Attn);
+        s = mhc(m, &b.attn_mhc, attn, &s, |m, h| attention(m, c, b, l, h));
+        let mlp = Site::Writer(l, Sublayer::Mlp);
+        s = mhc(m, &b.mlp_mhc, mlp, &s, |m, h| {
+            moe(m, &b.moe, &h.rms_norm(&b.mlp_norm), c.top_k, l)
         });
+        // The residual here is all streams, not one row.
+        s = m.site(Site::Residual(l), s);
     }
-    s.merge_streams().rms_norm(&w.norm).matmul(&w.head)
+    let h = m.site(Site::PreHead, s.merge_streams().rms_norm(&w.norm));
+    h.matmul(&w.head)
 }
 
 /// Read one input from the streams, run `f`, mix back.
-fn mhc(w: &Mhc, s: &Tensor, f: impl FnOnce(&Tensor) -> Tensor) -> Tensor {
+fn mhc(
+    m: &mut Model,
+    w: &Mhc,
+    site: Site,
+    s: &Tensor,
+    f: impl FnOnce(&mut Model, &Tensor) -> Tensor,
+) -> Tensor {
     let h = s.mix_streams(&w.pre);
-    let out = f(&h).reduce();
+    let out = m.site(site, f(m, &h).reduce());
     s.mix_streams(&w.res).add(&out.spread_streams(&w.post))
 }
 

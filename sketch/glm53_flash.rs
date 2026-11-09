@@ -56,16 +56,19 @@ pub struct Flash {
 
 pub fn forward(m: &mut Model, c: &Config, w: &Flash, tokens: &Tensor) -> Tensor {
     let mut x = m.embed(tokens, &w.embed).reduce();
-    for (l, b) in w.blocks.iter().enumerate() {
+    for (i, b) in w.blocks.iter().enumerate() {
+        let l = Layer(i);
         let a = match &b.mixer {
-            Mixer::Full(f, i) => attention(m, &c.attn, f, Some(i), Layer(l), &x),
-            Mixer::Kda(k) => kda(m, c, k, Layer(l), &x),
+            Mixer::Full(f, ix) => attention(m, &c.attn, f, Some(ix), l, &x),
+            Mixer::Kda(k) => kda(m, c, k, l, &x),
         };
-        x = x.add(&a.reduce());
-        let f = moe(m, &b.moe, &x.rms_norm(&b.mlp_norm), c.top_k);
-        x = x.add(&f.reduce());
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a.reduce()));
+        let f = moe(m, &b.moe, &x.rms_norm(&b.mlp_norm), c.top_k, l);
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Mlp), f.reduce()));
+        x = m.site(Site::Residual(l), x);
     }
-    x.rms_norm(&w.norm).matmul(&w.head)
+    let h = m.site(Site::PreHead, x.rms_norm(&w.norm));
+    h.matmul(&w.head)
 }
 
 /// Short conv, then the delta-rule recurrence over per-head state.

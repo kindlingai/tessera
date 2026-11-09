@@ -71,16 +71,19 @@ pub struct Qwen {
 
 pub fn forward(m: &mut Model, c: &Config, w: &Qwen, tokens: &Tensor) -> Tensor {
     let mut x = m.embed(tokens, &w.embed).reduce();
-    for (l, b) in w.blocks.iter().enumerate() {
+    for (i, b) in w.blocks.iter().enumerate() {
+        let l = Layer(i);
         let a = match &b.mixer {
-            Mixer::Attn(g) => gated_attention(m, c, g, Layer(l), &x),
-            Mixer::Delta(d) => deltanet(m, c, d, Layer(l), &x),
+            Mixer::Attn(g) => gated_attention(m, c, g, l, &x),
+            Mixer::Delta(d) => deltanet(m, c, d, l, &x),
         };
-        x = x.add(&a.reduce());
-        let f = moe(m, &b.moe, &x.rms_norm_zc(&b.mlp_norm), c.top_k);
-        x = x.add(&f.reduce());
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a.reduce()));
+        let f = moe(m, &b.moe, &x.rms_norm_zc(&b.mlp_norm), c.top_k, l);
+        x = x.add(&m.site(Site::Writer(l, Sublayer::Mlp), f.reduce()));
+        x = m.site(Site::Residual(l), x);
     }
-    x.rms_norm_zc(&w.norm).matmul(&w.head)
+    let h = m.site(Site::PreHead, x.rms_norm_zc(&w.norm));
+    h.matmul(&w.head)
 }
 
 /// GQA with partial RoPE and a sigmoid output gate.
