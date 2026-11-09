@@ -38,6 +38,7 @@ fn inputs(tys: Vec<TensorType>) -> (Graph, Vec<NodeId>) {
                 op: Op::Input { entry: 0, port },
                 args: vec![],
                 ty,
+                numerics: None,
             });
             NodeId(port)
         })
@@ -127,7 +128,8 @@ fn weights_and_fields_checked() {
     g.weights[1].ty.shape = Shape::from([Rows]);
     assert_eq!(verify(&g).unwrap_err().error.kind, ErrorKind::Shape);
     let text = crate::verify_test::mlp().to_json();
-    let extra = text.replacen("\"version\": 1,", "\"version\": 1, \"extra\": 0,", 1);
+    let v = format!("\"version\": {VERSION},");
+    let extra = text.replacen(&v, &format!("{v} \"extra\": 0,"), 1);
     assert!(matches!(
         Graph::from_json(&extra),
         Err(FormatError::Json(_))

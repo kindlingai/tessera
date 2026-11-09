@@ -3,8 +3,8 @@
 use crate::tensor::Tensor;
 use crate::weights::Embed;
 use graph::{
-    Attend, Dim, DimName, Entry, EntryKind, Graph, Node, NodeId, Op, Output, PathSeg, Port, Role,
-    Select, Size, TensorType, Weight, infer, verify,
+    Attend, Composite, Dim, DimName, Entry, EntryKind, Graph, Node, NodeId, Numerics, Op, Output,
+    PathSeg, Port, Region, Role, Select, Size, TensorType, Weight, infer, verify,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -72,6 +72,32 @@ impl Model {
         push(&self.g, Op::Attend(a), &[q, k, v])
     }
 
+    /// Marks the nodes `body` traces as one composite region.
+    pub fn composite<const N: usize>(
+        &self,
+        kind: Composite,
+        body: impl FnOnce() -> [Tensor; N],
+    ) -> [Tensor; N] {
+        let start = NodeId(self.g.borrow().nodes.len() as u32);
+        let outs = body();
+        let mut g = self.g.borrow_mut();
+        let end = NodeId(g.nodes.len() as u32);
+        assert!(start < end, "{kind:?} traced no nodes");
+        let outputs = outs.iter().map(|t| t.id).collect::<Vec<_>>();
+        let within = outputs.iter().all(|&o| start <= o && o < end);
+        assert!(within, "{kind:?} must return values it computed");
+        let inputs = g.reads(start, end);
+        g.regions.push(Region {
+            kind,
+            start,
+            end,
+            inputs,
+            outputs,
+        });
+        drop(g);
+        outs
+    }
+
     /// Sets the last entry's outputs and returns the verified graph.
     pub fn finish<const N: usize>(&self, outputs: [(Role, &Tensor); N]) -> Graph {
         let mut shared = self.g.borrow_mut();
@@ -87,7 +113,7 @@ impl Model {
     }
 }
 
-/// Appends a node; a typing error is a description bug.
+/// Appends a node with the strongest numerics. Typing errors panic.
 pub(crate) fn push(g: &Shared, op: Op, args: &[&Tensor]) -> Tensor {
     let tys: Vec<&TensorType> = args.iter().map(|t| &t.ty).collect();
     let ty = match infer(&g.borrow(), &op, &tys) {
@@ -97,6 +123,7 @@ pub(crate) fn push(g: &Shared, op: Op, args: &[&Tensor]) -> Tensor {
     let id = {
         let mut graph = g.borrow_mut();
         graph.nodes.push(Node {
+            numerics: op.reduces().then(Numerics::default),
             op,
             args: args.iter().map(|t| t.id).collect(),
             ty: ty.clone(),

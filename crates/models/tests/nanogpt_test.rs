@@ -154,3 +154,14 @@ fn trace_is_deterministic() {
     assert_eq!(g.hash(), program(&config(&cfg)).hash());
     assert_eq!(g.weights.len(), 4 + 8 * cfg.n_layer);
 }
+
+#[test]
+fn layers_mark_composites() {
+    use trace::Composite::{Attention, Mlp};
+    let g = graph(&case(1, 8).cfg);
+    let kinds: Vec<_> = g.regions.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds, [Attention, Mlp, Attention, Mlp]);
+    let mlp = &g.regions[1];
+    let ops = &g.nodes[mlp.start.0 as usize..mlp.end.0 as usize];
+    assert_eq!(ops.iter().filter(|n| n.numerics.is_some()).count(), 2);
+}

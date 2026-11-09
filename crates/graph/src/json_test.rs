@@ -27,7 +27,7 @@ fn round_trip() {
 fn version_checked() {
     let text = mlp()
         .to_json()
-        .replacen("\"version\": 1", "\"version\": 99", 1);
+        .replacen(&format!("\"version\": {VERSION}"), "\"version\": 99", 1);
     let err = Graph::from_json(&text).unwrap_err();
     assert!(matches!(err, FormatError::Version { found: 99 }), "{err}");
 }

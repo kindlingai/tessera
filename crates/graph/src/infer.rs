@@ -14,6 +14,8 @@ pub enum ErrorKind {
     Shape,
     DType,
     Placement,
+    Numerics,
+    Region,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 use crate::cpu::Cpu;
 use crate::run::Kernels;
 use crate::tensor::{Error, Tensor};
-use graph::{Act, Attend, Mask, Stage};
+use graph::{Act, Attend, DType, Mask, Numerics, Stage};
 use ops_math::{gelu, rms_norm, softmax, vec_add, vec_scale};
 use ops_model::{gather_rows, gqa_attention};
 
@@ -22,8 +22,17 @@ fn gpu_err(e: ops::Error) -> Error {
     Error::Gpu(e.to_string())
 }
 
+/// The ops kernels accumulate in f32.
+fn f32_sums(n: &Numerics) -> bool {
+    n.accumulate == DType::F32
+}
+
 impl Kernels for Gpu {
-    fn matmul(&mut self, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+    fn matmul(&mut self, n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+        if !f32_sums(n) {
+            self.fallbacks += 1;
+            return Cpu.matmul(n, x, w);
+        }
         let (m, k) = x.rows();
         let n = w.shape[0];
         let problem = gemm::Problem {
@@ -49,13 +58,14 @@ impl Kernels for Gpu {
         Ok(Tensor::f32(shape, gemm::gpu(&call).map_err(gpu_err)?))
     }
 
-    fn attend(&mut self, a: &Attend, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, Error> {
+    fn attend(&mut self, n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error> {
+        let [q, k, v] = qkv;
         let [seqs, ctx, heads, d] = q.shape[..] else {
             return Err(Error::Mismatch("attention wants rank 4".into()));
         };
-        if a.mask != Mask::Causal {
+        if a.mask != Mask::Causal || !f32_sums(n) {
             self.fallbacks += 1;
-            return Cpu.attend(a, q, k, v);
+            return Cpu.attend(n, a, qkv);
         }
         let (keys, kv_heads) = (k.shape[1], k.shape[2]);
         let past = crate::cpu::past_keys(a, ctx, keys)?;
@@ -90,7 +100,17 @@ impl Kernels for Gpu {
         Ok(Tensor::f32(q.shape.clone(), out))
     }
 
-    fn stage(&mut self, s: &Stage, x: &Tensor, operand: Option<&Tensor>) -> Result<Tensor, Error> {
+    fn stage(
+        &mut self,
+        n: &Numerics,
+        s: &Stage,
+        x: &Tensor,
+        operand: Option<&Tensor>,
+    ) -> Result<Tensor, Error> {
+        if !f32_sums(n) {
+            self.fallbacks += 1;
+            return Cpu.stage(n, s, x, operand);
+        }
         let xs = x.floats()?.to_vec();
         let (rows, width) = x.rows();
         let out = match (s, operand) {
@@ -120,7 +140,7 @@ impl Kernels for Gpu {
             (Stage::AllReduce, _) => Ok(xs),
             _ => {
                 self.fallbacks += 1;
-                return Cpu.stage(s, x, operand);
+                return Cpu.stage(n, s, x, operand);
             }
         };
         Ok(Tensor::f32(x.shape.clone(), out.map_err(gpu_err)?))

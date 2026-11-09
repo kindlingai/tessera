@@ -2,15 +2,23 @@
 
 use crate::tensor::{Data, Error, Tensor};
 use graph::{
-    Attend, DimExpr, DimName, Graph, NodeId, Op, PathSeg, Select, Shape, Size, Stage, View,
+    Attend, DimExpr, DimName, Graph, NodeId, Numerics, Op, PathSeg, Select, Shape, Size, Stage,
+    View,
 };
 use std::collections::BTreeMap;
 
 /// One per backend; views and casts stay on the host.
 pub trait Kernels {
-    fn matmul(&mut self, x: &Tensor, w: &Tensor) -> Result<Tensor, Error>;
-    fn attend(&mut self, a: &Attend, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, Error>;
-    fn stage(&mut self, s: &Stage, x: &Tensor, operand: Option<&Tensor>) -> Result<Tensor, Error>;
+    // `n` is the node's numerics, or the default without one.
+    fn matmul(&mut self, n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error>;
+    fn attend(&mut self, n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error>;
+    fn stage(
+        &mut self,
+        n: &Numerics,
+        s: &Stage,
+        x: &Tensor,
+        operand: Option<&Tensor>,
+    ) -> Result<Tensor, Error>;
     fn gather(&mut self, table: &Tensor, ids: &Tensor) -> Result<Tensor, Error>;
 }
 
@@ -126,7 +134,8 @@ pub fn run(
         }
         let value = |a: &NodeId| values[a.0 as usize].as_ref().expect("args come first");
         let args: Vec<&Tensor> = n.args.iter().map(value).collect();
-        let out = ctx.eval(k, &n.op, &args)?;
+        let num = n.numerics.unwrap_or_default();
+        let out = ctx.eval(k, &num, &n.op, &args)?;
         let want = sizes.shape(&n.ty.shape)?;
         if out.shape != want || out.data.dtype() != n.ty.dtype {
             let msg = format!(
@@ -171,21 +180,27 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn eval(&self, k: &mut dyn Kernels, op: &Op, args: &[&Tensor]) -> Result<Tensor, Error> {
+    fn eval(
+        &self,
+        k: &mut dyn Kernels,
+        num: &Numerics,
+        op: &Op,
+        args: &[&Tensor],
+    ) -> Result<Tensor, Error> {
         match op {
             Op::Input { entry, port } if *entry as usize == self.entry => {
                 Ok(self.inputs[*port as usize].clone())
             }
             Op::Input { .. } => Err(Error::Unsupported("another entry's input".into())),
             Op::Weight(i) => Ok(self.weights[*i as usize].clone()),
-            Op::Matmul => k.matmul(args[0], args[1]),
-            Op::Attend(a) => k.attend(a, args[0], args[1], args[2]),
+            Op::Matmul => k.matmul(num, args[0], args[1]),
+            Op::Attend(a) => k.attend(num, a, [args[0], args[1], args[2]]),
             Op::Row(row) => {
                 let mut x = args[0].clone();
                 let mut rest = args[1..].iter();
                 for s in &row.0 {
                     let operand = (s.operands() == 1).then(|| *rest.next().expect("verified"));
-                    x = k.stage(s, &x, operand)?;
+                    x = k.stage(num, s, &x, operand)?;
                 }
                 Ok(x)
             }

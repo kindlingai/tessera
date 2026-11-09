@@ -55,14 +55,7 @@ fn field(name: &str) -> PathSeg {
 fn weights_follow_fields() {
     let m = model();
     let net: Net = trace::declare(&m);
-    let [ids] = m.entry(
-        EntryKind::Forward,
-        [Port {
-            role: Role::Tokens,
-            ty: TensorType::new([Rows], DType::U32),
-        }],
-    );
-    let mut x = m.embed(&ids, &net.embed);
+    let mut x = m.embed(&traced_ids(&m), &net.embed);
     for b in &net.blocks {
         x = x.rms_norm(&b.norm, 1e-5).matmul(&b.qkv).slice(1, 0, Hidden);
     }
@@ -80,6 +73,13 @@ fn weights_follow_fields() {
 fn type_errors_panic() {
     let m = model();
     let net: Net = trace::declare(&m);
+    let x = m
+        .embed(&traced_ids(&m), &net.embed)
+        .matmul(&net.blocks[0].qkv);
+    x.matmul(&net.blocks[1].qkv);
+}
+
+fn traced_ids(m: &Model) -> Tensor {
     let [ids] = m.entry(
         EntryKind::Forward,
         [Port {
@@ -87,6 +87,46 @@ fn type_errors_panic() {
             ty: TensorType::new([Rows], DType::U32),
         }],
     );
-    let x = m.embed(&ids, &net.embed).matmul(&net.blocks[0].qkv);
-    x.matmul(&net.blocks[1].qkv);
+    ids
+}
+
+#[test]
+fn composites_record_regions() {
+    let m = model();
+    let net: Net = trace::declare(&m);
+    let x = m.embed(&traced_ids(&m), &net.embed);
+    let b = &net.blocks[0];
+    let [y] = m.composite(Composite::Mlp, || {
+        let h = x.rms_norm(&b.norm, 1e-5);
+        let [inner] = m.composite(Composite::Attention, || [h.matmul(&b.qkv)]);
+        [inner.slice(1, 0, Hidden)]
+    });
+    let g = m.finish([(Role::Logits, &y)]);
+    let [inner, outer] = &g.regions[..] else {
+        panic!("two regions, inner first");
+    };
+    assert_eq!(
+        (outer.kind, inner.kind),
+        (Composite::Mlp, Composite::Attention)
+    );
+    assert_eq!(outer.outputs, [y.id]);
+    assert_eq!(outer.inputs, g.reads(outer.start, outer.end));
+    assert!(outer.start < inner.start && inner.end < outer.end);
+    let matmul = g.node(inner.outputs[0]);
+    assert_eq!(matmul.numerics, Some(graph::Numerics::default()));
+    assert_eq!(
+        g.node(outer.start).numerics,
+        Some(graph::Numerics::default())
+    );
+}
+
+#[test]
+#[should_panic(expected = "must return values it computed")]
+fn composites_own_outputs() {
+    let m = model();
+    let net: Net = trace::declare(&m);
+    let x = m.embed(&traced_ids(&m), &net.embed);
+    m.composite(Composite::Mlp, || {
+        [x.rms_norm(&net.blocks[0].norm, 1e-5), x.clone()]
+    });
 }
