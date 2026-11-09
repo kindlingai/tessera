@@ -1,168 +1,134 @@
 //! Thin wrappers over the GPU ops and their CPU oracles.
 
-use gemm::{Call, Problem, gpu as gemm_gpu};
+use gemm::{Call, Problem};
 use ops::Error;
+
+/// The GPU kernels, or their CPU oracles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Gpu,
+    Cpu,
+}
+
+impl Target {
+    fn run<F>(
+        self,
+        fix: &F,
+        gpu: fn(&F) -> Result<Vec<f32>, Error>,
+        cpu: fn(&F) -> Vec<f32>,
+    ) -> Result<Vec<f32>, Error> {
+        match self {
+            Target::Gpu => gpu(fix),
+            Target::Cpu => Ok(cpu(fix)),
+        }
+    }
+}
 
 /// C = alpha * op(A) @ op(B) + beta * C, with explicit leading dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm(
+    t: Target,
     a: &[f32],
     b: &[f32],
     c: Vec<f32>,
-    m: usize,
-    n: usize,
-    k: usize,
-    lda: usize,
-    ldb: usize,
-    ldc: usize,
-    trans_a: bool,
-    trans_b: bool,
+    (m, n, k): (usize, usize, usize),
+    (lda, ldb, ldc): (usize, usize, usize),
+    (trans_a, trans_b): (bool, bool),
     beta: f32,
 ) -> Result<Vec<f32>, Error> {
+    let problem = Problem {
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        alpha: 1.0,
+        beta,
+        trans_a,
+        trans_b,
+    };
     let call = Call {
         a: a.to_vec(),
         b: b.to_vec(),
         c,
-        problem: Problem {
-            m,
-            n,
-            k,
-            lda,
-            ldb,
-            ldc,
-            alpha: 1.0,
-            beta,
-            trans_a,
-            trans_b,
-        },
+        problem,
     };
-    gemm_gpu(&call)
+    t.run(&call, gemm::gpu, gemm::cpu)
 }
 
 /// Y = X @ W^T, with W in PyTorch linear layout (n,k).
-pub fn linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, Error> {
-    gemm(x, w, vec![0.0; m * n], m, n, k, k, k, n, false, true, 0.0)
+pub fn linear(
+    t: Target,
+    x: &[f32],
+    w: &[f32],
+    (m, n, k): (usize, usize, usize),
+) -> Result<Vec<f32>, Error> {
+    gemm(
+        t,
+        x,
+        w,
+        vec![0.0; m * n],
+        (m, n, k),
+        (k, k, n),
+        (false, true),
+        0.0,
+    )
 }
 
 pub fn rms_norm(
+    t: Target,
     x: &[f32],
     weight: &[f32],
     rows: usize,
-    hidden: usize,
     eps: f32,
 ) -> Result<Vec<f32>, Error> {
-    ops_math::rms_norm::gpu(&ops_math::rms_norm::Fixture {
+    use ops_math::rms_norm::{Fixture, cpu, gpu};
+    let fix = Fixture {
         x: x.to_vec(),
         weight: weight.to_vec(),
         rows,
-        hidden,
+        hidden: weight.len(),
         eps,
-    })
-}
-
-pub fn gelu(x: &[f32]) -> Result<Vec<f32>, Error> {
-    ops_math::gelu::gpu(&ops_math::gelu::Fixture { x: x.to_vec() })
-}
-
-pub fn vec_add(x: &[f32], addend: &[f32]) -> Result<Vec<f32>, Error> {
-    ops_math::vec_add::gpu(&ops_math::vec_add::Fixture {
-        x: x.to_vec(),
-        addend: addend.to_vec(),
-    })
-}
-
-pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, Error> {
-    ops_math::softmax::gpu(&ops_math::softmax::Fixture {
-        logits: x.to_vec(),
-        rows,
-        cols,
-    })
-}
-
-pub fn gather_rows(src: &[f32], indices: &[u32], hidden: usize) -> Result<Vec<f32>, Error> {
-    ops_model::gather_rows::gpu(&ops_model::gather_rows::Fixture {
-        src: src.to_vec(),
-        indices: indices.to_vec(),
-        hidden,
-    })
-}
-
-// CPU oracle versions, for the reference forward pass.
-
-/// C = alpha * op(A) @ op(B) + beta * C on the CPU oracle.
-#[allow(clippy::too_many_arguments)]
-pub fn gemm_cpu(
-    a: &[f32],
-    b: &[f32],
-    c: Vec<f32>,
-    m: usize,
-    n: usize,
-    k: usize,
-    lda: usize,
-    ldb: usize,
-    ldc: usize,
-    trans_a: bool,
-    trans_b: bool,
-    beta: f32,
-) -> Vec<f32> {
-    let call = Call {
-        a: a.to_vec(),
-        b: b.to_vec(),
-        c,
-        problem: Problem {
-            m,
-            n,
-            k,
-            lda,
-            ldb,
-            ldc,
-            alpha: 1.0,
-            beta,
-            trans_a,
-            trans_b,
-        },
     };
-    gemm::cpu(&call)
+    t.run(&fix, gpu, cpu)
 }
 
-/// Y = X @ W^T on the CPU oracle.
-pub fn linear_cpu(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-    gemm_cpu(x, w, vec![0.0; m * n], m, n, k, k, k, n, false, true, 0.0)
+pub fn gelu(t: Target, x: &[f32]) -> Result<Vec<f32>, Error> {
+    use ops_math::gelu::{Fixture, cpu, gpu};
+    t.run(&Fixture { x: x.to_vec() }, gpu, cpu)
 }
 
-pub fn rms_norm_cpu(x: &[f32], weight: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
-    ops_math::rms_norm::cpu(&ops_math::rms_norm::Fixture {
-        x: x.to_vec(),
-        weight: weight.to_vec(),
-        rows,
-        hidden,
-        eps,
-    })
-}
-
-pub fn gelu_cpu(x: &[f32]) -> Vec<f32> {
-    ops_math::gelu::cpu(&ops_math::gelu::Fixture { x: x.to_vec() })
-}
-
-pub fn vec_add_cpu(x: &[f32], addend: &[f32]) -> Vec<f32> {
-    ops_math::vec_add::cpu(&ops_math::vec_add::Fixture {
+pub fn vec_add(t: Target, x: &[f32], addend: &[f32]) -> Result<Vec<f32>, Error> {
+    use ops_math::vec_add::{Fixture, cpu, gpu};
+    let fix = Fixture {
         x: x.to_vec(),
         addend: addend.to_vec(),
-    })
+    };
+    t.run(&fix, gpu, cpu)
 }
 
-pub fn softmax_cpu(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    ops_math::softmax::cpu(&ops_math::softmax::Fixture {
+pub fn softmax(t: Target, x: &[f32], cols: usize) -> Result<Vec<f32>, Error> {
+    use ops_math::softmax::{Fixture, cpu, gpu};
+    let fix = Fixture {
         logits: x.to_vec(),
-        rows,
+        rows: x.len() / cols,
         cols,
-    })
+    };
+    t.run(&fix, gpu, cpu)
 }
 
-pub fn gather_rows_cpu(src: &[f32], indices: &[u32], hidden: usize) -> Vec<f32> {
-    ops_model::gather_rows::cpu(&ops_model::gather_rows::Fixture {
+pub fn gather_rows(
+    t: Target,
+    src: &[f32],
+    indices: &[u32],
+    hidden: usize,
+) -> Result<Vec<f32>, Error> {
+    use ops_model::gather_rows::{Fixture, cpu, gpu};
+    let fix = Fixture {
         src: src.to_vec(),
         indices: indices.to_vec(),
         hidden,
-    })
+    };
+    t.run(&fix, gpu, cpu)
 }
