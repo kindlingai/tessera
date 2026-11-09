@@ -3,8 +3,8 @@
 
 use super::fp4::{e2m1_to_f32, e4m3_to_f32};
 use super::layout::{
-    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_bytes, nvfp4_matrix_bytes, nvfp4_row_bytes,
-    nvfp4_scale_bytes,
+    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_row_bytes, nvfp4_matrix_bytes,
+    nvfp4_row_bytes, nvfp4_scales_row_bytes,
 };
 use crate::Error;
 
@@ -14,8 +14,8 @@ fn read_f32_le(src: &[u8]) -> f32 {
 
 pub fn dequant_row_nvfp4(src: &[u8], in_dim: usize, dst: &mut [f32], global_scale: f32) {
     assert_eq!(dst.len(), in_dim);
-    let data_len = nvfp4_data_bytes(in_dim);
-    let scales_len = nvfp4_scale_bytes(in_dim);
+    let data_len = nvfp4_data_row_bytes(in_dim);
+    let scales_len = nvfp4_scales_row_bytes(in_dim);
     assert!(src.len() >= data_len + scales_len);
     let data = &src[..data_len];
     let scales = &src[data_len..data_len + scales_len];
@@ -79,7 +79,7 @@ pub fn nvfp4_weight_at(
 ) -> f32 {
     let row_bytes = nvfp4_row_bytes(in_dim);
     let row_off = row * row_bytes;
-    let data_len = nvfp4_data_bytes(in_dim);
+    let data_len = nvfp4_data_row_bytes(in_dim);
     let byte = src[row_off + col / 2];
     let q = if col.is_multiple_of(2) {
         byte & 0x0f
