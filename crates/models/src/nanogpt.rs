@@ -1,9 +1,9 @@
 //! The tiny GPT from `crates/nanogpt`, as a description.
 
+use crate::shared::{bounded, fixed, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Attend, Composite, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Port,
-    Role, Shape, Size, Tensor, TensorType, Weights,
+    Act, Composite, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Shape, Tensor, Weights,
 };
 
 pub struct Config {
@@ -20,14 +20,6 @@ pub struct Config {
 
 impl Config {
     pub fn dims(&self) -> Vec<Dim> {
-        let fixed = |name, n| Dim {
-            name,
-            size: Size::Fixed(n),
-        };
-        let bounded = |name, n| Dim {
-            name,
-            size: Size::Bounded(n),
-        };
         vec![
             bounded(Seqs, self.max_seqs),
             bounded(Context, self.block),
@@ -98,13 +90,9 @@ fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
     let heads = Shape::from([Seqs, Context, Heads, HeadDim]);
     let project = |w: &Linear| h.matmul(w).reshape(heads.clone());
     let scale = 1.0 / ((c.hidden / c.heads) as f32).sqrt();
-    let mask = Mask::Causal;
-    let out = m.attend(
-        Attend { mask, scale },
-        &project(&l.wq),
-        &project(&l.wk),
-        &project(&l.wv),
-    );
+    let qkv = [&l.wq, &l.wk, &l.wv].map(project);
+    let [q, k, v] = &qkv;
+    let out = m.attend(Mask::Causal, scale, [q, k, v], None);
     out.reshape([Seqs, Context, Hidden]).matmul(&l.wproj)
 }
 
@@ -112,20 +100,7 @@ fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w: Gpt = trace::declare(&m);
-    let ids = TensorType::new([Seqs, Context], DType::U32);
-    let [tokens, positions] = m.entry(
-        EntryKind::Forward,
-        [
-            Port {
-                role: Role::Tokens,
-                ty: ids.clone(),
-            },
-            Port {
-                role: Role::Positions,
-                ty: ids,
-            },
-        ],
-    );
+    let [tokens, positions] = tokens(&m);
     let logits = forward(&m, c, &w, &tokens, &positions);
     m.finish([(Role::Logits, &logits)])
 }

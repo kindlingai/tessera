@@ -20,8 +20,14 @@ pub struct Linear(pub(crate) Tensor);
 /// `#[shape(Width)]`.
 pub struct Norm(pub(crate) Tensor);
 
+/// `#[shape(Width)]`: added to rows.
+pub struct Vector(pub(crate) Tensor);
+
 /// `#[shape(Rows, Width)]`: a table read by index.
 pub struct Embed(pub(crate) Tensor);
+
+/// `#[shape(Count, In, Out)]`, stored `[Count, Out, In]`.
+pub struct Linears(pub(crate) Tensor);
 
 fn leaf(m: &Model, path: &[PathSeg], shape: Vec<DimExpr>, want: usize) -> Tensor {
     assert_eq!(
@@ -42,6 +48,21 @@ impl Weights for Linear {
 impl Weights for Norm {
     fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
         Norm(leaf(m, path, shape.to_vec(), 1))
+    }
+}
+
+impl Weights for Vector {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        Vector(leaf(m, path, shape.to_vec(), 1))
+    }
+}
+
+impl Weights for Linears {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        let mut stored = shape.to_vec();
+        stored.reverse();
+        stored.rotate_right(1);
+        Linears(leaf(m, path, stored, 3))
     }
 }
 

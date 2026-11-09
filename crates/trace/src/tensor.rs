@@ -1,8 +1,8 @@
 //! Traced tensors: each method appends one node.
 
 use crate::model::{Shared, push};
-use crate::weights::{Linear, Norm};
-use graph::{Act, DType, DimExpr, NodeId, Op, Row, Shape, Stage, TensorType, View};
+use crate::weights::{Linear, Norm, Vector};
+use graph::{Act, DType, DimExpr, Mask, NodeId, Op, Row, Select, Shape, Stage, TensorType, View};
 
 #[derive(Clone)]
 pub struct Tensor {
@@ -30,6 +30,15 @@ impl Tensor {
         self.op(Op::Matmul, &[&w.0])
     }
 
+    /// Each row times `w[.., N, K]`, whose batch axes match.
+    pub fn matmul_rows(&self, w: &Tensor) -> Tensor {
+        self.op(Op::Matmul, &[w])
+    }
+
+    pub fn add_vector(&self, v: &Vector) -> Tensor {
+        self.stage(Stage::Add, &[&v.0])
+    }
+
     pub fn add(&self, other: &Tensor) -> Tensor {
         self.stage(Stage::Add, &[other])
     }
@@ -44,6 +53,18 @@ impl Tensor {
 
     pub fn rms_norm(&self, w: &Norm, eps: f32) -> Tensor {
         self.stage(Stage::RmsNorm { eps }, &[&w.0])
+    }
+
+    pub fn center(&self) -> Tensor {
+        self.stage(Stage::Center, &[])
+    }
+
+    pub fn unit_sum(&self) -> Tensor {
+        self.stage(Stage::UnitSum, &[])
+    }
+
+    pub fn rope(&self, positions: &Tensor, theta: f32) -> Tensor {
+        self.stage(Stage::Rope { theta }, &[positions])
     }
 
     pub fn act(&self, act: Act) -> Tensor {
@@ -65,6 +86,27 @@ impl Tensor {
 
     pub fn permute(&self, order: &[u32]) -> Tensor {
         self.op(Op::View(View::Permute(order.to_vec())), &[])
+    }
+
+    pub fn expand(&self, axis: u32, to: impl Into<DimExpr>) -> Tensor {
+        let to = to.into();
+        self.op(Op::View(View::Expand { axis, to }), &[])
+    }
+
+    pub fn concat(&self, other: &Tensor) -> Tensor {
+        self.op(Op::View(View::Concat), &[other])
+    }
+
+    pub fn mask(&self, mask: Mask) -> Tensor {
+        self.op(Op::Mask(mask), &[])
+    }
+
+    pub fn top_k(&self, k: impl Into<DimExpr>) -> Tensor {
+        self.op(Op::Select(Select::TopK { k: k.into() }), &[])
+    }
+
+    pub fn take(&self, ids: &Tensor) -> Tensor {
+        self.op(Op::Select(Select::Take), &[ids])
     }
 
     pub fn cast(&self, dtype: DType) -> Tensor {

@@ -17,11 +17,29 @@ pub enum DimName {
     Heads,
     KvHeads,
     HeadDim,
+    /// A head's width outside its rotary part.
+    Nope,
+    /// A head's rotary width.
+    Rope,
+    /// Width of the low-rank query.
+    QLatent,
+    /// Width of the low-rank keys and values.
+    Latent,
     Ffn,
+    /// A dense layer's MLP width; experts use `Ffn`.
+    DenseFfn,
     Vocab,
     Experts,
     TopK,
+    IndexHeads,
+    IndexDim,
+    /// Keys an indexer keeps for each query.
+    IndexKeep,
     Layers,
+    DenseLayers,
+    MoeLayers,
+    /// Layers that run their own indexer.
+    IndexLayers,
 }
 
 /// How a dimension gets its size.
@@ -178,6 +196,13 @@ impl<T: Into<DimExpr>> Mul<T> for DimName {
     type Output = DimExpr;
     fn mul(self, rhs: T) -> DimExpr {
         DimExpr::from(self) * rhs
+    }
+}
+
+impl<T: Into<DimExpr>> Add<T> for DimName {
+    type Output = DimExpr;
+    fn add(self, rhs: T) -> DimExpr {
+        DimExpr::from(self) + rhs
     }
 }
 

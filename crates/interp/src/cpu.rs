@@ -19,6 +19,7 @@ fn act(a: Act, x: f32) -> f32 {
         Act::GeluTanh => gelu(x),
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+        Act::Relu => x.max(0.0),
     }
 }
 
@@ -130,6 +131,9 @@ impl Kernels for Cpu {
             (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
             // One rank holds the whole sum already.
             (Stage::AllReduce, _) => {}
+            (Stage::Center | Stage::UnitSum | Stage::Rope { .. }, _) => {
+                return Err(Error::Unsupported(format!("{s:?}")));
+            }
             _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
         }
         Ok(Tensor::f32(x.shape.clone(), out))

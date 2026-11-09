@@ -2,6 +2,7 @@
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
 use crate::node::{Graph, Op, Select, Stage, View};
+use crate::select;
 use crate::types::{Placement, TensorType};
 use std::fmt;
 
@@ -53,7 +54,7 @@ fn undeclared(name: DimName) -> TypeError {
     }
 }
 
-fn poly(dims: &[Dim], e: &DimExpr) -> Result<Poly, TypeError> {
+pub(crate) fn poly(dims: &[Dim], e: &DimExpr) -> Result<Poly, TypeError> {
     e.poly(dims).map_err(undeclared)
 }
 
@@ -75,6 +76,11 @@ pub(crate) fn same_shape(dims: &[Dim], a: &Shape, b: &Shape) -> Result<bool, Typ
         }
     }
     Ok(true)
+}
+
+/// The first `n` axes.
+pub(crate) fn front(s: &Shape, n: usize) -> Shape {
+    Shape(s.0[..n].to_vec())
 }
 
 fn finite(x: f32, what: &str) -> Result<(), TypeError> {
@@ -99,10 +105,11 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
 fn arity(op: &Op) -> usize {
     match op {
         Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Matmul | Op::Select(_) => 2,
-        Op::Attend(_) => 3,
+        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) => 1,
+        Op::Matmul | Op::Select(_) | Op::View(View::Concat) => 2,
+        Op::Attend(a) => 3 + usize::from(a.picked),
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
-        Op::View(_) | Op::Cast(_) => 1,
+        Op::View(_) => 1,
     }
 }
 
@@ -134,7 +141,9 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             attend(&g.dims, args)
         }
         Op::Row(r) => row(&g.dims, &r.0, args),
-        Op::Select(Select::Gather) => gather(args[0], args[1]),
+        Op::Mask(_) => select::mask(args[0]),
+        Op::Select(s) => select::select(&g.dims, s, args),
+        Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
         Op::View(v) => view(&g.dims, v, args[0]),
         Op::Cast(dtype) => {
             // Rounding each rank's share is not rounding the sum.
@@ -153,16 +162,23 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
 
 fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, TypeError> {
     use Placement::*;
-    need(w.rank() == 2 && x.rank() >= 1, ErrorKind::Shape, || {
+    // Batch axes of `w` must lead `x` too.
+    let lead = w.rank().saturating_sub(2);
+    let fits = w.rank() >= 2
+        && x.rank() > lead
+        && same_shape(dims, &front(&x.shape, lead), &front(&w.shape, lead))?;
+    need(fits, ErrorKind::Shape, || {
         format!(
-            "matmul takes x [.., K] and w [N, K], got {} and {}",
+            "matmul takes x [.., K] and w [.., N, K], got {} and {}",
             x.shape, w.shape
         )
     })?;
     let k = x.shape.0.last().expect("rank checked");
-    need(same(dims, k, &w.shape.0[1])?, ErrorKind::Shape, || {
-        format!("matmul K differs: x {} and w {}", x.shape, w.shape)
-    })?;
+    need(
+        same(dims, k, &w.shape.0[lead + 1])?,
+        ErrorKind::Shape,
+        || format!("matmul K differs: x {} and w {}", x.shape, w.shape),
+    )?;
     need(
         x.dtype.is_float() && x.dtype == w.dtype,
         ErrorKind::DType,
@@ -174,12 +190,13 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         },
     )?;
     let last = x.rank() as u32 - 1;
+    let n = lead as u32;
     let placement = match (x.placement, w.placement) {
         (Replicated, Replicated) => Replicated,
-        (Replicated, Split { axis: 0 }) => Split { axis: last },
-        (Split { axis }, Replicated) if axis < last => Split { axis },
+        (Replicated, Split { axis }) if axis == n => Split { axis: last },
+        (Split { axis }, Replicated) if (n..last).contains(&axis) => Split { axis },
         (Partial, Replicated) => Partial,
-        (Split { axis }, Split { axis: 1 }) if axis == last => Partial,
+        (Split { axis }, Split { axis: k }) if axis == last && k == n + 1 => Partial,
         (xp, wp) => {
             return Err(TypeError {
                 kind: ErrorKind::Placement,
@@ -188,7 +205,7 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         }
     };
     let mut shape = x.shape.0.clone();
-    *shape.last_mut().expect("rank checked") = w.shape.0[0].clone();
+    *shape.last_mut().expect("rank checked") = w.shape.0[lead].clone();
     Ok(TensorType {
         shape: Shape(shape),
         dtype: x.dtype,
@@ -198,9 +215,11 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
 
 fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (q, k, v) = (a[0], a[1], a[2]);
-    need(a.iter().all(|t| t.rank() == 4), ErrorKind::Shape, || {
-        "attention takes [Seqs, Context, Heads, HeadDim] tensors".into()
-    })?;
+    need(
+        a[..3].iter().all(|t| t.rank() == 4),
+        ErrorKind::Shape,
+        || "attention takes [Seqs, Context, Heads, HeadDim] tensors".into(),
+    )?;
     need(
         same_shape(dims, &k.shape, &v.shape)?,
         ErrorKind::Shape,
@@ -242,7 +261,46 @@ fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
         ErrorKind::Placement,
         || format!("attention needs whole or head-split tensors, got {p:?}"),
     )?;
+    if let Some(ids) = a.get(3) {
+        let fits = ids.rank() == 3 && same_shape(dims, &front(&ids.shape, 2), &front(&q.shape, 2))?;
+        need(fits, ErrorKind::Shape, || {
+            format!("key lists {} do not match queries {}", ids.shape, q.shape)
+        })?;
+        need(ids.dtype.is_int(), ErrorKind::DType, || {
+            format!("key lists must be integers, got {:?}", ids.dtype)
+        })?;
+        need(
+            ids.placement == Placement::Replicated,
+            ErrorKind::Placement,
+            || "key lists must be replicated".into(),
+        )?;
+    }
     Ok(q.clone())
+}
+
+/// Positions must lead `x`, which keeps whole pairs.
+fn rope(dims: &[Dim], x: &TensorType, pos: &TensorType, p: Placement) -> Result<(), TypeError> {
+    let lead = pos.rank().min(x.rank() - 1);
+    let fits = pos.rank() < x.rank() && same_shape(dims, &front(&x.shape, lead), &pos.shape)?;
+    need(fits, ErrorKind::Shape, || {
+        format!("positions {} do not lead {}", pos.shape, x.shape)
+    })?;
+    let width = poly(dims, x.shape.0.last().expect("rank checked"))?;
+    let even = width.as_const().is_none_or(|w| w % 2 == 0);
+    need(even, ErrorKind::Shape, || {
+        format!("rope needs an even width, got {}", x.shape)
+    })?;
+    need(pos.dtype.is_int(), ErrorKind::DType, || {
+        format!("positions must be integers, got {:?}", pos.dtype)
+    })?;
+    let last = x.rank() as u32 - 1;
+    let placed = pos.placement == Placement::Replicated && p != Placement::Split { axis: last };
+    need(placed, ErrorKind::Placement, || {
+        format!(
+            "rope cannot turn {p:?} rows by {:?} positions",
+            pos.placement
+        )
+    })
 }
 
 fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorType, TypeError> {
@@ -285,7 +343,13 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 )?;
                 whole(p, last, s)?;
             }
-            (Stage::Softmax, _) => whole(p, last, s)?,
+            (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
+            (Stage::Rope { theta }, Some(pos)) => {
+                need(theta.is_finite() && *theta > 0.0, ErrorKind::Value, || {
+                    format!("rope base is {theta}")
+                })?;
+                rope(dims, x, pos, p)?;
+            }
             (Stage::Act(_), _) => need(p != Placement::Partial, ErrorKind::Placement, || {
                 format!("{s:?} is nonlinear, so it cannot read partial sums")
             })?,
@@ -352,41 +416,6 @@ fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
     })
 }
 
-fn gather(table: &TensorType, ids: &TensorType) -> Result<TensorType, TypeError> {
-    use Placement::*;
-    need(table.rank() >= 2, ErrorKind::Shape, || {
-        format!("gather reads rows of a table, got {}", table.shape)
-    })?;
-    need(ids.dtype.is_int(), ErrorKind::DType, || {
-        format!("gather indices must be integers, got {:?}", ids.dtype)
-    })?;
-    need(ids.placement == Replicated, ErrorKind::Placement, || {
-        "gather indices must be replicated".into()
-    })?;
-    let lead = ids.rank() as u32;
-    let placement = match table.placement {
-        Replicated => Replicated,
-        // Ranks without the row contribute zeros.
-        Split { axis: 0 } => Partial,
-        Split { axis } => Split {
-            axis: axis - 1 + lead,
-        },
-        Partial => {
-            return Err(TypeError {
-                kind: ErrorKind::Placement,
-                message: "gather cannot read a partial table".into(),
-            });
-        }
-    };
-    let mut shape = ids.shape.0.clone();
-    shape.extend(table.shape.0[1..].iter().cloned());
-    Ok(TensorType {
-        shape: Shape(shape),
-        dtype: table.dtype,
-        placement,
-    })
-}
-
 fn view(dims: &[Dim], v: &View, x: &TensorType) -> Result<TensorType, TypeError> {
     let mut out = x.clone();
     match v {
@@ -428,6 +457,16 @@ fn view(dims: &[Dim], v: &View, x: &TensorType) -> Result<TensorType, TypeError>
             )?;
             out.shape.0[a] = len.clone();
         }
+        View::Expand { axis, to } => {
+            let a = *axis as usize;
+            let one = a < x.rank() && poly(dims, &x.shape.0[a])? == Poly::constant(1);
+            need(one, ErrorKind::Shape, || {
+                format!("axis {a} of {} is not size one", x.shape)
+            })?;
+            poly(dims, to)?;
+            out.shape.0[a] = to.clone();
+        }
+        View::Concat => unreachable!("concat takes two arguments"),
         View::Permute(perm) => {
             let mut seen: Vec<u32> = perm.clone();
             seen.sort();
@@ -447,5 +486,27 @@ fn view(dims: &[Dim], v: &View, x: &TensorType) -> Result<TensorType, TypeError>
             }
         }
     }
+    Ok(out)
+}
+
+fn concat(dims: &[Dim], a: &TensorType, b: &TensorType) -> Result<TensorType, TypeError> {
+    let lead = a.rank().saturating_sub(1);
+    let fits = a.rank() >= 1
+        && a.rank() == b.rank()
+        && same_shape(dims, &front(&a.shape, lead), &front(&b.shape, lead))?;
+    need(fits, ErrorKind::Shape, || {
+        format!("{} and {} differ before the last axis", a.shape, b.shape)
+    })?;
+    need(a.dtype == b.dtype, ErrorKind::DType, || {
+        format!("concat mixes {:?} and {:?}", a.dtype, b.dtype)
+    })?;
+    let split = Placement::Split { axis: lead as u32 };
+    need(
+        a.placement == b.placement && a.placement != split,
+        ErrorKind::Placement,
+        || format!("concat cannot join {:?} and {:?}", a.placement, b.placement),
+    )?;
+    let mut out = a.clone();
+    out.shape.0[lead] = a.shape.0[lead].clone() + b.shape.0[lead].clone();
     Ok(out)
 }
