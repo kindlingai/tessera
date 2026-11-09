@@ -161,6 +161,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
 
 [[package]]
+name = "lower"
+version = "0.1.0"
+dependencies = [
+ "gemm",
+ "gpukit",
+ "graph",
+ "interp",
+ "models",
+ "objc2",
+ "objc2-metal",
+ "ops",
+ "ops-math",
+ "ops-model",
+ "trace",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,6 +190,7 @@ dependencies = [
  "checkpoint",
  "graph",
  "interp",
+ "lower",
  "nanogpt",
  "ops",
  "trace",
