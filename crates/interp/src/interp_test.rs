@@ -1,6 +1,6 @@
 use crate::*;
 use trace::DimName::*;
-use trace::{Attend, DType, Dim, EntryKind, Graph, Mask, Model, Port, Role, Size, TensorType};
+use trace::{DType, Dim, EntryKind, Graph, Mask, Model, Port, Role, Size, TensorType};
 
 fn model() -> Model {
     Model::new(vec![
@@ -77,7 +77,7 @@ fn attention(mask: Mask) -> Graph {
     let m = model();
     let shape = [Seqs, Context, Heads, HeadDim];
     let [q, k, v] = m.entry(EntryKind::Forward, [port(shape), port(shape), port(shape)]);
-    let out = m.attend(Attend { mask, scale: 0.5 }, &q, &k, &v);
+    let out = m.attend(mask, 0.5, [&q, &k, &v], None);
     m.finish([(Role::Logits, &out)])
 }
 
@@ -145,7 +145,7 @@ fn decode(mask: Mask) -> Graph {
     let keys = [Seqs, Context, Heads, HeadDim];
     let ports = [port([Seqs, Rows, Heads, HeadDim]), port(keys), port(keys)];
     let [q, k, v] = m.entry(EntryKind::Forward, ports);
-    let out = m.attend(Attend { mask, scale: 0.5 }, &q, &k, &v);
+    let out = m.attend(mask, 0.5, [&q, &k, &v], None);
     m.finish([(Role::Logits, &out)])
 }
 

@@ -6,6 +6,7 @@ mod json;
 mod node;
 mod numerics;
 mod regions;
+mod select;
 mod types;
 mod verify;
 

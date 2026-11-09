@@ -1,10 +1,10 @@
 //! The builder a description runs against.
 
 use crate::tensor::Tensor;
-use crate::weights::Embed;
+use crate::weights::{Embed, Linears};
 use graph::{
-    Attend, Composite, Dim, DimName, Entry, EntryKind, Graph, Node, NodeId, Numerics, Op, Output,
-    PathSeg, Port, Region, Role, Select, Size, TensorType, Weight, infer, verify,
+    Attend, Composite, Dim, DimName, Entry, EntryKind, Graph, Mask, Node, NodeId, Numerics, Op,
+    Output, PathSeg, Port, Region, Role, Select, Size, TensorType, Weight, infer, verify,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -68,8 +68,27 @@ impl Model {
         push(&self.g, Op::Select(Select::Gather), &[&table.0, ids])
     }
 
-    pub fn attend(&self, a: Attend, q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
-        push(&self.g, Op::Attend(a), &[q, k, v])
+    /// One `[.., Out, In]` matrix per index.
+    pub fn pick(&self, set: &Linears, ids: &Tensor) -> Tensor {
+        push(&self.g, Op::Select(Select::Gather), &[&set.0, ids])
+    }
+
+    /// With `keys`, each query reads only its listed keys.
+    pub fn attend(
+        &self,
+        mask: Mask,
+        scale: f32,
+        [q, k, v]: [&Tensor; 3],
+        keys: Option<&Tensor>,
+    ) -> Tensor {
+        let picked = keys.is_some();
+        let op = Op::Attend(Attend {
+            mask,
+            scale,
+            picked,
+        });
+        let args: Vec<&Tensor> = [q, k, v].into_iter().chain(keys).collect();
+        push(&self.g, op, &args)
     }
 
     /// Marks the nodes `body` traces as one composite region.

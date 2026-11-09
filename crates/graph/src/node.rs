@@ -87,9 +87,11 @@ pub enum Op {
         port: u32,
     },
     Weight(u32),
-    /// `x[.., K]` times `w[N, K]` transposed.
+    /// `x[.., K]` times `w[.., N, K]` transposed.
     Matmul,
     Attend(Attend),
+    /// Scores `[.., Queries, Keys]`; unseen keys become negative infinity.
+    Mask(Mask),
     Row(Row),
     Select(Select),
     View(View),
@@ -113,6 +115,8 @@ impl Op {
 pub struct Attend {
     pub mask: Mask,
     pub scale: f32,
+    /// Argument four lists each query's keys; out-of-range ids are skipped.
+    pub picked: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +136,18 @@ pub enum Stage {
     Add,
     Mul,
     Scale(f32),
-    RmsNorm { eps: f32 },
+    RmsNorm {
+        eps: f32,
+    },
+    /// Subtracts the row's mean.
+    Center,
+    /// Divides the row by its sum.
+    UnitSum,
+    /// Rotates adjacent pairs; the argument holds positions.
+    Rope {
+        /// Pair `j` turns by `position * theta^(-2j/width)`.
+        theta: f32,
+    },
     Act(Act),
     Softmax,
     AllReduce,
@@ -142,15 +157,16 @@ impl Stage {
     /// Arguments this stage reads besides the row itself.
     pub fn operands(&self) -> usize {
         match self {
-            Stage::Add | Stage::Mul | Stage::RmsNorm { .. } => 1,
+            Stage::Add | Stage::Mul | Stage::RmsNorm { .. } | Stage::Rope { .. } => 1,
             _ => 0,
         }
     }
 
     pub fn reduces(&self) -> bool {
+        use Stage::*;
         matches!(
             self,
-            Stage::RmsNorm { .. } | Stage::Softmax | Stage::AllReduce
+            RmsNorm { .. } | Center | UnitSum | Softmax | AllReduce
         )
     }
 }
@@ -160,6 +176,7 @@ pub enum Act {
     GeluTanh,
     Silu,
     Sigmoid,
+    Relu,
 }
 
 /// Data-dependent picks.
@@ -167,6 +184,13 @@ pub enum Act {
 pub enum Select {
     /// Rows of the first argument at the second's indices.
     Gather,
+    /// Row entries at the second argument's indices; out-of-range gives zero.
+    Take,
+    /// Indices of each row's largest entries above negative infinity.
+    TopK {
+        /// Largest first, low index on ties; spare slots hold width.
+        k: DimExpr,
+    },
 }
 
 /// Layout changes; they move data but compute nothing.
@@ -179,6 +203,13 @@ pub enum View {
         len: DimExpr,
     },
     Permute(Vec<u32>),
+    /// Repeats a size-one axis.
+    Expand {
+        axis: u32,
+        to: DimExpr,
+    },
+    /// Joins two arguments along the last axis.
+    Concat,
 }
 
 /// A matcher may replace these contiguous nodes as one unit.
@@ -200,6 +231,7 @@ pub struct Region {
 pub enum Composite {
     Attention,
     Mlp,
+    Moe,
 }
 
 /// A way into the graph, with typed ports.

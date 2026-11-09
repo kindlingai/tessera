@@ -193,8 +193,11 @@ impl Context<'_> {
             }
             Op::Input { .. } => Err(Error::Unsupported("another entry's input".into())),
             Op::Weight(i) => Ok(self.weights[*i as usize].clone()),
+            Op::Matmul if args[1].shape.len() > 2 => lacks("batched matmul"),
             Op::Matmul => k.matmul(num, args[0], args[1]),
+            Op::Attend(a) if a.picked => lacks("attention over picked keys"),
             Op::Attend(a) => k.attend(num, a, [args[0], args[1], args[2]]),
+            Op::Mask(_) => lacks("masks"),
             Op::Row(row) => {
                 let mut x = args[0].clone();
                 let mut rest = args[1..].iter();
@@ -205,6 +208,7 @@ impl Context<'_> {
                 Ok(x)
             }
             Op::Select(Select::Gather) => k.gather(args[0], args[1]),
+            Op::Select(s) => lacks(&format!("{s:?}")),
             Op::View(v) => self.view(v, args[0]),
             Op::Cast(dtype) => Ok(Tensor {
                 shape: args[0].shape.clone(),
@@ -237,8 +241,14 @@ impl Context<'_> {
                 })
             }
             View::Permute(order) => Ok(permute(x, order)),
+            View::Expand { .. } | View::Concat => lacks(&format!("{v:?}")),
         }
     }
+}
+
+/// Ops that trace and verify but do not run yet.
+fn lacks(what: &str) -> Result<Tensor, Error> {
+    Err(Error::Unsupported(what.into()))
 }
 
 fn permute(x: &Tensor, order: &[u32]) -> Tensor {
