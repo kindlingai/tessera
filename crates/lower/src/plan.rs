@@ -20,6 +20,17 @@ pub enum MapStage {
     Act(Act),
 }
 
+/// The sizes one attention works over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attn {
+    pub seqs: usize,
+    pub queries: usize,
+    pub keys: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub width: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kernel {
     /// `x[m, k]` times `w[n, k]` transposed.
@@ -54,15 +65,18 @@ pub enum Kernel {
         heads: usize,
         width: usize,
     },
-    /// Causal attention; keys and values arrive joined.
-    Attend {
-        seqs: usize,
+    /// Causal attention, key by key; keys and values arrive joined.
+    Attend(Attn),
+    /// Every query-key product, as `[Seqs, Heads, Queries, Keys]`.
+    Scores(Attn),
+    /// Scaled causal softmax over each score row, in place.
+    Causal {
         queries: usize,
         keys: usize,
-        heads: usize,
-        kv_heads: usize,
-        width: usize,
+        scale: f32,
     },
+    /// Each head's probabilities times its values.
+    Values(Attn),
     Gather {
         rows: usize,
         width: usize,
@@ -79,7 +93,7 @@ pub enum Kernel {
 impl Kernel {
     /// Whether it writes over its first input.
     pub fn overwrites(&self) -> bool {
-        matches!(self, Kernel::Rope { .. })
+        matches!(self, Kernel::Rope { .. } | Kernel::Causal { .. })
     }
 
     pub fn name(&self) -> &'static str {
@@ -90,7 +104,10 @@ impl Kernel {
             Kernel::Softmax { .. } => "softmax",
             Kernel::Angles { .. } => "angles",
             Kernel::Rope { .. } => "rope",
-            Kernel::Attend { .. } => "attend",
+            Kernel::Attend(_) => "attend",
+            Kernel::Scores(_) => "scores",
+            Kernel::Causal { .. } => "causal",
+            Kernel::Values(_) => "values",
             Kernel::Gather { .. } => "gather",
             Kernel::Map(_) => "map",
             Kernel::Join { .. } => "join",

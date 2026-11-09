@@ -2,9 +2,12 @@
 
 use crate::Error;
 use crate::cost::Device;
-use crate::plan::{Kernel, MapStage};
+use crate::plan::{Attn, Kernel, MapStage};
 use graph::{Attend, DimName, Graph, Mask, NodeId, Op as Node, Pairs, Select, Shape, Stage, View};
 use std::collections::HashMap;
+
+/// The most score elements dense attention may hold.
+pub const DENSE_SCORES: usize = 1 << 28;
 
 /// The most rows the one-thread-per-column matmul takes.
 pub const THIN_ROWS: usize = 32;
@@ -338,7 +341,7 @@ impl Picker<'_> {
         angles
     }
 
-    /// The kernel wants scaled queries, and keys beside values.
+    /// Key by key, or as two matmuls: whichever costs less.
     fn attend(&mut self, i: usize, a: &Attend) -> Result<Val, Error> {
         let n = &self.g.nodes[i];
         if a.picked || a.mask != Mask::Causal {
@@ -350,16 +353,7 @@ impl Picker<'_> {
         else {
             return unsupported("attention below rank 4");
         };
-        let covers = [NodeId(i as u32)];
-        let scale = Kernel::Map(vec![MapStage::Scale(a.scale)]);
-        let scaled = self.emit(scale, vec![q], self.len(q), &covers);
-        let side = kv_heads * width;
-        let join = Kernel::Join {
-            left: side,
-            right: side,
-        };
-        let joined = self.emit(join, vec![k, v], 2 * self.len(k), &covers);
-        let kernel = Kernel::Attend {
+        let sizes = Attn {
             seqs,
             queries,
             keys,
@@ -367,6 +361,39 @@ impl Picker<'_> {
             kv_heads,
             width,
         };
-        Ok(self.emit(kernel, vec![scaled, joined], self.len(q), &covers))
+        let covers = [NodeId(i as u32)];
+        let side = kv_heads * width;
+        let scale = Kernel::Map(vec![MapStage::Scale(a.scale)]);
+        let join = Kernel::Join {
+            left: side,
+            right: side,
+        };
+        let causal = Kernel::Causal {
+            queries,
+            keys,
+            scale: a.scale,
+        };
+        let (out, joined) = (self.len(q), 2 * self.len(k));
+        let pairs = seqs * heads * queries * keys;
+        let cost = |ops: [(&Kernel, usize); 3]| -> f64 {
+            let each = ops.map(|(kernel, len)| self.device.seconds(kernel, len));
+            each.iter().sum()
+        };
+        let stream = cost([
+            (&scale, out),
+            (&join, joined),
+            (&Kernel::Attend(sizes), out),
+        ]);
+        let (first, last) = (Kernel::Scores(sizes), Kernel::Values(sizes));
+        let dense = cost([(&first, pairs), (&causal, pairs), (&last, out)]);
+        if pairs <= DENSE_SCORES && dense < stream {
+            let scores = self.emit(first, vec![q, k], pairs, &covers);
+            let probs = self.emit(causal, vec![scores], pairs, &covers);
+            return Ok(self.emit(last, vec![probs, v], out, &covers));
+        }
+        // The streaming kernel wants scaled queries, and keys beside values.
+        let scaled = self.emit(scale, vec![q], out, &covers);
+        let both = self.emit(join, vec![k, v], joined, &covers);
+        Ok(self.emit(Kernel::Attend(sizes), vec![scaled, both], out, &covers))
     }
 }

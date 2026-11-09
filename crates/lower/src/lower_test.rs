@@ -63,6 +63,23 @@ fn cost_picks_the_matmul() {
 }
 
 #[test]
+fn cost_picks_attention() {
+    // Dense attention is unproven, so a guess streams.
+    let (_, stream) = toy(&Device::guess());
+    assert_eq!((count(&stream, "attend"), count(&stream, "scores")), (2, 0));
+    let (_, dense) = toy(&Device::guess().without("attend"));
+    assert_eq!((count(&dense, "attend"), count(&dense, "join")), (0, 0));
+    let per_layer = ["scores", "causal", "values"].map(|k| count(&dense, k));
+    assert_eq!(per_layer, [2, 2, 2]);
+    let softmax = dense
+        .steps
+        .iter()
+        .find(|s| s.kernel.name() == "causal")
+        .unwrap();
+    assert_eq!(softmax.write.buffer, softmax.reads[0].buffer, "in place");
+}
+
+#[test]
 fn order_saves_memory() {
     let g = program(&Config::toy(4, 16));
     let picked = select(&g, 0, &SIZES, &Device::guess()).unwrap();

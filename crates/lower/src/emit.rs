@@ -230,6 +230,39 @@ pub fn softmax() -> Text {
     }
 }
 
+/// One thread turns a score row into causal probabilities.
+pub fn causal() -> Text {
+    // Rows are queries; the last query sees every key.
+    let body = "    if (gid >= rows) {
+        return;
+    }
+    u32 seen = keys - queries + gid % queries + 1;
+    u64 at = (u64)gid * keys;
+    float top = x[at] * scale;
+    for (u32 i = 1; i < seen; i++) {
+        top = f_max(top, x[at + i] * scale);
+    }
+    float sum = 0.0f;
+    for (u32 i = 0; i < seen; i++) {
+        sum += f_exp(x[at + i] * scale - top);
+    }
+    for (u32 i = 0; i < keys; i++) {
+        x[at + i] = i < seen ? f_exp(x[at + i] * scale - top) / sum : 0.0f;
+    }
+";
+    Text {
+        entry: "plan_causal".into(),
+        buffers: vec![float("x", true)],
+        scalars: vec![
+            ("rows", "u32"),
+            ("queries", "u32"),
+            ("keys", "u32"),
+            ("scale", "float"),
+        ],
+        body: body.into(),
+    }
+}
+
 /// A cosine and sine per position and pair.
 pub fn angles() -> Text {
     let body = "    u32 pairs = width / 2;

@@ -1,7 +1,7 @@
 //! Each kernel's arguments and launch shape, stated once.
 
 use crate::emit::{self, Text};
-use crate::plan::{Kernel, Slot, Step};
+use crate::plan::{Attn, Kernel, Slot, Step};
 use ops_model::{apply_rope_heads, gather_rows, gqa_attention};
 
 /// One kernel argument, in the order its source declares.
@@ -54,12 +54,15 @@ fn fixed(metal: &'static str, cuda: &'static str, entry: &'static str) -> Source
 
 pub fn source(kernel: &Kernel) -> Source {
     match kernel {
-        Kernel::Matmul { .. } => fixed(gemm::METAL, gemm::CUDA, gemm::ENTRY),
+        Kernel::Matmul { .. } | Kernel::Scores(_) | Kernel::Values(_) => {
+            fixed(gemm::METAL, gemm::CUDA, gemm::ENTRY)
+        }
+        Kernel::Causal { .. } => Source::Made(emit::causal()),
         Kernel::Rope { .. } => {
             use apply_rope_heads::{CUDA, ENTRY, METAL};
             fixed(METAL, CUDA, ENTRY)
         }
-        Kernel::Attend { .. } => {
+        Kernel::Attend(_) => {
             use gqa_attention::{CUDA, ENTRY, METAL};
             fixed(METAL, CUDA, ENTRY)
         }
@@ -146,7 +149,18 @@ pub fn launches(step: &Step) -> Vec<Launch> {
             ];
             (args, Shape::Line(heads * positions))
         }
-        Kernel::Attend { .. } => return attend(step),
+        Kernel::Attend(a) => return attend(step, &a),
+        Kernel::Scores(a) => return scores(step, &a),
+        Kernel::Values(a) => return values(step, &a),
+        Kernel::Causal {
+            queries,
+            keys,
+            scale,
+        } => {
+            let sizes = [count(len / keys), count(queries), count(keys)];
+            let args = [read(0)].into_iter().chain(sizes).chain([Arg::F32(scale)]);
+            (args.collect(), Shape::Line(len / keys))
+        }
         // The kernel takes its output first.
         Kernel::Gather { rows, width } => {
             let args = vec![write, read(0), read(1), pair(rows, width)];
@@ -167,39 +181,106 @@ pub fn launches(step: &Step) -> Vec<Launch> {
 }
 
 /// One launch per sequence, each at its own offset.
-fn attend(step: &Step) -> Vec<Launch> {
-    let Kernel::Attend {
-        seqs,
-        queries,
-        keys,
-        heads,
-        kv_heads,
-        width,
-    } = step.kernel
-    else {
-        return Vec::new();
-    };
+fn attend(step: &Step, a: &Attn) -> Vec<Launch> {
     let shape = gqa_attention::Fixture {
         q: Vec::new(),
         kv: Vec::new(),
-        seq_len: queries,
-        total_kv: keys,
-        n_heads: heads,
-        n_kv_heads: kv_heads,
-        head_dim: width,
+        seq_len: a.queries,
+        total_kv: a.keys,
+        n_heads: a.heads,
+        n_kv_heads: a.kv_heads,
+        head_dim: a.width,
         sliding_window: 0,
-        kv_cache_len: keys - queries,
+        kv_cache_len: a.keys - a.queries,
     };
-    let (q, kv) = (queries * heads * width, keys * kv_heads * width * 2);
+    let (q, kv) = (
+        a.queries * a.heads * a.width,
+        a.keys * a.kv_heads * a.width * 2,
+    );
     let launch = |s: usize| Launch {
         args: vec![
             Arg::Buffer(step.reads[0], s * q),
             Arg::Buffer(step.reads[1], s * kv),
             Arg::Buffer(step.write, s * q),
             bytes(&shape.params()),
-            pair(queries, heads),
+            pair(a.queries, a.heads),
         ],
-        shape: Shape::Rows(queries * heads),
+        shape: Shape::Rows(a.queries * a.heads),
     };
-    (0..seqs).map(launch).collect()
+    (0..a.seqs).map(launch).collect()
+}
+
+/// One tiled matmul per sequence and head, over strided rows.
+fn per_head(a: &Attn, p: gemm::Problem, at: impl Fn(usize, usize) -> [Arg; 3]) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: p.n.div_ceil(gemm::BN),
+        down: p.m.div_ceil(gemm::BM),
+        threads: gemm::THREADS as usize,
+    };
+    let pairs = (0..a.seqs).flat_map(|s| (0..a.heads).map(move |h| (s, h)));
+    let launch = |(s, h)| Launch {
+        args: Vec::from(at(s, h))
+            .into_iter()
+            .chain([Arg::Bytes(gemm::abi_params(&p))])
+            .collect(),
+        shape,
+    };
+    pairs.map(launch).collect()
+}
+
+/// Where head `h` of sequence `s` starts in each tensor.
+struct Starts {
+    /// In `[Seqs, Queries, Heads, Width]`.
+    query: usize,
+    /// In `[Seqs, Keys, KvHeads, Width]`.
+    key: usize,
+    /// In `[Seqs, Heads, Queries, Keys]`.
+    score: usize,
+}
+
+fn starts(a: &Attn, s: usize, h: usize) -> Starts {
+    let kv = h / (a.heads / a.kv_heads);
+    Starts {
+        query: (s * a.queries * a.heads + h) * a.width,
+        key: (s * a.keys * a.kv_heads + kv) * a.width,
+        score: (s * a.heads + h) * a.queries * a.keys,
+    }
+}
+
+/// Queries times keys, each head's rows a stride apart.
+fn scores(step: &Step, a: &Attn) -> Vec<Launch> {
+    let rows = gemm::Problem::linear(a.queries, a.keys, a.width);
+    let p = gemm::Problem {
+        lda: a.heads * a.width,
+        ldb: a.kv_heads * a.width,
+        ..rows
+    };
+    per_head(a, p, |s, h| {
+        let at = starts(a, s, h);
+        let (q, k) = (step.reads[0], step.reads[1]);
+        [
+            Arg::Buffer(q, at.query),
+            Arg::Buffer(k, at.key),
+            Arg::Buffer(step.write, at.score),
+        ]
+    })
+}
+
+/// Probabilities times values, written into each head's columns.
+fn values(step: &Step, a: &Attn) -> Vec<Launch> {
+    let rows = gemm::Problem::matmul(a.queries, a.width, a.keys);
+    let p = gemm::Problem {
+        ldb: a.kv_heads * a.width,
+        ldc: a.heads * a.width,
+        ..rows
+    };
+    per_head(a, p, |s, h| {
+        let at = starts(a, s, h);
+        let (probs, v) = (step.reads[0], step.reads[1]);
+        [
+            Arg::Buffer(probs, at.score),
+            Arg::Buffer(v, at.key),
+            Arg::Buffer(step.write, at.query),
+        ]
+    })
 }

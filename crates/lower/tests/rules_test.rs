@@ -79,10 +79,11 @@ fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32
     max_abs_diff(&got[0], want[0].floats().unwrap())
 }
 
-/// One device per matmul kernel, so both get checked.
-fn devices() -> [Device; 2] {
-    let guess = Device::guess;
-    [guess().without("thin"), guess().without("matmul")]
+/// One device per kernel choice, so each gets checked.
+fn devices() -> [Device; 3] {
+    let tiled = || Device::guess().without("thin");
+    let thin = Device::guess().without("matmul");
+    [tiled(), thin, tiled().without("attend")]
 }
 
 #[test]
@@ -113,7 +114,7 @@ fn each_rule_matches_cpu() {
         }
         checked += seen.len();
     }
-    assert!(checked > 80, "only {checked} rule uses checked");
+    assert!(checked > 120, "only {checked} rule uses checked");
 }
 
 #[test]
