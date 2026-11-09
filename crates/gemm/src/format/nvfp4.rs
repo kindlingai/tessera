@@ -1,5 +1,4 @@
-//! NVFP4 decode and its CPU GEMM oracle (MLX 2-tier: E2M1 codes + per-block
-//! FP8 E4M3 scale).
+//! NVFP4 decode: E2M1 codes with per-block E4M3 scales.
 
 use super::fp4::{e2m1_to_f32, e4m3_to_f32};
 use super::layout::{
@@ -90,7 +89,7 @@ pub fn nvfp4_weight_at(
     e2m1_to_f32(q) * scale * global_scale
 }
 
-/// CPU NVFP4 GEMM (oracle for Metal parity).
+/// CPU NVFP4 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T`.
 pub fn nvfp4_gemm_cpu(
     a: &[f32],
     m: usize,

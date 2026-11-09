@@ -4,7 +4,7 @@ using namespace metal;
 constant float ROUTER_RMS_EPS = 1e-6f;
 constant uint MAX_EXPERTS = 256u;
 
-/// Must stay layout-identical to MoeRouterParams in mod.rs and .cu.
+/// Must match MoeRouterParams in mod.rs and .cu.
 struct MoeRouterParams {
     uint canvas;
     uint hidden;
@@ -14,8 +14,7 @@ struct MoeRouterParams {
     uint top_k2;
 };
 
-/// One threadgroup per canvas row: normalize, project, then one thread selects
-/// the top-k (ties toward the lower expert index) and softmaxes over them.
+/// One threadgroup per row, one thread picks the top-k.
 kernel void moe_router_topk(
     device const float *stream [[buffer(0)]],
     device const float *router_scale [[buffer(1)]],

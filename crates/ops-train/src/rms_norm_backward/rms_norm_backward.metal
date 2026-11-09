@@ -1,8 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// One threadgroup per row: reduce sum(x^2) and sum(dy*w*x) together, then
-/// write dx = inv*dy*w - inv^3 * x * dot / hidden.
+/// dx = inv*dy*w - inv^3 * x * dot / hidden.
 kernel void rms_norm_backward(
     device const float *x [[buffer(0)]],
     device const float *weight [[buffer(1)]],

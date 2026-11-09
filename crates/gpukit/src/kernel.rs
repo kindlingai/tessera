@@ -1,51 +1,6 @@
-//! Kernel registration: one block declares what a kernel is (its name, its
-//! backend bodies, its function-constant pipeline, its manifest row) and the
-//! expansion emits the consts, the backend dispatch wrapper, and the tier-1
-//! test module.
-//!
-//! Two arms, one per kernel home:
-//!
-//! - `op` — a backend-agnostic op whose Metal and CUDA bodies sit beside a CPU
-//!   oracle (`crates/dgops`): emits `ENTRY`, `METAL`, the `CUDA` source, the
-//!   two generated backend modules, the backend-selecting `gpu()` wrapper, and
-//!   the test module. Its `abi` list is the single declaration of the kernel
-//!   argument list: both backends' `gpu()` bodies are generated from it, so the
-//!   two argument orders cannot drift (see `Generated dispatch` below).
-//! - `shader` — one Metal entry point with an FC-specialized pipeline and an
-//!   optional manifest `SPEC` (the engine's `src/shaders`): emits `ENTRY`,
-//!   `SHADER`, an optional `pipeline_for`, an optional `NAME`+`SPEC`, and the
-//!   test module.
-//!
-//! Everything crate-specific (the error type, the Metal context type, the
-//! manifest type, the oracle assertion) is passed in by the caller's shim, so
-//! this crate stays backend- and crate-agnostic. What differs between kernels
-//! — fixtures, CPU oracles, kernel bodies — stays hand-written at the call
-//! site; the only generated code is an `op` arm's host-side dispatch, and it is
-//! generated for both backends from the one `abi` list.
-//!
-//! Constraints worth knowing before editing:
-//!
-//! - `include_str!($metal)` resolves relative to the *invoking* file, so
-//!   `metal = "gelu.metal"` means "beside this `mod.rs`".
-//! - `cuda = "gelu.cu"` embeds the CUDA C++ source beside the op, exactly like
-//!   `metal`: NVRTC compiles it on first dispatch, so no build-time toolchain is
-//!   needed and the artifact matches the running device's architecture.
-//! - The `metal`/`cuda` modules emitted here resolve relative to the caller's
-//!   directory (they are inline modules, so their `use super::*;` sees the op).
-//! - The `pipeline` body must be a caller-written closure: names introduced by
-//!   this macro's transcriber are hygiene-invisible to caller tokens, so a
-//!   generated `fn pipeline_for(ctx, variant)` cannot expose `ctx`/`variant` to
-//!   a body written at the call site. The closure is coerced to a fn pointer so
-//!   its parameters get their types from the generated signature.
-//! - The same rule is why an `op` arm's `fixture = Fixture => fix` names the
-//!   binding: the `abi`/`launch`/`result` expressions are caller tokens, so the
-//!   binding they read has to come from the call site. The generated `gpu()`
-//!   takes an internal parameter and immediately rebinds it with
-//!   `let $fixvar = ...` (a metavariable can name a local, not a parameter).
-//! - The generated backend modules glob-import the op module (`use super::*;`)
-//!   so the fixture type and helpers resolve inside them.
+//! Kernel registration: `op` for portable ops, `shader` for Metal.
 
-/// Register one kernel. See the module docs for the two arms.
+/// Register one kernel, with its dispatch and tests.
 #[macro_export]
 macro_rules! kernel {
     // ---- op with a generated dispatch ABI ----------------------------------
@@ -57,13 +12,16 @@ macro_rules! kernel {
         name = $name:literal,
         metal = $metal:literal,
         cuda = $cuda:literal,
+        // Caller tokens can only see bindings the caller names.
         fixture = $fixture:ty => $fixvar:ident,
+        // Both backends bind from this list, so orders match.
         abi = [ $($abi:tt)* ],
         launch = $launch:tt($largs:expr),
         result = ($res:ident, $rlen:expr),
         tests = $tests:tt $(,)?
     ) => {
         pub const ENTRY: &str = $name;
+        // Paths resolve beside the invoking file.
         pub const METAL: &str = include_str!($metal);
         pub const CUDA: &str = include_str!($cuda);
 
@@ -107,8 +65,7 @@ macro_rules! kernel {
             }
         }
 
-        /// Run this op on the backend this build has: Metal on macOS, CUDA
-        /// elsewhere when the cuda feature is on.
+        /// Run this op on Metal (macOS) or CUDA (cuda feature).
         pub fn gpu(fix: &$fixture) -> Result<Vec<f32>, $err> {
             #[cfg(target_os = "macos")]
             {
@@ -143,6 +100,7 @@ macro_rules! kernel {
         name = $name:literal,
         entry = $entry:literal,
         metal = $metal:literal,
+        // A closure: hygiene hides generated parameter names from caller tokens.
         $(pipeline = $pipeline:expr,)?
         $(spec = { $($spec:tt)* },)?
         tests = $tests:tt $(,)?
@@ -153,17 +111,16 @@ macro_rules! kernel {
         $(
             #[cfg(target_os = "macos")]
             pub fn pipeline_for(ctx: &$ctx, variant: $variant) -> Result<$pipeline_ty, $err> {
+                // The coercion gives the closure's parameters their types.
                 let pipeline: fn(&$ctx, $variant) -> Result<$pipeline_ty, $err> = $pipeline;
                 pipeline(ctx, variant)
             }
         )?
 
         $(
-            /// Manifest name; equals `ENTRY` unless the kernel's entry point
-            /// differs from its manifest name (see `attention_gemm`).
+            /// Manifest name, which may differ from `ENTRY`.
             pub const NAME: &str = $name;
-            // The caller spec macro declares the const AND scatters it into
-            // the gathered manifest, so a spec cannot exist unregistered.
+            // Declares and registers together, so no spec goes unregistered.
             $spec_macro! {
                 pub const SPEC {
                     name: NAME,
@@ -177,25 +134,7 @@ macro_rules! kernel {
         $crate::__shader_tests!($assert_oracle, $skip_gpu, $elem_f32, $variant, $tests);
     };
 }
-// ---------------------------------------------------------------------------
-// Test expansion
-//
-// A kernel block declares its tests either as a verbatim block
-// (`tests = { … }`) or as a fixture table (`tests = [ … ]`). A table entry is
-//
-//   case => fixture => (max_tol, min_cos)                  // default entry points
-//   case => fixture => gpu_fn => (max_tol, min_cos)        // different gpu entry
-//   case => fixture => no_variant => (max_tol, min_cos)    // gpu() takes no variant
-//   case => { fixture = …, gpu = …, cpu = …, oracle = …, tol = …, cos = … }
-//
-// Generated tests live in `mod tests::<case>` inside the kernel module and reach
-// the kernel's items through `use super::super::*;`, so an entry names a fixture
-// once instead of repeating a fully qualified path per assertion. The expected
-// output length is the fixture's own `out_len()` (op fixtures use `len()`), so a
-// case never names a length function. The oracle defaults to the CPU reference:
-// a case that declares a real oracle gets `cpu_matches_oracle`, the rest get
-// `cpu_is_finite`.
-// ---------------------------------------------------------------------------
+// Tests come as a verbatim `{ … }` block or a `[ … ]` fixture table.
 
 /// Expand the `tests =` field of a shader kernel.
 #[macro_export]
@@ -357,8 +296,7 @@ macro_rules! __op_tests {
     };
 }
 
-/// One portable-op fixture-table case. The expected length is the fixture's own
-/// `len()` unless the case names an explicit `out_len` function.
+/// One portable-op fixture-table case.
 #[macro_export]
 macro_rules! __op_case {
     ($assert_oracle:path, $gpu_available:path, $case:ident, $fixture:path, method, $gpu:path,
@@ -440,35 +378,7 @@ macro_rules! __op_cases {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Generated dispatch (op arm with `abi`)
-//
-// An op whose bindings are a flat list of buffers and scalars declares them
-// once; both backends' gpu() bodies are generated from that list, so the two
-// argument orders cannot drift. Entry grammar, in kernel-argument order:
-//
-//   in(buf = expr)        read-only f32 buffer, size expr.len()
-//   inout(buf = expr)     read-write f32 buffer (the result when named by
-//                         `result`), size expr.len()
-//   out(buf = size)       write-only f32 buffer of `size` elements
-//   in_u32(buf = expr)    read-only u32 buffer, size expr.len()
-//   in_u32(buf = expr,    same, but the expression is evaluated once into a
-//          as tmp)        local `tmp` first. Use this whenever `expr` is not a
-//                         place expression (e.g. a method returning a Vec):
-//                         the plain form names `expr` twice, so a temporary
-//                         dies before its bytes are copied.
-//   u32(expr) f32(expr)   scalar arguments
-//   u32x2(a, b)           two u32 dims: one packed uint2 on Metal, two args on CUDA
-//   pod(expr)             repr(C) POD scalar argument
-//   pod(expr, as tmp)     same, but the expression is evaluated once into a
-//                         local `tmp` first. Use this whenever `expr` is a
-//                         method call: the plain form's `&$e` does NOT extend
-//                         a temporary's lifetime through set_bytes, so the
-//                         kernel silently reads freed stack bytes.
-//
-// `launch = 1d(expr) | rows(expr)` picks the dispatch shape and
-// `result = (buf, len_expr)` the buffer copied back to the host.
-// ---------------------------------------------------------------------------
+// Dispatch generated from an op's `abi` list, in argument order.
 
 /// Metal: allocate and upload every buffer of an op ABI.
 #[macro_export]
@@ -494,6 +404,7 @@ macro_rules! __op_metal_prep {
             .ok_or(<$err>::Gpu("buffer alloc"))?;
         $crate::__op_metal_prep!($err, $ctx, $pool $($tail)*);
     };
+    // `as tmp` binds once, so a temporary outlives the copy.
     ($err:path, $ctx:ident, $pool:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
         let $tmp = $e;
         let $n = $pool
@@ -548,6 +459,7 @@ macro_rules! __op_metal_bind {
         gpukit::metal::bind_buffer($enc, &$n, $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
     };
+    // One packed uint2 on Metal, two arguments on CUDA.
     ($enc:ident, $idx:expr, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
         gpukit::metal::set_bytes($enc, &[$a as u32, $b as u32], $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
@@ -560,6 +472,7 @@ macro_rules! __op_metal_bind {
         gpukit::metal::set_bytes($enc, &($e as f32), $idx);
         $crate::__op_metal_bind!($enc, $idx + 1 $($tail)*);
     };
+    // Plain `&$e` would drop a temporary before set_bytes reads it.
     ($enc:ident, $idx:expr, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
         let $tmp = $e;
         gpukit::metal::set_bytes($enc, &$tmp, $idx);
@@ -615,7 +528,7 @@ macro_rules! __op_cuda_prep {
     };
 }
 
-/// CUDA: append every buffer and scalar to the launch arguments, in order.
+/// CUDA: append every buffer and scalar to the launch arguments.
 #[macro_export]
 macro_rules! __op_cuda_args {
     ($args:ident $(,)?) => {};

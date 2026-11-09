@@ -1,10 +1,4 @@
 //! Link-time registry of shader include folders.
-//!
-//! Each crate that owns shared headers registers its folder once with
-//! [`register_includes!`]; [`include_table`] collects every registered folder
-//! into one name → contents table, which the Metal context uses to resolve
-//! `#include "name.metal"`. Registration is the only step — a header on disk
-//! in a registered folder cannot be forgotten.
 
 use crate::Error;
 
@@ -21,21 +15,14 @@ gather! {
     pub static INCLUDE_DIRS: scattered_collect::ScatteredSlice<IncludeFolder>;
 }
 
-/// Embed a folder of shader headers and register it for `#include`
-/// resolution in every [`crate::metal::Context`].
-///
-/// `path` is an `include_dir!` path, e.g.
-/// `"$CARGO_MANIFEST_DIR/src/shaders/include"`. Invoke at most once per
-/// module. The registering crate's build script must emit
-/// `rerun-if-changed` for the folder — cargo does not track embedded files
-/// on its own.
+/// Embed and register a folder of shader headers.
 #[macro_export]
 macro_rules! register_includes {
     ($path:tt) => {
         const _: () = {
-            // `include_dir!` emits paths naming its own crate; this alias
-            // resolves them without the caller depending on it directly.
+            // Spares the caller a direct `include_dir` dependency.
             use $crate::includes::include_dir;
+            // Cargo misses embedded files: callers emit `rerun-if-changed`.
             static DIR: include_dir::Dir<'static> = include_dir::include_dir!($path);
             $crate::includes::scatter! {
                 #[scatter($crate::includes::INCLUDE_DIRS)]
@@ -46,11 +33,7 @@ macro_rules! register_includes {
     };
 }
 
-/// The union of every registered folder as a name → contents table.
-///
-/// Folders are read non-recursively. Fails on a header that is not UTF-8 or
-/// a name registered by two folders — bare-name `#include` resolution has no
-/// way to pick between duplicates.
+/// Every registered header as (name, contents), failing on duplicates.
 pub fn include_table() -> Result<Vec<(&'static str, &'static str)>, Error> {
     let mut table: Vec<(&'static str, &'static str)> = Vec::new();
     for folder in INCLUDE_DIRS.iter() {

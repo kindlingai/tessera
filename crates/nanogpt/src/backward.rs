@@ -1,6 +1,4 @@
-//! Backward pass: analytic gradients for the tiny GPT, composed from the same
-//! dgops kernels as the forward pass (every matrix gradient is a GEMM with the
-//! appropriate transpose flags).
+//! Analytic gradients for the tiny GPT, on GPU ops.
 
 use crate::model::{Cache, EPS, GptConfig, Weights};
 use crate::tensor as t;
@@ -68,7 +66,7 @@ pub fn loss(w: &Weights, cfg: &GptConfig, tokens: &[u32], targets: &[u32]) -> Re
     Ok(cross_entropy(&cache.logits, targets, rows, cfg.vocab).0)
 }
 
-/// (dX, dW) for Y = X @ W^T with X (m,k), W (n,k).
+/// (dX, dW) for Y = X @ W^T, W is (n,k).
 fn linear_bwd(
     x: &[f32],
     w: &[f32],
@@ -82,7 +80,7 @@ fn linear_bwd(
     Ok((dx, dw))
 }
 
-/// dW for an RMSNorm scale: sum over rows of dy * x * inv.
+/// RMSNorm scale gradient: sum over rows of dy*x*inv.
 fn rms_norm_dw(x: &[f32], dy: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
     let mut dw = vec![0.0f32; hidden];
     for r in 0..rows {

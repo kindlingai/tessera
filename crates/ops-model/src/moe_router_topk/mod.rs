@@ -1,10 +1,4 @@
-//! MoE router: RMSNorm(no scale) \u2192 scaled linear \u2192 top-k softmax.
-//!
-//! Per canvas row: \`n = rms_norm_no_scale(stream) * router_scale * hidden^-0.5\`,
-//! \`logits = n @ router_proj^T\`, then the top \`k\` logits are softmaxed over the
-//! selected set and multiplied by \`per_expert_scale\`. Ties break toward the
-//! lower expert index (the CPU oracle's stable sort). Weights are returned
-//! bf16-rounded, exactly as the engine packs them.
+//! MoE router: RMSNorm, scaled linear, then softmax over the top-k.
 
 ops::op_kernel! {
     name = "moe_router_topk",
@@ -30,7 +24,7 @@ ops::op_kernel! {
 
 pub const RMS_EPS: f32 = 1e-6;
 
-/// Must stay layout-identical to MoeRouterParams in .metal / .cu.
+/// Must match MoeRouterParams in the .metal and .cu files.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MoeRouterParams {
@@ -114,9 +108,10 @@ pub fn bf16_round(v: f32) -> f32 {
     f32::from_bits(v.to_bits() & 0xFFFF_0000)
 }
 
-/// One row's route: the top-k expert indices and their bf16-rounded weights.
+/// One row's top-k expert indices and bf16-rounded weights.
 pub fn route_row(logits: &[f32], top_k: usize, per_expert_scale: &[f32]) -> (Vec<u32>, Vec<f32>) {
     let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    // Ties go to the lower expert index, like the GPU.
     ranked.sort_by(|(ia, pa), (ib, pb)| {
         pb.partial_cmp(pa)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -139,7 +134,7 @@ pub fn route_row(logits: &[f32], top_k: usize, per_expert_scale: &[f32]) -> (Vec
     (indices, weights)
 }
 
-/// The CPU oracle: indices and bf16-rounded weights for every canvas row.
+/// Indices and bf16-rounded weights for every canvas row.
 pub fn cpu_routes(fix: &Fixture) -> (Vec<u32>, Vec<f32>) {
     let mut indices = Vec::with_capacity(fix.len());
     let mut weights = Vec::with_capacity(fix.len());
@@ -163,8 +158,7 @@ pub fn cpu_routes(fix: &Fixture) -> (Vec<u32>, Vec<f32>) {
     (indices, weights)
 }
 
-/// The fixture-table oracle compares the weight buffer; indices are checked by
-/// the dedicated test below (they are integers, so tolerance would hide a swap).
+/// Weights only: tolerance would hide swapped integer indices.
 pub fn cpu(fix: &Fixture) -> Vec<f32> {
     cpu_routes(fix).1
 }

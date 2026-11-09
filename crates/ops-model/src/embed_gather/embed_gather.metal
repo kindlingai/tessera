@@ -2,7 +2,6 @@
 using namespace metal;
 
 /// out[t, d] = decode(table[ids[t]], d) * embed_scale.
-/// Table row is raw bf16 (\`raw\` = 1) or a q8 row (bf16 scale + int8 codes).
 kernel void embed_gather(
     device const uint *blob [[buffer(0)]],
     device const uint *ids [[buffer(1)]],

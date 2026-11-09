@@ -8,12 +8,12 @@ pub enum Backend {
     Cuda,
 }
 
-/// The backend available to this build, if any. macOS always has Metal; every
-/// other target needs the cuda feature and a working driver at dispatch time.
+/// The backend this build can use, if any.
 pub fn available() -> Option<Backend> {
     if cfg!(target_os = "macos") {
         Some(Backend::Metal)
     } else if cfg!(feature = "cuda") {
+        // The driver loads only at dispatch time.
         Some(Backend::Cuda)
     } else {
         None

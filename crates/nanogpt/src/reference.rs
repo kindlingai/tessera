@@ -1,11 +1,4 @@
-//! Independent CPU forward pass -- the composition the GPU path is checked
-//! against.
-//!
-//! The op math comes from the shared CPU oracles (`gemm::cpu` /
-//! `ops::ops::*::cpu` through `tensor::*_cpu`), so every kernel is pinned to
-//! one CPU implementation; what is independent here is the wiring -- embedding,
-//! attention, residuals and layer order -- which is the part no per-op test can
-//! see.
+//! CPU forward pass: shared op oracles, independently written wiring.
 
 use crate::model::{EPS, GptConfig, Weights};
 use crate::tensor as t;

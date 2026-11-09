@@ -1,4 +1,4 @@
-//! Gather rows by index from a row-major [tokens, hidden] f32 source.
+//! Gather rows by index from a row-major [tokens, hidden] source.
 
 ops::op_kernel! {
     name = "gather_rows",
@@ -44,7 +44,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// Repeated and out-of-order indices over a hidden wider than one block.
+/// Repeated, unordered indices over a hidden wider than one block.
 pub fn moe_fixture() -> Fixture {
     let tokens = 64;
     let hidden = 512;

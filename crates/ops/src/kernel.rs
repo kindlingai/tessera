@@ -1,8 +1,4 @@
-//! `op_kernel!` — the dgops binding of `gpukit::kernel!`.
-//!
-//! Binds this crate's error type, the shared oracle assertion, and the
-//! GPU-availability gate, so an op's registration block names only what is
-//! specific to that op.
+//! `op_kernel!`: `gpukit::kernel!` bound to this crate's error and helpers.
 
 #[macro_export]
 macro_rules! op_kernel {

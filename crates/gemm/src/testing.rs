@@ -1,15 +1,15 @@
 //! Test support: backend availability and the f32 oracle comparison.
 
-/// True when a GPU dispatch should actually run. A hosted macOS CI runner has
-/// no usable Metal device; a CUDA host is expected to have one.
+/// Whether GPU tests should run here.
 pub fn gpu_available() -> bool {
+    // Hosted macOS CI runners have no usable Metal device.
     let backend = cfg!(target_os = "macos") || cfg!(feature = "cuda");
     backend && !(cfg!(target_os = "macos") && std::env::var_os("CI").is_some())
 }
 
 pub use gpukit::testing::{assert_oracle, cosine_f32, max_abs_diff};
 
-/// Assert the CPU oracle is finite and the GPU result matches it for one shape.
+/// Tests one shape: a finite oracle, and GPU matching it.
 #[macro_export]
 macro_rules! gemm_case {
     (

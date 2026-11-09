@@ -1,11 +1,10 @@
-//! Weight-payload byte layout: how many bytes one quantized row or matrix
-//! occupies, for every storage format the decode side understands.
+//! Bytes per quantized row and matrix, for each format.
 
-/// Affine int4 group size (legacy `q4_block`).
+/// Weights per affine int4 or int6 group.
 pub const GROUP_SIZE: usize = 32;
-/// NVFP4 micro-block size (MLX / NVIDIA nvfp4).
+/// Weights per NVFP4 block scale.
 pub const NVFP4_GROUP_SIZE: usize = 16;
-/// Per-tensor FP32 global scale prefix on `nvfp4_block` payloads (1.0 for 2-tier MLX quant).
+/// An f32 global scale prefixes NVFP4 payloads.
 pub const NVFP4_HEADER_BYTES: usize = 4;
 
 /// Bytes for one Q4 block covering `GROUP_SIZE` weights along K.
@@ -32,12 +31,12 @@ pub fn q6_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
     out_dim * q6_row_bytes(in_dim)
 }
 
-/// Packed E2M1 nibbles per row (2 codes per byte, low nibble first).
+/// E2M1 code bytes per row, low nibble first.
 pub fn nvfp4_data_row_bytes(in_dim: usize) -> usize {
     in_dim.div_ceil(2)
 }
 
-/// FP8 E4M3 block scales per row (one byte per 16 weights along K).
+/// E4M3 block scale bytes per row.
 pub fn nvfp4_scales_row_bytes(in_dim: usize) -> usize {
     in_dim.div_ceil(NVFP4_GROUP_SIZE)
 }

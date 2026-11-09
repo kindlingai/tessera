@@ -17,7 +17,7 @@ ops::op_kernel! {
     ],
 }
 
-/// Matches the engine's gelu_tanh in include/activations.metal.
+/// sqrt(2/pi), the tanh-approximation GELU coefficient.
 const GELU_TANH_COEF: f32 = 0.797_884_6;
 
 #[derive(Debug, Clone)]

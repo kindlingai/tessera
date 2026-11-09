@@ -1,11 +1,4 @@
-//! End-to-end CUDA check: compile a trivial kernel at runtime with NVRTC
-//! through gpukit, launch it, and read the result back -- the path every
-//! dgops/dgemm kernel takes on a CUDA host.
-//!
-//! Skips (rather than fails) when no device or NVRTC is found, so the default
-//! macOS test run is unaffected. Run it on a CUDA host with:
-//!
-//!     cargo test -p gpukit --features cuda --test cuda_smoke_test -- --nocapture
+//! NVRTC compile, launch and readback; skips without a device.
 
 #![cfg(feature = "cuda")]
 

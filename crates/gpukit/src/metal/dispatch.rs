@@ -7,8 +7,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLSize,
 };
 
-/// Bind `value`'s bytes as kernel argument `index`. `T` must be plain
-/// `#[repr(C)]` data with no padding the kernel would misread.
+/// Bind `value`'s bytes as an argument; `T` must be `#[repr(C)]`.
 pub fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &T,
@@ -38,8 +37,7 @@ pub fn div_up(value: usize, group: usize) -> usize {
     value.div_ceil(group)
 }
 
-/// 1D dispatch chunked to Metal's 65535-threadgroup grid limit; `encode`
-/// receives each chunk's `(base, count)` to bind as kernel arguments.
+/// 1D dispatch split at 65535 threadgroups; `encode` gets (base, count).
 pub fn dispatch_1d_ranged(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -137,7 +135,7 @@ pub fn dispatch_1d(
     Ok(())
 }
 
-/// 2D grid with fixed threadgroup width (e.g. one threadgroup per `(x, y)` pair).
+/// One threadgroup of `tg_width` threads per (x, y).
 pub fn dispatch_grid(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,

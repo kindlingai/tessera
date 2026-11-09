@@ -1,7 +1,4 @@
-//! SwiGLU gate/up activation: \`out = gelu_tanh(gate) * up\` elementwise.
-//!
-//! This is the dense-MLP activation of the diffusion decoder layer (the engine
-//! runs \`gelu\` then \`swiglu_mul\`; one fused body computes the same function).
+//! SwiGLU activation: `out = gelu_tanh(gate) * up`, elementwise.
 
 ops::op_kernel! {
     name = "swiglu_gelu",
@@ -22,7 +19,7 @@ ops::op_kernel! {
     ],
 }
 
-/// Matches the engine's gelu_tanh coefficient (include/activations.metal).
+/// sqrt(2/pi), the tanh-approximation GELU coefficient.
 const GELU_TANH_COEF: f32 = 0.797_884_6;
 
 #[derive(Debug, Clone)]
@@ -44,7 +41,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// The real MLP intermediate width (2112), well past one thread block.
+/// Real MLP width (2112), past one thread block.
 pub fn mlp_shape_fixture() -> Fixture {
     let len = 4 * 2112;
     Fixture {

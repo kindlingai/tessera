@@ -19,10 +19,7 @@ fn test_config() -> CacheConfig {
     }
 }
 
-/// Hammer the process-global pipeline archive from many threads at once.
-/// Same entry across threads exercises the dedup fast path; different entries
-/// race concurrent `addComputePipelineFunctions`. Unsynchronized, this races
-/// the non-thread-safe `MTLBinaryArchive` and SIGSEGVs.
+/// An unlocked `MTLBinaryArchive` crashes under concurrent compiles.
 #[test]
 fn compile_race_free() {
     if Context::new(test_config()).is_err() {

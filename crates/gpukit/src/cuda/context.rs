@@ -19,10 +19,7 @@ pub struct ContextConfig {
     pub device_ordinal: usize,
 }
 
-/// A CUDA context plus a content-addressed cache of loaded modules.
-///
-/// Cheap to clone (an Arc); every operation makes the context current on the
-/// calling thread first, so tests may dispatch from parallel threads.
+/// A CUDA context plus a cache of loaded modules.
 #[derive(Clone)]
 pub struct Context(Arc<Inner>);
 
@@ -35,16 +32,13 @@ struct Inner {
     modules: Mutex<HashMap<u64, Arc<Module>>>,
 }
 
-// A CUcontext is a driver-owned opaque handle. The CUDA driver API is
-// thread-safe, every operation makes the context current on the calling
-// thread first, and the module cache is behind a Mutex -- so sharing one
-// Context across threads is sound.
+// The driver API is thread-safe; calls set the context first.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Unload modules before destroying the context they were loaded into.
+        // Modules must unload before their context goes.
         if let Ok(mut modules) = self.modules.lock() {
             modules.clear();
         }
@@ -63,7 +57,7 @@ fn device_attr(driver: &Driver, device: CUdevice, attr: c_int) -> Result<i32, Er
     Ok(value)
 }
 
-/// Stable (no-random-seed) hash of a module image, used as its cache key.
+/// FNV-1a: unlike `DefaultHasher`, stable across runs.
 fn image_hash(image: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in image {
@@ -74,8 +68,7 @@ fn image_hash(image: &[u8]) -> u64 {
 }
 
 impl Context {
-    /// Open (and initialize) the CUDA driver and a context on the configured
-    /// device ordinal.
+    /// Initialize the driver and open a context on one device.
     pub fn new(config: ContextConfig) -> Result<Self, Error> {
         let driver = driver::driver()?;
         driver.check(unsafe { (driver.cu_init)(0) }, "cuInit")?;
@@ -159,9 +152,7 @@ impl Context {
         )
     }
 
-    /// Load a cubin/PTX image, reusing an already-loaded module for identical
-    /// bytes. The image must be a valid cuModuleLoadData argument (ELF cubin or
-    /// NUL-terminated PTX).
+    /// Load an ELF cubin or NUL-terminated PTX, reusing identical images.
     pub fn load_module(&self, image: &[u8]) -> Result<Arc<Module>, Error> {
         let key = image_hash(image);
         if let Some(existing) = self.0.modules.lock().unwrap().get(&key) {
@@ -185,26 +176,14 @@ impl Context {
         Ok(module)
     }
 
-    /// Compile CUDA C++ at runtime (NVRTC) and resolve `entry`.
-
-    ///
-
-    /// The PTX goes through [`load_module`], so a source compiled twice in one
-
-    /// context is loaded once. The architecture comes from this context's
-
-    /// device, so an artifact is never tied to the build machine.
-
+    /// Compile with NVRTC for this device and resolve `entry`.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<Kernel, Error> {
         let (major, minor) = self.compute_capability();
-
         let ptx = super::nvrtc::compile_to_ptx(source, major, minor)?;
-
         self.load_module(&ptx)?.function(entry)
     }
 
-    /// Enqueue a kernel launch; returns once the launch is enqueued, not
-    /// completed. Call synchronize (or copy to host) to wait.
+    /// Enqueue a kernel launch without waiting for it to finish.
     pub fn launch(
         &self,
         kernel: &Kernel,
@@ -236,8 +215,7 @@ impl Context {
     }
 }
 
-/// A loaded CUDA module. Unloaded when the last Kernel referencing it drops
-/// (or when its Context drops).
+/// A loaded CUDA module, unloaded when its last kernel drops.
 pub struct Module {
     driver: &'static Driver,
     raw: CUmodule,
@@ -256,8 +234,7 @@ impl Module {
                 "cuModuleGetFunction",
             )
             .map_err(|e| match e {
-                // Name the symbol: a missing entry otherwise reads as a bare
-                // driver error with no hint which kernel failed to resolve.
+                // The bare driver error does not name the entry.
                 Error::Cuda(msg) => Error::Cuda(format!("{msg} for entry {name:?}")),
                 other => other,
             })?;
@@ -269,9 +246,7 @@ impl Module {
     }
 }
 
-// Same reasoning as Inner: a CUmodule is a driver-owned handle and the CUDA
-// driver API is thread-safe, so a loaded module may be shared and used from
-// any thread (each launch makes its context current first).
+// Thread-safe for the same reason as `Inner`.
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
@@ -283,7 +258,7 @@ impl Drop for Module {
     }
 }
 
-/// A resolved kernel entry point. Cheap to clone; keeps its module alive.
+/// A resolved kernel entry point that keeps its module alive.
 #[derive(Clone)]
 pub struct Kernel {
     module: Arc<Module>,
@@ -291,9 +266,7 @@ pub struct Kernel {
     name: String,
 }
 
-// The handle is a driver-owned opaque pointer, valid for as long as the module
-// it came from lives -- which the Arc<Module> field guarantees. Launches are
-// safe from any thread (each makes its context current first).
+// Thread-safe like `Inner`, and the Arc keeps the module alive.
 unsafe impl Send for Kernel {}
 unsafe impl Sync for Kernel {}
 
@@ -302,8 +275,7 @@ impl Kernel {
         &self.name
     }
 
-    /// Raise the dynamic shared-memory limit for this kernel (needed above
-    /// 48 KiB). Returns the driver error when the limit is unsupported.
+    /// Raise the dynamic shared-memory limit, needed above 48 KiB.
     pub fn set_max_dynamic_shared(&self, bytes: i32) -> Result<(), Error> {
         const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
         self.module.driver.check(

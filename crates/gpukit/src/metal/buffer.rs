@@ -29,7 +29,7 @@ impl BufferPool {
         } else {
             device.newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)?
         };
-        // Fresh and pooled buffers may hold stale bytes; zero so partial writes cannot leak.
+        // Zero so a partial write never exposes stale bytes.
         let len = buf.length();
         unsafe {
             std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, len);
@@ -37,7 +37,7 @@ impl BufferPool {
         Some(buf)
     }
 
-    /// Drop all pooled buffers (e.g. at generate start for deterministic reuse).
+    /// Drop all pooled buffers.
     pub fn clear(&mut self) {
         self.free.clear();
     }
@@ -46,8 +46,7 @@ impl BufferPool {
         self.free.push((capacity, buffer));
     }
 
-    /// Drop pooled buffers so unified memory can be reclaimed (buffers are not returned to the OS
-    /// until the `Retained` handles are released).
+    /// Keep at most `max_buffers` pooled, freeing the rest.
     pub fn trim(&mut self, max_buffers: usize) {
         if self.free.len() > max_buffers {
             self.free.truncate(max_buffers);

@@ -1,29 +1,25 @@
 //! The GEMM problem and the buffers it runs on.
 
-/// C = alpha * op(A) @ op(B) + beta * C, row-major with explicit leading
-/// dimensions.
-///
-/// A is (m,k) when trans_a is false, else (k,m); B is (k,n) when trans_b is
-/// false, else (n,k). Every leading dimension must be at least the width of a
-/// stored row. One kernel body covers every transpose combination, so a
-/// forward linear (W is (n,k)) and the backward forms (dW = dY^T @ X,
-/// dX = dY @ W^T) are the same code with different flags.
+/// A row-major GEMM shape with explicit leading dimensions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Problem {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    /// Each leading dimension is at least its stored row width.
     pub lda: usize,
     pub ldb: usize,
     pub ldc: usize,
     pub alpha: f32,
     pub beta: f32,
+    /// A is (k,m) when set, else (m,k).
     pub trans_a: bool,
+    /// B is (n,k) when set, else (k,n).
     pub trans_b: bool,
 }
 
 impl Problem {
-    /// C = A @ B^T with A (m,k) and B (n,k): the PyTorch linear weight layout.
+    /// C = A @ B^T, with B in PyTorch linear layout (n,k).
     pub fn linear(m: usize, n: usize, k: usize) -> Self {
         Self {
             m,
@@ -84,8 +80,7 @@ impl Problem {
     }
 }
 
-/// Kernel argument block; its layout must match the Metal struct and the CUDA
-/// struct in gemm.metal / gemm.cu.
+/// Kernel arguments, laid out as in gemm.metal and gemm.cu.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AbiParams {
@@ -118,7 +113,7 @@ impl From<Problem> for AbiParams {
     }
 }
 
-/// One GEMM call: the operand buffers plus the problem describing them.
+/// One GEMM call: operand buffers and their problem.
 #[derive(Debug, Clone)]
 pub struct Call {
     pub a: Vec<f32>,
@@ -128,8 +123,7 @@ pub struct Call {
 }
 
 impl Call {
-    /// Build a call, sizing nothing: the buffers must already match the
-    /// problem's lengths (see Problem::a_len / b_len / c_len).
+    /// Buffers must already match `Problem::a_len`, `b_len` and `c_len`.
     pub fn new(a: Vec<f32>, b: Vec<f32>, c: Vec<f32>, problem: Problem) -> Self {
         Self { a, b, c, problem }
     }

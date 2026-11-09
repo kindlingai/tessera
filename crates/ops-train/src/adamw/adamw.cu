@@ -1,5 +1,4 @@
-// AdamW update, [p_new, m_new, v_new]. Mirrors adamw.metal.
-// tanhf/expf/sqrtf/powf/fmaxf are device intrinsics: NVRTC has no <cmath>.
+// Mirrors adamw.metal. NVRTC has no <cmath>, so use intrinsics.
 
 struct AdamwParams {
     unsigned step;

@@ -86,7 +86,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// Non-zero moment estimates and a late step, to exercise bias correction.
+/// Non-zero moments and a late step test bias correction.
 pub fn bias_correction_fixture() -> Fixture {
     let len = 1024;
     Fixture {

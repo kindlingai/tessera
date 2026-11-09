@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Must stay layout-identical to GqaRopeParams in mod.rs and .cu.
+/// Must match GqaRopeParams in mod.rs and .cu.
 struct GqaRopeParams {
     uint seq_len;
     uint total_kv;

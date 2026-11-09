@@ -10,9 +10,8 @@ use objc2_metal::{
 };
 use std::sync::Arc;
 
-/// Stable (no-random-seed) hash of a shader source for cache-label derivation.
+/// FNV-1a of a shader source: unlike `DefaultHasher`, stable across runs.
 pub fn source_hash(source: &str) -> u64 {
-    // FNV-1a: deterministic across runs (std DefaultHasher is randomized).
     let mut h: u64 = 0xcbf29ce484222325;
     for b in source.as_bytes() {
         h ^= *b as u64;
@@ -21,13 +20,7 @@ pub fn source_hash(source: &str) -> u64 {
     h
 }
 
-/// Function-constant assignments for one pipeline specialization.
-///
-/// [`Context::compile_specialized`] folds every value here, plus the source
-/// hash, into the cache label — so two specializations can only share a
-/// pipeline when their full input set is identical. An axis that bypasses
-/// this struct (a source `#define`, a differing header table) must differ in
-/// source text, which the hash covers.
+/// Function-constant values; every one goes into the cache label.
 #[derive(Clone, Default)]
 pub struct FcValues {
     bools: Vec<(u32, bool)>,
@@ -113,7 +106,7 @@ impl FcValues {
     }
 }
 
-/// A Metal device + command queue plus the compile/cache configuration.
+/// A Metal device, command queue and pipeline cache.
 pub struct Context {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -122,10 +115,7 @@ pub struct Context {
 }
 
 impl Context {
-    /// Open the system default device. Shared headers come from the folders
-    /// registered with [`crate::register_includes!`]. The first context in
-    /// the process fixes the pipeline cache's settings; later contexts share
-    /// that cache and their `cache` config is ignored.
+    /// Open the default device; the first context fixes cache settings.
     pub fn new(cache: CacheConfig) -> Result<Self, Error> {
         let includes = crate::includes::include_table()?;
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
@@ -152,8 +142,7 @@ impl Context {
             .map_err(compile_error)
     }
 
-    /// Compile one unspecialized kernel. Cached by entry name alone, so an
-    /// entry name must map to one source body process-wide.
+    /// Compile one kernel, cached by entry name across the process.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
         self.compile_from_library(&library, entry)
@@ -186,9 +175,7 @@ impl Context {
             .collect()
     }
 
-    /// Compile a kernel specialized by function constants. The cache label is
-    /// `label_prefix` + every constant value + the source hash (see
-    /// [`FcValues`]); `label_prefix` is for human readability, not uniqueness.
+    /// Compile a kernel specialized by function constants.
     pub fn compile_specialized(
         &self,
         source: &str,
@@ -203,6 +190,7 @@ impl Context {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(compile_error)?;
+        // The prefix is for people; values and hash give uniqueness.
         let label = format!(
             "{label_prefix}{}_s{:x}",
             values.label_suffix(),

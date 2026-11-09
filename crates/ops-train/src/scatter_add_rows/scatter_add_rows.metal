@@ -1,8 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// One threadgroup per source row; every element is accumulated with a device
-/// atomic add, so repeated indices accumulate rather than overwrite.
+/// Atomic adds, so repeated indices accumulate rather than overwrite.
 kernel void scatter_add_rows(
     device float *dst [[buffer(0)]],
     device const uint *indices [[buffer(1)]],

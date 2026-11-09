@@ -1,5 +1,4 @@
-//! Tier-1 shapes. Every case is sized from its transpose flags and leading
-//! dimensions, so the buffers a Call carries are exactly what the kernel reads.
+//! Test shapes, each sized exactly to what the kernel reads.
 
 use crate::problem::{Call, Problem};
 
@@ -41,7 +40,7 @@ pub fn linear() -> Call {
     build(8, 16, 32, false, true, 0.0)
 }
 
-/// Backward: A is k x m (trans_a), B is k x n.
+/// Backward shape: A is (k,m), B is (k,n).
 pub fn backward_a() -> Call {
     build(6, 5, 7, true, false, 0.0)
 }
@@ -51,7 +50,7 @@ pub fn both_trans() -> Call {
     build(9, 7, 11, true, true, 0.5)
 }
 
-/// Tile-boundary case: m, n and k all cross the 64/16 tiles with a tail.
+/// m, n and k each end in a partial tile.
 pub fn tile() -> Call {
     build(
         crate::BM + 13,

@@ -1,9 +1,4 @@
-//! Grouped-query causal attention over a paged K/V region (f32).
-//!
-//! The KV region holds, per position \`t\` and KV head \`h\`, a head_dim K vector
-//! followed by a head_dim V vector: \`kv[t * n_kv_heads * head_dim * 2 + ...]\`.
-//! Query head \`qh\` reads KV head \`qh / n_groups\`. The mask is causal with an
-//! optional sliding window; the online softmax is computed in one pass.
+//! Grouped-query causal attention with an optional sliding window.
 
 ops::op_kernel! {
     name = "gqa_attention",
@@ -27,7 +22,7 @@ ops::op_kernel! {
     ],
 }
 
-/// Must stay layout-identical to GqaAttentionParams in .metal / .cu.
+/// Must match GqaAttentionParams in the .metal and .cu files.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GqaAttentionParams {
@@ -97,7 +92,7 @@ fn fill(len: usize, seed: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Whether key \`ki\` is visible to query \`qi\` under the causal+window mask.
+/// Whether key `ki` is visible to query `qi`.
 fn visible(p: &Fixture, qi: usize, ki: usize) -> bool {
     if ki >= p.kv_cache_len + qi + 1 {
         return false;
@@ -124,7 +119,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// Sliding window 4 over 16 positions: only the last few keys stay visible.
+/// Sliding window 4 over 16 positions.
 pub fn sliding_window_fixture() -> Fixture {
     let (seq_len, n_heads, n_kv_heads, head_dim) = (16usize, 8usize, 2usize, 32usize);
     let total_kv = seq_len;
@@ -141,7 +136,7 @@ pub fn sliding_window_fixture() -> Fixture {
     }
 }
 
-/// The full-attention layer geometry: 16 heads, 2 KV heads, head_dim 512.
+/// Full-attention geometry: 16 heads, 2 KV heads, head_dim 512.
 pub fn full_gqa_fixture() -> Fixture {
     let (seq_len, n_heads, n_kv_heads, head_dim) = (5usize, 16usize, 2usize, 512usize);
     let total_kv = seq_len;
@@ -176,7 +171,7 @@ pub fn kv_prefix_fixture() -> Fixture {
     }
 }
 
-/// Online-softmax GQA attention — the CPU oracle for both GPU bodies.
+/// One-pass online-softmax GQA attention.
 pub fn cpu(fix: &Fixture) -> Vec<f32> {
     let hd = fix.head_dim;
     let nkv = fix.n_kv_heads;

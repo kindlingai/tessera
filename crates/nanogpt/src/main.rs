@@ -1,13 +1,4 @@
-//! Tiny character-level GPT running on the portable Metal/CUDA ops in dgops.
-//!
-//!   nanogpt --check                  forward parity: GPU composition vs the
-//!                                    independent CPU reference
-//!   nanogpt --train --steps 2000     train on the corpus, print loss
-//!   nanogpt --sample --prompt "ROMEO: " --tokens 400
-//!
-//! --data PATH replaces the embedded tiny-shakespeare slice; --seed makes a
-//! run reproducible. The backend is whichever dgops found (Metal on macOS,
-//! CUDA elsewhere when built with --features cuda).
+//! Tiny character-level GPT trained on the portable GPU ops.
 
 mod backward;
 mod data;

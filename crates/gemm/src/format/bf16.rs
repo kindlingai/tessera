@@ -1,6 +1,6 @@
-//! bf16 bit-level conversion, the shared decode primitive.
+//! bf16 bit conversions.
 
-/// Decode bf16 bits to f32 (matches `src/shaders/cpu/mod.rs::bf16_to_f32`).
+/// Decode bf16 bits to f32.
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }

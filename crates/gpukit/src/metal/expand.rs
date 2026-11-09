@@ -1,27 +1,13 @@
-//! Runtime `#include "x.metal"` expansion for shader sources.
-//!
-//! The Metal runtime compiler takes one source string, so shared headers are
-//! spliced in before compilation — string work measured in microseconds
-//! against a millisecond Metal compile. Emits `#line` directives so compile
-//! errors map back to the original files (the entry file is labeled
-//! `kernel.metal`; its line numbers match the original source).
-//!
-//! Only quoted local includes (`#include "name.metal"`) are expanded; system
-//! includes (`#include <metal_stdlib>`) pass through to the Metal compiler
-//! untouched.
+//! Splices `#include "x.metal"` headers in; Metal compiles one string.
 
-/// `#include "name.metal"` → `Some(name)`; anything else (system includes,
-/// code) → `None`.
+/// `#include "name.metal"` gives `Some(name)`; system includes pass.
 fn parse_local_include(line: &str) -> Option<&str> {
     let rest = line.trim().strip_prefix("#include \"")?;
     let name = &rest[..rest.find('"')?];
     name.ends_with(".metal").then_some(name)
 }
 
-/// Recursively expand quoted includes against the caller's header table.
-///
-/// Panics on an include name absent from `includes` — a missing header is a
-/// build defect, not a runtime condition.
+/// Expand quoted includes, with `#line` so errors name files.
 pub fn expand(source: &str, includes: &[(&str, &str)]) -> String {
     expand_labeled("kernel.metal", source, includes)
 }
@@ -35,6 +21,7 @@ fn expand_labeled(label: &str, source: &str, includes: &[(&str, &str)]) -> Strin
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(_, s)| *s)
+                // A missing header is a build defect, so panic.
                 .unwrap_or_else(|| {
                     panic!("expand: unknown include {name:?} (missing from the include table)")
                 });

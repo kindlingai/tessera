@@ -51,7 +51,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// Repeated and out-of-order indices over a hidden wider than one block.
+/// Repeated, unordered indices over a hidden wider than one block.
 pub fn repeated_fixture() -> Fixture {
     let dst_rows = 8;
     let hidden = 512;

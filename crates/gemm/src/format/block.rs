@@ -1,5 +1,4 @@
-//! Affine int4 / int6 / int8 decode and the CPU GEMM oracles that read a
-//! quantized row by index.
+//! Affine int4, int6 and int8 decode, with CPU GEMM oracles.
 
 use super::bf16::bf16_to_f32;
 use super::layout::{
@@ -58,7 +57,7 @@ pub fn q4_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
     delta * q + min
 }
 
-/// CPU Q4 GEMM matching `gemm_linear_f32` (deterministic parity path).
+/// CPU Q4 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T`.
 pub fn q4_gemm_cpu(a: &[f32], m: usize, k: usize, w_q4: &[u8], n: usize, out: &mut [f32]) {
     assert_eq!(a.len(), m * k);
     assert_eq!(out.len(), m * n);
@@ -105,7 +104,7 @@ pub fn q8_weight_at(src: &[u8], row: usize, col: usize, in_dim: usize) -> f32 {
     q * scale
 }
 
-/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T` (matches `gemm_q8`).
+/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T`.
 pub fn q8_gemm_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
     assert_eq!(a.len(), m * k);
     assert_eq!(out.len(), m * n);
@@ -121,7 +120,7 @@ pub fn q8_gemm_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &m
     }
 }
 
-/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[K,N]` with K-indexed rows (matches `gemm_q8_rowk`).
+/// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[K,N]`, rows indexed by K.
 pub fn q8_gemm_rowk_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
     assert_eq!(a.len(), m * k);
     assert_eq!(out.len(), m * n);
@@ -137,8 +136,7 @@ pub fn q8_gemm_rowk_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, ou
     }
 }
 
-/// Dequantize one Q6 value (CPU mirror of the kernel decode; kernel computes
-/// half-precision s*q+mn, this returns the f32 pre-rounding value for tests).
+/// Dequantize one Q6 value in f32, before any half rounding.
 pub fn q6_weight_at(row_base: &[u8], col: usize) -> f32 {
     const BLOCK: usize = 4 + GROUP_SIZE * 6 / 8;
     let g = col / GROUP_SIZE;
@@ -154,7 +152,7 @@ pub fn q6_weight_at(row_base: &[u8], col: usize) -> f32 {
     scale * q as f32 + mn
 }
 
-/// CPU q6 GEMM (engine fallback): y[m,n] = a[m,k] @ Wq6[n,k]^T.
+/// CPU Q6 GEMM: `y[M,N] = x[M,K] @ W[N,K]^T`.
 pub fn q6_gemm_cpu(a: &[f32], m: usize, k: usize, w_q6: &[u8], n: usize, out: &mut [f32]) {
     let row_bytes = q6_row_bytes(k);
     let mut wrow = vec![0.0f32; k];

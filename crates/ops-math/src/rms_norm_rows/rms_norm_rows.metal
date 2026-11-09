@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Per-row Gemma RMSNorm: one thread per row, f32 I/O, optional affine scale.
+/// Per-row Gemma RMSNorm with an optional affine scale.
 kernel void rms_norm_rows(
     device const float *x [[buffer(0)]],
     device const float *weight [[buffer(1)]],

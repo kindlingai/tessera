@@ -1,5 +1,4 @@
-//! The CPU oracle: plain loops over flat arrays, no shared helper with the
-//! GPU path.
+//! The CPU oracle, sharing no code with the GPU path.
 
 use crate::problem::Call;
 

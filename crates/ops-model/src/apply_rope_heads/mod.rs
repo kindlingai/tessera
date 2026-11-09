@@ -1,9 +1,4 @@
-//! Split-half / proportional RoPE on \`[seq, heads, head_dim]\` (f32, in place).
-//!
-//! One thread per (head, position). The rotation pairs are \`(d, d + rot/2)\` for
-//! sliding layers (\`rotary_dim == head_dim\`) and \`(d, head_dim/2 + d)\` for the
-//! full-attention layers' proportional partial RoPE (\`rotary_dim < head_dim\`).
-//! \`elem_offset\` rotates a K slice inside a larger Q+K buffer.
+//! Split-half or proportional RoPE on `[seq, heads, head_dim]`, in place.
 
 ops::op_kernel! {
     name = "apply_rope_heads",
@@ -26,8 +21,7 @@ ops::op_kernel! {
     ],
 }
 
-/// Must stay layout-identical to GqaRopeParams in apply_rope_heads.metal / .cu
-/// (and to the engine's GqaParams, which carries the same 13 fields).
+/// Must match GqaRopeParams in apply_rope_heads.metal and .cu.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GqaRopeParams {
@@ -87,8 +81,7 @@ fn fill_tensor(len: usize, seed: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Interleaved [cos, sin] pairs, one per frequency — the engine's
-/// \`cpu::compute_rope_freqs\`.
+/// Interleaved [cos, sin] pairs, one per frequency.
 pub fn rope_freqs(seq_len: usize, rotary_dim: usize, full_head_dim: usize, theta: f32) -> Vec<f32> {
     let mut freqs = vec![0.0f32; seq_len * rotary_dim];
     let half = rotary_dim / 2;
@@ -147,7 +140,7 @@ pub fn full_partial_fixture() -> Fixture {
     }
 }
 
-/// RoPE only on the K slice inside a larger Q+K buffer.
+/// `elem_offset` rotates only the K slice of a Q+K buffer.
 pub fn k_offset_fixture() -> Fixture {
     let (seq_len, n_q_heads, n_kv_heads, head_dim) = (32usize, 16usize, 8usize, 256usize);
     let q_len = seq_len * n_q_heads * head_dim;
@@ -163,7 +156,7 @@ pub fn k_offset_fixture() -> Fixture {
     }
 }
 
-/// Rotate one head in place (the CPU oracle and the per-thread GPU body).
+/// Rotate one head in place.
 pub fn apply_rope(vec: &mut [f32], freqs: &[f32], rotary_dim: usize) {
     let head_dim = vec.len();
     let half = rotary_dim / 2;

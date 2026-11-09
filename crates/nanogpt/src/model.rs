@@ -1,6 +1,4 @@
-//! A tiny GPT: config, deterministic weight init, and a forward pass composed
-//! entirely from dgops kernels (gather_rows, rms_norm, gemm, softmax, gelu,
-//! vec_add). The cache it returns is what the backward pass needs.
+//! Tiny GPT config, weight init and GPU forward pass.
 
 use crate::tensor as t;
 use ops::Error;
@@ -17,7 +15,7 @@ pub struct GptConfig {
 }
 
 impl GptConfig {
-    /// nanoGPT-shaped but small enough to train on a laptop in minutes.
+    /// nanoGPT-shaped, small enough to train on a laptop.
     pub fn tiny(vocab: usize) -> Self {
         Self {
             vocab,
@@ -37,7 +35,7 @@ impl GptConfig {
     }
 }
 
-/// xorshift64*, so every run with the same seed builds the same weights.
+/// Seeded xorshift, so a seed always gives the same weights.
 pub struct Rng(u64);
 
 impl Rng {
@@ -136,13 +134,12 @@ pub struct Cache {
     pub seq: usize,
 }
 
-/// One forward pass over batch sequences of seq tokens (seq <= block; shorter
-/// contexts are what autoregressive sampling feeds). Returns logits
-/// (batch*seq, vocab) plus every intermediate the backward pass needs.
+/// Forward pass, keeping every intermediate the backward pass needs.
 pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Result<Cache, Error> {
     let c = cfg.n_embd;
     let heads = cfg.n_head;
     let hd = cfg.head_dim();
+    // Sampling feeds contexts shorter than block.
     assert!(seq > 0 && seq <= cfg.block, "seq must be in 1..=block");
     assert_eq!(
         tokens.len() % seq,

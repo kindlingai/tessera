@@ -8,12 +8,10 @@ pub fn div_up(value: usize, group: usize) -> usize {
     value.div_ceil(group)
 }
 
-/// Threads per block for the 1D helpers (matches the Metal backend's 256).
+/// Threads per block for the 1D helpers, as on Metal.
 pub const THREADS_PER_BLOCK: u32 = 256;
 
-/// Typed kernel arguments. Values are stored in aligned slots and pointed at
-/// only once the argument list is complete, so a cuLaunchKernel always sees
-/// correctly aligned storage.
+/// Typed kernel arguments in aligned slots.
 #[derive(Default)]
 pub struct KernelArgs {
     args: Vec<Arg>,
@@ -78,8 +76,7 @@ impl KernelArgs {
         self
     }
 
-    /// Bind a small POD value of arbitrary layout. Storage is 8-byte aligned;
-    /// argument types needing stricter alignment are not supported.
+    /// Bind a small value needing at most 8-byte alignment.
     pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
         let mut words = vec![0u64; div_up(bytes.len(), 8)].into_boxed_slice();
         unsafe {
@@ -93,6 +90,7 @@ impl KernelArgs {
         self
     }
 
+    // Call only on a complete list, so slots stay put.
     pub(crate) fn pointers(&mut self) -> Vec<*mut std::ffi::c_void> {
         self.args.iter_mut().map(Arg::as_mut_ptr).collect()
     }
@@ -110,7 +108,7 @@ pub fn launch_1d(
     ctx.launch(kernel, (grid, 1, 1), (block, 1, 1), 0, args)
 }
 
-/// 1D grid over [base, base+count) chunked to the CUDA grid-x limit.
+/// 1D launches over `count`, split at the grid-x limit.
 pub fn launch_1d_ranged(
     ctx: &Context,
     kernel: &Kernel,
@@ -130,10 +128,7 @@ pub fn launch_1d_ranged(
     Ok(())
 }
 
-/// One block per row, block_width threads per block.
-///
-/// Rows go on gridDim.x, not y: CUDA caps gridDim.y at 65535, and a row count
-/// is a data-dependent dimension. Kernel bodies therefore index blockIdx.x.
+/// One block per row; y would cap rows at 65535.
 pub fn launch_rows(
     ctx: &Context,
     kernel: &Kernel,
@@ -144,10 +139,9 @@ pub fn launch_rows(
     ctx.launch(kernel, (rows as u32, 1, 1), (block_width, 1, 1), 0, args)
 }
 
-/// 2D grid with a fixed block width (one block per (x, y)).
-///
-/// gridDim.y is capped at 65535 by CUDA; callers whose height is a
-/// data-dependent dimension must keep the large axis on x.
+const MAX_GRID_Y: usize = 65535;
+
+/// 2D grid of blocks; put the large axis on x.
 pub fn launch_grid(
     ctx: &Context,
     kernel: &Kernel,
@@ -157,8 +151,8 @@ pub fn launch_grid(
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
     assert!(
-        height <= 65535,
-        "launch_grid height {height} exceeds the CUDA gridDim.y limit of 65535"
+        height <= MAX_GRID_Y,
+        "launch_grid height {height} exceeds the CUDA gridDim.y limit of {MAX_GRID_Y}"
     );
     ctx.launch(
         kernel,

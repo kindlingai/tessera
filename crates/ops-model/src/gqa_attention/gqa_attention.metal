@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Must stay layout-identical to GqaAttentionParams in mod.rs and .cu.
+/// Must match GqaAttentionParams in mod.rs and .cu.
 struct GqaAttentionParams {
     uint seq_len;
     uint total_kv;
@@ -55,7 +55,7 @@ kernel void gqa_attention(
     }
 
     for (uint t = 0; t < p.total_kv; t++) {
-        // Causal: a query at position kv_cache_len + tok sees keys up to that.
+        // Causal: query kv_cache_len + tok sees keys up to itself.
         if (t > p.kv_cache_len + tok) {
             break;
         }

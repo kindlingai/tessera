@@ -1,10 +1,4 @@
-//! Per-thread memoized Metal context and pipeline cache.
-//!
-//! Context creation and MSL compilation are both expensive, and a step
-//! dispatches the same handful of kernels thousands of times, so both are
-//! cached per thread (a Metal context and its pipeline objects are not Send).
-//! Callers that pass the same [`CacheConfig`] share one context and one
-//! pipeline cache per thread.
+//! Per-thread Metal context and pipelines, since neither is Send.
 
 use super::{CacheConfig, ComputePipeline, Context};
 use std::cell::RefCell;
@@ -17,10 +11,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// This thread's Metal context, created on first use.
-///
-/// The first caller's `cache` wins for the thread; a later caller asking for a
-/// different configuration reuses the cached context.
+/// This thread's Metal context; the first caller's `cache` wins.
 pub fn cached_context(cache: CacheConfig) -> Result<Rc<Context>, crate::Error> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -32,7 +23,7 @@ pub fn cached_context(cache: CacheConfig) -> Result<Rc<Context>, crate::Error> {
     })
 }
 
-/// A compiled pipeline for (source, entry), compiled at most once per thread.
+/// The pipeline for (source, entry), compiled once per thread.
 pub fn cached_pipeline(
     ctx: &Context,
     source: &'static str,

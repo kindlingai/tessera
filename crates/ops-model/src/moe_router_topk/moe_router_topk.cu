@@ -1,5 +1,4 @@
-// MoE router: RMSNorm -> scaled linear -> top-k softmax. Mirrors
-// moe_router_topk.metal. rsqrtf/expf are device builtins: NVRTC has no <cmath>.
+// Mirrors moe_router_topk.metal. NVRTC has no <cmath>, so use intrinsics.
 
 struct MoeRouterParams {
     unsigned canvas;

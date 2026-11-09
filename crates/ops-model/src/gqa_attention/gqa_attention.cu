@@ -1,5 +1,4 @@
-// Causal (optionally windowed) GQA attention, one thread block per query head.
-// Mirrors gqa_attention.metal.
+// Mirrors gqa_attention.metal: one thread block per query head.
 
 struct GqaAttentionParams {
     unsigned seq_len;

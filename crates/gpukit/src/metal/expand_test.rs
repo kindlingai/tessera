@@ -20,7 +20,7 @@ fn emits_line_directives() {
         s.contains("#line 1 \"include/inner.metal\""),
         "nested #line missing"
     );
-    // The include sits on line 2, so the entry file resumes at line 3.
+    // The include is line 2, so line 3 resumes.
     assert!(
         s.contains("#line 3 \"kernel.metal\""),
         "resume #line missing:\n{s}"

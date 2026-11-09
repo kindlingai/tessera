@@ -1,5 +1,4 @@
-// Split-half / proportional RoPE, in place. Mirrors apply_rope_heads.metal.
-// sincosf/tanhf/expf/rsqrtf are device builtins: NVRTC has no <cmath>.
+// Mirrors apply_rope_heads.metal. NVRTC has no <cmath>, so use intrinsics.
 
 struct GqaRopeParams {
     unsigned seq_len;

@@ -1,7 +1,4 @@
-//! Runtime `MTLBinaryArchive` cache for compiled compute pipelines.
-//!
-//! Persists device-specific pipeline ISA to disk so cold starts can skip
-//! recompilation after the first run (pure runtime API; no Metal SDK required).
+//! On-disk `MTLBinaryArchive` cache, so cold starts skip recompiling.
 
 use crate::Error;
 use objc2::rc::Retained;
@@ -20,21 +17,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub struct CacheConfig {
     /// `false` keeps an in-memory archive only (nothing touches disk).
     pub enabled: bool,
-    /// Cache directory; `None` resolves `$XDG_CACHE_HOME` (else `~/.cache`,
-    /// else `/tmp`) + `<namespace>/metal-pipelines`.
+    /// `None` means the user cache directory, then `/tmp`.
     pub dir: Option<PathBuf>,
     pub namespace: &'static str,
-    /// Version key baked into the cache file name. Must change whenever any
-    /// shader source the archive may hold changes (hash the whole shader
-    /// tree), or an edited kernel is served stale from the old archive.
+    /// Change it with any shader source, or edits run stale.
     pub key: u64,
     /// Print cache load/save lines to stderr.
     pub verbose: bool,
 }
 
 impl CacheConfig {
-    /// In-memory only: nothing touches disk, so namespace/key are inert.
-    /// The portable layer uses this; the engine policy layer builds its own.
+    /// In-memory only, so namespace and key do nothing.
     pub const MEMORY: Self = Self {
         enabled: false,
         dir: None,
@@ -69,11 +62,7 @@ fn sanitize_device_name(name: &str) -> String {
 }
 
 pub struct PipelineArchiveCache {
-    /// All access to the non-thread-safe `MTLBinaryArchive` — the pipeline-lookup
-    /// read during compilation, `addComputePipelineFunctions`, and `serialize` —
-    /// goes through this Mutex, so the archive is never touched from two threads
-    /// at once. The compiled-pipeline map lives here too so a repeat request
-    /// returns a clone without re-entering the archive at all.
+    /// `MTLBinaryArchive` is not thread-safe: every use takes this lock.
     inner: Mutex<ArchiveInner>,
     cache_file: PathBuf,
     persist: bool,
@@ -82,24 +71,19 @@ pub struct PipelineArchiveCache {
 
 struct ArchiveInner {
     archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
-    /// Compiled pipelines keyed by the caller's label. The label must encode
-    /// the full specialization (see `Context::compile_specialized`), making
-    /// this an exact-match dedup, not a lossy hash.
+    /// Keyed by label, which must encode the full specialization.
     compiled: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     dirty: bool,
 }
 
-// SAFETY: the only non-`Send`/`Sync` members are Metal objects reached through
-// `inner`'s Mutex. The archive is never used unsynchronized (see the field doc),
-// and `MTLComputePipelineState` is immutable and safe to share once created.
+// SAFETY: the archive sits behind the lock; pipelines are immutable.
 unsafe impl Send for PipelineArchiveCache {}
 unsafe impl Sync for PipelineArchiveCache {}
 
 static GLOBAL_CACHE: OnceLock<Result<Arc<PipelineArchiveCache>, String>> = OnceLock::new();
 
 impl PipelineArchiveCache {
-    /// The process-global cache. The first call fixes the configuration;
-    /// later calls return the same cache and ignore `config`.
+    /// The process-global cache; the first call's `config` wins.
     pub fn shared(
         device: &ProtocolObject<dyn MTLDevice>,
         config: &CacheConfig,
@@ -195,8 +179,6 @@ impl PipelineArchiveCache {
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Fast path: already compiled this exact pipeline — hand back a clone
-        // (a cheap retain) without re-entering the archive.
         if let Some(pipeline) = inner.compiled.get(label) {
             return Ok(pipeline.clone());
         }
@@ -237,9 +219,7 @@ impl PipelineArchiveCache {
         if !std::mem::replace(&mut inner.dirty, false) {
             return;
         }
-        // Serialize to a pid-tagged temp then atomically rename, so a crash or a
-        // second process writing the same cache file can never leave a
-        // half-written (corrupt) archive that would fail to reopen.
+        // Write then rename, so readers never see half an archive.
         let tmp = self
             .cache_file
             .with_extension(format!("tmp-{}", std::process::id()));

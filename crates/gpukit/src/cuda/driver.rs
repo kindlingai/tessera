@@ -1,11 +1,4 @@
-//! Minimal CUDA driver-API bindings, resolved at runtime with dlopen.
-//!
-//! Linking libcuda at build time would require the CUDA stub library on every
-//! host -- and it does not exist on macOS at all. Resolving the ~24 entry points
-//! used here from libcuda.so.1 on first use keeps the crate buildable (and the
-//! backend type-checkable) on hosts with no CUDA installed; a dispatch on such
-//! a host fails with the name of the missing symbol instead of a link error.
-//! DGQ_CUDA_DRIVER overrides the library name.
+//! CUDA driver bindings, loaded at runtime with dlopen.
 
 use crate::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -20,11 +13,13 @@ pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
 
 pub const CUDA_SUCCESS: CUresult = 0;
-/// CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR / _MINOR.
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
 const RTLD_NOW: c_int = 2;
+/// Environment variable that overrides the driver library name.
+const DRIVER_ENV: &str = "DGQ_CUDA_DRIVER";
+const DRIVER_LIB: &str = "libcuda.so.1";
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -68,9 +63,7 @@ type CuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUre
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
-/// Resolved CUDA driver entry points. Holds only extern "C" fn pointers, so it
-/// is Sync without a wrapper; the dlopen handle is intentionally leaked (a
-/// driver library outlives the process in every sane deployment).
+/// Resolved driver entry points; the dlopen handle is never closed.
 pub struct Driver {
     pub cu_init: CuInit,
     pub cu_device_get_count: CuDeviceGetCount,
@@ -117,7 +110,7 @@ fn last_dl_error() -> String {
 
 impl Driver {
     fn open() -> Result<Self, String> {
-        let lib_name = std::env::var("DGQ_CUDA_DRIVER").unwrap_or_else(|_| "libcuda.so.1".into());
+        let lib_name = std::env::var(DRIVER_ENV).unwrap_or_else(|_| DRIVER_LIB.into());
         let c_name = CString::new(lib_name.clone()).map_err(|e| format!("bad driver name: {e}"))?;
         let lib = unsafe { dlopen(c_name.as_ptr(), RTLD_NOW) };
         if lib.is_null() {
@@ -149,7 +142,7 @@ impl Driver {
         })
     }
 
-    /// Human-readable name for a driver return code (cuGetErrorName).
+    /// The name of a driver return code.
     pub fn error_name(&self, code: CUresult) -> String {
         let mut p: *const c_char = std::ptr::null();
         unsafe { (self.cu_get_error_name)(code, &mut p) };
@@ -159,8 +152,7 @@ impl Driver {
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 
-    /// Turn a non-success driver return code into an Error::Cuda, naming the
-    /// call that failed.
+    /// Turn a failed return code into an error naming `what`.
     pub fn check(&self, code: CUresult, what: &str) -> Result<(), Error> {
         if code == CUDA_SUCCESS {
             return Ok(());

@@ -1,11 +1,4 @@
-//! NVRTC bindings, resolved at runtime with dlopen.
-//!
-//! Compiling CUDA C++ at runtime is the CUDA analogue of compiling MSL
-//! through Metal: the source is embedded in the binary, so a kernel is never
-//! tied to the build machine's architecture, and building the crate needs no
-//! toolchain. NVRTC ships with the CUDA toolkit (not the driver), so a host
-//! with only the driver reports the missing library at first dispatch.
-//! DGQ_NVRTC overrides the library name.
+//! NVRTC bindings loaded with dlopen; NVRTC ships with the toolkit.
 
 use crate::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -16,6 +9,8 @@ pub type NvrtcProgram = *mut c_void;
 
 const NVRTC_SUCCESS: NvrtcResult = 0;
 const RTLD_NOW: c_int = 2;
+/// Environment variable that overrides the NVRTC library name.
+const NVRTC_ENV: &str = "DGQ_NVRTC";
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -39,7 +34,7 @@ type NvrtcGetProgramLogSize = unsafe extern "C" fn(NvrtcProgram, *mut usize) -> 
 type NvrtcGetProgramLog = unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult;
 type NvrtcDestroyProgram = unsafe extern "C" fn(*mut NvrtcProgram) -> NvrtcResult;
 
-/// Resolved NVRTC entry points; the dlopen handle is intentionally leaked.
+/// Resolved NVRTC entry points; the dlopen handle is never closed.
 struct Nvrtc {
     create: NvrtcCreateProgram,
     compile: NvrtcCompileProgram,
@@ -72,7 +67,7 @@ fn last_dl_error() -> String {
 impl Nvrtc {
     fn open() -> Result<Self, String> {
         let mut names: Vec<String> = Vec::new();
-        if let Ok(explicit) = std::env::var("DGQ_NVRTC") {
+        if let Ok(explicit) = std::env::var(NVRTC_ENV) {
             names.push(explicit);
         }
         for name in [
@@ -113,14 +108,12 @@ fn library() -> Result<&'static Nvrtc, Error> {
     match LIB.get_or_init(Nvrtc::open) {
         Ok(lib) => Ok(lib),
         Err(msg) => Err(Error::Cuda(format!(
-            "no NVRTC ({msg}); install the CUDA toolkit or set DGQ_NVRTC"
+            "no NVRTC ({msg}); install the CUDA toolkit or set {NVRTC_ENV}"
         ))),
     }
 }
 
-/// Compile CUDA C++ `source` to PTX for compute capability (major, minor).
-///
-/// The returned image is NUL-terminated, ready for `cuModuleLoadData`.
+/// Compile `source` to NUL-terminated PTX for one compute capability.
 pub fn compile_to_ptx(source: &str, major: i32, minor: i32) -> Result<Vec<u8>, Error> {
     let lib = library()?;
     let c_src =

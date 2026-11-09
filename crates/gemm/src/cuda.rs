@@ -5,11 +5,7 @@ use crate::problem::{AbiParams, Call, Problem};
 use crate::{BM, BN, CUDA, ENTRY, THREADS};
 use gpukit::cuda::{BufferPool, DeviceBuffer, KernelArgs, div_up, launch_grid};
 
-/// Launch the GEMM into caller-owned device buffers — no host round-trip.
-///
-/// This is the entry point a multi-kernel pipeline uses: the buffers stay on
-/// the device across dispatches and only the final result is read back. The
-/// one-shot `gpu` below is the tier-1 convenience wrapper over it.
+/// Launch into caller-owned device buffers, with no host copies.
 pub fn gpu_device(
     ctx: &gpukit::cuda::Context,
     problem: &Problem,

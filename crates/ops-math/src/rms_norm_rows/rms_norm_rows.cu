@@ -1,5 +1,4 @@
-// Per-row Gemma RMSNorm: one thread block per row, f32 I/O, optional affine
-// scale. Mirrors rms_norm_rows.metal; rsqrtf/__syncthreads are device builtins.
+// Mirrors rms_norm_rows.metal, with one thread block per row.
 
 extern "C" __global__ void rms_norm_rows(
     const float *x,

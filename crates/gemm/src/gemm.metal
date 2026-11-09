@@ -14,7 +14,7 @@ struct GemmParams {
     uint trans_a, trans_b;
 };
 
-/// C = alpha * op(A) @ op(B) + beta * C, one 64x64 block tile per threadgroup.
+/// Tiled f32 GEMM, one 64x64 tile per threadgroup.
 kernel void gemm_f32(
     device const float *A [[buffer(0)]],
     device const float *B [[buffer(1)]],
@@ -85,6 +85,7 @@ kernel void gemm_f32(
                 continue;
             }
             ulong idx = (ulong)m * p.ldc + n;
+            // C may hold NaN when beta is 0: skip it.
             float prior = (p.beta == 0.0f) ? 0.0f : p.beta * C[idx];
             C[idx] = p.alpha * acc[i][j] + prior;
         }

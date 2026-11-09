@@ -4,7 +4,7 @@ use super::context::Context;
 use super::driver::CUdeviceptr;
 use crate::Error;
 
-/// A device allocation owned by the pool (or the caller) and freed on drop.
+/// A device allocation, freed on drop.
 pub struct DeviceBuffer {
     ctx: Context,
     ptr: CUdeviceptr,
@@ -12,8 +12,7 @@ pub struct DeviceBuffer {
 }
 
 impl DeviceBuffer {
-    /// Allocate a standalone device buffer (freed on drop). A pipeline that
-    /// wants many long-lived buffers uses [`BufferPool`] instead.
+    /// Allocate one device buffer outside any pool.
     pub fn alloc(ctx: &Context, size: usize) -> Result<Self, Error> {
         ctx.set_current()?;
         let mut ptr: CUdeviceptr = 0;
@@ -94,8 +93,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        // Best effort: a context already destroyed by process teardown makes
-        // the free a no-op, and there is nothing useful to do about it.
+        // At process exit the context may already be gone.
         if self.ctx.set_current().is_ok() {
             unsafe {
                 (self.ctx.driver().cu_mem_free)(self.ptr);
@@ -104,8 +102,7 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// Size-bucketed device-memory pool. Allocations are zeroed on hand-out so a
-/// partial write can never leak stale bytes into a kernel.
+/// Reusable device buffers, zeroed so stale bytes never leak.
 #[derive(Default)]
 pub struct BufferPool {
     free: Vec<DeviceBuffer>,

@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// One threadgroup per row; 256 threads reduce and then write the row.
+/// One 256-thread threadgroup reduces and writes each row.
 kernel void rms_norm_rows(
     device const float *x [[buffer(0)]],
     device const float *weight [[buffer(1)]],

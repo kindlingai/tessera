@@ -1,8 +1,4 @@
-//! CUDA backend: driver-API context, module/kernel cache, buffers, dispatch.
-//!
-//! The driver is resolved at runtime (see the driver module), so this backend
-//! compiles -- and type-checks -- on hosts without CUDA. Only a dispatch needs
-//! the real libcuda.
+//! CUDA backend; libcuda loads at runtime, so builds need nothing.
 
 mod buffer;
 mod cached;

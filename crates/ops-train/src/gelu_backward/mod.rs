@@ -19,7 +19,7 @@ ops::op_kernel! {
     ],
 }
 
-/// Matches the engine's gelu_tanh in include/activations.metal.
+/// sqrt(2/pi), the tanh-approximation GELU coefficient.
 const GELU_TANH_COEF: f32 = 0.797_884_6;
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ pub fn long_fixture() -> Fixture {
     }
 }
 
-/// d/dx gelu_tanh(x), with the tanh clamped to +-1 outside |u| > 8.
+/// d/dx gelu_tanh(x), clamping tanh to +-1 where |u| > 8.
 pub fn gelu_tanh_grad(x: f32) -> f32 {
     let x3 = x * x * x;
     let u = GELU_TANH_COEF * (x + 0.044_715 * x3);

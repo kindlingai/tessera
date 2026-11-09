@@ -1,11 +1,8 @@
-//! Character-level corpus and tokenizer.
-//!
-//! The default corpus is a 120 KB slice of tiny shakespeare
-//! (karpathy/char-rnn, public domain). Pass --data to use another text file;
-//! the vocabulary is whatever bytes it contains.
+//! Byte-level corpus and tokenizer.
 
 use std::collections::HashMap;
 
+/// Tiny shakespeare slice (karpathy/char-rnn, public domain).
 pub const DEFAULT_TEXT: &str = include_str!("../data/tiny.txt");
 
 pub struct Corpus {
@@ -50,8 +47,7 @@ impl Corpus {
             .collect()
     }
 
-    /// A deterministic training crop: batch windows of block tokens plus their
-    /// one-token-shifted targets.
+    /// Deterministic windows of block tokens, with targets shifted by one.
     pub fn batch(&self, start: usize, batch: usize, block: usize) -> (Vec<u32>, Vec<u32>) {
         let n = self.bytes.len();
         let mut x = Vec::with_capacity(batch * block);

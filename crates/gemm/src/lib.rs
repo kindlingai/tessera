@@ -1,16 +1,4 @@
-//! The GEMM family: one tiled body per backend, one CPU oracle, one parity
-//! test per shape.
-//!
-//! C = alpha * op(A) @ op(B) + beta * C. A GEMM here is the operation plus its
-//! tiling; anything that changes what the kernel computes (weight format,
-//! stacked segment tables, grouped MoE index maps, epilogue fusion) is a
-//! compile-time axis value on the same body, never a forked kernel.
-//!
-//! The f32 body is here today, together with the decode side of every weight
-//! format the engine stores (see the format module): byte layout, bit-level
-//! codecs, and the per-format CPU GEMM oracles. The fused bodies that consume
-//! that decode -- stacked and grouped structures, arena/gather epilogues --
-//! join as axis values on the same body, not as forked kernels.
+//! Tiled f32 GEMM, `C = alpha * op(A) @ op(B) + beta * C`.
 
 mod cpu;
 #[cfg(feature = "cuda")]
@@ -33,8 +21,7 @@ pub const THREADS: u32 = 256;
 
 pub const ENTRY: &str = "gemm_f32";
 
-/// The kernel's packed argument struct as bytes, for a caller that launches
-/// the body itself (a multi-kernel pipeline holding device buffers).
+/// Kernel argument bytes, for callers that launch it themselves.
 pub fn abi_params(p: &Problem) -> Vec<u8> {
     let abi = crate::problem::AbiParams::from(*p);
     let bytes = unsafe {
@@ -50,13 +37,12 @@ pub const METAL: &str = include_str!("gemm.metal");
 /// CUDA C++ source, compiled by NVRTC on first dispatch.
 pub const CUDA: &str = include_str!("gemm.cu");
 
-/// The CPU reference: the same function in plain loops. This is the oracle.
+/// The CPU reference that GPU results are checked against.
 pub fn cpu(call: &Call) -> Vec<f32> {
     cpu::cpu(call)
 }
 
-/// Run on the backend this build has: Metal on macOS, CUDA elsewhere when the
-/// cuda feature is on.
+/// Run on this build's GPU backend.
 pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
     #[cfg(target_os = "macos")]
     {

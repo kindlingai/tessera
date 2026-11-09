@@ -1,4 +1,4 @@
-//! Thin wrappers over dgops and dgemm that keep the model code readable.
+//! Thin wrappers over the GPU ops and their CPU oracles.
 
 use gemm::{Call, Problem, gpu as gemm_gpu};
 use ops::Error;
@@ -39,7 +39,7 @@ pub fn gemm(
     gemm_gpu(&call)
 }
 
-/// Y = X @ W^T with X (m,k), W (n,k) (PyTorch linear layout).
+/// Y = X @ W^T, with W in PyTorch linear layout (n,k).
 pub fn linear(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, Error> {
     gemm(x, w, vec![0.0; m * n], m, n, k, k, k, n, false, true, 0.0)
 }
@@ -167,11 +167,8 @@ pub fn adamw(
         weight_decay,
     })
 }
-// ---------------------------------------------------------------------------
-// CPU counterparts: the same ops through the shared CPU oracles (dgemm /
-// dgops). The reference forward uses these so a kernel's parity is pinned to
-// one CPU implementation; what stays independent there is the composition.
-// ---------------------------------------------------------------------------
+
+// CPU oracle versions, for the reference forward pass.
 
 /// C = alpha * op(A) @ op(B) + beta * C on the CPU oracle.
 #[allow(clippy::too_many_arguments)]
@@ -209,7 +206,7 @@ pub fn gemm_cpu(
     gemm::cpu(&call)
 }
 
-/// Y = X @ W^T with X (m,k), W (n,k) (PyTorch linear layout) on the CPU oracle.
+/// Y = X @ W^T on the CPU oracle.
 pub fn linear_cpu(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     gemm_cpu(x, w, vec![0.0; m * n], m, n, k, k, k, n, false, true, 0.0)
 }

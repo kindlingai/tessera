@@ -1,6 +1,4 @@
-//! Per-row Gemma RMSNorm over \`[seq_len, hidden]\` (f32 I/O, optional affine
-//! scale). Ported from the engine kernel of the same name so the diffusion
-//! pipeline can run on CUDA against the same CPU oracle the engine uses.
+//! Per-row Gemma RMSNorm over `[seq_len, hidden]`, optional affine scale.
 
 ops::op_kernel! {
     name = "rms_norm_rows",
@@ -48,7 +46,7 @@ pub fn tiny_fixture() -> Fixture {
     }
 }
 
-/// Rows wider than one thread block, and wider than one warp.
+/// Rows wider than one thread block and one warp.
 pub fn mlp_shape_fixture() -> Fixture {
     let (seq_len, hidden) = (3, 2112);
     let len = seq_len * hidden;
@@ -76,8 +74,7 @@ pub fn gemma_shape_fixture() -> Fixture {
     }
 }
 
-/// Per-row RMSNorm: \`out = x / sqrt(mean(x^2) + eps) * weight\`.
-/// The oracle for both GPU bodies, and the engine's \`cpu::rms_norm_rows\`.
+/// Per-row RMSNorm: `out = x / sqrt(mean(x^2) + eps) * weight`.
 pub fn cpu(fix: &Fixture) -> Vec<f32> {
     let mut out = vec![0.0f32; fix.len()];
     for s in 0..fix.seq_len {

@@ -1,5 +1,4 @@
 // Tiled f32 GEMM. Mirrors gemm.metal.
-// C = alpha * op(A) @ op(B) + beta * C
 
 #define BM 64
 #define BN 64
@@ -82,6 +81,7 @@ extern "C" __global__ void gemm_f32(
                 continue;
             }
             size_t idx = (size_t)m * p.ldc + n;
+            // C may hold NaN when beta is 0: skip it.
             float prior = (p.beta == 0.0f) ? 0.0f : p.beta * C[idx];
             C[idx] = p.alpha * acc[i][j] + prior;
         }

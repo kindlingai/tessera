@@ -1,4 +1,4 @@
-//! AdamW training loop plus a finite-difference check of the analytic grads.
+//! AdamW training loop and a finite-difference gradient check.
 
 use crate::Args;
 use crate::backward;
@@ -62,7 +62,7 @@ impl OptState {
     }
 }
 
-/// Linear warmup then cosine decay to 10% of the base rate.
+/// Linear warmup, then cosine decay to 10% of base.
 fn lr_at(base: f32, step: usize, total: usize) -> f32 {
     let warmup = 50.min(total / 10).max(1);
     if step < warmup {
@@ -102,21 +102,14 @@ pub fn train(w: &mut Weights, cfg: &GptConfig, corpus: &Corpus, args: &Args) -> 
     Ok(())
 }
 
-/// Central-difference check of the analytic gradient, as a directional
-/// derivative over whole tensors: for a unit direction d, the analytic
-/// g.d must equal (L(w + eps d) - L(w - eps d)) / 2 eps. Aggregating over the
-/// tensor keeps the signal far above f32 loss resolution, where a per-entry
-/// probe of a small gradient is pure rounding noise (and tests the gradient's
-/// direction, not just its scale).
+/// Checks analytic gradients along random whole-tensor directions.
 pub fn gradcheck(w: &mut Weights, cfg: &GptConfig, corpus: &Corpus) -> Result<(), String> {
     let (x, y) = corpus.batch(0, 1, cfg.block);
     let cache = model::forward(w, cfg, &x, cfg.block).map_err(|e| e.to_string())?;
     let (_, mut grads) = backward::backward(w, cfg, &cache, &y).map_err(|e| e.to_string())?;
 
     let mut rng = crate::model::Rng::new(99);
-    // The error-vs-eps curve separates the two failure modes: truncation grows
-    // with eps^2, f32 loss rounding shrinks as 1/eps. The minimum is the real
-    // agreement.
+    // Truncation grows as eps^2, f32 rounding shrinks as 1/eps.
     let eps_values = [1e-2f32, 3e-3, 1e-3];
     let mut worst = 0.0f32;
 
@@ -130,6 +123,7 @@ pub fn gradcheck(w: &mut Weights, cfg: &GptConfig, corpus: &Corpus) -> Result<()
             let ps = backward::param_list(w);
             ps[k].len()
         };
+        // Whole tensors keep the signal above f32 loss rounding.
         let raw: Vec<f32> = (0..n).map(|_| rng.normal()).collect();
         let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
         let dir: Vec<f32> = raw.iter().map(|v| v / norm).collect();
@@ -162,8 +156,7 @@ pub fn gradcheck(w: &mut Weights, cfg: &GptConfig, corpus: &Corpus) -> Result<()
             }
             let numeric = (lp - lm) / (2.0 * eps);
             let rel = (analytic - numeric).abs() / analytic.abs().max(numeric.abs()).max(1e-8);
-            // Gate on the largest step: it is the least noise-dominated, and
-            // truncation is negligible for a smooth loss at this scale.
+            // Gate on the largest eps: it is least noisy.
             if eps == 1e-2 {
                 worst = worst.max(rel);
             }

@@ -1,9 +1,4 @@
 //! Token-embedding gather from a bf16 or q8-row table, scaled.
-//!
-//! The table lives in the pack blob at a byte offset; each row is either raw
-//! bf16 (\`hidden\` \u00d7 2 bytes) or a q8 row (bf16 scale + int8 codes). This is
-//! the engine's first pipeline stage, ported so it can run on CUDA against the
-//! same CPU oracle.
 
 ops::op_kernel! {
     name = "embed_gather",
@@ -42,7 +37,7 @@ pub fn q8_row_bytes(hidden: usize) -> usize {
 
 #[derive(Debug, Clone)]
 pub struct Fixture {
-    /// Raw table payload as stored in the blob (bf16 or q8 rows).
+    /// Bytes holding the table at `w_off`.
     pub blob: Vec<u8>,
     pub ids: Vec<u32>,
     pub hidden: usize,
@@ -50,7 +45,7 @@ pub struct Fixture {
     pub embed_scale: f32,
     /// Table format: true = raw bf16, false = q8 row.
     pub raw: bool,
-    /// Byte offset of the table inside the blob (exercises non-zero offsets).
+    /// Byte offset of the table inside the blob.
     pub w_off: u64,
 }
 
@@ -59,8 +54,7 @@ impl Fixture {
         self.ids.len() * self.hidden
     }
 
-    /// The blob as the u32 words the generated ABI uploads. Padded to a
-    /// multiple of 4 bytes so the tail read is in bounds.
+    /// The blob as u32 words, zero-padded to a whole word.
     pub fn blob_words(&self) -> Vec<u32> {
         let mut bytes = self.blob.clone();
         while bytes.len() % 4 != 0 {
@@ -88,7 +82,7 @@ impl Fixture {
         }
     }
 
-    /// A row of the table as f32 (the raw, unscaled weight).
+    /// One table row as unscaled f32.
     pub fn table_row_f32(&self, row: usize) -> Vec<f32> {
         let off = self.w_off as usize + row * self.row_bytes();
         let src = &self.blob[off..off + self.row_bytes()];
@@ -138,7 +132,7 @@ fn q8_table(rows: &[&[f32]], hidden: usize) -> Vec<u8> {
     blob
 }
 
-/// Two 8-wide bf16 rows, gathered out of order with a non-zero table offset.
+/// Two 8-wide bf16 rows, out of order, at an offset.
 pub fn raw_tiny_fixture() -> Fixture {
     let hidden = 8;
     let r0: Vec<f32> = (0..hidden).map(|i| 0.25 + i as f32 * 0.125).collect();
@@ -158,7 +152,7 @@ pub fn raw_tiny_fixture() -> Fixture {
     }
 }
 
-/// The real model shape: vocab 262144, hidden 2816 (a 5-row slice).
+/// A 5-row slice at the real hidden width, 2816.
 pub fn raw_gemma_fixture() -> Fixture {
     let hidden = 2816;
     let rows = 5usize;
