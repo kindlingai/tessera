@@ -18,13 +18,13 @@ pub struct Config {
 
 #[derive(Weights)]
 pub struct Attn {
-    #[split(heads)]
+    #[shape(Hidden, Heads, HeadDim)]
     pub q: Linear,
-    #[split(heads)]
+    #[shape(Hidden, KvHeads, HeadDim)]
     pub kv: Linear,
     pub q_norm: Norm,
     pub k_norm: Norm,
-    #[split(rows)]
+    #[shape(Heads, HeadDim, Hidden)]
     pub o: Linear,
 }
 
@@ -41,7 +41,7 @@ pub struct Block {
 
 #[derive(Weights)]
 pub struct DGemma {
-    #[split(vocab)]
+    #[shape(Vocab, Hidden)]
     pub embed: Embed,
     pub blocks: Vec<Block>,
     pub norm: Norm,

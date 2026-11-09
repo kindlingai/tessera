@@ -29,11 +29,11 @@ pub struct Block {
 
 #[derive(Weights)]
 pub struct Flash {
-    #[split(vocab)]
+    #[shape(Vocab, Hidden)]
     pub embed: Embed,
     pub blocks: Vec<Block>,
     pub norm: Norm,
-    #[split(vocab)]
+    #[shape(Hidden, Vocab)]
     pub head: Linear,
 }
 

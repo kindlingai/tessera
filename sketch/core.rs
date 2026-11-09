@@ -14,6 +14,9 @@ pub enum DimName {
     HeadDim,
     Latent,
     Rope,
+    QLatent,
+    Ffn,
+    Conv,
     Vocab,
     Experts,
     TopK,
@@ -73,9 +76,15 @@ pub struct Precision {
 pub struct Mesh {
     pub tp: usize,
     pub ep: usize,
+    pub pp: usize,
 }
 
-/// Placement in a sharded graph. Descriptions only hint split axes.
+pub enum MeshAxis {
+    Tensor,
+    Expert,
+}
+
+/// Sharded-graph placement, from shapes and a splitter's choices.
 pub enum Placement {
     Replicated,
     Split(Axis),
@@ -582,6 +591,30 @@ pub enum ShardError {
 }
 
 /// Per-rank graphs: weights split, reduces become collectives, pools sized.
-pub fn shard(g: &Graph, d: &Deployment) -> Result<Vec<RankGraph>, ShardError> {
-    g.shard_by(d)
+pub fn shard(g: &Graph, d: &Deployment, s: &dyn Splitter) -> Result<Vec<RankGraph>, ShardError> {
+    let plan = s.split(g, &d.mesh, d.pool_bytes)?;
+    g.apply(&plan, d)
+}
+
+/// Picks a graph's splits for a mesh; models ship one.
+pub trait Splitter {
+    fn split(&self, g: &Graph, mesh: &Mesh, pool_bytes: usize) -> Result<Sharding, ShardError>;
+}
+
+/// A splitter's answer, recorded so every rank agrees on it.
+pub struct Sharding {
+    /// Per named dimension: which mesh axis, or how to cope.
+    pub dims: Vec<(DimName, AxisChoice)>,
+    /// Pipeline stages: the first layer of each.
+    pub stages: Vec<Layer>,
+    /// Single nodes placed against their dimensions' rule.
+    pub overrides: Vec<(NodeId, Placement)>,
+}
+
+pub enum AxisChoice {
+    Split(MeshAxis),
+    /// Every rank keeps the whole dimension.
+    Copy,
+    /// Split after padding to a multiple of the width.
+    Pad(MeshAxis),
 }

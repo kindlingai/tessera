@@ -253,7 +253,11 @@ pub fn ds41_serve(c: &ds41::Config, w: &Ds41) -> Program {
 /// gr8's GLM cluster: four GB10s, one rank each.
 pub fn gb10_tp4() -> Deployment {
     Deployment {
-        mesh: Mesh { tp: 4, ep: 1 },
+        mesh: Mesh {
+            tp: 4,
+            ep: 1,
+            pp: 1,
+        },
         pool_bytes: 24 << 30,
     }
 }
@@ -261,15 +265,70 @@ pub fn gb10_tp4() -> Deployment {
 /// One device holds every weight and the whole pool.
 pub fn single(pool_bytes: usize) -> Deployment {
     Deployment {
-        mesh: Mesh { tp: 1, ep: 1 },
+        mesh: Mesh {
+            tp: 1,
+            ep: 1,
+            pp: 1,
+        },
         pool_bytes,
     }
 }
 
+/// Megatron-style splits; the graph's sizes decide the fallbacks.
+pub struct ByRule;
+
+impl Splitter for ByRule {
+    fn split(&self, g: &Graph, mesh: &Mesh, _pool: usize) -> Result<Sharding, ShardError> {
+        if g.size(Heads) % mesh.tp != 0 {
+            return Err(ShardError::Indivisible(Heads, mesh.tp));
+        }
+        let tensor = AxisChoice::Split(MeshAxis::Tensor);
+        let pad = |d: DimName| match g.size(d) % mesh.tp {
+            0 => AxisChoice::Split(MeshAxis::Tensor),
+            _ => AxisChoice::Pad(MeshAxis::Tensor),
+        };
+        let kv = match g.size(KvHeads) < mesh.tp {
+            true => AxisChoice::Copy,
+            false => AxisChoice::Split(MeshAxis::Tensor),
+        };
+        // No expert axis: every rank holds a slice of each.
+        let experts = match mesh.ep > 1 {
+            true => AxisChoice::Split(MeshAxis::Expert),
+            false => AxisChoice::Copy,
+        };
+        let dims = vec![
+            (Heads, tensor),
+            (KvHeads, kv),
+            (Ffn, pad(Ffn)),
+            (Vocab, pad(Vocab)),
+            (Experts, experts),
+        ];
+        Ok(Sharding {
+            dims,
+            stages: g.balance_stages(mesh.pp),
+            overrides: vec![],
+        })
+    }
+}
+
+/// DeepSeek: mHC streams stay whole; Engram caches copy everywhere.
+pub struct Ds41Splitter;
+
+impl Splitter for Ds41Splitter {
+    fn split(&self, g: &Graph, mesh: &Mesh, pool: usize) -> Result<Sharding, ShardError> {
+        let mut s = ByRule.split(g, mesh, pool)?;
+        s.dims.push((Streams, AxisChoice::Copy));
+        for n in g.row_caches() {
+            s.overrides.push((n, Placement::Replicated));
+        }
+        Ok(s)
+    }
+}
+
 /// One program on two meshes; only the shard pass differs.
-pub fn deploy_both(p: &Program) -> (Vec<RankGraph>, Vec<RankGraph>) {
+pub fn deploy_both(p: &Program, s: &dyn Splitter) -> (Vec<RankGraph>, Vec<RankGraph>) {
     let g = p.build();
-    let cluster = shard(&g, &gb10_tp4()).unwrap();
-    let mac = shard(&g, &single(48 << 30)).unwrap();
+    let cluster = shard(&g, &gb10_tp4(), s).unwrap();
+    let mac = shard(&g, &single(48 << 30), s).unwrap();
     (cluster, mac)
 }

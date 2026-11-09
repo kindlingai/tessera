@@ -21,16 +21,16 @@ pub struct DeltaShape {
 #[derive(Weights)]
 pub struct Delta {
     pub norm: Norm,
-    #[split(heads)]
+    #[shape(Hidden, Heads, HeadDim)]
     pub qkv: Linear,
-    #[split(heads)]
+    #[shape(Heads, HeadDim, Conv)]
     pub conv: Linear,
-    #[split(heads)]
+    #[shape(Hidden, Heads, HeadDim)]
     pub gates: Linear,
-    #[split(heads)]
+    #[shape(Hidden, Heads, HeadDim)]
     pub out_gate: Linear,
     pub out_norm: Norm,
-    #[split(rows)]
+    #[shape(Heads, HeadDim, Hidden)]
     pub out: Linear,
 }
 

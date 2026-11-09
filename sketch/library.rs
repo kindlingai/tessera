@@ -4,9 +4,9 @@ use crate::core::*;
 
 #[derive(Weights)]
 pub struct Mlp<A> {
-    #[split(cols)]
+    #[shape(Hidden, Ffn)]
     pub up: Linear,
-    #[split(rows)]
+    #[shape(Ffn, Hidden)]
     pub down: Linear,
     pub act: A,
 }
@@ -20,7 +20,7 @@ pub fn mlp<A: Activation>(w: &Mlp<A>, h: &Tensor) -> Tensor {
 pub struct Moe<A> {
     pub router: Linear,
     pub router_bias: Vector,
-    #[split(experts)]
+    #[shape(Experts)]
     pub experts: Experts<Mlp<A>>,
     pub shared: Option<Mlp<A>>,
 }

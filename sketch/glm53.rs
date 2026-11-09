@@ -20,13 +20,15 @@ pub struct AttnShape {
 #[derive(Weights)]
 pub struct Mla {
     pub norm: Norm,
+    #[shape(Hidden, QLatent)]
     pub q_a: Linear,
     pub q_norm: Norm,
-    #[split(heads)]
+    #[shape(QLatent, Heads, HeadDim)]
     pub q_b: Linear,
+    #[shape(Hidden, Latent + Rope)]
     pub kv_a: Linear,
     pub kv_norm: Norm,
-    #[split(rows)]
+    #[shape(Heads, HeadDim, Hidden)]
     pub o_proj: Linear,
 }
 
@@ -53,11 +55,11 @@ pub enum Ffn {
 
 #[derive(Weights)]
 pub struct Glm53 {
-    #[split(vocab)]
+    #[shape(Vocab, Hidden)]
     pub embed: Embed,
     pub blocks: Vec<Block>,
     pub norm: Norm,
-    #[split(vocab)]
+    #[shape(Hidden, Vocab)]
     pub head: Linear,
 }
 
