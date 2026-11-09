@@ -4,7 +4,7 @@ use interp::{Cpu, Data, Gpu, Kernels, Tensor, bind, gpu_ready, run};
 use models::nanogpt::{Config, program};
 use nanogpt::data::{Corpus, DEFAULT_TEXT};
 use nanogpt::model::{self as gpt, EPS, GptConfig, Weights};
-use nanogpt::reference;
+use nanogpt::tensor::Target;
 use trace::{Graph, PathSeg};
 
 struct Case {
@@ -127,7 +127,7 @@ fn close(label: &str, got: &[f32], want: &[f32]) {
 fn cpu_matches_reference() {
     for (batch, seq) in [(2, 64), (3, 17)] {
         let c = case(batch, seq);
-        let want = reference::forward(&c.w, &c.cfg, &c.tokens, c.seq);
+        let want = gpt::forward(Target::Cpu, &c.w, &c.cfg, &c.tokens, c.seq).unwrap();
         close(&format!("cpu {batch}x{seq}"), &logits(&c, &mut Cpu), &want);
     }
 }
@@ -140,9 +140,9 @@ fn gpu_matches_nanogpt() {
     let (c, mut k) = (case(2, 64), Gpu::default());
     let got = logits(&c, &mut k);
     assert_eq!(k.fallbacks, 0, "every op should have a GPU kernel");
-    let ours = gpt::forward(&c.w, &c.cfg, &c.tokens, c.seq).unwrap();
+    let ours = gpt::forward(Target::Gpu, &c.w, &c.cfg, &c.tokens, c.seq).unwrap();
     close("gpu vs nanogpt gpu", &got, &ours);
-    let cpu = reference::forward(&c.w, &c.cfg, &c.tokens, c.seq);
+    let cpu = gpt::forward(Target::Cpu, &c.w, &c.cfg, &c.tokens, c.seq).unwrap();
     close("gpu vs cpu reference", &got, &cpu);
 }
 

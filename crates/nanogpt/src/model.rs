@@ -1,6 +1,6 @@
 //! Tiny GPT config, weight init and GPU forward pass.
 
-use crate::tensor as t;
+use crate::tensor::{self, Target};
 use ops::Error;
 
 pub const EPS: f32 = 1e-5;
@@ -106,16 +106,15 @@ impl Weights {
     }
 }
 
-/// Logits for every position, on the GPU ops.
+/// Logits for every position, on either target.
 pub fn forward(
+    t: Target,
     w: &Weights,
     cfg: &GptConfig,
     tokens: &[u32],
     seq: usize,
 ) -> Result<Vec<f32>, Error> {
     let c = cfg.n_embd;
-    let heads = cfg.n_head;
-    let hd = cfg.head_dim();
     assert!(seq > 0 && seq <= cfg.block, "seq must be in 1..=block");
     assert_eq!(
         tokens.len() % seq,
@@ -124,78 +123,77 @@ pub fn forward(
     );
     let batch = tokens.len() / seq;
     let m = batch * seq;
-
     let pos_ids: Vec<u32> = (0..batch)
         .flat_map(|_| (0..seq).map(|x| x as u32))
         .collect();
-    let tok = t::gather_rows(&w.tok_emb, tokens, c)?;
-    let pos = t::gather_rows(&w.pos_emb, &pos_ids, c)?;
-    let mut x = t::vec_add(&tok, &pos)?;
-
-    let scale = 1.0 / (hd as f32).sqrt();
-
+    let tok = tensor::gather_rows(t, &w.tok_emb, tokens, c)?;
+    let pos = tensor::gather_rows(t, &w.pos_emb, &pos_ids, c)?;
+    let mut x = tensor::vec_add(t, &tok, &pos)?;
     for lw in &w.layers {
-        let h1 = t::rms_norm(&x, &lw.ln1, m, c, EPS)?;
-        let qkv = t::linear(&h1, &lw.wqkv, m, 3 * c, c)?;
+        let h1 = tensor::rms_norm(t, &x, &lw.ln1, m, EPS)?;
+        let qkv = tensor::linear(t, &h1, &lw.wqkv, (m, 3 * c, c))?;
+        let attn = attention(t, cfg, &qkv, batch, seq)?;
+        let proj = tensor::linear(t, &attn, &lw.wproj, (m, c, c))?;
+        let x_attn = tensor::vec_add(t, &x, &proj)?;
+        let h2 = tensor::rms_norm(t, &x_attn, &lw.ln2, m, EPS)?;
+        let g = tensor::linear(t, &h2, &lw.w1, (m, cfg.mlp(), c))?;
+        let f = tensor::gelu(t, &g)?;
+        let down = tensor::linear(t, &f, &lw.w2, (m, c, cfg.mlp()))?;
+        x = tensor::vec_add(t, &x_attn, &down)?;
+    }
+    let hf = tensor::rms_norm(t, &x, &w.ln_f, m, EPS)?;
+    tensor::linear(t, &hf, &w.lm_head, (m, cfg.vocab, c))
+}
 
-        let mut attn = vec![0.0f32; m * c];
-        for b in 0..batch {
-            for h in 0..heads {
-                let base = b * seq * 3 * c + h * hd;
-                let q = &qkv[base..];
-                let k = &qkv[base + c..];
-                let mut scores = t::gemm(
-                    q,
-                    k,
-                    vec![0.0; seq * seq],
-                    seq,
-                    seq,
-                    hd,
-                    3 * c,
-                    3 * c,
-                    seq,
-                    false,
-                    true,
-                    0.0,
-                )?;
-                for i in 0..seq {
-                    for j in 0..seq {
-                        let idx = i * seq + j;
-                        scores[idx] = if j > i { -1e30 } else { scores[idx] * scale };
-                    }
-                }
-                let p = t::softmax(&scores, seq, seq)?;
-                let v = &qkv[base + 2 * c..];
-                let head_out = t::gemm(
-                    &p,
-                    v,
-                    vec![0.0; seq * hd],
-                    seq,
-                    hd,
-                    seq,
-                    seq,
-                    3 * c,
-                    hd,
-                    false,
-                    false,
-                    0.0,
-                )?;
-                for row in 0..seq {
-                    let dst = (b * seq + row) * c + h * hd;
-                    attn[dst..dst + hd].copy_from_slice(&head_out[row * hd..(row + 1) * hd]);
+/// Causal attention per sequence and head, from packed qkv.
+fn attention(
+    t: Target,
+    cfg: &GptConfig,
+    qkv: &[f32],
+    batch: usize,
+    seq: usize,
+) -> Result<Vec<f32>, Error> {
+    let (c, hd) = (cfg.n_embd, cfg.head_dim());
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut attn = vec![0.0f32; batch * seq * c];
+    for b in 0..batch {
+        for h in 0..cfg.n_head {
+            let base = b * seq * 3 * c + h * hd;
+            let (q, k, v) = (&qkv[base..], &qkv[base + c..], &qkv[base + 2 * c..]);
+            let dims = (seq, seq, hd);
+            let mut scores = tensor::gemm(
+                t,
+                q,
+                k,
+                vec![0.0; seq * seq],
+                dims,
+                (3 * c, 3 * c, seq),
+                (false, true),
+                0.0,
+            )?;
+            for i in 0..seq {
+                for j in 0..seq {
+                    let s = &mut scores[i * seq + j];
+                    *s = if j > i { -1e30 } else { *s * scale };
                 }
             }
+            let p = tensor::softmax(t, &scores, seq)?;
+            let dims = (seq, hd, seq);
+            let out = tensor::gemm(
+                t,
+                &p,
+                v,
+                vec![0.0; seq * hd],
+                dims,
+                (seq, 3 * c, hd),
+                (false, false),
+                0.0,
+            )?;
+            for row in 0..seq {
+                let dst = (b * seq + row) * c + h * hd;
+                attn[dst..dst + hd].copy_from_slice(&out[row * hd..(row + 1) * hd]);
+            }
         }
-
-        let proj = t::linear(&attn, &lw.wproj, m, c, c)?;
-        let x_attn = t::vec_add(&x, &proj)?;
-        let h2 = t::rms_norm(&x_attn, &lw.ln2, m, c, EPS)?;
-        let g = t::linear(&h2, &lw.w1, m, cfg.mlp(), c)?;
-        let f = t::gelu(&g)?;
-        let down = t::linear(&f, &lw.w2, m, c, cfg.mlp())?;
-        x = t::vec_add(&x_attn, &down)?;
     }
-
-    let hf = t::rms_norm(&x, &w.ln_f, m, c, EPS)?;
-    t::linear(&hf, &w.lm_head, m, cfg.vocab, c)
+    Ok(attn)
 }

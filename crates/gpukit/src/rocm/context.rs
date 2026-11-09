@@ -286,4 +286,8 @@ impl Device for Context {
     fn compile(&self, source: &str, entry: &str) -> Result<Kernel, Error> {
         self.compile_kernel(source, entry)
     }
+
+    fn synchronize(&self) -> Result<(), Error> {
+        Context::synchronize(self)
+    }
 }

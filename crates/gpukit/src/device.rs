@@ -21,6 +21,8 @@ pub trait Device: Clone + Send + Sync + 'static {
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
     fn load_image(&self, image: &[u8], entry: &str) -> Result<Self::Kernel, Error>;
     fn compile(&self, source: &str, entry: &str) -> Result<Self::Kernel, Error>;
+    /// Waits for all queued work.
+    fn synchronize(&self) -> Result<(), Error>;
 }
 
 type KernelMap<K> = OnceLock<Mutex<HashMap<(usize, &'static str), K>>>;
