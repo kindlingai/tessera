@@ -2,7 +2,6 @@
 
 use crate::emit::{self, Text};
 use crate::plan::{Kernel, Slot, Step};
-use ops_math::rms_norm;
 use ops_model::{apply_rope_heads, gather_rows, gqa_attention};
 
 /// One kernel argument, in the order its source declares.
@@ -56,7 +55,6 @@ fn fixed(metal: &'static str, cuda: &'static str, entry: &'static str) -> Source
 pub fn source(kernel: &Kernel) -> Source {
     match kernel {
         Kernel::Matmul { .. } => fixed(gemm::METAL, gemm::CUDA, gemm::ENTRY),
-        Kernel::RmsNorm { .. } => fixed(rms_norm::METAL, rms_norm::CUDA, rms_norm::ENTRY),
         Kernel::Rope { .. } => {
             use apply_rope_heads::{CUDA, ENTRY, METAL};
             fixed(METAL, CUDA, ENTRY)
@@ -66,6 +64,8 @@ pub fn source(kernel: &Kernel) -> Source {
             fixed(METAL, CUDA, ENTRY)
         }
         Kernel::Gather { .. } => fixed(gather_rows::METAL, gather_rows::CUDA, gather_rows::ENTRY),
+        Kernel::RmsNorm { .. } => Source::Made(emit::rms_norm()),
+        Kernel::Softmax { .. } => Source::Made(emit::softmax()),
         Kernel::Thin { .. } => Source::Made(emit::thin()),
         Kernel::Map(stages) => Source::Made(emit::map(stages)),
         Kernel::Join { .. } => Source::Made(emit::join()),
@@ -104,8 +104,13 @@ pub fn launches(step: &Step) -> Vec<Launch> {
             (args, Shape::Line(n))
         }
         Kernel::RmsNorm { rows, width, eps } => {
-            let args = vec![read(0), read(1), write, pair(rows, width), Arg::F32(eps)];
-            (args, Shape::Rows(rows))
+            let sizes = [count(rows), count(width), Arg::F32(eps)];
+            let args = [read(0), read(1), write].into_iter().chain(sizes);
+            (args.collect(), Shape::Line(rows))
+        }
+        Kernel::Softmax { rows, width } => {
+            let args = vec![read(0), write, count(rows), count(width)];
+            (args, Shape::Line(rows))
         }
         Kernel::Angles { width, theta } => {
             let positions = step.reads[0].len;

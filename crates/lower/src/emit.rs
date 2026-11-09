@@ -33,6 +33,7 @@ typedef unsigned long u64;
 #define f_cos(x) precise::cos(x)
 #define f_sin(x) precise::sin(x)
 #define f_bits(x) as_type<float>(x)
+#define f_rsqrt(x) rsqrt(x)
 
 ";
 
@@ -46,6 +47,7 @@ typedef unsigned long long u64;
 #define f_cos(x) cosf(x)
 #define f_sin(x) sinf(x)
 #define f_bits(x) __uint_as_float(x)
+#define f_rsqrt(x) rsqrtf(x)
 
 ";
 
@@ -174,6 +176,56 @@ pub fn thin() -> Text {
         entry: "plan_thin".into(),
         buffers: vec![float("x", false), float("w", false), float("out", true)],
         scalars: vec![("m", "u32"), ("n", "u32"), ("k", "u32")],
+        body: body.into(),
+    }
+}
+
+/// One thread scales each row by its root mean square.
+pub fn rms_norm() -> Text {
+    // Summed in order, so batch size never changes a row.
+    let body = "    if (gid >= rows) {
+        return;
+    }
+    u64 at = (u64)gid * width;
+    float sum = 0.0f;
+    for (u32 i = 0; i < width; i++) {
+        sum += x[at + i] * x[at + i];
+    }
+    float inv = f_rsqrt(sum / (float)width + eps);
+    for (u32 i = 0; i < width; i++) {
+        out[at + i] = x[at + i] * inv * w[i];
+    }
+";
+    Text {
+        entry: "plan_rms_norm".into(),
+        buffers: vec![float("x", false), float("w", false), float("out", true)],
+        scalars: vec![("rows", "u32"), ("width", "u32"), ("eps", "float")],
+        body: body.into(),
+    }
+}
+
+/// One thread turns a whole row into probabilities.
+pub fn softmax() -> Text {
+    let body = "    if (gid >= rows) {
+        return;
+    }
+    u64 at = (u64)gid * width;
+    float top = x[at];
+    for (u32 i = 1; i < width; i++) {
+        top = f_max(top, x[at + i]);
+    }
+    float sum = 0.0f;
+    for (u32 i = 0; i < width; i++) {
+        sum += f_exp(x[at + i] - top);
+    }
+    for (u32 i = 0; i < width; i++) {
+        out[at + i] = f_exp(x[at + i] - top) / sum;
+    }
+";
+    Text {
+        entry: "plan_softmax".into(),
+        buffers: vec![float("x", false), float("out", true)],
+        scalars: vec![("rows", "u32"), ("width", "u32")],
         body: body.into(),
     }
 }

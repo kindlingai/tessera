@@ -8,8 +8,8 @@ description = "Model descriptions, traced into graphs"
 
 [features]
 default = []
-cuda = ["interp/cuda", "nanogpt/cuda", "lower/cuda"]
-rocm = ["interp/rocm", "nanogpt/rocm", "lower/rocm"]
+cuda = ["lower/cuda"]
+rocm = ["lower/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
@@ -17,7 +17,6 @@ trace = { path = "../trace" }
 
 [dev-dependencies]
 checkpoint = { path = "../checkpoint" }
-interp = { path = "../interp", features = ["gpu"] }
+interp = { path = "../interp" }
 lower = { path = "../lower" }
 ops = { path = "../ops" }
-nanogpt = { path = "../nanogpt" }

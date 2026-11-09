@@ -303,6 +303,10 @@ impl Picker<'_> {
                     let w = self.val(w)?.0;
                     cur = self.emit(kernel, vec![cur, w], len, &covers);
                 }
+                (Stage::Softmax, _) => {
+                    let rows = len / width;
+                    cur = self.emit(Kernel::Softmax { rows, width }, vec![cur], len, &covers);
+                }
                 (Stage::Rope { theta, pairs }, Some(at)) if *pairs == Pairs::Halves => {
                     let at = self.val(at)?.0;
                     let angles = self.turns(i, at, width, *theta);
