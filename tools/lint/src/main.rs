@@ -3,11 +3,14 @@
 mod comments;
 mod files;
 mod kernel;
+mod macros;
 mod names;
 mod rust;
 
 #[cfg(test)]
 mod comments_test;
+#[cfg(test)]
+mod macros_test;
 #[cfg(test)]
 mod names_test;
 #[cfg(test)]
@@ -22,6 +25,9 @@ pub const MAX_FAMILY_SEGMENTS: usize = 4;
 pub const MAX_FILE_LINES: usize = 1000;
 pub const MAX_CRATE_FILES: usize = 30;
 pub const MAX_CRATE_LINES: usize = 15000;
+/// Per language; they do not count toward the crate limits.
+pub const MAX_MACRO_FILES: usize = 5;
+pub const MIN_MACRO_CALLS: usize = 2;
 /// Most of a file inline tests may fill.
 pub const MAX_TEST_PERCENT: usize = 1;
 
@@ -53,6 +59,7 @@ fn main() -> ExitCode {
         check_file(src, &mut found, &mut names);
     }
     names::check(&dirs, &names, &mut found);
+    macros::check(&dirs, &sources, &mut found);
     files::check_crates(&dirs, &sources, &mut found);
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     for v in &found {

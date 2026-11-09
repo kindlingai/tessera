@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{MAX_CRATE_FILES, MAX_CRATE_LINES, Violation};
+use crate::{MAX_CRATE_FILES, MAX_CRATE_LINES, MAX_MACRO_FILES, Violation};
 
 /// Rust plus the GPU kernel languages.
 pub const EXTENSIONS: &[&str] = &[
@@ -102,13 +102,68 @@ pub fn owner<'a>(dirs: &'a [String], path: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+fn language(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()? {
+        "rs" => Some("Rust"),
+        "metal" => Some("Metal"),
+        "cu" | "cuh" => Some("CUDA"),
+        "h" | "hpp" | "c" | "cc" | "cpp" => Some("C"),
+        "wgsl" => Some("WGSL"),
+        "hip" => Some("HIP"),
+        _ => None,
+    }
+}
+
+/// A `macros/` file's language and its macros directory.
+pub fn macro_dir(crate_dir: &str, path: &str) -> Option<(&'static str, String)> {
+    let rel = Path::new(path.strip_prefix(crate_dir)?);
+    let mut dir = PathBuf::from(crate_dir);
+    for part in rel.parent()?.components() {
+        dir.push(part);
+        if part.as_os_str() == "macros" {
+            return Some((language(rel)?, dir.to_string_lossy().into_owned()));
+        }
+    }
+    None
+}
+
 pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation>) {
     let mut totals: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut macros: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
     for src in sources {
-        if let Some(dir) = owner(dirs, &src.path) {
-            let t = totals.entry(dir).or_default();
-            t.0 += 1;
-            t.1 += src.lines;
+        let Some(dir) = owner(dirs, &src.path) else {
+            continue;
+        };
+        if let Some((lang, mdir)) = macro_dir(dir, &src.path) {
+            macros.entry((dir, lang)).or_default().push(mdir);
+            continue;
+        }
+        let t = totals.entry(dir).or_default();
+        t.0 += 1;
+        t.1 += src.lines;
+    }
+    for ((dir, lang), mut mdirs) in macros {
+        let path = format!("{dir}Cargo.toml");
+        if mdirs.len() > MAX_MACRO_FILES {
+            out.push(Violation {
+                path: path.clone(),
+                line: 1,
+                rule: "macro-files",
+                message: format!("{} {lang} macro files (max {MAX_MACRO_FILES})", mdirs.len()),
+            });
+        }
+        mdirs.sort();
+        mdirs.dedup();
+        if mdirs.len() > 1 {
+            out.push(Violation {
+                path,
+                line: 1,
+                rule: "macro-files",
+                message: format!(
+                    "{lang} macros in more than one directory: {}",
+                    mdirs.join(", ")
+                ),
+            });
         }
     }
     for (dir, (files, lines)) in totals {
