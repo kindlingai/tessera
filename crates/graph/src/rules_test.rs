@@ -183,7 +183,10 @@ fn picks_by_index() {
 fn layout_and_rope() {
     let x = f32s([Seqs, Rows, Heads, HeadDim], Replicated);
     let pos = TensorType::new([Seqs, Rows], DType::U32);
-    let rope = Op::Row(Row(vec![Stage::Rope { theta: 1e4 }]));
+    let rope = Op::Row(Row(vec![Stage::Rope {
+        theta: 1e4,
+        pairs: Pairs::Halves,
+    }]));
     assert!(result(vec![x.clone(), pos.clone()], rope.clone()).is_ok());
     let rows = TensorType::new([Rows], DType::U32);
     let misled = placed(vec![x.clone(), rows], rope.clone());

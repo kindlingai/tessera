@@ -3,7 +3,7 @@
 use crate::round::Acc;
 use crate::run::Kernels;
 use crate::tensor::{Error, Tensor};
-use graph::{Act, Attend, Mask, Numerics, Stage};
+use graph::{Act, Attend, Mask, Numerics, Pairs, Stage};
 
 /// Sums in fixed order with exact math. Meets any `Numerics`.
 pub struct Cpu;
@@ -20,6 +20,23 @@ fn act(a: Act, x: f32) -> f32 {
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Sigmoid => 1.0 / (1.0 + (-x).exp()),
         Act::Relu => x.max(0.0),
+    }
+}
+
+/// Pair `j`'s rotation at `pos`, in a row `width` wide.
+pub(crate) fn angle(pos: usize, j: usize, width: usize, theta: f32) -> f32 {
+    pos as f32 * theta.powf(-((2 * j) as f32) / width as f32)
+}
+
+fn turn(row: &mut [f32], pos: usize, theta: f32, pairs: Pairs) {
+    let half = row.len() / 2;
+    for j in 0..half {
+        let (a, b) = match pairs {
+            Pairs::Adjacent => (2 * j, 2 * j + 1),
+            Pairs::Halves => (j, j + half),
+        };
+        let (sin, cos) = angle(pos, j, row.len(), theta).sin_cos();
+        (row[a], row[b]) = (row[a] * cos - row[b] * sin, row[a] * sin + row[b] * cos);
     }
 }
 
@@ -131,7 +148,17 @@ impl Kernels for Cpu {
             (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
             // One rank holds the whole sum already.
             (Stage::AllReduce, _) => {}
-            (Stage::Center | Stage::UnitSum | Stage::Rope { .. }, _) => {
+            (Stage::Rope { theta, pairs }, Some(at)) => {
+                let at = at.indices()?;
+                // Each position covers the same number of elements.
+                let span = out.len() / at.len().max(1);
+                for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
+                    for row in block.chunks_mut(width) {
+                        turn(row, pos, *theta, *pairs);
+                    }
+                }
+            }
+            (Stage::Center | Stage::UnitSum, _) => {
                 return Err(Error::Unsupported(format!("{s:?}")));
             }
             _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),

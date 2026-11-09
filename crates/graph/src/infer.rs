@@ -344,7 +344,7 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 whole(p, last, s)?;
             }
             (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
-            (Stage::Rope { theta }, Some(pos)) => {
+            (Stage::Rope { theta, .. }, Some(pos)) => {
                 need(theta.is_finite() && *theta > 0.0, ErrorKind::Value, || {
                     format!("rope base is {theta}")
                 })?;

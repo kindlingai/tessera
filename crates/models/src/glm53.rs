@@ -1,10 +1,10 @@
 //! GLM-5.3: low-rank attention over indexed keys, and MoE.
 
-use crate::shared::{bounded, fixed, tokens};
+use crate::shared::{bounded, fixed, rows, swiglu, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Linears, Mask, Model, Norm, Role, Tensor,
-    Vector, Weights,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Linears, Mask, Model, Norm, Pairs, Role,
+    Tensor, Vector, Weights,
 };
 
 pub struct Config {
@@ -194,12 +194,6 @@ pub struct Glm53 {
     pub head: Linear,
 }
 
-/// `[Seqs, Context]` followed by `rest`.
-fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
-    let lead = [Seqs.into(), Context.into()];
-    lead.into_iter().chain(rest).collect()
-}
-
 pub fn forward(m: &Model, c: &Config, w: &Glm53, tokens: &Tensor, positions: &Tensor) -> Tensor {
     let mut x = m.embed(tokens, &w.embed);
     let mut indexers = w.indexers.iter();
@@ -240,7 +234,7 @@ fn mla(
     [h, positions]: [&Tensor; 2],
     keys: impl FnOnce(&Tensor) -> Tensor,
 ) -> (Tensor, Tensor) {
-    let turn = |t: Tensor| t.rope(positions, c.rope_theta);
+    let turn = |t: Tensor| t.rope(positions, c.rope_theta, Pairs::Adjacent);
     let qr = h.matmul(&w.q_a).rms_norm(&w.q_norm, c.eps);
     let keys = keys(&qr);
     let q = qr.matmul(&w.q_b).reshape([Seqs, Context, Heads, HeadDim]);
@@ -276,11 +270,6 @@ fn pick_keys(c: &Config, w: &Indexer, qr: &Tensor, h: &Tensor) -> Tensor {
     let scores = hits.permute(&[0, 1, 3, 2]).matmul_rows(&by_head);
     let scores = scores.reshape([Seqs, Context, Context]);
     scores.mask(Mask::Causal).top_k(IndexKeep)
-}
-
-fn swiglu(h: &Tensor, [gate, up, down]: [&Linear; 3]) -> Tensor {
-    let inner = h.matmul(gate).act(Act::Silu).mul(&h.matmul(up));
-    inner.matmul(down)
 }
 
 /// Each row's top experts, weighted, plus the shared expert.

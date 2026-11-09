@@ -1,7 +1,10 @@
 //! Pieces every token model's program uses.
 
 use trace::DimName::{Context, Seqs};
-use trace::{DType, Dim, DimName, EntryKind, Model, Port, Role, Size, Tensor, TensorType};
+use trace::{
+    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, Port, Role, Size, Tensor,
+    TensorType,
+};
 
 pub(crate) fn fixed(name: DimName, n: u64) -> Dim {
     let size = Size::Fixed(n);
@@ -24,4 +27,15 @@ pub(crate) fn tokens(m: &Model) -> [Tensor; 2] {
         EntryKind::Forward,
         [port(Role::Tokens), port(Role::Positions)],
     )
+}
+
+/// `[Seqs, Context]` followed by `rest`.
+pub(crate) fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
+    let lead = [Seqs.into(), Context.into()];
+    lead.into_iter().chain(rest).collect()
+}
+
+pub(crate) fn swiglu(h: &Tensor, [gate, up, down]: [&Linear; 3]) -> Tensor {
+    let inner = h.matmul(gate).act(Act::Silu).mul(&h.matmul(up));
+    inner.matmul(down)
 }
