@@ -41,7 +41,7 @@ jobs:
         with:
           shared-key: linux
       - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --all-features --no-fail-fast
 
   macos:
     # The Metal backend.
@@ -55,4 +55,4 @@ jobs:
         with:
           shared-key: macos
       - run: cargo clippy --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast

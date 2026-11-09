@@ -41,3 +41,11 @@ pub fn assert_oracle(a: &[f32], b: &[f32], max_tol: f32, min_cos: f32) {
         "output has non-finite values"
     );
 }
+
+/// Whether a CUDA driver loads on this host.
+pub fn cuda_ready() -> bool {
+    #[cfg(feature = "cuda")]
+    return crate::cuda::driver::driver().is_ok();
+    #[cfg(not(feature = "cuda"))]
+    false
+}

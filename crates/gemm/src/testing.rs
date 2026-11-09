@@ -2,9 +2,11 @@
 
 /// Whether GPU tests should run here.
 pub fn gpu_available() -> bool {
-    // Hosted macOS CI runners have no usable Metal device.
-    let backend = cfg!(target_os = "macos") || cfg!(feature = "cuda");
-    backend && !(cfg!(target_os = "macos") && std::env::var_os("CI").is_some())
+    if cfg!(target_os = "macos") {
+        // Hosted macOS CI runners have no usable Metal device.
+        return std::env::var_os("CI").is_none();
+    }
+    gpukit::testing::cuda_ready()
 }
 
 pub use gpukit::testing::{assert_oracle, cosine_f32, max_abs_diff};
