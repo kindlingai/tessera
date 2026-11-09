@@ -16,7 +16,10 @@ pub struct Config {
 
 pub struct EngramShape {
     pub orders: Vec<usize>,
-    pub table_tier: Tier,
+    pub cache: RowCache,
+    /// Head candidates per sequence to prefetch for.
+    pub prefetch_k: usize,
+    pub prefetch_budget: Rows,
 }
 
 /// How a layer picks the keys its attention reads.
@@ -151,9 +154,28 @@ fn indexer_keys(m: &mut Model, c: &Config, i: &Indexer, h: &Tensor, l: Layer) ->
 /// Hash recent n-grams, gather table rows, gate them in.
 fn engram(m: &mut Model, c: &Config, w: &Engram, tokens: &Tensor, s: &Tensor) -> Tensor {
     let ids = m.ngram_hash(tokens, &c.engram.orders);
-    let mem = m.gather(&w.table, &ids, c.engram.table_tier);
+    // Ids need only tokens, so the planner hoists this read.
+    let mem = m.row_cache(&w.table, &c.engram.cache).fetch(&ids);
     let h = s.merge_streams().rms_norm(&w.norm);
     mem.matmul(&w.key)
         .gate(Act::Sigmoid, &h.matmul(&w.gate))
         .spread_streams_even()
+}
+
+/// Likely ids for the next round: drafts plus head candidates.
+pub fn prefetch_next(m: &mut Model, w: &Ds41, c: &Config, logits: &Tensor, drafts: &Tensor) {
+    let next = m.top_k(logits, c.engram.prefetch_k).ids.union(drafts);
+    let ids = m.ngram_hash_with(&m.last_tokens_all(), &next, &c.engram.orders);
+    for e in w.blocks.iter().filter_map(|b| b.engram.as_ref()) {
+        let cache = m.row_cache(&e.table, &c.engram.cache);
+        cache.prefetch(&ids, c.engram.prefetch_budget);
+    }
+}
+
+/// At admission every id of a queued prompt is known.
+pub fn prefetch_prompt(m: &mut Model, w: &Ds41, c: &Config, prompt: &Tensor) {
+    let ids = m.ngram_hash(prompt, &c.engram.orders);
+    for e in w.blocks.iter().filter_map(|b| b.engram.as_ref()) {
+        m.row_cache(&e.table, &c.engram.cache).prefetch_all(&ids);
+    }
 }

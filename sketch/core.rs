@@ -22,6 +22,7 @@ pub enum Tier {
     Device,
     Host,
     Remote,
+    Disk,
 }
 
 /// Weight storage; kernels pick their decode by format.
@@ -275,6 +276,25 @@ pub struct SiteCaps {
     pub whole_row: bool,
 }
 
+// Plan nodes: what a step graph is made of.
+
+pub enum Node {
+    Kernel(Kernel),
+    /// Usually fused into Row as publish and consume.
+    Collective(Collective),
+    Transfer(Transfer),
+}
+
+/// An async move between memory tiers, off the compute queue.
+pub struct Transfer {
+    pub from: Tier,
+    pub to: Tier,
+    /// The consuming kernel; a late transfer stalls it.
+    pub deadline: NodeId,
+}
+
+pub struct NodeId;
+
 // Resources: state that outlives one pass.
 
 pub enum Sync {
@@ -304,6 +324,12 @@ pub struct RecurState {
 
 pub struct ConvHistory {
     pub width: usize,
+}
+
+/// Device copies of table rows; wrong prefetches only waste bandwidth.
+pub struct RowCache {
+    pub from: Tier,
+    pub capacity: Rows,
 }
 
 /// A value one pass leaves for the next, per row.
