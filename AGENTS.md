@@ -2,6 +2,8 @@
 
 Agents may not touch any file named README.md.
 
+No design docs, plans or history in the repo, outside an explicit changelog.
+
 ## Code shape
 
 `cargo run -p tessera-lint` checks these, and CI fails on any breach:
