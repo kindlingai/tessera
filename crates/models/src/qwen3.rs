@@ -1,6 +1,6 @@
 //! Qwen3: grouped-query attention with RoPE, and SwiGLU MLPs.
 
-use crate::shared::{bounded, fixed, rows, swiglu, tokens};
+use crate::shared::{Stack, rows, swiglu, tokens};
 use trace::DimName::*;
 use trace::{
     Composite, Dim, DimName, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role, Tensor,
@@ -8,49 +8,35 @@ use trace::{
 };
 
 pub struct Config {
-    pub vocab: u64,
-    pub hidden: u64,
-    pub layers: u64,
-    pub heads: u64,
+    pub stack: Stack,
     pub kv_heads: u64,
-    pub head_dim: u64,
-    pub ffn: u64,
     pub rope_theta: f32,
     pub eps: f32,
-    pub max_seqs: u64,
-    pub max_context: u64,
 }
 
 impl Config {
     /// The 0.6B checkpoint's sizes.
     pub fn small(max_seqs: u64, max_context: u64) -> Self {
-        Self {
+        let stack = Stack {
             vocab: 151_936,
             hidden: 1024,
             layers: 28,
             heads: 16,
-            kv_heads: 8,
             head_dim: 128,
             ffn: 3072,
-            rope_theta: 1e6,
-            eps: 1e-6,
             max_seqs,
             max_context,
+        };
+        Self {
+            stack,
+            kv_heads: 8,
+            rope_theta: 1e6,
+            eps: 1e-6,
         }
     }
 
     pub fn dims(&self) -> Vec<Dim> {
-        vec![
-            bounded(Seqs, self.max_seqs),
-            bounded(Context, self.max_context),
-            fixed(Vocab, self.vocab),
-            fixed(Hidden, self.hidden),
-            fixed(Heads, self.heads),
-            fixed(KvHeads, self.kv_heads),
-            fixed(HeadDim, self.head_dim),
-            fixed(Ffn, self.ffn),
-            fixed(Layers, self.layers),
-        ]
+        self.stack.dims(&[(KvHeads, self.kv_heads)])
     }
 }
 
@@ -115,7 +101,7 @@ fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor, positions: &Tensor) -
     let q = turn(split(&l.q, Heads), &l.q_norm);
     let k = turn(split(&l.k, KvHeads), &l.k_norm);
     let v = split(&l.v, KvHeads);
-    let scale = 1.0 / (c.head_dim as f32).sqrt();
+    let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
     let out = m.attend(Mask::Causal, scale, [&q, &k, &v], None);
     out.reshape(rows([Heads * HeadDim])).matmul(&l.o)
 }

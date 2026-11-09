@@ -1,6 +1,7 @@
 //! The traced nanogpt, run from its JSON alone, matches crates/nanogpt.
 
 use interp::{Cpu, Data, Gpu, Kernels, Tensor, bind, gpu_ready, run};
+use models::Stack;
 use models::nanogpt::{Config, program};
 use nanogpt::data::{Corpus, DEFAULT_TEXT};
 use nanogpt::model::{self as gpt, EPS, GptConfig, Weights};
@@ -27,15 +28,17 @@ fn case(batch: usize, seq: usize) -> Case {
 }
 
 fn config(cfg: &GptConfig) -> Config {
-    Config {
+    let stack = Stack {
         vocab: cfg.vocab as u64,
-        block: cfg.block as u64,
+        hidden: cfg.n_embd as u64,
         layers: cfg.n_layer as u64,
         heads: cfg.n_head as u64,
-        hidden: cfg.n_embd as u64,
-        eps: EPS,
+        head_dim: (cfg.n_embd / cfg.n_head) as u64,
+        ffn: 4 * cfg.n_embd as u64,
         max_seqs: 8,
-    }
+        max_context: cfg.block as u64,
+    };
+    Config { stack, eps: EPS }
 }
 
 /// The interpreter only ever sees the JSON text.

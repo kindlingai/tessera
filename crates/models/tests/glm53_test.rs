@@ -14,9 +14,9 @@ fn release_traces() {
     verify(&back).unwrap();
 
     let regions = |kind| g.regions.iter().filter(|r| r.kind == kind).count() as u64;
-    assert_eq!(regions(Composite::Attention), c.layers);
+    assert_eq!(regions(Composite::Attention), c.stack.layers);
     assert_eq!(regions(Composite::Mlp), c.dense_layers);
-    assert_eq!(regions(Composite::Moe), c.layers - c.dense_layers);
+    assert_eq!(regions(Composite::Moe), c.stack.layers - c.dense_layers);
     // Indexing layers also hand their keys to later layers.
     let shared = g.regions.iter().filter(|r| r.outputs.len() == 2).count();
     assert_eq!(shared, 21);
