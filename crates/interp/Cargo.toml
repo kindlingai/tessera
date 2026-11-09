@@ -11,6 +11,7 @@ default = []
 # The GPU kernels from the ops crates; Metal on macOS.
 gpu = ["dep:gemm", "dep:ops", "dep:ops-math", "dep:ops-model"]
 cuda = ["gpu", "gemm/cuda", "ops/cuda", "ops-math/cuda", "ops-model/cuda"]
+rocm = ["gpu", "gemm/rocm", "ops/rocm", "ops-math/rocm", "ops-model/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
