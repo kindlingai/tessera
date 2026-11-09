@@ -19,3 +19,4 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 ## Supported Models
 
  - nanogpt (barely)
+ - qwen (barely)
