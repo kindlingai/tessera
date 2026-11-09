@@ -1,0 +1,22 @@
+name: PR body
+
+# Squash merges copy the PR body into the commit message.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  group: pr-body-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coauthors:
+    # No Co-Authored-By lines crediting AI tools.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/body.txt"
+          scripts/check-coauthors.sh --message "$RUNNER_TEMP/body.txt"

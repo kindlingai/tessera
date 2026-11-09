@@ -4,7 +4,8 @@ Agents may not touch any file named README.md.
 
 No design docs, plans or history in the repo, outside an explicit changelog.
 
-No `Co-Authored-By` lines that credit an AI tool or bot. CI and the commit-msg hook refuse them.
+No `Co-Authored-By` lines that credit an AI tool or bot, in commits or PR bodies. CI and the commit-msg hook
+refuse them.
 
 ## Code shape
 
