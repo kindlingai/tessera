@@ -1,4 +1,4 @@
-//! DiffusionGemma: one denoising pass over a block. Sketch.
+//! DiffusionGemma: denoising passes over a block, as a loop. Sketch.
 
 use crate::core::*;
 use crate::library::{Mlp, mlp};
@@ -12,6 +12,8 @@ pub struct Config {
     pub kv_heads: usize,
     pub softcap: f32,
     pub embed_scale: f32,
+    pub max_steps: usize,
+    pub unmask_per_step: usize,
 }
 
 #[derive(Weights)]
@@ -45,16 +47,40 @@ pub struct DGemma {
     pub norm: Norm,
 }
 
-/// Per-row facts the planner turns into plans.
+/// Per-row request facts; the step count comes from the loop.
 pub struct RowState {
-    pub step: Tensor,
     pub cap: Tensor,
     pub read_only: Tensor,
     /// Grammar or slot constraint: allowed vocabulary columns.
     pub allowed: Plan,
 }
 
-/// One pass; the host repeats it until the block unmasks.
+/// Denoises until rows unmask, reach their cap, or the bound.
+pub fn generate(m: &mut Model, c: &Config, w: &DGemma, rs: &RowState, canvas: Tensor) -> Tensor {
+    // A read-only row at its cap feeds no later pass.
+    let last = |_: &_, it: &Iter| at_cap(it, rs).and(&rs.read_only);
+    let until = Until {
+        max: c.max_steps,
+        last: Box::new(last),
+    };
+    let start = (canvas, Carried::empty());
+    let (canvas, _) = m.repeat(until, start, |m, (canvas, mut sc), it| {
+        let logits = denoise(m, c, w, rs, &canvas, &mut sc, it);
+        let canvas = unmask(m, &logits, &canvas, c.unmask_per_step);
+        let more = canvas.has_masked().and(&at_cap(it, rs).not());
+        Next {
+            carry: (canvas, sc),
+            more,
+        }
+    });
+    canvas
+}
+
+fn at_cap(it: &Iter, rs: &RowState) -> Tensor {
+    it.step.add_one().compare(Cmp::Gt, &rs.cap.sub_one())
+}
+
+/// One pass over the block.
 pub fn denoise(
     m: &mut Model,
     c: &Config,
@@ -62,6 +88,7 @@ pub fn denoise(
     rs: &RowState,
     canvas: &Tensor,
     sc: &mut Carried<Tensor>,
+    it: &Iter,
 ) -> Tensor {
     let soft = sc.read_or_zero();
     let mut x = m
@@ -89,21 +116,20 @@ pub fn denoise(
         .rms_norm(&w.norm)
         .matmul_cols(&w.embed, &rs.allowed)
         .softcap(c.softcap);
-    self_condition(m, w, rs, &logits, sc);
+    self_condition(m, w, rs, &logits, sc, it);
     logits
 }
 
-/// Feeds the next pass; live only for rows that continue.
+/// Feeds the next pass; a row's last pass skips it.
 fn self_condition(
     m: &mut Model,
     w: &DGemma,
     rs: &RowState,
     logits: &Tensor,
     sc: &mut Carried<Tensor>,
+    it: &Iter,
 ) {
-    let last = rs.step.add_one().compare(Cmp::Gt, &rs.cap.sub_one());
-    let finishing = last.and(&rs.read_only);
-    let live = m.filter(&finishing.not());
+    let live = m.filter(&it.last.not());
     sc.write_rows(&live, logits.softmax().matmul_rows(&w.embed, &rs.allowed));
 }
 
@@ -118,9 +144,10 @@ fn attention(m: &mut Model, c: &Config, w: &Attn, l: Layer, mask: Mask, h: &Tens
     m.attend(kind, mask, &q, &kv, &cache, None).matmul(&w.o)
 }
 
-/// Unmask the most confident positions; reads return scores.
-pub fn unmask(m: &mut Model, logits: &Tensor, count: usize) -> Tensor {
-    let confidence = logits.softmax().max_per_row();
+/// Fills the most confident masked positions of the canvas.
+pub fn unmask(m: &mut Model, logits: &Tensor, canvas: &Tensor, count: usize) -> Tensor {
+    let confidence = logits.softmax().max_per_row().masked_only(canvas);
     let pick = m.top_k(&confidence, count);
-    m.sample_rows(logits, &pick.ids, Sampler::Gumbel)
+    let tokens = m.sample_rows(logits, &pick.ids, Sampler::Gumbel);
+    canvas.place(&pick.ids, &tokens)
 }

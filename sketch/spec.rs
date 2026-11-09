@@ -2,7 +2,7 @@
 
 use crate::core::*;
 use crate::glm53::{self, Glm53};
-use crate::library::{fit_budget, greedy_accept, keep_confident, rejection_accept};
+use crate::library::{fit_budget, greedy_accept, rejection_accept};
 
 /// A drafter names the target sites it reads.
 pub trait Subscriber {
@@ -110,6 +110,7 @@ pub enum Drafter {
 
 /// Lengths, costs and limits: per-round inputs and tuning data.
 pub struct DraftPolicy {
+    pub max_rounds: usize,
     pub len: PerDrafter<usize>,
     pub cost: PerDrafter<f32>,
     pub min_dwell: usize,
@@ -134,16 +135,47 @@ pub enum Rule {
     Rejection,
 }
 
-/// Draft, verify, accept, commit: one captured graph.
+/// Rounds until each row stops; accepted tokens stream out.
+pub fn decode(
+    m: &mut Model,
+    t: &Glm53,
+    d: &Drafters,
+    p: &DraftPolicy,
+    s: &SeqStats,
+    rule: Rule,
+    left: Tensor,
+    out: &Port,
+) -> Tensor {
+    // Every round emits a token, so one left means last.
+    let last = |left: &Tensor, _: &Iter| left.compare_scalar(Cmp::Lt, 2.0);
+    let until = Until {
+        max: p.max_rounds,
+        last: Box::new(last),
+    };
+    m.repeat(until, left, |m, left, it| {
+        let n = round(m, t, d, p, s, &rule, it, &left);
+        let tokens = m.accepted_tokens(&n);
+        m.emit(out, &tokens);
+        let left = left.sub(&n.add_one());
+        let more = left.compare_scalar(Cmp::Gt, 0.0).and(&tokens.no_stop());
+        Next { carry: left, more }
+    })
+}
+
+/// Draft, verify, accept, commit: one loop iteration.
 pub fn round(
     r: &mut Model,
     t: &Glm53,
     d: &Drafters,
     p: &DraftPolicy,
     s: &SeqStats,
-    rule: Rule,
+    rule: &Rule,
+    it: &Iter,
+    left: &Tensor,
 ) -> Counts {
-    let plans = choose_drafter(r, s, p);
+    // A row's last round drafts nothing; one verify row suffices.
+    let drafting = it.live.minus(&r.filter(&it.last));
+    let plans = choose_drafter(r, s, p, &drafting, &left.sub_scalar(1.0));
     let a = draft_mtp(r, &d.mtp.0, d.mtp.1, &plans.part(Drafter::Mtp), p);
     let b = draft_dflash(r, &d.dflash.0, &d.dflash.1, &plans.part(Drafter::Dflash), p);
     let (w, taps, shape) = &d.dspine;
@@ -159,11 +191,19 @@ pub fn round(
     };
     r.update_stats(s, &plans, &n);
     r.commit_all(&n);
+    // No later round drafts from a last row's taps.
+    r.drop_taps(&it.last);
     n
 }
 
 /// Best expected gain per sequence, held for a minimum dwell.
-fn choose_drafter(r: &mut Model, s: &SeqStats, p: &DraftPolicy) -> Plans<Drafter> {
+fn choose_drafter(
+    r: &mut Model,
+    s: &SeqStats,
+    p: &DraftPolicy,
+    rows: &Plan,
+    max_len: &Tensor,
+) -> Plans<Drafter> {
     let gains = s
         .accept
         .mul_cols(&p.len.as_tensor())
@@ -171,25 +211,35 @@ fn choose_drafter(r: &mut Model, s: &SeqStats, p: &DraftPolicy) -> Plans<Drafter
     let want = r.sample(&gains, Sampler::Argmax);
     let stay = s.dwell.compare_scalar(Cmp::Lt, p.min_dwell as f32);
     let choice = stay.choose_tensor(&s.drafter, &want);
-    let rows = fit_budget(r, &choice.map_len(&p.len), p.row_budget);
-    r.partition_rows(&choice, &rows)
+    let wanted = choice.map_len(&p.len).min(max_len);
+    let lens = fit_budget(r, &wanted, p.row_budget);
+    r.partition_rows(&choice.only(rows), &lens)
 }
 
-/// Chained drafts; each pass drops rows below the confidence floor.
+/// Chained drafts as a nested loop; KStop decides who continues.
 fn draft_mtp(r: &mut Model, w: &Mtp, ctx: ResourceId, rows: &Plan, p: &DraftPolicy) -> Drafts {
-    let mut live = rows.clone();
-    let mut h = r.context(ctx).last();
-    let mut tok = r.last_tokens(&live);
-    let mut out = Drafts::empty();
-    for _ in 0..p.len.get(Drafter::Mtp) {
+    let len = p.len.get(Drafter::Mtp);
+    let start = (r.context(ctx).last(), r.last_tokens(rows), Drafts::empty());
+    // The last link's hidden state feeds nothing.
+    let last = move |_: &_, it: &Iter| it.step.compare_scalar(Cmp::Gt, len as f32 - 2.0);
+    let until = Until {
+        max: len,
+        last: Box::new(last),
+    };
+    let (_, _, out) = r.repeat(until, start, |r, (h, tok, mut out), it| {
         let e = r.embed(&tok, &w.embed).rms_norm(&w.enorm);
         let x = e.concat(&h.rms_norm(&w.hnorm)).matmul(&w.proj);
-        h = r.with_rows(&live, |r| r.block(&w.block, &x));
+        let h = r.with_rows(&it.live, |r| r.block(&w.block, &x));
         let logits = h.matmul(&w.head);
-        tok = r.sample(&logits, Sampler::Argmax);
+        let tok = r.sample(&logits, Sampler::Argmax);
         out.push(&tok, &logits.log_softmax_at(&tok));
-        live = keep_confident(r, &logits.softmax().max_per_row(), p.confidence_floor);
-    }
+        let sure = logits.softmax().max_per_row();
+        let more = sure.compare_scalar(Cmp::Gt, p.confidence_floor);
+        Next {
+            carry: (h, tok, out),
+            more,
+        }
+    });
     out
 }
 

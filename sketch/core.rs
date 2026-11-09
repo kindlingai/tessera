@@ -276,6 +276,47 @@ pub struct SiteCaps {
     pub whole_row: bool,
 }
 
+// Loops: a body run by a driver outside it.
+
+/// The loop's input port, written by its driver each iteration.
+pub struct Iter {
+    pub step: Tensor,
+    pub live: Plan,
+    /// Rows whose carry no later iteration reads.
+    pub last: Tensor,
+}
+
+/// A body's result: its carry and the rows that continue.
+pub struct Next<C> {
+    pub carry: C,
+    pub more: Tensor,
+}
+
+/// The bound, plus how drivers spot a row's last pass.
+pub struct Until<C> {
+    pub max: usize,
+    pub last: Box<dyn Fn(&C, &Iter) -> Tensor>,
+}
+
+/// Chosen by the planner; values never depend on it.
+pub enum Driver {
+    /// The scheduler relaunches the body graph.
+    Host,
+    /// A conditional loop node inside one graph.
+    DeviceGraph,
+    /// A persistent kernel iterates itself.
+    Fused,
+}
+
+pub enum PortKind {
+    /// Written before each launch.
+    PerLaunch,
+    /// Polled by a running device loop.
+    Mailbox,
+    /// Drained by the host while the loop runs.
+    Stream,
+}
+
 // Plan nodes: what a step graph is made of.
 
 pub enum Node {
