@@ -1,8 +1,10 @@
 //! Traced tensors: each method appends one node.
 
 use crate::model::{Shared, push};
-use crate::weights::{Linear, Norm, Vector};
-use graph::{Act, DType, DimExpr, Mask, NodeId, Op, Row, Select, Shape, Stage, TensorType, View};
+use crate::weights::{Embed, Linear, Norm, Vector};
+use graph::{
+    Act, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
+};
 
 #[derive(Clone)]
 pub struct Tensor {
@@ -28,6 +30,11 @@ impl Tensor {
 
     pub fn matmul(&self, w: &Linear) -> Tensor {
         self.op(Op::Matmul, &[&w.0])
+    }
+
+    /// Logits over a table's rows, for tied embeddings.
+    pub fn unembed(&self, table: &Embed) -> Tensor {
+        self.op(Op::Matmul, &[&table.0])
     }
 
     /// Each row times `w[.., N, K]`, whose batch axes match.
@@ -63,8 +70,8 @@ impl Tensor {
         self.stage(Stage::UnitSum, &[])
     }
 
-    pub fn rope(&self, positions: &Tensor, theta: f32) -> Tensor {
-        self.stage(Stage::Rope { theta }, &[positions])
+    pub fn rope(&self, positions: &Tensor, theta: f32, pairs: Pairs) -> Tensor {
+        self.stage(Stage::Rope { theta, pairs }, &[positions])
     }
 
     pub fn act(&self, act: Act) -> Tensor {

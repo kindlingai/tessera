@@ -143,10 +143,11 @@ pub enum Stage {
     Center,
     /// Divides the row by its sum.
     UnitSum,
-    /// Rotates adjacent pairs; the argument holds positions.
+    /// Rotates pairs of elements; the argument holds positions.
     Rope {
         /// Pair `j` turns by `position * theta^(-2j/width)`.
         theta: f32,
+        pairs: Pairs,
     },
     Act(Act),
     Softmax,
@@ -169,6 +170,15 @@ impl Stage {
             RmsNorm { .. } | Center | UnitSum | Softmax | AllReduce
         )
     }
+}
+
+/// Which two elements of a row rotate together.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pairs {
+    /// Elements `2j` and `2j + 1`.
+    Adjacent,
+    /// Elements `j` and `j + width / 2`.
+    Halves,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

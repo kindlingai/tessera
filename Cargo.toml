@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/checkpoint",
     "crates/graph",
     "crates/trace",
     "crates/trace-derive",

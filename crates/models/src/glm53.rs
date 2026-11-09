@@ -1,28 +1,23 @@
 //! GLM-5.3: low-rank attention over indexed keys, and MoE.
 
-use crate::shared::{bounded, fixed, tokens};
+use crate::shared::{Stack, rows, swiglu, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Linears, Mask, Model, Norm, Role, Tensor,
-    Vector, Weights,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Linears, Mask, Model, Norm, Pairs, Role,
+    Tensor, Vector, Weights,
 };
 
 pub struct Config {
-    pub vocab: u64,
-    pub hidden: u64,
-    pub layers: u64,
+    /// Its `ffn` is an expert's width; values use `head_dim`.
+    pub stack: Stack,
     /// Leading layers with a dense MLP.
     pub dense_layers: u64,
-    pub heads: u64,
-    /// A head's width outside its rotary part.
-    pub nope: u64,
-    /// Values are `nope + rope` wide, like queries.
+    /// The part of `head_dim` that is rotated.
     pub rope: u64,
     pub rope_theta: f32,
     pub q_latent: u64,
     pub latent: u64,
     pub dense_ffn: u64,
-    pub ffn: u64,
     pub experts: u64,
     pub top_k: u64,
     pub route_scale: f32,
@@ -32,26 +27,29 @@ pub struct Config {
     /// Past the dense layers, every n-th layer indexes.
     pub index_every: u64,
     pub eps: f32,
-    pub max_seqs: u64,
-    pub max_context: u64,
 }
 
 impl Config {
     /// The released checkpoint's sizes.
     pub fn release(max_seqs: u64, max_context: u64) -> Self {
-        Self {
+        let stack = Stack {
             vocab: 154_880,
             hidden: 6144,
             layers: 78,
-            dense_layers: 3,
             heads: 64,
-            nope: 192,
+            head_dim: 256,
+            ffn: 2048,
+            max_seqs,
+            max_context,
+        };
+        Self {
+            stack,
+            dense_layers: 3,
             rope: 64,
             rope_theta: 8e6,
             q_latent: 2048,
             latent: 512,
             dense_ffn: 12_288,
-            ffn: 2048,
             experts: 256,
             top_k: 8,
             route_scale: 2.5,
@@ -60,8 +58,6 @@ impl Config {
             index_keep: 2048,
             index_every: 4,
             eps: 1e-5,
-            max_seqs,
-            max_context,
         }
     }
 
@@ -72,30 +68,23 @@ impl Config {
     }
 
     pub fn dims(&self) -> Vec<Dim> {
-        let indexing = (0..self.layers).filter(|&l| self.indexes(l)).count();
-        vec![
-            bounded(Seqs, self.max_seqs),
-            bounded(Context, self.max_context),
-            fixed(Vocab, self.vocab),
-            fixed(Hidden, self.hidden),
-            fixed(Heads, self.heads),
-            fixed(HeadDim, self.nope + self.rope),
-            fixed(Nope, self.nope),
-            fixed(Rope, self.rope),
-            fixed(QLatent, self.q_latent),
-            fixed(Latent, self.latent),
-            fixed(DenseFfn, self.dense_ffn),
-            fixed(Ffn, self.ffn),
-            fixed(Experts, self.experts),
-            fixed(TopK, self.top_k),
-            fixed(IndexHeads, self.index_heads),
-            fixed(IndexDim, self.index_dim),
-            fixed(IndexKeep, self.index_keep),
-            fixed(Layers, self.layers),
-            fixed(DenseLayers, self.dense_layers),
-            fixed(MoeLayers, self.layers - self.dense_layers),
-            fixed(IndexLayers, indexing as u64),
-        ]
+        let layers = self.stack.layers;
+        let indexing = (0..layers).filter(|&l| self.indexes(l)).count();
+        self.stack.dims(&[
+            (Nope, self.stack.head_dim - self.rope),
+            (Rope, self.rope),
+            (QLatent, self.q_latent),
+            (Latent, self.latent),
+            (DenseFfn, self.dense_ffn),
+            (Experts, self.experts),
+            (TopK, self.top_k),
+            (IndexHeads, self.index_heads),
+            (IndexDim, self.index_dim),
+            (IndexKeep, self.index_keep),
+            (DenseLayers, self.dense_layers),
+            (MoeLayers, layers - self.dense_layers),
+            (IndexLayers, indexing as u64),
+        ])
     }
 }
 
@@ -194,12 +183,6 @@ pub struct Glm53 {
     pub head: Linear,
 }
 
-/// `[Seqs, Context]` followed by `rest`.
-fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
-    let lead = [Seqs.into(), Context.into()];
-    lead.into_iter().chain(rest).collect()
-}
-
 pub fn forward(m: &Model, c: &Config, w: &Glm53, tokens: &Tensor, positions: &Tensor) -> Tensor {
     let mut x = m.embed(tokens, &w.embed);
     let mut indexers = w.indexers.iter();
@@ -240,7 +223,7 @@ fn mla(
     [h, positions]: [&Tensor; 2],
     keys: impl FnOnce(&Tensor) -> Tensor,
 ) -> (Tensor, Tensor) {
-    let turn = |t: Tensor| t.rope(positions, c.rope_theta);
+    let turn = |t: Tensor| t.rope(positions, c.rope_theta, Pairs::Adjacent);
     let qr = h.matmul(&w.q_a).rms_norm(&w.q_norm, c.eps);
     let keys = keys(&qr);
     let q = qr.matmul(&w.q_b).reshape([Seqs, Context, Heads, HeadDim]);
@@ -256,7 +239,7 @@ fn mla(
         .reshape(rows([Heads.into(), Nope + HeadDim]));
     let k = per_head.slice(3, 0u64, Nope).concat(&shared);
     let v = per_head.slice(3, Nope, HeadDim);
-    let scale = 1.0 / ((c.nope + c.rope) as f32).sqrt();
+    let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
     let out = m.attend(Mask::Causal, scale, [&q, &k, &v], Some(&keys));
     let out = out.reshape(rows([Heads * HeadDim])).matmul(&w.o);
     (out, keys)
@@ -276,11 +259,6 @@ fn pick_keys(c: &Config, w: &Indexer, qr: &Tensor, h: &Tensor) -> Tensor {
     let scores = hits.permute(&[0, 1, 3, 2]).matmul_rows(&by_head);
     let scores = scores.reshape([Seqs, Context, Context]);
     scores.mask(Mask::Causal).top_k(IndexKeep)
-}
-
-fn swiglu(h: &Tensor, [gate, up, down]: [&Linear; 3]) -> Tensor {
-    let inner = h.matmul(gate).act(Act::Silu).mul(&h.matmul(up));
-    inner.matmul(down)
 }
 
 /// Each row's top experts, weighted, plus the shared expert.

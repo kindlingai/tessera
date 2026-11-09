@@ -1,36 +1,20 @@
 //! The tiny GPT from `crates/nanogpt`, as a description.
 
-use crate::shared::{bounded, fixed, tokens};
+use crate::shared::{Stack, tokens};
 use trace::DimName::*;
 use trace::{
     Act, Composite, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Shape, Tensor, Weights,
 };
 
 pub struct Config {
-    pub vocab: u64,
-    /// Longest context, and the position table's length.
-    pub block: u64,
-    pub layers: u64,
-    pub heads: u64,
-    pub hidden: u64,
+    /// Its context bound is also the position table's length.
+    pub stack: Stack,
     pub eps: f32,
-    /// Most sequences one launch may carry.
-    pub max_seqs: u64,
 }
 
 impl Config {
     pub fn dims(&self) -> Vec<Dim> {
-        vec![
-            bounded(Seqs, self.max_seqs),
-            bounded(Context, self.block),
-            fixed(Positions, self.block),
-            fixed(Vocab, self.vocab),
-            fixed(Hidden, self.hidden),
-            fixed(Heads, self.heads),
-            fixed(HeadDim, self.hidden / self.heads),
-            fixed(Ffn, 4 * self.hidden),
-            fixed(Layers, self.layers),
-        ]
+        self.stack.dims(&[(Positions, self.stack.max_context)])
     }
 }
 
@@ -89,7 +73,7 @@ pub fn forward(m: &Model, c: &Config, w: &Gpt, tokens: &Tensor, positions: &Tens
 fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
     let heads = Shape::from([Seqs, Context, Heads, HeadDim]);
     let project = |w: &Linear| h.matmul(w).reshape(heads.clone());
-    let scale = 1.0 / ((c.hidden / c.heads) as f32).sqrt();
+    let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
     let qkv = [&l.wq, &l.wk, &l.wv].map(project);
     let [q, k, v] = &qkv;
     let out = m.attend(Mask::Causal, scale, [q, k, v], None);

@@ -1,16 +1,50 @@
 //! Pieces every token model's program uses.
 
-use trace::DimName::{Context, Seqs};
-use trace::{DType, Dim, DimName, EntryKind, Model, Port, Role, Size, Tensor, TensorType};
+use trace::DimName::*;
+use trace::{
+    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, Port, Role, Size, Tensor,
+    TensorType,
+};
 
-pub(crate) fn fixed(name: DimName, n: u64) -> Dim {
-    let size = Size::Fixed(n);
-    Dim { name, size }
+/// Sizes every decoder stack here declares.
+pub struct Stack {
+    pub vocab: u64,
+    pub hidden: u64,
+    pub layers: u64,
+    pub heads: u64,
+    pub head_dim: u64,
+    pub ffn: u64,
+    /// Most sequences one launch may carry.
+    pub max_seqs: u64,
+    pub max_context: u64,
 }
 
-pub(crate) fn bounded(name: DimName, max: u64) -> Dim {
-    let size = Size::Bounded(max);
-    Dim { name, size }
+impl Stack {
+    /// These dimensions, followed by the model's `own`.
+    pub(crate) fn dims(&self, own: &[(DimName, u64)]) -> Vec<Dim> {
+        let bounded = |name, max| Dim {
+            name,
+            size: Size::Bounded(max),
+        };
+        let fixed = |(name, n): &(DimName, u64)| Dim {
+            name: *name,
+            size: Size::Fixed(*n),
+        };
+        let shared = [
+            (Vocab, self.vocab),
+            (Hidden, self.hidden),
+            (Layers, self.layers),
+            (Heads, self.heads),
+            (HeadDim, self.head_dim),
+            (Ffn, self.ffn),
+        ];
+        let mut dims = vec![
+            bounded(Seqs, self.max_seqs),
+            bounded(Context, self.max_context),
+        ];
+        dims.extend(shared.iter().chain(own).map(fixed));
+        dims
+    }
 }
 
 /// A forward entry's tokens and positions, `[Seqs, Context]` each.
@@ -24,4 +58,15 @@ pub(crate) fn tokens(m: &Model) -> [Tensor; 2] {
         EntryKind::Forward,
         [port(Role::Tokens), port(Role::Positions)],
     )
+}
+
+/// `[Seqs, Context]` followed by `rest`.
+pub(crate) fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
+    let lead = [Seqs.into(), Context.into()];
+    lead.into_iter().chain(rest).collect()
+}
+
+pub(crate) fn swiglu(h: &Tensor, [gate, up, down]: [&Linear; 3]) -> Tensor {
+    let inner = h.matmul(gate).act(Act::Silu).mul(&h.matmul(up));
+    inner.matmul(down)
 }

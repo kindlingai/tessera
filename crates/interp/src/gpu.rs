@@ -3,9 +3,9 @@
 use crate::cpu::Cpu;
 use crate::run::Kernels;
 use crate::tensor::{Error, Tensor};
-use graph::{Act, Attend, DType, Mask, Numerics, Stage};
+use graph::{Act, Attend, DType, Mask, Numerics, Pairs, Stage};
 use ops_math::{gelu, rms_norm, softmax, vec_add, vec_scale};
-use ops_model::{gather_rows, gqa_attention};
+use ops_model::{apply_rope_heads, gather_rows, gqa_attention};
 
 /// Whether this host can dispatch GPU kernels.
 pub fn gpu_ready() -> bool {
@@ -22,9 +22,35 @@ fn gpu_err(e: ops::Error) -> Error {
     Error::Gpu(e.to_string())
 }
 
+/// Whether the rope kernel's layout fits this stage.
+fn halves(pairs: Pairs, x: &Tensor, at: &Tensor) -> bool {
+    pairs == Pairs::Halves && x.shape.len() == 4 && at.shape.len() == 2
+}
+
 /// The ops kernels accumulate in f32.
 fn f32_sums(n: &Numerics) -> bool {
     n.accumulate == DType::F32
+}
+
+/// One launch per sequence of `[Seqs, Context, Heads, HeadDim]`.
+fn rope(theta: f32, xs: &[f32], shape: &[usize], at: &[usize]) -> Result<Vec<f32>, ops::Error> {
+    let (ctx, heads, d) = (shape[1], shape[2], shape[3]);
+    let mut out = Vec::with_capacity(xs.len());
+    for (x, at) in xs.chunks(ctx * heads * d).zip(at.chunks(ctx)) {
+        let turns = |&pos| (0..d / 2).map(move |j| crate::cpu::angle(pos, j, d, theta));
+        let freqs = at.iter().flat_map(turns).flat_map(|a| [a.cos(), a.sin()]);
+        let fix = apply_rope_heads::Fixture {
+            x: x.to_vec(),
+            freqs: freqs.collect(),
+            seq_len: ctx,
+            num_heads: heads,
+            head_dim: d,
+            rotary_dim: d,
+            elem_offset: 0,
+        };
+        out.extend(apply_rope_heads::gpu(&fix)?);
+    }
+    Ok(out)
 }
 
 impl Kernels for Gpu {
@@ -131,6 +157,9 @@ impl Kernels for Gpu {
                 eps: *eps,
             }),
             (Stage::Act(Act::GeluTanh), _) => gelu::gpu(&gelu::Fixture { x: xs }),
+            (Stage::Rope { theta, pairs }, Some(at)) if halves(*pairs, x, at) => {
+                rope(*theta, &xs, &x.shape, &at.indices()?)
+            }
             (Stage::Softmax, _) => softmax::gpu(&softmax::Fixture {
                 logits: xs,
                 rows,
