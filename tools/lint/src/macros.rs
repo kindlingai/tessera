@@ -7,7 +7,7 @@ use syn::Item;
 
 use crate::files::{Source, macro_dir, owner};
 use crate::rust::lines_of;
-use crate::{MIN_MACRO_CALLS, Violation};
+use crate::{LIMITS, Violation};
 
 /// Counts `name!` invocations in a token stream, by name.
 pub fn calls(tokens: TokenStream, counts: &mut BTreeMap<String, usize>) {
@@ -97,15 +97,13 @@ pub fn check(dirs: &[String], sources: &[Source], out: &mut Vec<Violation>) {
                 .copied()
                 .unwrap_or(0);
             let n = all.saturating_sub(d.own);
-            if n < MIN_MACRO_CALLS {
+            let min = LIMITS.min_macro_calls;
+            if n < min {
                 out.push(Violation {
                     path: d.path,
                     line: d.line,
                     rule: "macro-calls",
-                    message: format!(
-                        "macro `{}` has {n} callsites (min {MIN_MACRO_CALLS})",
-                        d.name
-                    ),
+                    message: format!("macro `{}` has {n} callsites (min {min})", d.name),
                 });
             }
         }

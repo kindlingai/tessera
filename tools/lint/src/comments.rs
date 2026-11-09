@@ -1,7 +1,7 @@
 //! Comment extraction for Rust and C-like kernel sources.
 
 use crate::files::Source;
-use crate::{MAX_COMMENT_WORDS, Violation};
+use crate::{LIMITS, Violation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -249,12 +249,13 @@ pub fn group(raw: &[Raw]) -> Vec<Comment> {
 }
 
 pub fn check(src: &Source, rust: bool, out: &mut Vec<Violation>) {
+    let max = LIMITS.max_comment_words;
     for c in group(&scan(&src.text, rust)) {
-        if c.words > MAX_COMMENT_WORDS {
+        if c.words > max {
             out.push(src.violation(
                 c.line,
                 "comment-words",
-                format!("comment of {} words (max {MAX_COMMENT_WORDS})", c.words),
+                format!("comment of {} words (max {max})", c.words),
             ));
         }
     }

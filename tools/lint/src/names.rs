@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::files::owner;
-use crate::{MAX_FAMILY_SEGMENTS, MAX_NAME_SEGMENTS, Violation};
+use crate::{LIMITS, Violation};
 
 /// A Rust function or kernel entry point, with its location.
 pub struct Name {
@@ -34,14 +34,15 @@ fn in_family(name: &str, crate_names: &[&str]) -> bool {
 /// Why `name` breaks the rule, if it does.
 pub fn fault(name: &str, crate_names: &[&str]) -> Option<String> {
     let n = pieces(name).len();
-    if n <= MAX_NAME_SEGMENTS {
+    let (base, family) = (LIMITS.max_name_segments, LIMITS.max_family_segments);
+    if n <= base {
         return None;
     }
-    if n <= MAX_FAMILY_SEGMENTS && in_family(name, crate_names) {
+    if n <= family && in_family(name, crate_names) {
         return None;
     }
-    Some(if n > MAX_FAMILY_SEGMENTS {
-        format!("{n} segments (max {MAX_FAMILY_SEGMENTS})")
+    Some(if n > family {
+        format!("{n} segments (max {family})")
     } else {
         format!("{n} segments: no other function in the crate shares its first or last")
     })

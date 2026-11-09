@@ -1,15 +1,10 @@
 //! Which files the rules read, and the per-crate totals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{MAX_CRATE_FILES, MAX_CRATE_LINES, MAX_MACRO_FILES, Violation};
-
-/// Rust plus the GPU kernel languages.
-pub const EXTENSIONS: &[&str] = &[
-    "rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip",
-];
+use crate::{LIMITS, Violation};
 
 pub struct Source {
     pub path: String,
@@ -66,7 +61,7 @@ pub fn sources(root: &Path) -> Result<Vec<Source>, String> {
     let mut out = Vec::new();
     for path in listed(root)? {
         let ext = Path::new(&path).extension().and_then(|e| e.to_str());
-        if !ext.is_some_and(|e| EXTENSIONS.contains(&e)) {
+        if !ext.is_some_and(|e| LIMITS.extensions.iter().any(|x| x == e)) {
             continue;
         }
         // Deleted but still in the index.
@@ -127,8 +122,22 @@ pub fn macro_dir(crate_dir: &str, path: &str) -> Option<(&'static str, String)> 
     None
 }
 
+/// Files, lines and source directories counted toward one crate.
+#[derive(Default)]
+struct Tally<'a> {
+    files: usize,
+    lines: usize,
+    modules: BTreeSet<&'a str>,
+}
+
+/// A crate's file budget: base plus extra per directory.
+fn max_files(modules: usize) -> usize {
+    let extra = modules.saturating_sub(1);
+    LIMITS.max_crate_files_base + extra * LIMITS.max_crate_files_addl_module
+}
+
 pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation>) {
-    let mut totals: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut totals: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut macros: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
     for src in sources {
         let Some(dir) = owner(dirs, &src.path) else {
@@ -139,17 +148,20 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
             continue;
         }
         let t = totals.entry(dir).or_default();
-        t.0 += 1;
-        t.1 += src.lines;
+        t.files += 1;
+        t.lines += src.lines;
+        t.modules
+            .insert(src.path.rsplit_once('/').map_or("", |(d, _)| d));
     }
     for ((dir, lang), mut mdirs) in macros {
         let path = format!("{dir}Cargo.toml");
-        if mdirs.len() > MAX_MACRO_FILES {
+        let max_macros = LIMITS.max_macro_files;
+        if mdirs.len() > max_macros {
             out.push(Violation {
                 path: path.clone(),
                 line: 1,
                 rule: "macro-files",
-                message: format!("{} {lang} macro files (max {MAX_MACRO_FILES})", mdirs.len()),
+                message: format!("{} {lang} macro files (max {max_macros})", mdirs.len()),
             });
         }
         mdirs.sort();
@@ -166,22 +178,26 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
             });
         }
     }
-    for (dir, (files, lines)) in totals {
+    for (dir, t) in totals {
         let path = format!("{dir}Cargo.toml");
-        if files > MAX_CRATE_FILES {
+        let (files, lines, modules) = (t.files, t.lines, t.modules.len());
+        let (budget, max_lines) = (max_files(modules), LIMITS.max_crate_lines);
+        if files > budget {
             out.push(Violation {
                 path: path.clone(),
                 line: 1,
                 rule: "crate-files",
-                message: format!("{files} source files (max {MAX_CRATE_FILES})"),
+                message: format!(
+                    "{files} source files (max {budget} for {modules} source directories)"
+                ),
             });
         }
-        if lines > MAX_CRATE_LINES {
+        if lines > max_lines {
             out.push(Violation {
                 path,
                 line: 1,
                 rule: "crate-lines",
-                message: format!("{lines} source lines (max {MAX_CRATE_LINES})"),
+                message: format!("{lines} source lines (max {max_lines})"),
             });
         }
     }
