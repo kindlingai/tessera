@@ -3,7 +3,7 @@
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Cpu, Data, Tensor, run};
-use lower::{Device, Feed, cut, lower, open};
+use lower::{Device, Feed, cut, lower, open, rules};
 use models::{Stack, nanogpt, qwen3};
 use ops::testing::{Noise, gpu_available, max_abs_diff};
 use trace::{EntryKind, Mask, Model, Port, Role};
@@ -79,11 +79,10 @@ fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32
     max_abs_diff(&got[0], want[0].floats().unwrap())
 }
 
-/// One device per kernel choice, so each gets checked.
-fn devices() -> [Device; 3] {
-    let tiled = || Device::guess().without("thin");
-    let thin = Device::guess().without("matmul");
-    [tiled(), thin, tiled().without("attend")]
+/// One device per registered rule, favoring it everywhere.
+fn devices() -> Vec<(&'static str, Device)> {
+    let favor = |r: &&lower::Rule| (r.name, Device::guess().favoring(r.name));
+    rules().iter().map(favor).collect()
 }
 
 #[test]
@@ -92,11 +91,15 @@ fn each_rule_matches_cpu() {
         return eprintln!("no GPU here; skipped");
     }
     let mut noise = Noise(7);
-    let mut checked = 0;
-    for (g, device) in graphs().iter().flat_map(|g| devices().map(|d| (g, d))) {
+    let mut used: Vec<&str> = Vec::new();
+    for (g, (rule, device)) in graphs()
+        .iter()
+        .flat_map(|g| devices().into_iter().map(move |d| (g, d)))
+    {
         let plan = lower(g, 0, &SIZES, &device).unwrap();
         let mut seen: Vec<&[NodeId]> = Vec::new();
         for step in &plan.steps {
+            used.extend((step.rule == rule).then_some(rule));
             if seen.contains(&&step.covers[..]) {
                 continue;
             }
@@ -112,9 +115,15 @@ fn each_rule_matches_cpu() {
             let off = gap(&sub, &[], &inputs, &device);
             assert!(off < 1e-4, "{:?} is off by {off:e}", step.kernel);
         }
-        checked += seen.len();
     }
-    assert!(checked > 120, "only {checked} rule uses checked");
+    // A new rule must be reachable from some graph here.
+    for rule in rules() {
+        assert!(
+            used.contains(&rule.name),
+            "no graph exercises {}",
+            rule.name
+        );
+    }
 }
 
 #[test]
@@ -131,9 +140,9 @@ fn whole_models_match_cpu() {
             .collect();
         let ports = &g.entries[0].inputs;
         let inputs: Vec<Tensor> = ports.iter().map(|p| fill(&g, &p.ty, &mut noise)).collect();
-        for device in devices() {
+        for (rule, device) in devices() {
             let off = gap(&g, &weights, &inputs, &device);
-            assert!(off < 1e-3, "outputs are off by {off:e}");
+            assert!(off < 1e-3, "favoring {rule}, outputs are off by {off:e}");
         }
     }
 }

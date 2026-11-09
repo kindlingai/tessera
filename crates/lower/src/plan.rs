@@ -1,6 +1,8 @@
 //! A plan: kernel launches over buffers that stay on device.
 
-use graph::{Act, NodeId};
+use crate::abi::{Arg, Launch};
+use crate::kernel::KernelRef;
+use graph::NodeId;
 
 /// Leading elements of one buffer. Every element is four bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9,119 +11,30 @@ pub struct Slot {
     pub len: usize,
 }
 
-/// One elementwise step of a generated kernel.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MapStage {
-    /// Adds the next operand.
-    Add,
-    /// Multiplies by the next operand.
-    Mul,
-    Scale(f32),
-    Act(Act),
-}
-
-/// The sizes one attention works over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Attn {
-    pub seqs: usize,
-    pub queries: usize,
-    pub keys: usize,
-    pub heads: usize,
-    pub kv_heads: usize,
-    pub width: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Kernel {
-    /// `x[m, k]` times `w[n, k]` transposed.
-    Matmul {
-        m: usize,
-        n: usize,
-        k: usize,
-    },
-    /// The same product, one thread per output column.
-    Thin {
-        m: usize,
-        n: usize,
-        k: usize,
-    },
-    RmsNorm {
-        rows: usize,
-        width: usize,
-        eps: f32,
-    },
-    Softmax {
-        rows: usize,
-        width: usize,
-    },
-    /// Each position's cosine and sine, per pair.
-    Angles {
-        width: usize,
-        theta: f32,
-    },
-    /// Rotates halves in place, by the second input's angles.
-    Rope {
-        positions: usize,
-        heads: usize,
-        width: usize,
-    },
-    /// Causal attention, key by key; keys and values arrive joined.
-    Attend(Attn),
-    /// Every query-key product, as `[Seqs, Heads, Queries, Keys]`.
-    Scores(Attn),
-    /// Scaled causal softmax over each score row, in place.
-    Causal {
-        queries: usize,
-        keys: usize,
-        scale: f32,
-    },
-    /// Each head's probabilities times its values.
-    Values(Attn),
-    Gather {
-        rows: usize,
-        width: usize,
-    },
-    /// A generated kernel; operands follow the first input.
-    Map(Vec<MapStage>),
-    /// Rows of two inputs, joined along the last axis.
-    Join {
-        left: usize,
-        right: usize,
-    },
-}
-
-impl Kernel {
-    /// Whether it writes over its first input.
-    pub fn overwrites(&self) -> bool {
-        matches!(self, Kernel::Rope { .. } | Kernel::Causal { .. })
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Kernel::Matmul { .. } => "matmul",
-            Kernel::Thin { .. } => "thin",
-            Kernel::RmsNorm { .. } => "rms_norm",
-            Kernel::Softmax { .. } => "softmax",
-            Kernel::Angles { .. } => "angles",
-            Kernel::Rope { .. } => "rope",
-            Kernel::Attend(_) => "attend",
-            Kernel::Scores(_) => "scores",
-            Kernel::Causal { .. } => "causal",
-            Kernel::Values(_) => "values",
-            Kernel::Gather { .. } => "gather",
-            Kernel::Map(_) => "map",
-            Kernel::Join { .. } => "join",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
-    pub kernel: Kernel,
+    pub kernel: KernelRef,
+    /// The rule that proposed it.
+    pub rule: &'static str,
     pub reads: Vec<Slot>,
     pub write: Slot,
     /// The graph nodes this launch computes, or helps compute.
     pub covers: Vec<NodeId>,
+}
+
+impl Step {
+    pub fn launches(&self) -> Vec<Launch> {
+        self.kernel.launches(self)
+    }
+
+    /// The `i`th input's buffer, from its start.
+    pub fn read(&self, i: usize) -> Arg {
+        Arg::Buffer(self.reads[i], 0)
+    }
+
+    pub fn out(&self) -> Arg {
+        Arg::Buffer(self.write, 0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

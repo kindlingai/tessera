@@ -1,4 +1,6 @@
-use crate::{Device, Error, Kernel, MapStage, Plan, assign, lower, peak, schedule, select};
+use crate::kernels::{Map, MapStage};
+use crate::{Device, Dialect, Error, Kernel, KernelRef, Plan, Source};
+use crate::{assign, lower, peak, rules, schedule, select};
 use graph::DimName::{self, Context, Seqs};
 use graph::{Act, Composite, Graph};
 use models::qwen3::{Config, program};
@@ -16,14 +18,18 @@ fn count(plan: &Plan, kernel: &str) -> usize {
     plan.steps.iter().filter(named).count()
 }
 
+fn gate() -> Map {
+    Map(vec![MapStage::Act(Act::Silu), MapStage::Mul])
+}
+
 #[test]
 fn gate_fuses() {
     let (g, plan) = toy(&Device::guess());
-    let fused = Kernel::Map(vec![MapStage::Act(Act::Silu), MapStage::Mul]);
+    let fused = KernelRef::new(gate());
     let steps: Vec<_> = plan.steps.iter().filter(|s| s.kernel == fused).collect();
     assert_eq!(steps.len(), 2, "one per layer");
     for s in steps {
-        assert_eq!((s.covers.len(), s.reads.len()), (2, 2));
+        assert_eq!((s.covers.len(), s.reads.len(), s.rule), (2, 2, "map"));
         let holds = |r: &&graph::Region| s.covers.iter().all(|c| r.start <= *c && *c < r.end);
         let region = g.regions.iter().find(holds).unwrap();
         assert_eq!(region.kind, Composite::Mlp);
@@ -42,7 +48,7 @@ fn buffers_are_shared() {
         plan.buffers.len() < values,
         "dead values free their buffers"
     );
-    assert_eq!(count(&plan, "angles"), 1);
+    assert_eq!(count(&plan, "angles"), 1, "one table serves every rotation");
     let unsized_context = lower(&g, 0, &[(Seqs, 2)], &Device::guess());
     assert!(matches!(unsized_context, Err(Error::Size(_))));
 }
@@ -67,7 +73,7 @@ fn cost_picks_attention() {
     // Dense attention is unproven, so a guess streams.
     let (_, stream) = toy(&Device::guess());
     assert_eq!((count(&stream, "attend"), count(&stream, "scores")), (2, 0));
-    let (_, dense) = toy(&Device::guess().without("attend"));
+    let (_, dense) = toy(&Device::guess().favoring("dense"));
     assert_eq!((count(&dense, "attend"), count(&dense, "join")), (0, 0));
     let per_layer = ["scores", "causal", "values"].map(|k| count(&dense, k));
     assert_eq!(per_layer, [2, 2, 2]);
@@ -77,6 +83,22 @@ fn cost_picks_attention() {
         .find(|s| s.kernel.name() == "causal")
         .unwrap();
     assert_eq!(softmax.write.buffer, softmax.reads[0].buffer, "in place");
+}
+
+#[test]
+fn rules_register_themselves() {
+    let names: Vec<&str> = rules().iter().map(|r| r.name).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "rule names are unique and ordered");
+    for expected in ["attend", "dense", "map", "matmul", "thin"] {
+        assert!(names.contains(&expected), "{expected} is missing");
+    }
+    let g = program(&Config::toy(4, 16));
+    let picked = select(&g, 0, &SIZES, &Device::guess()).unwrap();
+    let contested: Vec<&str> = picked.contested.iter().copied().collect();
+    assert_eq!(contested, ["attend", "dense", "matmul", "thin"]);
 }
 
 #[test]
@@ -94,9 +116,7 @@ fn order_saves_memory() {
 
 #[test]
 fn dialects_agree() {
-    use crate::{Dialect, Source, source};
-    let fused = Kernel::Map(vec![MapStage::Act(Act::Silu), MapStage::Mul]);
-    let Source::Made(text) = source(&fused) else {
+    let Source::Made(text) = gate().source() else {
         panic!("maps are generated");
     };
     let (metal, cuda) = (text.render(Dialect::Metal), text.render(Dialect::Cuda));

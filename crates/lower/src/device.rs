@@ -4,7 +4,7 @@ macro_rules! device_runner {
     ($bk:ident) => {
         pub mod $bk {
             use crate::Error;
-            use crate::abi::{Arg, Launch, Shape, Source, launches, source};
+            use crate::abi::{Arg, Launch, Shape, Source};
             use crate::emit::Dialect;
             use crate::plan::{Plan, Slot};
             use crate::run::Run;
@@ -36,7 +36,7 @@ macro_rules! device_runner {
                     let mut made: HashMap<String, Kernel> = HashMap::new();
                     let mut kernels = Vec::with_capacity(plan.steps.len());
                     for step in &plan.steps {
-                        let text = match source(&step.kernel) {
+                        let text = match step.kernel.source() {
                             Source::Fixed { cuda, entry, .. } => {
                                 kernels.push(cached_source_kernel(cuda, entry)?);
                                 continue;
@@ -110,7 +110,7 @@ macro_rules! device_runner {
                 /// Enqueues every launch, then waits once.
                 fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
                     for i in steps {
-                        for launch in launches(&self.plan.steps[i]) {
+                        for launch in self.plan.steps[i].launches() {
                             self.launch(&self.kernels[i], &launch)?;
                         }
                     }

@@ -1,6 +1,8 @@
 //! Gives each value a buffer, for one op order.
 
-use crate::plan::{Kernel, Output, Plan, Slot, Step};
+use crate::kernel::KernelRef;
+use crate::kernels::Map;
+use crate::plan::{Output, Plan, Slot, Step};
 use crate::select::{Home, Selected, Val};
 
 /// A last use that never comes: weights, inputs and outputs.
@@ -101,7 +103,8 @@ impl Buffers<'_> {
                 let copy = self.alloc(op.write);
                 let covers = op.covers.clone();
                 self.plan.steps.push(Step {
-                    kernel: Kernel::Map(Vec::new()),
+                    kernel: KernelRef::new(Map(Vec::new())),
+                    rule: op.rule,
                     reads: vec![reads[0]],
                     write: copy,
                     covers,
@@ -114,6 +117,7 @@ impl Buffers<'_> {
         };
         self.plan.steps.push(Step {
             kernel: op.kernel.clone(),
+            rule: op.rule,
             reads,
             write,
             covers: op.covers.clone(),

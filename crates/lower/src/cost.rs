@@ -1,6 +1,7 @@
 //! What launches cost on one device, fitted to measurements.
 
-use crate::plan::{Kernel, Plan, Step};
+use crate::kernel::Kernel;
+use crate::plan::{Plan, Step};
 use std::collections::BTreeMap;
 
 /// What a plan uses of each resource.
@@ -13,43 +14,21 @@ pub struct Cost {
 }
 
 /// One device's launch times, by kernel name.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Device {
     /// Work and seconds, sorted by work.
     curves: BTreeMap<&'static str, Vec<(f64, f64)>>,
+    /// A rule to pick wherever it applies, whatever it costs.
+    favor: Option<&'static str>,
 }
 
-/// Multiply-adds, or elements touched, in one launch of `k`.
-pub fn work(k: &Kernel, len: usize) -> f64 {
-    let tile = |n: usize| n.div_ceil(64) * 64;
-    let units = match *k {
-        // The tiled kernel pays for whole tiles.
-        Kernel::Matmul { m, n, k } => tile(m) * tile(n) * k,
-        Kernel::Thin { m, n, k } => m * n * k,
-        Kernel::Attend(a) => a.seqs * a.heads * a.queries * a.keys * a.width,
-        // Two tiled matmuls per head.
-        Kernel::Scores(a) => a.seqs * a.heads * tile(a.queries) * tile(a.keys) * a.width,
-        Kernel::Values(a) => a.seqs * a.heads * tile(a.queries) * tile(a.width) * a.keys,
-        Kernel::Map(ref stages) => len * (1 + stages.len()),
-        _ => len,
-    };
-    units as f64
-}
+/// What every launch is guessed to cost before any work.
+const FIXED: f64 = 1e-4;
 
 impl Device {
-    /// Rough times, for planning before anything is measured.
+    /// No measurements: each kernel's own guess decides.
     pub fn guess() -> Self {
-        let line = |per_unit: f64| vec![(0.0, 1e-4), (1e12, 1e-4 + 1e12 * per_unit)];
-        let names = [
-            "matmul", "rms_norm", "softmax", "angles", "rope", "attend", "causal", "gather", "map",
-            "join",
-        ];
-        let mut curves: BTreeMap<_, _> = names.iter().map(|n| (*n, line(1e-10))).collect();
-        // Unproven, so each must earn its place by measurement.
-        for name in ["thin", "scores", "values"] {
-            curves.insert(name, line(1e-9));
-        }
-        Self { curves }
+        Self::default()
     }
 
     /// The same device, never choosing `kernel`.
@@ -58,10 +37,23 @@ impl Device {
         self
     }
 
+    /// The same device, always choosing `rule` where it applies.
+    pub fn favoring(mut self, rule: &'static str) -> Self {
+        self.favor = Some(rule);
+        self
+    }
+
+    pub fn favors(&self, rule: &str) -> bool {
+        self.favor == Some(rule)
+    }
+
     /// Estimated seconds for one launch writing `len` elements.
-    pub fn seconds(&self, k: &Kernel, len: usize) -> f64 {
-        let curve = self.curves.get(k.name());
-        curve.map_or(f64::INFINITY, |c| along(c, work(k, len)))
+    pub fn seconds(&self, k: &dyn Kernel, len: usize) -> f64 {
+        let work = k.work(len);
+        match self.curves.get(k.name()) {
+            Some(curve) => along(curve, work),
+            None => FIXED + k.guess() * work,
+        }
     }
 
     /// The plan's estimated use of each resource.
@@ -69,9 +61,9 @@ impl Device {
         let mut total = Cost::default();
         for step in &plan.steps {
             let moved: usize = step.reads.iter().map(|r| r.len).sum();
-            total.seconds += self.seconds(&step.kernel, step.write.len);
+            total.seconds += self.seconds(&*step.kernel, step.write.len);
             total.bytes += 4 * (moved + step.write.len) as u64;
-            total.launches += crate::abi::launches(step).len();
+            total.launches += step.launches().len();
         }
         total
     }
@@ -80,7 +72,7 @@ impl Device {
     pub fn fit<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
         let mut by: BTreeMap<&'static str, BTreeMap<u64, Vec<f64>>> = BTreeMap::new();
         for (step, seconds) in samples {
-            let units = work(&step.kernel, step.write.len) as u64;
+            let units = step.kernel.work(step.write.len) as u64;
             let sizes = by.entry(step.kernel.name()).or_default();
             sizes.entry(units).or_default().push(seconds);
         }
