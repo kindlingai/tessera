@@ -2,6 +2,10 @@
 resolver = "3"
 members = [
     "crates/graph",
+    "crates/trace",
+    "crates/trace-derive",
+    "crates/interp",
+    "crates/models",
     "crates/gpukit",
     "crates/gemm",
     "crates/ops",

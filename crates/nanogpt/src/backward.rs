@@ -1,7 +1,7 @@
 //! Analytic gradients for the tiny GPT, on GPU ops.
 
-use crate::model::{Cache, EPS, GptConfig, Weights};
-use crate::tensor as t;
+use nanogpt::model::{Cache, EPS, GptConfig, Weights};
+use nanogpt::tensor as t;
 use ops::Error;
 
 pub struct LayerGrads {
@@ -61,7 +61,7 @@ fn cross_entropy(logits: &[f32], targets: &[u32], rows: usize, vocab: usize) -> 
 
 /// Cross-entropy of a forward pass, without keeping the cache.
 pub fn loss(w: &Weights, cfg: &GptConfig, tokens: &[u32], targets: &[u32]) -> Result<f32, Error> {
-    let cache = crate::model::forward(w, cfg, tokens, cfg.block)?;
+    let cache = nanogpt::model::forward(w, cfg, tokens, cfg.block)?;
     let rows = cache.logits.len() / cfg.vocab;
     Ok(cross_entropy(&cache.logits, targets, rows, cfg.vocab).0)
 }

@@ -12,7 +12,7 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    pub fn from_str(text: &str) -> Self {
+    pub fn from_text(text: &str) -> Self {
         let bytes = text.as_bytes().to_vec();
         let mut vocab: Vec<u8> = bytes.clone();
         vocab.sort_unstable();
@@ -31,6 +31,10 @@ impl Corpus {
 
     pub fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     /// Encode a string; unknown bytes are skipped.
