@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use super::KernelArgs;
 use super::hip::{self, HipFunction, HipModule, Runtime};
 use crate::Error;
+use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::launch::Launch;
 
@@ -222,5 +223,67 @@ unsafe impl Sync for Kernel {}
 impl Kernel {
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl Device for Context {
+    type Kernel = Kernel;
+
+    fn open() -> Result<Self, Error> {
+        Context::new(ContextConfig::default())
+    }
+
+    fn error(msg: String) -> Error {
+        Error::Rocm(msg)
+    }
+
+    fn caches() -> &'static Caches<Self> {
+        static CACHES: Caches<Context> = Caches::new();
+        &CACHES
+    }
+
+    fn alloc(&self, size: usize) -> Result<u64, Error> {
+        self.set_current()?;
+        let mut ptr = 0;
+        let rt = self.runtime();
+        rt.check(unsafe { (rt.hip_malloc)(&mut ptr, size) }, "hipMalloc")?;
+        Ok(ptr)
+    }
+
+    fn free(&self, ptr: u64) {
+        // At process exit the runtime may already be gone.
+        if self.set_current().is_ok() {
+            unsafe { (self.runtime().hip_free)(ptr) };
+        }
+    }
+
+    fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.set_current()?;
+        let rt = self.runtime();
+        let (dst, src) = (ptr as *mut _, bytes.as_ptr().cast());
+        let code = unsafe { (rt.hip_memcpy)(dst, src, bytes.len(), hip::MEMCPY_HOST_TO_DEVICE) };
+        rt.check(code, "hipMemcpy to device")
+    }
+
+    fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        self.set_current()?;
+        let rt = self.runtime();
+        let (dst, src) = (bytes.as_mut_ptr().cast(), ptr as *const _);
+        let code = unsafe { (rt.hip_memcpy)(dst, src, bytes.len(), hip::MEMCPY_DEVICE_TO_HOST) };
+        rt.check(code, "hipMemcpy to host")
+    }
+
+    fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
+        self.set_current()?;
+        let rt = self.runtime();
+        rt.check(unsafe { (rt.hip_memset)(ptr, 0, size) }, "hipMemset")
+    }
+
+    fn load_image(&self, image: &[u8], entry: &str) -> Result<Kernel, Error> {
+        self.load_module(image)?.function(entry)
+    }
+
+    fn compile(&self, source: &str, entry: &str) -> Result<Kernel, Error> {
+        self.compile_kernel(source, entry)
     }
 }
