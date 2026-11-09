@@ -1,0 +1,14 @@
+[package]
+name = "ops"
+version = "0.1.0"
+edition = "2024"
+description = "Shared core of the portable GPU ops: backend choice, op registration, test helpers"
+license = "MIT"
+
+[features]
+default = []
+# NVRTC compiles the .cu bodies on first dispatch, so no toolkit is needed.
+cuda = ["gpukit/cuda"]
+
+[dependencies]
+gpukit = { path = "../gpukit", default-features = false }

@@ -16,8 +16,8 @@ mod reference;
 mod tensor;
 mod train;
 
-use dgops::backend;
 use model::{GptConfig, Rng, Weights};
+use ops::backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
 

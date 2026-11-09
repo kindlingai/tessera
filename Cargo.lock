@@ -34,28 +34,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "dgemm"
-version = "0.1.0"
-dependencies = [
- "gpukit",
- "objc2",
- "objc2-metal",
-]
-
-[[package]]
-name = "dgops"
-version = "0.1.0"
-dependencies = [
- "gpukit",
- "objc2",
- "objc2-metal",
-]
-
-[[package]]
 name = "dtor"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd3f6c362b2bbd7063090886afd78978f5dbf1f11da7efcc40f81d32c943fac1"
+
+[[package]]
+name = "gemm"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "objc2",
+ "objc2-metal",
+]
 
 [[package]]
 name = "gpukit"
@@ -117,8 +108,11 @@ checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
 name = "nanogpt"
 version = "0.1.0"
 dependencies = [
- "dgemm",
- "dgops",
+ "gemm",
+ "ops",
+ "ops-math",
+ "ops-model",
+ "ops-train",
 ]
 
 [[package]]
@@ -156,6 +150,37 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-foundation",
+]
+
+[[package]]
+name = "ops"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+]
+
+[[package]]
+name = "ops-math"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "ops",
+]
+
+[[package]]
+name = "ops-model"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "ops",
+]
+
+[[package]]
+name = "ops-train"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "ops",
 ]
 
 [[package]]

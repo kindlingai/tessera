@@ -4,7 +4,7 @@
 
 use crate::model::{Cache, EPS, GptConfig, Weights};
 use crate::tensor as t;
-use dgops::Error;
+use ops::Error;
 
 pub struct LayerGrads {
     pub ln1: Vec<f32>,

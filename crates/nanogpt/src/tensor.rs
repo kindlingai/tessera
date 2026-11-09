@@ -1,7 +1,7 @@
 //! Thin wrappers over dgops and dgemm that keep the model code readable.
 
-use dgemm::{Call, Problem, gpu as gemm_gpu};
-use dgops::Error;
+use gemm::{Call, Problem, gpu as gemm_gpu};
+use ops::Error;
 
 /// C = alpha * op(A) @ op(B) + beta * C, with explicit leading dimensions.
 #[allow(clippy::too_many_arguments)]
@@ -51,7 +51,7 @@ pub fn rms_norm(
     hidden: usize,
     eps: f32,
 ) -> Result<Vec<f32>, Error> {
-    dgops::ops::rms_norm::gpu(&dgops::ops::rms_norm::Fixture {
+    ops_math::rms_norm::gpu(&ops_math::rms_norm::Fixture {
         x: x.to_vec(),
         weight: weight.to_vec(),
         rows,
@@ -61,18 +61,18 @@ pub fn rms_norm(
 }
 
 pub fn gelu(x: &[f32]) -> Result<Vec<f32>, Error> {
-    dgops::ops::gelu::gpu(&dgops::ops::gelu::Fixture { x: x.to_vec() })
+    ops_math::gelu::gpu(&ops_math::gelu::Fixture { x: x.to_vec() })
 }
 
 pub fn vec_add(x: &[f32], addend: &[f32]) -> Result<Vec<f32>, Error> {
-    dgops::ops::vec_add::gpu(&dgops::ops::vec_add::Fixture {
+    ops_math::vec_add::gpu(&ops_math::vec_add::Fixture {
         x: x.to_vec(),
         addend: addend.to_vec(),
     })
 }
 
 pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, Error> {
-    dgops::ops::softmax::gpu(&dgops::ops::softmax::Fixture {
+    ops_math::softmax::gpu(&ops_math::softmax::Fixture {
         logits: x.to_vec(),
         rows,
         cols,
@@ -80,7 +80,7 @@ pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, Error> {
 }
 
 pub fn gather_rows(src: &[f32], indices: &[u32], hidden: usize) -> Result<Vec<f32>, Error> {
-    dgops::ops::gather_rows::gpu(&dgops::ops::gather_rows::Fixture {
+    ops_model::gather_rows::gpu(&ops_model::gather_rows::Fixture {
         src: src.to_vec(),
         indices: indices.to_vec(),
         hidden,
@@ -95,7 +95,7 @@ pub fn rms_norm_backward(
     hidden: usize,
     eps: f32,
 ) -> Result<Vec<f32>, Error> {
-    dgops::ops::rms_norm_backward::gpu(&dgops::ops::rms_norm_backward::Fixture {
+    ops_train::rms_norm_backward::gpu(&ops_train::rms_norm_backward::Fixture {
         x: x.to_vec(),
         weight: weight.to_vec(),
         dy: dy.to_vec(),
@@ -106,7 +106,7 @@ pub fn rms_norm_backward(
 }
 
 pub fn gelu_backward(g: &[f32], dy: &[f32]) -> Result<Vec<f32>, Error> {
-    dgops::ops::gelu_backward::gpu(&dgops::ops::gelu_backward::Fixture {
+    ops_train::gelu_backward::gpu(&ops_train::gelu_backward::Fixture {
         g: g.to_vec(),
         dy: dy.to_vec(),
     })
@@ -118,7 +118,7 @@ pub fn softmax_backward(
     rows: usize,
     cols: usize,
 ) -> Result<Vec<f32>, Error> {
-    dgops::ops::softmax_backward::gpu(&dgops::ops::softmax_backward::Fixture {
+    ops_train::softmax_backward::gpu(&ops_train::softmax_backward::Fixture {
         probs: probs.to_vec(),
         dp: dp.to_vec(),
         rows,
@@ -132,7 +132,7 @@ pub fn scatter_add_rows(
     src: &[f32],
     hidden: usize,
 ) -> Result<Vec<f32>, Error> {
-    dgops::ops::scatter_add_rows::gpu(&dgops::ops::scatter_add_rows::Fixture {
+    ops_train::scatter_add_rows::gpu(&ops_train::scatter_add_rows::Fixture {
         dst: dst.to_vec(),
         indices: indices.to_vec(),
         src: src.to_vec(),
@@ -154,7 +154,7 @@ pub fn adamw(
     eps: f32,
     weight_decay: f32,
 ) -> Result<Vec<f32>, Error> {
-    dgops::ops::adamw::gpu(&dgops::ops::adamw::Fixture {
+    ops_train::adamw::gpu(&ops_train::adamw::Fixture {
         p: p.to_vec(),
         g: g.to_vec(),
         m: m.to_vec(),
@@ -206,7 +206,7 @@ pub fn gemm_cpu(
             trans_b,
         },
     };
-    dgemm::cpu(&call)
+    gemm::cpu(&call)
 }
 
 /// Y = X @ W^T with X (m,k), W (n,k) (PyTorch linear layout) on the CPU oracle.
@@ -215,7 +215,7 @@ pub fn linear_cpu(x: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32
 }
 
 pub fn rms_norm_cpu(x: &[f32], weight: &[f32], rows: usize, hidden: usize, eps: f32) -> Vec<f32> {
-    dgops::ops::rms_norm::cpu(&dgops::ops::rms_norm::Fixture {
+    ops_math::rms_norm::cpu(&ops_math::rms_norm::Fixture {
         x: x.to_vec(),
         weight: weight.to_vec(),
         rows,
@@ -225,18 +225,18 @@ pub fn rms_norm_cpu(x: &[f32], weight: &[f32], rows: usize, hidden: usize, eps: 
 }
 
 pub fn gelu_cpu(x: &[f32]) -> Vec<f32> {
-    dgops::ops::gelu::cpu(&dgops::ops::gelu::Fixture { x: x.to_vec() })
+    ops_math::gelu::cpu(&ops_math::gelu::Fixture { x: x.to_vec() })
 }
 
 pub fn vec_add_cpu(x: &[f32], addend: &[f32]) -> Vec<f32> {
-    dgops::ops::vec_add::cpu(&dgops::ops::vec_add::Fixture {
+    ops_math::vec_add::cpu(&ops_math::vec_add::Fixture {
         x: x.to_vec(),
         addend: addend.to_vec(),
     })
 }
 
 pub fn softmax_cpu(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    dgops::ops::softmax::cpu(&dgops::ops::softmax::Fixture {
+    ops_math::softmax::cpu(&ops_math::softmax::Fixture {
         logits: x.to_vec(),
         rows,
         cols,
@@ -244,7 +244,7 @@ pub fn softmax_cpu(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 pub fn gather_rows_cpu(src: &[f32], indices: &[u32], hidden: usize) -> Vec<f32> {
-    dgops::ops::gather_rows::cpu(&dgops::ops::gather_rows::Fixture {
+    ops_model::gather_rows::cpu(&ops_model::gather_rows::Fixture {
         src: src.to_vec(),
         indices: indices.to_vec(),
         hidden,

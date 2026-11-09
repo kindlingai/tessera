@@ -3,7 +3,7 @@
 //! vec_add). The cache it returns is what the backward pass needs.
 
 use crate::tensor as t;
-use dgops::Error;
+use ops::Error;
 
 pub const EPS: f32 = 1e-5;
 

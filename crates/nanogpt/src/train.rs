@@ -5,7 +5,7 @@ use crate::backward;
 use crate::data::Corpus;
 use crate::model::{self, GptConfig, Weights};
 use crate::tensor as t;
-use dgops::Error;
+use ops::Error;
 
 pub const BETA1: f32 = 0.9;
 pub const BETA2: f32 = 0.95;

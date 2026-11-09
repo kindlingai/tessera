@@ -1,0 +1,15 @@
+[package]
+name = "ops-model"
+version = "0.1.0"
+edition = "2024"
+description = "Portable GPU ops for transformer layers: embedding, RoPE, attention, MoE routing"
+license = "MIT"
+
+[features]
+default = []
+# NVRTC compiles the .cu bodies on first dispatch, so no toolkit is needed.
+cuda = ["gpukit/cuda", "ops/cuda"]
+
+[dependencies]
+gpukit = { path = "../gpukit", default-features = false }
+ops = { path = "../ops" }
