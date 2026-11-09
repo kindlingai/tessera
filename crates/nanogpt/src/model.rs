@@ -15,7 +15,7 @@ pub struct GptConfig {
 }
 
 impl GptConfig {
-    /// nanoGPT-shaped, small enough to train on a laptop.
+    /// nanoGPT-shaped and small.
     pub fn tiny(vocab: usize) -> Self {
         Self {
             vocab,
@@ -50,11 +50,6 @@ impl Rng {
         x ^= x << 17;
         self.0 = x;
         x
-    }
-
-    /// Uniform in [0, 1).
-    pub fn uniform(&mut self) -> f64 {
-        ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64)
     }
 
     /// Standard normal via Box-Muller.
@@ -111,35 +106,16 @@ impl Weights {
     }
 }
 
-pub struct LayerCache {
-    pub h1: Vec<f32>,
-    pub qkv: Vec<f32>,
-    pub probs: Vec<f32>,
-    pub attn: Vec<f32>,
-    pub x_attn: Vec<f32>,
-    pub h2: Vec<f32>,
-    pub g: Vec<f32>,
-    pub f: Vec<f32>,
-    pub x_out: Vec<f32>,
-}
-
-pub struct Cache {
-    pub tokens: Vec<u32>,
-    pub pos_ids: Vec<u32>,
-    pub x0: Vec<f32>,
-    pub layers: Vec<LayerCache>,
-    pub hf: Vec<f32>,
-    pub logits: Vec<f32>,
-    pub batch: usize,
-    pub seq: usize,
-}
-
-/// Forward pass, keeping every intermediate the backward pass needs.
-pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Result<Cache, Error> {
+/// Logits for every position, on the GPU ops.
+pub fn forward(
+    w: &Weights,
+    cfg: &GptConfig,
+    tokens: &[u32],
+    seq: usize,
+) -> Result<Vec<f32>, Error> {
     let c = cfg.n_embd;
     let heads = cfg.n_head;
     let hd = cfg.head_dim();
-    // Sampling feeds contexts shorter than block.
     assert!(seq > 0 && seq <= cfg.block, "seq must be in 1..=block");
     assert_eq!(
         tokens.len() % seq,
@@ -154,17 +130,14 @@ pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Resu
         .collect();
     let tok = t::gather_rows(&w.tok_emb, tokens, c)?;
     let pos = t::gather_rows(&w.pos_emb, &pos_ids, c)?;
-    let x0 = t::vec_add(&tok, &pos)?;
-    let mut x = x0.clone();
+    let mut x = t::vec_add(&tok, &pos)?;
 
     let scale = 1.0 / (hd as f32).sqrt();
-    let mut layers = Vec::with_capacity(cfg.n_layer);
 
     for lw in &w.layers {
         let h1 = t::rms_norm(&x, &lw.ln1, m, c, EPS)?;
         let qkv = t::linear(&h1, &lw.wqkv, m, 3 * c, c)?;
 
-        let mut probs = vec![0.0f32; batch * heads * seq * seq];
         let mut attn = vec![0.0f32; m * c];
         for b in 0..batch {
             for h in 0..heads {
@@ -211,8 +184,6 @@ pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Resu
                     let dst = (b * seq + row) * c + h * hd;
                     attn[dst..dst + hd].copy_from_slice(&head_out[row * hd..(row + 1) * hd]);
                 }
-                let pbase = (b * heads + h) * seq * seq;
-                probs[pbase..pbase + seq * seq].copy_from_slice(&p);
             }
         }
 
@@ -222,32 +193,9 @@ pub fn forward(w: &Weights, cfg: &GptConfig, tokens: &[u32], seq: usize) -> Resu
         let g = t::linear(&h2, &lw.w1, m, cfg.mlp(), c)?;
         let f = t::gelu(&g)?;
         let down = t::linear(&f, &lw.w2, m, c, cfg.mlp())?;
-        let x_out = t::vec_add(&x_attn, &down)?;
-
-        layers.push(LayerCache {
-            h1,
-            qkv,
-            probs,
-            attn,
-            x_attn,
-            h2,
-            g,
-            f,
-            x_out: x_out.clone(),
-        });
-        x = x_out;
+        x = t::vec_add(&x_attn, &down)?;
     }
 
     let hf = t::rms_norm(&x, &w.ln_f, m, c, EPS)?;
-    let logits = t::linear(&hf, &w.lm_head, m, cfg.vocab, c)?;
-    Ok(Cache {
-        tokens: tokens.to_vec(),
-        pos_ids,
-        x0,
-        layers,
-        hf,
-        logits,
-        batch,
-        seq,
-    })
+    t::linear(&hf, &w.lm_head, m, cfg.vocab, c)
 }

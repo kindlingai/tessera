@@ -234,7 +234,7 @@ impl Module {
                 other => other,
             })?;
         Ok(Kernel {
-            module: Arc::clone(self),
+            _module: Arc::clone(self),
             raw,
             name: name.to_string(),
         })
@@ -256,7 +256,8 @@ impl Drop for Module {
 /// A resolved kernel entry point that keeps its module alive.
 #[derive(Clone)]
 pub struct Kernel {
-    module: Arc<Module>,
+    /// Holding it keeps the module loaded.
+    _module: Arc<Module>,
     raw: CUfunction,
     name: String,
 }
@@ -268,20 +269,5 @@ unsafe impl Sync for Kernel {}
 impl Kernel {
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Raise the dynamic shared-memory limit, needed above 48 KiB.
-    pub fn set_max_dynamic_shared(&self, bytes: i32) -> Result<(), Error> {
-        const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
-        self.module.driver.check(
-            unsafe {
-                (self.module.driver.cu_func_set_attribute)(
-                    self.raw,
-                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    bytes,
-                )
-            },
-            "cuFuncSetAttribute",
-        )
     }
 }

@@ -5,18 +5,13 @@ edition = "2024"
 description = "Tiny character-level GPT that runs on the portable Metal/CUDA ops"
 license = "MIT"
 
-[[bin]]
-name = "nanogpt"
-path = "src/main.rs"
-
 [dependencies]
 gemm = { path = "../gemm" }
 ops = { path = "../ops" }
 ops-math = { path = "../ops-math" }
 ops-model = { path = "../ops-model" }
-ops-train = { path = "../ops-train" }
 
 [features]
 default = []
-cuda = ["gemm/cuda", "ops/cuda", "ops-math/cuda", "ops-model/cuda", "ops-train/cuda"]
-rocm = ["gemm/rocm", "ops/rocm", "ops-math/rocm", "ops-model/rocm", "ops-train/rocm"]
+cuda = ["gemm/cuda", "ops/cuda", "ops-math/cuda", "ops-model/cuda"]
+rocm = ["gemm/rocm", "ops/rocm", "ops-math/rocm", "ops-model/rocm"]

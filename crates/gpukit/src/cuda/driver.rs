@@ -53,7 +53,6 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> CUresult;
-type CuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
@@ -78,7 +77,6 @@ pub struct Driver {
     pub cu_memcpy_dtod: CuMemcpyDtoD,
     pub cu_memset_d8: CuMemsetD8,
     pub cu_launch_kernel: CuLaunchKernel,
-    pub cu_func_set_attribute: CuFuncSetAttribute,
     cu_get_error_name: CuGetErrorName,
     cu_get_error_string: CuGetErrorString,
 }
@@ -113,7 +111,6 @@ impl Driver {
             cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", CuMemcpyDtoD),
             cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
-            cu_func_set_attribute: sym!(lib, "cuFuncSetAttribute", CuFuncSetAttribute),
             cu_get_error_name: sym!(lib, "cuGetErrorName", CuGetErrorName),
             cu_get_error_string: sym!(lib, "cuGetErrorString", CuGetErrorString),
         })

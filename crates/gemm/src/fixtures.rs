@@ -40,8 +40,8 @@ pub fn linear() -> Call {
     build(8, 16, 32, false, true, 0.0)
 }
 
-/// Backward shape: A is (k,m), B is (k,n).
-pub fn backward_a() -> Call {
+/// A is (k,m), B is (k,n).
+pub fn trans_a() -> Call {
     build(6, 5, 7, true, false, 0.0)
 }
 

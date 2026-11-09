@@ -7,7 +7,7 @@ pub const DEFAULT_TEXT: &str = include_str!("../data/tiny.txt");
 
 pub struct Corpus {
     bytes: Vec<u8>,
-    vocab: Vec<u8>,
+    vocab: usize,
     stoi: HashMap<u8, u32>,
 }
 
@@ -22,47 +22,25 @@ impl Corpus {
             .enumerate()
             .map(|(i, &b)| (b, i as u32))
             .collect();
-        Self { bytes, vocab, stoi }
+        Self {
+            bytes,
+            vocab: vocab.len(),
+            stoi,
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        self.vocab
     }
 
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Encode a string; unknown bytes are skipped.
-    pub fn encode(&self, s: &str) -> Vec<u32> {
-        s.bytes()
-            .filter_map(|b| self.stoi.get(&b).copied())
-            .collect()
-    }
-
-    pub fn decode(&self, ids: &[u32]) -> String {
-        ids.iter()
-            .filter_map(|&i| self.vocab.get(i as usize).copied())
-            .map(char::from)
-            .collect()
-    }
-
-    /// Deterministic windows of block tokens, with targets shifted by one.
-    pub fn batch(&self, start: usize, batch: usize, block: usize) -> (Vec<u32>, Vec<u32>) {
+    /// Deterministic windows of block tokens.
+    pub fn batch(&self, start: usize, batch: usize, block: usize) -> Vec<u32> {
         let n = self.bytes.len();
-        let mut x = Vec::with_capacity(batch * block);
-        let mut y = Vec::with_capacity(batch * block);
-        for b in 0..batch {
-            let off = (start + b * block * 7) % (n - block - 1);
-            for t in 0..block {
-                x.push(self.stoi[&self.bytes[off + t]]);
-                y.push(self.stoi[&self.bytes[off + t + 1]]);
-            }
-        }
-        (x, y)
+        (0..batch)
+            .flat_map(|b| {
+                let off = (start + b * block * 7) % (n - block - 1);
+                self.bytes[off..off + block].iter().map(|c| self.stoi[c])
+            })
+            .collect()
     }
 }

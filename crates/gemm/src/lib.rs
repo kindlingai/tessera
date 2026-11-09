@@ -8,7 +8,6 @@ pub use device::cuda;
 #[cfg(feature = "rocm")]
 pub use device::rocm;
 pub mod fixtures;
-pub mod format;
 #[cfg(target_os = "macos")]
 mod metal;
 pub mod problem;

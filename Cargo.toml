@@ -11,7 +11,6 @@ members = [
     "crates/ops",
     "crates/ops-math",
     "crates/ops-model",
-    "crates/ops-train",
     "crates/nanogpt",
     "tools/lint",
 ]
