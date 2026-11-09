@@ -36,6 +36,10 @@ impl Kernel for Softmax {
         "softmax"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.rows, self.width]
+    }
+
     fn source(&self) -> Source {
         Source::Made(Text {
             entry: "plan_softmax".into(),

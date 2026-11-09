@@ -17,6 +17,10 @@ impl Kernel for Gather {
         "gather"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.rows, self.width]
+    }
+
     fn source(&self) -> Source {
         Source::Fixed {
             metal: gather_rows::METAL,

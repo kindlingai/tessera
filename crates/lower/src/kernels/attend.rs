@@ -16,6 +16,10 @@ impl Kernel for Attend {
         "attend"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
+    }
+
     fn source(&self) -> Source {
         use gqa_attention::{CUDA, ENTRY, METAL};
         Source::Fixed {

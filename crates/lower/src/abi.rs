@@ -1,6 +1,6 @@
 //! What a kernel declares: its arguments, shape and source.
 
-use crate::emit::Text;
+use crate::emit::{Dialect, Text, hash};
 use crate::plan::Slot;
 
 /// One kernel argument, in the order its source declares.
@@ -62,4 +62,16 @@ pub enum Source {
     },
     /// Written once, rendered per dialect.
     Made(Text),
+}
+
+impl Source {
+    /// Changes whenever the kernel's text does.
+    pub fn hash(&self) -> u64 {
+        match self {
+            Source::Fixed { metal, cuda, entry } => [metal, cuda, entry]
+                .iter()
+                .fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text)),
+            Source::Made(text) => hash(&text.render(Dialect::Cuda)),
+        }
+    }
 }

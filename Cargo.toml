@@ -8,6 +8,7 @@ members = [
     "crates/interp",
     "crates/lower",
     "crates/models",
+    "crates/calibrate",
     "crates/gpukit",
     "crates/gemm",
     "crates/ops",

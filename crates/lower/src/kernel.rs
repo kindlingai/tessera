@@ -16,6 +16,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn work(&self, len: usize) -> f64 {
         len as f64
     }
+    /// Sizes its time depends on. Near sizes cost alike.
+    fn sizes(&self) -> Vec<usize> {
+        Vec::new()
+    }
     /// Seconds per unit of work, until it is measured.
     fn guess(&self) -> f64 {
         1e-10

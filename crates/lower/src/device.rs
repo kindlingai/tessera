@@ -15,6 +15,7 @@ macro_rules! device_runner {
             };
             use std::collections::HashMap;
             use std::ops::Range;
+            use std::time::Instant;
 
             pub struct Runner {
                 ctx: &'static Context,
@@ -113,6 +114,22 @@ macro_rules! device_runner {
                     let mut out = vec![0.0; slot.len];
                     self.buffer(slot).read_f32(&mut out)?;
                     Ok(out)
+                }
+
+                fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {
+                    self.ctx.synchronize()?;
+                    let start = Instant::now();
+                    for _ in 0..times {
+                        for launch in self.plan.steps[step].launches() {
+                            self.launch(&self.kernels[step], &launch)?;
+                        }
+                    }
+                    self.ctx.synchronize()?;
+                    Ok(start.elapsed().as_secs_f64() / times as f64)
+                }
+
+                fn device(&self) -> String {
+                    format!("{} {}", stringify!($bk), self.ctx.name())
                 }
 
                 /// Enqueues every launch, then waits once.

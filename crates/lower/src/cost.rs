@@ -1,8 +1,14 @@
-//! What launches cost on one device, fitted to measurements.
+//! What launches cost on one device, from timed samples.
 
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{Error, ErrorKind};
+use std::path::Path;
+
+/// Bumped whenever a stored device changes meaning.
+const VERSION: u32 = 1;
 
 /// What a plan uses of each resource.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -13,27 +19,75 @@ pub struct Cost {
     pub launches: usize,
 }
 
-/// One device's launch times, by kernel name.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// One kernel's timed launch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Sample {
+    /// The kernel as it prints: its name and every size.
+    pub kernel: String,
+    /// A hash of its source when it was timed.
+    pub source: u64,
+    pub sizes: Vec<usize>,
+    pub work: f64,
+    pub seconds: f64,
+    /// Logarithms of the sizes and the work.
+    #[serde(skip)]
+    at: Vec<f64>,
+}
+
+/// Where a launch lies among samples: nearby ones cost alike.
+fn place(sizes: &[usize], work: f64) -> Vec<f64> {
+    let sizes = sizes.iter().map(|s| (*s).max(1) as f64);
+    sizes.chain([work.max(1.0)]).map(f64::ln).collect()
+}
+
+impl Sample {
+    pub fn new(step: &Step, seconds: f64) -> Self {
+        let (sizes, work) = (step.kernel.sizes(), step.kernel.work(step.write.len));
+        Self {
+            kernel: format!("{:?}", step.kernel),
+            source: step.kernel.source().hash(),
+            at: place(&sizes, work),
+            sizes,
+            work,
+            seconds,
+        }
+    }
+
+    /// The same kernel and sizes, whatever its source or time.
+    fn same(&self, other: &Sample) -> bool {
+        self.kernel == other.kernel && self.work == other.work
+    }
+}
+
+/// One device's timed launches, by kernel name.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Device {
-    /// Work and seconds, sorted by work.
-    curves: BTreeMap<&'static str, Vec<(f64, f64)>>,
+    /// The hardware that ran the samples.
+    pub name: String,
+    timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
+    #[serde(skip)]
     favor: Option<&'static str>,
+    /// Kernels never to choose.
+    #[serde(skip)]
+    barred: Vec<&'static str>,
 }
 
 /// What every launch is guessed to cost before any work.
 const FIXED: f64 = 1e-4;
 
+/// How many samples one estimate blends.
+const NEAR: usize = 3;
+
 impl Device {
-    /// No measurements: each kernel's own guess decides.
+    /// No samples: each kernel's own guess decides.
     pub fn guess() -> Self {
         Self::default()
     }
 
     /// The same device, never choosing `kernel`.
     pub fn without(mut self, kernel: &'static str) -> Self {
-        self.curves.insert(kernel, vec![(0.0, f64::INFINITY)]);
+        self.barred.push(kernel);
         self
     }
 
@@ -49,11 +103,13 @@ impl Device {
 
     /// Estimated seconds for one launch writing `len` elements.
     pub fn seconds(&self, k: &dyn Kernel, len: usize) -> f64 {
-        let work = k.work(len);
-        match self.curves.get(k.name()) {
-            Some(curve) => along(curve, work),
-            None => FIXED + k.guess() * work,
+        if self.barred.contains(&k.name()) {
+            return f64::INFINITY;
         }
+        let work = k.work(len);
+        let timed = self.timed.get(k.name());
+        let near = timed.and_then(|t| estimate(t, &place(&k.sizes(), work), work));
+        near.unwrap_or(FIXED + k.guess() * work)
     }
 
     /// The plan's estimated use of each resource.
@@ -68,37 +124,84 @@ impl Device {
         total
     }
 
-    /// Replaces the curve of every kernel that `samples` measured.
+    /// Whether this launch was timed with its current source.
+    pub fn known(&self, step: &Step) -> bool {
+        let now = Sample::new(step, 0.0);
+        let timed = self.timed.get(step.kernel.name());
+        let fresh = |s: &Sample| s.same(&now) && s.source == now.source;
+        timed.is_some_and(|t| t.iter().any(fresh))
+    }
+
+    pub fn samples(&self) -> usize {
+        self.timed.values().map(Vec::len).sum()
+    }
+
+    /// Adds timed launches. A launch timed before is replaced.
     pub fn fit<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
-        let mut by: BTreeMap<&'static str, BTreeMap<u64, Vec<f64>>> = BTreeMap::new();
+        let mut seen: Vec<(&'static str, Sample, Vec<f64>)> = Vec::new();
         for (step, seconds) in samples {
-            let units = step.kernel.work(step.write.len) as u64;
-            let sizes = by.entry(step.kernel.name()).or_default();
-            sizes.entry(units).or_default().push(seconds);
+            let sample = Sample::new(step, seconds);
+            match seen.iter_mut().find(|(_, s, _)| s.same(&sample)) {
+                Some((_, _, all)) => all.push(seconds),
+                None => seen.push((step.kernel.name(), sample, vec![seconds])),
+            }
         }
-        for (name, sizes) in by {
-            let point = |(units, mut seen): (u64, Vec<f64>)| {
-                // The median shrugs off one slow launch.
-                seen.sort_by(f64::total_cmp);
-                (units as f64, seen[seen.len() / 2])
-            };
-            self.curves
-                .insert(name, sizes.into_iter().map(point).collect());
+        for (name, mut sample, mut all) in seen {
+            // The median shrugs off one slow launch.
+            all.sort_by(f64::total_cmp);
+            sample.seconds = all[all.len() / 2];
+            let timed = self.timed.entry(name.to_string()).or_default();
+            timed.retain(|old| !old.same(&sample));
+            timed.push(sample);
         }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), Error> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, serde_json::to_string(&(VERSION, self))?)
+    }
+
+    /// A stored device. Another version's file is invalid data.
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let text = std::fs::read_to_string(path)?;
+        let (version, _): (u32, serde::de::IgnoredAny) = serde_json::from_str(&text)?;
+        if version != VERSION {
+            let found = format!("device version {version}");
+            return Err(Error::new(ErrorKind::InvalidData, found));
+        }
+        let (_, mut device): (u32, Device) = serde_json::from_str(&text)?;
+        for s in device.timed.values_mut().flatten() {
+            s.at = place(&s.sizes, s.work);
+        }
+        Ok(device)
     }
 }
 
-/// Seconds at `x`: between measured points, or scaled past them.
-fn along(curve: &[(f64, f64)], x: f64) -> f64 {
-    let (first, last) = (curve[0], curve[curve.len() - 1]);
-    if x <= first.0 {
-        return first.1;
+/// Seconds at `at`: the nearest samples, each scaled to `work`.
+fn estimate(timed: &[Sample], at: &[f64], work: f64) -> Option<f64> {
+    let mut near = [(f64::INFINITY, 0.0); NEAR];
+    for s in timed.iter().filter(|s| s.at.len() == at.len()) {
+        let apart = |(a, b): (&f64, &f64)| (a - b) * (a - b);
+        let far: f64 = s.at.iter().zip(at).map(apart).sum();
+        let scaled = if s.work > 0.0 {
+            s.seconds * work / s.work
+        } else {
+            s.seconds
+        };
+        // Keeps `near` sorted, nearest first.
+        let mut held = (far, scaled);
+        for slot in &mut near {
+            if held.0 < slot.0 {
+                std::mem::swap(slot, &mut held);
+            }
+        }
     }
-    if x >= last.0 {
-        let scale = if last.0 > 0.0 { x / last.0 } else { 1.0 };
-        return last.1 * scale;
-    }
-    let above = curve.iter().position(|p| p.0 >= x).expect("x is inside");
-    let (a, b) = (curve[above - 1], curve[above]);
-    a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0)
+    // Far samples fade fast. An exact match outweighs the rest.
+    let weigh = |(far, _): &(f64, f64)| 1.0 / (far * far + 1e-12);
+    let found = near.iter().filter(|(far, _)| far.is_finite());
+    let total: f64 = found.clone().map(weigh).sum();
+    let sum: f64 = found.map(|n| weigh(n) * n.1).sum();
+    (total > 0.0).then(|| sum / total)
 }

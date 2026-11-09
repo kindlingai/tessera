@@ -35,6 +35,10 @@ impl Kernel for RmsNorm {
         "rms_norm"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.rows, self.width]
+    }
+
     fn source(&self) -> Source {
         Source::Made(Text {
             entry: "plan_rms_norm".into(),

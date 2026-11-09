@@ -24,6 +24,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
+name = "calibrate"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
+ "graph",
+ "lower",
+ "ops",
+ "trace",
+]
+
+[[package]]
 name = "checkpoint"
 version = "0.1.0"
 dependencies = [
@@ -170,6 +181,8 @@ dependencies = [
  "ops",
  "ops-model",
  "scattered-collect",
+ "serde",
+ "serde_json",
  "trace",
 ]
 
@@ -183,6 +196,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "models"
 version = "0.1.0"
 dependencies = [
+ "calibrate",
  "checkpoint",
  "graph",
  "interp",

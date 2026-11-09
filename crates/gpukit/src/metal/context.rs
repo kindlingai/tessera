@@ -131,6 +131,11 @@ impl Context {
         })
     }
 
+    /// The device's marketing name.
+    pub fn name(&self) -> String {
+        self.device.name().to_string()
+    }
+
     /// Compile a source string (quoted includes expanded) to a library.
     pub fn compile_library(
         &self,

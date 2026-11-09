@@ -55,6 +55,10 @@ impl Kernel for Matmul {
         vec![launch(p, [step.read(0), step.read(1), step.out()])]
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.m, self.n, self.k]
+    }
+
     /// The tiled kernel pays for whole tiles.
     fn work(&self, _: usize) -> f64 {
         (tiles(self.m) * tiles(self.n) * self.k) as f64

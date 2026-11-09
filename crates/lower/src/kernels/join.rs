@@ -26,6 +26,10 @@ impl Kernel for Join {
         "join"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.left, self.right]
+    }
+
     fn source(&self) -> Source {
         Source::Made(Text {
             entry: "plan_join".into(),

@@ -6,6 +6,7 @@ use crate::emit::Dialect;
 use crate::plan::{Plan, Slot};
 use crate::run::{Held, Run};
 use gpukit::metal::{BufferPool, CacheConfig, ComputePipeline, Context, set_bytes};
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -94,6 +95,29 @@ impl Runner {
     }
 }
 
+impl Runner {
+    /// Runs the steps in one command buffer. Returns GPU seconds.
+    fn commit(&self, steps: impl Iterator<Item = usize>) -> Result<f64, Error> {
+        let cmd = self.ctx.queue.commandBuffer();
+        let cmd = cmd.ok_or_else(|| gpu("command buffer"))?;
+        let enc = cmd.computeCommandEncoder();
+        let enc = enc.ok_or_else(|| gpu("encoder"))?;
+        for i in steps {
+            enc.setComputePipelineState(&self.pipelines[i].pipeline);
+            for launch in self.plan.steps[i].launches() {
+                self.encode(&enc, &launch);
+            }
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        // The GPU's own clock leaves out the scheduling wait.
+        let (start, end): (f64, f64) =
+            unsafe { (msg_send![&*cmd, GPUStartTime], msg_send![&*cmd, GPUEndTime]) };
+        Ok(end - start)
+    }
+}
+
 impl Run for Runner {
     fn plan(&self) -> &Plan {
         &self.plan
@@ -138,21 +162,16 @@ impl Run for Runner {
         Ok(out)
     }
 
-    /// One command buffer holds every launch.
     fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
-        let cmd = self.ctx.queue.commandBuffer();
-        let cmd = cmd.ok_or_else(|| gpu("command buffer"))?;
-        let enc = cmd.computeCommandEncoder();
-        let enc = enc.ok_or_else(|| gpu("encoder"))?;
-        for i in steps {
-            enc.setComputePipelineState(&self.pipelines[i].pipeline);
-            for launch in self.plan.steps[i].launches() {
-                self.encode(&enc, &launch);
-            }
-        }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        Ok(())
+        self.commit(steps).map(drop)
+    }
+
+    fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {
+        let again = std::iter::repeat_n(step, times);
+        Ok(self.commit(again)? / times as f64)
+    }
+
+    fn device(&self) -> String {
+        format!("metal {}", self.ctx.name())
     }
 }

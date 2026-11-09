@@ -19,7 +19,7 @@ mod select;
 
 pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
-pub use cost::{Cost, Device};
+pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use emit::{Dialect, Text, float, hash};
 pub use kernel::{Kernel, KernelRef};

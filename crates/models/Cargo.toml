@@ -8,14 +8,15 @@ description = "Model descriptions, traced into graphs"
 
 [features]
 default = []
-cuda = ["lower/cuda"]
-rocm = ["lower/rocm"]
+cuda = ["lower/cuda", "calibrate/cuda"]
+rocm = ["lower/rocm", "calibrate/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
 trace = { path = "../trace" }
 
 [dev-dependencies]
+calibrate = { path = "../calibrate" }
 checkpoint = { path = "../checkpoint" }
 interp = { path = "../interp" }
 lower = { path = "../lower" }

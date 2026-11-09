@@ -74,6 +74,10 @@ impl Kernel for Rope {
         "rope"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.positions, self.heads, self.width]
+    }
+
     fn source(&self) -> Source {
         use apply_rope_heads::{CUDA, ENTRY, METAL};
         Source::Fixed {

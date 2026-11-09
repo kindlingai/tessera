@@ -52,6 +52,10 @@ impl Kernel for Scores {
         "scores"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
+    }
+
     fn source(&self) -> Source {
         source()
     }
@@ -106,6 +110,10 @@ impl Kernel for Causal {
         "causal"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.queries, self.keys]
+    }
+
     fn source(&self) -> Source {
         let sizes = [("rows", "u32"), ("queries", "u32"), ("keys", "u32")];
         Source::Made(Text {
@@ -134,6 +142,10 @@ impl Kernel for Causal {
 impl Kernel for Values {
     fn name(&self) -> &'static str {
         "values"
+    }
+
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
     }
 
     fn source(&self) -> Source {
