@@ -15,6 +15,20 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  commits:
+    # No Co-Authored-By lines crediting AI tools.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - if: github.event_name == 'pull_request'
+        run: >-
+          scripts/check-coauthors.sh
+          ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+      - if: github.event_name == 'push'
+        run: scripts/check-coauthors.sh ${{ github.event.before }}..${{ github.sha }}
+
   lint:
     # Code-shape rules (tools/lint) and formatting.
     runs-on: ubuntu-latest
