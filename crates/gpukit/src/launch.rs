@@ -1,7 +1,5 @@
-//! One-shot launch helpers and the kernel-argument builder.
+//! Kernel arguments and launch helpers shared by CUDA and ROCm.
 
-use super::context::{Context, Kernel};
-use super::driver::CUdeviceptr;
 use crate::Error;
 
 pub fn div_up(value: usize, group: usize) -> usize {
@@ -10,6 +8,26 @@ pub fn div_up(value: usize, group: usize) -> usize {
 
 /// Threads per block for the 1D helpers, as on Metal.
 pub const THREADS_PER_BLOCK: u32 = 256;
+
+/// A device context that can enqueue a kernel.
+pub trait Launch {
+    type Kernel;
+
+    /// Enqueue a launch without waiting for it to finish.
+    fn launch(
+        &self,
+        kernel: &Self::Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_bytes: u32,
+        args: &mut KernelArgs,
+    ) -> Result<(), Error>;
+}
+
+/// The bytes of a `repr(C)` value, for one kernel argument.
+pub fn pod_bytes<T: Copy>(value: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>()) }
+}
 
 /// Typed kernel arguments in aligned slots.
 #[derive(Default)]
@@ -64,7 +82,7 @@ impl KernelArgs {
     }
 
     /// Bind a device pointer (a kernel T* argument).
-    pub fn device_ptr(&mut self, p: CUdeviceptr) -> &mut Self {
+    pub fn device_ptr(&mut self, p: u64) -> &mut Self {
         self.u64(p)
     }
 
@@ -97,9 +115,9 @@ impl KernelArgs {
 }
 
 /// 1D grid, one thread per element (256-thread blocks).
-pub fn launch_1d(
-    ctx: &Context,
-    kernel: &Kernel,
+pub fn launch_1d<C: Launch>(
+    ctx: &C,
+    kernel: &C::Kernel,
     count: usize,
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
@@ -109,9 +127,9 @@ pub fn launch_1d(
 }
 
 /// 1D launches over `count`, split at the grid-x limit.
-pub fn launch_1d_ranged(
-    ctx: &Context,
-    kernel: &Kernel,
+pub fn launch_1d_ranged<C: Launch>(
+    ctx: &C,
+    kernel: &C::Kernel,
     count: usize,
     mut bind: impl FnMut(&mut KernelArgs, u32, u32),
 ) -> Result<(), Error> {
@@ -129,9 +147,9 @@ pub fn launch_1d_ranged(
 }
 
 /// One block per row; y would cap rows at 65535.
-pub fn launch_rows(
-    ctx: &Context,
-    kernel: &Kernel,
+pub fn launch_rows<C: Launch>(
+    ctx: &C,
+    kernel: &C::Kernel,
     rows: usize,
     block_width: u32,
     args: &mut KernelArgs,
@@ -142,9 +160,9 @@ pub fn launch_rows(
 const MAX_GRID_Y: usize = 65535;
 
 /// 2D grid of blocks; put the large axis on x.
-pub fn launch_grid(
-    ctx: &Context,
-    kernel: &Kernel,
+pub fn launch_grid<C: Launch>(
+    ctx: &C,
+    kernel: &C::Kernel,
     width: usize,
     height: usize,
     block_width: u32,
@@ -152,7 +170,7 @@ pub fn launch_grid(
 ) -> Result<(), Error> {
     assert!(
         height <= MAX_GRID_Y,
-        "launch_grid height {height} exceeds the CUDA gridDim.y limit of {MAX_GRID_Y}"
+        "launch_grid height {height} exceeds the gridDim.y limit of {MAX_GRID_Y}"
     );
     ctx.launch(
         kernel,

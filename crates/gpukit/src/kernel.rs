@@ -45,42 +45,26 @@ macro_rules! kernel {
         }
 
         #[cfg(feature = "cuda")]
-        pub mod cuda {
-            use gpukit::cuda::{BufferPool, KernelArgs};
-            use super::*;
+        $crate::__op_device_mod!(cuda, $err, $fixture => $fixvar, [$($abi)*],
+            $launch($largs), ($res, $rlen));
 
-            pub fn gpu(__fixture: &$fixture) -> Result<Vec<f32>, $err> {
-                let $fixvar = __fixture;
-                let ctx = gpukit::cuda::cached_context()?;
-                let kernel = gpukit::cuda::cached_source_kernel(super::CUDA, super::ENTRY)?;
-                let mut pool = BufferPool::new();
-                $crate::__op_cuda_prep!(ctx, pool, $($abi)*);
-                let mut args = KernelArgs::new();
-                $crate::__op_cuda_args!(args, $($abi)*);
-                $crate::__op_cuda_dispatch!($launch, ctx, &kernel, $largs, &mut args)?;
-                ctx.synchronize()?;
-                let mut out = vec![0.0f32; $rlen];
-                $res.read_f32(&mut out)?;
-                Ok(out)
-            }
-        }
+        #[cfg(feature = "rocm")]
+        $crate::__op_device_mod!(rocm, $err, $fixture => $fixvar, [$($abi)*],
+            $launch($largs), ($res, $rlen));
 
-        /// Run this op on Metal (macOS) or CUDA (cuda feature).
+        /// Run this op on the backend `gpukit::backend` picks.
         pub fn gpu(fix: &$fixture) -> Result<Vec<f32>, $err> {
-            #[cfg(target_os = "macos")]
-            {
-                self::metal::gpu(fix)
-            }
-            #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-            {
-                self::cuda::gpu(fix)
-            }
-            #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-            {
-                let _ = fix;
-                Err(<$err>::Gpu(
-                    "no GPU backend enabled (build with --features cuda on a CUDA host)",
-                ))
+            let _ = fix;
+            match gpukit::backend::available() {
+                #[cfg(target_os = "macos")]
+                Some(gpukit::backend::Backend::Metal) => self::metal::gpu(fix),
+                #[cfg(feature = "cuda")]
+                Some(gpukit::backend::Backend::Cuda) => self::cuda::gpu(fix),
+                #[cfg(feature = "rocm")]
+                Some(gpukit::backend::Backend::Rocm) => self::rocm::gpu(fix),
+                _ => Err(<$err>::Gpu(
+                    "no GPU backend enabled (build with --features cuda or rocm)",
+                )),
             }
         }
 
@@ -484,23 +468,51 @@ macro_rules! __op_metal_bind {
     };
 }
 
-/// CUDA: allocate and upload every buffer of an op ABI.
+/// CUDA or ROCm: one op's `gpu` in module `$bk`.
 #[macro_export]
-macro_rules! __op_cuda_prep {
+macro_rules! __op_device_mod {
+    ($bk:ident, $err:path, $fixture:ty => $fixvar:ident, [$($abi:tt)*],
+     $launch:tt($largs:expr), ($res:ident, $rlen:expr)) => {
+        pub mod $bk {
+            use gpukit::$bk::{BufferPool, KernelArgs};
+            use super::*;
+
+            pub fn gpu(__fixture: &$fixture) -> Result<Vec<f32>, $err> {
+                let $fixvar = __fixture;
+                let ctx = gpukit::$bk::cached_context()?;
+                // Both backends compile the one CUDA-dialect source.
+                let kernel = gpukit::$bk::cached_source_kernel(super::CUDA, super::ENTRY)?;
+                let mut pool = BufferPool::new();
+                $crate::__op_device_prep!(ctx, pool, $($abi)*);
+                let mut args = KernelArgs::new();
+                $crate::__op_device_args!($bk, args, $($abi)*);
+                $crate::__op_device_dispatch!($bk, $launch, ctx, &kernel, $largs, &mut args)?;
+                ctx.synchronize()?;
+                let mut out = vec![0.0f32; $rlen];
+                $res.read_f32(&mut out)?;
+                Ok(out)
+            }
+        }
+    };
+}
+
+/// CUDA or ROCm: allocate and upload every ABI buffer.
+#[macro_export]
+macro_rules! __op_device_prep {
     ($ctx:ident, $pool:ident $(,)?) => {};
     ($ctx:ident, $pool:ident, in($n:ident = $e:expr) $($tail:tt)*) => {
         let $n = $pool.allocate($ctx, $e.len() * 4)?;
         $n.write_f32(&$e)?;
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, inout($n:ident = $e:expr) $($tail:tt)*) => {
         let $n = $pool.allocate($ctx, $e.len() * 4)?;
         $n.write_f32(&$e)?;
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, out($n:ident = $size:expr) $($tail:tt)*) => {
         let $n = $pool.allocate($ctx, ($size) * 4)?;
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
         let $tmp = $e;
@@ -508,71 +520,71 @@ macro_rules! __op_cuda_prep {
         $n.write_bytes(unsafe {
             std::slice::from_raw_parts($tmp.as_ptr().cast::<u8>(), $tmp.len() * 4)
         })?;
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         let $n = $pool.allocate($ctx, $e.len() * 4)?;
         $n.write_bytes(unsafe {
             std::slice::from_raw_parts($e.as_ptr().cast::<u8>(), $e.len() * 4)
         })?;
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
     ($ctx:ident, $pool:ident, $head:ident($e:expr) $($tail:tt)*) => {
-        $crate::__op_cuda_prep!($ctx, $pool $($tail)*);
+        $crate::__op_device_prep!($ctx, $pool $($tail)*);
     };
 }
 
-/// CUDA: append every buffer and scalar to the launch arguments.
+/// CUDA or ROCm: append every buffer and scalar as arguments.
 #[macro_export]
-macro_rules! __op_cuda_args {
-    ($args:ident $(,)?) => {};
-    ($args:ident, in($n:ident = $e:expr) $($tail:tt)*) => {
+macro_rules! __op_device_args {
+    ($bk:ident, $args:ident $(,)?) => {};
+    ($bk:ident, $args:ident, in($n:ident = $e:expr) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, inout($n:ident = $e:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, inout($n:ident = $e:expr) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, out($n:ident = $size:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, out($n:ident = $size:expr) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, in_u32($n:ident = $e:expr, as $tmp:ident) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, in_u32($n:ident = $e:expr) $($tail:tt)*) => {
         $args.device_ptr($n.device_ptr());
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, u32x2($a:expr, $b:expr) $($tail:tt)*) => {
         $args.u32($a as u32);
         $args.u32($b as u32);
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, u32($e:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, u32($e:expr) $($tail:tt)*) => {
         $args.u32($e as u32);
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, f32($e:expr) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, f32($e:expr) $($tail:tt)*) => {
         $args.f32($e as f32);
-        $crate::__op_cuda_args!($args $($tail)*);
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
+    ($bk:ident, $args:ident, pod($e:expr, as $tmp:ident) $($tail:tt)*) => {
         let $tmp = $e;
-        $args.bytes(gpukit::cuda::pod_bytes(&$tmp));
-        $crate::__op_cuda_args!($args $($tail)*);
+        $args.bytes(gpukit::$bk::pod_bytes(&$tmp));
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
-    ($args:ident, pod($e:expr) $($tail:tt)*) => {
-        $args.bytes(gpukit::cuda::pod_bytes(&$e));
-        $crate::__op_cuda_args!($args $($tail)*);
+    ($bk:ident, $args:ident, pod($e:expr) $($tail:tt)*) => {
+        $args.bytes(gpukit::$bk::pod_bytes(&$e));
+        $crate::__op_device_args!($bk, $args $($tail)*);
     };
 }
 
@@ -587,13 +599,13 @@ macro_rules! __op_metal_dispatch {
     };
 }
 
-/// CUDA: pick the dispatch shape declared by the op ABI.
+/// CUDA or ROCm: pick the ABI's dispatch shape.
 #[macro_export]
-macro_rules! __op_cuda_dispatch {
-    (1d, $ctx:expr, $kernel:expr, $n:expr, $args:expr) => {
-        gpukit::cuda::launch_1d($ctx, $kernel, $n, $args)
+macro_rules! __op_device_dispatch {
+    ($bk:ident, 1d, $ctx:expr, $kernel:expr, $n:expr, $args:expr) => {
+        gpukit::$bk::launch_1d($ctx, $kernel, $n, $args)
     };
-    (rows, $ctx:expr, $kernel:expr, $n:expr, $args:expr) => {
-        gpukit::cuda::launch_rows($ctx, $kernel, $n, 256, $args)
+    ($bk:ident, rows, $ctx:expr, $kernel:expr, $n:expr, $args:expr) => {
+        gpukit::$bk::launch_rows($ctx, $kernel, $n, 256, $args)
     };
 }

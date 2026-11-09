@@ -108,7 +108,7 @@ fn load_corpus(args: &Args) -> Result<data::Corpus, String> {
 fn run() -> Result<(), String> {
     let args = parse()?;
     let backend = backend::available()
-        .ok_or("no GPU backend in this build (build with --features cuda on a CUDA host)")?;
+        .ok_or("no GPU backend in this build (build with --features cuda or rocm)")?;
     println!("backend: {backend}");
 
     let corpus = load_corpus(&args)?;

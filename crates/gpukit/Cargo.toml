@@ -10,6 +10,8 @@ default = []
 # CUDA backend. The driver is resolved at runtime, so enabling this does not
 # require a CUDA toolkit to build; running a kernel does.
 cuda = []
+# ROCm backend. The HIP runtime and hiprtc load at runtime, like CUDA.
+rocm = []
 
 [dependencies]
 scattered-collect = "0.22"

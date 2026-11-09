@@ -19,3 +19,4 @@ ops-train = { path = "../ops-train" }
 [features]
 default = []
 cuda = ["gemm/cuda", "ops/cuda", "ops-math/cuda", "ops-model/cuda", "ops-train/cuda"]
+rocm = ["gemm/rocm", "ops/rocm", "ops-math/rocm", "ops-model/rocm", "ops-train/rocm"]

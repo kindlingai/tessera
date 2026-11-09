@@ -1,7 +1,8 @@
 //! CUDA driver bindings, loaded at runtime with dlopen.
 
 use crate::Error;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use crate::dl::Library;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub type CUresult = c_int;
@@ -16,16 +17,9 @@ pub const CUDA_SUCCESS: CUresult = 0;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
-const RTLD_NOW: c_int = 2;
 /// Environment variable that overrides the driver library name.
 const DRIVER_ENV: &str = "DGQ_CUDA_DRIVER";
 const DRIVER_LIB: &str = "libcuda.so.1";
-
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlerror() -> *mut c_char;
-}
 
 type CuInit = unsafe extern "C" fn(u32) -> CUresult;
 type CuDeviceGetCount = unsafe extern "C" fn(*mut c_int) -> CUresult;
@@ -90,32 +84,15 @@ pub struct Driver {
 }
 
 macro_rules! sym {
-    ($lib:expr, $name:literal, $ty:ty) => {{
-        let raw = unsafe { dlsym($lib, concat!($name, "\0").as_ptr().cast()) };
-        if raw.is_null() {
-            return Err(format!("CUDA driver is missing symbol {}", $name));
-        }
-        unsafe { std::mem::transmute::<*mut c_void, $ty>(raw) }
-    }};
-}
-
-fn last_dl_error() -> String {
-    let p = unsafe { dlerror() };
-    if p.is_null() {
-        "unknown dlopen error".to_string()
-    } else {
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
+    ($lib:expr, $name:literal, $ty:ty) => {
+        unsafe { $lib.function::<$ty>($name) }.map_err(|e| format!("CUDA driver: {e}"))?
+    };
 }
 
 impl Driver {
     fn open() -> Result<Self, String> {
         let lib_name = std::env::var(DRIVER_ENV).unwrap_or_else(|_| DRIVER_LIB.into());
-        let c_name = CString::new(lib_name.clone()).map_err(|e| format!("bad driver name: {e}"))?;
-        let lib = unsafe { dlopen(c_name.as_ptr(), RTLD_NOW) };
-        if lib.is_null() {
-            return Err(format!("cannot load {lib_name}: {}", last_dl_error()));
-        }
+        let lib = Library::open_first(&[lib_name]).map_err(|e| format!("cannot load {e}"))?;
         Ok(Driver {
             cu_init: sym!(lib, "cuInit", CuInit),
             cu_device_get_count: sym!(lib, "cuDeviceGetCount", CuDeviceGetCount),

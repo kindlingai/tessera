@@ -49,3 +49,23 @@ pub fn cuda_ready() -> bool {
     #[cfg(not(feature = "cuda"))]
     false
 }
+
+/// Whether a HIP runtime loads and sees a device.
+pub fn rocm_ready() -> bool {
+    #[cfg(feature = "rocm")]
+    return crate::rocm::cached_context().is_ok();
+    #[cfg(not(feature = "rocm"))]
+    false
+}
+
+/// Whether the backend `backend::available` picks can run here.
+pub fn backend_ready() -> bool {
+    use crate::backend::{self, Backend};
+    match backend::available() {
+        // Hosted macOS CI runners have no usable Metal device.
+        Some(Backend::Metal) => std::env::var_os("CI").is_none(),
+        Some(Backend::Cuda) => cuda_ready(),
+        Some(Backend::Rocm) => rocm_ready(),
+        None => false,
+    }
+}

@@ -9,6 +9,8 @@ license = "MIT"
 default = []
 # NVRTC compiles the .cu body on first dispatch, so no toolkit is needed.
 cuda = ["gpukit/cuda"]
+# hiprtc compiles the same .cu body, so no ROCm toolkit is needed.
+rocm = ["gpukit/rocm"]
 
 [dependencies]
 gpukit = { path = "../gpukit", default-features = false }

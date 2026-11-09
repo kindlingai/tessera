@@ -28,11 +28,6 @@ pub fn cached_kernel(cubin: &'static [u8], entry: &'static str) -> Result<Kernel
     Ok(kernel)
 }
 
-/// The bytes of a `repr(C)` value, for one kernel argument.
-pub fn pod_bytes<T: Copy>(value: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>()) }
-}
-
 /// Compile `source` once per process and resolve `entry`.
 pub fn cached_source_kernel(
     source: &'static str,

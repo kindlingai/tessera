@@ -1,22 +1,16 @@
 //! NVRTC bindings loaded with dlopen; NVRTC ships with the toolkit.
 
 use crate::Error;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use crate::dl::Library;
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub type NvrtcResult = c_int;
 pub type NvrtcProgram = *mut c_void;
 
 const NVRTC_SUCCESS: NvrtcResult = 0;
-const RTLD_NOW: c_int = 2;
 /// Environment variable that overrides the NVRTC library name.
 const NVRTC_ENV: &str = "DGQ_NVRTC";
-
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlerror() -> *mut c_char;
-}
 
 type NvrtcCreateProgram = unsafe extern "C" fn(
     *mut NvrtcProgram,
@@ -46,22 +40,9 @@ struct Nvrtc {
 }
 
 macro_rules! sym {
-    ($lib:expr, $name:literal, $ty:ty) => {{
-        let raw = unsafe { dlsym($lib, concat!($name, "\0").as_ptr().cast()) };
-        if raw.is_null() {
-            return Err(format!("NVRTC is missing symbol {}", $name));
-        }
-        unsafe { std::mem::transmute::<*mut c_void, $ty>(raw) }
-    }};
-}
-
-fn last_dl_error() -> String {
-    let p = unsafe { dlerror() };
-    if p.is_null() {
-        "unknown dlopen error".to_string()
-    } else {
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
+    ($lib:expr, $name:literal, $ty:ty) => {
+        unsafe { $lib.function::<$ty>($name) }.map_err(|e| format!("NVRTC: {e}"))?
+    };
 }
 
 impl Nvrtc {
@@ -79,27 +60,16 @@ impl Nvrtc {
         ] {
             names.push(name.to_string());
         }
-        let mut last = String::from("no NVRTC library names to try");
-        for name in names {
-            let Ok(c_name) = CString::new(name.clone()) else {
-                continue;
-            };
-            let lib = unsafe { dlopen(c_name.as_ptr(), RTLD_NOW) };
-            if lib.is_null() {
-                last = format!("{name}: {}", last_dl_error());
-                continue;
-            }
-            return Ok(Self {
-                create: sym!(lib, "nvrtcCreateProgram", NvrtcCreateProgram),
-                compile: sym!(lib, "nvrtcCompileProgram", NvrtcCompileProgram),
-                ptx_size: sym!(lib, "nvrtcGetPTXSize", NvrtcGetPtxSize),
-                ptx: sym!(lib, "nvrtcGetPTX", NvrtcGetPtx),
-                log_size: sym!(lib, "nvrtcGetProgramLogSize", NvrtcGetProgramLogSize),
-                log: sym!(lib, "nvrtcGetProgramLog", NvrtcGetProgramLog),
-                destroy: sym!(lib, "nvrtcDestroyProgram", NvrtcDestroyProgram),
-            });
-        }
-        Err(last)
+        let lib = Library::open_first(&names)?;
+        Ok(Self {
+            create: sym!(lib, "nvrtcCreateProgram", NvrtcCreateProgram),
+            compile: sym!(lib, "nvrtcCompileProgram", NvrtcCompileProgram),
+            ptx_size: sym!(lib, "nvrtcGetPTXSize", NvrtcGetPtxSize),
+            ptx: sym!(lib, "nvrtcGetPTX", NvrtcGetPtx),
+            log_size: sym!(lib, "nvrtcGetProgramLogSize", NvrtcGetProgramLogSize),
+            log: sym!(lib, "nvrtcGetProgramLog", NvrtcGetProgramLog),
+            destroy: sym!(lib, "nvrtcDestroyProgram", NvrtcDestroyProgram),
+        })
     }
 }
 
