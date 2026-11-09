@@ -11,6 +11,7 @@ use super::driver::{
     Driver,
 };
 use crate::Error;
+use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::launch::Launch;
 
@@ -269,5 +270,65 @@ unsafe impl Sync for Kernel {}
 impl Kernel {
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl Device for Context {
+    type Kernel = Kernel;
+
+    fn open() -> Result<Self, Error> {
+        Context::new(ContextConfig::default())
+    }
+
+    fn error(msg: String) -> Error {
+        Error::Cuda(msg)
+    }
+
+    fn caches() -> &'static Caches<Self> {
+        static CACHES: Caches<Context> = Caches::new();
+        &CACHES
+    }
+
+    fn alloc(&self, size: usize) -> Result<u64, Error> {
+        self.set_current()?;
+        let mut ptr = 0;
+        let d = self.driver();
+        d.check(unsafe { (d.cu_mem_alloc)(&mut ptr, size) }, "cuMemAlloc")?;
+        Ok(ptr)
+    }
+
+    fn free(&self, ptr: u64) {
+        // At process exit the context may already be gone.
+        if self.set_current().is_ok() {
+            unsafe { (self.driver().cu_mem_free)(ptr) };
+        }
+    }
+
+    fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.set_current()?;
+        let d = self.driver();
+        let code = unsafe { (d.cu_memcpy_htod)(ptr, bytes.as_ptr().cast(), bytes.len()) };
+        d.check(code, "cuMemcpyHtoD")
+    }
+
+    fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        self.set_current()?;
+        let d = self.driver();
+        let code = unsafe { (d.cu_memcpy_dtoh)(bytes.as_mut_ptr().cast(), ptr, bytes.len()) };
+        d.check(code, "cuMemcpyDtoH")
+    }
+
+    fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
+        self.set_current()?;
+        let d = self.driver();
+        d.check(unsafe { (d.cu_memset_d8)(ptr, 0, size) }, "cuMemsetD8")
+    }
+
+    fn load_image(&self, image: &[u8], entry: &str) -> Result<Kernel, Error> {
+        self.load_module(image)?.function(entry)
+    }
+
+    fn compile(&self, source: &str, entry: &str) -> Result<Kernel, Error> {
+        self.compile_kernel(source, entry)
     }
 }

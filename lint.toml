@@ -27,5 +27,11 @@ max_test_percent = 1
 # Unpaired test files count against the rest of their crate.
 max_module_test_percent = 25
 
+# tools/simcheck starts windows of lines at anchors its content picks,
+# about `similar_spacing` apart. Windows fail at `max_similarity` cosine.
+similar_window = 20
+similar_spacing = 7
+max_similarity = 0.97
+
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]

@@ -70,3 +70,62 @@ jobs:
           shared-key: macos
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace --no-fail-fast
+
+  similarity:
+    # Near-copies of code (tools/simcheck), compared by embeddings.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      SIMCHECK: cargo run -q --release --manifest-path tools/simcheck/Cargo.toml --
+      HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      # The PR head, so report links match the checked-out lines.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD }}
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: simcheck
+          workspaces: tools/simcheck
+          # The job fails on near-copies; keep the build anyway.
+          cache-on-failure: true
+      - run: cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
+      - run: cargo clippy --manifest-path tools/simcheck/Cargo.toml --all-targets
+      - run: cargo test --manifest-path tools/simcheck/Cargo.toml
+      # The checkpoint's text tower, pinned in tools/simcheck/src/fetch.rs.
+      - id: model
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/eg2-text
+          key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
+      - if: steps.model.outputs.cache-hit != 'true'
+        run: $SIMCHECK fetch "$RUNNER_TEMP/eg2-text"
+      - if: steps.model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/eg2-text
+          key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
+      # Embeddings keyed by window text. Each run saves a fresh copy.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/simcheck.bin
+          key: simcheck-${{ github.run_id }}
+          restore-keys: simcheck-
+      - env:
+          SIMCHECK_LINKS: https://github.com/${{ github.repository }}/blob/${{ env.HEAD }}
+        run: $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/simcheck.md"
+      - if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: scripts/simcheck-comment.sh "$RUNNER_TEMP/simcheck.md"
+      - if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/simcheck.bin
+          key: simcheck-${{ github.run_id }}

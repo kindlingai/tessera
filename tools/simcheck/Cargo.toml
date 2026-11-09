@@ -1,0 +1,23 @@
+[package]
+name = "tessera-simcheck"
+version = "0.1.0"
+description = "Fails on near-copies of code, found with EmbeddingGemma 2 embeddings"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Its own workspace, so the main build never compiles eg2cpu.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+eg2cpu = { git = "https://github.com/undrgrnd-labs/hunch", rev = "a80156abbf8ec2e5a9b85ed0e5ff98454c1aaa09" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rayon = "1"
+ureq = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
