@@ -4,12 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{MAX_CRATE_FILES, MAX_CRATE_LINES, MAX_MACRO_FILES, Violation};
-
-/// Rust plus the GPU kernel languages.
-pub const EXTENSIONS: &[&str] = &[
-    "rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip",
-];
+use crate::{LIMITS, Violation};
 
 pub struct Source {
     pub path: String,
@@ -66,7 +61,7 @@ pub fn sources(root: &Path) -> Result<Vec<Source>, String> {
     let mut out = Vec::new();
     for path in listed(root)? {
         let ext = Path::new(&path).extension().and_then(|e| e.to_str());
-        if !ext.is_some_and(|e| EXTENSIONS.contains(&e)) {
+        if !ext.is_some_and(|e| LIMITS.extensions.iter().any(|x| x == e)) {
             continue;
         }
         // Deleted but still in the index.
@@ -144,12 +139,13 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
     }
     for ((dir, lang), mut mdirs) in macros {
         let path = format!("{dir}Cargo.toml");
-        if mdirs.len() > MAX_MACRO_FILES {
+        let max_macros = LIMITS.max_macro_files;
+        if mdirs.len() > max_macros {
             out.push(Violation {
                 path: path.clone(),
                 line: 1,
                 rule: "macro-files",
-                message: format!("{} {lang} macro files (max {MAX_MACRO_FILES})", mdirs.len()),
+                message: format!("{} {lang} macro files (max {max_macros})", mdirs.len()),
             });
         }
         mdirs.sort();
@@ -168,20 +164,21 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
     }
     for (dir, (files, lines)) in totals {
         let path = format!("{dir}Cargo.toml");
-        if files > MAX_CRATE_FILES {
+        let (max_files, max_lines) = (LIMITS.max_crate_files, LIMITS.max_crate_lines);
+        if files > max_files {
             out.push(Violation {
                 path: path.clone(),
                 line: 1,
                 rule: "crate-files",
-                message: format!("{files} source files (max {MAX_CRATE_FILES})"),
+                message: format!("{files} source files (max {max_files})"),
             });
         }
-        if lines > MAX_CRATE_LINES {
+        if lines > max_lines {
             out.push(Violation {
                 path,
                 line: 1,
                 rule: "crate-lines",
-                message: format!("{lines} source lines (max {MAX_CRATE_LINES})"),
+                message: format!("{lines} source lines (max {max_lines})"),
             });
         }
     }

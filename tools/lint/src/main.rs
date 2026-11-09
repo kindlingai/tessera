@@ -18,18 +18,24 @@ mod rust_test;
 
 use std::process::ExitCode;
 
-pub const MAX_COMMENT_WORDS: usize = 10;
-pub const MAX_NAME_SEGMENTS: usize = 3;
-/// Allowed when another function shares the first or last segment.
-pub const MAX_FAMILY_SEGMENTS: usize = 4;
-pub const MAX_FILE_LINES: usize = 1000;
-pub const MAX_CRATE_FILES: usize = 30;
-pub const MAX_CRATE_LINES: usize = 15000;
-/// Per language; they do not count toward the crate limits.
-pub const MAX_MACRO_FILES: usize = 5;
-pub const MIN_MACRO_CALLS: usize = 2;
-/// Most of a file inline tests may fill.
-pub const MAX_TEST_PERCENT: usize = 1;
+/// The limits in the repository's lint.toml, compiled in.
+#[derive(serde::Deserialize)]
+pub struct Limits {
+    pub max_comment_words: usize,
+    pub max_name_segments: usize,
+    pub max_family_segments: usize,
+    pub max_file_lines: usize,
+    pub max_crate_files: usize,
+    pub max_crate_lines: usize,
+    pub max_macro_files: usize,
+    pub min_macro_calls: usize,
+    pub max_test_percent: usize,
+    pub extensions: Vec<String>,
+}
+
+pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
+    toml::from_str(include_str!("../../../lint.toml")).expect("lint.toml")
+});
 
 pub struct Violation {
     pub path: String,
@@ -74,12 +80,9 @@ fn main() -> ExitCode {
 }
 
 fn check_file(src: &files::Source, out: &mut Vec<Violation>, names: &mut Vec<names::Name>) {
-    if src.lines > MAX_FILE_LINES {
-        out.push(src.violation(
-            1,
-            "file-lines",
-            format!("{} lines (max {MAX_FILE_LINES})", src.lines),
-        ));
+    let max = LIMITS.max_file_lines;
+    if src.lines > max {
+        out.push(src.violation(1, "file-lines", format!("{} lines (max {max})", src.lines)));
     }
     let is_rust = src.path.ends_with(".rs");
     comments::check(src, is_rust, out);

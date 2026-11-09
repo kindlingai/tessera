@@ -1,0 +1,24 @@
+# Code-shape limits. tools/lint compiles these in; CI and the hook enforce them.
+
+# Words in one comment block; adjacent comment lines are one block.
+max_comment_words = 10
+
+# Snake-case segments in a function name, and when a shared prefix
+# or suffix lets a name go one longer.
+max_name_segments = 3
+max_family_segments = 4
+
+max_file_lines = 1000
+
+max_crate_files = 30
+max_crate_lines = 15000
+
+# Per language in a crate's macros/ directory, outside the crate limits.
+max_macro_files = 5
+min_macro_calls = 2
+
+# Share of a file inline tests may fill, in percent.
+max_test_percent = 1
+
+# File types the rules read.
+extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]

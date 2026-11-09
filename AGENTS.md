@@ -6,7 +6,7 @@ No design docs, plans or history in the repo, outside an explicit changelog.
 
 ## Code shape
 
-`cargo run -p tessera-lint` checks these, and CI fails on any breach:
+`cargo run -p tessera-lint` checks these, and CI fails on any breach. The limits live in `lint.toml`:
 
 - No comment longer than 10 words. Adjacent comment lines count as one comment.
 - No function name with more than 3 snake_case segments, or 4 when another function in the crate shares its first

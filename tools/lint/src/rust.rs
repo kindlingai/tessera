@@ -9,7 +9,7 @@ use syn::{Attribute, Item};
 
 use crate::files::Source;
 use crate::names::Name;
-use crate::{MAX_TEST_PERCENT, Violation};
+use crate::{LIMITS, Violation};
 
 struct Names<'a> {
     src: &'a Source,
@@ -141,9 +141,10 @@ pub fn check(src: &Source, out: &mut Vec<Violation>, names: &mut Vec<Name>) {
     } else {
         test_lines(&file.items)
     };
-    if n * 100 > src.lines * MAX_TEST_PERCENT {
+    let max = LIMITS.max_test_percent;
+    if n * 100 > src.lines * max {
         let message = format!(
-            "{n} of {} lines are tests (max {MAX_TEST_PERCENT}%): move them to a *_test.rs file",
+            "{n} of {} lines are tests (max {max}%): move them to a *_test.rs file",
             src.lines
         );
         out.push(src.violation(first.unwrap_or(1), "inline-tests", message));
