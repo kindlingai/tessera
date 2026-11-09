@@ -57,7 +57,7 @@ impl Fixture {
     /// The blob as u32 words, zero-padded to a whole word.
     pub fn blob_words(&self) -> Vec<u32> {
         let mut bytes = self.blob.clone();
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         bytes

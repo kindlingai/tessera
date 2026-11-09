@@ -94,7 +94,7 @@ fn fill(len: usize, seed: f32) -> Vec<f32> {
 
 /// Whether key `ki` is visible to query `qi`.
 fn visible(p: &Fixture, qi: usize, ki: usize) -> bool {
-    if ki >= p.kv_cache_len + qi + 1 {
+    if ki > p.kv_cache_len + qi {
         return false;
     }
     if p.sliding_window > 0 && ki + p.sliding_window <= p.kv_cache_len + qi {
