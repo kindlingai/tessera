@@ -48,7 +48,7 @@ fn step_in() -> Vec<PortDecl> {
     ]
 }
 
-/// GLM-5.3 at TP4 with speculation, as gr8 serves it.
+/// GLM-5.3 with speculation, as gr8 serves it.
 pub fn glm53_serve(c: &glm53::Config, w: &Glm53, d: &Drafters, lim: &DraftLimits) -> Program {
     let prefill = Entry {
         kind: EntryKind::Prefill,
@@ -93,7 +93,6 @@ pub fn glm53_serve(c: &glm53::Config, w: &Glm53, d: &Drafters, lim: &DraftLimits
         dims: vec![
             (Seqs, Size::Bounded(8)),
             (Context, Size::Bounded(425_984)),
-            (Pages, Size::Bounded(6656)),
             (PageRows, Size::Fixed(64)),
             (Drafts, Size::Bounded(17)),
             (Hidden, Size::Config),
@@ -105,13 +104,12 @@ pub fn glm53_serve(c: &glm53::Config, w: &Glm53, d: &Drafters, lim: &DraftLimits
             (TopK, Size::Config),
             (Layers, Size::Config),
         ],
-        mesh: Mesh { tp: 4, ep: 1 },
         precision: gr8_precision(),
         entries: vec![prefill, decode],
     }
 }
 
-/// DiffusionGemma on one device: generation and reads share an entry.
+/// DiffusionGemma: generation and reads share an entry.
 pub fn dgemma_serve(c: &dgemma::Config, w: &DGemma) -> Program {
     let mut ports = step_in();
     ports.extend([
@@ -156,7 +154,6 @@ pub fn dgemma_serve(c: &dgemma::Config, w: &DGemma) -> Program {
             (Seqs, Size::Bounded(32)),
             (Block, Size::Config),
             (Context, Size::Bounded(131_072)),
-            (Pages, Size::Bounded(4096)),
             (PageRows, Size::Fixed(64)),
             (Hidden, Size::Config),
             (Heads, Size::Config),
@@ -165,7 +162,6 @@ pub fn dgemma_serve(c: &dgemma::Config, w: &DGemma) -> Program {
             (Vocab, Size::Config),
             (Layers, Size::Config),
         ],
-        mesh: Mesh { tp: 1, ep: 1 },
         precision: Precision {
             residual: DType::F32,
             activations: DType::Bf16,
@@ -176,7 +172,7 @@ pub fn dgemma_serve(c: &dgemma::Config, w: &DGemma) -> Program {
     }
 }
 
-/// DeepSeek V4.1 Flash at TP4, plus LSA upkeep and prefetch.
+/// DeepSeek V4.1 Flash, plus LSA upkeep and Engram prefetch.
 pub fn ds41_serve(c: &ds41::Config, w: &Ds41) -> Program {
     let prefill = Entry {
         kind: EntryKind::Prefill,
@@ -238,7 +234,6 @@ pub fn ds41_serve(c: &ds41::Config, w: &Ds41) -> Program {
         dims: vec![
             (Seqs, Size::Bounded(8)),
             (Context, Size::Bounded(1_048_576)),
-            (Pages, Size::Bounded(16_384)),
             (PageRows, Size::Fixed(64)),
             (Streams, Size::Config),
             (Hidden, Size::Config),
@@ -250,8 +245,31 @@ pub fn ds41_serve(c: &ds41::Config, w: &Ds41) -> Program {
             (TopK, Size::Config),
             (Layers, Size::Config),
         ],
-        mesh: Mesh { tp: 4, ep: 1 },
         precision: gr8_precision(),
         entries: vec![prefill, decode, maintain, prefetch],
     }
+}
+
+/// gr8's GLM cluster: four GB10s, one rank each.
+pub fn gb10_tp4() -> Deployment {
+    Deployment {
+        mesh: Mesh { tp: 4, ep: 1 },
+        pool_bytes: 24 << 30,
+    }
+}
+
+/// One device holds every weight and the whole pool.
+pub fn single(pool_bytes: usize) -> Deployment {
+    Deployment {
+        mesh: Mesh { tp: 1, ep: 1 },
+        pool_bytes,
+    }
+}
+
+/// One program on two meshes; only the shard pass differs.
+pub fn deploy_both(p: &Program) -> (Vec<RankGraph>, Vec<RankGraph>) {
+    let g = p.build();
+    let cluster = shard(&g, &gb10_tp4()).unwrap();
+    let mac = shard(&g, &single(48 << 30)).unwrap();
+    (cluster, mac)
 }

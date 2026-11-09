@@ -69,17 +69,17 @@ pub struct Precision {
     pub accumulate: DType,
 }
 
-/// Ranks per axis; `Split` placements map onto these.
+/// Ranks per axis. Deployment, not the program, chooses these.
 pub struct Mesh {
     pub tp: usize,
     pub ep: usize,
 }
 
-/// Where a tensor's values live across tensor-parallel ranks.
+/// Placement in a sharded graph. Descriptions only hint split axes.
 pub enum Placement {
     Replicated,
     Split(Axis),
-    /// Per-rank partial sums; only `reduce` makes it whole.
+    /// Per-rank partial sums; a `reduce` point makes it whole.
     Partial,
 }
 
@@ -547,9 +547,9 @@ pub struct Entry {
     pub body: Box<dyn Fn(&mut Model, &Ports)>,
 }
 
+/// Width-independent: the same program serves any mesh.
 pub struct Program {
     pub dims: Vec<(DimName, Size)>,
-    pub mesh: Mesh,
     pub precision: Precision,
     pub entries: Vec<Entry>,
 }
@@ -559,3 +559,29 @@ pub struct Ports;
 
 /// One bound port.
 pub struct Port;
+
+// Deployment: applied to a built graph, never in a program.
+
+/// What one machine group offers a program.
+pub struct Deployment {
+    pub mesh: Mesh,
+    /// Memory per rank for KV pages and caches.
+    pub pool_bytes: usize,
+}
+
+pub struct Graph;
+pub struct RankGraph;
+
+pub enum ShardError {
+    /// A split dimension does not divide by the width.
+    Indivisible(DimName, usize),
+    /// A whole value is needed where only a Partial exists.
+    MissingReduce(NodeId),
+    /// An affine edit would land on a Partial.
+    AffineOnPartial(NodeId),
+}
+
+/// Per-rank graphs: weights split, reduces become collectives, pools sized.
+pub fn shard(g: &Graph, d: &Deployment) -> Result<Vec<RankGraph>, ShardError> {
+    g.shard_by(d)
+}
