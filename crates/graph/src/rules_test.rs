@@ -207,3 +207,36 @@ fn layout_and_rope() {
     let split = f32s([Rows, Hidden], Split { axis: 1 });
     assert_eq!(placed(vec![split], center), Err(ErrorKind::Placement));
 }
+
+#[test]
+fn kept_rows_append() {
+    let rows = f32s([Seqs, Rows, Heads, HeadDim], Replicated);
+    let kept = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let wide = f32s([Seqs, Rows, Heads, Hidden], Replicated);
+    let split = rows.clone().placed(Split { axis: 2 });
+    let (mut g, ids) = inputs(vec![rows, wide, split]);
+    g.kept.push(kept.clone());
+    let append = |g: &Graph, arg: usize, kept| {
+        let grown = infer(g, &Op::Append(kept), &[&g.node(ids[arg]).ty]);
+        grown.map_err(|e| e.kind)
+    };
+    assert_eq!(append(&g, 0, 0), Ok(kept.clone()));
+    assert_eq!(append(&g, 1, 0), Err(ErrorKind::Shape));
+    assert_eq!(append(&g, 2, 0), Err(ErrorKind::Placement));
+    assert_eq!(append(&g, 0, 1), Err(ErrorKind::Reference));
+    let push = |g: &mut Graph| {
+        g.nodes.push(Node {
+            op: Op::Append(0),
+            args: vec![ids[0]],
+            ty: kept.clone(),
+            numerics: None,
+        });
+        verify(g).map_err(|e| e.error.kind)
+    };
+    assert_eq!(push(&mut g), Ok(()));
+    assert_eq!(push(&mut g), Err(ErrorKind::Reference), "appended twice");
+    g.nodes.pop();
+    // Kept rows must grow along a bounded axis.
+    g.kept[0] = f32s([Seqs, Heads, Heads, HeadDim], Replicated);
+    assert_eq!(verify(&g).unwrap_err().error.kind, ErrorKind::Shape);
+}

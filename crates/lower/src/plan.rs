@@ -50,16 +50,19 @@ pub struct Plan {
     pub steps: Vec<Step>,
     /// Each used graph weight, and where it loads.
     pub weights: Vec<(u32, Slot)>,
+    /// Each kept-row buffer, holding this launch's rows too.
+    pub kept: Vec<(u32, Slot)>,
     /// One per input port of the entry.
     pub inputs: Vec<Slot>,
     pub outputs: Vec<Output>,
 }
 
 impl Plan {
-    /// Elements in buffers that hold no weight or input.
+    /// Elements in buffers no weight, input or kept row owns.
     pub fn scratch(&self) -> usize {
-        let fixed = self.weights.iter().map(|(_, s)| s).chain(&self.inputs);
-        let held: usize = fixed.map(|s| s.len).sum();
+        let named = self.weights.iter().chain(&self.kept).map(|(_, s)| s);
+        let owned = |s: &Slot| self.buffers[s.buffer as usize];
+        let held: usize = named.chain(&self.inputs).map(owned).sum();
         self.buffers.iter().sum::<usize>() - held
     }
 }

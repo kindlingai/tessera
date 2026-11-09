@@ -7,7 +7,7 @@ macro_rules! device_runner {
             use crate::abi::{Arg, Launch, Shape, Source};
             use crate::emit::Dialect;
             use crate::plan::{Plan, Slot};
-            use crate::run::Run;
+            use crate::run::{Held, Run};
             use gpukit::device::Device;
             use gpukit::$bk::{
                 Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,
@@ -19,46 +19,27 @@ macro_rules! device_runner {
             pub struct Runner {
                 ctx: &'static Context,
                 plan: Plan,
-                buffers: Vec<DeviceBuffer>,
+                held: Held<DeviceBuffer>,
                 kernels: Vec<Kernel>,
+                /// Compiled generated kernels, by entry.
+                made: HashMap<String, Kernel>,
             }
 
             impl Runner {
                 pub fn new(plan: Plan) -> Result<Self, Error> {
-                    let ctx = cached_context()?;
-                    let mut buffers = Vec::with_capacity(plan.buffers.len());
-                    for len in &plan.buffers {
-                        let buffer = DeviceBuffer::alloc(ctx, (len * 4).max(4))?;
-                        // Kernels may read what they are about to write.
-                        buffer.zero()?;
-                        buffers.push(buffer);
-                    }
-                    let mut made: HashMap<String, Kernel> = HashMap::new();
-                    let mut kernels = Vec::with_capacity(plan.steps.len());
-                    for step in &plan.steps {
-                        let text = match step.kernel.source() {
-                            Source::Fixed { cuda, entry, .. } => {
-                                kernels.push(cached_source_kernel(cuda, entry)?);
-                                continue;
-                            }
-                            Source::Made(text) => text,
-                        };
-                        if !made.contains_key(&text.entry) {
-                            let compiled = ctx.compile(&text.render(Dialect::Cuda), &text.entry)?;
-                            made.insert(text.entry.clone(), compiled);
-                        }
-                        kernels.push(made[&text.entry].clone());
-                    }
-                    Ok(Self {
-                        ctx,
-                        plan,
-                        buffers,
-                        kernels,
-                    })
+                    let mut runner = Self {
+                        ctx: cached_context()?,
+                        plan: Plan::default(),
+                        held: Held::default(),
+                        kernels: Vec::new(),
+                        made: HashMap::new(),
+                    };
+                    runner.replan(plan)?;
+                    Ok(runner)
                 }
 
                 fn buffer(&self, slot: Slot) -> &DeviceBuffer {
-                    &self.buffers[slot.buffer as usize]
+                    self.held.get(slot)
                 }
 
                 /// Passes each argument by position, then enqueues.
@@ -95,6 +76,33 @@ macro_rules! device_runner {
             impl Run for Runner {
                 fn plan(&self) -> &Plan {
                     &self.plan
+                }
+
+                fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+                    let ctx = self.ctx;
+                    self.held.bind(&plan, |len| {
+                        let buffer = DeviceBuffer::alloc(ctx, (len * 4).max(4))?;
+                        // Kernels may read what they are about to write.
+                        buffer.zero()?;
+                        Ok(buffer)
+                    })?;
+                    self.kernels.clear();
+                    for step in &plan.steps {
+                        let text = match step.kernel.source() {
+                            Source::Fixed { cuda, entry, .. } => {
+                                self.kernels.push(cached_source_kernel(cuda, entry)?);
+                                continue;
+                            }
+                            Source::Made(text) => text,
+                        };
+                        if !self.made.contains_key(&text.entry) {
+                            let compiled = ctx.compile(&text.render(Dialect::Cuda), &text.entry)?;
+                            self.made.insert(text.entry.clone(), compiled);
+                        }
+                        self.kernels.push(self.made[&text.entry].clone());
+                    }
+                    self.plan = plan;
+                    Ok(())
                 }
 
                 fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {

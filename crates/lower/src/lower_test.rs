@@ -1,9 +1,9 @@
 use crate::kernels::{Map, MapStage};
-use crate::{Device, Dialect, Error, Kernel, KernelRef, Plan, Source};
+use crate::{Arg, Device, Dialect, Error, Held, Kernel, KernelRef, Plan, Source};
 use crate::{assign, lower, peak, rules, schedule, select};
-use graph::DimName::{self, Context, Seqs};
+use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
-use models::qwen3::{Config, program};
+use models::qwen3::{Config, program, stepper};
 
 const SIZES: [(DimName, u64); 2] = [(Seqs, 2), (Context, 5)];
 
@@ -129,4 +129,59 @@ fn dialects_agree() {
     for body in [&metal, &cuda] {
         assert!(body.contains("v = v * a0[gid];"));
     }
+}
+
+/// A toy step plan: `rows` new, `all` kept afterwards.
+fn step(seqs: u64, rows: u64, all: u64) -> Result<Plan, Error> {
+    let sizes = [(Seqs, seqs), (Rows, rows), (Context, all)];
+    lower(&stepper(&Config::toy(4, 16)), 0, &sizes, &Device::guess())
+}
+
+#[test]
+fn kept_rows_fit() {
+    let plan = step(1, 2, 5).unwrap();
+    assert_eq!(plan.kept.len(), 2 * 2, "keys and values per layer");
+    // Two key heads of eight, for up to sixteen rows.
+    for (_, slot) in &plan.kept {
+        assert_eq!((slot.len, plan.buffers[slot.buffer as usize]), (80, 256));
+    }
+    let appends = plan.steps.iter().filter(|s| s.kernel.name() == "append");
+    for s in appends.clone() {
+        assert!(plan.kept.iter().any(|(_, slot)| *slot == s.write));
+        let [launch] = &s.launches()[..] else {
+            panic!("one copy");
+        };
+        // Three rows are kept, so the copy starts later.
+        assert_eq!(launch.args[1..], [Arg::Buffer(s.write, 48), Arg::U32(32)]);
+    }
+    assert_eq!((appends.count(), count(&plan, "argmax")), (4, 1));
+    let scratch: usize = plan.buffers.iter().sum::<usize>() - 4 * 256;
+    assert!(plan.scratch() < scratch, "kept rows are not scratch");
+    assert!(matches!(step(2, 2, 5), Err(Error::Unsupported(_))));
+}
+
+#[test]
+fn replans_hold_buffers() {
+    let (first, next) = (step(1, 3, 3).unwrap(), step(1, 1, 4).unwrap());
+    let mut held: Held<usize> = Held::default();
+    let mut made = 0;
+    let mut alloc = |_: usize| {
+        made += 1;
+        Ok(made)
+    };
+    held.bind(&first, &mut alloc).unwrap();
+    let named = |p: &Plan| -> Vec<_> { p.weights.iter().chain(&p.kept).copied().collect() };
+    let before: Vec<usize> = named(&first).iter().map(|(_, s)| *held.get(*s)).collect();
+    held.bind(&next, &mut alloc).unwrap();
+    let after: Vec<usize> = named(&next).iter().map(|(_, s)| *held.get(*s)).collect();
+    assert_eq!(named(&first).len(), named(&next).len());
+    let owner = |p: &Plan| -> Vec<u32> { named(p).iter().map(|(index, _)| *index).collect() };
+    assert_eq!(owner(&first), owner(&next));
+    assert_eq!(before, after, "weights and kept rows stay put");
+    assert!(made < first.buffers.len() + next.buffers.len());
+    // Binding the same plan again allocates nothing.
+    let so_far = made;
+    held.bind(&next, |_| unreachable!("every buffer is held"))
+        .unwrap();
+    assert_eq!(made, so_far);
 }

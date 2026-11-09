@@ -11,7 +11,7 @@ pub use graph::{
     Act, Attend, Composite, DType, Dim, DimExpr, DimName, EntryKind, Graph, Mask, Pairs, PathSeg,
     Port, Role, Shape, Size, TensorType,
 };
-pub use model::Model;
+pub use model::{Kept, Model};
 pub use tensor::Tensor;
 pub use trace_derive::Weights;
 pub use weights::{Embed, Linear, Linears, Norm, Vector, Weights, declare};

@@ -3,9 +3,11 @@
 use crate::Error;
 use crate::cost::Device;
 use crate::kernel::KernelRef;
-use crate::kernels::MapStage;
+use crate::kernels::{Append, MapStage};
 use crate::rule::{Attn, Draft, Read, Rule, Site, rules};
-use graph::{Attend, DimName, Graph, Mask, NodeId, Op as Node, Select, Shape, Stage, View};
+use graph::{
+    Attend, DimExpr, DimName, Graph, Mask, NodeId, Op as Node, Select, Shape, Stage, View,
+};
 use std::collections::{BTreeSet, HashMap};
 
 /// A value some op writes, or the plan is given.
@@ -16,6 +18,11 @@ pub struct Val(pub u32);
 pub enum Home {
     Weight(u32),
     Input(u32),
+    /// Kept rows; `room` elements hold the longest context.
+    Kept {
+        index: u32,
+        room: usize,
+    },
     /// Written by an op; its buffer may be reused.
     Temp,
 }
@@ -292,10 +299,43 @@ impl Picker<'_> {
                 };
                 self.choose(site, &covers)?
             }
+            Node::Select(Select::TopK { .. }) => {
+                let (x, wide) = self.val(arg(0))?;
+                let width = *wide.last().expect("verified rank");
+                let (rows, k) = (self.len(x) / width, len * width / self.len(x));
+                self.choose(Site::Top { x, rows, width, k }, &covers)?
+            }
+            Node::Append(kept) => self.append(i, *kept, &shape)?,
             other => return unsupported(other),
         };
         self.vals[i] = Some((val, shape));
         Ok(())
+    }
+
+    /// Copies node `i`'s new rows in after those already kept.
+    fn append(&mut self, i: usize, index: u32, all: &[usize]) -> Result<Val, Error> {
+        let (rows, _) = self.val(self.g.nodes[i].args[0].0 as usize)?;
+        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
+            return unsupported("kept rows along a computed axis");
+        };
+        // Sequences would move as their rows grow.
+        if all[0] != 1 {
+            return unsupported("kept rows for several sequences");
+        }
+        let most = self.g.dims.iter().find(|d| d.name == *axis);
+        let most = most.map_or(0, |d| d.size.max() as usize);
+        let len: usize = all.iter().product();
+        let room = most * (len / all[1]);
+        let write = self.value(len, Home::Kept { index, room });
+        let (skip, len) = (len - self.len(rows), self.len(rows));
+        self.out.ops.push(Op {
+            kernel: KernelRef::new(Append { skip, len }),
+            rule: "append",
+            reads: vec![rows],
+            write,
+            covers: vec![NodeId(i as u32)],
+        });
+        Ok(write)
     }
 
     /// Extends the chain its first argument left, or starts one.

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::fmt;
 
 /// Bumped whenever the JSON form changes meaning.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug)]
 pub enum FormatError {

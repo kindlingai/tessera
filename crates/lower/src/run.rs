@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -11,12 +12,98 @@ pub enum Feed<'a> {
     Ids(&'a [u32]),
 }
 
+/// Device buffers that outlive one plan.
+pub struct Held<B> {
+    /// Every live buffer, with its element count.
+    all: Vec<(usize, B)>,
+    weights: HashMap<u32, usize>,
+    kept: HashMap<u32, usize>,
+    /// Where each of the plan's buffers lies in `all`.
+    bound: Vec<usize>,
+}
+
+impl<B> Default for Held<B> {
+    fn default() -> Self {
+        let (weights, kept) = Default::default();
+        Self {
+            all: Vec::new(),
+            weights,
+            kept,
+            bound: Vec::new(),
+        }
+    }
+}
+
+impl<B> Held<B> {
+    pub fn get(&self, slot: Slot) -> &B {
+        &self.all[self.bound[slot.buffer as usize]].1
+    }
+
+    /// Binds `plan`'s buffers. Weights and kept rows stay as loaded.
+    pub fn bind(
+        &mut self,
+        plan: &Plan,
+        mut alloc: impl FnMut(usize) -> Result<B, Error>,
+    ) -> Result<(), Error> {
+        let old = std::mem::take(&mut self.all).into_iter().map(Some);
+        let mut old: Vec<Option<(usize, B)>> = old.collect();
+        for at in self.weights.values_mut().chain(self.kept.values_mut()) {
+            self.all.push(old[*at].take().expect("each is held once"));
+            *at = self.all.len() - 1;
+        }
+        // The last plan's scratch buffers.
+        let mut spare: Vec<(usize, B)> = old.into_iter().flatten().collect();
+        let mut owner = vec![None; plan.buffers.len()];
+        for (kept, named) in [(false, &plan.weights), (true, &plan.kept)] {
+            for (index, slot) in named {
+                owner[slot.buffer as usize] = Some((kept, *index));
+            }
+        }
+        self.bound.clear();
+        for (&len, owner) in plan.buffers.iter().zip(owner) {
+            let held = match owner {
+                Some((true, index)) => self.kept.get(&index).copied(),
+                Some((false, index)) => self.weights.get(&index).copied(),
+                None => {
+                    let fits = spare.iter().position(|(n, _)| *n == len);
+                    fits.map(|at| {
+                        self.all.push(spare.swap_remove(at));
+                        self.all.len() - 1
+                    })
+                }
+            };
+            let at = match held.filter(|at| self.all[*at].0 == len) {
+                Some(at) => at,
+                None => {
+                    self.all.push((len, alloc(len)?));
+                    self.all.len() - 1
+                }
+            };
+            match owner {
+                Some((true, index)) => self.kept.insert(index, at),
+                Some((false, index)) => self.weights.insert(index, at),
+                None => None,
+            };
+            self.bound.push(at);
+        }
+        Ok(())
+    }
+}
+
 /// A plan with its buffers allocated and kernels compiled.
 pub trait Run {
     fn plan(&self) -> &Plan;
+    /// Takes up another plan. Weights and kept rows stay loaded.
+    fn replan(&mut self, plan: Plan) -> Result<(), Error>;
     /// Copies host bytes to the start of a slot.
     fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error>;
     fn read(&self, slot: Slot) -> Result<Vec<f32>, Error>;
+
+    /// Reads a slot of indices, stored as float bits.
+    fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
+        Ok(self.read(slot)?.into_iter().map(f32::to_bits).collect())
+    }
+
     /// Runs these steps in order and waits for them.
     fn submit(&self, steps: Range<usize>) -> Result<(), Error>;
 

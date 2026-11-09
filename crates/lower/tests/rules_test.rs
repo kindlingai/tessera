@@ -1,6 +1,6 @@
 //! Each rule's launches against the CPU interpreter, on the GPU.
 
-use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs};
+use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Cpu, Data, Tensor, run};
 use lower::{Device, Feed, cut, lower, open, rules};
@@ -29,6 +29,21 @@ fn decode() -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// Each row's likeliest entry, over more entries than threads.
+fn likeliest() -> Graph {
+    let dim = |name, size| Dim { name, size };
+    let bounded = |name| dim(name, Size::Bounded(8));
+    let m = Model::new(vec![
+        bounded(Seqs),
+        bounded(Rows),
+        dim(Vocab, Size::Fixed(600)),
+    ]);
+    let ty = TensorType::new([Seqs, Rows, Vocab], DType::F32);
+    let role = Role::Logits;
+    let [logits] = m.entry(EntryKind::Forward, [Port { role, ty }]);
+    m.finish([(Role::Tokens, &logits.top_k(1u64))])
+}
+
 /// A toy of each model, and ops neither one uses.
 fn graphs() -> Vec<Graph> {
     let stack = Stack {
@@ -43,7 +58,7 @@ fn graphs() -> Vec<Graph> {
     };
     let tiny = nanogpt::Config { stack, eps: 1e-5 };
     let qwen = qwen3::program(&qwen3::Config::toy(4, 16));
-    vec![qwen, nanogpt::program(&tiny), decode()]
+    vec![qwen, nanogpt::program(&tiny), decode(), likeliest()]
 }
 
 /// Random floats, or ids below 8, shaped like `ty`.
@@ -75,8 +90,13 @@ fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32
         runner.load(at as u32, w.floats().unwrap()).unwrap();
     }
     let feeds: Vec<Feed> = inputs.iter().map(feed).collect();
-    let got = runner.run(&feeds).unwrap();
-    max_abs_diff(&got[0], want[0].floats().unwrap())
+    let got = runner.run(&feeds).unwrap().remove(0);
+    let Data::U32(ids) = &want[0].data else {
+        return max_abs_diff(&got, want[0].floats().unwrap());
+    };
+    // Indices come back as bits, and must match exactly.
+    let same = got.iter().map(|x| x.to_bits()).eq(ids.iter().copied());
+    if same { 0.0 } else { f32::INFINITY }
 }
 
 /// One device per registered rule, favoring it everywhere.

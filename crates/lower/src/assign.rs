@@ -46,6 +46,17 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
                 let slot = b.alloc(Val(v as u32));
                 b.plan.weights.push((w, slot));
             }
+            Home::Kept { index, room } => {
+                // The longest context fits, so the buffer never moves.
+                b.plan.buffers.push(room);
+                let buffer = b.plan.buffers.len() as u32 - 1;
+                let slot = Slot {
+                    buffer,
+                    len: value.len,
+                };
+                b.slots[v] = Some(slot);
+                b.plan.kept.push((index, slot));
+            }
             Home::Input(_) | Home::Temp => {}
         }
     }
@@ -113,7 +124,9 @@ impl Buffers<'_> {
             }
             reads[0]
         } else {
-            self.alloc(op.write)
+            // Kept rows have their buffer already.
+            let held = self.slots[op.write.0 as usize];
+            held.unwrap_or_else(|| self.alloc(op.write))
         };
         self.plan.steps.push(Step {
             kernel: op.kernel.clone(),
