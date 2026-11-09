@@ -1,6 +1,6 @@
 use crate::files::Source;
 use crate::rust::{check, is_test_file, test_lines};
-use crate::{Violation, kernel, segments};
+use crate::{Violation, kernel, names};
 
 fn source(path: &str, text: &str) -> Source {
     Source {
@@ -11,21 +11,15 @@ fn source(path: &str, text: &str) -> Source {
 }
 
 fn rules(path: &str, text: &str) -> Vec<&'static str> {
-    let mut out: Vec<Violation> = Vec::new();
+    let (mut out, mut found): (Vec<Violation>, _) = (Vec::new(), Vec::new());
     let src = source(path, text);
     if path.ends_with(".rs") {
-        check(&src, &mut out);
+        check(&src, &mut out, &mut found);
     } else {
-        kernel::check(&src, &mut out);
+        kernel::check(&src, &mut found);
     }
+    names::check(&[], &found, &mut out);
     out.iter().map(|v| v.rule).collect()
-}
-
-#[test]
-fn segments_count_pieces() {
-    assert_eq!(segments("a_b_c"), 3);
-    assert_eq!(segments("__a__b_"), 2);
-    assert_eq!(segments("r#type"), 1);
 }
 
 #[test]

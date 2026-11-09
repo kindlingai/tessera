@@ -80,7 +80,7 @@ pub fn sources(root: &Path) -> Result<Vec<Source>, String> {
 }
 
 /// Directories holding a package manifest.
-fn crate_dirs(root: &Path) -> Result<Vec<String>, String> {
+pub fn crate_dirs(root: &Path) -> Result<Vec<String>, String> {
     let mut dirs = Vec::new();
     for path in listed(root)? {
         let Some(dir) = path.strip_suffix("Cargo.toml") else {
@@ -94,28 +94,19 @@ fn crate_dirs(root: &Path) -> Result<Vec<String>, String> {
     Ok(dirs)
 }
 
-pub fn check_crates(root: &Path, sources: &[Source], out: &mut Vec<Violation>) {
-    let dirs = match crate_dirs(root) {
-        Ok(d) => d,
-        Err(e) => {
-            out.push(Violation {
-                path: ".".into(),
-                line: 1,
-                rule: "crate-size",
-                message: e,
-            });
-            return;
-        }
-    };
+/// The deepest crate directory holding `path`.
+pub fn owner<'a>(dirs: &'a [String], path: &str) -> Option<&'a str> {
+    dirs.iter()
+        .filter(|d| path.starts_with(d.as_str()))
+        .max_by_key(|d| d.len())
+        .map(String::as_str)
+}
+
+pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation>) {
     let mut totals: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for src in sources {
-        // A file belongs to its deepest enclosing crate.
-        let owner = dirs
-            .iter()
-            .filter(|d| src.path.starts_with(d.as_str()))
-            .max_by_key(|d| d.len());
-        if let Some(dir) = owner {
-            let t = totals.entry(dir.as_str()).or_default();
+        if let Some(dir) = owner(dirs, &src.path) {
+            let t = totals.entry(dir).or_default();
             t.0 += 1;
             t.1 += src.lines;
         }

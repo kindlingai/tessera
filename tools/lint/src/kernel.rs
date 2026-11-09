@@ -1,7 +1,8 @@
 //! Kernel entry-point names in Metal and CUDA sources.
 
+use crate::comments;
 use crate::files::Source;
-use crate::{MAX_NAME_SEGMENTS, Violation, comments, segments};
+use crate::names::Name;
 
 /// Words before a kernel entry point's name.
 const MARKERS: &[&str] = &["kernel", "__global__"];
@@ -19,7 +20,7 @@ fn name_after(code: &[u8], at: usize) -> Option<(usize, String)> {
     Some((start, name))
 }
 
-pub fn check(src: &Source, out: &mut Vec<Violation>) {
+pub fn check(src: &Source, names: &mut Vec<Name>) {
     let code = comments::strip(&src.text, false);
     let b = code.as_bytes();
     for marker in MARKERS {
@@ -27,25 +28,19 @@ pub fn check(src: &Source, out: &mut Vec<Violation>) {
         while let Some(off) = code[from..].find(marker) {
             let at = from + off;
             from = at + marker.len();
-            let whole =
-                (at == 0 || !is_ident(b[at - 1])) && !is_ident(*b.get(from).unwrap_or(&b' '));
-            if !whole {
+            let before = at == 0 || !is_ident(b[at - 1]);
+            if !before || is_ident(*b.get(from).unwrap_or(&b' ')) {
                 continue;
             }
             let Some((pos, name)) = name_after(b, from) else {
                 continue;
             };
-            if segments(&name) > MAX_NAME_SEGMENTS {
-                let line = code[..pos].matches('\n').count() + 1;
-                out.push(src.violation(
-                    line,
-                    "name-segments",
-                    format!(
-                        "kernel `{name}` has {} segments (max {MAX_NAME_SEGMENTS})",
-                        segments(&name)
-                    ),
-                ));
-            }
+            names.push(Name {
+                path: src.path.clone(),
+                line: code[..pos].matches('\n').count() + 1,
+                name,
+                what: "kernel",
+            });
         }
     }
 }

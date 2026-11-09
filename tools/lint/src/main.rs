@@ -3,10 +3,13 @@
 mod comments;
 mod files;
 mod kernel;
+mod names;
 mod rust;
 
 #[cfg(test)]
 mod comments_test;
+#[cfg(test)]
+mod names_test;
 #[cfg(test)]
 mod rust_test;
 
@@ -14,6 +17,8 @@ use std::process::ExitCode;
 
 pub const MAX_COMMENT_WORDS: usize = 10;
 pub const MAX_NAME_SEGMENTS: usize = 3;
+/// Allowed when another function shares the first or last segment.
+pub const MAX_FAMILY_SEGMENTS: usize = 4;
 pub const MAX_FILE_LINES: usize = 1000;
 pub const MAX_CRATE_FILES: usize = 30;
 pub const MAX_CRATE_LINES: usize = 15000;
@@ -36,11 +41,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut found = Vec::new();
+    let dirs = match files::crate_dirs(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tessera-lint: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (mut found, mut names) = (Vec::new(), Vec::new());
     for src in &sources {
-        check_file(src, &mut found);
+        check_file(src, &mut found, &mut names);
     }
-    files::check_crates(&root, &sources, &mut found);
+    names::check(&dirs, &names, &mut found);
+    files::check_crates(&dirs, &sources, &mut found);
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     for v in &found {
         println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
@@ -53,7 +66,7 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn check_file(src: &files::Source, out: &mut Vec<Violation>) {
+fn check_file(src: &files::Source, out: &mut Vec<Violation>, names: &mut Vec<names::Name>) {
     if src.lines > MAX_FILE_LINES {
         out.push(src.violation(
             1,
@@ -64,14 +77,8 @@ fn check_file(src: &files::Source, out: &mut Vec<Violation>) {
     let is_rust = src.path.ends_with(".rs");
     comments::check(src, is_rust, out);
     if is_rust {
-        rust::check(src, out);
+        rust::check(src, out, names);
     } else {
-        kernel::check(src, out);
+        kernel::check(src, names);
     }
-}
-
-/// Snake-case pieces of a name, ignoring leading or doubled underscores.
-pub fn segments(name: &str) -> usize {
-    let name = name.strip_prefix("r#").unwrap_or(name);
-    name.split('_').filter(|s| !s.is_empty()).count()
 }

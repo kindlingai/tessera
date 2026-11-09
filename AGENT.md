@@ -7,7 +7,8 @@ Agents may not touch any file named README.md.
 `cargo run -p tessera-lint` checks these, and CI fails on any breach:
 
 - No comment longer than 10 words. Adjacent comment lines count as one comment.
-- No function name with more than 3 snake_case segments. Kernel entry points count. Methods in a trait impl and
+- No function name with more than 3 snake_case segments, or 4 when another function in the crate shares its first
+  or last segment (`rms_norm_backward_cpu` beside `gelu_cpu`). Kernel entry points count. Methods in a trait impl and
   functions in an `extern` block are exempt: their names come from elsewhere.
 - No source file longer than 1000 lines.
 - No crate with more than 30 source files or 15,000 source lines. Kernel sources (.metal, .cu, ...) count.

@@ -8,23 +8,22 @@ use syn::visit::Visit;
 use syn::{Attribute, Item};
 
 use crate::files::Source;
-use crate::{MAX_NAME_SEGMENTS, MAX_TEST_PERCENT, Violation, segments};
+use crate::names::Name;
+use crate::{MAX_TEST_PERCENT, Violation};
 
 struct Names<'a> {
     src: &'a Source,
-    out: &'a mut Vec<Violation>,
+    found: &'a mut Vec<Name>,
 }
 
 impl Names<'_> {
     fn name(&mut self, ident: &syn::Ident) {
-        let name = ident.to_string();
-        let n = segments(&name);
-        if n > MAX_NAME_SEGMENTS {
-            let line = ident.span().start().line;
-            let message = format!("fn `{name}` has {n} segments (max {MAX_NAME_SEGMENTS})");
-            self.out
-                .push(self.src.violation(line, "name-segments", message));
-        }
+        self.found.push(Name {
+            path: self.src.path.clone(),
+            line: ident.span().start().line,
+            name: ident.to_string(),
+            what: "fn",
+        });
     }
 }
 
@@ -123,7 +122,7 @@ pub fn is_test_file(path: &str) -> bool {
         .is_some_and(|s| s.ends_with("test"))
 }
 
-pub fn check(src: &Source, out: &mut Vec<Violation>) {
+pub fn check(src: &Source, out: &mut Vec<Violation>, names: &mut Vec<Name>) {
     let file = match syn::parse_file(&src.text) {
         Ok(f) => f,
         Err(e) => {
@@ -132,7 +131,7 @@ pub fn check(src: &Source, out: &mut Vec<Violation>) {
             return;
         }
     };
-    Names { src, out }.visit_file(&file);
+    Names { src, found: names }.visit_file(&file);
     if is_test_file(&src.path) {
         return;
     }
