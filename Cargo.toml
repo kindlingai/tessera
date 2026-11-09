@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/graph",
     "crates/gpukit",
     "crates/gemm",
     "crates/ops",
