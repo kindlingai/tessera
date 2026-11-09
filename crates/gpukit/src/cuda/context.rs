@@ -304,7 +304,7 @@ impl Kernel {
 
     /// Raise the dynamic shared-memory limit for this kernel (needed above
     /// 48 KiB). Returns the driver error when the limit is unsupported.
-    pub fn set_max_dynamic_shared(&self, bytes: i32) -> Result<(), Error> {
+    pub fn set_dynamic_shared(&self, bytes: i32) -> Result<(), Error> {
         const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
         self.module.driver.check(
             unsafe {

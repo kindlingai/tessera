@@ -18,7 +18,7 @@ fn skip(why: &str) {
 }
 
 #[test]
-fn driver_loads_module_and_launches() {
+fn driver_launches_kernel() {
     let Ok(ctx) = Context::new(ContextConfig::default()) else {
         return skip("no CUDA device");
     };

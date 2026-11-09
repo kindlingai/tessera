@@ -5,11 +5,11 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-pub fn f32_to_bf16_bits(v: f32) -> u16 {
+pub fn f32_to_bf16(v: f32) -> u16 {
     (v.to_bits() >> 16) as u16
 }
 
-pub fn bf16_bytes_to_f32(src: &[u8], out: &mut [f32]) {
+pub fn decode_bf16(src: &[u8], out: &mut [f32]) {
     let n = src.len() / 2;
     assert_eq!(out.len(), n);
     for i in 0..n {

@@ -61,11 +61,7 @@ impl BufferPool {
         }
     }
 
-    pub fn write_f32_at_offset(
-        buffer: &ProtocolObject<dyn MTLBuffer>,
-        byte_offset: usize,
-        data: &[f32],
-    ) {
+    pub fn write_f32_at(buffer: &ProtocolObject<dyn MTLBuffer>, byte_offset: usize, data: &[f32]) {
         let ptr = buffer.contents().as_ptr() as *mut f32;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(byte_offset / 4), data.len());
@@ -80,10 +76,10 @@ impl BufferPool {
     }
 
     pub fn read_f32(buffer: &ProtocolObject<dyn MTLBuffer>, out: &mut [f32]) {
-        Self::read_f32_at_offset(buffer, 0, out);
+        Self::read_f32_at(buffer, 0, out);
     }
 
-    pub fn read_f32_at_offset(
+    pub fn read_f32_at(
         buffer: &ProtocolObject<dyn MTLBuffer>,
         byte_offset: usize,
         out: &mut [f32],
@@ -95,10 +91,10 @@ impl BufferPool {
     }
 
     pub fn read_u32(buffer: &ProtocolObject<dyn MTLBuffer>, out: &mut [u32]) {
-        Self::read_u32_at_offset(buffer, 0, out);
+        Self::read_u32_at(buffer, 0, out);
     }
 
-    pub fn read_u32_at_offset(
+    pub fn read_u32_at(
         buffer: &ProtocolObject<dyn MTLBuffer>,
         byte_offset: usize,
         out: &mut [u32],

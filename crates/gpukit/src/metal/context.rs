@@ -156,11 +156,11 @@ impl Context {
     /// entry name must map to one source body process-wide.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        self.compile_kernel_from_library(&library, entry)
+        self.compile_from_library(&library, entry)
     }
 
     /// As [`Self::compile_kernel`], for an already-compiled library.
-    pub fn compile_kernel_from_library(
+    pub fn compile_from_library(
         &self,
         library: &ProtocolObject<dyn MTLLibrary>,
         entry: &str,
@@ -182,7 +182,7 @@ impl Context {
         let library = self.compile_library(source)?;
         entries
             .iter()
-            .map(|entry| self.compile_kernel_from_library(&library, entry))
+            .map(|entry| self.compile_from_library(&library, entry))
             .collect()
     }
 

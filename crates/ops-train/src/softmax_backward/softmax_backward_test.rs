@@ -1,6 +1,6 @@
 /// The defining invariant: every row's ds sums to zero.
 #[test]
-fn rows_sum_to_zero() {
+fn rows_sum_zero() {
     if !ops::testing::gpu_available() {
         return;
     }

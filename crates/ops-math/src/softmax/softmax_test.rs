@@ -1,6 +1,6 @@
 /// The invariant that must hold regardless of backend: rows sum to 1.
 #[test]
-fn rows_sum_to_one() {
+fn rows_sum_one() {
     if !ops::testing::gpu_available() {
         return;
     }

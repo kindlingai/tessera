@@ -19,7 +19,7 @@ fn e2m1_roundtrip_magnitudes() {
 }
 
 #[test]
-fn fp8_e4m3_encoder_known_table() {
+fn e4m3_encode_table() {
     let table: &[(f32, u8)] = &[
         (0.0, 0x00),
         (1.0 / 512.0, 0x01),
@@ -33,21 +33,21 @@ fn fp8_e4m3_encoder_known_table() {
         (448.0, 0x7E),
     ];
     for &(value, expected_bits) in table {
-        let got = fp8_e4m3_from_f32(value);
+        let got = e4m3_from_f32(value);
         assert_eq!(
             got, expected_bits,
             "encode({value}): got 0x{got:02X} expected 0x{expected_bits:02X}"
         );
         assert!(
-            (fp8_e4m3_to_f32(got) - value).abs() < 1e-3 * value.abs().max(1e-6),
+            (e4m3_to_f32(got) - value).abs() < 1e-3 * value.abs().max(1e-6),
             "encode/decode roundtrip for {value}: got {}",
-            fp8_e4m3_to_f32(got)
+            e4m3_to_f32(got)
         );
     }
 }
 
 #[test]
-fn fp8_e4m3_known_table() {
+fn e4m3_decode_table() {
     let table: &[(u8, f32)] = &[
         (0x00, 0.0),
         (0x01, 2f32.powi(-9)),
@@ -58,27 +58,27 @@ fn fp8_e4m3_known_table() {
         (0x7E, 448.0),
     ];
     for &(bits, expected) in table {
-        let got = fp8_e4m3_to_f32(bits);
+        let got = e4m3_to_f32(bits);
         assert!(
             (got - expected).abs() < 1e-6,
             "0x{bits:02X}: got {got} expected {expected}"
         );
     }
-    assert!(fp8_e4m3_to_f32(0x7F).is_nan());
+    assert!(e4m3_to_f32(0x7F).is_nan());
 }
 
 #[test]
-fn fp8_e4m3_roundtrip_non_nan() {
+fn e4m3_roundtrip() {
     for bits in 0u8..=0x7E {
         if bits == 0x7F {
             continue;
         }
-        let decoded = fp8_e4m3_to_f32(bits);
+        let decoded = e4m3_to_f32(bits);
         if decoded.is_nan() || decoded == 0.0 {
             continue;
         }
-        let reenc = fp8_e4m3_from_f32(decoded);
-        let again = fp8_e4m3_to_f32(reenc);
+        let reenc = e4m3_from_f32(decoded);
+        let again = e4m3_to_f32(reenc);
         assert!(
             (again - decoded).abs() < 0.02 * decoded.abs().max(1e-3),
             "bits=0x{bits:02X} decoded={decoded} reenc=0x{reenc:02X} again={again}"
@@ -88,7 +88,7 @@ fn fp8_e4m3_roundtrip_non_nan() {
 
 #[test]
 fn fp8_scale_half() {
-    let bits = fp8_e4m3_from_f32(0.5);
+    let bits = e4m3_from_f32(0.5);
     assert_eq!(bits, 48);
-    assert!((fp8_e4m3_to_f32(bits) - 0.5).abs() < 1e-3);
+    assert!((e4m3_to_f32(bits) - 0.5).abs() < 1e-3);
 }

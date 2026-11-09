@@ -25,7 +25,7 @@ ops::op_kernel! {
     result = (buf_out, fix.len()),
     tests = [
         raw_tiny => raw_tiny_fixture => (1e-6, 0.999999),
-        raw_gemma_shape => raw_gemma_shape_fixture => (1e-6, 0.999999),
+        raw_gemma_shape => raw_gemma_fixture => (1e-6, 0.999999),
         q8_tiny => q8_tiny_fixture => (1e-6, 0.999999),
     ],
 }
@@ -159,7 +159,7 @@ pub fn raw_tiny_fixture() -> Fixture {
 }
 
 /// The real model shape: vocab 262144, hidden 2816 (a 5-row slice).
-pub fn raw_gemma_shape_fixture() -> Fixture {
+pub fn raw_gemma_fixture() -> Fixture {
     let hidden = 2816;
     let rows = 5usize;
     let table: Vec<Vec<f32>> = (0..rows)

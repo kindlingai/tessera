@@ -122,7 +122,7 @@ pub fn q8_gemm_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &m
 }
 
 /// CPU Q8 GEMM: `y[M,N] = x[M,K] @ W[K,N]` with K-indexed rows (matches `gemm_q8_rowk`).
-pub fn q8_gemm_rowk_cpu(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
+pub fn q8_gemm_rowk(a: &[f32], m: usize, k: usize, w_q8: &[u8], n: usize, out: &mut [f32]) {
     assert_eq!(a.len(), m * k);
     assert_eq!(out.len(), m * n);
     assert_eq!(w_q8.len(), k * q8_row_bytes(n));

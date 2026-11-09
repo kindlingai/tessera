@@ -33,17 +33,17 @@ pub fn q6_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {
 }
 
 /// Packed E2M1 nibbles per row (2 codes per byte, low nibble first).
-pub fn nvfp4_data_row_bytes(in_dim: usize) -> usize {
+pub fn nvfp4_data_bytes(in_dim: usize) -> usize {
     in_dim.div_ceil(2)
 }
 
 /// FP8 E4M3 block scales per row (one byte per 16 weights along K).
-pub fn nvfp4_scales_row_bytes(in_dim: usize) -> usize {
+pub fn nvfp4_scale_bytes(in_dim: usize) -> usize {
     in_dim.div_ceil(NVFP4_GROUP_SIZE)
 }
 
 pub fn nvfp4_row_bytes(in_dim: usize) -> usize {
-    nvfp4_data_row_bytes(in_dim) + nvfp4_scales_row_bytes(in_dim)
+    nvfp4_data_bytes(in_dim) + nvfp4_scale_bytes(in_dim)
 }
 
 pub fn nvfp4_matrix_bytes(out_dim: usize, in_dim: usize) -> usize {

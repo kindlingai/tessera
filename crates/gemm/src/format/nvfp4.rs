@@ -1,10 +1,10 @@
 //! NVFP4 decode and its CPU GEMM oracle (MLX 2-tier: E2M1 codes + per-block
 //! FP8 E4M3 scale).
 
-use super::fp4::{e2m1_to_f32, fp8_e4m3_to_f32};
+use super::fp4::{e2m1_to_f32, e4m3_to_f32};
 use super::layout::{
-    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_row_bytes, nvfp4_matrix_bytes,
-    nvfp4_row_bytes, nvfp4_scales_row_bytes,
+    NVFP4_GROUP_SIZE, NVFP4_HEADER_BYTES, nvfp4_data_bytes, nvfp4_matrix_bytes, nvfp4_row_bytes,
+    nvfp4_scale_bytes,
 };
 use crate::Error;
 
@@ -14,8 +14,8 @@ fn read_f32_le(src: &[u8]) -> f32 {
 
 pub fn dequant_row_nvfp4(src: &[u8], in_dim: usize, dst: &mut [f32], global_scale: f32) {
     assert_eq!(dst.len(), in_dim);
-    let data_len = nvfp4_data_row_bytes(in_dim);
-    let scales_len = nvfp4_scales_row_bytes(in_dim);
+    let data_len = nvfp4_data_bytes(in_dim);
+    let scales_len = nvfp4_scale_bytes(in_dim);
     assert!(src.len() >= data_len + scales_len);
     let data = &src[..data_len];
     let scales = &src[data_len..data_len + scales_len];
@@ -23,7 +23,7 @@ pub fn dequant_row_nvfp4(src: &[u8], in_dim: usize, dst: &mut [f32], global_scal
     for idx in 0..in_dim {
         let byte = data[idx / 2];
         let q = if idx % 2 == 0 { byte & 0x0f } else { byte >> 4 };
-        let scale = fp8_e4m3_to_f32(scales[idx / NVFP4_GROUP_SIZE]);
+        let scale = e4m3_to_f32(scales[idx / NVFP4_GROUP_SIZE]);
         dst[idx] = e2m1_to_f32(q) * scale * global_scale;
     }
 }
@@ -48,7 +48,7 @@ pub fn dequant_matrix_nvfp4(
     }
 }
 
-pub fn dequant_matrix_nvfp4_payload(
+pub fn dequant_nvfp4_payload(
     src: &[u8],
     out_dim: usize,
     in_dim: usize,
@@ -79,14 +79,14 @@ pub fn nvfp4_weight_at(
 ) -> f32 {
     let row_bytes = nvfp4_row_bytes(in_dim);
     let row_off = row * row_bytes;
-    let data_len = nvfp4_data_row_bytes(in_dim);
+    let data_len = nvfp4_data_bytes(in_dim);
     let byte = src[row_off + col / 2];
     let q = if col.is_multiple_of(2) {
         byte & 0x0f
     } else {
         byte >> 4
     };
-    let scale = fp8_e4m3_to_f32(src[row_off + data_len + col / NVFP4_GROUP_SIZE]);
+    let scale = e4m3_to_f32(src[row_off + data_len + col / NVFP4_GROUP_SIZE]);
     e2m1_to_f32(q) * scale * global_scale
 }
 

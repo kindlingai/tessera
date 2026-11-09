@@ -45,7 +45,7 @@ pub fn e2m1_from_f32(x: f32) -> u8 {
 }
 
 /// FP8 E4M3 (PyTorch e4m3fn) → f32 (matches MLX `fp8_e4m3` operator float).
-pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+pub fn e4m3_to_f32(bits: u8) -> f32 {
     let s = (bits >> 7) & 1;
     let e = (bits >> 3) & 0xF;
     let m = bits & 0x7;
@@ -60,7 +60,7 @@ pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
 }
 
 /// f32 → FP8 E4M3 (PyTorch e4m3fn, matches MLX `fp8_e4m3` constructor).
-pub fn fp8_e4m3_from_f32(f: f32) -> u8 {
+pub fn e4m3_from_f32(f: f32) -> u8 {
     const FP8_MAX: u32 = 543 << 21;
     const DENORM_MASK: u32 = 141 << 23;
     let mut f_bits = f.to_bits();

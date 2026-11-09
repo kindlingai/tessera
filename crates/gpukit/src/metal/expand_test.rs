@@ -30,7 +30,7 @@ fn emits_line_directives() {
 }
 
 #[test]
-fn passthrough_without_local_includes() {
+fn keeps_system_includes() {
     let s = expand("#include <metal_stdlib>\nkernel void k() {}\n", INCLUDES);
     assert!(s.contains("#include <metal_stdlib>"));
     assert!(s.contains("kernel void k() {}"));

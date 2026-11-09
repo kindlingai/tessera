@@ -24,7 +24,7 @@ fn test_config() -> CacheConfig {
 /// race concurrent `addComputePipelineFunctions`. Unsynchronized, this races
 /// the non-thread-safe `MTLBinaryArchive` and SIGSEGVs.
 #[test]
-fn concurrent_compile_is_race_free() {
+fn compile_race_free() {
     if Context::new(test_config()).is_err() {
         eprintln!("skip: no Metal device");
         return;
