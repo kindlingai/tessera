@@ -183,3 +183,42 @@ fn entries_run_alone() {
     let out = run(&g, &mut Cpu, &[], 1, &[x]).unwrap();
     assert_eq!(out[0].data, Data::F32(vec![3.0, 6.0]));
 }
+
+#[derive(trace::Weights)]
+struct Proj {
+    #[shape(HeadDim, Heads)]
+    w: trace::Linear,
+}
+
+/// A matmul summing in `acc`, as a pass derives it.
+fn summing(acc: DType) -> Graph {
+    let m = model();
+    let p: Proj = trace::declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [port([Rows, HeadDim])]);
+    let mut g = m.finish([(Role::Logits, &x.matmul(&p.w))]);
+    let n = g.nodes.last_mut().unwrap().numerics.as_mut().unwrap();
+    n.accumulate = acc;
+    graph::verify(&g).unwrap();
+    g
+}
+
+#[test]
+fn accumulators_follow_numerics() {
+    let ones = bind(&summing(DType::F32), |_| Some(Data::F32(vec![1.0; 6]))).unwrap();
+    let x = Tensor::f32(vec![1, 3], vec![2048.0, 1.0, 1.0]);
+    let sums = |acc| {
+        let g = summing(acc);
+        let out = run(&g, &mut Cpu, &ones, 0, std::slice::from_ref(&x)).unwrap();
+        out[0].floats().unwrap().to_vec()
+    };
+    assert_eq!(sums(DType::F32), [2050.0, 2050.0]);
+    assert_eq!(sums(DType::F16), [2048.0, 2048.0]);
+    assert_eq!(sums(DType::Bf16), [2048.0, 2048.0]);
+    #[cfg(feature = "gpu")]
+    if gpu_ready() {
+        let mut k = Gpu::default();
+        let out = run(&summing(DType::F16), &mut k, &ones, 0, &[x]).unwrap();
+        assert_eq!(out[0].floats().unwrap(), [2048.0, 2048.0]);
+        assert_eq!(k.fallbacks, 1);
+    }
+}

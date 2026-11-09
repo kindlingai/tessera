@@ -3,8 +3,10 @@
 use crate::dims::Dim;
 use crate::infer::{ErrorKind, TypeError, elements, infer, need, same_shape};
 use crate::json::VERSION;
-use crate::node::Graph;
-use crate::types::{Placement, TensorType};
+use crate::node::{Graph, Op};
+use crate::numerics::Numerics;
+use crate::regions;
+use crate::types::{DType, Placement, TensorType};
 use std::fmt;
 
 /// A failed check, with the node it concerns.
@@ -72,6 +74,7 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
         }
         let ty = infer(g, &n.op, &args).map_err(at)?;
         agree(&g.dims, &ty, &n.ty).map_err(at)?;
+        numerics(&n.op, n.numerics.as_ref()).map_err(at)?;
     }
     for o in g.entries.iter().flat_map(|e| &e.outputs) {
         need(
@@ -81,7 +84,18 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
         )
         .map_err(top)?;
     }
-    Ok(())
+    regions::check(g).map_err(top)
+}
+
+fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {
+    need(n.is_some() == op.reduces(), ErrorKind::Numerics, || {
+        let want = if op.reduces() { "needs" } else { "takes no" };
+        format!("{op:?} {want} numerics")
+    })?;
+    let acc = n.map(|n| n.accumulate);
+    need(acc.is_none_or(DType::is_float), ErrorKind::Numerics, || {
+        format!("accumulator {acc:?} is not a float")
+    })
 }
 
 fn declared(dims: &[Dim], t: &TensorType) -> Result<(), TypeError> {

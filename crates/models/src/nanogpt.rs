@@ -2,8 +2,8 @@
 
 use trace::DimName::*;
 use trace::{
-    Act, Attend, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Port, Role, Shape,
-    Size, Tensor, TensorType, Weights,
+    Act, Attend, Composite, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Port,
+    Role, Shape, Size, Tensor, TensorType, Weights,
 };
 
 pub struct Config {
@@ -82,14 +82,18 @@ pub fn forward(m: &Model, c: &Config, w: &Gpt, tokens: &Tensor, positions: &Tens
         .add(&m.embed(positions, &w.pos_emb));
     for l in &w.layers {
         let h = x.rms_norm(&l.ln1, c.eps);
-        x = x.add(&attention(m, c, l, &h).matmul(&l.wproj));
-        let up = x.rms_norm(&l.ln2, c.eps).matmul(&l.w1);
-        x = x.add(&up.act(Act::GeluTanh).matmul(&l.w2));
+        let [attn] = m.composite(Composite::Attention, || [attention(m, c, l, &h)]);
+        x = x.add(&attn);
+        let h = x.rms_norm(&l.ln2, c.eps);
+        let [mlp] = m.composite(Composite::Mlp, || {
+            [h.matmul(&l.w1).act(Act::GeluTanh).matmul(&l.w2)]
+        });
+        x = x.add(&mlp);
     }
     x.rms_norm(&w.ln_f, c.eps).matmul(&w.lm_head)
 }
 
-/// Causal multi-head attention; heads stay whole when sharded.
+/// Causal multi-head attention and its output projection.
 fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
     let heads = Shape::from([Seqs, Context, Heads, HeadDim]);
     let project = |w: &Linear| h.matmul(w).reshape(heads.clone());
@@ -101,7 +105,7 @@ fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
         &project(&l.wk),
         &project(&l.wv),
     );
-    out.reshape([Seqs, Context, Hidden])
+    out.reshape([Seqs, Context, Hidden]).matmul(&l.wproj)
 }
 
 /// One forward entry: tokens and positions in, logits out.

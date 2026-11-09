@@ -1,14 +1,12 @@
 //! Plain loops: the reference other backends are checked against.
 
+use crate::round::Acc;
 use crate::run::Kernels;
 use crate::tensor::{Error, Tensor};
-use graph::{Act, Attend, Mask, Stage};
+use graph::{Act, Attend, Mask, Numerics, Stage};
 
+/// Sums in fixed order with exact math. Meets any `Numerics`.
 pub struct Cpu;
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
 
 /// The tanh approximation, as the GPU kernels compute it.
 fn gelu(x: f32) -> f32 {
@@ -24,12 +22,12 @@ fn act(a: Act, x: f32) -> f32 {
     }
 }
 
-fn softmax(row: &mut [f32]) {
+fn softmax(acc: Acc, row: &mut [f32]) {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for v in row.iter_mut() {
         *v = (*v - max).exp();
-        sum += *v;
+        sum = acc.add(sum, *v);
     }
     for v in row.iter_mut() {
         *v /= sum;
@@ -46,7 +44,8 @@ pub(crate) fn past_keys(a: &Attend, queries: usize, keys: usize) -> Result<usize
 }
 
 impl Kernels for Cpu {
-    fn matmul(&mut self, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+    fn matmul(&mut self, n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+        let acc = Acc::new(n.accumulate)?;
         let (m, k) = x.rows();
         let n = w.shape[0];
         let (xs, ws) = (x.floats()?, w.floats()?);
@@ -54,7 +53,7 @@ impl Kernels for Cpu {
         for (r, row) in out.chunks_mut(n).enumerate() {
             let xr = &xs[r * k..(r + 1) * k];
             for (c, o) in row.iter_mut().enumerate() {
-                *o = dot(xr, &ws[c * k..(c + 1) * k]);
+                *o = acc.dot(xr, &ws[c * k..(c + 1) * k]);
             }
         }
         let mut shape = x.shape.clone();
@@ -62,7 +61,9 @@ impl Kernels for Cpu {
         Ok(Tensor::f32(shape, out))
     }
 
-    fn attend(&mut self, a: &Attend, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, Error> {
+    fn attend(&mut self, n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error> {
+        let acc = Acc::new(n.accumulate)?;
+        let [q, k, v] = qkv;
         let [seqs, ctx, heads, d] = q.shape[..] else {
             return Err(Error::Mismatch("attention wants rank 4".into()));
         };
@@ -83,13 +84,13 @@ impl Kernels for Cpu {
                         keys
                     };
                     for (j, pj) in p[..seen].iter_mut().enumerate() {
-                        *pj = dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
+                        *pj = acc.dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
                     }
-                    softmax(&mut p[..seen]);
+                    softmax(acc, &mut p[..seen]);
                     let o = &mut out[qo..qo + d];
                     for (j, &pj) in p[..seen].iter().enumerate() {
                         for (oi, &vi) in o.iter_mut().zip(&vs[kv_at(j)..kv_at(j) + d]) {
-                            *oi += pj * vi;
+                            *oi = acc.add(*oi, pj * vi);
                         }
                     }
                 }
@@ -98,7 +99,14 @@ impl Kernels for Cpu {
         Ok(Tensor::f32(q.shape.clone(), out))
     }
 
-    fn stage(&mut self, s: &Stage, x: &Tensor, operand: Option<&Tensor>) -> Result<Tensor, Error> {
+    fn stage(
+        &mut self,
+        n: &Numerics,
+        s: &Stage,
+        x: &Tensor,
+        operand: Option<&Tensor>,
+    ) -> Result<Tensor, Error> {
+        let acc = Acc::new(n.accumulate)?;
         let mut out = x.floats()?.to_vec();
         let (_, width) = x.rows();
         match (s, operand) {
@@ -113,13 +121,13 @@ impl Kernels for Cpu {
             (Stage::RmsNorm { eps }, Some(w)) => {
                 let w = w.floats()?;
                 for row in out.chunks_mut(width) {
-                    let mean = row.iter().map(|v| v * v).sum::<f32>() / width as f32;
+                    let mean = acc.sum(row.iter().map(|v| v * v)) / width as f32;
                     let inv = 1.0 / (mean + eps).sqrt();
                     row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
                 }
             }
             (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
-            (Stage::Softmax, _) => out.chunks_mut(width).for_each(softmax),
+            (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
             // One rank holds the whole sum already.
             (Stage::AllReduce, _) => {}
             _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),

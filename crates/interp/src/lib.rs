@@ -3,6 +3,7 @@
 mod cpu;
 #[cfg(feature = "gpu")]
 mod gpu;
+mod round;
 mod run;
 mod tensor;
 
@@ -14,3 +15,5 @@ pub use tensor::{Data, Error, Tensor};
 
 #[cfg(test)]
 mod interp_test;
+#[cfg(test)]
+mod round_test;

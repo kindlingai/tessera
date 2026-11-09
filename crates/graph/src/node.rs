@@ -2,6 +2,7 @@
 
 use crate::dims::{Dim, DimExpr, Shape};
 use crate::json::VERSION;
+use crate::numerics::Numerics;
 use crate::types::{DType, TensorType};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,7 @@ pub struct Graph {
     pub dims: Vec<Dim>,
     pub weights: Vec<Weight>,
     pub nodes: Vec<Node>,
+    pub regions: Vec<Region>,
     pub entries: Vec<Entry>,
 }
 
@@ -23,12 +25,26 @@ impl Graph {
             dims,
             weights: Vec::new(),
             nodes: Vec::new(),
+            regions: Vec::new(),
             entries: Vec::new(),
         }
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
+    }
+
+    /// Outside arguments of nodes `start..end`, by first use.
+    pub fn reads(&self, start: NodeId, end: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        for n in &self.nodes[start.0 as usize..end.0 as usize] {
+            for &a in &n.args {
+                if a < start && !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -58,6 +74,9 @@ pub struct Node {
     pub op: Op,
     pub args: Vec<NodeId>,
     pub ty: TensorType,
+    /// Present exactly on ops that reduce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerics: Option<Numerics>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -75,6 +94,17 @@ pub enum Op {
     Select(Select),
     View(View),
     Cast(DType),
+}
+
+impl Op {
+    /// Whether this op sums, so it carries `Numerics`.
+    pub fn reduces(&self) -> bool {
+        match self {
+            Op::Matmul | Op::Attend(_) => true,
+            Op::Row(r) => r.0.iter().any(Stage::reduces),
+            _ => false,
+        }
+    }
 }
 
 /// Over `[Seqs, Context, Heads, HeadDim]`; key heads serve contiguous groups.
@@ -116,6 +146,13 @@ impl Stage {
             _ => 0,
         }
     }
+
+    pub fn reduces(&self) -> bool {
+        matches!(
+            self,
+            Stage::RmsNorm { .. } | Stage::Softmax | Stage::AllReduce
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +179,27 @@ pub enum View {
         len: DimExpr,
     },
     Permute(Vec<u32>),
+}
+
+/// A matcher may replace these contiguous nodes as one unit.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Region {
+    pub kind: Composite,
+    pub start: NodeId,
+    /// One past the last node.
+    pub end: NodeId,
+    /// Equals `Graph::reads(start, end)`.
+    pub inputs: Vec<NodeId>,
+    /// Later nodes may read these and no other inside values.
+    pub outputs: Vec<NodeId>,
+}
+
+/// Matchers find regions by kind. Inside nodes are the fallback.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Composite {
+    Attention,
+    Mlp,
 }
 
 /// A way into the graph, with typed ports.

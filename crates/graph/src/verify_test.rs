@@ -3,10 +3,12 @@ use DimName::*;
 
 pub(crate) fn push(g: &mut Graph, op: Op, args: &[NodeId]) -> NodeId {
     let ty = attempt(g, op.clone(), args).unwrap();
+    let op_reduces = op.reduces();
     g.nodes.push(Node {
         op,
         args: args.to_vec(),
         ty,
+        numerics: op_reduces.then(Numerics::default),
     });
     NodeId(g.nodes.len() as u32 - 1)
 }
