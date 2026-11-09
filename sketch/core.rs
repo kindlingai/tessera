@@ -336,6 +336,33 @@ pub struct Transfer {
 
 pub struct NodeId;
 
+// Effects: ops declare them; the planner derives the graph's edges.
+
+pub enum Access {
+    Read,
+    /// New rows past the committed length.
+    Append,
+    Write,
+    /// Makes tentative writes real.
+    Commit,
+}
+
+/// How one op touches one resource, over some rows.
+pub struct Effect {
+    pub resource: ResourceId,
+    pub access: Access,
+    pub rows: RowRange,
+}
+
+/// Committed rows, the round's tentative rows, or a window.
+pub struct RowRange;
+
+/// Orderings a kernel keeps inside one launch.
+pub struct EffectCaps {
+    /// Pairs it honors, such as append then read.
+    pub internal: Vec<(Access, Access)>,
+}
+
 // Resources: state that outlives one pass.
 
 pub enum Sync {

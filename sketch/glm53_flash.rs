@@ -2,6 +2,7 @@
 
 use crate::core::*;
 use crate::glm53::{AttnShape, Indexer, Mla, attention};
+use crate::kda::{Kda, KdaShape, kda};
 use crate::library::{Moe, moe};
 
 pub struct Config {
@@ -10,26 +11,7 @@ pub struct Config {
     pub full: LayerSet,
     pub top_k: usize,
     pub attn: AttnShape,
-    pub heads: usize,
-    pub head_dim: usize,
-    pub conv: usize,
-}
-
-/// Kimi delta attention: a gated delta rule per head.
-#[derive(Weights)]
-pub struct Kda {
-    pub norm: Norm,
-    #[split(heads)]
-    pub qkv: Linear,
-    #[split(heads)]
-    pub conv: Linear,
-    #[split(heads)]
-    pub gates: Linear,
-    #[split(heads)]
-    pub out_gate: Linear,
-    pub out_norm: Norm,
-    #[split(rows)]
-    pub out: Linear,
+    pub kda: KdaShape,
 }
 
 pub enum Mixer {
@@ -60,7 +42,7 @@ pub fn forward(m: &mut Model, c: &Config, w: &Flash, tokens: &Tensor) -> Tensor 
         let l = Layer(i);
         let a = match &b.mixer {
             Mixer::Full(f, ix) => attention(m, &c.attn, f, Some(ix), l, &x),
-            Mixer::Kda(k) => kda(m, c, k, l, &x),
+            Mixer::Kda(k) => kda(m, &c.kda, k, l, &x),
         };
         x = x.add(&m.site(Site::Writer(l, Sublayer::Attn), a.reduce()));
         let f = moe(m, &b.moe, &x.rms_norm(&b.mlp_norm), c.top_k, l);
@@ -69,22 +51,4 @@ pub fn forward(m: &mut Model, c: &Config, w: &Flash, tokens: &Tensor) -> Tensor 
     }
     let h = m.site(Site::PreHead, x.rms_norm(&w.norm));
     h.matmul(&w.head)
-}
-
-/// Short conv, then the delta-rule recurrence over per-head state.
-fn kda(m: &mut Model, c: &Config, w: &Kda, l: Layer, x: &Tensor) -> Tensor {
-    let h = x.rms_norm(&w.norm);
-    let history = m.conv_history(l, c.conv);
-    let qkv = m.recur(
-        RecurRule::Conv { width: c.conv },
-        &h.matmul(&w.qkv),
-        &history,
-    );
-    let state = m.recur_state(l, RecurRule::Kda, c.heads, c.head_dim, c.head_dim);
-    let o = m
-        .recur(RecurRule::Kda, &qkv, &state)
-        .with_gates(&h.matmul(&w.gates));
-    o.rms_norm(&w.out_norm)
-        .gate(Act::Sigmoid, &h.matmul(&w.out_gate))
-        .matmul(&w.out)
 }
