@@ -1,46 +1,49 @@
 use crate::names::{Name, check, fault, pieces};
 
-#[test]
-fn pieces_skip_underscores() {
-    assert_eq!(pieces("a_b_c"), ["a", "b", "c"]);
-    assert_eq!(pieces("__a__b_"), ["a", "b"]);
-    assert_eq!(pieces("r#type"), ["type"]);
-}
+/// Names and their segments.
+const PIECES: &[(&str, &[&str])] = &[
+    ("a_b_c", &["a", "b", "c"]),
+    ("__a__b_", &["a", "b"]),
+    ("r#type", &["type"]),
+];
 
-#[test]
-fn three_always_pass() {
-    assert!(fault("a_b_c", &["a_b_c"]).is_none());
-}
+/// A name, the crate's names, and whether it fails.
+const FAULTS: &[(&str, &[&str], bool)] = &[
+    ("a_b_c", &["a_b_c"], false),
+    ("rms_norm_backward_cpu", &["rms_norm_backward_cpu"], true),
+    (
+        "rms_norm_backward_cpu",
+        &["rms_norm_backward_cpu", "gelu_cpu"],
+        false,
+    ),
+    (
+        "dgemm_tile_load_f16",
+        &["dgemm_tile_load_f16", "dgemm_run"],
+        false,
+    ),
+    // Twins are not a family.
+    ("a_b_c_d", &["a_b_c_d", "a_b_c_d"], true),
+    ("a_b_c_d_cpu", &["a_b_c_d_cpu", "x_cpu"], true),
+];
 
-#[test]
-fn four_need_family() {
-    let alone = ["rms_norm_backward_cpu"];
-    assert!(fault("rms_norm_backward_cpu", &alone).is_some());
-    let suffix = ["rms_norm_backward_cpu", "gelu_cpu"];
-    assert!(fault("rms_norm_backward_cpu", &suffix).is_none());
-    let prefix = ["dgemm_tile_load_f16", "dgemm_run"];
-    assert!(fault("dgemm_tile_load_f16", &prefix).is_none());
-}
-
-#[test]
-fn twins_are_not_family() {
-    let twins = ["a_b_c_d", "a_b_c_d"];
-    assert!(fault("a_b_c_d", &twins).is_some());
-}
-
-#[test]
-fn five_always_fail() {
-    assert!(fault("a_b_c_d_cpu", &["a_b_c_d_cpu", "x_cpu"]).is_some());
-}
-
-#[test]
-fn family_per_crate() {
-    let name = |path: &str, name: &str| Name {
+fn name(path: &str, name: &str) -> Name {
+    Name {
         path: path.into(),
         line: 1,
         name: name.into(),
         what: "fn",
-    };
+    }
+}
+
+#[test]
+fn names_need_family() {
+    for &(n, want) in PIECES {
+        assert_eq!(pieces(n), want);
+    }
+    for &(n, names, fails) in FAULTS {
+        assert_eq!(fault(n, names).is_some(), fails, "{n} among {names:?}");
+    }
+    // Families do not cross crates.
     let dirs = ["crates/a/".to_string(), "crates/b/".to_string()];
     let names = [
         name("crates/a/x.rs", "one_two_three_cpu"),

@@ -23,5 +23,9 @@ min_macro_calls = 2
 # Share of a file inline tests may fill, in percent.
 max_test_percent = 1
 
+# The percent of a module plus its tests that #[test] fns fill.
+# Unpaired test files count against the rest of their crate.
+max_module_test_percent = 25
+
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]

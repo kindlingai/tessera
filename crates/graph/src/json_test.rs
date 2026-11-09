@@ -9,18 +9,21 @@ fn with_scale(scale: f32) -> Graph {
     g
 }
 
+/// Asserts `g` survives JSON with its text unchanged.
+fn survives(g: &Graph) -> Graph {
+    let back = Graph::from_json(&g.to_json()).unwrap();
+    assert_eq!(&back, g);
+    assert_eq!(back.to_json(), g.to_json());
+    verify(&back).unwrap();
+    back
+}
+
 #[test]
 fn round_trip() {
     let scale = 1.0 / 3f32.sqrt();
-    let g = with_scale(scale);
-    let back = Graph::from_json(&g.to_json()).unwrap();
-    assert_eq!(back, g);
-    let Op::Row(Row(stages)) = &back.nodes.last().unwrap().op else {
-        panic!("last node is the scale");
-    };
-    assert_eq!(stages[0], Stage::Scale(scale));
-    assert_eq!(back.to_json(), g.to_json());
-    verify(&back).unwrap();
+    let back = survives(&with_scale(scale));
+    let op = &back.nodes.last().unwrap().op;
+    assert_eq!(op, &Op::Row(Row(vec![Stage::Scale(scale)])));
 }
 
 #[test]

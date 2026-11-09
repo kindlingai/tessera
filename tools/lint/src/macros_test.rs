@@ -38,51 +38,49 @@ fn macro_dirs_found() {
 
 const DEF: &str = "macro_rules! twice { ($e:expr) => { $e; twice!(@ $e) }; }\n";
 
-#[test]
-fn two_calls_pass() {
-    let defs = source("crates/a/src/macros/mod.rs", DEF);
-    let used = source("crates/a/src/lib.rs", "fn f() { twice!(1); twice!(2); }\n");
-    assert!(rules(&[defs, used]).is_empty());
+/// Files named `crates/a/src/{prefix}{i}.rs` for `i` in `0..n`.
+fn many(n: usize, prefix: impl Fn(usize) -> String, text: &str) -> Vec<Source> {
+    (0..n)
+        .map(|i| source(&format!("crates/a/src/{}{i}.rs", prefix(i)), text))
+        .collect()
+}
+
+/// Source sets and the rules each breaks.
+fn cases() -> Vec<(Vec<Source>, Vec<&'static str>)> {
+    let defs = || source("crates/a/src/macros/mod.rs", DEF);
+    let lib = |text| source("crates/a/src/lib.rs", text);
+    let mut capped = many(25, |_| "f".into(), "fn f() {}\n");
+    capped.push(source("crates/a/src/macros/mod.rs", "mod x;\n"));
+    vec![
+        (
+            vec![defs(), lib("fn f() { twice!(1); twice!(2); }\n")],
+            vec![],
+        ),
+        // Calls inside the definition do not count.
+        (
+            vec![defs(), lib("fn f() { twice!(1); }\n")],
+            vec!["macro-calls"],
+        ),
+        (
+            vec![source(
+                "crates/a/src/macros/mod.rs",
+                "mod more;\nfn helper() {}\n",
+            )],
+            vec!["macro-content"],
+        ),
+        (
+            many(6, |_| "macros/m".into(), "mod x;\n"),
+            vec!["macro-files"],
+        ),
+        (capped, vec![]),
+        (many(26, |_| "f".into(), "fn f() {}\n"), vec!["crate-files"]),
+        (many(26, |i| format!("d{}/f", i % 2), "fn f() {}\n"), vec![]),
+    ]
 }
 
 #[test]
-fn own_calls_skip() {
-    let defs = source("crates/a/src/macros/mod.rs", DEF);
-    let used = source("crates/a/src/lib.rs", "fn f() { twice!(1); }\n");
-    assert_eq!(rules(&[defs, used]), ["macro-calls"]);
-}
-
-#[test]
-fn only_macro_rules() {
-    let defs = source("crates/a/src/macros/mod.rs", "mod more;\nfn helper() {}\n");
-    assert_eq!(rules(&[defs]), ["macro-content"]);
-}
-
-#[test]
-fn macro_files_capped() {
-    let many: Vec<Source> = (0..6)
-        .map(|i| source(&format!("crates/a/src/macros/m{i}.rs"), "mod x;\n"))
-        .collect();
-    assert_eq!(rules(&many), ["macro-files"]);
-}
-
-#[test]
-fn outside_crate_limits() {
-    let mut sources: Vec<Source> = (0..25)
-        .map(|i| source(&format!("crates/a/src/f{i}.rs"), "fn f() {}\n"))
-        .collect();
-    sources.push(source("crates/a/src/macros/mod.rs", "mod x;\n"));
-    assert!(rules(&sources).is_empty());
-}
-
-#[test]
-fn directories_add_files() {
-    let flat: Vec<Source> = (0..26)
-        .map(|i| source(&format!("crates/a/src/f{i}.rs"), "fn f() {}\n"))
-        .collect();
-    assert_eq!(rules(&flat), ["crate-files"]);
-    let split: Vec<Source> = (0..26)
-        .map(|i| source(&format!("crates/a/src/d{}/f{i}.rs", i % 2), "fn f() {}\n"))
-        .collect();
-    assert!(rules(&split).is_empty());
+fn macro_rules_checked() {
+    for (i, (sources, want)) in cases().into_iter().enumerate() {
+        assert_eq!(rules(&sources), want, "case {i}");
+    }
 }

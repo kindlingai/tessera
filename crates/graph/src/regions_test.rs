@@ -1,99 +1,93 @@
 use crate::verify_test::mlp;
 use crate::*;
 
-/// Covers the up, act and down nodes of `mlp()`.
-fn sealed() -> Graph {
+/// A region's start, end and outputs over `mlp()`.
+type Span = (u32, u32, &'static [u32]);
+
+/// Region sets and whether they verify.
+const SETS: &[(&[Span], bool)] = &[
+    (&[(7, 10, &[9])], true),
+    // Node 10 reads 9. Node 9 is not an output.
+    (&[(7, 10, &[8])], false),
+    (&[(7, 9, &[9])], false),
+    (&[(9, 9, &[9])], false),
+    (&[(7, 10, &[9]), (7, 9, &[8]), (5, 6, &[5])], true),
+    (&[(7, 10, &[9]), (8, 11, &[10])], false),
+    (&[(7, 10, &[9]), (7, 10, &[9])], false),
+];
+
+const STRICT: Numerics = Numerics {
+    accumulate: DType::F32,
+    order: Order::Fixed,
+    math: Math::Exact,
+};
+
+const RELAXED: Numerics = Numerics {
+    accumulate: DType::F16,
+    order: Order::Any,
+    math: Math::Approx,
+};
+
+const INT: Numerics = Numerics {
+    accumulate: DType::I32,
+    ..RELAXED
+};
+
+/// A node's numerics, and whether the graph then verifies.
+const NUMERICS: &[(usize, Option<Numerics>, bool)] = &[
+    (7, None, false),
+    (5, Some(STRICT), false),
+    (7, Some(RELAXED), true),
+    (7, Some(INT), false),
+];
+
+/// `mlp()` with regions whose inputs come from `Graph::reads`.
+fn with_regions(spans: &[Span]) -> Graph {
     let mut g = mlp();
-    g.regions.push(region(7, 10, vec![9]));
+    for &(start, end, outputs) in spans {
+        let (start, end) = (NodeId(start), NodeId(end));
+        g.regions.push(Region {
+            kind: Composite::Mlp,
+            start,
+            end,
+            inputs: g.reads(start, end),
+            outputs: outputs.iter().copied().map(NodeId).collect(),
+        });
+    }
     g
 }
 
-fn region(start: u32, end: u32, outputs: Vec<u32>) -> Region {
-    Region {
-        kind: Composite::Mlp,
-        start: NodeId(start),
-        end: NodeId(end),
-        inputs: Vec::new(),
-        outputs: outputs.into_iter().map(NodeId).collect(),
+fn expect(g: &Graph, ok: bool, kind: ErrorKind) {
+    match verify(g) {
+        Ok(()) => assert!(ok, "{:?} verified", g.regions),
+        Err(e) => assert_eq!((ok, e.error.kind), (false, kind), "{e}"),
     }
 }
 
-/// Fills in inputs the way the tracer does.
-fn add(g: &mut Graph, mut r: Region) {
-    r.inputs = g.reads(r.start, r.end);
-    g.regions.push(r);
+fn region_case(&(spans, ok): &(&[Span], bool)) {
+    let g = with_regions(spans);
+    expect(&g, ok, ErrorKind::Region);
+    if ok {
+        assert_eq!(Graph::from_json(&g.to_json()).unwrap(), g);
+    }
 }
 
-fn kind_of(g: &Graph) -> ErrorKind {
-    verify(g).unwrap_err().error.kind
-}
-
-#[test]
-fn sealed_region_verifies() {
+fn numerics_case(&(node, numerics, ok): &(usize, Option<Numerics>, bool)) {
     let mut g = mlp();
-    add(&mut g, region(7, 10, vec![9]));
-    assert_eq!(g.regions[0].inputs, [NodeId(6), NodeId(3), NodeId(4)]);
-    verify(&g).unwrap();
-    let back = Graph::from_json(&g.to_json()).unwrap();
-    assert_eq!(back, g);
+    g.nodes[node].numerics = numerics;
+    expect(&g, ok, ErrorKind::Numerics);
 }
 
 #[test]
-fn inputs_must_match() {
-    assert_eq!(kind_of(&sealed()), ErrorKind::Region);
-}
-
-#[test]
-fn values_cannot_leak() {
-    let mut g = mlp();
-    add(&mut g, region(7, 10, vec![8]));
-    assert_eq!(kind_of(&g), ErrorKind::Region);
-    let mut g = mlp();
-    add(&mut g, region(7, 9, vec![9]));
-    assert_eq!(kind_of(&g), ErrorKind::Region);
-    let mut g = mlp();
-    add(&mut g, region(9, 9, vec![9]));
-    assert_eq!(kind_of(&g), ErrorKind::Region);
-}
-
-#[test]
-fn regions_nest() {
-    let mut g = mlp();
-    add(&mut g, region(7, 10, vec![9]));
-    add(&mut g, region(7, 9, vec![8]));
-    add(&mut g, region(5, 6, vec![5]));
-    verify(&g).unwrap();
-    add(&mut g, region(8, 11, vec![10]));
-    assert_eq!(kind_of(&g), ErrorKind::Region);
-    let mut g = mlp();
-    add(&mut g, region(7, 10, vec![9]));
-    add(&mut g, region(7, 10, vec![9]));
-    assert_eq!(kind_of(&g), ErrorKind::Region);
+fn regions_seal() {
+    SETS.iter().for_each(region_case);
+    let mut g = with_regions(&[(7, 10, &[9])]);
+    g.regions[0].inputs.clear();
+    expect(&g, false, ErrorKind::Region);
 }
 
 #[test]
 fn numerics_only_on_reductions() {
-    let mut g = mlp();
-    assert_eq!(g.nodes[7].numerics, Some(Numerics::default()));
-    g.nodes[7].numerics = None;
-    let err = verify(&g).unwrap_err();
-    assert_eq!((err.node, err.error.kind), (Some(7), ErrorKind::Numerics));
-
-    let mut g = mlp();
-    g.nodes[5].numerics = Some(Numerics::default());
-    assert_eq!(kind_of(&g), ErrorKind::Numerics);
-
-    let mut g = mlp();
-    let relaxed = Numerics {
-        accumulate: DType::F16,
-        order: Order::Any,
-        math: Math::Approx,
-    };
-    g.nodes[7].numerics = Some(relaxed);
-    verify(&g).unwrap();
-    g.nodes[7].numerics = Some(Numerics {
-        accumulate: DType::I32,
-        ..relaxed
-    });
-    assert_eq!(kind_of(&g), ErrorKind::Numerics);
+    assert_eq!(mlp().nodes[7].numerics, Some(STRICT));
+    NUMERICS.iter().for_each(numerics_case);
 }

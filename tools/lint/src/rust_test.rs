@@ -14,7 +14,7 @@ fn rules(path: &str, text: &str) -> Vec<&'static str> {
     let (mut out, mut found): (Vec<Violation>, _) = (Vec::new(), Vec::new());
     let src = source(path, text);
     if path.ends_with(".rs") {
-        check(&src, &mut out, &mut found);
+        check(&src, &mut out, &mut found, &mut Vec::new());
     } else {
         kernel::check(&src, &mut found);
     }

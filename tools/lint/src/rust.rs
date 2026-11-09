@@ -9,6 +9,7 @@ use syn::{Attribute, Item};
 
 use crate::files::Source;
 use crate::names::Name;
+use crate::share::TestFile;
 use crate::{LIMITS, Violation};
 
 struct Names<'a> {
@@ -114,7 +115,26 @@ pub fn test_lines(items: &[Item]) -> (usize, Option<usize>) {
     (total, first)
 }
 
-/// Files named `*test.rs` may hold any amount of test code.
+/// Lines of `#[test]` functions, including those in inline modules.
+fn test_fns(items: &[Item]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            Item::Fn(f)
+                if f.attrs
+                    .iter()
+                    .any(|a| is_test(a) && !a.path().is_ident("cfg")) =>
+            {
+                let (lo, hi) = lines_of(item);
+                hi - lo + 1
+            }
+            Item::Mod(m) => m.content.as_ref().map_or(0, |(_, inner)| test_fns(inner)),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Files named `*test.rs` hold tests and fixtures.
 pub fn is_test_file(path: &str) -> bool {
     Path::new(path)
         .file_stem()
@@ -122,7 +142,12 @@ pub fn is_test_file(path: &str) -> bool {
         .is_some_and(|s| s.ends_with("test"))
 }
 
-pub fn check(src: &Source, out: &mut Vec<Violation>, names: &mut Vec<Name>) {
+pub fn check(
+    src: &Source,
+    out: &mut Vec<Violation>,
+    names: &mut Vec<Name>,
+    tests: &mut Vec<TestFile>,
+) {
     let file = match syn::parse_file(&src.text) {
         Ok(f) => f,
         Err(e) => {
@@ -133,6 +158,10 @@ pub fn check(src: &Source, out: &mut Vec<Violation>, names: &mut Vec<Name>) {
     };
     Names { src, found: names }.visit_file(&file);
     if is_test_file(&src.path) {
+        tests.push(TestFile {
+            path: src.path.clone(),
+            lines: test_fns(&file.items),
+        });
         return;
     }
     let whole = file.attrs.iter().any(is_test);

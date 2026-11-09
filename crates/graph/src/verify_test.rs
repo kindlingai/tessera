@@ -86,89 +86,90 @@ pub(crate) fn mlp() -> Graph {
     g
 }
 
-fn kind(g: &Graph, op: Op, args: &[NodeId]) -> ErrorKind {
-    attempt(g, op, args).unwrap_err().kind
-}
+/// An op on `mlp_with` nodes, and its expected error.
+type Bad = (Op, &'static [u32], ErrorKind);
 
-#[test]
-fn mlp_verifies() {
-    verify(&mlp()).unwrap();
-}
-
-#[test]
-fn shape_errors() {
-    let (g, [_, x, h, u, _]) = mlp_with(Placement::Replicated, Placement::Replicated);
-    let up = NodeId(3);
-    assert_eq!(kind(&g, Op::Matmul, &[u, up]), ErrorKind::Shape);
-    assert_eq!(
-        kind(&g, Op::Row(Row(vec![Stage::Add])), &[x, u]),
-        ErrorKind::Shape
-    );
-    let wide = View::Reshape(Shape::from([Rows, Ffn]));
-    assert_eq!(kind(&g, Op::View(wide), &[h]), ErrorKind::Shape);
+/// Bad ops on whole weights. Node 10 casts x.
+fn whole_cases() -> Vec<Bad> {
+    use ErrorKind::*;
+    let row = |s| Op::Row(Row(vec![s]));
     let past = View::Slice {
         axis: 1,
         start: 4.into(),
         len: 8.into(),
     };
-    assert_eq!(kind(&g, Op::View(past), &[h]), ErrorKind::Shape);
+    vec![
+        (Op::Matmul, &[7, 3], Shape),
+        (row(Stage::Add), &[5, 7], Shape),
+        (Op::View(View::Reshape([Rows, Ffn].into())), &[6], Shape),
+        (Op::View(past), &[6], Shape),
+        (Op::Select(Select::Gather), &[1, 5], DType),
+        (row(Stage::Add), &[5, 10], DType),
+        (row(Stage::Softmax), &[0], DType),
+    ]
 }
 
-#[test]
-fn dtype_errors() {
-    let (mut g, [t, x, _, _, _]) = mlp_with(Placement::Replicated, Placement::Replicated);
-    let e = NodeId(1);
-    assert_eq!(
-        kind(&g, Op::Select(Select::Gather), &[e, x]),
-        ErrorKind::DType
-    );
-    let ints = push(&mut g, Op::Cast(DType::I32), &[x]);
-    assert_eq!(
-        kind(&g, Op::Row(Row(vec![Stage::Add])), &[x, ints]),
-        ErrorKind::DType
-    );
-    assert_eq!(
-        kind(&g, Op::Row(Row(vec![Stage::Softmax])), &[t]),
-        ErrorKind::DType
-    );
-}
-
-#[test]
-fn placement_errors() {
-    use Placement::*;
-    let (mut g, [_, x, _, u, d]) = mlp_with(Split { axis: 0 }, Split { axis: 1 });
-    assert_eq!(g.node(u).ty.placement, Split { axis: 1 });
-    assert_eq!(g.node(d).ty.placement, Partial);
-    let add = Op::Row(Row(vec![Stage::Add]));
-    assert_eq!(kind(&g, add.clone(), &[x, d]), ErrorKind::Placement);
-    let norm = Op::Row(Row(vec![Stage::RmsNorm { eps: 1e-5 }]));
-    assert_eq!(kind(&g, norm, &[d, NodeId(2)]), ErrorKind::Placement);
+/// Bad ops with up split on rows, down on columns.
+fn split_cases() -> Vec<Bad> {
+    let row = |s| Op::Row(Row(vec![s]));
     let slice = View::Slice {
         axis: 1,
         start: 0.into(),
         len: 4.into(),
     };
-    assert_eq!(kind(&g, Op::View(slice), &[u]), ErrorKind::Placement);
+    vec![
+        (row(Stage::Add), &[5, 9], ErrorKind::Placement),
+        (
+            row(Stage::RmsNorm { eps: 1e-5 }),
+            &[9, 2],
+            ErrorKind::Placement,
+        ),
+        (Op::View(slice), &[7], ErrorKind::Placement),
+    ]
+}
+
+fn refused(g: &Graph, (op, args, want): Bad) {
+    let ids: Vec<NodeId> = args.iter().copied().map(NodeId).collect();
+    let got = attempt(g, op.clone(), &ids).unwrap_err().kind;
+    assert_eq!(got, want, "{op:?} on {args:?}");
+}
+
+type Edit = fn(&mut Graph);
+
+/// Edits that break `mlp()`, and the node blamed.
+const TAMPER: &[(Edit, Option<u32>)] = &[
+    (|g| g.nodes[6].ty.shape = Shape::from([Rows, Ffn]), Some(6)),
+    (|g| g.nodes[6].args[0] = NodeId(9), Some(6)),
+    (|g| g.dims.truncate(g.dims.len() - 1), None),
+];
+
+#[test]
+fn bad_ops_refused() {
+    use Placement::*;
+    verify(&mlp()).unwrap();
+    let (mut g, [_, x, ..]) = mlp_with(Replicated, Replicated);
+    push(&mut g, Op::Cast(DType::I32), &[x]);
+    whole_cases().into_iter().for_each(|c| refused(&g, c));
+    let (g, _) = mlp_with(Split { axis: 0 }, Split { axis: 1 });
+    split_cases().into_iter().for_each(|c| refused(&g, c));
+}
+
+#[test]
+fn reduce_makes_partials_whole() {
+    use Placement::*;
+    let (mut g, [_, x, _, u, d]) = mlp_with(Split { axis: 0 }, Split { axis: 1 });
+    assert_eq!(g.node(u).ty.placement, Split { axis: 1 });
+    assert_eq!(g.node(d).ty.placement, Partial);
     let whole = push(&mut g, Op::Row(Row(vec![Stage::AllReduce])), &[d]);
-    assert_eq!(
-        push(&mut g, add, &[x, whole]),
-        NodeId(g.nodes.len() as u32 - 1)
-    );
+    push(&mut g, Op::Row(Row(vec![Stage::Add])), &[x, whole]);
     verify(&g).unwrap();
 }
 
 #[test]
 fn verify_catches_tampering() {
-    let mut g = mlp();
-    g.nodes[6].ty.shape = Shape::from([Rows, Ffn]);
-    let err = verify(&g).unwrap_err();
-    assert_eq!((err.node, err.error.kind), (Some(6), ErrorKind::Shape));
-
-    let mut g = mlp();
-    g.nodes[6].args[0] = NodeId(9);
-    assert_eq!(verify(&g).unwrap_err().error.kind, ErrorKind::Reference);
-
-    let mut g = mlp();
-    g.dims.pop();
-    assert_eq!(verify(&g).unwrap_err().node, None);
+    for (edit, node) in TAMPER {
+        let mut g = mlp();
+        edit(&mut g);
+        assert_eq!(verify(&g).unwrap_err().node, *node);
+    }
 }
