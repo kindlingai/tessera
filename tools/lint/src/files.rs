@@ -1,6 +1,6 @@
 //! Which files the rules read, and the per-crate totals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -122,8 +122,22 @@ pub fn macro_dir(crate_dir: &str, path: &str) -> Option<(&'static str, String)> 
     None
 }
 
+/// Files, lines and source directories counted toward one crate.
+#[derive(Default)]
+struct Tally<'a> {
+    files: usize,
+    lines: usize,
+    modules: BTreeSet<&'a str>,
+}
+
+/// A crate's file budget: base plus extra per directory.
+fn max_files(modules: usize) -> usize {
+    let extra = modules.saturating_sub(1);
+    LIMITS.max_crate_files_base + extra * LIMITS.max_crate_files_addl_module
+}
+
 pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation>) {
-    let mut totals: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut totals: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut macros: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
     for src in sources {
         let Some(dir) = owner(dirs, &src.path) else {
@@ -134,8 +148,10 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
             continue;
         }
         let t = totals.entry(dir).or_default();
-        t.0 += 1;
-        t.1 += src.lines;
+        t.files += 1;
+        t.lines += src.lines;
+        t.modules
+            .insert(src.path.rsplit_once('/').map_or("", |(d, _)| d));
     }
     for ((dir, lang), mut mdirs) in macros {
         let path = format!("{dir}Cargo.toml");
@@ -162,15 +178,18 @@ pub fn check_crates(dirs: &[String], sources: &[Source], out: &mut Vec<Violation
             });
         }
     }
-    for (dir, (files, lines)) in totals {
+    for (dir, t) in totals {
         let path = format!("{dir}Cargo.toml");
-        let (max_files, max_lines) = (LIMITS.max_crate_files, LIMITS.max_crate_lines);
-        if files > max_files {
+        let (files, lines, modules) = (t.files, t.lines, t.modules.len());
+        let (budget, max_lines) = (max_files(modules), LIMITS.max_crate_lines);
+        if files > budget {
             out.push(Violation {
                 path: path.clone(),
                 line: 1,
                 rule: "crate-files",
-                message: format!("{files} source files (max {max_files})"),
+                message: format!(
+                    "{files} source files (max {budget} for {modules} source directories)"
+                ),
             });
         }
         if lines > max_lines {

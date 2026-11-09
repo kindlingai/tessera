@@ -13,7 +13,8 @@ No design docs, plans or history in the repo, outside an explicit changelog.
   or last segment (`rms_norm_backward_cpu` beside `gelu_cpu`). Kernel entry points count. Methods in a trait impl and
   functions in an `extern` block are exempt: their names come from elsewhere.
 - No source file longer than 1000 lines.
-- No crate with more than 30 source files or 15,000 source lines. Kernel sources (.metal, .cu, ...) count.
+- No crate with more than 25 source files, plus 3 for each source directory beyond the first, or more than 15,000
+  source lines. Kernel sources (.metal, .cu, ...) count.
 - A crate may keep up to 5 files per language in one `macros/` directory. They obey the file limits but do not count
   toward the crate's. Rust ones hold only `macro_rules!` (and `mod` lines), and each macro needs at least two
   callsites in the crate.

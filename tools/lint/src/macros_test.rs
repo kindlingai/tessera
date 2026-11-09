@@ -68,9 +68,21 @@ fn macro_files_capped() {
 
 #[test]
 fn outside_crate_limits() {
-    let mut sources: Vec<Source> = (0..30)
+    let mut sources: Vec<Source> = (0..25)
         .map(|i| source(&format!("crates/a/src/f{i}.rs"), "fn f() {}\n"))
         .collect();
     sources.push(source("crates/a/src/macros/mod.rs", "mod x;\n"));
     assert!(rules(&sources).is_empty());
+}
+
+#[test]
+fn directories_add_files() {
+    let flat: Vec<Source> = (0..26)
+        .map(|i| source(&format!("crates/a/src/f{i}.rs"), "fn f() {}\n"))
+        .collect();
+    assert_eq!(rules(&flat), ["crate-files"]);
+    let split: Vec<Source> = (0..26)
+        .map(|i| source(&format!("crates/a/src/d{}/f{i}.rs", i % 2), "fn f() {}\n"))
+        .collect();
+    assert!(rules(&split).is_empty());
 }

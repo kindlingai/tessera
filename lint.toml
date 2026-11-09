@@ -10,7 +10,10 @@ max_family_segments = 4
 
 max_file_lines = 1000
 
-max_crate_files = 30
+# Source files per crate: a base, plus more for each source
+# directory beyond the first. macros/ directories do not count.
+max_crate_files_base = 25
+max_crate_files_addl_module = 3
 max_crate_lines = 15000
 
 # Per language in a crate's macros/ directory, outside the crate limits.
