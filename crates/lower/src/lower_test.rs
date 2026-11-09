@@ -85,8 +85,8 @@ fn dialects_agree() {
     let (metal, cuda) = (text.render(Dialect::Metal), text.render(Dialect::Cuda));
     // Buffers, then scalars, in one order for both.
     assert!(metal.contains("device const float *a0 [[buffer(1)]]"));
-    assert!(metal.contains("constant uint &len [[buffer(3)]]"));
-    let order = "const float *x,\n    const float *a0,\n    float *out,\n    uint len\n";
+    assert!(metal.contains("constant u32 &len [[buffer(3)]]"));
+    let order = "const float *x,\n    const float *a0,\n    float *out,\n    u32 len\n";
     assert!(cuda.contains(order), "{cuda}");
     assert!(cuda.contains(&format!("__global__ void {}(", text.entry)));
     for body in [&metal, &cuda] {

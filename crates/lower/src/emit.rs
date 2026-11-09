@@ -23,6 +23,8 @@ pub struct Text {
 /// Each dialect's spelling of the names a body may use.
 const METAL: &str = "#include <metal_stdlib>
 using namespace metal;
+typedef unsigned int u32;
+typedef unsigned long u64;
 #define f_exp(x) exp(x)
 #define f_tanh(x) tanh(x)
 #define f_max(a, b) max(a, b)
@@ -34,8 +36,8 @@ using namespace metal;
 
 ";
 
-const CUDA: &str = "typedef unsigned int uint;
-typedef unsigned long long ulong;
+const CUDA: &str = "typedef unsigned int u32;
+typedef unsigned long long u64;
 #define f_exp(x) expf(x)
 #define f_tanh(x) tanhf(x)
 #define f_max(a, b) fmaxf(a, b)
@@ -67,11 +69,11 @@ impl Text {
         }
         let (head, kind, index) = match metal {
             true => {
-                params.push("uint gid [[thread_position_in_grid]]".into());
+                params.push("u32 gid [[thread_position_in_grid]]".into());
                 (METAL, "kernel void", "")
             }
             false => {
-                let index = "    uint gid = blockIdx.x * blockDim.x + threadIdx.x;\n";
+                let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n";
                 (CUDA, "extern \"C\" __global__ void", index)
             }
         };
@@ -126,16 +128,16 @@ pub fn map(stages: &[MapStage]) -> Text {
     Text {
         entry: format!("map_{:x}", hash(&body)),
         buffers,
-        scalars: vec![("len", "uint")],
+        scalars: vec![("len", "u32")],
         body,
     }
 }
 
 /// Rows of `a` and `b`, joined along the last axis.
 pub fn join() -> Text {
-    let body = "    uint width = left + right;
-    uint row = gid / width;
-    uint col = gid % width;
+    let body = "    u32 width = left + right;
+    u32 row = gid / width;
+    u32 col = gid % width;
     if (row >= rows) {
         return;
     }
@@ -144,7 +146,7 @@ pub fn join() -> Text {
     Text {
         entry: "plan_join".into(),
         buffers: vec![float("a", false), float("b", false), float("out", true)],
-        scalars: vec![("left", "uint"), ("right", "uint"), ("rows", "uint")],
+        scalars: vec![("left", "u32"), ("right", "u32"), ("rows", "u32")],
         body: body.into(),
     }
 }
@@ -155,32 +157,32 @@ pub fn thin() -> Text {
         return;
     }
     float sums[32];
-    for (uint row = 0; row < m; row++) {
+    for (u32 row = 0; row < m; row++) {
         sums[row] = 0.0f;
     }
-    for (uint i = 0; i < k; i++) {
-        float c = w[(ulong)gid * k + i];
-        for (uint row = 0; row < m; row++) {
+    for (u32 i = 0; i < k; i++) {
+        float c = w[(u64)gid * k + i];
+        for (u32 row = 0; row < m; row++) {
             sums[row] += x[row * k + i] * c;
         }
     }
-    for (uint row = 0; row < m; row++) {
-        out[(ulong)row * n + gid] = sums[row];
+    for (u32 row = 0; row < m; row++) {
+        out[(u64)row * n + gid] = sums[row];
     }
 ";
     Text {
         entry: "plan_thin".into(),
         buffers: vec![float("x", false), float("w", false), float("out", true)],
-        scalars: vec![("m", "uint"), ("n", "uint"), ("k", "uint")],
+        scalars: vec![("m", "u32"), ("n", "u32"), ("k", "u32")],
         body: body.into(),
     }
 }
 
 /// A cosine and sine per position and pair.
 pub fn angles() -> Text {
-    let body = "    uint pairs = width / 2;
-    uint at = gid / pairs;
-    uint pair = gid % pairs;
+    let body = "    u32 pairs = width / 2;
+    u32 at = gid / pairs;
+    u32 pair = gid % pairs;
     if (at >= count) {
         return;
     }
@@ -191,8 +193,8 @@ pub fn angles() -> Text {
 ";
     Text {
         entry: "plan_angles".into(),
-        buffers: vec![("positions".into(), "uint", false), float("out", true)],
-        scalars: vec![("count", "uint"), ("width", "uint"), ("theta", "float")],
+        buffers: vec![("positions".into(), "u32", false), float("out", true)],
+        scalars: vec![("count", "u32"), ("width", "u32"), ("theta", "float")],
         body: body.into(),
     }
 }
