@@ -11,6 +11,6 @@ macro_rules! case {
 
 case!(tiny, crate::fixtures::tiny);
 case!(linear, crate::fixtures::linear);
-case!(backward_a, crate::fixtures::backward_a);
+case!(trans_a, crate::fixtures::trans_a);
 case!(both_trans, crate::fixtures::both_trans);
 case!(tile, crate::fixtures::tile);

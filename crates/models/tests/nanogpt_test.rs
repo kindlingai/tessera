@@ -17,7 +17,7 @@ struct Case {
 fn case(batch: usize, seq: usize) -> Case {
     let corpus = Corpus::from_text(DEFAULT_TEXT);
     let cfg = GptConfig::tiny(corpus.vocab_size());
-    let (tokens, _) = corpus.batch(7, batch, seq);
+    let tokens = corpus.batch(7, batch, seq);
     Case {
         w: Weights::random(&cfg, 1337),
         cfg,
@@ -140,7 +140,7 @@ fn gpu_matches_nanogpt() {
     let (c, mut k) = (case(2, 64), Gpu::default());
     let got = logits(&c, &mut k);
     assert_eq!(k.fallbacks, 0, "every op should have a GPU kernel");
-    let ours = gpt::forward(&c.w, &c.cfg, &c.tokens, c.seq).unwrap().logits;
+    let ours = gpt::forward(&c.w, &c.cfg, &c.tokens, c.seq).unwrap();
     close("gpu vs nanogpt gpu", &got, &ours);
     let cpu = reference::forward(&c.w, &c.cfg, &c.tokens, c.seq);
     close("gpu vs cpu reference", &got, &cpu);
