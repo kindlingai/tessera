@@ -96,7 +96,7 @@ fn matches_reference() {
 /// The same model as a plan, wholly on the GPU.
 mod plan {
     use super::*;
-    use lower::{Device, Feed, Kernel, Plan, assign, lower, open, select};
+    use lower::{Device, Feed, Kernel, Plan, assign, launches, lower, open, select};
     use std::collections::BTreeMap;
     use trace::DimName::{Context, Seqs};
 
@@ -143,11 +143,18 @@ mod plan {
         }
     }
 
-    /// Fits this machine's rates from runs of both matmul kernels.
+    /// Times every kernel: cost only chooses what was measured.
     fn calibrate(g: &Graph, c: &Case) -> Device {
-        let tiled = Device::guess().without("thin");
+        let tiled = || Device::guess().without("thin");
+        let stream = tiled().without("scores");
         let thin = Device::guess().without("matmul");
-        let cases = [(&tiled, vec![8, 32, 128, 384]), (&thin, vec![8, 16, 32])];
+        let dense = tiled().without("attend");
+        let long = vec![8, 32, 128, 384];
+        let cases = [
+            (&stream, long.clone()),
+            (&thin, vec![8, 16, 32]),
+            (&dense, long),
+        ];
         let mut runs = Vec::new();
         for (device, lengths) in cases {
             for n in lengths {
@@ -172,8 +179,8 @@ mod plan {
         let cost = device.cost(&r.plan);
         let (n, whole) = (r.out.len() / 151_936, r.whole);
         eprintln!("plan, {n} tokens: {whole:.3} s in one command buffer");
-        let (launches, estimate) = (cost.launches, cost.seconds);
-        eprintln!("  {launches} launches: estimated {estimate:.3} s, measured {waited:.3} s");
+        let (all, estimate) = (cost.launches, cost.seconds);
+        eprintln!("  {all} launches: estimated {estimate:.3} s, measured {waited:.3} s");
         let mb = |elements: usize| elements as f64 * 4.0 / 1e6;
         let (moved, scratch, traced) =
             (cost.bytes as f64 / 1e9, mb(r.plan.scratch()), mb(r.traced));
@@ -181,7 +188,7 @@ mod plan {
         let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
         for (step, seconds) in r.plan.steps.iter().zip(&r.steps) {
             let (count, total) = by.entry(step.kernel.name()).or_default();
-            (*count, *total) = (*count + 1, *total + seconds);
+            (*count, *total) = (*count + launches(step).len(), *total + seconds);
         }
         for (name, (count, seconds)) in by {
             eprintln!("  {name:8} {count:4} launches {seconds:.3} s");
@@ -193,16 +200,15 @@ mod plan {
         );
     }
 
-    /// The planned mix should not lose to either kernel alone.
-    fn compare(g: &Graph, c: &Case, planned: &Run) {
+    /// The plan should not lose to a forced choice.
+    fn compare(g: &Graph, c: &Case, planned: &Run, device: &Device, without: [&'static str; 2]) {
         let waited = |r: &Run| r.steps.iter().sum::<f64>();
-        let alone = |kernel| waited(&run(g, c, &c.tokens, &Device::guess().without(kernel)));
-        let (tiled, thin, mixed) = (alone("thin"), alone("matmul"), waited(planned));
-        eprintln!("  tiled only {tiled:.3} s, thin only {thin:.3} s, planned {mixed:.3} s");
-        assert!(
-            mixed < 1.25 * tiled.min(thin),
-            "the plan lost to one kernel"
-        );
+        let tokens = repeat(c, planned.out.len() / 151_936);
+        let lacking = |kernel| waited(&run(g, c, &tokens, &device.clone().without(kernel)));
+        let (a, b, mixed) = (lacking(without[0]), lacking(without[1]), waited(planned));
+        let [x, y] = without;
+        eprintln!("  without {x} {a:.3} s, without {y} {b:.3} s, planned {mixed:.3} s");
+        assert!(mixed < 1.25 * a.min(b), "the plan lost to a forced choice");
     }
 
     pub fn check(g: &Graph, c: &Case) {
@@ -210,7 +216,7 @@ mod plan {
         let device = calibrate(g, c);
         let short = run(g, c, &c.tokens, &device);
         report(&short, &device);
-        compare(g, c, &short);
+        compare(g, c, &short, &device, ["thin", "matmul"]);
         close("plan", &short.out, c);
         // Past the reference's length, the CPU is the check.
         let longer = repeat(c, 64);
@@ -221,6 +227,7 @@ mod plan {
         // Causal, so a long run's first rows match the reference.
         let long = run(g, c, &repeat(c, 512), &device);
         report(&long, &device);
+        compare(g, c, &long, &device, ["scores", "attend"]);
         close("plan, start of 512", &long.out[..c.want.len()], c);
     }
 }

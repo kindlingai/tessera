@@ -26,14 +26,10 @@ pub fn work(k: &Kernel, len: usize) -> f64 {
         // The tiled kernel pays for whole tiles.
         Kernel::Matmul { m, n, k } => tile(m) * tile(n) * k,
         Kernel::Thin { m, n, k } => m * n * k,
-        Kernel::Attend {
-            seqs,
-            queries,
-            keys,
-            heads,
-            width,
-            ..
-        } => seqs * queries * keys * heads * width,
+        Kernel::Attend(a) => a.seqs * a.heads * a.queries * a.keys * a.width,
+        // Two tiled matmuls per head.
+        Kernel::Scores(a) => a.seqs * a.heads * tile(a.queries) * tile(a.keys) * a.width,
+        Kernel::Values(a) => a.seqs * a.heads * tile(a.queries) * tile(a.width) * a.keys,
         Kernel::Map(ref stages) => len * (1 + stages.len()),
         _ => len,
     };
@@ -45,11 +41,14 @@ impl Device {
     pub fn guess() -> Self {
         let line = |per_unit: f64| vec![(0.0, 1e-4), (1e12, 1e-4 + 1e12 * per_unit)];
         let names = [
-            "matmul", "rms_norm", "softmax", "angles", "rope", "attend", "gather", "map", "join",
+            "matmul", "rms_norm", "softmax", "angles", "rope", "attend", "causal", "gather", "map",
+            "join",
         ];
         let mut curves: BTreeMap<_, _> = names.iter().map(|n| (*n, line(1e-10))).collect();
-        // Unproven, so it must earn its place by measurement.
-        curves.insert("thin", line(1e-9));
+        // Unproven, so each must earn its place by measurement.
+        for name in ["thin", "scores", "values"] {
+            curves.insert(name, line(1e-9));
+        }
         Self { curves }
     }
 
@@ -72,7 +71,7 @@ impl Device {
             let moved: usize = step.reads.iter().map(|r| r.len).sum();
             total.seconds += self.seconds(&step.kernel, step.write.len);
             total.bytes += 4 * (moved + step.write.len) as u64;
-            total.launches += 1;
+            total.launches += crate::abi::launches(step).len();
         }
         total
     }

@@ -19,7 +19,7 @@ pub use assign::assign;
 pub use cost::{Cost, Device, work};
 pub use cut::cut;
 pub use emit::{Dialect, Text};
-pub use plan::{Kernel, MapStage, Output, Plan, Slot, Step};
+pub use plan::{Attn, Kernel, MapStage, Output, Plan, Slot, Step};
 pub use run::{Feed, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, THIN_ROWS, Val, Value, select};
