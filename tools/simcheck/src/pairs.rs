@@ -5,6 +5,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Two files' closest window pair, and how many pairs pass.
 pub struct Hit {
@@ -32,6 +33,11 @@ impl Allow {
     }
 }
 
+/// Files in different languages may mirror each other.
+fn same_kind(a: &Window, b: &Window) -> bool {
+    Path::new(&a.path).extension() == Path::new(&b.path).extension()
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -48,6 +54,7 @@ pub fn near(
         .into_par_iter()
         .flat_map_iter(|i| {
             (i + 1..wins.len())
+                .filter(move |&j| same_kind(&wins[i], &wins[j]))
                 .filter(move |&j| !overlap(&wins[i], &wins[j], window))
                 .map(move |j| (i, j, dot(&embs[i], &embs[j])))
                 .filter(move |&(_, _, s)| s >= min)
