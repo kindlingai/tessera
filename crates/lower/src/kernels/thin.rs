@@ -58,6 +58,10 @@ impl Kernel for Thin {
         }]
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.m, self.n, self.k]
+    }
+
     fn work(&self, _: usize) -> f64 {
         (self.m * self.n * self.k) as f64
     }

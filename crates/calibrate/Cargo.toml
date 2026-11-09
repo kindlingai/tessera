@@ -1,0 +1,25 @@
+[package]
+name = "calibrate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Times kernels on this machine and stores what they cost"
+
+[features]
+default = []
+cuda = ["lower/cuda"]
+rocm = ["lower/rocm"]
+
+[[bin]]
+name = "tessera-calibrate"
+path = "src/main.rs"
+
+[dependencies]
+graph = { path = "../graph" }
+trace = { path = "../trace" }
+lower = { path = "../lower" }
+gpukit = { path = "../gpukit", default-features = false }
+
+[dev-dependencies]
+ops = { path = "../ops" }

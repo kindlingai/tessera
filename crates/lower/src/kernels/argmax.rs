@@ -62,6 +62,10 @@ const ARGMAX: &str = "    if (gid >= rows) {
 ";
 
 impl Rows {
+    fn sizes(&self) -> Vec<usize> {
+        vec![self.rows, self.width]
+    }
+
     fn text(&self, entry: &str, peaks: bool, body: &str) -> Source {
         let ids = |name: &str, writes| (name.to_string(), "u32", writes);
         let mut buffers = vec![float("x", false)];
@@ -92,6 +96,10 @@ impl Kernel for Peaks {
         "peaks"
     }
 
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
+    }
+
     fn source(&self) -> Source {
         self.0.text("plan_peaks", false, PEAKS)
     }
@@ -108,6 +116,10 @@ impl Kernel for Peaks {
 impl Kernel for Argmax {
     fn name(&self) -> &'static str {
         "argmax"
+    }
+
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
     }
 
     fn source(&self) -> Source {

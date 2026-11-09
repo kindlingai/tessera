@@ -18,6 +18,13 @@ pub struct Attn {
     pub width: usize,
 }
 
+impl Attn {
+    /// What an attention kernel's time depends on.
+    pub fn sizes(&self) -> Vec<usize> {
+        vec![self.seqs, self.queries, self.keys, self.heads, self.width]
+    }
+}
+
 /// One piece of a graph that some kernels can compute.
 #[derive(Clone, Copy, Debug)]
 pub enum Site<'a> {

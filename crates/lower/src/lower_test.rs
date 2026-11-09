@@ -1,5 +1,5 @@
-use crate::kernels::{Map, MapStage};
-use crate::{Arg, Device, Dialect, Error, Held, Kernel, KernelRef, Plan, Source};
+use crate::kernels::{Map, MapStage, Thin};
+use crate::{Arg, Device, Dialect, Error, Held, Kernel, KernelRef, Plan, Slot, Source, Step};
 use crate::{assign, lower, peak, rules, schedule, select};
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
@@ -184,4 +184,48 @@ fn replans_hold_buffers() {
     held.bind(&next, |_| unreachable!("every buffer is held"))
         .unwrap();
     assert_eq!(made, so_far);
+}
+
+/// One thin launch of `m` rows, 64 outputs wide.
+fn thin(m: usize) -> Step {
+    let (n, k) = (64, 32);
+    Step {
+        kernel: KernelRef::new(Thin { m, n, k }),
+        rule: "thin",
+        reads: Vec::new(),
+        write: Slot {
+            buffer: 0,
+            len: m * n,
+        },
+        covers: Vec::new(),
+    }
+}
+
+#[test]
+fn near_samples_estimate() {
+    let seconds = |d: &Device, m: usize| d.seconds(&*thin(m).kernel, m * 64);
+    let mut device = Device::guess();
+    let guess = seconds(&device, 4);
+    device.fit([(&thin(1), 1e-3), (&thin(16), 4e-3)]);
+    assert_eq!(device.samples(), 2);
+    assert!((seconds(&device, 1) - 1e-3).abs() < 1e-9, "an exact match");
+    assert!((seconds(&device, 16) - 4e-3).abs() < 1e-9);
+    // Between samples, each is scaled by work and they blend.
+    let between = seconds(&device, 4);
+    assert!(1e-3 < between && between < 4e-3 && between != guess);
+    assert!((seconds(&device, 32) - 8e-3).abs() < 1e-4, "scaled by work");
+    assert!(device.known(&thin(1)) && !device.known(&thin(4)));
+    // A launch timed again replaces its sample.
+    device.fit([(&thin(1), 2e-3), (&thin(1), 9e-3), (&thin(1), 3e-3)]);
+    assert_eq!(device.samples(), 2);
+    assert!((seconds(&device, 1) - 3e-3).abs() < 1e-9, "the median");
+    assert!(seconds(&device.clone().without("thin"), 1).is_infinite());
+}
+
+#[test]
+fn sources_differ() {
+    let hash = |stages: Vec<MapStage>| Map(stages).source().hash();
+    assert_eq!(hash(vec![MapStage::Add]), hash(vec![MapStage::Add]));
+    assert_ne!(hash(vec![MapStage::Add]), hash(vec![MapStage::Mul]));
+    assert_ne!(hash(Vec::new()), thin(1).kernel.source().hash());
 }

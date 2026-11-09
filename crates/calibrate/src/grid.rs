@@ -1,0 +1,247 @@
+//! Small graphs that reach every rule, at many sizes.
+
+use crate::measure;
+use gpukit::testing::Noise;
+use graph::DimName::{self, *};
+use lower::{Device, Error, Feed, Run, Step, lower, open};
+use trace::{
+    Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
+    TensorType, Weights, declare,
+};
+
+/// A timed plan holds at most this many elements.
+const ROOM: usize = 750_000_000;
+
+type Sizes = Vec<(DimName, u64)>;
+
+/// The grid times every rule at these sizes.
+pub struct Grid {
+    /// Row counts, for everything that works on rows.
+    pub rows: Vec<u64>,
+    /// Hidden and inner widths.
+    pub widths: Vec<u64>,
+    pub vocabs: Vec<u64>,
+    /// Heads, key heads and head width.
+    pub heads: Vec<[u64; 3]>,
+    /// Queries and keys of one attention.
+    pub spans: Vec<[u64; 2]>,
+}
+
+/// A graph, with each size to time it at.
+struct Case {
+    g: Graph,
+    sizes: Vec<Sizes>,
+}
+
+#[derive(Weights)]
+struct Layer {
+    #[shape(Hidden, Ffn)]
+    w: Linear,
+}
+
+#[derive(Weights)]
+struct Scale {
+    #[shape(Hidden)]
+    norm: Norm,
+}
+
+#[derive(Weights)]
+struct Table {
+    #[shape(Vocab, Hidden)]
+    embed: Embed,
+}
+
+/// Every name bounded at `most`, then the fixed ones.
+fn model(bounded: &[DimName], fixed: &[(DimName, u64)]) -> Model {
+    let most = Size::Bounded(1 << 20);
+    let bounded = bounded.iter().map(|name| (*name, most));
+    let fixed = fixed.iter().map(|(name, n)| (*name, Size::Fixed(*n)));
+    let dim = |(name, size)| Dim { name, size };
+    Model::new(bounded.chain(fixed).map(dim).collect())
+}
+
+fn floats<const N: usize>(shape: [DimName; N]) -> Port {
+    let ty = TensorType::new(shape, DType::F32);
+    let role = Role::Logits;
+    Port { role, ty }
+}
+
+fn ids<const N: usize>(shape: [DimName; N]) -> Port {
+    let ty = TensorType::new(shape, DType::U32);
+    let role = Role::Tokens;
+    Port { role, ty }
+}
+
+/// `k` inputs to `n` outputs: every matmul.
+fn linear(k: u64, n: u64) -> Graph {
+    let m = model(&[Rows], &[(Hidden, k), (Ffn, n)]);
+    let w: Layer = declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [floats([Rows, Hidden])]);
+    m.finish([(Role::Logits, &x.matmul(&w.w))])
+}
+
+/// A norm, two maps, a softmax and an argmax.
+fn rows(width: u64) -> Graph {
+    let m = model(&[Rows], &[(Hidden, width)]);
+    let w: Scale = declare(&m);
+    let port = || floats([Rows, Hidden]);
+    let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
+    let gated = x.rms_norm(&w.norm, 1e-6).act(Act::Silu).mul(&y);
+    let ids = y.add(&gated).softmax().top_k(1u64);
+    m.finish([(Role::Tokens, &ids)])
+}
+
+/// A rotation, then causal attention.
+fn attention([heads, kv_heads, width]: [u64; 3]) -> Graph {
+    let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
+    let m = model(&[Seqs, Rows, Context], &fixed);
+    let keys = || floats([Seqs, Context, KvHeads, HeadDim]);
+    let ports = [
+        floats([Seqs, Rows, Heads, HeadDim]),
+        keys(),
+        keys(),
+        ids([Seqs, Rows]),
+    ];
+    let [q, k, v, at] = m.entry(EntryKind::Forward, ports);
+    let q = q.rope(&at, 1e4, Pairs::Halves);
+    let out = m.attend(Mask::Causal, 0.1, [&q, &k, &v], None);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Rows read from a table.
+fn table(vocab: u64, width: u64) -> Graph {
+    let m = model(&[Rows], &[(Vocab, vocab), (Hidden, width)]);
+    let w: Table = declare(&m);
+    let [tokens] = m.entry(EntryKind::Forward, [ids([Rows])]);
+    m.finish([(Role::Logits, &m.embed(&tokens, &w.embed))])
+}
+
+/// An input's values.
+enum Fed {
+    Floats(Vec<f32>),
+    Ids(Vec<u32>),
+}
+
+impl Fed {
+    fn feed(&self) -> Feed<'_> {
+        match self {
+            Fed::Floats(v) => Feed::Floats(v),
+            Fed::Ids(v) => Feed::Ids(v),
+        }
+    }
+}
+
+/// Noise shaped like `ty`; ids stay below eight.
+fn fill(g: &Graph, ty: &TensorType, sizes: &Sizes, noise: &mut Noise) -> Result<Fed, Error> {
+    let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+    let poly = ty.shape.elements(&g.dims).ok();
+    let unsized_shape = || Error::Size(ty.shape.to_string());
+    let len = poly.and_then(|p| p.eval(&size)).ok_or_else(unsized_shape)?;
+    let mut draws = (0..len).map(|_| noise.draw());
+    Ok(match ty.dtype {
+        DType::U32 => Fed::Ids(draws.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
+        _ => Fed::Floats(draws.by_ref().collect()),
+    })
+}
+
+impl Case {
+    /// Times this case at each of its sizes that fits.
+    fn run(&self, device: &mut Device, noise: &mut Noise) -> Result<Vec<(Step, f64)>, Error> {
+        let mut runner: Option<Box<dyn Run>> = None;
+        let mut added = Vec::new();
+        for sizes in &self.sizes {
+            let plan = lower(&self.g, 0, sizes, &Device::guess())?;
+            if plan.buffers.iter().sum::<usize>() > ROOM {
+                continue;
+            }
+            let runner = match &mut runner {
+                Some(runner) => runner,
+                None => runner.insert(self.open(plan, noise)?),
+            };
+            let ports = self.g.entries[0].inputs.iter();
+            let fed: Result<Vec<Fed>, Error> =
+                ports.map(|p| fill(&self.g, &p.ty, sizes, noise)).collect();
+            let fed = fed?;
+            let feeds: Vec<Feed> = fed.iter().map(Fed::feed).collect();
+            added.extend(measure(&mut **runner, (&self.g, 0), sizes, &feeds, device)?);
+        }
+        Ok(added)
+    }
+
+    /// A runner with noise for weights.
+    fn open(&self, plan: lower::Plan, noise: &mut Noise) -> Result<Box<dyn Run>, Error> {
+        let runner = open(plan)?;
+        for (at, w) in self.g.weights.iter().enumerate() {
+            let Fed::Floats(data) = fill(&self.g, &w.ty, &Vec::new(), noise)? else {
+                return Err(Error::Unsupported("integer weights".into()));
+            };
+            runner.load(at as u32, &data)?;
+        }
+        Ok(runner)
+    }
+}
+
+impl Grid {
+    /// Sizes from one decoded row to a long prompt.
+    pub fn full() -> Self {
+        Self {
+            rows: vec![1, 4, 16, 64, 256, 1024],
+            widths: vec![256, 1024, 4096],
+            vocabs: vec![32_768, 131_072],
+            heads: vec![[16, 8, 128], [8, 8, 64]],
+            spans: vec![
+                [1, 16],
+                [1, 128],
+                [1, 1024],
+                [16, 16],
+                [128, 128],
+                [512, 512],
+            ],
+        }
+    }
+
+    /// Enough to reach every rule, in well under a second.
+    pub fn tiny() -> Self {
+        Self {
+            rows: vec![1, 3],
+            widths: vec![16],
+            vocabs: vec![300],
+            heads: vec![[4, 2, 8]],
+            spans: vec![[1, 5], [4, 4]],
+        }
+    }
+
+    fn cases(&self) -> Vec<Case> {
+        let by_rows = |g: Graph| {
+            let sizes = self.rows.iter().map(|r| vec![(Rows, *r)]).collect();
+            Case { g, sizes }
+        };
+        let mut cases = Vec::new();
+        for &k in &self.widths {
+            let outs = self.widths.iter().chain(&self.vocabs);
+            cases.extend(outs.map(|n| by_rows(linear(k, *n))));
+        }
+        for &width in self.widths.iter().chain(&self.vocabs) {
+            cases.push(by_rows(rows(width)));
+            cases.extend(self.vocabs.iter().map(|v| by_rows(table(*v, width))));
+        }
+        for &heads in &self.heads {
+            let span =
+                |[queries, keys]: &[u64; 2]| vec![(Seqs, 1), (Rows, *queries), (Context, *keys)];
+            let sizes = self.spans.iter().map(span).collect();
+            let g = attention(heads);
+            cases.push(Case { g, sizes });
+        }
+        cases
+    }
+
+    /// Times every case on this GPU. Returns the launches timed.
+    pub fn run(&self, device: &mut Device) -> Result<Vec<(Step, f64)>, Error> {
+        let mut noise = Noise(17);
+        let mut added = Vec::new();
+        for case in self.cases() {
+            added.extend(case.run(device, &mut noise)?);
+        }
+        Ok(added)
+    }
+}

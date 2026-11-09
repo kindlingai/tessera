@@ -4,7 +4,6 @@ use crate::Error;
 use crate::plan::{Plan, Slot};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Instant;
 
 /// One entry input's values.
 pub enum Feed<'a> {
@@ -106,6 +105,10 @@ pub trait Run {
 
     /// Runs these steps in order and waits for them.
     fn submit(&self, steps: Range<usize>) -> Result<(), Error>;
+    /// Runs one step `times` over. Returns seconds per run.
+    fn repeat(&self, step: usize, times: usize) -> Result<f64, Error>;
+    /// The backend and the hardware it drives.
+    fn device(&self) -> String;
 
     /// Uploads one graph weight. Unused weights are ignored.
     fn load(&self, weight: u32, data: &[f32]) -> Result<(), Error> {
@@ -144,16 +147,11 @@ pub trait Run {
         outputs.map(|o| self.read(o.slot)).collect()
     }
 
-    /// Runs and waits step by step; returns each step's seconds.
+    /// Runs step by step. Returns each step's seconds.
     fn run_timed(&self, inputs: &[Feed]) -> Result<Vec<f64>, Error> {
         self.feed(inputs)?;
-        let mut seconds = Vec::with_capacity(self.plan().steps.len());
-        for i in 0..self.plan().steps.len() {
-            let start = Instant::now();
-            self.submit(i..i + 1)?;
-            seconds.push(start.elapsed().as_secs_f64());
-        }
-        Ok(seconds)
+        let steps = 0..self.plan().steps.len();
+        steps.map(|i| self.repeat(i, 1)).collect()
     }
 }
 

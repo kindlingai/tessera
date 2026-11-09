@@ -14,6 +14,8 @@ rocm = ["gpukit/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 scattered-collect = "0.22"
 gpukit = { path = "../gpukit", default-features = false }
 gemm = { path = "../gemm" }

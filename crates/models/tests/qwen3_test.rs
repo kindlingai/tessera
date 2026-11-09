@@ -1,11 +1,15 @@
 //! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
 
+use calibrate::{measure, path, stored};
 use checkpoint::File;
 use interp::{Cpu, Data, Tensor, bind, run};
+use lower::{Device, Feed, Plan, Run, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use ops::testing::{cosine_f32, gpu_available, max_abs_diff};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
+use trace::DimName::{self, Context, Rows, Seqs};
 use trace::{Graph, PathSeg};
 
 /// The interpreter only ever sees the JSON text.
@@ -90,132 +94,193 @@ fn matches_reference() {
     if !gpu_available() {
         return eprintln!("no GPU here; skipped");
     }
-    let samples = plan::check(&g, &c);
-    decode::check(&g, &c, samples);
+    let mut gpu = Gpu::open(&g, &c);
+    forward::check(&mut gpu, &g);
+    decode::check(&mut gpu, &g);
+    gpu.save();
 }
 
-/// The same model as a plan, wholly on the GPU.
-mod plan {
+/// Plans for either entry on one runner. Weights load once.
+struct Gpu<'a> {
+    c: &'a Case,
+    runner: Box<dyn Run>,
+    /// This machine's stored samples, and what this run adds.
+    device: Device,
+    /// Launches this run timed for lack of a stored sample.
+    learned: usize,
+}
+
+/// One sequence's launch: its new tokens after `past` rows.
+#[derive(Clone, Copy)]
+struct Span<'a> {
+    past: usize,
+    tokens: &'a [u32],
+}
+
+impl Span<'_> {
+    /// Sizes for either entry: the forward one ignores `Rows`.
+    fn sizes(&self) -> [(DimName, u64); 3] {
+        let (rows, all) = (self.tokens.len(), self.past + self.tokens.len());
+        [(Seqs, 1), (Rows, rows as u64), (Context, all as u64)]
+    }
+
+    fn positions(&self) -> Vec<u32> {
+        (self.past as u32..(self.past + self.tokens.len()) as u32).collect()
+    }
+}
+
+/// A whole prompt for the forward entry.
+fn prompt(tokens: &[u32]) -> Span<'_> {
+    Span { past: 0, tokens }
+}
+
+/// How often a plan launches each kernel.
+fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
+    let mut by = BTreeMap::new();
+    for step in &plan.steps {
+        *by.entry(step.kernel.name()).or_default() += 1;
+    }
+    by
+}
+
+/// Launches and seconds, by kernel.
+fn table(plan: &Plan, steps: &[f64]) {
+    let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
+    for (step, seconds) in plan.steps.iter().zip(steps) {
+        let (count, total) = by.entry(step.kernel.name()).or_default();
+        (*count, *total) = (*count + step.launches().len(), *total + seconds);
+    }
+    for (name, (count, seconds)) in by {
+        eprintln!("  {name:8} {count:4} launches {seconds:.4} s");
+    }
+}
+
+impl<'a> Gpu<'a> {
+    fn open(g: &Graph, c: &'a Case) -> Self {
+        let first = prompt(&c.tokens);
+        let plan = lower(g, 0, &first.sizes(), &Device::guess()).unwrap();
+        let runner = open(plan).unwrap();
+        for (at, w) in c.weights.iter().enumerate() {
+            runner.load(at as u32, w.floats().unwrap()).unwrap();
+        }
+        let device = stored(&*runner).unwrap();
+        let (name, samples) = (runner.device(), device.samples());
+        eprintln!("{name}: {samples} stored samples");
+        Self {
+            c,
+            runner,
+            device,
+            learned: 0,
+        }
+    }
+
+    /// Times this launch under each competing rule, where unknown.
+    fn learn(&mut self, g: &Graph, rows: Span) {
+        let (sizes, positions) = (rows.sizes(), rows.positions());
+        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
+        // What the stored samples alone would launch.
+        let before = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
+        let device = &mut self.device;
+        let added = measure(&mut *self.runner, (g, 0), &sizes, &feeds, device).unwrap();
+        self.learned += added.len();
+        let after = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
+        if before != after {
+            let (new, past) = (rows.tokens.len(), rows.past);
+            eprintln!("  {new} rows after {past}: timing changed the plan");
+            eprintln!("    from {before:?}\n    to   {after:?}");
+        }
+    }
+
+    /// Lowers this launch for `device` and feeds it.
+    fn plan(&mut self, g: &Graph, rows: Span, device: &Device) {
+        let plan = lower(g, 0, &rows.sizes(), device).unwrap();
+        self.runner.replan(plan).unwrap();
+        let positions = rows.positions();
+        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
+        self.runner.feed(&feeds).unwrap();
+    }
+
+    /// Each step's seconds for the plan in place.
+    fn steps(&self) -> Vec<f64> {
+        let steps = 0..self.runner.plan().steps.len();
+        steps.map(|i| self.runner.repeat(i, 1).unwrap()).collect()
+    }
+
+    fn save(&self) {
+        let file = path(&self.device.name);
+        let (learned, all) = (self.learned, self.device.samples());
+        eprintln!("timed {learned} launches; {all} samples known");
+        if learned > 0 {
+            self.device.save(&file).unwrap();
+            eprintln!("  stored in {}", file.display());
+        }
+    }
+}
+
+/// The forward entry as a plan, wholly on the GPU.
+mod forward {
     use super::*;
-    use lower::kernels::{Matmul, Thin};
-    use lower::{Device, Feed, Kernel, Plan, assign, lower, open, select};
-    use std::collections::BTreeMap;
-    use trace::DimName::{Context, Seqs};
 
-    /// Timed launches, for fitting a device.
-    pub type Samples = Vec<(lower::Step, f64)>;
-
-    pub struct Run {
+    struct Timed {
         plan: Plan,
-        pub out: Vec<f32>,
-        /// Seconds per launch, waited on one by one.
+        out: Vec<f32>,
+        /// Seconds per launch, by the device's own clock.
         steps: Vec<f64>,
-        /// Seconds for every launch in one command buffer.
+        /// Seconds for the whole plan, logits read back.
         whole: f64,
-        /// Scratch elements had the ops kept their traced order.
-        traced: usize,
     }
 
     fn repeat(c: &Case, n: usize) -> Vec<u32> {
         c.tokens.iter().cycle().take(n).copied().collect()
     }
 
-    /// Lowers for `tokens` on `device`, runs, and times each launch.
-    pub fn run(g: &Graph, c: &Case, tokens: &[u32], device: &Device) -> Run {
-        let sizes = [(Seqs, 1), (Context, tokens.len() as u64)];
-        let picked = select(g, 0, &sizes, device).unwrap();
-        let in_order: Vec<usize> = (0..picked.ops.len()).collect();
-        let traced = assign(&picked, &in_order).scratch();
-        let plan = lower(g, 0, &sizes, device).unwrap();
-        let runner = open(plan.clone()).unwrap();
-        for (at, w) in c.weights.iter().enumerate() {
-            runner.load(at as u32, w.floats().unwrap()).unwrap();
-        }
-        let positions: Vec<u32> = (0..tokens.len() as u32).collect();
-        let feeds = [Feed::Ids(tokens), Feed::Ids(&positions)];
-        // The first run pays for anything Metal sets up lazily.
-        runner.run(&feeds).unwrap();
+    /// Runs `tokens` as planned for `device`, and times each launch.
+    fn run(gpu: &mut Gpu, g: &Graph, tokens: &[u32], device: &Device) -> Timed {
+        gpu.plan(g, prompt(tokens), device);
+        let all = 0..gpu.runner.plan().steps.len();
+        let out = gpu.runner.plan().outputs[0].slot;
+        // The first run pays for anything set up lazily.
+        gpu.runner.submit(all.clone()).unwrap();
         let start = Instant::now();
-        let out = runner.run(&feeds).unwrap().remove(0);
+        gpu.runner.submit(all).unwrap();
+        let out = gpu.runner.read(out).unwrap();
         let whole = start.elapsed().as_secs_f64();
-        let steps = runner.run_timed(&feeds).unwrap();
-        Run {
-            plan,
+        Timed {
+            plan: gpu.runner.plan().clone(),
             out,
-            steps,
+            steps: gpu.steps(),
             whole,
-            traced,
         }
-    }
-
-    /// Rules that competed somewhere when lowering `tokens`.
-    fn contested(g: &Graph, tokens: usize, device: &Device) -> Vec<&'static str> {
-        let sizes = [(Seqs, 1), (Context, tokens as u64)];
-        let picked = select(g, 0, &sizes, device).unwrap();
-        picked.contested.into_iter().collect()
-    }
-
-    /// Times every kernel: cost only chooses what was measured.
-    fn calibrate(g: &Graph, c: &Case) -> (Device, Samples) {
-        let mut runs = Vec::new();
-        for n in [8, 32, 128, 384] {
-            // Favoring each contested rule measures every candidate.
-            for rule in contested(g, n, &Device::guess()) {
-                let device = Device::guess().favoring(rule);
-                runs.push(run(g, c, &repeat(c, n), &device));
-            }
-        }
-        let timed = |r: &'_ Run| r.plan.steps.clone().into_iter().zip(r.steps.clone());
-        let samples: Samples = runs.iter().flat_map(timed).collect();
-        let mut device = Device::guess();
-        device.fit(samples.iter().map(|(step, seconds)| (step, *seconds)));
-        // The head matmul, as estimated for each kernel.
-        let (m, n, k) = (c.tokens.len(), 151_936, 1024);
-        let ms = |kernel: &dyn Kernel| device.seconds(kernel, m * n) * 1e3;
-        let (tiled, thin) = (ms(&Matmul { m, n, k }), ms(&Thin { m, n, k }));
-        eprintln!("  head matmul, {m} rows: tiled {tiled:.1} ms, thin {thin:.1} ms");
-        (device, samples)
     }
 
     /// Prints what the plan chose, its estimate and its time.
-    fn report(r: &Run, device: &Device) {
-        let waited: f64 = r.steps.iter().sum();
+    fn report(r: &Timed, device: &Device) {
+        let timed: f64 = r.steps.iter().sum();
         let cost = device.cost(&r.plan);
         let (n, whole) = (r.out.len() / 151_936, r.whole);
-        eprintln!("plan, {n} tokens: {whole:.3} s in one command buffer");
+        eprintln!("plan, {n} tokens: {whole:.3} s with logits read back");
         let (all, estimate) = (cost.launches, cost.seconds);
-        eprintln!("  {all} launches: estimated {estimate:.3} s, measured {waited:.3} s");
-        let mb = |elements: usize| elements as f64 * 4.0 / 1e6;
-        let (moved, scratch, traced) =
-            (cost.bytes as f64 / 1e9, mb(r.plan.scratch()), mb(r.traced));
-        eprintln!("  moves {moved:.2} GB; scratch {scratch:.1} MB, {traced:.1} MB in traced order");
+        eprintln!("  {all} launches: estimated {estimate:.3} s, timed {timed:.3} s");
+        let (moved, scratch) = (cost.bytes as f64 / 1e9, r.plan.scratch() as f64 * 4.0 / 1e6);
+        eprintln!("  moves {moved:.2} GB; scratch {scratch:.1} MB");
         table(&r.plan, &r.steps);
-        let ratio = estimate / waited;
+        let ratio = estimate / timed;
         assert!(
-            (0.33..3.0).contains(&ratio),
+            (0.5..2.0).contains(&ratio),
             "the estimate is off by {ratio:.2}x"
         );
     }
 
-    /// Launches and seconds, by kernel.
-    pub fn table(plan: &Plan, steps: &[f64]) {
-        let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
-        for (step, seconds) in plan.steps.iter().zip(steps) {
-            let (count, total) = by.entry(step.kernel.name()).or_default();
-            (*count, *total) = (*count + step.launches().len(), *total + seconds);
-        }
-        for (name, (count, seconds)) in by {
-            eprintln!("  {name:8} {count:4} launches {seconds:.4} s");
-        }
-    }
-
     /// The plan should not lose to favoring any one rule.
-    fn compare(g: &Graph, c: &Case, planned: &Run, device: &Device) {
-        let waited = |r: &Run| r.steps.iter().sum::<f64>();
-        let tokens = repeat(c, planned.out.len() / 151_936);
-        let (mixed, mut least) = (waited(planned), f64::INFINITY);
-        for rule in contested(g, tokens.len(), device) {
-            let forced = waited(&run(g, c, &tokens, &device.clone().favoring(rule)));
+    fn compare(gpu: &mut Gpu, g: &Graph, planned: &Timed) {
+        let timed = |r: &Timed| r.steps.iter().sum::<f64>();
+        let tokens = repeat(gpu.c, planned.out.len() / 151_936);
+        let sizes = prompt(&tokens).sizes();
+        let contested = select(g, 0, &sizes, &Device::guess()).unwrap().contested;
+        let (mixed, mut least) = (timed(planned), f64::INFINITY);
+        for rule in contested {
+            let device = gpu.device.clone().favoring(rule);
+            let forced = timed(&run(gpu, g, &tokens, &device));
             eprintln!("  favoring {rule:8} {forced:.3} s");
             least = least.min(forced);
         }
@@ -223,46 +288,42 @@ mod plan {
         assert!(mixed < 1.25 * least, "the plan lost to a forced choice");
     }
 
-    /// Returns its timed launches, for plans of other shapes.
-    pub fn check(g: &Graph, c: &Case) -> Samples {
-        eprintln!("calibrating:");
-        let (device, samples) = calibrate(g, c);
-        let short = run(g, c, &c.tokens, &device);
+    pub fn check(gpu: &mut Gpu, g: &Graph) {
+        let c = gpu.c;
+        let (longer, long) = (repeat(c, 64), repeat(c, 512));
+        for tokens in [&c.tokens, &longer, &long] {
+            gpu.learn(g, prompt(tokens));
+        }
+        let device = gpu.device.clone();
+        let short = run(gpu, g, &c.tokens, &device);
         report(&short, &device);
-        compare(g, c, &short, &device);
+        compare(gpu, g, &short);
         close("plan", &short.out, c);
         // Past the reference's length, the CPU is the check.
-        let longer = repeat(c, 64);
-        let planned = run(g, c, &longer, &device);
+        let planned = run(gpu, g, &longer, &device);
         let off = max_abs_diff(&planned.out, &logits(g, c, &longer));
         eprintln!("plan vs interpreter, 64 tokens: max_abs {off:.3e}");
         assert!(off < 1e-3, "the plan and the interpreter disagree");
         // Causal, so a long run's first rows match the reference.
-        let long = run(g, c, &repeat(c, 512), &device);
+        let long = run(gpu, g, &long, &device);
         report(&long, &device);
-        compare(g, c, &long, &device);
+        compare(gpu, g, &long);
         close("plan, start of 512", &long.out[..c.want.len()], c);
-        samples
+    }
+
+    /// The logits of `tokens` as planned, for other checks.
+    pub fn logits_of(gpu: &mut Gpu, g: &Graph, tokens: &[u32]) -> Vec<f32> {
+        let device = gpu.device.clone();
+        run(gpu, g, tokens, &device).out
     }
 }
 
 /// Greedy decoding: one plan per launch, rows kept on device.
 mod decode {
-    use super::plan::Samples;
     use super::*;
-    use lower::{Device, Feed, Run, lower, open, select};
-    use trace::DimName::{Context, Rows, Seqs};
 
     /// Tokens decoded after the prompt.
     const NEW: usize = 32;
-
-    struct Decoder<'a> {
-        g: &'a Graph,
-        c: &'a Case,
-        runner: Option<Box<dyn Run>>,
-        /// The last launch's tokens and positions.
-        fed: [Vec<u32>; 2],
-    }
 
     /// A prompt and the tokens decoded after it.
     struct Decoded {
@@ -283,88 +344,44 @@ mod decode {
         }
     }
 
-    fn sizes(past: usize, rows: usize) -> [(trace::DimName, u64); 3] {
-        let all = (past + rows) as u64;
-        [(Seqs, 1), (Rows, rows as u64), (Context, all)]
+    /// Runs one launch. Returns indices, then planning and running seconds.
+    fn launch(gpu: &mut Gpu, g: &Graph, rows: Span, device: &Device) -> (Vec<u32>, [f64; 2]) {
+        let start = Instant::now();
+        let plan = lower(g, 0, &rows.sizes(), device).unwrap();
+        let out = plan.outputs[0].slot;
+        gpu.runner.replan(plan).unwrap();
+        let planning = start.elapsed().as_secs_f64();
+        let positions = rows.positions();
+        let start = Instant::now();
+        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
+        gpu.runner.feed(&feeds).unwrap();
+        gpu.runner.submit(0..gpu.runner.plan().steps.len()).unwrap();
+        let ids = gpu.runner.ids(out).unwrap();
+        (ids, [planning, start.elapsed().as_secs_f64()])
     }
 
-    impl Decoder<'_> {
-        /// Runs `rows` after `past` kept rows. Returns indices, seconds.
-        fn launch(&mut self, past: usize, rows: &[u32], device: &Device) -> (Vec<u32>, [f64; 2]) {
-            let start = Instant::now();
-            let plan = lower(self.g, 0, &sizes(past, rows.len()), device).unwrap();
-            let out = plan.outputs[0].slot;
-            let first = self.runner.is_none();
-            match &mut self.runner {
-                Some(r) => r.replan(plan).unwrap(),
-                None => self.runner = Some(open(plan).unwrap()),
-            }
-            let planning = start.elapsed().as_secs_f64();
-            let r = self.runner.as_ref().unwrap();
-            // Later plans find the weights already there.
-            for (at, w) in self.c.weights.iter().enumerate().filter(|_| first) {
-                r.load(at as u32, w.floats().unwrap()).unwrap();
-            }
-            let positions = (past as u32..(past + rows.len()) as u32).collect();
-            self.fed = [rows.to_vec(), positions];
-            let start = Instant::now();
-            let feeds = [Feed::Ids(&self.fed[0]), Feed::Ids(&self.fed[1])];
-            r.feed(&feeds).unwrap();
-            r.submit(0..r.plan().steps.len()).unwrap();
-            let ids = r.ids(out).unwrap();
-            (ids, [planning, start.elapsed().as_secs_f64()])
+    /// The prompt at once, then one row per launch.
+    fn decode(gpu: &mut Gpu, g: &Graph, device: &Device) -> Decoded {
+        let mut tokens = gpu.c.tokens.clone();
+        let (prompt, [_, prefill]) = launch(gpu, g, super::prompt(&tokens), device);
+        tokens.push(*prompt.last().unwrap());
+        let (mut planning, mut running) = (0.0, 0.0);
+        for _ in 1..NEW {
+            let (past, last) = (tokens.len() - 1, [tokens[tokens.len() - 1]]);
+            let rows = Span {
+                past,
+                tokens: &last,
+            };
+            let (ids, [planned, ran]) = launch(gpu, g, rows, device);
+            (planning, running) = (planning + planned, running + ran);
+            tokens.push(ids[0]);
         }
-
-        /// Runs the last launch again, waiting on every step.
-        fn timed(&self) -> Samples {
-            let r = self.runner.as_ref().unwrap();
-            let feeds = [Feed::Ids(&self.fed[0]), Feed::Ids(&self.fed[1])];
-            let seconds = r.run_timed(&feeds).unwrap();
-            r.plan().steps.iter().cloned().zip(seconds).collect()
-        }
-
-        /// The prompt at once, then one row per launch.
-        fn decode(&mut self, device: &Device) -> Decoded {
-            let mut tokens = self.c.tokens.clone();
-            let (prompt, [_, prefill]) = self.launch(0, &tokens, device);
-            tokens.push(*prompt.last().unwrap());
-            let (mut planning, mut running) = (0.0, 0.0);
-            for _ in 1..NEW {
-                let (past, last) = (tokens.len() - 1, [tokens[tokens.len() - 1]]);
-                let (ids, [planned, ran]) = self.launch(past, &last, device);
-                (planning, running) = (planning + planned, running + ran);
-                tokens.push(ids[0]);
-            }
-            Decoded {
-                tokens,
-                prompt,
-                prefill,
-                planning,
-                running,
-            }
-        }
-
-        /// Rules that compete when one row is decoded.
-        fn contested(&self) -> Vec<&'static str> {
-            let picked = select(self.g, 0, &sizes(15, 1), &Device::guess()).unwrap();
-            picked.contested.into_iter().collect()
-        }
-
-        /// Adds a prompt and single rows under each contested rule.
-        fn calibrate(&mut self, mut samples: Samples) -> Device {
-            for rule in self.contested() {
-                let device = Device::guess().favoring(rule);
-                let prompt = self.c.tokens.clone();
-                self.launch(0, &prompt, &device);
-                samples.extend(self.timed());
-                for past in prompt.len()..prompt.len() + 3 {
-                    self.launch(past, &[0], &device);
-                    samples.extend(self.timed());
-                }
-            }
-            let mut device = Device::guess();
-            device.fit(samples.iter().map(|(step, seconds)| (step, *seconds)));
-            device
+        Decoded {
+            tokens,
+            prompt,
+            prefill,
+            planning,
+            running,
         }
     }
 
@@ -374,29 +391,30 @@ mod decode {
         assert!(lead < 1e-3, "{label}: {chosen} trails the best by {lead}");
     }
 
-    pub fn check(forward: &Graph, c: &Case, samples: Samples) {
+    pub fn check(gpu: &mut Gpu, forward: &Graph) {
         let text = stepper(&Config::small(1, 1024)).to_json();
         let g = Graph::from_json(&text).unwrap();
         assert_eq!(g.weights, forward.weights);
-        let (runner, fed) = (None, [Vec::new(), Vec::new()]);
-        let mut d = Decoder {
-            g: &g,
-            c,
-            runner,
-            fed,
-        };
-        let device = d.calibrate(samples);
-        let planned = d.decode(&device);
+        let c = gpu.c;
+        // A prompt, then single rows at a few lengths.
+        gpu.learn(&g, prompt(&c.tokens));
+        for past in [15, 16, 31, 46] {
+            let tokens = &[0];
+            gpu.learn(&g, Span { past, tokens });
+        }
+        let device = gpu.device.clone();
+        let planned = decode(gpu, &g, &device);
         let (ms, rate) = (planned.prefill * 1e3, planned.rate());
         eprintln!("prefill, {} tokens: {ms:.1} ms", c.tokens.len());
         eprintln!("decode, {} tokens: {rate:.1} tokens/s", NEW - 1);
         let per = |seconds: f64| seconds * 1e3 / (NEW - 1) as f64;
         let (plan_ms, run_ms) = (per(planned.planning), per(planned.running));
         eprintln!("  per token: planning {plan_ms:.2} ms, device {run_ms:.2} ms");
-        let (steps, seconds): (Vec<_>, Vec<f64>) = d.timed().into_iter().unzip();
-        let last = d.runner.as_ref().unwrap().plan();
-        assert_eq!(last.steps, steps);
-        plan::table(last, &seconds);
+        let last = gpu.runner.plan().clone();
+        let (estimate, steps) = (device.cost(&last).seconds * 1e3, gpu.steps());
+        let timed = steps.iter().sum::<f64>() * 1e3;
+        eprintln!("  last token: estimated {estimate:.2} ms, timed {timed:.2} ms");
+        table(&last, &steps);
         let vocab = c.want.len() / c.tokens.len();
         for (row, id) in c.want.chunks(vocab).zip(&planned.prompt) {
             likeliest("prefill", row, *id);
@@ -404,15 +422,22 @@ mod decode {
         // One pass over everything must choose the same tokens.
         let tokens = &planned.tokens;
         eprintln!("  decoded {:?}", &tokens[c.tokens.len()..]);
-        let whole = plan::run(forward, c, &tokens[..tokens.len() - 1], &device).out;
+        let whole = forward::logits_of(gpu, forward, &tokens[..tokens.len() - 1]);
         let rows = whole.chunks(vocab).zip(&tokens[1..]);
         for (row, id) in rows.skip(c.tokens.len() - 1) {
             likeliest("decode", row, *id);
         }
         // The plan should not lose to favoring any one rule.
+        let one = Span {
+            past: 15,
+            tokens: &[0],
+        };
+        let contested = select(&g, 0, &one.sizes(), &Device::guess())
+            .unwrap()
+            .contested;
         let mut most = 0.0f64;
-        for rule in d.contested() {
-            let forced = d.decode(&device.clone().favoring(rule)).rate();
+        for rule in contested {
+            let forced = decode(gpu, &g, &device.clone().favoring(rule)).rate();
             eprintln!("  favoring {rule:8} {forced:.1} tokens/s");
             most = most.max(forced);
         }
