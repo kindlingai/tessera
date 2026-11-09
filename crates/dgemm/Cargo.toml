@@ -1,0 +1,31 @@
+[package]
+name = "dgemm"
+version = "0.1.0"
+edition = "2024"
+description = "The GEMM family: tiled Metal and CUDA bodies with a shared CPU oracle"
+license = "MIT"
+
+[features]
+default = []
+# Enable the CUDA dispatch path. The .cu body is compiled by NVRTC on first
+# dispatch, so neither the driver nor a toolkit is needed to build.
+cuda = ["gpukit/cuda"]
+
+[dependencies]
+gpukit = { path = "../gpukit", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLTypes",
+] }

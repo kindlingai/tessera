@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tools/lint"]
+members = ["crates/gpukit", "crates/dgemm", "crates/dgops", "crates/nanogpt", "tools/lint"]
 
 [workspace.package]
 edition = "2024"

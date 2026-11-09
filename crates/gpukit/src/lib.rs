@@ -1,0 +1,26 @@
+//! GPU compute infrastructure with no kernel or model knowledge:
+//! device/queue context, shader include expansion, function-constant
+//! specialization with input-derived cache labels, an on-disk pipeline
+//! archive, a buffer pool, and one-shot dispatch helpers.
+//!
+//! The crate holds mechanism only. Anything policy-shaped — which axes a
+//! kernel specializes on, cache configuration, flag parsing — belongs to the
+//! caller and arrives through [`metal::CacheConfig`], [`register_includes!`],
+//! and plain arguments.
+
+mod error;
+pub use error::Error;
+
+pub mod includes;
+
+mod kernel;
+
+pub mod testing;
+
+#[cfg(target_os = "macos")]
+pub mod metal;
+
+/// CUDA backend (runtime-resolved driver; see the module docs). Gated behind
+/// the cuda feature so a Metal-only build never carries it.
+#[cfg(feature = "cuda")]
+pub mod cuda;
