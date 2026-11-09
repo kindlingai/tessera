@@ -2,4 +2,4 @@
 # Points git at the repository's hooks in .githooks.
 set -e
 git config core.hooksPath .githooks
-echo "pre-commit hook installed (.githooks/pre-commit)"
+echo "hooks installed: pre-commit, commit-msg (.githooks)"

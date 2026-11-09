@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuses Co-Authored-By lines that credit AI tools.
+exec scripts/check-coauthors.sh --message "$1"
