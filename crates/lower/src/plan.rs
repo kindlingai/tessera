@@ -39,6 +39,10 @@ pub enum Kernel {
         width: usize,
         eps: f32,
     },
+    Softmax {
+        rows: usize,
+        width: usize,
+    },
     /// Each position's cosine and sine, per pair.
     Angles {
         width: usize,
@@ -83,6 +87,7 @@ impl Kernel {
             Kernel::Matmul { .. } => "matmul",
             Kernel::Thin { .. } => "thin",
             Kernel::RmsNorm { .. } => "rms_norm",
+            Kernel::Softmax { .. } => "softmax",
             Kernel::Angles { .. } => "angles",
             Kernel::Rope { .. } => "rope",
             Kernel::Attend { .. } => "attend",

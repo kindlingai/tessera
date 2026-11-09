@@ -45,7 +45,7 @@ impl Device {
     pub fn guess() -> Self {
         let line = |per_unit: f64| vec![(0.0, 1e-4), (1e12, 1e-4 + 1e12 * per_unit)];
         let names = [
-            "matmul", "rms_norm", "angles", "rope", "attend", "gather", "map", "join",
+            "matmul", "rms_norm", "softmax", "angles", "rope", "attend", "gather", "map", "join",
         ];
         let mut curves: BTreeMap<_, _> = names.iter().map(|n| (*n, line(1e-10))).collect();
         // Unproven, so it must earn its place by measurement.

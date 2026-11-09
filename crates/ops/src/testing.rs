@@ -5,4 +5,4 @@ pub fn gpu_available() -> bool {
     gpukit::testing::backend_ready()
 }
 
-pub use gpukit::testing::{assert_oracle, cosine_f32, max_abs_diff};
+pub use gpukit::testing::{Noise, assert_oracle, cosine_f32, max_abs_diff};

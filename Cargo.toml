@@ -11,9 +11,7 @@ members = [
     "crates/gpukit",
     "crates/gemm",
     "crates/ops",
-    "crates/ops-math",
     "crates/ops-model",
-    "crates/nanogpt",
     "tools/lint",
 ]
 

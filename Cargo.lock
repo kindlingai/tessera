@@ -120,11 +120,7 @@ dependencies = [
 name = "interp"
 version = "0.1.0"
 dependencies = [
- "gemm",
  "graph",
- "ops",
- "ops-math",
- "ops-model",
  "trace",
 ]
 
@@ -172,7 +168,6 @@ dependencies = [
  "objc2",
  "objc2-metal",
  "ops",
- "ops-math",
  "ops-model",
  "trace",
 ]
@@ -191,19 +186,8 @@ dependencies = [
  "graph",
  "interp",
  "lower",
- "nanogpt",
  "ops",
  "trace",
-]
-
-[[package]]
-name = "nanogpt"
-version = "0.1.0"
-dependencies = [
- "gemm",
- "ops",
- "ops-math",
- "ops-model",
 ]
 
 [[package]]
@@ -248,14 +232,6 @@ name = "ops"
 version = "0.1.0"
 dependencies = [
  "gpukit",
-]
-
-[[package]]
-name = "ops-math"
-version = "0.1.0"
-dependencies = [
- "gpukit",
- "ops",
 ]
 
 [[package]]

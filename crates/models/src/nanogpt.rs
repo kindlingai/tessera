@@ -1,4 +1,4 @@
-//! The tiny GPT from `crates/nanogpt`, as a description.
+//! A tiny GPT: learned positions, GELU MLPs, causal attention.
 
 use crate::shared::{Stack, tokens};
 use trace::DimName::*;

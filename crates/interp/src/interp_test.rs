@@ -115,31 +115,6 @@ fn bind_checks_weights() {
     assert_eq!(ok[0].shape, [2]);
 }
 
-#[cfg(feature = "gpu")]
-#[test]
-fn gpu_matches_cpu() {
-    if !gpu_ready() {
-        return;
-    }
-    let cases = [
-        (attention(Mask::Causal), qkv()),
-        (decode(Mask::Causal), decode_inputs(2)),
-    ];
-    for (g, ins) in cases {
-        let cpu = run(&g, &mut Cpu, &[], 0, &ins).unwrap();
-        let mut k = Gpu::default();
-        let gpu = run(&g, &mut k, &[], 0, &ins).unwrap();
-        let (a, b) = (cpu[0].floats().unwrap(), gpu[0].floats().unwrap());
-        let worst = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        assert!(worst < 1e-5, "attention differs by {worst}");
-        assert_eq!(k.fallbacks, 0);
-    }
-}
-
 fn decode(mask: Mask) -> Graph {
     let m = model();
     let keys = [Seqs, Context, Heads, HeadDim];
@@ -214,11 +189,4 @@ fn accumulators_follow_numerics() {
     assert_eq!(sums(DType::F32), [2050.0, 2050.0]);
     assert_eq!(sums(DType::F16), [2048.0, 2048.0]);
     assert_eq!(sums(DType::Bf16), [2048.0, 2048.0]);
-    #[cfg(feature = "gpu")]
-    if gpu_ready() {
-        let mut k = Gpu::default();
-        let out = run(&summing(DType::F16), &mut k, &ones, 0, &[x]).unwrap();
-        assert_eq!(out[0].floats().unwrap(), [2048.0, 2048.0]);
-        assert_eq!(k.fallbacks, 1);
-    }
 }

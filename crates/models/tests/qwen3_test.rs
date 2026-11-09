@@ -1,9 +1,9 @@
 //! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
 
 use checkpoint::File;
-use interp::{Cpu, Data, Gpu, Kernels, Tensor, bind, gpu_ready, run};
+use interp::{Cpu, Data, Tensor, bind, run};
 use models::qwen3::{Config, program, tensor_name};
-use ops::testing::{cosine_f32, max_abs_diff};
+use ops::testing::{cosine_f32, gpu_available, max_abs_diff};
 use std::path::PathBuf;
 use std::time::Instant;
 use trace::{Graph, PathSeg};
@@ -47,8 +47,8 @@ fn case(g: &Graph) -> Option<Case> {
     })
 }
 
-/// One sequence of `tokens` through the interpreter.
-fn logits(g: &Graph, c: &Case, tokens: &[u32], k: &mut dyn Kernels) -> Vec<f32> {
+/// One sequence of `tokens` through the CPU interpreter.
+fn logits(g: &Graph, c: &Case, tokens: &[u32]) -> Vec<f32> {
     let shape = vec![1, tokens.len()];
     let positions = (0..tokens.len() as u32).collect();
     let ids = |data| Tensor {
@@ -57,7 +57,7 @@ fn logits(g: &Graph, c: &Case, tokens: &[u32], k: &mut dyn Kernels) -> Vec<f32> 
     };
     let inputs = [ids(tokens.to_vec()), ids(positions)];
     let start = Instant::now();
-    let out = run(g, k, &c.weights, 0, &inputs).unwrap();
+    let out = run(g, &mut Cpu, &c.weights, 0, &inputs).unwrap();
     let seconds = start.elapsed().as_secs_f32();
     eprintln!("interpreter, {} tokens: {seconds:.3} s", tokens.len());
     out[0].floats().unwrap().to_vec()
@@ -86,14 +86,10 @@ fn matches_reference() {
     let Some(c) = case(&g) else {
         return eprintln!("TESSERA_QWEN3 is not set; skipped");
     };
-    close("cpu", &logits(&g, &c, &c.tokens, &mut Cpu), &c);
-    if !gpu_ready() {
+    close("cpu", &logits(&g, &c, &c.tokens), &c);
+    if !gpu_available() {
         return eprintln!("no GPU here; skipped");
     }
-    let mut k = Gpu::default();
-    close("gpu", &logits(&g, &c, &c.tokens, &mut k), &c);
-    // SiLU and the gate multiply have no GPU kernel yet.
-    assert_eq!(k.fallbacks, 2 * 28, "only the MLP's two stages fall back");
     plan::check(&g, &c);
 }
 
@@ -216,13 +212,15 @@ mod plan {
         report(&short, &device);
         compare(g, c, &short);
         close("plan", &short.out, c);
-        // Longer than the reference, so compare with the interpreter.
-        let long = repeat(c, 512);
-        let planned = run(g, c, &long, &device);
-        report(&planned, &device);
-        let want = logits(g, c, &long, &mut Gpu::default());
-        let off = max_abs_diff(&planned.out, &want);
-        eprintln!("plan vs interpreter, 512 tokens: max_abs {off:.3e}");
+        // Past the reference's length, the CPU is the check.
+        let longer = repeat(c, 64);
+        let planned = run(g, c, &longer, &device);
+        let off = max_abs_diff(&planned.out, &logits(g, c, &longer));
+        eprintln!("plan vs interpreter, 64 tokens: max_abs {off:.3e}");
         assert!(off < 1e-3, "the plan and the interpreter disagree");
+        // Causal, so a long run's first rows match the reference.
+        let long = run(g, c, &repeat(c, 512), &device);
+        report(&long, &device);
+        close("plan, start of 512", &long.out[..c.want.len()], c);
     }
 }
