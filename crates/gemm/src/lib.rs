@@ -1,8 +1,12 @@
 //! Tiled f32 GEMM, `C = alpha * op(A) @ op(B) + beta * C`.
 
 mod cpu;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+mod device;
 #[cfg(feature = "cuda")]
-pub mod cuda;
+pub use device::cuda;
+#[cfg(feature = "rocm")]
+pub use device::rocm;
 pub mod fixtures;
 pub mod format;
 #[cfg(target_os = "macos")]
@@ -34,7 +38,7 @@ pub fn abi_params(p: &Problem) -> Vec<u8> {
 }
 pub const METAL: &str = include_str!("gemm.metal");
 
-/// CUDA C++ source, compiled by NVRTC on first dispatch.
+/// CUDA C++ source; NVRTC or hiprtc compiles it on use.
 pub const CUDA: &str = include_str!("gemm.cu");
 
 /// The CPU reference that GPU results are checked against.
@@ -42,22 +46,19 @@ pub fn cpu(call: &Call) -> Vec<f32> {
     cpu::cpu(call)
 }
 
-/// Run on this build's GPU backend.
+/// Run on the backend `gpukit::backend` picks.
 pub fn gpu(call: &Call) -> Result<Vec<f32>, Error> {
-    #[cfg(target_os = "macos")]
-    {
-        metal::gpu(call)
-    }
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    {
-        cuda::gpu(call)
-    }
-    #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
-    {
-        let _ = call;
-        Err(Error::Gpu(
-            "no GPU backend enabled (build with --features cuda on a CUDA host)",
-        ))
+    let _ = call;
+    match gpukit::backend::available() {
+        #[cfg(target_os = "macos")]
+        Some(gpukit::backend::Backend::Metal) => metal::gpu(call),
+        #[cfg(feature = "cuda")]
+        Some(gpukit::backend::Backend::Cuda) => cuda::gpu(call),
+        #[cfg(feature = "rocm")]
+        Some(gpukit::backend::Backend::Rocm) => rocm::gpu(call),
+        _ => Err(Error::Gpu(
+            "no GPU backend enabled (build with --features cuda or rocm)",
+        )),
     }
 }
 

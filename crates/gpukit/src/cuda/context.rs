@@ -4,13 +4,15 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::sync::{Arc, Mutex};
 
-use super::dispatch::KernelArgs;
+use super::KernelArgs;
 use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CUcontext, CUdevice, CUfunction, CUmodule,
     Driver,
 };
 use crate::Error;
+use crate::dl::image_hash;
+use crate::launch::Launch;
 
 /// How to open the CUDA context.
 #[derive(Debug, Clone, Default)]
@@ -32,7 +34,7 @@ struct Inner {
     modules: Mutex<HashMap<u64, Arc<Module>>>,
 }
 
-// The driver API is thread-safe; calls set the context first.
+// The driver API is thread-safe. Calls set the context first.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -55,16 +57,6 @@ fn device_attr(driver: &Driver, device: CUdevice, attr: c_int) -> Result<i32, Er
         "cuDeviceGetAttribute",
     )?;
     Ok(value)
-}
-
-/// FNV-1a: unlike `DefaultHasher`, stable across runs.
-fn image_hash(image: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in image {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 impl Context {
@@ -182,9 +174,12 @@ impl Context {
         let ptx = super::nvrtc::compile_to_ptx(source, major, minor)?;
         self.load_module(&ptx)?.function(entry)
     }
+}
 
-    /// Enqueue a kernel launch without waiting for it to finish.
-    pub fn launch(
+impl Launch for Context {
+    type Kernel = Kernel;
+
+    fn launch(
         &self,
         kernel: &Kernel,
         grid: (u32, u32, u32),
