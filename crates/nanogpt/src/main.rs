@@ -1,11 +1,9 @@
 //! Tiny character-level GPT trained on the portable GPU ops.
 
 mod backward;
-mod data;
-mod model;
-mod reference;
-mod tensor;
 mod train;
+
+use nanogpt::{data, model, reference};
 
 use model::{GptConfig, Rng, Weights};
 use ops::backend;
@@ -104,7 +102,7 @@ fn load_corpus(args: &Args) -> Result<data::Corpus, String> {
         }
         None => data::DEFAULT_TEXT.to_string(),
     };
-    Ok(data::Corpus::from_str(&text))
+    Ok(data::Corpus::from_text(&text))
 }
 
 fn run() -> Result<(), String> {

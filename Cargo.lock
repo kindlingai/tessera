@@ -109,6 +109,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "interp"
+version = "0.1.0"
+dependencies = [
+ "gemm",
+ "graph",
+ "ops",
+ "ops-math",
+ "ops-model",
+ "trace",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,6 +157,16 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "models"
+version = "0.1.0"
+dependencies = [
+ "graph",
+ "interp",
+ "nanogpt",
+ "trace",
+]
 
 [[package]]
 name = "nanogpt"
@@ -391,6 +413,23 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "trace"
+version = "0.1.0"
+dependencies = [
+ "graph",
+ "trace-derive",
+]
+
+[[package]]
+name = "trace-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "unicode-ident"

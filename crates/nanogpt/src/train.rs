@@ -2,9 +2,9 @@
 
 use crate::Args;
 use crate::backward;
-use crate::data::Corpus;
-use crate::model::{self, GptConfig, Weights};
-use crate::tensor as t;
+use nanogpt::data::Corpus;
+use nanogpt::model::{self, GptConfig, Weights};
+use nanogpt::tensor as t;
 use ops::Error;
 
 pub const BETA1: f32 = 0.9;
@@ -108,7 +108,7 @@ pub fn gradcheck(w: &mut Weights, cfg: &GptConfig, corpus: &Corpus) -> Result<()
     let cache = model::forward(w, cfg, &x, cfg.block).map_err(|e| e.to_string())?;
     let (_, mut grads) = backward::backward(w, cfg, &cache, &y).map_err(|e| e.to_string())?;
 
-    let mut rng = crate::model::Rng::new(99);
+    let mut rng = nanogpt::model::Rng::new(99);
     // Truncation grows as eps^2, f32 rounding shrinks as 1/eps.
     let eps_values = [1e-2f32, 3e-3, 1e-3];
     let mut worst = 0.0f32;
