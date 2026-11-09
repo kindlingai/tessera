@@ -36,8 +36,8 @@ struct Settings {
     extensions: Vec<String>,
 }
 
-/// Texts per call to the model.
-const BATCH: usize = 256;
+/// Texts per call to the model, and per progress line.
+const BATCH: usize = 64;
 
 fn git(root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git").args(args).current_dir(root).output()?;
@@ -78,10 +78,15 @@ fn embed(model: &Path, wins: &[Window], cache: &mut Cache) -> Result<Vec<Vec<f32
     eprintln!("{} windows, {} to embed", wins.len(), missing.len());
     if !missing.is_empty() {
         let m = eg2cpu::Model::load(model).context("loading the model; run `fetch` first")?;
-        for chunk in missing.chunks(BATCH) {
+        let start = std::time::Instant::now();
+        for (i, chunk) in missing.chunks(BATCH).enumerate() {
             for (t, out) in chunk.iter().zip(m.embed_batch(chunk)?) {
                 cache.insert(key(t), out.embedding);
             }
+            let done = (i * BATCH + chunk.len()).min(missing.len());
+            let pct = done * 100 / missing.len();
+            let secs = start.elapsed().as_secs();
+            eprintln!("embedded {done}/{} ({pct}%) in {secs}s", missing.len());
         }
     }
     Ok(wins
