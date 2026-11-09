@@ -105,7 +105,7 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
 fn arity(op: &Op) -> usize {
     match op {
         Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) => 1,
+        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) | Op::Append(_) => 1,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked),
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
@@ -142,6 +142,10 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         }
         Op::Row(r) => row(&g.dims, &r.0, args),
         Op::Mask(_) => select::mask(args[0]),
+        Op::Append(i) => {
+            let kept = g.kept.get(*i as usize).ok_or_else(missing)?;
+            append(&g.dims, kept, args[0])
+        }
         Op::Select(s) => select::select(&g.dims, s, args),
         Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
         Op::View(v) => view(&g.dims, v, args[0]),
@@ -509,4 +513,23 @@ fn concat(dims: &[Dim], a: &TensorType, b: &TensorType) -> Result<TensorType, Ty
     let mut out = a.clone();
     out.shape.0[lead] = a.shape.0[lead].clone() + b.shape.0[lead].clone();
     Ok(out)
+}
+
+/// New rows match kept ones on every axis but rows.
+fn append(dims: &[Dim], kept: &TensorType, rows: &TensorType) -> Result<TensorType, TypeError> {
+    let rest = |t: &TensorType| Shape(t.shape.0.iter().skip(2).cloned().collect());
+    let fits = kept.rank() >= 2
+        && same_shape(dims, &front(&kept.shape, 1), &front(&rows.shape, 1))?
+        && same_shape(dims, &rest(kept), &rest(rows))?;
+    need(fits && rows.rank() == kept.rank(), ErrorKind::Shape, || {
+        format!("rows {} cannot join kept {}", rows.shape, kept.shape)
+    })?;
+    need(rows.dtype == kept.dtype, ErrorKind::DType, || {
+        format!("rows are {:?}, kept rows {:?}", rows.dtype, kept.dtype)
+    })?;
+    let whole = [rows.placement, kept.placement] == [Placement::Replicated; 2];
+    need(whole, ErrorKind::Placement, || {
+        "kept rows must be replicated".into()
+    })?;
+    Ok(kept.clone())
 }

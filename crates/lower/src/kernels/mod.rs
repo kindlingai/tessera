@@ -1,5 +1,7 @@
 //! One file per kernel, with the rule proposing it.
 
+mod append;
+mod argmax;
 mod attend;
 mod dense;
 mod gather;
@@ -11,6 +13,8 @@ mod rope;
 mod softmax;
 mod thin;
 
+pub use append::Append;
+pub use argmax::{Argmax, Peaks};
 pub use attend::Attend;
 pub use dense::{Causal, DENSE_SCORES, Scores, Values};
 pub use gather::Gather;

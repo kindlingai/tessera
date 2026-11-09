@@ -1,6 +1,6 @@
 //! Whole-graph checks: references, order and recorded types.
 
-use crate::dims::Dim;
+use crate::dims::{Dim, DimExpr, Size};
 use crate::infer::{ErrorKind, TypeError, elements, infer, need, same_shape};
 use crate::json::VERSION;
 use crate::node::{Graph, Op};
@@ -52,11 +52,14 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
         })
         .map_err(top)?;
     }
+    for (i, k) in g.kept.iter().enumerate() {
+        kept(g, i, k).map_err(top)?;
+    }
     let ports = g
         .entries
         .iter()
         .flat_map(|e| e.inputs.iter().map(|p| &p.ty));
-    for ty in g.weights.iter().map(|w| &w.ty).chain(ports) {
+    for ty in g.weights.iter().map(|w| &w.ty).chain(&g.kept).chain(ports) {
         declared(&g.dims, ty).map_err(top)?;
     }
     for (i, n) in g.nodes.iter().enumerate() {
@@ -85,6 +88,24 @@ pub fn verify(g: &Graph) -> Result<(), VerifyError> {
         .map_err(top)?;
     }
     regions::check(g).map_err(top)
+}
+
+/// Kept rows grow along a bounded axis, appended once.
+fn kept(g: &Graph, i: usize, k: &TensorType) -> Result<(), TypeError> {
+    let grows = match k.shape.0.get(1) {
+        Some(DimExpr::Dim(name)) => g.dims.iter().find(|d| d.name == *name),
+        _ => None,
+    };
+    let bounded = grows.is_some_and(|d| matches!(d.size, Size::Bounded(_)));
+    need(bounded, ErrorKind::Shape, || {
+        format!("kept rows {} need a bounded second axis", k.shape)
+    })?;
+    let appends = |n: &&crate::node::Node| n.op == Op::Append(i as u32);
+    need(
+        g.nodes.iter().filter(appends).count() <= 1,
+        ErrorKind::Reference,
+        || format!("kept rows {i} are appended to twice"),
+    )
 }
 
 fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {

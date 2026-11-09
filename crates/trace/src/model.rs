@@ -16,6 +16,9 @@ pub struct Model {
     g: Shared,
 }
 
+/// Rows a model keeps between launches.
+pub struct Kept(pub(crate) u32);
+
 impl Model {
     pub fn new(dims: Vec<Dim>) -> Self {
         Self {
@@ -45,6 +48,13 @@ impl Model {
             g.weights.len() as u32 - 1
         };
         push(&self.g, Op::Weight(index), &[])
+    }
+
+    /// Declares rows kept between launches, shaped `[Seqs, Kept, ..]`.
+    pub fn kept(&self, ty: TensorType) -> Kept {
+        let mut g = self.g.borrow_mut();
+        g.kept.push(ty);
+        Kept(g.kept.len() as u32 - 1)
     }
 
     /// Adds an entry and returns its input ports as tensors.

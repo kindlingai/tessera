@@ -97,11 +97,60 @@ pub fn bind(g: &Graph, find: impl Fn(&[PathSeg]) -> Option<Data>) -> Result<Vec<
         .collect()
 }
 
-/// Runs `entry` and returns its outputs in order.
+/// Kept rows, held between launches.
+#[derive(Clone, Debug, Default)]
+pub struct Store {
+    kept: Vec<Option<Tensor>>,
+}
+
+impl Store {
+    /// How many rows each sequence has kept so far.
+    pub fn rows(&self, i: usize) -> usize {
+        let kept = self.kept.get(i).and_then(Option::as_ref);
+        kept.map_or(0, |t| t.shape[1])
+    }
+
+    /// Appends `rows` per sequence. Returns every kept row.
+    fn append(&mut self, i: usize, rows: &Tensor) -> Result<Tensor, Error> {
+        self.kept.resize(self.kept.len().max(i + 1), None);
+        let (seqs, new) = (rows.shape[0], rows.floats()?);
+        if self.kept[i].as_ref().is_some_and(|t| t.shape[0] != seqs) {
+            let msg = format!("kept rows {i} hold another count of sequences");
+            return Err(Error::Mismatch(msg));
+        }
+        let old = self.kept[i].take();
+        let past = old.as_ref().map_or(Ok(&[][..]), Tensor::floats)?;
+        let (a, b) = (past.len() / seqs.max(1), new.len() / seqs.max(1));
+        let mut all = Vec::with_capacity(past.len() + new.len());
+        for s in 0..seqs {
+            all.extend_from_slice(&past[s * a..(s + 1) * a]);
+            all.extend_from_slice(&new[s * b..(s + 1) * b]);
+        }
+        let mut shape = rows.shape.clone();
+        shape[1] += old.map_or(0, |t| t.shape[1]);
+        let grown = Tensor::f32(shape, all);
+        self.kept[i] = Some(grown.clone());
+        Ok(grown)
+    }
+}
+
+/// Runs `entry` with nothing kept from earlier launches.
 pub fn run(
     g: &Graph,
     k: &mut dyn Kernels,
     weights: &[Tensor],
+    entry: usize,
+    inputs: &[Tensor],
+) -> Result<Vec<Tensor>, Error> {
+    run_kept(g, k, weights, &mut Store::default(), entry, inputs)
+}
+
+/// Runs `entry` and returns its outputs in order.
+pub fn run_kept(
+    g: &Graph,
+    k: &mut dyn Kernels,
+    weights: &[Tensor],
+    store: &mut Store,
     entry: usize,
     inputs: &[Tensor],
 ) -> Result<Vec<Tensor>, Error> {
@@ -120,13 +169,27 @@ pub fn run(
             )));
         }
     }
+    let needed = reachable(g, e.outputs.iter().map(|o| o.node));
+    // This launch's appends lengthen the kept rows.
+    for n in g
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| needed[*i])
+        .map(|(_, n)| n)
+    {
+        if let Op::Append(i) = n.op {
+            let new = sizes.expr(&g.node(n.args[0]).ty.shape.0[1])?;
+            let total = [store.rows(i as usize) + new];
+            sizes.learn(&Shape(vec![g.kept[i as usize].shape.0[1].clone()]), &total)?;
+        }
+    }
     let ctx = Context {
         sizes: &sizes,
         entry,
         inputs,
         weights,
     };
-    let needed = reachable(g, e.outputs.iter().map(|o| o.node));
     let mut values: Vec<Option<Tensor>> = vec![None; g.nodes.len()];
     for (i, n) in g.nodes.iter().enumerate() {
         if !needed[i] {
@@ -135,7 +198,10 @@ pub fn run(
         let value = |a: &NodeId| values[a.0 as usize].as_ref().expect("args come first");
         let args: Vec<&Tensor> = n.args.iter().map(value).collect();
         let num = n.numerics.unwrap_or_default();
-        let out = ctx.eval(k, &num, &n.op, &args)?;
+        let out = match n.op {
+            Op::Append(i) => store.append(i as usize, args[0])?,
+            _ => ctx.eval(k, &num, &n.op, &args)?,
+        };
         let want = sizes.shape(&n.ty.shape)?;
         if out.shape != want || out.data.dtype() != n.ty.dtype {
             let msg = format!(
@@ -208,7 +274,9 @@ impl Context<'_> {
                 Ok(x)
             }
             Op::Select(Select::Gather) => k.gather(args[0], args[1]),
+            Op::Select(Select::TopK { k }) => top_k(args[0], self.sizes.expr(k)?),
             Op::Select(s) => lacks(&format!("{s:?}")),
+            Op::Append(_) => lacks("kept rows outside a launch"),
             Op::View(v) => self.view(v, args[0]),
             Op::Cast(dtype) => Ok(Tensor {
                 shape: args[0].shape.clone(),
@@ -244,6 +312,24 @@ impl Context<'_> {
             View::Expand { .. } | View::Concat => lacks(&format!("{v:?}")),
         }
     }
+}
+
+/// Each row's largest finite entries, best first.
+fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
+    let (_, width) = x.rows();
+    let mut ids = Vec::with_capacity(x.data.len() / width.max(1) * k);
+    for row in x.floats()?.chunks(width.max(1)) {
+        let mut order: Vec<usize> = (0..width).filter(|i| row[*i] > f32::NEG_INFINITY).collect();
+        // A stable sort keeps the lower index on ties.
+        order.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
+        // Spare slots hold the width.
+        order.resize(k, width);
+        ids.extend(order.into_iter().take(k).map(|i| i as u32));
+    }
+    let mut shape = x.shape.clone();
+    *shape.last_mut().expect("verified rank") = k;
+    let data = Data::U32(ids);
+    Ok(Tensor { shape, data })
 }
 
 /// Ops that trace and verify but do not run yet.

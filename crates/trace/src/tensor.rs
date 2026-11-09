@@ -1,6 +1,6 @@
 //! Traced tensors: each method appends one node.
 
-use crate::model::{Shared, push};
+use crate::model::{Kept, Shared, push};
 use crate::weights::{Embed, Linear, Norm, Vector};
 use graph::{
     Act, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
@@ -114,6 +114,11 @@ impl Tensor {
 
     pub fn take(&self, ids: &Tensor) -> Tensor {
         self.op(Op::Select(Select::Take), &[ids])
+    }
+
+    /// Appends these rows. Returns every kept row.
+    pub fn append(&self, kept: &Kept) -> Tensor {
+        self.op(Op::Append(kept.0), &[])
     }
 
     pub fn cast(&self, dtype: DType) -> Tensor {

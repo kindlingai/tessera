@@ -6,7 +6,7 @@ mod run;
 mod tensor;
 
 pub use cpu::Cpu;
-pub use run::{Kernels, bind, run};
+pub use run::{Kernels, Store, bind, run, run_kept};
 pub use tensor::{Data, Error, Tensor};
 
 #[cfg(test)]

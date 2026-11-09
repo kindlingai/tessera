@@ -49,15 +49,17 @@ impl Stack {
 
 /// A forward entry's tokens and positions, `[Seqs, Context]` each.
 pub(crate) fn tokens(m: &Model) -> [Tensor; 2] {
-    let ty = TensorType::new([Seqs, Context], DType::U32);
+    ports(m, EntryKind::Forward, Context)
+}
+
+/// A new entry's tokens and positions, `[Seqs, rows]` each.
+pub(crate) fn ports(m: &Model, kind: EntryKind, rows: DimName) -> [Tensor; 2] {
+    let ty = TensorType::new([Seqs, rows], DType::U32);
     let port = |role| Port {
         role,
         ty: ty.clone(),
     };
-    m.entry(
-        EntryKind::Forward,
-        [port(Role::Tokens), port(Role::Positions)],
-    )
+    m.entry(kind, [port(Role::Tokens), port(Role::Positions)])
 }
 
 /// `[Seqs, Context]` followed by `rest`.

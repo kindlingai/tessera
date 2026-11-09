@@ -4,7 +4,7 @@ use crate::Error;
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::Dialect;
 use crate::plan::{Plan, Slot};
-use crate::run::Run;
+use crate::run::{Held, Run};
 use gpukit::metal::{BufferPool, CacheConfig, ComputePipeline, Context, set_bytes};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -21,8 +21,10 @@ type Encoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 pub struct Runner {
     ctx: Rc<Context>,
     plan: Plan,
-    buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    held: Held<Retained<ProtocolObject<dyn MTLBuffer>>>,
     pipelines: Vec<Rc<ComputePipeline>>,
+    /// Compiled generated kernels, by entry.
+    made: HashMap<String, Rc<ComputePipeline>>,
 }
 
 fn gpu(what: &'static str) -> Error {
@@ -45,40 +47,19 @@ fn grid(enc: &Encoder, width: usize, height: usize, threads: usize) {
 
 impl Runner {
     pub fn new(plan: Plan) -> Result<Self, Error> {
-        let ctx = gpukit::metal::cached_context(CacheConfig::MEMORY)?;
-        let shared = MTLResourceOptions::StorageModeShared;
-        let mut buffers = Vec::with_capacity(plan.buffers.len());
-        for len in &plan.buffers {
-            let bytes = (len * 4).max(4);
-            let buffer = ctx.device.newBufferWithLength_options(bytes, shared);
-            buffers.push(buffer.ok_or_else(|| gpu("buffer allocation"))?);
-        }
-        let mut made: HashMap<String, Rc<ComputePipeline>> = HashMap::new();
-        let mut pipelines = Vec::with_capacity(plan.steps.len());
-        for step in &plan.steps {
-            let text = match step.kernel.source() {
-                Source::Fixed { metal, entry, .. } => {
-                    pipelines.push(gpukit::metal::cached_pipeline(&ctx, metal, entry)?);
-                    continue;
-                }
-                Source::Made(text) => text,
-            };
-            if !made.contains_key(&text.entry) {
-                let compiled = ctx.compile_kernel(&text.render(Dialect::Metal), &text.entry)?;
-                made.insert(text.entry.clone(), Rc::new(compiled));
-            }
-            pipelines.push(Rc::clone(&made[&text.entry]));
-        }
-        Ok(Self {
-            ctx,
-            plan,
-            buffers,
-            pipelines,
-        })
+        let mut runner = Self {
+            ctx: gpukit::metal::cached_context(CacheConfig::MEMORY)?,
+            plan: Plan::default(),
+            held: Held::default(),
+            pipelines: Vec::new(),
+            made: HashMap::new(),
+        };
+        runner.replan(plan)?;
+        Ok(runner)
     }
 
     fn buffer(&self, slot: Slot) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.buffers[slot.buffer as usize]
+        self.held.get(slot)
     }
 
     /// Binds each argument at its index, then dispatches.
@@ -116,6 +97,34 @@ impl Runner {
 impl Run for Runner {
     fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+        let (ctx, shared) = (&self.ctx, MTLResourceOptions::StorageModeShared);
+        self.held.bind(&plan, |len| {
+            let buffer = ctx
+                .device
+                .newBufferWithLength_options((len * 4).max(4), shared);
+            buffer.ok_or_else(|| gpu("buffer allocation"))
+        })?;
+        self.pipelines.clear();
+        for step in &plan.steps {
+            let text = match step.kernel.source() {
+                Source::Fixed { metal, entry, .. } => {
+                    let fixed = gpukit::metal::cached_pipeline(ctx, metal, entry)?;
+                    self.pipelines.push(fixed);
+                    continue;
+                }
+                Source::Made(text) => text,
+            };
+            if !self.made.contains_key(&text.entry) {
+                let compiled = ctx.compile_kernel(&text.render(Dialect::Metal), &text.entry)?;
+                self.made.insert(text.entry.clone(), Rc::new(compiled));
+            }
+            self.pipelines.push(Rc::clone(&self.made[&text.entry]));
+        }
+        self.plan = plan;
+        Ok(())
     }
 
     fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {

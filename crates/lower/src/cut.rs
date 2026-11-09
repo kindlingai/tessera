@@ -5,6 +5,7 @@ use graph::{Entry, EntryKind, Graph, Node, NodeId, Op, Output, Port, Role};
 /// A graph of `nodes` alone. Their reads become its inputs.
 pub fn cut(g: &Graph, nodes: &[NodeId]) -> Graph {
     let mut out = Graph::new(g.dims.clone());
+    out.kept.clone_from(&g.kept);
     let reads: Vec<NodeId> = nodes
         .iter()
         .flat_map(|n| &g.node(*n).args)

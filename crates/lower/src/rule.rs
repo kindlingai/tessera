@@ -58,6 +58,13 @@ pub enum Site<'a> {
         rows: usize,
         width: usize,
     },
+    /// Indices of each row's `k` largest entries.
+    Top {
+        x: Val,
+        rows: usize,
+        width: usize,
+        k: usize,
+    },
 }
 
 /// A draft reads a value, or an earlier draft's result.

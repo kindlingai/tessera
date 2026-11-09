@@ -27,20 +27,21 @@ impl<'a> Lives<'a> {
         self.s.values[v.0 as usize].home == Home::Temp
     }
 
+    /// Temporary elements op `i` writes. Kept rows count zero.
+    fn written(&self, i: usize) -> isize {
+        let write = self.s.ops[i].write;
+        let len = self.s.values[write.0 as usize].len as isize;
+        if self.temp(write) { len } else { 0 }
+    }
+
     /// Elements op `i` allocates, less those it lets go.
     fn growth(&self, i: usize) -> isize {
         let op = &self.s.ops[i];
         let len = |v: Val| self.s.values[v.0 as usize].len as isize;
-        // An in-place kernel takes over its first input's buffer.
-        let kept = op.kernel.overwrites().then(|| op.reads[0]);
         let dies = |v: &Val| self.temp(*v) && self.readers[v.0 as usize] == 1;
         let freed: isize = distinct(&op.reads).filter(dies).map(len).sum();
-        let reused = kept.filter(dies).is_some();
-        if reused {
-            -freed + len(op.write)
-        } else {
-            len(op.write) - freed
-        }
+        // In place or not, a dying input frees its size.
+        self.written(i) - freed
     }
 
     fn run(&mut self, i: usize) {
@@ -87,9 +88,8 @@ pub fn peak(s: &Selected, order: &[usize]) -> usize {
     let (mut live, mut most) = (0isize, 0isize);
     for &i in order {
         // The write exists before the reads are let go.
-        let op = &s.ops[i];
         let growth = lives.growth(i);
-        let written = s.values[op.write.0 as usize].len as isize;
+        let written = lives.written(i);
         most = most.max(live + written.max(growth));
         live += growth;
         lives.run(i);

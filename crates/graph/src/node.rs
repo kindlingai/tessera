@@ -13,6 +13,8 @@ pub struct Graph {
     pub version: u32,
     pub dims: Vec<Dim>,
     pub weights: Vec<Weight>,
+    /// Rows kept between launches, as `[Seqs, Kept, ..]`.
+    pub kept: Vec<TensorType>,
     pub nodes: Vec<Node>,
     pub regions: Vec<Region>,
     pub entries: Vec<Entry>,
@@ -24,6 +26,7 @@ impl Graph {
             version: VERSION,
             dims,
             weights: Vec::new(),
+            kept: Vec::new(),
             nodes: Vec::new(),
             regions: Vec::new(),
             entries: Vec::new(),
@@ -92,6 +95,8 @@ pub enum Op {
     Attend(Attend),
     /// Scores `[.., Queries, Keys]`; unseen keys become negative infinity.
     Mask(Mask),
+    /// Appends rows to kept rows. The result holds all.
+    Append(u32),
     Row(Row),
     Select(Select),
     View(View),
@@ -257,6 +262,8 @@ pub struct Entry {
 pub enum EntryKind {
     /// Whole sequences in, logits for every position out.
     Forward,
+    /// New rows in. Kept rows carry what came before.
+    Step,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

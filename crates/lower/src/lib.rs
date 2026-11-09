@@ -25,7 +25,7 @@ pub use emit::{Dialect, Text, float, hash};
 pub use kernel::{Kernel, KernelRef};
 pub use plan::{Output, Plan, Slot, Step};
 pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
-pub use run::{Feed, Run, open};
+pub use run::{Feed, Held, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
 
