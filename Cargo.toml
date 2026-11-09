@@ -6,6 +6,7 @@ members = [
     "crates/trace",
     "crates/trace-derive",
     "crates/interp",
+    "crates/lower",
     "crates/models",
     "crates/gpukit",
     "crates/gemm",

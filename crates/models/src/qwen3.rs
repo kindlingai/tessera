@@ -35,6 +35,26 @@ impl Config {
         }
     }
 
+    /// The same layout, small enough to run in tests.
+    pub fn toy(max_seqs: u64, max_context: u64) -> Self {
+        let stack = Stack {
+            vocab: 32,
+            hidden: 16,
+            layers: 2,
+            heads: 4,
+            head_dim: 8,
+            ffn: 32,
+            max_seqs,
+            max_context,
+        };
+        Self {
+            stack,
+            kv_heads: 2,
+            rope_theta: 1e4,
+            eps: 1e-6,
+        }
+    }
+
     pub fn dims(&self) -> Vec<Dim> {
         self.stack.dims(&[(KvHeads, self.kv_heads)])
     }

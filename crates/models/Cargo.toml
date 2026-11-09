@@ -18,5 +18,6 @@ trace = { path = "../trace" }
 [dev-dependencies]
 checkpoint = { path = "../checkpoint" }
 interp = { path = "../interp", features = ["gpu"] }
+lower = { path = "../lower" }
 ops = { path = "../ops" }
 nanogpt = { path = "../nanogpt" }
