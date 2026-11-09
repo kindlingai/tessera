@@ -1,0 +1,2 @@
+# File pairs allowed to hold near-copies of each other.
+pairs = []

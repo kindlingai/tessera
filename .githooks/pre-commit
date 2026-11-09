@@ -2,4 +2,5 @@
 # The same checks as CI's lint job. Install: scripts/install-hooks.sh
 set -e
 cargo fmt --all --check
+cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
 cargo run -q -p tessera-lint
