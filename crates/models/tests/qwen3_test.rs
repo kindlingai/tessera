@@ -96,7 +96,8 @@ fn matches_reference() {
 /// The same model as a plan, wholly on the GPU.
 mod plan {
     use super::*;
-    use lower::{Device, Feed, Kernel, Plan, assign, launches, lower, open, select};
+    use lower::kernels::{Matmul, Thin};
+    use lower::{Device, Feed, Kernel, Plan, assign, lower, open, select};
     use std::collections::BTreeMap;
     use trace::DimName::{Context, Seqs};
 
@@ -143,22 +144,21 @@ mod plan {
         }
     }
 
+    /// Rules that competed somewhere when lowering `tokens`.
+    fn contested(g: &Graph, tokens: usize, device: &Device) -> Vec<&'static str> {
+        let sizes = [(Seqs, 1), (Context, tokens as u64)];
+        let picked = select(g, 0, &sizes, device).unwrap();
+        picked.contested.into_iter().collect()
+    }
+
     /// Times every kernel: cost only chooses what was measured.
     fn calibrate(g: &Graph, c: &Case) -> Device {
-        let tiled = || Device::guess().without("thin");
-        let stream = tiled().without("scores");
-        let thin = Device::guess().without("matmul");
-        let dense = tiled().without("attend");
-        let long = vec![8, 32, 128, 384];
-        let cases = [
-            (&stream, long.clone()),
-            (&thin, vec![8, 16, 32]),
-            (&dense, long),
-        ];
         let mut runs = Vec::new();
-        for (device, lengths) in cases {
-            for n in lengths {
-                runs.push(run(g, c, &repeat(c, n), device));
+        for n in [8, 32, 128, 384] {
+            // Favoring each contested rule measures every candidate.
+            for rule in contested(g, n, &Device::guess()) {
+                let device = Device::guess().favoring(rule);
+                runs.push(run(g, c, &repeat(c, n), &device));
             }
         }
         let timed = |r: &'_ Run| r.plan.steps.clone().into_iter().zip(r.steps.clone());
@@ -167,8 +167,8 @@ mod plan {
         device.fit(samples.iter().map(|(step, seconds)| (step, *seconds)));
         // The head matmul, as estimated for each kernel.
         let (m, n, k) = (c.tokens.len(), 151_936, 1024);
-        let ms = |kernel| device.seconds(&kernel, m * n) * 1e3;
-        let (tiled, thin) = (ms(Kernel::Matmul { m, n, k }), ms(Kernel::Thin { m, n, k }));
+        let ms = |kernel: &dyn Kernel| device.seconds(kernel, m * n) * 1e3;
+        let (tiled, thin) = (ms(&Matmul { m, n, k }), ms(&Thin { m, n, k }));
         eprintln!("  head matmul, {m} rows: tiled {tiled:.1} ms, thin {thin:.1} ms");
         device
     }
@@ -188,7 +188,7 @@ mod plan {
         let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
         for (step, seconds) in r.plan.steps.iter().zip(&r.steps) {
             let (count, total) = by.entry(step.kernel.name()).or_default();
-            (*count, *total) = (*count + launches(step).len(), *total + seconds);
+            (*count, *total) = (*count + step.launches().len(), *total + seconds);
         }
         for (name, (count, seconds)) in by {
             eprintln!("  {name:8} {count:4} launches {seconds:.3} s");
@@ -200,15 +200,18 @@ mod plan {
         );
     }
 
-    /// The plan should not lose to a forced choice.
-    fn compare(g: &Graph, c: &Case, planned: &Run, device: &Device, without: [&'static str; 2]) {
+    /// The plan should not lose to favoring any one rule.
+    fn compare(g: &Graph, c: &Case, planned: &Run, device: &Device) {
         let waited = |r: &Run| r.steps.iter().sum::<f64>();
         let tokens = repeat(c, planned.out.len() / 151_936);
-        let lacking = |kernel| waited(&run(g, c, &tokens, &device.clone().without(kernel)));
-        let (a, b, mixed) = (lacking(without[0]), lacking(without[1]), waited(planned));
-        let [x, y] = without;
-        eprintln!("  without {x} {a:.3} s, without {y} {b:.3} s, planned {mixed:.3} s");
-        assert!(mixed < 1.25 * a.min(b), "the plan lost to a forced choice");
+        let (mixed, mut least) = (waited(planned), f64::INFINITY);
+        for rule in contested(g, tokens.len(), device) {
+            let forced = waited(&run(g, c, &tokens, &device.clone().favoring(rule)));
+            eprintln!("  favoring {rule:8} {forced:.3} s");
+            least = least.min(forced);
+        }
+        eprintln!("  as planned        {mixed:.3} s");
+        assert!(mixed < 1.25 * least, "the plan lost to a forced choice");
     }
 
     pub fn check(g: &Graph, c: &Case) {
@@ -216,7 +219,7 @@ mod plan {
         let device = calibrate(g, c);
         let short = run(g, c, &c.tokens, &device);
         report(&short, &device);
-        compare(g, c, &short, &device, ["thin", "matmul"]);
+        compare(g, c, &short, &device);
         close("plan", &short.out, c);
         // Past the reference's length, the CPU is the check.
         let longer = repeat(c, 64);
@@ -227,7 +230,7 @@ mod plan {
         // Causal, so a long run's first rows match the reference.
         let long = run(g, c, &repeat(c, 512), &device);
         report(&long, &device);
-        compare(g, c, &long, &device, ["scores", "attend"]);
+        compare(g, c, &long, &device);
         close("plan, start of 512", &long.out[..c.want.len()], c);
     }
 }

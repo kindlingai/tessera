@@ -2,15 +2,11 @@
 
 use crate::Error;
 use crate::cost::Device;
-use crate::plan::{Attn, Kernel, MapStage};
-use graph::{Attend, DimName, Graph, Mask, NodeId, Op as Node, Pairs, Select, Shape, Stage, View};
-use std::collections::HashMap;
-
-/// The most score elements dense attention may hold.
-pub const DENSE_SCORES: usize = 1 << 28;
-
-/// The most rows the one-thread-per-column matmul takes.
-pub const THIN_ROWS: usize = 32;
+use crate::kernel::KernelRef;
+use crate::kernels::MapStage;
+use crate::rule::{Attn, Draft, Read, Rule, Site, rules};
+use graph::{Attend, DimName, Graph, Mask, NodeId, Op as Node, Select, Shape, Stage, View};
+use std::collections::{BTreeSet, HashMap};
 
 /// A value some op writes, or the plan is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +29,9 @@ pub struct Value {
 /// One launch, before it has buffers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Op {
-    pub kernel: Kernel,
+    pub kernel: KernelRef,
+    /// The rule that proposed it.
+    pub rule: &'static str,
     pub reads: Vec<Val>,
     pub write: Val,
     pub covers: Vec<NodeId>,
@@ -46,6 +44,8 @@ pub struct Selected {
     pub ops: Vec<Op>,
     pub inputs: Vec<Val>,
     pub outputs: Vec<(Val, Vec<usize>)>,
+    /// Rules that competed with another at some site.
+    pub contested: BTreeSet<&'static str>,
 }
 
 /// Elementwise stages waiting for the node they fuse into.
@@ -60,13 +60,15 @@ struct Picker<'a> {
     g: &'a Graph,
     sizes: &'a [(DimName, u64)],
     device: &'a Device,
+    rules: Vec<&'static Rule>,
     out: Selected,
     /// Each lowered node's value and shape.
     vals: Vec<Option<(Val, Vec<usize>)>>,
     chains: HashMap<usize, Chain>,
     /// Per node: the node its work is emitted with.
     sink: Vec<usize>,
-    angles: HashMap<(Val, usize, u32), Val>,
+    /// Results that later equal launches may reuse.
+    shared: HashMap<(String, Vec<Val>), Val>,
 }
 
 fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
@@ -83,7 +85,7 @@ fn map_stage(s: &Stage) -> Option<MapStage> {
     }
 }
 
-/// Whether a generated elementwise kernel can run this whole op.
+/// Whether one elementwise kernel can run this whole op.
 fn maps(op: &Node) -> bool {
     matches!(op, Node::Row(r) if r.0.iter().all(|s| map_stage(s).is_some()))
 }
@@ -141,11 +143,12 @@ pub fn select(
         g,
         sizes,
         device,
+        rules: rules(),
         out: Selected::default(),
         vals: vec![None; g.nodes.len()],
         chains: HashMap::new(),
         sink: sinks(g, &needed, &outputs),
-        angles: HashMap::new(),
+        shared: HashMap::new(),
     };
     for (port, decl) in e.inputs.iter().enumerate() {
         let len = p.shape(&decl.ty.shape)?.iter().product();
@@ -190,12 +193,64 @@ impl Picker<'_> {
         Val(self.out.values.len() as u32 - 1)
     }
 
-    /// Adds an op writing a new value of `len` elements.
-    fn emit(&mut self, kernel: Kernel, reads: Vec<Val>, len: usize, covers: &[NodeId]) -> Val {
+    /// Asks every rule, then emits the cheapest proposal.
+    fn choose(&mut self, site: Site, covers: &[NodeId]) -> Result<Val, Error> {
+        let mut best: Option<(f64, &'static str, Vec<Draft>)> = None;
+        let mut offered = Vec::new();
+        for rule in &self.rules {
+            let Some(drafts) = (rule.propose)(&site) else {
+                continue;
+            };
+            let seconds = |d: &Draft| self.device.seconds(&*d.kernel, d.len);
+            let mut cost: f64 = drafts.iter().map(seconds).sum();
+            // A favored rule wins wherever it applies.
+            if self.device.favors(rule.name) {
+                cost = f64::NEG_INFINITY;
+            }
+            offered.push(rule.name);
+            if best.as_ref().is_none_or(|(least, ..)| cost < *least) {
+                best = Some((cost, rule.name, drafts));
+            }
+        }
+        if offered.len() > 1 {
+            self.out.contested.extend(offered);
+        }
+        let Some((_, rule, drafts)) = best else {
+            return unsupported(site);
+        };
+        let mut made: Vec<Val> = Vec::with_capacity(drafts.len());
+        for d in drafts {
+            let read = |r: &Read| match r {
+                Read::Value(v) => *v,
+                Read::Draft(at) => made[*at],
+            };
+            let reads: Vec<Val> = d.reads.iter().map(read).collect();
+            made.push(self.emit(d.kernel, rule, reads, d.len, covers));
+        }
+        Ok(*made.last().expect("a rule proposes at least one launch"))
+    }
+
+    /// Adds an op writing a new value, or shares one.
+    fn emit(
+        &mut self,
+        kernel: KernelRef,
+        rule: &'static str,
+        reads: Vec<Val>,
+        len: usize,
+        covers: &[NodeId],
+    ) -> Val {
+        let key = (format!("{kernel:?}"), reads.clone());
+        if let Some(same) = self.shared.get(&key).filter(|_| kernel.shared()) {
+            return *same;
+        }
         let write = self.value(len, Home::Temp);
+        if kernel.shared() {
+            self.shared.insert(key, write);
+        }
         let covers = covers.to_vec();
         self.out.ops.push(Op {
             kernel,
+            rule,
             reads,
             write,
             covers,
@@ -221,36 +276,26 @@ impl Picker<'_> {
                 let [n, k] = wide[..] else {
                     return unsupported("a batched matmul");
                 };
-                let kernel = self.matmul(self.len(x) / k, n, k);
-                self.emit(kernel, vec![x, w], len, &covers)
+                let m = self.len(x) / k;
+                self.choose(Site::Matmul { x, w, m, n, k }, &covers)?
             }
             Node::Row(r) if maps(&n.op) => return self.map(i, &r.0),
             Node::Row(r) => self.row(i, &r.0)?,
             Node::Attend(a) => self.attend(i, a)?,
             Node::Select(Select::Gather) => {
                 let ((table, wide), (ids, _)) = (self.val(arg(0))?, self.val(arg(1))?);
-                let kernel = Kernel::Gather {
+                let site = Site::Gather {
+                    table,
+                    ids,
                     rows: self.len(ids),
                     width: self.len(table) / wide[0],
                 };
-                self.emit(kernel, vec![table, ids], len, &covers)
+                self.choose(site, &covers)?
             }
             other => return unsupported(other),
         };
         self.vals[i] = Some((val, shape));
         Ok(())
-    }
-
-    /// The cheaper matmul kernel on this device, for this shape.
-    fn matmul(&self, m: usize, n: usize, k: usize) -> Kernel {
-        let tiled = Kernel::Matmul { m, n, k };
-        let thin = Kernel::Thin { m, n, k };
-        let seconds = |kernel: &Kernel| self.device.seconds(kernel, m * n);
-        if m <= THIN_ROWS && seconds(&thin) < seconds(&tiled) {
-            thin
-        } else {
-            tiled
-        }
     }
 
     /// Extends the chain its first argument left, or starts one.
@@ -281,7 +326,12 @@ impl Picker<'_> {
             }
             reads.push(operand);
         }
-        let val = self.emit(Kernel::Map(chain.stages), reads, self.len(x), &chain.covers);
+        let site = Site::Map {
+            stages: &chain.stages,
+            reads: &reads,
+            len: self.len(x),
+        };
+        let val = self.choose(site, &chain.covers)?;
         self.vals[i] = Some((val, shape));
         Ok(())
     }
@@ -294,54 +344,28 @@ impl Picker<'_> {
         let width = *shape.last().expect("verified rank");
         let len = self.len(cur);
         let mut rest = n.args[1..].iter().map(|a| a.0 as usize);
-        for s in stages {
-            let operand = (s.operands() == 1).then(|| rest.next().expect("verified"));
-            match (s, operand) {
-                (Stage::RmsNorm { eps }, Some(w)) => {
-                    let kernel = Kernel::RmsNorm {
-                        rows: len / width,
-                        width,
-                        eps: *eps,
-                    };
-                    let w = self.val(w)?.0;
-                    cur = self.emit(kernel, vec![cur, w], len, &covers);
-                }
-                (Stage::Softmax, _) => {
-                    let rows = len / width;
-                    cur = self.emit(Kernel::Softmax { rows, width }, vec![cur], len, &covers);
-                }
-                (Stage::Rope { theta, pairs }, Some(at)) if *pairs == Pairs::Halves => {
-                    let at = self.val(at)?.0;
-                    let angles = self.turns(i, at, width, *theta);
-                    let kernel = Kernel::Rope {
-                        positions: self.len(at),
-                        heads: len / (self.len(at) * width),
-                        width,
-                    };
-                    cur = self.emit(kernel, vec![cur, angles], len, &covers);
-                }
-                // One rank holds the whole sum already.
-                (Stage::AllReduce, _) => {}
-                (other, _) => return unsupported(other),
+        for stage in stages {
+            // One rank holds the whole sum already.
+            if *stage == Stage::AllReduce {
+                continue;
             }
+            let mut operand = None;
+            if stage.operands() == 1 {
+                let val = self.val(rest.next().expect("verified"))?.0;
+                operand = Some((val, self.len(val)));
+            }
+            let site = Site::Stage {
+                stage,
+                x: cur,
+                operand,
+                len,
+                width,
+            };
+            cur = self.choose(site, &covers)?;
         }
         Ok(cur)
     }
 
-    /// One table of angles serves every rotation that matches.
-    fn turns(&mut self, i: usize, at: Val, width: usize, theta: f32) -> Val {
-        let key = (at, width, theta.to_bits());
-        if let Some(angles) = self.angles.get(&key) {
-            return *angles;
-        }
-        let kernel = Kernel::Angles { width, theta };
-        let len = self.len(at) * width;
-        let angles = self.emit(kernel, vec![at], len, &[NodeId(i as u32)]);
-        self.angles.insert(key, angles);
-        angles
-    }
-
-    /// Key by key, or as two matmuls: whichever costs less.
     fn attend(&mut self, i: usize, a: &Attend) -> Result<Val, Error> {
         let n = &self.g.nodes[i];
         if a.picked || a.mask != Mask::Causal {
@@ -361,39 +385,13 @@ impl Picker<'_> {
             kv_heads,
             width,
         };
-        let covers = [NodeId(i as u32)];
-        let side = kv_heads * width;
-        let scale = Kernel::Map(vec![MapStage::Scale(a.scale)]);
-        let join = Kernel::Join {
-            left: side,
-            right: side,
-        };
-        let causal = Kernel::Causal {
-            queries,
-            keys,
+        let site = Site::Attend {
             scale: a.scale,
+            q,
+            k,
+            v,
+            sizes,
         };
-        let (out, joined) = (self.len(q), 2 * self.len(k));
-        let pairs = seqs * heads * queries * keys;
-        let cost = |ops: [(&Kernel, usize); 3]| -> f64 {
-            let each = ops.map(|(kernel, len)| self.device.seconds(kernel, len));
-            each.iter().sum()
-        };
-        let stream = cost([
-            (&scale, out),
-            (&join, joined),
-            (&Kernel::Attend(sizes), out),
-        ]);
-        let (first, last) = (Kernel::Scores(sizes), Kernel::Values(sizes));
-        let dense = cost([(&first, pairs), (&causal, pairs), (&last, out)]);
-        if pairs <= DENSE_SCORES && dense < stream {
-            let scores = self.emit(first, vec![q, k], pairs, &covers);
-            let probs = self.emit(causal, vec![scores], pairs, &covers);
-            return Ok(self.emit(last, vec![probs, v], out, &covers));
-        }
-        // The streaming kernel wants scaled queries, and keys beside values.
-        let scaled = self.emit(scale, vec![q], out, &covers);
-        let both = self.emit(join, vec![k, v], joined, &covers);
-        Ok(self.emit(Kernel::Attend(sizes), vec![scaled, both], out, &covers))
+        self.choose(site, &[NodeId(i as u32)])
     }
 }

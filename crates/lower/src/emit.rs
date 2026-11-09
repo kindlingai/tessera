@@ -1,9 +1,5 @@
 //! Source text for generated kernels, in each backend's dialect.
 
-use crate::plan::MapStage;
-use graph::Act;
-use std::fmt::Write;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Metal,
@@ -15,9 +11,10 @@ pub enum Dialect {
 pub struct Text {
     pub entry: String,
     /// Name, element type, and whether the kernel writes it.
-    buffers: Vec<(String, &'static str, bool)>,
-    scalars: Vec<(&'static str, &'static str)>,
-    body: String,
+    pub buffers: Vec<(String, &'static str, bool)>,
+    /// Name and type, bound after the buffers.
+    pub scalars: Vec<(&'static str, &'static str)>,
+    pub body: String,
 }
 
 /// Each dialect's spelling of the names a body may use.
@@ -84,202 +81,13 @@ impl Text {
     }
 }
 
-fn float(name: &str, writes: bool) -> (String, &'static str, bool) {
+/// A float buffer parameter.
+pub fn float(name: &str, writes: bool) -> (String, &'static str, bool) {
     (name.into(), "float", writes)
 }
 
-/// FNV-1a, so equal bodies share one entry name.
-fn hash(text: &str) -> u64 {
+/// FNV-1a, so equal bodies can share one entry name.
+pub fn hash(text: &str) -> u64 {
     let mix = |h: u64, b: u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     text.bytes().fold(0xcbf2_9ce4_8422_2325, mix)
-}
-
-fn act(a: Act) -> &'static str {
-    match a {
-        Act::Silu => "v = v / (1.0f + f_exp(-v));",
-        Act::Sigmoid => "v = 1.0f / (1.0f + f_exp(-v));",
-        Act::Relu => "v = f_max(v, 0.0f);",
-        Act::GeluTanh => {
-            "v = 0.5f * v * (1.0f + f_tanh(f_clamp(\
-             0.7978846f * (v + 0.044715f * v * v * v), -8.0f, 8.0f)));"
-        }
-    }
-}
-
-/// `out = stages(x, operands..)`, one element per thread.
-pub fn map(stages: &[MapStage]) -> Text {
-    let mut buffers = vec![float("x", false)];
-    let mut body =
-        "    if (gid >= len) {\n        return;\n    }\n    float v = x[gid];\n".to_string();
-    for s in stages {
-        let line = match s {
-            MapStage::Add | MapStage::Mul => {
-                let op = if *s == MapStage::Add { '+' } else { '*' };
-                let name = format!("a{}", buffers.len() - 1);
-                buffers.push(float(&name, false));
-                format!("v = v {op} {name}[gid];")
-            }
-            // Bits, so the constant survives the round trip.
-            MapStage::Scale(by) => format!("v = v * f_bits(0x{:08x}u);", by.to_bits()),
-            MapStage::Act(a) => act(*a).to_string(),
-        };
-        let _ = writeln!(body, "    {line}");
-    }
-    body.push_str("    out[gid] = v;\n");
-    buffers.push(float("out", true));
-    Text {
-        entry: format!("map_{:x}", hash(&body)),
-        buffers,
-        scalars: vec![("len", "u32")],
-        body,
-    }
-}
-
-/// Rows of `a` and `b`, joined along the last axis.
-pub fn join() -> Text {
-    let body = "    u32 width = left + right;
-    u32 row = gid / width;
-    u32 col = gid % width;
-    if (row >= rows) {
-        return;
-    }
-    out[gid] = col < left ? a[row * left + col] : b[row * right + col - left];
-";
-    Text {
-        entry: "plan_join".into(),
-        buffers: vec![float("a", false), float("b", false), float("out", true)],
-        scalars: vec![("left", "u32"), ("right", "u32"), ("rows", "u32")],
-        body: body.into(),
-    }
-}
-
-/// Each thread sums one output column for every row.
-pub fn thin() -> Text {
-    let body = "    if (gid >= n) {
-        return;
-    }
-    float sums[32];
-    for (u32 row = 0; row < m; row++) {
-        sums[row] = 0.0f;
-    }
-    for (u32 i = 0; i < k; i++) {
-        float c = w[(u64)gid * k + i];
-        for (u32 row = 0; row < m; row++) {
-            sums[row] += x[row * k + i] * c;
-        }
-    }
-    for (u32 row = 0; row < m; row++) {
-        out[(u64)row * n + gid] = sums[row];
-    }
-";
-    Text {
-        entry: "plan_thin".into(),
-        buffers: vec![float("x", false), float("w", false), float("out", true)],
-        scalars: vec![("m", "u32"), ("n", "u32"), ("k", "u32")],
-        body: body.into(),
-    }
-}
-
-/// One thread scales each row by its root mean square.
-pub fn rms_norm() -> Text {
-    // Summed in order, so batch size never changes a row.
-    let body = "    if (gid >= rows) {
-        return;
-    }
-    u64 at = (u64)gid * width;
-    float sum = 0.0f;
-    for (u32 i = 0; i < width; i++) {
-        sum += x[at + i] * x[at + i];
-    }
-    float inv = f_rsqrt(sum / (float)width + eps);
-    for (u32 i = 0; i < width; i++) {
-        out[at + i] = x[at + i] * inv * w[i];
-    }
-";
-    Text {
-        entry: "plan_rms_norm".into(),
-        buffers: vec![float("x", false), float("w", false), float("out", true)],
-        scalars: vec![("rows", "u32"), ("width", "u32"), ("eps", "float")],
-        body: body.into(),
-    }
-}
-
-/// One thread turns a whole row into probabilities.
-pub fn softmax() -> Text {
-    let body = "    if (gid >= rows) {
-        return;
-    }
-    u64 at = (u64)gid * width;
-    float top = x[at];
-    for (u32 i = 1; i < width; i++) {
-        top = f_max(top, x[at + i]);
-    }
-    float sum = 0.0f;
-    for (u32 i = 0; i < width; i++) {
-        sum += f_exp(x[at + i] - top);
-    }
-    for (u32 i = 0; i < width; i++) {
-        out[at + i] = f_exp(x[at + i] - top) / sum;
-    }
-";
-    Text {
-        entry: "plan_softmax".into(),
-        buffers: vec![float("x", false), float("out", true)],
-        scalars: vec![("rows", "u32"), ("width", "u32")],
-        body: body.into(),
-    }
-}
-
-/// One thread turns a score row into causal probabilities.
-pub fn causal() -> Text {
-    // Rows are queries; the last query sees every key.
-    let body = "    if (gid >= rows) {
-        return;
-    }
-    u32 seen = keys - queries + gid % queries + 1;
-    u64 at = (u64)gid * keys;
-    float top = x[at] * scale;
-    for (u32 i = 1; i < seen; i++) {
-        top = f_max(top, x[at + i] * scale);
-    }
-    float sum = 0.0f;
-    for (u32 i = 0; i < seen; i++) {
-        sum += f_exp(x[at + i] * scale - top);
-    }
-    for (u32 i = 0; i < keys; i++) {
-        x[at + i] = i < seen ? f_exp(x[at + i] * scale - top) / sum : 0.0f;
-    }
-";
-    Text {
-        entry: "plan_causal".into(),
-        buffers: vec![float("x", true)],
-        scalars: vec![
-            ("rows", "u32"),
-            ("queries", "u32"),
-            ("keys", "u32"),
-            ("scale", "float"),
-        ],
-        body: body.into(),
-    }
-}
-
-/// A cosine and sine per position and pair.
-pub fn angles() -> Text {
-    let body = "    u32 pairs = width / 2;
-    u32 at = gid / pairs;
-    u32 pair = gid % pairs;
-    if (at >= count) {
-        return;
-    }
-    float turn = f_pow(theta, -(float)(2 * pair) / (float)width);
-    float angle = (float)positions[at] * turn;
-    out[at * width + 2 * pair] = f_cos(angle);
-    out[at * width + 2 * pair + 1] = f_sin(angle);
-";
-    Text {
-        entry: "plan_angles".into(),
-        buffers: vec![("positions".into(), "u32", false), float("out", true)],
-        scalars: vec![("count", "u32"), ("width", "u32"), ("theta", "float")],
-        body: body.into(),
-    }
 }

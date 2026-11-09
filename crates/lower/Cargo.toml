@@ -14,6 +14,7 @@ rocm = ["gpukit/rocm"]
 
 [dependencies]
 graph = { path = "../graph" }
+scattered-collect = "0.22"
 gpukit = { path = "../gpukit", default-features = false }
 gemm = { path = "../gemm" }
 ops-model = { path = "../ops-model" }

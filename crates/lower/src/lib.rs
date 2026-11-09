@@ -7,22 +7,27 @@ mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
 mod emit;
+mod kernel;
+pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod plan;
+pub mod rule;
 mod run;
 mod schedule;
 mod select;
 
-pub use abi::{Arg, Launch, Shape, Source, launches, source};
+pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
-pub use cost::{Cost, Device, work};
+pub use cost::{Cost, Device};
 pub use cut::cut;
-pub use emit::{Dialect, Text};
-pub use plan::{Attn, Kernel, MapStage, Output, Plan, Slot, Step};
+pub use emit::{Dialect, Text, float, hash};
+pub use kernel::{Kernel, KernelRef};
+pub use plan::{Output, Plan, Slot, Step};
+pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Feed, Run, open};
 pub use schedule::{peak, schedule};
-pub use select::{Home, Op, Selected, THIN_ROWS, Val, Value, select};
+pub use select::{Home, Op, Selected, Val, Value, select};
 
 use graph::{DimName, Graph};
 

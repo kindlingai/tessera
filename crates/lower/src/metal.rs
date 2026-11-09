@@ -1,7 +1,7 @@
 //! Replays a plan on Metal. Buffers stay on the device.
 
 use crate::Error;
-use crate::abi::{Arg, Launch, Shape, Source, launches, source};
+use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::Dialect;
 use crate::plan::{Plan, Slot};
 use crate::run::Run;
@@ -56,7 +56,7 @@ impl Runner {
         let mut made: HashMap<String, Rc<ComputePipeline>> = HashMap::new();
         let mut pipelines = Vec::with_capacity(plan.steps.len());
         for step in &plan.steps {
-            let text = match source(&step.kernel) {
+            let text = match step.kernel.source() {
                 Source::Fixed { metal, entry, .. } => {
                     pipelines.push(gpukit::metal::cached_pipeline(&ctx, metal, entry)?);
                     continue;
@@ -137,7 +137,7 @@ impl Run for Runner {
         let enc = enc.ok_or_else(|| gpu("encoder"))?;
         for i in steps {
             enc.setComputePipelineState(&self.pipelines[i].pipeline);
-            for launch in launches(&self.plan.steps[i]) {
+            for launch in self.plan.steps[i].launches() {
                 self.encode(&enc, &launch);
             }
         }
