@@ -92,17 +92,24 @@ jobs:
         with:
           shared-key: simcheck
           workspaces: tools/simcheck
+          # The job fails on near-copies; keep the build anyway.
+          cache-on-failure: true
       - run: cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
       - run: cargo clippy --manifest-path tools/simcheck/Cargo.toml --all-targets
       - run: cargo test --manifest-path tools/simcheck/Cargo.toml
       # The checkpoint's text tower, pinned in tools/simcheck/src/fetch.rs.
       - id: model
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/eg2-text
           key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
       - if: steps.model.outputs.cache-hit != 'true'
         run: $SIMCHECK fetch "$RUNNER_TEMP/eg2-text"
+      - if: steps.model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/eg2-text
+          key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
       # Embeddings keyed by window text. Each run saves a fresh copy.
       - uses: actions/cache/restore@v4
         with:
