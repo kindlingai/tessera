@@ -1,0 +1,5 @@
+#!/bin/sh
+# The same checks as CI's lint job. Install: scripts/install-hooks.sh
+set -e
+cargo fmt --all --check
+cargo run -q -p tessera-lint
