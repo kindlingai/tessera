@@ -82,6 +82,40 @@ pub(crate) fn join() -> Source {
     }
 }
 
+/// Each thread sums one output column for every row.
+pub(crate) fn thin() -> Source {
+    let body = "kernel void plan_thin(
+    device const float *x [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant uint3 &dims [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dims.y) {
+        return;
+    }
+    float sums[32];
+    for (uint row = 0; row < dims.x; row++) {
+        sums[row] = 0.0f;
+    }
+    const device float *col = w + (ulong)gid * dims.z;
+    for (uint i = 0; i < dims.z; i++) {
+        float c = col[i];
+        for (uint row = 0; row < dims.x; row++) {
+            sums[row] += x[row * dims.z + i] * c;
+        }
+    }
+    for (uint row = 0; row < dims.x; row++) {
+        out[(ulong)row * dims.y + gid] = sums[row];
+    }
+}
+";
+    Source {
+        entry: "plan_thin".into(),
+        text: format!("{HEADER}{body}"),
+    }
+}
+
 /// A cosine and sine per position and pair.
 pub(crate) fn angles() -> Source {
     let body = "kernel void plan_angles(

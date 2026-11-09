@@ -28,6 +28,12 @@ pub enum Kernel {
         n: usize,
         k: usize,
     },
+    /// The same product, one thread per output column.
+    Thin {
+        m: usize,
+        n: usize,
+        k: usize,
+    },
     RmsNorm {
         rows: usize,
         width: usize,
@@ -67,9 +73,15 @@ pub enum Kernel {
 }
 
 impl Kernel {
+    /// Whether it writes over its first input.
+    pub fn overwrites(&self) -> bool {
+        matches!(self, Kernel::Rope { .. })
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Kernel::Matmul { .. } => "matmul",
+            Kernel::Thin { .. } => "thin",
             Kernel::RmsNorm { .. } => "rms_norm",
             Kernel::Angles { .. } => "angles",
             Kernel::Rope { .. } => "rope",
@@ -106,4 +118,13 @@ pub struct Plan {
     /// One per input port of the entry.
     pub inputs: Vec<Slot>,
     pub outputs: Vec<Output>,
+}
+
+impl Plan {
+    /// Elements in buffers that hold no weight or input.
+    pub fn scratch(&self) -> usize {
+        let fixed = self.weights.iter().map(|(_, s)| s).chain(&self.inputs);
+        let held: usize = fixed.map(|s| s.len).sum();
+        self.buffers.iter().sum::<usize>() - held
+    }
 }

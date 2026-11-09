@@ -1,14 +1,33 @@
 //! Lowers a graph to kernel launches over device buffers.
 
-mod build;
+mod assign;
+mod cost;
 mod cut;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod plan;
+mod schedule;
+mod select;
 
-pub use build::lower;
+pub use assign::assign;
+pub use cost::{Cost, Device, work};
 pub use cut::cut;
 pub use plan::{Kernel, MapStage, Output, Plan, Slot, Step};
+pub use schedule::{peak, schedule};
+pub use select::{Home, Op, Selected, THIN_ROWS, Val, Value, select};
+
+use graph::{DimName, Graph};
+
+/// Selects kernels, orders them, then assigns buffers.
+pub fn lower(
+    g: &Graph,
+    entry: usize,
+    sizes: &[(DimName, u64)],
+    device: &Device,
+) -> Result<Plan, Error> {
+    let picked = select(g, entry, sizes, device)?;
+    Ok(assign(&picked, &schedule(&picked)))
+}
 
 use std::fmt;
 
@@ -40,4 +59,4 @@ impl From<gpukit::Error> for Error {
 }
 
 #[cfg(test)]
-mod build_test;
+mod lower_test;

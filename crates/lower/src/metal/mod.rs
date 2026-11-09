@@ -187,6 +187,11 @@ impl Runner {
                 let (across, down) = (div_up(*n, gemm::BN), div_up(*m, gemm::BM));
                 grid(enc, across, down, gemm::THREADS as usize);
             }
+            Kernel::Thin { m, n, k } => {
+                let next = self.bind_all(enc, step);
+                set_bytes(enc, &[*m as u32, *n as u32, *k as u32, 0], next);
+                line(enc, *n);
+            }
             Kernel::RmsNorm { rows, width, eps } => {
                 let next = self.bind_all(enc, step);
                 set_bytes(enc, &pair(*rows, *width), next);
@@ -291,6 +296,7 @@ fn pipeline(ctx: &Context, made: &mut Made, k: &Kernel) -> Result<Rc<ComputePipe
         Kernel::Rope { .. } => return fixed(apply_rope_heads::METAL, apply_rope_heads::ENTRY),
         Kernel::Attend { .. } => return fixed(gqa_attention::METAL, gqa_attention::ENTRY),
         Kernel::Gather { .. } => return fixed(gather_rows::METAL, gather_rows::ENTRY),
+        Kernel::Thin { .. } => source::thin(),
         Kernel::Map(stages) => source::map(stages),
         Kernel::Join { .. } => source::join(),
         Kernel::Angles { .. } => source::angles(),

@@ -4,7 +4,7 @@
 use graph::{DType, DimName, Graph, NodeId, TensorType, verify};
 use interp::{Cpu, Data, Tensor, run};
 use lower::metal::{Feed, Runner};
-use lower::{cut, lower};
+use lower::{Device, cut, lower};
 use models::qwen3::{Config, program};
 use ops::testing::{gpu_available, max_abs_diff};
 
@@ -43,9 +43,9 @@ fn feed(t: &Tensor) -> Feed<'_> {
 }
 
 /// Runs entry 0 both ways; returns the largest difference.
-fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor]) -> f32 {
+fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
     let want = run(g, &mut Cpu, weights, 0, inputs).unwrap();
-    let runner = Runner::new(lower(g, 0, &SIZES).unwrap()).unwrap();
+    let runner = Runner::new(lower(g, 0, &SIZES, device).unwrap()).unwrap();
     for (at, w) in weights.iter().enumerate() {
         runner.load(at as u32, w.floats().unwrap()).unwrap();
     }
@@ -54,32 +54,42 @@ fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor]) -> f32 {
     max_abs_diff(&got[0], want[0].floats().unwrap())
 }
 
+/// One device per matmul kernel, so both get checked.
+fn devices() -> [Device; 2] {
+    let guess = Device::guess;
+    [guess().without("thin"), guess().without("matmul")]
+}
+
 #[test]
 fn each_rule_matches_cpu() {
     if !gpu_available() {
         return eprintln!("no GPU here; skipped");
     }
     let g = program(&Config::toy(4, 16));
-    let plan = lower(&g, 0, &SIZES).unwrap();
     let mut noise = Noise(7);
-    let mut seen: Vec<&[NodeId]> = Vec::new();
-    for step in &plan.steps {
-        if seen.contains(&&step.covers[..]) {
-            continue;
+    let mut checked = 0;
+    for device in devices() {
+        let plan = lower(&g, 0, &SIZES, &device).unwrap();
+        let mut seen: Vec<&[NodeId]> = Vec::new();
+        for step in &plan.steps {
+            if seen.contains(&&step.covers[..]) {
+                continue;
+            }
+            seen.push(&step.covers);
+            // The nodes one rule covered, as their own graph.
+            let sub = cut(&g, &step.covers);
+            verify(&sub).unwrap();
+            let ports = &sub.entries[0].inputs;
+            let inputs: Vec<Tensor> = ports
+                .iter()
+                .map(|p| fill(&sub, &p.ty, &mut noise))
+                .collect();
+            let off = gap(&sub, &[], &inputs, &device);
+            assert!(off < 1e-4, "{:?} is off by {off:e}", step.kernel);
         }
-        seen.push(&step.covers);
-        // The nodes one rule covered, as their own graph.
-        let sub = cut(&g, &step.covers);
-        verify(&sub).unwrap();
-        let ports = &sub.entries[0].inputs;
-        let inputs: Vec<Tensor> = ports
-            .iter()
-            .map(|p| fill(&sub, &p.ty, &mut noise))
-            .collect();
-        let off = gap(&sub, &[], &inputs);
-        assert!(off < 1e-4, "{:?} is off by {off:e}", step.kernel);
+        checked += seen.len();
     }
-    assert!(seen.len() > 20, "only {} rule uses checked", seen.len());
+    assert!(checked > 40, "only {checked} rule uses checked");
 }
 
 #[test]
@@ -96,6 +106,8 @@ fn whole_model_matches_cpu() {
         .collect();
     let ports = &g.entries[0].inputs;
     let inputs: Vec<Tensor> = ports.iter().map(|p| fill(&g, &p.ty, &mut noise)).collect();
-    let off = gap(&g, &weights, &inputs);
-    assert!(off < 1e-3, "logits are off by {off:e}");
+    for device in devices() {
+        let off = gap(&g, &weights, &inputs, &device);
+        assert!(off < 1e-3, "logits are off by {off:e}");
+    }
 }

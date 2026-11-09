@@ -1,0 +1,98 @@
+//! Orders ops so the fewest temporary elements are live.
+
+use crate::select::{Home, Selected, Val};
+
+/// What an order needs to know about each value.
+struct Lives<'a> {
+    s: &'a Selected,
+    /// Per value: ops yet to read it. Outputs stay positive.
+    readers: Vec<usize>,
+}
+
+impl<'a> Lives<'a> {
+    fn new(s: &'a Selected) -> Self {
+        let mut readers = vec![0; s.values.len()];
+        for op in &s.ops {
+            for v in distinct(&op.reads) {
+                readers[v.0 as usize] += 1;
+            }
+        }
+        for (v, _) in &s.outputs {
+            readers[v.0 as usize] += 1;
+        }
+        Self { s, readers }
+    }
+
+    fn temp(&self, v: Val) -> bool {
+        self.s.values[v.0 as usize].home == Home::Temp
+    }
+
+    /// Elements op `i` allocates, less those it lets go.
+    fn growth(&self, i: usize) -> isize {
+        let op = &self.s.ops[i];
+        let len = |v: Val| self.s.values[v.0 as usize].len as isize;
+        // An in-place kernel takes over its first input's buffer.
+        let kept = op.kernel.overwrites().then(|| op.reads[0]);
+        let dies = |v: &Val| self.temp(*v) && self.readers[v.0 as usize] == 1;
+        let freed: isize = distinct(&op.reads).filter(dies).map(len).sum();
+        let reused = kept.filter(dies).is_some();
+        if reused {
+            -freed + len(op.write)
+        } else {
+            len(op.write) - freed
+        }
+    }
+
+    fn run(&mut self, i: usize) {
+        for v in distinct(&self.s.ops[i].reads) {
+            self.readers[v.0 as usize] -= 1;
+        }
+    }
+}
+
+fn distinct(reads: &[Val]) -> impl Iterator<Item = Val> + '_ {
+    let first = |(at, v): &(usize, &Val)| !reads[..*at].contains(v);
+    reads.iter().enumerate().filter(first).map(|(_, v)| *v)
+}
+
+/// Runs the ready op that grows live memory least.
+pub fn schedule(s: &Selected) -> Vec<usize> {
+    let mut writer = vec![None; s.values.len()];
+    for (i, op) in s.ops.iter().enumerate() {
+        writer[op.write.0 as usize] = Some(i);
+    }
+    let mut done = vec![false; s.ops.len()];
+    let mut lives = Lives::new(s);
+    let mut order = Vec::with_capacity(s.ops.len());
+    while order.len() < s.ops.len() {
+        let ready = |i: &usize| {
+            let written = |v: &Val| writer[v.0 as usize].is_none_or(|w| done[w]);
+            !done[*i] && s.ops[*i].reads.iter().all(written)
+        };
+        // Ties go to the op traced first.
+        let next = (0..s.ops.len())
+            .filter(ready)
+            .min_by_key(|i| lives.growth(*i));
+        let next = next.expect("traced order is always possible");
+        lives.run(next);
+        done[next] = true;
+        order.push(next);
+    }
+    order
+}
+
+/// The most temporary elements alive at once under `order`.
+pub fn peak(s: &Selected, order: &[usize]) -> usize {
+    let mut lives = Lives::new(s);
+    let (mut live, mut most) = (0isize, 0isize);
+    for &i in order {
+        // The write exists before the reads are let go.
+        let op = &s.ops[i];
+        let growth = lives.growth(i);
+        let written = s.values[op.write.0 as usize].len as isize;
+        most = most.max(live + written.max(growth));
+        live += growth;
+        lives.run(i);
+    }
+    most as usize
+}
