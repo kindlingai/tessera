@@ -6,6 +6,12 @@ license.workspace = true
 publish.workspace = true
 description = "Lowers a graph to a plan of kernel launches"
 
+[features]
+default = []
+# The runtime loads when a plan first runs, as in gpukit.
+cuda = ["gpukit/cuda"]
+rocm = ["gpukit/rocm"]
+
 [dependencies]
 graph = { path = "../graph" }
 gpukit = { path = "../gpukit", default-features = false }

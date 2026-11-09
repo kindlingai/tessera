@@ -94,16 +94,13 @@ fn matches_reference() {
     close("gpu", &logits(&g, &c, &c.tokens, &mut k), &c);
     // SiLU and the gate multiply have no GPU kernel yet.
     assert_eq!(k.fallbacks, 2 * 28, "only the MLP's two stages fall back");
-    #[cfg(target_os = "macos")]
     plan::check(&g, &c);
 }
 
-/// The same model as a plan, wholly on Metal.
-#[cfg(target_os = "macos")]
+/// The same model as a plan, wholly on the GPU.
 mod plan {
     use super::*;
-    use lower::metal::{Feed, Runner};
-    use lower::{Device, Kernel, Plan, assign, lower, select};
+    use lower::{Device, Feed, Kernel, Plan, assign, lower, open, select};
     use std::collections::BTreeMap;
     use trace::DimName::{Context, Seqs};
 
@@ -129,7 +126,7 @@ mod plan {
         let in_order: Vec<usize> = (0..picked.ops.len()).collect();
         let traced = assign(&picked, &in_order).scratch();
         let plan = lower(g, 0, &sizes, device).unwrap();
-        let runner = Runner::new(plan.clone()).unwrap();
+        let runner = open(plan.clone()).unwrap();
         for (at, w) in c.weights.iter().enumerate() {
             runner.load(at as u32, w.floats().unwrap()).unwrap();
         }

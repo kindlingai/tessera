@@ -1,18 +1,26 @@
 //! Lowers a graph to kernel launches over device buffers.
 
+mod abi;
 mod assign;
 mod cost;
 mod cut;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub mod device;
+mod emit;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod plan;
+mod run;
 mod schedule;
 mod select;
 
+pub use abi::{Arg, Launch, Shape, Source, launches, source};
 pub use assign::assign;
 pub use cost::{Cost, Device, work};
 pub use cut::cut;
+pub use emit::{Dialect, Text};
 pub use plan::{Kernel, MapStage, Output, Plan, Slot, Step};
+pub use run::{Feed, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, THIN_ROWS, Val, Value, select};
 

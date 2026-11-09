@@ -1,10 +1,8 @@
-//! Each rule's launches against the CPU interpreter, on Metal.
-#![cfg(target_os = "macos")]
+//! Each rule's launches against the CPU interpreter, on the GPU.
 
 use graph::{DType, DimName, Graph, NodeId, TensorType, verify};
 use interp::{Cpu, Data, Tensor, run};
-use lower::metal::{Feed, Runner};
-use lower::{Device, cut, lower};
+use lower::{Device, Feed, cut, lower, open};
 use models::qwen3::{Config, program};
 use ops::testing::{gpu_available, max_abs_diff};
 
@@ -45,7 +43,7 @@ fn feed(t: &Tensor) -> Feed<'_> {
 /// Runs entry 0 both ways; returns the largest difference.
 fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
     let want = run(g, &mut Cpu, weights, 0, inputs).unwrap();
-    let runner = Runner::new(lower(g, 0, &SIZES, device).unwrap()).unwrap();
+    let runner = open(lower(g, 0, &SIZES, device).unwrap()).unwrap();
     for (at, w) in weights.iter().enumerate() {
         runner.load(at as u32, w.floats().unwrap()).unwrap();
     }
