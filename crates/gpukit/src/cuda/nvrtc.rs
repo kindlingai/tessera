@@ -1,4 +1,4 @@
-//! NVRTC bindings loaded with dlopen; NVRTC ships with the toolkit.
+//! NVRTC bindings, loaded with dlopen. NVRTC ships with the toolkit.
 
 use crate::Error;
 use crate::dl::Library;
@@ -28,7 +28,7 @@ type NvrtcGetProgramLogSize = unsafe extern "C" fn(NvrtcProgram, *mut usize) -> 
 type NvrtcGetProgramLog = unsafe extern "C" fn(NvrtcProgram, *mut c_char) -> NvrtcResult;
 type NvrtcDestroyProgram = unsafe extern "C" fn(*mut NvrtcProgram) -> NvrtcResult;
 
-/// Resolved NVRTC entry points; the dlopen handle is never closed.
+/// Resolved NVRTC entry points. The dlopen handle stays open.
 struct Nvrtc {
     create: NvrtcCreateProgram,
     compile: NvrtcCompileProgram,

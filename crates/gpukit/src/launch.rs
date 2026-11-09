@@ -146,7 +146,7 @@ pub fn launch_1d_ranged<C: Launch>(
     Ok(())
 }
 
-/// One block per row; y would cap rows at 65535.
+/// One block per row on x. Y caps at 65535.
 pub fn launch_rows<C: Launch>(
     ctx: &C,
     kernel: &C::Kernel,
@@ -159,7 +159,7 @@ pub fn launch_rows<C: Launch>(
 
 const MAX_GRID_Y: usize = 65535;
 
-/// 2D grid of blocks; put the large axis on x.
+/// 2D grid of blocks. Put the large axis on x.
 pub fn launch_grid<C: Launch>(
     ctx: &C,
     kernel: &C::Kernel,

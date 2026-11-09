@@ -1,4 +1,4 @@
-//! CUDA backend; libcuda loads at runtime, so builds need nothing.
+//! CUDA backend. libcuda and NVRTC load at runtime with dlopen.
 
 mod buffer;
 mod cached;

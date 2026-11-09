@@ -69,7 +69,7 @@ impl DeviceBuffer {
     }
 
     pub fn write_f32(&self, data: &[f32]) -> Result<(), Error> {
-        // f32 is plain data; viewing it as bytes is exact.
+        // The byte view is exact: f32 is plain data.
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
         self.write_bytes(bytes)
@@ -102,7 +102,7 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// Reusable device buffers, zeroed so stale bytes never leak.
+/// Reusable device buffers. `allocate` zeroes each one it returns.
 #[derive(Default)]
 pub struct BufferPool {
     free: Vec<DeviceBuffer>,

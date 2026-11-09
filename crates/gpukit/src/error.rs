@@ -3,11 +3,11 @@
 pub enum Error {
     /// Device, queue, buffer, or encoder creation failed.
     Gpu(&'static str),
-    /// Shader or pipeline compilation failed; carries the compiler message.
+    /// Shader or pipeline compilation failure, with the compiler message.
     Compile(String),
     /// Pipeline archive open or persistence failed.
     Cache(String),
-    /// CUDA driver, module, or launch failure; carries the driver message.
+    /// CUDA driver, module, or launch failure, with the driver message.
     Cuda(String),
     /// HIP runtime, module, or launch failure, with the runtime message.
     Rocm(String),

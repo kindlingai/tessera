@@ -57,7 +57,7 @@ type CuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUre
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
-/// Resolved driver entry points; the dlopen handle is never closed.
+/// Resolved driver entry points. The dlopen handle stays open.
 pub struct Driver {
     pub cu_init: CuInit,
     pub cu_device_get_count: CuDeviceGetCount,

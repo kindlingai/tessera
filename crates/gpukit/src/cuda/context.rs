@@ -34,7 +34,7 @@ struct Inner {
     modules: Mutex<HashMap<u64, Arc<Module>>>,
 }
 
-// The driver API is thread-safe; calls set the context first.
+// The driver API is thread-safe. Calls set the context first.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 

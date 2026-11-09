@@ -1,4 +1,4 @@
-//! GPU compute mechanism; callers supply all kernel and cache policy.
+//! GPU compute mechanism. Callers supply all kernel and cache policy.
 
 mod error;
 pub use error::Error;
