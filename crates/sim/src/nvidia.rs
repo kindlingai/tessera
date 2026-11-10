@@ -185,6 +185,18 @@ impl Chip for Nvidia {
         slowest
     }
 
+    /// Float ops at the float32 peak, bytes at stream rates.
+    fn bound(&self, l: &Load) -> f64 {
+        let s = &self.sm;
+        let rate = |bytes: &f64| match *bytes > s.cache.value {
+            true => bytes / s.read.value,
+            false => bytes / s.cached.value,
+        };
+        let moved: f64 = l.reads.iter().map(rate).sum::<f64>() + l.written / s.write.value;
+        // A multiply-add counts as two flops.
+        s.floor.value + (2.0 * l.floats() / s.fp32.value).max(moved)
+    }
+
     fn constants(&self) -> Vec<(&'static str, Const)> {
         let s = &self.sm;
         vec![

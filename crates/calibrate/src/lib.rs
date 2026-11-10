@@ -78,7 +78,8 @@ pub fn judge(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Verdict> {
     let mut by: BTreeMap<&'static str, (f64, Vec<f64>)> = BTreeMap::new();
     for (step, _) in timed {
         let same = |s: &&Step| s.kernel == step.kernel && s.write.len == step.write.len;
-        let Some(load) = step.kernel.load(step).filter(|_| !seen.iter().any(same)) else {
+        let load = step.kernel.load(step.write.len);
+        let Some(load) = load.filter(|_| !seen.iter().any(same)) else {
             continue;
         };
         seen.push(step);
@@ -102,6 +103,35 @@ pub fn judge(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Verdict> {
         }
     };
     by.into_iter().map(verdict).collect()
+}
+
+/// One kernel's timed launches against the chip's best case.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Headroom {
+    pub kernel: &'static str,
+    pub launches: usize,
+    /// Seconds the launches took, all together.
+    pub seconds: f64,
+    /// The least seconds their work needs, where a load says.
+    pub bound: Option<f64>,
+}
+
+/// Sets each kernel's time beside the least its work needs.
+pub fn headroom(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Headroom> {
+    let mut by: BTreeMap<&'static str, Headroom> = BTreeMap::new();
+    for (step, seconds) in timed {
+        let kernel = step.kernel.name();
+        let bound = step.kernel.load(step.write.len).map(|l| chip.bound(&l));
+        let h = by.entry(kernel).or_insert(Headroom {
+            kernel,
+            launches: 0,
+            seconds: 0.0,
+            bound: bound.map(|_| 0.0),
+        });
+        (h.launches, h.seconds) = (h.launches + 1, h.seconds + seconds);
+        h.bound = h.bound.zip(bound).map(|(sum, b)| sum + b);
+    }
+    by.into_values().collect()
 }
 
 /// Where this machine keeps the samples for `device`.

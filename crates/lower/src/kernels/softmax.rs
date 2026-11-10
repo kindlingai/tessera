@@ -39,7 +39,7 @@ impl Kernel for Softmax {
     }
 
     /// Finds each row's maximum, then takes two exponentials.
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let (float, special, loads) = (3.0, 3.0, 3.0);
         let trip = Ops {
             float,

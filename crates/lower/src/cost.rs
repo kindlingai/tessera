@@ -3,6 +3,7 @@
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use serde::{Deserialize, Serialize};
+use sim::{Chip, Fit, Pool};
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
@@ -64,6 +65,11 @@ impl Sample {
 pub struct Device {
     /// The hardware that ran the samples.
     pub name: String,
+    /// The chip's constants, as probes fitted them.
+    pub fit: Option<Fit>,
+    /// The model those constants make.
+    #[serde(skip)]
+    pool: Option<Pool>,
     timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
@@ -83,6 +89,12 @@ impl Device {
     /// No samples: each kernel's own guess decides.
     pub fn guess() -> Self {
         Self::default()
+    }
+
+    /// The same device, with a chip model for unmeasured kernels.
+    pub fn fitted(mut self, fit: Fit) -> Self {
+        (self.fit, self.pool) = (Some(fit), Some(fit.pool("fitted")));
+        self
     }
 
     /// The same device, never choosing `kernel`.
@@ -109,7 +121,14 @@ impl Device {
         let work = k.work(len);
         let timed = self.timed.get(k.name());
         let near = timed.and_then(|t| estimate(t, &place(&k.sizes(), work), work));
-        near.unwrap_or(FIXED + k.guess() * work)
+        // With no sample of this kernel, the chip model speaks.
+        let modelled = || Some(self.pool.as_ref()?.estimate(&k.load(len)?).seconds);
+        near.or_else(modelled).unwrap_or(FIXED + k.guess() * work)
+    }
+
+    /// The least seconds the chip needs for this launch's work.
+    pub fn bound(&self, k: &dyn Kernel, len: usize) -> Option<f64> {
+        Some(self.pool.as_ref()?.bound(&k.load(len)?))
     }
 
     /// The plan's estimated use of each resource.
@@ -175,6 +194,7 @@ impl Device {
         for s in device.timed.values_mut().flatten() {
             s.at = place(&s.sizes, s.work);
         }
+        device.pool = device.fit.map(|fit| fit.pool("fitted"));
         Ok(device)
     }
 }

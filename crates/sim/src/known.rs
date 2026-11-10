@@ -1,45 +1,8 @@
 //! Tables for the machines these models were fitted on.
 
-use crate::{Chip, Const, Pool, gb10};
+use crate::{Chip, Fit, Pool, gb10};
 
-/// What `tessera-calibrate` fitted on one machine.
-struct Fit {
-    floor: f64,
-    spawn: f64,
-    step: f64,
-    curve: f64,
-    rate: f64,
-    wait: f64,
-    near: f64,
-    cached: f64,
-    read: f64,
-    scan: f64,
-    write: f64,
-}
-
-impl Fit {
-    /// Pairs each value with its probe.
-    fn pool(&self, name: &str, step: &'static str) -> Pool {
-        let m = Const::measured;
-        Pool {
-            name: name.into(),
-            floor: m(self.floor, "256 threads that do nothing"),
-            spawn: m(self.spawn, "65,536 idle threads against 256"),
-            step: m(self.step, step),
-            curve: m(self.curve, "an exponential loop in 256 threads"),
-            rate: m(self.rate, "the multiply-add loop at its best thread count"),
-            wait: m(self.wait, "256 threads, each load on a new line of 512 MB"),
-            near: m(self.near, "256 threads, each along its own 16 KB"),
-            cache: Const::inferred(4e6, "4 MB read at cache speed; larger sizes unprobed"),
-            cached: m(self.cached, "4 MB read again at the best thread count"),
-            read: m(self.read, "512 MB read at the best thread count"),
-            scan: m(self.scan, "512 MB read in separate stretches"),
-            write: m(self.write, "256 MB written at the best thread count"),
-        }
-    }
-}
-
-/// The GPU of an Apple M3 Pro, through Metal.
+/// An Apple M3 Pro, through Metal. Its step varies twofold.
 pub fn m3_pro() -> Pool {
     let fit = Fit {
         floor: 3e-6,
@@ -49,13 +12,13 @@ pub fn m3_pro() -> Pool {
         rate: 3.8e11,
         wait: 3.1e-7,
         near: 6.5e-8,
+        cache: 4e6,
         cached: 2.54e11,
         read: 1.28e11,
         scan: 8.5e10,
         write: 1.15e11,
     };
-    let step = "a multiply-add loop in 256 threads; 14 to 32 ns between runs";
-    fit.pool("metal Apple M3 Pro", step)
+    fit.pool("metal Apple M3 Pro")
 }
 
 /// The Radeon 8060S of a Ryzen AI Max, through ROCm.
@@ -68,12 +31,13 @@ pub fn strix_halo() -> Pool {
         rate: 2.0e12,
         wait: 3.35e-7,
         near: 4.3e-8,
+        cache: 4e6,
         cached: 3.24e11,
         read: 2.23e11,
         scan: 1.19e11,
         write: 2.04e11,
     };
-    fit.pool("rocm Radeon 8060S", "a multiply-add loop in 256 threads")
+    fit.pool("rocm Radeon 8060S")
 }
 
 /// The table for a runner's device name. ROCm names none.

@@ -1,6 +1,6 @@
 //! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
 
-use calibrate::{measure, path, stored};
+use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
 use interp::{Cpu, Data, Tensor, bind, run};
 use lower::{Device, Feed, Plan, Run, lower, open, select};
@@ -155,6 +155,28 @@ fn table(plan: &Plan, steps: &[f64]) {
     }
 }
 
+/// Each kernel's time over the least its work needs.
+fn room(device: &Device, plan: &Plan, steps: &[f64]) {
+    let Some(fit) = device.fit else {
+        return eprintln!("  no chip was fitted; run tessera-calibrate for headroom");
+    };
+    let timed: Vec<_> = plan
+        .steps
+        .iter()
+        .cloned()
+        .zip(steps.iter().copied())
+        .collect();
+    let all: f64 = steps.iter().sum();
+    for h in headroom(&fit.pool("fitted"), &timed) {
+        let Some(bound) = h.bound else { continue };
+        let (share, over) = (100.0 * h.seconds / all, h.seconds / bound);
+        eprintln!(
+            "  {:8} {share:4.1}% of the time, {over:.1}x its best case",
+            h.kernel
+        );
+    }
+}
+
 impl<'a> Gpu<'a> {
     fn open(g: &Graph, c: &'a Case) -> Self {
         let first = prompt(&c.tokens);
@@ -264,6 +286,7 @@ mod forward {
         let (moved, scratch) = (cost.bytes as f64 / 1e9, r.plan.scratch() as f64 * 4.0 / 1e6);
         eprintln!("  moves {moved:.2} GB; scratch {scratch:.1} MB");
         table(&r.plan, &r.steps);
+        room(device, &r.plan, &r.steps);
         let ratio = estimate / timed;
         assert!(
             (0.5..2.0).contains(&ratio),
@@ -415,6 +438,7 @@ mod decode {
         let timed = steps.iter().sum::<f64>() * 1e3;
         eprintln!("  last token: estimated {estimate:.2} ms, timed {timed:.2} ms");
         table(&last, &steps);
+        room(&device, &last, &steps);
         let vocab = c.want.len() / c.tokens.len();
         for (row, id) in c.want.chunks(vocab).zip(&planned.prompt) {
             likeliest("prefill", row, *id);

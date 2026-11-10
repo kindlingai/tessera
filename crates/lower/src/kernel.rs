@@ -30,8 +30,8 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn order(&self) -> Order {
         Order::Fixed
     }
-    /// The work and traffic of `step`, for a chip model.
-    fn load(&self, _: &Step) -> Option<Load> {
+    /// Its work and traffic when writing `len` elements.
+    fn load(&self, _: usize) -> Option<Load> {
         None
     }
     /// Whether it writes over its first input.

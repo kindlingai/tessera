@@ -3,7 +3,7 @@
 use lower::{
     Arg, Error, Feed, Kernel, KernelRef, Launch, Plan, Run, Shape, Slot, Source, Step, Text, open,
 };
-use sim::{Const, Pool};
+use sim::Fit;
 
 /// The work a probe's threads repeat `trips` times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,8 +232,8 @@ impl Reading {
     }
 }
 
-/// A thread-pool model of this device, from `suite`'s readings.
-pub fn fit(name: String, readings: &[Reading]) -> Pool {
+/// This device's constants, from `suite`'s readings.
+pub fn fit(readings: &[Reading]) -> Fit {
     let of = |kind: Kind, threads: usize, bytes: usize| {
         let same = |r: &&Reading| {
             let p = r.probe;
@@ -265,39 +265,20 @@ pub fn fit(name: String, readings: &[Reading]) -> Pool {
     let wait = of(Kind::Read { depth: 1 }, 256, LARGE).per_trip();
     let near = (of(Kind::Scan, 256, SMALL).per_trip() - step).max(0.0);
     let curve = (of(Kind::Curve, 256, 0).seconds - floor) / 4096.0;
-    let m = Const::measured;
-    Pool {
-        name,
-        floor: m(floor, "256 threads that do nothing"),
-        spawn: m(spawn, "65,536 idle threads against 256"),
-        step: m(step, "a multiply-add loop in 256 threads"),
-        curve: m(curve, "an exponential loop in 256 threads"),
-        rate: m(
-            fastest(&|r| r.probe.kind == Kind::Spin, &trips),
-            "the multiply-add loop at its best thread count",
-        ),
-        wait: m(wait, "256 threads, each load on a new line of 512 MB"),
-        near: m(near, "256 threads, each along its own 16 KB"),
-        cache: Const::inferred(
-            SMALL as f64,
-            "4 MB read at cache speed; larger sizes unprobed",
-        ),
-        cached: m(
-            fastest(&|r| (reads(r) || scans(r)) && r.bytes() == SMALL, &bytes),
-            "4 MB read again at the best thread count",
-        ),
-        read: m(
-            fastest(&|r| reads(r) && r.bytes() == LARGE, &bytes),
-            "512 MB read at the best thread count",
-        ),
-        scan: m(
-            fastest(&|r| scans(r) && r.bytes() == LARGE, &bytes),
-            "512 MB read in separate stretches, best thread count",
-        ),
-        write: m(
-            fastest(&|r| r.probe.kind == Kind::Write, &bytes),
-            "256 MB written at the best thread count",
-        ),
+    Fit {
+        floor,
+        spawn,
+        step,
+        curve,
+        rate: fastest(&|r| r.probe.kind == Kind::Spin, &trips),
+        wait,
+        near,
+        // The small buffer is the one known to stay cached.
+        cache: SMALL as f64,
+        cached: fastest(&|r| (reads(r) || scans(r)) && r.bytes() == SMALL, &bytes),
+        read: fastest(&|r| reads(r) && r.bytes() == LARGE, &bytes),
+        scan: fastest(&|r| scans(r) && r.bytes() == LARGE, &bytes),
+        write: fastest(&|r| r.probe.kind == Kind::Write, &bytes),
     }
 }
 

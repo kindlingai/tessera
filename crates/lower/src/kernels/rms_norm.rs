@@ -38,7 +38,7 @@ impl Kernel for RmsNorm {
     }
 
     /// Sums each row, then scales it.
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let trip = Ops {
             float: 3.0,
             loads: 3.0,

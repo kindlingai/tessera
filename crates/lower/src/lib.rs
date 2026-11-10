@@ -28,7 +28,7 @@ pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Feed, Held, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
-pub use sim::{Load, Ops};
+pub use sim::{Fit, Load, Ops};
 
 use graph::{DimName, Graph};
 

@@ -1,7 +1,7 @@
 //! Probes this GPU, times the grid and stores the samples.
 
 use calibrate::probe::{fit, read, suite};
-use calibrate::{Grid, judge, path};
+use calibrate::{Grid, headroom, judge, path};
 use lower::{Device, Step};
 use sim::{Chip, known};
 use std::error::Error;
@@ -20,6 +20,19 @@ fn report(chip: &dyn Chip, timed: &[(Step, f64)]) {
     }
 }
 
+/// Prints, per kernel, the time above the chip's best case.
+fn room(chip: &dyn Chip, timed: &[(Step, f64)]) {
+    println!("headroom, timed over the least the work needs:");
+    let all: f64 = timed.iter().map(|(_, seconds)| seconds).sum();
+    for h in headroom(chip, timed) {
+        let share = 100.0 * h.seconds / all;
+        let over = h.bound.map_or("no load stated".into(), |b| {
+            format!("{:.1}x", h.seconds / b)
+        });
+        println!("  {:9} {share:5.1}% of the time  {over}", h.kernel);
+    }
+}
+
 /// Probes the chip, times the grid, restarts the stored file.
 fn run() -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
@@ -32,7 +45,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "{}: timed {launches} launches in {seconds:.0} s",
         device.name
     );
-    let pool = fit(format!("{}, probed", device.name), &readings);
+    let fit = fit(&readings);
+    let pool = fit.pool(&format!("{}, probed", device.name));
     for (name, c) in pool.constants() {
         println!("  {name:7} {:10.4e}  {}", c.value, c.note);
     }
@@ -40,6 +54,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(table) = known(&device.name) {
         report(&*table, &timed);
     }
+    room(&pool, &timed);
+    // The stored device carries the fit, for unmeasured kernels.
+    let device = device.fitted(fit);
     let path = path(&device.name);
     device.save(&path)?;
     println!("{} samples in {}", device.samples(), path.display());

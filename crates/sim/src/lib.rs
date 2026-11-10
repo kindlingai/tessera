@@ -6,7 +6,7 @@ mod pool;
 
 pub use known::{known, m3_pro, strix_halo};
 pub use nvidia::{Nvidia, Sm, gb10};
-pub use pool::Pool;
+pub use pool::{Fit, Pool};
 
 /// Where a constant's value comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +76,11 @@ pub struct Load {
 }
 
 impl Load {
+    /// Float ops every thread together runs.
+    pub fn floats(&self) -> f64 {
+        self.threads as f64 * self.trips * self.trip.float
+    }
+
     /// Bytes all loads bring. Shared buffers count per load.
     pub fn loaded(&self) -> f64 {
         self.threads as f64 * self.trips * self.trip.loads * WORD
@@ -133,6 +138,8 @@ impl Estimate {
 pub trait Chip {
     fn name(&self) -> &str;
     fn estimate(&self, load: &Load) -> Estimate;
+    /// The least seconds any kernel needs for the same work.
+    fn bound(&self, load: &Load) -> f64;
     /// Every constant the model reads, by name.
     fn constants(&self) -> Vec<(&'static str, Const)>;
 }

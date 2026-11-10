@@ -1,5 +1,5 @@
 use crate::probe::{Kind, Probe, Reading, fit, suite};
-use crate::{Grid, judge, path};
+use crate::{Grid, headroom, judge, path};
 use lower::{Device, rules};
 use ops::testing::gpu_available;
 use sim::Chip;
@@ -51,14 +51,14 @@ fn fake(probe: Probe) -> Reading {
 #[test]
 fn probes_fit_pools() {
     let readings: Vec<Reading> = suite().into_iter().map(fake).collect();
-    let pool = fit("a made-up chip".into(), &readings);
+    let fit = fit(&readings);
     let near = |got: f64, want: f64| (got / want - 1.0).abs() < 0.02;
-    assert!(near(pool.floor.value, 2e-6) && near(pool.step.value, 10e-9));
-    assert!(near(pool.curve.value, 30e-9) && near(pool.rate.value, 1e12));
-    assert!(near(pool.wait.value, 300e-9) && near(pool.near.value, 40e-9));
-    assert!(near(pool.read.value, 100e9) && near(pool.scan.value, 80e9));
-    assert!(near(pool.write.value, 90e9), "{:?}", pool.write);
-    assert_eq!(pool.constants().len(), 12);
+    assert!(near(fit.floor, 2e-6) && near(fit.step, 10e-9));
+    assert!(near(fit.curve, 30e-9) && near(fit.rate, 1e12));
+    assert!(near(fit.wait, 300e-9) && near(fit.near, 40e-9));
+    assert!(near(fit.read, 100e9) && near(fit.scan, 80e9));
+    assert!(near(fit.write, 90e9), "{fit:?}");
+    assert_eq!(fit.pool("a made-up chip").constants().len(), 12);
 }
 
 #[test]
@@ -76,5 +76,9 @@ fn judge_skips_unmodelled_kernels() {
     for v in verdicts {
         let [low, median, high] = v.ratio;
         assert!(0.0 < low && low <= median && median <= high, "{v:?}");
+    }
+    // A kernel has a bound when it states a load.
+    for h in headroom(&sim::m3_pro(), &timed) {
+        assert_eq!(h.bound.is_some(), names.contains(&h.kernel), "{h:?}");
     }
 }
