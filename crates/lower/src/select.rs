@@ -1,13 +1,12 @@
-//! Picks kernels for graph nodes, as ops over values.
+//! Picks kernels by covering each tree, as ops over values.
 
 use crate::Error;
 use crate::cost::Device;
 use crate::kernel::KernelRef;
-use crate::kernels::{Append, MapStage};
-use crate::rule::{Attn, Draft, Read, Rule, Site, rules};
-use graph::{
-    Attend, DimExpr, DimName, Graph, Mask, NodeId, Op as Node, Select, Shape, Stage, View,
-};
+use crate::kernels::Append;
+use crate::rule::{Draft, Read, Rule, rules};
+use crate::tree::{T, Term, Tree, unsupported};
+use graph::{DimExpr, DimName, Graph, NodeId};
 use std::collections::{BTreeSet, HashMap};
 
 /// A value some op writes, or the plan is given.
@@ -55,274 +54,160 @@ pub struct Selected {
     pub contested: BTreeSet<&'static str>,
 }
 
-/// Elementwise stages waiting for the node they fuse into.
-struct Chain {
-    source: usize,
-    stages: Vec<MapStage>,
-    operands: Vec<usize>,
-    covers: Vec<NodeId>,
+/// The cheapest cover found at one node.
+struct Choice {
+    rule: &'static str,
+    drafts: Vec<Draft>,
+    /// Seconds for the drafts and for all they read.
+    cost: f64,
+    /// Every rule that proposed here.
+    offered: Vec<&'static str>,
 }
 
-struct Picker<'a> {
-    g: &'a Graph,
-    sizes: &'a [(DimName, u64)],
+/// A cover's reads of tree nodes.
+fn reads(drafts: &[Draft]) -> Vec<T> {
+    let node = |r: &Read| match r {
+        Read::Node(t) => Some(*t),
+        Read::Draft(_) => None,
+    };
+    drafts
+        .iter()
+        .flat_map(|d| d.reads.iter().filter_map(node))
+        .collect()
+}
+
+struct Cover<'a> {
+    tree: &'a Tree<'a>,
     device: &'a Device,
     rules: Vec<&'static Rule>,
+    /// Per solved node: its choice, if a rule covers it.
+    best: Vec<Option<Option<Choice>>>,
+}
+
+impl Cover<'_> {
+    /// Seconds to have `t` in a buffer, within one tree.
+    fn need(&mut self, t: T) -> Option<f64> {
+        // Another tree's root is paid for there.
+        match self.tree.root(t) {
+            true => Some(0.0),
+            false => self.solve(t),
+        }
+    }
+
+    /// Remembers the cheapest cover of `t`'s subtree.
+    fn solve(&mut self, t: T) -> Option<f64> {
+        if self.best[t.0 as usize].is_none() {
+            let choice = self.choose(t);
+            self.best[t.0 as usize] = Some(choice);
+        }
+        let solved = self.best[t.0 as usize].as_ref()?;
+        solved.as_ref().map(|c| c.cost)
+    }
+
+    /// Asks every rule, and keeps the cheapest proposal.
+    fn choose(&mut self, t: T) -> Option<Choice> {
+        let n = self.tree.node(t);
+        // A view or kept rows only pass their argument on.
+        if matches!(n.term, Term::View | Term::Append(_)) {
+            let cost = self.need(n.args[0])?;
+            return Some(Choice {
+                rule: "append",
+                drafts: Vec::new(),
+                cost,
+                offered: Vec::new(),
+            });
+        }
+        let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
+        for rule in self.rules.clone() {
+            let Some(drafts) = (rule.propose)(self.tree, t) else {
+                continue;
+            };
+            offered.push(rule.name);
+            let seconds = |d: &Draft| self.device.seconds(&*d.kernel, d.len);
+            let mut cost: f64 = drafts.iter().map(seconds).sum();
+            let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r)).sum();
+            let Some(below) = below else {
+                continue;
+            };
+            cost += below;
+            // A favored rule wins here. Readers see its true cost.
+            let favored = self.device.favors(rule.name);
+            let beaten = |b: &Choice| match self.device.favors(b.rule) {
+                true => false,
+                false => favored || cost < b.cost,
+            };
+            if best.as_ref().is_none_or(beaten) {
+                best = Some(Choice {
+                    rule: rule.name,
+                    drafts,
+                    cost,
+                    offered: Vec::new(),
+                });
+            }
+        }
+        best.map(|b| Choice { offered, ..b })
+    }
+
+    /// The reads of the chosen cover at `t`.
+    fn below(&self, t: T) -> Vec<T> {
+        let n = self.tree.node(t);
+        match &self.best[t.0 as usize] {
+            Some(Some(c)) if c.drafts.is_empty() => vec![n.args[0]],
+            Some(Some(c)) => reads(&c.drafts),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The ops written, and the values they use.
+#[derive(Default)]
+struct Emit {
     out: Selected,
-    /// Each lowered node's value and shape.
-    vals: Vec<Option<(Val, Vec<usize>)>>,
-    chains: HashMap<usize, Chain>,
-    /// Per node: the node its work is emitted with.
-    sink: Vec<usize>,
     /// Results that later equal launches may reuse.
     shared: HashMap<(String, Vec<Val>), Val>,
 }
 
-fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
-    Err(Error::Unsupported(format!("{what:?}")))
-}
-
-fn map_stage(s: &Stage) -> Option<MapStage> {
-    match s {
-        Stage::Add => Some(MapStage::Add),
-        Stage::Mul => Some(MapStage::Mul),
-        Stage::Scale(by) => Some(MapStage::Scale(*by)),
-        Stage::Act(a) => Some(MapStage::Act(*a)),
-        _ => None,
-    }
-}
-
-/// Whether one elementwise kernel can run this whole op.
-fn maps(op: &Node) -> bool {
-    matches!(op, Node::Row(r) if r.0.iter().all(|s| map_stage(s).is_some()))
-}
-
-/// Which nodes the outputs depend on.
-fn needed(g: &Graph, outputs: &[usize]) -> Vec<bool> {
-    let mut needed = vec![false; g.nodes.len()];
-    for &o in outputs {
-        needed[o] = true;
-    }
-    for i in (0..g.nodes.len()).rev() {
-        if needed[i] {
-            for a in &g.nodes[i].args {
-                needed[a.0 as usize] = true;
-            }
-        }
-    }
-    needed
-}
-
-/// A map read once, as another map's row, joins it.
-fn sinks(g: &Graph, needed: &[bool], outputs: &[usize]) -> Vec<usize> {
-    let mut readers = vec![Vec::new(); g.nodes.len()];
-    for (j, n) in g.nodes.iter().enumerate().filter(|(j, _)| needed[*j]) {
-        for a in &n.args {
-            readers[a.0 as usize].push(j);
-        }
-    }
-    let mut sink: Vec<usize> = (0..g.nodes.len()).collect();
-    for i in (0..g.nodes.len()).rev() {
-        let alone = needed[i] && !outputs.contains(&i) && maps(&g.nodes[i].op);
-        if let (true, [j]) = (alone, &readers[i][..]) {
-            let reader = &g.nodes[*j];
-            if maps(&reader.op) && reader.args[0].0 as usize == i {
-                sink[i] = sink[*j];
-            }
-        }
-    }
-    sink
-}
-
-/// Chooses kernels for `entry`, sized by `sizes`, costed by `device`.
-pub fn select(
-    g: &Graph,
-    entry: usize,
-    sizes: &[(DimName, u64)],
-    device: &Device,
-) -> Result<Selected, Error> {
-    let Some(e) = g.entries.get(entry) else {
-        return unsupported(format_args!("entry {entry}"));
-    };
-    let outputs: Vec<usize> = e.outputs.iter().map(|o| o.node.0 as usize).collect();
-    let needed = needed(g, &outputs);
-    let mut p = Picker {
-        g,
-        sizes,
-        device,
-        rules: rules(),
-        out: Selected::default(),
-        vals: vec![None; g.nodes.len()],
-        chains: HashMap::new(),
-        sink: sinks(g, &needed, &outputs),
-        shared: HashMap::new(),
-    };
-    for (port, decl) in e.inputs.iter().enumerate() {
-        let len = p.shape(&decl.ty.shape)?.iter().product();
-        let val = p.value(len, Home::Input(port as u32));
-        p.out.inputs.push(val);
-    }
-    for i in (0..g.nodes.len()).filter(|i| needed[*i]) {
-        p.node(i, entry)?;
-    }
-    for o in outputs {
-        let out = p.val(o)?;
-        p.out.outputs.push(out);
-    }
-    Ok(p.out)
-}
-
-impl Picker<'_> {
-    fn shape(&self, s: &Shape) -> Result<Vec<usize>, Error> {
-        let size = |name| {
-            let bound = self.sizes.iter().find(|(n, _)| *n == name);
-            bound.map(|(_, size)| *size)
-        };
-        let dim = |e: &graph::DimExpr| {
-            let poly = e.poly(&self.g.dims).ok()?;
-            Some(poly.eval(&size)? as usize)
-        };
-        let sized: Option<Vec<usize>> = s.0.iter().map(dim).collect();
-        sized.ok_or_else(|| Error::Size(s.to_string()))
-    }
-
-    fn val(&self, node: usize) -> Result<(Val, Vec<usize>), Error> {
-        let missing = || Error::Unsupported(format!("node {node} as an argument"));
-        self.vals[node].clone().ok_or_else(missing)
+impl Emit {
+    fn value(&mut self, len: usize, home: Home) -> Val {
+        self.out.values.push(Value { len, home });
+        Val(self.out.values.len() as u32 - 1)
     }
 
     fn len(&self, v: Val) -> usize {
         self.out.values[v.0 as usize].len
     }
 
-    fn value(&mut self, len: usize, home: Home) -> Val {
-        self.out.values.push(Value { len, home });
-        Val(self.out.values.len() as u32 - 1)
-    }
-
-    /// Asks every rule, then emits the cheapest proposal.
-    fn choose(&mut self, site: Site, covers: &[NodeId]) -> Result<Val, Error> {
-        let mut best: Option<(f64, &'static str, Vec<Draft>)> = None;
-        let mut offered = Vec::new();
-        for rule in &self.rules {
-            let Some(drafts) = (rule.propose)(&site) else {
-                continue;
-            };
-            let seconds = |d: &Draft| self.device.seconds(&*d.kernel, d.len);
-            let mut cost: f64 = drafts.iter().map(seconds).sum();
-            // A favored rule wins wherever it applies.
-            if self.device.favors(rule.name) {
-                cost = f64::NEG_INFINITY;
-            }
-            offered.push(rule.name);
-            if best.as_ref().is_none_or(|(least, ..)| cost < *least) {
-                best = Some((cost, rule.name, drafts));
-            }
-        }
-        if offered.len() > 1 {
-            self.out.contested.extend(offered);
-        }
-        let Some((_, rule, drafts)) = best else {
-            return unsupported(site);
-        };
-        let mut made: Vec<Val> = Vec::with_capacity(drafts.len());
-        for d in drafts {
-            let read = |r: &Read| match r {
-                Read::Value(v) => *v,
-                Read::Draft(at) => made[*at],
-            };
-            let reads: Vec<Val> = d.reads.iter().map(read).collect();
-            made.push(self.emit(d.kernel, rule, reads, d.len, covers));
-        }
-        Ok(*made.last().expect("a rule proposes at least one launch"))
-    }
-
     /// Adds an op writing a new value, or shares one.
-    fn emit(
-        &mut self,
-        kernel: KernelRef,
-        rule: &'static str,
-        reads: Vec<Val>,
-        len: usize,
-        covers: &[NodeId],
-    ) -> Val {
-        let key = (format!("{kernel:?}"), reads.clone());
-        if let Some(same) = self.shared.get(&key).filter(|_| kernel.shared()) {
+    fn op(&mut self, d: Draft, rule: &'static str, reads: Vec<Val>, covers: &[NodeId]) -> Val {
+        let key = (format!("{:?}", d.kernel), reads.clone());
+        if let Some(same) = self.shared.get(&key).filter(|_| d.kernel.shared()) {
             return *same;
         }
-        let write = self.value(len, Home::Temp);
-        if kernel.shared() {
+        let write = self.value(d.len, Home::Temp);
+        if d.kernel.shared() {
             self.shared.insert(key, write);
         }
-        let covers = covers.to_vec();
         self.out.ops.push(Op {
-            kernel,
+            kernel: d.kernel,
             rule,
             reads,
             write,
-            covers,
+            covers: covers.to_vec(),
         });
         write
     }
 
-    fn node(&mut self, i: usize, entry: usize) -> Result<(), Error> {
-        let n = &self.g.nodes[i];
-        let shape = self.shape(&n.ty.shape)?;
-        let len = shape.iter().product();
-        let covers = [NodeId(i as u32)];
-        let arg = |k: usize| n.args[k].0 as usize;
-        let val = match &n.op {
-            Node::Input { entry: e, port } if *e as usize == entry => {
-                self.out.inputs[*port as usize]
-            }
-            Node::Weight(w) => self.value(len, Home::Weight(*w)),
-            // A reshape is the same value under a new shape.
-            Node::View(View::Reshape(_)) => self.val(arg(0))?.0,
-            Node::Matmul => {
-                let ((x, _), (w, wide)) = (self.val(arg(0))?, self.val(arg(1))?);
-                let [n, k] = wide[..] else {
-                    return unsupported("a batched matmul");
-                };
-                let m = self.len(x) / k;
-                self.choose(Site::Matmul { x, w, m, n, k }, &covers)?
-            }
-            Node::Row(r) if maps(&n.op) => return self.map(i, &r.0),
-            Node::Row(r) => self.row(i, &r.0)?,
-            Node::Attend(a) => self.attend(i, a)?,
-            Node::Select(Select::Gather) => {
-                let ((table, wide), (ids, _)) = (self.val(arg(0))?, self.val(arg(1))?);
-                let site = Site::Gather {
-                    table,
-                    ids,
-                    rows: self.len(ids),
-                    width: self.len(table) / wide[0],
-                };
-                self.choose(site, &covers)?
-            }
-            Node::Select(Select::TopK { .. }) => {
-                let (x, wide) = self.val(arg(0))?;
-                let width = *wide.last().expect("verified rank");
-                let (rows, k) = (self.len(x) / width, len * width / self.len(x));
-                self.choose(Site::Top { x, rows, width, k }, &covers)?
-            }
-            Node::Append(kept) => self.append(i, *kept, &shape)?,
-            other => return unsupported(other),
-        };
-        self.vals[i] = Some((val, shape));
-        Ok(())
-    }
-
-    /// Copies node `i`'s new rows in after those already kept.
-    fn append(&mut self, i: usize, index: u32, all: &[usize]) -> Result<Val, Error> {
-        let (rows, _) = self.val(self.g.nodes[i].args[0].0 as usize)?;
-        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
+    /// Copies new rows in after those already kept.
+    fn append(&mut self, tree: &Tree, t: T, index: u32, rows: Val) -> Result<Val, Error> {
+        let (n, all) = (tree.node(t), &tree.node(t).shape);
+        let DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
             return unsupported("kept rows along a computed axis");
         };
         // Sequences would move as their rows grow.
         if all[0] != 1 {
             return unsupported("kept rows for several sequences");
         }
-        let most = self.g.dims.iter().find(|d| d.name == *axis);
+        let most = tree.g.dims.iter().find(|d| d.name == *axis);
         let most = most.map_or(0, |d| d.size.max() as usize);
         let len: usize = all.iter().product();
         let room = most * (len / all[1]);
@@ -333,105 +218,82 @@ impl Picker<'_> {
             rule: "append",
             reads: vec![rows],
             write,
-            covers: vec![NodeId(i as u32)],
+            covers: vec![n.from],
         });
         Ok(write)
     }
+}
 
-    /// Extends the chain its first argument left, or starts one.
-    fn map(&mut self, i: usize, stages: &[Stage]) -> Result<(), Error> {
-        let n = &self.g.nodes[i];
-        let first = n.args[0].0 as usize;
-        let mut chain = self.chains.remove(&first).unwrap_or(Chain {
-            source: first,
-            stages: Vec::new(),
-            operands: Vec::new(),
-            covers: Vec::new(),
-        });
-        chain.stages.extend(stages.iter().filter_map(map_stage));
-        chain
-            .operands
-            .extend(n.args[1..].iter().map(|a| a.0 as usize));
-        chain.covers.push(NodeId(i as u32));
-        if self.sink[i] != i {
-            self.chains.insert(i, chain);
-            return Ok(());
+/// Chooses kernels for `entry`, sized by `sizes`, costed by `device`.
+pub fn select(
+    g: &Graph,
+    entry: usize,
+    sizes: &[(DimName, u64)],
+    device: &Device,
+) -> Result<Selected, Error> {
+    let tree = Tree::new(g, entry, sizes)?;
+    let nodes = (0..tree.len() as u32).map(T);
+    let mut cover = Cover {
+        tree: &tree,
+        device,
+        rules: rules(),
+        best: (0..tree.len()).map(|_| None).collect(),
+    };
+    // Roots get buffers. So does whatever a chosen cover reads.
+    let mut own = vec![false; tree.len()];
+    for t in nodes.clone().rev().filter(|t| !tree.leaf(*t)) {
+        if !(tree.root(t) || own[t.0 as usize]) {
+            continue;
         }
-        let (x, shape) = self.val(chain.source)?;
-        let mut reads = vec![x];
-        for o in &chain.operands {
-            let operand = self.val(*o)?.0;
-            if self.len(operand) != self.len(x) {
-                return unsupported("a broadcast operand");
-            }
-            reads.push(operand);
+        own[t.0 as usize] = true;
+        if cover.solve(t).is_none() {
+            return unsupported(&tree.node(t).term);
         }
-        let site = Site::Map {
-            stages: &chain.stages,
-            reads: &reads,
-            len: self.len(x),
-        };
-        let val = self.choose(site, &chain.covers)?;
-        self.vals[i] = Some((val, shape));
-        Ok(())
+        for r in cover.below(t) {
+            own[r.0 as usize] = true;
+        }
     }
-
-    /// A row holding a norm or rotation, stage by stage.
-    fn row(&mut self, i: usize, stages: &[Stage]) -> Result<Val, Error> {
-        let n = &self.g.nodes[i];
-        let covers = [NodeId(i as u32)];
-        let (mut cur, shape) = self.val(n.args[0].0 as usize)?;
-        let width = *shape.last().expect("verified rank");
-        let len = self.len(cur);
-        let mut rest = n.args[1..].iter().map(|a| a.0 as usize);
-        for stage in stages {
-            // One rank holds the whole sum already.
-            if *stage == Stage::AllReduce {
-                continue;
-            }
-            let mut operand = None;
-            if stage.operands() == 1 {
-                let val = self.val(rest.next().expect("verified"))?.0;
-                operand = Some((val, self.len(val)));
-            }
-            let site = Site::Stage {
-                stage,
-                x: cur,
-                operand,
-                len,
-                width,
-            };
-            cur = self.choose(site, &covers)?;
-        }
-        Ok(cur)
+    let mut e = Emit::default();
+    for len in &tree.ports {
+        let port = e.out.inputs.len() as u32;
+        let val = e.value(*len, Home::Input(port));
+        e.out.inputs.push(val);
     }
-
-    fn attend(&mut self, i: usize, a: &Attend) -> Result<Val, Error> {
-        let n = &self.g.nodes[i];
-        if a.picked || a.mask != Mask::Causal {
-            return unsupported(a);
-        }
-        let arg = |k: usize| self.val(n.args[k].0 as usize);
-        let ((q, wide), (k, deep), (v, _)) = (arg(0)?, arg(1)?, arg(2)?);
-        let (&[seqs, queries, heads, width], &[_, keys, kv_heads, _]) = (&wide[..], &deep[..])
-        else {
-            return unsupported("attention below rank 4");
+    // In traced order, so equal graphs give equal plans.
+    let mut vals: Vec<Option<Val>> = vec![None; tree.len()];
+    for t in nodes {
+        let n = tree.node(t);
+        let val = |a: T| vals[a.0 as usize].expect("arguments come first");
+        let made = match &n.term {
+            Term::Leaf(Home::Input(port)) => e.out.inputs[*port as usize],
+            Term::Leaf(home) => e.value(tree.elements(t), *home),
+            _ if !own[t.0 as usize] => continue,
+            Term::View => val(n.args[0]),
+            Term::Append(index) => e.append(&tree, t, *index, val(n.args[0]))?,
+            _ => {
+                let choice = cover.best[t.0 as usize].take().flatten();
+                let choice = choice.expect("solved above");
+                if choice.offered.len() > 1 {
+                    e.out.contested.extend(&choice.offered);
+                }
+                let covers = tree.covered(t, &reads(&choice.drafts));
+                let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());
+                for d in choice.drafts {
+                    let read = |r: &Read| match r {
+                        Read::Node(a) => val(*a),
+                        Read::Draft(at) => made[*at],
+                    };
+                    let reads: Vec<Val> = d.reads.iter().map(read).collect();
+                    made.push(e.op(d, choice.rule, reads, &covers));
+                }
+                *made.last().expect("a rule proposes at least one launch")
+            }
         };
-        let sizes = Attn {
-            seqs,
-            queries,
-            keys,
-            heads,
-            kv_heads,
-            width,
-        };
-        let site = Site::Attend {
-            scale: a.scale,
-            q,
-            k,
-            v,
-            sizes,
-        };
-        self.choose(site, &[NodeId(i as u32)])
+        vals[t.0 as usize] = Some(made);
     }
+    for (t, shape) in &tree.outputs {
+        let val = vals[t.0 as usize].expect("outputs have values");
+        e.out.outputs.push((val, shape.clone()));
+    }
+    Ok(e.out)
 }

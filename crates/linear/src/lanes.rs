@@ -1,7 +1,9 @@
 //! A matmul for few rows, with threads sharing each sum.
 
 use graph::Order;
-use lower::{Arg, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, Text, float};
+use lower::{
+    Arg, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, T, Text, Tree, float,
+};
 
 /// Inputs one lane multiplies and adds by itself.
 const CHUNK: usize = 16;
@@ -231,8 +233,8 @@ impl Kernel for Sums {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
-    let Site::Matmul { x, w, m, n, k } = *site else {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let Site::Matmul { x, w, m, n, k } = tree.site(at)? else {
         return None;
     };
     let (lanes, form) = (lanes(k), Form::F32);

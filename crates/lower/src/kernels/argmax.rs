@@ -5,6 +5,7 @@ use crate::emit::{Text, float};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Read, Site};
+use crate::tree::{T, Tree};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 256;
@@ -135,19 +136,19 @@ impl Kernel for Argmax {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Top {
         x,
         rows,
         width,
         k: 1,
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };
     let parts = PARTS.min(width).max(1);
     let sizes = Rows { rows, width, parts };
-    let both = [Read::Value(x), Read::Draft(0)];
+    let both = [Read::Node(x), Read::Draft(0)];
     Some(vec![
         Draft::new(Peaks(sizes), [x], rows * parts),
         Draft::new(Argmax(sizes), both, rows),
