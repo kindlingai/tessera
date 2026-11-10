@@ -1,12 +1,8 @@
-//! Plain loops: the reference other backends are checked against.
+//! Plain loops: the reference every plan is checked against.
 
 use crate::round::Acc;
-use crate::run::Kernels;
 use crate::tensor::{Error, Tensor};
 use graph::{Act, Attend, Mask, Numerics, Pairs, Stage};
-
-/// Sums in fixed order with exact math. Meets any `Numerics`.
-pub struct Cpu;
 
 /// The tanh approximation, as the GPU kernels compute it.
 fn gelu(x: f32) -> f32 {
@@ -61,126 +57,125 @@ pub(crate) fn past_keys(a: &Attend, queries: usize, keys: usize) -> Result<usize
     }
 }
 
-impl Kernels for Cpu {
-    fn matmul(&mut self, n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
-        let acc = Acc::new(n.accumulate)?;
-        let (m, k) = x.rows();
-        let n = w.shape[0];
-        let (xs, ws) = (x.floats()?, w.floats()?);
-        let mut out = vec![0.0; m * n];
-        for (r, row) in out.chunks_mut(n).enumerate() {
-            let xr = &xs[r * k..(r + 1) * k];
-            for (c, o) in row.iter_mut().enumerate() {
-                *o = acc.dot(xr, &ws[c * k..(c + 1) * k]);
-            }
-        }
-        let mut shape = x.shape.clone();
-        *shape.last_mut().expect("verified rank") = n;
-        Ok(Tensor::f32(shape, out))
-    }
+// These sum in fixed order with exact math.
 
-    fn attend(&mut self, n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error> {
-        let acc = Acc::new(n.accumulate)?;
-        let [q, k, v] = qkv;
-        let [seqs, ctx, heads, d] = q.shape[..] else {
-            return Err(Error::Mismatch("attention wants rank 4".into()));
-        };
-        let (keys, kv_heads) = (k.shape[1], k.shape[2]);
-        let group = heads / kv_heads;
-        let past = past_keys(a, ctx, keys)?;
-        let (qs, ks, vs) = (q.floats()?, k.floats()?, v.floats()?);
-        let mut out = vec![0.0; qs.len()];
-        let mut p = vec![0.0; keys];
-        for s in 0..seqs {
-            for t in 0..ctx {
-                for h in 0..heads {
-                    let qo = ((s * ctx + t) * heads + h) * d;
-                    let kv_at = |j: usize| ((s * keys + j) * kv_heads + h / group) * d;
-                    let seen = if a.mask == Mask::Causal {
-                        past + t + 1
-                    } else {
-                        keys
-                    };
-                    for (j, pj) in p[..seen].iter_mut().enumerate() {
-                        *pj = acc.dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
-                    }
-                    softmax(acc, &mut p[..seen]);
-                    let o = &mut out[qo..qo + d];
-                    for (j, &pj) in p[..seen].iter().enumerate() {
-                        for (oi, &vi) in o.iter_mut().zip(&vs[kv_at(j)..kv_at(j) + d]) {
-                            *oi = acc.add(*oi, pj * vi);
-                        }
-                    }
-                }
-            }
+pub(crate) fn matmul(n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let (m, k) = x.rows();
+    let n = w.shape[0];
+    let (xs, ws) = (x.floats()?, w.floats()?);
+    let mut out = vec![0.0; m * n];
+    for (r, row) in out.chunks_mut(n).enumerate() {
+        let xr = &xs[r * k..(r + 1) * k];
+        for (c, o) in row.iter_mut().enumerate() {
+            *o = acc.dot(xr, &ws[c * k..(c + 1) * k]);
         }
-        Ok(Tensor::f32(q.shape.clone(), out))
     }
+    let mut shape = x.shape.clone();
+    *shape.last_mut().expect("verified rank") = n;
+    Ok(Tensor::f32(shape, out))
+}
 
-    fn stage(
-        &mut self,
-        n: &Numerics,
-        s: &Stage,
-        x: &Tensor,
-        operand: Option<&Tensor>,
-    ) -> Result<Tensor, Error> {
-        let acc = Acc::new(n.accumulate)?;
-        let mut out = x.floats()?.to_vec();
-        let (_, width) = x.rows();
-        match (s, operand) {
-            (Stage::Add | Stage::Mul, Some(o)) => {
-                let o = o.floats()?;
-                for (i, v) in out.iter_mut().enumerate() {
-                    let b = o[i % o.len()];
-                    *v = if *s == Stage::Add { *v + b } else { *v * b };
+pub(crate) fn attend(n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let [q, k, v] = qkv;
+    let [seqs, ctx, heads, d] = q.shape[..] else {
+        return Err(Error::Mismatch("attention wants rank 4".into()));
+    };
+    let (keys, kv_heads) = (k.shape[1], k.shape[2]);
+    let group = heads / kv_heads;
+    let past = past_keys(a, ctx, keys)?;
+    let (qs, ks, vs) = (q.floats()?, k.floats()?, v.floats()?);
+    let mut out = vec![0.0; qs.len()];
+    let mut p = vec![0.0; keys];
+    for s in 0..seqs {
+        for t in 0..ctx {
+            for h in 0..heads {
+                let qo = ((s * ctx + t) * heads + h) * d;
+                let kv_at = |j: usize| ((s * keys + j) * kv_heads + h / group) * d;
+                let seen = if a.mask == Mask::Causal {
+                    past + t + 1
+                } else {
+                    keys
+                };
+                for (j, pj) in p[..seen].iter_mut().enumerate() {
+                    *pj = acc.dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
                 }
-            }
-            (Stage::Scale(by), _) => out.iter_mut().for_each(|v| *v *= by),
-            (Stage::RmsNorm { eps }, Some(w)) => {
-                let w = w.floats()?;
-                for row in out.chunks_mut(width) {
-                    let mean = acc.sum(row.iter().map(|v| v * v)) / width as f32;
-                    let inv = 1.0 / (mean + eps).sqrt();
-                    row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
-                }
-            }
-            (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
-            (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
-            // One rank holds the whole sum already.
-            (Stage::AllReduce, _) => {}
-            (Stage::Rope { theta, pairs }, Some(at)) => {
-                let at = at.indices()?;
-                // Each position covers the same number of elements.
-                let span = out.len() / at.len().max(1);
-                for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
-                    for row in block.chunks_mut(width) {
-                        turn(row, pos, *theta, *pairs);
+                softmax(acc, &mut p[..seen]);
+                let o = &mut out[qo..qo + d];
+                for (j, &pj) in p[..seen].iter().enumerate() {
+                    for (oi, &vi) in o.iter_mut().zip(&vs[kv_at(j)..kv_at(j) + d]) {
+                        *oi = acc.add(*oi, pj * vi);
                     }
                 }
             }
-            (Stage::Center | Stage::UnitSum, _) => {
-                return Err(Error::Unsupported(format!("{s:?}")));
-            }
-            _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
         }
-        Ok(Tensor::f32(x.shape.clone(), out))
     }
+    Ok(Tensor::f32(q.shape.clone(), out))
+}
 
-    fn gather(&mut self, table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {
-        let rows = table.shape[0];
-        let width = table.data.len() / rows.max(1);
-        let ids_at = ids.indices()?;
-        if let Some(bad) = ids_at.iter().find(|&&i| i >= rows) {
-            return Err(Error::Mismatch(format!("index {bad} past {rows} rows")));
+pub(crate) fn stage(
+    n: &Numerics,
+    s: &Stage,
+    x: &Tensor,
+    operand: Option<&Tensor>,
+) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let mut out = x.floats()?.to_vec();
+    let (_, width) = x.rows();
+    match (s, operand) {
+        (Stage::Add | Stage::Mul, Some(o)) => {
+            let o = o.floats()?;
+            for (i, v) in out.iter_mut().enumerate() {
+                let b = o[i % o.len()];
+                *v = if *s == Stage::Add { *v + b } else { *v * b };
+            }
         }
-        let at = ids_at
-            .iter()
-            .flat_map(|&r| (0..width).map(move |c| r * width + c));
-        let mut shape = ids.shape.clone();
-        shape.extend_from_slice(&table.shape[1..]);
-        Ok(Tensor {
-            shape,
-            data: table.data.pick(at),
-        })
+        (Stage::Scale(by), _) => out.iter_mut().for_each(|v| *v *= by),
+        (Stage::RmsNorm { eps }, Some(w)) => {
+            let w = w.floats()?;
+            for row in out.chunks_mut(width) {
+                let mean = acc.sum(row.iter().map(|v| v * v)) / width as f32;
+                let inv = 1.0 / (mean + eps).sqrt();
+                row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
+            }
+        }
+        (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
+        (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
+        // One rank holds the whole sum already.
+        (Stage::AllReduce, _) => {}
+        (Stage::Rope { theta, pairs }, Some(at)) => {
+            let at = at.indices()?;
+            // Each position covers the same number of elements.
+            let span = out.len() / at.len().max(1);
+            for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
+                for row in block.chunks_mut(width) {
+                    turn(row, pos, *theta, *pairs);
+                }
+            }
+        }
+        (Stage::Center | Stage::UnitSum, _) => {
+            return Err(Error::Unsupported(format!("{s:?}")));
+        }
+        _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
+    Ok(Tensor::f32(x.shape.clone(), out))
+}
+
+pub(crate) fn gather(table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {
+    let rows = table.shape[0];
+    let width = table.data.len() / rows.max(1);
+    let ids_at = ids.indices()?;
+    if let Some(bad) = ids_at.iter().find(|&&i| i >= rows) {
+        return Err(Error::Mismatch(format!("index {bad} past {rows} rows")));
+    }
+    let at = ids_at
+        .iter()
+        .flat_map(|&r| (0..width).map(move |c| r * width + c));
+    let mut shape = ids.shape.clone();
+    shape.extend_from_slice(&table.shape[1..]);
+    Ok(Tensor {
+        shape,
+        data: table.data.pick(at),
+    })
 }

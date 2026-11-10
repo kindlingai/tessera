@@ -32,7 +32,6 @@ dependencies = [
  "kernels",
  "linear",
  "lower",
- "ops",
  "sim",
  "trace",
 ]
@@ -149,9 +148,9 @@ name = "kernels"
 version = "0.1.0"
 dependencies = [
  "gemm",
+ "gpukit",
  "graph",
  "lower",
- "ops-model",
  "sim",
 ]
 
@@ -159,11 +158,11 @@ dependencies = [
 name = "linear"
 version = "0.1.0"
 dependencies = [
+ "gpukit",
  "graph",
  "interp",
  "kernels",
  "lower",
- "ops",
  "trace",
 ]
 
@@ -205,7 +204,6 @@ dependencies = [
  "models",
  "objc2",
  "objc2-metal",
- "ops",
  "scattered-collect",
  "serde",
  "serde_json",
@@ -225,11 +223,11 @@ version = "0.1.0"
 dependencies = [
  "calibrate",
  "checkpoint",
+ "gpukit",
  "graph",
  "interp",
  "kernels",
  "lower",
- "ops",
  "trace",
 ]
 
@@ -268,21 +266,6 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-foundation",
-]
-
-[[package]]
-name = "ops"
-version = "0.1.0"
-dependencies = [
- "gpukit",
-]
-
-[[package]]
-name = "ops-model"
-version = "0.1.0"
-dependencies = [
- "gpukit",
- "ops",
 ]
 
 [[package]]

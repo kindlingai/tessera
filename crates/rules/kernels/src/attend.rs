@@ -1,10 +1,10 @@
 //! Causal attention that walks the keys one at a time.
 
+use crate::gqa_attention;
 use crate::join::Join;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
 use lower::{Arg, Attn, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
-use ops_model::gqa_attention;
 
 /// Reads scaled queries, and keys joined with values.
 #[derive(Clone, Copy, Debug)]

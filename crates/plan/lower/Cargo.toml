@@ -41,5 +41,4 @@ kernels = { workspace = true }
 linear = { workspace = true }
 interp = { workspace = true }
 models = { workspace = true }
-ops = { workspace = true }
 trace = { workspace = true }

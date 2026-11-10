@@ -3,11 +3,11 @@
 // Linking the crate registers its rules.
 use kernels as _;
 
-use interp::{Cpu, Data, Tensor, run};
+use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use interp::{Data, Tensor, run};
 use lower::{Device, Feed, lower, open};
 use models::Stack;
 use models::nanogpt::{Config, program};
-use ops::testing::{Noise, gpu_available, max_abs_diff};
 use trace::DimName::{Context, Seqs};
 use trace::Graph;
 
@@ -152,13 +152,13 @@ fn cpu_matches_record() {
         data: Data::U32(data),
     };
     let inputs = [ids(TOKENS.to_vec()), ids(positions())];
-    let out = run(&g, &mut Cpu, &weights(&g), 0, &inputs).unwrap();
+    let out = run(&g, &weights(&g), 0, &inputs).unwrap();
     close("cpu", out[0].floats().unwrap());
 }
 
 #[test]
 fn plan_matches_record() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let g = graph();

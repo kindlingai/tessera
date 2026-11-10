@@ -21,4 +21,4 @@ calibrate = { workspace = true }
 checkpoint = { workspace = true }
 interp = { workspace = true }
 lower = { workspace = true }
-ops = { workspace = true }
+gpukit = { workspace = true }

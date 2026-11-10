@@ -1,6 +1,10 @@
 //! Gather rows by index from a row-major [tokens, hidden] source.
 
-ops::op_kernel! {
+gpukit::kernel! {
+    op,
+    error = gpukit::Error,
+    assert_oracle = gpukit::testing::assert_oracle,
+    gpu_available = gpukit::testing::backend_ready,
     name = "gather_rows",
     metal = "gather_rows.metal",
     cuda = "gather_rows.cu",

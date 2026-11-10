@@ -25,4 +25,3 @@ linear = { workspace = true }
 gpukit = { workspace = true }
 
 [dev-dependencies]
-ops = { workspace = true }

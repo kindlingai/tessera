@@ -1,7 +1,7 @@
 use crate::probe::{Kind, Probe, Reading, fit, suite};
 use crate::{Grid, headroom, judge, path};
+use gpukit::testing::backend_ready;
 use lower::{Device, rules};
-use ops::testing::gpu_available;
 use sim::Chip;
 
 /// A crate's rules register once this one links it.
@@ -12,7 +12,7 @@ fn linked_rules_register() {
 
 #[test]
 fn grid_reaches_rules() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut device = Device::guess();
@@ -63,7 +63,7 @@ fn probes_fit_pools() {
 
 #[test]
 fn judge_skips_unmodelled_kernels() {
-    if !ops::testing::gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut device = Device::guess();

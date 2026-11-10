@@ -23,7 +23,6 @@ pub enum Error {
     Unsupported(String),
     /// Values disagree with the graph's types.
     Mismatch(String),
-    Gpu(String),
 }
 
 impl fmt::Display for Error {
@@ -31,7 +30,6 @@ impl fmt::Display for Error {
         match self {
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Mismatch(m) => write!(f, "mismatch: {m}"),
-            Error::Gpu(m) => write!(f, "gpu: {m}"),
         }
     }
 }

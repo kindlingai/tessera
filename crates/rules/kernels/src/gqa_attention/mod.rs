@@ -1,6 +1,10 @@
 //! Grouped-query causal attention with an optional sliding window.
 
-ops::op_kernel! {
+gpukit::kernel! {
+    op,
+    error = gpukit::Error,
+    assert_oracle = gpukit::testing::assert_oracle,
+    gpu_available = gpukit::testing::backend_ready,
     name = "gqa_attention",
     metal = "gqa_attention.metal",
     cuda = "gqa_attention.cu",

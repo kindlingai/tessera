@@ -2,10 +2,10 @@
 
 use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
-use interp::{Cpu, Data, Tensor, bind, run};
+use gpukit::testing::{backend_ready, cosine_f32, max_abs_diff};
+use interp::{Data, Tensor, bind, run};
 use lower::{Device, Feed, Plan, Run, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
-use ops::testing::{cosine_f32, gpu_available, max_abs_diff};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -61,7 +61,7 @@ fn logits(g: &Graph, c: &Case, tokens: &[u32]) -> Vec<f32> {
     };
     let inputs = [ids(tokens.to_vec()), ids(positions)];
     let start = Instant::now();
-    let out = run(g, &mut Cpu, &c.weights, 0, &inputs).unwrap();
+    let out = run(g, &c.weights, 0, &inputs).unwrap();
     let seconds = start.elapsed().as_secs_f32();
     eprintln!("interpreter, {} tokens: {seconds:.3} s", tokens.len());
     out[0].floats().unwrap().to_vec()
@@ -91,7 +91,7 @@ fn matches_reference() {
         return eprintln!("TESSERA_QWEN3 is not set; skipped");
     };
     close("cpu", &logits(&g, &c, &c.tokens), &c);
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut gpu = Gpu::open(&g, &c);
