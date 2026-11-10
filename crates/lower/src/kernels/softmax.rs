@@ -3,9 +3,11 @@
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::{Text, float};
 use crate::kernel::Kernel;
+use crate::kernels::per_row;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use graph::Stage;
+use sim::{Load, Ops};
 
 /// One thread turns each row into probabilities.
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +36,20 @@ const BODY: &str = "    if (gid >= rows) {
 impl Kernel for Softmax {
     fn name(&self) -> &'static str {
         "softmax"
+    }
+
+    /// Finds each row's maximum, then takes two exponentials.
+    fn load(&self, _: &Step) -> Option<Load> {
+        let (float, special, loads) = (3.0, 3.0, 3.0);
+        let trip = Ops {
+            float,
+            special,
+            loads,
+            stores: 1.0,
+            fresh: 1.0 / 16.0,
+            int: 0.0,
+        };
+        Some(per_row(self.rows, self.width, trip, 0.0))
     }
 
     fn sizes(&self) -> Vec<usize> {

@@ -5,6 +5,7 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use graph::Order;
+use sim::{Load, Ops};
 
 /// `x[m, k]` times `w[n, k]` transposed.
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +50,29 @@ impl Kernel for Matmul {
 
     fn order(&self) -> Order {
         Order::PerConfig
+    }
+
+    /// Each group stages 16 of `k`, then every thread multiplies.
+    fn load(&self, _: &Step) -> Option<Load> {
+        let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
+        let groups = self.m.div_ceil(gemm::BM) * self.n.div_ceil(gemm::BN);
+        let threads = gemm::THREADS as usize;
+        let per_thread = |outputs: usize| (outputs * gemm::BK / threads) as f64;
+        let trip = Ops {
+            float: per_thread(gemm::BM * gemm::BN),
+            loads: per_thread(gemm::BM + gemm::BN),
+            fresh: 1.0 / 16.0,
+            ..Ops::default()
+        };
+        Some(Load {
+            threads: groups * threads,
+            group: threads,
+            trips: k / gemm::BK as f64,
+            trip,
+            reads: vec![4.0 * n * k, 4.0 * m * k],
+            written: 4.0 * m * n,
+            flight: 64.0,
+        })
     }
 
     fn source(&self) -> Source {

@@ -3,6 +3,7 @@
 use crate::abi::{Launch, Source};
 use crate::plan::Step;
 use graph::Order;
+use sim::Load;
 use std::fmt;
 use std::sync::Arc;
 
@@ -28,6 +29,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     /// How firmly it orders its sums.
     fn order(&self) -> Order {
         Order::Fixed
+    }
+    /// The work and traffic of `step`, for a chip model.
+    fn load(&self, _: &Step) -> Option<Load> {
+        None
     }
     /// Whether it writes over its first input.
     fn overwrites(&self) -> bool {
