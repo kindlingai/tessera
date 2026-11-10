@@ -2,6 +2,7 @@
 
 use crate::abi::{Launch, Source};
 use crate::plan::Step;
+use graph::Order;
 use std::fmt;
 use std::sync::Arc;
 
@@ -23,6 +24,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     /// Seconds per unit of work, until it is measured.
     fn guess(&self) -> f64 {
         1e-10
+    }
+    /// How firmly it orders its sums.
+    fn order(&self) -> Order {
+        Order::Fixed
     }
     /// Whether it writes over its first input.
     fn overwrites(&self) -> bool {

@@ -4,6 +4,7 @@ use crate::abi::{Arg, Launch, Shape, Source};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use graph::Order;
 
 /// `x[m, k]` times `w[n, k]` transposed.
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +45,10 @@ pub(crate) fn launch(p: gemm::Problem, buffers: [Arg; 3]) -> Launch {
 impl Kernel for Matmul {
     fn name(&self) -> &'static str {
         "matmul"
+    }
+
+    fn order(&self) -> Order {
+        Order::PerConfig
     }
 
     fn source(&self) -> Source {

@@ -5,6 +5,7 @@ use crate::kernel::Kernel;
 use crate::kernels::{Join, Map, MapStage};
 use crate::plan::Step;
 use crate::rule::{Attn, Draft, Read, Site};
+use graph::Order;
 use ops_model::gqa_attention;
 
 /// Reads scaled queries, and keys joined with values.
@@ -14,6 +15,10 @@ pub struct Attend(pub Attn);
 impl Kernel for Attend {
     fn name(&self) -> &'static str {
         "attend"
+    }
+
+    fn order(&self) -> Order {
+        Order::PerConfig
     }
 
     fn sizes(&self) -> Vec<usize> {

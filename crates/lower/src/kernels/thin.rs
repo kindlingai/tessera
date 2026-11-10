@@ -5,6 +5,7 @@ use crate::emit::{Text, float};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use graph::Order;
 
 /// Its row limit: each thread keeps one sum per row.
 pub const THIN_ROWS: usize = 32;
@@ -38,6 +39,10 @@ const BODY: &str = "    if (gid >= n) {
 impl Kernel for Thin {
     fn name(&self) -> &'static str {
         "thin"
+    }
+
+    fn order(&self) -> Order {
+        Order::PerConfig
     }
 
     fn source(&self) -> Source {

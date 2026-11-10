@@ -2,40 +2,29 @@
 
 mod grid;
 
+// Linking the crate registers its rules.
+use linear as _;
+
 pub use grid::Grid;
 
 use graph::{DimName, Graph};
 use lower::{Device, Error, Feed, Run, Step, lower, select};
 use std::path::PathBuf;
 
-/// Seconds a short step repeats to fill.
-const TARGET: f64 = 2e-3;
+/// Whole passes over a plan, each step timed once.
+const PASSES: usize = 3;
 
-/// The most times one step repeats.
-const MOST: usize = 64;
-
-/// Steps this short are timed three times over.
-const SHORT: f64 = 0.05;
-
-/// Times the plan's distinct launches, its inputs already fed.
+/// Times every launch of the plan, its inputs already fed.
 pub fn time(runner: &dyn Run) -> Result<Vec<(Step, f64)>, Error> {
-    let steps = runner.plan().steps.clone();
+    let steps = &runner.plan().steps;
     // The first run pays for anything set up lazily.
     runner.submit(0..steps.len())?;
-    let mut timed: Vec<(Step, f64)> = Vec::new();
-    for (i, step) in steps.into_iter().enumerate() {
-        let same = |(s, _): &(Step, f64)| s.kernel == step.kernel && s.write.len == step.write.len;
-        if timed.iter().any(same) {
-            continue;
+    let mut timed = Vec::with_capacity(PASSES * steps.len());
+    // In plan order, so a launch finds its weights cold.
+    for _ in 0..PASSES {
+        for (i, step) in steps.iter().enumerate() {
+            timed.push((step.clone(), runner.repeat(i, 1)?));
         }
-        let mut least = runner.repeat(i, 1)?;
-        let times = ((TARGET / least.max(1e-9)) as usize).clamp(1, MOST);
-        let trials = if least < SHORT { 3 } else { 0 };
-        // An in-place step repeats on its own output.
-        for _ in 0..trials {
-            least = least.min(runner.repeat(i, times)?);
-        }
-        timed.push((step, least));
     }
     Ok(timed)
 }

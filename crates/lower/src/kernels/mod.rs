@@ -16,7 +16,7 @@ mod thin;
 pub use append::Append;
 pub use argmax::{Argmax, Peaks};
 pub use attend::Attend;
-pub use dense::{Causal, DENSE_SCORES, Scores, Values};
+pub use dense::{Causal, DENSE_SCORES, Part, PerHead};
 pub use gather::Gather;
 pub use join::Join;
 pub use map::{Map, MapStage};
