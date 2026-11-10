@@ -12,11 +12,11 @@ cuda = ["lower/cuda"]
 rocm = ["lower/rocm"]
 
 [dependencies]
-graph = { path = "../graph" }
-lower = { path = "../lower" }
+graph = { workspace = true }
+lower = { workspace = true }
 
 [dev-dependencies]
-kernels = { path = "../kernels" }
-interp = { path = "../interp" }
-ops = { path = "../ops" }
-trace = { path = "../trace" }
+kernels = { workspace = true }
+interp = { workspace = true }
+ops = { workspace = true }
+trace = { workspace = true }

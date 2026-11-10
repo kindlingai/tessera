@@ -7,7 +7,7 @@ publish.workspace = true
 description = "Runs a graph op by op, on the CPU or the portable GPU ops"
 
 [dependencies]
-graph = { path = "../graph" }
+graph = { workspace = true }
 
 [dev-dependencies]
-trace = { path = "../trace" }
+trace = { workspace = true }
