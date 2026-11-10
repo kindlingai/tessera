@@ -3,9 +3,11 @@
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::{Text, float};
 use crate::kernel::Kernel;
+use crate::kernels::per_row;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use graph::Stage;
+use sim::{Load, Ops};
 
 /// One thread scales each row by its root mean square.
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +35,19 @@ const BODY: &str = "    if (gid >= rows) {
 impl Kernel for RmsNorm {
     fn name(&self) -> &'static str {
         "rms_norm"
+    }
+
+    /// Sums each row, then scales it.
+    fn load(&self, _: &Step) -> Option<Load> {
+        let trip = Ops {
+            float: 3.0,
+            loads: 3.0,
+            stores: 1.0,
+            fresh: 1.0 / 16.0,
+            ..Ops::default()
+        };
+        let gain = 4.0 * self.width as f64;
+        Some(per_row(self.rows, self.width, trip, gain))
     }
 
     fn sizes(&self) -> Vec<usize> {

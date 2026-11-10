@@ -1,7 +1,7 @@
 //! A matmul for few rows, with threads sharing each sum.
 
 use graph::Order;
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, Text, float};
+use lower::{Arg, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, Text, float};
 
 /// Inputs one lane multiplies and adds by itself.
 const CHUNK: usize = 16;
@@ -123,6 +123,28 @@ impl Kernel for Lanes {
         Order::PerConfig
     }
 
+    /// Each thread runs along its own stretch of a row.
+    fn load(&self, _: &Step) -> Option<Load> {
+        let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
+        let lanes = self.lanes as f64;
+        let trip = Ops {
+            float: m,
+            int: 2.0,
+            loads: 1.0 + m,
+            fresh: 1.0 / 16.0,
+            ..Ops::default()
+        };
+        Some(Load {
+            threads: self.n * self.lanes,
+            group: 256,
+            trips: k / lanes,
+            trip,
+            reads: vec![4.0 * n * k, 4.0 * m * k],
+            written: 4.0 * m * n * lanes,
+            flight: 64.0,
+        })
+    }
+
     fn source(&self) -> Source {
         let (ty, load) = self.form.load();
         let w = ("w".to_string(), ty, false);
@@ -164,6 +186,26 @@ impl Kernel for Sums {
 
     fn sizes(&self) -> Vec<usize> {
         vec![self.count, self.lanes]
+    }
+
+    fn load(&self, _: &Step) -> Option<Load> {
+        let (count, lanes) = (self.count as f64, self.lanes as f64);
+        let trip = Ops {
+            float: 1.0,
+            int: 1.0,
+            loads: 1.0,
+            fresh: 1.0 / 16.0,
+            ..Ops::default()
+        };
+        Some(Load {
+            threads: self.count,
+            group: 256,
+            trips: lanes,
+            trip,
+            reads: vec![4.0 * count * lanes],
+            written: 4.0 * count,
+            flight: 64.0,
+        })
     }
 
     fn source(&self) -> Source {

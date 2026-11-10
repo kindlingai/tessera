@@ -1,6 +1,7 @@
 //! Times kernels on this machine and stores what they cost.
 
 mod grid;
+pub mod probe;
 
 // Linking the crate registers its rules.
 use linear as _;
@@ -9,6 +10,8 @@ pub use grid::Grid;
 
 use graph::{DimName, Graph};
 use lower::{Device, Error, Feed, Run, Step, lower, select};
+use sim::Chip;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Whole passes over a plan, each step timed once.
@@ -53,6 +56,52 @@ pub fn measure(
     }
     device.name = runner.device();
     Ok(added)
+}
+
+/// A chip model against the timed launches of one kernel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Verdict {
+    pub kernel: &'static str,
+    pub launches: usize,
+    /// Seconds the launches took, all together.
+    pub seconds: f64,
+    /// Estimate over timed: the lowest, median and highest.
+    pub ratio: [f64; 3],
+}
+
+/// Compares `chip`'s estimates with timed launches, by kernel.
+pub fn judge(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Verdict> {
+    // Each distinct launch counts once, at its median time.
+    let mut device = Device::guess();
+    device.fit(timed.iter().map(|(step, seconds)| (step, *seconds)));
+    let mut seen: Vec<&Step> = Vec::new();
+    let mut by: BTreeMap<&'static str, (f64, Vec<f64>)> = BTreeMap::new();
+    for (step, _) in timed {
+        let same = |s: &&Step| s.kernel == step.kernel && s.write.len == step.write.len;
+        let Some(load) = step.kernel.load(step).filter(|_| !seen.iter().any(same)) else {
+            continue;
+        };
+        seen.push(step);
+        let seconds = device.seconds(&*step.kernel, step.write.len);
+        let (total, ratios) = by.entry(step.kernel.name()).or_default();
+        *total += seconds;
+        ratios.push(chip.estimate(&load).seconds / seconds);
+    }
+    let verdict = |(kernel, (seconds, mut ratios)): (&'static str, (f64, Vec<f64>))| {
+        ratios.sort_by(f64::total_cmp);
+        let ratio = [
+            ratios[0],
+            ratios[ratios.len() / 2],
+            ratios[ratios.len() - 1],
+        ];
+        Verdict {
+            kernel,
+            launches: ratios.len(),
+            seconds,
+            ratio,
+        }
+    };
+    by.into_iter().map(verdict).collect()
 }
 
 /// Where this machine keeps the samples for `device`.

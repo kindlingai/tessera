@@ -6,6 +6,7 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use graph::Act;
+use sim::{Load, Ops};
 use std::fmt::Write;
 
 /// One elementwise step.
@@ -38,6 +39,30 @@ fn act(a: Act) -> &'static str {
 impl Kernel for Map {
     fn name(&self) -> &'static str {
         "map"
+    }
+
+    /// One thread per element, each on its own lines.
+    fn load(&self, step: &Step) -> Option<Load> {
+        let (len, inputs) = (step.write.len as f64, step.reads.len() as f64);
+        let special = |s: &&MapStage| matches!(s, MapStage::Act(_));
+        let acts = self.0.iter().filter(special).count() as f64;
+        let trip = Ops {
+            float: self.0.len() as f64 - acts,
+            int: 1.0,
+            special: acts,
+            loads: inputs,
+            stores: 1.0,
+            fresh: 1.0,
+        };
+        Some(Load {
+            threads: step.write.len,
+            group: 256,
+            trips: 1.0,
+            trip,
+            reads: vec![4.0 * len; step.reads.len()],
+            written: 4.0 * len,
+            flight: 4.0 * inputs,
+        })
     }
 
     fn source(&self) -> Source {
