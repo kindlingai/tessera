@@ -43,7 +43,7 @@ impl Kernel for Thin {
     }
 
     /// One thread per column loops over all of `k`.
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
         let trip = Ops {
             float: m,

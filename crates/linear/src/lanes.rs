@@ -124,7 +124,7 @@ impl Kernel for Lanes {
     }
 
     /// Each thread runs along its own stretch of a row.
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
         let lanes = self.lanes as f64;
         let trip = Ops {
@@ -188,7 +188,7 @@ impl Kernel for Sums {
         vec![self.count, self.lanes]
     }
 
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let (count, lanes) = (self.count as f64, self.lanes as f64);
         let trip = Ops {
             float: 1.0,

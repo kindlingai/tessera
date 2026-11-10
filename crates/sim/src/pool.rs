@@ -1,6 +1,7 @@
 //! Any GPU as slow threads behind one memory bus.
 
 use crate::{Chip, Const, Estimate, Limit, Load};
+use serde::{Deserialize, Serialize};
 
 /// The constants a probe run can fit on any backend.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +31,45 @@ pub struct Pool {
     pub scan: Const,
     /// Bytes a second into memory.
     pub write: Const,
+}
+
+/// A pool's constants as plain numbers, as probes fit them.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Fit {
+    pub floor: f64,
+    pub spawn: f64,
+    pub step: f64,
+    pub curve: f64,
+    pub rate: f64,
+    pub wait: f64,
+    pub near: f64,
+    pub cache: f64,
+    pub cached: f64,
+    pub read: f64,
+    pub scan: f64,
+    pub write: f64,
+}
+
+impl Fit {
+    /// Pairs each value with its probe.
+    pub fn pool(&self, name: &str) -> Pool {
+        let m = Const::measured;
+        Pool {
+            name: name.into(),
+            floor: m(self.floor, "256 threads that do nothing"),
+            spawn: m(self.spawn, "65,536 idle threads against 256"),
+            step: m(self.step, "a multiply-add loop in 256 threads"),
+            curve: m(self.curve, "an exponential loop in 256 threads"),
+            rate: m(self.rate, "the multiply-add loop at its best thread count"),
+            wait: m(self.wait, "256 threads, each load on a new line of 512 MB"),
+            near: m(self.near, "256 threads, each along its own 16 KB"),
+            cache: Const::inferred(self.cache, "the small probe buffer; larger sizes unprobed"),
+            cached: m(self.cached, "4 MB read again at the best thread count"),
+            read: m(self.read, "512 MB read at the best thread count"),
+            scan: m(self.scan, "512 MB read in separate stretches"),
+            write: m(self.write, "256 MB written at the best thread count"),
+        }
+    }
 }
 
 impl Chip for Pool {
@@ -65,6 +105,19 @@ impl Chip for Pool {
             slowest.limit = Limit::Write;
         }
         slowest
+    }
+
+    /// Every op at the chip's rate, every byte at best.
+    fn bound(&self, l: &Load) -> f64 {
+        let curves = l.floats() / l.trip.float.max(1.0) * l.trip.special;
+        let ops = l.floats() + curves * self.curve.value / self.step.value;
+        let best = self.read.value.max(self.scan.value);
+        let rate = |bytes: &f64| match *bytes > self.cache.value {
+            true => bytes / best,
+            false => bytes / self.cached.value,
+        };
+        let moved: f64 = l.reads.iter().map(rate).sum::<f64>() + l.written / self.write.value;
+        self.floor.value + (ops / self.rate.value).max(moved)
     }
 
     fn constants(&self) -> Vec<(&'static str, Const)> {

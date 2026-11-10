@@ -53,7 +53,7 @@ impl Kernel for Matmul {
     }
 
     /// Each group stages 16 of `k`, then every thread multiplies.
-    fn load(&self, _: &Step) -> Option<Load> {
+    fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
         let groups = self.m.div_ceil(gemm::BM) * self.n.div_ceil(gemm::BN);
         let threads = gemm::THREADS as usize;

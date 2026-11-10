@@ -1,9 +1,10 @@
 use crate::kernels::{Map, MapStage, Thin};
-use crate::{Arg, Device, Dialect, Error, Held, Kernel, KernelRef, Plan, Slot, Source, Step};
+use crate::{Arg, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Plan, Slot, Source, Step};
 use crate::{assign, lower, peak, rules, schedule, select};
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
 use models::qwen3::{Config, program, stepper};
+use sim::Chip;
 
 const SIZES: [(DimName, u64); 2] = [(Seqs, 2), (Context, 5)];
 
@@ -231,4 +232,48 @@ fn sources_differ() {
     assert_eq!(hash(vec![MapStage::Add]), hash(vec![MapStage::Add]));
     assert_ne!(hash(vec![MapStage::Add]), hash(vec![MapStage::Mul]));
     assert_ne!(hash(Vec::new()), thin(1).kernel.source().hash());
+}
+
+/// Round constants for a made-up chip.
+fn chip() -> Fit {
+    Fit {
+        floor: 2e-6,
+        spawn: 1e-10,
+        step: 10e-9,
+        curve: 30e-9,
+        rate: 1e12,
+        wait: 300e-9,
+        near: 40e-9,
+        cache: 4e6,
+        cached: 250e9,
+        read: 100e9,
+        scan: 80e9,
+        write: 90e9,
+    }
+}
+
+#[test]
+fn models_fill_gaps() {
+    let (step, fit) = (thin(1), chip());
+    let seconds = |d: &Device| d.seconds(&*step.kernel, 64);
+    let device = Device::guess().fitted(fit);
+    let load = step.kernel.load(64).unwrap();
+    let modelled = fit.pool("fitted").estimate(&load).seconds;
+    assert_eq!(seconds(&device), modelled);
+    assert!(
+        seconds(&Device::guess()) != modelled,
+        "a bare guess differs"
+    );
+    let bound = device.bound(&*step.kernel, 64).unwrap();
+    assert!(bound <= modelled && Device::guess().bound(&*step.kernel, 64).is_none());
+    // A sample of the kernel outranks the model.
+    let mut timed = device.clone();
+    timed.fit([(&step, 5e-3)]);
+    assert_eq!(seconds(&timed), 5e-3);
+    // The stored fit brings the model back.
+    let file = std::env::temp_dir().join("tessera-lower-fit-test.json");
+    device.save(&file).unwrap();
+    let loaded = Device::load(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert!(loaded == device && seconds(&loaded) == modelled);
 }
