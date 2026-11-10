@@ -39,6 +39,9 @@ fn gate_fuses() {
 #[test]
 fn buffers_are_shared() {
     let (g, plan) = toy(&Device::guess());
+    // Matmul schedules sum in their own orders.
+    assert_eq!(plan.order(), graph::Order::PerConfig);
+    assert_eq!(Plan::default().order(), graph::Order::Fixed);
     for s in &plan.steps {
         let in_place = s.reads.iter().any(|r| r.buffer == s.write.buffer);
         assert_eq!(in_place, s.kernel.overwrites());

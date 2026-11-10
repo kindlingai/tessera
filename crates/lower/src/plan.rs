@@ -2,7 +2,7 @@
 
 use crate::abi::{Arg, Launch};
 use crate::kernel::KernelRef;
-use graph::NodeId;
+use graph::{NodeId, Order};
 
 /// Leading elements of one buffer. Every element is four bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,6 +58,12 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The weakest order any of its kernels sums in.
+    pub fn order(&self) -> Order {
+        let orders = self.steps.iter().map(|s| s.kernel.order());
+        orders.max().unwrap_or(Order::Fixed)
+    }
+
     /// Elements in buffers no weight, input or kept row owns.
     pub fn scratch(&self) -> usize {
         let named = self.weights.iter().chain(&self.kept).map(|(_, s)| s);

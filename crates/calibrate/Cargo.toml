@@ -19,6 +19,7 @@ path = "src/main.rs"
 graph = { path = "../graph" }
 trace = { path = "../trace" }
 lower = { path = "../lower" }
+linear = { path = "../linear" }
 gpukit = { path = "../gpukit", default-features = false }
 
 [dev-dependencies]

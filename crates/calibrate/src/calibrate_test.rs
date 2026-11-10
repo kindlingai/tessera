@@ -2,6 +2,12 @@ use crate::{Grid, path};
 use lower::{Device, rules};
 use ops::testing::gpu_available;
 
+/// A crate's rules register once this one links it.
+#[test]
+fn linked_rules_register() {
+    assert!(rules().iter().any(|r| r.name == "lanes"));
+}
+
 #[test]
 fn grid_reaches_rules() {
     if !gpu_available() {

@@ -6,13 +6,23 @@ use crate::kernel::Kernel;
 use crate::kernels::matmul::{launch, source, tiles};
 use crate::plan::Step;
 use crate::rule::{Attn, Draft, Read, Site};
+use graph::Order;
 
 /// The most score elements this form may hold.
 pub const DENSE_SCORES: usize = 1 << 28;
 
-/// Every query-key product, as `[Seqs, Heads, Queries, Keys]`.
+/// Which of the two products a launch computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Every query-key product, as `[Seqs, Heads, Queries, Keys]`.
+    Scores,
+    /// Each head's probabilities times its values.
+    Values,
+}
+
+/// One tiled matmul per head.
 #[derive(Clone, Copy, Debug)]
-pub struct Scores(pub Attn);
+pub struct PerHead(pub Part, pub Attn);
 
 /// Scaled causal softmax over each score row, in place.
 #[derive(Clone, Copy, Debug)]
@@ -21,10 +31,6 @@ pub struct Causal {
     pub keys: usize,
     pub scale: f32,
 }
-
-/// Each head's probabilities times its values.
-#[derive(Clone, Copy, Debug)]
-pub struct Values(pub Attn);
 
 /// Where head `h` of sequence `s` starts in each tensor.
 struct Starts {
@@ -47,13 +53,20 @@ fn per_head(a: &Attn, each: impl Fn(Starts) -> Launch) -> Vec<Launch> {
     pairs.map(|pair| each(at(pair))).collect()
 }
 
-impl Kernel for Scores {
+impl Kernel for PerHead {
     fn name(&self) -> &'static str {
-        "scores"
+        match self.0 {
+            Part::Scores => "scores",
+            Part::Values => "values",
+        }
+    }
+
+    fn order(&self) -> Order {
+        Order::PerConfig
     }
 
     fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
+        self.1.sizes()
     }
 
     fn source(&self) -> Source {
@@ -62,22 +75,34 @@ impl Kernel for Scores {
 
     /// Each head's rows sit a stride apart, with no copy.
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let p = gemm::Problem {
+        let a = &self.1;
+        let scores = gemm::Problem {
             lda: a.heads * a.width,
             ldb: a.kv_heads * a.width,
             ..gemm::Problem::linear(a.queries, a.keys, a.width)
         };
-        let (q, k, out) = (step.reads[0], step.reads[1], step.write);
+        let values = gemm::Problem {
+            ldb: a.kv_heads * a.width,
+            ldc: a.heads * a.width,
+            ..gemm::Problem::matmul(a.queries, a.width, a.keys)
+        };
+        let slots = [step.reads[0], step.reads[1], step.write];
         per_head(a, |at| {
-            let buffers = [(q, at.query), (k, at.key), (out, at.score)];
-            launch(p, buffers.map(|(slot, skip)| Arg::Buffer(slot, skip)))
+            let (p, skips) = match self.0 {
+                Part::Scores => (scores, [at.query, at.key, at.score]),
+                Part::Values => (values, [at.score, at.key, at.query]),
+            };
+            launch(p, [0, 1, 2].map(|i| Arg::Buffer(slots[i], skips[i])))
         })
     }
 
     fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        (a.seqs * a.heads * tiles(a.queries) * tiles(a.keys) * a.width) as f64
+        let a = &self.1;
+        let per_head = match self.0 {
+            Part::Scores => tiles(a.queries) * tiles(a.keys) * a.width,
+            Part::Values => tiles(a.queries) * tiles(a.width) * a.keys,
+        };
+        (a.seqs * a.heads * per_head) as f64
     }
 
     /// Unproven, so it must earn its place by measurement.
@@ -139,44 +164,6 @@ impl Kernel for Causal {
     }
 }
 
-impl Kernel for Values {
-    fn name(&self) -> &'static str {
-        "values"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
-
-    fn source(&self) -> Source {
-        source()
-    }
-
-    /// Each head writes its own columns of the output.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let p = gemm::Problem {
-            ldb: a.kv_heads * a.width,
-            ldc: a.heads * a.width,
-            ..gemm::Problem::matmul(a.queries, a.width, a.keys)
-        };
-        let (probs, v, out) = (step.reads[0], step.reads[1], step.write);
-        per_head(a, |at| {
-            let buffers = [(probs, at.score), (v, at.key), (out, at.query)];
-            launch(p, buffers.map(|(slot, skip)| Arg::Buffer(slot, skip)))
-        })
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        (a.seqs * a.heads * tiles(a.queries) * tiles(a.width) * a.keys) as f64
-    }
-
-    fn guess(&self) -> f64 {
-        1e-9
-    }
-}
-
 fn propose(site: &Site) -> Option<Vec<Draft>> {
     let Site::Attend {
         scale,
@@ -197,9 +184,13 @@ fn propose(site: &Site) -> Option<Vec<Draft>> {
     };
     (pairs <= DENSE_SCORES).then(|| {
         vec![
-            Draft::new(Scores(sizes), [q, k], pairs),
+            Draft::new(PerHead(Part::Scores, sizes), [q, k], pairs),
             Draft::new(causal, [Read::Draft(0)], pairs),
-            Draft::new(Values(sizes), [Read::Draft(1), Read::Value(v)], out),
+            Draft::new(
+                PerHead(Part::Values, sizes),
+                [Read::Draft(1), Read::Value(v)],
+                out,
+            ),
         ]
     })
 }
