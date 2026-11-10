@@ -1,12 +1,7 @@
 //! A matmul with one thread per output column.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::plan::Step;
-use crate::rule::{Draft, Site};
-use crate::tree::{T, Tree};
 use graph::Order;
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
 use sim::{Load, Ops};
 
 /// Its row limit: each thread keeps one sum per row.
@@ -107,4 +102,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     (m <= THIN_ROWS).then(|| vec![Draft::new(Thin { m, n, k }, [x, w], m * n)])
 }
 
-crate::rule!("thin", propose);
+lower::rule!("thin", propose);

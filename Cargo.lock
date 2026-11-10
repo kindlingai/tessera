@@ -29,6 +29,7 @@ version = "0.1.0"
 dependencies = [
  "gpukit",
  "graph",
+ "kernels",
  "linear",
  "lower",
  "ops",
@@ -144,11 +145,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
+name = "kernels"
+version = "0.1.0"
+dependencies = [
+ "gemm",
+ "graph",
+ "lower",
+ "ops-model",
+ "sim",
+]
+
+[[package]]
 name = "linear"
 version = "0.1.0"
 dependencies = [
  "graph",
  "interp",
+ "kernels",
  "lower",
  "ops",
  "trace",
@@ -184,15 +197,15 @@ checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
 name = "lower"
 version = "0.1.0"
 dependencies = [
- "gemm",
  "gpukit",
  "graph",
  "interp",
+ "kernels",
+ "linear",
  "models",
  "objc2",
  "objc2-metal",
  "ops",
- "ops-model",
  "scattered-collect",
  "serde",
  "serde_json",
@@ -214,6 +227,7 @@ dependencies = [
  "checkpoint",
  "graph",
  "interp",
+ "kernels",
  "lower",
  "ops",
  "trace",

@@ -1,5 +1,8 @@
 //! The lane schedule against the CPU interpreter, on the GPU.
 
+// The other matmul rules come from here.
+use kernels as _;
+
 use graph::DimName::{self, Ffn, Hidden, Rows};
 use interp::{Cpu, Data, Tensor, run};
 use lower::{Device, Dialect, Feed, Source, lower, open, rules};

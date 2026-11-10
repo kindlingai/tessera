@@ -1,11 +1,7 @@
 //! The hand-written tiled matmul.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::kernel::Kernel;
-use crate::plan::Step;
-use crate::rule::{Draft, Site};
-use crate::tree::{T, Tree};
 use graph::Order;
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
 use sim::{Load, Ops};
 
 /// `x[m, k]` times `w[n, k]` transposed.
@@ -102,4 +98,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(Matmul { m, n, k }, [x, w], m * n)])
 }
 
-crate::rule!("matmul", propose);
+lower::rule!("matmul", propose);

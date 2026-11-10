@@ -1,12 +1,7 @@
 //! Rotary positions: a table of angles, then the rotation.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::plan::Step;
-use crate::rule::{Draft, Read, Site};
-use crate::tree::{T, Tree};
 use graph::{Pairs, Stage};
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
 use ops_model::apply_rope_heads;
 
 /// Each position's cosine and sine, per pair.
@@ -144,4 +139,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     ])
 }
 
-crate::rule!("rope", propose);
+lower::rule!("rope", propose);

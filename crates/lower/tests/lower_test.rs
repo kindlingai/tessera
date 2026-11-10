@@ -1,11 +1,14 @@
-use crate::kernels::{Map, MapStage, Thin};
-use crate::{
+//! Plans for a toy model, without a GPU.
+
+use graph::DimName::{self, Context, Rows, Seqs};
+use graph::{Act, Composite, Graph};
+use kernels::Thin;
+use lower::kernels::{Map, MapStage};
+use lower::{
     Arg, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Plan, Site, Slot, Source, Step, T,
     Tree,
 };
-use crate::{assign, lower, peak, rules, schedule, select};
-use graph::DimName::{self, Context, Rows, Seqs};
-use graph::{Act, Composite, Graph};
+use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
 use sim::Chip;
 
@@ -18,7 +21,7 @@ fn toy(device: &Device) -> (Graph, Plan) {
 }
 
 fn count(plan: &Plan, kernel: &str) -> usize {
-    let named = |s: &&crate::Step| s.kernel.name() == kernel;
+    let named = |s: &&lower::Step| s.kernel.name() == kernel;
     plan.steps.iter().filter(named).count()
 }
 

@@ -3,7 +3,8 @@
 mod grid;
 pub mod probe;
 
-// Linking the crate registers its rules.
+// Linking the crates registers their rules.
+use kernels as _;
 use linear as _;
 
 pub use grid::Grid;

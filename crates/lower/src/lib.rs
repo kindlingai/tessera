@@ -73,6 +73,3 @@ impl From<gpukit::Error> for Error {
         Error::Gpu(e)
     }
 }
-
-#[cfg(test)]
-mod lower_test;

@@ -1,13 +1,8 @@
 //! RMS norm over rows, generated.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::kernels::per_row;
-use crate::plan::Step;
-use crate::rule::{Draft, Site};
-use crate::tree::{T, Tree};
+use crate::per_row;
 use graph::Stage;
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
 use sim::{Load, Ops};
 
 /// One thread scales each row by its root mean square.
@@ -97,4 +92,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(kernel, [x, w], len)])
 }
 
-crate::rule!("rms_norm", propose);
+lower::rule!("rms_norm", propose);
