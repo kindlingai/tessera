@@ -7,7 +7,9 @@ use graph::DimName::{self, Ffn, Hidden, Rows};
 use interp::{Cpu, Data, Tensor, run};
 use lower::{Device, Dialect, Feed, Source, lower, open, rules};
 use ops::testing::{Noise, gpu_available, max_abs_diff};
-use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights};
+use trace::{
+    Act, DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights,
+};
 
 #[derive(Weights)]
 struct Layer {
@@ -15,8 +17,16 @@ struct Layer {
     w: Linear,
 }
 
+/// A graph's work on its input and the product.
+type Finish = fn(&trace::Tensor, trace::Tensor) -> trace::Tensor;
+
 /// `k` inputs to `n` outputs, over any number of rows.
 fn linear(k: u64, n: u64) -> Graph {
+    finished(k, n, |_, product| product)
+}
+
+/// The same, with stages after the matmul.
+fn finished(k: u64, n: u64, finish: Finish) -> Graph {
     let fixed = |name, n| Dim {
         name,
         size: Size::Fixed(n),
@@ -28,7 +38,7 @@ fn linear(k: u64, n: u64) -> Graph {
     let ty = TensorType::new([Rows, Hidden], DType::F32);
     let role = Role::Logits;
     let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
-    m.finish([(Role::Logits, &x.matmul(&w.w))])
+    m.finish([(Role::Logits, &finish(&x, x.matmul(&w.w)))])
 }
 
 fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
@@ -48,6 +58,12 @@ fn rule_registers() {
     // Past its row limit, another rule takes the site.
     let wide = lower(&g, 0, &sizes(33), &Device::guess().favoring("lanes")).unwrap();
     assert!(wide.steps.iter().all(|s| s.kernel.name() != "lanes"));
+    // A favored rule keeps its node from a hiding cover.
+    let residual = finished(48, 48, |x, product| x.add(&product));
+    let tiled = Device::guess().favoring("matmul");
+    let kept = lower(&residual, 0, &sizes(3), &tiled).unwrap();
+    let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(names, ["matmul", "map"]);
     // Three rows take the body that shares each weight.
     let Source::Made(text) = plan.steps[0].kernel.source() else {
         panic!("lanes are generated");
@@ -65,16 +81,23 @@ fn lanes_match_cpu() {
     }
     let mut draws = Noise(23);
     // Widths that lanes do not divide, and one they do.
-    let cases: [(u64, u64, DimName); 3] = [(50, 7, Rows), (1, 3, Rows), (1024, 96, Rows)];
-    for (k, n, rows) in cases {
-        let g = linear(k, n);
+    let plain = [(50, 7), (1, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n)));
+    // The sum as an operand, then as the chain's input.
+    let residual: Finish = |x, product| x.add(&product);
+    let gate: Finish = |x, product| product.act(Act::Silu).mul(x);
+    let fused = [residual, gate].map(|finish| (48, 48, finished(48, 48, finish)));
+    for (k, n, g) in plain.into_iter().chain(fused) {
+        let rows: DimName = Rows;
         let weights = [noise(vec![n as usize, k as usize], &mut draws)];
         for m in [1usize, 5] {
             let x = noise(vec![m, k as usize], &mut draws);
             let want = run(&g, &mut Cpu, &weights, 0, std::slice::from_ref(&x)).unwrap();
             let device = Device::guess().favoring("lanes");
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
-            assert_eq!(plan.steps[0].kernel.name(), "lanes");
+            // Stages after the matmul ride in the sums launch.
+            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+            assert_eq!(names, ["lanes", "sums"]);
+            assert_eq!(plan.steps[1].covers.len(), g.nodes.len() - 2);
             let runner = open(plan).unwrap();
             runner.load(0, weights[0].floats().unwrap()).unwrap();
             let Data::F32(fed) = &x.data else {

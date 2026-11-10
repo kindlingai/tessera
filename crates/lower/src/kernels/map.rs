@@ -37,6 +37,31 @@ fn act(a: Act) -> &'static str {
     }
 }
 
+/// Source lines running `stages` on `v`. `operand` names each read.
+pub fn stage_lines(stages: &[MapStage], operand: &dyn Fn(usize) -> String) -> String {
+    let (mut lines, mut taken) = (String::new(), 0);
+    for s in stages {
+        let line = match s {
+            MapStage::Add | MapStage::Mul => {
+                let op = if *s == MapStage::Add { '+' } else { '*' };
+                taken += 1;
+                format!("v = v {op} {};", operand(taken - 1))
+            }
+            // Bits, so the constant survives the round trip.
+            MapStage::Scale(by) => format!("v = v * f_bits(0x{:08x}u);", by.to_bits()),
+            MapStage::Act(a) => act(*a).to_string(),
+        };
+        let _ = writeln!(lines, "    {line}");
+    }
+    lines
+}
+
+/// How many operands `stages` read, besides their input.
+pub fn operands(stages: &[MapStage]) -> usize {
+    let reads = |s: &&MapStage| matches!(s, MapStage::Add | MapStage::Mul);
+    stages.iter().filter(reads).count()
+}
+
 impl Kernel for Map {
     fn name(&self) -> &'static str {
         "map"
@@ -44,8 +69,7 @@ impl Kernel for Map {
 
     /// One thread per element, each on its own lines.
     fn load(&self, len: usize) -> Option<Load> {
-        let operand = |s: &&MapStage| matches!(s, MapStage::Add | MapStage::Mul);
-        let inputs = 1 + self.0.iter().filter(operand).count();
+        let inputs = 1 + operands(&self.0);
         let special = |s: &&MapStage| matches!(s, MapStage::Act(_));
         let acts = self.0.iter().filter(special).count() as f64;
         let trip = Ops {
@@ -69,23 +93,10 @@ impl Kernel for Map {
 
     fn source(&self) -> Source {
         let mut buffers = vec![float("x", false)];
+        buffers.extend((0..operands(&self.0)).map(|k| float(&format!("a{k}"), false)));
         let start = "    if (gid >= len) {\n        return;\n    }\n    float v = x[gid];\n";
-        let mut body = start.to_string();
-        for s in &self.0 {
-            let line = match s {
-                MapStage::Add | MapStage::Mul => {
-                    let op = if *s == MapStage::Add { '+' } else { '*' };
-                    let name = format!("a{}", buffers.len() - 1);
-                    buffers.push(float(&name, false));
-                    format!("v = v {op} {name}[gid];")
-                }
-                // Bits, so the constant survives the round trip.
-                MapStage::Scale(by) => format!("v = v * f_bits(0x{:08x}u);", by.to_bits()),
-                MapStage::Act(a) => act(*a).to_string(),
-            };
-            let _ = writeln!(body, "    {line}");
-        }
-        body.push_str("    out[gid] = v;\n");
+        let lines = stage_lines(&self.0, &|k| format!("a{k}[gid]"));
+        let body = format!("{start}{lines}    out[gid] = v;\n");
         buffers.push(float("out", true));
         Source::Made(Text {
             entry: format!("map_{:x}", hash(&body)),

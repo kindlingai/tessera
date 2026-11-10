@@ -310,8 +310,8 @@ impl<'a> Tree<'a> {
         fits.then_some(Site::Map { stages, reads, len })
     }
 
-    /// Graph nodes a cover at `t` computes, given its reads.
-    pub fn covered(&self, t: T, reads: &[T]) -> Vec<NodeId> {
+    /// Tree nodes a cover at `t` computes, given its reads.
+    pub fn inside(&self, t: T, reads: &[T]) -> Vec<T> {
         let (mut nodes, mut stack) = (Vec::new(), vec![t]);
         while let Some(n) = stack.pop() {
             nodes.push(n);
@@ -319,6 +319,12 @@ impl<'a> Tree<'a> {
             stack.extend(self.node(n).args.iter().filter(inside));
         }
         nodes.sort_unstable();
+        nodes
+    }
+
+    /// The graph nodes those came from.
+    pub fn covered(&self, t: T, reads: &[T]) -> Vec<NodeId> {
+        let nodes = self.inside(t, reads);
         let mut from: Vec<NodeId> = nodes.iter().map(|n| self.node(*n).from).collect();
         from.dedup();
         from

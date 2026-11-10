@@ -1,9 +1,12 @@
 //! A matmul for few rows, with threads sharing each sum.
 
 use graph::Order;
+use lower::kernels::{MapStage, operands, stage_lines};
 use lower::{
     Arg, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, T, Text, Tree, float,
+    hash,
 };
+use std::cmp::Ordering;
 
 /// Inputs one lane multiplies and adds by itself.
 const CHUNK: usize = 16;
@@ -45,11 +48,20 @@ pub struct Lanes {
     pub form: Form,
 }
 
-/// Each output's lane sums, added in lane order.
-#[derive(Clone, Copy, Debug)]
+/// Elementwise stages a sum runs through before it is stored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct After {
+    pub stages: Vec<MapStage>,
+    /// Which of the chain's reads the sum stands in for.
+    pub sum: usize,
+}
+
+/// Each output's lane sums, added in lane order, then finished.
+#[derive(Clone, Debug)]
 pub struct Sums {
     pub count: usize,
     pub lanes: usize,
+    pub after: After,
 }
 
 /// How many lanes share a sum over `k` inputs.
@@ -108,7 +120,6 @@ const SUMS: &str = "    if (gid >= count) {
     for (u32 l = 0; l < lanes; l++) {
         acc += parts[at + l];
     }
-    out[gid] = acc;
 ";
 
 impl Kernel for Lanes {
@@ -211,19 +222,44 @@ impl Kernel for Sums {
     }
 
     fn source(&self) -> Source {
+        let After { stages, sum } = &self.after;
+        let others = if stages.is_empty() {
+            0
+        } else {
+            operands(stages)
+        };
+        // The chain's reads in order, the sum among them.
+        let read = |k: usize| match k.cmp(sum) {
+            Ordering::Equal => "acc".to_string(),
+            Ordering::Less => format!("a{k}[gid]"),
+            Ordering::Greater => format!("a{}[gid]", k - 1),
+        };
+        let (entry, body) = match stages.is_empty() {
+            true => ("linear_sums".into(), format!("{SUMS}    out[gid] = acc;\n")),
+            false => {
+                let lines = stage_lines(stages, &|k| read(k + 1));
+                let first = read(0);
+                let body = format!("{SUMS}    float v = {first};\n{lines}    out[gid] = v;\n");
+                (format!("linear_sums_{:x}", hash(&body)), body)
+            }
+        };
+        let mut buffers = vec![float("parts", false)];
+        buffers.extend((0..others).map(|k| float(&format!("a{k}"), false)));
+        buffers.push(float("out", true));
         Source::Made(Text {
-            entry: "linear_sums".into(),
-            buffers: vec![float("parts", false), float("out", true)],
+            entry,
+            buffers,
             scalars: vec![("count", "u32"), ("lanes", "u32")],
-            body: SUMS.into(),
+            body,
         })
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let sizes = [self.count, self.lanes].map(Arg::count);
-        let buffers = [step.read(0), step.out()];
+        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+        args.push(step.out());
         vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
+            args: args.into_iter().chain(sizes).collect(),
             shape: Shape::Line(self.count),
         }]
     }
@@ -233,8 +269,23 @@ impl Kernel for Sums {
     }
 }
 
+/// A matmul, or stages finishing a matmul with one reader.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Matmul { x, w, m, n, k } = tree.site(at)? else {
+    let (product, after, others) = match tree.site(at)? {
+        product @ Site::Matmul { .. } => (product, After::default(), Vec::new()),
+        Site::Map { stages, reads, .. } => {
+            let lone = |r: &T| match tree.site(*r) {
+                Some(product @ Site::Matmul { .. }) if !tree.root(*r) => Some(product),
+                _ => None,
+            };
+            let sum = reads.iter().position(|r| lone(r).is_some())?;
+            let others = reads.iter().filter(|r| **r != reads[sum]);
+            let others = others.map(|r| Read::Node(*r)).collect();
+            (lone(&reads[sum])?, After { stages, sum }, others)
+        }
+        _ => return None,
+    };
+    let Site::Matmul { x, w, m, n, k } = product else {
         return None;
     };
     let (lanes, form) = (lanes(k), Form::F32);
@@ -249,9 +300,15 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         form,
     };
     let count = m * n;
+    let sums = Sums {
+        count,
+        lanes,
+        after,
+    };
+    let reads = [Read::Draft(0)].into_iter().chain(others);
     Some(vec![
         Draft::new(parts, [x, w], count * lanes),
-        Draft::new(Sums { count, lanes }, [Read::Draft(0)], count),
+        Draft::new(sums, reads, count),
     ])
 }
 
