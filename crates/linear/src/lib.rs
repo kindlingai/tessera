@@ -2,4 +2,4 @@
 
 mod lanes;
 
-pub use lanes::{Form, Lanes, Sums, lanes};
+pub use lanes::{After, Form, Lanes, Sums, lanes};

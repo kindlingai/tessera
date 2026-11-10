@@ -80,6 +80,8 @@ struct Cover<'a> {
     tree: &'a Tree<'a>,
     device: &'a Device,
     rules: Vec<&'static Rule>,
+    /// The rule the device favors, if it names one.
+    favorite: Option<&'static Rule>,
     /// Per solved node: its choice, if a rule covers it.
     best: Vec<Option<Option<Choice>>>,
 }
@@ -123,6 +125,9 @@ impl Cover<'_> {
                 continue;
             };
             offered.push(rule.name);
+            if self.swallows(rule, t, &drafts) {
+                continue;
+            }
             let seconds = |d: &Draft| self.device.seconds(&*d.kernel, d.len);
             let mut cost: f64 = drafts.iter().map(seconds).sum();
             let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r)).sum();
@@ -146,6 +151,18 @@ impl Cover<'_> {
             }
         }
         best.map(|b| Choice { offered, ..b })
+    }
+
+    /// Whether a cover hides a node the favored rule takes.
+    fn swallows(&self, rule: &Rule, t: T, drafts: &[Draft]) -> bool {
+        let Some(favorite) = self.favorite.filter(|f| f.name != rule.name) else {
+            return false;
+        };
+        let inside = self.tree.inside(t, &reads(drafts));
+        let below = inside.into_iter().filter(|n| *n != t);
+        below
+            .into_iter()
+            .any(|n| (favorite.propose)(self.tree, n).is_some())
     }
 
     /// The reads of the chosen cover at `t`.
@@ -233,10 +250,12 @@ pub fn select(
 ) -> Result<Selected, Error> {
     let tree = Tree::new(g, entry, sizes)?;
     let nodes = (0..tree.len() as u32).map(T);
+    let rules = rules();
     let mut cover = Cover {
         tree: &tree,
         device,
-        rules: rules(),
+        favorite: rules.iter().copied().find(|r| device.favors(r.name)),
+        rules,
         best: (0..tree.len()).map(|_| None).collect(),
     };
     // Roots get buffers. So does whatever a chosen cover reads.
