@@ -5,6 +5,7 @@ use crate::emit::{Text, float};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Read, Site};
+use crate::tree::{T, Tree};
 use graph::{Pairs, Stage};
 use ops_model::apply_rope_heads;
 
@@ -114,14 +115,14 @@ impl Kernel for Rope {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Stage {
         stage: Stage::Rope { theta, pairs },
         x,
         operand: Some((at, positions)),
         len,
         width,
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };
@@ -139,7 +140,7 @@ fn propose(site: &Site) -> Option<Vec<Draft>> {
     };
     Some(vec![
         Draft::new(angles, [at], positions * width),
-        Draft::new(rope, [Read::Value(x), Read::Draft(0)], len),
+        Draft::new(rope, [Read::Node(x), Read::Draft(0)], len),
     ])
 }
 

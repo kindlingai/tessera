@@ -5,6 +5,7 @@ use crate::emit::{Text, float};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use crate::tree::{T, Tree};
 use graph::Order;
 use sim::{Load, Ops};
 
@@ -99,8 +100,8 @@ impl Kernel for Thin {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
-    let Site::Matmul { x, w, m, n, k } = *site else {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let Site::Matmul { x, w, m, n, k } = tree.site(at)? else {
         return None;
     };
     (m <= THIN_ROWS).then(|| vec![Draft::new(Thin { m, n, k }, [x, w], m * n)])

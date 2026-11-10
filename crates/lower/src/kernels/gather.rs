@@ -4,6 +4,7 @@ use crate::abi::{Arg, Launch, Shape, Source};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use crate::tree::{T, Tree};
 use ops_model::gather_rows;
 
 #[derive(Clone, Copy, Debug)]
@@ -39,13 +40,13 @@ impl Kernel for Gather {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Gather {
         table,
         ids,
         rows,
         width,
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };

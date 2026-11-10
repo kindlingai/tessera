@@ -1,5 +1,8 @@
 use crate::kernels::{Map, MapStage, Thin};
-use crate::{Arg, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Plan, Slot, Source, Step};
+use crate::{
+    Arg, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Plan, Site, Slot, Source, Step, T,
+    Tree,
+};
 use crate::{assign, lower, peak, rules, schedule, select};
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
@@ -276,4 +279,45 @@ fn models_fill_gaps() {
     let loaded = Device::load(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
     assert!(loaded == device && seconds(&loaded) == modelled);
+}
+
+#[test]
+fn trees_cut_shared() {
+    let g = program(&Config::toy(4, 16));
+    let tree = Tree::new(&g, 0, &SIZES).unwrap();
+    let chains = |want: &[MapStage]| -> Vec<(T, Vec<T>)> {
+        let all = (0..tree.len() as u32).map(T);
+        let chain = |t: T| match tree.site(t)? {
+            Site::Map { stages, reads, .. } if stages == want => Some((t, reads)),
+            _ => None,
+        };
+        all.filter_map(chain).collect()
+    };
+    // The activation has one reader, so it joins the multiply.
+    let gates = chains(&[MapStage::Act(Act::Silu), MapStage::Mul]);
+    assert_eq!(gates.len(), 2, "one per layer");
+    for (gate, reads) in &gates {
+        let act = tree.node(*gate).args[0];
+        assert!(!tree.root(act) && reads.len() == 2);
+        assert_eq!(tree.covered(*gate, reads).len(), 2);
+    }
+    // The residual stream has two readers: a root.
+    let adds = chains(&[MapStage::Add]);
+    assert_eq!(adds.len(), 2 * 2, "two per layer");
+    for (add, reads) in &adds {
+        assert!(tree.root(reads[0]) && tree.covered(*add, reads).len() == 1);
+    }
+    let (logits, shape) = &tree.outputs[0];
+    assert!(tree.root(*logits) && *shape == [2, 5, 32]);
+}
+
+#[test]
+fn favoring_stays_local() {
+    // No rule competes with maps, so favoring them changes nothing.
+    let (_, plain) = toy(&Device::guess());
+    let (_, favored) = toy(&Device::guess().favoring("map"));
+    assert!(
+        plain == favored,
+        "a favored rule skewed its readers' choice"
+    );
 }

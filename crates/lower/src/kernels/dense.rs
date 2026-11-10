@@ -6,6 +6,7 @@ use crate::kernel::Kernel;
 use crate::kernels::matmul::{launch, source, tiles};
 use crate::plan::Step;
 use crate::rule::{Attn, Draft, Read, Site};
+use crate::tree::{T, Tree};
 use graph::Order;
 
 /// The most score elements this form may hold.
@@ -164,14 +165,14 @@ impl Kernel for Causal {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Attend {
         scale,
         q,
         k,
         v,
         sizes,
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };
@@ -188,7 +189,7 @@ fn propose(site: &Site) -> Option<Vec<Draft>> {
             Draft::new(causal, [Read::Draft(0)], pairs),
             Draft::new(
                 PerHead(Part::Values, sizes),
-                [Read::Draft(1), Read::Value(v)],
+                [Read::Draft(1), Read::Node(v)],
                 out,
             ),
         ]

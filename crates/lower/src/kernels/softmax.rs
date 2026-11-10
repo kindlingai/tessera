@@ -6,6 +6,7 @@ use crate::kernel::Kernel;
 use crate::kernels::per_row;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use crate::tree::{T, Tree};
 use graph::Stage;
 use sim::{Load, Ops};
 
@@ -75,14 +76,14 @@ impl Kernel for Softmax {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Stage {
         stage: Stage::Softmax,
         x,
         len,
         width,
         ..
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };

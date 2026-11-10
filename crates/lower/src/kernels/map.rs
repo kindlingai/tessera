@@ -5,6 +5,7 @@ use crate::emit::{Text, float, hash};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
+use crate::tree::{T, Tree};
 use graph::Act;
 use sim::{Load, Ops};
 use std::fmt::Write;
@@ -109,11 +110,11 @@ impl Kernel for Map {
     }
 }
 
-fn propose(site: &Site) -> Option<Vec<Draft>> {
-    let Site::Map { stages, reads, len } = *site else {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let Site::Map { stages, reads, len } = tree.site(at)? else {
         return None;
     };
-    Some(vec![Draft::new(Map(stages.to_vec()), reads.to_vec(), len)])
+    Some(vec![Draft::new(Map(stages), reads, len)])
 }
 
 crate::rule!("map", propose);

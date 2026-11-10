@@ -16,6 +16,7 @@ pub mod rule;
 mod run;
 mod schedule;
 mod select;
+mod tree;
 
 pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
@@ -29,6 +30,7 @@ pub use run::{Feed, Held, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
 pub use sim::{Fit, Load, Ops};
+pub use tree::{Node, T, Term, Tree};
 
 use graph::{DimName, Graph};
 

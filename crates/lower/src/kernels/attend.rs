@@ -5,6 +5,7 @@ use crate::kernel::Kernel;
 use crate::kernels::{Join, Map, MapStage};
 use crate::plan::Step;
 use crate::rule::{Attn, Draft, Read, Site};
+use crate::tree::{T, Tree};
 use graph::Order;
 use ops_model::gqa_attention;
 
@@ -72,14 +73,14 @@ impl Kernel for Attend {
 }
 
 /// Scale the queries, join keys with values, then attend.
-fn propose(site: &Site) -> Option<Vec<Draft>> {
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Site::Attend {
         scale,
         q,
         k,
         v,
         sizes,
-    } = *site
+    } = tree.site(at)?
     else {
         return None;
     };

@@ -2,7 +2,7 @@
 
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::MapStage;
-use crate::select::Val;
+use crate::tree::{T, Tree};
 use graph::Stage;
 
 pub use scattered_collect::declarative::{gather, scatter};
@@ -25,65 +25,65 @@ impl Attn {
     }
 }
 
-/// One piece of a graph that some kernels can compute.
-#[derive(Clone, Copy, Debug)]
+/// A pattern at a tree node, for kernels to compute.
+#[derive(Clone, Debug)]
 pub enum Site<'a> {
     /// `x[m, k]` times `w[n, k]` transposed.
     Matmul {
-        x: Val,
-        w: Val,
+        x: T,
+        w: T,
         m: usize,
         n: usize,
         k: usize,
     },
     /// Elementwise stages over `reads[0]`; operands follow it.
     Map {
-        stages: &'a [MapStage],
-        reads: &'a [Val],
+        stages: Vec<MapStage>,
+        reads: Vec<T>,
         len: usize,
     },
     /// One row stage that is not elementwise.
     Stage {
         stage: &'a Stage,
-        x: Val,
+        x: T,
         /// The stage's argument, and how many elements it holds.
-        operand: Option<(Val, usize)>,
+        operand: Option<(T, usize)>,
         len: usize,
         width: usize,
     },
     /// Causal attention with `scale` on the scores.
     Attend {
         scale: f32,
-        q: Val,
-        k: Val,
-        v: Val,
+        q: T,
+        k: T,
+        v: T,
         sizes: Attn,
     },
     Gather {
-        table: Val,
-        ids: Val,
+        table: T,
+        ids: T,
         rows: usize,
         width: usize,
     },
     /// Indices of each row's `k` largest entries.
     Top {
-        x: Val,
+        x: T,
         rows: usize,
         width: usize,
         k: usize,
     },
 }
 
-/// A draft reads a value, or an earlier draft's result.
+/// A draft reads a tree node, or an earlier draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Read {
-    Value(Val),
+    Node(T),
     Draft(usize),
 }
 
-impl From<Val> for Read {
-    fn from(v: Val) -> Self {
-        Read::Value(v)
+impl From<T> for Read {
+    fn from(t: T) -> Self {
+        Read::Node(t)
     }
 }
 
@@ -109,10 +109,10 @@ impl Draft {
     }
 }
 
-/// Launches for a site, the last writing its value.
+/// Launches for a tree node, covering nodes above their reads.
 pub struct Rule {
     pub name: &'static str,
-    pub propose: fn(&Site) -> Option<Vec<Draft>>,
+    pub propose: fn(&Tree, T) -> Option<Vec<Draft>>,
 }
 
 gather! {
@@ -120,7 +120,7 @@ gather! {
     pub static RULES: scattered_collect::ScatteredSlice<Rule>;
 }
 
-/// Registers a rule. Selection then considers it at every site.
+/// Registers a rule. Selection then asks it at every node.
 #[macro_export]
 macro_rules! rule {
     ($name:literal, $propose:path) => {
