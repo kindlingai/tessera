@@ -13,12 +13,12 @@ cuda = ["gpukit/cuda"]
 rocm = ["gpukit/rocm"]
 
 [dependencies]
-graph = { path = "../graph" }
-sim = { path = "../sim" }
+graph = { workspace = true }
+sim = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 scattered-collect = "0.22"
-gpukit = { path = "../gpukit", default-features = false }
+gpukit = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
@@ -37,9 +37,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-kernels = { path = "../kernels" }
-linear = { path = "../linear" }
-interp = { path = "../interp" }
-models = { path = "../models" }
-ops = { path = "../ops" }
-trace = { path = "../trace" }
+kernels = { workspace = true }
+linear = { workspace = true }
+interp = { workspace = true }
+models = { workspace = true }
+ops = { workspace = true }
+trace = { workspace = true }

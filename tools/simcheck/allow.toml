@@ -1,6 +1,6 @@
 # File pairs allowed to hold near-copies of each other.
 pairs = [
-    ["crates/gpukit/src/cuda/context.rs", "crates/gpukit/src/rocm/context.rs"],
-    ["crates/gpukit/src/kernel.rs", "crates/gpukit/src/kernel.rs"],
-    ["crates/gpukit/tests/cuda_smoke_test.rs", "crates/gpukit/tests/rocm_smoke_test.rs"],
+    ["crates/gpu/gpukit/src/cuda/context.rs", "crates/gpu/gpukit/src/rocm/context.rs"],
+    ["crates/gpu/gpukit/src/kernel.rs", "crates/gpu/gpukit/src/kernel.rs"],
+    ["crates/gpu/gpukit/tests/cuda_smoke_test.rs", "crates/gpu/gpukit/tests/rocm_smoke_test.rs"],
 ]

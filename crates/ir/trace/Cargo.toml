@@ -7,5 +7,5 @@ publish.workspace = true
 description = "Builds graphs by running model descriptions"
 
 [dependencies]
-graph = { path = "../graph" }
-trace-derive = { path = "../trace-derive" }
+graph = { workspace = true }
+trace-derive = { workspace = true }

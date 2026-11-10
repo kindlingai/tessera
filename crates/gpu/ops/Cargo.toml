@@ -13,4 +13,4 @@ cuda = ["gpukit/cuda"]
 rocm = ["gpukit/rocm"]
 
 [dependencies]
-gpukit = { path = "../gpukit", default-features = false }
+gpukit = { workspace = true }

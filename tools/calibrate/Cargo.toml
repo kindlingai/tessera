@@ -16,13 +16,13 @@ name = "tessera-calibrate"
 path = "src/main.rs"
 
 [dependencies]
-graph = { path = "../graph" }
-trace = { path = "../trace" }
-lower = { path = "../lower" }
-sim = { path = "../sim" }
-kernels = { path = "../kernels" }
-linear = { path = "../linear" }
-gpukit = { path = "../gpukit", default-features = false }
+graph = { workspace = true }
+trace = { workspace = true }
+lower = { workspace = true }
+sim = { workspace = true }
+kernels = { workspace = true }
+linear = { workspace = true }
+gpukit = { workspace = true }
 
 [dev-dependencies]
-ops = { path = "../ops" }
+ops = { workspace = true }

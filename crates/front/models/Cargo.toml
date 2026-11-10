@@ -12,13 +12,13 @@ cuda = ["lower/cuda", "calibrate/cuda", "kernels/cuda"]
 rocm = ["lower/rocm", "calibrate/rocm", "kernels/rocm"]
 
 [dependencies]
-graph = { path = "../graph" }
-trace = { path = "../trace" }
+graph = { workspace = true }
+trace = { workspace = true }
 
 [dev-dependencies]
-kernels = { path = "../kernels" }
-calibrate = { path = "../calibrate" }
-checkpoint = { path = "../checkpoint" }
-interp = { path = "../interp" }
-lower = { path = "../lower" }
-ops = { path = "../ops" }
+kernels = { workspace = true }
+calibrate = { workspace = true }
+checkpoint = { workspace = true }
+interp = { workspace = true }
+lower = { workspace = true }
+ops = { workspace = true }

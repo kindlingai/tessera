@@ -1,21 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/checkpoint",
-    "crates/graph",
-    "crates/trace",
-    "crates/trace-derive",
-    "crates/interp",
-    "crates/lower",
-    "crates/models",
-    "crates/calibrate",
-    "crates/kernels",
-    "crates/linear",
-    "crates/sim",
-    "crates/gpukit",
-    "crates/gemm",
-    "crates/ops",
-    "crates/ops-model",
+    "crates/front/*",
+    "crates/gpu/*",
+    "crates/ir/*",
+    "crates/plan/*",
+    "crates/rules/*",
+    "tools/calibrate",
     "tools/lint",
 ]
 
@@ -23,3 +14,21 @@ members = [
 edition = "2024"
 license = "MIT"
 publish = false
+
+# Every crate here, so members name each other without paths.
+[workspace.dependencies]
+calibrate = { path = "tools/calibrate" }
+checkpoint = { path = "crates/front/checkpoint" }
+gemm = { path = "crates/gpu/gemm" }
+gpukit = { path = "crates/gpu/gpukit" }
+graph = { path = "crates/ir/graph" }
+interp = { path = "crates/ir/interp" }
+kernels = { path = "crates/rules/kernels" }
+linear = { path = "crates/rules/linear" }
+lower = { path = "crates/plan/lower" }
+models = { path = "crates/front/models" }
+ops = { path = "crates/gpu/ops" }
+ops-model = { path = "crates/gpu/ops-model" }
+sim = { path = "crates/plan/sim" }
+trace = { path = "crates/ir/trace" }
+trace-derive = { path = "crates/ir/trace-derive" }

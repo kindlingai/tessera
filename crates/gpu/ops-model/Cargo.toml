@@ -13,5 +13,5 @@ cuda = ["gpukit/cuda", "ops/cuda"]
 rocm = ["gpukit/rocm", "ops/rocm"]
 
 [dependencies]
-gpukit = { path = "../gpukit", default-features = false }
-ops = { path = "../ops" }
+gpukit = { workspace = true }
+ops = { workspace = true }
