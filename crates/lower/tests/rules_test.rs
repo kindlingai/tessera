@@ -1,5 +1,9 @@
 //! Each rule's launches against the CPU interpreter, on the GPU.
 
+// Linking the crates registers their rules.
+use kernels as _;
+use linear as _;
+
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Cpu, Data, Tensor, run};

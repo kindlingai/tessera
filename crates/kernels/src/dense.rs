@@ -1,13 +1,10 @@
 //! Attention as two matmuls per head around a softmax.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::kernels::matmul::{launch, source, tiles};
-use crate::plan::Step;
-use crate::rule::{Attn, Draft, Read, Site};
-use crate::tree::{T, Tree};
+use crate::matmul::{launch, source, tiles};
 use graph::Order;
+use lower::{
+    Arg, Attn, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float,
+};
 
 /// The most score elements this form may hold.
 pub const DENSE_SCORES: usize = 1 << 28;
@@ -196,4 +193,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     })
 }
 
-crate::rule!("dense", propose);
+lower::rule!("dense", propose);

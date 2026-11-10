@@ -1,12 +1,9 @@
 //! Causal attention that walks the keys one at a time.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::kernel::Kernel;
-use crate::kernels::{Join, Map, MapStage};
-use crate::plan::Step;
-use crate::rule::{Attn, Draft, Read, Site};
-use crate::tree::{T, Tree};
+use crate::join::Join;
 use graph::Order;
+use lower::kernels::{Map, MapStage};
+use lower::{Arg, Attn, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
 use ops_model::gqa_attention;
 
 /// Reads scaled queries, and keys joined with values.
@@ -97,4 +94,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     ])
 }
 
-crate::rule!("attend", propose);
+lower::rule!("attend", propose);

@@ -16,6 +16,7 @@ graph = { path = "../graph" }
 lower = { path = "../lower" }
 
 [dev-dependencies]
+kernels = { path = "../kernels" }
 interp = { path = "../interp" }
 ops = { path = "../ops" }
 trace = { path = "../trace" }

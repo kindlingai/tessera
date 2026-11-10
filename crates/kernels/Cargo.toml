@@ -1,0 +1,19 @@
+[package]
+name = "kernels"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Kernels and the lowering rules that propose them"
+
+[features]
+default = []
+cuda = ["lower/cuda"]
+rocm = ["lower/rocm"]
+
+[dependencies]
+graph = { path = "../graph" }
+lower = { path = "../lower" }
+sim = { path = "../sim" }
+gemm = { path = "../gemm" }
+ops-model = { path = "../ops-model" }

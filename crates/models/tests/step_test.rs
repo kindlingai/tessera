@@ -1,5 +1,8 @@
 //! A step entry's kept rows against whole forward passes.
 
+// Linking the crate registers its rules.
+use kernels as _;
+
 use interp::{Cpu, Data, Store, Tensor, run, run_kept};
 use lower::{Device, Feed, Run, lower, open, rules};
 use models::qwen3::{Config, program, stepper};

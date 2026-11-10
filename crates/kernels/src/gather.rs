@@ -1,10 +1,6 @@
 //! Rows of a table at given indices.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::kernel::Kernel;
-use crate::plan::Step;
-use crate::rule::{Draft, Site};
-use crate::tree::{T, Tree};
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
 use ops_model::gather_rows;
 
 #[derive(Clone, Copy, Debug)]
@@ -57,4 +53,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     )])
 }
 
-crate::rule!("gather", propose);
+lower::rule!("gather", propose);

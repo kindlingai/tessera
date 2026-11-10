@@ -1,9 +1,6 @@
 //! Joins rows of two inputs along the last axis.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::plan::Step;
+use lower::{Arg, Kernel, Launch, Shape, Source, Step, Text, float};
 
 /// Each output row: a `left` row, then a `right` row.
 #[derive(Clone, Copy, Debug)]

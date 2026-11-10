@@ -1,5 +1,8 @@
 //! The traced nanogpt, run from JSON alone, matches recorded logits.
 
+// Linking the crate registers its rules.
+use kernels as _;
+
 use interp::{Cpu, Data, Tensor, run};
 use lower::{Device, Feed, lower, open};
 use models::Stack;

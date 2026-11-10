@@ -1,11 +1,6 @@
 //! Each row's largest entry, found in two launches.
 
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
-use crate::kernel::Kernel;
-use crate::plan::Step;
-use crate::rule::{Draft, Read, Site};
-use crate::tree::{T, Tree};
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 256;
@@ -155,4 +150,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     ])
 }
 
-crate::rule!("argmax", propose);
+lower::rule!("argmax", propose);
