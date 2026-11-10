@@ -8,12 +8,12 @@ description = "Kernels and the lowering rules that propose them"
 
 [features]
 default = []
-cuda = ["lower/cuda"]
-rocm = ["lower/rocm"]
+cuda = ["lower/cuda", "gpukit/cuda"]
+rocm = ["lower/rocm", "gpukit/rocm"]
 
 [dependencies]
 graph = { workspace = true }
 lower = { workspace = true }
 sim = { workspace = true }
 gemm = { workspace = true }
-ops-model = { workspace = true }
+gpukit = { workspace = true }

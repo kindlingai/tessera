@@ -27,8 +27,6 @@ kernels = { path = "crates/rules/kernels" }
 linear = { path = "crates/rules/linear" }
 lower = { path = "crates/plan/lower" }
 models = { path = "crates/front/models" }
-ops = { path = "crates/gpu/ops" }
-ops-model = { path = "crates/gpu/ops-model" }
 sim = { path = "crates/plan/sim" }
 trace = { path = "crates/ir/trace" }
 trace-derive = { path = "crates/ir/trace-derive" }

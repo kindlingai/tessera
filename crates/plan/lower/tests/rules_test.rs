@@ -4,12 +4,12 @@
 use kernels as _;
 use linear as _;
 
+use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
-use interp::{Cpu, Data, Tensor, run};
+use interp::{Data, Tensor, run};
 use lower::{Device, Feed, cut, lower, open, rules};
 use models::{Stack, nanogpt, qwen3};
-use ops::testing::{Noise, gpu_available, max_abs_diff};
 use trace::{EntryKind, Mask, Model, Port, Role};
 
 const SIZES: [(DimName, u64); 3] = [(Seqs, 2), (Rows, 3), (Context, 5)];
@@ -88,7 +88,7 @@ fn feed(t: &Tensor) -> Feed<'_> {
 
 /// Runs entry 0 both ways; returns the largest difference.
 fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
-    let want = run(g, &mut Cpu, weights, 0, inputs).unwrap();
+    let want = run(g, weights, 0, inputs).unwrap();
     let runner = open(lower(g, 0, &SIZES, device).unwrap()).unwrap();
     for (at, w) in weights.iter().enumerate() {
         runner.load(at as u32, w.floats().unwrap()).unwrap();
@@ -111,7 +111,7 @@ fn devices() -> Vec<(&'static str, Device)> {
 
 #[test]
 fn each_rule_matches_cpu() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut noise = Noise(7);
@@ -152,7 +152,7 @@ fn each_rule_matches_cpu() {
 
 #[test]
 fn whole_models_match_cpu() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut noise = Noise(11);

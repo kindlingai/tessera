@@ -1,26 +1,9 @@
 //! Walks the graph in order, binding dimensions from the inputs.
 
+use crate::cpu;
 use crate::tensor::{Data, Error, Tensor};
-use graph::{
-    Attend, DimExpr, DimName, Graph, NodeId, Numerics, Op, PathSeg, Select, Shape, Size, Stage,
-    View,
-};
+use graph::{DimExpr, DimName, Graph, NodeId, Numerics, Op, PathSeg, Select, Shape, Size, View};
 use std::collections::BTreeMap;
-
-/// One per backend; views and casts stay on the host.
-pub trait Kernels {
-    // `n` is the node's numerics, or the default without one.
-    fn matmul(&mut self, n: &Numerics, x: &Tensor, w: &Tensor) -> Result<Tensor, Error>;
-    fn attend(&mut self, n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tensor, Error>;
-    fn stage(
-        &mut self,
-        n: &Numerics,
-        s: &Stage,
-        x: &Tensor,
-        operand: Option<&Tensor>,
-    ) -> Result<Tensor, Error>;
-    fn gather(&mut self, table: &Tensor, ids: &Tensor) -> Result<Tensor, Error>;
-}
 
 /// Dimension sizes for one launch.
 struct Sizes<'a> {
@@ -137,18 +120,16 @@ impl Store {
 /// Runs `entry` with nothing kept from earlier launches.
 pub fn run(
     g: &Graph,
-    k: &mut dyn Kernels,
     weights: &[Tensor],
     entry: usize,
     inputs: &[Tensor],
 ) -> Result<Vec<Tensor>, Error> {
-    run_kept(g, k, weights, &mut Store::default(), entry, inputs)
+    run_kept(g, weights, &mut Store::default(), entry, inputs)
 }
 
 /// Runs `entry` and returns its outputs in order.
 pub fn run_kept(
     g: &Graph,
-    k: &mut dyn Kernels,
     weights: &[Tensor],
     store: &mut Store,
     entry: usize,
@@ -200,7 +181,7 @@ pub fn run_kept(
         let num = n.numerics.unwrap_or_default();
         let out = match n.op {
             Op::Append(i) => store.append(i as usize, args[0])?,
-            _ => ctx.eval(k, &num, &n.op, &args)?,
+            _ => ctx.eval(&num, &n.op, &args)?,
         };
         let want = sizes.shape(&n.ty.shape)?;
         if out.shape != want || out.data.dtype() != n.ty.dtype {
@@ -246,13 +227,7 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn eval(
-        &self,
-        k: &mut dyn Kernels,
-        num: &Numerics,
-        op: &Op,
-        args: &[&Tensor],
-    ) -> Result<Tensor, Error> {
+    fn eval(&self, num: &Numerics, op: &Op, args: &[&Tensor]) -> Result<Tensor, Error> {
         match op {
             Op::Input { entry, port } if *entry as usize == self.entry => {
                 Ok(self.inputs[*port as usize].clone())
@@ -260,20 +235,20 @@ impl Context<'_> {
             Op::Input { .. } => Err(Error::Unsupported("another entry's input".into())),
             Op::Weight(i) => Ok(self.weights[*i as usize].clone()),
             Op::Matmul if args[1].shape.len() > 2 => lacks("batched matmul"),
-            Op::Matmul => k.matmul(num, args[0], args[1]),
+            Op::Matmul => cpu::matmul(num, args[0], args[1]),
             Op::Attend(a) if a.picked => lacks("attention over picked keys"),
-            Op::Attend(a) => k.attend(num, a, [args[0], args[1], args[2]]),
+            Op::Attend(a) => cpu::attend(num, a, [args[0], args[1], args[2]]),
             Op::Mask(_) => lacks("masks"),
             Op::Row(row) => {
                 let mut x = args[0].clone();
                 let mut rest = args[1..].iter();
                 for s in &row.0 {
                     let operand = (s.operands() == 1).then(|| *rest.next().expect("verified"));
-                    x = k.stage(num, s, &x, operand)?;
+                    x = cpu::stage(num, s, &x, operand)?;
                 }
                 Ok(x)
             }
-            Op::Select(Select::Gather) => k.gather(args[0], args[1]),
+            Op::Select(Select::Gather) => cpu::gather(args[0], args[1]),
             Op::Select(Select::TopK { k }) => top_k(args[0], self.sizes.expr(k)?),
             Op::Select(s) => lacks(&format!("{s:?}")),
             Op::Append(_) => lacks("kept rows outside a launch"),

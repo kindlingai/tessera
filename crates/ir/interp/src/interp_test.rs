@@ -54,7 +54,7 @@ fn views() -> Graph {
 
 #[test]
 fn views_move_data() {
-    let out = run(&views(), &mut Cpu, &[], 0, &[ramp(vec![2, 2, 3])]).unwrap();
+    let out = run(&views(), &[], 0, &[ramp(vec![2, 2, 3])]).unwrap();
     assert_eq!(
         out[0].data,
         Data::F32(vec![1., 2., 4., 5., 7., 8., 10., 11.])
@@ -67,9 +67,9 @@ fn views_move_data() {
 #[test]
 fn launch_sizes_checked() {
     let g = views();
-    let too_long = run(&g, &mut Cpu, &[], 0, &[ramp(vec![5, 2, 3])]);
+    let too_long = run(&g, &[], 0, &[ramp(vec![5, 2, 3])]);
     assert!(matches!(too_long, Err(Error::Mismatch(_))));
-    let wrong_heads = run(&g, &mut Cpu, &[], 0, &[ramp(vec![2, 3, 3])]);
+    let wrong_heads = run(&g, &[], 0, &[ramp(vec![2, 3, 3])]);
     assert!(matches!(wrong_heads, Err(Error::Mismatch(_))));
 }
 
@@ -92,11 +92,11 @@ fn qkv() -> [Tensor; 3] {
 #[test]
 fn causal_first_row() {
     let ins = qkv();
-    let out = run(&attention(Mask::Causal), &mut Cpu, &[], 0, &ins).unwrap();
+    let out = run(&attention(Mask::Causal), &[], 0, &ins).unwrap();
     let (o, v) = (out[0].floats().unwrap(), ins[2].floats().unwrap());
     assert_eq!(o[..6], v[..6]);
     assert_eq!(o[24..30], v[24..30]);
-    let both = run(&attention(Mask::Bidirectional), &mut Cpu, &[], 0, &ins).unwrap();
+    let both = run(&attention(Mask::Bidirectional), &[], 0, &ins).unwrap();
     assert_ne!(both[0].floats().unwrap()[..6], v[..6]);
 }
 
@@ -136,12 +136,12 @@ fn decode_inputs(rows: usize) -> [Tensor; 3] {
 #[test]
 fn decode_sees_past_keys() {
     let ins = decode_inputs(1);
-    let causal = run(&decode(Mask::Causal), &mut Cpu, &[], 0, &ins).unwrap();
-    let both = run(&decode(Mask::Bidirectional), &mut Cpu, &[], 0, &ins).unwrap();
+    let causal = run(&decode(Mask::Causal), &[], 0, &ins).unwrap();
+    let both = run(&decode(Mask::Bidirectional), &[], 0, &ins).unwrap();
     assert_eq!(causal, both);
     let short = Tensor::f32(vec![2, 4, 2, 3], vec![0.0; 47]);
     let [q, _, v] = qkv();
-    assert!(run(&attention(Mask::Causal), &mut Cpu, &[], 0, &[q, short, v]).is_err());
+    assert!(run(&attention(Mask::Causal), &[], 0, &[q, short, v]).is_err());
 }
 
 #[test]
@@ -153,9 +153,9 @@ fn entries_run_alone() {
     let g = m.finish([(Role::Logits, &b.scale(3.0))]);
     assert_eq!(first.entries.len(), 1);
     let x = Tensor::f32(vec![2], vec![1.0, 2.0]);
-    let out = run(&g, &mut Cpu, &[], 0, std::slice::from_ref(&x)).unwrap();
+    let out = run(&g, &[], 0, std::slice::from_ref(&x)).unwrap();
     assert_eq!(out[0].data, Data::F32(vec![2.0, 4.0]));
-    let out = run(&g, &mut Cpu, &[], 1, &[x]).unwrap();
+    let out = run(&g, &[], 1, &[x]).unwrap();
     assert_eq!(out[0].data, Data::F32(vec![3.0, 6.0]));
 }
 
@@ -183,7 +183,7 @@ fn accumulators_follow_numerics() {
     let x = Tensor::f32(vec![1, 3], vec![2048.0, 1.0, 1.0]);
     let sums = |acc| {
         let g = summing(acc);
-        let out = run(&g, &mut Cpu, &ones, 0, std::slice::from_ref(&x)).unwrap();
+        let out = run(&g, &ones, 0, std::slice::from_ref(&x)).unwrap();
         out[0].floats().unwrap().to_vec()
     };
     assert_eq!(sums(DType::F32), [2050.0, 2050.0]);

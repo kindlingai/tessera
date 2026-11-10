@@ -1,7 +1,7 @@
 //! Rows of a table at given indices.
 
+use crate::gather_rows;
 use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
-use ops_model::gather_rows;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Gather {

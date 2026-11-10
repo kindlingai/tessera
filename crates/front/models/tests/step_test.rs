@@ -3,10 +3,10 @@
 // Linking the crate registers its rules.
 use kernels as _;
 
-use interp::{Cpu, Data, Store, Tensor, run, run_kept};
+use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use interp::{Data, Store, Tensor, run, run_kept};
 use lower::{Device, Feed, Run, lower, open, rules};
 use models::qwen3::{Config, program, stepper};
-use ops::testing::{Noise, gpu_available, max_abs_diff};
 use std::ops::Range;
 use trace::DimName::{Context, Rows, Seqs};
 use trace::Graph;
@@ -55,7 +55,7 @@ fn steps_match_forward() {
     let weights = weights(&whole, &mut noise);
     let draw = |_| ((noise.draw() + 1.0) * 16.0) as u32;
     let tokens: Vec<u32> = (0..SEQS * LEN).map(draw).collect();
-    let want = run(&whole, &mut Cpu, &weights, 0, &inputs(&tokens, 0..LEN)).unwrap();
+    let want = run(&whole, &weights, 0, &inputs(&tokens, 0..LEN)).unwrap();
     let want = want[0].floats().unwrap();
     let vocab = want.len() / (SEQS * LEN);
     // Three rows at once, then shorter launches.
@@ -63,7 +63,7 @@ fn steps_match_forward() {
     let mut got = vec![0.0; want.len()];
     for span in [0..3, 3..4, 4..5, 5..7] {
         let feeds = inputs(&tokens, span.clone());
-        let out = run_kept(&step, &mut Cpu, &weights, &mut store, 0, &feeds).unwrap();
+        let out = run_kept(&step, &weights, &mut store, 0, &feeds).unwrap();
         let (ids, logits) = (out[0].indices().unwrap(), out[1].floats().unwrap());
         assert_eq!(out[0].shape, [SEQS, span.len()]);
         assert_eq!(store.rows(0), span.end);
@@ -85,16 +85,16 @@ fn launches_start_empty() {
     let tokens = [1; SEQS * LEN];
     let feeds = inputs(&tokens, 0..2);
     // Without a store, every launch is a first one.
-    let once = run(&step, &mut Cpu, &weights, 0, &feeds).unwrap();
-    let again = run(&step, &mut Cpu, &weights, 0, &feeds).unwrap();
+    let once = run(&step, &weights, 0, &feeds).unwrap();
+    let again = run(&step, &weights, 0, &feeds).unwrap();
     assert_eq!(once, again);
     // Rows past the context bound are refused.
     let mut store = Store::default();
     let long = inputs(&tokens, 0..LEN);
     for _ in 0..2 {
-        run_kept(&step, &mut Cpu, &weights, &mut store, 0, &long).unwrap();
+        run_kept(&step, &weights, &mut store, 0, &long).unwrap();
     }
-    let third = run_kept(&step, &mut Cpu, &weights, &mut store, 0, &long);
+    let third = run_kept(&step, &weights, &mut store, 0, &long);
     assert!(third.is_err(), "21 rows exceed a context of 16");
 }
 
@@ -134,7 +134,7 @@ fn launch(
 
 #[test]
 fn plans_keep_rows() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let step = stepper(&Config::toy(4, 16));
@@ -146,7 +146,7 @@ fn plans_keep_rows() {
         let (mut store, mut runner) = (Store::default(), None);
         for span in spans.clone() {
             let feeds = feeds(&tokens, 1, span);
-            let want = run_kept(&step, &mut Cpu, &weights, &mut store, 0, &feeds).unwrap();
+            let want = run_kept(&step, &weights, &mut store, 0, &feeds).unwrap();
             let (ids, logits) = launch(&step, &mut runner, &weights, &feeds, &device);
             let off = max_abs_diff(&logits, want[1].floats().unwrap());
             assert!(off < 1e-4, "the plan is off by {off:e}");

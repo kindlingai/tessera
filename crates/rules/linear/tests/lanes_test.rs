@@ -3,10 +3,10 @@
 // The other matmul rules come from here.
 use kernels as _;
 
+use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{self, Ffn, Hidden, Rows};
-use interp::{Cpu, Data, Tensor, run};
+use interp::{Data, Tensor, run};
 use lower::{Device, Dialect, Feed, Source, lower, open, rules};
-use ops::testing::{Noise, gpu_available, max_abs_diff};
 use trace::{
     Act, DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights,
 };
@@ -76,7 +76,7 @@ fn rule_registers() {
 
 #[test]
 fn lanes_match_cpu() {
-    if !gpu_available() {
+    if !backend_ready() {
         return eprintln!("no GPU here; skipped");
     }
     let mut draws = Noise(23);
@@ -91,7 +91,7 @@ fn lanes_match_cpu() {
         let weights = [noise(vec![n as usize, k as usize], &mut draws)];
         for m in [1usize, 5] {
             let x = noise(vec![m, k as usize], &mut draws);
-            let want = run(&g, &mut Cpu, &weights, 0, std::slice::from_ref(&x)).unwrap();
+            let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
             let device = Device::guess().favoring("lanes");
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
             // Stages after the matmul ride in the sums launch.

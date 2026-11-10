@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Runs a graph op by op, on the CPU or the portable GPU ops"
+description = "Runs a graph op by op on the CPU: the reference for every plan"
 
 [dependencies]
 graph = { workspace = true }

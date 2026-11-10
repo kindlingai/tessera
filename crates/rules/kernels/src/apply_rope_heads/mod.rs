@@ -1,6 +1,10 @@
 //! Split-half or proportional RoPE on `[seq, heads, head_dim]`, in place.
 
-ops::op_kernel! {
+gpukit::kernel! {
+    op,
+    error = gpukit::Error,
+    assert_oracle = gpukit::testing::assert_oracle,
+    gpu_available = gpukit::testing::backend_ready,
     name = "apply_rope_heads",
     metal = "apply_rope_heads.metal",
     cuda = "apply_rope_heads.cu",

@@ -1,8 +1,8 @@
 //! Rotary positions: a table of angles, then the rotation.
 
+use crate::apply_rope_heads;
 use graph::{Pairs, Stage};
 use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
-use ops_model::apply_rope_heads;
 
 /// Each position's cosine and sine, per pair.
 #[derive(Clone, Copy, Debug)]

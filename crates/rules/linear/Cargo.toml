@@ -18,5 +18,5 @@ lower = { workspace = true }
 [dev-dependencies]
 kernels = { workspace = true }
 interp = { workspace = true }
-ops = { workspace = true }
+gpukit = { workspace = true }
 trace = { workspace = true }
