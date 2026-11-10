@@ -115,12 +115,12 @@ impl File {
         let mut file = &self.file;
         file.seek(SeekFrom::Start(self.data + start))?;
         file.read_exact(&mut bytes)?;
-        let wide = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
         // A bf16 is the top half of an f32.
-        let half = |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+        let half = |b: &[u8; 2]| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16);
         Ok(match width {
-            4 => bytes.chunks_exact(4).map(wide).collect(),
-            _ => bytes.chunks_exact(2).map(half).collect(),
+            4 => bytes.as_chunks::<4>().0.iter().map(wide).collect(),
+            _ => bytes.as_chunks::<2>().0.iter().map(half).collect(),
         })
     }
 }
