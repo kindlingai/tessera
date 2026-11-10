@@ -108,7 +108,8 @@ fn rules_register_themselves() {
     let g = program(&Config::toy(4, 16));
     let picked = select(&g, 0, &SIZES, &Device::guess()).unwrap();
     let contested: Vec<&str> = picked.contested.iter().copied().collect();
-    assert_eq!(contested, ["attend", "dense", "matmul", "thin"]);
+    let competing = ["attend", "dense", "lane_norm", "matmul", "rms_norm", "thin"];
+    assert_eq!(contested, competing);
 }
 
 #[test]
