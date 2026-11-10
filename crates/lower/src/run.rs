@@ -157,7 +157,9 @@ pub trait Run {
 
 /// A runner on the backend this build dispatches to.
 pub fn open(plan: Plan) -> Result<Box<dyn Run>, Error> {
-    use gpukit::backend::{Backend, available};
+    #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
+    use gpukit::backend::Backend;
+    use gpukit::backend::available;
     match available() {
         #[cfg(target_os = "macos")]
         Some(Backend::Metal) => Ok(Box::new(crate::metal::Runner::new(plan)?)),

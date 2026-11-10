@@ -48,12 +48,8 @@ impl Cache {
             .chunks_exact(entry)
             .map(|e| {
                 let k = u64::from_le_bytes(e[..8].try_into().expect("8 bytes"));
-                let v = e[8..].chunks_exact(4);
-                (
-                    k,
-                    v.map(|f| f32::from_le_bytes(f.try_into().expect("4 bytes")))
-                        .collect(),
-                )
+                let v = e[8..].as_chunks::<4>().0.iter();
+                (k, v.map(|f| f32::from_le_bytes(*f)).collect())
             })
             .collect();
         Ok(Cache { dim, map })

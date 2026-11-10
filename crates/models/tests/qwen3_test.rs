@@ -40,14 +40,14 @@ fn case(g: &Graph) -> Option<Case> {
     let find = |p: &[PathSeg]| Some(Data::F32(file.floats(&tensor_name(p)?).ok()?));
     let tokens = std::fs::read_to_string(dir.join("tokens.txt")).unwrap();
     let floats = std::fs::read(dir.join("logits.f32")).unwrap();
-    let wide = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
     Some(Case {
         weights: bind(g, find).unwrap(),
         tokens: tokens
             .split_whitespace()
             .map(|t| t.parse().unwrap())
             .collect(),
-        want: floats.chunks_exact(4).map(wide).collect(),
+        want: floats.as_chunks::<4>().0.iter().map(wide).collect(),
     })
 }
 
