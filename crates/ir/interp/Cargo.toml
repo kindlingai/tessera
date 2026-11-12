@@ -8,6 +8,7 @@ description = "Runs a graph op by op on the CPU: the reference for every plan"
 
 [dependencies]
 graph = { workspace = true }
+mem = { workspace = true }
 
 [dev-dependencies]
 trace = { workspace = true }

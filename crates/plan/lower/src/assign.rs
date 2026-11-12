@@ -44,15 +44,16 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
         match value.home {
             Home::Weight(weight) => {
                 let slot = b.alloc(Val(v as u32));
-                let form = value.form;
-                b.plan.weights.push(Loaded { weight, slot, form });
+                b.plan.weights.push(Loaded { weight, slot });
             }
             Home::Kept { index, room } => {
                 // The longest context fits, so the buffer never moves.
-                let buffer = b.buffer(room, value.zone);
+                let buffer = b.buffer(room * value.dtype.bytes(), value.zone);
                 let slot = Slot {
                     buffer,
+                    offset: 0,
                     len: value.len,
+                    dtype: value.dtype,
                 };
                 b.slots[v] = Some(slot);
                 b.plan.kept.push((index, slot));
@@ -75,8 +76,8 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
 }
 
 impl Buffers<'_> {
-    fn buffer(&mut self, len: usize, zone: u32) -> u32 {
-        self.plan.buffers.push(len);
+    fn buffer(&mut self, bytes: usize, zone: u32) -> u32 {
+        self.plan.buffers.push(bytes);
         self.plan.zones.push(zone);
         self.plan.buffers.len() as u32 - 1
     }
@@ -87,13 +88,21 @@ impl Buffers<'_> {
 
     /// Reuses a free buffer of the value's size, if any.
     fn alloc(&mut self, v: Val) -> Slot {
-        let Value { len, zone, .. } = self.s.values[v.0 as usize];
-        let fits = |b: &u32| self.plan.buffers[*b as usize] == len && self.plan.zone(*b) == zone;
+        let Value {
+            len, zone, dtype, ..
+        } = self.s.values[v.0 as usize];
+        let bytes = len * dtype.bytes();
+        let fits = |b: &u32| self.plan.buffers[*b as usize] == bytes && self.plan.zone(*b) == zone;
         let buffer = match self.free.iter().position(fits) {
             Some(at) => self.free.swap_remove(at),
-            None => self.buffer(len, zone),
+            None => self.buffer(bytes, zone),
         };
-        let slot = Slot { buffer, len };
+        let slot = Slot {
+            buffer,
+            offset: 0,
+            len,
+            dtype,
+        };
         self.slots[v.0 as usize] = Some(slot);
         slot
     }

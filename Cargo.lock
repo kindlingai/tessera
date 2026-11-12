@@ -80,6 +80,7 @@ name = "gpukit"
 version = "0.1.0"
 dependencies = [
  "include_dir",
+ "mem",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -134,6 +135,7 @@ name = "interp"
 version = "0.1.0"
 dependencies = [
  "graph",
+ "mem",
  "trace",
 ]
 
@@ -201,6 +203,7 @@ dependencies = [
  "interp",
  "kernels",
  "linear",
+ "mem",
  "models",
  "objc2",
  "objc2-metal",
@@ -209,6 +212,13 @@ dependencies = [
  "serde_json",
  "sim",
  "trace",
+]
+
+[[package]]
+name = "mem"
+version = "0.1.0"
+dependencies = [
+ "graph",
 ]
 
 [[package]]

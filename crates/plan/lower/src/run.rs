@@ -2,56 +2,51 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use mem::{Buffer, Tensor, View, ViewMut, copy};
 use std::collections::HashMap;
 use std::ops::Range;
 
-/// One entry input's values.
-pub enum Feed<'a> {
-    Floats(&'a [f32]),
-    Ids(&'a [u32]),
-}
-
-/// Device buffers that outlive one plan.
-pub struct Held<B> {
-    /// Every live buffer, with its element count.
-    all: Vec<(usize, B)>,
+/// Buffers that outlive one plan.
+#[derive(Default)]
+pub struct Held {
+    /// Every live buffer.
+    all: Vec<Buffer>,
     weights: HashMap<u32, usize>,
     kept: HashMap<u32, usize>,
     /// Where each of the plan's buffers lies in `all`.
     bound: Vec<usize>,
 }
 
-impl<B> Default for Held<B> {
-    fn default() -> Self {
-        let (weights, kept) = Default::default();
-        Self {
-            all: Vec::new(),
-            weights,
-            kept,
-            bound: Vec::new(),
-        }
+impl Held {
+    pub fn get(&self, slot: Slot) -> &Buffer {
+        &self.all[self.bound[slot.buffer as usize]]
     }
-}
 
-impl<B> Held<B> {
-    pub fn get(&self, slot: Slot) -> &B {
-        &self.all[self.bound[slot.buffer as usize]].1
+    /// The slot as a flat view.
+    pub fn view(&self, slot: Slot) -> View<'_> {
+        self.get(slot)
+            .view(slot.start(), slot.dtype, vec![slot.len])
+    }
+
+    pub fn view_mut(&mut self, slot: Slot) -> ViewMut<'_> {
+        let at = self.bound[slot.buffer as usize];
+        self.all[at].view_mut(slot.start(), slot.dtype, vec![slot.len])
     }
 
     /// Binds `plan`'s buffers. Weights and kept rows stay as loaded.
     pub fn bind(
         &mut self,
         plan: &Plan,
-        mut alloc: impl FnMut(usize) -> Result<B, Error>,
+        mut alloc: impl FnMut(u32, usize) -> Result<Buffer, Error>,
     ) -> Result<(), Error> {
         let old = std::mem::take(&mut self.all).into_iter().map(Some);
-        let mut old: Vec<Option<(usize, B)>> = old.collect();
+        let mut old: Vec<Option<Buffer>> = old.collect();
         for at in self.weights.values_mut().chain(self.kept.values_mut()) {
             self.all.push(old[*at].take().expect("each is held once"));
             *at = self.all.len() - 1;
         }
         // The last plan's scratch buffers.
-        let mut spare: Vec<(usize, B)> = old.into_iter().flatten().collect();
+        let mut spare: Vec<Buffer> = old.into_iter().flatten().collect();
         let mut owner = vec![None; plan.buffers.len()];
         for l in &plan.weights {
             owner[l.slot.buffer as usize] = Some((false, l.weight));
@@ -60,22 +55,21 @@ impl<B> Held<B> {
             owner[slot.buffer as usize] = Some((true, *index));
         }
         self.bound.clear();
-        for (&len, owner) in plan.buffers.iter().zip(owner) {
+        for (b, (&bytes, owner)) in plan.buffers.iter().zip(owner).enumerate() {
+            let zone = plan.zone(b as u32);
+            let same = |buffer: &Buffer| buffer.bytes() == bytes && buffer.zone == zone;
             let held = match owner {
                 Some((true, index)) => self.kept.get(&index).copied(),
                 Some((false, index)) => self.weights.get(&index).copied(),
-                None => {
-                    let fits = spare.iter().position(|(n, _)| *n == len);
-                    fits.map(|at| {
-                        self.all.push(spare.swap_remove(at));
-                        self.all.len() - 1
-                    })
-                }
+                None => spare.iter().position(same).map(|at| {
+                    self.all.push(spare.swap_remove(at));
+                    self.all.len() - 1
+                }),
             };
-            let at = match held.filter(|at| self.all[*at].0 == len) {
+            let at = match held.filter(|at| same(&self.all[*at])) {
                 Some(at) => at,
                 None => {
-                    self.all.push((len, alloc(len)?));
+                    self.all.push(alloc(zone, bytes)?);
                     self.all.len() - 1
                 }
             };
@@ -93,17 +87,10 @@ impl<B> Held<B> {
 /// A plan with its buffers allocated and kernels compiled.
 pub trait Run {
     fn plan(&self) -> &Plan;
+    fn held(&self) -> &Held;
+    fn held_mut(&mut self) -> &mut Held;
     /// Takes up another plan. Weights and kept rows stay loaded.
     fn replan(&mut self, plan: Plan) -> Result<(), Error>;
-    /// Copies host bytes to the start of a slot.
-    fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error>;
-    fn read(&self, slot: Slot) -> Result<Vec<f32>, Error>;
-
-    /// Reads a slot of indices, stored as float bits.
-    fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
-        Ok(self.read(slot)?.into_iter().map(f32::to_bits).collect())
-    }
-
     /// Runs these steps in order and waits for them.
     fn submit(&self, steps: Range<usize>) -> Result<(), Error>;
     /// Runs one step `times` over. Returns seconds per run.
@@ -111,44 +98,60 @@ pub trait Run {
     /// The backend and the hardware it drives.
     fn device(&self) -> String;
 
-    /// Uploads one graph weight as planned. Unused weights are ignored.
-    fn load(&self, weight: u32, data: &[f32]) -> Result<(), Error> {
-        for l in self.plan().weights.iter().filter(|l| l.weight == weight) {
-            if l.slot.len != l.form.words(data.len()) {
+    /// Copies `src` into the slot, converting its form if needed.
+    fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
+        Ok(copy(src, &mut self.held_mut().view_mut(slot))?)
+    }
+
+    /// The slot's values on the host, as one row.
+    fn read(&self, slot: Slot) -> Result<Tensor, Error> {
+        Ok(self.held().view(slot).to_tensor()?)
+    }
+
+    fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
+        Ok(self.held().view(slot).to_u32()?)
+    }
+
+    /// Uploads one graph weight. Unused weights are ignored.
+    fn load(&mut self, weight: u32, data: View) -> Result<(), Error> {
+        let slots: Vec<Slot> = (self.plan().weights.iter())
+            .filter(|l| l.weight == weight)
+            .map(|l| l.slot)
+            .collect();
+        for slot in slots {
+            if slot.len != data.len() {
                 return Err(Error::Size(format!("weight {weight}")));
             }
-            self.write(l.slot, &l.form.narrow(data))?;
+            self.write(slot, data.clone())?;
         }
         Ok(())
     }
 
-    fn feed(&self, inputs: &[Feed]) -> Result<(), Error> {
-        if inputs.len() != self.plan().inputs.len() {
+    fn feed(&mut self, inputs: &[View]) -> Result<(), Error> {
+        let slots = self.plan().inputs.clone();
+        if inputs.len() != slots.len() {
             return Err(Error::Size("the input list".into()));
         }
-        for (at, (slot, feed)) in self.plan().inputs.iter().zip(inputs).enumerate() {
-            let bytes: Vec<u8> = match feed {
-                Feed::Floats(v) => v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-                Feed::Ids(v) => v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-            };
-            if bytes.len() != slot.len * 4 {
+        for (at, (slot, input)) in slots.into_iter().zip(inputs).enumerate() {
+            if input.len() != slot.len || input.dtype() != slot.dtype {
                 return Err(Error::Size(format!("input {at}")));
             }
-            self.write(*slot, &bytes)?;
+            self.write(slot, input.clone())?;
         }
         Ok(())
     }
 
-    /// Runs every step as one submission.
-    fn run(&self, inputs: &[Feed]) -> Result<Vec<Vec<f32>>, Error> {
+    /// Runs every step as one submission. Outputs come back shaped.
+    fn run(&mut self, inputs: &[View]) -> Result<Vec<Tensor>, Error> {
         self.feed(inputs)?;
         self.submit(0..self.plan().steps.len())?;
         let outputs = self.plan().outputs.iter();
-        outputs.map(|o| self.read(o.slot)).collect()
+        let shaped = |o: &crate::plan::Output| Ok(self.read(o.slot)?.reshaped(o.shape.clone()));
+        outputs.map(shaped).collect()
     }
 
     /// Runs step by step. Returns each step's seconds.
-    fn run_timed(&self, inputs: &[Feed]) -> Result<Vec<f64>, Error> {
+    fn run_timed(&mut self, inputs: &[View]) -> Result<Vec<f64>, Error> {
         self.feed(inputs)?;
         let steps = 0..self.plan().steps.len();
         steps.map(|i| self.repeat(i, 1)).collect()

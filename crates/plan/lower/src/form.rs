@@ -1,101 +1,24 @@
-//! How values are stored, and which weights are pinned.
+//! Pinned weight forms, and how kernels read a form.
 
-use graph::PathSeg;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Form {
-    #[default]
-    F32,
-    /// The top half of an f32.
-    Bf16,
-}
-
-impl Form {
-    pub fn bytes(self) -> usize {
-        match self {
-            Form::F32 => 4,
-            Form::Bf16 => 2,
-        }
-    }
-
-    /// Four-byte words that hold `elements`.
-    pub fn words(self, elements: usize) -> usize {
-        (elements * self.bytes()).div_ceil(4)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Form::F32 => "f32",
-            Form::Bf16 => "bf16",
-        }
-    }
-
-    /// A generated kernel's type for one element.
-    pub fn ty(self) -> &'static str {
-        match self {
-            Form::F32 => "float",
-            Form::Bf16 => "u16",
-        }
-    }
-
-    /// Element `index` of buffer `name`, as a float.
-    pub fn load(self, name: &str, index: &str) -> String {
-        match self {
-            Form::F32 => format!("{name}[{index}]"),
-            Form::Bf16 => format!("f_bits((u32){name}[{index}] << 16)"),
-        }
-    }
-
-    /// Whether `input` reads as `form`, when `weight` is this form.
-    pub fn taken(self, input: usize, weight: usize, form: Form) -> bool {
-        form == Form::F32 || (input == weight && form == self)
-    }
-
-    /// Bytes a matmul reads: the weight, then the rows.
-    pub fn matmul_bytes(self, m: usize, n: usize, k: usize) -> Vec<f64> {
-        vec![(self.bytes() * n * k) as f64, (4 * m * k) as f64]
-    }
-
-    /// `x` as this form holds it, back in f32.
-    pub fn round(self, x: f32) -> f32 {
-        match self {
-            Form::F32 => x,
-            Form::Bf16 => f32::from_bits(u32::from(bf16(x)) << 16),
-        }
-    }
-
-    /// `data` packed as this form, in whole words.
-    pub fn narrow(self, data: &[f32]) -> Vec<u8> {
-        let mut bytes: Vec<u8> = match self {
-            Form::F32 => data.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-            Form::Bf16 => data.iter().flat_map(|x| bf16(*x).to_ne_bytes()).collect(),
-        };
-        bytes.resize(4 * self.words(data.len()), 0);
-        bytes
-    }
-}
-
-/// The nearest bf16, ties to even. NaN stays NaN.
-fn bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if x.is_nan() {
-        return (bits >> 16) as u16 | 0x40;
-    }
-    let round = 0x7FFF + ((bits >> 16) & 1);
-    ((bits + round) >> 16) as u16
-}
+use graph::{DType, PathSeg};
 
 /// The form of each weight, as the user says.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pins {
     /// The form of every weight no pattern names.
-    pub weights: Form,
+    pub weights: DType,
     /// Patterns over weight paths, the last match winning.
-    pub named: Vec<(String, Form)>,
+    pub named: Vec<(String, DType)>,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Self::all(DType::F32)
+    }
 }
 
 impl Pins {
-    pub fn all(weights: Form) -> Self {
+    pub fn all(weights: DType) -> Self {
         Self {
             weights,
             named: Vec::new(),
@@ -103,13 +26,13 @@ impl Pins {
     }
 
     /// Pins weights whose path fits `pattern`. `*` is any run.
-    pub fn pin(mut self, pattern: &str, form: Form) -> Self {
+    pub fn pin(mut self, pattern: &str, form: DType) -> Self {
         self.named.push((pattern.into(), form));
         self
     }
 
     /// The form of the weight at `path`.
-    pub fn form(&self, path: &[PathSeg]) -> Form {
+    pub fn form(&self, path: &[PathSeg]) -> DType {
         let seg = |s: &PathSeg| match s {
             PathSeg::Field(f) => f.clone(),
             PathSeg::Index(i) => i.to_string(),
@@ -139,4 +62,60 @@ fn matches(pattern: &str, name: &str) -> bool {
         };
     }
     rest.is_empty()
+}
+
+/// A stored form, as a generated kernel reads it.
+pub trait Stored: Copy {
+    /// Whether a float form needs widening before an f32 read.
+    fn narrow(self) -> bool;
+    fn name(self) -> &'static str;
+    /// A generated kernel's type for one element.
+    fn ty(self) -> &'static str;
+    /// Element `index` of buffer `name`, as a float.
+    fn load(self, name: &str, index: &str) -> String;
+    /// Whether `input` reads as `form`, when `weight` is this form.
+    fn taken(self, input: usize, weight: usize, form: DType) -> bool;
+    /// Bytes a matmul reads: the weight, then the rows.
+    fn matmul_bytes(self, m: usize, n: usize, k: usize) -> Vec<f64>;
+}
+
+impl Stored for DType {
+    fn narrow(self) -> bool {
+        self.is_float() && self != DType::F32
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            DType::F32 => "f32",
+            DType::Bf16 => "bf16",
+            DType::F16 => "f16",
+            DType::I32 => "i32",
+            DType::U32 => "u32",
+            DType::Bool => "bool",
+        }
+    }
+
+    fn ty(self) -> &'static str {
+        match self {
+            DType::Bf16 | DType::F16 => "u16",
+            DType::U32 | DType::Bool => "u32",
+            DType::I32 => "int",
+            DType::F32 => "float",
+        }
+    }
+
+    fn load(self, name: &str, index: &str) -> String {
+        match self {
+            DType::Bf16 => format!("f_bits((u32){name}[{index}] << 16)"),
+            _ => format!("{name}[{index}]"),
+        }
+    }
+
+    fn taken(self, input: usize, weight: usize, form: DType) -> bool {
+        !form.narrow() || (input == weight && form == self)
+    }
+
+    fn matmul_bytes(self, m: usize, n: usize, k: usize) -> Vec<f64> {
+        vec![(self.bytes() * n * k) as f64, (4 * m * k) as f64]
+    }
 }

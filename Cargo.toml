@@ -26,6 +26,7 @@ interp = { path = "crates/ir/interp" }
 kernels = { path = "crates/rules/kernels" }
 linear = { path = "crates/rules/linear" }
 lower = { path = "crates/plan/lower" }
+mem = { path = "crates/ir/mem" }
 models = { path = "crates/front/models" }
 sim = { path = "crates/plan/sim" }
 trace = { path = "crates/ir/trace" }

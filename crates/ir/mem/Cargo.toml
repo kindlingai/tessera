@@ -1,0 +1,10 @@
+[package]
+name = "mem"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Buffers in zones, and typed views onto them"
+
+[dependencies]
+graph = { workspace = true }

@@ -1,7 +1,7 @@
 //! The hand-written tiled matmul.
 
 use graph::Order;
-use lower::{Arg, Draft, Form, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
+use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
 use sim::{Load, Ops};
 
 /// `x[m, k]` times `w[n, k]` transposed.
@@ -11,16 +11,16 @@ pub struct Matmul {
     pub n: usize,
     pub k: usize,
     /// How `w` is stored. `x` is always f32.
-    pub form: Form,
+    pub form: DType,
 }
 
-pub(crate) fn source(form: Form) -> Source {
+pub(crate) fn source(form: DType) -> Source {
     Source::Fixed {
         metal: gemm::METAL,
         cuda: gemm::CUDA,
         entry: match form {
-            Form::F32 => gemm::ENTRY,
-            Form::Bf16 => gemm::ENTRY_BF16,
+            DType::Bf16 => gemm::ENTRY_BF16,
+            _ => gemm::ENTRY,
         },
     }
 }
@@ -48,8 +48,8 @@ pub(crate) fn launch(p: gemm::Problem, buffers: [Arg; 3]) -> Launch {
 impl Kernel for Matmul {
     fn name(&self) -> &'static str {
         match self.form {
-            Form::F32 => "matmul",
-            Form::Bf16 => "matmul_bf16",
+            DType::Bf16 => "matmul_bf16",
+            _ => "matmul",
         }
     }
 
@@ -84,7 +84,7 @@ impl Kernel for Matmul {
         source(self.form)
     }
 
-    fn accepts(&self, input: usize, form: Form) -> bool {
+    fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 1, form)
     }
 

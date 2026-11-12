@@ -140,6 +140,6 @@ fn clusters_are_stored() {
     let loaded = Device::load(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
     assert!(loaded == device && loaded.zones() == 2);
-    assert_eq!(loaded.transfer(0, 1, 250_000), Some(2e-6 + 1e-6));
-    assert_eq!(loaded.transfer(1, 1, 250_000), Some(0.0));
+    assert_eq!(loaded.transfer(0, 1, 1_000_000), Some(2e-6 + 1e-6));
+    assert_eq!(loaded.transfer(1, 1, 1_000_000), Some(0.0));
 }

@@ -5,8 +5,8 @@ use graph::{Act, Composite, Graph};
 use kernels::Thin;
 use lower::kernels::{Map, MapStage};
 use lower::{
-    Arg, Device, Dialect, Error, Fit, Form, Held, Kernel, KernelRef, Pins, Plan, Site, Slot,
-    Source, Step, T, Tree,
+    Arg, Buffer, DType, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Site,
+    Slot, Source, Step, T, Tree,
 };
 use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
@@ -154,7 +154,7 @@ fn kept_rows_fit() {
     assert_eq!(plan.kept.len(), 2 * 2, "keys and values per layer");
     // Two key heads of eight, for up to sixteen rows.
     for (_, slot) in &plan.kept {
-        assert_eq!((slot.len, plan.buffers[slot.buffer as usize]), (80, 256));
+        assert_eq!((slot.len, plan.buffers[slot.buffer as usize]), (80, 1024));
     }
     let appends = plan.steps.iter().filter(|s| s.kernel.name() == "append");
     for s in appends.clone() {
@@ -166,7 +166,7 @@ fn kept_rows_fit() {
         assert_eq!(launch.args[1..], [Arg::Buffer(s.write, 48), Arg::U32(32)]);
     }
     assert_eq!((appends.count(), count(&plan, "argmax")), (4, 1));
-    let scratch: usize = plan.buffers.iter().sum::<usize>() - 4 * 256;
+    let scratch: usize = plan.buffers.iter().sum::<usize>() - 4 * 1024;
     assert!(plan.scratch() < scratch, "kept rows are not scratch");
     assert!(matches!(step(2, 2, 5), Err(Error::Unsupported(_))));
 }
@@ -174,20 +174,22 @@ fn kept_rows_fit() {
 #[test]
 fn replans_hold_buffers() {
     let (first, next) = (step(1, 3, 3).unwrap(), step(1, 1, 4).unwrap());
-    let mut held: Held<usize> = Held::default();
+    let mut held = Held::default();
     let mut made = 0;
-    let mut alloc = |_: usize| {
+    let mut alloc = |zone: u32, bytes: usize| {
         made += 1;
-        Ok(made)
+        Ok(Buffer::host(zone, bytes))
     };
     held.bind(&first, &mut alloc).unwrap();
     let named = |p: &Plan| -> Vec<(u32, Slot)> {
         let weights = p.weights.iter().map(|l| (l.weight, l.slot));
         weights.chain(p.kept.iter().copied()).collect()
     };
-    let before: Vec<usize> = named(&first).iter().map(|(_, s)| *held.get(*s)).collect();
+    // The same memory, wherever the buffer list puts it.
+    let at = |held: &Held, s: Slot| held.get(s).backing().mapped().unwrap().as_ptr();
+    let before: Vec<_> = named(&first).iter().map(|(_, s)| at(&held, *s)).collect();
     held.bind(&next, &mut alloc).unwrap();
-    let after: Vec<usize> = named(&next).iter().map(|(_, s)| *held.get(*s)).collect();
+    let after: Vec<_> = named(&next).iter().map(|(_, s)| at(&held, *s)).collect();
     assert_eq!(named(&first).len(), named(&next).len());
     let owner = |p: &Plan| -> Vec<u32> { named(p).iter().map(|(index, _)| *index).collect() };
     assert_eq!(owner(&first), owner(&next));
@@ -195,7 +197,7 @@ fn replans_hold_buffers() {
     assert!(made < first.buffers.len() + next.buffers.len());
     // Binding the same plan again allocates nothing.
     let so_far = made;
-    held.bind(&next, |_| unreachable!("every buffer is held"))
+    held.bind(&next, |_, _| unreachable!("every buffer is held"))
         .unwrap();
     assert_eq!(made, so_far);
 }
@@ -208,14 +210,11 @@ fn thin(m: usize) -> Step {
             m,
             n,
             k,
-            form: Form::F32,
+            form: DType::F32,
         }),
         rule: "thin",
         reads: Vec::new(),
-        write: Slot {
-            buffer: 0,
-            len: m * n,
-        },
+        write: Slot::floats(0, m * n),
         covers: Vec::new(),
         zone: 0,
     }
@@ -336,52 +335,36 @@ fn favoring_stays_local() {
 }
 
 #[test]
-fn forms_round() {
-    let tie = f32::from_bits(0x3F80_8000);
-    assert_eq!(Form::Bf16.round(tie), 1.0, "ties go to even");
-    let above = f32::from_bits(0x3F80_8001);
-    assert_eq!(Form::Bf16.round(above).to_bits(), 0x3F81_0000);
-    assert!(Form::Bf16.round(f32::NAN).is_nan());
-    assert_eq!(
-        Form::Bf16.narrow(&[1.0, 2.0, 3.0]).len(),
-        8,
-        "padded to words"
-    );
-    assert_eq!(Form::F32.narrow(&[1.0, 2.0, 3.0]).len(), 12);
-    assert_eq!((Form::Bf16.words(3), Form::F32.words(3)), (2, 3));
-}
-
-#[test]
 fn pins_match_paths() {
     use graph::PathSeg::{Field, Index};
     let path = |s: &str| -> Vec<graph::PathSeg> {
         let seg = |p: &str| p.parse().map_or(Field(p.into()), Index);
         s.split('.').map(seg).collect()
     };
-    let pins = Pins::all(Form::Bf16)
-        .pin("embed", Form::F32)
-        .pin("layers.*.ln*", Form::F32)
-        .pin("layers.1.*", Form::Bf16);
-    assert_eq!(pins.form(&path("embed")), Form::F32);
-    assert_eq!(pins.form(&path("layers.0.ln1")), Form::F32);
-    assert_eq!(pins.form(&path("layers.0.q")), Form::Bf16);
+    let pins = Pins::all(DType::Bf16)
+        .pin("embed", DType::F32)
+        .pin("layers.*.ln*", DType::F32)
+        .pin("layers.1.*", DType::Bf16);
+    assert_eq!(pins.form(&path("embed")), DType::F32);
+    assert_eq!(pins.form(&path("layers.0.ln1")), DType::F32);
+    assert_eq!(pins.form(&path("layers.0.q")), DType::Bf16);
     assert_eq!(
         pins.form(&path("layers.1.ln1")),
-        Form::Bf16,
+        DType::Bf16,
         "the last pin wins"
     );
-    assert_eq!(pins.form(&path("norm")), Form::Bf16);
-    assert_eq!(Pins::default().form(&path("layers.0.q")), Form::F32);
+    assert_eq!(pins.form(&path("norm")), DType::Bf16);
+    assert_eq!(Pins::default().form(&path("layers.0.q")), DType::F32);
 }
 
 #[test]
 fn pinned_weights_narrow() {
     let g = program(&Config::toy(4, 16));
-    let pins = Pins::all(Form::Bf16).pin("embed", Form::F32);
+    let pins = Pins::all(DType::Bf16).pin("embed", DType::F32);
     let plan = lower(&g, 0, &SIZES, &Device::guess().pinned(pins)).unwrap();
     for l in &plan.weights {
         let embed = l.weight == 0;
-        assert_eq!(l.form == Form::F32, embed, "weight {}", l.weight);
+        assert_eq!(l.slot.dtype == DType::F32, embed, "weight {}", l.weight);
     }
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     for narrow in ["thin_bf16", "widen", "gather"] {

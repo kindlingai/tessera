@@ -55,10 +55,7 @@ fn views() -> Graph {
 #[test]
 fn views_move_data() {
     let out = run(&views(), &[], 0, &[ramp(vec![2, 2, 3])]).unwrap();
-    assert_eq!(
-        out[0].data,
-        Data::F32(vec![1., 2., 4., 5., 7., 8., 10., 11.])
-    );
+    assert_eq!(out[0].floats().unwrap(), [1., 2., 4., 5., 7., 8., 10., 11.]);
     assert_eq!(out[1].shape, [3, 2, 2]);
     assert_eq!(out[1].floats().unwrap()[..4], [0., 3., 6., 9.]);
     assert_eq!(out[2].shape, [12]);
@@ -110,8 +107,8 @@ fn bind_checks_weights() {
     let [] = m.entry(EntryKind::Forward, []);
     let g = m.finish([(Role::Logits, &w)]);
     assert!(bind(&g, |_| None).is_err());
-    assert!(bind(&g, |_| Some(Data::F32(vec![1.0; 3]))).is_err());
-    let ok = bind(&g, |_| Some(Data::F32(vec![1.0; 2]))).unwrap();
+    assert!(bind(&g, |_| Some(Tensor::f32(vec![3], vec![1.0; 3]))).is_err());
+    let ok = bind(&g, |_| Some(Tensor::f32(vec![2], vec![1.0; 2]))).unwrap();
     assert_eq!(ok[0].shape, [2]);
 }
 
@@ -154,9 +151,9 @@ fn entries_run_alone() {
     assert_eq!(first.entries.len(), 1);
     let x = Tensor::f32(vec![2], vec![1.0, 2.0]);
     let out = run(&g, &[], 0, std::slice::from_ref(&x)).unwrap();
-    assert_eq!(out[0].data, Data::F32(vec![2.0, 4.0]));
+    assert_eq!(out[0].floats().unwrap(), [2.0, 4.0]);
     let out = run(&g, &[], 1, &[x]).unwrap();
-    assert_eq!(out[0].data, Data::F32(vec![3.0, 6.0]));
+    assert_eq!(out[0].floats().unwrap(), [3.0, 6.0]);
 }
 
 #[derive(trace::Weights)]
@@ -179,7 +176,10 @@ fn summing(acc: DType) -> Graph {
 
 #[test]
 fn accumulators_follow_numerics() {
-    let ones = bind(&summing(DType::F32), |_| Some(Data::F32(vec![1.0; 6]))).unwrap();
+    let ones = bind(&summing(DType::F32), |_| {
+        Some(Tensor::f32(vec![6], vec![1.0; 6]))
+    })
+    .unwrap();
     let x = Tensor::f32(vec![1, 3], vec![2048.0, 1.0, 1.0]);
     let sums = |acc| {
         let g = summing(acc);

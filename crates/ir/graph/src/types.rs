@@ -14,6 +14,15 @@ pub enum DType {
 }
 
 impl DType {
+    /// Bytes one element takes.
+    pub fn bytes(self) -> usize {
+        match self {
+            DType::F32 | DType::I32 | DType::U32 => 4,
+            DType::Bf16 | DType::F16 => 2,
+            DType::Bool => 1,
+        }
+    }
+
     pub fn is_float(self) -> bool {
         matches!(self, DType::F32 | DType::Bf16 | DType::F16)
     }

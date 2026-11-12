@@ -120,10 +120,10 @@ impl Device {
         self.cluster.zones.len() as u32
     }
 
-    /// Seconds to move `len` elements between zones, if linked.
-    pub fn transfer(&self, from: u32, to: u32, len: usize) -> Option<f64> {
-        let bytes = 4.0 * len as f64;
-        self.cluster.transfer(from as usize, to as usize, bytes)
+    /// Seconds to move `bytes` between zones, if linked.
+    pub fn transfer(&self, from: u32, to: u32, bytes: usize) -> Option<f64> {
+        self.cluster
+            .transfer(from as usize, to as usize, bytes as f64)
     }
 
     /// The same device, never choosing `kernel`.
@@ -172,15 +172,15 @@ impl Device {
     pub fn cost(&self, plan: &Plan) -> Cost {
         let mut total = Cost::default();
         for step in &plan.steps {
-            let moved: usize = step.reads.iter().map(|r| r.len).sum();
+            let moved: usize = step.reads.iter().map(|r| r.bytes()).sum();
             // A read in another zone makes the step a move.
             let from = step.reads.first().map(|r| plan.zone(r.buffer));
             total.seconds += match from.filter(|z| *z != step.zone) {
-                Some(from) => self.transfer(from, step.zone, step.write.len),
+                Some(from) => self.transfer(from, step.zone, step.write.bytes()),
                 None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len)),
             }
             .unwrap_or(f64::INFINITY);
-            total.bytes += 4 * (moved + step.write.len) as u64;
+            total.bytes += (moved + step.write.bytes()) as u64;
             total.launches += step.launches().len();
         }
         total

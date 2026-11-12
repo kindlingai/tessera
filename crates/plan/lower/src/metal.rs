@@ -5,13 +5,13 @@ use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::Dialect;
 use crate::plan::{Plan, Slot};
 use crate::run::{Held, Run};
-use gpukit::metal::{BufferPool, CacheConfig, ComputePipeline, Context, set_bytes};
+use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared, set_bytes};
+use mem::Buffer;
 use objc2::msg_send;
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLDevice, MTLResourceOptions, MTLSize,
+    MTLSize,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -22,7 +22,7 @@ type Encoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 pub struct Runner {
     ctx: Rc<Context>,
     plan: Plan,
-    held: Held<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    held: Held,
     pipelines: Vec<Rc<ComputePipeline>>,
     /// Compiled generated kernels, by entry.
     made: HashMap<String, Rc<ComputePipeline>>,
@@ -60,7 +60,11 @@ impl Runner {
     }
 
     fn buffer(&self, slot: Slot) -> &ProtocolObject<dyn MTLBuffer> {
-        self.held.get(slot)
+        let shared = self.held.get(slot).backing().as_any();
+        shared
+            .downcast_ref::<Shared>()
+            .expect("this runner allocates shared buffers")
+            .buffer()
     }
 
     /// Binds each argument at its index, then dispatches.
@@ -69,7 +73,8 @@ impl Runner {
             match arg {
                 Arg::Buffer(slot, skip) => {
                     let buffer = Some(self.buffer(*slot));
-                    unsafe { enc.setBuffer_offset_atIndex(buffer, skip * 4, index) };
+                    let at = slot.start() + skip * slot.dtype.bytes();
+                    unsafe { enc.setBuffer_offset_atIndex(buffer, at, index) };
                 }
                 Arg::U32(v) => set_bytes(enc, v, index),
                 Arg::F32(v) => set_bytes(enc, v, index),
@@ -127,12 +132,10 @@ impl Run for Runner {
         if plan.zoned() {
             return Err(Error::Unsupported("a plan over several zones".into()));
         }
-        let (ctx, shared) = (&self.ctx, MTLResourceOptions::StorageModeShared);
-        self.held.bind(&plan, |len| {
-            let buffer = ctx
-                .device
-                .newBufferWithLength_options((len * 4).max(4), shared);
-            buffer.ok_or_else(|| gpu("buffer allocation"))
+        let ctx = &self.ctx;
+        self.held.bind(&plan, |zone, bytes| {
+            let shared = Shared::new(&ctx.device, bytes).ok_or_else(|| gpu("buffer allocation"));
+            Ok(Buffer::new(zone, shared?))
         })?;
         self.pipelines.clear();
         for step in &plan.steps {
@@ -154,15 +157,12 @@ impl Run for Runner {
         Ok(())
     }
 
-    fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
-        BufferPool::write_bytes(self.buffer(slot), bytes);
-        Ok(())
+    fn held(&self) -> &Held {
+        &self.held
     }
 
-    fn read(&self, slot: Slot) -> Result<Vec<f32>, Error> {
-        let mut out = vec![0.0; slot.len];
-        BufferPool::read_f32(self.buffer(slot), &mut out);
-        Ok(out)
+    fn held_mut(&mut self) -> &mut Held {
+        &mut self.held
     }
 
     fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
