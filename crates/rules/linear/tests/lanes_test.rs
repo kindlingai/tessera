@@ -5,8 +5,8 @@ use kernels as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{self, Ffn, Hidden, Rows};
-use interp::{Data, Tensor, run};
-use lower::{Device, Dialect, Feed, Source, lower, open, rules};
+use interp::{Tensor, run};
+use lower::{Device, Dialect, Source, lower, open, rules};
 use trace::{
     Act, DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights,
 };
@@ -98,13 +98,10 @@ fn lanes_match_cpu() {
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
             assert_eq!(names, ["lanes", "sums"]);
             assert_eq!(plan.steps[1].covers.len(), g.nodes.len() - 2);
-            let runner = open(plan).unwrap();
-            runner.load(0, weights[0].floats().unwrap()).unwrap();
-            let Data::F32(fed) = &x.data else {
-                unreachable!("noise is floats");
-            };
-            let got = runner.run(&[Feed::Floats(fed)]).unwrap().remove(0);
-            let off = max_abs_diff(&got, want[0].floats().unwrap());
+            let mut runner = open(plan).unwrap();
+            runner.load(0, weights[0].view()).unwrap();
+            let got = runner.run(&[x.view()]).unwrap().remove(0);
+            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
             assert!(off < 1e-3, "{m} rows of {k} to {n}: off by {off:e}");
         }
     }

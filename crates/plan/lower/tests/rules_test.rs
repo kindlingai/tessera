@@ -7,8 +7,8 @@ use linear as _;
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
-use interp::{Data, Tensor, run};
-use lower::{Device, Feed, Form, Pins, cut, lower, open, rules};
+use interp::{Tensor, run};
+use lower::{Device, Pins, View, cut, lower, open, round, rules};
 use models::{Stack, nanogpt, qwen3};
 use trace::{EntryKind, Mask, Model, Port, Role};
 
@@ -71,35 +71,26 @@ fn fill(g: &Graph, ty: &TensorType, noise: &mut Noise) -> Tensor {
     let dim = |e: &graph::DimExpr| e.poly(&g.dims).unwrap().eval(&size).unwrap() as usize;
     let shape: Vec<usize> = ty.shape.0.iter().map(dim).collect();
     let mut values = (0..shape.iter().product()).map(|_| noise.draw());
-    let data = match ty.dtype {
-        DType::U32 => Data::U32(values.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
-        _ => Data::F32(values.by_ref().collect()),
-    };
-    Tensor { shape, data }
-}
-
-fn feed(t: &Tensor) -> Feed<'_> {
-    match &t.data {
-        Data::F32(v) => Feed::Floats(v),
-        Data::U32(v) => Feed::Ids(v),
-        Data::I32(_) => unreachable!("no signed inputs"),
+    match ty.dtype {
+        DType::U32 => Tensor::u32(shape, values.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
+        _ => Tensor::f32(shape, values.by_ref().collect()),
     }
 }
 
 /// Runs entry 0 both ways; returns the largest difference.
 fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
     let want = run(g, weights, 0, inputs).unwrap();
-    let runner = open(lower(g, 0, &SIZES, device).unwrap()).unwrap();
+    let mut runner = open(lower(g, 0, &SIZES, device).unwrap()).unwrap();
     for (at, w) in weights.iter().enumerate() {
-        runner.load(at as u32, w.floats().unwrap()).unwrap();
+        runner.load(at as u32, w.view()).unwrap();
     }
-    let feeds: Vec<Feed> = inputs.iter().map(feed).collect();
+    let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
     let got = runner.run(&feeds).unwrap().remove(0);
-    let Data::U32(ids) = &want[0].data else {
-        return max_abs_diff(&got, want[0].floats().unwrap());
-    };
-    // Indices come back as bits, and must match exactly.
-    let same = got.iter().map(|x| x.to_bits()).eq(ids.iter().copied());
+    if want[0].dtype() != DType::U32 {
+        return max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+    }
+    // Indices must match exactly.
+    let same = got.indices().unwrap() == want[0].indices().unwrap();
     if same { 0.0 } else { f32::INFINITY }
 }
 
@@ -169,16 +160,16 @@ fn whole_models_match_cpu() {
             assert!(off < 1e-3, "favoring {rule}, outputs are off by {off:e}");
         }
         // Weights the GPU reads as bf16, the CPU reads widened.
-        let narrow = |t: &Tensor| Tensor {
-            shape: t.shape.clone(),
-            data: match &t.data {
-                Data::F32(v) => Data::F32(v.iter().map(|x| Form::Bf16.round(*x)).collect()),
-                other => other.clone(),
-            },
+        let narrow = |t: &Tensor| match t.floats() {
+            Ok(v) => Tensor::f32(
+                t.shape.clone(),
+                v.iter().map(|x| round(DType::Bf16, *x)).collect(),
+            ),
+            Err(_) => t.clone(),
         };
         let weights: Vec<Tensor> = weights.iter().map(narrow).collect();
         for (rule, device) in devices() {
-            let device = device.pinned(Pins::all(Form::Bf16));
+            let device = device.pinned(Pins::all(DType::Bf16));
             let off = gap(&g, &weights, &inputs, &device);
             assert!(
                 off < 1e-3,

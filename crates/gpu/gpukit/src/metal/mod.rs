@@ -10,6 +10,7 @@ mod expand;
 #[cfg(test)]
 mod expand_test;
 mod pipeline_cache;
+mod shared;
 
 pub use buffer::BufferPool;
 pub use cached::{cached_context, cached_pipeline};
@@ -19,3 +20,4 @@ pub use dispatch::{
 };
 pub use expand::expand;
 pub use pipeline_cache::{CacheConfig, PipelineArchiveCache};
+pub use shared::Shared;

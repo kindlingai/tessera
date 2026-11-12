@@ -13,6 +13,7 @@ macro_rules! device_runner {
                 Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,
                 launch_1d, launch_grid, launch_rows,
             };
+            use mem::Buffer;
             use std::collections::HashMap;
             use std::ops::Range;
             use std::time::Instant;
@@ -20,7 +21,7 @@ macro_rules! device_runner {
             pub struct Runner {
                 ctx: &'static Context,
                 plan: Plan,
-                held: Held<DeviceBuffer>,
+                held: Held,
                 kernels: Vec<Kernel>,
                 /// Compiled generated kernels, by entry.
                 made: HashMap<String, Kernel>,
@@ -40,7 +41,10 @@ macro_rules! device_runner {
                 }
 
                 fn buffer(&self, slot: Slot) -> &DeviceBuffer {
-                    self.held.get(slot)
+                    let backing = self.held.get(slot).backing().as_any();
+                    backing
+                        .downcast_ref::<DeviceBuffer>()
+                        .expect("this runner allocates device buffers")
                 }
 
                 /// Passes each argument by position, then enqueues.
@@ -49,8 +53,8 @@ macro_rules! device_runner {
                     for arg in &launch.args {
                         match arg {
                             Arg::Buffer(slot, skip) => {
-                                let at = self.buffer(*slot).device_ptr() + (skip * 4) as u64;
-                                args.device_ptr(at)
+                                let at = slot.start() + skip * slot.dtype.bytes();
+                                args.device_ptr(self.buffer(*slot).device_ptr() + at as u64)
                             }
                             Arg::U32(v) => args.u32(*v),
                             Arg::F32(v) => args.f32(*v),
@@ -84,11 +88,11 @@ macro_rules! device_runner {
                         return Err(Error::Unsupported("a plan over several zones".into()));
                     }
                     let ctx = self.ctx;
-                    self.held.bind(&plan, |len| {
-                        let buffer = DeviceBuffer::alloc(ctx, (len * 4).max(4))?;
+                    self.held.bind(&plan, |zone, bytes| {
+                        let buffer = DeviceBuffer::alloc(ctx, bytes.max(4))?;
                         // Kernels may read what they are about to write.
                         buffer.zero()?;
-                        Ok(buffer)
+                        Ok(Buffer::new(zone, buffer))
                     })?;
                     self.kernels.clear();
                     for step in &plan.steps {
@@ -109,14 +113,12 @@ macro_rules! device_runner {
                     Ok(())
                 }
 
-                fn write(&self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
-                    Ok(self.buffer(slot).write_bytes(bytes)?)
+                fn held(&self) -> &Held {
+                    &self.held
                 }
 
-                fn read(&self, slot: Slot) -> Result<Vec<f32>, Error> {
-                    let mut out = vec![0.0; slot.len];
-                    self.buffer(slot).read_f32(&mut out)?;
-                    Ok(out)
+                fn held_mut(&mut self) -> &mut Held {
+                    &mut self.held
                 }
 
                 fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {

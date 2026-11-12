@@ -1,7 +1,9 @@
 //! A matmul with one thread per output column.
 
 use graph::Order;
-use lower::{Arg, Draft, Form, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
+use lower::{
+    Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Text, Tree, float,
+};
 use sim::{Load, Ops};
 
 /// Its row limit: each thread keeps one sum per row.
@@ -13,7 +15,7 @@ pub struct Thin {
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub form: Form,
+    pub form: DType,
 }
 
 fn body(load: &str) -> String {
@@ -41,8 +43,8 @@ fn body(load: &str) -> String {
 impl Kernel for Thin {
     fn name(&self) -> &'static str {
         match self.form {
-            Form::F32 => "thin",
-            Form::Bf16 => "thin_bf16",
+            DType::Bf16 => "thin_bf16",
+            _ => "thin",
         }
     }
 
@@ -81,7 +83,7 @@ impl Kernel for Thin {
         })
     }
 
-    fn accepts(&self, input: usize, form: Form) -> bool {
+    fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 1, form)
     }
 

@@ -3,8 +3,8 @@
 use graph::Order;
 use lower::kernels::{MapStage, operands, stage_lines};
 use lower::{
-    Arg, Draft, Form, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, T, Text, Tree,
-    float, hash,
+    Arg, DType, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, Stored, T, Text,
+    Tree, float, hash,
 };
 use std::cmp::Ordering;
 
@@ -24,7 +24,7 @@ pub struct Lanes {
     pub n: usize,
     pub k: usize,
     pub lanes: usize,
-    pub form: Form,
+    pub form: DType,
 }
 
 /// Elementwise stages a sum runs through before it is stored.
@@ -104,8 +104,8 @@ const SUMS: &str = "    if (gid >= count) {
 impl Kernel for Lanes {
     fn name(&self) -> &'static str {
         match self.form {
-            Form::F32 => "lanes",
-            Form::Bf16 => "lanes_bf16",
+            DType::Bf16 => "lanes_bf16",
+            _ => "lanes",
         }
     }
 
@@ -173,7 +173,7 @@ impl Kernel for Lanes {
         1e-9
     }
 
-    fn accepts(&self, input: usize, form: Form) -> bool {
+    fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 1, form)
     }
 }

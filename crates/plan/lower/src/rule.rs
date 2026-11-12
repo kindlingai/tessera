@@ -1,10 +1,9 @@
 //! Rules propose kernels for a site; link time collects them.
 
-use crate::form::Form;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::MapStage;
 use crate::tree::{T, Tree};
-use graph::Stage;
+use graph::{DType, Stage};
 
 pub use scattered_collect::declarative::{gather, scatter};
 
@@ -36,7 +35,7 @@ pub enum Site<'a> {
         m: usize,
         n: usize,
         k: usize,
-        form: Form,
+        form: DType,
     },
     /// Elementwise stages over `reads[0]`; operands follow it.
     Map {
@@ -66,7 +65,7 @@ pub enum Site<'a> {
         ids: T,
         rows: usize,
         width: usize,
-        form: Form,
+        form: DType,
     },
     /// Indices of each row's `k` largest entries.
     Top {

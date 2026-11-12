@@ -1,8 +1,9 @@
 //! Plain loops: the reference every plan is checked against.
 
 use crate::round::Acc;
-use crate::tensor::{Error, Tensor};
+use crate::tensor::Error;
 use graph::{Act, Attend, Mask, Numerics, Pairs, Stage};
+use mem::Tensor;
 
 /// The tanh approximation, as the GPU kernels compute it.
 fn gelu(x: f32) -> f32 {
@@ -164,7 +165,7 @@ pub(crate) fn stage(
 
 pub(crate) fn gather(table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {
     let rows = table.shape[0];
-    let width = table.data.len() / rows.max(1);
+    let width = table.len() / rows.max(1);
     let ids_at = ids.indices()?;
     if let Some(bad) = ids_at.iter().find(|&&i| i >= rows) {
         return Err(Error::Mismatch(format!("index {bad} past {rows} rows")));
@@ -174,8 +175,5 @@ pub(crate) fn gather(table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {
         .flat_map(|&r| (0..width).map(move |c| r * width + c));
     let mut shape = ids.shape.clone();
     shape.extend_from_slice(&table.shape[1..]);
-    Ok(Tensor {
-        shape,
-        data: table.data.pick(at),
-    })
+    Ok(table.pick(shape, at))
 }

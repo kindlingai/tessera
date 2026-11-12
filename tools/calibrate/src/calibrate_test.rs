@@ -1,4 +1,4 @@
-use crate::probe::{Kind, Probe, Reading, fit, suite};
+use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
 use crate::{Grid, headroom, judge, path};
 use gpukit::testing::backend_ready;
 use lower::{Device, rules};
@@ -81,4 +81,22 @@ fn judge_skips_unmodelled_kernels() {
     for h in headroom(&sim::m3_pro(), &timed) {
         assert_eq!(h.bound.is_some(), names.contains(&h.kernel), "{h:?}");
     }
+}
+
+/// A float probe, an index probe and the links run.
+#[test]
+fn probes_and_links_run() {
+    if !backend_ready() {
+        return eprintln!("no GPU here; skipped");
+    }
+    let probe = |kind, threads, trips| Probe {
+        kind,
+        threads,
+        trips,
+    };
+    let readings = read(&[probe(Kind::Spin, 256, 16), probe(Kind::Chase, 1, 4)]).unwrap();
+    assert!(readings.iter().all(|r| r.seconds > 0.0));
+    let cluster = links().unwrap();
+    assert_eq!(cluster.links.len(), 2);
+    assert!(cluster.links.iter().all(|l| l.rate > 0.0));
 }

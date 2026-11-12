@@ -4,8 +4,8 @@
 use kernels as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
-use interp::{Data, Tensor, run};
-use lower::{Device, Feed, lower, open};
+use interp::{Tensor, run};
+use lower::{Device, lower, open};
 use models::Stack;
 use models::nanogpt::{Config, program};
 use trace::DimName::{Context, Seqs};
@@ -147,10 +147,7 @@ fn close(label: &str, got: &[f32]) {
 #[test]
 fn cpu_matches_record() {
     let g = graph();
-    let ids = |data: Vec<u32>| Tensor {
-        shape: vec![2, 5],
-        data: Data::U32(data),
-    };
+    let ids = |data: Vec<u32>| Tensor::u32(vec![2, 5], data);
     let inputs = [ids(TOKENS.to_vec()), ids(positions())];
     let out = run(&g, &weights(&g), 0, &inputs).unwrap();
     close("cpu", out[0].floats().unwrap());
@@ -163,12 +160,14 @@ fn plan_matches_record() {
     }
     let g = graph();
     let plan = lower(&g, 0, &[(Seqs, 2), (Context, 5)], &Device::guess()).unwrap();
-    let runner = open(plan).unwrap();
+    let mut runner = open(plan).unwrap();
     for (at, w) in weights(&g).iter().enumerate() {
-        runner.load(at as u32, w.floats().unwrap()).unwrap();
+        runner.load(at as u32, w.view()).unwrap();
     }
-    let feeds = [Feed::Ids(&TOKENS), Feed::Ids(&positions())];
-    close("plan", &runner.run(&feeds).unwrap()[0]);
+    let ids = |data: Vec<u32>| Tensor::u32(vec![2, 5], data);
+    let inputs = [ids(TOKENS.to_vec()), ids(positions())];
+    let out = runner.run(&[inputs[0].view(), inputs[1].view()]).unwrap();
+    close("plan", out[0].floats().unwrap());
 }
 
 #[test]

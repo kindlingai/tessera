@@ -1,11 +1,11 @@
 //! An entry as trees: values with one reader join it.
 
 use crate::Error;
-use crate::form::{Form, Pins};
+use crate::form::Pins;
 use crate::kernels::MapStage;
 use crate::rule::{Attn, Site};
 use crate::select::Home;
-use graph::{Attend, DimName, Graph, Mask, NodeId, Op, Select, Shape, Stage, View};
+use graph::{Attend, DType, DimName, Graph, Mask, NodeId, Op, Select, Shape, Stage, View};
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -34,7 +34,7 @@ pub struct Node {
     pub args: Vec<T>,
     pub shape: Vec<usize>,
     /// How its elements are stored.
-    pub form: Form,
+    pub form: DType,
     /// The graph node it came from.
     pub from: NodeId,
 }
@@ -47,8 +47,8 @@ pub struct Tree<'a> {
     readers: Vec<u32>,
     /// The entry's outputs, with each one's graph shape.
     pub outputs: Vec<(T, Vec<usize>)>,
-    /// Elements of each input port, used or not.
-    pub ports: Vec<usize>,
+    /// Elements and type of each input port, used or not.
+    pub ports: Vec<(usize, DType)>,
 }
 
 pub(crate) fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
@@ -116,7 +116,7 @@ impl<'a> Tree<'a> {
         };
         for port in &e.inputs {
             let len = sized(g, sizes, &port.ty.shape)?.iter().product();
-            tree.ports.push(len);
+            tree.ports.push((len, port.ty.dtype));
         }
         // Each graph node's value, as a view node.
         let mut at: Vec<Option<T>> = vec![None; g.nodes.len()];
@@ -130,7 +130,7 @@ impl<'a> Tree<'a> {
             let args = args?;
             let form = match &n.op {
                 Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
-                _ => Form::F32,
+                _ => n.ty.dtype,
             };
             let mut push = |term: Term, args: Vec<T>| {
                 let shape = shape.clone();
@@ -197,6 +197,10 @@ impl<'a> Tree<'a> {
 
     pub fn elements(&self, t: T) -> usize {
         self.node(t).shape.iter().product()
+    }
+
+    pub fn bytes(&self, t: T) -> usize {
+        self.elements(t) * self.node(t).form.bytes()
     }
 
     pub fn leaf(&self, t: T) -> bool {

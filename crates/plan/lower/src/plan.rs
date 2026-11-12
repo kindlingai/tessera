@@ -1,15 +1,37 @@
 //! A plan: kernel launches over buffers that stay on device.
 
 use crate::abi::{Arg, Launch};
-use crate::form::Form;
 use crate::kernel::KernelRef;
-use graph::{NodeId, Order};
+use graph::{DType, NodeId, Order};
 
-/// Leading elements of one buffer. Every element is four bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `len` elements of one buffer, `offset` elements in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub buffer: u32,
+    pub offset: usize,
     pub len: usize,
+    pub dtype: DType,
+}
+
+impl Slot {
+    /// Elements from the start of a buffer, as f32.
+    pub fn floats(buffer: u32, len: usize) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            len,
+            dtype: DType::F32,
+        }
+    }
+
+    /// The first byte's offset.
+    pub fn start(&self) -> usize {
+        self.offset * self.dtype.bytes()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.len * self.dtype.bytes()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,12 +62,11 @@ impl Step {
     }
 }
 
-/// One graph weight, where it loads and in what form.
+/// A graph weight and where it loads, with its form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loaded {
     pub weight: u32,
     pub slot: Slot,
-    pub form: Form,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,7 +77,7 @@ pub struct Output {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plan {
-    /// Elements per buffer. Values that never overlap share one.
+    /// Bytes per buffer. Values that never overlap share one.
     pub buffers: Vec<usize>,
     /// The zone each buffer lies in. Empty means zone 0.
     pub zones: Vec<u32>,
@@ -86,7 +107,7 @@ impl Plan {
         self.zones.iter().any(|z| *z != 0)
     }
 
-    /// Elements in buffers no weight, input or kept row owns.
+    /// Bytes in buffers no weight, input or kept row owns.
     pub fn scratch(&self) -> usize {
         let named = self
             .weights

@@ -10,7 +10,7 @@ use linear as _;
 pub use grid::Grid;
 
 use graph::{DimName, Graph};
-use lower::{Device, Error, Feed, Run, Step, lower, select};
+use lower::{Device, Error, Run, Step, View, lower, select};
 use sim::Chip;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ pub fn measure(
     runner: &mut dyn Run,
     (g, entry): (&Graph, usize),
     sizes: &[(DimName, u64)],
-    feeds: &[Feed],
+    feeds: &[View],
     device: &mut Device,
 ) -> Result<Vec<(Step, f64)>, Error> {
     // The same pins, or the weights would load again.

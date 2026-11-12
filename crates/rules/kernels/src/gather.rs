@@ -1,21 +1,21 @@
 //! Rows of a table at given indices.
 
 use crate::gather_rows;
-use lower::{Arg, Draft, Form, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
+use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Gather {
     pub rows: usize,
     pub width: usize,
     /// How the table is stored.
-    pub form: Form,
+    pub form: DType,
 }
 
 impl Kernel for Gather {
     fn name(&self) -> &'static str {
         match self.form {
-            Form::F32 => "gather",
-            Form::Bf16 => "gather_bf16",
+            DType::Bf16 => "gather_bf16",
+            _ => "gather",
         }
     }
 
@@ -28,13 +28,13 @@ impl Kernel for Gather {
             metal: gather_rows::METAL,
             cuda: gather_rows::CUDA,
             entry: match self.form {
-                Form::F32 => gather_rows::ENTRY,
-                Form::Bf16 => gather_rows::ENTRY_BF16,
+                DType::Bf16 => gather_rows::ENTRY_BF16,
+                _ => gather_rows::ENTRY,
             },
         }
     }
 
-    fn accepts(&self, input: usize, form: Form) -> bool {
+    fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 0, form)
     }
 

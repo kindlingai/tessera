@@ -1,8 +1,8 @@
 //! Small kernels that expose one hardware limit each.
 
 use lower::{
-    Arg, Cluster, Error, Feed, Kernel, KernelRef, Launch, Link, Plan, Run, Shape, Slot, Source,
-    Step, Text, Zone, ZoneKind, open,
+    Arg, Cluster, DType, Error, Kernel, KernelRef, Launch, Link, Plan, Run, Shape, Slot, Source,
+    Step, Tensor, Text, Zone, ZoneKind, open,
 };
 use sim::{Fit, Tag};
 use std::time::Instant;
@@ -121,19 +121,27 @@ impl Probe {
     /// A plan of this one launch, reading buffer 0.
     fn plan(&self) -> Plan {
         let [read, write] = self.buffers();
-        let slot = |buffer, len| Slot { buffer, len };
+        let slot = Slot::floats;
+        // A chase reads a table of indices.
+        let input = match self.kind {
+            Kind::Chase => Slot {
+                dtype: DType::U32,
+                ..slot(0, read)
+            },
+            _ => slot(0, read),
+        };
         let step = Step {
             kernel: KernelRef::new(*self),
             rule: "probe",
-            reads: vec![slot(0, read)],
+            reads: vec![input],
             write: slot(1, write),
             covers: Vec::new(),
             zone: 0,
         };
         Plan {
-            buffers: vec![read, write],
+            buffers: vec![4 * read, 4 * write],
             steps: vec![step],
-            inputs: vec![slot(0, read)],
+            inputs: vec![input],
             ..Plan::default()
         }
     }
@@ -179,17 +187,17 @@ impl Kernel for Probe {
 const CHASE: usize = 1 << 26;
 
 /// Each entry names the next, in one cycle through all.
-fn chain() -> Vec<u32> {
+fn chain() -> Tensor {
     // An odd step and a power-of-two length visit every entry.
     let step = 40_503 * 65_537 + 2;
     let next = |i: usize| (i.wrapping_add(step) % CHASE) as u32;
-    (0..CHASE).map(next).collect()
+    Tensor::u32(vec![CHASE], (0..CHASE).map(next).collect())
 }
 
 /// Times each probe on this GPU. The fastest run counts.
 pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
     let mut runner: Option<Box<dyn Run>> = None;
-    let mut table: Option<Vec<u32>> = None;
+    let mut table: Option<Tensor> = None;
     let mut readings = Vec::with_capacity(probes.len());
     for &probe in probes {
         let runner = match &mut runner {
@@ -200,7 +208,7 @@ pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
             None => runner.insert(open(probe.plan())?),
         };
         if probe.kind == Kind::Chase {
-            runner.feed(&[Feed::Ids(table.get_or_insert_with(chain))])?;
+            runner.feed(&[table.get_or_insert_with(chain).view()])?;
         }
         // The first run touches every page.
         runner.submit(0..1)?;
@@ -235,26 +243,25 @@ fn least(tries: usize, mut go: impl FnMut() -> Result<(), Error>) -> Result<f64,
 
 /// Times moves between this GPU and the host, both ways.
 pub fn links() -> Result<Cluster, Error> {
-    let slot = |len| Slot { buffer: 0, len };
+    let slot = |len| Slot::floats(0, len);
     let plan = Plan {
-        buffers: vec![MOVED],
+        buffers: vec![4 * MOVED],
         inputs: vec![slot(MOVED)],
         ..Plan::default()
     };
-    let runner = open(plan)?;
-    let bytes = vec![0u8; 4 * MOVED];
+    let mut runner = open(plan)?;
+    let zeros = Tensor::zeros(vec![MOVED], DType::F32);
     let mut cluster = Cluster::one(&runner.device());
     let host = cluster.add(Zone {
         name: "host".into(),
         kind: ZoneKind::Cpu,
         parent: None,
     });
-    let write = |len: usize| runner.write(slot(len), &bytes[..4 * len]);
-    let read = |len: usize| runner.read(slot(len)).map(drop);
-    for (from, to, go) in [
-        (host, 0, &write as &dyn Fn(usize) -> Result<(), Error>),
-        (0, host, &read),
-    ] {
+    for (from, to) in [(host, 0), (0, host)] {
+        let mut go = |len: usize| match from == host {
+            true => runner.write(slot(len), zeros.view().slice(0, 0, len)),
+            false => runner.read(slot(len)).map(drop),
+        };
         // One element shows the latency, and the rest the rate.
         let latency = least(64, || go(1))?;
         let large = least(4, || go(MOVED))?;

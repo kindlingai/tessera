@@ -4,8 +4,8 @@
 use kernels as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
-use interp::{Data, Store, Tensor, run, run_kept};
-use lower::{Device, Feed, Run, lower, open, rules};
+use interp::{Store, Tensor, run, run_kept};
+use lower::{Device, Run, lower, open, rules};
 use models::qwen3::{Config, program, stepper};
 use std::ops::Range;
 use trace::DimName::{Context, Rows, Seqs};
@@ -33,9 +33,7 @@ fn feeds(tokens: &[u32], seqs: usize, span: Range<usize>) -> [Tensor; 2] {
     let shape = vec![seqs, span.len()];
     let rows = |of: &dyn Fn(usize, usize) -> u32| {
         let all = (0..seqs).flat_map(|s| span.clone().map(move |t| of(s, t)));
-        let data = Data::U32(all.collect());
-        let shape = shape.clone();
-        Tensor { shape, data }
+        Tensor::u32(shape.clone(), all.collect())
     };
     [rows(&|s, t| tokens[s * LEN + t]), rows(&|_, t| t as u32)]
 }
@@ -120,16 +118,15 @@ fn launch(
             // Weights load once. Later plans reuse them.
             let r = runner.insert(open(plan).unwrap());
             for (at, w) in weights.iter().enumerate() {
-                r.load(at as u32, w.floats().unwrap()).unwrap();
+                r.load(at as u32, w.view()).unwrap();
             }
         }
     }
-    let r = runner.as_ref().unwrap();
-    let ids_of = |t: &Tensor| t.indices().unwrap().iter().map(|i| *i as u32).collect();
-    let fed: [Vec<u32>; 2] = [ids_of(&feeds[0]), ids_of(&feeds[1])];
-    r.feed(&[Feed::Ids(&fed[0]), Feed::Ids(&fed[1])]).unwrap();
+    let r = runner.as_mut().unwrap();
+    r.feed(&[feeds[0].view(), feeds[1].view()]).unwrap();
     r.submit(0..r.plan().steps.len()).unwrap();
-    (r.ids(ids).unwrap(), r.read(logits).unwrap())
+    let logits = r.read(logits).unwrap().floats().unwrap().to_vec();
+    (r.ids(ids).unwrap(), logits)
 }
 
 #[test]

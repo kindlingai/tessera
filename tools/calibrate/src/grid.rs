@@ -3,7 +3,7 @@
 use crate::measure;
 use gpukit::testing::Noise;
 use graph::DimName::{self, *};
-use lower::{Device, Error, Feed, Run, Step, lower, open};
+use lower::{Device, Error, Run, Step, Tensor, View, lower, open};
 use trace::{
     Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
     TensorType, Weights, declare,
@@ -116,31 +116,17 @@ fn table(vocab: u64, width: u64) -> Graph {
     m.finish([(Role::Logits, &m.embed(&tokens, &w.embed))])
 }
 
-/// An input's values.
-enum Fed {
-    Floats(Vec<f32>),
-    Ids(Vec<u32>),
-}
-
-impl Fed {
-    fn feed(&self) -> Feed<'_> {
-        match self {
-            Fed::Floats(v) => Feed::Floats(v),
-            Fed::Ids(v) => Feed::Ids(v),
-        }
-    }
-}
-
-/// Noise shaped like `ty`; ids stay below eight.
-fn fill(g: &Graph, ty: &TensorType, sizes: &Sizes, noise: &mut Noise) -> Result<Fed, Error> {
+/// Noise for `ty` as one row. Ids stay below eight.
+fn fill(g: &Graph, ty: &TensorType, sizes: &Sizes, noise: &mut Noise) -> Result<Tensor, Error> {
     let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
     let poly = ty.shape.elements(&g.dims).ok();
     let unsized_shape = || Error::Size(ty.shape.to_string());
     let len = poly.and_then(|p| p.eval(&size)).ok_or_else(unsized_shape)?;
     let mut draws = (0..len).map(|_| noise.draw());
+    let shape = vec![len as usize];
     Ok(match ty.dtype {
-        DType::U32 => Fed::Ids(draws.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
-        _ => Fed::Floats(draws.by_ref().collect()),
+        DType::U32 => Tensor::u32(shape, draws.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
+        _ => Tensor::f32(shape, draws.by_ref().collect()),
     })
 }
 
@@ -159,10 +145,10 @@ impl Case {
                 None => runner.insert(self.open(plan, noise)?),
             };
             let ports = self.g.entries[0].inputs.iter();
-            let fed: Result<Vec<Fed>, Error> =
+            let fed: Result<Vec<Tensor>, Error> =
                 ports.map(|p| fill(&self.g, &p.ty, sizes, noise)).collect();
             let fed = fed?;
-            let feeds: Vec<Feed> = fed.iter().map(Fed::feed).collect();
+            let feeds: Vec<View> = fed.iter().map(Tensor::view).collect();
             added.extend(measure(&mut **runner, (&self.g, 0), sizes, &feeds, device)?);
         }
         Ok(added)
@@ -170,12 +156,10 @@ impl Case {
 
     /// A runner with noise for weights.
     fn open(&self, plan: lower::Plan, noise: &mut Noise) -> Result<Box<dyn Run>, Error> {
-        let runner = open(plan)?;
+        let mut runner = open(plan)?;
         for (at, w) in self.g.weights.iter().enumerate() {
-            let Fed::Floats(data) = fill(&self.g, &w.ty, &Vec::new(), noise)? else {
-                return Err(Error::Unsupported("integer weights".into()));
-            };
-            runner.load(at as u32, &data)?;
+            let data = fill(&self.g, &w.ty, &Vec::new(), noise)?;
+            runner.load(at as u32, data.view())?;
         }
         Ok(runner)
     }

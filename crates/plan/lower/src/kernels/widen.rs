@@ -2,16 +2,17 @@
 
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::emit::{Text, float};
-use crate::form::Form;
+use crate::form::Stored;
 use crate::kernel::Kernel;
 use crate::plan::Step;
+use graph::DType;
 use sim::{Load, Ops};
 
 /// Widens `len` elements of `form` to f32.
 #[derive(Clone, Copy, Debug)]
 pub struct Widen {
     pub len: usize,
-    pub form: Form,
+    pub form: DType,
 }
 
 impl Kernel for Widen {
@@ -58,7 +59,7 @@ impl Kernel for Widen {
         })
     }
 
-    fn accepts(&self, _: usize, form: Form) -> bool {
+    fn accepts(&self, _: usize, form: DType) -> bool {
         form == self.form
     }
 }

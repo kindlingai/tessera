@@ -24,11 +24,12 @@ pub use assign::assign;
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use emit::{Dialect, Text, float, hash};
-pub use form::{Form, Pins};
+pub use form::{Pins, Stored};
 pub use kernel::{Kernel, KernelRef};
+pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};
 pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
-pub use run::{Feed, Held, Run, open};
+pub use run::{Held, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
 pub use sim::{Cluster, Fit, Link, Load, Ops, Zone, ZoneKind};
@@ -56,6 +57,8 @@ pub enum Error {
     /// A dimension has no size for this launch.
     Size(String),
     Gpu(gpukit::Error),
+    /// A view did not fit its buffer or its use.
+    Memory(mem::Error),
 }
 
 impl fmt::Display for Error {
@@ -64,6 +67,7 @@ impl fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "no rule lowers {what}"),
             Error::Size(what) => write!(f, "{what} has no size in this launch"),
             Error::Gpu(e) => write!(f, "gpu: {e}"),
+            Error::Memory(e) => write!(f, "memory: {e}"),
         }
     }
 }
@@ -73,5 +77,11 @@ impl std::error::Error for Error {}
 impl From<gpukit::Error> for Error {
     fn from(e: gpukit::Error) -> Self {
         Error::Gpu(e)
+    }
+}
+
+impl From<mem::Error> for Error {
+    fn from(e: mem::Error) -> Self {
+        Error::Memory(e)
     }
 }

@@ -5,8 +5,9 @@ mod round;
 mod run;
 mod tensor;
 
+pub use mem::Tensor;
 pub use run::{Store, bind, run, run_kept};
-pub use tensor::{Data, Error, Tensor};
+pub use tensor::Error;
 
 #[cfg(test)]
 mod interp_test;

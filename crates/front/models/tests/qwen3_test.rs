@@ -3,8 +3,8 @@
 use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
 use gpukit::testing::{backend_ready, cosine_f32, max_abs_diff};
-use interp::{Data, Tensor, bind, run};
-use lower::{Device, Feed, Form, Pins, Plan, Run, lower, open, select};
+use interp::{Tensor, bind, run};
+use lower::{DType, Device, Pins, Plan, Run, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,7 +37,10 @@ struct Case {
 fn case(g: &Graph) -> Option<Case> {
     let dir = PathBuf::from(std::env::var_os("TESSERA_QWEN3")?);
     let file = File::open(&dir.join("model.safetensors")).unwrap();
-    let find = |p: &[PathSeg]| Some(Data::F32(file.floats(&tensor_name(p)?).ok()?));
+    let find = |p: &[PathSeg]| {
+        let v = file.floats(&tensor_name(p)?).ok()?;
+        Some(Tensor::f32(vec![v.len()], v))
+    };
     let tokens = std::fs::read_to_string(dir.join("tokens.txt")).unwrap();
     let floats = std::fs::read(dir.join("logits.f32")).unwrap();
     let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
@@ -55,10 +58,7 @@ fn case(g: &Graph) -> Option<Case> {
 fn logits(g: &Graph, c: &Case, tokens: &[u32]) -> Vec<f32> {
     let shape = vec![1, tokens.len()];
     let positions = (0..tokens.len() as u32).collect();
-    let ids = |data| Tensor {
-        shape: shape.clone(),
-        data: Data::U32(data),
-    };
+    let ids = |data| Tensor::u32(shape.clone(), data);
     let inputs = [ids(tokens.to_vec()), ids(positions)];
     let start = Instant::now();
     let out = run(g, &c.weights, 0, &inputs).unwrap();
@@ -102,7 +102,7 @@ fn matches_reference() {
 
 /// The checkpoint is bf16, so plans read it as stored.
 fn pinned() -> Device {
-    Device::guess().pinned(Pins::all(Form::Bf16))
+    Device::guess().pinned(Pins::all(DType::Bf16))
 }
 
 /// Plans for either entry on one runner. Weights load once.
@@ -131,6 +131,13 @@ impl Span<'_> {
 
     fn positions(&self) -> Vec<u32> {
         (self.past as u32..(self.past + self.tokens.len()) as u32).collect()
+    }
+
+    /// Tokens and positions as one-row tensors.
+    fn tensors(&self) -> [Tensor; 2] {
+        let shape = vec![1, self.tokens.len()];
+        let tokens = Tensor::u32(shape.clone(), self.tokens.to_vec());
+        [tokens, Tensor::u32(shape, self.positions())]
     }
 }
 
@@ -186,9 +193,9 @@ impl<'a> Gpu<'a> {
     fn open(g: &Graph, c: &'a Case) -> Self {
         let first = prompt(&c.tokens);
         let plan = lower(g, 0, &first.sizes(), &pinned()).unwrap();
-        let runner = open(plan).unwrap();
+        let mut runner = open(plan).unwrap();
         for (at, w) in c.weights.iter().enumerate() {
-            runner.load(at as u32, w.floats().unwrap()).unwrap();
+            runner.load(at as u32, w.view()).unwrap();
         }
         let device = stored(&*runner).unwrap().pinned(pinned().pins);
         let (name, samples) = (runner.device(), device.samples());
@@ -203,8 +210,8 @@ impl<'a> Gpu<'a> {
 
     /// Times this launch under each competing rule, where unknown.
     fn learn(&mut self, g: &Graph, rows: Span) {
-        let (sizes, positions) = (rows.sizes(), rows.positions());
-        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
+        let (sizes, [tokens, positions]) = (rows.sizes(), rows.tensors());
+        let feeds = [tokens.view(), positions.view()];
         // What the stored samples alone would launch.
         let before = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
         let device = &mut self.device;
@@ -222,9 +229,10 @@ impl<'a> Gpu<'a> {
     fn plan(&mut self, g: &Graph, rows: Span, device: &Device) {
         let plan = lower(g, 0, &rows.sizes(), device).unwrap();
         self.runner.replan(plan).unwrap();
-        let positions = rows.positions();
-        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
-        self.runner.feed(&feeds).unwrap();
+        let [tokens, positions] = rows.tensors();
+        self.runner
+            .feed(&[tokens.view(), positions.view()])
+            .unwrap();
     }
 
     /// Each step's seconds for the plan in place.
@@ -270,7 +278,7 @@ mod forward {
         gpu.runner.submit(all.clone()).unwrap();
         let start = Instant::now();
         gpu.runner.submit(all).unwrap();
-        let out = gpu.runner.read(out).unwrap();
+        let out = gpu.runner.read(out).unwrap().floats().unwrap().to_vec();
         let whole = start.elapsed().as_secs_f64();
         Timed {
             plan: gpu.runner.plan().clone(),
@@ -379,10 +387,9 @@ mod decode {
         let out = plan.outputs[0].slot;
         gpu.runner.replan(plan).unwrap();
         let planning = start.elapsed().as_secs_f64();
-        let positions = rows.positions();
+        let [tokens, positions] = rows.tensors();
         let start = Instant::now();
-        let feeds = [Feed::Ids(rows.tokens), Feed::Ids(&positions)];
-        gpu.runner.feed(&feeds).unwrap();
+        gpu.runner.feed(&[tokens.view(), positions.view()]).unwrap();
         gpu.runner.submit(0..gpu.runner.plan().steps.len()).unwrap();
         let ids = gpu.runner.ids(out).unwrap();
         (ids, [planning, start.elapsed().as_secs_f64()])

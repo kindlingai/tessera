@@ -1,8 +1,9 @@
 //! Walks the graph in order, binding dimensions from the inputs.
 
 use crate::cpu;
-use crate::tensor::{Data, Error, Tensor};
+use crate::tensor::Error;
 use graph::{DimExpr, DimName, Graph, NodeId, Numerics, Op, PathSeg, Select, Shape, Size, View};
+use mem::Tensor;
 use std::collections::BTreeMap;
 
 /// Dimension sizes for one launch.
@@ -60,8 +61,8 @@ impl<'a> Sizes<'a> {
     }
 }
 
-/// Weight tensors in graph order, found by path.
-pub fn bind(g: &Graph, find: impl Fn(&[PathSeg]) -> Option<Data>) -> Result<Vec<Tensor>, Error> {
+/// Weights in graph order, found by path and shaped here.
+pub fn bind(g: &Graph, find: impl Fn(&[PathSeg]) -> Option<Tensor>) -> Result<Vec<Tensor>, Error> {
     let sizes = Sizes::new(g);
     g.weights
         .iter()
@@ -75,7 +76,7 @@ pub fn bind(g: &Graph, find: impl Fn(&[PathSeg]) -> Option<Data>) -> Result<Vec<
                 let msg = format!("{:?}: got {got:?}, want {want} {:?}", w.path, w.ty.dtype);
                 return Err(Error::Mismatch(msg));
             }
-            Ok(Tensor { shape, data })
+            Ok(data.reshaped(shape))
         })
         .collect()
 }
@@ -142,8 +143,7 @@ pub fn run_kept(
     let mut sizes = Sizes::new(g);
     for (port, t) in e.inputs.iter().zip(inputs) {
         sizes.learn(&port.ty.shape, &t.shape)?;
-        let filled = t.data.len() == t.shape.iter().product::<usize>();
-        if t.data.dtype() != port.ty.dtype || !filled {
+        if t.dtype() != port.ty.dtype || !t.filled() {
             return Err(Error::Mismatch(format!(
                 "{:?} port wants {:?} filling {:?}",
                 port.role, port.ty.dtype, t.shape
@@ -184,7 +184,7 @@ pub fn run_kept(
             _ => ctx.eval(&num, &n.op, &args)?,
         };
         let want = sizes.shape(&n.ty.shape)?;
-        if out.shape != want || out.data.dtype() != n.ty.dtype {
+        if out.shape != want || out.dtype() != n.ty.dtype {
             let msg = format!(
                 "node {i} {:?} gave {:?}, graph says {want:?}",
                 n.op, out.shape
@@ -253,19 +253,13 @@ impl Context<'_> {
             Op::Select(s) => lacks(&format!("{s:?}")),
             Op::Append(_) => lacks("kept rows outside a launch"),
             Op::View(v) => self.view(v, args[0]),
-            Op::Cast(dtype) => Ok(Tensor {
-                shape: args[0].shape.clone(),
-                data: args[0].data.cast(*dtype)?,
-            }),
+            Op::Cast(dtype) => Ok(args[0].cast(*dtype)?),
         }
     }
 
     fn view(&self, v: &View, x: &Tensor) -> Result<Tensor, Error> {
         match v {
-            View::Reshape(s) => Ok(Tensor {
-                shape: self.sizes.shape(s)?,
-                data: x.data.clone(),
-            }),
+            View::Reshape(s) => Ok(x.reshaped(self.sizes.shape(s)?)),
             View::Slice { axis, start, len } => {
                 let a = *axis as usize;
                 let (start, len) = (self.sizes.expr(start)?, self.sizes.expr(len)?);
@@ -278,10 +272,7 @@ impl Context<'_> {
                 });
                 let mut shape = x.shape.clone();
                 shape[a] = len;
-                Ok(Tensor {
-                    shape,
-                    data: x.data.pick(at),
-                })
+                Ok(x.pick(shape, at))
             }
             View::Permute(order) => Ok(permute(x, order)),
             View::Expand { .. } | View::Concat => lacks(&format!("{v:?}")),
@@ -292,7 +283,7 @@ impl Context<'_> {
 /// Each row's largest finite entries, best first.
 fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
     let (_, width) = x.rows();
-    let mut ids = Vec::with_capacity(x.data.len() / width.max(1) * k);
+    let mut ids = Vec::with_capacity(x.len() / width.max(1) * k);
     for row in x.floats()?.chunks(width.max(1)) {
         let mut order: Vec<usize> = (0..width).filter(|i| row[*i] > f32::NEG_INFINITY).collect();
         // A stable sort keeps the lower index on ties.
@@ -303,8 +294,7 @@ fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
     }
     let mut shape = x.shape.clone();
     *shape.last_mut().expect("verified rank") = k;
-    let data = Data::U32(ids);
-    Ok(Tensor { shape, data })
+    Ok(Tensor::u32(shape, ids))
 }
 
 /// Ops that trace and verify but do not run yet.
@@ -328,8 +318,5 @@ fn permute(x: &Tensor, order: &[u32]) -> Tensor {
         }
         offset
     });
-    Tensor {
-        data: x.data.pick(at),
-        shape,
-    }
+    x.pick(shape.clone(), at)
 }
