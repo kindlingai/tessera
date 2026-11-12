@@ -1,4 +1,4 @@
-// Tiled f32 GEMM. Mirrors gemm.metal.
+// Tiled GEMM, B as f32 or bf16. Mirrors gemm.metal.
 
 #define BM 64
 #define BN 64
@@ -13,9 +13,13 @@ struct GemmParams {
     unsigned trans_a, trans_b;
 };
 
-extern "C" __global__ void gemm_f32(
+__device__ __forceinline__ float widen(float v) { return v; }
+__device__ __forceinline__ float widen(unsigned short v) { return __uint_as_float((unsigned)v << 16); }
+
+template <typename TB>
+__device__ __forceinline__ void gemm_t(
     const float *A,
-    const float *B,
+    const TB *B,
     float *C,
     GemmParams p
 ) {
@@ -52,7 +56,7 @@ extern "C" __global__ void gemm_f32(
                 unsigned n = col0 + tx * TN + j;
                 float v = 0.0f;
                 if (k < p.k && n < p.n) {
-                    v = p.trans_b != 0u ? B[(size_t)n * p.ldb + k] : B[(size_t)k * p.ldb + n];
+                    v = widen(p.trans_b != 0u ? B[(size_t)n * p.ldb + k] : B[(size_t)k * p.ldb + n]);
                 }
                 Bs[kk * BN + tx * TN + j] = v;
             }
@@ -86,4 +90,12 @@ extern "C" __global__ void gemm_f32(
             C[idx] = p.alpha * acc[i][j] + prior;
         }
     }
+}
+
+extern "C" __global__ void gemm_f32(const float *A, const float *B, float *C, GemmParams p) {
+    gemm_t<float>(A, B, C, p);
+}
+
+extern "C" __global__ void gemm_bf16(const float *A, const unsigned short *B, float *C, GemmParams p) {
+    gemm_t<unsigned short>(A, B, C, p);
 }

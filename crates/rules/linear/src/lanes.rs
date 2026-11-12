@@ -3,8 +3,8 @@
 use graph::Order;
 use lower::kernels::{MapStage, operands, stage_lines};
 use lower::{
-    Arg, Draft, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, T, Text, Tree, float,
-    hash,
+    Arg, Draft, Form, Kernel, Launch, Load, Ops, Read, Shape, Site, Source, Step, T, Text, Tree,
+    float, hash,
 };
 use std::cmp::Ordering;
 
@@ -16,27 +16,6 @@ const ROWS: usize = 32;
 
 /// The most lane sums one launch may write.
 const ROOM: usize = 1 << 26;
-
-/// How a weight element is stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Form {
-    F32,
-}
-
-impl Form {
-    /// The buffer's element type, and how element `at + i` loads.
-    fn load(self) -> (&'static str, &'static str) {
-        match self {
-            Form::F32 => ("float", "w[at + i]"),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Form::F32 => "f32",
-        }
-    }
-}
 
 /// Each lane's sum over its share of `k`.
 #[derive(Clone, Copy, Debug)]
@@ -124,7 +103,10 @@ const SUMS: &str = "    if (gid >= count) {
 
 impl Kernel for Lanes {
     fn name(&self) -> &'static str {
-        "lanes"
+        match self.form {
+            Form::F32 => "lanes",
+            Form::Bf16 => "lanes_bf16",
+        }
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -152,18 +134,18 @@ impl Kernel for Lanes {
             group: 256,
             trips: k / lanes,
             trip,
-            reads: vec![4.0 * n * k, 4.0 * m * k],
+            reads: self.form.matmul_bytes(self.m, self.n, self.k),
             written: 4.0 * m * n * lanes,
             flight: 64.0,
         })
     }
 
     fn source(&self) -> Source {
-        let (ty, load) = self.form.load();
-        let w = ("w".to_string(), ty, false);
+        let load = self.form.load("w", "at + i");
+        let w = ("w".to_string(), self.form.ty(), false);
         let (rows, body) = match self.m {
-            1 => ("row", one(load)),
-            _ => ("rows", several(load)),
+            1 => ("row", one(&load)),
+            _ => ("rows", several(&load)),
         };
         Source::Made(Text {
             entry: format!("linear_{rows}_{}", self.form.name()),
@@ -189,6 +171,10 @@ impl Kernel for Lanes {
     /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
         1e-9
+    }
+
+    fn accepts(&self, input: usize, form: Form) -> bool {
+        self.form.taken(input, 1, form)
     }
 }
 
@@ -285,10 +271,18 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         }
         _ => return None,
     };
-    let Site::Matmul { x, w, m, n, k } = product else {
+    let Site::Matmul {
+        x,
+        w,
+        m,
+        n,
+        k,
+        form,
+    } = product
+    else {
         return None;
     };
-    let (lanes, form) = (lanes(k), Form::F32);
+    let lanes = lanes(k);
     if m > ROWS || m * n * lanes > ROOM {
         return None;
     }

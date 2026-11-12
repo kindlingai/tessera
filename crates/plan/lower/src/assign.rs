@@ -2,7 +2,7 @@
 
 use crate::kernel::KernelRef;
 use crate::kernels::Map;
-use crate::plan::{Output, Plan, Slot, Step};
+use crate::plan::{Loaded, Output, Plan, Slot, Step};
 use crate::select::{Home, Selected, Val, Value};
 
 /// A last use that never comes: weights, inputs and outputs.
@@ -42,9 +42,10 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     };
     for (v, value) in s.values.iter().enumerate() {
         match value.home {
-            Home::Weight(w) => {
+            Home::Weight(weight) => {
                 let slot = b.alloc(Val(v as u32));
-                b.plan.weights.push((w, slot));
+                let form = value.form;
+                b.plan.weights.push(Loaded { weight, slot, form });
             }
             Home::Kept { index, room } => {
                 // The longest context fits, so the buffer never moves.

@@ -23,6 +23,8 @@ pub const BK: usize = 16;
 pub const THREADS: u32 = 256;
 
 pub const ENTRY: &str = "gemm_f32";
+/// The same tiles, with B stored as bf16.
+pub const ENTRY_BF16: &str = "gemm_bf16";
 
 /// Kernel argument bytes, for callers that launch it themselves.
 pub fn abi_params(p: &Problem) -> Vec<u8> {

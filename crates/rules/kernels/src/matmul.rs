@@ -1,7 +1,7 @@
 //! The hand-written tiled matmul.
 
 use graph::Order;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
+use lower::{Arg, Draft, Form, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
 use sim::{Load, Ops};
 
 /// `x[m, k]` times `w[n, k]` transposed.
@@ -10,13 +10,18 @@ pub struct Matmul {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    /// How `w` is stored. `x` is always f32.
+    pub form: Form,
 }
 
-pub(crate) fn source() -> Source {
+pub(crate) fn source(form: Form) -> Source {
     Source::Fixed {
         metal: gemm::METAL,
         cuda: gemm::CUDA,
-        entry: gemm::ENTRY,
+        entry: match form {
+            Form::F32 => gemm::ENTRY,
+            Form::Bf16 => gemm::ENTRY_BF16,
+        },
     }
 }
 
@@ -42,7 +47,10 @@ pub(crate) fn launch(p: gemm::Problem, buffers: [Arg; 3]) -> Launch {
 
 impl Kernel for Matmul {
     fn name(&self) -> &'static str {
-        "matmul"
+        match self.form {
+            Form::F32 => "matmul",
+            Form::Bf16 => "matmul_bf16",
+        }
     }
 
     fn order(&self) -> Order {
@@ -66,14 +74,18 @@ impl Kernel for Matmul {
             group: threads,
             trips: k / gemm::BK as f64,
             trip,
-            reads: vec![4.0 * n * k, 4.0 * m * k],
+            reads: self.form.matmul_bytes(self.m, self.n, self.k),
             written: 4.0 * m * n,
             flight: 64.0,
         })
     }
 
     fn source(&self) -> Source {
-        source()
+        source(self.form)
+    }
+
+    fn accepts(&self, input: usize, form: Form) -> bool {
+        self.form.taken(input, 1, form)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -92,10 +104,18 @@ impl Kernel for Matmul {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Matmul { x, w, m, n, k } = tree.site(at)? else {
+    let Site::Matmul {
+        x,
+        w,
+        m,
+        n,
+        k,
+        form,
+    } = tree.site(at)?
+    else {
         return None;
     };
-    Some(vec![Draft::new(Matmul { m, n, k }, [x, w], m * n)])
+    Some(vec![Draft::new(Matmul { m, n, k, form }, [x, w], m * n)])
 }
 
 lower::rule!("matmul", propose);

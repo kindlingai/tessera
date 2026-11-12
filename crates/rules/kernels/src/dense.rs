@@ -68,7 +68,7 @@ impl Kernel for PerHead {
     }
 
     fn source(&self) -> Source {
-        source()
+        source(lower::Form::F32)
     }
 
     /// Each head's rows sit a stride apart, with no copy.

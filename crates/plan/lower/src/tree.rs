@@ -1,6 +1,7 @@
 //! An entry as trees: values with one reader join it.
 
 use crate::Error;
+use crate::form::{Form, Pins};
 use crate::kernels::MapStage;
 use crate::rule::{Attn, Site};
 use crate::select::Home;
@@ -32,6 +33,8 @@ pub struct Node {
     pub term: Term,
     pub args: Vec<T>,
     pub shape: Vec<usize>,
+    /// How its elements are stored.
+    pub form: Form,
     /// The graph node it came from.
     pub from: NodeId,
 }
@@ -93,7 +96,12 @@ fn sized(g: &Graph, sizes: &[(DimName, u64)], s: &Shape) -> Result<Vec<usize>, E
 
 impl<'a> Tree<'a> {
     /// Views `entry` at these sizes, one node per row stage.
-    pub fn new(g: &'a Graph, entry: usize, sizes: &[(DimName, u64)]) -> Result<Self, Error> {
+    pub fn new(
+        g: &'a Graph,
+        entry: usize,
+        sizes: &[(DimName, u64)],
+        pins: &Pins,
+    ) -> Result<Self, Error> {
         let Some(e) = g.entries.get(entry) else {
             return unsupported(format_args!("entry {entry}"));
         };
@@ -120,12 +128,17 @@ impl<'a> Tree<'a> {
             let args: Result<Vec<T>, Error> =
                 (n.args.iter().map(|a| at[a.0 as usize].ok_or_else(missing))).collect();
             let args = args?;
+            let form = match &n.op {
+                Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
+                _ => Form::F32,
+            };
             let mut push = |term: Term, args: Vec<T>| {
                 let shape = shape.clone();
                 tree.nodes.push(Node {
                     term,
                     args,
                     shape,
+                    form,
                     from,
                 });
                 T(tree.nodes.len() as u32 - 1)
@@ -211,8 +224,15 @@ impl<'a> Tree<'a> {
                 let [n, k] = wide(w)[..] else {
                     return None;
                 };
-                let m = self.elements(x) / k;
-                Some(Site::Matmul { x, w, m, n, k })
+                let (m, form) = (self.elements(x) / k, self.node(w).form);
+                Some(Site::Matmul {
+                    x,
+                    w,
+                    m,
+                    n,
+                    k,
+                    form,
+                })
             }
             Term::Stage(stage) if map_stage(stage).is_some() => self.chain(t),
             Term::Stage(stage) => {
@@ -260,11 +280,13 @@ impl<'a> Tree<'a> {
                     self.elements(ids),
                     self.elements(table) / wide(table).first()?,
                 );
+                let form = self.node(table).form;
                 Some(Site::Gather {
                     table,
                     ids,
                     rows,
                     width,
+                    form,
                 })
             }
             Term::Top => {

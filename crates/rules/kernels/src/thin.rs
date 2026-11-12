@@ -1,7 +1,7 @@
 //! A matmul with one thread per output column.
 
 use graph::Order;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
+use lower::{Arg, Draft, Form, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
 use sim::{Load, Ops};
 
 /// Its row limit: each thread keeps one sum per row.
@@ -13,29 +13,37 @@ pub struct Thin {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    pub form: Form,
 }
 
-const BODY: &str = "    if (gid >= n) {
+fn body(load: &str) -> String {
+    format!(
+        "    if (gid >= n) {{
         return;
-    }
+    }}
     float sums[32];
-    for (u32 row = 0; row < m; row++) {
+    for (u32 row = 0; row < m; row++) {{
         sums[row] = 0.0f;
-    }
-    for (u32 i = 0; i < k; i++) {
-        float c = w[(u64)gid * k + i];
-        for (u32 row = 0; row < m; row++) {
+    }}
+    for (u32 i = 0; i < k; i++) {{
+        float c = {load};
+        for (u32 row = 0; row < m; row++) {{
             sums[row] += x[row * k + i] * c;
-        }
-    }
-    for (u32 row = 0; row < m; row++) {
+        }}
+    }}
+    for (u32 row = 0; row < m; row++) {{
         out[(u64)row * n + gid] = sums[row];
-    }
-";
+    }}
+"
+    )
+}
 
 impl Kernel for Thin {
     fn name(&self) -> &'static str {
-        "thin"
+        match self.form {
+            Form::F32 => "thin",
+            Form::Bf16 => "thin_bf16",
+        }
     }
 
     /// One thread per column loops over all of `k`.
@@ -53,7 +61,7 @@ impl Kernel for Thin {
             group: 256,
             trips: k,
             trip,
-            reads: vec![4.0 * n * k, 4.0 * m * k],
+            reads: self.form.matmul_bytes(self.m, self.n, self.k),
             written: 4.0 * m * n,
             flight: 64.0,
         })
@@ -64,12 +72,17 @@ impl Kernel for Thin {
     }
 
     fn source(&self) -> Source {
+        let w = ("w".to_string(), self.form.ty(), false);
         Source::Made(Text {
-            entry: "plan_thin".into(),
-            buffers: vec![float("x", false), float("w", false), float("out", true)],
+            entry: format!("plan_thin_{}", self.form.name()),
+            buffers: vec![float("x", false), w, float("out", true)],
             scalars: vec![("m", "u32"), ("n", "u32"), ("k", "u32")],
-            body: BODY.into(),
+            body: body(&self.form.load("w", "(u64)gid * k + i")),
         })
+    }
+
+    fn accepts(&self, input: usize, form: Form) -> bool {
+        self.form.taken(input, 1, form)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -96,10 +109,19 @@ impl Kernel for Thin {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Matmul { x, w, m, n, k } = tree.site(at)? else {
+    let Site::Matmul {
+        x,
+        w,
+        m,
+        n,
+        k,
+        form,
+    } = tree.site(at)?
+    else {
         return None;
     };
-    (m <= THIN_ROWS).then(|| vec![Draft::new(Thin { m, n, k }, [x, w], m * n)])
+    let thin = Thin { m, n, k, form };
+    (m <= THIN_ROWS).then(|| vec![Draft::new(thin, [x, w], m * n)])
 }
 
 lower::rule!("thin", propose);

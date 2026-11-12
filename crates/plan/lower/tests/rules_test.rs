@@ -8,7 +8,7 @@ use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Data, Tensor, run};
-use lower::{Device, Feed, cut, lower, open, rules};
+use lower::{Device, Feed, Form, Pins, cut, lower, open, rules};
 use models::{Stack, nanogpt, qwen3};
 use trace::{EntryKind, Mask, Model, Port, Role};
 
@@ -167,6 +167,23 @@ fn whole_models_match_cpu() {
         for (rule, device) in devices() {
             let off = gap(&g, &weights, &inputs, &device);
             assert!(off < 1e-3, "favoring {rule}, outputs are off by {off:e}");
+        }
+        // Weights the GPU reads as bf16, the CPU reads widened.
+        let narrow = |t: &Tensor| Tensor {
+            shape: t.shape.clone(),
+            data: match &t.data {
+                Data::F32(v) => Data::F32(v.iter().map(|x| Form::Bf16.round(*x)).collect()),
+                other => other.clone(),
+            },
+        };
+        let weights: Vec<Tensor> = weights.iter().map(narrow).collect();
+        for (rule, device) in devices() {
+            let device = device.pinned(Pins::all(Form::Bf16));
+            let off = gap(&g, &weights, &inputs, &device);
+            assert!(
+                off < 1e-3,
+                "favoring {rule} as bf16, outputs are off by {off:e}"
+            );
         }
     }
 }
