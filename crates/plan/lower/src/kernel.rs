@@ -3,7 +3,7 @@
 use crate::abi::{Launch, Source};
 use crate::plan::Step;
 use graph::Order;
-use sim::Load;
+use sim::{Load, ZoneKind};
 use std::fmt;
 use std::sync::Arc;
 
@@ -41,6 +41,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     /// Whether equal launches on equal inputs may share a result.
     fn shared(&self) -> bool {
         false
+    }
+    /// The hardware it runs on.
+    fn runs_on(&self) -> ZoneKind {
+        ZoneKind::Gpu
     }
 }
 

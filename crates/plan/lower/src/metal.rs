@@ -124,6 +124,9 @@ impl Run for Runner {
     }
 
     fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+        if plan.zoned() {
+            return Err(Error::Unsupported("a plan over several zones".into()));
+        }
         let (ctx, shared) = (&self.ctx, MTLResourceOptions::StorageModeShared);
         self.held.bind(&plan, |len| {
             let buffer = ctx

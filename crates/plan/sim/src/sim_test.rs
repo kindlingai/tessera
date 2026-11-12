@@ -103,3 +103,29 @@ fn known_chips_stream() {
     assert_eq!(known("metal Apple M3 Pro").unwrap().name(), m3_pro().name);
     assert!(known("rocm HIP device 0").is_none());
 }
+
+#[test]
+fn clusters_pick_links() {
+    use crate::{Cluster, Link, Zone, ZoneKind};
+    let mut c = Cluster::default();
+    assert_eq!((c.zones.len(), c.kind(0)), (1, ZoneKind::Gpu));
+    let host = c.add(Zone {
+        name: "host".into(),
+        kind: ZoneKind::Cpu,
+        parent: None,
+    });
+    let link = |latency, rate| Link {
+        from: 0,
+        to: host,
+        latency,
+        rate,
+        tag: Tag::Assumed,
+    };
+    c.links.push(link(1e-5, 1e10));
+    c.links.push(link(1e-3, 1e12));
+    assert_eq!(c.transfer(0, 0, 1e9), Some(0.0));
+    // Small moves take the quick link, large ones the wide.
+    assert_eq!(c.transfer(0, host, 1e4), Some(1e-5 + 1e-6));
+    assert_eq!(c.transfer(0, host, 1e9), Some(1e-3 + 1e-3));
+    assert_eq!(c.transfer(host, 0, 1.0), None, "links are one way");
+}

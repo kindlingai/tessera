@@ -3,7 +3,7 @@
 use crate::kernel::KernelRef;
 use crate::kernels::Map;
 use crate::plan::{Output, Plan, Slot, Step};
-use crate::select::{Home, Selected, Val};
+use crate::select::{Home, Selected, Val, Value};
 
 /// A last use that never comes: weights, inputs and outputs.
 const FOREVER: usize = usize::MAX;
@@ -48,8 +48,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
             }
             Home::Kept { index, room } => {
                 // The longest context fits, so the buffer never moves.
-                b.plan.buffers.push(room);
-                let buffer = b.plan.buffers.len() as u32 - 1;
+                let buffer = b.buffer(room, value.zone);
                 let slot = Slot {
                     buffer,
                     len: value.len,
@@ -75,20 +74,23 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
 }
 
 impl Buffers<'_> {
+    fn buffer(&mut self, len: usize, zone: u32) -> u32 {
+        self.plan.buffers.push(len);
+        self.plan.zones.push(zone);
+        self.plan.buffers.len() as u32 - 1
+    }
+
     fn slot(&self, v: Val) -> Slot {
         self.slots[v.0 as usize].expect("written before it is read")
     }
 
     /// Reuses a free buffer of the value's size, if any.
     fn alloc(&mut self, v: Val) -> Slot {
-        let len = self.s.values[v.0 as usize].len;
-        let fits = |b: &u32| self.plan.buffers[*b as usize] == len;
+        let Value { len, zone, .. } = self.s.values[v.0 as usize];
+        let fits = |b: &u32| self.plan.buffers[*b as usize] == len && self.plan.zone(*b) == zone;
         let buffer = match self.free.iter().position(fits) {
             Some(at) => self.free.swap_remove(at),
-            None => {
-                self.plan.buffers.push(len);
-                self.plan.buffers.len() as u32 - 1
-            }
+            None => self.buffer(len, zone),
         };
         let slot = Slot { buffer, len };
         self.slots[v.0 as usize] = Some(slot);
@@ -119,6 +121,7 @@ impl Buffers<'_> {
                     reads: vec![reads[0]],
                     write: copy,
                     covers,
+                    zone: op.zone,
                 });
                 reads[0] = copy;
             }
@@ -134,6 +137,7 @@ impl Buffers<'_> {
             reads,
             write,
             covers: op.covers.clone(),
+            zone: op.zone,
         });
         for (k, v) in op.reads.iter().enumerate() {
             let repeat = op.reads[..k].contains(v);

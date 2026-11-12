@@ -3,13 +3,17 @@
 mod known;
 mod nvidia;
 mod pool;
+mod zone;
+
+use serde::{Deserialize, Serialize};
 
 pub use known::{known, m3_pro, strix_halo};
 pub use nvidia::{Nvidia, Sm, gb10};
 pub use pool::{Fit, Pool};
+pub use zone::{Cluster, Link, Zone, ZoneKind};
 
 /// Where a constant's value comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
     /// Timed on the hardware. The note says how.
     Measured,

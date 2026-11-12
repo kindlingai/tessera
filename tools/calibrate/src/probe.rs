@@ -1,9 +1,11 @@
 //! Small kernels that expose one hardware limit each.
 
 use lower::{
-    Arg, Error, Feed, Kernel, KernelRef, Launch, Plan, Run, Shape, Slot, Source, Step, Text, open,
+    Arg, Cluster, Error, Feed, Kernel, KernelRef, Launch, Link, Plan, Run, Shape, Slot, Source,
+    Step, Text, Zone, ZoneKind, open,
 };
-use sim::Fit;
+use sim::{Fit, Tag};
+use std::time::Instant;
 
 /// The work a probe's threads repeat `trips` times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +128,7 @@ impl Probe {
             reads: vec![slot(0, read)],
             write: slot(1, write),
             covers: Vec::new(),
+            zone: 0,
         };
         Plan {
             buffers: vec![read, write],
@@ -215,6 +218,57 @@ pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
 /// Bytes that stay in cache, and bytes that cannot.
 const SMALL: usize = 1 << 22;
 const LARGE: usize = 1 << 29;
+
+/// Elements the host link probe moves at most: 64 MB.
+const MOVED: usize = 1 << 24;
+
+/// The fastest of `tries` runs of `go`, in seconds.
+fn least(tries: usize, mut go: impl FnMut() -> Result<(), Error>) -> Result<f64, Error> {
+    let mut best = f64::INFINITY;
+    for _ in 0..tries {
+        let start = Instant::now();
+        go()?;
+        best = best.min(start.elapsed().as_secs_f64());
+    }
+    Ok(best)
+}
+
+/// Times moves between this GPU and the host, both ways.
+pub fn links() -> Result<Cluster, Error> {
+    let slot = |len| Slot { buffer: 0, len };
+    let plan = Plan {
+        buffers: vec![MOVED],
+        inputs: vec![slot(MOVED)],
+        ..Plan::default()
+    };
+    let runner = open(plan)?;
+    let bytes = vec![0u8; 4 * MOVED];
+    let mut cluster = Cluster::one(&runner.device());
+    let host = cluster.add(Zone {
+        name: "host".into(),
+        kind: ZoneKind::Cpu,
+        parent: None,
+    });
+    let write = |len: usize| runner.write(slot(len), &bytes[..4 * len]);
+    let read = |len: usize| runner.read(slot(len)).map(drop);
+    for (from, to, go) in [
+        (host, 0, &write as &dyn Fn(usize) -> Result<(), Error>),
+        (0, host, &read),
+    ] {
+        // One element shows the latency, and the rest the rate.
+        let latency = least(64, || go(1))?;
+        let large = least(4, || go(MOVED))?;
+        let rate = (4 * MOVED) as f64 / (large - latency).max(1e-9);
+        cluster.links.push(Link {
+            from,
+            to,
+            latency,
+            rate,
+            tag: Tag::Measured,
+        });
+    }
+    Ok(cluster)
+}
 
 impl Reading {
     /// Bytes the probe moved through memory.
