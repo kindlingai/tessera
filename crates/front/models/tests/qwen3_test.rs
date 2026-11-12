@@ -4,7 +4,7 @@ use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
 use gpukit::testing::{backend_ready, cosine_f32, max_abs_diff};
 use interp::{Data, Tensor, bind, run};
-use lower::{Device, Feed, Plan, Run, lower, open, select};
+use lower::{Device, Feed, Form, Pins, Plan, Run, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -100,6 +100,11 @@ fn matches_reference() {
     gpu.save();
 }
 
+/// The checkpoint is bf16, so plans read it as stored.
+fn pinned() -> Device {
+    Device::guess().pinned(Pins::all(Form::Bf16))
+}
+
 /// Plans for either entry on one runner. Weights load once.
 struct Gpu<'a> {
     c: &'a Case,
@@ -180,12 +185,12 @@ fn room(device: &Device, plan: &Plan, steps: &[f64]) {
 impl<'a> Gpu<'a> {
     fn open(g: &Graph, c: &'a Case) -> Self {
         let first = prompt(&c.tokens);
-        let plan = lower(g, 0, &first.sizes(), &Device::guess()).unwrap();
+        let plan = lower(g, 0, &first.sizes(), &pinned()).unwrap();
         let runner = open(plan).unwrap();
         for (at, w) in c.weights.iter().enumerate() {
             runner.load(at as u32, w.floats().unwrap()).unwrap();
         }
-        let device = stored(&*runner).unwrap();
+        let device = stored(&*runner).unwrap().pinned(pinned().pins);
         let (name, samples) = (runner.device(), device.samples());
         eprintln!("{name}: {samples} stored samples");
         Self {
@@ -299,7 +304,7 @@ mod forward {
         let timed = |r: &Timed| r.steps.iter().sum::<f64>();
         let tokens = repeat(gpu.c, planned.out.len() / 151_936);
         let sizes = prompt(&tokens).sizes();
-        let contested = select(g, 0, &sizes, &Device::guess()).unwrap().contested;
+        let contested = select(g, 0, &sizes, &pinned()).unwrap().contested;
         let (mixed, mut least) = (timed(planned), f64::INFINITY);
         for rule in contested {
             let device = gpu.device.clone().favoring(rule);
@@ -456,9 +461,7 @@ mod decode {
             past: 15,
             tokens: &[0],
         };
-        let contested = select(&g, 0, &one.sizes(), &Device::guess())
-            .unwrap()
-            .contested;
+        let contested = select(&g, 0, &one.sizes(), &pinned()).unwrap().contested;
         let mut most = 0.0f64;
         for rule in contested {
             let forced = decode(gpu, &g, &device.clone().favoring(rule)).rate();

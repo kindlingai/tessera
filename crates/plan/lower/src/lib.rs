@@ -7,6 +7,7 @@ mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
 mod emit;
+mod form;
 mod kernel;
 pub mod kernels;
 #[cfg(target_os = "macos")]
@@ -23,8 +24,9 @@ pub use assign::assign;
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use emit::{Dialect, Text, float, hash};
+pub use form::{Form, Pins};
 pub use kernel::{Kernel, KernelRef};
-pub use plan::{Output, Plan, Slot, Step};
+pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Feed, Held, Run, open};
 pub use schedule::{peak, schedule};

@@ -22,6 +22,7 @@ const METAL: &str = "#include <metal_stdlib>
 using namespace metal;
 typedef unsigned int u32;
 typedef unsigned long u64;
+typedef unsigned short u16;
 #define f_exp(x) exp(x)
 #define f_tanh(x) tanh(x)
 #define f_max(a, b) max(a, b)
@@ -36,6 +37,7 @@ typedef unsigned long u64;
 
 const CUDA: &str = "typedef unsigned int u32;
 typedef unsigned long long u64;
+typedef unsigned short u16;
 #define f_exp(x) expf(x)
 #define f_tanh(x) tanhf(x)
 #define f_max(a, b) fmaxf(a, b)

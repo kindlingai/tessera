@@ -5,8 +5,8 @@ use graph::{Act, Composite, Graph};
 use kernels::Thin;
 use lower::kernels::{Map, MapStage};
 use lower::{
-    Arg, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Plan, Site, Slot, Source, Step, T,
-    Tree,
+    Arg, Device, Dialect, Error, Fit, Form, Held, Kernel, KernelRef, Pins, Plan, Site, Slot,
+    Source, Step, T, Tree,
 };
 use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
@@ -181,7 +181,10 @@ fn replans_hold_buffers() {
         Ok(made)
     };
     held.bind(&first, &mut alloc).unwrap();
-    let named = |p: &Plan| -> Vec<_> { p.weights.iter().chain(&p.kept).copied().collect() };
+    let named = |p: &Plan| -> Vec<(u32, Slot)> {
+        let weights = p.weights.iter().map(|l| (l.weight, l.slot));
+        weights.chain(p.kept.iter().copied()).collect()
+    };
     let before: Vec<usize> = named(&first).iter().map(|(_, s)| *held.get(*s)).collect();
     held.bind(&next, &mut alloc).unwrap();
     let after: Vec<usize> = named(&next).iter().map(|(_, s)| *held.get(*s)).collect();
@@ -201,7 +204,12 @@ fn replans_hold_buffers() {
 fn thin(m: usize) -> Step {
     let (n, k) = (64, 32);
     Step {
-        kernel: KernelRef::new(Thin { m, n, k }),
+        kernel: KernelRef::new(Thin {
+            m,
+            n,
+            k,
+            form: Form::F32,
+        }),
         rule: "thin",
         reads: Vec::new(),
         write: Slot {
@@ -289,7 +297,7 @@ fn models_fill_gaps() {
 #[test]
 fn trees_cut_shared() {
     let g = program(&Config::toy(4, 16));
-    let tree = Tree::new(&g, 0, &SIZES).unwrap();
+    let tree = Tree::new(&g, 0, &SIZES, &Pins::default()).unwrap();
     let chains = |want: &[MapStage]| -> Vec<(T, Vec<T>)> {
         let all = (0..tree.len() as u32).map(T);
         let chain = |t: T| match tree.site(t)? {
@@ -325,4 +333,73 @@ fn favoring_stays_local() {
         plain == favored,
         "a favored rule skewed its readers' choice"
     );
+}
+
+#[test]
+fn forms_round() {
+    let tie = f32::from_bits(0x3F80_8000);
+    assert_eq!(Form::Bf16.round(tie), 1.0, "ties go to even");
+    let above = f32::from_bits(0x3F80_8001);
+    assert_eq!(Form::Bf16.round(above).to_bits(), 0x3F81_0000);
+    assert!(Form::Bf16.round(f32::NAN).is_nan());
+    assert_eq!(
+        Form::Bf16.narrow(&[1.0, 2.0, 3.0]).len(),
+        8,
+        "padded to words"
+    );
+    assert_eq!(Form::F32.narrow(&[1.0, 2.0, 3.0]).len(), 12);
+    assert_eq!((Form::Bf16.words(3), Form::F32.words(3)), (2, 3));
+}
+
+#[test]
+fn pins_match_paths() {
+    use graph::PathSeg::{Field, Index};
+    let path = |s: &str| -> Vec<graph::PathSeg> {
+        let seg = |p: &str| p.parse().map_or(Field(p.into()), Index);
+        s.split('.').map(seg).collect()
+    };
+    let pins = Pins::all(Form::Bf16)
+        .pin("embed", Form::F32)
+        .pin("layers.*.ln*", Form::F32)
+        .pin("layers.1.*", Form::Bf16);
+    assert_eq!(pins.form(&path("embed")), Form::F32);
+    assert_eq!(pins.form(&path("layers.0.ln1")), Form::F32);
+    assert_eq!(pins.form(&path("layers.0.q")), Form::Bf16);
+    assert_eq!(
+        pins.form(&path("layers.1.ln1")),
+        Form::Bf16,
+        "the last pin wins"
+    );
+    assert_eq!(pins.form(&path("norm")), Form::Bf16);
+    assert_eq!(Pins::default().form(&path("layers.0.q")), Form::F32);
+}
+
+#[test]
+fn pinned_weights_narrow() {
+    let g = program(&Config::toy(4, 16));
+    let pins = Pins::all(Form::Bf16).pin("embed", Form::F32);
+    let plan = lower(&g, 0, &SIZES, &Device::guess().pinned(pins)).unwrap();
+    for l in &plan.weights {
+        let embed = l.weight == 0;
+        assert_eq!(l.form == Form::F32, embed, "weight {}", l.weight);
+    }
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    for narrow in ["thin_bf16", "widen", "gather"] {
+        assert!(
+            names.contains(&narrow),
+            "{narrow} is missing from {names:?}"
+        );
+    }
+    assert!(!names.contains(&"gather_bf16"), "the table stays f32");
+    // The head reads the tied embedding, kept f32.
+    let embed = plan.weights.iter().find(|l| l.weight == 0).unwrap();
+    for s in plan.steps.iter().filter(|s| s.kernel.name() == "thin") {
+        assert_eq!(s.reads[1], embed.slot);
+    }
+    // Norm weights widen once each, however often they are read.
+    let widened = names.iter().filter(|n| **n == "widen").count();
+    let norms = g.weights.iter().filter(|w| w.ty.shape.0.len() == 1).count();
+    assert_eq!(widened, norms);
+    let (_, wide) = toy(&Device::guess());
+    assert!(plan.buffers.iter().sum::<usize>() < wide.buffers.iter().sum::<usize>());
 }

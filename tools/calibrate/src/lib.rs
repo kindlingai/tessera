@@ -41,10 +41,13 @@ pub fn measure(
     feeds: &[Feed],
     device: &mut Device,
 ) -> Result<Vec<(Step, f64)>, Error> {
-    let contested = select(g, entry, sizes, &Device::guess())?.contested;
-    let favored = contested.into_iter().map(|r| Device::guess().favoring(r));
+    // The same pins, or the weights would load again.
+    let pins = device.pins.clone();
+    let guess = || Device::guess().pinned(pins.clone());
+    let contested = select(g, entry, sizes, &guess())?.contested;
+    let favored = contested.into_iter().map(|r| guess().favoring(r));
     let mut added = Vec::new();
-    for choice in [Device::guess()].into_iter().chain(favored) {
+    for choice in [guess()].into_iter().chain(favored) {
         let plan = lower(g, entry, sizes, &choice)?;
         if plan.steps.iter().all(|s| device.known(s)) {
             continue;

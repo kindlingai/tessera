@@ -2,8 +2,9 @@
 
 use crate::Error;
 use crate::cost::Device;
-use crate::kernel::KernelRef;
-use crate::kernels::{Append, Move};
+use crate::form::Form;
+use crate::kernel::{Kernel, KernelRef};
+use crate::kernels::{Append, Move, Widen};
 use crate::rule::{Draft, Read, Rule, rules};
 use crate::tree::{T, Term, Tree, unsupported};
 use graph::{DimExpr, DimName, Graph, NodeId};
@@ -28,10 +29,12 @@ pub enum Home {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Value {
+    /// Four-byte words it occupies.
     pub len: usize,
     pub home: Home,
     /// The zone it lies in.
     pub zone: u32,
+    pub form: Form,
 }
 
 /// One launch, before it has buffers.
@@ -185,6 +188,7 @@ impl Cover<'_> {
             }
             let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
             let mut cost: f64 = drafts.iter().map(seconds).sum();
+            cost += self.widening(zone, &drafts);
             let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r, zone)).sum();
             let Some(below) = below else {
                 continue;
@@ -206,6 +210,23 @@ impl Cover<'_> {
             }
         }
         best.map(|b| Choice { offered, ..b })
+    }
+
+    /// Seconds to widen reads the drafts cannot take as stored.
+    fn widening(&self, zone: u32, drafts: &[Draft]) -> f64 {
+        let mut seconds = 0.0;
+        for d in drafts {
+            for (i, r) in d.reads.iter().enumerate() {
+                let Read::Node(t) = r else { continue };
+                let form = self.tree.node(*t).form;
+                if form != Form::F32 && !d.kernel.accepts(i, form) {
+                    let len = self.tree.elements(*t);
+                    let widen = Widen { len, form };
+                    seconds += self.device.seconds_in(zone, &widen, len);
+                }
+            }
+        }
+        seconds
     }
 
     /// Whether a cover hides a node the favored rule takes.
@@ -248,12 +269,27 @@ struct Emit {
     shared: HashMap<(String, Vec<Val>), Val>,
     /// Each value's copy in another zone, once made.
     moved: HashMap<(Val, u32), Val>,
+    /// Each narrow value as floats, once made.
+    widened: HashMap<Val, Val>,
 }
 
 impl Emit {
-    fn value(&mut self, len: usize, home: Home, zone: u32) -> Val {
-        self.out.values.push(Value { len, home, zone });
+    /// A value of `len` elements, sized by its form.
+    fn value(&mut self, len: usize, home: Home, zone: u32, form: Form) -> Val {
+        let len = form.words(len);
+        self.out.values.push(Value {
+            len,
+            home,
+            zone,
+            form,
+        });
         Val(self.out.values.len() as u32 - 1)
+    }
+
+    /// Elements a value holds.
+    fn elements(&self, v: Val) -> usize {
+        let Value { len, form, .. } = self.out.values[v.0 as usize];
+        len * 4 / form.bytes()
     }
 
     fn len(&self, v: Val) -> usize {
@@ -268,8 +304,8 @@ impl Emit {
         if let Some(copy) = self.moved.get(&(v, zone)) {
             return *copy;
         }
-        let len = self.len(v);
-        let write = self.value(len, Home::Temp, zone);
+        let (len, form) = (self.len(v), self.out.values[v.0 as usize].form);
+        let write = self.value(self.elements(v), Home::Temp, zone, form);
         self.out.ops.push(Op {
             kernel: KernelRef::new(Move { len }),
             rule: "move",
@@ -282,6 +318,29 @@ impl Emit {
         write
     }
 
+    /// The value as floats, unless `k` reads it as stored.
+    fn widen(&mut self, v: Val, input: usize, k: &dyn Kernel) -> Val {
+        let Value { zone, form, .. } = self.out.values[v.0 as usize];
+        if form == Form::F32 || k.accepts(input, form) {
+            return v;
+        }
+        if let Some(wide) = self.widened.get(&v) {
+            return *wide;
+        }
+        let len = self.elements(v);
+        let write = self.value(len, Home::Temp, zone, Form::F32);
+        self.out.ops.push(Op {
+            kernel: KernelRef::new(Widen { len, form }),
+            rule: "widen",
+            reads: vec![v],
+            write,
+            covers: Vec::new(),
+            zone,
+        });
+        self.widened.insert(v, write);
+        write
+    }
+
     /// Adds an op writing a new value, or shares one.
     fn op(
         &mut self,
@@ -291,12 +350,17 @@ impl Emit {
         covers: &[NodeId],
         zone: u32,
     ) -> Val {
-        let reads: Vec<Val> = reads.into_iter().map(|v| self.bring(v, zone)).collect();
+        let mut taken = Vec::with_capacity(reads.len());
+        for (i, v) in reads.into_iter().enumerate() {
+            let v = self.bring(v, zone);
+            taken.push(self.widen(v, i, &*d.kernel));
+        }
+        let reads = taken;
         let key = (format!("{:?}", d.kernel), reads.clone());
         if let Some(same) = self.shared.get(&key).filter(|_| d.kernel.shared()) {
             return *same;
         }
-        let write = self.value(d.len, Home::Temp, zone);
+        let write = self.value(d.len, Home::Temp, zone, Form::F32);
         if d.kernel.shared() {
             self.shared.insert(key, write);
         }
@@ -325,7 +389,7 @@ impl Emit {
         let most = most.map_or(0, |d| d.size.max() as usize);
         let len: usize = all.iter().product();
         let room = most * (len / all[1]);
-        let write = self.value(len, Home::Kept { index, room }, EDGE);
+        let write = self.value(len, Home::Kept { index, room }, EDGE, Form::F32);
         let rows = self.bring(rows, EDGE);
         let (skip, len) = (len - self.len(rows), self.len(rows));
         self.out.ops.push(Op {
@@ -347,7 +411,7 @@ pub fn select(
     sizes: &[(DimName, u64)],
     device: &Device,
 ) -> Result<Selected, Error> {
-    let tree = Tree::new(g, entry, sizes)?;
+    let tree = Tree::new(g, entry, sizes, &device.pins)?;
     let nodes = (0..tree.len() as u32).map(T);
     let rules = rules();
     let mut cover = Cover {
@@ -387,7 +451,7 @@ pub fn select(
     let mut e = Emit::default();
     for len in &tree.ports {
         let port = e.out.inputs.len() as u32;
-        let val = e.value(*len, Home::Input(port), EDGE);
+        let val = e.value(*len, Home::Input(port), EDGE, Form::F32);
         e.out.inputs.push(val);
     }
     // In traced order, so equal graphs give equal plans.
@@ -397,7 +461,7 @@ pub fn select(
         let val = |a: T| vals[a.0 as usize].expect("arguments come first");
         let made = match (&n.term, own[t.0 as usize]) {
             (Term::Leaf(Home::Input(port)), _) => e.out.inputs[*port as usize],
-            (Term::Leaf(home), _) => e.value(tree.elements(t), *home, EDGE),
+            (Term::Leaf(home), _) => e.value(tree.elements(t), *home, EDGE, n.form),
             (_, None) => continue,
             (Term::View, _) => val(n.args[0]),
             (Term::Append(index), _) => e.append(&tree, t, *index, val(n.args[0]))?,

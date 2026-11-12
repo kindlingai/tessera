@@ -14,10 +14,14 @@ struct GemmParams {
     uint trans_a, trans_b;
 };
 
-/// Tiled f32 GEMM, one 64x64 tile per threadgroup.
-kernel void gemm_f32(
+inline float widen(float v) { return v; }
+inline float widen(ushort v) { return as_type<float>((uint)v << 16); }
+
+/// Tiled GEMM, 64x64 per threadgroup. B may be bf16.
+template <typename TB>
+kernel void gemm_t(
     device const float *A [[buffer(0)]],
-    device const float *B [[buffer(1)]],
+    device const TB *B [[buffer(1)]],
     device float *C [[buffer(2)]],
     constant GemmParams &p [[buffer(3)]],
     uint3 tgp [[threadgroup_position_in_grid]],
@@ -56,7 +60,7 @@ kernel void gemm_f32(
                 uint n = col0 + tx * TN + j;
                 float v = 0.0f;
                 if (k < p.k && n < p.n) {
-                    v = p.trans_b != 0u ? B[(ulong)n * p.ldb + k] : B[(ulong)k * p.ldb + n];
+                    v = widen(p.trans_b != 0u ? B[(ulong)n * p.ldb + k] : B[(ulong)k * p.ldb + n]);
                 }
                 Bs[kk * BN + tx * TN + j] = v;
             }
@@ -91,3 +95,8 @@ kernel void gemm_f32(
         }
     }
 }
+
+template [[host_name("gemm_f32")]] kernel void gemm_t<float>(
+    device const float *, device const float *, device float *, constant GemmParams &, uint3, uint);
+template [[host_name("gemm_bf16")]] kernel void gemm_t<ushort>(
+    device const float *, device const ushort *, device float *, constant GemmParams &, uint3, uint);

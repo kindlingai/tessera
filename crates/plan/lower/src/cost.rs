@@ -1,5 +1,6 @@
 //! What launches cost on one device, from timed samples.
 
+use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,9 @@ pub struct Device {
     /// Kernels never to choose.
     #[serde(skip)]
     barred: Vec<&'static str>,
+    /// The form each weight is stored in.
+    #[serde(skip)]
+    pub pins: Pins,
 }
 
 /// What every launch is guessed to cost before any work.
@@ -97,6 +101,12 @@ impl Device {
     /// The same device, with a chip model for unmeasured kernels.
     pub fn fitted(mut self, fit: Fit) -> Self {
         (self.fit, self.pool) = (Some(fit), Some(fit.pool("fitted")));
+        self
+    }
+
+    /// The same device, with weights stored as `pins` say.
+    pub fn pinned(mut self, pins: Pins) -> Self {
+        self.pins = pins;
         self
     }
 

@@ -1,5 +1,6 @@
 //! Rules propose kernels for a site; link time collects them.
 
+use crate::form::Form;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::MapStage;
 use crate::tree::{T, Tree};
@@ -28,13 +29,14 @@ impl Attn {
 /// A pattern at a tree node, for kernels to compute.
 #[derive(Clone, Debug)]
 pub enum Site<'a> {
-    /// `x[m, k]` times `w[n, k]` transposed.
+    /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
     Matmul {
         x: T,
         w: T,
         m: usize,
         n: usize,
         k: usize,
+        form: Form,
     },
     /// Elementwise stages over `reads[0]`; operands follow it.
     Map {
@@ -64,6 +66,7 @@ pub enum Site<'a> {
         ids: T,
         rows: usize,
         width: usize,
+        form: Form,
     },
     /// Indices of each row's `k` largest entries.
     Top {

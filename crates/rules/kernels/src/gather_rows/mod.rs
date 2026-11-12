@@ -23,6 +23,9 @@ gpukit::kernel! {
     ],
 }
 
+/// The same kernel over a bf16 table.
+pub const ENTRY_BF16: &str = "gather_rows_bf16";
+
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub src: Vec<f32>,

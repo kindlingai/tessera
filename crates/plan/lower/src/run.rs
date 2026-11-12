@@ -53,10 +53,11 @@ impl<B> Held<B> {
         // The last plan's scratch buffers.
         let mut spare: Vec<(usize, B)> = old.into_iter().flatten().collect();
         let mut owner = vec![None; plan.buffers.len()];
-        for (kept, named) in [(false, &plan.weights), (true, &plan.kept)] {
-            for (index, slot) in named {
-                owner[slot.buffer as usize] = Some((kept, *index));
-            }
+        for l in &plan.weights {
+            owner[l.slot.buffer as usize] = Some((false, l.weight));
+        }
+        for (index, slot) in &plan.kept {
+            owner[slot.buffer as usize] = Some((true, *index));
         }
         self.bound.clear();
         for (&len, owner) in plan.buffers.iter().zip(owner) {
@@ -110,14 +111,13 @@ pub trait Run {
     /// The backend and the hardware it drives.
     fn device(&self) -> String;
 
-    /// Uploads one graph weight. Unused weights are ignored.
+    /// Uploads one graph weight as planned. Unused weights are ignored.
     fn load(&self, weight: u32, data: &[f32]) -> Result<(), Error> {
-        for (_, slot) in self.plan().weights.iter().filter(|(w, _)| *w == weight) {
-            if slot.len != data.len() {
+        for l in self.plan().weights.iter().filter(|l| l.weight == weight) {
+            if l.slot.len != l.form.words(data.len()) {
                 return Err(Error::Size(format!("weight {weight}")));
             }
-            let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_ne_bytes()).collect();
-            self.write(*slot, &bytes)?;
+            self.write(l.slot, &l.form.narrow(data))?;
         }
         Ok(())
     }

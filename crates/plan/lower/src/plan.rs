@@ -1,6 +1,7 @@
 //! A plan: kernel launches over buffers that stay on device.
 
 use crate::abi::{Arg, Launch};
+use crate::form::Form;
 use crate::kernel::KernelRef;
 use graph::{NodeId, Order};
 
@@ -39,6 +40,14 @@ impl Step {
     }
 }
 
+/// One graph weight, where it loads and in what form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub weight: u32,
+    pub slot: Slot,
+    pub form: Form,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Output {
     pub slot: Slot,
@@ -52,8 +61,8 @@ pub struct Plan {
     /// The zone each buffer lies in. Empty means zone 0.
     pub zones: Vec<u32>,
     pub steps: Vec<Step>,
-    /// Each used graph weight, and where it loads.
-    pub weights: Vec<(u32, Slot)>,
+    /// Each used graph weight.
+    pub weights: Vec<Loaded>,
     /// Each kept-row buffer, holding this launch's rows too.
     pub kept: Vec<(u32, Slot)>,
     /// One per input port of the entry.
@@ -79,7 +88,11 @@ impl Plan {
 
     /// Elements in buffers no weight, input or kept row owns.
     pub fn scratch(&self) -> usize {
-        let named = self.weights.iter().chain(&self.kept).map(|(_, s)| s);
+        let named = self
+            .weights
+            .iter()
+            .map(|l| &l.slot)
+            .chain(self.kept.iter().map(|(_, s)| s));
         let owned = |s: &Slot| self.buffers[s.buffer as usize];
         let held: usize = named.chain(&self.inputs).map(owned).sum();
         self.buffers.iter().sum::<usize>() - held
