@@ -209,6 +209,7 @@ fn thin(m: usize) -> Step {
             len: m * n,
         },
         covers: Vec::new(),
+        zone: 0,
     }
 }
 

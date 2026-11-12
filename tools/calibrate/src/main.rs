@@ -1,8 +1,8 @@
 //! Probes this GPU, times the grid and stores the samples.
 
-use calibrate::probe::{fit, read, suite};
+use calibrate::probe::{fit, links, read, suite};
 use calibrate::{Grid, headroom, judge, path};
-use lower::{Device, Step};
+use lower::{Cluster, Device, Step};
 use sim::{Chip, known};
 use std::error::Error;
 use std::process::ExitCode;
@@ -33,10 +33,20 @@ fn room(chip: &dyn Chip, timed: &[(Step, f64)]) {
     }
 }
 
+/// Prints each link: its latency, then its rate.
+fn hops(cluster: &Cluster) {
+    for l in &cluster.links {
+        let (from, to) = (&cluster.zones[l.from].name, &cluster.zones[l.to].name);
+        let (us, gb) = (l.latency * 1e6, l.rate / 1e9);
+        println!("  {from} -> {to}: {us:.2} us, then {gb:.1} GB/s");
+    }
+}
+
 /// Probes the chip, times the grid, restarts the stored file.
 fn run() -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
     let readings = read(&suite())?;
+    let cluster = links()?;
     let mut device = Device::guess();
     let timed = Grid::full().run(&mut device)?;
     let seconds = start.elapsed().as_secs_f64();
@@ -55,8 +65,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         report(&*table, &timed);
     }
     room(&pool, &timed);
+    hops(&cluster);
     // The stored device carries the fit, for unmeasured kernels.
-    let device = device.fitted(fit);
+    let device = device.fitted(fit).zoned(cluster);
     let path = path(&device.name);
     device.save(&path)?;
     println!("{} samples in {}", device.samples(), path.display());
@@ -73,6 +84,7 @@ fn probe() -> Result<(), Box<dyn Error>> {
             p.kind, p.threads, p.trips
         );
     }
+    hops(&links()?);
     Ok(())
 }
 

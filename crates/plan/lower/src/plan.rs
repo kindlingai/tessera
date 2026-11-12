@@ -20,6 +20,8 @@ pub struct Step {
     pub write: Slot,
     /// The graph nodes this launch computes, or helps compute.
     pub covers: Vec<NodeId>,
+    /// The zone it runs in.
+    pub zone: u32,
 }
 
 impl Step {
@@ -47,6 +49,8 @@ pub struct Output {
 pub struct Plan {
     /// Elements per buffer. Values that never overlap share one.
     pub buffers: Vec<usize>,
+    /// The zone each buffer lies in. Empty means zone 0.
+    pub zones: Vec<u32>,
     pub steps: Vec<Step>,
     /// Each used graph weight, and where it loads.
     pub weights: Vec<(u32, Slot)>,
@@ -62,6 +66,15 @@ impl Plan {
     pub fn order(&self) -> Order {
         let orders = self.steps.iter().map(|s| s.kernel.order());
         orders.max().unwrap_or(Order::Fixed)
+    }
+
+    pub fn zone(&self, buffer: u32) -> u32 {
+        self.zones.get(buffer as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether any buffer lies outside zone 0.
+    pub fn zoned(&self) -> bool {
+        self.zones.iter().any(|z| *z != 0)
     }
 
     /// Elements in buffers no weight, input or kept row owns.

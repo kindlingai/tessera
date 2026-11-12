@@ -29,7 +29,7 @@ pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Feed, Held, Run, open};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
-pub use sim::{Fit, Load, Ops};
+pub use sim::{Cluster, Fit, Link, Load, Ops, Zone, ZoneKind};
 pub use tree::{Node, T, Term, Tree};
 
 use graph::{DimName, Graph};

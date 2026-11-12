@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::cost::Device;
 use crate::kernel::KernelRef;
-use crate::kernels::Append;
+use crate::kernels::{Append, Move};
 use crate::rule::{Draft, Read, Rule, rules};
 use crate::tree::{T, Term, Tree, unsupported};
 use graph::{DimExpr, DimName, Graph, NodeId};
@@ -26,10 +26,12 @@ pub enum Home {
     Temp,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Value {
     pub len: usize,
     pub home: Home,
+    /// The zone it lies in.
+    pub zone: u32,
 }
 
 /// One launch, before it has buffers.
@@ -41,6 +43,7 @@ pub struct Op {
     pub reads: Vec<Val>,
     pub write: Val,
     pub covers: Vec<NodeId>,
+    pub zone: u32,
 }
 
 /// The kernels chosen for one entry, in traced order.
@@ -54,7 +57,7 @@ pub struct Selected {
     pub contested: BTreeSet<&'static str>,
 }
 
-/// The cheapest cover found at one node.
+/// The cheapest cover found at one node, in one zone.
 struct Choice {
     rule: &'static str,
     drafts: Vec<Draft>,
@@ -76,42 +79,90 @@ fn reads(drafts: &[Draft]) -> Vec<T> {
         .collect()
 }
 
+/// Leaves and outputs lie where the runner feeds and reads.
+const EDGE: u32 = 0;
+
 struct Cover<'a> {
     tree: &'a Tree<'a>,
     device: &'a Device,
     rules: Vec<&'static Rule>,
     /// The rule the device favors, if it names one.
     favorite: Option<&'static Rule>,
-    /// Per solved node: its choice, if a rule covers it.
-    best: Vec<Option<Option<Choice>>>,
+    /// Per node and zone: the choice there, if any.
+    best: Vec<Vec<Option<Option<Choice>>>>,
+    /// Per root: the zones its readers run in.
+    wanted: Vec<Vec<u32>>,
 }
 
 impl Cover<'_> {
-    /// Seconds to have `t` in a buffer, within one tree.
-    fn need(&mut self, t: T) -> Option<f64> {
-        // Another tree's root is paid for there.
+    fn zones(&self) -> std::ops::Range<u32> {
+        0..self.device.zones()
+    }
+
+    /// Seconds to have `t` in `zone`, within one tree.
+    fn need(&mut self, t: T, zone: u32) -> Option<f64> {
+        if self.tree.leaf(t) {
+            return self.device.transfer(EDGE, zone, self.tree.elements(t));
+        }
+        // Another tree's root pays its own moves once placed.
         match self.tree.root(t) {
             true => Some(0.0),
-            false => self.solve(t),
+            false => self.place(t, zone).map(|(_, cost)| cost),
         }
     }
 
-    /// Remembers the cheapest cover of `t`'s subtree.
-    fn solve(&mut self, t: T) -> Option<f64> {
-        if self.best[t.0 as usize].is_none() {
-            let choice = self.choose(t);
-            self.best[t.0 as usize] = Some(choice);
+    /// Where to make `t` cheapest for a reader in `zone`.
+    fn place(&mut self, t: T, zone: u32) -> Option<(u32, f64)> {
+        let len = self.tree.elements(t);
+        let mut best: Option<(u32, f64)> = None;
+        for z in self.zones() {
+            let (Some(made), Some(moved)) = (self.solve(t, z), self.device.transfer(z, zone, len))
+            else {
+                continue;
+            };
+            if best.is_none_or(|(_, b)| made + moved < b) {
+                best = Some((z, made + moved));
+            }
         }
-        let solved = self.best[t.0 as usize].as_ref()?;
+        best
+    }
+
+    /// A root's cheapest zone, its readers' moves included.
+    fn settle(&mut self, t: T) -> Option<u32> {
+        let (len, wanted) = (self.tree.elements(t), self.wanted[t.0 as usize].clone());
+        let mut best: Option<(u32, f64)> = None;
+        for z in self.zones() {
+            let moves = wanted.iter().map(|w| self.device.transfer(z, *w, len));
+            let (Some(made), Some(moved)) = (self.solve(t, z), moves.sum::<Option<f64>>()) else {
+                continue;
+            };
+            if best.is_none_or(|(_, b)| made + moved < b) {
+                best = Some((z, made + moved));
+            }
+        }
+        best.map(|(z, _)| z)
+    }
+
+    /// Remembers the cheapest cover of `t`'s subtree in `zone`.
+    fn solve(&mut self, t: T, zone: u32) -> Option<f64> {
+        let (t, z) = (t.0 as usize, zone as usize);
+        if self.best[t][z].is_none() {
+            let choice = self.choose(T(t as u32), zone);
+            self.best[t][z] = Some(choice);
+        }
+        let solved = self.best[t][z].as_ref()?;
         solved.as_ref().map(|c| c.cost)
     }
 
     /// Asks every rule, and keeps the cheapest proposal.
-    fn choose(&mut self, t: T) -> Option<Choice> {
+    fn choose(&mut self, t: T, zone: u32) -> Option<Choice> {
         let n = self.tree.node(t);
         // A view or kept rows only pass their argument on.
         if matches!(n.term, Term::View | Term::Append(_)) {
-            let cost = self.need(n.args[0])?;
+            if matches!(n.term, Term::Append(_)) && zone != EDGE {
+                return None;
+            }
+            let cost = self.need(n.args[0], zone)?;
             return Some(Choice {
                 rule: "append",
                 drafts: Vec::new(),
@@ -119,18 +170,22 @@ impl Cover<'_> {
                 offered: Vec::new(),
             });
         }
+        let kind = self.device.cluster.kind(zone as usize);
         let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
         for rule in self.rules.clone() {
             let Some(drafts) = (rule.propose)(self.tree, t) else {
                 continue;
             };
+            if drafts.iter().any(|d| d.kernel.runs_on() != kind) {
+                continue;
+            }
             offered.push(rule.name);
             if self.swallows(rule, t, &drafts) {
                 continue;
             }
-            let seconds = |d: &Draft| self.device.seconds(&*d.kernel, d.len);
+            let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
             let mut cost: f64 = drafts.iter().map(seconds).sum();
-            let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r)).sum();
+            let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r, zone)).sum();
             let Some(below) = below else {
                 continue;
             };
@@ -165,14 +220,23 @@ impl Cover<'_> {
             .any(|n| (favorite.propose)(self.tree, n).is_some())
     }
 
-    /// The reads of the chosen cover at `t`.
-    fn below(&self, t: T) -> Vec<T> {
+    /// The reads of `t`'s cover in `zone`, each placed.
+    fn below(&mut self, t: T, zone: u32) -> Vec<(T, u32)> {
         let n = self.tree.node(t);
-        match &self.best[t.0 as usize] {
+        let reads = match &self.best[t.0 as usize][zone as usize] {
             Some(Some(c)) if c.drafts.is_empty() => vec![n.args[0]],
             Some(Some(c)) => reads(&c.drafts),
             _ => Vec::new(),
+        };
+        let mut placed = Vec::with_capacity(reads.len());
+        for r in reads {
+            let z = match self.tree.leaf(r) || self.tree.root(r) {
+                true => zone,
+                false => self.place(r, zone).expect("solved above").0,
+            };
+            placed.push((r, z));
         }
+        placed
     }
 }
 
@@ -182,11 +246,13 @@ struct Emit {
     out: Selected,
     /// Results that later equal launches may reuse.
     shared: HashMap<(String, Vec<Val>), Val>,
+    /// Each value's copy in another zone, once made.
+    moved: HashMap<(Val, u32), Val>,
 }
 
 impl Emit {
-    fn value(&mut self, len: usize, home: Home) -> Val {
-        self.out.values.push(Value { len, home });
+    fn value(&mut self, len: usize, home: Home, zone: u32) -> Val {
+        self.out.values.push(Value { len, home, zone });
         Val(self.out.values.len() as u32 - 1)
     }
 
@@ -194,13 +260,43 @@ impl Emit {
         self.out.values[v.0 as usize].len
     }
 
+    /// The value in `zone`, moved there if it lies elsewhere.
+    fn bring(&mut self, v: Val, zone: u32) -> Val {
+        if self.out.values[v.0 as usize].zone == zone {
+            return v;
+        }
+        if let Some(copy) = self.moved.get(&(v, zone)) {
+            return *copy;
+        }
+        let len = self.len(v);
+        let write = self.value(len, Home::Temp, zone);
+        self.out.ops.push(Op {
+            kernel: KernelRef::new(Move { len }),
+            rule: "move",
+            reads: vec![v],
+            write,
+            covers: Vec::new(),
+            zone,
+        });
+        self.moved.insert((v, zone), write);
+        write
+    }
+
     /// Adds an op writing a new value, or shares one.
-    fn op(&mut self, d: Draft, rule: &'static str, reads: Vec<Val>, covers: &[NodeId]) -> Val {
+    fn op(
+        &mut self,
+        d: Draft,
+        rule: &'static str,
+        reads: Vec<Val>,
+        covers: &[NodeId],
+        zone: u32,
+    ) -> Val {
+        let reads: Vec<Val> = reads.into_iter().map(|v| self.bring(v, zone)).collect();
         let key = (format!("{:?}", d.kernel), reads.clone());
         if let Some(same) = self.shared.get(&key).filter(|_| d.kernel.shared()) {
             return *same;
         }
-        let write = self.value(d.len, Home::Temp);
+        let write = self.value(d.len, Home::Temp, zone);
         if d.kernel.shared() {
             self.shared.insert(key, write);
         }
@@ -210,6 +306,7 @@ impl Emit {
             reads,
             write,
             covers: covers.to_vec(),
+            zone,
         });
         write
     }
@@ -228,7 +325,8 @@ impl Emit {
         let most = most.map_or(0, |d| d.size.max() as usize);
         let len: usize = all.iter().product();
         let room = most * (len / all[1]);
-        let write = self.value(len, Home::Kept { index, room });
+        let write = self.value(len, Home::Kept { index, room }, EDGE);
+        let rows = self.bring(rows, EDGE);
         let (skip, len) = (len - self.len(rows), self.len(rows));
         self.out.ops.push(Op {
             kernel: KernelRef::new(Append { skip, len }),
@@ -236,6 +334,7 @@ impl Emit {
             reads: vec![rows],
             write,
             covers: vec![n.from],
+            zone: EDGE,
         });
         Ok(write)
     }
@@ -256,26 +355,39 @@ pub fn select(
         device,
         favorite: rules.iter().copied().find(|r| device.favors(r.name)),
         rules,
-        best: (0..tree.len()).map(|_| None).collect(),
+        best: (0..tree.len())
+            .map(|_| (0..device.zones()).map(|_| None).collect())
+            .collect(),
+        wanted: vec![Vec::new(); tree.len()],
     };
+    for (t, _) in &tree.outputs {
+        cover.wanted[t.0 as usize].push(EDGE);
+    }
     // Roots get buffers. So does whatever a chosen cover reads.
-    let mut own = vec![false; tree.len()];
+    let mut own: Vec<Option<u32>> = vec![None; tree.len()];
     for t in nodes.clone().rev().filter(|t| !tree.leaf(*t)) {
-        if !(tree.root(t) || own[t.0 as usize]) {
+        let zone = match (tree.root(t), own[t.0 as usize]) {
+            (true, _) => cover.settle(t),
+            (false, placed) => placed,
+        };
+        let Some(zone) = zone else {
+            if tree.root(t) {
+                return unsupported(&tree.node(t).term);
+            }
             continue;
-        }
-        own[t.0 as usize] = true;
-        if cover.solve(t).is_none() {
-            return unsupported(&tree.node(t).term);
-        }
-        for r in cover.below(t) {
-            own[r.0 as usize] = true;
+        };
+        own[t.0 as usize] = Some(zone);
+        for (r, z) in cover.below(t, zone) {
+            match tree.root(r) {
+                true => cover.wanted[r.0 as usize].push(zone),
+                false => own[r.0 as usize] = Some(z),
+            }
         }
     }
     let mut e = Emit::default();
     for len in &tree.ports {
         let port = e.out.inputs.len() as u32;
-        let val = e.value(*len, Home::Input(port));
+        let val = e.value(*len, Home::Input(port), EDGE);
         e.out.inputs.push(val);
     }
     // In traced order, so equal graphs give equal plans.
@@ -283,14 +395,14 @@ pub fn select(
     for t in nodes {
         let n = tree.node(t);
         let val = |a: T| vals[a.0 as usize].expect("arguments come first");
-        let made = match &n.term {
-            Term::Leaf(Home::Input(port)) => e.out.inputs[*port as usize],
-            Term::Leaf(home) => e.value(tree.elements(t), *home),
-            _ if !own[t.0 as usize] => continue,
-            Term::View => val(n.args[0]),
-            Term::Append(index) => e.append(&tree, t, *index, val(n.args[0]))?,
-            _ => {
-                let choice = cover.best[t.0 as usize].take().flatten();
+        let made = match (&n.term, own[t.0 as usize]) {
+            (Term::Leaf(Home::Input(port)), _) => e.out.inputs[*port as usize],
+            (Term::Leaf(home), _) => e.value(tree.elements(t), *home, EDGE),
+            (_, None) => continue,
+            (Term::View, _) => val(n.args[0]),
+            (Term::Append(index), _) => e.append(&tree, t, *index, val(n.args[0]))?,
+            (_, Some(zone)) => {
+                let choice = cover.best[t.0 as usize][zone as usize].take().flatten();
                 let choice = choice.expect("solved above");
                 if choice.offered.len() > 1 {
                     e.out.contested.extend(&choice.offered);
@@ -303,7 +415,7 @@ pub fn select(
                         Read::Draft(at) => made[*at],
                     };
                     let reads: Vec<Val> = d.reads.iter().map(read).collect();
-                    made.push(e.op(d, choice.rule, reads, &covers));
+                    made.push(e.op(d, choice.rule, reads, &covers, zone));
                 }
                 *made.last().expect("a rule proposes at least one launch")
             }
@@ -312,6 +424,7 @@ pub fn select(
     }
     for (t, shape) in &tree.outputs {
         let val = vals[t.0 as usize].expect("outputs have values");
+        let val = e.bring(val, EDGE);
         e.out.outputs.push((val, shape.clone()));
     }
     Ok(e.out)

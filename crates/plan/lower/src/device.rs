@@ -80,6 +80,9 @@ macro_rules! device_runner {
                 }
 
                 fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+                    if plan.zoned() {
+                        return Err(Error::Unsupported("a plan over several zones".into()));
+                    }
                     let ctx = self.ctx;
                     self.held.bind(&plan, |len| {
                         let buffer = DeviceBuffer::alloc(ctx, (len * 4).max(4))?;

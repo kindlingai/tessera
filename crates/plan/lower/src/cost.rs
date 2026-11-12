@@ -3,7 +3,7 @@
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use serde::{Deserialize, Serialize};
-use sim::{Chip, Fit, Pool};
+use sim::{Chip, Cluster, Fit, Pool};
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
@@ -70,6 +70,9 @@ pub struct Device {
     /// The model those constants make.
     #[serde(skip)]
     pool: Option<Pool>,
+    /// The zones plans may span. Zone 0 is this GPU.
+    #[serde(default)]
+    pub cluster: Cluster,
     timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
@@ -97,6 +100,22 @@ impl Device {
         self
     }
 
+    /// The same device, over these zones and links.
+    pub fn zoned(mut self, cluster: Cluster) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    pub fn zones(&self) -> u32 {
+        self.cluster.zones.len() as u32
+    }
+
+    /// Seconds to move `len` elements between zones, if linked.
+    pub fn transfer(&self, from: u32, to: u32, len: usize) -> Option<f64> {
+        let bytes = 4.0 * len as f64;
+        self.cluster.transfer(from as usize, to as usize, bytes)
+    }
+
     /// The same device, never choosing `kernel`.
     pub fn without(mut self, kernel: &'static str) -> Self {
         self.barred.push(kernel);
@@ -111,6 +130,14 @@ impl Device {
 
     pub fn favors(&self, rule: &str) -> bool {
         self.favor == Some(rule)
+    }
+
+    /// Seconds for one launch in `zone`. Samples cover zone 0.
+    pub fn seconds_in(&self, zone: u32, k: &dyn Kernel, len: usize) -> f64 {
+        match zone {
+            0 => self.seconds(k, len),
+            _ => FIXED + k.guess() * k.work(len),
+        }
     }
 
     /// Estimated seconds for one launch writing `len` elements.
@@ -136,7 +163,13 @@ impl Device {
         let mut total = Cost::default();
         for step in &plan.steps {
             let moved: usize = step.reads.iter().map(|r| r.len).sum();
-            total.seconds += self.seconds(&*step.kernel, step.write.len);
+            // A read in another zone makes the step a move.
+            let from = step.reads.first().map(|r| plan.zone(r.buffer));
+            total.seconds += match from.filter(|z| *z != step.zone) {
+                Some(from) => self.transfer(from, step.zone, step.write.len),
+                None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len)),
+            }
+            .unwrap_or(f64::INFINITY);
             total.bytes += 4 * (moved + step.write.len) as u64;
             total.launches += step.launches().len();
         }
