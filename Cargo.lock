@@ -28,12 +28,12 @@ name = "calibrate"
 version = "0.1.0"
 dependencies = [
  "codegen",
- "engine",
  "gpukit",
  "graph",
  "kernels",
  "linear",
  "lower",
+ "settings",
  "sim",
  "trace",
 ]
@@ -72,13 +72,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd3f6c362b2bbd7063090886afd78978f5dbf1f11da7efcc40f81d32c943fac1"
 
 [[package]]
-name = "engine"
-version = "0.1.0"
-dependencies = [
- "gpukit",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -88,10 +81,10 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 name = "gemm"
 version = "0.1.0"
 dependencies = [
- "engine",
  "gpukit",
  "objc2",
  "objc2-metal",
+ "settings",
 ]
 
 [[package]]
@@ -191,12 +184,12 @@ name = "linear"
 version = "0.1.0"
 dependencies = [
  "codegen",
- "engine",
  "gpukit",
  "graph",
  "interp",
  "kernels",
  "lower",
+ "settings",
  "trace",
 ]
 
@@ -231,7 +224,6 @@ name = "lower"
 version = "0.1.0"
 dependencies = [
  "codegen",
- "engine",
  "gpukit",
  "graph",
  "interp",
@@ -244,6 +236,7 @@ dependencies = [
  "scattered-collect",
  "serde",
  "serde_json",
+ "settings",
  "sim",
  "trace",
 ]
@@ -267,12 +260,12 @@ version = "0.1.0"
 dependencies = [
  "calibrate",
  "checkpoint",
- "engine",
  "gpukit",
  "graph",
  "interp",
  "kernels",
  "lower",
+ "settings",
  "trace",
 ]
 
@@ -404,6 +397,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "settings"
+version = "0.1.0"
+dependencies = [
+ "gpukit",
 ]
 
 [[package]]

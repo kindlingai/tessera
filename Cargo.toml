@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/front/*",
-    "crates/gpu/*",
-    "crates/ir/*",
-    "crates/plan/*",
-    "crates/rules/*",
+    "engine/gpu/*",
+    "engine/ir/*",
+    "engine/models",
+    "engine/plan/*",
+    "engine/rules/*",
+    "frontend/*",
     "tools/calibrate",
     "tools/lint",
 ]
@@ -18,22 +19,22 @@ publish = false
 # Every crate here, so members name each other without paths.
 [workspace.dependencies]
 calibrate = { path = "tools/calibrate" }
-checkpoint = { path = "crates/front/checkpoint" }
-gemm = { path = "crates/gpu/gemm" }
-codegen = { path = "crates/plan/codegen" }
-engine = { path = "crates/front/engine" }
-gpukit = { path = "crates/gpu/gpukit" }
-graph = { path = "crates/ir/graph" }
-interp = { path = "crates/ir/interp" }
-kernel-macro = { path = "crates/plan/kernel-macro" }
-kernels = { path = "crates/rules/kernels" }
-linear = { path = "crates/rules/linear" }
-lower = { path = "crates/plan/lower" }
-mem = { path = "crates/ir/mem" }
-models = { path = "crates/front/models" }
-sim = { path = "crates/plan/sim" }
-trace = { path = "crates/ir/trace" }
-trace-derive = { path = "crates/ir/trace-derive" }
+checkpoint = { path = "frontend/checkpoint" }
+gemm = { path = "engine/gpu/gemm" }
+codegen = { path = "engine/plan/codegen" }
+settings = { path = "frontend/settings" }
+gpukit = { path = "engine/gpu/gpukit" }
+graph = { path = "engine/ir/graph" }
+interp = { path = "engine/ir/interp" }
+kernel-macro = { path = "engine/plan/kernel-macro" }
+kernels = { path = "engine/rules/kernels" }
+linear = { path = "engine/rules/linear" }
+lower = { path = "engine/plan/lower" }
+mem = { path = "engine/ir/mem" }
+models = { path = "engine/models" }
+sim = { path = "engine/plan/sim" }
+trace = { path = "engine/ir/trace" }
+trace-derive = { path = "engine/ir/trace-derive" }
 
 # The host executor interprets whole kernels, so tests need it optimized.
 [profile.dev.package.codegen]

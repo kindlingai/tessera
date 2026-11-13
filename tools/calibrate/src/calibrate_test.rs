@@ -1,8 +1,8 @@
 use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
 use crate::{Grid, headroom, judge, path};
-use engine::settings;
 use gpukit::testing::scratch;
 use lower::{Device, Settings, rules};
+use settings::read as settings;
 use sim::Chip;
 use std::path::PathBuf;
 

@@ -90,7 +90,7 @@ fn probe(settings: &Settings) -> Result<(), Box<dyn Error>> {
 
 fn main() -> ExitCode {
     let probing = std::env::args().nth(1).as_deref() == Some("probe");
-    let settings = engine::settings();
+    let settings = settings::read();
     match if probing {
         probe(&settings)
     } else {
