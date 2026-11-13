@@ -3,6 +3,7 @@
 use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
+use crate::recipe::Recipe;
 use crate::run::Run;
 use gpukit::{Limits, Settings};
 use serde::{Deserialize, Serialize};
@@ -84,10 +85,10 @@ pub struct Device {
     timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
-    favor: Option<&'static str>,
+    favor: Option<String>,
     /// Kernels never to choose.
     #[serde(skip)]
-    barred: Vec<&'static str>,
+    barred: Vec<String>,
     /// The form each weight is stored in.
     #[serde(skip)]
     pub pins: Pins,
@@ -160,6 +161,14 @@ impl Device {
         Ok(device.within(runner.limits()))
     }
 
+    /// The same device, choosing as `recipe` says.
+    pub fn with(mut self, recipe: &Recipe) -> Self {
+        self.pins = recipe.pins.clone();
+        self.favor = recipe.favor.clone();
+        self.barred = recipe.barred.clone();
+        self.changed()
+    }
+
     /// The same device, within what its hardware gives a group.
     pub fn within(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -206,19 +215,19 @@ impl Device {
     }
 
     /// The same device, never choosing `kernel`.
-    pub fn without(mut self, kernel: &'static str) -> Self {
-        self.barred.push(kernel);
+    pub fn without(mut self, kernel: impl Into<String>) -> Self {
+        self.barred.push(kernel.into());
         self.changed()
     }
 
     /// The same device, always choosing `rule` where it applies.
-    pub fn favoring(mut self, rule: &'static str) -> Self {
-        self.favor = Some(rule);
+    pub fn favoring(mut self, rule: impl Into<String>) -> Self {
+        self.favor = Some(rule.into());
         self.changed()
     }
 
     pub fn favors(&self, rule: &str) -> bool {
-        self.favor == Some(rule)
+        self.favor.as_deref() == Some(rule)
     }
 
     /// Seconds for one launch in `zone`. Samples cover zone 0.
@@ -231,7 +240,7 @@ impl Device {
 
     /// Estimated seconds for one launch writing `len` elements.
     pub fn seconds(&self, k: &dyn Kernel, len: usize) -> f64 {
-        if self.barred.contains(&k.name()) {
+        if self.barred.iter().any(|b| b == k.name()) {
             return f64::INFINITY;
         }
         let work = k.work(len);

@@ -1,6 +1,11 @@
-//! A model directory as graph, weights, tokenizer and stops.
+//! A Hugging Face model directory: graph, weights, tokenizer, template.
 
-use crate::template::Template;
+mod template;
+#[cfg(test)]
+mod template_test;
+
+pub use template::{Message, Template};
+
 use checkpoint::File;
 use graph::Graph;
 use interp::{Tensor, bind};
@@ -48,8 +53,8 @@ pub struct Loaded {
     pub stop: Vec<u32>,
 }
 
-/// Reads a Qwen3 directory with `context` rows per sequence.
-pub fn load(dir: &Path, context: u64) -> Result<Loaded, Box<dyn Error + Send + Sync>> {
+/// Reads a Qwen3 directory: `slots` sequences of `context` rows.
+pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Loaded, Box<dyn Error + Send + Sync>> {
     let hf: HfConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     if hf.model_type != "qwen3" {
         return Err(format!("{} is not a model this engine traces", hf.model_type).into());
@@ -62,7 +67,7 @@ pub fn load(dir: &Path, context: u64) -> Result<Loaded, Box<dyn Error + Send + S
             heads: hf.num_attention_heads,
             head_dim: hf.head_dim,
             ffn: hf.intermediate_size,
-            max_seqs: 1,
+            max_seqs: slots,
             max_context: context,
         },
         kv_heads: hf.num_key_value_heads,

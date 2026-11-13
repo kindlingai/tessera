@@ -349,6 +349,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "eval"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "hf",
+ "lower",
+ "serde",
+ "serde_json",
+ "settings",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,6 +460,21 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hf"
+version = "0.1.0"
+dependencies = [
+ "checkpoint",
+ "graph",
+ "interp",
+ "minijinja",
+ "minijinja-contrib",
+ "models",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
 
 [[package]]
 name = "http"
@@ -1119,14 +1146,9 @@ name = "serve"
 version = "0.1.0"
 dependencies = [
  "axum",
- "checkpoint",
  "engine",
- "graph",
- "interp",
+ "hf",
  "lower",
- "minijinja",
- "minijinja-contrib",
- "models",
  "serde",
  "serde_json",
  "settings",

@@ -7,8 +7,9 @@ use linear as _;
 use graph::DimName::{Context, Rows, Seqs};
 use graph::Graph;
 use interp::Tensor;
-use lower::{Cache, Device, Error, Pins, Run, Settings, open};
+use lower::{Cache, Device, Error, Recipe, Run, Settings, open};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Tokens to continue, and when to stop.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,10 +78,10 @@ impl Engine {
     pub fn open(
         graph: Graph,
         context: usize,
-        pins: Pins,
+        recipe: &Recipe,
         settings: &Settings,
     ) -> Result<Self, Error> {
-        let device = Device::guess(settings).pinned(pins.clone());
+        let device = Device::guess(settings).with(recipe);
         let mut plans = Cache::default();
         let slots = graph
             .dims
@@ -95,7 +96,7 @@ impl Engine {
         let (sizes, _) = launch_of(&first, slots);
         let plan = plans.lower(&graph, 0, &sizes, &device)?;
         let runner = open(plan, settings)?;
-        let device = Device::stored(&*runner, settings)?.pinned(pins);
+        let device = Device::stored(&*runner, settings)?.with(recipe);
         Ok(Self {
             graph,
             runner,
@@ -117,6 +118,15 @@ impl Engine {
     /// The backend and hardware under the runner.
     pub fn device(&self) -> String {
         self.runner.device()
+    }
+
+    /// How often the plan in place launches each kernel.
+    pub fn kernels(&self) -> BTreeMap<&'static str, usize> {
+        let mut by = BTreeMap::new();
+        for step in &self.runner.plan().steps {
+            *by.entry(step.kernel.name()).or_default() += step.launches().len();
+        }
+        by
     }
 
     /// One launch of `rows`: the likeliest token after each.

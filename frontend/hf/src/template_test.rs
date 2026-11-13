@@ -1,4 +1,4 @@
-use crate::template::{Message, Template};
+use crate::{Message, Template};
 
 const CHATML: &str = "{% for m in messages %}\
 {{ '<|im_start|>' + m.role + '\n' + m.content.strip() + '<|im_end|>\n' }}{% endfor %}\

@@ -1,16 +1,12 @@
 //! `tessera-serve --model <dir> [--port 8080] [--context 4096]`
 
-mod model;
 mod server;
-mod template;
-#[cfg(test)]
-mod template_test;
 mod text;
 #[cfg(test)]
 mod text_test;
 
 use engine::Engine;
-use lower::{DType, Pins};
+use lower::{DType, Pins, Recipe};
 use server::{Job, Shared};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -56,13 +52,16 @@ fn engine_thread(
     queue: mpsc::Sender<Job>,
 ) {
     let start = Instant::now();
-    let loaded = match model::load(&args.model, args.context as u64) {
+    let loaded = match hf::load(&args.model, 1, args.context as u64) {
         Ok(loaded) => loaded,
         Err(e) => return drop(ready.send(Err(e.to_string()))),
     };
     let settings = settings::read();
-    let pins = Pins::all(DType::Bf16);
-    let opened = Engine::open(loaded.graph, args.context, pins, &settings);
+    let recipe = Recipe {
+        pins: Pins::all(DType::Bf16),
+        ..Recipe::default()
+    };
+    let opened = Engine::open(loaded.graph, args.context, &recipe, &settings);
     let mut engine = match opened {
         Ok(engine) => engine,
         Err(e) => return drop(ready.send(Err(e.to_string()))),

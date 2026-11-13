@@ -1,6 +1,5 @@
 //! The HTTP routes: health, completions and chat, plain or streamed.
 
-use crate::template::{Message, Template};
 use crate::text::Spool;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -9,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine::{Event, Reason, Request};
+use hf::{Message, Template};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, mpsc};

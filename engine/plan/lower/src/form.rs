@@ -1,9 +1,10 @@
 //! Pinned weight forms, and how kernels read a form.
 
 use graph::{DType, PathSeg};
+use serde::{Deserialize, Serialize};
 
 /// The form of each weight, as the user says.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pins {
     /// The form of every weight no pattern names.
     pub weights: DType,

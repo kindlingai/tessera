@@ -26,6 +26,7 @@ codegen = { path = "engine/plan/codegen" }
 engine = { path = "engine/engine" }
 settings = { path = "frontend/settings" }
 gpukit = { path = "engine/gpu/gpukit" }
+hf = { path = "frontend/hf" }
 graph = { path = "engine/ir/graph" }
 interp = { path = "engine/ir/interp" }
 kernel-macro = { path = "engine/plan/kernel-macro" }
