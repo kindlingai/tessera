@@ -26,10 +26,10 @@ fn rule_registers() {
     assert!(wide.steps.iter().all(|s| s.kernel.name() != "lanes"));
     // A favored rule keeps its node from a hiding cover.
     let residual = finished(48, 48, |x, product| x.add(&product));
-    let tiled = Device::guess().favoring("matmul");
-    let kept = lower(&residual, 0, &sizes(3), &tiled).unwrap();
+    let thin = Device::guess().favoring("thin");
+    let kept = lower(&residual, 0, &sizes(3), &thin).unwrap();
     let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
-    assert_eq!(names, ["matmul", "map"]);
+    assert_eq!(names, ["thin", "map"]);
     // Weights come in wide loads, under a hashed entry name.
     let Source::Made(text) = plan.steps[0].kernel.source() else {
         panic!("lanes are generated");

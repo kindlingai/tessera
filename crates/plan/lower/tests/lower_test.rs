@@ -3,6 +3,7 @@
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
 use kernels::Thin;
+use linear::SCHEDULES;
 use lower::kernels::{Map, MapStage};
 use lower::{
     Arg, Buffer, DType, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Site,
@@ -20,6 +21,12 @@ fn toy(device: &Device) -> (Graph, Plan) {
     (g, plan)
 }
 
+/// The device with every tiled schedule barred.
+fn untiled(device: Device) -> Device {
+    let names = SCHEDULES.iter().flat_map(|s| s.names);
+    names.fold(device, Device::without)
+}
+
 fn count(plan: &Plan, kernel: &str) -> usize {
     let named = |s: &&lower::Step| s.kernel.name() == kernel;
     plan.steps.iter().filter(named).count()
@@ -31,7 +38,9 @@ fn gate() -> Map {
 
 #[test]
 fn gate_fuses() {
-    let (g, plan) = toy(&Device::guess());
+    // Barring the fusing matmuls leaves the gate a map.
+    let plain = untiled(Device::guess()).without("lanes");
+    let (g, plan) = toy(&plain);
     let fused = KernelRef::new(gate());
     let steps: Vec<_> = plan.steps.iter().filter(|s| s.kernel == fused).collect();
     assert_eq!(steps.len(), 2, "one per layer");
@@ -66,15 +75,21 @@ fn buffers_are_shared() {
 #[test]
 fn cost_picks_the_matmul() {
     // Ten rows fit the thin kernel, so cost alone decides.
-    let (_, tiled) = toy(&Device::guess().without("thin"));
-    let (_, thin) = toy(&Device::guess().without("matmul"));
-    assert_eq!((count(&tiled, "thin"), count(&thin, "matmul")), (0, 0));
-    assert_eq!(count(&tiled, "matmul"), count(&thin, "thin"));
-    let mut measured = Device::guess();
+    let tiled_steps = |p: &Plan| {
+        p.steps
+            .iter()
+            .filter(|s| s.kernel.name().starts_with("tiled_"))
+            .count()
+    };
+    let (_, tiled) = toy(&Device::guess().without("thin").without("lanes"));
+    let (_, thin) = toy(&untiled(Device::guess()).without("lanes"));
+    assert_eq!((count(&tiled, "thin"), tiled_steps(&thin)), (0, 0));
+    assert_eq!(tiled_steps(&tiled), count(&thin, "thin"));
+    let mut measured = Device::guess().without("lanes");
     let cheap = thin.steps.iter().map(|s| (s, 1e-6));
     measured.fit(cheap.chain(tiled.steps.iter().map(|s| (s, 1e-3))));
     let (_, fitted) = toy(&measured);
-    assert_eq!(count(&fitted, "matmul"), 0, "the faster kernel wins");
+    assert_eq!(tiled_steps(&fitted), 0, "the faster kernel wins");
     assert!(measured.cost(&fitted).seconds < measured.cost(&tiled).seconds);
 }
 
@@ -325,9 +340,9 @@ fn trees_cut_shared() {
 
 #[test]
 fn favoring_stays_local() {
-    // No rule competes with maps, so favoring them changes nothing.
+    // No rule competes with rope, so favoring it changes nothing.
     let (_, plain) = toy(&Device::guess());
-    let (_, favored) = toy(&Device::guess().favoring("map"));
+    let (_, favored) = toy(&Device::guess().favoring("rope"));
     assert!(
         plain == favored,
         "a favored rule skewed its readers' choice"
@@ -367,7 +382,7 @@ fn pinned_weights_narrow() {
         assert_eq!(l.slot.dtype == DType::F32, embed, "weight {}", l.weight);
     }
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-    for narrow in ["thin_bf16", "widen", "gather"] {
+    for narrow in ["lanes_bf16", "widen", "gather"] {
         assert!(
             names.contains(&narrow),
             "{narrow} is missing from {names:?}"
@@ -376,7 +391,7 @@ fn pinned_weights_narrow() {
     assert!(!names.contains(&"gather_bf16"), "the table stays f32");
     // The head reads the tied embedding, kept f32.
     let embed = plan.weights.iter().find(|l| l.weight == 0).unwrap();
-    for s in plan.steps.iter().filter(|s| s.kernel.name() == "thin") {
+    for s in plan.steps.iter().filter(|s| s.kernel.name() == "lanes") {
         assert_eq!(s.reads[1], embed.slot);
     }
     // Norm weights widen once each, however often they are read.
@@ -399,10 +414,10 @@ fn plans_are_cached() {
     cache
         .lower(&g, 0, &[(Seqs, 1), (Context, 5)], &device)
         .unwrap();
-    let favored = device.clone().favoring("matmul");
+    let favored = device.clone().favoring("tiled");
     assert!(favored.generation() != device.generation());
     // Two devices changed alike are still two devices.
-    let twice = device.clone().favoring("matmul");
+    let twice = device.clone().favoring("tiled");
     assert!(twice.generation() != favored.generation() && twice == favored);
     let tiled = cache.lower(&g, 0, &SIZES, &favored).unwrap();
     assert!(tiled != first && cache.hits == 1 && cache.len() == 3);

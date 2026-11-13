@@ -3,7 +3,6 @@ pairs = [
     ["crates/gpu/gpukit/src/cuda/context.rs", "crates/gpu/gpukit/src/rocm/context.rs"],
     ["crates/gpu/gpukit/src/kernel.rs", "crates/gpu/gpukit/src/kernel.rs"],
     ["crates/gpu/gpukit/tests/cuda_smoke_test.rs", "crates/gpu/gpukit/tests/rocm_smoke_test.rs"],
-    # Three matmul schedules state the same sizes, loads and launches.
-    ["crates/rules/kernels/src/matmul.rs", "crates/rules/linear/src/lanes.rs"],
+    # Two matmul schedules state the same sizes, loads and launches.
     ["crates/rules/kernels/src/thin.rs", "crates/rules/linear/src/lanes.rs"],
 ]
