@@ -126,6 +126,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bundle"
+version = "0.1.0"
+dependencies = [
+ "checkpoint",
+ "graph",
+ "interp",
+ "minijinja",
+ "minijinja-contrib",
+ "models",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -353,8 +368,8 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 name = "eval"
 version = "0.1.0"
 dependencies = [
+ "bundle",
  "engine",
- "hf",
  "lower",
  "serde",
  "serde_json",
@@ -461,21 +476,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
-name = "hf"
-version = "0.1.0"
-dependencies = [
- "checkpoint",
- "graph",
- "interp",
- "minijinja",
- "minijinja-contrib",
- "models",
- "serde",
- "serde_json",
- "tokenizers",
-]
 
 [[package]]
 name = "http"
@@ -1147,8 +1147,8 @@ name = "serve"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bundle",
  "engine",
- "hf",
  "lower",
  "serde",
  "serde_json",
