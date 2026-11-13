@@ -69,11 +69,9 @@ fn table_resolves() {
 /// The `toolkit-cuda` and `toolkit-rocm` features say which are here.
 #[test]
 fn toolkits_agree() {
-    let here = |backend: &str| match backend {
-        "cuda" => cfg!(feature = "toolkit-cuda"),
-        "rocm" => cfg!(feature = "toolkit-rocm"),
-        _ => false,
-    };
+    let cuda = cfg!(feature = "toolkit-cuda");
+    let rocm = cfg!(feature = "toolkit-rocm");
+    let here = |backend: &str| (backend == "cuda" && cuda) || (backend == "rocm" && rocm);
     let dir = scratch("platforms");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("tiled.cu"), tiled_text(Dialect::Cuda)).unwrap();
@@ -103,9 +101,17 @@ fn check_cuda(tile: &Option<[usize; 3]>, pdl: bool, target: &str, dir: &Path) {
         return;
     }
     let (_, sass) = run("cuobjdump", &["-sass", "tiled.cubin"], dir);
+    let ops: std::collections::BTreeSet<&str> = sass
+        .split_whitespace()
+        .filter(|w| {
+            w.len() > 2
+                && w.chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '.' || c.is_ascii_digit())
+        })
+        .collect();
     assert!(
         sass.contains("HMMA.1688"),
-        "{target}: no 16x8x8 tf32 tile in the SASS"
+        "{target}: no 16x8x8 tf32 tile in the SASS, which has {ops:?}"
     );
     let (_, ptx) = run("nvcc", &[&arch, "-ptx", "-o", "-", "tiled.cu"], dir);
     assert_eq!(
