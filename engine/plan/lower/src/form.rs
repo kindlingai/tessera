@@ -3,7 +3,9 @@
 use graph::PathSeg;
 use serde::{Deserialize, Serialize};
 
-pub use codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, FORMS, Form, U32, U32_FORM, named, of};
+pub use codegen::form::{
+    BF16_FORM, Bf16, F32, F32_FORM, FORMS, Form, Layout, U32, U32_FORM, named, of,
+};
 
 /// The form of each weight, as the user says.
 #[derive(Clone, Debug, PartialEq)]

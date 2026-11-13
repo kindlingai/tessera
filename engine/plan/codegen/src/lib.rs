@@ -10,7 +10,7 @@ pub mod prelude;
 mod tile;
 
 pub use dialect::{Dialect, Text, float, hash};
-pub use form::Form;
+pub use form::{Form, Layout};
 pub use kernel_macro::kernel;
 pub use numerics::{Precision, Terms, terms};
 

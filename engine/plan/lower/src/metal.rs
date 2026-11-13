@@ -79,7 +79,7 @@ impl Runner {
             match arg {
                 Arg::Buffer(slot, skip) => {
                     let buffer = Some(self.buffer(*slot));
-                    let at = slot.start() + skip * slot.dtype.bytes();
+                    let at = slot.at(*skip);
                     unsafe { enc.setBuffer_offset_atIndex(buffer, at, index) };
                 }
                 Arg::U32(v) => set_bytes(enc, v, index),

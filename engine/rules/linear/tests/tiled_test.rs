@@ -11,7 +11,7 @@ mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
 use linear::{SCHEDULES, Schedule};
 use lower::form::{BF16_FORM, F32_FORM};
-use lower::{Device, Dialect, Pins, Source, lower, open, round, rules};
+use lower::{Device, Dialect, Pins, Source, lower, open, rules};
 use settings::read as settings;
 use trace::Act;
 
@@ -68,7 +68,7 @@ fn tiles_match_cpu() {
         for form in [F32_FORM, BF16_FORM] {
             // The reference sees the weights as the kernel stores them.
             let w = noise(vec![n as usize, k as usize], &mut draws);
-            let rounded = w.floats().unwrap().iter().map(|x| round(form.dtype(), *x));
+            let rounded = w.floats().unwrap().iter().map(|x| form.round(*x));
             let weights = [Tensor::f32(w.shape.clone(), rounded.collect())];
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
             for ((at, schedule), settings) in SCHEDULES.iter().enumerate().zip(runs.iter().cycle())

@@ -6,6 +6,7 @@ mod json;
 mod node;
 mod numerics;
 mod regions;
+mod scalar;
 mod select;
 mod types;
 mod verify;
@@ -18,6 +19,7 @@ pub use node::{
     PathSeg, Port, Region, Role, Row, Select, Stage, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order};
+pub use scalar::{Bf16, E2M1, E4M3, F16};
 pub use types::{DType, Placement, TensorType};
 pub use verify::{VerifyError, verify};
 
@@ -29,5 +31,7 @@ mod json_test;
 mod regions_test;
 #[cfg(test)]
 mod rules_test;
+#[cfg(test)]
+mod scalar_test;
 #[cfg(test)]
 mod verify_test;

@@ -4,7 +4,7 @@ use crate::buffer::Buffer;
 use crate::layout::Layout;
 use crate::tensor::Tensor;
 use crate::{Error, mismatch};
-use graph::DType;
+use graph::{Bf16, DType};
 use std::borrow::Cow;
 
 /// A window `at` bytes into a buffer, with a layout.
@@ -42,47 +42,6 @@ fn typed_mut<T>(bytes: &mut [u8]) -> Result<&mut [T], Error> {
         return mismatch("a view off its element boundary");
     }
     Ok(unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), bytes.len() / size) })
-}
-
-fn bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if x.is_nan() {
-        return (bits >> 16) as u16 | 0x40;
-    }
-    let round = 0x7FFF + ((bits >> 16) & 1);
-    ((bits + round) >> 16) as u16
-}
-
-/// `x` rounded to `dtype`, as f32. Ties go to even.
-pub fn round(dtype: DType, x: f32) -> f32 {
-    match dtype {
-        DType::Bf16 => f32::from_bits(u32::from(bf16(x)) << 16),
-        _ => x,
-    }
-}
-
-/// `data` as the bytes of a `dtype` buffer.
-pub fn narrow(dtype: DType, data: &[f32]) -> Vec<u8> {
-    match dtype {
-        DType::Bf16 => data.iter().flat_map(|x| bf16(*x).to_ne_bytes()).collect(),
-        _ => data.iter().flat_map(|x| x.to_ne_bytes()).collect(),
-    }
-}
-
-/// `bytes` of `from` elements, as bytes of `to` elements.
-fn convert(from: DType, to: DType, bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let floats: Vec<f32> = match from {
-        DType::F32 => typed::<f32>(bytes)?.to_vec(),
-        DType::Bf16 => {
-            let wide = |h: &u16| f32::from_bits(u32::from(*h) << 16);
-            typed::<u16>(bytes)?.iter().map(wide).collect()
-        }
-        _ => return mismatch(format_args!("a copy from {from:?} to {to:?}")),
-    };
-    match to {
-        DType::F32 | DType::Bf16 => Ok(narrow(to, &floats)),
-        _ => mismatch(format_args!("a copy from {from:?} to {to:?}")),
-    }
 }
 
 impl<'a> View<'a> {
@@ -175,11 +134,17 @@ impl<'a> View<'a> {
         typed(self.mapped()?)
     }
 
-    /// The floats, wherever they lie and however they are stored.
+    /// The floats, wherever they lie. A bf16 widens.
     pub fn to_f32(&self) -> Result<Vec<f32>, Error> {
         let packed = self.packed()?;
-        let wide = convert(self.dtype, DType::F32, &packed)?;
-        Ok(typed::<f32>(&wide)?.to_vec())
+        match self.dtype {
+            DType::F32 => Ok(typed::<f32>(&packed)?.to_vec()),
+            DType::Bf16 => Ok(typed::<u16>(&packed)?
+                .iter()
+                .map(|h| Bf16(*h).into())
+                .collect()),
+            other => mismatch(format_args!("floats from {other:?}")),
+        }
     }
 
     pub fn to_u32(&self) -> Result<Vec<u32>, Error> {
@@ -318,14 +283,11 @@ impl ViewMut<'_> {
     }
 }
 
-/// Copies `src` into `dst`, converting between f32 and bf16.
+/// Copies `src` into `dst` of the same type.
 pub fn copy(src: View, dst: &mut ViewMut) -> Result<(), Error> {
-    if src.len() != dst.len() {
-        return mismatch(format_args!("{} elements into {}", src.len(), dst.len()));
+    if src.len() != dst.len() || src.dtype != dst.dtype {
+        let (s, d) = ((src.len(), src.dtype), (dst.len(), dst.dtype));
+        return mismatch(format_args!("{s:?} into {d:?}"));
     }
-    let packed = src.packed()?;
-    match src.dtype == dst.dtype {
-        true => dst.write(&packed),
-        false => dst.write(&convert(src.dtype, dst.dtype, &packed)?),
-    }
+    dst.write(&src.packed()?)
 }

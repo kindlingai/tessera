@@ -59,8 +59,8 @@ macro_rules! device_runner {
                     for arg in &launch.args {
                         match arg {
                             Arg::Buffer(slot, skip) => {
-                                let at = slot.start() + skip * slot.dtype.bytes();
-                                args.device_ptr(self.buffer(*slot).device_ptr() + at as u64)
+                                let at = slot.at(*skip) as u64;
+                                args.device_ptr(self.buffer(*slot).device_ptr() + at)
                             }
                             Arg::U32(v) => args.u32(*v),
                             Arg::F32(v) => args.f32(*v),

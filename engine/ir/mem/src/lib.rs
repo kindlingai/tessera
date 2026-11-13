@@ -9,7 +9,7 @@ pub use buffer::{Backing, Buffer, Host};
 pub use graph::DType;
 pub use layout::Layout;
 pub use tensor::Tensor;
-pub use view::{View, ViewMut, copy, narrow, round};
+pub use view::{View, ViewMut, copy};
 
 use std::fmt;
 
