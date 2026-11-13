@@ -154,6 +154,14 @@ pub fn tanh(_: f32) -> f32 {
     device()
 }
 
+pub fn max(_: f32, _: f32) -> f32 {
+    device()
+}
+
+pub fn clamp(_: f32, _: f32, _: f32) -> f32 {
+    device()
+}
+
 /// Waits for every thread in the group.
 pub fn barrier() {
     device()
