@@ -92,7 +92,7 @@ impl Kernel for LaneNorm {
         let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
         args.push(step.out());
         args.extend([self.rows, self.width].map(Arg::count));
-        args.push(Arg::F32(self.eps));
+        args.push(Arg::value(&self.eps));
         vec![Launch {
             args,
             shape: Shape::Line(self.rows * LANES),

@@ -2,10 +2,11 @@
 
 use crate::Error;
 use crate::abi::{Arg, Launch, Shape, Source};
+use crate::extent::Extent;
 use crate::plan::{Plan, Slot};
 use crate::run::{Held, Run};
 use codegen::Dialect;
-use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared, set_bytes};
+use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared};
 use graph::DimName;
 use mem::Buffer;
 use objc2::msg_send;
@@ -77,19 +78,16 @@ impl Runner {
     fn encode(&self, enc: &Encoder, launch: &Launch) {
         for (index, arg) in launch.args.iter().enumerate() {
             match arg {
-                Arg::Buffer(slot, skip) => {
+                Arg::Buffer(slot, Extent::Fixed(skip)) => {
                     let buffer = Some(self.buffer(*slot));
                     let at = slot.at(*skip);
                     unsafe { enc.setBuffer_offset_atIndex(buffer, at, index) };
                 }
-                Arg::U32(v) => set_bytes(enc, v, index),
-                Arg::F32(v) => set_bytes(enc, v, index),
-                Arg::Pair(a, b) => set_bytes(enc, &[*a, *b], index),
-                Arg::Bytes(bytes) => {
+                Arg::Value(bytes) => {
                     let at = std::ptr::NonNull::from(&bytes[..]).cast();
                     unsafe { enc.setBytes_length_atIndex(at, bytes.len(), index) };
                 }
-                Arg::Size(_) | Arg::Offset(..) | Arg::Span(..) => {
+                Arg::Size(_) | Arg::Buffer(..) => {
                     unreachable!("bound before encoding")
                 }
             }

@@ -243,9 +243,9 @@ impl Kernel for Attend {
         );
         let buffers = |s: usize| {
             [
-                Arg::Buffer(step.reads[0], s * q),
-                Arg::Buffer(step.reads[1], s * kv),
-                Arg::Buffer(step.write, s * q),
+                Arg::at(step.reads[0], s * q),
+                Arg::at(step.reads[1], s * kv),
+                Arg::at(step.write, s * q),
             ]
         };
         let width = std::iter::once(Arg::count(a.width));

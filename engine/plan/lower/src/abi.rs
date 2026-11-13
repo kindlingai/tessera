@@ -9,35 +9,23 @@ use graph::DimName;
 /// One kernel argument, in the order its source declares.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Arg {
-    /// A slot's buffer, this many elements in.
-    Buffer(Slot, usize),
-    U32(u32),
-    F32(f32),
-    /// One `uint2` on Metal; two arguments elsewhere.
-    Pair(u32, u32),
-    /// A small `repr(C)` struct, passed by value.
-    Bytes(Vec<u8>),
-    /// A count read from a dimension at launch.
-    Size(Extent),
     /// A slot's buffer, an extent of elements in.
-    Offset(Slot, Extent),
-    /// Two extents as one `uint2`.
-    Span(Extent, Extent),
+    Buffer(Slot, Extent),
+    /// A plain value by its bytes, any `repr(C)` type.
+    Value(Vec<u8>),
+    /// A u32 read from a dimension at launch.
+    Size(Extent),
 }
 
 impl Arg {
-    /// The bytes of a `repr(C)` value.
-    pub fn bytes<T: Copy>(value: &T) -> Arg {
+    /// A `repr(C)` value by its bytes.
+    pub fn value<T: Copy>(value: &T) -> Arg {
         let at = std::ptr::from_ref(value).cast::<u8>();
-        Arg::Bytes(unsafe { std::slice::from_raw_parts(at, size_of::<T>()) }.to_vec())
-    }
-
-    pub fn pair(a: usize, b: usize) -> Arg {
-        Arg::Pair(a as u32, b as u32)
+        Arg::Value(unsafe { std::slice::from_raw_parts(at, size_of::<T>()) }.to_vec())
     }
 
     pub fn count(n: usize) -> Arg {
-        Arg::U32(n as u32)
+        Arg::value(&(n as u32))
     }
 
     /// A count, plain when it is already known.
@@ -48,19 +36,22 @@ impl Arg {
         }
     }
 
-    /// A slot's buffer, `e` elements in.
-    pub fn offset(slot: Slot, e: Extent) -> Arg {
-        match e {
-            Extent::Fixed(n) => Arg::Buffer(slot, n),
-            e => Arg::Offset(slot, e),
+    /// A slot's buffer, `skip` elements in.
+    pub fn at(slot: Slot, skip: usize) -> Arg {
+        Arg::Buffer(slot, Extent::Fixed(skip))
+    }
+
+    /// The value, when it is a u32.
+    pub fn u32(&self) -> Option<u32> {
+        match self {
+            Arg::Value(b) if b.len() == 4 => Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            _ => None,
         }
     }
 
-    pub fn span(a: Extent, b: Extent) -> Arg {
-        match (a, b) {
-            (Extent::Fixed(a), Extent::Fixed(b)) => Arg::pair(a, b),
-            (a, b) => Arg::Span(a, b),
-        }
+    /// The value, when it is an f32.
+    pub fn f32(&self) -> Option<f32> {
+        self.u32().map(f32::from_bits)
     }
 }
 
@@ -101,9 +92,8 @@ impl Launch {
         let mut args = Vec::with_capacity(self.args.len());
         for arg in self.args {
             args.push(match arg {
-                Arg::Size(e) => Arg::U32(count(&e)?),
-                Arg::Offset(slot, e) => Arg::Buffer(slot, e.value(size)?),
-                Arg::Span(a, b) => Arg::Pair(count(&a)?, count(&b)?),
+                Arg::Size(e) => Arg::count(count(&e)? as usize),
+                Arg::Buffer(slot, e) => Arg::at(slot, e.value(size)?),
                 fixed => fixed,
             });
         }
