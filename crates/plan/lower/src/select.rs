@@ -389,7 +389,10 @@ impl Emit {
         let room = most * (len / all[1]);
         let write = self.value(len, Home::Kept { index, room }, EDGE, DType::F32);
         let rows = self.bring(rows, EDGE);
-        let (skip, len) = (len - self.len(rows), self.len(rows));
+        // The new rows go after those kept so far.
+        let width = len / all[1];
+        let skip = n.extents[1].times(width).less(self.len(rows));
+        let len = self.len(rows);
         self.out.ops.push(Op {
             kernel: KernelRef::new(Append { skip, len }),
             rule: "append",
@@ -409,7 +412,18 @@ pub fn select(
     sizes: &[(DimName, u64)],
     device: &Device,
 ) -> Result<Selected, Error> {
-    let tree = Tree::new(g, entry, sizes, &device.pins)?;
+    select_upto(g, entry, sizes, &[], device)
+}
+
+/// The same, with `upto` dimensions read at launch.
+pub fn select_upto(
+    g: &Graph,
+    entry: usize,
+    sizes: &[(DimName, u64)],
+    upto: &[DimName],
+    device: &Device,
+) -> Result<Selected, Error> {
+    let tree = Tree::upto(g, entry, sizes, upto, &device.pins)?;
     let nodes = (0..tree.len() as u32).map(T);
     let rules = rules();
     let mut cover = Cover {

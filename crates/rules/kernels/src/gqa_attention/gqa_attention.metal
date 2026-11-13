@@ -27,6 +27,7 @@ kernel void gqa_attention(
     device float *out [[buffer(2)]],
     constant GqaAttentionParams &p [[buffer(3)]],
     constant uint2 &dims [[buffer(4)]],
+    constant uint2 &span [[buffer(5)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint3 tpg3 [[threads_per_threadgroup]]
@@ -35,6 +36,9 @@ kernel void gqa_attention(
     const uint tpg = tpg3.x;
     const uint seq_len = dims.x;
     const uint n_heads = dims.y;
+    // The key count, and the keys before the queries.
+    const uint total_kv = span.x;
+    const uint kv_cache_len = span.y;
     const uint hd = p.head_dim;
     const uint nkv = p.n_kv_heads;
     const uint tok = row / n_heads;
@@ -54,12 +58,12 @@ kernel void gqa_attention(
         acc[d] = 0.0f;
     }
 
-    for (uint t = 0; t < p.total_kv; t++) {
+    for (uint t = 0; t < total_kv; t++) {
         // Causal: query kv_cache_len + tok sees keys up to itself.
-        if (t > p.kv_cache_len + tok) {
+        if (t > kv_cache_len + tok) {
             break;
         }
-        if (p.sliding_window > 0 && t + p.sliding_window <= p.kv_cache_len + tok) {
+        if (p.sliding_window > 0 && t + p.sliding_window <= kv_cache_len + tok) {
             continue;
         }
         const uint k_off = t * nkv * hd * 2 + kvh * hd;

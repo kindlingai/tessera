@@ -113,7 +113,7 @@ fn launch(
     let plan = lower(g, 0, &sizes, device).unwrap();
     let [ids, logits] = [plan.outputs[0].slot, plan.outputs[1].slot];
     match runner {
-        Some(r) => r.replan(plan).unwrap(),
+        Some(r) => r.replan(&plan).unwrap(),
         None => {
             // Weights load once. Later plans reuse them.
             let r = runner.insert(open(plan).unwrap());

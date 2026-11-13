@@ -22,7 +22,9 @@ extern "C" __global__ void gqa_attention(
     float *out,
     GqaAttentionParams p,
     unsigned seq_len,
-    unsigned n_heads
+    unsigned n_heads,
+    unsigned total_kv,
+    unsigned kv_cache_len
 ) {
     const unsigned row = blockIdx.x;
     const unsigned hd = p.head_dim;
@@ -44,11 +46,11 @@ extern "C" __global__ void gqa_attention(
         acc[d] = 0.0f;
     }
 
-    for (unsigned t = 0; t < p.total_kv; t++) {
-        if (t > p.kv_cache_len + tok) {
+    for (unsigned t = 0; t < total_kv; t++) {
+        if (t > kv_cache_len + tok) {
             break;
         }
-        if (p.sliding_window > 0 && t + p.sliding_window <= p.kv_cache_len + tok) {
+        if (p.sliding_window > 0 && t + p.sliding_window <= kv_cache_len + tok) {
             continue;
         }
         const unsigned k_off = t * nkv * hd * 2 + kvh * hd;

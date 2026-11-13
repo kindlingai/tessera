@@ -52,7 +52,7 @@ pub fn measure(
         if plan.steps.iter().all(|s| device.known(s)) {
             continue;
         }
-        runner.replan(plan)?;
+        runner.replan(&plan)?;
         runner.feed(feeds)?;
         let timed = time(runner)?;
         device.fit(timed.iter().map(|(step, seconds)| (step, *seconds)));

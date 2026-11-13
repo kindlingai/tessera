@@ -1,5 +1,6 @@
 //! Rules propose kernels for a site; link time collects them.
 
+use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::MapStage;
 use crate::tree::{T, Tree};
@@ -12,7 +13,8 @@ pub use scattered_collect::declarative::{gather, scatter};
 pub struct Attn {
     pub seqs: usize,
     pub queries: usize,
-    pub keys: usize,
+    /// The key count. Decode reads it at launch.
+    pub keys: Extent,
     pub heads: usize,
     pub kv_heads: usize,
     pub width: usize,
@@ -21,7 +23,8 @@ pub struct Attn {
 impl Attn {
     /// What an attention kernel's time depends on.
     pub fn sizes(&self) -> Vec<usize> {
-        vec![self.seqs, self.queries, self.keys, self.heads, self.width]
+        let keys = self.keys.most();
+        vec![self.seqs, self.queries, keys, self.heads, self.width]
     }
 }
 

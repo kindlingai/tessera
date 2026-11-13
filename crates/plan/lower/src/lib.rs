@@ -7,6 +7,7 @@ mod cost;
 mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
+mod extent;
 mod form;
 mod kernel;
 pub mod kernels;
@@ -25,6 +26,7 @@ pub use cache::Cache;
 pub use codegen::{Dialect, Gen, LANES, Text, float, hash};
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
+pub use extent::Extent;
 pub use form::{Pins, Stored};
 pub use kernel::{Kernel, KernelRef};
 pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};
@@ -32,7 +34,7 @@ pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Held, Run, open};
 pub use schedule::{peak, schedule};
-pub use select::{Home, Op, Selected, Val, Value, select};
+pub use select::{Home, Op, Selected, Val, Value, select, select_upto};
 pub use sim::{Cluster, Fit, Link, Load, Ops, Zone, ZoneKind};
 pub use tree::{Node, T, Term, Tree};
 
@@ -45,7 +47,18 @@ pub fn lower(
     sizes: &[(DimName, u64)],
     device: &Device,
 ) -> Result<Plan, Error> {
-    let picked = select(g, entry, sizes, device)?;
+    lower_upto(g, entry, sizes, &[], device)
+}
+
+/// The same, with `upto` dimensions read at launch.
+pub fn lower_upto(
+    g: &Graph,
+    entry: usize,
+    sizes: &[(DimName, u64)],
+    upto: &[DimName],
+    device: &Device,
+) -> Result<Plan, Error> {
+    let picked = select_upto(g, entry, sizes, upto, device)?;
     Ok(assign(&picked, &schedule(&picked)))
 }
 
@@ -60,6 +73,8 @@ pub enum Error {
     Gpu(gpukit::Error),
     /// A view did not fit its buffer or its use.
     Memory(mem::Error),
+    /// A runtime dimension was never bound.
+    Unbound,
 }
 
 impl fmt::Display for Error {
@@ -69,6 +84,7 @@ impl fmt::Display for Error {
             Error::Size(what) => write!(f, "{what} has no size in this launch"),
             Error::Gpu(e) => write!(f, "gpu: {e}"),
             Error::Memory(e) => write!(f, "memory: {e}"),
+            Error::Unbound => write!(f, "a runtime dimension has no value"),
         }
     }
 }

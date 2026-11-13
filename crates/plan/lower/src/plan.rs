@@ -3,6 +3,7 @@
 use crate::abi::{Arg, Launch};
 use crate::kernel::KernelRef;
 use graph::{DType, NodeId, Order};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `len` elements of one buffer, `offset` elements in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,8 +76,10 @@ pub struct Output {
     pub shape: Vec<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Plan {
+    /// Tells plans apart without comparing them. Zero means unknown.
+    pub id: u64,
     /// Bytes per buffer. Values that never overlap share one.
     pub buffers: Vec<usize>,
     /// The zone each buffer lies in. Empty means zone 0.
@@ -91,7 +94,27 @@ pub struct Plan {
     pub outputs: Vec<Output>,
 }
 
+static IDS: AtomicU64 = AtomicU64::new(1);
+
+/// Equal plans run alike, whatever their ids.
+impl PartialEq for Plan {
+    fn eq(&self, other: &Self) -> bool {
+        self.buffers == other.buffers
+            && self.zones == other.zones
+            && self.steps == other.steps
+            && self.weights == other.weights
+            && self.kept == other.kept
+            && self.inputs == other.inputs
+            && self.outputs == other.outputs
+    }
+}
+
 impl Plan {
+    /// An id no other plan has had in this process.
+    pub fn fresh() -> u64 {
+        IDS.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// The weakest order any of its kernels sums in.
     pub fn order(&self) -> Order {
         let orders = self.steps.iter().map(|s| s.kernel.order());
