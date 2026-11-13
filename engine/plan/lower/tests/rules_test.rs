@@ -161,10 +161,7 @@ fn whole_models_match_cpu() {
         }
         // Weights the GPU reads as bf16, the CPU reads widened.
         let narrow = |t: &Tensor| match t.floats() {
-            Ok(v) => Tensor::f32(
-                t.shape.clone(),
-                v.iter().map(|x| BF16_FORM.round(*x)).collect(),
-            ),
+            Ok(v) => Tensor::f32(t.shape.clone(), BF16_FORM.roundtrip(v)),
             Err(_) => t.clone(),
         };
         let weights: Vec<Tensor> = weights.iter().map(narrow).collect();

@@ -43,6 +43,12 @@ impl Held {
             .view(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
+    /// `bytes` into the slot, as the form packed them.
+    pub fn upload(&mut self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        let at = self.bound[slot.buffer as usize];
+        Ok(self.all[at].backing_mut().upload(slot.start(), bytes)?)
+    }
+
     pub fn view_mut(&mut self, slot: Slot) -> ViewMut<'_> {
         let at = self.bound[slot.buffer as usize];
         self.all[at].view_mut(slot.start(), slot.form.dtype(), vec![slot.len])
@@ -126,13 +132,14 @@ pub trait Run {
     /// How the hardware's tiles round.
     fn precision(&self) -> Precision;
 
-    /// Floats go through the slot's form. Anything else copies.
+    /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
-        let dst = &mut self.held_mut().view_mut(slot);
-        if src.dtype() == slot.form.dtype() {
-            return Ok(copy(src, dst)?);
+        let plain = slot.form.block() == 1 && src.dtype() == slot.form.dtype();
+        if plain {
+            return Ok(copy(src, &mut self.held_mut().view_mut(slot))?);
         }
-        Ok(dst.write(&slot.form.pack(&src.to_f32()?))?)
+        let packed = slot.form.pack(&src.to_f32()?);
+        self.held_mut().upload(slot, &packed)
     }
 
     /// The slot's values on the host, as one row.

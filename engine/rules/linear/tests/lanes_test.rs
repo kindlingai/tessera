@@ -10,6 +10,8 @@ use interp::run;
 
 mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
+use interp::Tensor;
+use lower::Pins;
 use lower::{Device, Dialect, Source, lower, open, rules};
 use settings::read as settings;
 use trace::Act;
@@ -64,15 +66,26 @@ fn lanes_match_cpu() {
     let fused = [residual, gate].map(|finish| (48, 48, finished(48, 48, finish), false));
     for (k, n, g, bare) in plain.into_iter().chain(fused) {
         let rows: DimName = Rows;
-        let weights = [noise(vec![n as usize, k as usize], &mut draws)];
-        for (m, settings) in [1usize, 5].into_iter().zip(runs().iter().cycle()) {
+        let w = noise(vec![n as usize, k as usize], &mut draws);
+        let forms = common::forms(k as usize).into_iter();
+        for ((m, settings), form) in [1usize, 5]
+            .into_iter()
+            .cycle()
+            .zip(runs().iter().cycle())
+            .zip(forms)
+        {
+            // The reference sees the weights as the kernel stores them.
+            let rounded = form.roundtrip(w.floats().unwrap());
+            let weights = [Tensor::f32(w.shape.clone(), rounded)];
             let x = noise(vec![m, k as usize], &mut draws);
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-            let device = Device::guess(settings).favoring("lanes");
+            let device = Device::guess(settings)
+                .favoring("lanes")
+                .pinned(Pins::all(form));
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
             // Stages after the matmul ride in the same launch.
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-            assert_eq!(names, ["lanes"]);
+            assert_eq!(names, [form.suffixed("lanes")]);
             assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
             let terms = terms(&plan);
             let mut runner = open(plan, settings).unwrap();
@@ -85,7 +98,11 @@ fn lanes_match_cpu() {
                 true => terms.matmul(&runner.precision(), xs, ws, k as usize),
                 false => 1e-3,
             };
-            let label = format!("{m} rows of {k} to {n} on {}", runner.device());
+            let label = format!(
+                "{m} rows of {k} to {n} as {} on {}",
+                form.name(),
+                runner.device()
+            );
             assert!(off <= bound, "{label}: off by {off:e}, allowed {bound:e}");
             eprintln!("{label}: off by {off:.2e} of {bound:.2e}");
         }

@@ -28,7 +28,7 @@ impl Slot {
 
     /// The first byte's offset.
     pub fn start(&self) -> usize {
-        self.form.bytes(self.offset)
+        self.form.offset(self.offset)
     }
 
     pub fn bytes(&self) -> usize {
@@ -37,7 +37,7 @@ impl Slot {
 
     /// The byte offset of element `skip`.
     pub fn at(&self, skip: usize) -> usize {
-        self.form.bytes(self.offset + skip)
+        self.form.offset(self.offset + skip)
     }
 }
 

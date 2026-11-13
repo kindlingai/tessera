@@ -14,57 +14,82 @@ pub struct Text {
     pub buffers: Vec<(String, &'static str, bool)>,
     /// Name and type, bound after the buffers.
     pub scalars: Vec<(&'static str, &'static str)>,
+    /// Functions the body calls, each once.
+    pub headers: Vec<String>,
     pub body: String,
 }
 
-/// Each dialect's spelling of the names a body may use.
-const METAL: &str = "#include <metal_stdlib>
-using namespace metal;
-typedef unsigned int u32;
-typedef unsigned long u64;
-typedef unsigned short u16;
-#define f_exp(x) exp(x)
-#define f_tanh(x) tanh(x)
-#define f_max(a, b) max(a, b)
-#define f_clamp(x, lo, hi) clamp(x, lo, hi)
-#define f_pow(a, b) precise::pow(a, b)
-#define f_cos(x) precise::cos(x)
-#define f_sin(x) precise::sin(x)
-#define f_bits(x) as_type<float>(x)
-#define f_rsqrt(x) rsqrt(x)
-#define f_shfl_xor(v, m) simd_shuffle_xor(v, m)
-#define f_barrier() threadgroup_barrier(mem_flags::mem_threadgroup)
-#define f_group(ty, name, n) threadgroup ty name[n]
-#define f_f32x4(p) (*(device float4 *)(p))
-#define f_u32x2(p) (*(device const uint2 *)(p))
-#define f_make4(a, b, c, d) float4(a, b, c, d)
+/// The names a body may use, spelled per dialect.
+const NAMES: &[(&str, &str, &str)] = &[
+    ("u64", "unsigned long", "unsigned long long"),
+    ("f_const(ty)", "device const ty *", "const ty *"),
+    ("f_fn", "static inline", "static __device__ inline"),
+    ("f_exp(x)", "exp(x)", "expf(x)"),
+    ("f_tanh(x)", "tanh(x)", "tanhf(x)"),
+    ("f_max(a, b)", "max(a, b)", "fmaxf(a, b)"),
+    (
+        "f_clamp(x, lo, hi)",
+        "clamp(x, lo, hi)",
+        "fminf(fmaxf(x, lo), hi)",
+    ),
+    ("f_pow(a, b)", "precise::pow(a, b)", "powf(a, b)"),
+    ("f_cos(x)", "precise::cos(x)", "cosf(x)"),
+    ("f_sin(x)", "precise::sin(x)", "sinf(x)"),
+    ("f_bits(x)", "as_type<float>(x)", "__uint_as_float(x)"),
+    ("f_rsqrt(x)", "rsqrt(x)", "rsqrtf(x)"),
+    (
+        "f_barrier()",
+        "threadgroup_barrier(mem_flags::mem_threadgroup)",
+        "__syncthreads()",
+    ),
+    (
+        "f_group(ty, name, n)",
+        "threadgroup ty name[n]",
+        "__shared__ ty name[n]",
+    ),
+    ("f_f32x4(p)", "(*(device float4 *)(p))", "(*(float4 *)(p))"),
+    (
+        "f_u32x2(p)",
+        "(*(device const uint2 *)(p))",
+        "(*(const uint2 *)(p))",
+    ),
+    (
+        "f_make4(a, b, c, d)",
+        "float4(a, b, c, d)",
+        "make_float4(a, b, c, d)",
+    ),
+];
 
-";
-
-const CUDA: &str = "typedef unsigned int u32;
-typedef unsigned long long u64;
-typedef unsigned short u16;
-#define f_exp(x) expf(x)
-#define f_tanh(x) tanhf(x)
-#define f_max(a, b) fmaxf(a, b)
-#define f_clamp(x, lo, hi) fminf(fmaxf(x, lo), hi)
-#define f_pow(a, b) powf(a, b)
-#define f_cos(x) cosf(x)
-#define f_sin(x) sinf(x)
-#define f_bits(x) __uint_as_float(x)
-#define f_rsqrt(x) rsqrtf(x)
-#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+/// The shuffle. HIP leaves out the mask.
+const METAL_SHFL: &str = "#define f_shfl_xor(v, m) simd_shuffle_xor(v, m)\n";
+const CUDA_SHFL: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #define f_shfl_xor(v, m) __shfl_xor(v, m)
 #else
 #define f_shfl_xor(v, m) __shfl_xor_sync(0xffffffffu, v, m)
 #endif
-#define f_barrier() __syncthreads()
-#define f_group(ty, name, n) __shared__ ty name[n]
-#define f_f32x4(p) (*(float4 *)(p))
-#define f_u32x2(p) (*(const uint2 *)(p))
-#define f_make4(a, b, c, d) make_float4(a, b, c, d)
-
 ";
+
+/// The text before every kernel in `dialect`.
+fn head(dialect: Dialect) -> String {
+    let metal = dialect == Dialect::Metal;
+    let mut text = String::new();
+    if metal {
+        text.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
+    }
+    text.push_str(
+        "typedef unsigned int u32;\ntypedef unsigned short u16;\ntypedef unsigned char u8;\n",
+    );
+    for (name, for_metal, for_cuda) in NAMES {
+        let spelling = if metal { for_metal } else { for_cuda };
+        match *name {
+            "u64" => text.push_str(&format!("typedef {spelling} u64;\n")),
+            _ => text.push_str(&format!("#define {name} {spelling}\n")),
+        }
+    }
+    text.push_str(if metal { METAL_SHFL } else { CUDA_SHFL });
+    text.push('\n');
+    text
+}
 
 impl Text {
     pub fn render(&self, dialect: Dialect) -> String {
@@ -89,16 +114,21 @@ impl Text {
             true => {
                 params.push("u32 gid [[thread_position_in_grid]]".into());
                 params.push("u32 lid [[thread_index_in_threadgroup]]".into());
-                (format!("{METAL}{}", crate::tile::METAL), "kernel void", "")
+                (
+                    format!("{}{}", head(dialect), crate::tile::METAL),
+                    "kernel void",
+                    "",
+                )
             }
             false => {
                 let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
-                let head = format!("{CUDA}{}", crate::tile::cuda());
+                let head = format!("{}{}", head(dialect), crate::tile::cuda());
                 (head, "extern \"C\" __global__ void", index)
             }
         };
         let (entry, params, body) = (&self.entry, params.join(",\n    "), &self.body);
-        format!("{head}{kind} {entry}(\n    {params}\n) {{\n{index}{body}}}\n")
+        let headers = self.headers.concat();
+        format!("{head}{headers}{kind} {entry}(\n    {params}\n) {{\n{index}{body}}}\n")
     }
 }
 
