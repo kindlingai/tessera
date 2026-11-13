@@ -6,12 +6,13 @@ use lower::{Arg, Draft, Form as Stored, Kernel, Launch, Shape, Source, Step, T, 
 
 /// One thread per output element, widened from the table.
 #[kernel]
-fn gather<F: Form<Elem = f32>>(
-    table: Buf<F>,
+fn gather(
+    #[form(form)] table: Buf<Dyn>,
     ids: Buf<U32>,
     mut out: BufMut<F32>,
     rows: u32,
     width: u32,
+    #[build] form: &'static dyn Stored,
 ) {
     if gid() >= rows * width {
         return;
@@ -30,10 +31,7 @@ pub struct Gather {
 
 impl Kernel for Gather {
     fn name(&self) -> &'static str {
-        match self.form.name() {
-            "bf16" => "gather_bf16",
-            _ => "gather",
-        }
+        self.form.suffixed("gather")
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -41,11 +39,7 @@ impl Kernel for Gather {
     }
 
     fn source(&self) -> Source {
-        let body = match self.form.name() {
-            "bf16" => gather_ir::<Bf16>(),
-            _ => gather_ir::<F32>(),
-        };
-        let mut body = body;
+        let mut body = gather_ir(self.form);
         body.entry = format!("plan_gather_{}", self.form.name());
         Source::Made(body)
     }

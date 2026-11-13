@@ -2,7 +2,7 @@
 
 use crate::LANES;
 use crate::dialect::Text;
-use graph::DType;
+use crate::form::Form;
 use std::collections::HashMap;
 
 /// A value's type, as the printer needs it.
@@ -14,8 +14,6 @@ pub enum Ty {
     Bool,
     /// Four floats loaded at once.
     F32x4,
-    /// Four bf16 loaded at once, as two words.
-    Bf16x4,
 }
 
 impl Ty {
@@ -26,7 +24,6 @@ impl Ty {
             Ty::U64 => "u64",
             Ty::Bool => "bool",
             Ty::F32x4 => "float4",
-            Ty::Bf16x4 => "uint2",
         }
     }
 }
@@ -160,10 +157,10 @@ impl Expr {
 }
 
 /// A buffer element's type as a value.
-fn element(dtype: DType) -> Ty {
-    match dtype {
-        DType::U32 | DType::I32 => Ty::U32,
-        _ => Ty::F32,
+fn element(form: &dyn Form) -> Ty {
+    match form.dtype().is_float() {
+        true => Ty::F32,
+        false => Ty::U32,
     }
 }
 
@@ -240,12 +237,12 @@ pub enum Stmt {
     },
 }
 
-/// A kernel parameter: a buffer of `dtype`, or a scalar.
+/// A kernel parameter: a buffer of `form`, or a scalar.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
     Buffer {
         name: String,
-        dtype: DType,
+        form: &'static dyn Form,
         writes: bool,
     },
     Scalar {
@@ -266,8 +263,10 @@ pub struct Body {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Value(Ty),
-    /// A buffer parameter of this element type.
-    Buffer(DType),
+    /// Four elements of this form, loaded at once.
+    Wide(&'static dyn Form),
+    /// A buffer parameter of this form.
+    Buffer(&'static dyn Form),
     /// Group memory, or a local array, of this element type.
     Array(Ty),
     /// Tile sums over this many rows and columns.
@@ -311,6 +310,7 @@ impl Printer<'_> {
             Expr::Bool(_) => Ty::Bool,
             Expr::Var(name) => match self.kind(name) {
                 Kind::Value(ty) => ty,
+                Kind::Wide(_) => Ty::F32x4,
                 other => panic!("`{name}` is {other:?}, not a value"),
             },
             Expr::Neg(a) => self.ty(a),
@@ -323,33 +323,41 @@ impl Printer<'_> {
             Expr::Index(base, _) => match &**base {
                 Expr::Var(name) => match self.kind(name) {
                     Kind::Array(ty) => ty,
-                    Kind::Buffer(dtype) => element(dtype),
+                    Kind::Buffer(form) => element(form),
                     _ => Ty::F32,
                 },
                 _ => Ty::F32,
             },
             Expr::Field(..) => Ty::F32,
             Expr::Select(_, a, _) => self.ty(a),
-            Expr::Call(i, args) => match i {
+            Expr::Call(i, _) => match i {
                 Intrinsic::Gid | Intrinsic::Lid | Intrinsic::Lane => Ty::U32,
-                Intrinsic::Load4 => match self.buffer(&args[0]) {
-                    DType::Bf16 => Ty::Bf16x4,
-                    _ => Ty::F32x4,
-                },
-                Intrinsic::Zero4 => Ty::F32x4,
+                Intrinsic::Load4 | Intrinsic::Zero4 => Ty::F32x4,
                 _ => Ty::F32,
             },
         }
     }
 
-    /// The element type of a buffer parameter.
-    fn buffer(&self, e: &Expr) -> DType {
+    /// The form of a buffer parameter.
+    fn buffer(&self, e: &Expr) -> &'static dyn Form {
         match e {
             Expr::Var(name) => match self.kind(name) {
-                Kind::Buffer(dtype) => dtype,
+                Kind::Buffer(form) => form,
                 other => panic!("`{name}` is {other:?}, not a buffer"),
             },
             _ => panic!("a buffer is named directly"),
+        }
+    }
+
+    /// The form behind a four-wide value from a buffer.
+    fn wide(&self, e: &Expr) -> Option<&'static dyn Form> {
+        match e {
+            Expr::Var(name) => match self.kind(name) {
+                Kind::Wide(form) => Some(form),
+                _ => None,
+            },
+            Expr::Call(Intrinsic::Load4, args) => Some(self.buffer(&args[0])),
+            _ => None,
         }
     }
 
@@ -374,22 +382,16 @@ impl Printer<'_> {
                     panic!("an index names what it reads");
                 };
                 match self.kind(name) {
-                    Kind::Buffer(DType::Bf16) => format!("f_bits((u32){name}[{at}] << 16)"),
+                    Kind::Buffer(form) => form.load(name, &at),
                     _ => format!("{name}[{at}]"),
                 }
             }
             Expr::Field(base, h) => {
-                let ty = self.ty(base);
+                let form = self.wide(base);
                 let base = self.expr(base);
-                match ty {
-                    // Two bf16 share each word: low half first.
-                    Ty::Bf16x4 => match h {
-                        'x' => format!("f_bits({base}.x << 16)"),
-                        'y' => format!("f_bits({base}.x & 0xffff0000u)"),
-                        'z' => format!("f_bits({base}.y << 16)"),
-                        _ => format!("f_bits({base}.y & 0xffff0000u)"),
-                    },
-                    _ => format!("{base}.{h}"),
+                match form {
+                    Some(form) => form.part(&base, *h),
+                    None => format!("{base}.{h}"),
                 }
             }
             Expr::Call(i, args) => self.call(*i, args),
@@ -423,14 +425,11 @@ impl Printer<'_> {
                 format!("f_clamp({v}, {lo}, {hi})")
             }
             Intrinsic::Load4 => {
-                let (dtype, at) = (self.buffer(&args[0]), arg(self, 1));
+                let (form, at) = (self.buffer(&args[0]), arg(self, 1));
                 let Expr::Var(name) = &args[0] else {
                     unreachable!()
                 };
-                match dtype {
-                    DType::Bf16 => format!("f_u32x2({name} + {at})"),
-                    _ => format!("f_f32x4({name} + {at})"),
-                }
+                form.load4(name, &at)
             }
             Intrinsic::Store4 => {
                 let Expr::Var(name) = &args[0] else {
@@ -458,12 +457,21 @@ impl Printer<'_> {
             Stmt::Let { name, init } => {
                 let ty = self.ty(init);
                 // A zeroed four leaves the compiler to fill it.
-                let text = match init {
-                    Expr::Call(Intrinsic::Zero4, _) => format!("float4 {name};"),
-                    _ => format!("{} {name} = {};", ty.c(), self.expr(init)),
+                let (text, kind) = match (init, self.wide(init)) {
+                    (Expr::Call(Intrinsic::Zero4, _), _) => {
+                        (format!("float4 {name};"), Kind::Value(ty))
+                    }
+                    (_, Some(form)) => (
+                        format!("{} {name} = {};", form.wide(), self.expr(init)),
+                        Kind::Wide(form),
+                    ),
+                    _ => (
+                        format!("{} {name} = {};", ty.c(), self.expr(init)),
+                        Kind::Value(ty),
+                    ),
                 };
                 self.line(text);
-                self.bind(name, Kind::Value(ty));
+                self.bind(name, kind);
             }
             Stmt::Array { name, ty, len } => {
                 self.line(format!("{} {name}[{len}] = {{}};", ty.c()));
@@ -733,19 +741,9 @@ impl Body {
         let (mut buffers, mut scalars) = (Vec::new(), Vec::new());
         for param in p.params {
             match param {
-                Param::Buffer {
-                    name,
-                    dtype,
-                    writes,
-                } => {
-                    p.bind(name, Kind::Buffer(*dtype));
-                    let ty = match dtype {
-                        DType::Bf16 => "u16",
-                        DType::U32 => "u32",
-                        DType::I32 => "int",
-                        _ => "float",
-                    };
-                    buffers.push((name.clone(), ty, *writes));
+                Param::Buffer { name, form, writes } => {
+                    p.bind(name, Kind::Buffer(*form));
+                    buffers.push((name.clone(), form.ty(), *writes));
                 }
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));

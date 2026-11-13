@@ -10,3 +10,4 @@ description = "Generates kernel text for every dialect, and counts what it costs
 graph = { workspace = true }
 kernel-macro = { workspace = true }
 sim = { workspace = true }
+scattered-collect = "0.22"

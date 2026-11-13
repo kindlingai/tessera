@@ -18,7 +18,9 @@ use trace::Act;
 /// A device that can only choose schedule `at`.
 fn only(at: usize) -> Device {
     let others = SCHEDULES.iter().enumerate().filter(|(i, _)| *i != at);
-    let bar = |d: Device, (_, s): (usize, &Schedule)| d.without(s.names[0]).without(s.names[1]);
+    let bar = |d: Device, (_, s): (usize, &Schedule)| {
+        d.without(s.name).without(BF16_FORM.suffixed(s.name))
+    };
     others.fold(Device::guess(&settings()).favoring("tiled"), bar)
 }
 
@@ -74,7 +76,7 @@ fn tiles_match_cpu() {
                 let device = only(at).pinned(Pins::all(form));
                 let plan = lower(&g, 0, &[(Rows, m)], &device).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-                let name = schedule.names[(form.name() == "bf16") as usize];
+                let name = form.suffixed(schedule.name);
                 assert_eq!(names, [name]);
                 let terms = terms(&plan);
                 let mut runner = open(plan, settings).unwrap();

@@ -9,7 +9,12 @@ use sim::Load;
 
 /// One thread per element, widened to f32.
 #[kernel]
-fn widen<F: Form<Elem = f32>>(x: Buf<F>, mut out: BufMut<F32>, len: u32) {
+fn widen(
+    #[form(form)] x: Buf<Dyn>,
+    mut out: BufMut<F32>,
+    len: u32,
+    #[build] form: &'static dyn Stored,
+) {
     if gid() >= len {
         return;
     }
@@ -29,11 +34,7 @@ impl Kernel for Widen {
     }
 
     fn source(&self) -> Source {
-        let body = match self.form.name() {
-            "bf16" => widen_ir::<Bf16>(),
-            _ => widen_ir::<F32>(),
-        };
-        let mut body = body;
+        let mut body = widen_ir(self.form);
         body.entry = format!("plan_widen_{}", self.form.name());
         Source::Made(body)
     }
@@ -47,15 +48,11 @@ impl Kernel for Widen {
 
     fn load(&self, _: usize) -> Option<Load> {
         let len = self.len as f64;
-        let trip = match self.form.name() {
-            "bf16" => widen_ir::<Bf16>().trip(),
-            _ => widen_ir::<F32>().trip(),
-        };
         Some(Load {
             threads: self.len,
             group: 256,
             trips: 1.0,
-            trip,
+            trip: widen_ir(self.form).trip(),
             reads: vec![self.form.bytes(self.len) as f64],
             written: 4.0 * len,
             flight: 4.0,

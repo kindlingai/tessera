@@ -1,8 +1,8 @@
 //! A trip's operations, counted from the tree.
 
 use crate::LANES;
+use crate::form::Form;
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
-use graph::DType;
 use sim::Ops;
 use std::collections::HashMap;
 
@@ -59,7 +59,7 @@ struct Counter {
     /// Freshness and width summed over loads, for their means.
     fresh: f64,
     width: f64,
-    buffers: HashMap<String, DType>,
+    buffers: HashMap<String, &'static dyn Form>,
     shared: Vec<String>,
     tiles: HashMap<String, (usize, usize)>,
     /// Global loads this statement has made, which repeats share.
@@ -146,7 +146,7 @@ impl Counter {
         }
     }
 
-    fn global(&self, e: &Expr) -> Option<DType> {
+    fn global(&self, e: &Expr) -> Option<&'static dyn Form> {
         match e {
             Expr::Var(name) => self.buffers.get(name).copied(),
             _ => None,
@@ -180,11 +180,11 @@ impl Counter {
             }
             Expr::Index(base, at) => {
                 self.expr(at);
-                if let Some(dtype) = self.global(base) {
+                if let Some(form) = self.global(base) {
                     // The compiler loads a repeated element once.
                     if !self.seen.contains(e) {
                         self.seen.push(e.clone());
-                        self.load(at, dtype.bytes() as f64);
+                        self.load(at, form.bytes(1) as f64);
                     }
                 } else if matches!(&**base, Expr::Var(n) if self.shared.contains(n)) {
                     self.add(Ops {
@@ -242,7 +242,7 @@ impl Counter {
                         true
                     }
                     Intrinsic::Load4 => {
-                        let bytes = self.global(&args[0]).map_or(4, DType::bytes) as f64;
+                        let bytes = self.global(&args[0]).map_or(4, |f| f.bytes(1)) as f64;
                         let (at, mut l) = (&args[1], self.loops.pop());
                         // Four elements move the address by one of them.
                         let fresh = match &mut l {
@@ -436,8 +436,8 @@ impl Body {
             ..Counter::default()
         };
         for param in &self.params {
-            if let Param::Buffer { name, dtype, .. } = param {
-                c.buffers.insert(name.clone(), *dtype);
+            if let Param::Buffer { name, form, .. } = param {
+                c.buffers.insert(name.clone(), *form);
             }
         }
         c.stmts(&self.stmts);

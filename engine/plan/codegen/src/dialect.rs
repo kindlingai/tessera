@@ -37,6 +37,7 @@ typedef unsigned short u16;
 #define f_group(ty, name, n) threadgroup ty name[n]
 #define f_f32x4(p) (*(device float4 *)(p))
 #define f_u32x2(p) (*(device const uint2 *)(p))
+#define f_make4(a, b, c, d) float4(a, b, c, d)
 
 ";
 
@@ -61,6 +62,7 @@ typedef unsigned short u16;
 #define f_group(ty, name, n) __shared__ ty name[n]
 #define f_f32x4(p) (*(float4 *)(p))
 #define f_u32x2(p) (*(const uint2 *)(p))
+#define f_make4(a, b, c, d) make_float4(a, b, c, d)
 
 ";
 

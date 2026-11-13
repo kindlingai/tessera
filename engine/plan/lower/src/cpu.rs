@@ -61,7 +61,7 @@ impl Runner {
         let mut args = Vec::with_capacity(launch.args.len());
         for (arg, param) in launch.args.iter().zip(&body.params) {
             args.push(match (arg, param) {
-                (Arg::Buffer(slot, skip), Param::Buffer { dtype, .. }) => {
+                (Arg::Buffer(slot, skip), Param::Buffer { form, .. }) => {
                     let at = match buffers.iter().position(|b| *b == slot.buffer) {
                         Some(at) => at,
                         None => {
@@ -69,11 +69,11 @@ impl Runner {
                             buffers.len() - 1
                         }
                     };
-                    let skip = slot.start() / dtype.bytes() + skip;
+                    let skip = slot.start() / form.bytes(1) + skip;
                     ArgVal::Buf {
                         at,
                         skip,
-                        dtype: *dtype,
+                        form: *form,
                     }
                 }
                 (Arg::U32(v), _) => ArgVal::U32(*v),

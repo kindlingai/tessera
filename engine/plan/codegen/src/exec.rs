@@ -1,8 +1,8 @@
 //! Runs a body on the host, each group in lockstep.
 
+use crate::form::Form;
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
 use crate::numerics::Precision;
-use graph::DType;
 use std::collections::HashMap;
 
 /// One argument of a launch, as the host sees it.
@@ -12,7 +12,7 @@ pub enum ArgVal {
     Buf {
         at: usize,
         skip: usize,
-        dtype: DType,
+        form: &'static dyn Form,
     },
     U32(u32),
     F32(f32),
@@ -88,7 +88,7 @@ impl Val {
 struct Arg {
     buffer: usize,
     skip: usize,
-    dtype: DType,
+    form: &'static dyn Form,
 }
 
 /// One group's state while it runs.
@@ -127,10 +127,10 @@ impl Group<'_, '_> {
 
     fn arg(&self, name: &str) -> Arg {
         match self.args.get(name) {
-            Some(ArgVal::Buf { at, skip, dtype }) => Arg {
+            Some(ArgVal::Buf { at, skip, form }) => Arg {
                 buffer: *at,
                 skip: *skip,
-                dtype: *dtype,
+                form: *form,
             },
             _ => panic!("`{name}` is not a buffer"),
         }
@@ -139,31 +139,27 @@ impl Group<'_, '_> {
     /// Element `index` of a buffer, widened to the register type.
     fn load(&self, arg: &Arg, index: u64) -> Val {
         let bytes = &self.buffers[arg.buffer];
-        let size = arg.dtype.bytes();
-        let at = (arg.skip + index as usize) * size;
-        let Some(raw) = bytes.get(at..at + size) else {
+        let at = arg.skip + index as usize;
+        if arg.form.bytes(at + 1) > bytes.len() {
             panic!("a read {index} elements past buffer {}", arg.buffer);
-        };
-        match arg.dtype {
-            DType::Bf16 => Val::F(f32::from_bits(
-                u32::from(u16::from_le_bytes([raw[0], raw[1]])) << 16,
-            )),
-            DType::U32 | DType::I32 => Val::U(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
-            _ => Val::F(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+        }
+        match arg.form.dtype().is_float() {
+            true => Val::F(arg.form.unpack(bytes, at)),
+            false => Val::U(arg.form.unpack(bytes, at) as u32),
         }
     }
 
+    /// Writes store f32 or ids. No form packs them.
     fn store(&mut self, arg: &Arg, index: u64, value: Val) {
-        let size = arg.dtype.bytes();
-        let at = (arg.skip + index as usize) * size;
+        let at = (arg.skip + index as usize) * 4;
         let bytes = &mut self.buffers[arg.buffer];
-        let Some(raw) = bytes.get_mut(at..at + size) else {
+        let Some(raw) = bytes.get_mut(at..at + 4) else {
             panic!("a write {index} elements past buffer {}", arg.buffer);
         };
-        match arg.dtype {
-            DType::U32 | DType::I32 => raw.copy_from_slice(&value.u().to_le_bytes()),
-            DType::Bf16 => panic!("kernels write floats, not bf16"),
-            _ => raw.copy_from_slice(&value.f().to_le_bytes()),
+        match arg.form.dtype().is_float() {
+            true if arg.form.narrow() => panic!("kernels write only f32"),
+            true => raw.copy_from_slice(&value.f().to_le_bytes()),
+            false => raw.copy_from_slice(&value.u().to_le_bytes()),
         }
     }
 

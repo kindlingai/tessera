@@ -5,8 +5,8 @@ use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    BinOp, Error, Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, Pat, PathArguments, Stmt,
-    Type, UnOp, parse_macro_input,
+    BinOp, Error, Expr, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Pat, PathArguments,
+    Stmt, Type, UnOp, parse_macro_input,
 };
 
 type Res = Result<Tokens, Error>;
@@ -47,14 +47,21 @@ fn tree(f: &mut ItemFn) -> Res {
         };
         let name = ident.ident.to_string();
         let at_build = p.attrs.iter().any(|a| a.path().is_ident("build"));
-        p.attrs.retain(|a| !a.path().is_ident("build"));
+        let form = p
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("form"))
+            .map(|a| a.parse_args::<Ident>())
+            .transpose()?;
+        p.attrs
+            .retain(|a| !a.path().is_ident("build") && !a.path().is_ident("form"));
         match at_build {
             true => {
                 let (ident, ty) = (&ident.ident, &p.ty);
                 build.push(quote!(#ident: #ty));
                 ctx.build.push(name);
             }
-            false => params.push(param(&name, &p.ty)?),
+            false => params.push(param(&name, &p.ty, form)?),
         }
     }
     let stmts = block(&f.block.stmts, &ctx)?;
@@ -72,27 +79,29 @@ fn tree(f: &mut ItemFn) -> Res {
     })
 }
 
-fn param(name: &str, ty: &Type) -> Res {
+/// `#[form(f)]` on a `Buf<Dyn>` reads build parameter `f`.
+fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
     let Type::Path(path) = ty else {
         return Err(Error::new(ty.span(), "a buffer or scalar type"));
     };
     let last = path.path.segments.last().expect("a type");
     let head = last.ident.to_string();
-    let form = |args: &PathArguments| match args {
-        PathArguments::AngleBracketed(a) => match a.args.first() {
-            Some(GenericArgument::Type(t)) => Ok(quote!(<#t as codegen::prelude::Form>::DTYPE)),
+    let form = |args: &PathArguments| match (&picked, args) {
+        (Some(f), _) => Ok(quote!(#f)),
+        (None, PathArguments::AngleBracketed(a)) => match a.args.first() {
+            Some(GenericArgument::Type(t)) => Ok(quote!(<#t as codegen::prelude::Form>::FORM)),
             _ => Err(Error::new(a.span(), "a form, like `F32` or `F`")),
         },
         _ => Err(Error::new(last.span(), "`Buf<F>` names its form")),
     };
     Ok(match head.as_str() {
         "Buf" => {
-            let dtype = form(&last.arguments)?;
-            quote!(Param::Buffer { name: #name.into(), dtype: #dtype, writes: false })
+            let form = form(&last.arguments)?;
+            quote!(Param::Buffer { name: #name.into(), form: #form, writes: false })
         }
         "BufMut" => {
-            let dtype = form(&last.arguments)?;
-            quote!(Param::Buffer { name: #name.into(), dtype: #dtype, writes: true })
+            let form = form(&last.arguments)?;
+            quote!(Param::Buffer { name: #name.into(), form: #form, writes: true })
         }
         _ => {
             let ty = scalar(ty)?;
