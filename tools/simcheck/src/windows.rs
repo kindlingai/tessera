@@ -1,6 +1,6 @@
 //! Cutting source files into windows that start at content anchors.
 
-use crate::shape::shape;
+use shape::shape;
 
 /// Lines `line..line + window` of `path`, trimmed and joined.
 pub struct Window {

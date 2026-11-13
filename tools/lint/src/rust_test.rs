@@ -74,3 +74,9 @@ fn test_file_names() {
     assert!(is_test_file("crates/x/src/ops_test.rs"));
     assert!(!is_test_file("crates/x/src/tests.rs"));
 }
+
+#[test]
+fn path_mods_fail() {
+    let text = "#[path = \"../x.rs\"]\nmod x;\nmod y {}\n";
+    assert_eq!(rules("a.rs", text), ["path-attr"]);
+}

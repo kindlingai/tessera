@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::files::Source;
-use crate::shape::shape;
 use crate::{LIMITS, Violation};
+use shape::shape;
 
 /// Shapes longer than this count as code.
 const SUBSTANTIVE: usize = 3;

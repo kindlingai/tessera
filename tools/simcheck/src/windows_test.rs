@@ -1,5 +1,5 @@
-use crate::shape::shape;
 use crate::windows::{cut, overlap};
+use shape::shape;
 
 const SPACING: usize = 7;
 

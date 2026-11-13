@@ -1,4 +1,4 @@
-//! Line shapes. tools/simcheck includes this file by path.
+//! Line shapes, for tools/lint and tools/simcheck.
 
 use std::iter::Peekable;
 use std::str::Chars;

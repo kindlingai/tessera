@@ -7,7 +7,6 @@ mod macros;
 mod names;
 mod runs;
 mod rust;
-mod shape;
 mod share;
 
 #[cfg(test)]

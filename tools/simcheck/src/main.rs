@@ -4,8 +4,6 @@ mod cache;
 mod fetch;
 mod pairs;
 mod report;
-#[path = "../../lint/src/shape.rs"]
-mod shape;
 mod windows;
 
 #[cfg(test)]
