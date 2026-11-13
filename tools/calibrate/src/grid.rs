@@ -190,7 +190,7 @@ impl Grid {
             rows: vec![1, 3],
             widths: vec![16],
             vocabs: vec![300],
-            heads: vec![[4, 2, 8]],
+            heads: vec![[4, 2, 16]],
             spans: vec![[1, 5], [4, 4]],
         }
     }

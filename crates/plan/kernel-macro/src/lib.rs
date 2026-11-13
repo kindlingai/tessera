@@ -236,6 +236,24 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
                 depth: (#depth_expr) as usize,
             }))
         }
+        Expr::MethodCall(m) if m.method == "zero" => {
+            let Expr::Path(acc) = &*m.receiver else {
+                return Err(Error::new(m.receiver.span(), "name the tile sums"));
+            };
+            let acc = quote!(#acc).to_string();
+            Ok(quote!(Stmt::TileZero { acc: #acc.into() }))
+        }
+        Expr::MethodCall(m) if m.method == "scale" => {
+            let Expr::Path(acc) = &*m.receiver else {
+                return Err(Error::new(m.receiver.span(), "name the tile sums"));
+            };
+            let acc = quote!(#acc).to_string();
+            let Some(Expr::Closure(f)) = m.args.first() else {
+                return Err(Error::new(m.span(), "`acc.scale(|r| ..)`"));
+            };
+            let by = expr(&f.body, ctx)?;
+            Ok(quote!(Stmt::TileScale { acc: #acc.into(), by: #by }))
+        }
         Expr::MethodCall(m) if m.method == "each" => {
             let Expr::Path(acc) = &*m.receiver else {
                 return Err(Error::new(m.receiver.span(), "name the tile sums"));
