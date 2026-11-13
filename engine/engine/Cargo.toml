@@ -1,0 +1,25 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Token ids in, token ids out: a stepper graph on a runner"
+
+[features]
+default = []
+cuda = ["lower/cuda", "kernels/cuda"]
+rocm = ["lower/rocm", "kernels/rocm"]
+
+[dependencies]
+graph = { workspace = true }
+interp = { workspace = true }
+kernels = { workspace = true }
+linear = { workspace = true }
+lower = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+gpukit = { workspace = true }
+models = { workspace = true }
+settings = { workspace = true }

@@ -1,7 +1,7 @@
 //! Probes this GPU, times the grid and stores the samples.
 
 use calibrate::probe::{fit, links, read, suite};
-use calibrate::{Grid, headroom, judge, path};
+use calibrate::{Grid, headroom, judge};
 use lower::{Cluster, Device, Settings, Step};
 use sim::{Chip, known};
 use std::error::Error;
@@ -68,7 +68,7 @@ fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     hops(&cluster);
     // The stored device carries the fit, for unmeasured kernels.
     let device = device.fitted(fit).zoned(cluster);
-    let path = path(settings, &device.name).ok_or("no home: set TESSERA_COSTS")?;
+    let path = Device::path(settings, &device.name).ok_or("no home: set TESSERA_COSTS")?;
     device.save(&path)?;
     println!("{} samples in {}", device.samples(), path.display());
     Ok(())

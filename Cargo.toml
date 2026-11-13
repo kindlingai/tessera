@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "engine/engine",
     "engine/gpu/*",
     "engine/ir/*",
     "engine/models",
@@ -22,6 +23,7 @@ calibrate = { path = "tools/calibrate" }
 checkpoint = { path = "frontend/checkpoint" }
 gemm = { path = "engine/gpu/gemm" }
 codegen = { path = "engine/plan/codegen" }
+engine = { path = "engine/engine" }
 settings = { path = "frontend/settings" }
 gpukit = { path = "engine/gpu/gpukit" }
 graph = { path = "engine/ir/graph" }

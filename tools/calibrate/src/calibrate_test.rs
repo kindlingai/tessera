@@ -1,5 +1,5 @@
 use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
-use crate::{Grid, headroom, judge, path};
+use crate::{Grid, headroom, judge};
 use gpukit::testing::scratch;
 use lower::{Device, Settings, rules};
 use settings::read as settings;
@@ -34,7 +34,7 @@ fn grid_reaches_rules() {
         costs: Some(PathBuf::from("costs")),
         ..settings
     };
-    let stored = path(&costs, &device.name).unwrap();
+    let stored = Device::path(&costs, &device.name).unwrap();
     assert!(stored.ends_with(format!("{}.json", device.name.replace(' ', "-"))));
 }
 
