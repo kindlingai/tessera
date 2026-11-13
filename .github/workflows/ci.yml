@@ -72,7 +72,8 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
 
   similarity:
-    # Near-copies of code (tools/simcheck), compared by embeddings.
+    # Near-copies of code (tools/simcheck), compared by embeddings,
+    # and allow.toml pairs that allow nothing.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -130,38 +131,6 @@ jobs:
           path: ${{ runner.temp }}/simcheck.bin
           key: simcheck-${{ github.run_id }}
 
-  stale-allow:
-    # Fails on tools/simcheck/allow.toml pairs that allow nothing.
-    if: ${{ !cancelled() }}
-    needs: similarity
-    runs-on: ubuntu-latest
-    env:
-      SIMCHECK: cargo run -q --release --manifest-path tools/simcheck/Cargo.toml --
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: simcheck
-          workspaces: tools/simcheck
-          save-if: false
-      - id: model
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/eg2-text
-          key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
-      - if: steps.model.outputs.cache-hit != 'true'
-        run: $SIMCHECK fetch "$RUNNER_TEMP/eg2-text"
-      # The similarity job's embeddings, so nothing embeds again.
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/simcheck.bin
-          key: simcheck-${{ github.run_id }}
-          restore-keys: simcheck-
-      - run: $SIMCHECK stale "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin"
-
   platforms:
     # The platform table against nvcc, cuobjdump and clang's amdgcn
     # backend, with no GPU needed.
@@ -185,7 +154,7 @@ jobs:
     # The one check to require: every job above passed, and no
     # human step is pending.
     if: always()
-    needs: [commits, lint, linux, macos, similarity, stale-allow, platforms]
+    needs: [commits, lint, linux, macos, similarity, platforms]
     runs-on: ubuntu-latest
     steps:
       - env:

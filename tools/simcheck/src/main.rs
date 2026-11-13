@@ -24,10 +24,9 @@ use windows::{Window, cut};
 
 const USAGE: &str = "usage: tessera-simcheck fetch <model_dir>
        tessera-simcheck check <model_dir> [cache_file [report_file [link_base]]]
-       tessera-simcheck stale <model_dir> [cache_file]
 
 `check` links report hunks under <link_base> when given.
-`stale` fails on allow.toml pairs that allow nothing.";
+It also fails on allow.toml pairs that allow nothing.";
 
 /// The repository's lint.toml keys this tool reads.
 #[derive(serde::Deserialize)]
@@ -97,17 +96,12 @@ fn embed(model: &Path, wins: &[Window], cache: &mut Cache) -> Result<Vec<Vec<f32
         .collect())
 }
 
-/// Every window and the pairs that score high.
-struct Scan {
-    s: Settings,
-    root: PathBuf,
-    allow: Allow,
-    wins: Vec<Window>,
-    hits: Vec<pairs::Hit>,
-    used: Vec<bool>,
-}
-
-fn scan(model: &Path, cache_file: Option<&Path>) -> Result<Scan> {
+fn check(
+    model: &Path,
+    cache_file: Option<&Path>,
+    report: Option<&Path>,
+    links: Option<&str>,
+) -> Result<bool> {
     let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
     let allow = Allow::parse(include_str!("../allow.toml"))?;
     let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
@@ -122,29 +116,7 @@ fn scan(model: &Path, cache_file: Option<&Path>) -> Result<Scan> {
         cache.save(f, &keys)?;
     }
     let (hits, used) = near(&wins, &embs, s.similar_window, s.max_similarity, &allow);
-    Ok(Scan {
-        s,
-        root,
-        allow,
-        wins,
-        hits,
-        used,
-    })
-}
-
-fn check(
-    model: &Path,
-    cache_file: Option<&Path>,
-    report: Option<&Path>,
-    links: Option<&str>,
-) -> Result<bool> {
-    let Scan {
-        s,
-        root,
-        wins,
-        hits,
-        ..
-    } = scan(model, cache_file)?;
+    let stale = allow.stale(&used);
     for h in &hits {
         let (a, b) = (&wins[h.a], &wins[h.b]);
         println!(
@@ -152,22 +124,15 @@ fn check(
             a.path, a.line, h.score, b.path, b.line, h.count, s.max_similarity
         );
     }
-    if let Some(r) = report {
-        let limits = (s.similar_window, s.max_similarity);
-        let md = report::markdown(&hits, &wins, &root, limits, links)?;
-        std::fs::write(r, md)?;
-    }
-    Ok(hits.is_empty())
-}
-
-/// Fails on allow pairs with no hit at the limit.
-fn stale(model: &Path, cache_file: Option<&Path>) -> Result<bool> {
-    let scan = scan(model, cache_file)?;
-    let stale = scan.allow.stale(&scan.used);
     for (a, b) in &stale {
         println!("tools/simcheck/allow.toml: stale: {a} and {b} are not near-copies");
     }
-    Ok(stale.is_empty())
+    if let Some(r) = report {
+        let limits = (s.similar_window, s.max_similarity);
+        let md = report::markdown(&hits, &stale, &wins, &root, limits, links)?;
+        std::fs::write(r, md)?;
+    }
+    Ok(hits.is_empty() && stale.is_empty())
 }
 
 fn main() -> ExitCode {
@@ -189,8 +154,6 @@ fn main() -> ExitCode {
             Some(Path::new(report)),
             Some(links),
         ),
-        ["stale", dir] => stale(Path::new(dir), None),
-        ["stale", dir, cache] => stale(Path::new(dir), Some(Path::new(cache))),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
