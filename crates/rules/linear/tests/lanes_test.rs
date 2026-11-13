@@ -5,47 +5,13 @@ use kernels as _;
 use linear as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
-use graph::DimName::{self, Ffn, Hidden, Rows};
-use interp::{Tensor, run};
+use graph::DimName::{self, Rows};
+use interp::run;
+
+mod common;
+use common::{Finish, finished, linear, noise};
 use lower::{Device, Dialect, Source, lower, open, rules};
-use trace::{
-    Act, DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights,
-};
-
-#[derive(Weights)]
-struct Layer {
-    #[shape(Hidden, Ffn)]
-    w: Linear,
-}
-
-/// A graph's work on its input and the product.
-type Finish = fn(&trace::Tensor, trace::Tensor) -> trace::Tensor;
-
-/// `k` inputs to `n` outputs, over any number of rows.
-fn linear(k: u64, n: u64) -> Graph {
-    finished(k, n, |_, product| product)
-}
-
-/// The same, with stages after the matmul.
-fn finished(k: u64, n: u64, finish: Finish) -> Graph {
-    let fixed = |name, n| Dim {
-        name,
-        size: Size::Fixed(n),
-    };
-    let size = Size::Bounded(64);
-    let rows = Dim { name: Rows, size };
-    let m = Model::new(vec![rows, fixed(Hidden, k), fixed(Ffn, n)]);
-    let w: Layer = trace::declare(&m);
-    let ty = TensorType::new([Rows, Hidden], DType::F32);
-    let role = Role::Logits;
-    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
-    m.finish([(Role::Logits, &finish(&x, x.matmul(&w.w)))])
-}
-
-fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
-    let data = (0..shape.iter().product()).map(|_| noise.draw()).collect();
-    Tensor::f32(shape, data)
-}
+use trace::Act;
 
 #[test]
 fn rule_registers() {

@@ -5,7 +5,7 @@ use crate::cost::Device;
 use crate::form::Stored;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{Append, Move, Widen};
-use crate::rule::{Draft, Read, Rule, rules};
+use crate::rule::{Draft, Read, Rule, rules, ways};
 use crate::tree::{T, Term, Tree, unsupported};
 use graph::{DType, DimExpr, DimName, Graph, NodeId};
 use std::collections::{BTreeSet, HashMap};
@@ -183,30 +183,33 @@ impl Cover<'_> {
                 continue;
             }
             offered.push(rule.name);
-            if self.swallows(rule, t, &drafts) {
-                continue;
-            }
-            let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
-            let mut cost: f64 = drafts.iter().map(seconds).sum();
-            cost += self.widening(zone, &drafts);
-            let below: Option<f64> = reads(&drafts).into_iter().map(|r| self.need(r, zone)).sum();
-            let Some(below) = below else {
-                continue;
-            };
-            cost += below;
-            // A favored rule wins here. Readers see its true cost.
-            let favored = self.device.favors(rule.name);
-            let beaten = |b: &Choice| match self.device.favors(b.rule) {
-                true => false,
-                false => favored || cost < b.cost,
-            };
-            if best.as_ref().is_none_or(beaten) {
-                best = Some(Choice {
-                    rule: rule.name,
-                    drafts,
-                    cost,
-                    offered: Vec::new(),
-                });
+            for drafts in ways(drafts) {
+                if self.swallows(rule, t, &drafts) {
+                    continue;
+                }
+                let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
+                let mut cost: f64 = drafts.iter().map(seconds).sum();
+                cost += self.widening(zone, &drafts);
+                let below = reads(&drafts).into_iter().map(|r| self.need(r, zone));
+                let Some(below) = below.sum::<Option<f64>>() else {
+                    continue;
+                };
+                cost += below;
+                // A favored rule wins here. Readers see its true cost.
+                let favored = self.device.favors(rule.name);
+                let beaten = |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {
+                    (true, _) => cost < b.cost,
+                    (false, true) => false,
+                    (false, false) => favored || cost < b.cost,
+                };
+                if best.as_ref().is_none_or(beaten) {
+                    best = Some(Choice {
+                        rule: rule.name,
+                        drafts,
+                        cost,
+                        offered: Vec::new(),
+                    });
+                }
             }
         }
         best.map(|b| Choice { offered, ..b })

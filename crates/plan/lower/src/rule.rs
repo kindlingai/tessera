@@ -98,6 +98,8 @@ pub struct Draft {
     pub kernel: KernelRef,
     pub reads: Vec<Read>,
     pub len: usize,
+    /// Drafts sharing a choice form one way. The cheapest wins.
+    pub choice: usize,
 }
 
 impl Draft {
@@ -110,8 +112,27 @@ impl Draft {
             kernel: KernelRef::new(kernel),
             reads: reads.into_iter().map(Into::into).collect(),
             len,
+            choice: 0,
         }
     }
+
+    /// The same draft, as part of way `choice`.
+    pub fn choice(mut self, choice: usize) -> Self {
+        self.choice = choice;
+        self
+    }
+}
+
+/// A rule's drafts grouped into ways, in first-seen order.
+pub fn ways(drafts: Vec<Draft>) -> Vec<Vec<Draft>> {
+    let mut ways: Vec<(usize, Vec<Draft>)> = Vec::new();
+    for d in drafts {
+        match ways.iter_mut().find(|(c, _)| *c == d.choice) {
+            Some((_, way)) => way.push(d),
+            None => ways.push((d.choice, vec![d])),
+        }
+    }
+    ways.into_iter().map(|(_, way)| way).collect()
 }
 
 /// Launches for a tree node, covering nodes above their reads.

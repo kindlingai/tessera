@@ -2,39 +2,22 @@
 
 // The other matmul rules come from here.
 use kernels as _;
-use linear as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
-use graph::DimName::{Ffn, Hidden, Rows};
+use graph::DimName::Rows;
 use interp::{Tensor, run};
+
+mod common;
+use common::{Finish, finished, linear, noise};
+use linear::{SCHEDULES, Schedule};
 use lower::{Device, Dialect, Pins, Source, lower, open, round, rules};
-use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights};
+use trace::{Act, DType};
 
-#[derive(Weights)]
-struct Layer {
-    #[shape(Hidden, Ffn)]
-    w: Linear,
-}
-
-/// `k` inputs to `n` outputs, over any number of rows.
-fn linear(k: u64, n: u64) -> Graph {
-    let fixed = |name, n| Dim {
-        name,
-        size: Size::Fixed(n),
-    };
-    let size = Size::Bounded(256);
-    let rows = Dim { name: Rows, size };
-    let m = Model::new(vec![rows, fixed(Hidden, k), fixed(Ffn, n)]);
-    let w: Layer = trace::declare(&m);
-    let ty = TensorType::new([Rows, Hidden], DType::F32);
-    let role = Role::Logits;
-    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
-    m.finish([(Role::Logits, &x.matmul(&w.w))])
-}
-
-fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
-    let data = (0..shape.iter().product()).map(|_| noise.draw()).collect();
-    Tensor::f32(shape, data)
+/// A device that can only choose schedule `at`.
+fn only(at: usize) -> Device {
+    let others = SCHEDULES.iter().enumerate().filter(|(i, _)| *i != at);
+    let bar = |d: Device, (_, s): (usize, &Schedule)| d.without(s.names[0]).without(s.names[1]);
+    others.fold(Device::guess().favoring("tiled"), bar)
 }
 
 #[test]
@@ -43,7 +26,8 @@ fn rule_registers() {
     let g = linear(72, 50);
     let plan = lower(&g, 0, &[(Rows, 37)], &Device::guess().favoring("tiled")).unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-    assert_eq!(names, ["tiled"]);
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("tiled_"), "{names:?}");
     let Source::Made(text) = plan.steps[0].kernel.source() else {
         panic!("tiled is generated");
     };
@@ -76,23 +60,51 @@ fn tiles_match_cpu() {
             let rounded = w.floats().unwrap().iter().map(|x| round(form, *x));
             let weights = [Tensor::f32(w.shape.clone(), rounded.collect())];
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-            let device = Device::guess().favoring("tiled");
-            let device = device.pinned(Pins::all(form));
-            let plan = lower(&g, 0, &[(Rows, m)], &device).unwrap();
-            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-            let name = match form {
-                DType::Bf16 => "tiled_bf16",
-                _ => "tiled",
-            };
-            assert_eq!(names, [name]);
-            let mut runner = open(plan).unwrap();
-            runner.load(0, weights[0].view()).unwrap();
-            let got = runner.run(&[x.view()]).unwrap().remove(0);
-            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-            assert!(off < 1e-3, "{m}x{n}x{k} {form:?}: off by {off:e}");
-            let seconds = runner.run_timed(&[x.view()]).unwrap()[0];
-            let rate = 2.0 * (m * n * k) as f64 / seconds / 1e12;
-            eprintln!("{m}x{n}x{k} {form:?}: {rate:.2} TFLOP/s, off by {off:.2e}");
+            for (at, schedule) in SCHEDULES.iter().enumerate() {
+                let device = only(at).pinned(Pins::all(form));
+                let plan = lower(&g, 0, &[(Rows, m)], &device).unwrap();
+                let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                let name = schedule.names[(form == DType::Bf16) as usize];
+                assert_eq!(names, [name]);
+                let mut runner = open(plan).unwrap();
+                runner.load(0, weights[0].view()).unwrap();
+                let got = runner.run(&[x.view()]).unwrap().remove(0);
+                let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+                let seconds = runner.run_timed(&[x.view()]).unwrap()[0];
+                let rate = 2.0 * (m * n * k) as f64 / seconds / 1e12;
+                eprintln!("{m}x{n}x{k} {name}: {rate:.2} TFLOP/s, off by {off:.2e}");
+                assert!(off < 1e-3, "{m}x{n}x{k} {name}: off by {off:e}");
+            }
         }
+    }
+}
+
+#[test]
+fn stages_ride_along() {
+    if !backend_ready() {
+        return eprintln!("no GPU here; skipped");
+    }
+    let mut draws = Noise(31);
+    // The sum as an operand, then as the chain's input.
+    let residual: Finish = |x, product| x.add(&product);
+    let gate: Finish = |x, product| product.act(Act::Silu).mul(x);
+    for finish in [residual, gate] {
+        let g = finished(48, 48, finish);
+        let weights = [noise(vec![48, 48], &mut draws)];
+        let x = noise(vec![70, 48], &mut draws);
+        let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
+        let device = Device::guess().favoring("tiled");
+        let plan = lower(&g, 0, &[(Rows, 70)], &device).unwrap();
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+        assert!(
+            names.len() == 1 && names[0].starts_with("tiled_"),
+            "{names:?}"
+        );
+        assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
+        let mut runner = open(plan).unwrap();
+        runner.load(0, weights[0].view()).unwrap();
+        let got = runner.run(&[x.view()]).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-3, "fused chain off by {off:e}");
     }
 }
