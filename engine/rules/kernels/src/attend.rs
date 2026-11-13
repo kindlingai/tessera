@@ -13,6 +13,57 @@ const THREADS: u32 = 256;
 /// The widest head: two sums per thread.
 const WIDEST: u32 = 2 * THREADS;
 
+/// Every thread's share of a dot product, summed through `red`.
+#[kernel]
+fn group_dot(
+    q: Buf<F32>,
+    k: Buf<F32>,
+    q_off: u64,
+    k_off: u64,
+    width: u32,
+    red: &mut Shared<f32>,
+) -> f32 {
+    let mut partial = 0.0f32;
+    for d in (lid()..width).by(THREADS) {
+        partial += q[q_off + d as u64] * k[k_off + d as u64];
+    }
+    red[lid()] = partial;
+    barrier();
+    for level in 0..8 {
+        let span = 128 >> level;
+        if lid() < span {
+            red[lid()] += red[lid() + span];
+        }
+        barrier();
+    }
+    let dot = red[0];
+    barrier();
+    dot
+}
+
+/// Folds a value row into `acc`, scaled by `corr` first.
+#[kernel]
+fn fold_value(acc: &mut [f32; 2], corr: f32, p: f32, v: Buf<F32>, v_off: u64, width: u32) {
+    for i in 0..2 {
+        let d = lid() + i * THREADS;
+        if d < width {
+            acc[i as usize] = acc[i as usize] * corr + p * v[v_off + d as u64];
+        }
+    }
+}
+
+/// Writes `acc` over `l` as the output row.
+#[kernel]
+fn write_row(acc: &mut [f32; 2], mut out: BufMut<F32>, q_off: u64, l: f32, width: u32) {
+    let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+    for i in 0..2 {
+        let d = lid() + i * THREADS;
+        if d < width {
+            out[q_off + d as u64] = acc[i as usize] * inv;
+        }
+    }
+}
+
 /// A group per query and head shares each dot product.
 #[kernel]
 fn attend(
@@ -47,41 +98,16 @@ fn attend(
     for t in 0..last {
         // A joined row: every head's key, then every head's value.
         let k_off = ((t * kv_heads * 2 + kvh) * width) as u64;
-        let mut partial = 0.0f32;
-        for d in (lid()..width).by(THREADS) {
-            partial += q[q_off + d as u64] * kv[k_off + d as u64];
-        }
-        red[lid()] = partial;
-        barrier();
-        for level in 0..8 {
-            let span = 128 >> level;
-            if lid() < span {
-                red[lid()] += red[lid() + span];
-            }
-            barrier();
-        }
-        let dot = red[0];
-        barrier();
+        let dot = group_dot(q, kv, q_off, k_off, width, &mut red);
         let m_new = max(m, dot);
         let corr = exp(m - m_new);
         let p = exp(dot - m_new);
         m = m_new;
         l = l * corr + p;
         let v_off = k_off + (kv_heads * width) as u64;
-        for i in 0..2 {
-            let d = lid() + i * THREADS;
-            if d < width {
-                acc[i as usize] = acc[i as usize] * corr + p * kv[v_off + d as u64];
-            }
-        }
+        fold_value(&mut acc, corr, p, kv, v_off, width);
     }
-    let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
-    for i in 0..2 {
-        let d = lid() + i * THREADS;
-        if d < width {
-            out[q_off + d as u64] = acc[i as usize] * inv;
-        }
-    }
+    write_row(&mut acc, out, q_off, l, width);
 }
 
 /// A group per query row and head, within its slot.
@@ -122,40 +148,15 @@ fn attend_rows(
     };
     for t in 0..last {
         let kv_off = (((slot * stride + t) * kv_heads + kvh) * width) as u64;
-        let mut partial = 0.0f32;
-        for d in (lid()..width).by(THREADS) {
-            partial += q[q_off + d as u64] * k[kv_off + d as u64];
-        }
-        red[lid()] = partial;
-        barrier();
-        for level in 0..8 {
-            let span = 128 >> level;
-            if lid() < span {
-                red[lid()] += red[lid() + span];
-            }
-            barrier();
-        }
-        let dot = red[0];
-        barrier();
+        let dot = group_dot(q, k, q_off, kv_off, width, &mut red);
         let m_new = max(m, dot);
         let corr = exp(m - m_new);
         let p = exp(dot - m_new);
         m = m_new;
         l = l * corr + p;
-        for i in 0..2 {
-            let d = lid() + i * THREADS;
-            if d < width {
-                acc[i as usize] = acc[i as usize] * corr + p * v[kv_off + d as u64];
-            }
-        }
+        fold_value(&mut acc, corr, p, v, kv_off, width);
     }
-    let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
-    for i in 0..2 {
-        let d = lid() + i * THREADS;
-        if d < width {
-            out[q_off + d as u64] = acc[i as usize] * inv;
-        }
-    }
+    write_row(&mut acc, out, q_off, l, width);
 }
 
 /// Scaled query rows over kept keys, by slot and position.
