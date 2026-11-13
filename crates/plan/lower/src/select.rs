@@ -350,12 +350,16 @@ impl Emit {
             taken.push(self.widen(v, i, &*d.kernel));
         }
         let reads = taken;
-        let key = (format!("{:?}", d.kernel), reads.clone());
-        if let Some(same) = self.shared.get(&key).filter(|_| d.kernel.shared()) {
+        // Printing kernels is slow, so shared ones alone are keyed.
+        let key = d
+            .kernel
+            .shared()
+            .then(|| (format!("{:?}", d.kernel), reads.clone()));
+        if let Some(same) = key.as_ref().and_then(|k| self.shared.get(k)) {
             return *same;
         }
         let write = self.value(d.len, Home::Temp, zone, dtype);
-        if d.kernel.shared() {
+        if let Some(key) = key {
             self.shared.insert(key, write);
         }
         self.out.ops.push(Op {

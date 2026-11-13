@@ -4,7 +4,7 @@ use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
 use gpukit::testing::{backend_ready, cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
-use lower::{DType, Device, Pins, Plan, Run, lower, open, select};
+use lower::{Cache, DType, Device, Pins, Plan, Run, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -113,6 +113,8 @@ struct Gpu<'a> {
     device: Device,
     /// Launches this run timed for lack of a stored sample.
     learned: usize,
+    /// Plans by sizes, reused where a launch repeats.
+    plans: Cache,
 }
 
 /// One sequence's launch: its new tokens after `past` rows.
@@ -205,6 +207,7 @@ impl<'a> Gpu<'a> {
             runner,
             device,
             learned: 0,
+            plans: Cache::default(),
         }
     }
 
@@ -227,7 +230,7 @@ impl<'a> Gpu<'a> {
 
     /// Lowers this launch for `device` and feeds it.
     fn plan(&mut self, g: &Graph, rows: Span, device: &Device) {
-        let plan = lower(g, 0, &rows.sizes(), device).unwrap();
+        let plan = self.plans.lower(g, 0, &rows.sizes(), device).unwrap();
         self.runner.replan(plan).unwrap();
         let [tokens, positions] = rows.tensors();
         self.runner
@@ -245,6 +248,8 @@ impl<'a> Gpu<'a> {
         let file = path(&self.device.name);
         let (learned, all) = (self.learned, self.device.samples());
         eprintln!("timed {learned} launches; {all} samples known");
+        let (kept, hits) = (self.plans.len(), self.plans.hits);
+        eprintln!("plans: {kept} lowered, {hits} reused");
         if learned > 0 {
             self.device.save(&file).unwrap();
             eprintln!("  stored in {}", file.display());
@@ -383,7 +388,7 @@ mod decode {
     /// Runs one launch. Returns indices, then planning and running seconds.
     fn launch(gpu: &mut Gpu, g: &Graph, rows: Span, device: &Device) -> (Vec<u32>, [f64; 2]) {
         let start = Instant::now();
-        let plan = lower(g, 0, &rows.sizes(), device).unwrap();
+        let plan = gpu.plans.lower(g, 0, &rows.sizes(), device).unwrap();
         let out = plan.outputs[0].slot;
         gpu.runner.replan(plan).unwrap();
         let planning = start.elapsed().as_secs_f64();

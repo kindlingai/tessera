@@ -24,8 +24,9 @@ pub struct Runner {
     plan: Plan,
     held: Held,
     pipelines: Vec<Rc<ComputePipeline>>,
-    /// Compiled generated kernels, by entry.
+    /// Compiled kernels, by entry, and by how a kernel prints.
     made: HashMap<String, Rc<ComputePipeline>>,
+    known: HashMap<String, Rc<ComputePipeline>>,
 }
 
 fn gpu(what: &'static str) -> Error {
@@ -54,6 +55,7 @@ impl Runner {
             held: Held::default(),
             pipelines: Vec::new(),
             made: HashMap::new(),
+            known: HashMap::new(),
         };
         runner.replan(plan)?;
         Ok(runner)
@@ -139,19 +141,28 @@ impl Run for Runner {
         })?;
         self.pipelines.clear();
         for step in &plan.steps {
-            let text = match step.kernel.source() {
-                Source::Fixed { metal, entry, .. } => {
-                    let fixed = gpukit::metal::cached_pipeline(ctx, metal, entry)?;
-                    self.pipelines.push(fixed);
-                    continue;
-                }
-                Source::Made(text) => text,
-            };
-            if !self.made.contains_key(&text.entry) {
-                let compiled = ctx.compile_kernel(&text.render(Dialect::Metal), &text.entry)?;
-                self.made.insert(text.entry.clone(), Rc::new(compiled));
+            // Printing a kernel is cheaper than writing its source.
+            let key = format!("{:?}", step.kernel);
+            if let Some(pipeline) = self.known.get(&key) {
+                self.pipelines.push(Rc::clone(pipeline));
+                continue;
             }
-            self.pipelines.push(Rc::clone(&self.made[&text.entry]));
+            let pipeline = match step.kernel.source() {
+                Source::Fixed { metal, entry, .. } => {
+                    gpukit::metal::cached_pipeline(ctx, metal, entry)?
+                }
+                Source::Made(text) => match self.made.get(&text.entry) {
+                    Some(compiled) => Rc::clone(compiled),
+                    None => {
+                        let source = text.render(Dialect::Metal);
+                        let compiled = Rc::new(ctx.compile_kernel(&source, &text.entry)?);
+                        self.made.insert(text.entry.clone(), Rc::clone(&compiled));
+                        compiled
+                    }
+                },
+            };
+            self.known.insert(key, Rc::clone(&pipeline));
+            self.pipelines.push(pipeline);
         }
         self.plan = plan;
         Ok(())

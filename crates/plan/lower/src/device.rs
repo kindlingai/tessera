@@ -23,8 +23,9 @@ macro_rules! device_runner {
                 plan: Plan,
                 held: Held,
                 kernels: Vec<Kernel>,
-                /// Compiled generated kernels, by entry.
+                /// Compiled kernels, by entry, and by how a kernel prints.
                 made: HashMap<String, Kernel>,
+                known: HashMap<String, Kernel>,
             }
 
             impl Runner {
@@ -35,6 +36,7 @@ macro_rules! device_runner {
                         held: Held::default(),
                         kernels: Vec::new(),
                         made: HashMap::new(),
+                        known: HashMap::new(),
                     };
                     runner.replan(plan)?;
                     Ok(runner)
@@ -96,18 +98,26 @@ macro_rules! device_runner {
                     })?;
                     self.kernels.clear();
                     for step in &plan.steps {
-                        let text = match step.kernel.source() {
-                            Source::Fixed { cuda, entry, .. } => {
-                                self.kernels.push(cached_source_kernel(cuda, entry)?);
-                                continue;
-                            }
-                            Source::Made(text) => text,
-                        };
-                        if !self.made.contains_key(&text.entry) {
-                            let compiled = ctx.compile(&text.render(Dialect::Cuda), &text.entry)?;
-                            self.made.insert(text.entry.clone(), compiled);
+                        // Printing a kernel is cheaper than writing its source.
+                        let key = format!("{:?}", step.kernel);
+                        if let Some(kernel) = self.known.get(&key) {
+                            self.kernels.push(kernel.clone());
+                            continue;
                         }
-                        self.kernels.push(self.made[&text.entry].clone());
+                        let kernel = match step.kernel.source() {
+                            Source::Fixed { cuda, entry, .. } => cached_source_kernel(cuda, entry)?,
+                            Source::Made(text) => match self.made.get(&text.entry) {
+                                Some(compiled) => compiled.clone(),
+                                None => {
+                                    let source = text.render(Dialect::Cuda);
+                                    let compiled = ctx.compile(&source, &text.entry)?;
+                                    self.made.insert(text.entry.clone(), compiled.clone());
+                                    compiled
+                                }
+                            },
+                        };
+                        self.known.insert(key, kernel.clone());
+                        self.kernels.push(kernel);
                     }
                     self.plan = plan;
                     Ok(())

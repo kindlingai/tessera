@@ -5,9 +5,11 @@ use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bumped whenever a stored device changes meaning.
 const VERSION: u32 = 1;
@@ -62,7 +64,7 @@ impl Sample {
 }
 
 /// One device's timed launches, by kernel name.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Device {
     /// The hardware that ran the samples.
     pub name: String,
@@ -84,6 +86,35 @@ pub struct Device {
     /// The form each weight is stored in.
     #[serde(skip)]
     pub pins: Pins,
+    /// Fresh after every change that could alter a plan.
+    #[serde(skip)]
+    generation: u64,
+    /// Estimates already made, by kernel and sizes.
+    #[serde(skip)]
+    memo: RefCell<Memo>,
+}
+
+/// Seconds by kernel name, sizes and work.
+type Memo = HashMap<(&'static str, Vec<usize>, u64), f64>;
+
+/// Each generation is handed out once per process.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
+fn fresh() -> u64 {
+    GENERATIONS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Equal in all they hold. The generation is not held.
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.fit == other.fit
+            && self.cluster == other.cluster
+            && self.timed == other.timed
+            && self.favor == other.favor
+            && self.barred == other.barred
+            && self.pins == other.pins
+    }
 }
 
 /// What every launch is guessed to cost before any work.
@@ -101,19 +132,30 @@ impl Device {
     /// The same device, with a chip model for unmeasured kernels.
     pub fn fitted(mut self, fit: Fit) -> Self {
         (self.fit, self.pool) = (Some(fit), Some(fit.pool("fitted")));
+        self.changed()
+    }
+
+    fn changed(mut self) -> Self {
+        self.generation = fresh();
+        self.memo.get_mut().clear();
         self
+    }
+
+    /// Changes with anything that could alter a plan.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The same device, with weights stored as `pins` say.
     pub fn pinned(mut self, pins: Pins) -> Self {
         self.pins = pins;
-        self
+        self.changed()
     }
 
     /// The same device, over these zones and links.
     pub fn zoned(mut self, cluster: Cluster) -> Self {
         self.cluster = cluster;
-        self
+        self.changed()
     }
 
     pub fn zones(&self) -> u32 {
@@ -129,13 +171,13 @@ impl Device {
     /// The same device, never choosing `kernel`.
     pub fn without(mut self, kernel: &'static str) -> Self {
         self.barred.push(kernel);
-        self
+        self.changed()
     }
 
     /// The same device, always choosing `rule` where it applies.
     pub fn favoring(mut self, rule: &'static str) -> Self {
         self.favor = Some(rule);
-        self
+        self.changed()
     }
 
     pub fn favors(&self, rule: &str) -> bool {
@@ -156,11 +198,17 @@ impl Device {
             return f64::INFINITY;
         }
         let work = k.work(len);
+        let key = (k.name(), k.sizes(), work.to_bits());
+        if let Some(seconds) = self.memo.borrow().get(&key) {
+            return *seconds;
+        }
         let timed = self.timed.get(k.name());
-        let near = timed.and_then(|t| estimate(t, &place(&k.sizes(), work), work));
+        let near = timed.and_then(|t| estimate(t, &place(&key.1, work), work));
         // With no sample of this kernel, the chip model speaks.
         let modelled = || Some(self.pool.as_ref()?.estimate(&k.load(len)?).seconds);
-        near.or_else(modelled).unwrap_or(FIXED + k.guess() * work)
+        let seconds = near.or_else(modelled).unwrap_or(FIXED + k.guess() * work);
+        self.memo.borrow_mut().insert(key, seconds);
+        seconds
     }
 
     /// The least seconds the chip needs for this launch's work.
@@ -200,6 +248,8 @@ impl Device {
 
     /// Adds timed launches. A launch timed before is replaced.
     pub fn fit<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
+        self.generation = fresh();
+        self.memo.get_mut().clear();
         let mut seen: Vec<(&'static str, Sample, Vec<f64>)> = Vec::new();
         for (step, seconds) in samples {
             let sample = Sample::new(step, seconds);
@@ -238,6 +288,7 @@ impl Device {
             s.at = place(&s.sizes, s.work);
         }
         device.pool = device.fit.map(|fit| fit.pool("fitted"));
+        device.generation = fresh();
         Ok(device)
     }
 }
