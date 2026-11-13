@@ -89,10 +89,22 @@ impl Inliner {
         let mut names = HashMap::new();
         for (param, arg) in body.params.iter().zip(args) {
             match param {
-                // Buffers, group memory and tiles pass by name.
-                Param::Buffer { name, .. } | Param::Shared { name, .. } | Param::Tiles { name } => {
+                // Buffers, group memory, tiles and arrays pass by name.
+                Param::Buffer { name, .. }
+                | Param::Shared { name, .. }
+                | Param::Tiles { name }
+                | Param::Array { name, .. } => {
                     let Expr::Var(named) = arg else {
                         panic!("`{}` takes `{name}` by name", body.entry);
+                    };
+                    names.insert(name.clone(), named);
+                }
+                // A name the callee never assigns reads as itself.
+                Param::Scalar { name, .. }
+                    if matches!(arg, Expr::Var(_)) && !assigns(&body.stmts, name) =>
+                {
+                    let Expr::Var(named) = arg else {
+                        unreachable!()
                     };
                     names.insert(name.clone(), named);
                 }
@@ -128,6 +140,16 @@ fn returns(stmts: &[Stmt]) -> bool {
         Stmt::Return => true,
         Stmt::For { body, .. } | Stmt::TileEach { body, .. } => returns(body),
         Stmt::If { then, els, .. } => returns(then) || returns(els),
+        _ => false,
+    })
+}
+
+/// Whether any statement assigns to `name`.
+fn assigns(stmts: &[Stmt], name: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Assign { target, .. } => matches!(target, Expr::Var(n) if n == name),
+        Stmt::For { body, .. } | Stmt::TileEach { body, .. } => assigns(body, name),
+        Stmt::If { then, els, .. } => assigns(then, name) || assigns(els, name),
         _ => false,
     })
 }

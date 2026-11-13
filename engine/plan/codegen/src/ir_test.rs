@@ -96,15 +96,13 @@ fn calls(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
 fn kernels_call() {
     let body = calls_ir();
     let text = body.text().render(Dialect::Cuda);
-    // The first call's names end in 1, the second's 2.
-    assert!(text.contains("u64 at_1 = (u64)at;"));
-    assert!(text.contains("u32 n_1 = (u32)width;"));
-    assert!(text.contains("for (u32 i_1 = 0; i_1 < n_1; i_1 += 1) {"));
-    assert!(text.contains("sum_1 += (x[(at_1 + (u64)i_1)] * x[(at_1 + (u64)i_1)]);"));
+    // Callee locals get the call's number. Passed names stay.
+    assert!(!text.contains("(u64)at;") && !text.contains("(u32)width;"));
+    assert!(text.contains("for (u32 i_1 = 0; i_1 < width; i_1 += 1) {"));
+    assert!(text.contains("sum_1 += (x[(at + (u64)i_1)] * x[(at + (u64)i_1)]);"));
     assert!(text.contains("float inv = f_rsqrt((sum_1 / (float)width));"));
-    assert!(text.contains("float by_2 = (float)inv;"));
     assert!(text.contains("#pragma unroll 2"));
-    assert!(text.contains("out[(at_2 + (u64)i_2)] = (x[(at_2 + (u64)i_2)] * by_2);"));
+    assert!(text.contains("out[(at + (u64)i_2)] = (x[(at + (u64)i_2)] * inv);"));
 
     let rows = [[1.0f32, 2.0, 2.0, 4.0], [3.0, 0.0, 0.0, 4.0]];
     let mut x: Vec<u8> = rows
@@ -159,6 +157,14 @@ fn scale_rows(acc: &mut Tiles, alpha: &Shared<f32>) {
     acc.scale(|r| alpha[r]);
 }
 
+/// Adds `by` to both of a thread's running sums.
+#[kernel]
+fn bump(sums: &mut [f32; 2], by: f32) {
+    for i in 0..2 {
+        sums[i as usize] += by;
+    }
+}
+
 /// Eight threads sum their elements through group memory.
 #[kernel]
 fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
@@ -166,8 +172,10 @@ fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
     red[lid()] = x[gid() as u64];
     barrier();
     let total = tree_sum::<8, 3>(&mut red);
+    let mut sums = [0.0f32; 2];
+    bump(&mut sums, total);
     if lid() == 0 {
-        out[(gid() / 8) as u64] = total;
+        out[(gid() / 8) as u64] = sums[1];
     }
     let mut o = tiles(16, 16);
     let mut alpha = shared::<f32>(16);
@@ -179,11 +187,12 @@ fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
 fn callers_lend_memory() {
     let body = group_sum_ir();
     let text = body.text().render(Dialect::Metal);
-    // The callee's loop is renamed; the caller's memory is not.
+    // The callee's loop is renamed. The caller's memory is not.
     assert!(text.contains("for (u32 level_1 = 0; level_1 < 3; level_1 += 1) {"));
     assert!(text.contains("u32 span_1 = (8 >> (level_1 + 1));"));
     assert!(text.contains("red[lid] += red[(lid + span_1)];"));
     assert!(text.contains("float total = red[0];"));
+    assert!(text.contains("sums[(u32)i_2] += total;"));
     assert!(text.contains("o[i][j][e] *= alpha[r];"));
 
     let mut x: Vec<u8> = (1..=8).flat_map(|v| (v as f32).to_le_bytes()).collect();
