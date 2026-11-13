@@ -39,9 +39,7 @@ impl Kernel for Scatter {
     }
 
     fn source(&self) -> Source {
-        let mut body = scatter_ir();
-        body.entry = "plan_scatter".into();
-        Source::Made(body)
+        Source::named(scatter_ir(), "plan_scatter")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

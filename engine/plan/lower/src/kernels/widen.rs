@@ -34,9 +34,10 @@ impl Kernel for Widen {
     }
 
     fn source(&self) -> Source {
-        let mut body = widen_ir(self.form);
-        body.entry = format!("plan_widen_{}", self.form.name());
-        Source::Made(body)
+        Source::named(
+            widen_ir(self.form),
+            format!("plan_widen_{}", self.form.name()),
+        )
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

@@ -49,9 +49,7 @@ impl Kernel for Softmax {
     }
 
     fn source(&self) -> Source {
-        let mut body = softmax_ir();
-        body.entry = "plan_softmax".into();
-        Source::Made(body)
+        Source::named(softmax_ir(), "plan_softmax")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

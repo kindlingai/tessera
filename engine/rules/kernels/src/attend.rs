@@ -164,22 +164,10 @@ fn attend_rows(
 pub struct AttendRows(pub Attn);
 
 impl Kernel for AttendRows {
-    fn name(&self) -> &'static str {
-        "attend_rows"
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
+    over_attn!("attend_rows");
 
     fn source(&self) -> Source {
-        let mut body = attend_rows_ir();
-        body.entry = "plan_attend_rows".into();
-        Source::Made(body)
+        Source::named(attend_rows_ir(), "plan_attend_rows")
     }
 
     /// One launch over every row.
@@ -216,22 +204,10 @@ impl Kernel for AttendRows {
 pub struct Attend(pub Attn);
 
 impl Kernel for Attend {
-    fn name(&self) -> &'static str {
-        "attend"
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
+    over_attn!("attend");
 
     fn source(&self) -> Source {
-        let mut body = attend_ir();
-        body.entry = "plan_attend".into();
-        Source::Made(body)
+        Source::named(attend_ir(), "plan_attend")
     }
 
     /// One launch per sequence, each at its own offset.

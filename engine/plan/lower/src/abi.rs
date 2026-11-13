@@ -118,6 +118,12 @@ pub enum Source {
 }
 
 impl Source {
+    /// A tree under its own entry name.
+    pub fn named(mut body: Body, entry: impl Into<String>) -> Source {
+        body.entry = entry.into();
+        Source::Made(body)
+    }
+
     /// Changes whenever the kernel's text does.
     pub fn hash(&self) -> u64 {
         match self {

@@ -33,9 +33,21 @@ fn shaped(src: &Source) -> Shaped<'_> {
     out
 }
 
+/// A field or argument line, such as `pub rows: usize,`.
+fn field(shape: &str) -> bool {
+    let name = shape.trim_start_matches('a');
+    (1..=2).contains(&(shape.len() - name.len()))
+        && name.starts_with(':')
+        && !name.starts_with("::")
+        && shape.ends_with(',')
+}
+
 /// False for field lists, tables and runs of mostly braces.
 fn worth(run: &[String]) -> bool {
-    let code = run.iter().filter(|s| s.len() > SUBSTANTIVE).count();
+    let code = run
+        .iter()
+        .filter(|s| s.len() > SUBSTANTIVE && !field(s))
+        .count();
     let repeats = run.windows(2).filter(|w| w[0] == w[1]).count();
     code * 2 >= run.len() && repeats * 2 < run.len()
 }

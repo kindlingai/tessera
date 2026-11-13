@@ -417,17 +417,7 @@ impl Flash {
 }
 
 impl Kernel for Flash {
-    fn name(&self) -> &'static str {
-        "flash"
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
+    over_attn!("flash");
 
     fn load(&self, len: usize) -> Option<Load> {
         let a = &self.0;
@@ -451,9 +441,7 @@ impl Kernel for Flash {
     }
 
     fn source(&self) -> Source {
-        let mut body = self.tree();
-        body.entry = format!("flash_{}", self.0.width);
-        Source::Made(body)
+        Source::named(self.tree(), format!("flash_{}", self.0.width))
     }
 
     /// One launch per sequence, each at its own offset.
@@ -524,17 +512,7 @@ impl FlashRows {
 }
 
 impl Kernel for FlashRows {
-    fn name(&self) -> &'static str {
-        "flash_rows"
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
+    over_attn!("flash_rows");
 
     /// One launch. A block streams keys once per slot.
     fn load(&self, len: usize) -> Option<Load> {
@@ -555,9 +533,7 @@ impl Kernel for FlashRows {
     }
 
     fn source(&self) -> Source {
-        let mut body = self.tree();
-        body.entry = format!("flash_rows_{}", self.0.width);
-        Source::Made(body)
+        Source::named(self.tree(), format!("flash_rows_{}", self.0.width))
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
