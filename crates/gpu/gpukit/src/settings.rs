@@ -22,6 +22,8 @@ pub struct Settings {
     pub costs: Option<PathBuf>,
     /// The Qwen3 reference files the parity test reads.
     pub qwen3: Option<PathBuf>,
+    /// The GPU whose tile rounding the host imitates.
+    pub emulate: Option<Backend>,
 }
 
 impl Default for Settings {
@@ -31,6 +33,7 @@ impl Default for Settings {
             host_lanes: 32,
             costs: None,
             qwen3: None,
+            emulate: None,
         }
     }
 }

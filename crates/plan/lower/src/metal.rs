@@ -217,4 +217,8 @@ impl Run for Runner {
     fn limits(&self) -> gpukit::Limits {
         self.ctx.limits()
     }
+
+    fn precision(&self) -> codegen::Precision {
+        codegen::Precision::METAL
+    }
 }

@@ -1,5 +1,6 @@
 //! The process front: settings read once, passed down.
 
+use gpukit::backend::Backend;
 use gpukit::{Pick, Settings};
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ pub fn settings() -> Settings {
     // `CI` picks the host: hosted macOS runners lack Metal.
     let host = var("TESSERA_BACKEND").as_deref() == Ok("cpu")
         || (cfg!(target_os = "macos") && var_os("CI").is_some());
-    // TESSERA_LANES, TESSERA_COSTS and TESSERA_QWEN3 fill fields.
+    // TESSERA_LANES, TESSERA_COSTS, TESSERA_QWEN3, TESSERA_EMULATE fill fields.
     let lanes = var("TESSERA_LANES").ok().and_then(|v| v.parse().ok());
     let costs = var_os("TESSERA_COSTS")
         .map(PathBuf::from)
@@ -20,5 +21,11 @@ pub fn settings() -> Settings {
         host_lanes: lanes.unwrap_or(32),
         costs,
         qwen3: var_os("TESSERA_QWEN3").map(PathBuf::from),
+        emulate: match var("TESSERA_EMULATE").as_deref() {
+            Ok("metal") => Some(Backend::Metal),
+            Ok("cuda") => Some(Backend::Cuda),
+            Ok("rocm") => Some(Backend::Rocm),
+            _ => None,
+        },
     }
 }

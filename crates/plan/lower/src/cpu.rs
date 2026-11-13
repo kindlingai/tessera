@@ -4,6 +4,7 @@ use crate::Error;
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::plan::Plan;
 use crate::run::{Held, Run};
+use codegen::Precision;
 use codegen::exec::{self, ArgVal, Grid};
 use codegen::ir::{Body, Param};
 use gpukit::Limits;
@@ -21,16 +22,18 @@ pub struct Runner {
     /// Runtime dimensions, as last bound.
     bound: HashMap<DimName, u32>,
     lanes: usize,
+    precision: Precision,
 }
 
 impl Runner {
-    pub fn new(plan: Plan, lanes: usize) -> Result<Self, Error> {
+    pub fn new(plan: Plan, lanes: usize, precision: Precision) -> Result<Self, Error> {
         let mut runner = Self {
             plan: Plan::default(),
             held: Held::default(),
             bodies: Vec::new(),
             bound: HashMap::new(),
             lanes,
+            precision,
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -100,7 +103,7 @@ impl Runner {
         };
         let body = body.clone();
         let mut mapped = self.held.mapped_mut(&buffers);
-        exec::run(&body, &args, &mut mapped, grid, self.lanes);
+        exec::run(&body, &args, &mut mapped, grid, self.lanes, self.precision);
         Ok(())
     }
 }
@@ -172,10 +175,20 @@ impl Run for Runner {
     }
 
     fn device(&self) -> String {
-        format!("cpu {} lanes", self.lanes)
+        let tiles = match self.precision {
+            Precision::EXACT => "",
+            Precision::METAL => ", metal tiles",
+            Precision::CUDA => ", cuda tiles",
+            _ => ", hip tiles",
+        };
+        format!("cpu {} lanes{tiles}", self.lanes)
     }
 
     fn limits(&self) -> Limits {
         limits(self.lanes)
+    }
+
+    fn precision(&self) -> Precision {
+        self.precision
     }
 }

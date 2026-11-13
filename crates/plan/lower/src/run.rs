@@ -2,6 +2,8 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use codegen::Precision;
+use gpukit::backend::Backend;
 use gpukit::{Limits, Settings};
 use graph::DimName;
 use mem::{Buffer, Tensor, View, ViewMut, copy};
@@ -121,6 +123,8 @@ pub trait Run {
     fn device(&self) -> String;
     /// What the hardware gives one group of threads.
     fn limits(&self) -> Limits;
+    /// How the hardware's tiles round.
+    fn precision(&self) -> Precision;
 
     /// Copies `src` into the slot, converting its form if needed.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
@@ -188,6 +192,15 @@ pub trait Run {
     }
 }
 
+/// How `backend`'s tiles round.
+pub fn precision(backend: Backend) -> Precision {
+    match backend {
+        Backend::Metal => Precision::METAL,
+        Backend::Cuda => Precision::CUDA,
+        Backend::Rocm => Precision::HIP,
+    }
+}
+
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
@@ -202,6 +215,7 @@ pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
         _ => Ok(Box::new(crate::cpu::Runner::new(
             plan,
             settings.host_lanes,
+            settings.emulate.map_or(Precision::EXACT, precision),
         )?)),
     }
 }
