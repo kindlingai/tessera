@@ -3,7 +3,8 @@
 use crate::abi::Arg;
 use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
-use crate::kernels::MapStage;
+use crate::kernels::{Map, MapStage};
+use crate::plan::Step;
 use crate::tree::{T, Tree};
 use graph::{DType, Stage};
 
@@ -28,6 +29,26 @@ impl Attn {
     pub fn sizes(&self) -> Vec<usize> {
         let keys = self.keys.most();
         vec![self.seqs, self.queries, keys, self.heads, self.width]
+    }
+
+    /// A ragged launch: six buffers, then its five sizes.
+    pub fn rows_args(&self, step: &Step) -> Vec<Arg> {
+        let buffers = [
+            step.read(0),
+            step.read(1),
+            step.read(2),
+            step.out(),
+            step.read(3),
+            step.read(4),
+        ];
+        let sizes = [
+            Arg::count(self.queries),
+            Arg::size(self.keys),
+            Arg::count(self.stride),
+            Arg::count(self.heads),
+            Arg::count(self.kv_heads),
+        ];
+        buffers.into_iter().chain(sizes).collect()
     }
 
     /// Queries, keys, the keys before the queries, heads, kv heads.
@@ -189,6 +210,25 @@ pub fn rules() -> Vec<&'static Rule> {
 }
 
 impl Site {
+    /// Scales `q`, then runs `kernel` over rows and kept keys.
+    pub fn ragged_drafts(
+        scale: f32,
+        [q, k, v]: [T; 3],
+        [slots, positions]: [T; 2],
+        out: usize,
+        kernel: impl Kernel + 'static,
+    ) -> Vec<Draft> {
+        let scaled = Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out);
+        let reads = [
+            Read::Draft(0),
+            Read::Node(k),
+            Read::Node(v),
+            slots.into(),
+            positions.into(),
+        ];
+        vec![scaled, Draft::new(kernel, reads, out)]
+    }
+
     /// This site as an attention, if it is one.
     pub fn attention(&self) -> Option<Attention> {
         match self {

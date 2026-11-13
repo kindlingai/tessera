@@ -4,7 +4,7 @@ use crate::join::Join;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
+use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Site, Source, Step, T, Tree};
 
 /// Threads in a group: one group per query and head.
 const THREADS: u32 = 256;
@@ -163,7 +163,7 @@ pub struct AttendRows(pub Attn);
 
 impl Kernel for AttendRows {
     fn name(&self) -> &'static str {
-        "attend"
+        "attend_rows"
     }
 
     fn order(&self) -> Order {
@@ -183,24 +183,10 @@ impl Kernel for AttendRows {
     /// One launch over every row.
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let a = &self.0;
-        let sizes = [
-            Arg::count(a.queries),
-            Arg::size(a.keys),
-            Arg::count(a.stride),
-            Arg::count(a.heads),
-            Arg::count(a.kv_heads),
-            Arg::count(a.width),
-        ];
-        let buffers = [
-            step.read(0),
-            step.read(1),
-            step.read(2),
-            step.out(),
-            step.read(3),
-            step.read(4),
-        ];
+        let mut args = a.rows_args(step);
+        args.push(Arg::count(a.width));
         vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
+            args,
             shape: Shape::Grid {
                 across: a.queries * a.heads,
                 down: 1,
@@ -299,16 +285,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let out = sizes.queries * sizes.heads * sizes.width;
     // Ragged rows read the kept keys and values in place.
-    if let Some([slots, positions]) = rows {
-        let scaled = Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out);
-        let reads = [
-            Read::Draft(0),
-            Read::Node(k),
-            Read::Node(v),
-            slots.into(),
-            positions.into(),
-        ];
-        return Some(vec![scaled, Draft::new(AttendRows(sizes), reads, out)]);
+    if let Some(by) = rows {
+        return Some(Site::ragged_drafts(
+            scale,
+            [q, k, v],
+            by,
+            out,
+            AttendRows(sizes),
+        ));
     }
     // Sequences would sit at moving offsets as the keys grow.
     if sizes.keys.runtime() && sizes.seqs > 1 {
