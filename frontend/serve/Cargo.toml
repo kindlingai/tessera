@@ -1,0 +1,31 @@
+[package]
+name = "serve"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "An HTTP front end: text in, streamed text out, over the engine"
+
+[[bin]]
+name = "tessera-serve"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["engine/cuda"]
+rocm = ["engine/rocm"]
+
+[dependencies]
+axum = "0.8"
+checkpoint = { workspace = true }
+engine = { workspace = true }
+graph = { workspace = true }
+interp = { workspace = true }
+lower = { workspace = true }
+models = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+settings = { workspace = true }
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1"

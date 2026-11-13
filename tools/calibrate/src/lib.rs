@@ -13,7 +13,6 @@ use graph::{DimName, Graph};
 use lower::{Device, Error, Run, Settings, Step, View, lower, select};
 use sim::Chip;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 /// Whole passes over a plan, each step timed once.
 const PASSES: usize = 3;
@@ -140,24 +139,6 @@ pub fn headroom(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Headroom> {
         h.bound = h.bound.zip(bound).map(|(sum, b)| sum + b);
     }
     by.into_values().collect()
-}
-
-/// Where this machine keeps the samples for `device`.
-pub fn path(settings: &Settings, device: &str) -> Option<PathBuf> {
-    let plain = |c: char| if c.is_ascii_alphanumeric() { c } else { '-' };
-    let file: String = device.chars().map(plain).collect();
-    Some(settings.costs.as_ref()?.join(format!("{file}.json")))
-}
-
-/// The samples stored for the runner's device, or a guess.
-pub fn stored(runner: &dyn Run, settings: &Settings) -> Result<Device, std::io::Error> {
-    let loaded = path(settings, &runner.device()).map(|p| Device::load(&p));
-    let device = match loaded {
-        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Device::guess(settings),
-        Some(loaded) => loaded?,
-        None => Device::guess(settings),
-    };
-    Ok(device.within(runner.limits()))
 }
 
 #[cfg(test)]

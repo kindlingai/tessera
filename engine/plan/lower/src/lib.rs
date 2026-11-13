@@ -77,6 +77,8 @@ pub enum Error {
     Memory(mem::Error),
     /// A runtime dimension was never bound.
     Unbound,
+    /// A stored device file could not be read.
+    Io(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -87,6 +89,7 @@ impl fmt::Display for Error {
             Error::Gpu(e) => write!(f, "gpu: {e}"),
             Error::Memory(e) => write!(f, "memory: {e}"),
             Error::Unbound => write!(f, "a runtime dimension has no value"),
+            Error::Io(e) => write!(f, "stored samples: {e}"),
         }
     }
 }
@@ -96,6 +99,12 @@ impl std::error::Error for Error {}
 impl From<gpukit::Error> for Error {
     fn from(e: gpukit::Error) -> Self {
         Error::Gpu(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
 
-use calibrate::{headroom, measure, path, stored};
+use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
@@ -201,7 +201,7 @@ impl<'a> Gpu<'a> {
         for (at, w) in c.weights.iter().enumerate() {
             runner.load(at as u32, w.view()).unwrap();
         }
-        let device = stored(&*runner, &c.settings).unwrap();
+        let device = Device::stored(&*runner, &c.settings).unwrap();
         let device = device.pinned(pinned(&c.settings).pins);
         let (name, samples) = (runner.device(), device.samples());
         eprintln!("{name}: {samples} stored samples");
@@ -249,7 +249,7 @@ impl<'a> Gpu<'a> {
     }
 
     fn save(&self) {
-        let file = path(&self.c.settings, &self.device.name).unwrap();
+        let file = Device::path(&self.c.settings, &self.device.name).unwrap();
         let (learned, all) = (self.learned, self.device.samples());
         eprintln!("timed {learned} launches; {all} samples known");
         let (kept, hits) = (self.plans.len(), self.plans.hits);

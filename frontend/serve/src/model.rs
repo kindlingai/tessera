@@ -1,0 +1,92 @@
+//! A model directory as graph, weights, tokenizer and stops.
+
+use checkpoint::File;
+use graph::Graph;
+use interp::{Tensor, bind};
+use models::Stack;
+use models::qwen3::{Config, stepper, tensor_name};
+use serde::Deserialize;
+use std::error::Error;
+use std::path::Path;
+use tokenizers::Tokenizer;
+
+/// What the graph needs from a Hugging Face `config.json`.
+#[derive(Deserialize)]
+struct HfConfig {
+    model_type: String,
+    vocab_size: u64,
+    hidden_size: u64,
+    num_hidden_layers: u64,
+    num_attention_heads: u64,
+    num_key_value_heads: u64,
+    head_dim: u64,
+    intermediate_size: u64,
+    rope_theta: f32,
+    rms_norm_eps: f32,
+}
+
+/// One id or a list, as `generation_config.json` writes it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Ids {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+#[derive(Deserialize)]
+struct Generation {
+    eos_token_id: Option<Ids>,
+}
+
+pub struct Loaded {
+    pub graph: Graph,
+    pub weights: Vec<Tensor>,
+    pub tokenizer: Tokenizer,
+    /// Ids that end an answer.
+    pub stop: Vec<u32>,
+}
+
+/// Reads a Qwen3 directory with `context` rows per sequence.
+pub fn load(dir: &Path, context: u64) -> Result<Loaded, Box<dyn Error + Send + Sync>> {
+    let hf: HfConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+    if hf.model_type != "qwen3" {
+        return Err(format!("{} is not a model this engine traces", hf.model_type).into());
+    }
+    let config = Config {
+        stack: Stack {
+            vocab: hf.vocab_size,
+            hidden: hf.hidden_size,
+            layers: hf.num_hidden_layers,
+            heads: hf.num_attention_heads,
+            head_dim: hf.head_dim,
+            ffn: hf.intermediate_size,
+            max_seqs: 1,
+            max_context: context,
+        },
+        kv_heads: hf.num_key_value_heads,
+        rope_theta: hf.rope_theta,
+        eps: hf.rms_norm_eps,
+    };
+    let graph = stepper(&config);
+    let file = File::open(&dir.join("model.safetensors"))?;
+    let find = |p: &[graph::PathSeg]| {
+        let v = file.floats(&tensor_name(p)?).ok()?;
+        Some(Tensor::f32(vec![v.len()], v))
+    };
+    let weights = bind(&graph, find)?;
+    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+    let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
+        Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
+            Some(Ids::One(id)) => vec![id],
+            Some(Ids::Many(ids)) => ids,
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    Ok(Loaded {
+        graph,
+        weights,
+        tokenizer,
+        stop,
+    })
+}

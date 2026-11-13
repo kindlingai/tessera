@@ -3,13 +3,14 @@
 use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
+use crate::run::Run;
 use gpukit::{Limits, Settings};
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bumped whenever a stored device changes meaning.
@@ -139,6 +140,24 @@ impl Device {
             limits,
             ..Self::default()
         }
+    }
+
+    /// Where this machine keeps the samples for `device`.
+    pub fn path(settings: &Settings, device: &str) -> Option<PathBuf> {
+        let plain = |c: char| if c.is_ascii_alphanumeric() { c } else { '-' };
+        let file: String = device.chars().map(plain).collect();
+        Some(settings.costs.as_ref()?.join(format!("{file}.json")))
+    }
+
+    /// The samples stored for the runner's device, or a guess.
+    pub fn stored(runner: &dyn Run, settings: &Settings) -> Result<Self, Error> {
+        let loaded = Self::path(settings, &runner.device()).map(|p| Self::load(&p));
+        let device = match loaded {
+            Some(Err(e)) if e.kind() == ErrorKind::NotFound => Self::guess(settings),
+            Some(loaded) => loaded?,
+            None => Self::guess(settings),
+        };
+        Ok(device.within(runner.limits()))
     }
 
     /// The same device, within what its hardware gives a group.
