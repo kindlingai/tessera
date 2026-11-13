@@ -1166,6 +1166,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape"
+version = "0.1.0"
+
+[[package]]
 name = "sim"
 version = "0.1.0"
 dependencies = [
@@ -1253,6 +1257,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
+ "shape",
  "syn 2.0.119",
  "toml",
 ]

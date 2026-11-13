@@ -3,26 +3,11 @@ use DimName::*;
 
 fn dims() -> Vec<Dim> {
     vec![
-        Dim {
-            name: Rows,
-            size: Size::Bounded(64),
-        },
-        Dim {
-            name: Context,
-            size: Size::Bounded(64),
-        },
-        Dim {
-            name: Hidden,
-            size: Size::Fixed(8),
-        },
-        Dim {
-            name: Heads,
-            size: Size::Fixed(2),
-        },
-        Dim {
-            name: HeadDim,
-            size: Size::Fixed(4),
-        },
+        Dim::bounded(Rows, 64),
+        Dim::bounded(Context, 64),
+        Dim::fixed(Hidden, 8),
+        Dim::fixed(Heads, 2),
+        Dim::fixed(HeadDim, 4),
     ]
 }
 

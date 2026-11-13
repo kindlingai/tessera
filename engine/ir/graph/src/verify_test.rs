@@ -29,22 +29,10 @@ fn weight(g: &mut Graph, name: &str, ty: TensorType) -> NodeId {
 /// Embed, norm, MLP and residual, with chosen weight placements.
 pub(crate) fn mlp_with(up_at: Placement, down_at: Placement) -> (Graph, [NodeId; 5]) {
     let dims = vec![
-        Dim {
-            name: Rows,
-            size: Size::Bounded(64),
-        },
-        Dim {
-            name: Hidden,
-            size: Size::Fixed(8),
-        },
-        Dim {
-            name: Ffn,
-            size: Size::Fixed(32),
-        },
-        Dim {
-            name: Vocab,
-            size: Size::Fixed(16),
-        },
+        Dim::bounded(Rows, 64),
+        Dim::fixed(Hidden, 8),
+        Dim::fixed(Ffn, 32),
+        Dim::fixed(Vocab, 16),
     ];
     let mut g = Graph::new(dims);
     let tokens = TensorType::new([Rows], DType::U32);

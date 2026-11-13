@@ -53,6 +53,19 @@ impl<'ast> Visit<'ast> for Names<'_> {
     }
 }
 
+/// Lines of `#[path]` attributes. Shared code goes in a crate.
+#[derive(Default)]
+struct PathMods(Vec<usize>);
+
+impl<'ast> Visit<'ast> for PathMods {
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        for a in m.attrs.iter().filter(|a| a.path().is_ident("path")) {
+            self.0.push(a.pound_token.span.start().line);
+        }
+        syn::visit::visit_item_mod(self, m);
+    }
+}
+
 /// `#[test]`, `#[tokio::test]` and `#[cfg(test)]` style attributes.
 pub fn is_test(attr: &Attribute) -> bool {
     let path = attr.path();
@@ -157,6 +170,12 @@ pub fn check(
         }
     };
     Names { src, found: names }.visit_file(&file);
+    let mut mods = PathMods::default();
+    mods.visit_file(&file);
+    for line in mods.0 {
+        let message = "`#[path]` mod: move shared code into a library crate".into();
+        out.push(src.violation(line, "path-attr", message));
+    }
     if is_test_file(&src.path) {
         tests.push(TestFile {
             path: src.path.clone(),

@@ -4,14 +4,7 @@ use Placement::*;
 
 /// A graph holding only inputs of these types.
 fn inputs(tys: Vec<TensorType>) -> (Graph, Vec<NodeId>) {
-    let fixed = |name, n| Dim {
-        name,
-        size: Size::Fixed(n),
-    };
-    let bounded = |name, n| Dim {
-        name,
-        size: Size::Bounded(n),
-    };
+    let (fixed, bounded) = (Dim::fixed, Dim::bounded);
     let dims = vec![
         bounded(Seqs, 4),
         bounded(Rows, 64),

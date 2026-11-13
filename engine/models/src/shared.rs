@@ -2,8 +2,7 @@
 
 use trace::DimName::*;
 use trace::{
-    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, Port, Role, Size, Tensor,
-    TensorType,
+    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, Port, Role, Tensor, TensorType,
 };
 
 /// Sizes every decoder stack here declares.
@@ -22,14 +21,8 @@ pub struct Stack {
 impl Stack {
     /// These dimensions, followed by the model's `own`.
     pub(crate) fn dims(&self, own: &[(DimName, u64)]) -> Vec<Dim> {
-        let bounded = |name, max| Dim {
-            name,
-            size: Size::Bounded(max),
-        };
-        let fixed = |(name, n): &(DimName, u64)| Dim {
-            name: *name,
-            size: Size::Fixed(*n),
-        };
+        let bounded = Dim::bounded;
+        let fixed = |&(name, n): &(DimName, u64)| Dim::fixed(name, n);
         let shared = [
             (Vocab, self.vocab),
             (Hidden, self.hidden),
