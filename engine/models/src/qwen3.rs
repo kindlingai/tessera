@@ -1,10 +1,10 @@
 //! Qwen3: grouped-query attention with RoPE, and SwiGLU MLPs.
 
-use crate::shared::{Stack, ports, swiglu, tokens};
+use crate::shared::{Stack, step_ports, swiglu, tokens};
 use trace::DimName::*;
 use trace::{
-    Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear, Mask, Model,
-    Norm, Pairs, PathSeg, Role, Size, Tensor, TensorType, Weights,
+    Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Mask, Model, Norm, Pairs,
+    PathSeg, Role, Size, Tensor, TensorType, Weights,
 };
 
 pub struct Config {
@@ -107,6 +107,8 @@ struct Pass<'a> {
     positions: &'a Tensor,
     /// The axis this launch's rows lie on.
     rows: DimName,
+    /// Each row's kept-row lane: the rows are ragged.
+    slots: Option<&'a Tensor>,
 }
 
 pub fn forward(m: &Model, c: &Config, w: &Qwen3, tokens: &Tensor, positions: &Tensor) -> Tensor {
@@ -116,6 +118,7 @@ pub fn forward(m: &Model, c: &Config, w: &Qwen3, tokens: &Tensor, positions: &Te
         c,
         positions,
         rows,
+        slots: None,
     };
     pass.logits(w, tokens, None)
 }
@@ -140,7 +143,13 @@ impl Pass<'_> {
     /// Queries and keys are normed per head, then rotated.
     fn attention(&self, l: &Layer, h: &Tensor, kept: Option<&Cache>) -> Tensor {
         let (c, rows) = (self.c, self.rows);
-        let split = |w: &Linear, heads: DimName| h.matmul(w).reshape([Seqs, rows, heads, HeadDim]);
+        let split = |w: &Linear, heads: DimName| {
+            let shaped: Vec<DimExpr> = match self.slots {
+                Some(_) => vec![rows.into(), heads.into(), HeadDim.into()],
+                None => vec![Seqs.into(), rows.into(), heads.into(), HeadDim.into()],
+            };
+            h.matmul(w).reshape(shaped)
+        };
         let turn = |t: Tensor, norm: &Norm| {
             let normed = t.rms_norm(norm, c.eps);
             normed.rope(self.positions, c.rope_theta, Pairs::Halves)
@@ -148,12 +157,19 @@ impl Pass<'_> {
         let q = turn(split(&l.q, Heads), &l.q_norm);
         let mut k = turn(split(&l.k, KvHeads), &l.k_norm);
         let mut v = split(&l.v, KvHeads);
-        if let Some([keys, values]) = kept {
-            (k, v) = (k.append(keys), v.append(values));
-        }
         let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
-        let out = self.m.attend(Mask::Causal, scale, [&q, &k, &v], None);
-        let flat: Vec<DimExpr> = vec![Seqs.into(), rows.into(), Heads * HeadDim];
+        let out = match (kept, self.slots) {
+            (Some([keys, values]), Some(slots)) => {
+                let by = [slots, self.positions];
+                (k, v) = (k.append(keys, by), v.append(values, by));
+                self.m.attend_rows(scale, [&q, &k, &v], by)
+            }
+            _ => self.m.attend(Mask::Causal, scale, [&q, &k, &v], None),
+        };
+        let flat: Vec<DimExpr> = match self.slots {
+            Some(_) => vec![rows.into(), Heads * HeadDim],
+            None => vec![Seqs.into(), rows.into(), Heads * HeadDim],
+        };
         out.reshape(flat).matmul(&l.o)
     }
 }
@@ -174,7 +190,7 @@ pub fn stepper(c: &Config) -> Graph {
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
     let w: Qwen3 = trace::declare(&m);
-    let [tokens, positions] = ports(&m, EntryKind::Step, Rows);
+    let [tokens, positions, slots] = step_ports(&m);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
     let cache = |_: &Layer| [m.kept(ty.clone()), m.kept(ty.clone())];
     let kept: Vec<Cache> = w.layers.iter().map(cache).collect();
@@ -184,9 +200,10 @@ pub fn stepper(c: &Config) -> Graph {
         c,
         positions,
         rows,
+        slots: Some(&slots),
     };
     let logits = pass.logits(&w, &tokens, Some(&kept));
-    let ids = logits.top_k(1u64).reshape([Seqs, Rows]);
+    let ids = logits.top_k(1u64).reshape([Rows]);
     m.finish([(Role::Tokens, &ids), (Role::Logits, &logits)])
 }
 

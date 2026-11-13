@@ -115,6 +115,49 @@ pub(crate) fn attend(n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tens
     Ok(Tensor::f32(q.shape.clone(), out))
 }
 
+/// Each query row reads its slot up to its position.
+pub(crate) fn attend_rows(
+    n: &Numerics,
+    a: &Attend,
+    [q, k, v]: [&Tensor; 3],
+    [slots, positions]: [&Tensor; 2],
+) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let [rows, heads, d] = q.shape[..] else {
+        return Err(Error::Mismatch(
+            "ragged attention wants rank 3 queries".into(),
+        ));
+    };
+    let (keys, kv_heads) = (k.shape[1], k.shape[2]);
+    let group = heads / kv_heads;
+    let (qs, ks, vs) = (q.floats()?, k.floats()?, v.floats()?);
+    let (slots, positions) = (slots.indices()?, positions.indices()?);
+    let mut out = vec![0.0; qs.len()];
+    let mut p = vec![0.0; keys];
+    for r in 0..rows {
+        let (s, seen) = (slots[r], positions[r] + 1);
+        if seen > keys {
+            let msg = format!("row {r} at position {} is past {keys} keys", seen - 1);
+            return Err(Error::Mismatch(msg));
+        }
+        for h in 0..heads {
+            let qo = (r * heads + h) * d;
+            let kv_at = |j: usize| ((s * keys + j) * kv_heads + h / group) * d;
+            for (j, pj) in p[..seen].iter_mut().enumerate() {
+                *pj = acc.dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
+            }
+            softmax(acc, &mut p[..seen]);
+            let o = &mut out[qo..qo + d];
+            for (j, &pj) in p[..seen].iter().enumerate() {
+                for (oi, &vi) in o.iter_mut().zip(&vs[kv_at(j)..kv_at(j) + d]) {
+                    *oi = acc.add(*oi, pj * vi);
+                }
+            }
+        }
+    }
+    Ok(Tensor::f32(q.shape.clone(), out))
+}
+
 pub(crate) fn stage(
     n: &Numerics,
     s: &Stage,

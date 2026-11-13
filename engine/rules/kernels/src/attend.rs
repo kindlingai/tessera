@@ -4,7 +4,7 @@ use crate::join::Join;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Site, Source, Step, T, Tree};
+use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
 
 /// Threads in a group: one group per query and head.
 const THREADS: u32 = 256;
@@ -83,6 +83,146 @@ fn attend(
     }
 }
 
+/// A group per query row and head, within its slot.
+#[kernel]
+fn attend_rows(
+    q: Buf<F32>,
+    k: Buf<F32>,
+    v: Buf<F32>,
+    mut out: BufMut<F32>,
+    slots: Buf<U32>,
+    positions: Buf<U32>,
+    rows: u32,
+    keys: u32,
+    stride: u32,
+    heads: u32,
+    kv_heads: u32,
+    width: u32,
+) {
+    let group = gid() / THREADS;
+    let row = group / heads;
+    let qh = group % heads;
+    if row >= rows {
+        return;
+    }
+    let slot = slots[row as u64];
+    let position = positions[row as u64];
+    let kvh = qh / (heads / kv_heads);
+    let q_off = ((row * heads + qh) * width) as u64;
+    let mut red = shared::<f32>(THREADS);
+    let mut m = f32::NEG_INFINITY;
+    let mut l = 0.0f32;
+    let mut acc = [0.0f32; 2];
+    // The row sees its slot up to its own position.
+    let last = if position + 1 < keys {
+        position + 1
+    } else {
+        keys
+    };
+    for t in 0..last {
+        let kv_off = (((slot * stride + t) * kv_heads + kvh) * width) as u64;
+        let mut partial = 0.0f32;
+        for d in (lid()..width).by(THREADS) {
+            partial += q[q_off + d as u64] * k[kv_off + d as u64];
+        }
+        red[lid()] = partial;
+        barrier();
+        for level in 0..8 {
+            let span = 128 >> level;
+            if lid() < span {
+                red[lid()] += red[lid() + span];
+            }
+            barrier();
+        }
+        let dot = red[0];
+        barrier();
+        let m_new = max(m, dot);
+        let corr = exp(m - m_new);
+        let p = exp(dot - m_new);
+        m = m_new;
+        l = l * corr + p;
+        for i in 0..2 {
+            let d = lid() + i * THREADS;
+            if d < width {
+                acc[i as usize] = acc[i as usize] * corr + p * v[kv_off + d as u64];
+            }
+        }
+    }
+    let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+    for i in 0..2 {
+        let d = lid() + i * THREADS;
+        if d < width {
+            out[q_off + d as u64] = acc[i as usize] * inv;
+        }
+    }
+}
+
+/// Scaled query rows over kept keys, by slot and position.
+#[derive(Clone, Copy, Debug)]
+pub struct AttendRows(pub Attn);
+
+impl Kernel for AttendRows {
+    fn name(&self) -> &'static str {
+        "attend"
+    }
+
+    fn order(&self) -> Order {
+        Order::PerConfig
+    }
+
+    fn sizes(&self) -> Vec<usize> {
+        self.0.sizes()
+    }
+
+    fn source(&self) -> Source {
+        let mut body = attend_rows_ir();
+        body.entry = "plan_attend_rows".into();
+        Source::Made(body)
+    }
+
+    /// One launch over every row.
+    fn launches(&self, step: &Step) -> Vec<Launch> {
+        let a = &self.0;
+        let sizes = [
+            Arg::count(a.queries),
+            Arg::size(a.keys),
+            Arg::count(a.stride),
+            Arg::count(a.heads),
+            Arg::count(a.kv_heads),
+            Arg::count(a.width),
+        ];
+        let buffers = [
+            step.read(0),
+            step.read(1),
+            step.read(2),
+            step.out(),
+            step.read(3),
+            step.read(4),
+        ];
+        vec![Launch {
+            args: buffers.into_iter().chain(sizes).collect(),
+            shape: Shape::Grid {
+                across: a.queries * a.heads,
+                down: 1,
+                threads: THREADS as usize,
+            },
+        }]
+    }
+
+    fn work(&self, _: usize) -> f64 {
+        let a = &self.0;
+        (a.heads * a.queries * a.keys.most() * a.width) as f64
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            group_bytes: 4 * THREADS as usize,
+            group_threads: THREADS as usize,
+            ..Needs::default()
+        }
+    }
+}
+
 /// Reads scaled queries, and keys joined with values.
 #[derive(Clone, Copy, Debug)]
 pub struct Attend(pub Attn);
@@ -153,25 +293,29 @@ impl Kernel for Attend {
 
 /// Scale the queries, join keys with values, then attend.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Attend {
-        scale,
-        q,
-        k,
-        v,
-        sizes,
-    } = tree.site(at)?
-    else {
+    let (scale, [q, k, v], sizes, rows) = tree.site(at)?.attention()?;
+    if sizes.width > WIDEST as usize {
         return None;
-    };
+    }
+    let out = sizes.queries * sizes.heads * sizes.width;
+    // Ragged rows read the kept keys and values in place.
+    if let Some([slots, positions]) = rows {
+        let scaled = Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out);
+        let reads = [
+            Read::Draft(0),
+            Read::Node(k),
+            Read::Node(v),
+            slots.into(),
+            positions.into(),
+        ];
+        return Some(vec![scaled, Draft::new(AttendRows(sizes), reads, out)]);
+    }
     // Sequences would sit at moving offsets as the keys grow.
     if sizes.keys.runtime() && sizes.seqs > 1 {
         return None;
     }
-    if sizes.width > WIDEST as usize {
-        return None;
-    }
     let side = sizes.kv_heads * sizes.width;
-    let out = sizes.seqs * sizes.queries * sizes.heads * sizes.width;
+    let out = sizes.seqs * out;
     let join = Join {
         left: side,
         right: side,

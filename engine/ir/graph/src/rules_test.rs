@@ -112,6 +112,7 @@ fn decode_and_constants() {
             mask: Mask::Causal,
             scale,
             picked: false,
+            ragged: false,
         })
     };
     let tys = vec![q, kv.clone(), kv];
@@ -172,6 +173,7 @@ fn picks_by_index() {
         mask: Mask::Causal,
         scale: 0.5,
         picked: true,
+        ragged: false,
     });
     let tys = vec![q, kv.clone(), kv];
     assert_eq!(placed(tys.clone(), attend.clone()), Err(ErrorKind::Arity));
@@ -210,15 +212,16 @@ fn layout_and_rope() {
 
 #[test]
 fn kept_rows_append() {
-    let rows = f32s([Seqs, Rows, Heads, HeadDim], Replicated);
+    let rows = f32s([Rows, Heads, HeadDim], Replicated);
     let kept = f32s([Seqs, Context, Heads, HeadDim], Replicated);
-    let wide = f32s([Seqs, Rows, Heads, Hidden], Replicated);
-    let split = rows.clone().placed(Split { axis: 2 });
-    let (mut g, ids) = inputs(vec![rows, wide, split]);
+    let wide = f32s([Rows, Heads, Hidden], Replicated);
+    let split = rows.clone().placed(Split { axis: 1 });
+    let ids = TensorType::new([Rows], DType::U32);
+    let (mut g, at) = inputs(vec![rows, wide, split, ids.clone(), ids]);
     g.kept.push(kept.clone());
     let append = |g: &Graph, arg: usize, kept| {
-        let grown = infer(g, &Op::Append(kept), &[&g.node(ids[arg]).ty]);
-        grown.map_err(|e| e.kind)
+        let args = [at[arg], at[3], at[4]].map(|i| &g.node(i).ty);
+        infer(g, &Op::Append(kept), &args).map_err(|e| e.kind)
     };
     assert_eq!(append(&g, 0, 0), Ok(kept.clone()));
     assert_eq!(append(&g, 1, 0), Err(ErrorKind::Shape));
@@ -227,7 +230,7 @@ fn kept_rows_append() {
     let push = |g: &mut Graph| {
         g.nodes.push(Node {
             op: Op::Append(0),
-            args: vec![ids[0]],
+            args: vec![at[0], at[3], at[4]],
             ty: kept.clone(),
             numerics: None,
         });

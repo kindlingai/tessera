@@ -23,7 +23,8 @@ impl<'a> Sizes<'a> {
     fn of(&self, name: DimName) -> Option<u64> {
         match self.g.dims.iter().find(|d| d.name == name)?.size {
             Size::Fixed(n) => Some(n),
-            Size::Bounded(_) => self.bound.get(&name).copied(),
+            // A bounded axis no port names is its bound.
+            Size::Bounded(max) => Some(self.bound.get(&name).copied().unwrap_or(max)),
         }
     }
 
@@ -94,27 +95,49 @@ impl Store {
         kept.map_or(0, |t| t.shape[1])
     }
 
-    /// Appends `rows` per sequence. Returns every kept row.
-    fn append(&mut self, i: usize, rows: &Tensor) -> Result<Tensor, Error> {
+    /// Writes rows by slot and position. Returns `ctx` rows each.
+    fn append(
+        &mut self,
+        i: usize,
+        [rows, slots, positions]: [&Tensor; 3],
+        seqs: usize,
+        ctx: usize,
+    ) -> Result<Tensor, Error> {
         self.kept.resize(self.kept.len().max(i + 1), None);
-        let (seqs, new) = (rows.shape[0], rows.floats()?);
-        if self.kept[i].as_ref().is_some_and(|t| t.shape[0] != seqs) {
-            let msg = format!("kept rows {i} hold another count of sequences");
-            return Err(Error::Mismatch(msg));
-        }
+        let (new, slots, positions) = (rows.floats()?, slots.indices()?, positions.indices()?);
+        let width: usize = rows.shape[1..].iter().product();
         let old = self.kept[i].take();
-        let past = old.as_ref().map_or(Ok(&[][..]), Tensor::floats)?;
-        let (a, b) = (past.len() / seqs.max(1), new.len() / seqs.max(1));
-        let mut all = Vec::with_capacity(past.len() + new.len());
-        for s in 0..seqs {
-            all.extend_from_slice(&past[s * a..(s + 1) * a]);
-            all.extend_from_slice(&new[s * b..(s + 1) * b]);
+        let had = old.as_ref().map_or(0, |t| t.shape[1]);
+        let len = had.max(ctx);
+        // Rows stay where they were. The store only grows.
+        let mut all = vec![0.0f32; seqs * len * width];
+        if let Some(old) = &old {
+            for (s, from) in old.floats()?.chunks(had * width).enumerate() {
+                all[s * len * width..][..from.len()].copy_from_slice(from);
+            }
         }
-        let mut shape = rows.shape.clone();
-        shape[1] += old.map_or(0, |t| t.shape[1]);
+        for (r, row) in new.chunks(width).enumerate() {
+            let (s, p) = (slots[r], positions[r]);
+            if s >= seqs || p >= len {
+                let msg = format!("row {r} at slot {s}, position {p} is outside the kept rows");
+                return Err(Error::Mismatch(msg));
+            }
+            all[(s * len + p) * width..][..width].copy_from_slice(row);
+        }
+        let mut shape = vec![seqs, len];
+        shape.extend_from_slice(&rows.shape[1..]);
         let grown = Tensor::f32(shape, all);
         self.kept[i] = Some(grown.clone());
-        Ok(grown)
+        if len == ctx {
+            return Ok(grown);
+        }
+        let mut seen = Vec::with_capacity(seqs * ctx * width);
+        for s in 0..seqs {
+            seen.extend_from_slice(&grown.floats()?[s * len * width..][..ctx * width]);
+        }
+        let mut shape = vec![seqs, ctx];
+        shape.extend_from_slice(&rows.shape[1..]);
+        Ok(Tensor::f32(shape, seen))
     }
 }
 
@@ -151,7 +174,7 @@ pub fn run_kept(
         }
     }
     let needed = reachable(g, e.outputs.iter().map(|o| o.node));
-    // This launch's appends lengthen the kept rows.
+    // The kept rows reach the furthest position this launch writes.
     for n in g
         .nodes
         .iter()
@@ -159,9 +182,11 @@ pub fn run_kept(
         .filter(|(i, _)| needed[*i])
         .map(|(_, n)| n)
     {
-        if let Op::Append(i) = n.op {
-            let new = sizes.expr(&g.node(n.args[0]).ty.shape.0[1])?;
-            let total = [store.rows(i as usize) + new];
+        if let Op::Append(i) = n.op
+            && let Op::Input { port, .. } = g.node(n.args[2]).op
+        {
+            let furthest = inputs[port as usize].indices()?.iter().max().copied();
+            let total = [furthest.map_or(0, |p| p + 1)];
             sizes.learn(&Shape(vec![g.kept[i as usize].shape.0[1].clone()]), &total)?;
         }
     }
@@ -180,7 +205,11 @@ pub fn run_kept(
         let args: Vec<&Tensor> = n.args.iter().map(value).collect();
         let num = n.numerics.unwrap_or_default();
         let out = match n.op {
-            Op::Append(i) => store.append(i as usize, args[0])?,
+            Op::Append(i) => {
+                let kept = &g.kept[i as usize].shape.0;
+                let (seqs, ctx) = (sizes.expr(&kept[0])?, sizes.expr(&kept[1])?);
+                store.append(i as usize, [args[0], args[1], args[2]], seqs, ctx)?
+            }
             _ => ctx.eval(&num, &n.op, &args)?,
         };
         let want = sizes.shape(&n.ty.shape)?;
@@ -237,6 +266,9 @@ impl Context<'_> {
             Op::Matmul if args[1].shape.len() > 2 => lacks("batched matmul"),
             Op::Matmul => cpu::matmul(num, args[0], args[1]),
             Op::Attend(a) if a.picked => lacks("attention over picked keys"),
+            Op::Attend(a) if a.ragged => {
+                cpu::attend_rows(num, a, [args[0], args[1], args[2]], [args[3], args[4]])
+            }
             Op::Attend(a) => cpu::attend(num, a, [args[0], args[1], args[2]]),
             Op::Mask(_) => lacks("masks"),
             Op::Row(row) => {

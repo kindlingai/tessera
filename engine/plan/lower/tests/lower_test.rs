@@ -184,19 +184,20 @@ fn kept_rows_fit() {
     for (_, slot) in &plan.kept {
         assert_eq!((slot.len, plan.buffers[slot.buffer as usize]), (80, 1024));
     }
-    let appends = plan.steps.iter().filter(|s| s.kernel.name() == "append");
+    let appends = plan.steps.iter().filter(|s| s.kernel.name() == "scatter");
     for s in appends.clone() {
         assert!(plan.kept.iter().any(|(_, slot)| *slot == s.write));
         let [launch] = &s.launches()[..] else {
-            panic!("one copy");
+            panic!("one scatter");
         };
-        // Three rows are kept, so the copy starts later.
-        assert_eq!(launch.args[1..], [Arg::Buffer(s.write, 48), Arg::U32(32)]);
+        // Two rows of sixteen, into slots of sixteen rows.
+        assert_eq!(launch.args[4..], [Arg::U32(2), Arg::U32(16), Arg::U32(16)]);
     }
     assert_eq!((appends.count(), count(&plan, "argmax")), (4, 1));
     let scratch: usize = plan.buffers.iter().sum::<usize>() - 4 * 1024;
     assert!(plan.scratch() < scratch, "kept rows are not scratch");
-    assert!(matches!(step(2, 2, 5), Err(Error::Unsupported(_))));
+    // Several slots fit, each holding the bound of rows.
+    assert!(step(2, 2, 5).is_ok());
 }
 
 #[test]

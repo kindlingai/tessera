@@ -122,6 +122,9 @@ pub struct Attend {
     pub scale: f32,
     /// Argument four lists each query's keys; out-of-range ids are skipped.
     pub picked: bool,
+    /// Query rows carry a slot and position: arguments four, five.
+    #[serde(default)]
+    pub ragged: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,5 +288,7 @@ pub enum Role {
     Tokens,
     /// Each token's 0-based position in its sequence.
     Positions,
+    /// Each row's kept-row lane.
+    Slots,
     Logits,
 }
