@@ -258,6 +258,11 @@ pub enum Param {
     Tiles {
         name: String,
     },
+    /// The caller's local array, by name.
+    Array {
+        name: String,
+        ty: Ty,
+    },
 }
 
 /// A whole kernel, before any dialect.
@@ -767,7 +772,7 @@ impl Body {
                     p.bind(name, Kind::Value(*ty));
                     scalars.push((leak(name), ty.c()));
                 }
-                Param::Shared { name, .. } | Param::Tiles { name } => {
+                Param::Shared { name, .. } | Param::Tiles { name } | Param::Array { name, .. } => {
                     panic!("`{}` takes `{name}` from a caller", self.entry);
                 }
             }
