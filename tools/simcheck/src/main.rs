@@ -23,9 +23,9 @@ use std::process::{Command, ExitCode};
 use windows::{Window, cut};
 
 const USAGE: &str = "usage: tessera-simcheck fetch <model_dir>
-       tessera-simcheck check <model_dir> [cache_file [report_file]]
+       tessera-simcheck check <model_dir> [cache_file [report_file [link_base]]]
 
-`check` links report hunks under $SIMCHECK_LINKS when it is set.";
+`check` links report hunks under <link_base> when given.";
 
 /// The repository's lint.toml keys this tool reads.
 #[derive(serde::Deserialize)]
@@ -95,7 +95,12 @@ fn embed(model: &Path, wins: &[Window], cache: &mut Cache) -> Result<Vec<Vec<f32
         .collect())
 }
 
-fn check(model: &Path, cache_file: Option<&Path>, report: Option<&Path>) -> Result<bool> {
+fn check(
+    model: &Path,
+    cache_file: Option<&Path>,
+    report: Option<&Path>,
+    links: Option<&str>,
+) -> Result<bool> {
     let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
     let allow = Allow::parse(include_str!("../allow.toml"))?;
     let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
@@ -118,9 +123,8 @@ fn check(model: &Path, cache_file: Option<&Path>, report: Option<&Path>) -> Resu
         );
     }
     if let Some(r) = report {
-        let links = std::env::var("SIMCHECK_LINKS").ok();
         let limits = (s.similar_window, s.max_similarity);
-        let md = report::markdown(&hits, &wins, &root, limits, links.as_deref())?;
+        let md = report::markdown(&hits, &wins, &root, limits, links)?;
         std::fs::write(r, md)?;
     }
     Ok(hits.is_empty())
@@ -131,12 +135,19 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let run = match args[..] {
         ["fetch", dir] => fetch::fetch(Path::new(dir)).map(|()| true),
-        ["check", dir] => check(Path::new(dir), None, None),
-        ["check", dir, cache] => check(Path::new(dir), Some(Path::new(cache)), None),
+        ["check", dir] => check(Path::new(dir), None, None, None),
+        ["check", dir, cache] => check(Path::new(dir), Some(Path::new(cache)), None, None),
         ["check", dir, cache, report] => check(
             Path::new(dir),
             Some(Path::new(cache)),
             Some(Path::new(report)),
+            None,
+        ),
+        ["check", dir, cache, report, links] => check(
+            Path::new(dir),
+            Some(Path::new(cache)),
+            Some(Path::new(report)),
+            Some(links),
         ),
         _ => {
             eprintln!("{USAGE}");

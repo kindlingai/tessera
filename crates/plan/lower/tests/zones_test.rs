@@ -4,6 +4,8 @@
 use kernels as _;
 use linear as _;
 
+use engine::settings;
+use gpukit::testing::scratch;
 use graph::DimName::{Context, Rows, Seqs};
 use lower::kernels::Map;
 use lower::{
@@ -85,7 +87,7 @@ fn named<'a>(plan: &'a Plan, kernel: &'a str) -> impl Iterator<Item = &'a Step> 
 
 #[test]
 fn cheap_links_place_work() {
-    let device = Device::guess().zoned(two(1e-6));
+    let device = Device::guess(&settings()).zoned(two(1e-6));
     let plan = step(&device);
     assert!(plan.zoned());
     let [top] = &named(&plan, "host_top").collect::<Vec<_>>()[..] else {
@@ -114,25 +116,28 @@ fn cheap_links_place_work() {
     }
     let cost = device.cost(&plan);
     assert!(cost.seconds.is_finite() && cost.seconds > 0.0);
-    assert!(matches!(open(plan), Err(Error::Unsupported(_))));
+    assert!(matches!(
+        open(plan, &settings()),
+        Err(Error::Unsupported(_))
+    ));
 }
 
 #[test]
 fn slow_links_stay() {
-    let home = step(&Device::guess());
+    let home = step(&Device::guess(&settings()));
     assert!(!home.zoned() && named(&home, "argmax").count() == 1);
-    assert_eq!(step(&Device::guess().zoned(two(1.0))), home);
+    assert_eq!(step(&Device::guess(&settings()).zoned(two(1.0))), home);
     // Unlinked zones cannot be reached at all.
     let mut apart = two(0.0);
     apart.links.clear();
-    assert_eq!(step(&Device::guess().zoned(apart)), home);
+    assert_eq!(step(&Device::guess(&settings()).zoned(apart)), home);
     assert_eq!(home.zones, vec![0; home.buffers.len()]);
 }
 
 #[test]
 fn clusters_are_stored() {
-    let device = Device::guess().zoned(two(2e-6));
-    let file = std::env::temp_dir().join("tessera-lower-zones-test.json");
+    let device = Device::guess(&settings()).zoned(two(2e-6));
+    let file = scratch("tessera-lower-zones-test.json");
     device.save(&file).unwrap();
     let loaded = Device::load(&file).unwrap();
     std::fs::remove_file(&file).unwrap();

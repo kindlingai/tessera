@@ -4,7 +4,12 @@ use std::path::PathBuf;
 /// Writes a header and tensor bytes to a temporary file.
 fn write(name: &str, header: &str, data: &[u8]) -> PathBuf {
     let id = std::process::id();
-    let path = std::env::temp_dir().join(format!("tessera-{name}-{id}.safetensors"));
+    let dir = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/scratch"
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("tessera-{name}-{id}.safetensors"));
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(data);

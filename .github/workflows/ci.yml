@@ -116,9 +116,9 @@ jobs:
           path: ${{ runner.temp }}/simcheck.bin
           key: simcheck-${{ github.run_id }}
           restore-keys: simcheck-
-      - env:
-          SIMCHECK_LINKS: https://github.com/${{ github.repository }}/blob/${{ env.HEAD }}
-        run: $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/simcheck.md"
+      - run: >
+          $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/simcheck.md"
+          "https://github.com/${{ github.repository }}/blob/${{ env.HEAD }}"
       - if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}

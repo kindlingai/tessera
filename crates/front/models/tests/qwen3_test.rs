@@ -2,12 +2,11 @@
 
 use calibrate::{headroom, measure, path, stored};
 use checkpoint::File;
-use gpukit::testing::{backend_ready, cosine_f32, max_abs_diff};
+use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
-use lower::{Cache, DType, Device, Pins, Plan, Run, lower, open, select};
+use lower::{Cache, DType, Device, Pins, Plan, Run, Settings, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Instant;
 use trace::DimName::{self, Context, Rows, Seqs};
 use trace::{Graph, PathSeg};
@@ -29,13 +28,15 @@ fn traces() {
 
 /// Read from the directory `TESSERA_QWEN3` names.
 struct Case {
+    settings: Settings,
     weights: Vec<Tensor>,
     tokens: Vec<u32>,
     want: Vec<f32>,
 }
 
 fn case(g: &Graph) -> Option<Case> {
-    let dir = PathBuf::from(std::env::var_os("TESSERA_QWEN3")?);
+    let settings = engine::settings();
+    let dir = settings.qwen3.clone()?;
     let file = File::open(&dir.join("model.safetensors")).unwrap();
     let find = |p: &[PathSeg]| {
         let v = file.floats(&tensor_name(p)?).ok()?;
@@ -45,6 +46,7 @@ fn case(g: &Graph) -> Option<Case> {
     let floats = std::fs::read(dir.join("logits.f32")).unwrap();
     let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
     Some(Case {
+        settings,
         weights: bind(g, find).unwrap(),
         tokens: tokens
             .split_whitespace()
@@ -91,7 +93,7 @@ fn matches_reference() {
         return eprintln!("TESSERA_QWEN3 is not set; skipped");
     };
     close("cpu", &logits(&g, &c, &c.tokens), &c);
-    if !backend_ready() {
+    if c.settings.gpu().is_none() {
         return eprintln!("no GPU here; skipped");
     }
     let mut gpu = Gpu::open(&g, &c);
@@ -101,8 +103,8 @@ fn matches_reference() {
 }
 
 /// The checkpoint is bf16, so plans read it as stored.
-fn pinned() -> Device {
-    Device::guess().pinned(Pins::all(DType::Bf16))
+fn pinned(settings: &Settings) -> Device {
+    Device::guess(settings).pinned(Pins::all(DType::Bf16))
 }
 
 /// Plans for either entry on one runner. Weights load once.
@@ -194,12 +196,13 @@ fn room(device: &Device, plan: &Plan, steps: &[f64]) {
 impl<'a> Gpu<'a> {
     fn open(g: &Graph, c: &'a Case) -> Self {
         let first = prompt(&c.tokens);
-        let plan = lower(g, 0, &first.sizes(), &pinned()).unwrap();
-        let mut runner = open(plan).unwrap();
+        let plan = lower(g, 0, &first.sizes(), &pinned(&c.settings)).unwrap();
+        let mut runner = open(plan, &c.settings).unwrap();
         for (at, w) in c.weights.iter().enumerate() {
             runner.load(at as u32, w.view()).unwrap();
         }
-        let device = stored(&*runner).unwrap().pinned(pinned().pins);
+        let device = stored(&*runner, &c.settings).unwrap();
+        let device = device.pinned(pinned(&c.settings).pins);
         let (name, samples) = (runner.device(), device.samples());
         eprintln!("{name}: {samples} stored samples");
         Self {
@@ -218,7 +221,8 @@ impl<'a> Gpu<'a> {
         // What the stored samples alone would launch.
         let before = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
         let device = &mut self.device;
-        let added = measure(&mut *self.runner, (g, 0), &sizes, &feeds, device).unwrap();
+        let settings = &self.c.settings;
+        let added = measure(&mut *self.runner, (g, 0), &sizes, &feeds, device, settings).unwrap();
         self.learned += added.len();
         let after = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
         if before != after {
@@ -245,7 +249,7 @@ impl<'a> Gpu<'a> {
     }
 
     fn save(&self) {
-        let file = path(&self.device.name);
+        let file = path(&self.c.settings, &self.device.name).unwrap();
         let (learned, all) = (self.learned, self.device.samples());
         eprintln!("timed {learned} launches; {all} samples known");
         let (kept, hits) = (self.plans.len(), self.plans.hits);
@@ -317,7 +321,9 @@ mod forward {
         let timed = |r: &Timed| r.steps.iter().sum::<f64>();
         let tokens = repeat(gpu.c, planned.out.len() / 151_936);
         let sizes = prompt(&tokens).sizes();
-        let contested = select(g, 0, &sizes, &pinned()).unwrap().contested;
+        let contested = select(g, 0, &sizes, &pinned(&gpu.c.settings))
+            .unwrap()
+            .contested;
         let mut least = f64::INFINITY;
         for rule in contested {
             let device = gpu.device.clone().favoring(rule);
@@ -482,7 +488,8 @@ mod decode {
             past: 15,
             tokens: &[0],
         };
-        let contested = select(&g, 0, &one.sizes(), &pinned()).unwrap().contested;
+        let pinned = pinned(&gpu.c.settings);
+        let contested = select(&g, 0, &one.sizes(), &pinned).unwrap().contested;
         let mut most = 0.0f64;
         for rule in contested {
             let forced = decode(gpu, &g, &device.clone().favoring(rule)).rate();

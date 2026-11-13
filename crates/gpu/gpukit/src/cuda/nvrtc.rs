@@ -9,8 +9,6 @@ pub type NvrtcResult = c_int;
 pub type NvrtcProgram = *mut c_void;
 
 const NVRTC_SUCCESS: NvrtcResult = 0;
-/// Environment variable that overrides the NVRTC library name.
-const NVRTC_ENV: &str = "DGQ_NVRTC";
 
 type NvrtcCreateProgram = unsafe extern "C" fn(
     *mut NvrtcProgram,
@@ -48,9 +46,6 @@ macro_rules! sym {
 impl Nvrtc {
     fn open() -> Result<Self, String> {
         let mut names: Vec<String> = Vec::new();
-        if let Ok(explicit) = std::env::var(NVRTC_ENV) {
-            names.push(explicit);
-        }
         for name in [
             "libnvrtc.so",
             "libnvrtc.so.13",
@@ -78,7 +73,7 @@ fn library() -> Result<&'static Nvrtc, Error> {
     match LIB.get_or_init(Nvrtc::open) {
         Ok(lib) => Ok(lib),
         Err(msg) => Err(Error::Cuda(format!(
-            "no NVRTC ({msg}); install the CUDA toolkit or set {NVRTC_ENV}"
+            "no NVRTC ({msg}); install the CUDA toolkit or put it on the library path"
         ))),
     }
 }

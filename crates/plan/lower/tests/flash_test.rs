@@ -4,6 +4,7 @@
 use kernels as _;
 use linear as _;
 
+use engine::settings;
 use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs};
 use graph::{DType, Dim, Graph, Size, TensorType};
@@ -64,11 +65,11 @@ fn flash_matches_cpu() {
                 (Rows, rows as u64),
                 (Context, keys as u64),
             ];
-            let device = Device::guess().favoring("flash");
+            let device = Device::guess(&settings()).favoring("flash");
             let plan = lower(&g, 0, &sizes, &device).unwrap();
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
             assert_eq!(names, ["map", "flash"], "{seqs}x{rows}x{keys} at {width}");
-            let mut runner = open(plan).unwrap();
+            let mut runner = open(plan, &settings()).unwrap();
             let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
             let got = runner.run(&views).unwrap().remove(0);
             let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());

@@ -1,5 +1,7 @@
 //! Oracle comparison helpers shared by every crate's tests.
 
+use std::path::PathBuf;
+
 /// Largest absolute element-wise difference. Panics if the lengths differ.
 pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
@@ -53,6 +55,16 @@ impl Noise {
     }
 }
 
+/// A file tests may write, under the workspace's target directory.
+pub fn scratch(file: &str) -> PathBuf {
+    let dir = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/scratch"
+    ));
+    std::fs::create_dir_all(&dir).expect("a target directory");
+    dir.join(file)
+}
+
 /// Whether a CUDA driver loads on this host.
 pub fn cuda_ready() -> bool {
     #[cfg(feature = "cuda")]
@@ -67,16 +79,4 @@ pub fn rocm_ready() -> bool {
     return crate::rocm::cached_context().is_ok();
     #[cfg(not(feature = "rocm"))]
     false
-}
-
-/// Whether the backend `backend::available` picks can run here.
-pub fn backend_ready() -> bool {
-    use crate::backend::{self, Backend};
-    match backend::available() {
-        // Hosted macOS CI runners have no usable Metal device.
-        Some(Backend::Metal) => std::env::var_os("CI").is_none(),
-        Some(Backend::Cuda) => cuda_ready(),
-        Some(Backend::Rocm) => rocm_ready(),
-        None => false,
-    }
 }

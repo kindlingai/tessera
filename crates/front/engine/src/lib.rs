@@ -1,0 +1,24 @@
+//! The process front: settings read once, passed down.
+
+use gpukit::{Pick, Settings};
+use std::path::PathBuf;
+
+/// The only reader of the process environment.
+#[allow(clippy::disallowed_methods, reason = "the one sanctioned reader")]
+pub fn settings() -> Settings {
+    use std::env::{home_dir, var, var_os};
+    // `CI` picks the host: hosted macOS runners lack Metal.
+    let host = var("TESSERA_BACKEND").as_deref() == Ok("cpu")
+        || (cfg!(target_os = "macos") && var_os("CI").is_some());
+    // TESSERA_LANES, TESSERA_COSTS and TESSERA_QWEN3 fill fields.
+    let lanes = var("TESSERA_LANES").ok().and_then(|v| v.parse().ok());
+    let costs = var_os("TESSERA_COSTS")
+        .map(PathBuf::from)
+        .or_else(|| Some(home_dir()?.join(".cache/tessera/costs")));
+    Settings {
+        backend: if host { Pick::Host } else { Pick::Auto },
+        host_lanes: lanes.unwrap_or(32),
+        costs,
+        qwen3: var_os("TESSERA_QWEN3").map(PathBuf::from),
+    }
+}

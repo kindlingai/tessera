@@ -20,8 +20,6 @@ pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
-/// Environment variable that overrides the driver library name.
-const DRIVER_ENV: &str = "DGQ_CUDA_DRIVER";
 const DRIVER_LIB: &str = "libcuda.so.1";
 
 type CuInit = unsafe extern "C" fn(u32) -> CUresult;
@@ -92,8 +90,8 @@ macro_rules! sym {
 
 impl Driver {
     fn open() -> Result<Self, String> {
-        let lib_name = std::env::var(DRIVER_ENV).unwrap_or_else(|_| DRIVER_LIB.into());
-        let lib = Library::open_first(&[lib_name]).map_err(|e| format!("cannot load {e}"))?;
+        let lib =
+            Library::open_first(&[DRIVER_LIB.into()]).map_err(|e| format!("cannot load {e}"))?;
         Ok(Driver {
             cu_init: sym!(lib, "cuInit", CuInit),
             cu_device_get_count: sym!(lib, "cuDeviceGetCount", CuDeviceGetCount),

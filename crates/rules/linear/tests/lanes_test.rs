@@ -10,6 +10,7 @@ use interp::run;
 
 mod common;
 use common::{Finish, finished, linear, noise};
+use engine::settings;
 use lower::{Device, Dialect, Source, lower, open, rules};
 use trace::Act;
 
@@ -18,15 +19,27 @@ fn rule_registers() {
     assert!(rules().iter().any(|r| r.name == "lanes"));
     let g = linear(52, 7);
     let sizes = |m| [(Rows, m)];
-    let plan = lower(&g, 0, &sizes(3), &Device::guess().favoring("lanes")).unwrap();
+    let plan = lower(
+        &g,
+        0,
+        &sizes(3),
+        &Device::guess(&settings()).favoring("lanes"),
+    )
+    .unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names, ["lanes"]);
     // Past its row limit, another rule takes the site.
-    let wide = lower(&g, 0, &sizes(33), &Device::guess().favoring("lanes")).unwrap();
+    let wide = lower(
+        &g,
+        0,
+        &sizes(33),
+        &Device::guess(&settings()).favoring("lanes"),
+    )
+    .unwrap();
     assert!(wide.steps.iter().all(|s| s.kernel.name() != "lanes"));
     // A favored rule keeps its node from a hiding cover.
     let residual = finished(48, 48, |x, product| x.add(&product));
-    let thin = Device::guess().favoring("thin");
+    let thin = Device::guess(&settings()).favoring("thin");
     let kept = lower(&residual, 0, &sizes(3), &thin).unwrap();
     let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names, ["thin", "map"]);
@@ -55,13 +68,13 @@ fn lanes_match_cpu() {
         for m in [1usize, 5] {
             let x = noise(vec![m, k as usize], &mut draws);
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-            let device = Device::guess().favoring("lanes");
+            let device = Device::guess(&settings()).favoring("lanes");
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
             // Stages after the matmul ride in the same launch.
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
             assert_eq!(names, ["lanes"]);
             assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
-            let mut runner = open(plan).unwrap();
+            let mut runner = open(plan, &settings()).unwrap();
             runner.load(0, weights[0].view()).unwrap();
             let got = runner.run(&[x.view()]).unwrap().remove(0);
             let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());

@@ -1,5 +1,7 @@
 //! Plans for a toy model, without a GPU.
 
+use engine::settings;
+use gpukit::testing::scratch;
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
 use kernels::Thin;
@@ -39,7 +41,7 @@ fn gate() -> Map {
 #[test]
 fn gate_fuses() {
     // Barring the fusing matmuls leaves the gate a map.
-    let plain = untiled(Device::guess()).without("lanes");
+    let plain = untiled(Device::guess(&settings())).without("lanes");
     let (g, plan) = toy(&plain);
     let fused = KernelRef::new(gate());
     let steps: Vec<_> = plan.steps.iter().filter(|s| s.kernel == fused).collect();
@@ -54,7 +56,7 @@ fn gate_fuses() {
 
 #[test]
 fn buffers_are_shared() {
-    let (g, plan) = toy(&Device::guess());
+    let (g, plan) = toy(&Device::guess(&settings()));
     // Matmul schedules sum in their own orders.
     assert_eq!(plan.order(), graph::Order::PerConfig);
     assert_eq!(Plan::default().order(), graph::Order::Fixed);
@@ -68,7 +70,7 @@ fn buffers_are_shared() {
         "dead values free their buffers"
     );
     assert_eq!(count(&plan, "angles"), 1, "one table serves every rotation");
-    let unsized_context = lower(&g, 0, &[(Seqs, 2)], &Device::guess());
+    let unsized_context = lower(&g, 0, &[(Seqs, 2)], &Device::guess(&settings()));
     assert!(matches!(unsized_context, Err(Error::Size(_))));
 }
 
@@ -81,11 +83,11 @@ fn cost_picks_the_matmul() {
             .filter(|s| s.kernel.name().starts_with("tiled_"))
             .count()
     };
-    let (_, tiled) = toy(&Device::guess().without("thin").without("lanes"));
-    let (_, thin) = toy(&untiled(Device::guess()).without("lanes"));
+    let (_, tiled) = toy(&Device::guess(&settings()).without("thin").without("lanes"));
+    let (_, thin) = toy(&untiled(Device::guess(&settings())).without("lanes"));
     assert_eq!((count(&tiled, "thin"), tiled_steps(&thin)), (0, 0));
     assert_eq!(tiled_steps(&tiled), count(&thin, "thin"));
-    let mut measured = Device::guess().without("lanes");
+    let mut measured = Device::guess(&settings()).without("lanes");
     let cheap = thin.steps.iter().map(|s| (s, 1e-6));
     measured.fit(cheap.chain(tiled.steps.iter().map(|s| (s, 1e-3))));
     let (_, fitted) = toy(&measured);
@@ -96,13 +98,13 @@ fn cost_picks_the_matmul() {
 #[test]
 fn cost_picks_attention() {
     // Dense attention is unproven, so a guess streams.
-    let (_, stream) = toy(&Device::guess());
+    let (_, stream) = toy(&Device::guess(&settings()));
     assert_eq!((count(&stream, "attend"), count(&stream, "scores")), (2, 0));
     // The host cannot run the hand-written dense gemm.
-    if lower::cpu::chosen() {
+    if settings().gpu().is_none() {
         return;
     }
-    let (_, dense) = toy(&Device::guess().favoring("dense"));
+    let (_, dense) = toy(&Device::guess(&settings()).favoring("dense"));
     assert_eq!((count(&dense, "attend"), count(&dense, "join")), (0, 0));
     let per_layer = ["scores", "causal", "values"].map(|k| count(&dense, k));
     assert_eq!(per_layer, [2, 2, 2]);
@@ -123,7 +125,7 @@ fn rule_names_differ() {
     sorted.dedup();
     assert_eq!(names, sorted, "rule names are unique and ordered");
     let g = program(&Config::toy(4, 16));
-    let picked = select(&g, 0, &SIZES, &Device::guess()).unwrap();
+    let picked = select(&g, 0, &SIZES, &Device::guess(&settings())).unwrap();
     assert!(
         picked.contested.len() > 1,
         "some site saw more than one rule"
@@ -133,7 +135,7 @@ fn rule_names_differ() {
 #[test]
 fn order_saves_memory() {
     let g = program(&Config::toy(4, 16));
-    let picked = select(&g, 0, &SIZES, &Device::guess()).unwrap();
+    let picked = select(&g, 0, &SIZES, &Device::guess(&settings())).unwrap();
     let traced: Vec<usize> = (0..picked.ops.len()).collect();
     let order = schedule(&picked);
     let mut sorted = order.clone();
@@ -166,7 +168,12 @@ fn dialects_agree() {
 /// A toy step plan: `rows` new, `all` kept afterwards.
 fn step(seqs: u64, rows: u64, all: u64) -> Result<Plan, Error> {
     let sizes = [(Seqs, seqs), (Rows, rows), (Context, all)];
-    lower(&stepper(&Config::toy(4, 16)), 0, &sizes, &Device::guess())
+    lower(
+        &stepper(&Config::toy(4, 16)),
+        0,
+        &sizes,
+        &Device::guess(&settings()),
+    )
 }
 
 #[test]
@@ -244,7 +251,7 @@ fn thin(m: usize) -> Step {
 #[test]
 fn near_samples_estimate() {
     let seconds = |d: &Device, m: usize| d.seconds(&*thin(m).kernel, m * 64);
-    let mut device = Device::guess();
+    let mut device = Device::guess(&settings());
     let guess = seconds(&device, 4);
     device.fit([(&thin(1), 1e-3), (&thin(16), 4e-3)]);
     assert_eq!(device.samples(), 2);
@@ -293,22 +300,27 @@ fn chip() -> Fit {
 fn models_fill_gaps() {
     let (step, fit) = (thin(1), chip());
     let seconds = |d: &Device| d.seconds(&*step.kernel, 64);
-    let device = Device::guess().fitted(fit);
+    let device = Device::guess(&settings()).fitted(fit);
     let load = step.kernel.load(64).unwrap();
     let modelled = fit.pool("fitted").estimate(&load).seconds;
     assert_eq!(seconds(&device), modelled);
     assert!(
-        seconds(&Device::guess()) != modelled,
+        seconds(&Device::guess(&settings())) != modelled,
         "a bare guess differs"
     );
     let bound = device.bound(&*step.kernel, 64).unwrap();
-    assert!(bound <= modelled && Device::guess().bound(&*step.kernel, 64).is_none());
+    assert!(
+        bound <= modelled
+            && Device::guess(&settings())
+                .bound(&*step.kernel, 64)
+                .is_none()
+    );
     // A sample of the kernel outranks the model.
     let mut timed = device.clone();
     timed.fit([(&step, 5e-3)]);
     assert_eq!(seconds(&timed), 5e-3);
     // The stored fit brings the model back.
-    let file = std::env::temp_dir().join("tessera-lower-fit-test.json");
+    let file = scratch("tessera-lower-fit-test.json");
     device.save(&file).unwrap();
     let loaded = Device::load(&file).unwrap();
     std::fs::remove_file(&file).unwrap();
@@ -348,8 +360,8 @@ fn trees_cut_shared() {
 #[test]
 fn favoring_stays_local() {
     // No rule competes with rope, so favoring it changes nothing.
-    let (_, plain) = toy(&Device::guess());
-    let (_, favored) = toy(&Device::guess().favoring("rope"));
+    let (_, plain) = toy(&Device::guess(&settings()));
+    let (_, favored) = toy(&Device::guess(&settings()).favoring("rope"));
     assert!(
         plain == favored,
         "a favored rule skewed its readers' choice"
@@ -383,7 +395,7 @@ fn pins_match_paths() {
 fn pinned_weights_narrow() {
     let g = program(&Config::toy(4, 16));
     let pins = Pins::all(DType::Bf16).pin("embed", DType::F32);
-    let plan = lower(&g, 0, &SIZES, &Device::guess().pinned(pins)).unwrap();
+    let plan = lower(&g, 0, &SIZES, &Device::guess(&settings()).pinned(pins)).unwrap();
     for l in &plan.weights {
         let embed = l.weight == 0;
         assert_eq!(l.slot.dtype == DType::F32, embed, "weight {}", l.weight);
@@ -405,7 +417,7 @@ fn pinned_weights_narrow() {
     let widened = names.iter().filter(|n| **n == "widen").count();
     let norms = g.weights.iter().filter(|w| w.ty.shape.0.len() == 1).count();
     assert_eq!(widened, norms);
-    let (_, wide) = toy(&Device::guess());
+    let (_, wide) = toy(&Device::guess(&settings()));
     assert!(plan.buffers.iter().sum::<usize>() < wide.buffers.iter().sum::<usize>());
 }
 
@@ -413,7 +425,7 @@ fn pinned_weights_narrow() {
 fn plans_are_cached() {
     let g = program(&Config::toy(4, 16));
     let mut cache = lower::Cache::default();
-    let device = Device::guess();
+    let device = Device::guess(&settings());
     let first = cache.lower(&g, 0, &SIZES, &device).unwrap();
     let again = cache.lower(&g, 0, &SIZES, &device).unwrap();
     assert!(first == again && cache.hits == 1 && cache.len() == 1);
@@ -475,7 +487,7 @@ fn limits_bar_kernels() {
         lanes: 64,
         ..lower::Limits::assumed()
     };
-    let (_, plan) = toy(&Device::guess().within(wide));
+    let (_, plan) = toy(&Device::guess(&settings()).within(wide));
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     let lanes = |n: &&str| n.starts_with("lanes") || n.starts_with("tiled") || *n == "lane_norm";
     assert!(!names.iter().any(lanes), "{names:?}");
@@ -488,8 +500,8 @@ fn limits_bar_kernels() {
         group_bytes: 12 * 1024,
         ..lower::Limits::assumed()
     };
-    let (g, _) = toy(&Device::guess());
-    let device = Device::guess().within(small).favoring("tiled");
+    let (g, _) = toy(&Device::guess(&settings()));
+    let device = Device::guess(&settings()).within(small).favoring("tiled");
     let plan = lower(&g, 0, &SIZES, &device).unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert!(names.contains(&"tiled_32x32_w16"), "{names:?}");

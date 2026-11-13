@@ -3,7 +3,7 @@
 use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
-use gpukit::Limits;
+use gpukit::{Limits, Settings};
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
 use std::cell::RefCell;
@@ -129,11 +129,11 @@ const FIXED: f64 = 1e-4;
 const NEAR: usize = 3;
 
 impl Device {
-    /// The device `open` picks, before any samples.
-    pub fn guess() -> Self {
-        let limits = match crate::cpu::chosen() {
-            true => crate::cpu::limits(),
-            false => Limits::assumed(),
+    /// The device `open` picks under `settings`, before any samples.
+    pub fn guess(settings: &Settings) -> Self {
+        let limits = match settings.gpu() {
+            None => crate::cpu::limits(settings.host_lanes),
+            Some(_) => Limits::assumed(),
         };
         Self {
             limits,

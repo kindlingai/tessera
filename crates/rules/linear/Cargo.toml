@@ -17,6 +17,7 @@ graph = { workspace = true }
 lower = { workspace = true }
 
 [dev-dependencies]
+engine = { workspace = true }
 kernels = { workspace = true }
 interp = { workspace = true }
 gpukit = { workspace = true }

@@ -3,6 +3,7 @@
 // Linking the crate registers its rules.
 use kernels as _;
 
+use engine::settings;
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, lower, open};
@@ -156,8 +157,14 @@ fn cpu_matches_record() {
 #[test]
 fn plan_matches_record() {
     let g = graph();
-    let plan = lower(&g, 0, &[(Seqs, 2), (Context, 5)], &Device::guess()).unwrap();
-    let mut runner = open(plan).unwrap();
+    let plan = lower(
+        &g,
+        0,
+        &[(Seqs, 2), (Context, 5)],
+        &Device::guess(&settings()),
+    )
+    .unwrap();
+    let mut runner = open(plan, &settings()).unwrap();
     for (at, w) in weights(&g).iter().enumerate() {
         runner.load(at as u32, w.view()).unwrap();
     }

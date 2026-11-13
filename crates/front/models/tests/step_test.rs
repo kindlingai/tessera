@@ -3,6 +3,7 @@
 // Linking the crate registers its rules.
 use kernels as _;
 
+use engine::settings;
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Store, Tensor, run, run_kept};
 use lower::{Device, Run, lower, open, rules};
@@ -116,7 +117,7 @@ fn launch(
         Some(r) => r.replan(&plan).unwrap(),
         None => {
             // Weights load once. Later plans reuse them.
-            let r = runner.insert(open(plan).unwrap());
+            let r = runner.insert(open(plan, &settings()).unwrap());
             for (at, w) in weights.iter().enumerate() {
                 r.load(at as u32, w.view()).unwrap();
             }
@@ -135,7 +136,7 @@ fn plans_keep_rows() {
     let weights = weights(&step, &mut Noise(9));
     let tokens: Vec<u32> = (0..LEN as u32).map(|t| (t * 7 + 3) % 32).collect();
     let spans = [0..3, 3..4, 4..5, 5..7];
-    let favor = |r: &&lower::Rule| Device::guess().favoring(r.name);
+    let favor = |r: &&lower::Rule| Device::guess(&settings()).favoring(r.name);
     for device in rules().iter().map(favor) {
         let (mut store, mut runner) = (Store::default(), None);
         for span in spans.clone() {

@@ -3,9 +3,11 @@
 mod error;
 pub use error::Error;
 pub use limits::Limits;
+pub use settings::{Pick, Settings};
 
 pub mod backend;
 pub mod limits;
+pub mod settings;
 
 pub mod includes;
 

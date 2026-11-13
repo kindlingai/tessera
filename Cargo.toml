@@ -21,6 +21,7 @@ calibrate = { path = "tools/calibrate" }
 checkpoint = { path = "crates/front/checkpoint" }
 gemm = { path = "crates/gpu/gemm" }
 codegen = { path = "crates/plan/codegen" }
+engine = { path = "crates/front/engine" }
 gpukit = { path = "crates/gpu/gpukit" }
 graph = { path = "crates/ir/graph" }
 interp = { path = "crates/ir/interp" }

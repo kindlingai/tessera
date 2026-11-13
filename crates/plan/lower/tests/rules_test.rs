@@ -4,6 +4,7 @@
 use kernels as _;
 use linear as _;
 
+use engine::settings;
 use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
@@ -80,7 +81,7 @@ fn fill(g: &Graph, ty: &TensorType, noise: &mut Noise) -> Tensor {
 /// Runs entry 0 both ways; returns the largest difference.
 fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
     let want = run(g, weights, 0, inputs).unwrap();
-    let mut runner = open(lower(g, 0, &SIZES, device).unwrap()).unwrap();
+    let mut runner = open(lower(g, 0, &SIZES, device).unwrap(), &settings()).unwrap();
     for (at, w) in weights.iter().enumerate() {
         runner.load(at as u32, w.view()).unwrap();
     }
@@ -96,7 +97,7 @@ fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32
 
 /// One device per registered rule, favoring it everywhere.
 fn devices() -> Vec<(&'static str, Device)> {
-    let favor = |r: &&lower::Rule| (r.name, Device::guess().favoring(r.name));
+    let favor = |r: &&lower::Rule| (r.name, Device::guess(&settings()).favoring(r.name));
     rules().iter().map(favor).collect()
 }
 
@@ -131,7 +132,7 @@ fn each_rule_matches_cpu() {
     // A new rule must be reachable from some graph here.
     for rule in rules() {
         // Hand-written kernels wait for a compiler.
-        if lower::cpu::chosen() && rule.name == "dense" {
+        if settings().gpu().is_none() && rule.name == "dense" {
             continue;
         }
         assert!(

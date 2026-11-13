@@ -9,8 +9,6 @@ pub type HiprtcResult = c_int;
 pub type HiprtcProgram = *mut c_void;
 
 const HIPRTC_SUCCESS: HiprtcResult = 0;
-/// Environment variable that overrides the hiprtc library name.
-const HIPRTC_ENV: &str = "DGQ_HIPRTC";
 
 type HiprtcCreateProgram = unsafe extern "C" fn(
     *mut HiprtcProgram,
@@ -47,7 +45,7 @@ macro_rules! sym {
 
 impl Hiprtc {
     fn open() -> Result<Self, String> {
-        let mut names: Vec<String> = std::env::var(HIPRTC_ENV).into_iter().collect();
+        let mut names: Vec<String> = Vec::new();
         for name in [
             "libhiprtc.so",
             "libhiprtc.so.7",
@@ -74,7 +72,7 @@ fn library() -> Result<&'static Hiprtc, Error> {
     match LIB.get_or_init(Hiprtc::open) {
         Ok(lib) => Ok(lib),
         Err(msg) => Err(Error::Rocm(format!(
-            "no hiprtc ({msg}); install ROCm or set {HIPRTC_ENV}"
+            "no hiprtc ({msg}); install ROCm or put it on the library path"
         ))),
     }
 }

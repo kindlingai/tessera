@@ -1,0 +1,9 @@
+# Inputs arrive as arguments. The workspace's clippy.toml says why.
+disallowed-methods = [
+    { path = "std::env::var", reason = "pass it as an argument" },
+    { path = "std::env::var_os", reason = "pass it as an argument" },
+    { path = "std::env::vars", reason = "pass it as an argument" },
+    { path = "std::env::vars_os", reason = "pass it as an argument" },
+    { path = "std::env::home_dir", reason = "pass it as an argument" },
+    { path = "std::env::temp_dir", reason = "pass it as an argument" },
+]

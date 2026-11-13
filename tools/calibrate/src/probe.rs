@@ -2,8 +2,8 @@
 
 use codegen::prelude::*;
 use lower::{
-    Arg, Cluster, DType, Error, Kernel, KernelRef, Launch, Link, Plan, Run, Shape, Slot, Source,
-    Step, Tensor, Zone, ZoneKind, open,
+    Arg, Cluster, DType, Error, Kernel, KernelRef, Launch, Link, Plan, Run, Settings, Shape, Slot,
+    Source, Step, Tensor, Zone, ZoneKind, open,
 };
 use sim::{Fit, Tag};
 use std::time::Instant;
@@ -237,7 +237,7 @@ fn chain() -> Tensor {
 }
 
 /// Times each probe on this GPU. The fastest run counts.
-pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
+pub fn read(probes: &[Probe], settings: &Settings) -> Result<Vec<Reading>, Error> {
     let mut runner: Option<Box<dyn Run>> = None;
     let mut table: Option<Tensor> = None;
     let mut readings = Vec::with_capacity(probes.len());
@@ -247,7 +247,7 @@ pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
                 runner.replan(&probe.plan())?;
                 runner
             }
-            None => runner.insert(open(probe.plan())?),
+            None => runner.insert(open(probe.plan(), settings)?),
         };
         if probe.kind == Kind::Chase {
             runner.feed(&[table.get_or_insert_with(chain).view()])?;
@@ -284,14 +284,14 @@ fn least(tries: usize, mut go: impl FnMut() -> Result<(), Error>) -> Result<f64,
 }
 
 /// Times moves between this GPU and the host, both ways.
-pub fn links() -> Result<Cluster, Error> {
+pub fn links(settings: &Settings) -> Result<Cluster, Error> {
     let slot = |len| Slot::floats(0, len);
     let plan = Plan {
         buffers: vec![4 * MOVED],
         inputs: vec![slot(MOVED)],
         ..Plan::default()
     };
-    let mut runner = open(plan)?;
+    let mut runner = open(plan, settings)?;
     let zeros = Tensor::zeros(vec![MOVED], DType::F32);
     let mut cluster = Cluster::one(&runner.device());
     let host = cluster.add(Zone {

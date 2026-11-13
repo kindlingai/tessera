@@ -1,0 +1,9 @@
+# The process environment is read in one place: engine::settings.
+disallowed-methods = [
+    { path = "std::env::var", reason = "read it in engine::settings" },
+    { path = "std::env::var_os", reason = "read it in engine::settings" },
+    { path = "std::env::vars", reason = "read it in engine::settings" },
+    { path = "std::env::vars_os", reason = "read it in engine::settings" },
+    { path = "std::env::home_dir", reason = "read it in engine::settings" },
+    { path = "std::env::temp_dir", reason = "read it in engine::settings" },
+]

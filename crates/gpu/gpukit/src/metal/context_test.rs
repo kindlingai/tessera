@@ -1,4 +1,5 @@
 use super::{CacheConfig, Context};
+use std::path::PathBuf;
 
 const SRC: &str = "\
 #include <metal_stdlib>
@@ -12,7 +13,10 @@ kernel void pc_k3(device float* o [[buffer(0)]], uint i [[thread_position_in_gri
 fn test_config() -> CacheConfig {
     CacheConfig {
         enabled: true,
-        dir: Some(std::env::temp_dir().join("gpukit-test-pipeline-cache")),
+        dir: Some(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../target/scratch"
+        ))),
         namespace: "gpukit-test",
         key: 0x67706b74,
         verbose: false,
