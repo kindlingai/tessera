@@ -2,11 +2,12 @@
 
 use crate::Error;
 use crate::abi::{Arg, Launch, Shape, Source};
+use crate::extent::Extent;
 use crate::plan::Plan;
 use crate::run::{Held, Run};
 use codegen::Precision;
 use codegen::exec::{self, ArgVal, Grid};
-use codegen::ir::{Body, Param};
+use codegen::ir::{Body, Param, Ty};
 use gpukit::Limits;
 use graph::DimName;
 use mem::{Buffer, Host};
@@ -61,7 +62,7 @@ impl Runner {
         let mut args = Vec::with_capacity(launch.args.len());
         for (arg, param) in launch.args.iter().zip(&body.params) {
             args.push(match (arg, param) {
-                (Arg::Buffer(slot, skip), Param::Buffer { form, .. }) => {
+                (Arg::Buffer(slot, Extent::Fixed(skip)), Param::Buffer { form, .. }) => {
                     let at = match buffers.iter().position(|b| *b == slot.buffer) {
                         Some(at) => at,
                         None => {
@@ -76,10 +77,16 @@ impl Runner {
                         form: *form,
                     }
                 }
-                (Arg::U32(v), _) => ArgVal::U32(*v),
-                (Arg::F32(v), _) => ArgVal::F32(*v),
-                (other, _) => {
-                    return Err(Error::Unsupported(format!("{other:?} on the host")));
+                // The body says what each value is.
+                (Arg::Value(_), Param::Scalar { ty: Ty::F32, .. }) => {
+                    ArgVal::F32(arg.f32().unwrap())
+                }
+                (Arg::Value(_), Param::Scalar { ty: Ty::U32, .. }) => {
+                    ArgVal::U32(arg.u32().unwrap())
+                }
+                (other, param) => {
+                    let what = format!("{other:?} as {param:?} on the host");
+                    return Err(Error::Unsupported(what));
                 }
             });
         }

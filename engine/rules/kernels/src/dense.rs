@@ -57,7 +57,7 @@ fn launch(p: gemm::Problem, buffers: [Arg; 3]) -> Launch {
         down: p.m.div_ceil(gemm::BM),
         threads: gemm::THREADS as usize,
     };
-    let params = Arg::Bytes(gemm::abi_params(&p));
+    let params = Arg::Value(gemm::abi_params(&p));
     let args = Vec::from(buffers).into_iter().chain([params]);
     Launch {
         args: args.collect(),
@@ -150,7 +150,7 @@ impl Kernel for PerHead {
                 Part::Scores => (scores, [at.query, at.key, at.score]),
                 Part::Values => (values, [at.score, at.key, at.query]),
             };
-            launch(p, [0, 1, 2].map(|i| Arg::Buffer(slots[i], skips[i])))
+            launch(p, [0, 1, 2].map(|i| Arg::at(slots[i], skips[i])))
         })
     }
 
@@ -189,7 +189,7 @@ impl Kernel for Causal {
         let sizes = [rows, self.queries, self.keys].map(Arg::count);
         let args = [step.read(0)].into_iter().chain(sizes);
         vec![Launch {
-            args: args.chain([Arg::F32(self.scale)]).collect(),
+            args: args.chain([Arg::value(&self.scale)]).collect(),
             shape: Shape::Line(rows),
         }]
     }

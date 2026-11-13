@@ -61,11 +61,11 @@ impl Step {
 
     /// The `i`th input's buffer, from its start.
     pub fn read(&self, i: usize) -> Arg {
-        Arg::Buffer(self.reads[i], 0)
+        Arg::at(self.reads[i], 0)
     }
 
     pub fn out(&self) -> Arg {
-        Arg::Buffer(self.write, 0)
+        Arg::at(self.write, 0)
     }
 }
 

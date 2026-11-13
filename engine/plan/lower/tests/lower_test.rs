@@ -193,7 +193,7 @@ fn kept_rows_fit() {
             panic!("one scatter");
         };
         // Two rows of sixteen, into slots of sixteen rows.
-        assert_eq!(launch.args[4..], [Arg::U32(2), Arg::U32(16), Arg::U32(16)]);
+        assert_eq!(launch.args[4..], [2, 16, 16].map(Arg::count));
     }
     assert_eq!((appends.count(), count(&plan, "argmax")), (4, 1));
     let scratch: usize = plan.buffers.iter().sum::<usize>() - 4 * 1024;

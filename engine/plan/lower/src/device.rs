@@ -5,6 +5,7 @@ macro_rules! device_runner {
         pub mod $bk {
             use crate::Error;
             use crate::abi::{Arg, Launch, Shape, Source};
+            use crate::extent::Extent;
             use crate::plan::{Plan, Slot};
             use crate::run::{Held, Run};
             use codegen::Dialect;
@@ -58,15 +59,12 @@ macro_rules! device_runner {
                     let mut args = KernelArgs::new();
                     for arg in &launch.args {
                         match arg {
-                            Arg::Buffer(slot, skip) => {
+                            Arg::Buffer(slot, Extent::Fixed(skip)) => {
                                 let at = slot.at(*skip) as u64;
                                 args.device_ptr(self.buffer(*slot).device_ptr() + at)
                             }
-                            Arg::U32(v) => args.u32(*v),
-                            Arg::F32(v) => args.f32(*v),
-                            Arg::Pair(a, b) => args.u32(*a).u32(*b),
-                            Arg::Bytes(bytes) => args.bytes(bytes),
-                            Arg::Size(_) | Arg::Offset(..) | Arg::Span(..) => {
+                            Arg::Value(bytes) => args.bytes(bytes),
+                            Arg::Size(_) | Arg::Buffer(..) => {
                                 unreachable!("bound before launching")
                             }
                         };

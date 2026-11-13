@@ -70,7 +70,7 @@ impl Kernel for Angles {
         let sizes = [
             Arg::count(positions),
             Arg::count(self.width),
-            Arg::F32(self.theta),
+            Arg::value(&self.theta),
         ];
         let buffers = [step.read(0), step.out()];
         vec![Launch {

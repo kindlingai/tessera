@@ -5,7 +5,7 @@ use gpukit::backend::Backend;
 use gpukit::testing::Noise;
 use graph::DimName::{Ffn, Hidden, Rows};
 use interp::Tensor;
-use lower::{Arg, Plan, Settings, Source, Terms};
+use lower::{Plan, Settings, Source, Terms};
 use settings::read as settings;
 use std::collections::HashMap;
 use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights};
@@ -77,11 +77,14 @@ pub fn terms(plan: &Plan) -> Terms {
         let Param::Scalar { name, .. } = param else {
             continue;
         };
-        let value = match arg {
-            Arg::U32(v) => *v as f64,
-            Arg::F32(v) => *v as f64,
-            other => panic!("{other:?} is not a scalar"),
+        let Param::Scalar { ty, .. } = param else {
+            unreachable!()
         };
+        let value = match ty {
+            codegen::ir::Ty::F32 => arg.f32().map(f64::from),
+            _ => arg.u32().map(f64::from),
+        };
+        let value = value.unwrap_or_else(|| panic!("{arg:?} is not a scalar"));
         params.insert(name.clone(), value);
     }
     lower::terms(&body, &params).expect("every loop bound is a parameter")

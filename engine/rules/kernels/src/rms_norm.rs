@@ -57,7 +57,7 @@ impl Kernel for RmsNorm {
         let sizes = [
             Arg::count(self.rows),
             Arg::count(self.width),
-            Arg::F32(self.eps),
+            Arg::value(&self.eps),
         ];
         let buffers = [step.read(0), step.read(1), step.out()];
         vec![Launch {

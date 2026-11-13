@@ -466,10 +466,10 @@ impl Kernel for Flash {
         let per_kv = a.keys.most() * a.kv_heads * a.width;
         let launch = |s: usize| Launch {
             args: [
-                Arg::Buffer(step.reads[0], s * per_q),
-                Arg::Buffer(step.reads[1], s * per_kv),
-                Arg::Buffer(step.reads[2], s * per_kv),
-                Arg::Buffer(step.write, s * per_q),
+                Arg::at(step.reads[0], s * per_q),
+                Arg::at(step.reads[1], s * per_kv),
+                Arg::at(step.reads[2], s * per_kv),
+                Arg::at(step.write, s * per_q),
             ]
             .into_iter()
             .chain(a.args())
