@@ -1,0 +1,33 @@
+[package]
+name = "gemm"
+version = "0.1.0"
+edition = "2024"
+description = "The GEMM family: tiled Metal and CUDA bodies with a shared CPU oracle"
+license = "MIT"
+
+[features]
+default = []
+# NVRTC compiles the .cu body on first dispatch, so no toolkit is needed.
+cuda = ["gpukit/cuda"]
+# hiprtc compiles the same .cu body, so no ROCm toolkit is needed.
+rocm = ["gpukit/rocm"]
+
+[dependencies]
+settings = { workspace = true }
+gpukit = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLTypes",
+] }

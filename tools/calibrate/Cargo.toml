@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 codegen = { workspace = true }
-engine = { workspace = true }
+settings = { workspace = true }
 graph = { workspace = true }
 trace = { workspace = true }
 lower = { workspace = true }
