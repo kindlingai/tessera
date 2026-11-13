@@ -28,11 +28,10 @@ max_test_percent = 1
 # Unpaired test files count against the rest of their crate.
 max_module_test_percent = 25
 
-# Non-blank lines in a run of line shapes, and the most places one
-# run may appear in files of one type. Shapes collapse names and numbers.
-# Struct fields keep their names.
-shape_run = 9
-max_shape_copies = 3
+# Steps of non-blank lines in a run of line shapes, and the most
+# places one run that long may appear in files of one type.
+# Shapes collapse names and numbers. Struct fields keep their names.
+shape_steps = [[10, 3], [20, 2], [40, 1]]
 
 # tools/simcheck starts windows of lines at anchors its content picks,
 # about `similar_spacing` apart. Windows fail at `max_similarity` cosine.

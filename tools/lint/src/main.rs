@@ -38,8 +38,7 @@ pub struct Limits {
     pub min_macro_calls: usize,
     pub max_test_percent: usize,
     pub max_module_test_percent: usize,
-    pub shape_run: usize,
-    pub max_shape_copies: usize,
+    pub shape_steps: Vec<(usize, usize)>,
     pub extensions: Vec<String>,
 }
 

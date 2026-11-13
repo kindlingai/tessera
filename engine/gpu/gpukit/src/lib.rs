@@ -19,6 +19,8 @@ pub mod testing;
 pub mod metal;
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
+mod api;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod dl;

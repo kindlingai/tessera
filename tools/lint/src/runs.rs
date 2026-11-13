@@ -75,23 +75,34 @@ fn places<'a>(files: &'a [Shaped<'a>], len: usize) -> BTreeMap<(&'a str, &'a [St
     found
 }
 
-/// Runs in over `max_shape_copies` places want a macro.
+/// Reported regions: file, start and length.
+type Done = Vec<(usize, usize, usize)>;
+
+/// Longest steps go first. Each region reports once.
 pub fn check(sources: &[Source], out: &mut Vec<Violation>) {
-    let (len, max) = (LIMITS.shape_run, LIMITS.max_shape_copies);
     let files: Vec<Shaped> = sources.iter().map(shaped).collect();
-    let mut hits: Vec<Places> = places(&files, len)
+    let mut steps = LIMITS.shape_steps.clone();
+    steps.sort_by(|a, b| b.cmp(a));
+    let mut done = Done::new();
+    for (len, max) in steps {
+        step(&files, len, max, &mut done, out);
+    }
+}
+
+fn step(files: &[Shaped], len: usize, max: usize, done: &mut Done, out: &mut Vec<Violation>) {
+    let mut hits: Vec<Places> = places(files, len)
         .into_values()
         .filter(|p| p.len() > max)
         .collect();
     hits.sort();
-    // Shifted runs of one repeat: report the first only.
-    let mut last: Option<(usize, usize)> = None;
     for p in hits {
+        // Shifted runs of one repeat: report the first only.
         let (f, s) = p[0];
-        if last.is_some_and(|(lf, ls)| lf == f && s < ls + len) {
+        let near = |&(df, ds, dl): &(usize, usize, usize)| df == f && s < ds + dl && ds < s + len;
+        if done.iter().any(near) {
             continue;
         }
-        last = Some((f, s));
+        done.push((f, s, len));
         let at = |&(f, s): &(usize, usize)| format!("{}:{}", files[f].src.path, files[f].line[s]);
         let others: Vec<String> = p[1..].iter().map(at).collect();
         let msg = format!(

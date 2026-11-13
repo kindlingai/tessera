@@ -10,16 +10,20 @@ fn source(path: &str, text: String) -> Source {
     }
 }
 
-/// Violations over files of `line(i, n)`, one per path.
-fn hits(paths: &[&str], line: impl Fn(usize, usize) -> String) -> usize {
+/// Violations over `len` lines of `line(i, n)` per path.
+fn hits_of(len: usize, paths: &[&str], line: impl Fn(usize, usize) -> String) -> usize {
     let srcs: Vec<Source> = paths
         .iter()
         .enumerate()
-        .map(|(n, p)| source(p, (0..11).map(|i| line(i, n) + "\n").collect()))
+        .map(|(n, p)| source(p, (0..len).map(|i| line(i, n) + "\n").collect()))
         .collect();
     let mut out = Vec::new();
     check(&srcs, &mut out);
     out.len()
+}
+
+fn hits(paths: &[&str], line: impl Fn(usize, usize) -> String) -> usize {
+    hits_of(11, paths, line)
 }
 
 /// A call with `i` arguments, named by `n`.
@@ -52,4 +56,14 @@ fn struct_fields_keep_names() {
     assert_eq!(hits(&all, def(true)), 0);
     assert_eq!(hits(&all, def(false)), 1);
     assert_eq!(hits(&all, init), 1);
+}
+
+#[test]
+fn copies_per_step() {
+    let (two, three) = (["a.rs", "b.rs"], ["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(hits_of(19, &three, call), 0);
+    assert_eq!(hits_of(20, &three, call), 1);
+    assert_eq!(hits_of(39, &two, call), 0);
+    assert_eq!(hits_of(40, &two, call), 1);
+    assert_eq!(hits_of(40, &["a.rs", "b.rs", "c.rs", "d.rs"], call), 1);
 }
