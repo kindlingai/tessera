@@ -10,7 +10,7 @@ mod top;
 pub use attend::Attend;
 pub use chain::Chain;
 pub use gather::Gather;
-pub use matmul::Matmul;
+pub use matmul::{After, Finished, Matmul};
 pub use stage::Stage;
 pub use top::Top;
 

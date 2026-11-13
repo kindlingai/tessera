@@ -4,13 +4,13 @@ use codegen::hash;
 use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use codegen::prelude::*;
 use graph::Order;
-use lower::kernels::{MapStage, add_operands, operands, stage_stmts};
+use lower::kernels::{add_operands, finish};
 use lower::sites;
+use lower::sites::After;
 use lower::{
-    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
+    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 thread_local! {
@@ -65,14 +65,6 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
     }
 }
 
-/// Elementwise stages a sum runs through before it is stored.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct After {
-    pub stages: Vec<MapStage>,
-    /// Which of the chain's reads the sum stands in for.
-    pub sum: usize,
-}
-
 /// `x[m, k]` times `w[n, k]` transposed, per SIMD group.
 #[derive(Clone, Debug)]
 pub struct Lanes {
@@ -84,54 +76,30 @@ pub struct Lanes {
 }
 
 impl Lanes {
-    fn others(&self) -> usize {
-        match self.after.stages.is_empty() {
-            true => 0,
-            false => operands(&self.after.stages),
-        }
-    }
-
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
         let build = || linear_ir::<WIDE, AHEAD>(self.m, self.form);
         let key = (self.m, self.form.name());
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         // The operands sit between the weights and the output.
-        add_operands(&mut body, 2, self.others());
+        add_operands(&mut body, 2, self.after.others());
         body.stmts.push(self.stores());
         body
     }
 
     /// Each row's sum through the stages, into its place.
     fn stores(&self) -> Stmt {
-        let After { stages, sum } = &self.after;
         let u64 = |e| Expr::cast(Ty::U64, e);
         let o = Expr::bin(BinOp::Mul, u64(Expr::var("r")), u64(Expr::var("n")));
         let o = Expr::bin(BinOp::Add, o, u64(Expr::var("col")));
-        let v = Expr::index(Expr::var("s"), Expr::var("r"));
-        // The chain's reads in order, the sum among them.
-        let read = |j: usize| match j.cmp(sum) {
-            Ordering::Equal => v.clone(),
-            Ordering::Less => Expr::index(Expr::var(&format!("a{j}")), o.clone()),
-            Ordering::Greater => Expr::index(Expr::var(&format!("a{}", j - 1)), o.clone()),
-        };
-        let mut body = vec![Stmt::Let {
-            name: "v".into(),
-            init: read(0),
-        }];
-        body.extend(stage_stmts(stages, &|j| read(j + 1)));
-        body.push(Stmt::Assign {
-            target: Expr::index(Expr::var("out"), o),
-            op: None,
-            value: Expr::var("v"),
-        });
+        let sum = Expr::index(Expr::var("s"), Expr::var("r"));
         Stmt::For {
             var: "r".into(),
             from: Expr::Int(0),
             to: Expr::Int(self.m as i64),
             step: Expr::Int(1),
             unroll: 0,
-            body,
+            body: finish(&self.after, sum, o),
         }
     }
 }
@@ -202,29 +170,9 @@ impl Kernel for Lanes {
     }
 }
 
-/// The matmul at `at`, or the one its stages finish.
-pub(crate) fn finishing(tree: &Tree, at: T) -> Option<(sites::Matmul, After, Vec<Read>)> {
-    if let Some(product) = tree.site::<sites::Matmul>(at) {
-        return Some((product, After::default(), Vec::new()));
-    }
-    let sites::Chain { stages, reads, .. } = tree.site(at)?;
-    let lone = |r: &T| tree.site::<sites::Matmul>(*r).filter(|_| !tree.root(*r));
-    let sum = reads.iter().position(|r| lone(r).is_some())?;
-    let others = reads.iter().filter(|r| **r != reads[sum]);
-    let others = others.map(|r| Read::Node(*r)).collect();
-    Some((lone(&reads[sum])?, After { stages, sum }, others))
-}
-
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (product, after, others) = finishing(tree, at)?;
-    let sites::Matmul {
-        x,
-        w,
-        m,
-        n,
-        k,
-        form,
-    } = product;
+    let site: sites::Finished = tree.site(at)?;
+    let sites::Matmul { m, n, k, form, .. } = site.product;
     // Wide loads need whole groups of four along `k`.
     if m > ROWS || !k.is_multiple_of(WIDE as usize) {
         return None;
@@ -234,10 +182,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         n,
         k,
         form,
-        after,
+        after: site.after.clone(),
     };
-    let reads = [Read::Node(x), Read::Node(w)].into_iter().chain(others);
-    Some(vec![Draft::new(lanes, reads, m * n)])
+    Some(vec![Draft::new(lanes, site.reads(), m * n)])
 }
 
 lower::rule!("lanes", propose);

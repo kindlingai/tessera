@@ -3,5 +3,5 @@
 mod lanes;
 mod tiled;
 
-pub use lanes::{After, Lanes};
+pub use lanes::Lanes;
 pub use tiled::{SCHEDULES, Schedule, Tiled};
