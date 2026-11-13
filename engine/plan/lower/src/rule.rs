@@ -5,6 +5,7 @@ use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
 use crate::plan::Step;
 use crate::tree::{T, Tree};
+use codegen::kept::Layout;
 
 pub use scattered_collect::declarative::{gather, scatter};
 
@@ -18,8 +19,10 @@ pub struct Attn {
     pub heads: usize,
     pub kv_heads: usize,
     pub width: usize,
-    /// Rows one slot holds in the kept keys.
-    pub stride: usize,
+    /// Rows one slot may hold in the kept keys.
+    pub context: usize,
+    /// Where kept rows lie.
+    pub kept: &'static dyn Layout,
     /// Slots the query rows span, at most.
     pub segments: usize,
 }
@@ -38,7 +41,13 @@ impl Attn {
         ]
     }
 
-    /// A ragged launch: six buffers, then its five sizes.
+    /// The layout's scalars, which come after a kernel's own.
+    pub fn kept_args(&self) -> Vec<Arg> {
+        let values = self.kept.values(self.seqs, self.context);
+        values.into_iter().map(|v| Arg::count(v as usize)).collect()
+    }
+
+    /// A ragged launch: six buffers, then its four sizes.
     pub fn rows_args(&self, step: &Step) -> Vec<Arg> {
         let buffers = [
             step.read(0),
@@ -51,7 +60,6 @@ impl Attn {
         let sizes = [
             Arg::count(self.queries),
             Arg::size(self.keys),
-            Arg::count(self.stride),
             Arg::count(self.heads),
             Arg::count(self.kv_heads),
         ];

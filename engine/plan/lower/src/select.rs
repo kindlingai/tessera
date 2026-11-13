@@ -83,7 +83,7 @@ pub fn select_upto(
     upto: &[DimName],
     device: &Device,
 ) -> Result<Selected, Error> {
-    let tree = Tree::upto(g, entry, sizes, upto, &device.pins)?;
+    let tree = Tree::upto(g, entry, sizes, upto, &device.pins, device.kept)?;
     let nodes = (0..tree.len() as u32).map(T);
     let rules = rules();
     let mut cover = Cover {

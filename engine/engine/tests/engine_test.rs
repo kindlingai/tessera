@@ -4,7 +4,7 @@ use engine::{Batch, Engine, Event, Fair, Reason, Request, Row};
 use gpukit::testing::Noise;
 use graph::Graph;
 use interp::{Store, Tensor, run_kept};
-use lower::Recipe;
+use lower::{Recipe, kept};
 use models::qwen3::{Config, stepper};
 
 fn weights(g: &Graph, noise: &mut Noise) -> Vec<Tensor> {
@@ -55,10 +55,13 @@ fn reference(g: &Graph, weights: &[Tensor], prompt: &[u32], n: usize) -> Vec<u32
 
 /// A toy engine with `slots` lanes, its graph and weights.
 fn open(seed: u64, slots: u64) -> (Graph, Vec<Tensor>, Engine) {
+    open_on(seed, slots, Recipe::default())
+}
+
+fn open_on(seed: u64, slots: u64, recipe: Recipe) -> (Graph, Vec<Tensor>, Engine) {
     let c = Config::toy(slots, 16);
     let g = stepper(&c);
     let weights = weights(&g, &mut Noise(seed));
-    let recipe = Recipe::default();
     let mut engine = Engine::open(stepper(&c), 16, &recipe, &settings::read()).unwrap();
     engine.load(&weights).unwrap();
     (g, weights, engine)
@@ -125,22 +128,29 @@ fn engine_matches_interpreter() {
 
 #[test]
 fn rows_mix_slots() {
-    let (g, weights, mut engine) = open(13, 4);
-    // Two prompts at once, decodes side by side, then alone.
-    let launches = [
-        vec![row(2, 5, 0), row(2, 7, 1), row(0, 9, 0)],
-        vec![row(0, 4, 1), row(2, 3, 2)],
-        vec![row(2, 6, 3)],
-        vec![row(0, 8, 2), row(2, 1, 4)],
-    ];
-    let mut store = Store::default();
-    for rows in launches {
-        let want = step(&g, &weights, &mut store, &rows);
-        assert_eq!(engine.step(&rows).unwrap(), want, "{rows:?}");
+    // The interpreter keeps rows densely. Any layout must agree.
+    for kept in [kept::DENSE, kept::INTERLEAVED] {
+        let recipe = Recipe {
+            kept,
+            ..Recipe::default()
+        };
+        let (g, weights, mut engine) = open_on(13, 4, recipe);
+        // Two prompts at once, decodes side by side, then alone.
+        let launches = [
+            vec![row(2, 5, 0), row(2, 7, 1), row(0, 9, 0)],
+            vec![row(0, 4, 1), row(2, 3, 2)],
+            vec![row(2, 6, 3)],
+            vec![row(0, 8, 2), row(2, 1, 4)],
+        ];
+        let mut store = Store::default();
+        for rows in launches {
+            let want = step(&g, &weights, &mut store, &rows);
+            assert_eq!(engine.step(&rows).unwrap(), want, "{rows:?} on {kept:?}");
+        }
+        // Slots and positions past the graph's bounds are refused.
+        assert!(engine.step(&[row(4, 1, 0)]).is_err());
+        assert!(engine.step(&[row(0, 1, 16)]).is_err());
     }
-    // Slots and positions past the graph's bounds are refused.
-    assert!(engine.step(&[row(4, 1, 0)]).is_err());
-    assert!(engine.step(&[row(0, 1, 16)]).is_err());
 }
 
 /// Several answers through one batch, each against its own reference.

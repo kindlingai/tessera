@@ -186,6 +186,11 @@ impl Tiles {
     }
 }
 
+/// The kept row of `position` in `slot`.
+pub fn kept_row(_: u32, _: u32) -> u32 {
+    device()
+}
+
 /// The thread's index in the grid.
 pub fn gid() -> u32 {
     device()

@@ -1,6 +1,7 @@
 //! Causal attention that walks the keys one at a time.
 
 use crate::join::Join;
+use codegen::kept;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
@@ -121,7 +122,6 @@ fn attend_rows(
     positions: Buf<U32>,
     rows: u32,
     keys: u32,
-    stride: u32,
     heads: u32,
     kv_heads: u32,
     width: u32,
@@ -147,7 +147,7 @@ fn attend_rows(
         keys
     };
     for t in 0..last {
-        let kv_off = (((slot * stride + t) * kv_heads + kvh) * width) as u64;
+        let kv_off = ((kept_row(slot, t) * kv_heads + kvh) * width) as u64;
         let dot = group_dot(q, k, q_off, kv_off, width, &mut red);
         let m_new = max(m, dot);
         let corr = exp(m - m_new);
@@ -167,7 +167,8 @@ impl Kernel for AttendRows {
     over_attn!("attend_rows");
 
     fn source(&self) -> Source {
-        Source::named(attend_rows_ir(), "plan_attend_rows")
+        let body = kept::attach(attend_rows_ir(), self.0.kept);
+        Source::named(body, format!("plan_attend_rows_{}", self.0.kept.name()))
     }
 
     /// One launch over every row.
@@ -175,6 +176,7 @@ impl Kernel for AttendRows {
         let a = &self.0;
         let mut args = a.rows_args(step);
         args.push(Arg::count(a.width));
+        args.extend(a.kept_args());
         vec![Launch {
             args,
             shape: Shape::Grid {

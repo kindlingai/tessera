@@ -333,7 +333,7 @@ fn models_fill_gaps() {
 #[test]
 fn trees_cut_shared() {
     let g = program(&Config::toy(4, 16));
-    let tree = Tree::new(&g, 0, &SIZES, &Pins::default()).unwrap();
+    let tree = Tree::new(&g, 0, &SIZES, &Pins::default(), lower::kept::DENSE).unwrap();
     let chains = |want: &[MapStage]| -> Vec<(T, Vec<T>)> {
         let all = (0..tree.len() as u32).map(T);
         let chain = |t: T| match tree.site(t)? {

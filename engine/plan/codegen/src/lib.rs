@@ -7,12 +7,14 @@ pub mod exec;
 pub mod form;
 pub mod inline;
 pub mod ir;
+pub mod kept;
 pub mod numerics;
 pub mod prelude;
 mod tile;
 
 pub use dialect::{Dialect, Text, float, hash};
 pub use form::{Form, Layout};
+pub use kept::Layout as Kept;
 pub use kernel_macro::kernel;
 pub use numerics::{Precision, Terms, terms};
 
