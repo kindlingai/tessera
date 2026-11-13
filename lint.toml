@@ -1,7 +1,8 @@
-# Code-shape limits. tools/lint compiles these in; CI and the hook enforce them.
+# Code-shape limits. tools/lint compiles these in, and CI and the hook enforce them.
 
-# Words in one comment block; adjacent comment lines are one block.
+# Words in one comment block. Adjacent comment lines are one block.
 max_comment_words = 10
+# A `;` in a comment must sit in backticks or a ``` block.
 
 # Snake-case segments in a function name, and when a shared prefix
 # or suffix lets a name go one longer.

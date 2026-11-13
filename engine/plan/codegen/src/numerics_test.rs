@@ -6,7 +6,7 @@ use std::collections::HashMap;
 fn operands_round() {
     let (hi, lo) = Precision::HIP.split(1.0 + 1.0 / 1024.0 + 1.0 / 4096.0);
     assert_eq!((hi, lo), (1.0 + 1.0 / 1024.0, 1.0 / 4096.0));
-    // f16 overflows past 65504; tf32 keeps f32's range.
+    // f16 overflows past 65504. `tf32` keeps f32's range.
     assert!(Precision::HIP.split(70_000.0).0.is_infinite());
     assert!(Precision::CUDA.split(70_000.0).0.is_finite());
     // Below 2^-14 an f16 keeps a fixed step of 2^-24.

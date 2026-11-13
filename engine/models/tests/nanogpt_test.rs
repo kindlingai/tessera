@@ -124,7 +124,7 @@ fn weights(g: &Graph) -> Vec<Tensor> {
     let mut make = |w: &graph::Weight| {
         let size = |e: &trace::DimExpr| e.poly(&g.dims).unwrap().as_const().unwrap() as usize;
         let shape: Vec<usize> = w.ty.shape.0.iter().map(size).collect();
-        // Norm weights sit near one; the rest near zero.
+        // Norm weights sit near one. The rest sit near zero.
         let value = |noise: &mut Noise| match shape.len() {
             1 => 1.0 + 0.1 * noise.draw(),
             _ => 0.3 * noise.draw(),

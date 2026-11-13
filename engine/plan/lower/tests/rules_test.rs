@@ -79,7 +79,7 @@ fn fill(g: &Graph, ty: &TensorType, noise: &mut Noise) -> Tensor {
     }
 }
 
-/// Runs entry 0 both ways; returns the largest difference.
+/// Runs entry 0 both ways. Returns the largest difference.
 fn gap(g: &Graph, weights: &[Tensor], inputs: &[Tensor], device: &Device) -> f32 {
     let want = run(g, weights, 0, inputs).unwrap();
     let mut runner = open(lower(g, 0, &SIZES, device).unwrap(), &settings()).unwrap();

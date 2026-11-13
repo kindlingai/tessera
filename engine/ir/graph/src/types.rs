@@ -40,7 +40,7 @@ pub enum Placement {
     Split {
         axis: u32,
     },
-    /// Per-rank partial sums; an all-reduce makes it whole.
+    /// Per-rank partial sums. An all-reduce makes it whole.
     Partial,
 }
 

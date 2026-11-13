@@ -20,7 +20,7 @@ pub fn source_hash(source: &str) -> u64 {
     h
 }
 
-/// Function-constant values; every one goes into the cache label.
+/// Function-constant values. Every one goes into the cache label.
 #[derive(Clone, Default)]
 pub struct FcValues {
     bools: Vec<(u32, bool)>,
@@ -115,7 +115,7 @@ pub struct Context {
 }
 
 impl Context {
-    /// Open the default device; the first context fixes cache settings.
+    /// Open the default device. The first context fixes cache settings.
     pub fn new(cache: CacheConfig) -> Result<Self, Error> {
         let includes = crate::includes::include_table()?;
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
@@ -205,7 +205,7 @@ impl Context {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &fc)
             .map_err(compile_error)?;
-        // The prefix is for people; values and hash give uniqueness.
+        // The prefix is for people. Values and hash give uniqueness.
         let label = format!(
             "{label_prefix}{}_s{:x}",
             values.label_suffix(),

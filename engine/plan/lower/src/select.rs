@@ -23,12 +23,12 @@ pub struct Val(pub u32);
 pub enum Home {
     Weight(u32),
     Input(u32),
-    /// Kept rows; `room` elements hold the longest context.
+    /// Kept rows. `room` elements hold the longest context.
     Kept {
         index: u32,
         room: usize,
     },
-    /// Written by an op; its buffer may be reused.
+    /// Written by an op. Its buffer may be reused.
     Temp,
 }
 

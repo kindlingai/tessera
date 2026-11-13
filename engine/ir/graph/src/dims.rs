@@ -28,7 +28,7 @@ pub enum DimName {
     /// Width of the low-rank keys and values.
     Latent,
     Ffn,
-    /// A dense layer's MLP width; experts use `Ffn`.
+    /// A dense layer's MLP width. Experts use `Ffn`.
     DenseFfn,
     Vocab,
     Experts,
@@ -140,7 +140,7 @@ impl Poly {
         }
     }
 
-    /// The value under `size`; `None` if a dimension is unbound.
+    /// The value under `size`. `None` if a dimension is unbound.
     pub fn eval(&self, size: &dyn Fn(DimName) -> Option<u64>) -> Option<u64> {
         let mut total = 0;
         for (m, c) in &self.0 {
@@ -168,7 +168,7 @@ impl DimExpr {
         })
     }
 
-    /// Fixed dimensions become constants; bounded ones stay symbolic.
+    /// Fixed dimensions become constants. Bounded ones stay symbolic.
     pub fn poly(&self, dims: &[Dim]) -> Result<Poly, DimName> {
         Ok(match self {
             DimExpr::Const(c) => Poly::constant(*c),

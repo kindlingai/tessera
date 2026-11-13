@@ -69,14 +69,14 @@ struct ArchiveInner {
     dirty: bool,
 }
 
-// SAFETY: the archive sits behind the lock; pipelines are immutable.
+// SAFETY: the archive sits behind the lock. Pipelines are immutable.
 unsafe impl Send for PipelineArchiveCache {}
 unsafe impl Sync for PipelineArchiveCache {}
 
 static GLOBAL_CACHE: OnceLock<Result<Arc<PipelineArchiveCache>, String>> = OnceLock::new();
 
 impl PipelineArchiveCache {
-    /// The process-global cache; the first call's `config` wins.
+    /// The process-global cache. The first call's `config` wins.
     pub fn shared(
         device: &ProtocolObject<dyn MTLDevice>,
         config: &CacheConfig,

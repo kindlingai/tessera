@@ -1,6 +1,6 @@
-//! Splices `#include "x.metal"` headers in; Metal compiles one string.
+//! Splices `#include "x.metal"` headers in. Metal compiles one string.
 
-/// `#include "name.metal"` gives `Some(name)`; system includes pass.
+/// `#include "name.metal"` gives `Some(name)`. System includes pass.
 fn parse_local_include(line: &str) -> Option<&str> {
     let rest = line.trim().strip_prefix("#include \"")?;
     let name = &rest[..rest.find('"')?];

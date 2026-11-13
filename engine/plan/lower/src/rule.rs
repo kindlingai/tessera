@@ -1,4 +1,4 @@
-//! Rules propose kernels for a site; link time collects them.
+//! Rules propose kernels for a site. Link time collects them.
 
 use crate::abi::Arg;
 use crate::extent::Extent;

@@ -26,7 +26,7 @@ impl Model {
         }
     }
 
-    /// A fixed dimension's size; panics on bounded ones.
+    /// A fixed dimension's size. Panics on bounded ones.
     pub fn size(&self, name: DimName) -> u64 {
         let g = self.g.borrow();
         match g.dims.iter().find(|d| d.name == name) {

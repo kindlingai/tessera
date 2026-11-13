@@ -7,7 +7,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLSize,
 };
 
-/// Bind `value`'s bytes as an argument; `T` must be `#[repr(C)]`.
+/// Bind `value`'s bytes as an argument. `T` must be `#[repr(C)]`.
 pub fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: &T,
@@ -37,7 +37,7 @@ pub fn div_up(value: usize, group: usize) -> usize {
     value.div_ceil(group)
 }
 
-/// 1D dispatch split at 65535 threadgroups; `encode` gets (base, count).
+/// 1D dispatch split at 65535 threadgroups. `encode` gets (base, count).
 pub fn dispatch_1d_ranged(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
