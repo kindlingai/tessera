@@ -3,7 +3,7 @@
 use crate::abi::{Launch, Source};
 use crate::form::Form;
 use crate::plan::Step;
-use gpukit::Limits;
+use gpukit::Platform;
 use graph::Order;
 use sim::{Load, ZoneKind};
 use std::fmt;
@@ -68,6 +68,8 @@ pub struct Needs {
     pub group_threads: usize,
     /// Hand-written text, for a backend with a compiler.
     pub compiler: bool,
+    /// Tiles on a matrix unit.
+    pub tile: bool,
 }
 
 impl Needs {
@@ -79,11 +81,13 @@ impl Needs {
         }
     }
 
-    pub fn fits(&self, limits: &Limits) -> bool {
+    pub fn fits(&self, platform: &Platform) -> bool {
+        let limits = &platform.limits;
         (self.lanes == 0 || self.lanes == limits.lanes)
             && self.group_bytes <= limits.group_bytes
             && self.group_threads <= limits.group_threads
             && (!self.compiler || limits.compiler)
+            && (!self.tile || platform.tile().is_some())
     }
 }
 

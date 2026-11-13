@@ -314,6 +314,7 @@ impl Kernel for Tiled {
             lanes: LANES,
             group_bytes: 4 * (bm + bn) * (bk + PAD as usize),
             group_threads: self.schedule.threads(),
+            tile: true,
             ..Needs::default()
         }
     }

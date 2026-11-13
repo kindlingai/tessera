@@ -9,6 +9,7 @@ use codegen::Precision;
 use codegen::exec::{self, ArgVal, Grid};
 use codegen::ir::{Body, Param, Ty};
 use gpukit::Limits;
+use gpukit::Platform;
 use graph::DimName;
 use mem::{Buffer, Host};
 use std::collections::HashMap;
@@ -192,8 +193,8 @@ impl Run for Runner {
         format!("cpu {} lanes{tiles}", self.lanes)
     }
 
-    fn limits(&self) -> Limits {
-        limits(self.lanes)
+    fn platform(&self) -> Platform {
+        Platform::host(limits(self.lanes))
     }
 
     fn precision(&self) -> Precision {

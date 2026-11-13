@@ -8,6 +8,7 @@ use std::thread::LocalKey;
 use super::hip::{self, Runtime};
 use crate::api::{self, Api, Call, Handle, Kind};
 use crate::device::{Caches, Device};
+use crate::platform::{self, Asked, Platform};
 use crate::{Error, Limits};
 
 pub use crate::api::ContextConfig;
@@ -18,9 +19,10 @@ pub type Module = api::Module<Runtime>;
 pub type Kernel = api::Kernel<Runtime>;
 pub type Graph = api::Graph<Runtime>;
 
-/// `warpSize`, asked once.
+/// `warpSize`, asked once, and the platform, built once.
 pub struct Own {
     lanes: OnceLock<usize>,
+    platform: OnceLock<Platform>,
 }
 
 impl Context {
@@ -57,10 +59,51 @@ impl Context {
 
         let own = Own {
             lanes: OnceLock::new(),
+            platform: OnceLock::new(),
         };
         let ctx = Self::made(runtime, own, device, name);
         ctx.set_current()?;
         Ok(ctx)
+    }
+
+    /// One `hipDeviceGetAttribute`.
+    fn attr(&self, which: c_int) -> Result<i32, Error> {
+        let mut v: c_int = 0;
+        let r = self.runtime();
+        r.check(
+            unsafe { (r.hip_device_get_attribute)(&mut v, which, self.device()) },
+            "hipDeviceGetAttribute",
+        )?;
+        Ok(v)
+    }
+
+    /// The device as asked, with its row. Zero when unasked.
+    pub fn platform(&self) -> Platform {
+        self.own()
+            .platform
+            .get_or_init(|| {
+                let attr = |a| self.attr(a).unwrap_or(0);
+                let mut v: c_int = 0;
+                unsafe { (self.runtime().hip_runtime_get_version)(&mut v) };
+                let (major, minor) = (
+                    attr(hip::ATTR_COMPUTE_CAPABILITY_MAJOR),
+                    attr(hip::ATTR_COMPUTE_CAPABILITY_MINOR),
+                );
+                Platform::new(Asked {
+                    backend: "rocm",
+                    arch: format!("gfx{major}_{minor}"),
+                    name: self.name().to_string(),
+                    driver: format!("{}.{}", v / 10_000_000, (v / 100_000) % 100),
+                    limits: self.limits(),
+                    units: attr(hip::ATTR_MULTIPROCESSOR_COUNT) as usize,
+                    bandwidth: platform::bandwidth(
+                        attr(hip::ATTR_MEMORY_CLOCK_RATE),
+                        attr(hip::ATTR_MEMORY_BUS_WIDTH),
+                    ),
+                    integrated: attr(hip::ATTR_INTEGRATED) != 0,
+                })
+            })
+            .clone()
     }
 
     /// Lanes come from the device. The rest are AMD constants.

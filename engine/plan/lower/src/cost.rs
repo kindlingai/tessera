@@ -6,7 +6,7 @@ use crate::plan::{Plan, Step};
 use crate::recipe::Recipe;
 use crate::run::Run;
 use codegen::kept::Layout;
-use gpukit::{Limits, Settings};
+use gpukit::{Limits, Platform, Settings};
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
 use std::cell::RefCell;
@@ -80,9 +80,9 @@ pub struct Device {
     /// The zones plans may span. Zone 0 is this GPU.
     #[serde(default)]
     pub cluster: Cluster,
-    /// What this GPU gives one group of threads.
+    /// The hardware as asked, with its table row.
     #[serde(default)]
-    pub limits: Limits,
+    pub platform: Platform,
     timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
@@ -120,7 +120,7 @@ impl PartialEq for Device {
         self.name == other.name
             && self.fit == other.fit
             && self.cluster == other.cluster
-            && self.limits == other.limits
+            && self.platform == other.platform
             && self.timed == other.timed
             && self.favor == other.favor
             && self.barred == other.barred
@@ -140,7 +140,7 @@ impl Default for Device {
             fit: None,
             pool: None,
             cluster: Cluster::default(),
-            limits: Limits::default(),
+            platform: Platform::default(),
             timed: BTreeMap::new(),
             favor: None,
             barred: Vec::new(),
@@ -161,12 +161,12 @@ const NEAR: usize = 3;
 impl Device {
     /// The device `open` picks under `settings`, before any samples.
     pub fn guess(settings: &Settings) -> Self {
-        let limits = match settings.gpu() {
-            None => crate::cpu::limits(settings.host_lanes),
-            Some(_) => Limits::assumed(),
+        let platform = match settings.gpu() {
+            None => Platform::host(crate::cpu::limits(settings.host_lanes)),
+            Some(_) => Platform::assumed(Limits::assumed()),
         };
         Self {
-            limits,
+            platform,
             ..Self::default()
         }
     }
@@ -178,15 +178,16 @@ impl Device {
         Some(settings.costs.as_ref()?.join(format!("{file}.json")))
     }
 
-    /// The samples stored for the runner's device, or a guess.
+    /// The samples stored for the runner's platform, or a guess.
     pub fn stored(runner: &dyn Run, settings: &Settings) -> Result<Self, Error> {
-        let loaded = Self::path(settings, &runner.device()).map(|p| Self::load(&p));
+        let platform = runner.platform();
+        let loaded = Self::path(settings, &platform.id()).map(|p| Self::load(&p));
         let device = match loaded {
             Some(Err(e)) if e.kind() == ErrorKind::NotFound => Self::guess(settings),
             Some(loaded) => loaded?,
             None => Self::guess(settings),
         };
-        Ok(device.within(runner.limits()))
+        Ok(device.on(platform))
     }
 
     /// The same device, choosing as `recipe` says.
@@ -198,9 +199,9 @@ impl Device {
         self.changed()
     }
 
-    /// The same device, within what its hardware gives a group.
-    pub fn within(mut self, limits: Limits) -> Self {
-        self.limits = limits;
+    /// The same device, on this hardware.
+    pub fn on(mut self, platform: Platform) -> Self {
+        self.platform = platform;
         self.changed()
     }
 

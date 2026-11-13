@@ -486,6 +486,7 @@ impl Kernel for Flash {
             lanes: LANES,
             group_bytes: 4 * floats,
             group_threads: THREADS as usize,
+            tile: true,
             ..Needs::default()
         }
     }
@@ -566,6 +567,7 @@ impl Kernel for FlashRows {
             lanes: LANES,
             group_bytes: 4 * floats,
             group_threads: THREADS as usize,
+            tile: true,
             ..Needs::default()
         }
     }

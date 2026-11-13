@@ -1,12 +1,13 @@
 use crate::metal::expand::expand;
 use crate::metal::pipeline_cache::{CacheConfig, PipelineArchiveCache};
+use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
-    MTLFunctionConstantValues, MTLLibrary,
+    MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary,
 };
 use std::sync::Arc;
 
@@ -134,6 +135,28 @@ impl Context {
     /// The device's marketing name.
     pub fn name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// The device as asked, with its table row.
+    pub fn platform(&self) -> Platform {
+        let families = [
+            (MTLGPUFamily::Apple9, "apple9"),
+            (MTLGPUFamily::Apple8, "apple8"),
+            (MTLGPUFamily::Apple7, "apple7"),
+        ];
+        let newest = families
+            .iter()
+            .find(|(f, _)| self.device.supportsFamily(*f));
+        Platform::new(Asked {
+            backend: "metal",
+            arch: newest.map_or("apple", |(_, n)| n).into(),
+            name: self.name(),
+            driver: String::new(),
+            limits: self.limits(),
+            units: 0,
+            bandwidth: 0.0,
+            integrated: true,
+        })
     }
 
     /// Apple GPUs run 32 lanes together. The rest is asked.
