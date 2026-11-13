@@ -318,13 +318,16 @@ mod forward {
         let tokens = repeat(gpu.c, planned.out.len() / 151_936);
         let sizes = prompt(&tokens).sizes();
         let contested = select(g, 0, &sizes, &pinned()).unwrap().contested;
-        let (mixed, mut least) = (timed(planned), f64::INFINITY);
+        let mut least = f64::INFINITY;
         for rule in contested {
             let device = gpu.device.clone().favoring(rule);
             let forced = timed(&run(gpu, g, &tokens, &device));
             eprintln!("  favoring {rule:8} {forced:.3} s");
             least = least.min(forced);
         }
+        // A second timing, warm like the forced runs before it.
+        let device = gpu.device.clone();
+        let mixed = timed(&run(gpu, g, &tokens, &device));
         eprintln!("  as planned        {mixed:.3} s");
         assert!(mixed < 1.25 * least, "the plan lost to a forced choice");
     }
