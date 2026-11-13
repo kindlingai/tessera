@@ -57,7 +57,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
                     buffer,
                     offset: 0,
                     len: value.len,
-                    dtype: value.form.dtype(),
+                    form: value.form,
                 };
                 b.slots[v] = Some(slot);
                 b.plan.kept.push((index, slot));
@@ -95,7 +95,7 @@ impl Buffers<'_> {
         let Value {
             len, zone, form, ..
         } = self.s.values[v.0 as usize];
-        let (bytes, dtype) = (form.bytes(len), form.dtype());
+        let bytes = form.bytes(len);
         let fits = |b: &u32| self.plan.buffers[*b as usize] == bytes && self.plan.zone(*b) == zone;
         let buffer = match self.free.iter().position(fits) {
             Some(at) => self.free.swap_remove(at),
@@ -105,7 +105,7 @@ impl Buffers<'_> {
             buffer,
             offset: 0,
             len,
-            dtype,
+            form,
         };
         self.slots[v.0 as usize] = Some(slot);
         slot

@@ -1,10 +1,19 @@
 //! Storage forms: how buffers hold elements and reads decode them.
 
-use graph::DType;
+use graph::{Bf16 as Half, DType};
 use std::fmt;
 use std::sync::Mutex;
 
 pub use scattered_collect::declarative::{gather, scatter};
+
+/// How elements lie, and so which kernels can read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Rows of elements. Any kernel can index one.
+    Rows,
+    /// Whole tiles. A kernel written for them reads them.
+    Tiles { rows: usize, cols: usize },
+}
 
 /// Decodes its elements in kernel text and on the host.
 pub trait Form: Sync {
@@ -19,6 +28,27 @@ pub trait Form: Sync {
     fn load(&self, name: &str, index: &str) -> String;
     /// Element `index` of `bytes`, as a float.
     fn unpack(&self, bytes: &[u8], index: usize) -> f32;
+    /// `data` as the bytes of this form.
+    fn pack(&self, data: &[f32]) -> Vec<u8>;
+
+    /// Elements that share one scale, decoded together.
+    fn block(&self) -> usize {
+        1
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::Rows
+    }
+
+    /// Elements a row's length must be a multiple of.
+    fn align(&self) -> usize {
+        self.block()
+    }
+
+    /// `x` as this form keeps it.
+    fn round(&self, x: f32) -> f32 {
+        self.unpack(&self.pack(&[x]), 0)
+    }
 
     /// Kernel text: elements `index` to `index + 3` as a `wide()`.
     fn load4(&self, name: &str, index: &str) -> String {
@@ -54,7 +84,8 @@ pub trait Form: Sync {
 
     /// Whether `input` reads as `form`, when `weight` is this form.
     fn taken(&self, input: usize, weight: usize, form: &dyn Form) -> bool {
-        !form.narrow() || (input == weight && form.name() == self.name())
+        let rows = form.layout() == Layout::Rows;
+        rows && (!form.narrow() || (input == weight && form.name() == self.name()))
     }
 
     /// Bytes a matmul reads: the weight, then the rows.
@@ -163,6 +194,9 @@ impl Form for F32 {
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         f32::from_bits(word(bytes, index))
     }
+    fn pack(&self, data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
 }
 
 impl Form for Bf16 {
@@ -199,7 +233,12 @@ impl Form for Bf16 {
     }
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         let at = index * 2;
-        f32::from_bits(u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])) << 16)
+        Half(u16::from_le_bytes([bytes[at], bytes[at + 1]])).into()
+    }
+    fn pack(&self, data: &[f32]) -> Vec<u8> {
+        data.iter()
+            .flat_map(|x| Half::from(*x).0.to_le_bytes())
+            .collect()
     }
 }
 
@@ -221,6 +260,11 @@ impl Form for U32 {
     }
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         word(bytes, index) as f32
+    }
+    fn pack(&self, data: &[f32]) -> Vec<u8> {
+        data.iter()
+            .flat_map(|x| (*x as u32).to_le_bytes())
+            .collect()
     }
 }
 

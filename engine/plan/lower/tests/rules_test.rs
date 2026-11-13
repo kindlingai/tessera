@@ -8,7 +8,8 @@ use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Tensor, run};
-use lower::{Device, Pins, View, cut, lower, open, round, rules};
+use lower::form::BF16_FORM;
+use lower::{Device, Pins, View, cut, lower, open, rules};
 use models::{Stack, nanogpt, qwen3};
 use settings::read as settings;
 use trace::{EntryKind, Mask, Model, Port, Role};
@@ -162,13 +163,13 @@ fn whole_models_match_cpu() {
         let narrow = |t: &Tensor| match t.floats() {
             Ok(v) => Tensor::f32(
                 t.shape.clone(),
-                v.iter().map(|x| round(DType::Bf16, *x)).collect(),
+                v.iter().map(|x| BF16_FORM.round(*x)).collect(),
             ),
             Err(_) => t.clone(),
         };
         let weights: Vec<Tensor> = weights.iter().map(narrow).collect();
         for (rule, device) in devices() {
-            let device = device.pinned(Pins::all(lower::form::BF16_FORM));
+            let device = device.pinned(Pins::all(BF16_FORM));
             let off = gap(&g, &weights, &inputs, &device);
             assert!(
                 off < 1e-3,

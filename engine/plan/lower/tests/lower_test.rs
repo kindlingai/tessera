@@ -9,8 +9,8 @@ use lower::form::{BF16_FORM, F32_FORM};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
 use lower::{
-    Arg, Buffer, DType, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Slot,
-    Source, Step, T, Tree,
+    Arg, Buffer, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Slot, Source,
+    Step, T, Tree,
 };
 use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
@@ -401,7 +401,7 @@ fn pinned_weights_narrow() {
     let plan = lower(&g, 0, &SIZES, &Device::guess(&settings()).pinned(pins)).unwrap();
     for l in &plan.weights {
         let embed = l.weight == 0;
-        assert_eq!(l.slot.dtype == DType::F32, embed, "weight {}", l.weight);
+        assert_eq!(l.slot.form == F32_FORM, embed, "weight {}", l.weight);
     }
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     for narrow in ["lanes_bf16", "widen", "gather"] {

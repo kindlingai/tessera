@@ -1,6 +1,7 @@
 //! Small kernels that expose one hardware limit each.
 
 use codegen::prelude::*;
+use lower::form::U32_FORM;
 use lower::{
     Arg, Cluster, DType, Error, Kernel, KernelRef, Launch, Link, Plan, Run, Settings, Shape, Slot,
     Source, Step, Tensor, Zone, ZoneKind, open,
@@ -172,7 +173,7 @@ impl Probe {
         // A chase reads a table of indices.
         let input = match self.kind {
             Kind::Chase => Slot {
-                dtype: DType::U32,
+                form: U32_FORM,
                 ..slot(0, read)
             },
             _ => slot(0, read),

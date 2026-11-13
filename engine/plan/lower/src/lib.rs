@@ -33,7 +33,7 @@ pub use extent::Extent;
 pub use form::{Form, Pins};
 pub use gpukit::{Limits, Pick, Settings};
 pub use kernel::{Kernel, KernelRef, Needs};
-pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};
+pub use mem::{Buffer, DType, Tensor, View, ViewMut};
 pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use recipe::Recipe;
 pub use rule::{Attn, Draft, RULES, Read, Rule, rules};

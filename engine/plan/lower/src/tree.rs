@@ -184,6 +184,11 @@ impl<'a> Tree<'a> {
                 Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
                 _ => crate::form::of(n.ty.dtype),
             };
+            // Kernels read whole blocks, so a row holds whole ones.
+            if !shape.last().is_some_and(|k| k.is_multiple_of(form.align())) {
+                let what = format!("node {i} in {} needs rows of {}", form.name(), form.align());
+                return Err(Error::Unsupported(what));
+            }
             let mut push = |term: Term, args: Vec<T>| {
                 let (shape, extents) = (shape.clone(), extents.clone());
                 tree.nodes.push(Node {

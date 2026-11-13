@@ -1,8 +1,9 @@
 //! A plan: kernel launches over buffers that stay on device.
 
 use crate::abi::{Arg, Launch};
+use crate::form::{F32_FORM, Form};
 use crate::kernel::KernelRef;
-use graph::{DType, NodeId, Order};
+use graph::{NodeId, Order};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `len` elements of one buffer, `offset` elements in.
@@ -11,7 +12,7 @@ pub struct Slot {
     pub buffer: u32,
     pub offset: usize,
     pub len: usize,
-    pub dtype: DType,
+    pub form: &'static dyn Form,
 }
 
 impl Slot {
@@ -21,17 +22,22 @@ impl Slot {
             buffer,
             offset: 0,
             len,
-            dtype: DType::F32,
+            form: F32_FORM,
         }
     }
 
     /// The first byte's offset.
     pub fn start(&self) -> usize {
-        self.offset * self.dtype.bytes()
+        self.form.bytes(self.offset)
     }
 
     pub fn bytes(&self) -> usize {
-        self.len * self.dtype.bytes()
+        self.form.bytes(self.len)
+    }
+
+    /// The byte offset of element `skip`.
+    pub fn at(&self, skip: usize) -> usize {
+        self.form.bytes(self.offset + skip)
     }
 }
 

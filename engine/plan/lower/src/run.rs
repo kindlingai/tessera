@@ -40,12 +40,12 @@ impl Held {
 
     pub fn view(&self, slot: Slot) -> View<'_> {
         self.get(slot)
-            .view(slot.start(), slot.dtype, vec![slot.len])
+            .view(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
     pub fn view_mut(&mut self, slot: Slot) -> ViewMut<'_> {
         let at = self.bound[slot.buffer as usize];
-        self.all[at].view_mut(slot.start(), slot.dtype, vec![slot.len])
+        self.all[at].view_mut(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
     /// Binds `plan`'s buffers. Weights and kept rows stay as loaded.
@@ -126,9 +126,13 @@ pub trait Run {
     /// How the hardware's tiles round.
     fn precision(&self) -> Precision;
 
-    /// Copies `src` into the slot, converting its form if needed.
+    /// Floats go through the slot's form. Anything else copies.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
-        Ok(copy(src, &mut self.held_mut().view_mut(slot))?)
+        let dst = &mut self.held_mut().view_mut(slot);
+        if src.dtype() == slot.form.dtype() {
+            return Ok(copy(src, dst)?);
+        }
+        Ok(dst.write(&slot.form.pack(&src.to_f32()?))?)
     }
 
     /// The slot's values on the host, as one row.
@@ -167,7 +171,7 @@ pub trait Run {
             return Err(Error::Size("the input list".into()));
         }
         for (at, (slot, input)) in slots.into_iter().zip(inputs).enumerate() {
-            if input.len() != slot.len || input.dtype() != slot.dtype {
+            if input.len() != slot.len || input.dtype() != slot.form.dtype() {
                 return Err(Error::Size(format!("input {at}")));
             }
             self.write(slot, input.clone())?;
