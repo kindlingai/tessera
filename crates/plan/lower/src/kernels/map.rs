@@ -5,6 +5,7 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use crate::tree::{T, Tree};
+use codegen::ir::{BinOp, Expr, Intrinsic, Stmt};
 use codegen::{Text, float, hash};
 use graph::Act;
 use sim::{Load, Ops};
@@ -54,6 +55,62 @@ pub fn stage_lines(stages: &[MapStage], operand: &dyn Fn(usize) -> String) -> St
         let _ = writeln!(lines, "    {line}");
     }
     lines
+}
+
+/// `v` through an activation, as a tree.
+fn act_expr(a: Act) -> Expr {
+    let (v, lit) = (|| Expr::var("v"), Expr::Float);
+    let call = |i, args| Expr::Call(i, args);
+    let neg = |e| Expr::Neg(Box::new(e));
+    match a {
+        Act::Silu => {
+            let den = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Exp, vec![neg(v())]));
+            Expr::bin(BinOp::Div, v(), den)
+        }
+        Act::Sigmoid => {
+            let den = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Exp, vec![neg(v())]));
+            Expr::bin(BinOp::Div, lit(1.0), den)
+        }
+        Act::Relu => call(Intrinsic::Max, vec![v(), lit(0.0)]),
+        Act::GeluTanh => {
+            let cube = Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, v(), v()), v());
+            let inner = Expr::bin(BinOp::Add, v(), Expr::bin(BinOp::Mul, lit(0.044715), cube));
+            let scaled = Expr::bin(BinOp::Mul, lit(0.7978846), inner);
+            let clamped = call(Intrinsic::Clamp, vec![scaled, lit(-8.0), lit(8.0)]);
+            let t = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Tanh, vec![clamped]));
+            Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, lit(0.5), v()), t)
+        }
+    }
+}
+
+/// Statements running `stages` on `v`. `operand` gives each read.
+pub fn stage_stmts(stages: &[MapStage], operand: &dyn Fn(usize) -> Expr) -> Vec<Stmt> {
+    let mut taken = 0;
+    let assign = |value| Stmt::Assign {
+        target: Expr::var("v"),
+        op: None,
+        value,
+    };
+    stages
+        .iter()
+        .map(|s| match s {
+            MapStage::Add | MapStage::Mul => {
+                let op = if *s == MapStage::Add {
+                    BinOp::Add
+                } else {
+                    BinOp::Mul
+                };
+                taken += 1;
+                assign(Expr::bin(op, Expr::var("v"), operand(taken - 1)))
+            }
+            MapStage::Scale(by) => assign(Expr::bin(
+                BinOp::Mul,
+                Expr::var("v"),
+                Expr::Float(f64::from(*by)),
+            )),
+            MapStage::Act(a) => assign(act_expr(*a)),
+        })
+        .collect()
 }
 
 /// How many operands `stages` read, besides their input.

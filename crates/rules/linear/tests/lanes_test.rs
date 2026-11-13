@@ -36,7 +36,7 @@ fn rule_registers() {
     };
     for dialect in [Dialect::Metal, Dialect::Cuda] {
         let text = text.render(dialect);
-        assert!(text.contains("f_f32x4(w + at + i)") && text.contains("linear_f32_"));
+        assert!(text.contains("f_f32x4(w + (at + (u64)i))") && text.contains("linear_f32_"));
     }
 }
 

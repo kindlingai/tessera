@@ -1,19 +1,65 @@
 //! A matmul for few rows, a warp per column.
 
-use codegen::{Gen, LANES, hash};
+use codegen::hash;
+use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
+use codegen::prelude::*;
 use graph::{DType, Order};
-use lower::kernels::{MapStage, operands, stage_lines};
+use lower::kernels::{MapStage, operands, stage_stmts};
 use lower::{Arg, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, Stored, T, Tree};
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+
+thread_local! {
+    /// The kernel per row count and form, built once.
+    static TREES: RefCell<HashMap<(usize, bool), Body>> = RefCell::new(HashMap::new());
+}
 
 /// Elements one wide load brings a lane.
-const WIDE: usize = 4;
+const WIDE: u32 = 4;
 
 /// Trips unrolled, so a lane keeps several loads in flight.
-const AHEAD: usize = 4;
+const AHEAD: u32 = 4;
 
 /// The most rows this schedule is offered for.
 const ROWS: usize = 32;
+
+/// Each lane sums part of every row, then all reduce.
+#[kernel]
+fn linear<const WIDE: u32, const AHEAD: u32, F: Form>(
+    x: Buf<F32>,
+    w: Buf<F>,
+    out: BufMut<F32>,
+    n: u32,
+    k: u32,
+    #[build] m: usize,
+) {
+    let col = gid() / LANES as u32;
+    if col >= n {
+        return;
+    }
+    let at = col as u64 * k as u64;
+    let mut s = [0.0f32; ROWS];
+    for r in 0..m as u32 {
+        s[r as usize] = 0.0;
+    }
+    for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(AHEAD) {
+        let c = w.load4(at + i as u64);
+        for r in 0..m as u32 {
+            let v = x.load4(r as u64 * k as u64 + i as u64);
+            s[r as usize] += v.x * c.x;
+            s[r as usize] += v.y * c.y;
+            s[r as usize] += v.z * c.z;
+            s[r as usize] += v.w * c.w;
+        }
+    }
+    for r in 0..m as u32 {
+        s[r as usize] = sum32(s[r as usize]);
+    }
+    if lane() != 0 {
+        return;
+    }
+}
 
 /// Elementwise stages a sum runs through before it is stored.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -41,62 +87,56 @@ impl Lanes {
         }
     }
 
-    /// The whole kernel: the loop, the reduce, then the stages.
-    fn write(&self) -> Gen {
-        let mut g = Gen::new("linear");
-        g.floats("x", false);
-        g.buffer("w", self.form.ty(), false);
-        for a in 0..self.others() {
-            g.floats(&format!("a{a}"), false);
-        }
-        g.floats("out", true);
-        g.scalar("n", "u32");
-        g.scalar("k", "u32");
-        let lane = g.lane();
-        g.line(format!("u32 col = gid / {LANES};"));
-        g.guard("col >= n");
-        g.line("u64 at = (u64)col * k;");
-        for r in 0..self.m {
-            g.line(format!("float s{r} = 0.0f;"));
-        }
-        let step = (LANES * WIDE).to_string();
-        g.repeat("i", &format!("{lane} * {WIDE}"), "k", &step, AHEAD, |g| {
-            let c = g.four(self.form, "w + at + i");
-            for r in 0..self.m {
-                let x = g.four(DType::F32, &format!("x + {r}u * k + i"));
-                for (x, c) in x.iter().zip(&c) {
-                    g.fma(&format!("s{r}"), x, c);
-                }
-            }
-        });
-        for r in 0..self.m {
-            g.sum32(&format!("s{r}"));
-        }
-        g.guard("lane != 0");
-        for r in 0..self.m {
-            self.store(&mut g, r);
-        }
-        g
+    /// The kernel with the chain's operands and its stores added.
+    fn tree(&self) -> Body {
+        let build = || match self.form {
+            DType::Bf16 => linear_ir::<WIDE, AHEAD, Bf16>(self.m),
+            _ => linear_ir::<WIDE, AHEAD, F32>(self.m),
+        };
+        let key = (self.m, self.form == DType::Bf16);
+        let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
+        let operand = |a: usize| Param::Buffer {
+            name: format!("a{a}"),
+            dtype: DType::F32,
+            writes: false,
+        };
+        // The operands sit between the weights and the output.
+        body.params.splice(2..2, (0..self.others()).map(operand));
+        body.stmts.push(self.stores());
+        body
     }
 
-    /// Row `r`'s sum through the stages, into its place.
-    fn store(&self, g: &mut Gen, r: usize) {
+    /// Each row's sum through the stages, into its place.
+    fn stores(&self) -> Stmt {
         let After { stages, sum } = &self.after;
-        let o = format!("((u64){r} * n + col)");
-        if stages.is_empty() {
-            return g.line(format!("out[{o}] = s{r};"));
-        }
+        let u64 = |e| Expr::cast(Ty::U64, e);
+        let o = Expr::bin(BinOp::Mul, u64(Expr::var("r")), u64(Expr::var("n")));
+        let o = Expr::bin(BinOp::Add, o, u64(Expr::var("col")));
+        let v = Expr::index(Expr::var("s"), Expr::var("r"));
         // The chain's reads in order, the sum among them.
         let read = |j: usize| match j.cmp(sum) {
-            Ordering::Equal => format!("s{r}"),
-            Ordering::Less => format!("a{j}[{o}]"),
-            Ordering::Greater => format!("a{}[{o}]", j - 1),
+            Ordering::Equal => v.clone(),
+            Ordering::Less => Expr::index(Expr::var(&format!("a{j}")), o.clone()),
+            Ordering::Greater => Expr::index(Expr::var(&format!("a{}", j - 1)), o.clone()),
         };
-        g.line(format!("{{ float v = {};", read(0)));
-        for line in stage_lines(stages, &|j| read(j + 1)).lines() {
-            g.line(line.trim_start().to_string());
+        let mut body = vec![Stmt::Let {
+            name: "v".into(),
+            init: read(0),
+        }];
+        body.extend(stage_stmts(stages, &|j| read(j + 1)));
+        body.push(Stmt::Assign {
+            target: Expr::index(Expr::var("out"), o),
+            op: None,
+            value: Expr::var("v"),
+        });
+        Stmt::For {
+            var: "r".into(),
+            from: Expr::Int(0),
+            to: Expr::Int(self.m as i64),
+            step: Expr::Int(1),
+            unroll: 0,
+            body,
         }
-        g.line(format!("out[{o}] = v; }}"));
     }
 }
 
@@ -119,20 +159,20 @@ impl Kernel for Lanes {
 
     fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m, self.n, self.k);
-        let bytes = self.form.bytes() * WIDE;
+        let bytes = self.form.bytes() * WIDE as usize;
         Some(Load {
             threads: n * LANES,
             group: 256,
-            trips: (k / (LANES * WIDE)) as f64,
-            trip: self.write().trip(),
+            trips: (k / (LANES * WIDE as usize)) as f64,
+            trip: self.tree().trip(),
             reads: self.form.matmul_bytes(m, n, k),
             written: (4 * m * n) as f64,
-            flight: (bytes * AHEAD) as f64,
+            flight: (bytes * AHEAD as usize) as f64,
         })
     }
 
     fn source(&self) -> Source {
-        let mut text = self.write().finish();
+        let mut text = self.tree().text();
         text.entry = format!("linear_{}_{:x}", self.form.name(), hash(&text.body));
         Source::Made(text)
     }
@@ -193,7 +233,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     };
     // Wide loads need whole groups of four along `k`.
-    if m > ROWS || !k.is_multiple_of(WIDE) {
+    if m > ROWS || !k.is_multiple_of(WIDE as usize) {
         return None;
     }
     let lanes = Lanes {

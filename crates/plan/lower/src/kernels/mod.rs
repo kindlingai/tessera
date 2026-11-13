@@ -6,6 +6,6 @@ mod moves;
 mod widen;
 
 pub use append::Append;
-pub use map::{Map, MapStage, operands, stage_lines};
+pub use map::{Map, MapStage, operands, stage_lines, stage_stmts};
 pub use moves::Move;
 pub use widen::Widen;

@@ -11,12 +11,17 @@ use syn::{
 
 type Res = Result<Tokens, Error>;
 
+/// Names that are values when the tree is built.
+struct Ctx {
+    build: Vec<String>,
+}
+
 #[proc_macro_attribute]
 pub fn kernel(_: TokenStream, item: TokenStream) -> TokenStream {
-    let f = parse_macro_input!(item as ItemFn);
-    match tree(&f) {
+    let mut f = parse_macro_input!(item as ItemFn);
+    match tree(&mut f) {
         Ok(tree) => quote! {
-            #[allow(dead_code, unused_mut, clippy::all)]
+            #[allow(dead_code, unused_mut, unused_variables, clippy::all)]
             #f
             #tree
         }
@@ -25,17 +30,36 @@ pub fn kernel(_: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// The sibling function that builds the body.
-fn tree(f: &ItemFn) -> Res {
+/// The sibling that builds the body, taking `#[build]` parameters.
+fn tree(f: &mut ItemFn) -> Res {
     let name = &f.sig.ident;
     let ir_name = format_ident!("{name}_ir");
     let vis = &f.vis;
     let (impl_generics, _, where_clause) = f.sig.generics.split_for_impl();
     let entry = name.to_string();
-    let params: Vec<Tokens> = f.sig.inputs.iter().map(param).collect::<Result<_, _>>()?;
-    let stmts = block(&f.block.stmts)?;
+    let (mut params, mut build, mut ctx) = (Vec::new(), Vec::new(), Ctx { build: Vec::new() });
+    for arg in &mut f.sig.inputs {
+        let FnArg::Typed(p) = arg else {
+            return Err(Error::new(arg.span(), "a kernel takes no self"));
+        };
+        let Pat::Ident(ident) = &*p.pat else {
+            return Err(Error::new(p.pat.span(), "name each parameter"));
+        };
+        let name = ident.ident.to_string();
+        let at_build = p.attrs.iter().any(|a| a.path().is_ident("build"));
+        p.attrs.retain(|a| !a.path().is_ident("build"));
+        match at_build {
+            true => {
+                let (ident, ty) = (&ident.ident, &p.ty);
+                build.push(quote!(#ident: #ty));
+                ctx.build.push(name);
+            }
+            false => params.push(param(&name, &p.ty)?),
+        }
+    }
+    let stmts = block(&f.block.stmts, &ctx)?;
     Ok(quote! {
-        #vis fn #ir_name #impl_generics () -> codegen::ir::Body #where_clause {
+        #vis fn #ir_name #impl_generics (#(#build),*) -> codegen::ir::Body #where_clause {
             #[allow(unused_imports)]
             use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
             Body {
@@ -47,18 +71,11 @@ fn tree(f: &ItemFn) -> Res {
     })
 }
 
-fn param(arg: &FnArg) -> Res {
-    let FnArg::Typed(p) = arg else {
-        return Err(Error::new(arg.span(), "a kernel takes no self"));
+fn param(name: &str, ty: &Type) -> Res {
+    let Type::Path(path) = ty else {
+        return Err(Error::new(ty.span(), "a buffer or scalar type"));
     };
-    let Pat::Ident(ident) = &*p.pat else {
-        return Err(Error::new(p.pat.span(), "name each parameter"));
-    };
-    let name = ident.ident.to_string();
-    let Type::Path(ty) = &*p.ty else {
-        return Err(Error::new(p.ty.span(), "a buffer or scalar type"));
-    };
-    let last = ty.path.segments.last().expect("a type");
+    let last = path.path.segments.last().expect("a type");
     let head = last.ident.to_string();
     let form = |args: &PathArguments| match args {
         PathArguments::AngleBracketed(a) => match a.args.first() {
@@ -77,30 +94,33 @@ fn param(arg: &FnArg) -> Res {
             quote!(Param::Buffer { name: #name.into(), dtype: #dtype, writes: true })
         }
         _ => {
-            let ty = scalar(&p.ty)?;
+            let ty = scalar(ty)?;
             quote!(Param::Scalar { name: #name.into(), ty: #ty })
         }
     })
 }
 
-/// A scalar type's `Ty`.
+/// A scalar type's `Ty`. `usize` indexes locals as `u32`.
 fn scalar(ty: &Type) -> Res {
     let text = quote!(#ty).to_string();
     Ok(match text.as_str() {
         "f32" => quote!(Ty::F32),
-        "u32" => quote!(Ty::U32),
+        "u32" | "usize" => quote!(Ty::U32),
         "u64" => quote!(Ty::U64),
         "bool" => quote!(Ty::Bool),
         _ => return Err(Error::new(ty.span(), "f32, u32, u64 or bool")),
     })
 }
 
-fn block(stmts: &[Stmt]) -> Res {
-    let stmts: Vec<Tokens> = stmts.iter().map(stmt).collect::<Result<_, _>>()?;
+fn block(stmts: &[Stmt], ctx: &Ctx) -> Res {
+    let stmts: Vec<Tokens> = stmts
+        .iter()
+        .map(|s| stmt(s, ctx))
+        .collect::<Result<_, _>>()?;
     Ok(quote!(vec![#(#stmts),*]))
 }
 
-fn stmt(s: &Stmt) -> Res {
+fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
     match s {
         Stmt::Local(local) => {
             let name = match &local.pat {
@@ -114,15 +134,15 @@ fn stmt(s: &Stmt) -> Res {
             let Some(init) = &local.init else {
                 return Err(Error::new(local.span(), "give the binding a value"));
             };
-            declare(&name, &init.expr)
+            declare(&name, &init.expr, ctx)
         }
-        Stmt::Expr(e, _) => statement(e),
+        Stmt::Expr(e, _) => statement(e, ctx),
         other => Err(Error::new(other.span(), "not part of a kernel body")),
     }
 }
 
 /// A `let`: group memory, a local array, or a value.
-fn declare(name: &str, init: &Expr) -> Res {
+fn declare(name: &str, init: &Expr, ctx: &Ctx) -> Res {
     if let Expr::Call(call) = init
         && let Expr::Path(p) = &*call.func
         && p.path.segments.len() == 2
@@ -150,19 +170,19 @@ fn declare(name: &str, init: &Expr) -> Res {
         let n = &r.len;
         return Ok(quote!(Stmt::Array { name: #name.into(), ty: #ty, len: (#n) as usize }));
     }
-    let init = expr(init)?;
+    let init = expr(init, ctx)?;
     Ok(quote!(Stmt::Let { name: #name.into(), init: #init }))
 }
 
-fn statement(e: &Expr) -> Res {
+fn statement(e: &Expr, ctx: &Ctx) -> Res {
     match e {
         Expr::Assign(a) => {
-            let (target, value) = (expr(&a.left)?, expr(&a.right)?);
+            let (target, value) = (expr(&a.left, ctx)?, expr(&a.right, ctx)?);
             Ok(quote!(Stmt::Assign { target: #target, op: None, value: #value }))
         }
         Expr::Binary(b) if assign_op(&b.op).is_some() => {
             let op = assign_op(&b.op).expect("checked");
-            let (target, value) = (expr(&b.left)?, expr(&b.right)?);
+            let (target, value) = (expr(&b.left, ctx)?, expr(&b.right, ctx)?);
             Ok(quote!(Stmt::Assign { target: #target, op: Some(#op), value: #value }))
         }
         Expr::ForLoop(f) => {
@@ -170,8 +190,8 @@ fn statement(e: &Expr) -> Res {
                 return Err(Error::new(f.pat.span(), "name the loop variable"));
             };
             let var = var.ident.to_string();
-            let (from, to, step, unroll) = range(&f.expr)?;
-            let body = block(&f.body.stmts)?;
+            let (from, to, step, unroll) = range(&f.expr, ctx)?;
+            let body = block(&f.body.stmts, ctx)?;
             Ok(quote!(Stmt::For {
                 var: #var.into(),
                 from: #from,
@@ -182,14 +202,14 @@ fn statement(e: &Expr) -> Res {
             }))
         }
         Expr::If(i) => {
-            let cond = expr(&i.cond)?;
-            let then = block(&i.then_branch.stmts)?;
+            let cond = expr(&i.cond, ctx)?;
+            let then = block(&i.then_branch.stmts, ctx)?;
             let els = match &i.else_branch {
                 None => quote!(vec![]),
                 Some((_, e)) => match &**e {
-                    Expr::Block(b) => block(&b.block.stmts)?,
+                    Expr::Block(b) => block(&b.block.stmts, ctx)?,
                     nested @ Expr::If(_) => {
-                        let s = statement(nested)?;
+                        let s = statement(nested, ctx)?;
                         quote!(vec![#s])
                     }
                     other => return Err(Error::new(other.span(), "a block or `else if`")),
@@ -201,25 +221,25 @@ fn statement(e: &Expr) -> Res {
         Expr::Call(c) if is_path(&c.func, "barrier") => Ok(quote!(Stmt::Barrier)),
         Expr::Block(b) => {
             // A bare block scopes nothing the tree needs.
-            let stmts = block(&b.block.stmts)?;
+            let stmts = block(&b.block.stmts, ctx)?;
             Ok(quote!(Stmt::If { cond: Expr::Bool(true), then: #stmts, els: vec![] }))
         }
         other => {
-            let e = expr(other)?;
+            let e = expr(other, ctx)?;
             Ok(quote!(Stmt::Expr(#e)))
         }
     }
 }
 
 /// `a..b` under any `.by(s)` and `.unroll(n)`.
-fn range(e: &Expr) -> Result<(Tokens, Tokens, Tokens, Tokens), Error> {
+fn range(e: &Expr, ctx: &Ctx) -> Result<(Tokens, Tokens, Tokens, Tokens), Error> {
     let (mut step, mut unroll) = (quote!(Expr::Int(1)), quote!(0usize));
     let mut e = e;
     loop {
         match e {
             Expr::Paren(p) => e = &p.expr,
             Expr::MethodCall(m) if m.method == "by" => {
-                step = expr(&m.args[0])?;
+                step = expr(&m.args[0], ctx)?;
                 e = &m.receiver;
             }
             Expr::MethodCall(m) if m.method == "unroll" => {
@@ -231,7 +251,7 @@ fn range(e: &Expr) -> Result<(Tokens, Tokens, Tokens, Tokens), Error> {
                 let (Some(from), Some(to)) = (&r.start, &r.end) else {
                     return Err(Error::new(r.span(), "a range with both ends"));
                 };
-                return Ok((expr(from)?, expr(to)?, step, unroll));
+                return Ok((expr(from, ctx)?, expr(to, ctx)?, step, unroll));
             }
             other => return Err(Error::new(other.span(), "`for v in (a..b).by(s)`")),
         }
@@ -276,14 +296,16 @@ fn is_path(e: &Expr, name: &str) -> bool {
 }
 
 /// A name that is a value at build time.
-fn is_const_name(name: &str) -> bool {
-    name.chars()
+fn is_const_name(name: &str, ctx: &Ctx) -> bool {
+    let shouting = name
+        .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && name.chars().any(|c| c.is_ascii_uppercase())
+        && name.chars().any(|c| c.is_ascii_uppercase());
+    shouting || ctx.build.iter().any(|b| b == name)
 }
 
 /// Whether every leaf is a literal or a build-time constant.
-fn is_const(e: &Expr) -> bool {
+fn is_const(e: &Expr, ctx: &Ctx) -> bool {
     match e {
         Expr::Lit(ExprLit {
             lit: Lit::Int(_), ..
@@ -291,18 +313,21 @@ fn is_const(e: &Expr) -> bool {
         Expr::Path(p) => p
             .path
             .get_ident()
-            .is_some_and(|i| is_const_name(&i.to_string())),
-        Expr::Paren(p) => is_const(&p.expr),
-        Expr::Cast(c) => is_const(&c.expr),
-        Expr::Binary(b) => bin_op(&b.op).is_some() && is_const(&b.left) && is_const(&b.right),
+            .is_some_and(|i| is_const_name(&i.to_string(), ctx)),
+        Expr::Paren(p) => is_const(&p.expr, ctx),
+        Expr::Cast(c) => is_const(&c.expr, ctx),
+        Expr::Binary(b) => {
+            bin_op(&b.op).is_some() && is_const(&b.left, ctx) && is_const(&b.right, ctx)
+        }
         _ => false,
     }
 }
 
-fn expr(e: &Expr) -> Res {
-    if is_const(e) && !matches!(e, Expr::Lit(_)) {
+fn expr(e: &Expr, ctx: &Ctx) -> Res {
+    if is_const(e, ctx) && !matches!(e, Expr::Lit(_)) {
         return Ok(quote!(Expr::Int((#e) as i64)));
     }
+    let sub = |e: &Expr| expr(e, ctx);
     match e {
         Expr::Lit(l) => match &l.lit {
             Lit::Int(n) => {
@@ -326,9 +351,9 @@ fn expr(e: &Expr) -> Res {
             }
             None => Err(Error::new(p.span(), "a plain name")),
         },
-        Expr::Paren(p) => expr(&p.expr),
+        Expr::Paren(p) => sub(&p.expr),
         Expr::Unary(u) => {
-            let a = expr(&u.expr)?;
+            let a = sub(&u.expr)?;
             match u.op {
                 UnOp::Neg(_) => Ok(quote!(Expr::Neg(Box::new(#a)))),
                 UnOp::Not(_) => Ok(quote!(Expr::Not(Box::new(#a)))),
@@ -339,19 +364,19 @@ fn expr(e: &Expr) -> Res {
             let Some(op) = bin_op(&b.op) else {
                 return Err(Error::new(b.op.span(), "an assignment is a statement"));
             };
-            let (l, r) = (expr(&b.left)?, expr(&b.right)?);
+            let (l, r) = (sub(&b.left)?, sub(&b.right)?);
             Ok(quote!(Expr::bin(#op, #l, #r)))
         }
         Expr::Cast(c) => {
-            let (ty, a) = (scalar(&c.ty)?, expr(&c.expr)?);
+            let (ty, a) = (scalar(&c.ty)?, sub(&c.expr)?);
             Ok(quote!(Expr::cast(#ty, #a)))
         }
         Expr::Index(i) => {
-            let (base, at) = (expr(&i.expr)?, expr(&i.index)?);
+            let (base, at) = (sub(&i.expr)?, sub(&i.index)?);
             Ok(quote!(Expr::index(#base, #at)))
         }
         Expr::Field(f) => {
-            let (base, member) = (expr(&f.base)?, &f.member);
+            let (base, member) = (sub(&f.base)?, &f.member);
             let name = quote!(#member).to_string();
             let Some(h) = name.chars().next().filter(|_| name.len() == 1) else {
                 return Err(Error::new(f.member.span(), "`.x`, `.y`, `.z` or `.w`"));
@@ -359,8 +384,8 @@ fn expr(e: &Expr) -> Res {
             Ok(quote!(Expr::field(#base, #h)))
         }
         Expr::MethodCall(m) => {
-            let recv = expr(&m.receiver)?;
-            let args: Vec<Tokens> = m.args.iter().map(expr).collect::<Result<_, _>>()?;
+            let recv = sub(&m.receiver)?;
+            let args: Vec<Tokens> = m.args.iter().map(sub).collect::<Result<_, _>>()?;
             let intrinsic = match m.method.to_string().as_str() {
                 "load4" => quote!(Intrinsic::Load4),
                 "store4" => quote!(Intrinsic::Store4),
@@ -373,7 +398,7 @@ fn expr(e: &Expr) -> Res {
                 return Err(Error::new(c.func.span(), "call a prelude function"));
             };
             let name = quote!(#p).to_string().replace(' ', "");
-            let args: Vec<Tokens> = c.args.iter().map(expr).collect::<Result<_, _>>()?;
+            let args: Vec<Tokens> = c.args.iter().map(sub).collect::<Result<_, _>>()?;
             let intrinsic = match name.as_str() {
                 "gid" => quote!(Intrinsic::Gid),
                 "lid" => quote!(Intrinsic::Lid),
@@ -383,6 +408,8 @@ fn expr(e: &Expr) -> Res {
                 "rsqrt" => quote!(Intrinsic::Rsqrt),
                 "exp" => quote!(Intrinsic::Exp),
                 "tanh" => quote!(Intrinsic::Tanh),
+                "max" => quote!(Intrinsic::Max),
+                "clamp" => quote!(Intrinsic::Clamp),
                 "F32x4::zero" => quote!(Intrinsic::Zero4),
                 other => return Err(Error::new(p.span(), format!("no `{other}` here"))),
             };

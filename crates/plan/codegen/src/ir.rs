@@ -97,6 +97,9 @@ pub enum Intrinsic {
     Rsqrt,
     Exp,
     Tanh,
+    Max,
+    /// `clamp(value, low, high)`.
+    Clamp,
     /// `load4(buffer, index)`: four elements as floats.
     Load4,
     /// `store4(buffer, index, value)`.
@@ -355,6 +358,11 @@ impl Printer<'_> {
             Intrinsic::Rsqrt => format!("f_rsqrt({})", arg(self, 0)),
             Intrinsic::Exp => format!("f_exp({})", arg(self, 0)),
             Intrinsic::Tanh => format!("f_tanh({})", arg(self, 0)),
+            Intrinsic::Max => format!("f_max({}, {})", arg(self, 0), arg(self, 1)),
+            Intrinsic::Clamp => {
+                let (v, lo, hi) = (arg(self, 0), arg(self, 1), arg(self, 2));
+                format!("f_clamp({v}, {lo}, {hi})")
+            }
             Intrinsic::Load4 => {
                 let (dtype, at) = (self.buffer(&args[0]), arg(self, 1));
                 let Expr::Var(name) = &args[0] else {
@@ -432,7 +440,11 @@ impl Printer<'_> {
                 unroll,
                 body,
             } => {
+                // Loops over constants unroll unless told otherwise.
+                let constant =
+                    matches!((from, to, step), (Expr::Int(_), Expr::Int(_), Expr::Int(_)));
                 match unroll {
+                    0 if constant => self.line("#pragma unroll".into()),
                     0 => {}
                     1 => self.line("#pragma unroll".into()),
                     n => self.line(format!("#pragma unroll {n}")),
@@ -582,8 +594,12 @@ impl Counter {
                         });
                         true
                     }
-                    Intrinsic::ShflXor => {
+                    Intrinsic::ShflXor | Intrinsic::Max => {
                         self.add(float(1.0));
+                        true
+                    }
+                    Intrinsic::Clamp => {
+                        self.add(float(2.0));
                         true
                     }
                     Intrinsic::Sum32 => {
