@@ -12,6 +12,7 @@ cuda = ["lower/cuda", "gpukit/cuda"]
 rocm = ["lower/rocm", "gpukit/rocm"]
 
 [dependencies]
+codegen = { workspace = true }
 graph = { workspace = true }
 lower = { workspace = true }
 sim = { workspace = true }

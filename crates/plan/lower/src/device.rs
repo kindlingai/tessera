@@ -5,9 +5,9 @@ macro_rules! device_runner {
         pub mod $bk {
             use crate::Error;
             use crate::abi::{Arg, Launch, Shape, Source};
-            use crate::emit::Dialect;
             use crate::plan::{Plan, Slot};
             use crate::run::{Held, Run};
+            use codegen::Dialect;
             use gpukit::device::Device;
             use gpukit::$bk::{
                 Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,

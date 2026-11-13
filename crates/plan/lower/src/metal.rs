@@ -2,9 +2,9 @@
 
 use crate::Error;
 use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::Dialect;
 use crate::plan::{Plan, Slot};
 use crate::run::{Held, Run};
+use codegen::Dialect;
 use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared, set_bytes};
 use mem::Buffer;
 use objc2::msg_send;

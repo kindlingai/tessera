@@ -1,88 +1,64 @@
-//! RMS norm in three short launches, summing in lanes.
+//! RMS norm with one warp per row, summed by shuffles.
 
-use graph::{Order, Stage};
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
-use sim::{Load, Ops};
+use codegen::{Gen, LANES};
+use graph::{DType, Order, Stage};
+use lower::{Arg, Draft, Kernel, Launch, Load, Shape, Site, Source, Step, T, Tree};
 
-/// Elements one lane squares and adds by itself.
-const CHUNK: usize = 16;
+/// Elements one wide load brings a lane.
+const WIDE: usize = 4;
 
-/// Which of the norm's launches a kernel is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pass {
-    /// Each lane's sum of squares over part of a row.
-    Squares,
-    /// Each row's lanes added, then inverted to a factor.
-    Root,
-    /// Every element times its row's factor and its column's gain.
-    Scale,
-}
+/// Trips unrolled, so a lane keeps several loads in flight.
+const AHEAD: usize = 4;
 
-/// One launch of an RMS norm over `rows` of `width`.
+/// An RMS norm over `rows` of `width`, one launch.
 #[derive(Clone, Copy, Debug)]
 pub struct LaneNorm {
-    pub pass: Pass,
     pub rows: usize,
     pub width: usize,
-    pub lanes: usize,
     pub eps: f32,
 }
 
-// Lanes are runs of a row, so rows sum alike.
-const SQUARES: &str = "    if (gid >= rows * lanes) {
-        return;
-    }
-    u32 lane = gid % lanes;
-    u64 at = (u64)(gid / lanes) * width;
-    u32 from = (u32)((u64)width * lane / lanes);
-    u32 to = (u32)((u64)width * (lane + 1) / lanes);
-    float acc = 0.0f;
-    for (u32 i = from; i < to; i++) {
-        acc += x[at + i] * x[at + i];
-    }
-    out[gid] = acc;
-";
-
-const ROOT: &str = "    if (gid >= rows) {
-        return;
-    }
-    u64 at = (u64)gid * lanes;
-    float acc = 0.0f;
-    for (u32 l = 0; l < lanes; l++) {
-        acc += parts[at + l];
-    }
-    out[gid] = f_rsqrt(acc / (float)width + eps);
-";
-
-const SCALE: &str = "    if (gid >= rows * width) {
-        return;
-    }
-    out[gid] = x[gid] * inv[gid / width] * w[gid % width];
-";
-
 impl LaneNorm {
-    /// Its name, its source, and the buffers it reads.
-    fn parts(&self) -> (&'static str, &'static str, &'static [&'static str]) {
-        match self.pass {
-            Pass::Squares => ("norm_squares", SQUARES, &["x"]),
-            Pass::Root => ("norm_root", ROOT, &["parts"]),
-            Pass::Scale => ("norm_scale", SCALE, &["x", "inv", "w"]),
-        }
-    }
-
-    /// How many threads it starts, and each one's loop trips.
-    fn threads(&self) -> (usize, usize) {
-        match self.pass {
-            Pass::Squares => (self.rows * self.lanes, self.width / self.lanes),
-            Pass::Root => (self.rows, self.lanes),
-            Pass::Scale => (self.rows * self.width, 1),
-        }
+    /// Sums a row's squares, then scales the row.
+    fn write(&self) -> Gen {
+        let mut g = Gen::new("norm_lanes");
+        g.floats("x", false);
+        g.floats("w", false);
+        g.floats("out", true);
+        g.scalar("rows", "u32");
+        g.scalar("width", "u32");
+        g.scalar("eps", "float");
+        let lane = g.lane();
+        g.line(format!("u32 row = gid / {LANES};"));
+        g.guard("row >= rows");
+        g.line("u64 at = (u64)row * width;");
+        g.line("float acc = 0.0f;");
+        let (from, step) = (format!("{lane} * {WIDE}"), (LANES * WIDE).to_string());
+        g.repeat("i", &from, "width", &step, AHEAD, |g| {
+            let x = g.four(DType::F32, "x + at + i");
+            for x in &x {
+                g.fma("acc", x, x);
+            }
+        });
+        g.sum32("acc");
+        let inv = g.rsqrt("acc / (float)width + eps");
+        g.line(format!("float inv = {inv};"));
+        g.repeat("i", &from, "width", &step, AHEAD, |g| {
+            let x = g.four(DType::F32, "x + at + i");
+            let w = g.four(DType::F32, "w + i");
+            g.line("float4 o;");
+            for (h, (x, w)) in ["x", "y", "z", "w"].iter().zip(x.iter().zip(&w)) {
+                g.arith(format!("o.{h} = {x} * inv * {w};"), 2.0);
+            }
+            g.store4("out + at + i", "o");
+        });
+        g
     }
 }
 
 impl Kernel for LaneNorm {
     fn name(&self) -> &'static str {
-        self.parts().0
+        "lane_norm"
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -95,54 +71,36 @@ impl Kernel for LaneNorm {
     }
 
     fn load(&self, len: usize) -> Option<Load> {
-        let (threads, trips) = self.threads();
-        let scale = self.pass == Pass::Scale;
-        let loads = if scale { 3.0 } else { 1.0 };
-        let trip = Ops {
-            float: if scale { 2.0 } else { 1.0 },
-            loads,
-            stores: f64::from(u8::from(scale)),
-            fresh: if scale { 1.0 } else { 1.0 / 16.0 },
-            ..Ops::default()
-        };
+        let elements = (self.rows * self.width) as f64;
         Some(Load {
-            threads,
+            threads: self.rows * LANES,
             group: 256,
-            trips: trips as f64,
-            trip,
-            reads: vec![4.0 * (threads * trips) as f64],
+            trips: (self.width / (LANES * WIDE)) as f64,
+            trip: self.write().trip(),
+            // The row is read twice, the gains once.
+            reads: vec![8.0 * elements, 4.0 * elements],
             written: 4.0 * len as f64,
-            flight: if scale { 12.0 } else { 64.0 },
+            flight: (4 * WIDE * AHEAD) as f64,
         })
     }
 
     fn source(&self) -> Source {
-        let (entry, body, reads) = self.parts();
-        let mut buffers: Vec<_> = reads.iter().map(|name| float(name, false)).collect();
-        buffers.push(float("out", true));
-        let scalars = [("rows", "u32"), ("width", "u32"), ("lanes", "u32")];
-        Source::Made(Text {
-            entry: entry.into(),
-            buffers,
-            scalars: scalars.into_iter().chain([("eps", "float")]).collect(),
-            body: body.into(),
-        })
+        Source::Made(self.write().finish())
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
         args.push(step.out());
-        args.extend([self.rows, self.width, self.lanes].map(Arg::count));
+        args.extend([self.rows, self.width].map(Arg::count));
         args.push(Arg::F32(self.eps));
         vec![Launch {
             args,
-            shape: Shape::Line(self.threads().0),
+            shape: Shape::Line(self.rows * LANES),
         }]
     }
 
     fn work(&self, _: usize) -> f64 {
-        let (threads, trips) = self.threads();
-        (threads * trips) as f64
+        (self.rows * self.width) as f64
     }
 
     /// Unproven, so it must earn its place by measurement.
@@ -162,20 +120,16 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     else {
         return None;
     };
-    let (rows, lanes) = (len / width, (width / CHUNK).clamp(1, 256));
-    let pass = |pass| LaneNorm {
-        pass,
-        rows,
+    // Wide loads need whole groups of four along a row.
+    if !width.is_multiple_of(WIDE) {
+        return None;
+    }
+    let norm = LaneNorm {
+        rows: len / width,
         width,
-        lanes,
         eps: *eps,
     };
-    let scaled = [Read::Node(x), Read::Draft(1), Read::Node(w)];
-    Some(vec![
-        Draft::new(pass(Pass::Squares), [x], rows * lanes),
-        Draft::new(pass(Pass::Root), [Read::Draft(0)], rows),
-        Draft::new(pass(Pass::Scale), scaled, len),
-    ])
+    Some(vec![Draft::new(norm, [x, w], len)])
 }
 
 lower::rule!("lane_norm", propose);

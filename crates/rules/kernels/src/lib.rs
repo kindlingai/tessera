@@ -24,7 +24,7 @@ pub use attend::Attend;
 pub use dense::{Causal, DENSE_SCORES, Part, PerHead};
 pub use gather::Gather;
 pub use join::Join;
-pub use lane_norm::{LaneNorm, Pass};
+pub use lane_norm::LaneNorm;
 pub use matmul::Matmul;
 pub use rms_norm::RmsNorm;
 pub use rope::{Angles, Rope};

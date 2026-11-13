@@ -2,6 +2,7 @@
 
 // The other matmul rules come from here.
 use kernels as _;
+use linear as _;
 
 use gpukit::testing::{Noise, backend_ready, max_abs_diff};
 use graph::DimName::{self, Ffn, Hidden, Rows};
@@ -49,12 +50,11 @@ fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
 #[test]
 fn rule_registers() {
     assert!(rules().iter().any(|r| r.name == "lanes"));
-    assert_eq!((linear::lanes(8), linear::lanes(1024)), (1, 64));
-    let g = linear(50, 7);
+    let g = linear(52, 7);
     let sizes = |m| [(Rows, m)];
     let plan = lower(&g, 0, &sizes(3), &Device::guess().favoring("lanes")).unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-    assert_eq!(names, ["lanes", "sums"]);
+    assert_eq!(names, ["lanes"]);
     // Past its row limit, another rule takes the site.
     let wide = lower(&g, 0, &sizes(33), &Device::guess().favoring("lanes")).unwrap();
     assert!(wide.steps.iter().all(|s| s.kernel.name() != "lanes"));
@@ -64,13 +64,13 @@ fn rule_registers() {
     let kept = lower(&residual, 0, &sizes(3), &tiled).unwrap();
     let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names, ["matmul", "map"]);
-    // Three rows take the body that shares each weight.
+    // Weights come in wide loads, under a hashed entry name.
     let Source::Made(text) = plan.steps[0].kernel.source() else {
         panic!("lanes are generated");
     };
     for dialect in [Dialect::Metal, Dialect::Cuda] {
         let text = text.render(dialect);
-        assert!(text.contains("float c = w[at + i];") && text.contains("linear_rows_f32("));
+        assert!(text.contains("f_f32x4(w + at + i)") && text.contains("linear_f32_"));
     }
 }
 
@@ -81,7 +81,7 @@ fn lanes_match_cpu() {
     }
     let mut draws = Noise(23);
     // Widths that lanes do not divide, and one they do.
-    let plain = [(50, 7), (1, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n)));
+    let plain = [(52, 7), (4, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n)));
     // The sum as an operand, then as the chain's input.
     let residual: Finish = |x, product| x.add(&product);
     let gate: Finish = |x, product| product.act(Act::Silu).mul(x);
@@ -94,10 +94,10 @@ fn lanes_match_cpu() {
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
             let device = Device::guess().favoring("lanes");
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
-            // Stages after the matmul ride in the sums launch.
+            // Stages after the matmul ride in the same launch.
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-            assert_eq!(names, ["lanes", "sums"]);
-            assert_eq!(plan.steps[1].covers.len(), g.nodes.len() - 2);
+            assert_eq!(names, ["lanes"]);
+            assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
             let mut runner = open(plan).unwrap();
             runner.load(0, weights[0].view()).unwrap();
             let got = runner.run(&[x.view()]).unwrap().remove(0);

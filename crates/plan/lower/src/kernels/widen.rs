@@ -1,10 +1,10 @@
 //! A narrow value as floats, for kernels that read floats.
 
 use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float};
 use crate::form::Stored;
 use crate::kernel::Kernel;
 use crate::plan::Step;
+use codegen::{Text, float};
 use graph::DType;
 use sim::{Load, Ops};
 
