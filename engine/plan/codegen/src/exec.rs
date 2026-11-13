@@ -750,7 +750,8 @@ pub fn run(
             Param::Buffer { name, .. }
             | Param::Scalar { name, .. }
             | Param::Shared { name, .. }
-            | Param::Tiles { name } => name.clone(),
+            | Param::Tiles { name }
+            | Param::Array { name, .. } => name.clone(),
         };
         named.insert(name, *arg);
     }

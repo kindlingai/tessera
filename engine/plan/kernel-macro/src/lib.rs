@@ -5,8 +5,8 @@ use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    BinOp, Error, Expr, ExprCall, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Pat,
-    PathArguments, ReturnType, Stmt, Type, UnOp, parse_macro_input,
+    BinOp, Error, Expr, ExprCall, ExprLit, FnArg, GenericArgument, GenericParam, Generics, Ident,
+    ItemFn, Lit, Pat, PathArguments, ReturnType, Stmt, Type, UnOp, parse_macro_input,
 };
 
 type Res = Result<Tokens, Error>;
@@ -36,7 +36,9 @@ fn tree(f: &mut ItemFn) -> Res {
     let ir_name = format_ident!("{name}_ir");
     let inline_name = format_ident!("{name}_inline");
     let vis = &f.vis;
-    let (impl_generics, ty_generics, where_clause) = f.sig.generics.split_for_impl();
+    // Type parameters only the Rust signature reads would hang unbound.
+    let generics = tree_generics(f);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let turbofish = ty_generics.as_turbofish();
     let entry = name.to_string();
     let (mut params, mut build, mut ctx) = (Vec::new(), Vec::new(), Ctx { build: Vec::new() });
@@ -121,6 +123,34 @@ fn tree(f: &mut ItemFn) -> Res {
     })
 }
 
+/// The generics the tree reads: consts, and an unpicked `Buf<F>`.
+fn tree_generics(f: &ItemFn) -> Generics {
+    let mut used = Vec::new();
+    for arg in &f.sig.inputs {
+        let FnArg::Typed(p) = arg else { continue };
+        if p.attrs.iter().any(|a| a.path().is_ident("form")) {
+            continue;
+        }
+        if let Type::Path(path) = &*p.ty
+            && let Some(last) = path.path.segments.last()
+            && let PathArguments::AngleBracketed(a) = &last.arguments
+            && let Some(GenericArgument::Type(t)) = a.args.first()
+        {
+            used.push(quote!(#t).to_string());
+        }
+    }
+    let mut generics = f.sig.generics.clone();
+    generics.params = generics
+        .params
+        .into_iter()
+        .filter(|p| match p {
+            GenericParam::Type(t) => used.contains(&t.ident.to_string()),
+            _ => true,
+        })
+        .collect();
+    generics
+}
+
 /// `#[form(f)]` on a `Buf<Dyn>` reads build parameter `f`.
 fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
     // A reference passes group memory or tiles by name.
@@ -128,6 +158,10 @@ fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
         Type::Reference(r) => &*r.elem,
         other => other,
     };
+    if let Type::Array(a) = ty {
+        let ty = scalar(&a.elem)?;
+        return Ok(quote!(Param::Array { name: #name.into(), ty: #ty }));
+    }
     let Type::Path(path) = ty else {
         return Err(Error::new(ty.span(), "a buffer or scalar type"));
     };
