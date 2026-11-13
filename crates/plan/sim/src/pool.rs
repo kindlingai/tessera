@@ -31,6 +31,8 @@ pub struct Pool {
     pub scan: Const,
     /// Bytes a second into memory.
     pub write: Const,
+    /// Flops a second on the matrix unit. Zero: none.
+    pub tile: Const,
 }
 
 /// A pool's constants as plain numbers, as probes fit them.
@@ -48,6 +50,8 @@ pub struct Fit {
     pub read: f64,
     pub scan: f64,
     pub write: f64,
+    #[serde(default)]
+    pub tile: f64,
 }
 
 impl Fit {
@@ -68,6 +72,7 @@ impl Fit {
             read: m(self.read, "512 MB read at the best thread count"),
             scan: m(self.scan, "512 MB read in separate stretches"),
             write: m(self.write, "256 MB written at the best thread count"),
+            tile: m(self.tile, "tile multiplies looping on registers"),
         }
     }
 }
@@ -86,6 +91,12 @@ impl Chip for Pool {
         let waits = fresh * self.wait.value + (1.0 - fresh) * t.loads * self.near.value;
         let chain = l.trips * (ops + waits);
         let compute = threads * l.trips * ops / self.step.value / self.rate.value;
+        // Without a matrix unit, tile flops run as floats.
+        let tiled = threads * l.trips * t.tile_flops;
+        let compute = match self.tile.value > 0.0 {
+            true => compute + tiled / self.tile.value,
+            false => compute + tiled / self.rate.value,
+        };
         // Little's law: bytes in flight over the wait.
         let flow = threads * l.flight / self.wait.value;
         let through = |peak: f64| if flow > 0.0 { peak.min(flow) } else { peak };
@@ -111,6 +122,9 @@ impl Chip for Pool {
     fn bound(&self, l: &Load) -> f64 {
         let curves = l.floats() / l.trip.float.max(1.0) * l.trip.special;
         let ops = l.floats() + curves * self.curve.value / self.step.value;
+        let tiled = l.threads as f64 * l.trips * l.trip.tile_flops;
+        let best_rate = self.rate.value.max(self.tile.value);
+        let ops = ops + tiled * self.rate.value / best_rate;
         let best = self.read.value.max(self.scan.value);
         let rate = |bytes: &f64| match *bytes > self.cache.value {
             true => bytes / best,
@@ -134,6 +148,7 @@ impl Chip for Pool {
             ("read", self.read),
             ("scan", self.scan),
             ("write", self.write),
+            ("tile", self.tile),
         ]
     }
 }

@@ -45,6 +45,7 @@ impl Kernel for Softmax {
             fresh: 1.0 / 16.0,
             int: 0.0,
             width: 0.0,
+            tile_flops: 0.0,
         };
         Some(per_row(self.rows, self.width, trip, 0.0))
     }

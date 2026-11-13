@@ -80,6 +80,7 @@ impl Kernel for Map {
             stores: 1.0,
             fresh: 1.0,
             width: 0.0,
+            tile_flops: 0.0,
         };
         Some(Load {
             threads: len,

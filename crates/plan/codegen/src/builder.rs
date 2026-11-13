@@ -70,6 +70,7 @@ impl Gen {
         t.special += ops.special;
         t.loads += ops.loads;
         t.stores += ops.stores;
+        t.tile_flops += ops.tile_flops;
         // Loads of one trip share one width and freshness.
         if ops.loads > 0.0 {
             t.width = ops.width;
@@ -183,6 +184,89 @@ impl Gen {
             int: 5.0,
             ..Ops::default()
         });
+    }
+
+    /// A warp's zeroed block of `rows` by `cols` sums.
+    pub fn tile_acc(&mut self, name: &str, rows: usize, cols: usize) {
+        let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+        self.line(format!("tile_acc {name}_t[{tm}][{tn}];"));
+        self.line(format!("float {name}[{tm}][{tn}][TILE_COUNT];"));
+        self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
+        self.line(format!("            {name}[i][j][e] = 0.0f;"));
+        self.line("        }");
+        self.line("    }");
+        self.line("}");
+    }
+
+    /// Adds `depth` staged columns of A times B to `acc`.
+    pub fn tile_block(&mut self, acc: &str, a: &str, b: &str, stride: &str, dims: [usize; 3]) {
+        let [rows, cols, depth] = dims;
+        let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+        self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
+        self.line("    }");
+        self.line("}");
+        self.line(format!("for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"));
+        self.line(format!("    tile_a ta[{tm}];"));
+        self.line(format!("    tile_b tb[{tn}];"));
+        self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line(format!(
+            "        TILE_LOAD_A(ta[i], ({a}) + i * TILE_M * ({stride}) + kk, {stride});"
+        ));
+        self.line("    }");
+        self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line(format!(
+            "        TILE_LOAD_B(tb[j], ({b}) + j * TILE_N * ({stride}) + kk, {stride});"
+        ));
+        self.line("    }");
+        self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line(format!("        for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line(format!(
+            "            TILE_MMA({acc}_t[i][j], ta[i], tb[j]);"
+        ));
+        self.line("        }");
+        self.line("    }");
+        self.line("}");
+        // The unit's sums truncate, so blocks add up in floats.
+        self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
+        self.line(format!(
+            "            {acc}[i][j][e] += TILE_VAL({acc}_t[i][j], e);"
+        ));
+        self.line("        }");
+        self.line("    }");
+        self.line("}");
+        // A lane's share of the block's multiply-adds, as tile flops.
+        let flops = (2 * rows * cols * depth) as f64 / LANES as f64;
+        self.count(Ops {
+            tile_flops: flops,
+            float: (rows * cols) as f64 / LANES as f64,
+            loads: ((rows + cols) * depth) as f64 / LANES as f64,
+            width: 4.0,
+            ..Ops::default()
+        });
+    }
+
+    /// Each sum this lane holds: `r`, `c`, `v`.
+    pub fn tile_each(&mut self, acc: &str, rows: usize, cols: usize, body: impl FnOnce(&mut Gen)) {
+        self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
+        self.line(format!(
+            "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
+        ));
+        self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
+        self.line("            u32 r = i * TILE_M + TILE_ROW(e);");
+        self.line("            u32 c = j * TILE_N + TILE_COL(e);");
+        self.line(format!("            float v = {acc}[i][j][e];"));
+        self.indent += 3;
+        body(self);
+        self.indent -= 3;
+        self.line("        }");
+        self.line("    }");
+        self.line("}");
     }
 
     /// `1 / sqrt(expr)`, one special op.

@@ -53,6 +53,7 @@ fn pool() -> Pool {
         read: c(125e9),
         scan: c(100e9),
         write: c(110e9),
+        tile: c(0.0),
     }
 }
 

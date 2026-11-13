@@ -22,6 +22,8 @@ pub enum Kind {
     Write,
     /// A load whose address the last load gave.
     Chase,
+    /// Tile multiplies on registers, away from memory.
+    Tile,
 }
 
 /// One launch of a probe kernel.
@@ -54,6 +56,7 @@ impl Probe {
             Kind::Scan => [all, self.threads],
             Kind::Write => [16, all.max(self.threads)],
             Kind::Chase => [CHASE, self.threads],
+            Kind::Tile => [64 * 36, self.threads],
         }
     }
 
@@ -115,6 +118,46 @@ impl Probe {
     out[gid] = at;
 "
             ),
+            // A warp's 32x32 block over 32 staged columns.
+            Kind::Tile => format!(
+                "{HEAD}    u32 lane = lid % 32;
+    f_group(float, s, 64 * 36);
+    for (u32 i = lid; i < 64 * 36; i += 256) {{
+        s[i] = x[i];
+    }}
+    f_barrier();
+    tile_acc acc[32 / TILE_M][32 / TILE_N];
+    for (u32 i = 0; i < 32 / TILE_M; i++) {{
+        for (u32 j = 0; j < 32 / TILE_N; j++) {{
+            TILE_ZERO(acc[i][j]);
+        }}
+    }}
+    for (u32 it = 0; it < trips; it++) {{
+        for (u32 kk = 0; kk < 32; kk += TILE_K) {{
+            tile_a ta[32 / TILE_M];
+            tile_b tb[32 / TILE_N];
+            for (u32 i = 0; i < 32 / TILE_M; i++) {{
+                TILE_LOAD_A(ta[i], s + i * TILE_M * 36 + kk, 36);
+            }}
+            for (u32 j = 0; j < 32 / TILE_N; j++) {{
+                TILE_LOAD_B(tb[j], s + 32 * 36 + j * TILE_N * 36 + kk, 36);
+            }}
+            for (u32 i = 0; i < 32 / TILE_M; i++) {{
+                for (u32 j = 0; j < 32 / TILE_N; j++) {{
+                    TILE_MMA(acc[i][j], ta[i], tb[j]);
+                }}
+            }}
+        }}
+    }}
+    float sum = 0.0f;
+    for (u32 i = 0; i < 32 / TILE_M; i++) {{
+        for (u32 j = 0; j < 32 / TILE_N; j++) {{
+            sum += TILE_VAL(acc[i][j], 0);
+        }}
+    }}
+    out[gid] = sum;
+"
+            ),
         }
     }
 
@@ -164,6 +207,7 @@ impl Kernel for Probe {
             Kind::Scan => "probe_scan".to_string(),
             Kind::Write => "probe_write".to_string(),
             Kind::Chase => "probe_chase".to_string(),
+            Kind::Tile => "probe_tile".to_string(),
         };
         Source::Made(Text {
             entry,
@@ -284,7 +328,7 @@ impl Reading {
         match self.probe.kind {
             Kind::Read { depth } => all * depth,
             Kind::Scan | Kind::Write => all,
-            Kind::Spin | Kind::Curve | Kind::Chase => 0,
+            Kind::Spin | Kind::Curve | Kind::Chase | Kind::Tile => 0,
         }
     }
 
@@ -326,6 +370,8 @@ pub fn fit(readings: &[Reading]) -> Fit {
     let wait = of(Kind::Read { depth: 1 }, 256, LARGE).per_trip();
     let near = (of(Kind::Scan, 256, SMALL).per_trip() - step).max(0.0);
     let curve = (of(Kind::Curve, 256, 0).seconds - floor) / 4096.0;
+    // A warp's trip does 65536 tile flops.
+    let tiles = |r: &Reading| (r.probe.threads / 32 * r.probe.trips) as f64 * 65_536.0;
     Fit {
         floor,
         spawn,
@@ -340,6 +386,7 @@ pub fn fit(readings: &[Reading]) -> Fit {
         read: fastest(&|r| reads(r) && r.bytes() == LARGE, &bytes),
         scan: fastest(&|r| scans(r) && r.bytes() == LARGE, &bytes),
         write: fastest(&|r| r.probe.kind == Kind::Write, &bytes),
+        tile: fastest(&|r| r.probe.kind == Kind::Tile, &tiles),
     }
 }
 
@@ -374,6 +421,9 @@ pub fn suite() -> Vec<Probe> {
     }
     for (threads, trips) in [(1, 100_000), (256, 10_000), (65_536, 1000)] {
         all.push(probe(Kind::Chase, threads, trips));
+    }
+    for threads in [256, 4096, 65_536] {
+        all.push(probe(Kind::Tile, threads, 256));
     }
     all
 }
