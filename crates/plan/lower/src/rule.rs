@@ -27,7 +27,7 @@ impl Attn {
 
 /// A pattern at a tree node, for kernels to compute.
 #[derive(Clone, Debug)]
-pub enum Site<'a> {
+pub enum Site {
     /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
     Matmul {
         x: T,
@@ -45,7 +45,7 @@ pub enum Site<'a> {
     },
     /// One row stage that is not elementwise.
     Stage {
-        stage: &'a Stage,
+        stage: Stage,
         x: T,
         /// The stage's argument, and how many elements it holds.
         operand: Option<(T, usize)>,

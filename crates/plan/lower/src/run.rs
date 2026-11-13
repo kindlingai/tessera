@@ -57,19 +57,26 @@ impl Held {
         self.bound.clear();
         for (b, (&bytes, owner)) in plan.buffers.iter().zip(owner).enumerate() {
             let zone = plan.zone(b as u32);
-            let same = |buffer: &Buffer| buffer.bytes() == bytes && buffer.zone == zone;
+            // Named buffers fit exactly. Scratch may be larger.
+            let fits = |buffer: &Buffer| buffer.zone == zone && buffer.bytes() >= bytes;
             let held = match owner {
                 Some((true, index)) => self.kept.get(&index).copied(),
                 Some((false, index)) => self.weights.get(&index).copied(),
-                None => spare.iter().position(same).map(|at| {
+                None => spare.iter().position(fits).map(|at| {
                     self.all.push(spare.swap_remove(at));
                     self.all.len() - 1
                 }),
             };
-            let at = match held.filter(|at| same(&self.all[*at])) {
+            let same = |buffer: &Buffer| buffer.zone == zone && buffer.bytes() == bytes;
+            let at = match held.filter(|at| owner.is_none() || same(&self.all[*at])) {
                 Some(at) => at,
                 None => {
-                    self.all.push(alloc(zone, bytes)?);
+                    // Scratch grows in steps, so a growing context reuses it.
+                    let want = match owner {
+                        Some(_) => bytes,
+                        None => bytes.next_power_of_two(),
+                    };
+                    self.all.push(alloc(zone, want)?);
                     self.all.len() - 1
                 }
             };

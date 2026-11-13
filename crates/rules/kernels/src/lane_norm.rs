@@ -127,7 +127,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let norm = LaneNorm {
         rows: len / width,
         width,
-        eps: *eps,
+        eps,
     };
     Some(vec![Draft::new(norm, [x, w], len)])
 }

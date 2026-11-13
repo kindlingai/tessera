@@ -136,6 +136,19 @@ impl Poly {
 }
 
 impl DimExpr {
+    /// Its value, given each bounded name's size.
+    pub fn value(&self, dims: &[Dim], size: &dyn Fn(DimName) -> Option<u64>) -> Option<u64> {
+        Some(match self {
+            DimExpr::Const(c) => *c,
+            DimExpr::Dim(name) => match dims.iter().find(|d| d.name == *name)?.size {
+                Size::Fixed(n) => n,
+                Size::Bounded(_) => size(*name)?,
+            },
+            DimExpr::Mul(a, b) => a.value(dims, size)? * b.value(dims, size)?,
+            DimExpr::Add(a, b) => a.value(dims, size)? + b.value(dims, size)?,
+        })
+    }
+
     /// Fixed dimensions become constants; bounded ones stay symbolic.
     pub fn poly(&self, dims: &[Dim]) -> Result<Poly, DimName> {
         Ok(match self {

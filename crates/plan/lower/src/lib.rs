@@ -2,6 +2,7 @@
 
 mod abi;
 mod assign;
+mod cache;
 mod cost;
 mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -20,6 +21,7 @@ mod tree;
 
 pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
+pub use cache::Cache;
 pub use codegen::{Dialect, Gen, LANES, Text, float, hash};
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;

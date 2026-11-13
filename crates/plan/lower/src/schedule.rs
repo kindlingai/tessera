@@ -58,27 +58,40 @@ fn distinct(reads: &[Val]) -> impl Iterator<Item = Val> + '_ {
 
 /// Runs the ready op that grows live memory least.
 pub fn schedule(s: &Selected) -> Vec<usize> {
+    // Per op: its readers, and how many inputs are unwritten.
     let mut writer = vec![None; s.values.len()];
     for (i, op) in s.ops.iter().enumerate() {
         writer[op.write.0 as usize] = Some(i);
     }
-    let mut done = vec![false; s.ops.len()];
+    let mut after: Vec<Vec<usize>> = vec![Vec::new(); s.ops.len()];
+    let mut waiting = vec![0; s.ops.len()];
+    for (i, op) in s.ops.iter().enumerate() {
+        for v in distinct(&op.reads) {
+            if let Some(w) = writer[v.0 as usize] {
+                after[w].push(i);
+                waiting[i] += 1;
+            }
+        }
+    }
+    let mut ready: Vec<usize> = (0..s.ops.len()).filter(|i| waiting[*i] == 0).collect();
     let mut lives = Lives::new(s);
     let mut order = Vec::with_capacity(s.ops.len());
-    while order.len() < s.ops.len() {
-        let ready = |i: &usize| {
-            let written = |v: &Val| writer[v.0 as usize].is_none_or(|w| done[w]);
-            !done[*i] && s.ops[*i].reads.iter().all(written)
-        };
+    while !ready.is_empty() {
         // Ties go to the op traced first.
-        let next = (0..s.ops.len())
-            .filter(ready)
-            .min_by_key(|i| lives.growth(*i));
-        let next = next.expect("traced order is always possible");
+        let best = (0..ready.len())
+            .min_by_key(|at| (lives.growth(ready[*at]), ready[*at]))
+            .expect("ready is not empty");
+        let next = ready.swap_remove(best);
         lives.run(next);
-        done[next] = true;
         order.push(next);
+        for &r in &after[next] {
+            waiting[r] -= 1;
+            if waiting[r] == 0 {
+                ready.push(r);
+            }
+        }
     }
+    assert_eq!(order.len(), s.ops.len(), "traced order is always possible");
     order
 }
 

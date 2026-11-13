@@ -121,13 +121,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     else {
         return None;
     };
-    if *pairs != Pairs::Halves {
+    if pairs != Pairs::Halves {
         return None;
     }
-    let angles = Angles {
-        width,
-        theta: *theta,
-    };
+    let angles = Angles { width, theta };
     let rope = Rope {
         positions,
         heads: len / (positions * width),

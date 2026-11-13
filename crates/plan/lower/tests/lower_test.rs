@@ -385,3 +385,33 @@ fn pinned_weights_narrow() {
     let (_, wide) = toy(&Device::guess());
     assert!(plan.buffers.iter().sum::<usize>() < wide.buffers.iter().sum::<usize>());
 }
+
+#[test]
+fn plans_are_cached() {
+    let g = program(&Config::toy(4, 16));
+    let mut cache = lower::Cache::default();
+    let device = Device::guess();
+    let first = cache.lower(&g, 0, &SIZES, &device).unwrap();
+    let again = cache.lower(&g, 0, &SIZES, &device).unwrap();
+    assert!(first == again && cache.hits == 1 && cache.len() == 1);
+    // Other sizes, or a device that changed, lower afresh.
+    cache
+        .lower(&g, 0, &[(Seqs, 1), (Context, 5)], &device)
+        .unwrap();
+    let favored = device.clone().favoring("matmul");
+    assert!(favored.generation() != device.generation());
+    // Two devices changed alike are still two devices.
+    let twice = device.clone().favoring("matmul");
+    assert!(twice.generation() != favored.generation() && twice == favored);
+    let tiled = cache.lower(&g, 0, &SIZES, &favored).unwrap();
+    assert!(tiled != first && cache.hits == 1 && cache.len() == 3);
+    let mut fitted = device.clone();
+    fitted.fit([(&tiled.steps[0], 1e-3)]);
+    assert!(fitted.generation() != device.generation());
+    // Another graph at the same sizes is another plan.
+    let step = stepper(&Config::toy(4, 16));
+    let sizes = [(Seqs, 1), (Rows, 2), (Context, 5)];
+    let stepped = cache.lower(&step, 0, &sizes, &device).unwrap();
+    let forward = cache.lower(&g, 0, &sizes, &device).unwrap();
+    assert!(stepped != forward && cache.len() == 5);
+}

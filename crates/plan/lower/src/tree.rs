@@ -43,6 +43,8 @@ pub struct Node {
 pub struct Tree<'a> {
     pub g: &'a Graph,
     nodes: Vec<Node>,
+    /// Per node: the pattern rules see there, found once.
+    sites: Vec<Option<Site>>,
     /// Per node: how many arguments and outputs name it.
     readers: Vec<u32>,
     /// The entry's outputs, with each one's graph shape.
@@ -86,10 +88,7 @@ fn sized(g: &Graph, sizes: &[(DimName, u64)], s: &Shape) -> Result<Vec<usize>, E
         let bound = sizes.iter().find(|(n, _)| *n == name);
         bound.map(|(_, size)| *size)
     };
-    let dim = |e: &graph::DimExpr| {
-        let poly = e.poly(&g.dims).ok()?;
-        Some(poly.eval(&size)? as usize)
-    };
+    let dim = |e: &graph::DimExpr| Some(e.value(&g.dims, &size)? as usize);
     let all: Option<Vec<usize>> = s.0.iter().map(dim).collect();
     all.ok_or_else(|| Error::Size(s.to_string()))
 }
@@ -110,6 +109,7 @@ impl<'a> Tree<'a> {
         let mut tree = Tree {
             g,
             nodes: Vec::new(),
+            sites: Vec::new(),
             readers: Vec::new(),
             outputs: Vec::new(),
             ports: Vec::new(),
@@ -180,6 +180,10 @@ impl<'a> Tree<'a> {
             let shape = sized(g, sizes, &g.nodes[o].ty.shape)?;
             tree.outputs.push((t, shape));
         }
+        // Every rule asks everywhere, so sites are found once.
+        tree.sites = (0..tree.nodes.len() as u32)
+            .map(|t| tree.find_site(T(t)))
+            .collect();
         Ok(tree)
     }
 
@@ -218,7 +222,11 @@ impl<'a> Tree<'a> {
     }
 
     /// The pattern at `t`, as rules know it, if any.
-    pub fn site(&self, t: T) -> Option<Site<'_>> {
+    pub fn site(&self, t: T) -> Option<Site> {
+        self.sites[t.0 as usize].clone()
+    }
+
+    fn find_site(&self, t: T) -> Option<Site> {
         let n = self.node(t);
         let wide = |a: T| &self.node(a).shape;
         match &n.term {
@@ -244,7 +252,7 @@ impl<'a> Tree<'a> {
                 let operand = n.args.get(1).map(|o| (*o, self.elements(*o)));
                 let (len, width) = (self.elements(x), *wide(x).last()?);
                 Some(Site::Stage {
-                    stage,
+                    stage: stage.clone(),
                     x,
                     operand,
                     len,
@@ -312,7 +320,7 @@ impl<'a> Tree<'a> {
     }
 
     /// The elementwise stages ending at `t`, back through first arguments.
-    fn chain(&self, t: T) -> Option<Site<'_>> {
+    fn chain(&self, t: T) -> Option<Site> {
         let mut nodes = vec![t];
         while let Some(first) = self.node(nodes[nodes.len() - 1]).args.first() {
             if !self.joins(*first) {

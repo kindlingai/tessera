@@ -87,7 +87,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let kernel = RmsNorm {
         rows: len / width,
         width,
-        eps: *eps,
+        eps,
     };
     Some(vec![Draft::new(kernel, [x, w], len)])
 }
