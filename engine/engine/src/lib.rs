@@ -10,6 +10,11 @@ use interp::Tensor;
 use lower::{Cache, Device, Error, Recipe, Run, Settings, open};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::mpsc;
+
+mod schedule;
+
+pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 
 /// Tokens to continue, and when to stop.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -163,38 +168,13 @@ impl Engine {
         request: &Request,
         emit: &mut dyn FnMut(Event),
     ) -> Result<(), Error> {
-        if request.tokens.is_empty() || request.tokens.len() > self.context {
-            return Err(Error::Size("the prompt".into()));
+        let (events, taken) = mpsc::channel();
+        let mut batch = Batch::new(self, Box::new(Fair));
+        batch.submit(request.clone(), Box::new(move |e| events.send(e).is_ok()));
+        while batch.step()? {
+            taken.try_iter().for_each(&mut *emit);
         }
-        let mut past = 0;
-        let mut next = request.tokens.clone();
-        for made in 0..request.max_tokens {
-            if past + next.len() >= self.context {
-                emit(Event::Done(Reason::Context));
-                return Ok(());
-            }
-            let row = |(i, token): (usize, &u32)| Row {
-                slot: 0,
-                token: *token,
-                position: (past + i) as u32,
-            };
-            let rows: Vec<Row> = next.iter().enumerate().map(row).collect();
-            let ids = self.step(&rows)?;
-            let id = *ids.last().expect("a row per token");
-            if request.stop.contains(&id) {
-                emit(Event::Done(Reason::Stop));
-                return Ok(());
-            }
-            emit(Event::Token(id));
-            past += next.len();
-            next = vec![id];
-            if made + 1 == request.max_tokens {
-                emit(Event::Done(Reason::Length));
-            }
-        }
-        if request.max_tokens == 0 {
-            emit(Event::Done(Reason::Length));
-        }
+        taken.try_iter().for_each(emit);
         Ok(())
     }
 }

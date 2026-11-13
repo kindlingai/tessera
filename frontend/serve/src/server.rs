@@ -25,7 +25,7 @@ pub struct Shared {
     pub tokenizer: Tokenizer,
     pub template: Option<Template>,
     pub stop: Vec<u32>,
-    /// The engine thread's queue. One answer runs at a time.
+    /// The engine thread's queue. Answers share each step.
     pub jobs: Mutex<mpsc::Sender<Job>>,
 }
 
