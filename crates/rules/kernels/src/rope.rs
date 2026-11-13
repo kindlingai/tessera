@@ -1,9 +1,27 @@
 //! Rotary positions: a table of angles, then the rotation.
 
-use crate::apply_rope_heads;
 use codegen::prelude::*;
 use graph::{Pairs, Stage};
 use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
+
+/// One thread per position, head and pair, rotating in place.
+#[kernel]
+fn rope(mut x: BufMut<F32>, freqs: Buf<F32>, positions: u32, heads: u32, width: u32) {
+    let pairs = width / 2;
+    if gid() >= positions * heads * pairs {
+        return;
+    }
+    let pair = gid() % pairs;
+    let h = (gid() / pairs) % heads;
+    let s = gid() / pairs / heads;
+    let at = ((s * heads + h) * width) as u64;
+    let c = freqs[(s * width + 2 * pair) as u64];
+    let sn = freqs[(s * width + 2 * pair + 1) as u64];
+    let x0 = x[at + pair as u64];
+    let x1 = x[at + (pairs + pair) as u64];
+    x[at + pair as u64] = x0 * c - x1 * sn;
+    x[at + (pairs + pair) as u64] = x0 * sn + x1 * c;
+}
 
 /// One thread per position and pair: its cosine and sine.
 #[kernel]
@@ -76,33 +94,17 @@ impl Kernel for Rope {
     }
 
     fn source(&self) -> Source {
-        use apply_rope_heads::{CUDA, ENTRY, METAL};
-        Source::Fixed {
-            metal: METAL,
-            cuda: CUDA,
-            entry: ENTRY,
-        }
+        let mut text = rope_ir().text();
+        text.entry = "plan_rope".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let shape = apply_rope_heads::Fixture {
-            x: Vec::new(),
-            freqs: Vec::new(),
-            seq_len: self.positions,
-            num_heads: self.heads,
-            head_dim: self.width,
-            rotary_dim: self.width,
-            elem_offset: 0,
-        };
-        let sizes = Arg::pair(self.heads, self.positions);
+        let sizes = [self.positions, self.heads, self.width].map(Arg::count);
+        let buffers = [step.read(0), step.read(1)];
         vec![Launch {
-            args: vec![
-                step.read(0),
-                step.read(1),
-                Arg::bytes(&shape.params()),
-                sizes,
-            ],
-            shape: Shape::Line(self.heads * self.positions),
+            args: buffers.into_iter().chain(sizes).collect(),
+            shape: Shape::Line(self.positions * self.heads * self.width / 2),
         }]
     }
 

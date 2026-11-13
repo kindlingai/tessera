@@ -1,7 +1,23 @@
 //! Rows of a table at given indices.
 
-use crate::gather_rows;
+use codegen::prelude::*;
 use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
+
+/// One thread per output element, widened from the table.
+#[kernel]
+fn gather<F: Form<Elem = f32>>(
+    table: Buf<F>,
+    ids: Buf<U32>,
+    mut out: BufMut<F32>,
+    rows: u32,
+    width: u32,
+) {
+    if gid() >= rows * width {
+        return;
+    }
+    let row = ids[(gid() / width) as u64];
+    out[gid() as u64] = table[row as u64 * width as u64 + (gid() % width) as u64];
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Gather {
@@ -24,26 +40,25 @@ impl Kernel for Gather {
     }
 
     fn source(&self) -> Source {
-        Source::Fixed {
-            metal: gather_rows::METAL,
-            cuda: gather_rows::CUDA,
-            entry: match self.form {
-                DType::Bf16 => gather_rows::ENTRY_BF16,
-                _ => gather_rows::ENTRY,
-            },
-        }
+        let body = match self.form {
+            DType::Bf16 => gather_ir::<Bf16>(),
+            _ => gather_ir::<F32>(),
+        };
+        let mut text = body.text();
+        text.entry = format!("plan_gather_{}", self.form.name());
+        Source::Made(text)
     }
 
     fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 0, form)
     }
 
-    /// The kernel takes its output first.
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = Arg::pair(self.rows, self.width);
+        let sizes = [self.rows, self.width].map(Arg::count);
+        let buffers = [step.read(0), step.read(1), step.out()];
         vec![Launch {
-            args: vec![step.out(), step.read(0), step.read(1), sizes],
-            shape: Shape::Rows(self.rows),
+            args: buffers.into_iter().chain(sizes).collect(),
+            shape: Shape::Line(self.rows * self.width),
         }]
     }
 }

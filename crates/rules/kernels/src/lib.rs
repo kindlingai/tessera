@@ -1,15 +1,11 @@
 //! Kernels and their lowering rules. Linking this crate registers them.
 
-// Fixtures are never empty, so `is_empty` would mean nothing.
-#[allow(clippy::len_without_is_empty)]
-pub mod apply_rope_heads;
 mod argmax;
 mod attend;
 mod dense;
 mod flash;
 mod gather;
-#[allow(clippy::len_without_is_empty)]
-pub mod gather_rows;
+// Fixtures are never empty, so `is_empty` would mean nothing.
 #[allow(clippy::len_without_is_empty)]
 pub mod gqa_attention;
 mod join;
