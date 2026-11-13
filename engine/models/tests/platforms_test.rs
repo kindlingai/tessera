@@ -11,8 +11,8 @@ use lower::{Dialect, Kernel, Source};
 use std::path::Path;
 use std::process::Command;
 
-/// The tiled kernel's text. Every tile row must compile it.
-fn tiled_text(dialect: Dialect) -> String {
+/// The tiled kernel's text and entry name.
+fn tiled_text(dialect: Dialect) -> (String, String) {
     let tiled = Tiled {
         m: 64,
         n: 64,
@@ -24,7 +24,16 @@ fn tiled_text(dialect: Dialect) -> String {
     let Source::Made(body) = tiled.source() else {
         panic!("tiled is generated");
     };
-    body.text().render(dialect)
+    let text = body.text();
+    (text.render(dialect), text.entry.clone())
+}
+
+/// The metal-tt script for one compute pipeline.
+fn pipeline_script(entry: &str) -> String {
+    format!(
+        r#"{{"libraries": {{"paths": [{{"label": "L", "path": "./tiled.metallib"}}]}},
+ "pipelines": {{"compute_pipelines": [{{"compute_function": "alias:L#{entry}"}}]}}}}"#
+    )
 }
 
 /// One tile multiply, for a bare amdgcn compile.
@@ -72,10 +81,11 @@ fn toolkits_agree() {
     let here = |backend: &str| {
         let (program, flag, want) = match backend {
             "cuda" => ("nvcc", "--version", "nvcc"),
-            _ => ("clang++", "--print-targets", "amdgcn"),
+            "rocm" => ("clang++", "--print-targets", "amdgcn"),
+            _ => ("xcrun", "--find", "metal-tt"),
         };
         let found = Command::new(program)
-            .arg(flag)
+            .args([flag, want])
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(want));
         if !found {
@@ -85,8 +95,12 @@ fn toolkits_agree() {
     };
     let dir = scratch("platforms");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("tiled.cu"), tiled_text(Dialect::Cuda)).unwrap();
+    let (cuda, _) = tiled_text(Dialect::Cuda);
+    let (metal, entry) = tiled_text(Dialect::Metal);
+    std::fs::write(dir.join("tiled.cu"), cuda).unwrap();
     std::fs::write(dir.join("probe.cpp"), hip_probe()).unwrap();
+    std::fs::write(dir.join("tiled.metal"), metal).unwrap();
+    std::fs::write(dir.join("tiled.mtlp-json"), pipeline_script(&entry)).unwrap();
     for row in rows() {
         let backend = backend_of(&row).to_string();
         if row.check.is_empty() || !here(&backend) {
@@ -96,6 +110,7 @@ fn toolkits_agree() {
             match backend.as_str() {
                 "cuda" => check_cuda(&row.tile, row.pdl, target, &dir),
                 "rocm" => check_rocm(&row.tile, target, &dir),
+                "metal" => check_metal(&row.tile, target, &dir),
                 other => panic!("no toolkit check for {other}"),
             }
         }
@@ -157,5 +172,38 @@ fn check_rocm(tile: &Option<[usize; 3]>, target: &str, dir: &Path) {
             asm.contains("v_wmma_f32_16x16x16_f16"),
             "{target}: no wmma in the assembly"
         );
+    }
+}
+
+/// metal-tt builds a GPU slice per architecture in the family.
+fn check_metal(tile: &Option<[usize; 3]>, family: &str, dir: &Path) {
+    let xcrun = |args: &[&str]| run("xcrun", &[&["-sdk", "macosx"], args].concat(), dir);
+    let (ok, log) = xcrun(&["metal", "-c", "tiled.metal", "-o", "tiled.ir"]);
+    assert!(ok, "metal: {log}");
+    let (ok, log) = xcrun(&["metallib", "tiled.ir", "-o", "tiled.metallib"]);
+    assert!(ok, "metallib: {log}");
+    let (ok, flags) = xcrun(&["metal-config", "-gpu-family", family]);
+    assert!(ok, "metal-config {family}: {flags}");
+    let flags: Vec<&str> = flags.split_whitespace().collect();
+    let out = "tiled.binary.metallib";
+    let args = [
+        &["metal-tt", "tiled.metallib", "tiled.mtlp-json", "-o", out],
+        &flags[..],
+    ]
+    .concat();
+    let (built, log) = xcrun(&args);
+    assert_eq!(built, tile.is_some(), "{family}: {log}");
+    if tile.is_none() {
+        return;
+    }
+    let (_, archs) = xcrun(&["metal-lipo", "-archs", out]);
+    let gpus: Vec<&str> = archs
+        .split_whitespace()
+        .filter(|a| a.starts_with("applegpu_"))
+        .collect();
+    assert!(!gpus.is_empty(), "{family}: no GPU slice in {archs}");
+    for gpu in gpus {
+        let row = row_for(&format!("metal {gpu}")).unwrap_or_else(|| panic!("{gpu}: no row"));
+        assert_eq!(&row.tile, tile, "{gpu}");
     }
 }
