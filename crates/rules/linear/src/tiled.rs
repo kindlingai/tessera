@@ -1,8 +1,11 @@
 //! A matmul on the matrix unit, staged through group memory.
 
+use crate::lanes::{After, finishing};
 use codegen::{Gen, LANES, hash};
 use graph::{DType, Order};
-use lower::{Arg, Draft, Kernel, Launch, Load, Shape, Site, Source, Step, Stored, T, Tree};
+use lower::kernels::{operands, stage_lines};
+use lower::{Arg, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, Stored, T, Tree};
+use std::cmp::Ordering;
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,15 +14,45 @@ pub struct Schedule {
     pub block: (usize, usize, usize),
     /// How the group's warps split the block's rows and columns.
     pub warps: (usize, usize),
+    /// Its cost curves' names, for f32 and bf16 weights.
+    pub names: [&'static str; 2],
 }
 
-impl Schedule {
-    /// Four warps on a 64 by 64 by 32 block.
-    pub const DEFAULT: Schedule = Schedule {
+/// Every matmul's schedules. `w16` warps own 16 by 16.
+pub const SCHEDULES: [Schedule; 6] = [
+    Schedule {
         block: (64, 64, 32),
         warps: (2, 2),
-    };
+        names: ["tiled_64x64", "tiled_64x64_bf16"],
+    },
+    Schedule {
+        block: (32, 64, 32),
+        warps: (1, 2),
+        names: ["tiled_32x64", "tiled_32x64_bf16"],
+    },
+    Schedule {
+        block: (128, 64, 32),
+        warps: (4, 2),
+        names: ["tiled_128x64", "tiled_128x64_bf16"],
+    },
+    Schedule {
+        block: (64, 128, 32),
+        warps: (2, 4),
+        names: ["tiled_64x128", "tiled_64x128_bf16"],
+    },
+    Schedule {
+        block: (64, 64, 32),
+        warps: (4, 4),
+        names: ["tiled_64x64_w16", "tiled_64x64_w16_bf16"],
+    },
+    Schedule {
+        block: (32, 32, 32),
+        warps: (2, 2),
+        names: ["tiled_32x32_w16", "tiled_32x32_w16_bf16"],
+    },
+];
 
+impl Schedule {
     fn threads(&self) -> usize {
         self.warps.0 * self.warps.1 * LANES
     }
@@ -31,22 +64,43 @@ impl Schedule {
 }
 
 /// `x[m, k]` times `w[n, k]` transposed, by tiles.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Tiled {
     pub m: usize,
     pub n: usize,
     pub k: usize,
     pub form: DType,
     pub schedule: Schedule,
+    pub after: After,
 }
 
 /// Floats of padding after each staged row, against bank conflicts.
 const PAD: usize = 4;
 
+/// Elements one wide load brings.
+const WIDE: usize = 4;
+
+/// One operand's slab and where its rows come from.
+struct Slab<'a> {
+    slab: &'a str,
+    src: &'a str,
+    dtype: DType,
+    first: &'a str,
+    count: &'a str,
+    rows: usize,
+}
+
 impl Tiled {
     fn groups(&self) -> (usize, usize) {
         let (bm, bn, _) = self.schedule.block;
         (self.m.div_ceil(bm), self.n.div_ceil(bn))
+    }
+
+    fn others(&self) -> usize {
+        match self.after.stages.is_empty() {
+            true => 0,
+            false => operands(&self.after.stages),
+        }
     }
 
     /// Stages a block of `x` and `w`, multiplies, then stores.
@@ -57,11 +111,14 @@ impl Tiled {
         let mut g = Gen::new("tiled");
         g.floats("x", false);
         g.buffer("w", self.form.ty(), false);
+        for a in 0..self.others() {
+            g.floats(&format!("a{a}"), false);
+        }
         g.floats("out", true);
         g.scalar("m", "u32");
         g.scalar("n", "u32");
         g.scalar("k", "u32");
-        let lane = g.lane();
+        g.lane();
         g.line(format!("u32 warp = lid / {LANES};"));
         g.line(format!("u32 group = gid / {threads};"));
         g.line(format!(
@@ -81,25 +138,25 @@ impl Tiled {
         g.line(format!("f_group(float, As, {});", bm * stride));
         g.line(format!("f_group(float, Bs, {});", bn * stride));
         g.tile_acc("acc", wm, wn);
-        let load_w = self.form.load("w", "(u64)(col0 + r) * k + k0 + c");
+        let a = Slab {
+            slab: "As",
+            src: "x",
+            dtype: DType::F32,
+            first: "row0",
+            count: "m",
+            rows: bm,
+        };
+        let b = Slab {
+            slab: "Bs",
+            src: "w",
+            dtype: self.form,
+            first: "col0",
+            count: "n",
+            rows: bn,
+        };
         g.repeat("k0", "0", "k", &bk.to_string(), 1, |g| {
-            // Threads fill both slabs, zero past the edges.
-            g.line(format!(
-                "for (u32 i = lid; i < {bm} * {bk}; i += {threads}) {{"
-            ));
-            g.line(format!("    u32 r = i / {bk}, c = i % {bk};"));
-            g.line("    bool in = row0 + r < m && k0 + c < k;");
-            g.line(format!(
-                "    As[r * {stride} + c] = in ? x[(u64)(row0 + r) * k + k0 + c] : 0.0f;"
-            ));
-            g.line("}");
-            g.line(format!(
-                "for (u32 i = lid; i < {bn} * {bk}; i += {threads}) {{"
-            ));
-            g.line(format!("    u32 r = i / {bk}, c = i % {bk};"));
-            g.line("    bool in = col0 + r < n && k0 + c < k;");
-            g.line(format!("    Bs[r * {stride} + c] = in ? {load_w} : 0.0f;"));
-            g.line("}");
+            self.stage(g, &a);
+            self.stage(g, &b);
             g.line("f_barrier();");
             let a = format!("As + wm * {stride}");
             let b = format!("Bs + wn * {stride}");
@@ -108,21 +165,87 @@ impl Tiled {
         });
         g.tile_each("acc", wm, wn, |g| {
             g.line("u32 gr = row0 + wm + r, gc = col0 + wn + c;");
-            g.line("if (gr < m && gc < n) {");
-            g.line("    out[(u64)gr * n + gc] = v;");
-            g.line("}");
+            g.block("if (gr < m && gc < n)", |g| self.store(g));
         });
-        let _ = lane;
         g
+    }
+
+    /// Threads fill the slab's rows, zero past the edges.
+    fn stage(&self, g: &mut Gen, s: &Slab) {
+        let Slab {
+            slab,
+            src,
+            dtype,
+            first,
+            count,
+            rows,
+        } = *s;
+        let (_, _, bk) = self.schedule.block;
+        let (threads, stride) = (self.schedule.threads(), bk + PAD);
+        let at = format!("(u64)({first} + r) * k + k0 + c");
+        if !self.k.is_multiple_of(WIDE) {
+            g.line(format!(
+                "for (u32 i = lid; i < {rows} * {bk}; i += {threads}) {{"
+            ));
+            g.line(format!("    u32 r = i / {bk}, c = i % {bk};"));
+            g.line(format!(
+                "    bool in = {first} + r < {count} && k0 + c < k;"
+            ));
+            let load = dtype.load(src, &at);
+            g.line(format!(
+                "    {slab}[r * {stride} + c] = in ? {load} : 0.0f;"
+            ));
+            g.line("}");
+            return;
+        }
+        // Groups of four along `k` need one test per load.
+        let per = bk / WIDE;
+        g.line(format!(
+            "for (u32 i = lid; i < {rows} * {per}; i += {threads}) {{"
+        ));
+        g.line(format!("    u32 r = i / {per}, c = (i % {per}) * {WIDE};"));
+        g.block(
+            &format!("    if ({first} + r < {count} && k0 + c < k)"),
+            |g| {
+                let v = g.four(dtype, &format!("{src} + {at}"));
+                for (e, v) in v.iter().enumerate() {
+                    g.line(format!("    {slab}[r * {stride} + c + {e}] = {v};"));
+                }
+            },
+        );
+        g.block("    else", |g| {
+            for e in 0..WIDE {
+                g.line(format!("    {slab}[r * {stride} + c + {e}] = 0.0f;"));
+            }
+        });
+        g.line("}");
+    }
+
+    /// The sum `v` through the stages, into its place.
+    fn store(&self, g: &mut Gen) {
+        let After { stages, sum } = &self.after;
+        let o = "((u64)gr * n + gc)";
+        if stages.is_empty() {
+            return g.line(format!("out[{o}] = v;"));
+        }
+        // The chain's reads in order, the sum among them.
+        g.line("float s = v;");
+        let read = |j: usize| match j.cmp(sum) {
+            Ordering::Equal => "s".to_string(),
+            Ordering::Less => format!("a{j}[{o}]"),
+            Ordering::Greater => format!("a{}[{o}]", j - 1),
+        };
+        g.line(format!("{{ float v = {};", read(0)));
+        for line in stage_lines(stages, &|j| read(j + 1)).lines() {
+            g.line(line.trim_start().to_string());
+        }
+        g.line(format!("out[{o}] = v; }}"));
     }
 }
 
 impl Kernel for Tiled {
     fn name(&self) -> &'static str {
-        match self.form {
-            DType::Bf16 => "tiled_bf16",
-            _ => "tiled",
-        }
+        self.schedule.names[(self.form == DType::Bf16) as usize]
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -138,16 +261,18 @@ impl Kernel for Tiled {
         let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
         let (gm, gn) = self.groups();
         let (_, _, bk) = self.schedule.block;
+        // Each operand is re-read once per group across it.
+        let mut reads = vec![
+            4.0 * m * k * gn as f64,
+            self.form.bytes() as f64 * n * k * gm as f64,
+        ];
+        reads.extend((0..self.others()).map(|_| 4.0 * m * n));
         Some(Load {
             threads: gm * gn * self.schedule.threads(),
             group: self.schedule.threads(),
             trips: (self.k.div_ceil(bk)) as f64,
             trip: self.write().trip(),
-            // Each operand is re-read once per group across it.
-            reads: vec![
-                4.0 * m * k * gn as f64,
-                self.form.bytes() as f64 * n * k * gm as f64,
-            ],
+            reads,
             written: 4.0 * m * n,
             flight: 16.0,
         })
@@ -161,10 +286,11 @@ impl Kernel for Tiled {
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let (gm, gn) = self.groups();
-        let args = [step.read(0), step.read(1), step.out()];
-        let sizes = [self.m, self.n, self.k].map(Arg::count);
+        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+        args.push(step.out());
+        args.extend([self.m, self.n, self.k].map(Arg::count));
         vec![Launch {
-            args: args.into_iter().chain(sizes).collect(),
+            args,
             shape: Shape::Grid {
                 across: gm * gn,
                 down: 1,
@@ -188,6 +314,7 @@ impl Kernel for Tiled {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (product, after, others) = finishing(tree, at)?;
     let Site::Matmul {
         x,
         w,
@@ -195,18 +322,24 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         n,
         k,
         form,
-    } = tree.site(at)?
+    } = product
     else {
         return None;
     };
-    let tiled = Tiled {
-        m,
-        n,
-        k,
-        form,
-        schedule: Schedule::DEFAULT,
+    // Each schedule is one way, so the cheapest wins.
+    let draft = |(choice, schedule): (usize, &Schedule)| {
+        let tiled = Tiled {
+            m,
+            n,
+            k,
+            form,
+            schedule: *schedule,
+            after: after.clone(),
+        };
+        let reads = [Read::Node(x), Read::Node(w)].into_iter();
+        Draft::new(tiled, reads.chain(others.iter().copied()), m * n).choice(choice)
     };
-    Some(vec![Draft::new(tiled, [x, w], m * n)])
+    Some(SCHEDULES.iter().enumerate().map(draft).collect())
 }
 
 lower::rule!("tiled", propose);

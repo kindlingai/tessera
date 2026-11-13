@@ -4,4 +4,4 @@ mod lanes;
 mod tiled;
 
 pub use lanes::{After, Lanes};
-pub use tiled::{Schedule, Tiled};
+pub use tiled::{SCHEDULES, Schedule, Tiled};

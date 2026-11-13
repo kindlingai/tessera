@@ -446,6 +446,8 @@ mod decode {
             gpu.learn(&g, Span { past, tokens });
         }
         let device = gpu.device.clone();
+        // The first pass compiles what the plan newly picked.
+        decode(gpu, &g, &device);
         let planned = decode(gpu, &g, &device);
         let (ms, rate) = (planned.prefill * 1e3, planned.rate());
         eprintln!("prefill, {} tokens: {ms:.1} ms", c.tokens.len());

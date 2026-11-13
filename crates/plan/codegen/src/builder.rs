@@ -94,6 +94,15 @@ impl Gen {
         "lane"
     }
 
+    /// `open` and a brace, `body` indented inside, then the close.
+    pub fn block(&mut self, open: &str, body: impl FnOnce(&mut Gen)) {
+        self.line(format!("{open} {{"));
+        self.indent += 1;
+        body(self);
+        self.indent -= 1;
+        self.line("}");
+    }
+
     /// `var` from `from` below `to` by `step`, `ahead` trips unrolled.
     pub fn repeat(
         &mut self,
@@ -191,8 +200,11 @@ impl Gen {
         let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
         self.line(format!("tile_acc {name}_t[{tm}][{tn}];"));
         self.line(format!("float {name}[{tm}][{tn}][TILE_COUNT];"));
+        self.line("#pragma unroll");
         self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line("        #pragma unroll");
         self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
         self.line(format!("            {name}[i][j][e] = 0.0f;"));
         self.line("        }");
@@ -204,25 +216,32 @@ impl Gen {
     pub fn tile_block(&mut self, acc: &str, a: &str, b: &str, stride: &str, dims: [usize; 3]) {
         let [rows, cols, depth] = dims;
         let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+        self.line("#pragma unroll");
         self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
         self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
         self.line("    }");
         self.line("}");
+        self.line("#pragma unroll");
         self.line(format!("for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"));
         self.line(format!("    tile_a ta[{tm}];"));
         self.line(format!("    tile_b tb[{tn}];"));
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
         self.line(format!(
             "        TILE_LOAD_A(ta[i], ({a}) + i * TILE_M * ({stride}) + kk, {stride});"
         ));
         self.line("    }");
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
         self.line(format!(
             "        TILE_LOAD_B(tb[j], ({b}) + j * TILE_N * ({stride}) + kk, {stride});"
         ));
         self.line("    }");
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("        #pragma unroll");
         self.line(format!("        for (u32 j = 0; j < {tn}; j++) {{"));
         self.line(format!(
             "            TILE_MMA({acc}_t[i][j], ta[i], tb[j]);"
@@ -231,8 +250,11 @@ impl Gen {
         self.line("    }");
         self.line("}");
         // The unit's sums truncate, so blocks add up in floats.
+        self.line("#pragma unroll");
         self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("    #pragma unroll");
         self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line("        #pragma unroll");
         self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
         self.line(format!(
             "            {acc}[i][j][e] += TILE_VAL({acc}_t[i][j], e);"
@@ -253,10 +275,12 @@ impl Gen {
 
     /// Each sum this lane holds: `r`, `c`, `v`.
     pub fn tile_each(&mut self, acc: &str, rows: usize, cols: usize, body: impl FnOnce(&mut Gen)) {
+        self.line("#pragma unroll");
         self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
         self.line(format!(
             "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
         ));
+        self.line("        #pragma unroll");
         self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {");
         self.line("            u32 r = i * TILE_M + TILE_ROW(e);");
         self.line("            u32 c = j * TILE_N + TILE_COL(e);");

@@ -161,10 +161,10 @@ impl Kernel for Lanes {
     }
 }
 
-/// A matmul, or stages finishing a matmul with one reader.
-fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (product, after, others) = match tree.site(at)? {
-        product @ Site::Matmul { .. } => (product, After::default(), Vec::new()),
+/// The matmul at `at`, or the one its stages finish.
+pub(crate) fn finishing(tree: &Tree, at: T) -> Option<(Site, After, Vec<Read>)> {
+    match tree.site(at)? {
+        product @ Site::Matmul { .. } => Some((product, After::default(), Vec::new())),
         Site::Map { stages, reads, .. } => {
             let lone = |r: &T| match tree.site(*r) {
                 Some(product @ Site::Matmul { .. }) if !tree.root(*r) => Some(product),
@@ -173,10 +173,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             let sum = reads.iter().position(|r| lone(r).is_some())?;
             let others = reads.iter().filter(|r| **r != reads[sum]);
             let others = others.map(|r| Read::Node(*r)).collect();
-            (lone(&reads[sum])?, After { stages, sum }, others)
+            Some((lone(&reads[sum])?, After { stages, sum }, others))
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
+
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (product, after, others) = finishing(tree, at)?;
     let Site::Matmul {
         x,
         w,
