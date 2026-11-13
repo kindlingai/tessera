@@ -6,7 +6,9 @@ use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{MapStage, operands, stage_stmts};
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, Stored, T, Tree};
+use lower::{
+    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -76,7 +78,7 @@ pub struct Lanes {
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub form: DType,
+    pub form: &'static dyn Stored,
     pub after: After,
 }
 
@@ -90,11 +92,11 @@ impl Lanes {
 
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let build = || match self.form {
-            DType::Bf16 => linear_ir::<WIDE, AHEAD, Bf16>(self.m),
+        let build = || match self.form.name() {
+            "bf16" => linear_ir::<WIDE, AHEAD, Bf16>(self.m),
             _ => linear_ir::<WIDE, AHEAD, F32>(self.m),
         };
-        let key = (self.m, self.form == DType::Bf16);
+        let key = (self.m, self.form.name() == "bf16");
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         let operand = |a: usize| Param::Buffer {
             name: format!("a{a}"),
@@ -143,8 +145,8 @@ impl Lanes {
 
 impl Kernel for Lanes {
     fn name(&self) -> &'static str {
-        match self.form {
-            DType::Bf16 => "lanes_bf16",
+        match self.form.name() {
+            "bf16" => "lanes_bf16",
             _ => "lanes",
         }
     }
@@ -160,7 +162,7 @@ impl Kernel for Lanes {
 
     fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m, self.n, self.k);
-        let bytes = self.form.bytes() * WIDE as usize;
+        let bytes = self.form.bytes(WIDE as usize);
         Some(Load {
             threads: n * LANES,
             group: 256,
@@ -197,7 +199,7 @@ impl Kernel for Lanes {
         1e-9
     }
 
-    fn accepts(&self, input: usize, form: DType) -> bool {
+    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         self.form.taken(input, 1, form)
     }
 

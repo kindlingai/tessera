@@ -8,10 +8,11 @@ use emit::Emit;
 
 use crate::Error;
 use crate::cost::Device;
+use crate::form::{self, Form};
 use crate::kernel::KernelRef;
 use crate::rule::{Read, rules};
 use crate::tree::{T, Term, Tree, unsupported};
-use graph::{DType, DimName, Graph, NodeId};
+use graph::{DimName, Graph, NodeId};
 use std::collections::BTreeSet;
 
 /// A value some op writes, or the plan is given.
@@ -38,7 +39,7 @@ pub struct Value {
     pub home: Home,
     /// The zone it lies in.
     pub zone: u32,
-    pub dtype: DType,
+    pub form: &'static dyn Form,
 }
 
 /// One launch, before it has buffers.
@@ -121,7 +122,7 @@ pub fn select_upto(
     }
     let mut e = Emit::default();
     for (port, &(len, dtype)) in tree.ports.iter().enumerate() {
-        let val = e.value(len, Home::Input(port as u32), EDGE, dtype);
+        let val = e.value(len, Home::Input(port as u32), EDGE, form::of(dtype));
         e.out.inputs.push(val);
     }
     // In traced order, so equal graphs give equal plans.
@@ -154,8 +155,8 @@ pub fn select_upto(
                     };
                     let reads: Vec<Val> = d.reads.iter().map(read).collect();
                     // The last launch writes the node's own type.
-                    let dtype = if i == last { n.form } else { DType::F32 };
-                    made.push(e.op(d, choice.rule, reads, &covers, zone, dtype));
+                    let form = if i == last { n.form } else { form::F32_FORM };
+                    made.push(e.op(d, choice.rule, reads, &covers, zone, form));
                 }
                 *made.last().expect("a rule proposes at least one launch")
             }

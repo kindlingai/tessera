@@ -168,7 +168,7 @@ fn whole_models_match_cpu() {
         };
         let weights: Vec<Tensor> = weights.iter().map(narrow).collect();
         for (rule, device) in devices() {
-            let device = device.pinned(Pins::all(DType::Bf16));
+            let device = device.pinned(Pins::all(lower::form::BF16_FORM));
             let off = gap(&g, &weights, &inputs, &device);
             assert!(
                 off < 1e-3,

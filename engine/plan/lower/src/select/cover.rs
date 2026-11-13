@@ -1,7 +1,6 @@
 //! Covers each tree node with the cheapest rule, per zone.
 
 use crate::cost::Device;
-use crate::form::Stored;
 use crate::kernels::Widen;
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};

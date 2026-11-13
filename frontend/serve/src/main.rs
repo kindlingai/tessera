@@ -6,7 +6,7 @@ mod text;
 mod text_test;
 
 use engine::Engine;
-use lower::{DType, Pins, Recipe};
+use lower::{Pins, Recipe};
 use server::{Job, Shared};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -58,7 +58,7 @@ fn engine_thread(
     };
     let settings = settings::read();
     let recipe = Recipe {
-        pins: Pins::all(DType::Bf16),
+        pins: Pins::all(lower::form::BF16_FORM),
         ..Recipe::default()
     };
     let opened = Engine::open(loaded.graph, args.context, &recipe, &settings);

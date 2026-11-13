@@ -2,7 +2,7 @@
 
 use crate::Error;
 use crate::extent::Extent;
-use crate::form::Pins;
+use crate::form::{Form, Pins};
 use crate::kernels::MapStage;
 use crate::select::Home;
 use crate::sites::Pattern;
@@ -38,7 +38,7 @@ pub struct Node {
     /// Each axis, with runtime dimensions kept symbolic.
     pub extents: Vec<Extent>,
     /// How its elements are stored.
-    pub form: DType,
+    pub form: &'static dyn Form,
     /// The graph node it came from.
     pub from: NodeId,
 }
@@ -182,7 +182,7 @@ impl<'a> Tree<'a> {
             let args = args?;
             let form = match &n.op {
                 Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
-                _ => n.ty.dtype,
+                _ => crate::form::of(n.ty.dtype),
             };
             let mut push = |term: Term, args: Vec<T>| {
                 let (shape, extents) = (shape.clone(), extents.clone());
@@ -254,7 +254,7 @@ impl<'a> Tree<'a> {
     }
 
     pub fn bytes(&self, t: T) -> usize {
-        self.elements(t) * self.node(t).form.bytes()
+        self.node(t).form.bytes(self.elements(t))
     }
 
     pub fn leaf(&self, t: T) -> bool {

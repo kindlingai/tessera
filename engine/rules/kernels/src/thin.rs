@@ -4,7 +4,7 @@ use codegen::ir::Body;
 use codegen::prelude::*;
 use graph::Order;
 use lower::sites;
-use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Source, Step, Stored, T, Tree};
+use lower::{Arg, Draft, Form as Stored, Kernel, Launch, Shape, Source, Step, T, Tree};
 use sim::Load;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub struct Thin {
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub form: DType,
+    pub form: &'static dyn Stored,
 }
 
 /// One thread per column with one sum per row.
@@ -56,19 +56,19 @@ fn thin<F: Form<Elem = f32>>(
 
 impl Thin {
     fn tree(&self) -> Body {
-        let build = || match self.form {
-            DType::Bf16 => thin_ir::<Bf16>(self.m),
+        let build = || match self.form.name() {
+            "bf16" => thin_ir::<Bf16>(self.m),
             _ => thin_ir::<F32>(self.m),
         };
-        let key = (self.m, self.form == DType::Bf16);
+        let key = (self.m, self.form.name() == "bf16");
         TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone())
     }
 }
 
 impl Kernel for Thin {
     fn name(&self) -> &'static str {
-        match self.form {
-            DType::Bf16 => "thin_bf16",
+        match self.form.name() {
+            "bf16" => "thin_bf16",
             _ => "thin",
         }
     }
@@ -98,7 +98,7 @@ impl Kernel for Thin {
         Source::Made(body)
     }
 
-    fn accepts(&self, input: usize, form: DType) -> bool {
+    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         self.form.taken(input, 1, form)
     }
 

@@ -4,7 +4,7 @@ use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
-use lower::{Cache, DType, Device, Pins, Plan, Run, Settings, View, lower, open, select};
+use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -104,7 +104,7 @@ fn matches_reference() {
 
 /// The checkpoint is bf16, so plans read it as stored.
 fn pinned(settings: &Settings) -> Device {
-    Device::guess(settings).pinned(Pins::all(DType::Bf16))
+    Device::guess(settings).pinned(Pins::all(lower::form::BF16_FORM))
 }
 
 /// Plans for either entry on one runner. Weights load once.

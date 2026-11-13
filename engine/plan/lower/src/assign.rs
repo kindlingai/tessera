@@ -52,12 +52,12 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
             }
             Home::Kept { index, room } => {
                 // The longest context fits, so the buffer never moves.
-                let buffer = b.buffer(room * value.dtype.bytes(), value.zone);
+                let buffer = b.buffer(value.form.bytes(room), value.zone);
                 let slot = Slot {
                     buffer,
                     offset: 0,
                     len: value.len,
-                    dtype: value.dtype,
+                    dtype: value.form.dtype(),
                 };
                 b.slots[v] = Some(slot);
                 b.plan.kept.push((index, slot));
@@ -93,9 +93,9 @@ impl Buffers<'_> {
     /// Reuses a free buffer of the value's size, if any.
     fn alloc(&mut self, v: Val) -> Slot {
         let Value {
-            len, zone, dtype, ..
+            len, zone, form, ..
         } = self.s.values[v.0 as usize];
-        let bytes = len * dtype.bytes();
+        let (bytes, dtype) = (form.bytes(len), form.dtype());
         let fits = |b: &u32| self.plan.buffers[*b as usize] == bytes && self.plan.zone(*b) == zone;
         let buffer = match self.free.iter().position(fits) {
             Some(at) => self.free.swap_remove(at),

@@ -2,7 +2,7 @@
 
 use codegen::prelude::*;
 use lower::sites;
-use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Source, Step, Stored, T, Tree};
+use lower::{Arg, Draft, Form as Stored, Kernel, Launch, Shape, Source, Step, T, Tree};
 
 /// One thread per output element, widened from the table.
 #[kernel]
@@ -25,13 +25,13 @@ pub struct Gather {
     pub rows: usize,
     pub width: usize,
     /// How the table is stored.
-    pub form: DType,
+    pub form: &'static dyn Stored,
 }
 
 impl Kernel for Gather {
     fn name(&self) -> &'static str {
-        match self.form {
-            DType::Bf16 => "gather_bf16",
+        match self.form.name() {
+            "bf16" => "gather_bf16",
             _ => "gather",
         }
     }
@@ -41,8 +41,8 @@ impl Kernel for Gather {
     }
 
     fn source(&self) -> Source {
-        let body = match self.form {
-            DType::Bf16 => gather_ir::<Bf16>(),
+        let body = match self.form.name() {
+            "bf16" => gather_ir::<Bf16>(),
             _ => gather_ir::<F32>(),
         };
         let mut body = body;
@@ -50,7 +50,7 @@ impl Kernel for Gather {
         Source::Made(body)
     }
 
-    fn accepts(&self, input: usize, form: DType) -> bool {
+    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         self.form.taken(input, 0, form)
     }
 

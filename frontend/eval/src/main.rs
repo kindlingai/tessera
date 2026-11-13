@@ -1,7 +1,7 @@
 //! `tessera-eval --model <dir> [--recipe <json>] [--m 1,4]`: JSON out.
 
 use engine::{Engine, Row};
-use lower::{DType, Pins, Recipe};
+use lower::{Pins, Recipe};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -148,7 +148,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {
-            pins: Pins::all(DType::Bf16),
+            pins: Pins::all(lower::form::BF16_FORM),
             ..Recipe::default()
         },
     };
