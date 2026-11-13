@@ -59,7 +59,7 @@ fn rounds_ties_even() {
         assert_eq!(round(*x), *want, "{x}");
     }
     assert!(f16(f32::NAN).is_nan() && bf16(f32::NAN).is_nan() && e4m3(f32::NAN).is_nan());
-    assert_eq!(e2m1(f32::NAN), 0.0);
+    assert_eq!(e2m1(f32::NAN), 6.0, "no NaN code, so it saturates");
     assert_eq!(Bf16::from(1.0).0, 0x3f80);
     assert_eq!(F16::from(1.0).0, 0x3c00);
     assert_eq!(E4M3::from(1.0).0, 0x38);
