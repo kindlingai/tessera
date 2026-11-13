@@ -66,19 +66,33 @@ fn table_resolves() {
     }
 }
 
-/// The `toolkit-cuda` and `toolkit-rocm` features say which are here.
+/// A toolkit that is not installed is skipped.
 #[test]
 fn toolkits_agree() {
-    let cuda = cfg!(feature = "toolkit-cuda");
-    let rocm = cfg!(feature = "toolkit-rocm");
-    let here = |backend: &str| (backend == "cuda" && cuda) || (backend == "rocm" && rocm);
+    let here = |backend: &str| {
+        let (program, flag, want) = match backend {
+            "cuda" => ("nvcc", "--version", "nvcc"),
+            _ => ("clang++", "--print-targets", "amdgcn"),
+        };
+        let found = Command::new(program)
+            .arg(flag)
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(want));
+        if !found {
+            println!("{backend}: no toolkit here, skipped");
+        }
+        found
+    };
     let dir = scratch("platforms");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("tiled.cu"), tiled_text(Dialect::Cuda)).unwrap();
     std::fs::write(dir.join("probe.cpp"), hip_probe()).unwrap();
     for row in rows() {
         let backend = backend_of(&row).to_string();
-        for target in row.check.iter().filter(|_| here(&backend)) {
+        if !here(&backend) {
+            continue;
+        }
+        for target in &row.check {
             match backend.as_str() {
                 "cuda" => check_cuda(&row.tile, row.pdl, target, &dir),
                 "rocm" => check_rocm(&row.tile, target, &dir),
