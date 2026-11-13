@@ -1,5 +1,22 @@
 //! Kernels and their lowering rules. Linking this crate registers them.
 
+/// Name, order and sizes of a kernel over one `Attn`.
+macro_rules! over_attn {
+    ($name:literal) => {
+        fn name(&self) -> &'static str {
+            $name
+        }
+
+        fn order(&self) -> Order {
+            Order::PerConfig
+        }
+
+        fn sizes(&self) -> Vec<usize> {
+            self.0.sizes()
+        }
+    };
+}
+
 mod argmax;
 mod attend;
 mod dense;

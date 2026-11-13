@@ -39,9 +39,10 @@ impl Kernel for Gather {
     }
 
     fn source(&self) -> Source {
-        let mut body = gather_ir(self.form);
-        body.entry = format!("plan_gather_{}", self.form.name());
-        Source::Made(body)
+        Source::named(
+            gather_ir(self.form),
+            format!("plan_gather_{}", self.form.name()),
+        )
     }
 
     fn accepts(&self, input: usize, form: &dyn Stored) -> bool {

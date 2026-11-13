@@ -179,9 +179,7 @@ impl Kernel for Causal {
     }
 
     fn source(&self) -> Source {
-        let mut body = causal_ir();
-        body.entry = "plan_causal".into();
-        Source::Made(body)
+        Source::named(causal_ir(), "plan_causal")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

@@ -94,9 +94,7 @@ impl Kernel for Peaks {
     }
 
     fn source(&self) -> Source {
-        let mut body = peaks_ir();
-        body.entry = "plan_peaks".into();
-        Source::Made(body)
+        Source::named(peaks_ir(), "plan_peaks")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -118,9 +116,7 @@ impl Kernel for Argmax {
     }
 
     fn source(&self) -> Source {
-        let mut body = argmax_ir();
-        body.entry = "plan_argmax".into();
-        Source::Made(body)
+        Source::named(argmax_ir(), "plan_argmax")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
