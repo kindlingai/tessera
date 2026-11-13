@@ -39,12 +39,12 @@ fn rule_registers() {
     )
     .unwrap();
     assert!(wide.steps.iter().all(|s| s.kernel.name() != "lanes"));
-    // A favored rule keeps its node from a hiding cover.
+    // A favored rule takes the chain that finishes its product.
     let residual = finished(48, 48, |x, product| x.add(&product));
     let thin = Device::guess(&settings()).favoring("thin");
     let kept = lower(&residual, 0, &sizes(3), &thin).unwrap();
     let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
-    assert_eq!(names, ["thin", "map"]);
+    assert_eq!(names, ["thin"]);
     // Weights come in wide loads, under a hashed entry name.
     let Source::Made(body) = plan.steps[0].kernel.source() else {
         panic!("lanes are generated");

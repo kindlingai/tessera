@@ -42,14 +42,20 @@ fn gate() -> Map {
 
 #[test]
 fn gate_fuses() {
-    // Barring the fusing matmuls leaves the gate a map.
+    // With the lanes barred, thin takes the gate's stages too.
     let plain = untiled(Device::guess(&settings())).without("lanes");
     let (g, plan) = toy(&plain);
-    let fused = KernelRef::new(gate());
-    let steps: Vec<_> = plan.steps.iter().filter(|s| s.kernel == fused).collect();
+    let alone = KernelRef::new(gate());
+    assert!(plan.steps.iter().all(|s| s.kernel != alone));
+    let gated = |s: &&lower::Step| s.rule == "thin" && s.covers.len() == 3;
+    let steps: Vec<_> = plan.steps.iter().filter(gated).collect();
     assert_eq!(steps.len(), 2, "one per layer");
     for s in steps {
-        assert_eq!((s.covers.len(), s.reads.len(), s.rule), (2, 2, "map"));
+        assert_eq!(
+            s.reads.len(),
+            3,
+            "the rows, the weights and the gate's operand"
+        );
         let holds = |r: &&graph::Region| s.covers.iter().all(|c| r.start <= *c && *c < r.end);
         let region = g.regions.iter().find(holds).unwrap();
         assert_eq!(region.kind, Composite::Mlp);
@@ -242,6 +248,7 @@ fn thin(m: usize) -> Step {
             n,
             k,
             form: lower::form::F32_FORM,
+            after: sites::After::default(),
         }),
         rule: "thin",
         reads: Vec::new(),
@@ -478,6 +485,7 @@ fn trips_are_counted() {
         n: 8,
         k: 64,
         form: lower::form::F32_FORM,
+        after: sites::After::default(),
     });
     assert_eq!((thin.loads, thin.float), (4.0, 3.0));
     assert!((thin.fresh - 1.0 / 16.0).abs() < 1e-9, "{thin:?}");

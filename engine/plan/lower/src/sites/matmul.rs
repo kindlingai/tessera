@@ -1,5 +1,7 @@
-use super::Pattern;
+use super::{Chain, Pattern};
 use crate::form::Form;
+use crate::kernels::MapStage;
+use crate::rule::Read;
 use crate::tree::{T, Term, Tree};
 
 /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
@@ -31,6 +33,62 @@ impl Pattern for Matmul {
             n,
             k,
             form,
+        })
+    }
+}
+
+/// Elementwise stages a sum runs through before it is stored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct After {
+    pub stages: Vec<MapStage>,
+    /// Which of the chain's reads the sum stands in for.
+    pub sum: usize,
+}
+
+impl After {
+    /// Operands the stages read besides the sum.
+    pub fn others(&self) -> usize {
+        crate::kernels::operands(&self.stages)
+    }
+}
+
+/// A matmul with the stages that finish it, if any.
+#[derive(Clone, Debug)]
+pub struct Finished {
+    pub product: Matmul,
+    pub after: After,
+    /// The stages' other operands, in their order.
+    pub others: Vec<Read>,
+}
+
+impl Finished {
+    /// The rows, the weights, then the stages' other operands.
+    pub fn reads(&self) -> Vec<Read> {
+        let mut reads = vec![Read::Node(self.product.x), Read::Node(self.product.w)];
+        reads.extend(self.others.iter().copied());
+        reads
+    }
+}
+
+impl Pattern for Finished {
+    /// The matmul at `at`, or the one its chain finishes.
+    fn find(tree: &Tree, at: T) -> Option<Self> {
+        if let Some(product) = tree.site::<Matmul>(at) {
+            return Some(Self {
+                product,
+                after: After::default(),
+                others: Vec::new(),
+            });
+        }
+        let Chain { stages, reads, .. } = tree.site(at)?;
+        // A product read elsewhere is stored on its own.
+        let lone = |r: &T| tree.site::<Matmul>(*r).filter(|_| !tree.root(*r));
+        let sum = reads.iter().position(|r| lone(r).is_some())?;
+        let others = reads.iter().filter(|r| **r != reads[sum]);
+        Some(Self {
+            product: lone(&reads[sum])?,
+            after: After { stages, sum },
+            others: others.map(|r| Read::Node(*r)).collect(),
         })
     }
 }

@@ -1,18 +1,17 @@
 //! A matmul on the matrix unit, staged through group memory.
 
-use crate::lanes::{After, finishing};
 use codegen::form::F32_FORM;
 use codegen::hash;
 use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use codegen::prelude::*;
 use graph::Order;
-use lower::kernels::{add_operands, operands, stage_stmts};
+use lower::kernels::{add_operands, finish};
 use lower::sites;
+use lower::sites::After;
 use lower::{
-    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
+    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
 };
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// How a block of the output is computed.
@@ -184,13 +183,6 @@ impl Tiled {
         (self.m.div_ceil(bm), self.n.div_ceil(bn))
     }
 
-    fn others(&self) -> usize {
-        match self.after.stages.is_empty() {
-            true => 0,
-            false => operands(&self.after.stages),
-        }
-    }
-
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
         let wide = self.k.is_multiple_of(WIDE as usize);
@@ -205,44 +197,20 @@ impl Tiled {
         let key = (at.expect("a listed schedule"), self.form.name(), wide);
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         // The operands sit between the weights and the output.
-        add_operands(&mut body, 2, self.others());
+        add_operands(&mut body, 2, self.after.others());
         body.stmts.push(self.stores());
         body
     }
 
     /// Each sum through the stages, into its place.
     fn stores(&self) -> Stmt {
-        let After { stages, sum } = &self.after;
         let u64 = |e| Expr::cast(Ty::U64, e);
         let add = |a, b| Expr::bin(BinOp::Add, a, b);
         let gr = add(add(Expr::var("row0"), Expr::var("wm0")), Expr::var("r"));
         let gc = add(add(Expr::var("col0"), Expr::var("wn0")), Expr::var("c"));
         let o = Expr::bin(BinOp::Mul, u64(Expr::var("gr")), u64(Expr::var("n")));
         let o = add(o, u64(Expr::var("gc")));
-        // The chain's reads in order, the sum among them.
-        let read = |j: usize| match j.cmp(sum) {
-            Ordering::Equal => Expr::var("s"),
-            Ordering::Less => Expr::index(Expr::var(&format!("a{j}")), o.clone()),
-            Ordering::Greater => Expr::index(Expr::var(&format!("a{}", j - 1)), o.clone()),
-        };
-        // The stages run on `v`, so the sum moves first.
-        let mut then = vec![
-            Stmt::Let {
-                name: "s".into(),
-                init: Expr::var("v"),
-            },
-            Stmt::Assign {
-                target: Expr::var("v"),
-                op: None,
-                value: read(0),
-            },
-        ];
-        then.extend(stage_stmts(stages, &|j| read(j + 1)));
-        then.push(Stmt::Assign {
-            target: Expr::index(Expr::var("out"), o.clone()),
-            op: None,
-            value: Expr::var("v"),
-        });
+        let then = finish(&self.after, Expr::var("v"), o);
         let inside = Expr::bin(
             BinOp::And,
             Expr::bin(BinOp::Lt, Expr::var("gr"), Expr::var("m")),
@@ -293,7 +261,7 @@ impl Kernel for Tiled {
             4.0 * m * k * gn as f64,
             self.form.bytes(self.n * self.k) as f64 * gm as f64,
         ];
-        reads.extend((0..self.others()).map(|_| 4.0 * m * n));
+        reads.extend((0..self.after.others()).map(|_| 4.0 * m * n));
         Some(Load {
             threads: gm * gn * self.schedule.threads(),
             group: self.schedule.threads(),
@@ -352,15 +320,8 @@ impl Kernel for Tiled {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (product, after, others) = finishing(tree, at)?;
-    let sites::Matmul {
-        x,
-        w,
-        m,
-        n,
-        k,
-        form,
-    } = product;
+    let site: sites::Finished = tree.site(at)?;
+    let sites::Matmul { m, n, k, form, .. } = site.product;
     // Each schedule is one way, so the cheapest wins.
     let draft = |(choice, schedule): (usize, &Schedule)| {
         let tiled = Tiled {
@@ -369,10 +330,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             k,
             form,
             schedule: *schedule,
-            after: after.clone(),
+            after: site.after.clone(),
         };
-        let reads = [Read::Node(x), Read::Node(w)].into_iter();
-        Draft::new(tiled, reads.chain(others.iter().copied()), m * n).choice(choice)
+        Draft::new(tiled, site.reads(), m * n).choice(choice)
     };
     Some(SCHEDULES.iter().enumerate().map(draft).collect())
 }

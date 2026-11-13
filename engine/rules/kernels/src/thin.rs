@@ -1,9 +1,12 @@
 //! A matmul with one thread per output column.
 
-use codegen::ir::Body;
+use codegen::hash;
+use codegen::ir::{BinOp, Body, Expr, Intrinsic, Stmt, Ty};
 use codegen::prelude::*;
 use graph::Order;
+use lower::kernels::{add_operands, finish};
 use lower::sites;
+use lower::sites::After;
 use lower::{Arg, Draft, Form as Stored, Kernel, Launch, Shape, Source, Step, T, Tree};
 use sim::Load;
 use std::cell::RefCell;
@@ -18,12 +21,13 @@ thread_local! {
 pub const THIN_ROWS: usize = 32;
 
 /// The same product as `Matmul`, for few rows.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Thin {
     pub m: usize,
     pub n: usize,
     pub k: usize,
     pub form: &'static dyn Stored,
+    pub after: After,
 }
 
 /// One thread per column with one sum per row.
@@ -50,16 +54,29 @@ fn thin(
             sums[row as usize] += x[(row * k + i) as u64] * c;
         }
     }
-    for row in 0..m as u32 {
-        out[row as u64 * n as u64 + gid() as u64] = sums[row as usize];
-    }
 }
 
 impl Thin {
+    /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
         let build = || thin_ir(self.m, self.form);
         let key = (self.m, self.form.name());
-        TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone())
+        let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
+        // The operands sit between the weights and the output.
+        add_operands(&mut body, 2, self.after.others());
+        let u64 = |e| Expr::cast(Ty::U64, e);
+        let o = Expr::bin(BinOp::Mul, u64(Expr::var("row")), u64(Expr::var("n")));
+        let o = Expr::bin(BinOp::Add, o, u64(Expr::Call(Intrinsic::Gid, Vec::new())));
+        let sum = Expr::index(Expr::var("sums"), Expr::var("row"));
+        body.stmts.push(Stmt::For {
+            var: "row".into(),
+            from: Expr::Int(0),
+            to: Expr::Int(self.m as i64),
+            step: Expr::Int(1),
+            unroll: 0,
+            body: finish(&self.after, sum, o),
+        });
+        body
     }
 }
 
@@ -88,10 +105,10 @@ impl Kernel for Thin {
     }
 
     fn source(&self) -> Source {
-        Source::named(
-            self.tree(),
-            format!("plan_thin_{}_{}", self.form.name(), self.m),
-        )
+        let body = self.tree();
+        // The text holds the stages. The name hashes the text.
+        let entry = format!("thin_{}_{:x}", self.form.name(), hash(&body.text().body));
+        Source::named(body, entry)
     }
 
     fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
@@ -99,10 +116,11 @@ impl Kernel for Thin {
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [self.n, self.k].map(Arg::count);
-        let buffers = [step.read(0), step.read(1), step.out()];
+        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+        args.push(step.out());
+        args.extend([self.n, self.k].map(Arg::count));
         vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
+            args,
             shape: Shape::Line(self.n),
         }]
     }
@@ -122,16 +140,19 @@ impl Kernel for Thin {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let sites::Matmul {
-        x,
-        w,
+    let site: sites::Finished = tree.site(at)?;
+    let sites::Matmul { m, n, k, form, .. } = site.product;
+    if m > THIN_ROWS {
+        return None;
+    }
+    let thin = Thin {
         m,
         n,
         k,
         form,
-    } = tree.site(at)?;
-    let thin = Thin { m, n, k, form };
-    (m <= THIN_ROWS).then(|| vec![Draft::new(thin, [x, w], m * n)])
+        after: site.after.clone(),
+    };
+    Some(vec![Draft::new(thin, site.reads(), m * n)])
 }
 
 lower::rule!("thin", propose);

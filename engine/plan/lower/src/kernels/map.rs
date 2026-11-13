@@ -6,12 +6,14 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::Draft;
 use crate::sites;
+use crate::sites::After;
 use crate::tree::{T, Tree};
 use codegen::hash;
 use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
 use codegen::prelude::*;
 use graph::Act;
 use sim::Load;
+use std::cmp::Ordering;
 
 /// Adds `count` f32 operands `a0..` to `body`, at `at`.
 pub fn add_operands(body: &mut Body, at: usize, count: usize) {
@@ -101,6 +103,33 @@ pub fn stage_stmts(stages: &[MapStage], operand: &dyn Fn(usize) -> Expr) -> Vec<
             MapStage::Act(a) => assign(act_expr(*a)),
         })
         .collect()
+}
+
+/// A sum through `after`'s stages, into `out[at]`.
+pub fn finish(after: &After, sum: Expr, at: Expr) -> Vec<Stmt> {
+    // Operands `a0..` sit at `at`. The sum takes its place.
+    let read = |j: usize| match j.cmp(&after.sum) {
+        Ordering::Equal => Expr::var("sum"),
+        Ordering::Less => Expr::index(Expr::var(&format!("a{j}")), at.clone()),
+        Ordering::Greater => Expr::index(Expr::var(&format!("a{}", j - 1)), at.clone()),
+    };
+    let mut stmts = vec![
+        Stmt::Let {
+            name: "sum".into(),
+            init: sum,
+        },
+        Stmt::Let {
+            name: "v".into(),
+            init: read(0),
+        },
+    ];
+    stmts.extend(stage_stmts(&after.stages, &|j| read(j + 1)));
+    stmts.push(Stmt::Assign {
+        target: Expr::index(Expr::var("out"), at),
+        op: None,
+        value: Expr::var("v"),
+    });
+    stmts
 }
 
 /// How many operands `stages` read, besides their input.
