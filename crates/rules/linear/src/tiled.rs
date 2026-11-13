@@ -1,11 +1,15 @@
 //! A matmul on the matrix unit, staged through group memory.
 
 use crate::lanes::{After, finishing};
-use codegen::{Gen, LANES, hash};
+use codegen::hash;
+use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
+use codegen::prelude::*;
 use graph::{DType, Order};
-use lower::kernels::{operands, stage_lines};
+use lower::kernels::{operands, stage_stmts};
 use lower::{Arg, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, Stored, T, Tree};
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +67,107 @@ impl Schedule {
     }
 }
 
+/// Floats of padding after each staged row, against bank conflicts.
+const PAD: u32 = 4;
+
+/// Elements one wide load brings.
+const WIDE: u32 = 4;
+
+thread_local! {
+    /// The kernel per schedule, form and staging, built once.
+    static TREES: RefCell<HashMap<(usize, bool, bool), Body>> = RefCell::new(HashMap::new());
+}
+
+/// Stages a block of `x` and `w`, then multiplies.
+#[kernel]
+fn tiled<F: Form>(
+    x: Buf<F32>,
+    w: Buf<F>,
+    out: BufMut<F32>,
+    m: u32,
+    n: u32,
+    k: u32,
+    #[build] bm: u32,
+    #[build] bn: u32,
+    #[build] bk: u32,
+    #[build] wm: u32,
+    #[build] wn: u32,
+    #[build] warps_n: u32,
+    #[build] threads: u32,
+    #[build] wide: bool,
+) {
+    let warp = lid() / LANES as u32;
+    let group = gid() / threads;
+    let row0 = (group / ((n + bn - 1) / bn)) * bm;
+    let col0 = (group % ((n + bn - 1) / bn)) * bn;
+    let wm0 = (warp / warps_n) * wm;
+    let wn0 = (warp % warps_n) * wn;
+    let mut a_s = shared::<f32>(bm * (bk + PAD));
+    let mut b_s = shared::<f32>(bn * (bk + PAD));
+    let mut acc = tiles(wm, wn);
+    for k0 in (0..k).by(bk) {
+        if wide {
+            // Groups of four along `k` need one test per load.
+            for i in (lid()..bm * (bk / WIDE)).by(threads) {
+                let r = i / (bk / WIDE);
+                let c = (i % (bk / WIDE)) * WIDE;
+                let at = r * (bk + PAD) + c;
+                if row0 + r < m && k0 + c < k {
+                    let v = x.load4((row0 + r) as u64 * k as u64 + (k0 + c) as u64);
+                    a_s[at] = v.x;
+                    a_s[at + 1] = v.y;
+                    a_s[at + 2] = v.z;
+                    a_s[at + 3] = v.w;
+                } else {
+                    a_s[at] = 0.0;
+                    a_s[at + 1] = 0.0;
+                    a_s[at + 2] = 0.0;
+                    a_s[at + 3] = 0.0;
+                }
+            }
+            for i in (lid()..bn * (bk / WIDE)).by(threads) {
+                let r = i / (bk / WIDE);
+                let c = (i % (bk / WIDE)) * WIDE;
+                let at = r * (bk + PAD) + c;
+                if col0 + r < n && k0 + c < k {
+                    let v = w.load4((col0 + r) as u64 * k as u64 + (k0 + c) as u64);
+                    b_s[at] = v.x;
+                    b_s[at + 1] = v.y;
+                    b_s[at + 2] = v.z;
+                    b_s[at + 3] = v.w;
+                } else {
+                    b_s[at] = 0.0;
+                    b_s[at + 1] = 0.0;
+                    b_s[at + 2] = 0.0;
+                    b_s[at + 3] = 0.0;
+                }
+            }
+        } else {
+            for i in (lid()..bm * bk).by(threads) {
+                let r = i / bk;
+                let c = i % bk;
+                if row0 + r < m && k0 + c < k {
+                    a_s[r * (bk + PAD) + c] = x[(row0 + r) as u64 * k as u64 + (k0 + c) as u64];
+                } else {
+                    a_s[r * (bk + PAD) + c] = 0.0;
+                }
+            }
+            for i in (lid()..bn * bk).by(threads) {
+                let r = i / bk;
+                let c = i % bk;
+                if col0 + r < n && k0 + c < k {
+                    b_s[r * (bk + PAD) + c] = w[(col0 + r) as u64 * k as u64 + (k0 + c) as u64];
+                } else {
+                    b_s[r * (bk + PAD) + c] = 0.0;
+                }
+            }
+        }
+        barrier();
+        acc.block(&a_s, wm0 * (bk + PAD), &b_s, wn0 * (bk + PAD), bk + PAD, bk);
+        barrier();
+    }
+}
+
 /// `x[m, k]` times `w[n, k]` transposed, by tiles.
 #[derive(Clone, Debug)]
 pub struct Tiled {
@@ -72,22 +177,6 @@ pub struct Tiled {
     pub form: DType,
     pub schedule: Schedule,
     pub after: After,
-}
-
-/// Floats of padding after each staged row, against bank conflicts.
-const PAD: usize = 4;
-
-/// Elements one wide load brings.
-const WIDE: usize = 4;
-
-/// One operand's slab and where its rows come from.
-struct Slab<'a> {
-    slab: &'a str,
-    src: &'a str,
-    dtype: DType,
-    first: &'a str,
-    count: &'a str,
-    rows: usize,
 }
 
 impl Tiled {
@@ -103,143 +192,94 @@ impl Tiled {
         }
     }
 
-    /// Stages a block of `x` and `w`, multiplies, then stores.
-    fn write(&self) -> Gen {
-        let (bm, bn, bk) = self.schedule.block;
-        let (wm, wn) = self.schedule.warp();
-        let (threads, stride) = (self.schedule.threads(), bk + PAD);
-        let mut g = Gen::new("tiled");
-        g.floats("x", false);
-        g.buffer("w", self.form.ty(), false);
-        for a in 0..self.others() {
-            g.floats(&format!("a{a}"), false);
-        }
-        g.floats("out", true);
-        g.scalar("m", "u32");
-        g.scalar("n", "u32");
-        g.scalar("k", "u32");
-        g.lane();
-        g.line(format!("u32 warp = lid / {LANES};"));
-        g.line(format!("u32 group = gid / {threads};"));
-        g.line(format!(
-            "u32 row0 = (group / ((n + {bn} - 1) / {bn})) * {bm};"
-        ));
-        g.line(format!(
-            "u32 col0 = (group % ((n + {bn} - 1) / {bn})) * {bn};"
-        ));
-        g.line(format!(
-            "u32 wm = (warp / {}) * {wm};",
-            self.schedule.warps.1
-        ));
-        g.line(format!(
-            "u32 wn = (warp % {}) * {wn};",
-            self.schedule.warps.1
-        ));
-        g.line(format!("f_group(float, As, {});", bm * stride));
-        g.line(format!("f_group(float, Bs, {});", bn * stride));
-        g.tile_acc("acc", wm, wn);
-        let a = Slab {
-            slab: "As",
-            src: "x",
-            dtype: DType::F32,
-            first: "row0",
-            count: "m",
-            rows: bm,
-        };
-        let b = Slab {
-            slab: "Bs",
-            src: "w",
-            dtype: self.form,
-            first: "col0",
-            count: "n",
-            rows: bn,
-        };
-        g.repeat("k0", "0", "k", &bk.to_string(), 1, |g| {
-            self.stage(g, &a);
-            self.stage(g, &b);
-            g.line("f_barrier();");
-            let a = format!("As + wm * {stride}");
-            let b = format!("Bs + wn * {stride}");
-            g.tile_block("acc", &a, &b, &stride.to_string(), [wm, wn, bk]);
-            g.line("f_barrier();");
-        });
-        g.tile_each("acc", wm, wn, |g| {
-            g.line("u32 gr = row0 + wm + r, gc = col0 + wn + c;");
-            g.block("if (gr < m && gc < n)", |g| self.store(g));
-        });
-        g
-    }
-
-    /// Threads fill the slab's rows, zero past the edges.
-    fn stage(&self, g: &mut Gen, s: &Slab) {
-        let Slab {
-            slab,
-            src,
-            dtype,
-            first,
-            count,
-            rows,
-        } = *s;
-        let (_, _, bk) = self.schedule.block;
-        let (threads, stride) = (self.schedule.threads(), bk + PAD);
-        let at = format!("(u64)({first} + r) * k + k0 + c");
-        if !self.k.is_multiple_of(WIDE) {
-            g.line(format!(
-                "for (u32 i = lid; i < {rows} * {bk}; i += {threads}) {{"
-            ));
-            g.line(format!("    u32 r = i / {bk}, c = i % {bk};"));
-            g.line(format!(
-                "    bool in = {first} + r < {count} && k0 + c < k;"
-            ));
-            let load = dtype.load(src, &at);
-            g.line(format!(
-                "    {slab}[r * {stride} + c] = in ? {load} : 0.0f;"
-            ));
-            g.line("}");
-            return;
-        }
-        // Groups of four along `k` need one test per load.
-        let per = bk / WIDE;
-        g.line(format!(
-            "for (u32 i = lid; i < {rows} * {per}; i += {threads}) {{"
-        ));
-        g.line(format!("    u32 r = i / {per}, c = (i % {per}) * {WIDE};"));
-        g.block(
-            &format!("    if ({first} + r < {count} && k0 + c < k)"),
-            |g| {
-                let v = g.four(dtype, &format!("{src} + {at}"));
-                for (e, v) in v.iter().enumerate() {
-                    g.line(format!("    {slab}[r * {stride} + c + {e}] = {v};"));
-                }
-            },
-        );
-        g.block("    else", |g| {
-            for e in 0..WIDE {
-                g.line(format!("    {slab}[r * {stride} + c + {e}] = 0.0f;"));
+    /// The kernel with the chain's operands and its stores added.
+    fn tree(&self) -> Body {
+        let wide = self.k.is_multiple_of(WIDE as usize);
+        let build = || {
+            let s = &self.schedule;
+            let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
+            let (wm, wn) = (s.warp().0 as u32, s.warp().1 as u32);
+            let (warps_n, threads) = (s.warps.1 as u32, s.threads() as u32);
+            match self.form {
+                DType::Bf16 => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, warps_n, threads, wide),
+                _ => tiled_ir::<F32>(bm, bn, bk, wm, wn, warps_n, threads, wide),
             }
-        });
-        g.line("}");
+        };
+        let at = SCHEDULES.iter().position(|s| *s == self.schedule);
+        let key = (
+            at.expect("a listed schedule"),
+            self.form == DType::Bf16,
+            wide,
+        );
+        let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
+        let operand = |a: usize| Param::Buffer {
+            name: format!("a{a}"),
+            dtype: DType::F32,
+            writes: false,
+        };
+        // The operands sit between the weights and the output.
+        body.params.splice(2..2, (0..self.others()).map(operand));
+        body.stmts.push(self.stores());
+        body
     }
 
-    /// The sum `v` through the stages, into its place.
-    fn store(&self, g: &mut Gen) {
+    /// Each sum through the stages, into its place.
+    fn stores(&self) -> Stmt {
         let After { stages, sum } = &self.after;
-        let o = "((u64)gr * n + gc)";
-        if stages.is_empty() {
-            return g.line(format!("out[{o}] = v;"));
-        }
+        let u64 = |e| Expr::cast(Ty::U64, e);
+        let add = |a, b| Expr::bin(BinOp::Add, a, b);
+        let gr = add(add(Expr::var("row0"), Expr::var("wm0")), Expr::var("r"));
+        let gc = add(add(Expr::var("col0"), Expr::var("wn0")), Expr::var("c"));
+        let o = Expr::bin(BinOp::Mul, u64(Expr::var("gr")), u64(Expr::var("n")));
+        let o = add(o, u64(Expr::var("gc")));
         // The chain's reads in order, the sum among them.
-        g.line("float s = v;");
         let read = |j: usize| match j.cmp(sum) {
-            Ordering::Equal => "s".to_string(),
-            Ordering::Less => format!("a{j}[{o}]"),
-            Ordering::Greater => format!("a{}[{o}]", j - 1),
+            Ordering::Equal => Expr::var("s"),
+            Ordering::Less => Expr::index(Expr::var(&format!("a{j}")), o.clone()),
+            Ordering::Greater => Expr::index(Expr::var(&format!("a{}", j - 1)), o.clone()),
         };
-        g.line(format!("{{ float v = {};", read(0)));
-        for line in stage_lines(stages, &|j| read(j + 1)).lines() {
-            g.line(line.trim_start().to_string());
+        // The stages run on `v`, so the sum moves first.
+        let mut then = vec![
+            Stmt::Let {
+                name: "s".into(),
+                init: Expr::var("v"),
+            },
+            Stmt::Assign {
+                target: Expr::var("v"),
+                op: None,
+                value: read(0),
+            },
+        ];
+        then.extend(stage_stmts(stages, &|j| read(j + 1)));
+        then.push(Stmt::Assign {
+            target: Expr::index(Expr::var("out"), o.clone()),
+            op: None,
+            value: Expr::var("v"),
+        });
+        let inside = Expr::bin(
+            BinOp::And,
+            Expr::bin(BinOp::Lt, Expr::var("gr"), Expr::var("m")),
+            Expr::bin(BinOp::Lt, Expr::var("gc"), Expr::var("n")),
+        );
+        let body = vec![
+            Stmt::Let {
+                name: "gr".into(),
+                init: gr,
+            },
+            Stmt::Let {
+                name: "gc".into(),
+                init: gc,
+            },
+            Stmt::If {
+                cond: inside,
+                then,
+                els: Vec::new(),
+            },
+        ];
+        Stmt::TileEach {
+            acc: "acc".into(),
+            body,
         }
-        g.line(format!("out[{o}] = v; }}"));
     }
 }
 
@@ -271,7 +311,7 @@ impl Kernel for Tiled {
             threads: gm * gn * self.schedule.threads(),
             group: self.schedule.threads(),
             trips: (self.k.div_ceil(bk)) as f64,
-            trip: self.write().trip(),
+            trip: self.tree().trip(),
             reads,
             written: 4.0 * m * n,
             flight: 16.0,
@@ -279,7 +319,7 @@ impl Kernel for Tiled {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.write().finish();
+        let mut text = self.tree().text();
         text.entry = format!("tiled_{}_{:x}", self.form.name(), hash(&text.body));
         Source::Made(text)
     }

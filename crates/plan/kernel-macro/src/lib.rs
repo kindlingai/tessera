@@ -59,6 +59,7 @@ fn tree(f: &mut ItemFn) -> Res {
     }
     let stmts = block(&f.block.stmts, &ctx)?;
     Ok(quote! {
+        #[allow(clippy::too_many_arguments)]
         #vis fn #ir_name #impl_generics (#(#build),*) -> codegen::ir::Body #where_clause {
             #[allow(unused_imports)]
             use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
@@ -141,24 +142,31 @@ fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
     }
 }
 
-/// A `let`: group memory, a local array, or a value.
+/// A `let`: group memory, tiles, an array, or a value.
 fn declare(name: &str, init: &Expr, ctx: &Ctx) -> Res {
     if let Expr::Call(call) = init
         && let Expr::Path(p) = &*call.func
-        && p.path.segments.len() == 2
-        && p.path.segments[0].ident == "Shared"
+        && let Some(last) = p.path.segments.last()
+        && last.ident == "shared"
     {
-        let PathArguments::AngleBracketed(a) = &p.path.segments[0].arguments else {
-            return Err(Error::new(p.span(), "`Shared::<T, N>::new()`"));
+        let PathArguments::AngleBracketed(a) = &last.arguments else {
+            return Err(Error::new(p.span(), "`shared::<T>(len)`"));
         };
-        let mut args = a.args.iter();
-        let (Some(GenericArgument::Type(t)), Some(GenericArgument::Const(n))) =
-            (args.next(), args.next())
-        else {
-            return Err(Error::new(a.span(), "`Shared::<T, N>::new()`"));
+        let Some(GenericArgument::Type(t)) = a.args.first() else {
+            return Err(Error::new(a.span(), "`shared::<T>(len)`"));
         };
-        let ty = scalar(t)?;
-        return Ok(quote!(Stmt::Shared { name: #name.into(), ty: #ty, len: (#n) as usize }));
+        let (ty, len) = (scalar(t)?, &call.args[0]);
+        return Ok(quote!(Stmt::Shared { name: #name.into(), ty: #ty, len: (#len) as usize }));
+    }
+    if let Expr::Call(call) = init
+        && is_path(&call.func, "tiles")
+    {
+        let (rows, cols) = (&call.args[0], &call.args[1]);
+        return Ok(quote!(Stmt::TileAcc {
+            name: #name.into(),
+            rows: (#rows) as usize,
+            cols: (#cols) as usize,
+        }));
     }
     if let Expr::Repeat(r) = init {
         let ty = match &*r.expr {
@@ -200,6 +208,71 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
                 unroll: #unroll,
                 body: #body,
             }))
+        }
+        Expr::MethodCall(m) if m.method == "block" => {
+            let Expr::Path(acc) = &*m.receiver else {
+                return Err(Error::new(m.receiver.span(), "name the tile sums"));
+            };
+            let acc = quote!(#acc).to_string();
+            let args: Vec<Tokens> = m
+                .args
+                .iter()
+                .map(|a| expr(a, ctx))
+                .collect::<Result<_, _>>()?;
+            let [a, a_at, b, b_at, stride, _] = args.as_slice() else {
+                return Err(Error::new(
+                    m.span(),
+                    "`acc.block(a, a_at, b, b_at, stride, depth)`",
+                ));
+            };
+            let depth_expr = &m.args[5];
+            Ok(quote!(Stmt::TileBlock {
+                acc: #acc.into(),
+                a: #a,
+                a_at: #a_at,
+                b: #b,
+                b_at: #b_at,
+                stride: #stride,
+                depth: (#depth_expr) as usize,
+            }))
+        }
+        Expr::MethodCall(m) if m.method == "each" => {
+            let Expr::Path(acc) = &*m.receiver else {
+                return Err(Error::new(m.receiver.span(), "name the tile sums"));
+            };
+            let acc = quote!(#acc).to_string();
+            let Some(Expr::Closure(f)) = m.args.first() else {
+                return Err(Error::new(m.span(), "`acc.each(|r, c, v| { .. })`"));
+            };
+            let names: Vec<String> = f
+                .inputs
+                .iter()
+                .map(|p| match p {
+                    Pat::Ident(i) => Ok(i.ident.to_string()),
+                    other => Err(Error::new(other.span(), "`|r, c, v|`")),
+                })
+                .collect::<Result<_, _>>()?;
+            if names != ["r", "c", "v"] {
+                return Err(Error::new(f.span(), "the closure takes `|r, c, v|`"));
+            }
+            let body = match &*f.body {
+                Expr::Block(b) => block(&b.block.stmts, ctx)?,
+                other => return Err(Error::new(other.span(), "a block body")),
+            };
+            Ok(quote!(Stmt::TileEach { acc: #acc.into(), body: #body }))
+        }
+        Expr::If(i) if is_const(&i.cond, ctx) => {
+            // Settled at build time: the printer keeps one branch.
+            let cond = &i.cond;
+            let then = block(&i.then_branch.stmts, ctx)?;
+            let els = match &i.else_branch {
+                None => quote!(vec![]),
+                Some((_, e)) => match &**e {
+                    Expr::Block(b) => block(&b.block.stmts, ctx)?,
+                    other => return Err(Error::new(other.span(), "a block")),
+                },
+            };
+            Ok(quote!(Stmt::If { cond: Expr::Bool(#cond), then: #then, els: #els }))
         }
         Expr::If(i) => {
             let cond = expr(&i.cond, ctx)?;
@@ -352,6 +425,8 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             None => Err(Error::new(p.span(), "a plain name")),
         },
         Expr::Paren(p) => sub(&p.expr),
+        // A borrow passes group memory by name.
+        Expr::Reference(r) => sub(&r.expr),
         Expr::Unary(u) => {
             let a = sub(&u.expr)?;
             match u.op {

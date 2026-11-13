@@ -4,7 +4,7 @@ use graph::DType;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-pub use crate::builder::LANES;
+pub use crate::LANES;
 pub use kernel_macro::kernel;
 
 /// How a buffer's elements are stored. Reads widen to f32.
@@ -88,22 +88,15 @@ impl<F: Form> BufMut<F> {
     }
 }
 
-/// Group memory, `N` elements for the whole group.
-pub struct Shared<T, const N: usize>(PhantomData<T>);
+/// Group memory, for the whole group.
+pub struct Shared<T>(PhantomData<T>);
 
-impl<T, const N: usize> Shared<T, N> {
-    pub fn new() -> Self {
-        device()
-    }
+/// `len` elements of group memory. `len` is fixed when built.
+pub fn shared<T>(_: u32) -> Shared<T> {
+    device()
 }
 
-impl<T, const N: usize> Default for Shared<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T, const N: usize> Index<u32> for Shared<T, N> {
+impl<T> Index<u32> for Shared<T> {
     type Output = T;
 
     fn index(&self, _: u32) -> &T {
@@ -111,8 +104,28 @@ impl<T, const N: usize> Index<u32> for Shared<T, N> {
     }
 }
 
-impl<T, const N: usize> IndexMut<u32> for Shared<T, N> {
+impl<T> IndexMut<u32> for Shared<T> {
     fn index_mut(&mut self, _: u32) -> &mut T {
+        device()
+    }
+}
+
+/// A warp's block of sums on the matrix unit.
+pub struct Tiles;
+
+/// A zeroed `rows` by `cols` block, both fixed when built.
+pub fn tiles(_: u32, _: u32) -> Tiles {
+    device()
+}
+
+impl Tiles {
+    /// Adds `depth` staged columns of `a` times `b`.
+    pub fn block(&mut self, _: &Shared<f32>, _: u32, _: &Shared<f32>, _: u32, _: u32, _: u32) {
+        device()
+    }
+
+    /// Calls `f` per sum this lane holds: row, column, value.
+    pub fn each(&self, _: impl FnMut(u32, u32, f32)) {
         device()
     }
 }

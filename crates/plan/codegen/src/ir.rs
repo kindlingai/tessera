@@ -1,6 +1,6 @@
 //! A kernel body as a tree, printed and costed.
 
-use crate::builder::LANES;
+use crate::LANES;
 use crate::dialect::Text;
 use graph::DType;
 use sim::Ops;
@@ -192,6 +192,27 @@ pub enum Stmt {
     Return,
     Barrier,
     Expr(Expr),
+    /// A warp's zeroed block of `rows` by `cols` sums.
+    TileAcc {
+        name: String,
+        rows: usize,
+        cols: usize,
+    },
+    /// Adds `depth` staged columns of A times B to `acc`.
+    TileBlock {
+        acc: String,
+        a: Expr,
+        a_at: Expr,
+        b: Expr,
+        b_at: Expr,
+        stride: Expr,
+        depth: usize,
+    },
+    /// Runs `body` per sum this lane holds: `r`, `c`, `v`.
+    TileEach {
+        acc: String,
+        body: Vec<Stmt>,
+    },
 }
 
 /// A kernel parameter: a buffer of `dtype`, or a scalar.
@@ -224,6 +245,8 @@ enum Kind {
     Buffer(DType),
     /// Group memory, or a local array, of this element type.
     Array(Ty),
+    /// Tile sums over this many rows and columns.
+    Tiles(usize, usize),
 }
 
 /// Prints a body as the dialect-neutral text.
@@ -459,6 +482,19 @@ impl Printer<'_> {
                 self.scope.pop();
                 self.line("}".into());
             }
+            // A condition settled at build time leaves one branch.
+            Stmt::If {
+                cond: Expr::Bool(taken),
+                then,
+                els,
+            } => {
+                let branch = if *taken { then } else { els };
+                if !branch.is_empty() {
+                    self.line("{".into());
+                    self.block(branch);
+                    self.line("}".into());
+                }
+            }
             Stmt::If { cond, then, els } => {
                 let cond = self.expr(cond);
                 self.line(format!("if ({cond}) {{"));
@@ -467,6 +503,113 @@ impl Printer<'_> {
                     self.line("} else {".into());
                     self.block(els);
                 }
+                self.line("}".into());
+            }
+            Stmt::TileAcc { name, rows, cols } => {
+                // The tile macros read `lane`.
+                self.lane = true;
+                let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+                self.line(format!("tile_acc {name}_t[{tm}][{tn}];"));
+                self.line(format!("float {name}[{tm}][{tn}][TILE_COUNT];"));
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+                self.line("        #pragma unroll".into());
+                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+                self.line(format!("            {name}[i][j][e] = 0.0f;"));
+                self.line("        }".into());
+                self.line("    }".into());
+                self.line("}".into());
+                self.bind(name, Kind::Tiles(*rows, *cols));
+            }
+            Stmt::TileBlock {
+                acc,
+                a,
+                a_at,
+                b,
+                b_at,
+                stride,
+                depth,
+            } => {
+                let Kind::Tiles(rows, cols) = self.kind(acc) else {
+                    panic!("`{acc}` is not a tile block");
+                };
+                let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
+                let a = format!("({} + {})", self.expr(a), self.expr(a_at));
+                let b = format!("({} + {})", self.expr(b), self.expr(b_at));
+                let stride = self.expr(stride);
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+                self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
+                self.line("    }".into());
+                self.line("}".into());
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"));
+                self.line(format!("    tile_a ta[{tm}];"));
+                self.line(format!("    tile_b tb[{tn}];"));
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+                self.line(format!(
+                    "        TILE_LOAD_A(ta[i], {a} + i * TILE_M * ({stride}) + kk, {stride});"
+                ));
+                self.line("    }".into());
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+                self.line(format!(
+                    "        TILE_LOAD_B(tb[j], {b} + j * TILE_N * ({stride}) + kk, {stride});"
+                ));
+                self.line("    }".into());
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+                self.line("        #pragma unroll".into());
+                self.line(format!("        for (u32 j = 0; j < {tn}; j++) {{"));
+                self.line(format!(
+                    "            TILE_MMA({acc}_t[i][j], ta[i], tb[j]);"
+                ));
+                self.line("        }".into());
+                self.line("    }".into());
+                self.line("}".into());
+                // The unit's sums truncate, so blocks add up in floats.
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));
+                self.line("    #pragma unroll".into());
+                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+                self.line("        #pragma unroll".into());
+                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+                self.line(format!(
+                    "            {acc}[i][j][e] += TILE_VAL({acc}_t[i][j], e);"
+                ));
+                self.line("        }".into());
+                self.line("    }".into());
+                self.line("}".into());
+            }
+            Stmt::TileEach { acc, body } => {
+                let Kind::Tiles(rows, cols) = self.kind(acc) else {
+                    panic!("`{acc}` is not a tile block");
+                };
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
+                self.line(format!(
+                    "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
+                ));
+                self.line("        #pragma unroll".into());
+                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+                self.line("            u32 r = i * TILE_M + TILE_ROW(e);".into());
+                self.line("            u32 c = j * TILE_N + TILE_COL(e);".into());
+                self.line(format!("            float v = {acc}[i][j][e];"));
+                self.scope.push(HashMap::new());
+                for (name, ty) in [("r", Ty::U32), ("c", Ty::U32), ("v", Ty::F32)] {
+                    self.bind(name, Kind::Value(ty));
+                }
+                self.indent += 2;
+                self.block(body);
+                self.indent -= 2;
+                self.scope.pop();
+                self.line("        }".into());
+                self.line("    }".into());
                 self.line("}".into());
             }
             Stmt::Return => self.line("return;".into()),
@@ -508,6 +651,7 @@ struct Counter {
     times: f64,
     buffers: HashMap<String, DType>,
     shared: Vec<String>,
+    tiles: HashMap<String, (usize, usize)>,
 }
 
 impl Counter {
@@ -646,6 +790,9 @@ impl Counter {
             }
             Stmt::Array { .. } => {}
             Stmt::Shared { name, .. } => self.shared.push(name.clone()),
+            Stmt::TileAcc { name, rows, cols } => {
+                self.tiles.insert(name.clone(), (*rows, *cols));
+            }
             Stmt::Assign { target, op, value } => {
                 let is_float = self.expr(value);
                 // `acc += a * b` is one multiply-add.
@@ -716,6 +863,20 @@ impl Counter {
             Stmt::Expr(e) => {
                 self.expr(e);
             }
+            Stmt::TileBlock { acc, depth, .. } => {
+                let Some((rows, cols)) = self.tiles.get(acc).copied() else {
+                    panic!("`{acc}` is not a tile block");
+                };
+                // A lane's share of the block's multiply-adds, as tile flops.
+                self.add(Ops {
+                    tile_flops: (2 * rows * cols * depth) as f64 / LANES as f64,
+                    float: (rows * cols) as f64 / LANES as f64,
+                    loads: ((rows + cols) * depth) as f64 / LANES as f64,
+                    width: 4.0,
+                    ..Ops::default()
+                });
+            }
+            Stmt::TileEach { body, .. } => self.stmts(body),
         }
     }
 }

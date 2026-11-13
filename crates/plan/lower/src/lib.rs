@@ -23,7 +23,7 @@ mod tree;
 pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
 pub use cache::Cache;
-pub use codegen::{Dialect, Gen, LANES, Text, float, hash};
+pub use codegen::{Dialect, LANES, Text, float, hash};
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use extent::Extent;
