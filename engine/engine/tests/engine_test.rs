@@ -1,6 +1,6 @@
 //! The engine's decode loop against the interpreter.
 
-use engine::{Engine, Event, Reason, Request, Row};
+use engine::{Batch, Engine, Event, Fair, Reason, Request, Row};
 use gpukit::testing::Noise;
 use graph::Graph;
 use interp::{Store, Tensor, run_kept};
@@ -141,4 +141,67 @@ fn rows_mix_slots() {
     // Slots and positions past the graph's bounds are refused.
     assert!(engine.step(&[row(4, 1, 0)]).is_err());
     assert!(engine.step(&[row(0, 1, 16)]).is_err());
+}
+
+/// Several answers through one batch, each against its own reference.
+fn batched(seed: u64, slots: u64, budget: usize, cancel_after: Option<usize>) {
+    let (g, weights, mut engine) = open(seed, slots);
+    let prompts: [&[u32]; 5] = [
+        &[3, 9, 4],
+        &[1, 2, 3, 4, 5, 6],
+        &[7],
+        &[8, 8],
+        &[2, 4, 6, 8],
+    ];
+    let wants: Vec<Vec<u32>> = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| reference(&g, &weights, p, 3 + i))
+        .collect();
+    let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    batch.budget(budget);
+    let mut taken = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        let request = Request {
+            tokens: prompt.to_vec(),
+            max_tokens: 3 + i,
+            stop: Vec::new(),
+        };
+        let (events, receiver) = std::sync::mpsc::channel();
+        let mut sent = 0;
+        batch.submit(
+            request,
+            Box::new(move |e| {
+                sent += 1;
+                events.send(e).is_ok() && cancel_after.is_none_or(|n| sent < n)
+            }),
+        );
+        taken.push(receiver);
+    }
+    while batch.step().unwrap() {}
+    for (i, receiver) in taken.into_iter().enumerate() {
+        let got: Vec<Event> = receiver.try_iter().collect();
+        match cancel_after {
+            None => assert_eq!(
+                (ids(&got), got.last()),
+                (wants[i].clone(), Some(&Event::Done(Reason::Length))),
+                "answer {i}"
+            ),
+            Some(n) => assert_eq!(
+                (ids(&got), got.last()),
+                (wants[i][..n].to_vec(), Some(&Event::Done(Reason::Stop))),
+                "answer {i}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn batch_matches_single() {
+    // More answers than slots, with whole prompts in one step.
+    batched(17, 3, 64, None);
+    // Prompts in chunks of two rows, shared across answers.
+    batched(19, 2, 2, None);
+    // Cancelled answers free their slots for the rest.
+    batched(23, 2, 64, Some(2));
 }
