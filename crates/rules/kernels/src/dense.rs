@@ -1,13 +1,44 @@
 //! Attention as two matmuls per head around a softmax.
 
-use crate::matmul::{launch, source, tiles};
 use graph::Order;
 use lower::{
-    Arg, Attn, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float,
+    Arg, Attn, DType, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float,
 };
 
 /// The most score elements this form may hold.
 pub const DENSE_SCORES: usize = 1 << 28;
+
+/// The hand-written gemm, which takes either operand transposed.
+fn source(form: DType) -> Source {
+    Source::Fixed {
+        metal: gemm::METAL,
+        cuda: gemm::CUDA,
+        entry: match form {
+            DType::Bf16 => gemm::ENTRY_BF16,
+            _ => gemm::ENTRY,
+        },
+    }
+}
+
+/// A count rounded up to whole 64-wide tiles.
+fn tiles(n: usize) -> usize {
+    n.div_ceil(64) * 64
+}
+
+/// One gemm launch on buffers `a`, `b` and `c`.
+fn launch(p: gemm::Problem, buffers: [Arg; 3]) -> Launch {
+    let shape = Shape::Grid {
+        across: p.n.div_ceil(gemm::BN),
+        down: p.m.div_ceil(gemm::BM),
+        threads: gemm::THREADS as usize,
+    };
+    let params = Arg::Bytes(gemm::abi_params(&p));
+    let args = Vec::from(buffers).into_iter().chain([params]);
+    Launch {
+        args: args.collect(),
+        shape,
+    }
+}
 
 /// Which of the two products a launch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +99,7 @@ impl Kernel for PerHead {
     }
 
     fn source(&self) -> Source {
-        source(lower::DType::F32)
+        source(DType::F32)
     }
 
     /// Each head's rows sit a stride apart, with no copy.
