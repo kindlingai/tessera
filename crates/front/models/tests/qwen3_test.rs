@@ -239,7 +239,7 @@ impl<'a> Gpu<'a> {
     }
 
     /// Each step's seconds for the plan in place.
-    fn steps(&self) -> Vec<f64> {
+    fn steps(&mut self) -> Vec<f64> {
         let steps = 0..self.runner.plan().steps.len();
         steps.map(|i| self.runner.repeat(i, 1).unwrap()).collect()
     }

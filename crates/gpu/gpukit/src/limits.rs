@@ -11,6 +11,13 @@ pub struct Limits {
     pub group_bytes: usize,
     /// The most threads in one group.
     pub group_threads: usize,
+    /// Whether hand-written kernel text can be compiled here.
+    #[serde(default = "yes")]
+    pub compiler: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Limits {
@@ -20,6 +27,7 @@ impl Limits {
             lanes: 32,
             group_bytes: 32 * 1024,
             group_threads: 1024,
+            compiler: true,
         }
     }
 }

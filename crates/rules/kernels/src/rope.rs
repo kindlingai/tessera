@@ -59,9 +59,9 @@ impl Kernel for Angles {
     }
 
     fn source(&self) -> Source {
-        let mut text = angles_ir().text();
-        text.entry = "plan_angles".into();
-        Source::Made(text)
+        let mut body = angles_ir();
+        body.entry = "plan_angles".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -94,9 +94,9 @@ impl Kernel for Rope {
     }
 
     fn source(&self) -> Source {
-        let mut text = rope_ir().text();
-        text.entry = "plan_rope".into();
-        Source::Made(text)
+        let mut body = rope_ir();
+        body.entry = "plan_rope".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

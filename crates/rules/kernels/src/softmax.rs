@@ -48,9 +48,9 @@ impl Kernel for Softmax {
     }
 
     fn source(&self) -> Source {
-        let mut text = softmax_ir().text();
-        text.entry = "plan_softmax".into();
-        Source::Made(text)
+        let mut body = softmax_ir();
+        body.entry = "plan_softmax".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

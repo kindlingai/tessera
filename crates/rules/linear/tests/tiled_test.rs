@@ -3,7 +3,7 @@
 // The other matmul rules come from here.
 use kernels as _;
 
-use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::Rows;
 use interp::{Tensor, run};
 
@@ -28,20 +28,17 @@ fn rule_registers() {
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names.len(), 1, "{names:?}");
     assert!(names[0].starts_with("tiled_"), "{names:?}");
-    let Source::Made(text) = plan.steps[0].kernel.source() else {
+    let Source::Made(body) = plan.steps[0].kernel.source() else {
         panic!("tiled is generated");
     };
     for dialect in [Dialect::Metal, Dialect::Cuda] {
-        let text = text.render(dialect);
+        let text = body.text().render(dialect);
         assert!(text.contains("TILE_MMA(acc_t[i][j], ta[i], tb[j])"));
     }
 }
 
 #[test]
 fn tiles_match_cpu() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut draws = Noise(29);
     // Sizes off the block, on it, and beyond it.
     let sizes = [
@@ -81,9 +78,6 @@ fn tiles_match_cpu() {
 
 #[test]
 fn stages_ride_along() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut draws = Noise(31);
     // The sum as an operand, then as the chain's input.
     let residual: Finish = |x, product| x.add(&product);

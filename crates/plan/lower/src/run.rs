@@ -24,7 +24,18 @@ impl Held {
         &self.all[self.bound[slot.buffer as usize]]
     }
 
-    /// The slot as a flat view.
+    /// These buffers' bytes, each named once, for the host.
+    pub fn mapped_mut(&mut self, buffers: &[u32]) -> Vec<&mut [u8]> {
+        let wanted: Vec<usize> = buffers.iter().map(|b| self.bound[*b as usize]).collect();
+        let mut out: Vec<Option<&mut [u8]>> = (0..wanted.len()).map(|_| None).collect();
+        for (at, buffer) in self.all.iter_mut().enumerate() {
+            if let Some(i) = wanted.iter().position(|w| *w == at) {
+                out[i] = buffer.backing_mut().mapped_mut();
+            }
+        }
+        out.into_iter().map(|o| o.expect("host memory")).collect()
+    }
+
     pub fn view(&self, slot: Slot) -> View<'_> {
         self.get(slot)
             .view(slot.start(), slot.dtype, vec![slot.len])
@@ -103,9 +114,9 @@ pub trait Run {
     /// Gives a runtime dimension its value for the next launches.
     fn bind(&mut self, name: DimName, value: u32);
     /// Runs these steps in order and waits for them.
-    fn submit(&self, steps: Range<usize>) -> Result<(), Error>;
+    fn submit(&mut self, steps: Range<usize>) -> Result<(), Error>;
     /// Runs one step `times` over. Returns seconds per run.
-    fn repeat(&self, step: usize, times: usize) -> Result<f64, Error>;
+    fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error>;
     /// The backend and the hardware it drives.
     fn device(&self) -> String;
     /// What the hardware gives one group of threads.
@@ -182,6 +193,10 @@ pub fn open(plan: Plan) -> Result<Box<dyn Run>, Error> {
     #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
     use gpukit::backend::Backend;
     use gpukit::backend::available;
+    // The host runs any plan when no GPU is up.
+    if crate::cpu::chosen() {
+        return Ok(Box::new(crate::cpu::Runner::new(plan)?));
+    }
     match available() {
         #[cfg(target_os = "macos")]
         Some(Backend::Metal) => Ok(Box::new(crate::metal::Runner::new(plan)?)),
@@ -189,9 +204,6 @@ pub fn open(plan: Plan) -> Result<Box<dyn Run>, Error> {
         Some(Backend::Cuda) => Ok(Box::new(crate::device::cuda::Runner::new(plan)?)),
         #[cfg(feature = "rocm")]
         Some(Backend::Rocm) => Ok(Box::new(crate::device::rocm::Runner::new(plan)?)),
-        _ => {
-            drop(plan);
-            Err(Error::Unsupported("a build with no GPU backend".into()))
-        }
+        _ => Ok(Box::new(crate::cpu::Runner::new(plan)?)),
     }
 }

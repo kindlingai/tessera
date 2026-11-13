@@ -98,6 +98,10 @@ fn cost_picks_attention() {
     // Dense attention is unproven, so a guess streams.
     let (_, stream) = toy(&Device::guess());
     assert_eq!((count(&stream, "attend"), count(&stream, "scores")), (2, 0));
+    // The host cannot run the hand-written dense gemm.
+    if lower::cpu::chosen() {
+        return;
+    }
     let (_, dense) = toy(&Device::guess().favoring("dense"));
     assert_eq!((count(&dense, "attend"), count(&dense, "join")), (0, 0));
     let per_layer = ["scores", "causal", "values"].map(|k| count(&dense, k));
@@ -141,16 +145,19 @@ fn order_saves_memory() {
 
 #[test]
 fn dialects_agree() {
-    let Source::Made(text) = gate().source() else {
+    let Source::Made(body) = gate().source() else {
         panic!("maps are generated");
     };
-    let (metal, cuda) = (text.render(Dialect::Metal), text.render(Dialect::Cuda));
+    let (metal, cuda) = (
+        body.text().render(Dialect::Metal),
+        body.text().render(Dialect::Cuda),
+    );
     // Buffers, then scalars, in one order for both.
     assert!(metal.contains("device const float *a0 [[buffer(1)]]"));
     assert!(metal.contains("constant u32 &len [[buffer(3)]]"));
     let order = "const float *x,\n    const float *a0,\n    float *out,\n    u32 len\n";
     assert!(cuda.contains(order), "{cuda}");
-    assert!(cuda.contains(&format!("__global__ void {}(", text.entry)));
+    assert!(cuda.contains(&format!("__global__ void {}(", body.entry)));
     for body in [&metal, &cuda] {
         assert!(body.contains("v = (v * a0[(u64)gid]);"), "{body}");
     }

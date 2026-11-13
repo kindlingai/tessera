@@ -1,9 +1,35 @@
 //! Attention as two matmuls per head around a softmax.
 
+use codegen::prelude::*;
 use graph::Order;
 use lower::{
-    Arg, Attn, DType, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float,
+    Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Site, Source, Step, T, Tree,
 };
+
+/// Rows are queries. The last query sees every key.
+#[kernel]
+fn causal(mut x: BufMut<F32>, rows: u32, queries: u32, keys: u32, scale: f32) {
+    if gid() >= rows {
+        return;
+    }
+    let seen = keys - queries + gid() % queries + 1;
+    let at = gid() as u64 * keys as u64;
+    let mut top = x[at] * scale;
+    for i in 1..seen {
+        top = max(top, x[at + i as u64] * scale);
+    }
+    let mut sum = 0.0f32;
+    for i in 0..seen {
+        sum += exp(x[at + i as u64] * scale - top);
+    }
+    for i in 0..keys {
+        x[at + i as u64] = if i < seen {
+            exp(x[at + i as u64] * scale - top) / sum
+        } else {
+            0.0
+        };
+    }
+}
 
 /// The most score elements this form may hold.
 pub const DENSE_SCORES: usize = 1 << 28;
@@ -83,6 +109,10 @@ fn per_head(a: &Attn, each: impl Fn(Starts) -> Launch) -> Vec<Launch> {
 }
 
 impl Kernel for PerHead {
+    fn needs(&self) -> Needs {
+        Needs::text()
+    }
+
     fn name(&self) -> &'static str {
         match self.0 {
             Part::Scores => "scores",
@@ -140,25 +170,6 @@ impl Kernel for PerHead {
     }
 }
 
-// Rows are queries; the last query sees every key.
-const BODY: &str = "    if (gid >= rows) {
-        return;
-    }
-    u32 seen = keys - queries + gid % queries + 1;
-    u64 at = (u64)gid * keys;
-    float top = x[at] * scale;
-    for (u32 i = 1; i < seen; i++) {
-        top = f_max(top, x[at + i] * scale);
-    }
-    float sum = 0.0f;
-    for (u32 i = 0; i < seen; i++) {
-        sum += f_exp(x[at + i] * scale - top);
-    }
-    for (u32 i = 0; i < keys; i++) {
-        x[at + i] = i < seen ? f_exp(x[at + i] * scale - top) / sum : 0.0f;
-    }
-";
-
 impl Kernel for Causal {
     fn name(&self) -> &'static str {
         "causal"
@@ -169,13 +180,9 @@ impl Kernel for Causal {
     }
 
     fn source(&self) -> Source {
-        let sizes = [("rows", "u32"), ("queries", "u32"), ("keys", "u32")];
-        Source::Made(Text {
-            entry: "plan_causal".into(),
-            buffers: vec![float("x", true)],
-            scalars: sizes.into_iter().chain([("scale", "float")]).collect(),
-            body: BODY.into(),
-        })
+        let mut body = causal_ir();
+        body.entry = "plan_causal".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

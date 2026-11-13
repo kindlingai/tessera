@@ -321,9 +321,9 @@ impl Kernel for Tiled {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.tree().text();
-        text.entry = format!("tiled_{}_{:x}", self.form.name(), hash(&text.body));
-        Source::Made(text)
+        let mut body = self.tree();
+        body.entry = format!("tiled_{}_{:x}", self.form.name(), hash(&body.text().body));
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -361,6 +361,7 @@ impl Kernel for Tiled {
             lanes: LANES,
             group_bytes: 4 * (bm + bn) * (bk + PAD as usize),
             group_threads: self.schedule.threads(),
+            ..Needs::default()
         }
     }
 }

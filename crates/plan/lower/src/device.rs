@@ -11,7 +11,7 @@ macro_rules! device_runner {
             use gpukit::device::Device;
             use gpukit::$bk::{
                 Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,
-                launch_1d, launch_grid, launch_rows,
+                launch_1d, launch_grid,
             };
             use graph::DimName;
             use mem::Buffer;
@@ -73,7 +73,6 @@ macro_rules! device_runner {
                     }
                     match launch.shape {
                         Shape::Line(count) => launch_1d(self.ctx, kernel, count, &mut args)?,
-                        Shape::Rows(rows) => launch_rows(self.ctx, kernel, rows, 256, &mut args)?,
                         Shape::Grid {
                             across,
                             down,
@@ -128,12 +127,12 @@ macro_rules! device_runner {
                         }
                         let kernel = match step.kernel.source() {
                             Source::Fixed { cuda, entry, .. } => cached_source_kernel(cuda, entry)?,
-                            Source::Made(text) => match self.made.get(&text.entry) {
+                            Source::Made(body) => match self.made.get(&body.entry) {
                                 Some(compiled) => compiled.clone(),
                                 None => {
-                                    let source = text.render(Dialect::Cuda);
-                                    let compiled = ctx.compile(&source, &text.entry)?;
-                                    self.made.insert(text.entry.clone(), compiled.clone());
+                                    let source = body.text().render(Dialect::Cuda);
+                                    let compiled = ctx.compile(&source, &body.entry)?;
+                                    self.made.insert(body.entry.clone(), compiled.clone());
                                     compiled
                                 }
                             },
@@ -157,7 +156,7 @@ macro_rules! device_runner {
                     &mut self.held
                 }
 
-                fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {
+                fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
                     self.ctx.synchronize()?;
                     let start = Instant::now();
                     let launches = self.launches(step)?;
@@ -179,7 +178,7 @@ macro_rules! device_runner {
                 }
 
                 /// Enqueues every launch, then waits once.
-                fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
+                fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
                     for i in steps {
                         for launch in self.launches(i)? {
                             self.launch(&self.kernels[i], &launch)?;

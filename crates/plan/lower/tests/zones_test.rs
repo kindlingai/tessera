@@ -4,7 +4,6 @@
 use kernels as _;
 use linear as _;
 
-use gpukit::testing::backend_ready;
 use graph::DimName::{Context, Rows, Seqs};
 use lower::kernels::Map;
 use lower::{
@@ -115,9 +114,7 @@ fn cheap_links_place_work() {
     }
     let cost = device.cost(&plan);
     assert!(cost.seconds.is_finite() && cost.seconds > 0.0);
-    if backend_ready() {
-        assert!(matches!(open(plan), Err(Error::Unsupported(_))));
-    }
+    assert!(matches!(open(plan), Err(Error::Unsupported(_))));
 }
 
 #[test]

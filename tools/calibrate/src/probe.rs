@@ -200,7 +200,7 @@ impl Kernel for Probe {
     }
 
     fn source(&self) -> Source {
-        let mut text = match self.kind {
+        let mut body = match self.kind {
             Kind::Spin => probe_spin_ir(),
             Kind::Curve => probe_curve_ir(),
             Kind::Read { depth } => probe_read_ir(depth as u32),
@@ -208,12 +208,11 @@ impl Kernel for Probe {
             Kind::Write => probe_write_ir(),
             Kind::Chase => probe_chase_ir(),
             Kind::Tile => probe_tile_ir(),
-        }
-        .text();
+        };
         if let Kind::Read { depth } = self.kind {
-            text.entry = format!("probe_read{depth}");
+            body.entry = format!("probe_read{depth}");
         }
-        Source::Made(text)
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

@@ -112,6 +112,7 @@ impl Context {
             )? as usize,
             group_threads: device_attr(driver, device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?
                 as usize,
+            compiler: true,
         };
 
         Ok(Self(Arc::new(Inner {

@@ -4,7 +4,7 @@
 use kernels as _;
 use linear as _;
 
-use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{self, Rows};
 use interp::run;
 
@@ -31,20 +31,17 @@ fn rule_registers() {
     let names: Vec<&str> = kept.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names, ["thin", "map"]);
     // Weights come in wide loads, under a hashed entry name.
-    let Source::Made(text) = plan.steps[0].kernel.source() else {
+    let Source::Made(body) = plan.steps[0].kernel.source() else {
         panic!("lanes are generated");
     };
     for dialect in [Dialect::Metal, Dialect::Cuda] {
-        let text = text.render(dialect);
+        let text = body.text().render(dialect);
         assert!(text.contains("f_f32x4(w + (at + (u64)i))") && text.contains("linear_f32_"));
     }
 }
 
 #[test]
 fn lanes_match_cpu() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut draws = Noise(23);
     // Widths that lanes do not divide, and one they do.
     let plain = [(52, 7), (4, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n)));

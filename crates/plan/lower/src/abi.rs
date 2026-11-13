@@ -2,7 +2,8 @@
 
 use crate::extent::Extent;
 use crate::plan::Slot;
-use codegen::{Dialect, Text, hash};
+use codegen::ir::Body;
+use codegen::{Dialect, hash};
 use graph::DimName;
 
 /// One kernel argument, in the order its source declares.
@@ -78,8 +79,6 @@ impl Shape {
 pub enum Shape {
     /// One thread per element, in groups of 256.
     Line(usize),
-    /// One group of 256 threads per row.
-    Rows(usize),
     Grid {
         across: usize,
         down: usize,
@@ -124,8 +123,8 @@ pub enum Source {
         cuda: &'static str,
         entry: &'static str,
     },
-    /// Written once, rendered per dialect.
-    Made(Text),
+    /// A tree, rendered per dialect or run on the host.
+    Made(Body),
 }
 
 impl Source {
@@ -135,7 +134,7 @@ impl Source {
             Source::Fixed { metal, cuda, entry } => [metal, cuda, entry]
                 .iter()
                 .fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text)),
-            Source::Made(text) => hash(&text.render(Dialect::Cuda)),
+            Source::Made(body) => hash(&body.text().render(Dialect::Cuda)),
         }
     }
 }
