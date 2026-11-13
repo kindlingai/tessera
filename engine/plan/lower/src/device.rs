@@ -11,8 +11,8 @@ macro_rules! device_runner {
             use codegen::Dialect;
             use gpukit::device::Device;
             use gpukit::$bk::{
-                Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,
-                launch_1d, launch_grid,
+                Context, DeviceBuffer, Graph, Kernel, KernelArgs, cached_context,
+                cached_source_kernel, launch_1d, launch_grid,
             };
             use graph::DimName;
             use mem::Buffer;
@@ -30,6 +30,8 @@ macro_rules! device_runner {
                 known: HashMap<String, Kernel>,
                 /// Runtime dimensions, as last bound.
                 bound: HashMap<DimName, u32>,
+                /// The whole plan's launches per binding, recorded once.
+                graphs: HashMap<Vec<(DimName, u32)>, Graph>,
             }
 
             impl Runner {
@@ -42,6 +44,7 @@ macro_rules! device_runner {
                         made: HashMap::new(),
                         known: HashMap::new(),
                         bound: HashMap::new(),
+                        graphs: HashMap::new(),
                     };
                     runner.replan(&plan)?;
                     Ok(runner)
@@ -108,6 +111,8 @@ macro_rules! device_runner {
                     if plan.zoned() {
                         return Err(Error::Unsupported("a plan over several zones".into()));
                     }
+                    // Buffers may move, so recorded launches go stale.
+                    self.graphs.clear();
                     let ctx = self.ctx;
                     self.held.bind(plan, |zone, bytes| {
                         let buffer = DeviceBuffer::alloc(ctx, bytes.max(4))?;
@@ -179,13 +184,32 @@ macro_rules! device_runner {
                     crate::run::precision(gpukit::backend::Backend::$variant)
                 }
 
-                /// Enqueues every launch, then waits once.
+                /// Launches every step, as a recorded graph when whole.
                 fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
-                    for i in steps {
-                        for launch in self.launches(i)? {
-                            self.launch(&self.kernels[i], &launch)?;
+                    let whole = self.plan.id != 0 && steps == (0..self.plan.steps.len());
+                    if !whole {
+                        for i in steps {
+                            for launch in self.launches(i)? {
+                                self.launch(&self.kernels[i], &launch)?;
+                            }
                         }
+                        return Ok(self.ctx.synchronize()?);
                     }
+                    let mut key: Vec<(DimName, u32)> =
+                        self.bound.iter().map(|(k, v)| (*k, *v)).collect();
+                    key.sort_unstable();
+                    if !self.graphs.contains_key(&key) {
+                        let graph = self.ctx.capture(|| -> Result<(), Error> {
+                            for i in steps.clone() {
+                                for launch in self.launches(i)? {
+                                    self.launch(&self.kernels[i], &launch)?;
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        self.graphs.insert(key.clone(), graph);
+                    }
+                    self.ctx.replay(&self.graphs[&key])?;
                     Ok(self.ctx.synchronize()?)
                 }
             }

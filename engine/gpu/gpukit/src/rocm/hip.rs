@@ -10,10 +10,16 @@ pub type HipDeviceptr = u64;
 pub type HipModule = *mut c_void;
 pub type HipFunction = *mut c_void;
 pub type HipStream = *mut c_void;
+pub type HipGraph = *mut c_void;
+pub type HipGraphExec = *mut c_void;
+pub type HipGraphNode = *mut c_void;
 
 pub const HIP_SUCCESS: HipError = 0;
 pub const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const MEMCPY_DEVICE_TO_HOST: c_int = 2;
+pub const HIP_STREAM_NON_BLOCKING: u32 = 1;
+/// Other threads may still synchronize while a capture is open.
+pub const HIP_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
 type HipInit = unsafe extern "C" fn(u32) -> HipError;
 type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
@@ -41,6 +47,21 @@ type HipModuleLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> HipError;
+type HipStreamCreate = unsafe extern "C" fn(*mut HipStream, u32) -> HipError;
+type HipStreamDestroy = unsafe extern "C" fn(HipStream) -> HipError;
+type HipStreamSynchronize = unsafe extern "C" fn(HipStream) -> HipError;
+type HipStreamBeginCapture = unsafe extern "C" fn(HipStream, c_int) -> HipError;
+type HipStreamEndCapture = unsafe extern "C" fn(HipStream, *mut HipGraph) -> HipError;
+type HipGraphInstantiate = unsafe extern "C" fn(
+    *mut HipGraphExec,
+    HipGraph,
+    *mut HipGraphNode,
+    *mut c_char,
+    usize,
+) -> HipError;
+type HipGraphLaunch = unsafe extern "C" fn(HipGraphExec, HipStream) -> HipError;
+type HipGraphExecDestroy = unsafe extern "C" fn(HipGraphExec) -> HipError;
+type HipGraphDestroy = unsafe extern "C" fn(HipGraph) -> HipError;
 type HipGetErrorName = unsafe extern "C" fn(HipError) -> *const c_char;
 type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
 
@@ -59,6 +80,15 @@ pub struct Runtime {
     pub hip_memcpy: HipMemcpy,
     pub hip_memset: HipMemset,
     pub hip_module_launch_kernel: HipModuleLaunchKernel,
+    pub hip_stream_create: HipStreamCreate,
+    pub hip_stream_destroy: HipStreamDestroy,
+    pub hip_stream_synchronize: HipStreamSynchronize,
+    pub hip_stream_begin_capture: HipStreamBeginCapture,
+    pub hip_stream_end_capture: HipStreamEndCapture,
+    pub hip_graph_instantiate: HipGraphInstantiate,
+    pub hip_graph_launch: HipGraphLaunch,
+    pub hip_graph_exec_destroy: HipGraphExecDestroy,
+    pub hip_graph_destroy: HipGraphDestroy,
     hip_get_error_name: HipGetErrorName,
     hip_get_error_string: HipGetErrorString,
 }
@@ -102,6 +132,15 @@ impl Runtime {
             hip_memcpy: sym!(lib, "hipMemcpy", HipMemcpy),
             hip_memset: sym!(lib, "hipMemset", HipMemset),
             hip_module_launch_kernel: sym!(lib, "hipModuleLaunchKernel", HipModuleLaunchKernel),
+            hip_stream_create: sym!(lib, "hipStreamCreateWithFlags", HipStreamCreate),
+            hip_stream_destroy: sym!(lib, "hipStreamDestroy", HipStreamDestroy),
+            hip_stream_synchronize: sym!(lib, "hipStreamSynchronize", HipStreamSynchronize),
+            hip_stream_begin_capture: sym!(lib, "hipStreamBeginCapture", HipStreamBeginCapture),
+            hip_stream_end_capture: sym!(lib, "hipStreamEndCapture", HipStreamEndCapture),
+            hip_graph_instantiate: sym!(lib, "hipGraphInstantiate", HipGraphInstantiate),
+            hip_graph_launch: sym!(lib, "hipGraphLaunch", HipGraphLaunch),
+            hip_graph_exec_destroy: sym!(lib, "hipGraphExecDestroy", HipGraphExecDestroy),
+            hip_graph_destroy: sym!(lib, "hipGraphDestroy", HipGraphDestroy),
             hip_get_error_name: sym!(lib, "hipGetErrorName", HipGetErrorName),
             hip_get_error_string: sym!(lib, "hipGetErrorString", HipGetErrorString),
         })

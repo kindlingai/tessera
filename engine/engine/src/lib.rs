@@ -53,7 +53,7 @@ pub struct Engine {
 }
 
 /// A token at a position, in a slot's sequence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub slot: u32,
     pub token: u32,
@@ -66,14 +66,20 @@ fn launch_of(rows: &[Row], slots: usize) -> ([(graph::DimName, u64); 4], [Tensor
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
     seen.sort_unstable();
     seen.dedup();
+    // Rows round up to a power of two.
+    let filled = rows.len().next_power_of_two();
     let sizes = [
         (Seqs, slots as u64),
-        (Rows, rows.len() as u64),
+        (Rows, filled as u64),
         (Context, furthest as u64 + 1),
         (Segments, seen.len() as u64),
     ];
-    let shape = vec![rows.len()];
-    let column = |of: fn(&Row) -> u32| Tensor::u32(shape.clone(), rows.iter().map(of).collect());
+    // The last row fills out. Copies rewrite its kept row.
+    let last = rows.last().copied().unwrap_or_default();
+    let column = |of: fn(&Row) -> u32| {
+        let values = rows.iter().chain(std::iter::repeat(&last));
+        Tensor::u32(vec![filled], values.take(filled).map(of).collect())
+    };
     let feeds = [
         column(|r| r.token),
         column(|r| r.position),
@@ -159,7 +165,9 @@ impl Engine {
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
         self.runner.feed(&views)?;
         self.runner.submit(0..self.runner.plan().steps.len())?;
-        self.runner.ids(out)
+        let mut ids = self.runner.ids(out)?;
+        ids.truncate(rows.len());
+        Ok(ids)
     }
 
     /// Decodes greedily after `request.tokens`, one event per token.

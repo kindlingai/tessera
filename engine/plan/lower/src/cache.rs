@@ -12,7 +12,7 @@ type Key = (u64, usize, Vec<(DimName, u64)>, Vec<DimName>, u64);
 /// Runtime dimensions are lowered at the next power of two.
 const LEAST: u64 = 16;
 
-/// Each runtime dimension's value for a launch.
+/// Each runtime dimension's bucket, bound at launch.
 pub type Bound = Vec<(DimName, u32)>;
 
 /// Lowered plans by graph, entry and sizes.
@@ -49,7 +49,7 @@ impl Cache {
         Ok(self.upto(g, entry, sizes, &[], device)?.0.clone())
     }
 
-    /// A plan reading `upto` at launch, and what to bind.
+    /// A plan reading `upto` at launch, bound at their buckets.
     pub fn upto(
         &mut self,
         g: &Graph,
@@ -66,7 +66,7 @@ impl Cache {
             false => (*name, *n),
         };
         let rounded: Vec<(DimName, u64)> = sizes.iter().map(bucket).collect();
-        for (name, n) in sizes.iter().filter(|(name, _)| upto.contains(name)) {
+        for (name, n) in rounded.iter().filter(|(name, _)| upto.contains(name)) {
             bound.push((*name, *n as u32));
         }
         let key = (

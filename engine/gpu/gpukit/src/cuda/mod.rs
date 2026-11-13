@@ -8,6 +8,6 @@ pub use crate::launch::{
     KernelArgs, Launch, THREADS_PER_BLOCK, div_up, launch_1d, launch_1d_ranged, launch_grid,
     launch_rows, pod_bytes,
 };
-pub use context::{Context, ContextConfig, Kernel, Module};
+pub use context::{Context, ContextConfig, Graph, Kernel, Module};
 
 crate::device::backend_api!(Context, Kernel);
