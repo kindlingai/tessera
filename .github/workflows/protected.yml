@@ -1,0 +1,48 @@
+name: Protected files
+
+# pull_request_target runs main's copy of this file and its scripts,
+# so a PR cannot change its own checks. It never runs PR code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, unlabeled]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: protected-${{ github.event.pull_request.number }}
+
+jobs:
+  human-review:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Label changes to protected files
+        if: contains(fromJSON('["opened", "reopened", "synchronize"]'), github.event.action)
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' \
+            | scripts/protected.sh > "$RUNNER_TEMP/hits"
+          if [ -s "$RUNNER_TEMP/hits" ]; then
+            cat "$RUNNER_TEMP/hits"
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" \
+              -f 'labels[]=needs-human-review' >/dev/null
+          fi
+      - name: Rerun CI's success job
+        # A finished success job read the old label or setting.
+        if: contains(fromJSON('["edited", "unlabeled"]'), github.event.action)
+        run: |
+          run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$SHA" \
+            --json databaseId,status --jq '.[0] | select(.status == "completed") | .databaseId')
+          [ -n "$run" ] || exit 0
+          job=$(gh run view -R "$GITHUB_REPOSITORY" "$run" --json jobs \
+            --jq '.jobs[] | select(.name == "success") | .databaseId')
+          gh run rerun -R "$GITHUB_REPOSITORY" --job "$job"
+      - run: scripts/pr-gate.sh

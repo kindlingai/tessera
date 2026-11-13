@@ -179,7 +179,7 @@ fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
 fn callers_lend_memory() {
     let body = group_sum_ir();
     let text = body.text().render(Dialect::Metal);
-    // The callee's loop is renamed; the caller's memory is not.
+    // The callee's loop is renamed. The caller's memory is not.
     assert!(text.contains("for (u32 level_1 = 0; level_1 < 3; level_1 += 1) {"));
     assert!(text.contains("u32 span_1 = (8 >> (level_1 + 1));"));
     assert!(text.contains("red[lid] += red[(lid + span_1)];"));

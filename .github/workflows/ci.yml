@@ -131,7 +131,8 @@ jobs:
           key: simcheck-${{ github.run_id }}
 
   success:
-    # The one check to require: every job above passed.
+    # The one check to require: every job above passed, and no
+    # human step is pending.
     if: always()
     needs: [commits, lint, linux, macos, similarity]
     runs-on: ubuntu-latest
@@ -141,3 +142,11 @@ jobs:
         run: |
           echo "job results: $RESULTS"
           for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+      # Protected files and fork settings: see protected.yml.
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+      - if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: scripts/pr-gate.sh
