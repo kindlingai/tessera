@@ -138,6 +138,16 @@ impl Tiles {
     pub fn each(&self, _: impl FnMut(u32, u32, f32)) {
         device()
     }
+
+    /// Every sum back to zero.
+    pub fn zero(&mut self) {
+        device()
+    }
+
+    /// Every sum times `f` of its row.
+    pub fn scale(&mut self, _: impl Fn(u32) -> f32) {
+        device()
+    }
 }
 
 /// The thread's index in the grid.

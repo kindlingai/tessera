@@ -256,6 +256,16 @@ impl Counter {
                 });
             }
             Stmt::TileEach { body, .. } => self.stmts(body),
+            Stmt::TileZero { .. } => {}
+            Stmt::TileScale { acc, by } => {
+                self.expr(by);
+                if let Some((rows, cols)) = self.tiles.get(acc).copied() {
+                    self.add(Ops {
+                        float: (rows * cols) as f64 / LANES as f64,
+                        ..Ops::default()
+                    });
+                }
+            }
         }
     }
 }

@@ -229,6 +229,15 @@ pub enum Stmt {
         acc: String,
         body: Vec<Stmt>,
     },
+    /// Every sum back to zero.
+    TileZero {
+        acc: String,
+    },
+    /// Every sum times `by`, an expression in its row `r`.
+    TileScale {
+        acc: String,
+        by: Expr,
+    },
 }
 
 /// A kernel parameter: a buffer of `dtype`, or a scalar.
@@ -635,6 +644,41 @@ impl Printer<'_> {
                 self.block(body);
                 self.indent -= 2;
                 self.scope.pop();
+                self.line("        }".into());
+                self.line("    }".into());
+                self.line("}".into());
+            }
+            Stmt::TileZero { acc } => {
+                let Kind::Tiles(rows, cols) = self.kind(acc) else {
+                    panic!("`{acc}` is not a tile block");
+                };
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
+                self.line(format!(
+                    "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
+                ));
+                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+                self.line(format!("            {acc}[i][j][e] = 0.0f;"));
+                self.line("        }".into());
+                self.line("    }".into());
+                self.line("}".into());
+            }
+            Stmt::TileScale { acc, by } => {
+                let Kind::Tiles(rows, cols) = self.kind(acc) else {
+                    panic!("`{acc}` is not a tile block");
+                };
+                self.scope.push(HashMap::new());
+                self.bind("r", Kind::Value(Ty::U32));
+                let by = self.expr(by);
+                self.scope.pop();
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
+                self.line(format!(
+                    "    for (u32 j = 0; j < ({cols}) / TILE_N; j++) {{"
+                ));
+                self.line("        for (u32 e = 0; e < TILE_COUNT; e++) {".into());
+                self.line("            u32 r = i * TILE_M + TILE_ROW(e);".into());
+                self.line(format!("            {acc}[i][j][e] *= {by};"));
                 self.line("        }".into());
                 self.line("    }".into());
                 self.line("}".into());

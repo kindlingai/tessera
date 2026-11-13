@@ -58,34 +58,29 @@ __device__ __forceinline__ void tile_one(tile_acc &c, const u32 *a, const u32 *b
 #define TILE_VAL(acc, e) ((acc).v[e])
 ";
 
-/// HIP: bf16 wmma, split three ways to keep near f32.
+/// HIP: f16 wmma, split three ways to keep 22 bits.
 const HIP: &str = "#define TILE_M 16
 #define TILE_N 16
 #define TILE_K 16
 typedef float tile_acc __attribute__((ext_vector_type(8)));
-typedef short tile_half __attribute__((ext_vector_type(16)));
+typedef _Float16 tile_half __attribute__((ext_vector_type(16)));
 typedef struct { tile_half hi; tile_half lo; } tile_a;
 typedef tile_a tile_b;
 #define TILE_ZERO(acc) acc = (tile_acc){0, 0, 0, 0, 0, 0, 0, 0}
-__device__ __forceinline__ short tile_bf16(float x) {
-    u32 u = __float_as_uint(x);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return (short)(u >> 16);
-}
 __device__ __forceinline__ void tile_load_row(tile_a &f, const float *p, u32 s, u32 lane) {
     const float *row = p + (lane % 16) * s;
     for (u32 i = 0; i < 16; i++) {
-        short hi = tile_bf16(row[i]);
+        _Float16 hi = (_Float16)row[i];
         f.hi[i] = hi;
-        f.lo[i] = tile_bf16(row[i] - __uint_as_float(((u32)(unsigned short)hi) << 16));
+        f.lo[i] = (_Float16)(row[i] - (float)hi);
     }
 }
 #define TILE_LOAD_A(f, p, s) tile_load_row(f, p, s, lane)
 #define TILE_LOAD_B(f, p, s) tile_load_row(f, p, s, lane)
 #define TILE_MMA(c, a, b) do { \\
-    c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32((a).lo, (b).hi, c); \\
-    c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32((a).hi, (b).lo, c); \\
-    c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32((a).hi, (b).hi, c); } while (0)
+    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((a).lo, (b).hi, c); \\
+    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((a).hi, (b).lo, c); \\
+    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((a).hi, (b).hi, c); } while (0)
 #define TILE_COUNT 8
 #define TILE_ROW(e) (2 * (e) + lane / 16)
 #define TILE_COL(e) (lane % 16)

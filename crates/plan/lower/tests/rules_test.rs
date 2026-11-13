@@ -19,7 +19,7 @@ fn decode() -> Graph {
     let dim = |name, size| Dim { name, size };
     let bounded = [(Seqs, 4), (Rows, 8), (Context, 16)];
     let mut dims: Vec<Dim> = bounded.map(|(n, max)| dim(n, Size::Bounded(max))).into();
-    dims.extend([dim(Heads, Size::Fixed(2)), dim(HeadDim, Size::Fixed(4))]);
+    dims.extend([dim(Heads, Size::Fixed(2)), dim(HeadDim, Size::Fixed(16))]);
     let m = Model::new(dims);
     let port = |rows| Port {
         role: Role::Tokens,

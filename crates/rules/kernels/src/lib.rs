@@ -6,6 +6,7 @@ pub mod apply_rope_heads;
 mod argmax;
 mod attend;
 mod dense;
+mod flash;
 mod gather;
 #[allow(clippy::len_without_is_empty)]
 pub mod gather_rows;
