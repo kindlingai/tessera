@@ -2,6 +2,9 @@
 
 mod model;
 mod server;
+mod template;
+#[cfg(test)]
+mod template_test;
 mod text;
 #[cfg(test)]
 mod text_test;
@@ -71,6 +74,7 @@ fn engine_thread(
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());
     let shared = Shared {
         tokenizer: loaded.tokenizer,
+        template: loaded.template,
         stop: loaded.stop,
         jobs: Mutex::new(queue),
     };
