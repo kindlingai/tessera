@@ -1,5 +1,5 @@
 #!/bin/sh
-# Creates or edits the pull request's near-copy comment.
+# Creates or edits the pull request's simcheck comment.
 # Usage: simcheck-comment.sh <report.md>
 # Needs GH_TOKEN, PR and GITHUB_REPOSITORY in the environment.
 set -e
@@ -11,7 +11,7 @@ id=$(gh api --paginate "$comments" \
     --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
 if [ -n "$id" ]; then
     gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$report" >/dev/null
-elif ! grep -q '^None found' "$report"; then
+elif ! grep -q '^None found' "$report" || grep -q '^### New files' "$report"; then
     # A clean run with no earlier comment says nothing.
     gh api "$comments" -F body=@"$report" >/dev/null
 fi

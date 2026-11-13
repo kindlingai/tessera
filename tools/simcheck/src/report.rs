@@ -1,5 +1,6 @@
 //! A Markdown report of near-copies, for a pull request comment.
 
+use crate::far::Lean;
 use crate::pairs::Hit;
 use crate::windows::Window;
 use anyhow::Result;
@@ -80,10 +81,34 @@ fn near_copies(
     Ok(())
 }
 
-/// Near-copies, then allow pairs that allow nothing.
+/// New files that read more like another crate. Advice only.
+fn leans(out: &mut String, leans: &[Lean]) -> Result<()> {
+    if leans.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\n### New files nearer another crate\n")?;
+    writeln!(
+        out,
+        "These new files read more like another crate than their own. \
+         Think about moving them. This does not fail the check.\n"
+    )?;
+    writeln!(out, "| File | Own crate | Nearer crate |\n|---|---|---|")?;
+    for l in leans {
+        writeln!(
+            out,
+            "| `{}` | `{}` {:.3} | `{}` {:.3} |",
+            l.path, l.home, l.own, l.other, l.near
+        )?;
+    }
+    Ok(())
+}
+
+/// Allow pairs that allow nothing, as TOML lines to remove.
+type Stale<'a> = &'a [&'a (String, String)];
+
+/// Near-copies, stale allow pairs, then leaning new files.
 pub fn markdown(
-    hits: &[Hit],
-    stale: &[&(String, String)],
+    (hits, stale, lean): (&[Hit], Stale, &[Lean]),
     wins: &[Window],
     root: &Path,
     limits: (usize, f32),
@@ -92,6 +117,7 @@ pub fn markdown(
     let mut out = format!("{MARKER}\n### Near-copies of code\n\n");
     if hits.is_empty() && stale.is_empty() {
         out.push_str("None found.\n");
+        leans(&mut out, lean)?;
         return Ok(out);
     }
     if !hits.is_empty() {
@@ -106,5 +132,6 @@ pub fn markdown(
         }
         out.push_str("````\n");
     }
+    leans(&mut out, lean)?;
     Ok(out)
 }
