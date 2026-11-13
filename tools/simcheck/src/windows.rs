@@ -3,6 +3,7 @@
 use shape::shape;
 
 /// Lines `line..line + window` of `path`, trimmed and joined.
+#[derive(Clone)]
 pub struct Window {
     pub path: String,
     pub line: usize,
