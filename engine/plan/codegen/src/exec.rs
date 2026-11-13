@@ -747,7 +747,10 @@ pub fn run(
     let mut named = HashMap::new();
     for (param, arg) in body.params.iter().zip(args) {
         let name = match param {
-            Param::Buffer { name, .. } | Param::Scalar { name, .. } => name.clone(),
+            Param::Buffer { name, .. }
+            | Param::Scalar { name, .. }
+            | Param::Shared { name, .. }
+            | Param::Tiles { name } => name.clone(),
         };
         named.insert(name, *arg);
     }

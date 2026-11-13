@@ -5,8 +5,8 @@ use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    BinOp, Error, Expr, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Pat, PathArguments,
-    Stmt, Type, UnOp, parse_macro_input,
+    BinOp, Error, Expr, ExprCall, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Pat,
+    PathArguments, ReturnType, Stmt, Type, UnOp, parse_macro_input,
 };
 
 type Res = Result<Tokens, Error>;
@@ -30,15 +30,18 @@ pub fn kernel(_: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// The sibling that builds the body, taking `#[build]` parameters.
+/// Two siblings: the body builder, and the call to inline.
 fn tree(f: &mut ItemFn) -> Res {
     let name = &f.sig.ident;
     let ir_name = format_ident!("{name}_ir");
+    let inline_name = format_ident!("{name}_inline");
     let vis = &f.vis;
-    let (impl_generics, _, where_clause) = f.sig.generics.split_for_impl();
+    let (impl_generics, ty_generics, where_clause) = f.sig.generics.split_for_impl();
+    let turbofish = ty_generics.as_turbofish();
     let entry = name.to_string();
     let (mut params, mut build, mut ctx) = (Vec::new(), Vec::new(), Ctx { build: Vec::new() });
-    for arg in &mut f.sig.inputs {
+    let (mut takes, mut binds, mut passes) = (Vec::new(), Vec::new(), Vec::new());
+    for (n, arg) in f.sig.inputs.iter_mut().enumerate() {
         let FnArg::Typed(p) = arg else {
             return Err(Error::new(arg.span(), "a kernel takes no self"));
         };
@@ -55,25 +58,64 @@ fn tree(f: &mut ItemFn) -> Res {
             .transpose()?;
         p.attrs
             .retain(|a| !a.path().is_ident("build") && !a.path().is_ident("form"));
+        let taken = format_ident!("a{n}");
         match at_build {
             true => {
                 let (ident, ty) = (&ident.ident, &p.ty);
                 build.push(quote!(#ident: #ty));
                 ctx.build.push(name);
+                takes.push(quote!(#taken: impl codegen::inline::Pass<#ty>));
+                binds.push(quote!(let #ident = #taken.pass();));
+                passes.push(quote!(#ident));
             }
-            false => params.push(param(&name, &p.ty, form)?),
+            false => {
+                params.push(param(&name, &p.ty, form)?);
+                takes.push(quote!(#taken: impl codegen::inline::Pass<codegen::ir::Expr>));
+                binds.push(quote!(args.push(#taken.pass());));
+            }
         }
     }
-    let stmts = block(&f.block.stmts, &ctx)?;
+    let (stmts, ret) = match (&f.sig.output, f.block.stmts.split_last()) {
+        (ReturnType::Default, _) => (block(&f.block.stmts, &ctx)?, quote!(None)),
+        (ReturnType::Type(..), Some((Stmt::Expr(e, None), rest))) => {
+            let value = expr(e, &ctx)?;
+            let ret = quote! {{
+                let mut pre: Vec<Stmt> = Vec::new();
+                let value = #value;
+                stmts.extend(pre);
+                Some(value)
+            }};
+            (block(rest, &ctx)?, ret)
+        }
+        (ReturnType::Type(..), _) => {
+            return Err(Error::new(f.sig.output.span(), "end with the value"));
+        }
+    };
     Ok(quote! {
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments, unused_mut)]
         #vis fn #ir_name #impl_generics (#(#build),*) -> codegen::ir::Body #where_clause {
             #[allow(unused_imports)]
             use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+            let mut inl = codegen::inline::Inliner::default();
+            let mut stmts: Vec<Stmt> = #stmts;
+            let ret: Option<Expr> = #ret;
             Body {
                 entry: #entry.into(),
                 params: vec![#(#params),*],
-                stmts: #stmts,
+                stmts,
+                ret,
+            }
+        }
+
+        #[allow(clippy::too_many_arguments, unused_mut)]
+        #vis fn #inline_name #impl_generics (#(#takes),*) -> codegen::inline::Inline #where_clause {
+            #[allow(unused_imports)]
+            use codegen::inline::Pass;
+            let mut args: Vec<codegen::ir::Expr> = Vec::new();
+            #(#binds)*
+            codegen::inline::Inline {
+                body: #ir_name #turbofish (#(#passes),*),
+                args,
             }
         }
     })
@@ -81,6 +123,11 @@ fn tree(f: &mut ItemFn) -> Res {
 
 /// `#[form(f)]` on a `Buf<Dyn>` reads build parameter `f`.
 fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
+    // A reference passes group memory or tiles by name.
+    let ty = match ty {
+        Type::Reference(r) => &*r.elem,
+        other => other,
+    };
     let Type::Path(path) = ty else {
         return Err(Error::new(ty.span(), "a buffer or scalar type"));
     };
@@ -103,6 +150,17 @@ fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
             let form = form(&last.arguments)?;
             quote!(Param::Buffer { name: #name.into(), form: #form, writes: true })
         }
+        "Shared" => {
+            let PathArguments::AngleBracketed(a) = &last.arguments else {
+                return Err(Error::new(last.span(), "`Shared<T>` names its element"));
+            };
+            let Some(GenericArgument::Type(t)) = a.args.first() else {
+                return Err(Error::new(a.span(), "`Shared<T>` names its element"));
+            };
+            let ty = scalar(t)?;
+            quote!(Param::Shared { name: #name.into(), ty: #ty })
+        }
+        "Tiles" => quote!(Param::Tiles { name: #name.into() }),
         _ => {
             let ty = scalar(ty)?;
             quote!(Param::Scalar { name: #name.into(), ty: #ty })
@@ -127,10 +185,34 @@ fn block(stmts: &[Stmt], ctx: &Ctx) -> Res {
         .iter()
         .map(|s| stmt(s, ctx))
         .collect::<Result<_, _>>()?;
-    Ok(quote!(vec![#(#stmts),*]))
+    Ok(quote!({
+        let mut b: Vec<Stmt> = Vec::new();
+        #(b.extend(#stmts);)*
+        b
+    }))
 }
 
+/// A statement's list: any inlined calls, then itself.
 fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
+    if let Stmt::Expr(Expr::Call(c), _) = s
+        && let Some(call) = kernel_call(c, ctx)?
+    {
+        return Ok(quote!({
+            let mut pre: Vec<Stmt> = Vec::new();
+            inl.stmt(&mut pre, #call);
+            pre
+        }));
+    }
+    let one = one(s, ctx)?;
+    Ok(quote!({
+        let mut pre: Vec<Stmt> = Vec::new();
+        let s = #one;
+        pre.push(s);
+        pre
+    }))
+}
+
+fn one(s: &Stmt, ctx: &Ctx) -> Res {
     match s {
         Stmt::Local(local) => {
             let name = match &local.pat {
@@ -308,10 +390,7 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
                 None => quote!(vec![]),
                 Some((_, e)) => match &**e {
                     Expr::Block(b) => block(&b.block.stmts, ctx)?,
-                    nested @ Expr::If(_) => {
-                        let s = statement(nested, ctx)?;
-                        quote!(vec![#s])
-                    }
+                    nested @ Expr::If(_) => stmt(&Stmt::Expr(nested.clone(), None), ctx)?,
                     other => return Err(Error::new(other.span(), "a block or `else if`")),
                 },
             };
@@ -389,6 +468,38 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
         BinOp::Or(_) => quote!(BinOp::Or),
         _ => return None,
     })
+}
+
+/// Names the prelude gives, which are not kernels.
+const PRELUDE: &[&str] = &[
+    "barrier", "gid", "lid", "lane", "shfl_xor", "sum32", "rsqrt", "exp", "tanh", "max", "clamp",
+    "pow", "cos", "sin", "shared", "tiles",
+];
+
+/// A call to another kernel: `f_inline(..)`, build values passed raw.
+fn kernel_call(c: &ExprCall, ctx: &Ctx) -> Result<Option<Tokens>, Error> {
+    let Expr::Path(p) = &*c.func else {
+        return Ok(None);
+    };
+    let mut path = p.path.clone();
+    let many = path.segments.len() > 1;
+    let Some(last) = path.segments.last_mut() else {
+        return Ok(None);
+    };
+    let name = last.ident.to_string();
+    if many || PRELUDE.contains(&name.as_str()) {
+        return Ok(None);
+    }
+    last.ident = format_ident!("{name}_inline");
+    let args: Vec<Tokens> = c
+        .args
+        .iter()
+        .map(|a| match is_const(a, ctx) {
+            true => Ok(quote!((#a))),
+            false => expr(a, ctx),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Some(quote!(#path(#(#args),*))))
 }
 
 fn is_path(e: &Expr, name: &str) -> bool {
@@ -518,6 +629,9 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             Ok(quote!(Expr::Call(#intrinsic, vec![#recv, #(#args),*])))
         }
         Expr::Call(c) => {
+            if let Some(call) = kernel_call(c, ctx)? {
+                return Ok(quote!(inl.expr(&mut pre, #call)));
+            }
             let Expr::Path(p) = &*c.func else {
                 return Err(Error::new(c.func.span(), "call a prelude function"));
             };

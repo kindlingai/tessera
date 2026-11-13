@@ -5,6 +5,7 @@ mod count;
 mod dialect;
 pub mod exec;
 pub mod form;
+pub mod inline;
 pub mod ir;
 pub mod numerics;
 pub mod prelude;

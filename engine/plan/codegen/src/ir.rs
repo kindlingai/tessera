@@ -237,7 +237,7 @@ pub enum Stmt {
     },
 }
 
-/// A kernel parameter: a buffer of `form`, or a scalar.
+/// A kernel parameter. Only a callee takes the last two.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
     Buffer {
@@ -249,6 +249,15 @@ pub enum Param {
         name: String,
         ty: Ty,
     },
+    /// The caller's group memory, by name.
+    Shared {
+        name: String,
+        ty: Ty,
+    },
+    /// The caller's tile sums, by name.
+    Tiles {
+        name: String,
+    },
 }
 
 /// A whole kernel, before any dialect.
@@ -257,6 +266,8 @@ pub struct Body {
     pub entry: String,
     pub params: Vec<Param>,
     pub stmts: Vec<Stmt>,
+    /// The value a kernel called from another gives back.
+    pub ret: Option<Expr>,
 }
 
 /// Every name in scope and what it is.
@@ -731,6 +742,7 @@ fn float(x: f64) -> String {
 impl Body {
     /// The text of this body, with buffers and scalars declared.
     pub fn text(&self) -> Text {
+        assert!(self.ret.is_none(), "`{}` has a value: call it", self.entry);
         let mut p = Printer {
             scope: vec![HashMap::new()],
             lines: Vec::new(),
@@ -754,6 +766,9 @@ impl Body {
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
                     scalars.push((leak(name), ty.c()));
+                }
+                Param::Shared { name, .. } | Param::Tiles { name } => {
+                    panic!("`{}` takes `{name}` from a caller", self.entry);
                 }
             }
         }
