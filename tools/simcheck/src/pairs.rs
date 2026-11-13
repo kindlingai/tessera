@@ -26,10 +26,21 @@ impl Allow {
         Ok(toml::from_str(text)?)
     }
 
-    pub fn permits(&self, a: &str, b: &str) -> bool {
+    /// The index of the pair that allows `a` beside `b`.
+    fn find(&self, a: &str, b: &str) -> Option<usize> {
         self.pairs
             .iter()
-            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+            .position(|(x, y)| (x == a && y == b) || (x == b && y == a))
+    }
+
+    /// Pairs that allowed nothing, given which ones did.
+    pub fn stale(&self, used: &[bool]) -> Vec<&(String, String)> {
+        self.pairs
+            .iter()
+            .zip(used)
+            .filter(|(_, u)| !**u)
+            .map(|(p, _)| p)
+            .collect()
     }
 }
 
@@ -42,14 +53,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// One hit per file pair scoring at least `min`.
+/// Hits at `min` or above, and which allow pairs matched.
 pub fn near(
     wins: &[Window],
     embs: &[Vec<f32>],
     window: usize,
     min: f32,
     allow: &Allow,
-) -> Vec<Hit> {
+) -> (Vec<Hit>, Vec<bool>) {
     let found: Vec<(usize, usize, f32)> = (0..wins.len())
         .into_par_iter()
         .flat_map_iter(|i| {
@@ -62,9 +73,11 @@ pub fn near(
         })
         .collect();
     let mut by_files: BTreeMap<(&str, &str), Hit> = BTreeMap::new();
+    let mut used = vec![false; allow.pairs.len()];
     for (a, b, score) in found {
         let files = (wins[a].path.as_str(), wins[b].path.as_str());
-        if allow.permits(files.0, files.1) {
+        if let Some(i) = allow.find(files.0, files.1) {
+            used[i] = true;
             continue;
         }
         let hit = by_files.entry(files).or_insert(Hit {
@@ -78,5 +91,5 @@ pub fn near(
             (hit.a, hit.b, hit.score) = (a, b, score);
         }
     }
-    by_files.into_values().collect()
+    (by_files.into_values().collect(), used)
 }

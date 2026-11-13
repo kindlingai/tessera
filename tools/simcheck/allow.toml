@@ -3,9 +3,6 @@ pairs = [
     ["engine/gpu/gpukit/src/cuda/context.rs", "engine/gpu/gpukit/src/rocm/context.rs"],
     ["engine/gpu/gpukit/src/kernel.rs", "engine/gpu/gpukit/src/kernel.rs"],
     ["engine/gpu/gpukit/tests/cuda_smoke_test.rs", "engine/gpu/gpukit/tests/rocm_smoke_test.rs"],
-    # Two matmul schedules state the same sizes, loads and launches.
-    ["engine/rules/kernels/src/thin.rs", "engine/rules/linear/src/lanes.rs"],
-    # Whole and ragged attention share the online softmax. Kernels cannot call each other.
-    ["engine/rules/kernels/src/attend.rs", "engine/rules/kernels/src/attend.rs"],
+    # Flash attention's variants share the online softmax.
     ["engine/rules/kernels/src/flash.rs", "engine/rules/kernels/src/flash.rs"],
 ]
