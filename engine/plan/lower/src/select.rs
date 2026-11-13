@@ -4,7 +4,7 @@ use crate::Error;
 use crate::cost::Device;
 use crate::form::Stored;
 use crate::kernel::{Kernel, KernelRef};
-use crate::kernels::{Append, Move, Widen};
+use crate::kernels::{Move, Scatter, Widen};
 use crate::rule::{Draft, Read, Rule, rules, ways};
 use crate::tree::{T, Term, Tree, unsupported};
 use graph::{DType, DimExpr, DimName, Graph, NodeId};
@@ -381,30 +381,29 @@ impl Emit {
         write
     }
 
-    /// Copies new rows in after those already kept.
-    fn append(&mut self, tree: &Tree, t: T, index: u32, rows: Val) -> Result<Val, Error> {
+    /// Writes new rows into kept rows by slot and position.
+    fn append(&mut self, tree: &Tree, t: T, index: u32, args: [Val; 3]) -> Result<Val, Error> {
         let (n, all) = (tree.node(t), &tree.node(t).shape);
         let DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
             return unsupported("kept rows along a computed axis");
         };
-        // Sequences would move as their rows grow.
-        if all[0] != 1 {
-            return unsupported("kept rows for several sequences");
-        }
+        // A slot holds the axis's bound, whatever this launch sees.
         let most = tree.g.dims.iter().find(|d| d.name == *axis);
-        let most = most.map_or(0, |d| d.size.max() as usize);
+        let stride = most.map_or(0, |d| d.size.max() as usize);
+        let width: usize = all[2..].iter().product();
+        let room = all[0] * stride * width;
         let len: usize = all.iter().product();
-        let room = most * (len / all[1]);
         let write = self.value(len, Home::Kept { index, room }, EDGE, DType::F32);
-        let rows = self.bring(rows, EDGE);
-        // The new rows go after those kept so far.
-        let width = len / all[1];
-        let skip = n.extents[1].times(width).less(self.len(rows));
-        let len = self.len(rows);
+        let [rows, slots, positions] = args.map(|v| self.bring(v, EDGE));
+        let kernel = Scatter {
+            rows: self.len(rows) / width,
+            width,
+            stride,
+        };
         self.out.ops.push(Op {
-            kernel: KernelRef::new(Append { skip, len }),
+            kernel: KernelRef::new(kernel),
             rule: "append",
-            reads: vec![rows],
+            reads: vec![rows, slots, positions],
             write,
             covers: vec![n.from],
             zone: EDGE,
@@ -483,7 +482,10 @@ pub fn select_upto(
             (Term::Leaf(home), _) => e.value(tree.elements(t), *home, EDGE, n.form),
             (_, None) => continue,
             (Term::View, _) => val(n.args[0]),
-            (Term::Append(index), _) => e.append(&tree, t, *index, val(n.args[0]))?,
+            (Term::Append(index), _) => {
+                let args = [n.args[0], n.args[1], n.args[2]].map(val);
+                e.append(&tree, t, *index, args)?
+            }
             (_, Some(zone)) => {
                 let choice = cover.best[t.0 as usize][zone as usize].take().flatten();
                 let choice = choice.expect("solved above");

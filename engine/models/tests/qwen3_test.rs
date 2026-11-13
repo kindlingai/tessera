@@ -4,7 +4,7 @@ use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
-use lower::{Cache, DType, Device, Pins, Plan, Run, Settings, lower, open, select};
+use lower::{Cache, DType, Device, Pins, Plan, Run, Settings, View, lower, open, select};
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -137,11 +137,12 @@ impl Span<'_> {
         (self.past as u32..(self.past + self.tokens.len()) as u32).collect()
     }
 
-    /// Tokens and positions as one-row tensors.
-    fn tensors(&self) -> [Tensor; 2] {
-        let shape = vec![1, self.tokens.len()];
+    /// Tokens, positions and slots as columns, all in slot 0.
+    fn tensors(&self) -> [Tensor; 3] {
+        let shape = vec![self.tokens.len()];
         let tokens = Tensor::u32(shape.clone(), self.tokens.to_vec());
-        [tokens, Tensor::u32(shape, self.positions())]
+        let slots = Tensor::u32(shape.clone(), vec![0; self.tokens.len()]);
+        [tokens, Tensor::u32(shape, self.positions()), slots]
     }
 }
 
@@ -216,8 +217,10 @@ impl<'a> Gpu<'a> {
 
     /// Times this launch under each competing rule, where unknown.
     fn learn(&mut self, g: &Graph, rows: Span) {
-        let (sizes, [tokens, positions]) = (rows.sizes(), rows.tensors());
-        let feeds = [tokens.view(), positions.view()];
+        let (sizes, tensors) = (rows.sizes(), rows.tensors());
+        // The forward entry has no slots column.
+        let ports = g.entries[0].inputs.len();
+        let feeds: Vec<View> = tensors[..ports].iter().map(Tensor::view).collect();
         // What the stored samples alone would launch.
         let before = kernels(&lower(g, 0, &sizes, &self.device).unwrap());
         let device = &mut self.device;
@@ -236,10 +239,9 @@ impl<'a> Gpu<'a> {
     fn plan(&mut self, g: &Graph, rows: Span, device: &Device) {
         let plan = self.plans.lower(g, 0, &rows.sizes(), device).unwrap();
         self.runner.replan(&plan).unwrap();
-        let [tokens, positions] = rows.tensors();
-        self.runner
-            .feed(&[tokens.view(), positions.view()])
-            .unwrap();
+        let (tensors, ports) = (rows.tensors(), g.entries[0].inputs.len());
+        let feeds: Vec<View> = tensors[..ports].iter().map(Tensor::view).collect();
+        self.runner.feed(&feeds).unwrap();
     }
 
     /// Each step's seconds for the plan in place.
@@ -405,9 +407,10 @@ mod decode {
         gpu.runner.replan(plan).unwrap();
         gpu.runner.bind_all(&bound);
         let planning = start.elapsed().as_secs_f64();
-        let [tokens, positions] = rows.tensors();
+        let tensors = rows.tensors();
+        let feeds: Vec<View> = tensors.iter().map(Tensor::view).collect();
         let start = Instant::now();
-        gpu.runner.feed(&[tokens.view(), positions.view()]).unwrap();
+        gpu.runner.feed(&feeds).unwrap();
         gpu.runner.submit(0..gpu.runner.plan().steps.len()).unwrap();
         let ids = gpu.runner.ids(out).unwrap();
         (ids, [planning, start.elapsed().as_secs_f64()])

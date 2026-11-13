@@ -105,9 +105,10 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
 fn arity(op: &Op) -> usize {
     match op {
         Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) | Op::Append(_) => 1,
+        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) => 1,
+        Op::Append(_) => 3,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) => 2,
-        Op::Attend(a) => 3 + usize::from(a.picked),
+        Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
         Op::View(_) => 1,
     }
@@ -136,6 +137,10 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             .map(|w| w.ty.clone())
             .ok_or_else(missing),
         Op::Matmul => matmul(&g.dims, args[0], args[1]),
+        Op::Attend(a) if a.ragged => {
+            finite(a.scale, "attention scale")?;
+            attend_rows(&g.dims, args)
+        }
         Op::Attend(a) => {
             finite(a.scale, "attention scale")?;
             attend(&g.dims, args)
@@ -144,7 +149,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Mask(_) => select::mask(args[0]),
         Op::Append(i) => {
             let kept = g.kept.get(*i as usize).ok_or_else(missing)?;
-            append(&g.dims, kept, args[0])
+            append(&g.dims, kept, args)
         }
         Op::Select(s) => select::select(&g.dims, s, args),
         Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
@@ -217,6 +222,22 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
     })
 }
 
+/// Heads group over key heads, and one float dtype throughout.
+fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Result<(), TypeError> {
+    let heads = poly(dims, &q.shape.0[q_heads])?.as_const();
+    let kv_heads = poly(dims, &k.shape.0[2])?.as_const();
+    if let (Some(h), Some(kv)) = (heads, kv_heads) {
+        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
+            format!("{h} query heads do not group over {kv} key heads")
+        })?;
+    }
+    need(
+        q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype,
+        ErrorKind::DType,
+        || "attention needs one float dtype".into(),
+    )
+}
+
 fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
     let (q, k, v) = (a[0], a[1], a[2]);
     need(
@@ -242,18 +263,7 @@ fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             },
         )?;
     }
-    let heads = poly(dims, &q.shape.0[2])?.as_const();
-    let kv_heads = poly(dims, &k.shape.0[2])?.as_const();
-    if let (Some(h), Some(kv)) = (heads, kv_heads) {
-        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
-            format!("{h} query heads do not group over {kv} key heads")
-        })?;
-    }
-    need(
-        q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype,
-        ErrorKind::DType,
-        || "attention needs one float dtype".into(),
-    )?;
+    heads_fit(dims, [q, k, v], 2)?;
     let p = q.placement;
     need(
         k.placement == p && v.placement == p,
@@ -515,15 +525,68 @@ fn concat(dims: &[Dim], a: &TensorType, b: &TensorType) -> Result<TensorType, Ty
     Ok(out)
 }
 
-/// New rows match kept ones on every axis but rows.
-fn append(dims: &[Dim], kept: &TensorType, rows: &TensorType) -> Result<TensorType, TypeError> {
-    let rest = |t: &TensorType| Shape(t.shape.0.iter().skip(2).cloned().collect());
+/// `slots` and `positions`: one integer each per row of `rows`.
+fn row_ids(
+    dims: &[Dim],
+    rows: &Shape,
+    slots: &TensorType,
+    positions: &TensorType,
+) -> Result<(), TypeError> {
+    for (what, t) in [("slots", slots), ("positions", positions)] {
+        let fits = t.rank() == 1 && same(dims, &t.shape.0[0], &rows.0[0])?;
+        need(fits, ErrorKind::Shape, || {
+            format!("{what} {} do not match rows {rows}", t.shape)
+        })?;
+        need(t.dtype.is_int(), ErrorKind::DType, || {
+            format!("{what} must be integers, got {:?}", t.dtype)
+        })?;
+    }
+    Ok(())
+}
+
+/// Queries `[Rows, Heads, HeadDim]` over kept `[Seqs, Context, KvHeads, HeadDim]`.
+fn attend_rows(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
+    let (q, k, v) = (a[0], a[1], a[2]);
+    need(
+        q.rank() == 3 && k.rank() == 4 && v.rank() == 4,
+        ErrorKind::Shape,
+        || "ragged attention takes [Rows, Heads, HeadDim] queries over kept rows".into(),
+    )?;
+    need(
+        same_shape(dims, &k.shape, &v.shape)?,
+        ErrorKind::Shape,
+        || format!("keys {} and values {} differ", k.shape, v.shape),
+    )?;
+    need(
+        same(dims, &q.shape.0[2], &k.shape.0[3])?,
+        ErrorKind::Shape,
+        || {
+            format!(
+                "queries {} and keys {} differ in head width",
+                q.shape, k.shape
+            )
+        },
+    )?;
+    heads_fit(dims, [q, k, v], 1)?;
+    let whole = [q.placement, k.placement, v.placement] == [Placement::Replicated; 3];
+    need(whole, ErrorKind::Placement, || {
+        "ragged attention needs replicated tensors".into()
+    })?;
+    row_ids(dims, &q.shape, a[3], a[4])?;
+    Ok(q.clone())
+}
+
+/// Rows go to kept `[Seqs, Context, ..]` by slot and position.
+fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorType, TypeError> {
+    let (rows, slots, positions) = (a[0], a[1], a[2]);
+    let rest = |t: &TensorType, skip| Shape(t.shape.0.iter().skip(skip).cloned().collect());
     let fits = kept.rank() >= 2
-        && same_shape(dims, &front(&kept.shape, 1), &front(&rows.shape, 1))?
-        && same_shape(dims, &rest(kept), &rest(rows))?;
-    need(fits && rows.rank() == kept.rank(), ErrorKind::Shape, || {
+        && rows.rank() + 1 == kept.rank()
+        && same_shape(dims, &rest(kept, 2), &rest(rows, 1))?;
+    need(fits, ErrorKind::Shape, || {
         format!("rows {} cannot join kept {}", rows.shape, kept.shape)
     })?;
+    row_ids(dims, &rows.shape, slots, positions)?;
     need(rows.dtype == kept.dtype, ErrorKind::DType, || {
         format!("rows are {:?}, kept rows {:?}", rows.dtype, kept.dtype)
     })?;

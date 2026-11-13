@@ -62,6 +62,17 @@ pub(crate) fn ports(m: &Model, kind: EntryKind, rows: DimName) -> [Tensor; 2] {
     m.entry(kind, [port(Role::Tokens), port(Role::Positions)])
 }
 
+/// A step entry's rows: tokens, positions and slots, `[Rows]` each.
+pub(crate) fn step_ports(m: &Model) -> [Tensor; 3] {
+    let ty = TensorType::new([Rows], DType::U32);
+    let port = |role| Port {
+        role,
+        ty: ty.clone(),
+    };
+    let ports = [port(Role::Tokens), port(Role::Positions), port(Role::Slots)];
+    m.entry(EntryKind::Step, ports)
+}
+
 /// `[Seqs, Context]` followed by `rest`.
 pub(crate) fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
     let lead = [Seqs.into(), Context.into()];

@@ -4,9 +4,7 @@ use codegen::ir::Body;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{
-    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, T, Tree,
-};
+use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -301,16 +299,10 @@ impl Kernel for Flash {
 
 /// Scale the queries, then attend by tiles.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Attend {
-        scale,
-        q,
-        k,
-        v,
-        sizes,
-    } = tree.site(at)?
-    else {
+    let (scale, [q, k, v], sizes, rows) = tree.site(at)?.attention()?;
+    if rows.is_some() {
         return None;
-    };
+    }
     // Sequences would sit at moving offsets as the keys grow.
     if sizes.keys.runtime() && sizes.seqs > 1 {
         return None;

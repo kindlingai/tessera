@@ -19,6 +19,8 @@ pub struct Attn {
     pub heads: usize,
     pub kv_heads: usize,
     pub width: usize,
+    /// Rows one slot holds in the kept keys.
+    pub stride: usize,
 }
 
 impl Attn {
@@ -39,6 +41,9 @@ impl Attn {
         ]
     }
 }
+
+/// An attention site's parts: scale, queries, keys, values, sizes, rows.
+pub type Attention = (f32, [T; 3], Attn, Option<[T; 2]>);
 
 /// A pattern at a tree node, for kernels to compute.
 #[derive(Clone, Debug)]
@@ -74,6 +79,8 @@ pub enum Site {
         k: T,
         v: T,
         sizes: Attn,
+        /// Ragged rows: each query's slot and position.
+        rows: Option<[T; 2]>,
     },
     Gather {
         table: T,
@@ -179,4 +186,21 @@ pub fn rules() -> Vec<&'static Rule> {
     let mut all: Vec<&'static Rule> = RULES.iter().collect();
     all.sort_by_key(|r| r.name);
     all
+}
+
+impl Site {
+    /// This site as an attention, if it is one.
+    pub fn attention(&self) -> Option<Attention> {
+        match self {
+            Site::Attend {
+                scale,
+                q,
+                k,
+                v,
+                sizes,
+                rows,
+            } => Some((*scale, [*q, *k, *v], *sizes, *rows)),
+            _ => None,
+        }
+    }
 }

@@ -116,9 +116,9 @@ impl Tensor {
         self.op(Op::Select(Select::Take), &[ids])
     }
 
-    /// Appends these rows. Returns every kept row.
-    pub fn append(&self, kept: &Kept) -> Tensor {
-        self.op(Op::Append(kept.0), &[])
+    /// Writes rows by slot and position. Returns the kept rows.
+    pub fn append(&self, kept: &Kept, [slots, positions]: [&Tensor; 2]) -> Tensor {
+        self.op(Op::Append(kept.0), &[slots, positions])
     }
 
     pub fn cast(&self, dtype: DType) -> Tensor {

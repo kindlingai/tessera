@@ -305,6 +305,39 @@ impl<'a> Tree<'a> {
                     width,
                 })
             }
+            Term::Attend(a) if a.ragged => {
+                let (q, k, v) = (n.args[0], n.args[1], n.args[2]);
+                let (&[queries, heads, width], &[seqs, _, kv_heads, _]) =
+                    (&wide(q)[..], &wide(k)[..])
+                else {
+                    return None;
+                };
+                // The kept rows keep their axis's bound per slot.
+                let Term::Append(index) = self.node(k).term else {
+                    return None;
+                };
+                let graph::DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
+                    return None;
+                };
+                let stride = self.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+                let sizes = Attn {
+                    seqs,
+                    queries,
+                    keys: self.node(k).extents[1],
+                    heads,
+                    kv_heads,
+                    width,
+                    stride,
+                };
+                Some(Site::Attend {
+                    scale: a.scale,
+                    q,
+                    k,
+                    v,
+                    sizes,
+                    rows: Some([n.args[3], n.args[4]]),
+                })
+            }
             Term::Attend(a) => {
                 if a.picked || a.mask != Mask::Causal {
                     return None;
@@ -323,6 +356,7 @@ impl<'a> Tree<'a> {
                     heads,
                     kv_heads,
                     width,
+                    stride: keys.most(),
                 };
                 let scale = a.scale;
                 Some(Site::Attend {
@@ -331,6 +365,7 @@ impl<'a> Tree<'a> {
                     k,
                     v,
                     sizes,
+                    rows: None,
                 })
             }
             Term::Gather => {

@@ -42,27 +42,34 @@ pub struct Engine {
     device: Device,
     plans: Cache,
     context: usize,
+    /// Kept-row lanes the graph declares.
+    slots: usize,
 }
 
-/// One launch: `tokens` after `past` rows of one sequence.
-struct Span<'a> {
-    past: usize,
-    tokens: &'a [u32],
+/// A token at a position, in a slot's sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Row {
+    pub slot: u32,
+    pub token: u32,
+    pub position: u32,
 }
 
-impl Span<'_> {
-    fn sizes(&self) -> [(graph::DimName, u64); 3] {
-        let all = (self.past + self.tokens.len()) as u64;
-        [(Seqs, 1), (Rows, self.tokens.len() as u64), (Context, all)]
-    }
-
-    fn feeds(&self) -> [Tensor; 2] {
-        let shape = vec![1, self.tokens.len()];
-        let from = self.past as u32;
-        let positions = (from..from + self.tokens.len() as u32).collect();
-        let tokens = Tensor::u32(shape.clone(), self.tokens.to_vec());
-        [tokens, Tensor::u32(shape, positions)]
-    }
+/// The sizes and inputs one launch of `rows` needs.
+fn launch_of(rows: &[Row], slots: usize) -> ([(graph::DimName, u64); 3], [Tensor; 3]) {
+    let furthest = rows.iter().map(|r| r.position).max().unwrap_or(0);
+    let sizes = [
+        (Seqs, slots as u64),
+        (Rows, rows.len() as u64),
+        (Context, furthest as u64 + 1),
+    ];
+    let shape = vec![rows.len()];
+    let column = |of: fn(&Row) -> u32| Tensor::u32(shape.clone(), rows.iter().map(of).collect());
+    let feeds = [
+        column(|r| r.token),
+        column(|r| r.position),
+        column(|r| r.slot),
+    ];
+    (sizes, feeds)
 }
 
 impl Engine {
@@ -75,11 +82,18 @@ impl Engine {
     ) -> Result<Self, Error> {
         let device = Device::guess(settings).pinned(pins.clone());
         let mut plans = Cache::default();
-        let first = Span {
-            past: 0,
-            tokens: &[0],
-        };
-        let plan = plans.lower(&graph, 0, &first.sizes(), &device)?;
+        let slots = graph
+            .dims
+            .iter()
+            .find(|d| d.name == Seqs)
+            .map_or(1, |d| d.size.max() as usize);
+        let first = [Row {
+            slot: 0,
+            token: 0,
+            position: 0,
+        }];
+        let (sizes, _) = launch_of(&first, slots);
+        let plan = plans.lower(&graph, 0, &sizes, &device)?;
         let runner = open(plan, settings)?;
         let device = Device::stored(&*runner, settings)?.pinned(pins);
         Ok(Self {
@@ -88,6 +102,7 @@ impl Engine {
             device,
             plans,
             context,
+            slots,
         })
     }
 
@@ -104,17 +119,26 @@ impl Engine {
         self.runner.device()
     }
 
-    /// Runs one launch. Returns the likeliest token after each row.
-    fn launch(&mut self, span: Span) -> Result<Vec<u32>, Error> {
-        let sizes = span.sizes();
+    /// One launch of `rows`: the likeliest token after each.
+    pub fn step(&mut self, rows: &[Row]) -> Result<Vec<u32>, Error> {
+        if rows.is_empty() {
+            return Err(Error::Size("the rows".into()));
+        }
+        if rows
+            .iter()
+            .any(|r| r.slot as usize >= self.slots || r.position as usize >= self.context)
+        {
+            return Err(Error::Size("a row's slot or position".into()));
+        }
+        let (sizes, feeds) = launch_of(rows, self.slots);
         let (plan, bound) = self
             .plans
             .upto(&self.graph, 0, &sizes, &[Context], &self.device)?;
         let out = plan.outputs[0].slot;
         self.runner.replan(plan)?;
         self.runner.bind_all(&bound);
-        let [tokens, positions] = span.feeds();
-        self.runner.feed(&[tokens.view(), positions.view()])?;
+        let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
+        self.runner.feed(&views)?;
         self.runner.submit(0..self.runner.plan().steps.len())?;
         self.runner.ids(out)
     }
@@ -135,11 +159,13 @@ impl Engine {
                 emit(Event::Done(Reason::Context));
                 return Ok(());
             }
-            let span = Span {
-                past,
-                tokens: &next,
+            let row = |(i, token): (usize, &u32)| Row {
+                slot: 0,
+                token: *token,
+                position: (past + i) as u32,
             };
-            let ids = self.launch(span)?;
+            let rows: Vec<Row> = next.iter().enumerate().map(row).collect();
+            let ids = self.step(&rows)?;
             let id = *ids.last().expect("a row per token");
             if request.stop.contains(&id) {
                 emit(Event::Done(Reason::Stop));

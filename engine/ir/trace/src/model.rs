@@ -96,9 +96,26 @@ impl Model {
             mask,
             scale,
             picked,
+            ragged: false,
         });
         let args: Vec<&Tensor> = [q, k, v].into_iter().chain(keys).collect();
         push(&self.g, op, &args)
+    }
+
+    /// Query rows over kept keys, by slot and position.
+    pub fn attend_rows(
+        &self,
+        scale: f32,
+        [q, k, v]: [&Tensor; 3],
+        [slots, positions]: [&Tensor; 2],
+    ) -> Tensor {
+        let op = Op::Attend(Attend {
+            mask: Mask::Causal,
+            scale,
+            picked: false,
+            ragged: true,
+        });
+        push(&self.g, op, &[q, k, v, slots, positions])
     }
 
     /// Marks the nodes `body` traces as one composite region.
