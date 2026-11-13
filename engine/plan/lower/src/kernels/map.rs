@@ -1,16 +1,27 @@
 //! Generated elementwise kernels, one per chain of stages.
 
 use crate::abi::{Arg, Launch, Shape, Source};
+use crate::form::F32_FORM;
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::Draft;
 use crate::sites;
 use crate::tree::{T, Tree};
 use codegen::hash;
-use codegen::ir::{BinOp, Expr, Intrinsic, Param, Stmt};
+use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
 use codegen::prelude::*;
-use graph::{Act, DType};
+use graph::Act;
 use sim::Load;
+
+/// Adds `count` f32 operands `a0..` to `body`, at `at`.
+pub fn add_operands(body: &mut Body, at: usize, count: usize) {
+    let operand = |k: usize| Param::Buffer {
+        name: format!("a{k}"),
+        form: F32_FORM,
+        writes: false,
+    };
+    body.params.splice(at..at, (0..count).map(operand));
+}
 
 /// One thread per element. The stages follow, then the store.
 #[kernel]
@@ -142,14 +153,8 @@ impl Map {
     /// The skeleton with the stages and the store appended.
     fn tree(&self) -> codegen::ir::Body {
         let mut body = map_ir();
-        let operand = |k: usize| Param::Buffer {
-            name: format!("a{k}"),
-            dtype: DType::F32,
-            writes: false,
-        };
         // The operands sit between the input and the output.
-        body.params
-            .splice(1..1, (0..operands(&self.0)).map(operand));
+        add_operands(&mut body, 1, operands(&self.0));
         let at = || Expr::cast(codegen::ir::Ty::U64, Expr::Call(Intrinsic::Gid, Vec::new()));
         let read = |k: usize| Expr::index(Expr::var(&format!("a{k}")), at());
         body.stmts.extend(stage_stmts(&self.0, &read));

@@ -1,36 +1,55 @@
 //! The `#[kernel]` prelude. Nothing here runs on the host.
 
-use graph::DType;
+use crate::form;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 pub use crate::LANES;
 pub use kernel_macro::kernel;
 
-/// How a buffer stores elements, and what a read gives.
-pub trait Form {
-    const DTYPE: DType;
+/// The register type one element reads into.
+pub trait Elems {
     type Elem: Copy;
+}
+
+/// A buffer whose form the kernel text settles.
+pub trait Form: Elems {
+    const FORM: &'static dyn form::Form;
 }
 
 pub struct F32;
 pub struct Bf16;
 pub struct U32;
+/// A float buffer whose `#[form(..)]` picks the form.
+pub struct Dyn;
 
-impl Form for F32 {
-    const DTYPE: DType = DType::F32;
+impl Elems for F32 {
     type Elem = f32;
 }
 
 /// Reads widen to f32.
-impl Form for Bf16 {
-    const DTYPE: DType = DType::Bf16;
+impl Elems for Bf16 {
     type Elem = f32;
 }
 
-impl Form for U32 {
-    const DTYPE: DType = DType::U32;
+impl Elems for U32 {
     type Elem = u32;
+}
+
+impl Elems for Dyn {
+    type Elem = f32;
+}
+
+impl Form for F32 {
+    const FORM: &'static dyn form::Form = form::F32_FORM;
+}
+
+impl Form for Bf16 {
+    const FORM: &'static dyn form::Form = form::BF16_FORM;
+}
+
+impl Form for U32 {
+    const FORM: &'static dyn form::Form = form::U32_FORM;
 }
 
 /// A float4, loaded or stored in one go.
@@ -54,12 +73,12 @@ fn device() -> ! {
 }
 
 /// A buffer the kernel reads.
-pub struct Buf<F: Form>(PhantomData<F>);
+pub struct Buf<F: Elems>(PhantomData<F>);
 
 /// A buffer the kernel writes.
-pub struct BufMut<F: Form>(PhantomData<F>);
+pub struct BufMut<F: Elems>(PhantomData<F>);
 
-impl<F: Form> Index<u64> for Buf<F> {
+impl<F: Elems> Index<u64> for Buf<F> {
     type Output = F::Elem;
 
     fn index(&self, _: u64) -> &F::Elem {
@@ -67,14 +86,14 @@ impl<F: Form> Index<u64> for Buf<F> {
     }
 }
 
-impl<F: Form> Buf<F> {
+impl<F: Elems> Buf<F> {
     /// Elements `at` to `at + 3`, within one line.
     pub fn load4(&self, _: u64) -> F32x4 {
         device()
     }
 }
 
-impl<F: Form> Index<u64> for BufMut<F> {
+impl<F: Elems> Index<u64> for BufMut<F> {
     type Output = F::Elem;
 
     fn index(&self, _: u64) -> &F::Elem {
@@ -82,13 +101,13 @@ impl<F: Form> Index<u64> for BufMut<F> {
     }
 }
 
-impl<F: Form> IndexMut<u64> for BufMut<F> {
+impl<F: Elems> IndexMut<u64> for BufMut<F> {
     fn index_mut(&mut self, _: u64) -> &mut F::Elem {
         device()
     }
 }
 
-impl<F: Form> BufMut<F> {
+impl<F: Elems> BufMut<F> {
     pub fn load4(&self, _: u64) -> F32x4 {
         device()
     }

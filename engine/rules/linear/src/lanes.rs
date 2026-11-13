@@ -1,10 +1,10 @@
 //! A matmul for few rows, a SIMD group per column.
 
 use codegen::hash;
-use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
+use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use codegen::prelude::*;
-use graph::{DType, Order};
-use lower::kernels::{MapStage, operands, stage_stmts};
+use graph::Order;
+use lower::kernels::{MapStage, add_operands, operands, stage_stmts};
 use lower::sites;
 use lower::{
     Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 thread_local! {
     /// The kernel per row count and form, built once.
-    static TREES: RefCell<HashMap<(usize, bool), Body>> = RefCell::new(HashMap::new());
+    static TREES: RefCell<HashMap<(usize, &'static str), Body>> = RefCell::new(HashMap::new());
 }
 
 /// Elements one wide load brings a lane.
@@ -29,13 +29,14 @@ const ROWS: usize = 32;
 
 /// Lanes sum parts of every row, then the group reduces.
 #[kernel]
-fn linear<const WIDE: u32, const AHEAD: u32, F: Form<Elem = f32>>(
+fn linear<const WIDE: u32, const AHEAD: u32>(
     x: Buf<F32>,
-    w: Buf<F>,
+    #[form(form)] w: Buf<Dyn>,
     out: BufMut<F32>,
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] form: &'static dyn Stored,
 ) {
     let col = gid() / LANES as u32;
     if col >= n {
@@ -92,19 +93,11 @@ impl Lanes {
 
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let build = || match self.form.name() {
-            "bf16" => linear_ir::<WIDE, AHEAD, Bf16>(self.m),
-            _ => linear_ir::<WIDE, AHEAD, F32>(self.m),
-        };
-        let key = (self.m, self.form.name() == "bf16");
+        let build = || linear_ir::<WIDE, AHEAD>(self.m, self.form);
+        let key = (self.m, self.form.name());
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
-        let operand = |a: usize| Param::Buffer {
-            name: format!("a{a}"),
-            dtype: DType::F32,
-            writes: false,
-        };
         // The operands sit between the weights and the output.
-        body.params.splice(2..2, (0..self.others()).map(operand));
+        add_operands(&mut body, 2, self.others());
         body.stmts.push(self.stores());
         body
     }
@@ -145,10 +138,7 @@ impl Lanes {
 
 impl Kernel for Lanes {
     fn name(&self) -> &'static str {
-        match self.form.name() {
-            "bf16" => "lanes_bf16",
-            _ => "lanes",
-        }
+        self.form.suffixed("lanes")
     }
 
     fn sizes(&self) -> Vec<usize> {

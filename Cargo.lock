@@ -181,6 +181,7 @@ version = "0.1.0"
 dependencies = [
  "graph",
  "kernel-macro",
+ "scattered-collect",
  "sim",
 ]
 

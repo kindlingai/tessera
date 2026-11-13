@@ -3,12 +3,14 @@
 mod count;
 mod dialect;
 pub mod exec;
+pub mod form;
 pub mod ir;
 pub mod numerics;
 pub mod prelude;
 mod tile;
 
 pub use dialect::{Dialect, Text, float, hash};
+pub use form::Form;
 pub use kernel_macro::kernel;
 pub use numerics::{Precision, Terms, terms};
 

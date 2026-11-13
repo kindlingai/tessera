@@ -2,10 +2,10 @@
 
 use crate::lanes::{After, finishing};
 use codegen::hash;
-use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
+use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use codegen::prelude::*;
-use graph::{DType, Order};
-use lower::kernels::{operands, stage_stmts};
+use graph::Order;
+use lower::kernels::{add_operands, operands, stage_stmts};
 use lower::sites;
 use lower::{
     Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
@@ -21,8 +21,8 @@ pub struct Schedule {
     pub block: (usize, usize, usize),
     /// How SIMD groups split the block's rows and columns.
     pub simds: (usize, usize),
-    /// Its cost curves' names, for f32 and bf16 weights.
-    pub names: [&'static str; 2],
+    /// Its cost curve's name. The weight form adds a suffix.
+    pub name: &'static str,
 }
 
 /// Every matmul's schedules. `w16` SIMD groups own 16 by 16.
@@ -30,32 +30,32 @@ pub const SCHEDULES: [Schedule; 6] = [
     Schedule {
         block: (64, 64, 32),
         simds: (2, 2),
-        names: ["tiled_64x64", "tiled_64x64_bf16"],
+        name: "tiled_64x64",
     },
     Schedule {
         block: (32, 64, 32),
         simds: (1, 2),
-        names: ["tiled_32x64", "tiled_32x64_bf16"],
+        name: "tiled_32x64",
     },
     Schedule {
         block: (128, 64, 32),
         simds: (4, 2),
-        names: ["tiled_128x64", "tiled_128x64_bf16"],
+        name: "tiled_128x64",
     },
     Schedule {
         block: (64, 128, 32),
         simds: (2, 4),
-        names: ["tiled_64x128", "tiled_64x128_bf16"],
+        name: "tiled_64x128",
     },
     Schedule {
         block: (64, 64, 32),
         simds: (4, 4),
-        names: ["tiled_64x64_w16", "tiled_64x64_w16_bf16"],
+        name: "tiled_64x64_w16",
     },
     Schedule {
         block: (32, 32, 32),
         simds: (2, 2),
-        names: ["tiled_32x32_w16", "tiled_32x32_w16_bf16"],
+        name: "tiled_32x32_w16",
     },
 ];
 
@@ -78,14 +78,15 @@ const WIDE: u32 = 4;
 
 thread_local! {
     /// The kernel per schedule, form and staging, built once.
-    static TREES: RefCell<HashMap<(usize, bool, bool), Body>> = RefCell::new(HashMap::new());
+    static TREES: RefCell<HashMap<(usize, &'static str, bool), Body>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Stages a block of `x` and `w`, then multiplies.
 #[kernel]
-fn tiled<F: Form<Elem = f32>>(
+fn tiled(
     x: Buf<F32>,
-    w: Buf<F>,
+    #[form(form)] w: Buf<Dyn>,
     out: BufMut<F32>,
     m: u32,
     n: u32,
@@ -98,6 +99,7 @@ fn tiled<F: Form<Elem = f32>>(
     #[build] simds_n: u32,
     #[build] threads: u32,
     #[build] wide: bool,
+    #[build] form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     let group = gid() / threads;
@@ -203,25 +205,13 @@ impl Tiled {
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
-            match self.form.name() {
-                "bf16" => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, simds_n, threads, wide),
-                _ => tiled_ir::<F32>(bm, bn, bk, wm, wn, simds_n, threads, wide),
-            }
+            tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, self.form)
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
-        let key = (
-            at.expect("a listed schedule"),
-            self.form.name() == "bf16",
-            wide,
-        );
+        let key = (at.expect("a listed schedule"), self.form.name(), wide);
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
-        let operand = |a: usize| Param::Buffer {
-            name: format!("a{a}"),
-            dtype: DType::F32,
-            writes: false,
-        };
         // The operands sit between the weights and the output.
-        body.params.splice(2..2, (0..self.others()).map(operand));
+        add_operands(&mut body, 2, self.others());
         body.stmts.push(self.stores());
         body
     }
@@ -288,7 +278,7 @@ impl Tiled {
 
 impl Kernel for Tiled {
     fn name(&self) -> &'static str {
-        self.schedule.names[(self.form.name() == "bf16") as usize]
+        self.form.suffixed(self.schedule.name)
     }
 
     fn sizes(&self) -> Vec<usize> {

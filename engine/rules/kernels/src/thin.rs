@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 thread_local! {
     /// The kernel per row count and form, built once.
-    static TREES: RefCell<HashMap<(usize, bool), Body>> = RefCell::new(HashMap::new());
+    static TREES: RefCell<HashMap<(usize, &'static str), Body>> = RefCell::new(HashMap::new());
 }
 
 /// Its row limit: each thread keeps one sum per row.
@@ -28,13 +28,14 @@ pub struct Thin {
 
 /// One thread per column with one sum per row.
 #[kernel]
-fn thin<F: Form<Elem = f32>>(
+fn thin(
     x: Buf<F32>,
-    w: Buf<F>,
+    #[form(form)] w: Buf<Dyn>,
     mut out: BufMut<F32>,
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] form: &'static dyn Stored,
 ) {
     if gid() >= n {
         return;
@@ -56,21 +57,15 @@ fn thin<F: Form<Elem = f32>>(
 
 impl Thin {
     fn tree(&self) -> Body {
-        let build = || match self.form.name() {
-            "bf16" => thin_ir::<Bf16>(self.m),
-            _ => thin_ir::<F32>(self.m),
-        };
-        let key = (self.m, self.form.name() == "bf16");
+        let build = || thin_ir(self.m, self.form);
+        let key = (self.m, self.form.name());
         TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone())
     }
 }
 
 impl Kernel for Thin {
     fn name(&self) -> &'static str {
-        match self.form.name() {
-            "bf16" => "thin_bf16",
-            _ => "thin",
-        }
+        self.form.suffixed("thin")
     }
 
     /// One thread per column loops over all of `k`.

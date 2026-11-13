@@ -27,7 +27,7 @@ fn toy(device: &Device) -> (Graph, Plan) {
 
 /// The device with every tiled schedule barred.
 fn untiled(device: Device) -> Device {
-    let names = SCHEDULES.iter().flat_map(|s| s.names);
+    let names = SCHEDULES.iter().map(|s| s.name);
     names.fold(device, Device::without)
 }
 
