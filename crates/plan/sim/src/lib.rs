@@ -61,6 +61,14 @@ pub struct Ops {
     pub stores: f64,
     /// The share of loads that open a new cache line.
     pub fresh: f64,
+    /// Bytes one load brings. Zero means a float.
+    pub width: f64,
+}
+
+impl Ops {
+    pub fn width(&self) -> f64 {
+        if self.width > 0.0 { self.width } else { WORD }
+    }
 }
 
 /// A launch, as the work and traffic it causes.
@@ -87,7 +95,7 @@ impl Load {
 
     /// Bytes all loads bring. Shared buffers count per load.
     pub fn loaded(&self) -> f64 {
-        self.threads as f64 * self.trips * self.trip.loads * WORD
+        self.threads as f64 * self.trips * self.trip.loads * self.trip.width()
     }
 }
 

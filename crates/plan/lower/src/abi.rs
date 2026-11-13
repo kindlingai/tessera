@@ -1,7 +1,7 @@
 //! What a kernel declares: its arguments, shape and source.
 
-use crate::emit::{Dialect, Text, hash};
 use crate::plan::Slot;
+use codegen::{Dialect, Text, hash};
 
 /// One kernel argument, in the order its source declares.
 #[derive(Clone, Debug, PartialEq)]

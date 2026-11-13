@@ -1,0 +1,11 @@
+[package]
+name = "codegen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Generates kernel text for every dialect, and counts what it costs"
+
+[dependencies]
+graph = { workspace = true }
+sim = { workspace = true }

@@ -12,6 +12,7 @@ cuda = ["lower/cuda"]
 rocm = ["lower/rocm"]
 
 [dependencies]
+codegen = { workspace = true }
 graph = { workspace = true }
 lower = { workspace = true }
 

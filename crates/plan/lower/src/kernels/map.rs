@@ -1,11 +1,11 @@
 //! Generated elementwise kernels, one per chain of stages.
 
 use crate::abi::{Arg, Launch, Shape, Source};
-use crate::emit::{Text, float, hash};
 use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use crate::tree::{T, Tree};
+use codegen::{Text, float, hash};
 use graph::Act;
 use sim::{Load, Ops};
 use std::fmt::Write;
@@ -79,6 +79,7 @@ impl Kernel for Map {
             loads: inputs as f64,
             stores: 1.0,
             fresh: 1.0,
+            width: 0.0,
         };
         Some(Load {
             threads: len,

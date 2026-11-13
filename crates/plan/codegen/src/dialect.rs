@@ -32,6 +32,11 @@ typedef unsigned short u16;
 #define f_sin(x) precise::sin(x)
 #define f_bits(x) as_type<float>(x)
 #define f_rsqrt(x) rsqrt(x)
+#define f_shfl_xor(v, m) simd_shuffle_xor(v, m)
+#define f_barrier() threadgroup_barrier(mem_flags::mem_threadgroup)
+#define f_group(ty, name, n) threadgroup ty name[n]
+#define f_f32x4(p) (*(device float4 *)(p))
+#define f_u32x2(p) (*(device const uint2 *)(p))
 
 ";
 
@@ -47,6 +52,15 @@ typedef unsigned short u16;
 #define f_sin(x) sinf(x)
 #define f_bits(x) __uint_as_float(x)
 #define f_rsqrt(x) rsqrtf(x)
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#define f_shfl_xor(v, m) __shfl_xor(v, m)
+#else
+#define f_shfl_xor(v, m) __shfl_xor_sync(0xffffffffu, v, m)
+#endif
+#define f_barrier() __syncthreads()
+#define f_group(ty, name, n) __shared__ ty name[n]
+#define f_f32x4(p) (*(float4 *)(p))
+#define f_u32x2(p) (*(const uint2 *)(p))
 
 ";
 
@@ -68,13 +82,15 @@ impl Text {
                 false => format!("{ty} {name}"),
             });
         }
+        // Bodies get `gid` and `lid`, the index in the group.
         let (head, kind, index) = match metal {
             true => {
                 params.push("u32 gid [[thread_position_in_grid]]".into());
+                params.push("u32 lid [[thread_index_in_threadgroup]]".into());
                 (METAL, "kernel void", "")
             }
             false => {
-                let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n";
+                let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
                 (CUDA, "extern \"C\" __global__ void", index)
             }
         };
