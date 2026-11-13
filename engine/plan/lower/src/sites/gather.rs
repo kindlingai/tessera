@@ -1,6 +1,6 @@
 use super::Pattern;
+use crate::form::Form;
 use crate::tree::{T, Term, Tree};
-use graph::DType;
 
 /// Rows of `table` picked by `ids`.
 #[derive(Clone, Copy, Debug)]
@@ -9,7 +9,7 @@ pub struct Gather {
     pub ids: T,
     pub rows: usize,
     pub width: usize,
-    pub form: DType,
+    pub form: &'static dyn Form,
 }
 
 impl Pattern for Gather {

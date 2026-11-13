@@ -9,7 +9,7 @@ mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
 mod extent;
-mod form;
+pub mod form;
 mod kernel;
 pub mod kernels;
 #[cfg(target_os = "macos")]
@@ -30,7 +30,7 @@ pub use codegen::{Dialect, LANES, Precision, Terms, Text, float, hash, terms};
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use extent::Extent;
-pub use form::{Pins, Stored};
+pub use form::{Form, Pins};
 pub use gpukit::{Limits, Pick, Settings};
 pub use kernel::{Kernel, KernelRef, Needs};
 pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};

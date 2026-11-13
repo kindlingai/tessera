@@ -10,9 +10,10 @@ use interp::{Tensor, run};
 mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
 use linear::{SCHEDULES, Schedule};
+use lower::form::{BF16_FORM, F32_FORM};
 use lower::{Device, Dialect, Pins, Source, lower, open, round, rules};
 use settings::read as settings;
-use trace::{Act, DType};
+use trace::Act;
 
 /// A device that can only choose schedule `at`.
 fn only(at: usize) -> Device {
@@ -62,10 +63,10 @@ fn tiles_match_cpu() {
         let (m, n, k) = (*m, *n, *k);
         let g = linear(k, n);
         let x = noise(vec![m as usize, k as usize], &mut draws);
-        for form in [DType::F32, DType::Bf16] {
+        for form in [F32_FORM, BF16_FORM] {
             // The reference sees the weights as the kernel stores them.
             let w = noise(vec![n as usize, k as usize], &mut draws);
-            let rounded = w.floats().unwrap().iter().map(|x| round(form, *x));
+            let rounded = w.floats().unwrap().iter().map(|x| round(form.dtype(), *x));
             let weights = [Tensor::f32(w.shape.clone(), rounded.collect())];
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
             for ((at, schedule), settings) in SCHEDULES.iter().enumerate().zip(runs.iter().cycle())
@@ -73,7 +74,7 @@ fn tiles_match_cpu() {
                 let device = only(at).pinned(Pins::all(form));
                 let plan = lower(&g, 0, &[(Rows, m)], &device).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-                let name = schedule.names[(form == DType::Bf16) as usize];
+                let name = schedule.names[(form.name() == "bf16") as usize];
                 assert_eq!(names, [name]);
                 let terms = terms(&plan);
                 let mut runner = open(plan, settings).unwrap();

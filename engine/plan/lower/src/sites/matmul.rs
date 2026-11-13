@@ -1,6 +1,6 @@
 use super::Pattern;
+use crate::form::Form;
 use crate::tree::{T, Term, Tree};
-use graph::DType;
 
 /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
 #[derive(Clone, Copy, Debug)]
@@ -10,7 +10,7 @@ pub struct Matmul {
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub form: DType,
+    pub form: &'static dyn Form,
 }
 
 impl Pattern for Matmul {

@@ -7,7 +7,9 @@ use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{operands, stage_stmts};
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, Stored, T, Tree};
+use lower::{
+    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -175,7 +177,7 @@ pub struct Tiled {
     pub m: usize,
     pub n: usize,
     pub k: usize,
-    pub form: DType,
+    pub form: &'static dyn Stored,
     pub schedule: Schedule,
     pub after: After,
 }
@@ -201,15 +203,15 @@ impl Tiled {
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
-            match self.form {
-                DType::Bf16 => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, simds_n, threads, wide),
+            match self.form.name() {
+                "bf16" => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, simds_n, threads, wide),
                 _ => tiled_ir::<F32>(bm, bn, bk, wm, wn, simds_n, threads, wide),
             }
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
         let key = (
             at.expect("a listed schedule"),
-            self.form == DType::Bf16,
+            self.form.name() == "bf16",
             wide,
         );
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
@@ -286,7 +288,7 @@ impl Tiled {
 
 impl Kernel for Tiled {
     fn name(&self) -> &'static str {
-        self.schedule.names[(self.form == DType::Bf16) as usize]
+        self.schedule.names[(self.form.name() == "bf16") as usize]
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -305,7 +307,7 @@ impl Kernel for Tiled {
         // Each operand is re-read once per group across it.
         let mut reads = vec![
             4.0 * m * k * gn as f64,
-            self.form.bytes() as f64 * n * k * gm as f64,
+            self.form.bytes(self.n * self.k) as f64 * gm as f64,
         ];
         reads.extend((0..self.others()).map(|_| 4.0 * m * n));
         Some(Load {
@@ -349,7 +351,7 @@ impl Kernel for Tiled {
         1e-9
     }
 
-    fn accepts(&self, input: usize, form: DType) -> bool {
+    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
         self.form.taken(input, 1, form)
     }
 

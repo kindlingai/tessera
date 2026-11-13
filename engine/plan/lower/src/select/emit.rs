@@ -1,14 +1,14 @@
 //! Writes the chosen covers as ops over values.
 
 use crate::Error;
-use crate::form::Stored;
+use crate::form::{self, Form};
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{Move, Scatter, Widen};
 use crate::rule::Draft;
 use crate::select::cover::EDGE;
 use crate::select::{Home, Op, Selected, Val, Value};
 use crate::tree::{T, Tree, unsupported};
-use graph::{DType, DimExpr, NodeId};
+use graph::{DimExpr, NodeId};
 use std::collections::HashMap;
 
 /// The ops written, and the values they use.
@@ -24,12 +24,18 @@ pub(crate) struct Emit {
 }
 
 impl Emit {
-    pub(crate) fn value(&mut self, len: usize, home: Home, zone: u32, dtype: DType) -> Val {
+    pub(crate) fn value(
+        &mut self,
+        len: usize,
+        home: Home,
+        zone: u32,
+        form: &'static dyn Form,
+    ) -> Val {
         self.out.values.push(Value {
             len,
             home,
             zone,
-            dtype,
+            form,
         });
         Val(self.out.values.len() as u32 - 1)
     }
@@ -46,8 +52,8 @@ impl Emit {
         if let Some(copy) = self.moved.get(&(v, zone)) {
             return *copy;
         }
-        let (len, dtype) = (self.len(v), self.out.values[v.0 as usize].dtype);
-        let write = self.value(len, Home::Temp, zone, dtype);
+        let (len, form) = (self.len(v), self.out.values[v.0 as usize].form);
+        let write = self.value(len, Home::Temp, zone, form);
         self.out.ops.push(Op {
             kernel: KernelRef::new(Move { len }),
             rule: "move",
@@ -63,17 +69,17 @@ impl Emit {
     /// The value as floats, unless `k` reads it as stored.
     fn widen(&mut self, v: Val, input: usize, k: &dyn Kernel) -> Val {
         let Value {
-            len, zone, dtype, ..
+            len, zone, form, ..
         } = self.out.values[v.0 as usize];
-        if !dtype.narrow() || k.accepts(input, dtype) {
+        if !form.narrow() || k.accepts(input, form) {
             return v;
         }
         if let Some(wide) = self.widened.get(&v) {
             return *wide;
         }
-        let write = self.value(len, Home::Temp, zone, DType::F32);
+        let write = self.value(len, Home::Temp, zone, form::F32_FORM);
         self.out.ops.push(Op {
-            kernel: KernelRef::new(Widen { len, form: dtype }),
+            kernel: KernelRef::new(Widen { len, form }),
             rule: "widen",
             reads: vec![v],
             write,
@@ -92,7 +98,7 @@ impl Emit {
         reads: Vec<Val>,
         covers: &[NodeId],
         zone: u32,
-        dtype: DType,
+        form: &'static dyn Form,
     ) -> Val {
         let mut taken = Vec::with_capacity(reads.len());
         for (i, v) in reads.into_iter().enumerate() {
@@ -108,7 +114,7 @@ impl Emit {
         if let Some(same) = key.as_ref().and_then(|k| self.shared.get(k)) {
             return *same;
         }
-        let write = self.value(d.len, Home::Temp, zone, dtype);
+        let write = self.value(d.len, Home::Temp, zone, form);
         if let Some(key) = key {
             self.shared.insert(key, write);
         }
@@ -141,7 +147,7 @@ impl Emit {
         let width: usize = all[2..].iter().product();
         let room = all[0] * stride * width;
         let len: usize = all.iter().product();
-        let write = self.value(len, Home::Kept { index, room }, EDGE, DType::F32);
+        let write = self.value(len, Home::Kept { index, room }, EDGE, form::F32_FORM);
         let [rows, slots, positions] = args.map(|v| self.bring(v, EDGE));
         let kernel = Scatter {
             rows: self.len(rows) / width,

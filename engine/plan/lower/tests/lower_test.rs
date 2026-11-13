@@ -5,6 +5,7 @@ use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
 use kernels::Thin;
 use linear::SCHEDULES;
+use lower::form::{BF16_FORM, F32_FORM};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
 use lower::{
@@ -240,7 +241,7 @@ fn thin(m: usize) -> Step {
             m,
             n,
             k,
-            form: DType::F32,
+            form: lower::form::F32_FORM,
         }),
         rule: "thin",
         reads: Vec::new(),
@@ -377,26 +378,26 @@ fn pins_match_paths() {
         let seg = |p: &str| p.parse().map_or(Field(p.into()), Index);
         s.split('.').map(seg).collect()
     };
-    let pins = Pins::all(DType::Bf16)
-        .pin("embed", DType::F32)
-        .pin("layers.*.ln*", DType::F32)
-        .pin("layers.1.*", DType::Bf16);
-    assert_eq!(pins.form(&path("embed")), DType::F32);
-    assert_eq!(pins.form(&path("layers.0.ln1")), DType::F32);
-    assert_eq!(pins.form(&path("layers.0.q")), DType::Bf16);
-    assert_eq!(
-        pins.form(&path("layers.1.ln1")),
-        DType::Bf16,
-        "the last pin wins"
-    );
-    assert_eq!(pins.form(&path("norm")), DType::Bf16);
-    assert_eq!(Pins::default().form(&path("layers.0.q")), DType::F32);
+    let pins = Pins::all(BF16_FORM)
+        .pin("embed", F32_FORM)
+        .pin("layers.*.ln*", F32_FORM)
+        .pin("layers.1.*", BF16_FORM);
+    let form = |p: &str| pins.form(&path(p)).name();
+    assert_eq!(form("embed"), "f32");
+    assert_eq!(form("layers.0.ln1"), "f32");
+    assert_eq!(form("layers.0.q"), "bf16");
+    assert_eq!(form("layers.1.ln1"), "bf16", "the last pin wins");
+    assert_eq!(form("norm"), "bf16");
+    assert_eq!(Pins::default().form(&path("layers.0.q")).name(), "f32");
+    // Pins round trip through their names.
+    let text = serde_json::to_string(&pins).unwrap();
+    assert_eq!(serde_json::from_str::<Pins>(&text).unwrap(), pins);
 }
 
 #[test]
 fn pinned_weights_narrow() {
     let g = program(&Config::toy(4, 16));
-    let pins = Pins::all(DType::Bf16).pin("embed", DType::F32);
+    let pins = Pins::all(BF16_FORM).pin("embed", F32_FORM);
     let plan = lower(&g, 0, &SIZES, &Device::guess(&settings()).pinned(pins)).unwrap();
     for l in &plan.weights {
         let embed = l.weight == 0;
@@ -476,7 +477,7 @@ fn trips_are_counted() {
         m: 3,
         n: 8,
         k: 64,
-        form: graph::DType::F32,
+        form: lower::form::F32_FORM,
     });
     assert_eq!((thin.loads, thin.float), (4.0, 3.0));
     assert!((thin.fresh - 1.0 / 16.0).abs() < 1e-9, "{thin:?}");
