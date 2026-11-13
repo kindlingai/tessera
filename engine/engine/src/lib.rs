@@ -4,7 +4,7 @@
 use kernels as _;
 use linear as _;
 
-use graph::DimName::{Context, Rows, Seqs};
+use graph::DimName::{Context, Rows, Segments, Seqs};
 use graph::Graph;
 use interp::Tensor;
 use lower::{Cache, Device, Error, Recipe, Run, Settings, open};
@@ -56,12 +56,16 @@ pub struct Row {
 }
 
 /// The sizes and inputs one launch of `rows` needs.
-fn launch_of(rows: &[Row], slots: usize) -> ([(graph::DimName, u64); 3], [Tensor; 3]) {
+fn launch_of(rows: &[Row], slots: usize) -> ([(graph::DimName, u64); 4], [Tensor; 3]) {
     let furthest = rows.iter().map(|r| r.position).max().unwrap_or(0);
+    let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
+    seen.sort_unstable();
+    seen.dedup();
     let sizes = [
         (Seqs, slots as u64),
         (Rows, rows.len() as u64),
         (Context, furthest as u64 + 1),
+        (Segments, seen.len() as u64),
     ];
     let shape = vec![rows.len()];
     let column = |of: fn(&Row) -> u32| Tensor::u32(shape.clone(), rows.iter().map(of).collect());
@@ -141,9 +145,9 @@ impl Engine {
             return Err(Error::Size("a row's slot or position".into()));
         }
         let (sizes, feeds) = launch_of(rows, self.slots);
-        let (plan, bound) = self
-            .plans
-            .upto(&self.graph, 0, &sizes, &[Context], &self.device)?;
+        let (plan, bound) =
+            self.plans
+                .upto(&self.graph, 0, &sizes, &[Context, Segments], &self.device)?;
         let out = plan.outputs[0].slot;
         self.runner.replan(plan)?;
         self.runner.bind_all(&bound);

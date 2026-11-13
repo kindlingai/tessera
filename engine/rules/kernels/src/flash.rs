@@ -540,16 +540,17 @@ impl Kernel for FlashRows {
         self.0.sizes()
     }
 
-    /// One launch. The passes a block takes are unknown here.
+    /// One launch. A block streams keys once per slot.
     fn load(&self, len: usize) -> Option<Load> {
         let a = &self.0;
         let (keys, side) = (a.keys.most() as f64, (a.kv_heads * a.width) as f64);
         let blocks = a.queries.div_ceil(BQ as usize) as f64;
-        let streamed = 4.0 * keys * side * blocks;
+        let passes = a.segments.min(BQ as usize) as f64;
+        let streamed = 4.0 * keys * side * blocks * passes;
         Some(Load {
             threads: self.groups() * THREADS as usize,
             group: THREADS as usize,
-            trips: keys / BK as f64,
+            trips: passes * keys / BK as f64,
             trip: self.tree().trip(),
             reads: vec![4.0 * len as f64, streamed, streamed],
             written: 4.0 * len as f64,
@@ -577,7 +578,8 @@ impl Kernel for FlashRows {
 
     fn work(&self, _: usize) -> f64 {
         let a = &self.0;
-        (a.heads * a.queries * a.keys.most() * a.width) as f64
+        let passes = a.segments.min(BQ as usize);
+        (a.heads * a.queries * a.keys.most() * a.width * passes) as f64
     }
 
     /// Q, the K and V slot, P, sums, seen counts.
