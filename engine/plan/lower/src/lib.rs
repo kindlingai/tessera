@@ -32,7 +32,7 @@ pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use extent::Extent;
 pub use form::{Form, Pins};
-pub use gpukit::{Limits, Pick, Settings};
+pub use gpukit::{Limits, Pick, Platform, Settings};
 pub use kernel::{Kernel, KernelRef, Needs};
 pub use mem::{Buffer, DType, Tensor, View, ViewMut};
 pub use plan::{Loaded, Output, Plan, Slot, Step};

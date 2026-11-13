@@ -144,7 +144,7 @@ fn reference(dir: &Path) -> Result<(Vec<u32>, Vec<u32>), Failure> {
 
 fn evaluate(args: &Args) -> Result<Report, Failure> {
     let slots = args.m.iter().copied().max().unwrap_or(1) as u64;
-    let loaded = hf::load(&args.model, slots, args.context as u64)?;
+    let loaded = bundle::load(&args.model, slots, args.context as u64)?;
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {

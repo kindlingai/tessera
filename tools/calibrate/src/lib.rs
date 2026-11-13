@@ -41,8 +41,8 @@ pub fn measure(
     device: &mut Device,
     settings: &Settings,
 ) -> Result<Vec<(Step, f64)>, Error> {
-    if device.limits != runner.limits() {
-        *device = device.clone().within(runner.limits());
+    if device.platform != runner.platform() {
+        *device = device.clone().on(runner.platform());
     }
     // The same pins, or the weights would load again.
     let pins = device.pins.clone();

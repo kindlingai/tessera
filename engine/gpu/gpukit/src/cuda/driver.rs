@@ -21,6 +21,10 @@ pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 8;
 pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const CU_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 18;
+pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
+pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
 pub const CU_STREAM_NON_BLOCKING: u32 = 1;
 pub const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 1;
 
@@ -50,6 +54,7 @@ pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 const DRIVER_LIB: &str = "libcuda.so.1";
 
 type CuInit = unsafe extern "C" fn(u32) -> CUresult;
+type CuDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> CUresult;
 type CuDeviceGetCount = unsafe extern "C" fn(*mut c_int) -> CUresult;
 type CuDeviceGet = unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult;
 type CuDeviceGetName = unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult;
@@ -102,6 +107,7 @@ type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CU
 /// Resolved driver entry points. The dlopen handle stays open.
 pub struct Driver {
     pub cu_init: CuInit,
+    pub cu_driver_get_version: CuDriverGetVersion,
     pub cu_device_get_count: CuDeviceGetCount,
     pub cu_device_get: CuDeviceGet,
     pub cu_device_get_name: CuDeviceGetName,
@@ -146,6 +152,7 @@ impl Driver {
             Library::open_first(&[DRIVER_LIB.into()]).map_err(|e| format!("cannot load {e}"))?;
         Ok(Driver {
             cu_init: sym!(lib, "cuInit", CuInit),
+            cu_driver_get_version: sym!(lib, "cuDriverGetVersion", CuDriverGetVersion),
             cu_device_get_count: sym!(lib, "cuDeviceGetCount", CuDeviceGetCount),
             cu_device_get: sym!(lib, "cuDeviceGet", CuDeviceGet),
             cu_device_get_name: sym!(lib, "cuDeviceGetName", CuDeviceGetName),

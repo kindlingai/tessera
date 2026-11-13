@@ -44,7 +44,7 @@ struct Generation {
     eos_token_id: Option<Ids>,
 }
 
-pub struct Loaded {
+pub struct Bundle {
     pub graph: Graph,
     pub weights: Vec<Tensor>,
     pub tokenizer: Tokenizer,
@@ -54,7 +54,7 @@ pub struct Loaded {
 }
 
 /// Reads a Qwen3 directory: `slots` sequences of `context` rows.
-pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Loaded, Box<dyn Error + Send + Sync>> {
+pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let hf: HfConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     if hf.model_type != "qwen3" {
         return Err(format!("{} is not a model this engine traces", hf.model_type).into());
@@ -91,7 +91,7 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Loaded, Box<dyn Erro
         },
         Err(_) => Vec::new(),
     };
-    Ok(Loaded {
+    Ok(Bundle {
         graph,
         weights,
         tokenizer,
