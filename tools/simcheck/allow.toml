@@ -7,4 +7,5 @@ pairs = [
     ["engine/rules/kernels/src/thin.rs", "engine/rules/linear/src/lanes.rs"],
     # Whole and ragged attention share the online softmax. Kernels cannot call each other.
     ["engine/rules/kernels/src/attend.rs", "engine/rules/kernels/src/attend.rs"],
+    ["engine/rules/kernels/src/flash.rs", "engine/rules/kernels/src/flash.rs"],
 ]
