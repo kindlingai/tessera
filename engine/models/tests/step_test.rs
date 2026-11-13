@@ -8,7 +8,7 @@ use interp::{Store, Tensor, run, run_kept};
 use lower::{Device, Run, lower, open, rules};
 use models::qwen3::{Config, program, stepper};
 use settings::read as settings;
-use trace::DimName::{Context, Rows, Seqs};
+use trace::DimName::{Context, Rows, Segments, Seqs};
 use trace::Graph;
 
 const SEQS: usize = 2;
@@ -126,10 +126,14 @@ fn launch(
         .max()
         .copied()
         .unwrap_or(0);
+    let mut slots = inputs[2].indices().unwrap().to_vec();
+    slots.sort_unstable();
+    slots.dedup();
     let sizes = [
         (Seqs, SEQS as u64),
         (Rows, rows as u64),
         (Context, furthest as u64 + 1),
+        (Segments, slots.len() as u64),
     ];
     let plan = lower(g, 0, &sizes, device).unwrap();
     let [ids, logits] = [plan.outputs[0].slot, plan.outputs[1].slot];

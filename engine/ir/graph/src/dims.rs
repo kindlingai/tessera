@@ -11,6 +11,8 @@ pub enum DimName {
     Seqs,
     Rows,
     Context,
+    /// Slots one launch's rows span. A size with no axis.
+    Segments,
     /// Length of a learned position table.
     Positions,
     Hidden,

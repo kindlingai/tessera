@@ -5,7 +5,7 @@ use kernels as _;
 use linear as _;
 
 use gpukit::testing::{Noise, max_abs_diff};
-use graph::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Seqs};
+use graph::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Segments, Seqs};
 use graph::{DType, Dim, Graph, Size, TensorType};
 use interp::{Store, Tensor, run, run_kept};
 use lower::{Device, Run, lower, open};
@@ -151,7 +151,12 @@ fn ragged_rows_match_cpu() {
                     Tensor::u32(vec![n], positions),
                 ];
                 let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
-                let sizes = [(Seqs, 4), (Rows, n as u64), (Context, furthest)];
+                let sizes = [
+                    (Seqs, 4),
+                    (Rows, n as u64),
+                    (Context, furthest),
+                    (Segments, runs.len() as u64),
+                ];
                 let device = Device::guess(&settings()).favoring(favored);
                 let plan = lower(&g, 0, &sizes, &device).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();

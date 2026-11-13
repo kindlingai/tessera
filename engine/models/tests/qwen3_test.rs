@@ -8,7 +8,7 @@ use lower::{Cache, DType, Device, Pins, Plan, Run, Settings, View, lower, open, 
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
-use trace::DimName::{self, Context, Rows, Seqs};
+use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
 
 /// The interpreter only ever sees the JSON text.
@@ -128,9 +128,14 @@ struct Span<'a> {
 
 impl Span<'_> {
     /// Sizes for either entry: the forward one ignores `Rows`.
-    fn sizes(&self) -> [(DimName, u64); 3] {
+    fn sizes(&self) -> [(DimName, u64); 4] {
         let (rows, all) = (self.tokens.len(), self.past + self.tokens.len());
-        [(Seqs, 1), (Rows, rows as u64), (Context, all as u64)]
+        [
+            (Seqs, 1),
+            (Rows, rows as u64),
+            (Context, all as u64),
+            (Segments, 1),
+        ]
     }
 
     fn positions(&self) -> Vec<u32> {

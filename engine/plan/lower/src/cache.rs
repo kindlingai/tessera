@@ -60,6 +60,8 @@ impl Cache {
     ) -> Result<(&Plan, Bound), Error> {
         let mut bound = Vec::with_capacity(upto.len());
         let bucket = |(name, n): &(DimName, u64)| match upto.contains(name) {
+            // Segment counts start at one, contexts at the least plan.
+            true if *name == DimName::Segments => (*name, n.next_power_of_two()),
             true => (*name, n.next_power_of_two().max(LEAST)),
             false => (*name, *n),
         };
