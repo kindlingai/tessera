@@ -10,7 +10,7 @@ use interp::{Tensor, run};
 mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
 use linear::{SCHEDULES, Schedule};
-use lower::form::{BF16_FORM, F32_FORM};
+use lower::form::FORMS;
 use lower::{Device, Dialect, Pins, Source, lower, open, rules};
 use settings::read as settings;
 use trace::Act;
@@ -19,7 +19,7 @@ use trace::Act;
 fn only(at: usize) -> Device {
     let others = SCHEDULES.iter().enumerate().filter(|(i, _)| *i != at);
     let bar = |d: Device, (_, s): (usize, &Schedule)| {
-        d.without(s.name).without(BF16_FORM.suffixed(s.name))
+        FORMS.iter().fold(d, |d, f| d.without(f.suffixed(s.name)))
     };
     others.fold(Device::guess(&settings()).favoring("tiled"), bar)
 }
@@ -65,11 +65,11 @@ fn tiles_match_cpu() {
         let (m, n, k) = (*m, *n, *k);
         let g = linear(k, n);
         let x = noise(vec![m as usize, k as usize], &mut draws);
-        for form in [F32_FORM, BF16_FORM] {
+        for form in common::forms(k as usize) {
             // The reference sees the weights as the kernel stores them.
             let w = noise(vec![n as usize, k as usize], &mut draws);
-            let rounded = w.floats().unwrap().iter().map(|x| form.round(*x));
-            let weights = [Tensor::f32(w.shape.clone(), rounded.collect())];
+            let rounded = form.roundtrip(w.floats().unwrap());
+            let weights = [Tensor::f32(w.shape.clone(), rounded)];
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
             for ((at, schedule), settings) in SCHEDULES.iter().enumerate().zip(runs.iter().cycle())
             {

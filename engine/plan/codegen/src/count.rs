@@ -184,7 +184,7 @@ impl Counter {
                     // The compiler loads a repeated element once.
                     if !self.seen.contains(e) {
                         self.seen.push(e.clone());
-                        self.load(at, form.bytes(1) as f64);
+                        self.load(at, form.element_bytes());
                     }
                 } else if matches!(&**base, Expr::Var(n) if self.shared.contains(n)) {
                     self.add(Ops {
@@ -242,7 +242,7 @@ impl Counter {
                         true
                     }
                     Intrinsic::Load4 => {
-                        let bytes = self.global(&args[0]).map_or(4, |f| f.bytes(1)) as f64;
+                        let bytes = self.global(&args[0]).map_or(4.0, |f| f.element_bytes());
                         let (at, mut l) = (&args[1], self.loops.pop());
                         // Four elements move the address by one of them.
                         let fresh = match &mut l {

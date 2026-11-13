@@ -70,6 +70,11 @@ macro_rules! minifloat {
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name(pub $repr);
 
+        impl $name {
+            pub const EXPONENT: u32 = $e;
+            pub const MANTISSA: u32 = $m;
+        }
+
         impl From<f32> for $name {
             fn from(x: f32) -> Self {
                 $name(Format::<$e, $m, $inf, $nan>::narrow(x) as $repr)

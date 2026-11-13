@@ -86,3 +86,14 @@ pub fn terms(plan: &Plan) -> Terms {
     }
     lower::terms(&body, &params).expect("every loop bound is a parameter")
 }
+
+/// Every weight form whose blocks fit rows of `k`.
+pub fn forms(k: usize) -> Vec<&'static dyn lower::Form> {
+    let fits = |f: &&&dyn lower::Form| k.is_multiple_of(f.align());
+    lower::form::FORMS
+        .iter()
+        .filter(fits)
+        .copied()
+        .filter(|f| f.dtype().is_float())
+        .collect()
+}

@@ -69,7 +69,7 @@ impl Runner {
                             buffers.len() - 1
                         }
                     };
-                    let skip = slot.start() / form.bytes(1) + skip;
+                    let skip = form.elements(slot.start()) + skip;
                     ArgVal::Buf {
                         at,
                         skip,

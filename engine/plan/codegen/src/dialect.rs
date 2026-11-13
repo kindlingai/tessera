@@ -14,6 +14,8 @@ pub struct Text {
     pub buffers: Vec<(String, &'static str, bool)>,
     /// Name and type, bound after the buffers.
     pub scalars: Vec<(&'static str, &'static str)>,
+    /// Functions the body calls, each once.
+    pub headers: Vec<String>,
     pub body: String,
 }
 
@@ -23,6 +25,9 @@ using namespace metal;
 typedef unsigned int u32;
 typedef unsigned long u64;
 typedef unsigned short u16;
+typedef unsigned char u8;
+#define f_const(ty) device const ty *
+#define f_fn static inline
 #define f_exp(x) exp(x)
 #define f_tanh(x) tanh(x)
 #define f_max(a, b) max(a, b)
@@ -44,6 +49,9 @@ typedef unsigned short u16;
 const CUDA: &str = "typedef unsigned int u32;
 typedef unsigned long long u64;
 typedef unsigned short u16;
+typedef unsigned char u8;
+#define f_const(ty) const ty *
+#define f_fn static __device__ inline
 #define f_exp(x) expf(x)
 #define f_tanh(x) tanhf(x)
 #define f_max(a, b) fmaxf(a, b)
@@ -98,7 +106,8 @@ impl Text {
             }
         };
         let (entry, params, body) = (&self.entry, params.join(",\n    "), &self.body);
-        format!("{head}{kind} {entry}(\n    {params}\n) {{\n{index}{body}}}\n")
+        let headers = self.headers.concat();
+        format!("{head}{headers}{kind} {entry}(\n    {params}\n) {{\n{index}{body}}}\n")
     }
 }
 

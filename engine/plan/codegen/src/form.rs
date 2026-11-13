@@ -45,9 +45,30 @@ pub trait Form: Sync {
         self.block()
     }
 
-    /// `x` as this form keeps it.
-    fn round(&self, x: f32) -> f32 {
-        self.unpack(&self.pack(&[x]), 0)
+    /// `data` as this form keeps it.
+    fn roundtrip(&self, data: &[f32]) -> Vec<f32> {
+        let packed = self.pack(data);
+        (0..data.len()).map(|i| self.unpack(&packed, i)).collect()
+    }
+
+    /// Kernel functions `load` calls, each defined once.
+    fn header(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Bytes one element takes, averaged over a block.
+    fn element_bytes(&self) -> f64 {
+        self.dtype().bytes() as f64
+    }
+
+    /// The byte at which element `index` starts.
+    fn offset(&self, index: usize) -> usize {
+        index * self.dtype().bytes()
+    }
+
+    /// The element starting at byte `offset`.
+    fn elements(&self, offset: usize) -> usize {
+        offset / self.dtype().bytes()
     }
 
     /// Kernel text: elements `index` to `index + 3` as a `wide()`.

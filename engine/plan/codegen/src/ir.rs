@@ -739,11 +739,17 @@ impl Body {
             params: &self.params,
         };
         let (mut buffers, mut scalars) = (Vec::new(), Vec::new());
+        let mut headers: Vec<String> = Vec::new();
         for param in p.params {
             match param {
                 Param::Buffer { name, form, writes } => {
                     p.bind(name, Kind::Buffer(*form));
                     buffers.push((name.clone(), form.ty(), *writes));
+                    for h in form.header() {
+                        if !headers.contains(&h) {
+                            headers.push(h);
+                        }
+                    }
                 }
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
@@ -762,6 +768,7 @@ impl Body {
             entry: self.entry.clone(),
             buffers,
             scalars,
+            headers,
             body: lines.join("\n") + "\n",
         }
     }
