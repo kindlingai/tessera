@@ -4,7 +4,7 @@ use engine::{Engine, Event, Reason, Request, Row};
 use gpukit::testing::Noise;
 use graph::Graph;
 use interp::{Store, Tensor, run_kept};
-use lower::Pins;
+use lower::Recipe;
 use models::qwen3::{Config, stepper};
 
 fn weights(g: &Graph, noise: &mut Noise) -> Vec<Tensor> {
@@ -58,7 +58,8 @@ fn open(seed: u64, slots: u64) -> (Graph, Vec<Tensor>, Engine) {
     let c = Config::toy(slots, 16);
     let g = stepper(&c);
     let weights = weights(&g, &mut Noise(seed));
-    let mut engine = Engine::open(stepper(&c), 16, Pins::default(), &settings::read()).unwrap();
+    let recipe = Recipe::default();
+    let mut engine = Engine::open(stepper(&c), 16, &recipe, &settings::read()).unwrap();
     engine.load(&weights).unwrap();
     (g, weights, engine)
 }

@@ -1,0 +1,18 @@
+[package]
+name = "hf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A Hugging Face model directory as graph, weights, tokenizer and template"
+
+[dependencies]
+checkpoint = { workspace = true }
+graph = { workspace = true }
+interp = { workspace = true }
+minijinja = { version = "3", features = ["json", "serde"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+models = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }

@@ -15,6 +15,7 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod plan;
+mod recipe;
 pub mod rule;
 mod run;
 mod schedule;
@@ -33,6 +34,7 @@ pub use gpukit::{Limits, Pick, Settings};
 pub use kernel::{Kernel, KernelRef, Needs};
 pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};
 pub use plan::{Loaded, Output, Plan, Slot, Step};
+pub use recipe::Recipe;
 pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
 pub use run::{Held, Run, open, precision};
 pub use schedule::{peak, schedule};
