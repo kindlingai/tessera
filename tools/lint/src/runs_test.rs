@@ -35,16 +35,21 @@ fn copies_per_type() {
 }
 
 #[test]
-fn fields_are_not_code() {
+fn struct_fields_keep_names() {
     let all = ["a.rs", "b.rs", "c.rs", "d.rs"];
-    let field = |i: usize, n: usize| match i % 2 {
-        0 => format!("pub f{n}: Vec<u{n}>,"),
-        _ => format!("g{n}: u{n},"),
+    let def = |own: bool| {
+        move |i: usize, n: usize| match (i, i % 2) {
+            (0, _) => format!("pub struct S{n} {{"),
+            (_, 0) => format!("pub f{i}{}: Vec<u8>,", if own { n } else { 0 }),
+            _ => format!("pub g{i}{}: u8,", if own { n } else { 0 }),
+        }
     };
-    let arm = |i: usize, n: usize| match i % 2 {
-        0 => format!("K{n}::A => f(x{n}),"),
-        _ => format!("K{n}::B => {n},"),
+    let init = |i: usize, n: usize| match (i, i % 2) {
+        (0, _) => format!("let s{n} = S {{"),
+        (_, 0) => format!("a{n}: x{n},"),
+        _ => format!("b{n}: f(x{n}),"),
     };
-    assert_eq!(hits(&all, field), 0);
-    assert_eq!(hits(&all, arm), 1);
+    assert_eq!(hits(&all, def(true)), 0);
+    assert_eq!(hits(&all, def(false)), 1);
+    assert_eq!(hits(&all, init), 1);
 }

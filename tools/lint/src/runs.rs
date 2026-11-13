@@ -24,30 +24,33 @@ fn shaped(src: &Source) -> Shaped<'_> {
         line: Vec::new(),
         shape: Vec::new(),
     };
+    let mut fields = false;
     for (i, l) in src.text.lines().enumerate() {
-        if !l.trim().is_empty() {
-            out.line.push(i + 1);
-            out.shape.push(shape(l));
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
         }
+        fields &= !t.starts_with('}');
+        out.line.push(i + 1);
+        out.shape.push(if fields { named(t) } else { shape(t) });
+        fields |= t.ends_with('{') && (t.starts_with("struct ") || t.contains(" struct "));
     }
     out
 }
 
-/// A field or argument line, such as `pub rows: usize,`.
-fn field(shape: &str) -> bool {
-    let name = shape.trim_start_matches('a');
-    (1..=2).contains(&(shape.len() - name.len()))
-        && name.starts_with(':')
-        && !name.starts_with("::")
-        && shape.ends_with(',')
+/// A struct field keeps its name. Its type collapses.
+fn named(line: &str) -> String {
+    match line.split_once(':') {
+        Some((name, ty)) if !ty.starts_with(':') && !line.starts_with(['/', '#']) => {
+            format!("{name}:{}", shape(ty))
+        }
+        _ => shape(line),
+    }
 }
 
 /// False for field lists, tables and runs of mostly braces.
 fn worth(run: &[String]) -> bool {
-    let code = run
-        .iter()
-        .filter(|s| s.len() > SUBSTANTIVE && !field(s))
-        .count();
+    let code = run.iter().filter(|s| s.len() > SUBSTANTIVE).count();
     let repeats = run.windows(2).filter(|w| w[0] == w[1]).count();
     code * 2 >= run.len() && repeats * 2 < run.len()
 }

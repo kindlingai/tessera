@@ -30,7 +30,7 @@ max_module_test_percent = 25
 
 # Non-blank lines in a run of line shapes, and the most places one
 # run may appear in files of one type. Shapes collapse names and numbers.
-# Field and argument lines do not count as code.
+# Struct fields keep their names.
 shape_run = 9
 max_shape_copies = 3
 
