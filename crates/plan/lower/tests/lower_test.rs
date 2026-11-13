@@ -460,3 +460,34 @@ fn trips_are_counted() {
     assert_eq!((thin.loads, thin.float), (4.0, 3.0));
     assert!((thin.fresh - 1.0 / 16.0).abs() < 1e-9, "{thin:?}");
 }
+
+#[test]
+fn limits_bar_kernels() {
+    // A 64-lane device runs none of the 32-lane kernels.
+    let wide = lower::Limits {
+        lanes: 64,
+        ..lower::Limits::assumed()
+    };
+    let (_, plan) = toy(&Device::guess().within(wide));
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    let lanes = |n: &&str| n.starts_with("lanes") || n.starts_with("tiled") || *n == "lane_norm";
+    assert!(!names.iter().any(lanes), "{names:?}");
+    assert!(
+        names.contains(&"thin") && names.contains(&"rms_norm"),
+        "{names:?}"
+    );
+    // A small group memory keeps the tiled schedules that fit.
+    let small = lower::Limits {
+        group_bytes: 12 * 1024,
+        ..lower::Limits::assumed()
+    };
+    let (g, _) = toy(&Device::guess());
+    let device = Device::guess().within(small).favoring("tiled");
+    let plan = lower(&g, 0, &SIZES, &device).unwrap();
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert!(names.contains(&"tiled_32x32_w16"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("tiled_64")),
+        "{names:?}"
+    );
+}

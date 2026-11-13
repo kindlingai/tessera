@@ -174,6 +174,10 @@ macro_rules! device_runner {
                     format!("{} {}", stringify!($bk), self.ctx.name())
                 }
 
+                fn limits(&self) -> gpukit::Limits {
+                    self.ctx.limits()
+                }
+
                 /// Enqueues every launch, then waits once.
                 fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
                     for i in steps {

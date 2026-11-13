@@ -3,6 +3,7 @@
 use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
+use gpukit::Limits;
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
 use std::cell::RefCell;
@@ -76,6 +77,9 @@ pub struct Device {
     /// The zones plans may span. Zone 0 is this GPU.
     #[serde(default)]
     pub cluster: Cluster,
+    /// What this GPU gives one group of threads.
+    #[serde(default)]
+    pub limits: Limits,
     timed: BTreeMap<String, Vec<Sample>>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
@@ -110,6 +114,7 @@ impl PartialEq for Device {
         self.name == other.name
             && self.fit == other.fit
             && self.cluster == other.cluster
+            && self.limits == other.limits
             && self.timed == other.timed
             && self.favor == other.favor
             && self.barred == other.barred
@@ -127,6 +132,12 @@ impl Device {
     /// No samples: each kernel's own guess decides.
     pub fn guess() -> Self {
         Self::default()
+    }
+
+    /// The same device, within what its hardware gives a group.
+    pub fn within(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self.changed()
     }
 
     /// The same device, with a chip model for unmeasured kernels.

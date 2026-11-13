@@ -184,6 +184,11 @@ impl Cover<'_> {
             }
             offered.push(rule.name);
             for drafts in ways(drafts) {
+                // A kernel the device cannot run is not a way.
+                let limits = &self.device.limits;
+                if drafts.iter().any(|d| !d.kernel.needs().fits(limits)) {
+                    continue;
+                }
                 if self.swallows(rule, t, &drafts) {
                     continue;
                 }

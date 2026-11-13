@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use gpukit::Limits;
 use graph::DimName;
 use mem::{Buffer, Tensor, View, ViewMut, copy};
 use std::collections::HashMap;
@@ -107,6 +108,8 @@ pub trait Run {
     fn repeat(&self, step: usize, times: usize) -> Result<f64, Error>;
     /// The backend and the hardware it drives.
     fn device(&self) -> String;
+    /// What the hardware gives one group of threads.
+    fn limits(&self) -> Limits;
 
     /// Copies `src` into the slot, converting its form if needed.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {

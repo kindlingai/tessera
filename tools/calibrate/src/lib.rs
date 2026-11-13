@@ -41,6 +41,9 @@ pub fn measure(
     feeds: &[View],
     device: &mut Device,
 ) -> Result<Vec<(Step, f64)>, Error> {
+    if device.limits != runner.limits() {
+        *device = device.clone().within(runner.limits());
+    }
     // The same pins, or the weights would load again.
     let pins = device.pins.clone();
     let guess = || Device::guess().pinned(pins.clone());
@@ -150,10 +153,11 @@ pub fn path(device: &str) -> PathBuf {
 
 /// The samples stored for the runner's device, or a guess.
 pub fn stored(runner: &dyn Run) -> Result<Device, std::io::Error> {
-    match Device::load(&path(&runner.device())) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Device::guess()),
-        loaded => loaded,
-    }
+    let device = match Device::load(&path(&runner.device())) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Device::guess(),
+        loaded => loaded?,
+    };
+    Ok(device.within(runner.limits()))
 }
 
 #[cfg(test)]

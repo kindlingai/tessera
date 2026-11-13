@@ -1,11 +1,13 @@
-//! A matmul for few rows, a warp per column.
+//! A matmul for few rows, a SIMD group per column.
 
 use codegen::hash;
 use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
 use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{MapStage, operands, stage_stmts};
-use lower::{Arg, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, Stored, T, Tree};
+use lower::{
+    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, Stored, T, Tree,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -24,7 +26,7 @@ const AHEAD: u32 = 4;
 /// The most rows this schedule is offered for.
 const ROWS: usize = 32;
 
-/// Each lane sums part of every row, then all reduce.
+/// Lanes sum parts of every row, then the group reduces.
 #[kernel]
 fn linear<const WIDE: u32, const AHEAD: u32, F: Form<Elem = f32>>(
     x: Buf<F32>,
@@ -69,7 +71,7 @@ pub struct After {
     pub sum: usize,
 }
 
-/// `x[m, k]` times `w[n, k]` transposed, one warp per column.
+/// `x[m, k]` times `w[n, k]` transposed, per SIMD group.
 #[derive(Clone, Debug)]
 pub struct Lanes {
     pub m: usize,
@@ -198,6 +200,14 @@ impl Kernel for Lanes {
 
     fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 1, form)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            lanes: LANES,
+            group_bytes: 0,
+            group_threads: 256,
+        }
     }
 }
 

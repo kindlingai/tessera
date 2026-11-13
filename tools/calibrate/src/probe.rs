@@ -129,7 +129,7 @@ fn probe_chase(x: Buf<U32>, mut out: BufMut<U32>, threads: u32, trips: u32, len:
     out[gid() as u64] = at;
 }
 
-/// Repeats a warp's 32x32 block over 32 staged columns.
+/// Repeats a SIMD group's 32x32 block over 32 staged columns.
 #[kernel]
 fn probe_tile(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
     if gid() >= threads {
@@ -369,7 +369,7 @@ pub fn fit(readings: &[Reading]) -> Fit {
     let wait = of(Kind::Read { depth: 1 }, 256, LARGE).per_trip();
     let near = (of(Kind::Scan, 256, SMALL).per_trip() - step).max(0.0);
     let curve = (of(Kind::Curve, 256, 0).seconds - floor) / 4096.0;
-    // A warp's trip does 65536 tile flops.
+    // A SIMD group's trip does 65536 tile flops.
     let tiles = |r: &Reading| (r.probe.threads / 32 * r.probe.trips) as f64 * 65_536.0;
     Fit {
         floor,

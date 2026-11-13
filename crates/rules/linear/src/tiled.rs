@@ -6,7 +6,9 @@ use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
 use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{operands, stage_stmts};
-use lower::{Arg, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, Stored, T, Tree};
+use lower::{
+    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, Stored, T, Tree,
+};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -16,54 +18,54 @@ use std::collections::HashMap;
 pub struct Schedule {
     /// Rows, columns and depth of one group's block.
     pub block: (usize, usize, usize),
-    /// How the group's warps split the block's rows and columns.
-    pub warps: (usize, usize),
+    /// How SIMD groups split the block's rows and columns.
+    pub simds: (usize, usize),
     /// Its cost curves' names, for f32 and bf16 weights.
     pub names: [&'static str; 2],
 }
 
-/// Every matmul's schedules. `w16` warps own 16 by 16.
+/// Every matmul's schedules. `w16` SIMD groups own 16 by 16.
 pub const SCHEDULES: [Schedule; 6] = [
     Schedule {
         block: (64, 64, 32),
-        warps: (2, 2),
+        simds: (2, 2),
         names: ["tiled_64x64", "tiled_64x64_bf16"],
     },
     Schedule {
         block: (32, 64, 32),
-        warps: (1, 2),
+        simds: (1, 2),
         names: ["tiled_32x64", "tiled_32x64_bf16"],
     },
     Schedule {
         block: (128, 64, 32),
-        warps: (4, 2),
+        simds: (4, 2),
         names: ["tiled_128x64", "tiled_128x64_bf16"],
     },
     Schedule {
         block: (64, 128, 32),
-        warps: (2, 4),
+        simds: (2, 4),
         names: ["tiled_64x128", "tiled_64x128_bf16"],
     },
     Schedule {
         block: (64, 64, 32),
-        warps: (4, 4),
+        simds: (4, 4),
         names: ["tiled_64x64_w16", "tiled_64x64_w16_bf16"],
     },
     Schedule {
         block: (32, 32, 32),
-        warps: (2, 2),
+        simds: (2, 2),
         names: ["tiled_32x32_w16", "tiled_32x32_w16_bf16"],
     },
 ];
 
 impl Schedule {
     fn threads(&self) -> usize {
-        self.warps.0 * self.warps.1 * LANES
+        self.simds.0 * self.simds.1 * LANES
     }
 
-    /// The rows and columns one warp owns.
-    fn warp(&self) -> (usize, usize) {
-        (self.block.0 / self.warps.0, self.block.1 / self.warps.1)
+    /// The rows and columns one SIMD group owns.
+    fn simd(&self) -> (usize, usize) {
+        (self.block.0 / self.simds.0, self.block.1 / self.simds.1)
     }
 }
 
@@ -92,16 +94,16 @@ fn tiled<F: Form<Elem = f32>>(
     #[build] bk: u32,
     #[build] wm: u32,
     #[build] wn: u32,
-    #[build] warps_n: u32,
+    #[build] simds_n: u32,
     #[build] threads: u32,
     #[build] wide: bool,
 ) {
-    let warp = lid() / LANES as u32;
+    let simd = lid() / LANES as u32;
     let group = gid() / threads;
     let row0 = (group / ((n + bn - 1) / bn)) * bm;
     let col0 = (group % ((n + bn - 1) / bn)) * bn;
-    let wm0 = (warp / warps_n) * wm;
-    let wn0 = (warp % warps_n) * wn;
+    let wm0 = (simd / simds_n) * wm;
+    let wn0 = (simd % simds_n) * wn;
     let mut a_s = shared::<f32>(bm * (bk + PAD));
     let mut b_s = shared::<f32>(bn * (bk + PAD));
     let mut acc = tiles(wm, wn);
@@ -198,11 +200,11 @@ impl Tiled {
         let build = || {
             let s = &self.schedule;
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
-            let (wm, wn) = (s.warp().0 as u32, s.warp().1 as u32);
-            let (warps_n, threads) = (s.warps.1 as u32, s.threads() as u32);
+            let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
+            let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
             match self.form {
-                DType::Bf16 => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, warps_n, threads, wide),
-                _ => tiled_ir::<F32>(bm, bn, bk, wm, wn, warps_n, threads, wide),
+                DType::Bf16 => tiled_ir::<Bf16>(bm, bn, bk, wm, wn, simds_n, threads, wide),
+                _ => tiled_ir::<F32>(bm, bn, bk, wm, wn, simds_n, threads, wide),
             }
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
@@ -350,6 +352,16 @@ impl Kernel for Tiled {
 
     fn accepts(&self, input: usize, form: DType) -> bool {
         self.form.taken(input, 1, form)
+    }
+
+    /// Two staged slabs of `bk + PAD` floats a row.
+    fn needs(&self) -> Needs {
+        let (bm, bn, bk) = self.schedule.block;
+        Needs {
+            lanes: LANES,
+            group_bytes: 4 * (bm + bn) * (bk + PAD as usize),
+            group_threads: self.schedule.threads(),
+        }
     }
 }
 

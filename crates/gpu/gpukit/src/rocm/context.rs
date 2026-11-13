@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::KernelArgs;
 use super::hip::{self, HipFunction, HipModule, Runtime};
-use crate::Error;
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::launch::Launch;
+use crate::{Error, Limits};
 
 /// Which HIP device to open.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,8 @@ struct Inner {
     device: c_int,
     name: String,
     modules: Mutex<HashMap<u64, Arc<Module>>>,
+    /// `warpSize`, asked once.
+    lanes: OnceLock<usize>,
 }
 
 impl Context {
@@ -66,9 +68,45 @@ impl Context {
             device,
             name,
             modules: Mutex::new(HashMap::new()),
+            lanes: OnceLock::new(),
         }));
         ctx.set_current()?;
         Ok(ctx)
+    }
+
+    /// Lanes come from the device. The rest are AMD constants.
+    pub fn limits(&self) -> Limits {
+        let lanes = *self
+            .0
+            .lanes
+            .get_or_init(|| self.probe_lanes().unwrap_or(64));
+        Limits {
+            lanes,
+            group_bytes: 64 * 1024,
+            group_threads: 1024,
+        }
+    }
+
+    /// A kernel's `warpSize`: 32 on RDNA, 64 on CDNA.
+    fn probe_lanes(&self) -> Result<usize, Error> {
+        let source = "extern \"C\" __global__ void tessera_lanes(unsigned *out) {
+    if (threadIdx.x == 0) {
+        out[0] = warpSize;
+    }
+}
+";
+        let kernel = self.compile(source, "tessera_lanes")?;
+        let out = self.alloc(4)?;
+        let mut args = crate::launch::KernelArgs::new();
+        args.device_ptr(out);
+        let launched = crate::launch::launch_1d(self, &kernel, 64, &mut args).and_then(|_| {
+            self.synchronize()?;
+            let mut bytes = [0u8; 4];
+            self.download(out, &mut bytes)?;
+            Ok(u32::from_ne_bytes(bytes) as usize)
+        });
+        self.free(out);
+        launched
     }
 
     pub fn name(&self) -> &str {

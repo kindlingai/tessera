@@ -14,6 +14,9 @@ pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
 
 pub const CUDA_SUCCESS: CUresult = 0;
+pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
+pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 8;
+pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 

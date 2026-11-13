@@ -1,8 +1,8 @@
-//! RMS norm with one warp per row, summed by shuffles.
+//! RMS norm, a SIMD group per row, summed by shuffles.
 
 use codegen::prelude::*;
 use graph::{Order, Stage};
-use lower::{Arg, Draft, Kernel, Launch, Load, Shape, Site, Source, Step, T, Tree};
+use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Site, Source, Step, T, Tree};
 
 /// Elements one wide load brings a lane.
 const WIDE: u32 = 4;
@@ -105,6 +105,14 @@ impl Kernel for LaneNorm {
     /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
         1e-9
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            lanes: LANES,
+            group_bytes: 0,
+            group_threads: 256,
+        }
     }
 }
 

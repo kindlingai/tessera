@@ -95,6 +95,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "scattered-collect",
+ "serde",
 ]
 
 [[package]]
