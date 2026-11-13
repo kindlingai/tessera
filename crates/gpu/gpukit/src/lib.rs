@@ -2,8 +2,10 @@
 
 mod error;
 pub use error::Error;
+pub use limits::Limits;
 
 pub mod backend;
+pub mod limits;
 
 pub mod includes;
 

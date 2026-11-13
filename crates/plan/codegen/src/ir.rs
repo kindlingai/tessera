@@ -208,7 +208,7 @@ pub enum Stmt {
     Return,
     Barrier,
     Expr(Expr),
-    /// A warp's zeroed block of `rows` by `cols` sums.
+    /// A SIMD group's zeroed block of `rows` by `cols` sums.
     TileAcc {
         name: String,
         rows: usize,

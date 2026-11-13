@@ -1,6 +1,6 @@
-use crate::Error;
 use crate::metal::expand::expand;
 use crate::metal::pipeline_cache::{CacheConfig, PipelineArchiveCache};
+use crate::{Error, Limits};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
@@ -134,6 +134,15 @@ impl Context {
     /// The device's marketing name.
     pub fn name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Apple GPUs run 32 lanes together. The rest is asked.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            lanes: 32,
+            group_bytes: self.device.maxThreadgroupMemoryLength(),
+            group_threads: self.device.maxThreadsPerThreadgroup().width,
+        }
     }
 
     /// Compile a source string (quoted includes expanded) to a library.

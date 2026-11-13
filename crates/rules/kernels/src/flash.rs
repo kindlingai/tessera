@@ -4,7 +4,9 @@ use codegen::ir::Body;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Read, Shape, Site, Source, Step, T, Tree};
+use lower::{
+    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, T, Tree,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -14,7 +16,7 @@ const BQ: u32 = 32;
 /// Keys one block of the stream holds.
 const BK: u32 = 16;
 
-/// Four warps: two form the scores, all four apply them.
+/// Four SIMD groups: two form scores, four apply them.
 const THREADS: u32 = 128;
 
 /// Floats of padding after each staged row, against bank conflicts.
@@ -42,7 +44,7 @@ fn flash(
     kv_heads: u32,
     #[build] w: u32,
 ) {
-    let warp = lid() / LANES as u32;
+    let simd = lid() / LANES as u32;
     let group = gid() / THREADS;
     let h = group % heads;
     let q0 = (group / heads) * BQ;
@@ -70,9 +72,9 @@ fn flash(
     let mut o11 = tiles(16, 16);
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
-    // Each warp owns up to two column pieces of sixteen.
-    let first = warp * 16 < w;
-    let second = (warp + 4) * 16 < w;
+    // Each SIMD group owns up to two column pieces.
+    let first = simd * 16 < w;
+    let second = (simd + 4) * 16 < w;
     for b in 0..(keys + BK - 1) / BK {
         let k0 = b * BK;
         for i in (lid()..BK * w).by(THREADS) {
@@ -85,13 +87,13 @@ fn flash(
             };
         }
         barrier();
-        if warp < 2 {
+        if simd < 2 {
             s_t.zero();
-            s_t.block(&q_s, warp * 16 * (w + PAD), &kv_s, 0, w + PAD, w);
+            s_t.block(&q_s, simd * 16 * (w + PAD), &kv_s, 0, w + PAD, w);
             s_t.each(|r, c, v| {
                 let t = k0 + c;
-                let seen = t < keys && t <= past + q0 + warp * 16 + r;
-                p_s[(warp * 16 + r) * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
+                let seen = t < keys && t <= past + q0 + simd * 16 + r;
+                p_s[(simd * 16 + r) * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
             });
         }
         barrier();
@@ -132,12 +134,12 @@ fn flash(
         if first {
             o00.scale(|r| alpha_s[r]);
             o01.scale(|r| alpha_s[16 + r]);
-            o00.block(&p_s, 0, &kv_s, warp * 16 * (BK + PAD), BK + PAD, BK);
+            o00.block(&p_s, 0, &kv_s, simd * 16 * (BK + PAD), BK + PAD, BK);
             o01.block(
                 &p_s,
                 16 * (BK + PAD),
                 &kv_s,
-                warp * 16 * (BK + PAD),
+                simd * 16 * (BK + PAD),
                 BK + PAD,
                 BK,
             );
@@ -145,12 +147,12 @@ fn flash(
         if second {
             o10.scale(|r| alpha_s[r]);
             o11.scale(|r| alpha_s[16 + r]);
-            o10.block(&p_s, 0, &kv_s, (warp + 4) * 16 * (BK + PAD), BK + PAD, BK);
+            o10.block(&p_s, 0, &kv_s, (simd + 4) * 16 * (BK + PAD), BK + PAD, BK);
             o11.block(
                 &p_s,
                 16 * (BK + PAD),
                 &kv_s,
-                (warp + 4) * 16 * (BK + PAD),
+                (simd + 4) * 16 * (BK + PAD),
                 BK + PAD,
                 BK,
             );
@@ -164,12 +166,12 @@ fn flash(
     if first {
         o00.each(|r, c, v| {
             if q0 + r < queries {
-                out[((q0 + r) * heads + h) as u64 * w as u64 + (warp * 16 + c) as u64] = v / l_s[r];
+                out[((q0 + r) * heads + h) as u64 * w as u64 + (simd * 16 + c) as u64] = v / l_s[r];
             }
         });
         o01.each(|r, c, v| {
             if q0 + 16 + r < queries {
-                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + (warp * 16 + c) as u64] =
+                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + (simd * 16 + c) as u64] =
                     v / l_s[16 + r];
             }
         });
@@ -177,13 +179,13 @@ fn flash(
     if second {
         o10.each(|r, c, v| {
             if q0 + r < queries {
-                out[((q0 + r) * heads + h) as u64 * w as u64 + ((warp + 4) * 16 + c) as u64] =
+                out[((q0 + r) * heads + h) as u64 * w as u64 + ((simd + 4) * 16 + c) as u64] =
                     v / l_s[r];
             }
         });
         o11.each(|r, c, v| {
             if q0 + 16 + r < queries {
-                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + ((warp + 4) * 16 + c) as u64] =
+                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + ((simd + 4) * 16 + c) as u64] =
                     v / l_s[16 + r];
             }
         });
@@ -284,6 +286,17 @@ impl Kernel for Flash {
     /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
         1e-9
+    }
+
+    /// Q, the K and V slot, P, two sum rows.
+    fn needs(&self) -> Needs {
+        let (w, bq, bk, pad) = (self.0.width, BQ as usize, BK as usize, PAD as usize);
+        let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 2 * bq;
+        Needs {
+            lanes: LANES,
+            group_bytes: 4 * floats,
+            group_threads: THREADS as usize,
+        }
     }
 }
 

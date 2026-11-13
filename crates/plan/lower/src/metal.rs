@@ -214,4 +214,8 @@ impl Run for Runner {
     fn device(&self) -> String {
         format!("metal {}", self.ctx.name())
     }
+
+    fn limits(&self) -> gpukit::Limits {
+        self.ctx.limits()
+    }
 }

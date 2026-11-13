@@ -3,6 +3,7 @@
 use crate::abi::{Launch, Source};
 use crate::form::Stored;
 use crate::plan::Step;
+use gpukit::Limits;
 use graph::{DType, Order};
 use sim::{Load, ZoneKind};
 use std::fmt;
@@ -51,6 +52,27 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn accepts(&self, input: usize, form: DType) -> bool {
         let _ = input;
         !form.narrow()
+    }
+    /// What it asks of a thread group. Zero asks nothing.
+    fn needs(&self) -> Needs {
+        Needs::default()
+    }
+}
+
+/// What a kernel asks of the device to run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Needs {
+    /// Exactly this many lanes together, or zero for any.
+    pub lanes: usize,
+    pub group_bytes: usize,
+    pub group_threads: usize,
+}
+
+impl Needs {
+    pub fn fits(&self, limits: &Limits) -> bool {
+        (self.lanes == 0 || self.lanes == limits.lanes)
+            && self.group_bytes <= limits.group_bytes
+            && self.group_threads <= limits.group_threads
     }
 }
 

@@ -7,13 +7,14 @@ use std::sync::{Arc, Mutex};
 use super::KernelArgs;
 use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CUcontext, CUdevice, CUfunction, CUmodule,
-    Driver,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_WARP_SIZE, CUcontext, CUdevice,
+    CUfunction, CUmodule, Driver,
 };
-use crate::Error;
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::launch::Launch;
+use crate::{Error, Limits};
 
 /// How to open the CUDA context.
 #[derive(Debug, Clone, Default)]
@@ -32,6 +33,7 @@ struct Inner {
     device: CUdevice,
     name: String,
     compute_capability: (i32, i32),
+    limits: Limits,
     modules: Mutex<HashMap<u64, Arc<Module>>>,
 }
 
@@ -101,6 +103,16 @@ impl Context {
 
         let major = device_attr(driver, device, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let minor = device_attr(driver, device, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let limits = Limits {
+            lanes: device_attr(driver, device, CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as usize,
+            group_bytes: device_attr(
+                driver,
+                device,
+                CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            )? as usize,
+            group_threads: device_attr(driver, device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?
+                as usize,
+        };
 
         Ok(Self(Arc::new(Inner {
             driver,
@@ -108,8 +120,14 @@ impl Context {
             device,
             name,
             compute_capability: (major, minor),
+            limits,
             modules: Mutex::new(HashMap::new()),
         })))
+    }
+
+    /// Lanes, group memory and group size, from the device.
+    pub fn limits(&self) -> Limits {
+        self.0.limits
     }
 
     pub fn name(&self) -> &str {

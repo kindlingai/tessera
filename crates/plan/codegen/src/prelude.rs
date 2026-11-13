@@ -120,7 +120,7 @@ impl<T> IndexMut<u32> for Shared<T> {
     }
 }
 
-/// A warp's block of sums on the matrix unit.
+/// A SIMD group's block of sums on the matrix unit.
 pub struct Tiles;
 
 /// A zeroed `rows` by `cols` block, both fixed when built.

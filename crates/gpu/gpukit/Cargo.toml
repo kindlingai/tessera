@@ -14,6 +14,7 @@ cuda = []
 rocm = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 mem = { workspace = true }
 scattered-collect = "0.22"
 include_dir = "0.7"
