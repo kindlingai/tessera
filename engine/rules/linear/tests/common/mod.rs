@@ -8,7 +8,7 @@ use interp::Tensor;
 use lower::{Arg, Plan, Settings, Source, Terms};
 use settings::read as settings;
 use std::collections::HashMap;
-use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights};
+use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, TensorType, Weights};
 
 #[derive(Weights)]
 struct Layer {
@@ -26,13 +26,8 @@ pub fn linear(k: u64, n: u64) -> Graph {
 
 /// The same, with stages after the matmul.
 pub fn finished(k: u64, n: u64, finish: Finish) -> Graph {
-    let fixed = |name, n| Dim {
-        name,
-        size: Size::Fixed(n),
-    };
-    let size = Size::Bounded(256);
-    let rows = Dim { name: Rows, size };
-    let m = Model::new(vec![rows, fixed(Hidden, k), fixed(Ffn, n)]);
+    let rows = Dim::bounded(Rows, 256);
+    let m = Model::new(vec![rows, Dim::fixed(Hidden, k), Dim::fixed(Ffn, n)]);
     let w: Layer = trace::declare(&m);
     let ty = TensorType::new([Rows, Hidden], DType::F32);
     let role = Role::Logits;

@@ -67,6 +67,23 @@ pub struct Dim {
     pub size: Size,
 }
 
+impl Dim {
+    pub const fn fixed(name: DimName, n: u64) -> Self {
+        Self {
+            name,
+            size: Size::Fixed(n),
+        }
+    }
+
+    /// Varies per launch, up to `max`.
+    pub const fn bounded(name: DimName, max: u64) -> Self {
+        Self {
+            name,
+            size: Size::Bounded(max),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum DimExpr {
     Dim(DimName),

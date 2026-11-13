@@ -28,22 +28,10 @@ struct Net {
 
 fn model() -> Model {
     Model::new(vec![
-        Dim {
-            name: Rows,
-            size: Size::Bounded(16),
-        },
-        Dim {
-            name: Hidden,
-            size: Size::Fixed(8),
-        },
-        Dim {
-            name: Vocab,
-            size: Size::Fixed(32),
-        },
-        Dim {
-            name: Layers,
-            size: Size::Fixed(2),
-        },
+        Dim::bounded(Rows, 16),
+        Dim::fixed(Hidden, 8),
+        Dim::fixed(Vocab, 32),
+        Dim::fixed(Layers, 2),
     ])
 }
 

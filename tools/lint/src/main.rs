@@ -5,7 +5,9 @@ mod files;
 mod kernel;
 mod macros;
 mod names;
+mod runs;
 mod rust;
+mod shape;
 mod share;
 
 #[cfg(test)]
@@ -14,6 +16,8 @@ mod comments_test;
 mod macros_test;
 #[cfg(test)]
 mod names_test;
+#[cfg(test)]
+mod runs_test;
 #[cfg(test)]
 mod rust_test;
 #[cfg(test)]
@@ -35,6 +39,8 @@ pub struct Limits {
     pub min_macro_calls: usize,
     pub max_test_percent: usize,
     pub max_module_test_percent: usize,
+    pub shape_run: usize,
+    pub max_shape_copies: usize,
     pub extensions: Vec<String>,
 }
 
@@ -73,6 +79,7 @@ fn main() -> ExitCode {
     names::check(&dirs, &names, &mut found);
     macros::check(&dirs, &sources, &mut found);
     files::check_crates(&dirs, &sources, &mut found);
+    runs::check(&sources, &mut found);
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     for v in &found {
         println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);

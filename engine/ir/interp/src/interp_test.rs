@@ -1,29 +1,14 @@
 use crate::*;
 use trace::DimName::*;
-use trace::{DType, Dim, EntryKind, Graph, Mask, Model, Port, Role, Size, TensorType};
+use trace::{DType, Dim, EntryKind, Graph, Mask, Model, Port, Role, TensorType};
 
 fn model() -> Model {
     Model::new(vec![
-        Dim {
-            name: Seqs,
-            size: Size::Bounded(2),
-        },
-        Dim {
-            name: Rows,
-            size: Size::Bounded(4),
-        },
-        Dim {
-            name: Context,
-            size: Size::Bounded(4),
-        },
-        Dim {
-            name: Heads,
-            size: Size::Fixed(2),
-        },
-        Dim {
-            name: HeadDim,
-            size: Size::Fixed(3),
-        },
+        Dim::bounded(Seqs, 2),
+        Dim::bounded(Rows, 4),
+        Dim::bounded(Context, 4),
+        Dim::fixed(Heads, 2),
+        Dim::fixed(HeadDim, 3),
     ])
 }
 
