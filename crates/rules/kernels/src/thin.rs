@@ -92,9 +92,9 @@ impl Kernel for Thin {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.tree().text();
-        text.entry = format!("plan_thin_{}_{}", self.form.name(), self.m);
-        Source::Made(text)
+        let mut body = self.tree();
+        body.entry = format!("plan_thin_{}_{}", self.form.name(), self.m);
+        Source::Made(body)
     }
 
     fn accepts(&self, input: usize, form: DType) -> bool {

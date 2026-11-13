@@ -3,7 +3,7 @@
 // Linking the crate registers its rules.
 use kernels as _;
 
-use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, lower, open};
 use models::Stack;
@@ -155,9 +155,6 @@ fn cpu_matches_record() {
 
 #[test]
 fn plan_matches_record() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let g = graph();
     let plan = lower(&g, 0, &[(Seqs, 2), (Context, 5)], &Device::guess()).unwrap();
     let mut runner = open(plan).unwrap();

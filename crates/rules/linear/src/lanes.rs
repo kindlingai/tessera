@@ -174,9 +174,9 @@ impl Kernel for Lanes {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.tree().text();
-        text.entry = format!("linear_{}_{:x}", self.form.name(), hash(&text.body));
-        Source::Made(text)
+        let mut body = self.tree();
+        body.entry = format!("linear_{}_{:x}", self.form.name(), hash(&body.text().body));
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -205,8 +205,8 @@ impl Kernel for Lanes {
     fn needs(&self) -> Needs {
         Needs {
             lanes: LANES,
-            group_bytes: 0,
             group_threads: 256,
+            ..Needs::default()
         }
     }
 }

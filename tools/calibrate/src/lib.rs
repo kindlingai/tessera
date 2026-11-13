@@ -19,8 +19,8 @@ use std::path::PathBuf;
 const PASSES: usize = 3;
 
 /// Times every launch of the plan, its inputs already fed.
-pub fn time(runner: &dyn Run) -> Result<Vec<(Step, f64)>, Error> {
-    let steps = &runner.plan().steps;
+pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
+    let steps = runner.plan().steps.clone();
     // The first run pays for anything set up lazily.
     runner.submit(0..steps.len())?;
     let mut timed = Vec::with_capacity(PASSES * steps.len());

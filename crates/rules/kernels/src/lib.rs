@@ -5,9 +5,6 @@ mod attend;
 mod dense;
 mod flash;
 mod gather;
-// Fixtures are never empty, so `is_empty` would mean nothing.
-#[allow(clippy::len_without_is_empty)]
-pub mod gqa_attention;
 mod join;
 mod lane_norm;
 mod rms_norm;

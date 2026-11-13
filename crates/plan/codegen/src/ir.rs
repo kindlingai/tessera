@@ -466,7 +466,7 @@ impl Printer<'_> {
                 self.bind(name, Kind::Value(ty));
             }
             Stmt::Array { name, ty, len } => {
-                self.line(format!("{} {name}[{len}];", ty.c()));
+                self.line(format!("{} {name}[{len}] = {{}};", ty.c()));
                 self.bind(name, Kind::Array(*ty));
             }
             Stmt::Shared { name, ty, len } => {

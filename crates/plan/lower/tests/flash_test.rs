@@ -4,7 +4,7 @@
 use kernels as _;
 use linear as _;
 
-use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs};
 use graph::{DType, Dim, Graph, Size, TensorType};
 use interp::{Tensor, run};
@@ -40,9 +40,6 @@ fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
 
 #[test]
 fn flash_matches_cpu() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut draws = Noise(41);
     // Rows off, on and past the block, with older keys.
     let cases = [

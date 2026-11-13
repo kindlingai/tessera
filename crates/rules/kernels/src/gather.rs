@@ -44,9 +44,9 @@ impl Kernel for Gather {
             DType::Bf16 => gather_ir::<Bf16>(),
             _ => gather_ir::<F32>(),
         };
-        let mut text = body.text();
-        text.entry = format!("plan_gather_{}", self.form.name());
-        Source::Made(text)
+        let mut body = body;
+        body.entry = format!("plan_gather_{}", self.form.name());
+        Source::Made(body)
     }
 
     fn accepts(&self, input: usize, form: DType) -> bool {

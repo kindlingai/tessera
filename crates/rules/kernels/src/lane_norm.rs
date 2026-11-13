@@ -84,7 +84,7 @@ impl Kernel for LaneNorm {
     }
 
     fn source(&self) -> Source {
-        Source::Made(norm_lanes_ir::<WIDE, AHEAD>().text())
+        Source::Made(norm_lanes_ir::<WIDE, AHEAD>())
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -110,8 +110,8 @@ impl Kernel for LaneNorm {
     fn needs(&self) -> Needs {
         Needs {
             lanes: LANES,
-            group_bytes: 0,
             group_threads: 256,
+            ..Needs::default()
         }
     }
 }

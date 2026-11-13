@@ -117,9 +117,9 @@ impl Kernel for Map {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.tree().text();
-        text.entry = format!("map_{:x}", hash(&text.body));
-        Source::Made(text)
+        let mut body = self.tree();
+        body.entry = format!("map_{:x}", hash(&body.text().body));
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

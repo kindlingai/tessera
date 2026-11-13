@@ -33,3 +33,7 @@ models = { path = "crates/front/models" }
 sim = { path = "crates/plan/sim" }
 trace = { path = "crates/ir/trace" }
 trace-derive = { path = "crates/ir/trace-derive" }
+
+# The host executor interprets whole kernels, so tests need it optimized.
+[profile.dev.package.codegen]
+opt-level = 3

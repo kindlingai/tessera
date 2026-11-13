@@ -47,9 +47,9 @@ impl Kernel for RmsNorm {
     }
 
     fn source(&self) -> Source {
-        let mut text = rms_norm_ir().text();
-        text.entry = "plan_rms_norm".into();
-        Source::Made(text)
+        let mut body = rms_norm_ir();
+        body.entry = "plan_rms_norm".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

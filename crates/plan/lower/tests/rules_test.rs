@@ -4,7 +4,7 @@
 use kernels as _;
 use linear as _;
 
-use gpukit::testing::{Noise, backend_ready, max_abs_diff};
+use gpukit::testing::{Noise, max_abs_diff};
 use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Tensor, run};
@@ -102,9 +102,6 @@ fn devices() -> Vec<(&'static str, Device)> {
 
 #[test]
 fn each_rule_matches_cpu() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut noise = Noise(7);
     let mut used: Vec<&str> = Vec::new();
     for (g, (rule, device)) in graphs()
@@ -133,6 +130,10 @@ fn each_rule_matches_cpu() {
     }
     // A new rule must be reachable from some graph here.
     for rule in rules() {
+        // Hand-written kernels wait for a compiler.
+        if lower::cpu::chosen() && rule.name == "dense" {
+            continue;
+        }
         assert!(
             used.contains(&rule.name),
             "no graph exercises {}",
@@ -143,9 +144,6 @@ fn each_rule_matches_cpu() {
 
 #[test]
 fn whole_models_match_cpu() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
     let mut noise = Noise(11);
     for g in graphs() {
         let weights: Vec<Tensor> = g

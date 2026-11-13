@@ -2,6 +2,7 @@
 
 mod count;
 mod dialect;
+pub mod exec;
 pub mod ir;
 pub mod prelude;
 mod tile;

@@ -4,6 +4,7 @@ mod abi;
 mod assign;
 mod cache;
 mod cost;
+pub mod cpu;
 mod cut;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;

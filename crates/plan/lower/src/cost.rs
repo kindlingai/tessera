@@ -129,9 +129,16 @@ const FIXED: f64 = 1e-4;
 const NEAR: usize = 3;
 
 impl Device {
-    /// No samples: each kernel's own guess decides.
+    /// The device `open` picks, before any samples.
     pub fn guess() -> Self {
-        Self::default()
+        let limits = match crate::cpu::chosen() {
+            true => crate::cpu::limits(),
+            false => Limits::assumed(),
+        };
+        Self {
+            limits,
+            ..Self::default()
+        }
     }
 
     /// The same device, within what its hardware gives a group.

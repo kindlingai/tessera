@@ -39,9 +39,9 @@ impl Kernel for Join {
     }
 
     fn source(&self) -> Source {
-        let mut text = join_ir().text();
-        text.entry = "plan_join".into();
-        Source::Made(text)
+        let mut body = join_ir();
+        body.entry = "plan_join".into();
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

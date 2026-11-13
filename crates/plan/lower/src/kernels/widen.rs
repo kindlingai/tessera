@@ -34,9 +34,9 @@ impl Kernel for Widen {
             DType::Bf16 => widen_ir::<Bf16>(),
             _ => widen_ir::<F32>(),
         };
-        let mut text = body.text();
-        text.entry = format!("plan_widen_{}", self.form.name());
-        Source::Made(text)
+        let mut body = body;
+        body.entry = format!("plan_widen_{}", self.form.name());
+        Source::Made(body)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

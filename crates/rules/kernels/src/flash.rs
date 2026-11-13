@@ -247,9 +247,9 @@ impl Kernel for Flash {
     }
 
     fn source(&self) -> Source {
-        let mut text = self.tree().text();
-        text.entry = format!("flash_{}", self.0.width);
-        Source::Made(text)
+        let mut body = self.tree();
+        body.entry = format!("flash_{}", self.0.width);
+        Source::Made(body)
     }
 
     /// One launch per sequence, each at its own offset.
@@ -258,17 +258,15 @@ impl Kernel for Flash {
         let per_q = a.queries * a.heads * a.width;
         let per_kv = a.keys.most() * a.kv_heads * a.width;
         let launch = |s: usize| Launch {
-            args: vec![
+            args: [
                 Arg::Buffer(step.reads[0], s * per_q),
                 Arg::Buffer(step.reads[1], s * per_kv),
                 Arg::Buffer(step.reads[2], s * per_kv),
                 Arg::Buffer(step.write, s * per_q),
-                Arg::count(a.queries),
-                Arg::size(a.keys),
-                Arg::size(a.keys.less(a.queries)),
-                Arg::count(a.heads),
-                Arg::count(a.kv_heads),
-            ],
+            ]
+            .into_iter()
+            .chain(a.args())
+            .collect(),
             shape: Shape::Grid {
                 across: self.groups(),
                 down: 1,
@@ -296,6 +294,7 @@ impl Kernel for Flash {
             lanes: LANES,
             group_bytes: 4 * floats,
             group_threads: THREADS as usize,
+            ..Needs::default()
         }
     }
 }

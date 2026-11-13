@@ -1,5 +1,6 @@
 //! Rules propose kernels for a site; link time collects them.
 
+use crate::abi::Arg;
 use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::MapStage;
@@ -25,6 +26,17 @@ impl Attn {
     pub fn sizes(&self) -> Vec<usize> {
         let keys = self.keys.most();
         vec![self.seqs, self.queries, keys, self.heads, self.width]
+    }
+
+    /// Queries, keys, the keys before the queries, heads, kv heads.
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::count(self.queries),
+            Arg::size(self.keys),
+            Arg::size(self.keys.less(self.queries)),
+            Arg::count(self.heads),
+            Arg::count(self.kv_heads),
+        ]
     }
 }
 

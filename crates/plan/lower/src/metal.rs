@@ -99,7 +99,6 @@ impl Runner {
                 let threads = count.clamp(1, 256);
                 grid(enc, count.div_ceil(threads), 1, threads);
             }
-            Shape::Rows(rows) => grid(enc, 1, rows, 256),
             Shape::Grid {
                 across,
                 down,
@@ -173,12 +172,12 @@ impl Run for Runner {
                 Source::Fixed { metal, entry, .. } => {
                     gpukit::metal::cached_pipeline(ctx, metal, entry)?
                 }
-                Source::Made(text) => match self.made.get(&text.entry) {
+                Source::Made(body) => match self.made.get(&body.entry) {
                     Some(compiled) => Rc::clone(compiled),
                     None => {
-                        let source = text.render(Dialect::Metal);
-                        let compiled = Rc::new(ctx.compile_kernel(&source, &text.entry)?);
-                        self.made.insert(text.entry.clone(), Rc::clone(&compiled));
+                        let source = body.text().render(Dialect::Metal);
+                        let compiled = Rc::new(ctx.compile_kernel(&source, &body.entry)?);
+                        self.made.insert(body.entry.clone(), Rc::clone(&compiled));
                         compiled
                     }
                 },
@@ -202,11 +201,11 @@ impl Run for Runner {
         &mut self.held
     }
 
-    fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
+    fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         self.commit(steps).map(drop)
     }
 
-    fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {
+    fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
         let again = std::iter::repeat_n(step, times);
         Ok(self.commit(again)? / times as f64)
     }

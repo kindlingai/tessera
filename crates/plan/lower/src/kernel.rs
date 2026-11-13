@@ -66,13 +66,24 @@ pub struct Needs {
     pub lanes: usize,
     pub group_bytes: usize,
     pub group_threads: usize,
+    /// Hand-written text, for a backend with a compiler.
+    pub compiler: bool,
 }
 
 impl Needs {
+    /// Hand-written kernels ask for a compiler, nothing else.
+    pub fn text() -> Self {
+        Needs {
+            compiler: true,
+            ..Needs::default()
+        }
+    }
+
     pub fn fits(&self, limits: &Limits) -> bool {
         (self.lanes == 0 || self.lanes == limits.lanes)
             && self.group_bytes <= limits.group_bytes
             && self.group_threads <= limits.group_threads
+            && (!self.compiler || limits.compiler)
     }
 }
 
