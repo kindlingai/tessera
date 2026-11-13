@@ -55,6 +55,8 @@ pub struct Tree<'a> {
     pub outputs: Vec<(T, Vec<usize>)>,
     /// Elements and type of each input port, used or not.
     pub ports: Vec<(usize, DType)>,
+    /// The sizes this tree was viewed at.
+    sizes: Vec<(DimName, u64)>,
 }
 
 pub(crate) fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
@@ -94,12 +96,13 @@ fn sized(
     upto: &[DimName],
     s: &Shape,
 ) -> Result<Vec<Extent>, Error> {
-    let at = |e: &graph::DimExpr, value: Option<u64>| {
-        let size = |name| match upto.contains(&name) {
-            true => value,
+    // `e` with `vary` at `value`, other sizes as given.
+    let at = |e: &graph::DimExpr, vary: DimName, value: u64| {
+        let size = |name| match name == vary {
+            true => Some(value),
             false => sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n),
         };
-        e.value(&g.dims, &size)
+        e.value(&g.dims, &size).map(|v| v as i64)
     };
     let most = |e: &graph::DimExpr| {
         let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n);
@@ -107,18 +110,25 @@ fn sized(
     };
     let dim = |e: &graph::DimExpr| -> Option<Extent> {
         let most = most(e)?;
-        let (v0, v1, v2) = (at(e, Some(0))?, at(e, Some(1))?, at(e, Some(2))?);
-        if upto.is_empty() || (v0 == v1 && v1 == v2) {
-            return Some(Extent::Fixed(most));
+        let mut runtime = None;
+        for name in upto {
+            let (v0, v1, v2) = (at(e, *name, 0)?, at(e, *name, 1)?, at(e, *name, 2)?);
+            if v0 == v1 && v1 == v2 {
+                continue;
+            }
+            // At most one runtime dimension, entering linearly.
+            let (mul, add) = (v1 - v0, v0);
+            if v2 - v1 != mul || mul < 0 || runtime.is_some() {
+                return None;
+            }
+            runtime = Some(Extent::Dim {
+                name: *name,
+                mul: mul as usize,
+                add,
+                most,
+            });
         }
-        // At most one runtime dimension, entering linearly.
-        let (mul, add) = (v1 - v0, v0 as i64);
-        (v2 - v1 == mul && upto.len() == 1).then_some(Extent::Dim {
-            name: upto[0],
-            mul: mul as usize,
-            add,
-            most,
-        })
+        Some(runtime.unwrap_or(Extent::Fixed(most)))
     };
     let all: Option<Vec<Extent>> = s.0.iter().map(dim).collect();
     all.ok_or_else(|| Error::Size(s.to_string()))
@@ -155,6 +165,7 @@ impl<'a> Tree<'a> {
             readers: Vec::new(),
             outputs: Vec::new(),
             ports: Vec::new(),
+            sizes: sizes.to_vec(),
         };
         for port in &e.inputs {
             let shape = sized(g, sizes, upto, &port.ty.shape)?;
@@ -320,6 +331,9 @@ impl<'a> Tree<'a> {
                     return None;
                 };
                 let stride = self.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+                // Slots the rows span, if the launch says. Else any.
+                let segments = self.sizes.iter().find(|(n, _)| *n == DimName::Segments);
+                let segments = segments.map_or(queries, |(_, n)| *n as usize).min(queries);
                 let sizes = Attn {
                     seqs,
                     queries,
@@ -328,6 +342,7 @@ impl<'a> Tree<'a> {
                     kv_heads,
                     width,
                     stride,
+                    segments,
                 };
                 Some(Site::Attend {
                     scale: a.scale,
@@ -357,6 +372,7 @@ impl<'a> Tree<'a> {
                     kv_heads,
                     width,
                     stride: keys.most(),
+                    segments: 1,
                 };
                 let scale = a.scale;
                 Some(Site::Attend {

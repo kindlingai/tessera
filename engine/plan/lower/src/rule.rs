@@ -22,13 +22,22 @@ pub struct Attn {
     pub width: usize,
     /// Rows one slot holds in the kept keys.
     pub stride: usize,
+    /// Slots the query rows span, at most.
+    pub segments: usize,
 }
 
 impl Attn {
     /// What an attention kernel's time depends on.
     pub fn sizes(&self) -> Vec<usize> {
         let keys = self.keys.most();
-        vec![self.seqs, self.queries, keys, self.heads, self.width]
+        vec![
+            self.seqs,
+            self.queries,
+            keys,
+            self.heads,
+            self.width,
+            self.segments,
+        ]
     }
 
     /// A ragged launch: six buffers, then its five sizes.
