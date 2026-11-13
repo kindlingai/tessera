@@ -2,7 +2,7 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
-use gpukit::Limits;
+use gpukit::{Limits, Settings};
 use graph::DimName;
 use mem::{Buffer, Tensor, View, ViewMut, copy};
 use std::collections::HashMap;
@@ -188,22 +188,20 @@ pub trait Run {
     }
 }
 
-/// A runner on the backend this build dispatches to.
-pub fn open(plan: Plan) -> Result<Box<dyn Run>, Error> {
+/// A runner on the GPU `settings` picks, or the host.
+pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
     use gpukit::backend::Backend;
-    use gpukit::backend::available;
-    // The host runs any plan when no GPU is up.
-    if crate::cpu::chosen() {
-        return Ok(Box::new(crate::cpu::Runner::new(plan)?));
-    }
-    match available() {
+    match settings.gpu() {
         #[cfg(target_os = "macos")]
         Some(Backend::Metal) => Ok(Box::new(crate::metal::Runner::new(plan)?)),
         #[cfg(feature = "cuda")]
         Some(Backend::Cuda) => Ok(Box::new(crate::device::cuda::Runner::new(plan)?)),
         #[cfg(feature = "rocm")]
         Some(Backend::Rocm) => Ok(Box::new(crate::device::rocm::Runner::new(plan)?)),
-        _ => Ok(Box::new(crate::cpu::Runner::new(plan)?)),
+        _ => Ok(Box::new(crate::cpu::Runner::new(
+            plan,
+            settings.host_lanes,
+        )?)),
     }
 }

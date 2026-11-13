@@ -24,13 +24,13 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(plan: Plan) -> Result<Self, Error> {
+    pub fn new(plan: Plan, lanes: usize) -> Result<Self, Error> {
         let mut runner = Self {
             plan: Plan::default(),
             held: Held::default(),
             bodies: Vec::new(),
             bound: HashMap::new(),
-            lanes: lanes(),
+            lanes,
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -105,18 +105,10 @@ impl Runner {
     }
 }
 
-/// Lanes per SIMD group: 32, or what `TESSERA_LANES` says.
-fn lanes() -> usize {
-    std::env::var("TESSERA_LANES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32)
-}
-
-/// A group's limits on the host, lanes as configured.
-pub fn limits() -> Limits {
+/// A host group's limits, `lanes` to a SIMD group.
+pub fn limits(lanes: usize) -> Limits {
     Limits {
-        lanes: lanes(),
+        lanes,
         group_bytes: 64 * 1024,
         group_threads: 1024,
         compiler: false,
@@ -184,11 +176,6 @@ impl Run for Runner {
     }
 
     fn limits(&self) -> Limits {
-        limits()
+        limits(self.lanes)
     }
-}
-
-/// Plans run on the host: no GPU, or asked for.
-pub fn chosen() -> bool {
-    std::env::var("TESSERA_BACKEND").as_deref() == Ok("cpu") || !gpukit::testing::backend_ready()
 }

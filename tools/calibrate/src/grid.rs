@@ -3,7 +3,7 @@
 use crate::measure;
 use gpukit::testing::Noise;
 use graph::DimName::{self, *};
-use lower::{Device, Error, Run, Step, Tensor, View, lower, open};
+use lower::{Device, Error, Run, Settings, Step, Tensor, View, lower, open};
 use trace::{
     Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
     TensorType, Weights, declare,
@@ -132,31 +132,48 @@ fn fill(g: &Graph, ty: &TensorType, sizes: &Sizes, noise: &mut Noise) -> Result<
 
 impl Case {
     /// Times this case at each of its sizes that fits.
-    fn run(&self, device: &mut Device, noise: &mut Noise) -> Result<Vec<(Step, f64)>, Error> {
+    fn run(
+        &self,
+        device: &mut Device,
+        noise: &mut Noise,
+        settings: &Settings,
+    ) -> Result<Vec<(Step, f64)>, Error> {
         let mut runner: Option<Box<dyn Run>> = None;
         let mut added = Vec::new();
         for sizes in &self.sizes {
-            let plan = lower(&self.g, 0, sizes, &Device::guess())?;
+            let plan = lower(&self.g, 0, sizes, &Device::guess(settings))?;
             if plan.buffers.iter().sum::<usize>() > ROOM {
                 continue;
             }
             let runner = match &mut runner {
                 Some(runner) => runner,
-                None => runner.insert(self.open(plan, noise)?),
+                None => runner.insert(self.open(plan, noise, settings)?),
             };
             let ports = self.g.entries[0].inputs.iter();
             let fed: Result<Vec<Tensor>, Error> =
                 ports.map(|p| fill(&self.g, &p.ty, sizes, noise)).collect();
             let fed = fed?;
             let feeds: Vec<View> = fed.iter().map(Tensor::view).collect();
-            added.extend(measure(&mut **runner, (&self.g, 0), sizes, &feeds, device)?);
+            added.extend(measure(
+                &mut **runner,
+                (&self.g, 0),
+                sizes,
+                &feeds,
+                device,
+                settings,
+            )?);
         }
         Ok(added)
     }
 
     /// A runner with noise for weights.
-    fn open(&self, plan: lower::Plan, noise: &mut Noise) -> Result<Box<dyn Run>, Error> {
-        let mut runner = open(plan)?;
+    fn open(
+        &self,
+        plan: lower::Plan,
+        noise: &mut Noise,
+        settings: &Settings,
+    ) -> Result<Box<dyn Run>, Error> {
+        let mut runner = open(plan, settings)?;
         for (at, w) in self.g.weights.iter().enumerate() {
             let data = fill(&self.g, &w.ty, &Vec::new(), noise)?;
             runner.load(at as u32, data.view())?;
@@ -220,11 +237,11 @@ impl Grid {
     }
 
     /// Times every case on this GPU. Returns the launches timed.
-    pub fn run(&self, device: &mut Device) -> Result<Vec<(Step, f64)>, Error> {
+    pub fn run(&self, device: &mut Device, settings: &Settings) -> Result<Vec<(Step, f64)>, Error> {
         let mut noise = Noise(17);
         let mut added = Vec::new();
         for case in self.cases() {
-            added.extend(case.run(device, &mut noise)?);
+            added.extend(case.run(device, &mut noise, settings)?);
         }
         Ok(added)
     }

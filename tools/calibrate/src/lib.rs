@@ -10,7 +10,7 @@ use linear as _;
 pub use grid::Grid;
 
 use graph::{DimName, Graph};
-use lower::{Device, Error, Run, Step, View, lower, select};
+use lower::{Device, Error, Run, Settings, Step, View, lower, select};
 use sim::Chip;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -40,13 +40,14 @@ pub fn measure(
     sizes: &[(DimName, u64)],
     feeds: &[View],
     device: &mut Device,
+    settings: &Settings,
 ) -> Result<Vec<(Step, f64)>, Error> {
     if device.limits != runner.limits() {
         *device = device.clone().within(runner.limits());
     }
     // The same pins, or the weights would load again.
     let pins = device.pins.clone();
-    let guess = || Device::guess().pinned(pins.clone());
+    let guess = || Device::guess(settings).pinned(pins.clone());
     let contested = select(g, entry, sizes, &guess())?.contested;
     let favored = contested.into_iter().map(|r| guess().favoring(r));
     let mut added = Vec::new();
@@ -77,9 +78,9 @@ pub struct Verdict {
 }
 
 /// Compares `chip`'s estimates with timed launches, by kernel.
-pub fn judge(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Verdict> {
+pub fn judge(chip: &dyn Chip, timed: &[(Step, f64)], settings: &Settings) -> Vec<Verdict> {
     // Each distinct launch counts once, at its median time.
-    let mut device = Device::guess();
+    let mut device = Device::guess(settings);
     device.fit(timed.iter().map(|(step, seconds)| (step, *seconds)));
     let mut seen: Vec<&Step> = Vec::new();
     let mut by: BTreeMap<&'static str, (f64, Vec<f64>)> = BTreeMap::new();
@@ -142,20 +143,19 @@ pub fn headroom(chip: &dyn Chip, timed: &[(Step, f64)]) -> Vec<Headroom> {
 }
 
 /// Where this machine keeps the samples for `device`.
-pub fn path(device: &str) -> PathBuf {
+pub fn path(settings: &Settings, device: &str) -> Option<PathBuf> {
     let plain = |c: char| if c.is_ascii_alphanumeric() { c } else { '-' };
     let file: String = device.chars().map(plain).collect();
-    let dir = std::env::var_os("TESSERA_COSTS").map(PathBuf::from);
-    let home = || std::env::home_dir().unwrap_or_else(std::env::temp_dir);
-    let dir = dir.unwrap_or_else(|| home().join(".cache/tessera/costs"));
-    dir.join(format!("{file}.json"))
+    Some(settings.costs.as_ref()?.join(format!("{file}.json")))
 }
 
 /// The samples stored for the runner's device, or a guess.
-pub fn stored(runner: &dyn Run) -> Result<Device, std::io::Error> {
-    let device = match Device::load(&path(&runner.device())) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Device::guess(),
-        loaded => loaded?,
+pub fn stored(runner: &dyn Run, settings: &Settings) -> Result<Device, std::io::Error> {
+    let loaded = path(settings, &runner.device()).map(|p| Device::load(&p));
+    let device = match loaded {
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Device::guess(settings),
+        Some(loaded) => loaded?,
+        None => Device::guess(settings),
     };
     Ok(device.within(runner.limits()))
 }

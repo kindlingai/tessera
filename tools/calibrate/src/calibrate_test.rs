@@ -1,8 +1,10 @@
 use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
 use crate::{Grid, headroom, judge, path};
-use gpukit::testing::backend_ready;
-use lower::{Device, rules};
+use engine::settings;
+use gpukit::testing::scratch;
+use lower::{Device, Settings, rules};
 use sim::Chip;
+use std::path::PathBuf;
 
 /// A crate's rules register once this one links it.
 #[test]
@@ -12,23 +14,28 @@ fn linked_rules_register() {
 
 #[test]
 fn grid_reaches_rules() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
-    let mut device = Device::guess();
-    let timed = Grid::tiny().run(&mut device).unwrap();
+    let settings = settings();
+    let mut device = Device::guess(&settings);
+    let timed = Grid::tiny().run(&mut device, &settings).unwrap();
     assert!(device.samples() > 0 && !device.name.is_empty());
-    for rule in rules() {
+    // The host cannot run the hand-written dense gemm.
+    let host = settings.gpu().is_none();
+    for rule in rules().iter().filter(|r| !(host && r.name == "dense")) {
         let ran = timed.iter().any(|(step, _)| step.rule == rule.name);
         assert!(ran, "the grid never ran {}", rule.name);
     }
     // Everything is known now, so a second pass times nothing.
-    assert!(Grid::tiny().run(&mut device).unwrap().is_empty());
-    let file = std::env::temp_dir().join("tessera-calibrate-test.json");
+    assert!(Grid::tiny().run(&mut device, &settings).unwrap().is_empty());
+    let file = scratch("tessera-calibrate-test.json");
     device.save(&file).unwrap();
     assert!(Device::load(&file).unwrap() == device, "a round trip");
     std::fs::remove_file(&file).unwrap();
-    assert!(path(&device.name).ends_with(format!("{}.json", device.name.replace(' ', "-"))));
+    let costs = Settings {
+        costs: Some(PathBuf::from("costs")),
+        ..settings
+    };
+    let stored = path(&costs, &device.name).unwrap();
+    assert!(stored.ends_with(format!("{}.json", device.name.replace(' ', "-"))));
 }
 
 /// A made-up chip's reading for one probe.
@@ -65,12 +72,10 @@ fn probes_fit_pools() {
 
 #[test]
 fn judge_skips_unmodelled_kernels() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
-    let mut device = Device::guess();
-    let timed = Grid::tiny().run(&mut device).unwrap();
-    let verdicts = judge(&sim::m3_pro(), &timed);
+    let settings = settings();
+    let mut device = Device::guess(&settings);
+    let timed = Grid::tiny().run(&mut device, &settings).unwrap();
+    let verdicts = judge(&sim::m3_pro(), &timed, &settings);
     let names: Vec<&str> = verdicts.iter().map(|v| v.kernel).collect();
     assert!(names.contains(&"lanes") && names.contains(&"map"));
     // Attention states its load later, so judging skips it.
@@ -88,17 +93,16 @@ fn judge_skips_unmodelled_kernels() {
 /// A float probe, an index probe and the links run.
 #[test]
 fn probes_and_links_run() {
-    if !backend_ready() {
-        return eprintln!("no GPU here; skipped");
-    }
+    let settings = settings();
     let probe = |kind, threads, trips| Probe {
         kind,
         threads,
         trips,
     };
-    let readings = read(&[probe(Kind::Spin, 256, 16), probe(Kind::Chase, 1, 4)]).unwrap();
+    let probes = [probe(Kind::Spin, 256, 16), probe(Kind::Chase, 1, 4)];
+    let readings = read(&probes, &settings).unwrap();
     assert!(readings.iter().all(|r| r.seconds > 0.0));
-    let cluster = links().unwrap();
+    let cluster = links(&settings).unwrap();
     assert_eq!(cluster.links.len(), 2);
     assert!(cluster.links.iter().all(|l| l.rate > 0.0));
 }

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub struct CacheConfig {
     /// `false` keeps an in-memory archive only (nothing touches disk).
     pub enabled: bool,
-    /// `None` means the user cache directory, then `/tmp`.
+    /// Where archives live. `None` keeps the archive in memory.
     pub dir: Option<PathBuf>,
     pub namespace: &'static str,
     /// Change it with any shader source, or edits run stale.
@@ -36,16 +36,9 @@ impl CacheConfig {
         verbose: false,
     };
 
-    fn root_dir(&self) -> PathBuf {
-        if let Some(dir) = &self.dir {
-            return dir.clone();
-        }
-        std::env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join(self.namespace)
-            .join("metal-pipelines")
+    fn root_dir(&self) -> Option<PathBuf> {
+        let dir = self.dir.as_ref().filter(|_| self.enabled)?;
+        Some(dir.join(self.namespace).join("metal-pipelines"))
     }
 }
 
@@ -106,11 +99,9 @@ impl PipelineArchiveCache {
 
     fn open(device: &ProtocolObject<dyn MTLDevice>, config: &CacheConfig) -> Result<Self, Error> {
         let open_started = std::time::Instant::now();
-        if !config.enabled {
+        let Some(cache_dir) = config.root_dir() else {
             return Self::open_ephemeral(device);
-        }
-
-        let cache_dir = config.root_dir();
+        };
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| Error::Cache(format!("mkdir failed: {e}")))?;
 

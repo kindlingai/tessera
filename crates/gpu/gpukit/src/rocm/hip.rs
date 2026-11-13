@@ -15,9 +15,6 @@ pub const HIP_SUCCESS: HipError = 0;
 pub const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const MEMCPY_DEVICE_TO_HOST: c_int = 2;
 
-/// Environment variable that overrides the runtime library name.
-const RUNTIME_ENV: &str = "DGQ_HIP_RUNTIME";
-
 type HipInit = unsafe extern "C" fn(u32) -> HipError;
 type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
@@ -81,7 +78,7 @@ fn c_message(p: *const c_char) -> String {
 
 impl Runtime {
     fn open() -> Result<Self, String> {
-        let mut names: Vec<String> = std::env::var(RUNTIME_ENV).into_iter().collect();
+        let mut names: Vec<String> = Vec::new();
         for name in [
             "libamdhip64.so",
             "libamdhip64.so.7",

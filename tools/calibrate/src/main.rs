@@ -2,16 +2,16 @@
 
 use calibrate::probe::{fit, links, read, suite};
 use calibrate::{Grid, headroom, judge, path};
-use lower::{Cluster, Device, Step};
+use lower::{Cluster, Device, Settings, Step};
 use sim::{Chip, known};
 use std::error::Error;
 use std::process::ExitCode;
 use std::time::Instant;
 
 /// Prints, per kernel, the model against the clock.
-fn report(chip: &dyn Chip, timed: &[(Step, f64)]) {
+fn report(chip: &dyn Chip, timed: &[(Step, f64)], settings: &Settings) {
     println!("{} against timed launches:", chip.name());
-    for v in judge(chip, timed) {
+    for v in judge(chip, timed, settings) {
         let [low, median, high] = v.ratio;
         println!(
             "  {:9} {:5} launches {:8.3} s  estimate/timed {low:.2} {median:.2} {high:.2}",
@@ -43,12 +43,12 @@ fn hops(cluster: &Cluster) {
 }
 
 /// Probes the chip, times the grid, restarts the stored file.
-fn run() -> Result<(), Box<dyn Error>> {
+fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
-    let readings = read(&suite())?;
-    let cluster = links()?;
-    let mut device = Device::guess();
-    let timed = Grid::full().run(&mut device)?;
+    let readings = read(&suite(), settings)?;
+    let cluster = links(settings)?;
+    let mut device = Device::guess(settings);
+    let timed = Grid::full().run(&mut device, settings)?;
     let seconds = start.elapsed().as_secs_f64();
     let launches = timed.len();
     println!(
@@ -60,23 +60,23 @@ fn run() -> Result<(), Box<dyn Error>> {
     for (name, c) in pool.constants() {
         println!("  {name:7} {:10.4e}  {}", c.value, c.note);
     }
-    report(&pool, &timed);
+    report(&pool, &timed, settings);
     if let Some(table) = known(&device.name) {
-        report(&*table, &timed);
+        report(&*table, &timed, settings);
     }
     room(&pool, &timed);
     hops(&cluster);
     // The stored device carries the fit, for unmeasured kernels.
     let device = device.fitted(fit).zoned(cluster);
-    let path = path(&device.name);
+    let path = path(settings, &device.name).ok_or("no home: set TESSERA_COSTS")?;
     device.save(&path)?;
     println!("{} samples in {}", device.samples(), path.display());
     Ok(())
 }
 
 /// Prints each probe's reading.
-fn probe() -> Result<(), Box<dyn Error>> {
-    for r in read(&suite())? {
+fn probe(settings: &Settings) -> Result<(), Box<dyn Error>> {
+    for r in read(&suite(), settings)? {
         let (p, us) = (r.probe, r.seconds * 1e6);
         let per = r.seconds * 1e9 / p.trips.max(1) as f64;
         println!(
@@ -84,13 +84,18 @@ fn probe() -> Result<(), Box<dyn Error>> {
             p.kind, p.threads, p.trips
         );
     }
-    hops(&links()?);
+    hops(&links(settings)?);
     Ok(())
 }
 
 fn main() -> ExitCode {
     let probing = std::env::args().nth(1).as_deref() == Some("probe");
-    match if probing { probe() } else { run() } {
+    let settings = engine::settings();
+    match if probing {
+        probe(&settings)
+    } else {
+        run(&settings)
+    } {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tessera-calibrate: {e}");

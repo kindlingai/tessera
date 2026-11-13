@@ -2,7 +2,7 @@
 
 /// Whether GPU tests should run here.
 pub fn gpu_available() -> bool {
-    gpukit::testing::backend_ready()
+    engine::settings().gpu().is_some()
 }
 
 pub use gpukit::testing::{assert_oracle, cosine_f32, max_abs_diff};

@@ -39,6 +39,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+engine = { workspace = true }
 kernels = { workspace = true }
 linear = { workspace = true }
 interp = { workspace = true }

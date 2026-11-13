@@ -9,6 +9,7 @@ use interp::{Tensor, run};
 
 mod common;
 use common::{Finish, finished, linear, noise};
+use engine::settings;
 use linear::{SCHEDULES, Schedule};
 use lower::{Device, Dialect, Pins, Source, lower, open, round, rules};
 use trace::{Act, DType};
@@ -17,14 +18,20 @@ use trace::{Act, DType};
 fn only(at: usize) -> Device {
     let others = SCHEDULES.iter().enumerate().filter(|(i, _)| *i != at);
     let bar = |d: Device, (_, s): (usize, &Schedule)| d.without(s.names[0]).without(s.names[1]);
-    others.fold(Device::guess().favoring("tiled"), bar)
+    others.fold(Device::guess(&settings()).favoring("tiled"), bar)
 }
 
 #[test]
 fn rule_registers() {
     assert!(rules().iter().any(|r| r.name == "tiled"));
     let g = linear(72, 50);
-    let plan = lower(&g, 0, &[(Rows, 37)], &Device::guess().favoring("tiled")).unwrap();
+    let plan = lower(
+        &g,
+        0,
+        &[(Rows, 37)],
+        &Device::guess(&settings()).favoring("tiled"),
+    )
+    .unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names.len(), 1, "{names:?}");
     assert!(names[0].starts_with("tiled_"), "{names:?}");
@@ -63,7 +70,7 @@ fn tiles_match_cpu() {
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
                 let name = schedule.names[(form == DType::Bf16) as usize];
                 assert_eq!(names, [name]);
-                let mut runner = open(plan).unwrap();
+                let mut runner = open(plan, &settings()).unwrap();
                 runner.load(0, weights[0].view()).unwrap();
                 let got = runner.run(&[x.view()]).unwrap().remove(0);
                 let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
@@ -87,7 +94,7 @@ fn stages_ride_along() {
         let weights = [noise(vec![48, 48], &mut draws)];
         let x = noise(vec![70, 48], &mut draws);
         let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-        let device = Device::guess().favoring("tiled");
+        let device = Device::guess(&settings()).favoring("tiled");
         let plan = lower(&g, 0, &[(Rows, 70)], &device).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         assert!(
@@ -95,7 +102,7 @@ fn stages_ride_along() {
             "{names:?}"
         );
         assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
-        let mut runner = open(plan).unwrap();
+        let mut runner = open(plan, &settings()).unwrap();
         runner.load(0, weights[0].view()).unwrap();
         let got = runner.run(&[x.view()]).unwrap().remove(0);
         let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());

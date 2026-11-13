@@ -2,7 +2,9 @@ use crate::cache::{Cache, key};
 
 #[test]
 fn cache_round_trips() {
-    let path = std::env::temp_dir().join(format!("simcheck-{}.bin", std::process::id()));
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/scratch"));
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("simcheck-{}.bin", std::process::id()));
     let mut c = Cache::default();
     c.insert(key("a"), vec![1.0, 2.0]);
     c.insert(key("b"), vec![3.0, 4.0]);
