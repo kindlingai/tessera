@@ -82,9 +82,11 @@ jobs:
       HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       # The PR head, so report links match the checked-out lines.
+      # Full history, so new files count from the base branch.
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.HEAD }}
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
@@ -116,9 +118,11 @@ jobs:
           path: ${{ runner.temp }}/simcheck.bin
           key: simcheck-${{ github.run_id }}
           restore-keys: simcheck-
+      # On a pull request, new files that lean elsewhere get a note.
       - run: >
           $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/simcheck.md"
           "https://github.com/${{ github.repository }}/blob/${{ env.HEAD }}"
+          ${{ github.base_ref && format('origin/{0}', github.base_ref) || '' }}
       - if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}

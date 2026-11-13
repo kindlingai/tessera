@@ -1,5 +1,6 @@
 //! A Markdown report of near-copies, for a pull request comment.
 
+use crate::far::Lean;
 use crate::pairs::Hit;
 use crate::windows::Window;
 use anyhow::Result;
@@ -36,9 +37,32 @@ fn place(w: &Window, window: usize, links: Option<&str>) -> String {
     }
 }
 
-/// Each file pair's closest hunks, links and allow line.
+/// New files that read more like another crate. Advice only.
+fn leans(out: &mut String, leans: &[Lean]) -> Result<()> {
+    if leans.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\n### New files nearer another crate\n")?;
+    writeln!(
+        out,
+        "These new files read more like another crate than their own. \
+         Think about moving them. This does not fail the check.\n"
+    )?;
+    writeln!(out, "| File | Own crate | Nearer crate |\n|---|---|---|")?;
+    for l in leans {
+        writeln!(
+            out,
+            "| `{}` | `{}` {:.3} | `{}` {:.3} |",
+            l.path, l.home, l.own, l.other, l.near
+        )?;
+    }
+    Ok(())
+}
+
+/// Near-copy hunks with allow lines, then leaning files.
 pub fn markdown(
     hits: &[Hit],
+    lean: &[Lean],
     wins: &[Window],
     root: &Path,
     (window, min): (usize, f32),
@@ -47,6 +71,7 @@ pub fn markdown(
     let mut out = format!("{MARKER}\n### Near-copies of code\n\n");
     if hits.is_empty() {
         out.push_str("None found.\n");
+        leans(&mut out, lean)?;
         return Ok(out);
     }
     writeln!(
@@ -81,5 +106,6 @@ pub fn markdown(
     if hits.len() > MAX_HITS {
         writeln!(out, "{} more pairs are not shown.", hits.len() - MAX_HITS)?;
     }
+    leans(&mut out, lean)?;
     Ok(out)
 }

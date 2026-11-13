@@ -38,6 +38,9 @@ shape_steps = [[10, 3], [20, 2], [40, 1]]
 similar_window = 20
 similar_spacing = 7
 max_similarity = 0.97
+# A new file nearer another crate than its own by this
+# much gets a note in the pull request. It does not fail.
+max_lean = 0.03
 
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]

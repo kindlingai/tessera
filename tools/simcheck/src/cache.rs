@@ -64,6 +64,10 @@ impl Cache {
         self.map.insert(k, v);
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.map.keys().copied()
+    }
+
     /// Writes the entries in `keep`, dropping the rest.
     pub fn save(&self, path: &Path, keep: &[u64]) -> Result<()> {
         let mut out = MAGIC.to_vec();
