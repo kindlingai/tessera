@@ -1,5 +1,6 @@
-//! The HTTP routes: health, and completions plain or streamed.
+//! The HTTP routes: health, completions and chat, plain or streamed.
 
+use crate::template::{Message, Template};
 use crate::text::Spool;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -22,6 +23,7 @@ pub type Job = (Request, async_mpsc::Sender<Event>);
 /// What every handler shares.
 pub struct Shared {
     pub tokenizer: Tokenizer,
+    pub template: Option<Template>,
     pub stop: Vec<u32>,
     /// The engine thread's queue. One answer runs at a time.
     pub jobs: Mutex<mpsc::Sender<Job>>,
@@ -34,6 +36,22 @@ pub struct Completion {
     max_tokens: usize,
     #[serde(default)]
     stream: bool,
+}
+
+#[derive(Deserialize)]
+pub struct Chat {
+    messages: Vec<Message>,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default)]
+    stream: bool,
+    /// Whether the model may think first. Left out: its default.
+    #[serde(default = "yes")]
+    think: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_max_tokens() -> usize {
@@ -66,6 +84,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/completions", post(complete))
+        .route("/v1/chat/completions", post(chat))
         .with_state(shared)
 }
 
@@ -73,16 +92,20 @@ pub fn router(shared: Arc<Shared>) -> Router {
 type Refused = (StatusCode, String);
 
 /// Queues the prompt. Returns the event stream, or why not.
-fn submit(shared: &Shared, c: &Completion) -> Result<async_mpsc::Receiver<Event>, Refused> {
+fn submit(
+    shared: &Shared,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<async_mpsc::Receiver<Event>, Refused> {
     let bad = |what: String| (StatusCode::BAD_REQUEST, what);
-    let encoded = shared.tokenizer.encode(c.prompt.as_str(), false);
+    let encoded = shared.tokenizer.encode(prompt, false);
     let tokens = encoded.map_err(|e| bad(e.to_string()))?.get_ids().to_vec();
     if tokens.is_empty() {
         return Err(bad("an empty prompt".into()));
     }
     let request = Request {
         tokens,
-        max_tokens: c.max_tokens,
+        max_tokens,
         stop: shared.stop.clone(),
     };
     let (events, receiver) = async_mpsc::channel(64);
@@ -98,13 +121,38 @@ fn submit(shared: &Shared, c: &Completion) -> Result<async_mpsc::Receiver<Event>
 }
 
 async fn complete(State(shared): State<Arc<Shared>>, Json(c): Json<Completion>) -> Response {
-    let mut events = match submit(&shared, &c) {
-        Ok(events) => events,
-        Err(refused) => return refused.into_response(),
+    match submit(&shared, &c.prompt, c.max_tokens) {
+        Ok(events) => answer(shared, events, c.stream).await,
+        Err(refused) => refused.into_response(),
+    }
+}
+
+async fn chat(State(shared): State<Arc<Shared>>, Json(c): Json<Chat>) -> Response {
+    let Some(template) = &shared.template else {
+        return (StatusCode::BAD_REQUEST, "the model has no chat template").into_response();
     };
+    if c.messages.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no messages").into_response();
+    }
+    let prompt = match template.render(&c.messages, c.think) {
+        Ok(prompt) => prompt,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match submit(&shared, &prompt, c.max_tokens) {
+        Ok(events) => answer(shared, events, c.stream).await,
+        Err(refused) => refused.into_response(),
+    }
+}
+
+/// The events as text: one response, or streamed pieces.
+async fn answer(
+    shared: Arc<Shared>,
+    mut events: async_mpsc::Receiver<Event>,
+    stream: bool,
+) -> Response {
     let decode = move |ids: &[u32]| shared.tokenizer.decode(ids, true).unwrap_or_default();
     let mut spool = Spool::default();
-    if c.stream {
+    if stream {
         let pieces = ReceiverStream::new(events).map(move |e| {
             let piece = match e {
                 Event::Token(id) => Piece {

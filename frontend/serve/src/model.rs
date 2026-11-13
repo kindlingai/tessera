@@ -1,5 +1,6 @@
 //! A model directory as graph, weights, tokenizer and stops.
 
+use crate::template::Template;
 use checkpoint::File;
 use graph::Graph;
 use interp::{Tensor, bind};
@@ -42,6 +43,7 @@ pub struct Loaded {
     pub graph: Graph,
     pub weights: Vec<Tensor>,
     pub tokenizer: Tokenizer,
+    pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
 }
@@ -75,6 +77,7 @@ pub fn load(dir: &Path, context: u64) -> Result<Loaded, Box<dyn Error + Send + S
     };
     let weights = bind(&graph, find)?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+    let template = Template::load(dir)?;
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
         Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
             Some(Ids::One(id)) => vec![id],
@@ -87,6 +90,7 @@ pub fn load(dir: &Path, context: u64) -> Result<Loaded, Box<dyn Error + Send + S
         graph,
         weights,
         tokenizer,
+        template,
         stop,
     })
 }
