@@ -229,6 +229,13 @@ impl Counter {
                         self.add(float(1.0));
                         true
                     }
+                    Intrinsic::KeptRow => {
+                        self.add(Ops {
+                            int: 2.0,
+                            ..Ops::default()
+                        });
+                        false
+                    }
                     Intrinsic::Clamp => {
                         self.add(float(2.0));
                         true

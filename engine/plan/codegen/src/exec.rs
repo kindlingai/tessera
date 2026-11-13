@@ -2,6 +2,7 @@
 
 use crate::form::Form;
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::kept::Layout;
 use crate::numerics::Precision;
 use std::collections::HashMap;
 
@@ -106,6 +107,7 @@ struct Group<'a, 'b> {
     tiles: HashMap<String, (usize, usize, Vec<Vec<f32>>)>,
     /// Threads that returned.
     done: Vec<bool>,
+    layout: Option<&'static dyn Layout>,
     args: &'b HashMap<String, ArgVal>,
     buffers: &'b mut [&'a mut [u8]],
 }
@@ -378,6 +380,21 @@ impl Group<'_, '_> {
                 vec![Val::B(false); n]
             }
             Intrinsic::Zero4 => vec![Val::V([0.0; 4]); n],
+            Intrinsic::KeptRow => {
+                let layout = self
+                    .layout
+                    .expect("a kernel reading kept rows names its layout");
+                let values: Vec<u32> = (layout.params().iter())
+                    .map(|p| match self.args.get(*p) {
+                        Some(ArgVal::U32(v)) => *v,
+                        other => panic!("layout scalar `{p}` is {other:?}"),
+                    })
+                    .collect();
+                let (s, p) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+                (0..n)
+                    .map(|t| Val::U(layout.at(s[t].u(), p[t].u(), &values)))
+                    .collect()
+            }
         }
     }
 
@@ -766,6 +783,7 @@ pub fn run(
             shared: HashMap::new(),
             tiles: HashMap::new(),
             done: vec![false; grid.threads],
+            layout: body.layout,
             args: &named,
             buffers: &mut *buffers,
         };

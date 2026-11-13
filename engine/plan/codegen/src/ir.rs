@@ -3,6 +3,7 @@
 use crate::LANES;
 use crate::dialect::Text;
 use crate::form::Form;
+use crate::kept::Layout;
 use std::collections::HashMap;
 
 /// A value's type, as the printer needs it.
@@ -105,6 +106,8 @@ pub enum Intrinsic {
     Store4,
     /// A zeroed `float4`.
     Zero4,
+    /// `kept_row(slot, position)`: the row the layout gives.
+    KeptRow,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -269,6 +272,8 @@ pub enum Param {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Body {
     pub entry: String,
+    /// The kept-row layout `kept_row` reads, when a call does.
+    pub layout: Option<&'static dyn Layout>,
     pub params: Vec<Param>,
     pub stmts: Vec<Stmt>,
     /// The value a kernel called from another gives back.
@@ -296,6 +301,7 @@ struct Printer<'a> {
     indent: usize,
     lane: bool,
     params: &'a [Param],
+    layout: Option<&'static dyn Layout>,
 }
 
 impl Printer<'_> {
@@ -347,7 +353,7 @@ impl Printer<'_> {
             Expr::Field(..) => Ty::F32,
             Expr::Select(_, a, _) => self.ty(a),
             Expr::Call(i, _) => match i {
-                Intrinsic::Gid | Intrinsic::Lid | Intrinsic::Lane => Ty::U32,
+                Intrinsic::Gid | Intrinsic::Lid | Intrinsic::Lane | Intrinsic::KeptRow => Ty::U32,
                 Intrinsic::Load4 | Intrinsic::Zero4 => Ty::F32x4,
                 _ => Ty::F32,
             },
@@ -455,6 +461,13 @@ impl Printer<'_> {
                 format!("f_f32x4({name} + {}) = {}", arg(self, 1), arg(self, 2))
             }
             Intrinsic::Zero4 => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
+            Intrinsic::KeptRow => {
+                let (slot, position) = (arg(self, 0), arg(self, 1));
+                let layout = self
+                    .layout
+                    .expect("a kernel reading kept rows names its layout");
+                layout.row(&slot, &position)
+            }
         }
     }
 
@@ -754,6 +767,7 @@ impl Body {
             indent: 1,
             lane: false,
             params: &self.params,
+            layout: self.layout,
         };
         let (mut buffers, mut scalars) = (Vec::new(), Vec::new());
         let mut headers: Vec<String> = Vec::new();

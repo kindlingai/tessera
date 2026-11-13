@@ -145,14 +145,16 @@ impl Emit {
         let most = tree.g.dims.iter().find(|d| d.name == *axis);
         let stride = most.map_or(0, |d| d.size.max() as usize);
         let width: usize = all[2..].iter().product();
-        let room = all[0] * stride * width;
+        let room = tree.kept.rows(all[0], stride) * width;
         let len: usize = all.iter().product();
         let write = self.value(len, Home::Kept { index, room }, EDGE, form::F32_FORM);
         let [rows, slots, positions] = args.map(|v| self.bring(v, EDGE));
         let kernel = Scatter {
             rows: self.len(rows) / width,
             width,
-            stride,
+            slots: all[0],
+            context: stride,
+            kept: tree.kept,
         };
         self.out.ops.push(Op {
             kernel: KernelRef::new(kernel),

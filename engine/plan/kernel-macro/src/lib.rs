@@ -103,6 +103,7 @@ fn tree(f: &mut ItemFn) -> Res {
             let ret: Option<Expr> = #ret;
             Body {
                 entry: #entry.into(),
+                layout: None,
                 params: vec![#(#params),*],
                 stmts,
                 ret,
@@ -507,7 +508,7 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
 /// Names the prelude gives, which are not kernels.
 const PRELUDE: &[&str] = &[
     "barrier", "gid", "lid", "lane", "shfl_xor", "sum32", "rsqrt", "exp", "tanh", "max", "clamp",
-    "pow", "cos", "sin", "shared", "tiles",
+    "pow", "cos", "sin", "shared", "tiles", "kept_row",
 ];
 
 /// A call to another kernel: `f_inline(..)`, build values passed raw.
@@ -686,6 +687,7 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 "cos" => quote!(Intrinsic::Cos),
                 "sin" => quote!(Intrinsic::Sin),
                 "F32x4::zero" => quote!(Intrinsic::Zero4),
+                "kept_row" => quote!(Intrinsic::KeptRow),
                 other => return Err(Error::new(p.span(), format!("no `{other}` here"))),
             };
             Ok(quote!(Expr::Call(#intrinsic, vec![#(#args),*])))

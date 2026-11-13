@@ -43,6 +43,7 @@ fn block_headers_render() {
         }],
         stmts: Vec::new(),
         ret: None,
+        layout: None,
     };
     let text = body.text();
     assert_eq!(text.headers.len(), 2, "the f16 scale and the form");

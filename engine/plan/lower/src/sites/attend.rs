@@ -37,7 +37,7 @@ impl Pattern for Attend {
             let graph::DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
                 return None;
             };
-            let stride = tree.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+            let context = tree.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
             // Slots the rows span, if the launch says. Else any.
             let segments = tree.sizes.iter().find(|(n, _)| *n == DimName::Segments);
             let segments = segments.map_or(queries, |(_, n)| *n as usize).min(queries);
@@ -48,7 +48,8 @@ impl Pattern for Attend {
                 heads,
                 kv_heads,
                 width,
-                stride,
+                context,
+                kept: tree.kept,
                 segments,
             };
             return Some(Self {
@@ -68,6 +69,10 @@ impl Pattern for Attend {
             return None;
         };
         let keys = tree.node(k).extents[1];
+        // Whole sequences read the kept rows as they lie, unbroken.
+        if tree.kept.run(keys.most()) < keys.most() {
+            return None;
+        }
         let sizes = Attn {
             seqs,
             queries,
@@ -75,7 +80,8 @@ impl Pattern for Attend {
             heads,
             kv_heads,
             width,
-            stride: keys.most(),
+            context: keys.most(),
+            kept: tree.kept,
             segments: 1,
         };
         Some(Self {

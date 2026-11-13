@@ -6,6 +6,7 @@ use crate::form::{Form, Pins};
 use crate::kernels::MapStage;
 use crate::select::Home;
 use crate::sites::Pattern;
+use codegen::kept::Layout;
 use graph::{Attend, DType, DimName, Graph, NodeId, Op, Select, Shape, Stage, View};
 
 /// A node of the view. Arguments come before their readers.
@@ -55,6 +56,8 @@ pub struct Tree<'a> {
     pub ports: Vec<(usize, DType)>,
     /// The sizes this tree was viewed at.
     pub(crate) sizes: Vec<(DimName, u64)>,
+    /// Where kept rows lie.
+    pub kept: &'static dyn Layout,
 }
 
 pub(crate) fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
@@ -139,8 +142,9 @@ impl<'a> Tree<'a> {
         entry: usize,
         sizes: &[(DimName, u64)],
         pins: &Pins,
+        kept: &'static dyn Layout,
     ) -> Result<Self, Error> {
-        Self::upto(g, entry, sizes, &[], pins)
+        Self::upto(g, entry, sizes, &[], pins, kept)
     }
 
     /// The same, with `upto` dimensions read at launch.
@@ -150,6 +154,7 @@ impl<'a> Tree<'a> {
         sizes: &[(DimName, u64)],
         upto: &[DimName],
         pins: &Pins,
+        kept: &'static dyn Layout,
     ) -> Result<Self, Error> {
         let Some(e) = g.entries.get(entry) else {
             return unsupported(format_args!("entry {entry}"));
@@ -163,6 +168,7 @@ impl<'a> Tree<'a> {
             outputs: Vec::new(),
             ports: Vec::new(),
             sizes: sizes.to_vec(),
+            kept,
         };
         for port in &e.inputs {
             let shape = sized(g, sizes, upto, &port.ty.shape)?;

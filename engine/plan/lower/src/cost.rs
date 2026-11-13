@@ -5,6 +5,7 @@ use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use crate::recipe::Recipe;
 use crate::run::Run;
+use codegen::kept::Layout;
 use gpukit::{Limits, Settings};
 use serde::{Deserialize, Serialize};
 use sim::{Chip, Cluster, Fit, Pool};
@@ -67,7 +68,7 @@ impl Sample {
 }
 
 /// One device's timed launches, by kernel name.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Device {
     /// The hardware that ran the samples.
     pub name: String,
@@ -92,6 +93,9 @@ pub struct Device {
     /// The form each weight is stored in.
     #[serde(skip)]
     pub pins: Pins,
+    /// Where kept rows lie.
+    #[serde(skip, default = "dense")]
+    pub kept: &'static dyn Layout,
     /// Fresh after every change that could alter a plan.
     #[serde(skip)]
     generation: u64,
@@ -121,6 +125,30 @@ impl PartialEq for Device {
             && self.favor == other.favor
             && self.barred == other.barred
             && self.pins == other.pins
+            && self.kept == other.kept
+    }
+}
+
+fn dense() -> &'static dyn Layout {
+    codegen::kept::DENSE
+}
+
+impl Default for Device {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            fit: None,
+            pool: None,
+            cluster: Cluster::default(),
+            limits: Limits::default(),
+            timed: BTreeMap::new(),
+            favor: None,
+            barred: Vec::new(),
+            pins: Pins::default(),
+            kept: dense(),
+            generation: 0,
+            memo: RefCell::default(),
+        }
     }
 }
 
@@ -166,6 +194,7 @@ impl Device {
         self.pins = recipe.pins.clone();
         self.favor = recipe.favor.clone();
         self.barred = recipe.barred.clone();
+        self.kept = recipe.kept;
         self.changed()
     }
 

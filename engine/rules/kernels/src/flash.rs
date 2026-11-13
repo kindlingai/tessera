@@ -1,6 +1,7 @@
 //! Causal attention on tiles, the keys streamed in blocks.
 
 use codegen::ir::Body;
+use codegen::kept;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
@@ -286,7 +287,6 @@ fn flash_rows(
     positions: Buf<U32>,
     queries: u32,
     keys: u32,
-    stride: u32,
     heads: u32,
     kv_heads: u32,
     #[build] w: u32,
@@ -355,7 +355,7 @@ fn flash_rows(
             o11.zero();
             for b in 0..(last + BK - 1) / BK {
                 let k0 = b * BK;
-                let at = slot * stride + k0;
+                let at = kept_row(slot, k0);
                 stage_kv::<false>(&mut kv_s, k, at, k0, last, kv_heads, kvh, w);
                 barrier();
                 scores(&mut s_t, &q_s, &kv_s, &mut p_s, &seen_s, simd, k0, w);
@@ -533,13 +533,17 @@ impl Kernel for FlashRows {
     }
 
     fn source(&self) -> Source {
-        Source::named(self.tree(), format!("flash_rows_{}", self.0.width))
+        let body = kept::attach(self.tree(), self.0.kept);
+        let entry = format!("flash_rows_{}_{}", self.0.width, self.0.kept.name());
+        Source::named(body, entry)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let a = &self.0;
+        let mut args = a.rows_args(step);
+        args.extend(a.kept_args());
         vec![Launch {
-            args: a.rows_args(step),
+            args,
             shape: Shape::Grid {
                 across: self.groups(),
                 down: 1,
@@ -575,6 +579,11 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     if site.rows.is_some() {
+        // Keys stage a block at a time, in one run.
+        let run = site.sizes.kept.run(site.sizes.context);
+        if !run.is_multiple_of(BK as usize) {
+            return None;
+        }
         return site.ragged(FlashRows(site.sizes));
     }
     let sites::Attend {
