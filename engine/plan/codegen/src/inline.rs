@@ -89,11 +89,12 @@ impl Inliner {
         let mut names = HashMap::new();
         for (param, arg) in body.params.iter().zip(args) {
             match param {
-                Param::Buffer { name, .. } => {
-                    let Expr::Var(buffer) = arg else {
-                        panic!("`{}` takes a buffer as `{name}`", body.entry);
+                // Buffers, group memory and tiles pass by name.
+                Param::Buffer { name, .. } | Param::Shared { name, .. } | Param::Tiles { name } => {
+                    let Expr::Var(named) = arg else {
+                        panic!("`{}` takes `{name}` by name", body.entry);
                     };
-                    names.insert(name.clone(), buffer);
+                    names.insert(name.clone(), named);
                 }
                 Param::Scalar { name, ty } => {
                     let fresh = self.fresh(name);

@@ -139,3 +139,72 @@ fn kernels_call() {
     let want = [0.4f32, 0.8, 0.8, 1.6, 1.2, 0.0, 0.0, 1.6];
     assert_eq!(got, want);
 }
+
+/// Sums `red` into its first slot, span halving each level.
+#[kernel]
+fn tree_sum<const N: u32, const LEVELS: u32>(red: &mut Shared<f32>) -> f32 {
+    for level in 0..LEVELS {
+        let span = N >> (level + 1);
+        if lid() < span {
+            red[lid()] += red[lid() + span];
+        }
+        barrier();
+    }
+    red[0]
+}
+
+/// Scales each row of `acc` by its entry in `alpha`.
+#[kernel]
+fn scale_rows(acc: &mut Tiles, alpha: &Shared<f32>) {
+    acc.scale(|r| alpha[r]);
+}
+
+/// Eight threads sum their elements through group memory.
+#[kernel]
+fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
+    let mut red = shared::<f32>(8);
+    red[lid()] = x[gid() as u64];
+    barrier();
+    let total = tree_sum::<8, 3>(&mut red);
+    if lid() == 0 {
+        out[(gid() / 8) as u64] = total;
+    }
+    let mut o = tiles(16, 16);
+    let mut alpha = shared::<f32>(16);
+    alpha[lid()] = total;
+    scale_rows(&mut o, &alpha);
+}
+
+#[test]
+fn callers_lend_memory() {
+    let body = group_sum_ir();
+    let text = body.text().render(Dialect::Metal);
+    // The callee's loop is renamed; the caller's memory is not.
+    assert!(text.contains("for (u32 level_1 = 0; level_1 < 3; level_1 += 1) {"));
+    assert!(text.contains("u32 span_1 = (8 >> (level_1 + 1));"));
+    assert!(text.contains("red[lid] += red[(lid + span_1)];"));
+    assert!(text.contains("float total = red[0];"));
+    assert!(text.contains("o[i][j][e] *= alpha[r];"));
+
+    let mut x: Vec<u8> = (1..=8).flat_map(|v| (v as f32).to_le_bytes()).collect();
+    let mut out = vec![0u8; 4];
+    let buf = |at| ArgVal::Buf {
+        at,
+        skip: 0,
+        form: crate::form::F32_FORM,
+    };
+    let grid = Grid {
+        groups: 1,
+        threads: 8,
+    };
+    let args = [buf(0), buf(1)];
+    exec::run(
+        &body,
+        &args,
+        &mut [&mut x, &mut out],
+        grid,
+        LANES,
+        Precision::EXACT,
+    );
+    assert_eq!(f32::from_le_bytes(out[..4].try_into().unwrap()), 36.0);
+}

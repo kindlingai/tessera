@@ -123,6 +123,11 @@ fn tree(f: &mut ItemFn) -> Res {
 
 /// `#[form(f)]` on a `Buf<Dyn>` reads build parameter `f`.
 fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
+    // A reference passes group memory or tiles by name.
+    let ty = match ty {
+        Type::Reference(r) => &*r.elem,
+        other => other,
+    };
     let Type::Path(path) = ty else {
         return Err(Error::new(ty.span(), "a buffer or scalar type"));
     };
@@ -145,6 +150,17 @@ fn param(name: &str, ty: &Type, picked: Option<Ident>) -> Res {
             let form = form(&last.arguments)?;
             quote!(Param::Buffer { name: #name.into(), form: #form, writes: true })
         }
+        "Shared" => {
+            let PathArguments::AngleBracketed(a) = &last.arguments else {
+                return Err(Error::new(last.span(), "`Shared<T>` names its element"));
+            };
+            let Some(GenericArgument::Type(t)) = a.args.first() else {
+                return Err(Error::new(a.span(), "`Shared<T>` names its element"));
+            };
+            let ty = scalar(t)?;
+            quote!(Param::Shared { name: #name.into(), ty: #ty })
+        }
+        "Tiles" => quote!(Param::Tiles { name: #name.into() }),
         _ => {
             let ty = scalar(ty)?;
             quote!(Param::Scalar { name: #name.into(), ty: #ty })

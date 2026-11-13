@@ -237,7 +237,7 @@ pub enum Stmt {
     },
 }
 
-/// A kernel parameter: a buffer of `form`, or a scalar.
+/// A kernel parameter. Only a callee takes the last two.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
     Buffer {
@@ -248,6 +248,15 @@ pub enum Param {
     Scalar {
         name: String,
         ty: Ty,
+    },
+    /// The caller's group memory, by name.
+    Shared {
+        name: String,
+        ty: Ty,
+    },
+    /// The caller's tile sums, by name.
+    Tiles {
+        name: String,
     },
 }
 
@@ -757,6 +766,9 @@ impl Body {
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
                     scalars.push((leak(name), ty.c()));
+                }
+                Param::Shared { name, .. } | Param::Tiles { name } => {
+                    panic!("`{}` takes `{name}` from a caller", self.entry);
                 }
             }
         }
