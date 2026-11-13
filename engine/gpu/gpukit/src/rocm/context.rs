@@ -1,11 +1,12 @@
 //! HIP device context, module cache, and kernel handles.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use super::KernelArgs;
-use super::hip::{self, HipFunction, HipModule, Runtime};
+use super::hip::{self, HipFunction, HipGraph, HipGraphExec, HipModule, HipStream, Runtime};
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::launch::Launch;
@@ -29,6 +30,8 @@ struct Inner {
     modules: Mutex<HashMap<u64, Arc<Module>>>,
     /// `warpSize`, asked once.
     lanes: OnceLock<usize>,
+    /// Held through a capture, and by every other device call.
+    exclusive: Mutex<()>,
 }
 
 impl Context {
@@ -69,6 +72,7 @@ impl Context {
             name,
             modules: Mutex::new(HashMap::new()),
             lanes: OnceLock::new(),
+            exclusive: Mutex::new(()),
         }));
         ctx.set_current()?;
         Ok(ctx)
@@ -130,11 +134,72 @@ impl Context {
         )
     }
 
+    /// The lock, unless this thread is the one capturing.
+    fn hold(&self) -> Option<MutexGuard<'_, ()>> {
+        match CAPTURING.with(Cell::get).is_null() {
+            true => Some(self.0.exclusive.lock().unwrap_or_else(|e| e.into_inner())),
+            false => None,
+        }
+    }
+
+    /// Waits for the null stream, where all plain work runs.
     pub fn synchronize(&self) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         self.0.runtime.check(
-            unsafe { (self.0.runtime.hip_device_synchronize)() },
-            "hipDeviceSynchronize",
+            unsafe { (self.0.runtime.hip_stream_synchronize)(std::ptr::null_mut()) },
+            "hipStreamSynchronize",
+        )
+    }
+
+    /// Runs `record` and keeps its launches as one graph.
+    pub fn capture<E: From<Error>>(
+        &self,
+        record: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Graph, E> {
+        let _hold = self.hold();
+        self.set_current()?;
+        let r = self.0.runtime;
+        let mut stream: HipStream = std::ptr::null_mut();
+        r.check(
+            unsafe { (r.hip_stream_create)(&mut stream, hip::HIP_STREAM_NON_BLOCKING) },
+            "hipStreamCreateWithFlags",
+        )?;
+        let mut graph = Graph {
+            runtime: r,
+            stream,
+            graph: std::ptr::null_mut(),
+            exec: std::ptr::null_mut(),
+        };
+        let mode = hip::HIP_STREAM_CAPTURE_MODE_RELAXED;
+        r.check(
+            unsafe { (r.hip_stream_begin_capture)(stream, mode) },
+            "hipStreamBeginCapture",
+        )?;
+        CAPTURING.with(|c| c.set(stream));
+        let recorded = record();
+        CAPTURING.with(|c| c.set(std::ptr::null_mut()));
+        // The capture ends either way, or the stream stays stuck.
+        let ended = r.check(
+            unsafe { (r.hip_stream_end_capture)(stream, &mut graph.graph) },
+            "hipStreamEndCapture",
+        );
+        recorded.and(ended.map_err(E::from))?;
+        let (none, nothing) = (std::ptr::null_mut(), std::ptr::null_mut());
+        r.check(
+            unsafe { (r.hip_graph_instantiate)(&mut graph.exec, graph.graph, none, nothing, 0) },
+            "hipGraphInstantiate",
+        )?;
+        Ok(graph)
+    }
+
+    /// Runs a captured graph on the null stream, after copies.
+    pub fn replay(&self, graph: &Graph) -> Result<(), Error> {
+        self.set_current()?;
+        let r = self.0.runtime;
+        r.check(
+            unsafe { (r.hip_graph_launch)(graph.exec, std::ptr::null_mut()) },
+            "hipGraphLaunch",
         )
     }
 
@@ -181,6 +246,7 @@ impl Launch for Context {
         shared_bytes: u32,
         args: &mut KernelArgs,
     ) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let mut params = args.pointers();
         self.0.runtime.check(
@@ -194,7 +260,7 @@ impl Launch for Context {
                     block.1,
                     block.2,
                     shared_bytes,
-                    std::ptr::null_mut(),
+                    CAPTURING.with(Cell::get),
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
@@ -255,6 +321,36 @@ pub struct Kernel {
     name: String,
 }
 
+thread_local! {
+    /// This thread's capture stream, or null outside a capture.
+    static CAPTURING: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Launches recorded once, replayed on their own stream.
+pub struct Graph {
+    runtime: &'static Runtime,
+    stream: HipStream,
+    graph: HipGraph,
+    exec: HipGraphExec,
+}
+
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.exec.is_null() {
+                (self.runtime.hip_graph_exec_destroy)(self.exec);
+            }
+            if !self.graph.is_null() {
+                (self.runtime.hip_graph_destroy)(self.graph);
+            }
+            (self.runtime.hip_stream_destroy)(self.stream);
+        }
+    }
+}
+
 // Thread-safe like `Module`, and the Arc keeps the module alive.
 unsafe impl Send for Kernel {}
 unsafe impl Sync for Kernel {}
@@ -282,6 +378,7 @@ impl Device for Context {
     }
 
     fn alloc(&self, size: usize) -> Result<u64, Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let mut ptr = 0;
         let rt = self.runtime();
@@ -290,6 +387,7 @@ impl Device for Context {
     }
 
     fn free(&self, ptr: u64) {
+        let _hold = self.hold();
         // At process exit the runtime may already be gone.
         if self.set_current().is_ok() {
             unsafe { (self.runtime().hip_free)(ptr) };
@@ -297,6 +395,7 @@ impl Device for Context {
     }
 
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let rt = self.runtime();
         let (dst, src) = (ptr as *mut _, bytes.as_ptr().cast());
@@ -305,6 +404,7 @@ impl Device for Context {
     }
 
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let rt = self.runtime();
         let (dst, src) = (bytes.as_mut_ptr().cast(), ptr as *const _);
@@ -313,6 +413,7 @@ impl Device for Context {
     }
 
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let rt = self.runtime();
         rt.check(unsafe { (rt.hip_memset)(ptr, 0, size) }, "hipMemset")

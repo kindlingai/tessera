@@ -12,6 +12,8 @@ pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 
 pub const CUDA_SUCCESS: CUresult = 0;
 pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
@@ -19,6 +21,9 @@ pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 8;
 pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+pub const CU_STREAM_NON_BLOCKING: u32 = 1;
+/// Other threads may still synchronize while a capture is open.
+pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
 const DRIVER_LIB: &str = "libcuda.so.1";
 
@@ -54,6 +59,15 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> CUresult;
+type CuStreamCreate = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
+type CuStreamDestroy = unsafe extern "C" fn(CUstream) -> CUresult;
+type CuStreamSynchronize = unsafe extern "C" fn(CUstream) -> CUresult;
+type CuStreamBeginCapture = unsafe extern "C" fn(CUstream, c_int) -> CUresult;
+type CuStreamEndCapture = unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult;
+type CuGraphInstantiate = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult;
+type CuGraphLaunch = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
+type CuGraphExecDestroy = unsafe extern "C" fn(CUgraphExec) -> CUresult;
+type CuGraphDestroy = unsafe extern "C" fn(CUgraph) -> CUresult;
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
@@ -78,6 +92,15 @@ pub struct Driver {
     pub cu_memcpy_dtod: CuMemcpyDtoD,
     pub cu_memset_d8: CuMemsetD8,
     pub cu_launch_kernel: CuLaunchKernel,
+    pub cu_stream_create: CuStreamCreate,
+    pub cu_stream_destroy: CuStreamDestroy,
+    pub cu_stream_synchronize: CuStreamSynchronize,
+    pub cu_stream_begin_capture: CuStreamBeginCapture,
+    pub cu_stream_end_capture: CuStreamEndCapture,
+    pub cu_graph_instantiate: CuGraphInstantiate,
+    pub cu_graph_launch: CuGraphLaunch,
+    pub cu_graph_exec_destroy: CuGraphExecDestroy,
+    pub cu_graph_destroy: CuGraphDestroy,
     cu_get_error_name: CuGetErrorName,
     cu_get_error_string: CuGetErrorString,
 }
@@ -112,6 +135,15 @@ impl Driver {
             cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", CuMemcpyDtoD),
             cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
+            cu_stream_create: sym!(lib, "cuStreamCreate", CuStreamCreate),
+            cu_stream_destroy: sym!(lib, "cuStreamDestroy_v2", CuStreamDestroy),
+            cu_stream_synchronize: sym!(lib, "cuStreamSynchronize", CuStreamSynchronize),
+            cu_stream_begin_capture: sym!(lib, "cuStreamBeginCapture_v2", CuStreamBeginCapture),
+            cu_stream_end_capture: sym!(lib, "cuStreamEndCapture", CuStreamEndCapture),
+            cu_graph_instantiate: sym!(lib, "cuGraphInstantiateWithFlags", CuGraphInstantiate),
+            cu_graph_launch: sym!(lib, "cuGraphLaunch", CuGraphLaunch),
+            cu_graph_exec_destroy: sym!(lib, "cuGraphExecDestroy", CuGraphExecDestroy),
+            cu_graph_destroy: sym!(lib, "cuGraphDestroy", CuGraphDestroy),
             cu_get_error_name: sym!(lib, "cuGetErrorName", CuGetErrorName),
             cu_get_error_string: sym!(lib, "cuGetErrorString", CuGetErrorString),
         })

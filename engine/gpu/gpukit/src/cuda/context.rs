@@ -1,15 +1,17 @@
 //! CUDA context, module cache, and kernel handles.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int};
-use std::sync::{Arc, Mutex};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::KernelArgs;
 use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_WARP_SIZE, CUcontext, CUdevice,
-    CUfunction, CUmodule, Driver,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+    CU_STREAM_CAPTURE_MODE_RELAXED, CU_STREAM_NON_BLOCKING, CUcontext, CUdevice, CUfunction,
+    CUgraph, CUgraphExec, CUmodule, CUstream, Driver,
 };
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
@@ -35,6 +37,8 @@ struct Inner {
     compute_capability: (i32, i32),
     limits: Limits,
     modules: Mutex<HashMap<u64, Arc<Module>>>,
+    /// Held through a capture, and by every other device call.
+    exclusive: Mutex<()>,
 }
 
 // The driver API is thread-safe. Calls set the context first.
@@ -123,6 +127,7 @@ impl Context {
             compute_capability: (major, minor),
             limits,
             modules: Mutex::new(HashMap::new()),
+            exclusive: Mutex::new(()),
         })))
     }
 
@@ -156,11 +161,70 @@ impl Context {
         )
     }
 
+    /// The lock, unless this thread is the one capturing.
+    fn hold(&self) -> Option<MutexGuard<'_, ()>> {
+        match CAPTURING.with(Cell::get).is_null() {
+            true => Some(self.0.exclusive.lock().unwrap_or_else(|e| e.into_inner())),
+            false => None,
+        }
+    }
+
+    /// Waits for the legacy stream, where all plain work runs.
     pub fn synchronize(&self) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         self.0.driver.check(
-            unsafe { (self.0.driver.cu_ctx_synchronize)() },
-            "cuCtxSynchronize",
+            unsafe { (self.0.driver.cu_stream_synchronize)(std::ptr::null_mut()) },
+            "cuStreamSynchronize",
+        )
+    }
+
+    /// Runs `record` and keeps its launches as one graph.
+    pub fn capture<E: From<Error>>(
+        &self,
+        record: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Graph, E> {
+        let _hold = self.hold();
+        self.set_current()?;
+        let d = self.0.driver;
+        let mut stream: CUstream = std::ptr::null_mut();
+        d.check(
+            unsafe { (d.cu_stream_create)(&mut stream, CU_STREAM_NON_BLOCKING) },
+            "cuStreamCreate",
+        )?;
+        let mut graph = Graph {
+            driver: d,
+            stream,
+            graph: std::ptr::null_mut(),
+            exec: std::ptr::null_mut(),
+        };
+        d.check(
+            unsafe { (d.cu_stream_begin_capture)(stream, CU_STREAM_CAPTURE_MODE_RELAXED) },
+            "cuStreamBeginCapture",
+        )?;
+        CAPTURING.with(|c| c.set(stream));
+        let recorded = record();
+        CAPTURING.with(|c| c.set(std::ptr::null_mut()));
+        // The capture ends either way, or the stream stays stuck.
+        let ended = d.check(
+            unsafe { (d.cu_stream_end_capture)(stream, &mut graph.graph) },
+            "cuStreamEndCapture",
+        );
+        recorded.and(ended.map_err(E::from))?;
+        d.check(
+            unsafe { (d.cu_graph_instantiate)(&mut graph.exec, graph.graph, 0) },
+            "cuGraphInstantiate",
+        )?;
+        Ok(graph)
+    }
+
+    /// Runs a captured graph on the legacy stream, after copies.
+    pub fn replay(&self, graph: &Graph) -> Result<(), Error> {
+        self.set_current()?;
+        let d = self.0.driver;
+        d.check(
+            unsafe { (d.cu_graph_launch)(graph.exec, std::ptr::null_mut()) },
+            "cuGraphLaunch",
         )
     }
 
@@ -207,6 +271,7 @@ impl Launch for Context {
         shared_bytes: u32,
         args: &mut KernelArgs,
     ) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let mut params = args.pointers();
         self.0.driver.check(
@@ -220,7 +285,7 @@ impl Launch for Context {
                     block.1,
                     block.2,
                     shared_bytes,
-                    std::ptr::null_mut(),
+                    CAPTURING.with(Cell::get),
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
@@ -282,6 +347,36 @@ pub struct Kernel {
     name: String,
 }
 
+thread_local! {
+    /// This thread's capture stream, or null outside a capture.
+    static CAPTURING: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Launches recorded once, replayed on their own stream.
+pub struct Graph {
+    driver: &'static Driver,
+    stream: CUstream,
+    graph: CUgraph,
+    exec: CUgraphExec,
+}
+
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.exec.is_null() {
+                (self.driver.cu_graph_exec_destroy)(self.exec);
+            }
+            if !self.graph.is_null() {
+                (self.driver.cu_graph_destroy)(self.graph);
+            }
+            (self.driver.cu_stream_destroy)(self.stream);
+        }
+    }
+}
+
 // Thread-safe like `Inner`, and the Arc keeps the module alive.
 unsafe impl Send for Kernel {}
 unsafe impl Sync for Kernel {}
@@ -309,6 +404,7 @@ impl Device for Context {
     }
 
     fn alloc(&self, size: usize) -> Result<u64, Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let mut ptr = 0;
         let d = self.driver();
@@ -317,6 +413,7 @@ impl Device for Context {
     }
 
     fn free(&self, ptr: u64) {
+        let _hold = self.hold();
         // At process exit the context may already be gone.
         if self.set_current().is_ok() {
             unsafe { (self.driver().cu_mem_free)(ptr) };
@@ -324,6 +421,7 @@ impl Device for Context {
     }
 
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let d = self.driver();
         let code = unsafe { (d.cu_memcpy_htod)(ptr, bytes.as_ptr().cast(), bytes.len()) };
@@ -331,6 +429,7 @@ impl Device for Context {
     }
 
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let d = self.driver();
         let code = unsafe { (d.cu_memcpy_dtoh)(bytes.as_mut_ptr().cast(), ptr, bytes.len()) };
@@ -338,6 +437,7 @@ impl Device for Context {
     }
 
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
+        let _hold = self.hold();
         self.set_current()?;
         let d = self.driver();
         d.check(unsafe { (d.cu_memset_d8)(ptr, 0, size) }, "cuMemsetD8")
