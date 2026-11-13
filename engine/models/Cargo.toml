@@ -10,6 +10,9 @@ description = "Model descriptions, traced into graphs"
 default = []
 cuda = ["lower/cuda", "calibrate/cuda", "kernels/cuda"]
 rocm = ["lower/rocm", "calibrate/rocm", "kernels/rocm"]
+# The platform test asks these toolkits, where they are installed.
+toolkit-cuda = []
+toolkit-rocm = []
 
 [dependencies]
 graph = { workspace = true }
@@ -23,3 +26,4 @@ checkpoint = { workspace = true }
 interp = { workspace = true }
 lower = { workspace = true }
 gpukit = { workspace = true }
+linear = { workspace = true }

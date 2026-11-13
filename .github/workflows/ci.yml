@@ -162,11 +162,30 @@ jobs:
           restore-keys: simcheck-
       - run: $SIMCHECK stale "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin"
 
+  platforms:
+    # The platform table against nvcc, cuobjdump and clang's amdgcn
+    # backend, with no GPU needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: platforms
+      - name: Install nvcc, cuobjdump and clang
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cuobjdump-13-0 clang
+          echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
+      - run: cargo test -p models --features toolkit-cuda,toolkit-rocm --test platforms_test -- --nocapture
+
   success:
     # The one check to require: every job above passed, and no
     # human step is pending.
     if: always()
-    needs: [commits, lint, linux, macos, similarity, stale-allow]
+    needs: [commits, lint, linux, macos, similarity, stale-allow, platforms]
     runs-on: ubuntu-latest
     steps:
       - env:

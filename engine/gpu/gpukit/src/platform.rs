@@ -18,8 +18,27 @@ pub struct Row {
     /// Whether a launch may overlap the one before it.
     #[serde(default)]
     pub pdl: bool,
+    /// Compiler targets a toolkit check compiles the tile text for.
+    #[serde(default)]
+    pub check: Vec<String>,
     #[serde(default)]
     pub note: String,
+}
+
+/// Every row of the table, in file order.
+pub fn rows() -> Vec<Row> {
+    let mut files: Vec<_> = TABLE.files().collect();
+    files.sort_by_key(|f| f.path().to_path_buf());
+    files
+        .iter()
+        .filter_map(|f| serde_json::from_slice::<Row>(f.contents()).ok())
+        .collect()
+}
+
+/// The backend a row's patterns name.
+pub fn backend_of(row: &Row) -> &str {
+    let first = row.matches.first().map_or("", String::as_str);
+    first.split(' ').next().unwrap_or("")
 }
 
 /// A device as asked, plus its table row.
@@ -111,14 +130,13 @@ impl Platform {
 }
 
 /// The row whose pattern fits `id`, from the embedded table.
-fn row_for(id: &str) -> Option<Row> {
+pub fn row_for(id: &str) -> Option<Row> {
     let fits = |pattern: &str| match pattern.strip_suffix('*') {
         Some(head) => id.starts_with(head),
         None => id == pattern,
     };
-    TABLE
-        .files()
-        .filter_map(|f| serde_json::from_slice::<Row>(f.contents()).ok())
+    rows()
+        .into_iter()
         .find(|row| row.matches.iter().any(|p| fits(p)))
 }
 

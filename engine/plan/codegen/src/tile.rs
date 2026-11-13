@@ -87,6 +87,11 @@ __device__ __forceinline__ void tile_load_row(tile_a &f, const float *p, u32 s, 
 #define TILE_VAL(acc, e) ((acc)[e])
 ";
 
+/// HIP's tile text alone, for compilers other than hiprtc.
+pub fn hip() -> &'static str {
+    HIP
+}
+
 /// The CUDA text, with HIP's tile when hiprtc compiles it.
 pub fn cuda() -> String {
     format!("#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)\n{HIP}#else\n{CUDA}#endif\n\n")

@@ -147,9 +147,14 @@ impl Context {
         let newest = families
             .iter()
             .find(|(f, _)| self.device.supportsFamily(*f));
+        // The architecture names the chip's GPU, as `applegpu_g15p`.
+        let arch = match self.device.architecture().name().to_string() {
+            name if name.starts_with("applegpu_") => name,
+            _ => newest.map_or("apple", |(_, n)| n).into(),
+        };
         Platform::new(Asked {
             backend: "metal",
-            arch: newest.map_or("apple", |(_, n)| n).into(),
+            arch,
             name: self.name(),
             driver: String::new(),
             limits: self.limits(),

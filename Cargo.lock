@@ -807,6 +807,7 @@ dependencies = [
  "graph",
  "interp",
  "kernels",
+ "linear",
  "lower",
  "settings",
  "trace",

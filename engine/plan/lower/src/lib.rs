@@ -27,7 +27,7 @@ pub use abi::{Arg, Launch, Shape, Source};
 pub use assign::assign;
 pub use cache::Cache;
 pub use codegen::kept;
-pub use codegen::{Dialect, LANES, Precision, Terms, Text, float, hash, terms};
+pub use codegen::{Dialect, LANES, Precision, Terms, Text, float, hash, hip_tiles, terms};
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use extent::Extent;

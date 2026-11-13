@@ -1,5 +1,11 @@
 {
-  "matches": ["cuda sm_7*"],
+  "matches": [
+    "cuda sm_7*"
+  ],
   "tile": null,
+  "check": [
+    "sm_70",
+    "sm_75"
+  ],
   "note": "Tensor cores take f16 only. The tf32 tile text needs 8.0."
 }

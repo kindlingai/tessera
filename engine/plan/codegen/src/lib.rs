@@ -17,6 +17,7 @@ pub use form::{Form, Layout};
 pub use kept::Layout as Kept;
 pub use kernel_macro::kernel;
 pub use numerics::{Precision, Terms, terms};
+pub use tile::hip as hip_tiles;
 
 /// Threads that share sums by shuffles, on every backend.
 pub const LANES: usize = 32;

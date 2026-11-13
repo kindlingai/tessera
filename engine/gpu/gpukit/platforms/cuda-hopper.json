@@ -1,5 +1,14 @@
 {
-  "matches": ["cuda sm_9*"],
-  "tile": [16, 8, 8],
-  "pdl": true
+  "matches": [
+    "cuda sm_9*"
+  ],
+  "tile": [
+    16,
+    8,
+    8
+  ],
+  "pdl": true,
+  "check": [
+    "sm_90"
+  ]
 }
