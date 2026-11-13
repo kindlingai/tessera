@@ -1,6 +1,7 @@
 //! A matmul on the matrix unit, staged through group memory.
 
 use crate::lanes::{After, finishing};
+use codegen::form::F32_FORM;
 use codegen::hash;
 use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use codegen::prelude::*;
@@ -82,6 +83,53 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Stages `span` rows of `src` from `r0`, `k0`, zero outside.
+#[kernel]
+fn stage<F: Elems<Elem = f32>>(
+    dst: &mut Shared<f32>,
+    #[form(form)] src: Buf<F>,
+    r0: u32,
+    k0: u32,
+    limit: u32,
+    k: u32,
+    #[build] span: u32,
+    #[build] bk: u32,
+    #[build] threads: u32,
+    #[build] wide: bool,
+    #[build] form: &'static dyn Stored,
+) {
+    if wide {
+        // Groups of four along `k` need one test per load.
+        for i in (lid()..span * (bk / WIDE)).by(threads) {
+            let r = i / (bk / WIDE);
+            let c = (i % (bk / WIDE)) * WIDE;
+            let at = r * (bk + PAD) + c;
+            if r0 + r < limit && k0 + c < k {
+                let v = src.load4((r0 + r) as u64 * k as u64 + (k0 + c) as u64);
+                dst[at] = v.x;
+                dst[at + 1] = v.y;
+                dst[at + 2] = v.z;
+                dst[at + 3] = v.w;
+            } else {
+                dst[at] = 0.0;
+                dst[at + 1] = 0.0;
+                dst[at + 2] = 0.0;
+                dst[at + 3] = 0.0;
+            }
+        }
+    } else {
+        for i in (lid()..span * bk).by(threads) {
+            let r = i / bk;
+            let c = i % bk;
+            if r0 + r < limit && k0 + c < k {
+                dst[r * (bk + PAD) + c] = src[(r0 + r) as u64 * k as u64 + (k0 + c) as u64];
+            } else {
+                dst[r * (bk + PAD) + c] = 0.0;
+            }
+        }
+    }
+}
+
 /// Stages a block of `x` and `w`, then multiplies.
 #[kernel]
 fn tiled(
@@ -111,62 +159,8 @@ fn tiled(
     let mut b_s = shared::<f32>(bn * (bk + PAD));
     let mut acc = tiles(wm, wn);
     for k0 in (0..k).by(bk) {
-        if wide {
-            // Groups of four along `k` need one test per load.
-            for i in (lid()..bm * (bk / WIDE)).by(threads) {
-                let r = i / (bk / WIDE);
-                let c = (i % (bk / WIDE)) * WIDE;
-                let at = r * (bk + PAD) + c;
-                if row0 + r < m && k0 + c < k {
-                    let v = x.load4((row0 + r) as u64 * k as u64 + (k0 + c) as u64);
-                    a_s[at] = v.x;
-                    a_s[at + 1] = v.y;
-                    a_s[at + 2] = v.z;
-                    a_s[at + 3] = v.w;
-                } else {
-                    a_s[at] = 0.0;
-                    a_s[at + 1] = 0.0;
-                    a_s[at + 2] = 0.0;
-                    a_s[at + 3] = 0.0;
-                }
-            }
-            for i in (lid()..bn * (bk / WIDE)).by(threads) {
-                let r = i / (bk / WIDE);
-                let c = (i % (bk / WIDE)) * WIDE;
-                let at = r * (bk + PAD) + c;
-                if col0 + r < n && k0 + c < k {
-                    let v = w.load4((col0 + r) as u64 * k as u64 + (k0 + c) as u64);
-                    b_s[at] = v.x;
-                    b_s[at + 1] = v.y;
-                    b_s[at + 2] = v.z;
-                    b_s[at + 3] = v.w;
-                } else {
-                    b_s[at] = 0.0;
-                    b_s[at + 1] = 0.0;
-                    b_s[at + 2] = 0.0;
-                    b_s[at + 3] = 0.0;
-                }
-            }
-        } else {
-            for i in (lid()..bm * bk).by(threads) {
-                let r = i / bk;
-                let c = i % bk;
-                if row0 + r < m && k0 + c < k {
-                    a_s[r * (bk + PAD) + c] = x[(row0 + r) as u64 * k as u64 + (k0 + c) as u64];
-                } else {
-                    a_s[r * (bk + PAD) + c] = 0.0;
-                }
-            }
-            for i in (lid()..bn * bk).by(threads) {
-                let r = i / bk;
-                let c = i % bk;
-                if col0 + r < n && k0 + c < k {
-                    b_s[r * (bk + PAD) + c] = w[(col0 + r) as u64 * k as u64 + (k0 + c) as u64];
-                } else {
-                    b_s[r * (bk + PAD) + c] = 0.0;
-                }
-            }
-        }
+        stage(&mut a_s, x, row0, k0, m, k, bm, bk, threads, wide, F32_FORM);
+        stage(&mut b_s, w, col0, k0, n, k, bn, bk, threads, wide, form);
         barrier();
         acc.block(&a_s, wm0 * (bk + PAD), &b_s, wn0 * (bk + PAD), bk + PAD, bk);
         barrier();
