@@ -1,6 +1,7 @@
 //! An entry as trees: values with one reader join it.
 
 use crate::Error;
+use crate::extent::Extent;
 use crate::form::Pins;
 use crate::kernels::MapStage;
 use crate::rule::{Attn, Site};
@@ -32,7 +33,10 @@ pub enum Term {
 pub struct Node {
     pub term: Term,
     pub args: Vec<T>,
+    /// Each axis at the plan's largest size.
     pub shape: Vec<usize>,
+    /// Each axis, with runtime dimensions kept symbolic.
+    pub extents: Vec<Extent>,
     /// How its elements are stored.
     pub form: DType,
     /// The graph node it came from.
@@ -83,13 +87,40 @@ fn needed(g: &Graph, outputs: &[usize]) -> Vec<bool> {
     needed
 }
 
-fn sized(g: &Graph, sizes: &[(DimName, u64)], s: &Shape) -> Result<Vec<usize>, Error> {
-    let size = |name| {
-        let bound = sizes.iter().find(|(n, _)| *n == name);
-        bound.map(|(_, size)| *size)
+/// Each axis of `s`, fixed or affine in `upto`.
+fn sized(
+    g: &Graph,
+    sizes: &[(DimName, u64)],
+    upto: &[DimName],
+    s: &Shape,
+) -> Result<Vec<Extent>, Error> {
+    let at = |e: &graph::DimExpr, value: Option<u64>| {
+        let size = |name| match upto.contains(&name) {
+            true => value,
+            false => sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n),
+        };
+        e.value(&g.dims, &size)
     };
-    let dim = |e: &graph::DimExpr| Some(e.value(&g.dims, &size)? as usize);
-    let all: Option<Vec<usize>> = s.0.iter().map(dim).collect();
+    let most = |e: &graph::DimExpr| {
+        let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, n)| *n);
+        e.value(&g.dims, &size).map(|n| n as usize)
+    };
+    let dim = |e: &graph::DimExpr| -> Option<Extent> {
+        let most = most(e)?;
+        let (v0, v1, v2) = (at(e, Some(0))?, at(e, Some(1))?, at(e, Some(2))?);
+        if upto.is_empty() || (v0 == v1 && v1 == v2) {
+            return Some(Extent::Fixed(most));
+        }
+        // At most one runtime dimension, entering linearly.
+        let (mul, add) = (v1 - v0, v0 as i64);
+        (v2 - v1 == mul && upto.len() == 1).then_some(Extent::Dim {
+            name: upto[0],
+            mul: mul as usize,
+            add,
+            most,
+        })
+    };
+    let all: Option<Vec<Extent>> = s.0.iter().map(dim).collect();
     all.ok_or_else(|| Error::Size(s.to_string()))
 }
 
@@ -99,6 +130,17 @@ impl<'a> Tree<'a> {
         g: &'a Graph,
         entry: usize,
         sizes: &[(DimName, u64)],
+        pins: &Pins,
+    ) -> Result<Self, Error> {
+        Self::upto(g, entry, sizes, &[], pins)
+    }
+
+    /// The same, with `upto` dimensions read at launch.
+    pub fn upto(
+        g: &'a Graph,
+        entry: usize,
+        sizes: &[(DimName, u64)],
+        upto: &[DimName],
         pins: &Pins,
     ) -> Result<Self, Error> {
         let Some(e) = g.entries.get(entry) else {
@@ -115,14 +157,16 @@ impl<'a> Tree<'a> {
             ports: Vec::new(),
         };
         for port in &e.inputs {
-            let len = sized(g, sizes, &port.ty.shape)?.iter().product();
+            let shape = sized(g, sizes, upto, &port.ty.shape)?;
+            let len = shape.iter().map(Extent::most).product();
             tree.ports.push((len, port.ty.dtype));
         }
         // Each graph node's value, as a view node.
         let mut at: Vec<Option<T>> = vec![None; g.nodes.len()];
         for i in (0..g.nodes.len()).filter(|i| needed[*i]) {
             let n = &g.nodes[i];
-            let shape = sized(g, sizes, &n.ty.shape)?;
+            let extents = sized(g, sizes, upto, &n.ty.shape)?;
+            let shape: Vec<usize> = extents.iter().map(Extent::most).collect();
             let from = NodeId(i as u32);
             let missing = || Error::Unsupported(format!("node {i} reads an unsupported node"));
             let args: Result<Vec<T>, Error> =
@@ -133,11 +177,12 @@ impl<'a> Tree<'a> {
                 _ => n.ty.dtype,
             };
             let mut push = |term: Term, args: Vec<T>| {
-                let shape = shape.clone();
+                let (shape, extents) = (shape.clone(), extents.clone());
                 tree.nodes.push(Node {
                     term,
                     args,
                     shape,
+                    extents,
                     form,
                     from,
                 });
@@ -177,8 +222,9 @@ impl<'a> Tree<'a> {
         for o in outputs {
             let t = at[o].expect("outputs are needed");
             tree.readers[t.0 as usize] += 1;
-            let shape = sized(g, sizes, &g.nodes[o].ty.shape)?;
-            tree.outputs.push((t, shape));
+            let shape = sized(g, sizes, upto, &g.nodes[o].ty.shape)?;
+            tree.outputs
+                .push((t, shape.iter().map(Extent::most).collect()));
         }
         // Every rule asks everywhere, so sites are found once.
         tree.sites = (0..tree.nodes.len() as u32)
@@ -264,11 +310,12 @@ impl<'a> Tree<'a> {
                     return None;
                 }
                 let (q, k, v) = (n.args[0], n.args[1], n.args[2]);
-                let (&[seqs, queries, heads, width], &[_, keys, kv_heads, _]) =
+                let (&[seqs, queries, heads, width], &[_, _, kv_heads, _]) =
                     (&wide(q)[..], &wide(k)[..])
                 else {
                     return None;
                 };
+                let keys = self.node(k).extents[1];
                 let sizes = Attn {
                     seqs,
                     queries,

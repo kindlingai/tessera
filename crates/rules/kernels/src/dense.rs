@@ -45,8 +45,8 @@ fn per_head(a: &Attn, each: impl Fn(Starts) -> Launch) -> Vec<Launch> {
     let pairs = (0..a.seqs).flat_map(|s| (0..a.heads).map(move |h| (s, h)));
     let at = |(s, h): (usize, usize)| Starts {
         query: (s * a.queries * a.heads + h) * a.width,
-        key: (s * a.keys * a.kv_heads + h / (a.heads / a.kv_heads)) * a.width,
-        score: (s * a.heads + h) * a.queries * a.keys,
+        key: (s * a.keys.most() * a.kv_heads + h / (a.heads / a.kv_heads)) * a.width,
+        score: (s * a.heads + h) * a.queries * a.keys.most(),
     };
     pairs.map(|pair| each(at(pair))).collect()
 }
@@ -77,12 +77,12 @@ impl Kernel for PerHead {
         let scores = gemm::Problem {
             lda: a.heads * a.width,
             ldb: a.kv_heads * a.width,
-            ..gemm::Problem::linear(a.queries, a.keys, a.width)
+            ..gemm::Problem::linear(a.queries, a.keys.most(), a.width)
         };
         let values = gemm::Problem {
             ldb: a.kv_heads * a.width,
             ldc: a.heads * a.width,
-            ..gemm::Problem::matmul(a.queries, a.width, a.keys)
+            ..gemm::Problem::matmul(a.queries, a.width, a.keys.most())
         };
         let slots = [step.reads[0], step.reads[1], step.write];
         per_head(a, |at| {
@@ -97,8 +97,8 @@ impl Kernel for PerHead {
     fn work(&self, _: usize) -> f64 {
         let a = &self.1;
         let per_head = match self.0 {
-            Part::Scores => tiles(a.queries) * tiles(a.keys) * a.width,
-            Part::Values => tiles(a.queries) * tiles(a.width) * a.keys,
+            Part::Scores => tiles(a.queries) * tiles(a.keys.most()) * a.width,
+            Part::Values => tiles(a.queries) * tiles(a.width) * a.keys.most(),
         };
         (a.seqs * a.heads * per_head) as f64
     }
@@ -173,11 +173,15 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     else {
         return None;
     };
-    let pairs = sizes.seqs * sizes.heads * sizes.queries * sizes.keys;
+    // The keys shape the scores, so they must be known.
+    if sizes.keys.runtime() {
+        return None;
+    }
+    let pairs = sizes.seqs * sizes.heads * sizes.queries * sizes.keys.most();
     let out = sizes.seqs * sizes.queries * sizes.heads * sizes.width;
     let causal = Causal {
         queries: sizes.queries,
-        keys: sizes.keys,
+        keys: sizes.keys.most(),
         scale,
     };
     (pairs <= DENSE_SCORES).then(|| {

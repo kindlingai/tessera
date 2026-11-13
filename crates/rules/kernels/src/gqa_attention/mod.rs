@@ -15,6 +15,7 @@ gpukit::kernel! {
         out(out = fix.len()),
         pod(fix.params()),
         u32x2(fix.seq_len, fix.n_heads),
+        u32x2(fix.total_kv, fix.kv_cache_len),
     ],
     launch = rows(fix.seq_len * fix.n_heads),
     result = (out, fix.len()),

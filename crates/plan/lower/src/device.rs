@@ -13,6 +13,7 @@ macro_rules! device_runner {
                 Context, DeviceBuffer, Kernel, KernelArgs, cached_context, cached_source_kernel,
                 launch_1d, launch_grid, launch_rows,
             };
+            use graph::DimName;
             use mem::Buffer;
             use std::collections::HashMap;
             use std::ops::Range;
@@ -26,6 +27,8 @@ macro_rules! device_runner {
                 /// Compiled kernels, by entry, and by how a kernel prints.
                 made: HashMap<String, Kernel>,
                 known: HashMap<String, Kernel>,
+                /// Runtime dimensions, as last bound.
+                bound: HashMap<DimName, u32>,
             }
 
             impl Runner {
@@ -37,8 +40,9 @@ macro_rules! device_runner {
                         kernels: Vec::new(),
                         made: HashMap::new(),
                         known: HashMap::new(),
+                        bound: HashMap::new(),
                     };
-                    runner.replan(plan)?;
+                    runner.replan(&plan)?;
                     Ok(runner)
                 }
 
@@ -62,6 +66,9 @@ macro_rules! device_runner {
                             Arg::F32(v) => args.f32(*v),
                             Arg::Pair(a, b) => args.u32(*a).u32(*b),
                             Arg::Bytes(bytes) => args.bytes(bytes),
+                            Arg::Size(_) | Arg::Offset(..) | Arg::Span(..) => {
+                                unreachable!("bound before launching")
+                            }
                         };
                     }
                     match launch.shape {
@@ -75,8 +82,20 @@ macro_rules! device_runner {
                             let threads = threads as u32;
                             launch_grid(self.ctx, kernel, across, down, threads, &mut args)?
                         }
+                        Shape::Runtime(_) => unreachable!("bound before launching"),
                     }
                     Ok(())
+                }
+
+                /// Each launch of a step, its runtime sizes filled in.
+                fn launches(&self, step: usize) -> Result<Vec<Launch>, Error> {
+                    let size = |name| self.bound.get(&name).copied();
+                    let bound = |l: Launch| l.bound(&size).ok_or(Error::Unbound);
+                    self.plan.steps[step]
+                        .launches()
+                        .into_iter()
+                        .map(bound)
+                        .collect()
                 }
             }
 
@@ -85,12 +104,15 @@ macro_rules! device_runner {
                     &self.plan
                 }
 
-                fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+                fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
+                    if plan.id != 0 && plan.id == self.plan.id {
+                        return Ok(());
+                    }
                     if plan.zoned() {
                         return Err(Error::Unsupported("a plan over several zones".into()));
                     }
                     let ctx = self.ctx;
-                    self.held.bind(&plan, |zone, bytes| {
+                    self.held.bind(plan, |zone, bytes| {
                         let buffer = DeviceBuffer::alloc(ctx, bytes.max(4))?;
                         // Kernels may read what they are about to write.
                         buffer.zero()?;
@@ -119,8 +141,12 @@ macro_rules! device_runner {
                         self.known.insert(key, kernel.clone());
                         self.kernels.push(kernel);
                     }
-                    self.plan = plan;
+                    self.plan = plan.clone();
                     Ok(())
+                }
+
+                fn bind(&mut self, name: DimName, value: u32) {
+                    self.bound.insert(name, value);
                 }
 
                 fn held(&self) -> &Held {
@@ -134,9 +160,10 @@ macro_rules! device_runner {
                 fn repeat(&self, step: usize, times: usize) -> Result<f64, Error> {
                     self.ctx.synchronize()?;
                     let start = Instant::now();
+                    let launches = self.launches(step)?;
                     for _ in 0..times {
-                        for launch in self.plan.steps[step].launches() {
-                            self.launch(&self.kernels[step], &launch)?;
+                        for launch in &launches {
+                            self.launch(&self.kernels[step], launch)?;
                         }
                     }
                     self.ctx.synchronize()?;
@@ -150,7 +177,7 @@ macro_rules! device_runner {
                 /// Enqueues every launch, then waits once.
                 fn submit(&self, steps: Range<usize>) -> Result<(), Error> {
                     for i in steps {
-                        for launch in self.plan.steps[i].launches() {
+                        for launch in self.launches(i)? {
                             self.launch(&self.kernels[i], &launch)?;
                         }
                     }

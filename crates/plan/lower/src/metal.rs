@@ -6,6 +6,7 @@ use crate::plan::{Plan, Slot};
 use crate::run::{Held, Run};
 use codegen::Dialect;
 use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared, set_bytes};
+use graph::DimName;
 use mem::Buffer;
 use objc2::msg_send;
 use objc2::runtime::ProtocolObject;
@@ -27,6 +28,8 @@ pub struct Runner {
     /// Compiled kernels, by entry, and by how a kernel prints.
     made: HashMap<String, Rc<ComputePipeline>>,
     known: HashMap<String, Rc<ComputePipeline>>,
+    /// Runtime dimensions, as last bound.
+    bound: HashMap<DimName, u32>,
 }
 
 fn gpu(what: &'static str) -> Error {
@@ -56,8 +59,9 @@ impl Runner {
             pipelines: Vec::new(),
             made: HashMap::new(),
             known: HashMap::new(),
+            bound: HashMap::new(),
         };
-        runner.replan(plan)?;
+        runner.replan(&plan)?;
         Ok(runner)
     }
 
@@ -85,6 +89,9 @@ impl Runner {
                     let at = std::ptr::NonNull::from(&bytes[..]).cast();
                     unsafe { enc.setBytes_length_atIndex(at, bytes.len(), index) };
                 }
+                Arg::Size(_) | Arg::Offset(..) | Arg::Span(..) => {
+                    unreachable!("bound before encoding")
+                }
             }
         }
         match launch.shape {
@@ -98,7 +105,19 @@ impl Runner {
                 down,
                 threads,
             } => grid(enc, across, down, threads),
+            Shape::Runtime(_) => unreachable!("bound before encoding"),
         }
+    }
+
+    /// Each launch of a step, its runtime sizes filled in.
+    fn launches(&self, step: usize) -> Result<Vec<Launch>, Error> {
+        let size = |name| self.bound.get(&name).copied();
+        let bound = |l: Launch| l.bound(&size).ok_or(Error::Unbound);
+        self.plan.steps[step]
+            .launches()
+            .into_iter()
+            .map(bound)
+            .collect()
     }
 }
 
@@ -111,7 +130,7 @@ impl Runner {
         let enc = enc.ok_or_else(|| gpu("encoder"))?;
         for i in steps {
             enc.setComputePipelineState(&self.pipelines[i].pipeline);
-            for launch in self.plan.steps[i].launches() {
+            for launch in self.launches(i)? {
                 self.encode(&enc, &launch);
             }
         }
@@ -130,12 +149,15 @@ impl Run for Runner {
         &self.plan
     }
 
-    fn replan(&mut self, plan: Plan) -> Result<(), Error> {
+    fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
+        if plan.id != 0 && plan.id == self.plan.id {
+            return Ok(());
+        }
         if plan.zoned() {
             return Err(Error::Unsupported("a plan over several zones".into()));
         }
         let ctx = &self.ctx;
-        self.held.bind(&plan, |zone, bytes| {
+        self.held.bind(plan, |zone, bytes| {
             let shared = Shared::new(&ctx.device, bytes).ok_or_else(|| gpu("buffer allocation"));
             Ok(Buffer::new(zone, shared?))
         })?;
@@ -164,8 +186,12 @@ impl Run for Runner {
             self.known.insert(key, Rc::clone(&pipeline));
             self.pipelines.push(pipeline);
         }
-        self.plan = plan;
+        self.plan = plan.clone();
         Ok(())
+    }
+
+    fn bind(&mut self, name: DimName, value: u32) {
+        self.bound.insert(name, value);
     }
 
     fn held(&self) -> &Held {

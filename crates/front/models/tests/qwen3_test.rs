@@ -231,7 +231,7 @@ impl<'a> Gpu<'a> {
     /// Lowers this launch for `device` and feeds it.
     fn plan(&mut self, g: &Graph, rows: Span, device: &Device) {
         let plan = self.plans.lower(g, 0, &rows.sizes(), device).unwrap();
-        self.runner.replan(plan).unwrap();
+        self.runner.replan(&plan).unwrap();
         let [tokens, positions] = rows.tensors();
         self.runner
             .feed(&[tokens.view(), positions.view()])
@@ -388,9 +388,12 @@ mod decode {
     /// Runs one launch. Returns indices, then planning and running seconds.
     fn launch(gpu: &mut Gpu, g: &Graph, rows: Span, device: &Device) -> (Vec<u32>, [f64; 2]) {
         let start = Instant::now();
-        let plan = gpu.plans.lower(g, 0, &rows.sizes(), device).unwrap();
+        // One plan per context range, its length bound at launch.
+        let upto = [Context];
+        let (plan, bound) = gpu.plans.upto(g, 0, &rows.sizes(), &upto, device).unwrap();
         let out = plan.outputs[0].slot;
         gpu.runner.replan(plan).unwrap();
+        gpu.runner.bind_all(&bound);
         let planning = start.elapsed().as_secs_f64();
         let [tokens, positions] = rows.tensors();
         let start = Instant::now();

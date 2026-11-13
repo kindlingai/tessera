@@ -1,7 +1,9 @@
 //! What a kernel declares: its arguments, shape and source.
 
+use crate::extent::Extent;
 use crate::plan::Slot;
 use codegen::{Dialect, Text, hash};
+use graph::DimName;
 
 /// One kernel argument, in the order its source declares.
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +16,12 @@ pub enum Arg {
     Pair(u32, u32),
     /// A small `repr(C)` struct, passed by value.
     Bytes(Vec<u8>),
+    /// A count read from a dimension at launch.
+    Size(Extent),
+    /// A slot's buffer, an extent of elements in.
+    Offset(Slot, Extent),
+    /// Two extents as one `uint2`.
+    Span(Extent, Extent),
 }
 
 impl Arg {
@@ -30,6 +38,39 @@ impl Arg {
     pub fn count(n: usize) -> Arg {
         Arg::U32(n as u32)
     }
+
+    /// A count, plain when it is already known.
+    pub fn size(e: Extent) -> Arg {
+        match e {
+            Extent::Fixed(n) => Arg::count(n),
+            e => Arg::Size(e),
+        }
+    }
+
+    /// A slot's buffer, `e` elements in.
+    pub fn offset(slot: Slot, e: Extent) -> Arg {
+        match e {
+            Extent::Fixed(n) => Arg::Buffer(slot, n),
+            e => Arg::Offset(slot, e),
+        }
+    }
+
+    pub fn span(a: Extent, b: Extent) -> Arg {
+        match (a, b) {
+            (Extent::Fixed(a), Extent::Fixed(b)) => Arg::pair(a, b),
+            (a, b) => Arg::Span(a, b),
+        }
+    }
+}
+
+impl Shape {
+    /// A line of `e` threads, plain when known.
+    pub fn line(e: Extent) -> Shape {
+        match e {
+            Extent::Fixed(n) => Shape::Line(n),
+            e => Shape::Runtime(e),
+        }
+    }
 }
 
 /// How threads are laid out over the work.
@@ -44,12 +85,35 @@ pub enum Shape {
         down: usize,
         threads: usize,
     },
+    /// A line whose length is read at launch.
+    Runtime(Extent),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Launch {
     pub args: Vec<Arg>,
     pub shape: Shape,
+}
+
+impl Launch {
+    /// The same launch with every runtime size filled in.
+    pub fn bound(self, size: &dyn Fn(DimName) -> Option<u32>) -> Option<Launch> {
+        let count = |e: &Extent| Some(e.value(size)? as u32);
+        let mut args = Vec::with_capacity(self.args.len());
+        for arg in self.args {
+            args.push(match arg {
+                Arg::Size(e) => Arg::U32(count(&e)?),
+                Arg::Offset(slot, e) => Arg::Buffer(slot, e.value(size)?),
+                Arg::Span(a, b) => Arg::Pair(count(&a)?, count(&b)?),
+                fixed => fixed,
+            });
+        }
+        let shape = match self.shape {
+            Shape::Runtime(e) => Shape::Line(e.value(size)?),
+            fixed => fixed,
+        };
+        Some(Launch { args, shape })
+    }
 }
 
 /// Where a kernel's source comes from.

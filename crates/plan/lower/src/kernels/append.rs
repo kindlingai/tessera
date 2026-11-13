@@ -1,6 +1,7 @@
 //! Copies new rows in after a plan's kept rows.
 
 use crate::abi::{Arg, Launch, Shape, Source};
+use crate::extent::Extent;
 use crate::kernel::Kernel;
 use crate::kernels::Map;
 use crate::plan::Step;
@@ -8,7 +9,7 @@ use crate::plan::Step;
 /// Copies `len` elements to `skip` elements into the kept rows.
 #[derive(Clone, Copy, Debug)]
 pub struct Append {
-    pub skip: usize,
+    pub skip: Extent,
     pub len: usize,
 }
 
@@ -23,7 +24,7 @@ impl Kernel for Append {
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let out = Arg::Buffer(step.write, self.skip);
+        let out = Arg::offset(step.write, self.skip);
         vec![Launch {
             args: vec![step.read(0), out, Arg::count(self.len)],
             shape: Shape::Line(self.len),

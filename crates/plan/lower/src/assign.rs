@@ -33,9 +33,13 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     for (v, _) in &s.outputs {
         last[v.0 as usize] = FOREVER;
     }
+    let plan = Plan {
+        id: Plan::fresh(),
+        ..Plan::default()
+    };
     let mut b = Buffers {
         s,
-        plan: Plan::default(),
+        plan,
         slots: vec![None; s.values.len()],
         last,
         free: Vec::new(),

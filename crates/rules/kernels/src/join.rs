@@ -1,12 +1,14 @@
 //! Joins rows of two inputs along the last axis.
 
-use lower::{Arg, Kernel, Launch, Shape, Source, Step, Text, float};
+use lower::{Arg, Extent, Kernel, Launch, Shape, Source, Step, Text, float};
 
 /// Each output row: a `left` row, then a `right` row.
 #[derive(Clone, Copy, Debug)]
 pub struct Join {
     pub left: usize,
     pub right: usize,
+    /// The row count. Decode reads it at launch.
+    pub rows: Extent,
 }
 
 const BODY: &str = "    u32 width = left + right;
@@ -37,13 +39,15 @@ impl Kernel for Join {
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let len = step.write.len;
-        let rows = len / (self.left + self.right);
-        let sizes = [self.left, self.right, rows].map(Arg::count);
+        let sizes = [self.left, self.right].map(Arg::count);
         let buffers = [step.read(0), step.read(1), step.out()];
+        let args = buffers
+            .into_iter()
+            .chain(sizes)
+            .chain([Arg::size(self.rows)]);
         vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
-            shape: Shape::Line(len),
+            args: args.collect(),
+            shape: Shape::line(self.rows.times(self.left + self.right)),
         }]
     }
 }

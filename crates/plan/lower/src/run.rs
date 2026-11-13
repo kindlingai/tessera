@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use graph::DimName;
 use mem::{Buffer, Tensor, View, ViewMut, copy};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -97,7 +98,9 @@ pub trait Run {
     fn held(&self) -> &Held;
     fn held_mut(&mut self) -> &mut Held;
     /// Takes up another plan. Weights and kept rows stay loaded.
-    fn replan(&mut self, plan: Plan) -> Result<(), Error>;
+    fn replan(&mut self, plan: &Plan) -> Result<(), Error>;
+    /// Gives a runtime dimension its value for the next launches.
+    fn bind(&mut self, name: DimName, value: u32);
     /// Runs these steps in order and waits for them.
     fn submit(&self, steps: Range<usize>) -> Result<(), Error>;
     /// Runs one step `times` over. Returns seconds per run.
@@ -117,6 +120,12 @@ pub trait Run {
 
     fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
         Ok(self.held().view(slot).to_u32()?)
+    }
+
+    fn bind_all(&mut self, sizes: &[(DimName, u32)]) {
+        for (name, value) in sizes {
+            self.bind(*name, *value);
+        }
     }
 
     /// Uploads one graph weight. Unused weights are ignored.

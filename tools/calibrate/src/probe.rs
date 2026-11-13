@@ -202,7 +202,7 @@ pub fn read(probes: &[Probe]) -> Result<Vec<Reading>, Error> {
     for &probe in probes {
         let runner = match &mut runner {
             Some(runner) => {
-                runner.replan(probe.plan())?;
+                runner.replan(&probe.plan())?;
                 runner
             }
             None => runner.insert(open(probe.plan())?),
