@@ -26,7 +26,7 @@ const ROWS: usize = 32;
 
 /// Each lane sums part of every row, then all reduce.
 #[kernel]
-fn linear<const WIDE: u32, const AHEAD: u32, F: Form>(
+fn linear<const WIDE: u32, const AHEAD: u32, F: Form<Elem = f32>>(
     x: Buf<F32>,
     w: Buf<F>,
     out: BufMut<F32>,

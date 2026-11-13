@@ -1,9 +1,30 @@
 //! Softmax over rows, generated.
 
 use crate::per_row;
+use codegen::prelude::*;
 use graph::Stage;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
 use sim::{Load, Ops};
+
+/// One thread per row: peak, sum, then the probabilities.
+#[kernel]
+fn softmax(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
+    if gid() >= rows {
+        return;
+    }
+    let at = gid() as u64 * width as u64;
+    let mut top = x[at];
+    for i in 1..width {
+        top = max(top, x[at + i as u64]);
+    }
+    let mut sum = 0.0f32;
+    for i in 0..width {
+        sum += exp(x[at + i as u64] - top);
+    }
+    for i in 0..width {
+        out[at + i as u64] = exp(x[at + i as u64] - top) / sum;
+    }
+}
 
 /// One thread turns each row into probabilities.
 #[derive(Clone, Copy, Debug)]
@@ -11,23 +32,6 @@ pub struct Softmax {
     pub rows: usize,
     pub width: usize,
 }
-
-const BODY: &str = "    if (gid >= rows) {
-        return;
-    }
-    u64 at = (u64)gid * width;
-    float top = x[at];
-    for (u32 i = 1; i < width; i++) {
-        top = f_max(top, x[at + i]);
-    }
-    float sum = 0.0f;
-    for (u32 i = 0; i < width; i++) {
-        sum += f_exp(x[at + i] - top);
-    }
-    for (u32 i = 0; i < width; i++) {
-        out[at + i] = f_exp(x[at + i] - top) / sum;
-    }
-";
 
 impl Kernel for Softmax {
     fn name(&self) -> &'static str {
@@ -55,12 +59,9 @@ impl Kernel for Softmax {
     }
 
     fn source(&self) -> Source {
-        Source::Made(Text {
-            entry: "plan_softmax".into(),
-            buffers: vec![float("x", false), float("out", true)],
-            scalars: vec![("rows", "u32"), ("width", "u32")],
-            body: BODY.into(),
-        })
+        let mut text = softmax_ir().text();
+        text.entry = "plan_softmax".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

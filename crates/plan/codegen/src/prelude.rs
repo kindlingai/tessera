@@ -7,20 +7,30 @@ use std::ops::{Index, IndexMut};
 pub use crate::LANES;
 pub use kernel_macro::kernel;
 
-/// How a buffer's elements are stored. Reads widen to f32.
+/// How a buffer stores elements, and what a read gives.
 pub trait Form {
     const DTYPE: DType;
+    type Elem: Copy;
 }
 
 pub struct F32;
 pub struct Bf16;
+pub struct U32;
 
 impl Form for F32 {
     const DTYPE: DType = DType::F32;
+    type Elem = f32;
 }
 
+/// Reads widen to f32.
 impl Form for Bf16 {
     const DTYPE: DType = DType::Bf16;
+    type Elem = f32;
+}
+
+impl Form for U32 {
+    const DTYPE: DType = DType::U32;
+    type Elem = u32;
 }
 
 /// A float4, loaded or stored in one go.
@@ -50,9 +60,9 @@ pub struct Buf<F: Form>(PhantomData<F>);
 pub struct BufMut<F: Form>(PhantomData<F>);
 
 impl<F: Form> Index<u64> for Buf<F> {
-    type Output = f32;
+    type Output = F::Elem;
 
-    fn index(&self, _: u64) -> &f32 {
+    fn index(&self, _: u64) -> &F::Elem {
         device()
     }
 }
@@ -65,15 +75,15 @@ impl<F: Form> Buf<F> {
 }
 
 impl<F: Form> Index<u64> for BufMut<F> {
-    type Output = f32;
+    type Output = F::Elem;
 
-    fn index(&self, _: u64) -> &f32 {
+    fn index(&self, _: u64) -> &F::Elem {
         device()
     }
 }
 
 impl<F: Form> IndexMut<u64> for BufMut<F> {
-    fn index_mut(&mut self, _: u64) -> &mut f32 {
+    fn index_mut(&mut self, _: u64) -> &mut F::Elem {
         device()
     }
 }
@@ -172,6 +182,18 @@ pub fn max(_: f32, _: f32) -> f32 {
 }
 
 pub fn clamp(_: f32, _: f32, _: f32) -> f32 {
+    device()
+}
+
+pub fn pow(_: f32, _: f32) -> f32 {
+    device()
+}
+
+pub fn cos(_: f32) -> f32 {
+    device()
+}
+
+pub fn sin(_: f32) -> f32 {
     device()
 }
 

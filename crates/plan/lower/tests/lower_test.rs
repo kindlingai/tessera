@@ -152,7 +152,7 @@ fn dialects_agree() {
     assert!(cuda.contains(order), "{cuda}");
     assert!(cuda.contains(&format!("__global__ void {}(", text.entry)));
     for body in [&metal, &cuda] {
-        assert!(body.contains("v = v * a0[gid];"));
+        assert!(body.contains("v = (v * a0[(u64)gid]);"), "{body}");
     }
 }
 

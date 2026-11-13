@@ -16,6 +16,7 @@ name = "tessera-calibrate"
 path = "src/main.rs"
 
 [dependencies]
+codegen = { workspace = true }
 graph = { workspace = true }
 trace = { workspace = true }
 lower = { workspace = true }

@@ -1,8 +1,24 @@
 //! Rotary positions: a table of angles, then the rotation.
 
 use crate::apply_rope_heads;
+use codegen::prelude::*;
 use graph::{Pairs, Stage};
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
+
+/// One thread per position and pair: its cosine and sine.
+#[kernel]
+fn angles(positions: Buf<U32>, mut out: BufMut<F32>, count: u32, width: u32, theta: f32) {
+    let pairs = width / 2;
+    let at = gid() / pairs;
+    let pair = gid() % pairs;
+    if at >= count {
+        return;
+    }
+    let turn = pow(theta, -((2 * pair) as f32) / width as f32);
+    let angle = positions[at as u64] as f32 * turn;
+    out[(at * width + 2 * pair) as u64] = cos(angle);
+    out[(at * width + 2 * pair + 1) as u64] = sin(angle);
+}
 
 /// Each position's cosine and sine, per pair.
 #[derive(Clone, Copy, Debug)]
@@ -19,30 +35,15 @@ pub struct Rope {
     pub width: usize,
 }
 
-const BODY: &str = "    u32 pairs = width / 2;
-    u32 at = gid / pairs;
-    u32 pair = gid % pairs;
-    if (at >= count) {
-        return;
-    }
-    float turn = f_pow(theta, -(float)(2 * pair) / (float)width);
-    float angle = (float)positions[at] * turn;
-    out[at * width + 2 * pair] = f_cos(angle);
-    out[at * width + 2 * pair + 1] = f_sin(angle);
-";
-
 impl Kernel for Angles {
     fn name(&self) -> &'static str {
         "angles"
     }
 
     fn source(&self) -> Source {
-        Source::Made(Text {
-            entry: "plan_angles".into(),
-            buffers: vec![("positions".into(), "u32", false), float("out", true)],
-            scalars: vec![("count", "u32"), ("width", "u32"), ("theta", "float")],
-            body: BODY.into(),
-        })
+        let mut text = angles_ir().text();
+        text.entry = "plan_angles".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

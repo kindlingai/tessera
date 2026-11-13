@@ -1,9 +1,27 @@
 //! RMS norm over rows, generated.
 
 use crate::per_row;
+use codegen::prelude::*;
 use graph::Stage;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Text, Tree, float};
+use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
 use sim::{Load, Ops};
+
+/// One thread per row. Summing in order keeps batches alike.
+#[kernel]
+fn rms_norm(x: Buf<F32>, w: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32, eps: f32) {
+    if gid() >= rows {
+        return;
+    }
+    let at = gid() as u64 * width as u64;
+    let mut sum = 0.0f32;
+    for i in 0..width {
+        sum += x[at + i as u64] * x[at + i as u64];
+    }
+    let inv = rsqrt(sum / width as f32 + eps);
+    for i in 0..width {
+        out[at + i as u64] = x[at + i as u64] * inv * w[i as u64];
+    }
+}
 
 /// One thread scales each row by its root mean square.
 #[derive(Clone, Copy, Debug)]
@@ -12,21 +30,6 @@ pub struct RmsNorm {
     pub width: usize,
     pub eps: f32,
 }
-
-// Summed in order, so batch size never changes a row.
-const BODY: &str = "    if (gid >= rows) {
-        return;
-    }
-    u64 at = (u64)gid * width;
-    float sum = 0.0f;
-    for (u32 i = 0; i < width; i++) {
-        sum += x[at + i] * x[at + i];
-    }
-    float inv = f_rsqrt(sum / (float)width + eps);
-    for (u32 i = 0; i < width; i++) {
-        out[at + i] = x[at + i] * inv * w[i];
-    }
-";
 
 impl Kernel for RmsNorm {
     fn name(&self) -> &'static str {
@@ -51,12 +54,9 @@ impl Kernel for RmsNorm {
     }
 
     fn source(&self) -> Source {
-        Source::Made(Text {
-            entry: "plan_rms_norm".into(),
-            buffers: vec![float("x", false), float("w", false), float("out", true)],
-            scalars: vec![("rows", "u32"), ("width", "u32"), ("eps", "float")],
-            body: BODY.into(),
-        })
+        let mut text = rms_norm_ir().text();
+        text.entry = "plan_rms_norm".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

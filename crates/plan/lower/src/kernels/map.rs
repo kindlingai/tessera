@@ -5,11 +5,20 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::{Draft, Site};
 use crate::tree::{T, Tree};
-use codegen::ir::{BinOp, Expr, Intrinsic, Stmt};
-use codegen::{Text, float, hash};
-use graph::Act;
+use codegen::hash;
+use codegen::ir::{BinOp, Expr, Intrinsic, Param, Stmt};
+use codegen::prelude::*;
+use graph::{Act, DType};
 use sim::{Load, Ops};
-use std::fmt::Write;
+
+/// One thread per element. The stages follow, then the store.
+#[kernel]
+fn map(x: Buf<F32>, out: BufMut<F32>, len: u32) {
+    if gid() >= len {
+        return;
+    }
+    let mut v = x[gid() as u64];
+}
 
 /// One elementwise step.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,37 +34,6 @@ pub enum MapStage {
 /// `out = stages(x, operands..)`. No stages makes a copy.
 #[derive(Clone, Debug)]
 pub struct Map(pub Vec<MapStage>);
-
-fn act(a: Act) -> &'static str {
-    match a {
-        Act::Silu => "v = v / (1.0f + f_exp(-v));",
-        Act::Sigmoid => "v = 1.0f / (1.0f + f_exp(-v));",
-        Act::Relu => "v = f_max(v, 0.0f);",
-        Act::GeluTanh => {
-            "v = 0.5f * v * (1.0f + f_tanh(f_clamp(\
-             0.7978846f * (v + 0.044715f * v * v * v), -8.0f, 8.0f)));"
-        }
-    }
-}
-
-/// Source lines running `stages` on `v`. `operand` names each read.
-pub fn stage_lines(stages: &[MapStage], operand: &dyn Fn(usize) -> String) -> String {
-    let (mut lines, mut taken) = (String::new(), 0);
-    for s in stages {
-        let line = match s {
-            MapStage::Add | MapStage::Mul => {
-                let op = if *s == MapStage::Add { '+' } else { '*' };
-                taken += 1;
-                format!("v = v {op} {};", operand(taken - 1))
-            }
-            // Bits, so the constant survives the round trip.
-            MapStage::Scale(by) => format!("v = v * f_bits(0x{:08x}u);", by.to_bits()),
-            MapStage::Act(a) => act(*a).to_string(),
-        };
-        let _ = writeln!(lines, "    {line}");
-    }
-    lines
-}
 
 /// `v` through an activation, as a tree.
 fn act_expr(a: Act) -> Expr {
@@ -151,18 +129,26 @@ impl Kernel for Map {
     }
 
     fn source(&self) -> Source {
-        let mut buffers = vec![float("x", false)];
-        buffers.extend((0..operands(&self.0)).map(|k| float(&format!("a{k}"), false)));
-        let start = "    if (gid >= len) {\n        return;\n    }\n    float v = x[gid];\n";
-        let lines = stage_lines(&self.0, &|k| format!("a{k}[gid]"));
-        let body = format!("{start}{lines}    out[gid] = v;\n");
-        buffers.push(float("out", true));
-        Source::Made(Text {
-            entry: format!("map_{:x}", hash(&body)),
-            buffers,
-            scalars: vec![("len", "u32")],
-            body,
-        })
+        let mut body = map_ir();
+        let operand = |k: usize| Param::Buffer {
+            name: format!("a{k}"),
+            dtype: DType::F32,
+            writes: false,
+        };
+        // The operands sit between the input and the output.
+        body.params
+            .splice(1..1, (0..operands(&self.0)).map(operand));
+        let at = || Expr::cast(codegen::ir::Ty::U64, Expr::Call(Intrinsic::Gid, Vec::new()));
+        let read = |k: usize| Expr::index(Expr::var(&format!("a{k}")), at());
+        body.stmts.extend(stage_stmts(&self.0, &read));
+        body.stmts.push(Stmt::Assign {
+            target: Expr::index(Expr::var("out"), at()),
+            op: None,
+            value: Expr::var("v"),
+        });
+        let mut text = body.text();
+        text.entry = format!("map_{:x}", hash(&text.body));
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

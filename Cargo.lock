@@ -27,6 +27,7 @@ checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 name = "calibrate"
 version = "0.1.0"
 dependencies = [
+ "codegen",
  "gpukit",
  "graph",
  "kernels",

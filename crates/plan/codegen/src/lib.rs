@@ -1,5 +1,6 @@
 //! Kernel text for every dialect, with its cost counted.
 
+mod count;
 mod dialect;
 pub mod ir;
 pub mod prelude;
