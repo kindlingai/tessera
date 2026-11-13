@@ -89,7 +89,7 @@ fn toolkits_agree() {
     std::fs::write(dir.join("probe.cpp"), hip_probe()).unwrap();
     for row in rows() {
         let backend = backend_of(&row).to_string();
-        if !here(&backend) {
+        if row.check.is_empty() || !here(&backend) {
             continue;
         }
         for target in &row.check {
