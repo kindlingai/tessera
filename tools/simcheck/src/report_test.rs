@@ -15,8 +15,7 @@ fn report_shows_hunks() {
         count: 2,
     };
     let md = markdown(
-        &[hit],
-        &[],
+        (&[hit], &[], &[]),
         &wins,
         root,
         (20, 0.97),
@@ -28,8 +27,11 @@ fn report_shows_hunks() {
         md.contains("````rust\n//! Downloads")
             && md.contains("[\"src/fetch.rs\", \"src/fetch.rs\"],")
     );
-    let clean = markdown(&[], &[], &wins, root, (20, 0.97), None).unwrap();
+    let clean = markdown((&[], &[], &[]), &wins, root, (20, 0.97), None).unwrap();
     assert!(clean.ends_with("None found.\n"));
+    let pair = ("a.rs".to_string(), "b.rs".to_string());
+    let stale = markdown((&[], &[&pair], &[]), &wins, root, (20, 0.97), None).unwrap();
+    assert!(stale.contains("allow nothing") && stale.contains("[\"a.rs\", \"b.rs\"],"));
     let lean = Lean {
         path: "a/x.rs".into(),
         home: "a".into(),
@@ -37,6 +39,6 @@ fn report_shows_hunks() {
         other: "b".into(),
         near: 0.9,
     };
-    let leaning = markdown(&[], &[lean], &wins, root, (20, 0.97), None).unwrap();
+    let leaning = markdown((&[], &[], &[lean]), &wins, root, (20, 0.97), None).unwrap();
     assert!(leaning.contains("| `a/x.rs` | `a` 0.800 | `b` 0.900 |"));
 }
