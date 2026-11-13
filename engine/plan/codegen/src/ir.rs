@@ -257,6 +257,8 @@ pub struct Body {
     pub entry: String,
     pub params: Vec<Param>,
     pub stmts: Vec<Stmt>,
+    /// The value a kernel called from another gives back.
+    pub ret: Option<Expr>,
 }
 
 /// Every name in scope and what it is.
@@ -731,6 +733,7 @@ fn float(x: f64) -> String {
 impl Body {
     /// The text of this body, with buffers and scalars declared.
     pub fn text(&self) -> Text {
+        assert!(self.ret.is_none(), "`{}` has a value: call it", self.entry);
         let mut p = Printer {
             scope: vec![HashMap::new()],
             lines: Vec::new(),

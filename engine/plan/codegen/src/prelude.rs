@@ -75,8 +75,25 @@ fn device() -> ! {
 /// A buffer the kernel reads.
 pub struct Buf<F: Elems>(PhantomData<F>);
 
+// A derive would ask `F: Copy`.
+impl<F: Elems> Clone for Buf<F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F: Elems> Copy for Buf<F> {}
+
 /// A buffer the kernel writes.
 pub struct BufMut<F: Elems>(PhantomData<F>);
+
+impl<F: Elems> Clone for BufMut<F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F: Elems> Copy for BufMut<F> {}
 
 impl<F: Elems> Index<u64> for Buf<F> {
     type Output = F::Elem;

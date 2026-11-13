@@ -76,6 +76,7 @@ fn dot_body(k: Expr) -> Body {
                 value: Expr::Call(crate::ir::Intrinsic::Sum32, vec![var("s")]),
             },
         ],
+        ret: None,
     }
 }
 

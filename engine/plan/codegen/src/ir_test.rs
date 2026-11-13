@@ -1,6 +1,7 @@
 use crate as codegen;
-use crate::Dialect;
+use crate::exec::{self, ArgVal, Grid};
 use crate::prelude::*;
+use crate::{Dialect, Precision};
 
 /// A dot product over `k` weights by 32 lanes.
 #[kernel]
@@ -60,4 +61,81 @@ fn constants_fold() {
     assert!(f32.text().body.contains("float4 c = f_f32x4(w + (u64)i);"));
     assert!(f32.text().body.contains("#pragma unroll 4"));
     assert_eq!(f32.trip().width, 16.0);
+}
+
+/// A row's sum of squares: `n` from `at`, in order.
+#[kernel]
+fn squares(x: Buf<F32>, at: u64, n: u32) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        sum += x[at + i as u64] * x[at + i as u64];
+    }
+    sum
+}
+
+/// Scales `n` of `x` from `at` by `by`, into `out`.
+#[kernel]
+fn scale<const AHEAD: u32>(x: Buf<F32>, mut out: BufMut<F32>, at: u64, n: u32, by: f32) {
+    for i in (0..n).unroll(AHEAD) {
+        out[at + i as u64] = x[at + i as u64] * by;
+    }
+}
+
+/// An RMS norm from the two kernels above.
+#[kernel]
+fn calls(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
+    if gid() >= rows {
+        return;
+    }
+    let at = gid() as u64 * width as u64;
+    let inv = rsqrt(squares(x, at, width) / width as f32);
+    scale::<2>(x, out, at, width, inv);
+}
+
+#[test]
+fn kernels_call() {
+    let body = calls_ir();
+    let text = body.text().render(Dialect::Cuda);
+    // The first call's names end in 1, the second's 2.
+    assert!(text.contains("u64 at_1 = (u64)at;"));
+    assert!(text.contains("u32 n_1 = (u32)width;"));
+    assert!(text.contains("for (u32 i_1 = 0; i_1 < n_1; i_1 += 1) {"));
+    assert!(text.contains("sum_1 += (x[(at_1 + (u64)i_1)] * x[(at_1 + (u64)i_1)]);"));
+    assert!(text.contains("float inv = f_rsqrt((sum_1 / (float)width));"));
+    assert!(text.contains("float by_2 = (float)inv;"));
+    assert!(text.contains("#pragma unroll 2"));
+    assert!(text.contains("out[(at_2 + (u64)i_2)] = (x[(at_2 + (u64)i_2)] * by_2);"));
+
+    let rows = [[1.0f32, 2.0, 2.0, 4.0], [3.0, 0.0, 0.0, 4.0]];
+    let mut x: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let mut out = vec![0u8; x.len()];
+    let buf = |at| ArgVal::Buf {
+        at,
+        skip: 0,
+        form: crate::form::F32_FORM,
+    };
+    let args = [buf(0), buf(1), ArgVal::U32(2), ArgVal::U32(4)];
+    let grid = Grid {
+        groups: 1,
+        threads: 2,
+    };
+    exec::run(
+        &body,
+        &args,
+        &mut [&mut x, &mut out],
+        grid,
+        LANES,
+        Precision::EXACT,
+    );
+    let got: Vec<f32> = out
+        .chunks(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    // Each row's mean square is 6.25: scale 0.4.
+    let want = [0.4f32, 0.8, 0.8, 1.6, 1.2, 0.0, 0.0, 1.6];
+    assert_eq!(got, want);
 }
