@@ -9,7 +9,7 @@ use graph::DimName::{self, Rows};
 use interp::run;
 
 mod common;
-use common::{Finish, finished, linear, noise};
+use common::{Finish, finished, linear, noise, runs, terms};
 use engine::settings;
 use lower::{Device, Dialect, Source, lower, open, rules};
 use trace::Act;
@@ -57,28 +57,37 @@ fn rule_registers() {
 fn lanes_match_cpu() {
     let mut draws = Noise(23);
     // Widths that lanes do not divide, and one they do.
-    let plain = [(52, 7), (4, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n)));
+    let plain = [(52, 7), (4, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n), true));
     // The sum as an operand, then as the chain's input.
     let residual: Finish = |x, product| x.add(&product);
     let gate: Finish = |x, product| product.act(Act::Silu).mul(x);
-    let fused = [residual, gate].map(|finish| (48, 48, finished(48, 48, finish)));
-    for (k, n, g) in plain.into_iter().chain(fused) {
+    let fused = [residual, gate].map(|finish| (48, 48, finished(48, 48, finish), false));
+    for (k, n, g, bare) in plain.into_iter().chain(fused) {
         let rows: DimName = Rows;
         let weights = [noise(vec![n as usize, k as usize], &mut draws)];
-        for m in [1usize, 5] {
+        for (m, settings) in [1usize, 5].into_iter().zip(runs().iter().cycle()) {
             let x = noise(vec![m, k as usize], &mut draws);
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-            let device = Device::guess(&settings()).favoring("lanes");
+            let device = Device::guess(settings).favoring("lanes");
             let plan = lower(&g, 0, &[(rows, m as u64)], &device).unwrap();
             // Stages after the matmul ride in the same launch.
             let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
             assert_eq!(names, ["lanes"]);
             assert_eq!(plan.steps[0].covers.len(), g.nodes.len() - 2);
-            let mut runner = open(plan, &settings()).unwrap();
+            let terms = terms(&plan);
+            let mut runner = open(plan, settings).unwrap();
             runner.load(0, weights[0].view()).unwrap();
             let got = runner.run(&[x.view()]).unwrap().remove(0);
             let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-            assert!(off < 1e-3, "{m} rows of {k} to {n}: off by {off:e}");
+            // The dot's bound leaves out a fused chain's stages.
+            let (xs, ws) = (x.floats().unwrap(), weights[0].floats().unwrap());
+            let bound = match bare {
+                true => terms.matmul(&runner.precision(), xs, ws, k as usize),
+                false => 1e-3,
+            };
+            let label = format!("{m} rows of {k} to {n} on {}", runner.device());
+            assert!(off <= bound, "{label}: off by {off:e}, allowed {bound:e}");
+            eprintln!("{label}: off by {off:.2e} of {bound:.2e}");
         }
     }
 }

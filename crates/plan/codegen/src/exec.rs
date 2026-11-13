@@ -1,6 +1,7 @@
 //! Runs a body on the host, each group in lockstep.
 
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::numerics::Precision;
 use graph::DType;
 use std::collections::HashMap;
 
@@ -94,6 +95,7 @@ struct Arg {
 struct Group<'a, 'b> {
     threads: usize,
     lanes: usize,
+    precision: Precision,
     first: usize,
     /// Names in scope, innermost last, each a value per thread.
     vars: Vec<(String, Vec<Val>)>,
@@ -616,15 +618,23 @@ impl Group<'_, '_> {
                     let (sa, sb) = (&self.shared[a], &self.shared[b]);
                     let mut block =
                         std::mem::take(&mut self.tiles.get_mut(acc).expect("tile sums").2[s]);
+                    let p = self.precision;
                     for i in 0..rows {
                         for j in 0..cols {
-                            let mut sum = 0.0f32;
-                            for k in 0..*depth {
-                                sum = sa[a0 + i * ld + k]
-                                    .f()
-                                    .mul_add(sb[b0 + j * ld + k].f(), sum);
+                            let sum = &mut block[i * cols + j];
+                            // The unit sums `p.depth` products, then adds them in.
+                            for chunk in (0..*depth).step_by(p.depth.max(1)) {
+                                let mut part = 0.0f32;
+                                for k in chunk..(chunk + p.depth.max(1)).min(*depth) {
+                                    let (ah, al) = p.split(sa[a0 + i * ld + k].f());
+                                    let (bh, bl) = p.split(sb[b0 + j * ld + k].f());
+                                    // The split's products: hi·hi, hi·lo, lo·hi.
+                                    part = ah.mul_add(bh, part);
+                                    part = ah.mul_add(bl, part);
+                                    part = al.mul_add(bh, part);
+                                }
+                                *sum = p.accumulate(*sum, part);
                             }
-                            block[i * cols + j] += sum;
                         }
                     }
                     self.tiles.get_mut(acc).expect("tile sums").2[s] = block;
@@ -729,7 +739,14 @@ fn binary(op: BinOp, a: Val, b: Val) -> Val {
 }
 
 /// Runs `body` over `grid`. `args` follow the parameters.
-pub fn run(body: &Body, args: &[ArgVal], buffers: &mut [&mut [u8]], grid: Grid, lanes: usize) {
+pub fn run(
+    body: &Body,
+    args: &[ArgVal],
+    buffers: &mut [&mut [u8]],
+    grid: Grid,
+    lanes: usize,
+    precision: Precision,
+) {
     assert_eq!(args.len(), body.params.len(), "one argument per parameter");
     let mut named = HashMap::new();
     for (param, arg) in body.params.iter().zip(args) {
@@ -742,6 +759,7 @@ pub fn run(body: &Body, args: &[ArgVal], buffers: &mut [&mut [u8]], grid: Grid, 
         let mut group = Group {
             threads: grid.threads,
             lanes,
+            precision,
             first: g * grid.threads,
             vars: Vec::new(),
             arrays: HashMap::new(),

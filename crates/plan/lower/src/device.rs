@@ -1,7 +1,7 @@
 //! Replays a plan on CUDA or ROCm, from one body.
 
 macro_rules! device_runner {
-    ($bk:ident) => {
+    ($bk:ident, $variant:ident) => {
         pub mod $bk {
             use crate::Error;
             use crate::abi::{Arg, Launch, Shape, Source};
@@ -177,6 +177,10 @@ macro_rules! device_runner {
                     self.ctx.limits()
                 }
 
+                fn precision(&self) -> codegen::Precision {
+                    crate::run::precision(gpukit::backend::Backend::$variant)
+                }
+
                 /// Enqueues every launch, then waits once.
                 fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
                     for i in steps {
@@ -192,7 +196,7 @@ macro_rules! device_runner {
 }
 
 #[cfg(feature = "cuda")]
-device_runner!(cuda);
+device_runner!(cuda, Cuda);
 
 #[cfg(feature = "rocm")]
-device_runner!(rocm);
+device_runner!(rocm, Rocm);

@@ -1,8 +1,13 @@
 //! Shared graphs and inputs for the matmul tests.
 
+use codegen::ir::Param;
+use engine::settings;
+use gpukit::backend::Backend;
 use gpukit::testing::Noise;
 use graph::DimName::{Ffn, Hidden, Rows};
 use interp::Tensor;
+use lower::{Arg, Plan, Settings, Source, Terms};
+use std::collections::HashMap;
 use trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, Size, TensorType, Weights};
 
 #[derive(Weights)]
@@ -38,4 +43,46 @@ pub fn finished(k: u64, n: u64, finish: Finish) -> Graph {
 pub fn noise(shape: Vec<usize>, noise: &mut Noise) -> Tensor {
     let data = (0..shape.iter().product()).map(|_| noise.draw()).collect();
     Tensor::f32(shape, data)
+}
+
+/// A GPU run, or each emulation on the host.
+pub fn runs() -> Vec<Settings> {
+    let s = settings();
+    if s.gpu().is_some() {
+        return vec![s];
+    }
+    let emulations = [
+        None,
+        Some(Backend::Metal),
+        Some(Backend::Cuda),
+        Some(Backend::Rocm),
+    ];
+    emulations
+        .map(|emulate| Settings {
+            emulate,
+            ..s.clone()
+        })
+        .to_vec()
+}
+
+/// The sums one output of `plan`'s only step gathers.
+pub fn terms(plan: &Plan) -> Terms {
+    let step = &plan.steps[0];
+    let Source::Made(body) = step.kernel.source() else {
+        panic!("a generated kernel");
+    };
+    let launch = step.kernel.launches(step).remove(0);
+    let mut params = HashMap::new();
+    for (param, arg) in body.params.iter().zip(&launch.args) {
+        let Param::Scalar { name, .. } = param else {
+            continue;
+        };
+        let value = match arg {
+            Arg::U32(v) => *v as f64,
+            Arg::F32(v) => *v as f64,
+            other => panic!("{other:?} is not a scalar"),
+        };
+        params.insert(name.clone(), value);
+    }
+    lower::terms(&body, &params).expect("every loop bound is a parameter")
 }
