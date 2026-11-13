@@ -431,3 +431,32 @@ fn plans_are_cached() {
     let forward = cache.lower(&g, 0, &sizes, &device).unwrap();
     assert!(stepped != forward && cache.len() == 5);
 }
+
+#[test]
+fn trips_are_counted() {
+    let trip = |k: &dyn lower::Kernel| k.load(64).unwrap().trip;
+    // Walking a row opens a line every sixteen floats.
+    let norm = trip(&kernels::RmsNorm {
+        rows: 4,
+        width: 64,
+        eps: 1e-5,
+    });
+    assert_eq!((norm.loads, norm.stores), (3.0, 1.0));
+    assert!((norm.fresh - 1.0 / 16.0).abs() < 1e-9, "{norm:?}");
+    assert_eq!(norm.special, 0.0, "the root lies outside the loops");
+    // One thread per element reads a new line each time.
+    let map = trip(&Map(vec![MapStage::Add, MapStage::Act(Act::Silu)]));
+    assert_eq!(
+        (map.loads, map.stores, map.special, map.fresh),
+        (2.0, 1.0, 1.0, 1.0)
+    );
+    // Thin sums `m` rows a trip, each row apart.
+    let thin = trip(&Thin {
+        m: 3,
+        n: 8,
+        k: 64,
+        form: graph::DType::F32,
+    });
+    assert_eq!((thin.loads, thin.float), (4.0, 3.0));
+    assert!((thin.fresh - 1.0 / 16.0).abs() < 1e-9, "{thin:?}");
+}

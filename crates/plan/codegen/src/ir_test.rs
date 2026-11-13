@@ -46,7 +46,8 @@ fn trees_render() {
     }
     // One trip: two wide loads and four multiply-adds.
     let trip = body.trip();
-    assert_eq!((trip.loads, trip.float, trip.width), (2.0, 4.0, 16.0));
+    assert_eq!((trip.loads, trip.float, trip.width), (2.0, 4.0, 12.0));
+    assert_eq!(trip.fresh, 1.0, "each trip moves 128 elements");
     assert_eq!(trip.int, 2.0, "the loop's own index work");
     assert_eq!(trip.special, 0.0, "the root lies outside the loop");
 }

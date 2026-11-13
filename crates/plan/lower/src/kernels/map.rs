@@ -9,7 +9,7 @@ use codegen::hash;
 use codegen::ir::{BinOp, Expr, Intrinsic, Param, Stmt};
 use codegen::prelude::*;
 use graph::{Act, DType};
-use sim::{Load, Ops};
+use sim::Load;
 
 /// One thread per element. The stages follow, then the store.
 #[kernel]
@@ -105,23 +105,11 @@ impl Kernel for Map {
     /// One thread per element, each on its own lines.
     fn load(&self, len: usize) -> Option<Load> {
         let inputs = 1 + operands(&self.0);
-        let special = |s: &&MapStage| matches!(s, MapStage::Act(_));
-        let acts = self.0.iter().filter(special).count() as f64;
-        let trip = Ops {
-            float: self.0.len() as f64 - acts,
-            int: 1.0,
-            special: acts,
-            loads: inputs as f64,
-            stores: 1.0,
-            fresh: 1.0,
-            width: 0.0,
-            tile_flops: 0.0,
-        };
         Some(Load {
             threads: len,
             group: 256,
             trips: 1.0,
-            trip,
+            trip: self.tree().trip(),
             reads: vec![4.0 * len as f64; inputs],
             written: 4.0 * len as f64,
             flight: 4.0 * inputs as f64,
@@ -129,6 +117,29 @@ impl Kernel for Map {
     }
 
     fn source(&self) -> Source {
+        let mut text = self.tree().text();
+        text.entry = format!("map_{:x}", hash(&text.body));
+        Source::Made(text)
+    }
+
+    fn launches(&self, step: &Step) -> Vec<Launch> {
+        let len = step.write.len;
+        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+        args.extend([step.out(), Arg::count(len)]);
+        vec![Launch {
+            args,
+            shape: Shape::Line(len),
+        }]
+    }
+
+    fn work(&self, len: usize) -> f64 {
+        (len * (1 + self.0.len())) as f64
+    }
+}
+
+impl Map {
+    /// The skeleton with the stages and the store appended.
+    fn tree(&self) -> codegen::ir::Body {
         let mut body = map_ir();
         let operand = |k: usize| Param::Buffer {
             name: format!("a{k}"),
@@ -146,23 +157,7 @@ impl Kernel for Map {
             op: None,
             value: Expr::var("v"),
         });
-        let mut text = body.text();
-        text.entry = format!("map_{:x}", hash(&text.body));
-        Source::Made(text)
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let len = step.write.len;
-        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
-        args.extend([step.out(), Arg::count(len)]);
-        vec![Launch {
-            args,
-            shape: Shape::Line(len),
-        }]
-    }
-
-    fn work(&self, len: usize) -> f64 {
-        (len * (1 + self.0.len())) as f64
+        body
     }
 }
 
