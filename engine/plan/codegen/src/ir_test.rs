@@ -96,7 +96,7 @@ fn calls(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
 fn kernels_call() {
     let body = calls_ir();
     let text = body.text().render(Dialect::Cuda);
-    // Callee locals get the call's number; passed names stay.
+    // Callee locals get the call's number. Passed names stay.
     assert!(!text.contains("(u64)at;") && !text.contains("(u32)width;"));
     assert!(text.contains("for (u32 i_1 = 0; i_1 < width; i_1 += 1) {"));
     assert!(text.contains("sum_1 += (x[(at + (u64)i_1)] * x[(at + (u64)i_1)]);"));
@@ -187,7 +187,7 @@ fn group_sum(x: Buf<F32>, mut out: BufMut<F32>) {
 fn callers_lend_memory() {
     let body = group_sum_ir();
     let text = body.text().render(Dialect::Metal);
-    // The callee's loop is renamed; the caller's memory is not.
+    // The callee's loop is renamed. The caller's memory is not.
     assert!(text.contains("for (u32 level_1 = 0; level_1 < 3; level_1 += 1) {"));
     assert!(text.contains("u32 span_1 = (8 >> (level_1 + 1));"));
     assert!(text.contains("red[lid] += red[(lid + span_1)];"));
