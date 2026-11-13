@@ -17,6 +17,7 @@ pub fn m3_pro() -> Pool {
         read: 1.28e11,
         scan: 8.5e10,
         write: 1.15e11,
+        tile: 3.9e12,
     };
     fit.pool("metal Apple M3 Pro")
 }
@@ -36,6 +37,7 @@ pub fn strix_halo() -> Pool {
         read: 2.23e11,
         scan: 1.19e11,
         write: 2.04e11,
+        tile: 1.5e13,
     };
     fit.pool("rocm Radeon 8060S")
 }

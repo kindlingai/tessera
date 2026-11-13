@@ -87,11 +87,12 @@ impl Text {
             true => {
                 params.push("u32 gid [[thread_position_in_grid]]".into());
                 params.push("u32 lid [[thread_index_in_threadgroup]]".into());
-                (METAL, "kernel void", "")
+                (format!("{METAL}{}", crate::tile::METAL), "kernel void", "")
             }
             false => {
                 let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
-                (CUDA, "extern \"C\" __global__ void", index)
+                let head = format!("{CUDA}{}", crate::tile::cuda());
+                (head, "extern \"C\" __global__ void", index)
             }
         };
         let (entry, params, body) = (&self.entry, params.join(",\n    "), &self.body);

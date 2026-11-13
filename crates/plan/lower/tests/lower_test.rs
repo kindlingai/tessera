@@ -263,6 +263,7 @@ fn chip() -> Fit {
         read: 100e9,
         scan: 80e9,
         write: 90e9,
+        tile: 0.0,
     }
 }
 

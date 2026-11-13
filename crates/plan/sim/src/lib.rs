@@ -63,6 +63,8 @@ pub struct Ops {
     pub fresh: f64,
     /// Bytes one load brings. Zero means a float.
     pub width: f64,
+    /// Flops done on the matrix unit, with f32 operands.
+    pub tile_flops: f64,
 }
 
 impl Ops {

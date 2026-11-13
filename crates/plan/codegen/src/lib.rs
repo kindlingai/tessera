@@ -2,6 +2,7 @@
 
 mod builder;
 mod dialect;
+mod tile;
 
 pub use builder::{Gen, LANES};
 pub use dialect::{Dialect, Text, float, hash};
