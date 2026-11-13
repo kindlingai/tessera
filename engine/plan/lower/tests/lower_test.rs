@@ -6,9 +6,10 @@ use graph::{Act, Composite, Graph};
 use kernels::Thin;
 use linear::SCHEDULES;
 use lower::kernels::{Map, MapStage};
+use lower::sites;
 use lower::{
-    Arg, Buffer, DType, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Site,
-    Slot, Source, Step, T, Tree,
+    Arg, Buffer, DType, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Slot,
+    Source, Step, T, Tree,
 };
 use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
@@ -335,7 +336,7 @@ fn trees_cut_shared() {
     let chains = |want: &[MapStage]| -> Vec<(T, Vec<T>)> {
         let all = (0..tree.len() as u32).map(T);
         let chain = |t: T| match tree.site(t)? {
-            Site::Map { stages, reads, .. } if stages == want => Some((t, reads)),
+            sites::Chain { stages, reads, .. } if stages == want => Some((t, reads)),
             _ => None,
         };
         all.filter_map(chain).collect()

@@ -4,9 +4,8 @@ use codegen::ir::Body;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{
-    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, T, Tree,
-};
+use lower::sites;
+use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -597,21 +596,23 @@ impl Kernel for FlashRows {
 
 /// Scale the queries, then attend by tiles.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (scale, [q, k, v], sizes, rows) = tree.site(at)?.attention()?;
+    let site: sites::Attend = tree.site(at)?;
     // Tiles of sixteen along the head, within one group's memory.
-    if !sizes.width.is_multiple_of(16) || sizes.width > WIDEST {
+    if !site.sizes.width.is_multiple_of(16) || site.sizes.width > WIDEST {
         return None;
     }
-    let out = sizes.queries * sizes.heads * sizes.width;
-    if let Some(by) = rows {
-        return Some(Site::ragged_drafts(
-            scale,
-            [q, k, v],
-            by,
-            out,
-            FlashRows(sizes),
-        ));
+    if site.rows.is_some() {
+        return site.ragged(FlashRows(site.sizes));
     }
+    let sites::Attend {
+        scale,
+        q,
+        k,
+        v,
+        sizes,
+        ..
+    } = site;
+    let out = site.out();
     // Sequences would sit at moving offsets as the keys grow.
     if sizes.keys.runtime() && sizes.seqs > 1 {
         return None;

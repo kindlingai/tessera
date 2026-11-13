@@ -2,7 +2,8 @@
 
 use codegen::prelude::*;
 use graph::{Order, Stage};
-use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Site, Source, Step, T, Tree};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 
 /// Elements one wide load brings a lane.
 const WIDE: u32 = 4;
@@ -117,7 +118,7 @@ impl Kernel for LaneNorm {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Stage {
+    let sites::Stage {
         stage: Stage::RmsNorm { eps },
         x,
         operand: Some((w, _)),

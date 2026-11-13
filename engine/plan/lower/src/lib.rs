@@ -20,6 +20,7 @@ pub mod rule;
 mod run;
 mod schedule;
 mod select;
+pub mod sites;
 mod tree;
 
 pub use abi::{Arg, Launch, Shape, Source};
@@ -35,7 +36,7 @@ pub use kernel::{Kernel, KernelRef, Needs};
 pub use mem::{Buffer, DType, Tensor, View, ViewMut, round};
 pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use recipe::Recipe;
-pub use rule::{Attn, Draft, RULES, Read, Rule, Site, rules};
+pub use rule::{Attn, Draft, RULES, Read, Rule, rules};
 pub use run::{Held, Run, open, precision};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select, select_upto};

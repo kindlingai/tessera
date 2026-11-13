@@ -4,7 +4,8 @@ use crate::join::Join;
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::{Map, MapStage};
-use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Site, Source, Step, T, Tree};
+use lower::sites;
+use lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
 
 /// Threads in a group: one group per query and head.
 const THREADS: u32 = 256;
@@ -279,21 +280,23 @@ impl Kernel for Attend {
 
 /// Scale the queries, join keys with values, then attend.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (scale, [q, k, v], sizes, rows) = tree.site(at)?.attention()?;
-    if sizes.width > WIDEST as usize {
+    let site: sites::Attend = tree.site(at)?;
+    if site.sizes.width > WIDEST as usize {
         return None;
     }
-    let out = sizes.queries * sizes.heads * sizes.width;
     // Ragged rows read the kept keys and values in place.
-    if let Some(by) = rows {
-        return Some(Site::ragged_drafts(
-            scale,
-            [q, k, v],
-            by,
-            out,
-            AttendRows(sizes),
-        ));
+    if site.rows.is_some() {
+        return site.ragged(AttendRows(site.sizes));
     }
+    let sites::Attend {
+        scale,
+        q,
+        k,
+        v,
+        sizes,
+        ..
+    } = site;
+    let out = site.out();
     // Sequences would sit at moving offsets as the keys grow.
     if sizes.keys.runtime() && sizes.seqs > 1 {
         return None;

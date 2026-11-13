@@ -1,7 +1,8 @@
 //! Each row's largest entry, found in two launches.
 
 use codegen::prelude::*;
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Source, Step, T, Tree};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 256;
@@ -132,7 +133,7 @@ impl Kernel for Argmax {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Top {
+    let sites::Top {
         x,
         rows,
         width,

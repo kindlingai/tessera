@@ -3,10 +3,8 @@
 use crate::abi::Arg;
 use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
-use crate::kernels::{Map, MapStage};
 use crate::plan::Step;
 use crate::tree::{T, Tree};
-use graph::{DType, Stage};
 
 pub use scattered_collect::declarative::{gather, scatter};
 
@@ -70,62 +68,6 @@ impl Attn {
             Arg::count(self.kv_heads),
         ]
     }
-}
-
-/// An attention site's parts: scale, queries, keys, values, sizes, rows.
-pub type Attention = (f32, [T; 3], Attn, Option<[T; 2]>);
-
-/// A pattern at a tree node, for kernels to compute.
-#[derive(Clone, Debug)]
-pub enum Site {
-    /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
-    Matmul {
-        x: T,
-        w: T,
-        m: usize,
-        n: usize,
-        k: usize,
-        form: DType,
-    },
-    /// Elementwise stages over `reads[0]`; operands follow it.
-    Map {
-        stages: Vec<MapStage>,
-        reads: Vec<T>,
-        len: usize,
-    },
-    /// One row stage that is not elementwise.
-    Stage {
-        stage: Stage,
-        x: T,
-        /// The stage's argument, and how many elements it holds.
-        operand: Option<(T, usize)>,
-        len: usize,
-        width: usize,
-    },
-    /// Causal attention with `scale` on the scores.
-    Attend {
-        scale: f32,
-        q: T,
-        k: T,
-        v: T,
-        sizes: Attn,
-        /// Ragged rows: each query's slot and position.
-        rows: Option<[T; 2]>,
-    },
-    Gather {
-        table: T,
-        ids: T,
-        rows: usize,
-        width: usize,
-        form: DType,
-    },
-    /// Indices of each row's `k` largest entries.
-    Top {
-        x: T,
-        rows: usize,
-        width: usize,
-        k: usize,
-    },
 }
 
 /// A draft reads a tree node, or an earlier draft.
@@ -216,40 +158,4 @@ pub fn rules() -> Vec<&'static Rule> {
     let mut all: Vec<&'static Rule> = RULES.iter().collect();
     all.sort_by_key(|r| r.name);
     all
-}
-
-impl Site {
-    /// Scales `q`, then runs `kernel` over rows and kept keys.
-    pub fn ragged_drafts(
-        scale: f32,
-        [q, k, v]: [T; 3],
-        [slots, positions]: [T; 2],
-        out: usize,
-        kernel: impl Kernel + 'static,
-    ) -> Vec<Draft> {
-        let scaled = Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out);
-        let reads = [
-            Read::Draft(0),
-            Read::Node(k),
-            Read::Node(v),
-            slots.into(),
-            positions.into(),
-        ];
-        vec![scaled, Draft::new(kernel, reads, out)]
-    }
-
-    /// This site as an attention, if it is one.
-    pub fn attention(&self) -> Option<Attention> {
-        match self {
-            Site::Attend {
-                scale,
-                q,
-                k,
-                v,
-                sizes,
-                rows,
-            } => Some((*scale, [*q, *k, *v], *sizes, *rows)),
-            _ => None,
-        }
-    }
 }

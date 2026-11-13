@@ -2,7 +2,8 @@
 
 use codegen::prelude::*;
 use graph::{Pairs, Stage};
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Source, Step, T, Tree};
 
 /// One thread per position, head and pair, rotating in place.
 #[kernel]
@@ -114,7 +115,7 @@ impl Kernel for Rope {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Stage {
+    let sites::Stage {
         stage: Stage::Rope { theta, pairs },
         x,
         operand: Some((at, positions)),
