@@ -6,9 +6,8 @@ use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
 use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{operands, stage_stmts};
-use lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, Stored, T, Tree,
-};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, Stored, T, Tree};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -368,17 +367,14 @@ impl Kernel for Tiled {
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (product, after, others) = finishing(tree, at)?;
-    let Site::Matmul {
+    let sites::Matmul {
         x,
         w,
         m,
         n,
         k,
         form,
-    } = product
-    else {
-        return None;
-    };
+    } = product;
     // Each schedule is one way, so the cheapest wins.
     let draft = |(choice, schedule): (usize, &Schedule)| {
         let tiled = Tiled {

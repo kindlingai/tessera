@@ -3,7 +3,8 @@
 use codegen::ir::Body;
 use codegen::prelude::*;
 use graph::Order;
-use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
+use lower::sites;
+use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Source, Step, Stored, T, Tree};
 use sim::Load;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -125,17 +126,14 @@ impl Kernel for Thin {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Matmul {
+    let sites::Matmul {
         x,
         w,
         m,
         n,
         k,
         form,
-    } = tree.site(at)?
-    else {
-        return None;
-    };
+    } = tree.site(at)?;
     let thin = Thin { m, n, k, form };
     (m <= THIN_ROWS).then(|| vec![Draft::new(thin, [x, w], m * n)])
 }

@@ -2,6 +2,7 @@
 
 use codegen::prelude::*;
 use graph::Order;
+use lower::sites;
 use lower::{Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
 
 /// Rows are queries. The last query sees every key.
@@ -199,10 +200,19 @@ impl Kernel for Causal {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let (scale, [q, k, v], sizes, rows) = tree.site(at)?.attention()?;
-    if rows.is_some() {
+    let site: sites::Attend = tree.site(at)?;
+    // Whole sequences only: the scores take a rectangular launch.
+    let sites::Attend {
+        scale,
+        q,
+        k,
+        v,
+        sizes,
+        rows: None,
+    } = site
+    else {
         return None;
-    }
+    };
     // The keys shape the scores, so they must be known.
     if sizes.keys.runtime() {
         return None;

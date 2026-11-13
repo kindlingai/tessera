@@ -3,7 +3,8 @@
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::kernel::Kernel;
 use crate::plan::Step;
-use crate::rule::{Draft, Site};
+use crate::rule::Draft;
+use crate::sites;
 use crate::tree::{T, Tree};
 use codegen::hash;
 use codegen::ir::{BinOp, Expr, Intrinsic, Param, Stmt};
@@ -162,9 +163,7 @@ impl Map {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Map { stages, reads, len } = tree.site(at)? else {
-        return None;
-    };
+    let sites::Chain { stages, reads, len } = tree.site(at)?;
     Some(vec![Draft::new(Map(stages), reads, len)])
 }
 

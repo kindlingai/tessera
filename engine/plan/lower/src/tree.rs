@@ -4,9 +4,9 @@ use crate::Error;
 use crate::extent::Extent;
 use crate::form::Pins;
 use crate::kernels::MapStage;
-use crate::rule::{Attn, Site};
 use crate::select::Home;
-use graph::{Attend, DType, DimName, Graph, Mask, NodeId, Op, Select, Shape, Stage, View};
+use crate::sites::Pattern;
+use graph::{Attend, DType, DimName, Graph, NodeId, Op, Select, Shape, Stage, View};
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,8 +47,6 @@ pub struct Node {
 pub struct Tree<'a> {
     pub g: &'a Graph,
     nodes: Vec<Node>,
-    /// Per node: the pattern rules see there, found once.
-    sites: Vec<Option<Site>>,
     /// Per node: how many arguments and outputs name it.
     readers: Vec<u32>,
     /// The entry's outputs, with each one's graph shape.
@@ -56,7 +54,7 @@ pub struct Tree<'a> {
     /// Elements and type of each input port, used or not.
     pub ports: Vec<(usize, DType)>,
     /// The sizes this tree was viewed at.
-    sizes: Vec<(DimName, u64)>,
+    pub(crate) sizes: Vec<(DimName, u64)>,
 }
 
 pub(crate) fn unsupported<T>(what: impl std::fmt::Debug) -> Result<T, Error> {
@@ -161,7 +159,6 @@ impl<'a> Tree<'a> {
         let mut tree = Tree {
             g,
             nodes: Vec::new(),
-            sites: Vec::new(),
             readers: Vec::new(),
             outputs: Vec::new(),
             ports: Vec::new(),
@@ -237,10 +234,6 @@ impl<'a> Tree<'a> {
             tree.outputs
                 .push((t, shape.iter().map(Extent::most).collect()));
         }
-        // Every rule asks everywhere, so sites are found once.
-        tree.sites = (0..tree.nodes.len() as u32)
-            .map(|t| tree.find_site(T(t)))
-            .collect();
         Ok(tree)
     }
 
@@ -278,168 +271,15 @@ impl<'a> Tree<'a> {
         kept || self.readers[t.0 as usize] != 1 || self.output(t)
     }
 
-    /// The pattern at `t`, as rules know it, if any.
-    pub fn site(&self, t: T) -> Option<Site> {
-        self.sites[t.0 as usize].clone()
-    }
-
-    fn find_site(&self, t: T) -> Option<Site> {
-        let n = self.node(t);
-        let wide = |a: T| &self.node(a).shape;
-        match &n.term {
-            Term::Leaf(_) | Term::View | Term::Append(_) => None,
-            Term::Matmul => {
-                let (x, w) = (n.args[0], n.args[1]);
-                let [n, k] = wide(w)[..] else {
-                    return None;
-                };
-                let (m, form) = (self.elements(x) / k, self.node(w).form);
-                Some(Site::Matmul {
-                    x,
-                    w,
-                    m,
-                    n,
-                    k,
-                    form,
-                })
-            }
-            Term::Stage(stage) if map_stage(stage).is_some() => self.chain(t),
-            Term::Stage(stage) => {
-                let x = n.args[0];
-                let operand = n.args.get(1).map(|o| (*o, self.elements(*o)));
-                let (len, width) = (self.elements(x), *wide(x).last()?);
-                Some(Site::Stage {
-                    stage: stage.clone(),
-                    x,
-                    operand,
-                    len,
-                    width,
-                })
-            }
-            Term::Attend(a) if a.ragged => {
-                let (q, k, v) = (n.args[0], n.args[1], n.args[2]);
-                let (&[queries, heads, width], &[seqs, _, kv_heads, _]) =
-                    (&wide(q)[..], &wide(k)[..])
-                else {
-                    return None;
-                };
-                // The kept rows keep their axis's bound per slot.
-                let Term::Append(index) = self.node(k).term else {
-                    return None;
-                };
-                let graph::DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
-                    return None;
-                };
-                let stride = self.g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
-                // Slots the rows span, if the launch says. Else any.
-                let segments = self.sizes.iter().find(|(n, _)| *n == DimName::Segments);
-                let segments = segments.map_or(queries, |(_, n)| *n as usize).min(queries);
-                let sizes = Attn {
-                    seqs,
-                    queries,
-                    keys: self.node(k).extents[1],
-                    heads,
-                    kv_heads,
-                    width,
-                    stride,
-                    segments,
-                };
-                Some(Site::Attend {
-                    scale: a.scale,
-                    q,
-                    k,
-                    v,
-                    sizes,
-                    rows: Some([n.args[3], n.args[4]]),
-                })
-            }
-            Term::Attend(a) => {
-                if a.picked || a.mask != Mask::Causal {
-                    return None;
-                }
-                let (q, k, v) = (n.args[0], n.args[1], n.args[2]);
-                let (&[seqs, queries, heads, width], &[_, _, kv_heads, _]) =
-                    (&wide(q)[..], &wide(k)[..])
-                else {
-                    return None;
-                };
-                let keys = self.node(k).extents[1];
-                let sizes = Attn {
-                    seqs,
-                    queries,
-                    keys,
-                    heads,
-                    kv_heads,
-                    width,
-                    stride: keys.most(),
-                    segments: 1,
-                };
-                let scale = a.scale;
-                Some(Site::Attend {
-                    scale,
-                    q,
-                    k,
-                    v,
-                    sizes,
-                    rows: None,
-                })
-            }
-            Term::Gather => {
-                let (table, ids) = (n.args[0], n.args[1]);
-                let (rows, width) = (
-                    self.elements(ids),
-                    self.elements(table) / wide(table).first()?,
-                );
-                let form = self.node(table).form;
-                Some(Site::Gather {
-                    table,
-                    ids,
-                    rows,
-                    width,
-                    form,
-                })
-            }
-            Term::Top => {
-                let x = n.args[0];
-                let width = *wide(x).last()?;
-                let (rows, k) = (
-                    self.elements(x) / width,
-                    self.elements(t) * width / self.elements(x),
-                );
-                Some(Site::Top { x, rows, width, k })
-            }
-        }
+    /// The pattern `P` at `t`, if the node shows it.
+    pub fn site<P: Pattern>(&self, t: T) -> Option<P> {
+        P::find(self, t)
     }
 
     /// Whether `t` is an elementwise stage only its reader needs.
-    fn joins(&self, t: T) -> bool {
+    pub(crate) fn joins(&self, t: T) -> bool {
         let map = matches!(&self.node(t).term, Term::Stage(s) if map_stage(s).is_some());
         map && !self.root(t)
-    }
-
-    /// The elementwise stages ending at `t`, back through first arguments.
-    fn chain(&self, t: T) -> Option<Site> {
-        let mut nodes = vec![t];
-        while let Some(first) = self.node(nodes[nodes.len() - 1]).args.first() {
-            if !self.joins(*first) {
-                break;
-            }
-            nodes.push(*first);
-        }
-        nodes.reverse();
-        let source = self.node(nodes[0]).args[0];
-        let len = self.elements(source);
-        let (mut stages, mut reads) = (Vec::new(), vec![source]);
-        for n in nodes.iter().map(|n| self.node(*n)) {
-            let Term::Stage(stage) = &n.term else {
-                return None;
-            };
-            stages.push(map_stage(stage)?);
-            reads.extend(&n.args[1..]);
-        }
-        // An operand of another size would need broadcasting.
-        let fits = reads.iter().all(|r| self.elements(*r) == len);
-        fits.then_some(Site::Map { stages, reads, len })
     }
 
     /// Tree nodes a cover at `t` computes, given its reads.

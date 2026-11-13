@@ -3,7 +3,8 @@
 use crate::per_row;
 use codegen::prelude::*;
 use graph::Stage;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Site, Source, Step, T, Tree};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
 use sim::Load;
 
 /// One thread per row: peak, sum, then the probabilities.
@@ -64,7 +65,7 @@ impl Kernel for Softmax {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Stage {
+    let sites::Stage {
         stage: Stage::Softmax,
         x,
         len,

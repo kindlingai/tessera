@@ -5,9 +5,8 @@ use codegen::ir::{BinOp, Body, Expr, Param, Stmt, Ty};
 use codegen::prelude::*;
 use graph::{DType, Order};
 use lower::kernels::{MapStage, operands, stage_stmts};
-use lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Site, Source, Step, Stored, T, Tree,
-};
+use lower::sites;
+use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, Stored, T, Tree};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -212,36 +211,28 @@ impl Kernel for Lanes {
 }
 
 /// The matmul at `at`, or the one its stages finish.
-pub(crate) fn finishing(tree: &Tree, at: T) -> Option<(Site, After, Vec<Read>)> {
-    match tree.site(at)? {
-        product @ Site::Matmul { .. } => Some((product, After::default(), Vec::new())),
-        Site::Map { stages, reads, .. } => {
-            let lone = |r: &T| match tree.site(*r) {
-                Some(product @ Site::Matmul { .. }) if !tree.root(*r) => Some(product),
-                _ => None,
-            };
-            let sum = reads.iter().position(|r| lone(r).is_some())?;
-            let others = reads.iter().filter(|r| **r != reads[sum]);
-            let others = others.map(|r| Read::Node(*r)).collect();
-            Some((lone(&reads[sum])?, After { stages, sum }, others))
-        }
-        _ => None,
+pub(crate) fn finishing(tree: &Tree, at: T) -> Option<(sites::Matmul, After, Vec<Read>)> {
+    if let Some(product) = tree.site::<sites::Matmul>(at) {
+        return Some((product, After::default(), Vec::new()));
     }
+    let sites::Chain { stages, reads, .. } = tree.site(at)?;
+    let lone = |r: &T| tree.site::<sites::Matmul>(*r).filter(|_| !tree.root(*r));
+    let sum = reads.iter().position(|r| lone(r).is_some())?;
+    let others = reads.iter().filter(|r| **r != reads[sum]);
+    let others = others.map(|r| Read::Node(*r)).collect();
+    Some((lone(&reads[sum])?, After { stages, sum }, others))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let (product, after, others) = finishing(tree, at)?;
-    let Site::Matmul {
+    let sites::Matmul {
         x,
         w,
         m,
         n,
         k,
         form,
-    } = product
-    else {
-        return None;
-    };
+    } = product;
     // Wide loads need whole groups of four along `k`.
     if m > ROWS || !k.is_multiple_of(WIDE as usize) {
         return None;

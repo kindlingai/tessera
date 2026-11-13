@@ -7,8 +7,9 @@ use linear as _;
 use gpukit::testing::scratch;
 use graph::DimName::{Context, Rows, Seqs};
 use lower::kernels::Map;
+use lower::sites;
 use lower::{
-    Cluster, Device, Draft, Error, Kernel, Launch, Link, Plan, Site, Source, Step, T, Tree, Zone,
+    Cluster, Device, Draft, Error, Kernel, Launch, Link, Plan, Source, Step, T, Tree, Zone,
     ZoneKind, lower, open,
 };
 use models::qwen3::{Config, stepper};
@@ -48,7 +49,7 @@ impl Kernel for HostTop {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Top { x, rows, k: 1, .. } = tree.site(at)? else {
+    let sites::Top { x, rows, k: 1, .. } = tree.site(at)? else {
         return None;
     };
     Some(vec![Draft::new(HostTop { rows }, [x], rows)])

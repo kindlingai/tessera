@@ -1,7 +1,8 @@
 //! Rows of a table at given indices.
 
 use codegen::prelude::*;
-use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
+use lower::sites;
+use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Source, Step, Stored, T, Tree};
 
 /// One thread per output element, widened from the table.
 #[kernel]
@@ -64,16 +65,13 @@ impl Kernel for Gather {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let Site::Gather {
+    let sites::Gather {
         table,
         ids,
         rows,
         width,
         form,
-    } = tree.site(at)?
-    else {
-        return None;
-    };
+    } = tree.site(at)?;
     let gather = Gather { rows, width, form };
     Some(vec![Draft::new(gather, [table, ids], rows * width)])
 }
