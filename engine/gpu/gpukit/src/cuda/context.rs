@@ -6,13 +6,16 @@ use std::thread::LocalKey;
 
 use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
+    CU_DEVICE_ATTRIBUTE_INTEGRATED, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
+    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
     CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, CU_STREAM_CAPTURE_MODE_RELAXED,
     CU_STREAM_NON_BLOCKING, CUcontext, CUdevice, Driver, LaunchAttribute, LaunchConfig,
 };
 use crate::api::{self, Api, Call, Handle, Kind};
 use crate::device::Caches;
+use crate::platform::{self, Asked, Platform};
 use crate::{Error, Limits};
 
 pub use crate::api::ContextConfig;
@@ -28,6 +31,17 @@ pub struct Own {
     raw: CUcontext,
     compute_capability: (i32, i32),
     limits: Limits,
+    platform: Platform,
+}
+
+/// The driver's version, `13.0` for 13000.
+fn driver_version(driver: &Driver) -> Result<String, Error> {
+    let mut v: c_int = 0;
+    driver.check(
+        unsafe { (driver.cu_driver_get_version)(&mut v) },
+        "cuDriverGetVersion",
+    )?;
+    Ok(format!("{}.{}", v / 1000, (v % 1000) / 10))
 }
 
 fn device_attr(driver: &Driver, device: CUdevice, attr: c_int) -> Result<i32, Error> {
@@ -90,13 +104,28 @@ impl Context {
             group_threads: device_attr(driver, device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?
                 as usize,
             compiler: true,
-            // Hopper on: griddepcontrol and the launch attribute.
-            pdl: major >= 9,
+            pdl: false,
         };
+        let attr = |a| device_attr(driver, device, a);
+        let platform = Platform::new(Asked {
+            backend: "cuda",
+            arch: format!("sm_{major}{minor}"),
+            name: name.clone(),
+            driver: driver_version(driver)?,
+            limits,
+            units: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
+            bandwidth: platform::bandwidth(
+                attr(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?,
+                attr(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?,
+            ),
+            integrated: attr(CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
+        });
         let own = Own {
             raw,
             compute_capability: (major, minor),
-            limits,
+            // The table says whether launches may overlap.
+            limits: platform.limits,
+            platform,
         };
         Ok(Self::made(driver, own, device, name))
     }
@@ -104,6 +133,11 @@ impl Context {
     /// Lanes, group memory and group size, from the device.
     pub fn limits(&self) -> Limits {
         self.own().limits
+    }
+
+    /// The device as asked, with its table row.
+    pub fn platform(&self) -> Platform {
+        self.own().platform.clone()
     }
 
     /// (major, minor), e.g. (12, 1) for sm_121.

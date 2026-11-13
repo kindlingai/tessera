@@ -202,8 +202,8 @@ macro_rules! device_runner {
                     format!("{} {}", stringify!($bk), self.ctx.name())
                 }
 
-                fn limits(&self) -> gpukit::Limits {
-                    self.ctx.limits()
+                fn platform(&self) -> gpukit::Platform {
+                    self.ctx.platform()
                 }
 
                 fn precision(&self) -> codegen::Precision {

@@ -461,6 +461,7 @@ dependencies = [
  "objc2-metal",
  "scattered-collect",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

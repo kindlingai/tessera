@@ -17,11 +17,20 @@ pub type HipGraphNode = *mut c_void;
 pub const HIP_SUCCESS: HipError = 0;
 pub const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const MEMCPY_DEVICE_TO_HOST: c_int = 2;
+/// `hipDeviceAttribute_t`, as HIP 6 and 7 number it.
+pub const ATTR_INTEGRATED: c_int = 16;
+pub const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 23;
+pub const ATTR_MEMORY_BUS_WIDTH: c_int = 59;
+pub const ATTR_MEMORY_CLOCK_RATE: c_int = 60;
+pub const ATTR_COMPUTE_CAPABILITY_MINOR: c_int = 61;
+pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 63;
 pub const HIP_STREAM_NON_BLOCKING: u32 = 1;
 /// Other threads may still synchronize while a capture is open.
 pub const HIP_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
 type HipInit = unsafe extern "C" fn(u32) -> HipError;
+type HipRuntimeGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
+type HipDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> HipError;
 type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
 type HipDeviceGetName = unsafe extern "C" fn(*mut c_char, c_int, c_int) -> HipError;
@@ -68,6 +77,8 @@ type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
 /// Resolved runtime entry points. The dlopen handle stays open.
 pub struct Runtime {
     pub hip_init: HipInit,
+    pub hip_runtime_get_version: HipRuntimeGetVersion,
+    pub hip_device_get_attribute: HipDeviceGetAttribute,
     pub hip_get_device_count: HipGetDeviceCount,
     pub hip_set_device: HipSetDevice,
     pub hip_device_get_name: HipDeviceGetName,
@@ -120,6 +131,8 @@ impl Runtime {
         let lib = Library::open_first(&names)?;
         Ok(Runtime {
             hip_init: sym!(lib, "hipInit", HipInit),
+            hip_runtime_get_version: sym!(lib, "hipRuntimeGetVersion", HipRuntimeGetVersion),
+            hip_device_get_attribute: sym!(lib, "hipDeviceGetAttribute", HipDeviceGetAttribute),
             hip_get_device_count: sym!(lib, "hipGetDeviceCount", HipGetDeviceCount),
             hip_set_device: sym!(lib, "hipSetDevice", HipSetDevice),
             hip_device_get_name: sym!(lib, "hipDeviceGetName", HipDeviceGetName),

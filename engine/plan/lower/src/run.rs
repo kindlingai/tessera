@@ -5,7 +5,7 @@ use crate::plan::{Plan, Slot};
 use crate::recipe::Launching;
 use codegen::Precision;
 use gpukit::backend::Backend;
-use gpukit::{Limits, Settings};
+use gpukit::{Limits, Platform, Settings};
 use graph::DimName;
 use mem::{Buffer, Tensor, View, ViewMut, copy};
 use std::collections::HashMap;
@@ -131,7 +131,11 @@ pub trait Run {
     /// The backend and the hardware it drives.
     fn device(&self) -> String;
     /// What the hardware gives one group of threads.
-    fn limits(&self) -> Limits;
+    fn limits(&self) -> Limits {
+        self.platform().limits
+    }
+    /// The hardware as asked, with its table row.
+    fn platform(&self) -> Platform;
     /// How the hardware's tiles round.
     fn precision(&self) -> Precision;
 

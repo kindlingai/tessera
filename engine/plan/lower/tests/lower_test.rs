@@ -5,6 +5,7 @@ use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
 use kernels::Thin;
 use linear::SCHEDULES;
+use lower::Platform;
 use lower::form::{BF16_FORM, F32_FORM};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
@@ -498,7 +499,7 @@ fn limits_bar_kernels() {
         lanes: 64,
         ..lower::Limits::assumed()
     };
-    let (_, plan) = toy(&Device::guess(&settings()).within(wide));
+    let (_, plan) = toy(&Device::guess(&settings()).on(Platform::assumed(wide)));
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     let lanes = |n: &&str| n.starts_with("lanes") || n.starts_with("tiled") || *n == "lane_norm";
     assert!(!names.iter().any(lanes), "{names:?}");
@@ -512,7 +513,8 @@ fn limits_bar_kernels() {
         ..lower::Limits::assumed()
     };
     let (g, _) = toy(&Device::guess(&settings()));
-    let device = Device::guess(&settings()).within(small).favoring("tiled");
+    let on = Device::guess(&settings()).on(Platform::assumed(small));
+    let device = on.favoring("tiled");
     let plan = lower(&g, 0, &SIZES, &device).unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert!(names.contains(&"tiled_32x32_w16"), "{names:?}");
