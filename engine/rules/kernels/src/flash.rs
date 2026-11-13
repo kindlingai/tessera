@@ -29,6 +29,149 @@ thread_local! {
     static TREES: RefCell<HashMap<(u32, bool), Body>> = RefCell::new(HashMap::new());
 }
 
+/// Stages the group's query rows, zero past `queries`.
+#[kernel]
+fn stage_q(
+    q_s: &mut Shared<f32>,
+    q: Buf<F32>,
+    q0: u32,
+    queries: u32,
+    heads: u32,
+    h: u32,
+    #[build] w: u32,
+) {
+    for i in (lid()..BQ * w).by(THREADS) {
+        let r = i / w;
+        let d = i % w;
+        q_s[r * (w + PAD) + d] = if q0 + r < queries {
+            q[((q0 + r) * heads + h) as u64 * w as u64 + d as u64]
+        } else {
+            0.0
+        };
+    }
+}
+
+/// Stages a block of rows from `at`, zero past `count`.
+#[kernel]
+fn stage_kv<const TRANSPOSED: bool>(
+    kv_s: &mut Shared<f32>,
+    src: Buf<F32>,
+    at: u32,
+    k0: u32,
+    count: u32,
+    kv_heads: u32,
+    kvh: u32,
+    #[build] w: u32,
+) {
+    for i in (lid()..BK * w).by(THREADS) {
+        let t = i / w;
+        let d = i % w;
+        let v = if k0 + t < count {
+            src[((at + t) * kv_heads + kvh) as u64 * w as u64 + d as u64]
+        } else {
+            0.0
+        };
+        if TRANSPOSED {
+            kv_s[d * (BK + PAD) + t] = v;
+        } else {
+            kv_s[t * (w + PAD) + d] = v;
+        }
+    }
+}
+
+/// Scores by tiles, masked past what each row has seen.
+#[kernel]
+fn scores(
+    s_t: &mut Tiles,
+    q_s: &Shared<f32>,
+    kv_s: &Shared<f32>,
+    p_s: &mut Shared<f32>,
+    seen_s: &Shared<u32>,
+    simd: u32,
+    k0: u32,
+    #[build] w: u32,
+) {
+    if simd < 2 {
+        s_t.zero();
+        s_t.block(q_s, simd * 16 * (w + PAD), kv_s, 0, w + PAD, w);
+        s_t.each(|r, c, v| {
+            let t = k0 + c;
+            let seen = t < seen_s[simd * 16 + r];
+            p_s[(simd * 16 + r) * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
+        });
+    }
+}
+
+/// A row's softmax step. `state` holds its peak and sum.
+#[kernel]
+fn soften(p_s: &mut Shared<f32>, alpha_s: &mut Shared<f32>, state: &mut [f32; 2], row: u32) {
+    if lid() < BQ {
+        let mut top = f32::NEG_INFINITY;
+        for c in 0..BK {
+            top = max(top, p_s[row * (BK + PAD) + c]);
+        }
+        let m_new = max(state[0], top);
+        // A row that has seen nothing keeps zero sums.
+        let safe = if m_new == f32::NEG_INFINITY {
+            0.0
+        } else {
+            m_new
+        };
+        let alpha = exp(state[0] - safe);
+        let mut sum = 0.0f32;
+        for c in 0..BK {
+            let p = exp(p_s[row * (BK + PAD) + c] - safe);
+            p_s[row * (BK + PAD) + c] = p;
+            sum += p;
+        }
+        state[1] = state[1] * alpha + sum;
+        state[0] = m_new;
+        alpha_s[row] = alpha;
+    }
+}
+
+/// Scales two tile sums by `alpha_s`, then adds column `col`.
+#[kernel]
+fn fold_pair(
+    top: &mut Tiles,
+    bottom: &mut Tiles,
+    p_s: &Shared<f32>,
+    kv_s: &Shared<f32>,
+    alpha_s: &Shared<f32>,
+    col: u32,
+) {
+    top.scale(|r| alpha_s[r]);
+    bottom.scale(|r| alpha_s[16 + r]);
+    top.block(p_s, 0, kv_s, col, BK + PAD, BK);
+    bottom.block(p_s, 16 * (BK + PAD), kv_s, col, BK + PAD, BK);
+}
+
+/// Writes two tile sums over `l_s`, rows that saw keys.
+#[kernel]
+fn write_pair(
+    top: &Tiles,
+    bottom: &Tiles,
+    mut out: BufMut<F32>,
+    l_s: &Shared<f32>,
+    seen_s: &Shared<u32>,
+    q0: u32,
+    heads: u32,
+    h: u32,
+    col: u32,
+    #[build] w: u32,
+) {
+    top.each(|r, c, v| {
+        if seen_s[r] > 0 {
+            out[((q0 + r) * heads + h) as u64 * w as u64 + (col + c) as u64] = v / l_s[r];
+        }
+    });
+    bottom.each(|r, c, v| {
+        if seen_s[16 + r] > 0 {
+            out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + (col + c) as u64] = v / l_s[16 + r];
+        }
+    });
+}
+
 /// Lanes keep their output shares across the key stream.
 #[kernel]
 fn flash(
@@ -55,13 +198,16 @@ fn flash(
     let mut p_s = shared::<f32>(BQ * (BK + PAD));
     let mut alpha_s = shared::<f32>(BQ);
     let mut l_s = shared::<f32>(BQ);
-    for i in (lid()..BQ * w).by(THREADS) {
-        let r = i / w;
-        let d = i % w;
-        q_s[r * (w + PAD) + d] = if q0 + r < queries {
-            q[((q0 + r) * heads + h) as u64 * w as u64 + d as u64]
+    // Keys each row sees: through its own position. Else zero.
+    let mut seen_s = shared::<u32>(BQ);
+    stage_q(&mut q_s, q, q0, queries, heads, h, w);
+    if lid() < BQ {
+        let r = q0 + row;
+        let through = past + r + 1;
+        seen_s[row] = if r >= queries {
+            0
         } else {
-            0.0
+            if through < keys { through } else { keys }
         };
     }
     let mut s_t = tiles(16, 16);
@@ -69,125 +215,63 @@ fn flash(
     let mut o01 = tiles(16, 16);
     let mut o10 = tiles(16, 16);
     let mut o11 = tiles(16, 16);
-    let mut m = f32::NEG_INFINITY;
-    let mut l = 0.0f32;
+    let mut state = [0.0f32; 2];
+    state[0] = f32::NEG_INFINITY;
     // Each SIMD group owns up to two column pieces.
     let first = simd * 16 < w;
     let second = (simd + 4) * 16 < w;
     for b in 0..(keys + BK - 1) / BK {
         let k0 = b * BK;
-        for i in (lid()..BK * w).by(THREADS) {
-            let t = i / w;
-            let d = i % w;
-            kv_s[t * (w + PAD) + d] = if k0 + t < keys {
-                k[((k0 + t) * kv_heads + kvh) as u64 * w as u64 + d as u64]
-            } else {
-                0.0
-            };
-        }
+        stage_kv::<false>(&mut kv_s, k, k0, k0, keys, kv_heads, kvh, w);
         barrier();
-        if simd < 2 {
-            s_t.zero();
-            s_t.block(&q_s, simd * 16 * (w + PAD), &kv_s, 0, w + PAD, w);
-            s_t.each(|r, c, v| {
-                let t = k0 + c;
-                let seen = t < keys && t <= past + q0 + simd * 16 + r;
-                p_s[(simd * 16 + r) * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
-            });
-        }
+        scores(&mut s_t, &q_s, &kv_s, &mut p_s, &seen_s, simd, k0, w);
         barrier();
-        if lid() < BQ {
-            let mut top = f32::NEG_INFINITY;
-            for c in 0..BK {
-                top = max(top, p_s[row * (BK + PAD) + c]);
-            }
-            let m_new = max(m, top);
-            // A row that has seen nothing keeps zero sums.
-            let safe = if m_new == f32::NEG_INFINITY {
-                0.0
-            } else {
-                m_new
-            };
-            let alpha = exp(m - safe);
-            let mut sum = 0.0f32;
-            for c in 0..BK {
-                let p = exp(p_s[row * (BK + PAD) + c] - safe);
-                p_s[row * (BK + PAD) + c] = p;
-                sum += p;
-            }
-            l = l * alpha + sum;
-            m = m_new;
-            alpha_s[row] = alpha;
-        }
+        soften(&mut p_s, &mut alpha_s, &mut state, row);
         barrier();
-        for i in (lid()..BK * w).by(THREADS) {
-            let t = i / w;
-            let d = i % w;
-            kv_s[d * (BK + PAD) + t] = if k0 + t < keys {
-                values[((k0 + t) * kv_heads + kvh) as u64 * w as u64 + d as u64]
-            } else {
-                0.0
-            };
-        }
+        stage_kv::<true>(&mut kv_s, values, k0, k0, keys, kv_heads, kvh, w);
         barrier();
         if first {
-            o00.scale(|r| alpha_s[r]);
-            o01.scale(|r| alpha_s[16 + r]);
-            o00.block(&p_s, 0, &kv_s, simd * 16 * (BK + PAD), BK + PAD, BK);
-            o01.block(
+            fold_pair(
+                &mut o00,
+                &mut o01,
                 &p_s,
-                16 * (BK + PAD),
                 &kv_s,
+                &alpha_s,
                 simd * 16 * (BK + PAD),
-                BK + PAD,
-                BK,
             );
         }
         if second {
-            o10.scale(|r| alpha_s[r]);
-            o11.scale(|r| alpha_s[16 + r]);
-            o10.block(&p_s, 0, &kv_s, (simd + 4) * 16 * (BK + PAD), BK + PAD, BK);
-            o11.block(
+            fold_pair(
+                &mut o10,
+                &mut o11,
                 &p_s,
-                16 * (BK + PAD),
                 &kv_s,
+                &alpha_s,
                 (simd + 4) * 16 * (BK + PAD),
-                BK + PAD,
-                BK,
             );
         }
         barrier();
     }
     if lid() < BQ {
-        l_s[row] = l;
+        l_s[row] = state[1];
     }
     barrier();
     if first {
-        o00.each(|r, c, v| {
-            if q0 + r < queries {
-                out[((q0 + r) * heads + h) as u64 * w as u64 + (simd * 16 + c) as u64] = v / l_s[r];
-            }
-        });
-        o01.each(|r, c, v| {
-            if q0 + 16 + r < queries {
-                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + (simd * 16 + c) as u64] =
-                    v / l_s[16 + r];
-            }
-        });
+        write_pair(&o00, &o01, out, &l_s, &seen_s, q0, heads, h, simd * 16, w);
     }
     if second {
-        o10.each(|r, c, v| {
-            if q0 + r < queries {
-                out[((q0 + r) * heads + h) as u64 * w as u64 + ((simd + 4) * 16 + c) as u64] =
-                    v / l_s[r];
-            }
-        });
-        o11.each(|r, c, v| {
-            if q0 + 16 + r < queries {
-                out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + ((simd + 4) * 16 + c) as u64] =
-                    v / l_s[16 + r];
-            }
-        });
+        write_pair(
+            &o10,
+            &o11,
+            out,
+            &l_s,
+            &seen_s,
+            q0,
+            heads,
+            h,
+            (simd + 4) * 16,
+            w,
+        );
     }
 }
 
@@ -221,20 +305,13 @@ fn flash_rows(
     let mut l_s = shared::<f32>(BQ);
     // Rows the pass serves: one past the position. Else zero.
     let mut seen_s = shared::<u32>(BQ);
-    for i in (lid()..BQ * w).by(THREADS) {
-        let r = i / w;
-        let d = i % w;
-        q_s[r * (w + PAD) + d] = if q0 + r < queries {
-            q[((q0 + r) * heads + h) as u64 * w as u64 + d as u64]
-        } else {
-            0.0
-        };
-    }
+    stage_q(&mut q_s, q, q0, queries, heads, h, w);
     let mut s_t = tiles(16, 16);
     let mut o00 = tiles(16, 16);
     let mut o01 = tiles(16, 16);
     let mut o10 = tiles(16, 16);
     let mut o11 = tiles(16, 16);
+    let mut state = [0.0f32; 2];
     // Each SIMD group owns up to two column pieces.
     let first = simd * 16 < w;
     let second = (simd + 4) * 16 < w;
@@ -270,129 +347,49 @@ fn flash_rows(
             if last > keys {
                 last = keys;
             }
-            let mut m = f32::NEG_INFINITY;
-            let mut l = 0.0f32;
+            state[0] = f32::NEG_INFINITY;
+            state[1] = 0.0;
             o00.zero();
             o01.zero();
             o10.zero();
             o11.zero();
             for b in 0..(last + BK - 1) / BK {
                 let k0 = b * BK;
-                for i in (lid()..BK * w).by(THREADS) {
-                    let t = i / w;
-                    let d = i % w;
-                    kv_s[t * (w + PAD) + d] = if k0 + t < last {
-                        k[((slot * stride + k0 + t) * kv_heads + kvh) as u64 * w as u64 + d as u64]
-                    } else {
-                        0.0
-                    };
-                }
+                let at = slot * stride + k0;
+                stage_kv::<false>(&mut kv_s, k, at, k0, last, kv_heads, kvh, w);
                 barrier();
-                if simd < 2 {
-                    s_t.zero();
-                    s_t.block(&q_s, simd * 16 * (w + PAD), &kv_s, 0, w + PAD, w);
-                    s_t.each(|r, c, v| {
-                        let t = k0 + c;
-                        let seen = t < seen_s[simd * 16 + r];
-                        p_s[(simd * 16 + r) * (BK + PAD) + c] =
-                            if seen { v } else { f32::NEG_INFINITY };
-                    });
-                }
+                scores(&mut s_t, &q_s, &kv_s, &mut p_s, &seen_s, simd, k0, w);
                 barrier();
-                if lid() < BQ {
-                    let mut top = f32::NEG_INFINITY;
-                    for c in 0..BK {
-                        top = max(top, p_s[row * (BK + PAD) + c]);
-                    }
-                    let m_new = max(m, top);
-                    // A row that has seen nothing keeps zero sums.
-                    let safe = if m_new == f32::NEG_INFINITY {
-                        0.0
-                    } else {
-                        m_new
-                    };
-                    let alpha = exp(m - safe);
-                    let mut sum = 0.0f32;
-                    for c in 0..BK {
-                        let p = exp(p_s[row * (BK + PAD) + c] - safe);
-                        p_s[row * (BK + PAD) + c] = p;
-                        sum += p;
-                    }
-                    l = l * alpha + sum;
-                    m = m_new;
-                    alpha_s[row] = alpha;
-                }
+                soften(&mut p_s, &mut alpha_s, &mut state, row);
                 barrier();
-                for i in (lid()..BK * w).by(THREADS) {
-                    let t = i / w;
-                    let d = i % w;
-                    kv_s[d * (BK + PAD) + t] = if k0 + t < last {
-                        values[((slot * stride + k0 + t) * kv_heads + kvh) as u64 * w as u64
-                            + d as u64]
-                    } else {
-                        0.0
-                    };
-                }
+                stage_kv::<true>(&mut kv_s, values, at, k0, last, kv_heads, kvh, w);
                 barrier();
                 if first {
-                    o00.scale(|r| alpha_s[r]);
-                    o01.scale(|r| alpha_s[16 + r]);
-                    o00.block(&p_s, 0, &kv_s, simd * 16 * (BK + PAD), BK + PAD, BK);
-                    o01.block(
+                    fold_pair(
+                        &mut o00,
+                        &mut o01,
                         &p_s,
-                        16 * (BK + PAD),
                         &kv_s,
+                        &alpha_s,
                         simd * 16 * (BK + PAD),
-                        BK + PAD,
-                        BK,
                     );
                 }
                 if second {
-                    o10.scale(|r| alpha_s[r]);
-                    o11.scale(|r| alpha_s[16 + r]);
-                    o10.block(&p_s, 0, &kv_s, (simd + 4) * 16 * (BK + PAD), BK + PAD, BK);
-                    o11.block(
-                        &p_s,
-                        16 * (BK + PAD),
-                        &kv_s,
-                        (simd + 4) * 16 * (BK + PAD),
-                        BK + PAD,
-                        BK,
-                    );
+                    let col = (simd + 4) * 16 * (BK + PAD);
+                    fold_pair(&mut o10, &mut o11, &p_s, &kv_s, &alpha_s, col);
                 }
                 barrier();
             }
             if lid() < BQ {
-                l_s[row] = l;
+                l_s[row] = state[1];
             }
             barrier();
             if first {
-                o00.each(|r, c, v| {
-                    if seen_s[r] > 0 {
-                        out[((q0 + r) * heads + h) as u64 * w as u64 + (simd * 16 + c) as u64] =
-                            v / l_s[r];
-                    }
-                });
-                o01.each(|r, c, v| {
-                    if seen_s[16 + r] > 0 {
-                        out[((q0 + 16 + r) * heads + h) as u64 * w as u64
-                            + (simd * 16 + c) as u64] = v / l_s[16 + r];
-                    }
-                });
+                write_pair(&o00, &o01, out, &l_s, &seen_s, q0, heads, h, simd * 16, w);
             }
             if second {
-                o10.each(|r, c, v| {
-                    if seen_s[r] > 0 {
-                        out[((q0 + r) * heads + h) as u64 * w as u64
-                            + ((simd + 4) * 16 + c) as u64] = v / l_s[r];
-                    }
-                });
-                o11.each(|r, c, v| {
-                    if seen_s[16 + r] > 0 {
-                        out[((q0 + 16 + r) * heads + h) as u64 * w as u64
-                            + ((simd + 4) * 16 + c) as u64] = v / l_s[16 + r];
-                    }
-                });
+                let col = (simd + 4) * 16;
+                write_pair(&o10, &o11, out, &l_s, &seen_s, q0, heads, h, col, w);
             }
             barrier();
         }
