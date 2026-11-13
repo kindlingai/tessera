@@ -6,7 +6,7 @@ use crate::kernel::Kernel;
 use crate::plan::Step;
 use codegen::prelude::*;
 use graph::DType;
-use sim::{Load, Ops};
+use sim::Load;
 
 /// One thread per element, widened to f32.
 #[kernel]
@@ -48,12 +48,9 @@ impl Kernel for Widen {
 
     fn load(&self, _: usize) -> Option<Load> {
         let len = self.len as f64;
-        let trip = Ops {
-            int: 1.0,
-            loads: 1.0,
-            stores: 1.0,
-            fresh: 1.0,
-            ..Ops::default()
+        let trip = match self.form {
+            DType::Bf16 => widen_ir::<Bf16>().trip(),
+            _ => widen_ir::<F32>().trip(),
         };
         Some(Load {
             threads: self.len,

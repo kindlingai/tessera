@@ -6,22 +6,69 @@ use graph::DType;
 use sim::Ops;
 use std::collections::HashMap;
 
+/// Bytes in a cache line.
+const LINE: f64 = 64.0;
+
+/// How an address moves with the loop variable, per trip.
+#[derive(Clone, Copy, PartialEq)]
+enum Advance {
+    /// The same address every trip.
+    Still,
+    /// This many index units a trip.
+    By(f64),
+    /// Any other way: a new line every trip.
+    Jumps,
+}
+
+impl Advance {
+    fn add(self, other: Advance) -> Advance {
+        match (self, other) {
+            (Advance::Jumps, _) | (_, Advance::Jumps) => Advance::Jumps,
+            (Advance::By(a), Advance::By(b)) => Advance::By(a + b),
+            (Advance::By(a), Advance::Still) | (Advance::Still, Advance::By(a)) => Advance::By(a),
+            (Advance::Still, Advance::Still) => Advance::Still,
+        }
+    }
+
+    fn times(self, by: f64) -> Advance {
+        match self {
+            Advance::By(a) => Advance::By(a * by),
+            other => other,
+        }
+    }
+}
+
+/// A runtime loop being counted: its variable and step.
+struct Loop {
+    var: String,
+    step: Option<f64>,
+    /// Names bound from the variable inside the loop.
+    derived: Vec<String>,
+}
+
 /// Counts a trip's operations, inside the runtime loops.
 #[derive(Default)]
 struct Counter {
     trip: Ops,
-    /// Runtime loops entered.
-    looping: usize,
+    /// The runtime loops entered, innermost last.
+    loops: Vec<Loop>,
+    /// A body without runtime loops counts as one trip.
+    straight: bool,
     /// The product of enclosing constant loop counts.
     times: f64,
+    /// Freshness and width summed over loads, for their means.
+    fresh: f64,
+    width: f64,
     buffers: HashMap<String, DType>,
     shared: Vec<String>,
     tiles: HashMap<String, (usize, usize)>,
+    /// Global loads this statement has made, which repeats share.
+    seen: Vec<Expr>,
 }
 
 impl Counter {
     fn add(&mut self, ops: Ops) {
-        if self.looping == 0 {
+        if self.loops.is_empty() && !self.straight {
             return;
         }
         let (t, n) = (&mut self.trip, self.times);
@@ -31,10 +78,71 @@ impl Counter {
         t.loads += ops.loads * n;
         t.stores += ops.stores * n;
         t.tile_flops += ops.tile_flops * n;
-        // Loads of one trip share one width and freshness.
-        if ops.loads > 0.0 {
-            t.width = ops.width;
-            t.fresh = ops.fresh;
+        self.fresh += ops.fresh * ops.loads * n;
+        self.width += ops.width * ops.loads * n;
+    }
+
+    /// A load at `at`: how often it opens a line.
+    fn load(&mut self, at: &Expr, bytes: f64) {
+        let fresh = match self.loops.last() {
+            None => 1.0,
+            Some(l) => match self.advance(at, l).times(l.step.unwrap_or(f64::NAN)) {
+                Advance::Still => 0.0,
+                Advance::By(units) if units.is_finite() => (units * bytes / LINE).min(1.0),
+                _ => 1.0,
+            },
+        };
+        self.add(Ops {
+            loads: 1.0,
+            fresh,
+            width: bytes,
+            ..Ops::default()
+        });
+    }
+
+    /// How `e` moves per trip of `l`, in index units.
+    fn advance(&self, e: &Expr, l: &Loop) -> Advance {
+        match e {
+            Expr::Var(name) if *name == l.var => Advance::By(1.0),
+            Expr::Var(name) if l.derived.contains(name) => Advance::Jumps,
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Var(_) => Advance::Still,
+            Expr::Neg(a) => self.advance(a, l).times(-1.0),
+            Expr::Cast(_, a) => self.advance(a, l),
+            Expr::Bin(BinOp::Add, a, b) => self.advance(a, l).add(self.advance(b, l)),
+            Expr::Bin(BinOp::Sub, a, b) => self.advance(a, l).add(self.advance(b, l).times(-1.0)),
+            Expr::Bin(BinOp::Mul, a, b) => match (self.advance(a, l), self.advance(b, l)) {
+                (Advance::Still, Advance::Still) => Advance::Still,
+                (Advance::By(n), Advance::Still) => match &**b {
+                    Expr::Int(c) => Advance::By(n * *c as f64),
+                    _ => Advance::Jumps,
+                },
+                (Advance::Still, Advance::By(n)) => match &**a {
+                    Expr::Int(c) => Advance::By(n * *c as f64),
+                    _ => Advance::Jumps,
+                },
+                _ => Advance::Jumps,
+            },
+            Expr::Bin(..) | Expr::Call(..) | Expr::Select(..) | Expr::Index(..) => {
+                match self.mentions(e, l) {
+                    true => Advance::Jumps,
+                    false => Advance::Still,
+                }
+            }
+            Expr::Not(a) | Expr::Field(a, _) => self.advance(a, l),
+        }
+    }
+
+    /// Whether `e` reads the loop variable or a derivative.
+    fn mentions(&self, e: &Expr, l: &Loop) -> bool {
+        match e {
+            Expr::Var(name) => *name == l.var || l.derived.contains(name),
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => false,
+            Expr::Neg(a) | Expr::Not(a) | Expr::Cast(_, a) | Expr::Field(a, _) => {
+                self.mentions(a, l)
+            }
+            Expr::Bin(_, a, b) | Expr::Index(a, b) => self.mentions(a, l) || self.mentions(b, l),
+            Expr::Select(c, a, b) => [c, a, b].iter().any(|e| self.mentions(e, l)),
+            Expr::Call(_, args) => args.iter().any(|a| self.mentions(a, l)),
         }
     }
 
@@ -73,11 +181,11 @@ impl Counter {
             Expr::Index(base, at) => {
                 self.expr(at);
                 if let Some(dtype) = self.global(base) {
-                    self.add(Ops {
-                        loads: 1.0,
-                        width: dtype.bytes() as f64,
-                        ..Ops::default()
-                    });
+                    // The compiler loads a repeated element once.
+                    if !self.seen.contains(e) {
+                        self.seen.push(e.clone());
+                        self.load(at, dtype.bytes() as f64);
+                    }
                 } else if matches!(&**base, Expr::Var(n) if self.shared.contains(n)) {
                     self.add(Ops {
                         loads: 1.0,
@@ -134,11 +242,24 @@ impl Counter {
                         true
                     }
                     Intrinsic::Load4 => {
-                        let width = 4.0 * self.global(&args[0]).map_or(4, DType::bytes) as f64;
+                        let bytes = self.global(&args[0]).map_or(4, DType::bytes) as f64;
+                        let (at, mut l) = (&args[1], self.loops.pop());
+                        // Four elements move the address by one of them.
+                        let fresh = match &mut l {
+                            None => 1.0,
+                            Some(l) => {
+                                match self.advance(at, l).times(l.step.unwrap_or(f64::NAN)) {
+                                    Advance::Still => 0.0,
+                                    Advance::By(u) if u.is_finite() => (u * bytes / LINE).min(1.0),
+                                    _ => 1.0,
+                                }
+                            }
+                        };
+                        self.loops.extend(l);
                         self.add(Ops {
                             loads: 1.0,
-                            fresh: 1.0,
-                            width,
+                            fresh,
+                            width: 4.0 * bytes,
                             ..Ops::default()
                         });
                         true
@@ -158,14 +279,22 @@ impl Counter {
 
     fn stmts(&mut self, stmts: &[Stmt]) {
         for s in stmts {
+            self.seen.clear();
             self.stmt(s);
         }
     }
 
     fn stmt(&mut self, s: &Stmt) {
         match s {
-            Stmt::Let { init, .. } => {
+            Stmt::Let { name, init } => {
                 self.expr(init);
+                // Names set from the loop variable move with it.
+                if let Some(l) = self.loops.last()
+                    && self.mentions(init, l)
+                {
+                    let name = name.clone();
+                    self.loops.last_mut().expect("a loop").derived.push(name);
+                }
             }
             Stmt::Array { .. } => {}
             Stmt::Shared { name, .. } => self.shared.push(name.clone()),
@@ -203,6 +332,7 @@ impl Counter {
                 }
             }
             Stmt::For {
+                var,
                 from,
                 to,
                 step,
@@ -223,13 +353,21 @@ impl Counter {
                         self.times = was;
                     }
                     None => {
-                        self.looping += 1;
+                        let step = match step {
+                            Expr::Int(s) => Some(*s as f64),
+                            _ => None,
+                        };
+                        self.loops.push(Loop {
+                            var: var.clone(),
+                            step,
+                            derived: Vec::new(),
+                        });
                         self.add(Ops {
                             int: 2.0,
                             ..Ops::default()
                         });
                         self.stmts(body);
-                        self.looping -= 1;
+                        self.loops.pop();
                     }
                 }
             }
@@ -270,11 +408,31 @@ impl Counter {
     }
 }
 
+/// Whether any loop's bounds are read at launch.
+fn runtime_loops(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::For {
+            from,
+            to,
+            step,
+            body,
+            ..
+        } => {
+            let fixed = matches!((from, to, step), (Expr::Int(_), Expr::Int(_), Expr::Int(_)));
+            !fixed || runtime_loops(body)
+        }
+        Stmt::If { then, els, .. } => runtime_loops(then) || runtime_loops(els),
+        Stmt::TileEach { body, .. } => runtime_loops(body),
+        _ => false,
+    })
+}
+
 impl Body {
-    /// One trip's operations, from the loops that read a size.
+    /// One trip's operations: a runtime loop's, or the whole body's.
     pub fn trip(&self) -> Ops {
         let mut c = Counter {
             times: 1.0,
+            straight: !runtime_loops(&self.stmts),
             ..Counter::default()
         };
         for param in &self.params {
@@ -283,6 +441,11 @@ impl Body {
             }
         }
         c.stmts(&self.stmts);
-        c.trip
+        let mut trip = c.trip;
+        if trip.loads > 0.0 {
+            trip.fresh = c.fresh / trip.loads;
+            trip.width = c.width / trip.loads;
+        }
+        trip
     }
 }
