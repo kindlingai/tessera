@@ -80,7 +80,7 @@ thread_local! {
 
 /// Stages a block of `x` and `w`, then multiplies.
 #[kernel]
-fn tiled<F: Form>(
+fn tiled<F: Form<Elem = f32>>(
     x: Buf<F32>,
     w: Buf<F>,
     out: BufMut<F32>,

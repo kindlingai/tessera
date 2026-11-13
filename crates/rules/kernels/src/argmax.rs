@@ -1,6 +1,7 @@
 //! Each row's largest entry, found in two launches.
 
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Text, Tree, float};
+use codegen::prelude::*;
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Site, Source, Step, T, Tree};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 256;
@@ -21,58 +22,53 @@ pub struct Peaks(pub Rows);
 #[derive(Clone, Copy, Debug)]
 pub struct Argmax(pub Rows);
 
-// Strictly greater, so the lowest index wins ties.
-const PEAKS: &str = "    if (gid >= rows * parts) {
+/// Strictly greater, so the lowest index wins ties.
+#[kernel]
+fn peaks(x: Buf<F32>, mut out: BufMut<U32>, rows: u32, width: u32, parts: u32) {
+    if gid() >= rows * parts {
         return;
     }
-    u32 span = (width + parts - 1) / parts;
-    u32 from = (gid % parts) * span;
-    u32 to = from + span < width ? from + span : width;
-    u64 at = (u64)(gid / parts) * width;
-    u32 arg = width;
-    float best = f_bits(0xff800000u);
-    for (u32 i = from; i < to; i++) {
-        if (x[at + i] > best) {
-            best = x[at + i];
+    let span = (width + parts - 1) / parts;
+    let from = (gid() % parts) * span;
+    let to = if from + span < width {
+        from + span
+    } else {
+        width
+    };
+    let at = (gid() / parts) as u64 * width as u64;
+    let mut arg = width;
+    let mut best = f32::NEG_INFINITY;
+    for i in from..to {
+        if x[at + i as u64] > best {
+            best = x[at + i as u64];
             arg = i;
         }
     }
-    out[gid] = arg;
-";
+    out[gid() as u64] = arg;
+}
 
-// A piece with nothing finite holds the width.
-const ARGMAX: &str = "    if (gid >= rows) {
+/// A piece with nothing finite holds the width.
+#[kernel]
+fn argmax(x: Buf<F32>, peaks: Buf<U32>, mut out: BufMut<U32>, rows: u32, width: u32, parts: u32) {
+    if gid() >= rows {
         return;
     }
-    u64 at = (u64)gid * width;
-    u32 arg = width;
-    float best = f_bits(0xff800000u);
-    for (u32 p = 0; p < parts; p++) {
-        u32 i = peaks[gid * parts + p];
-        if (i < width && x[at + i] > best) {
-            best = x[at + i];
+    let at = gid() as u64 * width as u64;
+    let mut arg = width;
+    let mut best = f32::NEG_INFINITY;
+    for p in 0..parts {
+        let i = peaks[(gid() * parts + p) as u64];
+        if i < width && x[at + i as u64] > best {
+            best = x[at + i as u64];
             arg = i;
         }
     }
-    out[gid] = arg;
-";
+    out[gid() as u64] = arg;
+}
 
 impl Rows {
     fn sizes(&self) -> Vec<usize> {
         vec![self.rows, self.width]
-    }
-
-    fn text(&self, entry: &str, peaks: bool, body: &str) -> Source {
-        let ids = |name: &str, writes| (name.to_string(), "u32", writes);
-        let mut buffers = vec![float("x", false)];
-        buffers.extend(peaks.then(|| ids("peaks", false)));
-        buffers.push(ids("out", true));
-        Source::Made(Text {
-            entry: entry.into(),
-            buffers,
-            scalars: vec![("rows", "u32"), ("width", "u32"), ("parts", "u32")],
-            body: body.into(),
-        })
     }
 
     /// Every input, the output, then the three sizes.
@@ -97,7 +93,9 @@ impl Kernel for Peaks {
     }
 
     fn source(&self) -> Source {
-        self.0.text("plan_peaks", false, PEAKS)
+        let mut text = peaks_ir().text();
+        text.entry = "plan_peaks".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -119,7 +117,9 @@ impl Kernel for Argmax {
     }
 
     fn source(&self) -> Source {
-        self.0.text("plan_argmax", true, ARGMAX)
+        let mut text = argmax_ir().text();
+        text.entry = "plan_argmax".into();
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

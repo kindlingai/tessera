@@ -1,8 +1,9 @@
 //! Small kernels that expose one hardware limit each.
 
+use codegen::prelude::*;
 use lower::{
     Arg, Cluster, DType, Error, Kernel, KernelRef, Launch, Link, Plan, Run, Shape, Slot, Source,
-    Step, Tensor, Text, Zone, ZoneKind, open,
+    Step, Tensor, Zone, ZoneKind, open,
 };
 use sim::{Fit, Tag};
 use std::time::Instant;
@@ -41,10 +42,114 @@ pub struct Reading {
     pub seconds: f64,
 }
 
-const HEAD: &str = "    if (gid >= threads) {
+/// Each probe stops its idle threads first.
+#[kernel]
+fn probe_spin(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
         return;
     }
-";
+    let mut v = x[(gid() % 16) as u64];
+    for i in 0..trips {
+        v = v * 0.999 + 0.001;
+    }
+    out[gid() as u64] = v;
+}
+
+#[kernel]
+fn probe_curve(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
+        return;
+    }
+    let mut v = x[(gid() % 16) as u64];
+    for i in 0..trips {
+        v = exp(-v);
+    }
+    out[gid() as u64] = v;
+}
+
+/// `depth` loads a trip, threads interleaved through the buffer.
+#[kernel]
+fn probe_read(
+    x: Buf<F32>,
+    mut out: BufMut<F32>,
+    threads: u32,
+    trips: u32,
+    len: u32,
+    #[build] depth: u32,
+) {
+    if gid() >= threads {
+        return;
+    }
+    let mut acc = 0.0f32;
+    for i in 0..trips {
+        let at = i as u64 * depth as u64 * threads as u64 + gid() as u64;
+        for d in 0..depth {
+            acc += x[at + threads as u64 * d as u64];
+        }
+    }
+    out[gid() as u64] = acc;
+}
+
+#[kernel]
+fn probe_scan(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
+        return;
+    }
+    let at = gid() as u64 * trips as u64;
+    let mut acc = 0.0f32;
+    for i in 0..trips {
+        acc += x[at + i as u64];
+    }
+    out[gid() as u64] = acc;
+}
+
+#[kernel]
+fn probe_write(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
+        return;
+    }
+    for i in 0..trips {
+        out[i as u64 * threads as u64 + gid() as u64] = i as f32;
+    }
+    if trips == 0 {
+        out[gid() as u64] = x[(gid() % 16) as u64];
+    }
+}
+
+/// Each load's address comes from the last.
+#[kernel]
+fn probe_chase(x: Buf<U32>, mut out: BufMut<U32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
+        return;
+    }
+    let mut at = (gid() * 2654435761) % len;
+    for i in 0..trips {
+        at = x[at as u64];
+    }
+    out[gid() as u64] = at;
+}
+
+/// Repeats a warp's 32x32 block over 32 staged columns.
+#[kernel]
+fn probe_tile(x: Buf<F32>, mut out: BufMut<F32>, threads: u32, trips: u32, len: u32) {
+    if gid() >= threads {
+        return;
+    }
+    let mut s = shared::<f32>(64 * 36);
+    for i in (lid()..64 * 36).by(256) {
+        s[i] = x[i as u64];
+    }
+    barrier();
+    let mut acc = tiles(32, 32);
+    for it in 0..trips {
+        acc.block(&s, 0, &s, 32 * 36, 36, 32);
+    }
+    let mut sum = 0.0f32;
+    acc.each(|r, c, v| {
+        sum += v;
+    });
+    out[gid() as u64] = sum;
+}
 
 impl Probe {
     /// Elements the probe reads, then elements it writes.
@@ -57,107 +162,6 @@ impl Probe {
             Kind::Write => [16, all.max(self.threads)],
             Kind::Chase => [CHASE, self.threads],
             Kind::Tile => [64 * 36, self.threads],
-        }
-    }
-
-    fn body(&self) -> String {
-        match self.kind {
-            Kind::Spin => format!(
-                "{HEAD}    float v = x[gid % 16];
-    for (u32 i = 0; i < trips; i++) {{
-        v = v * 0.999f + 0.001f;
-    }}
-    out[gid] = v;
-"
-            ),
-            Kind::Curve => format!(
-                "{HEAD}    float v = x[gid % 16];
-    for (u32 i = 0; i < trips; i++) {{
-        v = f_exp(-v);
-    }}
-    out[gid] = v;
-"
-            ),
-            Kind::Read { depth } => {
-                let load = |d: usize| format!("x[at + (u64)threads * {d}]");
-                let loads: Vec<String> = (0..depth).map(load).collect();
-                let sum = loads.join(" + ");
-                format!(
-                    "{HEAD}    float acc = 0.0f;
-    for (u32 i = 0; i < trips; i++) {{
-        u64 at = (u64)i * {depth} * threads + gid;
-        acc += {sum};
-    }}
-    out[gid] = acc;
-"
-                )
-            }
-            Kind::Scan => format!(
-                "{HEAD}    u64 at = (u64)gid * trips;
-    float acc = 0.0f;
-    for (u32 i = 0; i < trips; i++) {{
-        acc += x[at + i];
-    }}
-    out[gid] = acc;
-"
-            ),
-            Kind::Write => format!(
-                "{HEAD}    for (u32 i = 0; i < trips; i++) {{
-        out[(u64)i * threads + gid] = (float)i;
-    }}
-    if (trips == 0) {{
-        out[gid] = x[gid % 16];
-    }}
-"
-            ),
-            Kind::Chase => format!(
-                "{HEAD}    u32 at = (gid * 2654435761u) % len;
-    for (u32 i = 0; i < trips; i++) {{
-        at = x[at];
-    }}
-    out[gid] = at;
-"
-            ),
-            // A warp's 32x32 block over 32 staged columns.
-            Kind::Tile => format!(
-                "{HEAD}    u32 lane = lid % 32;
-    f_group(float, s, 64 * 36);
-    for (u32 i = lid; i < 64 * 36; i += 256) {{
-        s[i] = x[i];
-    }}
-    f_barrier();
-    tile_acc acc[32 / TILE_M][32 / TILE_N];
-    for (u32 i = 0; i < 32 / TILE_M; i++) {{
-        for (u32 j = 0; j < 32 / TILE_N; j++) {{
-            TILE_ZERO(acc[i][j]);
-        }}
-    }}
-    for (u32 it = 0; it < trips; it++) {{
-        for (u32 kk = 0; kk < 32; kk += TILE_K) {{
-            tile_a ta[32 / TILE_M];
-            tile_b tb[32 / TILE_N];
-            for (u32 i = 0; i < 32 / TILE_M; i++) {{
-                TILE_LOAD_A(ta[i], s + i * TILE_M * 36 + kk, 36);
-            }}
-            for (u32 j = 0; j < 32 / TILE_N; j++) {{
-                TILE_LOAD_B(tb[j], s + 32 * 36 + j * TILE_N * 36 + kk, 36);
-            }}
-            for (u32 i = 0; i < 32 / TILE_M; i++) {{
-                for (u32 j = 0; j < 32 / TILE_N; j++) {{
-                    TILE_MMA(acc[i][j], ta[i], tb[j]);
-                }}
-            }}
-        }}
-    }}
-    float sum = 0.0f;
-    for (u32 i = 0; i < 32 / TILE_M; i++) {{
-        for (u32 j = 0; j < 32 / TILE_N; j++) {{
-            sum += TILE_VAL(acc[i][j], 0);
-        }}
-    }}
-    out[gid] = sum;
-"
-            ),
         }
     }
 
@@ -196,25 +200,20 @@ impl Kernel for Probe {
     }
 
     fn source(&self) -> Source {
-        let ty = match self.kind {
-            Kind::Chase => "u32",
-            _ => "float",
-        };
-        let entry = match self.kind {
-            Kind::Spin => "probe_spin".to_string(),
-            Kind::Curve => "probe_curve".to_string(),
-            Kind::Read { depth } => format!("probe_read{depth}"),
-            Kind::Scan => "probe_scan".to_string(),
-            Kind::Write => "probe_write".to_string(),
-            Kind::Chase => "probe_chase".to_string(),
-            Kind::Tile => "probe_tile".to_string(),
-        };
-        Source::Made(Text {
-            entry,
-            buffers: vec![("x".into(), ty, false), ("out".into(), ty, true)],
-            scalars: vec![("threads", "u32"), ("trips", "u32"), ("len", "u32")],
-            body: self.body(),
-        })
+        let mut text = match self.kind {
+            Kind::Spin => probe_spin_ir(),
+            Kind::Curve => probe_curve_ir(),
+            Kind::Read { depth } => probe_read_ir(depth as u32),
+            Kind::Scan => probe_scan_ir(),
+            Kind::Write => probe_write_ir(),
+            Kind::Chase => probe_chase_ir(),
+            Kind::Tile => probe_tile_ir(),
+        }
+        .text();
+        if let Kind::Read { depth } = self.kind {
+            text.entry = format!("probe_read{depth}");
+        }
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

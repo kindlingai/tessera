@@ -1,9 +1,8 @@
 //! A matmul with one thread per output column.
 
+use codegen::prelude::*;
 use graph::Order;
-use lower::{
-    Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Text, Tree, float,
-};
+use lower::{Arg, DType, Draft, Kernel, Launch, Shape, Site, Source, Step, Stored, T, Tree};
 use sim::{Load, Ops};
 
 /// Its row limit: each thread keeps one sum per row.
@@ -18,26 +17,25 @@ pub struct Thin {
     pub form: DType,
 }
 
-fn body(load: &str) -> String {
-    format!(
-        "    if (gid >= n) {{
+/// One thread per column with one sum per row.
+#[kernel]
+fn thin<F: Form<Elem = f32>>(x: Buf<F32>, w: Buf<F>, mut out: BufMut<F32>, m: u32, n: u32, k: u32) {
+    if gid() >= n {
         return;
-    }}
-    float sums[32];
-    for (u32 row = 0; row < m; row++) {{
-        sums[row] = 0.0f;
-    }}
-    for (u32 i = 0; i < k; i++) {{
-        float c = {load};
-        for (u32 row = 0; row < m; row++) {{
-            sums[row] += x[row * k + i] * c;
-        }}
-    }}
-    for (u32 row = 0; row < m; row++) {{
-        out[(u64)row * n + gid] = sums[row];
-    }}
-"
-    )
+    }
+    let mut sums = [0.0f32; THIN_ROWS];
+    for row in 0..m {
+        sums[row as usize] = 0.0;
+    }
+    for i in 0..k {
+        let c = w[gid() as u64 * k as u64 + i as u64];
+        for row in 0..m {
+            sums[row as usize] += x[(row * k + i) as u64] * c;
+        }
+    }
+    for row in 0..m {
+        out[row as u64 * n as u64 + gid() as u64] = sums[row as usize];
+    }
 }
 
 impl Kernel for Thin {
@@ -74,13 +72,13 @@ impl Kernel for Thin {
     }
 
     fn source(&self) -> Source {
-        let w = ("w".to_string(), self.form.ty(), false);
-        Source::Made(Text {
-            entry: format!("plan_thin_{}", self.form.name()),
-            buffers: vec![float("x", false), w, float("out", true)],
-            scalars: vec![("m", "u32"), ("n", "u32"), ("k", "u32")],
-            body: body(&self.form.load("w", "(u64)gid * k + i")),
-        })
+        let body = match self.form {
+            DType::Bf16 => thin_ir::<Bf16>(),
+            _ => thin_ir::<F32>(),
+        };
+        let mut text = body.text();
+        text.entry = format!("plan_thin_{}", self.form.name());
+        Source::Made(text)
     }
 
     fn accepts(&self, input: usize, form: DType) -> bool {

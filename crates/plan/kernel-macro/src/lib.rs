@@ -422,8 +422,30 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 let name = i.to_string();
                 Ok(quote!(Expr::var(#name)))
             }
+            // `f32::INFINITY` and its kin are floats in the tree.
+            None if p.path.segments.len() == 2 && p.path.segments[0].ident == "f32" => {
+                Ok(quote!(Expr::Float(f64::from(#p))))
+            }
             None => Err(Error::new(p.span(), "a plain name")),
         },
+        Expr::If(i) => {
+            let only = |b: &syn::Block| match b.stmts.as_slice() {
+                [Stmt::Expr(e, None)] => expr(e, ctx),
+                _ => Err(Error::new(b.span(), "one value in each branch")),
+            };
+            let Some((_, els)) = &i.else_branch else {
+                return Err(Error::new(i.span(), "a value needs both branches"));
+            };
+            let Expr::Block(els) = &**els else {
+                return Err(Error::new(els.span(), "a block"));
+            };
+            let (c, a, b) = (
+                expr(&i.cond, ctx)?,
+                only(&i.then_branch)?,
+                only(&els.block)?,
+            );
+            Ok(quote!(Expr::select(#c, #a, #b)))
+        }
         Expr::Paren(p) => sub(&p.expr),
         // A borrow passes group memory by name.
         Expr::Reference(r) => sub(&r.expr),
@@ -485,6 +507,9 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 "tanh" => quote!(Intrinsic::Tanh),
                 "max" => quote!(Intrinsic::Max),
                 "clamp" => quote!(Intrinsic::Clamp),
+                "pow" => quote!(Intrinsic::Pow),
+                "cos" => quote!(Intrinsic::Cos),
+                "sin" => quote!(Intrinsic::Sin),
                 "F32x4::zero" => quote!(Intrinsic::Zero4),
                 other => return Err(Error::new(p.span(), format!("no `{other}` here"))),
             };

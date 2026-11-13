@@ -4,9 +4,18 @@ use crate::abi::{Arg, Launch, Shape, Source};
 use crate::form::Stored;
 use crate::kernel::Kernel;
 use crate::plan::Step;
-use codegen::{Text, float};
+use codegen::prelude::*;
 use graph::DType;
 use sim::{Load, Ops};
+
+/// One thread per element, widened to f32.
+#[kernel]
+fn widen<F: Form<Elem = f32>>(x: Buf<F>, mut out: BufMut<F32>, len: u32) {
+    if gid() >= len {
+        return;
+    }
+    out[gid() as u64] = x[gid() as u64];
+}
 
 /// Widens `len` elements of `form` to f32.
 #[derive(Clone, Copy, Debug)]
@@ -21,15 +30,13 @@ impl Kernel for Widen {
     }
 
     fn source(&self) -> Source {
-        let load = self.form.load("x", "gid");
-        Source::Made(Text {
-            entry: format!("plan_widen_{}", self.form.name()),
-            buffers: vec![("x".into(), self.form.ty(), false), float("out", true)],
-            scalars: vec![("len", "u32")],
-            body: format!(
-                "    if (gid >= len) {{\n        return;\n    }}\n    out[gid] = {load};\n"
-            ),
-        })
+        let body = match self.form {
+            DType::Bf16 => widen_ir::<Bf16>(),
+            _ => widen_ir::<F32>(),
+        };
+        let mut text = body.text();
+        text.entry = format!("plan_widen_{}", self.form.name());
+        Source::Made(text)
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
