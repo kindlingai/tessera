@@ -5,6 +5,7 @@ mod files;
 mod kernel;
 mod macros;
 mod names;
+mod readme;
 mod runs;
 mod rust;
 mod share;
@@ -15,6 +16,8 @@ mod comments_test;
 mod macros_test;
 #[cfg(test)]
 mod names_test;
+#[cfg(test)]
+mod readme_test;
 #[cfg(test)]
 mod runs_test;
 #[cfg(test)]
@@ -69,6 +72,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if std::env::args().nth(1).as_deref() == Some("tables") {
+        return match readme::write(&root, &dirs) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("tessera-lint: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let (mut found, mut names, mut tests) = (Vec::new(), Vec::new(), Vec::new());
     for src in &sources {
         check_file(src, &mut found, &mut names, &mut tests);
@@ -78,6 +90,10 @@ fn main() -> ExitCode {
     macros::check(&dirs, &sources, &mut found);
     files::check_crates(&dirs, &sources, &mut found);
     runs::check(&sources, &mut found);
+    if let Err(e) = readme::check(&root, &dirs, &mut found) {
+        eprintln!("tessera-lint: {e}");
+        return ExitCode::from(2);
+    }
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     for v in &found {
         println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
