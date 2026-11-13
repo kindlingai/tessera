@@ -8,4 +8,5 @@ description = "Generates kernel text for every dialect, and counts what it costs
 
 [dependencies]
 graph = { workspace = true }
+kernel-macro = { workspace = true }
 sim = { workspace = true }

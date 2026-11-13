@@ -24,6 +24,7 @@ codegen = { path = "crates/plan/codegen" }
 gpukit = { path = "crates/gpu/gpukit" }
 graph = { path = "crates/ir/graph" }
 interp = { path = "crates/ir/interp" }
+kernel-macro = { path = "crates/plan/kernel-macro" }
 kernels = { path = "crates/rules/kernels" }
 linear = { path = "crates/rules/linear" }
 lower = { path = "crates/plan/lower" }
