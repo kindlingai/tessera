@@ -39,7 +39,7 @@ pub fn abi_params(p: &Problem) -> Vec<u8> {
 }
 pub const METAL: &str = include_str!("gemm.metal");
 
-/// CUDA C++ source; NVRTC or hiprtc compiles it on use.
+/// CUDA C++ source. NVRTC or hiprtc compiles it on use.
 pub const CUDA: &str = include_str!("gemm.cu");
 
 /// The CPU reference that GPU results are checked against.

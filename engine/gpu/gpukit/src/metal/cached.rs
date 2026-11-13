@@ -11,7 +11,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// This thread's Metal context; the first caller's `cache` wins.
+/// This thread's Metal context. The first caller's `cache` wins.
 pub fn cached_context(cache: CacheConfig) -> Result<Rc<Context>, crate::Error> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();

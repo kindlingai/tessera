@@ -93,7 +93,7 @@ pub enum Op {
     /// `x[.., K]` times `w[.., N, K]` transposed.
     Matmul,
     Attend(Attend),
-    /// Scores `[.., Queries, Keys]`; unseen keys become negative infinity.
+    /// Scores `[.., Queries, Keys]`. Unseen keys become negative infinity.
     Mask(Mask),
     /// Appends rows to kept rows. The result holds all.
     Append(u32),
@@ -114,13 +114,13 @@ impl Op {
     }
 }
 
-/// Over `[Seqs, Context, Heads, HeadDim]`; key heads serve contiguous groups.
+/// Over `[Seqs, Context, Heads, HeadDim]`. Key heads serve contiguous groups.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Attend {
     pub mask: Mask,
     pub scale: f32,
-    /// Argument four lists each query's keys; out-of-range ids are skipped.
+    /// Argument four lists each query's keys. Out-of-range ids are skipped.
     pub picked: bool,
     /// Query rows carry a slot and position: arguments four, five.
     #[serde(default)]
@@ -138,7 +138,7 @@ pub enum Mask {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Row(pub Vec<Stage>);
 
-/// One step over last-axis rows; some take an argument.
+/// One step over last-axis rows. Some take an argument.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Stage {
     Add,
@@ -151,7 +151,7 @@ pub enum Stage {
     Center,
     /// Divides the row by its sum.
     UnitSum,
-    /// Rotates pairs of elements; the argument holds positions.
+    /// Rotates pairs of elements. The argument holds positions.
     Rope {
         /// Pair `j` turns by `position * theta^(-2j/width)`.
         theta: f32,
@@ -202,16 +202,16 @@ pub enum Act {
 pub enum Select {
     /// Rows of the first argument at the second's indices.
     Gather,
-    /// Row entries at the second argument's indices; out-of-range gives zero.
+    /// Row entries at the second argument's indices. Out-of-range gives zero.
     Take,
     /// Indices of each row's largest entries above negative infinity.
     TopK {
-        /// Largest first, low index on ties; spare slots hold width.
+        /// Largest first, low index on ties. Spare slots hold width.
         k: DimExpr,
     },
 }
 
-/// Layout changes; they move data but compute nothing.
+/// Layout changes. They move data but compute nothing.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum View {
     Reshape(Shape),

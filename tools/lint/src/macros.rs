@@ -37,7 +37,7 @@ struct Def {
     own: usize,
 }
 
-/// Definitions in one macros file; anything else is a violation.
+/// Definitions in one macros file. Anything else is a violation.
 fn definitions(src: &Source, out: &mut Vec<Violation>) -> Vec<Def> {
     let file = match syn::parse_file(&src.text) {
         Ok(f) => f,

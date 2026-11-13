@@ -39,7 +39,7 @@ impl Library {
         Err(last)
     }
 
-    /// Resolve `name`; `F` must be its true fn type.
+    /// Resolve `name`. `F` must be its true fn type.
     pub unsafe fn function<F: Copy>(&self, name: &str) -> Result<F, String> {
         assert_eq!(size_of::<F>(), size_of::<*mut c_void>());
         let c_name = CString::new(name).map_err(|e| format!("bad symbol name: {e}"))?;

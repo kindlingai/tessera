@@ -1,4 +1,4 @@
-//! NVRTC compile, launch and readback; skips without a device.
+//! NVRTC compile, launch and readback. Skips without a device.
 
 #![cfg(feature = "cuda")]
 

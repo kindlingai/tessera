@@ -20,6 +20,10 @@ pub struct Raw {
     pub words: usize,
     /// Code precedes it on its first line.
     pub trailing: bool,
+    /// Opens or closes a ``` code block.
+    pub fence: bool,
+    /// Holds a `;` outside backticks.
+    pub semicolon: bool,
 }
 
 /// A comment as the rule counts it.
@@ -27,6 +31,19 @@ pub struct Raw {
 pub struct Comment {
     pub line: usize,
     pub words: usize,
+}
+
+/// A `;` outside backtick spans.
+pub fn prose_semicolon(body: &str) -> bool {
+    let mut code = false;
+    for c in body.chars() {
+        match c {
+            '`' => code = !code,
+            ';' if !code => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 pub fn words(body: &str) -> usize {
@@ -76,13 +93,14 @@ impl Scanner<'_> {
         }
         let body = String::from_utf8_lossy(&self.b[start + 2..self.i]);
         let body = body.trim_start_matches(['/', '!']);
-        let (end, words) = (line, words(body));
         self.out.push(Raw {
             kind,
             line,
-            end,
-            words,
+            end: line,
+            words: words(body),
             trailing,
+            fence: body.trim_start().starts_with("```"),
+            semicolon: prose_semicolon(body),
         });
     }
 
@@ -113,6 +131,8 @@ impl Scanner<'_> {
             end: self.line,
             words: words(body),
             trailing,
+            fence: false,
+            semicolon: prose_semicolon(body),
         });
     }
 
@@ -248,9 +268,34 @@ pub fn group(raw: &[Raw]) -> Vec<Comment> {
     out
 }
 
+/// Lines of comments with a `;` outside code spans and blocks.
+pub fn semicolons(raw: &[Raw]) -> Vec<usize> {
+    let mut block = false;
+    let mut prev: Option<&Raw> = None;
+    let mut out = Vec::new();
+    for r in raw {
+        // An unclosed block ends where its comment does.
+        if prev.is_none_or(|p| p.kind != r.kind || p.end + 1 != r.line) {
+            block = false;
+        }
+        if r.fence {
+            block = !block;
+        } else if r.semicolon && !block {
+            out.push(r.line);
+        }
+        prev = Some(r);
+    }
+    out
+}
+
 pub fn check(src: &Source, rust: bool, out: &mut Vec<Violation>) {
+    let raw = scan(&src.text, rust);
+    for line in semicolons(&raw) {
+        let message = "`;` in prose: split the sentence, or quote code in backticks".into();
+        out.push(src.violation(line, "comment-semicolon", message));
+    }
     let max = LIMITS.max_comment_words;
-    for c in group(&scan(&src.text, rust)) {
+    for c in group(&raw) {
         if c.words > max {
             out.push(src.violation(
                 c.line,

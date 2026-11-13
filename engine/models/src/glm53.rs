@@ -8,7 +8,7 @@ use trace::{
 };
 
 pub struct Config {
-    /// Its `ffn` is an expert's width; values use `head_dim`.
+    /// Its `ffn` is an expert's width. Values use `head_dim`.
     pub stack: Stack,
     /// Leading layers with a dense MLP.
     pub dense_layers: u64,
@@ -61,7 +61,7 @@ impl Config {
         }
     }
 
-    /// Whether layer `l` picks keys; others reuse the last pick.
+    /// Whether layer `l` picks keys. Others reuse the last pick.
     pub fn indexes(&self, l: u64) -> bool {
         let dense = self.dense_layers;
         l < dense || (l + 1 - dense).is_multiple_of(self.index_every)

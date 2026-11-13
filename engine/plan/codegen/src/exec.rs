@@ -172,7 +172,7 @@ impl Group<'_, '_> {
         Val::V(out)
     }
 
-    /// `e` for every thread; `mask` says which values matter.
+    /// `e` for every thread. `mask` says which values matter.
     fn eval(&mut self, e: &Expr, mask: &[bool]) -> Vec<Val> {
         let n = self.threads;
         match e {
