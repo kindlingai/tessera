@@ -22,6 +22,28 @@ pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 pub const CU_STREAM_NON_BLOCKING: u32 = 1;
+pub const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 1;
+
+/// `CUlaunchAttribute`: an id, then a 64-byte value.
+#[repr(C)]
+pub struct LaunchAttribute {
+    pub id: u32,
+    pub pad: u32,
+    pub value: [u64; 8],
+}
+
+/// `CUlaunchConfig`, as the driver lays it out.
+#[repr(C)]
+pub struct LaunchConfig {
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_bytes: u32,
+    pub pad: u32,
+    pub stream: CUstream,
+    pub attrs: *mut LaunchAttribute,
+    pub attr_count: u32,
+    pub pad2: u32,
+}
 /// Other threads may still synchronize while a capture is open.
 pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
@@ -59,6 +81,12 @@ type CuLaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> CUresult;
+type CuLaunchKernelEx = unsafe extern "C" fn(
+    *const LaunchConfig,
+    CUfunction,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> CUresult;
 type CuStreamCreate = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
 type CuStreamDestroy = unsafe extern "C" fn(CUstream) -> CUresult;
 type CuStreamSynchronize = unsafe extern "C" fn(CUstream) -> CUresult;
@@ -92,6 +120,7 @@ pub struct Driver {
     pub cu_memcpy_dtod: CuMemcpyDtoD,
     pub cu_memset_d8: CuMemsetD8,
     pub cu_launch_kernel: CuLaunchKernel,
+    pub cu_launch_kernel_ex: CuLaunchKernelEx,
     pub cu_stream_create: CuStreamCreate,
     pub cu_stream_destroy: CuStreamDestroy,
     pub cu_stream_synchronize: CuStreamSynchronize,
@@ -135,6 +164,7 @@ impl Driver {
             cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", CuMemcpyDtoD),
             cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
+            cu_launch_kernel_ex: sym!(lib, "cuLaunchKernelEx", CuLaunchKernelEx),
             cu_stream_create: sym!(lib, "cuStreamCreate", CuStreamCreate),
             cu_stream_destroy: sym!(lib, "cuStreamDestroy_v2", CuStreamDestroy),
             cu_stream_synchronize: sym!(lib, "cuStreamSynchronize", CuStreamSynchronize),

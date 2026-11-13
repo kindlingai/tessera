@@ -89,6 +89,7 @@ impl Context {
             group_bytes: 64 * 1024,
             group_threads: 1024,
             compiler: true,
+            pdl: false,
         }
     }
 
@@ -192,6 +193,9 @@ impl Context {
         )?;
         Ok(graph)
     }
+
+    /// HIP has no programmatic launch, so this changes nothing.
+    pub fn programmatic(&self, _: bool) {}
 
     /// Runs a captured graph on the null stream, after copies.
     pub fn replay(&self, graph: &Graph) -> Result<(), Error> {

@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::plan::{Plan, Slot};
+use crate::recipe::Launching;
 use codegen::Precision;
 use gpukit::backend::Backend;
 use gpukit::{Limits, Settings};
@@ -123,6 +124,8 @@ pub trait Run {
     fn bind(&mut self, name: DimName, value: u32);
     /// Runs these steps in order and waits for them.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error>;
+    /// How to launch from now on, where the device can.
+    fn launching(&mut self, _: Launching) {}
     /// Runs one step `times` over. Returns seconds per run.
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error>;
     /// The backend and the hardware it drives.

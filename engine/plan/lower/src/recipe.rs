@@ -16,6 +16,27 @@ pub struct Recipe {
     /// Kernels never to choose, by name.
     #[serde(default)]
     pub barred: Vec<String>,
+    /// How launches go to the device.
+    #[serde(default)]
+    pub launch: Launching,
+}
+
+/// Launch-time choices, each taken where the device allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Launching {
+    /// Record a whole plan once and replay it.
+    pub graphs: bool,
+    /// Let each generated kernel start before the last one ends.
+    pub pdl: bool,
+}
+
+impl Default for Launching {
+    fn default() -> Self {
+        Self {
+            graphs: true,
+            pdl: true,
+        }
+    }
 }
 
 impl Recipe {

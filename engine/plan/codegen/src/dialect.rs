@@ -62,6 +62,16 @@ const NAMES: &[(&str, &str, &str)] = &[
 
 /// The shuffle. HIP leaves out the mask.
 const METAL_SHFL: &str = "#define f_shfl_xor(v, m) simd_shuffle_xor(v, m)\n";
+/// Hopper on: wait for the last kernel, release the next.
+const CUDA_PDL: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define f_pdl_wait() asm volatile(\"griddepcontrol.wait;\" ::: \"memory\")
+#define f_pdl_go() asm volatile(\"griddepcontrol.launch_dependents;\")
+#else
+#define f_pdl_wait()
+#define f_pdl_go()
+#endif
+";
+
 const CUDA_SHFL: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #define f_shfl_xor(v, m) __shfl_xor(v, m)
 #else
@@ -87,6 +97,9 @@ fn head(dialect: Dialect) -> String {
         }
     }
     text.push_str(if metal { METAL_SHFL } else { CUDA_SHFL });
+    if !metal {
+        text.push_str(CUDA_PDL);
+    }
     text.push('\n');
     text
 }
@@ -121,7 +134,7 @@ impl Text {
                 )
             }
             false => {
-                let index = "    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
+                let index = "    f_pdl_wait();\n    f_pdl_go();\n    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
                 let head = format!("{}{}", head(dialect), crate::tile::cuda());
                 (head, "extern \"C\" __global__ void", index)
             }
