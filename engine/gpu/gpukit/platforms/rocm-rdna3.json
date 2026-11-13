@@ -1,4 +1,14 @@
 {
-  "matches": ["rocm gfx11*"],
-  "tile": [16, 16, 16]
+  "matches": [
+    "rocm gfx11*"
+  ],
+  "tile": [
+    16,
+    16,
+    16
+  ],
+  "check": [
+    "gfx1100",
+    "gfx1151"
+  ]
 }

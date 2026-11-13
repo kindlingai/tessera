@@ -135,11 +135,31 @@ jobs:
           path: ${{ runner.temp }}/simcheck.bin
           key: simcheck-${{ github.run_id }}
 
+  platforms:
+    # The platform table against nvcc, cuobjdump and clang's amdgcn
+    # backend, with no GPU needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: platforms
+      - name: Install nvcc, cuobjdump, nvdisasm and clang
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cuobjdump-13-0 cuda-nvdisasm-13-0 clang
+          echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
+      - run: which nvcc cuobjdump nvdisasm clang++
+      - run: cargo test -p models --test platforms_test -- --nocapture
+
   success:
     # The one check to require: every job above passed, and no
     # human step is pending.
     if: always()
-    needs: [commits, lint, linux, macos, similarity]
+    needs: [commits, lint, linux, macos, similarity, platforms]
     runs-on: ubuntu-latest
     steps:
       - env:

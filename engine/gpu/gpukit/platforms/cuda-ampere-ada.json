@@ -1,4 +1,14 @@
 {
-  "matches": ["cuda sm_8*"],
-  "tile": [16, 8, 8]
+  "matches": [
+    "cuda sm_8*"
+  ],
+  "tile": [
+    16,
+    8,
+    8
+  ],
+  "check": [
+    "sm_80",
+    "sm_89"
+  ]
 }
