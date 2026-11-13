@@ -37,18 +37,14 @@ fn place(w: &Window, window: usize, links: Option<&str>) -> String {
 }
 
 /// Each file pair's closest hunks, links and allow line.
-pub fn markdown(
+fn near_copies(
+    out: &mut String,
     hits: &[Hit],
     wins: &[Window],
     root: &Path,
     (window, min): (usize, f32),
     links: Option<&str>,
-) -> Result<String> {
-    let mut out = format!("{MARKER}\n### Near-copies of code\n\n");
-    if hits.is_empty() {
-        out.push_str("None found.\n");
-        return Ok(out);
-    }
+) -> Result<()> {
     writeln!(
         out,
         "{} file pairs hold {window}-line windows at or above {min} cosine similarity. \
@@ -79,7 +75,36 @@ pub fn markdown(
         )?;
     }
     if hits.len() > MAX_HITS {
-        writeln!(out, "{} more pairs are not shown.", hits.len() - MAX_HITS)?;
+        writeln!(out, "{} more pairs are not shown.\n", hits.len() - MAX_HITS)?;
+    }
+    Ok(())
+}
+
+/// Near-copies, then allow pairs that allow nothing.
+pub fn markdown(
+    hits: &[Hit],
+    stale: &[&(String, String)],
+    wins: &[Window],
+    root: &Path,
+    limits: (usize, f32),
+    links: Option<&str>,
+) -> Result<String> {
+    let mut out = format!("{MARKER}\n### Near-copies of code\n\n");
+    if hits.is_empty() && stale.is_empty() {
+        out.push_str("None found.\n");
+        return Ok(out);
+    }
+    if !hits.is_empty() {
+        near_copies(&mut out, hits, wins, root, limits, links)?;
+    }
+    if !stale.is_empty() {
+        out.push_str(
+            "These `tools/simcheck/allow.toml` pairs allow nothing. Remove them.\n\n````toml\n",
+        );
+        for (a, b) in stale {
+            writeln!(out, "[\"{a}\", \"{b}\"],")?;
+        }
+        out.push_str("````\n");
     }
     Ok(out)
 }
