@@ -143,6 +143,7 @@ impl Context {
             group_bytes: self.device.maxThreadgroupMemoryLength(),
             group_threads: self.device.maxThreadsPerThreadgroup().width,
             compiler: true,
+            pdl: false,
         }
     }
 

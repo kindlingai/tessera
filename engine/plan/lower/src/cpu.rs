@@ -122,6 +122,7 @@ pub fn limits(lanes: usize) -> Limits {
         group_bytes: 64 * 1024,
         group_threads: 1024,
         compiler: false,
+        pdl: false,
     }
 }
 

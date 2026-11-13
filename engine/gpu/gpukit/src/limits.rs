@@ -14,6 +14,9 @@ pub struct Limits {
     /// Whether hand-written kernel text can be compiled here.
     #[serde(default = "yes")]
     pub compiler: bool,
+    /// Whether a launch may overlap the one before it.
+    #[serde(default)]
+    pub pdl: bool,
 }
 
 fn yes() -> bool {
@@ -28,6 +31,7 @@ impl Limits {
             group_bytes: 32 * 1024,
             group_threads: 1024,
             compiler: true,
+            pdl: false,
         }
     }
 }

@@ -7,6 +7,7 @@ macro_rules! device_runner {
             use crate::abi::{Arg, Launch, Shape, Source};
             use crate::extent::Extent;
             use crate::plan::{Plan, Slot};
+            use crate::recipe::Launching;
             use crate::run::{Held, Run};
             use codegen::Dialect;
             use gpukit::device::Device;
@@ -25,19 +26,26 @@ macro_rules! device_runner {
                 plan: Plan,
                 held: Held,
                 kernels: Vec<Kernel>,
-                /// Compiled kernels, by entry, and by how a kernel prints.
+                /// Compiled kernels, by entry.
                 made: HashMap<String, Kernel>,
-                known: HashMap<String, Kernel>,
+                /// By how a kernel prints, with whether it was generated.
+                known: HashMap<String, (Kernel, bool)>,
                 /// Runtime dimensions, as last bound.
                 bound: HashMap<DimName, u32>,
                 /// The whole plan's launches per binding, recorded once.
                 graphs: HashMap<Vec<(DimName, u32)>, Graph>,
+                launching: Launching,
+                /// Whether the device overlaps dependent launches at all.
+                overlaps: bool,
+                /// Which steps' kernels wait on the one before them.
+                waits: Vec<bool>,
             }
 
             impl Runner {
                 pub fn new(plan: Plan) -> Result<Self, Error> {
+                    let ctx = cached_context()?;
                     let mut runner = Self {
-                        ctx: cached_context()?,
+                        ctx,
                         plan: Plan::default(),
                         held: Held::default(),
                         kernels: Vec::new(),
@@ -45,6 +53,10 @@ macro_rules! device_runner {
                         known: HashMap::new(),
                         bound: HashMap::new(),
                         graphs: HashMap::new(),
+                        launching: Launching::default(),
+                        // Asked once: asking may launch, and captures come later.
+                        overlaps: ctx.limits().pdl,
+                        waits: Vec::new(),
                     };
                     runner.replan(&plan)?;
                     Ok(runner)
@@ -58,7 +70,10 @@ macro_rules! device_runner {
                 }
 
                 /// Passes each argument by position, then enqueues.
-                fn launch(&self, kernel: &Kernel, launch: &Launch) -> Result<(), Error> {
+                fn launch(&self, step: usize, launch: &Launch) -> Result<(), Error> {
+                    let kernel = &self.kernels[step];
+                    let overlap = self.launching.pdl && self.overlaps && self.waits[step];
+                    self.ctx.programmatic(overlap);
                     let mut args = KernelArgs::new();
                     for arg in &launch.args {
                         match arg {
@@ -121,14 +136,19 @@ macro_rules! device_runner {
                         Ok(Buffer::new(zone, buffer))
                     })?;
                     self.kernels.clear();
+                    self.waits.clear();
                     for step in &plan.steps {
                         // Printing a kernel is cheaper than writing its source.
                         let key = format!("{:?}", step.kernel);
-                        if let Some(kernel) = self.known.get(&key) {
+                        if let Some((kernel, generated)) = self.known.get(&key) {
                             self.kernels.push(kernel.clone());
+                            self.waits.push(*generated);
                             continue;
                         }
-                        let kernel = match step.kernel.source() {
+                        let source = step.kernel.source();
+                        // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
+                        let generated = matches!(source, Source::Made(_));
+                        let kernel = match source {
                             Source::Fixed { cuda, entry, .. } => cached_source_kernel(cuda, entry)?,
                             Source::Made(body) => match self.made.get(&body.entry) {
                                 Some(compiled) => compiled.clone(),
@@ -140,8 +160,9 @@ macro_rules! device_runner {
                                 }
                             },
                         };
-                        self.known.insert(key, kernel.clone());
+                        self.known.insert(key, (kernel.clone(), generated));
                         self.kernels.push(kernel);
+                        self.waits.push(generated);
                     }
                     self.plan = plan.clone();
                     Ok(())
@@ -149,6 +170,11 @@ macro_rules! device_runner {
 
                 fn bind(&mut self, name: DimName, value: u32) {
                     self.bound.insert(name, value);
+                }
+
+                fn launching(&mut self, launching: Launching) {
+                    self.launching = launching;
+                    self.graphs.clear();
                 }
 
                 fn held(&self) -> &Held {
@@ -165,7 +191,7 @@ macro_rules! device_runner {
                     let launches = self.launches(step)?;
                     for _ in 0..times {
                         for launch in &launches {
-                            self.launch(&self.kernels[step], launch)?;
+                            self.launch(step, launch)?;
                         }
                     }
                     self.ctx.synchronize()?;
@@ -186,11 +212,13 @@ macro_rules! device_runner {
 
                 /// Launches every step, as a recorded graph when whole.
                 fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
-                    let whole = self.plan.id != 0 && steps == (0..self.plan.steps.len());
+                    let whole = self.launching.graphs
+                        && self.plan.id != 0
+                        && steps == (0..self.plan.steps.len());
                     if !whole {
                         for i in steps {
                             for launch in self.launches(i)? {
-                                self.launch(&self.kernels[i], &launch)?;
+                                self.launch(i, &launch)?;
                             }
                         }
                         return Ok(self.ctx.synchronize()?);
@@ -202,7 +230,7 @@ macro_rules! device_runner {
                         let graph = self.ctx.capture(|| -> Result<(), Error> {
                             for i in steps.clone() {
                                 for launch in self.launches(i)? {
-                                    self.launch(&self.kernels[i], &launch)?;
+                                    self.launch(i, &launch)?;
                                 }
                             }
                             Ok(())

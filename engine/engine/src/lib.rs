@@ -110,7 +110,8 @@ impl Engine {
         }];
         let (sizes, _) = launch_of(&first, slots);
         let plan = plans.lower(&graph, 0, &sizes, &device)?;
-        let runner = open(plan, settings)?;
+        let mut runner = open(plan, settings)?;
+        runner.launching(recipe.launch);
         let device = Device::stored(&*runner, settings)?.with(recipe);
         Ok(Self {
             graph,

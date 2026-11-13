@@ -10,8 +10,9 @@ use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
-    CU_STREAM_CAPTURE_MODE_RELAXED, CU_STREAM_NON_BLOCKING, CUcontext, CUdevice, CUfunction,
-    CUgraph, CUgraphExec, CUmodule, CUstream, Driver,
+    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, CU_STREAM_CAPTURE_MODE_RELAXED,
+    CU_STREAM_NON_BLOCKING, CUcontext, CUdevice, CUfunction, CUgraph, CUgraphExec, CUmodule,
+    CUstream, Driver, LaunchAttribute, LaunchConfig,
 };
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
@@ -117,6 +118,8 @@ impl Context {
             group_threads: device_attr(driver, device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?
                 as usize,
             compiler: true,
+            // Hopper on: griddepcontrol and the launch attribute.
+            pdl: major >= 9,
         };
 
         Ok(Self(Arc::new(Inner {
@@ -218,6 +221,11 @@ impl Context {
         Ok(graph)
     }
 
+    /// Lets this thread's launches overlap the one before.
+    pub fn programmatic(&self, on: bool) {
+        PROGRAMMATIC.with(|p| p.set(on));
+    }
+
     /// Runs a captured graph on the legacy stream, after copies.
     pub fn replay(&self, graph: &Graph) -> Result<(), Error> {
         self.set_current()?;
@@ -274,6 +282,35 @@ impl Launch for Context {
         let _hold = self.hold();
         self.set_current()?;
         let mut params = args.pointers();
+        if PROGRAMMATIC.with(Cell::get) {
+            let mut attr = LaunchAttribute {
+                id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                pad: 0,
+                value: [1, 0, 0, 0, 0, 0, 0, 0],
+            };
+            let config = LaunchConfig {
+                grid: [grid.0, grid.1, grid.2],
+                block: [block.0, block.1, block.2],
+                shared_bytes,
+                pad: 0,
+                stream: CAPTURING.with(Cell::get),
+                attrs: &mut attr,
+                attr_count: 1,
+                pad2: 0,
+            };
+            let null = std::ptr::null_mut();
+            return self.0.driver.check(
+                unsafe {
+                    (self.0.driver.cu_launch_kernel_ex)(
+                        &config,
+                        kernel.raw,
+                        params.as_mut_ptr(),
+                        null,
+                    )
+                },
+                "cuLaunchKernelEx",
+            );
+        }
         self.0.driver.check(
             unsafe {
                 (self.0.driver.cu_launch_kernel)(
@@ -350,6 +387,8 @@ pub struct Kernel {
 thread_local! {
     /// This thread's capture stream, or null outside a capture.
     static CAPTURING: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    /// Whether this thread's next launches may overlap the last.
+    static PROGRAMMATIC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Launches recorded once, replayed on their own stream.
