@@ -1,14 +1,51 @@
 //! RMS norm with one warp per row, summed by shuffles.
 
-use codegen::{Gen, LANES};
-use graph::{DType, Order, Stage};
+use codegen::prelude::*;
+use graph::{Order, Stage};
 use lower::{Arg, Draft, Kernel, Launch, Load, Shape, Site, Source, Step, T, Tree};
 
 /// Elements one wide load brings a lane.
-const WIDE: usize = 4;
+const WIDE: u32 = 4;
 
 /// Trips unrolled, so a lane keeps several loads in flight.
-const AHEAD: usize = 4;
+const AHEAD: u32 = 4;
+
+/// Sums a row's squares, then scales the row.
+#[kernel]
+fn norm_lanes<const WIDE: u32, const AHEAD: u32>(
+    x: Buf<F32>,
+    w: Buf<F32>,
+    mut out: BufMut<F32>,
+    rows: u32,
+    width: u32,
+    eps: f32,
+) {
+    let row = gid() / LANES as u32;
+    if row >= rows {
+        return;
+    }
+    let at = row as u64 * width as u64;
+    let mut acc = 0.0f32;
+    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+        let v = x.load4(at + i as u64);
+        acc += v.x * v.x;
+        acc += v.y * v.y;
+        acc += v.z * v.z;
+        acc += v.w * v.w;
+    }
+    acc = sum32(acc);
+    let inv = rsqrt(acc / width as f32 + eps);
+    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+        let v = x.load4(at + i as u64);
+        let g = w.load4(i as u64);
+        let mut o = F32x4::zero();
+        o.x = v.x * inv * g.x;
+        o.y = v.y * inv * g.y;
+        o.z = v.z * inv * g.z;
+        o.w = v.w * inv * g.w;
+        out.store4(at + i as u64, o);
+    }
+}
 
 /// An RMS norm over `rows` of `width`, one launch.
 #[derive(Clone, Copy, Debug)]
@@ -16,44 +53,6 @@ pub struct LaneNorm {
     pub rows: usize,
     pub width: usize,
     pub eps: f32,
-}
-
-impl LaneNorm {
-    /// Sums a row's squares, then scales the row.
-    fn write(&self) -> Gen {
-        let mut g = Gen::new("norm_lanes");
-        g.floats("x", false);
-        g.floats("w", false);
-        g.floats("out", true);
-        g.scalar("rows", "u32");
-        g.scalar("width", "u32");
-        g.scalar("eps", "float");
-        let lane = g.lane();
-        g.line(format!("u32 row = gid / {LANES};"));
-        g.guard("row >= rows");
-        g.line("u64 at = (u64)row * width;");
-        g.line("float acc = 0.0f;");
-        let (from, step) = (format!("{lane} * {WIDE}"), (LANES * WIDE).to_string());
-        g.repeat("i", &from, "width", &step, AHEAD, |g| {
-            let x = g.four(DType::F32, "x + at + i");
-            for x in &x {
-                g.fma("acc", x, x);
-            }
-        });
-        g.sum32("acc");
-        let inv = g.rsqrt("acc / (float)width + eps");
-        g.line(format!("float inv = {inv};"));
-        g.repeat("i", &from, "width", &step, AHEAD, |g| {
-            let x = g.four(DType::F32, "x + at + i");
-            let w = g.four(DType::F32, "w + i");
-            g.line("float4 o;");
-            for (h, (x, w)) in ["x", "y", "z", "w"].iter().zip(x.iter().zip(&w)) {
-                g.arith(format!("o.{h} = {x} * inv * {w};"), 2.0);
-            }
-            g.store4("out + at + i", "o");
-        });
-        g
-    }
 }
 
 impl Kernel for LaneNorm {
@@ -75,8 +74,8 @@ impl Kernel for LaneNorm {
         Some(Load {
             threads: self.rows * LANES,
             group: 256,
-            trips: (self.width / (LANES * WIDE)) as f64,
-            trip: self.write().trip(),
+            trips: (self.width / (LANES * WIDE as usize)) as f64,
+            trip: norm_lanes_ir::<WIDE, AHEAD>().trip(),
             // The row is read twice, the gains once.
             reads: vec![8.0 * elements, 4.0 * elements],
             written: 4.0 * len as f64,
@@ -85,7 +84,7 @@ impl Kernel for LaneNorm {
     }
 
     fn source(&self) -> Source {
-        Source::Made(self.write().finish())
+        Source::Made(norm_lanes_ir::<WIDE, AHEAD>().text())
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -121,7 +120,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     };
     // Wide loads need whole groups of four along a row.
-    if !width.is_multiple_of(WIDE) {
+    if !width.is_multiple_of(WIDE as usize) {
         return None;
     }
     let norm = LaneNorm {
