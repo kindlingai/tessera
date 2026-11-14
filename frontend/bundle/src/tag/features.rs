@@ -8,7 +8,7 @@ use crate::tokenize::spacy::{Word, is_space};
 use std::collections::HashMap;
 
 /// MurmurHash64A with seed 1: spaCy's `hash_string`.
-pub fn hash_string(s: &str) -> u64 {
+pub(super) fn hash_string(s: &str) -> u64 {
     const M: u64 = 0xc6a4_a793_5bd1_e995;
     let key = s.as_bytes();
     let mut h = 1 ^ (key.len() as u64).wrapping_mul(M);
@@ -32,7 +32,7 @@ pub fn hash_string(s: &str) -> u64 {
 }
 
 /// Thinc's `ops.hash`: MurmurHash3's x64 128-bit mix on one u64.
-pub fn thinc_hash(val: u64, seed: u32) -> [u32; 4] {
+pub(super) fn thinc_hash(val: u64, seed: u32) -> [u32; 4] {
     let fmix = |mut h: u64| {
         h ^= h >> 33;
         h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);

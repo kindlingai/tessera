@@ -117,7 +117,7 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
 }
 
 /// Matrix `name` as f32 `[out][in]`, decoded by its record.
-pub fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
+fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
     let r = record(f, name)?;
     match r.format {
         TRELLIS => {
@@ -131,7 +131,7 @@ pub fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
 }
 
 /// Packed codes of `name`, or `rows` as `(first, count)`.
-pub fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
+fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
     let r = record(f, name)?;
     if r.format != TRELLIS {
         let what = format!("{name} is in exlr8 format {}, not trellis", r.format);
