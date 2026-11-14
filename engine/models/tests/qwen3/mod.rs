@@ -3,7 +3,8 @@
 mod golden_test;
 mod step_test;
 
-use crate::common::{Spec, small_stack, suite};
+use crate::common::{Golden, Spec, Tolerance, small_stack, suite};
+use lower::form::BF16_FORM;
 use models::qwen3::{Config, program};
 use trace::Composite::{Attention, Mlp};
 use trace::Graph;
@@ -23,6 +24,20 @@ fn release() -> Graph {
     program(&Config::small(8, 40_960))
 }
 
+/// The reference's checkpoint is bf16, which plans keep.
+pub const GOLDEN: Golden = Golden {
+    read: golden_test::read,
+    form: BF16_FORM,
+    tolerance: Tolerance {
+        max_abs: 1e-3,
+        cos: 0.99999,
+        top: true,
+    },
+    per_token: true,
+    unit: false,
+    anywhere: false,
+};
+
 const SPEC: Spec = Spec {
     name: "qwen3",
     release,
@@ -33,6 +48,7 @@ const SPEC: Spec = Spec {
         (include_str!("manifests/hf.json"), release),
         (include_str!("manifests/gguf.json"), release),
     ],
+    golden: Some(GOLDEN),
 };
 
 suite!(SPEC);

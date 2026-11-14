@@ -18,6 +18,7 @@ const SPEC: Spec = Spec {
     regions: &[(Attention, 78), (Mlp, 3), (Moe, 75)],
     small: None,
     files: &[],
+    golden: None,
 };
 
 suite!(SPEC);

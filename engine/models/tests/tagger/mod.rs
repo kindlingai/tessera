@@ -22,6 +22,7 @@ const SPEC: Spec = Spec {
     regions: &[],
     small: None,
     files: &[],
+    golden: None,
 };
 
 suite!(SPEC);

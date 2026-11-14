@@ -1,11 +1,8 @@
-//! The nanogpt against recorded logits.
+//! The nanogpt's recorded logits.
 
-use super::release;
-use gpukit::testing::{Noise, max_abs_diff};
-use interp::{Tensor, run};
-use lower::{Device, lower, open};
-use settings::read as settings;
-use trace::DimName::{Context, Seqs};
+use crate::common::{Case, Reference};
+use gpukit::testing::Noise;
+use interp::Tensor;
 use trace::Graph;
 
 /// Two sequences of five tokens.
@@ -112,41 +109,18 @@ fn weights(g: &Graph) -> Vec<Tensor> {
     g.weights.iter().map(&mut make).collect()
 }
 
-fn positions() -> Vec<u32> {
-    (0..2).flat_map(|_| 0..5).collect()
-}
-
-fn close(label: &str, got: &[f32]) {
-    let off = max_abs_diff(got, &WANT);
-    eprintln!("{label}: max_abs {off:.3e}");
-    assert!(off < 1e-5, "{label} is off by {off:e}");
-}
-
-#[test]
-fn cpu_matches_record() {
-    let g = release();
-    let ids = |data: Vec<u32>| Tensor::u32(vec![2, 5], data);
-    let inputs = [ids(TOKENS.to_vec()), ids(positions())];
-    let out = run(&g, &weights(&g), 0, &inputs).unwrap();
-    close("cpu", out[0].floats().unwrap());
-}
-
-#[test]
-fn plan_matches_record() {
-    let g = release();
-    let plan = lower(
-        &g,
-        0,
-        &[(Seqs, 2), (Context, 5)],
-        &Device::guess(&settings()),
-    )
-    .unwrap();
-    let mut runner = open(plan, &settings()).unwrap();
-    for (at, w) in weights(&g).iter().enumerate() {
-        runner.load(at as u32, w.view()).unwrap();
-    }
-    let ids = |data: Vec<u32>| Tensor::u32(vec![2, 5], data);
-    let inputs = [ids(TOKENS.to_vec()), ids(positions())];
-    let out = runner.run(&[inputs[0].view(), inputs[1].view()]).unwrap();
-    close("plan", out[0].floats().unwrap());
+/// This file holds the record, so it is always there.
+pub fn read(g: &Graph) -> Option<Reference> {
+    let seqs = 2;
+    let want = WANT.to_vec();
+    let case = Case {
+        name: "record".into(),
+        seqs,
+        tokens: TOKENS.to_vec(),
+        want,
+    };
+    Some(Reference {
+        weights: weights(g),
+        cases: vec![case],
+    })
 }

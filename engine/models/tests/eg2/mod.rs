@@ -3,7 +3,8 @@
 mod golden_test;
 mod rotation_test;
 
-use crate::common::{Spec, small_stack, suite};
+use crate::common::{Golden, Spec, Tolerance, small_stack, suite};
+use lower::form::F32_FORM;
 use models::Rotated;
 use models::eg2::{Config, program};
 use trace::Composite::{Attention, Mlp};
@@ -30,6 +31,20 @@ fn release() -> Graph {
     program::<Linear>(&Config::release(1, 1024))
 }
 
+/// The embedding is a unit vector, so no max_abs bound.
+pub const GOLDEN: Golden = Golden {
+    read: golden_test::read,
+    form: F32_FORM,
+    tolerance: Tolerance {
+        max_abs: f32::INFINITY,
+        cos: 0.9999,
+        top: false,
+    },
+    per_token: false,
+    unit: true,
+    anywhere: false,
+};
+
 const SPEC: Spec = Spec {
     name: "eg2",
     release,
@@ -42,6 +57,7 @@ const SPEC: Spec = Spec {
             program::<Rotated>(&Config::release(1, 1024))
         }),
     ],
+    golden: Some(GOLDEN),
 };
 
 suite!(SPEC);
