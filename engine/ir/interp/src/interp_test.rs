@@ -175,3 +175,29 @@ fn accumulators_follow_numerics() {
     assert_eq!(sums(DType::F16), [2048.0, 2048.0]);
     assert_eq!(sums(DType::Bf16), [2048.0, 2048.0]);
 }
+
+/// Concat, center and unit sum over `[Context, Heads, HeadDim]` rows.
+fn row_ops() -> Graph {
+    let m = model();
+    let [x] = m.entry(EntryKind::Forward, [port([Context, Heads, HeadDim])]);
+    let outs = [x.concat(&x), x.center(), x.unit_sum()];
+    m.finish([
+        (Role::Logits, &outs[0]),
+        (Role::Logits, &outs[1]),
+        (Role::Logits, &outs[2]),
+    ])
+}
+
+#[test]
+fn join_center_sum() {
+    let out = run(&row_ops(), &[], 0, &[ramp(vec![1, 2, 3])]).unwrap();
+    assert_eq!(
+        out[0].floats().unwrap(),
+        [0., 1., 2., 0., 1., 2., 3., 4., 5., 3., 4., 5.]
+    );
+    assert_eq!(out[1].floats().unwrap(), [-1., 0., 1., -1., 0., 1.]);
+    assert_eq!(
+        out[2].floats().unwrap(),
+        [0., 1. / 3., 2. / 3., 0.25, 1. / 3., 5. / 12.]
+    );
+}

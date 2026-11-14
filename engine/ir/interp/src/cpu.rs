@@ -208,9 +208,14 @@ pub(crate) fn stage(
                 }
             }
         }
-        (Stage::Center | Stage::UnitSum, _) => {
-            return Err(Error::Unsupported(format!("{s:?}")));
-        }
+        (Stage::Center, _) => out.chunks_mut(width).for_each(|r| {
+            let mean = acc.sum(r.iter().copied()) / width as f32;
+            r.iter_mut().for_each(|v| *v -= mean);
+        }),
+        (Stage::UnitSum, _) => out.chunks_mut(width).for_each(|r| {
+            let sum = acc.sum(r.iter().copied());
+            r.iter_mut().for_each(|v| *v /= sum);
+        }),
         _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
     Ok(Tensor::f32(x.shape.clone(), out))

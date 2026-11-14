@@ -191,7 +191,7 @@ impl<'a> Tree<'a> {
                 _ => crate::form::of(n.ty.dtype),
             };
             // Kernels read whole blocks, so a row holds whole ones.
-            if !shape.last().is_some_and(|k| k.is_multiple_of(form.align())) {
+            if !shape.last().is_none_or(|k| k.is_multiple_of(form.align())) {
                 let what = format!("node {i} in {} needs rows of {}", form.name(), form.align());
                 return Err(Error::Unsupported(what));
             }

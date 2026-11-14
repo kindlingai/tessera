@@ -4,7 +4,7 @@ use crate::shared::{Stack, tokens};
 use trace::DimName::*;
 use trace::{
     Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
-    Tensor, Vector, Weights,
+    Scalar, Tensor, Weights,
 };
 
 pub struct Config {
@@ -169,9 +169,8 @@ pub struct Layer {
     pub ple_proj: Linear,
     #[shape(Hidden)]
     pub ple_norm: Norm,
-    /// The checkpoint's one scalar, repeated across the row.
-    #[shape(Hidden)]
-    pub scalar: Vector,
+    #[shape()]
+    pub scalar: Scalar,
 }
 
 #[derive(Weights)]
@@ -224,7 +223,7 @@ pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor
         x = x.add(&mlp);
         let gated = x.matmul(&layer.ple_gate).act(Act::GeluTanh).mul(&ple);
         let o = gated.matmul(&layer.ple_proj).rms_norm(&layer.ple_norm, eps);
-        x = x.add(&o).mul_vector(&layer.scalar);
+        x = x.add(&o).mul_scalar(&layer.scalar);
     }
     x
 }
@@ -338,10 +337,6 @@ pub fn weight(
             let rows = (c.per_layer * c.stack.hidden) as usize;
             let at = *i as usize * rows;
             Some(all[at..at + rows].to_vec())
-        }
-        [Field(_), Index(_), Field(f)] if f == "scalar" => {
-            let one = read(&tensor_name(c, path)?)?;
-            Some(vec![one[0]; c.stack.hidden as usize])
         }
         _ => read(&tensor_name(c, path)?),
     }
