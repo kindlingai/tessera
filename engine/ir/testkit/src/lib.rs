@@ -2,7 +2,6 @@
 
 mod compare;
 mod fill;
-pub mod gguf;
 mod noise;
 mod scratch;
 
