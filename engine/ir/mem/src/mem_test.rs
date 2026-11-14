@@ -50,3 +50,30 @@ fn copies_same_type() {
     assert_ne!(wide, src);
     assert!(format!("{wide:?}").contains("9.0"));
 }
+
+#[test]
+fn packed_views() {
+    for (form, size) in [("q8_0", 34), ("q4_0", 18)] {
+        let bytes = vec![19; size];
+        let mut tensor = Tensor::packed(vec![32], form, &bytes);
+        assert_eq!((tensor.len(), tensor.dtype()), (32, DType::F32));
+        assert!(tensor.filled());
+        assert_eq!(tensor.bytes(), bytes);
+        tensor.bytes_mut()[0] = 23;
+        let view = tensor.view();
+        assert_eq!(view.packed_form(), Some(form));
+        assert_eq!(view.raw_bytes().unwrap(), tensor.bytes());
+        assert!(view.as_f32().is_err() && view.to_f32().is_err());
+        assert!(view.bytes().is_err() && view.packed().is_err());
+        assert_eq!(view.reshape(vec![4, 8]).unwrap().packed_form(), Some(form));
+        assert!(view.reshape(vec![31]).is_err());
+        assert_eq!(view.to_tensor().unwrap(), tensor);
+        assert_eq!(tensor.clone(), tensor);
+        let reshaped = tensor.reshaped(vec![4, 8]);
+        assert_eq!(reshaped.bytes(), tensor.bytes());
+        assert_eq!(reshaped.view().packed_form(), Some(form));
+        assert!(format!("{tensor:?}").contains(form));
+        assert_ne!(tensor, Tensor::packed(vec![32], "other", tensor.bytes()));
+    }
+    assert!(Tensor::f32(vec![1], vec![0.]).view().raw_bytes().is_err());
+}

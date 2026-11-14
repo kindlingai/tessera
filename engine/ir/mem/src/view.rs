@@ -10,6 +10,7 @@ use std::borrow::Cow;
 /// A window `at` bytes into a buffer, with a layout.
 #[derive(Clone)]
 pub struct View<'a> {
+    pub(crate) form: Option<&'static str>,
     pub(crate) buffer: &'a Buffer,
     pub(crate) at: usize,
     pub(crate) dtype: DType,
@@ -45,6 +46,27 @@ fn typed_mut<T>(bytes: &mut [u8]) -> Result<&mut [T], Error> {
 }
 
 impl<'a> View<'a> {
+    pub fn packed_form(&self) -> Option<&'static str> {
+        self.form
+    }
+
+    pub fn raw_bytes(&self) -> Result<&'a [u8], Error> {
+        if self.form.is_none() || !self.layout.is_contiguous() || self.at != 0 {
+            return mismatch("raw bytes require a complete packed view");
+        }
+        match self.buffer.backing().mapped() {
+            Some(all) => Ok(&all[..self.buffer.bytes()]),
+            None => mismatch("packed bytes are not mapped"),
+        }
+    }
+
+    fn plain(&self) -> Result<(), Error> {
+        if self.form.is_some() {
+            return mismatch("packed weight bytes are not plain floats");
+        }
+        Ok(())
+    }
+
     pub fn dtype(&self) -> DType {
         self.dtype
     }
@@ -71,6 +93,7 @@ impl<'a> View<'a> {
 
     /// Bytes from `at` to the furthest element, as stored.
     pub fn bytes(&self) -> Result<Cow<'a, [u8]>, Error> {
+        self.plain()?;
         let span = self.dtype.bytes() * self.layout.span();
         if self.at + span > self.buffer.bytes() {
             return mismatch("a view past the end of its buffer");
@@ -120,6 +143,7 @@ impl<'a> View<'a> {
 
     /// The floats in place: mapped, contiguous and f32.
     pub fn as_f32(&self) -> Result<&'a [f32], Error> {
+        self.plain()?;
         self.expect(DType::F32)?;
         typed(self.mapped()?)
     }
@@ -136,6 +160,7 @@ impl<'a> View<'a> {
 
     /// The floats, wherever they lie. A bf16 widens.
     pub fn to_f32(&self) -> Result<Vec<f32>, Error> {
+        self.plain()?;
         let packed = self.packed()?;
         match self.dtype {
             DType::F32 => Ok(typed::<f32>(&packed)?.to_vec()),
@@ -164,6 +189,13 @@ impl<'a> View<'a> {
 
     /// A packed copy on the host.
     pub fn to_tensor(&self) -> Result<Tensor, Error> {
+        if let Some(form) = self.form {
+            return Ok(Tensor::packed(
+                self.layout.shape.clone(),
+                form,
+                self.raw_bytes()?,
+            ));
+        }
         let mut out = Tensor::zeros(self.layout.shape.clone(), self.dtype);
         if !self.layout.is_contiguous() {
             out.bytes_mut().copy_from_slice(&self.packed()?);
@@ -185,7 +217,9 @@ impl<'a> View<'a> {
     }
 
     pub fn permute(&self, order: &[usize]) -> View<'a> {
+        assert!(self.form.is_none(), "packed weights cannot change layout");
         View {
+            form: self.form,
             buffer: self.buffer,
             at: self.at,
             dtype: self.dtype,
@@ -194,8 +228,10 @@ impl<'a> View<'a> {
     }
 
     pub fn slice(&self, axis: usize, start: usize, len: usize) -> View<'a> {
+        assert!(self.form.is_none(), "packed weights cannot change layout");
         let (layout, skip) = self.layout.slice(axis, start, len);
         View {
+            form: self.form,
             buffer: self.buffer,
             at: self.at + skip * self.dtype.bytes(),
             dtype: self.dtype,
@@ -213,6 +249,7 @@ impl<'a> View<'a> {
             ));
         }
         Ok(View {
+            form: self.form,
             buffer: self.buffer,
             at: self.at,
             dtype: self.dtype,
@@ -224,6 +261,7 @@ impl<'a> View<'a> {
 impl ViewMut<'_> {
     pub fn view(&self) -> View<'_> {
         View {
+            form: None,
             buffer: self.buffer,
             at: self.at,
             dtype: self.dtype,

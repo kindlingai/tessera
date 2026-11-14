@@ -142,8 +142,10 @@ name = "bundle"
 version = "0.1.0"
 dependencies = [
  "checkpoint",
+ "engine",
  "graph",
  "interp",
+ "lower",
  "minijinja",
  "minijinja-contrib",
  "models",

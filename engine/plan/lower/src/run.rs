@@ -159,6 +159,20 @@ pub trait Run {
 
     /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
+        if let Some(name) = src.packed_form() {
+            let raw = src.raw_bytes()?;
+            let from = crate::form::named(name)
+                .ok_or_else(|| Error::Unsupported(format!("form {name}")))?;
+            if raw.len() != from.bytes(slot.len) {
+                return Err(Error::Size(format!("packed {name}")));
+            }
+            if name == slot.form.name() {
+                return self.held_mut().upload(slot, raw);
+            }
+            let floats = (0..slot.len).map(|i| from.unpack(raw, i)).collect();
+            let wide = Tensor::f32(vec![slot.len], floats);
+            return self.write(slot, wide.view());
+        }
         let plain = slot.form.block() == 1 && src.dtype() == slot.form.dtype();
         if plain {
             return Ok(copy(src, &mut self.held_mut().view_mut(slot))?);

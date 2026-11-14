@@ -11,6 +11,7 @@ use std::fmt;
 pub struct Tensor {
     pub shape: Vec<usize>,
     dtype: DType,
+    form: Option<&'static str>,
     /// Elements held, whether or not the shape agrees.
     count: usize,
     layout: Layout,
@@ -36,10 +37,25 @@ impl Tensor {
         Self {
             shape,
             dtype,
+            form: None,
             count: bytes / dtype.bytes(),
             layout,
             buffer: Buffer::host(0, bytes),
         }
+    }
+
+    /// Pre-packed bytes of registered form `form`, filling `shape`.
+    pub fn packed(shape: Vec<usize>, form: &'static str, bytes: &[u8]) -> Self {
+        let mut out = Self {
+            count: shape.iter().product(),
+            layout: Layout::contiguous(shape.clone()),
+            shape,
+            dtype: DType::F32,
+            form: Some(form),
+            buffer: Buffer::host(0, bytes.len()),
+        };
+        out.bytes_mut().copy_from_slice(bytes);
+        out
     }
 
     pub fn f32(shape: Vec<usize>, v: Vec<f32>) -> Self {
@@ -78,6 +94,7 @@ impl Tensor {
 
     pub fn view(&self) -> View<'_> {
         View {
+            form: self.form,
             buffer: &self.buffer,
             at: 0,
             dtype: self.dtype,
@@ -86,6 +103,10 @@ impl Tensor {
     }
 
     pub fn view_mut(&mut self) -> ViewMut<'_> {
+        assert!(
+            self.form.is_none(),
+            "packed weights have no typed mutable view"
+        );
         ViewMut {
             buffer: &mut self.buffer,
             at: 0,
@@ -95,12 +116,16 @@ impl Tensor {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        let span = self.dtype.bytes() * self.count;
+        let span = self
+            .form
+            .map_or(self.dtype.bytes() * self.count, |_| self.buffer.bytes());
         &self.buffer.backing().mapped().expect("host memory")[..span]
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        let span = self.dtype.bytes() * self.count;
+        let span = self
+            .form
+            .map_or(self.dtype.bytes() * self.count, |_| self.buffer.bytes());
         &mut self.buffer.backing_mut().mapped_mut().expect("host memory")[..span]
     }
 
@@ -122,11 +147,16 @@ impl Tensor {
 
     /// The same bytes under another shape.
     pub fn reshaped(&self, shape: Vec<usize>) -> Self {
+        if let Some(form) = self.form {
+            assert_eq!(shape.iter().product::<usize>(), self.count);
+            return Self::packed(shape, form, self.bytes());
+        }
         Self::from_bytes(shape, self.dtype, self.bytes())
     }
 
     /// Elements by index, keeping the element type.
     pub fn pick(&self, shape: Vec<usize>, at: impl Iterator<Item = usize>) -> Self {
+        assert!(self.form.is_none(), "packed weights cannot select elements");
         let (all, size) = (self.bytes(), self.dtype.bytes());
         let mut out = Vec::with_capacity(size * shape.iter().product::<usize>());
         for i in at {
@@ -164,18 +194,29 @@ impl Tensor {
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        Self::from_bytes(self.shape.clone(), self.dtype, self.bytes())
+        self.reshaped(self.shape.clone())
     }
 }
 
 impl PartialEq for Tensor {
     fn eq(&self, other: &Self) -> bool {
-        self.shape == other.shape && self.dtype == other.dtype && self.bytes() == other.bytes()
+        self.shape == other.shape
+            && self.dtype == other.dtype
+            && self.form == other.form
+            && self.bytes() == other.bytes()
     }
 }
 
 impl fmt::Debug for Tensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(form) = self.form {
+            return write!(
+                f,
+                "Tensor {form} {:?} {} bytes",
+                self.shape,
+                self.bytes().len()
+            );
+        }
         write!(f, "Tensor {:?} {:?} ", self.dtype, self.shape)?;
         match self.dtype {
             DType::F32 => write!(f, "{:?}", self.floats().unwrap_or(&[])),
