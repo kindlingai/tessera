@@ -1,5 +1,20 @@
 use crate::{Chip, Const, Limit, Load, Ops, Pool, Tag, gb10, known, m3_pro, strix_halo};
 
+/// One-instruction e4m3 costs a chip fewer ops.
+#[test]
+fn priced_per_chip() {
+    let trip = Ops {
+        f16: 1.0,
+        e4m3: 1.0,
+        e2m1: 1.0,
+        ..Ops::default()
+    };
+    let (native, plain) = (trip.priced(true), trip.priced(false));
+    assert_eq!((native.f16, native.e4m3, native.e2m1), (0.0, 0.0, 0.0));
+    assert!(native.int < plain.int && native.float < plain.float);
+    assert_eq!((plain.int, plain.float), (13.0, 5.0));
+}
+
 /// A stream of `bytes`, one float per thread per trip.
 fn stream(bytes: f64, threads: usize) -> Load {
     let trip = Ops {

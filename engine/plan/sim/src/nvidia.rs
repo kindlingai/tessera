@@ -57,6 +57,8 @@ pub struct Sm {
     pub fp16: Const,
     /// Peak 8-bit block-scaled tensor-core rate.
     pub fp8: Const,
+    /// One, where one instruction widens an e4m3.
+    pub cvt8: Const,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +109,7 @@ pub fn gb10() -> Nvidia {
         fp32: i(25.8e12, "128 lanes x 48 SMs x 2.1 GHz x 2"),
         fp16: m(99.7e12, "m16n8k16 loop, 16 accumulators, at 2.1 GHz"),
         fp8: m(203.6e12, "m16n8k32 block-scaled 8-bit loop at 2.1 GHz"),
+        cvt8: a(1.0, "sm_89 on: cvt.rn.f16x2.e4m3x2"),
     };
     Nvidia {
         name: "cuda NVIDIA GB10".into(),
@@ -133,7 +136,7 @@ impl Chip for Nvidia {
         let resident = fit.min(per_sm);
         let busy = s.sms.value.min(grid);
         let per_scheduler = resident * warps / s.schedulers.value;
-        let t = &l.trip;
+        let t = &l.trip.priced(s.cvt8.value > 0.0);
         let pipes = [
             (t.float + 1.0, s.float.value),
             (t.int, s.int.value),
@@ -194,7 +197,8 @@ impl Chip for Nvidia {
         };
         let moved: f64 = l.reads.iter().map(rate).sum::<f64>() + l.written / s.write.value;
         // A multiply-add counts as two flops.
-        s.floor.value + (2.0 * l.floats() / s.fp32.value).max(moved)
+        let floats = l.threads as f64 * l.trips * l.trip.priced(s.cvt8.value > 0.0).float;
+        s.floor.value + (2.0 * floats / s.fp32.value).max(moved)
     }
 
     fn constants(&self) -> Vec<(&'static str, Const)> {
@@ -229,6 +233,7 @@ impl Chip for Nvidia {
             ("fp32", s.fp32),
             ("fp16", s.fp16),
             ("fp8", s.fp8),
+            ("cvt8", s.cvt8),
         ]
     }
 }
