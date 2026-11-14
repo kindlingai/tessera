@@ -91,7 +91,7 @@ fn store_keeps_rows() {
     close(&step(s, &[(1, 1, 20.)]), &[15.]);
     // A position past the context bound is refused.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(0, 4, 1.)])).is_err());
-    assert_eq!(s.rows(0), 3);
+    assert_eq!(s.len(0), 3);
     // A slot past `Seqs` is refused. The store keeps rows.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(2, 0, 1.)])).is_err());
     // A row past its slot's last written position is refused.

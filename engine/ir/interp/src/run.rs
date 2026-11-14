@@ -91,8 +91,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// How many rows each sequence has kept so far.
-    pub fn rows(&self, i: usize) -> usize {
+    /// Positions kept tensor `i` holds, up to the furthest written.
+    pub fn len(&self, i: usize) -> usize {
         let kept = self.kept.get(i).and_then(Option::as_ref);
         kept.map_or(0, |t| t.shape[1])
     }

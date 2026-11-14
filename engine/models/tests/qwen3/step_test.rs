@@ -83,7 +83,7 @@ fn steps_match_forward() {
             got[(s * LEN + p) * vocab..][..vocab].copy_from_slice(row);
         }
     }
-    assert_eq!(store.rows(0), LEN);
+    assert_eq!(store.len(0), LEN);
     let off = max_abs_diff(&got, want);
     assert!(off < 1e-5, "steps drift from the forward pass by {off:e}");
 }
