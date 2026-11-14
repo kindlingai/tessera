@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 struct Fixture {
     meta: Vec<(String, Value)>,
-    tensors: Vec<(String, u32, usize, Vec<u8>)>,
+    /// Name, GGUF type, dims fastest first, and bytes.
+    tensors: Vec<(String, u32, Vec<u64>, Vec<u8>)>,
 }
 
 fn text(bytes: &mut Vec<u8>, s: &str) {
@@ -71,12 +72,9 @@ impl Fixture {
             .iter()
             .enumerate()
             .map(|(index, w)| {
-                let n =
-                    w.ty.shape
-                        .0
-                        .iter()
-                        .map(|e| e.poly(&g.dims).unwrap().as_const().unwrap() as usize)
-                        .product();
+                let axis = |e: &graph::DimExpr| e.poly(&g.dims).unwrap().as_const().unwrap();
+                let dims: Vec<u64> = w.ty.shape.0.iter().rev().map(axis).collect();
+                let n = dims.iter().product::<u64>() as usize;
                 let name = tensor_name(&w.path).unwrap();
                 let norm = name.contains("norm");
                 let values: Vec<f32> = (0..n)
@@ -93,7 +91,7 @@ impl Fixture {
                 } else {
                     (if form.name() == "q8_0" { 8 } else { 2 }, form)
                 };
-                (name, ty, n, f.pack(&values))
+                (name, ty, dims, f.pack(&values))
             })
             .collect();
         Self { meta, tensors }
@@ -116,10 +114,10 @@ impl Fixture {
             value(&mut bytes, v);
         }
         let mut data = Vec::new();
-        for (name, ty, elements, raw) in &self.tensors {
+        for (name, ty, dims, raw) in &self.tensors {
             text(&mut bytes, name);
-            bytes.extend(1u32.to_le_bytes());
-            bytes.extend((*elements as u64).to_le_bytes());
+            bytes.extend((dims.len() as u32).to_le_bytes());
+            dims.iter().for_each(|d| bytes.extend(d.to_le_bytes()));
             bytes.extend(ty.to_le_bytes());
             bytes.extend((data.len() as u64).to_le_bytes());
             data.extend(raw);

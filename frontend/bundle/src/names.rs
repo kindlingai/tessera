@@ -15,6 +15,8 @@ pub struct Unresolved {
     pub missing: Vec<String>,
     /// Weights several slices fit, with the slices.
     pub ambiguous: Vec<(String, Vec<String>)>,
+    /// Weights a rule sent to a slice of another shape.
+    pub misfit: Vec<(String, String)>,
 }
 
 impl fmt::Display for Unresolved {
@@ -24,6 +26,9 @@ impl fmt::Display for Unresolved {
         }
         for (path, slices) in &self.ambiguous {
             writeln!(f, "{path}: fits {}", slices.join(", "))?;
+        }
+        for (path, slice) in &self.misfit {
+            writeln!(f, "{path}: {slice} has another shape")?;
         }
         Ok(())
     }
@@ -124,6 +129,17 @@ fn parts(path: &[PathSeg]) -> (Option<usize>, &str) {
     (index, field.unwrap_or(""))
 }
 
+/// The weight's shape, where every axis is a constant.
+fn wanted(g: &Graph, shape: &graph::Shape) -> Option<Vec<usize>> {
+    let axis = |e: &graph::DimExpr| e.value(&g.dims, &|_| None).map(|n| n as usize);
+    shape.0.iter().map(axis).collect()
+}
+
+/// Whether `slice` has the shape, any when unknown.
+fn shaped(want: Option<&Vec<usize>>, slice: &Slice) -> bool {
+    want.is_none_or(|w| *w == slice.shape)
+}
+
 /// Whether `pattern` names `path`, `*` taking the index.
 fn fits(pattern: &str, path: &str, index: Option<usize>) -> bool {
     match index {
@@ -140,6 +156,7 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Str
     let mut failed = Unresolved::default();
     for w in &g.weights {
         let (path, (index, field)) = (text(&w.path), parts(&w.path));
+        let want = wanted(g, &w.ty.shape);
         // The last rule naming the path decides.
         let ruled = (rules.iter().flat_map(|r| r.iter()))
             .rev()
@@ -149,21 +166,19 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Str
                 Some(i) => slice.replace('*', &i.to_string()),
                 None => slice.clone(),
             };
-            match slices.iter().any(|s| s.name == name) {
-                true => out.push(name),
-                false => failed.missing.push(path),
+            match slices.iter().find(|s| s.name == name) {
+                Some(s) if shaped(want.as_ref(), s) => out.push(name),
+                Some(_) => failed.misfit.push((path, name)),
+                None => failed.missing.push(path),
             }
             continue;
         }
-        let elements = (w.ty.shape.elements(&g.dims).ok())
-            .and_then(|n| n.as_const())
-            .map(|n| n as usize);
         let own = [field];
         let fallback = [own.as_slice()];
         let spellings = roles.get(field).copied().unwrap_or(&fallback);
         let found: Vec<&str> = (slices.iter().zip(&parsed))
             .filter(|(_, (at, w))| *at == index && spellings.contains(&w.as_slice()))
-            .filter(|(s, _)| elements.is_none_or(|n| n == s.elements()))
+            .filter(|(s, _)| shaped(want.as_ref(), s))
             .map(|(s, _)| s.name.as_str())
             .collect();
         match found.as_slice() {
