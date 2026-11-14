@@ -4,6 +4,7 @@
 use kernels as _;
 use linear as _;
 
+use calibrate::measure;
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
@@ -123,27 +124,33 @@ fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
 
 /// Every case through the forward entry on this machine's GPU.
 fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
-    let device = Device::guess(settings);
+    let mut device = Device::guess(settings);
     let mut runner: Option<Box<dyn Run>> = None;
+    let mut learned = 0;
     for c in cases {
         let sizes = [(Seqs, 1), (Context, c.tokens.len() as u64)];
-        let plan = lower(g, 0, &sizes, &device).unwrap();
-        eprintln!("  {} launches: {:?}", plan.steps.len(), kernels(&plan));
+        let feeds = inputs(&c.tokens);
+        let views = [feeds[0].view(), feeds[1].view()];
         let r = match runner.as_mut() {
-            Some(r) => {
-                r.replan(&plan).unwrap();
-                r
-            }
+            Some(r) => r,
             None => {
+                let plan = lower(g, 0, &sizes, &device).unwrap();
                 let mut r = open(plan, settings).unwrap();
                 for (at, t) in w.iter().enumerate() {
                     r.load(at as u32, t.view()).unwrap();
                 }
+                device = Device::stored(&*r, settings).unwrap();
                 runner.insert(r)
             }
         };
-        let feeds = inputs(&c.tokens);
-        r.feed(&[feeds[0].view(), feeds[1].view()]).unwrap();
+        // Launches with no stored sample are timed under each rule.
+        learned += measure(&mut **r, (g, 0), &sizes, &views, &mut device, settings)
+            .unwrap()
+            .len();
+        let plan = lower(g, 0, &sizes, &device).unwrap();
+        eprintln!("  {} launches: {:?}", plan.steps.len(), kernels(&plan));
+        r.replan(&plan).unwrap();
+        r.feed(&views).unwrap();
         let (slot, steps) = (r.plan().outputs[0].slot, r.plan().steps.len());
         let start = Instant::now();
         r.submit(0..steps).unwrap();
@@ -173,6 +180,13 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
         eprintln!("    {}", parts.join(", "));
         let got = unit(&mean_rows(&out, c.tokens.len()));
         close(&format!("{} on the device", c.name), &got, &c.embedding);
+    }
+    if let Some(path) = Device::path(settings, &device.name) {
+        device.save(&path).unwrap();
+        eprintln!(
+            "  timed {learned} launches; samples stored in {}",
+            path.display()
+        );
     }
 }
 
