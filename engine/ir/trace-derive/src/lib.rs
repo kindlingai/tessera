@@ -1,11 +1,12 @@
 //! `#[derive(Weights)]`: one weight declaration per struct field.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use proc_macro2::Span;
+use quote::{ToTokens, quote};
 use syn::punctuated::Punctuated;
-use syn::{Data, DeriveInput, Expr, Fields, Token, parse_macro_input};
+use syn::{Data, DeriveInput, Expr, Fields, Ident, Token, parse_macro_input};
 
-/// Fields take `#[shape(..)]` in `DimName` expressions.
+/// `#[shape(..)]` in `DimName` terms, or `S0`.. from the parent.
 #[proc_macro_derive(Weights, attributes(shape))]
 pub fn derive_weights(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -32,11 +33,16 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             dims.extend(list);
         }
         let key = name.to_string();
+        let passed = passed(&dims);
+        let binds = passed.iter().map(|(ident, i)| {
+            quote! { let #ident: ::trace::DimExpr = given[#i].clone(); }
+        });
         inits.push(quote! {
             #name: {
                 path.push(::trace::PathSeg::Field(#key.into()));
                 let shape = {
                     use ::trace::DimName::*;
+                    #(#binds)*
                     [#(::trace::DimExpr::from(#dims)),*]
                 };
                 let value = <#ty as ::trace::Weights>::declare(m, path, &shape);
@@ -50,13 +56,29 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     Ok(quote! {
         impl #impl_generics ::trace::Weights for #ident #ty_generics #where_clause {
             #[allow(unused_imports)]
+            #[allow(unused_variables, non_snake_case)]
             fn declare(
                 m: &::trace::Model,
                 path: &mut Vec<::trace::PathSeg>,
-                _shape: &[::trace::DimExpr],
+                given: &[::trace::DimExpr],
             ) -> Self {
                 Self { #(#inits),* }
             }
         }
     })
+}
+
+/// Indices of the `S<i>` names in the shape expressions.
+fn passed(dims: &[Expr]) -> Vec<(Ident, usize)> {
+    let mut found: Vec<(Ident, usize)> = Vec::new();
+    for word in dims.iter().flat_map(|d| d.to_token_stream().into_iter()) {
+        let text = word.to_string();
+        let Some(i) = text.strip_prefix('S').and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        if !found.iter().any(|(_, at)| *at == i) {
+            found.push((Ident::new(&text, Span::call_site()), i));
+        }
+    }
+    found
 }

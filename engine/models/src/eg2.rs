@@ -4,7 +4,7 @@ use crate::shared::{Stack, tokens};
 use trace::DimName::*;
 use trace::{
     Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
-    Scalar, Tensor, Weights,
+    Scalar, Tensor, Weights, each,
 };
 
 pub struct Config {
@@ -58,90 +58,44 @@ impl Config {
         (l + 1).is_multiple_of(self.full_every)
     }
 
-    fn full_layers(&self) -> u64 {
-        (0..self.stack.layers).filter(|&l| self.full(l)).count() as u64
+    /// Layer `l`'s head width and key head count.
+    pub fn heads(&self, l: u64) -> [DimExpr; 2] {
+        match self.full(l) {
+            true => [FullHeadDim.into(), 1u64.into()],
+            false => [HeadDim.into(), KvHeads.into()],
+        }
     }
 
     pub fn dims(&self) -> Vec<Dim> {
-        let full = self.full_layers();
         self.stack.dims(&[
             (KvHeads, self.kv_heads),
             (FullHeadDim, self.full_head_dim),
             (PerLayer, self.per_layer),
             (Embedding, self.embedding),
-            (SlidingLayers, self.stack.layers - full),
-            (FullLayers, full),
         ])
     }
-
-    /// The layer the n-th sliding or full attention serves.
-    pub fn layer_of(&self, full: bool, n: u64) -> u64 {
-        let kind = |l: &u64| self.full(*l) == full;
-        (0..self.stack.layers).filter(kind).nth(n as usize).unwrap()
-    }
 }
 
-/// An attention's weights, as the layer kinds share them.
-struct Parts<'a> {
-    ln: &'a Norm,
-    q: &'a Linear,
-    k: &'a Linear,
-    v: &'a Linear,
-    q_norm: &'a Norm,
-    k_norm: &'a Norm,
-    o: &'a Linear,
-    post: &'a Norm,
-    head: DimExpr,
-    kv_heads: DimExpr,
-    theta: f32,
-    mask: Mask,
+/// One layer's attention: `S0` head width, `S1` key heads.
+#[derive(Weights)]
+pub struct Attention {
+    #[shape(Hidden)]
+    pub ln: Norm,
+    #[shape(Hidden, Heads * S0)]
+    pub q: Linear,
+    #[shape(Hidden, S1 * S0)]
+    pub k: Linear,
+    #[shape(Hidden, S1 * S0)]
+    pub v: Linear,
+    #[shape(S0)]
+    pub q_norm: Norm,
+    #[shape(S0)]
+    pub k_norm: Norm,
+    #[shape(Heads * S0, Hidden)]
+    pub o: Linear,
+    #[shape(Hidden)]
+    pub post: Norm,
 }
-
-macro_rules! attention {
-    ($name:ident, $head:ident, $kv:expr) => {
-        #[derive(Weights)]
-        pub struct $name {
-            #[shape(Hidden)]
-            pub ln: Norm,
-            #[shape(Hidden, Heads * $head)]
-            pub q: Linear,
-            #[shape(Hidden, $kv)]
-            pub k: Linear,
-            #[shape(Hidden, $kv)]
-            pub v: Linear,
-            #[shape($head)]
-            pub q_norm: Norm,
-            #[shape($head)]
-            pub k_norm: Norm,
-            #[shape(Heads * $head, Hidden)]
-            pub o: Linear,
-            #[shape(Hidden)]
-            pub post: Norm,
-        }
-
-        impl $name {
-            fn parts(&self, kv_heads: DimExpr, theta: f32, mask: Mask) -> Parts<'_> {
-                Parts {
-                    ln: &self.ln,
-                    q: &self.q,
-                    k: &self.k,
-                    v: &self.v,
-                    q_norm: &self.q_norm,
-                    k_norm: &self.k_norm,
-                    o: &self.o,
-                    post: &self.post,
-                    head: $head.into(),
-                    kv_heads,
-                    theta,
-                    mask,
-                }
-            }
-        }
-    };
-}
-
-attention!(Sliding, HeadDim, KvHeads * HeadDim);
-attention!(Full, FullHeadDim, FullHeadDim);
 
 #[derive(Weights)]
 pub struct Layer {
@@ -168,14 +122,11 @@ pub struct Layer {
     pub scalar: Scalar,
 }
 
+/// The weights outside attention.
 #[derive(Weights)]
 pub struct Eg2 {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
-    #[shape(SlidingLayers)]
-    pub sliding: Vec<Sliding>,
-    #[shape(FullLayers)]
-    pub full: Vec<Full>,
     #[shape(Layers)]
     pub layers: Vec<Layer>,
     #[shape(PerLayer)]
@@ -186,29 +137,26 @@ pub struct Eg2 {
     pub proj: Linear,
 }
 
+/// Each layer's attention, shaped for its kind.
+pub fn attention(m: &Model, c: &Config) -> Vec<Attention> {
+    each(m, "attention", Layers, |l| c.heads(u64::from(l)).to_vec())
+}
+
 /// The residual stream after every layer, `[Seqs, Context, Hidden]`.
-pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor) -> Tensor {
+pub fn trunk(
+    m: &Model,
+    c: &Config,
+    w: &Eg2,
+    attention: &[Attention],
+    [tokens, positions]: [&Tensor; 2],
+) -> Tensor {
     let (eps, hidden) = (c.eps, c.stack.hidden as f32);
     let inputs = m.embed(tokens, &w.embed).scale(hidden.sqrt());
     let mut x = inputs.clone();
-    let (mut sliding, mut full) = (w.sliding.iter(), w.full.iter());
     for (l, layer) in w.layers.iter().enumerate() {
         let ple = inputs.matmul(&layer.ple_in).scale(hidden.powf(-0.5));
         let ple = ple.rms_norm(&w.ple_norm, eps);
-        let parts = match c.full(l as u64) {
-            true => full
-                .next()
-                .unwrap()
-                .parts(1u64.into(), c.full_theta, Mask::Bidirectional),
-            false => {
-                let kv = KvHeads.into();
-                sliding
-                    .next()
-                    .unwrap()
-                    .parts(kv, c.theta, Mask::Within(c.window))
-            }
-        };
-        let attend = || [attention(m, c, &parts, &x, positions)];
+        let attend = || [attend(m, c, l as u64, &attention[l], &x, positions)];
         let [attn] = m.composite(Composite::Attention, attend);
         x = x.add(&attn);
         let h = x.rms_norm(&layer.pre_ff, eps);
@@ -224,8 +172,14 @@ pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor
 }
 
 /// One embedding per text, `[Seqs, Embedding]`. Callers normalize.
-pub fn forward(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor) -> Tensor {
-    let x = trunk(m, c, w, tokens, positions);
+pub fn forward(
+    m: &Model,
+    c: &Config,
+    w: &Eg2,
+    attention: &[Attention],
+    ports: [&Tensor; 2],
+) -> Tensor {
+    let x = trunk(m, c, w, attention, ports);
     x.rms_norm(&w.norm, c.eps).matmul(&w.proj).mean(1)
 }
 
@@ -235,30 +189,36 @@ fn geglu(h: &Tensor, l: &Layer) -> Tensor {
 }
 
 /// Queries, keys and values are normed per head, scores unscaled.
-fn attention(m: &Model, c: &Config, p: &Parts, x: &Tensor, positions: &Tensor) -> Tensor {
-    let h = x.rms_norm(p.ln, c.eps);
+fn attend(m: &Model, c: &Config, l: u64, a: &Attention, x: &Tensor, positions: &Tensor) -> Tensor {
+    let [head, kv_heads] = c.heads(l);
+    let (theta, mask) = match c.full(l) {
+        true => (c.full_theta, Mask::Bidirectional),
+        false => (c.theta, Mask::Within(c.window)),
+    };
+    let h = x.rms_norm(&a.ln, c.eps);
     let split = |w: &Linear, heads: DimExpr| {
-        let shaped = vec![Seqs.into(), Context.into(), heads, p.head.clone()];
+        let shaped = vec![Seqs.into(), Context.into(), heads, head.clone()];
         h.matmul(w).reshape(shaped)
     };
     let turn = |t: Tensor, norm: &Norm| {
         let normed = t.rms_norm(norm, c.eps);
-        normed.rope(positions, p.theta, Pairs::Halves)
+        normed.rope(positions, theta, Pairs::Halves)
     };
-    let q = turn(split(p.q, Heads.into()), p.q_norm);
-    let k = turn(split(p.k, p.kv_heads.clone()), p.k_norm);
-    let v = split(p.v, p.kv_heads.clone()).rms(c.eps);
-    let out = m.attend(p.mask, 1.0, [&q, &k, &v], None);
-    let flat = vec![Seqs.into(), Context.into(), Heads * p.head.clone()];
-    out.reshape(flat).matmul(p.o).rms_norm(p.post, c.eps)
+    let q = turn(split(&a.q, Heads.into()), &a.q_norm);
+    let k = turn(split(&a.k, kv_heads.clone()), &a.k_norm);
+    let v = split(&a.v, kv_heads).rms(c.eps);
+    let out = m.attend(mask, 1.0, [&q, &k, &v], None);
+    let flat = vec![Seqs.into(), Context.into(), Heads * head];
+    out.reshape(flat).matmul(&a.o).rms_norm(&a.post, c.eps)
 }
 
 /// One forward entry: tokens and positions in, embeddings out.
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w: Eg2 = trace::declare(&m);
+    let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
-    let out = forward(&m, c, &w, &tokens, &positions);
+    let out = forward(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
 }
 
@@ -266,13 +226,14 @@ pub fn program(c: &Config) -> Graph {
 pub fn probe(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w: Eg2 = trace::declare(&m);
+    let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
-    let out = trunk(&m, c, &w, &tokens, &positions);
+    let out = trunk(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
 }
 
 /// The released checkpoint's tensor name for a weight path.
-pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
+pub fn tensor_name(path: &[PathSeg]) -> Option<String> {
     use PathSeg::{Field, Index};
     let name = match path {
         [Field(f)] => match f.as_str() {
@@ -282,7 +243,7 @@ pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
             "ple_norm" => "ple.per_layer_projection_norm.weight".into(),
             _ => return None,
         },
-        [Field(kind), Index(n), Field(f)] if kind == "sliding" || kind == "full" => {
+        [Field(kind), Index(l), Field(f)] if kind == "attention" => {
             let part = match f.as_str() {
                 "ln" => "input_layernorm",
                 "post" => "post_attention_layernorm",
@@ -290,7 +251,6 @@ pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
                 "q" | "k" | "v" | "o" => &format!("self_attn.{f}_proj"),
                 _ => return None,
             };
-            let l = c.layer_of(kind == "full", u64::from(*n));
             format!("layers.{l}.{part}.weight")
         }
         [Field(layers), Index(i), Field(f)] if layers == "layers" => {
@@ -325,6 +285,6 @@ pub fn weight(
             let at = *i as usize * rows;
             Some(all[at..at + rows].to_vec())
         }
-        _ => read(&tensor_name(c, path)?),
+        _ => read(&tensor_name(path)?),
     }
 }
