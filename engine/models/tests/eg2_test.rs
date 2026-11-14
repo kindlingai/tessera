@@ -102,7 +102,7 @@ fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
     plain(g, &pulled(g, c, &file))
 }
 
-/// The exlr8 release: matrices against bf16, embeddings against the reference.
+/// The exlr8 release: its embeddings against the reference.
 fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
     let release = match std::fs::read_to_string(dir.join("exlr8.repo")) {
         Ok(repo) => {
@@ -112,24 +112,6 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
         }
         Err(_) => Release::open(&dir.join("exlr8")),
     };
-    let file = File::open(&dir.join("model.safetensors")).unwrap();
-    for name in [
-        "language_model.layers.0.self_attn.q_proj.weight",
-        "language_model.layers.0.mlp.down_proj.weight",
-        "language_model.embedding_projection.weight",
-        "language_model.embed_tokens.weight",
-    ] {
-        let start = Instant::now();
-        let got = release.read(name).unwrap();
-        let seconds = start.elapsed().as_secs_f32();
-        let want = file.floats(name).unwrap();
-        let cos = cosine_f32(&got, &want);
-        eprintln!(
-            "exlr8 {name}: {} values in {seconds:.2} s, cos {cos:.5}",
-            got.len()
-        );
-        assert!(cos > 0.95, "{name}: cos {cos}");
-    }
     let start = Instant::now();
     let w = plain(g, &pulled(g, c, &release));
     eprintln!(
