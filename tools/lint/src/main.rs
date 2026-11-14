@@ -1,5 +1,6 @@
 //! The repository's code-shape rules. AGENTS.md lists them.
 
+mod audit;
 mod comments;
 mod files;
 mod kernel;
@@ -47,6 +48,8 @@ pub struct Limits {
     pub shape_steps: Vec<(usize, usize)>,
     pub extensions: Vec<String>,
     pub hash_comment_files: Vec<String>,
+    pub layers: Vec<Vec<String>>,
+    pub layer_allow: Vec<audit::Allow>,
 }
 
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
@@ -104,6 +107,10 @@ fn main() -> ExitCode {
         }
     }
     if let Err(e) = readme::check(&root, &dirs, &mut found) {
+        eprintln!("tessera-lint: {e}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = audit::check(&root, &mut found) {
         eprintln!("tessera-lint: {e}");
         return ExitCode::from(2);
     }
