@@ -92,13 +92,13 @@ fn inputs(tokens: &[u32]) -> [Tensor; 2] {
     [ids(tokens.to_vec()), ids(positions)]
 }
 
-/// The output's mean over the tokens, on the interpreter.
-fn pooled(g: &Graph, w: &[Tensor], tokens: &[u32]) -> Vec<f32> {
+/// The output's mean over its `rows`, on the interpreter.
+fn pooled(g: &Graph, w: &[Tensor], tokens: &[u32], rows: usize) -> Vec<f32> {
     let start = Instant::now();
     let out = run(g, w, 0, &inputs(tokens)).unwrap();
     let seconds = start.elapsed().as_secs_f32();
     eprintln!("  interpreter, {} tokens: {seconds:.2} s", tokens.len());
-    mean_rows(out[0].floats().unwrap(), tokens.len())
+    mean_rows(out[0].floats().unwrap(), rows)
 }
 
 /// The mean of `rows` rows.
@@ -178,7 +178,7 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
             .map(|(k, s)| format!("{k} {:.1} ms", s * 1e3))
             .collect();
         eprintln!("    {}", parts.join(", "));
-        let got = unit(&mean_rows(&out, c.tokens.len()));
+        let got = unit(&out);
         close(&format!("{} on the device", c.name), &got, &c.embedding);
     }
     if let Some(path) = Device::path(settings, &device.name) {
@@ -208,7 +208,7 @@ fn check_layers(dir: &Path, c: &Case) {
         let cfg = config(layers);
         let g = graph(probe(&cfg));
         let w = weights(&g, &cfg, dir);
-        let got = pooled(&g, &w, &c.tokens);
+        let got = pooled(&g, &w, &c.tokens, c.tokens.len());
         let hidden = got.len();
         let at = (layers as usize - 1) * hidden;
         let want = &c.layer_means[at..at + hidden];
@@ -229,7 +229,7 @@ fn matches_reference() {
     let g = graph(program(&cfg));
     let w = weights(&g, &cfg, &dir);
     for c in &cases {
-        let got = unit(&pooled(&g, &w, &c.tokens));
+        let got = unit(&pooled(&g, &w, &c.tokens, 1));
         close(&c.name, &got, &c.embedding);
     }
     let settings = settings::read();

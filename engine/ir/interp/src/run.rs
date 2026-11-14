@@ -287,6 +287,7 @@ impl Context<'_> {
             Op::View(View::Concat) => concat(args[0], args[1]),
             Op::View(v) => self.view(v, args[0]),
             Op::Cast(dtype) => Ok(args[0].cast(*dtype)?),
+            Op::Mean(axis) => cpu::mean(num, args[0], *axis as usize),
         }
     }
 

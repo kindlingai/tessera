@@ -226,6 +226,25 @@ pub(crate) fn stage(
     Ok(Tensor::f32(x.shape.clone(), out))
 }
 
+/// The mean over `axis`, in fixed order.
+pub(crate) fn mean(n: &Numerics, x: &Tensor, axis: usize) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let count = x.shape[axis];
+    let inner: usize = x.shape[axis + 1..].iter().product();
+    let outer: usize = x.shape[..axis].iter().product();
+    let xs = x.floats()?;
+    let mut out = Vec::with_capacity(outer * inner);
+    for o in 0..outer {
+        for i in 0..inner {
+            let along = (0..count).map(|t| xs[(o * count + t) * inner + i]);
+            out.push(acc.sum(along) / count as f32);
+        }
+    }
+    let mut shape = x.shape.clone();
+    shape.remove(axis);
+    Ok(Tensor::f32(shape, out))
+}
+
 /// One over the row's root mean square.
 fn rms_inverse(acc: Acc, row: &[f32], eps: f32) -> f32 {
     let mean = acc.sum(row.iter().map(|v| v * v)) / row.len() as f32;

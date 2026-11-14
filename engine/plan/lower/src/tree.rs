@@ -28,6 +28,8 @@ pub enum Term {
     Append(u32),
     /// Its argument under another shape.
     View,
+    /// The mean over this axis.
+    Mean(u32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -218,6 +220,7 @@ impl<'a> Tree<'a> {
                 Op::Select(Select::Gather) => push(Term::Gather, args),
                 Op::Select(Select::TopK { .. }) => push(Term::Top, args),
                 Op::Append(kept) => push(Term::Append(*kept), args),
+                Op::Mean(axis) => push(Term::Mean(*axis), args),
                 Op::Row(r) => {
                     let (mut cur, mut rest) = (args[0], args[1..].iter());
                     // One rank holds the whole sum already.

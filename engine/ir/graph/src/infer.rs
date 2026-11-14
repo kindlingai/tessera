@@ -105,7 +105,7 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
 fn arity(op: &Op) -> usize {
     match op {
         Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) => 1,
+        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) | Op::Mean(_) => 1,
         Op::Append(_) => 3,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
@@ -154,6 +154,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Select(s) => select::select(&g.dims, s, args),
         Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
         Op::View(v) => view(&g.dims, v, args[0]),
+        Op::Mean(axis) => mean(*axis, args[0]),
         Op::Cast(dtype) => {
             // Rounding each rank's share is not rounding the sum.
             need(
@@ -421,6 +422,27 @@ fn shift(q: Placement, lead: usize) -> Placement {
         },
         q => q,
     }
+}
+
+/// `x` without `axis`, as a sum over whole values.
+fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
+    need(x.dtype.is_float(), ErrorKind::DType, || {
+        format!("a mean needs floats, got {:?}", x.dtype)
+    })?;
+    need((axis as usize) < x.rank(), ErrorKind::Shape, || {
+        format!("no axis {axis} in {}", x.shape)
+    })?;
+    need(
+        x.placement != Placement::Partial,
+        ErrorKind::Placement,
+        || "a mean cannot read partial sums".into(),
+    )?;
+    let mut shape = x.shape.0.clone();
+    shape.remove(axis as usize);
+    Ok(TensorType {
+        shape: Shape(shape),
+        ..x.clone()
+    })
 }
 
 fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
