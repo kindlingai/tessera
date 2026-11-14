@@ -1,3 +1,4 @@
+use crate::cpu_test::{close, eval, port as typed};
 use crate::*;
 use trace::DimName::*;
 use trace::{DType, Dim, EntryKind, Graph, Mask, Model, Port, Role, TensorType};
@@ -200,4 +201,65 @@ fn join_center_sum() {
         out[2].floats().unwrap(),
         [0., 1. / 3., 2. / 3., 0.25, 1. / 3., 5. / 12.]
     );
+}
+
+/// Keys and values `[Seqs, Context, heads, HeadDim]`, as one port.
+fn kv_port(heads: trace::DimName) -> Port {
+    typed([Seqs, Context, heads, HeadDim], DType::F32)
+}
+
+/// Zero queries average the keys they see in `v`.
+fn window(rows: usize, v: &[f32]) -> Tensor {
+    let q = Tensor::f32(vec![1, rows, 1, 2], vec![0.0; rows * 2]);
+    let kv = Tensor::f32(vec![1, v.len() / 2, 1, 2], v.to_vec());
+    let q_port = typed([Seqs, Rows, KvHeads, HeadDim], DType::F32);
+    let ports = [q_port, kv_port(KvHeads), kv_port(KvHeads)];
+    let out = eval(ports, &[q, kv.clone(), kv], None, |m, [q, k, v]| {
+        [m.attend(Mask::Within(1), 1.0, [&q, &k, &v], None)]
+    });
+    out.unwrap().remove(0)
+}
+
+/// Two rows, 4 query heads over 2 key heads.
+fn rows_over(positions: Vec<u32>) -> Result<Vec<Tensor>, Error> {
+    let ln3 = 3f32.ln();
+    let mut k = vec![0., ln3, 0., 0., ln3, 0., 0., 0., 99., 99., 99., 99.];
+    k.extend([9.; 12]);
+    let mut v = vec![4., -8., 0., 2., 8., 4., 4., 0., 99., 99., 99., 99.];
+    v.extend([-1., 2., 3., -3., 50., 50., 50., 50., 60., 60., 60., 60.]);
+    let ids = |v| Tensor::u32(vec![2], v);
+    let inputs = [
+        Tensor::f32(vec![2, 4, 2], [1., 0., 0., 1.].repeat(4)),
+        Tensor::f32(vec![2, 3, 2, 2], k),
+        Tensor::f32(vec![2, 3, 2, 2], v),
+        ids(vec![1, 0]),
+        ids(positions),
+    ];
+    let idx = || typed([Rows], DType::U32);
+    let q = typed([Rows, Hidden, HeadDim], DType::F32);
+    let ports = [q, kv_port(Heads), kv_port(Heads), idx(), idx()];
+    eval(ports, &inputs, None, |m, [q, k, v, s, p]| {
+        [m.attend_rows(1.0, [&q, &k, &v], [&s, &p])]
+    })
+}
+
+#[test]
+fn window_edges() {
+    let v: Vec<f32> = (0..4).flat_map(|t| [(1 << t) as f32, -t as f32]).collect();
+    // One key either side, cut at both ends.
+    let want = [1.5, -0.5, 7. / 3., -1., 14. / 3., -2., 6., -2.5];
+    close(&window(4, &v), &want);
+    // A lone query sits at the last position.
+    close(&window(1, &v), &want[6..]);
+}
+
+#[test]
+fn rows_read_slots() {
+    let out = rows_over(vec![0, 1]).unwrap();
+    // Row 0 sees one key. Row 1 weighs two.
+    let want = [
+        -1., 2., -1., 2., 3., -3., 3., -3., 7., 1., 5., -5., 2., 1., 2., 1.,
+    ];
+    close(&out[0], &want);
+    assert!(matches!(rows_over(vec![0, 3]), Err(Error::Mismatch(_))));
 }
