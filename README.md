@@ -18,8 +18,11 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 
 ## Supported Models
 
- - nanogpt (barely)
- - qwen (barely)
+ - Qwen 0.6B
+ - Embedding Gemma 2
+ - spaCy
+
+## Crates
 
 <!-- crate table -->
 Crate | Description
