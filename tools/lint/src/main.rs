@@ -1,5 +1,6 @@
 //! The repository's code-shape rules. AGENTS.md lists them.
 
+mod audit;
 mod comments;
 mod files;
 mod kernel;
@@ -47,6 +48,11 @@ pub struct Limits {
     pub shape_steps: Vec<(usize, usize)>,
     pub extensions: Vec<String>,
     pub hash_comment_files: Vec<String>,
+    pub layers: Vec<Vec<String>>,
+    pub layer_allow: Vec<audit::Allow>,
+    pub warn_rules: Vec<String>,
+    pub min_repeat_statements: usize,
+    pub timing_exempt: Vec<String>,
 }
 
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
@@ -107,6 +113,10 @@ fn main() -> ExitCode {
         eprintln!("tessera-lint: {e}");
         return ExitCode::from(2);
     }
+    if let Err(e) = audit::check(&root, &dirs, &sources, &mut found) {
+        eprintln!("tessera-lint: {e}");
+        return ExitCode::from(2);
+    }
     found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     for v in &found {
         println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
@@ -119,12 +129,19 @@ fn main() -> ExitCode {
         eprintln!("tessera-lint: {e}");
         return ExitCode::from(2);
     }
-    if found.is_empty() {
-        eprintln!("tessera-lint: {} files clean", sources.len());
+    let fails = found.iter().filter(|v| !is_note(v)).count();
+    let notes = found.len() - fails;
+    if fails == 0 {
+        eprintln!("tessera-lint: {} files clean, {notes} notes", sources.len());
         return ExitCode::SUCCESS;
     }
-    eprintln!("tessera-lint: {} violations", found.len());
+    eprintln!("tessera-lint: {fails} violations, {notes} notes");
     ExitCode::FAILURE
+}
+
+/// A note advises and does not fail the run.
+fn is_note(v: &Violation) -> bool {
+    audit::level(v.rule, &LIMITS.warn_rules) == findings::Level::Note
 }
 
 /// Violations as findings, for tessera-check.
@@ -133,7 +150,7 @@ fn report(found: &[Violation]) -> findings::Report {
     for v in found {
         r.findings.push(findings::Finding {
             rule: v.rule.into(),
-            level: findings::Level::Fail,
+            level: audit::level(v.rule, &LIMITS.warn_rules),
             path: v.path.clone(),
             line: v.line,
             message: v.message.clone(),

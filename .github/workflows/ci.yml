@@ -41,6 +41,11 @@ jobs:
         with:
           shared-key: lint
       - run: cargo fmt --all --check
+      # Unused dependencies. It does not read dev-dependencies.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.9.2
+      - run: cargo machete
       # The report job renders this JSON into the PR comment.
       - run: mkdir -p "$RUNNER_TEMP/checks" && cargo run -q -p tessera-lint -- --json "$RUNNER_TEMP/checks/lint.json"
       - if: always()
