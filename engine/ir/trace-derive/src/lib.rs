@@ -1,7 +1,7 @@
 //! `#[derive(Weights)]`: one weight declaration per struct field.
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenTree};
 use quote::{ToTokens, quote};
 use syn::punctuated::Punctuated;
 use syn::{Data, DeriveInput, Expr, Fields, Ident, Token, parse_macro_input};
@@ -71,8 +71,24 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 /// Indices of the `S<i>` names in the shape expressions.
 fn passed(dims: &[Expr]) -> Vec<(Ident, usize)> {
     let mut found: Vec<(Ident, usize)> = Vec::new();
-    for word in dims.iter().flat_map(|d| d.to_token_stream().into_iter()) {
-        let text = word.to_string();
+    for dim in dims {
+        find_passed(dim.to_token_stream(), &mut found);
+    }
+    found
+}
+
+/// Adds each new `S<i>` in `tokens`, also inside groups.
+fn find_passed(tokens: proc_macro2::TokenStream, found: &mut Vec<(Ident, usize)>) {
+    for tree in tokens {
+        let ident = match tree {
+            TokenTree::Group(group) => {
+                find_passed(group.stream(), found);
+                continue;
+            }
+            TokenTree::Ident(ident) => ident,
+            _ => continue,
+        };
+        let text = ident.to_string();
         let Some(i) = text.strip_prefix('S').and_then(|n| n.parse::<usize>().ok()) else {
             continue;
         };
@@ -80,5 +96,4 @@ fn passed(dims: &[Expr]) -> Vec<(Ident, usize)> {
             found.push((Ident::new(&text, Span::call_site()), i));
         }
     }
-    found
 }

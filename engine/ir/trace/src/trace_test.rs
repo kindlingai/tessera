@@ -118,3 +118,24 @@ fn composites_own_outputs() {
         [x.rms_norm(&net.blocks[0].norm, 1e-5), x.clone()]
     });
 }
+
+#[derive(Weights)]
+struct Grouped {
+    #[shape(Hidden, (S0 + 1) * 2)]
+    up: Linear,
+    #[shape(Hidden * (S1 + 1))]
+    scale: Norm,
+}
+
+#[test]
+fn weights_reach_groups() {
+    let m = model();
+    let given = |_| vec![Vocab.into(), Layers.into()];
+    let all: Vec<Grouped> = trace::each(&m, "g", Layers, given);
+    let g = &all[1];
+    assert_eq!(
+        g.up.0.ty().shape,
+        Shape(vec![(Vocab + 1) * 2, Hidden.into()])
+    );
+    assert_eq!(g.scale.0.ty().shape, Shape(vec![Hidden * (Layers + 1)]));
+}
