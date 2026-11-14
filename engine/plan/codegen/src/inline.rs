@@ -1,6 +1,6 @@
 //! One kernel's tree inlined into another's, at build time.
 
-use crate::ir::{Body, Expr, Param, Stmt};
+use crate::ir::{Body, Expr, Helper, Param, Stmt};
 use std::collections::HashMap;
 
 /// A called kernel's argument: a build value or a tree.
@@ -24,7 +24,7 @@ macro_rules! int_args {
     )*};
 }
 
-int_args!(i32, u32, u64, usize);
+int_args!(i32, i64, u8, u16, u32, u64, usize);
 
 impl Pass<Expr> for f32 {
     fn pass(self) -> Expr {
@@ -44,9 +44,15 @@ impl Pass<Expr> for bool {
     }
 }
 
-/// A call: the callee's tree and the caller's arguments.
+/// A call's target: a kernel to inline, or a helper.
+pub enum Callee {
+    Kernel(Body),
+    Helper(Helper),
+}
+
+/// A call: the callee and the caller's arguments.
 pub struct Inline {
-    pub body: Body,
+    pub callee: Callee,
     pub args: Vec<Expr>,
 }
 
@@ -54,6 +60,8 @@ pub struct Inline {
 #[derive(Default)]
 pub struct Inliner {
     calls: usize,
+    /// The helpers called so far, each once.
+    pub helpers: Vec<Helper>,
 }
 
 impl Inliner {
@@ -64,7 +72,10 @@ impl Inliner {
 
     /// A call as a value, after the statements in `pre`.
     pub fn expr(&mut self, pre: &mut Vec<Stmt>, call: Inline) -> Expr {
-        let entry = call.body.entry.clone();
+        let entry = match &call.callee {
+            Callee::Kernel(body) => body.entry.clone(),
+            Callee::Helper(h) => h.name.clone(),
+        };
         match self.inline(pre, call) {
             Some(value) => value,
             None => panic!("`{entry}` has no value"),
@@ -73,7 +84,17 @@ impl Inliner {
 
     fn inline(&mut self, pre: &mut Vec<Stmt>, call: Inline) -> Option<Expr> {
         self.calls += 1;
-        let Inline { body, args } = call;
+        let Inline { callee, args } = call;
+        let body = match callee {
+            Callee::Kernel(body) => body,
+            Callee::Helper(h) => {
+                let took = h.body.params.len();
+                assert_eq!(args.len(), took, "`{}` takes {took} arguments", h.name);
+                let value = Expr::Fn(h.name.clone(), h.ret, args);
+                self.helper(h);
+                return Some(value);
+            }
+        };
         assert_eq!(
             args.len(),
             body.params.len(),
@@ -126,7 +147,16 @@ impl Inliner {
         }
         let renamer = Rename { names };
         pre.extend(body.stmts.iter().map(|s| renamer.stmt(s)));
+        for h in body.helpers {
+            self.helper(h);
+        }
         body.ret.as_ref().map(|e| renamer.expr(e))
+    }
+
+    fn helper(&mut self, h: Helper) {
+        if !self.helpers.iter().any(|k| k.name == h.name) {
+            self.helpers.push(h);
+        }
     }
 
     fn fresh(&self, name: &str) -> String {
@@ -203,6 +233,11 @@ impl Rename {
             Expr::Field(base, h) => Expr::Field(sub(base), *h),
             Expr::Call(i, args) => Expr::Call(*i, args.iter().map(|a| self.expr(a)).collect()),
             Expr::Select(c, a, b) => Expr::Select(sub(c), sub(a), sub(b)),
+            Expr::Fn(name, ty, args) => Expr::Fn(
+                name.clone(),
+                *ty,
+                args.iter().map(|a| self.expr(a)).collect(),
+            ),
         }
     }
 

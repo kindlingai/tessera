@@ -10,6 +10,7 @@ pub enum DType {
     F16,
     I32,
     U32,
+    U8,
     Bool,
 }
 
@@ -19,7 +20,7 @@ impl DType {
         match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::Bf16 | DType::F16 => 2,
-            DType::Bool => 1,
+            DType::U8 | DType::Bool => 1,
         }
     }
 

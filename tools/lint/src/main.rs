@@ -9,6 +9,7 @@ mod readme;
 mod runs;
 mod rust;
 mod share;
+mod text;
 
 #[cfg(test)]
 mod comments_test;
@@ -24,6 +25,8 @@ mod runs_test;
 mod rust_test;
 #[cfg(test)]
 mod share_test;
+#[cfg(test)]
+mod text_test;
 
 use std::process::ExitCode;
 
@@ -130,6 +133,7 @@ fn check_file(
     comments::check(src, is_rust, out);
     if is_rust {
         rust::check(src, out, names, tests);
+        text::check(src, out);
     } else {
         kernel::check(src, names);
     }
