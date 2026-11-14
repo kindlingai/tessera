@@ -1,5 +1,6 @@
 //! A Hugging Face model directory: graph, weights, tokenizer, template.
 
+pub mod tag;
 mod template;
 #[cfg(test)]
 mod template_test;
