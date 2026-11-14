@@ -7,7 +7,7 @@ set -e
 bots='anthropic|claude|openai|chatgpt|codex|z\.ai|zhipu|glm|copilot|gemini|cursor|devin|aider|\[bot\]'
 pattern="^[[:space:]]*co-authored-by:.*($bots)"
 
-# Prints offending lines from stdin; true if any.
+# Prints offending lines from stdin. True if any.
 offending() {
     grep -v '^#' | grep -Ei "$pattern"
 }

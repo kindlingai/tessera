@@ -43,6 +43,7 @@ pub struct Limits {
     pub max_module_test_percent: usize,
     pub shape_steps: Vec<(usize, usize)>,
     pub extensions: Vec<String>,
+    pub hash_comment_files: Vec<String>,
 }
 
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
@@ -90,6 +91,15 @@ fn main() -> ExitCode {
     macros::check(&dirs, &sources, &mut found);
     files::check_crates(&dirs, &sources, &mut found);
     runs::check(&sources, &mut found);
+    match files::hash_sources(&root) {
+        Ok(srcs) => srcs
+            .iter()
+            .for_each(|s| comments::check_hash(s, &mut found)),
+        Err(e) => {
+            eprintln!("tessera-lint: {e}");
+            return ExitCode::from(2);
+        }
+    }
     if let Err(e) = readme::check(&root, &dirs, &mut found) {
         eprintln!("tessera-lint: {e}");
         return ExitCode::from(2);

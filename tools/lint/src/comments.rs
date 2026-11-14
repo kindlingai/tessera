@@ -288,11 +288,44 @@ pub fn semicolons(raw: &[Raw]) -> Vec<usize> {
     out
 }
 
+/// The text after each `#` that starts a comment, by line.
+pub fn hash_comments(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if i == 0 && line.starts_with("#!") {
+            continue;
+        }
+        let (mut quote, mut prev) = (None, ' ');
+        for (at, c) in line.char_indices() {
+            match (quote, c) {
+                (None, '\'' | '"') => quote = Some(c),
+                (Some(q), _) if c == q => quote = None,
+                (None, '#') if prev.is_whitespace() => {
+                    out.push((i + 1, &line[at + 1..]));
+                    break;
+                }
+                _ => {}
+            }
+            prev = c;
+        }
+    }
+    out
+}
+
+const SEMICOLON: &str = "`;` in prose: split the sentence, or quote code in backticks";
+
+pub fn check_hash(src: &Source, out: &mut Vec<Violation>) {
+    for (line, body) in hash_comments(&src.text) {
+        if prose_semicolon(body) {
+            out.push(src.violation(line, "comment-semicolon", SEMICOLON.into()));
+        }
+    }
+}
+
 pub fn check(src: &Source, rust: bool, out: &mut Vec<Violation>) {
     let raw = scan(&src.text, rust);
     for line in semicolons(&raw) {
-        let message = "`;` in prose: split the sentence, or quote code in backticks".into();
-        out.push(src.violation(line, "comment-semicolon", message));
+        out.push(src.violation(line, "comment-semicolon", SEMICOLON.into()));
     }
     let max = LIMITS.max_comment_words;
     for c in group(&raw) {

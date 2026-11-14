@@ -3,6 +3,7 @@
 # Words in one comment block. Adjacent comment lines are one block.
 max_comment_words = 10
 # A `;` in a comment must sit in backticks or a ``` block.
+# This also covers `#` comments in `hash_comment_files`.
 
 # Snake-case segments in a function name, and when a shared prefix
 # or suffix lets a name go one longer.
@@ -44,3 +45,6 @@ max_lean = 0.03
 
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]
+
+# Files with `#` comments. Only the semicolon rule reads these.
+hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]

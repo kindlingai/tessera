@@ -58,10 +58,32 @@ fn listed(root: &Path) -> Result<Vec<String>, String> {
 }
 
 pub fn sources(root: &Path) -> Result<Vec<Source>, String> {
+    read(root, |path| {
+        let ext = Path::new(path).extension().and_then(|e| e.to_str());
+        ext.is_some_and(|e| LIMITS.extensions.iter().any(|x| x == e))
+    })
+}
+
+/// `*.ext` matches by extension, `dir/*` by directory.
+fn matches(pattern: &str, path: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        (Some(ext), _) => path.ends_with(ext),
+        (_, Some(dir)) => path.starts_with(dir),
+        _ => path == pattern,
+    }
+}
+
+/// Files with `#` comments, per `hash_comment_files`.
+pub fn hash_sources(root: &Path) -> Result<Vec<Source>, String> {
+    read(root, |path| {
+        LIMITS.hash_comment_files.iter().any(|p| matches(p, path))
+    })
+}
+
+fn read(root: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<Source>, String> {
     let mut out = Vec::new();
     for path in listed(root)? {
-        let ext = Path::new(&path).extension().and_then(|e| e.to_str());
-        if !ext.is_some_and(|e| LIMITS.extensions.iter().any(|x| x == e)) {
+        if !keep(&path) {
             continue;
         }
         // Deleted but still in the index.
