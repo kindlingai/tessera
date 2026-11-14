@@ -80,15 +80,16 @@ fn linear(k: u64, n: u64) -> Graph {
     m.finish([(Role::Logits, &x.matmul(&w.w))])
 }
 
-/// A norm, two maps, a softmax and an argmax.
+/// Norms, maps, a softmax, an argmax and a mean.
 fn rows(width: u64) -> Graph {
     let m = model(&[Rows], &[(Hidden, width)]);
     let w: Scale = declare(&m);
     let port = || floats([Rows, Hidden]);
     let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
-    let gated = x.rms_norm(&w.norm, 1e-6).act(Act::Silu).mul(&y);
-    let ids = y.add(&gated).softmax().top_k(1u64);
-    m.finish([(Role::Tokens, &ids)])
+    let gated = x.rms_norm(&w.norm, 1e-6).act(Act::Silu).mul(&y.rms(1e-6));
+    let sum = y.add(&gated);
+    let ids = sum.softmax().top_k(1u64);
+    m.finish([(Role::Tokens, &ids), (Role::Logits, &sum.mean(0))])
 }
 
 /// A rotation, then causal attention.

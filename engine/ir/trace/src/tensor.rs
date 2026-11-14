@@ -134,6 +134,11 @@ impl Tensor {
         self.op(Op::Append(kept.0), &[slots, positions])
     }
 
+    /// The mean over `axis`. The axis goes away.
+    pub fn mean(&self, axis: u32) -> Tensor {
+        self.op(Op::Mean(axis), &[])
+    }
+
     pub fn cast(&self, dtype: DType) -> Tensor {
         self.op(Op::Cast(dtype), &[])
     }

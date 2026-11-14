@@ -223,10 +223,10 @@ pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor
     x
 }
 
-/// Each token projected to the embedding width. Mean these.
+/// One embedding per text, `[Seqs, Embedding]`. Callers normalize.
 pub fn forward(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor) -> Tensor {
     let x = trunk(m, c, w, tokens, positions);
-    x.rms_norm(&w.norm, c.eps).matmul(&w.proj)
+    x.rms_norm(&w.norm, c.eps).matmul(&w.proj).mean(1)
 }
 
 fn geglu(h: &Tensor, l: &Layer) -> Tensor {
@@ -253,7 +253,7 @@ fn attention(m: &Model, c: &Config, p: &Parts, x: &Tensor, positions: &Tensor) -
     out.reshape(flat).matmul(p.o).rms_norm(p.post, c.eps)
 }
 
-/// One forward entry: tokens and positions in, projected tokens out.
+/// One forward entry: tokens and positions in, embeddings out.
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w: Eg2 = trace::declare(&m);
