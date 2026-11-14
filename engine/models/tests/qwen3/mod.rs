@@ -24,7 +24,7 @@ fn release() -> Graph {
     program(&Config::small(8, 40_960))
 }
 
-/// The reference's checkpoint is bf16, which plans keep.
+/// Plans keep the reference checkpoint in bf16.
 pub const GOLDEN: Golden = Golden {
     read: golden_test::read,
     form: BF16_FORM,
