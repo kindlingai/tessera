@@ -97,6 +97,27 @@ const CUDA_PDL: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #endif
 ";
 
+/// Bit fields: one extract instruction on each backend.
+const METAL_BITS: &str = "#define f_field(w, l, n) extract_bits((u32)(w), (l), (n))
+#define f_sfield(w, l, n) ((float)extract_bits((int)(w), (l), (n)))
+";
+const CUDA_BITS: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#define f_field(w, l, n) (((u32)(w) >> (l)) & ((1u << (n)) - 1u))
+#define f_sfield(w, l, n) ((float)(((int)((u32)(w) << (32u - (l) - (n)))) >> (32u - (n))))
+#else
+f_fn u32 f_field(u32 w, u32 l, u32 n) {
+    u32 r;
+    asm(\"bfe.u32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
+    return r;
+}
+f_fn float f_sfield(u32 w, u32 l, u32 n) {
+    int r;
+    asm(\"bfe.s32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
+    return (float)r;
+}
+#endif
+";
+
 const CUDA_SHFL: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #define f_shfl_xor(v, m) __shfl_xor(v, m)
 #else
@@ -122,6 +143,7 @@ fn head(dialect: Dialect) -> String {
         }
     }
     text.push_str(if metal { METAL_SHFL } else { CUDA_SHFL });
+    text.push_str(if metal { METAL_BITS } else { CUDA_BITS });
     if !metal {
         text.push_str(CUDA_PDL);
     }

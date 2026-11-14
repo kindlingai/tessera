@@ -395,6 +395,22 @@ impl Group<'_, '_> {
                 let v = self.eval(&args[0], mask);
                 v.into_iter().map(|x| Val::U(x.f().to_bits())).collect()
             }
+            Intrinsic::Bits | Intrinsic::Signed => {
+                let (w, l, n) = (
+                    self.eval(&args[0], mask),
+                    self.eval(&args[1], mask),
+                    self.eval(&args[2], mask),
+                );
+                (0..n.len())
+                    .map(|t| {
+                        let field = field(w[t].u(), l[t].u(), n[t].u());
+                        match i {
+                            Intrinsic::Bits => Val::U(field),
+                            _ => Val::F(sign_extend(field, n[t].u()) as f32),
+                        }
+                    })
+                    .collect()
+            }
             Intrinsic::FromBits => {
                 let v = self.eval(&args[0], mask);
                 v.into_iter()
@@ -829,4 +845,15 @@ pub fn run(
         let mask = vec![true; grid.threads];
         group.block(&body.stmts, &mask);
     }
+}
+
+/// The `n` bits of `w` from bit `low`.
+fn field(w: u32, low: u32, n: u32) -> u32 {
+    (w >> low) & ((1u64 << n) - 1) as u32
+}
+
+/// An `n`-bit field as a signed value.
+fn sign_extend(field: u32, n: u32) -> i32 {
+    let shift = 32 - n;
+    ((field << shift) as i32) >> shift
 }

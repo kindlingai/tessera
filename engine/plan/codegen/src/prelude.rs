@@ -134,6 +134,23 @@ impl<F: Elems> Buf<F> {
     }
 }
 
+/// Bit fields of a word, below 32 bits wide.
+pub trait Bits {
+    /// The `n` bits from bit `low`.
+    fn bits(self, low: u32, n: u32) -> u32;
+    /// The same, sign-extended, as a float.
+    fn signed(self, low: u32, n: u32) -> f32;
+}
+
+impl Bits for u32 {
+    fn bits(self, _: u32, _: u32) -> u32 {
+        device()
+    }
+    fn signed(self, _: u32, _: u32) -> f32 {
+        device()
+    }
+}
+
 /// The buffer from element `n` on.
 impl<F: Elems> Add<u64> for Buf<F> {
     type Output = Self;

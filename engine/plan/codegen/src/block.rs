@@ -4,7 +4,7 @@ use crate as codegen;
 use crate::form::Form;
 use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
-use crate::prelude::{Buf, F32x4, U8, device, helper, kernel};
+use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use graph::{DType, E2M1, E4M3, F16};
 
 /// A code: what one element stores, before its block's scale.
@@ -15,13 +15,13 @@ pub trait Code: Sync {
     fn encode(scaled: f32) -> u32;
     fn decode(code: u32) -> f32;
 
-    /// Code `c` as a float, in a kernel.
-    fn float(_: u32) -> f32 {
+    /// Code at bit `low` of `w`, as a float.
+    fn field(_: u32, _: u32) -> f32 {
         device()
     }
 
-    /// `float` as a tree, for the block's helper.
-    fn float_inline(c: impl Pass<Expr>) -> Inline;
+    /// `field` as a tree, for the block's helper.
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline;
 
     /// The scale for a block, from its values.
     fn scale(block: &[f32]) -> f32 {
@@ -104,21 +104,27 @@ impl Code for E2M1 {
     fn decode(code: u32) -> f32 {
         E2M1(code as u8).into()
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        minifloat_inline::<2, 1>(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        e2m1_field_inline(w, low)
     }
 }
 
-/// A signed byte, from its two's complement.
+/// An e2m1 nibble.
 #[kernel]
-fn i8_code(c: u32) -> f32 {
-    ((c ^ 128) as f32) - 128.0
+fn e2m1_field(w: u32, low: u32) -> f32 {
+    minifloat::<2, 1>(w.bits(low, 4))
+}
+
+/// A signed byte.
+#[kernel]
+fn i8_field(w: u32, low: u32) -> f32 {
+    w.signed(low, 8)
 }
 
 /// A nibble 8 below its value.
 #[kernel]
-fn nibble_code(c: u32) -> f32 {
-    c as f32 - 8.0
+fn nibble_field(w: u32, low: u32) -> f32 {
+    w.bits(low, 4) as f32 - 8.0
 }
 
 /// A signed byte.
@@ -133,8 +139,8 @@ impl Code for I8 {
     fn decode(code: u32) -> f32 {
         f32::from(code as u8 as i8)
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        i8_code_inline(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        i8_field_inline(w, low)
     }
 }
 
@@ -150,8 +156,8 @@ impl Code for Nibble {
     fn decode(code: u32) -> f32 {
         code as f32 - 8.0
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        nibble_code_inline(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        nibble_field_inline(w, low)
     }
 
     /// Keeps the sign: the widest value lands on -8.
@@ -187,7 +193,6 @@ fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bo
     } else {
         (4 * (j % 2)) as u32
     };
-    let c = ((b[S::BYTES as u64 + byte] as u32) >> shift) & ((1u32 << C::BITS) - 1);
     let head = if HEAD {
         f32::from_bits(
             p[0] as u32 | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24),
@@ -195,7 +200,7 @@ fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bo
     } else {
         1.0
     };
-    head * S::load(b) * C::float(c)
+    head * S::load(b) * C::field(b[S::BYTES as u64 + byte] as u32, shift)
 }
 
 /// Elements `i..i+4`: head, scale and four codes.
@@ -230,12 +235,11 @@ fn four<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool>
     };
     let head = if HEAD { f32::from_bits(p.word(0)) } else { 1.0 };
     let scale = head * S::load(b);
-    let mask = (1u32 << C::BITS) - 1;
     F32x4::new(
-        scale * C::float((w >> shift) & mask),
-        scale * C::float((w >> (shift + step)) & mask),
-        scale * C::float((w >> (shift + 2 * step)) & mask),
-        scale * C::float((w >> (shift + 3 * step)) & mask),
+        scale * C::field(w, shift),
+        scale * C::field(w, shift + step),
+        scale * C::field(w, shift + 2 * step),
+        scale * C::field(w, shift + 3 * step),
     )
 }
 
