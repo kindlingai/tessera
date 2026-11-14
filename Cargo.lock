@@ -161,6 +161,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "testkit",
  "tokenizers",
 ]
 
@@ -189,6 +190,7 @@ dependencies = [
  "run",
  "settings",
  "sim",
+ "testkit",
  "trace",
 ]
 

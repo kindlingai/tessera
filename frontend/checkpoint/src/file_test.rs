@@ -3,15 +3,10 @@ use std::path::PathBuf;
 
 /// Writes a header and tensor bytes to a temporary file.
 fn write(name: &str, header: &str, data: &[u8]) -> PathBuf {
-    let id = std::process::id();
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/scratch"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("tessera-{name}-{id}.safetensors"));
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(data);
-    std::fs::write(&path, bytes).unwrap();
-    path
+    testkit::stage(&format!("{name}.safetensors"), &bytes)
 }
 
 const HEADER: &str = r#"{"__metadata__":{"format":"pt"},

@@ -8,16 +8,12 @@ use lower::{Pick, Recipe, Settings, Weight};
 use models::qwen3::{Config, stepper};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use testkit::gguf::{field, header, info, pad, text};
 
 struct Fixture {
     meta: Vec<(String, Value)>,
     /// Name, GGUF type, dims fastest first, and bytes.
     tensors: Vec<(String, u32, Vec<u64>, Vec<u8>)>,
-}
-
-fn text(bytes: &mut Vec<u8>, s: &str) {
-    bytes.extend((s.len() as u64).to_le_bytes());
-    bytes.extend(s.bytes());
 }
 
 fn value(bytes: &mut Vec<u8>, v: &Value) {
@@ -98,40 +94,28 @@ impl Fixture {
     }
 
     fn write(&self) -> PathBuf {
-        let mut bytes = Vec::from(*b"GGUF");
-        bytes.extend(3u32.to_le_bytes());
-        bytes.extend((self.tensors.len() as u64).to_le_bytes());
-        bytes.extend((self.meta.len() as u64).to_le_bytes());
+        let mut bytes = Vec::new();
+        header(&mut bytes, self.tensors.len(), self.meta.len());
         for (key, v) in &self.meta {
-            text(&mut bytes, key);
+            let mut raw = Vec::new();
             let ty: u32 = match v {
                 Value::String(_) => 8,
                 Value::Array(_) => 9,
                 Value::Number(n) if n.is_u64() => 10,
                 _ => 6,
             };
-            bytes.extend(ty.to_le_bytes());
-            value(&mut bytes, v);
+            value(&mut raw, v);
+            field(&mut bytes, key, ty, &raw);
         }
         let mut data = Vec::new();
         for (name, ty, dims, raw) in &self.tensors {
-            text(&mut bytes, name);
-            bytes.extend((dims.len() as u32).to_le_bytes());
-            dims.iter().for_each(|d| bytes.extend(d.to_le_bytes()));
-            bytes.extend(ty.to_le_bytes());
-            bytes.extend((data.len() as u64).to_le_bytes());
+            info(&mut bytes, name, dims, *ty, data.len() as u64);
             data.extend(raw);
-            data.resize(data.len().next_multiple_of(32), 0);
+            pad(&mut data, 32);
         }
-        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        pad(&mut bytes, 32);
         bytes.extend(data);
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/scratch"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("bundle-gguf-{}-{id}", std::process::id()));
-        std::fs::write(&path, bytes).unwrap();
-        path
+        testkit::stage("bundle.gguf", &bytes)
     }
 
     fn load(&self) -> Result<crate::Bundle, Box<dyn std::error::Error + Send + Sync>> {

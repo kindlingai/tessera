@@ -1,22 +1,9 @@
 use crate::{Error, Gguf, GgufType, Meta, Offer, Stored};
-use std::path::PathBuf;
-
-fn string(out: &mut Vec<u8>, text: &str) {
-    out.extend((text.len() as u64).to_le_bytes());
-    out.extend(text.as_bytes());
-}
-
-fn field(out: &mut Vec<u8>, key: &str, ty: u32, bytes: &[u8]) {
-    string(out, key);
-    out.extend(ty.to_le_bytes());
-    out.extend(bytes);
-}
+use testkit::gguf::{field, header, info, pad, text as string};
 
 fn sample(alignment: u64) -> Vec<u8> {
-    let mut out = b"GGUF".to_vec();
-    out.extend(3u32.to_le_bytes());
-    out.extend(4u64.to_le_bytes());
-    out.extend(16u64.to_le_bytes());
+    let mut out = Vec::new();
+    header(&mut out, 4, 16);
     let values: &[(u32, &[u8])] = &[
         (0, &[255]),
         (1, &[254]),
@@ -53,13 +40,9 @@ fn sample(alignment: u64) -> Vec<u8> {
         ("q8", 32, 8, 128),
         ("q4", 32, 2, 192),
     ] {
-        string(&mut out, name);
-        out.extend(1u32.to_le_bytes());
-        out.extend(count.to_le_bytes());
-        out.extend(ty.to_le_bytes());
-        out.extend(offset.to_le_bytes());
+        info(&mut out, name, &[count], ty, offset);
     }
-    out.resize(out.len().next_multiple_of(alignment.max(1) as usize), 0);
+    pad(&mut out, alignment as usize);
     let mut data = vec![0; 210];
     data[..4].copy_from_slice(&1.25f32.to_le_bytes());
     data[4..8].copy_from_slice(&(-2.5f32).to_le_bytes());
@@ -70,18 +53,8 @@ fn sample(alignment: u64) -> Vec<u8> {
     out
 }
 
-fn write(bytes: &[u8]) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/scratch"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("checkpoint-gguf-{}-{id}", std::process::id()));
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
 fn open(bytes: &[u8]) -> Result<Gguf, Error> {
-    let path = write(bytes);
+    let path = testkit::stage("checkpoint.gguf", bytes);
     let result = Gguf::open(&path);
     std::fs::remove_file(path).unwrap();
     result

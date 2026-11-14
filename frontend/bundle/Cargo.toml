@@ -24,3 +24,4 @@ tokenizers = { version = "0.22", default-features = false, features = ["unstable
 [dev-dependencies]
 engine = { workspace = true }
 settings = { workspace = true }
+testkit = { workspace = true }
