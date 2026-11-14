@@ -1,5 +1,6 @@
 use super::Pattern;
 use crate::tree::{T, Term, Tree};
+use graph::{Op, Select};
 
 /// Indices of each row's `k` largest entries.
 #[derive(Clone, Copy, Debug)]
@@ -13,7 +14,7 @@ pub struct Top {
 impl Pattern for Top {
     fn find(tree: &Tree, at: T) -> Option<Self> {
         let node = tree.node(at);
-        if node.term != Term::Top {
+        if !matches!(node.term, Term::Op(Op::Select(Select::TopK { .. }))) {
             return None;
         }
         let x = node.args[0];

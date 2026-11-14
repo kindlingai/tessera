@@ -3,7 +3,7 @@ use crate::kernel::Kernel;
 use crate::kernels::{Map, MapStage};
 use crate::rule::{Attn, Draft, Read};
 use crate::tree::{T, Term, Tree};
-use graph::{DimName, Mask};
+use graph::{DimName, Mask, Op};
 
 /// Attention with `scale` on the scores.
 #[derive(Clone, Copy, Debug)]
@@ -20,7 +20,7 @@ pub struct Attend {
 impl Pattern for Attend {
     fn find(tree: &Tree, at: T) -> Option<Self> {
         let node = tree.node(at);
-        let Term::Attend(a) = &node.term else {
+        let Term::Op(Op::Attend(a)) = &node.term else {
             return None;
         };
         let wide = |t: T| &tree.node(t).shape;
@@ -31,7 +31,7 @@ impl Pattern for Attend {
                 return None;
             };
             // The kept rows keep their axis's bound per slot.
-            let Term::Append(index) = tree.node(k).term else {
+            let Term::Op(Op::Append(index)) = tree.node(k).term else {
                 return None;
             };
             let graph::DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
