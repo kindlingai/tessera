@@ -92,7 +92,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Positions kept tensor `i` holds, up to the furthest written.
+    /// Positions kept tensor `i` has room for in each slot.
     pub fn len(&self, i: usize) -> usize {
         let kept = self.kept.get(i).and_then(Option::as_ref);
         kept.map_or(0, |t| t.shape[1])
