@@ -10,8 +10,10 @@ refuse them.
 No mannered prose in comments, error messages or text. Avoid flamboyant speech and prefer ASD-STE100
 where possible. No historical commentary. Comments are intentionally limited - code should be clearly written.
 
-Excessive code duplication is strictly checked. Use macros if duplicate detectors fire. Never change lint
+Excessive code duplication is checked as part of CI. Use macros if duplicate detectors fire. Never change lint
 rules or add exceptions without a project maintainer's _human_ approval.
+
+Merge larger changes in small, easier-to-review PRs in a stack.
 
 ## Code shape
 
