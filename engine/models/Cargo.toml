@@ -27,3 +27,4 @@ lower = { workspace = true }
 gpukit = { workspace = true }
 linear = { workspace = true }
 run = { workspace = true }
+testkit = { workspace = true }

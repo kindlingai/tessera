@@ -16,6 +16,7 @@ name = "tessera-calibrate"
 path = "src/main.rs"
 
 [dependencies]
+testkit = { workspace = true }
 codegen = { workspace = true }
 settings = { workspace = true }
 graph = { workspace = true }
@@ -24,7 +25,6 @@ lower = { workspace = true }
 sim = { workspace = true }
 kernels = { workspace = true }
 linear = { workspace = true }
-gpukit = { workspace = true }
 run = { workspace = true }
 
 [dev-dependencies]

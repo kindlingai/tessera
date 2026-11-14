@@ -7,13 +7,13 @@ use bundle::names::{Rule, repo};
 use calibrate::measure;
 use checkpoint::exlr8::Release;
 use checkpoint::{File, Offer};
-use gpukit::testing::cosine_f32;
 use interp::Tensor;
 use lower::{Device, Settings, Weight, lower};
 use models::eg2::{Config, probe};
 use run::Run;
 use std::path::Path;
 use std::time::Instant;
+use testkit::cosine_f32;
 use trace::Graph;
 use trace::Linear;
 

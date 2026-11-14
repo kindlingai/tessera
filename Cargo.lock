@@ -182,7 +182,6 @@ name = "calibrate"
 version = "0.1.0"
 dependencies = [
  "codegen",
- "gpukit",
  "graph",
  "kernels",
  "linear",
@@ -227,6 +226,7 @@ dependencies = [
  "graph",
  "serde",
  "serde_json",
+ "testkit",
  "ureq",
 ]
 
@@ -560,6 +560,7 @@ dependencies = [
  "objc2-metal",
  "serde",
  "serde_json",
+ "testkit",
 ]
 
 [[package]]
@@ -1645,6 +1646,14 @@ dependencies = [
  "findings",
  "settings",
  "ureq",
+]
+
+[[package]]
+name = "testkit"
+version = "0.1.0"
+dependencies = [
+ "graph",
+ "mem",
 ]
 
 [[package]]

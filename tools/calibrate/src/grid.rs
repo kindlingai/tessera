@@ -1,12 +1,12 @@
 //! Small graphs that reach every rule, at many sizes.
 
 use crate::measure;
-use gpukit::testing::Noise;
 use graph::DimName::{self, *};
 use lower::{Device, Error, Settings, Step, Tensor, View, lower};
 use run::{Run, open};
+use testkit::Noise;
 use trace::{
-    Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
+    Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role,
     TensorType, Weights, declare,
 };
 
@@ -54,11 +54,9 @@ struct Table {
 
 /// Every name bounded at `most`, then the fixed ones.
 fn model(bounded: &[DimName], fixed: &[(DimName, u64)]) -> Model {
-    let most = Size::Bounded(1 << 20);
-    let bounded = bounded.iter().map(|name| (*name, most));
-    let fixed = fixed.iter().map(|(name, n)| (*name, Size::Fixed(*n)));
-    let dim = |(name, size)| Dim { name, size };
-    Model::new(bounded.chain(fixed).map(dim).collect())
+    let bounded = bounded.iter().map(|name| Dim::bounded(*name, 1 << 20));
+    let fixed = fixed.iter().map(|(name, n)| Dim::fixed(*name, *n));
+    Model::new(bounded.chain(fixed).collect())
 }
 
 fn floats<const N: usize>(shape: [DimName; N]) -> Port {
@@ -127,16 +125,8 @@ fn table(vocab: u64, width: u64) -> Graph {
 
 /// Noise for `ty` as one row. Ids stay below eight.
 fn fill(g: &Graph, ty: &TensorType, sizes: &Sizes, noise: &mut Noise) -> Result<Tensor, Error> {
-    let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
-    let poly = ty.shape.elements(&g.dims).ok();
     let unsized_shape = || Error::Size(ty.shape.to_string());
-    let len = poly.and_then(|p| p.eval(&size)).ok_or_else(unsized_shape)?;
-    let mut draws = (0..len).map(|_| noise.draw());
-    let shape = vec![len as usize];
-    Ok(match ty.dtype {
-        DType::U32 => Tensor::u32(shape, draws.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
-        _ => Tensor::f32(shape, draws.by_ref().collect()),
-    })
+    testkit::fill(g, ty, sizes, noise).ok_or_else(unsized_shape)
 }
 
 impl Case {

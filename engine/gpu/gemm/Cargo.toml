@@ -31,3 +31,6 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLAllocation",
     "MTLTypes",
 ] }
+
+[dev-dependencies]
+testkit = { workspace = true }
