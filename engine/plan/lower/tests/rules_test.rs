@@ -16,7 +16,7 @@ use trace::{EntryKind, Mask, Model, Port, Role};
 
 const SIZES: [(DimName, u64); 3] = [(Seqs, 2), (Rows, 3), (Context, 5)];
 
-/// Fewer queries than keys, then a softmax.
+/// Fewer queries than keys, then a softmax and a mean.
 fn decode() -> Graph {
     let dim = |name, size| Dim { name, size };
     let bounded = [(Seqs, 4), (Rows, 8), (Context, 16)];
@@ -32,7 +32,7 @@ fn decode() -> Graph {
         [port(Rows), port(Context), port(Context)],
     );
     let out = m.attend(Mask::Causal, 0.5, [&q, &k, &v], None).softmax();
-    m.finish([(Role::Logits, &out)])
+    m.finish([(Role::Logits, &out), (Role::Logits, &out.mean(1))])
 }
 
 /// Each row's likeliest entry, over more entries than threads.
