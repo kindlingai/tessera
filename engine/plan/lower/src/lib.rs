@@ -41,7 +41,7 @@ pub use recipe::{Launching, Recipe};
 pub use rule::{Attn, Draft, RULES, Read, Rule, linked, rules};
 pub use run::{Held, Run, Weight, open, precision};
 pub use schedule::{peak, schedule};
-pub use select::{Home, Op, Selected, Val, Value, select, select_upto};
+pub use select::{Home, Op, Selected, Val, Value, select};
 pub use sim::{Cluster, Fit, Link, Load, Ops, Zone, ZoneKind};
 pub use tree::{Node, T, Term, Tree};
 
@@ -58,14 +58,14 @@ pub fn lower(
 }
 
 /// The same, with `upto` dimensions read at launch.
-pub fn lower_upto(
+pub(crate) fn lower_upto(
     g: &Graph,
     entry: usize,
     sizes: &[(DimName, u64)],
     upto: &[DimName],
     device: &Device,
 ) -> Result<Plan, Error> {
-    let picked = select_upto(g, entry, sizes, upto, device)?;
+    let picked = select::select_upto(g, entry, sizes, upto, device)?;
     Ok(assign(&picked, &schedule(&picked)))
 }
 
