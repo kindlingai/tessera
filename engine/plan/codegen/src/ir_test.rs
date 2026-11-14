@@ -217,3 +217,31 @@ fn callers_lend_memory() {
     );
     assert_eq!(f32::from_le_bytes(out[..4].try_into().unwrap()), 36.0);
 }
+
+/// Shadowing in a nested block and in the same block.
+#[kernel]
+fn shadows(mut out: BufMut<F32>, base: u32, second: bool) {
+    let col = base + lid() * 16;
+    if second {
+        let col = col + 64;
+        out[col as u64] = 1.0;
+    }
+    let col = col + 1;
+    let col = col * 2;
+    out[col as u64] = 2.0;
+}
+
+#[test]
+fn shadows_read_outer() {
+    let text = shadows_ir().text().body;
+    for line in [
+        "u32 col = (base + (lid * 16));",
+        "u32 col_1 = (col + 64);",
+        "out[(u64)col_1] = 1.0f;",
+        "u32 col_1 = (col + 1);",
+        "u32 col_2 = (col_1 * 2);",
+        "out[(u64)col_2] = 2.0f;",
+    ] {
+        assert!(text.contains(line), "`{line}` in\n{text}");
+    }
+}
