@@ -524,3 +524,42 @@ fn limits_bar_kernels() {
         "{names:?}"
     );
 }
+
+#[test]
+fn uncovered_is_named() {
+    use graph::{DType, Dim, DimName::Vocab, Size, TensorType};
+    use trace::{EntryKind, Model, Port, Role};
+    let dim = |name, size| Dim { name, size };
+    let m = Model::new(vec![
+        dim(Seqs, Size::Bounded(4)),
+        dim(Rows, Size::Bounded(4)),
+        dim(Vocab, Size::Fixed(64)),
+    ]);
+    let ty = TensorType::new([Seqs, Rows, Vocab], DType::F32);
+    let role = Role::Logits;
+    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
+    // No rule takes a lone center, so the act fails.
+    let g = m.finish([(Role::Logits, &x.center().act(Act::Silu))]);
+    let sizes = [(Seqs, 2), (Rows, 3)];
+    let Err(Error::Unsupported(what)) = lower(&g, 0, &sizes, &Device::guess(&settings())) else {
+        panic!("a lone center lowered");
+    };
+    assert!(what.starts_with("Stage(Center)"), "{what}");
+}
+
+#[test]
+fn unlinked_rules_fail() {
+    let all = rules();
+    assert!(lower::linked(&all).is_ok());
+    let own: Vec<_> = all
+        .into_iter()
+        .filter(|r| r.module.starts_with("lower::"))
+        .collect();
+    let Err(Error::Unsupported(what)) = lower::linked(&own) else {
+        panic!("only this crate's rules passed as linked");
+    };
+    assert!(
+        what.contains("use kernels as _; use linear as _;"),
+        "{what}"
+    );
+}

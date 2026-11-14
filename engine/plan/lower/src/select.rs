@@ -10,8 +10,8 @@ use crate::Error;
 use crate::cost::Device;
 use crate::form::{self, Form};
 use crate::kernel::KernelRef;
-use crate::rule::{Read, rules};
-use crate::tree::{T, Term, Tree, unsupported};
+use crate::rule::{Read, linked, rules};
+use crate::tree::{T, Term, Tree};
 use graph::{DimName, Graph, NodeId, View};
 use std::collections::BTreeSet;
 
@@ -65,6 +65,17 @@ pub struct Selected {
     pub contested: BTreeSet<&'static str>,
 }
 
+/// Names node `t`, and the root above it.
+fn uncovered(tree: &Tree, t: T, root: T) -> String {
+    let node = tree.node(t);
+    let reads: Vec<&[usize]> = node.args.iter().map(|a| &tree.node(*a).shape[..]).collect();
+    let mut what = format!("{:?} over {:?} from {reads:?}", node.term, node.shape);
+    if t != root {
+        what += &format!(", under {:?}", tree.node(root).term);
+    }
+    what
+}
+
 /// Chooses kernels for `entry`, sized by `sizes`, costed by `device`.
 pub fn select(
     g: &Graph,
@@ -83,9 +94,10 @@ pub fn select_upto(
     upto: &[DimName],
     device: &Device,
 ) -> Result<Selected, Error> {
+    let rules = rules();
+    linked(&rules)?;
     let tree = Tree::upto(g, entry, sizes, upto, &device.pins, device.kept)?;
     let nodes = (0..tree.len() as u32).map(T);
-    let rules = rules();
     let mut cover = Cover {
         tree: &tree,
         device,
@@ -95,6 +107,7 @@ pub fn select_upto(
             .map(|_| (0..device.zones()).map(|_| None).collect())
             .collect(),
         wanted: vec![Vec::new(); tree.len()],
+        bare: Vec::new(),
     };
     for (t, _) in &tree.outputs {
         cover.wanted[t.0 as usize].push(EDGE);
@@ -108,13 +121,7 @@ pub fn select_upto(
         };
         let Some(zone) = zone else {
             if tree.root(t) {
-                let node = tree.node(t);
-                let reads: Vec<&[usize]> =
-                    node.args.iter().map(|a| &tree.node(*a).shape[..]).collect();
-                return unsupported(format_args!(
-                    "{:?} over {:?} from {reads:?}",
-                    node.term, node.shape
-                ));
+                return Err(Error::Unsupported(uncovered(&tree, cover.uncovered(t), t)));
             }
             continue;
         };

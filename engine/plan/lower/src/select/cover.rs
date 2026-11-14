@@ -41,6 +41,8 @@ pub(crate) struct Cover<'a> {
     pub(crate) best: Vec<Vec<Option<Option<Choice>>>>,
     /// Per root: the zones its readers run in.
     pub(crate) wanted: Vec<Vec<u32>>,
+    /// Nodes no rule proposes at, deepest first.
+    pub(crate) bare: Vec<T>,
 }
 
 impl Cover<'_> {
@@ -122,10 +124,12 @@ impl Cover<'_> {
         }
         let kind = self.device.cluster.kind(zone as usize);
         let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
+        let mut proposed = false;
         for rule in self.rules.clone() {
             let Some(drafts) = (rule.propose)(self.tree, t) else {
                 continue;
             };
+            proposed = true;
             if drafts.iter().any(|d| d.kernel.runs_on() != kind) {
                 continue;
             }
@@ -164,7 +168,26 @@ impl Cover<'_> {
                 }
             }
         }
+        if !proposed && !self.bare.contains(&t) {
+            self.bare.push(t);
+        }
         best.map(|b| Choice { offered, ..b })
+    }
+
+    /// The deepest node below `root` that no rule proposes at.
+    pub(crate) fn uncovered(&self, root: T) -> T {
+        let mut below = vec![false; self.tree.len()];
+        let mut stack = vec![root];
+        while let Some(t) = stack.pop() {
+            below[t.0 as usize] = true;
+            for &a in &self.tree.node(t).args {
+                if !self.tree.leaf(a) && !self.tree.root(a) {
+                    stack.push(a);
+                }
+            }
+        }
+        let found = self.bare.iter().find(|t| below[t.0 as usize]);
+        found.copied().unwrap_or(root)
     }
 
     /// Seconds to widen reads the drafts cannot take as stored.
