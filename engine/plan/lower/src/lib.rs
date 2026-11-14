@@ -4,20 +4,14 @@ mod abi;
 mod assign;
 mod cache;
 mod cost;
-pub mod cpu;
 mod cut;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
-pub mod device;
 mod extent;
 pub mod form;
 mod kernel;
 pub mod kernels;
-#[cfg(target_os = "macos")]
-pub mod metal;
 mod plan;
 mod recipe;
 pub mod rule;
-mod run;
 mod schedule;
 mod select;
 pub mod sites;
@@ -31,7 +25,7 @@ pub use codegen::{Dialect, LANES, Precision, Terms, Text, float, hash, hip_tiles
 pub use cost::{Cost, Device, Sample};
 pub use cut::cut;
 pub use extent::Extent;
-pub use form::{Form, Pins};
+pub use form::{Form, Pins, Weight};
 pub use gpukit::{Limits, Pick, Platform, Settings};
 pub use kernel::{Kernel, KernelRef, Needs, UNPROVEN};
 pub use kernel_macro::Kernel;
@@ -39,7 +33,6 @@ pub use mem::{Buffer, DType, Tensor, View, ViewMut};
 pub use plan::{Loaded, Output, Plan, Slot, Step};
 pub use recipe::{Launching, Recipe};
 pub use rule::{Attn, Draft, RULES, Read, Rule, linked, rules};
-pub use run::{Held, Run, Weight, open, precision};
 pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
 pub use sim::{Cluster, Fit, Link, Load, Ops, Zone, ZoneKind};

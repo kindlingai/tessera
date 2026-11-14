@@ -12,7 +12,8 @@ mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
 use interp::Tensor;
 use lower::Pins;
-use lower::{Device, Dialect, Source, lower, open, rules};
+use lower::{Device, Dialect, Source, lower, rules};
+use run::open;
 use settings::read as settings;
 use trace::Act;
 

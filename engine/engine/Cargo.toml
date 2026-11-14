@@ -8,8 +8,8 @@ description = "Token ids in, token ids out: a stepper graph on a runner"
 
 [features]
 default = []
-cuda = ["lower/cuda", "kernels/cuda"]
-rocm = ["lower/rocm", "kernels/rocm"]
+cuda = ["run/cuda"]
+rocm = ["run/rocm"]
 
 [dependencies]
 graph = { workspace = true }
@@ -17,6 +17,7 @@ interp = { workspace = true }
 kernels = { workspace = true }
 linear = { workspace = true }
 lower = { workspace = true }
+run = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

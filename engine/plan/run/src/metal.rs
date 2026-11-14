@@ -1,13 +1,10 @@
 //! Replays a plan on Metal. Buffers stay on the device.
 
-use crate::Error;
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::extent::Extent;
-use crate::plan::{Plan, Slot};
-use crate::run::{Held, Run};
+use crate::kernels::Kernels;
+use crate::run::{Base, Run, line};
 use codegen::Dialect;
 use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared};
-use graph::DimName;
+use lower::{Arg, Error, Extent, Launch, Plan, Shape, Slot};
 use mem::Buffer;
 use objc2::msg_send;
 use objc2::runtime::ProtocolObject;
@@ -15,22 +12,16 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLSize,
 };
-use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
 type Encoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
 
-pub struct Runner {
+pub(crate) struct Runner {
     ctx: Rc<Context>,
-    plan: Plan,
-    held: Held,
+    base: Base,
     pipelines: Vec<Rc<ComputePipeline>>,
-    /// Compiled kernels, by entry, and by how a kernel prints.
-    made: HashMap<String, Rc<ComputePipeline>>,
-    known: HashMap<String, Rc<ComputePipeline>>,
-    /// Runtime dimensions, as last bound.
-    bound: HashMap<DimName, u32>,
+    compiled: Kernels<Rc<ComputePipeline>>,
 }
 
 fn gpu(what: &'static str) -> Error {
@@ -55,19 +46,16 @@ impl Runner {
     pub fn new(plan: Plan) -> Result<Self, Error> {
         let mut runner = Self {
             ctx: gpukit::metal::cached_context(CacheConfig::MEMORY)?,
-            plan: Plan::default(),
-            held: Held::default(),
+            base: Base::default(),
             pipelines: Vec::new(),
-            made: HashMap::new(),
-            known: HashMap::new(),
-            bound: HashMap::new(),
+            compiled: Kernels::default(),
         };
         runner.replan(&plan)?;
         Ok(runner)
     }
 
     fn buffer(&self, slot: Slot) -> &ProtocolObject<dyn MTLBuffer> {
-        let shared = self.held.get(slot).backing().as_any();
+        let shared = self.base.held.get(slot).backing().as_any();
         shared
             .downcast_ref::<Shared>()
             .expect("this runner allocates shared buffers")
@@ -94,8 +82,8 @@ impl Runner {
         }
         match launch.shape {
             Shape::Line(count) => {
-                let threads = count.clamp(1, 256);
-                grid(enc, count.div_ceil(threads), 1, threads);
+                let (groups, threads) = line(count);
+                grid(enc, groups, 1, threads);
             }
             Shape::Grid {
                 across,
@@ -104,17 +92,6 @@ impl Runner {
             } => grid(enc, across, down, threads),
             Shape::Runtime(_) => unreachable!("bound before encoding"),
         }
-    }
-
-    /// Each launch of a step, its runtime sizes filled in.
-    fn launches(&self, step: usize) -> Result<Vec<Launch>, Error> {
-        let size = |name| self.bound.get(&name).copied();
-        let bound = |l: Launch| l.bound(&size).ok_or(Error::Unbound);
-        self.plan.steps[step]
-            .launches()
-            .into_iter()
-            .map(bound)
-            .collect()
     }
 }
 
@@ -127,7 +104,7 @@ impl Runner {
         let enc = enc.ok_or_else(|| gpu("encoder"))?;
         for i in steps {
             enc.setComputePipelineState(&self.pipelines[i].pipeline);
-            for launch in self.launches(i)? {
+            for launch in self.base.launches(i)? {
                 self.encode(&enc, &launch);
             }
         }
@@ -142,61 +119,36 @@ impl Runner {
 }
 
 impl Run for Runner {
-    fn plan(&self) -> &Plan {
-        &self.plan
+    fn base(&self) -> &Base {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut Base {
+        &mut self.base
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        if plan.id != 0 && plan.id == self.plan.id {
+        if !self.base.fresh(plan)? {
             return Ok(());
         }
-        if plan.zoned() {
-            return Err(Error::Unsupported("a plan over several zones".into()));
-        }
         let ctx = &self.ctx;
-        self.held.bind(plan, |zone, bytes| {
+        self.base.held.bind(plan, |zone, bytes| {
             let shared = Shared::new(&ctx.device, bytes).ok_or_else(|| gpu("buffer allocation"));
             Ok(Buffer::new(zone, shared?))
         })?;
         self.pipelines.clear();
         for step in &plan.steps {
-            // Printing a kernel is cheaper than writing its source.
-            let key = format!("{:?}", step.kernel);
-            if let Some(pipeline) = self.known.get(&key) {
-                self.pipelines.push(Rc::clone(pipeline));
-                continue;
-            }
-            let pipeline = match step.kernel.source() {
-                Source::Fixed { metal, entry, .. } => {
-                    gpukit::metal::cached_pipeline(ctx, metal, entry)?
-                }
-                Source::Made(body) => match self.made.get(&body.entry) {
-                    Some(compiled) => Rc::clone(compiled),
-                    None => {
-                        let source = body.text().render(Dialect::Metal);
-                        let compiled = Rc::new(ctx.compile_kernel(&source, &body.entry)?);
-                        self.made.insert(body.entry.clone(), Rc::clone(&compiled));
-                        compiled
-                    }
-                },
+            let fixed = |text, entry| -> Result<_, Error> {
+                Ok(gpukit::metal::cached_pipeline(ctx, text, entry)?)
             };
-            self.known.insert(key, Rc::clone(&pipeline));
+            let made = |source: &str, entry: &str| -> Result<_, Error> {
+                Ok(Rc::new(ctx.compile_kernel(source, entry)?))
+            };
+            let (pipeline, _) = self.compiled.get(step, Dialect::Metal, fixed, made)?;
             self.pipelines.push(pipeline);
         }
-        self.plan = plan.clone();
+        self.base.plan = plan.clone();
         Ok(())
-    }
-
-    fn bind(&mut self, name: DimName, value: u32) {
-        self.bound.insert(name, value);
-    }
-
-    fn held(&self) -> &Held {
-        &self.held
-    }
-
-    fn held_mut(&mut self) -> &mut Held {
-        &mut self.held
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

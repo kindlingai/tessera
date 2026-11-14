@@ -1,6 +1,8 @@
 //! dlopen for the backends whose runtimes load at run time.
 
+use crate::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::OnceLock;
 
 const RTLD_NOW: c_int = 2;
 
@@ -50,6 +52,49 @@ impl Library {
         Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&raw) })
     }
 }
+
+/// The C string at `p`, or empty when null.
+pub fn message(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+/// Opens a library once per process. `fail` words the error.
+pub fn once<T>(
+    cell: &'static OnceLock<Result<T, String>>,
+    open: impl FnOnce() -> Result<T, String>,
+    fail: impl FnOnce(&str) -> Error,
+) -> Result<&'static T, Error> {
+    cell.get_or_init(open).as_ref().map_err(|msg| fail(msg))
+}
+
+/// Entry points from the first library that loads.
+macro_rules! library {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident as $what:literal in [$($file:literal),+ $(,)?] {
+            $($fvis:vis $field:ident: $ty:ty = $sym:literal,)+
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $name {
+            $($fvis $field: $ty,)+
+        }
+
+        impl $name {
+            fn open() -> Result<Self, String> {
+                let lib = $crate::dl::Library::open_first(&[$($file.to_string()),+])?;
+                Ok(Self {
+                    $($field: unsafe { lib.function::<$ty>($sym) }
+                        .map_err(|e| format!("{}: {e}", $what))?,)+
+                })
+            }
+        }
+    };
+}
+pub(crate) use library;
 
 /// FNV-1a: unlike `DefaultHasher`, stable across runs.
 pub(crate) fn image_hash(image: &[u8]) -> u64 {

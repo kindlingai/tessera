@@ -9,11 +9,12 @@ use lower::form::{BF16_FORM, F32_FORM};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
 use lower::{
-    Arg, Buffer, Device, Dialect, Error, Fit, Held, Kernel, KernelRef, Pins, Plan, Slot, Source,
-    Step, T, Tree,
+    Arg, Buffer, Device, Dialect, Error, Fit, Kernel, KernelRef, Pins, Plan, Slot, Source, Step, T,
+    Tree,
 };
 use lower::{assign, lower, peak, rules, schedule, select};
 use models::qwen3::{Config, program, stepper};
+use run::Held;
 use settings::read as settings;
 use sim::Chip;
 

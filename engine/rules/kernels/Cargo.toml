@@ -6,11 +6,6 @@ license.workspace = true
 publish.workspace = true
 description = "Kernels and the lowering rules that propose them"
 
-[features]
-default = []
-cuda = ["lower/cuda"]
-rocm = ["lower/rocm"]
-
 [dependencies]
 codegen = { workspace = true }
 graph = { workspace = true }

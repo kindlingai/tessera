@@ -9,8 +9,9 @@ use checkpoint::exlr8::Release;
 use checkpoint::{File, Offer};
 use gpukit::testing::cosine_f32;
 use interp::Tensor;
-use lower::{Device, Run, Settings, Weight, lower};
+use lower::{Device, Settings, Weight, lower};
 use models::eg2::{Config, probe};
+use run::Run;
 use std::path::Path;
 use std::time::Instant;
 use trace::Graph;
@@ -131,7 +132,7 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) ->
             None => {
                 let plan = lower(g, 0, &sizes, &device).unwrap();
                 let r = loaded(plan, g, w, settings);
-                device = Device::stored(&*r, settings).unwrap();
+                device = Device::stored(r.platform(), settings).unwrap();
                 runner.insert(r)
             }
         };

@@ -7,7 +7,8 @@ use linear as _;
 use graph::DimName::{Context, Rows, Segments, Seqs};
 use graph::Graph;
 use interp::Tensor;
-use lower::{Cache, Device, Error, Recipe, Run, Settings, Weight, open};
+use lower::{Cache, Device, Error, Recipe, Settings, Weight};
+use run::{Run, open};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -112,7 +113,7 @@ impl Engine {
         let plan = plans.lower(&graph, 0, &sizes, &device)?;
         let mut runner = open(plan, settings)?;
         runner.launching(recipe.launch);
-        let device = Device::stored(&*runner, settings)?.with(recipe);
+        let device = Device::stored(runner.platform(), settings)?.with(recipe);
         Ok(Self {
             graph,
             runner,

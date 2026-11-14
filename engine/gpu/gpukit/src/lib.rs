@@ -26,6 +26,8 @@ pub mod device;
 mod dl;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod launch;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+mod rtc;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;

@@ -8,8 +8,8 @@ description = "Generated matmul kernels, registered as lowering rules"
 
 [features]
 default = []
-cuda = ["lower/cuda"]
-rocm = ["lower/rocm"]
+cuda = ["run/cuda"]
+rocm = ["run/rocm"]
 
 [dependencies]
 codegen = { workspace = true }
@@ -21,4 +21,5 @@ settings = { workspace = true }
 kernels = { workspace = true }
 interp = { workspace = true }
 gpukit = { workspace = true }
+run = { workspace = true }
 trace = { workspace = true }

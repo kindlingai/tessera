@@ -40,6 +40,7 @@ linear = { path = "engine/rules/linear" }
 lower = { path = "engine/plan/lower" }
 mem = { path = "engine/ir/mem" }
 models = { path = "engine/models" }
+run = { path = "engine/plan/run" }
 shape = { path = "tools/shape" }
 sim = { path = "engine/plan/sim" }
 trace = { path = "engine/ir/trace" }

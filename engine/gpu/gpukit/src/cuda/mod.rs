@@ -2,7 +2,6 @@
 
 mod context;
 pub mod driver;
-pub mod nvrtc;
 
 pub use crate::launch::{
     KernelArgs, Launch, THREADS_PER_BLOCK, div_up, launch_1d, launch_grid, pod_bytes,

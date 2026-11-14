@@ -1,4 +1,3 @@
 # File pairs allowed to hold near-copies of each other.
 pairs = [
-    ["engine/gpu/gpukit/tests/cuda_smoke_test.rs", "engine/gpu/gpukit/tests/rocm_smoke_test.rs"],
 ]

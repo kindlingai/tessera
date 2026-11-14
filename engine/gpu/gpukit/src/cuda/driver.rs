@@ -1,8 +1,9 @@
-//! CUDA driver bindings, loaded at runtime with dlopen.
+//! CUDA driver and NVRTC bindings, loaded at runtime with dlopen.
 
 use crate::Error;
-use crate::dl::Library;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use crate::dl::{message, once};
+use crate::rtc::Rtc;
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub type CUresult = c_int;
@@ -50,8 +51,6 @@ pub struct LaunchConfig {
 }
 /// Other threads may still synchronize while a capture is open.
 pub const CU_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
-
-const DRIVER_LIB: &str = "libcuda.so.1";
 
 type CuInit = unsafe extern "C" fn(u32) -> CUresult;
 type CuDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> CUresult;
@@ -102,84 +101,43 @@ type CuGraphDestroy = unsafe extern "C" fn(CUgraph) -> CUresult;
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
-/// Resolved driver entry points. The dlopen handle stays open.
-pub struct Driver {
-    pub cu_init: CuInit,
-    pub cu_driver_get_version: CuDriverGetVersion,
-    pub cu_device_get_count: CuDeviceGetCount,
-    pub cu_device_get: CuDeviceGet,
-    pub cu_device_get_name: CuDeviceGetName,
-    pub cu_device_get_attribute: CuDeviceGetAttribute,
-    pub cu_ctx_create: CuCtxCreate,
-    pub cu_ctx_destroy: CuCtxDestroy,
-    pub cu_ctx_set_current: CuCtxSetCurrent,
-    pub cu_module_load_data: CuModuleLoadData,
-    pub cu_module_unload: CuModuleUnload,
-    pub cu_module_get_function: CuModuleGetFunction,
-    pub cu_mem_alloc: CuMemAlloc,
-    pub cu_mem_free: CuMemFree,
-    pub cu_memcpy_htod: CuMemcpyHtoD,
-    pub cu_memcpy_dtoh: CuMemcpyDtoH,
-    pub cu_memset_d8: CuMemsetD8,
-    pub cu_launch_kernel: CuLaunchKernel,
-    pub cu_launch_kernel_ex: CuLaunchKernelEx,
-    pub cu_stream_create: CuStreamCreate,
-    pub cu_stream_destroy: CuStreamDestroy,
-    pub cu_stream_synchronize: CuStreamSynchronize,
-    pub cu_stream_begin_capture: CuStreamBeginCapture,
-    pub cu_stream_end_capture: CuStreamEndCapture,
-    pub cu_graph_instantiate: CuGraphInstantiate,
-    pub cu_graph_launch: CuGraphLaunch,
-    pub cu_graph_exec_destroy: CuGraphExecDestroy,
-    pub cu_graph_destroy: CuGraphDestroy,
-    cu_get_error_name: CuGetErrorName,
-    cu_get_error_string: CuGetErrorString,
-}
-
-macro_rules! sym {
-    ($lib:expr, $name:literal, $ty:ty) => {
-        unsafe { $lib.function::<$ty>($name) }.map_err(|e| format!("CUDA driver: {e}"))?
-    };
+crate::dl::library! {
+    /// Resolved driver entry points. The dlopen handle stays open.
+    pub struct Driver as "CUDA driver" in ["libcuda.so.1"] {
+        pub cu_init: CuInit = "cuInit",
+        pub cu_driver_get_version: CuDriverGetVersion = "cuDriverGetVersion",
+        pub cu_device_get_count: CuDeviceGetCount = "cuDeviceGetCount",
+        pub cu_device_get: CuDeviceGet = "cuDeviceGet",
+        pub cu_device_get_name: CuDeviceGetName = "cuDeviceGetName",
+        pub cu_device_get_attribute: CuDeviceGetAttribute = "cuDeviceGetAttribute",
+        pub cu_ctx_create: CuCtxCreate = "cuCtxCreate_v2",
+        pub cu_ctx_destroy: CuCtxDestroy = "cuCtxDestroy_v2",
+        pub cu_ctx_set_current: CuCtxSetCurrent = "cuCtxSetCurrent",
+        pub cu_module_load_data: CuModuleLoadData = "cuModuleLoadData",
+        pub cu_module_unload: CuModuleUnload = "cuModuleUnload",
+        pub cu_module_get_function: CuModuleGetFunction = "cuModuleGetFunction",
+        pub cu_mem_alloc: CuMemAlloc = "cuMemAlloc_v2",
+        pub cu_mem_free: CuMemFree = "cuMemFree_v2",
+        pub cu_memcpy_htod: CuMemcpyHtoD = "cuMemcpyHtoD_v2",
+        pub cu_memcpy_dtoh: CuMemcpyDtoH = "cuMemcpyDtoH_v2",
+        pub cu_memset_d8: CuMemsetD8 = "cuMemsetD8_v2",
+        pub cu_launch_kernel: CuLaunchKernel = "cuLaunchKernel",
+        pub cu_launch_kernel_ex: CuLaunchKernelEx = "cuLaunchKernelEx",
+        pub cu_stream_create: CuStreamCreate = "cuStreamCreate",
+        pub cu_stream_destroy: CuStreamDestroy = "cuStreamDestroy_v2",
+        pub cu_stream_synchronize: CuStreamSynchronize = "cuStreamSynchronize",
+        pub cu_stream_begin_capture: CuStreamBeginCapture = "cuStreamBeginCapture_v2",
+        pub cu_stream_end_capture: CuStreamEndCapture = "cuStreamEndCapture",
+        pub cu_graph_instantiate: CuGraphInstantiate = "cuGraphInstantiateWithFlags",
+        pub cu_graph_launch: CuGraphLaunch = "cuGraphLaunch",
+        pub cu_graph_exec_destroy: CuGraphExecDestroy = "cuGraphExecDestroy",
+        pub cu_graph_destroy: CuGraphDestroy = "cuGraphDestroy",
+        cu_get_error_name: CuGetErrorName = "cuGetErrorName",
+        cu_get_error_string: CuGetErrorString = "cuGetErrorString",
+    }
 }
 
 impl Driver {
-    fn open() -> Result<Self, String> {
-        let lib =
-            Library::open_first(&[DRIVER_LIB.into()]).map_err(|e| format!("cannot load {e}"))?;
-        Ok(Driver {
-            cu_init: sym!(lib, "cuInit", CuInit),
-            cu_driver_get_version: sym!(lib, "cuDriverGetVersion", CuDriverGetVersion),
-            cu_device_get_count: sym!(lib, "cuDeviceGetCount", CuDeviceGetCount),
-            cu_device_get: sym!(lib, "cuDeviceGet", CuDeviceGet),
-            cu_device_get_name: sym!(lib, "cuDeviceGetName", CuDeviceGetName),
-            cu_device_get_attribute: sym!(lib, "cuDeviceGetAttribute", CuDeviceGetAttribute),
-            cu_ctx_create: sym!(lib, "cuCtxCreate_v2", CuCtxCreate),
-            cu_ctx_destroy: sym!(lib, "cuCtxDestroy_v2", CuCtxDestroy),
-            cu_ctx_set_current: sym!(lib, "cuCtxSetCurrent", CuCtxSetCurrent),
-            cu_module_load_data: sym!(lib, "cuModuleLoadData", CuModuleLoadData),
-            cu_module_unload: sym!(lib, "cuModuleUnload", CuModuleUnload),
-            cu_module_get_function: sym!(lib, "cuModuleGetFunction", CuModuleGetFunction),
-            cu_mem_alloc: sym!(lib, "cuMemAlloc_v2", CuMemAlloc),
-            cu_mem_free: sym!(lib, "cuMemFree_v2", CuMemFree),
-            cu_memcpy_htod: sym!(lib, "cuMemcpyHtoD_v2", CuMemcpyHtoD),
-            cu_memcpy_dtoh: sym!(lib, "cuMemcpyDtoH_v2", CuMemcpyDtoH),
-            cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
-            cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
-            cu_launch_kernel_ex: sym!(lib, "cuLaunchKernelEx", CuLaunchKernelEx),
-            cu_stream_create: sym!(lib, "cuStreamCreate", CuStreamCreate),
-            cu_stream_destroy: sym!(lib, "cuStreamDestroy_v2", CuStreamDestroy),
-            cu_stream_synchronize: sym!(lib, "cuStreamSynchronize", CuStreamSynchronize),
-            cu_stream_begin_capture: sym!(lib, "cuStreamBeginCapture_v2", CuStreamBeginCapture),
-            cu_stream_end_capture: sym!(lib, "cuStreamEndCapture", CuStreamEndCapture),
-            cu_graph_instantiate: sym!(lib, "cuGraphInstantiateWithFlags", CuGraphInstantiate),
-            cu_graph_launch: sym!(lib, "cuGraphLaunch", CuGraphLaunch),
-            cu_graph_exec_destroy: sym!(lib, "cuGraphExecDestroy", CuGraphExecDestroy),
-            cu_graph_destroy: sym!(lib, "cuGraphDestroy", CuGraphDestroy),
-            cu_get_error_name: sym!(lib, "cuGetErrorName", CuGetErrorName),
-            cu_get_error_string: sym!(lib, "cuGetErrorString", CuGetErrorString),
-        })
-    }
-
     /// The name of a driver return code.
     pub fn error_name(&self, code: CUresult) -> String {
         let mut p: *const c_char = std::ptr::null();
@@ -187,7 +145,7 @@ impl Driver {
         if p.is_null() {
             return format!("CUDA error {code}");
         }
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        message(p)
     }
 
     /// Turn a failed return code into an error naming `what`.
@@ -197,11 +155,7 @@ impl Driver {
         }
         let mut p: *const c_char = std::ptr::null();
         unsafe { (self.cu_get_error_string)(code, &mut p) };
-        let msg = if p.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-        };
+        let msg = message(p);
         Err(Error::Cuda(format!(
             "{what} failed: {} ({code}) {msg}",
             self.error_name(code)
@@ -212,8 +166,24 @@ impl Driver {
 /// The process-wide driver, opened on first use.
 pub fn driver() -> Result<&'static Driver, Error> {
     static DRIVER: OnceLock<Result<Driver, String>> = OnceLock::new();
-    match DRIVER.get_or_init(Driver::open) {
-        Ok(d) => Ok(d),
-        Err(msg) => Err(Error::Cuda(format!("CUDA driver unavailable: {msg}"))),
-    }
+    once(&DRIVER, Driver::open, |msg| {
+        Error::Cuda(format!("CUDA driver unavailable: {msg}"))
+    })
 }
+
+/// NVRTC ships with the CUDA toolkit.
+pub(crate) static NVRTC: Rtc = Rtc {
+    name: "NVRTC",
+    prefix: "nvrtc",
+    code: "PTX",
+    libraries: &[
+        "libnvrtc.so",
+        "libnvrtc.so.13",
+        "libnvrtc.so.12",
+        "libnvrtc.so.11",
+        "/usr/local/cuda/lib64/libnvrtc.so",
+    ],
+    install: "install the CUDA toolkit",
+    error: Error::Cuda,
+    lib: OnceLock::new(),
+};

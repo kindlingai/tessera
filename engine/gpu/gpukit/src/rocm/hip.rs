@@ -1,8 +1,9 @@
-//! HIP runtime bindings, loaded at runtime with dlopen.
+//! HIP runtime and hiprtc bindings, loaded at runtime with dlopen.
 
 use crate::Error;
-use crate::dl::Library;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use crate::dl::{message, once};
+use crate::rtc::Rtc;
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub type HipError = c_int;
@@ -73,96 +74,50 @@ type HipGraphDestroy = unsafe extern "C" fn(HipGraph) -> HipError;
 type HipGetErrorName = unsafe extern "C" fn(HipError) -> *const c_char;
 type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
 
-/// Resolved runtime entry points. The dlopen handle stays open.
-pub struct Runtime {
-    pub hip_init: HipInit,
-    pub hip_runtime_get_version: HipRuntimeGetVersion,
-    pub hip_device_get_attribute: HipDeviceGetAttribute,
-    pub hip_get_device_count: HipGetDeviceCount,
-    pub hip_set_device: HipSetDevice,
-    pub hip_device_get_name: HipDeviceGetName,
-    pub hip_module_load_data: HipModuleLoadData,
-    pub hip_module_unload: HipModuleUnload,
-    pub hip_module_get_function: HipModuleGetFunction,
-    pub hip_malloc: HipMalloc,
-    pub hip_free: HipFree,
-    pub hip_memcpy: HipMemcpy,
-    pub hip_memset: HipMemset,
-    pub hip_module_launch_kernel: HipModuleLaunchKernel,
-    pub hip_stream_create: HipStreamCreate,
-    pub hip_stream_destroy: HipStreamDestroy,
-    pub hip_stream_synchronize: HipStreamSynchronize,
-    pub hip_stream_begin_capture: HipStreamBeginCapture,
-    pub hip_stream_end_capture: HipStreamEndCapture,
-    pub hip_graph_instantiate: HipGraphInstantiate,
-    pub hip_graph_launch: HipGraphLaunch,
-    pub hip_graph_exec_destroy: HipGraphExecDestroy,
-    pub hip_graph_destroy: HipGraphDestroy,
-    hip_get_error_name: HipGetErrorName,
-    hip_get_error_string: HipGetErrorString,
-}
-
-macro_rules! sym {
-    ($lib:expr, $name:literal, $ty:ty) => {
-        unsafe { $lib.function::<$ty>($name) }.map_err(|e| format!("HIP runtime: {e}"))?
-    };
-}
-
-fn c_message(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
+crate::dl::library! {
+    /// Resolved runtime entry points. The dlopen handle stays open.
+    pub struct Runtime as "HIP runtime" in [
+        "libamdhip64.so",
+        "libamdhip64.so.7",
+        "libamdhip64.so.6",
+        "/opt/rocm/lib/libamdhip64.so",
+    ] {
+        pub hip_init: HipInit = "hipInit",
+        pub hip_runtime_get_version: HipRuntimeGetVersion = "hipRuntimeGetVersion",
+        pub hip_device_get_attribute: HipDeviceGetAttribute = "hipDeviceGetAttribute",
+        pub hip_get_device_count: HipGetDeviceCount = "hipGetDeviceCount",
+        pub hip_set_device: HipSetDevice = "hipSetDevice",
+        pub hip_device_get_name: HipDeviceGetName = "hipDeviceGetName",
+        pub hip_module_load_data: HipModuleLoadData = "hipModuleLoadData",
+        pub hip_module_unload: HipModuleUnload = "hipModuleUnload",
+        pub hip_module_get_function: HipModuleGetFunction = "hipModuleGetFunction",
+        pub hip_malloc: HipMalloc = "hipMalloc",
+        pub hip_free: HipFree = "hipFree",
+        pub hip_memcpy: HipMemcpy = "hipMemcpy",
+        pub hip_memset: HipMemset = "hipMemset",
+        pub hip_module_launch_kernel: HipModuleLaunchKernel = "hipModuleLaunchKernel",
+        pub hip_stream_create: HipStreamCreate = "hipStreamCreateWithFlags",
+        pub hip_stream_destroy: HipStreamDestroy = "hipStreamDestroy",
+        pub hip_stream_synchronize: HipStreamSynchronize = "hipStreamSynchronize",
+        pub hip_stream_begin_capture: HipStreamBeginCapture = "hipStreamBeginCapture",
+        pub hip_stream_end_capture: HipStreamEndCapture = "hipStreamEndCapture",
+        pub hip_graph_instantiate: HipGraphInstantiate = "hipGraphInstantiate",
+        pub hip_graph_launch: HipGraphLaunch = "hipGraphLaunch",
+        pub hip_graph_exec_destroy: HipGraphExecDestroy = "hipGraphExecDestroy",
+        pub hip_graph_destroy: HipGraphDestroy = "hipGraphDestroy",
+        hip_get_error_name: HipGetErrorName = "hipGetErrorName",
+        hip_get_error_string: HipGetErrorString = "hipGetErrorString",
     }
-    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
 impl Runtime {
-    fn open() -> Result<Self, String> {
-        let mut names: Vec<String> = Vec::new();
-        for name in [
-            "libamdhip64.so",
-            "libamdhip64.so.7",
-            "libamdhip64.so.6",
-            "/opt/rocm/lib/libamdhip64.so",
-        ] {
-            names.push(name.to_string());
-        }
-        let lib = Library::open_first(&names)?;
-        Ok(Runtime {
-            hip_init: sym!(lib, "hipInit", HipInit),
-            hip_runtime_get_version: sym!(lib, "hipRuntimeGetVersion", HipRuntimeGetVersion),
-            hip_device_get_attribute: sym!(lib, "hipDeviceGetAttribute", HipDeviceGetAttribute),
-            hip_get_device_count: sym!(lib, "hipGetDeviceCount", HipGetDeviceCount),
-            hip_set_device: sym!(lib, "hipSetDevice", HipSetDevice),
-            hip_device_get_name: sym!(lib, "hipDeviceGetName", HipDeviceGetName),
-            hip_module_load_data: sym!(lib, "hipModuleLoadData", HipModuleLoadData),
-            hip_module_unload: sym!(lib, "hipModuleUnload", HipModuleUnload),
-            hip_module_get_function: sym!(lib, "hipModuleGetFunction", HipModuleGetFunction),
-            hip_malloc: sym!(lib, "hipMalloc", HipMalloc),
-            hip_free: sym!(lib, "hipFree", HipFree),
-            hip_memcpy: sym!(lib, "hipMemcpy", HipMemcpy),
-            hip_memset: sym!(lib, "hipMemset", HipMemset),
-            hip_module_launch_kernel: sym!(lib, "hipModuleLaunchKernel", HipModuleLaunchKernel),
-            hip_stream_create: sym!(lib, "hipStreamCreateWithFlags", HipStreamCreate),
-            hip_stream_destroy: sym!(lib, "hipStreamDestroy", HipStreamDestroy),
-            hip_stream_synchronize: sym!(lib, "hipStreamSynchronize", HipStreamSynchronize),
-            hip_stream_begin_capture: sym!(lib, "hipStreamBeginCapture", HipStreamBeginCapture),
-            hip_stream_end_capture: sym!(lib, "hipStreamEndCapture", HipStreamEndCapture),
-            hip_graph_instantiate: sym!(lib, "hipGraphInstantiate", HipGraphInstantiate),
-            hip_graph_launch: sym!(lib, "hipGraphLaunch", HipGraphLaunch),
-            hip_graph_exec_destroy: sym!(lib, "hipGraphExecDestroy", HipGraphExecDestroy),
-            hip_graph_destroy: sym!(lib, "hipGraphDestroy", HipGraphDestroy),
-            hip_get_error_name: sym!(lib, "hipGetErrorName", HipGetErrorName),
-            hip_get_error_string: sym!(lib, "hipGetErrorString", HipGetErrorString),
-        })
-    }
-
     /// Turn a failed return code into an error naming `what`.
     pub fn check(&self, code: HipError, what: &str) -> Result<(), Error> {
         if code == HIP_SUCCESS {
             return Ok(());
         }
-        let name = c_message(unsafe { (self.hip_get_error_name)(code) });
-        let msg = c_message(unsafe { (self.hip_get_error_string)(code) });
+        let name = message(unsafe { (self.hip_get_error_name)(code) });
+        let msg = message(unsafe { (self.hip_get_error_string)(code) });
         Err(Error::Rocm(format!("{what} failed: {name} ({code}) {msg}")))
     }
 }
@@ -170,8 +125,23 @@ impl Runtime {
 /// The process-wide HIP runtime, opened on first use.
 pub fn runtime() -> Result<&'static Runtime, Error> {
     static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
-    match RUNTIME.get_or_init(Runtime::open) {
-        Ok(r) => Ok(r),
-        Err(msg) => Err(Error::Rocm(format!("HIP runtime unavailable: {msg}"))),
-    }
+    once(&RUNTIME, Runtime::open, |msg| {
+        Error::Rocm(format!("HIP runtime unavailable: {msg}"))
+    })
 }
+
+/// hiprtc compiles the CUDA-dialect sources for AMD devices.
+pub(crate) static HIPRTC: Rtc = Rtc {
+    name: "hiprtc",
+    prefix: "hiprtc",
+    code: "Code",
+    libraries: &[
+        "libhiprtc.so",
+        "libhiprtc.so.7",
+        "libhiprtc.so.6",
+        "/opt/rocm/lib/libhiprtc.so",
+    ],
+    install: "install ROCm",
+    error: Error::Rocm,
+    lib: OnceLock::new(),
+};

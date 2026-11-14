@@ -186,6 +186,7 @@ dependencies = [
  "kernels",
  "linear",
  "lower",
+ "run",
  "settings",
  "sim",
  "trace",
@@ -405,6 +406,7 @@ dependencies = [
  "linear",
  "lower",
  "models",
+ "run",
  "serde",
  "settings",
 ]
@@ -859,6 +861,7 @@ dependencies = [
  "interp",
  "kernels",
  "lower",
+ "run",
  "settings",
  "trace",
 ]
@@ -914,8 +917,7 @@ dependencies = [
  "linear",
  "mem",
  "models",
- "objc2",
- "objc2-metal",
+ "run",
  "scattered-collect",
  "serde",
  "serde_json",
@@ -1023,6 +1025,7 @@ dependencies = [
  "kernels",
  "linear",
  "lower",
+ "run",
  "serde_json",
  "settings",
  "trace",
@@ -1307,6 +1310,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
 dependencies = [
  "rmp",
+]
+
+[[package]]
+name = "run"
+version = "0.1.0"
+dependencies = [
+ "codegen",
+ "gpukit",
+ "graph",
+ "lower",
+ "mem",
+ "objc2",
+ "objc2-metal",
 ]
 
 [[package]]

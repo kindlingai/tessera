@@ -6,12 +6,6 @@ license.workspace = true
 publish.workspace = true
 description = "Lowers a graph to a plan of kernel launches"
 
-[features]
-default = []
-# The runtime loads when a plan first runs, as in gpukit.
-cuda = ["gpukit/cuda"]
-rocm = ["gpukit/rocm"]
-
 [dependencies]
 graph = { workspace = true }
 sim = { workspace = true }
@@ -23,26 +17,11 @@ kernel-macro = { workspace = true }
 gpukit = { workspace = true }
 mem = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6", default-features = false, features = ["std"] }
-objc2-metal = { version = "0.3", default-features = false, features = [
-    "MTLDevice",
-    "MTLCommandQueue",
-    "MTLCommandBuffer",
-    "MTLCommandEncoder",
-    "MTLComputeCommandEncoder",
-    "MTLComputePipeline",
-    "MTLLibrary",
-    "MTLBuffer",
-    "MTLResource",
-    "MTLAllocation",
-    "MTLTypes",
-] }
-
 [dev-dependencies]
 settings = { workspace = true }
 kernels = { workspace = true }
 linear = { workspace = true }
 interp = { workspace = true }
 models = { workspace = true }
+run = { workspace = true }
 trace = { workspace = true }

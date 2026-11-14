@@ -273,6 +273,7 @@ impl Api for Runtime {
 
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
         ctx.set_current()?;
-        super::hiprtc::compile_to_code(source)
+        // With no --offload-arch, hiprtc targets the current device.
+        hip::HIPRTC.compile(source, &["-std=c++17"])
     }
 }
