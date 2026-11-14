@@ -32,7 +32,13 @@ fn rms_norm<const WEIGHTED: bool>(
 }
 
 /// One thread scales each row by its root mean square.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = rms_name(self),
+    source = rms_source,
+    launches = rms_launches,
+    load = rms_load,
+)]
 pub struct RmsNorm {
     pub rows: usize,
     pub width: usize,
@@ -40,55 +46,43 @@ pub struct RmsNorm {
     pub weighted: bool,
 }
 
-impl RmsNorm {
-    fn body(&self) -> codegen::ir::Body {
-        match self.weighted {
-            true => rms_norm_ir::<true>(),
-            false => rms_norm_ir::<false>(),
-        }
+fn rms_name(k: &RmsNorm) -> &'static str {
+    match k.weighted {
+        true => "rms_norm",
+        false => "rms",
     }
 }
 
-impl Kernel for RmsNorm {
-    fn name(&self) -> &'static str {
-        match self.weighted {
-            true => "rms_norm",
-            false => "rms",
-        }
+fn rms_body(k: &RmsNorm) -> codegen::ir::Body {
+    match k.weighted {
+        true => rms_norm_ir::<true>(),
+        false => rms_norm_ir::<false>(),
     }
+}
 
-    /// Sums each row, then scales it.
-    fn load(&self, _: usize) -> Option<Load> {
-        let gain = if self.weighted {
-            4.0 * self.width as f64
-        } else {
-            0.0
-        };
-        Some(per_row(self.rows, self.width, self.body().trip(), gain))
-    }
+fn rms_source(k: &RmsNorm) -> Source {
+    Source::named(rms_body(k), format!("plan_{}", k.name()))
+}
 
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.rows, self.width]
-    }
+/// Sums each row, then scales it.
+fn rms_load(k: &RmsNorm, _: usize) -> Option<Load> {
+    let gain = if k.weighted {
+        4.0 * k.width as f64
+    } else {
+        0.0
+    };
+    Some(per_row(k.rows, k.width, rms_body(k).trip(), gain))
+}
 
-    fn source(&self) -> Source {
-        Source::named(self.body(), format!("plan_{}", self.name()))
-    }
-
-    /// Without a weight, the row stands in for it, unread.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [
-            Arg::count(self.rows),
-            Arg::count(self.width),
-            Arg::value(&self.eps),
-        ];
-        let w = step.read(usize::from(self.weighted));
-        let buffers = [step.read(0), w, step.out()];
-        vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
-            shape: Shape::Line(self.rows),
-        }]
-    }
+/// Without a weight, the row stands in for it, unread.
+fn rms_launches(k: &RmsNorm, step: &Step) -> Vec<Launch> {
+    let sizes = [Arg::count(k.rows), Arg::count(k.width), Arg::value(&k.eps)];
+    let w = step.read(usize::from(k.weighted));
+    let buffers = [step.read(0), w, step.out()];
+    vec![Launch {
+        args: buffers.into_iter().chain(sizes).collect(),
+        shape: Shape::Line(k.rows),
+    }]
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

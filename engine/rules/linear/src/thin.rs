@@ -4,13 +4,25 @@ use crate::product::{Product, Variant};
 use codegen::ir::{Body, Expr, Intrinsic};
 use codegen::prelude::*;
 use graph::Order;
-use lower::{Draft, Form as Stored, Kernel, Launch, Load, Shape, Source, Step, T, Tree, UNPROVEN};
+use lower::{Draft, Form as Stored, Kernel, Launch, Load, Shape, Step, T, Tree};
 
 /// Its row limit: each thread keeps one sum per row.
 pub const THIN_ROWS: usize = 32;
 
 /// The same product as `Matmul`, for few rows.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Kernel)]
+#[launch(
+    name = self.product.form.suffixed("thin"),
+    sizes = self.product.sizes(),
+    work = self.product.work(),
+    accepts = self.product.accepts(input, form),
+    order = Order::PerConfig,
+    // The text holds the stages. The name hashes the text.
+    source = self.product.source(self.tree(), "thin"),
+    launches = thin_launches,
+    load = thin_load,
+    unproven,
+)]
 pub struct Thin {
     pub product: Product,
 }
@@ -53,45 +65,29 @@ impl Thin {
     }
 }
 
-impl Kernel for Thin {
-    fn name(&self) -> &'static str {
-        self.product.form.suffixed("thin")
-    }
+/// One thread per column loops over all of `k`.
+fn thin_load(k: &Thin, _: usize) -> Option<Load> {
+    let Product {
+        m,
+        n,
+        k: depth,
+        form,
+        ..
+    } = k.product;
+    Some(Load {
+        threads: n,
+        group: 256,
+        trips: depth as f64,
+        trip: k.tree().trip(),
+        reads: form.matmul_bytes(m, n, depth),
+        written: 4.0 * (m * n) as f64,
+        flight: 64.0,
+    })
+}
 
-    over_product!();
-
-    /// One thread per column loops over all of `k`.
-    fn load(&self, _: usize) -> Option<Load> {
-        let Product { m, n, k, form, .. } = self.product;
-        let trip = self.tree().trip();
-        Some(Load {
-            threads: n,
-            group: 256,
-            trips: k as f64,
-            trip,
-            reads: form.matmul_bytes(m, n, k),
-            written: 4.0 * (m * n) as f64,
-            flight: 64.0,
-        })
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn source(&self) -> Source {
-        // The text holds the stages. The name hashes the text.
-        self.product.source(self.tree(), "thin")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let Product { n, k, .. } = self.product;
-        self.product.launch(step, &[n, k], Shape::Line(n))
-    }
-
-    fn guess(&self) -> f64 {
-        UNPROVEN
-    }
+fn thin_launches(k: &Thin, step: &Step) -> Vec<Launch> {
+    let Product { n, k: depth, .. } = k.product;
+    k.product.launch(step, &[n, depth], Shape::Line(n))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

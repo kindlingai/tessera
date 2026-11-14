@@ -2,7 +2,7 @@
 
 use codegen::prelude::*;
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Source, Step, T, Tree};
+use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Step, T, Tree};
 
 /// The most threads that share one row's scan.
 const PARTS: usize = 256;
@@ -16,11 +16,25 @@ pub struct Rows {
 }
 
 /// The best index in each piece of each row.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    peaks,
+    name = "peaks",
+    sizes = self.0.sizes(),
+    work = self.0.rows * self.0.width,
+    launches = self.0.launch(step, self.0.rows * self.0.parts),
+)]
 pub struct Peaks(pub Rows);
 
 /// The best of each row's peaks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    argmax,
+    name = "argmax",
+    sizes = self.0.sizes(),
+    work = self.0.rows * self.0.parts,
+    launches = self.0.launch(step, self.0.rows),
+)]
 pub struct Argmax(pub Rows);
 
 /// Strictly greater, so the lowest index wins ties.
@@ -81,50 +95,6 @@ impl Rows {
             args,
             shape: Shape::Line(threads),
         }]
-    }
-}
-
-impl Kernel for Peaks {
-    fn name(&self) -> &'static str {
-        "peaks"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
-
-    fn source(&self) -> Source {
-        Source::named(peaks_ir(), "plan_peaks")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        self.0.launch(step, self.0.rows * self.0.parts)
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        (self.0.rows * self.0.width) as f64
-    }
-}
-
-impl Kernel for Argmax {
-    fn name(&self) -> &'static str {
-        "argmax"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.0.sizes()
-    }
-
-    fn source(&self) -> Source {
-        Source::named(argmax_ir(), "plan_argmax")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        self.0.launch(step, self.0.rows)
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        (self.0.rows * self.0.parts) as f64
     }
 }
 

@@ -6,9 +6,7 @@ use codegen::ir::{BinOp, Body, Expr, Stmt};
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::finish;
-use lower::{
-    Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree, UNPROVEN,
-};
+use lower::{Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Step, T, Tree};
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +155,20 @@ fn tiled(
 }
 
 /// `x[m, k]` times `w[n, k]` transposed, by tiles.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Kernel)]
+#[launch(
+    name = self.product.form.suffixed(self.schedule.name),
+    sizes = self.product.sizes(),
+    work = self.product.work(),
+    accepts = self.product.accepts(input, form),
+    needs = tiled_needs(&self.schedule),
+    // Each device's tiles sum in their own order.
+    order = Order::PerConfig,
+    source = self.product.source(self.tree(), "tiled"),
+    launches = tiled_launches,
+    load = tiled_load,
+    unproven,
+)]
 pub struct Tiled {
     pub product: Product,
     pub schedule: Schedule,
@@ -221,69 +232,48 @@ impl Tiled {
     }
 }
 
-impl Kernel for Tiled {
-    fn name(&self) -> &'static str {
-        self.product.form.suffixed(self.schedule.name)
-    }
+fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
+    let Product { m, n, k, form, .. } = t.product;
+    let (mf, nf) = (m as f64, n as f64);
+    let (gm, gn) = t.groups();
+    let (_, _, bk) = t.schedule.block;
+    // Each operand is re-read once per group across it.
+    let mut reads = vec![
+        4.0 * mf * k as f64 * gn as f64,
+        form.bytes(n * k) as f64 * gm as f64,
+    ];
+    reads.extend((0..t.product.after.others()).map(|_| 4.0 * mf * nf));
+    Some(Load {
+        threads: gm * gn * t.schedule.threads(),
+        group: t.schedule.threads(),
+        trips: (k.div_ceil(bk)) as f64,
+        trip: t.tree().trip(),
+        reads,
+        written: 4.0 * mf * nf,
+        flight: 16.0,
+    })
+}
 
-    over_product!();
+fn tiled_launches(t: &Tiled, step: &Step) -> Vec<Launch> {
+    let Product { m, n, k, .. } = t.product;
+    let (gm, gn) = t.groups();
+    let shape = Shape::Grid {
+        across: gm * gn,
+        down: 1,
+        threads: t.schedule.threads(),
+    };
+    t.product.launch(step, &[m, n, k], shape)
+}
 
-    /// Each device's tiles sum in their own order.
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn load(&self, _: usize) -> Option<Load> {
-        let Product { m, n, k, form, .. } = self.product;
-        let (mf, nf) = (m as f64, n as f64);
-        let (gm, gn) = self.groups();
-        let (_, _, bk) = self.schedule.block;
-        // Each operand is re-read once per group across it.
-        let mut reads = vec![
-            4.0 * mf * k as f64 * gn as f64,
-            form.bytes(n * k) as f64 * gm as f64,
-        ];
-        reads.extend((0..self.product.after.others()).map(|_| 4.0 * mf * nf));
-        Some(Load {
-            threads: gm * gn * self.schedule.threads(),
-            group: self.schedule.threads(),
-            trips: (k.div_ceil(bk)) as f64,
-            trip: self.tree().trip(),
-            reads,
-            written: 4.0 * mf * nf,
-            flight: 16.0,
-        })
-    }
-
-    fn source(&self) -> Source {
-        self.product.source(self.tree(), "tiled")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let Product { m, n, k, .. } = self.product;
-        let (gm, gn) = self.groups();
-        let shape = Shape::Grid {
-            across: gm * gn,
-            down: 1,
-            threads: self.schedule.threads(),
-        };
-        self.product.launch(step, &[m, n, k], shape)
-    }
-
-    fn guess(&self) -> f64 {
-        UNPROVEN
-    }
-
-    /// Two staged slabs of `bk + PAD` floats a row.
-    fn needs(&self) -> Needs {
-        let (bm, bn, bk) = self.schedule.block;
-        Needs {
-            lanes: LANES,
-            group_bytes: 4 * (bm + bn) * (bk + PAD as usize),
-            group_threads: self.schedule.threads(),
-            tile: true,
-            ..Needs::default()
-        }
+/// Two staged slabs of `bk + PAD` floats a row.
+fn tiled_needs(schedule: &Schedule) -> Needs {
+    let (bm, bn, bk) = schedule.block;
+    Needs {
+        lanes: LANES,
+        group_bytes: 4 * (bm + bn) * (bk + PAD as usize),
+        group_threads: schedule.threads(),
+        tile: true,
+        ..Needs::default()
     }
 }
 

@@ -6,9 +6,7 @@ use codegen::prelude::*;
 use graph::{Mask, Order};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
-use lower::{
-    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, UNPROVEN,
-};
+use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -460,7 +458,18 @@ fn flash_rows(
 }
 
 /// Reads scaled queries, and keys and values apart.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "flash",
+    order = Order::PerConfig,
+    sizes = self.0.sizes(),
+    work = self.0.seqs * self.0.heads * self.0.queries * self.0.seen() * self.0.width,
+    needs = flash_needs(&self.0),
+    source = flash_source,
+    launches = flash_launches,
+    load = flash_load,
+    unproven,
+)]
 pub struct Flash(pub Attn);
 
 impl Flash {
@@ -481,77 +490,74 @@ impl Flash {
     }
 }
 
-impl Kernel for Flash {
-    over_attn!("flash");
+fn flash_load(k: &Flash, len: usize) -> Option<Load> {
+    let a = &k.0;
+    let (keys, side) = (a.seen() as f64, (a.kv_heads * a.width) as f64);
+    // Each query block and slice reads the keys and values.
+    let slices = (a.width / chunk(a.width)) as f64;
+    let blocks = a.queries.div_ceil(BQ as usize) as f64 * slices;
+    let per_seq = 4.0 * keys * side * blocks;
+    Some(Load {
+        threads: a.seqs * k.groups() * THREADS as usize,
+        group: THREADS as usize,
+        trips: keys / BK as f64 * slices,
+        trip: k.tree().trip(),
+        reads: vec![
+            4.0 * len as f64,
+            per_seq * a.seqs as f64,
+            per_seq * a.seqs as f64,
+        ],
+        written: 4.0 * len as f64,
+        flight: 16.0,
+    })
+}
 
-    fn load(&self, len: usize) -> Option<Load> {
-        let a = &self.0;
-        let (keys, side) = (a.seen() as f64, (a.kv_heads * a.width) as f64);
-        // Each query block and slice reads the keys and values.
-        let slices = (a.width / chunk(a.width)) as f64;
-        let blocks = a.queries.div_ceil(BQ as usize) as f64 * slices;
-        let per_seq = 4.0 * keys * side * blocks;
-        Some(Load {
-            threads: a.seqs * self.groups() * THREADS as usize,
-            group: THREADS as usize,
-            trips: keys / BK as f64 * slices,
-            trip: self.tree().trip(),
-            reads: vec![
-                4.0 * len as f64,
-                per_seq * a.seqs as f64,
-                per_seq * a.seqs as f64,
-            ],
-            written: 4.0 * len as f64,
-            flight: 16.0,
-        })
-    }
+fn flash_source(k: &Flash) -> Source {
+    Source::named(k.tree(), format!("flash_{}", k.0.width))
+}
 
-    fn source(&self) -> Source {
-        Source::named(self.tree(), format!("flash_{}", self.0.width))
-    }
+/// One launch per sequence, each at its own offset.
+fn flash_launches(k: &Flash, step: &Step) -> Vec<Launch> {
+    let a = &k.0;
+    let per_q = a.queries * a.heads * a.width;
+    let per_kv = a.keys.most() * a.kv_heads * a.width;
+    let buffers = |s: usize| {
+        [
+            Arg::at(step.reads[0], s * per_q),
+            Arg::at(step.reads[1], s * per_kv),
+            Arg::at(step.reads[2], s * per_kv),
+            Arg::at(step.write, s * per_q),
+        ]
+    };
+    let launch = |s| a.launch(buffers(s), [], k.groups(), THREADS as usize);
+    (0..a.seqs).map(launch).collect()
+}
 
-    /// One launch per sequence, each at its own offset.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let per_q = a.queries * a.heads * a.width;
-        let per_kv = a.keys.most() * a.kv_heads * a.width;
-        let buffers = |s: usize| {
-            [
-                Arg::at(step.reads[0], s * per_q),
-                Arg::at(step.reads[1], s * per_kv),
-                Arg::at(step.reads[2], s * per_kv),
-                Arg::at(step.write, s * per_q),
-            ]
-        };
-        let launch = |s| a.launch(buffers(s), [], self.groups(), THREADS as usize);
-        (0..a.seqs).map(launch).collect()
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        (a.seqs * a.heads * a.queries * a.seen() * a.width) as f64
-    }
-
-    fn guess(&self) -> f64 {
-        UNPROVEN
-    }
-
-    /// Q and K chunks, P, sums, and the seen ranges.
-    fn needs(&self) -> Needs {
-        let (w, bq, bk, pad) = (chunk(self.0.width), BQ as usize, BK as usize, PAD as usize);
-        let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 4 * bq;
-        Needs {
-            lanes: LANES,
-            group_bytes: 4 * floats,
-            group_threads: THREADS as usize,
-            tile: true,
-            ..Needs::default()
-        }
+/// Q and K chunks, P, sums, and the seen ranges.
+fn flash_needs(a: &Attn) -> Needs {
+    let (w, bq, bk, pad) = (chunk(a.width), BQ as usize, BK as usize, PAD as usize);
+    let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 4 * bq;
+    Needs {
+        lanes: LANES,
+        group_bytes: 4 * floats,
+        group_threads: THREADS as usize,
+        tile: true,
+        ..Needs::default()
     }
 }
 
 /// Scaled query rows over kept keys, by slot and position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "flash_rows",
+    order = Order::PerConfig,
+    sizes = self.0.sizes(),
+    work = self.0.heads * self.0.queries * self.0.keys.most() * self.0.width * self.passes(),
+    needs = rows_needs(&self.0),
+    source = rows_source,
+    launches = rows_launches,
+    load = rows_load,
+)]
 pub struct FlashRows(pub Attn);
 
 impl FlashRows {
@@ -568,66 +574,61 @@ impl FlashRows {
     fn groups(&self) -> usize {
         self.0.heads * self.0.queries.div_ceil(BQ as usize)
     }
+
+    /// Key passes: one a segment, up to a block.
+    fn passes(&self) -> usize {
+        self.0.segments.min(BQ as usize)
+    }
 }
 
-impl Kernel for FlashRows {
-    over_attn!("flash_rows");
+/// One launch. A block streams keys once per slot.
+fn rows_load(k: &FlashRows, len: usize) -> Option<Load> {
+    let a = &k.0;
+    let (keys, side) = (a.keys.most() as f64, (a.kv_heads * a.width) as f64);
+    let blocks = a.queries.div_ceil(BQ as usize) as f64;
+    let passes = k.passes() as f64;
+    let streamed = 4.0 * keys * side * blocks * passes;
+    Some(Load {
+        threads: k.groups() * THREADS as usize,
+        group: THREADS as usize,
+        trips: passes * keys / BK as f64,
+        trip: k.tree().trip(),
+        reads: vec![4.0 * len as f64, streamed, streamed],
+        written: 4.0 * len as f64,
+        flight: 16.0,
+    })
+}
 
-    /// One launch. A block streams keys once per slot.
-    fn load(&self, len: usize) -> Option<Load> {
-        let a = &self.0;
-        let (keys, side) = (a.keys.most() as f64, (a.kv_heads * a.width) as f64);
-        let blocks = a.queries.div_ceil(BQ as usize) as f64;
-        let passes = a.segments.min(BQ as usize) as f64;
-        let streamed = 4.0 * keys * side * blocks * passes;
-        Some(Load {
-            threads: self.groups() * THREADS as usize,
-            group: THREADS as usize,
-            trips: passes * keys / BK as f64,
-            trip: self.tree().trip(),
-            reads: vec![4.0 * len as f64, streamed, streamed],
-            written: 4.0 * len as f64,
-            flight: 16.0,
-        })
-    }
+fn rows_source(k: &FlashRows) -> Source {
+    let body = kept::attach(k.tree(), k.0.kept);
+    let entry = format!("flash_rows_{}_{}", k.0.width, k.0.kept.name());
+    Source::named(body, entry)
+}
 
-    fn source(&self) -> Source {
-        let body = kept::attach(self.tree(), self.0.kept);
-        let entry = format!("flash_rows_{}_{}", self.0.width, self.0.kept.name());
-        Source::named(body, entry)
-    }
+fn rows_launches(k: &FlashRows, step: &Step) -> Vec<Launch> {
+    let a = &k.0;
+    let mut args = a.rows_args(step);
+    args.extend(a.kept_args());
+    vec![Launch {
+        args,
+        shape: Shape::Grid {
+            across: k.groups(),
+            down: 1,
+            threads: THREADS as usize,
+        },
+    }]
+}
 
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let mut args = a.rows_args(step);
-        args.extend(a.kept_args());
-        vec![Launch {
-            args,
-            shape: Shape::Grid {
-                across: self.groups(),
-                down: 1,
-                threads: THREADS as usize,
-            },
-        }]
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        let passes = a.segments.min(BQ as usize);
-        (a.heads * a.queries * a.keys.most() * a.width * passes) as f64
-    }
-
-    /// Q, the K and V slot, P, sums, seen counts.
-    fn needs(&self) -> Needs {
-        let (w, bq, bk, pad) = (self.0.width, BQ as usize, BK as usize, PAD as usize);
-        let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 3 * bq;
-        Needs {
-            lanes: LANES,
-            group_bytes: 4 * floats,
-            group_threads: THREADS as usize,
-            tile: true,
-            ..Needs::default()
-        }
+/// Q, the K and V slot, P, sums, seen counts.
+fn rows_needs(a: &Attn) -> Needs {
+    let (w, bq, bk, pad) = (a.width, BQ as usize, BK as usize, PAD as usize);
+    let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 3 * bq;
+    Needs {
+        lanes: LANES,
+        group_bytes: 4 * floats,
+        group_threads: THREADS as usize,
+        tile: true,
+        ..Needs::default()
     }
 }
 
