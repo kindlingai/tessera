@@ -1,5 +1,7 @@
 //! `tessera-eval --model <path> [--recipe <json>] [--m 1,4]`: JSON out.
 
+use checkpoint::exlr8::Release;
+use checkpoint::{File, Gguf, Offer, Stored};
 use engine::{Engine, Row};
 use lower::{Pins, Recipe};
 use serde::Serialize;
@@ -12,7 +14,33 @@ use std::time::Instant;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--m <list>] [--new <n>] \
-[--prompt <text>] [--reference <dir>] [--context <rows>]";
+[--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>]";
+
+/// A checkpoint's slices, as a manifest for the model tests.
+fn manifest(model: &Path) -> Result<String, Failure> {
+    let offer: Box<dyn Offer> = if model.is_file() {
+        Box::new(Gguf::open(model)?)
+    } else if model.join("exlr8-vocab.safetensors").is_file() {
+        Box::new(Release::open(model))
+    } else {
+        Box::new(File::open(&model.join("model.safetensors"))?)
+    };
+    let stored = |s: Stored| match s {
+        Stored::F32 => "f32".to_string(),
+        Stored::Bf16 => "bf16".to_string(),
+        Stored::F16 => "f16".to_string(),
+        Stored::Form(f) => f.name().to_string(),
+        Stored::Other => "other".to_string(),
+    };
+    // One slice a line, so a manifest diffs by tensor.
+    let mut lines = Vec::new();
+    for s in offer.slices() {
+        let entry =
+            serde_json::json!({"name": s.name, "shape": s.shape, "stored": stored(s.stored)});
+        lines.push(format!("  {}", serde_json::to_string(&entry)?));
+    }
+    Ok(format!("[\n{}\n]\n", lines.join(",\n")))
+}
 
 struct Args {
     model: PathBuf,
@@ -25,6 +53,8 @@ struct Args {
     /// A directory with `tokens.txt` and `logits.f32` to check against.
     reference: Option<PathBuf>,
     context: usize,
+    /// Write the file's slices as JSON, then stop.
+    slices: Option<PathBuf>,
 }
 
 fn args() -> Option<Args> {
@@ -36,6 +66,7 @@ fn args() -> Option<Args> {
         prompt: "The capital of France is".into(),
         reference: None,
         context: 4096,
+        slices: None,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -54,6 +85,7 @@ fn args() -> Option<Args> {
             "--prompt" => args.prompt = value,
             "--reference" => args.reference = Some(value.into()),
             "--context" => args.context = value.parse().ok()?,
+            "--slices" => args.slices = Some(value.into()),
             _ => return None,
         }
     }
@@ -206,6 +238,15 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    if let Some(out) = &args.slices {
+        return match manifest(&args.model).and_then(|text| Ok(std::fs::write(out, text)?)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("tessera-eval: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match evaluate(&args) {
         Ok(report) => {
             println!(

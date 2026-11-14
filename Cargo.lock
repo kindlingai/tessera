@@ -426,6 +426,7 @@ name = "eval"
 version = "0.1.0"
 dependencies = [
  "bundle",
+ "checkpoint",
  "engine",
  "lower",
  "serde",
@@ -1025,6 +1026,7 @@ dependencies = [
  "kernels",
  "linear",
  "lower",
+ "serde_json",
  "settings",
  "trace",
 ]
