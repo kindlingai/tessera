@@ -4,10 +4,10 @@ mod golden_test;
 mod rotation_test;
 mod rows_test;
 
-use crate::common::{Golden, Spec, Tolerance, small_stack, suite};
+use crate::common::{Check, Compare, Golden, Source, Spec, Tolerance, small_stack, suite};
 use lower::form::F32_FORM;
 use models::Rotated;
-use models::eg2::{Config, program};
+use models::eg2::{Config, probe, program};
 use trace::Composite::{Attention, Mlp};
 use trace::{Graph, Linear};
 
@@ -32,17 +32,35 @@ fn release() -> Graph {
     program::<Linear>(&Config::release(1, 1024))
 }
 
-/// The embedding is a unit vector, so no max_abs bound.
+/// The residual stream after `layers`, its JSON read back.
+fn probed(layers: u64) -> Graph {
+    let mut c = Config::release(1, 1024);
+    c.stack.layers = layers;
+    Graph::from_json(&probe::<Linear>(&c).to_json()).unwrap()
+}
+
+/// Unit vectors and layer means, so no max_abs bound.
+const CLOSE: Tolerance = Tolerance {
+    max_abs: f32::INFINITY,
+    cos: 0.9999,
+    top: false,
+};
+
 pub const GOLDEN: Golden = Golden {
-    read: golden_test::read,
+    source: Source::Files(|s| s.eg2.clone()),
     form: F32_FORM,
-    tolerance: Tolerance {
-        max_abs: f32::INFINITY,
-        cos: 0.9999,
-        top: false,
-    },
-    per_token: false,
-    unit: true,
+    checks: &[
+        Check {
+            name: "embedding",
+            compare: Compare::Unit,
+            tolerance: CLOSE,
+        },
+        Check {
+            name: "layer_means",
+            compare: Compare::Layers(probed, &[1, 2, 5, 6, 12, 24]),
+            tolerance: CLOSE,
+        },
+    ],
     anywhere: false,
 };
 

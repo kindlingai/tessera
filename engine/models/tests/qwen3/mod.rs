@@ -3,7 +3,7 @@
 mod golden_test;
 mod step_test;
 
-use crate::common::{Golden, Spec, Tolerance, small_stack, suite};
+use crate::common::{Check, Compare, Golden, Source, Spec, Tolerance, small_stack, suite};
 use lower::form::BF16_FORM;
 use models::qwen3::{Config, program};
 use trace::Composite::{Attention, Mlp};
@@ -24,17 +24,22 @@ fn release() -> Graph {
     program(&Config::small(8, 40_960))
 }
 
-/// Plans keep the reference checkpoint in bf16.
-pub const GOLDEN: Golden = Golden {
-    read: golden_test::read,
-    form: BF16_FORM,
+/// Each position must pick the reference's top token.
+pub const LOGITS: Check = Check {
+    name: "logits",
+    compare: Compare::Tokens,
     tolerance: Tolerance {
         max_abs: 1e-3,
         cos: 0.99999,
         top: true,
     },
-    per_token: true,
-    unit: false,
+};
+
+/// Plans keep the reference checkpoint in bf16.
+pub const GOLDEN: Golden = Golden {
+    source: Source::Files(|s| s.qwen3.clone()),
+    form: BF16_FORM,
+    checks: &[LOGITS],
     anywhere: false,
 };
 

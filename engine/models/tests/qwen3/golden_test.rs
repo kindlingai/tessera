@@ -1,19 +1,16 @@
 //! Qwen3-0.6B on the GPU: timing, cost and decoding.
 
-use super::{GOLDEN, release};
-use crate::common::{
-    Case, Reference, floats, interpreted, kernels, loaded, seconds, table, tokens,
-};
+use super::{GOLDEN, LOGITS, release};
+use crate::common::{interpreted, kernels, loaded, seconds, table};
 use calibrate::{headroom, measure};
-use checkpoint::File;
-use interp::{Tensor, bind};
+use interp::Tensor;
 use lower::{Cache, Device, Pins, Plan, Settings, View, lower, select};
-use models::qwen3::{Config, stepper, tensor_name};
+use models::qwen3::{Config, stepper};
 use run::Run;
 use std::time::Instant;
 use testkit::{argmax, max_abs_diff};
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
-use trace::{Graph, PathSeg};
+use trace::Graph;
 
 /// Read from the directory `TESSERA_QWEN3` names.
 struct Fixture {
@@ -23,30 +20,14 @@ struct Fixture {
     want: Vec<f32>,
 }
 
-/// The reference the suite's golden test reads.
-pub fn read(g: &Graph) -> Option<Reference> {
-    let dir = settings::read().qwen3?;
-    let file = File::open(&dir.join("model.safetensors")).unwrap();
-    let find = |p: &[PathSeg]| {
-        let v = file.floats(&tensor_name(p)?).ok()?;
-        Some(Tensor::f32(vec![v.len()], v))
-    };
-    let tokens = tokens(&dir.join("tokens.txt"));
-    let want = floats(&dir.join("logits.f32"));
-    Some(Reference {
-        weights: bind(g, find).unwrap(),
-        cases: vec![Case::one("reference", tokens, want)],
-    })
-}
-
 fn fixture(g: &Graph) -> Option<Fixture> {
-    let mut reference = read(g)?;
-    let one = reference.cases.remove(0);
+    let mut reference = GOLDEN.reference("qwen3", g)?;
+    let mut one = reference.cases.remove(0);
     Some(Fixture {
         settings: settings::read(),
         weights: reference.weights,
+        want: one.outputs.remove("logits").unwrap(),
         tokens: one.tokens,
-        want: one.want,
     })
 }
 
@@ -57,7 +38,7 @@ fn logits(g: &Graph, c: &Fixture, tokens: &[u32]) -> Vec<f32> {
 
 /// Each position must pick the reference's top token.
 fn close(label: &str, got: &[f32], c: &Fixture) {
-    GOLDEN.tolerance.check(label, got, &c.want, c.tokens.len());
+    LOGITS.tolerance.check(label, got, &c.want, c.tokens.len());
 }
 
 #[test]
