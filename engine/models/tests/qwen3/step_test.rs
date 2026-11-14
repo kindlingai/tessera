@@ -2,8 +2,9 @@
 
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Store, Tensor, run, run_kept};
-use lower::{Device, Run, lower, open, rules};
+use lower::{Device, lower, rules};
 use models::qwen3::{Config, program, stepper};
+use run::{Run, open};
 use settings::read as settings;
 use trace::DimName::{Context, Rows, Segments, Seqs};
 use trace::Graph;

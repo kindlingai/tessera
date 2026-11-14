@@ -8,8 +8,8 @@ description = "Model descriptions, traced into graphs"
 
 [features]
 default = []
-cuda = ["lower/cuda", "calibrate/cuda", "kernels/cuda"]
-rocm = ["lower/rocm", "calibrate/rocm", "kernels/rocm"]
+cuda = ["run/cuda", "calibrate/cuda"]
+rocm = ["run/rocm", "calibrate/rocm"]
 
 [dependencies]
 graph = { workspace = true }
@@ -26,3 +26,4 @@ interp = { workspace = true }
 lower = { workspace = true }
 gpukit = { workspace = true }
 linear = { workspace = true }
+run = { workspace = true }

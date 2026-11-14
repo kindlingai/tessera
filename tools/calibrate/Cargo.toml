@@ -8,8 +8,8 @@ description = "Times kernels on this machine and stores what they cost"
 
 [features]
 default = []
-cuda = ["lower/cuda", "kernels/cuda"]
-rocm = ["lower/rocm", "kernels/rocm"]
+cuda = ["run/cuda"]
+rocm = ["run/rocm"]
 
 [[bin]]
 name = "tessera-calibrate"
@@ -25,5 +25,6 @@ sim = { workspace = true }
 kernels = { workspace = true }
 linear = { workspace = true }
 gpukit = { workspace = true }
+run = { workspace = true }
 
 [dev-dependencies]

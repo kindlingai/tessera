@@ -10,9 +10,10 @@ use lower::kernels::Map;
 use lower::sites;
 use lower::{
     Cluster, Device, Draft, Error, Kernel, Launch, Link, Plan, Source, Step, T, Tree, Zone,
-    ZoneKind, lower, open,
+    ZoneKind, lower,
 };
 use models::qwen3::{Config, stepper};
+use run::open;
 use settings::read as settings;
 use sim::Tag;
 

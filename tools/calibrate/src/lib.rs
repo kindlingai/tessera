@@ -10,7 +10,8 @@ use linear as _;
 pub use grid::Grid;
 
 use graph::{DimName, Graph};
-use lower::{Device, Error, Run, Settings, Step, View, lower, select};
+use lower::{Device, Error, Settings, Step, View, lower, select};
+use run::Run;
 use sim::Chip;
 use std::collections::BTreeMap;
 

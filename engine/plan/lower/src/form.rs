@@ -1,9 +1,17 @@
 //! Pins: which registered form each weight takes.
 
 use graph::PathSeg;
+use mem::Tensor;
 use serde::{Deserialize, Serialize};
 
 pub use codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, FORMS, Form, U32, U32_FORM, named, of};
+
+/// A weight as a file holds it.
+pub enum Weight {
+    Floats(Tensor),
+    /// One form's bytes, as `Form::pack` lays them out.
+    Packed(&'static dyn Form, Vec<u8>),
+}
 
 /// The form of each weight, as the user says.
 #[derive(Clone, Debug, PartialEq)]

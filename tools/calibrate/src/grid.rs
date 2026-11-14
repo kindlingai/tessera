@@ -3,7 +3,8 @@
 use crate::measure;
 use gpukit::testing::Noise;
 use graph::DimName::{self, *};
-use lower::{Device, Error, Run, Settings, Step, Tensor, View, lower, open};
+use lower::{Device, Error, Settings, Step, Tensor, View, lower};
+use run::{Run, open};
 use trace::{
     Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
     TensorType, Weights, declare,

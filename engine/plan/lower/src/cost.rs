@@ -4,7 +4,6 @@ use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::plan::{Plan, Step};
 use crate::recipe::Recipe;
-use crate::run::Run;
 use codegen::kept::Layout;
 use gpukit::{Limits, Platform, Settings};
 use serde::{Deserialize, Serialize};
@@ -162,7 +161,7 @@ impl Device {
     /// The device `open` picks under `settings`, before any samples.
     pub fn guess(settings: &Settings) -> Self {
         let platform = match settings.gpu() {
-            None => Platform::host(crate::cpu::limits(settings.host_lanes)),
+            None => Platform::host(Limits::host(settings.host_lanes)),
             Some(_) => Platform::assumed(Limits::assumed()),
         };
         Self {
@@ -178,9 +177,8 @@ impl Device {
         Some(settings.costs.as_ref()?.join(format!("{file}.json")))
     }
 
-    /// The samples stored for the runner's platform, or a guess.
-    pub fn stored(runner: &dyn Run, settings: &Settings) -> Result<Self, Error> {
-        let platform = runner.platform();
+    /// The samples stored for `platform`, or a guess.
+    pub fn stored(platform: Platform, settings: &Settings) -> Result<Self, Error> {
         let loaded = Self::path(settings, &platform.id()).map(|p| Self::load(&p));
         let device = match loaded {
             Some(Err(e)) if e.kind() == ErrorKind::NotFound => Self::guess(settings),

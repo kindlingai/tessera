@@ -10,8 +10,9 @@ use graph::DimName::{Context, Ffn, HeadDim, Heads, Hidden, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Tensor, run};
 use lower::form::BF16_FORM;
-use lower::{Device, Pins, View, cut, lower, open, rules};
+use lower::{Device, Pins, View, cut, lower, rules};
 use models::{Stack, nanogpt, qwen3};
+use run::open;
 use settings::read as settings;
 use trace::{EntryKind, Linear, Mask, Model, Port, Role, Weights};
 

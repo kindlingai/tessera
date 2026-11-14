@@ -34,6 +34,17 @@ impl Limits {
             pdl: false,
         }
     }
+
+    /// A host group's limits, `lanes` to a SIMD group.
+    pub const fn host(lanes: usize) -> Self {
+        Self {
+            lanes,
+            group_bytes: 64 * 1024,
+            group_threads: 1024,
+            compiler: false,
+            pdl: false,
+        }
+    }
 }
 
 impl Default for Limits {

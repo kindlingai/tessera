@@ -11,7 +11,8 @@ mod common;
 use common::{Finish, finished, linear, noise, runs, terms};
 use linear::{SCHEDULES, Schedule};
 use lower::form::FORMS;
-use lower::{Device, Dialect, Pins, Source, lower, open, rules};
+use lower::{Device, Dialect, Pins, Source, lower, rules};
+use run::open;
 use settings::read as settings;
 use trace::Act;
 

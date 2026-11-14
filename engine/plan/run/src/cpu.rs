@@ -1,28 +1,19 @@
 //! Replays a plan on the host, each tree in lockstep.
 
-use crate::Error;
-use crate::abi::{Arg, Launch, Shape, Source};
-use crate::extent::Extent;
-use crate::plan::Plan;
-use crate::run::{Held, Run};
+use crate::run::{Base, Run, line};
 use codegen::Precision;
 use codegen::exec::{self, ArgVal, Grid};
 use codegen::ir::{Body, Param, Ty};
-use gpukit::Limits;
-use gpukit::Platform;
-use graph::DimName;
+use gpukit::{Limits, Platform};
+use lower::{Arg, Error, Extent, Launch, Plan, Shape, Source};
 use mem::{Buffer, Host};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Instant;
 
-pub struct Runner {
-    plan: Plan,
-    held: Held,
+pub(crate) struct Runner {
+    base: Base,
     /// Each step's tree. Hand-written kernels have none here.
     bodies: Vec<Option<Body>>,
-    /// Runtime dimensions, as last bound.
-    bound: HashMap<DimName, u32>,
     lanes: usize,
     precision: Precision,
 }
@@ -30,10 +21,8 @@ pub struct Runner {
 impl Runner {
     pub fn new(plan: Plan, lanes: usize, precision: Precision) -> Result<Self, Error> {
         let mut runner = Self {
-            plan: Plan::default(),
-            held: Held::default(),
+            base: Base::default(),
             bodies: Vec::new(),
-            bound: HashMap::new(),
             lanes,
             precision,
         };
@@ -41,21 +30,10 @@ impl Runner {
         Ok(runner)
     }
 
-    /// Each launch of a step, its runtime sizes filled in.
-    fn launches(&self, step: usize) -> Result<Vec<Launch>, Error> {
-        let size = |name| self.bound.get(&name).copied();
-        let bound = |l: Launch| l.bound(&size).ok_or(Error::Unbound);
-        self.plan.steps[step]
-            .launches()
-            .into_iter()
-            .map(bound)
-            .collect()
-    }
-
     /// One launch of `step`'s tree over the host.
     fn launch(&mut self, step: usize, launch: &Launch) -> Result<(), Error> {
         let Some(body) = &self.bodies[step] else {
-            let what = self.plan.steps[step].kernel.name();
+            let what = self.base.plan.steps[step].kernel.name();
             return Err(Error::Unsupported(format!("{what} is hand-written")));
         };
         // Every buffer once, however many arguments point into it.
@@ -93,11 +71,8 @@ impl Runner {
         }
         let grid = match launch.shape {
             Shape::Line(count) => {
-                let threads = count.clamp(1, 256);
-                Grid {
-                    groups: count.div_ceil(threads),
-                    threads,
-                }
+                let (groups, threads) = line(count);
+                Grid { groups, threads }
             }
             Shape::Grid {
                 across,
@@ -110,44 +85,26 @@ impl Runner {
             Shape::Runtime(_) => unreachable!("bound before running"),
         };
         let body = body.clone();
-        let mut mapped = self.held.mapped_mut(&buffers);
+        let mut mapped = self.base.held.mapped_mut(&buffers);
         exec::run(&body, &args, &mut mapped, grid, self.lanes, self.precision);
         Ok(())
     }
 }
 
-/// A host group's limits, `lanes` to a SIMD group.
-pub fn limits(lanes: usize) -> Limits {
-    Limits {
-        lanes,
-        group_bytes: 64 * 1024,
-        group_threads: 1024,
-        compiler: false,
-        pdl: false,
-    }
-}
-
 impl Run for Runner {
-    fn plan(&self) -> &Plan {
-        &self.plan
+    fn base(&self) -> &Base {
+        &self.base
     }
 
-    fn held(&self) -> &Held {
-        &self.held
-    }
-
-    fn held_mut(&mut self) -> &mut Held {
-        &mut self.held
+    fn base_mut(&mut self) -> &mut Base {
+        &mut self.base
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        if plan.id != 0 && plan.id == self.plan.id {
+        if !self.base.fresh(plan)? {
             return Ok(());
         }
-        if plan.zoned() {
-            return Err(Error::Unsupported("a plan over several zones".into()));
-        }
-        self.held.bind(plan, |zone, bytes| {
+        self.base.held.bind(plan, |zone, bytes| {
             Ok(Buffer::new(zone, Host::new(bytes.max(4))))
         })?;
         self.bodies = plan
@@ -158,17 +115,13 @@ impl Run for Runner {
                 Source::Fixed { .. } => None,
             })
             .collect();
-        self.plan = plan.clone();
+        self.base.plan = plan.clone();
         Ok(())
-    }
-
-    fn bind(&mut self, name: DimName, value: u32) {
-        self.bound.insert(name, value);
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
-            for launch in self.launches(i)? {
+            for launch in self.base.launches(i)? {
                 self.launch(i, &launch)?;
             }
         }
@@ -194,7 +147,7 @@ impl Run for Runner {
     }
 
     fn platform(&self) -> Platform {
-        Platform::host(limits(self.lanes))
+        Platform::host(Limits::host(self.lanes))
     }
 
     fn precision(&self) -> Precision {
