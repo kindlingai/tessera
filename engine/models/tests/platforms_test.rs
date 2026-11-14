@@ -3,7 +3,7 @@
 // The other matmul rules come from here.
 use kernels as _;
 
-use gpukit::platform::{backend_of, row_for, rows};
+use gpukit::platform::{backend_of, rows};
 use gpukit::testing::scratch;
 use linear::{SCHEDULES, Tiled};
 use lower::sites::After;
@@ -55,24 +55,6 @@ fn run(program: &str, args: &[&str], dir: &Path) -> (bool, String) {
     let text =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     (out.status.success(), text)
-}
-
-#[test]
-fn table_resolves() {
-    let tile = |id: &str| row_for(id).and_then(|r| r.tile);
-    assert_eq!(tile("cuda sm_121"), Some([16, 8, 8]));
-    assert_eq!(tile("cuda sm_90"), Some([16, 8, 8]));
-    assert_eq!(tile("cuda sm_75"), None, "a row with no usable tile");
-    assert!(row_for("cuda sm_75").is_some());
-    assert!(row_for("cuda sm_61").is_none(), "no row at all");
-    assert_eq!(tile("rocm gfx11_5"), Some([16, 16, 16]));
-    assert_eq!(tile("metal applegpu_g15p"), Some([8, 8, 8]));
-    assert_eq!(tile("metal apple9"), Some([8, 8, 8]));
-    assert!(row_for("cuda sm_90").is_some_and(|r| r.pdl));
-    assert!(row_for("cuda sm_89").is_some_and(|r| !r.pdl));
-    for row in rows() {
-        assert!(!row.matches.is_empty(), "{row:?}");
-    }
 }
 
 /// A toolkit that is not installed is skipped.

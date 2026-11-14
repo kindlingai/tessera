@@ -9,6 +9,8 @@ pub use settings::{Pick, Settings};
 pub mod backend;
 pub mod limits;
 pub mod platform;
+#[cfg(test)]
+mod platform_test;
 pub mod settings;
 
 pub mod includes;
