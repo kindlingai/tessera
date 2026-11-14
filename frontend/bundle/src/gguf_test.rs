@@ -1,4 +1,5 @@
-use crate::gguf::{pins, tensor_name};
+use crate::gguf::pins;
+use crate::names_test::gguf_name as tensor_name;
 use engine::{Engine, Row};
 use graph::Graph;
 use interp::Tensor;

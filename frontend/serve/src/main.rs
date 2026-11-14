@@ -56,11 +56,21 @@ fn engine_thread(
     queue: mpsc::Sender<Job>,
 ) {
     let start = Instant::now();
-    let loaded = match bundle::load(&args.model, args.slots as u64, args.context as u64) {
-        Ok(loaded) => loaded,
-        Err(e) => return drop(ready.send(Err(e.to_string()))),
-    };
     let settings = settings::read();
+    let rules = match &settings.names {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| bundle::names::rules(&text).map_err(|e| e.to_string())),
+        None => Ok(Vec::new()),
+    };
+    let loaded = rules.and_then(|rules| {
+        bundle::load_named(&args.model, args.slots as u64, args.context as u64, &rules)
+            .map_err(|e| e.to_string())
+    });
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(e) => return drop(ready.send(Err(e))),
+    };
     let recipe = Recipe {
         pins: loaded
             .pins

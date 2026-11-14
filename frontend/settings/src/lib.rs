@@ -11,8 +11,8 @@ pub fn read() -> Settings {
     // `CI` picks the host: hosted macOS runners lack Metal.
     let host = var("TESSERA_BACKEND").as_deref() == Ok("cpu")
         || (cfg!(target_os = "macos") && var_os("CI").is_some());
-    // TESSERA_LANES, TESSERA_COSTS, TESSERA_QWEN3, TESSERA_EG2, TESSERA_SPACY and
-    // TESSERA_EMULATE fill fields.
+    // TESSERA_LANES, TESSERA_COSTS, TESSERA_QWEN3, TESSERA_EG2, TESSERA_SPACY,
+    // TESSERA_NAMES and TESSERA_EMULATE fill fields.
     let lanes = var("TESSERA_LANES").ok().and_then(|v| v.parse().ok());
     let costs = var_os("TESSERA_COSTS")
         .map(PathBuf::from)
@@ -24,6 +24,7 @@ pub fn read() -> Settings {
         qwen3: var_os("TESSERA_QWEN3").map(PathBuf::from),
         eg2: var_os("TESSERA_EG2").map(PathBuf::from),
         spacy: var_os("TESSERA_SPACY").map(PathBuf::from),
+        names: var_os("TESSERA_NAMES").map(PathBuf::from),
         emulate: match var("TESSERA_EMULATE").as_deref() {
             Ok("metal") => Some(Backend::Metal),
             Ok("cuda") => Some(Backend::Cuda),

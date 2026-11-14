@@ -1,12 +1,12 @@
 //! One GGUF file: graph, weights, tokenizer and template.
 
+use crate::names::Rule;
 use crate::tokenize::hf::Hf;
 use crate::{Bundle, Template};
-use checkpoint::{Gguf, GgufType};
+use checkpoint::Gguf;
 use graph::{Graph, PathSeg};
-use interp::Tensor;
+use lower::Pins;
 use lower::form::{F32_FORM, Form, named};
-use lower::{Pins, Weight};
 use models::Stack;
 use models::qwen3::{Config, stepper};
 use serde_json::{Map, Value, json};
@@ -55,55 +55,6 @@ fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, F
         return Err(format!("invalid {arch} dimensions").into());
     }
     Ok(config)
-}
-
-/// GGUF's names for weight paths, shared by every architecture.
-pub(crate) fn tensor_name(path: &[PathSeg]) -> Option<String> {
-    use PathSeg::{Field, Index};
-    Some(match path {
-        [Field(f)] if f == "embed" => "token_embd.weight".into(),
-        [Field(f)] if f == "norm" => "output_norm.weight".into(),
-        [Field(root), Index(i), Field(f)] if root == "layers" => {
-            let field = match f.as_str() {
-                "ln1" => "attn_norm",
-                "ln2" => "ffn_norm",
-                "q_norm" => "attn_q_norm",
-                "k_norm" => "attn_k_norm",
-                "q" => "attn_q",
-                "k" => "attn_k",
-                "v" => "attn_v",
-                "o" => "attn_output",
-                "gate" => "ffn_gate",
-                "up" => "ffn_up",
-                "down" => "ffn_down",
-                _ => return None,
-            };
-            format!("blk.{i}.{field}.weight")
-        }
-        _ => return None,
-    })
-}
-
-fn form(ty: GgufType) -> &'static dyn Form {
-    match ty {
-        GgufType::Q8_0 => named("q8_0").expect("registered q8_0"),
-        GgufType::Q4_0 => named("q4_0").expect("registered q4_0"),
-        _ => F32_FORM,
-    }
-}
-
-/// One weight as the file stores it, `want` elements long.
-fn weight(gguf: &Gguf, name: &str, want: usize) -> Result<Weight, Failure> {
-    if gguf.elements(name)? != want {
-        return Err(format!("{name}: {} elements, want {want}", gguf.elements(name)?).into());
-    }
-    Ok(match gguf.tensor_type(name)? {
-        GgufType::F32 | GgufType::F16 => {
-            let values = gguf.floats(name)?;
-            Weight::Floats(Tensor::f32(vec![values.len()], values))
-        }
-        ty => Weight::Packed(form(ty), gguf.bytes(name)?.2),
-    })
 }
 
 pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Form], layers: u64) -> Pins {
@@ -213,7 +164,12 @@ fn tokenizer(gguf: &Gguf) -> Result<Hf, Failure> {
     Hf::from_json(&serde_json::to_vec(&data)?)
 }
 
-pub(crate) fn load(path: &Path, slots: u64, context: u64) -> Result<Bundle, Failure> {
+pub(crate) fn load(
+    path: &Path,
+    slots: u64,
+    context: u64,
+    user: &[Rule],
+) -> Result<Bundle, Failure> {
     let gguf = Gguf::open(path)?;
     let arch = gguf
         .str("general.architecture")
@@ -231,26 +187,7 @@ pub(crate) fn load(path: &Path, slots: u64, context: u64) -> Result<Bundle, Fail
     {
         return Err("an untied output.weight is not supported".into());
     }
-    let forms = graph
-        .weights
-        .iter()
-        .map(|w| {
-            let name = tensor_name(&w.path).ok_or("a weight path GGUF has no name for")?;
-            Ok::<_, Failure>(form(gguf.tensor_type(&name)?))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let pins = pins(&graph, &forms, layers);
-    let mut weights = Vec::with_capacity(graph.weights.len());
-    for w in &graph.weights {
-        let name = tensor_name(&w.path).ok_or("a weight path GGUF has no name for")?;
-        let want =
-            w.ty.shape
-                .elements(&graph.dims)
-                .ok()
-                .and_then(|n| n.as_const());
-        let want = want.ok_or("a weight of unknown size")? as usize;
-        weights.push(weight(&gguf, &name, want)?);
-    }
+    let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
     let template = gguf
         .str("tokenizer.chat_template")
         .map(|s| Template::new(s.to_owned()))

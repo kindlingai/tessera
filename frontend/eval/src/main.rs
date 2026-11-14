@@ -144,7 +144,12 @@ fn reference(dir: &Path) -> Result<(Vec<u32>, Vec<u32>), Failure> {
 
 fn evaluate(args: &Args) -> Result<Report, Failure> {
     let slots = args.m.iter().copied().max().unwrap_or(1) as u64;
-    let loaded = bundle::load(&args.model, slots, args.context as u64)?;
+    let settings = settings::read();
+    let rules = match &settings.names {
+        Some(path) => bundle::names::rules(&std::fs::read_to_string(path)?)?,
+        None => Vec::new(),
+    };
+    let loaded = bundle::load_named(&args.model, slots, args.context as u64, &rules)?;
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {
@@ -154,7 +159,6 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
             ..Recipe::default()
         },
     };
-    let settings = settings::read();
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
     engine.load(&loaded.weights)?;
     let (prompt, wanted) = match &args.reference {
