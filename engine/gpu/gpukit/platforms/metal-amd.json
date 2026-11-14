@@ -1,0 +1,10 @@
+{
+  "matches": [
+    "metal amdgpu_*"
+  ],
+  "tile": null,
+  "check": [
+    "amdgpu_gfx1030"
+  ],
+  "note": "AMD GPUs under Metal have no simdgroup matrix"
+}

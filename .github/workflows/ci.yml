@@ -70,6 +70,7 @@ jobs:
           shared-key: macos
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace --no-fail-fast
+      - run: cargo test -p models --test platforms_test -- --nocapture
 
   similarity:
     # Near-copies of code (tools/simcheck), compared by embeddings,

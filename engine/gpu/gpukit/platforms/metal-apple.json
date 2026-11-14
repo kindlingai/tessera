@@ -9,5 +9,11 @@
     8,
     8,
     8
+  ],
+  "check": [
+    "applegpu_g13g",
+    "applegpu_g14g",
+    "applegpu_g15g",
+    "applegpu_g15s"
   ]
 }
