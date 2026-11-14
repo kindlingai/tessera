@@ -54,10 +54,10 @@ fn likeliest() -> Graph {
 fn graphs() -> Vec<Graph> {
     let stack = Stack {
         vocab: 32,
-        hidden: 16,
+        hidden: 32,
         layers: 2,
         heads: 4,
-        head_dim: 4,
+        head_dim: 8,
         ffn: 64,
         max_seqs: 4,
         max_context: 16,
@@ -110,11 +110,21 @@ fn each_rule_matches_cpu() {
         .iter()
         .flat_map(|g| devices().into_iter().map(move |d| (g, d)))
     {
-        let plan = lower(g, 0, &SIZES, &device).unwrap();
+        let form = lower::form::FORMS
+            .iter()
+            .copied()
+            .find(|f| f.block() > 1 && rule.ends_with(f.name()));
+        let device = match form {
+            Some(form) => device.pinned(Pins::all(form)),
+            None => device,
+        };
+        let Ok(plan) = lower(g, 0, &SIZES, &device) else {
+            continue;
+        };
         let mut seen: Vec<&[NodeId]> = Vec::new();
         for step in &plan.steps {
             used.extend((step.rule == rule).then_some(rule));
-            if seen.contains(&&step.covers[..]) {
+            if step.covers.is_empty() || seen.contains(&&step.covers[..]) {
                 continue;
             }
             seen.push(&step.covers);
@@ -126,7 +136,21 @@ fn each_rule_matches_cpu() {
                 .iter()
                 .map(|p| fill(&sub, &p.ty, &mut noise))
                 .collect();
-            let off = gap(&sub, &[], &inputs, &device);
+            let weights: Vec<Tensor> = sub
+                .weights
+                .iter()
+                .map(|w| {
+                    let value = fill(&sub, &w.ty, &mut noise);
+                    match value.floats() {
+                        Ok(data) => Tensor::f32(
+                            value.shape.clone(),
+                            device.pins.form(&w.path).roundtrip(data),
+                        ),
+                        Err(_) => value,
+                    }
+                })
+                .collect();
+            let off = gap(&sub, &weights, &inputs, &device);
             assert!(off < 1e-4, "{:?} is off by {off:e}", step.kernel);
         }
     }

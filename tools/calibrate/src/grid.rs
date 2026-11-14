@@ -3,7 +3,7 @@
 use crate::measure;
 use gpukit::testing::Noise;
 use graph::DimName::{self, *};
-use lower::{Device, Error, Run, Settings, Step, Tensor, View, lower, open};
+use lower::{Device, Error, Pins, Run, Settings, Step, Tensor, View, lower, open};
 use trace::{
     Act, DType, Dim, Embed, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, Port, Role, Size,
     TensorType, Weights, declare,
@@ -31,6 +31,7 @@ pub struct Grid {
 struct Case {
     g: Graph,
     sizes: Vec<Sizes>,
+    pins: Pins,
 }
 
 #[derive(Weights)]
@@ -138,10 +139,28 @@ impl Case {
         noise: &mut Noise,
         settings: &Settings,
     ) -> Result<Vec<(Step, f64)>, Error> {
+        let saved = device.pins.clone();
+        *device = device.clone().pinned(self.pins.clone());
+        let result = self.measure(device, noise, settings);
+        *device = device.clone().pinned(saved);
+        result
+    }
+
+    fn measure(
+        &self,
+        device: &mut Device,
+        noise: &mut Noise,
+        settings: &Settings,
+    ) -> Result<Vec<(Step, f64)>, Error> {
         let mut runner: Option<Box<dyn Run>> = None;
         let mut added = Vec::new();
         for sizes in &self.sizes {
-            let plan = lower(&self.g, 0, sizes, &Device::guess(settings))?;
+            let plan = lower(
+                &self.g,
+                0,
+                sizes,
+                &Device::guess(settings).pinned(self.pins.clone()),
+            )?;
             if plan.buffers.iter().sum::<usize>() > ROOM {
                 continue;
             }
@@ -205,7 +224,7 @@ impl Grid {
     pub fn tiny() -> Self {
         Self {
             rows: vec![1, 3],
-            widths: vec![16],
+            widths: vec![32],
             vocabs: vec![300],
             heads: vec![[4, 2, 16]],
             spans: vec![[1, 5], [4, 4]],
@@ -215,12 +234,27 @@ impl Grid {
     fn cases(&self) -> Vec<Case> {
         let by_rows = |g: Graph| {
             let sizes = self.rows.iter().map(|r| vec![(Rows, *r)]).collect();
-            Case { g, sizes }
+            Case {
+                g,
+                sizes,
+                pins: Pins::default(),
+            }
         };
         let mut cases = Vec::new();
         for &k in &self.widths {
             let outs = self.widths.iter().chain(&self.vocabs);
-            cases.extend(outs.map(|n| by_rows(linear(k, *n))));
+            for n in outs {
+                cases.push(by_rows(linear(k, *n)));
+                for form in lower::form::FORMS
+                    .iter()
+                    .copied()
+                    .filter(|f| f.block() > 1 && (k as usize).is_multiple_of(f.block()))
+                {
+                    let mut case = by_rows(linear(k, *n));
+                    case.pins = Pins::all(form);
+                    cases.push(case);
+                }
+            }
         }
         for &width in self.widths.iter().chain(&self.vocabs) {
             cases.push(by_rows(rows(width)));
@@ -231,7 +265,11 @@ impl Grid {
                 |[queries, keys]: &[u64; 2]| vec![(Seqs, 1), (Rows, *queries), (Context, *keys)];
             let sizes = self.spans.iter().map(span).collect();
             let g = attention(heads);
-            cases.push(Case { g, sizes });
+            cases.push(Case {
+                g,
+                sizes,
+                pins: Pins::default(),
+            });
         }
         cases
     }
