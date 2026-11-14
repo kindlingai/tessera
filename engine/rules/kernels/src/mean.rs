@@ -1,6 +1,7 @@
 //! The mean over one axis, a thread per output element.
 
 use codegen::prelude::*;
+use graph::Op;
 use lower::{Arg, Draft, Extent, Kernel, Launch, Shape, Source, Step, T, Term, Tree};
 
 /// Sums `count` strided values, in order, then divides.
@@ -62,7 +63,7 @@ impl Kernel for Mean {
 /// Axes before the mean fold into one, those after too.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
-    let Term::Mean(axis) = node.term else {
+    let Term::Op(Op::Mean(axis)) = node.term else {
         return None;
     };
     let axis = axis as usize;

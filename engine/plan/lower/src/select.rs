@@ -12,7 +12,7 @@ use crate::form::{self, Form};
 use crate::kernel::KernelRef;
 use crate::rule::{Read, rules};
 use crate::tree::{T, Term, Tree, unsupported};
-use graph::{DimName, Graph, NodeId};
+use graph::{DimName, Graph, NodeId, View};
 use std::collections::BTreeSet;
 
 /// A value some op writes, or the plan is given.
@@ -140,8 +140,8 @@ pub fn select_upto(
             (Term::Leaf(Home::Input(port)), _) => e.out.inputs[*port as usize],
             (Term::Leaf(home), _) => e.value(tree.elements(t), *home, EDGE, n.form),
             (_, None) => continue,
-            (Term::View, _) => val(n.args[0]),
-            (Term::Append(index), _) => {
+            (Term::Op(graph::Op::View(View::Reshape(_))), _) => val(n.args[0]),
+            (Term::Op(graph::Op::Append(index)), _) => {
                 let args = [n.args[0], n.args[1], n.args[2]].map(val);
                 e.append(&tree, t, *index, args)?
             }

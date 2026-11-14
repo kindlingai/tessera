@@ -4,6 +4,7 @@ use crate::cost::Device;
 use crate::kernels::Widen;
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
+use graph::{Op, View};
 
 /// The cheapest cover found at one node, in one zone.
 pub(crate) struct Choice {
@@ -106,8 +107,9 @@ impl Cover<'_> {
     fn choose(&mut self, t: T, zone: u32) -> Option<Choice> {
         let n = self.tree.node(t);
         // A view or kept rows only pass their argument on.
-        if matches!(n.term, Term::View | Term::Append(_)) {
-            if matches!(n.term, Term::Append(_)) && zone != EDGE {
+        let passes = matches!(n.term, Term::Op(Op::View(View::Reshape(_)) | Op::Append(_)));
+        if passes {
+            if matches!(n.term, Term::Op(Op::Append(_))) && zone != EDGE {
                 return None;
             }
             let cost = self.need(n.args[0], zone)?;
