@@ -50,7 +50,10 @@ extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", 
 hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]
 
 # Rules that report in the findings and do not fail the run.
-warn_rules = ["unused-pub"]
+warn_rules = ["unused-pub", "repeated-fn"]
+
+# Statements in a function body before a copy elsewhere counts.
+min_repeat_statements = 4
 
 # Crate directories by layer, lowest first. A crate may depend on its own
 # layer or a lower one, dev-dependencies included.

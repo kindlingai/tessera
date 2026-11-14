@@ -5,6 +5,9 @@ mod audit_test;
 mod layers;
 #[cfg(test)]
 mod layers_test;
+mod repeats;
+#[cfg(test)]
+mod repeats_test;
 mod unused;
 #[cfg(test)]
 mod unused_test;
@@ -37,5 +40,6 @@ pub fn check(
     let pkgs = workspace::load(root)?;
     layers::check(&pkgs, &LIMITS.layers, &LIMITS.layer_allow, out);
     unused::check(dirs, sources, out);
+    repeats::check(sources, out);
     Ok(())
 }
