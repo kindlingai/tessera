@@ -11,8 +11,9 @@
     8
   ],
   "check": [
-    "apple7",
-    "apple8",
-    "apple9"
+    "applegpu_g13g",
+    "applegpu_g14g",
+    "applegpu_g15g",
+    "applegpu_g15s"
   ]
 }
