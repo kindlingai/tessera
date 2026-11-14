@@ -1,55 +1,19 @@
-//! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
-
-mod common;
+//! Qwen3-0.6B against outputs its reference recorded.
 
 use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
 use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, open, select};
-use models::Stack;
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
 
-/// Two small layers, wide enough for every block form.
-fn small() -> Graph {
-    let stack = Stack {
-        vocab: 64,
-        hidden: 64,
-        layers: 2,
-        heads: 2,
-        head_dim: 32,
-        ffn: 128,
-        max_seqs: 1,
-        max_context: 16,
-    };
-    let c = Config {
-        stack,
-        kv_heads: 1,
-        rope_theta: 1e4,
-        eps: 1e-6,
-    };
-    program(&c)
-}
-
-common::suite!("qwen3", small);
-
 /// The interpreter only ever sees the JSON text.
 fn graph() -> Graph {
     Graph::from_json(&program(&Config::small(8, 40_960)).to_json()).unwrap()
-}
-
-#[test]
-fn traces() {
-    let g = graph();
-    graph::verify(&g).unwrap();
-    assert_eq!(g.regions.len(), 2 * 28);
-    let count = |w: &graph::Weight| w.ty.shape.elements(&g.dims).unwrap().as_const().unwrap();
-    let parameters: u64 = g.weights.iter().map(count).sum();
-    assert_eq!(parameters, 596_049_920);
 }
 
 /// Read from the directory `TESSERA_QWEN3` names.

@@ -1,8 +1,5 @@
 //! A step entry's ragged rows against whole forward passes.
 
-// Linking the crate registers its rules.
-use kernels as _;
-
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Store, Tensor, run, run_kept};
 use lower::{Device, Run, lower, open, rules};

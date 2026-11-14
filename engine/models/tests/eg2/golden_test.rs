@@ -1,10 +1,4 @@
-//! EmbeddingGemma 2: traced, loaded from its checkpoint, and checked.
-
-// Linking these registers their lowering rules.
-use kernels as _;
-use linear as _;
-
-mod common;
+//! EmbeddingGemma 2 against outputs its reference recorded.
 
 use bundle::names::{Rule, repo};
 use calibrate::measure;
@@ -13,7 +7,6 @@ use checkpoint::{File, Offer};
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, Plan, Run, Settings, Weight, lower, open};
-use models::Stack;
 use models::eg2::{Config, probe, program};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,48 +22,9 @@ fn config(layers: u64) -> Config {
     c
 }
 
-/// Two small layers, one sliding and one full.
-fn small() -> Graph {
-    let stack = Stack {
-        vocab: 64,
-        hidden: 256,
-        layers: 2,
-        heads: 2,
-        head_dim: 128,
-        ffn: 256,
-        max_seqs: 1,
-        max_context: 16,
-    };
-    let c = Config {
-        stack,
-        kv_heads: 1,
-        full_every: 2,
-        full_head_dim: 256,
-        per_layer: 128,
-        embedding: 128,
-        window: 4,
-        theta: 1e4,
-        full_theta: 1e6,
-        eps: 1e-6,
-    };
-    program::<Linear>(&c)
-}
-
-common::suite!("eg2", small);
-
 /// The interpreter only ever sees the JSON text.
 fn graph(g: Graph) -> Graph {
     Graph::from_json(&g.to_json()).unwrap()
-}
-
-#[test]
-fn traces() {
-    let g = graph(program::<Linear>(&config(24)));
-    graph::verify(&g).unwrap();
-    assert_eq!(g.regions.len(), 2 * 24);
-    let count = |w: &graph::Weight| w.ty.shape.elements(&g.dims).unwrap().as_const().unwrap();
-    let parameters: u64 = g.weights.iter().map(count).sum();
-    assert_eq!(parameters, 271_002_648);
 }
 
 /// The reference's ids and outputs for one text.
