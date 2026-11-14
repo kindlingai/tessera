@@ -102,6 +102,16 @@ pub enum Intrinsic {
     Sin,
     /// `load4(buffer, index)`: four elements as floats.
     Load4,
+    LoadByte,
+    LoadU16,
+    LoadU32,
+    LoadPack4Aligned,
+    LoadPack4,
+    F16ToF32,
+    E4m3ToF32,
+    E2m1ToF32,
+    S8ToF32,
+    BitsToF32,
     /// `store4(buffer, index, value)`.
     Store4,
     /// A zeroed `float4`.
@@ -301,6 +311,7 @@ struct Printer<'a> {
     lines: Vec<String>,
     indent: usize,
     lane: bool,
+    headers: Vec<String>,
     params: &'a [Param],
     layout: Option<&'static dyn Layout>,
 }
@@ -378,6 +389,11 @@ impl Printer<'_> {
             Expr::Select(_, a, _) => self.ty(a),
             Expr::Call(i, _) => match i {
                 Intrinsic::Gid | Intrinsic::Lid | Intrinsic::Lane | Intrinsic::KeptRow => Ty::U32,
+                Intrinsic::LoadByte
+                | Intrinsic::LoadU16
+                | Intrinsic::LoadU32
+                | Intrinsic::LoadPack4Aligned
+                | Intrinsic::LoadPack4 => Ty::U32,
                 Intrinsic::Load4 | Intrinsic::Zero4 => Ty::F32x4,
                 _ => Ty::F32,
             },
@@ -470,6 +486,42 @@ impl Printer<'_> {
                 let (v, lo, hi) = (arg(self, 0), arg(self, 1), arg(self, 2));
                 format!("f_clamp({v}, {lo}, {hi})")
             }
+            Intrinsic::LoadByte
+            | Intrinsic::LoadU16
+            | Intrinsic::LoadU32
+            | Intrinsic::LoadPack4Aligned
+            | Intrinsic::LoadPack4 => {
+                let (name, at) = (arg(self, 0), arg(self, 1));
+                match i {
+                    Intrinsic::LoadByte => format!("((u32)({name})[{at}])"),
+                    Intrinsic::LoadU16 => format!("f_u16({name} + ({at}))"),
+                    Intrinsic::LoadU32 => format!("f_u32({name} + ({at}))"),
+                    Intrinsic::LoadPack4Aligned => format!("f_pack4_aligned({name} + ({at}))"),
+                    _ => format!("f_pack4({name} + ({at}))"),
+                }
+            }
+            Intrinsic::F16ToF32 | Intrinsic::E4m3ToF32 | Intrinsic::E2m1ToF32 => {
+                let (name, header) = match i {
+                    Intrinsic::F16ToF32 => {
+                        ("f_mini5_10", <graph::F16 as crate::block::Scale>::header())
+                    }
+                    Intrinsic::E4m3ToF32 => {
+                        ("f_mini4_3", <graph::E4M3 as crate::block::Scale>::header())
+                    }
+                    _ => (
+                        "f_mini2_1",
+                        <graph::E2M1 as crate::block::Code>::header().unwrap(),
+                    ),
+                };
+                if !self.headers.contains(&header) {
+                    self.headers.push(header);
+                }
+                format!("{name}({})", arg(self, 0))
+            }
+            Intrinsic::S8ToF32 => {
+                format!("((float)(((int)({} & 255u) ^ 128) - 128))", arg(self, 0))
+            }
+            Intrinsic::BitsToF32 => format!("f_bits({})", arg(self, 0)),
             Intrinsic::Load4 => {
                 let (form, at) = (self.buffer(&args[0]), arg(self, 1));
                 let Expr::Var(name) = &args[0] else {
@@ -786,19 +838,19 @@ impl Body {
             lines: Vec::new(),
             indent: 1,
             lane: false,
+            headers: Vec::new(),
             params: &self.params,
             layout: self.layout,
         };
         let (mut buffers, mut scalars) = (Vec::new(), Vec::new());
-        let mut headers: Vec<String> = Vec::new();
         for param in p.params {
             match param {
                 Param::Buffer { name, form, writes } => {
                     p.bind(name, Kind::Buffer(*form));
                     buffers.push((name.clone(), form.ty(), *writes));
                     for h in form.header() {
-                        if !headers.contains(&h) {
-                            headers.push(h);
+                        if !p.headers.contains(&h) {
+                            p.headers.push(h);
                         }
                     }
                 }
@@ -822,7 +874,7 @@ impl Body {
             entry: self.entry.clone(),
             buffers,
             scalars,
-            headers,
+            headers: p.headers,
             body: lines.join("\n") + "\n",
         }
     }
