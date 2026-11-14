@@ -1,6 +1,7 @@
 //! exlr8 v2 releases: trellis and fp8 matrices decoded to f32.
 
 use crate::file::{Error, File};
+use crate::offer::{Offer, Slice, Stored};
 use codegen::trellis;
 use graph::{E4M3, F16};
 use std::cell::RefCell;
@@ -261,5 +262,127 @@ impl Release {
                 _ => matrix(f, matrix_name),
             }
         })
+    }
+}
+
+impl Release {
+    /// Every shard with the prefix its names take.
+    fn shards(&self) -> Vec<(String, String)> {
+        let mut out = vec![
+            ("exlr8-vocab".to_string(), "language_model.".to_string()),
+            ("exlr8-dense-global-000".to_string(), String::new()),
+        ];
+        for layer in 0.. {
+            let file = format!("exlr8-dense-text-{layer:03}");
+            if self.with(&file, |_| Ok(())).is_err() {
+                break;
+            }
+            out.push((file, format!("language_model.layers.{layer}.")));
+        }
+        out
+    }
+
+    /// A shard's slices: matrix parts and plain tensors.
+    fn offered(f: &File, prefix: &str) -> Vec<Slice> {
+        let raw = f.slices();
+        let shape = |name: &str| raw.iter().find(|s| s.name == name).map(|s| s.shape.clone());
+        let mut out = Vec::new();
+        for s in &raw {
+            let Some(matrix) = s.name.strip_suffix(".record") else {
+                continue;
+            };
+            let name = |part: &str| format!("{prefix}{matrix}.{part}");
+            let (Some(suh), Some(svh)) = (
+                shape(&format!("{matrix}.suh")),
+                shape(&format!("{matrix}.svh")),
+            ) else {
+                if let Some(rows) = shape(&format!("{matrix}.fp8")) {
+                    out.push(Slice {
+                        name: name("weight"),
+                        shape: rows,
+                        stored: Stored::F32,
+                    });
+                }
+                continue;
+            };
+            let (inp, outp) = (suh[0], svh[0]);
+            let Some(entries) = shape(&format!("{matrix}.trellis")) else {
+                continue;
+            };
+            let k = (entries[0] * entries[1] * 8 / (inp * outp)) as u32;
+            let Some(form) = trellis::form_for(k) else {
+                continue;
+            };
+            out.push(Slice {
+                name: name("weight"),
+                shape: vec![outp, inp],
+                stored: Stored::F32,
+            });
+            out.push(Slice {
+                name: name("codes"),
+                shape: vec![outp, inp],
+                stored: Stored::Form(form),
+            });
+            out.push(Slice {
+                name: name("suh"),
+                shape: vec![inp],
+                stored: Stored::F16,
+            });
+            out.push(Slice {
+                name: name("svh"),
+                shape: vec![outp],
+                stored: Stored::F16,
+            });
+        }
+        let part = |n: &str| {
+            [
+                ".record",
+                ".checksum",
+                ".trellis",
+                ".suh",
+                ".svh",
+                ".fp8",
+                ".scale",
+                ".q4",
+                ".s4",
+                ".bf16",
+                ".fp32",
+            ]
+            .iter()
+            .any(|p| n.ends_with(p))
+                || n.starts_with("__pad")
+        };
+        for s in raw {
+            if !part(&s.name) {
+                out.push(Slice {
+                    name: format!("{prefix}{}", s.name),
+                    ..s
+                });
+            }
+        }
+        out
+    }
+}
+
+impl Offer for Release {
+    fn slices(&self) -> Vec<Slice> {
+        let mut out = Vec::new();
+        for (file, prefix) in self.shards() {
+            let slices = self.with(&file, |f| Ok(Self::offered(f, &prefix)));
+            out.extend(slices.unwrap_or_default());
+        }
+        out
+    }
+
+    fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
+        self.read(name)
+    }
+
+    fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
+        Release::packed(self, name, None)
+    }
+
+    fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
+        Release::packed(self, name, Some(rows))
     }
 }

@@ -50,7 +50,11 @@ fn both_spellings_resolve() {
     let g = graph();
     for spell in [|s: &str| s.to_string(), gguf] {
         let slices = offered(&g, spell);
-        let names = resolve(&g, &slices, &[]).unwrap();
+        let names: Vec<String> = resolve(&g, &slices, &[])
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         let want: Vec<String> = slices.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, want);
     }
@@ -94,17 +98,20 @@ fn rules_decide() {
         .iter_mut()
         .for_each(|s| s.name = s.name.replace("q_proj", "query"));
     assert!(resolve(&g, &slices, &[]).is_err());
-    let repo = rules(r#"{"layers.*.q": "model.layers.*.self_attn.query.weight"}"#).unwrap();
+    let repo = rules(r#"{"layers.*.q": "model.layers.*.self_attn.query"}"#).unwrap();
     let names = resolve(&g, &slices, &[&repo]).unwrap();
     let at = g
         .weights
         .iter()
         .position(|w| tensor_name(&w.path).unwrap().contains("0.self_attn.q_proj"));
-    assert_eq!(names[at.unwrap()], "model.layers.0.self_attn.query.weight");
+    assert_eq!(
+        names[at.unwrap()].name,
+        "model.layers.0.self_attn.query.weight"
+    );
     let user = rules(r#"{"layers.*.q": "elsewhere.*"}"#).unwrap();
     let failed = resolve(&g, &slices, &[&repo, &user]).unwrap_err();
     assert_eq!(failed.missing, ["layers.0.q", "layers.1.q"]);
-    let wrong = rules(r#"{"norm": "model.layers.0.self_attn.query.weight"}"#).unwrap();
+    let wrong = rules(r#"{"norm": "model.layers.0.self_attn.query"}"#).unwrap();
     let failed = resolve(&g, &slices, &[&repo, &wrong]).unwrap_err();
     assert!(
         failed
@@ -116,4 +123,13 @@ fn rules_decide() {
 /// GGUF's name for a weight path.
 pub(crate) fn gguf_name(path: &[graph::PathSeg]) -> Option<String> {
     Some(gguf(&tensor_name(path)?))
+}
+
+/// A weight path as `layers.3.q`.
+pub(crate) fn text(path: &[graph::PathSeg]) -> String {
+    let seg = |p: &graph::PathSeg| match p {
+        graph::PathSeg::Field(f) => f.clone(),
+        graph::PathSeg::Index(i) => i.to_string(),
+    };
+    path.iter().map(seg).collect::<Vec<_>>().join(".")
 }

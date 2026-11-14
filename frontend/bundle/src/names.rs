@@ -5,8 +5,16 @@ use graph::{Graph, PathSeg};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// A weight path to a slice name, `*` the layer index.
+/// A weight path to a slice stem, `*` the layer index.
 pub type Rule = (String, String);
+
+/// A slice claimed for a weight, whole or by rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Claim {
+    pub name: String,
+    /// `(first, count)` rows of a slice stacked over the layers.
+    pub rows: Option<(usize, usize)>,
+}
 
 /// Why the weights and the slices do not pair off.
 #[derive(Debug, Default, PartialEq)]
@@ -38,7 +46,6 @@ impl std::error::Error for Unresolved {}
 
 /// Name parts that say nothing about a weight's role.
 const NOISE: &[&str] = &[
-    "weight",
     "model",
     "layers",
     "blk",
@@ -49,6 +56,12 @@ const NOISE: &[&str] = &[
     "transformer",
     "language",
 ];
+
+/// Endings that name one piece of a matrix.
+const ENDINGS: &[&str] = &["weight", "codes", "suh", "svh"];
+
+/// Fields holding one part of a matrix.
+const PARTS: &[&str] = &["w", "suh", "svh"];
 
 /// Spellings of each field's role, as word sets.
 const ROLES: &[(&str, &[&[&str]])] = &[
@@ -93,40 +106,89 @@ const ROLES: &[(&str, &[&[&str]])] = &[
     ),
 ];
 
-/// A name's layer index, if any, and its telling words.
-fn words(name: &str) -> (Option<usize>, Vec<&str>) {
+/// A slice name taken apart: layer index, telling words, ending.
+struct Words<'a> {
+    index: Option<usize>,
+    words: Vec<&'a str>,
+    ending: Option<&'a str>,
+}
+
+fn words(name: &str) -> Words<'_> {
+    let (stem, ending) = match name.rsplit_once('.') {
+        Some((stem, last)) if ENDINGS.contains(&last) => (stem, Some(last)),
+        _ => (name, None),
+    };
     let mut index = None;
-    let mut out = Vec::new();
-    for part in name.split(['.', '_', '-']) {
+    let mut words = Vec::new();
+    for part in stem.split(['.', '_', '-']) {
         if let Ok(n) = part.parse::<usize>() {
             index = index.or(Some(n));
         } else if !part.is_empty() && !NOISE.contains(&part) {
-            out.push(part);
+            words.push(part);
         }
     }
-    (index, out)
+    Words {
+        index,
+        words,
+        ending,
+    }
 }
 
-/// A weight path as text, `layers.3.q`.
-fn text(path: &[PathSeg]) -> String {
+/// A weight path taken apart: index, role field, matrix part.
+struct Role<'a> {
+    text: String,
+    index: Option<usize>,
+    field: &'a str,
+    part: Option<&'a str>,
+}
+
+fn role(path: &[PathSeg]) -> Role<'_> {
     let seg = |p: &PathSeg| match p {
         PathSeg::Field(f) => f.clone(),
         PathSeg::Index(i) => i.to_string(),
     };
-    path.iter().map(seg).collect::<Vec<_>>().join(".")
-}
-
-/// A path's layer index and field name.
-fn parts(path: &[PathSeg]) -> (Option<usize>, &str) {
     let index = path.iter().find_map(|p| match p {
         PathSeg::Index(i) => Some(*i as usize),
         PathSeg::Field(_) => None,
     });
-    let field = path.iter().rev().find_map(|p| match p {
+    let mut fields = path.iter().rev().filter_map(|p| match p {
         PathSeg::Field(f) => Some(f.as_str()),
         PathSeg::Index(_) => None,
     });
-    (index, field.unwrap_or(""))
+    let last = fields.next().unwrap_or("");
+    let (field, part, rest) = match PARTS.contains(&last) {
+        true => (
+            fields.next().unwrap_or(""),
+            Some(last),
+            &path[..path.len() - 1],
+        ),
+        false => (last, None, path),
+    };
+    let text = rest.iter().map(seg).collect::<Vec<_>>().join(".");
+    Role {
+        text,
+        index,
+        field,
+        part,
+    }
+}
+
+/// A matrix part prefers stored codes to their decoded view.
+fn preferred<'a>(part: Option<&str>, mut found: Vec<&'a Slice>) -> Vec<&'a Slice> {
+    let codes = |s: &&Slice| s.name.ends_with(".codes");
+    if part == Some("w") && found.iter().any(codes) {
+        found.retain(codes);
+    }
+    found
+}
+
+/// Whether `ending` holds `part`, or a whole tensor.
+fn holds(ending: Option<&str>, part: Option<&str>) -> bool {
+    match part {
+        None => matches!(ending, None | Some("weight")),
+        Some("w") => matches!(ending, Some("weight" | "codes")),
+        Some(p) => ending == Some(p),
+    }
 }
 
 /// The weight's shape, where every axis is a constant.
@@ -135,9 +197,30 @@ fn wanted(g: &Graph, shape: &graph::Shape) -> Option<Vec<usize>> {
     shape.0.iter().map(axis).collect()
 }
 
+/// Axes of more than one element.
+fn wide(shape: &[usize]) -> Vec<usize> {
+    shape.iter().copied().filter(|n| *n > 1).collect()
+}
+
 /// Whether `slice` has the shape, any when unknown.
 fn shaped(want: Option<&Vec<usize>>, slice: &Slice) -> bool {
-    want.is_none_or(|w| *w == slice.shape)
+    want.is_none_or(|w| wide(w) == wide(&slice.shape))
+}
+
+/// The claim on a slice, by rows when stacked.
+fn stacked(want: Option<&Vec<usize>>, slice: &Slice, index: Option<usize>) -> Option<Claim> {
+    let name = slice.name.clone();
+    if shaped(want, slice) {
+        return Some(Claim { name, rows: None });
+    }
+    let (want, index) = (want?, index?);
+    let (first, rest) = want.split_first()?;
+    let (rows, tail) = slice.shape.split_first()?;
+    let fits = rows % first == 0 && (index + 1) * first <= *rows && wide(rest) == wide(tail);
+    fits.then(|| Claim {
+        name,
+        rows: Some((index * first, *first)),
+    })
 }
 
 /// Whether `pattern` names `path`, `*` taking the index.
@@ -149,44 +232,67 @@ fn fits(pattern: &str, path: &str, index: Option<usize>) -> bool {
 }
 
 /// The slice for every weight, in the graph's order.
-pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<String>, Unresolved> {
+pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Claim>, Unresolved> {
     let roles: BTreeMap<&str, &[&[&str]]> = ROLES.iter().copied().collect();
-    let parsed: Vec<(Option<usize>, Vec<&str>)> = slices.iter().map(|s| words(&s.name)).collect();
+    let parsed: Vec<Words> = slices.iter().map(|s| words(&s.name)).collect();
     let mut out = Vec::with_capacity(g.weights.len());
     let mut failed = Unresolved::default();
     for w in &g.weights {
-        let (path, (index, field)) = (text(&w.path), parts(&w.path));
+        let r = role(&w.path);
         let want = wanted(g, &w.ty.shape);
         // The last rule naming the path decides.
         let ruled = (rules.iter().flat_map(|r| r.iter()))
             .rev()
-            .find(|(pattern, _)| fits(pattern, &path, index));
-        if let Some((_, slice)) = ruled {
-            let name = match index {
-                Some(i) => slice.replace('*', &i.to_string()),
-                None => slice.clone(),
+            .find(|(pattern, _)| fits(pattern, &r.text, r.index));
+        if let Some((_, stem)) = ruled {
+            let (stem, layered) = match stem.strip_suffix("[*]") {
+                Some(stem) => (stem.to_string(), true),
+                None => (stem.clone(), false),
             };
-            match slices.iter().find(|s| s.name == name) {
-                Some(s) if shaped(want.as_ref(), s) => out.push(name),
-                Some(_) => failed.misfit.push((path, name)),
-                None => failed.missing.push(path),
+            let stem = match r.index {
+                Some(i) => stem.replace('*', &i.to_string()),
+                None => stem,
+            };
+            let named: Vec<&Slice> = (slices.iter().zip(&parsed))
+                .filter(|(s, w)| holds(w.ending, r.part) && stem_of(&s.name, w.ending) == stem)
+                .map(|(s, _)| s)
+                .collect();
+            let named = preferred(r.part, named);
+            let claim = named.first().and_then(|s| match layered {
+                true => stacked(want.as_ref(), s, r.index),
+                false => shaped(want.as_ref(), s).then(|| Claim {
+                    name: s.name.clone(),
+                    rows: None,
+                }),
+            });
+            match (claim, named.first()) {
+                (Some(c), _) => out.push(c),
+                (None, Some(s)) => failed.misfit.push((r.text, s.name.clone())),
+                (None, None) => failed.missing.push(r.text),
             }
             continue;
         }
-        let own = [field];
+        let own = [r.field];
         let fallback = [own.as_slice()];
-        let spellings = roles.get(field).copied().unwrap_or(&fallback);
-        let found: Vec<&str> = (slices.iter().zip(&parsed))
-            .filter(|(_, (at, w))| *at == index && spellings.contains(&w.as_slice()))
-            .filter(|(s, _)| shaped(want.as_ref(), s))
-            .map(|(s, _)| s.name.as_str())
+        let spellings = roles.get(r.field).copied().unwrap_or(&fallback);
+        let found: Vec<&Slice> = (slices.iter().zip(&parsed))
+            .filter(|(_, w)| w.index == r.index && holds(w.ending, r.part))
+            .filter(|(s, w)| spellings.contains(&w.words.as_slice()) && shaped(want.as_ref(), s))
+            .map(|(s, _)| s)
+            .collect();
+        let found: Vec<&str> = preferred(r.part, found)
+            .iter()
+            .map(|s| s.name.as_str())
             .collect();
         match found.as_slice() {
-            [one] => out.push((*one).into()),
-            [] => failed.missing.push(path),
+            [one] => out.push(Claim {
+                name: (*one).into(),
+                rows: None,
+            }),
+            [] => failed.missing.push(r.text),
             many => failed
                 .ambiguous
-                .push((path, many.iter().map(|s| (*s).into()).collect())),
+                .push((r.text, many.iter().map(|s| (*s).into()).collect())),
         }
     }
     match failed == Unresolved::default() {
@@ -195,8 +301,25 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Str
     }
 }
 
-/// Rules from a JSON object: path pattern to slice pattern.
+/// `name` without its ending.
+fn stem_of<'a>(name: &'a str, ending: Option<&str>) -> &'a str {
+    match ending {
+        Some(e) => &name[..name.len() - e.len() - 1],
+        None => name,
+    }
+}
+
+/// Rules from a JSON object: path pattern to slice stem.
 pub fn rules(json: &str) -> Result<Vec<Rule>, serde_json::Error> {
     let map: BTreeMap<String, String> = serde_json::from_str(json)?;
     Ok(map.into_iter().collect())
+}
+
+/// The repository's rules for a model, where it needs any.
+pub fn repo(model: &str) -> Option<Vec<Rule>> {
+    let json = match model {
+        "eg2" => include_str!("../names/eg2.json"),
+        _ => return None,
+    };
+    Some(rules(json).expect("the repository's rules parse"))
 }

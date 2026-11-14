@@ -4,16 +4,17 @@
 use kernels as _;
 use linear as _;
 
+use bundle::names::{Rule, repo};
 use calibrate::measure;
-use checkpoint::File;
 use checkpoint::exlr8::Release;
+use checkpoint::{File, Offer};
 use codegen::trellis;
 use gpukit::testing::{cosine_f32, max_abs_diff};
-use interp::{Tensor, bind, run};
+use interp::{Tensor, run};
 use lower::form::F32_FORM;
-use lower::{Device, Pins, Plan, Run, Settings, lower, open};
+use lower::{Device, Pins, Plan, Run, Settings, Weight, lower, open};
 use models::Rotated;
-use models::eg2::{Config, probe, program, tensor_name, weight};
+use models::eg2::{Config, probe, program};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -78,19 +79,30 @@ fn cases(dir: &Path) -> Vec<Case> {
     out
 }
 
-/// Weights for `g` through `read`, by checkpoint tensor name.
-fn bound(g: &Graph, c: &Config, read: &dyn Fn(&str) -> Option<Vec<f32>>) -> Vec<Tensor> {
-    let find = |p: &[trace::PathSeg]| {
-        let v = weight(c, p, read)?;
-        Some(Tensor::f32(vec![v.len()], v))
+/// The graph's weights from `offer`, as the file stores them.
+fn pulled(g: &Graph, c: &Config, offer: &dyn Offer) -> Vec<Weight> {
+    let rules: Vec<Rule> = repo("eg2").unwrap();
+    bundle::pull(g, offer, c.stack.layers, &[&rules]).unwrap().0
+}
+
+/// Every weight as floats, packed ones decoded.
+fn plain(g: &Graph, weights: &[Weight]) -> Vec<Tensor> {
+    let wide = |(w, gw): (&Weight, &graph::Weight)| match w {
+        Weight::Floats(t) => t.clone(),
+        Weight::Packed(f, bytes) => {
+            let axis = |e: &graph::DimExpr| e.value(&g.dims, &|_| None).unwrap() as usize;
+            let shape: Vec<usize> = gw.ty.shape.0.iter().map(axis).collect();
+            let n = f.elements(bytes.len());
+            Tensor::f32(shape, (0..n).map(|i| f.unpack(bytes, i)).collect())
+        }
     };
-    bind(g, find).unwrap()
+    weights.iter().zip(&g.weights).map(wide).collect()
 }
 
 /// Weights for `g` from the bf16 checkpoint in `dir`.
 fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
     let file = File::open(&dir.join("model.safetensors")).unwrap();
-    bound(g, c, &|name| file.floats(name).ok())
+    plain(g, &pulled(g, c, &file))
 }
 
 /// The exlr8 release: matrices against bf16, embeddings against the reference.
@@ -122,14 +134,15 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
         assert!(cos > 0.95, "{name}: cos {cos}");
     }
     let start = Instant::now();
-    let w = bound(g, c, &|name| release.read(name).ok());
+    let w = plain(g, &pulled(g, c, &release));
     eprintln!(
         "exlr8: every weight decoded in {:.1} s",
         start.elapsed().as_secs_f32()
     );
     // The codes before their rotations, rotated in the graph.
     let turned = graph(program::<Rotated>(c));
-    let sides = bound(&turned, c, &|name| release.read(name).ok());
+    let stored = pulled(&turned, c, &release);
+    let sides = plain(&turned, &stored);
     let mut embeddings = Vec::new();
     for c in cases {
         let got = unit(&pooled(g, &w, &c.tokens, 1));
@@ -150,18 +163,19 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
         embeddings.push(rotated);
     }
     Exlr8 {
-        release,
         graph: turned,
         weights: sides,
+        stored,
         embeddings,
     }
 }
 
 /// The rotated graph, its weights, and the interpreter's embeddings.
 struct Exlr8 {
-    release: Release,
     graph: Graph,
     weights: Vec<Tensor>,
+    /// The same weights as the release stores them.
+    stored: Vec<Weight>,
     embeddings: Vec<Vec<f32>>,
 }
 
@@ -363,24 +377,9 @@ fn matches_reference() {
         close("exlr8 rotated on the device", got, want);
     }
     // The codes on the device, decoded as they are read.
-    let codes = |at: u32| {
-        let path = &q.graph.weights[at as usize].path;
-        let [.., trace::PathSeg::Field(last)] = &path[..] else {
-            return None;
-        };
-        if last != "w" {
-            return None;
-        }
-        // A layer's per-layer input: its slice of the shared projection.
-        let shared = "language_model.ple.per_layer_model_projection.codes";
-        let (name, rows) = match (path.get(1), path.get(2)) {
-            (Some(trace::PathSeg::Index(l)), Some(trace::PathSeg::Field(f))) if f == "ple_in" => {
-                let per = cfg.per_layer as usize;
-                (shared.to_string(), Some((*l as usize * per, per)))
-            }
-            _ => (tensor_name(path)?, None),
-        };
-        Some(q.release.packed(&name, rows).unwrap())
+    let codes = |at: u32| match &q.stored[at as usize] {
+        Weight::Packed(_, bytes) => Some(bytes.clone()),
+        Weight::Floats(_) => None,
     };
     let stored = Stored {
         pins: Pins::all(F32_FORM).pin("*.w", trellis::form_for(4).unwrap()),

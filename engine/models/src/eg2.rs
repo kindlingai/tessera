@@ -3,8 +3,8 @@
 use crate::shared::{Dense, Stack, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, PathSeg, Role, Scalar,
-    Tensor, Weights, each,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, Role, Scalar, Tensor,
+    Weights, each,
 };
 
 pub struct Config {
@@ -237,80 +237,4 @@ pub fn probe<D: Dense>(c: &Config) -> Graph {
     let [tokens, positions] = tokens(&m);
     let out = trunk(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
-}
-
-/// The checkpoint's tensor name for a weight path.
-pub fn tensor_name(path: &[PathSeg]) -> Option<String> {
-    use PathSeg::{Field, Index};
-    if let [rest @ .., Field(part)] = path
-        && let Some(suffix) = match part.as_str() {
-            "w" => Some("codes"),
-            "suh" | "svh" => Some(part.as_str()),
-            _ => None,
-        }
-    {
-        let whole = tensor_name(rest)?;
-        return Some(whole.replace(".weight", &format!(".{suffix}")));
-    }
-    let name = match path {
-        [Field(f)] => match f.as_str() {
-            "embed" => "embed_tokens.weight".into(),
-            "norm" => "norm.weight".into(),
-            "proj" => "embedding_projection.weight".into(),
-            "ple_norm" => "ple.per_layer_projection_norm.weight".into(),
-            _ => return None,
-        },
-        [Field(kind), Index(l), Field(f)] if kind == "attention" => {
-            let part = match f.as_str() {
-                "ln" => "input_layernorm",
-                "post" => "post_attention_layernorm",
-                "q_norm" | "k_norm" => &format!("self_attn.{f}"),
-                "q" | "k" | "v" | "o" => &format!("self_attn.{f}_proj"),
-                _ => return None,
-            };
-            format!("layers.{l}.{part}.weight")
-        }
-        [Field(layers), Index(i), Field(f)] if layers == "layers" => {
-            let part = match f.as_str() {
-                "pre_ff" => "pre_feedforward_layernorm.weight",
-                "post_ff" => "post_feedforward_layernorm.weight",
-                "gate" | "up" | "down" => &format!("mlp.{f}_proj.weight"),
-                "ple_gate" => "ple_block.per_layer_input_gate.weight",
-                "ple_proj" => "ple_block.per_layer_projection.weight",
-                "ple_norm" => "ple_block.post_per_layer_input_norm.weight",
-                "scalar" => "layer_scalar",
-                _ => return None,
-            };
-            format!("layers.{i}.{part}")
-        }
-        _ => return None,
-    };
-    Some(format!("language_model.{name}"))
-}
-
-/// A weight's values from the checkpoint, through `read` by name.
-pub fn weight(
-    c: &Config,
-    path: &[PathSeg],
-    read: &dyn Fn(&str) -> Option<Vec<f32>>,
-) -> Option<Vec<f32>> {
-    use PathSeg::{Field, Index};
-    let shared = "language_model.ple.per_layer_model_projection";
-    match path {
-        [Field(_), Index(i), Field(f), rest @ ..] if f == "ple_in" => {
-            // The layer's slice of the shared projection.
-            let part = rest.first().map(|p| format!("{p:?}")).unwrap_or_default();
-            let (name, span) = match part.as_str() {
-                "" => ("weight", c.per_layer * c.stack.hidden),
-                "Field(\"w\")" => ("codes", c.per_layer * c.stack.hidden),
-                "Field(\"svh\")" => ("svh", c.per_layer),
-                "Field(\"suh\")" => return read(&format!("{shared}.suh")),
-                _ => return None,
-            };
-            let all = read(&format!("{shared}.{name}"))?;
-            let at = *i as usize * span as usize;
-            Some(all[at..at + span as usize].to_vec())
-        }
-        _ => read(&tensor_name(path)?),
-    }
 }
