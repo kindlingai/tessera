@@ -25,6 +25,10 @@ struct Crate {
     items: Vec<Item>,
     /// Names in the signatures of a type's methods, by type.
     impls: BTreeMap<String, BTreeSet<String>>,
+    /// Names in each `macro_rules!` body.
+    defs: BTreeMap<String, BTreeSet<String>>,
+    /// Item macro calls, by macro name.
+    calls: Vec<(String, BTreeSet<String>)>,
     /// Names used anywhere in the crate.
     all: BTreeSet<String>,
     /// Names used by tests, benches, examples and binaries.
@@ -140,15 +144,37 @@ impl Crate {
                     self.collect(path, &inner.cloned().collect::<Vec<_>>());
                 }
                 Syn::Impl(i) => self.methods(i),
+                Syn::Macro(m) => self.invoked(&m.mac, m.ident.as_ref()),
                 _ => {}
             }
         }
+    }
+
+    fn invoked(&mut self, mac: &syn::Macro, defined: Option<&syn::Ident>) {
+        let called = names(mac.tokens.clone());
+        if let Some(name) = defined {
+            self.defs.insert(name.to_string(), called);
+        } else if let Some(name) = mac.path.get_ident() {
+            self.calls.push((name.to_string(), called));
+        }
+    }
+
+    /// Each call's names with the body of its macro.
+    fn groups(&self) -> Vec<BTreeSet<&str>> {
+        let mut groups = Vec::new();
+        for (name, called) in &self.calls {
+            let body = self.defs.get(name).into_iter().flatten();
+            groups.push(called.iter().chain(body).map(String::as_str).collect());
+        }
+        groups
     }
 
     fn methods(&mut self, i: &syn::ItemImpl) {
         let Some(name) = self_name(&i.self_ty) else {
             return;
         };
+        let bounds = names(i.generics.to_token_stream());
+        self.impls.entry(name.clone()).or_default().extend(bounds);
         for item in &i.items {
             if let ImplItem::Fn(f) = item
                 && (i.trait_.is_some() || is_pub(&f.vis))
@@ -197,15 +223,21 @@ fn reached<'a>(c: &'a Crate, outside: &BTreeSet<&str>) -> BTreeSet<&'a str> {
     for item in &c.items {
         by_name.entry(&item.name).or_default().push(item);
     }
+    let groups = c.groups();
+    let called = groups.iter().flatten().copied();
     let mut todo: Vec<&str> = by_name
         .keys()
         .copied()
+        .chain(called)
         .filter(|n| outside.contains(n))
         .collect();
     let mut used = BTreeSet::new();
     while let Some(name) = todo.pop() {
         if !used.insert(name) {
             continue;
+        }
+        for group in groups.iter().filter(|g| g.contains(name)) {
+            todo.extend(group.iter().copied());
         }
         for item in by_name.get(name).into_iter().flatten() {
             todo.extend(item.refs.iter().map(String::as_str));

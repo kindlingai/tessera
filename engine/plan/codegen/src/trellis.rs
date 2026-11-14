@@ -84,7 +84,7 @@ fn bit(tile: &[u8], b: usize) -> u32 {
 }
 
 /// A state's weight: the mcg hash, then E4M3 rounding.
-pub fn codebook(state: u32) -> f32 {
+fn codebook(state: u32) -> f32 {
     let x = (state & 0xFFFF).wrapping_mul(MCG);
     let x = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
     let low = f32::from(F16((x & 0xFFFF) as u16));

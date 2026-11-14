@@ -115,7 +115,7 @@ plain!(
 );
 
 /// Each position's rows in order, slot by slot within it.
-pub struct Interleaved;
+pub(crate) struct Interleaved;
 
 plain!(
     Interleaved,
