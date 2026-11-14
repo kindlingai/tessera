@@ -44,7 +44,7 @@ jobs:
       - run: cargo run -q -p tessera-lint
 
   linux:
-    # CPU and CUDA host code; the CUDA driver loads at runtime.
+    # CPU and CUDA host code. The CUDA driver loads at runtime.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,7 +96,7 @@ jobs:
         with:
           shared-key: simcheck
           workspaces: tools/simcheck
-          # The job fails on near-copies; keep the build anyway.
+          # The job fails on near-copies. Keep the build anyway.
           cache-on-failure: true
       - run: cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
       - run: cargo clippy --manifest-path tools/simcheck/Cargo.toml --all-targets

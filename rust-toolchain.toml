@@ -1,4 +1,4 @@
-# CI installs this exact version; bump both together.
+# CI installs this exact version. Bump both together.
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]

@@ -1,4 +1,4 @@
-use crate::comments::{Comment, group, scan, semicolons, strip, words};
+use crate::comments::{Comment, group, hash_comments, scan, semicolons, strip, words};
 
 fn grouped(text: &str, rust: bool) -> Vec<Comment> {
     group(&scan(text, rust))
@@ -72,4 +72,10 @@ fn strip_keeps_lines() {
 fn semicolons_outside_code() {
     let text = "// a; b\n// `a; b`\n/// ```\n/// a; b\n/// ```\nfn f() {}\n/* c; d */\n";
     assert_eq!(semicolons(&scan(text, true)), [1, 7]);
+}
+
+#[test]
+fn hash_comments_skip_strings() {
+    let text = "#!/bin/sh\nx=\"a # b\" # c; d\necho ${#v} $#\n  # e\n";
+    assert_eq!(hash_comments(text), [(2, " c; d"), (4, " e")]);
 }
