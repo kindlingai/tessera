@@ -3,8 +3,7 @@
 use gpukit::testing::scratch;
 use graph::DimName::{self, Context, Rows, Seqs};
 use graph::{Act, Composite, Graph};
-use kernels::Thin;
-use linear::SCHEDULES;
+use linear::{Product, SCHEDULES, Thin};
 use lower::Platform;
 use lower::form::{BF16_FORM, F32_FORM};
 use lower::kernels::{Map, MapStage};
@@ -245,11 +244,13 @@ fn thin(m: usize) -> Step {
     let (n, k) = (64, 32);
     Step {
         kernel: KernelRef::new(Thin {
-            m,
-            n,
-            k,
-            form: lower::form::F32_FORM,
-            after: sites::After::default(),
+            product: Product {
+                m,
+                n,
+                k,
+                form: lower::form::F32_FORM,
+                after: sites::After::default(),
+            },
         }),
         rule: "thin",
         reads: Vec::new(),
@@ -483,11 +484,13 @@ fn trips_are_counted() {
     );
     // Thin sums `m` rows a trip, each row apart.
     let thin = trip(&Thin {
-        m: 3,
-        n: 8,
-        k: 64,
-        form: lower::form::F32_FORM,
-        after: sites::After::default(),
+        product: Product {
+            m: 3,
+            n: 8,
+            k: 64,
+            form: lower::form::F32_FORM,
+            after: sites::After::default(),
+        },
     });
     assert_eq!((thin.loads, thin.float), (4.0, 3.0));
     assert!((thin.fresh - 1.0 / 16.0).abs() < 1e-9, "{thin:?}");

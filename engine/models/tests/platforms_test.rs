@@ -5,7 +5,7 @@ use kernels as _;
 
 use gpukit::platform::{backend_of, rows};
 use gpukit::testing::scratch;
-use linear::{SCHEDULES, Tiled};
+use linear::{Product, SCHEDULES, Tiled};
 use lower::sites::After;
 use lower::{Dialect, Kernel, Source};
 use std::path::Path;
@@ -14,12 +14,14 @@ use std::process::Command;
 /// The tiled kernel's text and entry name.
 fn tiled_text(dialect: Dialect) -> (String, String) {
     let tiled = Tiled {
-        m: 64,
-        n: 64,
-        k: 64,
-        form: lower::form::F32_FORM,
+        product: Product {
+            m: 64,
+            n: 64,
+            k: 64,
+            form: lower::form::F32_FORM,
+            after: After::default(),
+        },
         schedule: SCHEDULES[0],
-        after: After::default(),
     };
     let Source::Made(body) = tiled.source() else {
         panic!("tiled is generated");

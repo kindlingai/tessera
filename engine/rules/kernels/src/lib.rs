@@ -29,7 +29,6 @@ mod mean;
 mod rms_norm;
 mod rope;
 mod softmax;
-mod thin;
 
 pub use argmax::{Argmax, Peaks};
 pub use attend::Attend;
@@ -42,7 +41,6 @@ pub use mean::Mean;
 pub use rms_norm::RmsNorm;
 pub use rope::{Angles, Rope};
 pub use softmax::Softmax;
-pub use thin::{THIN_ROWS, Thin};
 
 use sim::{Load, Ops};
 

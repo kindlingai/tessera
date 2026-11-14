@@ -1,18 +1,12 @@
 //! A matmul on the matrix unit, staged through group memory.
 
+use crate::product::{Product, Variant, place};
 use codegen::form::F32_FORM;
-use codegen::hash;
-use codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
+use codegen::ir::{BinOp, Body, Expr, Stmt};
 use codegen::prelude::*;
 use graph::Order;
-use lower::kernels::{add_operands, finish};
-use lower::sites;
-use lower::sites::After;
-use lower::{
-    Arg, Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree,
-};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use lower::kernels::finish;
+use lower::{Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,12 +69,6 @@ const PAD: u32 = 4;
 
 /// Elements one wide load brings.
 const WIDE: u32 = 4;
-
-thread_local! {
-    /// The kernel per schedule, form and staging, built once.
-    static TREES: RefCell<HashMap<(usize, &'static str, bool), Body>> =
-        RefCell::new(HashMap::new());
-}
 
 /// Stages `span` rows of `src` from `r0`, `k0`, zero outside.
 #[kernel]
@@ -169,48 +157,41 @@ fn tiled(
 /// `x[m, k]` times `w[n, k]` transposed, by tiles.
 #[derive(Clone, Debug)]
 pub struct Tiled {
-    pub m: usize,
-    pub n: usize,
-    pub k: usize,
-    pub form: &'static dyn Stored,
+    pub product: Product,
     pub schedule: Schedule,
-    pub after: After,
 }
 
 impl Tiled {
     fn groups(&self) -> (usize, usize) {
         let (bm, bn, _) = self.schedule.block;
-        (self.m.div_ceil(bm), self.n.div_ceil(bn))
+        (self.product.m.div_ceil(bm), self.product.n.div_ceil(bn))
     }
 
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let wide = self.k.is_multiple_of(WIDE as usize);
+        let Product { k, form, .. } = self.product;
+        let wide = k.is_multiple_of(WIDE as usize);
         let build = || {
             let s = &self.schedule;
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
-            tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, self.form)
+            tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form)
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
-        let key = (at.expect("a listed schedule"), self.form.name(), wide);
-        let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
-        // The operands sit between the weights and the output.
-        add_operands(&mut body, 2, self.after.others());
+        let key: Variant = ("tiled", at.expect("a listed schedule"), form.name(), wide);
+        let mut body = self.product.tree(key, build);
         body.stmts.push(self.stores());
         body
     }
 
     /// Each sum through the stages, into its place.
     fn stores(&self) -> Stmt {
-        let u64 = |e| Expr::cast(Ty::U64, e);
         let add = |a, b| Expr::bin(BinOp::Add, a, b);
         let gr = add(add(Expr::var("row0"), Expr::var("wm0")), Expr::var("r"));
         let gc = add(add(Expr::var("col0"), Expr::var("wn0")), Expr::var("c"));
-        let o = Expr::bin(BinOp::Mul, u64(Expr::var("gr")), u64(Expr::var("n")));
-        let o = add(o, u64(Expr::var("gc")));
-        let then = finish(&self.after, Expr::var("v"), o);
+        let o = place(Expr::var("gr"), Expr::var("gc"));
+        let then = finish(&self.product.after, Expr::var("v"), o);
         let inside = Expr::bin(
             BinOp::And,
             Expr::bin(BinOp::Lt, Expr::var("gr"), Expr::var("m")),
@@ -240,12 +221,10 @@ impl Tiled {
 
 impl Kernel for Tiled {
     fn name(&self) -> &'static str {
-        self.form.suffixed(self.schedule.name)
+        self.product.form.suffixed(self.schedule.name)
     }
 
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.m, self.n, self.k]
-    }
+    over_product!();
 
     /// Each device's tiles sum in their own order.
     fn order(&self) -> Order {
@@ -253,58 +232,45 @@ impl Kernel for Tiled {
     }
 
     fn load(&self, _: usize) -> Option<Load> {
-        let (m, n, k) = (self.m as f64, self.n as f64, self.k as f64);
+        let Product { m, n, k, form, .. } = self.product;
+        let (mf, nf) = (m as f64, n as f64);
         let (gm, gn) = self.groups();
         let (_, _, bk) = self.schedule.block;
         // Each operand is re-read once per group across it.
         let mut reads = vec![
-            4.0 * m * k * gn as f64,
-            self.form.bytes(self.n * self.k) as f64 * gm as f64,
+            4.0 * mf * k as f64 * gn as f64,
+            form.bytes(n * k) as f64 * gm as f64,
         ];
-        reads.extend((0..self.after.others()).map(|_| 4.0 * m * n));
+        reads.extend((0..self.product.after.others()).map(|_| 4.0 * mf * nf));
         Some(Load {
             threads: gm * gn * self.schedule.threads(),
             group: self.schedule.threads(),
-            trips: (self.k.div_ceil(bk)) as f64,
+            trips: (k.div_ceil(bk)) as f64,
             trip: self.tree().trip(),
             reads,
-            written: 4.0 * m * n,
+            written: 4.0 * mf * nf,
             flight: 16.0,
         })
     }
 
     fn source(&self) -> Source {
-        let mut body = self.tree();
-        body.entry = format!("tiled_{}_{:x}", self.form.name(), hash(&body.text().body));
-        Source::Made(body)
+        self.product.source(self.tree(), "tiled")
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
+        let Product { m, n, k, .. } = self.product;
         let (gm, gn) = self.groups();
-        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
-        args.push(step.out());
-        args.extend([self.m, self.n, self.k].map(Arg::count));
-        vec![Launch {
-            args,
-            shape: Shape::Grid {
-                across: gm * gn,
-                down: 1,
-                threads: self.schedule.threads(),
-            },
-        }]
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        (self.m * self.n * self.k) as f64
+        let shape = Shape::Grid {
+            across: gm * gn,
+            down: 1,
+            threads: self.schedule.threads(),
+        };
+        self.product.launch(step, &[m, n, k], shape)
     }
 
     /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
         1e-9
-    }
-
-    fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
-        self.form.taken(input, 1, form)
     }
 
     /// Two staged slabs of `bk + PAD` floats a row.
@@ -321,19 +287,14 @@ impl Kernel for Tiled {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let site: sites::Finished = tree.site(at)?;
-    let sites::Matmul { m, n, k, form, .. } = site.product;
+    let (product, reads) = Product::find(tree, at)?;
     // Each schedule is one way, so the cheapest wins.
     let draft = |(choice, schedule): (usize, &Schedule)| {
         let tiled = Tiled {
-            m,
-            n,
-            k,
-            form,
+            product: product.clone(),
             schedule: *schedule,
-            after: site.after.clone(),
         };
-        Draft::new(tiled, site.reads(), m * n).choice(choice)
+        Draft::new(tiled, reads.clone(), product.outputs()).choice(choice)
     };
     Some(SCHEDULES.iter().enumerate().map(draft).collect())
 }
