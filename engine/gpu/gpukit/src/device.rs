@@ -19,7 +19,6 @@ pub trait Device: Clone + Send + Sync + 'static {
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
-    fn load_image(&self, image: &[u8], entry: &str) -> Result<Self::Kernel, Error>;
     fn compile(&self, source: &str, entry: &str) -> Result<Self::Kernel, Error>;
 }
 
@@ -28,7 +27,6 @@ type KernelMap<K> = OnceLock<Mutex<HashMap<(usize, &'static str), K>>>;
 /// One backend's context and kernels, made on first use.
 pub struct Caches<D: Device> {
     ctx: OnceLock<Result<D, String>>,
-    images: KernelMap<D::Kernel>,
     sources: KernelMap<D::Kernel>,
 }
 
@@ -36,7 +34,6 @@ impl<D: Device> Caches<D> {
     pub const fn new() -> Self {
         Self {
             ctx: OnceLock::new(),
-            images: OnceLock::new(),
             sources: OnceLock::new(),
         }
     }
@@ -69,15 +66,6 @@ fn lookup<D: Device>(
     let kernel = build(cached_context::<D>()?)?;
     map.lock().unwrap().insert(key, kernel.clone());
     Ok(kernel)
-}
-
-/// Resolve `entry` from a compiled image, once per process.
-pub fn cached_kernel<D: Device>(
-    image: &'static [u8],
-    entry: &'static str,
-) -> Result<D::Kernel, Error> {
-    let key = (image.as_ptr() as usize, entry);
-    lookup(&D::caches().images, key, |c: &D| c.load_image(image, entry))
 }
 
 /// Compile `source` and resolve `entry`, once per process.
@@ -242,14 +230,6 @@ macro_rules! backend_api {
         /// The process-wide context, opened on first use.
         pub fn cached_context() -> Result<&'static $ctx, $crate::Error> {
             $crate::device::cached_context()
-        }
-
-        /// Resolve `entry` from a compiled image, once per process.
-        pub fn cached_kernel(
-            image: &'static [u8],
-            entry: &'static str,
-        ) -> Result<$kernel, $crate::Error> {
-            $crate::device::cached_kernel::<$ctx>(image, entry)
         }
 
         /// Compile `source` and resolve `entry`, once per process.

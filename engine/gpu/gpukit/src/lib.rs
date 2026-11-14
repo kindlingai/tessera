@@ -15,8 +15,6 @@ pub mod settings;
 
 pub mod includes;
 
-mod kernel;
-
 pub mod testing;
 
 #[cfg(target_os = "macos")]

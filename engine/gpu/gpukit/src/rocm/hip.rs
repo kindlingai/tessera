@@ -34,7 +34,6 @@ type HipDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> H
 type HipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
 type HipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
 type HipDeviceGetName = unsafe extern "C" fn(*mut c_char, c_int, c_int) -> HipError;
-type HipDeviceSynchronize = unsafe extern "C" fn() -> HipError;
 type HipModuleLoadData = unsafe extern "C" fn(*mut HipModule, *const c_void) -> HipError;
 type HipModuleUnload = unsafe extern "C" fn(HipModule) -> HipError;
 type HipModuleGetFunction =
@@ -82,7 +81,6 @@ pub struct Runtime {
     pub hip_get_device_count: HipGetDeviceCount,
     pub hip_set_device: HipSetDevice,
     pub hip_device_get_name: HipDeviceGetName,
-    pub hip_device_synchronize: HipDeviceSynchronize,
     pub hip_module_load_data: HipModuleLoadData,
     pub hip_module_unload: HipModuleUnload,
     pub hip_module_get_function: HipModuleGetFunction,
@@ -136,7 +134,6 @@ impl Runtime {
             hip_get_device_count: sym!(lib, "hipGetDeviceCount", HipGetDeviceCount),
             hip_set_device: sym!(lib, "hipSetDevice", HipSetDevice),
             hip_device_get_name: sym!(lib, "hipDeviceGetName", HipDeviceGetName),
-            hip_device_synchronize: sym!(lib, "hipDeviceSynchronize", HipDeviceSynchronize),
             hip_module_load_data: sym!(lib, "hipModuleLoadData", HipModuleLoadData),
             hip_module_unload: sym!(lib, "hipModuleUnload", HipModuleUnload),
             hip_module_get_function: sym!(lib, "hipModuleGetFunction", HipModuleGetFunction),
