@@ -6,6 +6,7 @@ use linear as _;
 
 use calibrate::measure;
 use checkpoint::File;
+use checkpoint::exlr8::Release;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
 use lower::{Device, Plan, Run, Settings, lower, open};
@@ -73,15 +74,61 @@ fn cases(dir: &Path) -> Vec<Case> {
     out
 }
 
-/// Weights for `g` from the checkpoint in `dir`.
-fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
-    let file = File::open(&dir.join("model.safetensors")).unwrap();
-    let read = |name: &str| file.floats(name).ok();
+/// Weights for `g` through `read`, by checkpoint tensor name.
+fn bound(g: &Graph, c: &Config, read: &dyn Fn(&str) -> Option<Vec<f32>>) -> Vec<Tensor> {
     let find = |p: &[trace::PathSeg]| {
-        let v = weight(c, p, &read)?;
+        let v = weight(c, p, read)?;
         Some(Tensor::f32(vec![v.len()], v))
     };
     bind(g, find).unwrap()
+}
+
+/// Weights for `g` from the bf16 checkpoint in `dir`.
+fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
+    let file = File::open(&dir.join("model.safetensors")).unwrap();
+    bound(g, c, &|name| file.floats(name).ok())
+}
+
+/// The exlr8 release: matrices against bf16, embeddings against the reference.
+fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
+    let release = match std::fs::read_to_string(dir.join("exlr8.repo")) {
+        Ok(repo) => {
+            let (repo, revision) = repo.trim().split_once('@').unwrap_or((repo.trim(), "main"));
+            eprintln!("exlr8: streaming {repo} at {revision}");
+            Release::remote(repo, revision)
+        }
+        Err(_) => Release::open(&dir.join("exlr8")),
+    };
+    let file = File::open(&dir.join("model.safetensors")).unwrap();
+    for name in [
+        "language_model.layers.0.self_attn.q_proj.weight",
+        "language_model.layers.0.mlp.down_proj.weight",
+        "language_model.embedding_projection.weight",
+        "language_model.embed_tokens.weight",
+    ] {
+        let start = Instant::now();
+        let got = release.read(name).unwrap();
+        let seconds = start.elapsed().as_secs_f32();
+        let want = file.floats(name).unwrap();
+        let cos = cosine_f32(&got, &want);
+        eprintln!(
+            "exlr8 {name}: {} values in {seconds:.2} s, cos {cos:.5}",
+            got.len()
+        );
+        assert!(cos > 0.95, "{name}: cos {cos}");
+    }
+    let start = Instant::now();
+    let w = bound(g, c, &|name| release.read(name).ok());
+    eprintln!(
+        "exlr8: every weight decoded in {:.1} s",
+        start.elapsed().as_secs_f32()
+    );
+    for c in cases {
+        let got = unit(&pooled(g, &w, &c.tokens, 1));
+        let cos = cosine_f32(&got, &c.embedding);
+        eprintln!("exlr8 {}: cos {cos:.5} against the bf16 reference", c.name);
+        assert!(cos > 0.98, "{}: cos {cos}", c.name);
+    }
 }
 
 /// Tokens and positions for one text, `[1, len]` each.
@@ -231,6 +278,9 @@ fn matches_reference() {
     for c in &cases {
         let got = unit(&pooled(&g, &w, &c.tokens, 1));
         close(&c.name, &got, &c.embedding);
+    }
+    if dir.join("exlr8").is_dir() || dir.join("exlr8.repo").is_file() {
+        check_exlr8(&dir, &g, &cfg, &cases[..1]);
     }
     let settings = settings::read();
     if settings.gpu().is_none() {
