@@ -1,8 +1,8 @@
 //! The nanogpt's recorded logits.
 
 use crate::common::{Case, Reference};
-use gpukit::testing::Noise;
 use interp::Tensor;
+use testkit::{Noise, weights_with};
 use trace::Graph;
 
 /// Two sequences of five tokens.
@@ -94,19 +94,11 @@ const WANT: [f32; 80] = [
 
 /// The weights `WANT` was recorded with, in graph order.
 fn weights(g: &Graph) -> Vec<Tensor> {
-    let mut noise = Noise(1337);
-    let mut make = |w: &graph::Weight| {
-        let size = |e: &trace::DimExpr| e.poly(&g.dims).unwrap().as_const().unwrap() as usize;
-        let shape: Vec<usize> = w.ty.shape.0.iter().map(size).collect();
-        // Norm weights sit near one. The rest sit near zero.
-        let value = |noise: &mut Noise| match shape.len() {
-            1 => 1.0 + 0.1 * noise.draw(),
-            _ => 0.3 * noise.draw(),
-        };
-        let values = (0..shape.iter().product()).map(|_| value(&mut noise));
-        Tensor::f32(shape.clone(), values.collect())
-    };
-    g.weights.iter().map(&mut make).collect()
+    // Norm weights sit near one. The rest sit near zero.
+    weights_with(g, &mut Noise(1337), |w| match w.ty.shape.0.len() {
+        1 => (1.0, 0.1),
+        _ => (0.0, 0.3),
+    })
 }
 
 /// This file holds the record, so it is always there.

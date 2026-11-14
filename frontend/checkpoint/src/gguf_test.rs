@@ -1,94 +1,9 @@
-use crate::{Error, Gguf, GgufType, Meta, Offer, Stored};
-use std::path::PathBuf;
+use crate::{Error, Gguf, GgufTensor, GgufType, Meta, Offer, Stored, write_gguf};
 
-fn string(out: &mut Vec<u8>, text: &str) {
-    out.extend((text.len() as u64).to_le_bytes());
-    out.extend(text.as_bytes());
-}
+const IDS: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12];
 
-fn field(out: &mut Vec<u8>, key: &str, ty: u32, bytes: &[u8]) {
-    string(out, key);
-    out.extend(ty.to_le_bytes());
-    out.extend(bytes);
-}
-
-fn sample(alignment: u64) -> Vec<u8> {
-    let mut out = b"GGUF".to_vec();
-    out.extend(3u32.to_le_bytes());
-    out.extend(4u64.to_le_bytes());
-    out.extend(16u64.to_le_bytes());
-    let values: &[(u32, &[u8])] = &[
-        (0, &[255]),
-        (1, &[254]),
-        (2, &9u16.to_le_bytes()),
-        (3, &(-10i16).to_le_bytes()),
-        (4, &11u32.to_le_bytes()),
-        (5, &(-12i32).to_le_bytes()),
-        (6, &1.5f32.to_le_bytes()),
-        (7, &[1]),
-        (10, &13u64.to_le_bytes()),
-        (11, &(-14i64).to_le_bytes()),
-        (12, &2.5f64.to_le_bytes()),
-    ];
-    for (ty, bytes) in values {
-        field(&mut out, &format!("t{ty}"), *ty, bytes);
-    }
-    let mut text = Vec::new();
-    string(&mut text, "hello");
-    field(&mut out, "t8", 8, &text);
-    let mut array = 8u32.to_le_bytes().to_vec();
-    array.extend(1u64.to_le_bytes());
-    array.extend(&text);
-    field(&mut out, "strings", 9, &array);
-    let mut ints = 5u32.to_le_bytes().to_vec();
-    ints.extend(2u64.to_le_bytes());
-    ints.extend(1i32.to_le_bytes());
-    ints.extend(2i32.to_le_bytes());
-    field(&mut out, "integers", 9, &ints);
-    field(&mut out, "positive", 11, &3i64.to_le_bytes());
-    field(&mut out, "general.alignment", 10, &alignment.to_le_bytes());
-    for (name, count, ty, offset) in [
-        ("f", 2u64, 0u32, 0u64),
-        ("h", 2, 1, 64),
-        ("q8", 32, 8, 128),
-        ("q4", 32, 2, 192),
-    ] {
-        string(&mut out, name);
-        out.extend(1u32.to_le_bytes());
-        out.extend(count.to_le_bytes());
-        out.extend(ty.to_le_bytes());
-        out.extend(offset.to_le_bytes());
-    }
-    out.resize(out.len().next_multiple_of(alignment.max(1) as usize), 0);
-    let mut data = vec![0; 210];
-    data[..4].copy_from_slice(&1.25f32.to_le_bytes());
-    data[4..8].copy_from_slice(&(-2.5f32).to_le_bytes());
-    data[64..68].copy_from_slice(&[0, 0x3c, 0, 0xc0]);
-    data[128..162].fill(23);
-    data[192..].fill(45);
-    out.extend(data);
-    out
-}
-
-fn write(bytes: &[u8]) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/scratch"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("checkpoint-gguf-{}-{id}", std::process::id()));
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
-fn open(bytes: &[u8]) -> Result<Gguf, Error> {
-    let path = write(bytes);
-    let result = Gguf::open(&path);
-    std::fs::remove_file(path).unwrap();
-    result
-}
-
-fn metadata(g: &Gguf) {
-    let values = [
+fn scalars() -> [Meta; 11] {
+    [
         Meta::U8(255),
         Meta::I8(-2),
         Meta::U16(9),
@@ -100,8 +15,51 @@ fn metadata(g: &Gguf) {
         Meta::U64(13),
         Meta::I64(-14),
         Meta::F64(2.5),
+    ]
+}
+
+fn sample(alignment: u64) -> Vec<u8> {
+    let mut meta: Vec<(String, Meta)> = IDS
+        .iter()
+        .zip(scalars())
+        .map(|(ty, v)| (format!("t{ty}"), v))
+        .collect();
+    let hello = Meta::Str("hello".into());
+    meta.extend([
+        ("t8".into(), hello.clone()),
+        ("strings".into(), Meta::Array(vec![hello])),
+        (
+            "integers".into(),
+            Meta::Array(vec![Meta::I32(1), Meta::I32(2)]),
+        ),
+        ("positive".into(), Meta::I64(3)),
+        ("general.alignment".into(), Meta::U64(alignment)),
+    ]);
+    let floats = [1.25f32, -2.5].iter().flat_map(|f| f.to_le_bytes());
+    let tensor = |name: &str, ty, count, bytes: Vec<u8>| GgufTensor {
+        name: name.into(),
+        ty,
+        dims: vec![count],
+        bytes,
+    };
+    let tensors = [
+        tensor("f", GgufType::F32, 2, floats.collect()),
+        tensor("h", GgufType::F16, 2, vec![0, 0x3c, 0, 0xc0]),
+        tensor("q8", GgufType::Q8_0, 32, vec![23; 34]),
+        tensor("q4", GgufType::Q4_0, 32, vec![45; 18]),
     ];
-    for (ty, expected) in [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12].into_iter().zip(values) {
+    write_gguf(&meta, &tensors)
+}
+
+fn open(bytes: &[u8]) -> Result<Gguf, Error> {
+    let path = testkit::stage("checkpoint.gguf", bytes);
+    let result = Gguf::open(&path);
+    std::fs::remove_file(path).unwrap();
+    result
+}
+
+fn metadata(g: &Gguf) {
+    for (ty, expected) in IDS.into_iter().zip(scalars()) {
         assert_eq!(g.meta(&format!("t{ty}")), Some(&expected));
     }
     assert_eq!(g.str("t8"), Some("hello"));

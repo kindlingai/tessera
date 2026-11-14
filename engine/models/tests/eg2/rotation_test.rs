@@ -1,11 +1,11 @@
 //! A matrix between two rotations equals the rotated matrix.
 
 use checkpoint::exlr8::rotated;
-use gpukit::testing::{Noise, cosine_f32};
 use interp::{Tensor, run};
 use models::Rotated;
 use models::eg2::{Config, program};
 use std::collections::BTreeMap;
+use testkit::{Noise, cosine_f32, weights_with};
 use trace::{Graph, Linear, PathSeg};
 
 /// A weight path as `attention.0.q.w`.
@@ -24,20 +24,16 @@ fn shape(g: &Graph, w: &graph::Weight) -> Vec<usize> {
 
 /// Random weights for every path, scales near one.
 fn random(g: &Graph, noise: &mut Noise) -> BTreeMap<String, Tensor> {
-    let mut out = BTreeMap::new();
-    for w in &g.weights {
+    let scales = |w: &graph::Weight| {
         let path = text(&w.path);
-        let shape = shape(g, w);
-        let n: usize = shape.iter().product();
-        let scale = path.ends_with(".suh") || path.ends_with(".svh");
-        let draw = |noise: &mut Noise| match scale {
-            true => 1.0 + 0.1 * noise.draw(),
-            false => noise.draw(),
-        };
-        let data = (0..n).map(|_| draw(noise)).collect();
-        out.insert(path, Tensor::f32(shape, data));
-    }
-    out
+        match path.ends_with(".suh") || path.ends_with(".svh") {
+            true => (1.0, 0.1),
+            false => (0.0, 1.0),
+        }
+    };
+    let tensors = weights_with(g, noise, scales);
+    let paths = g.weights.iter().map(|w| text(&w.path));
+    paths.zip(tensors).collect()
 }
 
 #[test]

@@ -6,7 +6,6 @@ use linear as _;
 
 use bundle::names::{repo, resolve};
 use checkpoint::{Slice, Stored};
-use gpukit::testing::{Noise, cosine_f32, max_abs_diff};
 use interp::{Tensor, run};
 use lower::form::named;
 use lower::{Device, Form, Pins, Plan, Settings, View, lower};
@@ -14,8 +13,9 @@ use run::{Run, open};
 use settings::read as settings;
 use std::collections::BTreeMap;
 use std::path::Path;
+use testkit::{Noise, argmax, cosine_f32, fill, max_abs_diff};
 use trace::DimName::{Context, Seqs};
-use trace::{Composite, DType, DimName, Graph, TensorType};
+use trace::{Composite, DimName, Graph, TensorType};
 
 /// One model as the suite sees it.
 pub struct Spec {
@@ -108,7 +108,7 @@ impl Tolerance {
         let (max, mut cos) = (max_abs_diff(got, want), 1.0f32);
         for (g, w) in got.chunks(width).zip(want.chunks(width)) {
             cos = cos.min(cosine_f32(g, w));
-            assert!(!self.top || best(g) == best(w), "{label}: top differs");
+            assert!(!self.top || argmax(g) == argmax(w), "{label}: top differs");
         }
         eprintln!("{label}: max_abs {max:.3e} worst cos {cos:.7}");
         assert!(
@@ -125,12 +125,6 @@ impl Golden {
         let scaled = if self.unit { unit(got) } else { got.to_vec() };
         self.tolerance.check(label, &scaled, &case.want, rows);
     }
-}
-
-/// The index of a row's largest entry.
-pub fn best(row: &[f32]) -> usize {
-    let top = |a: &(usize, &f32), b: &(usize, &f32)| a.1.total_cmp(b.1);
-    row.iter().enumerate().max_by(top).unwrap().0
 }
 
 pub fn unit(v: &[f32]) -> Vec<f32> {
@@ -284,29 +278,16 @@ pub fn files(spec: &Spec) {
 /// Rows the faux run feeds.
 const ROWS: u64 = 8;
 
-/// Random floats, or ids below 8, shaped like `ty`.
-fn fill(g: &Graph, ty: &TensorType, noise: &mut Noise) -> Tensor {
-    let sizes = [(Seqs, 1), (Context, ROWS)];
-    let size = |name: DimName| sizes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
-    let dim = |e: &graph::DimExpr| e.poly(&g.dims).unwrap().eval(&size).unwrap() as usize;
-    let shape: Vec<usize> = ty.shape.0.iter().map(dim).collect();
-    let mut values = (0..shape.iter().product()).map(|_| noise.draw());
-    match ty.dtype {
-        DType::U32 => Tensor::u32(shape, values.map(|v| ((v + 1.0) * 4.0) as u32).collect()),
-        _ => Tensor::f32(shape, values.by_ref().collect()),
-    }
-}
-
 /// Random weights in every form: device against interpreter.
 pub fn faux(spec: &Spec) {
     let Some(small) = spec.small else { return };
     let g = small();
     let mut noise = Noise(17);
-    let weights: Vec<Tensor> = (g.weights.iter())
-        .map(|w| fill(&g, &w.ty, &mut noise))
-        .collect();
+    let sizes = [(Seqs, 1), (Context, ROWS)];
+    let mut draw = |ty: &TensorType| fill(&g, ty, &sizes, &mut noise).unwrap();
+    let weights: Vec<Tensor> = g.weights.iter().map(|w| draw(&w.ty)).collect();
     let ports = &g.entries[0].inputs;
-    let inputs: Vec<Tensor> = ports.iter().map(|p| fill(&g, &p.ty, &mut noise)).collect();
+    let inputs: Vec<Tensor> = ports.iter().map(|p| draw(&p.ty)).collect();
     let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
     let settings = settings();
     for form in ["f32", "bf16", "q8_0", "q4_0", "nvfp4"] {
@@ -317,7 +298,7 @@ pub fn faux(spec: &Spec) {
             .collect();
         let want = run(&g, &kept, 0, &inputs).unwrap();
         let device = Device::guess(&settings).pinned(Pins::all(f));
-        let plan = lower(&g, 0, &[(Seqs, 1), (Context, ROWS)], &device).unwrap();
+        let plan = lower(&g, 0, &sizes, &device).unwrap();
         let mut runner = loaded(plan, &g, &kept, &settings);
         let got = runner.run(&feeds).unwrap().remove(0);
         let (got, want) = (got.floats().unwrap(), want[0].floats().unwrap());

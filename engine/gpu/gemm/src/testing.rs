@@ -5,7 +5,7 @@ pub(crate) fn gpu_available() -> bool {
     settings::read().gpu().is_some()
 }
 
-pub(crate) use gpukit::testing::assert_oracle;
+pub(crate) use testkit::assert_oracle;
 
 /// Tests one shape: a finite oracle, and GPU matching it.
 macro_rules! gemm_case {

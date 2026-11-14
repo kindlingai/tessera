@@ -47,6 +47,15 @@ impl GgufType {
         }
     }
 
+    pub(crate) fn id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q8_0 => 8,
+        }
+    }
+
     fn bytes(self, elements: usize) -> Result<usize, Error> {
         let (block, bytes) = match self {
             Self::F32 => (1, 4),

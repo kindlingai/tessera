@@ -2,16 +2,16 @@
 
 use super::{GOLDEN, release};
 use crate::common::{
-    Case, Reference, best, floats, interpreted, kernels, loaded, seconds, table, tokens,
+    Case, Reference, floats, interpreted, kernels, loaded, seconds, table, tokens,
 };
 use calibrate::{headroom, measure};
 use checkpoint::File;
-use gpukit::testing::max_abs_diff;
 use interp::{Tensor, bind};
 use lower::{Cache, Device, Pins, Plan, Settings, View, lower, select};
 use models::qwen3::{Config, stepper, tensor_name};
 use run::Run;
 use std::time::Instant;
+use testkit::{argmax, max_abs_diff};
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
 
@@ -391,7 +391,7 @@ mod decode {
 
     /// `chosen` must be a row's best, or tie with it.
     fn likeliest(label: &str, row: &[f32], chosen: u32) {
-        let lead = row[best(row)] - row[chosen as usize];
+        let lead = row[argmax(row)] - row[chosen as usize];
         assert!(lead < 1e-3, "{label}: {chosen} trails the best by {lead}");
     }
 

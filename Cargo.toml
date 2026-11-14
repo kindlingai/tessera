@@ -43,6 +43,7 @@ models = { path = "engine/models" }
 run = { path = "engine/plan/run" }
 shape = { path = "tools/shape" }
 sim = { path = "engine/plan/sim" }
+testkit = { path = "engine/ir/testkit" }
 trace = { path = "engine/ir/trace" }
 trace-derive = { path = "engine/ir/trace-derive" }
 

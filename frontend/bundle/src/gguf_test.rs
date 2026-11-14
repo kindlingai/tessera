@@ -1,39 +1,20 @@
 use crate::gguf::pins;
 use crate::names_test::gguf_name as tensor_name;
+use checkpoint::{GgufTensor, GgufType, Meta, write_gguf};
 use engine::{Engine, Row};
 use graph::Graph;
 use interp::Tensor;
 use lower::form::{F32_FORM, Form, named};
 use lower::{Pick, Recipe, Settings, Weight};
 use models::qwen3::{Config, stepper};
-use serde_json::{Value, json};
-use std::path::PathBuf;
 
 struct Fixture {
-    meta: Vec<(String, Value)>,
-    /// Name, GGUF type, dims fastest first, and bytes.
-    tensors: Vec<(String, u32, Vec<u64>, Vec<u8>)>,
+    meta: Vec<(String, Meta)>,
+    tensors: Vec<GgufTensor>,
 }
 
-fn text(bytes: &mut Vec<u8>, s: &str) {
-    bytes.extend((s.len() as u64).to_le_bytes());
-    bytes.extend(s.bytes());
-}
-
-fn value(bytes: &mut Vec<u8>, v: &Value) {
-    match v {
-        Value::String(s) => text(bytes, s),
-        Value::Number(n) if n.is_u64() => bytes.extend(n.as_u64().unwrap().to_le_bytes()),
-        Value::Number(n) => bytes.extend((n.as_f64().unwrap() as f32).to_le_bytes()),
-        Value::Array(a) => {
-            bytes.extend(8u32.to_le_bytes());
-            bytes.extend((a.len() as u64).to_le_bytes());
-            for v in a {
-                value(bytes, v);
-            }
-        }
-        _ => panic!("fixture metadata type"),
-    }
+fn strs(items: &[&str]) -> Meta {
+    Meta::Array(items.iter().map(|s| Meta::Str(s.to_string())).collect())
 }
 
 impl Fixture {
@@ -41,7 +22,7 @@ impl Fixture {
         let mut c = Config::toy(2, 8);
         c.stack.hidden = 32;
         let g = stepper(&c);
-        let mut meta = vec![("general.architecture".into(), json!("qwen3"))];
+        let mut meta = vec![("general.architecture".into(), Meta::Str("qwen3".into()))];
         for (key, n) in [
             ("embedding_length", c.stack.hidden),
             ("block_count", c.stack.layers),
@@ -50,21 +31,21 @@ impl Fixture {
             ("attention.key_length", c.stack.head_dim),
             ("feed_forward_length", c.stack.ffn),
         ] {
-            meta.push((format!("qwen3.{key}"), json!(n)));
+            meta.push((format!("qwen3.{key}"), Meta::U64(n)));
         }
         meta.extend([
-            ("qwen3.rope.freq_base".into(), json!(c.rope_theta)),
+            ("qwen3.rope.freq_base".into(), Meta::F32(c.rope_theta)),
             (
                 "qwen3.attention.layer_norm_rms_epsilon".into(),
-                json!(c.eps),
+                Meta::F32(c.eps),
             ),
-            ("tokenizer.ggml.tokens".into(), json!(["a", "b", "ab"])),
-            ("tokenizer.ggml.merges".into(), json!(["a b"])),
-            ("tokenizer.ggml.eos_token_id".into(), json!(2)),
-            ("tokenizer.ggml.eot_token_id".into(), json!(2)),
+            ("tokenizer.ggml.tokens".into(), strs(&["a", "b", "ab"])),
+            ("tokenizer.ggml.merges".into(), strs(&["a b"])),
+            ("tokenizer.ggml.eos_token_id".into(), Meta::U64(2)),
+            ("tokenizer.ggml.eot_token_id".into(), Meta::U64(2)),
             (
                 "tokenizer.chat_template".into(),
-                json!("{{ messages[0].content }}"),
+                Meta::Str("{{ messages[0].content }}".into()),
             ),
         ]);
         let tensors = g
@@ -87,55 +68,25 @@ impl Fixture {
                     })
                     .collect();
                 let (ty, f) = if norm {
-                    (0, F32_FORM)
+                    (GgufType::F32, F32_FORM)
+                } else if form.name() == "q8_0" {
+                    (GgufType::Q8_0, form)
                 } else {
-                    (if form.name() == "q8_0" { 8 } else { 2 }, form)
+                    (GgufType::Q4_0, form)
                 };
-                (name, ty, dims, f.pack(&values))
+                GgufTensor {
+                    name,
+                    ty,
+                    dims,
+                    bytes: f.pack(&values),
+                }
             })
             .collect();
         Self { meta, tensors }
     }
 
-    fn write(&self) -> PathBuf {
-        let mut bytes = Vec::from(*b"GGUF");
-        bytes.extend(3u32.to_le_bytes());
-        bytes.extend((self.tensors.len() as u64).to_le_bytes());
-        bytes.extend((self.meta.len() as u64).to_le_bytes());
-        for (key, v) in &self.meta {
-            text(&mut bytes, key);
-            let ty: u32 = match v {
-                Value::String(_) => 8,
-                Value::Array(_) => 9,
-                Value::Number(n) if n.is_u64() => 10,
-                _ => 6,
-            };
-            bytes.extend(ty.to_le_bytes());
-            value(&mut bytes, v);
-        }
-        let mut data = Vec::new();
-        for (name, ty, dims, raw) in &self.tensors {
-            text(&mut bytes, name);
-            bytes.extend((dims.len() as u32).to_le_bytes());
-            dims.iter().for_each(|d| bytes.extend(d.to_le_bytes()));
-            bytes.extend(ty.to_le_bytes());
-            bytes.extend((data.len() as u64).to_le_bytes());
-            data.extend(raw);
-            data.resize(data.len().next_multiple_of(32), 0);
-        }
-        bytes.resize(bytes.len().next_multiple_of(32), 0);
-        bytes.extend(data);
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/scratch"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("bundle-gguf-{}-{id}", std::process::id()));
-        std::fs::write(&path, bytes).unwrap();
-        path
-    }
-
     fn load(&self) -> Result<crate::Bundle, Box<dyn std::error::Error + Send + Sync>> {
-        let path = self.write();
+        let path = testkit::stage("bundle.gguf", &write_gguf(&self.meta, &self.tensors));
         let loaded = crate::load(&path, 2, 8);
         std::fs::remove_file(path).unwrap();
         loaded
@@ -219,13 +170,13 @@ fn tied_output() {
     let mut output = fixture
         .tensors
         .iter()
-        .find(|t| t.0 == "token_embd.weight")
+        .find(|t| t.name == "token_embd.weight")
         .unwrap()
         .clone();
-    output.0 = "output.weight".into();
+    output.name = "output.weight".into();
     fixture.tensors.push(output);
     assert!(fixture.load().is_ok());
-    fixture.tensors.last_mut().unwrap().3[4] ^= 1;
+    fixture.tensors.last_mut().unwrap().bytes[4] ^= 1;
     assert!(
         fixture
             .load()
@@ -235,7 +186,7 @@ fn tied_output() {
             .contains("untied output.weight")
     );
     fixture.tensors.pop();
-    fixture.meta[0].1 = json!("other");
+    fixture.meta[0].1 = Meta::Str("other".into());
     assert!(fixture.load().is_err());
 }
 

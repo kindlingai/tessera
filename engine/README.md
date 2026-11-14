@@ -12,6 +12,7 @@ Crate | Description
 [graph](ir/graph) | The model graph: typed nodes, symbolic shapes, a JSON form
 [interp](ir/interp) | Runs a graph op by op on the CPU: the reference for every plan
 [mem](ir/mem) | Buffers in zones, and typed views onto them
+[testkit](ir/testkit) | Helpers that tests share: noise, comparisons and scratch files
 [trace](ir/trace) | Builds graphs by running model descriptions
 [trace-derive](ir/trace-derive) | #[derive(Weights)] for model descriptions
 [models](models) | Model descriptions, traced into graphs
