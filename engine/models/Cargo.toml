@@ -20,6 +20,7 @@ settings = { workspace = true }
 kernels = { workspace = true }
 calibrate = { workspace = true }
 checkpoint = { workspace = true }
+codegen = { workspace = true }
 interp = { workspace = true }
 lower = { workspace = true }
 gpukit = { workspace = true }

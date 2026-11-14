@@ -11,6 +11,7 @@ pub mod kept;
 pub mod numerics;
 pub mod prelude;
 mod tile;
+pub mod trellis;
 
 pub use dialect::{Dialect, Text, float, hash};
 pub use form::{Form, Layout};

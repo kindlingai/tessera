@@ -38,12 +38,12 @@ pub trait Scale: Sync {
 }
 
 /// The kernel function decoding `e` and `m` bits.
-fn minifloat_name(e: u32, m: u32) -> String {
+pub(crate) fn minifloat_name(e: u32, m: u32) -> String {
     format!("f_mini{e}_{m}")
 }
 
 /// The function's text: a float from a word.
-fn minifloat(e: u32, m: u32) -> String {
+pub(crate) fn minifloat(e: u32, m: u32) -> String {
     let bias = (1 << (e - 1)) - 1;
     let step = 2f32.powi(1 - bias - m as i32);
     let normal = format!("f_bits(((e + {}u) << 23) | (mn << {}))", 127 - bias, 23 - m);

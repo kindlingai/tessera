@@ -1,22 +1,17 @@
 //! exlr8 v2 releases: trellis and fp8 matrices decoded to f32.
 
 use crate::file::{Error, File};
+use codegen::trellis;
 use graph::{E4M3, F16};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-/// The codebook multiplier.
-const MCG: u32 = 0xCBAC_1FED;
 
 /// Record field 0: how the matrix is stored.
 const TRELLIS: i64 = 1;
 const FP8_ROW: i64 = 5;
 const BF16: i64 = 6;
 const FP32: i64 = 7;
-
-/// Record field 4: entries hold 128 input channels.
-const INPUT_SIDE: i64 = 2;
 
 /// A matrix's record: format, shape, trellis width, sharded side.
 struct Record {
@@ -49,98 +44,17 @@ fn e4m3(bits: u8) -> f32 {
     f32::from(E4M3(bits))
 }
 
-/// Tile position `16 * row + col` per stream value.
-fn tile_order() -> [usize; 256] {
-    let mut perm = [0; 256];
-    for t in 0..32 {
-        let (r0, c0) = (2 * (t % 4), t / 4);
-        let spots = [
-            (0, 0),
-            (1, 0),
-            (8, 0),
-            (9, 0),
-            (0, 8),
-            (1, 8),
-            (8, 8),
-            (9, 8),
-        ];
-        for (i, (dr, dc)) in spots.into_iter().enumerate() {
-            perm[8 * t + i] = 16 * (r0 + dr) + c0 + dc;
-        }
-    }
-    perm
+/// Trellis matrix `name` packed: a header, then its entries.
+fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
+    let entries = f.bytes(&format!("{name}.trellis"))?;
+    Ok(trellis::packed(r.inp, r.out, r.side as u32, &entries))
 }
 
-/// A state's weight: the mcg hash, then E4M3 rounding.
-fn codebook(state: u32) -> f32 {
-    let x = (state & 0xFFFF).wrapping_mul(MCG);
-    let x = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
-    let low = f32::from(F16((x & 0xFFFF) as u16));
-    let high = f32::from(F16((x >> 16) as u16));
-    let sum = f32::from(F16::from(low + high));
-    f32::from(E4M3::from(sum.clamp(-448.0, 448.0)))
-}
-
-/// One packed tile, decoded in tile order.
-fn tile(raw: &[u8], k: u32, order: &[usize; 256]) -> [f32; 256] {
-    // Little-endian words, pairs swapped, bits most significant first.
-    let mut words: Vec<u16> = raw
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u16::from_le_bytes(*b))
-        .collect();
-    for pair in words.as_chunks_mut::<2>().0 {
-        pair.swap(0, 1);
-    }
-    let bit = |i: usize| u32::from(words[i / 16] >> (15 - i % 16) & 1);
-    let value = |i: usize| (0..k as usize).fold(0, |v, b| (v << 1) | bit(i * k as usize + b));
-    let values: Vec<u32> = (0..256).map(value).collect();
-    // A state: the 16 bits ending at its value, wrapping.
-    let mut out = [0.0; 256];
-    for (i, &at) in order.iter().enumerate() {
-        let mut state = 0;
-        for j in 0..16usize.div_ceil(k as usize) {
-            state |= values[(i + 256 - j) % 256] << (j * k as usize);
-        }
-        out[at] = codebook(state);
-    }
-    out
-}
-
-/// Entries into `T[in][out]`, 128 channels of a side each.
-fn trellis(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
-    let raw = f.bytes(&format!("{name}.trellis"))?;
-    let shape = f.shape(&format!("{name}.trellis")).expect("read above");
-    let (entries, bytes) = (shape[0], shape[1]);
-    let (step, order) = (32 * r.k as usize, tile_order());
-    let mut t = vec![0.0; r.inp * r.out];
-    let mut put = |entry: &[u8], at: usize, row0: usize, col0: usize| {
-        for (i, v) in tile(&entry[at..at + step], r.k, &order).iter().enumerate() {
-            t[(row0 + i / 16) * r.out + col0 + i % 16] = *v;
-        }
-    };
-    for (g, entry) in raw.chunks_exact(bytes).enumerate().take(entries) {
-        if r.side == INPUT_SIDE {
-            // Rows 128g..: tiles by output block, then row, then column.
-            for b in 0..r.out / 128 {
-                for row in 0..8 {
-                    for col in 0..8 {
-                        let at = (64 * b + 8 * row + col) * step;
-                        put(entry, at, 128 * g + 16 * row, 128 * b + 16 * col);
-                    }
-                }
-            }
-        } else {
-            // Columns 128g..: tiles by row, then column.
-            for row in 0..r.inp / 16 {
-                for col in 0..8 {
-                    put(entry, (8 * row + col) * step, 16 * row, 128 * g + 16 * col);
-                }
-            }
-        }
-    }
-    Ok(t)
+/// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
+fn decoded(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
+    let form = trellis::form_for(r.k).ok_or_else(|| Error::DType(format!("{name}: K{}", r.k)))?;
+    let bytes = packed(f, name, r)?;
+    Ok((0..r.inp * r.out).map(|i| form.unpack(&bytes, i)).collect())
 }
 
 /// The scaled Walsh-Hadamard transform of 128 values at `stride`.
@@ -196,27 +110,51 @@ pub fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
         TRELLIS => {
             let suh = halves(f, &format!("{name}.suh"))?;
             let svh = halves(f, &format!("{name}.svh"))?;
-            Ok(rotate(trellis(f, name, &r)?, &r, &suh, &svh))
+            let t = transpose(&decoded(f, name, &r)?, r.out, r.inp);
+            Ok(rotate(t, &r, &suh, &svh))
         }
         other => plain(f, name, &r, other),
     }
+}
+
+/// Packed codes of `name`, or `rows` as `(first, count)`.
+pub fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
+    let r = record(f, name)?;
+    if r.format != TRELLIS {
+        let what = format!("{name} is in exlr8 format {}, not trellis", r.format);
+        return Err(Error::DType(what));
+    }
+    let Some((first, count)) = rows else {
+        return packed(f, name, &r);
+    };
+    // Output-side entries are 128 rows: a range is whole entries.
+    let entry = r.inp * 128 * r.k as usize / 8;
+    if r.side == trellis::INPUT_SIDE as i64 || first % 128 != 0 || count % 128 != 0 {
+        return Err(Error::DType(format!(
+            "{name}: rows {first}.. are not whole entries"
+        )));
+    }
+    let entries = f.bytes(&format!("{name}.trellis"))?;
+    let at = first / 128 * entry;
+    let slice = &entries[at..at + count / 128 * entry];
+    Ok(trellis::packed(r.inp, count, r.side as u32, slice))
 }
 
 /// Matrix `name` as f32 `[out][in]` before its rotations, if any.
 pub fn codes(f: &File, name: &str) -> Result<Vec<f32>, Error> {
     let r = record(f, name)?;
     match r.format {
-        TRELLIS => Ok(transpose(&trellis(f, name, &r)?, &r)),
+        TRELLIS => decoded(f, name, &r),
         other => plain(f, name, &r, other),
     }
 }
 
-/// `T[in][out]` as `[out][in]`.
-fn transpose(t: &[f32], r: &Record) -> Vec<f32> {
-    let mut w = vec![0.0; r.inp * r.out];
-    for row in 0..r.inp {
-        for col in 0..r.out {
-            w[col * r.inp + row] = t[row * r.out + col];
+/// The transpose of `t`, `rows` by `cols`.
+fn transpose(t: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut w = vec![0.0; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            w[col * rows + row] = t[row * cols + col];
         }
     }
     w
@@ -297,6 +235,13 @@ impl Release {
             files.insert(file.into(), opened);
         }
         read(&files[file])
+    }
+
+    /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
+    pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
+        let (file, local) = Self::place(name);
+        let matrix_name = local.strip_suffix(".codes").unwrap_or(&local).to_string();
+        self.with(&file, |f| codes_packed(f, &matrix_name, rows))
     }
 
     /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.

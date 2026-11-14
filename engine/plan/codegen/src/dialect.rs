@@ -36,6 +36,7 @@ const NAMES: &[(&str, &str, &str)] = &[
     ("f_cos(x)", "precise::cos(x)", "cosf(x)"),
     ("f_sin(x)", "precise::sin(x)", "sinf(x)"),
     ("f_bits(x)", "as_type<float>(x)", "__uint_as_float(x)"),
+    ("f_asbits(x)", "as_type<u32>(x)", "__float_as_uint(x)"),
     ("f_rsqrt(x)", "rsqrt(x)", "rsqrtf(x)"),
     (
         "f_barrier()",
