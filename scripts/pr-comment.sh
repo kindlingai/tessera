@@ -1,11 +1,12 @@
 #!/bin/sh
-# Creates or edits the pull request's simcheck comment.
-# Usage: simcheck-comment.sh <report.md>
+# Creates or edits the pull request comment a report owns.
+# The report's first line is a marker that finds its comment.
+# Usage: pr-comment.sh <report.md>
 # Needs GH_TOKEN, PR and GITHUB_REPOSITORY in the environment.
 set -e
 report=$1
 [ -f "$report" ] || exit 0
-marker='<!-- tessera-simcheck -->'
+marker=$(head -n 1 "$report")
 comments="repos/$GITHUB_REPOSITORY/issues/$PR/comments"
 id=$(gh api --paginate "$comments" \
     --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)

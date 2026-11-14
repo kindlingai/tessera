@@ -1,0 +1,8 @@
+# Part-of-speech patterns: `<rule>: <pattern>`, over `word/TAG ` tokens.
+# An element is `<Class|Class>`, a word, `(a|b)`, `!<Class>` for a token
+# that must not follow, or `^` for the sentence start. A `*`, `+` or `?`
+# may follow. Classes are in src/pattern.rs.
+agent-passive: <Be> <Adverb>* !<Arith> <Verb-PastParticiple> by <Det>* <Adj>* !<Action> !<Identifier> <Noun>
+hidden-negation: <ContentVerb> <Adverb>? no <Adj>* <Noun>
+hidden-negation: ^ only <Det>* <Adj|Noun|Possessive|Hyphen>* <Noun> <Adverb>? <Verb-Finite>
+chained-clause: <Verb|Prep> <Word>*? <Noun> , (which|whose|who) !<Be>

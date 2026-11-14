@@ -11,6 +11,7 @@ members = [
     "tools/calibrate",
     "tools/lint",
     "tools/shape",
+    "tools/style",
 ]
 
 [workspace.package]

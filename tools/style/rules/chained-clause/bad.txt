@@ -1,0 +1,7 @@
+This builder serves the MLA group, whose spec keeps `tokens_per_state` at 1.
+---
+The daemon reads the config, which lists every peer.
+---
+The loader walks the tree, whose leaves each hold one schema.
+---
+Each request goes to the router, which forwards it to the first live group.
