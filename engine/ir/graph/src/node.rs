@@ -132,6 +132,8 @@ pub enum Mask {
     /// Query and key ends align, so queries see earlier keys.
     Causal,
     Bidirectional,
+    /// Both ways, keys at most this far from the query.
+    Within(u64),
 }
 
 /// Stages fused into one pass over each row.

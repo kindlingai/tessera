@@ -46,6 +46,10 @@ impl Tensor {
         self.stage(Stage::Add, &[&v.0])
     }
 
+    pub fn mul_vector(&self, v: &Vector) -> Tensor {
+        self.stage(Stage::Mul, &[&v.0])
+    }
+
     pub fn add(&self, other: &Tensor) -> Tensor {
         self.stage(Stage::Add, &[other])
     }
