@@ -17,10 +17,11 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "usage: tessera-style fetch <pipeline_dir>
-       tessera-style diff <pipeline_dir> <base> <head> [report_file [link_base]]
+       tessera-style diff <pipeline_dir> <base> <head> [json_file]
+       tessera-style staged <pipeline_dir> [json_file]
        tessera-style scan <pipeline_dir> <file>...
 
-`diff` checks added lines. Both fail on any hit.";
+`diff` and `staged` check added lines. Each command fails on any hit.";
 
 /// This crate's rules and their patterns.
 const RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/rules");
@@ -91,23 +92,32 @@ fn print(found: &[Found]) {
     }
 }
 
+/// Hits on a diff's added lines, also written to `json`.
+fn check_diff(dir: &str, diff: &str, json: Option<&&str>) -> Result<bool, String> {
+    let checker = Checker::new(Path::new(dir))?;
+    let mut found = Vec::new();
+    for h in diff::parse(diff) {
+        found.extend(checker.hunk(h)?);
+    }
+    print(&found);
+    if let Some(path) = json {
+        report::report(&found, &checker.rules).write(Path::new(path))?;
+    }
+    Ok(found.is_empty())
+}
+
 fn run(args: &[&str]) -> Result<bool, String> {
     match args {
         ["fetch", dir] => fetch::fetch(Path::new(dir)).map(|()| true),
-        ["diff", dir, base, head, rest @ ..] if rest.len() <= 2 => {
-            let checker = Checker::new(Path::new(dir))?;
-            let mut found = Vec::new();
-            for h in diff::parse(&git(&["diff", "--no-color", &format!("{base}...{head}")])?) {
-                found.extend(checker.hunk(h)?);
-            }
-            print(&found);
-            if let Some(report) = rest.first() {
-                let md = report::markdown(&found, &checker.rules, rest.get(1).copied())
-                    .map_err(|e| e.to_string())?;
-                std::fs::write(report, md).map_err(|e| format!("{report}: {e}"))?;
-            }
-            Ok(found.is_empty())
+        ["diff", dir, base, head, rest @ ..] if rest.len() <= 1 => {
+            let diff = git(&["diff", "--no-color", &format!("{base}...{head}")])?;
+            check_diff(dir, &diff, rest.first())
         }
+        ["staged", dir, rest @ ..] if rest.len() <= 1 => check_diff(
+            dir,
+            &git(&["diff", "--no-color", "--cached"])?,
+            rest.first(),
+        ),
         ["scan", dir, files @ ..] if !files.is_empty() => {
             let checker = Checker::new(Path::new(dir))?;
             let mut found = Vec::new();

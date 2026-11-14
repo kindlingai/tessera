@@ -26,11 +26,11 @@ use std::process::{Command, ExitCode};
 use windows::{Window, cut};
 
 const USAGE: &str = "usage: tessera-simcheck fetch <model_dir>
-       tessera-simcheck check <model_dir> [cache_file [report_file [link_base [base_ref]]]]
+       tessera-simcheck check <model_dir> [cache_file [json_file [base_ref]]]
        tessera-simcheck far <model_dir> [cache_file]
        tessera-simcheck place <model_dir> <cache_file> [paths_file]
 
-`check` links report hunks under <link_base> when given.
+`check` writes its findings to <json_file> when given.
 It also fails on allow.toml pairs that allow nothing.
 With <base_ref>, it also reports new files nearer another crate.
 `far` lists crates whose code leans toward each other.
@@ -109,8 +109,8 @@ fn embed(model: &Path, wins: &[Window], cache: &mut Cache) -> Result<Vec<Vec<f32
 fn check(
     model: &Path,
     cache_file: Option<&Path>,
-    report: Option<&Path>,
-    (links, base): (Option<&str>, Option<&str>),
+    json: Option<&Path>,
+    base: Option<&str>,
 ) -> Result<bool> {
     let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
     let allow = Allow::parse(include_str!("../allow.toml"))?;
@@ -144,10 +144,10 @@ fn check(
     for (a, b) in &stale {
         println!("tools/simcheck/allow.toml: stale: {a} and {b} are not near-copies");
     }
-    if let Some(r) = report {
+    if let Some(path) = json {
         let limits = (s.similar_window, s.max_similarity);
-        let md = report::markdown((&hits, &stale, &leans), &wins, &root, limits, links)?;
-        std::fs::write(r, md)?;
+        let r = report::report((&hits, &stale, &leans), &wins, &root, limits)?;
+        r.write(path).map_err(anyhow::Error::msg)?;
     }
     Ok(hits.is_empty() && stale.is_empty())
 }
@@ -303,25 +303,19 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let run = match args[..] {
         ["fetch", dir] => fetch::fetch(Path::new(dir)).map(|()| true),
-        ["check", dir] => check(Path::new(dir), None, None, (None, None)),
-        ["check", dir, cache] => check(Path::new(dir), Some(Path::new(cache)), None, (None, None)),
-        ["check", dir, cache, report] => check(
+        ["check", dir] => check(Path::new(dir), None, None, None),
+        ["check", dir, cache] => check(Path::new(dir), Some(Path::new(cache)), None, None),
+        ["check", dir, cache, json] => check(
             Path::new(dir),
             Some(Path::new(cache)),
-            Some(Path::new(report)),
-            (None, None),
+            Some(Path::new(json)),
+            None,
         ),
-        ["check", dir, cache, report, links] => check(
+        ["check", dir, cache, json, base] => check(
             Path::new(dir),
             Some(Path::new(cache)),
-            Some(Path::new(report)),
-            (Some(links), None),
-        ),
-        ["check", dir, cache, report, links, base] => check(
-            Path::new(dir),
-            Some(Path::new(cache)),
-            Some(Path::new(report)),
-            (Some(links), Some(base)),
+            Some(Path::new(json)),
+            Some(base),
         ),
         ["far", dir] => far(Path::new(dir), None),
         ["far", dir, cache] => far(Path::new(dir), Some(Path::new(cache))),

@@ -1,0 +1,11 @@
+[package]
+name = "findings"
+version = "0.1.0"
+description = "The JSON each check writes, for tessera-check to render"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

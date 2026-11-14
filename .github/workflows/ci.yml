@@ -24,10 +24,10 @@ jobs:
           fetch-depth: 0
       - if: github.event_name == 'pull_request'
         run: >-
-          scripts/check-coauthors.sh
+          tools/scripts/check-coauthors.sh
           ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
       - if: github.event_name == 'push'
-        run: scripts/check-coauthors.sh ${{ github.event.before }}..${{ github.sha }}
+        run: tools/scripts/check-coauthors.sh ${{ github.event.before }}..${{ github.sha }}
 
   lint:
     # Code-shape rules (tools/lint) and formatting.
@@ -41,7 +41,13 @@ jobs:
         with:
           shared-key: lint
       - run: cargo fmt --all --check
-      - run: cargo run -q -p tessera-lint
+      # The report job renders this JSON into the PR comment.
+      - run: mkdir -p "$RUNNER_TEMP/checks" && cargo run -q -p tessera-lint -- --json "$RUNNER_TEMP/checks/lint.json"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-lint
+          path: ${{ runner.temp }}/checks/lint.json
 
   linux:
     # CPU and CUDA host code. The CUDA driver loads at runtime.
@@ -76,14 +82,10 @@ jobs:
     # Near-copies of code (tools/simcheck), compared by embeddings,
     # and allow.toml pairs that allow nothing.
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     env:
       SIMCHECK: cargo run -q --release --manifest-path tools/simcheck/Cargo.toml --
       HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
-      # The PR head, so report links match the checked-out lines.
       # Full history, so new files count from the base branch.
       - uses: actions/checkout@v4
         with:
@@ -122,14 +124,14 @@ jobs:
           restore-keys: simcheck-
       # On a pull request, new files that lean elsewhere get a note.
       - run: >
-          $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/simcheck.md"
-          "https://github.com/${{ github.repository }}/blob/${{ env.HEAD }}"
+          mkdir -p "$RUNNER_TEMP/checks" &&
+          $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck.bin" "$RUNNER_TEMP/checks/simcheck.json"
           ${{ github.base_ref && format('origin/{0}', github.base_ref) || '' }}
-      - if: always() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: scripts/pr-comment.sh "$RUNNER_TEMP/simcheck.md"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-simcheck
+          path: ${{ runner.temp }}/checks/simcheck.json
       - if: always()
         uses: actions/cache/save@v4
         with:
@@ -138,12 +140,8 @@ jobs:
 
   style:
     # Comment and prose rules (tools/style) on a PR's added lines. The job
-    # posts each broken rule with its fix, and fails on any hit. On pushes
-    # it does nothing, so `success` can need it.
+    # fails on any hit, and does nothing on pushes, so `success` can need it.
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     env:
       PULL: ${{ github.event_name == 'pull_request' }}
       BASE: ${{ github.event.pull_request.base.sha }}
@@ -177,15 +175,49 @@ jobs:
           key: spacy-en-core-web-sm-8fb6f8155286360bf5486fe399e2738d1df7ded2
       - if: env.PULL == 'true'
         run: >
-          $STYLE diff "$RUNNER_TEMP/spacy" "$BASE" "$HEAD" "$RUNNER_TEMP/style.md"
-          "https://github.com/${{ github.repository }}/blob/$HEAD"
-      # Posts on failure too. Fork PRs get a read-only token and cannot comment.
+          mkdir -p "$RUNNER_TEMP/checks" &&
+          $STYLE diff "$RUNNER_TEMP/spacy" "$BASE" "$HEAD" "$RUNNER_TEMP/checks/style.json"
       - if: always() && env.PULL == 'true'
-        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-style
+          path: ${{ runner.temp }}/checks/style.json
+
+  report:
+    # One PR comment for lint, similarity and style (tools/check).
+    if: always() && github.event_name == 'pull_request'
+    needs: [lint, similarity, style]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD }}
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: checks-*
+          path: ${{ runner.temp }}/checks
+          merge-multiple: true
+      # Render the reports that exist. A job can fail before writing one.
+      - run: |
+          set -- "$RUNNER_TEMP"/checks/*.json
+          [ -e "$1" ] || exit 0
+          cargo run -q -p tessera-check -- render "$@" --markdown "$RUNNER_TEMP/checks.md" \
+            "https://github.com/${{ github.repository }}/blob/$HEAD"
+      # Fork PRs get a read-only token and cannot comment.
+      - continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-        run: scripts/pr-comment.sh "$RUNNER_TEMP/style.md"
+        run: tools/scripts/pr-comment.sh "$RUNNER_TEMP/checks.md"
 
   platforms:
     # The platform table against nvcc, cuobjdump and clang's amdgcn
@@ -226,4 +258,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-        run: scripts/pr-gate.sh
+        run: tools/scripts/pr-gate.sh

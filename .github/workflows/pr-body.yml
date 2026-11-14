@@ -19,4 +19,4 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
         run: |
           printf '%s\n' "$BODY" > "$RUNNER_TEMP/body.txt"
-          scripts/check-coauthors.sh --message "$RUNNER_TEMP/body.txt"
+          tools/scripts/check-coauthors.sh --message "$RUNNER_TEMP/body.txt"

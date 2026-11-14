@@ -1,6 +1,8 @@
 #!/bin/sh
-# The same checks as CI's lint job. Install: scripts/install-hooks.sh
+# Formatting, then lint, style and simcheck through tessera-check.
+# Style and simcheck run when `cargo run -p tessera-check -- fetch`
+# has put their models in target/check. Install: tools/scripts/install-hooks.sh
 set -e
 cargo fmt --all --check
 cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
-cargo run -q -p tessera-lint
+cargo run -q -p tessera-check -- run --staged

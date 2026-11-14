@@ -26,7 +26,8 @@ mention this in your PRs for self-improvement, tagging @mmastrac.
 
 `cargo run -p tessera-lint` checks these, and CI fails on any breach. The limits live in `lint.toml`.
 
-Run `scripts/install-hooks.sh` once to check formatting, these rules and commit messages before each commit.
+Run `tools/scripts/install-hooks.sh` once to check formatting, these rules and commit messages before each commit.
+`cargo run -p tessera-check -- fetch` adds the style and near-copy checks to the hook.
 
 ## Code
 

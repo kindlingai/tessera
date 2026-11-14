@@ -29,7 +29,7 @@ jobs:
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
             --jq '.[] | .filename, (.previous_filename // empty)' \
-            | scripts/protected.sh > "$RUNNER_TEMP/hits"
+            | tools/scripts/protected.sh > "$RUNNER_TEMP/hits"
           if [ -s "$RUNNER_TEMP/hits" ]; then
             cat "$RUNNER_TEMP/hits"
             gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" \
@@ -45,4 +45,4 @@ jobs:
           job=$(gh run view -R "$GITHUB_REPOSITORY" "$run" --json jobs \
             --jq '.jobs[] | select(.name == "success") | .databaseId')
           gh run rerun -R "$GITHUB_REPOSITORY" --job "$job"
-      - run: scripts/pr-gate.sh
+      - run: tools/scripts/pr-gate.sh
