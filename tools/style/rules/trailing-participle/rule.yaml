@@ -1,0 +1,26 @@
+name: 'Trailing participle'
+description: 'A clause after a comma claims a benefit (", ensuring thread safety").'
+group: comments
+stage: 0
+detectors:
+  # Stage 0: a claim with the grammar of a fact, bolted on after a comma. Cut
+  # the clause, then cut the comment if nothing remains.
+  #
+  # Present participle, the unmeasured benefit: ", ensuring thread safety".
+  - 're:,\s+(ensuring|allowing|highlighting|emphasizing|enabling|providing|making it)\b'
+  #
+  # Past participle ending the sentence, the appositive flourish: "The rung-0
+  # seam, closed." Comment-anchored, since the bare pattern also matches
+  # parameter names (`, registered: &[&str])`). 25 hits in a large codebase, none false.
+  - 're:^\s*(//+|#|\*).*,\s+[a-z]+ed\**\s*(\.|$)'
+  #
+  # Mid-sentence (", sorted so a ..."): 224 hits, mixed with plain description.
+  # Review by hand.
+jev:
+  type: noul
+  question: 'Does a comment end with a trailing participle clause that claims a benefit, such as '', ensuring thread safety'' or '', making it faster''?'
+  'true': 'A comment has a trailing benefit clause'
+  'false': 'No trailing benefit clauses'
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

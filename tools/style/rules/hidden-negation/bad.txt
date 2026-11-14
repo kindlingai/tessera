@@ -1,0 +1,15 @@
+Your sentence breaks no rule.
+---
+Deliberate repetition needs no fixing.
+---
+This call takes no lock.
+---
+The cache holds no state between runs.
+---
+Only the indexer's cache spec carries the pool size.
+---
+Only a list field links its members to an archive page.
+---
+Only line-start fences count, so a pair inside an inline code span is still text.
+---
+Only the head solves a claim.

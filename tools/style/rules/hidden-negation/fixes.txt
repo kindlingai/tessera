@@ -1,0 +1,15 @@
+Your sentence breaks no rule.
+=>
+Your sentence passes every rule.
+---
+The cache holds no state between runs.
+=>
+The cache starts empty on each run.
+---
+Only the indexer's cache spec carries the pool size.
+=>
+The pool size is read from its canonical location in the indexer's cache spec.
+---
+Only the head solves a claim.
+=>
+The head solves every claim.

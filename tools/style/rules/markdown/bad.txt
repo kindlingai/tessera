@@ -1,0 +1,10 @@
+**Setup**
+
+Run the installer.
+---
+- **Fast:** it runs in one pass.
+- **Small:** it allocates once.
+---
+1. **Parse** the header.
+---
+## How to Configure The Parser

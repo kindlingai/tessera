@@ -1,0 +1,10 @@
+// Increment the retry counter.
+retries += 1;
+=>
+retries += 1;
+---
+// Set the timeout to 30.
+let timeout = Duration::from_secs(30);
+=>
+// The load balancer drops idle connections after 35 s.
+let timeout = Duration::from_secs(30);

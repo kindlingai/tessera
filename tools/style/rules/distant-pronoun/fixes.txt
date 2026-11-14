@@ -1,0 +1,7 @@
+A local name must be unique within its routine. Other routines may reuse it.
+=>
+A local name must be unique within its routine. Other routines may reuse the name.
+---
+The cache holds an entry for the loader. Workers read it at start.
+=>
+The cache holds an entry for the loader. Workers read the cache at start.

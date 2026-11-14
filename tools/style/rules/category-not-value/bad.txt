@@ -1,0 +1,6 @@
+// An output the graph does not hold gets an answer, not a panic.
+assert_eq!(g.pull(&out("/nowhere/")), Vec::<Node>::new());
+---
+Handles a missing key gracefully.
+---
+Returns something sensible when the input is empty.

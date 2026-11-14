@@ -1,0 +1,11 @@
+A fast, safe, and simple parser.
+=>
+A parser that reads one line at a time and allocates only the line buffer.
+---
+Parses the input for speed, safety, and clarity.
+=>
+Parses the input in one pass.
+---
+Improved clarity, consistency, and readability throughout the module.
+=>
+Rename the loader's helpers to match the parser's.

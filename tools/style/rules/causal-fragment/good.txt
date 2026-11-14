@@ -1,0 +1,15 @@
+A lookup reads one node per segment, because routes that share a prefix are merged.
+---
+Fast path: single axis.
+---
+The keys are sorted, so the merge below is linear.
+---
+Each call gets a fresh buffer, because the reader keeps the old one.
+---
+Every node tags its links, fastest first:
+---
+Resolved at load, like the sitemap.
+---
+Empty key: fallback when `<html lang>` is unset or unknown.
+---
+Keyed by logical directory: `walk_site` resolves schemas by the logical parent.

@@ -1,0 +1,7 @@
+Utilize the cached handle to facilitate reuse.
+---
+Leverage the index to streamline lookups.
+---
+This serves as the entry point.
+---
+The golden file holds the expected output.

@@ -1,0 +1,16 @@
+# Part-of-speech patterns: `<level> <rule>: <pattern>`, over `word/TAG ` tokens.
+# An element is `<Class|Class>`, a word, `(a|b)`, `!<X>` or `&<X>` for
+# lookahead, `^`, `$`, or `[ a b | c ]`. A `*`, `+` or `?` may follow.
+# Classes are in src/pattern.rs. object-first and causal-fragment misread
+# verb-first doc comments, so they report leads.
+fail agent-passive: <Be> <Adverb>* !<Arith> <Verb-PastParticiple> by <Det>* <Adj>* !<Action> !<Identifier> <Noun>
+fail hidden-negation: <ContentVerb> <Adverb>? no <Adj>* <Noun>
+fail hidden-negation: ^ only <Det>* <Adj|Noun|Possessive|Hyphen>* <Noun> <Adverb>? <Verb-Finite>
+lead causal-fragment: ^ <Verb-PastParticiple|Verb-Ing|Verb-Past> [ <NotFinite> | [ (that|which|who) <NotComma>*? , ] ]*? (so|because)
+lead causal-fragment: ^ !<Verb-Base> [ <NotFinite> | [ (that|which|who) <NotComma>*? , ] | [ ,? <Verb-Past|Verb-PastParticiple> ] ]*? (so|because)
+fail chained-clause: <Verb|Prep> <Word>*? <Noun> , (which|whose|who) !<Be>
+lead object-first: <Noun> (which|that|whom) <NotVerb>*? <Noun|Pronoun|Num> <Adverb>? <Verb-Finite|NounPlural> &<ClauseEnd>
+lead object-first: [ ^ <Det>? | <Verb|Prep> <Det>? ] <Adj|Noun>*? <Noun> <Det> <Adj|Noun|Possessive> <Adj|Noun|Possessive>+ <Adverb>? <Verb|Noun> &<ClauseEnd>
+lead object-first: <Det> <Adj>* <Noun> <Identifier> <Verb-Finite|NounPlural> [ <Prep> | &<ClauseEnd> ]
+lead object-first: <Noun> <Det> <Adj|Noun>* <Noun> <Be>? <Verb-PastParticiple|Verb-Finite> <Prep> <Prep>
+lead object-first: <Prep> what <NotVerb>*? <Noun|Pronoun> <Adverb>? <Verb-Finite>

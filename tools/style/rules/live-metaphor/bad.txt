@@ -1,0 +1,5 @@
+Keep the blast radius small: touch only this module.
+---
+The config lives in the parent struct.
+---
+This loop is the beating heart of the scheduler.

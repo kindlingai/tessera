@@ -1,0 +1,3 @@
+name: 'Tests'
+description: 'A test duplicates another, restates the implementation, or repeats a higher-level test''s case.'
+group: code

@@ -1,0 +1,134 @@
+name: 'Unfalsifiable claims'
+description: 'Puffery, borrowed authority or management jargon: a claim the reader cannot check against the code.'
+group: comments
+stage: 0
+detectors:
+  # Stage 0 falsifiability: empty phrases that mask a claim or dodge
+  # accountability.
+  - 'action item'
+  - 'all hands on deck'
+  - 'at the end of the day'
+  - 'best-in-class'
+  - 'bio-break'
+  - 'blast radius'
+  - 'bleeding edge'
+  - 'blue-sky'
+  - 'boil the ocean'
+  - 'boots on the ground'
+  - 'break down silos'
+  - 'buy-in'
+  - 'change agent'
+  - 'circle back'
+  - 'core competency'
+  - 'culture fit'
+  - 'deliverable'
+  - 'disruptive'
+  - 'drinking the kool-aid'
+  - 'eat your own dog food'
+  - 'empower'
+  - 'facetime'
+  - 'fast-paced'
+  - 'flywheel'
+  - 'frictionless'
+  - 'future-proof'
+  - 'game-changer'
+  - 'game changer'
+  - 'growth hacking'
+  - 'hard stop'
+  - 'heavy lifting'
+  - 'hit the ground running'
+  - 'holistic'
+  - 'human capital'
+  - 'ideation'
+  - 'incentivize'
+  - 'low-hanging fruit'
+  - 'mission-critical'
+  - 'move the needle'
+  - 'net-net'
+  - 'north star'
+  - 'open the kimono'
+  - 'operational excellence'
+  - 'paradigm shift'
+  - 'park it'
+  - 'peel the onion'
+  - 'punt'
+  - 'quiet quitting'
+  - 'radical candor'
+  - 'reinvent the wheel'
+  - 'right-size'
+  - 'right-sizing'
+  - 'rock star'
+  - 'run it up the flagpole'
+  - 'scalable'
+  - 'sea change'
+  - 'secret sauce'
+  - 'self-starter'
+  - 'single pane of glass'
+  - 'skill gap'
+  - 'slick sheet'
+  - 'strategic alignment'
+  - 'stretch role'
+  - 'sunsetting'
+  - 'synergies'
+  - 'synergy'
+  - 'table stakes'
+  - 'table this'
+  - 'take it offline'
+  - 'team player'
+  - 'thought leader'
+  - 'thought shower'
+  - 'touch base'
+  - 'upskill'
+  - 'value proposition'
+  - 'value-add'
+  - 'wear many hats'
+  - 'wheelhouse'
+  - 'work-life integration'
+  - 're:\b(KPIs?|OKRs?|ROI)\b'
+  - 're:30[,.]?000[- ]foot'
+  - 're:give 1[0-9]{2}%'
+  - 're:north of [$0-9]'
+  - 're:out(side)? of the box'
+  - 're:we are a family'
+  # Technical vocabulary that is also management filler. Flag in commit
+  # messages, docs and prose. Never in code.
+  #   pivot       - quicksort pivot, pivot table
+  #   bandwidth   - network and memory bandwidth
+  #   ping        - ICMP, health checks
+  #   cadence     - release cadence, polling cadence
+  #   granular    - lock and cache granularity (granularity is used in-tree)
+  #   onboard     - user onboarding flows
+  #   deep dive   - only ever filler, but common in doc headings
+  #   going forward - filler, except when a commit states a policy change
+  # `leverage` is absent here on purpose. It is a hard fail under [vocabulary]
+  # because nothing in this codebase levers anything.
+  #
+  # Rejected as terms of art, do not add: sync, async (Rust `Sync`, `std::sync`,
+  # 13 files in-tree), benchmark, optimization, visibility, double-click,
+  # high-level, ecosystem, bare `table`.
+  - 'pivot'
+  - 'bandwidth'
+  - 'ping'
+  - 'cadence'
+  - 'granular'
+  - 'onboard'
+  - 'deep dive'
+  - 'going forward'
+  # Stage 0: editorial claims about importance.
+  - 'plays a pivotal role'
+  - 'crucial function'
+  - 'best practice'
+  - 'industry standard'
+  - 'generally recommended'
+  - 'future improvements could'
+  - 're:(?i)\bfuture (work|versions|releases) (could|may|might|will)\b'
+  - 're:(?i)\bfaces? (several|many|a number of|significant) challenges\b'
+  - 'could be extended to'
+jev:
+  type: noul
+  question: 'Does any comment or doc use puffery, buzzwords, borrowed authority or rare words where a common one works: ''robust'', ''elegant'', ''seamless'', ''leverage'', ''utilize'', ''best practice'', ''load-bearing'', ''golden''?'
+  'true': 'Prose uses puffery, buzzwords or rare words'
+  'false': 'Prose uses plain, common, checkable words'
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

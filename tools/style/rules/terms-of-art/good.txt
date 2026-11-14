@@ -1,0 +1,2 @@
+// Each axis gets its own index.
+for axis in &self.axes {

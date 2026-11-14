@@ -1,0 +1,25 @@
+name: 'History'
+description: 'A comment describes past state or the change itself ("previously", "changed X to Y").'
+group: comments
+stage: 0
+detectors:
+  # Stage 0, checklist rule 1.
+  - 'previously'
+  - 'used to be'
+  - 'changed to'
+  - 'now uses'
+  - 'no longer'
+  - 'we switched'
+jev:
+  type: noul
+  question: 'Does a comment describe history or past state, such as ''changed X to Y'', ''previously'', ''now uses'', or ''removed the old''?'
+  'true': 'A comment describes what the code used to do'
+  'false': 'Comments describe only the current code'
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added
+  # A regression test states the defect it guards against.
+  recheck_skips_test_docstrings: true
+  # A comment block that documents a test states the defect the test guards
+  # against. A scan sees the test attribute in the block's context lines.
+  ignore_test_docs: true

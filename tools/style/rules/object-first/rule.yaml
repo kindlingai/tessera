@@ -1,0 +1,19 @@
+name: 'Object first'
+description: 'A clause puts the object before its subject and verb ("the slot which the redo of 7 reads").'
+group: comments
+stage: 2
+# jev_parse.py checks this rule when uv is available. The parse finds the object
+# before the subject, which the Jev question missed or confused with passive.
+# The detectors and Jev question are the fallback for --no-parse.
+parse: true
+jev:
+  type: choice
+  question: 'Look at the word order of each clause in the comments. Which order does the comment use?'
+  labels:
+    subject_first: 'Every clause starts with its subject, then the verb, then the object: ''The parser fills the buffer'''
+    object_first: 'Some clause puts the object before its subject and verb: ''the buffer which the parser fills'''
+    no_comment: 'There is no comment'
+  violation: object_first
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

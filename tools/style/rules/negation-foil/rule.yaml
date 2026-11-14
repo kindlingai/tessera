@@ -1,0 +1,38 @@
+name: 'Negation foil'
+description: 'A claim followed by a negated restatement ("X, not Y"). Write the positive claim.'
+group: comments
+stage: 2
+detectors:
+  # Stage 2 positive form: negation becomes a positive claim.
+  #
+  # Invented-misreading forms. These fail on sight, since both halves conjure
+  # the misunderstanding they correct.
+  - 're:not just .* but'
+  - 're:not only .* but'
+  - 're:isn''t .*, it''s'
+  - 're:is not .*, it is'
+  - 're:(?i)\bit''s not\b.*, it''s\b'
+  - 're:no .*, no .*, just'
+  #
+  # Bare-foil forms: a finished claim, then a negated restatement of the same
+  # slot. Split the negation into its own sentence, or drop it. A negation that
+  # cannot fill a sentence was not required.
+  # Measured in a large codebase: 224, 23, 26, 11 respectively, and 2 for ", instead
+  # of" before the comma was dropped from the last two.
+  - 're:,\s+not\b'
+  - 're:,\s+never\b'
+  - 're:\band not\b'
+  - 're:\band never\b'
+  - 're:(?i)\binstead of\b'
+  - 're:(?i)\brather than\b'
+  #
+  # `, without` was tested and rejected: 3 hits, all ordinary prepositional
+  # phrases ("without either having to know the other's source text").
+jev:
+  type: noul
+  question: 'Does a comment define something by what it is not, using shapes like ''X, not Y'', ''X, never Y'', ''X instead of Y'', ''not just X but Y''?'
+  'true': 'A comment uses a negated contrast'
+  'false': 'Comments state positive claims'
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

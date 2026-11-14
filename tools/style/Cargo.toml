@@ -1,0 +1,15 @@
+[package]
+name = "tessera-style"
+version = "0.1.0"
+description = "Comment and prose style rules: regex detectors and part-of-speech patterns"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bundle = { workspace = true }
+fancy-regex = "0.14"
+ureq = "2"
+
+[dev-dependencies]
+settings = { workspace = true }

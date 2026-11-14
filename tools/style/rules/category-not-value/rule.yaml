@@ -1,0 +1,9 @@
+name: 'Category where a value belongs'
+description: 'A comment names a category ("gets an answer") where the code has a value ("returns an empty Vec").'
+group: comments
+stage: 0
+jev:
+  type: noul
+  question: 'Does a comment name a vague category where the code has a concrete value, such as ''gets an answer'' instead of ''returns an empty Vec''?'
+  'true': 'A comment names a category instead of the value'
+  'false': 'Comments name concrete values, or make no behaviour claims'

@@ -1,0 +1,4 @@
+Retry uploads once on a 503
+
+The storage proxy returns 503 during failover, which lasts under a second.
+One retry after 500 ms covers it and still surfaces a real outage.

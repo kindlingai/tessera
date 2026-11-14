@@ -1,0 +1,11 @@
+**Setup**
+
+Run the installer.
+=>
+## Setup
+
+Run the installer.
+---
+- **Fast:** it runs in one pass.
+=>
+- It runs in one pass.

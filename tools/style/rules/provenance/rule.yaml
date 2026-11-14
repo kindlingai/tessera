@@ -1,0 +1,24 @@
+name: 'Provenance'
+description: 'Vendor markup that arrived with generated text. A stamp cannot clear it.'
+group: comments
+stage: 6
+# Markup like {index=0} looks like code to the type guess.
+examples: '.txt'
+stampable: false
+detectors:
+  # Stage 6: never stampable.
+  - 'contentReference'
+  - 'oaicite'
+  # The index follows the token with no space: turn0search3.
+  - 're:turn0search\d*'
+  # DeepSeek citations: 【3†source】.
+  - 're:【[^】]*†[^】]*】'
+  - 'attributableIndex'
+  - 'grok_card'
+  - 'grok_render_citation_card_json'
+  - 'ppl-ai-file-upload'
+  - 'attached_file'
+  - ':::writing'
+  - 're:\[cite:\s*\d+\]'
+  - 're:\[span_\d+\]'
+  - 'utm_source='

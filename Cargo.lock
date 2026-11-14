@@ -1599,6 +1599,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-style"
+version = "0.1.0"
+dependencies = [
+ "bundle",
+ "fancy-regex",
+ "settings",
+ "ureq",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

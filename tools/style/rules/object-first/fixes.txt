@@ -1,0 +1,7 @@
+This is the slot which the redo of 7 reads.
+=>
+This slot is read by the redo of 7.
+---
+The map that the reaper walks must stay sorted.
+=>
+The reaper walks this map, so it must stay sorted.

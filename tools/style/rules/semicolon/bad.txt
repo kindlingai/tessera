@@ -1,0 +1,3 @@
+Read the header first; the body length depends on it.
+---
+This is cheap; it only copies a pointer.

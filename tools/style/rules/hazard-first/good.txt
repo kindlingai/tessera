@@ -1,0 +1,1 @@
+Call with the queue lock held. Drops each pending job past its deadline.
