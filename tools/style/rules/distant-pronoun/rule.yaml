@@ -1,0 +1,7 @@
+name: 'Distant pronoun'
+description: 'A pronoun whose noun is in the previous sentence, behind a closer noun it could also mean ("unique within its routine. Other routines may reuse it"). Repeat the noun.'
+group: comments
+stage: 3
+# Only the parse can tell a pronoun's candidates, their number and which one
+# is the subject, so this rule has no fallback for --no-parse.
+parse: true

@@ -1,0 +1,13 @@
+A commit body says why. The diff already says what.
+---
+A fragment introducing a list takes a colon.
+---
+Retries once. A second failure goes to the caller.
+---
+The wheel is not on PyPI. The published artifacts image has both binaries
+and the wheel:
+---
+It does not offer GPUs. An agent without GPUs is never chosen for a bundle.
+It announces an endpoint only.
+---
+Not a group route.

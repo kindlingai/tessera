@@ -1,0 +1,21 @@
+Your sentence passes every rule.
+---
+Deliberate repetition is fine.
+---
+This call does not take the lock.
+---
+The file has no header.
+---
+It runs unless no caller holds the lock.
+---
+The cache is no longer warm after a restart.
+---
+The pool size is read from its canonical location in the indexer's cache spec.
+---
+Runs only on Linux.
+---
+Only these URLs.
+---
+A list field links its members to an archive page. Other fields render inline.
+---
+The head solves every claim.

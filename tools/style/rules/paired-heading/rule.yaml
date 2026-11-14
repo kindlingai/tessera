@@ -1,0 +1,29 @@
+name: 'Paired heading'
+description: 'A heading joins two generic section names ("Features and Benefits"). Keep the one the section covers.'
+group: markdown
+examples: '.md'
+detectors:
+  # Two generic section names joined by "and" or "&", with an optional
+  # qualifier before or after either: "Challenges and Future Directions",
+  # "Lessons Learned and Takeaways". A heading
+  # that pairs two real things ("Input and output") uses none of these words.
+  - 're:(?i)^#{1,6}\s+((key|main|core|general|other|getting)\s+)?(overview|background|history|context|introduction|summary|conclusions?|features|capabilities|benefits|advantages|disadvantages|pros|cons|strengths|weaknesses|challenges|limitations|considerations|directions|outlook|prospects|awards|recognition|reception|impact|legacy|significance|purpose|goals|objectives|motivation|scope|tips|tricks|practices|insights|highlights|lessons|takeaways|concepts|principles|installation|setup|onboarding|configuration|customization|usage|examples|resources|references|acknowledgements|acknowledgments|community|support|contributing|contributions)(\s+[a-z]+)?\s+(and|&)\s+((future|best|key|next|other|related)\s+)?(overview|background|history|context|introduction|summary|conclusions?|features|capabilities|benefits|advantages|disadvantages|pros|cons|strengths|weaknesses|challenges|limitations|considerations|directions|outlook|prospects|awards|recognition|reception|impact|legacy|significance|purpose|goals|objectives|motivation|scope|tips|tricks|practices|insights|highlights|lessons|takeaways|concepts|principles|installation|setup|onboarding|configuration|customization|usage|examples|resources|references|acknowledgements|acknowledgments|community|support|contributing|contributions)(\s+[a-z]+)?\s*$'
+  # A pair followed by a generic noun: "Performance and Reliability
+  # Considerations".
+  - 're:(?i)^#{1,6}\s+[a-z]+\s+(and|&)\s+[a-z]+\s+(considerations|concerns|aspects|overview|insights|highlights|best practices)\s*$'
+# A yes or no question would fire on every heading with "and" in it, so Jev
+# picks between a padded pair and two real things.
+jev:
+  type: choice
+  question: 'Look at each markdown heading that joins two names with ''and''. Does it name two real things the section covers, or pad one idea into a generic pair?'
+  labels:
+    real_pair: 'The heading names two things the section covers together, or two terms of art: ''Input and output'', ''Errors and panics'', ''Safety and liveness'''
+    padded_pair: 'The heading pads one idea into a generic pair of section names: ''Features and Benefits'', ''Awards and recognition'', ''Installation and Setup'''
+    no_pair: 'No heading joins two names with ''and'''
+  violation: padded_pair
+  # Jev also flags real pairs like "Security and privacy" (0.86), so it fires
+  # only when sure. The detector covers the common pairs.
+  threshold: 0.9
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

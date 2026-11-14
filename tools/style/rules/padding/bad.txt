@@ -1,0 +1,7 @@
+/// This function is responsible for returning the length of the list. It
+/// takes no arguments and returns a usize, which is the number of items.
+/// This is useful when you need to know how many items there are.
+pub fn len(&self) -> usize { self.items.len() }
+---
+In this section we set up the connection. Setting up the connection is an
+important step. Once the connection is set up, we can use it.

@@ -1,0 +1,6 @@
+/// This function is responsible for returning the length of the list. It
+/// takes no arguments and returns a usize, which is the number of items.
+pub fn len(&self) -> usize { self.items.len() }
+=>
+/// Returns the number of items.
+pub fn len(&self) -> usize { self.items.len() }

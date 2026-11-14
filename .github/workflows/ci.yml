@@ -129,12 +129,38 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-        run: scripts/simcheck-comment.sh "$RUNNER_TEMP/simcheck.md"
+        run: scripts/pr-comment.sh "$RUNNER_TEMP/simcheck.md"
       - if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/simcheck.bin
           key: simcheck-${{ github.run_id }}
+
+  style:
+    # Comment-style rules (tools/style) on added lines, detectors only.
+    # Posts a PR comment with each rule's fix. It never fails CI.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD }}
+          fetch-depth: 0
+      - run: >
+          python3 tools/style/report.py "$BASE" "$HEAD" "$RUNNER_TEMP/style.md"
+          "https://github.com/${{ github.repository }}/blob/$HEAD"
+      # Fork PRs get a read-only token and cannot comment.
+      - continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: scripts/pr-comment.sh "$RUNNER_TEMP/style.md"
 
   platforms:
     # The platform table against nvcc, cuobjdump and clang's amdgcn

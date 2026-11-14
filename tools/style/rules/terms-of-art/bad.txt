@@ -1,0 +1,5 @@
+// Each dimension gets its own index.
+for axis in &self.axes {
+---
+// Render the facet list before we render the page.
+let labels = axes.iter().map(Axis::label);

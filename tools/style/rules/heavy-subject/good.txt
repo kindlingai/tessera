@@ -1,0 +1,12 @@
+Put `---` on its own line between examples.
+---
+The loader reads the signing key before startup.
+---
+The server answers an expired token with a 401.
+---
+The thread holding the lock must release it before the await.
+---
+Every new public item needs a doc comment.
+---
+A settled head stays head while it is alive. A daemon without a head uses
+the one its live peers publish.

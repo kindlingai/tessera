@@ -1,0 +1,15 @@
+Reads the header, the body and the trailer, in that order.
+---
+Accepts JSON, TOML and YAML.
+---
+Retries on 502, 503 and 504.
+---
+Parses, validates and normalizes the input. Each step has its own error type.
+---
+Returns the key, the value and the expiry time.
+---
+The fast path skips the lock. The slow path takes it.
+---
+The checker proves safety, liveness and fairness for each lock.
+---
+Review in order of correctness, performance, and security.

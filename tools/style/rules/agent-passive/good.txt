@@ -1,0 +1,11 @@
+The address table decides which slot a citation takes.
+---
+The row is cached.
+---
+The slots of positions 4 and 5 are read by the redo of 7.
+---
+The config must be reloaded by each restart.
+---
+A value that gives an address another node is known by is refused at register.
+---
+A prev_sibling target may itself be moved by prev_sibling.

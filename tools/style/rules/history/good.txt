@@ -1,0 +1,13 @@
+Iteration order must match the on-disk order, so this is a BTreeMap.
+---
+Offsets past 4 GiB occur in merged archives.
+---
+`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1` is required. The legacy executor's
+compiled-DAG surface is unimplemented. `@ray.remote` works on actor classes
+and raises on a plain function.
+---
+- [GUIDE.md](GUIDE.md): the `mentatd` manual. Commands, environment,
+  migration from Ray, fabrics, HTTP interface.
+---
+Each `Bug` constant restores a defect that shipped. `check-spec` sets each
+one alone and requires the property it broke to fail.

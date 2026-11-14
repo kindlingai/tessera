@@ -1,0 +1,5 @@
+Parses the header. :contentReference[oaicite:0]{index=0}
+---
+See the docs.[cite: 3]
+---
+https://example.com/guide?utm_source=chatgpt.com

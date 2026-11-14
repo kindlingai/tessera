@@ -1,0 +1,12 @@
+name: 'Early return'
+description: 'Nested conditionals where a guard clause with an early return would be flatter.'
+group: code
+jev:
+  type: noul
+  question: 'Does new code nest conditionals where a guard clause with an early return would be flatter?'
+  'true': 'Nested conditionals should be early returns'
+  'false': 'Control flow is flat or already uses guard clauses'
+  # Prose files skip this question.
+  applies_to: code
+  # This rule judges code, so it can hold on a hunk that adds no comment.
+  judges: code

@@ -1,0 +1,7 @@
+A line holding only `---` separates examples, so one example can span several paragraphs.
+=>
+Put `---` on its own line between examples. An example can then span several paragraphs.
+---
+A file containing the signing key is read before startup.
+=>
+The loader reads the signing key before startup.

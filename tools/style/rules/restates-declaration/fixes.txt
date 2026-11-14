@@ -1,0 +1,5 @@
+/// A Fold is a container for routes.
+pub struct Fold { routes: Vec<Route> }
+=>
+/// Routes merged into a tree by shared prefix.
+pub struct Fold { routes: Vec<Route> }

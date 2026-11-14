@@ -1,0 +1,11 @@
+name: 'Restated declaration'
+description: 'A comment defines an item by restating its declaration ("A Fold is a container" above struct Fold).'
+group: comments
+stage: 0
+jev:
+  type: noul
+  question: 'Does a comment above a type or function define it by restating its declaration, such as ''A Fold is a container'' above ''struct Fold''?'
+  'true': 'A comment restates the declaration it sits on'
+  'false': 'No comment restates its declaration'
+  # Prose files skip this question.
+  applies_to: code

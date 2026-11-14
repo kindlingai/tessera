@@ -1,0 +1,8 @@
+fn total(items: &[Item], verbose: bool) -> u64 {
+    // let old = items.iter().map(|i| i.size).sum();
+    items.iter().map(|i| i.bytes).sum()
+}
+=>
+fn total(items: &[Item]) -> u64 {
+    items.iter().map(|i| i.bytes).sum()
+}

@@ -1,0 +1,16 @@
+name: 'Markdown'
+description: 'Bold standing in for a heading, bolded lead-ins on list items, or title case in a heading.'
+group: markdown
+examples: '.md'
+detectors:
+  # Wikipedia signs-of-AI-writing list: bold instead of a heading, bolded
+  # lead-ins on list items.
+  - 're:^\*\*[^*]+\*\*'
+  - 're:^\s*[-*+] \*\*'
+  - 're:^\s*[0-9]+\. \*\*'
+  # Title case in a heading.
+  - 're:^#{1,6} .*\b[a-z]+\b [A-Z][a-z]+ [A-Z][a-z]+'
+  # Every word capitalized, four words or more: "How To Configure The Parser".
+  - 're:^#{1,6} [A-Z][a-z]*( [A-Z][a-z]+){3,}\s*$'
+  # Three or more bold spans on one line.
+  - 're:(\*\*[^*]+\*\*.*){3}'

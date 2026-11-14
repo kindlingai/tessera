@@ -1,0 +1,9 @@
+fn total(items: &[Item], verbose: bool) -> u64 {
+    // let old = items.iter().map(|i| i.size).sum();
+    items.iter().map(|i| i.bytes).sum()
+}
+---
+fn render(page: &Page) -> String {
+    let unused = page.title.clone();
+    page.body.to_html()
+}

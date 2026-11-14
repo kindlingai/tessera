@@ -1,0 +1,3 @@
+fn total(items: &[Item]) -> u64 {
+    items.iter().map(|i| i.bytes).sum()
+}

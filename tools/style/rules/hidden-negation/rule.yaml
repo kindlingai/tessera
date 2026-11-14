@@ -1,0 +1,17 @@
+name: 'Hidden negation'
+description: 'A negation shaped as a positive claim: a verb with "no" ("breaks no rule") or "Only" before the subject ("Only the head solves a claim"). State the positive fact.'
+group: comments
+stage: 2
+# The parse finds both shapes: "no" on the object of a verb other than be,
+# have or do, and "Only" on the subject of a finite verb. The detector below
+# covers the "no" shape for --no-parse.
+parse: true
+detectors:
+  # "breaks no rule", "needs no fixing", "takes no lock". Forms of be, have
+  # and do, and modals, stay legal: "the file has no header" is ordinary.
+  # Words that end in -s without being a verb ("unless no caller...") are
+  # skipped too.
+  - 're:(?i)\b(?!(?:is|was|has|does|unless|thus|plus|yes|as|its|this|us|less|across|towards|always|perhaps|sometimes|whereas)\b)[a-z]+(?:s|ed) no (?!longer\b|more\b|matter\b|sooner\b|doubt\b)[a-z]+'
+  # "Only" with an article at the start of a sentence, for --no-parse. It cannot
+  # see a verb, so the parse is the real check.
+  - 're:^\s*(//+|#|\*)?\s*Only (the|a|an)\s'

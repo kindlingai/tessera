@@ -1,0 +1,9 @@
+// The device drops the first write after a reset, so send the frame twice.
+port.write(&frame)?;
+port.write(&frame)?;
+---
+// Sorting here keeps the merge below linear.
+ids.sort_unstable();
+---
+// 4096 matches the kernel page size, so a read never splits a page.
+const CHUNK: usize = 4096;

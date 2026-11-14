@@ -1,0 +1,20 @@
+name: 'Clutter'
+description: 'Words doing no work ("basically", "in order to", "it should be noted"), and template placeholders.'
+group: comments
+stage: 4
+detectors:
+  - 'basically'
+  - 'essentially'
+  - 'simply'
+  - 'in order to'
+  - 'it should be noted'
+  - 'note that'
+  - 'it is worth noting'
+  - 'needless to say'
+  - 're:^\s*(//+|#|\*)\s*(Additionally|Moreover|Furthermore)\b'
+  - 'TODO: add description'
+  - 'your code here'
+  - 're:\[(description|summary|details)\]'
+  - 're:\[(Describe|Insert|Add|Your) [^\]]*\]'
+  # Section summaries.
+  - 're:(?i)\b(in summary|in conclusion|to summarize)\b'

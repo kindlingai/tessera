@@ -1,0 +1,10 @@
+fn load(path: &str) -> Option<Config> {
+    if path.is_empty() {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    if !text.starts_with('{') {
+        return None;
+    }
+    parse(&text)
+}

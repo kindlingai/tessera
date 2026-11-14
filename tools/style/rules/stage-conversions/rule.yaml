@@ -1,0 +1,3 @@
+name: 'Staged conversions'
+description: 'A conversion across several data domains happens in one untested step.'
+group: code

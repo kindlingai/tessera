@@ -1,0 +1,27 @@
+name: 'Rule of three'
+description: 'A list padded to three items for rhythm ("fast, safe, and simple"). Name what the code does, or list only the items the domain has.'
+group: comments
+stage: 4
+detectors:
+  # A list of three whose first and last items are abstract qualities. A list
+  # of three real things ("502, 503 and 504") has no word from these lists.
+  # Nouns count only after a purpose or benefit word ("for speed, ...",
+  # "improved clarity, ..."), since a ranking of abstract nouns is real:
+  # "review in order of correctness, performance and security".
+  - 're:(?i)\b(for|improv\w*|better|enhanc\w*|ensur\w*|boost\w*|increas\w*|maximi[sz]\w*)\s+(the\s+|its\s+|their\s+)?(clarity|consistency|readability|maintainability|simplicity|safety|speed|performance|reliability|scalability|robustness|flexibility|efficiency|security|usability|correctness|stability|elegance|quality|productivity|extensibility),\s+[a-z-]+,?\s+and\s+(clarity|consistency|readability|maintainability|simplicity|safety|speed|performance|reliability|scalability|robustness|flexibility|efficiency|security|usability|correctness|stability|elegance|quality|productivity|extensibility)\b'
+  - 're:(?i)\b(fast|safe|simple|clean|clear|concise|robust|reliable|efficient|scalable|flexible|extensible|maintainable|elegant|secure|powerful|lightweight|modern|intuitive|readable|consistent|performant|easy),\s+[a-z-]+,?\s+and\s+(fast|safe|simple|clean|clear|concise|robust|reliable|efficient|scalable|flexible|extensible|maintainable|elegant|secure|powerful|lightweight|modern|intuitive|readable|consistent|performant|easy)\b'
+  # Two real items, then "and more" to reach three.
+  - 're:(?i),\s+and\s+(much\s+|so\s+|many\s+)?more\b'
+# A yes or no question would fire on every list of three, so Jev picks between
+# a list the domain supplies and one padded for rhythm.
+jev:
+  type: choice
+  question: 'Find any list of three items in the comments. Does the code or the domain supply those three items, or were they chosen for rhythm?'
+  labels:
+    domain_list: 'The list names three things the code has or handles, or three terms of art: ''Retries on 502, 503 and 504'', ''Reads the header, the body and the trailer'', ''proves safety, liveness and fairness'''
+    rhythm_triad: 'The list is padded to three for rhythm, with vague or overlapping items: ''fast, safe, and simple'' or ''clarity, consistency, and readability'''
+    no_list: 'There is no list of three'
+  violation: rhythm_triad
+  # The re-check sees the added lines alone, so prose the change did not
+  # write cannot fire it.
+  recheck: added

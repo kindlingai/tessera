@@ -1,0 +1,7 @@
+Which slot a citation takes is decided by the address table.
+---
+The flag must be set by the loader.
+---
+The rows have been written by the importer.
+---
+The lock is being held by the reaper.

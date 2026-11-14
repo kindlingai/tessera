@@ -1,0 +1,19 @@
+A local name must be unique within its routine. Other routines may reuse the name.
+---
+The loader reads the file and parses it.
+---
+The cache holds forty entries. It evicts the oldest first.
+---
+Each routine owns its local names.
+---
+It is safe to call this twice.
+---
+The router keeps a watch set of daemons. The router drops a daemon after three missed rounds.
+---
+The cache holds entries for the loader. It evicts the oldest first.
+---
+The router keeps a watch set of daemons. It drops one after three missed rounds.
+---
+The workers pull jobs from the queues. They retry a failed job twice.
+---
+`mentatd start` records its pid and group.

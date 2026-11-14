@@ -1,0 +1,7 @@
+Two rules apply here. The first covers the cached case.
+---
+There are three things to consider.
+---
+This section describes the retry policy.
+---
+Three cases, handled in order below.

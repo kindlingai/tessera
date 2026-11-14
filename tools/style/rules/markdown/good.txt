@@ -1,0 +1,8 @@
+## Setup
+
+Run the installer.
+---
+- It runs in one pass.
+- It allocates once.
+---
+## How to configure the parser

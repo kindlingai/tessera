@@ -1,0 +1,7 @@
+This builder serves the MLA group, whose spec keeps `tokens_per_state` at 1.
+=>
+This builder serves the MLA group. That group's spec keeps `tokens_per_state` at 1.
+---
+Each request goes to the router, which forwards it to the first live group.
+=>
+The router forwards each request to the first live group.

@@ -1,0 +1,4 @@
+Uses the default axis view fallback order table.
+---
+The loader reads the header and then checks the magic number and then reads
+the section table and then maps each section into memory before it returns.

@@ -1,0 +1,11 @@
+Keep the scope small: touch only this module.
+---
+The reaper frees orphaned slots after a deadlock.
+---
+Cluster name. An announcement from another universe is dropped before its
+signature is checked, without a log line.
+---
+Setting it on its own makes groups flap in and out of the route table.
+---
+An entry for a fabric the router cannot reach costs a `PROBE_TIMEOUT_S` wait
+every round before the fall-through.

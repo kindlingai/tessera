@@ -1,0 +1,8 @@
+Refactor parser, update tests, and improve docs
+
+This commit refactors the parser module. All tests pass and the change
+follows existing conventions.
+---
+Fix retry bug
+
+Changed the retry loop while preserving existing functionality.

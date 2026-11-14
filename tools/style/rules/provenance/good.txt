@@ -1,0 +1,3 @@
+Parses the header. See RFC 9110.
+---
+https://example.com/guide

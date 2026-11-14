@@ -1,0 +1,4 @@
+/// Returns the number of items.
+pub fn len(&self) -> usize { self.items.len() }
+---
+let conn = connect(&addr)?;

@@ -1,0 +1,12 @@
+name: 'Duplication'
+description: 'The same logic appears several times where a helper, loop or macro would remove the copies.'
+group: code
+jev:
+  type: noul
+  question: 'Does the new code repeat the same logic several times where a helper, loop or macro would remove the copies?'
+  'true': 'Logic is duplicated'
+  'false': 'No meaningful duplication'
+  # Prose files skip this question.
+  applies_to: code
+  # This rule judges code, so it can hold on a hunk that adds no comment.
+  judges: code
