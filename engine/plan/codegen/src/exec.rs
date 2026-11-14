@@ -401,16 +401,18 @@ impl Group<'_, '_> {
                     .map(|x| Val::F(f32::from_bits(x.u())))
                     .collect()
             }
-            Intrinsic::Word => {
+            Intrinsic::Word | Intrinsic::Half => {
                 let Expr::Var(name) = &args[0] else {
                     panic!("a word read names its buffer");
                 };
+                let width = if i == Intrinsic::Word { 4 } else { 2 };
                 let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
                 let bytes = &self.buffers[arg.buffer];
                 (0..n)
                     .map(|t| {
                         let at = arg.skip + at[t].u() as usize;
-                        let raw = bytes[at..at + 4].try_into().expect("4 bytes");
+                        let mut raw = [0u8; 4];
+                        raw[..width].copy_from_slice(&bytes[at..at + width]);
                         Val::U(u32::from_le_bytes(raw))
                     })
                     .collect()

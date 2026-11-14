@@ -4,7 +4,7 @@ use crate as codegen;
 use crate::form::Form;
 use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
-use crate::prelude::{Buf, U8, device, helper, kernel};
+use crate::prelude::{Buf, F32x4, U8, device, helper, kernel};
 use graph::{DType, E2M1, E4M3, F16};
 
 /// A code: what one element stores, before its block's scale.
@@ -198,6 +198,47 @@ fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bo
     head * S::load(b) * C::float(c)
 }
 
+/// Elements `i..i+4`: head, scale and four codes.
+#[helper("form_{name}_x4")]
+fn four<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool>(
+    #[build] name: &'static str,
+    p: Buf<U8>,
+    i: u64,
+) -> F32x4 {
+    let j = i % B as u64;
+    let b = p + (HEAD as u64 * 4 + (i / B as u64) * (S::BYTES + B * C::BITS as usize / 8) as u64);
+    // First byte of the codes, then each shift.
+    let at = if C::BITS == 8 {
+        j
+    } else if HALVES {
+        j % (B / 2) as u64
+    } else {
+        j / 2
+    };
+    let step = if C::BITS == 8 || HALVES { 8 } else { 4 };
+    let shift = if C::BITS == 8 || !HALVES {
+        0
+    } else {
+        (4 * (j / (B / 2) as u64)) as u32
+    };
+    let c = b + (S::BYTES as u64 + at);
+    // Scales of two bytes keep the codes two-aligned.
+    let w = if S::BYTES == 2 {
+        c.half(0) | (c.half(2) << 16)
+    } else {
+        c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
+    };
+    let head = if HEAD { f32::from_bits(p.word(0)) } else { 1.0 };
+    let scale = head * S::load(b);
+    let mask = (1u32 << C::BITS) - 1;
+    F32x4::new(
+        scale * C::float((w >> shift) & mask),
+        scale * C::float((w >> (shift + step)) & mask),
+        scale * C::float((w >> (shift + 2 * step)) & mask),
+        scale * C::float((w >> (shift + 3 * step)) & mask),
+    )
+}
+
 /// `B` codes after one scale, after an optional `HEAD` f32.
 pub struct Block<S, C, const B: usize, const HALVES: bool, const HEAD: bool> {
     pub name: &'static str,
@@ -290,8 +331,16 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
         format!("form_{}({name}, {index})", self.name)
     }
 
+    /// Four codes share their block's scale and bytes.
+    fn load4(&self, name: &str, index: &str) -> String {
+        format!("form_{}_x4({name}, {index})", self.name)
+    }
+
     fn header(&self) -> Vec<Helper> {
-        vec![element_ir::<S, C, B, HALVES, HEAD>(self.name)]
+        vec![
+            element_ir::<S, C, B, HALVES, HEAD>(self.name),
+            four_ir::<S, C, B, HALVES, HEAD>(self.name),
+        ]
     }
 
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {

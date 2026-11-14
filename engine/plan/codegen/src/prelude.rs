@@ -127,6 +127,11 @@ impl<F: Elems> Buf<F> {
     pub fn word(&self, _: u32) -> u32 {
         device()
     }
+
+    /// The u16 at byte `offset`, a multiple of 2.
+    pub fn half(&self, _: u32) -> u32 {
+        device()
+    }
 }
 
 /// The buffer from element `n` on.

@@ -115,6 +115,8 @@ pub enum Intrinsic {
     KeptRow,
     /// `p.word(offset)`: the u32 at a byte offset.
     Word,
+    /// `p.half(offset)`: the u16 at a byte offset.
+    Half,
     /// `x.to_bits()` and `f32::from_bits(x)`.
     ToBits,
     FromBits,
@@ -412,6 +414,7 @@ impl Printer<'_> {
                 | Intrinsic::Lane
                 | Intrinsic::KeptRow
                 | Intrinsic::Word
+                | Intrinsic::Half
                 | Intrinsic::ToBits => Ty::U32,
                 Intrinsic::Load4 | Intrinsic::Zero4 | Intrinsic::Make4 => Ty::F32x4,
                 _ => Ty::F32,
@@ -534,6 +537,7 @@ impl Printer<'_> {
             }
             Intrinsic::Zero4 => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
             Intrinsic::Word => format!("f_u32(({} + {}))", arg(self, 0), arg(self, 1)),
+            Intrinsic::Half => format!("f_u16(({} + {}))", arg(self, 0), arg(self, 1)),
             Intrinsic::ToBits => format!("f_asbits({})", arg(self, 0)),
             Intrinsic::FromBits => format!("f_bits({})", arg(self, 0)),
             Intrinsic::Make4 => {
