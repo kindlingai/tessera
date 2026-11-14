@@ -1,7 +1,7 @@
 //! Traced tensors: each method appends one node.
 
 use crate::model::{Kept, Shared, push};
-use crate::weights::{Embed, Linear, Norm, Vector};
+use crate::weights::{Embed, Linear, Norm, Scalar, Vector};
 use graph::{
     Act, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
 };
@@ -48,6 +48,10 @@ impl Tensor {
 
     pub fn mul_vector(&self, v: &Vector) -> Tensor {
         self.stage(Stage::Mul, &[&v.0])
+    }
+
+    pub fn mul_scalar(&self, s: &Scalar) -> Tensor {
+        self.stage(Stage::Mul, &[&s.0])
     }
 
     pub fn add(&self, other: &Tensor) -> Tensor {

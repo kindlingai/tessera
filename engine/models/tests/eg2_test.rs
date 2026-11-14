@@ -35,7 +35,7 @@ fn traces() {
     assert_eq!(g.regions.len(), 2 * 24);
     let count = |w: &graph::Weight| w.ty.shape.elements(&g.dims).unwrap().as_const().unwrap();
     let parameters: u64 = g.weights.iter().map(count).sum();
-    assert_eq!(parameters, 271_022_080);
+    assert_eq!(parameters, 271_009_816);
 }
 
 /// The reference's ids and outputs for one text.

@@ -284,6 +284,7 @@ impl Context<'_> {
             Op::Select(Select::TopK { k }) => top_k(args[0], self.sizes.expr(k)?),
             Op::Select(s) => lacks(&format!("{s:?}")),
             Op::Append(_) => lacks("kept rows outside a launch"),
+            Op::View(View::Concat) => concat(args[0], args[1]),
             Op::View(v) => self.view(v, args[0]),
             Op::Cast(dtype) => Ok(args[0].cast(*dtype)?),
         }
@@ -332,6 +333,21 @@ fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
 /// Ops that trace and verify but do not run yet.
 fn lacks(what: &str) -> Result<Tensor, Error> {
     Err(Error::Unsupported(what.into()))
+}
+
+/// Each row of `a`, then the row of `b`.
+fn concat(a: &Tensor, b: &Tensor) -> Result<Tensor, Error> {
+    let (rows, n) = a.rows();
+    let m = b.rows().1;
+    let (xs, ys) = (a.floats()?, b.floats()?);
+    let mut out = Vec::with_capacity(rows * (n + m));
+    for r in 0..rows {
+        out.extend_from_slice(&xs[r * n..(r + 1) * n]);
+        out.extend_from_slice(&ys[r * m..(r + 1) * m]);
+    }
+    let mut shape = a.shape.clone();
+    *shape.last_mut().expect("verified rank") = n + m;
+    Ok(Tensor::f32(shape, out))
 }
 
 fn permute(x: &Tensor, order: &[u32]) -> Tensor {

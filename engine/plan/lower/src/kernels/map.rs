@@ -201,6 +201,7 @@ impl Map {
         // A repeating operand is read within its span.
         let read = |k: usize| {
             let at = match self.1[k] {
+                Some(1) => Expr::cast(codegen::ir::Ty::U64, Expr::Int(0)),
                 Some(span) => Expr::cast(
                     codegen::ir::Ty::U64,
                     Expr::bin(BinOp::Rem, gid(), Expr::Int(span as i64)),

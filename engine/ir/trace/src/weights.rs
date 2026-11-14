@@ -23,6 +23,9 @@ pub struct Norm(pub(crate) Tensor);
 /// `#[shape(Width)]`: added to rows.
 pub struct Vector(pub(crate) Tensor);
 
+/// `#[shape()]`: one value, for every element.
+pub struct Scalar(pub(crate) Tensor);
+
 /// `#[shape(Rows, Width)]`: a table read by index.
 pub struct Embed(pub(crate) Tensor);
 
@@ -54,6 +57,12 @@ impl Weights for Norm {
 impl Weights for Vector {
     fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
         Vector(leaf(m, path, shape.to_vec(), 1))
+    }
+}
+
+impl Weights for Scalar {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        Scalar(leaf(m, path, shape.to_vec(), 0))
     }
 }
 
