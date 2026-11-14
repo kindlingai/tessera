@@ -33,6 +33,11 @@ pub trait Form: Sync {
         false
     }
 
+    /// Distance between a lane's two wide loads, in elements.
+    fn pairs(&self) -> usize {
+        0
+    }
+
     /// Elements that share one scale, decoded together.
     fn block(&self) -> usize {
         1
