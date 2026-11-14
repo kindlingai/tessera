@@ -23,6 +23,9 @@ instead.
 Prefer procedural loops over functional ones when heavily nested (eg `for` and
 `if` over `iter` and `map`/`filter`).
 
+Don't over-focus on byte-identical results. Prefer complete solutions where other
+checks are necessary to confirm correctness.
+
 ## Process Self-Improvement
 
 If your PR was stuck for a long time on a process or code failure that was
