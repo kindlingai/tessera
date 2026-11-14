@@ -19,6 +19,20 @@ pub struct Text {
     pub body: String,
 }
 
+/// A pointer to a buffer's bytes.
+pub const BYTES: &str = "f_const(u8)";
+
+/// A helper's buffer parameter: a pointer to `ty`.
+pub fn pointer(ty: &str, name: &str) -> String {
+    format!("f_const({ty}) {name}")
+}
+
+/// A function defined once, called from kernel bodies.
+pub fn function(ret: &str, name: &str, params: &[String], lines: &[String]) -> String {
+    let (params, lines) = (params.join(", "), lines.join("\n"));
+    format!("f_fn {ret} {name}({params}) {{\n{lines}\n}}\n")
+}
+
 /// The names a body may use, spelled per dialect.
 const NAMES: &[(&str, &str, &str)] = &[
     ("u64", "unsigned long", "unsigned long long"),

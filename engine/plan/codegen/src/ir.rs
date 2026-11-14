@@ -1,7 +1,7 @@
 //! A kernel body as a tree, printed and costed.
 
 use crate::LANES;
-use crate::dialect::Text;
+use crate::dialect::{self, Text};
 use crate::form::{Form, U8_FORM};
 use crate::kept::Layout;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ impl Ty {
             Ty::U64 => "u64",
             Ty::Bool => "bool",
             Ty::F32x4 => "float4",
-            Ty::Bytes => "f_const(u8)",
+            Ty::Bytes => dialect::BYTES,
         }
     }
 }
@@ -909,7 +909,7 @@ impl Helper {
             match param {
                 Param::Buffer { name, form, .. } => {
                     p.bind(name, Kind::Buffer(*form));
-                    params.push(format!("f_const({}) {name}", form.ty()));
+                    params.push(dialect::pointer(form.ty(), name));
                 }
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
@@ -927,11 +927,7 @@ impl Helper {
         let value = p.expr(value);
         p.line(format!("return {value};"));
         assert!(!p.lane, "`{}` reads the lane: pass it in", self.name);
-        let (ret, name, params) = (self.ret.c(), &self.name, params.join(", "));
-        format!(
-            "f_fn {ret} {name}({params}) {{\n{}\n}}\n",
-            p.lines.join("\n")
-        )
+        dialect::function(self.ret.c(), &self.name, &params, &p.lines)
     }
 }
 
