@@ -1,0 +1,13 @@
+{
+  "attention.*.ln": "language_model.layers.*.input_layernorm",
+  "attention.*.post": "language_model.layers.*.post_attention_layernorm",
+  "layers.*.pre_ff": "language_model.layers.*.pre_feedforward_layernorm",
+  "layers.*.post_ff": "language_model.layers.*.post_feedforward_layernorm",
+  "layers.*.ple_in": "language_model.ple.per_layer_model_projection[*]",
+  "layers.*.ple_gate": "language_model.layers.*.ple_block.per_layer_input_gate",
+  "layers.*.ple_proj": "language_model.layers.*.ple_block.per_layer_projection",
+  "layers.*.ple_norm": "language_model.layers.*.ple_block.post_per_layer_input_norm",
+  "layers.*.scalar": "language_model.layers.*.layer_scalar",
+  "ple_norm": "language_model.ple.per_layer_projection_norm",
+  "proj": "language_model.embedding_projection"
+}

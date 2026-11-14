@@ -16,6 +16,7 @@ graph = { workspace = true }
 trace = { workspace = true }
 
 [dev-dependencies]
+bundle = { workspace = true }
 settings = { workspace = true }
 kernels = { workspace = true }
 calibrate = { workspace = true }

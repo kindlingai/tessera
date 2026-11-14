@@ -5,6 +5,8 @@ mod gguf;
 mod gguf_test;
 pub mod names;
 #[cfg(test)]
+mod names_eg2_test;
+#[cfg(test)]
 mod names_test;
 pub mod tag;
 mod template;
@@ -67,22 +69,27 @@ pub struct Bundle {
 }
 
 /// The weights and their forms, as `offer` stores them.
-pub(crate) fn pull(
+pub fn pull(
     graph: &Graph,
     offer: &dyn Offer,
     layers: u64,
     rules: &[&[Rule]],
 ) -> Result<(Vec<Weight>, Pins), Box<dyn Error + Send + Sync>> {
     let slices = offer.slices();
-    let names = names::resolve(graph, &slices, rules)?;
-    let mut weights = Vec::with_capacity(names.len());
-    let mut forms: Vec<&'static dyn Form> = Vec::with_capacity(names.len());
-    for name in &names {
-        let slice = slices.iter().find(|s| &s.name == name).expect("resolved");
-        let (weight, form) = match slice.stored {
-            Stored::Form(f) => (Weight::Packed(f, offer.packed(name)?), f),
-            Stored::Bf16 => (floats(offer, name)?, BF16_FORM),
-            _ => (floats(offer, name)?, F32_FORM),
+    let claims = names::resolve(graph, &slices, rules)?;
+    let mut weights = Vec::with_capacity(claims.len());
+    let mut forms: Vec<&'static dyn Form> = Vec::with_capacity(claims.len());
+    for (c, w) in claims.iter().zip(&graph.weights) {
+        let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
+        let axis = |e: &graph::DimExpr| e.value(&graph.dims, &|_| None).map(|n| n as usize);
+        let shape: Option<Vec<usize>> = w.ty.shape.0.iter().map(axis).collect();
+        let (weight, form) = match (slice.stored, c.rows) {
+            (Stored::Form(f), Some(rows)) => {
+                (Weight::Packed(f, offer.packed_rows(&c.name, rows)?), f)
+            }
+            (Stored::Form(f), None) => (Weight::Packed(f, offer.packed(&c.name)?), f),
+            (Stored::Bf16, _) => (floats(offer, slice, c.rows, shape)?, BF16_FORM),
+            _ => (floats(offer, slice, c.rows, shape)?, F32_FORM),
         };
         weights.push(weight);
         forms.push(form);
@@ -90,9 +97,20 @@ pub(crate) fn pull(
     Ok((weights, gguf::pins(graph, &forms, layers)))
 }
 
-fn floats(offer: &dyn Offer, name: &str) -> Result<Weight, checkpoint::Error> {
-    let v = offer.floats(name)?;
-    Ok(Weight::Floats(Tensor::f32(vec![v.len()], v)))
+/// A slice's floats, or its `rows`, in the graph's shape.
+fn floats(
+    offer: &dyn Offer,
+    slice: &checkpoint::Slice,
+    rows: Option<(usize, usize)>,
+    shape: Option<Vec<usize>>,
+) -> Result<Weight, checkpoint::Error> {
+    let mut v = offer.floats(&slice.name)?;
+    if let Some((first, count)) = rows {
+        let stride = slice.elements() / slice.shape[0];
+        v = v[first * stride..(first + count) * stride].to_vec();
+    }
+    let shape = shape.unwrap_or_else(|| vec![v.len()]);
+    Ok(Weight::Floats(Tensor::f32(shape, v)))
 }
 
 /// Reads a Qwen3 directory: `slots` sequences of `context` rows.

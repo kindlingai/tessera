@@ -37,4 +37,9 @@ pub trait Offer {
     fn floats(&self, name: &str) -> Result<Vec<f32>, Error>;
     /// Slice `name` as its form's bytes. Floats have none.
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error>;
+    /// Rows `first..first + count` of a packed slice.
+    fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
+        let _ = rows;
+        Err(Error::DType(format!("{name} is not read by rows")))
+    }
 }
