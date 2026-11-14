@@ -8,8 +8,8 @@ description = "Kernels and the lowering rules that propose them"
 
 [features]
 default = []
-cuda = ["lower/cuda", "gpukit/cuda"]
-rocm = ["lower/rocm", "gpukit/rocm"]
+cuda = ["lower/cuda"]
+rocm = ["lower/rocm"]
 
 [dependencies]
 codegen = { workspace = true }
@@ -17,4 +17,3 @@ graph = { workspace = true }
 lower = { workspace = true }
 sim = { workspace = true }
 gemm = { workspace = true }
-gpukit = { workspace = true }
