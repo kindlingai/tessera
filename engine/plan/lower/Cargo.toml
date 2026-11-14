@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 scattered-collect = "0.22"
 codegen = { workspace = true }
+kernel-macro = { workspace = true }
 gpukit = { workspace = true }
 mem = { workspace = true }
 

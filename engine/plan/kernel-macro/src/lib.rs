@@ -1,5 +1,7 @@
 //! `#[kernel]` keeps the function and adds one building its tree.
 
+mod derive;
+
 use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as Tokens, TokenTree};
 use quote::{format_ident, quote};
@@ -14,6 +16,16 @@ type Res = Result<Tokens, Error>;
 /// Names that are values when the tree is built.
 struct Ctx {
     build: Vec<String>,
+}
+
+/// A `Kernel` impl from the struct and its `#[launch]` line.
+#[proc_macro_derive(Kernel, attributes(launch))]
+pub fn derive_kernel(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as syn::DeriveInput);
+    match derive::derive(input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 #[proc_macro_attribute]

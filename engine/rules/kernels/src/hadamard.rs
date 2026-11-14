@@ -3,7 +3,7 @@
 use codegen::prelude::*;
 use graph::Stage;
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Needs, Shape, Source, Step, T, Tree};
+use lower::{Draft, Kernel, Needs, T, Tree};
 
 /// Each lane holds four values of the block.
 const PER_LANE: u32 = 4;
@@ -54,39 +54,10 @@ fn hadamard(x: Buf<F32>, mut out: BufMut<F32>, blocks: u32) {
 }
 
 /// `blocks` transforms of `BLOCK` values, one SIMD group each.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(hadamard, threads = self.blocks * LANES, needs = Needs::lanes())]
 pub struct Hadamard {
     pub blocks: usize,
-}
-
-impl Kernel for Hadamard {
-    fn name(&self) -> &'static str {
-        "hadamard"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.blocks]
-    }
-
-    fn source(&self) -> Source {
-        Source::named(hadamard_ir(), "plan_hadamard")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let args = vec![step.read(0), step.out(), Arg::count(self.blocks)];
-        vec![Launch {
-            args,
-            shape: Shape::Line(self.blocks * LANES),
-        }]
-    }
-
-    fn work(&self, len: usize) -> f64 {
-        len as f64
-    }
-
-    fn needs(&self) -> Needs {
-        Needs::lanes()
-    }
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

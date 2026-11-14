@@ -890,6 +890,7 @@ dependencies = [
  "gpukit",
  "graph",
  "interp",
+ "kernel-macro",
  "kernels",
  "linear",
  "mem",
