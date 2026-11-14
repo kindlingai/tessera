@@ -4,7 +4,7 @@ use engine::{Batch, Engine, Event, Fair, Reason, Request, Row};
 use gpukit::testing::Noise;
 use graph::Graph;
 use interp::{Store, Tensor, run_kept};
-use lower::{Recipe, Weight, kept};
+use lower::{Recipe, Weight, kept, rules};
 use models::qwen3::{Config, stepper};
 
 fn weights(g: &Graph, noise: &mut Noise) -> Vec<Tensor> {
@@ -129,13 +129,22 @@ fn engine_matches_interpreter() {
 
 #[test]
 fn rows_mix_slots() {
-    // The interpreter keeps rows densely. Any layout must agree.
+    // The interpreter keeps rows densely. Layouts and rules must agree.
+    let mut recipes = Vec::new();
     for kept in [kept::DENSE, kept::INTERLEAVED] {
-        let recipe = Recipe {
+        recipes.push(Recipe {
             kept,
             ..Recipe::default()
-        };
-        let (g, weights, mut engine) = open_on(13, 4, recipe);
+        });
+    }
+    for rule in rules() {
+        recipes.push(Recipe {
+            favor: Some(rule.name.into()),
+            ..Recipe::default()
+        });
+    }
+    for recipe in recipes {
+        let (g, weights, mut engine) = open_on(13, 4, recipe.clone());
         // Two prompts at once, decodes side by side, then alone.
         let launches = [
             vec![row(2, 5, 0), row(2, 7, 1), row(0, 9, 0)],
@@ -146,7 +155,7 @@ fn rows_mix_slots() {
         let mut store = Store::default();
         for rows in launches {
             let want = step(&g, &weights, &mut store, &rows);
-            assert_eq!(engine.step(&rows).unwrap(), want, "{rows:?} on {kept:?}");
+            assert_eq!(engine.step(&rows).unwrap(), want, "{rows:?} on {recipe:?}");
         }
         // Slots and positions past the graph's bounds are refused.
         assert!(engine.step(&[row(4, 1, 0)]).is_err());

@@ -10,6 +10,10 @@ pub use run::{Store, bind, run, run_kept};
 pub use tensor::Error;
 
 #[cfg(test)]
+mod cpu_test;
+#[cfg(test)]
 mod interp_test;
 #[cfg(test)]
 mod round_test;
+#[cfg(test)]
+mod run_test;
