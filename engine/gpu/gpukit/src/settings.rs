@@ -24,6 +24,8 @@ pub struct Settings {
     pub qwen3: Option<PathBuf>,
     /// The EmbeddingGemma 2 reference files the parity test reads.
     pub eg2: Option<PathBuf>,
+    /// The spaCy pipeline and tokens the parity test reads.
+    pub spacy: Option<PathBuf>,
     /// The GPU whose tile rounding the host imitates.
     pub emulate: Option<Backend>,
 }
@@ -36,6 +38,7 @@ impl Default for Settings {
             costs: None,
             qwen3: None,
             eg2: None,
+            spacy: None,
             emulate: None,
         }
     }
