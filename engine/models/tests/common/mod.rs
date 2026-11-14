@@ -257,7 +257,7 @@ pub fn traces(spec: &Spec) {
 }
 
 /// A real file's slices, as `tessera-eval --slices` wrote them.
-fn slices(json: &str) -> Vec<Slice> {
+pub fn slices(json: &str) -> Vec<Slice> {
     let entries: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
     let slice = |e: &serde_json::Value| Slice {
         name: e["name"].as_str().unwrap().to_string(),

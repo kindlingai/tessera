@@ -2,6 +2,7 @@
 
 mod golden_test;
 mod rotation_test;
+mod rows_test;
 
 use crate::common::{Golden, Spec, Tolerance, small_stack, suite};
 use lower::form::F32_FORM;

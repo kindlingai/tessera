@@ -124,12 +124,3 @@ fn rules_decide() {
 pub(crate) fn gguf_name(path: &[graph::PathSeg]) -> Option<String> {
     Some(gguf(&tensor_name(path)?))
 }
-
-/// A weight path as `layers.3.q`.
-pub(crate) fn text(path: &[graph::PathSeg]) -> String {
-    let seg = |p: &graph::PathSeg| match p {
-        graph::PathSeg::Field(f) => f.clone(),
-        graph::PathSeg::Index(i) => i.to_string(),
-    };
-    path.iter().map(seg).collect::<Vec<_>>().join(".")
-}

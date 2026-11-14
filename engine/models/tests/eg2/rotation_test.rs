@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use trace::{Graph, Linear, PathSeg};
 
 /// A weight path as `attention.0.q.w`.
-fn text(path: &[PathSeg]) -> String {
+pub(super) fn text(path: &[PathSeg]) -> String {
     let seg = |p: &PathSeg| match p {
         PathSeg::Field(f) => f.clone(),
         PathSeg::Index(i) => i.to_string(),
