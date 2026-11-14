@@ -100,6 +100,7 @@ pub enum Op {
     Row(Row),
     Select(Select),
     View(View),
+    /// Truncates toward zero. The value must fit the target type.
     Cast(DType),
     /// The mean over this axis. The axis goes away.
     Mean(u32),

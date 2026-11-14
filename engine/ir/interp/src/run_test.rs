@@ -64,15 +64,22 @@ fn top_k_ties() {
 
 #[test]
 fn casts_truncate() {
-    let x = Tensor::f32(vec![1, 4], vec![2.7, -2.7, -0.5, 3e9]);
-    let out = casts(x, [I32, U32]).unwrap();
-    // Toward zero, then clamped to the target's range.
-    assert_eq!(out[0].view().as_i32().unwrap(), [2, -2, 0, i32::MAX]);
-    assert_eq!(out[1].indices().unwrap(), [2, 0, 0, 3_000_000_000]);
+    let x = Tensor::f32(vec![1, 4], vec![2.7, -2.7, -0.5, 2e9]);
+    let out = casts(x, [I32]).unwrap();
+    // Toward zero.
+    assert_eq!(out[0].view().as_i32().unwrap(), [2, -2, 0, 2_000_000_000]);
+    let x = Tensor::f32(vec![1, 4], vec![2.7, 0.0, -0.5, 3e9]);
+    let out = casts(x, [U32]).unwrap();
+    assert_eq!(out[0].indices().unwrap(), [2, 0, 0, 3_000_000_000]);
     let ids = Tensor::u32(vec![1, 4], vec![7, 0, 1, u32::MAX]);
-    let out = casts(ids, [F32, I32]).unwrap();
+    let out = casts(ids.clone(), [F32]).unwrap();
     close(&out[0], &[7., 0., 1., 4_294_967_296.]);
-    assert_eq!(out[1].view().as_i32().unwrap(), [7, 0, 1, i32::MAX]);
+    // Values out of the target's range are refused.
+    for (x, to) in [(3e9, I32), (-2.7, U32), (f32::NAN, I32)] {
+        let x = Tensor::f32(vec![1, 4], vec![x; 4]);
+        assert!(matches!(casts(x, [to]), Err(Error::Mismatch(_))));
+    }
+    assert!(casts(ids, [I32]).is_err());
 }
 
 #[test]

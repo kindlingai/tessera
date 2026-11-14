@@ -152,6 +152,17 @@ impl Tensor {
                 .collect(),
             other => return mismatch(format_args!("cast from {other:?}")),
         };
+        let range = match to {
+            DType::I32 => Some(f64::from(i32::MIN)..=f64::from(i32::MAX)),
+            DType::U32 => Some(0.0..=f64::from(u32::MAX)),
+            _ => None,
+        };
+        // Kernel casts leave out-of-range values undefined.
+        if let Some(range) = range
+            && let Some(x) = wide.iter().find(|x| !range.contains(&x.trunc()))
+        {
+            return mismatch(format_args!("{x} does not fit {to:?}"));
+        }
         let shape = self.shape.clone();
         Ok(match to {
             DType::F32 => Self::f32(shape, wide.into_iter().map(|x| x as f32).collect()),
