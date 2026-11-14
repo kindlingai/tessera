@@ -155,6 +155,10 @@ pub enum Stage {
     Rms {
         eps: f32,
     },
+    /// The scaled Walsh-Hadamard transform of each `block` of the row.
+    Hadamard {
+        block: u32,
+    },
     /// Subtracts the row's mean.
     Center,
     /// Divides the row by its sum.

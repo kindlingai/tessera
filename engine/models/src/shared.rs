@@ -2,8 +2,55 @@
 
 use trace::DimName::*;
 use trace::{
-    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, Port, Role, Tensor, TensorType,
+    Act, DType, Dim, DimExpr, DimName, EntryKind, Linear, Model, PathSeg, Port, Role, Tensor,
+    TensorType, Vector, Weights,
 };
+
+/// A matrix a row multiplies into, however it is stored.
+pub trait Dense: Weights {
+    fn apply(&self, x: &Tensor) -> Tensor;
+}
+
+impl Dense for Linear {
+    fn apply(&self, x: &Tensor) -> Tensor {
+        x.matmul(self)
+    }
+}
+
+/// exlr8 rotates in blocks of this many channels.
+pub const ROTATION: u32 = 128;
+
+/// A matrix between two rotations.
+pub struct Rotated {
+    pub w: Linear,
+    pub suh: Vector,
+    pub svh: Vector,
+}
+
+impl Weights for Rotated {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        Self {
+            w: part(m, path, "w", shape),
+            suh: part(m, path, "suh", &shape[..1]),
+            svh: part(m, path, "svh", &shape[1..]),
+        }
+    }
+}
+
+/// Field `name` under `path`, declared with `shape`.
+fn part<T: Weights>(m: &Model, path: &mut Vec<PathSeg>, name: &str, shape: &[DimExpr]) -> T {
+    path.push(PathSeg::Field(name.into()));
+    let value = T::declare(m, path, shape);
+    path.pop();
+    value
+}
+
+impl Dense for Rotated {
+    fn apply(&self, x: &Tensor) -> Tensor {
+        let turned = x.mul_vector(&self.suh).hadamard(ROTATION).matmul(&self.w);
+        turned.hadamard(ROTATION).mul_vector(&self.svh)
+    }
+}
 
 /// Sizes every decoder stack here declares.
 pub struct Stack {

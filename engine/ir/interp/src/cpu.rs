@@ -193,6 +193,12 @@ pub(crate) fn stage(
                 row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
             }
         }
+        (Stage::Hadamard { block }, _) => {
+            let block = *block as usize;
+            for span in out.chunks_mut(block) {
+                hadamard(span);
+            }
+        }
         (Stage::Rms { eps }, _) => {
             for row in out.chunks_mut(width) {
                 let inv = rms_inverse(acc, row, *eps);
@@ -243,6 +249,22 @@ pub(crate) fn mean(n: &Numerics, x: &Tensor, axis: usize) -> Result<Tensor, Erro
     let mut shape = x.shape.clone();
     shape.remove(axis);
     Ok(Tensor::f32(shape, out))
+}
+
+/// The Walsh-Hadamard transform of `x`, scaled to keep its norm.
+fn hadamard(x: &mut [f32]) {
+    let mut len = 1;
+    while len < x.len() {
+        for pair in x.chunks_mut(2 * len) {
+            let (low, high) = pair.split_at_mut(len);
+            for (a, b) in low.iter_mut().zip(high) {
+                (*a, *b) = (*a + *b, *a - *b);
+            }
+        }
+        len *= 2;
+    }
+    let scale = 1.0 / (x.len() as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= scale);
 }
 
 /// One over the row's root mean square.

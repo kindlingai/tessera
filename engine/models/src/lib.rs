@@ -6,4 +6,4 @@ pub mod nanogpt;
 pub mod qwen3;
 mod shared;
 
-pub use shared::Stack;
+pub use shared::{Dense, ROTATION, Rotated, Stack};
