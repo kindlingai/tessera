@@ -15,6 +15,33 @@ pub enum Stored {
     Other,
 }
 
+impl Stored {
+    /// The name manifests write.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Stored::F32 => "f32",
+            Stored::Bf16 => "bf16",
+            Stored::F16 => "f16",
+            Stored::Form(f) => f.name(),
+            Stored::Other => "other",
+        }
+    }
+
+    /// The type `name` stands for, as `Stored::name` writes it.
+    pub fn parse(name: &str) -> Result<Stored, Error> {
+        match name {
+            "f32" => Ok(Stored::F32),
+            "bf16" => Ok(Stored::Bf16),
+            "f16" => Ok(Stored::F16),
+            "other" => Ok(Stored::Other),
+            _ => match codegen::form::named(name) {
+                Some(form) => Ok(Stored::Form(form)),
+                None => Err(Error::Format(format!("unknown stored type {name:?}"))),
+            },
+        }
+    }
+}
+
 /// One tensor on offer, by name, shape and storage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slice {
