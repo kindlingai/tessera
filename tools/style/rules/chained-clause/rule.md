@@ -11,6 +11,6 @@ The reader holds B as the object of the first claim while it turns into the
 subject of the second. Split the claims into two sentences, or lead with B.
 
 A clause that only describes the object with "is" adds a property, so the
-parse reports it as a lead: "picks the first address, which is the fastest".
+pattern skips it: "picks the first address, which is the fastest".
 A "which" clause inside the subject is fine ("The config, which lists every
 peer, is read first"), and so is a "that" clause, which narrows the noun.

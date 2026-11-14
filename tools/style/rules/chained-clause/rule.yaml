@@ -1,8 +1,2 @@
 name: 'Chained clause'
 description: 'A comma and "which" or "whose" hang a second claim off the first claim''s object ("serves the MLA group, whose spec keeps ..."). Split the claims into two sentences.'
-group: comments
-stage: 2
-# The shape needs the parse: a comma, then a "which", "whose" or "who" clause
-# on the object of the main verb. A regex cannot tell that object from the
-# subject, so this rule has no fallback for --no-parse.
-parse: true

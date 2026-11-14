@@ -1,26 +1,2 @@
 name: 'Passive with an agent'
 description: 'Passive voice whose agent exists and does the work ("is decided by the address table"). Lead with the agent.'
-group: comments
-stage: 2
-detectors:
-  # Stage 2: passive with an explicit agent. The actor is already in the
-  # sentence, so lead with it. 42 hits in a large codebase.
-  # Agentless passive ("the row is cached") describes state. Leave it.
-  # An action as the agent is fine ("read by the redo of 7"), so both patterns
-  # skip an agent that is a verb used as a noun, and an agent wrapped to the
-  # next line, which a line pattern cannot see. Add actions to both lists.
-  # Arithmetic is exempt too: "multiplied by 1e10" names an operand.
-  # A form of be or have after "by" ends a clause, as in "an address another
-  # node is known by is refused", so it is not an agent. Nor is an identifier,
-  # snake_case or in backticks: "moved by prev_sibling" names a relation.
-  - 're:^\s*(//+|#|\*).*\b(is|are|was|were|be|been|being)\s+(?!(?:multipli|divid|scal|shift|round|pad|increment|decrement|offset|bound|capp)ed\b)[a-z]+ed by\s+(?![-+]?\.?\d)(?!(?:is|are|was|were|be|been|has|have|had)\b)(?!`|[a-z0-9]+_[a-z0-9_]+\b)(?!(?:(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)\s+)*(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)?\s*$)(?!(?:(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)\s+)*(?:read|write|redo|step|call|pass|drop|flush|commit|insert|load|store|update|retry|reset|restart|reload|lookup|free|release|sweep|run|launch|swap|merge|refresh|resize|rewrite|replay|\w+(?:ation|ition|ction|sion))s?\b)'
-  # Irregular participles, which the -ed pattern misses: "is read by".
-  # Both patterns take any form of "be": "must be set by", "has been held by".
-  - 're:^\s*(//+|#|\*).*\b(is|are|was|were|be|been|being)\s+(read|held|built|run|set|sent|kept|written|rewritten|overridden|shown|taken|made|done|given|known|seen|found|left|put|drawn|chosen|driven|thrown|broken|bound|fed|led|spent|told|caught|brought|thought|hidden|spoken|begun|struck|stuck|hung|spun|shut|hit|split|spread|cast|lost|meant|paid|laid|said|heard|understood|forgotten|grown|blown|torn|worn|sold|won|dealt|got|gotten) by\s+(?![-+]?\.?\d)(?!(?:is|are|was|were|be|been|has|have|had)\b)(?!`|[a-z0-9]+_[a-z0-9_]+\b)(?!(?:(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)\s+)*(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)?\s*$)(?!(?:(?:the|a|an|each|every|any|its|this|that|next|following|first|last|later|previous|same)\s+)*(?:read|write|redo|step|call|pass|drop|flush|commit|insert|load|store|update|retry|reset|restart|reload|lookup|free|release|sweep|run|launch|swap|merge|refresh|resize|rewrite|replay|\w+(?:ation|ition|ction|sion))s?\b)'
-  #
-  # Copular definition restating the declaration ("/// A Fold is a container"
-  # above `struct Fold`): 562 hits, mostly ordinary prose. Review by hand.
-# jev_parse.py checks this rule when uv is available. The parse finds the
-# passive, its "by" agent and whether the agent is a noun, across line wraps,
-# which the regexes above cannot.
-parse: true

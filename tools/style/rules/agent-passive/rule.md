@@ -22,7 +22,6 @@ The active version makes the operation the subject and splits the thought in
 two. Lead with the agent when it is something that exists and does the work: a
 component, a table, a thread, a process or a person.
 
-In a large codebase, passive with an agent had 42 hits, and the comment fails the review
-unless the agent is an action. The detectors check the agent against a list of
-actions, and they cannot see an agent wrapped to the next line. Add actions to
-both lists in `rule.yaml`.
+The pattern skips an agent that names an action ("read by the redo of 7"), an
+operand ("multiplied by 1e10") or code in backticks. The `Action`, `Arith` and
+`Identifier` classes in `src/pattern.rs` hold those lists.
