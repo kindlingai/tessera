@@ -1,11 +1,18 @@
 //! EmbeddingGemma 2: traced, loaded from its checkpoint, and checked.
 
+// Linking these registers their lowering rules.
+use kernels as _;
+use linear as _;
+
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
+use lower::{Device, Plan, Run, Settings, lower, open};
 use models::eg2::{Config, probe, program, weight};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use trace::DimName::{Context, Seqs};
 use trace::Graph;
 
 /// The release sizes, cut to `layers`.
@@ -76,25 +83,80 @@ fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
     bind(g, find).unwrap()
 }
 
-/// The output's mean over the tokens.
-fn pooled(g: &Graph, w: &[Tensor], tokens: &[u32]) -> Vec<f32> {
+/// Tokens and positions for one text, `[1, len]` each.
+fn inputs(tokens: &[u32]) -> [Tensor; 2] {
     let shape = vec![1, tokens.len()];
     let positions = (0..tokens.len() as u32).collect();
     let ids = |data| Tensor::u32(shape.clone(), data);
+    [ids(tokens.to_vec()), ids(positions)]
+}
+
+/// The output's mean over the tokens, on the interpreter.
+fn pooled(g: &Graph, w: &[Tensor], tokens: &[u32]) -> Vec<f32> {
     let start = Instant::now();
-    let out = run(g, w, 0, &[ids(tokens.to_vec()), ids(positions)]).unwrap();
+    let out = run(g, w, 0, &inputs(tokens)).unwrap();
     let seconds = start.elapsed().as_secs_f32();
     eprintln!("  interpreter, {} tokens: {seconds:.2} s", tokens.len());
-    let out = out[0].floats().unwrap();
-    let width = out.len() / tokens.len();
+    mean_rows(out[0].floats().unwrap(), tokens.len())
+}
+
+/// The mean of `rows` rows.
+fn mean_rows(out: &[f32], rows: usize) -> Vec<f32> {
+    let width = out.len() / rows;
     let mut mean = vec![0.0f64; width];
     for row in out.chunks(width) {
         mean.iter_mut()
             .zip(row)
             .for_each(|(m, v)| *m += f64::from(*v));
     }
-    let n = tokens.len() as f64;
-    mean.iter().map(|m| (m / n) as f32).collect()
+    mean.iter().map(|m| (m / rows as f64) as f32).collect()
+}
+
+/// How often a plan launches each kernel.
+fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
+    let mut by = BTreeMap::new();
+    for step in &plan.steps {
+        *by.entry(step.kernel.name()).or_default() += step.launches().len();
+    }
+    by
+}
+
+/// Every case through the forward entry on this machine's GPU.
+fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
+    let device = Device::guess(settings);
+    let mut runner: Option<Box<dyn Run>> = None;
+    for c in cases {
+        let sizes = [(Seqs, 1), (Context, c.tokens.len() as u64)];
+        let plan = lower(g, 0, &sizes, &device).unwrap();
+        eprintln!("  {} launches: {:?}", plan.steps.len(), kernels(&plan));
+        let r = match runner.as_mut() {
+            Some(r) => {
+                r.replan(&plan).unwrap();
+                r
+            }
+            None => {
+                let mut r = open(plan, settings).unwrap();
+                for (at, t) in w.iter().enumerate() {
+                    r.load(at as u32, t.view()).unwrap();
+                }
+                runner.insert(r)
+            }
+        };
+        let feeds = inputs(&c.tokens);
+        r.feed(&[feeds[0].view(), feeds[1].view()]).unwrap();
+        let slot = r.plan().outputs[0].slot;
+        let start = Instant::now();
+        r.submit(0..r.plan().steps.len()).unwrap();
+        let out = r.read(slot).unwrap().floats().unwrap().to_vec();
+        let seconds = start.elapsed().as_secs_f32();
+        eprintln!(
+            "  {}, {} tokens: {seconds:.3} s",
+            r.device(),
+            c.tokens.len()
+        );
+        let got = unit(&mean_rows(&out, c.tokens.len()));
+        close(&format!("{} on the device", c.name), &got, &c.embedding);
+    }
 }
 
 fn unit(v: &[f32]) -> Vec<f32> {
@@ -129,7 +191,9 @@ fn matches_reference() {
         return eprintln!("TESSERA_EG2 is not set; skipped");
     };
     let cases = cases(&dir);
-    check_layers(&dir, &cases[0]);
+    if settings::read().gpu().is_none() {
+        check_layers(&dir, &cases[0]);
+    }
     let cfg = config(24);
     let g = graph(program(&cfg));
     let w = weights(&g, &cfg, &dir);
@@ -137,4 +201,9 @@ fn matches_reference() {
         let got = unit(&pooled(&g, &w, &c.tokens));
         close(&c.name, &got, &c.embedding);
     }
+    let settings = settings::read();
+    if settings.gpu().is_none() {
+        return eprintln!("no GPU here; skipped");
+    }
+    check_device(&settings, &g, &w, &cases);
 }

@@ -130,7 +130,7 @@ impl Buffers<'_> {
                 let copy = self.alloc(op.write);
                 let covers = op.covers.clone();
                 self.plan.steps.push(Step {
-                    kernel: KernelRef::new(Map(Vec::new())),
+                    kernel: KernelRef::new(Map::plain(Vec::new())),
                     rule: op.rule,
                     reads: vec![reads[0]],
                     write: copy,

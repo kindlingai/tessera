@@ -5,7 +5,7 @@ use crate::rule::{Attn, Draft, Read};
 use crate::tree::{T, Term, Tree};
 use graph::{DimName, Mask};
 
-/// Causal attention with `scale` on the scores.
+/// Attention with `scale` on the scores.
 #[derive(Clone, Copy, Debug)]
 pub struct Attend {
     pub scale: f32,
@@ -51,6 +51,7 @@ impl Pattern for Attend {
                 context,
                 kept: tree.kept,
                 segments,
+                mask: Mask::Causal,
             };
             return Some(Self {
                 scale: a.scale,
@@ -61,7 +62,7 @@ impl Pattern for Attend {
                 rows: Some([node.args[3], node.args[4]]),
             });
         }
-        if a.picked || a.mask != Mask::Causal {
+        if a.picked {
             return None;
         }
         let (&[seqs, queries, heads, width], &[_, _, kv_heads, _]) = (&wide(q)[..], &wide(k)[..])
@@ -83,6 +84,7 @@ impl Pattern for Attend {
             context: keys.most(),
             kept: tree.kept,
             segments: 1,
+            mask: a.mask,
         };
         Some(Self {
             scale: a.scale,
@@ -105,7 +107,7 @@ impl Attend {
     pub fn ragged(&self, kernel: impl Kernel + 'static) -> Option<Vec<Draft>> {
         let [slots, positions] = self.rows?;
         let out = self.out();
-        let scale = Map(vec![MapStage::Scale(self.scale)]);
+        let scale = Map::plain(vec![MapStage::Scale(self.scale)]);
         let reads = [
             Read::Draft(0),
             Read::Node(self.k),
