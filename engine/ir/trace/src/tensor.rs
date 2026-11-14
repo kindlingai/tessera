@@ -130,6 +130,11 @@ impl Tensor {
         self.op(Op::Select(Select::TopK { k: k.into() }), &[])
     }
 
+    /// Rows of this tensor at `ids`, like an embedding lookup.
+    pub fn gather(&self, ids: &Tensor) -> Tensor {
+        self.op(Op::Select(Select::Gather), &[ids])
+    }
+
     pub fn take(&self, ids: &Tensor) -> Tensor {
         self.op(Op::Select(Select::Take), &[ids])
     }

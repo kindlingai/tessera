@@ -61,7 +61,7 @@ pub struct Spacy {
 }
 
 /// Python's `str.isspace`, which also counts four separator controls.
-fn is_space(c: char) -> bool {
+pub(crate) fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
