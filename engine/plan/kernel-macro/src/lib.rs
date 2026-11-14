@@ -1,12 +1,12 @@
 //! `#[kernel]` keeps the function and adds one building its tree.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as Tokens;
+use proc_macro2::{TokenStream as Tokens, TokenTree};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
     BinOp, Error, Expr, ExprCall, ExprLit, FnArg, GenericArgument, GenericParam, Generics, Ident,
-    ItemFn, Lit, Pat, PathArguments, ReturnType, Stmt, Type, UnOp, parse_macro_input,
+    ItemFn, Lit, LitStr, Pat, PathArguments, ReturnType, Stmt, Type, UnOp, parse_macro_input,
 };
 
 type Res = Result<Tokens, Error>;
@@ -19,9 +19,33 @@ struct Ctx {
 #[proc_macro_attribute]
 pub fn kernel(_: TokenStream, item: TokenStream) -> TokenStream {
     let mut f = parse_macro_input!(item as ItemFn);
-    match tree(&mut f) {
+    let tree = tree(&mut f, None);
+    expand(&f, tree)
+}
+
+/// A function defined once, named by the format string.
+#[proc_macro_attribute]
+pub fn helper(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut f = parse_macro_input!(item as ItemFn);
+    let name = match attr.is_empty() {
+        true => {
+            let name = f.sig.ident.to_string();
+            quote!(#name.to_string())
+        }
+        false => {
+            let pattern = parse_macro_input!(attr as LitStr);
+            quote!(format!(#pattern))
+        }
+    };
+    let tree = tree(&mut f, Some(name));
+    expand(&f, tree)
+}
+
+/// The function as written, then its tree builders.
+fn expand(f: &ItemFn, tree: Res) -> TokenStream {
+    match tree {
         Ok(tree) => quote! {
-            #[allow(dead_code, unused_mut, unused_variables, clippy::all)]
+            #[allow(dead_code, unused_mut, unused_variables, unused_parens, clippy::all)]
             #f
             #tree
         }
@@ -30,8 +54,8 @@ pub fn kernel(_: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Two siblings: the body builder, and the call to inline.
-fn tree(f: &mut ItemFn) -> Res {
+/// Two siblings: the builder, and the call to inline.
+fn tree(f: &mut ItemFn, helper: Option<Tokens>) -> Res {
     let name = &f.sig.ident;
     let ir_name = format_ident!("{name}_ir");
     let inline_name = format_ident!("{name}_inline");
@@ -93,21 +117,36 @@ fn tree(f: &mut ItemFn) -> Res {
             return Err(Error::new(f.sig.output.span(), "end with the value"));
         }
     };
+    let body = quote! {
+        Body {
+            entry: #entry.into(),
+            layout: None,
+            params: vec![#(#params),*],
+            stmts,
+            ret,
+            helpers: inl.helpers,
+        }
+    };
+    let (item, built, callee) = match helper {
+        None => (quote!(codegen::ir::Body), body, quote!(Kernel)),
+        Some(name) => {
+            let ReturnType::Type(_, ty) = &f.sig.output else {
+                return Err(Error::new(f.sig.span(), "a helper has a value"));
+            };
+            let ret = value_ty(ty)?;
+            let built = quote!(codegen::ir::Helper { name: #name, ret: #ret, body: #body });
+            (quote!(codegen::ir::Helper), built, quote!(Helper))
+        }
+    };
     Ok(quote! {
-        #[allow(clippy::too_many_arguments, unused_mut)]
-        #vis fn #ir_name #impl_generics (#(#build),*) -> codegen::ir::Body #where_clause {
+        #[allow(clippy::all, unused_mut, unused_parens)]
+        #vis fn #ir_name #impl_generics (#(#build),*) -> #item #where_clause {
             #[allow(unused_imports)]
             use codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
             let mut inl = codegen::inline::Inliner::default();
             let mut stmts: Vec<Stmt> = #stmts;
             let ret: Option<Expr> = #ret;
-            Body {
-                entry: #entry.into(),
-                layout: None,
-                params: vec![#(#params),*],
-                stmts,
-                ret,
-            }
+            #built
         }
 
         #[allow(clippy::too_many_arguments, unused_mut)]
@@ -117,16 +156,39 @@ fn tree(f: &mut ItemFn) -> Res {
             let mut args: Vec<codegen::ir::Expr> = Vec::new();
             #(#binds)*
             codegen::inline::Inline {
-                body: #ir_name #turbofish (#(#passes),*),
+                callee: codegen::inline::Callee::#callee(#ir_name #turbofish (#(#passes),*)),
                 args,
             }
         }
     })
 }
 
-/// The generics the tree reads: consts, and an unpicked `Buf<F>`.
+/// A helper's type: a scalar, a `F32x4`, or `Buf<U8>` bytes.
+fn value_ty(ty: &Type) -> Res {
+    let text = quote!(#ty).to_string().replace(' ', "");
+    match text.as_str() {
+        "F32x4" => Ok(quote!(Ty::F32x4)),
+        "Buf<U8>" => Ok(quote!(Ty::Bytes)),
+        _ => scalar(ty),
+    }
+}
+
+/// Every identifier in `tokens`, groups included.
+fn idents(tokens: Tokens, out: &mut Vec<String>) {
+    for t in tokens {
+        match t {
+            TokenTree::Ident(i) => out.push(i.to_string()),
+            TokenTree::Group(g) => idents(g.stream(), out),
+            _ => {}
+        }
+    }
+}
+
+/// Generics the tree reads: consts, `Buf<F>`, types called through.
 fn tree_generics(f: &ItemFn) -> Generics {
     let mut used = Vec::new();
+    let block = &f.block;
+    idents(quote!(#block), &mut used);
     for arg in &f.sig.inputs {
         let FnArg::Typed(p) = arg else { continue };
         if p.attrs.iter().any(|a| a.path().is_ident("form")) {
@@ -234,7 +296,8 @@ fn stmt(s: &Stmt, ctx: &Ctx) -> Res {
     {
         return Ok(quote!({
             let mut pre: Vec<Stmt> = Vec::new();
-            inl.stmt(&mut pre, #call);
+            let call = #call;
+            inl.stmt(&mut pre, call);
             pre
         }));
     }
@@ -493,6 +556,7 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
         BinOp::Shr(_) => quote!(BinOp::Shr),
         BinOp::BitAnd(_) => quote!(BinOp::BitAnd),
         BinOp::BitOr(_) => quote!(BinOp::BitOr),
+        BinOp::BitXor(_) => quote!(BinOp::BitXor),
         BinOp::Lt(_) => quote!(BinOp::Lt),
         BinOp::Le(_) => quote!(BinOp::Le),
         BinOp::Gt(_) => quote!(BinOp::Gt),
@@ -511,18 +575,22 @@ const PRELUDE: &[&str] = &[
     "pow", "cos", "sin", "shared", "tiles", "kept_row",
 ];
 
-/// A call to another kernel: `f_inline(..)`, build values passed raw.
+/// Types whose functions the prelude spells, not kernels.
+const TYPES: &[&str] = &["f32", "F32x4"];
+
+/// A kernel or helper call: `f_inline(..)`, build values raw.
 fn kernel_call(c: &ExprCall, ctx: &Ctx) -> Result<Option<Tokens>, Error> {
     let Expr::Path(p) = &*c.func else {
         return Ok(None);
     };
     let mut path = p.path.clone();
+    let first = path.segments[0].ident.to_string();
     let many = path.segments.len() > 1;
     let Some(last) = path.segments.last_mut() else {
         return Ok(None);
     };
     let name = last.ident.to_string();
-    if many || PRELUDE.contains(&name.as_str()) {
+    if many && TYPES.contains(&first.as_str()) || !many && PRELUDE.contains(&name.as_str()) {
         return Ok(None);
     }
     last.ident = format_ident!("{name}_inline");
@@ -553,13 +621,18 @@ fn is_const_name(name: &str, ctx: &Ctx) -> bool {
 /// Whether every leaf is a literal or a build-time constant.
 fn is_const(e: &Expr, ctx: &Ctx) -> bool {
     match e {
-        Expr::Lit(ExprLit {
-            lit: Lit::Int(_), ..
-        }) => true,
-        Expr::Path(p) => p
-            .path
-            .get_ident()
-            .is_some_and(|i| is_const_name(&i.to_string(), ctx)),
+        Expr::Lit(ExprLit { lit, .. }) => {
+            matches!(lit, Lit::Int(_) | Lit::Float(_) | Lit::Str(_))
+        }
+        // `T::N` is an associated constant.
+        Expr::Path(p) => match p.path.get_ident() {
+            Some(i) => is_const_name(&i.to_string(), ctx),
+            None => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| is_const_name(&s.ident.to_string(), ctx)),
+        },
         Expr::Paren(p) => is_const(&p.expr, ctx),
         Expr::Cast(c) => is_const(&c.expr, ctx),
         Expr::Binary(b) => {
@@ -570,8 +643,9 @@ fn is_const(e: &Expr, ctx: &Ctx) -> bool {
 }
 
 fn expr(e: &Expr, ctx: &Ctx) -> Res {
+    // A build value: `Pass` picks the literal from its type.
     if is_const(e, ctx) && !matches!(e, Expr::Lit(_)) {
-        return Ok(quote!(Expr::Int((#e) as i64)));
+        return Ok(quote!(codegen::inline::Pass::<Expr>::pass(#e)));
     }
     let sub = |e: &Expr| expr(e, ctx);
     match e {
@@ -595,10 +669,6 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 let name = i.to_string();
                 Ok(quote!(Expr::var(#name)))
             }
-            // `f32::INFINITY` and its kin are floats in the tree.
-            None if p.path.segments.len() == 2 && p.path.segments[0].ident == "f32" => {
-                Ok(quote!(Expr::Float(f64::from(#p))))
-            }
             None => Err(Error::new(p.span(), "a plain name")),
         },
         Expr::If(i) => {
@@ -609,14 +679,12 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             let Some((_, els)) = &i.else_branch else {
                 return Err(Error::new(i.span(), "a value needs both branches"));
             };
-            let Expr::Block(els) = &**els else {
-                return Err(Error::new(els.span(), "a block"));
+            let b = match &**els {
+                Expr::Block(els) => only(&els.block)?,
+                nested @ Expr::If(_) => expr(nested, ctx)?,
+                other => return Err(Error::new(other.span(), "a block or `else if`")),
             };
-            let (c, a, b) = (
-                expr(&i.cond, ctx)?,
-                only(&i.then_branch)?,
-                only(&els.block)?,
-            );
+            let (c, a) = (expr(&i.cond, ctx)?, only(&i.then_branch)?);
             Ok(quote!(Expr::select(#c, #a, #b)))
         }
         Expr::Paren(p) => sub(&p.expr),
@@ -659,13 +727,19 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             let intrinsic = match m.method.to_string().as_str() {
                 "load4" => quote!(Intrinsic::Load4),
                 "store4" => quote!(Intrinsic::Store4),
+                "word" => quote!(Intrinsic::Word),
+                "to_bits" => quote!(Intrinsic::ToBits),
                 other => return Err(Error::new(m.method.span(), format!("no `{other}` here"))),
             };
             Ok(quote!(Expr::Call(#intrinsic, vec![#recv, #(#args),*])))
         }
         Expr::Call(c) => {
+            // Calls in the arguments come first, so `inl` is free.
             if let Some(call) = kernel_call(c, ctx)? {
-                return Ok(quote!(inl.expr(&mut pre, #call)));
+                return Ok(quote!({
+                    let call = #call;
+                    inl.expr(&mut pre, call)
+                }));
             }
             let Expr::Path(p) = &*c.func else {
                 return Err(Error::new(c.func.span(), "call a prelude function"));
@@ -687,6 +761,8 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 "cos" => quote!(Intrinsic::Cos),
                 "sin" => quote!(Intrinsic::Sin),
                 "F32x4::zero" => quote!(Intrinsic::Zero4),
+                "F32x4::new" => quote!(Intrinsic::Make4),
+                "f32::from_bits" => quote!(Intrinsic::FromBits),
                 "kept_row" => quote!(Intrinsic::KeptRow),
                 other => return Err(Error::new(p.span(), format!("no `{other}` here"))),
             };

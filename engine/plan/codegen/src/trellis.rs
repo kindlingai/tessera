@@ -1,7 +1,10 @@
 //! The exlr8 trellis form: K-bit codes in tiles.
 
-use crate::block::{minifloat, minifloat_name};
+use crate as codegen;
+use crate::block::{minifloat, minifloat_inline};
 use crate::form::Form;
+use crate::ir::Helper;
+use crate::prelude::{Buf, F32x4, U8, helper};
 use graph::{DType, E4M3, F16};
 
 /// The codebook multiplier.
@@ -125,60 +128,133 @@ impl<const K: u32> Trellis<K> {
         }
         codebook(state)
     }
+}
 
-    /// Kernel text of `decode`, as one function.
-    fn text(&self) -> String {
-        let (k, tile, head, name) = (K, Self::TILE, HEAD, self.name);
-        let steps = 16u32.div_ceil(K);
-        let f16 = minifloat_name(5, 10);
-        // A swapped word pair reads as 32 stream bits.
-        let word = format!(
-            "f_fn u32 form_{name}_pair(f_const(u8) t, u32 q) {{\n    return f_u32(t + 4u * (q % {pairs}u));\n}}\n",
-            pairs = 8 * K
-        );
-        // 32 stream bits from bit `s`, wrapping at the end.
-        let win = format!(
-            "f_fn u32 form_{name}_win(f_const(u8) t, u32 s) {{\n    u32 q = s >> 5;\n    u32 sh = s & 31u;\n    u32 hi = form_{name}_pair(t, q);\n    return sh == 0u ? hi : (hi << sh) | (form_{name}_pair(t, q + 1u) >> (32u - sh));\n}}\n"
-        );
-        // A state's first bit, for the code at `j`.
-        let start = format!(
-            "f_fn u32 form_{name}_start(u32 j) {{\n    return ((j + {}u) % 256u) * {k}u + {}u;\n}}\n",
-            257 - steps,
-            steps * K - 16
-        );
-        let value = format!(
-            "f_fn float form_{name}_value(u32 state) {{\n    u32 x = (state & 0xFFFFu) * {MCG}u;\n    x = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;\n    float v = f_round_f16({f16}(x & 0xFFFFu) + {f16}(x >> 16));\n    return f_round_e4m3(v);\n}}\n"
-        );
-        // The quotient from a float estimate, corrected by one.
-        let col = format!(
-            "f_fn u32 form_{name}_col(f_const(u8) p, u32 n, u32 inp) {{\n    u32 col = (u32)((float)n * f_bits(f_u32(p + 12)));\n    u32 row = n - col * inp;\n    if ((int)row < 0) {{\n        return col - 1u;\n    }}\n    return row >= inp ? col + 1u : col;\n}}\n"
-        );
-        let locate = format!(
-            "f_fn f_const(u8) form_{name}_tile(f_const(u8) p, u32 row, u32 col) {{\n    u32 inp = f_u32(p);\n    u32 out = f_u32(p + 4);\n    u32 tile;\n    if (f_u32(p + 8) == {INPUT_SIDE}u) {{\n        tile = (row / 128u) * (out / 2u) + 64u * (col / 128u) + 8u * ((row % 128u) / 16u) + (col % 128u) / 16u;\n    }} else {{\n        tile = (col / 128u) * (inp / 2u) + 8u * (row / 16u) + (col % 128u) / 16u;\n    }}\n    return p + {head} + (u64)tile * {tile}u;\n}}\n\
-f_fn u32 form_{name}_j(u32 r, u32 c) {{\n    return 8u * (4u * (c % 8u) + (r % 8u) / 2u) + 4u * (c >= 8u) + 2u * (r >= 8u) + (r % 2u);\n}}\n"
-        );
-        let one = format!(
-            "f_fn float form_{name}(f_const(u8) p, u64 i) {{\n    u32 inp = f_u32(p);\n    u32 n = (u32)i;\n    u32 col = form_{name}_col(p, n, inp);\n    u32 row = n - col * inp;\n    f_const(u8) t = form_{name}_tile(p, row, col);\n    u32 j = form_{name}_j(row % 16u, col % 16u);\n    return form_{name}_value(form_{name}_win(t, form_{name}_start(j)) >> 16);\n}}\n"
-        );
-        // Four rows: codes j, j+1, j+8, j+9.
-        let four = format!(
-            "f_fn float4 form_{name}_x4(f_const(u8) p, u64 i) {{\n    u32 inp = f_u32(p);\n    u32 n = (u32)i;\n    u32 col = form_{name}_col(p, n, inp);\n    u32 row = n - col * inp;\n    f_const(u8) t = form_{name}_tile(p, row, col);\n    u32 j = form_{name}_j(row % 16u, col % 16u);\n    u32 a = form_{name}_win(t, form_{name}_start(j));\n    u32 b = form_{name}_win(t, form_{name}_start(j + 8u));\n    return f_make4(form_{name}_value(a >> 16), form_{name}_value(a >> {next}), form_{name}_value(b >> 16), form_{name}_value(b >> {next}));\n}}\n",
-            next = 16 - K
-        );
-        format!("{word}{win}{start}{value}{col}{locate}{one}{four}")
+/// `x` rounded to nearest even, `e` and `m` bits.
+#[helper("{name}")]
+fn rounding(
+    #[build] name: &'static str,
+    #[build] e: u32,
+    #[build] m: u32,
+    #[build] top: f32,
+    x: f32,
+) -> f32 {
+    let a = if x < 0.0 { -x } else { x };
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    // A subnormal: in units of its step, rounded through 2^23.
+    let steps = f32::from_bits((125 + (1u32 << (e - 1)) + m) << 23);
+    let small = (a * steps + 8388608.0) - 8388608.0;
+    let bits = a.to_bits();
+    let nudge = ((1u32 << (22 - m)) - 1) + ((bits >> (23 - m)) & 1);
+    let r = f32::from_bits((bits + nudge) & !((1u32 << (23 - m)) - 1));
+    let big = if r > top { top } else { r };
+    let least = f32::from_bits((129 - (1u32 << (e - 1))) << 23);
+    sign * if a < least { small / steps } else { big }
+}
+
+/// A swapped word pair as 32 stream bits.
+#[helper("form_{name}_pair")]
+fn pair<const K: u32>(#[build] name: &'static str, t: Buf<U8>, q: u32) -> u32 {
+    t.word(4 * (q % (8 * K)))
+}
+
+/// 32 stream bits from bit `s`, wrapping at the end.
+#[helper("form_{name}_win")]
+fn win<const K: u32>(#[build] name: &'static str, t: Buf<U8>, s: u32) -> u32 {
+    let q = s >> 5;
+    let sh = s & 31;
+    let hi = pair::<K>(name, t, q);
+    if sh == 0 {
+        hi
+    } else {
+        (hi << sh) | (pair::<K>(name, t, q + 1) >> (32 - sh))
     }
 }
 
-/// Kernel text: round to nearest even in a float format.
-fn rounding(name: &str, e: u32, m: u32, top: f32) -> String {
-    let bias = (1i32 << (e - 1)) - 1;
-    let least = 2f32.powi(1 - bias);
-    let steps = 2f32.powi(bias - 1 + m as i32);
-    let drop = 23 - m;
-    format!(
-        "f_fn float {name}(float x) {{\n    float a = x < 0.0f ? -x : x;\n    float sign = x < 0.0f ? -1.0f : 1.0f;\n    if (a < {least:?}f) {{\n        float r = (a * {steps:?}f + 8388608.0f) - 8388608.0f;\n        return sign * (r / {steps:?}f);\n    }}\n    u32 bits = f_asbits(a);\n    u32 nudge = ({half}u) + ((bits >> {drop}u) & 1u);\n    float r = f_bits((bits + nudge) & ~{low}u);\n    return sign * (r > {top:?}f ? {top:?}f : r);\n}}\n",
-        half = (1u32 << (drop - 1)) - 1,
-        low = (1u32 << drop) - 1,
+/// A state's first bit, for the code at `j`.
+#[helper("form_{name}_start")]
+fn start<const K: u32>(#[build] name: &'static str, j: u32) -> u32 {
+    // A state spans `16 / K` codes, wrapping at 256.
+    ((j + (257 - (16 + K - 1) / K)) % 256) * K + ((16 + K - 1) / K * K - 16)
+}
+
+/// A state's weight: hashed, then rounded to f16 and e4m3.
+#[helper("form_{name}_value")]
+fn value(#[build] name: &'static str, state: u32) -> f32 {
+    let x = (state & 0xFFFF) * MCG;
+    let y = (x & 0x8FFF8FFF) ^ 0x3B603B60;
+    let v = rounding(
+        "f_round_f16",
+        5,
+        10,
+        65504.0,
+        minifloat::<5, 10>(y & 0xFFFF) + minifloat::<5, 10>(y >> 16),
+    );
+    rounding("f_round_e4m3", 4, 3, 448.0, v)
+}
+
+/// Element `n`'s column: a float estimate, corrected by one.
+#[helper("form_{name}_col")]
+fn col(#[build] name: &'static str, p: Buf<U8>, n: u32, inp: u32) -> u32 {
+    let c = (n as f32 * f32::from_bits(p.word(12))) as u32;
+    let row = n - c * inp;
+    // The top bit set: the row wrapped below zero.
+    if (row >> 31) != 0 {
+        c - 1
+    } else if row >= inp {
+        c + 1
+    } else {
+        c
+    }
+}
+
+/// The tile holding `T[row][col]`, counted in the entries.
+#[helper("form_{name}_tile")]
+fn tile<const K: u32>(#[build] name: &'static str, p: Buf<U8>, row: u32, col: u32) -> Buf<U8> {
+    let inp = p.word(0);
+    let out = p.word(4);
+    let t = if p.word(8) == INPUT_SIDE {
+        (row / 128) * (out / 2) + 64 * (col / 128) + 8 * ((row % 128) / 16) + (col % 128) / 16
+    } else {
+        (col / 128) * (inp / 2) + 8 * (row / 16) + (col % 128) / 16
+    };
+    p + (HEAD as u64 + t as u64 * (32 * K) as u64)
+}
+
+/// Stream position of tile element `(r, c)`.
+#[helper("form_{name}_j")]
+fn slot(#[build] name: &'static str, r: u32, c: u32) -> u32 {
+    8 * (4 * (c % 8) + (r % 8) / 2) + 4 * (c >= 8) as u32 + 2 * (r >= 8) as u32 + (r % 2)
+}
+
+/// Element `i` of a `[out][in]` matrix at `p`.
+#[helper("form_{name}")]
+fn one<const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> f32 {
+    let inp = p.word(0);
+    let n = i as u32;
+    let c = col(name, p, n, inp);
+    let row = n - c * inp;
+    let t = tile::<K>(name, p, row, c);
+    let j = slot(name, row % 16, c % 16);
+    value(name, win::<K>(name, t, start::<K>(name, j)) >> 16)
+}
+
+/// Four along a row: codes `j`, `j+1`, `j+8`, `j+9`.
+#[helper("form_{name}_x4")]
+fn four<const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> F32x4 {
+    let inp = p.word(0);
+    let n = i as u32;
+    let c = col(name, p, n, inp);
+    let row = n - c * inp;
+    let t = tile::<K>(name, p, row, c);
+    let j = slot(name, row % 16, c % 16);
+    let a = win::<K>(name, t, start::<K>(name, j));
+    let b = win::<K>(name, t, start::<K>(name, j + 8));
+    F32x4::new(
+        value(name, a >> 16),
+        value(name, a >> (16 - K)),
+        value(name, b >> 16),
+        value(name, b >> (16 - K)),
     )
 }
 
@@ -236,13 +312,8 @@ impl<const K: u32> Form for Trellis<K> {
     fn load4(&self, name: &str, index: &str) -> String {
         format!("form_{}_x4({name}, {index})", self.name)
     }
-    fn header(&self) -> Vec<String> {
-        vec![
-            minifloat(5, 10),
-            rounding("f_round_f16", 5, 10, 65504.0),
-            rounding("f_round_e4m3", 4, 3, 448.0),
-            self.text(),
-        ]
+    fn header(&self) -> Vec<Helper> {
+        vec![one_ir::<K>(self.name), four_ir::<K>(self.name)]
     }
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         Self::decode(bytes, index)

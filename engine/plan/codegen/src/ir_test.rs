@@ -245,3 +245,55 @@ fn shadows_read_outer() {
         assert!(text.contains(line), "`{line}` in\n{text}");
     }
 }
+
+/// `N` bits of `x` from `at`, as a float.
+#[helper("field{N}")]
+fn field<const N: u32>(x: u32, at: u32) -> f32 {
+    let mask = !((1u32 << N) - 1);
+    let v = (x >> at) & !mask;
+    if N >= 8 {
+        v as f32
+    } else if at == 0 {
+        -(v as f32)
+    } else {
+        0.0
+    }
+}
+
+/// The two bytes of `w[i]` as fields, summed.
+#[helper]
+fn pair(w: Buf<U8>, i: u64) -> f32 {
+    let b = w + i * 2;
+    let x = b[0] | (b[1] << 8);
+    field::<4>(x, 0) + field::<8>(x, 4)
+}
+
+#[test]
+fn helpers_render() {
+    let helper = pair_ir();
+    assert_eq!(helper.name, "pair");
+    let text = helper.text();
+    assert!(
+        text.starts_with("f_fn float pair(f_const(u8) w, u64 i) {\n"),
+        "{text}"
+    );
+    assert!(text.contains("f_const(u8) b = (w + (i * 2));"));
+    assert!(text.contains("return (field4(x, 0) + field8(x, 4));"));
+    // Called helpers come along, each once.
+    let names: Vec<&str> = helper
+        .body
+        .helpers
+        .iter()
+        .map(|h| h.name.as_str())
+        .collect();
+    assert_eq!(names, ["field4", "field8"]);
+    let field = &helper.body.helpers[0];
+    let text = field.text();
+    assert!(text.contains("u32 mask = (~15);"), "{text}");
+    // A build-time choice leaves one branch.
+    assert!(
+        text.contains("return ((at == 0) ? (-(float)v) : 0.0f);"),
+        "{text}"
+    );
+    assert!(helper.body.helpers[1].text().contains("return (float)v;"));
+}

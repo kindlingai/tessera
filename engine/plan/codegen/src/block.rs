@@ -1,6 +1,10 @@
 //! Block forms: a scale, then codes it multiplies.
 
+use crate as codegen;
 use crate::form::Form;
+use crate::inline::{Inline, Pass};
+use crate::ir::{Expr, Helper};
+use crate::prelude::{Buf, U8, device, helper, kernel};
 use graph::{DType, E2M1, E4M3, F16};
 
 /// A code: what one element stores, before its block's scale.
@@ -10,13 +14,14 @@ pub trait Code: Sync {
     const MAX: f32;
     fn encode(scaled: f32) -> u32;
     fn decode(code: u32) -> f32;
-    /// Kernel text: code `c` as a float.
-    fn text(c: &str) -> String;
 
-    /// The kernel function `text` calls, if any.
-    fn header() -> Option<String> {
-        None
+    /// Code `c` as a float, in a kernel.
+    fn float(_: u32) -> f32 {
+        device()
     }
+
+    /// `float` as a tree, for the block's helper.
+    fn float_inline(c: impl Pass<Expr>) -> Inline;
 
     /// The scale for a block, from its values.
     fn scale(block: &[f32]) -> f32 {
@@ -31,33 +36,44 @@ pub trait Scale: Sync {
     const MAX: f32;
     fn put(scale: f32, into: &mut [u8]);
     fn get(from: &[u8]) -> f32;
-    /// Kernel text: the scale whose first byte `p` points at.
-    fn text(p: &str) -> String;
-    /// The kernel function `text` calls.
-    fn header() -> String;
+
+    /// The scale starting at byte `p`, in a kernel.
+    fn load(_: Buf<U8>) -> f32 {
+        device()
+    }
+
+    /// `load` as a tree, for the block's helper.
+    fn load_inline(p: impl Pass<Expr>) -> Inline;
 }
 
-/// The kernel function decoding `e` and `m` bits.
-pub(crate) fn minifloat_name(e: u32, m: u32) -> String {
-    format!("f_mini{e}_{m}")
+/// A float from `x`: `E` exponent and `M` mantissa bits.
+#[helper("f_mini{E}_{M}")]
+pub(crate) fn minifloat<const E: u32, const M: u32>(x: u32) -> f32 {
+    let ex = (x >> M) & ((1u32 << E) - 1);
+    let mn = x & ((1u32 << M) - 1);
+    // A subnormal counts units of the least normal.
+    let v = if ex == 0 {
+        mn as f32 * f32::from_bits((129 - (1u32 << (E - 1)) - M) << 23)
+    } else {
+        f32::from_bits(((ex + (128 - (1u32 << (E - 1)))) << 23) | (mn << (23 - M)))
+    };
+    if ((x >> (E + M)) & 1) != 0 { -v } else { v }
 }
 
-/// The function's text: a float from a word.
-pub(crate) fn minifloat(e: u32, m: u32) -> String {
-    let bias = (1 << (e - 1)) - 1;
-    let step = 2f32.powi(1 - bias - m as i32);
-    let normal = format!("f_bits(((e + {}u) << 23) | (mn << {}))", 127 - bias, 23 - m);
-    format!(
-        "f_fn float {}(u32 x) {{\n    u32 e = (x >> {m}) & {}u;\n    u32 mn = x & {}u;\n    float v = e == 0u ? (float)mn * {step:?}f : {normal};\n    return ((x >> {}) & 1u) ? -v : v;\n}}\n",
-        minifloat_name(e, m),
-        (1 << e) - 1,
-        (1 << m) - 1,
-        e + m,
-    )
+/// An f16 scale: two bytes, low first.
+#[kernel]
+fn f16_scale(p: Buf<U8>) -> f32 {
+    minifloat::<5, 10>(p[0] as u32 | ((p[1] as u32) << 8))
+}
+
+/// An e4m3 scale: one byte.
+#[kernel]
+fn e4m3_scale(p: Buf<U8>) -> f32 {
+    minifloat::<4, 3>(p[0] as u32)
 }
 
 macro_rules! scale {
-    ($t:ident($repr:ty), $bytes:literal, $max:literal) => {
+    ($t:ident($repr:ty), $bytes:literal, $max:literal, $load:ident) => {
         impl Scale for $t {
             const BYTES: usize = $bytes;
             const MAX: f32 = $max;
@@ -69,22 +85,15 @@ macro_rules! scale {
                 raw.copy_from_slice(&from[..$bytes]);
                 $t(<$repr>::from_le_bytes(raw)).into()
             }
-            fn text(p: &str) -> String {
-                let word = (0..$bytes)
-                    .map(|i| format!("((u32)({p})[{i}] << {})", 8 * i))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                format!("{}({word})", minifloat_name($t::EXPONENT, $t::MANTISSA))
-            }
-            fn header() -> String {
-                minifloat($t::EXPONENT, $t::MANTISSA)
+            fn load_inline(p: impl Pass<Expr>) -> Inline {
+                $load(p)
             }
         }
     };
 }
 
-scale!(F16(u16), 2, 65504.0);
-scale!(E4M3(u8), 1, 448.0);
+scale!(F16(u16), 2, 65504.0, f16_scale_inline);
+scale!(E4M3(u8), 1, 448.0, e4m3_scale_inline);
 
 impl Code for E2M1 {
     const BITS: u32 = 4;
@@ -95,12 +104,21 @@ impl Code for E2M1 {
     fn decode(code: u32) -> f32 {
         E2M1(code as u8).into()
     }
-    fn text(c: &str) -> String {
-        format!("{}({c})", minifloat_name(2, 1))
+    fn float_inline(c: impl Pass<Expr>) -> Inline {
+        minifloat_inline::<2, 1>(c)
     }
-    fn header() -> Option<String> {
-        Some(minifloat(2, 1))
-    }
+}
+
+/// A signed byte, from its two's complement.
+#[kernel]
+fn i8_code(c: u32) -> f32 {
+    ((c ^ 128) as f32) - 128.0
+}
+
+/// A nibble 8 below its value.
+#[kernel]
+fn nibble_code(c: u32) -> f32 {
+    c as f32 - 8.0
 }
 
 /// A signed byte.
@@ -115,8 +133,8 @@ impl Code for I8 {
     fn decode(code: u32) -> f32 {
         f32::from(code as u8 as i8)
     }
-    fn text(c: &str) -> String {
-        format!("(float)(((int)({c}) ^ 128) - 128)")
+    fn float_inline(c: impl Pass<Expr>) -> Inline {
+        i8_code_inline(c)
     }
 }
 
@@ -132,8 +150,8 @@ impl Code for Nibble {
     fn decode(code: u32) -> f32 {
         code as f32 - 8.0
     }
-    fn text(c: &str) -> String {
-        format!("((float)({c}) - 8.0f)")
+    fn float_inline(c: impl Pass<Expr>) -> Inline {
+        nibble_code_inline(c)
     }
 
     /// Keeps the sign: the widest value lands on -8.
@@ -143,6 +161,41 @@ impl Code for Nibble {
             .fold(0.0f32, |m, x| if x.abs() > m.abs() { *x } else { m });
         top / -8.0
     }
+}
+
+/// Element `i` of `p`: head, block scale and code.
+#[helper("form_{name}")]
+fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool>(
+    #[build] name: &'static str,
+    p: Buf<U8>,
+    i: u64,
+) -> f32 {
+    let j = i % B as u64;
+    let b = p + (HEAD as u64 * 4 + (i / B as u64) * (S::BYTES + B * C::BITS as usize / 8) as u64);
+    // Code `j`'s byte and shift, paired by halves under `HALVES`.
+    let byte = if C::BITS == 8 {
+        j
+    } else if HALVES {
+        j % (B / 2) as u64
+    } else {
+        j / 2
+    };
+    let shift = if C::BITS == 8 {
+        0
+    } else if HALVES {
+        (4 * (j / (B / 2) as u64)) as u32
+    } else {
+        (4 * (j % 2)) as u32
+    };
+    let c = ((b[S::BYTES as u64 + byte] as u32) >> shift) & ((1u32 << C::BITS) - 1);
+    let head = if HEAD {
+        f32::from_bits(
+            p[0] as u32 | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24),
+        )
+    } else {
+        1.0
+    };
+    head * S::load(b) * C::float(c)
 }
 
 /// `B` codes after one scale, after an optional `HEAD` f32.
@@ -237,30 +290,8 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
         format!("form_{}({name}, {index})", self.name)
     }
 
-    /// An inline function decoding element `i` of `p`.
-    fn header(&self) -> Vec<String> {
-        let (head, scale, code) = (Self::HEAD_BYTES, S::BYTES, C::BITS);
-        let at = format!("p + {head} + (i / {B}) * {}", Self::BLOCK_BYTES);
-        let (byte, shift) = match (code, HALVES) {
-            (8, _) => ("j".to_string(), "0".to_string()),
-            (_, true) => (format!("j % {}", B / 2), format!("4 * (j / {})", B / 2)),
-            _ => ("j / 2".into(), "4 * (j % 2)".into()),
-        };
-        let mask = (1u32 << code) - 1;
-        let tensor = match HEAD {
-            true => "f_bits((u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24))",
-            false => "1.0f",
-        };
-        let own = format!(
-            "f_fn float form_{}(f_const(u8) p, u64 i) {{\n    u64 j = i % {B};\n    f_const(u8) b = {at};\n    u32 c = ((u32)b[{scale} + {byte}] >> ({shift})) & {mask}u;\n    return {tensor} * {} * {};\n}}\n",
-            self.name,
-            S::text("b"),
-            C::text("c"),
-        );
-        let mut parts = vec![S::header()];
-        parts.extend(C::header());
-        parts.push(own);
-        parts
+    fn header(&self) -> Vec<Helper> {
+        vec![element_ir::<S, C, B, HALVES, HEAD>(self.name)]
     }
 
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {

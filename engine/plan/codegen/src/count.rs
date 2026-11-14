@@ -2,7 +2,7 @@
 
 use crate::LANES;
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
 use sim::Ops;
 use std::collections::HashMap;
 
@@ -122,7 +122,7 @@ impl Counter {
                 },
                 _ => Advance::Jumps,
             },
-            Expr::Bin(..) | Expr::Call(..) | Expr::Select(..) | Expr::Index(..) => {
+            Expr::Bin(..) | Expr::Call(..) | Expr::Fn(..) | Expr::Select(..) | Expr::Index(..) => {
                 match self.mentions(e, l) {
                     true => Advance::Jumps,
                     false => Advance::Still,
@@ -142,7 +142,7 @@ impl Counter {
             }
             Expr::Bin(_, a, b) | Expr::Index(a, b) => self.mentions(a, l) || self.mentions(b, l),
             Expr::Select(c, a, b) => [c, a, b].iter().any(|e| self.mentions(e, l)),
-            Expr::Call(_, args) => args.iter().any(|a| self.mentions(a, l)),
+            Expr::Call(_, args) | Expr::Fn(_, _, args) => args.iter().any(|a| self.mentions(a, l)),
         }
     }
 
@@ -207,6 +207,12 @@ impl Counter {
                     ..Ops::default()
                 });
                 fa || fb
+            }
+            Expr::Fn(_, ty, args) => {
+                for a in args {
+                    self.expr(a);
+                }
+                *ty == Ty::F32
             }
             Expr::Call(i, args) => {
                 for a in args {
@@ -278,6 +284,7 @@ impl Counter {
                         });
                         false
                     }
+                    Intrinsic::FromBits | Intrinsic::Make4 => true,
                     _ => false,
                 }
             }
