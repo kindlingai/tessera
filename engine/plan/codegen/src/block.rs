@@ -308,6 +308,14 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
     fn block(&self) -> usize {
         B
     }
+    /// Nibbles: one word holds four codes of each half.
+    fn pairs(&self) -> usize {
+        match (C::BITS, HALVES) {
+            (4, true) => B / 2,
+            (4, false) => 4,
+            _ => 0,
+        }
+    }
     fn bytes(&self, elements: usize) -> usize {
         Self::HEAD_BYTES + elements.div_ceil(B) * Self::BLOCK_BYTES
     }

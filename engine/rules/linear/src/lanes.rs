@@ -37,6 +37,9 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
     k: u32,
     #[build] m: usize,
     #[build] form: &'static dyn Stored,
+    #[build] gap: u32,
+    #[build] per: u32,
+    #[build] span: u32,
 ) {
     let col = gid() / LANES as u32;
     if col >= n {
@@ -47,14 +50,21 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
     for r in 0..m as u32 {
         s[r as usize] = 0.0;
     }
-    for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(AHEAD) {
-        let c = w.load4(at + i as u64);
-        for r in 0..m as u32 {
-            let v = x.load4(r as u64 * k as u64 + i as u64);
-            s[r as usize] += v.x * c.x;
-            s[r as usize] += v.y * c.y;
-            s[r as usize] += v.z * c.z;
-            s[r as usize] += v.w * c.w;
+    // `per` lanes share a `span`, their loads `gap` apart.
+    for i in ((lane() / per) * span + (lane() % per) * WIDE..k)
+        .by(LANES as u32 / per * span)
+        .unroll(AHEAD)
+    {
+        for h in 0..span / (WIDE * per) {
+            let o = i + h * gap;
+            let c = w.load4(at + o as u64);
+            for r in 0..m as u32 {
+                let v = x.load4(r as u64 * k as u64 + o as u64);
+                s[r as usize] += v.x * c.x;
+                s[r as usize] += v.y * c.y;
+                s[r as usize] += v.z * c.z;
+                s[r as usize] += v.w * c.w;
+            }
         }
     }
     for r in 0..m as u32 {
@@ -78,9 +88,12 @@ pub struct Lanes {
 impl Lanes {
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let build = || match self.form.heavy() {
-            true => linear_ir::<WIDE, 1>(self.m, self.form),
-            false => linear_ir::<WIDE, AHEAD>(self.m, self.form),
+        let (m, form, gap) = (self.m, self.form, self.form.pairs() as u32);
+        let (per, span) = ((gap / WIDE).max(1), (2 * gap).max(WIDE));
+        let build = || match (gap, form.heavy()) {
+            (0, true) => linear_ir::<WIDE, 1>(m, form, gap, per, span),
+            (0, false) => linear_ir::<WIDE, AHEAD>(m, form, gap, per, span),
+            _ => linear_ir::<WIDE, 2>(m, form, gap, per, span),
         };
         let key = (self.m, self.form.name());
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
@@ -123,11 +136,12 @@ impl Kernel for Lanes {
 
     fn load(&self, _: usize) -> Option<Load> {
         let (m, n, k) = (self.m, self.n, self.k);
-        let bytes = self.form.bytes(WIDE as usize);
+        let loads = 1 + usize::from(self.form.pairs() > 0);
+        let bytes = self.form.bytes(WIDE as usize) * loads;
         Some(Load {
             threads: n * LANES,
             group: 256,
-            trips: (k / (LANES * WIDE as usize)) as f64,
+            trips: (k / (LANES * WIDE as usize * loads)) as f64,
             trip: self.tree().trip(),
             reads: self.form.matmul_bytes(m, n, k),
             written: (4 * m * n) as f64,
@@ -172,8 +186,9 @@ impl Kernel for Lanes {
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Finished = tree.site(at)?;
     let sites::Matmul { m, n, k, form, .. } = site.product;
-    // Wide loads need whole groups of four along `k`.
-    if m > ROWS || !k.is_multiple_of(WIDE as usize) {
+    // Wide loads need whole groups of four, pairs whole spans.
+    let span = (2 * form.pairs()).max(WIDE as usize);
+    if m > ROWS || !k.is_multiple_of(span) {
         return None;
     }
     let lanes = Lanes {
