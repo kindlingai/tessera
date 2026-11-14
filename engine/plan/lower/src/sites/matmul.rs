@@ -80,7 +80,15 @@ impl Pattern for Finished {
                 others: Vec::new(),
             });
         }
-        let Chain { stages, reads, .. } = tree.site(at)?;
+        let Chain {
+            stages,
+            reads,
+            spans,
+            ..
+        } = tree.site(at)?;
+        if spans.iter().any(Option::is_some) {
+            return None;
+        }
         // A product read elsewhere is stored on its own.
         let lone = |r: &T| tree.site::<Matmul>(*r).filter(|_| !tree.root(*r));
         let sum = reads.iter().position(|r| lone(r).is_some())?;

@@ -8,6 +8,8 @@ pub struct Chain {
     pub stages: Vec<MapStage>,
     pub reads: Vec<T>,
     pub len: usize,
+    /// Per operand: its length when it repeats along the rows.
+    pub spans: Vec<Option<usize>>,
 }
 
 impl Pattern for Chain {
@@ -35,8 +37,18 @@ impl Pattern for Chain {
             stages.push(map_stage(stage)?);
             reads.extend(&n.args[1..]);
         }
-        // An operand of another size would need broadcasting.
-        let fits = reads.iter().all(|r| tree.elements(*r) == len);
-        fits.then_some(Self { stages, reads, len })
+        // An operand repeats when its length divides the rows.
+        let span = |r: &T| match tree.elements(*r) {
+            n if n == len => Some(None),
+            n if len.is_multiple_of(n) => Some(Some(n)),
+            _ => None,
+        };
+        let spans: Option<Vec<_>> = reads[1..].iter().map(span).collect();
+        Some(Self {
+            stages,
+            reads,
+            len,
+            spans: spans?,
+        })
     }
 }

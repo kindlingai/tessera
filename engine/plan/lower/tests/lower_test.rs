@@ -38,7 +38,7 @@ fn count(plan: &Plan, kernel: &str) -> usize {
 }
 
 fn gate() -> Map {
-    Map(vec![MapStage::Act(Act::Silu), MapStage::Mul])
+    Map::plain(vec![MapStage::Act(Act::Silu), MapStage::Mul])
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn near_samples_estimate() {
 
 #[test]
 fn sources_differ() {
-    let hash = |stages: Vec<MapStage>| Map(stages).source().hash();
+    let hash = |stages: Vec<MapStage>| Map::plain(stages).source().hash();
     assert_eq!(hash(vec![MapStage::Add]), hash(vec![MapStage::Add]));
     assert_ne!(hash(vec![MapStage::Add]), hash(vec![MapStage::Mul]));
     assert_ne!(hash(Vec::new()), thin(1).kernel.source().hash());
@@ -475,7 +475,7 @@ fn trips_are_counted() {
     assert!((norm.fresh - 1.0 / 16.0).abs() < 1e-9, "{norm:?}");
     assert_eq!(norm.special, 0.0, "the root lies outside the loops");
     // One thread per element reads a new line each time.
-    let map = trip(&Map(vec![MapStage::Add, MapStage::Act(Act::Silu)]));
+    let map = trip(&Map::plain(vec![MapStage::Add, MapStage::Act(Act::Silu)]));
     assert_eq!(
         (map.loads, map.stores, map.special, map.fresh),
         (2.0, 1.0, 1.0, 1.0)

@@ -47,7 +47,15 @@ pub enum MapStage {
 
 /// `out = stages(x, operands..)`. No stages makes a copy.
 #[derive(Clone, Debug)]
-pub struct Map(pub Vec<MapStage>);
+pub struct Map(pub Vec<MapStage>, pub Vec<Option<usize>>);
+
+impl Map {
+    /// Stages whose operands are as long as the input.
+    pub fn plain(stages: Vec<MapStage>) -> Self {
+        let count = operands(&stages);
+        Self(stages, vec![None; count])
+    }
+}
 
 /// `v` through an activation, as a tree.
 fn act_expr(a: Act) -> Expr {
@@ -145,13 +153,17 @@ impl Kernel for Map {
 
     /// One thread per element, each on its own lines.
     fn load(&self, len: usize) -> Option<Load> {
+        let span = |s: &Option<usize>| 4.0 * s.unwrap_or(len) as f64;
         let inputs = 1 + operands(&self.0);
+        let reads = [4.0 * len as f64]
+            .into_iter()
+            .chain(self.1.iter().map(span));
         Some(Load {
             threads: len,
             group: 256,
             trips: 1.0,
             trip: self.tree().trip(),
-            reads: vec![4.0 * len as f64; inputs],
+            reads: reads.collect(),
             written: 4.0 * len as f64,
             flight: 4.0 * inputs as f64,
         })
@@ -184,8 +196,19 @@ impl Map {
         let mut body = map_ir();
         // The operands sit between the input and the output.
         add_operands(&mut body, 1, operands(&self.0));
-        let at = || Expr::cast(codegen::ir::Ty::U64, Expr::Call(Intrinsic::Gid, Vec::new()));
-        let read = |k: usize| Expr::index(Expr::var(&format!("a{k}")), at());
+        let gid = || Expr::Call(Intrinsic::Gid, Vec::new());
+        let at = || Expr::cast(codegen::ir::Ty::U64, gid());
+        // A repeating operand is read within its span.
+        let read = |k: usize| {
+            let at = match self.1[k] {
+                Some(span) => Expr::cast(
+                    codegen::ir::Ty::U64,
+                    Expr::bin(BinOp::Rem, gid(), Expr::Int(span as i64)),
+                ),
+                None => at(),
+            };
+            Expr::index(Expr::var(&format!("a{k}")), at)
+        };
         body.stmts.extend(stage_stmts(&self.0, &read));
         body.stmts.push(Stmt::Assign {
             target: Expr::index(Expr::var("out"), at()),
@@ -197,8 +220,13 @@ impl Map {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let sites::Chain { stages, reads, len } = tree.site(at)?;
-    Some(vec![Draft::new(Map(stages), reads, len)])
+    let sites::Chain {
+        stages,
+        reads,
+        len,
+        spans,
+    } = tree.site(at)?;
+    Some(vec![Draft::new(Map(stages, spans), reads, len)])
 }
 
 crate::rule!("map", propose);

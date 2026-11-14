@@ -3,7 +3,7 @@
 use codegen::ir::Body;
 use codegen::kept;
 use codegen::prelude::*;
-use graph::Order;
+use graph::{Mask, Order};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
 use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
@@ -576,6 +576,9 @@ impl Kernel for FlashRows {
 /// Scale the queries, then attend by tiles.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Attend = tree.site(at)?;
+    if site.sizes.mask != Mask::Causal {
+        return None;
+    }
     // Tiles of sixteen along the head, within one group's memory.
     if !site.sizes.width.is_multiple_of(16) || site.sizes.width > WIDEST {
         return None;
@@ -604,7 +607,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let out = sizes.seqs * out;
     let reads = [Read::Draft(0), Read::Node(k), Read::Node(v)];
     Some(vec![
-        Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out),
+        Draft::new(Map::plain(vec![MapStage::Scale(scale)]), [q], out),
         Draft::new(Flash(sizes), reads, out),
     ])
 }
