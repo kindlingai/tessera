@@ -113,6 +113,7 @@ fn toolkits_agree() {
                 "metal" => check_metal(&row.tile, target, &dir),
                 other => panic!("no toolkit check for {other}"),
             }
+            println!("{backend} {target}: agrees, tile {:?}", row.tile);
         }
     }
 }
@@ -175,35 +176,27 @@ fn check_rocm(tile: &Option<[usize; 3]>, target: &str, dir: &Path) {
     }
 }
 
-/// metal-tt builds a GPU slice per architecture in the family.
-fn check_metal(tile: &Option<[usize; 3]>, family: &str, dir: &Path) {
+/// metal-tt builds the GPU slice for the architecture.
+fn check_metal(tile: &Option<[usize; 3]>, target: &str, dir: &Path) {
     let xcrun = |args: &[&str]| run("xcrun", &[&["-sdk", "macosx"], args].concat(), dir);
     let (ok, log) = xcrun(&["metal", "-c", "tiled.metal", "-o", "tiled.ir"]);
     assert!(ok, "metal: {log}");
     let (ok, log) = xcrun(&["metallib", "tiled.ir", "-o", "tiled.metallib"]);
     assert!(ok, "metallib: {log}");
-    let (ok, flags) = xcrun(&["metal-config", "-gpu-family", family]);
-    assert!(ok, "metal-config {family}: {flags}");
-    let flags: Vec<&str> = flags.split_whitespace().collect();
-    let out = "tiled.binary.metallib";
-    let args = [
-        &["metal-tt", "tiled.metallib", "tiled.mtlp-json", "-o", out],
-        &flags[..],
-    ]
-    .concat();
-    let (built, log) = xcrun(&args);
-    assert_eq!(built, tile.is_some(), "{family} with {flags:?}: {log}");
+    let (out, script) = ("tiled.binary.metallib", "tiled.mtlp-json");
+    let (built, log) = xcrun(&[
+        "metal-tt",
+        "-arch",
+        target,
+        "tiled.metallib",
+        script,
+        "-o",
+        out,
+    ]);
+    assert_eq!(built, tile.is_some(), "{target}: {log}");
     if tile.is_none() {
         return;
     }
     let (_, archs) = xcrun(&["metal-lipo", "-archs", out]);
-    let gpus: Vec<&str> = archs
-        .split_whitespace()
-        .filter(|a| a.starts_with("applegpu_"))
-        .collect();
-    assert!(!gpus.is_empty(), "{family}: no GPU slice in {archs}");
-    for gpu in gpus {
-        let row = row_for(&format!("metal {gpu}")).unwrap_or_else(|| panic!("{gpu}: no row"));
-        assert_eq!(&row.tile, tile, "{gpu}");
-    }
+    assert!(archs.contains(target), "{target}: no slice in {archs}");
 }
