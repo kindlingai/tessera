@@ -20,7 +20,7 @@ const USAGE: &str = "usage: tessera-style fetch <pipeline_dir>
        tessera-style diff <pipeline_dir> <base> <head> [report_file [link_base]]
        tessera-style scan <pipeline_dir> <file>...
 
-`diff` checks added lines and always succeeds. `scan` fails on any hit.";
+`diff` checks added lines. Both fail on any hit.";
 
 /// This crate's rules and their patterns.
 const RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/rules");
@@ -106,7 +106,7 @@ fn run(args: &[&str]) -> Result<bool, String> {
                     .map_err(|e| e.to_string())?;
                 std::fs::write(report, md).map_err(|e| format!("{report}: {e}"))?;
             }
-            Ok(true)
+            Ok(found.is_empty())
         }
         ["scan", dir, files @ ..] if !files.is_empty() => {
             let checker = Checker::new(Path::new(dir))?;

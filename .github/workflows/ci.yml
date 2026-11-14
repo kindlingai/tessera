@@ -137,44 +137,51 @@ jobs:
           key: simcheck-${{ github.run_id }}
 
   style:
-    # Comment and prose rules (tools/style) on a PR's added lines.
-    # The job posts each broken rule with its fix. CI passes either way.
-    if: github.event_name == 'pull_request'
+    # Comment and prose rules (tools/style) on a PR's added lines. The job
+    # posts each broken rule with its fix, and fails on any hit. On pushes
+    # it does nothing, so `success` can need it.
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
     env:
+      PULL: ${{ github.event_name == 'pull_request' }}
       BASE: ${{ github.event.pull_request.base.sha }}
       HEAD: ${{ github.event.pull_request.head.sha }}
       STYLE: cargo run -q --release -p tessera-style --
     steps:
-      - uses: actions/checkout@v4
+      - if: env.PULL == 'true'
+        uses: actions/checkout@v4
         with:
           ref: ${{ env.HEAD }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - if: env.PULL == 'true'
+        uses: dtolnay/rust-toolchain@1.99.1
+      - if: env.PULL == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: style
       # spaCy's small English pipeline, pinned in tools/style/src/fetch.rs.
-      - id: spacy
+      - if: env.PULL == 'true'
+        id: spacy
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/spacy
           key: spacy-en-core-web-sm-8fb6f8155286360bf5486fe399e2738d1df7ded2
-      - if: steps.spacy.outputs.cache-hit != 'true'
+      - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
         run: $STYLE fetch "$RUNNER_TEMP/spacy"
-      - if: steps.spacy.outputs.cache-hit != 'true'
+      - if: env.PULL == 'true' && steps.spacy.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/spacy
           key: spacy-en-core-web-sm-8fb6f8155286360bf5486fe399e2738d1df7ded2
-      - run: >
+      - if: env.PULL == 'true'
+        run: >
           $STYLE diff "$RUNNER_TEMP/spacy" "$BASE" "$HEAD" "$RUNNER_TEMP/style.md"
           "https://github.com/${{ github.repository }}/blob/$HEAD"
-      # Fork PRs get a read-only token and cannot comment.
-      - continue-on-error: true
+      # Posts on failure too. Fork PRs get a read-only token and cannot comment.
+      - if: always() && env.PULL == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -204,7 +211,7 @@ jobs:
     # The one check to require: every job above passed, and no
     # human step is pending.
     if: always()
-    needs: [commits, lint, linux, macos, similarity, platforms]
+    needs: [commits, lint, linux, macos, similarity, platforms, style]
     runs-on: ubuntu-latest
     steps:
       - env:

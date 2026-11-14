@@ -77,12 +77,15 @@ pub fn markdown(
         out.push_str("None found.\n");
         return Ok(out);
     }
+    let (count, verb) = match found.len() {
+        1 => ("1 added line".to_string(), "breaks"),
+        n => (format!("{n} added lines"), "break"),
+    };
+    writeln!(out, "{count} {verb} the rules in `tools/style/rules`.")?;
     writeln!(
         out,
-        "{} added lines break the rules in `tools/style/rules`.",
-        found.len()
+        "Fix each one, or put `prose: ignore` above a false hit."
     )?;
-    writeln!(out, "This check does not fail CI.")?;
     for rule in rules {
         let mine: Vec<&Found> = found.iter().filter(|f| f.hit.rule == rule.id).collect();
         if !mine.is_empty() {
