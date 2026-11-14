@@ -46,5 +46,6 @@ Crate | Description
 [settings](frontend/settings) | Settings read once from the environment, passed down
 [calibrate](tools/calibrate) | Times kernels on this machine and stores what they cost
 [tessera-lint](tools/lint) | The repository's code-shape rules, run by CI and the pre-commit hook
+[load](tools/load) | Drives concurrent requests against tessera-serve and reports throughput
 [shape](tools/shape) | Line shapes: a line with names, numbers and strings collapsed
 [tessera-simcheck](tools/simcheck) | Fails on near-copies of code, found with EmbeddingGemma 2 embeddings
