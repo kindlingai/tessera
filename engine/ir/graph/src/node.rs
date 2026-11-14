@@ -100,6 +100,7 @@ pub enum Op {
     Row(Row),
     Select(Select),
     View(View),
+    /// Truncates toward zero. The value must fit the target type.
     Cast(DType),
     /// The mean over this axis. The axis goes away.
     Mean(u32),
@@ -216,9 +217,9 @@ pub enum Select {
     Gather,
     /// Row entries at the second argument's indices. Out-of-range gives zero.
     Take,
-    /// Indices of each row's largest entries above negative infinity.
+    /// Indices of each row's largest entries. Spare slots hold width.
     TopK {
-        /// Largest first, low index on ties. Spare slots hold width.
+        /// Best first, NaN and -inf skipped, ties to lower index.
         k: DimExpr,
     },
 }

@@ -84,6 +84,18 @@ fn matmul_row_splits() {
 }
 
 #[test]
+fn plain_casts() {
+    let cast = |from, to| {
+        let x = TensorType::new([Rows, Hidden], from);
+        placed(vec![x], Op::Cast(to))
+    };
+    assert_eq!(cast(DType::F32, DType::U32), Ok(Replicated));
+    for (from, to) in [(DType::F32, DType::Bf16), (DType::F16, DType::F32)] {
+        assert_eq!(cast(from, to), Err(ErrorKind::DType));
+    }
+}
+
+#[test]
 fn reshape_keeps_split_axis() {
     let heads = Shape::from([Rows, Heads, HeadDim]);
     let x = f32s([Rows, Hidden], Split { axis: 1 });
@@ -172,6 +184,26 @@ fn picks_by_index() {
     assert_eq!(placed(tys.clone(), attend.clone()), Err(ErrorKind::Arity));
     let listed = tys.into_iter().chain([ids]).collect();
     assert_eq!(placed(listed, attend), Ok(Replicated));
+}
+
+#[test]
+fn ragged_causal() {
+    let q = f32s([Rows, Heads, HeadDim], Replicated);
+    let kv = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let by = TensorType::new([Rows], DType::U32);
+    let tys = vec![q, kv.clone(), kv, by.clone(), by];
+    let attend = |mask| {
+        Op::Attend(Attend {
+            mask,
+            scale: 0.5,
+            picked: false,
+            ragged: true,
+        })
+    };
+    assert!(result(tys.clone(), attend(Mask::Causal)).is_ok());
+    for mask in [Mask::Bidirectional, Mask::Within(4)] {
+        assert_eq!(placed(tys.clone(), attend(mask)), Err(ErrorKind::Value));
+    }
 }
 
 #[test]

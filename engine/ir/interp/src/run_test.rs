@@ -51,29 +51,35 @@ fn casts<const N: usize>(x: Tensor, to: [DType; N]) -> Result<Vec<Tensor>, Error
 #[test]
 fn top_k_ties() {
     let (inf, nan) = (f32::INFINITY, f32::NAN);
-    // NaN is skipped. 0.0 ranks above -0.0.
+    // NaN is skipped. 0.0 and -0.0 tie.
     let x = vec![2., 7., 7., -1., -inf, 3., nan, -inf, -0.0, 0.0, -0.0, inf];
     let x = Tensor::f32(vec![3, 4], x);
     let out = eval([port([Rows, Hidden], F32)], &[x], None, |_, [x]| {
         [x.top_k(TopK)]
     });
     // Ties keep the lower index. Spare slots hold the width.
-    let want = [1, 2, 0, 1, 4, 4, 3, 1, 0];
+    let want = [1, 2, 0, 1, 4, 4, 3, 0, 1];
     assert_eq!(out.unwrap()[0].indices().unwrap(), want);
 }
 
 #[test]
 fn casts_truncate() {
-    let x = Tensor::f32(vec![1, 4], vec![2.7, -2.7, -0.5, 3e9]);
-    let out = casts(x.clone(), [I32, U32]).unwrap();
-    // Toward zero, then clamped to the target's range.
-    assert_eq!(out[0].view().as_i32().unwrap(), [2, -2, 0, i32::MAX]);
-    assert_eq!(out[1].indices().unwrap(), [2, 0, 0, 3_000_000_000]);
+    let x = Tensor::f32(vec![1, 4], vec![2.7, -2.7, -0.5, 2e9]);
+    let out = casts(x, [I32]).unwrap();
+    // Toward zero.
+    assert_eq!(out[0].view().as_i32().unwrap(), [2, -2, 0, 2_000_000_000]);
+    let x = Tensor::f32(vec![1, 4], vec![2.7, 0.0, -0.5, 3e9]);
+    let out = casts(x, [U32]).unwrap();
+    assert_eq!(out[0].indices().unwrap(), [2, 0, 0, 3_000_000_000]);
     let ids = Tensor::u32(vec![1, 4], vec![7, 0, 1, u32::MAX]);
-    let out = casts(ids, [F32, I32]).unwrap();
+    let out = casts(ids.clone(), [F32]).unwrap();
     close(&out[0], &[7., 0., 1., 4_294_967_296.]);
-    assert_eq!(out[1].view().as_i32().unwrap(), [7, 0, 1, i32::MAX]);
-    assert!(matches!(casts(x, [DType::Bf16]), Err(Error::Mismatch(_))));
+    // Values out of the target's range are refused.
+    for (x, to) in [(3e9, I32), (-2.7, U32), (f32::NAN, I32)] {
+        let x = Tensor::f32(vec![1, 4], vec![x; 4]);
+        assert!(matches!(casts(x, [to]), Err(Error::Mismatch(_))));
+    }
+    assert!(casts(ids, [I32]).is_err());
 }
 
 #[test]
@@ -84,18 +90,18 @@ fn store_keeps_rows() {
         &step(s, &[(0, 0, 1.), (0, 1, 3.), (1, 0, 10.)]),
         &[1., 2., 10.],
     );
-    let next = feeds(&[(0, 2, 5.)]);
-    // Without a store, earlier positions read as zeros.
-    let once = run(&g, &[], 0, &next);
-    assert_eq!(once, run(&g, &[], 0, &next));
-    close(&firsts(once), &[5. / 3.]);
+    // Without a store, no row wrote the earlier positions.
+    let once = run(&g, &[], 0, &feeds(&[(0, 2, 5.)]));
+    assert!(matches!(once, Err(Error::Mismatch(m)) if m.contains("position 0")));
     close(&step(s, &[(0, 2, 5.)]), &[3.]);
     // A launch shorter than the store sees its slot's rows.
     close(&step(s, &[(1, 1, 20.)]), &[15.]);
     // A position past the context bound is refused.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(0, 4, 1.)])).is_err());
-    assert_eq!(s.rows(0), 3);
+    assert_eq!(s.len(0), 3);
     // A slot past `Seqs` is refused. The store keeps rows.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(2, 0, 1.)])).is_err());
+    // A row past its slot's last written position is refused.
+    assert!(run_kept(&g, &[], s, 0, &feeds(&[(1, 3, 1.)])).is_err());
     close(&step(s, &[(0, 3, 7.)]), &[4.]);
 }
