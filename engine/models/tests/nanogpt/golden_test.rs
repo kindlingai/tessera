@@ -1,10 +1,9 @@
-//! The nanogpt, run from JSON alone, against recorded logits.
+//! The nanogpt against recorded logits.
 
-use super::config;
+use super::release;
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, lower, open};
-use models::nanogpt::program;
 use settings::read as settings;
 use trace::DimName::{Context, Seqs};
 use trace::Graph;
@@ -96,11 +95,6 @@ const WANT: [f32; 80] = [
     0.14493969,
 ];
 
-/// The interpreter only ever sees the JSON text.
-fn graph() -> Graph {
-    Graph::from_json(&program(&config()).to_json()).unwrap()
-}
-
 /// The weights `WANT` was recorded with, in graph order.
 fn weights(g: &Graph) -> Vec<Tensor> {
     let mut noise = Noise(1337);
@@ -130,7 +124,7 @@ fn close(label: &str, got: &[f32]) {
 
 #[test]
 fn cpu_matches_record() {
-    let g = graph();
+    let g = release();
     let ids = |data: Vec<u32>| Tensor::u32(vec![2, 5], data);
     let inputs = [ids(TOKENS.to_vec()), ids(positions())];
     let out = run(&g, &weights(&g), 0, &inputs).unwrap();
@@ -139,7 +133,7 @@ fn cpu_matches_record() {
 
 #[test]
 fn plan_matches_record() {
-    let g = graph();
+    let g = release();
     let plan = lower(
         &g,
         0,
