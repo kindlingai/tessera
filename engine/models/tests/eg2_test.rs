@@ -144,16 +144,33 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
         };
         let feeds = inputs(&c.tokens);
         r.feed(&[feeds[0].view(), feeds[1].view()]).unwrap();
-        let slot = r.plan().outputs[0].slot;
+        let (slot, steps) = (r.plan().outputs[0].slot, r.plan().steps.len());
         let start = Instant::now();
-        r.submit(0..r.plan().steps.len()).unwrap();
+        r.submit(0..steps).unwrap();
         let out = r.read(slot).unwrap().floats().unwrap().to_vec();
-        let seconds = start.elapsed().as_secs_f32();
-        eprintln!(
-            "  {}, {} tokens: {seconds:.3} s",
-            r.device(),
-            c.tokens.len()
-        );
+        let cold = start.elapsed().as_secs_f32();
+        // Warm: the plan ten more times, each read back.
+        let start = Instant::now();
+        for _ in 0..10 {
+            r.submit(0..steps).unwrap();
+            r.read(slot).unwrap();
+        }
+        let warm = start.elapsed().as_secs_f32() / 10.0;
+        let (name, n) = (r.device(), c.tokens.len());
+        let rate = n as f32 / warm;
+        eprintln!("  {name}, {n} tokens: cold {cold:.3} s, warm {warm:.4} s, {rate:.0} tokens/s");
+        // Seconds by kernel, each step timed alone on the device.
+        let mut by: BTreeMap<&str, f64> = BTreeMap::new();
+        for (i, step) in r.plan().steps.clone().iter().enumerate() {
+            *by.entry(step.kernel.name()).or_default() += r.repeat(i, 1).unwrap();
+        }
+        let mut by: Vec<_> = by.into_iter().collect();
+        by.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let parts: Vec<String> = by
+            .iter()
+            .map(|(k, s)| format!("{k} {:.1} ms", s * 1e3))
+            .collect();
+        eprintln!("    {}", parts.join(", "));
         let got = unit(&mean_rows(&out, c.tokens.len()));
         close(&format!("{} on the device", c.name), &got, &c.embedding);
     }
