@@ -7,12 +7,12 @@ use axum::response::sse::{Event as Sse, KeepAlive, Sse as Stream};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bundle::tokenize::hf::Hf;
 use bundle::{Message, Template};
 use engine::{Event, Reason, Request};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, mpsc};
-use tokenizers::Tokenizer;
 use tokio::sync::mpsc as async_mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,7 +22,7 @@ pub type Job = (Request, async_mpsc::Sender<Event>);
 
 /// What every handler shares.
 pub struct Shared {
-    pub tokenizer: Tokenizer,
+    pub tokenizer: Hf,
     pub template: Option<Template>,
     pub stop: Vec<u32>,
     /// The engine thread's queue. Answers share each step.
@@ -98,8 +98,10 @@ fn submit(
     max_tokens: usize,
 ) -> Result<async_mpsc::Receiver<Event>, Refused> {
     let bad = |what: String| (StatusCode::BAD_REQUEST, what);
-    let encoded = shared.tokenizer.encode(prompt, false);
-    let tokens = encoded.map_err(|e| bad(e.to_string()))?.get_ids().to_vec();
+    let tokens = shared
+        .tokenizer
+        .encode(prompt)
+        .map_err(|e| bad(e.to_string()))?;
     if tokens.is_empty() {
         return Err(bad("an empty prompt".into()));
     }
@@ -150,7 +152,7 @@ async fn answer(
     mut events: async_mpsc::Receiver<Event>,
     stream: bool,
 ) -> Response {
-    let decode = move |ids: &[u32]| shared.tokenizer.decode(ids, true).unwrap_or_default();
+    let decode = move |ids: &[u32]| shared.tokenizer.decode(ids);
     let mut spool = Spool::default();
     if stream {
         let pieces = ReceiverStream::new(events).map(move |e| {

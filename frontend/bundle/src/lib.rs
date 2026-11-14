@@ -3,6 +3,7 @@
 mod template;
 #[cfg(test)]
 mod template_test;
+pub mod tokenize;
 
 pub use template::{Message, Template};
 
@@ -14,7 +15,7 @@ use models::qwen3::{Config, stepper, tensor_name};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tokenizers::Tokenizer;
+use tokenize::hf::Hf;
 
 /// What the graph needs from a Hugging Face `config.json`.
 #[derive(Deserialize)]
@@ -47,7 +48,7 @@ struct Generation {
 pub struct Bundle {
     pub graph: Graph,
     pub weights: Vec<Tensor>,
-    pub tokenizer: Tokenizer,
+    pub tokenizer: Hf,
     pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
@@ -81,7 +82,7 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
         Some(Tensor::f32(vec![v.len()], v))
     };
     let weights = bind(&graph, find)?;
-    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+    let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let template = Template::load(dir)?;
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
         Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
