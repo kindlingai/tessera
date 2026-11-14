@@ -9,6 +9,7 @@ description = "A Hugging Face model directory as graph, weights, tokenizer and t
 [dependencies]
 checkpoint = { workspace = true }
 graph = { workspace = true }
+lower = { workspace = true }
 interp = { workspace = true }
 fancy-regex = "0.14"
 minijinja = { version = "3", features = ["json", "serde"] }
@@ -21,4 +22,5 @@ rmpv = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
 
 [dev-dependencies]
+engine = { workspace = true }
 settings = { workspace = true }

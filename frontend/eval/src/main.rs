@@ -1,4 +1,4 @@
-//! `tessera-eval --model <dir> [--recipe <json>] [--m 1,4]`: JSON out.
+//! `tessera-eval --model <path> [--recipe <json>] [--m 1,4]`: JSON out.
 
 use engine::{Engine, Row};
 use lower::{Pins, Recipe};
@@ -11,7 +11,7 @@ use std::time::Instant;
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: tessera-eval --model <dir> [--recipe <json>] [--m <list>] [--new <n>] \
+const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>]";
 
 struct Args {
@@ -148,7 +148,9 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {
-            pins: Pins::all(lower::form::BF16_FORM),
+            pins: loaded
+                .pins
+                .unwrap_or_else(|| Pins::all(lower::form::BF16_FORM)),
             ..Recipe::default()
         },
     };

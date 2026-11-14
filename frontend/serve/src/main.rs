@@ -62,7 +62,9 @@ fn engine_thread(
     };
     let settings = settings::read();
     let recipe = Recipe {
-        pins: Pins::all(lower::form::BF16_FORM),
+        pins: loaded
+            .pins
+            .unwrap_or_else(|| Pins::all(lower::form::BF16_FORM)),
         ..Recipe::default()
     };
     let opened = Engine::open(loaded.graph, args.context, &recipe, &settings);
