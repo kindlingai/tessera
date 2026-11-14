@@ -20,7 +20,7 @@ pub trait Backing: Any {
 }
 
 /// Host memory in words. Four-byte views stay aligned.
-pub struct Host(Vec<u32>, usize);
+pub struct Host(Vec<u32>);
 
 impl Host {
     /// Zeroed and touched: a device copy into fresh pages crawls.
@@ -28,13 +28,13 @@ impl Host {
     pub fn new(bytes: usize) -> Self {
         let mut words = Vec::with_capacity(bytes.div_ceil(4));
         words.resize(bytes.div_ceil(4), 0);
-        Self(words, bytes)
+        Self(words)
     }
 }
 
 impl Backing for Host {
     fn bytes(&self) -> usize {
-        self.1
+        4 * self.0.len()
     }
 
     fn mapped(&self) -> Option<&[u8]> {
@@ -106,7 +106,6 @@ impl Buffer {
     pub fn view(&self, at: usize, dtype: DType, shape: Vec<usize>) -> View<'_> {
         let layout = Layout::contiguous(shape);
         View {
-            form: None,
             buffer: self,
             at,
             dtype,

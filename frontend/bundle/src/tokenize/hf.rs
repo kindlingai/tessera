@@ -10,6 +10,11 @@ impl Hf {
         Ok(Self(tokenizers::Tokenizer::from_file(path)?))
     }
 
+    /// A `tokenizer.json` held in memory.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self(tokenizers::Tokenizer::from_bytes(bytes)?))
+    }
+
     /// Vocabulary ids of `text` alone, without special tokens.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
         Ok(self.0.encode(text, false)?.get_ids().to_vec())

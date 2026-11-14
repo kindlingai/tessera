@@ -2,8 +2,8 @@ use crate::gguf::{pins, tensor_name};
 use engine::{Engine, Row};
 use graph::Graph;
 use interp::Tensor;
-use lower::form::{BF16_FORM, F32_FORM, Form, named};
-use lower::{Loaded, Pick, Plan, Precision, Recipe, Run, Settings, Slot, cpu};
+use lower::form::{F32_FORM, Form, named};
+use lower::{Pick, Recipe, Settings, Weight};
 use models::qwen3::{Config, stepper};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -143,23 +143,21 @@ impl Fixture {
     }
 }
 
-fn widened(weights: &[Tensor]) -> Vec<Tensor> {
-    weights
-        .iter()
-        .map(|w| match w.view().packed_form() {
-            Some(name) => {
-                let f = named(name).unwrap();
-                Tensor::f32(
-                    w.shape.clone(),
-                    (0..w.len()).map(|i| f.unpack(w.bytes(), i)).collect(),
-                )
-            }
-            None => w.clone(),
-        })
-        .collect()
+fn widened(weights: &[Weight]) -> Vec<Weight> {
+    let wide = |w: &Weight| match w {
+        Weight::Packed(f, bytes) => {
+            let n = f.elements(bytes.len());
+            Weight::Floats(Tensor::f32(
+                vec![n],
+                (0..n).map(|i| f.unpack(bytes, i)).collect(),
+            ))
+        }
+        Weight::Floats(t) => Weight::Floats(t.clone()),
+    };
+    weights.iter().map(wide).collect()
 }
 
-fn engine(graph: Graph, recipe: &Recipe, weights: &[Tensor]) -> Engine {
+fn engine(graph: Graph, recipe: &Recipe, weights: &[Weight]) -> Engine {
     let settings = Settings {
         backend: Pick::Host,
         ..Settings::default()
@@ -173,7 +171,7 @@ fn compare(form: &'static dyn Form) {
     let loaded = Fixture::new(form).load().unwrap();
     assert_eq!(loaded.stop, [2]);
     assert!(loaded.template.is_some());
-    assert_eq!(loaded.tokenizer.encode("ab", false).unwrap().get_ids(), [2]);
+    assert_eq!(loaded.tokenizer.encode("ab").unwrap(), [2]);
     let pins = loaded.pins.unwrap();
     assert_eq!(pins.weights.name(), form.name());
     assert_eq!(pins.named.len(), 5);
@@ -256,67 +254,27 @@ fn mixed_pins() {
     }
 }
 
-fn runner(form: &'static dyn Form) -> (cpu::Runner, Slot) {
-    let slot = Slot {
-        buffer: 0,
-        offset: 0,
-        len: 32,
-        form,
-    };
-    let plan = Plan {
-        buffers: vec![slot.bytes()],
-        weights: vec![Loaded { weight: 0, slot }],
-        ..Plan::default()
-    };
-    (cpu::Runner::new(plan, 32, Precision::EXACT).unwrap(), slot)
-}
-
-fn stored(run: &cpu::Runner, slot: Slot) -> &[u8] {
-    run.held().get(slot).backing().mapped().unwrap()
-}
-
-fn verify(name: &'static str) {
-    let form = named(name).unwrap();
-    let mut bytes = vec![0; form.bytes(32)];
-    bytes[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
-    let tensor = Tensor::packed(vec![32], name, &bytes);
-    let floats: Vec<_> = (0..32).map(|i| form.unpack(&bytes, i)).collect();
-    let wide = Tensor::f32(vec![32], floats);
-    let (mut direct, slot) = runner(form);
-    direct.load(0, tensor.view()).unwrap();
-    assert_eq!(stored(&direct, slot), bytes);
-    if name == "q8_0" {
-        assert_ne!(form.pack(wide.floats().unwrap()), bytes);
-    }
-    for to in [F32_FORM, BF16_FORM, named("q4_0").unwrap()] {
-        let (mut direct, slot) = runner(to);
-        let (mut reference, _) = runner(to);
-        direct.load(0, tensor.view()).unwrap();
-        reference.load(0, wide.view()).unwrap();
-        if to.name() != name {
-            assert_eq!(stored(&direct, slot), stored(&reference, slot));
-        }
-    }
-    let (mut run, slot) = runner(form);
-    let bad = Tensor::packed(vec![32], name, &bytes[..bytes.len() - 1]);
-    assert!(matches!(
-        run.write(slot, bad.view()),
-        Err(lower::Error::Size(_))
-    ));
-    let unknown = Tensor::packed(vec![32], "unknown", &bytes);
-    assert!(matches!(
-        run.write(slot, unknown.view()),
-        Err(lower::Error::Unsupported(_))
-    ));
-    let wrong = Tensor::packed(vec![64], name, &bytes);
-    assert!(matches!(
-        run.load(0, wrong.view()),
-        Err(lower::Error::Size(_))
-    ));
-}
-
+/// Bytes of the wrong length are refused before any upload.
 #[test]
-fn packed_upload() {
-    verify("q8_0");
-    verify("q4_0");
+fn short_bytes() {
+    let loaded = Fixture::new(named("q8_0").unwrap()).load().unwrap();
+    let recipe = Recipe {
+        pins: loaded.pins.unwrap(),
+        ..Recipe::default()
+    };
+    let mut weights = loaded.weights;
+    let at = weights
+        .iter()
+        .position(|w| matches!(w, Weight::Packed(..)))
+        .unwrap();
+    let Weight::Packed(form, bytes) = &weights[at] else {
+        unreachable!()
+    };
+    weights[at] = Weight::Packed(*form, bytes[..bytes.len() - 1].to_vec());
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let mut engine = Engine::open(loaded.graph, 8, &recipe, &settings).unwrap();
+    assert!(matches!(engine.load(&weights), Err(lower::Error::Size(_))));
 }

@@ -1,6 +1,7 @@
 //! What every backend's plan runner does.
 
 use crate::Error;
+use crate::form::Form;
 use crate::plan::{Plan, Slot};
 use crate::recipe::Launching;
 use codegen::Precision;
@@ -113,6 +114,13 @@ impl Held {
     }
 }
 
+/// A weight as a file holds it.
+pub enum Weight {
+    Floats(Tensor),
+    /// One form's bytes, as `Form::pack` lays them out.
+    Packed(&'static dyn Form, Vec<u8>),
+}
+
 /// A plan with its buffers allocated and kernels compiled.
 pub trait Run {
     fn plan(&self) -> &Plan;
@@ -139,6 +147,30 @@ pub trait Run {
     /// How the hardware's tiles round.
     fn precision(&self) -> Precision;
 
+    /// Uploads a weight as stored, widened where a slot differs.
+    fn load_weight(&mut self, weight: u32, w: &Weight) -> Result<(), Error> {
+        let Weight::Packed(form, bytes) = w else {
+            let Weight::Floats(t) = w else { unreachable!() };
+            return self.load(weight, t.view());
+        };
+        let slots: Vec<Slot> = (self.plan().weights.iter())
+            .filter(|l| l.weight == weight)
+            .map(|l| l.slot)
+            .collect();
+        for slot in slots {
+            if form.bytes(slot.len) != bytes.len() {
+                return Err(Error::Size(format!("weight {weight} as {}", form.name())));
+            }
+            if slot.form.name() == form.name() {
+                self.held_mut().upload(slot, bytes)?;
+                continue;
+            }
+            let floats = (0..slot.len).map(|i| form.unpack(bytes, i)).collect();
+            self.write(slot, Tensor::f32(vec![slot.len], floats).view())?;
+        }
+        Ok(())
+    }
+
     /// Uploads one weight already in its form's bytes.
     fn load_packed(&mut self, weight: u32, bytes: &[u8]) -> Result<(), Error> {
         let slots: Vec<Slot> = (self.plan().weights.iter())
@@ -159,20 +191,6 @@ pub trait Run {
 
     /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
-        if let Some(name) = src.packed_form() {
-            let raw = src.raw_bytes()?;
-            let from = crate::form::named(name)
-                .ok_or_else(|| Error::Unsupported(format!("form {name}")))?;
-            if raw.len() != from.bytes(slot.len) {
-                return Err(Error::Size(format!("packed {name}")));
-            }
-            if name == slot.form.name() {
-                return self.held_mut().upload(slot, raw);
-            }
-            let floats = (0..slot.len).map(|i| from.unpack(raw, i)).collect();
-            let wide = Tensor::f32(vec![slot.len], floats);
-            return self.write(slot, wide.view());
-        }
         let plain = slot.form.block() == 1 && src.dtype() == slot.form.dtype();
         if plain {
             return Ok(copy(src, &mut self.held_mut().view_mut(slot))?);

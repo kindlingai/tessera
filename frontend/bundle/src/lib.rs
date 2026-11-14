@@ -1,5 +1,8 @@
 //! A Hugging Face model directory: graph, weights, tokenizer, template.
 
+mod gguf;
+#[cfg(test)]
+mod gguf_test;
 pub mod tag;
 mod template;
 #[cfg(test)]
@@ -10,7 +13,8 @@ pub use template::{Message, Template};
 
 use checkpoint::File;
 use graph::Graph;
-use interp::{Tensor, bind};
+use interp::bind;
+use lower::{Pins, Weight};
 use models::Stack;
 use models::qwen3::{Config, stepper, tensor_name};
 use serde::Deserialize;
@@ -48,7 +52,9 @@ struct Generation {
 
 pub struct Bundle {
     pub graph: Graph,
-    pub weights: Vec<Tensor>,
+    pub weights: Vec<Weight>,
+    /// Forms packed in the file, when any are.
+    pub pins: Option<Pins>,
     pub tokenizer: Hf,
     pub template: Option<Template>,
     /// Ids that end an answer.
@@ -57,6 +63,9 @@ pub struct Bundle {
 
 /// Reads a Qwen3 directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
+    if dir.is_file() {
+        return gguf::load(dir, slots, context);
+    }
     let hf: HfConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     if hf.model_type != "qwen3" {
         return Err(format!("{} is not a model this engine traces", hf.model_type).into());
@@ -80,9 +89,12 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
     let file = File::open(&dir.join("model.safetensors"))?;
     let find = |p: &[graph::PathSeg]| {
         let v = file.floats(&tensor_name(p)?).ok()?;
-        Some(Tensor::f32(vec![v.len()], v))
+        Some(interp::Tensor::f32(vec![v.len()], v))
     };
-    let weights = bind(&graph, find)?;
+    let weights = bind(&graph, find)?
+        .into_iter()
+        .map(Weight::Floats)
+        .collect();
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let template = Template::load(dir)?;
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
@@ -96,6 +108,7 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
     Ok(Bundle {
         graph,
         weights,
+        pins: None,
         tokenizer,
         template,
         stop,

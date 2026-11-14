@@ -1,34 +1,34 @@
-//! Qwen3 weights and tokenizer from one GGUF file.
+//! One GGUF file: graph, weights, tokenizer and template.
 
+use crate::tokenize::hf::Hf;
 use crate::{Bundle, Template};
 use checkpoint::{Gguf, GgufType};
 use graph::{Graph, PathSeg};
-use interp::{Tensor, bind};
-use lower::Pins;
+use interp::Tensor;
 use lower::form::{F32_FORM, Form, named};
+use lower::{Pins, Weight};
 use models::Stack;
 use models::qwen3::{Config, stepper};
 use serde_json::{Map, Value, json};
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-fn config(gguf: &Gguf, slots: u64, context: u64) -> Result<Config, Failure> {
+/// The stack's sizes, under the file's own architecture prefix.
+fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, Failure> {
     let integer = |key: &str| {
-        gguf.u64(key)
+        gguf.u64(&format!("{arch}.{key}"))
             .filter(|n| *n > 0)
-            .ok_or_else(|| format!("missing or invalid {key}"))
+            .ok_or_else(|| format!("missing or invalid {arch}.{key}"))
     };
     let float = |key: &str| {
-        gguf.f32(key)
+        gguf.f32(&format!("{arch}.{key}"))
             .filter(|n| n.is_finite() && *n > 0.)
-            .ok_or_else(|| format!("missing or invalid {key}"))
+            .ok_or_else(|| format!("missing or invalid {arch}.{key}"))
     };
-    let hidden = integer("qwen3.embedding_length")?;
-    let vocab = match gguf.u64("qwen3.vocab_size") {
+    let hidden = integer("embedding_length")?;
+    let vocab = match gguf.u64(&format!("{arch}.vocab_size")) {
         Some(n) => n,
         None => gguf.elements("token_embd.weight")? as u64 / hidden,
     };
@@ -36,27 +36,28 @@ fn config(gguf: &Gguf, slots: u64, context: u64) -> Result<Config, Failure> {
         stack: Stack {
             vocab,
             hidden,
-            layers: integer("qwen3.block_count")?,
-            heads: integer("qwen3.attention.head_count")?,
-            head_dim: integer("qwen3.attention.key_length")?,
-            ffn: integer("qwen3.feed_forward_length")?,
+            layers: integer("block_count")?,
+            heads: integer("attention.head_count")?,
+            head_dim: integer("attention.key_length")?,
+            ffn: integer("feed_forward_length")?,
             max_seqs: slots,
             max_context: context,
         },
-        kv_heads: integer("qwen3.attention.head_count_kv")?,
-        rope_theta: float("qwen3.rope.freq_base")?,
-        eps: float("qwen3.attention.layer_norm_rms_epsilon")?,
+        kv_heads: integer("attention.head_count_kv")?,
+        rope_theta: float("rope.freq_base")?,
+        eps: float("attention.layer_norm_rms_epsilon")?,
     };
     if vocab == 0
         || slots == 0
         || context == 0
         || !config.stack.heads.is_multiple_of(config.kv_heads)
     {
-        return Err("invalid qwen3 dimensions".into());
+        return Err(format!("invalid {arch} dimensions").into());
     }
     Ok(config)
 }
 
+/// GGUF's names for weight paths, shared by every architecture.
 pub(crate) fn tensor_name(path: &[PathSeg]) -> Option<String> {
     use PathSeg::{Field, Index};
     Some(match path {
@@ -91,17 +92,18 @@ fn form(ty: GgufType) -> &'static dyn Form {
     }
 }
 
-fn tensor(gguf: &Gguf, name: &str) -> Result<Tensor, checkpoint::Error> {
-    match gguf.tensor_type(name)? {
+/// One weight as the file stores it, `want` elements long.
+fn weight(gguf: &Gguf, name: &str, want: usize) -> Result<Weight, Failure> {
+    if gguf.elements(name)? != want {
+        return Err(format!("{name}: {} elements, want {want}", gguf.elements(name)?).into());
+    }
+    Ok(match gguf.tensor_type(name)? {
         GgufType::F32 | GgufType::F16 => {
             let values = gguf.floats(name)?;
-            Ok(Tensor::f32(vec![values.len()], values))
+            Weight::Floats(Tensor::f32(vec![values.len()], values))
         }
-        ty => {
-            let (_, elements, bytes) = gguf.bytes(name)?;
-            Ok(Tensor::packed(vec![elements], form(ty).name(), &bytes))
-        }
-    }
+        ty => Weight::Packed(form(ty), gguf.bytes(name)?.2),
+    })
 }
 
 pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Form], layers: u64) -> Pins {
@@ -158,7 +160,7 @@ pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Form], layers: u64) -> P
     pins
 }
 
-fn tokenizer(gguf: &Gguf) -> Result<Tokenizer, Failure> {
+fn tokenizer(gguf: &Gguf) -> Result<Hf, Failure> {
     let tokens = gguf
         .strs("tokenizer.ggml.tokens")
         .ok_or("missing tokenizer tokens")?;
@@ -208,40 +210,46 @@ fn tokenizer(gguf: &Gguf) -> Result<Tokenizer, Failure> {
             "continuing_subword_prefix": "", "end_of_word_suffix": "", "fuse_unk": false,
             "byte_fallback": false, "ignore_merges": false, "vocab": vocab, "merges": merges}
     });
-    Tokenizer::from_bytes(serde_json::to_vec(&data)?)
+    Hf::from_json(&serde_json::to_vec(&data)?)
 }
 
 pub(crate) fn load(path: &Path, slots: u64, context: u64) -> Result<Bundle, Failure> {
     let gguf = Gguf::open(path)?;
-    if gguf.str("general.architecture") != Some("qwen3") {
-        return Err("GGUF architecture must be qwen3".into());
-    }
-    let config = config(&gguf, slots, context)?;
+    let arch = gguf
+        .str("general.architecture")
+        .ok_or("a GGUF file names its architecture")?;
+    // The one place a model is chosen.
+    let (graph, layers) = match arch {
+        "qwen3" => {
+            let config = config(&gguf, arch, slots, context)?;
+            (stepper(&config), config.stack.layers)
+        }
+        other => return Err(format!("{other} is not a model this engine traces").into()),
+    };
     if gguf.has("output.weight")
         && gguf.bytes("output.weight")? != gguf.bytes("token_embd.weight")?
     {
-        return Err("untied output.weight is not supported for qwen3".into());
+        return Err("an untied output.weight is not supported".into());
     }
-    let graph = stepper(&config);
     let forms = graph
         .weights
         .iter()
         .map(|w| {
-            let name = tensor_name(&w.path).ok_or("unknown qwen3 weight path")?;
+            let name = tensor_name(&w.path).ok_or("a weight path GGUF has no name for")?;
             Ok::<_, Failure>(form(gguf.tensor_type(&name)?))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let pins = pins(&graph, &forms, config.stack.layers);
-    let failure = RefCell::new(None);
-    let weights = bind(&graph, |path| match tensor(&gguf, &tensor_name(path)?) {
-        Ok(tensor) => Some(tensor),
-        Err(e) => {
-            *failure.borrow_mut() = Some(e);
-            None
-        }
-    });
-    if let Some(e) = failure.into_inner() {
-        return Err(e.into());
+    let pins = pins(&graph, &forms, layers);
+    let mut weights = Vec::with_capacity(graph.weights.len());
+    for w in &graph.weights {
+        let name = tensor_name(&w.path).ok_or("a weight path GGUF has no name for")?;
+        let want =
+            w.ty.shape
+                .elements(&graph.dims)
+                .ok()
+                .and_then(|n| n.as_const());
+        let want = want.ok_or("a weight of unknown size")? as usize;
+        weights.push(weight(&gguf, &name, want)?);
     }
     let template = gguf
         .str("tokenizer.chat_template")
@@ -258,10 +266,10 @@ pub(crate) fn load(path: &Path, slots: u64, context: u64) -> Result<Bundle, Fail
     }
     Ok(Bundle {
         graph,
-        weights: weights?,
+        weights,
+        pins: Some(pins),
         tokenizer: tokenizer(&gguf)?,
         template,
         stop,
-        pins: Some(pins),
     })
 }

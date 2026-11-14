@@ -7,7 +7,7 @@ use linear as _;
 use graph::DimName::{Context, Rows, Segments, Seqs};
 use graph::Graph;
 use interp::Tensor;
-use lower::{Cache, Device, Error, Recipe, Run, Settings, open};
+use lower::{Cache, Device, Error, Recipe, Run, Settings, Weight, open};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -124,9 +124,9 @@ impl Engine {
     }
 
     /// Uploads the graph's weights, in its order.
-    pub fn load(&mut self, weights: &[Tensor]) -> Result<(), Error> {
+    pub fn load(&mut self, weights: &[Weight]) -> Result<(), Error> {
         for (at, w) in weights.iter().enumerate() {
-            self.runner.load(at as u32, w.view())?;
+            self.runner.load_weight(at as u32, w)?;
         }
         Ok(())
     }

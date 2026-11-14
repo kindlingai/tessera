@@ -1,4 +1,4 @@
-//! `tessera-serve --model <path> [--port 8080] [--context 4096] [--slots 4]`
+//! `tessera-serve --model <dir> [--port 8080] [--context 4096] [--slots 4]`
 
 mod server;
 mod text;
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
-const USAGE: &str = "usage: tessera-serve --model <path> [--host <addr>] [--port <n>] \
+const USAGE: &str = "usage: tessera-serve --model <dir> [--host <addr>] [--port <n>] \
 [--context <rows>] [--slots <n>]";
 
 struct Args {
