@@ -583,28 +583,8 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
 
 /// Names the prelude gives, which are not kernels.
 const PRELUDE: &[&str] = &[
-    "barrier",
-    "gid",
-    "lid",
-    "lane",
-    "shfl_xor",
-    "sum32",
-    "rsqrt",
-    "exp",
-    "tanh",
-    "max",
-    "clamp",
-    "pow",
-    "cos",
-    "sin",
-    "shared",
-    "tiles",
-    "kept_row",
-    "f16_to_f32",
-    "e4m3_to_f32",
-    "e2m1_to_f32",
-    "s8_to_f32",
-    "bits_to_f32",
+    "barrier", "gid", "lid", "lane", "shfl_xor", "sum32", "rsqrt", "exp", "tanh", "max", "clamp",
+    "pow", "cos", "sin", "shared", "tiles", "kept_row",
 ];
 
 /// Types whose functions the prelude spells, not kernels.
@@ -758,14 +738,9 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             let args: Vec<Tokens> = m.args.iter().map(sub).collect::<Result<_, _>>()?;
             let intrinsic = match m.method.to_string().as_str() {
                 "load4" => quote!(Intrinsic::Load4),
-                "byte" => quote!(Intrinsic::LoadByte),
-                "u16_le" => quote!(Intrinsic::LoadU16),
-                "u32_le" => quote!(Intrinsic::LoadU32),
-                "pack4_aligned" => quote!(Intrinsic::LoadPack4Aligned),
-                "pack4" => quote!(Intrinsic::LoadPack4),
-
                 "store4" => quote!(Intrinsic::Store4),
                 "word" => quote!(Intrinsic::Word),
+                "half" => quote!(Intrinsic::Half),
                 "to_bits" => quote!(Intrinsic::ToBits),
                 other => return Err(Error::new(m.method.span(), format!("no `{other}` here"))),
             };
@@ -786,12 +761,6 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             let args: Vec<Tokens> = c.args.iter().map(sub).collect::<Result<_, _>>()?;
             let intrinsic = match name.as_str() {
                 "gid" => quote!(Intrinsic::Gid),
-                "f16_to_f32" => quote!(Intrinsic::F16ToF32),
-                "e4m3_to_f32" => quote!(Intrinsic::E4m3ToF32),
-                "e2m1_to_f32" => quote!(Intrinsic::E2m1ToF32),
-                "s8_to_f32" => quote!(Intrinsic::S8ToF32),
-                "bits_to_f32" => quote!(Intrinsic::BitsToF32),
-
                 "lid" => quote!(Intrinsic::Lid),
                 "lane" => quote!(Intrinsic::Lane),
                 "shfl_xor" => quote!(Intrinsic::ShflXor),

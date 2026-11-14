@@ -118,31 +118,6 @@ impl<F: Elems> Index<u64> for Buf<F> {
 }
 
 impl<F: Elems> Buf<F> {
-    /// One byte at a byte offset.
-    pub fn byte(&self, _: u64) -> u32 {
-        device()
-    }
-
-    /// Two bytes at a two-byte-aligned byte offset.
-    pub fn u16_le(&self, _: u64) -> u32 {
-        device()
-    }
-
-    /// Four bytes at a four-byte-aligned byte offset.
-    pub fn u32_le(&self, _: u64) -> u32 {
-        device()
-    }
-
-    /// Four bytes at a two-byte-aligned byte offset.
-    pub fn pack4_aligned(&self, _: u64) -> u32 {
-        device()
-    }
-
-    /// Four bytes at any byte offset.
-    pub fn pack4(&self, _: u64) -> u32 {
-        device()
-    }
-
     /// Elements `at` to `at + 3`, within one line.
     pub fn load4(&self, _: u64) -> F32x4 {
         device()
@@ -150,6 +125,11 @@ impl<F: Elems> Buf<F> {
 
     /// The u32 at byte `offset`, a multiple of 4.
     pub fn word(&self, _: u32) -> u32 {
+        device()
+    }
+
+    /// The u16 at byte `offset`, a multiple of 2.
+    pub fn half(&self, _: u32) -> u32 {
         device()
     }
 }
@@ -318,23 +298,3 @@ pub trait Stride: Sized {
 }
 
 impl<I: Iterator> Stride for I {}
-
-pub fn f16_to_f32(_: u32) -> f32 {
-    device()
-}
-
-pub fn e4m3_to_f32(_: u32) -> f32 {
-    device()
-}
-
-pub fn e2m1_to_f32(_: u32) -> f32 {
-    device()
-}
-
-pub fn s8_to_f32(_: u32) -> f32 {
-    device()
-}
-
-pub fn bits_to_f32(_: u32) -> f32 {
-    device()
-}

@@ -62,31 +62,16 @@ const NAMES: &[(&str, &str, &str)] = &[
         "threadgroup ty name[n]",
         "__shared__ ty name[n]",
     ),
-    (
-        "f_u16(p)",
-        "(u32)(*(device const u16 *)(p))",
-        "(u32)(*(const u16 *)(p))",
-    ),
-    (
-        "f_u32(p)",
-        "(*(device const u32 *)(p))",
-        "(*(const u32 *)(p))",
-    ),
-    (
-        "f_pack4_aligned(p)",
-        "as_type<u32>(*(device const packed_ushort2 *)(p))",
-        "(((u64)(p) & 2u) == 0u ? (*(const u32 *)(p)) : ((u32)(*(const u16 *)(p)) | ((u32)(*(const u16 *)((p) + 2)) << 16)))",
-    ),
-    (
-        "f_pack4(p)",
-        "as_type<u32>(*(device const packed_uchar4 *)(p))",
-        "(((u64)(p) & 3u) == 0u ? (*(const u32 *)(p)) : ((u32)(p)[0] | ((u32)(p)[1] << 8) | ((u32)(p)[2] << 16) | ((u32)(p)[3] << 24)))",
-    ),
     ("f_f32x4(p)", "(*(device float4 *)(p))", "(*(float4 *)(p))"),
     (
         "f_u32(p)",
         "(*(device const u32 *)(p))",
         "(*(const u32 *)(p))",
+    ),
+    (
+        "f_u16(p)",
+        "(*(device const u16 *)(p))",
+        "(*(const u16 *)(p))",
     ),
     (
         "f_u32x2(p)",

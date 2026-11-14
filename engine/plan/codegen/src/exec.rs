@@ -356,54 +356,6 @@ impl Group<'_, '_> {
                     .map(|t| Val::F(v[t].f().clamp(lo[t].f(), hi[t].f())))
                     .collect()
             }
-            Intrinsic::F16ToF32
-            | Intrinsic::E4m3ToF32
-            | Intrinsic::E2m1ToF32
-            | Intrinsic::S8ToF32
-            | Intrinsic::BitsToF32 => self
-                .eval(&args[0], mask)
-                .into_iter()
-                .map(|x| {
-                    Val::F(match i {
-                        Intrinsic::F16ToF32 => f32::from(graph::F16(x.u() as u16)),
-                        Intrinsic::E4m3ToF32 => f32::from(graph::E4M3(x.u() as u8)),
-                        Intrinsic::E2m1ToF32 => f32::from(graph::E2M1(x.u() as u8)),
-                        Intrinsic::S8ToF32 => f32::from(x.u() as u8 as i8),
-                        _ => f32::from_bits(x.u()),
-                    })
-                })
-                .collect(),
-            Intrinsic::LoadByte
-            | Intrinsic::LoadU16
-            | Intrinsic::LoadU32
-            | Intrinsic::LoadPack4Aligned
-            | Intrinsic::LoadPack4 => {
-                let Expr::Var(name) = &args[0] else {
-                    panic!("a load names its buffer");
-                };
-                let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
-                let (width, align) = match i {
-                    Intrinsic::LoadByte => (1, 1),
-                    Intrinsic::LoadU16 => (2, 2),
-                    Intrinsic::LoadU32 => (4, 4),
-                    Intrinsic::LoadPack4Aligned => (4, 2),
-                    _ => (4, 1),
-                };
-                let bytes = &self.buffers[arg.buffer];
-                (0..n)
-                    .map(|t| {
-                        if !mask[t] {
-                            return Val::U(0);
-                        }
-                        let start = arg.form.offset(arg.skip) + at[t].l() as usize;
-                        assert!(start.is_multiple_of(align), "unaligned byte load");
-                        assert!(start + width <= bytes.len(), "byte load outside buffer");
-                        let mut word = [0u8; 4];
-                        word[..width].copy_from_slice(&bytes[start..start + width]);
-                        Val::U(u32::from_le_bytes(word))
-                    })
-                    .collect()
-            }
             Intrinsic::Load4 => {
                 let Expr::Var(name) = &args[0] else {
                     panic!("a load names its buffer");
@@ -449,16 +401,18 @@ impl Group<'_, '_> {
                     .map(|x| Val::F(f32::from_bits(x.u())))
                     .collect()
             }
-            Intrinsic::Word => {
+            Intrinsic::Word | Intrinsic::Half => {
                 let Expr::Var(name) = &args[0] else {
                     panic!("a word read names its buffer");
                 };
+                let width = if i == Intrinsic::Word { 4 } else { 2 };
                 let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
                 let bytes = &self.buffers[arg.buffer];
                 (0..n)
                     .map(|t| {
                         let at = arg.skip + at[t].u() as usize;
-                        let raw = bytes[at..at + 4].try_into().expect("4 bytes");
+                        let mut raw = [0u8; 4];
+                        raw[..width].copy_from_slice(&bytes[at..at + width]);
                         Val::U(u32::from_le_bytes(raw))
                     })
                     .collect()

@@ -2,7 +2,7 @@
 
 use graph::{Entry, EntryKind, Graph, Node, NodeId, Op, Output, Port, Role};
 
-/// Cuts nodes, keeping weights and exposing other reads as inputs.
+/// A graph of `nodes` alone. Their reads become its inputs.
 pub fn cut(g: &Graph, nodes: &[NodeId]) -> Graph {
     let mut out = Graph::new(g.dims.clone());
     out.kept.clone_from(&g.kept);
@@ -16,28 +16,19 @@ pub fn cut(g: &Graph, nodes: &[NodeId]) -> Graph {
             }
             seen
         });
-    let mut inputs = Vec::new();
-    for id in &reads {
-        let ty = g.node(*id).ty.clone();
-        let op = match g.node(*id).op {
-            Op::Weight(w) => {
-                let at = out.weights.len() as u32;
-                out.weights.push(g.weights[w as usize].clone());
-                Op::Weight(at)
-            }
-            _ => {
-                let port = inputs.len() as u32;
-                inputs.push(Port {
-                    role: Role::Tokens,
-                    ty: ty.clone(),
-                });
-                Op::Input { entry: 0, port }
-            }
-        };
+    let port = |id: &NodeId| Port {
+        role: Role::Tokens,
+        ty: g.node(*id).ty.clone(),
+    };
+    let inputs: Vec<Port> = reads.iter().map(port).collect();
+    for (at, p) in inputs.iter().enumerate() {
         out.nodes.push(Node {
-            op,
+            op: Op::Input {
+                entry: 0,
+                port: at as u32,
+            },
             args: Vec::new(),
-            ty,
+            ty: p.ty.clone(),
             numerics: None,
         });
     }

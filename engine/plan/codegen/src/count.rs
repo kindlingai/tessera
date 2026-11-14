@@ -254,47 +254,7 @@ impl Counter {
                         });
                         true
                     }
-                    Intrinsic::LoadByte
-                    | Intrinsic::LoadU16
-                    | Intrinsic::LoadU32
-                    | Intrinsic::LoadPack4Aligned
-                    | Intrinsic::LoadPack4 => {
-                        let width = match i {
-                            Intrinsic::LoadByte => 1.0,
-                            Intrinsic::LoadU16 => 2.0,
-                            _ => 4.0,
-                        };
-                        self.load(&args[1], width);
-                        false
-                    }
-                    Intrinsic::F16ToF32
-                    | Intrinsic::E4m3ToF32
-                    | Intrinsic::E2m1ToF32
-                    | Intrinsic::S8ToF32 => {
-                        let (int, float) = match i {
-                            Intrinsic::S8ToF32 => (3.0, 1.0),
-                            _ => (6.0, 2.0),
-                        };
-                        self.add(Ops {
-                            int,
-                            float,
-                            ..Ops::default()
-                        });
-                        true
-                    }
-                    Intrinsic::BitsToF32 => true,
                     Intrinsic::Load4 => {
-                        if self.global(&args[0]).is_some_and(|f| f.block() > 1) {
-                            self.add(Ops {
-                                loads: 8.0,
-                                int: 48.0,
-                                float: 16.0,
-                                fresh: 1.0,
-                                width: 1.0,
-                                ..Ops::default()
-                            });
-                            return true;
-                        }
                         let bytes = self.global(&args[0]).map_or(4.0, |f| f.element_bytes());
                         let (at, mut l) = (&args[1], self.loops.pop());
                         // Four elements move the address by one of them.
