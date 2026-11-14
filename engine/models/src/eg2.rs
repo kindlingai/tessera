@@ -219,22 +219,24 @@ fn attend<D: Dense>(
     a.o.apply(&out.reshape(flat)).rms_norm(&a.post, c.eps)
 }
 
-/// One forward entry: tokens and positions in, embeddings out.
-pub fn program<D: Dense>(c: &Config) -> Graph {
+/// The graph of one stage, from tokens and positions.
+fn staged<D: Dense>(c: &Config, stage: Stage<D>) -> Graph {
     let m = Model::new(c.dims());
     let w: Eg2<D> = trace::declare(&m);
     let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
-    let out = forward(&m, c, &w, &attention, [&tokens, &positions]);
+    let out = stage(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
+}
+
+type Stage<D> = fn(&Model, &Config, &Eg2<D>, &[Attention<D>], [&Tensor; 2]) -> Tensor;
+
+/// One forward entry: tokens and positions in, embeddings out.
+pub fn program<D: Dense>(c: &Config) -> Graph {
+    staged(c, forward::<D>)
 }
 
 /// The residual stream after the last layer, for parity checks.
 pub fn probe<D: Dense>(c: &Config) -> Graph {
-    let m = Model::new(c.dims());
-    let w: Eg2<D> = trace::declare(&m);
-    let attention = attention(&m, c);
-    let [tokens, positions] = tokens(&m);
-    let out = trunk(&m, c, &w, &attention, [&tokens, &positions]);
-    m.finish([(Role::Logits, &out)])
+    staged(c, trunk::<D>)
 }
