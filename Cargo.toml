@@ -9,6 +9,8 @@ members = [
     "engine/rules/*",
     "frontend/*",
     "tools/calibrate",
+    "tools/check",
+    "tools/findings",
     "tools/lint",
     "tools/shape",
     "tools/style",
@@ -26,6 +28,7 @@ checkpoint = { path = "frontend/checkpoint" }
 gemm = { path = "engine/gpu/gemm" }
 codegen = { path = "engine/plan/codegen" }
 engine = { path = "engine/engine" }
+findings = { path = "tools/findings" }
 settings = { path = "frontend/settings" }
 gpukit = { path = "engine/gpu/gpukit" }
 bundle = { path = "frontend/bundle" }

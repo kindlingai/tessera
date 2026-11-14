@@ -1,11 +1,12 @@
 use crate::far::Lean;
 use crate::pairs::Hit;
-use crate::report::{MARKER, markdown};
+use crate::report::report;
 use crate::windows::cut;
+use findings::Level;
 use std::path::Path;
 
 #[test]
-fn report_shows_hunks() {
+fn report_lists_each_kind() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let wins = cut("src/fetch.rs", include_str!("fetch.rs"), 20, 7);
     let hit = Hit {
@@ -14,24 +15,7 @@ fn report_shows_hunks() {
         score: 0.98,
         count: 2,
     };
-    let md = markdown(
-        (&[hit], &[], &[]),
-        &wins,
-        root,
-        (20, 0.97),
-        Some("https://x/blob/abc"),
-    )
-    .unwrap();
-    assert!(md.starts_with(MARKER) && md.contains("](https://x/blob/abc/src/fetch.rs#L1-L20)"));
-    assert!(
-        md.contains("````rust\n//! Downloads")
-            && md.contains("[\"src/fetch.rs\", \"src/fetch.rs\"],")
-    );
-    let clean = markdown((&[], &[], &[]), &wins, root, (20, 0.97), None).unwrap();
-    assert!(clean.ends_with("None found.\n"));
     let pair = ("a.rs".to_string(), "b.rs".to_string());
-    let stale = markdown((&[], &[&pair], &[]), &wins, root, (20, 0.97), None).unwrap();
-    assert!(stale.contains("allow nothing") && stale.contains("[\"a.rs\", \"b.rs\"],"));
     let lean = Lean {
         path: "a/x.rs".into(),
         home: "a".into(),
@@ -39,6 +23,13 @@ fn report_shows_hunks() {
         other: "b".into(),
         near: 0.9,
     };
-    let leaning = markdown((&[], &[], &[lean]), &wins, root, (20, 0.97), None).unwrap();
-    assert!(leaning.contains("| `a/x.rs` | `a` 0.800 | `b` 0.900 |"));
+    let r = report((&[hit], &[&pair], &[lean]), &wins, root, (20, 0.97)).unwrap();
+    let rules: Vec<&str> = r.findings.iter().map(|f| f.rule.as_str()).collect();
+    assert_eq!(rules, ["near-copy", "stale-allow", "new-file-lean"]);
+    assert!(r.findings[0].snippets[0].text.starts_with("//! Downloads"));
+    assert_eq!(
+        r.findings[0].fix.as_deref(),
+        Some("[\"src/fetch.rs\", \"src/fetch.rs\"],")
+    );
+    assert_eq!((r.fails(), r.findings[2].level == Level::Note), (2, true));
 }

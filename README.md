@@ -48,6 +48,8 @@ Crate | Description
 [serve](frontend/serve) | An HTTP front end: text in, streamed text out, over the engine
 [settings](frontend/settings) | Settings read once from the environment, passed down
 [calibrate](tools/calibrate) | Times kernels on this machine and stores what they cost
+[tessera-check](tools/check) | Runs the style checks, and prints one report or writes one PR comment
+[findings](tools/findings) | The JSON each check writes, for tessera-check to render
 [tessera-lint](tools/lint) | The repository's code-shape rules, run by CI and the pre-commit hook
 [shape](tools/shape) | Line shapes: a line with names, numbers and strings collapsed
 [tessera-simcheck](tools/simcheck) | Fails on near-copies of code, found with EmbeddingGemma 2 embeddings

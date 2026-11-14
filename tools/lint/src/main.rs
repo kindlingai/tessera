@@ -111,12 +111,37 @@ fn main() -> ExitCode {
     for v in &found {
         println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
     }
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, path] = &args[..]
+        && flag == "--json"
+        && let Err(e) = report(&found).write(std::path::Path::new(path))
+    {
+        eprintln!("tessera-lint: {e}");
+        return ExitCode::from(2);
+    }
     if found.is_empty() {
         eprintln!("tessera-lint: {} files clean", sources.len());
         return ExitCode::SUCCESS;
     }
     eprintln!("tessera-lint: {} violations", found.len());
     ExitCode::FAILURE
+}
+
+/// Violations as findings, for tessera-check.
+fn report(found: &[Violation]) -> findings::Report {
+    let mut r = findings::Report::new("lint", "Code shape");
+    for v in found {
+        r.findings.push(findings::Finding {
+            rule: v.rule.into(),
+            level: findings::Level::Fail,
+            path: v.path.clone(),
+            line: v.line,
+            message: v.message.clone(),
+            snippets: Vec::new(),
+            fix: None,
+        });
+    }
+    r
 }
 
 fn check_file(

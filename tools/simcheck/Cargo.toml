@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 eg2cpu = { git = "https://github.com/undrgrnd-labs/hunch", rev = "a80156abbf8ec2e5a9b85ed0e5ff98454c1aaa09" }
+findings = { path = "../findings" }
 shape = { path = "../shape" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
