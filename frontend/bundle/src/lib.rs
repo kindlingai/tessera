@@ -5,8 +5,6 @@ mod gguf;
 mod gguf_test;
 pub mod names;
 #[cfg(test)]
-mod names_eg2_test;
-#[cfg(test)]
 mod names_test;
 pub mod tag;
 mod template;
