@@ -144,17 +144,16 @@ impl Kernel for LaneNorm {
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Stage = tree.site(at)?;
     let (eps, weighted) = site.rms()?;
-    // Wide loads need whole groups of four along a row.
-    if !site.width.is_multiple_of(WIDE as usize) {
-        return None;
-    }
+    let (rows, width) = (site.len / site.width, site.width);
     let norm = LaneNorm {
-        rows: site.len / site.width,
-        width: site.width,
+        rows,
+        width,
         eps,
         weighted,
     };
-    Some(vec![Draft::new(norm, site.reads(), site.len)])
+    // Wide loads need whole groups of four along a row.
+    let fits = width.is_multiple_of(WIDE as usize);
+    fits.then(|| vec![Draft::new(norm, site.reads(), site.len)])
 }
 
 lower::rule!("lane_norm", propose);
