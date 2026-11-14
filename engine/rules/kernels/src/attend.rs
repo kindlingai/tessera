@@ -231,19 +231,8 @@ impl Kernel for Attend {
                 Arg::at(step.write, s * q),
             ]
         };
-        let tail = [Arg::count(a.width)].into_iter().chain(a.reach());
-        let launch = |s: usize| Launch {
-            args: buffers(s)
-                .into_iter()
-                .chain(a.args())
-                .chain(tail.clone())
-                .collect(),
-            shape: Shape::Grid {
-                across: a.queries * a.heads,
-                down: 1,
-                threads: THREADS as usize,
-            },
-        };
+        let across = a.queries * a.heads;
+        let launch = |s| a.launch(buffers(s), [Arg::count(a.width)], across, THREADS as usize);
         (0..a.seqs).map(launch).collect()
     }
 

@@ -1,6 +1,6 @@
 //! Rules propose kernels for a site. Link time collects them.
 
-use crate::abi::Arg;
+use crate::abi::{Arg, Launch, Shape};
 use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
 use crate::plan::Step;
@@ -61,6 +61,29 @@ impl Attn {
             Mask::Within(n) => (n as usize, n as usize),
         };
         [Arg::count(back), Arg::count(ahead)]
+    }
+
+    /// One group of `threads` per `across`, over whole sequences.
+    pub fn launch(
+        &self,
+        buffers: impl IntoIterator<Item = Arg>,
+        tail: impl IntoIterator<Item = Arg>,
+        across: usize,
+        threads: usize,
+    ) -> Launch {
+        let args = buffers
+            .into_iter()
+            .chain(self.args())
+            .chain(tail)
+            .chain(self.reach());
+        Launch {
+            args: args.collect(),
+            shape: Shape::Grid {
+                across,
+                down: 1,
+                threads,
+            },
+        }
     }
 
     /// The layout's scalars, which come after a kernel's own.

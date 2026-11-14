@@ -1,4 +1,4 @@
-//! Causal attention on tiles, the keys streamed in blocks.
+//! Attention on tiles, the keys streamed in blocks.
 
 use codegen::ir::Body;
 use codegen::kept;
@@ -22,15 +22,23 @@ const THREADS: u32 = 128;
 /// Floats of padding after each staged row, against bank conflicts.
 const PAD: u32 = 4;
 
-/// The widest head this schedule stages.
-const WIDEST: usize = 128;
+/// Columns one group stages and owns at a time.
+const CW: u32 = 128;
+
+/// The widest head: four column slices.
+const WIDEST: usize = 512;
+
+/// Columns the kernel for `w` stages at a time.
+fn chunk(w: usize) -> usize {
+    w.min(CW as usize)
+}
 
 thread_local! {
     /// The kernel per head width, whole and ragged, built once.
     static TREES: RefCell<HashMap<(u32, bool), Body>> = RefCell::new(HashMap::new());
 }
 
-/// Stages the group's query rows, zero past `queries`.
+/// Stages `cw` columns from `d0` of the group's query rows.
 #[kernel]
 fn stage_q(
     q_s: &mut Shared<f32>,
@@ -39,20 +47,22 @@ fn stage_q(
     queries: u32,
     heads: u32,
     h: u32,
+    d0: u32,
+    #[build] cw: u32,
     #[build] w: u32,
 ) {
-    for i in (lid()..BQ * w).by(THREADS) {
-        let r = i / w;
-        let d = i % w;
-        q_s[r * (w + PAD) + d] = if q0 + r < queries {
-            q[((q0 + r) * heads + h) as u64 * w as u64 + d as u64]
+    for i in (lid()..BQ * cw).by(THREADS) {
+        let r = i / cw;
+        let d = i % cw;
+        q_s[r * (cw + PAD) + d] = if q0 + r < queries {
+            q[((q0 + r) * heads + h) as u64 * w as u64 + (d0 + d) as u64]
         } else {
             0.0
         };
     }
 }
 
-/// Stages a block of rows from `at`, zero past `count`.
+/// Stages `cw` columns from `d0` of the rows at `at`.
 #[kernel]
 fn stage_kv<const TRANSPOSED: bool>(
     kv_s: &mut Shared<f32>,
@@ -62,43 +72,56 @@ fn stage_kv<const TRANSPOSED: bool>(
     count: u32,
     kv_heads: u32,
     kvh: u32,
+    d0: u32,
+    #[build] cw: u32,
     #[build] w: u32,
 ) {
-    for i in (lid()..BK * w).by(THREADS) {
-        let t = i / w;
-        let d = i % w;
+    for i in (lid()..BK * cw).by(THREADS) {
+        let t = i / cw;
+        let d = i % cw;
         let v = if k0 + t < count {
-            src[((at + t) * kv_heads + kvh) as u64 * w as u64 + d as u64]
+            src[((at + t) * kv_heads + kvh) as u64 * w as u64 + (d0 + d) as u64]
         } else {
             0.0
         };
         if TRANSPOSED {
             kv_s[d * (BK + PAD) + t] = v;
         } else {
-            kv_s[t * (w + PAD) + d] = v;
+            kv_s[t * (cw + PAD) + d] = v;
         }
     }
 }
 
-/// Scores by tiles, masked past what each row has seen.
+/// Adds `cw` staged columns to the score tiles.
 #[kernel]
-fn scores(
+fn score_chunk(
     s_t: &mut Tiles,
     q_s: &Shared<f32>,
     kv_s: &Shared<f32>,
-    p_s: &mut Shared<f32>,
-    seen_s: &Shared<u32>,
     simd: u32,
-    k0: u32,
-    #[build] w: u32,
+    #[build] cw: u32,
 ) {
     if simd < 2 {
-        s_t.zero();
-        s_t.block(q_s, simd * 16 * (w + PAD), kv_s, 0, w + PAD, w);
+        s_t.block(q_s, simd * 16 * (cw + PAD), kv_s, 0, cw + PAD, cw);
+    }
+}
+
+/// Writes the scores to `p_s`. Unseen keys get -inf.
+#[kernel]
+fn scores(
+    s_t: &Tiles,
+    p_s: &mut Shared<f32>,
+    from_s: &Shared<u32>,
+    to_s: &Shared<u32>,
+    simd: u32,
+    k0: u32,
+) {
+    if simd < 2 {
         s_t.each(|r, c, v| {
             let t = k0 + c;
-            let seen = t < seen_s[simd * 16 + r];
-            p_s[(simd * 16 + r) * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
+            let row = simd * 16 + r;
+            let seen = t >= from_s[row] && t < to_s[row];
+            p_s[row * (BK + PAD) + c] = if seen { v } else { f32::NEG_INFINITY };
         });
     }
 }
@@ -154,7 +177,8 @@ fn write_pair(
     bottom: &Tiles,
     mut out: BufMut<F32>,
     l_s: &Shared<f32>,
-    seen_s: &Shared<u32>,
+    from_s: &Shared<u32>,
+    to_s: &Shared<u32>,
     q0: u32,
     heads: u32,
     h: u32,
@@ -162,12 +186,12 @@ fn write_pair(
     #[build] w: u32,
 ) {
     top.each(|r, c, v| {
-        if seen_s[r] > 0 {
+        if to_s[r] > from_s[r] {
             out[((q0 + r) * heads + h) as u64 * w as u64 + (col + c) as u64] = v / l_s[r];
         }
     });
     bottom.each(|r, c, v| {
-        if seen_s[16 + r] > 0 {
+        if to_s[16 + r] > from_s[16 + r] {
             out[((q0 + 16 + r) * heads + h) as u64 * w as u64 + (col + c) as u64] = v / l_s[16 + r];
         }
     });
@@ -185,31 +209,56 @@ fn flash(
     past: u32,
     heads: u32,
     kv_heads: u32,
+    back: u32,
+    ahead: u32,
+    #[build] cw: u32,
     #[build] w: u32,
 ) {
     let simd = lid() / LANES as u32;
+    // A group owns `cw` columns and scores the whole head.
+    let slices = w / cw;
     let group = gid() / THREADS;
-    let h = group % heads;
-    let q0 = (group / heads) * BQ;
+    let slice = group % slices;
+    let rest = group / slices;
+    let h = rest % heads;
+    let q0 = (rest / heads) * BQ;
     let kvh = h / (heads / kv_heads);
     let row = lid();
-    let mut q_s = shared::<f32>(BQ * (w + PAD));
-    // Keys, then the values transposed, in one slot.
-    let mut kv_s = shared::<f32>(w * (BK + PAD));
+    let mut q_s = shared::<f32>(BQ * (cw + PAD));
+    // A chunk of keys, then the slice of values transposed.
+    let mut kv_s = shared::<f32>(cw * (BK + PAD));
     let mut p_s = shared::<f32>(BQ * (BK + PAD));
     let mut alpha_s = shared::<f32>(BQ);
     let mut l_s = shared::<f32>(BQ);
-    // Keys each row sees: through its own position. Else zero.
-    let mut seen_s = shared::<u32>(BQ);
-    stage_q(&mut q_s, q, q0, queries, heads, h, w);
+    // Row r sees keys `[from, to)`. Spare rows see none.
+    let mut from_s = shared::<u32>(BQ);
+    let mut to_s = shared::<u32>(BQ);
     if lid() < BQ {
         let r = q0 + row;
-        let through = past + r + 1;
-        seen_s[row] = if r >= queries {
-            0
+        let position = past + r;
+        let live = r < queries && position < keys;
+        let from = if position > back { position - back } else { 0 };
+        let to = if keys - position - 1 > ahead {
+            position + ahead + 1
         } else {
-            if through < keys { through } else { keys }
+            keys
         };
+        from_s[row] = if live { from } else { 0 };
+        to_s[row] = if live { to } else { 0 };
+    }
+    barrier();
+    // The key blocks any row of the group sees.
+    let mut lo = keys;
+    let mut hi = 0u32;
+    for r in 0..BQ {
+        if to_s[r] > from_s[r] {
+            if from_s[r] < lo {
+                lo = from_s[r];
+            }
+            if to_s[r] > hi {
+                hi = to_s[r];
+            }
+        }
     }
     let mut s_t = tiles(16, 16);
     let mut o00 = tiles(16, 16);
@@ -219,17 +268,25 @@ fn flash(
     let mut state = [0.0f32; 2];
     state[0] = f32::NEG_INFINITY;
     // Each SIMD group owns up to two column pieces.
-    let first = simd * 16 < w;
-    let second = (simd + 4) * 16 < w;
-    for b in 0..(keys + BK - 1) / BK {
+    let first = simd * 16 < cw;
+    let second = (simd + 4) * 16 < cw;
+    for b in lo / BK..(hi + BK - 1) / BK {
         let k0 = b * BK;
-        stage_kv::<false>(&mut kv_s, k, k0, k0, keys, kv_heads, kvh, w);
-        barrier();
-        scores(&mut s_t, &q_s, &kv_s, &mut p_s, &seen_s, simd, k0, w);
+        s_t.zero();
+        for c in 0..slices {
+            let d0 = c * cw;
+            stage_q(&mut q_s, q, q0, queries, heads, h, d0, cw, w);
+            stage_kv::<false>(&mut kv_s, k, k0, k0, keys, kv_heads, kvh, d0, cw, w);
+            barrier();
+            score_chunk(&mut s_t, &q_s, &kv_s, simd, cw);
+            barrier();
+        }
+        scores(&s_t, &mut p_s, &from_s, &to_s, simd, k0);
         barrier();
         soften(&mut p_s, &mut alpha_s, &mut state, row);
         barrier();
-        stage_kv::<true>(&mut kv_s, values, k0, k0, keys, kv_heads, kvh, w);
+        let d0 = slice * cw;
+        stage_kv::<true>(&mut kv_s, values, k0, k0, keys, kv_heads, kvh, d0, cw, w);
         barrier();
         if first {
             fold_pair(
@@ -257,22 +314,15 @@ fn flash(
         l_s[row] = state[1];
     }
     barrier();
+    // The slice's first column, then each SIMD group's pieces.
+    let d0 = slice * cw;
     if first {
-        write_pair(&o00, &o01, out, &l_s, &seen_s, q0, heads, h, simd * 16, w);
+        let col = d0 + simd * 16;
+        write_pair(&o00, &o01, out, &l_s, &from_s, &to_s, q0, heads, h, col, w);
     }
     if second {
-        write_pair(
-            &o10,
-            &o11,
-            out,
-            &l_s,
-            &seen_s,
-            q0,
-            heads,
-            h,
-            (simd + 4) * 16,
-            w,
-        );
+        let col = d0 + (simd + 4) * 16;
+        write_pair(&o10, &o11, out, &l_s, &from_s, &to_s, q0, heads, h, col, w);
     }
 }
 
@@ -305,7 +355,11 @@ fn flash_rows(
     let mut l_s = shared::<f32>(BQ);
     // Rows the pass serves: one past the position. Else zero.
     let mut seen_s = shared::<u32>(BQ);
-    stage_q(&mut q_s, q, q0, queries, heads, h, w);
+    let mut from_s = shared::<u32>(BQ);
+    if lid() < BQ {
+        from_s[row] = 0;
+    }
+    stage_q(&mut q_s, q, q0, queries, heads, h, 0, w, w);
     let mut s_t = tiles(16, 16);
     let mut o00 = tiles(16, 16);
     let mut o01 = tiles(16, 16);
@@ -356,13 +410,15 @@ fn flash_rows(
             for b in 0..(last + BK - 1) / BK {
                 let k0 = b * BK;
                 let at = kept_row(slot, k0);
-                stage_kv::<false>(&mut kv_s, k, at, k0, last, kv_heads, kvh, w);
+                stage_kv::<false>(&mut kv_s, k, at, k0, last, kv_heads, kvh, 0, w, w);
                 barrier();
-                scores(&mut s_t, &q_s, &kv_s, &mut p_s, &seen_s, simd, k0, w);
+                s_t.zero();
+                score_chunk(&mut s_t, &q_s, &kv_s, simd, w);
+                scores(&s_t, &mut p_s, &from_s, &seen_s, simd, k0);
                 barrier();
                 soften(&mut p_s, &mut alpha_s, &mut state, row);
                 barrier();
-                stage_kv::<true>(&mut kv_s, values, at, k0, last, kv_heads, kvh, w);
+                stage_kv::<true>(&mut kv_s, values, at, k0, last, kv_heads, kvh, 0, w, w);
                 barrier();
                 if first {
                     fold_pair(
@@ -385,11 +441,16 @@ fn flash_rows(
             }
             barrier();
             if first {
-                write_pair(&o00, &o01, out, &l_s, &seen_s, q0, heads, h, simd * 16, w);
+                let col = simd * 16;
+                write_pair(
+                    &o00, &o01, out, &l_s, &from_s, &seen_s, q0, heads, h, col, w,
+                );
             }
             if second {
                 let col = (simd + 4) * 16;
-                write_pair(&o10, &o11, out, &l_s, &seen_s, q0, heads, h, col, w);
+                write_pair(
+                    &o10, &o11, out, &l_s, &from_s, &seen_s, q0, heads, h, col, w,
+                );
             }
             barrier();
         }
@@ -402,17 +463,19 @@ pub struct Flash(pub Attn);
 
 impl Flash {
     fn tree(&self) -> Body {
-        let w = self.0.width as u32;
+        let w = self.0.width;
         TREES.with(|t| {
             t.borrow_mut()
-                .entry((w, false))
-                .or_insert_with(|| flash_ir(w))
+                .entry((w as u32, false))
+                .or_insert_with(|| flash_ir(chunk(w) as u32, w as u32))
                 .clone()
         })
     }
 
+    /// A group per head, block of queries and column slice.
     fn groups(&self) -> usize {
-        self.0.heads * self.0.queries.div_ceil(BQ as usize)
+        let slices = self.0.width / chunk(self.0.width);
+        self.0.heads * self.0.queries.div_ceil(BQ as usize) * slices
     }
 }
 
@@ -421,14 +484,15 @@ impl Kernel for Flash {
 
     fn load(&self, len: usize) -> Option<Load> {
         let a = &self.0;
-        let (keys, side) = (a.keys.most() as f64, (a.kv_heads * a.width) as f64);
-        // Keys and values are read per block of queries.
-        let blocks = a.queries.div_ceil(BQ as usize) as f64;
+        let (keys, side) = (a.seen() as f64, (a.kv_heads * a.width) as f64);
+        // Each query block and slice reads the keys and values.
+        let slices = (a.width / chunk(a.width)) as f64;
+        let blocks = a.queries.div_ceil(BQ as usize) as f64 * slices;
         let per_seq = 4.0 * keys * side * blocks;
         Some(Load {
             threads: a.seqs * self.groups() * THREADS as usize,
             group: THREADS as usize,
-            trips: keys / BK as f64,
+            trips: keys / BK as f64 * slices,
             trip: self.tree().trip(),
             reads: vec![
                 4.0 * len as f64,
@@ -449,28 +513,21 @@ impl Kernel for Flash {
         let a = &self.0;
         let per_q = a.queries * a.heads * a.width;
         let per_kv = a.keys.most() * a.kv_heads * a.width;
-        let launch = |s: usize| Launch {
-            args: [
+        let buffers = |s: usize| {
+            [
                 Arg::at(step.reads[0], s * per_q),
                 Arg::at(step.reads[1], s * per_kv),
                 Arg::at(step.reads[2], s * per_kv),
                 Arg::at(step.write, s * per_q),
             ]
-            .into_iter()
-            .chain(a.args())
-            .collect(),
-            shape: Shape::Grid {
-                across: self.groups(),
-                down: 1,
-                threads: THREADS as usize,
-            },
         };
+        let launch = |s| a.launch(buffers(s), [], self.groups(), THREADS as usize);
         (0..a.seqs).map(launch).collect()
     }
 
     fn work(&self, _: usize) -> f64 {
         let a = &self.0;
-        (a.seqs * a.heads * a.queries * a.keys.most() * a.width) as f64
+        (a.seqs * a.heads * a.queries * a.seen() * a.width) as f64
     }
 
     /// Unproven, so it must earn its place by measurement.
@@ -478,10 +535,10 @@ impl Kernel for Flash {
         1e-9
     }
 
-    /// Q, the K and V slot, P, two sum rows.
+    /// Q and K chunks, P, sums, and the seen ranges.
     fn needs(&self) -> Needs {
-        let (w, bq, bk, pad) = (self.0.width, BQ as usize, BK as usize, PAD as usize);
-        let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 2 * bq;
+        let (w, bq, bk, pad) = (chunk(self.0.width), BQ as usize, BK as usize, PAD as usize);
+        let floats = bq * (w + pad) + w * (bk + pad) + bq * (bk + pad) + 4 * bq;
         Needs {
             lanes: LANES,
             group_bytes: 4 * floats,
@@ -576,14 +633,15 @@ impl Kernel for FlashRows {
 /// Scale the queries, then attend by tiles.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Attend = tree.site(at)?;
-    if site.sizes.mask != Mask::Causal {
-        return None;
-    }
-    // Tiles of sixteen along the head, within one group's memory.
-    if !site.sizes.width.is_multiple_of(16) || site.sizes.width > WIDEST {
+    // Tiles of sixteen along the head, in whole slices.
+    let w = site.sizes.width;
+    if !w.is_multiple_of(16) || w > WIDEST || (w > CW as usize && !w.is_multiple_of(CW as usize)) {
         return None;
     }
     if site.rows.is_some() {
+        if site.sizes.mask != Mask::Causal || w > CW as usize {
+            return None;
+        }
         // Keys stage a block at a time, in one run.
         let run = site.sizes.kept.run(site.sizes.context);
         if !run.is_multiple_of(BK as usize) {
