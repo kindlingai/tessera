@@ -1,9 +1,8 @@
 use super::{Chain, Pattern};
-use crate::form::{F32_FORM, Form};
+use crate::form::Form;
 use crate::kernels::MapStage;
 use crate::rule::Read;
 use crate::tree::{T, Term, Tree};
-use codegen::form::Layout;
 
 /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
 #[derive(Clone, Copy, Debug)]
@@ -26,13 +25,7 @@ impl Pattern for Matmul {
         let [n, k] = tree.node(w).shape[..] else {
             return None;
         };
-        let m = tree.elements(x) / k;
-        // Row kernels see a tiled form widened to f32.
-        let stored = tree.node(w).form;
-        let form = match stored.layout() {
-            Layout::Rows => stored,
-            Layout::Tiles { .. } => F32_FORM,
-        };
+        let (m, form) = (tree.elements(x) / k, tree.node(w).form);
         Some(Self {
             x,
             w,

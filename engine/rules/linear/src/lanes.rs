@@ -78,7 +78,10 @@ pub struct Lanes {
 impl Lanes {
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let build = || linear_ir::<WIDE, AHEAD>(self.m, self.form);
+        let build = || match self.form.heavy() {
+            true => linear_ir::<WIDE, 1>(self.m, self.form),
+            false => linear_ir::<WIDE, AHEAD>(self.m, self.form),
+        };
         let key = (self.m, self.form.name());
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         // The operands sit between the weights and the output.

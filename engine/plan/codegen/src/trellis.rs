@@ -1,13 +1,13 @@
 //! The exlr8 trellis form: K-bit codes in tiles.
 
 use crate::block::{minifloat, minifloat_name};
-use crate::form::{Form, Layout};
+use crate::form::Form;
 use graph::{DType, E4M3, F16};
 
 /// The codebook multiplier.
 const MCG: u32 = 0xCBAC_1FED;
 
-/// Header bytes: `in`, `out`, the sharded side, a pad.
+/// Header words: `in`, `out`, the sharded side, `1 / in`.
 const HEAD: usize = 16;
 
 /// Record field 4: entries hold 128 input channels.
@@ -41,7 +41,8 @@ impl Shape {
 
     fn write(&self) -> [u8; HEAD] {
         let mut head = [0u8; HEAD];
-        for (i, v) in [self.inp as u32, self.out as u32, self.side]
+        let inverse = (1.0 / self.inp as f32).to_bits();
+        for (i, v) in [self.inp as u32, self.out as u32, self.side, inverse]
             .iter()
             .enumerate()
         {
@@ -100,7 +101,14 @@ impl<const K: u32> Trellis<K> {
 
     /// The code at stream position `j` of a tile.
     fn code(tile: &[u8], j: usize) -> u32 {
-        (0..K as usize).fold(0, |v, b| (v << 1) | bit(tile, j * K as usize + b))
+        let (k, b) = (K as usize, j * K as usize);
+        if 16 % k != 0 {
+            return (0..k).fold(0, |v, i| (v << 1) | bit(tile, b + i));
+        }
+        // Codes that divide a word sit in one, high first.
+        let word = (b / 16) ^ 1;
+        let w = u16::from_le_bytes([tile[2 * word], tile[2 * word + 1]]);
+        u32::from(w >> (16 - k - b % 16)) & ((1 << k) - 1)
     }
 
     /// Element `index` of a `[out][in]` matrix in `bytes`.
@@ -120,15 +128,44 @@ impl<const K: u32> Trellis<K> {
 
     /// Kernel text of `decode`, as one function.
     fn text(&self) -> String {
-        let (k, tile, head) = (K, Self::TILE, HEAD);
+        let (k, tile, head, name) = (K, Self::TILE, HEAD, self.name);
         let steps = 16u32.div_ceil(K);
         let f16 = minifloat_name(5, 10);
-        format!(
-            "f_fn u32 form_{name}_bit(f_const(u8) t, u32 b) {{\n    u32 w = (b >> 4) ^ 1u;\n    u32 word = (u32)t[2 * w] | ((u32)t[2 * w + 1] << 8);\n    return (word >> (15 - (b & 15))) & 1u;\n}}\n\
-f_fn u32 form_{name}_code(f_const(u8) t, u32 j) {{\n    u32 v = 0;\n    for (u32 b = 0; b < {k}u; b++) {{\n        v = (v << 1) | form_{name}_bit(t, j * {k}u + b);\n    }}\n    return v;\n}}\n\
-f_fn float form_{name}(f_const(u8) p, u64 i) {{\n    u32 inp = (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);\n    u32 out = (u32)p[4] | ((u32)p[5] << 8) | ((u32)p[6] << 16) | ((u32)p[7] << 24);\n    u32 side = (u32)p[8];\n    u32 col = (u32)(i / inp);\n    u32 row = (u32)(i % inp);\n    u32 tile;\n    if (side == {INPUT_SIDE}u) {{\n        tile = (row / 128u) * (out / 2u) + 64u * (col / 128u) + 8u * ((row % 128u) / 16u) + (col % 128u) / 16u;\n    }} else {{\n        tile = (col / 128u) * (inp / 2u) + 8u * (row / 16u) + (col % 128u) / 16u;\n    }}\n    f_const(u8) t = p + {head} + (u64)tile * {tile}u;\n    u32 r = row % 16u;\n    u32 c = col % 16u;\n    u32 j = 8u * (4u * (c % 8u) + (r % 8u) / 2u) + 4u * (c >= 8u) + 2u * (r >= 8u) + (r % 2u);\n    u32 state = 0;\n    for (u32 s = 0; s < {steps}u; s++) {{\n        state |= form_{name}_code(t, (j + 256u - s) % 256u) << (s * {k}u);\n    }}\n    u32 x = (state & 0xFFFFu) * {MCG}u;\n    x = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;\n    float v = f_round_f16({f16}(x & 0xFFFFu) + {f16}(x >> 16));\n    return f_round_e4m3(v);\n}}\n",
-            name = self.name,
-        )
+        // A swapped word pair reads as 32 stream bits.
+        let word = format!(
+            "f_fn u32 form_{name}_pair(f_const(u8) t, u32 q) {{\n    return f_u32(t + 4u * (q % {pairs}u));\n}}\n",
+            pairs = 8 * K
+        );
+        // 32 stream bits from bit `s`, wrapping at the end.
+        let win = format!(
+            "f_fn u32 form_{name}_win(f_const(u8) t, u32 s) {{\n    u32 q = s >> 5;\n    u32 sh = s & 31u;\n    u32 hi = form_{name}_pair(t, q);\n    return sh == 0u ? hi : (hi << sh) | (form_{name}_pair(t, q + 1u) >> (32u - sh));\n}}\n"
+        );
+        // A state's first bit, for the code at `j`.
+        let start = format!(
+            "f_fn u32 form_{name}_start(u32 j) {{\n    return ((j + {}u) % 256u) * {k}u + {}u;\n}}\n",
+            257 - steps,
+            steps * K - 16
+        );
+        let value = format!(
+            "f_fn float form_{name}_value(u32 state) {{\n    u32 x = (state & 0xFFFFu) * {MCG}u;\n    x = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;\n    float v = f_round_f16({f16}(x & 0xFFFFu) + {f16}(x >> 16));\n    return f_round_e4m3(v);\n}}\n"
+        );
+        // The quotient from a float estimate, corrected by one.
+        let col = format!(
+            "f_fn u32 form_{name}_col(f_const(u8) p, u32 n, u32 inp) {{\n    u32 col = (u32)((float)n * f_bits(f_u32(p + 12)));\n    u32 row = n - col * inp;\n    if ((int)row < 0) {{\n        return col - 1u;\n    }}\n    return row >= inp ? col + 1u : col;\n}}\n"
+        );
+        let locate = format!(
+            "f_fn f_const(u8) form_{name}_tile(f_const(u8) p, u32 row, u32 col) {{\n    u32 inp = f_u32(p);\n    u32 out = f_u32(p + 4);\n    u32 tile;\n    if (f_u32(p + 8) == {INPUT_SIDE}u) {{\n        tile = (row / 128u) * (out / 2u) + 64u * (col / 128u) + 8u * ((row % 128u) / 16u) + (col % 128u) / 16u;\n    }} else {{\n        tile = (col / 128u) * (inp / 2u) + 8u * (row / 16u) + (col % 128u) / 16u;\n    }}\n    return p + {head} + (u64)tile * {tile}u;\n}}\n\
+f_fn u32 form_{name}_j(u32 r, u32 c) {{\n    return 8u * (4u * (c % 8u) + (r % 8u) / 2u) + 4u * (c >= 8u) + 2u * (r >= 8u) + (r % 2u);\n}}\n"
+        );
+        let one = format!(
+            "f_fn float form_{name}(f_const(u8) p, u64 i) {{\n    u32 inp = f_u32(p);\n    u32 n = (u32)i;\n    u32 col = form_{name}_col(p, n, inp);\n    u32 row = n - col * inp;\n    f_const(u8) t = form_{name}_tile(p, row, col);\n    u32 j = form_{name}_j(row % 16u, col % 16u);\n    return form_{name}_value(form_{name}_win(t, form_{name}_start(j)) >> 16);\n}}\n"
+        );
+        // Four rows: codes j, j+1, j+8, j+9.
+        let four = format!(
+            "f_fn float4 form_{name}_x4(f_const(u8) p, u64 i) {{\n    u32 inp = f_u32(p);\n    u32 n = (u32)i;\n    u32 col = form_{name}_col(p, n, inp);\n    u32 row = n - col * inp;\n    f_const(u8) t = form_{name}_tile(p, row, col);\n    u32 j = form_{name}_j(row % 16u, col % 16u);\n    u32 a = form_{name}_win(t, form_{name}_start(j));\n    u32 b = form_{name}_win(t, form_{name}_start(j + 8u));\n    return f_make4(form_{name}_value(a >> 16), form_{name}_value(a >> {next}), form_{name}_value(b >> 16), form_{name}_value(b >> {next}));\n}}\n",
+            next = 16 - K
+        );
+        format!("{word}{win}{start}{value}{col}{locate}{one}{four}")
     }
 }
 
@@ -161,12 +198,15 @@ impl<const K: u32> Form for Trellis<K> {
     fn narrow(&self) -> bool {
         true
     }
-    fn layout(&self) -> Layout {
-        Layout::Tiles { rows: 16, cols: 16 }
-    }
     /// A tile, so no float row copies in as is.
     fn block(&self) -> usize {
         256
+    }
+    fn packs(&self) -> bool {
+        false
+    }
+    fn heavy(&self) -> bool {
+        true
     }
     fn align(&self) -> usize {
         ENTRY
@@ -192,6 +232,10 @@ impl<const K: u32> Form for Trellis<K> {
     fn load(&self, name: &str, index: &str) -> String {
         format!("form_{}({name}, {index})", self.name)
     }
+    /// Four along a row share one tile.
+    fn load4(&self, name: &str, index: &str) -> String {
+        format!("form_{}_x4({name}, {index})", self.name)
+    }
     fn header(&self) -> Vec<String> {
         vec![
             minifloat(5, 10),
@@ -203,7 +247,6 @@ impl<const K: u32> Form for Trellis<K> {
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         Self::decode(bytes, index)
     }
-    /// Codes come from the release. Nothing encodes here.
     fn pack(&self, _: &[f32]) -> Vec<u8> {
         panic!("{} codes are read from a release, never packed", self.name)
     }
