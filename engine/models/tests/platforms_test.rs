@@ -192,7 +192,7 @@ fn check_metal(tile: &Option<[usize; 3]>, family: &str, dir: &Path) {
     ]
     .concat();
     let (built, log) = xcrun(&args);
-    assert_eq!(built, tile.is_some(), "{family}: {log}");
+    assert_eq!(built, tile.is_some(), "{family} with {flags:?}: {log}");
     if tile.is_none() {
         return;
     }
