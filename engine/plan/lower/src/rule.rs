@@ -1,5 +1,6 @@
 //! Rules propose kernels for a site. Link time collects them.
 
+use crate::Error;
 use crate::abi::{Arg, Launch, Shape};
 use crate::extent::Extent;
 use crate::kernel::{Kernel, KernelRef};
@@ -183,6 +184,8 @@ pub fn ways(drafts: Vec<Draft>) -> Vec<Vec<Draft>> {
 pub struct Rule {
     pub name: &'static str,
     pub propose: fn(&Tree, T) -> Option<Vec<Draft>>,
+    /// The module that registered it.
+    pub module: &'static str,
 }
 
 gather! {
@@ -200,6 +203,7 @@ macro_rules! rule {
                 static RULE: $crate::rule::Rule = $crate::rule::Rule {
                     name: $name,
                     propose: $propose,
+                    module: module_path!(),
                 };
             }
         };
@@ -211,4 +215,16 @@ pub fn rules() -> Vec<&'static Rule> {
     let mut all: Vec<&'static Rule> = RULES.iter().collect();
     all.sort_by_key(|r| r.name);
     all
+}
+
+/// Fails when `rules` holds only this crate's own rules.
+pub fn linked(rules: &[&Rule]) -> Result<(), Error> {
+    let ours = Some(env!("CARGO_CRATE_NAME"));
+    if rules.iter().any(|r| r.module.split("::").next() != ours) {
+        return Ok(());
+    }
+    let hint = "add `use kernels as _; use linear as _;`";
+    Err(Error::Unsupported(format!(
+        "any node: no rule crate is linked; {hint}"
+    )))
 }
