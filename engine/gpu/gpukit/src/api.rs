@@ -420,10 +420,6 @@ impl<A: Api> Device for Context<A> {
         self.locked(|a| a.zero(ptr, size))
     }
 
-    fn load_image(&self, image: &[u8], entry: &str) -> Result<Kernel<A>, Error> {
-        self.load_module(image)?.function(entry)
-    }
-
     fn compile(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
         self.compile_kernel(source, entry)
     }

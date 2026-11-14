@@ -126,37 +126,6 @@ pub fn launch_1d<C: Launch>(
     ctx.launch(kernel, (grid, 1, 1), (block, 1, 1), 0, args)
 }
 
-/// 1D launches over `count`, split at the grid-x limit.
-pub fn launch_1d_ranged<C: Launch>(
-    ctx: &C,
-    kernel: &C::Kernel,
-    count: usize,
-    mut bind: impl FnMut(&mut KernelArgs, u32, u32),
-) -> Result<(), Error> {
-    const MAX_GRID_X: usize = i32::MAX as usize;
-    let chunk = MAX_GRID_X * THREADS_PER_BLOCK as usize;
-    let mut base = 0usize;
-    while base < count {
-        let len = (count - base).min(chunk);
-        let mut args = KernelArgs::new();
-        bind(&mut args, base as u32, len as u32);
-        launch_1d(ctx, kernel, len, &mut args)?;
-        base += len;
-    }
-    Ok(())
-}
-
-/// One block per row on x. Y caps at 65535.
-pub fn launch_rows<C: Launch>(
-    ctx: &C,
-    kernel: &C::Kernel,
-    rows: usize,
-    block_width: u32,
-    args: &mut KernelArgs,
-) -> Result<(), Error> {
-    ctx.launch(kernel, (rows as u32, 1, 1), (block_width, 1, 1), 0, args)
-}
-
 const MAX_GRID_Y: usize = 65535;
 
 /// 2D grid of blocks. Put the large axis on x.

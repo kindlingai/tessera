@@ -60,20 +60,6 @@ impl BufferPool {
         }
     }
 
-    pub fn write_f32_at(buffer: &ProtocolObject<dyn MTLBuffer>, byte_offset: usize, data: &[f32]) {
-        let ptr = buffer.contents().as_ptr() as *mut f32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(byte_offset / 4), data.len());
-        }
-    }
-
-    pub fn write_bf16(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[u16]) {
-        let ptr = buffer.contents().as_ptr() as *mut u16;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-    }
-
     pub fn read_f32(buffer: &ProtocolObject<dyn MTLBuffer>, out: &mut [f32]) {
         Self::read_f32_at(buffer, 0, out);
     }
@@ -86,35 +72,6 @@ impl BufferPool {
         let ptr = buffer.contents().as_ptr() as *const f32;
         unsafe {
             std::ptr::copy_nonoverlapping(ptr.add(byte_offset / 4), out.as_mut_ptr(), out.len());
-        }
-    }
-
-    pub fn read_u32(buffer: &ProtocolObject<dyn MTLBuffer>, out: &mut [u32]) {
-        Self::read_u32_at(buffer, 0, out);
-    }
-
-    pub fn read_u32_at(
-        buffer: &ProtocolObject<dyn MTLBuffer>,
-        byte_offset: usize,
-        out: &mut [u32],
-    ) {
-        let ptr = buffer.contents().as_ptr() as *const u32;
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr.add(byte_offset / 4), out.as_mut_ptr(), out.len());
-        }
-    }
-
-    pub fn write_bytes(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[u8]) {
-        let ptr = buffer.contents().as_ptr() as *mut u8;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-    }
-
-    pub fn write_i64(buffer: &ProtocolObject<dyn MTLBuffer>, data: &[i64]) {
-        let ptr = buffer.contents().as_ptr() as *mut i64;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
     }
 }

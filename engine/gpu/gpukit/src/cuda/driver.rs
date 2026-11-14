@@ -62,7 +62,6 @@ type CuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) ->
 type CuCtxCreate = unsafe extern "C" fn(*mut CUcontext, u32, CUdevice) -> CUresult;
 type CuCtxDestroy = unsafe extern "C" fn(CUcontext) -> CUresult;
 type CuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
-type CuCtxSynchronize = unsafe extern "C" fn() -> CUresult;
 type CuModuleLoadData = unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult;
 type CuModuleUnload = unsafe extern "C" fn(CUmodule) -> CUresult;
 type CuModuleGetFunction =
@@ -71,7 +70,6 @@ type CuMemAlloc = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type CuMemFree = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
-type CuMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
 type CuMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
 type CuLaunchKernel = unsafe extern "C" fn(
     CUfunction,
@@ -115,7 +113,6 @@ pub struct Driver {
     pub cu_ctx_create: CuCtxCreate,
     pub cu_ctx_destroy: CuCtxDestroy,
     pub cu_ctx_set_current: CuCtxSetCurrent,
-    pub cu_ctx_synchronize: CuCtxSynchronize,
     pub cu_module_load_data: CuModuleLoadData,
     pub cu_module_unload: CuModuleUnload,
     pub cu_module_get_function: CuModuleGetFunction,
@@ -123,7 +120,6 @@ pub struct Driver {
     pub cu_mem_free: CuMemFree,
     pub cu_memcpy_htod: CuMemcpyHtoD,
     pub cu_memcpy_dtoh: CuMemcpyDtoH,
-    pub cu_memcpy_dtod: CuMemcpyDtoD,
     pub cu_memset_d8: CuMemsetD8,
     pub cu_launch_kernel: CuLaunchKernel,
     pub cu_launch_kernel_ex: CuLaunchKernelEx,
@@ -160,7 +156,6 @@ impl Driver {
             cu_ctx_create: sym!(lib, "cuCtxCreate_v2", CuCtxCreate),
             cu_ctx_destroy: sym!(lib, "cuCtxDestroy_v2", CuCtxDestroy),
             cu_ctx_set_current: sym!(lib, "cuCtxSetCurrent", CuCtxSetCurrent),
-            cu_ctx_synchronize: sym!(lib, "cuCtxSynchronize", CuCtxSynchronize),
             cu_module_load_data: sym!(lib, "cuModuleLoadData", CuModuleLoadData),
             cu_module_unload: sym!(lib, "cuModuleUnload", CuModuleUnload),
             cu_module_get_function: sym!(lib, "cuModuleGetFunction", CuModuleGetFunction),
@@ -168,7 +163,6 @@ impl Driver {
             cu_mem_free: sym!(lib, "cuMemFree_v2", CuMemFree),
             cu_memcpy_htod: sym!(lib, "cuMemcpyHtoD_v2", CuMemcpyHtoD),
             cu_memcpy_dtoh: sym!(lib, "cuMemcpyDtoH_v2", CuMemcpyDtoH),
-            cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", CuMemcpyDtoD),
             cu_memset_d8: sym!(lib, "cuMemsetD8_v2", CuMemsetD8),
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", CuLaunchKernel),
             cu_launch_kernel_ex: sym!(lib, "cuLaunchKernelEx", CuLaunchKernelEx),
