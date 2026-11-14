@@ -13,3 +13,5 @@ pub use offer::{Offer, Slice, Stored};
 mod file_test;
 #[cfg(test)]
 mod gguf_test;
+#[cfg(test)]
+mod offer_test;

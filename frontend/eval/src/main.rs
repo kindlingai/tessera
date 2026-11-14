@@ -1,7 +1,7 @@
 //! `tessera-eval --model <path> [--recipe <json>] [--m 1,4]`: JSON out.
 
 use checkpoint::exlr8::Release;
-use checkpoint::{File, Gguf, Offer, Stored};
+use checkpoint::{File, Gguf, Offer};
 use engine::{Engine, Row};
 use lower::{Pins, Recipe};
 use serde::Serialize;
@@ -25,18 +25,11 @@ fn manifest(model: &Path) -> Result<String, Failure> {
     } else {
         Box::new(File::open(&model.join("model.safetensors"))?)
     };
-    let stored = |s: Stored| match s {
-        Stored::F32 => "f32".to_string(),
-        Stored::Bf16 => "bf16".to_string(),
-        Stored::F16 => "f16".to_string(),
-        Stored::Form(f) => f.name().to_string(),
-        Stored::Other => "other".to_string(),
-    };
     // One slice a line, so a manifest diffs by tensor.
     let mut lines = Vec::new();
     for s in offer.slices() {
-        let entry =
-            serde_json::json!({"name": s.name, "shape": s.shape, "stored": stored(s.stored)});
+        let entry = serde_json::json!(
+            {"name": s.name, "shape": s.shape, "stored": s.stored.name()});
         lines.push(format!("  {}", serde_json::to_string(&entry)?));
     }
     Ok(format!("[\n{}\n]\n", lines.join(",\n")))

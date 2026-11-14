@@ -91,7 +91,7 @@ fn slices(json: &str) -> Vec<Slice> {
         shape: (e["shape"].as_array().unwrap().iter())
             .map(|n| n.as_u64().unwrap() as usize)
             .collect(),
-        stored: Stored::F32,
+        stored: Stored::parse(e["stored"].as_str().unwrap()).unwrap(),
     };
     entries.iter().map(slice).collect()
 }
