@@ -1,10 +1,9 @@
 //! The exlr8 trellis form: K-bit codes in tiles.
 
 use crate as codegen;
-use crate::block::{minifloat, minifloat_inline};
 use crate::form::Form;
 use crate::ir::Helper;
-use crate::prelude::{Buf, F32x4, U8, helper};
+use crate::prelude::{Bits, Buf, F32x4, U8, helper};
 use graph::{DType, E4M3, F16};
 
 /// The codebook multiplier.
@@ -183,13 +182,7 @@ fn start<const K: u32>(#[build] name: &'static str, j: u32) -> u32 {
 fn value(#[build] name: &'static str, state: u32) -> f32 {
     let x = (state & 0xFFFF) * MCG;
     let y = (x & 0x8FFF8FFF) ^ 0x3B603B60;
-    let v = rounding(
-        "f_round_f16",
-        5,
-        10,
-        65504.0,
-        minifloat::<5, 10>(y & 0xFFFF) + minifloat::<5, 10>(y >> 16),
-    );
+    let v = rounding("f_round_f16", 5, 10, 65504.0, y.f16(0) + y.f16(16));
     rounding("f_round_e4m3", 4, 3, 448.0, v)
 }
 

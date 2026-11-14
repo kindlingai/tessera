@@ -51,7 +51,7 @@ fn rule_registers() {
     };
     for dialect in [Dialect::Metal, Dialect::Cuda] {
         let text = body.text().render(dialect);
-        assert!(text.contains("f_f32x4(w + (at + (u64)i))") && text.contains("linear_f32_"));
+        assert!(text.contains("f_f32x4(w + (at + (u64)o))") && text.contains("linear_f32_"));
     }
 }
 
@@ -63,7 +63,7 @@ fn lanes_match_cpu() {
     // The sum as an operand, then as the chain's input.
     let residual: Finish = |x, product| x.add(&product);
     let gate: Finish = |x, product| product.act(Act::Silu).mul(x);
-    let fused = [residual, gate].map(|finish| (48, 48, finished(48, 48, finish), false));
+    let fused = [residual, gate].map(|finish| (64, 64, finished(64, 64, finish), false));
     for (k, n, g, bare) in plain.into_iter().chain(fused) {
         let rows: DimName = Rows;
         let w = noise(vec![n as usize, k as usize], &mut draws);
@@ -98,13 +98,20 @@ fn lanes_match_cpu() {
                 true => terms.matmul(&runner.precision(), xs, ws, k as usize),
                 false => 1e-3,
             };
-            let label = format!(
-                "{m} rows of {k} to {n} as {} on {}",
-                form.name(),
-                runner.device()
-            );
+            let label = format!("{m}x{k}->{n} as {} on {}", form.name(), runner.device());
             assert!(off <= bound, "{label}: off by {off:e}, allowed {bound:e}");
             eprintln!("{label}: off by {off:.2e} of {bound:.2e}");
+            // Rows picking single weights read them back exactly.
+            let (k, n) = (k as usize, n as usize);
+            let pick = |r: usize| 13 * r % k;
+            let basis = Vec::from_iter((0..m * k).map(|i| f32::from(i % k == pick(i / k))));
+            let x = Tensor::f32(vec![m, k], basis);
+            let picked = runner.run(&[x.view()]).unwrap();
+            let rows = picked[0].floats().unwrap().chunks(n).enumerate();
+            for (r, out) in rows.filter(|_| bare) {
+                let want: Vec<f32> = (0..n).map(|c| ws[c * k + pick(r)]).collect();
+                assert_eq!(out, &want[..], "{label}: row {r}");
+            }
         }
     }
 }

@@ -47,9 +47,14 @@ fn block_headers_render() {
         helpers: Vec::new(),
     };
     let text = body.text();
-    assert_eq!(text.headers.len(), 2, "the f16 scale and the form");
+    assert_eq!(text.headers.len(), 2, "one element, then four");
     let metal = text.render(Dialect::Metal);
-    assert!(metal.contains("f_fn float f_mini5_10(u32 x)"));
+    assert!(metal.contains("f_f16("), "the scale is an f16 field");
     assert!(metal.contains("f_fn float form_q4_0(f_const(u8) p, u64 i)"));
+    assert!(metal.contains("f_fn float4 form_q4_0_x4(f_const(u8) p, u64 i)"));
+    assert!(
+        metal.contains("f_field(w, "),
+        "codes come out as bit fields"
+    );
     assert!(metal.contains("device const u8 *w"));
 }

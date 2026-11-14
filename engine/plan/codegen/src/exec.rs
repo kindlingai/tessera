@@ -1,9 +1,10 @@
 //! Runs a body on the host, each group in lockstep.
 
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
 use crate::kept::Layout;
 use crate::numerics::Precision;
+use graph::{E2M1, E4M3, F16};
 use std::collections::HashMap;
 
 /// One argument of a launch, as the host sees it.
@@ -395,22 +396,53 @@ impl Group<'_, '_> {
                 let v = self.eval(&args[0], mask);
                 v.into_iter().map(|x| Val::U(x.f().to_bits())).collect()
             }
+            Intrinsic::Field(m) => {
+                let (w, l) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+                (0..n)
+                    .map(|t| {
+                        let x = field(w[t].u(), l[t].u(), m.bits());
+                        Val::F(match m {
+                            Mini::F16 => f32::from(F16(x as u16)),
+                            Mini::E4M3 => f32::from(E4M3(x as u8)),
+                            Mini::E2M1 => f32::from(E2M1(x as u8)),
+                        })
+                    })
+                    .collect()
+            }
+            Intrinsic::Bits | Intrinsic::Signed => {
+                let (w, l, n) = (
+                    self.eval(&args[0], mask),
+                    self.eval(&args[1], mask),
+                    self.eval(&args[2], mask),
+                );
+                (0..n.len())
+                    .map(|t| {
+                        let field = field(w[t].u(), l[t].u(), n[t].u());
+                        match i {
+                            Intrinsic::Bits => Val::U(field),
+                            _ => Val::F(sign_extend(field, n[t].u()) as f32),
+                        }
+                    })
+                    .collect()
+            }
             Intrinsic::FromBits => {
                 let v = self.eval(&args[0], mask);
                 v.into_iter()
                     .map(|x| Val::F(f32::from_bits(x.u())))
                     .collect()
             }
-            Intrinsic::Word => {
+            Intrinsic::Word | Intrinsic::Half => {
                 let Expr::Var(name) = &args[0] else {
                     panic!("a word read names its buffer");
                 };
+                let width = if i == Intrinsic::Word { 4 } else { 2 };
                 let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
                 let bytes = &self.buffers[arg.buffer];
                 (0..n)
                     .map(|t| {
                         let at = arg.skip + at[t].u() as usize;
-                        let raw = bytes[at..at + 4].try_into().expect("4 bytes");
+                        let mut raw = [0u8; 4];
+                        raw[..width].copy_from_slice(&bytes[at..at + width]);
                         Val::U(u32::from_le_bytes(raw))
                     })
                     .collect()
@@ -827,4 +859,15 @@ pub fn run(
         let mask = vec![true; grid.threads];
         group.block(&body.stmts, &mask);
     }
+}
+
+/// The `n` bits of `w` from bit `low`.
+fn field(w: u32, low: u32, n: u32) -> u32 {
+    (w >> low) & ((1u64 << n) - 1) as u32
+}
+
+/// An `n`-bit field as a signed value.
+fn sign_extend(field: u32, n: u32) -> i32 {
+    let shift = 32 - n;
+    ((field << shift) as i32) >> shift
 }

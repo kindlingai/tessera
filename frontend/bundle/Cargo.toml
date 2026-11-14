@@ -7,16 +7,18 @@ publish.workspace = true
 description = "A Hugging Face model directory as graph, weights, tokenizer and template"
 
 [dependencies]
-lower = { workspace = true }
 checkpoint = { workspace = true }
 graph = { workspace = true }
 interp = { workspace = true }
+fancy-regex = "0.14"
 minijinja = { version = "3", features = ["json", "serde"] }
 minijinja-contrib = { version = "3", features = ["pycompat"] }
 models = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmp-serde = "1"
+rmpv = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
 
 [dev-dependencies]
-engine = { workspace = true }
+settings = { workspace = true }

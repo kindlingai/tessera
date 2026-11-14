@@ -162,10 +162,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
             let (tokens, best) = reference(dir)?;
             (tokens, Some(best))
         }
-        None => {
-            let encoded = loaded.tokenizer.encode(args.prompt.as_str(), false)?;
-            (encoded.get_ids().to_vec(), None)
-        }
+        None => (loaded.tokenizer.encode(args.prompt.as_str())?, None),
     };
     let parity = match wanted {
         Some(best) => {

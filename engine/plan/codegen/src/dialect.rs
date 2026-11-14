@@ -69,6 +69,11 @@ const NAMES: &[(&str, &str, &str)] = &[
         "(*(const u32 *)(p))",
     ),
     (
+        "f_u16(p)",
+        "(*(device const u16 *)(p))",
+        "(*(const u16 *)(p))",
+    ),
+    (
         "f_u32x2(p)",
         "(*(device const uint2 *)(p))",
         "(*(const uint2 *)(p))",
@@ -91,6 +96,67 @@ const CUDA_PDL: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define f_pdl_go()
 #endif
 ";
+
+/// Bit fields: one extract instruction on each backend.
+const METAL_BITS: &str = "#define f_field(w, l, n) extract_bits((u32)(w), (l), (n))
+#define f_sfield(w, l, n) ((float)extract_bits((int)(w), (l), (n)))
+";
+const CUDA_BITS: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#define f_field(w, l, n) (((u32)(w) >> (l)) & ((1u << (n)) - 1u))
+#define f_sfield(w, l, n) ((float)(((int)((u32)(w) << (32u - (l) - (n)))) >> (32u - (n))))
+#else
+f_fn u32 f_field(u32 w, u32 l, u32 n) {
+    u32 r;
+    asm(\"bfe.u32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
+    return r;
+}
+f_fn float f_sfield(u32 w, u32 l, u32 n) {
+    int r;
+    asm(\"bfe.s32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
+    return (float)r;
+}
+#endif
+";
+
+/// Narrow float fields, native where a backend has them.
+const METAL_FLOATS: &str = "#define f_f16(w, l) ((float)as_type<half>((u16)f_field(w, l, 16)))
+";
+const CUDA_FLOATS: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+#define f_f16(w, l) ((float)__builtin_bit_cast(_Float16, (unsigned short)f_field(w, l, 16)))
+#else
+f_fn float f_f16(u32 w, u32 l) {
+    float r;
+    unsigned short h = (unsigned short)f_field(w, l, 16);
+    asm(\"{.reg .b16 t; mov.b16 t, %1; cvt.f32.f16 %0, t;}\" : \"=f\"(r) : \"h\"(h));
+    return r;
+}
+#endif
+";
+const CUDA_E4M3: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+f_fn float f_e4m3(u32 w, u32 l) {
+    unsigned short b = (unsigned short)f_field(w, l, 8);
+    u32 h;
+    asm(\"cvt.rn.f16x2.e4m3x2 %0, %1;\" : \"=r\"(h) : \"h\"(b));
+    return f_f16(h, 0);
+}
+#else
+#define f_e4m3(w, l) f_e4m3_bits(f_field(w, l, 8))
+#endif
+";
+
+/// `name` widens a word's low bits, `e` and `m` wide.
+fn widen(name: &str, e: u32, m: u32) -> String {
+    let bias = (1u32 << (e - 1)) - 1;
+    let least = f32::from_bits((127 - bias - m + 1) << 23);
+    format!(
+        "f_fn float {name}(u32 x) {{\n    u32 ex = (x >> {m}u) & {}u;\n    u32 mn = x & {}u;\n    float v = ex == 0u ? (float)mn * {least:?}f : f_bits(((ex + {}u) << 23) | (mn << {}u));\n    return ((x >> {}u) & 1u) ? -v : v;\n}}\n",
+        (1u32 << e) - 1,
+        (1u32 << m) - 1,
+        127 - bias,
+        23 - m,
+        e + m,
+    )
+}
 
 const CUDA_SHFL: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #define f_shfl_xor(v, m) __shfl_xor(v, m)
@@ -117,6 +183,16 @@ fn head(dialect: Dialect) -> String {
         }
     }
     text.push_str(if metal { METAL_SHFL } else { CUDA_SHFL });
+    text.push_str(if metal { METAL_BITS } else { CUDA_BITS });
+    text.push_str(if metal { METAL_FLOATS } else { CUDA_FLOATS });
+    text.push_str(&widen("f_e4m3_bits", 4, 3));
+    text.push_str(&widen("f_e2m1_bits", 2, 1));
+    text.push_str(if metal {
+        "#define f_e4m3(w, l) f_e4m3_bits(f_field(w, l, 8))\n"
+    } else {
+        CUDA_E4M3
+    });
+    text.push_str("#define f_e2m1(w, l) f_e2m1_bits(f_field(w, l, 4))\n");
     if !metal {
         text.push_str(CUDA_PDL);
     }

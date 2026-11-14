@@ -4,7 +4,7 @@ use crate as codegen;
 use crate::form::Form;
 use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
-use crate::prelude::{Buf, U8, device, helper, kernel};
+use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use graph::{DType, E2M1, E4M3, F16};
 
 /// A code: what one element stores, before its block's scale.
@@ -15,13 +15,13 @@ pub trait Code: Sync {
     fn encode(scaled: f32) -> u32;
     fn decode(code: u32) -> f32;
 
-    /// Code `c` as a float, in a kernel.
-    fn float(_: u32) -> f32 {
+    /// Code at bit `low` of `w`, as a float.
+    fn field(_: u32, _: u32) -> f32 {
         device()
     }
 
-    /// `float` as a tree, for the block's helper.
-    fn float_inline(c: impl Pass<Expr>) -> Inline;
+    /// `field` as a tree, for the block's helper.
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline;
 
     /// The scale for a block, from its values.
     fn scale(block: &[f32]) -> f32 {
@@ -46,30 +46,16 @@ pub trait Scale: Sync {
     fn load_inline(p: impl Pass<Expr>) -> Inline;
 }
 
-/// A float from `x`: `E` exponent and `M` mantissa bits.
-#[helper("f_mini{E}_{M}")]
-pub(crate) fn minifloat<const E: u32, const M: u32>(x: u32) -> f32 {
-    let ex = (x >> M) & ((1u32 << E) - 1);
-    let mn = x & ((1u32 << M) - 1);
-    // A subnormal counts units of the least normal.
-    let v = if ex == 0 {
-        mn as f32 * f32::from_bits((129 - (1u32 << (E - 1)) - M) << 23)
-    } else {
-        f32::from_bits(((ex + (128 - (1u32 << (E - 1)))) << 23) | (mn << (23 - M)))
-    };
-    if ((x >> (E + M)) & 1) != 0 { -v } else { v }
-}
-
 /// An f16 scale: two bytes, low first.
 #[kernel]
 fn f16_scale(p: Buf<U8>) -> f32 {
-    minifloat::<5, 10>(p[0] as u32 | ((p[1] as u32) << 8))
+    (p[0] as u32 | ((p[1] as u32) << 8)).f16(0)
 }
 
 /// An e4m3 scale: one byte.
 #[kernel]
 fn e4m3_scale(p: Buf<U8>) -> f32 {
-    minifloat::<4, 3>(p[0] as u32)
+    (p[0] as u32).e4m3(0)
 }
 
 macro_rules! scale {
@@ -104,21 +90,27 @@ impl Code for E2M1 {
     fn decode(code: u32) -> f32 {
         E2M1(code as u8).into()
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        minifloat_inline::<2, 1>(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        e2m1_field_inline(w, low)
     }
 }
 
-/// A signed byte, from its two's complement.
+/// An e2m1 nibble.
 #[kernel]
-fn i8_code(c: u32) -> f32 {
-    ((c ^ 128) as f32) - 128.0
+fn e2m1_field(w: u32, low: u32) -> f32 {
+    w.e2m1(low)
+}
+
+/// A signed byte.
+#[kernel]
+fn i8_field(w: u32, low: u32) -> f32 {
+    w.signed(low, 8)
 }
 
 /// A nibble 8 below its value.
 #[kernel]
-fn nibble_code(c: u32) -> f32 {
-    c as f32 - 8.0
+fn nibble_field(w: u32, low: u32) -> f32 {
+    w.bits(low, 4) as f32 - 8.0
 }
 
 /// A signed byte.
@@ -133,8 +125,8 @@ impl Code for I8 {
     fn decode(code: u32) -> f32 {
         f32::from(code as u8 as i8)
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        i8_code_inline(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        i8_field_inline(w, low)
     }
 }
 
@@ -150,8 +142,8 @@ impl Code for Nibble {
     fn decode(code: u32) -> f32 {
         code as f32 - 8.0
     }
-    fn float_inline(c: impl Pass<Expr>) -> Inline {
-        nibble_code_inline(c)
+    fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+        nibble_field_inline(w, low)
     }
 
     /// Keeps the sign: the widest value lands on -8.
@@ -187,7 +179,6 @@ fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bo
     } else {
         (4 * (j % 2)) as u32
     };
-    let c = ((b[S::BYTES as u64 + byte] as u32) >> shift) & ((1u32 << C::BITS) - 1);
     let head = if HEAD {
         f32::from_bits(
             p[0] as u32 | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24),
@@ -195,7 +186,47 @@ fn element<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bo
     } else {
         1.0
     };
-    head * S::load(b) * C::float(c)
+    head * S::load(b) * C::field(b[S::BYTES as u64 + byte] as u32, shift)
+}
+
+/// Elements `i..i+4`: head, scale and four codes.
+#[helper("form_{name}_x4")]
+fn four<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool>(
+    #[build] name: &'static str,
+    p: Buf<U8>,
+    i: u64,
+) -> F32x4 {
+    let j = i % B as u64;
+    let b = p + (HEAD as u64 * 4 + (i / B as u64) * (S::BYTES + B * C::BITS as usize / 8) as u64);
+    // First byte of the codes, then each shift.
+    let at = if C::BITS == 8 {
+        j
+    } else if HALVES {
+        j % (B / 2) as u64
+    } else {
+        j / 2
+    };
+    let step = if C::BITS == 8 || HALVES { 8 } else { 4 };
+    let shift = if C::BITS == 8 || !HALVES {
+        0
+    } else {
+        (4 * (j / (B / 2) as u64)) as u32
+    };
+    let c = b + (S::BYTES as u64 + at);
+    // Scales of two bytes keep the codes two-aligned.
+    let w = if S::BYTES == 2 {
+        c.half(0) | (c.half(2) << 16)
+    } else {
+        c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
+    };
+    let head = if HEAD { f32::from_bits(p.word(0)) } else { 1.0 };
+    let scale = head * S::load(b);
+    F32x4::new(
+        scale * C::field(w, shift),
+        scale * C::field(w, shift + step),
+        scale * C::field(w, shift + 2 * step),
+        scale * C::field(w, shift + 3 * step),
+    )
 }
 
 /// `B` codes after one scale, after an optional `HEAD` f32.
@@ -267,6 +298,14 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
     fn block(&self) -> usize {
         B
     }
+    /// Nibbles: one word holds four codes of each half.
+    fn pairs(&self) -> usize {
+        match (C::BITS, HALVES) {
+            (4, true) => B / 2,
+            (4, false) => 4,
+            _ => 0,
+        }
+    }
     fn bytes(&self, elements: usize) -> usize {
         Self::HEAD_BYTES + elements.div_ceil(B) * Self::BLOCK_BYTES
     }
@@ -290,8 +329,16 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
         format!("form_{}({name}, {index})", self.name)
     }
 
+    /// Four codes share their block's scale and bytes.
+    fn load4(&self, name: &str, index: &str) -> String {
+        format!("form_{}_x4({name}, {index})", self.name)
+    }
+
     fn header(&self) -> Vec<Helper> {
-        vec![element_ir::<S, C, B, HALVES, HEAD>(self.name)]
+        vec![
+            element_ir::<S, C, B, HALVES, HEAD>(self.name),
+            four_ir::<S, C, B, HALVES, HEAD>(self.name),
+        ]
     }
 
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {

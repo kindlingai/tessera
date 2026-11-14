@@ -2,7 +2,7 @@
 
 use crate::LANES;
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
 use sim::Ops;
 use std::collections::HashMap;
 
@@ -78,6 +78,9 @@ impl Counter {
         t.loads += ops.loads * n;
         t.stores += ops.stores * n;
         t.tile_flops += ops.tile_flops * n;
+        t.f16 += ops.f16 * n;
+        t.e4m3 += ops.e4m3 * n;
+        t.e2m1 += ops.e2m1 * n;
         self.fresh += ops.fresh * ops.loads * n;
         self.width += ops.width * ops.loads * n;
     }
@@ -241,6 +244,32 @@ impl Counter {
                             ..Ops::default()
                         });
                         false
+                    }
+                    Intrinsic::Bits => {
+                        self.add(Ops {
+                            int: 1.0,
+                            ..Ops::default()
+                        });
+                        false
+                    }
+                    Intrinsic::Signed => {
+                        self.add(Ops {
+                            int: 1.0,
+                            float: 1.0,
+                            ..Ops::default()
+                        });
+                        true
+                    }
+                    // Tallied by format: each chip prices its conversions.
+                    Intrinsic::Field(m) => {
+                        let mut ops = Ops::default();
+                        match m {
+                            Mini::F16 => ops.f16 = 1.0,
+                            Mini::E4M3 => ops.e4m3 = 1.0,
+                            Mini::E2M1 => ops.e2m1 = 1.0,
+                        }
+                        self.add(ops);
+                        true
                     }
                     Intrinsic::Clamp => {
                         self.add(float(2.0));

@@ -65,11 +65,34 @@ pub struct Ops {
     pub width: f64,
     /// Flops done on the matrix unit, with f32 operands.
     pub tile_flops: f64,
+    /// Fields read as narrow floats, counted per format.
+    pub f16: f64,
+    pub e4m3: f64,
+    pub e2m1: f64,
 }
+
+/// Integer and float ops one widening by arithmetic takes.
+const WIDEN: (f64, f64) = (6.0, 2.0);
 
 impl Ops {
     pub fn width(&self) -> f64 {
         if self.width > 0.0 { self.width } else { WORD }
+    }
+
+    /// The conversions, costed as a chip's ops.
+    pub fn priced(mut self, native_e4m3: bool) -> Ops {
+        let e4m3 = if native_e4m3 { (2.0, 1.0) } else { WIDEN };
+        let spent = [
+            (self.f16, (1.0, 1.0)),
+            (self.e4m3, e4m3),
+            (self.e2m1, WIDEN),
+        ];
+        for (n, (int, float)) in spent {
+            self.int += n * int;
+            self.float += n * float;
+        }
+        (self.f16, self.e4m3, self.e2m1) = (0.0, 0.0, 0.0);
+        self
     }
 }
 
