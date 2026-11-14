@@ -143,7 +143,7 @@ pub fn attention<D: Dense>(m: &Model, c: &Config) -> Vec<Attention<D>> {
 }
 
 /// The residual stream after every layer, `[Seqs, Context, Hidden]`.
-pub fn trunk<D: Dense>(
+fn trunk<D: Dense>(
     m: &Model,
     c: &Config,
     w: &Eg2<D>,

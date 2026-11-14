@@ -18,7 +18,7 @@ impl Dense for Linear {
 }
 
 /// exlr8 rotates in blocks of this many channels.
-pub const ROTATION: u32 = 128;
+const ROTATION: u32 = 128;
 
 /// A matrix between two rotations.
 pub struct Rotated {

@@ -7,4 +7,4 @@ pub mod qwen3;
 mod shared;
 pub mod tagger;
 
-pub use shared::{Dense, ROTATION, Rotated, Stack};
+pub use shared::{Dense, Rotated, Stack};
