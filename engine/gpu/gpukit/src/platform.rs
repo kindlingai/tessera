@@ -5,7 +5,7 @@ use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 
 /// One JSON file per architecture, matched by platform id.
-static TABLE: Dir = include_dir!("$CARGO_MANIFEST_DIR/platforms");
+pub(crate) static TABLE: Dir = include_dir!("$CARGO_MANIFEST_DIR/platforms");
 
 /// What a driver cannot say about an architecture.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -25,14 +25,18 @@ pub struct Row {
     pub note: String,
 }
 
-/// Every row of the table, in file order.
+/// Every row, in file order. Panics on a bad file.
 pub fn rows() -> Vec<Row> {
     let mut files: Vec<_> = TABLE.files().collect();
     files.sort_by_key(|f| f.path().to_path_buf());
-    files
-        .iter()
-        .filter_map(|f| serde_json::from_slice::<Row>(f.contents()).ok())
-        .collect()
+    let mut rows = Vec::new();
+    for file in files {
+        match serde_json::from_slice::<Row>(file.contents()) {
+            Ok(row) => rows.push(row),
+            Err(e) => panic!("platforms/{}: {e}", file.path().display()),
+        }
+    }
+    rows
 }
 
 /// The backend a row's patterns name.
