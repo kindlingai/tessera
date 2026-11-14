@@ -6,15 +6,6 @@ use std::sync::Mutex;
 
 pub use scattered_collect::declarative::{gather, scatter};
 
-/// How elements lie, and so which kernels can read them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Layout {
-    /// Rows of elements. Any kernel can index one.
-    Rows,
-    /// Whole tiles. A kernel written for them reads them.
-    Tiles { rows: usize, cols: usize },
-}
-
 /// Decodes its elements in kernel text and on the host.
 pub trait Form: Sync {
     fn name(&self) -> &'static str;
@@ -31,13 +22,19 @@ pub trait Form: Sync {
     /// `data` as the bytes of this form.
     fn pack(&self, data: &[f32]) -> Vec<u8>;
 
+    /// Whether floats can become this form. Codes cannot.
+    fn packs(&self) -> bool {
+        true
+    }
+
+    /// Whether a load decodes at length, so loops stay rolled.
+    fn heavy(&self) -> bool {
+        false
+    }
+
     /// Elements that share one scale, decoded together.
     fn block(&self) -> usize {
         1
-    }
-
-    fn layout(&self) -> Layout {
-        Layout::Rows
     }
 
     /// Elements a row's length must be a multiple of.
@@ -105,8 +102,7 @@ pub trait Form: Sync {
 
     /// Whether `input` reads as `form`, when `weight` is this form.
     fn taken(&self, input: usize, weight: usize, form: &dyn Form) -> bool {
-        let rows = form.layout() == Layout::Rows;
-        rows && (!form.narrow() || (input == weight && form.name() == self.name()))
+        !form.narrow() || (input == weight && form.name() == self.name())
     }
 
     /// Bytes a matmul reads: the weight, then the rows.

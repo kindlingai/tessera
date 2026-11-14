@@ -50,6 +50,11 @@ const NAMES: &[(&str, &str, &str)] = &[
     ),
     ("f_f32x4(p)", "(*(device float4 *)(p))", "(*(float4 *)(p))"),
     (
+        "f_u32(p)",
+        "(*(device const u32 *)(p))",
+        "(*(const u32 *)(p))",
+    ),
+    (
         "f_u32x2(p)",
         "(*(device const uint2 *)(p))",
         "(*(const uint2 *)(p))",
