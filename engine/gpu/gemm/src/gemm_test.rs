@@ -1,6 +1,6 @@
 macro_rules! case {
     ($name:ident, $fixture:path) => {
-        crate::gemm_case! {
+        crate::testing::gemm_case! {
             mod $name,
             fixture = $fixture,
             max_tol = 1e-4,

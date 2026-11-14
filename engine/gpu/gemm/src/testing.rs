@@ -1,14 +1,13 @@
 //! Test support: backend availability and the f32 oracle comparison.
 
 /// Whether GPU tests should run here.
-pub fn gpu_available() -> bool {
+pub(crate) fn gpu_available() -> bool {
     settings::read().gpu().is_some()
 }
 
-pub use gpukit::testing::{assert_oracle, cosine_f32, max_abs_diff};
+pub(crate) use gpukit::testing::assert_oracle;
 
 /// Tests one shape: a finite oracle, and GPU matching it.
-#[macro_export]
 macro_rules! gemm_case {
     (
         mod $mod_name:ident,
@@ -41,3 +40,4 @@ macro_rules! gemm_case {
         }
     };
 }
+pub(crate) use gemm_case;
