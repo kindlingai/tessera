@@ -22,11 +22,6 @@ fn config(layers: u64) -> Config {
     c
 }
 
-/// The interpreter only ever sees the JSON text.
-fn graph(g: Graph) -> Graph {
-    Graph::from_json(&g.to_json()).unwrap()
-}
-
 /// The reference's ids and outputs for one text.
 struct Case {
     name: String,
@@ -237,7 +232,8 @@ fn close(label: &str, got: &[f32], want: &[f32]) {
 fn check_layers(dir: &Path, c: &Case) {
     for layers in [1, 2, 5, 6, 12, 24] {
         let cfg = config(layers);
-        let g = graph(probe::<Linear>(&cfg));
+        // The suite does not check probe's JSON.
+        let g = Graph::from_json(&probe::<Linear>(&cfg).to_json()).unwrap();
         let w = weights(&g, &cfg, dir);
         let got = pooled(&g, &w, &c.tokens, c.tokens.len());
         let hidden = got.len();
@@ -257,7 +253,7 @@ fn matches_reference() {
         check_layers(&dir, &cases[0]);
     }
     let cfg = config(24);
-    let g = graph(program::<Linear>(&cfg));
+    let g = program::<Linear>(&cfg);
     let w = weights(&g, &cfg, &dir);
     for c in &cases {
         let got = unit(&pooled(&g, &w, &c.tokens, 1));

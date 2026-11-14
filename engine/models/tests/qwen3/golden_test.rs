@@ -1,20 +1,16 @@
 //! Qwen3-0.6B against outputs its reference recorded.
 
+use super::release;
 use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
 use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, open, select};
-use models::qwen3::{Config, program, stepper, tensor_name};
+use models::qwen3::{Config, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
-
-/// The interpreter only ever sees the JSON text.
-fn graph() -> Graph {
-    Graph::from_json(&program(&Config::small(8, 40_960)).to_json()).unwrap()
-}
 
 /// Read from the directory `TESSERA_QWEN3` names.
 struct Case {
@@ -78,7 +74,7 @@ fn close(label: &str, got: &[f32], c: &Case) {
 
 #[test]
 fn matches_reference() {
-    let g = graph();
+    let g = release();
     let Some(c) = case(&g) else {
         return eprintln!("TESSERA_QWEN3 is not set; skipped");
     };
