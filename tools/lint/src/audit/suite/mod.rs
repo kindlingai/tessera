@@ -1,4 +1,4 @@
-//! Rules about the test files of each crate.
+//! Rules about the tests of each crate.
 
 #[cfg(test)]
 mod suite_test;
@@ -9,9 +9,9 @@ use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::Visit;
 
 use super::workspace::Pkg;
-use crate::Violation;
 use crate::files::Source;
 use crate::rust::{is_test, is_test_file};
+use crate::{LIMITS, Violation};
 
 /// A token, reduced to what path roots need.
 #[derive(PartialEq)]
@@ -63,6 +63,27 @@ fn roots(tokens: TokenStream) -> BTreeSet<String> {
     out
 }
 
+/// Clock types that tests may not name.
+const CLOCKS: [&str; 2] = ["Instant", "SystemTime"];
+
+/// The first clock a file names, with its line.
+fn clock(tokens: TokenStream) -> Option<(usize, String)> {
+    for t in tokens {
+        match t {
+            TokenTree::Ident(i) if CLOCKS.iter().any(|c| i == c) => {
+                return Some((i.span().start().line, i.to_string()));
+            }
+            TokenTree::Group(g) => {
+                if let Some(found) = clock(g.stream()) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Lines of `#[test]` functions.
 #[derive(Default)]
 struct Tests(Vec<usize>);
@@ -97,14 +118,17 @@ fn group(pkg: &Pkg, rel: &str) -> String {
     }
 }
 
-/// A test file's names and its first test.
+/// A Rust file: its names, tests and clocks.
 struct Entry<'a> {
     src: &'a Source,
     pkg: &'a Pkg,
     group: String,
+    /// In `tests/`, or a `*_test.rs` file of `src/`.
+    suite: bool,
     inside: bool,
     used: BTreeSet<String>,
-    test: Option<usize>,
+    tests: Vec<usize>,
+    timed: Option<(usize, String)>,
 }
 
 fn entries<'a>(pkgs: &'a [Pkg], sources: &'a [Source]) -> Vec<Entry<'a>> {
@@ -114,9 +138,7 @@ fn entries<'a>(pkgs: &'a [Pkg], sources: &'a [Source]) -> Vec<Entry<'a>> {
             continue;
         };
         let inside = rel.starts_with("src/") && is_test_file(rel);
-        if !inside && !rel.starts_with("tests/") {
-            continue;
-        }
+        let suite = inside || rel.starts_with("tests/");
         let (Ok(tokens), Ok(file)) = (src.text.parse::<TokenStream>(), syn::parse_file(&src.text))
         else {
             continue;
@@ -127,26 +149,35 @@ fn entries<'a>(pkgs: &'a [Pkg], sources: &'a [Source]) -> Vec<Entry<'a>> {
             src,
             pkg,
             group: group(pkg, rel),
+            suite,
             inside,
-            used: roots(tokens),
-            test: tests.0.first().copied(),
+            used: if suite {
+                roots(tokens.clone())
+            } else {
+                BTreeSet::new()
+            },
+            tests: tests.0,
+            timed: if suite { clock(tokens) } else { None },
         });
     }
     found
 }
 
-pub fn check(pkgs: &[Pkg], sources: &[Source], out: &mut Vec<Violation>) {
-    let crates: BTreeSet<String> = pkgs.iter().map(|p| p.name.replace('-', "_")).collect();
-    let all = entries(pkgs, sources);
+/// The names each group of test files uses.
+fn group_names<'a>(all: &'a [Entry]) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
     let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for e in &all {
-        groups
-            .entry(&e.group)
-            .or_default()
-            .extend(e.used.iter().map(String::as_str));
+    for e in all {
+        let names = groups.entry(&e.group).or_default();
+        names.extend(e.used.iter().map(String::as_str));
     }
-    for e in &all {
-        let Some(line) = e.test else {
+    groups
+}
+
+fn homes(all: &[Entry], pkgs: &[Pkg], out: &mut Vec<Violation>) {
+    let crates: BTreeSet<String> = pkgs.iter().map(|p| p.name.replace('-', "_")).collect();
+    let groups = group_names(all);
+    for e in all.iter().filter(|e| e.suite) {
+        let Some(&line) = e.tests.first() else {
             continue;
         };
         let used = if e.inside {
@@ -179,4 +210,32 @@ pub fn check(pkgs: &[Pkg], sources: &[Source], out: &mut Vec<Violation>) {
             ),
         });
     }
+}
+
+fn timing(all: &[Entry], out: &mut Vec<Violation>) {
+    for e in all.iter().filter(|e| e.suite) {
+        let exempt = LIMITS.timing_exempt.iter();
+        if exempt
+            .into_iter()
+            .any(|d| e.src.path.starts_with(d.as_str()))
+        {
+            continue;
+        }
+        if let Some((line, name)) = &e.timed {
+            out.push(Violation {
+                path: e.src.path.clone(),
+                line: *line,
+                rule: "test-timing",
+                message: format!(
+                    "`{name}` in a test file: time code in a bench or tools/calibrate"
+                ),
+            });
+        }
+    }
+}
+
+pub fn check(pkgs: &[Pkg], sources: &[Source], out: &mut Vec<Violation>) {
+    let all = entries(pkgs, sources);
+    homes(&all, pkgs, out);
+    timing(&all, out);
 }

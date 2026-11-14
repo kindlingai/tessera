@@ -52,6 +52,7 @@ pub struct Limits {
     pub layer_allow: Vec<audit::Allow>,
     pub warn_rules: Vec<String>,
     pub min_repeat_statements: usize,
+    pub timing_exempt: Vec<String>,
 }
 
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
