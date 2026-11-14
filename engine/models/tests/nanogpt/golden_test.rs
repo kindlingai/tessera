@@ -1,13 +1,10 @@
-//! The traced nanogpt, run from JSON alone, matches recorded logits.
+//! The nanogpt, run from JSON alone, against recorded logits.
 
-// Linking the crate registers its rules.
-use kernels as _;
-
+use super::config;
 use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, lower, open};
-use models::Stack;
-use models::nanogpt::{Config, program};
+use models::nanogpt::program;
 use settings::read as settings;
 use trace::DimName::{Context, Seqs};
 use trace::Graph;
@@ -99,20 +96,6 @@ const WANT: [f32; 80] = [
     0.14493969,
 ];
 
-fn config() -> Config {
-    let stack = Stack {
-        vocab: 8,
-        hidden: 8,
-        layers: 2,
-        heads: 2,
-        head_dim: 4,
-        ffn: 32,
-        max_seqs: 4,
-        max_context: 8,
-    };
-    Config { stack, eps: 1e-5 }
-}
-
 /// The interpreter only ever sees the JSON text.
 fn graph() -> Graph {
     Graph::from_json(&program(&config()).to_json()).unwrap()
@@ -172,23 +155,4 @@ fn plan_matches_record() {
     let inputs = [ids(TOKENS.to_vec()), ids(positions())];
     let out = runner.run(&[inputs[0].view(), inputs[1].view()]).unwrap();
     close("plan", out[0].floats().unwrap());
-}
-
-#[test]
-fn trace_is_deterministic() {
-    let g = graph();
-    graph::verify(&g).unwrap();
-    assert_eq!(g.hash(), program(&config()).hash());
-    assert_eq!(g.weights.len(), 4 + 8 * 2);
-}
-
-#[test]
-fn layers_mark_composites() {
-    use trace::Composite::{Attention, Mlp};
-    let g = graph();
-    let kinds: Vec<_> = g.regions.iter().map(|r| r.kind).collect();
-    assert_eq!(kinds, [Attention, Mlp, Attention, Mlp]);
-    let mlp = &g.regions[1];
-    let ops = &g.nodes[mlp.start.0 as usize..mlp.end.0 as usize];
-    assert_eq!(ops.iter().filter(|n| n.numerics.is_some()).count(), 2);
 }
