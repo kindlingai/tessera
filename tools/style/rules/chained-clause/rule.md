@@ -13,4 +13,4 @@ subject of the second. Split the claims into two sentences, or lead with B.
 A clause that only describes the object with "is" adds a property, so the
 pattern skips it: "picks the first address, which is the fastest".
 A "which" clause inside the subject is fine ("The config, which lists every
-peer, is read first"), and so is a "that" clause, which narrows the noun.
+peer, is read first"). A "that" clause is fine too. It narrows the noun.
