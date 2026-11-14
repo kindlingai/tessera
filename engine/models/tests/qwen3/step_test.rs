@@ -1,22 +1,11 @@
 //! A step entry's ragged rows against whole forward passes.
 
-use gpukit::testing::{Noise, max_abs_diff};
 use interp::{Store, Tensor, run, run_kept};
 use models::qwen3::{Config, program, stepper};
-use trace::Graph;
+use testkit::{Noise, argmax, max_abs_diff, weights};
 
 const SEQS: usize = 2;
 const LEN: usize = 7;
-
-fn weights(g: &Graph, noise: &mut Noise) -> Vec<Tensor> {
-    let size = |e: &graph::DimExpr| e.poly(&g.dims).unwrap().as_const().unwrap() as usize;
-    let fill = |w: &graph::Weight| {
-        let shape: Vec<usize> = w.ty.shape.0.iter().map(size).collect();
-        let data = (0..shape.iter().product()).map(|_| noise.draw()).collect();
-        Tensor::f32(shape, data)
-    };
-    g.weights.iter().map(fill).collect()
-}
 
 /// Every sequence's tokens and positions, `[Seqs, Len]` each.
 fn whole(tokens: &[u32]) -> [Tensor; 2] {
@@ -42,11 +31,6 @@ fn feeds(tokens: &[u32], rows: &[(usize, usize)]) -> [Tensor; 3] {
         column(&|_, p| p as u32),
         column(&|s, _| s as u32),
     ]
-}
-
-fn best(row: &[f32]) -> u32 {
-    let top = |a: &(usize, &f32), b: &(usize, &f32)| a.1.total_cmp(b.1);
-    row.iter().enumerate().max_by(top).unwrap().0 as u32
 }
 
 /// Rows mixing both sequences at different positions, in three launches.
@@ -79,7 +63,7 @@ fn steps_match_forward() {
         assert_eq!(out[0].shape, [rows.len()]);
         for (at, row) in logits.chunks(vocab).enumerate() {
             let (s, p) = rows[at];
-            assert_eq!(ids[at], best(row) as usize);
+            assert_eq!(ids[at], argmax(row));
             got[(s * LEN + p) * vocab..][..vocab].copy_from_slice(row);
         }
     }
