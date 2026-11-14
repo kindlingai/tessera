@@ -1,6 +1,7 @@
 use super::Pattern;
 use crate::form::Form;
 use crate::tree::{T, Term, Tree};
+use graph::{Op, Select};
 
 /// Rows of `table` picked by `ids`.
 #[derive(Clone, Copy, Debug)]
@@ -15,7 +16,7 @@ pub struct Gather {
 impl Pattern for Gather {
     fn find(tree: &Tree, at: T) -> Option<Self> {
         let node = tree.node(at);
-        if node.term != Term::Gather {
+        if node.term != Term::Op(Op::Select(Select::Gather)) {
             return None;
         }
         let (table, ids) = (node.args[0], node.args[1]);

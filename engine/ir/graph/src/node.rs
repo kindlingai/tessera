@@ -101,13 +101,15 @@ pub enum Op {
     Select(Select),
     View(View),
     Cast(DType),
+    /// The mean over this axis. The axis goes away.
+    Mean(u32),
 }
 
 impl Op {
     /// Whether this op sums, so it carries `Numerics`.
     pub fn reduces(&self) -> bool {
         match self {
-            Op::Matmul | Op::Attend(_) => true,
+            Op::Matmul | Op::Attend(_) | Op::Mean(_) => true,
             Op::Row(r) => r.0.iter().any(Stage::reduces),
             _ => false,
         }
@@ -149,6 +151,14 @@ pub enum Stage {
     RmsNorm {
         eps: f32,
     },
+    /// Divides the row by its root mean square.
+    Rms {
+        eps: f32,
+    },
+    /// The scaled Walsh-Hadamard transform of each `block` of the row.
+    Hadamard {
+        block: u32,
+    },
     /// Subtracts the row's mean.
     Center,
     /// Divides the row by its sum.
@@ -177,7 +187,7 @@ impl Stage {
         use Stage::*;
         matches!(
             self,
-            RmsNorm { .. } | Center | UnitSum | Softmax | AllReduce
+            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce
         )
     }
 }

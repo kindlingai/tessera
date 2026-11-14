@@ -1,8 +1,8 @@
 //! A kernel body as a tree, printed and costed.
 
 use crate::LANES;
-use crate::dialect::Text;
-use crate::form::Form;
+use crate::dialect::{self, Text};
+use crate::form::{Form, U8_FORM};
 use crate::kept::Layout;
 use std::collections::HashMap;
 
@@ -15,6 +15,8 @@ pub enum Ty {
     Bool,
     /// Four floats loaded at once.
     F32x4,
+    /// A pointer into a buffer's bytes.
+    Bytes,
 }
 
 impl Ty {
@@ -25,6 +27,7 @@ impl Ty {
             Ty::U64 => "u64",
             Ty::Bool => "bool",
             Ty::F32x4 => "float4",
+            Ty::Bytes => dialect::BYTES,
         }
     }
 }
@@ -40,6 +43,7 @@ pub enum BinOp {
     Shr,
     BitAnd,
     BitOr,
+    BitXor,
     Lt,
     Le,
     Gt,
@@ -62,6 +66,7 @@ impl BinOp {
             BinOp::Shr => ">>",
             BinOp::BitAnd => "&",
             BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
             BinOp::Lt => "<",
             BinOp::Le => "<=",
             BinOp::Gt => ">",
@@ -102,22 +107,19 @@ pub enum Intrinsic {
     Sin,
     /// `load4(buffer, index)`: four elements as floats.
     Load4,
-    LoadByte,
-    LoadU16,
-    LoadU32,
-    LoadPack4Aligned,
-    LoadPack4,
-    F16ToF32,
-    E4m3ToF32,
-    E2m1ToF32,
-    S8ToF32,
-    BitsToF32,
     /// `store4(buffer, index, value)`.
     Store4,
     /// A zeroed `float4`.
     Zero4,
     /// `kept_row(slot, position)`: the row the layout gives.
     KeptRow,
+    /// `p.word(offset)`: the u32 at a byte offset.
+    Word,
+    /// `x.to_bits()` and `f32::from_bits(x)`.
+    ToBits,
+    FromBits,
+    /// `F32x4::new(a, b, c, d)`.
+    Make4,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +139,8 @@ pub enum Expr {
     Call(Intrinsic, Vec<Expr>),
     /// `if cond { a } else { b }` as a value.
     Select(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// A helper call: its name, type and arguments.
+    Fn(String, Ty, Vec<Expr>),
 }
 
 impl Expr {
@@ -288,6 +292,18 @@ pub struct Body {
     pub stmts: Vec<Stmt>,
     /// The value a kernel called from another gives back.
     pub ret: Option<Expr>,
+    /// The helpers the body calls.
+    pub helpers: Vec<Helper>,
+}
+
+/// A function the text defines once and kernels call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Helper {
+    /// The name the text gives it.
+    pub name: String,
+    pub ret: Ty,
+    /// The parameters, statements and value.
+    pub body: Body,
 }
 
 /// Every name in scope and what it is.
@@ -311,7 +327,6 @@ struct Printer<'a> {
     lines: Vec<String>,
     indent: usize,
     lane: bool,
-    headers: Vec<String>,
     params: &'a [Param],
     layout: Option<&'static dyn Layout>,
 }
@@ -368,10 +383,10 @@ impl Printer<'_> {
             Expr::Var(name) => match self.kind(name) {
                 Kind::Value(ty) => ty,
                 Kind::Wide(_) => Ty::F32x4,
+                Kind::Buffer(form) if form.ty() == "u8" => Ty::Bytes,
                 other => panic!("`{name}` is {other:?}, not a value"),
             },
-            Expr::Neg(a) => self.ty(a),
-            Expr::Not(_) => Ty::Bool,
+            Expr::Neg(a) | Expr::Not(a) => self.ty(a),
             Expr::Bin(op, a, b) => match op.compares() {
                 true => Ty::Bool,
                 false => wider(self.ty(a), self.ty(b)),
@@ -386,15 +401,19 @@ impl Printer<'_> {
                 _ => Ty::F32,
             },
             Expr::Field(..) => Ty::F32,
-            Expr::Select(_, a, _) => self.ty(a),
+            Expr::Select(c, a, b) => match **c {
+                Expr::Bool(false) => self.ty(b),
+                _ => self.ty(a),
+            },
+            Expr::Fn(_, ty, _) => *ty,
             Expr::Call(i, _) => match i {
-                Intrinsic::Gid | Intrinsic::Lid | Intrinsic::Lane | Intrinsic::KeptRow => Ty::U32,
-                Intrinsic::LoadByte
-                | Intrinsic::LoadU16
-                | Intrinsic::LoadU32
-                | Intrinsic::LoadPack4Aligned
-                | Intrinsic::LoadPack4 => Ty::U32,
-                Intrinsic::Load4 | Intrinsic::Zero4 => Ty::F32x4,
+                Intrinsic::Gid
+                | Intrinsic::Lid
+                | Intrinsic::Lane
+                | Intrinsic::KeptRow
+                | Intrinsic::Word
+                | Intrinsic::ToBits => Ty::U32,
+                Intrinsic::Load4 | Intrinsic::Zero4 | Intrinsic::Make4 => Ty::F32x4,
                 _ => Ty::F32,
             },
         }
@@ -432,7 +451,11 @@ impl Printer<'_> {
             Expr::Bool(b) => b.to_string(),
             Expr::Var(name) => self.c_name(name),
             Expr::Neg(a) => format!("(-{})", self.expr(a)),
-            Expr::Not(a) => format!("(!{})", self.expr(a)),
+            // On an integer, `!` flips every bit.
+            Expr::Not(a) => match self.ty(a) {
+                Ty::Bool => format!("(!{})", self.expr(a)),
+                _ => format!("(~{})", self.expr(a)),
+            },
             Expr::Bin(op, a, b) => {
                 let (a, b) = (self.expr(a), self.expr(b));
                 format!("({a} {} {b})", op.c())
@@ -457,9 +480,18 @@ impl Printer<'_> {
                 }
             }
             Expr::Call(i, args) => self.call(*i, args),
+            // A choice settled at build time leaves one branch.
+            Expr::Select(c, a, b) if matches!(**c, Expr::Bool(_)) => {
+                let taken = if **c == Expr::Bool(true) { a } else { b };
+                self.expr(taken)
+            }
             Expr::Select(c, a, b) => {
                 let (c, a, b) = (self.expr(c), self.expr(a), self.expr(b));
                 format!("({c} ? {a} : {b})")
+            }
+            Expr::Fn(name, _, args) => {
+                let args: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+                format!("{name}({})", args.join(", "))
             }
         }
     }
@@ -486,42 +518,6 @@ impl Printer<'_> {
                 let (v, lo, hi) = (arg(self, 0), arg(self, 1), arg(self, 2));
                 format!("f_clamp({v}, {lo}, {hi})")
             }
-            Intrinsic::LoadByte
-            | Intrinsic::LoadU16
-            | Intrinsic::LoadU32
-            | Intrinsic::LoadPack4Aligned
-            | Intrinsic::LoadPack4 => {
-                let (name, at) = (arg(self, 0), arg(self, 1));
-                match i {
-                    Intrinsic::LoadByte => format!("((u32)({name})[{at}])"),
-                    Intrinsic::LoadU16 => format!("f_u16({name} + ({at}))"),
-                    Intrinsic::LoadU32 => format!("f_u32({name} + ({at}))"),
-                    Intrinsic::LoadPack4Aligned => format!("f_pack4_aligned({name} + ({at}))"),
-                    _ => format!("f_pack4({name} + ({at}))"),
-                }
-            }
-            Intrinsic::F16ToF32 | Intrinsic::E4m3ToF32 | Intrinsic::E2m1ToF32 => {
-                let (name, header) = match i {
-                    Intrinsic::F16ToF32 => {
-                        ("f_mini5_10", <graph::F16 as crate::block::Scale>::header())
-                    }
-                    Intrinsic::E4m3ToF32 => {
-                        ("f_mini4_3", <graph::E4M3 as crate::block::Scale>::header())
-                    }
-                    _ => (
-                        "f_mini2_1",
-                        <graph::E2M1 as crate::block::Code>::header().unwrap(),
-                    ),
-                };
-                if !self.headers.contains(&header) {
-                    self.headers.push(header);
-                }
-                format!("{name}({})", arg(self, 0))
-            }
-            Intrinsic::S8ToF32 => {
-                format!("((float)(((int)({} & 255u) ^ 128) - 128))", arg(self, 0))
-            }
-            Intrinsic::BitsToF32 => format!("f_bits({})", arg(self, 0)),
             Intrinsic::Load4 => {
                 let (form, at) = (self.buffer(&args[0]), arg(self, 1));
                 let Expr::Var(name) = &args[0] else {
@@ -537,6 +533,13 @@ impl Printer<'_> {
                 format!("f_f32x4({name} + {}) = {}", arg(self, 1), arg(self, 2))
             }
             Intrinsic::Zero4 => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
+            Intrinsic::Word => format!("f_u32(({} + {}))", arg(self, 0), arg(self, 1)),
+            Intrinsic::ToBits => format!("f_asbits({})", arg(self, 0)),
+            Intrinsic::FromBits => format!("f_bits({})", arg(self, 0)),
+            Intrinsic::Make4 => {
+                let parts = [0, 1, 2, 3].map(|n| arg(self, n));
+                format!("f_make4({})", parts.join(", "))
+            }
             Intrinsic::KeptRow => {
                 let (slot, position) = (arg(self, 0), arg(self, 1));
                 let layout = self
@@ -566,6 +569,7 @@ impl Printer<'_> {
                     // A zeroed four leaves the compiler to fill it.
                     (Expr::Call(Intrinsic::Zero4, _), _) => ("float4", None, Kind::Value(ty)),
                     (_, Some(form)) => (form.wide(), Some(self.expr(init)), Kind::Wide(form)),
+                    _ if ty == Ty::Bytes => (ty.c(), Some(self.expr(init)), Kind::Buffer(U8_FORM)),
                     _ => (ty.c(), Some(self.expr(init)), Kind::Value(ty)),
                 };
                 let name = self.declare(name, kind);
@@ -805,6 +809,7 @@ impl Printer<'_> {
 /// The wider of two types in arithmetic.
 fn wider(a: Ty, b: Ty) -> Ty {
     match (a, b) {
+        (Ty::Bytes, _) | (_, Ty::Bytes) => Ty::Bytes,
         (Ty::F32, _) | (_, Ty::F32) => Ty::F32,
         (Ty::U64, _) | (_, Ty::U64) => Ty::U64,
         (Ty::F32x4, _) | (_, Ty::F32x4) => Ty::F32x4,
@@ -838,21 +843,17 @@ impl Body {
             lines: Vec::new(),
             indent: 1,
             lane: false,
-            headers: Vec::new(),
             params: &self.params,
             layout: self.layout,
         };
         let (mut buffers, mut scalars) = (Vec::new(), Vec::new());
+        let mut helpers: Vec<Helper> = Vec::new();
         for param in p.params {
             match param {
                 Param::Buffer { name, form, writes } => {
                     p.bind(name, Kind::Buffer(*form));
                     buffers.push((name.clone(), form.ty(), *writes));
-                    for h in form.header() {
-                        if !p.headers.contains(&h) {
-                            p.headers.push(h);
-                        }
-                    }
+                    gather(&form.header(), &mut helpers);
                 }
                 Param::Scalar { name, ty } => {
                     p.bind(name, Kind::Value(*ty));
@@ -866,6 +867,7 @@ impl Body {
         for s in &self.stmts {
             p.stmt(s);
         }
+        gather(&self.helpers, &mut helpers);
         let mut lines = p.lines;
         if p.lane {
             lines.insert(0, format!("    u32 lane = gid % {LANES};"));
@@ -874,9 +876,58 @@ impl Body {
             entry: self.entry.clone(),
             buffers,
             scalars,
-            headers: p.headers,
+            headers: helpers.iter().map(Helper::text).collect(),
             body: lines.join("\n") + "\n",
         }
+    }
+}
+
+/// Adds each helper after the ones it calls, once each.
+fn gather(helpers: &[Helper], found: &mut Vec<Helper>) {
+    for h in helpers {
+        gather(&h.body.helpers, found);
+        match found.iter().find(|f| f.name == h.name) {
+            Some(f) => assert_eq!(*f, *h, "two helpers named `{}` differ", h.name),
+            None => found.push(h.clone()),
+        }
+    }
+}
+
+impl Helper {
+    /// The definition: `f_fn ret name(params) { .. }`.
+    pub fn text(&self) -> String {
+        let mut p = Printer {
+            scope: vec![HashMap::new()],
+            lines: Vec::new(),
+            indent: 1,
+            lane: false,
+            params: &self.body.params,
+            layout: None,
+        };
+        let mut params = Vec::new();
+        for param in p.params {
+            match param {
+                Param::Buffer { name, form, .. } => {
+                    p.bind(name, Kind::Buffer(*form));
+                    params.push(dialect::pointer(form.ty(), name));
+                }
+                Param::Scalar { name, ty } => {
+                    p.bind(name, Kind::Value(*ty));
+                    params.push(format!("{} {name}", ty.c()));
+                }
+                Param::Shared { name, .. } | Param::Tiles { name } | Param::Array { name, .. } => {
+                    panic!("`{}` takes `{name}` from a caller", self.name);
+                }
+            }
+        }
+        for s in &self.body.stmts {
+            p.stmt(s);
+        }
+        let value = self.body.ret.as_ref().expect("a helper has a value");
+        let value = p.expr(value);
+        p.line(format!("return {value};"));
+        assert!(!p.lane, "`{}` reads the lane: pass it in", self.name);
+        dialect::function(self.ret.c(), &self.name, &params, &p.lines)
     }
 }
 

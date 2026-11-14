@@ -1,19 +1,11 @@
 //! Storage forms: how buffers hold elements and reads decode them.
 
+use crate::ir::Helper;
 use graph::{Bf16 as Half, DType};
 use std::fmt;
 use std::sync::Mutex;
 
 pub use scattered_collect::declarative::{gather, scatter};
-
-/// How elements lie, and so which kernels can read them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Layout {
-    /// Rows of elements. Any kernel can index one.
-    Rows,
-    /// Whole tiles. A kernel written for them reads them.
-    Tiles { rows: usize, cols: usize },
-}
 
 /// Decodes its elements in kernel text and on the host.
 pub trait Form: Sync {
@@ -31,13 +23,19 @@ pub trait Form: Sync {
     /// `data` as the bytes of this form.
     fn pack(&self, data: &[f32]) -> Vec<u8>;
 
+    /// Whether floats can become this form. Codes cannot.
+    fn packs(&self) -> bool {
+        true
+    }
+
+    /// Whether a load decodes at length, so loops stay rolled.
+    fn heavy(&self) -> bool {
+        false
+    }
+
     /// Elements that share one scale, decoded together.
     fn block(&self) -> usize {
         1
-    }
-
-    fn layout(&self) -> Layout {
-        Layout::Rows
     }
 
     /// Elements a row's length must be a multiple of.
@@ -51,8 +49,8 @@ pub trait Form: Sync {
         (0..data.len()).map(|i| self.unpack(&packed, i)).collect()
     }
 
-    /// Kernel functions `load` calls, each defined once.
-    fn header(&self) -> Vec<String> {
+    /// The helpers `load` calls, each defined once.
+    fn header(&self) -> Vec<Helper> {
         Vec::new()
     }
 
@@ -105,8 +103,7 @@ pub trait Form: Sync {
 
     /// Whether `input` reads as `form`, when `weight` is this form.
     fn taken(&self, input: usize, weight: usize, form: &dyn Form) -> bool {
-        let rows = form.layout() == Layout::Rows;
-        rows && (!form.narrow() || (input == weight && form.name() == self.name()))
+        !form.narrow() || (input == weight && form.name() == self.name())
     }
 
     /// Bytes a matmul reads: the weight, then the rows.
@@ -187,6 +184,26 @@ pub struct F32;
 pub struct Bf16;
 /// Unsigned 32-bit ids.
 pub struct U32;
+/// Raw bytes, as a decode helper walks them.
+pub struct U8;
+
+/// The methods naming a form and its element.
+macro_rules! element {
+    ($name:literal, $dtype:ident, $bits:literal, $ty:literal) => {
+        fn name(&self) -> &'static str {
+            $name
+        }
+        fn dtype(&self) -> DType {
+            DType::$dtype
+        }
+        fn bits(&self) -> u32 {
+            $bits
+        }
+        fn ty(&self) -> &'static str {
+            $ty
+        }
+    };
+}
 
 fn word(bytes: &[u8], index: usize) -> u32 {
     let at = index * 4;
@@ -194,18 +211,7 @@ fn word(bytes: &[u8], index: usize) -> u32 {
 }
 
 impl Form for F32 {
-    fn name(&self) -> &'static str {
-        "f32"
-    }
-    fn dtype(&self) -> DType {
-        DType::F32
-    }
-    fn bits(&self) -> u32 {
-        24
-    }
-    fn ty(&self) -> &'static str {
-        "float"
-    }
+    element!("f32", F32, 24, "float");
     fn load(&self, name: &str, index: &str) -> String {
         format!("{name}[{index}]")
     }
@@ -221,18 +227,7 @@ impl Form for F32 {
 }
 
 impl Form for Bf16 {
-    fn name(&self) -> &'static str {
-        "bf16"
-    }
-    fn dtype(&self) -> DType {
-        DType::Bf16
-    }
-    fn bits(&self) -> u32 {
-        8
-    }
-    fn ty(&self) -> &'static str {
-        "u16"
-    }
+    element!("bf16", Bf16, 8, "u16");
     fn load(&self, name: &str, index: &str) -> String {
         format!("f_bits((u32){name}[{index}] << 16)")
     }
@@ -264,18 +259,7 @@ impl Form for Bf16 {
 }
 
 impl Form for U32 {
-    fn name(&self) -> &'static str {
-        "u32"
-    }
-    fn dtype(&self) -> DType {
-        DType::U32
-    }
-    fn bits(&self) -> u32 {
-        32
-    }
-    fn ty(&self) -> &'static str {
-        "u32"
-    }
+    element!("u32", U32, 32, "u32");
     fn load(&self, name: &str, index: &str) -> String {
         format!("{name}[{index}]")
     }
@@ -289,6 +273,19 @@ impl Form for U32 {
     }
 }
 
+impl Form for U8 {
+    element!("u8", U8, 8, "u8");
+    fn load(&self, name: &str, index: &str) -> String {
+        format!("{name}[{index}]")
+    }
+    fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
+        f32::from(bytes[index])
+    }
+    fn pack(&self, data: &[f32]) -> Vec<u8> {
+        data.iter().map(|x| *x as u8).collect()
+    }
+}
+
 crate::form!(F32);
 crate::form!(Bf16);
 crate::form!(U32);
@@ -297,3 +294,4 @@ crate::form!(U32);
 pub const F32_FORM: &dyn Form = &F32;
 pub const BF16_FORM: &dyn Form = &Bf16;
 pub const U32_FORM: &dyn Form = &U32;
+pub const U8_FORM: &dyn Form = &U8;

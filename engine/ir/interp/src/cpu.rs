@@ -189,9 +189,20 @@ pub(crate) fn stage(
         (Stage::RmsNorm { eps }, Some(w)) => {
             let w = w.floats()?;
             for row in out.chunks_mut(width) {
-                let mean = acc.sum(row.iter().map(|v| v * v)) / width as f32;
-                let inv = 1.0 / (mean + eps).sqrt();
+                let inv = rms_inverse(acc, row, *eps);
                 row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
+            }
+        }
+        (Stage::Hadamard { block }, _) => {
+            let block = *block as usize;
+            for span in out.chunks_mut(block) {
+                hadamard(span);
+            }
+        }
+        (Stage::Rms { eps }, _) => {
+            for row in out.chunks_mut(width) {
+                let inv = rms_inverse(acc, row, *eps);
+                row.iter_mut().for_each(|v| *v *= inv);
             }
         }
         (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
@@ -219,6 +230,47 @@ pub(crate) fn stage(
         _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
     Ok(Tensor::f32(x.shape.clone(), out))
+}
+
+/// The mean over `axis`, in fixed order.
+pub(crate) fn mean(n: &Numerics, x: &Tensor, axis: usize) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let count = x.shape[axis];
+    let inner: usize = x.shape[axis + 1..].iter().product();
+    let outer: usize = x.shape[..axis].iter().product();
+    let xs = x.floats()?;
+    let mut out = Vec::with_capacity(outer * inner);
+    for o in 0..outer {
+        for i in 0..inner {
+            let along = (0..count).map(|t| xs[(o * count + t) * inner + i]);
+            out.push(acc.sum(along) / count as f32);
+        }
+    }
+    let mut shape = x.shape.clone();
+    shape.remove(axis);
+    Ok(Tensor::f32(shape, out))
+}
+
+/// The Walsh-Hadamard transform of `x`, scaled to keep its norm.
+fn hadamard(x: &mut [f32]) {
+    let mut len = 1;
+    while len < x.len() {
+        for pair in x.chunks_mut(2 * len) {
+            let (low, high) = pair.split_at_mut(len);
+            for (a, b) in low.iter_mut().zip(high) {
+                (*a, *b) = (*a + *b, *a - *b);
+            }
+        }
+        len *= 2;
+    }
+    let scale = 1.0 / (x.len() as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= scale);
+}
+
+/// One over the row's root mean square.
+fn rms_inverse(acc: Acc, row: &[f32], eps: f32) -> f32 {
+    let mean = acc.sum(row.iter().map(|v| v * v)) / row.len() as f32;
+    1.0 / (mean + eps).sqrt()
 }
 
 pub(crate) fn gather(table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {

@@ -4,7 +4,7 @@ use crate::per_row;
 use codegen::prelude::*;
 use graph::Stage;
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
+use lower::{Draft, Kernel, T, Tree};
 use sim::Load;
 
 /// One thread per row: peak, sum, then the probabilities.
@@ -28,38 +28,16 @@ fn softmax(x: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32) {
 }
 
 /// One thread turns each row into probabilities.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(softmax, threads = self.rows, load = softmax_load)]
 pub struct Softmax {
     pub rows: usize,
     pub width: usize,
 }
 
-impl Kernel for Softmax {
-    fn name(&self) -> &'static str {
-        "softmax"
-    }
-
-    /// Finds each row's maximum, then takes two exponentials.
-    fn load(&self, _: usize) -> Option<Load> {
-        Some(per_row(self.rows, self.width, softmax_ir().trip(), 0.0))
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.rows, self.width]
-    }
-
-    fn source(&self) -> Source {
-        Source::named(softmax_ir(), "plan_softmax")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [self.rows, self.width].map(Arg::count);
-        let buffers = [step.read(0), step.out()];
-        vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
-            shape: Shape::Line(self.rows),
-        }]
-    }
+/// Finds each row's maximum, then takes two exponentials.
+fn softmax_load(k: &Softmax, _: usize) -> Option<Load> {
+    Some(per_row(k.rows, k.width, softmax_ir().trip(), 0.0))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

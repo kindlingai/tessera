@@ -19,6 +19,20 @@ pub struct Text {
     pub body: String,
 }
 
+/// A pointer to a buffer's bytes.
+pub const BYTES: &str = "f_const(u8)";
+
+/// A helper's buffer parameter: a pointer to `ty`.
+pub fn pointer(ty: &str, name: &str) -> String {
+    format!("f_const({ty}) {name}")
+}
+
+/// A function defined once, called from kernel bodies.
+pub fn function(ret: &str, name: &str, params: &[String], lines: &[String]) -> String {
+    let (params, lines) = (params.join(", "), lines.join("\n"));
+    format!("f_fn {ret} {name}({params}) {{\n{lines}\n}}\n")
+}
+
 /// The names a body may use, spelled per dialect.
 const NAMES: &[(&str, &str, &str)] = &[
     ("u64", "unsigned long", "unsigned long long"),
@@ -36,6 +50,7 @@ const NAMES: &[(&str, &str, &str)] = &[
     ("f_cos(x)", "precise::cos(x)", "cosf(x)"),
     ("f_sin(x)", "precise::sin(x)", "sinf(x)"),
     ("f_bits(x)", "as_type<float>(x)", "__uint_as_float(x)"),
+    ("f_asbits(x)", "as_type<u32>(x)", "__float_as_uint(x)"),
     ("f_rsqrt(x)", "rsqrt(x)", "rsqrtf(x)"),
     (
         "f_barrier()",
@@ -68,6 +83,11 @@ const NAMES: &[(&str, &str, &str)] = &[
         "(((u64)(p) & 3u) == 0u ? (*(const u32 *)(p)) : ((u32)(p)[0] | ((u32)(p)[1] << 8) | ((u32)(p)[2] << 16) | ((u32)(p)[3] << 24)))",
     ),
     ("f_f32x4(p)", "(*(device float4 *)(p))", "(*(float4 *)(p))"),
+    (
+        "f_u32(p)",
+        "(*(device const u32 *)(p))",
+        "(*(const u32 *)(p))",
+    ),
     (
         "f_u32x2(p)",
         "(*(device const uint2 *)(p))",

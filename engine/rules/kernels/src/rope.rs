@@ -3,7 +3,7 @@
 use codegen::prelude::*;
 use graph::{Pairs, Stage};
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Read, Shape, Source, Step, T, Tree};
+use lower::{Draft, Kernel, Read, T, Tree};
 
 /// One thread per position, head and pair, rotating in place.
 #[kernel]
@@ -40,74 +40,21 @@ fn angles(positions: Buf<U32>, mut out: BufMut<F32>, count: u32, width: u32, the
 }
 
 /// Each position's cosine and sine, per pair.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(angles, threads = self.count * self.width / 2, shared)]
 pub struct Angles {
+    pub count: usize,
     pub width: usize,
     pub theta: f32,
 }
 
 /// Rotates halves in place, by the second input's angles.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(rope, threads = self.positions * self.heads * self.width / 2, overwrites)]
 pub struct Rope {
     pub positions: usize,
     pub heads: usize,
     pub width: usize,
-}
-
-impl Kernel for Angles {
-    fn name(&self) -> &'static str {
-        "angles"
-    }
-
-    fn source(&self) -> Source {
-        Source::named(angles_ir(), "plan_angles")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let positions = step.reads[0].len;
-        let sizes = [
-            Arg::count(positions),
-            Arg::count(self.width),
-            Arg::value(&self.theta),
-        ];
-        let buffers = [step.read(0), step.out()];
-        vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
-            shape: Shape::Line(positions * self.width / 2),
-        }]
-    }
-
-    /// One table serves every rotation that matches.
-    fn shared(&self) -> bool {
-        true
-    }
-}
-
-impl Kernel for Rope {
-    fn name(&self) -> &'static str {
-        "rope"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.positions, self.heads, self.width]
-    }
-
-    fn source(&self) -> Source {
-        Source::named(rope_ir(), "plan_rope")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [self.positions, self.heads, self.width].map(Arg::count);
-        let buffers = [step.read(0), step.read(1)];
-        vec![Launch {
-            args: buffers.into_iter().chain(sizes).collect(),
-            shape: Shape::Line(self.positions * self.heads * self.width / 2),
-        }]
-    }
-
-    fn overwrites(&self) -> bool {
-        true
-    }
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -124,7 +71,11 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if pairs != Pairs::Halves {
         return None;
     }
-    let angles = Angles { width, theta };
+    let angles = Angles {
+        count: positions,
+        width,
+        theta,
+    };
     let rope = Rope {
         positions,
         heads: len / (positions * width),

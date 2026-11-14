@@ -70,6 +70,16 @@ impl Tensor {
         self.stage(Stage::RmsNorm { eps }, &[&w.0])
     }
 
+    /// The row over its root mean square, with no weight.
+    pub fn rms(&self, eps: f32) -> Tensor {
+        self.stage(Stage::Rms { eps }, &[])
+    }
+
+    /// The scaled Walsh-Hadamard transform of each `block` of the row.
+    pub fn hadamard(&self, block: u32) -> Tensor {
+        self.stage(Stage::Hadamard { block }, &[])
+    }
+
     pub fn center(&self) -> Tensor {
         self.stage(Stage::Center, &[])
     }
@@ -127,6 +137,11 @@ impl Tensor {
     /// Writes rows by slot and position. Returns the kept rows.
     pub fn append(&self, kept: &Kept, [slots, positions]: [&Tensor; 2]) -> Tensor {
         self.op(Op::Append(kept.0), &[slots, positions])
+    }
+
+    /// The mean over `axis`. The axis goes away.
+    pub fn mean(&self, axis: u32) -> Tensor {
+        self.op(Op::Mean(axis), &[])
     }
 
     pub fn cast(&self, dtype: DType) -> Tensor {

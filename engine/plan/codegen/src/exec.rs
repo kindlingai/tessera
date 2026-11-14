@@ -201,7 +201,11 @@ impl Group<'_, '_> {
             Expr::Not(a) => {
                 let mut v = self.eval(a, mask);
                 for x in &mut v {
-                    *x = Val::B(!x.b());
+                    *x = match *x {
+                        Val::U(u) => Val::U(!u),
+                        Val::L(l) => Val::L(!l),
+                        other => Val::B(!other.b()),
+                    };
                 }
                 v
             }
@@ -287,6 +291,7 @@ impl Group<'_, '_> {
                     .collect()
             }
             Expr::Call(i, args) => self.call(*i, args, mask),
+            Expr::Fn(name, ..) => panic!("`{name}` runs on the device: forms unpack on the host"),
         }
     }
 
@@ -428,6 +433,36 @@ impl Group<'_, '_> {
                 vec![Val::B(false); n]
             }
             Intrinsic::Zero4 => vec![Val::V([0.0; 4]); n],
+            Intrinsic::Make4 => {
+                let parts: Vec<Vec<Val>> = args.iter().map(|a| self.eval(a, mask)).collect();
+                (0..n)
+                    .map(|t| Val::V([0, 1, 2, 3].map(|i| parts[i][t].f())))
+                    .collect()
+            }
+            Intrinsic::ToBits => {
+                let v = self.eval(&args[0], mask);
+                v.into_iter().map(|x| Val::U(x.f().to_bits())).collect()
+            }
+            Intrinsic::FromBits => {
+                let v = self.eval(&args[0], mask);
+                v.into_iter()
+                    .map(|x| Val::F(f32::from_bits(x.u())))
+                    .collect()
+            }
+            Intrinsic::Word => {
+                let Expr::Var(name) = &args[0] else {
+                    panic!("a word read names its buffer");
+                };
+                let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
+                let bytes = &self.buffers[arg.buffer];
+                (0..n)
+                    .map(|t| {
+                        let at = arg.skip + at[t].u() as usize;
+                        let raw = bytes[at..at + 4].try_into().expect("4 bytes");
+                        Val::U(u32::from_le_bytes(raw))
+                    })
+                    .collect()
+            }
             Intrinsic::KeptRow => {
                 let layout = self
                     .layout
@@ -778,6 +813,7 @@ fn binary(op: BinOp, a: Val, b: Val) -> Val {
                 BinOp::Shr => x >> y,
                 BinOp::BitAnd => x & y,
                 BinOp::BitOr => x | y,
+                BinOp::BitXor => x ^ y,
                 other => panic!("{other:?} on integers"),
             })
         }
@@ -793,6 +829,7 @@ fn binary(op: BinOp, a: Val, b: Val) -> Val {
                 BinOp::Shr => x >> y,
                 BinOp::BitAnd => x & y,
                 BinOp::BitOr => x | y,
+                BinOp::BitXor => x ^ y,
                 other => panic!("{other:?} on integers"),
             })
         }

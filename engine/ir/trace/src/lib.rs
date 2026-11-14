@@ -14,7 +14,7 @@ pub use graph::{
 pub use model::{Kept, Model};
 pub use tensor::Tensor;
 pub use trace_derive::Weights;
-pub use weights::{Embed, Linear, Linears, Norm, Scalar, Vector, Weights, declare};
+pub use weights::{Embed, Linear, Linears, Norm, Scalar, Vector, Weights, declare, each};
 
 #[cfg(test)]
 mod trace_test;

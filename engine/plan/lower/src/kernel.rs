@@ -73,6 +73,15 @@ pub struct Needs {
 }
 
 impl Needs {
+    /// A SIMD group per row, in groups of 256 threads.
+    pub fn lanes() -> Self {
+        Needs {
+            lanes: codegen::LANES,
+            group_threads: 256,
+            ..Needs::default()
+        }
+    }
+
     /// Hand-written kernels ask for a compiler, nothing else.
     pub fn text() -> Self {
         Needs {

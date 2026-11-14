@@ -1,8 +1,8 @@
 //! What a kernel declares: its arguments, shape and source.
 
 use crate::extent::Extent;
-use crate::plan::Slot;
-use codegen::ir::Body;
+use crate::plan::{Slot, Step};
+use codegen::ir::{Body, Param};
 use codegen::{Dialect, hash};
 use graph::DimName;
 
@@ -55,6 +55,47 @@ impl Arg {
     }
 }
 
+impl From<usize> for Shape {
+    fn from(n: usize) -> Shape {
+        Shape::Line(n)
+    }
+}
+
+impl From<Extent> for Shape {
+    fn from(e: Extent) -> Shape {
+        Shape::line(e)
+    }
+}
+
+/// A kernel struct's field as a scalar argument.
+pub trait ToArg {
+    fn arg(&self) -> Arg;
+}
+
+impl ToArg for usize {
+    fn arg(&self) -> Arg {
+        Arg::count(*self)
+    }
+}
+
+impl ToArg for u32 {
+    fn arg(&self) -> Arg {
+        Arg::value(self)
+    }
+}
+
+impl ToArg for f32 {
+    fn arg(&self) -> Arg {
+        Arg::value(self)
+    }
+}
+
+impl ToArg for Extent {
+    fn arg(&self) -> Arg {
+        Arg::size(*self)
+    }
+}
+
 impl Shape {
     /// A line of `e` threads, plain when known.
     pub fn line(e: Extent) -> Shape {
@@ -86,6 +127,27 @@ pub struct Launch {
 }
 
 impl Launch {
+    /// `body`'s arguments: buffers from `step`, scalars by name.
+    pub fn of(
+        body: &Body,
+        step: &Step,
+        overwrites: bool,
+        scalar: &dyn Fn(&str) -> Arg,
+        shape: Shape,
+    ) -> Launch {
+        let mut reads = 0..;
+        let mut args = Vec::with_capacity(body.params.len());
+        for p in &body.params {
+            args.push(match p {
+                Param::Buffer { writes: true, .. } if !overwrites => step.out(),
+                Param::Buffer { .. } => step.read(reads.next().expect("reads")),
+                Param::Scalar { name, .. } => scalar(name),
+                _ => continue,
+            });
+        }
+        Launch { args, shape }
+    }
+
     /// The same launch with every runtime size filled in.
     pub fn bound(self, size: &dyn Fn(DimName) -> Option<u32>) -> Option<Launch> {
         let count = |e: &Extent| Some(e.value(size)? as u32);

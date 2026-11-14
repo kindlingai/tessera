@@ -13,6 +13,10 @@ where possible. No historical commentary. Comments are intentionally limited - c
 Excessive code duplication is strictly checked. Use macros if duplicate detectors fire. Never change lint
 rules or add exceptions without a project maintainer's _human_ approval.
 
+Do not use strings for composing large chunks of code - use structured macros instead.
+
+Prefer procedural loops over functional ones when heavily nested (eg `for` and `if` over `iter` and `map`/`filter`).
+
 ## Code shape
 
 `cargo run -p tessera-lint` checks these, and CI fails on any breach. The limits live in `lint.toml`.

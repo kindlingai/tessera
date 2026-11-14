@@ -7,7 +7,7 @@ use crate::kernels::MapStage;
 use crate::select::Home;
 use crate::sites::Pattern;
 use codegen::kept::Layout;
-use graph::{Attend, DType, DimName, Graph, NodeId, Op, Select, Shape, Stage, View};
+use graph::{DType, DimName, Graph, NodeId, Op, Shape, Stage};
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -18,16 +18,10 @@ pub struct T(pub u32);
 pub enum Term {
     /// A weight or an input, there before any launch.
     Leaf(Home),
-    Matmul,
     /// One stage of a row.
     Stage(Stage),
-    Attend(Attend),
-    Gather,
-    Top,
-    /// New rows joining the kept rows of this index.
-    Append(u32),
-    /// Its argument under another shape.
-    View,
+    /// Any other op, as the graph has it.
+    Op(Op),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -212,12 +206,7 @@ impl<'a> Tree<'a> {
                     push(Term::Leaf(Home::Input(*port)), args)
                 }
                 Op::Weight(w) => push(Term::Leaf(Home::Weight(*w)), args),
-                Op::View(View::Reshape(_)) => push(Term::View, args),
-                Op::Matmul => push(Term::Matmul, args),
-                Op::Attend(a) => push(Term::Attend(a.clone()), args),
-                Op::Select(Select::Gather) => push(Term::Gather, args),
-                Op::Select(Select::TopK { .. }) => push(Term::Top, args),
-                Op::Append(kept) => push(Term::Append(*kept), args),
+                Op::Input { .. } => return unsupported(&n.op),
                 Op::Row(r) => {
                     let (mut cur, mut rest) = (args[0], args[1..].iter());
                     // One rank holds the whole sum already.
@@ -229,7 +218,7 @@ impl<'a> Tree<'a> {
                     }
                     cur
                 }
-                other => return unsupported(other),
+                op => push(Term::Op(op.clone()), args),
             });
         }
         tree.readers = vec![0; tree.nodes.len()];
@@ -278,7 +267,7 @@ impl<'a> Tree<'a> {
 
     /// Whether the value must have a buffer of its own.
     pub fn root(&self, t: T) -> bool {
-        let kept = matches!(self.node(t).term, Term::Leaf(_) | Term::Append(_));
+        let kept = matches!(self.node(t).term, Term::Leaf(_) | Term::Op(Op::Append(_)));
         kept || self.readers[t.0 as usize] != 1 || self.output(t)
     }
 

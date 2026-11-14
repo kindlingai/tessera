@@ -3,6 +3,7 @@ use crate::form::Form;
 use crate::kernels::MapStage;
 use crate::rule::Read;
 use crate::tree::{T, Term, Tree};
+use graph::Op;
 
 /// `x[m, k]` times `w[n, k]` transposed, `w` stored as `form`.
 #[derive(Clone, Copy, Debug)]
@@ -18,7 +19,7 @@ pub struct Matmul {
 impl Pattern for Matmul {
     fn find(tree: &Tree, at: T) -> Option<Self> {
         let node = tree.node(at);
-        if node.term != Term::Matmul {
+        if node.term != Term::Op(Op::Matmul) {
             return None;
         }
         let (x, w) = (node.args[0], node.args[1]);

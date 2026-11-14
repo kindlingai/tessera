@@ -2,10 +2,10 @@
 
 use crate::form;
 use std::marker::PhantomData;
-use std::ops::{Index, IndexMut};
+use std::ops::{Add, Index, IndexMut};
 
 pub use crate::LANES;
-pub use kernel_macro::kernel;
+pub use kernel_macro::{helper, kernel};
 
 /// The register type one element reads into.
 pub trait Elems {
@@ -20,6 +20,8 @@ pub trait Form: Elems {
 pub struct F32;
 pub struct Bf16;
 pub struct U32;
+/// Bytes a decode helper walks. Reads widen to u32.
+pub struct U8;
 /// A float buffer whose `#[form(..)]` picks the form.
 pub struct Dyn;
 
@@ -33,6 +35,10 @@ impl Elems for Bf16 {
 }
 
 impl Elems for U32 {
+    type Elem = u32;
+}
+
+impl Elems for U8 {
     type Elem = u32;
 }
 
@@ -52,6 +58,10 @@ impl Form for U32 {
     const FORM: &'static dyn form::Form = form::U32_FORM;
 }
 
+impl Form for U8 {
+    const FORM: &'static dyn form::Form = form::U8_FORM;
+}
+
 /// A float4, loaded or stored in one go.
 #[derive(Clone, Copy, Default)]
 pub struct F32x4 {
@@ -65,10 +75,14 @@ impl F32x4 {
     pub fn zero() -> Self {
         Self::default()
     }
+
+    pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
+        Self { x, y, z, w }
+    }
 }
 
 /// Runs only on the device.
-fn device() -> ! {
+pub(crate) fn device() -> ! {
     unreachable!("kernel bodies run on the device")
 }
 
@@ -131,6 +145,20 @@ impl<F: Elems> Buf<F> {
 
     /// Elements `at` to `at + 3`, within one line.
     pub fn load4(&self, _: u64) -> F32x4 {
+        device()
+    }
+
+    /// The u32 at byte `offset`, a multiple of 4.
+    pub fn word(&self, _: u32) -> u32 {
+        device()
+    }
+}
+
+/// The buffer from element `n` on.
+impl<F: Elems> Add<u64> for Buf<F> {
+    type Output = Self;
+
+    fn add(self, _: u64) -> Self {
         device()
     }
 }

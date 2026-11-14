@@ -105,7 +105,7 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
 fn arity(op: &Op) -> usize {
     match op {
         Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) => 1,
+        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) | Op::Mean(_) => 1,
         Op::Append(_) => 3,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
@@ -154,6 +154,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Select(s) => select::select(&g.dims, s, args),
         Op::View(View::Concat) => concat(&g.dims, args[0], args[1]),
         Op::View(v) => view(&g.dims, v, args[0]),
+        Op::Mean(axis) => mean(*axis, args[0]),
         Op::Cast(dtype) => {
             // Rounding each rank's share is not rounding the sum.
             need(
@@ -357,6 +358,18 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 )?;
                 whole(p, last, s)?;
             }
+            (Stage::Rms { eps }, _) => {
+                finite(*eps, "norm epsilon")?;
+                whole(p, last, s)?;
+            }
+            (Stage::Hadamard { block }, _) => {
+                let width = x.shape.0.last().expect("rank checked");
+                let fits = block.is_power_of_two() && blocks(dims, width, *block)?;
+                need(fits, ErrorKind::Shape, || {
+                    format!("rows of {width} do not hold whole blocks of {block}")
+                })?;
+                whole(p, last, s)?;
+            }
             (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
             (Stage::Rope { theta, .. }, Some(pos)) => {
                 need(theta.is_finite() && *theta > 0.0, ErrorKind::Value, || {
@@ -417,6 +430,37 @@ fn shift(q: Placement, lead: usize) -> Placement {
         },
         q => q,
     }
+}
+
+/// `x` without `axis`, as a sum over whole values.
+fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
+    need(x.dtype.is_float(), ErrorKind::DType, || {
+        format!("a mean needs floats, got {:?}", x.dtype)
+    })?;
+    need((axis as usize) < x.rank(), ErrorKind::Shape, || {
+        format!("no axis {axis} in {}", x.shape)
+    })?;
+    need(
+        x.placement != Placement::Partial,
+        ErrorKind::Placement,
+        || "a mean cannot read partial sums".into(),
+    )?;
+    let mut shape = x.shape.0.clone();
+    shape.remove(axis as usize);
+    Ok(TensorType {
+        shape: Shape(shape),
+        ..x.clone()
+    })
+}
+
+/// Whether a known `width` is a multiple of `block`.
+fn blocks(dims: &[Dim], width: &DimExpr, block: u32) -> Result<bool, TypeError> {
+    let n = width.poly(dims).map_err(|d| TypeError {
+        kind: ErrorKind::Reference,
+        message: format!("{d:?} is not a dimension"),
+    })?;
+    Ok(n.as_const()
+        .is_none_or(|n| n.is_multiple_of(u64::from(block))))
 }
 
 fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {

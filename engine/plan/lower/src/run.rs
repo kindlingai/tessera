@@ -139,6 +139,24 @@ pub trait Run {
     /// How the hardware's tiles round.
     fn precision(&self) -> Precision;
 
+    /// Uploads one weight already in its form's bytes.
+    fn load_packed(&mut self, weight: u32, bytes: &[u8]) -> Result<(), Error> {
+        let slots: Vec<Slot> = (self.plan().weights.iter())
+            .filter(|l| l.weight == weight)
+            .map(|l| l.slot)
+            .collect();
+        for slot in slots {
+            if slot.form.bytes(slot.len) != bytes.len() {
+                return Err(Error::Size(format!(
+                    "weight {weight} as {}",
+                    slot.form.name()
+                )));
+            }
+            self.held_mut().upload(slot, bytes)?;
+        }
+        Ok(())
+    }
+
     /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
         let plain = slot.form.block() == 1 && src.dtype() == slot.form.dtype();

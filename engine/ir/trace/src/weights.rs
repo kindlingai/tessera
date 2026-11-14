@@ -2,7 +2,7 @@
 
 use crate::model::Model;
 use crate::tensor::Tensor;
-use graph::{DType, DimExpr, PathSeg, Shape, TensorType};
+use graph::{DType, DimExpr, DimName, PathSeg, Shape, TensorType};
 
 /// Declares weights under `path`, shaped by the field's `#[shape]`.
 pub trait Weights: Sized {
@@ -12,6 +12,24 @@ pub trait Weights: Sized {
 /// Declares a whole weight tree from the root.
 pub fn declare<W: Weights>(m: &Model) -> W {
     W::declare(m, &mut Vec::new(), &[])
+}
+
+/// `count` items under `name`, each shaped by `shape(index)`.
+pub fn each<T: Weights>(
+    m: &Model,
+    name: &str,
+    count: DimName,
+    shape: impl Fn(u32) -> Vec<DimExpr>,
+) -> Vec<T> {
+    let mut path = vec![PathSeg::Field(name.into())];
+    (0..m.size(count) as u32)
+        .map(|i| {
+            path.push(PathSeg::Index(i));
+            let item = T::declare(m, &mut path, &shape(i));
+            path.pop();
+            item
+        })
+        .collect()
 }
 
 /// `#[shape(In, Out)]`, stored `[Out, In]` as checkpoints do.

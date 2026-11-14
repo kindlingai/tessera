@@ -225,7 +225,7 @@ impl Walk<'_> {
                 self.terms.lane += 5.0 * self.times;
                 args.iter().for_each(|a| self.expr(a));
             }
-            Expr::Call(_, args) => args.iter().for_each(|a| self.expr(a)),
+            Expr::Call(_, args) | Expr::Fn(_, _, args) => args.iter().for_each(|a| self.expr(a)),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);

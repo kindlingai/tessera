@@ -92,6 +92,6 @@ pub fn forms(k: usize) -> Vec<&'static dyn lower::Form> {
         .iter()
         .filter(fits)
         .copied()
-        .filter(|f| f.dtype().is_float())
+        .filter(|f| f.dtype().is_float() && f.packs())
         .collect()
 }

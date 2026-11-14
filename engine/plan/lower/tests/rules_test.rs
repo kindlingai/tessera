@@ -5,7 +5,7 @@ use kernels as _;
 use linear as _;
 
 use gpukit::testing::{Noise, max_abs_diff};
-use graph::DimName::{Context, HeadDim, Heads, Rows, Seqs, Vocab};
+use graph::DimName::{Context, HeadDim, Heads, Hidden, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Tensor, run};
 use lower::form::BF16_FORM;
@@ -16,7 +16,7 @@ use trace::{EntryKind, Mask, Model, Port, Role};
 
 const SIZES: [(DimName, u64); 3] = [(Seqs, 2), (Rows, 3), (Context, 5)];
 
-/// Fewer queries than keys, then a softmax.
+/// Fewer queries than keys, then a softmax and a mean.
 fn decode() -> Graph {
     let dim = |name, size| Dim { name, size };
     let bounded = [(Seqs, 4), (Rows, 8), (Context, 16)];
@@ -32,7 +32,7 @@ fn decode() -> Graph {
         [port(Rows), port(Context), port(Context)],
     );
     let out = m.attend(Mask::Causal, 0.5, [&q, &k, &v], None).softmax();
-    m.finish([(Role::Logits, &out)])
+    m.finish([(Role::Logits, &out), (Role::Logits, &out.mean(1))])
 }
 
 /// Each row's likeliest entry, over more entries than threads.
@@ -50,6 +50,21 @@ fn likeliest() -> Graph {
     m.finish([(Role::Tokens, &logits.top_k(1u64))])
 }
 
+/// Rows of 256, rotated in two blocks.
+fn rotated() -> Graph {
+    let dim = |name, size| Dim { name, size };
+    let bounded = |name| dim(name, Size::Bounded(8));
+    let m = Model::new(vec![
+        bounded(Seqs),
+        bounded(Rows),
+        dim(Hidden, Size::Fixed(256)),
+    ]);
+    let ty = TensorType::new([Seqs, Rows, Hidden], DType::F32);
+    let role = Role::Logits;
+    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
+    m.finish([(Role::Logits, &x.hadamard(128))])
+}
+
 /// A toy of each model, and ops neither one uses.
 fn graphs() -> Vec<Graph> {
     let stack = Stack {
@@ -64,7 +79,13 @@ fn graphs() -> Vec<Graph> {
     };
     let tiny = nanogpt::Config { stack, eps: 1e-5 };
     let qwen = qwen3::program(&qwen3::Config::toy(4, 16));
-    vec![qwen, nanogpt::program(&tiny), decode(), likeliest()]
+    vec![
+        qwen,
+        nanogpt::program(&tiny),
+        decode(),
+        likeliest(),
+        rotated(),
+    ]
 }
 
 /// Random floats, or ids below 8, shaped like `ty`.

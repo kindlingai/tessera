@@ -1,10 +1,10 @@
 //! EmbeddingGemma 2: a bidirectional encoder with per-layer embeddings.
 
-use crate::shared::{Stack, tokens};
+use crate::shared::{Dense, Stack, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
-    Scalar, Tensor, Weights,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, PathSeg, Role, Scalar,
+    Tensor, Weights, each,
 };
 
 pub struct Config {
@@ -58,162 +58,105 @@ impl Config {
         (l + 1).is_multiple_of(self.full_every)
     }
 
-    fn full_layers(&self) -> u64 {
-        (0..self.stack.layers).filter(|&l| self.full(l)).count() as u64
+    /// Layer `l`'s head width and key head count.
+    pub fn heads(&self, l: u64) -> [DimExpr; 2] {
+        match self.full(l) {
+            true => [FullHeadDim.into(), 1u64.into()],
+            false => [HeadDim.into(), KvHeads.into()],
+        }
     }
 
     pub fn dims(&self) -> Vec<Dim> {
-        let full = self.full_layers();
         self.stack.dims(&[
             (KvHeads, self.kv_heads),
             (FullHeadDim, self.full_head_dim),
             (PerLayer, self.per_layer),
             (Embedding, self.embedding),
-            (SlidingLayers, self.stack.layers - full),
-            (FullLayers, full),
         ])
     }
-
-    /// The layer the n-th sliding or full attention serves.
-    pub fn layer_of(&self, full: bool, n: u64) -> u64 {
-        let kind = |l: &u64| self.full(*l) == full;
-        (0..self.stack.layers).filter(kind).nth(n as usize).unwrap()
-    }
 }
 
-/// An attention's weights, as the layer kinds share them.
-struct Parts<'a> {
-    ln: &'a Norm,
-    q: &'a Linear,
-    k: &'a Linear,
-    v: &'a Linear,
-    q_norm: &'a Norm,
-    k_norm: &'a Norm,
-    v_norm: &'a Norm,
-    o: &'a Linear,
-    post: &'a Norm,
-    head: DimExpr,
-    kv_heads: DimExpr,
-    theta: f32,
-    mask: Mask,
+/// One layer's attention: `S0` head width, `S1` key heads.
+#[derive(Weights)]
+pub struct Attention<D: Dense> {
+    #[shape(Hidden)]
+    pub ln: Norm,
+    #[shape(Hidden, Heads * S0)]
+    pub q: D,
+    #[shape(Hidden, S1 * S0)]
+    pub k: D,
+    #[shape(Hidden, S1 * S0)]
+    pub v: D,
+    #[shape(S0)]
+    pub q_norm: Norm,
+    #[shape(S0)]
+    pub k_norm: Norm,
+    #[shape(Heads * S0, Hidden)]
+    pub o: D,
+    #[shape(Hidden)]
+    pub post: Norm,
 }
-
-macro_rules! attention {
-    ($name:ident, $head:ident, $kv:expr) => {
-        #[derive(Weights)]
-        pub struct $name {
-            #[shape(Hidden)]
-            pub ln: Norm,
-            #[shape(Hidden, Heads * $head)]
-            pub q: Linear,
-            #[shape(Hidden, $kv)]
-            pub k: Linear,
-            #[shape(Hidden, $kv)]
-            pub v: Linear,
-            #[shape($head)]
-            pub q_norm: Norm,
-            #[shape($head)]
-            pub k_norm: Norm,
-            /// All ones: the checkpoint has no weight.
-            #[shape($head)]
-            pub v_norm: Norm,
-            #[shape(Heads * $head, Hidden)]
-            pub o: Linear,
-            #[shape(Hidden)]
-            pub post: Norm,
-        }
-
-        impl $name {
-            fn parts(&self, kv_heads: DimExpr, theta: f32, mask: Mask) -> Parts<'_> {
-                Parts {
-                    ln: &self.ln,
-                    q: &self.q,
-                    k: &self.k,
-                    v: &self.v,
-                    q_norm: &self.q_norm,
-                    k_norm: &self.k_norm,
-                    v_norm: &self.v_norm,
-                    o: &self.o,
-                    post: &self.post,
-                    head: $head.into(),
-                    kv_heads,
-                    theta,
-                    mask,
-                }
-            }
-        }
-    };
-}
-
-attention!(Sliding, HeadDim, KvHeads * HeadDim);
-attention!(Full, FullHeadDim, FullHeadDim);
 
 #[derive(Weights)]
-pub struct Layer {
+pub struct Layer<D: Dense> {
     #[shape(Hidden)]
     pub pre_ff: Norm,
     #[shape(Hidden, Ffn)]
-    pub gate: Linear,
+    pub gate: D,
     #[shape(Hidden, Ffn)]
-    pub up: Linear,
+    pub up: D,
     #[shape(Ffn, Hidden)]
-    pub down: Linear,
+    pub down: D,
     #[shape(Hidden)]
     pub post_ff: Norm,
     /// This layer's rows of the shared per-layer projection.
     #[shape(Hidden, PerLayer)]
-    pub ple_in: Linear,
+    pub ple_in: D,
     #[shape(Hidden, PerLayer)]
-    pub ple_gate: Linear,
+    pub ple_gate: D,
     #[shape(PerLayer, Hidden)]
-    pub ple_proj: Linear,
+    pub ple_proj: D,
     #[shape(Hidden)]
     pub ple_norm: Norm,
     #[shape()]
     pub scalar: Scalar,
 }
 
+/// The weights outside attention. `D` is how matrices are stored.
 #[derive(Weights)]
-pub struct Eg2 {
+pub struct Eg2<D: Dense> {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
-    #[shape(SlidingLayers)]
-    pub sliding: Vec<Sliding>,
-    #[shape(FullLayers)]
-    pub full: Vec<Full>,
     #[shape(Layers)]
-    pub layers: Vec<Layer>,
+    pub layers: Vec<Layer<D>>,
     #[shape(PerLayer)]
     pub ple_norm: Norm,
     #[shape(Hidden)]
     pub norm: Norm,
     #[shape(Hidden, Embedding)]
-    pub proj: Linear,
+    pub proj: D,
+}
+
+/// Each layer's attention, shaped for its kind.
+pub fn attention<D: Dense>(m: &Model, c: &Config) -> Vec<Attention<D>> {
+    each(m, "attention", Layers, |l| c.heads(u64::from(l)).to_vec())
 }
 
 /// The residual stream after every layer, `[Seqs, Context, Hidden]`.
-pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor) -> Tensor {
+pub fn trunk<D: Dense>(
+    m: &Model,
+    c: &Config,
+    w: &Eg2<D>,
+    attention: &[Attention<D>],
+    [tokens, positions]: [&Tensor; 2],
+) -> Tensor {
     let (eps, hidden) = (c.eps, c.stack.hidden as f32);
     let inputs = m.embed(tokens, &w.embed).scale(hidden.sqrt());
     let mut x = inputs.clone();
-    let (mut sliding, mut full) = (w.sliding.iter(), w.full.iter());
     for (l, layer) in w.layers.iter().enumerate() {
-        let ple = inputs.matmul(&layer.ple_in).scale(hidden.powf(-0.5));
+        let ple = layer.ple_in.apply(&inputs).scale(hidden.powf(-0.5));
         let ple = ple.rms_norm(&w.ple_norm, eps);
-        let parts = match c.full(l as u64) {
-            true => full
-                .next()
-                .unwrap()
-                .parts(1u64.into(), c.full_theta, Mask::Bidirectional),
-            false => {
-                let kv = KvHeads.into();
-                sliding
-                    .next()
-                    .unwrap()
-                    .parts(kv, c.theta, Mask::Within(c.window))
-            }
-        };
-        let attend = || [attention(m, c, &parts, &x, positions)];
+        let attend = || [attend(m, c, l as u64, &attention[l], &x, positions)];
         let [attn] = m.composite(Composite::Attention, attend);
         x = x.add(&attn);
         let h = x.rms_norm(&layer.pre_ff, eps);
@@ -221,64 +164,94 @@ pub fn trunk(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor
             [geglu(&h, layer).rms_norm(&layer.post_ff, eps)]
         });
         x = x.add(&mlp);
-        let gated = x.matmul(&layer.ple_gate).act(Act::GeluTanh).mul(&ple);
-        let o = gated.matmul(&layer.ple_proj).rms_norm(&layer.ple_norm, eps);
+        let gated = layer.ple_gate.apply(&x).act(Act::GeluTanh).mul(&ple);
+        let o = layer.ple_proj.apply(&gated).rms_norm(&layer.ple_norm, eps);
         x = x.add(&o).mul_scalar(&layer.scalar);
     }
     x
 }
 
-/// Each token projected to the embedding width. Mean these.
-pub fn forward(m: &Model, c: &Config, w: &Eg2, tokens: &Tensor, positions: &Tensor) -> Tensor {
-    let x = trunk(m, c, w, tokens, positions);
-    x.rms_norm(&w.norm, c.eps).matmul(&w.proj)
+/// One embedding per text, `[Seqs, Embedding]`. Callers normalize.
+pub fn forward<D: Dense>(
+    m: &Model,
+    c: &Config,
+    w: &Eg2<D>,
+    attention: &[Attention<D>],
+    ports: [&Tensor; 2],
+) -> Tensor {
+    let x = trunk(m, c, w, attention, ports);
+    w.proj.apply(&x.rms_norm(&w.norm, c.eps)).mean(1)
 }
 
-fn geglu(h: &Tensor, l: &Layer) -> Tensor {
-    let inner = h.matmul(&l.gate).act(Act::GeluTanh).mul(&h.matmul(&l.up));
-    inner.matmul(&l.down)
+fn geglu<D: Dense>(h: &Tensor, l: &Layer<D>) -> Tensor {
+    let inner = l.gate.apply(h).act(Act::GeluTanh).mul(&l.up.apply(h));
+    l.down.apply(&inner)
 }
 
 /// Queries, keys and values are normed per head, scores unscaled.
-fn attention(m: &Model, c: &Config, p: &Parts, x: &Tensor, positions: &Tensor) -> Tensor {
-    let h = x.rms_norm(p.ln, c.eps);
-    let split = |w: &Linear, heads: DimExpr| {
-        let shaped = vec![Seqs.into(), Context.into(), heads, p.head.clone()];
-        h.matmul(w).reshape(shaped)
+fn attend<D: Dense>(
+    m: &Model,
+    c: &Config,
+    l: u64,
+    a: &Attention<D>,
+    x: &Tensor,
+    positions: &Tensor,
+) -> Tensor {
+    let [head, kv_heads] = c.heads(l);
+    let (theta, mask) = match c.full(l) {
+        true => (c.full_theta, Mask::Bidirectional),
+        false => (c.theta, Mask::Within(c.window)),
+    };
+    let h = x.rms_norm(&a.ln, c.eps);
+    let split = |w: &D, heads: DimExpr| {
+        let shaped = vec![Seqs.into(), Context.into(), heads, head.clone()];
+        w.apply(&h).reshape(shaped)
     };
     let turn = |t: Tensor, norm: &Norm| {
         let normed = t.rms_norm(norm, c.eps);
-        normed.rope(positions, p.theta, Pairs::Halves)
+        normed.rope(positions, theta, Pairs::Halves)
     };
-    let q = turn(split(p.q, Heads.into()), p.q_norm);
-    let k = turn(split(p.k, p.kv_heads.clone()), p.k_norm);
-    let v = split(p.v, p.kv_heads.clone()).rms_norm(p.v_norm, c.eps);
-    let out = m.attend(p.mask, 1.0, [&q, &k, &v], None);
-    let flat = vec![Seqs.into(), Context.into(), Heads * p.head.clone()];
-    out.reshape(flat).matmul(p.o).rms_norm(p.post, c.eps)
+    let q = turn(split(&a.q, Heads.into()), &a.q_norm);
+    let k = turn(split(&a.k, kv_heads.clone()), &a.k_norm);
+    let v = split(&a.v, kv_heads).rms(c.eps);
+    let out = m.attend(mask, 1.0, [&q, &k, &v], None);
+    let flat = vec![Seqs.into(), Context.into(), Heads * head];
+    a.o.apply(&out.reshape(flat)).rms_norm(&a.post, c.eps)
 }
 
-/// One forward entry: tokens and positions in, projected tokens out.
-pub fn program(c: &Config) -> Graph {
+/// One forward entry: tokens and positions in, embeddings out.
+pub fn program<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let w: Eg2 = trace::declare(&m);
+    let w: Eg2<D> = trace::declare(&m);
+    let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
-    let out = forward(&m, c, &w, &tokens, &positions);
+    let out = forward(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
 }
 
 /// The residual stream after the last layer, for parity checks.
-pub fn probe(c: &Config) -> Graph {
+pub fn probe<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let w: Eg2 = trace::declare(&m);
+    let w: Eg2<D> = trace::declare(&m);
+    let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
-    let out = trunk(&m, c, &w, &tokens, &positions);
+    let out = trunk(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
 }
 
-/// The released checkpoint's tensor name for a weight path.
-pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
+/// The checkpoint's tensor name for a weight path.
+pub fn tensor_name(path: &[PathSeg]) -> Option<String> {
     use PathSeg::{Field, Index};
+    if let [rest @ .., Field(part)] = path
+        && let Some(suffix) = match part.as_str() {
+            "w" => Some("codes"),
+            "suh" | "svh" => Some(part.as_str()),
+            _ => None,
+        }
+    {
+        let whole = tensor_name(rest)?;
+        return Some(whole.replace(".weight", &format!(".{suffix}")));
+    }
     let name = match path {
         [Field(f)] => match f.as_str() {
             "embed" => "embed_tokens.weight".into(),
@@ -287,7 +260,7 @@ pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
             "ple_norm" => "ple.per_layer_projection_norm.weight".into(),
             _ => return None,
         },
-        [Field(kind), Index(n), Field(f)] if kind == "sliding" || kind == "full" => {
+        [Field(kind), Index(l), Field(f)] if kind == "attention" => {
             let part = match f.as_str() {
                 "ln" => "input_layernorm",
                 "post" => "post_attention_layernorm",
@@ -295,7 +268,6 @@ pub fn tensor_name(c: &Config, path: &[PathSeg]) -> Option<String> {
                 "q" | "k" | "v" | "o" => &format!("self_attn.{f}_proj"),
                 _ => return None,
             };
-            let l = c.layer_of(kind == "full", u64::from(*n));
             format!("layers.{l}.{part}.weight")
         }
         [Field(layers), Index(i), Field(f)] if layers == "layers" => {
@@ -323,21 +295,22 @@ pub fn weight(
     read: &dyn Fn(&str) -> Option<Vec<f32>>,
 ) -> Option<Vec<f32>> {
     use PathSeg::{Field, Index};
+    let shared = "language_model.ple.per_layer_model_projection";
     match path {
-        [Field(kind), _, Field(f)] if f == "v_norm" => {
-            let width = if kind == "full" {
-                c.full_head_dim
-            } else {
-                c.stack.head_dim
+        [Field(_), Index(i), Field(f), rest @ ..] if f == "ple_in" => {
+            // The layer's slice of the shared projection.
+            let part = rest.first().map(|p| format!("{p:?}")).unwrap_or_default();
+            let (name, span) = match part.as_str() {
+                "" => ("weight", c.per_layer * c.stack.hidden),
+                "Field(\"w\")" => ("codes", c.per_layer * c.stack.hidden),
+                "Field(\"svh\")" => ("svh", c.per_layer),
+                "Field(\"suh\")" => return read(&format!("{shared}.suh")),
+                _ => return None,
             };
-            Some(vec![1.0; width as usize])
+            let all = read(&format!("{shared}.{name}"))?;
+            let at = *i as usize * span as usize;
+            Some(all[at..at + span as usize].to_vec())
         }
-        [Field(_), Index(i), Field(f)] if f == "ple_in" => {
-            let all = read("language_model.ple.per_layer_model_projection.weight")?;
-            let rows = (c.per_layer * c.stack.hidden) as usize;
-            let at = *i as usize * rows;
-            Some(all[at..at + rows].to_vec())
-        }
-        _ => read(&tensor_name(c, path)?),
+        _ => read(&tensor_name(path)?),
     }
 }

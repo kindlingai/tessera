@@ -46,9 +46,6 @@ pub enum DimName {
     Layers,
     DenseLayers,
     MoeLayers,
-    /// Layers whose attention is windowed, and whole.
-    SlidingLayers,
-    FullLayers,
     /// Layers that run their own indexer.
     IndexLayers,
 }
