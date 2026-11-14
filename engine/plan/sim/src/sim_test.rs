@@ -1,4 +1,26 @@
-use crate::{Chip, Const, Limit, Load, Ops, Pool, Tag, gb10, known, m3_pro, strix_halo};
+use crate::known::{known, m3_pro};
+use crate::nvidia::gb10;
+use crate::{Chip, Const, Fit, Limit, Load, Ops, Pool, Tag};
+
+/// The Radeon 8060S of a Ryzen AI Max, through ROCm.
+fn strix_halo() -> Pool {
+    let fit = Fit {
+        floor: 7.4e-6,
+        spawn: 6e-12,
+        step: 1.0e-8,
+        curve: 2.4e-8,
+        rate: 2.0e12,
+        wait: 3.35e-7,
+        near: 4.3e-8,
+        cache: 4e6,
+        cached: 3.24e11,
+        read: 2.23e11,
+        scan: 1.19e11,
+        write: 2.04e11,
+        tile: 1.5e13,
+    };
+    fit.pool("rocm Radeon 8060S")
+}
 
 /// One-instruction e4m3 costs a chip fewer ops.
 #[test]

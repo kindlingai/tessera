@@ -96,7 +96,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Node>, Error> {
 }
 
 /// The `lexeme_norm` table of a pipeline's `vocab/lookups.bin`.
-pub fn lexeme_norms(bytes: &[u8]) -> Result<HashMap<u64, String>, Error> {
+pub(super) fn lexeme_norms(bytes: &[u8]) -> Result<HashMap<u64, String>, Error> {
     let root = rmpv::decode::read_value(&mut &bytes[..])?;
     let mut out = HashMap::new();
     let Some(table) = get(&root, "lexeme_norm").and_then(Value::as_map) else {

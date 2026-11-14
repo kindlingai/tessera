@@ -4,7 +4,7 @@
 //! spaCy's fixed string ids and base norms, from its source.
 
 /// Strings whose spaCy id is their position here.
-pub const SYMBOLS: [&str; 457] = [
+pub(super) const SYMBOLS: [&str; 457] = [
     "",
     "IS_ALPHA",
     "IS_ASCII",
@@ -465,7 +465,7 @@ pub const SYMBOLS: [&str; 457] = [
 ];
 
 /// Norms spaCy gives these texts before any lookup table.
-pub const BASE_NORMS: [(&str, &str); 45] = [
+pub(super) const BASE_NORMS: [(&str, &str); 45] = [
     ("'s", "'s"),
     ("'S", "'s"),
     ("’s", "'s"),

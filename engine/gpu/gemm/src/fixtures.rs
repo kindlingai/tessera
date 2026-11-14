@@ -31,27 +31,27 @@ fn build(m: usize, n: usize, k: usize, trans_a: bool, trans_b: bool, beta: f32) 
 }
 
 /// Small square case, no transposes, beta = 0.
-pub fn tiny() -> Call {
+pub(crate) fn tiny() -> Call {
     build(3, 4, 5, false, false, 0.0)
 }
 
 /// Linear layer: W is (n,k), so trans_b.
-pub fn linear() -> Call {
+pub(crate) fn linear() -> Call {
     build(8, 16, 32, false, true, 0.0)
 }
 
 /// A is (k,m), B is (k,n).
-pub fn trans_a() -> Call {
+pub(crate) fn trans_a() -> Call {
     build(6, 5, 7, true, false, 0.0)
 }
 
 /// Both transposes, with a nonzero C accumulated at beta.
-pub fn both_trans() -> Call {
+pub(crate) fn both_trans() -> Call {
     build(9, 7, 11, true, true, 0.5)
 }
 
 /// m, n and k each end in a partial tile.
-pub fn tile() -> Call {
+pub(crate) fn tile() -> Call {
     build(
         crate::BM + 13,
         crate::BN + 7,

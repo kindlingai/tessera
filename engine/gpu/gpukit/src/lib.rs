@@ -13,8 +13,6 @@ pub mod platform;
 mod platform_test;
 pub mod settings;
 
-pub mod includes;
-
 pub mod testing;
 
 #[cfg(target_os = "macos")]

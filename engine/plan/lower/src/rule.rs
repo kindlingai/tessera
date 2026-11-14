@@ -169,7 +169,7 @@ impl Draft {
 }
 
 /// A rule's drafts grouped into ways, in first-seen order.
-pub fn ways(drafts: Vec<Draft>) -> Vec<Vec<Draft>> {
+pub(crate) fn ways(drafts: Vec<Draft>) -> Vec<Vec<Draft>> {
     let mut ways: Vec<(usize, Vec<Draft>)> = Vec::new();
     for d in drafts {
         match ways.iter_mut().find(|(c, _)| *c == d.choice) {

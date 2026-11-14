@@ -87,7 +87,7 @@ pub fn select(
 }
 
 /// The same, with `upto` dimensions read at launch.
-pub fn select_upto(
+pub(crate) fn select_upto(
     g: &Graph,
     entry: usize,
     sizes: &[(DimName, u64)],

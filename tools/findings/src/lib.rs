@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::ExitCode;
 
 /// One tool's findings, or why it did not run.
 #[derive(Serialize, Deserialize, Default)]
@@ -81,5 +82,19 @@ impl Report {
     pub fn read(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+/// Runs `run` on the arguments. Code 2 means error.
+pub fn main_of(tool: &str, run: fn(&[&str]) -> Result<bool, String>) -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run(&args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("{tool}: {e}");
+            ExitCode::from(2)
+        }
     }
 }

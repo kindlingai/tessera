@@ -299,4 +299,4 @@ crate::form!(U32);
 pub const F32_FORM: &dyn Form = &F32;
 pub const BF16_FORM: &dyn Form = &Bf16;
 pub const U32_FORM: &dyn Form = &U32;
-pub const U8_FORM: &dyn Form = &U8;
+pub(crate) const U8_FORM: &dyn Form = &U8;

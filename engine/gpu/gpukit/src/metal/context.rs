@@ -15,14 +15,12 @@ use std::sync::Arc;
 pub struct Context {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    includes: Vec<(&'static str, &'static str)>,
     cache: Arc<PipelineArchiveCache>,
 }
 
 impl Context {
     /// Open the default device. The first context fixes cache settings.
     pub fn new(cache: CacheConfig) -> Result<Self, Error> {
-        let includes = crate::includes::include_table()?;
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::Gpu("no Metal device"))?;
         let queue = device
             .newCommandQueue()
@@ -31,7 +29,6 @@ impl Context {
         Ok(Self {
             device,
             queue,
-            includes,
             cache,
         })
     }
@@ -84,7 +81,7 @@ impl Context {
         &self,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
-        let ns_source = NSString::from_str(&expand(source, &self.includes));
+        let ns_source = NSString::from_str(&expand(source, &[]));
         self.device
             .newLibraryWithSource_options_error(&ns_source, None)
             .map_err(compile_error)

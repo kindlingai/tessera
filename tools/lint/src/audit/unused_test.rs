@@ -54,3 +54,21 @@ fn kinds_are_found() {
 fn binaries_export_nothing() {
     assert!(flagged(&[("a/src/main.rs", "pub fn go() {}\n")]).is_empty());
 }
+
+#[test]
+fn macro_items_reach_types() {
+    let lib = "pub struct Code;\npub struct Block<C>(C);\n\
+               macro_rules! make { ($n:ident) => { pub const $n: Block<Code> = Block(Code); }; }\n\
+               make!(NAME);\n";
+    let user = ("b/src/lib.rs", "fn f() { let _ = a::NAME; }\n");
+    assert!(flagged(&[("a/src/lib.rs", lib), user]).is_empty());
+    assert_eq!(flagged(&[("a/src/lib.rs", lib)]), ["Block", "Code"]);
+}
+
+#[test]
+fn bounds_reach_traits() {
+    let lib = "pub trait Code {}\npub struct Block<C>(C);\n\
+               impl<C: Code> Block<C> { pub fn new(c: C) -> Self { Self(c) } }\n";
+    let user = ("b/src/lib.rs", "fn f() { let _ = a::Block::new(1); }\n");
+    assert!(flagged(&[("a/src/lib.rs", lib), user]).is_empty());
+}

@@ -83,7 +83,7 @@ impl Problem {
 /// Kernel arguments, laid out as in gemm.metal and gemm.cu.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct AbiParams {
+pub(crate) struct AbiParams {
     pub m: u32,
     pub n: u32,
     pub k: u32,

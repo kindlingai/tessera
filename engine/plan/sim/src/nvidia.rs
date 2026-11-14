@@ -4,7 +4,7 @@ use crate::{Chip, Const, Estimate, Limit, Load};
 
 /// One chip's multiprocessors and memory system.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sm {
+pub(crate) struct Sm {
     pub sms: Const,
     /// Warp schedulers per multiprocessor, one issue a cycle each.
     pub schedulers: Const,
@@ -62,13 +62,13 @@ pub struct Sm {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Nvidia {
+pub(crate) struct Nvidia {
     pub name: String,
     pub sm: Sm,
 }
 
 /// The GB10, as in a DGX Spark.
-pub fn gb10() -> Nvidia {
+pub(crate) fn gb10() -> Nvidia {
     let (m, i, a) = (Const::measured, Const::inferred, Const::assumed);
     let sm = Sm {
         sms: m(48.0, "reported by the driver"),

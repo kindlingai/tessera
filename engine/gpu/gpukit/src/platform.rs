@@ -134,7 +134,7 @@ impl Platform {
 }
 
 /// The row whose pattern fits `id`, from the embedded table.
-pub fn row_for(id: &str) -> Option<Row> {
+pub(crate) fn row_for(id: &str) -> Option<Row> {
     let fits = |pattern: &str| match pattern.strip_suffix('*') {
         Some(head) => id.starts_with(head),
         None => id == pattern,

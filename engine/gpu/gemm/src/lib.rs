@@ -7,11 +7,13 @@ mod device;
 pub use device::cuda;
 #[cfg(feature = "rocm")]
 pub use device::rocm;
-pub mod fixtures;
+#[cfg(test)]
+mod fixtures;
 #[cfg(target_os = "macos")]
 mod metal;
 pub mod problem;
-pub mod testing;
+#[cfg(test)]
+mod testing;
 
 pub use gpukit::Error;
 pub use problem::{Call, Problem, out_len};

@@ -1,6 +1,7 @@
 //! Tables for the machines these models were fitted on.
 
-use crate::{Chip, Fit, Pool, gb10};
+use crate::nvidia::gb10;
+use crate::{Chip, Fit, Pool};
 
 /// An Apple M3 Pro, through Metal. Its step varies twofold.
 pub fn m3_pro() -> Pool {
@@ -20,26 +21,6 @@ pub fn m3_pro() -> Pool {
         tile: 3.9e12,
     };
     fit.pool("metal Apple M3 Pro")
-}
-
-/// The Radeon 8060S of a Ryzen AI Max, through ROCm.
-pub fn strix_halo() -> Pool {
-    let fit = Fit {
-        floor: 7.4e-6,
-        spawn: 6e-12,
-        step: 1.0e-8,
-        curve: 2.4e-8,
-        rate: 2.0e12,
-        wait: 3.35e-7,
-        near: 4.3e-8,
-        cache: 4e6,
-        cached: 3.24e11,
-        read: 2.23e11,
-        scan: 1.19e11,
-        write: 2.04e11,
-        tile: 1.5e13,
-    };
-    fit.pool("rocm Radeon 8060S")
 }
 
 /// The table for a runner's device name. ROCm names none.
