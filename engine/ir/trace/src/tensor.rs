@@ -70,6 +70,11 @@ impl Tensor {
         self.stage(Stage::RmsNorm { eps }, &[&w.0])
     }
 
+    /// The row over its root mean square, with no weight.
+    pub fn rms(&self, eps: f32) -> Tensor {
+        self.stage(Stage::Rms { eps }, &[])
+    }
+
     pub fn center(&self) -> Tensor {
         self.stage(Stage::Center, &[])
     }

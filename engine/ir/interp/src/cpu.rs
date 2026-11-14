@@ -189,9 +189,14 @@ pub(crate) fn stage(
         (Stage::RmsNorm { eps }, Some(w)) => {
             let w = w.floats()?;
             for row in out.chunks_mut(width) {
-                let mean = acc.sum(row.iter().map(|v| v * v)) / width as f32;
-                let inv = 1.0 / (mean + eps).sqrt();
+                let inv = rms_inverse(acc, row, *eps);
                 row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
+            }
+        }
+        (Stage::Rms { eps }, _) => {
+            for row in out.chunks_mut(width) {
+                let inv = rms_inverse(acc, row, *eps);
+                row.iter_mut().for_each(|v| *v *= inv);
             }
         }
         (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
@@ -219,6 +224,12 @@ pub(crate) fn stage(
         _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
     Ok(Tensor::f32(x.shape.clone(), out))
+}
+
+/// One over the row's root mean square.
+fn rms_inverse(acc: Acc, row: &[f32], eps: f32) -> f32 {
+    let mean = acc.sum(row.iter().map(|v| v * v)) / row.len() as f32;
+    1.0 / (mean + eps).sqrt()
 }
 
 pub(crate) fn gather(table: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {

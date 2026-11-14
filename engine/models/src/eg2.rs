@@ -89,7 +89,6 @@ struct Parts<'a> {
     v: &'a Linear,
     q_norm: &'a Norm,
     k_norm: &'a Norm,
-    v_norm: &'a Norm,
     o: &'a Linear,
     post: &'a Norm,
     head: DimExpr,
@@ -114,9 +113,6 @@ macro_rules! attention {
             pub q_norm: Norm,
             #[shape($head)]
             pub k_norm: Norm,
-            /// All ones: the checkpoint has no weight.
-            #[shape($head)]
-            pub v_norm: Norm,
             #[shape(Heads * $head, Hidden)]
             pub o: Linear,
             #[shape(Hidden)]
@@ -132,7 +128,6 @@ macro_rules! attention {
                     v: &self.v,
                     q_norm: &self.q_norm,
                     k_norm: &self.k_norm,
-                    v_norm: &self.v_norm,
                     o: &self.o,
                     post: &self.post,
                     head: $head.into(),
@@ -252,7 +247,7 @@ fn attention(m: &Model, c: &Config, p: &Parts, x: &Tensor, positions: &Tensor) -
     };
     let q = turn(split(p.q, Heads.into()), p.q_norm);
     let k = turn(split(p.k, p.kv_heads.clone()), p.k_norm);
-    let v = split(p.v, p.kv_heads.clone()).rms_norm(p.v_norm, c.eps);
+    let v = split(p.v, p.kv_heads.clone()).rms(c.eps);
     let out = m.attend(p.mask, 1.0, [&q, &k, &v], None);
     let flat = vec![Seqs.into(), Context.into(), Heads * p.head.clone()];
     out.reshape(flat).matmul(p.o).rms_norm(p.post, c.eps)
@@ -324,14 +319,6 @@ pub fn weight(
 ) -> Option<Vec<f32>> {
     use PathSeg::{Field, Index};
     match path {
-        [Field(kind), _, Field(f)] if f == "v_norm" => {
-            let width = if kind == "full" {
-                c.full_head_dim
-            } else {
-                c.stack.head_dim
-            };
-            Some(vec![1.0; width as usize])
-        }
         [Field(_), Index(i), Field(f)] if f == "ple_in" => {
             let all = read("language_model.ple.per_layer_model_projection.weight")?;
             let rows = (c.per_layer * c.stack.hidden) as usize;
