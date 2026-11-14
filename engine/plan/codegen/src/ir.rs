@@ -296,7 +296,8 @@ enum Kind {
 
 /// Prints a body as the dialect-neutral text.
 struct Printer<'a> {
-    scope: Vec<HashMap<String, Kind>>,
+    /// Each name's kind and the name the text gives it.
+    scope: Vec<HashMap<String, (Kind, String)>>,
     lines: Vec<String>,
     indent: usize,
     lane: bool,
@@ -307,16 +308,39 @@ struct Printer<'a> {
 impl Printer<'_> {
     fn kind(&self, name: &str) -> Kind {
         for scope in self.scope.iter().rev() {
-            if let Some(k) = scope.get(name) {
+            if let Some((k, _)) = scope.get(name) {
                 return *k;
             }
         }
         panic!("`{name}` is not in scope")
     }
 
+    /// The name the text gives `name`.
+    fn c_name(&self, name: &str) -> String {
+        let found = self.scope.iter().rev().find_map(|s| s.get(name));
+        found.map_or_else(|| name.into(), |(_, c)| c.clone())
+    }
+
     fn bind(&mut self, name: &str, kind: Kind) {
         let last = self.scope.last_mut().expect("a scope");
-        last.insert(name.into(), kind);
+        last.insert(name.into(), (kind, name.into()));
+    }
+
+    /// Binds a variable. A shadow gets a fresh C name.
+    fn declare(&mut self, name: &str, kind: Kind) -> String {
+        let taken = |p: &Self, c: &str| {
+            let mut all = p.scope.iter().flat_map(|s| s.iter());
+            all.any(|(n, (_, rendered))| n == c || rendered == c)
+        };
+        let mut c = name.to_string();
+        let mut n = 0;
+        while taken(self, &c) {
+            n += 1;
+            c = format!("{name}_{n}");
+        }
+        let last = self.scope.last_mut().expect("a scope");
+        last.insert(name.into(), (kind, c.clone()));
+        c
     }
 
     fn line(&mut self, text: String) {
@@ -390,7 +414,7 @@ impl Printer<'_> {
             Expr::Int(n) => n.to_string(),
             Expr::Float(x) => float(*x),
             Expr::Bool(b) => b.to_string(),
-            Expr::Var(name) => name.clone(),
+            Expr::Var(name) => self.c_name(name),
             Expr::Neg(a) => format!("(-{})", self.expr(a)),
             Expr::Not(a) => format!("(!{})", self.expr(a)),
             Expr::Bin(op, a, b) => {
@@ -405,7 +429,7 @@ impl Printer<'_> {
                 };
                 match self.kind(name) {
                     Kind::Buffer(form) => form.load(name, &at),
-                    _ => format!("{name}[{at}]"),
+                    _ => format!("{}[{at}]", self.c_name(name)),
                 }
             }
             Expr::Field(base, h) => {
@@ -485,26 +509,22 @@ impl Printer<'_> {
         match s {
             Stmt::Let { name, init } => {
                 let ty = self.ty(init);
-                // A zeroed four leaves the compiler to fill it.
-                let (text, kind) = match (init, self.wide(init)) {
-                    (Expr::Call(Intrinsic::Zero4, _), _) => {
-                        (format!("float4 {name};"), Kind::Value(ty))
-                    }
-                    (_, Some(form)) => (
-                        format!("{} {name} = {};", form.wide(), self.expr(init)),
-                        Kind::Wide(form),
-                    ),
-                    _ => (
-                        format!("{} {name} = {};", ty.c(), self.expr(init)),
-                        Kind::Value(ty),
-                    ),
+                // The initializer reads names bound before this one.
+                let (ty, value, kind) = match (init, self.wide(init)) {
+                    // A zeroed four leaves the compiler to fill it.
+                    (Expr::Call(Intrinsic::Zero4, _), _) => ("float4", None, Kind::Value(ty)),
+                    (_, Some(form)) => (form.wide(), Some(self.expr(init)), Kind::Wide(form)),
+                    _ => (ty.c(), Some(self.expr(init)), Kind::Value(ty)),
                 };
-                self.line(text);
-                self.bind(name, kind);
+                let name = self.declare(name, kind);
+                match value {
+                    Some(value) => self.line(format!("{ty} {name} = {value};")),
+                    None => self.line(format!("{ty} {name};")),
+                }
             }
             Stmt::Array { name, ty, len } => {
+                let name = self.declare(name, Kind::Array(*ty));
                 self.line(format!("{} {name}[{len}] = {{}};", ty.c()));
-                self.bind(name, Kind::Array(*ty));
             }
             Stmt::Shared { name, ty, len } => {
                 self.line(format!("f_group({}, {name}, {len});", ty.c()));
@@ -546,11 +566,11 @@ impl Printer<'_> {
                     n => self.line(format!("#pragma unroll {n}")),
                 }
                 let (from, to, step) = (self.expr(from), self.expr(to), self.expr(step));
+                self.scope.push(HashMap::new());
+                let var = self.declare(var, Kind::Value(Ty::U32));
                 self.line(format!(
                     "for (u32 {var} = {from}; {var} < {to}; {var} += {step}) {{"
                 ));
-                self.scope.push(HashMap::new());
-                self.bind(var, Kind::Value(Ty::U32));
                 self.block(body);
                 self.scope.pop();
                 self.line("}".into());
