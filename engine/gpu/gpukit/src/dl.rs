@@ -20,7 +20,7 @@ fn last_error() -> String {
 }
 
 /// A shared library that stays open until the process exits.
-pub struct Library(*mut c_void);
+pub(crate) struct Library(*mut c_void);
 
 impl Library {
     /// Open the first name that loads, else the last error.
@@ -52,7 +52,7 @@ impl Library {
 }
 
 /// FNV-1a: unlike `DefaultHasher`, stable across runs.
-pub fn image_hash(image: &[u8]) -> u64 {
+pub(crate) fn image_hash(image: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in image {
         h ^= *b as u64;

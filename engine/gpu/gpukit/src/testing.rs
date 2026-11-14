@@ -66,7 +66,7 @@ pub fn scratch(file: &str) -> PathBuf {
 }
 
 /// Whether a CUDA driver loads on this host.
-pub fn cuda_ready() -> bool {
+pub(crate) fn cuda_ready() -> bool {
     #[cfg(feature = "cuda")]
     return crate::cuda::driver::driver().is_ok();
     #[cfg(not(feature = "cuda"))]
@@ -74,7 +74,7 @@ pub fn cuda_ready() -> bool {
 }
 
 /// Whether a HIP runtime loads and sees a device.
-pub fn rocm_ready() -> bool {
+pub(crate) fn rocm_ready() -> bool {
     #[cfg(feature = "rocm")]
     return crate::rocm::cached_context().is_ok();
     #[cfg(not(feature = "rocm"))]

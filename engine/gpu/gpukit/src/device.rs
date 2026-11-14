@@ -69,7 +69,7 @@ fn lookup<D: Device>(
 }
 
 /// Compile `source` and resolve `entry`, once per process.
-pub fn cached_source<D: Device>(
+pub(crate) fn cached_source<D: Device>(
     source: &'static str,
     entry: &'static str,
 ) -> Result<D::Kernel, Error> {
