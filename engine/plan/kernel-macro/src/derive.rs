@@ -103,11 +103,18 @@ impl Line {
     }
 }
 
-/// A field a scalar parameter can name, by its type.
-fn scalar(ty: &syn::Type) -> Option<&'static str> {
-    let text = quote!(#ty).to_string();
-    match text.as_str() {
-        "usize" | "u32" | "f32" | "Extent" => Some(if text == "usize" { "count" } else { "" }),
+/// A scalar field: a count, extent or plain value.
+enum Scalar {
+    Count,
+    Extent,
+    Plain,
+}
+
+fn scalar(ty: &syn::Type) -> Option<Scalar> {
+    match quote!(#ty).to_string().as_str() {
+        "usize" => Some(Scalar::Count),
+        "Extent" => Some(Scalar::Extent),
+        "u32" | "f32" => Some(Scalar::Plain),
         _ => None,
     }
 }
@@ -148,11 +155,10 @@ fn fields_of(input: &DeriveInput, krate: &Tokens) -> Result<(Vec<Tokens>, Vec<To
         let Some(kind) = scalar(&f.ty) else { continue };
         let key = ident.to_string();
         arms.push(quote!(#key => #krate::ToArg::arg(&self.#ident),));
-        let text = quote!(#f.ty).to_string();
-        if kind == "count" {
-            sizes.push(quote!(self.#ident));
-        } else if text.ends_with("Extent") {
-            sizes.push(quote!(self.#ident.most()));
+        match kind {
+            Scalar::Count => sizes.push(quote!(self.#ident)),
+            Scalar::Extent => sizes.push(quote!(self.#ident.most())),
+            Scalar::Plain => {}
         }
     }
     Ok((arms, sizes))
