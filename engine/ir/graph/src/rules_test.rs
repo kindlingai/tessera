@@ -84,6 +84,18 @@ fn matmul_row_splits() {
 }
 
 #[test]
+fn plain_casts() {
+    let cast = |from, to| {
+        let x = TensorType::new([Rows, Hidden], from);
+        placed(vec![x], Op::Cast(to))
+    };
+    assert_eq!(cast(DType::F32, DType::U32), Ok(Replicated));
+    for (from, to) in [(DType::F32, DType::Bf16), (DType::F16, DType::F32)] {
+        assert_eq!(cast(from, to), Err(ErrorKind::DType));
+    }
+}
+
+#[test]
 fn reshape_keeps_split_axis() {
     let heads = Shape::from([Rows, Heads, HeadDim]);
     let x = f32s([Rows, Hidden], Split { axis: 1 });

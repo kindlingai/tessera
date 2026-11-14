@@ -3,7 +3,7 @@
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
 use crate::node::{Graph, Op, Select, Stage, View};
 use crate::select;
-use crate::types::{Placement, TensorType};
+use crate::types::{DType, Placement, TensorType};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +161,13 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
                 args[0].placement != Placement::Partial,
                 ErrorKind::Placement,
                 || "cast of partial sums".into(),
+            )?;
+            // No kernel or interp path casts other types yet.
+            let plain = |d| matches!(d, DType::F32 | DType::I32 | DType::U32);
+            need(
+                plain(args[0].dtype) && plain(*dtype),
+                ErrorKind::DType,
+                || format!("no cast from {:?} to {dtype:?}", args[0].dtype),
             )?;
             Ok(TensorType {
                 dtype: *dtype,
