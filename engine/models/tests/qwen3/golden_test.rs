@@ -1,87 +1,73 @@
-//! Qwen3-0.6B against outputs its reference recorded.
+//! Qwen3-0.6B on the GPU: timing, cost and decoding.
 
-use super::release;
+use super::{GOLDEN, release};
+use crate::common::{
+    Case, Reference, best, floats, interpreted, kernels, loaded, seconds, table, tokens,
+};
 use calibrate::{headroom, measure};
 use checkpoint::File;
-use gpukit::testing::{cosine_f32, max_abs_diff};
-use interp::{Tensor, bind, run};
-use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, open, select};
+use gpukit::testing::max_abs_diff;
+use interp::{Tensor, bind};
+use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, select};
 use models::qwen3::{Config, stepper, tensor_name};
-use std::collections::BTreeMap;
 use std::time::Instant;
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
 
 /// Read from the directory `TESSERA_QWEN3` names.
-struct Case {
+struct Fixture {
     settings: Settings,
     weights: Vec<Tensor>,
     tokens: Vec<u32>,
     want: Vec<f32>,
 }
 
-fn case(g: &Graph) -> Option<Case> {
-    let settings = settings::read();
-    let dir = settings.qwen3.clone()?;
+/// The reference the suite's golden test reads.
+pub fn read(g: &Graph) -> Option<Reference> {
+    let dir = settings::read().qwen3?;
     let file = File::open(&dir.join("model.safetensors")).unwrap();
     let find = |p: &[PathSeg]| {
         let v = file.floats(&tensor_name(p)?).ok()?;
         Some(Tensor::f32(vec![v.len()], v))
     };
-    let tokens = std::fs::read_to_string(dir.join("tokens.txt")).unwrap();
-    let floats = std::fs::read(dir.join("logits.f32")).unwrap();
-    let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
-    Some(Case {
-        settings,
+    let tokens = tokens(&dir.join("tokens.txt"));
+    let want = floats(&dir.join("logits.f32"));
+    Some(Reference {
         weights: bind(g, find).unwrap(),
-        tokens: tokens
-            .split_whitespace()
-            .map(|t| t.parse().unwrap())
-            .collect(),
-        want: floats.as_chunks::<4>().0.iter().map(wide).collect(),
+        cases: vec![Case::one("reference", tokens, want)],
     })
 }
 
-/// One sequence of `tokens` through the CPU interpreter.
-fn logits(g: &Graph, c: &Case, tokens: &[u32]) -> Vec<f32> {
-    let shape = vec![1, tokens.len()];
-    let positions = (0..tokens.len() as u32).collect();
-    let ids = |data| Tensor::u32(shape.clone(), data);
-    let inputs = [ids(tokens.to_vec()), ids(positions)];
-    let start = Instant::now();
-    let out = run(g, &c.weights, 0, &inputs).unwrap();
-    let seconds = start.elapsed().as_secs_f32();
-    eprintln!("interpreter, {} tokens: {seconds:.3} s", tokens.len());
-    out[0].floats().unwrap().to_vec()
+fn fixture(g: &Graph) -> Option<Fixture> {
+    let mut reference = read(g)?;
+    let one = reference.cases.remove(0);
+    Some(Fixture {
+        settings: settings::read(),
+        weights: reference.weights,
+        tokens: one.tokens,
+        want: one.want,
+    })
 }
 
-fn best(row: &[f32]) -> usize {
-    let top = |a: &(usize, &f32), b: &(usize, &f32)| a.1.total_cmp(b.1);
-    row.iter().enumerate().max_by(top).unwrap().0
+/// Rows of logits `tokens` give on the interpreter.
+fn logits(g: &Graph, c: &Fixture, tokens: &[u32]) -> Vec<f32> {
+    interpreted(g, &c.weights, 1, tokens)
 }
 
 /// Each position must pick the reference's top token.
-fn close(label: &str, got: &[f32], c: &Case) {
-    let vocab = got.len() / c.tokens.len();
-    let (max, mut cos) = (max_abs_diff(got, &c.want), 1.0f32);
-    for (g, w) in got.chunks(vocab).zip(c.want.chunks(vocab)) {
-        cos = cos.min(cosine_f32(g, w));
-        assert_eq!(best(g), best(w), "{label}: top token differs");
-    }
-    eprintln!("{label}: max_abs {max:.3e} worst cos {cos:.7}");
-    assert!(max < 1e-3 && cos > 0.99999, "{label}: {max:.3e} {cos}");
+fn close(label: &str, got: &[f32], c: &Fixture) {
+    GOLDEN.tolerance.check(label, got, &c.want, c.tokens.len());
 }
 
 #[test]
-fn matches_reference() {
-    let g = release();
-    let Some(c) = case(&g) else {
-        return eprintln!("TESSERA_QWEN3 is not set; skipped");
-    };
-    close("cpu", &logits(&g, &c, &c.tokens), &c);
-    if c.settings.gpu().is_none() {
+fn gpu_checks() {
+    if settings::read().gpu().is_none() {
         return eprintln!("no GPU here; skipped");
     }
+    let g = release();
+    let Some(c) = fixture(&g) else {
+        return eprintln!("TESSERA_QWEN3 is not set; skipped");
+    };
     let mut gpu = Gpu::open(&g, &c);
     forward::check(&mut gpu, &g);
     decode::check(&mut gpu, &g);
@@ -95,7 +81,7 @@ fn pinned(settings: &Settings) -> Device {
 
 /// Plans for either entry on one runner. Weights load once.
 struct Gpu<'a> {
-    c: &'a Case,
+    c: &'a Fixture,
     runner: Box<dyn Run>,
     /// This machine's stored samples, and what this run adds.
     device: Device,
@@ -142,27 +128,6 @@ fn prompt(tokens: &[u32]) -> Span<'_> {
     Span { past: 0, tokens }
 }
 
-/// How often a plan launches each kernel.
-fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
-    let mut by = BTreeMap::new();
-    for step in &plan.steps {
-        *by.entry(step.kernel.name()).or_default() += 1;
-    }
-    by
-}
-
-/// Launches and seconds, by kernel.
-fn table(plan: &Plan, steps: &[f64]) {
-    let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
-    for (step, seconds) in plan.steps.iter().zip(steps) {
-        let (count, total) = by.entry(step.kernel.name()).or_default();
-        (*count, *total) = (*count + step.launches().len(), *total + seconds);
-    }
-    for (name, (count, seconds)) in by {
-        eprintln!("  {name:8} {count:4} launches {seconds:.4} s");
-    }
-}
-
 /// Each kernel's time over the least its work needs.
 fn room(device: &Device, plan: &Plan, steps: &[f64]) {
     let Some(fit) = device.fit else {
@@ -186,13 +151,10 @@ fn room(device: &Device, plan: &Plan, steps: &[f64]) {
 }
 
 impl<'a> Gpu<'a> {
-    fn open(g: &Graph, c: &'a Case) -> Self {
+    fn open(g: &Graph, c: &'a Fixture) -> Self {
         let first = prompt(&c.tokens);
         let plan = lower(g, 0, &first.sizes(), &pinned(&c.settings)).unwrap();
-        let mut runner = open(plan, &c.settings).unwrap();
-        for (at, w) in c.weights.iter().enumerate() {
-            runner.load(at as u32, w.view()).unwrap();
-        }
+        let runner = loaded(plan, g, &c.weights, &c.settings);
         let device = Device::stored(&*runner, &c.settings).unwrap();
         let device = device.pinned(pinned(&c.settings).pins);
         let (name, samples) = (runner.device(), device.samples());
@@ -235,12 +197,6 @@ impl<'a> Gpu<'a> {
         self.runner.feed(&feeds).unwrap();
     }
 
-    /// Each step's seconds for the plan in place.
-    fn steps(&mut self) -> Vec<f64> {
-        let steps = 0..self.runner.plan().steps.len();
-        steps.map(|i| self.runner.repeat(i, 1).unwrap()).collect()
-    }
-
     fn save(&self) {
         let file = Device::path(&self.c.settings, &self.device.name).unwrap();
         let (learned, all) = (self.learned, self.device.samples());
@@ -267,7 +223,7 @@ mod forward {
         whole: f64,
     }
 
-    fn repeat(c: &Case, n: usize) -> Vec<u32> {
+    fn repeat(c: &Fixture, n: usize) -> Vec<u32> {
         c.tokens.iter().cycle().take(n).copied().collect()
     }
 
@@ -285,7 +241,7 @@ mod forward {
         Timed {
             plan: gpu.runner.plan().clone(),
             out,
-            steps: gpu.steps(),
+            steps: seconds(&mut *gpu.runner),
             whole,
         }
     }
@@ -460,7 +416,7 @@ mod decode {
         let (plan_ms, run_ms) = (per(planned.planning), per(planned.running));
         eprintln!("  per token: planning {plan_ms:.2} ms, device {run_ms:.2} ms");
         let last = gpu.runner.plan().clone();
-        let (estimate, steps) = (device.cost(&last).seconds * 1e3, gpu.steps());
+        let (estimate, steps) = (device.cost(&last).seconds * 1e3, seconds(&mut *gpu.runner));
         let timed = steps.iter().sum::<f64>() * 1e3;
         eprintln!("  last token: estimated {estimate:.2} ms, timed {timed:.2} ms");
         table(&last, &steps);

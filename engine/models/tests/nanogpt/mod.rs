@@ -1,9 +1,10 @@
 //! A small nanogpt.
 
-mod golden_test;
+mod golden;
 mod regions_test;
 
-use crate::common::{Spec, suite};
+use crate::common::{Golden, Spec, Tolerance, suite};
+use lower::form::F32_FORM;
 use models::Stack;
 use models::nanogpt::{Config, program};
 use trace::Composite::{Attention, Mlp};
@@ -34,6 +35,18 @@ const SPEC: Spec = Spec {
     regions: &[(Attention, 2), (Mlp, 2)],
     small: None,
     files: &[],
+    golden: Some(Golden {
+        read: golden::read,
+        form: F32_FORM,
+        tolerance: Tolerance {
+            max_abs: 1e-5,
+            cos: 0.0,
+            top: false,
+        },
+        per_token: true,
+        unit: false,
+        anywhere: true,
+    }),
 };
 
 suite!(SPEC);
