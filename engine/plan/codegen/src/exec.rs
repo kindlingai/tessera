@@ -1,9 +1,10 @@
 //! Runs a body on the host, each group in lockstep.
 
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
 use crate::kept::Layout;
 use crate::numerics::Precision;
+use graph::{E2M1, E4M3, F16};
 use std::collections::HashMap;
 
 /// One argument of a launch, as the host sees it.
@@ -394,6 +395,19 @@ impl Group<'_, '_> {
             Intrinsic::ToBits => {
                 let v = self.eval(&args[0], mask);
                 v.into_iter().map(|x| Val::U(x.f().to_bits())).collect()
+            }
+            Intrinsic::Field(m) => {
+                let (w, l) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+                (0..n)
+                    .map(|t| {
+                        let x = field(w[t].u(), l[t].u(), m.bits());
+                        Val::F(match m {
+                            Mini::F16 => f32::from(F16(x as u16)),
+                            Mini::E4M3 => f32::from(E4M3(x as u8)),
+                            Mini::E2M1 => f32::from(E2M1(x as u8)),
+                        })
+                    })
+                    .collect()
             }
             Intrinsic::Bits | Intrinsic::Signed => {
                 let (w, l, n) = (

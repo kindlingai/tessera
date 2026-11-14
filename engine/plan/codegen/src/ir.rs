@@ -84,6 +84,32 @@ impl BinOp {
     }
 }
 
+/// A narrow float format for reading a field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mini {
+    F16,
+    E4M3,
+    E2M1,
+}
+
+impl Mini {
+    pub fn bits(self) -> u32 {
+        match self {
+            Mini::F16 => 16,
+            Mini::E4M3 => 8,
+            Mini::E2M1 => 4,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mini::F16 => "f16",
+            Mini::E4M3 => "e4m3",
+            Mini::E2M1 => "e2m1",
+        }
+    }
+}
+
 /// What a kernel may call besides arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
@@ -121,6 +147,8 @@ pub enum Intrinsic {
     Bits,
     /// `w.signed(low, n)`: a bit field, sign-extended, as a float.
     Signed,
+    /// `w.f16(low)` and kin: a field read as a narrow float.
+    Field(Mini),
     /// `x.to_bits()` and `f32::from_bits(x)`.
     ToBits,
     FromBits,
@@ -549,6 +577,7 @@ impl Printer<'_> {
                 arg(self, 1),
                 arg(self, 2)
             ),
+            Intrinsic::Field(m) => format!("f_{}({}, {})", m.name(), arg(self, 0), arg(self, 1)),
             Intrinsic::Signed => {
                 format!(
                     "f_sfield({}, {}, {})",

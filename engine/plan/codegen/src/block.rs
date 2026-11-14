@@ -46,30 +46,16 @@ pub trait Scale: Sync {
     fn load_inline(p: impl Pass<Expr>) -> Inline;
 }
 
-/// A float from `x`: `E` exponent and `M` mantissa bits.
-#[helper("f_mini{E}_{M}")]
-pub(crate) fn minifloat<const E: u32, const M: u32>(x: u32) -> f32 {
-    let ex = (x >> M) & ((1u32 << E) - 1);
-    let mn = x & ((1u32 << M) - 1);
-    // A subnormal counts units of the least normal.
-    let v = if ex == 0 {
-        mn as f32 * f32::from_bits((129 - (1u32 << (E - 1)) - M) << 23)
-    } else {
-        f32::from_bits(((ex + (128 - (1u32 << (E - 1)))) << 23) | (mn << (23 - M)))
-    };
-    if ((x >> (E + M)) & 1) != 0 { -v } else { v }
-}
-
 /// An f16 scale: two bytes, low first.
 #[kernel]
 fn f16_scale(p: Buf<U8>) -> f32 {
-    minifloat::<5, 10>(p[0] as u32 | ((p[1] as u32) << 8))
+    (p[0] as u32 | ((p[1] as u32) << 8)).f16(0)
 }
 
 /// An e4m3 scale: one byte.
 #[kernel]
 fn e4m3_scale(p: Buf<U8>) -> f32 {
-    minifloat::<4, 3>(p[0] as u32)
+    (p[0] as u32).e4m3(0)
 }
 
 macro_rules! scale {
@@ -112,7 +98,7 @@ impl Code for E2M1 {
 /// An e2m1 nibble.
 #[kernel]
 fn e2m1_field(w: u32, low: u32) -> f32 {
-    minifloat::<2, 1>(w.bits(low, 4))
+    w.e2m1(low)
 }
 
 /// A signed byte.
