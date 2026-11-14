@@ -10,6 +10,8 @@ use std::path::Path;
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    /// A failed range request.
+    Net(String),
     /// The file breaks the format's rules.
     Format(String),
     Missing(String),
@@ -21,6 +23,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "checkpoint: {e}"),
+            Error::Net(m) => write!(f, "checkpoint over http: {m}"),
             Error::Format(m) => write!(f, "checkpoint format: {m}"),
             Error::Missing(name) => write!(f, "no tensor named {name}"),
             Error::DType(m) => write!(f, "unsupported element type: {m}"),
@@ -48,8 +51,18 @@ struct Entry {
     data_offsets: [u64; 2],
 }
 
+/// Where the bytes live.
+enum Backing {
+    Disk(fs::File),
+    /// Read by range requests.
+    Web(String),
+}
+
+/// The header pad in exlr8 files: one request reads it.
+const HEADER_PAD: u64 = 65_536;
+
 pub struct File {
-    file: fs::File,
+    backing: Backing,
     /// Where tensor bytes start.
     data: u64,
     entries: BTreeMap<String, Entry>,
@@ -64,6 +77,25 @@ fn width(dtype: &str) -> Option<u64> {
     }
 }
 
+/// Bytes `start..start + len` of `url`.
+fn fetch(url: &str, start: u64, len: u64) -> Result<Vec<u8>, Error> {
+    let range = format!("bytes={start}-{}", start + len - 1);
+    let net = |e: &dyn fmt::Display| Error::Net(format!("{url}: {e}"));
+    let resp = ureq::get(url)
+        .set("Range", &range)
+        .call()
+        .map_err(|e| net(&e))?;
+    if resp.status() != 206 {
+        return Err(net(&format_args!("status {} for {range}", resp.status())));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    resp.into_reader().take(len).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != len {
+        return Err(net(&format_args!("{} of {len} bytes", bytes.len())));
+    }
+    Ok(bytes)
+}
+
 impl File {
     pub fn open(path: &Path) -> Result<Self, Error> {
         let mut file = fs::File::open(path)?;
@@ -76,8 +108,24 @@ impl File {
         }
         let mut header = vec![0u8; len as usize];
         file.read_exact(&mut header)?;
+        Self::parse(Backing::Disk(file), &header, size)
+    }
+
+    /// A file served over http, one tensor per request.
+    pub fn remote(url: &str) -> Result<Self, Error> {
+        let first = fetch(url, 0, HEADER_PAD)?;
+        let len = u64::from_le_bytes(first[..8].try_into().expect("8 bytes"));
+        if len + 8 > HEADER_PAD {
+            return Err(format(format_args!("a {len}-byte header past the pad")));
+        }
+        let header = &first[8..8 + len as usize];
+        Self::parse(Backing::Web(url.into()), header, u64::MAX)
+    }
+
+    fn parse(backing: Backing, header: &[u8], size: u64) -> Result<Self, Error> {
+        let len = header.len() as u64;
         let mut all: BTreeMap<String, serde_json::Value> =
-            serde_json::from_slice(&header).map_err(format)?;
+            serde_json::from_slice(header).map_err(format)?;
         all.remove("__metadata__");
         let data = 8 + len;
         let mut entries = BTreeMap::new();
@@ -90,14 +138,38 @@ impl File {
             entries.insert(name, e);
         }
         Ok(Self {
-            file,
+            backing,
             data,
             entries,
         })
     }
 
+    /// Bytes `start..end` of the tensor area.
+    fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, Error> {
+        match &self.backing {
+            Backing::Disk(file) => {
+                let mut bytes = vec![0u8; (end - start) as usize];
+                let mut file = file;
+                file.seek(SeekFrom::Start(self.data + start))?;
+                file.read_exact(&mut bytes)?;
+                Ok(bytes)
+            }
+            Backing::Web(url) => fetch(url, self.data + start, end - start),
+        }
+    }
+
     pub fn shape(&self, name: &str) -> Option<&[usize]> {
         self.entries.get(name).map(|e| e.shape.as_slice())
+    }
+
+    /// A tensor's bytes as stored.
+    pub fn bytes(&self, name: &str) -> Result<Vec<u8>, Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        let [start, end] = e.data_offsets;
+        self.read(start, end)
     }
 
     /// A tensor's values, widened to f32.
@@ -111,10 +183,7 @@ impl File {
         if end - start != count * width {
             return Err(format(format_args!("{name} has the wrong byte count")));
         }
-        let mut bytes = vec![0u8; (end - start) as usize];
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(self.data + start))?;
-        file.read_exact(&mut bytes)?;
+        let bytes = self.read(start, end)?;
         let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
         // A bf16 is the top half of an f32.
         let half = |b: &[u8; 2]| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16);
