@@ -10,12 +10,14 @@ use checkpoint::exlr8::Release;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
 use lower::{Device, Plan, Run, Settings, lower, open};
+use models::Rotated;
 use models::eg2::{Config, probe, program, weight};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use trace::DimName::{Context, Seqs};
 use trace::Graph;
+use trace::Linear;
 
 /// The release sizes, cut to `layers`.
 fn config(layers: u64) -> Config {
@@ -31,7 +33,7 @@ fn graph(g: Graph) -> Graph {
 
 #[test]
 fn traces() {
-    let g = graph(program(&config(24)));
+    let g = graph(program::<Linear>(&config(24)));
     graph::verify(&g).unwrap();
     assert_eq!(g.regions.len(), 2 * 24);
     let count = |w: &graph::Weight| w.ty.shape.elements(&g.dims).unwrap().as_const().unwrap();
@@ -90,7 +92,7 @@ fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
 }
 
 /// The exlr8 release: matrices against bf16, embeddings against the reference.
-fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
+fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
     let release = match std::fs::read_to_string(dir.join("exlr8.repo")) {
         Ok(repo) => {
             let (repo, revision) = repo.trim().split_once('@').unwrap_or((repo.trim(), "main"));
@@ -123,12 +125,40 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
         "exlr8: every weight decoded in {:.1} s",
         start.elapsed().as_secs_f32()
     );
+    // The codes before their rotations, rotated in the graph.
+    let turned = graph(program::<Rotated>(c));
+    let sides = bound(&turned, c, &|name| release.read(name).ok());
+    let mut embeddings = Vec::new();
     for c in cases {
         let got = unit(&pooled(g, &w, &c.tokens, 1));
         let cos = cosine_f32(&got, &c.embedding);
         eprintln!("exlr8 {}: cos {cos:.5} against the bf16 reference", c.name);
         assert!(cos > 0.98, "{}: cos {cos}", c.name);
+        let rotated = unit(&pooled(&turned, &sides, &c.tokens, 1));
+        let same = cosine_f32(&rotated, &got);
+        eprintln!(
+            "exlr8 {} rotated in the graph: cos {same:.7} against decoded",
+            c.name
+        );
+        assert!(
+            same > 0.99999,
+            "{}: rotated in the graph differs, cos {same}",
+            c.name
+        );
+        embeddings.push(rotated);
     }
+    Exlr8 {
+        graph: turned,
+        weights: sides,
+        embeddings,
+    }
+}
+
+/// The rotated graph, its weights, and the interpreter's embeddings.
+struct Exlr8 {
+    graph: Graph,
+    weights: Vec<Tensor>,
+    embeddings: Vec<Vec<f32>>,
 }
 
 /// Tokens and positions for one text, `[1, len]` each.
@@ -170,7 +200,8 @@ fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
 }
 
 /// Every case through the forward entry on this machine's GPU.
-fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
+fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) -> Vec<Vec<f32>> {
+    let mut embeddings = Vec::new();
     let mut device = Device::guess(settings);
     let mut runner: Option<Box<dyn Run>> = None;
     let mut learned = 0;
@@ -225,8 +256,7 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
             .map(|(k, s)| format!("{k} {:.1} ms", s * 1e3))
             .collect();
         eprintln!("    {}", parts.join(", "));
-        let got = unit(&out);
-        close(&format!("{} on the device", c.name), &got, &c.embedding);
+        embeddings.push(unit(&out));
     }
     if let Some(path) = Device::path(settings, &device.name) {
         device.save(&path).unwrap();
@@ -235,6 +265,7 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) {
             path.display()
         );
     }
+    embeddings
 }
 
 fn unit(v: &[f32]) -> Vec<f32> {
@@ -253,7 +284,7 @@ fn close(label: &str, got: &[f32], want: &[f32]) {
 fn check_layers(dir: &Path, c: &Case) {
     for layers in [1, 2, 5, 6, 12, 24] {
         let cfg = config(layers);
-        let g = graph(probe(&cfg));
+        let g = graph(probe::<Linear>(&cfg));
         let w = weights(&g, &cfg, dir);
         let got = pooled(&g, &w, &c.tokens, c.tokens.len());
         let hidden = got.len();
@@ -273,18 +304,25 @@ fn matches_reference() {
         check_layers(&dir, &cases[0]);
     }
     let cfg = config(24);
-    let g = graph(program(&cfg));
+    let g = graph(program::<Linear>(&cfg));
     let w = weights(&g, &cfg, &dir);
     for c in &cases {
         let got = unit(&pooled(&g, &w, &c.tokens, 1));
         close(&c.name, &got, &c.embedding);
     }
-    if dir.join("exlr8").is_dir() || dir.join("exlr8.repo").is_file() {
-        check_exlr8(&dir, &g, &cfg, &cases[..1]);
-    }
+    let quantized = (dir.join("exlr8").is_dir() || dir.join("exlr8.repo").is_file())
+        .then(|| check_exlr8(&dir, &g, &cfg, &cases[..1]));
     let settings = settings::read();
     if settings.gpu().is_none() {
         return eprintln!("no GPU here; skipped");
     }
-    check_device(&settings, &g, &w, &cases);
+    let got = check_device(&settings, &g, &w, &cases);
+    for (c, got) in cases.iter().zip(&got) {
+        close(&format!("{} on the device", c.name), got, &c.embedding);
+    }
+    let Some(q) = quantized else { return };
+    let got = check_device(&settings, &q.graph, &q.weights, &cases[..1]);
+    for (want, got) in q.embeddings.iter().zip(&got) {
+        close("exlr8 rotated on the device", got, want);
+    }
 }

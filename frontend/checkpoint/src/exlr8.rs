@@ -198,6 +198,33 @@ pub fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
             let svh = halves(f, &format!("{name}.svh"))?;
             Ok(rotate(trellis(f, name, &r)?, &r, &suh, &svh))
         }
+        other => plain(f, name, &r, other),
+    }
+}
+
+/// Matrix `name` as f32 `[out][in]` before its rotations, if any.
+pub fn codes(f: &File, name: &str) -> Result<Vec<f32>, Error> {
+    let r = record(f, name)?;
+    match r.format {
+        TRELLIS => Ok(transpose(&trellis(f, name, &r)?, &r)),
+        other => plain(f, name, &r, other),
+    }
+}
+
+/// `T[in][out]` as `[out][in]`.
+fn transpose(t: &[f32], r: &Record) -> Vec<f32> {
+    let mut w = vec![0.0; r.inp * r.out];
+    for row in 0..r.inp {
+        for col in 0..r.out {
+            w[col * r.inp + row] = t[row * r.out + col];
+        }
+    }
+    w
+}
+
+/// A matrix stored as fp8 rows, bf16 or f32.
+fn plain(f: &File, name: &str, r: &Record, format: i64) -> Result<Vec<f32>, Error> {
+    match format {
         FP8_ROW => {
             let codes = f.bytes(&format!("{name}.fp8"))?;
             let scale = f.floats(&format!("{name}.scale"))?;
@@ -272,14 +299,21 @@ impl Release {
         read(&files[file])
     }
 
-    /// Tensor `name` as f32: matrices decoded, vectors as stored.
+    /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.
     pub fn read(&self, name: &str) -> Result<Vec<f32>, Error> {
         let (file, local) = Self::place(name);
         self.with(&file, |f| {
-            let matrix_name = local.strip_suffix(".weight").unwrap_or(&local);
-            match f.shape(&format!("{matrix_name}.record")) {
-                Some(_) => matrix(f, matrix_name),
-                None => f.floats(&local),
+            let (matrix_name, part) = match local.rsplit_once('.') {
+                Some((m, part)) if ["weight", "codes", "suh", "svh"].contains(&part) => (m, part),
+                _ => (local.as_str(), "weight"),
+            };
+            if f.shape(&format!("{matrix_name}.record")).is_none() {
+                return f.floats(&local);
+            }
+            match part {
+                "codes" => codes(f, matrix_name),
+                "suh" | "svh" => halves(f, &format!("{matrix_name}.{part}")),
+                _ => matrix(f, matrix_name),
             }
         })
     }

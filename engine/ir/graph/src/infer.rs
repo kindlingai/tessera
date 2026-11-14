@@ -362,6 +362,14 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 finite(*eps, "norm epsilon")?;
                 whole(p, last, s)?;
             }
+            (Stage::Hadamard { block }, _) => {
+                let width = x.shape.0.last().expect("rank checked");
+                let fits = block.is_power_of_two() && blocks(dims, width, *block)?;
+                need(fits, ErrorKind::Shape, || {
+                    format!("rows of {width} do not hold whole blocks of {block}")
+                })?;
+                whole(p, last, s)?;
+            }
             (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
             (Stage::Rope { theta, .. }, Some(pos)) => {
                 need(theta.is_finite() && *theta > 0.0, ErrorKind::Value, || {
@@ -443,6 +451,16 @@ fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
         shape: Shape(shape),
         ..x.clone()
     })
+}
+
+/// Whether a known `width` is a multiple of `block`.
+fn blocks(dims: &[Dim], width: &DimExpr, block: u32) -> Result<bool, TypeError> {
+    let n = width.poly(dims).map_err(|d| TypeError {
+        kind: ErrorKind::Reference,
+        message: format!("{d:?} is not a dimension"),
+    })?;
+    Ok(n.as_const()
+        .is_none_or(|n| n.is_multiple_of(u64::from(block))))
 }
 
 fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {

@@ -1,10 +1,10 @@
 //! EmbeddingGemma 2: a bidirectional encoder with per-layer embeddings.
 
-use crate::shared::{Stack, tokens};
+use crate::shared::{Dense, Stack, tokens};
 use trace::DimName::*;
 use trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
-    Scalar, Tensor, Weights, each,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, PathSeg, Role, Scalar,
+    Tensor, Weights, each,
 };
 
 pub struct Config {
@@ -78,83 +78,83 @@ impl Config {
 
 /// One layer's attention: `S0` head width, `S1` key heads.
 #[derive(Weights)]
-pub struct Attention {
+pub struct Attention<D: Dense> {
     #[shape(Hidden)]
     pub ln: Norm,
     #[shape(Hidden, Heads * S0)]
-    pub q: Linear,
+    pub q: D,
     #[shape(Hidden, S1 * S0)]
-    pub k: Linear,
+    pub k: D,
     #[shape(Hidden, S1 * S0)]
-    pub v: Linear,
+    pub v: D,
     #[shape(S0)]
     pub q_norm: Norm,
     #[shape(S0)]
     pub k_norm: Norm,
     #[shape(Heads * S0, Hidden)]
-    pub o: Linear,
+    pub o: D,
     #[shape(Hidden)]
     pub post: Norm,
 }
 
 #[derive(Weights)]
-pub struct Layer {
+pub struct Layer<D: Dense> {
     #[shape(Hidden)]
     pub pre_ff: Norm,
     #[shape(Hidden, Ffn)]
-    pub gate: Linear,
+    pub gate: D,
     #[shape(Hidden, Ffn)]
-    pub up: Linear,
+    pub up: D,
     #[shape(Ffn, Hidden)]
-    pub down: Linear,
+    pub down: D,
     #[shape(Hidden)]
     pub post_ff: Norm,
     /// This layer's rows of the shared per-layer projection.
     #[shape(Hidden, PerLayer)]
-    pub ple_in: Linear,
+    pub ple_in: D,
     #[shape(Hidden, PerLayer)]
-    pub ple_gate: Linear,
+    pub ple_gate: D,
     #[shape(PerLayer, Hidden)]
-    pub ple_proj: Linear,
+    pub ple_proj: D,
     #[shape(Hidden)]
     pub ple_norm: Norm,
     #[shape()]
     pub scalar: Scalar,
 }
 
-/// The weights outside attention.
+/// The weights outside attention. `D` is how matrices are stored.
 #[derive(Weights)]
-pub struct Eg2 {
+pub struct Eg2<D: Dense> {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
     #[shape(Layers)]
-    pub layers: Vec<Layer>,
+    pub layers: Vec<Layer<D>>,
     #[shape(PerLayer)]
     pub ple_norm: Norm,
     #[shape(Hidden)]
     pub norm: Norm,
     #[shape(Hidden, Embedding)]
-    pub proj: Linear,
+    pub proj: D,
 }
 
 /// Each layer's attention, shaped for its kind.
-pub fn attention(m: &Model, c: &Config) -> Vec<Attention> {
+pub fn attention<D: Dense>(m: &Model, c: &Config) -> Vec<Attention<D>> {
     each(m, "attention", Layers, |l| c.heads(u64::from(l)).to_vec())
 }
 
 /// The residual stream after every layer, `[Seqs, Context, Hidden]`.
-pub fn trunk(
+pub fn trunk<D: Dense>(
     m: &Model,
     c: &Config,
-    w: &Eg2,
-    attention: &[Attention],
+    w: &Eg2<D>,
+    attention: &[Attention<D>],
     [tokens, positions]: [&Tensor; 2],
 ) -> Tensor {
     let (eps, hidden) = (c.eps, c.stack.hidden as f32);
     let inputs = m.embed(tokens, &w.embed).scale(hidden.sqrt());
     let mut x = inputs.clone();
     for (l, layer) in w.layers.iter().enumerate() {
-        let ple = inputs.matmul(&layer.ple_in).scale(hidden.powf(-0.5));
+        let ple = layer.ple_in.apply(&inputs).scale(hidden.powf(-0.5));
         let ple = ple.rms_norm(&w.ple_norm, eps);
         let attend = || [attend(m, c, l as u64, &attention[l], &x, positions)];
         let [attn] = m.composite(Composite::Attention, attend);
@@ -164,41 +164,48 @@ pub fn trunk(
             [geglu(&h, layer).rms_norm(&layer.post_ff, eps)]
         });
         x = x.add(&mlp);
-        let gated = x.matmul(&layer.ple_gate).act(Act::GeluTanh).mul(&ple);
-        let o = gated.matmul(&layer.ple_proj).rms_norm(&layer.ple_norm, eps);
+        let gated = layer.ple_gate.apply(&x).act(Act::GeluTanh).mul(&ple);
+        let o = layer.ple_proj.apply(&gated).rms_norm(&layer.ple_norm, eps);
         x = x.add(&o).mul_scalar(&layer.scalar);
     }
     x
 }
 
 /// One embedding per text, `[Seqs, Embedding]`. Callers normalize.
-pub fn forward(
+pub fn forward<D: Dense>(
     m: &Model,
     c: &Config,
-    w: &Eg2,
-    attention: &[Attention],
+    w: &Eg2<D>,
+    attention: &[Attention<D>],
     ports: [&Tensor; 2],
 ) -> Tensor {
     let x = trunk(m, c, w, attention, ports);
-    x.rms_norm(&w.norm, c.eps).matmul(&w.proj).mean(1)
+    w.proj.apply(&x.rms_norm(&w.norm, c.eps)).mean(1)
 }
 
-fn geglu(h: &Tensor, l: &Layer) -> Tensor {
-    let inner = h.matmul(&l.gate).act(Act::GeluTanh).mul(&h.matmul(&l.up));
-    inner.matmul(&l.down)
+fn geglu<D: Dense>(h: &Tensor, l: &Layer<D>) -> Tensor {
+    let inner = l.gate.apply(h).act(Act::GeluTanh).mul(&l.up.apply(h));
+    l.down.apply(&inner)
 }
 
 /// Queries, keys and values are normed per head, scores unscaled.
-fn attend(m: &Model, c: &Config, l: u64, a: &Attention, x: &Tensor, positions: &Tensor) -> Tensor {
+fn attend<D: Dense>(
+    m: &Model,
+    c: &Config,
+    l: u64,
+    a: &Attention<D>,
+    x: &Tensor,
+    positions: &Tensor,
+) -> Tensor {
     let [head, kv_heads] = c.heads(l);
     let (theta, mask) = match c.full(l) {
         true => (c.full_theta, Mask::Bidirectional),
         false => (c.theta, Mask::Within(c.window)),
     };
     let h = x.rms_norm(&a.ln, c.eps);
-    let split = |w: &Linear, heads: DimExpr| {
+    let split = |w: &D, heads: DimExpr| {
         let shaped = vec![Seqs.into(), Context.into(), heads, head.clone()];
-        h.matmul(w).reshape(shaped)
+        w.apply(&h).reshape(shaped)
     };
     let turn = |t: Tensor, norm: &Norm| {
         let normed = t.rms_norm(norm, c.eps);
@@ -209,13 +216,13 @@ fn attend(m: &Model, c: &Config, l: u64, a: &Attention, x: &Tensor, positions: &
     let v = split(&a.v, kv_heads).rms(c.eps);
     let out = m.attend(mask, 1.0, [&q, &k, &v], None);
     let flat = vec![Seqs.into(), Context.into(), Heads * head];
-    out.reshape(flat).matmul(&a.o).rms_norm(&a.post, c.eps)
+    a.o.apply(&out.reshape(flat)).rms_norm(&a.post, c.eps)
 }
 
 /// One forward entry: tokens and positions in, embeddings out.
-pub fn program(c: &Config) -> Graph {
+pub fn program<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let w: Eg2 = trace::declare(&m);
+    let w: Eg2<D> = trace::declare(&m);
     let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
     let out = forward(&m, c, &w, &attention, [&tokens, &positions]);
@@ -223,18 +230,28 @@ pub fn program(c: &Config) -> Graph {
 }
 
 /// The residual stream after the last layer, for parity checks.
-pub fn probe(c: &Config) -> Graph {
+pub fn probe<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let w: Eg2 = trace::declare(&m);
+    let w: Eg2<D> = trace::declare(&m);
     let attention = attention(&m, c);
     let [tokens, positions] = tokens(&m);
     let out = trunk(&m, c, &w, &attention, [&tokens, &positions]);
     m.finish([(Role::Logits, &out)])
 }
 
-/// The released checkpoint's tensor name for a weight path.
+/// The checkpoint's tensor name for a weight path.
 pub fn tensor_name(path: &[PathSeg]) -> Option<String> {
     use PathSeg::{Field, Index};
+    if let [rest @ .., Field(part)] = path
+        && let Some(suffix) = match part.as_str() {
+            "w" => Some("codes"),
+            "suh" | "svh" => Some(part.as_str()),
+            _ => None,
+        }
+    {
+        let whole = tensor_name(rest)?;
+        return Some(whole.replace(".weight", &format!(".{suffix}")));
+    }
     let name = match path {
         [Field(f)] => match f.as_str() {
             "embed" => "embed_tokens.weight".into(),
@@ -278,12 +295,21 @@ pub fn weight(
     read: &dyn Fn(&str) -> Option<Vec<f32>>,
 ) -> Option<Vec<f32>> {
     use PathSeg::{Field, Index};
+    let shared = "language_model.ple.per_layer_model_projection";
     match path {
-        [Field(_), Index(i), Field(f)] if f == "ple_in" => {
-            let all = read("language_model.ple.per_layer_model_projection.weight")?;
-            let rows = (c.per_layer * c.stack.hidden) as usize;
-            let at = *i as usize * rows;
-            Some(all[at..at + rows].to_vec())
+        [Field(_), Index(i), Field(f), rest @ ..] if f == "ple_in" => {
+            // The layer's slice of the shared projection.
+            let part = rest.first().map(|p| format!("{p:?}")).unwrap_or_default();
+            let (name, span) = match part.as_str() {
+                "" => ("weight", c.per_layer * c.stack.hidden),
+                "Field(\"w\")" => ("codes", c.per_layer * c.stack.hidden),
+                "Field(\"svh\")" => ("svh", c.per_layer),
+                "Field(\"suh\")" => return read(&format!("{shared}.suh")),
+                _ => return None,
+            };
+            let all = read(&format!("{shared}.{name}"))?;
+            let at = *i as usize * span as usize;
+            Some(all[at..at + span as usize].to_vec())
         }
         _ => read(&tensor_name(path)?),
     }

@@ -109,6 +109,13 @@ fn attention([heads, kv_heads, width]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// Rows of 256, rotated in two blocks of 128.
+fn rotation() -> Graph {
+    let m = model(&[Rows], &[(Hidden, 256)]);
+    let [x] = m.entry(EntryKind::Forward, [floats([Rows, Hidden])]);
+    m.finish([(Role::Logits, &x.hadamard(128))])
+}
+
 /// Rows read from a table.
 fn table(vocab: u64, width: u64) -> Graph {
     let m = model(&[Rows], &[(Vocab, vocab), (Hidden, width)]);
@@ -223,6 +230,7 @@ impl Grid {
             let outs = self.widths.iter().chain(&self.vocabs);
             cases.extend(outs.map(|n| by_rows(linear(k, *n))));
         }
+        cases.push(by_rows(rotation()));
         for &width in self.widths.iter().chain(&self.vocabs) {
             cases.push(by_rows(rows(width)));
             cases.extend(self.vocabs.iter().map(|v| by_rows(table(*v, width))));

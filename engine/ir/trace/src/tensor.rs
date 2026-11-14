@@ -75,6 +75,11 @@ impl Tensor {
         self.stage(Stage::Rms { eps }, &[])
     }
 
+    /// The scaled Walsh-Hadamard transform of each `block` of the row.
+    pub fn hadamard(&self, block: u32) -> Tensor {
+        self.stage(Stage::Hadamard { block }, &[])
+    }
+
     pub fn center(&self) -> Tensor {
         self.stage(Stage::Center, &[])
     }
