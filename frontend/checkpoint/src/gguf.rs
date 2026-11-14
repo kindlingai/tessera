@@ -1,6 +1,7 @@
 //! A GGUF header and tensor bytes read on demand.
 
 use crate::Error;
+use crate::offer::{Offer, Slice, Stored};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -365,5 +366,37 @@ impl Gguf {
                 .map(|b| f32::from(graph::F16(u16::from_le_bytes(*b))))
                 .collect(),
         })
+    }
+}
+
+impl Offer for Gguf {
+    /// GGUF puts the fastest axis first, a slice last.
+    fn slices(&self) -> Vec<Slice> {
+        let stored = |ty: GgufType| match ty {
+            GgufType::F32 => Stored::F32,
+            GgufType::F16 => Stored::F16,
+            GgufType::Q8_0 => Stored::Form(&codegen::block::Q8_0),
+            GgufType::Q4_0 => Stored::Form(&codegen::block::Q4_0),
+        };
+        (self.entries.iter())
+            .map(|(name, e)| Slice {
+                name: name.clone(),
+                shape: e.dims.iter().rev().map(|d| *d as usize).collect(),
+                stored: stored(e.ty),
+            })
+            .collect()
+    }
+
+    fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
+        Gguf::floats(self, name)
+    }
+
+    fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
+        match self.tensor_type(name)? {
+            GgufType::F32 | GgufType::F16 => {
+                Err(Error::DType(format!("{name} holds floats, not a form")))
+            }
+            _ => Ok(self.bytes(name)?.2),
+        }
     }
 }

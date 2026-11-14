@@ -1,5 +1,6 @@
 //! One safetensors file: a JSON header, then tensor bytes.
 
+use crate::offer::{Offer, Slice, Stored};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -191,5 +192,31 @@ impl File {
             4 => bytes.as_chunks::<4>().0.iter().map(wide).collect(),
             _ => bytes.as_chunks::<2>().0.iter().map(half).collect(),
         })
+    }
+}
+
+impl Offer for File {
+    fn slices(&self) -> Vec<Slice> {
+        let stored = |dtype: &str| match dtype {
+            "F32" => Stored::F32,
+            "BF16" => Stored::Bf16,
+            "F16" => Stored::F16,
+            _ => Stored::Other,
+        };
+        (self.entries.iter())
+            .map(|(name, e)| Slice {
+                name: name.clone(),
+                shape: e.shape.clone(),
+                stored: stored(&e.dtype),
+            })
+            .collect()
+    }
+
+    fn floats(&self, name: &str) -> Result<Vec<f32>, Error> {
+        File::floats(self, name)
+    }
+
+    fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
+        Err(Error::DType(format!("{name} holds floats, not a form")))
     }
 }

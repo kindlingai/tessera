@@ -1,4 +1,4 @@
-use crate::{Error, Gguf, GgufType, Meta};
+use crate::{Error, Gguf, GgufType, Meta, Offer, Stored};
 use std::path::PathBuf;
 
 fn string(out: &mut Vec<u8>, text: &str) {
@@ -140,6 +140,16 @@ fn reads_gguf() {
         assert!(matches!(g.floats("q4"), Err(Error::DType(_))));
         assert!(matches!(g.elements("absent"), Err(Error::Missing(_))));
         assert!(g.has("q8") && !g.has("absent"));
+        let slices = g.slices();
+        let names: Vec<&str> = slices.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["f", "h", "q4", "q8"]);
+        let q8 = &slices[3];
+        assert_eq!(
+            (q8.elements(), q8.stored),
+            (32, Stored::Form(&codegen::block::Q8_0))
+        );
+        assert_eq!(Offer::packed(&g, "q8").unwrap(), vec![23; 34]);
+        assert!(matches!(Offer::packed(&g, "f"), Err(Error::DType(_))));
         let mut v2 = bytes.clone();
         v2[4] = 2;
         assert!(open(&v2).is_ok());

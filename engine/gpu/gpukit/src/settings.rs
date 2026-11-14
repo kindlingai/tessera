@@ -26,6 +26,8 @@ pub struct Settings {
     pub eg2: Option<PathBuf>,
     /// The spaCy pipeline and tokens the parity test reads.
     pub spacy: Option<PathBuf>,
+    /// A JSON file of weight-name rules, applied last.
+    pub names: Option<PathBuf>,
     /// The GPU whose tile rounding the host imitates.
     pub emulate: Option<Backend>,
 }
@@ -39,6 +41,7 @@ impl Default for Settings {
             qwen3: None,
             eg2: None,
             spacy: None,
+            names: None,
             emulate: None,
         }
     }

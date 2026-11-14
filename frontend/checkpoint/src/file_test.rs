@@ -1,4 +1,4 @@
-use crate::{Error, File};
+use crate::{Error, File, Offer, Stored};
 use std::path::PathBuf;
 
 /// Writes a header and tensor bytes to a temporary file.
@@ -33,6 +33,9 @@ fn widens_to_f32() {
     assert_eq!(f.shape("b"), Some(&[1, 2][..]));
     assert!(matches!(f.floats("c"), Err(Error::DType(_))));
     assert!(matches!(f.floats("d"), Err(Error::Missing(_))));
+    let stored: Vec<Stored> = f.slices().iter().map(|s| s.stored).collect();
+    assert_eq!(stored, [Stored::F32, Stored::Bf16, Stored::Other]);
+    assert!(matches!(Offer::packed(&f, "a"), Err(Error::DType(_))));
     std::fs::remove_file(path).unwrap();
 }
 
