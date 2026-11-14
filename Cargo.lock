@@ -208,6 +208,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "checkpoint"
 version = "0.1.0"
 dependencies = [
+ "codegen",
  "graph",
  "serde",
  "serde_json",
@@ -995,6 +996,7 @@ version = "0.1.0"
 dependencies = [
  "calibrate",
  "checkpoint",
+ "codegen",
  "gpukit",
  "graph",
  "interp",

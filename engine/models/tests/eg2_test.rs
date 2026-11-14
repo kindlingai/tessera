@@ -7,11 +7,13 @@ use linear as _;
 use calibrate::measure;
 use checkpoint::File;
 use checkpoint::exlr8::Release;
+use codegen::trellis;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
-use lower::{Device, Plan, Run, Settings, lower, open};
+use lower::form::F32_FORM;
+use lower::{Device, Pins, Plan, Run, Settings, lower, open};
 use models::Rotated;
-use models::eg2::{Config, probe, program, weight};
+use models::eg2::{Config, probe, program, tensor_name, weight};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -148,6 +150,7 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
         embeddings.push(rotated);
     }
     Exlr8 {
+        release,
         graph: turned,
         weights: sides,
         embeddings,
@@ -156,6 +159,7 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
 
 /// The rotated graph, its weights, and the interpreter's embeddings.
 struct Exlr8 {
+    release: Release,
     graph: Graph,
     weights: Vec<Tensor>,
     embeddings: Vec<Vec<f32>>,
@@ -199,10 +203,31 @@ fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
     by
 }
 
+/// Pins, and packed bytes by weight, for the device.
+struct Stored<'a> {
+    pins: Pins,
+    packed: &'a dyn Fn(u32) -> Option<Vec<u8>>,
+}
+
+impl Default for Stored<'_> {
+    fn default() -> Self {
+        Self {
+            pins: Pins::all(F32_FORM),
+            packed: &|_| None,
+        }
+    }
+}
+
 /// Every case through the forward entry on this machine's GPU.
-fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) -> Vec<Vec<f32>> {
+fn check_device(
+    settings: &Settings,
+    g: &Graph,
+    w: &[Tensor],
+    cases: &[Case],
+    stored: &Stored,
+) -> Vec<Vec<f32>> {
     let mut embeddings = Vec::new();
-    let mut device = Device::guess(settings);
+    let mut device = Device::guess(settings).pinned(stored.pins.clone());
     let mut runner: Option<Box<dyn Run>> = None;
     let mut learned = 0;
     for c in cases {
@@ -215,9 +240,15 @@ fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) ->
                 let plan = lower(g, 0, &sizes, &device).unwrap();
                 let mut r = open(plan, settings).unwrap();
                 for (at, t) in w.iter().enumerate() {
-                    r.load(at as u32, t.view()).unwrap();
+                    let path = &g.weights[at].path;
+                    let loaded = match (stored.packed)(at as u32) {
+                        Some(bytes) => r.load_packed(at as u32, &bytes),
+                        None => r.load(at as u32, t.view()),
+                    };
+                    loaded.unwrap_or_else(|e| panic!("weight {at} {path:?}: {e}"));
                 }
                 device = Device::stored(&*r, settings).unwrap();
+                device = device.pinned(stored.pins.clone());
                 runner.insert(r)
             }
         };
@@ -316,13 +347,47 @@ fn matches_reference() {
     if settings.gpu().is_none() {
         return eprintln!("no GPU here; skipped");
     }
-    let got = check_device(&settings, &g, &w, &cases);
+    let got = check_device(&settings, &g, &w, &cases, &Stored::default());
     for (c, got) in cases.iter().zip(&got) {
         close(&format!("{} on the device", c.name), got, &c.embedding);
     }
     let Some(q) = quantized else { return };
-    let got = check_device(&settings, &q.graph, &q.weights, &cases[..1]);
+    let got = check_device(
+        &settings,
+        &q.graph,
+        &q.weights,
+        &cases[..1],
+        &Stored::default(),
+    );
     for (want, got) in q.embeddings.iter().zip(&got) {
         close("exlr8 rotated on the device", got, want);
+    }
+    // The codes on the device, decoded as they are read.
+    let codes = |at: u32| {
+        let path = &q.graph.weights[at as usize].path;
+        let [.., trace::PathSeg::Field(last)] = &path[..] else {
+            return None;
+        };
+        if last != "w" {
+            return None;
+        }
+        // A layer's per-layer input: its slice of the shared projection.
+        let shared = "language_model.ple.per_layer_model_projection.codes";
+        let (name, rows) = match (path.get(1), path.get(2)) {
+            (Some(trace::PathSeg::Index(l)), Some(trace::PathSeg::Field(f))) if f == "ple_in" => {
+                let per = cfg.per_layer as usize;
+                (shared.to_string(), Some((*l as usize * per, per)))
+            }
+            _ => (tensor_name(path)?, None),
+        };
+        Some(q.release.packed(&name, rows).unwrap())
+    };
+    let stored = Stored {
+        pins: Pins::all(F32_FORM).pin("*.w", trellis::form_for(4).unwrap()),
+        packed: &codes,
+    };
+    let got = check_device(&settings, &q.graph, &q.weights, &cases[..1], &stored);
+    for (want, got) in q.embeddings.iter().zip(&got) {
+        close("exlr8 codes on the device", got, want);
     }
 }

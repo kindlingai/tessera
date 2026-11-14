@@ -88,10 +88,12 @@ pub fn terms(plan: &Plan) -> Terms {
 /// Every weight form whose blocks fit rows of `k`.
 pub fn forms(k: usize) -> Vec<&'static dyn lower::Form> {
     let fits = |f: &&&dyn lower::Form| k.is_multiple_of(f.align());
+    // Row kernels read rows: tiled forms are widened first.
+    let rows = |f: &&dyn lower::Form| f.layout() == codegen::form::Layout::Rows;
     lower::form::FORMS
         .iter()
         .filter(fits)
         .copied()
-        .filter(|f| f.dtype().is_float())
+        .filter(|f| f.dtype().is_float() && rows(f))
         .collect()
 }
