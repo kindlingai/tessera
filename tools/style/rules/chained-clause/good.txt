@@ -1,0 +1,11 @@
+This builder serves the MLA group. That group's spec keeps `tokens_per_state` at 1.
+---
+The config lists every peer, and the daemon reads it at start.
+---
+The router picks the first address, which is the fastest.
+---
+The config, which lists every peer, is read at start.
+---
+The daemon reads the config that lists every peer.
+---
+The router forwards each request to the first live group.
