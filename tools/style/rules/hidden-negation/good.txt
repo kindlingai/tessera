@@ -19,3 +19,5 @@ Only these URLs.
 A list field links its members to an archive page. Other fields render inline.
 ---
 The head solves every claim.
+---
+The cache starts empty on each run.

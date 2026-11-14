@@ -1,4 +1,4 @@
-//! Rules from `rules/<id>/`: rule.yaml, rule.md and fixes.txt.
+//! Rules from `rules/<id>/`: rule.yaml and rule.md.
 
 use std::path::{Path, PathBuf};
 
@@ -30,14 +30,6 @@ impl Rule {
         first
             .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default()
-    }
-
-    /// The first `bad => good` pair in fixes.txt.
-    pub fn example(&self) -> Option<(String, String)> {
-        let text = std::fs::read_to_string(self.dir.join("fixes.txt")).ok()?;
-        let block = text.split("\n---").next()?;
-        let (bad, good) = block.split_once("\n=>")?;
-        Some((bad.trim().to_string(), good.trim().to_string()))
     }
 }
 

@@ -31,7 +31,7 @@ fn place(f: &Found, links: Option<&str>) -> String {
     }
 }
 
-/// A rule's fix, its example, then each hit.
+/// A rule's fix, then each hit.
 fn section(
     out: &mut String,
     rule: &Rule,
@@ -50,12 +50,6 @@ fn section(
         .filter(|g| !g.is_empty())
         .unwrap_or(rule.description.clone());
     writeln!(out, "{why} More in {see}.")?;
-    if let Some((bad, good)) = rule.example() {
-        writeln!(
-            out,
-            "\n````text\n{bad}\n````\nbecomes\n````text\n{good}\n````"
-        )?;
-    }
     writeln!(out)?;
     for f in rows.iter().take(MAX_PER_RULE) {
         let text = f.text.trim();

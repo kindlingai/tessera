@@ -20,11 +20,6 @@ fn cases(rule: &Rule) -> Vec<(String, bool)> {
         .map(|b| (b, true))
         .collect();
     out.extend(blocks(read("good.txt")).into_iter().map(|b| (b, false)));
-    for pair in blocks(read("fixes.txt")) {
-        if let Some((bad, good)) = pair.split_once("\n=>\n") {
-            out.extend([(bad.to_string(), true), (good.to_string(), false)]);
-        }
-    }
     out
 }
 
