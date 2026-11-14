@@ -1,7 +1,7 @@
 //! Runs a body on the host, each group in lockstep.
 
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
 use crate::kept::Layout;
 use crate::numerics::Precision;
 use graph::{E2M1, E4M3, F16};
@@ -297,172 +297,57 @@ impl Group<'_, '_> {
     }
 
     fn call(&mut self, i: Intrinsic, args: &[Expr], mask: &[bool]) -> Vec<Val> {
-        let n = self.threads;
-        let unary = |g: &mut Self, f: fn(f32) -> f32| {
-            let v = g.eval(&args[0], mask);
-            v.into_iter().map(|x| Val::F(f(x.f()))).collect()
+        host(i)(self, args, mask)
+    }
+
+    fn unary(&mut self, args: &[Expr], mask: &[bool], f: fn(f32) -> f32) -> Vec<Val> {
+        let v = self.eval(&args[0], mask);
+        v.into_iter().map(|x| Val::F(f(x.f()))).collect()
+    }
+
+    fn pair(&mut self, args: &[Expr], mask: &[bool], f: fn(f32, f32) -> f32) -> Vec<Val> {
+        let (a, b) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+        a.into_iter()
+            .zip(b)
+            .map(|(x, y)| Val::F(f(x.f(), y.f())))
+            .collect()
+    }
+
+    /// The `bits` wide field at `args`, as `f` widens it.
+    fn narrow(&mut self, args: &[Expr], mask: &[bool], bits: u32, f: fn(u32) -> f32) -> Vec<Val> {
+        let (w, l) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+        (0..self.threads)
+            .map(|t| Val::F(f(field(w[t].u(), l[t].u(), bits))))
+            .collect()
+    }
+
+    /// `f` of each bit field and its width.
+    fn fields(&mut self, args: &[Expr], mask: &[bool], f: fn(u32, u32) -> Val) -> Vec<Val> {
+        let (w, l, n) = (
+            self.eval(&args[0], mask),
+            self.eval(&args[1], mask),
+            self.eval(&args[2], mask),
+        );
+        (0..n.len())
+            .map(|t| f(field(w[t].u(), l[t].u(), n[t].u()), n[t].u()))
+            .collect()
+    }
+
+    /// The `width` bytes at a byte offset, as a u32.
+    fn read(&mut self, args: &[Expr], mask: &[bool], width: usize) -> Vec<Val> {
+        let Expr::Var(name) = &args[0] else {
+            panic!("a word read names its buffer");
         };
-        match i {
-            Intrinsic::Gid => (0..n).map(|t| Val::U((self.first + t) as u32)).collect(),
-            Intrinsic::Lid => (0..n).map(|t| Val::U(t as u32)).collect(),
-            Intrinsic::Lane => (0..n).map(|t| Val::U((t % self.lanes) as u32)).collect(),
-            Intrinsic::ShflXor => {
-                let (v, m) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
-                (0..n)
-                    .map(|t| {
-                        let other = t ^ (m[t].u() as usize);
-                        // Lanes shuffle within their own SIMD group.
-                        if other / self.lanes == t / self.lanes && other < n {
-                            v[other]
-                        } else {
-                            v[t]
-                        }
-                    })
-                    .collect()
-            }
-            Intrinsic::Sum32 => {
-                let v = self.eval(&args[0], mask);
-                let lanes = self.lanes;
-                (0..n)
-                    .map(|t| {
-                        let group = t / lanes * lanes;
-                        let end = (group + lanes).min(n);
-                        Val::F((group..end).filter(|s| mask[*s]).map(|s| v[s].f()).sum())
-                    })
-                    .collect()
-            }
-            Intrinsic::Rsqrt => unary(self, |x| 1.0 / x.sqrt()),
-            Intrinsic::Exp => unary(self, f32::exp),
-            Intrinsic::Tanh => unary(self, f32::tanh),
-            Intrinsic::Cos => unary(self, f32::cos),
-            Intrinsic::Sin => unary(self, f32::sin),
-            Intrinsic::Max => {
-                let (a, b) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
-                a.into_iter()
-                    .zip(b)
-                    .map(|(x, y)| Val::F(x.f().max(y.f())))
-                    .collect()
-            }
-            Intrinsic::Pow => {
-                let (a, b) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
-                a.into_iter()
-                    .zip(b)
-                    .map(|(x, y)| Val::F(x.f().powf(y.f())))
-                    .collect()
-            }
-            Intrinsic::Clamp => {
-                let v = self.eval(&args[0], mask);
-                let (lo, hi) = (self.eval(&args[1], mask), self.eval(&args[2], mask));
-                (0..n)
-                    .map(|t| Val::F(v[t].f().clamp(lo[t].f(), hi[t].f())))
-                    .collect()
-            }
-            Intrinsic::Load4 => {
-                let Expr::Var(name) = &args[0] else {
-                    panic!("a load names its buffer");
-                };
-                let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
-                (0..n)
-                    .map(|t| {
-                        if mask[t] {
-                            self.load4(&arg, at[t].l())
-                        } else {
-                            Val::V([0.0; 4])
-                        }
-                    })
-                    .collect()
-            }
-            Intrinsic::Store4 => {
-                let Expr::Var(name) = &args[0] else {
-                    panic!("a store names its buffer");
-                };
-                let arg = self.arg(name);
-                let (at, v) = (self.eval(&args[1], mask), self.eval(&args[2], mask));
-                for t in (0..n).filter(|t| mask[*t]) {
-                    for (i, x) in v[t].v().into_iter().enumerate() {
-                        self.store(&arg, at[t].l() + i as u64, Val::F(x));
-                    }
-                }
-                vec![Val::B(false); n]
-            }
-            Intrinsic::Zero4 => vec![Val::V([0.0; 4]); n],
-            Intrinsic::Make4 => {
-                let parts: Vec<Vec<Val>> = args.iter().map(|a| self.eval(a, mask)).collect();
-                (0..n)
-                    .map(|t| Val::V([0, 1, 2, 3].map(|i| parts[i][t].f())))
-                    .collect()
-            }
-            Intrinsic::ToBits => {
-                let v = self.eval(&args[0], mask);
-                v.into_iter().map(|x| Val::U(x.f().to_bits())).collect()
-            }
-            Intrinsic::Field(m) => {
-                let (w, l) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
-                (0..n)
-                    .map(|t| {
-                        let x = field(w[t].u(), l[t].u(), m.bits());
-                        Val::F(match m {
-                            Mini::F16 => f32::from(F16(x as u16)),
-                            Mini::E4M3 => f32::from(E4M3(x as u8)),
-                            Mini::E2M1 => f32::from(E2M1(x as u8)),
-                        })
-                    })
-                    .collect()
-            }
-            Intrinsic::Bits | Intrinsic::Signed => {
-                let (w, l, n) = (
-                    self.eval(&args[0], mask),
-                    self.eval(&args[1], mask),
-                    self.eval(&args[2], mask),
-                );
-                (0..n.len())
-                    .map(|t| {
-                        let field = field(w[t].u(), l[t].u(), n[t].u());
-                        match i {
-                            Intrinsic::Bits => Val::U(field),
-                            _ => Val::F(sign_extend(field, n[t].u()) as f32),
-                        }
-                    })
-                    .collect()
-            }
-            Intrinsic::FromBits => {
-                let v = self.eval(&args[0], mask);
-                v.into_iter()
-                    .map(|x| Val::F(f32::from_bits(x.u())))
-                    .collect()
-            }
-            Intrinsic::Word | Intrinsic::Half => {
-                let Expr::Var(name) = &args[0] else {
-                    panic!("a word read names its buffer");
-                };
-                let width = if i == Intrinsic::Word { 4 } else { 2 };
-                let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
-                let bytes = &self.buffers[arg.buffer];
-                (0..n)
-                    .map(|t| {
-                        let at = arg.skip + at[t].u() as usize;
-                        let mut raw = [0u8; 4];
-                        raw[..width].copy_from_slice(&bytes[at..at + width]);
-                        Val::U(u32::from_le_bytes(raw))
-                    })
-                    .collect()
-            }
-            Intrinsic::KeptRow => {
-                let layout = self
-                    .layout
-                    .expect("a kernel reading kept rows names its layout");
-                let values: Vec<u32> = (layout.params().iter())
-                    .map(|p| match self.args.get(*p) {
-                        Some(ArgVal::U32(v)) => *v,
-                        other => panic!("layout scalar `{p}` is {other:?}"),
-                    })
-                    .collect();
-                let (s, p) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
-                (0..n)
-                    .map(|t| Val::U(layout.at(s[t].u(), p[t].u(), &values)))
-                    .collect()
-            }
-        }
+        let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
+        let bytes = &self.buffers[arg.buffer];
+        (0..self.threads)
+            .map(|t| {
+                let at = arg.skip + at[t].u() as usize;
+                let mut raw = [0u8; 4];
+                raw[..width].copy_from_slice(&bytes[at..at + width]);
+                Val::U(u32::from_le_bytes(raw))
+            })
+            .collect()
     }
 
     /// Every thread's statements, under `mask`.
@@ -749,6 +634,22 @@ impl Group<'_, '_> {
         }
     }
 }
+
+type Host = for<'a, 'b> fn(&mut Group<'a, 'b>, &[Expr], &[bool]) -> Vec<Val>;
+
+/// Runs each intrinsic per thread, from the table.
+macro_rules! hosts {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
+        { device: $dev:expr, text: $text:expr, host: $host:expr, count: $count:expr $(,)? })*) => {
+        fn host(i: Intrinsic) -> Host {
+            match i {
+                $(Intrinsic::$var => $host,)*
+            }
+        }
+    };
+}
+
+crate::intrinsic::table!(hosts);
 
 /// Integers wrap. Anything with a float is a float.
 fn binary(op: BinOp, a: Val, b: Val) -> Val {

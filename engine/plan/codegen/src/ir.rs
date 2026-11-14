@@ -84,77 +84,63 @@ impl BinOp {
     }
 }
 
-/// A narrow float format for reading a field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mini {
-    F16,
-    E4M3,
-    E2M1,
+/// The `Ty` of an intrinsic's Rust return type.
+macro_rules! ty {
+    (u32) => {
+        Ty::U32
+    };
+    (F32x4) => {
+        Ty::F32x4
+    };
+    (f32) => {
+        Ty::F32
+    };
+    // A statement's value is never read.
+    () => {
+        Ty::F32
+    };
 }
 
-impl Mini {
-    pub fn bits(self) -> u32 {
-        match self {
-            Mini::F16 => 16,
-            Mini::E4M3 => 8,
-            Mini::E2M1 => 4,
+/// What a kernel may call besides arithmetic, from the table.
+macro_rules! intrinsics {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:ident),*)
+        $(-> $ret:ident)? { device: $dev:expr, text: $text:expr, host: $host:expr,
+        count: $count:expr $(,)? })*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Intrinsic {
+            $($(#[$doc])* $var,)*
         }
-    }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Mini::F16 => "f16",
-            Mini::E4M3 => "e4m3",
-            Mini::E2M1 => "e2m1",
+        impl Intrinsic {
+            pub const ALL: &[Intrinsic] = &[$(Intrinsic::$var),*];
+
+            /// The type of the value a call gives.
+            pub fn ty(self) -> Ty {
+                match self {
+                    $(Intrinsic::$var => ty!($($ret)?),)*
+                }
+            }
+
+            /// Arguments a call takes, a method's receiver first.
+            pub fn arity(self) -> usize {
+                match self {
+                    $(Intrinsic::$var => <[&str]>::len(&[$(stringify!($arg)),*]),)*
+                }
+            }
+
+            fn print(self, p: &mut Printer, args: &[Expr]) -> String {
+                let n = self.arity();
+                assert_eq!(args.len(), n, "`{self:?}` takes {n} arguments");
+                let text: fn(&mut Printer, &[Expr]) -> String = match self {
+                    $(Intrinsic::$var => $text,)*
+                };
+                text(p, args)
+            }
         }
-    }
+    };
 }
 
-/// What a kernel may call besides arithmetic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Intrinsic {
-    /// The thread's index in the grid, and in its group.
-    Gid,
-    Lid,
-    /// The thread's lane among the 32 that shuffle together.
-    Lane,
-    /// `shfl_xor(value, mask)`.
-    ShflXor,
-    /// `sum32(value)`: the sum over the 32 lanes.
-    Sum32,
-    Rsqrt,
-    Exp,
-    Tanh,
-    Max,
-    /// `clamp(value, low, high)`.
-    Clamp,
-    Pow,
-    Cos,
-    Sin,
-    /// `load4(buffer, index)`: four elements as floats.
-    Load4,
-    /// `store4(buffer, index, value)`.
-    Store4,
-    /// A zeroed `float4`.
-    Zero4,
-    /// `kept_row(slot, position)`: the row the layout gives.
-    KeptRow,
-    /// `p.word(offset)`: the u32 at a byte offset.
-    Word,
-    /// `p.half(offset)`: the u16 at a byte offset.
-    Half,
-    /// `w.bits(low, n)`: a bit field as a u32.
-    Bits,
-    /// `w.signed(low, n)`: a bit field, sign-extended, as a float.
-    Signed,
-    /// `w.f16(low)` and kin: a field read as a narrow float.
-    Field(Mini),
-    /// `x.to_bits()` and `f32::from_bits(x)`.
-    ToBits,
-    FromBits,
-    /// `F32x4::new(a, b, c, d)`.
-    Make4,
-}
+crate::intrinsic::table!(intrinsics);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -440,18 +426,7 @@ impl Printer<'_> {
                 _ => self.ty(a),
             },
             Expr::Fn(_, ty, _) => *ty,
-            Expr::Call(i, _) => match i {
-                Intrinsic::Gid
-                | Intrinsic::Lid
-                | Intrinsic::Lane
-                | Intrinsic::KeptRow
-                | Intrinsic::Word
-                | Intrinsic::Half
-                | Intrinsic::Bits
-                | Intrinsic::ToBits => Ty::U32,
-                Intrinsic::Load4 | Intrinsic::Zero4 | Intrinsic::Make4 => Ty::F32x4,
-                _ => Ty::F32,
-            },
+            Expr::Call(i, _) => i.ty(),
         }
     }
 
@@ -515,7 +490,7 @@ impl Printer<'_> {
                     None => format!("{base}.{h}"),
                 }
             }
-            Expr::Call(i, args) => self.call(*i, args),
+            Expr::Call(i, args) => i.print(self, args),
             // A choice settled at build time leaves one branch.
             Expr::Select(c, a, b) if matches!(**c, Expr::Bool(_)) => {
                 let taken = if **c == Expr::Bool(true) { a } else { b };
@@ -532,74 +507,10 @@ impl Printer<'_> {
         }
     }
 
-    fn call(&mut self, i: Intrinsic, args: &[Expr]) -> String {
-        let arg = |p: &mut Self, n: usize| p.expr(&args[n]);
-        match i {
-            Intrinsic::Gid => "gid".into(),
-            Intrinsic::Lid => "lid".into(),
-            Intrinsic::Lane => {
-                self.lane = true;
-                "lane".into()
-            }
-            Intrinsic::ShflXor => format!("f_shfl_xor({}, {})", arg(self, 0), arg(self, 1)),
-            Intrinsic::Sum32 => panic!("sum32 is a statement: `v = sum32(v)`"),
-            Intrinsic::Rsqrt => format!("f_rsqrt({})", arg(self, 0)),
-            Intrinsic::Exp => format!("f_exp({})", arg(self, 0)),
-            Intrinsic::Tanh => format!("f_tanh({})", arg(self, 0)),
-            Intrinsic::Max => format!("f_max({}, {})", arg(self, 0), arg(self, 1)),
-            Intrinsic::Pow => format!("f_pow({}, {})", arg(self, 0), arg(self, 1)),
-            Intrinsic::Cos => format!("f_cos({})", arg(self, 0)),
-            Intrinsic::Sin => format!("f_sin({})", arg(self, 0)),
-            Intrinsic::Clamp => {
-                let (v, lo, hi) = (arg(self, 0), arg(self, 1), arg(self, 2));
-                format!("f_clamp({v}, {lo}, {hi})")
-            }
-            Intrinsic::Load4 => {
-                let (form, at) = (self.buffer(&args[0]), arg(self, 1));
-                let Expr::Var(name) = &args[0] else {
-                    unreachable!()
-                };
-                form.load4(name, &at)
-            }
-            Intrinsic::Store4 => {
-                let Expr::Var(name) = &args[0] else {
-                    panic!("a store names its buffer");
-                };
-                let name = name.clone();
-                format!("f_f32x4({name} + {}) = {}", arg(self, 1), arg(self, 2))
-            }
-            Intrinsic::Zero4 => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
-            Intrinsic::Word => format!("f_u32(({} + {}))", arg(self, 0), arg(self, 1)),
-            Intrinsic::Half => format!("f_u16(({} + {}))", arg(self, 0), arg(self, 1)),
-            Intrinsic::Bits => format!(
-                "f_field({}, {}, {})",
-                arg(self, 0),
-                arg(self, 1),
-                arg(self, 2)
-            ),
-            Intrinsic::Field(m) => format!("f_{}({}, {})", m.name(), arg(self, 0), arg(self, 1)),
-            Intrinsic::Signed => {
-                format!(
-                    "f_sfield({}, {}, {})",
-                    arg(self, 0),
-                    arg(self, 1),
-                    arg(self, 2)
-                )
-            }
-            Intrinsic::ToBits => format!("f_asbits({})", arg(self, 0)),
-            Intrinsic::FromBits => format!("f_bits({})", arg(self, 0)),
-            Intrinsic::Make4 => {
-                let parts = [0, 1, 2, 3].map(|n| arg(self, n));
-                format!("f_make4({})", parts.join(", "))
-            }
-            Intrinsic::KeptRow => {
-                let (slot, position) = (arg(self, 0), arg(self, 1));
-                let layout = self
-                    .layout
-                    .expect("a kernel reading kept rows names its layout");
-                layout.row(&slot, &position)
-            }
-        }
+    /// `name(args)`, each argument printed in turn.
+    fn spell(&mut self, name: &str, args: &[Expr]) -> String {
+        let args: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+        format!("{name}({})", args.join(", "))
     }
 
     fn block(&mut self, stmts: &[Stmt]) {

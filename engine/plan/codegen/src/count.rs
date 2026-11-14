@@ -2,7 +2,7 @@
 
 use crate::LANES;
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
 use sim::Ops;
 use std::collections::HashMap;
 
@@ -157,10 +157,6 @@ impl Counter {
     }
 
     fn expr(&mut self, e: &Expr) -> bool {
-        let float = |ops: f64| Ops {
-            float: ops,
-            ..Ops::default()
-        };
         match e {
             Expr::Int(_) | Expr::Bool(_) | Expr::Var(_) => false,
             Expr::Float(_) => true,
@@ -169,15 +165,9 @@ impl Counter {
                 let (fa, fb) = (self.expr(a), self.expr(b));
                 let is_float = fa || fb || matches!(op, BinOp::Div) && (fa || fb);
                 match (op.compares(), is_float) {
-                    (true, _) => self.add(Ops {
-                        int: 1.0,
-                        ..Ops::default()
-                    }),
+                    (true, _) => self.add(int(1.0)),
                     (false, true) => self.add(float(1.0)),
-                    (false, false) => self.add(Ops {
-                        int: 1.0,
-                        ..Ops::default()
-                    }),
+                    (false, false) => self.add(int(1.0)),
                 }
                 is_float
             }
@@ -205,10 +195,7 @@ impl Counter {
             Expr::Select(c, a, b) => {
                 self.expr(c);
                 let (fa, fb) = (self.expr(a), self.expr(b));
-                self.add(Ops {
-                    int: 1.0,
-                    ..Ops::default()
-                });
+                self.add(int(1.0));
                 fa || fb
             }
             Expr::Fn(_, ty, args) => {
@@ -221,103 +208,15 @@ impl Counter {
                 for a in args {
                     self.expr(a);
                 }
-                match i {
-                    Intrinsic::Rsqrt
-                    | Intrinsic::Exp
-                    | Intrinsic::Tanh
-                    | Intrinsic::Pow
-                    | Intrinsic::Cos
-                    | Intrinsic::Sin => {
-                        self.add(Ops {
-                            special: 1.0,
-                            ..Ops::default()
-                        });
-                        true
-                    }
-                    Intrinsic::ShflXor | Intrinsic::Max => {
-                        self.add(float(1.0));
-                        true
-                    }
-                    Intrinsic::KeptRow => {
-                        self.add(Ops {
-                            int: 2.0,
-                            ..Ops::default()
-                        });
-                        false
-                    }
-                    Intrinsic::Bits => {
-                        self.add(Ops {
-                            int: 1.0,
-                            ..Ops::default()
-                        });
-                        false
-                    }
-                    Intrinsic::Signed => {
-                        self.add(Ops {
-                            int: 1.0,
-                            float: 1.0,
-                            ..Ops::default()
-                        });
-                        true
-                    }
-                    // Tallied by format: each chip prices its conversions.
-                    Intrinsic::Field(m) => {
-                        let mut ops = Ops::default();
-                        match m {
-                            Mini::F16 => ops.f16 = 1.0,
-                            Mini::E4M3 => ops.e4m3 = 1.0,
-                            Mini::E2M1 => ops.e2m1 = 1.0,
-                        }
-                        self.add(ops);
-                        true
-                    }
-                    Intrinsic::Clamp => {
-                        self.add(float(2.0));
-                        true
-                    }
-                    Intrinsic::Sum32 => {
-                        self.add(Ops {
-                            float: 5.0,
-                            int: 5.0,
-                            ..Ops::default()
-                        });
-                        true
-                    }
-                    Intrinsic::Load4 => {
-                        let bytes = self.global(&args[0]).map_or(4.0, |f| f.element_bytes());
-                        let (at, mut l) = (&args[1], self.loops.pop());
-                        // Four elements move the address by one of them.
-                        let fresh = match &mut l {
-                            None => 1.0,
-                            Some(l) => {
-                                match self.advance(at, l).times(l.step.unwrap_or(f64::NAN)) {
-                                    Advance::Still => 0.0,
-                                    Advance::By(u) if u.is_finite() => (u * bytes / LINE).min(1.0),
-                                    _ => 1.0,
-                                }
-                            }
-                        };
-                        self.loops.extend(l);
-                        self.add(Ops {
-                            loads: 1.0,
-                            fresh,
-                            width: 4.0 * bytes,
-                            ..Ops::default()
-                        });
-                        true
-                    }
-                    Intrinsic::Store4 => {
-                        self.add(Ops {
-                            stores: 1.0,
-                            ..Ops::default()
-                        });
-                        false
-                    }
-                    Intrinsic::FromBits | Intrinsic::Make4 => true,
-                    _ => false,
-                }
+                cost(*i)(self, args)
             }
         }
+    }
+
+    /// Adds `ops`, and says whether the value is a float.
+    fn tally(&mut self, ops: Ops, float: bool) -> bool {
+        self.add(ops);
+        float
     }
 
     fn stmts(&mut self, stmts: &[Stmt]) {
@@ -450,6 +349,42 @@ impl Counter {
         }
     }
 }
+
+fn float(n: f64) -> Ops {
+    Ops {
+        float: n,
+        ..Ops::default()
+    }
+}
+
+fn int(n: f64) -> Ops {
+    Ops {
+        int: n,
+        ..Ops::default()
+    }
+}
+
+fn special(n: f64) -> Ops {
+    Ops {
+        special: n,
+        ..Ops::default()
+    }
+}
+
+/// Counts each intrinsic, from the table.
+macro_rules! costs {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
+        { device: $dev:expr, text: $text:expr, host: $host:expr, count: $count:expr $(,)? })*) => {
+        /// What a call adds. True for a float value.
+        fn cost(i: Intrinsic) -> fn(&mut Counter, &[Expr]) -> bool {
+            match i {
+                $(Intrinsic::$var => $count,)*
+            }
+        }
+    };
+}
+
+crate::intrinsic::table!(costs);
 
 /// Whether any loop's bounds are read at launch.
 fn runtime_loops(stmts: &[Stmt]) -> bool {
