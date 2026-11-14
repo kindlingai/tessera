@@ -4,9 +4,7 @@ use crate::product::{Product, Variant};
 use codegen::ir::{Body, Expr};
 use codegen::prelude::*;
 use graph::Order;
-use lower::{
-    Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree, UNPROVEN,
-};
+use lower::{Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Step, T, Tree};
 
 /// Elements one wide load brings a lane.
 const WIDE: u32 = 4;
@@ -66,7 +64,20 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
 }
 
 /// `x[m, k]` times `w[n, k]` transposed, per SIMD group.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Kernel)]
+#[launch(
+    name = self.product.form.suffixed("lanes"),
+    sizes = self.product.sizes(),
+    work = self.product.work(),
+    accepts = self.product.accepts(input, form),
+    needs = Needs::lanes(),
+    // The lanes sum in one fixed tree on every device.
+    order = Order::PerConfig,
+    source = self.product.source(self.tree(), "linear"),
+    launches = lanes_launches,
+    load = lanes_load,
+    unproven,
+)]
 pub struct Lanes {
     pub product: Product,
 }
@@ -90,49 +101,30 @@ impl Lanes {
     }
 }
 
-impl Kernel for Lanes {
-    fn name(&self) -> &'static str {
-        self.product.form.suffixed("lanes")
-    }
+fn lanes_load(k: &Lanes, _: usize) -> Option<Load> {
+    let Product {
+        m,
+        n,
+        k: depth,
+        form,
+        ..
+    } = k.product;
+    let loads = 1 + usize::from(form.pairs() > 0);
+    let bytes = form.bytes(WIDE as usize) * loads;
+    Some(Load {
+        threads: n * LANES,
+        group: 256,
+        trips: (depth / (LANES * WIDE as usize * loads)) as f64,
+        trip: k.tree().trip(),
+        reads: form.matmul_bytes(m, n, depth),
+        written: (4 * m * n) as f64,
+        flight: (bytes * AHEAD as usize) as f64,
+    })
+}
 
-    over_product!();
-
-    /// The lanes sum in one fixed tree on every device.
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn load(&self, _: usize) -> Option<Load> {
-        let Product { m, n, k, form, .. } = self.product;
-        let loads = 1 + usize::from(form.pairs() > 0);
-        let bytes = form.bytes(WIDE as usize) * loads;
-        Some(Load {
-            threads: n * LANES,
-            group: 256,
-            trips: (k / (LANES * WIDE as usize * loads)) as f64,
-            trip: self.tree().trip(),
-            reads: form.matmul_bytes(m, n, k),
-            written: (4 * m * n) as f64,
-            flight: (bytes * AHEAD as usize) as f64,
-        })
-    }
-
-    fn source(&self) -> Source {
-        self.product.source(self.tree(), "linear")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let Product { n, k, .. } = self.product;
-        self.product.launch(step, &[n, k], Shape::Line(n * LANES))
-    }
-
-    fn guess(&self) -> f64 {
-        UNPROVEN
-    }
-
-    fn needs(&self) -> Needs {
-        Needs::lanes()
-    }
+fn lanes_launches(k: &Lanes, step: &Step) -> Vec<Launch> {
+    let Product { n, k: depth, .. } = k.product;
+    k.product.launch(step, &[n, depth], Shape::Line(n * LANES))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

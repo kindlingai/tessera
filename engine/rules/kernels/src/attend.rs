@@ -164,89 +164,77 @@ fn attend_rows(
 }
 
 /// Scaled query rows over kept keys, by slot and position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "attend_rows",
+    order = Order::PerConfig,
+    sizes = self.0.sizes(),
+    work = self.0.heads * self.0.queries * self.0.keys.most() * self.0.width,
+    needs = group_needs(),
+    source = rows_source,
+    launches = rows_launches,
+)]
 pub struct AttendRows(pub Attn);
 
-impl Kernel for AttendRows {
-    over_attn!("attend_rows");
+fn rows_source(k: &AttendRows) -> Source {
+    let body = kept::attach(attend_rows_ir(), k.0.kept);
+    Source::named(body, format!("plan_attend_rows_{}", k.0.kept.name()))
+}
 
-    fn source(&self) -> Source {
-        let body = kept::attach(attend_rows_ir(), self.0.kept);
-        Source::named(body, format!("plan_attend_rows_{}", self.0.kept.name()))
-    }
-
-    /// One launch over every row.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let mut args = a.rows_args(step);
-        args.push(Arg::count(a.width));
-        args.extend(a.kept_args());
-        vec![Launch {
-            args,
-            shape: Shape::Grid {
-                across: a.queries * a.heads,
-                down: 1,
-                threads: THREADS as usize,
-            },
-        }]
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        (a.heads * a.queries * a.keys.most() * a.width) as f64
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            group_bytes: 4 * THREADS as usize,
-            group_threads: THREADS as usize,
-            ..Needs::default()
-        }
-    }
+/// One launch over every row.
+fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
+    let a = &k.0;
+    let mut args = a.rows_args(step);
+    args.push(Arg::count(a.width));
+    args.extend(a.kept_args());
+    vec![Launch {
+        args,
+        shape: Shape::Grid {
+            across: a.queries * a.heads,
+            down: 1,
+            threads: THREADS as usize,
+        },
+    }]
 }
 
 /// Reads scaled queries, and keys joined with values. Any mask.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    attend,
+    name = "attend",
+    order = Order::PerConfig,
+    sizes = self.0.sizes(),
+    work = self.0.seqs * self.0.heads * self.0.queries * self.0.seen() * self.0.width,
+    needs = group_needs(),
+    launches = attend_launches,
+)]
 pub struct Attend(pub Attn);
 
-impl Kernel for Attend {
-    over_attn!("attend");
+/// One launch per sequence, each at its own offset.
+fn attend_launches(k: &Attend, step: &Step) -> Vec<Launch> {
+    let a = &k.0;
+    let keys = a.keys.most();
+    let (q, kv) = (
+        a.queries * a.heads * a.width,
+        keys * a.kv_heads * a.width * 2,
+    );
+    let buffers = |s: usize| {
+        [
+            Arg::at(step.reads[0], s * q),
+            Arg::at(step.reads[1], s * kv),
+            Arg::at(step.write, s * q),
+        ]
+    };
+    let across = a.queries * a.heads;
+    let launch = |s| a.launch(buffers(s), [Arg::count(a.width)], across, THREADS as usize);
+    (0..a.seqs).map(launch).collect()
+}
 
-    fn source(&self) -> Source {
-        Source::named(attend_ir(), "plan_attend")
-    }
-
-    /// One launch per sequence, each at its own offset.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.0;
-        let keys = a.keys.most();
-        let (q, kv) = (
-            a.queries * a.heads * a.width,
-            keys * a.kv_heads * a.width * 2,
-        );
-        let buffers = |s: usize| {
-            [
-                Arg::at(step.reads[0], s * q),
-                Arg::at(step.reads[1], s * kv),
-                Arg::at(step.write, s * q),
-            ]
-        };
-        let across = a.queries * a.heads;
-        let launch = |s| a.launch(buffers(s), [Arg::count(a.width)], across, THREADS as usize);
-        (0..a.seqs).map(launch).collect()
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.0;
-        (a.seqs * a.heads * a.queries * a.seen() * a.width) as f64
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            group_bytes: 4 * THREADS as usize,
-            group_threads: THREADS as usize,
-            ..Needs::default()
-        }
+fn group_needs() -> Needs {
+    Needs {
+        group_bytes: 4 * THREADS as usize,
+        group_threads: THREADS as usize,
+        ..Needs::default()
     }
 }
 

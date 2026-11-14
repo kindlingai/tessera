@@ -1,9 +1,8 @@
 //! A narrow value as floats, for kernels that read floats.
 
-use crate::abi::{Arg, Launch, Shape, Source};
+use crate::Kernel;
+use crate::abi::Source;
 use crate::form::Form as Stored;
-use crate::kernel::Kernel;
-use crate::plan::Step;
 use codegen::prelude::*;
 use sim::Load;
 
@@ -22,45 +21,40 @@ fn widen(
 }
 
 /// Widens `len` elements of `form` to f32.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    widen(self.form),
+    crate = crate,
+    name = "widen",
+    threads = self.len,
+    sizes = [],
+    source = widen_source,
+    load = widen_load,
+    accepts = widen_accepts,
+)]
 pub struct Widen {
     pub len: usize,
     pub form: &'static dyn Stored,
 }
 
-impl Kernel for Widen {
-    fn name(&self) -> &'static str {
-        "widen"
-    }
+fn widen_source(k: &Widen) -> Source {
+    let entry = format!("plan_widen_{}", k.form.name());
+    Source::named(widen_ir(k.form), entry)
+}
 
-    fn source(&self) -> Source {
-        Source::named(
-            widen_ir(self.form),
-            format!("plan_widen_{}", self.form.name()),
-        )
-    }
+fn widen_load(k: &Widen, _: usize) -> Option<Load> {
+    let len = k.len as f64;
+    Some(Load {
+        threads: k.len,
+        group: 256,
+        trips: 1.0,
+        trip: widen_ir(k.form).trip(),
+        reads: vec![k.form.bytes(k.len) as f64],
+        written: 4.0 * len,
+        flight: 4.0,
+    })
+}
 
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        vec![Launch {
-            args: vec![step.read(0), step.out(), Arg::count(self.len)],
-            shape: Shape::Line(self.len),
-        }]
-    }
-
-    fn load(&self, _: usize) -> Option<Load> {
-        let len = self.len as f64;
-        Some(Load {
-            threads: self.len,
-            group: 256,
-            trips: 1.0,
-            trip: widen_ir(self.form).trip(),
-            reads: vec![self.form.bytes(self.len) as f64],
-            written: 4.0 * len,
-            flight: 4.0,
-        })
-    }
-
-    fn accepts(&self, _: usize, form: &dyn Stored) -> bool {
-        form.name() == self.form.name()
-    }
+fn widen_accepts(k: &Widen, _: usize, form: &dyn Stored) -> bool {
+    form.name() == k.form.name()
 }

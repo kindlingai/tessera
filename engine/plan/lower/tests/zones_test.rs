@@ -9,8 +9,7 @@ use graph::DimName::{Context, Rows, Seqs};
 use lower::kernels::Map;
 use lower::sites;
 use lower::{
-    Cluster, Device, Draft, Error, Kernel, Launch, Link, Plan, Source, Step, T, Tree, Zone,
-    ZoneKind, lower,
+    Cluster, Device, Draft, Error, Kernel, Link, Plan, Step, T, Tree, Zone, ZoneKind, lower,
 };
 use models::qwen3::{Config, stepper};
 use run::open;
@@ -18,35 +17,18 @@ use settings::read as settings;
 use sim::Tag;
 
 /// Picks each row's largest entry on the host.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "host_top",
+    sizes = [],
+    source = Map::plain(Vec::new()).source(),
+    launches = Vec::new(),
+    work = self.rows,
+    guess = 0.0,
+    runs_on = ZoneKind::Cpu,
+)]
 struct HostTop {
     rows: usize,
-}
-
-impl Kernel for HostTop {
-    fn name(&self) -> &'static str {
-        "host_top"
-    }
-
-    fn source(&self) -> Source {
-        Map::plain(Vec::new()).source()
-    }
-
-    fn launches(&self, _: &Step) -> Vec<Launch> {
-        Vec::new()
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        self.rows as f64
-    }
-
-    fn guess(&self) -> f64 {
-        0.0
-    }
-
-    fn runs_on(&self) -> ZoneKind {
-        ZoneKind::Cpu
-    }
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

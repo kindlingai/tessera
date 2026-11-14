@@ -1,7 +1,7 @@
 //! Writes rows into kept rows by slot and position.
 
+use crate::Kernel;
 use crate::abi::{Arg, Launch, Shape, Source};
-use crate::kernel::Kernel;
 use crate::plan::Step;
 use codegen::kept::{self, Layout};
 use codegen::prelude::*;
@@ -26,7 +26,15 @@ fn scatter(
 }
 
 /// `rows` of `width` elements into `slots` of `context` rows.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    crate = crate,
+    name = "scatter",
+    sizes = [],
+    work = self.rows * self.width,
+    source = scatter_source,
+    launches = scatter_launches,
+)]
 pub struct Scatter {
     pub rows: usize,
     pub width: usize,
@@ -35,28 +43,18 @@ pub struct Scatter {
     pub kept: &'static dyn Layout,
 }
 
-impl Kernel for Scatter {
-    fn name(&self) -> &'static str {
-        "scatter"
-    }
+fn scatter_source(k: &Scatter) -> Source {
+    let body = kept::attach(scatter_ir(), k.kept);
+    Source::named(body, format!("plan_scatter_{}", k.kept.name()))
+}
 
-    fn source(&self) -> Source {
-        let body = kept::attach(scatter_ir(), self.kept);
-        Source::named(body, format!("plan_scatter_{}", self.kept.name()))
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [self.rows, self.width].map(Arg::count);
-        let values = self.kept.values(self.slots, self.context);
-        let kept = values.into_iter().map(|v| Arg::count(v as usize));
-        let args = [step.read(0), step.read(1), step.read(2), step.out()];
-        vec![Launch {
-            args: args.into_iter().chain(sizes).chain(kept).collect(),
-            shape: Shape::Line(self.rows * self.width),
-        }]
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        (self.rows * self.width) as f64
-    }
+fn scatter_launches(k: &Scatter, step: &Step) -> Vec<Launch> {
+    let sizes = [k.rows, k.width].map(Arg::count);
+    let values = k.kept.values(k.slots, k.context);
+    let kept = values.into_iter().map(|v| Arg::count(v as usize));
+    let args = [step.read(0), step.read(1), step.read(2), step.out()];
+    vec![Launch {
+        args: args.into_iter().chain(sizes).chain(kept).collect(),
+        shape: Shape::Line(k.rows * k.width),
+    }]
 }

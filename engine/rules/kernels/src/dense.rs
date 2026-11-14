@@ -3,9 +3,7 @@
 use codegen::prelude::*;
 use graph::{Mask, Order};
 use lower::sites;
-use lower::{
-    Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree, UNPROVEN,
-};
+use lower::{Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
 
 /// Rows are queries. The last query sees every key.
 #[kernel]
@@ -77,11 +75,22 @@ pub enum Part {
 }
 
 /// One tiled matmul per head.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = part_name(self.0),
+    needs = Needs::text(),
+    order = Order::PerConfig,
+    sizes = self.1.sizes(),
+    source = source(DType::F32),
+    launches = per_head_launches,
+    work = per_head_work(self),
+    unproven,
+)]
 pub struct PerHead(pub Part, pub Attn);
 
 /// Scaled causal softmax over each score row, in place.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(causal, name = "causal", launches = causal_launches, overwrites)]
 pub struct Causal {
     pub queries: usize,
     pub keys: usize,
@@ -109,93 +118,53 @@ fn per_head(a: &Attn, each: impl Fn(Starts) -> Launch) -> Vec<Launch> {
     pairs.map(|pair| each(at(pair))).collect()
 }
 
-impl Kernel for PerHead {
-    fn needs(&self) -> Needs {
-        Needs::text()
-    }
-
-    fn name(&self) -> &'static str {
-        match self.0 {
-            Part::Scores => "scores",
-            Part::Values => "values",
-        }
-    }
-
-    fn order(&self) -> Order {
-        Order::PerConfig
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        self.1.sizes()
-    }
-
-    fn source(&self) -> Source {
-        source(DType::F32)
-    }
-
-    /// Each head's rows sit a stride apart, with no copy.
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let a = &self.1;
-        let scores = gemm::Problem {
-            lda: a.heads * a.width,
-            ldb: a.kv_heads * a.width,
-            ..gemm::Problem::linear(a.queries, a.keys.most(), a.width)
-        };
-        let values = gemm::Problem {
-            ldb: a.kv_heads * a.width,
-            ldc: a.heads * a.width,
-            ..gemm::Problem::matmul(a.queries, a.width, a.keys.most())
-        };
-        let slots = [step.reads[0], step.reads[1], step.write];
-        per_head(a, |at| {
-            let (p, skips) = match self.0 {
-                Part::Scores => (scores, [at.query, at.key, at.score]),
-                Part::Values => (values, [at.score, at.key, at.query]),
-            };
-            launch(p, [0, 1, 2].map(|i| Arg::at(slots[i], skips[i])))
-        })
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        let a = &self.1;
-        let per_head = match self.0 {
-            Part::Scores => tiles(a.queries) * tiles(a.keys.most()) * a.width,
-            Part::Values => tiles(a.queries) * tiles(a.width) * a.keys.most(),
-        };
-        (a.seqs * a.heads * per_head) as f64
-    }
-
-    fn guess(&self) -> f64 {
-        UNPROVEN
+fn part_name(part: Part) -> &'static str {
+    match part {
+        Part::Scores => "scores",
+        Part::Values => "values",
     }
 }
 
-impl Kernel for Causal {
-    fn name(&self) -> &'static str {
-        "causal"
-    }
+/// Each head's rows sit a stride apart, with no copy.
+fn per_head_launches(k: &PerHead, step: &Step) -> Vec<Launch> {
+    let a = &k.1;
+    let scores = gemm::Problem {
+        lda: a.heads * a.width,
+        ldb: a.kv_heads * a.width,
+        ..gemm::Problem::linear(a.queries, a.keys.most(), a.width)
+    };
+    let values = gemm::Problem {
+        ldb: a.kv_heads * a.width,
+        ldc: a.heads * a.width,
+        ..gemm::Problem::matmul(a.queries, a.width, a.keys.most())
+    };
+    let slots = [step.reads[0], step.reads[1], step.write];
+    per_head(a, |at| {
+        let (p, skips) = match k.0 {
+            Part::Scores => (scores, [at.query, at.key, at.score]),
+            Part::Values => (values, [at.score, at.key, at.query]),
+        };
+        launch(p, [0, 1, 2].map(|i| Arg::at(slots[i], skips[i])))
+    })
+}
 
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.queries, self.keys]
-    }
+fn per_head_work(k: &PerHead) -> usize {
+    let a = &k.1;
+    let per_head = match k.0 {
+        Part::Scores => tiles(a.queries) * tiles(a.keys.most()) * a.width,
+        Part::Values => tiles(a.queries) * tiles(a.width) * a.keys.most(),
+    };
+    a.seqs * a.heads * per_head
+}
 
-    fn source(&self) -> Source {
-        Source::named(causal_ir(), "plan_causal")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let rows = step.write.len / self.keys;
-        let sizes = [rows, self.queries, self.keys].map(Arg::count);
-        let args = [step.read(0)].into_iter().chain(sizes);
-        vec![Launch {
-            args: args.chain([Arg::value(&self.scale)]).collect(),
-            shape: Shape::Line(rows),
-        }]
-    }
-
-    fn overwrites(&self) -> bool {
-        true
-    }
+fn causal_launches(k: &Causal, step: &Step) -> Vec<Launch> {
+    let rows = step.write.len / k.keys;
+    let sizes = [rows, k.queries, k.keys].map(Arg::count);
+    let args = [step.read(0)].into_iter().chain(sizes);
+    vec![Launch {
+        args: args.chain([Arg::value(&k.scale)]).collect(),
+        shape: Shape::Line(rows),
+    }]
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

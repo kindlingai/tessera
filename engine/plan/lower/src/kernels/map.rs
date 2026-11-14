@@ -1,8 +1,8 @@
 //! Generated elementwise kernels, one per chain of stages.
 
+use crate::Kernel;
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::form::F32_FORM;
-use crate::kernel::Kernel;
 use crate::plan::Step;
 use crate::rule::Draft;
 use crate::sites;
@@ -46,7 +46,15 @@ pub enum MapStage {
 }
 
 /// `out = stages(x, operands..)`. No stages makes a copy.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Kernel)]
+#[launch(
+    crate = crate,
+    name = "map",
+    work = len * (1 + self.0.len()),
+    load = map_load,
+    source = map_source,
+    launches = map_launches,
+)]
 pub struct Map(pub Vec<MapStage>, pub Vec<Option<usize>>);
 
 impl Map {
@@ -146,48 +154,36 @@ pub fn operands(stages: &[MapStage]) -> usize {
     stages.iter().filter(reads).count()
 }
 
-impl Kernel for Map {
-    fn name(&self) -> &'static str {
-        "map"
-    }
+/// One thread per element, each on its own lines.
+fn map_load(k: &Map, len: usize) -> Option<Load> {
+    let span = |s: &Option<usize>| 4.0 * s.unwrap_or(len) as f64;
+    let inputs = 1 + operands(&k.0);
+    let reads = [4.0 * len as f64].into_iter().chain(k.1.iter().map(span));
+    Some(Load {
+        threads: len,
+        group: 256,
+        trips: 1.0,
+        trip: k.tree().trip(),
+        reads: reads.collect(),
+        written: 4.0 * len as f64,
+        flight: 4.0 * inputs as f64,
+    })
+}
 
-    /// One thread per element, each on its own lines.
-    fn load(&self, len: usize) -> Option<Load> {
-        let span = |s: &Option<usize>| 4.0 * s.unwrap_or(len) as f64;
-        let inputs = 1 + operands(&self.0);
-        let reads = [4.0 * len as f64]
-            .into_iter()
-            .chain(self.1.iter().map(span));
-        Some(Load {
-            threads: len,
-            group: 256,
-            trips: 1.0,
-            trip: self.tree().trip(),
-            reads: reads.collect(),
-            written: 4.0 * len as f64,
-            flight: 4.0 * inputs as f64,
-        })
-    }
+fn map_source(k: &Map) -> Source {
+    let mut body = k.tree();
+    body.entry = format!("map_{:x}", hash(&body.text().body));
+    Source::Made(body)
+}
 
-    fn source(&self) -> Source {
-        let mut body = self.tree();
-        body.entry = format!("map_{:x}", hash(&body.text().body));
-        Source::Made(body)
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let len = step.write.len;
-        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
-        args.extend([step.out(), Arg::count(len)]);
-        vec![Launch {
-            args,
-            shape: Shape::Line(len),
-        }]
-    }
-
-    fn work(&self, len: usize) -> f64 {
-        (len * (1 + self.0.len())) as f64
-    }
+fn map_launches(_: &Map, step: &Step) -> Vec<Launch> {
+    let len = step.write.len;
+    let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+    args.extend([step.out(), Arg::count(len)]);
+    vec![Launch {
+        args,
+        shape: Shape::Line(len),
+    }]
 }
 
 impl Map {
