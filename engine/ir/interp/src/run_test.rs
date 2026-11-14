@@ -95,5 +95,7 @@ fn store_keeps_rows() {
     // A position past the context bound is refused.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(0, 4, 1.)])).is_err());
     assert_eq!(s.rows(0), 3);
+    // A slot past `Seqs` is refused. The store keeps rows.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(2, 0, 1.)])).is_err());
+    close(&step(s, &[(0, 3, 7.)]), &[4.]);
 }

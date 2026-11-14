@@ -106,12 +106,12 @@ impl Store {
         self.kept.resize(self.kept.len().max(i + 1), None);
         let (new, slots, positions) = (rows.floats()?, slots.indices()?, positions.indices()?);
         let width: usize = rows.shape[1..].iter().product();
-        let old = self.kept[i].take();
-        let had = old.as_ref().map_or(0, |t| t.shape[1]);
+        let old = self.kept[i].as_ref();
+        let had = old.map_or(0, |t| t.shape[1]);
         let len = had.max(ctx);
         // Rows stay where they were. The store only grows.
         let mut all = vec![0.0f32; seqs * len * width];
-        if let Some(old) = &old {
+        if let Some(old) = old {
             for (s, from) in old.floats()?.chunks(had * width).enumerate() {
                 all[s * len * width..][..from.len()].copy_from_slice(from);
             }
