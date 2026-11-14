@@ -1,6 +1,7 @@
 //! One safetensors file: a JSON header, then tensor bytes.
 
 use crate::offer::{Offer, Slice, Stored};
+use graph::{Bf16, F16};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -69,12 +70,13 @@ pub struct File {
     entries: BTreeMap<String, Entry>,
 }
 
-/// Bytes per element, for the types this reader widens.
-fn width(dtype: &str) -> Option<u64> {
+/// How a safetensors dtype name lies in the file.
+fn stored(dtype: &str) -> Stored {
     match dtype {
-        "F32" => Some(4),
-        "BF16" => Some(2),
-        _ => None,
+        "F32" => Stored::F32,
+        "BF16" => Stored::Bf16,
+        "F16" => Stored::F16,
+        _ => Stored::Other,
     }
 }
 
@@ -178,31 +180,31 @@ impl File {
         let missing = || Error::Missing(name.into());
         let e = self.entries.get(name).ok_or_else(missing)?;
         let unknown = || Error::DType(format!("{name} is {}", e.dtype));
-        let width = width(&e.dtype).ok_or_else(unknown)?;
+        let kind = stored(&e.dtype);
+        let width = match kind {
+            Stored::F32 => 4,
+            Stored::Bf16 | Stored::F16 => 2,
+            _ => return Err(unknown()),
+        };
         let [start, end] = e.data_offsets;
         let count = e.shape.iter().product::<usize>() as u64;
         if end - start != count * width {
             return Err(format(format_args!("{name} has the wrong byte count")));
         }
         let bytes = self.read(start, end)?;
-        let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
-        // A bf16 is the top half of an f32.
-        let half = |b: &[u8; 2]| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16);
-        Ok(match width {
-            4 => bytes.as_chunks::<4>().0.iter().map(wide).collect(),
-            _ => bytes.as_chunks::<2>().0.iter().map(half).collect(),
+        let halves = || (bytes.as_chunks::<2>().0.iter()).map(|b| u16::from_le_bytes(*b));
+        Ok(match kind {
+            Stored::F32 => (bytes.as_chunks::<4>().0.iter())
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            Stored::Bf16 => halves().map(|h| f32::from(Bf16(h))).collect(),
+            _ => halves().map(|h| f32::from(F16(h))).collect(),
         })
     }
 }
 
 impl Offer for File {
     fn slices(&self) -> Vec<Slice> {
-        let stored = |dtype: &str| match dtype {
-            "F32" => Stored::F32,
-            "BF16" => Stored::Bf16,
-            "F16" => Stored::F16,
-            _ => Stored::Other,
-        };
         (self.entries.iter())
             .map(|(name, e)| Slice {
                 name: name.clone(),

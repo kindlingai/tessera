@@ -48,3 +48,18 @@ fn refuses_short_files() {
     assert!(matches!(File::open(&path), Err(Error::Format(_))));
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn widens_f16() {
+    let header = r#"{"h":{"dtype":"F16","shape":[3],"data_offsets":[0,6]}}"#;
+    let data: Vec<u8> = [0x3c00u16, 0x2e66, 0xc280]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    let path = write("f16", header, &data);
+    let f = File::open(&path).unwrap();
+    // 0.1 is not exact in f16.
+    assert_eq!(f.floats("h").unwrap(), [1.0, 0.099_975_586, -3.25]);
+    assert_eq!(f.slices()[0].stored, Stored::F16);
+    std::fs::remove_file(path).unwrap();
+}
