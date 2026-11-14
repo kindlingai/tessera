@@ -743,6 +743,9 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 "half" => quote!(Intrinsic::Half),
                 "bits" => quote!(Intrinsic::Bits),
                 "signed" => quote!(Intrinsic::Signed),
+                "f16" => quote!(Intrinsic::Field(codegen::ir::Mini::F16)),
+                "e4m3" => quote!(Intrinsic::Field(codegen::ir::Mini::E4M3)),
+                "e2m1" => quote!(Intrinsic::Field(codegen::ir::Mini::E2M1)),
                 "to_bits" => quote!(Intrinsic::ToBits),
                 other => return Err(Error::new(m.method.span(), format!("no `{other}` here"))),
             };

@@ -2,7 +2,7 @@
 
 use crate::LANES;
 use crate::form::Form;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Intrinsic, Mini, Param, Stmt, Ty};
 use sim::Ops;
 use std::collections::HashMap;
 
@@ -249,10 +249,19 @@ impl Counter {
                         });
                         false
                     }
-                    Intrinsic::Signed => {
+                    Intrinsic::Signed | Intrinsic::Field(Mini::F16) => {
                         self.add(Ops {
                             int: 1.0,
                             float: 1.0,
+                            ..Ops::default()
+                        });
+                        true
+                    }
+                    // Widened by hand where no backend converts natively.
+                    Intrinsic::Field(_) => {
+                        self.add(Ops {
+                            int: 6.0,
+                            float: 2.0,
                             ..Ops::default()
                         });
                         true
