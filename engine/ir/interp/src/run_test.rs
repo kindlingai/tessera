@@ -83,11 +83,9 @@ fn store_keeps_rows() {
         &step(s, &[(0, 0, 1.), (0, 1, 3.), (1, 0, 10.)]),
         &[1., 2., 10.],
     );
-    let next = feeds(&[(0, 2, 5.)]);
-    // Without a store, earlier positions read as zeros.
-    let once = run(&g, &[], 0, &next);
-    assert_eq!(once, run(&g, &[], 0, &next));
-    close(&firsts(once), &[5. / 3.]);
+    // Without a store, no row wrote the earlier positions.
+    let once = run(&g, &[], 0, &feeds(&[(0, 2, 5.)]));
+    assert!(matches!(once, Err(Error::Mismatch(m)) if m.contains("position 0")));
     close(&step(s, &[(0, 2, 5.)]), &[3.]);
     // A launch shorter than the store sees its slot's rows.
     close(&step(s, &[(1, 1, 20.)]), &[15.]);
@@ -96,5 +94,7 @@ fn store_keeps_rows() {
     assert_eq!(s.rows(0), 3);
     // A slot past `Seqs` is refused. The store keeps rows.
     assert!(run_kept(&g, &[], s, 0, &feeds(&[(2, 0, 1.)])).is_err());
+    // A row past its slot's last written position is refused.
+    assert!(run_kept(&g, &[], s, 0, &feeds(&[(1, 3, 1.)])).is_err());
     close(&step(s, &[(0, 3, 7.)]), &[4.]);
 }

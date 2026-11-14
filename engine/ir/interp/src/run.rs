@@ -86,6 +86,8 @@ pub fn bind(g: &Graph, find: impl Fn(&[PathSeg]) -> Option<Tensor>) -> Result<Ve
 #[derive(Clone, Debug, Default)]
 pub struct Store {
     kept: Vec<Option<Tensor>>,
+    /// Which slot and position each kept tensor has had written.
+    written: Vec<Vec<bool>>,
 }
 
 impl Store {
@@ -104,6 +106,7 @@ impl Store {
         ctx: usize,
     ) -> Result<Tensor, Error> {
         self.kept.resize(self.kept.len().max(i + 1), None);
+        self.written.resize(self.kept.len(), Vec::new());
         let (new, slots, positions) = (rows.floats()?, slots.indices()?, positions.indices()?);
         let width: usize = rows.shape[1..].iter().product();
         let old = self.kept[i].as_ref();
@@ -111,9 +114,11 @@ impl Store {
         let len = had.max(ctx);
         // Rows stay where they were. The store only grows.
         let mut all = vec![0.0f32; seqs * len * width];
+        let mut written = vec![false; seqs * len];
         if let Some(old) = old {
             for (s, from) in old.floats()?.chunks(had * width).enumerate() {
                 all[s * len * width..][..from.len()].copy_from_slice(from);
+                written[s * len..][..had].copy_from_slice(&self.written[i][s * had..][..had]);
             }
         }
         for (r, row) in new.chunks(width).enumerate() {
@@ -123,7 +128,16 @@ impl Store {
                 return Err(Error::Mismatch(msg));
             }
             all[(s * len + p) * width..][..width].copy_from_slice(row);
+            written[s * len + p] = true;
         }
+        // Rows read their slot's earlier positions.
+        for (r, (&s, &p)) in slots.iter().zip(&positions).enumerate() {
+            if let Some(gap) = (0..p).find(|&q| !written[s * len + q]) {
+                let msg = format!("row {r} at slot {s} reads position {gap}, which no row wrote");
+                return Err(Error::Mismatch(msg));
+            }
+        }
+        self.written[i] = written;
         let mut shape = vec![seqs, len];
         shape.extend_from_slice(&rows.shape[1..]);
         let grown = Tensor::f32(shape, all);
