@@ -162,11 +162,7 @@ impl Kernel for Lanes {
     }
 
     fn needs(&self) -> Needs {
-        Needs {
-            lanes: LANES,
-            group_threads: 256,
-            ..Needs::default()
-        }
+        Needs::lanes()
     }
 }
 
