@@ -1,5 +1,0 @@
-The codegen bug in https://github.com/rust-lang/rust/issues/54321 breaks inlining here.
----
-Four keeps each node inside one 64-byte cache line.
----
-See [GUIDE-SERVE.md](GUIDE-SERVE.md) for the router's environment variables.

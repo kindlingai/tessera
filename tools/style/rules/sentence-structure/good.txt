@@ -1,3 +1,0 @@
-Uses the order for resolving a default axis view.
----
-Maps each section into memory. The magic number check runs first.

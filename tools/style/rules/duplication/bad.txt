@@ -1,6 +1,0 @@
-let a = fs::read_to_string("a.toml").with_context(|| "reading a.toml")?;
-let a: Config = toml::from_str(&a)?;
-let b = fs::read_to_string("b.toml").with_context(|| "reading b.toml")?;
-let b: Config = toml::from_str(&b)?;
-let c = fs::read_to_string("c.toml").with_context(|| "reading c.toml")?;
-let c: Config = toml::from_str(&c)?;

@@ -1,8 +1,0 @@
-/// A Fold is a container for routes.
-pub struct Fold { routes: Vec<Route> }
----
-/// The Parser struct parses input.
-pub struct Parser { pos: usize }
----
-/// This function gets the name.
-pub fn name(&self) -> &str {

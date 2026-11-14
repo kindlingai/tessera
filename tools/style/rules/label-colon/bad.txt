@@ -1,5 +1,0 @@
-Stage 3. Era-specific names.
----
-Step 2. Merge the halves.
----
-Note. The buffer is reused between calls.

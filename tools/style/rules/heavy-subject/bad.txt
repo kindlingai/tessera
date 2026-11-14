@@ -1,7 +1,0 @@
-A line holding only `---` separates examples.
----
-A file containing the signing key is read before startup.
----
-A request carrying an expired token gets a 401.
----
-Any hunk adding a public item needs a doc comment.

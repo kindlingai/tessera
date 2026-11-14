@@ -1,6 +1,0 @@
-fn import(csv: &str) -> Vec<Invoice> {
-    csv.lines().skip(1).map(|l| {
-        let f: Vec<&str> = l.split(',').collect();
-        Invoice { id: f[0].parse().unwrap(), cents: (f[2].parse::<f64>().unwrap() * 100.0) as i64 }
-    }).collect()
-}

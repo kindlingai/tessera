@@ -1,7 +1,7 @@
 [package]
 name = "tessera-style"
 version = "0.1.0"
-description = "Comment and prose style rules: regex detectors and part-of-speech patterns"
+description = "Comment and prose style rules, as part-of-speech patterns"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

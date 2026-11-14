@@ -1,4 +1,0 @@
-// Number of seconds to wait before giving up.
-let n = 30;
-=>
-let timeout_secs = 30;

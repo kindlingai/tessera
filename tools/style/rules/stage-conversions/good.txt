@@ -1,4 +1,0 @@
-fn import(csv: &str) -> Result<Vec<Invoice>> {
-    let rows = parse_rows(csv)?;
-    rows.iter().map(Invoice::try_from).collect()
-}

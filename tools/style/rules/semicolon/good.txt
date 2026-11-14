@@ -1,3 +1,0 @@
-Read the header first. The body length depends on it.
----
-let a = 1; let b = 2;

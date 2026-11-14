@@ -1,3 +1,0 @@
-Utilize the cached handle to facilitate reuse.
-=>
-Reuse the cached handle.

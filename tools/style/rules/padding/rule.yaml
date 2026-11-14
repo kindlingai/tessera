@@ -1,9 +1,0 @@
-name: 'Padding'
-description: 'Filler intros and summaries, several sentences where one works, or a docstring on a trivial private function.'
-group: comments
-stage: 4
-jev:
-  type: noul
-  question: 'Is there padded prose: filler intros or summaries, several sentences where one works, or a docstring on a trivial function?'
-  'true': 'Comments or docs are padded'
-  'false': 'Comments and docs are terse'

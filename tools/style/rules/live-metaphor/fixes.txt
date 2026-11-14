@@ -1,3 +1,0 @@
-Keep the blast radius small: touch only this module.
-=>
-Keep the scope small: touch only this module.

@@ -1,5 +1,0 @@
-// Number of seconds to wait before giving up.
-let n = 30;
----
-// True if the user has confirmed their email.
-let flag = row.get::<bool>(3);

@@ -1,6 +1,0 @@
-#[test]
-fn parses_integers() {
-    for (input, want) in [("1", 1), ("2", 2), ("30", 30)] {
-        assert_eq!(parse(input), Ok(want), "{input}");
-    }
-}

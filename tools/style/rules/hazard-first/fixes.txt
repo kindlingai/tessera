@@ -1,4 +1,0 @@
-Walks the pending jobs and drops each one past its deadline. Call this with
-the queue lock held.
-=>
-Call with the queue lock held. Drops each pending job past its deadline.

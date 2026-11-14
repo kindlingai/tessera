@@ -1,7 +1,0 @@
-A contended lock means the reaper is running, so back off.
----
-The body length is in the header.
----
-Run the cluster daemon.
----
-Print the cluster state.

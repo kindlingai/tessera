@@ -1,3 +1,0 @@
-Now let's make sure we handle the case where the lock is contended.
-=>
-A contended lock means the reaper is running, so back off.

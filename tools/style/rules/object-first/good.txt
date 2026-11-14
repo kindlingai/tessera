@@ -1,9 +1,0 @@
-The redo of 7 reads this slot.
----
-The reaper walks this map, so it must stay sorted.
----
-Returns the slot for the given index.
----
-The group this container belongs to.
----
-Under mentat it reaches every actor the daemon knows.

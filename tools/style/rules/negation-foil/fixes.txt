@@ -1,7 +1,0 @@
-A commit body says why, not what.
-=>
-A commit body says why. The diff already says what.
----
-A fragment introducing a list takes a colon, not a full stop.
-=>
-A fragment introducing a list takes a colon.

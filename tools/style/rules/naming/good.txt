@@ -1,3 +1,0 @@
-let timeout_secs = 30;
----
-let email_confirmed = row.get::<bool>(3);

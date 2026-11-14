@@ -1,7 +1,0 @@
-See §23 of the design doc for why this is 4.
----
-Resolves Q43.
----
-Per ❡12, stages run in order.
----
-Open question 30: should this retry?

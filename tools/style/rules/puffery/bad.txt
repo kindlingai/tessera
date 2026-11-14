@@ -1,7 +1,0 @@
-A robust, elegant solution for parsing headers.
----
-Follows industry best practice for retries.
----
-Low-hanging fruit: cache the lookup.
----
-This mission-critical path must stay scalable.

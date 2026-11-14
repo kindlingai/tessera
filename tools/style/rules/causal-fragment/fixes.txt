@@ -1,7 +1,0 @@
-Routes that share a prefix, merged so a lookup reads one node per segment.
-=>
-A lookup reads one node per segment, because routes that share a prefix are merged.
----
-A fresh buffer per call, because the reader keeps the old one.
-=>
-Each call gets a fresh buffer, because the reader keeps the old one.

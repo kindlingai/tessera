@@ -1,8 +1,0 @@
-name: 'Label colon'
-description: 'A fragment introducing a list or definition takes a colon ("Stage 3: era-specific").'
-group: comments
-stage: 2
-detectors:
-  # Checklist rule 9: a label introducing content takes a colon, not a full
-  # stop. Anchored to line start so "resolved in Stage 5." stays legal.
-  - 're:^\s*(//+|#|\*)?\s*(Stage|Step|Phase|Part|Note|Example|Case)( [0-9]+)?\.(\s|$)'

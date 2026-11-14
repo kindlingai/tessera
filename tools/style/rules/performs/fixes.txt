@@ -1,3 +1,0 @@
-The lock, held fast across the await, is where deadlock waits.
-=>
-The lock is held across the await. Reordering deadlocks with the reaper.

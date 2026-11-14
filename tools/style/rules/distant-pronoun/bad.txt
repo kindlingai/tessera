@@ -1,7 +1,0 @@
-A local name must be unique within its routine. Other routines may reuse it.
----
-The cache holds an entry for the loader. Workers read it at start.
----
-The router keeps a watch set of daemons. Operators can clear it with a restart.
----
-The workers pull jobs from the queues. A supervisor restarts them on failure.

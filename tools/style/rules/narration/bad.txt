@@ -1,5 +1,0 @@
-Now let's make sure we handle the case where the lock is contended.
----
-Here we check the cache first.
----
-First we parse the header.

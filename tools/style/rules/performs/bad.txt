@@ -1,7 +1,0 @@
-The lock, held fast across the await, is where deadlock waits.
----
-Only the first of these survives.
----
-At 2am, in an unfamiliar module, this is the line you will curse.
----
-NEVER call this from the reaper. EVER.

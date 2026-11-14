@@ -1,3 +1,0 @@
-If the route is missing, this returns an empty fanout.
----
-If the input is empty, this returns 0.0.

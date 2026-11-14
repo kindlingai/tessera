@@ -1,3 +1,0 @@
-Cache the parsed config, making startup faster.
-=>
-Parsing the config takes about 40 ms, so it runs once.

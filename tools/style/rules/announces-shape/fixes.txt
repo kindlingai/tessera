@@ -1,3 +1,0 @@
-Two rules apply here. The first covers the cached case.
-=>
-A cached entry returns early.

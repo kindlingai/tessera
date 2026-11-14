@@ -1,5 +1,0 @@
-The lock is held across the await. Reordering deadlocks with the reaper.
----
-Keeps the first entry for each id.
----
-Deadlocks if called from the reaper, which holds the queue lock.

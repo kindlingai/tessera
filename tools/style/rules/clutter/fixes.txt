@@ -1,3 +1,0 @@
-In order to avoid a copy, borrow the slice.
-=>
-Borrow the slice to avoid a copy.

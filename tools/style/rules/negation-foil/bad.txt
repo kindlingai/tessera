@@ -1,9 +1,0 @@
-A commit body says why, not what.
----
-A fragment introducing a list takes a colon, not a full stop.
----
-This is not just a cache but an index.
----
-Retries once, never twice.
----
-Use the slot table rather than the raw offsets.

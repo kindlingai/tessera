@@ -1,8 +1,0 @@
-// An output the graph does not hold gets an answer, not a panic.
-assert_eq!(g.pull(&out("/nowhere/")), Vec::<Node>::new());
-=>
-assert_eq!(g.pull(&out("/nowhere/")), Vec::<Node>::new());
----
-Returns something sensible when the input is empty.
-=>
-If the input is empty, returns 0.0.

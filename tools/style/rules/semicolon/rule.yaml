@@ -1,9 +1,0 @@
-name: 'Semicolons'
-description: 'A semicolon joins two clauses of prose. Split them into two sentences.'
-group: comments
-stage: 2
-detectors:
-  # Checklist rule 5. Split into two sentences. Measured as the most common
-  # defect INTRODUCED by a rewrite pass, since a writer joining two clauses
-  # reaches for it while fixing something else.
-  - 're:^\s*(//+|#|\*).*[a-z]; [a-z]'

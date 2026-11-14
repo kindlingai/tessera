@@ -1,3 +1,0 @@
-Switched to a BTreeMap because the HashMap broke the output order.
-=>
-Output must be ordered, use a BTreeMap.

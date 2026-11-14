@@ -1,4 +1,0 @@
-let configs = ["a.toml", "b.toml", "c.toml"]
-    .iter()
-    .map(|path| read_config(path))
-    .collect::<Result<Vec<Config>>>()?;

@@ -1,18 +1,16 @@
-//! Style rules for comments and prose: regexes and tag patterns.
+//! Style rules for comments and prose, as part-of-speech patterns.
 
-mod detect;
 mod diff;
 #[cfg(test)]
 mod examples_test;
 mod fetch;
 mod pattern;
+mod prose;
 mod report;
 mod rules;
 mod tags;
-mod yaml;
 
 use bundle::tag::Tagger;
-use detect::{Detector, Level, apply_ignore, check, detectors, mask_markdown};
 use diff::Hunk;
 use report::Found;
 use std::path::Path;
@@ -22,36 +20,24 @@ const USAGE: &str = "usage: tessera-style fetch <pipeline_dir>
        tessera-style diff <pipeline_dir> <base> <head> [report_file [link_base]]
        tessera-style scan <pipeline_dir> <file>...
 
-A missing <pipeline_dir> skips the rules that read sentence structure.
-`diff` checks added lines and always succeeds. `scan` fails on any failure.";
+`diff` checks added lines and always succeeds. `scan` fails on any hit.";
 
-/// This crate's rules, and the patterns for parse rules.
+/// This crate's rules and their patterns.
 const RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/rules");
 const TAGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tags.txt");
 
 struct Checker {
     rules: Vec<rules::Rule>,
-    detectors: Vec<Detector>,
-    /// The tagger and its rules, when the pipeline is present.
-    tags: Option<(Tagger, Vec<tags::Rule>)>,
+    tagger: Tagger,
+    patterns: Vec<tags::Rule>,
 }
 
 impl Checker {
     fn new(pipeline: &Path) -> Result<Self, String> {
-        let rules = rules::load(Path::new(RULES))?;
-        let tags = match pipeline.join("tokenizer").exists() {
-            true => Some((
-                Tagger::open(pipeline).map_err(|e| e.to_string())?,
-                tags::load(Path::new(TAGS))?,
-            )),
-            false => None,
-        };
-        // Tag patterns replace the detectors of rules that read structure.
-        let detectors = detectors(rules.iter().filter(|r| !(r.parse && tags.is_some())))?;
         Ok(Self {
-            rules,
-            detectors,
-            tags,
+            rules: rules::load(Path::new(RULES))?,
+            tagger: Tagger::open(pipeline).map_err(|e| format!("{}: {e}", pipeline.display()))?,
+            patterns: tags::load(Path::new(TAGS))?,
         })
     }
 
@@ -60,14 +46,11 @@ impl Checker {
         if h.path.starts_with("tools/style/") {
             return Ok(Vec::new());
         }
-        apply_ignore(&mut h.lines);
+        prose::apply_ignore(&mut h.lines);
         if h.path.ends_with(".md") {
-            mask_markdown(&mut h.lines);
+            prose::mask_markdown(&mut h.lines);
         }
-        let mut hits = check(&h, &self.detectors);
-        if let Some((tagger, rules)) = &self.tags {
-            hits.extend(tags::check(&h, tagger, rules).map_err(|e| e.to_string())?);
-        }
+        let hits = tags::check(&h, &self.tagger, &self.patterns).map_err(|e| e.to_string())?;
         let text_of = |n: usize| {
             h.numbered()
                 .find(|(i, _)| *i == n)
@@ -76,10 +59,10 @@ impl Checker {
         };
         let mut out: Vec<Found> = Vec::new();
         for hit in hits {
-            let dup = out
+            if !out
                 .iter()
-                .any(|f| f.hit.line == hit.line && f.hit.rule == hit.rule);
-            if !dup {
+                .any(|f| f.hit.line == hit.line && f.hit.rule == hit.rule)
+            {
                 out.push(Found {
                     path: h.path.clone(),
                     text: text_of(hit.line),
@@ -104,15 +87,7 @@ fn git(args: &[&str]) -> Result<String, String> {
 
 fn print(found: &[Found]) {
     for f in found {
-        let level = if f.hit.level == Level::Lead {
-            "lead"
-        } else {
-            "fail"
-        };
-        println!(
-            "{}:{}: {}: {level}: {}",
-            f.path, f.hit.line, f.hit.rule, f.hit.found
-        );
+        println!("{}:{}: {}: {}", f.path, f.hit.line, f.hit.rule, f.hit.found);
     }
 }
 
@@ -127,14 +102,9 @@ fn run(args: &[&str]) -> Result<bool, String> {
             }
             print(&found);
             if let Some(report) = rest.first() {
-                let md = report::markdown(
-                    &found,
-                    &checker.rules,
-                    rest.get(1).copied(),
-                    checker.tags.is_some(),
-                );
-                std::fs::write(report, md.map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("{report}: {e}"))?;
+                let md = report::markdown(&found, &checker.rules, rest.get(1).copied())
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(report, md).map_err(|e| format!("{report}: {e}"))?;
             }
             Ok(true)
         }
@@ -146,7 +116,7 @@ fn run(args: &[&str]) -> Result<bool, String> {
                 found.extend(checker.hunk(Hunk::file(path, &text))?);
             }
             print(&found);
-            Ok(!found.iter().any(|f| f.hit.level == Level::Fail))
+            Ok(found.is_empty())
         }
         _ => Err(USAGE.into()),
     }

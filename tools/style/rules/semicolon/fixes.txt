@@ -1,3 +1,0 @@
-This is cheap; it only copies a pointer.
-=>
-This is cheap. It only copies a pointer.

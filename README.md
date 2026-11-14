@@ -48,4 +48,4 @@ Crate | Description
 [tessera-lint](tools/lint) | The repository's code-shape rules, run by CI and the pre-commit hook
 [shape](tools/shape) | Line shapes: a line with names, numbers and strings collapsed
 [tessera-simcheck](tools/simcheck) | Fails on near-copies of code, found with EmbeddingGemma 2 embeddings
-[tessera-style](tools/style) | Comment and prose style rules: regex detectors and part-of-speech patterns
+[tessera-style](tools/style) | Comment and prose style rules, as part-of-speech patterns

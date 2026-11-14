@@ -1,3 +1,0 @@
-Follows best practice for retries.
-=>
-Backoff doubles from 100 ms to a 30 s cap (per RFC 8555).

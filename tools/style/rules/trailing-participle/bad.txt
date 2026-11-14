@@ -1,5 +1,0 @@
-Take the lock before the read, ensuring thread safety.
----
-Cache the parsed config, allowing faster startup.
----
-The rung-0 seam, closed.
