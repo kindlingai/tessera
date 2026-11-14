@@ -13,7 +13,6 @@ use lower::{Device, Form, Pins, Plan, Run, Settings, View, lower, open};
 use settings::read as settings;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Instant;
 use trace::DimName::{Context, Seqs};
 use trace::{Composite, DType, DimName, Graph, TensorType};
 
@@ -163,12 +162,9 @@ pub fn loaded(plan: Plan, g: &Graph, weights: &[Tensor], settings: &Settings) ->
     runner
 }
 
-/// The interpreter's first output, timed.
+/// The interpreter's first output.
 pub fn interpreted(g: &Graph, weights: &[Tensor], seqs: usize, tokens: &[u32]) -> Vec<f32> {
-    let start = Instant::now();
     let out = run(g, weights, 0, &inputs(seqs, tokens)).unwrap();
-    let seconds = start.elapsed().as_secs_f32();
-    eprintln!("interpreter, {} tokens: {seconds:.3} s", tokens.len());
     out[0].floats().unwrap().to_vec()
 }
 
