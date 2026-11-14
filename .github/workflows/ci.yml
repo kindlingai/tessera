@@ -68,6 +68,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features
       - run: cargo test --workspace --all-features --no-fail-fast
 
+  features:
+    # Builds with no GPU backend and with each one alone, so
+    # code that only some backends use fails as dead code.
+    name: features (${{ matrix.features || 'none' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['', cuda, rocm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: features
+      - run: cargo clippy --workspace --all-targets --features "${{ matrix.features }}"
+
   macos:
     # The Metal backend.
     runs-on: macos-latest
@@ -248,7 +267,7 @@ jobs:
     # The one check to require: every job above passed, and no
     # human step is pending.
     if: always()
-    needs: [commits, lint, linux, macos, similarity, platforms, style]
+    needs: [commits, lint, linux, features, macos, similarity, platforms, style]
     runs-on: ubuntu-latest
     steps:
       - env:
