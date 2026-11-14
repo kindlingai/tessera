@@ -3,7 +3,9 @@
 use codegen::prelude::*;
 use graph::{Mask, Order};
 use lower::sites;
-use lower::{Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
+use lower::{
+    Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree, UNPROVEN,
+};
 
 /// Rows are queries. The last query sees every key.
 #[kernel]
@@ -163,9 +165,8 @@ impl Kernel for PerHead {
         (a.seqs * a.heads * per_head) as f64
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 }
 

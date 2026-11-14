@@ -6,7 +6,9 @@ use codegen::prelude::*;
 use graph::{Mask, Order};
 use lower::kernels::{Map, MapStage};
 use lower::sites;
-use lower::{Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree};
+use lower::{
+    Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree, UNPROVEN,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -530,9 +532,8 @@ impl Kernel for Flash {
         (a.seqs * a.heads * a.queries * a.seen() * a.width) as f64
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 
     /// Q and K chunks, P, sums, and the seen ranges.
