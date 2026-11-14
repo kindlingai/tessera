@@ -2,7 +2,7 @@
 
 use codegen::prelude::*;
 use graph::Op;
-use lower::{Arg, Draft, Extent, Kernel, Launch, Shape, Source, Step, T, Term, Tree};
+use lower::{Draft, Extent, Kernel, T, Term, Tree};
 
 /// Sums `count` strided values, in order, then divides.
 #[kernel]
@@ -20,44 +20,12 @@ fn mean(x: Buf<F32>, mut out: BufMut<F32>, outer: u32, count: u32, inner: u32) {
 }
 
 /// `x` is `[outer, count, inner]`. The middle axis goes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(mean, threads = self.outer.times(self.inner), work = self.outer.most() * self.count.most() * self.inner)]
 pub struct Mean {
     pub outer: Extent,
     pub count: Extent,
     pub inner: usize,
-}
-
-impl Kernel for Mean {
-    fn name(&self) -> &'static str {
-        "mean"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.outer.most(), self.count.most(), self.inner]
-    }
-
-    fn source(&self) -> Source {
-        Source::named(mean_ir(), "plan_mean")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [
-            Arg::size(self.outer),
-            Arg::size(self.count),
-            Arg::count(self.inner),
-        ];
-        vec![Launch {
-            args: [step.read(0), step.out()]
-                .into_iter()
-                .chain(sizes)
-                .collect(),
-            shape: Shape::line(self.outer.times(self.inner)),
-        }]
-    }
-
-    fn work(&self, _: usize) -> f64 {
-        (self.outer.most() * self.count.most() * self.inner) as f64
-    }
 }
 
 /// Axes before the mean fold into one, those after too.

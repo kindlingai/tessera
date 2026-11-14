@@ -1,7 +1,7 @@
 //! Joins rows of two inputs along the last axis.
 
 use codegen::prelude::*;
-use lower::{Arg, Extent, Kernel, Launch, Shape, Source, Step};
+use lower::{Extent, Kernel};
 
 /// One thread per output element, from whichever side holds it.
 #[kernel]
@@ -21,37 +21,11 @@ fn join(a: Buf<F32>, b: Buf<F32>, mut out: BufMut<F32>, left: u32, right: u32, r
 }
 
 /// Each output row: a `left` row, then a `right` row.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(join, threads = self.rows.times(self.left + self.right), sizes = [self.left, self.right])]
 pub struct Join {
     pub left: usize,
     pub right: usize,
     /// The row count. Decode reads it at launch.
     pub rows: Extent,
-}
-
-impl Kernel for Join {
-    fn name(&self) -> &'static str {
-        "join"
-    }
-
-    fn sizes(&self) -> Vec<usize> {
-        vec![self.left, self.right]
-    }
-
-    fn source(&self) -> Source {
-        Source::named(join_ir(), "plan_join")
-    }
-
-    fn launches(&self, step: &Step) -> Vec<Launch> {
-        let sizes = [self.left, self.right].map(Arg::count);
-        let buffers = [step.read(0), step.read(1), step.out()];
-        let args = buffers
-            .into_iter()
-            .chain(sizes)
-            .chain([Arg::size(self.rows)]);
-        vec![Launch {
-            args: args.collect(),
-            shape: Shape::line(self.rows.times(self.left + self.right)),
-        }]
-    }
 }
