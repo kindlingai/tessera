@@ -104,6 +104,18 @@ fn rotate(mut t: Vec<f32>, r: &Record, suh: &[f32], svh: &[f32]) -> Vec<f32> {
     w
 }
 
+/// `diag(suh) H T H diag(svh)` for a `[out][in]` matrix `t`.
+pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> Vec<f32> {
+    let r = Record {
+        format: TRELLIS,
+        out,
+        inp,
+        k: 0,
+        side: 0,
+    };
+    rotate(transpose(t, out, inp), &r, suh, svh)
+}
+
 /// Matrix `name` as f32 `[out][in]`, decoded by its record.
 pub fn matrix(f: &File, name: &str) -> Result<Vec<f32>, Error> {
     let r = record(f, name)?;

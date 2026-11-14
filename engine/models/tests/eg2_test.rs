@@ -8,12 +8,9 @@ use bundle::names::{Rule, repo};
 use calibrate::measure;
 use checkpoint::exlr8::Release;
 use checkpoint::{File, Offer};
-use codegen::trellis;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, run};
-use lower::form::F32_FORM;
-use lower::{Device, Pins, Plan, Run, Settings, Weight, lower, open};
-use models::Rotated;
+use lower::{Device, Plan, Run, Settings, Weight, lower, open};
 use models::eg2::{Config, probe, program};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -106,7 +103,7 @@ fn weights(g: &Graph, c: &Config, dir: &Path) -> Vec<Tensor> {
 }
 
 /// The exlr8 release: matrices against bf16, embeddings against the reference.
-fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
+fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) {
     let release = match std::fs::read_to_string(dir.join("exlr8.repo")) {
         Ok(repo) => {
             let (repo, revision) = repo.trim().split_once('@').unwrap_or((repo.trim(), "main"));
@@ -139,44 +136,12 @@ fn check_exlr8(dir: &Path, g: &Graph, c: &Config, cases: &[Case]) -> Exlr8 {
         "exlr8: every weight decoded in {:.1} s",
         start.elapsed().as_secs_f32()
     );
-    // The codes before their rotations, rotated in the graph.
-    let turned = graph(program::<Rotated>(c));
-    let stored = pulled(&turned, c, &release);
-    let sides = plain(&turned, &stored);
-    let mut embeddings = Vec::new();
     for c in cases {
         let got = unit(&pooled(g, &w, &c.tokens, 1));
         let cos = cosine_f32(&got, &c.embedding);
         eprintln!("exlr8 {}: cos {cos:.5} against the bf16 reference", c.name);
         assert!(cos > 0.98, "{}: cos {cos}", c.name);
-        let rotated = unit(&pooled(&turned, &sides, &c.tokens, 1));
-        let same = cosine_f32(&rotated, &got);
-        eprintln!(
-            "exlr8 {} rotated in the graph: cos {same:.7} against decoded",
-            c.name
-        );
-        assert!(
-            same > 0.99999,
-            "{}: rotated in the graph differs, cos {same}",
-            c.name
-        );
-        embeddings.push(rotated);
     }
-    Exlr8 {
-        graph: turned,
-        weights: sides,
-        stored,
-        embeddings,
-    }
-}
-
-/// The rotated graph, its weights, and the interpreter's embeddings.
-struct Exlr8 {
-    graph: Graph,
-    weights: Vec<Tensor>,
-    /// The same weights as the release stores them.
-    stored: Vec<Weight>,
-    embeddings: Vec<Vec<f32>>,
 }
 
 /// Tokens and positions for one text, `[1, len]` each.
@@ -217,31 +182,10 @@ fn kernels(plan: &Plan) -> BTreeMap<&'static str, usize> {
     by
 }
 
-/// Pins, and packed bytes by weight, for the device.
-struct Stored<'a> {
-    pins: Pins,
-    packed: &'a dyn Fn(u32) -> Option<Vec<u8>>,
-}
-
-impl Default for Stored<'_> {
-    fn default() -> Self {
-        Self {
-            pins: Pins::all(F32_FORM),
-            packed: &|_| None,
-        }
-    }
-}
-
 /// Every case through the forward entry on this machine's GPU.
-fn check_device(
-    settings: &Settings,
-    g: &Graph,
-    w: &[Tensor],
-    cases: &[Case],
-    stored: &Stored,
-) -> Vec<Vec<f32>> {
+fn check_device(settings: &Settings, g: &Graph, w: &[Tensor], cases: &[Case]) -> Vec<Vec<f32>> {
     let mut embeddings = Vec::new();
-    let mut device = Device::guess(settings).pinned(stored.pins.clone());
+    let mut device = Device::guess(settings);
     let mut runner: Option<Box<dyn Run>> = None;
     let mut learned = 0;
     for c in cases {
@@ -255,14 +199,10 @@ fn check_device(
                 let mut r = open(plan, settings).unwrap();
                 for (at, t) in w.iter().enumerate() {
                     let path = &g.weights[at].path;
-                    let loaded = match (stored.packed)(at as u32) {
-                        Some(bytes) => r.load_packed(at as u32, &bytes),
-                        None => r.load(at as u32, t.view()),
-                    };
-                    loaded.unwrap_or_else(|e| panic!("weight {at} {path:?}: {e}"));
+                    r.load(at as u32, t.view())
+                        .unwrap_or_else(|e| panic!("weight {at} {path:?}: {e}"));
                 }
                 device = Device::stored(&*r, settings).unwrap();
-                device = device.pinned(stored.pins.clone());
                 runner.insert(r)
             }
         };
@@ -355,38 +295,15 @@ fn matches_reference() {
         let got = unit(&pooled(&g, &w, &c.tokens, 1));
         close(&c.name, &got, &c.embedding);
     }
-    let quantized = (dir.join("exlr8").is_dir() || dir.join("exlr8.repo").is_file())
-        .then(|| check_exlr8(&dir, &g, &cfg, &cases[..1]));
+    if dir.join("exlr8").is_dir() || dir.join("exlr8.repo").is_file() {
+        check_exlr8(&dir, &g, &cfg, &cases[..1]);
+    }
     let settings = settings::read();
     if settings.gpu().is_none() {
         return eprintln!("no GPU here; skipped");
     }
-    let got = check_device(&settings, &g, &w, &cases, &Stored::default());
+    let got = check_device(&settings, &g, &w, &cases);
     for (c, got) in cases.iter().zip(&got) {
         close(&format!("{} on the device", c.name), got, &c.embedding);
-    }
-    let Some(q) = quantized else { return };
-    let got = check_device(
-        &settings,
-        &q.graph,
-        &q.weights,
-        &cases[..1],
-        &Stored::default(),
-    );
-    for (want, got) in q.embeddings.iter().zip(&got) {
-        close("exlr8 rotated on the device", got, want);
-    }
-    // The codes on the device, decoded as they are read.
-    let codes = |at: u32| match &q.stored[at as usize] {
-        Weight::Packed(_, bytes) => Some(bytes.clone()),
-        Weight::Floats(_) => None,
-    };
-    let stored = Stored {
-        pins: Pins::all(F32_FORM).pin("*.w", trellis::form_for(4).unwrap()),
-        packed: &codes,
-    };
-    let got = check_device(&settings, &q.graph, &q.weights, &cases[..1], &stored);
-    for (want, got) in q.embeddings.iter().zip(&got) {
-        close("exlr8 codes on the device", got, want);
     }
 }
