@@ -4,6 +4,8 @@
 use kernels as _;
 use linear as _;
 
+mod common;
+
 use bundle::names::{Rule, repo};
 use calibrate::measure;
 use checkpoint::exlr8::Release;
@@ -11,6 +13,7 @@ use checkpoint::{File, Offer};
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, run};
 use lower::{Device, Plan, Run, Settings, Weight, lower, open};
+use models::Stack;
 use models::eg2::{Config, probe, program};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +28,35 @@ fn config(layers: u64) -> Config {
     c.stack.layers = layers;
     c
 }
+
+/// Two small layers, one sliding and one full.
+fn small() -> Graph {
+    let stack = Stack {
+        vocab: 64,
+        hidden: 256,
+        layers: 2,
+        heads: 2,
+        head_dim: 128,
+        ffn: 256,
+        max_seqs: 1,
+        max_context: 16,
+    };
+    let c = Config {
+        stack,
+        kv_heads: 1,
+        full_every: 2,
+        full_head_dim: 256,
+        per_layer: 128,
+        embedding: 128,
+        window: 4,
+        theta: 1e4,
+        full_theta: 1e6,
+        eps: 1e-6,
+    };
+    program::<Linear>(&c)
+}
+
+common::suite!("eg2", small);
 
 /// The interpreter only ever sees the JSON text.
 fn graph(g: Graph) -> Graph {

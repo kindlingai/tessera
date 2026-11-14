@@ -1,15 +1,41 @@
 //! Qwen3-0.6B: traced, loaded from its checkpoint, and run.
 
+mod common;
+
 use calibrate::{headroom, measure};
 use checkpoint::File;
 use gpukit::testing::{cosine_f32, max_abs_diff};
 use interp::{Tensor, bind, run};
 use lower::{Cache, Device, Pins, Plan, Run, Settings, View, lower, open, select};
+use models::Stack;
 use models::qwen3::{Config, program, stepper, tensor_name};
 use std::collections::BTreeMap;
 use std::time::Instant;
 use trace::DimName::{self, Context, Rows, Segments, Seqs};
 use trace::{Graph, PathSeg};
+
+/// Two small layers, wide enough for every block form.
+fn small() -> Graph {
+    let stack = Stack {
+        vocab: 64,
+        hidden: 64,
+        layers: 2,
+        heads: 2,
+        head_dim: 32,
+        ffn: 128,
+        max_seqs: 1,
+        max_context: 16,
+    };
+    let c = Config {
+        stack,
+        kv_heads: 1,
+        rope_theta: 1e4,
+        eps: 1e-6,
+    };
+    program(&c)
+}
+
+common::suite!("qwen3", small);
 
 /// The interpreter only ever sees the JSON text.
 fn graph() -> Graph {
