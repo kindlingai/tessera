@@ -53,8 +53,20 @@ fn softmax(acc: Acc, row: &mut [f32]) {
 pub(crate) fn past_keys(a: &Attend, queries: usize, keys: usize) -> Result<usize, Error> {
     match keys.checked_sub(queries) {
         Some(past) => Ok(past),
-        None if a.mask == Mask::Bidirectional => Ok(0),
+        None if a.mask != Mask::Causal => Ok(0),
         None => Err(Error::Mismatch(format!("{queries} queries, {keys} keys"))),
+    }
+}
+
+/// The keys `[from, to)` a query at `position` sees.
+pub(crate) fn seen(mask: Mask, position: usize, keys: usize) -> (usize, usize) {
+    match mask {
+        Mask::Causal => (0, (position + 1).min(keys)),
+        Mask::Bidirectional => (0, keys),
+        Mask::Within(n) => {
+            let n = n as usize;
+            (position.saturating_sub(n), (position + n + 1).min(keys))
+        }
     }
 }
 
@@ -94,17 +106,15 @@ pub(crate) fn attend(n: &Numerics, a: &Attend, qkv: [&Tensor; 3]) -> Result<Tens
             for h in 0..heads {
                 let qo = ((s * ctx + t) * heads + h) * d;
                 let kv_at = |j: usize| ((s * keys + j) * kv_heads + h / group) * d;
-                let seen = if a.mask == Mask::Causal {
-                    past + t + 1
-                } else {
-                    keys
-                };
-                for (j, pj) in p[..seen].iter_mut().enumerate() {
+                let (from, to) = seen(a.mask, past + t, keys);
+                for (j, pj) in p[from..to].iter_mut().enumerate() {
+                    let j = from + j;
                     *pj = acc.dot(&qs[qo..qo + d], &ks[kv_at(j)..kv_at(j) + d]) * a.scale;
                 }
-                softmax(acc, &mut p[..seen]);
+                softmax(acc, &mut p[from..to]);
                 let o = &mut out[qo..qo + d];
-                for (j, &pj) in p[..seen].iter().enumerate() {
+                for (j, &pj) in p[from..to].iter().enumerate() {
+                    let j = from + j;
                     for (oi, &vi) in o.iter_mut().zip(&vs[kv_at(j)..kv_at(j) + d]) {
                         *oi = acc.add(*oi, pj * vi);
                     }

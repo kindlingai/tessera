@@ -19,6 +19,12 @@ pub enum DimName {
     Heads,
     KvHeads,
     HeadDim,
+    /// A full-attention layer's head width, where it differs.
+    FullHeadDim,
+    /// Width of a per-layer embedding.
+    PerLayer,
+    /// Width of a pooled embedding.
+    Embedding,
     /// A head's width outside its rotary part.
     Nope,
     /// A head's rotary width.
@@ -40,6 +46,9 @@ pub enum DimName {
     Layers,
     DenseLayers,
     MoeLayers,
+    /// Layers whose attention is windowed, and whole.
+    SlidingLayers,
+    FullLayers,
     /// Layers that run their own indexer.
     IndexLayers,
 }
