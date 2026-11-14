@@ -1,7 +1,7 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Graph, Op, Select, Stage, View};
+use crate::node::{Graph, Mask, Op, Select, Stage, View};
 use crate::select;
 use crate::types::{DType, Placement, TensorType};
 use std::fmt;
@@ -9,7 +9,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     Arity,
-    /// A constant that JSON cannot hold, like infinity.
+    /// A bad op parameter, like an infinite constant.
     Value,
     Reference,
     Shape,
@@ -139,6 +139,9 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Matmul => matmul(&g.dims, args[0], args[1]),
         Op::Attend(a) if a.ragged => {
             finite(a.scale, "attention scale")?;
+            need(a.mask == Mask::Causal, ErrorKind::Value, || {
+                format!("ragged attention is causal only, got {:?}", a.mask)
+            })?;
             attend_rows(&g.dims, args)
         }
         Op::Attend(a) => {

@@ -187,6 +187,26 @@ fn picks_by_index() {
 }
 
 #[test]
+fn ragged_causal() {
+    let q = f32s([Rows, Heads, HeadDim], Replicated);
+    let kv = f32s([Seqs, Context, Heads, HeadDim], Replicated);
+    let by = TensorType::new([Rows], DType::U32);
+    let tys = vec![q, kv.clone(), kv, by.clone(), by];
+    let attend = |mask| {
+        Op::Attend(Attend {
+            mask,
+            scale: 0.5,
+            picked: false,
+            ragged: true,
+        })
+    };
+    assert!(result(tys.clone(), attend(Mask::Causal)).is_ok());
+    for mask in [Mask::Bidirectional, Mask::Within(4)] {
+        assert_eq!(placed(tys.clone(), attend(mask)), Err(ErrorKind::Value));
+    }
+}
+
+#[test]
 fn layout_and_rope() {
     let x = f32s([Seqs, Rows, Heads, HeadDim], Replicated);
     let pos = TensorType::new([Seqs, Rows], DType::U32);
