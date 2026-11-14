@@ -470,6 +470,7 @@ fn trips_are_counted() {
         rows: 4,
         width: 64,
         eps: 1e-5,
+        weighted: true,
     });
     assert_eq!((norm.loads, norm.stores), (3.0, 1.0));
     assert!((norm.fresh - 1.0 / 16.0).abs() < 1e-9, "{norm:?}");

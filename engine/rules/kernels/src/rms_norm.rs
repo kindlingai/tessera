@@ -2,14 +2,20 @@
 
 use crate::per_row;
 use codegen::prelude::*;
-use graph::Stage;
 use lower::sites;
 use lower::{Arg, Draft, Kernel, Launch, Shape, Source, Step, T, Tree};
 use sim::Load;
 
 /// One thread per row. Summing in order keeps batches alike.
 #[kernel]
-fn rms_norm(x: Buf<F32>, w: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u32, eps: f32) {
+fn rms_norm<const WEIGHTED: bool>(
+    x: Buf<F32>,
+    w: Buf<F32>,
+    mut out: BufMut<F32>,
+    rows: u32,
+    width: u32,
+    eps: f32,
+) {
     if gid() >= rows {
         return;
     }
@@ -20,7 +26,8 @@ fn rms_norm(x: Buf<F32>, w: Buf<F32>, mut out: BufMut<F32>, rows: u32, width: u3
     }
     let inv = rsqrt(sum / width as f32 + eps);
     for i in 0..width {
-        out[at + i as u64] = x[at + i as u64] * inv * w[i as u64];
+        let gain = if WEIGHTED { w[i as u64] } else { 1.0 };
+        out[at + i as u64] = x[at + i as u64] * inv * gain;
     }
 }
 
@@ -30,17 +37,34 @@ pub struct RmsNorm {
     pub rows: usize,
     pub width: usize,
     pub eps: f32,
+    pub weighted: bool,
+}
+
+impl RmsNorm {
+    fn body(&self) -> codegen::ir::Body {
+        match self.weighted {
+            true => rms_norm_ir::<true>(),
+            false => rms_norm_ir::<false>(),
+        }
+    }
 }
 
 impl Kernel for RmsNorm {
     fn name(&self) -> &'static str {
-        "rms_norm"
+        match self.weighted {
+            true => "rms_norm",
+            false => "rms",
+        }
     }
 
     /// Sums each row, then scales it.
     fn load(&self, _: usize) -> Option<Load> {
-        let gain = 4.0 * self.width as f64;
-        Some(per_row(self.rows, self.width, rms_norm_ir().trip(), gain))
+        let gain = if self.weighted {
+            4.0 * self.width as f64
+        } else {
+            0.0
+        };
+        Some(per_row(self.rows, self.width, self.body().trip(), gain))
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -48,16 +72,18 @@ impl Kernel for RmsNorm {
     }
 
     fn source(&self) -> Source {
-        Source::named(rms_norm_ir(), "plan_rms_norm")
+        Source::named(self.body(), format!("plan_{}", self.name()))
     }
 
+    /// Without a weight, the row stands in for it, unread.
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let sizes = [
             Arg::count(self.rows),
             Arg::count(self.width),
             Arg::value(&self.eps),
         ];
-        let buffers = [step.read(0), step.read(1), step.out()];
+        let w = step.read(usize::from(self.weighted));
+        let buffers = [step.read(0), w, step.out()];
         vec![Launch {
             args: buffers.into_iter().chain(sizes).collect(),
             shape: Shape::Line(self.rows),
@@ -66,22 +92,15 @@ impl Kernel for RmsNorm {
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let sites::Stage {
-        stage: Stage::RmsNorm { eps },
-        x,
-        operand: Some((w, _)),
-        len,
-        width,
-    } = tree.site(at)?
-    else {
-        return None;
-    };
+    let site: sites::Stage = tree.site(at)?;
+    let (eps, weighted) = site.rms()?;
     let kernel = RmsNorm {
-        rows: len / width,
-        width,
+        rows: site.len / site.width,
+        width: site.width,
         eps,
+        weighted,
     };
-    Some(vec![Draft::new(kernel, [x, w], len)])
+    Some(vec![Draft::new(kernel, site.reads(), site.len)])
 }
 
 lower::rule!("rms_norm", propose);

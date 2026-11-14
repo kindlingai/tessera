@@ -1,5 +1,6 @@
 use super::Pattern;
 use crate::tree::{T, Term, Tree, map_stage};
+use graph::Stage as Row;
 
 /// One row stage that is not elementwise.
 #[derive(Clone, Debug)]
@@ -31,5 +32,24 @@ impl Pattern for Stage {
             len,
             width,
         })
+    }
+}
+
+impl Stage {
+    /// An RMS norm's epsilon, and whether it has a weight.
+    pub fn rms(&self) -> Option<(f32, bool)> {
+        match (&self.stage, self.operand) {
+            (Row::RmsNorm { eps }, Some(_)) => Some((*eps, true)),
+            (Row::Rms { eps }, None) => Some((*eps, false)),
+            _ => None,
+        }
+    }
+
+    /// The row, then its operand.
+    pub fn reads(&self) -> Vec<T> {
+        [self.x]
+            .into_iter()
+            .chain(self.operand.map(|(o, _)| o))
+            .collect()
     }
 }

@@ -149,6 +149,10 @@ pub enum Stage {
     RmsNorm {
         eps: f32,
     },
+    /// Divides the row by its root mean square.
+    Rms {
+        eps: f32,
+    },
     /// Subtracts the row's mean.
     Center,
     /// Divides the row by its sum.
@@ -177,7 +181,7 @@ impl Stage {
         use Stage::*;
         matches!(
             self,
-            RmsNorm { .. } | Center | UnitSum | Softmax | AllReduce
+            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce
         )
     }
 }
