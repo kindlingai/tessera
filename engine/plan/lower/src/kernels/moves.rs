@@ -18,7 +18,7 @@ impl Kernel for Move {
 
     /// The runner copies, so nothing compiles.
     fn source(&self) -> Source {
-        Map(Vec::new()).source()
+        Map::plain(Vec::new()).source()
     }
 
     fn launches(&self, _: &Step) -> Vec<Launch> {

@@ -77,6 +77,8 @@ fn attend(
     heads: u32,
     kv_heads: u32,
     width: u32,
+    back: u32,
+    ahead: u32,
 ) {
     let group = gid() / THREADS;
     let tok = group / heads;
@@ -90,13 +92,15 @@ fn attend(
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
     let mut acc = [0.0f32; 2];
-    // The query sees every key up to its own position.
-    let last = if past + tok + 1 < keys {
-        past + tok + 1
+    // The query sees `back` keys behind it and `ahead` past.
+    let position = past + tok;
+    let first = if position > back { position - back } else { 0 };
+    let last = if keys - position - 1 > ahead {
+        position + ahead + 1
     } else {
         keys
     };
-    for t in 0..last {
+    for t in first..last {
         // A joined row: every head's key, then every head's value.
         let k_off = ((t * kv_heads * 2 + kvh) * width) as u64;
         let dot = group_dot(q, kv, q_off, k_off, width, &mut red);
@@ -201,7 +205,7 @@ impl Kernel for AttendRows {
     }
 }
 
-/// Reads scaled queries, and keys joined with values.
+/// Reads scaled queries, and keys joined with values. Any mask.
 #[derive(Clone, Copy, Debug)]
 pub struct Attend(pub Attn);
 
@@ -227,12 +231,12 @@ impl Kernel for Attend {
                 Arg::at(step.write, s * q),
             ]
         };
-        let width = std::iter::once(Arg::count(a.width));
+        let tail = [Arg::count(a.width)].into_iter().chain(a.reach());
         let launch = |s: usize| Launch {
             args: buffers(s)
                 .into_iter()
                 .chain(a.args())
-                .chain(width.clone())
+                .chain(tail.clone())
                 .collect(),
             shape: Shape::Grid {
                 across: a.queries * a.heads,
@@ -245,7 +249,7 @@ impl Kernel for Attend {
 
     fn work(&self, _: usize) -> f64 {
         let a = &self.0;
-        (a.seqs * a.heads * a.queries * a.keys.most() * a.width) as f64
+        (a.seqs * a.heads * a.queries * a.seen() * a.width) as f64
     }
 
     fn needs(&self) -> Needs {
@@ -289,7 +293,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     };
     let joined = 2 * sizes.seqs * sizes.keys.most() * side;
     Some(vec![
-        Draft::new(Map(vec![MapStage::Scale(scale)]), [q], out),
+        Draft::new(Map::plain(vec![MapStage::Scale(scale)]), [q], out),
         Draft::new(join, [k, v], joined),
         Draft::new(Attend(sizes), [Read::Draft(0), Read::Draft(1)], out),
     ])

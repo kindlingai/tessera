@@ -1,7 +1,7 @@
 //! Attention as two matmuls per head around a softmax.
 
 use codegen::prelude::*;
-use graph::Order;
+use graph::{Mask, Order};
 use lower::sites;
 use lower::{Arg, Attn, DType, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
 
@@ -199,6 +199,9 @@ impl Kernel for Causal {
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Attend = tree.site(at)?;
+    if site.sizes.mask != Mask::Causal {
+        return None;
+    }
     // Whole sequences only: the scores take a rectangular launch.
     let sites::Attend {
         scale,

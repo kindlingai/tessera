@@ -28,7 +28,7 @@ impl Kernel for HostTop {
     }
 
     fn source(&self) -> Source {
-        Map(Vec::new()).source()
+        Map::plain(Vec::new()).source()
     }
 
     fn launches(&self, _: &Step) -> Vec<Launch> {

@@ -108,7 +108,13 @@ pub fn select_upto(
         };
         let Some(zone) = zone else {
             if tree.root(t) {
-                return unsupported(&tree.node(t).term);
+                let node = tree.node(t);
+                let reads: Vec<&[usize]> =
+                    node.args.iter().map(|a| &tree.node(*a).shape[..]).collect();
+                return unsupported(format_args!(
+                    "{:?} over {:?} from {reads:?}",
+                    node.term, node.shape
+                ));
             }
             continue;
         };

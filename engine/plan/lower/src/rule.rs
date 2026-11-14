@@ -6,6 +6,7 @@ use crate::kernel::{Kernel, KernelRef};
 use crate::plan::Step;
 use crate::tree::{T, Tree};
 use codegen::kept::Layout;
+use graph::Mask;
 
 pub use scattered_collect::declarative::{gather, scatter};
 
@@ -25,6 +26,7 @@ pub struct Attn {
     pub kept: &'static dyn Layout,
     /// Slots the query rows span, at most.
     pub segments: usize,
+    pub mask: Mask,
 }
 
 impl Attn {
@@ -39,6 +41,26 @@ impl Attn {
             self.width,
             self.segments,
         ]
+    }
+
+    /// The most keys one query sees.
+    pub fn seen(&self) -> usize {
+        let keys = self.keys.most();
+        match self.mask {
+            Mask::Within(n) => keys.min(2 * n as usize + 1),
+            _ => keys,
+        }
+    }
+
+    /// How far back and ahead a query sees.
+    pub fn reach(&self) -> [Arg; 2] {
+        let far = u32::MAX as usize;
+        let (back, ahead) = match self.mask {
+            Mask::Causal => (far, 0),
+            Mask::Bidirectional => (far, far),
+            Mask::Within(n) => (n as usize, n as usize),
+        };
+        [Arg::count(back), Arg::count(ahead)]
     }
 
     /// The layout's scalars, which come after a kernel's own.
