@@ -1,0 +1,11 @@
+[package]
+name = "testkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Helpers that tests share: noise, comparisons, scratch files, GGUF bytes"
+
+[dependencies]
+graph = { workspace = true }
+mem = { workspace = true }

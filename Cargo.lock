@@ -519,6 +519,7 @@ dependencies = [
  "objc2",
  "objc2-metal",
  "settings",
+ "testkit",
 ]
 
 [[package]]
@@ -1028,6 +1029,7 @@ dependencies = [
  "run",
  "serde_json",
  "settings",
+ "testkit",
  "trace",
 ]
 
