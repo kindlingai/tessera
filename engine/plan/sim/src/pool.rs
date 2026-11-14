@@ -83,7 +83,7 @@ impl Chip for Pool {
     }
 
     fn estimate(&self, l: &Load) -> Estimate {
-        let (threads, t) = (l.threads as f64, &l.trip);
+        let (threads, t) = (l.threads as f64, &l.trip.priced(false));
         // The step already holds a loop's own index work.
         let ops = t.float * self.step.value + t.special * self.curve.value;
         // Streams cross lines together, so their waits overlap.
@@ -120,9 +120,11 @@ impl Chip for Pool {
 
     /// Every op at the chip's rate, every byte at best.
     fn bound(&self, l: &Load) -> f64 {
-        let curves = l.floats() / l.trip.float.max(1.0) * l.trip.special;
-        let ops = l.floats() + curves * self.curve.value / self.step.value;
-        let tiled = l.threads as f64 * l.trips * l.trip.tile_flops;
+        let t = l.trip.priced(false);
+        let floats = l.threads as f64 * l.trips * t.float;
+        let ops =
+            floats + l.threads as f64 * l.trips * t.special * self.curve.value / self.step.value;
+        let tiled = l.threads as f64 * l.trips * t.tile_flops;
         let best_rate = self.rate.value.max(self.tile.value);
         let ops = ops + tiled * self.rate.value / best_rate;
         let best = self.read.value.max(self.scan.value);

@@ -78,6 +78,9 @@ impl Counter {
         t.loads += ops.loads * n;
         t.stores += ops.stores * n;
         t.tile_flops += ops.tile_flops * n;
+        t.f16 += ops.f16 * n;
+        t.e4m3 += ops.e4m3 * n;
+        t.e2m1 += ops.e2m1 * n;
         self.fresh += ops.fresh * ops.loads * n;
         self.width += ops.width * ops.loads * n;
     }
@@ -249,7 +252,7 @@ impl Counter {
                         });
                         false
                     }
-                    Intrinsic::Signed | Intrinsic::Field(Mini::F16) => {
+                    Intrinsic::Signed => {
                         self.add(Ops {
                             int: 1.0,
                             float: 1.0,
@@ -257,13 +260,15 @@ impl Counter {
                         });
                         true
                     }
-                    // Widened by hand where no backend converts natively.
-                    Intrinsic::Field(_) => {
-                        self.add(Ops {
-                            int: 6.0,
-                            float: 2.0,
-                            ..Ops::default()
-                        });
+                    // Tallied by format: each chip prices its conversions.
+                    Intrinsic::Field(m) => {
+                        let mut ops = Ops::default();
+                        match m {
+                            Mini::F16 => ops.f16 = 1.0,
+                            Mini::E4M3 => ops.e4m3 = 1.0,
+                            Mini::E2M1 => ops.e2m1 = 1.0,
+                        }
+                        self.add(ops);
                         true
                     }
                     Intrinsic::Clamp => {
