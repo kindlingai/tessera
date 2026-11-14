@@ -4,15 +4,16 @@
 use kernels as _;
 use linear as _;
 
-use gpukit::testing::{Noise, max_abs_diff};
-use graph::DimName::{Context, HeadDim, Heads, Hidden, Rows, Seqs, Vocab};
+use codegen::trellis;
+use gpukit::testing::{Noise, cosine_f32, max_abs_diff};
+use graph::DimName::{Context, Ffn, HeadDim, Heads, Hidden, Rows, Seqs, Vocab};
 use graph::{DType, Dim, DimName, Graph, NodeId, Size, TensorType, verify};
 use interp::{Tensor, run};
 use lower::form::BF16_FORM;
 use lower::{Device, Pins, View, cut, lower, open, rules};
 use models::{Stack, nanogpt, qwen3};
 use settings::read as settings;
-use trace::{EntryKind, Mask, Model, Port, Role};
+use trace::{EntryKind, Linear, Mask, Model, Port, Role, Weights};
 
 const SIZES: [(DimName, u64); 3] = [(Seqs, 2), (Rows, 3), (Context, 5)];
 
@@ -193,6 +194,71 @@ fn whole_models_match_cpu() {
                 off < 1e-3,
                 "favoring {rule} as bf16, outputs are off by {off:e}"
             );
+        }
+    }
+}
+
+#[derive(Weights)]
+struct Only {
+    #[shape(Hidden, Ffn)]
+    w: Linear,
+}
+
+/// `x[rows, 256]` times a `[256, 256]` matrix of codes.
+fn coded() -> Graph {
+    let dims = vec![
+        Dim {
+            name: Rows,
+            size: Size::Bounded(64),
+        },
+        Dim {
+            name: Hidden,
+            size: Size::Fixed(256),
+        },
+        Dim {
+            name: Ffn,
+            size: Size::Fixed(256),
+        },
+    ];
+    let m = Model::new(dims);
+    let w: Only = trace::declare(&m);
+    let ty = TensorType::new([Rows, Hidden], DType::F32);
+    let role = Role::Logits;
+    let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
+    m.finish([(Role::Logits, &x.matmul(&w.w))])
+}
+
+#[test]
+fn codes_match_host_decode() {
+    let g = coded();
+    let mut noise = Noise(3);
+    let (inp, out) = (256, 256);
+    for k in [2, 3, 4] {
+        let form = trellis::form_for(k).unwrap();
+        let entries: Vec<u8> = (0..out * inp * k as usize / 8)
+            .map(|_| (noise.draw() * 256.0) as u8)
+            .collect();
+        let bytes = trellis::packed(inp, out, 1, &entries);
+        let decoded: Vec<f32> = (0..out * inp).map(|i| form.unpack(&bytes, i)).collect();
+        let weights = [Tensor::f32(vec![out, inp], decoded)];
+        // Few rows take the lane kernel, many the tiled one.
+        for rows in [3usize, 40] {
+            let x: Vec<f32> = (0..rows * inp).map(|_| noise.draw()).collect();
+            let x = Tensor::f32(vec![rows, inp], x);
+            let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
+            let settings = settings();
+            let device = Device::guess(&settings).pinned(Pins::all(form));
+            let plan = lower(&g, 0, &[(Rows, rows as u64)], &device).unwrap();
+            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+            assert!(
+                names.iter().all(|n| n.contains(form.name())),
+                "{names:?} read the codes"
+            );
+            let mut runner = open(plan, &settings).unwrap();
+            runner.load_packed(0, &bytes).unwrap();
+            let got = runner.run(&[x.view()]).unwrap().remove(0);
+            let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+            assert!(cos > 0.99999, "K{k}, {rows} rows: cos {cos}");
         }
     }
 }
