@@ -101,18 +101,17 @@ fn weights(g: &Graph) -> Vec<Tensor> {
     })
 }
 
-/// This file holds the record, so it is always there.
-pub fn read(g: &Graph) -> Option<Reference> {
-    let seqs = 2;
-    let want = WANT.to_vec();
+/// The weights above and the record.
+pub fn read(g: &Graph) -> Reference {
     let case = Case {
         name: "record".into(),
-        seqs,
+        seqs: 2,
         tokens: TOKENS.to_vec(),
-        want,
+        outputs: [("logits".into(), WANT.to_vec())].into(),
     };
-    Some(Reference {
+    Reference {
         weights: weights(g),
         cases: vec![case],
-    })
+        checkpoint: None,
+    }
 }

@@ -3,7 +3,7 @@
 mod golden;
 mod regions_test;
 
-use crate::common::{Golden, Spec, Tolerance, suite};
+use crate::common::{Check, Compare, Golden, Source, Spec, Tolerance, suite};
 use lower::form::F32_FORM;
 use models::Stack;
 use models::nanogpt::{Config, program};
@@ -36,15 +36,17 @@ const SPEC: Spec = Spec {
     small: None,
     files: &[],
     golden: Some(Golden {
-        read: golden::read,
+        source: Source::Record(golden::read),
         form: F32_FORM,
-        tolerance: Tolerance {
-            max_abs: 1e-5,
-            cos: 0.0,
-            top: false,
-        },
-        per_token: true,
-        unit: false,
+        checks: &[Check {
+            name: "logits",
+            compare: Compare::Tokens,
+            tolerance: Tolerance {
+                max_abs: 1e-5,
+                cos: 0.0,
+                top: false,
+            },
+        }],
         anywhere: true,
     }),
 };

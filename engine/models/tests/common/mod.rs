@@ -4,18 +4,22 @@
 use kernels as _;
 use linear as _;
 
+mod golden;
+
+pub use golden::{Case, Check, Compare, Golden, Reference, Source, Tolerance, golden};
+pub use golden::{pulled, unit};
+
 use bundle::names::{repo, resolve};
 use checkpoint::{Slice, Stored};
 use interp::{Tensor, run};
 use lower::form::named;
-use lower::{Device, Form, Pins, Plan, Settings, View, lower};
+use lower::{Device, Pins, Plan, Settings, View, lower};
 use run::{Run, open};
 use settings::read as settings;
 use std::collections::BTreeMap;
-use std::path::Path;
-use testkit::{Noise, argmax, cosine_f32, fill, max_abs_diff};
+use testkit::{Noise, cosine_f32, fill, max_abs_diff};
 use trace::DimName::{Context, Seqs};
-use trace::{Composite, DimName, Graph, TensorType};
+use trace::{Composite, Graph, TensorType};
 
 /// One model as the suite sees it.
 pub struct Spec {
@@ -33,57 +37,6 @@ pub struct Spec {
     pub golden: Option<Golden>,
 }
 
-/// A recorded reference, and how closely to match it.
-pub struct Golden {
-    /// The weights and cases, where this host has them.
-    pub read: fn(&Graph) -> Option<Reference>,
-    /// The form the plan keeps weights in.
-    pub form: &'static dyn Form,
-    pub tolerance: Tolerance,
-    /// Rows are tokens when set, else one row.
-    pub per_token: bool,
-    /// The output is scaled to unit length first.
-    pub unit: bool,
-    /// The plan runs on a host with no GPU too.
-    pub anywhere: bool,
-}
-
-/// What a reference holds: weights, and inputs with outputs.
-pub struct Reference {
-    pub weights: Vec<Tensor>,
-    pub cases: Vec<Case>,
-}
-
-/// Sequences of one length, and the output recorded for them.
-pub struct Case {
-    pub name: String,
-    pub seqs: usize,
-    pub tokens: Vec<u32>,
-    pub want: Vec<f32>,
-}
-
-impl Case {
-    /// One sequence.
-    pub fn one(name: &str, tokens: Vec<u32>, want: Vec<f32>) -> Self {
-        let name = name.to_string();
-        Self {
-            name,
-            seqs: 1,
-            tokens,
-            want,
-        }
-    }
-
-    pub fn inputs(&self) -> [Tensor; 2] {
-        inputs(self.seqs, &self.tokens)
-    }
-
-    pub fn sizes(&self) -> [(DimName, u64); 2] {
-        let len = self.tokens.len() / self.seqs;
-        [(Seqs, self.seqs as u64), (Context, len as u64)]
-    }
-}
-
 /// Tokens and positions, `[seqs, len]` each.
 pub fn inputs(seqs: usize, tokens: &[u32]) -> [Tensor; 2] {
     let len = tokens.len() / seqs;
@@ -91,60 +44,6 @@ pub fn inputs(seqs: usize, tokens: &[u32]) -> [Tensor; 2] {
     let positions = (0..seqs).flat_map(|_| 0..len as u32).collect();
     let ids = |data| Tensor::u32(shape.clone(), data);
     [ids(tokens.to_vec()), ids(positions)]
-}
-
-/// How far an output may stray from the reference.
-pub struct Tolerance {
-    pub max_abs: f32,
-    /// The least cosine any row may have.
-    pub cos: f32,
-    /// Each row's largest entry must match.
-    pub top: bool,
-}
-
-impl Tolerance {
-    pub fn check(&self, label: &str, got: &[f32], want: &[f32], rows: usize) {
-        let width = got.len() / rows;
-        let (max, mut cos) = (max_abs_diff(got, want), 1.0f32);
-        for (g, w) in got.chunks(width).zip(want.chunks(width)) {
-            cos = cos.min(cosine_f32(g, w));
-            assert!(!self.top || argmax(g) == argmax(w), "{label}: top differs");
-        }
-        eprintln!("{label}: max_abs {max:.3e} worst cos {cos:.7}");
-        assert!(
-            max < self.max_abs && cos > self.cos,
-            "{label}: {max:.3e} {cos}"
-        );
-    }
-}
-
-impl Golden {
-    /// `got` must match what the case recorded.
-    pub fn close(&self, label: &str, got: &[f32], case: &Case) {
-        let rows = if self.per_token { case.tokens.len() } else { 1 };
-        let scaled = if self.unit { unit(got) } else { got.to_vec() };
-        self.tolerance.check(label, &scaled, &case.want, rows);
-    }
-}
-
-pub fn unit(v: &[f32]) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    v.iter().map(|x| x / norm).collect()
-}
-
-/// Ids from a text file of numbers.
-pub fn tokens(path: &Path) -> Vec<u32> {
-    let text = std::fs::read_to_string(path).unwrap();
-    text.split_whitespace()
-        .map(|t| t.parse().unwrap())
-        .collect()
-}
-
-/// Floats from a file of little-endian f32.
-pub fn floats(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap();
-    let wide = |b: &[u8; 4]| f32::from_le_bytes(*b);
-    bytes.as_chunks::<4>().0.iter().map(wide).collect()
 }
 
 /// A runner for `plan` with every weight loaded.
@@ -314,36 +213,5 @@ pub fn faux(spec: &Spec) {
             "{} as {form}: off {off:e} cos {cos}",
             spec.name
         );
-    }
-}
-
-/// The interpreter and the plan against the reference.
-pub fn golden(spec: &Spec) {
-    let Some(golden) = &spec.golden else { return };
-    let g = (spec.release)();
-    let Some(reference) = (golden.read)(&g) else {
-        return eprintln!("{}: no reference here; skipped", spec.name);
-    };
-    for case in &reference.cases {
-        let out = interpreted(&g, &reference.weights, case.seqs, &case.tokens);
-        golden.close(&format!("{} cpu", case.name), &out, case);
-    }
-    let settings = settings();
-    if settings.gpu().is_none() && !golden.anywhere {
-        return eprintln!("no GPU here; skipped");
-    }
-    let device = Device::guess(&settings).pinned(Pins::all(golden.form));
-    let mut runner: Option<Box<dyn Run>> = None;
-    for case in &reference.cases {
-        let plan = lower(&g, 0, &case.sizes(), &device).unwrap();
-        let r = match runner.as_mut() {
-            Some(r) => r,
-            None => runner.insert(loaded(plan.clone(), &g, &reference.weights, &settings)),
-        };
-        r.replan(&plan).unwrap();
-        let inputs = case.inputs();
-        let out = r.run(&[inputs[0].view(), inputs[1].view()]).unwrap();
-        let label = format!("{} on {}", case.name, r.device());
-        golden.close(&label, out[0].floats().unwrap(), case);
     }
 }
