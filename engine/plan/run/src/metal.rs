@@ -1,6 +1,7 @@
 //! Replays a plan on Metal. Buffers stay on the device.
 
-use crate::run::{Base, Kernels, Run, line};
+use crate::kernels::Kernels;
+use crate::run::{Base, Run, line};
 use codegen::Dialect;
 use gpukit::metal::{CacheConfig, ComputePipeline, Context, Shared};
 use lower::{Arg, Error, Extent, Launch, Plan, Shape, Slot};

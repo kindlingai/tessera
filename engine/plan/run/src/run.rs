@@ -1,10 +1,10 @@
 //! What every backend's plan runner does.
 
 use crate::held::Held;
-use codegen::{Dialect, Precision};
+use codegen::Precision;
 use gpukit::{Limits, Platform};
 use graph::DimName;
-use lower::{Error, Launch, Launching, Plan, Slot, Source, Step, Weight};
+use lower::{Error, Launch, Launching, Plan, Slot, Weight};
 use mem::{Tensor, View, copy};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -46,59 +46,6 @@ impl Base {
 pub(crate) fn line(count: usize) -> (usize, usize) {
     let threads = count.clamp(1, 256);
     (count.div_ceil(threads), threads)
-}
-
-/// Compiled kernels, by how a kernel prints and by entry.
-pub(crate) struct Kernels<T> {
-    made: HashMap<String, T>,
-    /// With whether each was generated.
-    known: HashMap<String, (T, bool)>,
-}
-
-impl<T> Default for Kernels<T> {
-    fn default() -> Self {
-        Self {
-            made: HashMap::new(),
-            known: HashMap::new(),
-        }
-    }
-}
-
-impl<T: Clone> Kernels<T> {
-    /// `step`'s kernel, compiled once. True when generated.
-    pub(crate) fn get(
-        &mut self,
-        step: &Step,
-        dialect: Dialect,
-        fixed: impl FnOnce(&'static str, &'static str) -> Result<T, Error>,
-        made: impl FnOnce(&str, &str) -> Result<T, Error>,
-    ) -> Result<(T, bool), Error> {
-        // Printing a kernel is cheaper than writing its source.
-        let key = format!("{:?}", step.kernel);
-        if let Some(found) = self.known.get(&key) {
-            return Ok(found.clone());
-        }
-        let found = match step.kernel.source() {
-            Source::Fixed { metal, cuda, entry } => {
-                let text = if dialect == Dialect::Metal {
-                    metal
-                } else {
-                    cuda
-                };
-                (fixed(text, entry)?, false)
-            }
-            Source::Made(body) => match self.made.get(&body.entry) {
-                Some(compiled) => (compiled.clone(), true),
-                None => {
-                    let compiled = made(&body.text().render(dialect), &body.entry)?;
-                    self.made.insert(body.entry.clone(), compiled.clone());
-                    (compiled, true)
-                }
-            },
-        };
-        self.known.insert(key, found.clone());
-        Ok(found)
-    }
 }
 
 /// A plan with its buffers allocated and kernels compiled.

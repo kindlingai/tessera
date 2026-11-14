@@ -3,7 +3,8 @@
 macro_rules! device_runner {
     ($bk:ident, $variant:ident) => {
         pub mod $bk {
-            use crate::run::{Base, Kernels, Run};
+            use crate::kernels::Kernels;
+            use crate::run::{Base, Run};
             use codegen::Dialect;
             use gpukit::device::Device;
             use gpukit::$bk::{

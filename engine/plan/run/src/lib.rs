@@ -4,6 +4,8 @@ mod cpu;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod device;
 mod held;
+#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
+mod kernels;
 #[cfg(target_os = "macos")]
 mod metal;
 mod run;
