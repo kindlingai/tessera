@@ -242,6 +242,21 @@ impl Counter {
                         });
                         false
                     }
+                    Intrinsic::Bits => {
+                        self.add(Ops {
+                            int: 1.0,
+                            ..Ops::default()
+                        });
+                        false
+                    }
+                    Intrinsic::Signed => {
+                        self.add(Ops {
+                            int: 1.0,
+                            float: 1.0,
+                            ..Ops::default()
+                        });
+                        true
+                    }
                     Intrinsic::Clamp => {
                         self.add(float(2.0));
                         true

@@ -117,6 +117,10 @@ pub enum Intrinsic {
     Word,
     /// `p.half(offset)`: the u16 at a byte offset.
     Half,
+    /// `w.bits(low, n)`: a bit field as a u32.
+    Bits,
+    /// `w.signed(low, n)`: a bit field, sign-extended, as a float.
+    Signed,
     /// `x.to_bits()` and `f32::from_bits(x)`.
     ToBits,
     FromBits,
@@ -415,6 +419,7 @@ impl Printer<'_> {
                 | Intrinsic::KeptRow
                 | Intrinsic::Word
                 | Intrinsic::Half
+                | Intrinsic::Bits
                 | Intrinsic::ToBits => Ty::U32,
                 Intrinsic::Load4 | Intrinsic::Zero4 | Intrinsic::Make4 => Ty::F32x4,
                 _ => Ty::F32,
@@ -538,6 +543,20 @@ impl Printer<'_> {
             Intrinsic::Zero4 => "float4(0.0f, 0.0f, 0.0f, 0.0f)".into(),
             Intrinsic::Word => format!("f_u32(({} + {}))", arg(self, 0), arg(self, 1)),
             Intrinsic::Half => format!("f_u16(({} + {}))", arg(self, 0), arg(self, 1)),
+            Intrinsic::Bits => format!(
+                "f_field({}, {}, {})",
+                arg(self, 0),
+                arg(self, 1),
+                arg(self, 2)
+            ),
+            Intrinsic::Signed => {
+                format!(
+                    "f_sfield({}, {}, {})",
+                    arg(self, 0),
+                    arg(self, 1),
+                    arg(self, 2)
+                )
+            }
             Intrinsic::ToBits => format!("f_asbits({})", arg(self, 0)),
             Intrinsic::FromBits => format!("f_bits({})", arg(self, 0)),
             Intrinsic::Make4 => {

@@ -741,6 +741,8 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
                 "store4" => quote!(Intrinsic::Store4),
                 "word" => quote!(Intrinsic::Word),
                 "half" => quote!(Intrinsic::Half),
+                "bits" => quote!(Intrinsic::Bits),
+                "signed" => quote!(Intrinsic::Signed),
                 "to_bits" => quote!(Intrinsic::ToBits),
                 other => return Err(Error::new(m.method.span(), format!("no `{other}` here"))),
             };
