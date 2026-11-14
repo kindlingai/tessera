@@ -1,5 +1,7 @@
 # tools
 
+Build tools that run as part of CI or pre-commit hooks.
+
 <!-- crate table -->
 Crate | Description
 --- | ---

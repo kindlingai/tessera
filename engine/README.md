@@ -1,5 +1,8 @@
 # engine
 
+The engine crates deal with the GPU/CPU, and work entirely in preloaded raw weights
+and tokens.
+
 <!-- crate table -->
 Crate | Description
 --- | ---

@@ -1,5 +1,9 @@
 # frontend
 
+The frontend is responsible for loading weights, mapping KV caches to real memory or storage,
+speaking front-end protocols like HTTP, WebSockets or image formats, and translating inputs
+like text and images to tokens for the engine to work with.
+
 <!-- crate table -->
 Crate | Description
 --- | ---
