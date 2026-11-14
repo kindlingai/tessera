@@ -1,5 +1,7 @@
 //! Source text for generated kernels, in each backend's dialect.
 
+use crate::ir::Intrinsic;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Metal,
@@ -38,20 +40,6 @@ const NAMES: &[(&str, &str, &str)] = &[
     ("u64", "unsigned long", "unsigned long long"),
     ("f_const(ty)", "device const ty *", "const ty *"),
     ("f_fn", "static inline", "static __device__ inline"),
-    ("f_exp(x)", "exp(x)", "expf(x)"),
-    ("f_tanh(x)", "tanh(x)", "tanhf(x)"),
-    ("f_max(a, b)", "max(a, b)", "fmaxf(a, b)"),
-    (
-        "f_clamp(x, lo, hi)",
-        "clamp(x, lo, hi)",
-        "fminf(fmaxf(x, lo), hi)",
-    ),
-    ("f_pow(a, b)", "precise::pow(a, b)", "powf(a, b)"),
-    ("f_cos(x)", "precise::cos(x)", "cosf(x)"),
-    ("f_sin(x)", "precise::sin(x)", "sinf(x)"),
-    ("f_bits(x)", "as_type<float>(x)", "__uint_as_float(x)"),
-    ("f_asbits(x)", "as_type<u32>(x)", "__float_as_uint(x)"),
-    ("f_rsqrt(x)", "rsqrt(x)", "rsqrtf(x)"),
     (
         "f_barrier()",
         "threadgroup_barrier(mem_flags::mem_threadgroup)",
@@ -62,31 +50,13 @@ const NAMES: &[(&str, &str, &str)] = &[
         "threadgroup ty name[n]",
         "__shared__ ty name[n]",
     ),
-    ("f_f32x4(p)", "(*(device float4 *)(p))", "(*(float4 *)(p))"),
-    (
-        "f_u32(p)",
-        "(*(device const u32 *)(p))",
-        "(*(const u32 *)(p))",
-    ),
-    (
-        "f_u16(p)",
-        "(*(device const u16 *)(p))",
-        "(*(const u16 *)(p))",
-    ),
     (
         "f_u32x2(p)",
         "(*(device const uint2 *)(p))",
         "(*(const uint2 *)(p))",
     ),
-    (
-        "f_make4(a, b, c, d)",
-        "float4(a, b, c, d)",
-        "make_float4(a, b, c, d)",
-    ),
 ];
 
-/// The shuffle. HIP leaves out the mask.
-const METAL_SHFL: &str = "#define f_shfl_xor(v, m) simd_shuffle_xor(v, m)\n";
 /// Hopper on: wait for the last kernel, release the next.
 const CUDA_PDL: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define f_pdl_wait() asm volatile(\"griddepcontrol.wait;\" ::: \"memory\")
@@ -94,53 +64,6 @@ const CUDA_PDL: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #else
 #define f_pdl_wait()
 #define f_pdl_go()
-#endif
-";
-
-/// Bit fields: one extract instruction on each backend.
-const METAL_BITS: &str = "#define f_field(w, l, n) extract_bits((u32)(w), (l), (n))
-#define f_sfield(w, l, n) ((float)extract_bits((int)(w), (l), (n)))
-";
-const CUDA_BITS: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
-#define f_field(w, l, n) (((u32)(w) >> (l)) & ((1u << (n)) - 1u))
-#define f_sfield(w, l, n) ((float)(((int)((u32)(w) << (32u - (l) - (n)))) >> (32u - (n))))
-#else
-f_fn u32 f_field(u32 w, u32 l, u32 n) {
-    u32 r;
-    asm(\"bfe.u32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
-    return r;
-}
-f_fn float f_sfield(u32 w, u32 l, u32 n) {
-    int r;
-    asm(\"bfe.s32 %0, %1, %2, %3;\" : \"=r\"(r) : \"r\"(w), \"r\"(l), \"r\"(n));
-    return (float)r;
-}
-#endif
-";
-
-/// Narrow float fields, native where a backend has them.
-const METAL_FLOATS: &str = "#define f_f16(w, l) ((float)as_type<half>((u16)f_field(w, l, 16)))
-";
-const CUDA_FLOATS: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
-#define f_f16(w, l) ((float)__builtin_bit_cast(_Float16, (unsigned short)f_field(w, l, 16)))
-#else
-f_fn float f_f16(u32 w, u32 l) {
-    float r;
-    unsigned short h = (unsigned short)f_field(w, l, 16);
-    asm(\"{.reg .b16 t; mov.b16 t, %1; cvt.f32.f16 %0, t;}\" : \"=f\"(r) : \"h\"(h));
-    return r;
-}
-#endif
-";
-const CUDA_E4M3: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-f_fn float f_e4m3(u32 w, u32 l) {
-    unsigned short b = (unsigned short)f_field(w, l, 8);
-    u32 h;
-    asm(\"cvt.rn.f16x2.e4m3x2 %0, %1;\" : \"=r\"(h) : \"h\"(b));
-    return f_f16(h, 0);
-}
-#else
-#define f_e4m3(w, l) f_e4m3_bits(f_field(w, l, 8))
 #endif
 ";
 
@@ -158,12 +81,41 @@ fn widen(name: &str, e: u32, m: u32) -> String {
     )
 }
 
-const CUDA_SHFL: &str = "#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
-#define f_shfl_xor(v, m) __shfl_xor(v, m)
-#else
-#define f_shfl_xor(v, m) __shfl_xor_sync(0xffffffffu, v, m)
-#endif
-";
+/// `name` spelled one way per dialect: Metal, then CUDA.
+fn define(name: &str, metal: &str, cuda: &str) -> [String; 2] {
+    [metal, cuda].map(|s| format!("#define {name} {s}\n"))
+}
+
+fn spelled(metal: &str, cuda: &str) -> [String; 2] {
+    [metal.into(), cuda.into()]
+}
+
+fn both(text: &str) -> [String; 2] {
+    spelled(text, text)
+}
+
+fn none() -> [String; 2] {
+    both("")
+}
+
+/// CUDA text with its own branch for HIP.
+fn hip(hip: &str, cuda: &str) -> String {
+    format!("#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)\n{hip}#else\n{cuda}#endif\n")
+}
+
+/// Each intrinsic's device text, from the table.
+macro_rules! devices {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
+        { device: $dev:expr, $($rest:tt)* })*) => {
+        fn device(i: Intrinsic) -> [String; 2] {
+            match i {
+                $(Intrinsic::$var => $dev,)*
+            }
+        }
+    };
+}
+
+crate::intrinsic::table!(devices);
 
 /// The text before every kernel in `dialect`.
 fn head(dialect: Dialect) -> String {
@@ -182,17 +134,10 @@ fn head(dialect: Dialect) -> String {
             _ => text.push_str(&format!("#define {name} {spelling}\n")),
         }
     }
-    text.push_str(if metal { METAL_SHFL } else { CUDA_SHFL });
-    text.push_str(if metal { METAL_BITS } else { CUDA_BITS });
-    text.push_str(if metal { METAL_FLOATS } else { CUDA_FLOATS });
-    text.push_str(&widen("f_e4m3_bits", 4, 3));
-    text.push_str(&widen("f_e2m1_bits", 2, 1));
-    text.push_str(if metal {
-        "#define f_e4m3(w, l) f_e4m3_bits(f_field(w, l, 8))\n"
-    } else {
-        CUDA_E4M3
-    });
-    text.push_str("#define f_e2m1(w, l) f_e2m1_bits(f_field(w, l, 4))\n");
+    for i in Intrinsic::ALL {
+        let [for_metal, for_cuda] = device(*i);
+        text.push_str(if metal { &for_metal } else { &for_cuda });
+    }
     if !metal {
         text.push_str(CUDA_PDL);
     }

@@ -8,9 +8,10 @@ use crate::Violation;
 use crate::files::Source;
 use crate::rust::is_test_file;
 
-/// The printer, which spells the dialect tokens, and this rule.
+/// Files that spell dialect tokens, and this rule.
 const ALLOWED: &[&str] = &[
     "engine/plan/codegen/src/dialect.rs",
+    "engine/plan/codegen/src/intrinsic.rs",
     "tools/lint/src/text.rs",
 ];
 

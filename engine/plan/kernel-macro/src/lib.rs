@@ -581,14 +581,34 @@ fn bin_op(op: &BinOp) -> Option<Tokens> {
     })
 }
 
-/// Names the prelude gives, which are not kernels.
-const PRELUDE: &[&str] = &[
-    "barrier", "gid", "lid", "lane", "shfl_xor", "sum32", "rsqrt", "exp", "tanh", "max", "clamp",
-    "pow", "cos", "sin", "shared", "tiles", "kept_row",
-];
+/// Prelude names this macro reads as statements.
+const STATEMENTS: &[&str] = &["barrier", "shared", "tiles"];
 
-/// Types whose functions the prelude spells, not kernels.
-const TYPES: &[&str] = &["f32", "F32x4"];
+/// Each intrinsic's kind, source name and variant.
+macro_rules! sources {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
+        { $($body:tt)* })*) => {
+        const INTRINSICS: &[(&str, &str, &str)] =
+            &[$((stringify!($kind), stringify!($($name)::+), stringify!($var))),*];
+    };
+}
+
+mod intrinsic {
+    include!("../../codegen/src/intrinsic.rs");
+}
+
+intrinsic::table!(sources);
+
+/// The intrinsic a method or path call named `name` reaches.
+fn variant(method: bool, name: &str) -> Option<Tokens> {
+    for (kind, source, var) in INTRINSICS {
+        if (*kind == "method") == method && source.replace(' ', "") == name {
+            let var = format_ident!("{var}");
+            return Some(quote!(Intrinsic::#var));
+        }
+    }
+    None
+}
 
 /// A kernel or helper call: `f_inline(..)`, build values raw.
 fn kernel_call(c: &ExprCall, ctx: &Ctx) -> Result<Option<Tokens>, Error> {
@@ -596,13 +616,13 @@ fn kernel_call(c: &ExprCall, ctx: &Ctx) -> Result<Option<Tokens>, Error> {
         return Ok(None);
     };
     let mut path = p.path.clone();
-    let first = path.segments[0].ident.to_string();
     let many = path.segments.len() > 1;
     let Some(last) = path.segments.last_mut() else {
         return Ok(None);
     };
     let name = last.ident.to_string();
-    if many && TYPES.contains(&first.as_str()) || !many && PRELUDE.contains(&name.as_str()) {
+    let whole = quote!(#p).to_string().replace(' ', "");
+    if !many && STATEMENTS.contains(&name.as_str()) || variant(false, &whole).is_some() {
         return Ok(None);
     }
     last.ident = format_ident!("{name}_inline");
@@ -736,18 +756,9 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
         Expr::MethodCall(m) => {
             let recv = sub(&m.receiver)?;
             let args: Vec<Tokens> = m.args.iter().map(sub).collect::<Result<_, _>>()?;
-            let intrinsic = match m.method.to_string().as_str() {
-                "load4" => quote!(Intrinsic::Load4),
-                "store4" => quote!(Intrinsic::Store4),
-                "word" => quote!(Intrinsic::Word),
-                "half" => quote!(Intrinsic::Half),
-                "bits" => quote!(Intrinsic::Bits),
-                "signed" => quote!(Intrinsic::Signed),
-                "f16" => quote!(Intrinsic::Field(codegen::ir::Mini::F16)),
-                "e4m3" => quote!(Intrinsic::Field(codegen::ir::Mini::E4M3)),
-                "e2m1" => quote!(Intrinsic::Field(codegen::ir::Mini::E2M1)),
-                "to_bits" => quote!(Intrinsic::ToBits),
-                other => return Err(Error::new(m.method.span(), format!("no `{other}` here"))),
+            let method = m.method.to_string();
+            let Some(intrinsic) = variant(true, &method) else {
+                return Err(Error::new(m.method.span(), format!("no `{method}` here")));
             };
             Ok(quote!(Expr::Call(#intrinsic, vec![#recv, #(#args),*])))
         }
@@ -764,25 +775,8 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             };
             let name = quote!(#p).to_string().replace(' ', "");
             let args: Vec<Tokens> = c.args.iter().map(sub).collect::<Result<_, _>>()?;
-            let intrinsic = match name.as_str() {
-                "gid" => quote!(Intrinsic::Gid),
-                "lid" => quote!(Intrinsic::Lid),
-                "lane" => quote!(Intrinsic::Lane),
-                "shfl_xor" => quote!(Intrinsic::ShflXor),
-                "sum32" => quote!(Intrinsic::Sum32),
-                "rsqrt" => quote!(Intrinsic::Rsqrt),
-                "exp" => quote!(Intrinsic::Exp),
-                "tanh" => quote!(Intrinsic::Tanh),
-                "max" => quote!(Intrinsic::Max),
-                "clamp" => quote!(Intrinsic::Clamp),
-                "pow" => quote!(Intrinsic::Pow),
-                "cos" => quote!(Intrinsic::Cos),
-                "sin" => quote!(Intrinsic::Sin),
-                "F32x4::zero" => quote!(Intrinsic::Zero4),
-                "F32x4::new" => quote!(Intrinsic::Make4),
-                "f32::from_bits" => quote!(Intrinsic::FromBits),
-                "kept_row" => quote!(Intrinsic::KeptRow),
-                other => return Err(Error::new(p.span(), format!("no `{other}` here"))),
+            let Some(intrinsic) = variant(false, &name) else {
+                return Err(Error::new(p.span(), format!("no `{name}` here")));
             };
             Ok(quote!(Expr::Call(#intrinsic, vec![#(#args),*])))
         }

@@ -251,67 +251,26 @@ impl Tiles {
     }
 }
 
-/// The kept row of `position` in `slot`.
-pub fn kept_row(_: u32, _: u32) -> u32 {
-    device()
+/// A free function's stub. Others are methods or associated.
+macro_rules! stub {
+    (fn [$($doc:tt)*] $name:ident ($($arg:ident),*) -> $ret:ident) => {
+        $($doc)*
+        pub fn $name($(_: $arg),*) -> $ret {
+            device()
+        }
+    };
+    ($($other:tt)*) => {};
 }
 
-/// The thread's index in the grid.
-pub fn gid() -> u32 {
-    device()
+/// The intrinsics called as free functions, from the table.
+macro_rules! stubs {
+    ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
+        { $($body:tt)* })*) => {
+        $(stub!($kind [$(#[$doc])*] $($name)::+ ($($arg)*) $(-> $ret)?);)*
+    };
 }
 
-/// The thread's index in its group.
-pub fn lid() -> u32 {
-    device()
-}
-
-/// The thread's lane among the 32 that shuffle together.
-pub fn lane() -> u32 {
-    device()
-}
-
-/// The value the lane `mask` away holds.
-pub fn shfl_xor(_: f32, _: u32) -> f32 {
-    device()
-}
-
-/// The sum over the 32 lanes, in every lane.
-pub fn sum32(_: f32) -> f32 {
-    device()
-}
-
-pub fn rsqrt(_: f32) -> f32 {
-    device()
-}
-
-pub fn exp(_: f32) -> f32 {
-    device()
-}
-
-pub fn tanh(_: f32) -> f32 {
-    device()
-}
-
-pub fn max(_: f32, _: f32) -> f32 {
-    device()
-}
-
-pub fn clamp(_: f32, _: f32, _: f32) -> f32 {
-    device()
-}
-
-pub fn pow(_: f32, _: f32) -> f32 {
-    device()
-}
-
-pub fn cos(_: f32) -> f32 {
-    device()
-}
-
-pub fn sin(_: f32) -> f32 {
-    device()
-}
+crate::intrinsic::table!(stubs);
 
 /// Waits for every thread in the group.
 pub fn barrier() {

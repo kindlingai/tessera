@@ -6,6 +6,7 @@ mod dialect;
 pub mod exec;
 pub mod form;
 pub mod inline;
+mod intrinsic;
 pub mod ir;
 pub mod kept;
 pub mod numerics;
@@ -25,6 +26,8 @@ pub const LANES: usize = 32;
 
 #[cfg(test)]
 mod block_test;
+#[cfg(test)]
+mod intrinsic_test;
 #[cfg(test)]
 mod ir_test;
 #[cfg(test)]
