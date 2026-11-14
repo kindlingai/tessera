@@ -7,8 +7,7 @@ mod zone;
 
 use serde::{Deserialize, Serialize};
 
-pub use known::{known, m3_pro, strix_halo};
-pub use nvidia::{Nvidia, Sm, gb10};
+pub use known::{known, m3_pro};
 pub use pool::{Fit, Pool};
 pub use zone::{Cluster, Link, Zone, ZoneKind};
 
