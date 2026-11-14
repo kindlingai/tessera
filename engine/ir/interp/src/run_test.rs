@@ -51,14 +51,14 @@ fn casts<const N: usize>(x: Tensor, to: [DType; N]) -> Result<Vec<Tensor>, Error
 #[test]
 fn top_k_ties() {
     let (inf, nan) = (f32::INFINITY, f32::NAN);
-    // NaN is skipped. 0.0 ranks above -0.0.
+    // NaN is skipped. 0.0 and -0.0 tie.
     let x = vec![2., 7., 7., -1., -inf, 3., nan, -inf, -0.0, 0.0, -0.0, inf];
     let x = Tensor::f32(vec![3, 4], x);
     let out = eval([port([Rows, Hidden], F32)], &[x], None, |_, [x]| {
         [x.top_k(TopK)]
     });
     // Ties keep the lower index. Spare slots hold the width.
-    let want = [1, 2, 0, 1, 4, 4, 3, 1, 0];
+    let want = [1, 2, 0, 1, 4, 4, 3, 0, 1];
     assert_eq!(out.unwrap()[0].indices().unwrap(), want);
 }
 

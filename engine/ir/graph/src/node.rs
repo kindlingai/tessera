@@ -217,9 +217,9 @@ pub enum Select {
     Gather,
     /// Row entries at the second argument's indices. Out-of-range gives zero.
     Take,
-    /// Indices of each row's largest entries above negative infinity.
+    /// Indices of each row's largest entries. Spare slots hold width.
     TopK {
-        /// Largest first, low index on ties. Spare slots hold width.
+        /// Best first, NaN and -inf skipped, ties to lower index.
         k: DimExpr,
     },
 }

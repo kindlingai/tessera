@@ -4,6 +4,7 @@ use crate::cpu;
 use crate::tensor::Error;
 use graph::{DimExpr, DimName, Graph, NodeId, Numerics, Op, PathSeg, Select, Shape, Size, View};
 use mem::Tensor;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// Dimension sizes for one launch.
@@ -334,8 +335,8 @@ fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
     let mut ids = Vec::with_capacity(x.len() / width.max(1) * k);
     for row in x.floats()?.chunks(width.max(1)) {
         let mut order: Vec<usize> = (0..width).filter(|i| row[*i] > f32::NEG_INFINITY).collect();
-        // A stable sort keeps the lower index on ties.
-        order.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
+        // A stable sort keeps the lower index. 0.0 ties -0.0.
+        order.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(Ordering::Equal));
         // Spare slots hold the width.
         order.resize(k, width);
         ids.extend(order.into_iter().take(k).map(|i| i as u32));
