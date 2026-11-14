@@ -6,7 +6,9 @@ use codegen::ir::{BinOp, Body, Expr, Stmt};
 use codegen::prelude::*;
 use graph::Order;
 use lower::kernels::finish;
-use lower::{Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
+use lower::{
+    Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree, UNPROVEN,
+};
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,9 +270,8 @@ impl Kernel for Tiled {
         self.product.launch(step, &[m, n, k], shape)
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 
     /// Two staged slabs of `bk + PAD` floats a row.

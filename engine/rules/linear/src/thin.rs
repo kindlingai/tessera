@@ -4,7 +4,7 @@ use crate::product::{Product, Variant};
 use codegen::ir::{Body, Expr, Intrinsic};
 use codegen::prelude::*;
 use graph::Order;
-use lower::{Draft, Form as Stored, Kernel, Launch, Load, Shape, Source, Step, T, Tree};
+use lower::{Draft, Form as Stored, Kernel, Launch, Load, Shape, Source, Step, T, Tree, UNPROVEN};
 
 /// Its row limit: each thread keeps one sum per row.
 pub const THIN_ROWS: usize = 32;
@@ -89,9 +89,8 @@ impl Kernel for Thin {
         self.product.launch(step, &[n, k], Shape::Line(n))
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 }
 

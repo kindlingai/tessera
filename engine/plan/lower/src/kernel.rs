@@ -9,6 +9,9 @@ use sim::{Load, ZoneKind};
 use std::fmt;
 use std::sync::Arc;
 
+/// Seconds per unit of work for an unmeasured kernel.
+pub const UNPROVEN: f64 = 1e-9;
+
 /// One kernel with its sizes. Any crate may add one.
 pub trait Kernel: fmt::Debug + Send + Sync {
     /// Names its cost curve, so it must be unique.

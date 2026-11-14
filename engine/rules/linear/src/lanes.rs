@@ -4,7 +4,9 @@ use crate::product::{Product, Variant};
 use codegen::ir::{Body, Expr};
 use codegen::prelude::*;
 use graph::Order;
-use lower::{Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
+use lower::{
+    Draft, Form as Stored, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree, UNPROVEN,
+};
 
 /// Elements one wide load brings a lane.
 const WIDE: u32 = 4;
@@ -124,9 +126,8 @@ impl Kernel for Lanes {
         self.product.launch(step, &[n, k], Shape::Line(n * LANES))
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 
     fn needs(&self) -> Needs {

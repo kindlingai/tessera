@@ -3,7 +3,7 @@
 use codegen::prelude::*;
 use graph::Order;
 use lower::sites;
-use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
+use lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree, UNPROVEN};
 
 /// Elements one wide load brings a lane.
 const WIDE: u32 = 4;
@@ -127,9 +127,8 @@ impl Kernel for LaneNorm {
         (self.rows * self.width) as f64
     }
 
-    /// Unproven, so it must earn its place by measurement.
     fn guess(&self) -> f64 {
-        1e-9
+        UNPROVEN
     }
 
     fn needs(&self) -> Needs {
