@@ -13,7 +13,7 @@ use sensai_graph::F16;
 use sensai_linear::{Product, SCHEDULES, Schedule, Tiled};
 use sensai_lower::form::{BF16_FORM, LOADS, named};
 use sensai_lower::sites::After;
-use sensai_lower::{Device, Dialect, Kernel, Pins, Settings, Source, Weight, lower};
+use sensai_lower::{Device, Dialect, Kernel, Pins, Settings, Source, Weight, lower, select};
 use sensai_run::open;
 use sensai_run::testing::{emulations, host, runs};
 use sensai_testkit::{Noise, cosine_f32, max_abs_diff};
@@ -25,6 +25,14 @@ fn only(at: usize, settings: &Settings) -> Device {
         LOADS.iter().fold(d, |d, f| d.without(f.suffixed(s.name)))
     };
     others.fold(Device::guess(settings).favoring("tiled"), bar)
+}
+
+/// Calibrate reads the ways to time each schedule.
+#[test]
+fn ways_list_schedules() {
+    let device = Device::guess(&host());
+    let picked = select(&linear(72, 50), 0, &[(Rows, 37)], &device).unwrap();
+    assert_eq!(picked.ways["tiled"].len(), SCHEDULES.len());
 }
 
 #[test]
@@ -162,10 +170,10 @@ fn codes_match_decode() {
     }
 }
 
-/// Unsampled, the M3 model puts both `w16` schedules first.
+/// Unsampled, the M3 model ranks the fastest three as timed.
 #[test]
 fn m3_ranks() {
-    let seconds = |schedule: &&Schedule| {
+    let seconds = |schedule: &Schedule| {
         let product = Product {
             m: 1536,
             n: 3072,
@@ -177,15 +185,19 @@ fn m3_ranks() {
         };
         let load = Tiled {
             product,
-            schedule: **schedule,
+            schedule: *schedule,
         }
         .load(0)
         .unwrap();
         sensai_sim::Chip::estimate(&sensai_sim::m3_pro(), &load).seconds
     };
-    let (w16, rest): (Vec<_>, Vec<_>) = SCHEDULES.iter().partition(|s| s.name.ends_with("w16"));
-    let slowest = w16.iter().map(seconds).fold(0.0, f64::max);
-    assert!(rest.iter().all(|s| seconds(s) > slowest));
+    let mut ranked: Vec<(f64, &str)> = SCHEDULES.iter().map(|s| (seconds(s), s.name)).collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let names: Vec<&str> = ranked.iter().take(3).map(|r| r.1).collect();
+    assert_eq!(
+        names,
+        ["tiled_64x64_w32x16", "tiled_32x32_w16", "tiled_64x64_w16"]
+    );
 }
 
 /// Neighbours gathered while staged, against the interpreter.

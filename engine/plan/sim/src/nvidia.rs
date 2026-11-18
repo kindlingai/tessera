@@ -59,6 +59,14 @@ pub(crate) struct Sm {
     pub fp8: Const,
     /// One, where one instruction widens an e4m3.
     pub cvt8: Const,
+    /// Bytes of group memory one multiprocessor holds.
+    pub group_memory: Const,
+    /// Registers a thread may hold.
+    pub cap: Const,
+    /// Seconds a thread waits per float from group memory.
+    pub staged: Const,
+    /// Seconds a thread takes per tile flop, in a chain.
+    pub mma: Const,
 }
 
 /// Tile flops run as three tf32 products at half rate.
@@ -113,6 +121,10 @@ pub(crate) fn gb10() -> Nvidia {
         fp16: m(99.7e12, "m16n8k16 loop, 16 accumulators, at 2.1 GHz"),
         fp8: m(203.6e12, "m16n8k32 block-scaled 8-bit loop at 2.1 GHz"),
         cvt8: a(1.0, "sm_89 on: cvt.rn.f16x2.e4m3x2"),
+        group_memory: i(64e3, "tiled schedules forced in turn; 100 KB at most"),
+        cap: a(255.0, "the PTX limit"),
+        staged: i(4e-8, "tiled schedules forced in turn"),
+        mma: i(1e-11, "tiled schedules forced in turn"),
     };
     Nvidia {
         name: "cuda NVIDIA GB10".into(),
@@ -130,10 +142,17 @@ impl Chip for Nvidia {
         let group = l.group.max(1) as f64;
         let warps = (group / 32.0).ceil();
         let grid = (l.threads as f64 / group).ceil().max(1.0);
-        // How many groups one multiprocessor runs at once.
-        let by_registers = (s.registers.value / (s.held.value * warps * 32.0)).floor();
+        // Groups one multiprocessor runs at once.
+        let stated = l.trip.held.min(s.cap.value);
+        let held = if stated > 0.0 { stated } else { s.held.value };
+        let by_registers = (s.registers.value / (held * warps * 32.0)).floor();
         let by_threads = (s.threads.value / (warps * 32.0)).floor();
-        let fit = by_registers.min(by_threads).min(s.groups.value).max(1.0);
+        let by_shared = match l.group_bytes > 0.0 {
+            true => (s.group_memory.value / l.group_bytes).floor(),
+            false => f64::INFINITY,
+        };
+        let fit = by_registers.min(by_threads).min(by_shared);
+        let fit = fit.min(s.groups.value).max(1.0);
         let per_sm = (grid / s.sms.value).ceil();
         let rounds = (per_sm / fit).ceil();
         let resident = fit.min(per_sm);
@@ -163,7 +182,9 @@ impl Chip for Nvidia {
             true => s.gather.value + (s.scatter.value - s.gather.value) * apart,
             false => s.gather.value,
         };
-        let chain = l.trips * (t.float * s.chain.value + t.loads * stall);
+        let tiles = t.shared * s.staged.value + t.tile_flops * s.mma.value;
+        let waits = t.float * s.chain.value + t.loads * stall + tiles;
+        let chain = rounds * l.trips * waits;
         let cold = |bytes: &&f64| **bytes > s.cache.value;
         let far: f64 = l.reads.iter().filter(cold).sum();
         let peak = if t.fresh < 1.0 { s.scan } else { s.read };
@@ -239,6 +260,10 @@ impl Chip for Nvidia {
             ("fp16", s.fp16),
             ("fp8", s.fp8),
             ("cvt8", s.cvt8),
+            ("group_memory", s.group_memory),
+            ("cap", s.cap),
+            ("staged", s.staged),
+            ("mma", s.mma),
         ]
     }
 }

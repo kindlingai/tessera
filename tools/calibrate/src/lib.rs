@@ -12,7 +12,7 @@ pub use grid::Grid;
 
 use sensai_engine::Error;
 use sensai_graph::{DimName, Graph};
-use sensai_lower::{Device, Settings, Step, View, lower, select};
+use sensai_lower::{Device, Settings, Step, View, ZoneKind, lower, select};
 use sensai_run::Run;
 use sensai_sim::Chip;
 use std::collections::BTreeMap;
@@ -66,15 +66,33 @@ fn measure(
     Ok(added)
 }
 
-/// The guess, then the guess favoring each rule that competes.
+/// The guess, each competing rule, then each rule's ways.
 fn choices(
     (g, entry): (&Graph, usize),
     sizes: &[(DimName, u64)],
     guess: &dyn Fn() -> Device,
 ) -> Result<Vec<Device>, Error> {
-    let contested = select(g, entry, sizes, &guess())?.contested;
-    let favored = contested.into_iter().map(|r| guess().favoring(r));
-    Ok([guess()].into_iter().chain(favored).collect())
+    let picked = select(g, entry, sizes, &guess())?;
+    let mut all: Vec<Device> = [guess()].into_iter().collect();
+    all.extend(picked.contested.iter().map(|r| guess().favoring(*r)));
+    // A host emulates GPU ways slowly. They never win there.
+    let gpu = guess().cluster.kind(0) == ZoneKind::Gpu;
+    for (rule, ways) in &picked.ways {
+        if ways.len() < 2 || !gpu {
+            continue;
+        }
+        for way in ways {
+            // Bars every kernel the other ways launch.
+            let mut device = guess().favoring(*rule);
+            for name in ways.iter().flatten() {
+                if !way.contains(name) {
+                    device = device.without(*name);
+                }
+            }
+            all.push(device);
+        }
+    }
+    Ok(all)
 }
 
 /// A chip model against the timed launches of one kernel.

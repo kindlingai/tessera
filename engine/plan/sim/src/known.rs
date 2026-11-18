@@ -31,9 +31,9 @@ fn m3_pro_fit() -> Fit {
         store: 320e3,
         resident: 1024.0,
         held: 128.0,
-        shared: 2e-8,
+        shared: 3e-8,
         banked: 1.8e11,
-        mma: 1e-9,
+        mma: 5e-10,
         spill: 3.2e-7,
     }
 }

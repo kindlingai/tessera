@@ -15,7 +15,7 @@ use crate::rule::{Read, linked};
 use crate::tree::{T, Term, Tree};
 use crate::{Error, Unsupported};
 use sensai_graph::{DimName, Graph, NodeId, View};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A value some op writes, or the plan is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,6 +71,8 @@ pub struct Selected {
     pub table: usize,
     /// Rules that competed with another at some site.
     pub contested: BTreeSet<&'static str>,
+    /// Each rule's runnable ways, as the kernels they launch.
+    pub ways: BTreeMap<&'static str, BTreeSet<Vec<&'static str>>>,
     /// Ranks that run together, and which this is.
     pub ranks: u32,
     pub rank: u32,
@@ -191,6 +193,9 @@ pub(crate) fn select_upto(
                 let choice = choice.expect("solved above");
                 if choice.offered.len() > 1 {
                     e.out.contested.extend(&choice.offered);
+                }
+                for (rule, way) in choice.ways {
+                    e.out.ways.entry(rule).or_default().insert(way);
                 }
                 let covers = tree.covered(t, &reads(&choice.drafts));
                 let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());

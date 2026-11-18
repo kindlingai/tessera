@@ -24,7 +24,7 @@ pub struct Schedule {
 }
 
 /// Every matmul's schedules. `w16` SIMD groups own 16 by 16.
-pub const SCHEDULES: [Schedule; 6] = [
+pub const SCHEDULES: [Schedule; 7] = [
     Schedule {
         block: (64, 64, 32),
         simds: (2, 2),
@@ -60,6 +60,12 @@ pub const SCHEDULES: [Schedule; 6] = [
         simds: (2, 2),
         name: "tiled_32x32_w16",
         near: "near_32x32_w16",
+    },
+    Schedule {
+        block: (64, 64, 32),
+        simds: (2, 4),
+        name: "tiled_64x64_w32x16",
+        near: "near_64x64_w32x16",
     },
 ];
 
@@ -344,7 +350,8 @@ fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
         Some(near) => 4.0 * mf * near.cin as f64,
         None => 4.0 * mf * k as f64,
     };
-    let mut reads = vec![rows, form.bytes(n * k) as f64 * gm as f64];
+    let mut reads = vec![rows];
+    reads.extend((0..gm).map(|_| form.bytes(n * k) as f64));
     reads.extend(
         t.product
             .near

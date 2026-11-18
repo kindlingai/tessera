@@ -18,7 +18,12 @@ pub(crate) struct Choice {
     cost: f64,
     /// Every rule that proposed here.
     pub(crate) offered: Vec<&'static str>,
+    /// Each runnable way here: its rule and kernel names.
+    pub(crate) ways: Vec<Way>,
 }
+
+/// One way a rule offers: its rule, then its kernels.
+pub(crate) type Way = (&'static str, Vec<&'static str>);
 
 /// A cover's reads of tree nodes.
 pub(crate) fn reads(drafts: &[Draft]) -> Vec<T> {
@@ -124,6 +129,7 @@ impl Cover<'_> {
                 drafts: Vec::new(),
                 cost,
                 offered: Vec::new(),
+                ways: Vec::new(),
             });
         }
         if n.term == Term::Stage(Stage::AllReduce) {
@@ -135,10 +141,12 @@ impl Cover<'_> {
                 drafts: vec![Draft::new(AllReduce { len }, [n.args[0]], len)],
                 cost,
                 offered: vec!["all_reduce"],
+                ways: Vec::new(),
             });
         }
         let kind = self.device.cluster.kind(zone as usize);
         let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
+        let mut runnable = Vec::new();
         let mut proposed = false;
         for rule in self.rules.clone() {
             let Some(drafts) = rule.propose.at(self.tree, t) else {
@@ -158,6 +166,7 @@ impl Cover<'_> {
                 if self.swallows(rule, t, &drafts, kind) {
                     continue;
                 }
+                runnable.push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
                 let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
                 let mut cost: f64 = drafts.iter().map(seconds).sum();
                 cost += self.widening(zone, &drafts);
@@ -179,6 +188,7 @@ impl Cover<'_> {
                         drafts,
                         cost,
                         offered: Vec::new(),
+                        ways: Vec::new(),
                     });
                 }
             }
@@ -186,7 +196,8 @@ impl Cover<'_> {
         if !proposed && !self.bare.contains(&t) {
             self.bare.push(t);
         }
-        best.map(|b| Choice { offered, ..b })
+        let ways = runnable;
+        best.map(|b| Choice { offered, ways, ..b })
     }
 
     /// The deepest node below `root` that no rule proposes at.
