@@ -8,7 +8,7 @@ description = "Moves bytes between ranks over sockets, shared memory or RDMA"
 
 [dependencies]
 thiserror = "2"
-sensai-gpukit = { workspace = true }
+sensai-dl = { workspace = true }
 
 [dev-dependencies]
 sensai-testkit = { workspace = true }

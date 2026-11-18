@@ -2,8 +2,9 @@
 
 use crate::Error;
 use crate::api::{LaunchFn, entry};
-use crate::dl::{message, once};
+use crate::dl::once;
 use crate::rtc::Rtc;
+use sensai_dl::message;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -41,7 +42,7 @@ type HipGraphInstantiate = unsafe extern "C" fn(
 type HipGetErrorName = unsafe extern "C" fn(HipError) -> *const c_char;
 type HipGetErrorString = unsafe extern "C" fn(HipError) -> *const c_char;
 
-crate::dl::library! {
+sensai_dl::library! {
     /// Resolved runtime entry points. The dlopen handle stays open.
     pub struct Runtime as "HIP runtime" in [
         "libamdhip64.so",
@@ -87,8 +88,8 @@ impl Runtime {
         if code == HIP_SUCCESS {
             return Ok(());
         }
-        let name = message(unsafe { (self.hip_get_error_name)(code) });
-        let msg = message(unsafe { (self.hip_get_error_string)(code) });
+        let name = unsafe { message((self.hip_get_error_name)(code)) };
+        let msg = unsafe { message((self.hip_get_error_string)(code)) };
         Err(Error::Rocm(format!("{what} failed: {name} ({code}) {msg}")))
     }
 }

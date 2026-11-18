@@ -1,9 +1,9 @@
 //! Ranks over RDMA writes into each other's slots.
 
 use crate::fabric::{Fabric, HEADER, Lane, Peer, Wiring, parts};
+use crate::ibv::{self, Gid, Lib, Mr, QpAttr, QpInitAttr, SendWr, Sge, Wc, mask};
 use crate::reduce::{BYTES, CTL_WORDS, ERR, Pinned, Pinning, Reduce, SEQ};
 use crate::{Error, Transport};
-use sensai_gpukit::ibv::{self, Gid, Lib, Mr, QpAttr, QpInitAttr, SendWr, Sge, Wc, mask};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

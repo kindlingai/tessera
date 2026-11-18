@@ -4,7 +4,7 @@ use crate::Kernel;
 use crate::abi::Source;
 use crate::form::Load as Stored;
 use sensai_codegen::prelude::*;
-use sensai_sim::Load;
+use sensai_work::Load;
 
 /// One thread per element, widened to f32.
 #[kernel]

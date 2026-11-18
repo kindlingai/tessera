@@ -2,8 +2,9 @@
 
 use crate::Error;
 use crate::api::{LaunchFn, entry};
-use crate::dl::{message, once};
+use crate::dl::once;
 use crate::rtc::Rtc;
+use sensai_dl::message;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -70,7 +71,7 @@ type CuGraphInstantiate = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
-crate::dl::library! {
+sensai_dl::library! {
     /// Resolved driver entry points. The dlopen handle stays open.
     pub struct Driver as "CUDA driver" in ["libcuda.so.1"] {
         pub(crate) cu_init: entry::Init = "cuInit",
@@ -119,7 +120,7 @@ impl Driver {
         if p.is_null() {
             return format!("CUDA error {code}");
         }
-        message(p)
+        unsafe { message(p) }
     }
 
     /// Turn a failed return code into an error naming `what`.
@@ -129,7 +130,7 @@ impl Driver {
         }
         let mut p: *const c_char = std::ptr::null();
         unsafe { (self.cu_get_error_string)(code, &mut p) };
-        let msg = message(p);
+        let msg = unsafe { message(p) };
         Err(Error::Cuda(format!(
             "{what} failed: {} ({code}) {msg}",
             self.error_name(code)

@@ -3,7 +3,7 @@
 use crate::LANES;
 use crate::form::Load;
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
-use sensai_sim::Ops;
+use sensai_work::Ops;
 use std::collections::HashMap;
 
 /// Bytes in a cache line.

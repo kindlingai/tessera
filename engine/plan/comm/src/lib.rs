@@ -1,6 +1,7 @@
 //! Moves bytes between ranks over handles the front end opened.
 
 mod fabric;
+mod ibv;
 pub mod reduce;
 mod shm;
 mod sockets;
@@ -72,3 +73,5 @@ pub enum Error {
 mod comm_test;
 #[cfg(test)]
 mod fabric_test;
+#[cfg(test)]
+mod ibv_test;

@@ -39,6 +39,7 @@ sensai-engine-settings = { path = "engine/settings" }
 sensai-findings = { path = "tools/findings" }
 sensai-frontend-comm = { path = "frontend/comm" }
 sensai-frontend-settings = { path = "frontend/settings" }
+sensai-dl = { path = "engine/gpu/dl" }
 sensai-gpukit = { path = "engine/gpu/gpukit" }
 sensai-bundle = { path = "frontend/bundle" }
 sensai-grammar = { path = "frontend/grammar" }
@@ -63,6 +64,7 @@ sensai-run = { path = "engine/plan/run" }
 sensai-serve = { path = "frontend/serve" }
 sensai-shape = { path = "tools/shape" }
 sensai-sim = { path = "engine/plan/sim" }
+sensai-work = { path = "engine/gpu/work" }
 sensai-tasks = { path = "frontend/tasks" }
 sensai-testkit = { path = "engine/ir/testkit" }
 sensai-trace = { path = "engine/ir/trace" }

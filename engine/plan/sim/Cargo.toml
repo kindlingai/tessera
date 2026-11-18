@@ -8,3 +8,4 @@ description = "Analytic models of GPUs: what a launch should cost"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+sensai-work = { workspace = true }

@@ -13,7 +13,7 @@ use sensai_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
 use sensai_codegen::prelude::*;
 use sensai_codegen::stage::Row;
 use sensai_graph::Act;
-use sensai_sim::Load;
+use sensai_work::Load;
 use std::cmp::Ordering;
 
 /// Adds `count` f32 operands `a0..` to `body`, at `at`.
