@@ -2,6 +2,7 @@
 
 use crate::{Error, io, pinned};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// File endings a model directory needs. Other files stay remote.
@@ -80,21 +81,81 @@ pub(crate) fn snapshot(spec: &str, cache: &Path, token: Option<&str>) -> Result<
     }
     let info = lookup(repo, commit, token)?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let ends = |name: &str, kinds: &[&str]| kinds.iter().any(|k| name.ends_with(k));
-    let safe = info
-        .siblings
-        .iter()
-        .any(|s| s.rfilename.ends_with(".safetensors"));
-    for s in info.siblings {
-        let name = s.rfilename;
-        let kept = ends(&name, &KEEP) || (!safe && ends(&name, &PICKLED));
-        if !name.contains('/') && kept && !dir.join(&name).is_file() {
-            let url = format!("https://huggingface.co/{repo}/resolve/{commit}/{name}");
-            download(&url, &dir.join(&name), token)?;
+    let names: Vec<String> = info.siblings.into_iter().map(|s| s.rfilename).collect();
+    let index = dir.join("model_index.json");
+    let folders = if names.iter().any(|n| n == "model_index.json") {
+        fetch_file(repo, commit, "model_index.json", &dir, token)?;
+        Some(components(&index)?)
+    } else {
+        None
+    };
+    for name in wanted(&names, folders.as_deref()) {
+        if !safe_path(name) {
+            return Err(Error::Source(spec.into(), "unsafe file path in repository"));
         }
+        fetch_file(repo, commit, name, &dir, token)?;
     }
     std::fs::write(&done, b"").map_err(io(&done))?;
     Ok(dir)
+}
+
+/// Diffusers component folders that `model_index.json` names.
+fn components(index: &Path) -> Result<Vec<String>, Error> {
+    let text = std::fs::read_to_string(index).map_err(io(index))?;
+    let map: BTreeMap<String, serde_json::Value> = serde_json::from_str(&text)
+        .map_err(|e| Error::Http(index.display().to_string(), e.to_string()))?;
+    let mut folders = Vec::new();
+    for (key, value) in map {
+        if value.as_array().is_some_and(|pair| pair.len() == 2) {
+            folders.push(key);
+        }
+    }
+    Ok(folders)
+}
+
+/// Files to fetch. With `folders`, root weights stay remote.
+pub(crate) fn wanted<'a>(names: &'a [String], folders: Option<&[String]>) -> Vec<&'a str> {
+    let ends = |name: &str, kinds: &[&str]| kinds.iter().any(|k| name.ends_with(k));
+    let safe = names.iter().any(|n| n.ends_with(".safetensors"));
+    let mut out = Vec::new();
+    for name in names {
+        if !(ends(name, &KEEP) || (!safe && ends(name, &PICKLED))) {
+            continue;
+        }
+        let keep = match (name.split_once('/'), folders) {
+            (None, None) => true,
+            (None, Some(_)) => ends(name, &[".json"]),
+            (Some((top, _)), Some(folders)) => folders.iter().any(|f| f == top),
+            (Some(_), None) => false,
+        };
+        if keep {
+            out.push(name.as_str());
+        }
+    }
+    out
+}
+
+pub(crate) fn safe_path(name: &str) -> bool {
+    !name.starts_with('/') && !name.contains('\\') && !name.split('/').any(|p| p == "..")
+}
+
+/// One repository file into `dir`, unless it is there.
+fn fetch_file(
+    repo: &str,
+    commit: &str,
+    name: &str,
+    dir: &Path,
+    token: Option<&str>,
+) -> Result<(), Error> {
+    let path = dir.join(name);
+    if path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io(parent))?;
+    }
+    let url = format!("https://huggingface.co/{repo}/resolve/{commit}/{name}");
+    download(&url, &path, token)
 }
 
 /// Streams `url` to `path` through a `.part` file.

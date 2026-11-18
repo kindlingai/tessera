@@ -3,6 +3,8 @@
 mod build;
 mod hub;
 #[cfg(test)]
+mod hub_test;
+#[cfg(test)]
 mod lib_test;
 mod source;
 #[cfg(test)]
