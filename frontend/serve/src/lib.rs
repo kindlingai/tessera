@@ -22,7 +22,7 @@ mod wire_test;
 use http::{Request, Response};
 pub use images::{fresh, square};
 use sensai_bundle::Message;
-use sensai_tasks::api::{Chat, Embed, Generator, Info, Paint, Tokens};
+use sensai_tasks::api::{Chat, Embed, GenerateImage, Generator, Info, Tokens};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
@@ -34,7 +34,7 @@ pub struct Model {
     pub chat: Option<Arc<dyn Chat>>,
     pub generator: Option<Arc<dyn Generator>>,
     pub embed: Option<Arc<dyn Embed>>,
-    pub paint: Option<Arc<dyn Paint>>,
+    pub image: Option<Arc<dyn GenerateImage>>,
     /// Unknown request fields refuse the request. Else they warn.
     pub strict: bool,
 }

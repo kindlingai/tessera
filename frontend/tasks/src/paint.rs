@@ -1,7 +1,7 @@
 //! Prompts to 16x16 sprites by masked diffusion.
 
 use crate::Error;
-use crate::api::{Image, Paint, Sizes, Tokens};
+use crate::api::{GenerateImage, Image, Sizes, Tokens};
 use crate::worker::Worker;
 use sensai_bundle::sprite::{denoiser, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
@@ -236,7 +236,7 @@ impl Worker<Painter> {
     }
 }
 
-impl Paint for Worker<Painter> {
+impl GenerateImage for Worker<Painter> {
     /// Sprites are painted 16 a side, then enlarged.
     fn sizes(&self) -> Sizes {
         Sizes {
@@ -246,7 +246,13 @@ impl Paint for Worker<Painter> {
         }
     }
 
-    fn paint(&self, prompt: &str, n: usize, seed: u32, size: usize) -> Result<Vec<Image>, Error> {
+    fn generate(
+        &self,
+        prompt: &str,
+        n: usize,
+        seed: u32,
+        size: usize,
+    ) -> Result<Vec<Image>, Error> {
         let prompt = prompt.to_string();
         self.run(move |p| {
             let options = Options {

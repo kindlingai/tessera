@@ -1,7 +1,7 @@
 //! FLUX.2 klein: a prompt to a picture.
 
 use crate::Error;
-use crate::api::{Image, Paint, Sizes, Tokens};
+use crate::api::{GenerateImage, Image, Sizes, Tokens};
 use crate::features::Features;
 use crate::flow::Flow;
 use crate::pictures::Pictures;
@@ -134,7 +134,7 @@ impl Worker<Klein> {
     }
 }
 
-impl Paint for Worker<Klein> {
+impl GenerateImage for Worker<Klein> {
     fn sizes(&self) -> Sizes {
         let largest = self.run(|k| k.largest * PATCH).unwrap_or(PATCH);
         Sizes {
@@ -144,7 +144,13 @@ impl Paint for Worker<Klein> {
         }
     }
 
-    fn paint(&self, prompt: &str, n: usize, seed: u32, size: usize) -> Result<Vec<Image>, Error> {
+    fn generate(
+        &self,
+        prompt: &str,
+        n: usize,
+        seed: u32,
+        size: usize,
+    ) -> Result<Vec<Image>, Error> {
         let prompt = prompt.to_string();
         self.run(move |k| {
             let side = size / PATCH;

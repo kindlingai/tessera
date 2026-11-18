@@ -1,4 +1,4 @@
-//! `/v1/images/generations` over `Paint`, as base64 PNGs.
+//! `/v1/images/generations` over `GenerateImage`, as base64 PNGs.
 
 use crate::http::Response;
 use crate::wire::{self, Images, Refusal, bad, refuse};
@@ -77,7 +77,7 @@ pub fn fresh() -> u32 {
 pub(crate) fn generations(slot: &Slot, body: &[u8]) -> Response {
     reply(slot, |m| {
         let paint = m
-            .paint
+            .image
             .as_ref()
             .ok_or_else(|| refuse(404, "the model does not paint pictures", None))?;
         let r: Images = wire::parse(m, body)?;
@@ -94,7 +94,7 @@ pub(crate) fn generations(slot: &Slot, body: &[u8]) -> Response {
         let size = side(r.size.as_deref(), paint.sizes())?;
         let seed = r.seed.unwrap_or_else(fresh);
         let images = paint
-            .paint(&r.prompt, n, seed, size)
+            .generate(&r.prompt, n, seed, size)
             .map_err(|e| refuse(500, e.to_string(), None))?;
         let data: Vec<Value> = (images.iter())
             .map(|i| json!({"b64_json": base64(&png::encode(i))}))

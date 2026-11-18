@@ -11,7 +11,6 @@ pub(super) struct Args {
     pub(super) n: Option<usize>,
     pub(super) seed: Option<u32>,
     pub(super) size: Option<usize>,
-    pub(super) kind: Option<String>,
     pub(super) clip: Option<String>,
     pub(super) out: Option<PathBuf>,
     pub(super) words: Vec<String>,
@@ -34,7 +33,6 @@ pub(super) fn parse(args: &[String]) -> Result<Args, Stop> {
             "--n" => got.n = Some(value.parse().map_err(|_| Stop::Usage)?),
             "--seed" => got.seed = Some(value.parse().map_err(|_| Stop::Usage)?),
             "--image-size" => got.size = Some(value.parse().map_err(|_| Stop::Usage)?),
-            "--task" => got.kind = Some(value.clone()),
             "--clip" => got.clip = Some(value.clone()),
             "-o" => got.out = Some(value.into()),
             _ => return Err(Stop::Usage),
@@ -75,24 +73,19 @@ pub fn run(source: Source, args: &[String]) -> Result<(), Stop> {
         flags.extend(["--clip".into(), clip.clone()]);
     }
     let mut options = source.options(&flags)?;
-    let klein = options.model.join("model_index.json").exists();
-    let kind = a
-        .kind
-        .as_deref()
-        .unwrap_or(if klein { "klein" } else { "paint" });
-    options.flag("--task", kind.into()).ok_or(Stop::Usage)?;
+    options.flag("--task", "image".into()).ok_or(Stop::Usage)?;
     options.slots = 1;
     let slot = load(options);
-    let paint = slot.get().and_then(|m| m.paint.as_ref());
-    let paint = paint.ok_or_else(|| Stop::Failed("the model does not paint pictures".into()))?;
-    let sizes = paint.sizes();
+    let image = slot.get().and_then(|m| m.image.as_ref());
+    let image = image.ok_or_else(|| Stop::Failed("the model makes no pictures".into()))?;
+    let sizes = image.sizes();
     let size = square(a.size.unwrap_or(sizes.default), sizes).map_err(Stop::Failed)?;
     let (n, seed) = (a.n.unwrap_or(1), a.seed.unwrap_or_else(fresh));
     if n == 0 {
         return Err(Stop::Usage);
     }
-    let images = paint
-        .paint(prompt, n, seed, size)
+    let images = image
+        .generate(prompt, n, seed, size)
         .map_err(|e| Stop::Failed(e.to_string()))?;
     for (i, image) in images.iter().enumerate() {
         let to = path(&a.out, seed, i, n);

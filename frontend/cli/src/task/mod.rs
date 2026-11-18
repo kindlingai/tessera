@@ -20,8 +20,8 @@ use std::time::Duration;
 pub const LIST: &str = "tasks:
   ask [--max-tokens <n>] [prompt...]  answer one prompt, from stdin if none
   chat [--max-tokens <n>]             talk with the model, one line a turn
-  image [--n <k>] [--seed <s>] [--image-size <px>] [--task paint|klein] [--clip <dir>] [-o <path>] [prompt...]
-                                      paint PNGs, from stdin if no prompt
+  image [--n <k>] [--seed <s>] [--image-size <px>] [--clip <dir>] [-o <path>] [prompt...]
+                                      PNGs from a prompt, or from stdin
   embed [text]                        one JSON vector per line of text, from stdin if none
   tag [text]                          one JSON line per token and its tag";
 

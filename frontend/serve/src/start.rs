@@ -3,7 +3,7 @@
 use crate::{Model, Slot};
 use sensai_engine::wasm::Module;
 use sensai_engine::{Batch, Engine, Fair, Pins, Recipe, Settings};
-use sensai_tasks::api::{Embed, Info, Paint, Tokens};
+use sensai_tasks::api::{Embed, GenerateImage, Info, Tokens};
 use sensai_tasks::klein::Klein;
 use sensai_tasks::paint::Painter;
 use sensai_tasks::{Generate, Job, Queued, Threaded, Worker};
@@ -14,7 +14,7 @@ use std::time::Instant;
 
 /// The flags `Options::flag` and `Options::switch` take.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--served-model-name <name>] [--task generate|embed|paint|klein] [--image-size <px>] [--clip <dir>] \
+[--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
 [--max-connections <n>] [--reject-unknown-fields] [--guided]";
 
 /// What the loaded model serves.
@@ -22,14 +22,15 @@ pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>]
 enum Task {
     Generate,
     Embed,
-    /// Pictures. CLIP is `--clip`, else the model's `clip/`.
-    Paint,
-    /// FLUX.2 klein pictures. The model is the diffusers repository.
-    Klein,
+    /// Pictures: FLUX.2 klein from diffusers, else sprites.
+    Image,
 }
 
-/// One painter as both of the traits the routes read.
-fn painter<P: Paint + Tokens + 'static>(p: P, set: impl FnOnce(Arc<dyn Tokens>, Arc<dyn Paint>)) {
+/// One image model as both traits the routes read.
+fn painter<P: GenerateImage + Tokens + 'static>(
+    p: P,
+    set: impl FnOnce(Arc<dyn Tokens>, Arc<dyn GenerateImage>),
+) {
     let p = Arc::new(p);
     set(p.clone(), p);
 }
@@ -105,8 +106,7 @@ impl Options {
             "--served-model-name" => self.name = Some(value),
             "--task" if value == "generate" => self.task = Task::Generate,
             "--task" if value == "embed" => self.task = Task::Embed,
-            "--task" if value == "paint" => self.task = Task::Paint,
-            "--task" if value == "klein" => self.task = Task::Klein,
+            "--task" if value == "image" => self.task = Task::Image,
             "--image-size" => self.image_size = value.parse().ok()?,
             "--clip" => self.clip = Some(value.into()),
             _ => return None,
@@ -191,7 +191,7 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         chat: Some(generate),
         generator: Some(Arc::new(queued)),
         embed: None,
-        paint: None,
+        image: None,
         strict: o.strict,
     };
     let _ = slot.set(model);
@@ -226,7 +226,7 @@ fn load(options: Options, slot: Slot) {
     };
     let strict = options.strict;
     // A task the worker thread serves, by its traits.
-    let set = |info, tokens: Arc<dyn Tokens>, embed, paint| {
+    let set = |info, tokens: Arc<dyn Tokens>, embed, image| {
         let chat = None;
         let generator = None;
         let model = Model {
@@ -235,7 +235,7 @@ fn load(options: Options, slot: Slot) {
             chat,
             generator,
             embed,
-            paint,
+            image,
             strict,
         };
         let _ = slot.set(model);
@@ -248,7 +248,12 @@ fn load(options: Options, slot: Slot) {
                 set(info, e.clone(), Some(e as Arc<dyn Embed>), None);
             })
             .map_err(|e| e.to_string()),
-        Task::Paint => Worker::<Painter>::open(
+        Task::Image if options.model.join("model_index.json").is_file() => {
+            Worker::<Klein>::open(options.model, settings, options.image_size)
+                .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
+                .map_err(|e| e.to_string())
+        }
+        Task::Image => Worker::<Painter>::open(
             options.model,
             options.clip,
             options.module,
@@ -257,9 +262,6 @@ fn load(options: Options, slot: Slot) {
         )
         .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
         .map_err(|e| e.to_string()),
-        Task::Klein => Worker::<Klein>::open(options.model, settings, options.image_size)
-            .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
-            .map_err(|e| e.to_string()),
     };
     if let Err(e) = failed {
         eprintln!("sensai: {e}");

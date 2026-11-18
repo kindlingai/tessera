@@ -129,8 +129,9 @@ pub struct Sizes {
 }
 
 /// Prompts to pictures. Calls can block.
-pub trait Paint: Send + Sync {
+pub trait GenerateImage: Send + Sync {
     fn sizes(&self) -> Sizes;
     /// `n` pictures, `size` a side. A seed repeats them.
-    fn paint(&self, prompt: &str, n: usize, seed: u32, size: usize) -> Result<Vec<Image>, Error>;
+    fn generate(&self, prompt: &str, n: usize, seed: u32, size: usize)
+    -> Result<Vec<Image>, Error>;
 }

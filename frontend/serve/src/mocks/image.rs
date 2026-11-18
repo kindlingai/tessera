@@ -1,12 +1,12 @@
 //! Pictures for `/v1/images/generations`.
 
 use sensai_tasks::Error;
-use sensai_tasks::api::{Image, Paint, Sizes};
+use sensai_tasks::api::{GenerateImage, Image, Sizes};
 
 /// Red is the seed, blue the index.
-pub(super) struct MockPaint;
+pub(super) struct MockImage;
 
-impl Paint for MockPaint {
+impl GenerateImage for MockImage {
     fn sizes(&self) -> Sizes {
         Sizes {
             step: 2,
@@ -15,7 +15,7 @@ impl Paint for MockPaint {
         }
     }
 
-    fn paint(&self, _: &str, n: usize, seed: u32, size: usize) -> Result<Vec<Image>, Error> {
+    fn generate(&self, _: &str, n: usize, seed: u32, size: usize) -> Result<Vec<Image>, Error> {
         let one = |i: usize| Image {
             width: size,
             height: size,
