@@ -3,7 +3,7 @@
 use crate::run::run;
 use crate::tensor::Error;
 use sensai_graph::{
-    DType, Entry, EntryKind, Graph, NodeId, Op, Output, PathSeg, Role, Weight, verify,
+    DType, Entry, EntryKind, Graph, NodeId, Op, Output, PathSeg, Role, View, Weight, verify,
 };
 use sensai_mem::Tensor;
 
@@ -52,6 +52,14 @@ pub(crate) fn frontier(g: &Graph) -> Vec<NodeId> {
     }
     for o in g.entries.iter().flat_map(|e| &e.outputs) {
         wanted[o.node.0 as usize] = true;
+    }
+    // A reshape costs nothing, so its reader keeps the view.
+    for i in (0..g.nodes.len()).rev() {
+        let n = &g.nodes[i];
+        if wanted[i] && fixed[i] && matches!(n.op, Op::View(View::Reshape(_))) {
+            wanted[i] = false;
+            wanted[n.args[0].0 as usize] = true;
+        }
     }
     let computed = |i: &usize| fixed[*i] && wanted[*i];
     let ops = (0..g.nodes.len()).filter(computed);
