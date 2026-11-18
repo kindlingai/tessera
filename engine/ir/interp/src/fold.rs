@@ -2,15 +2,18 @@
 
 use crate::run::run;
 use crate::tensor::Error;
-use sensai_graph::{Entry, EntryKind, Graph, NodeId, Op, Output, PathSeg, Role, Weight, verify};
+use sensai_graph::{
+    DType, Entry, EntryKind, Graph, NodeId, Op, Output, PathSeg, Role, Weight, verify,
+};
 use sensai_mem::Tensor;
 
-/// Whether each node reads only weights, at a fixed size.
+/// Whether each node is fixed-size floats from weights.
 fn fixed(g: &Graph) -> Vec<bool> {
     let mut fixed = vec![false; g.nodes.len()];
     for (i, n) in g.nodes.iter().enumerate() {
         let sized = n.ty.shape.elements(&g.dims).ok().and_then(|p| p.as_const());
         fixed[i] = sized.is_some()
+            && n.ty.dtype == DType::F32
             && match n.op {
                 Op::Weight(_) => true,
                 Op::Input { .. } | Op::Append(_) => false,
