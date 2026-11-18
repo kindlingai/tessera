@@ -90,7 +90,7 @@ impl Painter {
         let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
-        let d = denoiser(&dir.join("sprite.safetensors"), 2 * most as u64)?;
+        let d = denoiser(dir, 2 * most as u64)?;
         let mut denoiser = Model::open(d.graph, &Recipe::default(), settings)?;
         denoiser.load(&d.weights)?;
         Ok(Self {

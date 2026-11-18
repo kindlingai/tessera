@@ -7,6 +7,7 @@ names = "names.json"
 
 [weights]
 path = "weights"
+extra = { clip = "a/b@main" }
 
 [lower]
 favor = "flash"
@@ -23,6 +24,8 @@ fn reads_a_recipe() {
     recipe.dir = PathBuf::from("/r");
     assert_eq!(recipe.weights(None, None).unwrap(), Path::new("/r/weights"));
     assert_eq!(recipe.names(), Some(PathBuf::from("/r/names.json")));
+    assert_eq!(recipe.weights.extra["clip"], "a/b@main");
+    assert!(matches!(recipe.extras(None, None), Err(Error::NoCache)));
     let lower = recipe.lower.as_ref().unwrap();
     assert_eq!(lower.favor.as_deref(), Some("flash"));
     let flag = |f: &str, v: Option<&str>| (f.to_string(), v.map(String::from));

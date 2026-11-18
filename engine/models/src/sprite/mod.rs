@@ -1,10 +1,16 @@
 //! A masked-diffusion model of 16x16 palette sprites.
 
+mod tables;
+mod weights;
+
+pub use tables::{COLOR_FREQS, Constant, constants};
+pub use weights::declare;
+
 use crate::shared::{Attend, Side, join, spread};
 use sensai_trace::DimName::*;
 use sensai_trace::{
-    Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, PathSeg, Port, Role,
-    Shape, Tensor, TensorType, Vector, Weights,
+    Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, Port, Role, Tensor,
+    TensorType, Vector,
 };
 
 /// Tokens before the image: registers, then text.
@@ -14,7 +20,7 @@ const PREFIX: u64 = REGISTERS + TEXT;
 /// The 3x3 neighbours a depthwise convolution reads.
 pub const TAPS: u64 = 9;
 /// Rotary tables assume this head width.
-const HEAD_DIM: u64 = 64;
+pub const HEAD_DIM: u64 = 64;
 /// Every norm's variance floor.
 const EPS: f32 = 1e-6;
 
@@ -28,6 +34,8 @@ pub struct Config {
     /// Blocks before, inside and after the merged middle.
     pub depth: [u64; 3],
     pub max_seqs: u64,
+    /// The base of the 2D rotary tables.
+    pub rope: f64,
 }
 
 impl Config {
@@ -42,6 +50,7 @@ impl Config {
             text_dim: 512,
             depth: [2, 8, 2],
             max_seqs,
+            rope: 100.0,
         }
     }
 
@@ -65,113 +74,62 @@ impl Config {
 /// A weight used as a plain tensor, any rank.
 pub struct Table(pub Tensor);
 
-impl Weights for Table {
-    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
-        Table(m.weight(path, TensorType::new(Shape(shape.to_vec()), DType::F32)))
-    }
-}
-
-#[derive(Weights)]
 pub struct Block {
     /// Shift, scale and gate twice, scales offset by one.
-    #[shape(Hidden * 6)]
     pub modulation: Vector,
-    #[shape(Hidden, Hidden)]
     pub q: Linear,
-    #[shape(Hidden, Hidden)]
     pub k: Linear,
-    #[shape(Hidden, Hidden)]
     pub v: Linear,
-    #[shape(Hidden, Hidden)]
     pub o: Linear,
-    #[shape(HeadDim)]
     pub q_norm: Norm,
-    #[shape(HeadDim)]
     pub k_norm: Norm,
-    #[shape(Hidden, Ffn)]
     pub up: Linear,
-    #[shape(Hidden, Ffn)]
     pub gate: Linear,
-    #[shape(Ffn, Hidden)]
     pub down: Linear,
     /// Depthwise weights per tap, times `TAPS` for the mean.
-    #[shape(TAPS, Ffn)]
     pub taps: Table,
-    #[shape(1, Ffn)]
     pub conv_bias: Table,
 }
 
 /// Fixed tables for one grid size.
-#[derive(Weights)]
 pub struct Level {
     /// `x * cos + swap(x) * sin`, swap exchanging halves.
-    #[shape(S0, HeadDim)]
     pub cos: Table,
-    #[shape(S0, HeadDim)]
     pub sin: Table,
     /// Each row's neighbours. Past the end reads zero.
-    #[shape(S0, TAPS)]
     pub taps: Table,
     /// Zero on image rows: they read the bias.
-    #[shape(S0)]
     pub image: Table,
 }
 
-#[derive(Weights)]
 pub struct Sprite {
-    #[shape(Vocab + 1, Hidden)]
     pub embed: Table,
-    #[shape(S0, Hidden)]
     pub pos: Table,
     /// The last step's colors, for masked pixels.
-    #[shape(Vocab, Hidden)]
     pub draft: Linear,
-    #[shape(Embedding)]
     pub text_norm: Norm,
-    #[shape(Embedding, Hidden)]
     pub text: Linear,
-    #[shape(Hidden)]
     pub text_bias: Vector,
-    #[shape(TEXT, Hidden)]
     pub null_text: Table,
-    #[shape(Hidden)]
     pub null_cond: Table,
-    #[shape(Embedding)]
     pub pool_norm: Norm,
-    #[shape(Embedding, Hidden)]
     pub pool_in: Linear,
-    #[shape(Hidden)]
     pub pool_in_bias: Vector,
-    #[shape(Hidden, Hidden)]
     pub pool_out: Linear,
-    #[shape(Hidden)]
     pub pool_out_bias: Vector,
     /// The mask-ratio MLP, one row per masked count.
-    #[shape(S0 + 1, Hidden)]
     pub ratio: Table,
-    #[shape(Hidden, Hidden * 6)]
     pub modulate: Linear,
-    #[shape(Hidden * 6)]
     pub modulate_bias: Vector,
-    #[shape(REGISTERS, Hidden)]
     pub registers: Table,
-    #[shape(Hidden * 4)]
     pub merge_norm: Norm,
-    #[shape(Hidden * 4, Hidden)]
     pub merge: Linear,
-    #[shape(Hidden)]
     pub merge_bias: Vector,
-    #[shape(Hidden, Hidden * 4)]
     pub split: Linear,
-    #[shape(Hidden * 4)]
     pub split_bias: Vector,
-    #[shape(Hidden, Hidden * 2)]
     pub final_mod: Linear,
-    #[shape(Hidden * 2)]
     pub final_mod_bias: Vector,
-    #[shape(Hidden, Vocab)]
     pub head: Linear,
-    #[shape(Vocab)]
     pub head_bias: Vector,
 }
 
@@ -180,35 +138,6 @@ pub struct Stages {
     pub blocks: [Vec<Block>; 3],
     pub pixel: Level,
     pub patch: Level,
-}
-
-fn named<W: Weights>(m: &Model, path: &[&str], index: Option<u32>, shape: &[DimExpr]) -> W {
-    let mut p: Vec<PathSeg> = path.iter().map(|s| PathSeg::Field((*s).into())).collect();
-    p.extend(index.map(PathSeg::Index));
-    W::declare(m, &mut p, shape)
-}
-
-/// Declares every weight. Paths name the converted file's tensors.
-pub fn declare(m: &Model, c: &Config) -> (Sprite, Stages) {
-    let pixels = c.pixels();
-    let w = named(m, &[], None, &[pixels.into()]);
-    let stage = |name: &str, n: u64| {
-        let each = |i| named::<Block>(m, &[name], Some(i as u32), &[]);
-        (0..n).map(each).collect::<Vec<_>>()
-    };
-    let [a, b, d] = c.depth;
-    let blocks = [stage("in", a), stage("core", b), stage("out", d)];
-    let rows = |n: u64| [(PREFIX + n).into()];
-    let pixel = named(m, &["pixel"], None, &rows(pixels));
-    let patch = named(m, &["patch"], None, &rows(pixels / 4));
-    (
-        w,
-        Stages {
-            blocks,
-            pixel,
-            patch,
-        },
-    )
 }
 
 /// The graph's inputs, one row per canvas.

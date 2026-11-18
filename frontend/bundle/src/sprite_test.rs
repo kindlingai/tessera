@@ -58,12 +58,13 @@ fn states(clip: &Path, r: &File) -> Vec<f32> {
 
 #[test]
 fn matches_torch() {
-    let Some(dir) = sensai_testkit::reference("sprite") else {
+    let dir = sensai_testkit::reference("sprite");
+    let Some(dir) = dir.filter(|d| d.join("model_config.json").is_file()) else {
         return eprintln!("no sprite reference here; skipped");
     };
     let r = File::open(&dir.join("ref.safetensors")).unwrap();
     let states = states(&dir.join("clip"), &r);
-    let d = denoiser(&dir.join("sprite.safetensors"), 4).unwrap();
+    let d = denoiser(&dir, 4).unwrap();
     let canvas = ints(&r, "den.canvas");
     let masked = |c: &[u32]| c.iter().filter(|&&t| t == MASK).count() as u32;
     let counts: Vec<u32> = canvas.chunks(PIXELS).map(masked).collect();

@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 /// File endings a model directory needs. Other files stay remote.
 const KEEP: [&str; 5] = [".json", ".safetensors", ".jinja", ".txt", ".model"];
 
+/// PyTorch weights, kept only when a repository has no safetensors.
+const PICKLED: [&str; 2] = [".pt", ".bin"];
+
 #[derive(Deserialize)]
 struct Info {
     sha: String,
@@ -77,10 +80,15 @@ pub(crate) fn snapshot(spec: &str, cache: &Path, token: Option<&str>) -> Result<
     }
     let info = lookup(repo, commit, token)?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+    let ends = |name: &str, kinds: &[&str]| kinds.iter().any(|k| name.ends_with(k));
+    let safe = info
+        .siblings
+        .iter()
+        .any(|s| s.rfilename.ends_with(".safetensors"));
     for s in info.siblings {
         let name = s.rfilename;
-        let wanted = !name.contains('/') && KEEP.iter().any(|k| name.ends_with(k));
-        if wanted && !dir.join(&name).is_file() {
+        let kept = ends(&name, &KEEP) || (!safe && ends(&name, &PICKLED));
+        if !name.contains('/') && kept && !dir.join(&name).is_file() {
             let url = format!("https://huggingface.co/{repo}/resolve/{commit}/{name}");
             download(&url, &dir.join(&name), token)?;
         }

@@ -71,6 +71,27 @@ fn leaf(m: &Model, path: &[PathSeg], shape: Vec<DimExpr>, want: usize) -> Tensor
     m.weight(path, TensorType::new(Shape(shape), DType::F32))
 }
 
+impl Linear {
+    /// A matrix computed from weights, stored `[out, in]`.
+    pub fn of(t: Tensor) -> Self {
+        Linear(t)
+    }
+}
+
+impl Norm {
+    /// Norm gains a model computes from its weights.
+    pub fn of(t: Tensor) -> Self {
+        Norm(t)
+    }
+}
+
+impl Vector {
+    /// A row a model computes from its weights.
+    pub fn of(t: Tensor) -> Self {
+        Vector(t)
+    }
+}
+
 impl Weights for Linear {
     fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
         let swapped = shape.iter().rev().cloned().collect();

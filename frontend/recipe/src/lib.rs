@@ -11,6 +11,7 @@ pub use hub::fetch as fetch_hf;
 pub use source::Source;
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// What stops a recipe from opening.
@@ -40,6 +41,10 @@ pub struct Weights {
     pub path: Option<PathBuf>,
     /// `owner/name@commit` on Hugging Face.
     pub hf: Option<String>,
+    /// More `owner/name@commit` repositories, each passed to serve
+    /// as `--<name> <dir>`.
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
 }
 
 /// One `recipe.toml`.
@@ -95,6 +100,20 @@ impl Recipe {
             (None, Some(hf)) => hub::snapshot(hf, cache.ok_or(Error::NoCache)?, token),
             _ => Err(Error::Weights),
         }
+    }
+
+    /// Each extra repository, fetched into `cache`, as a serve flag.
+    pub fn extras(
+        &self,
+        cache: Option<&Path>,
+        token: Option<&str>,
+    ) -> Result<Vec<(String, PathBuf)>, Error> {
+        let mut flags = Vec::new();
+        for (name, spec) in &self.weights.extra {
+            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token)?;
+            flags.push((format!("--{}", name.replace('_', "-")), dir));
+        }
+        Ok(flags)
     }
 
     /// `[serve]` as `--flag` and value. `true` gives a bare flag.

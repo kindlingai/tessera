@@ -11,11 +11,10 @@ pub fn run(source: Source, rest: &[String]) -> Result<(), Stop> {
         return Err(Stop::Usage);
     };
     println!("recipe {}", recipe.dir.display());
-    println!(
-        "weights {}",
-        recipe
-            .weights(source.cache.as_deref(), source.token.as_deref())?
-            .display()
-    );
+    let (cache, token) = (source.cache.as_deref(), source.token.as_deref());
+    println!("weights {}", recipe.weights(cache, token)?.display());
+    for (flag, dir) in recipe.extras(cache, token)? {
+        println!("{} {}", flag.trim_start_matches('-'), dir.display());
+    }
     Ok(())
 }

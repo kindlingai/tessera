@@ -121,6 +121,9 @@ impl Source {
                 let rules = sensai_engine::wasm::load(&bytes).map_err(|e| failed(e.to_string()))?;
                 options.lower.get_or_insert_default().rules.extend(rules);
             }
+            for (flag, dir) in r.extras(cache, self.token.as_deref())? {
+                apply(&mut options, &flag, Some(dir.display().to_string()))?;
+            }
             for (flag, value) in r.flags() {
                 apply(&mut options, &flag, value)?;
             }
