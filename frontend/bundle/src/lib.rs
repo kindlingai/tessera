@@ -247,20 +247,22 @@ pub(crate) fn config(
 
 /// Reads a model directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
-    load_named(dir, slots, context, &[])
+    load_named(dir, slots, context, &[], false)
 }
 
-/// The same, with the user's weight-name rules applied last.
+/// The user's name rules go last. `masked` adds mask ports.
 pub fn load_named(
     dir: &Path,
     slots: u64,
     context: u64,
     user: &[Rule],
+    masked: bool,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
-        return gguf::load(dir, slots, context, user);
+        return gguf::load(dir, slots, context, user, masked);
     }
-    let (arch, config) = config(dir, slots, context)?;
+    let (arch, mut config) = config(dir, slots, context)?;
+    config.stack.masked = masked;
     let graph = stepper(&arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let file = File::open(&dir.join("model.safetensors"))?;

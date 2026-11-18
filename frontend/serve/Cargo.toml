@@ -17,6 +17,8 @@ path = "src/main.rs"
 default = []
 cuda = ["sensai-engine/cuda", "sensai-tasks/cuda"]
 rocm = ["sensai-engine/rocm", "sensai-tasks/rocm"]
+# `response_format` through llguidance. Needs `--guided` at start.
+guided = ["sensai-tasks/guided"]
 
 [dependencies]
 sensai-engine = { workspace = true }

@@ -3,6 +3,7 @@
 use crate::Model;
 use crate::http::Response;
 use sensai_bundle::Message;
+use sensai_tasks::api::Format;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -71,7 +72,6 @@ fn neutral(key: &str, value: &Value) -> Option<bool> {
         }
         "encoding_format" => return Some(value.is_null() || *value == json!("float")),
         "dimensions" => return Some(value.is_null()),
-        "response_format" => return Some(value.is_null() || *value == json!({"type": "text"})),
         _ => return None,
     };
     Some(value.is_null() || value.as_f64().is_some_and(|v| numbers.contains(&v)))
@@ -158,6 +158,42 @@ pub(crate) struct StreamOptions {
     extra: Bag,
 }
 
+/// The shape an answer must take.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema { json_schema: JsonSchema },
+}
+
+impl ResponseFormat {
+    /// The answer's shape. No schema allows any JSON.
+    pub(crate) fn format(self) -> Option<Format> {
+        match self {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(Format::Object),
+            ResponseFormat::JsonSchema { json_schema } => {
+                Some(Format::Schema(json_schema.schema.unwrap_or(json!({}))))
+            }
+        }
+    }
+}
+
+/// A named schema. Answers always follow it, `strict` or not.
+#[derive(Deserialize)]
+pub(crate) struct JsonSchema {
+    pub(crate) schema: Option<Value>,
+    #[serde(rename = "name")]
+    _name: Option<String>,
+    #[serde(rename = "description")]
+    _description: Option<String>,
+    #[serde(rename = "strict")]
+    _strict: Option<bool>,
+    #[serde(flatten)]
+    extra: Bag,
+}
+
 /// What completions and chat share.
 #[derive(Deserialize)]
 pub(crate) struct Common {
@@ -166,12 +202,18 @@ pub(crate) struct Common {
     pub(crate) stream: bool,
     pub(crate) stream_options: Option<StreamOptions>,
     pub(crate) stop: Option<Strings>,
+    pub(crate) response_format: Option<ResponseFormat>,
 }
 
 impl Common {
     fn nested(&self) -> Vec<String> {
         let options = self.stream_options.as_ref().map(|o| &o.extra);
-        options.map_or_else(Vec::new, |bag| paths("stream_options", bag).collect())
+        let mut out: Vec<String> =
+            options.map_or_else(Vec::new, |bag| paths("stream_options", bag).collect());
+        if let Some(ResponseFormat::JsonSchema { json_schema }) = &self.response_format {
+            out.extend(paths("response_format.json_schema", &json_schema.extra));
+        }
+        out
     }
 }
 

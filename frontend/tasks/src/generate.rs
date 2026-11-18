@@ -1,6 +1,7 @@
 //! Generation through the engine thread's queue.
 
-use crate::api::{Chat, Finish, Generator, Params, Sink, Step, Tokens};
+use crate::api::{Chat, Finish, Generator, Params, Refused, Sink, Step, Tokens};
+use crate::guided::Guides;
 use crate::{Error, Spool, Stops};
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_bundle::{Message, Template};
@@ -15,6 +16,8 @@ pub struct Generate {
     pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
+    /// Guides for answers with a format. None refuses them.
+    pub guides: Option<Arc<dyn Guides>>,
 }
 
 impl Tokens for Generate {
@@ -48,11 +51,19 @@ pub struct Queued {
 
 impl Generator for Queued {
     fn generate(&self, prompt: Vec<u32>, params: Params, mut sink: Sink) -> Result<(), Error> {
+        let guide = match (&params.format, &self.generate.guides) {
+            (None, _) => None,
+            (Some(format), Some(guides)) => Some(guides.guide(format)?),
+            (Some(_), None) => {
+                let why = "this model was loaded without guided decoding";
+                return Err(Box::new(Refused(why.into())));
+            }
+        };
         let request = Request {
             tokens: prompt,
             max_tokens: params.max_tokens,
             stop: self.generate.stop.clone(),
-            guide: None,
+            guide,
         };
         let generate = self.generate.clone();
         let (mut spool, mut stops) = (Spool::default(), Stops::new(params.stop));

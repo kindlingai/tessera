@@ -1,9 +1,9 @@
 //! Completions and chat completions, whole or streamed.
 
 use crate::http::{Body, Response};
-use crate::wire::{self, Chat, Common, Completion, Prompt, Refusal, bad, refuse};
+use crate::wire::{self, Chat, Common, Completion, Prompt, Refusal, ResponseFormat, bad, refuse};
 use crate::{Model, Slot, with_model};
-use sensai_tasks::api::{Finish, Params, Step};
+use sensai_tasks::api::{Finish, Params, Refused, Step};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -83,6 +83,7 @@ fn start(
     let params = Params {
         max_tokens: budget(model, prompt.len(), asked)?,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
+        format: common.response_format.and_then(ResponseFormat::format),
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
@@ -92,7 +93,10 @@ fn start(
             params,
             Box::new(move |step| sink.send(step).is_ok()),
         )
-        .map_err(|e| refuse(503, e.to_string(), None))?;
+        .map_err(|e| match e.downcast_ref::<Refused>() {
+            Some(why) => bad(why.0.clone(), "response_format"),
+            None => refuse(503, e.to_string(), None),
+        })?;
     Ok(Started {
         kind,
         id: fresh_id(kind),

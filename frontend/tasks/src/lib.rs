@@ -11,6 +11,7 @@ pub mod flow;
 #[cfg(test)]
 mod flow_test;
 pub mod generate;
+pub mod guided;
 pub mod klein;
 #[cfg(test)]
 mod klein_test;
@@ -27,6 +28,7 @@ pub mod worker;
 
 pub use embed::{Embedder, Threaded};
 pub use generate::{Generate, Job, Queued};
+pub use guided::{Guides, guides};
 pub use tag::Tagger;
 pub(crate) use text::{Spool, Stops};
 pub use worker::Worker;

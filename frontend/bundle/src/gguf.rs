@@ -169,12 +169,14 @@ pub(crate) fn load(
     slots: u64,
     context: u64,
     user: &[Rule],
+    masked: bool,
 ) -> Result<Bundle, Failure> {
     let gguf = Gguf::open(path)?;
     let arch = gguf
         .str("general.architecture")
         .ok_or("a GGUF file names its architecture")?;
-    let config = config(&gguf, arch, slots, context)?;
+    let mut config = config(&gguf, arch, slots, context)?;
+    config.stack.masked = masked;
     let graph = stepper(arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let layers = config.stack.layers;

@@ -10,13 +10,16 @@ description = "Text in, answers out: generation and tagging over a loaded model"
 default = []
 cuda = ["sensai-engine/cuda"]
 rocm = ["sensai-engine/rocm"]
+# Answers held to a JSON format, through llguidance.
+guided = ["dep:sensai-grammar", "sensai-grammar/llguidance"]
 
 [dependencies]
 sensai-bundle = { workspace = true }
 sensai-engine = { workspace = true }
+sensai-grammar = { workspace = true, optional = true }
+serde_json = "1"
 
 [dev-dependencies]
 sensai-checkpoint = { workspace = true }
 sensai-frontend-settings = { workspace = true }
-serde_json = "1"
 sensai-testkit = { workspace = true }

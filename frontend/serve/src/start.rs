@@ -14,7 +14,7 @@ use std::time::Instant;
 /// The flags `Options::flag` and `Options::switch` take.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|paint|klein] [--image-size <px>] \
-[--max-connections <n>] [--reject-unknown-fields]";
+[--max-connections <n>] [--reject-unknown-fields] [--guided]";
 
 /// What the loaded model serves.
 #[derive(Clone, Copy, PartialEq)]
@@ -45,6 +45,8 @@ pub struct Options {
     task: Task,
     /// Unknown request fields refuse the request.
     pub strict: bool,
+    /// Answers may ask for a `response_format`.
+    pub guided: bool,
     pub max_connections: usize,
     /// The largest picture klein paints, in pixels a side.
     pub image_size: usize,
@@ -65,6 +67,7 @@ impl Default for Options {
             name: None,
             task: Task::Generate,
             strict: false,
+            guided: false,
             max_connections: 64,
             image_size: 512,
             lower: None,
@@ -76,9 +79,12 @@ impl Default for Options {
 impl Options {
     /// Takes a flag with no value. `false` if unknown.
     pub fn switch(&mut self, flag: &str) -> bool {
-        let known = flag == "--reject-unknown-fields";
-        self.strict |= known;
-        known
+        match flag {
+            "--reject-unknown-fields" => self.strict = true,
+            "--guided" => self.guided = true,
+            _ => return false,
+        }
+        true
     }
 
     /// Takes `flag value`. `None` if either is bad.
@@ -138,18 +144,27 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         None => Vec::new(),
     };
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
-    let loaded =
-        sensai_bundle::load_named(&o.model, slots, context, &rules).map_err(|e| e.to_string())?;
+    let loaded = sensai_bundle::load_named(&o.model, slots, context, &rules, o.guided)
+        .map_err(|e| e.to_string())?;
     let recipe = lowering(o, loaded.pins);
     let opened = Engine::open(loaded.graph, o.max_model_len, &recipe, settings);
     let mut engine = opened.map_err(|e| e.to_string())?;
     engine.load(&loaded.weights).map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());
+    let guides = match (o.guided, engine.words()) {
+        (false, _) => None,
+        (true, None) => return Err("the model has no mask port".into()),
+        (true, Some(words)) => Some(
+            sensai_tasks::guides(&loaded.tokenizer, &loaded.stop, words)
+                .map_err(|e| e.to_string())?,
+        ),
+    };
     let generate = Arc::new(Generate {
         tokenizer: loaded.tokenizer,
         template: loaded.template,
         stop: loaded.stop,
+        guides,
     });
     let (queue, jobs) = mpsc::channel::<Job>();
     let queued = Queued {

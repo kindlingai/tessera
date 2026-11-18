@@ -27,7 +27,30 @@ pub struct Params {
     pub max_tokens: usize,
     /// Strings that end the answer, left out of it.
     pub stop: Vec<String>,
+    /// The shape the answer must take. None allows any text.
+    pub format: Option<Format>,
 }
+
+/// A shape an answer must take.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Format {
+    /// Any JSON object.
+    Object,
+    /// JSON that matches this schema.
+    Schema(serde_json::Value),
+}
+
+/// A request the model cannot answer as asked.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Why an answer ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -46,6 +46,11 @@ impl Hf {
         out
     }
 
+    /// The tokenizer as `tokenizer.json` text.
+    pub fn json(&self) -> Result<String, Error> {
+        self.0.to_string(false)
+    }
+
     /// Ids made only of ASCII digits.
     pub fn digits(&self) -> Vec<u32> {
         self.matching(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))

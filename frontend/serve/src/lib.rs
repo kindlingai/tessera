@@ -15,6 +15,8 @@ mod lib_test;
 mod mocks;
 pub mod start;
 mod wire;
+#[cfg(test)]
+mod wire_test;
 
 use http::{Request, Response};
 use sensai_bundle::Message;
