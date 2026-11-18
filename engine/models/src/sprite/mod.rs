@@ -1,9 +1,10 @@
 //! A masked-diffusion model of 16x16 palette sprites.
 
 mod tables;
+mod upstream;
 mod weights;
 
-pub use tables::{COLOR_FREQS, Constant, constants};
+pub use tables::{Constant, constants};
 pub use weights::declare;
 
 use crate::shared::{Attend, Side, join, spread};
@@ -14,13 +15,13 @@ use sensai_trace::{
 };
 
 /// Tokens before the image: registers, then text.
-pub const REGISTERS: u64 = 4;
+const REGISTERS: u64 = 4;
 pub const TEXT: u64 = 24;
 const PREFIX: u64 = REGISTERS + TEXT;
 /// The 3x3 neighbours a depthwise convolution reads.
 pub const TAPS: u64 = 9;
 /// Rotary tables assume this head width.
-pub const HEAD_DIM: u64 = 64;
+const HEAD_DIM: u64 = 64;
 /// Every norm's variance floor.
 const EPS: f32 = 1e-6;
 

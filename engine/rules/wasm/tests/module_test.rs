@@ -81,7 +81,7 @@ const ACT_CUDA: &str = "extern \"C\" __global__ void act(const float* a, float* 
 }";
 
 /// The version these modules speak.
-const ABI: u32 = 3;
+const ABI: u32 = 4;
 
 /// `kernels`, and one rule at `site`.
 fn declare(abi: u32, site: &str, kernels: Value) -> Value {
@@ -222,7 +222,7 @@ fn bad_modules_fail() {
     let newer = module(&manifest(ABI + 1, "matmul"), &offer, "");
     assert!(matches!(
         sensai_wasm::load(&newer),
-        Err(sensai_wasm::Error::Abi(4))
+        Err(sensai_wasm::Error::Abi(5))
     ));
     // An endless loop runs out of fuel.
     let spin = module(&manifest(ABI, "matmul"), &offer, "(loop (br 0))");

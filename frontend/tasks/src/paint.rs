@@ -5,8 +5,10 @@ use crate::api::{Image, Paint, Sizes, Tokens};
 use crate::worker::Worker;
 use sensai_bundle::sprite::{denoiser, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
+use sensai_engine::wasm::Module;
 use sensai_engine::{Model, Recipe, Settings, Tensor};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const GRID: usize = 16;
 const PIXELS: usize = GRID * GRID;
@@ -83,6 +85,7 @@ impl Painter {
     pub fn open(
         dir: &Path,
         clip: Option<&Path>,
+        module: Option<&Module>,
         settings: &Settings,
         most: usize,
     ) -> Result<Self, Error> {
@@ -90,7 +93,7 @@ impl Painter {
         let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
-        let d = denoiser(dir, 2 * most as u64)?;
+        let d = denoiser(dir, 2 * most as u64, module)?;
         let mut denoiser = Model::open(d.graph, &Recipe::default(), settings)?;
         denoiser.load(&d.weights)?;
         Ok(Self {
@@ -220,11 +223,13 @@ impl Worker<Painter> {
     pub fn open(
         dir: PathBuf,
         clip: Option<PathBuf>,
+        module: Option<Arc<Module>>,
         settings: Settings,
         most: usize,
     ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let painter = Painter::open(&dir, clip.as_deref(), &settings, most)?;
+            let module = module.as_deref();
+            let painter = Painter::open(&dir, clip.as_deref(), module, &settings, most)?;
             eprintln!("{}: painter loaded", painter.device());
             Ok(painter)
         })

@@ -6,7 +6,8 @@ mod site;
 mod text;
 
 use abi::{ABI, Ask, Kind, Manifest, Offer, Site};
-use guest::Guest;
+use guest::{BUILD_FUEL, FUEL, Guest};
+use sensai_graph::Graph;
 use sensai_lower::{Draft, Propose, Rule, T, Tree};
 use std::sync::Arc;
 use text::Fixed;
@@ -44,7 +45,7 @@ impl Asking {
     fn ask(&self, site: Site) -> Result<Option<Vec<Offer>>, Error> {
         let rule = self.rule;
         let input = serde_json::to_vec(&Ask { rule, site })?;
-        let output = self.guest.call("propose", Some(&input))?;
+        let output = self.guest.call("propose", Some(&input), FUEL)?;
         Ok(serde_json::from_slice(&output)?)
     }
 }
@@ -70,33 +71,90 @@ fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
+/// A loaded module: its rules, and maybe a graph.
+pub struct Module {
+    guest: Arc<Guest>,
+    pub rules: Vec<&'static Rule>,
+    graph: bool,
+}
+
+/// What `graph` and `tables` are given.
+#[derive(serde::Serialize)]
+struct Build<'a> {
+    config: &'a serde_json::value::RawValue,
+    seqs: u64,
+}
+
+impl Module {
+    /// The module in `bytes`. Its rules are never freed.
+    pub fn open(bytes: &[u8]) -> Result<Self, Error> {
+        let guest = Arc::new(Guest::new(bytes)?);
+        let manifest = guest.call("manifest", None, FUEL)?;
+        let manifest: Manifest = serde_json::from_slice(&manifest)?;
+        if manifest.abi != ABI {
+            return Err(Error::Abi(manifest.abi));
+        }
+        let mut kernels = Vec::with_capacity(manifest.kernels.len());
+        for k in manifest.kernels {
+            kernels.push(Fixed {
+                name: leak(k.name),
+                entry: leak(k.entry),
+                metal: leak(k.metal),
+                cuda: leak(k.cuda),
+            });
+        }
+        let kernels: &'static [Fixed] = kernels.leak();
+        let mut rules = Vec::with_capacity(manifest.rules.len());
+        for r in manifest.rules {
+            let rule = leak(r.name);
+            let asking = Asking {
+                guest: guest.clone(),
+                rule,
+                kind: r.site,
+                kernels,
+            };
+            rules.push(Rule::made(rule, module_path!(), asking));
+        }
+        let graph = manifest.graph;
+        Ok(Module {
+            guest,
+            rules,
+            graph,
+        })
+    }
+
+    /// Calls `name` with the config. `None` without a graph.
+    fn build(&self, name: &'static str, config: &str, seqs: u64) -> Result<Option<Vec<u8>>, Error> {
+        if !self.graph {
+            return Ok(None);
+        }
+        let config = serde_json::value::RawValue::from_string(config.into())?;
+        let input = serde_json::to_vec(&Build {
+            config: &config,
+            seqs,
+        })?;
+        Ok(Some(self.guest.call(name, Some(&input), BUILD_FUEL)?))
+    }
+
+    /// The graph for `config` JSON, if the module builds one.
+    pub fn graph(&self, config: &str, seqs: u64) -> Result<Option<Graph>, Error> {
+        let Some(out) = self.build("graph", config, seqs)? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(&out).map_err(Error::wasm)?;
+        Ok(Some(Graph::from_json(text).map_err(Error::wasm)?))
+    }
+
+    /// The tables that graph reads, by dotted path.
+    pub fn tables(&self, config: &str) -> Result<Vec<(String, Vec<f32>)>, Error> {
+        let Some(out) = self.build("tables", config, 1)? else {
+            return Ok(Vec::new());
+        };
+        sensai_guest::decode(&out).ok_or_else(|| Error::wasm("tables: a short or bad buffer"))
+    }
+}
+
 /// The rules `bytes` declares. They live until the process ends.
 pub fn load(bytes: &[u8]) -> Result<Vec<&'static Rule>, Error> {
-    let guest = Arc::new(Guest::new(bytes)?);
-    let manifest: Manifest = serde_json::from_slice(&guest.call("manifest", None)?)?;
-    if manifest.abi != ABI {
-        return Err(Error::Abi(manifest.abi));
-    }
-    let mut kernels = Vec::with_capacity(manifest.kernels.len());
-    for k in manifest.kernels {
-        kernels.push(Fixed {
-            name: leak(k.name),
-            entry: leak(k.entry),
-            metal: leak(k.metal),
-            cuda: leak(k.cuda),
-        });
-    }
-    let kernels: &'static [Fixed] = kernels.leak();
-    let mut rules = Vec::with_capacity(manifest.rules.len());
-    for r in manifest.rules {
-        let rule = leak(r.name);
-        let asking = Asking {
-            guest: guest.clone(),
-            rule,
-            kind: r.site,
-            kernels,
-        };
-        rules.push(Rule::made(rule, module_path!(), asking));
-    }
-    Ok(rules)
+    Ok(Module::open(bytes)?.rules)
 }

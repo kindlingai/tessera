@@ -4,7 +4,7 @@ use super::{Config, HEAD_DIM, PREFIX, TAPS};
 use std::f32::consts::PI;
 
 /// Fourier terms per color channel, and for the mask ratio.
-pub const COLOR_FREQS: u64 = 6;
+pub(crate) const COLOR_FREQS: u64 = 6;
 pub(crate) const RATIO_FREQS: u64 = 8;
 
 /// Color features: channels, their Fourier terms, then alpha.

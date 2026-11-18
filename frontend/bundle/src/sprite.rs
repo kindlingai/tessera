@@ -2,11 +2,14 @@
 
 use crate::tokenize::hf::Hf;
 use sensai_checkpoint::{File, Offer, Torch};
+use sensai_engine::wasm::Module;
 use sensai_engine::{Graph, PathSeg, Tensor, Weight, bind, clip, fold, sprite};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+
+/// Named tables of floats.
+type Tables = Vec<(String, Vec<f32>)>;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -49,57 +52,6 @@ fn tensors(
     Ok(bind(graph, find)?)
 }
 
-/// What `model_config.json` holds. The graph fixes some of it.
-#[derive(Deserialize)]
-struct Upstream {
-    vocab_size: u64,
-    grid_size: u64,
-    dim: u64,
-    n_heads: u64,
-    depth_in: u64,
-    depth_core: u64,
-    depth_out: u64,
-    patch: u64,
-    mlp_ratio: f64,
-    n_registers: u64,
-    text_dim: u64,
-    text_len: u64,
-    rope_theta: f64,
-    conv_ffn: bool,
-    color_freqs: u64,
-    self_cond: bool,
-}
-
-/// The graph's config from `dir/model_config.json`.
-fn config(dir: &Path, seqs: u64) -> Result<sprite::Config> {
-    let text = std::fs::read_to_string(dir.join("model_config.json"))?;
-    let u: Upstream = serde_json::from_str(&text)?;
-    // The graph merges 2x2 patches and reads two Fourier tables.
-    let fixed = [
-        ("n_registers", u.n_registers == sprite::REGISTERS),
-        ("text_len", u.text_len == sprite::TEXT),
-        ("patch", u.patch == 2),
-        ("dim / n_heads", u.dim == sprite::HEAD_DIM * u.n_heads),
-        ("color_freqs", u.color_freqs == sprite::COLOR_FREQS),
-        ("conv_ffn", u.conv_ffn),
-        ("self_cond", u.self_cond),
-    ];
-    if let Some((name, _)) = fixed.iter().find(|(_, same)| !same) {
-        return Err(format!("model_config.json: the graph fixes {name}").into());
-    }
-    Ok(sprite::Config {
-        grid: u.grid_size,
-        palette: u.vocab_size,
-        hidden: u.dim,
-        heads: u.n_heads,
-        ffn: (u.dim as f64 * u.mlp_ratio) as u64,
-        text_dim: u.text_dim,
-        depth: [u.depth_in, u.depth_core, u.depth_out],
-        max_seqs: seqs,
-        rope: u.rope_theta,
-    })
-}
-
 /// The first `.pt` file in `dir`.
 fn checkpoint(dir: &Path) -> Result<PathBuf> {
     let mut found: Vec<_> = (std::fs::read_dir(dir)?.flatten())
@@ -111,14 +63,27 @@ fn checkpoint(dir: &Path) -> Result<PathBuf> {
     Ok(found.into_iter().next().ok_or_else(none)?)
 }
 
+/// The graph and tables, from the module if present.
+fn graph(dir: &Path, seqs: u64, module: Option<&Module>) -> Result<(Graph, Tables)> {
+    let text = std::fs::read_to_string(dir.join("model_config.json"))?;
+    if let Some(m) = module
+        && let Some(graph) = m.graph(&text, seqs)?
+    {
+        return Ok((graph, m.tables(&text)?));
+    }
+    let config = sprite::Config::upstream(&text, seqs)?;
+    let tables = sprite::constants(&config).into_iter();
+    Ok((
+        sprite::program(&config),
+        tables.map(|c| (c.path, c.data)).collect(),
+    ))
+}
+
 /// The denoiser from its Hugging Face files, folded once here.
-pub fn denoiser(dir: &Path, seqs: u64) -> Result<Sprite> {
-    let config = config(dir, seqs)?;
-    let graph = sprite::program(&config);
+pub fn denoiser(dir: &Path, seqs: u64, module: Option<&Module>) -> Result<Sprite> {
+    let (graph, tables) = graph(dir, seqs, module)?;
     let file = Torch::open(&checkpoint(dir)?)?;
-    let tables: HashMap<String, Vec<f32>> = (sprite::constants(&config).into_iter())
-        .map(|c| (c.path, c.data))
-        .collect();
+    let tables: HashMap<String, Vec<f32>> = tables.into_iter().collect();
     let get = |name: &str| match tables.get(name) {
         Some(table) => Some(table.clone()),
         None => file.floats(&format!("ema.{name}")).ok(),

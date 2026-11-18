@@ -55,11 +55,16 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td colspan="2">&emsp;<a href="engine/rules"><b>rules/</b></a></td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/attention">sensai-attention</a></td><td>Attention kernels for the CPU and the GPU, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/cpu">sensai-cpu</a></td><td>CPU kernels for matmuls: short bodies over a dot primitive</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/rules/guest">sensai-guest</a></td><td>What a recipe module links: memory hand-off and the table format</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/kernels">sensai-kernels</a></td><td>Kernels and the lowering rules that propose them</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/linear">sensai-linear</a></td><td>Generated matmul kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/rules">sensai-rules</a></td><td>Links every lowering rule crate</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/wasm">sensai-wasm</a></td><td>Lowering rules a sandboxed wasm module proposes, over JSON</td></tr>
 <tr><td>&emsp;<a href="engine/settings">sensai-engine-settings</a></td><td>Knobs the front end sets once and the engine reads</td></tr>
+<tr><td colspan="2"><a href="examples"><b>examples/</b></a></td></tr>
+<tr><td colspan="2">&emsp;<a href="examples/recipes"><b>recipes/</b></a></td></tr>
+<tr><td colspan="2">&emsp;&emsp;<a href="examples/recipes/tessera-small"><b>tessera-small/</b></a></td></tr>
+<tr><td>&emsp;&emsp;&emsp;<a href="examples/recipes/tessera-small/model">sensai-sprite-module</a></td><td>tessera-small's graph and tables, as a recipe module</td></tr>
 <tr><td colspan="2"><a href="frontend"><b>frontend/</b></a></td></tr>
 <tr><td>&emsp;<a href="frontend/bundle">sensai-bundle</a></td><td>A Hugging Face model directory as graph, weights, tokenizer and template</td></tr>
 <tr><td>&emsp;<a href="frontend/checkpoint">sensai-checkpoint</a></td><td>Reads weights from safetensors files</td></tr>

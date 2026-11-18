@@ -1778,6 +1778,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensai-guest"
+version = "0.1.0"
+
+[[package]]
 name = "sensai-host"
 version = "0.1.0"
 dependencies = [
@@ -1914,6 +1918,8 @@ version = "0.1.0"
 dependencies = [
  "sensai-graph",
  "sensai-trace",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1967,6 +1973,7 @@ name = "sensai-recipe"
 version = "0.1.0"
 dependencies = [
  "sensai-engine",
+ "sensai-testkit",
  "serde",
  "thiserror",
  "toml",
@@ -2031,6 +2038,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensai-sprite-module"
+version = "0.1.0"
+dependencies = [
+ "sensai-guest",
+ "sensai-models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sensai-tasks"
 version = "0.1.0"
 dependencies = [
@@ -2074,6 +2091,7 @@ name = "sensai-wasm"
 version = "0.1.0"
 dependencies = [
  "sensai-graph",
+ "sensai-guest",
  "sensai-interp",
  "sensai-kernels",
  "sensai-linear",

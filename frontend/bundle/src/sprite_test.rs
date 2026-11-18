@@ -64,7 +64,7 @@ fn matches_torch() {
     };
     let r = File::open(&dir.join("ref.safetensors")).unwrap();
     let states = states(&dir.join("clip"), &r);
-    let d = denoiser(&dir, 4).unwrap();
+    let d = denoiser(&dir, 4, None).unwrap();
     let canvas = ints(&r, "den.canvas");
     let masked = |c: &[u32]| c.iter().filter(|&&t| t == MASK).count() as u32;
     let counts: Vec<u32> = canvas.chunks(PIXELS).map(masked).collect();

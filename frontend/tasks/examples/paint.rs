@@ -38,7 +38,13 @@ fn main() -> Result<(), sensai_tasks::Error> {
     };
     let n = if greedy { 1 } else { N };
     let started = Instant::now();
-    let mut painter = Painter::open(dir.as_ref(), None, &sensai_frontend_settings::read(), n)?;
+    let mut painter = Painter::open(
+        dir.as_ref(),
+        None,
+        None,
+        &sensai_frontend_settings::read(),
+        n,
+    )?;
     eprintln!("{}: opened in {:?}", painter.device(), started.elapsed());
     let started = Instant::now();
     let options = Options {

@@ -1,6 +1,7 @@
 //! Loads one model on a thread and serves HTTP.
 
 use crate::{Model, Slot};
+use sensai_engine::wasm::Module;
 use sensai_engine::{Batch, Engine, Fair, Pins, Recipe, Settings};
 use sensai_tasks::api::{Embed, Info, Paint, Tokens};
 use sensai_tasks::klein::Klein;
@@ -52,6 +53,8 @@ pub struct Options {
     pub image_size: usize,
     /// The CLIP text tower for `paint`. `None` takes `model/clip`.
     pub clip: Option<PathBuf>,
+    /// A recipe module that may build the model's graph.
+    pub module: Option<Arc<Module>>,
     /// Lowering choices. Empty pins take the model's own.
     pub lower: Option<Recipe>,
     /// Weight-name rules, ahead of `TESSERA_NAMES`.
@@ -73,6 +76,7 @@ impl Default for Options {
             max_connections: 64,
             image_size: 512,
             clip: None,
+            module: None,
             lower: None,
             names: None,
         }
@@ -244,11 +248,15 @@ fn load(options: Options, slot: Slot) {
                 set(info, e.clone(), Some(e as Arc<dyn Embed>), None);
             })
             .map_err(|e| e.to_string()),
-        Task::Paint => {
-            Worker::<Painter>::open(options.model, options.clip, settings, options.slots)
-                .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
-                .map_err(|e| e.to_string())
-        }
+        Task::Paint => Worker::<Painter>::open(
+            options.model,
+            options.clip,
+            options.module,
+            settings,
+            options.slots,
+        )
+        .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
+        .map_err(|e| e.to_string()),
         Task::Klein => Worker::<Klein>::open(options.model, settings, options.image_size)
             .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
             .map_err(|e| e.to_string()),

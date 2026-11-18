@@ -72,6 +72,7 @@ layers = [
     ["engine/engine/", "engine/models/"],
     ["frontend/"],
     ["tools/"],
+    ["examples/"],
 ]
 
 

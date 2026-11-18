@@ -1,5 +1,6 @@
 //! A recipe: weights, lowering choices and serve flags.
 
+mod build;
 mod hub;
 #[cfg(test)]
 mod lib_test;
@@ -91,6 +92,17 @@ impl Recipe {
     /// The rules module, if the recipe has one.
     pub fn module(&self) -> Option<PathBuf> {
         self.module.as_ref().map(|m| self.dir.join(m))
+    }
+    /// The module's bytes, built first if it is a crate.
+    pub fn module_bytes(&self, cache: Option<&Path>) -> Result<Option<Vec<u8>>, Error> {
+        let Some(path) = self.module() else {
+            return Ok(None);
+        };
+        let file = match path.join("Cargo.toml").is_file() {
+            true => build::module(&path, cache.ok_or(Error::NoCache)?)?,
+            false => path,
+        };
+        Ok(Some(std::fs::read(&file).map_err(io(&file))?))
     }
 
     /// The weights directory, fetched into `cache` when remote.

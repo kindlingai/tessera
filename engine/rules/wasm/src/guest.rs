@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use wasmi::{Config, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 /// Instructions one call may run.
-const FUEL: u64 = 1 << 26;
+pub(crate) const FUEL: u64 = 1 << 26;
+/// Instructions building a whole graph may run.
+pub(crate) const BUILD_FUEL: u64 = 1 << 36;
 
 struct Live {
     store: Store<()>,
@@ -46,10 +48,15 @@ impl Guest {
     }
 
     /// Calls `name` with `input` in guest memory, or with nothing.
-    pub fn call(&self, name: &'static str, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    pub fn call(
+        &self,
+        name: &'static str,
+        input: Option<&[u8]>,
+        fuel: u64,
+    ) -> Result<Vec<u8>, Error> {
         let mut live = self.0.lock().map_err(|_| Error::Poisoned)?;
         let live = &mut *live;
-        live.store.set_fuel(FUEL).map_err(Error::wasm)?;
+        live.store.set_fuel(fuel).map_err(Error::wasm)?;
         let packed = match input {
             None => {
                 let f = live.instance.get_typed_func::<(), i64>(&live.store, name);

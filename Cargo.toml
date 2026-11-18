@@ -8,6 +8,7 @@ members = [
     "engine/plan/*",
     "engine/rules/*",
     "engine/settings",
+    "examples/recipes/*/model",
     "frontend/*",
     "tools/calibrate",
     "tools/check",
@@ -44,6 +45,7 @@ sensai-gpukit = { path = "engine/gpu/gpukit" }
 sensai-bundle = { path = "frontend/bundle" }
 sensai-grammar = { path = "frontend/grammar" }
 sensai-graph = { path = "engine/ir/graph" }
+sensai-guest = { path = "engine/rules/guest" }
 sensai-interp = { path = "engine/ir/interp" }
 sensai-host = { path = "engine/plan/host" }
 sensai-jit = { path = "engine/plan/jit" }

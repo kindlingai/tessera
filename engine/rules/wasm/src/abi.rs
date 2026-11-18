@@ -4,15 +4,20 @@ use sensai_graph::DimName;
 use serde::{Deserialize, Serialize};
 
 /// The version of this exchange the host reads.
-pub(crate) const ABI: u32 = 3;
+pub(crate) const ABI: u32 = 4;
 
 /// What `manifest()` returns.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub abi: u32,
+    #[serde(default)]
     pub kernels: Vec<Text>,
+    #[serde(default)]
     pub rules: Vec<Declared>,
+    /// Whether it exports `graph` and `tables`.
+    #[serde(default)]
+    pub graph: bool,
 }
 
 /// One kernel's source, the same for every launch.

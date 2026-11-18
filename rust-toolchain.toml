@@ -2,3 +2,5 @@
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]
+# Recipe modules build for wasm.
+targets = ["wasm32-unknown-unknown"]

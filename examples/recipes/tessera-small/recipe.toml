@@ -1,6 +1,8 @@
 # thejagstudio/tessera-small: 16x16 palette sprites from a text prompt.
 # The weights are CC BY-NC 4.0. CLIP's text tower reads the prompt.
 name = "tessera-small"
+# The graph comes from this crate, built for wasm.
+module = "model"
 
 [weights]
 hf = "thejagstudio/tessera-small@e019edd7b29367821c05e6261bc40294ce6f8d27"

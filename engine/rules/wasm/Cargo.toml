@@ -8,9 +8,10 @@ description = "Lowering rules a sandboxed wasm module proposes, over JSON"
 
 [dependencies]
 sensai-graph = { workspace = true }
+sensai-guest = { workspace = true }
 sensai-lower = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 wasmi = "0.51"
 

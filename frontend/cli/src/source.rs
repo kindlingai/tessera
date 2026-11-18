@@ -1,8 +1,10 @@
 //! Where the model comes from, and the options it gives.
 
+use sensai_engine::wasm::Module;
 use sensai_recipe::Recipe;
 use sensai_serve::start::Options;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Why a run stops early.
 pub enum Stop {
@@ -115,11 +117,11 @@ impl Source {
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
-            if let Some(path) = r.module() {
-                let failed = |e: String| Stop::Failed(format!("{}: {e}", path.display()));
-                let bytes = std::fs::read(&path).map_err(|e| failed(e.to_string()))?;
-                let rules = sensai_engine::wasm::load(&bytes).map_err(|e| failed(e.to_string()))?;
+            if let Some(bytes) = r.module_bytes(cache)? {
+                let module = Module::open(&bytes).map_err(|e| Stop::Failed(e.to_string()))?;
+                let rules = module.rules.iter().copied();
                 options.lower.get_or_insert_default().rules.extend(rules);
+                options.module = Some(Arc::new(module));
             }
             for (flag, dir) in r.extras(cache, self.token.as_deref())? {
                 apply(&mut options, &flag, Some(dir.display().to_string()))?;
