@@ -21,7 +21,7 @@ reject_unknown_fields = true
 fn reads_a_recipe() {
     let mut recipe: Recipe = toml::from_str(TEXT).unwrap();
     recipe.dir = PathBuf::from("/r");
-    assert_eq!(recipe.weights(None).unwrap(), Path::new("/r/weights"));
+    assert_eq!(recipe.weights(None, None).unwrap(), Path::new("/r/weights"));
     assert_eq!(recipe.names(), Some(PathBuf::from("/r/names.json")));
     let lower = recipe.lower.as_ref().unwrap();
     assert_eq!(lower.favor.as_deref(), Some("flash"));
@@ -33,6 +33,6 @@ fn reads_a_recipe() {
     ];
     assert_eq!(recipe.flags(), want);
     recipe.weights.hf = Some("a/b@main".into());
-    assert!(matches!(recipe.weights(None), Err(Error::Weights)));
+    assert!(matches!(recipe.weights(None, None), Err(Error::Weights)));
     assert!(toml::from_str::<Recipe>("name = \"x\"\nranks = 4\n[weights]").is_err());
 }

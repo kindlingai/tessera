@@ -22,6 +22,23 @@ impl From<sensai_recipe::Error> for Stop {
 pub enum Origin {
     Recipe(String),
     Model(String),
+    /// `owner/name` or `owner/name@revision` on Hugging Face.
+    Hub(String),
+}
+
+/// The repository in a `--model hf:<owner>/<name>[@<revision>]` value.
+fn hub_spec(value: &str) -> Option<Result<String, Stop>> {
+    let spec = value.strip_prefix("hf:")?;
+    let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
+    let valid = |part: &str| !part.is_empty() && !part.contains(['/', '@']);
+    let named = matches!(repo.split_once('/'), Some((o, n)) if valid(o) && valid(n));
+    Some(if named && !revision.is_empty() {
+        Ok(spec.to_string())
+    } else {
+        Err(Stop::Failed(format!(
+            "{value}: use hf:<owner>/<name>[@<revision>]"
+        )))
+    })
 }
 
 /// Splits out the model flags, up to `--`.
@@ -42,7 +59,10 @@ pub fn split(given: &[String]) -> Result<(Option<Origin>, Vec<String>), Stop> {
         let value = args.next().ok_or(Stop::Usage)?.clone();
         let found = match arg.as_str() {
             "--recipe" => Origin::Recipe(value),
-            _ => Origin::Model(value),
+            _ => match hub_spec(&value) {
+                Some(spec) => Origin::Hub(spec?),
+                None => Origin::Model(value),
+            },
         };
         if origin.replace(found).is_some() {
             return Err(Stop::Usage);
@@ -56,21 +76,33 @@ pub struct Source {
     origin: Origin,
     pub recipe: Option<Recipe>,
     pub cache: Option<PathBuf>,
+    pub token: Option<String>,
+    /// The snapshot directory, for a Hugging Face origin.
+    pub fetched: Option<PathBuf>,
 }
 
 impl Source {
     /// Opens the recipe, if the origin is one.
     pub fn open(origin: Option<Origin>) -> Result<Source, Stop> {
         let origin = origin.ok_or(Stop::Usage)?;
-        let cache = sensai_frontend_settings::read().recipes;
+        let settings = sensai_frontend_settings::read();
+        let (cache, token) = (settings.recipes, settings.hf_token);
+        let mut fetched = None;
         let recipe = match &origin {
             Origin::Recipe(src) => Some(Recipe::open(src, cache.as_deref())?),
             Origin::Model(_) => None,
+            Origin::Hub(spec) => {
+                let dir = cache.as_deref().ok_or(sensai_recipe::Error::NoCache)?;
+                fetched = Some(sensai_recipe::fetch_hf(spec, dir, token.as_deref())?);
+                None
+            }
         };
         Ok(Source {
             origin,
             recipe,
             cache,
+            token,
+            fetched,
         })
     }
 
@@ -79,7 +111,7 @@ impl Source {
         let mut options = Options::default();
         if let Some(r) = &self.recipe {
             let cache = self.cache.as_deref();
-            options.model = r.weights(cache)?;
+            options.model = r.weights(cache, self.token.as_deref())?;
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
@@ -101,8 +133,10 @@ impl Source {
             let value = given.next().ok_or(Stop::Usage)?;
             apply(&mut options, &flag, Some(value))?;
         }
-        if let Origin::Model(dir) = &self.origin {
-            options.model = Path::new(dir).into();
+        match (&self.origin, &self.fetched) {
+            (Origin::Model(dir), _) => options.model = Path::new(dir).into(),
+            (_, Some(dir)) => options.model = dir.clone(),
+            _ => {}
         }
         Ok(options)
     }

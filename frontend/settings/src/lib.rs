@@ -49,7 +49,20 @@ pub fn read() -> Settings {
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
         hub,
+        hf_token: token(&var, std::env::home_dir()),
     }
+}
+
+/// `HF_TOKEN`, else the token file the Hugging Face tools write.
+fn token(var: &dyn Fn(&str) -> Option<PathBuf>, home: Option<PathBuf>) -> Option<String> {
+    let text = match var("HF_TOKEN") {
+        Some(t) => t.to_string_lossy().into_owned(),
+        None => {
+            let home = var("HF_HOME").or_else(|| Some(home?.join(".cache/huggingface")));
+            std::fs::read_to_string(home?.join("token")).ok()?
+        }
+    };
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// A `TESSERA_MEMORY` value. Bad values panic.

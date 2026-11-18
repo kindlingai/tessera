@@ -1,8 +1,10 @@
-//! `sensai (--recipe <src> | --model <dir>) <verb>`.
+//! `sensai (--recipe <src> | --model <dir | hf:<owner>/<name>[@<revision>]>) <verb>`.
 
 mod fetch;
 mod serve;
 mod source;
+#[cfg(test)]
+mod source_test;
 mod task;
 
 use sensai_serve::start::FLAGS;

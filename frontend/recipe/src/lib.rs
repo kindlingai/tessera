@@ -7,6 +7,7 @@ mod source;
 #[cfg(test)]
 mod source_test;
 
+pub use hub::fetch as fetch_hf;
 pub use source::Source;
 
 use serde::Deserialize;
@@ -88,10 +89,10 @@ impl Recipe {
     }
 
     /// The weights directory, fetched into `cache` when remote.
-    pub fn weights(&self, cache: Option<&Path>) -> Result<PathBuf, Error> {
+    pub fn weights(&self, cache: Option<&Path>, token: Option<&str>) -> Result<PathBuf, Error> {
         match (&self.weights.path, &self.weights.hf) {
             (Some(path), None) => Ok(self.dir.join(path)),
-            (None, Some(hf)) => hub::snapshot(hf, cache.ok_or(Error::NoCache)?),
+            (None, Some(hf)) => hub::snapshot(hf, cache.ok_or(Error::NoCache)?, token),
             _ => Err(Error::Weights),
         }
     }

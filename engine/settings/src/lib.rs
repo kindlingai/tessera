@@ -54,6 +54,8 @@ pub struct Settings {
     pub memory: Memory,
     /// The Hugging Face hub cache.
     pub hub: Option<PathBuf>,
+    /// The Hugging Face access token, for gated repositories.
+    pub hf_token: Option<String>,
 }
 
 impl Default for Settings {
@@ -69,6 +71,7 @@ impl Default for Settings {
             verbs: None,
             memory: Memory::Device,
             hub: None,
+            hf_token: None,
         }
     }
 }
