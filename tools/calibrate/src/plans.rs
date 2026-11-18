@@ -4,7 +4,7 @@ use crate::{headroom, measure};
 use sensai_engine::Error;
 use sensai_engine::{Engine, Request};
 use sensai_graph::DimName::{self, Context, Rows, Segments, Seqs};
-use sensai_graph::Graph;
+use sensai_graph::{Graph, Role};
 use sensai_lower::form::BF16_FORM;
 use sensai_lower::{Device, Pins, Plan, Recipe, Settings, Tensor, View, Weight, lower, select};
 use sensai_models::decoder::Swiglu;
@@ -116,7 +116,12 @@ impl<'a> Bench<'a> {
                     p.ty.shape.clone(),
                 )))
             };
-            fill(g, &p.ty, at, noise).ok_or_else(unsized_shape)
+            let t = fill(g, &p.ty, at, noise).ok_or_else(unsized_shape)?;
+            // One sequence: noise slots would read past its rows.
+            Ok(match p.role {
+                Role::Slots => Tensor::zeros(t.shape.clone(), t.dtype()),
+                _ => t,
+            })
         });
         fed.collect()
     }
