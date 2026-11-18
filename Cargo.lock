@@ -1632,6 +1632,7 @@ dependencies = [
  "sensai-recipe",
  "sensai-serve",
  "sensai-tasks",
+ "serde_json",
 ]
 
 [[package]]

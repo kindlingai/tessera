@@ -32,29 +32,44 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// `side` if a painter with sizes `s` makes it.
+pub fn square(side: usize, s: Sizes) -> Result<usize, String> {
+    match side > 0 && side <= s.largest && side.is_multiple_of(s.step) {
+        true => Ok(side),
+        false => Err(format!(
+            "`size` must be square, a multiple of {} up to {}",
+            s.step, s.largest
+        )),
+    }
+}
+
 /// The side a square `size` ("WxH") asks for.
 fn side(size: Option<&str>, s: Sizes) -> Result<usize, Refusal> {
     let Some(size) = size else {
         return Ok(s.default);
     };
     let wrong = || {
-        let (step, largest) = (s.step, s.largest);
-        let message = format!("`size` must be square, a multiple of {step} up to {largest}");
-        bad(message, "size")
+        bad(
+            format!(
+                "`size` must be square, a multiple of {} up to {}",
+                s.step, s.largest
+            ),
+            "size",
+        )
     };
     let (w, h) = size.split_once('x').ok_or_else(wrong)?;
     let (w, h): (usize, usize) = (
         w.parse().map_err(|_| wrong())?,
         h.parse().map_err(|_| wrong())?,
     );
-    match w == h && w > 0 && w <= s.largest && w.is_multiple_of(s.step) {
-        true => Ok(w),
+    match w == h {
+        true => square(w, s).map_err(|_| wrong()),
         false => Err(wrong()),
     }
 }
 
 /// A seed from the clock, when the request gives none.
-fn fresh() -> u32 {
+pub fn fresh() -> u32 {
     let since = SystemTime::now().duration_since(UNIX_EPOCH);
     since.map_or(0, |d| d.subsec_nanos())
 }

@@ -14,11 +14,13 @@ mod lib_test;
 #[cfg(test)]
 mod mocks;
 pub mod start;
+
 mod wire;
 #[cfg(test)]
 mod wire_test;
 
 use http::{Request, Response};
+pub use images::{fresh, square};
 use sensai_bundle::Message;
 use sensai_tasks::api::{Chat, Embed, Generator, Info, Paint, Tokens};
 use serde_json::{Value, json};

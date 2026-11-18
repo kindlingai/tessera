@@ -22,3 +22,4 @@ sensai-frontend-settings = { workspace = true }
 sensai-recipe = { workspace = true }
 sensai-serve = { workspace = true }
 sensai-tasks = { workspace = true }
+serde_json = "1"
