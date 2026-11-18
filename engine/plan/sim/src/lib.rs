@@ -98,7 +98,7 @@ impl Estimate {
 }
 
 /// A model of one GPU.
-pub trait Chip {
+pub trait Chip: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &str;
     fn estimate(&self, load: &Load) -> Estimate;
     /// The least seconds any kernel needs for the same work.

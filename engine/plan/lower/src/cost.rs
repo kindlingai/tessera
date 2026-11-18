@@ -9,12 +9,13 @@ use sensai_codegen::kept::Layout;
 use sensai_engine_settings::{Pick, Settings};
 use sensai_graph::Parts;
 use sensai_platform::{Limits, Platform};
-use sensai_sim::{Chip, Cluster, Cost, FIXED, Fit, Pool, Sample, Timings, ZoneKind};
+use sensai_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, known};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bumped whenever a stored device changes meaning.
@@ -27,10 +28,10 @@ pub struct Device {
     pub name: String,
     /// The chip's constants, as probes fitted them.
     pub fit: Option<Fit>,
-    /// The model those constants make.
+    /// A known chip's table, else the fitted model.
     #[serde(skip)]
     #[partial_eq(skip)]
-    pool: Option<Pool>,
+    model: Option<Arc<dyn Chip>>,
     /// The zones plans may span. Zone 0 is this GPU.
     #[serde(default)]
     pub cluster: Cluster,
@@ -92,6 +93,14 @@ fn fresh() -> u64 {
     GENERATIONS.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The table for `name`, else the model `fit` makes.
+fn model(name: &str, fit: Option<Fit>) -> Option<Arc<dyn Chip>> {
+    match known(name) {
+        Some(table) => Some(Arc::from(table)),
+        None => fit.map(|fit| Arc::new(fit.pool("fitted")) as Arc<dyn Chip>),
+    }
+}
+
 fn dense() -> &'static dyn Layout {
     sensai_codegen::kept::DENSE
 }
@@ -101,7 +110,7 @@ impl Default for Device {
         Self {
             name: String::new(),
             fit: None,
-            pool: None,
+            model: None,
             cluster: Cluster::default(),
             ranks: Vec::new(),
             parts: Vec::new(),
@@ -172,13 +181,19 @@ impl Device {
 
     /// The same device, on this hardware.
     pub fn on(mut self, platform: Platform) -> Self {
+        // Without stored samples, the hardware names the device.
+        if self.name.is_empty() && !platform.name.is_empty() {
+            self.name = format!("{} {}", platform.backend, platform.name);
+        }
         self.platform = platform;
+        self.model = model(&self.name, self.fit);
         self.changed()
     }
 
     /// The same device, with a chip model for unmeasured kernels.
     pub fn fitted(mut self, fit: Fit) -> Self {
-        (self.fit, self.pool) = (Some(fit), Some(fit.pool("fitted")));
+        self.fit = Some(fit);
+        self.model = model(&self.name, self.fit);
         self.changed()
     }
 
@@ -308,8 +323,8 @@ impl Device {
         let timed = if own { &self.timed } else { &self.host };
         let near = timed.estimate(k.name(), &key.2, work);
         // With no sample of this kernel, the chip model speaks.
-        let pool = self.pool.as_ref().filter(|_| own);
-        let modelled = || Some(pool?.estimate(&k.load(len)?).seconds);
+        let chip = self.model.as_ref().filter(|_| own);
+        let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
         let seconds = near.or_else(modelled).unwrap_or(FIXED + k.guess() * work);
         self.memo.borrow_mut().insert(key, seconds);
         seconds
@@ -317,7 +332,7 @@ impl Device {
 
     /// The least seconds the chip needs for this launch's work.
     pub fn bound(&self, k: &dyn Kernel, len: usize) -> Option<f64> {
-        Some(self.pool.as_ref()?.bound(&k.load(len)?))
+        Some(self.model.as_ref()?.bound(&k.load(len)?))
     }
 
     /// The plan's estimated use of each resource.
@@ -388,7 +403,7 @@ impl Device {
         device.host.restore();
         // Files from before residency take the table's constants.
         device.fit = device.fit.map(|fit| fit.filled(&device.name));
-        device.pool = device.fit.map(|fit| fit.pool("fitted"));
+        device.model = model(&device.name, device.fit);
         device.generation = fresh();
         Ok(device)
     }

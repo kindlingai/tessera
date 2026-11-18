@@ -9,11 +9,11 @@ use sensai_interp::{Tensor, run};
 
 mod common;
 use common::{linear, noise, terms};
+use sensai_gpukit::platform::{Asked, Platform};
 use sensai_graph::F16;
-use sensai_linear::{Product, SCHEDULES, Schedule, Tiled};
+use sensai_linear::{SCHEDULES, Schedule};
 use sensai_lower::form::{BF16_FORM, LOADS, named};
-use sensai_lower::sites::After;
-use sensai_lower::{Device, Dialect, Kernel, Pins, Settings, Source, Weight, lower, select};
+use sensai_lower::{Device, Dialect, Pins, Settings, Source, Weight, lower, select};
 use sensai_run::open;
 use sensai_run::testing::{emulations, host, runs};
 use sensai_testkit::{Noise, cosine_f32, max_abs_diff};
@@ -170,34 +170,32 @@ fn codes_match_decode() {
     }
 }
 
-/// Unsampled, the M3 model ranks the fastest three as timed.
+/// Unsampled, a known chip's table picks its fastest schedule.
 #[test]
-fn m3_ranks() {
-    let seconds = |schedule: &Schedule| {
-        let product = Product {
-            m: 1536,
-            n: 3072,
-            k: 3072,
-            form: BF16_FORM,
-            after: After::default(),
-            picked: None,
-            near: None,
-        };
-        let load = Tiled {
-            product,
-            schedule: *schedule,
-        }
-        .load(0)
-        .unwrap();
-        sensai_sim::Chip::estimate(&sensai_sim::m3_pro(), &load).seconds
-    };
-    let mut ranked: Vec<(f64, &str)> = SCHEDULES.iter().map(|s| (seconds(s), s.name)).collect();
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let names: Vec<&str> = ranked.iter().take(3).map(|r| r.1).collect();
-    assert_eq!(
-        names,
-        ["tiled_64x64_w32x16", "tiled_32x32_w16", "tiled_64x64_w16"]
-    );
+fn tables_pick_schedules() {
+    let chips = [
+        ("cuda", "sm_121", "NVIDIA GB10"),
+        ("metal", "apple9", "Apple M3 Pro"),
+    ];
+    for (backend, arch, name) in chips {
+        let platform = Platform::new(Asked {
+            backend,
+            arch: arch.into(),
+            name: name.into(),
+            driver: String::new(),
+            limits: sensai_gpukit::Limits::assumed(),
+            units: 0,
+            bandwidth: 0.0,
+            integrated: true,
+            memory: 0,
+        });
+        let device = Device::guess(&host())
+            .on(platform)
+            .pinned(Pins::all(BF16_FORM));
+        let plan = lower(&linear(3072, 3072), 0, &[(Rows, 256)], &device).unwrap();
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+        assert_eq!(names, ["tiled_64x64_w32x16_bf16"], "{name}");
+    }
 }
 
 /// Neighbours gathered while staged, against the interpreter.

@@ -1870,7 +1870,6 @@ dependencies = [
  "sensai-kernels",
  "sensai-lower",
  "sensai-run",
- "sensai-sim",
  "sensai-testkit",
  "sensai-trace",
 ]

@@ -18,7 +18,6 @@ sensai-kernels = { workspace = true }
 sensai-lower = { workspace = true }
 
 [dev-dependencies]
-sensai-sim = { workspace = true }
 sensai-testkit = { workspace = true }
 sensai-interp = { workspace = true }
 sensai-gpukit = { workspace = true }
