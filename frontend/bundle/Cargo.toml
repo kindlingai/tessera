@@ -21,5 +21,4 @@ rmpv = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
 
 [dev-dependencies]
-sensai-frontend-settings = { workspace = true }
 sensai-testkit = { workspace = true }

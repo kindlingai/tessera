@@ -1,5 +1,5 @@
 use crate::pickle::parse;
-use crate::{Error, Torch};
+use crate::{Error, File, Offer, Torch};
 use std::path::PathBuf;
 
 fn text(s: &str) -> Vec<u8> {
@@ -101,4 +101,37 @@ fn reads_strides_within_bounds() {
         open("short", 4, &[2, 1], &data[..8]),
         Err(Error::Format(_))
     ));
+}
+
+/// The cached snapshot `refs/main` names for `repo`.
+fn snapshot(repo: &str) -> Option<PathBuf> {
+    let hub = sensai_frontend_settings::read().hub?;
+    let dir = hub.join(format!("models--{}", repo.replace('/', "--")));
+    let main = std::fs::read_to_string(dir.join("refs/main")).ok()?;
+    Some(dir.join("snapshots").join(main.trim()))
+}
+
+/// Every tensor in `want`, with the same shape and values.
+fn same(got: &Torch, want: &File) {
+    for slice in want.slices() {
+        let name = &slice.name;
+        assert_eq!(got.shape(name), Some(&slice.shape[..]), "{name}");
+        let values = got.floats(name).unwrap();
+        assert!(values == want.floats(name).unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn clip_matches_safetensors() {
+    let (Some(dir), Some(clip)) = (
+        sensai_testkit::reference("sprite"),
+        snapshot("openai/clip-vit-base-patch32"),
+    ) else {
+        return eprintln!("no CLIP checkpoints here; skipped");
+    };
+    let torch = Torch::open(&clip.join("pytorch_model.bin")).unwrap();
+    same(
+        &torch,
+        &File::open(&dir.join("clip/model.safetensors")).unwrap(),
+    );
 }

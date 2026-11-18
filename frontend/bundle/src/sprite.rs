@@ -1,10 +1,8 @@
 //! The sprite denoiser and its CLIP text tower.
 
-use crate::sprite_fold::Upstream;
 use crate::tokenize::hf::Hf;
 use sensai_checkpoint::{File, Offer, Torch};
 use sensai_engine::{Graph, PathSeg, Tensor, Weight, bind, clip, sprite};
-use serde::Deserialize;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -49,99 +47,19 @@ fn weights(
     Ok(bind(graph, find)?.into_iter().map(Weight::Floats).collect())
 }
 
-/// The denoiser from any offer of its weight names.
-pub fn denoiser(offer: &dyn Offer, config: &sprite::Config) -> Result<Sprite> {
-    let graph = sprite::program(config);
-    let weights = weights(&graph, |n| offer.floats(n).ok(), dotted, |_| None)?;
-    let palette = (offer.floats("palette")?.chunks(3))
+/// The converted file, up to `seqs` canvases per launch.
+pub fn denoiser(path: &Path, seqs: u64) -> Result<Sprite> {
+    let config = sprite::Config::small(seqs);
+    let graph = sprite::program(&config);
+    let file = File::open(path)?;
+    let weights = weights(&graph, |n| file.floats(n).ok(), dotted, |_| None)?;
+    let palette = (file.floats("palette")?.chunks(3))
         .map(|c| [c[0] as u8, c[1] as u8, c[2] as u8])
         .collect();
     Ok(Sprite {
         graph,
         weights,
         palette,
-    })
-}
-
-/// A converted `.safetensors` file, or the upstream `.pt`.
-pub fn denoiser_offer(path: &Path, config: &sprite::Config) -> Result<Box<dyn Offer>> {
-    Ok(match path.extension().is_some_and(|x| x == "pt") {
-        true => Box::new(Upstream::new(Torch::open(path)?, config)),
-        false => Box::new(File::open(path)?),
-    })
-}
-
-/// The denoiser file in `dir`: converted, else the upstream `.pt`.
-pub fn denoiser_file(dir: &Path) -> Option<PathBuf> {
-    let converted = dir.join("sprite.safetensors");
-    if converted.is_file() {
-        return Some(converted);
-    }
-    let mut pts: Vec<_> = (std::fs::read_dir(dir).ok()?.flatten())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "pt"))
-        .collect();
-    pts.sort();
-    pts.into_iter().next()
-}
-
-/// The upstream `model_config.json`.
-#[derive(Deserialize)]
-struct UpstreamConfig {
-    vocab_size: u64,
-    grid_size: u64,
-    dim: u64,
-    n_heads: u64,
-    depth_in: u64,
-    depth_core: u64,
-    depth_out: u64,
-    patch: u64,
-    mlp_ratio: f64,
-    n_registers: u64,
-    text_dim: u64,
-    text_len: u64,
-    rope_theta: f64,
-    color_freqs: u64,
-    conv_ffn: bool,
-    self_cond: bool,
-}
-
-/// `dir/model_config.json` as a config, else tessera-small's.
-pub fn sprite_config(dir: &Path, seqs: u64) -> Result<sprite::Config> {
-    let path = dir.join("model_config.json");
-    if !path.is_file() {
-        return Ok(sprite::Config::small(seqs));
-    }
-    let c: UpstreamConfig = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let fixed = [
-        ("patch", c.patch as f64, 2.0),
-        (
-            "n_registers",
-            c.n_registers as f64,
-            sprite::REGISTERS as f64,
-        ),
-        ("text_len", c.text_len as f64, sprite::TEXT as f64),
-        ("head width", (c.dim / c.n_heads.max(1)) as f64, 64.0),
-        ("rope_theta", c.rope_theta, 100.0),
-        ("color_freqs", c.color_freqs as f64, 6.0),
-        ("conv_ffn", c.conv_ffn as u8 as f64, 1.0),
-        ("self_cond", c.self_cond as u8 as f64, 1.0),
-    ];
-    for (name, got, want) in fixed {
-        if got != want {
-            let at = path.display();
-            return Err(format!("{at}: {name} is {got}, the graph takes {want}").into());
-        }
-    }
-    Ok(sprite::Config {
-        grid: c.grid_size,
-        palette: c.vocab_size,
-        hidden: c.dim,
-        heads: c.n_heads,
-        ffn: (c.dim as f64 * c.mlp_ratio) as u64,
-        text_dim: c.text_dim,
-        depth: [c.depth_in, c.depth_core, c.depth_out],
-        max_seqs: seqs,
     })
 }
 

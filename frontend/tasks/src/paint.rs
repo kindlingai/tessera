@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::api::{Image, Paint, Sizes, Tokens};
 use crate::worker::Worker;
-use sensai_bundle::sprite::{denoiser, denoiser_file, denoiser_offer, sprite_config, text_tower};
+use sensai_bundle::sprite::{denoiser, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::{Model, Recipe, Settings, Tensor};
 use std::path::{Path, PathBuf};
@@ -79,7 +79,7 @@ struct Canvas {
 }
 
 impl Painter {
-    /// Sprite weights in `dir`, CLIP in `clip` or `dir/clip`.
+    /// `dir/sprite.safetensors`, CLIP in `clip` or `dir/clip`.
     pub fn open(
         dir: &Path,
         clip: Option<&Path>,
@@ -90,10 +90,7 @@ impl Painter {
         let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
-        let config = sprite_config(dir, 2 * most as u64)?;
-        let file =
-            denoiser_file(dir).ok_or_else(|| format!("no sprite weights in {}", dir.display()))?;
-        let d = denoiser(&*denoiser_offer(&file, &config)?, &config)?;
+        let d = denoiser(&dir.join("sprite.safetensors"), 2 * most as u64)?;
         let mut denoiser = Model::open(d.graph, &Recipe::default(), settings)?;
         denoiser.load(&d.weights)?;
         Ok(Self {

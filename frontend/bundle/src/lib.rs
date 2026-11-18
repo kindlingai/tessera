@@ -13,7 +13,6 @@ pub mod names;
 mod names_test;
 pub mod spacy;
 pub mod sprite;
-mod sprite_fold;
 #[cfg(test)]
 mod sprite_test;
 pub mod taps;
