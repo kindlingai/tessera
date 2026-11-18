@@ -356,7 +356,8 @@ jobs:
           for r in $RESULTS; do
             case "$r" in
             success | skipped) ;;
-            cancelled) cancelled=1 ;;
+            # A needed job that no runner took can show as abandoned.
+            cancelled | abandoned) cancelled=1 ;;
             *) exit 1 ;;
             esac
           done
