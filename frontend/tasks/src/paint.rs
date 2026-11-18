@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::api::{Image, Paint, Sizes, Tokens};
 use crate::worker::Worker;
-use sensai_bundle::sprite::{denoiser, text_tower};
+use sensai_bundle::sprite::{clip_dir, denoiser, denoiser_file, denoiser_offer, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::{Model, Recipe, Settings, Tensor};
 use std::path::{Path, PathBuf};
@@ -79,12 +79,16 @@ struct Canvas {
 }
 
 impl Painter {
-    /// `dir/sprite.safetensors`, with CLIP in `dir/clip`.
+    /// `dir/sprite.safetensors` or the upstream `.pt`, with CLIP
+    /// in `dir/clip` or the Hugging Face cache.
     pub fn open(dir: &Path, settings: &Settings, most: usize) -> Result<Self, Error> {
-        let c = text_tower(&dir.join("clip"), 1, TEXT as u64)?;
+        let missing = |what: &str| format!("no {what} for {}", dir.display());
+        let clip_dir = clip_dir(dir).ok_or_else(|| missing("CLIP text tower"))?;
+        let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
-        let d = denoiser(&dir.join("sprite.safetensors"), 2 * most as u64)?;
+        let file = denoiser_file(dir).ok_or_else(|| missing("sprite weights"))?;
+        let d = denoiser(&*denoiser_offer(&file)?, 2 * most as u64)?;
         let mut denoiser = Model::open(d.graph, &Recipe::default(), settings)?;
         denoiser.load(&d.weights)?;
         Ok(Self {
