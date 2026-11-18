@@ -10,5 +10,5 @@ description = "Generates kernel text for every dialect, and counts what it costs
 sensai-graph = { workspace = true }
 sensai-kernel-macro = { workspace = true }
 sensai-mem = { workspace = true }
-sensai-sim = { workspace = true }
+sensai-work = { workspace = true }
 scattered-collect = "0.22"

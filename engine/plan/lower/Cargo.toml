@@ -12,6 +12,7 @@ derive_more = { version = "2.1", features = ["from", "eq", "deref", "debug"] }
 sensai-graph = { workspace = true }
 sensai-platform = { workspace = true }
 sensai-sim = { workspace = true }
+sensai-work = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 scattered-collect = "0.22"

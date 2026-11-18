@@ -8,8 +8,10 @@ and tokens.
 <tr><th>Crate</th><th>Description</th></tr>
 <tr><td><a href="engine">sensai-engine</a></td><td>Graphs on runners: a decode loop over a stepper, or one launch of a forward graph</td></tr>
 <tr><td colspan="2"><a href="gpu"><b>gpu/</b></a></td></tr>
-<tr><td>&emsp;<a href="gpu/gpukit">sensai-gpukit</a></td><td>The runtimes tessera loads at run time, GPUs and RDMA: pipelines, buffers, verbs</td></tr>
+<tr><td>&emsp;<a href="gpu/dl">sensai-dl</a></td><td>dlopen for the runtimes that load at run time</td></tr>
+<tr><td>&emsp;<a href="gpu/gpukit">sensai-gpukit</a></td><td>The GPU runtimes tessera loads at run time: pipelines and buffers</td></tr>
 <tr><td>&emsp;<a href="gpu/platform">sensai-platform</a></td><td>Plain hardware description: platforms, limits and the per-architecture table</td></tr>
+<tr><td>&emsp;<a href="gpu/work">sensai-work</a></td><td>What a launch does: ops per trip and the load they make</td></tr>
 <tr><td colspan="2"><a href="ir"><b>ir/</b></a></td></tr>
 <tr><td>&emsp;<a href="ir/graph">sensai-graph</a></td><td>The model graph: typed nodes, symbolic shapes, a JSON form</td></tr>
 <tr><td>&emsp;<a href="ir/interp">sensai-interp</a></td><td>Runs a graph op by op on the CPU: the reference for every plan</td></tr>

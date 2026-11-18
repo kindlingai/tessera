@@ -4,10 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The tessera command: open a recipe, then serve or fetch it"
+description = "The sensai command: open a recipe, then serve, fetch or run a task"
 
 [[bin]]
-name = "tessera"
+name = "sensai"
 path = "src/main.rs"
 
 [features]
@@ -16,7 +16,9 @@ cuda = ["sensai-serve/cuda"]
 rocm = ["sensai-serve/rocm"]
 
 [dependencies]
+sensai-bundle = { workspace = true }
 sensai-engine = { workspace = true }
 sensai-frontend-settings = { workspace = true }
 sensai-recipe = { workspace = true }
 sensai-serve = { workspace = true }
+sensai-tasks = { workspace = true }

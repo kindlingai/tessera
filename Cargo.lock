@@ -1625,10 +1625,12 @@ dependencies = [
 name = "sensai-cli"
 version = "0.1.0"
 dependencies = [
+ "sensai-bundle",
  "sensai-engine",
  "sensai-frontend-settings",
  "sensai-recipe",
  "sensai-serve",
+ "sensai-tasks",
 ]
 
 [[package]]
@@ -1639,7 +1641,7 @@ dependencies = [
  "sensai-graph",
  "sensai-kernel-macro",
  "sensai-mem",
- "sensai-sim",
+ "sensai-work",
 ]
 
 [[package]]
@@ -1649,6 +1651,10 @@ dependencies = [
  "sensai-codegen",
  "sensai-lower",
 ]
+
+[[package]]
+name = "sensai-dl"
+version = "0.1.0"
 
 [[package]]
 name = "sensai-engine"
@@ -1674,7 +1680,7 @@ dependencies = [
 name = "sensai-engine-comm"
 version = "0.1.0"
 dependencies = [
- "sensai-gpukit",
+ "sensai-dl",
  "sensai-testkit",
  "thiserror",
 ]
@@ -1741,6 +1747,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "sensai-dl",
  "sensai-mem",
  "sensai-platform",
  "serde",
@@ -1834,9 +1841,9 @@ dependencies = [
  "sensai-linear",
  "sensai-lower",
  "sensai-run",
- "sensai-sim",
  "sensai-testkit",
  "sensai-trace",
+ "sensai-work",
 ]
 
 [[package]]
@@ -1884,6 +1891,7 @@ dependencies = [
  "sensai-mem",
  "sensai-platform",
  "sensai-sim",
+ "sensai-work",
  "serde",
  "serde_json",
  "thiserror",
@@ -2016,6 +2024,7 @@ version = "0.1.0"
 name = "sensai-sim"
 version = "0.1.0"
 dependencies = [
+ "sensai-work",
  "serde",
 ]
 
@@ -2076,6 +2085,10 @@ dependencies = [
  "wasmi",
  "wat",
 ]
+
+[[package]]
+name = "sensai-work"
+version = "0.1.0"
 
 [[package]]
 name = "serde"

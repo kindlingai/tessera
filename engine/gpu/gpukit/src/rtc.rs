@@ -1,7 +1,8 @@
 //! Runtime compilers for CUDA-dialect source, loaded with dlopen.
 
 use crate::Error;
-use crate::dl::{Library, once};
+use crate::dl::once;
+use sensai_dl::Library;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 

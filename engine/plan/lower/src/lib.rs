@@ -40,7 +40,8 @@ pub use sensai_engine_settings::{Pick, Settings};
 pub use sensai_kernel_macro::Kernel;
 pub use sensai_mem::{Buffer, DType, Tensor, View};
 pub use sensai_platform::{Limits, Platform};
-pub use sensai_sim::{Cluster, Fit, Link, Load, Zone, ZoneKind};
+pub use sensai_sim::{Cluster, Fit, Link, Zone, ZoneKind};
+pub use sensai_work::Load;
 pub use tree::{Node, T, Term, Tree};
 
 use sensai_graph::{DimName, Graph};

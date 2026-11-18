@@ -25,7 +25,7 @@ pub use rms_norm::RmsNorm;
 pub use rope::Rope;
 pub use softmax::Softmax;
 
-use sensai_sim::{Load, Ops};
+use sensai_work::{Load, Ops};
 
 /// One thread per row of `width`, along that row alone.
 pub(crate) fn per_row(rows: usize, width: usize, trip: Ops, shared: f64) -> Load {

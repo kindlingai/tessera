@@ -10,7 +10,7 @@ description = "Kernels and the lowering rules that propose them"
 sensai-codegen = { workspace = true }
 sensai-graph = { workspace = true }
 sensai-lower = { workspace = true }
-sensai-sim = { workspace = true }
+sensai-work = { workspace = true }
 
 [dev-dependencies]
 sensai-attention = { workspace = true }

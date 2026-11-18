@@ -1,6 +1,7 @@
 use crate::known::{known, m3_pro};
 use crate::nvidia::gb10;
-use crate::{Chip, Fit, Limit, Load, Ops, Pool, Tag};
+use crate::{Chip, Fit, Limit, Pool, Tag};
+use sensai_work::{Load, Ops};
 
 /// The Radeon 8060S of a Ryzen AI Max, through ROCm.
 fn strix_halo() -> Pool {

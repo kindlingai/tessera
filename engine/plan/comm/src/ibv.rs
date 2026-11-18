@@ -1,92 +1,92 @@
 //! libibverbs, loaded at run time with dlopen.
 
-use crate::dl::message;
+use sensai_dl::message;
 use std::ffi::{c_char, c_int, c_void};
 use std::io;
 use std::sync::OnceLock;
 
-pub const QPT_RC: u32 = 2;
+pub(crate) const QPT_RC: u32 = 2;
 const WR_RDMA_WRITE: u32 = 0;
-pub const SEND_SIGNALED: u32 = 2;
-pub const SEND_INLINE: u32 = 8;
-pub const QPS_INIT: u32 = 1;
-pub const QPS_RTR: u32 = 2;
-pub const QPS_RTS: u32 = 3;
-pub const ACCESS_LOCAL_WRITE: u32 = 1;
-pub const ACCESS_REMOTE_WRITE: u32 = 2;
-pub const WC_SUCCESS: u32 = 0;
+pub(crate) const SEND_SIGNALED: u32 = 2;
+pub(crate) const SEND_INLINE: u32 = 8;
+pub(crate) const QPS_INIT: u32 = 1;
+pub(crate) const QPS_RTR: u32 = 2;
+pub(crate) const QPS_RTS: u32 = 3;
+pub(crate) const ACCESS_LOCAL_WRITE: u32 = 1;
+pub(crate) const ACCESS_REMOTE_WRITE: u32 = 2;
+pub(crate) const WC_SUCCESS: u32 = 0;
 
 /// `ibv_qp_attr_mask` bits.
 pub mod mask {
-    pub const STATE: i32 = 1 << 0;
-    pub const ACCESS_FLAGS: i32 = 1 << 3;
-    pub const PKEY_INDEX: i32 = 1 << 4;
-    pub const PORT: i32 = 1 << 5;
-    pub const AV: i32 = 1 << 7;
-    pub const PATH_MTU: i32 = 1 << 8;
-    pub const TIMEOUT: i32 = 1 << 9;
-    pub const RETRY_CNT: i32 = 1 << 10;
-    pub const RNR_RETRY: i32 = 1 << 11;
-    pub const RQ_PSN: i32 = 1 << 12;
-    pub const MAX_QP_RD_ATOMIC: i32 = 1 << 13;
-    pub const MIN_RNR_TIMER: i32 = 1 << 15;
-    pub const SQ_PSN: i32 = 1 << 16;
-    pub const MAX_DEST_RD_ATOMIC: i32 = 1 << 17;
-    pub const DEST_QPN: i32 = 1 << 20;
+    pub(crate) const STATE: i32 = 1 << 0;
+    pub(crate) const ACCESS_FLAGS: i32 = 1 << 3;
+    pub(crate) const PKEY_INDEX: i32 = 1 << 4;
+    pub(crate) const PORT: i32 = 1 << 5;
+    pub(crate) const AV: i32 = 1 << 7;
+    pub(crate) const PATH_MTU: i32 = 1 << 8;
+    pub(crate) const TIMEOUT: i32 = 1 << 9;
+    pub(crate) const RETRY_CNT: i32 = 1 << 10;
+    pub(crate) const RNR_RETRY: i32 = 1 << 11;
+    pub(crate) const RQ_PSN: i32 = 1 << 12;
+    pub(crate) const MAX_QP_RD_ATOMIC: i32 = 1 << 13;
+    pub(crate) const MIN_RNR_TIMER: i32 = 1 << 15;
+    pub(crate) const SQ_PSN: i32 = 1 << 16;
+    pub(crate) const MAX_DEST_RD_ATOMIC: i32 = 1 << 17;
+    pub(crate) const DEST_QPN: i32 = 1 << 20;
 }
 
 pub(crate) enum Device {}
-pub enum Pd {}
+pub(crate) enum Pd {}
 
 /// The `ops` table follows the device pointer.
 #[repr(C)]
-pub struct Context {
+pub(crate) struct Context {
     device: *mut Device,
     pub(crate) ops: [*const c_void; 32],
 }
 
 #[repr(C)]
-pub struct Cq {
-    pub context: *mut Context,
+pub(crate) struct Cq {
+    pub(crate) context: *mut Context,
 }
 
 /// The prefix of `ibv_qp` up to its number.
 #[repr(C)]
-pub struct Qp {
-    pub context: *mut Context,
+pub(crate) struct Qp {
+    pub(crate) context: *mut Context,
     qp_context: *mut c_void,
     pd: *mut Pd,
     send_cq: *mut Cq,
     recv_cq: *mut Cq,
     srq: *mut c_void,
     handle: u32,
-    pub qp_num: u32,
+    pub(crate) qp_num: u32,
 }
 
 #[repr(C)]
-pub struct Mr {
+pub(crate) struct Mr {
     context: *mut Context,
     pd: *mut Pd,
     addr: *mut c_void,
     length: usize,
     handle: u32,
-    pub lkey: u32,
-    pub rkey: u32,
+    pub(crate) lkey: u32,
+    pub(crate) rkey: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Sge {
-    pub addr: u64,
-    pub length: u32,
-    pub lkey: u32,
+pub(crate) struct Sge {
+    pub(crate) addr: u64,
+    pub(crate) length: u32,
+    pub(crate) lkey: u32,
 }
 
 /// `ibv_send_wr` with the RDMA write arm of its union.
 #[repr(C)]
-pub struct SendWr {
+pub(crate) struct SendWr {
     wr_id: u64,
-    pub next: *mut SendWr,
+    pub(crate) next: *mut SendWr,
     sg_list: *mut Sge,
     num_sge: i32,
     opcode: u32,
@@ -102,7 +102,7 @@ pub struct SendWr {
 
 impl SendWr {
     /// An RDMA write of `sge` to `remote_addr` under `rkey`.
-    pub fn write(sge: *mut Sge, remote_addr: u64, rkey: u32, flags: u32) -> Self {
+    pub(crate) fn write(sge: *mut Sge, remote_addr: u64, rkey: u32, flags: u32) -> Self {
         let mut wr: Self = unsafe { std::mem::zeroed() };
         wr.sg_list = sge;
         wr.num_sge = 1;
@@ -116,9 +116,9 @@ impl SendWr {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Wc {
+pub(crate) struct Wc {
     wr_id: u64,
-    pub status: u32,
+    pub(crate) status: u32,
     opcode: u32,
     vendor_err: u32,
     byte_len: u32,
@@ -134,89 +134,89 @@ pub struct Wc {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct QpCap {
-    pub max_send_wr: u32,
-    pub max_recv_wr: u32,
-    pub max_send_sge: u32,
-    pub max_recv_sge: u32,
-    pub max_inline_data: u32,
+pub(crate) struct QpCap {
+    pub(crate) max_send_wr: u32,
+    pub(crate) max_recv_wr: u32,
+    pub(crate) max_send_sge: u32,
+    pub(crate) max_recv_sge: u32,
+    pub(crate) max_inline_data: u32,
 }
 
 #[repr(C)]
-pub struct QpInitAttr {
-    pub qp_context: *mut c_void,
-    pub send_cq: *mut Cq,
-    pub recv_cq: *mut Cq,
-    pub srq: *mut c_void,
-    pub cap: QpCap,
-    pub qp_type: u32,
-    pub sq_sig_all: i32,
+pub(crate) struct QpInitAttr {
+    pub(crate) qp_context: *mut c_void,
+    pub(crate) send_cq: *mut Cq,
+    pub(crate) recv_cq: *mut Cq,
+    pub(crate) srq: *mut c_void,
+    pub(crate) cap: QpCap,
+    pub(crate) qp_type: u32,
+    pub(crate) sq_sig_all: i32,
 }
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Gid(pub [u8; 16]);
+pub(crate) struct Gid(pub [u8; 16]);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct GlobalRoute {
-    pub dgid: Gid,
+pub(crate) struct GlobalRoute {
+    pub(crate) dgid: Gid,
     flow_label: u32,
-    pub sgid_index: u8,
-    pub hop_limit: u8,
+    pub(crate) sgid_index: u8,
+    pub(crate) hop_limit: u8,
     traffic_class: u8,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct AhAttr {
-    pub grh: GlobalRoute,
-    pub dlid: u16,
-    pub sl: u8,
-    pub src_path_bits: u8,
-    pub static_rate: u8,
-    pub is_global: u8,
-    pub port_num: u8,
+pub(crate) struct AhAttr {
+    pub(crate) grh: GlobalRoute,
+    pub(crate) dlid: u16,
+    pub(crate) sl: u8,
+    pub(crate) src_path_bits: u8,
+    pub(crate) static_rate: u8,
+    pub(crate) is_global: u8,
+    pub(crate) port_num: u8,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct QpAttr {
-    pub qp_state: u32,
-    pub cur_qp_state: u32,
-    pub path_mtu: u32,
-    pub path_mig_state: u32,
-    pub qkey: u32,
-    pub rq_psn: u32,
-    pub sq_psn: u32,
-    pub dest_qp_num: u32,
-    pub qp_access_flags: u32,
-    pub cap: QpCap,
-    pub ah_attr: AhAttr,
-    pub alt_ah_attr: AhAttr,
-    pub pkey_index: u16,
-    pub alt_pkey_index: u16,
-    pub en_sqd_async_notify: u8,
-    pub sq_draining: u8,
-    pub max_rd_atomic: u8,
-    pub max_dest_rd_atomic: u8,
-    pub min_rnr_timer: u8,
-    pub port_num: u8,
-    pub timeout: u8,
-    pub retry_cnt: u8,
-    pub rnr_retry: u8,
-    pub alt_port_num: u8,
-    pub alt_timeout: u8,
-    pub rate_limit: u32,
+pub(crate) struct QpAttr {
+    pub(crate) qp_state: u32,
+    pub(crate) cur_qp_state: u32,
+    pub(crate) path_mtu: u32,
+    pub(crate) path_mig_state: u32,
+    pub(crate) qkey: u32,
+    pub(crate) rq_psn: u32,
+    pub(crate) sq_psn: u32,
+    pub(crate) dest_qp_num: u32,
+    pub(crate) qp_access_flags: u32,
+    pub(crate) cap: QpCap,
+    pub(crate) ah_attr: AhAttr,
+    pub(crate) alt_ah_attr: AhAttr,
+    pub(crate) pkey_index: u16,
+    pub(crate) alt_pkey_index: u16,
+    pub(crate) en_sqd_async_notify: u8,
+    pub(crate) sq_draining: u8,
+    pub(crate) max_rd_atomic: u8,
+    pub(crate) max_dest_rd_atomic: u8,
+    pub(crate) min_rnr_timer: u8,
+    pub(crate) port_num: u8,
+    pub(crate) timeout: u8,
+    pub(crate) retry_cnt: u8,
+    pub(crate) rnr_retry: u8,
+    pub(crate) alt_port_num: u8,
+    pub(crate) alt_timeout: u8,
+    pub(crate) rate_limit: u32,
 }
 
 /// Room for `ibv_port_attr` of any version. The MTU leads.
 #[repr(C)]
 #[derive(Default)]
-pub struct PortAttr {
+pub(crate) struct PortAttr {
     state: u32,
     max_mtu: u32,
-    pub active_mtu: u32,
+    pub(crate) active_mtu: u32,
     rest: [u32; 13],
 }
 
@@ -241,25 +241,25 @@ type WcStatusStr = unsafe extern "C" fn(c_int) -> *const c_char;
 type PollCq = unsafe extern "C" fn(*mut Cq, c_int, *mut Wc) -> c_int;
 type PostSend = unsafe extern "C" fn(*mut Qp, *mut SendWr, *mut *mut SendWr) -> c_int;
 
-crate::dl::library! {
+sensai_dl::library! {
     /// The entry points the transport calls.
-    pub struct Lib as "libibverbs" in ["libibverbs.so.1"] {
+    pub(crate) struct Lib as "libibverbs" in ["libibverbs.so.1"] {
         get_device_list: GetDeviceList = "ibv_get_device_list",
         free_device_list: FreeDeviceList = "ibv_free_device_list",
         get_device_name: GetDeviceName = "ibv_get_device_name",
         open_device: OpenDevice = "ibv_open_device",
-        pub close_device: CloseDevice = "ibv_close_device",
-        pub alloc_pd: AllocPd = "ibv_alloc_pd",
-        pub dealloc_pd: DeallocPd = "ibv_dealloc_pd",
-        pub reg_mr: RegMr = "ibv_reg_mr",
-        pub dereg_mr: DeregMr = "ibv_dereg_mr",
-        pub create_cq: CreateCq = "ibv_create_cq",
-        pub destroy_cq: DestroyCq = "ibv_destroy_cq",
-        pub create_qp: CreateQp = "ibv_create_qp",
-        pub destroy_qp: DestroyQp = "ibv_destroy_qp",
-        pub modify_qp: ModifyQp = "ibv_modify_qp",
-        pub query_gid: QueryGid = "ibv_query_gid",
-        pub query_port: QueryPort = "ibv_query_port",
+        pub(crate) close_device: CloseDevice = "ibv_close_device",
+        pub(crate) alloc_pd: AllocPd = "ibv_alloc_pd",
+        pub(crate) dealloc_pd: DeallocPd = "ibv_dealloc_pd",
+        pub(crate) reg_mr: RegMr = "ibv_reg_mr",
+        pub(crate) dereg_mr: DeregMr = "ibv_dereg_mr",
+        pub(crate) create_cq: CreateCq = "ibv_create_cq",
+        pub(crate) destroy_cq: DestroyCq = "ibv_destroy_cq",
+        pub(crate) create_qp: CreateQp = "ibv_create_qp",
+        pub(crate) destroy_qp: DestroyQp = "ibv_destroy_qp",
+        pub(crate) modify_qp: ModifyQp = "ibv_modify_qp",
+        pub(crate) query_gid: QueryGid = "ibv_query_gid",
+        pub(crate) query_port: QueryPort = "ibv_query_port",
         wc_status_str: WcStatusStr = "ibv_wc_status_str",
     }
 }
@@ -268,12 +268,12 @@ static LIB: OnceLock<Result<Lib, String>> = OnceLock::new();
 
 impl Lib {
     /// Loaded once per process.
-    pub fn get() -> Result<&'static Lib, String> {
+    pub(crate) fn get() -> Result<&'static Lib, String> {
         LIB.get_or_init(Lib::open).as_ref().map_err(Clone::clone)
     }
 
     /// Opens the device called `name`.
-    pub fn device(&self, name: &str) -> Result<*mut Context, String> {
+    pub(crate) fn device(&self, name: &str) -> Result<*mut Context, String> {
         let mut n: c_int = 0;
         let list = unsafe { (self.get_device_list)(&mut n) };
         if list.is_null() {
@@ -282,7 +282,7 @@ impl Lib {
         let mut found = std::ptr::null_mut();
         for i in 0..n as usize {
             let device = unsafe { *list.add(i) };
-            if message(unsafe { (self.get_device_name)(device) }) == name {
+            if unsafe { message((self.get_device_name)(device)) } == name {
                 found = unsafe { (self.open_device)(device) };
             }
         }
@@ -297,7 +297,7 @@ impl Lib {
     ///
     /// # Safety
     /// `cq` must be live.
-    pub unsafe fn poll_cq(&self, cq: *mut Cq, wc: &mut [Wc]) -> c_int {
+    pub(crate) unsafe fn poll_cq(&self, cq: *mut Cq, wc: &mut [Wc]) -> c_int {
         let ops = unsafe { &(*(*cq).context).ops };
         let poll: PollCq = unsafe { std::mem::transmute(ops[11]) };
         unsafe { poll(cq, wc.len() as c_int, wc.as_mut_ptr()) }
@@ -305,14 +305,14 @@ impl Lib {
 
     /// # Safety
     /// `qp` and each linked `wr` must be live.
-    pub unsafe fn post_send(&self, qp: *mut Qp, wr: &mut SendWr) -> c_int {
+    pub(crate) unsafe fn post_send(&self, qp: *mut Qp, wr: &mut SendWr) -> c_int {
         let ops = unsafe { &(*(*qp).context).ops };
         let post: PostSend = unsafe { std::mem::transmute(ops[25]) };
         let mut bad = std::ptr::null_mut();
         unsafe { post(qp, wr, &mut bad) }
     }
 
-    pub fn status(&self, code: u32) -> String {
-        message(unsafe { (self.wc_status_str)(code as c_int) })
+    pub(crate) fn status(&self, code: u32) -> String {
+        unsafe { message((self.wc_status_str)(code as c_int)) }
     }
 }

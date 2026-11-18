@@ -30,8 +30,10 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td colspan="2"><a href="engine"><b>engine/</b></a></td></tr>
 <tr><td>&emsp;<a href="engine/engine">sensai-engine</a></td><td>Graphs on runners: a decode loop over a stepper, or one launch of a forward graph</td></tr>
 <tr><td colspan="2">&emsp;<a href="engine/gpu"><b>gpu/</b></a></td></tr>
-<tr><td>&emsp;&emsp;<a href="engine/gpu/gpukit">sensai-gpukit</a></td><td>The runtimes tessera loads at run time, GPUs and RDMA: pipelines, buffers, verbs</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/gpu/dl">sensai-dl</a></td><td>dlopen for the runtimes that load at run time</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/gpu/gpukit">sensai-gpukit</a></td><td>The GPU runtimes tessera loads at run time: pipelines and buffers</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/gpu/platform">sensai-platform</a></td><td>Plain hardware description: platforms, limits and the per-architecture table</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/gpu/work">sensai-work</a></td><td>What a launch does: ops per trip and the load they make</td></tr>
 <tr><td colspan="2">&emsp;<a href="engine/ir"><b>ir/</b></a></td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/ir/graph">sensai-graph</a></td><td>The model graph: typed nodes, symbolic shapes, a JSON form</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/ir/interp">sensai-interp</a></td><td>Runs a graph op by op on the CPU: the reference for every plan</td></tr>
@@ -61,7 +63,7 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td colspan="2"><a href="frontend"><b>frontend/</b></a></td></tr>
 <tr><td>&emsp;<a href="frontend/bundle">sensai-bundle</a></td><td>A Hugging Face model directory as graph, weights, tokenizer and template</td></tr>
 <tr><td>&emsp;<a href="frontend/checkpoint">sensai-checkpoint</a></td><td>Reads weights from safetensors files</td></tr>
-<tr><td>&emsp;<a href="frontend/cli">sensai-cli</a></td><td>The tessera command: open a recipe, then serve or fetch it</td></tr>
+<tr><td>&emsp;<a href="frontend/cli">sensai-cli</a></td><td>The sensai command: open a recipe, then serve, fetch or run a task</td></tr>
 <tr><td>&emsp;<a href="frontend/comm">sensai-frontend-comm</a></td><td>Joins ranks over TCP or a shared file, then hands the handles to the engine</td></tr>
 <tr><td>&emsp;<a href="frontend/eval">sensai-eval</a></td><td>Measures a model under a recipe: speed per batch, parity against a reference</td></tr>
 <tr><td>&emsp;<a href="frontend/grammar">sensai-grammar</a></td><td>Grammars that limit which tokens a decode step may pick</td></tr>

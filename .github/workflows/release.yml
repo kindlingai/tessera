@@ -69,8 +69,9 @@ jobs:
       - name: Take the binary out of the wheel
         run: |
           mkdir -p bin
-          unzip -j -o target/publish/sensaix/dist/*.whl '*.data/scripts/sensaix' -d bin
-          chmod +x bin/sensaix
+          unzip -j -o target/publish/sensaix/dist/*.whl '*.data/scripts/sensai*' -d bin
+          chmod +x bin/sensai bin/sensaix
+          ./bin/sensai 2>&1 | grep -q usage
           ./bin/sensaix 2>&1 | grep -q usage
       - uses: actions/upload-artifact@v4
         with:

@@ -2,7 +2,7 @@
 name = "sensai-gpukit"
 version = "0.1.0"
 edition = "2024"
-description = "The runtimes tessera loads at run time, GPUs and RDMA: pipelines, buffers, verbs"
+description = "The GPU runtimes tessera loads at run time: pipelines and buffers"
 license = "MIT"
 
 [features]
@@ -17,6 +17,7 @@ rocm = []
 thiserror = "2"
 derive_more = { version = "2.1", features = ["display"] }
 serde = { version = "1", features = ["derive"] }
+sensai-dl = { workspace = true }
 sensai-mem = { workspace = true }
 sensai-platform = { workspace = true }
 

@@ -4,7 +4,8 @@ use crate::abi::{Launch, Source};
 use crate::plan::Step;
 use sensai_graph::Order;
 use sensai_platform::Platform;
-use sensai_sim::{Load, ZoneKind};
+use sensai_sim::ZoneKind;
+use sensai_work::Load;
 use std::fmt;
 use std::sync::Arc;
 

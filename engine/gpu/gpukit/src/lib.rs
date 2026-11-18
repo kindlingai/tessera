@@ -5,10 +5,6 @@ pub use ::sensai_platform::{Limits, Platform, limits, platform};
 pub use error::Error;
 
 pub mod backend;
-pub mod ibv;
-#[cfg(test)]
-mod ibv_test;
-
 pub mod testing;
 
 #[cfg(target_os = "macos")]

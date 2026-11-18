@@ -9,6 +9,8 @@ use crate::meta::{Meta, Package};
 pub const ENGINE: &str = "sensai-engine";
 pub const FRONTEND: &str = "sensai";
 pub const CLI: &str = "sensaix";
+/// The second name the binary answers to.
+pub const CLI_ALIAS: &str = "sensai";
 const CLI_SOURCE: &str = "sensai-cli";
 
 #[derive(PartialEq)]
