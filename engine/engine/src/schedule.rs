@@ -1,6 +1,6 @@
 //! Many answers in flight, one step feeding them all.
 
-use crate::{Allowed, Engine, Error, Event, Fault, Reason, Request, Row};
+use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
 /// Takes each event. `false` ends the answer early.
@@ -41,20 +41,22 @@ impl Seq {
     }
 
     /// Counts `n` tokens fed. `id` follows the last one.
-    fn advance(&mut self, n: usize, id: u32) -> Result<Option<Reason>, Error> {
+    fn advance(&mut self, n: usize, id: u32) -> Option<Reason> {
         self.pending.drain(..n);
         self.fed += n;
         if !self.pending.is_empty() {
-            return Ok(None);
+            return None;
         }
-        if let Some(guide) = &mut self.request.guide {
-            guide.accept(id).map_err(fault)?;
+        if let Some(guide) = &mut self.request.guide
+            && guide.accept(id).is_err()
+        {
+            return Some(Reason::Guide);
         }
         if self.request.stop.contains(&id) {
-            return Ok(Some(Reason::Stop));
+            return Some(Reason::Stop);
         }
         if let Some(reason) = self.emit(id) {
-            return Ok(Some(reason));
+            return Some(reason);
         }
         self.pending.push_back(id);
         self.settle()
@@ -70,46 +72,41 @@ impl Seq {
     }
 
     /// Adds forced and single-choice tokens, then reads the next set.
-    fn settle(&mut self) -> Result<Option<Reason>, Error> {
+    fn settle(&mut self) -> Option<Reason> {
         loop {
-            let Some(guide) = &mut self.request.guide else {
-                return Ok(None);
-            };
+            let guide = self.request.guide.as_mut()?;
             let forced = guide.forced();
             let done = guide.done();
             let next = match done {
-                true => Allowed::Any,
-                false => guide.allowed().map_err(fault)?,
+                true => Ok(Allowed::Any),
+                false => guide.allowed(),
+            };
+            let Ok(next) = next else {
+                return Some(Reason::Guide);
             };
             let one = match next {
-                Allowed::One(id) => {
-                    guide.accept(id).map_err(fault)?;
-                    Some(id)
-                }
+                Allowed::One(id) if guide.accept(id).is_err() => return Some(Reason::Guide),
+                Allowed::One(id) => Some(id),
                 _ => None,
             };
             for id in forced.into_iter().chain(one) {
                 if self.request.stop.contains(&id) {
-                    return Ok(Some(Reason::Stop));
+                    return Some(Reason::Stop);
                 }
                 if let Some(reason) = self.emit(id) {
-                    return Ok(Some(reason));
+                    return Some(reason);
                 }
                 self.pending.push_back(id);
             }
             if done {
-                return Ok(Some(Reason::Stop));
+                return Some(Reason::Stop);
             }
             if one.is_none() {
                 self.next = next;
-                return Ok(None);
+                return None;
             }
         }
     }
-}
-
-fn fault(e: Fault) -> Error {
-    Error::Guide(e.to_string())
 }
 
 /// Which rows the next step feeds, within a row budget.
@@ -191,11 +188,11 @@ impl<'a> Batch<'a> {
     }
 
     /// Admits waiting answers while slots are free.
-    fn admit(&mut self) -> Result<(), Error> {
+    fn admit(&mut self) {
         while let Some(slot) = self.free.pop() {
             let Some((request, sink)) = self.waiting.pop_front() else {
                 self.free.push(slot);
-                return Ok(());
+                return;
             };
             let mut seq = Seq {
                 slot,
@@ -206,7 +203,7 @@ impl<'a> Batch<'a> {
                 made: 0,
                 next: Allowed::Any,
             };
-            match seq.settle()? {
+            match seq.settle() {
                 Some(reason) => {
                     (seq.sink)(Event::Done(reason));
                     self.free.push(slot);
@@ -214,7 +211,6 @@ impl<'a> Batch<'a> {
                 None => self.active.push(seq),
             }
         }
-        Ok(())
     }
 
     /// The most rows one step feeds.
@@ -265,7 +261,7 @@ impl<'a> Batch<'a> {
 
     /// One step of the policy's rows. False when nothing ran.
     pub fn step(&mut self) -> Result<bool, Error> {
-        self.admit()?;
+        self.admit();
         self.fit();
         let rows = self.policy.pick(&self.active, self.budget);
         if rows.is_empty() {
@@ -287,7 +283,7 @@ impl<'a> Batch<'a> {
                 .find(|(e, _)| rows[**e as usize].slot == slot);
             match mine {
                 None => i += 1,
-                Some((_, &last)) => match self.active[i].advance(n, last)? {
+                Some((_, &last)) => match self.active[i].advance(n, last) {
                     Some(reason) => {
                         (self.active[i].sink)(Event::Done(reason));
                         self.finish(i);

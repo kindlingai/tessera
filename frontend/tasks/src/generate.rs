@@ -79,7 +79,7 @@ impl Generator for Queued {
                 Event::Done(reason) => Step::Done {
                     text: stops.rest(),
                     finish: match reason {
-                        Reason::Stop => Finish::Stop,
+                        Reason::Stop | Reason::Guide => Finish::Stop,
                         Reason::Length | Reason::Context => Finish::Length,
                     },
                     tokens,

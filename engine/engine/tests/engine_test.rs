@@ -362,3 +362,39 @@ fn budget_refuses_plan() {
     ));
     assert!(open(sensai_engine::Memory::Off).is_ok());
 }
+
+/// Fails on its first pick.
+struct Broken;
+
+impl Guide for Broken {
+    fn allowed(&mut self) -> Result<Allowed, Fault> {
+        Ok(Allowed::Any)
+    }
+
+    fn accept(&mut self, _: u32) -> Result<(), Fault> {
+        Err("broken".into())
+    }
+}
+
+#[test]
+fn failures_stay_local() {
+    let (_, _, mut engine) = open(37, 2, &runs()[0]);
+    let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    let mut taken = Vec::new();
+    for guide in [Some(Box::new(Broken) as Box<dyn Guide>), None] {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let request = Request {
+            tokens: vec![3, 9],
+            max_tokens: 3,
+            guide,
+            ..Request::default()
+        };
+        batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+        taken.push(receiver);
+    }
+    while batch.step().unwrap() {}
+    let last = |r: &std::sync::mpsc::Receiver<Event>| r.try_iter().last();
+    let ends: Vec<_> = taken.iter().map(last).collect();
+    let want = [Reason::Guide, Reason::Length].map(|r| Some(Event::Done(r)));
+    assert_eq!(ends, want);
+}

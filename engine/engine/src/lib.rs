@@ -50,6 +50,8 @@ pub enum Reason {
     Length,
     /// The context filled before a stop.
     Context,
+    /// The guide failed. Other answers go on.
+    Guide,
 }
 
 /// One decoded token, or the end.
@@ -78,8 +80,6 @@ pub enum Error {
     Graph(#[from] sensai_graph::VerifyError),
     #[error("the masks do not fit the graph's mask port")]
     Mask,
-    #[error("guide: {0}")]
-    Guide(String),
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.

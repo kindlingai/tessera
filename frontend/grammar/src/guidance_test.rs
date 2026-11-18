@@ -67,3 +67,10 @@ fn sets_pick_tiers() {
     let mut m = vocab.regex("[0-9]+").unwrap();
     assert_eq!(m.allowed().unwrap(), Allowed::Few(digits));
 }
+
+#[test]
+fn split_characters_kept() {
+    let vocab = Vocab::new(&tokenizer(), &[EOS], ROWS).unwrap();
+    // The first byte of `é` stays itself, not U+FFFD.
+    assert_eq!(vocab.tokenize(&[b'a', 0xC3]), [u32::from(b'a'), 0xC3]);
+}

@@ -19,9 +19,13 @@ impl TokenizerEnv for Env {
     }
 
     fn tokenize_bytes(&self, s: &[u8]) -> Vec<TokenId> {
-        self.hf
-            .encode(&String::from_utf8_lossy(s))
-            .unwrap_or_default()
+        // Forced bytes may end inside a character.
+        let valid = std::str::from_utf8(s).map_or_else(|e| e.valid_up_to(), |_| s.len());
+        let (text, rest) = s.split_at(valid);
+        let text = std::str::from_utf8(text).unwrap_or_default();
+        let mut ids = self.hf.encode(text).unwrap_or_default();
+        ids.extend(self.trie.greedy_tokenize(rest));
+        ids
     }
 }
 
@@ -57,6 +61,11 @@ impl Vocab {
     /// The `u32` words of one mask.
     pub fn words(&self) -> usize {
         self.rows.div_ceil(32)
+    }
+
+    /// Ids for `bytes`, even when they end inside a character.
+    pub fn tokenize(&self, bytes: &[u8]) -> Vec<u32> {
+        self.factory.tok_env().tokenize_bytes(bytes)
     }
 
     /// Answers that match a JSON schema.
