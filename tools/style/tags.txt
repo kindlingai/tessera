@@ -6,3 +6,4 @@ agent-passive: <Be> <Adverb>* !<Arith> <Verb-PastParticiple> by <Det>* <Adj>* !<
 hidden-negation: <ContentVerb> <Adverb>? no <Adj>* <Noun>
 hidden-negation: ^ only <Det>* <Adj|Noun|Possessive|Hyphen>* <Noun> <Adverb>? <Verb-Finite>
 chained-clause: <Verb|Prep> <Word>*? <Noun> , (which|whose|who) !<Be>
+what-clause: ^ what !<Verb-Finite> !<Prep> <Word>*? <Noun> <Adverb>? <Verb-Finite>

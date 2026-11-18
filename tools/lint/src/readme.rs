@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::Violation;
+use crate::comments::{SEMICOLON, prose_semicolon, words};
+use crate::{LIMITS, Violation};
 
 pub const MARKER: &str = "<!-- crate table -->";
 
@@ -127,6 +128,9 @@ fn crates(root: &Path, dirs: &[String]) -> Result<Vec<Crate>, String> {
 
 pub fn check(root: &Path, dirs: &[String], out: &mut Vec<Violation>) -> Result<(), String> {
     let all = crates(root, dirs)?;
+    for c in &all {
+        described(root, c, out);
+    }
     for (folder, list) in folders(&all) {
         let path = format!("{folder}README.md");
         let found = match std::fs::read_to_string(root.join(&path)) {
@@ -146,6 +150,32 @@ pub fn check(root: &Path, dirs: &[String], out: &mut Vec<Violation>) -> Result<(
         });
     }
     Ok(())
+}
+
+/// A description follows the comment rules, with a longer limit.
+fn described(root: &Path, c: &Crate, out: &mut Vec<Violation>) {
+    let path = format!("{}Cargo.toml", c.dir);
+    let text = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+    let at = text.lines().position(|l| l.starts_with("description"));
+    let line = at.map_or(1, |i| i + 1);
+    let mut push = |rule, message: String| {
+        out.push(Violation {
+            path: path.clone(),
+            line,
+            rule,
+            message,
+        })
+    };
+    let (n, max) = (words(&c.description), LIMITS.max_description_words);
+    if n > max {
+        push(
+            "description-words",
+            format!("description of {n} words (max {max})"),
+        );
+    }
+    if prose_semicolon(&c.description) {
+        push("comment-semicolon", SEMICOLON.into());
+    }
 }
 
 /// Writes every table. Adds missing markers and READMEs.

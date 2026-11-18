@@ -52,7 +52,15 @@ fn examples_match() {
 fn rules_load() {
     let rules = crate::rules::load(Path::new(RULES)).unwrap();
     let ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(ids, ["agent-passive", "chained-clause", "hidden-negation"]);
+    assert_eq!(
+        ids,
+        [
+            "agent-passive",
+            "chained-clause",
+            "hidden-negation",
+            "what-clause"
+        ]
+    );
     assert!(
         rules
             .iter()

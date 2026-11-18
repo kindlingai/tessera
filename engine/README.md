@@ -6,15 +6,15 @@ and tokens.
 <!-- crate table -->
 <table>
 <tr><th>Crate</th><th>Description</th></tr>
-<tr><td><a href="engine">sensai-engine</a></td><td>Graphs on runners: a decode loop over a stepper, or one launch of a forward graph</td></tr>
+<tr><td><a href="engine">sensai-engine</a></td><td>Runs graphs: a decode loop over a stepper, or one forward launch</td></tr>
 <tr><td colspan="2"><a href="gpu"><b>gpu/</b></a></td></tr>
 <tr><td>&emsp;<a href="gpu/dl">sensai-dl</a></td><td>dlopen for the runtimes that load at run time</td></tr>
 <tr><td>&emsp;<a href="gpu/gpukit">sensai-gpukit</a></td><td>The GPU runtimes tessera loads at run time: pipelines and buffers</td></tr>
 <tr><td>&emsp;<a href="gpu/platform">sensai-platform</a></td><td>Plain hardware description: platforms, limits and the per-architecture table</td></tr>
-<tr><td>&emsp;<a href="gpu/work">sensai-work</a></td><td>What a launch does: ops per trip and the load they make</td></tr>
+<tr><td>&emsp;<a href="gpu/work">sensai-work</a></td><td>A launch's work: ops per trip and the load they make</td></tr>
 <tr><td colspan="2"><a href="ir"><b>ir/</b></a></td></tr>
 <tr><td>&emsp;<a href="ir/graph">sensai-graph</a></td><td>The model graph: typed nodes, symbolic shapes, a JSON form</td></tr>
-<tr><td>&emsp;<a href="ir/interp">sensai-interp</a></td><td>Runs a graph op by op on the CPU: the reference for every plan</td></tr>
+<tr><td>&emsp;<a href="ir/interp">sensai-interp</a></td><td>The CPU reference for every plan: runs a graph op by op</td></tr>
 <tr><td>&emsp;<a href="ir/kv">sensai-kv</a></td><td>Pages of kept rows, shared between runs by refcount</td></tr>
 <tr><td>&emsp;<a href="ir/mem">sensai-mem</a></td><td>Buffers in zones, typed views onto them, and storage forms</td></tr>
 <tr><td>&emsp;<a href="ir/testkit">sensai-testkit</a></td><td>Helpers that tests share: noise, comparisons and scratch files</td></tr>
@@ -25,7 +25,7 @@ and tokens.
 <tr><td>&emsp;<a href="plan/codegen">sensai-codegen</a></td><td>Generates kernel text for every dialect, and counts what it costs</td></tr>
 <tr><td>&emsp;<a href="plan/comm">sensai-engine-comm</a></td><td>Moves bytes between ranks over sockets, shared memory or RDMA</td></tr>
 <tr><td>&emsp;<a href="plan/host">sensai-host</a></td><td>Runs kernel bodies on the host, each group in lockstep</td></tr>
-<tr><td>&emsp;<a href="plan/jit">sensai-jit</a></td><td>Kernel bodies compiled for the host with Cranelift when a plan is made</td></tr>
+<tr><td>&emsp;<a href="plan/jit">sensai-jit</a></td><td>Compiles kernel bodies for the host with Cranelift as plans are made</td></tr>
 <tr><td>&emsp;<a href="plan/kernel-macro">sensai-kernel-macro</a></td><td>#[kernel]: a Rust function body as a kernel tree</td></tr>
 <tr><td>&emsp;<a href="plan/lower">sensai-lower</a></td><td>Lowers a graph to a plan of kernel launches</td></tr>
 <tr><td>&emsp;<a href="plan/run">sensai-run</a></td><td>Runs lowered plans on the host, Metal, CUDA or ROCm</td></tr>

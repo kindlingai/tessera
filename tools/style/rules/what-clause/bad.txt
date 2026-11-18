@@ -1,0 +1,7 @@
+What a launch feeds before its picks.
+---
+What the kernel needs: device addresses and the round.
+---
+What one pass over the layers shares.
+---
+What the loaded model serves.

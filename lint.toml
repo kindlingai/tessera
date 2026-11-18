@@ -2,6 +2,8 @@
 
 # Words in one comment block. Adjacent comment lines are one block.
 max_comment_words = 10
+# Words in a crate's `description`. The semicolon rule reads it too.
+max_description_words = 12
 # A `;` in a comment must sit in backticks or a ``` block.
 # This also covers `#` comments in `hash_comment_files`.
 

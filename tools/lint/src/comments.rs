@@ -312,7 +312,7 @@ pub fn hash_comments(text: &str) -> Vec<(usize, &str)> {
     out
 }
 
-const SEMICOLON: &str = "`;` in prose: split the sentence, or quote code in backticks";
+pub const SEMICOLON: &str = "`;` in prose: split the sentence, or quote code in backticks";
 
 pub fn check_hash(src: &Source, out: &mut Vec<Violation>) {
     for (line, body) in hash_comments(&src.text) {

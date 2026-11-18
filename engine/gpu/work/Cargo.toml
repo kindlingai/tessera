@@ -4,4 +4,4 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "What a launch does: ops per trip and the load they make"
+description = "A launch's work: ops per trip and the load they make"

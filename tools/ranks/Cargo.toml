@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Runs one rank of a sharded Qwen3 forward pass, joined to the others over TCP"
+description = "Runs one rank of a sharded Qwen3 forward pass, joined over TCP"
 
 [[bin]]
 name = "tessera-ranks"

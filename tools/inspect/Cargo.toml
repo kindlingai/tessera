@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Draws a model's graph, its lowering per rank, and tokens moving through the ranks"
+description = "Draws a model's graph, its lowering per rank, and tokens between ranks"
 
 [[bin]]
 name = "tessera-inspect"

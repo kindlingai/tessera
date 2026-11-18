@@ -18,8 +18,19 @@ pub fn is_prose_file(path: &str) -> bool {
     PROSE_EXTS.contains(&extension(path))
 }
 
+/// A crate's `description` value, which reads as prose.
+fn description(path: &str, line: &str) -> Option<String> {
+    let value = line.strip_prefix("description")?.trim_start();
+    let value = value.strip_prefix('=')?.trim();
+    path.ends_with("Cargo.toml")
+        .then(|| value.trim_matches('"').to_string())
+}
+
 /// A line's comment and marker. Prose files keep whole lines.
 pub fn comment(path: &str, line: &str) -> Option<String> {
+    if let Some(text) = description(path, line) {
+        return Some(text);
+    }
     let trimmed = line.trim_start();
     if is_prose_file(path) || trimmed.starts_with('*') || trimmed.starts_with("/*") {
         return Some(line.to_string());

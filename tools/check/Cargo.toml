@@ -1,7 +1,7 @@
 [package]
 name = "tessera-check"
 version = "0.1.0"
-description = "Runs the style checks, and prints one report or writes one PR comment"
+description = "Runs the style checks, for the terminal or one PR comment"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

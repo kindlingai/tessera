@@ -35,6 +35,7 @@ use std::process::ExitCode;
 #[derive(serde::Deserialize)]
 pub struct Limits {
     pub max_comment_words: usize,
+    pub max_description_words: usize,
     pub max_name_segments: usize,
     pub max_family_segments: usize,
     pub max_file_lines: usize,

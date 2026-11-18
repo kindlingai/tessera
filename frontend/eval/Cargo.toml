@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Measures a model under a recipe: speed per batch, parity against a reference"
+description = "Measures a recipe's model: batch speed, and parity with a reference"
 
 [[bin]]
 name = "tessera-eval"

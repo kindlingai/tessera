@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The sensai command: open a recipe, then serve, fetch or run a task"
+description = "The sensai command: opens a recipe, then serves, fetches or runs tasks"
 
 [[bin]]
 name = "sensai"
