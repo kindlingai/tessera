@@ -1625,10 +1625,12 @@ dependencies = [
 name = "sensai-cli"
 version = "0.1.0"
 dependencies = [
+ "sensai-bundle",
  "sensai-engine",
  "sensai-frontend-settings",
  "sensai-recipe",
  "sensai-serve",
+ "sensai-tasks",
 ]
 
 [[package]]

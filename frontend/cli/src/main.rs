@@ -1,103 +1,28 @@
-//! `tessera (--recipe <src> | --model <dir>) <verb>`.
+//! `sensai (--recipe <src> | --model <dir>) <verb>`.
 
-use sensai_recipe::Recipe;
-use sensai_serve::start::{FLAGS, Options};
-use std::path::Path;
+mod fetch;
+mod serve;
+mod source;
+mod task;
+
+use sensai_serve::start::FLAGS;
+use source::{Source, Stop, split};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: tessera (--recipe <dir | git+<url>#<commit>> | --model <dir>) <verb>
+const USAGE: &str = "usage: sensai (--recipe <dir | git+<url>#<commit>> | --model <dir>) <verb>
   serve [flags]  load the model and answer OpenAI-shaped requests
-  fetch          download the recipe and its weights, then print where they are";
-
-/// Why a run stops early.
-enum Stop {
-    Usage,
-    Failed(String),
-}
-
-impl From<sensai_recipe::Error> for Stop {
-    fn from(e: sensai_recipe::Error) -> Self {
-        Stop::Failed(e.to_string())
-    }
-}
-
-/// Where the model comes from.
-enum Origin {
-    Recipe(String),
-    Model(String),
-}
-
-/// Takes one serve flag. `Usage` when it is bad.
-fn apply(options: &mut Options, flag: &str, value: Option<String>) -> Result<(), Stop> {
-    match value {
-        None if options.switch(flag) => Ok(()),
-        Some(value) => options.flag(flag, value).ok_or(Stop::Usage),
-        None => Err(Stop::Usage),
-    }
-}
-
-/// Serve options from the recipe, then from the command line.
-fn options(
-    recipe: Option<&Recipe>,
-    cache: Option<&Path>,
-    rest: &[String],
-) -> Result<Options, Stop> {
-    let mut options = Options::default();
-    if let Some(r) = recipe {
-        options.model = r.weights(cache)?;
-        options.name = Some(r.name.clone());
-        options.lower = r.lower.clone();
-        options.names = r.names();
-        if let Some(path) = r.module() {
-            let failed = |e: String| Stop::Failed(format!("{}: {e}", path.display()));
-            let bytes = std::fs::read(&path).map_err(|e| failed(e.to_string()))?;
-            let rules = sensai_engine::wasm::load(&bytes).map_err(|e| failed(e.to_string()))?;
-            options.lower.get_or_insert_default().rules.extend(rules);
-        }
-        for (flag, value) in r.flags() {
-            apply(&mut options, &flag, value)?;
-        }
-    }
-    let mut given = rest.iter().cloned();
-    while let Some(flag) = given.next() {
-        if options.switch(&flag) {
-            continue;
-        }
-        let value = given.next().ok_or(Stop::Usage)?;
-        apply(&mut options, &flag, Some(value))?;
-    }
-    Ok(options)
-}
+  fetch          download the recipe and its weights, then print where they are
+  task <task>    run one task on the model";
 
 fn run(given: &[String]) -> Result<(), Stop> {
-    let (from, verb, rest) = match given {
-        [flag, src, verb, rest @ ..] if flag == "--recipe" => {
-            (Origin::Recipe(src.clone()), verb, rest)
-        }
-        [flag, dir, verb, rest @ ..] if flag == "--model" => {
-            (Origin::Model(dir.clone()), verb, rest)
-        }
-        _ => return Err(Stop::Usage),
+    let (origin, args) = split(given)?;
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(Stop::Usage);
     };
-    let settings = sensai_frontend_settings::read();
-    let cache = settings.recipes.as_deref();
-    let recipe = match &from {
-        Origin::Recipe(src) => Some(Recipe::open(src, cache)?),
-        Origin::Model(_) => None,
-    };
-    match (verb.as_str(), &recipe) {
-        ("fetch", Some(r)) if rest.is_empty() => {
-            println!("recipe {}", r.dir.display());
-            println!("weights {}", r.weights(cache)?.display());
-            Ok(())
-        }
-        ("serve", _) => {
-            let mut options = options(recipe.as_ref(), cache, rest)?;
-            if let Origin::Model(dir) = from {
-                options.model = dir.into();
-            }
-            sensai_serve::start::run(options).map_err(Stop::Failed)
-        }
+    match verb.as_str() {
+        "serve" => serve::run(Source::open(origin)?, rest),
+        "fetch" => fetch::run(Source::open(origin)?, rest),
+        "task" => task::run(origin, rest),
         _ => Err(Stop::Usage),
     }
 }
@@ -110,8 +35,15 @@ fn main() -> ExitCode {
             eprintln!("{USAGE}\nserve flags: {FLAGS}");
             ExitCode::from(2)
         }
+        Err(Stop::Tasks(unknown)) => {
+            if let Some(name) = unknown {
+                eprintln!("sensai: unknown task {name}");
+            }
+            eprintln!("{}", task::LIST);
+            ExitCode::from(2)
+        }
         Err(Stop::Failed(e)) => {
-            eprintln!("tessera: {e}");
+            eprintln!("sensai: {e}");
             ExitCode::FAILURE
         }
     }

@@ -101,16 +101,22 @@ impl Options {
     }
 }
 
+/// Loads the model on a thread. The slot fills after.
+pub fn spawn(options: Options) -> Slot {
+    let slot: Slot = Arc::new(OnceLock::new());
+    let loading = slot.clone();
+    std::thread::spawn(move || load(options, loading));
+    slot
+}
+
 /// Loads the model, then answers requests until killed.
 pub fn run(options: Options) -> Result<(), String> {
-    let slot: Slot = Arc::new(OnceLock::new());
     let (host, port) = (options.host.clone(), options.port);
     let limits = crate::http::Limits {
         max_connections: options.max_connections,
         ..Default::default()
     };
-    let loading = slot.clone();
-    std::thread::spawn(move || load(options, loading));
+    let slot = spawn(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
     crate::http::run(listener, limits, move |request| {
@@ -227,7 +233,7 @@ fn load(options: Options, slot: Slot) {
             .map_err(|e| e.to_string()),
     };
     if let Err(e) = failed {
-        eprintln!("tessera: {e}");
+        eprintln!("sensai: {e}");
         std::process::exit(1);
     }
 }

@@ -1,0 +1,115 @@
+//! `task <name>`: one job on the loaded model.
+
+mod ask;
+mod chat;
+
+use crate::source::{Origin, Source, Stop};
+use sensai_bundle::Message;
+use sensai_serve::start::{self, Options};
+use sensai_serve::{Model, Slot};
+use sensai_tasks::api::{Params, Step};
+use std::io::Write;
+use std::sync::mpsc;
+use std::time::Duration;
+
+pub const LIST: &str = "tasks:
+  ask [--max-tokens <n>] [prompt...]  answer one prompt, from stdin if none
+  chat [--max-tokens <n>]             talk with the model, one line a turn";
+
+pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
+    let Some((name, args)) = rest.split_first() else {
+        return Err(Stop::Tasks(None));
+    };
+    let task = match name.as_str() {
+        "ask" => ask::run,
+        "chat" => chat::run,
+        other => return Err(Stop::Tasks(Some(other.into()))),
+    };
+    let source = Source::open(origin)?;
+    let (max_tokens, args) = flags(args)?;
+    let mut options = source.options(&[])?;
+    options.slots = 1;
+    task(Talk::open(options, max_tokens), args)
+}
+
+/// Takes `--max-tokens <n>` from the front.
+fn flags(args: &[String]) -> Result<(Option<usize>, &[String]), Stop> {
+    match args {
+        [flag, n, rest @ ..] if flag == "--max-tokens" => {
+            let n = n.parse().map_err(|_| Stop::Usage)?;
+            Ok((Some(n), rest))
+        }
+        [dashes, rest @ ..] if dashes == "--" => Ok((None, rest)),
+        [flag, ..] if flag.starts_with("--") => Err(Stop::Usage),
+        _ => Ok((None, args)),
+    }
+}
+
+/// A loaded model that answers to stdout.
+pub struct Talk {
+    slot: Slot,
+    max_tokens: Option<usize>,
+}
+
+impl Talk {
+    /// Loads the model and waits for it.
+    fn open(options: Options, max_tokens: Option<usize>) -> Talk {
+        let slot = start::spawn(options);
+        while slot.get().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Talk { slot, max_tokens }
+    }
+
+    fn model(&self) -> &Model {
+        self.slot.get().expect("the model loaded")
+    }
+
+    /// The messages as one prompt, by the model's template.
+    fn render(&self, messages: &[Message]) -> Result<String, Stop> {
+        let chat = self.model().chat.as_ref();
+        let chat = chat.ok_or_else(|| Stop::Failed("the model has no chat template".into()))?;
+        chat.render(messages, false)
+            .map_err(|e| Stop::Failed(e.to_string()))
+    }
+
+    /// Prints the answer to `prompt` as it comes. Returns it.
+    fn say(&self, prompt: &str) -> Result<String, Stop> {
+        let model = self.model();
+        let failed = |e: String| Stop::Failed(e);
+        let generator = model.generator.as_ref();
+        let generator =
+            generator.ok_or_else(|| failed("the model does not generate text".into()))?;
+        let ids = model
+            .tokens
+            .encode(prompt)
+            .map_err(|e| failed(e.to_string()))?;
+        let room = model.info.context.saturating_sub(ids.len());
+        if ids.is_empty() || room == 0 {
+            return Err(failed("the prompt does not fit the context".into()));
+        }
+        let params = Params {
+            max_tokens: self.max_tokens.map_or(room, |n| n.min(room)),
+            stop: Vec::new(),
+        };
+        let (sink, steps) = mpsc::channel();
+        let send = Box::new(move |step| sink.send(step).is_ok());
+        generator
+            .generate(ids, params, send)
+            .map_err(|e| failed(e.to_string()))?;
+        let (mut answer, mut out) = (String::new(), std::io::stdout());
+        while let Ok(step) = steps.recv() {
+            let (text, done) = match step {
+                Step::Token { text, .. } => (text, false),
+                Step::Done { text, .. } => (text, true),
+            };
+            answer += &text;
+            let _ = write!(out, "{text}");
+            let _ = out.flush();
+            if done {
+                return Ok(answer);
+            }
+        }
+        Err(failed("the engine stopped".into()))
+    }
+}

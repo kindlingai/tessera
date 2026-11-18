@@ -41,9 +41,13 @@ pub fn manifest(meta: &Meta, out: &Out, owners: &Owners, rel: &Release) -> Resul
     doc.insert("package".into(), package.into());
     let mut target = Table::new();
     if out.kind == Kind::Bin {
-        target.insert("name".into(), out.name.clone().into());
-        target.insert("path".into(), "src/main.rs".into());
-        doc.insert("bin".into(), Value::Array(vec![target.into()]));
+        let bins = [crate::plan::CLI_ALIAS, out.name.as_str()].map(|name| {
+            let mut target = Table::new();
+            target.insert("name".into(), name.into());
+            target.insert("path".into(), "src/main.rs".into());
+            Value::from(target)
+        });
+        doc.insert("bin".into(), Value::Array(bins.into()));
     } else {
         target.insert("path".into(), "src/lib.rs".into());
         target.insert("proc-macro".into(), (out.kind == Kind::Macro).into());

@@ -70,7 +70,8 @@ pub fn npm(out: &Out, rel: &Release, launcher: &Path, base: &Path) -> Result<()>
         optional.insert(pkg, rel.version.clone().into());
     }
     let mut doc = common(name, out, rel);
-    doc["bin"] = json!({ name.as_str(): format!("bin/{name}.js") });
+    let launcher_bin = format!("bin/{name}.js");
+    doc["bin"] = json!({ name.as_str(): launcher_bin, crate::plan::CLI_ALIAS: launcher_bin });
     doc["files"] = json!(["bin/"]);
     doc["optionalDependencies"] = optional.into();
     let dir = base.join(name);
