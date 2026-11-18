@@ -180,6 +180,10 @@ pub(crate) fn ways(drafts: Vec<Draft>) -> Vec<Vec<Draft>> {
 /// Drafts for a tree node, covering nodes above their reads.
 pub trait Propose: Send + Sync {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>>;
+    /// Whether it covers whole regions. Readers stop at their outputs.
+    fn regions(&self) -> bool {
+        false
+    }
 }
 
 /// The form `rule!` registers.

@@ -2,13 +2,14 @@
 
 mod abi;
 mod guest;
+mod site;
 mod text;
 
 use abi::{ABI, Ask, Kind, Manifest, Offer, Site};
 use guest::Guest;
-use sensai_lower::{Draft, Propose, Read, Rule, T, Tree, sites};
+use sensai_lower::{Draft, Propose, Rule, T, Tree};
 use std::sync::Arc;
-use text::{Fixed, Text};
+use text::Fixed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,41 +47,22 @@ impl Asking {
         let output = self.guest.call("propose", Some(&input))?;
         Ok(serde_json::from_slice(&output)?)
     }
-
-    /// Drafts for the offers. `None` on unknown names.
-    fn drafts(&self, offers: Vec<Offer>, reads: &[Read]) -> Option<Vec<Draft>> {
-        let mut drafts = Vec::with_capacity(offers.len());
-        for offer in offers {
-            let fixed = self.kernels.iter().find(|k| k.name == offer.kernel)?;
-            let mut taken = Vec::with_capacity(offer.reads.len());
-            for i in &offer.reads {
-                taken.push(*reads.get(*i)?);
-            }
-            drafts.push(Draft::new(Text::new(fixed, &offer), taken, offer.len));
-        }
-        Some(drafts)
-    }
 }
 
 impl Propose for Asking {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
-        let m: sites::Matmul = tree.site(at)?;
-        if self.kind != Kind::Matmul || m.picked.is_some() {
-            return None;
-        }
-        let site = Site::Matmul {
-            m: m.m,
-            n: m.n,
-            k: m.k,
-            form: m.form.name(),
-        };
+        let (site, nodes) = site::find(tree, at, self.kind)?;
         match self.ask(site) {
-            Ok(offers) => self.drafts(offers?, &m.reads()),
+            Ok(offers) => site::drafts(offers?, self.kernels, tree, &nodes),
             Err(e) => {
                 eprintln!("wasm rule {}: {e}", self.rule);
                 None
             }
         }
+    }
+
+    fn regions(&self) -> bool {
+        self.kind != Kind::Matmul
     }
 }
 

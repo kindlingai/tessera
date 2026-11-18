@@ -11,7 +11,7 @@ use crate::error::Uncovered;
 use crate::form::{self, Load};
 use crate::kernel::KernelRef;
 use crate::plan::Share;
-use crate::rule::{Read, linked};
+use crate::rule::{Read, Rule, linked};
 use crate::tree::{T, Term, Tree};
 use crate::{Error, Unsupported};
 use sensai_graph::{DimName, Graph, NodeId, View};
@@ -112,7 +112,7 @@ pub(crate) fn select_upto(
     let rules = device.rules();
     linked(&rules)?;
     let (parts, rank) = (device.division(), device.rank);
-    let tree = Tree::upto(
+    let mut tree = Tree::upto(
         g,
         entry,
         sizes,
@@ -122,6 +122,12 @@ pub(crate) fn select_upto(
         &parts,
         rank,
     )?;
+    let whole: Vec<&Rule> = rules
+        .iter()
+        .copied()
+        .filter(|r| r.propose.regions())
+        .collect();
+    tree.end_regions(&whole);
     let nodes = (0..tree.len() as u32).map(T);
     let mut cover = Cover {
         tree: &tree,
@@ -139,7 +145,12 @@ pub(crate) fn select_upto(
     }
     // Roots get buffers. So does whatever a chosen cover reads.
     let mut own: Vec<Option<u32>> = vec![None; tree.len()];
+    // A chosen cover computes the roots inside it.
+    let mut absorbed = vec![false; tree.len()];
     for t in nodes.clone().rev().filter(|t| !tree.leaf(*t)) {
+        if absorbed[t.0 as usize] {
+            continue;
+        }
         let zone = match (tree.root(t), own[t.0 as usize]) {
             (true, _) => cover.settle(t),
             (false, placed) => placed,
@@ -151,6 +162,9 @@ pub(crate) fn select_upto(
             continue;
         };
         own[t.0 as usize] = Some(zone);
+        for r in cover.absorbed(t, zone) {
+            absorbed[r.0 as usize] = true;
+        }
         for (r, z) in cover.below(t, zone) {
             match tree.root(r) {
                 true => cover.wanted[r.0 as usize].push(zone),

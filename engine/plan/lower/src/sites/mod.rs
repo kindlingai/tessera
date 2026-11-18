@@ -4,6 +4,7 @@ mod attend;
 mod chain;
 mod gather;
 mod matmul;
+mod region;
 mod stage;
 mod top;
 
@@ -11,6 +12,7 @@ pub use attend::Attend;
 pub use chain::Chain;
 pub use gather::Gather;
 pub use matmul::{After, Finished, Matmul, Picked};
+pub use region::Region;
 pub use stage::Stage;
 pub use top::Top;
 

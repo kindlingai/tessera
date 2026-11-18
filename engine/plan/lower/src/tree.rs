@@ -4,6 +4,7 @@ use crate::extent::Extent;
 use crate::form::{Load, Pins};
 use crate::kernels::MapStage;
 use crate::plan::Share;
+use crate::rule::Rule;
 use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
@@ -58,6 +59,10 @@ pub struct Tree<'a> {
     pub(crate) rank: u32,
     /// Per node: the part of a split weight loaded here.
     shares: Vec<Option<Share>>,
+    /// Per graph node: the tree node holding its value.
+    at: Vec<Option<T>>,
+    /// Per node: a region output a region rule claims.
+    ends: Vec<bool>,
 }
 
 pub(crate) fn map_stage(s: &Stage) -> Option<MapStage> {
@@ -171,6 +176,8 @@ impl<'a> Tree<'a> {
             parts: parts.clone(),
             rank,
             shares: Vec::new(),
+            at: Vec::new(),
+            ends: Vec::new(),
         };
         let ranks = parts.ranks();
         for port in &e.inputs {
@@ -283,6 +290,8 @@ impl<'a> Tree<'a> {
                 op => push(Term::Op(op.clone()), args),
             });
         }
+        tree.at = at;
+        tree.ends = vec![false; tree.nodes.len()];
         tree.readers = vec![0; tree.nodes.len()];
         for n in &tree.nodes {
             for a in &n.args {
@@ -290,7 +299,7 @@ impl<'a> Tree<'a> {
             }
         }
         for o in outputs {
-            let t = at[o].expect("outputs are needed");
+            let t = tree.at[o].expect("outputs are needed");
             tree.readers[t.0 as usize] += 1;
             let shape = sized(g, sizes, upto, &g.nodes[o].ty.shape)?;
             tree.outputs
@@ -413,7 +422,8 @@ impl<'a> Tree<'a> {
     /// Whether the value must have a buffer of its own.
     pub fn root(&self, t: T) -> bool {
         let kept = matches!(self.node(t).term, Term::Leaf(_) | Term::Op(Op::Append(_)));
-        kept || self.readers[t.0 as usize] != 1 || self.output(t)
+        let end = self.ends[t.0 as usize];
+        kept || end || self.readers[t.0 as usize] != 1 || self.output(t)
     }
 
     /// The pattern `P` at `t`, if the node shows it.
@@ -425,6 +435,47 @@ impl<'a> Tree<'a> {
     pub(crate) fn joins(&self, t: T) -> bool {
         let map = matches!(&self.node(t).term, Term::Stage(s) if map_stage(s).is_some());
         map && !self.root(t)
+    }
+
+    /// Region outputs a rule in `rules` covers become roots.
+    pub(crate) fn end_regions(&mut self, rules: &[&Rule]) {
+        let outputs = self.g.regions.iter().filter_map(|r| match r.outputs[..] {
+            [o] => self.of(o),
+            _ => None,
+        });
+        let outputs: Vec<T> = outputs.collect();
+        for t in outputs {
+            let claimed = rules.iter().any(|r| r.propose.at(self, t).is_some());
+            self.ends[t.0 as usize] = claimed;
+        }
+    }
+
+    /// The tree node holding graph node `id`'s value.
+    pub fn of(&self, id: NodeId) -> Option<T> {
+        self.at.get(id.0 as usize).copied().flatten()
+    }
+
+    /// A dimension's size in this view.
+    pub fn size(&self, name: DimName) -> Option<u64> {
+        self.sizes.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+    }
+
+    /// Roots inside a cover at `t`. `None` if one leaks.
+    pub(crate) fn absorbs(&self, t: T, reads: &[T]) -> Option<Vec<T>> {
+        let inside = self.inside(t, reads);
+        let roots: Vec<T> = inside
+            .iter()
+            .copied()
+            .filter(|n| *n != t && self.root(*n))
+            .collect();
+        for &r in &roots {
+            let args = inside.iter().flat_map(|n| &self.node(*n).args);
+            let seen = args.filter(|a| **a == r).count();
+            if seen != self.readers[r.0 as usize] as usize {
+                return None;
+            }
+        }
+        Some(roots)
     }
 
     /// Tree nodes a cover at `t` computes, given its reads.

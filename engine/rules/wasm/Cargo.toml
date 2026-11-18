@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Lowering rules a sandboxed wasm module proposes, over JSON"
 
 [dependencies]
+sensai-graph = { workspace = true }
 sensai-lower = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,7 +15,6 @@ thiserror = "2"
 wasmi = "0.51"
 
 [dev-dependencies]
-sensai-graph = { workspace = true }
 sensai-interp = { workspace = true }
 sensai-kernels = { workspace = true }
 sensai-linear = { workspace = true }

@@ -166,6 +166,13 @@ impl Cover<'_> {
                     continue;
                 };
                 cost += below;
+                // Roots a cover absorbs no longer cost their own.
+                let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts)) else {
+                    continue;
+                };
+                for r in absorbed {
+                    cost -= self.solve(r, zone).unwrap_or(f64::INFINITY);
+                }
                 // A favored rule wins here. Readers see its true cost.
                 let favored = self.device.favors(rule.name);
                 let beaten = |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {
@@ -240,6 +247,16 @@ impl Cover<'_> {
             }
         }
         false
+    }
+
+    /// Roots the chosen cover of `t` in `zone` computes.
+    pub(crate) fn absorbed(&self, t: T, zone: u32) -> Vec<T> {
+        match &self.best[t.0 as usize][zone as usize] {
+            Some(Some(c)) if !c.drafts.is_empty() => {
+                self.tree.absorbs(t, &reads(&c.drafts)).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The reads of `t`'s cover in `zone`, each placed.

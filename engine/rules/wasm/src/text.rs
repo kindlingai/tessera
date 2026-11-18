@@ -1,7 +1,7 @@
 //! A module's kernel text, launched with plain arguments.
 
 use crate::abi::{Offer, Shape};
-use sensai_lower::{Kernel, Launch, Source, Step};
+use sensai_lower::{Arg, Kernel, Launch, Source, Step};
 use std::fmt;
 
 /// A module kernel's text, never freed.
@@ -13,18 +13,18 @@ pub struct Fixed {
     pub cuda: &'static str,
 }
 
-/// One launch of a module kernel: reads, output, then `counts`.
+/// One launch of a module kernel: reads, output, then `args`.
 #[derive(Clone)]
 pub struct Text {
     pub fixed: &'static Fixed,
-    pub counts: Vec<u32>,
+    pub args: Vec<Arg>,
     pub shape: sensai_lower::Shape,
     pub work: f64,
     pub guess: f64,
 }
 
 impl Text {
-    pub fn new(fixed: &'static Fixed, offer: &Offer) -> Self {
+    pub fn new(fixed: &'static Fixed, offer: &Offer, args: Vec<Arg>) -> Self {
         let shape = match offer.shape {
             Shape::Line(n) => sensai_lower::Shape::Line(n),
             Shape::Grid {
@@ -39,7 +39,7 @@ impl Text {
         };
         Self {
             fixed,
-            counts: offer.counts.clone(),
+            args,
             shape,
             work: offer.work,
             guess: offer.guess,
@@ -51,7 +51,7 @@ impl Text {
 impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Fixed { name, .. } = self.fixed;
-        write!(f, "{name}{:?}{:?}", self.counts, self.shape)
+        write!(f, "{name}{:?}{:?}", self.args, self.shape)
     }
 }
 
@@ -68,8 +68,13 @@ impl Kernel for Text {
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
-        let counts: Vec<usize> = self.counts.iter().map(|c| *c as usize).collect();
-        vec![Launch::plain(step, &counts, self.shape)]
+        let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
+        args.push(step.out());
+        args.extend(self.args.iter().cloned());
+        vec![Launch {
+            args,
+            shape: self.shape,
+        }]
     }
 
     fn work(&self, _: usize) -> f64 {
@@ -77,7 +82,11 @@ impl Kernel for Text {
     }
 
     fn sizes(&self) -> Vec<usize> {
-        self.counts.iter().map(|c| *c as usize).collect()
+        let size = |a: &Arg| match a {
+            Arg::Size(e) => Some(e.most()),
+            other => other.u32().map(|n| n as usize),
+        };
+        self.args.iter().filter_map(size).collect()
     }
 
     fn guess(&self) -> f64 {
