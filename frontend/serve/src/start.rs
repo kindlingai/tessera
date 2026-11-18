@@ -13,7 +13,7 @@ use std::time::Instant;
 
 /// The flags `Options::flag` and `Options::switch` take.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--served-model-name <name>] [--task generate|embed|paint|klein] [--image-size <px>] \
+[--served-model-name <name>] [--task generate|embed|paint|klein] [--image-size <px>] [--clip <dir>] \
 [--max-connections <n>] [--reject-unknown-fields] [--guided]";
 
 /// What the loaded model serves.
@@ -21,7 +21,7 @@ pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>]
 enum Task {
     Generate,
     Embed,
-    /// Pictures. The model directory holds the weights and `clip/`.
+    /// Pictures. CLIP is `--clip`, else the model's `clip/`.
     Paint,
     /// FLUX.2 klein pictures. The model is the diffusers repository.
     Klein,
@@ -50,6 +50,8 @@ pub struct Options {
     pub max_connections: usize,
     /// The largest picture klein paints, in pixels a side.
     pub image_size: usize,
+    /// The CLIP text tower for `paint`. `None` takes `model/clip`.
+    pub clip: Option<PathBuf>,
     /// Lowering choices. Empty pins take the model's own.
     pub lower: Option<Recipe>,
     /// Weight-name rules, ahead of `TESSERA_NAMES`.
@@ -70,6 +72,7 @@ impl Default for Options {
             guided: false,
             max_connections: 64,
             image_size: 512,
+            clip: None,
             lower: None,
             names: None,
         }
@@ -101,6 +104,7 @@ impl Options {
             "--task" if value == "paint" => self.task = Task::Paint,
             "--task" if value == "klein" => self.task = Task::Klein,
             "--image-size" => self.image_size = value.parse().ok()?,
+            "--clip" => self.clip = Some(value.into()),
             _ => return None,
         }
         Some(())
@@ -240,9 +244,11 @@ fn load(options: Options, slot: Slot) {
                 set(info, e.clone(), Some(e as Arc<dyn Embed>), None);
             })
             .map_err(|e| e.to_string()),
-        Task::Paint => Worker::<Painter>::open(options.model, settings, options.slots)
-            .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
-            .map_err(|e| e.to_string()),
+        Task::Paint => {
+            Worker::<Painter>::open(options.model, options.clip, settings, options.slots)
+                .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
+                .map_err(|e| e.to_string())
+        }
         Task::Klein => Worker::<Klein>::open(options.model, settings, options.image_size)
             .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
             .map_err(|e| e.to_string()),

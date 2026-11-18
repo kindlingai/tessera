@@ -1614,6 +1614,7 @@ name = "sensai-checkpoint"
 version = "0.1.0"
 dependencies = [
  "sensai-engine",
+ "sensai-frontend-settings",
  "sensai-testkit",
  "serde",
  "serde_json",

@@ -79,9 +79,15 @@ struct Canvas {
 }
 
 impl Painter {
-    /// `dir/sprite.safetensors`, with CLIP in `dir/clip`.
-    pub fn open(dir: &Path, settings: &Settings, most: usize) -> Result<Self, Error> {
-        let c = text_tower(&dir.join("clip"), 1, TEXT as u64)?;
+    /// `dir/sprite.safetensors`, CLIP in `clip` or `dir/clip`.
+    pub fn open(
+        dir: &Path,
+        clip: Option<&Path>,
+        settings: &Settings,
+        most: usize,
+    ) -> Result<Self, Error> {
+        let clip_dir = clip.map_or_else(|| dir.join("clip"), Path::to_path_buf);
+        let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
         let d = denoiser(&dir.join("sprite.safetensors"), 2 * most as u64)?;
@@ -211,9 +217,14 @@ impl Painter {
 
 impl Worker<Painter> {
     /// Opens the painter in `dir` on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings, most: usize) -> Result<Self, Error> {
+    pub fn open(
+        dir: PathBuf,
+        clip: Option<PathBuf>,
+        settings: Settings,
+        most: usize,
+    ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let painter = Painter::open(&dir, &settings, most)?;
+            let painter = Painter::open(&dir, clip.as_deref(), &settings, most)?;
             eprintln!("{}: painter loaded", painter.device());
             Ok(painter)
         })

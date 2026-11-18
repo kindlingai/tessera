@@ -1,10 +1,10 @@
-//! The sprite denoiser and its CLIP text tower, from safetensors.
+//! The sprite denoiser and its CLIP text tower.
 
 use crate::tokenize::hf::Hf;
-use sensai_checkpoint::File;
+use sensai_checkpoint::{File, Offer, Torch};
 use sensai_engine::{Graph, PathSeg, Tensor, Weight, bind, clip, sprite};
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -32,13 +32,13 @@ fn dotted(path: &[PathSeg]) -> String {
 /// Weights by name, each cut to its first `len(name)` values.
 fn weights(
     graph: &Graph,
-    file: &File,
+    get: impl Fn(&str) -> Option<Vec<f32>>,
     name: impl Fn(&[PathSeg]) -> String,
     len: impl Fn(&str) -> Option<usize>,
 ) -> Result<Vec<Weight>> {
     let find = |p: &[PathSeg]| {
         let name = name(p);
-        let mut v = file.floats(&name).ok()?;
+        let mut v = get(&name)?;
         if let Some(n) = len(&name) {
             v.truncate(n);
         }
@@ -52,10 +52,8 @@ pub fn denoiser(path: &Path, seqs: u64) -> Result<Sprite> {
     let config = sprite::Config::small(seqs);
     let graph = sprite::program(&config);
     let file = File::open(path)?;
-    let weights = weights(&graph, &file, dotted, |_| None)?;
-    let rgb = file.floats("palette")?;
-    let palette = rgb
-        .chunks(3)
+    let weights = weights(&graph, |n| file.floats(n).ok(), dotted, |_| None)?;
+    let palette = (file.floats("palette")?.chunks(3))
         .map(|c| [c[0] as u8, c[1] as u8, c[2] as u8])
         .collect();
     Ok(Sprite {
@@ -63,6 +61,12 @@ pub fn denoiser(path: &Path, seqs: u64) -> Result<Sprite> {
         weights,
         palette,
     })
+}
+
+/// CLIP's weight file in `dir`, safetensors first.
+fn clip_weights(dir: &Path) -> Option<PathBuf> {
+    let found = ["model.safetensors", "pytorch_model.bin"].map(|n| dir.join(n));
+    found.into_iter().find(|p| p.is_file())
 }
 
 /// A Hugging Face name for a CLIP text weight path.
@@ -99,10 +103,14 @@ fn hf_name(path: &[PathSeg]) -> String {
 pub fn text_tower(dir: &Path, seqs: u64, context: u64) -> Result<Clip> {
     let config = clip::Config::base(seqs, context);
     let graph = clip::program(&config);
-    let file = File::open(&dir.join("model.safetensors"))?;
+    let path = clip_weights(dir).ok_or_else(|| format!("no CLIP weights in {}", dir.display()))?;
+    let file: Box<dyn Offer> = match path.extension().is_some_and(|x| x == "bin") {
+        true => Box::new(Torch::open(&path)?),
+        false => Box::new(File::open(&path)?),
+    };
     let table = (context * config.stack.hidden) as usize;
     let len = |name: &str| name.ends_with("position_embedding.weight").then_some(table);
-    let weights = weights(&graph, &file, hf_name, len)?;
+    let weights = weights(&graph, |n| file.floats(n).ok(), hf_name, len)?;
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     Ok(Clip {
         graph,
