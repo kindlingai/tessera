@@ -313,6 +313,8 @@ pub(crate) fn stage(
             }
         }
         (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
+        (Stage::Sin, _) => out.iter_mut().for_each(|v| *v = v.sin()),
+        (Stage::Cos, _) => out.iter_mut().for_each(|v| *v = v.cos()),
         (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
         // One rank holds the whole sum already.
         (Stage::AllReduce, _) => {}

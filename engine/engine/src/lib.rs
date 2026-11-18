@@ -22,7 +22,7 @@ pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 pub use sensai_engine_comm as comm;
 pub use sensai_engine_settings::{Backend, Memory};
 pub use sensai_graph::{Bf16, DimExpr, E4M3, F16, Graph, PathSeg, Shape};
-pub use sensai_interp::{Tensor, bind};
+pub use sensai_interp::{Tensor, bind, fold};
 pub use sensai_lower::{Pick, Pins, Recipe, Settings, Weight, form};
 pub use sensai_mem::form as storage;
 pub use sensai_mem::{block, trellis};

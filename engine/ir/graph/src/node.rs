@@ -173,6 +173,10 @@ pub enum Stage {
         pairs: Pairs,
     },
     Act(Act),
+    /// Interpreter only: fold it away before lowering.
+    Sin,
+    /// Interpreter only: fold it away before lowering.
+    Cos,
     Softmax,
     AllReduce,
     /// Entries past the position in the argument become -inf.

@@ -80,6 +80,16 @@ impl Tensor {
         self.stage(Stage::Hadamard { block }, &[])
     }
 
+    /// Sine of each element. Only weight-only values may take it.
+    pub fn sin(&self) -> Tensor {
+        self.stage(Stage::Sin, &[])
+    }
+
+    /// Cosine of each element. Only weight-only values may take it.
+    pub fn cos(&self) -> Tensor {
+        self.stage(Stage::Cos, &[])
+    }
+
     pub fn center(&self) -> Tensor {
         self.stage(Stage::Center, &[])
     }

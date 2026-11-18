@@ -435,6 +435,11 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 allowed(dims, x, bits)?;
                 whole(p, last, s)?;
             }
+            (Stage::Sin | Stage::Cos, _) => {
+                need(p == Placement::Replicated, ErrorKind::Placement, || {
+                    format!("{s:?} is nonlinear, so it cannot read {p:?} values")
+                })?;
+            }
             (Stage::Act(a), _) => {
                 // Routed zeros stay zero only where the activation keeps zero.
                 let keeps_zero = *a != Act::Sigmoid;
