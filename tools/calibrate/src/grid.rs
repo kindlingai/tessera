@@ -3,7 +3,8 @@
 use crate::{choices, measure};
 use sensai_engine::Error;
 use sensai_graph::DimName::{self, *};
-use sensai_lower::{Device, Settings, Step, Tensor, View, lower};
+use sensai_lower::form::BF16_FORM;
+use sensai_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use sensai_run::{Run, open};
 use sensai_testkit::Noise;
 use sensai_testkit::graphs::{
@@ -33,6 +34,8 @@ pub struct Grid {
 struct Case {
     g: Graph,
     sizes: Vec<Sizes>,
+    /// Weight forms, as a checkpoint would pin them.
+    pins: Pins,
 }
 
 /// Every name bounded far past any size the grid uses.
@@ -65,8 +68,10 @@ impl Case {
     ) -> Result<Vec<(Step, f64)>, Error> {
         let mut runner: Option<Box<dyn Run>> = None;
         let mut added = Vec::new();
+        let given = std::mem::replace(&mut device.pins, self.pins.clone());
+        let guess = Device::guess(settings).pinned(self.pins.clone());
         for sizes in &self.sizes {
-            let plan = lower(&self.g, 0, sizes, &Device::guess(settings))?;
+            let plan = lower(&self.g, 0, sizes, &guess)?;
             if plan.buffers.iter().sum::<usize>() > ROOM {
                 continue;
             }
@@ -88,6 +93,7 @@ impl Case {
                 settings,
             )?);
         }
+        device.pins = given;
         Ok(added)
     }
 }
@@ -149,15 +155,19 @@ impl Grid {
     }
 
     fn cases(&self) -> Vec<Case> {
-        let by_rows = |g: Graph| {
+        let pinned = |g: Graph, pins: Pins| {
             let sizes = self.rows.iter().map(|r| vec![(Rows, *r)]).collect();
-            Case { g, sizes }
+            Case { g, sizes, pins }
         };
+        let by_rows = |g: Graph| pinned(g, Pins::default());
         let (one, three) = (bounded(&[Rows]), bounded(&[Seqs, Rows, Context]));
         let mut cases = Vec::new();
         for &k in &self.widths {
-            let outs = self.widths.iter().chain(&self.vocabs);
-            cases.extend(outs.map(|n| by_rows(linear(&one, k, *n))));
+            // Checkpoints mostly store bf16 weights.
+            for &n in self.widths.iter().chain(&self.vocabs) {
+                cases.push(by_rows(linear(&one, k, n)));
+                cases.push(pinned(linear(&one, k, n), Pins::all(BF16_FORM)));
+            }
         }
         cases.push(by_rows(rotation(&one)));
         cases.push(by_rows(turned(&one)));
@@ -177,12 +187,14 @@ impl Grid {
                 |[queries, keys]: &[u64; 2]| vec![(Seqs, 1), (Rows, *queries), (Context, *keys)];
             let sizes = self.spans.iter().map(span).collect();
             let g = attention(&three, heads);
-            cases.push(Case { g, sizes });
+            let pins = Pins::default();
+            cases.push(Case { g, sizes, pins });
             // Picked keys: queries and keys alike, two kept.
             let span = |[_, keys]: &[u64; 2]| vec![(Seqs, 1), (Context, *keys)];
             let sizes = self.spans.iter().map(span).collect();
             let g = indexed(&three, [heads[0], heads[2], 2]);
-            cases.push(Case { g, sizes });
+            let pins = Pins::default();
+            cases.push(Case { g, sizes, pins });
         }
         cases
     }
@@ -191,8 +203,9 @@ impl Grid {
     pub fn plans(&self, guess: &dyn Fn() -> Device) -> Result<Vec<sensai_lower::Plan>, Error> {
         let mut plans = Vec::new();
         for case in self.cases() {
+            let guess = || guess().pinned(case.pins.clone());
             for sizes in &case.sizes {
-                for choice in choices((&case.g, 0), sizes, guess)? {
+                for choice in choices((&case.g, 0), sizes, &guess)? {
                     plans.push(lower(&case.g, 0, sizes, &choice)?);
                 }
             }
