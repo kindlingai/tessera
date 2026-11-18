@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use toml::{Table, Value};
 
 use crate::Result;
+use crate::dist::Release;
 use crate::meta::{Dep, Meta};
 use crate::plan::{Kind, Out};
 
@@ -21,7 +22,8 @@ struct Want {
     optional: bool,
 }
 
-pub fn manifest(meta: &Meta, out: &Out, owners: &Owners, version: &str) -> Result<Table> {
+pub fn manifest(meta: &Meta, out: &Out, owners: &Owners, rel: &Release) -> Result<Table> {
+    let version = rel.version.as_str();
     let first = &meta.packages[out.members[0].pkg];
     let mut package = Table::new();
     package.insert("name".into(), out.name.clone().into());
@@ -32,6 +34,9 @@ pub fn manifest(meta: &Meta, out: &Out, owners: &Owners, version: &str) -> Resul
         first.license.clone().unwrap_or_default().into(),
     );
     package.insert("description".into(), out.description.clone().into());
+    if let Some(repo) = &rel.repository {
+        package.insert("repository".into(), repo.clone().into());
+    }
     let mut doc = Table::new();
     doc.insert("package".into(), package.into());
     let mut target = Table::new();

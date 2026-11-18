@@ -8,6 +8,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::Result;
+use crate::dist::{Release, pyproject};
 use crate::manifest::{Owners, manifest};
 use crate::meta::Meta;
 use crate::plan::{Kind, Member, Out};
@@ -16,7 +17,7 @@ use crate::rewrite::{Moves, exports, rewrite};
 /// Directories a published crate leaves out.
 const SKIP: [&str; 4] = ["tests", "benches", "examples", "target"];
 
-pub fn emit(meta: &Meta, out: &Out, owners: &Owners, version: &str, base: &Path) -> Result<()> {
+pub fn emit(meta: &Meta, out: &Out, owners: &Owners, rel: &Release, base: &Path) -> Result<()> {
     let dir = base.join(&out.name);
     let mut mods = Vec::new();
     for m in &out.members {
@@ -44,7 +45,10 @@ pub fn emit(meta: &Meta, out: &Out, owners: &Owners, version: &str, base: &Path)
     if !mods.is_empty() {
         write_root(out, &mods, &dir.join("src/lib.rs"))?;
     }
-    let doc = manifest(meta, out, owners, version)?;
+    if out.kind == Kind::Bin {
+        pyproject(out, rel, &dir)?;
+    }
+    let doc = manifest(meta, out, owners, rel)?;
     fs::write(dir.join("Cargo.toml"), toml::to_string(&doc)?)?;
     Ok(())
 }

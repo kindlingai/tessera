@@ -1,5 +1,6 @@
 //! Writes the merged crates.io crates to `target/publish` or `[dir]`.
 
+mod dist;
 mod emit;
 mod manifest;
 mod meta;
@@ -11,7 +12,7 @@ mod tokens;
 mod rewrite_test;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use toml::{Table, Value};
@@ -30,16 +31,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let meta = meta::load(&std::env::current_dir()?)?;
-    let base = std::env::args()
-        .nth(1)
-        .map_or_else(|| meta.workspace_root.join("target/publish"), PathBuf::from);
+    let (version, dir) = args()?;
+    let base = dir.unwrap_or_else(|| meta.workspace_root.join("target/publish"));
     let outs = plan::plan(&meta)?;
     let engine = meta
         .packages
         .iter()
         .find(|p| p.name == plan::ENGINE)
         .ok_or("no engine")?;
-    let version = engine.version.clone();
+    let rel = dist::Release {
+        version: version.unwrap_or_else(|| engine.version.clone()),
+        repository: repository(&meta.workspace_root)?,
+    };
     let mut owners = manifest::Owners::new();
     for o in &outs {
         for m in &o.members {
@@ -50,8 +53,11 @@ fn run() -> Result<()> {
         fs::remove_dir_all(&base)?;
     }
     for o in &outs {
-        emit::emit(&meta, o, &owners, &version, &base)?;
+        emit::emit(&meta, o, &owners, &rel, &base)?;
     }
+    let cli = outs.iter().find(|o| o.name == plan::CLI).ok_or("no cli")?;
+    let launcher = meta.workspace_root.join("tools/publish/npm/sensaix.js");
+    dist::npm(cli, &rel, &launcher, &base.join("npm"))?;
     let mut workspace = Table::new();
     workspace.insert("resolver".into(), "3".into());
     let members = outs.iter().map(|o| Value::from(o.name.clone())).collect();
@@ -69,4 +75,30 @@ fn run() -> Result<()> {
         base.display()
     );
     Ok(())
+}
+
+/// `[--version <v>] [dir]`
+fn args() -> Result<(Option<String>, Option<PathBuf>)> {
+    let mut version = None;
+    let mut dir = None;
+    let mut given = std::env::args().skip(1);
+    while let Some(a) = given.next() {
+        match a.as_str() {
+            "--version" => version = Some(given.next().ok_or("--version needs a value")?),
+            _ if dir.is_none() => dir = Some(PathBuf::from(a)),
+            _ => return Err(format!("unexpected argument {a}").into()),
+        }
+    }
+    Ok((version, dir))
+}
+
+/// The workspace's `repository`, if it names one.
+fn repository(root: &Path) -> Result<Option<String>> {
+    let doc: Table = toml::from_str(&fs::read_to_string(root.join("Cargo.toml"))?)?;
+    let repo = doc
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("repository"))
+        .and_then(Value::as_str);
+    Ok(repo.map(String::from))
 }

@@ -26,6 +26,7 @@ members = [
 edition = "2024"
 license = "MIT"
 publish = false
+repository = "https://github.com/kindlingai/tessera"
 
 # Every crate here, so members name each other without paths.
 [workspace.dependencies]

@@ -1,0 +1,157 @@
+name: release
+
+# A `v*` tag builds the binary, then publishes crates, npm and PyPI.
+# A manual run builds and dry-runs unless `publish` is set.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, without the v
+        required: true
+      publish:
+        description: Publish for real
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - id: v
+        env:
+          INPUT: ${{ inputs.version }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          v="${INPUT:-${GITHUB_REF_NAME#v}}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::not a version: $v"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+  build:
+    # Each wheel holds the binary. npm takes it from the wheel.
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, npm: linux-x64, features: "cuda,rocm" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, npm: linux-arm64, features: "cuda,rocm" }
+          - { os: macos-14, target: aarch64-apple-darwin, npm: darwin-arm64, features: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - run: cargo run -q -p tessera-publish -- --version "$VERSION"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: target/publish/sensaix
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          rust-toolchain: 1.99.1
+          args: --release --out dist ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+      - name: Take the binary out of the wheel
+        run: |
+          mkdir -p bin
+          unzip -j -o target/publish/sensaix/dist/*.whl '*.data/scripts/sensaix' -d bin
+          chmod +x bin/sensaix
+          ./bin/sensaix 2>&1 | grep -q usage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.npm }}
+          path: target/publish/sensaix/dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.npm }}
+          path: bin/sensaix
+
+  crates:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - run: cargo run -q -p tessera-publish -- --version "$VERSION"
+      - name: Publish the merged crates, macros first
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          flags=(--manifest-path target/publish/Cargo.toml --workspace --allow-dirty)
+          if [ "$PUBLISH" = true ]; then
+            cargo publish "${flags[@]}"
+          else
+            cargo publish "${flags[@]}" --dry-run
+          fi
+
+  npm:
+    needs: [version, crates]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: cargo run -q -p tessera-publish -- --version "$VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+      - name: Publish the platform packages, then the launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          dry=()
+          [ "$PUBLISH" = true ] || dry=(--dry-run)
+          for p in linux-x64 linux-arm64 darwin-arm64; do
+            dir="target/publish/npm/sensaix-$p"
+            install -D -m 755 "bins/bin-$p/sensaix" "$dir/bin/sensaix"
+            (cd "$dir" && npm publish --access public --provenance "${dry[@]}")
+          done
+          (cd target/publish/npm/sensaix && npm publish --access public --provenance "${dry[@]}")
+
+  pypi:
+    needs: [version, crates]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - if: needs.version.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
