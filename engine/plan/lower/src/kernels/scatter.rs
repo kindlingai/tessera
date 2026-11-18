@@ -3,6 +3,7 @@
 use crate::Kernel;
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::plan::Step;
+use crate::tree::{T, Tree};
 use sensai_codegen::kept::{self, Layout};
 use sensai_codegen::prelude::*;
 
@@ -41,6 +42,22 @@ pub(crate) struct Scatter {
     pub slots: usize,
     pub context: usize,
     pub kept: &'static dyn Layout,
+}
+
+impl Scatter {
+    /// The scatter that runs append node `t` into kept `index`.
+    pub(crate) fn at(tree: &Tree, t: T, index: u32) -> Option<Scatter> {
+        let (_, context) = tree.kept_rows(index)?;
+        let all = &tree.node(t).shape;
+        let width: usize = all[2..].iter().product();
+        Some(Scatter {
+            rows: tree.elements(tree.node(t).args[0]) / width,
+            width,
+            slots: all[0],
+            context,
+            kept: tree.kept,
+        })
+    }
 }
 
 fn scatter_source(k: &Scatter) -> Source {

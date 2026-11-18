@@ -10,7 +10,7 @@ use crate::rule::Draft;
 use crate::select::cover::EDGE;
 use crate::select::{Home, Op, Selected, Val, Value};
 use crate::tree::{T, Tree};
-use sensai_graph::{DimExpr, NodeId};
+use sensai_graph::NodeId;
 use std::collections::HashMap;
 
 /// The ops written, and the values they use.
@@ -23,6 +23,8 @@ pub(crate) struct Emit {
     moved: HashMap<(Val, u32), Val>,
     /// Each narrow value as floats, once made.
     widened: HashMap<Val, Val>,
+    /// Each kept index's rows, once made.
+    kept: HashMap<u32, Val>,
 }
 
 impl Emit {
@@ -132,6 +134,23 @@ impl Emit {
         write
     }
 
+    /// The kept rows of `index`, made once.
+    pub(crate) fn kept(&mut self, tree: &Tree, index: u32) -> Result<Val, Error> {
+        if let Some(val) = self.kept.get(&index) {
+            return Ok(*val);
+        }
+        let (t, context) = tree.kept_rows(index).ok_or(Unsupported::KeptRows)?;
+        let all = &tree.node(t).shape;
+        let width: usize = all[2..].iter().product();
+        let room = tree.kept.rows(all[0], context) * width;
+        let entries = kept::entries(tree.kept, all[0], context);
+        self.out.table = self.out.table.max(entries);
+        let len: usize = all.iter().product();
+        let val = self.value(len, Home::Kept { index, room }, EDGE, form::F32_FORM);
+        self.kept.insert(index, val);
+        Ok(val)
+    }
+
     /// Writes new rows into kept rows by slot and position.
     pub(crate) fn append(
         &mut self,
@@ -140,33 +159,15 @@ impl Emit {
         index: u32,
         args: [Val; 3],
     ) -> Result<Val, Error> {
-        let (n, all) = (tree.node(t), &tree.node(t).shape);
-        let DimExpr::Dim(axis) = &tree.g.kept[index as usize].shape.0[1] else {
-            return Err(Unsupported::KeptRows.into());
-        };
-        // A slot holds the axis's bound, whatever this launch sees.
-        let most = tree.g.dims.iter().find(|d| d.name == *axis);
-        let stride = most.map_or(0, |d| d.size.max() as usize);
-        let width: usize = all[2..].iter().product();
-        let room = tree.kept.rows(all[0], stride) * width;
-        let entries = kept::entries(tree.kept, all[0], stride);
-        self.out.table = self.out.table.max(entries);
-        let len: usize = all.iter().product();
-        let write = self.value(len, Home::Kept { index, room }, EDGE, form::F32_FORM);
+        let write = self.kept(tree, index)?;
+        let kernel = Scatter::at(tree, t, index).ok_or(Unsupported::KeptRows)?;
         let [rows, slots, positions] = args.map(|v| self.bring(v, EDGE));
-        let kernel = Scatter {
-            rows: self.len(rows) / width,
-            width,
-            slots: all[0],
-            context: stride,
-            kept: tree.kept,
-        };
         self.out.ops.push(Op {
             kernel: KernelRef::new(kernel),
             rule: "append",
             reads: vec![rows, slots, positions],
             write,
-            covers: vec![n.from],
+            covers: vec![tree.node(t).from],
             zone: EDGE,
         });
         Ok(write)

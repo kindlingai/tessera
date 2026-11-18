@@ -9,7 +9,7 @@ use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 use sensai_codegen::kept::Layout;
-use sensai_graph::{DType, DimName, Graph, NodeId, Op, Parts, Placement, Shape, Stage};
+use sensai_graph::{DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Shape, Stage};
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -453,6 +453,20 @@ impl<'a> Tree<'a> {
     /// The tree node holding graph node `id`'s value.
     pub fn of(&self, id: NodeId) -> Option<T> {
         self.at.get(id.0 as usize).copied().flatten()
+    }
+
+    /// The node appending to kept `index`, and rows per slot.
+    pub fn kept_rows(&self, index: u32) -> Option<(T, usize)> {
+        let append = Term::Op(Op::Append(index));
+        let t = (0..self.len() as u32)
+            .map(T)
+            .find(|t| self.node(*t).term == append)?;
+        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
+            return None;
+        };
+        // A slot holds the axis's bound, whatever this launch sees.
+        let most = self.g.dims.iter().find(|d| d.name == *axis);
+        Some((t, most.map_or(0, |d| d.size.max() as usize)))
     }
 
     /// A dimension's size in this view.

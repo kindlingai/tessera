@@ -4,7 +4,7 @@ use sensai_graph::DimName;
 use serde::{Deserialize, Serialize};
 
 /// The version of this exchange the host reads.
-pub(crate) const ABI: u32 = 2;
+pub(crate) const ABI: u32 = 3;
 
 /// What `manifest()` returns.
 #[derive(Debug, Deserialize)]
@@ -39,6 +39,7 @@ pub(crate) enum Kind {
     Matmul,
     Mlp,
     Moe,
+    Attention,
 }
 
 /// What `propose` is given.
@@ -64,7 +65,25 @@ pub(crate) enum Site {
         kind: Kind,
         inputs: Vec<Input>,
         len: usize,
+        kept: Vec<Kept>,
     },
+}
+
+/// Kept rows a region appends to. Its launches write them.
+#[derive(Debug, Serialize)]
+pub(crate) struct Kept {
+    pub index: u32,
+    /// Slots, rows per slot, and elements per row.
+    pub slots: usize,
+    pub context: usize,
+    pub width: usize,
+    /// The row layout, its rows per page, and its scalars.
+    pub layout: &'static str,
+    pub page: Option<usize>,
+    pub params: &'static [&'static str],
+    pub values: Vec<u32>,
+    /// Input places of the slot and position ids.
+    pub by: [Option<usize>; 2],
 }
 
 /// One value a region reads.
@@ -88,6 +107,7 @@ pub(crate) struct Input {
 pub(crate) enum Place {
     Read(usize),
     Draft { draft: usize },
+    Kept { kept: usize },
 }
 
 /// A u32 argument, fixed or read at launch.

@@ -126,12 +126,15 @@ impl Attn {
     }
 }
 
-/// A draft reads a tree node, or an earlier draft.
+/// A tree node, an earlier draft, or kept rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, derive_more::From)]
 pub enum Read {
     Node(T),
     #[from(ignore)]
     Draft(usize),
+    /// Kept rows by index. The launch may also write them.
+    #[from(ignore)]
+    Kept(u32),
 }
 
 /// One launch a rule proposes, writing `len` elements.

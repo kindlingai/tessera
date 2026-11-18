@@ -2,7 +2,7 @@
 
 use crate::abi::Source;
 use crate::cost::Device;
-use crate::kernels::{AllReduce, Widen};
+use crate::kernels::{AllReduce, Scatter, Widen};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use sensai_graph::{Op, Stage, View};
@@ -29,7 +29,7 @@ pub(crate) type Way = (&'static str, Vec<&'static str>);
 pub(crate) fn reads(drafts: &[Draft]) -> Vec<T> {
     let node = |r: &Read| match r {
         Read::Node(t) => Some(*t),
-        Read::Draft(_) => None,
+        Read::Draft(_) | Read::Kept(_) => None,
     };
     drafts
         .iter()
@@ -123,7 +123,13 @@ impl Cover<'_> {
             if matches!(n.term, Term::Op(Op::Append(_))) && zone != EDGE {
                 return None;
             }
-            let cost = self.need(n.args[0], zone)?;
+            let mut cost = self.need(n.args[0], zone)?;
+            // An append runs a scatter. An absorbing region saves it.
+            if let Term::Op(Op::Append(index)) = n.term {
+                let scatter = Scatter::at(self.tree, t, index)?;
+                let len = scatter.rows * scatter.width;
+                cost += self.device.seconds_in(zone, &scatter, len);
+            }
             return Some(Choice {
                 rule: "append",
                 drafts: Vec::new(),

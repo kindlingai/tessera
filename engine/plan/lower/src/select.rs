@@ -215,11 +215,14 @@ pub(crate) fn select_upto(
                 let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());
                 let last = choice.drafts.len() - 1;
                 for (i, d) in choice.drafts.into_iter().enumerate() {
-                    let read = |r: &Read| match r {
-                        Read::Node(a) => val(*a),
-                        Read::Draft(at) => made[*at],
-                    };
-                    let reads: Vec<Val> = d.reads.iter().map(read).collect();
+                    let mut reads = Vec::with_capacity(d.reads.len());
+                    for r in &d.reads {
+                        reads.push(match r {
+                            Read::Node(a) => val(*a),
+                            Read::Draft(at) => made[*at],
+                            Read::Kept(index) => e.kept(&tree, *index)?,
+                        });
+                    }
                     // The last launch writes the node's own type.
                     let form = if i == last { n.form } else { form::F32_FORM };
                     made.push(e.op(d, choice.rule, reads, &covers, zone, form));

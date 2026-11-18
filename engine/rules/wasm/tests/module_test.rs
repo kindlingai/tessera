@@ -1,15 +1,17 @@
-//! Modules from text: a matmul, a region, and bad modules.
+//! Modules from text: a matmul, regions, and bad modules.
 
 // The linked rules the module's rules compete with.
 use sensai_kernels as _;
 use sensai_linear as _;
 
-use sensai_graph::DimName::{Ffn, Hidden, Rows};
+use sensai_graph::DimName::{Context, Ffn, Hidden, Rows, Seqs};
 use sensai_graph::{Act, Composite};
-use sensai_interp::Tensor;
-use sensai_lower::{Arg, Cache, Device, Extent, Plan, Rule, Shape, Source, lower};
+use sensai_interp::{Store, Tensor, run_kept};
+use sensai_lower::kept::{self, Layout};
+use sensai_lower::{Arg, Cache, Device, Extent, Plan, Rule, Settings, Shape, Source, lower};
+use sensai_run::Run;
 use sensai_run::testing::{host, runs};
-use sensai_testkit::{Noise, max_abs_diff};
+use sensai_testkit::{Noise, graphs, max_abs_diff};
 use sensai_trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, TensorType, Weights};
 use serde_json::{Value, json};
 
@@ -78,16 +80,25 @@ const ACT_CUDA: &str = "extern \"C\" __global__ void act(const float* a, float* 
   y[i] = v / (1.0f + expf(-v)) * v;
 }";
 
-/// The manifest: both kernels, and one rule at `site`.
-fn manifest(abi: u32, site: &str) -> Value {
+/// The version these modules speak.
+const ABI: u32 = 3;
+
+/// `kernels`, and one rule at `site`.
+fn declare(abi: u32, site: &str, kernels: Value) -> Value {
     json!({
         "abi": abi,
-        "kernels": [
-            {"name": "wasm_gemm", "entry": "gemm", "metal": GEMM_METAL, "cuda": GEMM_CUDA},
-            {"name": "wasm_act", "entry": "act", "metal": ACT_METAL, "cuda": ACT_CUDA},
-        ],
+        "kernels": kernels,
         "rules": [{"name": format!("wasm_{site}"), "site": site}],
     })
+}
+
+/// The matmul kernels, and one rule at `site`.
+fn manifest(abi: u32, site: &str) -> Value {
+    let kernels = json!([
+        {"name": "wasm_gemm", "entry": "gemm", "metal": GEMM_METAL, "cuda": GEMM_CUDA},
+        {"name": "wasm_act", "entry": "act", "metal": ACT_METAL, "cuda": ACT_CUDA},
+    ]);
+    declare(abi, site, kernels)
 }
 
 /// `x w`, with its rows read at launch.
@@ -136,7 +147,7 @@ fn module(manifest: &Value, offer: &Value, body: &str) -> Vec<u8> {
 }
 
 fn load(site: &str, offer: Value) -> &'static Rule {
-    sensai_wasm::load(&module(&manifest(2, site), &offer, "")).unwrap()[0]
+    sensai_wasm::load(&module(&manifest(ABI, site), &offer, "")).unwrap()[0]
 }
 
 /// `g` with `rule` on each GPU, against the interpreter.
@@ -208,13 +219,13 @@ fn module_region_wins() {
 #[test]
 fn bad_modules_fail() {
     let offer = json!([gemm()]);
-    let newer = module(&manifest(3, "matmul"), &offer, "");
+    let newer = module(&manifest(ABI + 1, "matmul"), &offer, "");
     assert!(matches!(
         sensai_wasm::load(&newer),
-        Err(sensai_wasm::Error::Abi(3))
+        Err(sensai_wasm::Error::Abi(4))
     ));
     // An endless loop runs out of fuel.
-    let spin = module(&manifest(2, "matmul"), &offer, "(loop (br 0))");
+    let spin = module(&manifest(ABI, "matmul"), &offer, "(loop (br 0))");
     assert!(matches!(
         sensai_wasm::load(&spin),
         Err(sensai_wasm::Error::Wasm(_))
@@ -225,4 +236,157 @@ fn bad_modules_fail() {
         sensai_wasm::load(&imports),
         Err(sensai_wasm::Error::Wasm(_))
     ));
+}
+
+/// An attention region appends K and V and sums them.
+fn kept_graph() -> Graph {
+    let bounded = [
+        Dim::bounded(Seqs, 4),
+        Dim::bounded(Rows, 16),
+        Dim::bounded(Context, 16),
+    ];
+    graphs::appended(&bounded, 16)
+}
+
+/// Writes K and V rows at their slots and positions.
+const PUT: &str = "KERNEL put(BUF(const float*, k, 0), BUF(const float*, v, 1),
+    BUF(const uint*, slots, 2), BUF(const uint*, positions, 3), BUF(float*, keys, 4),
+    BUF(float*, values, 5), BUF(float*, done, 6), ARG(rows, 7), ARG(width, 8), TAIL(9) INDEX) {
+  if (i >= rows * width) return;
+  uint r = i / width, j = i % width, at = ROW(slots[r], positions[r]);
+  keys[at * width + j] = k[i];
+  values[at * width + j] = v[i];
+}";
+
+/// Sums K and V for every slot and position.
+const SUM: &str = "KERNEL sum(BUF(const float*, keys, 0), BUF(const float*, values, 1),
+    BUF(float*, out, 2), ARG(seqs, 3), ARG(ctx, 4), ARG(width, 5), TAIL(6) INDEX) {
+  if (i >= seqs * ctx * width) return;
+  uint j = i % width, p = (i / width) % ctx, s = i / (width * ctx), at = ROW(s, p);
+  out[i] = keys[at * width + j] + values[at * width + j];
+}";
+
+/// Metal and CUDA spellings of the macros the kernels use.
+fn spelled(paged: bool) -> [String; 2] {
+    let row = match paged {
+        true => "#define ROW(s, p) ((table[(s) * kept + ((p) >> 4)] << 4) | ((p) & 15u))",
+        false => "#define ROW(s, p) ((s) * kept + (p))",
+    };
+    let tail = match paged {
+        true => "#define TAIL(b) BUF(const uint*, table, b), ARG(kept, b + 1)",
+        false => "#define TAIL(b) ARG(kept, b)",
+    };
+    let metal = "#include <metal_stdlib>\nusing namespace metal;
+#define KERNEL kernel void
+#define BUF(t, n, b) device t n [[buffer(b)]]
+#define ARG(n, b) constant uint& n [[buffer(b)]]
+#define INDEX , uint i [[thread_position_in_grid]]
+#define START";
+    let cuda = "typedef unsigned uint;
+#define KERNEL extern \"C\" __global__ void
+#define BUF(t, n, b) t n
+#define ARG(n, b) uint n
+#define INDEX
+#define START uint i = blockIdx.x * blockDim.x + threadIdx.x;";
+    [metal, cuda].map(|head| format!("{head}\n{tail}\n{row}\n"))
+}
+
+fn kept_kernels(paged: bool) -> Value {
+    let [metal, cuda] = spelled(paged);
+    let start = |text: &str| text.replacen(") {\n", ") {\n  START\n", 1);
+    json!([
+        {"name": "wasm_put", "entry": "put", "metal": format!("{metal}{}", start(PUT)),
+         "cuda": format!("{cuda}{}", start(PUT))},
+        {"name": "wasm_sum", "entry": "sum", "metal": format!("{metal}{}", start(SUM)),
+         "cuda": format!("{cuda}{}", start(SUM))},
+    ])
+}
+
+/// Inputs 0, 3, 1 and 2: K, V, slots, positions.
+fn put() -> Value {
+    json!({
+        "kernel": "wasm_put", "reads": [0, 3, 1, 2, {"kept": 0}, {"kept": 1}], "len": 1,
+        "counts": [{"dim": "Rows"}, 16], "shape": {"line": 256},
+        "work": 64, "guess": 1e-15,
+    })
+}
+
+/// K plus V over `ctx` positions of all four slots.
+fn sum(ctx: usize) -> Value {
+    let len = 4 * ctx * 16;
+    json!({
+        "kernel": "wasm_sum", "reads": [{"kept": 0}, {"kept": 1}], "len": len,
+        "counts": [{"dim": "Seqs"}, {"dim": "Context"}, 16], "shape": {"line": len},
+        "work": len, "guess": 1e-15,
+    })
+}
+
+/// The rule for `layout`, its offers sized for `ctx` positions.
+fn attention(layout: &dyn Layout, ctx: usize) -> &'static Rule {
+    let kernels = kept_kernels(layout.page().is_some());
+    let offers = json!([put(), sum(ctx)]);
+    let bytes = module(&declare(ABI, "attention", kernels), &offers, "");
+    sensai_wasm::load(&bytes).unwrap()[0]
+}
+
+/// The plan for one launch of `ctx` positions.
+fn kept_plan(settings: &Settings, layout: &'static dyn Layout, ctx: usize) -> Plan {
+    let mut device = Device::guess(settings).adding(attention(layout, ctx));
+    device.kept = layout;
+    let sizes = [(Seqs, 4), (Rows, 4), (Context, ctx as u64)];
+    lower(&kept_graph(), 0, &sizes, &device).unwrap()
+}
+
+#[test]
+fn module_attention_writes_kept() {
+    // Each launch fills two positions of both slots, in order.
+    let launches: [[(u32, u32); 4]; 2] = [
+        [(0, 0), (0, 1), (1, 0), (1, 1)],
+        [(0, 2), (0, 3), (1, 2), (1, 3)],
+    ];
+    let layouts: [&'static dyn Layout; 2] = [kept::DENSE, &kept::PAGED16];
+    for layout in layouts {
+        let plan = kept_plan(&host(), layout, 4);
+        assert_eq!(rules(&plan), ["wasm_attention", "wasm_attention"]);
+        assert_eq!(plan.kept.len(), 2);
+        // Only a GPU runs fixed text.
+        for settings in runs().iter().filter(|s| s.gpu().is_some()) {
+            let (mut store, mut draws) = (Store::default(), Noise(9));
+            let mut runner: Option<Box<dyn Run>> = None;
+            for (i, rows) in launches.iter().enumerate() {
+                let plan = kept_plan(settings, layout, 2 * i + 2);
+                let table = plan.table;
+                let r = match &mut runner {
+                    Some(r) => {
+                        r.replan(&plan).unwrap();
+                        r
+                    }
+                    None => runner.insert(sensai_run::open(plan, settings).unwrap()),
+                };
+                // Reversed pages: no row lies where a dense one would.
+                if let Some(table) = table {
+                    let pages = (0..table.len as u32).rev().flat_map(u32::to_le_bytes);
+                    r.held_mut()
+                        .upload(table, &pages.collect::<Vec<u8>>())
+                        .unwrap();
+                }
+                let noise = |draws: &mut Noise| (0..64).map(|_| draws.draw()).collect();
+                let inputs = [
+                    Tensor::f32(vec![4, 16], noise(&mut draws)),
+                    Tensor::f32(vec![4, 16], noise(&mut draws)),
+                    Tensor::u32(vec![4], rows.iter().map(|r| r.0).collect()),
+                    Tensor::u32(vec![4], rows.iter().map(|r| r.1).collect()),
+                ];
+                let want = run_kept(&kept_graph(), &[], &mut store, 0, &inputs).unwrap();
+                let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
+                let got = r.run(&views).unwrap().remove(0);
+                let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+                assert!(
+                    off < 1e-6,
+                    "{layout:?} launch {i} on {}: off by {off:e}",
+                    r.device()
+                );
+            }
+        }
+    }
 }

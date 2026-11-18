@@ -1,6 +1,7 @@
 //! A module's kernel text, launched with plain arguments.
 
 use crate::abi::{Offer, Shape};
+use sensai_lower::kept::Layout;
 use sensai_lower::{Arg, Kernel, Launch, Source, Step};
 use std::fmt;
 
@@ -21,6 +22,8 @@ pub struct Text {
     pub shape: sensai_lower::Shape,
     pub work: f64,
     pub guess: f64,
+    /// For kept-row launches: the layout and its scalars.
+    pub kept: Option<(&'static dyn Layout, Vec<Arg>)>,
 }
 
 impl Text {
@@ -43,6 +46,7 @@ impl Text {
             shape,
             work: offer.work,
             guess: offer.guess,
+            kept: None,
         }
     }
 }
@@ -51,7 +55,8 @@ impl Text {
 impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Fixed { name, .. } = self.fixed;
-        write!(f, "{name}{:?}{:?}", self.args, self.shape)
+        let layout = self.kept.as_ref().map(|(l, _)| l.name());
+        write!(f, "{name}{:?}{:?}{layout:?}", self.args, self.shape)
     }
 }
 
@@ -71,6 +76,11 @@ impl Kernel for Text {
         let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
         args.push(step.out());
         args.extend(self.args.iter().cloned());
+        // Kept rows add any page table, then the layout's scalars.
+        if let Some((layout, values)) = &self.kept {
+            args.extend(step.kept(*layout));
+            args.extend(values.iter().cloned());
+        }
         vec![Launch {
             args,
             shape: self.shape,

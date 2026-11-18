@@ -51,9 +51,9 @@ impl Asking {
 
 impl Propose for Asking {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
-        let (site, nodes) = site::find(tree, at, self.kind)?;
+        let (site, reads) = site::find(tree, at, self.kind)?;
         match self.ask(site) {
-            Ok(offers) => site::drafts(offers?, self.kernels, tree, &nodes),
+            Ok(offers) => site::drafts(offers?, self.kernels, tree, &reads),
             Err(e) => {
                 eprintln!("wasm rule {}: {e}", self.rule);
                 None

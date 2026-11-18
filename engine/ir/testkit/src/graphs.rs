@@ -1,7 +1,9 @@
 //! Small graphs that reach every rule, for tests and calibrate.
 
 use sensai_graph::DimName::*;
-use sensai_graph::{DType, Dim, DimExpr, DimName, Graph, PathSeg, Port, Role, TensorType};
+use sensai_graph::{
+    Composite, DType, Dim, DimExpr, DimName, Graph, PathSeg, Port, Role, TensorType,
+};
 use sensai_trace::{
     Act, Embed, EntryKind, Linear, Linears, Mask, Model, Norm, Pairs, Vector, Weights, declare,
 };
@@ -121,6 +123,29 @@ pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     let [q, k, v, at] = m.entry(EntryKind::Forward, ports);
     let q = q.rope(&at, 1e4, Pairs::Halves);
     let out = m.attend(Mask::Causal, 0.1, [&q, &k, &v], None);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// An attention region appends K and V, then sums them.
+pub fn appended(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, width)]);
+    let slots = || Port {
+        role: Role::Slots,
+        ty: TensorType::new([Rows], DType::U32),
+    };
+    let ports = [
+        floats([Rows, Hidden]),
+        floats([Rows, Hidden]),
+        slots(),
+        slots(),
+    ];
+    let [k, v, slots, positions] = m.entry(EntryKind::Step, ports);
+    let ty = TensorType::new([Seqs, Context, Hidden], DType::F32);
+    let (keys, values) = (m.kept(ty.clone()), m.kept(ty));
+    let by = [&slots, &positions];
+    let [out] = m.composite(Composite::Attention, || {
+        [k.append(&keys, by).add(&v.append(&values, by))]
+    });
     m.finish([(Role::Logits, &out)])
 }
 

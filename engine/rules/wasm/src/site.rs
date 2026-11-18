@@ -1,12 +1,18 @@
 //! Sites for the module, and its offers as drafts.
 
-use crate::abi::{Count, Input, Kind, Offer, Place, Site};
+use crate::abi::{Count, Input, Kept, Kind, Offer, Place, Site};
 use crate::text::{Fixed, Text};
 use sensai_graph::{Composite, DimName, PathSeg};
 use sensai_lower::{Arg, Draft, Extent, Home, Read, T, Term, Tree, sites};
 
+/// What a site's offers may read.
+pub(crate) struct Reads {
+    pub nodes: Vec<T>,
+    pub kept: Vec<sites::Appended>,
+}
+
 /// The site for `kind` at `at`, and its reads.
-pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Vec<T>)> {
+pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
     if kind == Kind::Matmul {
         let m: sites::Matmul = tree.site(at)?;
         let site = Site::Matmul {
@@ -15,19 +21,48 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Vec<T>)> {
             k: m.k,
             form: m.form.name(),
         };
-        return m.picked.is_none().then_some((site, vec![m.x, m.w]));
+        let reads = Reads {
+            nodes: vec![m.x, m.w],
+            kept: Vec::new(),
+        };
+        return m.picked.is_none().then_some((site, reads));
     }
     let r: sites::Region = tree.site(at)?;
     let wanted = match kind {
         Kind::Mlp => Composite::Mlp,
+        Kind::Attention => Composite::Attention,
         _ => Composite::Moe,
     };
     if r.kind != wanted {
         return None;
     }
     let inputs = r.inputs.iter().map(|t| input(tree, *t)).collect();
-    let len = r.len;
-    Some((Site::Region { kind, inputs, len }, r.inputs))
+    let kept = r.kept.iter().map(|k| rows(tree, k)).collect();
+    let site = Site::Region {
+        kind,
+        inputs,
+        len: r.len,
+        kept,
+    };
+    let reads = Reads {
+        nodes: r.inputs,
+        kept: r.kept,
+    };
+    Some((site, reads))
+}
+
+fn rows(tree: &Tree, k: &sites::Appended) -> Kept {
+    Kept {
+        index: k.index,
+        slots: k.slots,
+        context: k.context,
+        width: k.width,
+        layout: tree.kept.name(),
+        page: tree.kept.page(),
+        params: tree.kept.params(),
+        values: tree.kept.values(k.slots, k.context),
+        by: k.by,
+    }
 }
 
 fn input(tree: &Tree, t: T) -> Input {
@@ -88,24 +123,35 @@ pub(crate) fn drafts(
     offers: Vec<Offer>,
     kernels: &'static [Fixed],
     tree: &Tree,
-    nodes: &[T],
+    from: &Reads,
 ) -> Option<Vec<Draft>> {
     let mut drafts = Vec::with_capacity(offers.len());
     for offer in offers {
         let fixed = kernels.iter().find(|k| k.name == offer.kernel)?;
         let mut reads = Vec::with_capacity(offer.reads.len());
+        let mut kept = None;
         for place in &offer.reads {
             reads.push(match *place {
-                Place::Read(i) => Read::Node(*nodes.get(i)?),
+                Place::Read(i) => Read::Node(*from.nodes.get(i)?),
                 Place::Draft { draft } if draft < drafts.len() => Read::Draft(draft),
                 Place::Draft { .. } => return None,
+                Place::Kept { kept: i } => {
+                    let k = from.kept.get(i)?;
+                    kept = Some(*k);
+                    Read::Kept(k.index)
+                }
             });
         }
         let mut args = Vec::with_capacity(offer.counts.len());
         for count in &offer.counts {
-            args.push(arg(tree, nodes, *count)?);
+            args.push(arg(tree, &from.nodes, *count)?);
         }
-        let text = Text::new(fixed, &offer, args);
+        let mut text = Text::new(fixed, &offer, args);
+        text.kept = kept.map(|k| {
+            let values = tree.kept.values(k.slots, k.context);
+            let values = values.into_iter().map(|v| Arg::count(v as usize));
+            (tree.kept, values.collect())
+        });
         drafts.push(Draft::new(text, reads, offer.len));
     }
     Some(drafts)

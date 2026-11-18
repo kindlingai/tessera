@@ -18,6 +18,8 @@ use objc2_metal::{
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -148,10 +150,14 @@ impl Context {
             .map_err(compile_error)
     }
 
-    /// Compile one kernel, cached by entry name across the process.
+    /// Compile one kernel, cached by entry and text.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<ComputePipeline, Error> {
         let library = self.compile_library(source)?;
-        self.compile_from_library(&library, entry)
+        // Two texts may share an entry. The label holds both.
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        let label = format!("{entry}#{:016x}", hasher.finish());
+        self.pipeline(&library, entry, &label)
     }
 
     /// As [`Self::compile_kernel`], for an already-compiled library.
@@ -160,6 +166,16 @@ impl Context {
         library: &ProtocolObject<dyn MTLLibrary>,
         entry: &str,
     ) -> Result<ComputePipeline, Error> {
+        self.pipeline(library, entry, entry)
+    }
+
+    /// `entry` in `library`, cached under `label`.
+    fn pipeline(
+        &self,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        entry: &str,
+        label: &str,
+    ) -> Result<ComputePipeline, Error> {
         let name = NSString::from_str(entry);
         let function = library
             .newFunctionWithName(&name)
@@ -167,7 +183,7 @@ impl Context {
         let pipeline = self
             .0
             .pipelines
-            .compile_compute(&self.0.device, &function, entry)?;
+            .compile_compute(&self.0.device, &function, label)?;
         Ok(ComputePipeline { pipeline })
     }
 

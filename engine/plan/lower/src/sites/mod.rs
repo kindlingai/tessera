@@ -32,6 +32,20 @@ pub struct Region {
     /// The values it reads, weights included, in first-read order.
     pub inputs: Vec<T>,
     pub len: usize,
+    /// Kept rows it appends to. Its launches write them.
+    pub kept: Vec<Appended>,
+}
+
+/// Kept rows a region appends to, as `Read::Kept` names them.
+#[derive(Clone, Copy, Debug)]
+pub struct Appended {
+    pub index: u32,
+    /// Slots, rows per slot, and elements per row.
+    pub slots: usize,
+    pub context: usize,
+    pub width: usize,
+    /// The places in `inputs` of the slot and position ids.
+    pub by: [Option<usize>; 2],
 }
 
 impl Pattern for Region {
@@ -43,32 +57,45 @@ impl Pattern for Region {
         }
         let inputs: Option<Vec<T>> = region.inputs.iter().map(|i| tree.of(*i)).collect();
         let inputs = inputs?;
-        // Sums, kept rows and rotations stay with the engine.
+        let mut kept = Vec::new();
+        // Sums and rotations stay with the engine.
         for n in tree.inside(at, &inputs) {
             let node = tree.node(n);
-            let engine = matches!(
-                node.term,
-                Term::Stage(Step::AllReduce) | Term::Op(Op::Append(_))
-            );
             let unread = node
                 .args
                 .iter()
                 .any(|a| tree.leaf(*a) && !inputs.contains(a));
-            if engine || unread {
+            if node.term == Term::Stage(Step::AllReduce) || unread {
                 return None;
             }
+            if let Term::Op(Op::Append(index)) = node.term {
+                let (_, context) = tree.kept_rows(index)?;
+                let place = |a: &T| inputs.iter().position(|i| i == a);
+                kept.push(Appended {
+                    index,
+                    slots: node.shape[0],
+                    context,
+                    width: node.shape[2..].iter().product(),
+                    by: [place(&node.args[1]), place(&node.args[2])],
+                });
+            }
         }
+        kept.sort_by_key(|k| k.index);
         let len = tree.elements(at);
         Some(Self {
             kind: region.kind,
             inputs,
             len,
+            kept,
         })
     }
 }
 
 impl Region {
+    /// Its inputs, then its kept rows.
     pub fn reads(&self) -> Vec<Read> {
-        self.inputs.iter().map(|t| Read::Node(*t)).collect()
+        let inputs = self.inputs.iter().map(|t| Read::Node(*t));
+        let kept = self.kept.iter().map(|k| Read::Kept(k.index));
+        inputs.chain(kept).collect()
     }
 }
