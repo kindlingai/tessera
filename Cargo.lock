@@ -1584,6 +1584,7 @@ dependencies = [
  "rmpv",
  "sensai-checkpoint",
  "sensai-engine",
+ "sensai-frontend-settings",
  "sensai-testkit",
  "serde",
  "serde_json",

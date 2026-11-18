@@ -32,7 +32,7 @@ fn linear(x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
     y
 }
 
-/// Sines then cosines of `x * 2^k * pi`, for each value of `x`.
+/// Sines then cosines of `x * 2^k * pi`, per value.
 fn fourier(x: &[f32], n: usize, out: &mut Vec<f32>) {
     for &v in x {
         let angles: Vec<f32> = (0..n).map(|k| v * ((1u32 << k) as f32 * PI)).collect();
@@ -84,7 +84,7 @@ fn rope(grid: usize, stride: usize) -> (Vec<f32>, Vec<f32>) {
     (cos, sin)
 }
 
-/// Each row's 3x3 neighbour rows, one past the end for padding.
+/// Each row's 3x3 neighbours. Padding is one past the end.
 fn taps(grid: usize) -> (Vec<f32>, Vec<f32>) {
     let rows = PREFIX + grid * grid;
     let mut ids = vec![rows as f32; rows * TAPS];
@@ -111,7 +111,7 @@ fn mlp(inner: &dyn Offer, name: &str, x: &[f32]) -> Result<Vec<f32>, Error> {
     Ok(linear(&hidden, &w(2, "weight")?, &w(2, "bias")?))
 }
 
-/// Tensors taken as they are, by new name and `ema.` name.
+/// Tensors taken as they are: new name, `ema.` name.
 const COPIES: [(&str, &str); 24] = [
     ("pos", "pos_emb"),
     ("draft", "sc_proj.weight"),
@@ -148,7 +148,7 @@ const BLOCK_COPIES: [(&str, &str); 5] = [
     ("conv_bias", "mlp.dw.bias"),
 ];
 
-/// Block parts cut from one fused weight: name, source, piece, pieces.
+/// Block parts cut from a fused weight: piece of pieces.
 const BLOCK_CUTS: [(&str, &str, usize, usize); 5] = [
     ("q", "attn.qkv.weight", 0, 3),
     ("k", "attn.qkv.weight", 1, 3),
@@ -159,17 +159,17 @@ const BLOCK_CUTS: [(&str, &str, usize, usize); 5] = [
 
 const STAGES: [&str; 3] = ["in", "core", "out"];
 
-/// The upstream `ema.*` tensors of `inner`, folded when read.
-///
-/// The `palette` slice holds RGB rows.
-pub struct Upstream<O> {
+/// Upstream `ema.*` tensors, folded when read. `palette` holds RGB.
+pub(crate) struct Upstream<O> {
     inner: O,
-    config: Config,
+    grid: u64,
+    depth: [u64; 3],
 }
 
 impl<O: Offer> Upstream<O> {
-    pub fn new(inner: O, config: Config) -> Self {
-        Self { inner, config }
+    pub fn new(inner: O, config: &Config) -> Self {
+        let (grid, depth) = (config.grid, config.depth);
+        Self { inner, grid, depth }
     }
 
     fn ema(&self, name: &str) -> Result<Vec<f32>, Error> {
@@ -178,7 +178,7 @@ impl<O: Offer> Upstream<O> {
 
     /// The grid and stride of a level's tables.
     fn level(&self, name: &str) -> Option<(usize, usize)> {
-        let grid = self.config.grid as usize;
+        let grid = self.grid as usize;
         match name {
             "pixel" => Some((grid, 1)),
             "patch" => Some((grid / PATCH, PATCH)),
@@ -257,7 +257,7 @@ impl<O: Offer> Upstream<O> {
         }
     }
 
-    /// Every name on offer, with the upstream shape it derives from.
+    /// Every name on offer, with its shape.
     fn names(&self) -> Vec<(String, Vec<usize>)> {
         let shapes: BTreeMap<String, Vec<usize>> = (self.inner.slices().into_iter())
             .map(|s| (s.name, s.shape))
@@ -284,7 +284,7 @@ impl<O: Offer> Upstream<O> {
             out.push((format!("{level}.taps"), vec![rows, TAPS]));
             out.push((format!("{level}.image"), vec![rows]));
         }
-        for (stage, depth) in STAGES.iter().zip(self.config.depth) {
+        for (stage, depth) in STAGES.iter().zip(self.depth) {
             for i in 0..depth {
                 let src = |n: &str| shape(&format!("blocks_{stage}.{i}.{n}"));
                 let dst = |n: &str| format!("{stage}.{i}.{n}");

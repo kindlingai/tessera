@@ -34,6 +34,10 @@ pub fn read() -> Settings {
     let costs = env.costs.or_else(|| cache("costs"));
     let check = env.check.or_else(|| cache("check"));
     let recipes = env.recipes.or_else(|| cache("recipes"));
+    let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let hub = (var("HF_HUB_CACHE"))
+        .or_else(|| var("HF_HOME").map(|h| h.join("hub")))
+        .or_else(|| Some(std::env::home_dir()?.join(".cache/huggingface/hub")));
     Settings {
         backend,
         host_lanes: env.lanes.unwrap_or(32),
@@ -44,6 +48,7 @@ pub fn read() -> Settings {
         emulate: env.emulate,
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
+        hub,
     }
 }
 

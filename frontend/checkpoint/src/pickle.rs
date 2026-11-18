@@ -1,12 +1,10 @@
-//! The pickle subset `torch.save` writes, read as data only.
-//!
-//! Globals come from a fixed list and no opcode runs code.
+//! The pickle subset `torch.save` writes, read as data.
 
 use crate::Error;
 use std::collections::HashMap;
 
 /// The most bytes a pickle may hold.
-pub const MAX_PICKLE: usize = 64 << 20;
+pub(crate) const MAX_PICKLE: usize = 64 << 20;
 const MAX_DEPTH: u32 = 64;
 /// The most value nodes memo reads may copy.
 const MAX_COPIED: u64 = 1 << 24;
@@ -216,7 +214,7 @@ impl<'a> Machine<'a> {
             .ok_or_else(|| bad("the stack runs empty"))
     }
 
-    fn to_mark(&mut self) -> Result<Vec<Slot>, Error> {
+    fn since_mark(&mut self) -> Result<Vec<Slot>, Error> {
         let mark = self.marks.pop().ok_or_else(|| bad("no mark"))?;
         Ok(self.stack.split_off(mark))
     }
@@ -244,7 +242,7 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    /// A memo put for `q` and `r`, a get for `h` and `j`.
+    /// A memo put for `q` and `r`, else a get.
     fn memo_op(&mut self, op: u8, key: u32) -> Result<(), Error> {
         match op {
             b'q' | b'r' => self.put(key),
@@ -267,7 +265,7 @@ impl<'a> Machine<'a> {
 
     /// Adds key, value pairs to the dict on top.
     fn set(&mut self, items: Vec<Slot>) -> Result<(), Error> {
-        if items.len() % 2 != 0 {
+        if !items.len().is_multiple_of(2) {
             return Err(bad("a key has no value"));
         }
         let dict = self.top()?;
@@ -360,7 +358,7 @@ impl<'a> Machine<'a> {
             0x88 => self.push(Value::Bool(true)),
             0x89 => self.push(Value::Bool(false)),
             b't' => {
-                let items = self.to_mark()?;
+                let items = self.since_mark()?;
                 self.stack.push(tuple(items)?);
             }
             0x85..=0x87 => {
@@ -416,7 +414,7 @@ impl<'a> Machine<'a> {
                 self.append(vec![item])?;
             }
             b'e' => {
-                let items = self.to_mark()?;
+                let items = self.since_mark()?;
                 self.append(items)?;
             }
             b's' => {
@@ -425,7 +423,7 @@ impl<'a> Machine<'a> {
                 self.set(vec![k, v])?;
             }
             b'u' => {
-                let items = self.to_mark()?;
+                let items = self.since_mark()?;
                 self.set(items)?;
             }
             b'c' => {

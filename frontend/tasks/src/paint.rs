@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::api::{Image, Paint, Sizes, Tokens};
 use crate::worker::Worker;
-use sensai_bundle::sprite::{clip_dir, denoiser, denoiser_file, denoiser_offer, text_tower};
+use sensai_bundle::sprite::{denoiser, denoiser_file, denoiser_offer, sprite_config, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::{Model, Recipe, Settings, Tensor};
 use std::path::{Path, PathBuf};
@@ -79,16 +79,21 @@ struct Canvas {
 }
 
 impl Painter {
-    /// `dir/sprite.safetensors` or the upstream `.pt`, with CLIP
-    /// in `dir/clip` or the Hugging Face cache.
-    pub fn open(dir: &Path, settings: &Settings, most: usize) -> Result<Self, Error> {
-        let missing = |what: &str| format!("no {what} for {}", dir.display());
-        let clip_dir = clip_dir(dir).ok_or_else(|| missing("CLIP text tower"))?;
+    /// Sprite weights in `dir`, CLIP in `clip` or `dir/clip`.
+    pub fn open(
+        dir: &Path,
+        clip: Option<&Path>,
+        settings: &Settings,
+        most: usize,
+    ) -> Result<Self, Error> {
+        let clip_dir = clip.map_or_else(|| dir.join("clip"), Path::to_path_buf);
         let c = text_tower(&clip_dir, 1, TEXT as u64)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
-        let file = denoiser_file(dir).ok_or_else(|| missing("sprite weights"))?;
-        let d = denoiser(&*denoiser_offer(&file)?, 2 * most as u64)?;
+        let config = sprite_config(dir, 2 * most as u64)?;
+        let file =
+            denoiser_file(dir).ok_or_else(|| format!("no sprite weights in {}", dir.display()))?;
+        let d = denoiser(&*denoiser_offer(&file, &config)?, &config)?;
         let mut denoiser = Model::open(d.graph, &Recipe::default(), settings)?;
         denoiser.load(&d.weights)?;
         Ok(Self {
@@ -215,9 +220,14 @@ impl Painter {
 
 impl Worker<Painter> {
     /// Opens the painter in `dir` on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings, most: usize) -> Result<Self, Error> {
+    pub fn open(
+        dir: PathBuf,
+        clip: Option<PathBuf>,
+        settings: Settings,
+        most: usize,
+    ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let painter = Painter::open(&dir, &settings, most)?;
+            let painter = Painter::open(&dir, clip.as_deref(), &settings, most)?;
             eprintln!("{}: painter loaded", painter.device());
             Ok(painter)
         })

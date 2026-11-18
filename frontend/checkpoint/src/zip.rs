@@ -1,4 +1,4 @@
-//! Stored entries of a zip archive, found through its central directory.
+//! Stored zip entries, found through the central directory.
 
 use crate::Error;
 use std::collections::BTreeMap;
@@ -38,7 +38,7 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 /// `len` bytes at `at`, inside a file of `size` bytes.
-pub fn read_at(file: &fs::File, at: u64, len: u64, size: u64) -> Result<Vec<u8>, Error> {
+pub(crate) fn read_at(file: &fs::File, at: u64, len: u64, size: u64) -> Result<Vec<u8>, Error> {
     if at.checked_add(len).is_none_or(|end| end > size) {
         return Err(bad("a range runs past the end"));
     }
@@ -49,7 +49,7 @@ pub fn read_at(file: &fs::File, at: u64, len: u64, size: u64) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// Where the central directory lies, and how many entries it holds.
+/// The central directory's offset, length and entry count.
 fn directory(file: &fs::File, size: u64) -> Result<(u64, u64, u64), Error> {
     let tail_len = size.min(22 + 65_535);
     let tail = read_at(file, size - tail_len, tail_len, size)?;

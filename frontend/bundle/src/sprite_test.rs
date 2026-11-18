@@ -1,10 +1,11 @@
 //! The sprite denoiser and CLIP's text tower against torch.
 
-use crate::sprite::{denoiser, denoiser_offer, hub_snapshot, text_tower};
+use crate::sprite::{denoiser, denoiser_offer, text_tower};
 use sensai_checkpoint::{File, Offer, Torch};
+use sensai_engine::sprite::Config;
 use sensai_engine::{Graph, Model, Pick, Recipe, Settings, Tensor, Weight};
 use sensai_testkit::cosine_f32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TEXT: usize = 24;
 const WIDTH: usize = 512;
@@ -64,7 +65,7 @@ fn matches_torch() {
     let r = File::open(&dir.join("ref.safetensors")).unwrap();
     let states = states(&dir.join("clip"), &r);
     let offer = File::open(&dir.join("sprite.safetensors")).unwrap();
-    let d = denoiser(&offer, 4).unwrap();
+    let d = denoiser(&offer, &Config::small(4)).unwrap();
     let canvas = ints(&r, "den.canvas");
     let masked = |c: &[u32]| c.iter().filter(|&&t| t == MASK).count() as u32;
     let counts: Vec<u32> = canvas.chunks(PIXELS).map(masked).collect();
@@ -81,7 +82,7 @@ fn matches_torch() {
     close("denoiser logits", &logits, &r.floats("den.logits").unwrap());
 }
 
-/// Every tensor in `want` against `got`, within `tol` of the largest value.
+/// `want`'s tensors in `got`, within `tol` of their largest value.
 fn same(got: &dyn Offer, want: &File, tol: f32) {
     let shapes = |o: &dyn Offer| {
         let mut s: Vec<_> = o.slices().into_iter().map(|s| (s.name, s.shape)).collect();
@@ -104,22 +105,26 @@ fn same(got: &dyn Offer, want: &File, tol: f32) {
     }
 }
 
+/// The cached snapshot `refs/main` names for `repo`.
+fn snapshot(repo: &str) -> Option<PathBuf> {
+    let hub = sensai_frontend_settings::read().hub?;
+    let dir = hub.join(format!("models--{}", repo.replace('/', "--")));
+    let main = std::fs::read_to_string(dir.join("refs/main")).ok()?;
+    Some(dir.join("snapshots").join(main.trim()))
+}
+
 #[test]
 fn upstream_matches_converted() {
-    let pt = |p: &Path| p.join("tessera-small-fp16.pt").is_file();
-    let (Some(dir), Some(snap)) = (
+    let (Some(dir), Some(snap), Some(clip)) = (
         sensai_testkit::reference("sprite"),
-        hub_snapshot("thejagstudio/tessera-small", pt),
+        snapshot("thejagstudio/tessera-small"),
+        snapshot("openai/clip-vit-base-patch32"),
     ) else {
         return eprintln!("no sprite checkpoints here; skipped");
     };
-    let upstream = denoiser_offer(&snap.join("tessera-small-fp16.pt")).unwrap();
+    let pt = denoiser_offer(&snap.join("tessera-small-fp16.pt"), &Config::small(1)).unwrap();
     let converted = File::open(&dir.join("sprite.safetensors")).unwrap();
-    same(&*upstream, &converted, 1e-5);
-    let bin = |p: &Path| p.join("pytorch_model.bin").is_file();
-    let Some(clip) = hub_snapshot("openai/clip-vit-base-patch32", bin) else {
-        return eprintln!("no CLIP pytorch_model.bin here; skipped");
-    };
+    same(&*pt, &converted, 1e-5);
     let torch = Torch::open(&clip.join("pytorch_model.bin")).unwrap();
     same(
         &torch,

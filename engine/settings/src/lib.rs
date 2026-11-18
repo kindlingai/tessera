@@ -52,6 +52,8 @@ pub struct Settings {
     pub verbs: Option<String>,
     /// The plan size the runners refuse past.
     pub memory: Memory,
+    /// The Hugging Face hub cache.
+    pub hub: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -66,6 +68,7 @@ impl Default for Settings {
             emulate: None,
             verbs: None,
             memory: Memory::Device,
+            hub: None,
         }
     }
 }
