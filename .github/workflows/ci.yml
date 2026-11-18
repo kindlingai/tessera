@@ -342,19 +342,26 @@ jobs:
     needs: [changes, commits, lint, linux, features, grammar, macos, similarity, platforms, style]
     runs-on: ubuntu-slim
     steps:
-      # Skips come only from `changes`, so it must pass itself.
+      - uses: actions/checkout@v4
+      # Skips come only from `changes`, so it must pass itself. A job
+      # that no hosted runner took counts as skipped, so a runner
+      # outage does not remove a merge queue entry.
       - env:
+          GH_TOKEN: ${{ github.token }}
           CHANGES: ${{ needs.changes.result }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           echo "changes: $CHANGES, job results: $RESULTS"
           [ "$CHANGES" = success ] || exit 1
           for r in $RESULTS; do
-            case "$r" in success | skipped) ;; *) exit 1 ;; esac
+            case "$r" in
+            success | skipped) ;;
+            cancelled) cancelled=1 ;;
+            *) exit 1 ;;
+            esac
           done
+          [ -z "$cancelled" ] || tools/scripts/runner-missing.sh
       # Protected files and fork settings: see protected.yml.
-      - if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
       - if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
