@@ -7,7 +7,8 @@ use sensai_codegen::prelude::*;
 use sensai_graph::Order;
 use sensai_lower::form::Load as Stored;
 use sensai_lower::kernels::finish;
-use sensai_lower::{Draft, Kernel, Launch, Load, Needs, Shape, Step, T, Tree};
+use sensai_lower::sites::Near;
+use sensai_lower::{Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree};
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub struct Schedule {
     pub simds: (usize, usize),
     /// Its cost curve's name. The weight form adds a suffix.
     pub name: &'static str,
+    /// The same, reading neighbours by id.
+    pub near: &'static str,
 }
 
 /// Every matmul's schedules. `w16` SIMD groups own 16 by 16.
@@ -26,31 +29,37 @@ pub const SCHEDULES: [Schedule; 6] = [
         block: (64, 64, 32),
         simds: (2, 2),
         name: "tiled_64x64",
+        near: "near_64x64",
     },
     Schedule {
         block: (32, 64, 32),
         simds: (1, 2),
         name: "tiled_32x64",
+        near: "near_32x64",
     },
     Schedule {
         block: (128, 64, 32),
         simds: (4, 2),
         name: "tiled_128x64",
+        near: "near_128x64",
     },
     Schedule {
         block: (64, 128, 32),
         simds: (2, 4),
         name: "tiled_64x128",
+        near: "near_64x128",
     },
     Schedule {
         block: (64, 64, 32),
         simds: (4, 4),
         name: "tiled_64x64_w16",
+        near: "near_64x64_w16",
     },
     Schedule {
         block: (32, 32, 32),
         simds: (2, 2),
         name: "tiled_32x32_w16",
+        near: "near_32x32_w16",
     },
 ];
 
@@ -70,6 +79,9 @@ const PAD: u32 = 4;
 
 /// Elements one wide load brings.
 const WIDE: u32 = 4;
+
+/// Pixels a 3x3 kernel reads.
+const TAPS: u32 = 9;
 
 /// Stages `span` rows of `src` from `r0`, `k0`, zero outside.
 #[kernel]
@@ -118,47 +130,124 @@ fn stage<F: Elems<Elem = f32>>(
     }
 }
 
-/// Stages a block of `x` and `w`, then multiplies.
+/// Stages rows of neighbours, one tap: `bk` divides `cin`.
 #[kernel]
-fn tiled(
-    x: Buf<F32>,
-    #[form(form)] w: Buf<Dyn>,
-    out: BufMut<F32>,
-    m: u32,
-    n: u32,
-    k: u32,
-    #[build] bm: u32,
-    #[build] bn: u32,
+fn stage_near<F: Elems<Elem = f32>>(
+    dst: &mut Shared<f32>,
+    #[form(form)] src: Buf<F>,
+    ids: Buf<U32>,
+    r0: u32,
+    k0: u32,
+    limit: u32,
+    pixels: u32,
+    cin: u32,
+    #[build] span: u32,
     #[build] bk: u32,
-    #[build] wm: u32,
-    #[build] wn: u32,
-    #[build] simds_n: u32,
     #[build] threads: u32,
-    #[build] wide: bool,
     #[build] form: &'static dyn Stored,
 ) {
-    let simd = lid() / LANES as u32;
-    let group = gid() / threads;
-    let row0 = (group / ((n + bn - 1) / bn)) * bm;
-    let col0 = (group % ((n + bn - 1) / bn)) * bn;
-    let wm0 = (simd / simds_n) * wm;
-    let wn0 = (simd % simds_n) * wn;
-    let mut a_s = shared::<f32>(bm * (bk + PAD));
-    let mut b_s = shared::<f32>(bn * (bk + PAD));
-    let mut acc = tiles(wm, wn);
-    for k0 in (0..k).by(bk) {
-        stage(&mut a_s, x, row0, k0, m, k, bm, bk, threads, wide, F32_FORM);
-        stage(&mut b_s, w, col0, k0, n, k, bn, bk, threads, wide, form);
-        barrier();
-        acc.block(&a_s, wm0 * (bk + PAD), &b_s, wn0 * (bk + PAD), bk + PAD, bk);
-        barrier();
+    let tap = k0 / cin;
+    let c0 = k0 % cin;
+    for i in (lid()..span * (bk / WIDE)).by(threads) {
+        let r = i / (bk / WIDE);
+        let c = (i % (bk / WIDE)) * WIDE;
+        let at = r * (bk + PAD) + c;
+        let row = r0 + r;
+        let p = row % pixels;
+        let mut id = pixels;
+        if row < limit {
+            id = ids[(p * TAPS + tap) as u64];
+        }
+        if id < pixels {
+            let v = src.load4((row - p + id) as u64 * cin as u64 + (c0 + c) as u64);
+            dst[at] = v.x;
+            dst[at + 1] = v.y;
+            dst[at + 2] = v.z;
+            dst[at + 3] = v.w;
+        } else {
+            dst[at] = 0.0;
+            dst[at + 1] = 0.0;
+            dst[at + 2] = 0.0;
+            dst[at + 3] = 0.0;
+        }
     }
 }
+
+/// A tiled kernel. The caller names what its staging reads.
+macro_rules! tiled_kernel {
+    (
+        $(#[$doc:meta])* $name:ident,
+        [$x:ident, $a:ident, $row0:ident, $k0:ident, $m:ident, $k:ident],
+        [$bm:ident, $bk:ident, $threads:ident, $wide:ident],
+        [$($bufs:tt)*],
+        [$($scalars:tt)*],
+        [$($stage:tt)*]
+    ) => {
+        $(#[$doc])*
+        #[kernel]
+        fn $name(
+            $x: Buf<F32>,
+            #[form(form)] w: Buf<Dyn>,
+            $($bufs)*
+            out: BufMut<F32>,
+            $m: u32,
+            n: u32,
+            $k: u32,
+            $($scalars)*
+            #[build] $bm: u32,
+            #[build] bn: u32,
+            #[build] $bk: u32,
+            #[build] wm: u32,
+            #[build] wn: u32,
+            #[build] simds_n: u32,
+            #[build] $threads: u32,
+            #[build] $wide: bool,
+            #[build] form: &'static dyn Stored,
+        ) {
+            let simd = lid() / LANES as u32;
+            let group = gid() / $threads;
+            let $row0 = (group / ((n + bn - 1) / bn)) * $bm;
+            let col0 = (group % ((n + bn - 1) / bn)) * bn;
+            let wm0 = (simd / simds_n) * wm;
+            let wn0 = (simd % simds_n) * wn;
+            let mut $a = shared::<f32>($bm * ($bk + PAD));
+            let mut b_s = shared::<f32>(bn * ($bk + PAD));
+            let mut acc = tiles(wm, wn);
+            for $k0 in (0..$k).by($bk) {
+                $($stage)*;
+                stage(&mut b_s, w, col0, $k0, n, $k, bn, $bk, $threads, $wide, form);
+                barrier();
+                acc.block(&$a, wm0 * ($bk + PAD), &b_s, wn0 * ($bk + PAD), $bk + PAD, $bk);
+                barrier();
+            }
+        }
+    };
+}
+
+tiled_kernel!(
+    /// Stages a block of `x` and `w`, then multiplies.
+    tiled,
+    [x, a_s, row0, k0, m, k],
+    [bm, bk, threads, wide],
+    [],
+    [],
+    [stage(&mut a_s, x, row0, k0, m, k, bm, bk, threads, wide, F32_FORM)]
+);
+
+tiled_kernel!(
+    /// `tiled`, its rows each pixel's neighbours, gathered while staged.
+    tiled_near,
+    [x, a_s, row0, k0, m, k],
+    [bm, bk, threads, wide],
+    [ids: Buf<U32>,],
+    [pixels: u32, cin: u32,],
+    [stage_near(&mut a_s, x, ids, row0, k0, m, pixels, cin, bm, bk, threads, F32_FORM)]
+);
 
 /// `x[m, k]` times `w[n, k]` transposed, by tiles.
 #[derive(Clone, Debug, Kernel)]
 #[launch(
-    name = self.product.form.suffixed(self.schedule.name),
+    name = self.product.form.suffixed(self.name()),
     sizes = self.product.sizes(),
     work = self.product.work(),
     accepts = self.product.accepts(input, form),
@@ -176,6 +265,13 @@ pub struct Tiled {
 }
 
 impl Tiled {
+    fn name(&self) -> &'static str {
+        match self.product.near {
+            Some(_) => self.schedule.near,
+            None => self.schedule.name,
+        }
+    }
+
     fn groups(&self) -> (usize, usize) {
         let (bm, bn, _) = self.schedule.block;
         (self.product.m.div_ceil(bm), self.product.n.div_ceil(bn))
@@ -185,15 +281,20 @@ impl Tiled {
     fn tree(&self) -> Body {
         let Product { k, form, .. } = self.product;
         let wide = k.is_multiple_of(WIDE as usize);
+        let near = self.product.near.is_some();
         let build = || {
             let s = &self.schedule;
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
-            tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form)
+            match near {
+                true => tiled_near_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form),
+                false => tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form),
+            }
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
-        let key: Variant = ("tiled", at.expect("a listed schedule"), form.name(), wide);
+        let kind = if near { "tiled_near" } else { "tiled" };
+        let key: Variant = (kind, at.expect("a listed schedule"), form.name(), wide);
         let mut body = self.product.tree(key, build);
         body.stmts.push(self.stores());
         body
@@ -239,7 +340,16 @@ fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
     let (gm, gn) = t.groups();
     let (_, _, bk) = t.schedule.block;
     // Neighbouring groups share `x` rows. `w` streams per row.
-    let mut reads = vec![4.0 * mf * k as f64, form.bytes(n * k) as f64 * gm as f64];
+    let rows = match t.product.near {
+        Some(near) => 4.0 * mf * near.cin as f64,
+        None => 4.0 * mf * k as f64,
+    };
+    let mut reads = vec![rows, form.bytes(n * k) as f64 * gm as f64];
+    reads.extend(
+        t.product
+            .near
+            .map(|near| (4 * near.pixels * near.taps) as f64),
+    );
     reads.extend((0..t.product.after.others()).map(|_| 4.0 * mf * nf));
     Some(Load {
         threads: gm * gn * t.schedule.threads(),
@@ -261,7 +371,12 @@ fn tiled_launches(t: &Tiled, step: &Step) -> Vec<Launch> {
         down: 1,
         threads: t.schedule.threads(),
     };
-    t.product.launch(step, &[m, n, k], shape)
+    match t.product.near {
+        Some(near) => t
+            .product
+            .launch(step, &[m, n, k, near.pixels, near.cin], shape),
+        None => t.product.launch(step, &[m, n, k], shape),
+    }
 }
 
 /// Two staged slabs of `bk + PAD` floats a row.
@@ -282,14 +397,45 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     // Each schedule is one way, so the cheapest wins.
-    let draft = |(choice, schedule): (usize, &Schedule)| {
+    let draft = |product: &Product, reads: &[Read], (choice, schedule): (usize, &Schedule)| {
         let tiled = Tiled {
             product: product.clone(),
             schedule: *schedule,
         };
-        Draft::new(tiled, reads.clone(), product.outputs()).choice(choice)
+        Draft::new(tiled, reads.to_vec(), product.outputs()).choice(choice)
     };
-    Some(SCHEDULES.iter().enumerate().map(draft).collect())
+    let mut drafts: Vec<Draft> = (SCHEDULES.iter().enumerate())
+        .map(|c| draft(&product, &reads, c))
+        .collect();
+    // Neighbours gathered while staged: the nine-fold input is never made.
+    if let Some((near, reads)) = gathered(tree, &product, &reads) {
+        let product = Product {
+            near: Some(near),
+            ..product.clone()
+        };
+        let ways = SCHEDULES
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (SCHEDULES.len() + i, s));
+        drafts.extend(ways.map(|c| draft(&product, &reads, c)));
+    }
+    Some(drafts)
+}
+
+/// The input's neighbours, and reads that skip the gather.
+fn gathered(tree: &Tree, product: &Product, reads: &[Read]) -> Option<(Near, Vec<Read>)> {
+    let Read::Node(x) = reads[0] else {
+        return None;
+    };
+    let near: Near = tree.site(x)?;
+    let fits = |s: &Schedule| near.cin.is_multiple_of(s.block.2);
+    if near.taps != TAPS as usize || !SCHEDULES.iter().all(fits) || product.picked.is_some() {
+        return None;
+    }
+    let mut reads = reads.to_vec();
+    reads[0] = Read::Node(near.src);
+    reads.insert(2, Read::Node(near.ids));
+    Some((near, reads))
 }
 
 sensai_lower::rule!("tiled", propose);

@@ -21,6 +21,7 @@ fn tiled_text(dialect: Dialect) -> (String, String) {
             form: sensai_lower::form::F32_FORM,
             after: After::default(),
             picked: None,
+            near: None,
         },
         schedule: SCHEDULES[0],
     };

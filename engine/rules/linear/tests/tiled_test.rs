@@ -173,6 +173,7 @@ fn m3_ranks() {
             form: BF16_FORM,
             after: After::default(),
             picked: None,
+            near: None,
         };
         let load = Tiled {
             product,
@@ -185,4 +186,48 @@ fn m3_ranks() {
     let (w16, rest): (Vec<_>, Vec<_>) = SCHEDULES.iter().partition(|s| s.name.ends_with("w16"));
     let slowest = w16.iter().map(seconds).fold(0.0, f64::max);
     assert!(rest.iter().all(|s| seconds(s) > slowest));
+}
+
+/// Neighbours gathered while staged, against the interpreter.
+#[test]
+fn near_matches_cpu() {
+    let g =
+        sensai_testkit::graphs::neighbours(&[sensai_trace::Dim::bounded(Rows, 64)], [12, 9, 32]);
+    let mut draws = Noise(31);
+    // Ids past the twelve rows read zeros.
+    let ids = (0..12 * 9).map(|i| ((i / 9 + i % 9) % 13) as f32).collect();
+    let weights = [
+        Tensor::f32(vec![12, 9], ids),
+        noise(vec![32, 288], &mut draws),
+    ];
+    let x = [0, 1].map(|_| noise(vec![2, 12, 32], &mut draws));
+    let want = run(&g, &weights, 0, &x).unwrap().remove(1);
+    for settings in runs() {
+        let plain = |d: Device, s: &Schedule| d.without(s.name);
+        let device = SCHEDULES
+            .iter()
+            .fold(Device::guess(&settings).favoring("tiled"), plain);
+        let plan = lower(&g, 0, &[(Rows, 2)], &device).unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| s.kernel.name().starts_with("near_"))
+        );
+        let mut runner = open(plan, &settings).unwrap();
+        for (at, w) in weights.iter().enumerate() {
+            runner.load(at as u32, w.view()).unwrap();
+        }
+        let got = runner
+            .run(&x.each_ref().map(Tensor::view))
+            .unwrap()
+            .remove(1);
+        let (got, want) = (got.floats().unwrap(), want.floats().unwrap());
+        let most = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let off = max_abs_diff(got, want);
+        assert!(
+            off < most * 1e-4,
+            "{}: off by {off:e} of {most:e}",
+            runner.device()
+        );
+    }
 }
