@@ -10,6 +10,7 @@ pub fn host() -> Settings {
 
 /// The host, then this build's GPU when one is ready.
 pub fn runs() -> Vec<Settings> {
+    sensai_gpukit::testing::require_gpu();
     let mut runs = vec![host()];
     if let Some(b) = gpu() {
         runs.push(Settings {
