@@ -279,7 +279,7 @@ pub(crate) fn step_ports(m: &Model, masked: bool) -> ([Tensor; 3], Option<Tensor
 }
 
 /// The most token ids one sparse pick chooses from.
-pub const FEW: u64 = 128;
+pub const FEW: u64 = 4096;
 
 /// A sparse step entry's rows, and each row's candidate ids.
 pub(crate) fn sparse_ports(m: &Model) -> [Tensor; 4] {

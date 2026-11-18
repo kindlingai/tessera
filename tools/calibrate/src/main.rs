@@ -2,7 +2,7 @@
 
 use sensai_calibrate::probe::{fit, links, read, suite};
 use sensai_calibrate::{Grid, headroom, judge};
-use sensai_calibrate::{bench, plans};
+use sensai_calibrate::{bench, guided, plans};
 use sensai_lower::{Cluster, Device, Pick, Settings, Step};
 use sensai_sim::{Chip, known};
 use std::error::Error;
@@ -150,6 +150,14 @@ fn main() -> ExitCode {
         Some("bench") => marks(&settings, &args[1..]),
         Some("probe") => probe(&settings),
         Some("plans") => plans(&settings),
+        Some("guided") => guided::report(
+            &settings,
+            args.get(1)
+                .filter(|a| *a == "--favor")
+                .and(args.get(2))
+                .cloned(),
+        )
+        .map_err(Into::into),
         _ => run(&settings),
     } {
         Ok(()) => ExitCode::SUCCESS,

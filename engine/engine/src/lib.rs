@@ -261,13 +261,16 @@ impl Engine {
                 _ => break,
             }
         }
-        if self.sparse && lists.len() == allowed.len() {
-            let k = lists
-                .iter()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(1)
-                .next_power_of_two();
+        let k = lists
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .next_power_of_two();
+        let gathered = picks.len().next_power_of_two() * k;
+        let words = self.words.ok_or(Error::Mask)?;
+        // Past half the vocabulary, the full head reads less.
+        if self.sparse && lists.len() == allowed.len() && 2 * gathered <= 32 * words {
             let mut ids = Vec::with_capacity(lists.len() * k);
             for list in &lists {
                 // Repeats of the first id never win over it.
@@ -276,7 +279,6 @@ impl Engine {
             let at = self.launch(rows, &picks, Head::Sparse(ids, k))?;
             return Ok(lists.iter().zip(at).map(|(l, i)| l[i as usize]).collect());
         }
-        let words = self.words.ok_or(Error::Mask)?;
         let bits = allowed.iter().flat_map(|a| a.bits(words)).collect();
         self.launch(rows, &picks, Head::Full(Some(bits)))
     }

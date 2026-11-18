@@ -2,6 +2,7 @@
 
 pub mod bench;
 mod grid;
+pub mod guided;
 pub mod plans;
 pub mod probe;
 
