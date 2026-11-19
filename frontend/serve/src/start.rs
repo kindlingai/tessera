@@ -15,7 +15,7 @@ use std::time::Instant;
 /// The flags `Options::flag` and `Options::switch` take.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
-[--max-connections <n>] [--reject-unknown-fields] [--guided]";
+[--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix]";
 
 /// What the loaded model serves.
 #[derive(Clone, Copy, PartialEq)]
@@ -49,6 +49,8 @@ pub struct Options {
     pub strict: bool,
     /// Answers may ask for a `response_format`.
     pub guided: bool,
+    /// A prompt that continues an answer keeps its rows.
+    pub reuse: bool,
     pub max_connections: usize,
     /// The largest picture klein paints, in pixels a side.
     pub image_size: usize,
@@ -76,6 +78,7 @@ impl Default for Options {
             task: Task::Generate,
             strict: false,
             guided: false,
+            reuse: false,
             max_connections: 64,
             image_size: 512,
             clip: None,
@@ -93,6 +96,7 @@ impl Options {
         match flag {
             "--reject-unknown-fields" => self.strict = true,
             "--guided" => self.guided = true,
+            "--reuse-prefix" => self.reuse = true,
             _ => return false,
         }
         true
@@ -210,6 +214,9 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
     };
     let _ = slot.set(model);
     let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    if o.reuse {
+        batch.reuse();
+    }
     loop {
         // Takes every job that has arrived. Waits only when idle.
         let job = match batch.busy() {
