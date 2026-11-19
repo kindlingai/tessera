@@ -156,14 +156,18 @@ pub(crate) fn wanted<'a>(names: &'a [String], folders: Option<&[String]>) -> Vec
 /// An exlr8 release's files, with experts at `width` only.
 pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
     // The shared expert has no K2 codes.
-    let codes = [format!(".k{width}"), format!(".k{}", width.max(3))];
+    let codes = [
+        format!(".k{width}.safetensors"),
+        format!(".k{}.safetensors", width.max(3)),
+    ];
     let mut out = Vec::new();
     for name in names {
         let keep = match name.split_once('/') {
             None => KEEP.iter().any(|k| name.ends_with(k)),
             Some(("dense", file)) => file.ends_with(".safetensors"),
             Some(("experts", file)) => {
-                file.ends_with(".index") || codes.iter().any(|c| file.ends_with(c.as_str()))
+                file.ends_with(".index.safetensors")
+                    || codes.iter().any(|c| file.ends_with(c.as_str()))
             }
             Some(_) => false,
         };
