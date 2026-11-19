@@ -3,6 +3,7 @@
 use std::io::Read;
 use std::path::Path;
 
+const HOST: &str = "huggingface.co";
 const REPO: &str = "https://huggingface.co/spacy/en_core_web_sm/resolve";
 /// en_core_web_sm 3.7.1. The parity tests check this revision.
 pub const REVISION: &str = "8fb6f8155286360bf5486fe399e2738d1df7ded2";
@@ -15,11 +16,22 @@ const FILES: [&str; 5] = [
     "vocab/lookups.bin",
 ];
 
+/// An agent on the environment's proxy, if `HOST` has one.
+fn agent() -> Result<ureq::Agent, String> {
+    match sensai_frontend_settings::proxy(HOST) {
+        None => Ok(ureq::Agent::new()),
+        Some(url) => ureq::Proxy::new(&url)
+            .map(|p| ureq::AgentBuilder::new().proxy(p).build())
+            .map_err(|e| format!("{url}: {e}")),
+    }
+}
+
 pub fn fetch(dir: &Path) -> Result<(), String> {
+    let agent = agent()?;
     for name in FILES {
         let url = format!("{REPO}/{REVISION}/{name}");
         let mut bytes = Vec::new();
-        let response = ureq::get(&url).call().map_err(|e| format!("{url}: {e}"))?;
+        let response = agent.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
         response
             .into_reader()
             .read_to_end(&mut bytes)

@@ -15,3 +15,19 @@ fn reads_variables() {
     assert_eq!(s.memory, sensai_engine::Memory::Bytes(24 << 30));
     assert_eq!(s.check, Some(std::path::PathBuf::from("/shared/check")));
 }
+
+#[test]
+fn selects_proxy() {
+    use crate::select;
+    let (none, some) = (None, Some("http://proxy:3128".to_string()));
+    let no = |names: &str| Some(names.to_string());
+    let host = "huggingface.co";
+    assert_eq!(select(&some, &none, &None, host), Some("http://proxy:3128"));
+    assert_eq!(select(&none, &some, &None, host), Some("http://proxy:3128"));
+    assert_eq!(select(&none, &none, &None, host), None);
+    assert_eq!(select(&some, &none, &no(".co, .org"), host), None);
+    assert_eq!(
+        select(&some, &none, &no(".org"), host),
+        Some("http://proxy:3128")
+    );
+}

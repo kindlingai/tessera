@@ -18,9 +18,39 @@ fn url(file: &str) -> String {
     format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{file}")
 }
 
+/// An agent on the environment's proxy, honouring `NO_PROXY`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "its own workspace, apart from the front end"
+)]
+fn agent() -> Result<ureq::Agent> {
+    const HOST: &str = "huggingface.co";
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let no = var("NO_PROXY")
+        .or_else(|| var("no_proxy"))
+        .unwrap_or_default();
+    for name in no.split(',') {
+        let name = name.trim().trim_start_matches('.');
+        if name == "*" || HOST == name || HOST.ends_with(&format!(".{name}")) {
+            return Ok(ureq::Agent::new());
+        }
+    }
+    let url = var("HTTPS_PROXY")
+        .or_else(|| var("https_proxy"))
+        .or_else(|| var("HTTP_PROXY"))
+        .or_else(|| var("http_proxy"));
+    match url {
+        Some(url) => Ok(ureq::AgentBuilder::new()
+            .proxy(ureq::Proxy::new(&url)?)
+            .build()),
+        None => Ok(ureq::Agent::new()),
+    }
+}
+
 /// Bytes `start..end` of a remote file, as a stream.
-fn range(url: &str, start: u64, end: u64) -> Result<impl Read> {
-    let resp = ureq::get(url)
+fn range(agent: &ureq::Agent, url: &str, start: u64, end: u64) -> Result<impl Read> {
+    let resp = agent
+        .get(url)
         .set("Range", &format!("bytes={start}-{}", end - 1))
         .call()
         .with_context(|| format!("GET {url} bytes {start}..{end}"))?;
@@ -40,12 +70,12 @@ struct Tensor {
 }
 
 /// The remote header's `language_model.*` tensors, by file offset.
-fn text_tensors(model: &str) -> Result<(Map<String, Value>, Vec<Tensor>)> {
+fn text_tensors(agent: &ureq::Agent, model: &str) -> Result<(Map<String, Value>, Vec<Tensor>)> {
     let mut len = [0u8; 8];
-    range(model, 0, 8)?.read_exact(&mut len)?;
+    range(agent, model, 0, 8)?.read_exact(&mut len)?;
     let header_len = u64::from_le_bytes(len);
     let mut text = Vec::new();
-    range(model, 8, 8 + header_len)?.read_to_end(&mut text)?;
+    range(agent, model, 8, 8 + header_len)?.read_to_end(&mut text)?;
     let header: Map<String, Value> = serde_json::from_slice(&text)?;
     let base = 8 + header_len;
     let mut kept = Vec::new();
@@ -91,12 +121,13 @@ fn packed_header(header: &Map<String, Value>, kept: &[Tensor]) -> Result<Vec<u8>
 /// Writes config, tokenizer and text-only weights into `out`.
 pub fn fetch(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out)?;
+    let agent = agent()?;
     for f in SMALL {
-        let mut body = ureq::get(&url(f)).call()?.into_reader();
+        let mut body = agent.get(&url(f)).call()?.into_reader();
         std::io::copy(&mut body, &mut File::create(out.join(f))?)?;
     }
     let model = url("model.safetensors");
-    let (header, kept) = text_tensors(&model)?;
+    let (header, kept) = text_tensors(&agent, &model)?;
     let hdr = packed_header(&header, &kept)?;
     let file = File::create(out.join("model.safetensors"))?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
@@ -108,7 +139,7 @@ pub fn fetch(out: &Path) -> Result<()> {
         while j < kept.len() && kept[j].start <= kept[j - 1].end + MERGE_GAP {
             j += 1;
         }
-        let mut body = range(&model, kept[i].start, kept[j - 1].end)?;
+        let mut body = range(&agent, &model, kept[i].start, kept[j - 1].end)?;
         let mut pos = kept[i].start;
         for t in &kept[i..j] {
             std::io::copy(&mut (&mut body).take(t.start - pos), &mut std::io::sink())?;
