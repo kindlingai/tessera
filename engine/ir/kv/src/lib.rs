@@ -4,7 +4,7 @@ mod pool;
 mod prefix;
 mod reuse;
 
-pub use pool::{Error, PageCopy, Pool, RunId, Tag};
+pub use pool::{Error, PageCopy, Pool, RunId, Stats, Tag};
 pub use prefix::Prefixes;
 pub use reuse::{Begin, Why, begin};
 

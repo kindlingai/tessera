@@ -7,6 +7,11 @@ fn admission_counts_worst() {
     let mut pool = Pool::new(4, 2);
     let a = pool.reserve(T, 1, 6).unwrap();
     assert_eq!(pool.reserve(T, 1, 4), Err(Error::NoRoom(2)));
+    let stats = pool.stats();
+    assert_eq!((stats.size, stats.active, stats.worst), (8, 2, 6));
+    pool.retain(a).unwrap();
+    let stats = pool.stats();
+    assert_eq!((stats.live_runs, stats.kept_runs, stats.active), (0, 1, 0));
     pool.release(a).unwrap();
     pool.reserve(T, 1, 8).unwrap();
 }

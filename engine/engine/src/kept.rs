@@ -1,8 +1,18 @@
 //! Finished answers' rows, kept for prompts that continue them.
 
-use sensai_kv::{Pool, Prefixes, RunId, Tag};
+use sensai_kv::{Pool, Prefixes, RunId, Stats, Tag};
 
 const TAG: Tag = Tag(0);
+
+/// The kept rows' pool, and how prompts met it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub pool: Stats,
+    /// Admitted prompts that started on kept rows.
+    pub hits: u64,
+    /// Admitted prompts that started with no rows.
+    pub misses: u64,
+}
 
 /// Dense: each slot is one page of `context` rows.
 pub(crate) struct Kept {
@@ -15,6 +25,8 @@ pub(crate) struct Kept {
     free: Vec<u32>,
     /// Paged: the pages each slot's lane names.
     laned: Option<Vec<usize>>,
+    hits: u64,
+    misses: u64,
 }
 
 impl Kept {
@@ -26,6 +38,8 @@ impl Kept {
             runs: vec![None; slots],
             free: Vec::new(),
             laned: None,
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -57,6 +71,7 @@ impl Kept {
             };
             let slot = self.pool.pages(run).ok()?[0];
             self.runs[slot as usize] = Some(run);
+            self.count(skip);
             return Some((slot, skip));
         };
         let slot = *self.free.last()?;
@@ -71,7 +86,23 @@ impl Kept {
         self.free.pop();
         self.runs[slot as usize] = Some(run);
         laned[slot as usize] = 0;
+        self.count(skip);
         Some((slot, skip))
+    }
+
+    fn count(&mut self, skip: usize) {
+        match skip {
+            0 => self.misses += 1,
+            _ => self.hits += 1,
+        }
+    }
+
+    pub fn totals(&self) -> Totals {
+        Totals {
+            pool: self.pool.stats(),
+            hits: self.hits,
+            misses: self.misses,
+        }
     }
 
     /// Paged: the slot's pages, if its lane lacks some.

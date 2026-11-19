@@ -43,3 +43,17 @@ fn small_routes() {
     assert_eq!(embedded["data"][1]["embedding"], json!([3.0]));
     assert_eq!(embedded["usage"]["prompt_tokens"], 2);
 }
+
+#[test]
+fn metrics_text() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), false);
+    assert_eq!(call(&slot, "/metrics", None), (200, String::new()));
+    let mut totals = sensai_engine::Totals::default();
+    (totals.pool.size, totals.pool.active, totals.hits) = (64, 16, 3);
+    *slot.get().unwrap().kv.lock().unwrap() = Some(totals);
+    let (_, text) = call(&slot, "/metrics", None);
+    let has = |line: &str| text.lines().any(|l| l == line);
+    assert!(has("# TYPE vllm:kv_cache_size_tokens gauge"));
+    assert!(has("vllm:kv_cache_size_tokens 64") && has("vllm:kv_active_tokens 16"));
+    assert!(has("tessera:kv_hits_total 3"));
+}

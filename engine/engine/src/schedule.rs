@@ -1,6 +1,6 @@
 //! Many answers in flight, one step feeding them all.
 
-use crate::kept::Kept;
+use crate::kept::{Kept, Totals};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
@@ -184,6 +184,11 @@ impl<'a> Batch<'a> {
             Some(lanes) => Kept::paged(slots, context, lanes.pages(), lanes.page),
             None => Kept::new(slots, context),
         });
+    }
+
+    /// The kept rows' totals. None without `reuse`.
+    pub fn totals(&self) -> Option<Totals> {
+        self.kept.as_ref().map(Kept::totals)
     }
 
     /// Queues an answer. An unfit prompt ends at once.

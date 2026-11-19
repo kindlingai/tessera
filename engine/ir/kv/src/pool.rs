@@ -54,6 +54,19 @@ struct Slot {
     run: Option<Run>,
 }
 
+/// A pool's totals. Row counts are whole pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Rows the pool holds.
+    pub size: usize,
+    /// Rows in pages that live runs hold.
+    pub active: usize,
+    /// Rows live runs may grow to.
+    pub worst: usize,
+    pub live_runs: usize,
+    pub kept_runs: usize,
+}
+
 /// Pages and their holders. Equal calls give equal pools.
 pub struct Pool {
     page: usize,
@@ -103,6 +116,24 @@ impl Pool {
         live.filter(|r| r.retired.is_none())
             .map(|r| self.need(r))
             .sum()
+    }
+
+    pub fn stats(&self) -> Stats {
+        let held = self.live.iter().filter(|l| **l > 0).count();
+        let mut stats = Stats {
+            size: self.live.len() * self.page,
+            active: held * self.page,
+            ..Stats::default()
+        };
+        for run in self.slots.iter().filter_map(|s| s.run.as_ref()) {
+            if run.retired.is_some() {
+                stats.kept_runs += 1;
+                continue;
+            }
+            stats.live_runs += 1;
+            stats.worst += self.span(run.worst) * self.page;
+        }
+        stats
     }
 
     /// A live run of `rows` that may grow to `worst`.

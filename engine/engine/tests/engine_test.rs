@@ -325,6 +325,9 @@ fn kept_rows_resume() {
         batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
         batch.step().unwrap();
         assert_eq!(taken.try_iter().next(), Some(Event::Kept(2)));
+        let totals = batch.totals().unwrap();
+        assert_eq!((totals.hits, totals.misses), (3, 1));
+        assert_eq!((totals.pool.size, totals.pool.active), (32, 16));
     }
 }
 

@@ -18,6 +18,7 @@ mod ranks;
 mod schedule;
 
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
+pub use kept::Totals;
 pub use model::Model;
 pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
