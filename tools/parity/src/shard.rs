@@ -4,7 +4,7 @@ use super::{Spec, host, runs};
 use sensai_graph::{Graph, Parts, Placement, Sharded, shard};
 use sensai_interp::{Tensor, run, run_parts, run_ranks};
 use sensai_lower::form::BF16_FORM;
-use sensai_lower::{Cluster, Device, View, Weight, lower};
+use sensai_lower::{Cluster, Device, Link, View, Weight, lower};
 use sensai_run::Loopback;
 use sensai_testkit::{Noise, fill, max_abs_diff};
 use sensai_trace::DimName::{Context, Rows, Seqs};
@@ -16,6 +16,22 @@ const RANKS: usize = 2;
 /// Two GPU zones, linked both ways.
 pub fn pair() -> Cluster {
     Cluster::two("a", "b")
+}
+
+/// `n` GPU zones, each linked to every other.
+fn mesh(n: usize) -> Cluster {
+    let mut cluster = pair();
+    let link = cluster.links[0];
+    for to in 2..n {
+        let zone = cluster.zones[0].clone();
+        cluster.add(zone);
+        for from in 0..to {
+            cluster.links.push(Link { from, to, ..link });
+            let (from, to) = (to, from);
+            cluster.links.push(Link { from, to, ..link });
+        }
+    }
+    cluster
 }
 
 /// Within a thousandth of the largest value.
@@ -89,7 +105,8 @@ pub fn step_ranks(g: &Graph, parts: &Parts) -> Sharded {
     close("step interpreted", &got[1], &want[1]);
     let ranks: Vec<u32> = (0..parts.ranks() as u32).collect();
     let host = host();
-    let device = Device::guess(&host).zoned(pair()).ranked(ranks.clone());
+    let device = Device::guess(&host).zoned(mesh(ranks.len()));
+    let device = device.ranked(ranks.clone());
     let device = device.uneven(parts.0.clone());
     let sizes = [(Seqs, 1), (Rows, n as u64), (Context, 8)];
     let lowered = |r: &u32| lower(&sharded.graph, 0, &sizes, &device.clone().as_rank(*r));

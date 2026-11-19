@@ -1,6 +1,7 @@
 //! GLM-5.3.
 
 mod regions_test;
+mod shard_test;
 
 use sensai_models::mla::{Config, RotatedMoe, program, stepper};
 use sensai_parity::{Spec, Stepper, suite};
