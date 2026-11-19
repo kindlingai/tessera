@@ -3,7 +3,7 @@
 use crate::names::Rule;
 use crate::{each, pins};
 use sensai_checkpoint::{File, Offer, exlr8};
-use sensai_engine::mla::{Config, Index, Moe, RotatedMoe, program};
+use sensai_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use sensai_engine::{Graph, Pins, Stack, Weight};
 use serde::Deserialize;
 use std::error::Error;
@@ -193,20 +193,45 @@ pub fn release(
     context: u64,
     width: u32,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
+    open(dir, [seqs, context], width, None)
+}
+
+/// The step graph of `dir`. The `user` rules go last.
+pub(crate) fn stepping(
+    dir: &Path,
+    sizes: [u64; 2],
+    width: u32,
+    user: &[Rule],
+    masked: bool,
+) -> Result<Release, Box<dyn Error + Send + Sync>> {
+    open(dir, sizes, width, Some((user, masked)))
+}
+
+/// A `step` gives the step graph its rules and mask.
+fn open(
+    dir: &Path,
+    [seqs, context]: [u64; 2],
+    width: u32,
+    step: Option<(&[Rule], bool)>,
+) -> Result<Release, Box<dyn Error + Send + Sync>> {
     let json = std::fs::read_to_string(dir.join("config.json"))?;
-    let config = config(&json, seqs, context)?;
+    let mut config = config(&json, seqs, context)?;
     let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
-    let (graph, offer): (Graph, Box<dyn Offer>) = match exlr8 {
-        true => {
-            let offer = exlr8::Release::open(dir).width(width);
-            (program::<RotatedMoe>(&config), Box::new(offer))
-        }
-        false => {
-            let file = File::open(&dir.join("model.safetensors"))?;
-            (program::<Moe>(&config), Box::new(file))
-        }
+    let mut rules = rules(&config, exlr8);
+    if let Some((user, masked)) = step {
+        config.stack.masked = masked;
+        rules.extend(user.iter().cloned());
+    }
+    let graph = match (exlr8, step.is_some()) {
+        (true, true) => stepper::<RotatedMoe>(&config),
+        (true, false) => program::<RotatedMoe>(&config),
+        (false, true) => stepper::<Moe>(&config),
+        (false, false) => program::<Moe>(&config),
     };
-    let rules = rules(&config, exlr8);
+    let offer: Box<dyn Offer> = match exlr8 {
+        true => Box::new(exlr8::Release::open(dir).width(width)),
+        false => Box::new(File::open(&dir.join("model.safetensors"))?),
+    };
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {
         config,

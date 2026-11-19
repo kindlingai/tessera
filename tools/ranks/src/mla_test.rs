@@ -129,3 +129,28 @@ fn mla_run() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(off < 1e-3 && cos > 0.9999, "off {off:e} cos {cos}");
 }
+
+/// The bundle reads the release as a step graph.
+#[test]
+fn mla_bundle() {
+    let c = sensai_bundle::mla::config(CONFIG, 1, ROWS as u64).unwrap();
+    let g = sensai_models::mla::program::<sensai_models::mla::Moe>(&c);
+    let floats = weights(&g, &mut Noise(9));
+    let dir = sensai_testkit::scratch(&format!("{}-mla-bundle", std::process::id()));
+    write(&dir, &g, &floats);
+    let vocab = r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"a":0},"unk_token":"a"}}"#;
+    std::fs::write(dir.join("tokenizer.json"), vocab).unwrap();
+    std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+    let bundle = sensai_bundle::load(&dir, 1, ROWS as u64).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let step = sensai_models::mla::stepper::<sensai_models::mla::Moe>(&c);
+    assert_eq!(bundle.graph, step);
+    assert_eq!(bundle.tokenizer.encode("a").unwrap(), [0]);
+    assert_eq!(bundle.weights.len(), floats.len());
+    for (got, want) in bundle.weights.iter().zip(&floats) {
+        let sensai_lower::Weight::Packed(_, bytes) = got else {
+            panic!("a bf16 weight stays packed");
+        };
+        assert_eq!(*bytes, BF16_FORM.pack(want.floats().unwrap()));
+    }
+}

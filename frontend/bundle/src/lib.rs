@@ -268,6 +268,9 @@ pub(crate) fn config(
     Ok((hf.model_type, config))
 }
 
+/// The trellis width an exlr8 release's experts load at.
+const WIDTH: u32 = 3;
+
 /// Reads a model directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     load_named(dir, slots, context, &[], false)
@@ -284,12 +287,32 @@ pub fn load_named(
     if dir.is_file() {
         return gguf::load(dir, slots, context, user, masked);
     }
+    let json = std::fs::read_to_string(dir.join("config.json"))?;
+    if mla::config(&json, slots, context).is_ok() {
+        let release = mla::stepping(dir, [slots, context], WIDTH, user, masked)?;
+        let mut weights = Vec::with_capacity(release.graph.weights.len());
+        release.each(|_, weight| {
+            weights.push(weight);
+            Ok(())
+        })?;
+        return dressed(dir, release.graph, weights, release.pins);
+    }
     let (arch, mut config) = config(dir, slots, context)?;
     config.stack.masked = masked;
     let graph = stepper(&arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let file = File::open(&dir.join("model.safetensors"))?;
     let (weights, pins) = pull(&graph, &file, config.stack.layers, &[user])?;
+    dressed(dir, graph, weights, pins)
+}
+
+/// The graph and weights with `dir`'s tokenizer, template, stops.
+fn dressed(
+    dir: &Path,
+    graph: Graph,
+    weights: Vec<Weight>,
+    pins: Pins,
+) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let template = Template::load(dir)?;
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
