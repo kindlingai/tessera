@@ -4,16 +4,68 @@ mod roce;
 
 pub use roce::{port, ports};
 
-use sensai_engine::comm::{Error, Shm, Sockets};
+use sensai_engine::Settings;
+use sensai_engine::comm::{Error, Fabric, Reduce, Shm, Sockets, Transport, Verbs};
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a rank waits for the others.
 const PATIENCE: Duration = Duration::from_secs(10);
+
+/// Room for every token's logits, and then some.
+pub const CAPACITY: usize = 64 << 20;
+
+/// Binds `listen`, or this rank's address. Joins the ranks.
+pub fn meet(rank: u32, addrs: &[SocketAddr], listen: Option<SocketAddr>) -> Result<Sockets, Error> {
+    let listen = listen.unwrap_or(addrs[rank as usize]);
+    let listener = TcpListener::bind(listen)?;
+    eprintln!("rank {rank}: listening on {listen}");
+    sockets(rank, listener, addrs)
+}
+
+/// One transport with two holders. They take turns.
+struct Shared(Rc<RefCell<Box<dyn Transport>>>);
+
+impl Transport for Shared {
+    fn rank(&self) -> u32 {
+        self.0.borrow().rank()
+    }
+
+    fn ranks(&self) -> u32 {
+        self.0.borrow().ranks()
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        self.0.borrow_mut().exchange(mine)
+    }
+
+    fn device(&mut self) -> Option<Reduce> {
+        self.0.borrow_mut().device()
+    }
+}
+
+/// The sums' transport, then control's. `fabric` sums over RDMA.
+pub fn join(
+    mut met: Box<dyn Transport>,
+    fabric: Option<&Fabric>,
+    settings: &Settings,
+) -> Result<[Box<dyn Transport>; 2], Error> {
+    let Some(fabric) = fabric else {
+        let met = Rc::new(RefCell::new(met));
+        return Ok([Box::new(Shared(met.clone())), Box::new(Shared(met))]);
+    };
+    let (rank, ranks) = (met.rank(), met.ranks());
+    let pinning = sensai_engine::pinning(settings);
+    let verbs = Verbs::connect(rank, ranks, fabric, CAPACITY, &mut *met, pinning)?;
+    eprintln!("rank {rank}: sums over {} RDMA lanes", fabric.lanes());
+    Ok([Box::new(verbs), met])
+}
 
 /// Joins rank `rank` of `addrs` on `listener`. Lower ranks call.
 pub fn sockets(rank: u32, listener: TcpListener, addrs: &[SocketAddr]) -> Result<Sockets, Error> {

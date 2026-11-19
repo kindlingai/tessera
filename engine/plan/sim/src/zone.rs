@@ -92,6 +92,31 @@ impl Cluster {
         cluster
     }
 
+    /// `ranks` zones of `kind`, each linked to every other.
+    pub fn mesh(ranks: usize, kind: ZoneKind) -> Self {
+        let mut cluster = Self::one("rank0");
+        cluster.zones[0].kind = kind;
+        for r in 1..ranks {
+            cluster.add(Zone {
+                name: format!("rank{r}"),
+                kind,
+                parent: None,
+            });
+        }
+        for from in 0..ranks {
+            for to in (0..ranks).filter(|t| *t != from) {
+                cluster.links.push(Link {
+                    from,
+                    to,
+                    latency: 1e-4,
+                    rate: 1e9,
+                    tag: Tag::Assumed,
+                });
+            }
+        }
+        cluster
+    }
+
     /// Adds a zone. Returns its index.
     pub fn add(&mut self, zone: Zone) -> usize {
         self.zones.push(zone);

@@ -25,6 +25,11 @@ sensai-engine = { workspace = true }
 sensai-bundle = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sensai-frontend-comm = { workspace = true }
 sensai-frontend-settings = { workspace = true }
 httparse = "1"
 sensai-tasks = { workspace = true }
+
+[dev-dependencies]
+sensai-models = { workspace = true }
+sensai-testkit = { workspace = true }

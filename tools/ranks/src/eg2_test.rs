@@ -1,10 +1,10 @@
 //! The EG2 exlr8 release over two ranks on one box.
 
-use super::{cluster, model};
+use super::{device, model};
 use sensai_graph::DimName::{Context, Seqs};
 use sensai_graph::shard;
 use sensai_interp::Tensor;
-use sensai_lower::{Device, ZoneKind, lower};
+use sensai_lower::lower;
 use sensai_run::Loopback;
 use sensai_run::testing::runs;
 use sensai_testkit::cosine_f32;
@@ -26,12 +26,7 @@ fn eg2_run() {
     let (g, weights, _) = model("eg2", &dir, n as u64).unwrap();
     let sharded = shard(&g, &sensai_graph::Parts::even(2)).unwrap().graph;
     let settings = runs().pop().unwrap();
-    let kind = match settings.gpu() {
-        Some(_) => ZoneKind::Gpu,
-        None => ZoneKind::Cpu,
-    };
-    let device = Device::guess(&settings).zoned(cluster(2, kind));
-    let device = device.ranked(vec![0, 1]);
+    let device = device(&settings, Default::default(), 2, settings.gpu().is_none());
     let sizes = [(Seqs, 1), (Context, n as u64)];
     let plans = [0, 1].map(|r| lower(&sharded, 0, &sizes, &device.clone().as_rank(r)).unwrap());
     let mut ranks = Loopback::open(&plans, &settings).unwrap();

@@ -7,6 +7,7 @@ mod source;
 mod source_test;
 mod task;
 
+use sensai_serve::ranks::FLAGS as RANKS;
 use sensai_serve::start::FLAGS;
 use source::{Source, Stop, split};
 use std::process::ExitCode;
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
     match run(&given) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Stop::Usage) => {
-            eprintln!("{USAGE}\nserve flags: {FLAGS}");
+            eprintln!("{USAGE}\nserve flags: {FLAGS} {RANKS}");
             ExitCode::from(2)
         }
         Err(Stop::Tasks(unknown)) => {

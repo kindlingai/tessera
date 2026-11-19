@@ -3,7 +3,7 @@
 use crate::{Engine, Error, Head, Row};
 use sensai_engine_comm::Transport;
 use sensai_graph::{Graph, Parts, shard};
-use sensai_lower::{Cluster, Device, Recipe, Settings};
+use sensai_lower::{Cluster, Device, Recipe, Settings, ZoneKind};
 use sensai_run::{Rank, Run};
 
 /// A rank's zones and each rank's share of split weights.
@@ -22,6 +22,19 @@ impl Place {
             parts,
             rank,
         }
+    }
+
+    /// A zone per rank, all linked. No `parts`: even shares.
+    pub fn mesh(ranks: usize, parts: Vec<u32>, gpu: bool) -> Self {
+        let kind = match gpu {
+            true => ZoneKind::Gpu,
+            false => ZoneKind::Cpu,
+        };
+        let parts = match parts.is_empty() {
+            true => Parts::even(ranks),
+            false => Parts(parts),
+        };
+        Self::new(Cluster::mesh(ranks, kind), parts)
     }
 
     pub(crate) fn split(&self, g: &Graph) -> Result<Graph, Error> {

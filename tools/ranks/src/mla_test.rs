@@ -1,11 +1,11 @@
 //! A tiny DeepSeek-shaped release over two ranks on one box.
 
-use super::{cluster, model};
+use super::{device, model};
 use sensai_graph::DimName::{Context, Seqs};
 use sensai_graph::{Graph, PathSeg, shard};
 use sensai_interp::{Tensor, run};
 use sensai_lower::form::BF16_FORM;
-use sensai_lower::{Device, ZoneKind, lower};
+use sensai_lower::lower;
 use sensai_run::Loopback;
 use sensai_run::testing::runs;
 use sensai_testkit::{Noise, cosine_f32, max_abs_diff, weights};
@@ -100,14 +100,7 @@ fn mla_run() {
     let want = want[0].floats().unwrap();
     let sharded = shard(&g, &sensai_graph::Parts::even(2)).unwrap().graph;
     let settings = runs().pop().unwrap();
-    let kind = match settings.gpu() {
-        Some(_) => ZoneKind::Gpu,
-        None => ZoneKind::Cpu,
-    };
-    let device = Device::guess(&settings)
-        .pinned(pins)
-        .zoned(cluster(2, kind));
-    let device = device.ranked(vec![0, 1]);
+    let device = device(&settings, pins, 2, settings.gpu().is_none());
     let sizes = [(Seqs, 1), (Context, ROWS as u64)];
     let plans = [0, 1].map(|r| lower(&sharded, 0, &sizes, &device.clone().as_rank(r)).unwrap());
     let mut ranks = Loopback::open(&plans, &settings).unwrap();

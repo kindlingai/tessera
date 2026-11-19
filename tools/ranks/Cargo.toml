@@ -27,6 +27,5 @@ sensai-rules = { workspace = true }
 sensai-lower = { workspace = true }
 sensai-models = { workspace = true }
 sensai-run = { workspace = true }
-sensai-sim = { workspace = true }
 sensai-testkit = { workspace = true }
 sensai-trace = { workspace = true }

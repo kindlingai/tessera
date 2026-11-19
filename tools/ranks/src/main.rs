@@ -3,17 +3,16 @@
 // Linking these registers their lowering rules.
 use sensai_rules as _;
 
-use sensai_engine_comm::{Fabric, Transport, Verbs};
-use sensai_frontend_comm::{ports, shm, sockets};
+use sensai_engine_comm::{Fabric, Transport};
+use sensai_frontend_comm::{CAPACITY, meet, ports, shm};
 use sensai_graph::DimName::{Context, Seqs};
 use sensai_graph::shard;
 use sensai_interp::Tensor;
-use sensai_lower::{Cluster, Device, Link, Pick, Weight, Zone, ZoneKind, lower};
+use sensai_lower::{Cluster, Device, Pick, Weight, ZoneKind, lower};
 use sensai_models::decoder::{Config, Moe, Swiglu, program};
 use sensai_run::{Rank, Run};
-use sensai_sim::Tag;
 use sensai_trace::Norm;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -95,31 +94,6 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
     ((args.rank as usize) < args.ranks).then_some(args)
 }
 
-/// Every rank a zone of `kind`, linked to every other.
-fn cluster(ranks: usize, kind: ZoneKind) -> Cluster {
-    let mut c = Cluster::one("rank0");
-    c.zones[0].kind = kind;
-    for r in 1..ranks {
-        c.add(Zone {
-            name: format!("rank{r}"),
-            kind,
-            parent: None,
-        });
-    }
-    for from in 0..ranks {
-        for to in (0..ranks).filter(|t| *t != from) {
-            c.links.push(Link {
-                from,
-                to,
-                latency: 1e-4,
-                rate: 1e9,
-                tag: Tag::Assumed,
-            });
-        }
-    }
-    c
-}
-
 #[cfg(test)]
 mod eg2_test;
 #[cfg(test)]
@@ -137,6 +111,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ranks` linked zones on the host or the GPU.
+fn device(
+    settings: &sensai_lower::Settings,
+    pins: sensai_lower::Pins,
+    ranks: usize,
+    host: bool,
+) -> Device {
+    let kind = match host {
+        true => ZoneKind::Cpu,
+        false => ZoneKind::Gpu,
+    };
+    let device = Device::guess(settings)
+        .pinned(pins)
+        .zoned(Cluster::mesh(ranks, kind));
+    device.ranked((0..ranks as u32).collect())
 }
 
 /// A model's weights: held, or read as they load.
@@ -190,38 +181,17 @@ fn model(name: &str, fixture: &Path, n: u64) -> Result<Loaded, Box<dyn std::erro
     Ok((g, Weights::Held(weights), pins))
 }
 
-/// Room for every token's logits, and then some.
-const CAPACITY: usize = 64 << 20;
-
-/// Joins the ranks over the file, or over sockets.
-fn meet(args: &Args) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>> {
-    if let Some(path) = &args.shm {
-        return Ok(Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?));
-    }
-    let listen = args.listen.unwrap_or(args.addrs[args.rank as usize]);
-    let listener = TcpListener::bind(listen)?;
-    eprintln!("rank {}: listening on {listen}", args.rank);
-    Ok(Box::new(sockets(args.rank, listener, &args.addrs)?))
-}
-
 /// The sums' transport: RDMA when ports are given.
 fn join(
     args: &Args,
     settings: &sensai_lower::Settings,
 ) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>> {
-    let mut met = meet(args)?;
-    let Some(fabric) = &args.fabric else {
-        return Ok(met);
+    let met: Box<dyn Transport> = match &args.shm {
+        Some(path) => Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?),
+        None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
-    let (rank, ranks) = (args.rank, args.ranks as u32);
-    let pinning = sensai_run::pinning(settings);
-    let verbs = Verbs::connect(rank, ranks, fabric, CAPACITY, &mut *met, pinning)?;
-    eprintln!(
-        "rank {}: sums over {} RDMA lanes",
-        args.rank,
-        fabric.lanes()
-    );
-    Ok(Box::new(verbs))
+    let [sums, _] = sensai_frontend_comm::join(met, args.fabric.as_ref(), settings)?;
+    Ok(sums)
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -278,16 +248,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let form = sensai_lower::form::named(form).ok_or_else(|| format!("no form `{form}`"))?;
         pins = sensai_lower::Pins::all(form);
     }
-    let kind = match args.host {
-        true => ZoneKind::Cpu,
-        false => ZoneKind::Gpu,
-    };
-    let device = Device::guess(&settings)
-        .pinned(pins)
-        .zoned(cluster(ranks, kind));
-    let device = device
-        .ranked((0..ranks as u32).collect())
-        .as_rank(args.rank);
+    let device = device(&settings, pins, ranks, args.host).as_rank(args.rank);
     let device = device.uneven(parts.0);
     let sizes = [(Seqs, 1), (Context, n as u64)];
     let start = Instant::now();

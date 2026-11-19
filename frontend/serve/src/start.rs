@@ -2,7 +2,7 @@
 
 use crate::{Model, Slot};
 use sensai_engine::wasm::Module;
-use sensai_engine::{Batch, Engine, Fair, Pins, Recipe, Settings};
+use sensai_engine::{Batch, Fair, Pins, Recipe, Settings};
 use sensai_tasks::api::{Embed, GenerateImage, Info, Tokens};
 use sensai_tasks::klein::Klein;
 use sensai_tasks::paint::Painter;
@@ -60,6 +60,8 @@ pub struct Options {
     pub lower: Option<Recipe>,
     /// Weight-name rules, ahead of `TESSERA_NAMES`.
     pub names: Option<PathBuf>,
+    /// This rank and its peers. Empty serves alone.
+    pub ranks: crate::ranks::Ranks,
 }
 
 impl Default for Options {
@@ -80,6 +82,7 @@ impl Default for Options {
             module: None,
             lower: None,
             names: None,
+            ranks: Default::default(),
         }
     }
 }
@@ -109,7 +112,7 @@ impl Options {
             "--task" if value == "image" => self.task = Task::Image,
             "--image-size" => self.image_size = value.parse().ok()?,
             "--clip" => self.clip = Some(value.into()),
-            _ => return None,
+            _ => return self.ranks.flag(flag, &value),
         }
         Some(())
     }
@@ -130,6 +133,10 @@ pub fn run(options: Options) -> Result<(), String> {
         max_connections: options.max_connections,
         ..Default::default()
     };
+    if options.ranks.follows() {
+        load(options, Slot::default());
+        return Ok(());
+    }
     let slot = spawn(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
@@ -151,6 +158,7 @@ fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
 /// Loads the generator, fills `slot`, then steps jobs.
 fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
     let start = Instant::now();
+    let links = o.ranks.join(settings)?;
     let rules = match &settings.names {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -161,11 +169,14 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
     let loaded = sensai_bundle::load_named(&o.model, slots, context, &rules, o.guided)
         .map_err(|e| e.to_string())?;
     let recipe = lowering(o, loaded.pins);
-    let opened = Engine::open(loaded.graph, o.max_model_len, &recipe, settings);
-    let mut engine = opened.map_err(|e| e.to_string())?;
+    let at = (&recipe, settings);
+    let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
     engine.load(&loaded.weights).map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());
+    if o.ranks.follows() {
+        return engine.follow().map_err(|e| e.to_string());
+    }
     let guides = match (o.guided, engine.words()) {
         (false, _) => None,
         (true, None) => return Err("the model has no mask port".into()),

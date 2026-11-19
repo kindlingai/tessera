@@ -13,6 +13,9 @@ mod images_test;
 mod lib_test;
 #[cfg(test)]
 mod mocks;
+pub mod ranks;
+#[cfg(test)]
+mod ranks_test;
 pub mod start;
 
 mod wire;
