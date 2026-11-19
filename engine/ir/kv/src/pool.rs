@@ -29,8 +29,10 @@ pub enum Error {
     NoRoom(usize),
     #[error("{rows} rows pass the run's worst case of {worst}")]
     PastWorst { rows: usize, worst: usize },
-    #[error("a fork takes at most the {0} rows its source holds")]
+    #[error("a run takes at most the {0} rows its source holds")]
     PastSource(usize),
+    #[error("{0:?} is live")]
+    Live(RunId),
     #[error("{0:?} is retained")]
     Retained(RunId),
     #[error("{0:?} is not a run")]
@@ -225,6 +227,42 @@ impl Pool {
         }
         debug_assert!(self.consistent());
         Ok(())
+    }
+
+    /// Makes a retained run live again, with its first `rows`.
+    pub fn adopt(&mut self, run: RunId, rows: usize, worst: usize) -> Result<RunId, Error> {
+        let r = self.run(run)?;
+        if r.retired.is_none() {
+            return Err(Error::Live(run));
+        }
+        if rows > r.rows {
+            return Err(Error::PastSource(r.rows));
+        }
+        if rows > worst {
+            return Err(Error::PastWorst { rows, worst });
+        }
+        let keep = self.span(rows);
+        let held = &r.pages[..keep];
+        let lost = held.iter().filter(|p| self.live[**p as usize] == 0);
+        let need = self.span(worst) - keep + self.copies(rows, held);
+        self.fits(need, lost.count())?;
+        let at = run.at as usize;
+        for page in self.run_mut(at).pages.split_off(keep) {
+            self.unhold(page, true);
+        }
+        let r = self.run_mut(at);
+        (r.rows, r.worst, r.retired) = (rows, worst, None);
+        for p in r.pages.clone() {
+            self.kept[p as usize] -= 1;
+            self.live[p as usize] += 1;
+        }
+        // The retained id is now stale.
+        self.slots[at].generation += 1;
+        debug_assert!(self.consistent());
+        Ok(RunId {
+            at: run.at,
+            generation: self.slots[at].generation,
+        })
     }
 
     /// Ends a run, live or retained.

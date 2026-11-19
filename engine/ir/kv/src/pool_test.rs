@@ -47,6 +47,21 @@ fn retained_rows_fork() {
     assert_eq!(pool.pages(a), Err(Error::Unknown(a)));
 }
 
+#[test]
+fn full_pool_adopts() {
+    let mut pool = Pool::new(2, 4);
+    let a = pool.reserve(T, 3, 4).unwrap();
+    pool.reserve(T, 3, 4).unwrap();
+    pool.retain(a).unwrap();
+    assert_eq!(pool.fork(a, 2, 4), Err(Error::NoRoom(1)));
+    let page = pool.pages(a).unwrap().to_vec();
+    let b = pool.adopt(a, 2, 4).unwrap();
+    assert_eq!(pool.adopt(b, 2, 4), Err(Error::Live(b)));
+    assert_eq!((pool.pages(b).unwrap(), pool.rows(b)), (&page[..], Ok(2)));
+    assert_eq!(pool.rows(a), Err(Error::Unknown(a)));
+    pool.grow(b, 4).unwrap();
+}
+
 /// Random calls on small pools. The pool checks itself.
 #[test]
 fn random_calls() {
@@ -61,12 +76,16 @@ fn random_calls() {
             let pick = (seed >> 33) as usize;
             let run = runs.get(pick / 8 % runs.len().max(1)).copied();
             let before = pool.digest();
-            let done = match (pick % 6, run) {
+            let done = match (pick % 7, run) {
                 (1, Some(r)) => pool.fork(r, pick % 9, 16).map(|r| runs.push(r)),
                 (2, Some(r)) => pool.grow(r, pick % 17).map(drop),
                 (3, Some(r)) => pool.truncate(r, pick % 9),
                 (4, Some(r)) => pool.retain(r),
                 (5, Some(r)) => pool.release(r).map(|()| runs.retain(|o| *o != r)),
+                (6, Some(r)) => pool.adopt(r, pick % 9, 16).map(|n| {
+                    runs.retain(|o| *o != r);
+                    runs.push(n);
+                }),
                 _ => pool
                     .reserve(T, pick % 9, 8 + pick % 9)
                     .map(|r| runs.push(r)),
