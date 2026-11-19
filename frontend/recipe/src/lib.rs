@@ -48,6 +48,8 @@ pub struct Weights {
     /// as `--<name> <dir>`.
     #[serde(default)]
     pub extra: BTreeMap<String, String>,
+    /// The expert width an exlr8 release is fetched at.
+    pub width: Option<u32>,
 }
 
 /// One `recipe.toml`.
@@ -111,7 +113,9 @@ impl Recipe {
     pub fn weights(&self, cache: Option<&Path>, token: Option<&str>) -> Result<PathBuf, Error> {
         match (&self.weights.path, &self.weights.hf) {
             (Some(path), None) => Ok(self.dir.join(path)),
-            (None, Some(hf)) => hub::snapshot(hf, cache.ok_or(Error::NoCache)?, token),
+            (None, Some(hf)) => {
+                hub::snapshot(hf, cache.ok_or(Error::NoCache)?, token, self.weights.width)
+            }
             _ => Err(Error::Weights),
         }
     }
@@ -124,7 +128,7 @@ impl Recipe {
     ) -> Result<Vec<(String, PathBuf)>, Error> {
         let mut flags = Vec::new();
         for (name, spec) in &self.weights.extra {
-            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token)?;
+            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token, None)?;
             flags.push((format!("--{}", name.replace('_', "-")), dir));
         }
         Ok(flags)

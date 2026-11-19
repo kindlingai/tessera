@@ -22,16 +22,22 @@ struct Sibling {
     rfilename: String,
 }
 
+/// The file that marks an exlr8 release.
+const EXLR8: &str = "dense/exlr8-vocab.safetensors";
+
+/// The expert width fetched when a recipe names none.
+const WIDTH: u32 = 3;
+
 /// `owner/name[@revision]`. A loose revision is pinned and printed.
 pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, Error> {
     let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
     if pinned(revision) {
-        return snapshot(&format!("{repo}@{revision}"), cache, token);
+        return snapshot(&format!("{repo}@{revision}"), cache, token, None);
     }
     let info = lookup(repo, revision, token)?;
     let pinned = format!("{repo}@{}", info.sha);
     eprintln!("sensai: model {pinned}");
-    snapshot(&pinned, cache, token)
+    snapshot(&pinned, cache, token, None)
 }
 
 /// The repository's files at `revision`.
@@ -67,15 +73,23 @@ fn get(url: &str, token: Option<&str>) -> Result<ureq::Response, Box<ureq::Error
     .map_err(Box::new)
 }
 
-/// `owner/name@commit`, downloaded into `cache` once.
-pub(crate) fn snapshot(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, Error> {
+/// `owner/name@commit`, downloaded into `cache` once per `width`.
+pub(crate) fn snapshot(
+    spec: &str,
+    cache: &Path,
+    token: Option<&str>,
+    width: Option<u32>,
+) -> Result<PathBuf, Error> {
     let refuse = || Error::Source(spec.into(), "hf weights are owner/name@<commit>");
     let (repo, commit) = spec.split_once('@').ok_or_else(refuse)?;
     if !pinned(commit) {
         return Err(refuse());
     }
     let dir = cache.join("hf").join(repo).join(commit);
-    let done = dir.join(".complete");
+    let done = dir.join(match width {
+        Some(k) => format!(".complete.k{k}"),
+        None => ".complete".into(),
+    });
     if done.is_file() {
         return Ok(dir);
     }
@@ -89,7 +103,11 @@ pub(crate) fn snapshot(spec: &str, cache: &Path, token: Option<&str>) -> Result<
     } else {
         None
     };
-    for name in wanted(&names, folders.as_deref()) {
+    let files = match names.iter().any(|n| n == EXLR8) {
+        true => exlr8(&names, width.unwrap_or(WIDTH)),
+        false => wanted(&names, folders.as_deref()),
+    };
+    for name in files {
         if !safe_path(name) {
             return Err(Error::Source(spec.into(), "unsafe file path in repository"));
         }
@@ -127,6 +145,27 @@ pub(crate) fn wanted<'a>(names: &'a [String], folders: Option<&[String]>) -> Vec
             (None, Some(_)) => ends(name, &[".json"]),
             (Some((top, _)), Some(folders)) => folders.iter().any(|f| f == top),
             (Some(_), None) => false,
+        };
+        if keep {
+            out.push(name.as_str());
+        }
+    }
+    out
+}
+
+/// An exlr8 release's files, with experts at `width` only.
+pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
+    // The shared expert has no K2 codes.
+    let codes = [format!(".k{width}"), format!(".k{}", width.max(3))];
+    let mut out = Vec::new();
+    for name in names {
+        let keep = match name.split_once('/') {
+            None => KEEP.iter().any(|k| name.ends_with(k)),
+            Some(("dense", file)) => file.ends_with(".safetensors"),
+            Some(("experts", file)) => {
+                file.ends_with(".index") || codes.iter().any(|c| file.ends_with(c.as_str()))
+            }
+            Some(_) => false,
         };
         if keep {
             out.push(name.as_str());

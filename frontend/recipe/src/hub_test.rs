@@ -1,4 +1,4 @@
-use crate::hub::{safe_path, wanted};
+use crate::hub::{exlr8, safe_path, wanted};
 
 fn owned(list: &[&str]) -> Vec<String> {
     list.iter().map(|n| n.to_string()).collect()
@@ -38,4 +38,27 @@ fn plain_repo() {
     for bad in ["../x.json", "a/../b.json", "/etc/x.json", "a\\b.json"] {
         assert!(!safe_path(bad), "{bad}");
     }
+}
+
+#[test]
+fn exlr8_one_width() {
+    let names = owned(&[
+        "config.json",
+        "dense/exlr8-dense-000.safetensors",
+        "dense/exlr8-vocab.safetensors",
+        "experts/exlr8-layer-001.index",
+        "experts/exlr8-layer-001.k2",
+        "experts/exlr8-layer-001.k3",
+        "experts/exlr8-layer-001.k4",
+        "hashes/exlr8-layer-001.k3.sha256",
+        "index-slices/tp4/k3/rank0.safetensors",
+    ]);
+    let at = |k| exlr8(&names, k).join(" ");
+    let head = "config.json dense/exlr8-dense-000.safetensors dense/exlr8-vocab.safetensors";
+    let experts = "experts/exlr8-layer-001";
+    assert_eq!(at(4), format!("{head} {experts}.index {experts}.k4"));
+    assert_eq!(
+        at(2),
+        format!("{head} {experts}.index {experts}.k2 {experts}.k3")
+    );
 }
