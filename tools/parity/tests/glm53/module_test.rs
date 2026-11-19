@@ -1,9 +1,10 @@
 //! The glm53-moe recipe's kernel: its plan, and its numbers.
 
 use sensai_codegen::trellis::packed;
+use sensai_engine::Engine;
 use sensai_engine::wasm::Module;
-use sensai_engine_settings::Backend;
-use sensai_graph::DimName::{Context, Hidden, Rows, Seqs};
+use sensai_engine_settings::{Backend, Pick, Settings};
+use sensai_graph::DimName::{Context, Hidden, Picks, Rows, Segments, Seqs};
 use sensai_graph::{Composite, F16};
 use sensai_interp::{Tensor, run};
 use sensai_lower::form::{Load, named};
@@ -11,7 +12,7 @@ use sensai_lower::{Device, Limits, Pins, Platform, Rule, Weight, lower};
 use sensai_models::mla::{Config, RotatedMoe, Routed, stepper};
 use sensai_recipe::Recipe;
 use sensai_run::open;
-use sensai_run::testing::runs;
+use sensai_run::testing::{host, runs};
 use sensai_testkit::{Noise, cosine_f32, max_abs_diff, weights};
 use sensai_trace::{DType, Dim, EntryKind, Graph, Model, Port, Role, TensorType, Weights};
 use std::path::Path;
@@ -24,10 +25,14 @@ fn small() -> Config {
     sensai_models::small::glm53()
 }
 
+fn recipe() -> Recipe {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/recipes/glm53-moe");
+    Recipe::read(&dir).unwrap()
+}
+
 /// The recipe's rule, from its module built to wasm.
 fn rule() -> &'static Rule {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/recipes/glm53-moe");
-    let recipe = Recipe::read(&dir).unwrap();
+    let recipe = recipe();
     let cache = sensai_testkit::scratch("recipes");
     let bytes = recipe.module_bytes(Some(&cache)).unwrap().unwrap();
     let module = Module::open(&bytes).unwrap();
@@ -43,6 +48,14 @@ fn pins() -> Pins {
         .pin("*moe*.up", codes)
         .pin("*moe*.down", codes)
         .pin("*shared*", turned)
+}
+
+/// The lowering choices serve hands a generate engine.
+fn choices() -> sensai_lower::Recipe {
+    let mut lower = recipe().lower.unwrap();
+    lower.rules.push(rule());
+    lower.pins = pins();
+    lower
 }
 
 #[derive(Weights)]
@@ -130,6 +143,41 @@ fn module_takes_routed() {
         assert_eq!(launch.args.len(), parameters());
         let counts: Vec<u32> = launch.args[24..].iter().filter_map(|a| a.u32()).collect();
         assert_eq!(counts, [ROWS as u32, 128, 128, 32, 2, 4, 4]);
+    }
+}
+
+/// A generate engine plans the recipe's kernel.
+#[test]
+fn module_reaches_engine() {
+    let c = small();
+    let step = stepper::<RotatedMoe>(&c);
+    let choices = choices();
+    assert_eq!(choices.favor.as_deref(), Some(NAME));
+    let routed = (c.stack.layers - c.dense_layers) as usize;
+    // The engine's first launch, planned for an assumed GPU.
+    let cuda = Settings {
+        backend: Pick::Gpu(Backend::Cuda),
+        ..host()
+    };
+    let device = Device::guess(&cuda).with(&choices);
+    let trimmed = sensai_graph::trim(&step, 0).unwrap();
+    let slots = trimmed.dims.iter().find(|d| d.name == Seqs).unwrap();
+    let slots = slots.size.max();
+    let sizes = [
+        (Seqs, slots),
+        (Rows, 1),
+        (Context, 1),
+        (Segments, 1),
+        (Picks, 1),
+    ];
+    let plan = lower(&trimmed, 0, &sizes, &device).unwrap();
+    let named = |s: &&sensai_lower::Step| s.kernel.name() == NAME;
+    assert_eq!(plan.steps.iter().filter(named).count(), routed);
+    // The host plans without it: the kernel is CUDA text.
+    for settings in runs() {
+        let engine = Engine::open(step.clone(), 16, &choices, &settings).unwrap();
+        let wanted = (settings.gpu() == Some(Backend::Cuda)).then_some(&routed);
+        assert_eq!(engine.kernels().get(NAME), wanted, "{}", engine.device());
     }
 }
 
