@@ -60,13 +60,6 @@ fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, F
     Ok(config)
 }
 
-fn segment(p: &PathSeg) -> String {
-    match p {
-        PathSeg::Field(s) => s.clone(),
-        PathSeg::Index(i) => i.to_string(),
-    }
-}
-
 pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Load], layers: u64) -> Pins {
     let mut counts = BTreeMap::new();
     for f in forms {
@@ -83,7 +76,7 @@ pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Load], layers: u64) -> P
         if let [PathSeg::Field(root), PathSeg::Index(i), rest @ ..] = w.path.as_slice()
             && root == "layers"
         {
-            let field = rest.iter().map(segment).collect::<Vec<_>>().join(".");
+            let field = PathSeg::dotted(rest);
             fields.entry(field).or_default().push((*i as u64, f));
         }
     }
@@ -101,8 +94,7 @@ pub(crate) fn pins(graph: &Graph, forms: &[&'static dyn Load], layers: u64) -> P
     }
     for (w, &f) in graph.weights.iter().zip(forms) {
         if pins.form(&w.path).name() != f.name() {
-            let segments: Vec<_> = w.path.iter().map(segment).collect();
-            pins = pins.pin(&segments.join("."), f);
+            pins = pins.pin(&PathSeg::dotted(&w.path), f);
         }
     }
     for (w, &f) in graph.weights.iter().zip(forms) {

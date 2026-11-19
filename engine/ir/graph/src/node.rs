@@ -66,6 +66,20 @@ pub enum PathSeg {
     Index(u32),
 }
 
+impl PathSeg {
+    /// The path as text, steps joined by dots.
+    pub fn dotted(path: &[PathSeg]) -> String {
+        let mut steps = Vec::new();
+        for seg in path {
+            steps.push(match seg {
+                PathSeg::Field(f) => f.clone(),
+                PathSeg::Index(i) => i.to_string(),
+            });
+        }
+        steps.join(".")
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct NodeId(pub u32);

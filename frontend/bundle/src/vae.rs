@@ -14,14 +14,6 @@ pub struct Decoder {
     pub weights: Vec<Weight>,
 }
 
-fn dotted(path: &[PathSeg]) -> String {
-    let seg = |p: &PathSeg| match p {
-        PathSeg::Field(f) => f.clone(),
-        PathSeg::Index(i) => i.to_string(),
-    };
-    path.iter().map(seg).collect::<Vec<_>>().join(".")
-}
-
 /// `[out, in, k, k]` kernels as `[out, k, k, in]`.
 fn taps(v: &[f32], shape: &[usize]) -> Vec<f32> {
     let [out, cin, kh, kw] = shape[..] else {
@@ -43,7 +35,7 @@ pub fn decoder(dir: &Path, side: u64, seqs: u64) -> Result<Decoder, Box<dyn Erro
     let graph = program(&Config::flux2(side, seqs));
     let file = File::open(&dir.join("vae").join("diffusion_pytorch_model.safetensors"))?;
     let find = |p: &[PathSeg]| {
-        let name = dotted(p);
+        let name = PathSeg::dotted(p);
         let v = match name.as_str() {
             "bn.std" => (file.floats("bn.running_var").ok()?.iter())
                 .map(|v| (v + BN_EPS).sqrt())

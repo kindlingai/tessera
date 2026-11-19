@@ -146,10 +146,6 @@ struct Role<'a> {
 }
 
 fn role(path: &[PathSeg]) -> Role<'_> {
-    let seg = |p: &PathSeg| match p {
-        PathSeg::Field(f) => f.clone(),
-        PathSeg::Index(i) => i.to_string(),
-    };
     let index = path.iter().find_map(|p| match p {
         PathSeg::Index(i) => Some(*i as usize),
         PathSeg::Field(_) => None,
@@ -167,7 +163,7 @@ fn role(path: &[PathSeg]) -> Role<'_> {
         ),
         false => (last, None, path),
     };
-    let text = rest.iter().map(seg).collect::<Vec<_>>().join(".");
+    let text = PathSeg::dotted(rest);
     Role {
         text,
         index,

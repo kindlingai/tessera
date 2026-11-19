@@ -26,14 +26,6 @@ pub struct Clip {
     pub tokenizer: Hf,
 }
 
-fn dotted(path: &[PathSeg]) -> String {
-    let seg = |p: &PathSeg| match p {
-        PathSeg::Field(f) => f.clone(),
-        PathSeg::Index(i) => i.to_string(),
-    };
-    path.iter().map(seg).collect::<Vec<_>>().join(".")
-}
-
 /// Weights by name, each cut to its first `len(name)` values.
 fn tensors(
     graph: &Graph,
@@ -88,7 +80,7 @@ pub fn denoiser(dir: &Path, seqs: u64, module: Option<&Module>) -> Result<Sprite
         Some(table) => Some(table.clone()),
         None => file.floats(&format!("ema.{name}")).ok(),
     };
-    let raw = tensors(&graph, get, dotted, |_| None)?;
+    let raw = tensors(&graph, get, PathSeg::dotted, |_| None)?;
     let (graph, folded) = fold(&graph, &raw)?;
     let palette = (file.floats("ema.palette_rgb")?.chunks(3))
         .map(|c| [c[0] as u8, c[1] as u8, c[2] as u8])
@@ -108,7 +100,7 @@ fn clip_weights(dir: &Path) -> Option<PathBuf> {
 
 /// A Hugging Face name for a CLIP text weight path.
 fn hf_name(path: &[PathSeg]) -> String {
-    let dotted = dotted(path);
+    let dotted = PathSeg::dotted(path);
     let mut parts: Vec<&str> = dotted.split('.').collect();
     fn field(f: &str) -> &str {
         match f {

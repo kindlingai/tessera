@@ -89,7 +89,7 @@ fn input(tree: &Tree, t: T) -> Input {
     });
     let weight = match node.term {
         Term::Leaf(Home::Weight(w) | Home::Part(w, 0)) => {
-            Some(dotted(&tree.g.weights[w as usize].path))
+            Some(PathSeg::dotted(&tree.g.weights[w as usize].path))
         }
         _ => None,
     };
@@ -102,14 +102,6 @@ fn input(tree: &Tree, t: T) -> Input {
         share: share.map(|s| [s.axis as usize, s.first, s.count, s.whole]),
         parts: None,
     }
-}
-
-fn dotted(path: &[PathSeg]) -> String {
-    let seg = |s: &PathSeg| match s {
-        PathSeg::Field(f) => f.clone(),
-        PathSeg::Index(i) => i.to_string(),
-    };
-    path.iter().map(seg).collect::<Vec<_>>().join(".")
 }
 
 /// A count's argument. Varying dimensions wait for launch.

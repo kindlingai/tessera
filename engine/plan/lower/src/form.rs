@@ -44,11 +44,7 @@ impl Pins {
 
     /// The form of the weight at `path`.
     pub fn form(&self, path: &[PathSeg]) -> &'static dyn Load {
-        let seg = |s: &PathSeg| match s {
-            PathSeg::Field(f) => f.clone(),
-            PathSeg::Index(i) => i.to_string(),
-        };
-        let name = path.iter().map(seg).collect::<Vec<_>>().join(".");
+        let name = PathSeg::dotted(path);
         let hit = self.named.iter().rev().find(|(p, _)| matches(p, &name));
         hit.map_or(self.weights, |(_, form)| *form)
     }
