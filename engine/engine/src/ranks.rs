@@ -80,7 +80,7 @@ impl Engine {
     }
 
     /// Rank 0 tells the others its launch.
-    pub(crate) fn announce(
+    pub(super) fn announce(
         &mut self,
         rows: &[Row],
         picks: &[u32],
