@@ -16,6 +16,7 @@ sensai-engine-comm = { workspace = true }
 sensai-engine-settings = { workspace = true }
 sensai-graph = { workspace = true }
 sensai-interp = { workspace = true }
+sensai-kv = { workspace = true }
 sensai-rules = { workspace = true }
 sensai-wasm = { workspace = true }
 sensai-lower = { workspace = true }

@@ -1,5 +1,6 @@
 //! Many answers in flight, one step feeding them all.
 
+use crate::kept::Kept;
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
@@ -13,6 +14,8 @@ pub struct Seq {
     sink: Sink,
     /// Tokens fed: the prompt, then each answer token.
     fed: usize,
+    /// The tokens of the fed rows.
+    history: Vec<u32>,
     /// Tokens to feed: the prompt, then picked and forced tokens.
     pending: VecDeque<u32>,
     made: usize,
@@ -42,7 +45,7 @@ impl Seq {
 
     /// Counts `n` tokens fed. `id` follows the last one.
     fn advance(&mut self, n: usize, id: u32) -> Option<Reason> {
-        self.pending.drain(..n);
+        self.history.extend(self.pending.drain(..n));
         self.fed += n;
         if !self.pending.is_empty() {
             return None;
@@ -150,6 +153,8 @@ pub struct Batch<'a> {
     waiting: VecDeque<(Request, Sink)>,
     active: Vec<Seq>,
     free: Vec<u32>,
+    /// Set when finished answers keep their rows.
+    kept: Option<Kept>,
     /// The most rows one step feeds.
     budget: usize,
 }
@@ -164,8 +169,14 @@ impl<'a> Batch<'a> {
             waiting: VecDeque::new(),
             active: Vec::new(),
             free,
+            kept: None,
             budget,
         }
+    }
+
+    /// Finished answers keep rows. Set it before any step.
+    pub fn reuse(&mut self) {
+        self.kept = Some(Kept::new(self.engine.slots, self.engine.context));
     }
 
     /// Queues an answer. An unfit prompt ends at once.
@@ -187,26 +198,33 @@ impl<'a> Batch<'a> {
         !self.waiting.is_empty() || !self.active.is_empty()
     }
 
+    /// A slot for the next answer, and its kept rows.
+    fn place(&mut self) -> Option<(u32, usize)> {
+        let tokens = &self.waiting.front()?.0.tokens;
+        match &mut self.kept {
+            Some(kept) => kept.admit(tokens),
+            None => Some((self.free.pop()?, 0)),
+        }
+    }
+
     /// Admits waiting answers while slots are free.
     fn admit(&mut self) {
-        while let Some(slot) = self.free.pop() {
-            let Some((request, sink)) = self.waiting.pop_front() else {
-                self.free.push(slot);
-                return;
-            };
+        while let Some((slot, skip)) = self.place() {
+            let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
             let mut seq = Seq {
                 slot,
-                pending: request.tokens.iter().copied().collect(),
+                pending: request.tokens[skip..].iter().copied().collect(),
+                history: request.tokens[..skip].to_vec(),
                 request,
                 sink,
-                fed: 0,
+                fed: skip,
                 made: 0,
                 next: Allowed::Any,
             };
             match seq.settle() {
                 Some(reason) => {
                     (seq.sink)(Event::Done(reason));
-                    self.free.push(slot);
+                    self.retire(seq);
                 }
                 None => self.active.push(seq),
             }
@@ -256,7 +274,15 @@ impl<'a> Batch<'a> {
 
     fn finish(&mut self, i: usize) {
         let seq = self.active.swap_remove(i);
-        self.free.push(seq.slot);
+        self.retire(seq);
+    }
+
+    /// Frees an answer's slot, or keeps its rows.
+    fn retire(&mut self, seq: Seq) {
+        match &mut self.kept {
+            Some(kept) => kept.finish(seq.slot, seq.history),
+            None => self.free.push(seq.slot),
+        }
     }
 
     /// One step of the policy's rows. False when nothing ran.

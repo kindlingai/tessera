@@ -267,6 +267,36 @@ fn mla_matches_interpreter() {
     }
 }
 
+#[test]
+fn kept_rows_resume() {
+    for s in runs() {
+        let (g, weights, mut engine) = open(31, 2, &s);
+        let mut batch = Batch::new(&mut engine, Box::new(Fair));
+        batch.reuse();
+        batch.budget(1);
+        let first = reference(&g, &weights, &[3, 9, 4], 3);
+        let longer = [&[3, 9, 4], &first[..]].concat();
+        // Each prompt, and the steps its new rows take.
+        let cases: [(&[u32], usize); 3] = [(&[3, 9, 4], 5), (&longer, 3), (&[3, 9, 7, 1], 4)];
+        for (prompt, steps) in cases {
+            let (events, taken) = std::sync::mpsc::channel();
+            let request = Request {
+                tokens: prompt.to_vec(),
+                max_tokens: 3,
+                ..Request::default()
+            };
+            batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+            let mut ran = 0;
+            while batch.step().unwrap() {
+                ran += 1;
+            }
+            let got: Vec<Event> = taken.try_iter().collect();
+            let want = reference(&g, &weights, prompt, 3);
+            assert_eq!((ids(&got), ran), (want, steps));
+        }
+    }
+}
+
 /// Trimmed steps return the whole graph's rows at their picks.
 #[test]
 fn trim_keeps_picks() {

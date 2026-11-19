@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 
 mod guide;
+mod kept;
 mod model;
 mod ranks;
 mod schedule;
