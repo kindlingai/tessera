@@ -1,7 +1,7 @@
 //! GPU compute mechanism. Callers supply all kernel and cache policy.
 
 mod error;
-pub use ::sensai_platform::{Limits, Platform, limits, platform};
+pub use ::sensai_platform::{Limits, Platform, platform};
 pub use error::Error;
 
 pub mod backend;
