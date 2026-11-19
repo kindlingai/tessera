@@ -162,6 +162,9 @@ pub struct Batch<'a> {
 impl<'a> Batch<'a> {
     pub fn new(engine: &'a mut Engine, policy: Box<dyn Policy>) -> Self {
         let free = (0..engine.slots as u32).rev().collect();
+        if let Some(lanes) = &mut engine.lanes {
+            lanes.reset();
+        }
         let budget = engine.context;
         Self {
             engine,
@@ -176,7 +179,11 @@ impl<'a> Batch<'a> {
 
     /// Finished answers keep rows. Set it before any step.
     pub fn reuse(&mut self) {
-        self.kept = Some(Kept::new(self.engine.slots, self.engine.context));
+        let (slots, context) = (self.engine.slots, self.engine.context);
+        self.kept = Some(match &self.engine.lanes {
+            Some(lanes) => Kept::paged(slots, context, lanes.pages(), lanes.page),
+            None => Kept::new(slots, context),
+        });
     }
 
     /// Queues an answer. An unfit prompt ends at once.
@@ -272,6 +279,18 @@ impl<'a> Batch<'a> {
         limited.then_some(out)
     }
 
+    /// Gives each fed slot the pages its rows need.
+    fn page(&mut self, rows: &[Row]) {
+        let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.engine.lanes) else {
+            return;
+        };
+        for r in rows {
+            if let Some(pages) = kept.grow(r.slot, r.position as usize + 1) {
+                lanes.set(r.slot, pages);
+            }
+        }
+    }
+
     fn finish(&mut self, i: usize) {
         let seq = self.active.swap_remove(i);
         self.retire(seq);
@@ -293,6 +312,7 @@ impl<'a> Batch<'a> {
         if rows.is_empty() {
             return Ok(false);
         }
+        self.page(&rows);
         let ends = crate::ends(&rows);
         let ids = match self.allowed(&rows, &ends) {
             Some(allowed) => self.engine.last_guided(&rows, &allowed)?,

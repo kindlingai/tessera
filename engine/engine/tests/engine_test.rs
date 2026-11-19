@@ -65,11 +65,23 @@ fn open_on(
     recipe: Recipe,
     settings: &Settings,
 ) -> (Graph, Vec<Tensor>, Engine) {
-    let mut c = Config::toy(slots, 16);
+    open_sized(seed, [slots, 16], masked, recipe, settings)
+}
+
+/// As `open_on`, with `[slots, context]`.
+fn open_sized(
+    seed: u64,
+    [slots, context]: [u64; 2],
+    masked: bool,
+    recipe: Recipe,
+    settings: &Settings,
+) -> (Graph, Vec<Tensor>, Engine) {
+    let mut c = Config::toy(slots, context);
     let g = stepper::<Norm, Swiglu>(&c);
     let weights = weights(&g, &mut Noise(seed));
     c.stack.masked = masked;
-    let mut engine = Engine::open(stepper::<Norm, Swiglu>(&c), 16, &recipe, settings).unwrap();
+    let graph = stepper::<Norm, Swiglu>(&c);
+    let mut engine = Engine::open(graph, context as usize, &recipe, settings).unwrap();
     let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
     engine.load(&stored).unwrap();
     (g, weights, engine)
@@ -267,6 +279,27 @@ fn mla_matches_interpreter() {
     }
 }
 
+/// Three ids after each prompt, and the steps they took.
+fn asked(batch: &mut Batch, prompts: &[&[u32]]) -> (Vec<Vec<u32>>, usize) {
+    let mut taken = Vec::new();
+    for prompt in prompts {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let request = Request {
+            tokens: prompt.to_vec(),
+            max_tokens: 3,
+            ..Request::default()
+        };
+        batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+        taken.push(receiver);
+    }
+    let mut steps = 0;
+    while batch.step().unwrap() {
+        steps += 1;
+    }
+    let got = |r: &std::sync::mpsc::Receiver<Event>| ids(&r.try_iter().collect::<Vec<_>>());
+    (taken.iter().map(got).collect(), steps)
+}
+
 #[test]
 fn kept_rows_resume() {
     for s in runs() {
@@ -279,20 +312,33 @@ fn kept_rows_resume() {
         // Each prompt, and the steps its new rows take.
         let cases: [(&[u32], usize); 3] = [(&[3, 9, 4], 5), (&longer, 3), (&[3, 9, 7, 1], 4)];
         for (prompt, steps) in cases {
-            let (events, taken) = std::sync::mpsc::channel();
-            let request = Request {
-                tokens: prompt.to_vec(),
-                max_tokens: 3,
-                ..Request::default()
-            };
-            batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
-            let mut ran = 0;
-            while batch.step().unwrap() {
-                ran += 1;
-            }
-            let got: Vec<Event> = taken.try_iter().collect();
             let want = reference(&g, &weights, prompt, 3);
-            assert_eq!((ids(&got), ran), (want, steps));
+            assert_eq!(asked(&mut batch, &[prompt]), (vec![want], steps));
+        }
+    }
+}
+
+#[test]
+fn paged_slots_share() {
+    let recipe = Recipe {
+        kept: &kept::PAGED16,
+        ..Recipe::default()
+    };
+    for s in runs() {
+        let (g, weights, mut engine) = open_sized(37, [2, 64], false, recipe.clone(), &s);
+        let mut batch = Batch::new(&mut engine, Box::new(Fair));
+        batch.reuse();
+        batch.budget(1);
+        let base: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
+        let (a, b) = (
+            [&base[..18], &[1, 2]].concat(),
+            [&base[..17], &[5]].concat(),
+        );
+        // Both later prompts start at the kept answer's first page.
+        let rounds: [(&[&[u32]], usize); 2] = [(&[&base], 22), (&[&a, &b], 10)];
+        for (prompts, steps) in rounds {
+            let want = prompts.iter().map(|p| reference(&g, &weights, p, 3));
+            assert_eq!(asked(&mut batch, prompts), (want.collect(), steps));
         }
     }
 }

@@ -12,6 +12,7 @@ use std::sync::mpsc;
 
 mod guide;
 mod kept;
+mod lanes;
 mod model;
 mod ranks;
 mod schedule;
@@ -94,6 +95,8 @@ pub struct Engine {
     context: usize,
     /// Kept-row lanes the graph declares.
     slots: usize,
+    /// The page table, when kept rows are paged.
+    lanes: Option<lanes::Lanes>,
     /// Mask words per pick, if the graph takes masks.
     words: Option<usize>,
     /// Whether entry 1 picks among candidate ids.
@@ -209,13 +212,9 @@ impl Engine {
         }];
         let (sizes, _) = launch_of(&first, &[0], slots);
         let plan = plans.lower(&graph, 0, &sizes, &device)?;
-        let table = plan.table;
+        let lanes = plan.table.zip(recipe.kept.page());
+        let lanes = lanes.map(|(table, page)| lanes::Lanes::new(page, table.len, slots));
         let mut runner = run(plan)?;
-        if let Some(table) = table {
-            // Each slot owns its own pages, in order.
-            let pages: Vec<u8> = (0..table.len as u32).flat_map(u32::to_le_bytes).collect();
-            runner.held_mut().upload(table, &pages)?;
-        }
         runner.launching(recipe.launch);
         let device = Device::stored(runner.platform(), settings)
             .map_err(sensai_lower::Error::from)?
@@ -230,6 +229,7 @@ impl Engine {
             plans,
             context,
             slots,
+            lanes,
             words,
             sparse,
             control: None,
@@ -354,6 +354,10 @@ impl Engine {
         )?;
         let out = plan.outputs[0].slot;
         self.runner.replan(plan)?;
+        let table = plan.table.zip(self.lanes.as_mut());
+        if let Some((table, bytes)) = table.and_then(|(t, l)| Some((t, l.changed()?))) {
+            self.runner.held_mut().upload(table, &bytes)?;
+        }
         self.runner.bind_all(&bound);
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
         self.runner.feed(&views)?;
