@@ -25,10 +25,14 @@ struct Layer {
 
 /// `a = x w`, then `silu(a) * a` as a region.
 fn graph(region: bool) -> Graph {
+    sized(region, 64, 32)
+}
+
+fn sized(region: bool, hidden: u64, ffn: u64) -> Graph {
     let m = Model::new(vec![
         Dim::bounded(Rows, 16),
-        Dim::fixed(Hidden, 64),
-        Dim::fixed(Ffn, 32),
+        Dim::fixed(Hidden, hidden),
+        Dim::fixed(Ffn, ffn),
     ]);
     let w: Layer = sensai_trace::declare(&m);
     let ty = TensorType::new([Rows, Hidden], DType::F32);
@@ -238,6 +242,29 @@ fn module_region_wins() {
         "{size:?}"
     );
     on_gpus(&g, rule);
+}
+
+#[test]
+fn module_reads_parts() {
+    let whole = json!({
+        "kernel": "wasm_gemm", "len": 512,
+        "reads": [0, {"part": [1, 0]}, {"part": [1, 1]}, {"part": [1, 2]}],
+        "shape": {"line": 512}, "work": 512, "guess": 1e-15,
+    });
+    let rule = load("mlp", json!([whole]));
+    let rotated = sensai_lower::form::named("trellis_k4_rot").unwrap();
+    let device = Device::default()
+        .adding(rule)
+        .pinned(sensai_lower::Pins::all(rotated));
+    let plan = lower(&sized(true, 128, 128), 0, &[(Rows, 4)], &device).unwrap();
+    assert_eq!(rules(&plan), ["wasm_mlp"]);
+    // Codes, `suh`, then `svh`, as the offer names them.
+    let parts: Vec<_> = (0..3).map(|p| plan.weights[p].slot).collect();
+    assert_eq!(
+        plan.weights.iter().map(|w| w.part).collect::<Vec<_>>(),
+        [Some(0), Some(1), Some(2)]
+    );
+    assert_eq!(plan.steps[0].reads[1..], parts);
 }
 
 #[test]

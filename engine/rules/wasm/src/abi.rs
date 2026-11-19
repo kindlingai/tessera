@@ -106,6 +106,9 @@ pub(crate) struct Input {
     /// This rank's part: axis, first, count, whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share: Option<[usize; 4]>,
+    /// A rotated weight: the lengths of `suh` and `svh`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<[usize; 2]>,
 }
 
 /// A site read, or an earlier offer's output.
@@ -113,8 +116,16 @@ pub(crate) struct Input {
 #[serde(untagged)]
 pub(crate) enum Place {
     Read(usize),
-    Draft { draft: usize },
-    Kept { kept: usize },
+    Draft {
+        draft: usize,
+    },
+    Kept {
+        kept: usize,
+    },
+    /// An input, then 0, 1 or 2: codes, `suh`, `svh`.
+    Part {
+        part: [usize; 2],
+    },
 }
 
 /// A u32 argument, fixed or read at launch.

@@ -9,6 +9,15 @@ use sensai_lower::{Arg, Draft, Extent, Home, Read, T, Term, Tree, sites};
 pub(crate) struct Reads {
     pub nodes: Vec<T>,
     pub kept: Vec<sites::Appended>,
+    /// Per rotated input: its place, then `suh` and `svh`.
+    pub parts: Vec<(usize, [T; 2])>,
+}
+
+impl Reads {
+    fn scales(&self, input: usize) -> Option<[T; 2]> {
+        let found = self.parts.iter().find(|(place, _)| *place == input)?;
+        Some(found.1)
+    }
 }
 
 /// The site for `kind` at `at`, and its reads.
@@ -24,6 +33,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         let reads = Reads {
             nodes: vec![m.x, m.w],
             kept: Vec::new(),
+            parts: Vec::new(),
         };
         return m.picked.is_none().then_some((site, reads));
     }
@@ -36,17 +46,23 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
     if r.kind != wanted {
         return None;
     }
-    let inputs = r.inputs.iter().map(|t| input(tree, *t)).collect();
-    let kept = r.kept.iter().map(|k| rows(tree, k)).collect();
+    let reads = Reads {
+        nodes: r.inputs,
+        kept: r.kept,
+        parts: r.parts,
+    };
+    let mut inputs = Vec::with_capacity(reads.nodes.len());
+    for (i, t) in reads.nodes.iter().enumerate() {
+        let mut input = input(tree, *t);
+        input.parts = reads.scales(i).map(|s| s.map(|t| tree.elements(t)));
+        inputs.push(input);
+    }
+    let kept = reads.kept.iter().map(|k| rows(tree, k)).collect();
     let site = Site::Region {
         kind,
         inputs,
         len: r.len,
         kept,
-    };
-    let reads = Reads {
-        nodes: r.inputs,
-        kept: r.kept,
     };
     Some((site, reads))
 }
@@ -72,7 +88,9 @@ fn input(tree: &Tree, t: T) -> Input {
         Extent::Fixed(_) => None,
     });
     let weight = match node.term {
-        Term::Leaf(Home::Weight(w)) => Some(dotted(&tree.g.weights[w as usize].path)),
+        Term::Leaf(Home::Weight(w) | Home::Part(w, 0)) => {
+            Some(dotted(&tree.g.weights[w as usize].path))
+        }
         _ => None,
     };
     let share = tree.share(t);
@@ -82,6 +100,7 @@ fn input(tree: &Tree, t: T) -> Input {
         form: node.form.name(),
         weight,
         share: share.map(|s| [s.axis as usize, s.first, s.count, s.whole]),
+        parts: None,
     }
 }
 
@@ -135,6 +154,8 @@ pub(crate) fn drafts(
                 Place::Read(i) => Read::Node(*from.nodes.get(i)?),
                 Place::Draft { draft } if draft < drafts.len() => Read::Draft(draft),
                 Place::Draft { .. } => return None,
+                Place::Part { part: [i, 0] } => Read::Node(*from.nodes.get(i)?),
+                Place::Part { part: [i, p] } => Read::Node(*from.scales(i)?.get(p - 1)?),
                 Place::Kept { kept: i } => {
                     let k = from.kept.get(i)?;
                     kept = Some(*k);

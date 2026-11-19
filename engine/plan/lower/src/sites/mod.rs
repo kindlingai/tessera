@@ -17,6 +17,7 @@ pub use stage::Stage;
 pub use top::Top;
 
 use crate::rule::Read;
+use crate::select::Home;
 use crate::tree::{T, Term, Tree};
 use sensai_graph::{Composite, Op, Stage as Step};
 
@@ -34,6 +35,8 @@ pub struct Region {
     pub len: usize,
     /// Kept rows it appends to. Its launches write them.
     pub kept: Vec<Appended>,
+    /// Per rotated input: its place, then `suh` and `svh`.
+    pub parts: Vec<(usize, [T; 2])>,
 }
 
 /// Kept rows a region appends to, as `Read::Kept` names them.
@@ -57,16 +60,27 @@ impl Pattern for Region {
         }
         let inputs: Option<Vec<T>> = region.inputs.iter().map(|i| tree.of(*i)).collect();
         let inputs = inputs?;
-        let mut kept = Vec::new();
-        // Sums and rotations stay with the engine.
+        let (mut kept, mut parts) = (Vec::new(), Vec::new());
+        // Sums stay with the engine.
         for n in tree.inside(at, &inputs) {
             let node = tree.node(n);
-            let unread = node
-                .args
-                .iter()
-                .any(|a| tree.leaf(*a) && !inputs.contains(a));
-            if node.term == Term::Stage(Step::AllReduce) || unread {
+            if node.term == Term::Stage(Step::AllReduce) {
                 return None;
+            }
+            for a in &node.args {
+                if !tree.leaf(*a) || inputs.contains(a) {
+                    continue;
+                }
+                // A rotated input brings its scales.
+                let (place, part) = scale(tree, &inputs, *a)?;
+                if !parts.iter().any(|(p, _)| *p == place) {
+                    parts.push((place, [*a; 2]));
+                }
+                for (p, scales) in &mut parts {
+                    if *p == place {
+                        scales[part] = *a;
+                    }
+                }
             }
             if let Term::Op(Op::Append(index)) = node.term {
                 let (_, context) = tree.kept_rows(index)?;
@@ -87,8 +101,19 @@ impl Pattern for Region {
             inputs,
             len,
             kept,
+            parts,
         })
     }
+}
+
+/// The input `t` scales, and which scale it is.
+fn scale(tree: &Tree, inputs: &[T], t: T) -> Option<(usize, usize)> {
+    let Term::Leaf(Home::Part(weight, part @ 1..)) = tree.node(t).term else {
+        return None;
+    };
+    let codes = Term::Leaf(Home::Part(weight, 0));
+    let place = inputs.iter().position(|i| tree.node(*i).term == codes)?;
+    Some((place, part as usize - 1))
 }
 
 impl Region {
