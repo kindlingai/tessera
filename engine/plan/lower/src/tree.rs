@@ -496,6 +496,10 @@ impl<'a> Tree<'a> {
     pub fn inside(&self, t: T, reads: &[T]) -> Vec<T> {
         let (mut nodes, mut stack) = (Vec::new(), vec![t]);
         while let Some(n) = stack.pop() {
+            // A root with two readers inside is reached twice.
+            if nodes.contains(&n) {
+                continue;
+            }
             nodes.push(n);
             let inside = |a: &&T| !reads.contains(a) && !self.leaf(**a);
             stack.extend(self.node(n).args.iter().filter(inside));

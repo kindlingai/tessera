@@ -1,0 +1,13 @@
+# GLM-5.3 with its routed block as one CUDA kernel.
+name = "glm53-moe"
+# The rule and its kernel come from this crate.
+module = "model"
+
+[weights]
+path = "weights"
+
+[lower]
+favor = "glm53_moe"
+
+[serve]
+task = "generate"

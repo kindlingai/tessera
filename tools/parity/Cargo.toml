@@ -24,4 +24,8 @@ sensai-testkit = { workspace = true }
 sensai-trace = { workspace = true }
 
 [dev-dependencies]
+sensai-codegen = { workspace = true }
+sensai-engine = { workspace = true }
+sensai-engine-settings = { workspace = true }
 sensai-models = { workspace = true }
+sensai-recipe = { workspace = true }

@@ -63,6 +63,8 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td>&emsp;<a href="engine/settings">sensai-engine-settings</a></td><td>Knobs the front end sets once and the engine reads</td></tr>
 <tr><td colspan="2"><a href="examples"><b>examples/</b></a></td></tr>
 <tr><td colspan="2">&emsp;<a href="examples/recipes"><b>recipes/</b></a></td></tr>
+<tr><td colspan="2">&emsp;&emsp;<a href="examples/recipes/glm53-moe"><b>glm53-moe/</b></a></td></tr>
+<tr><td>&emsp;&emsp;&emsp;<a href="examples/recipes/glm53-moe/model">sensai-glm53-moe-module</a></td><td>GLM-5.3's routed block as one CUDA kernel, as a recipe module</td></tr>
 <tr><td colspan="2">&emsp;&emsp;<a href="examples/recipes/tessera-small"><b>tessera-small/</b></a></td></tr>
 <tr><td>&emsp;&emsp;&emsp;<a href="examples/recipes/tessera-small/model">sensai-sprite-module</a></td><td>tessera-small's graph and tables, as a recipe module</td></tr>
 <tr><td colspan="2"><a href="frontend"><b>frontend/</b></a></td></tr>

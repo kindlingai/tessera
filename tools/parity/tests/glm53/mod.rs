@@ -1,5 +1,6 @@
 //! GLM-5.3.
 
+mod module_test;
 mod regions_test;
 
 use sensai_models::mla::{Config, RotatedMoe, program, stepper};
