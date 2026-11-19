@@ -92,6 +92,13 @@ impl Fixture {
     }
 }
 
+fn held(weights: crate::Weights) -> Vec<Weight> {
+    let crate::Weights::Held(all) = weights else {
+        panic!("a gguf file holds its weights");
+    };
+    all
+}
+
 fn widened(weights: &[Weight]) -> Vec<Weight> {
     let wide = |w: &Weight| match w {
         Weight::Packed(f, bytes) => {
@@ -135,11 +142,12 @@ fn compare(form: &'static dyn Load) {
         pins,
         ..Recipe::default()
     };
-    let wide = widened(&loaded.weights);
+    let weights = held(loaded.weights);
+    let wide = widened(&weights);
     let graph = &loaded.graph;
-    let mut direct = engine(graph.clone(), &recipe, &loaded.weights);
+    let mut direct = engine(graph.clone(), &recipe, &weights);
     let mut roundtrip = engine(graph.clone(), &recipe, &wide);
-    let mut override_direct = engine(graph.clone(), &Recipe::default(), &loaded.weights);
+    let mut override_direct = engine(graph.clone(), &Recipe::default(), &weights);
     let mut override_wide = engine(graph.clone(), &Recipe::default(), &wide);
     for position in 0..5 {
         let rows: Vec<_> = (0..2)
@@ -211,7 +219,7 @@ fn short_bytes() {
         pins: loaded.pins.unwrap(),
         ..Recipe::default()
     };
-    let mut weights = loaded.weights;
+    let mut weights = held(loaded.weights);
     let at = weights
         .iter()
         .position(|w| matches!(w, Weight::Packed(..)))

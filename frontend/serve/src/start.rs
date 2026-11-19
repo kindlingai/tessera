@@ -171,7 +171,8 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
     let recipe = lowering(o, loaded.pins);
     let at = (&recipe, settings);
     let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
-    engine.load(&loaded.weights).map_err(|e| e.to_string())?;
+    let loading = (loaded.weights).each(|at, w| engine.load_weight(at, w));
+    loading.map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());
     if o.ranks.follows() {

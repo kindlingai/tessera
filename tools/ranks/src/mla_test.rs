@@ -91,10 +91,8 @@ fn mla_run() {
     write(&dir, &g, &floats);
     let (read, stored, pins) = model("deepseek", &dir, ROWS as u64).unwrap();
     assert_eq!(read, g, "the release reads back as the same graph");
-    let tokens = Tensor::u32(
-        vec![1, ROWS],
-        (0..ROWS as u32).map(|t| t * 7 % 64).collect(),
-    );
+    let ids = (0..ROWS as u32).map(|t| t * 7 % 64).collect();
+    let tokens = Tensor::u32(vec![1, ROWS], ids);
     let positions = Tensor::u32(vec![1, ROWS], (0..ROWS as u32).collect());
     let want = run(&g, &floats, 0, &[tokens.clone(), positions.clone()]).unwrap();
     let want = want[0].floats().unwrap();
@@ -104,13 +102,7 @@ fn mla_run() {
     let sizes = [(Seqs, 1), (Context, ROWS as u64)];
     let plans = [0, 1].map(|r| lower(&sharded, 0, &sizes, &device.clone().as_rank(r)).unwrap());
     let mut ranks = Loopback::open(&plans, &settings).unwrap();
-    let mut loaded = 0;
-    let load = |at, w: &_| {
-        loaded += 1;
-        ranks.load_weight(at, w)
-    };
-    stored.each(load).unwrap();
-    assert_eq!(loaded, g.weights.len());
+    stored.each(|at, w| ranks.load_weight(at, w)).unwrap();
     let got = ranks.run(&[tokens.view(), positions.view()]).unwrap();
     let got = got[0].floats().unwrap();
     let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -135,15 +127,19 @@ fn mla_bundle() {
     std::fs::write(dir.join("tokenizer.json"), vocab).unwrap();
     std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
     let bundle = sensai_bundle::load(&dir, 1, ROWS as u64).unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
     let step = sensai_models::mla::stepper::<sensai_models::mla::Moe>(&c);
     assert_eq!(bundle.graph, step);
     assert_eq!(bundle.tokenizer.encode("a").unwrap(), [0]);
-    assert_eq!(bundle.weights.len(), floats.len());
-    for (got, want) in bundle.weights.iter().zip(&floats) {
-        let sensai_lower::Weight::Packed(_, bytes) = got else {
-            panic!("a bf16 weight stays packed");
-        };
-        assert_eq!(*bytes, BF16_FORM.pack(want.floats().unwrap()));
-    }
+    let mut read = 0;
+    let streamed = bundle.weights.each(|at, got| {
+        read += 1;
+        let want = BF16_FORM.pack(floats[at as usize].floats().unwrap());
+        match got {
+            sensai_lower::Weight::Packed(_, bytes) if *bytes == want => Ok(()),
+            _ => Err(format!("weight {at} is not its bf16 bytes")),
+        }
+    });
+    streamed.unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(read, floats.len());
 }

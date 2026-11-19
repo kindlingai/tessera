@@ -199,7 +199,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
         },
     };
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
-    engine.load(&loaded.weights)?;
+    (loaded.weights).each(|at, w| engine.load_weight(at, w))?;
     let (prompt, wanted) = match &args.reference {
         Some(dir) => {
             let (tokens, best) = reference(dir)?;

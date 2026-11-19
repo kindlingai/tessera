@@ -71,9 +71,33 @@ struct Generation {
     eos_token_id: Option<Ids>,
 }
 
+/// A model's weights: held, or read as they load.
+pub enum Weights {
+    Held(Vec<Weight>),
+    Streamed(Box<mla::Release>),
+}
+
+impl Weights {
+    /// Each weight in graph order, one held at a time.
+    pub fn each<E: Into<Box<dyn Error + Send + Sync>>>(
+        &self,
+        mut take: impl FnMut(u32, &Weight) -> Result<(), E>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match self {
+            Weights::Held(all) => {
+                for (at, w) in all.iter().enumerate() {
+                    take(at as u32, w).map_err(Into::into)?;
+                }
+                Ok(())
+            }
+            Weights::Streamed(release) => release.each(|at, w| take(at, &w).map_err(Into::into)),
+        }
+    }
+}
+
 pub struct Bundle {
     pub graph: Graph,
-    pub weights: Vec<Weight>,
+    pub weights: Weights,
     /// Forms packed in the file, when any are.
     pub pins: Option<Pins>,
     pub tokenizer: Hf,
@@ -290,12 +314,8 @@ pub fn load_named(
     let json = std::fs::read_to_string(dir.join("config.json"))?;
     if mla::config(&json, slots, context).is_ok() {
         let release = mla::stepping(dir, [slots, context], WIDTH, user, masked)?;
-        let mut weights = Vec::with_capacity(release.graph.weights.len());
-        release.each(|_, weight| {
-            weights.push(weight);
-            Ok(())
-        })?;
-        return dressed(dir, release.graph, weights, release.pins);
+        let (graph, pins) = (release.graph.clone(), release.pins.clone());
+        return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
     let (arch, mut config) = config(dir, slots, context)?;
     config.stack.masked = masked;
@@ -303,14 +323,14 @@ pub fn load_named(
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let file = File::open(&dir.join("model.safetensors"))?;
     let (weights, pins) = pull(&graph, &file, config.stack.layers, &[user])?;
-    dressed(dir, graph, weights, pins)
+    dressed(dir, graph, Weights::Held(weights), pins)
 }
 
 /// The graph and weights with `dir`'s tokenizer, template, stops.
 fn dressed(
     dir: &Path,
     graph: Graph,
-    weights: Vec<Weight>,
+    weights: Weights,
     pins: Pins,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;

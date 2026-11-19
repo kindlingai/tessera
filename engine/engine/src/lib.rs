@@ -239,9 +239,14 @@ impl Engine {
     /// Uploads the graph's weights, in its order.
     pub fn load(&mut self, weights: &[Weight]) -> Result<(), Error> {
         for (at, w) in weights.iter().enumerate() {
-            self.runner.load_weight(at as u32, w)?;
+            self.load_weight(at as u32, w)?;
         }
         Ok(())
+    }
+
+    /// Uploads weight `at` of the graph.
+    pub fn load_weight(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
+        Ok(self.runner.load_weight(at, w)?)
     }
 
     /// The backend and hardware under the runner.

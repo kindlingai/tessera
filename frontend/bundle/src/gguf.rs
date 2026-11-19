@@ -193,7 +193,7 @@ pub(crate) fn load(
     }
     Ok(Bundle {
         graph,
-        weights,
+        weights: crate::Weights::Held(weights),
         pins: Some(pins),
         tokenizer: tokenizer(&gguf)?,
         template,

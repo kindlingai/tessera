@@ -3,12 +3,13 @@
 // Linking these registers their lowering rules.
 use sensai_rules as _;
 
+use sensai_bundle::Weights;
 use sensai_engine_comm::{Fabric, Transport};
 use sensai_frontend_comm::{CAPACITY, meet, ports, shm};
 use sensai_graph::DimName::{Context, Seqs};
 use sensai_graph::shard;
 use sensai_interp::Tensor;
-use sensai_lower::{Cluster, Device, Pick, Weight, ZoneKind, lower};
+use sensai_lower::{Cluster, Device, Pick, ZoneKind, lower};
 use sensai_models::decoder::{Config, Moe, Swiglu, program};
 use sensai_run::{Rank, Run};
 use sensai_trace::Norm;
@@ -128,32 +129,6 @@ fn device(
         .pinned(pins)
         .zoned(Cluster::mesh(ranks, kind));
     device.ranked((0..ranks as u32).collect())
-}
-
-/// A model's weights: held, or read as they load.
-enum Weights {
-    Held(Vec<Weight>),
-    Streamed(Box<sensai_bundle::mla::Release>),
-}
-
-impl Weights {
-    /// Each weight in graph order, one held at a time.
-    fn each(
-        &self,
-        mut take: impl FnMut(u32, &Weight) -> Result<(), sensai_run::Error>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Weights::Held(all) => {
-                for (at, w) in all.iter().enumerate() {
-                    take(at as u32, w)?;
-                }
-            }
-            Weights::Streamed(release) => release
-                .each(|at, w| Ok(take(at, &w)?))
-                .map_err(|e| e.to_string())?,
-        }
-        Ok(())
-    }
 }
 
 type Loaded = (sensai_graph::Graph, Weights, sensai_lower::Pins);
@@ -276,7 +251,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("rank {}: on {}, sums {sums}", args.rank, rank.device());
     let start = Instant::now();
     // Each rank cuts its part from the packed bytes.
-    weights.each(|at, w| rank.load_weight(at, w))?;
+    let loading = weights.each(|at, w| rank.load_weight(at, w));
+    loading.map_err(|e| e.to_string())?;
     eprintln!(
         "rank {}: loaded in {:.1} s",
         args.rank,
