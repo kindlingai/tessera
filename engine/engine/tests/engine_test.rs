@@ -97,7 +97,7 @@ fn events(engine: &mut Engine, request: Request) -> Vec<Event> {
 fn ids(events: &[Event]) -> Vec<u32> {
     let id = |e: &Event| match e {
         Event::Token(id) => Some(*id),
-        Event::Done(_) => None,
+        Event::Kept(_) | Event::Done(_) => None,
     };
     events.iter().filter_map(id).collect()
 }
@@ -315,6 +315,16 @@ fn kept_rows_resume() {
             let want = reference(&g, &weights, prompt, 3);
             assert_eq!(asked(&mut batch, &[prompt]), (vec![want], steps));
         }
+        // The engine tells the sink the rows it kept.
+        let (events, taken) = std::sync::mpsc::channel();
+        let request = Request {
+            tokens: longer,
+            max_tokens: 1,
+            ..Request::default()
+        };
+        batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+        batch.step().unwrap();
+        assert_eq!(taken.try_iter().next(), Some(Event::Kept(2)));
     }
 }
 

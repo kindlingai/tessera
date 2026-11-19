@@ -14,7 +14,8 @@ fn completion_whole() {
     assert_eq!(got["choices"][0]["finish_reason"], "stop");
     assert_eq!(
         got["usage"],
-        json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})
+        json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 3}})
     );
     let asked = mock.asked.lock().unwrap().clone().unwrap();
     // The room the 16-token context leaves.

@@ -61,6 +61,8 @@ pub enum Reason {
 /// One decoded token, or the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
+    /// Prompt rows that kept rows cover. Sent before any token.
+    Kept(usize),
     Token(u32),
     Done(Reason),
 }

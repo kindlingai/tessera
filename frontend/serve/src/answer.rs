@@ -166,7 +166,8 @@ impl Started {
         }
     }
 
-    fn body(&self, choices: Value, usage: Option<usize>) -> Value {
+    /// `usage` holds the answer's tokens and the cached prompt tokens.
+    fn body(&self, choices: Value, usage: Option<(usize, usize)>) -> Value {
         let mut body = json!({
             "id": self.id,
             "object": self.object(),
@@ -174,11 +175,12 @@ impl Started {
             "model": self.model,
             "choices": choices,
         });
-        if let Some(tokens) = usage {
+        if let Some((tokens, cached)) = usage {
             body["usage"] = json!({
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": tokens,
                 "total_tokens": self.prompt_tokens + tokens,
+                "prompt_tokens_details": {"cached_tokens": cached},
             });
         }
         body
@@ -194,10 +196,12 @@ impl Started {
                     text: rest,
                     finish,
                     tokens,
+                    cached,
                 } => {
                     text += &rest;
                     let choice = self.choice(&text, Some(finish));
-                    return Response::json(200, &self.body(json!([choice]), Some(tokens)));
+                    let usage = Some((tokens, cached));
+                    return Response::json(200, &self.body(json!([choice]), usage));
                 }
             }
         }
@@ -222,15 +226,16 @@ impl Started {
                     text,
                     finish,
                     tokens,
-                } => (text, Some((finish, tokens))),
+                    cached,
+                } => (text, Some((finish, (tokens, cached)))),
             };
             let choice = self.choice(&text, end.map(|(f, _)| f));
             if !send(self.body(json!([choice]), None)) {
                 return;
             }
-            if let Some((_, tokens)) = end {
+            if let Some((_, usage)) = end {
                 if self.usage {
-                    send(self.body(json!([]), Some(tokens)));
+                    send(self.body(json!([]), Some(usage)));
                 }
                 let _ = out.send("[DONE]".into());
                 return;

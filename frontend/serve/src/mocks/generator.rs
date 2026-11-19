@@ -32,6 +32,7 @@ impl Generator for MockGenerator {
             text: "llo".into(),
             finish: Finish::Stop,
             tokens: 2,
+            cached: 3,
         });
         Ok(())
     }

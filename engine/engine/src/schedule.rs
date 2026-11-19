@@ -228,6 +228,9 @@ impl<'a> Batch<'a> {
                 made: 0,
                 next: Allowed::Any,
             };
+            if skip > 0 {
+                (seq.sink)(Event::Kept(skip));
+            }
             match seq.settle() {
                 Some(reason) => {
                     (seq.sink)(Event::Done(reason));

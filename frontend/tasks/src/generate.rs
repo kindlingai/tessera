@@ -67,13 +67,17 @@ impl Generator for Queued {
         };
         let generate = self.generate.clone();
         let (mut spool, mut stops) = (Spool::default(), Stops::new(params.stop));
-        let (mut tokens, mut ended) = (0, false);
+        let (mut tokens, mut cached, mut ended) = (0, 0, false);
         // The engine sends `Done` after a sink refuses a token.
         let each = move |event: Event| {
             if ended {
                 return false;
             }
             let step = match event {
+                Event::Kept(rows) => {
+                    cached = rows;
+                    return true;
+                }
                 Event::Token(id) => {
                     tokens += 1;
                     let piece = spool.push(id, |ids| generate.tokenizer.decode(ids));
@@ -84,6 +88,7 @@ impl Generator for Queued {
                             text,
                             finish: Finish::Stop,
                             tokens,
+                            cached,
                         },
                     }
                 }
@@ -94,6 +99,7 @@ impl Generator for Queued {
                         Reason::Length | Reason::Context => Finish::Length,
                     },
                     tokens,
+                    cached,
                 },
             };
             ended = matches!(step, Step::Done { .. });

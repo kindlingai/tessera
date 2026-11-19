@@ -69,6 +69,8 @@ pub enum Step {
         text: String,
         finish: Finish,
         tokens: usize,
+        /// Prompt tokens that kept rows covered.
+        cached: usize,
     },
 }
 
