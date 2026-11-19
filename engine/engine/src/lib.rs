@@ -12,10 +12,12 @@ use std::sync::mpsc;
 
 mod guide;
 mod model;
+mod ranks;
 mod schedule;
 
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use model::Model;
+pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 
 // The front end reaches the engine crates only through these.
@@ -95,6 +97,8 @@ pub struct Engine {
     words: Option<usize>,
     /// Whether entry 1 picks among candidate ids.
     sparse: bool,
+    /// Carries rank 0's launches to the other ranks.
+    control: Option<Box<dyn comm::Transport>>,
 }
 
 /// What a launch feeds before its picks.
@@ -165,12 +169,32 @@ impl Engine {
         recipe: &Recipe,
         settings: &Settings,
     ) -> Result<Self, Error> {
+        let run = |plan| Ok(open(plan, settings)?);
+        Self::placed(graph, context, recipe, settings, None, run)
+    }
+
+    /// As `open`. A `place` shards the graph for its rank.
+    fn placed(
+        graph: Graph,
+        context: usize,
+        recipe: &Recipe,
+        settings: &Settings,
+        place: Option<&Place>,
+        run: impl FnOnce(sensai_lower::Plan) -> Result<Box<dyn Run>, Error>,
+    ) -> Result<Self, Error> {
         let mut graph = sensai_graph::trim(&graph, 0)?;
         let sparse = graph.entries.len() > 1;
         if sparse {
             graph = sensai_graph::trim(&graph, 1)?;
         }
-        let device = Device::guess(settings).with(recipe);
+        let ranked = |device: Device| match place {
+            Some(place) => place.device(device),
+            None => device,
+        };
+        if let Some(place) = place {
+            graph = place.split(&graph)?;
+        }
+        let device = ranked(Device::guess(settings).with(recipe));
         let mut plans = Cache::default();
         let slots = graph
             .dims
@@ -185,7 +209,7 @@ impl Engine {
         let (sizes, _) = launch_of(&first, &[0], slots);
         let plan = plans.lower(&graph, 0, &sizes, &device)?;
         let table = plan.table;
-        let mut runner = open(plan, settings)?;
+        let mut runner = run(plan)?;
         if let Some(table) = table {
             // Each slot owns its own pages, in order.
             let pages: Vec<u8> = (0..table.len as u32).flat_map(u32::to_le_bytes).collect();
@@ -195,6 +219,7 @@ impl Engine {
         let device = Device::stored(runner.platform(), settings)
             .map_err(sensai_lower::Error::from)?
             .with(recipe);
+        let device = ranked(device);
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
         Ok(Self {
@@ -206,6 +231,7 @@ impl Engine {
             slots,
             words,
             sparse,
+            control: None,
         })
     }
 
@@ -294,6 +320,7 @@ impl Engine {
         {
             return Err(Error::RowPlace);
         }
+        self.announce(rows, picks, &head)?;
         let (mut sizes, mut feeds) = launch_of(rows, picks, self.slots);
         let wanted = feeds[3].len();
         let entry = match head {
