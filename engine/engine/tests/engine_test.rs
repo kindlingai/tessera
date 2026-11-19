@@ -240,6 +240,33 @@ fn batch_matches_single() {
     }
 }
 
+/// Low-rank attention computes its keys at each launch.
+#[test]
+fn mla_matches_interpreter() {
+    let graphs = [
+        mla::stepper::<mla::Moe>(&small::deepseek()),
+        mla::stepper::<mla::RotatedMoe>(&small::glm53()),
+    ];
+    let launches = [
+        vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0)],
+        vec![row(0, 4, 1), row(1, 3, 2)],
+        vec![row(1, 8, 3), row(0, 2, 2), row(0, 6, 3), row(0, 1, 4)],
+    ];
+    for settings in runs() {
+        for g in &graphs {
+            let weights = weights(g, &mut Noise(3));
+            let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+            let mut engine = Engine::open(g.clone(), 16, &Recipe::default(), &settings).unwrap();
+            engine.load(&stored).unwrap();
+            let mut store = Store::default();
+            for rows in &launches {
+                let want = step(g, &weights, &mut store, rows);
+                assert_eq!(engine.step(rows).unwrap(), want);
+            }
+        }
+    }
+}
+
 /// Trimmed steps return the whole graph's rows at their picks.
 #[test]
 fn trim_keeps_picks() {

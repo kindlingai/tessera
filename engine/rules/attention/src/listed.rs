@@ -3,7 +3,7 @@
 use sensai_codegen::prelude::*;
 use sensai_graph::Op;
 use sensai_lower::sites::Attend;
-use sensai_lower::{Attn, Draft, Kernel, Launch, Shape, Step, T, Term, Tree};
+use sensai_lower::{Attn, Draft, Extent, Kernel, Launch, Shape, Step, T, Term, Tree};
 
 /// One thread per output: the peak, then the weighted sum.
 #[kernel]
@@ -93,7 +93,8 @@ pub(crate) struct Sizes {
     pub len: usize,
     /// Queries per sequence. Ragged rows have one each.
     pub queries: usize,
-    pub keys: usize,
+    /// Each slot's keys, as many as the launch holds.
+    pub keys: Extent,
     pub heads: usize,
     pub kv_heads: usize,
     pub width: usize,
@@ -111,7 +112,7 @@ pub(crate) struct Sizes {
 #[launch(
     listed,
     name = "listed",
-    sizes = [self.0.len, self.0.keys, self.0.picks],
+    sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.len * self.0.picks * self.0.width,
     launches = listed_launches,
 )]
@@ -125,11 +126,13 @@ fn listed_launches(k: &Listed, step: &Step) -> Vec<Launch> {
         s.window.0,
         s.window.1,
     ];
-    let counts = [s.queries, s.keys, s.heads, s.kv_heads, s.width, s.picks];
+    let counts = [s.heads, s.kv_heads, s.width, s.picks];
     let mut launch = Launch::plain(step, &[s.len], Shape::Line(s.len));
     launch
         .args
         .insert(launch.args.len() - 1, sensai_lower::Arg::value(&s.scale));
+    launch.args.push(sensai_lower::Arg::count(s.queries));
+    launch.args.push(sensai_lower::Arg::size(s.keys));
     launch.args.extend(
         counts
             .into_iter()
@@ -147,11 +150,11 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     };
     let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
     let kept = |t: T| matches!(tree.node(t).term, Term::Op(Op::Append(_)));
-    if !a.ragged || kept(k) || kept(v) || tree.node(k).extents[1].runtime() {
+    if !a.ragged || kept(k) || kept(v) {
         return None;
     }
     let wide = |t: T| &tree.node(t).shape;
-    let (&[rows, heads, width], &[_, keys, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
+    let (&[rows, heads, width], &[_, most, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
         return None;
     };
     if wide(v).last() != Some(&width) {
@@ -160,12 +163,12 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let [slots, positions] = [node.args[3], node.args[4]];
     let (ids, picks) = match node.args.get(5) {
         Some(&ids) => (ids, *wide(ids).last()?),
-        None => (positions, keys),
+        None => (positions, most),
     };
     let sizes = Sizes {
         len: rows * heads * width,
         queries: 1,
-        keys,
+        keys: tree.node(k).extents[1],
         heads,
         kv_heads,
         width,
@@ -173,7 +176,7 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         ragged: true,
         from_list: a.picked,
         scale: a.scale,
-        window: (keys, 0),
+        window: (most, 0),
     };
     let reads = [q, k, v, ids, slots, positions];
     Some(vec![Draft::new(Listed(sizes), reads, sizes.len)])
@@ -186,7 +189,7 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> Option<Vec<Draft>> {
     let sizes = Sizes {
         len: a.seqs * a.queries * a.heads * a.width,
         queries: a.queries,
-        keys,
+        keys: Extent::Fixed(keys),
         heads: a.heads,
         kv_heads: a.kv_heads,
         width: a.width,
