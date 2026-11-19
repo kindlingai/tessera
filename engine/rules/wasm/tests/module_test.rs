@@ -441,3 +441,35 @@ fn module_attention_writes_kept() {
         }
     }
 }
+
+#[test]
+fn module_speaks_guest() {
+    use sensai_guest::site::{self, Count, Kind, Manifest, Offer, Place};
+    let manifest = Manifest {
+        abi: sensai_guest::ABI,
+        kernels: vec![site::kernel("wasm_gemm", "gemm", GEMM_CUDA)],
+        rules: vec![site::Rule {
+            name: "wasm_matmul",
+            site: Kind::Matmul,
+        }],
+        graph: false,
+    };
+    let rows = Count::Dim {
+        dim: "Rows".into(),
+        mul: 1,
+    };
+    let offer = Offer {
+        kernel: "wasm_gemm",
+        reads: vec![Place::Read(0), Place::Read(1)],
+        len: 128,
+        counts: vec![rows, Count::Fixed(32), Count::Fixed(64)],
+        shape: site::Shape::Line(128),
+        work: 8192.0,
+        guess: 1e-15,
+    };
+    let bytes = module(&json!(manifest), &json!([offer]), "");
+    let rule = sensai_wasm::load(&bytes).unwrap()[0];
+    let device = Device::default().adding(rule);
+    let plan = lower(&graph(false), 0, &[(Rows, 4)], &device).unwrap();
+    assert_eq!(rules(&plan), ["wasm_matmul"]);
+}

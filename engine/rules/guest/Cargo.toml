@@ -7,3 +7,7 @@ publish.workspace = true
 description = "What a recipe module links: memory hand-off and the table format"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

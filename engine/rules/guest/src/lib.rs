@@ -1,7 +1,12 @@
 //! What a recipe module links: memory hand-off, the table format.
 
+pub mod site;
+
 #[cfg(test)]
 mod lib_test;
+
+/// The version of the JSON exchange with the host.
+pub const ABI: u32 = 4;
 
 /// Room for `len` bytes, kept until the module ends.
 pub fn alloc(len: i32) -> i32 {

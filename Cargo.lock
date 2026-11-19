@@ -1780,6 +1780,10 @@ dependencies = [
 [[package]]
 name = "sensai-guest"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "sensai-host"

@@ -28,7 +28,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
             m: m.m,
             n: m.n,
             k: m.k,
-            form: m.form.name(),
+            form: m.form.name().into(),
         };
         let reads = Reads {
             nodes: vec![m.x, m.w],
@@ -73,9 +73,9 @@ fn rows(tree: &Tree, k: &sites::Appended) -> Kept {
         slots: k.slots,
         context: k.context,
         width: k.width,
-        layout: tree.kept.name(),
+        layout: tree.kept.name().into(),
         page: tree.kept.page(),
-        params: tree.kept.params(),
+        params: tree.kept.params().iter().map(|p| p.to_string()).collect(),
         values: tree.kept.values(k.slots, k.context),
         by: k.by,
     }
@@ -84,7 +84,7 @@ fn rows(tree: &Tree, k: &sites::Appended) -> Kept {
 fn input(tree: &Tree, t: T) -> Input {
     let node = tree.node(t);
     let dims = node.extents.iter().map(|e| match e {
-        Extent::Dim { name, .. } => Some(*name),
+        Extent::Dim { name, .. } => Some(format!("{name:?}")),
         Extent::Fixed(_) => None,
     });
     let weight = match node.term {
@@ -97,7 +97,7 @@ fn input(tree: &Tree, t: T) -> Input {
     Input {
         shape: node.shape.clone(),
         dims: dims.collect(),
-        form: node.form.name(),
+        form: node.form.name().into(),
         weight,
         share: share.map(|s| [s.axis as usize, s.first, s.count, s.whole]),
         parts: None,

@@ -1,10 +1,11 @@
 //! The JSON a module and the host exchange.
 
 use sensai_graph::DimName;
-use serde::{Deserialize, Serialize};
+pub(crate) use sensai_guest::site::{Ask, Input, Kept, Kind, Place, Shape, Site};
+use serde::Deserialize;
 
 /// The version of this exchange the host reads.
-pub(crate) const ABI: u32 = 4;
+pub(crate) use sensai_guest::ABI;
 
 /// What `manifest()` returns.
 #[derive(Debug, Deserialize)]
@@ -40,94 +41,6 @@ pub(crate) struct Declared {
     pub site: Kind,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Kind {
-    Matmul,
-    Mlp,
-    Moe,
-    Attention,
-}
-
-/// What `propose` is given.
-#[derive(Debug, Serialize)]
-pub(crate) struct Ask<'a> {
-    pub rule: &'a str,
-    pub site: Site,
-}
-
-/// A site's sizes. Offers name reads by place.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Site {
-    /// `x[m, k]` times `w[n, k]` transposed. Reads `[x, w]`.
-    Matmul {
-        m: usize,
-        n: usize,
-        k: usize,
-        form: &'static str,
-    },
-    /// A whole region. Reads are its inputs, in order.
-    Region {
-        kind: Kind,
-        inputs: Vec<Input>,
-        len: usize,
-        kept: Vec<Kept>,
-    },
-}
-
-/// Kept rows a region appends to. Its launches write them.
-#[derive(Debug, Serialize)]
-pub(crate) struct Kept {
-    pub index: u32,
-    /// Slots, rows per slot, and elements per row.
-    pub slots: usize,
-    pub context: usize,
-    pub width: usize,
-    /// The row layout, its rows per page, and its scalars.
-    pub layout: &'static str,
-    pub page: Option<usize>,
-    pub params: &'static [&'static str],
-    pub values: Vec<u32>,
-    /// Input places of the slot and position ids.
-    pub by: [Option<usize>; 2],
-}
-
-/// One value a region reads.
-#[derive(Debug, Serialize)]
-pub(crate) struct Input {
-    pub shape: Vec<usize>,
-    /// Per axis: the dimension read at launch, if any.
-    pub dims: Vec<Option<DimName>>,
-    pub form: &'static str,
-    /// A weight's dotted path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub weight: Option<String>,
-    /// This rank's part: axis, first, count, whole.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share: Option<[usize; 4]>,
-    /// A rotated weight: the lengths of `suh` and `svh`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parts: Option<[usize; 2]>,
-}
-
-/// A site read, or an earlier offer's output.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum Place {
-    Read(usize),
-    Draft {
-        draft: usize,
-    },
-    Kept {
-        kept: usize,
-    },
-    /// An input, then 0, 1 or 2: codes, `suh`, `svh`.
-    Part {
-        part: [usize; 2],
-    },
-}
-
 /// A u32 argument, fixed or read at launch.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(untagged)]
@@ -160,15 +73,4 @@ pub(crate) struct Offer {
     /// Work units, and seconds per unit until measured.
     pub work: f64,
     pub guess: f64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase", deny_unknown_fields)]
-pub(crate) enum Shape {
-    Line(usize),
-    Grid {
-        across: usize,
-        down: usize,
-        threads: usize,
-    },
 }

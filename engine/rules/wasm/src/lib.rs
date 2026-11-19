@@ -43,7 +43,7 @@ struct Asking {
 impl Asking {
     /// The module's offers, or the reason it gave none.
     fn ask(&self, site: Site) -> Result<Option<Vec<Offer>>, Error> {
-        let rule = self.rule;
+        let rule = self.rule.into();
         let input = serde_json::to_vec(&Ask { rule, site })?;
         let output = self.guest.call("propose", Some(&input), FUEL)?;
         Ok(serde_json::from_slice(&output)?)
