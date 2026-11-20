@@ -31,24 +31,26 @@ impl Fetcher for NoFetch {
     fn reset(&mut self) {}
 }
 
-type Outcome<L> = Result<Wired<L>, Error>;
+/// The link, unless the thread panicked, and how it ended.
+pub type Stopped<L> = (Option<Wired<L>>, Result<(), Error>);
+type Ended<L> = (Wired<L>, Result<(), Error>);
 
 /// A proxy thread. `stop` gives the link back.
 pub struct Running<L> {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Outcome<L>>>,
+    thread: Option<JoinHandle<Ended<L>>>,
 }
 
 fn serve<L: Comm>(
     mut proxy: Proxy,
     mut page: Page,
-    mut wired: Wired<L>,
+    wired: &mut Wired<L>,
     stop: &AtomicBool,
-) -> Outcome<L> {
+) -> Result<(), Error> {
     let mut idle = 0u32;
     let mut asked: Option<Instant> = None;
     loop {
-        match proxy.step(&mut page, &mut wired, &mut NoFetch)? {
+        match proxy.step(&mut page, wired, &mut NoFetch)? {
             true => idle = 0,
             false => idle = idle.saturating_add(1),
         }
@@ -57,7 +59,7 @@ fn serve<L: Comm>(
         }
         if let Some(at) = asked {
             if !proxy.open() {
-                return Ok(wired);
+                return Ok(());
             }
             if at.elapsed() > DRAIN {
                 return Err(Error::Link("puts still in flight at stop".into()));
@@ -76,26 +78,33 @@ impl<L: Comm + 'static> Running<L> {
         let asked = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("tessera-proxy".into())
-            .spawn(move || serve(proxy, page, wired, &asked))
+            .spawn(move || {
+                let mut wired = wired;
+                let ended = serve(proxy, page, &mut wired, &asked);
+                (wired, ended)
+            })
             .expect("a proxy thread");
         Running {
             stop,
             thread: Some(thread),
         }
     }
+}
 
+impl<L> Running<L> {
     /// Whether the thread stopped, which only an error does.
     pub fn failed(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Waits for puts in flight, then ends the thread.
-    pub fn stop(mut self) -> Outcome<L> {
+    pub fn stop(mut self) -> Stopped<L> {
         self.stop.store(true, Ordering::Release);
         let thread = self.thread.take().expect("a running thread");
-        thread
-            .join()
-            .unwrap_or_else(|_| Err(Error::Link("the proxy thread panicked".into())))
+        match thread.join() {
+            Ok((wired, ended)) => (Some(wired), ended),
+            Err(_) => (None, Err(Error::Link("the proxy thread panicked".into()))),
+        }
     }
 }
 

@@ -60,8 +60,6 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td>&emsp;&emsp;<a href="engine/rules/attention">attention/</a></td><td>tessera-attention</td><td>Attention kernels for the CPU and the GPU, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/cpu">cpu/</a></td><td>tessera-cpu</td><td>CPU kernels for matmuls: short bodies over a dot primitive</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/device">device/</a></td><td>tessera-device</td><td>Device headers, import scanner, host proxy and launcher for recipe kernels</td></tr>
-<tr><td>&emsp;&emsp;<a href="engine/rules/device">device/</a></td><td>tessera-device</td><td>Device headers, import scanner, host proxy and launcher for recipe kernels</td></tr>
-<tr><td>&emsp;&emsp;<a href="engine/rules/device">device/</a></td><td>tessera-device</td><td>Device headers, import scanner, host proxy and launcher for recipe kernels</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/guest">guest/</a></td><td>tessera-guest</td><td>The recipe module ABI: memory hand-off and the table format</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/kernels">kernels/</a></td><td>tessera-kernels</td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/linear">linear/</a></td><td>tessera-linear</td><td>Generated matmul kernels, registered as lowering rules</td></tr>
@@ -94,8 +92,6 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td>&emsp;<a href="tools/load">load/</a></td><td>tessera-load</td><td>Drives concurrent requests against tessera-serve and reports throughput</td></tr>
 <tr><td>&emsp;<a href="tools/parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
 <tr><td>&emsp;<a href="tools/publish">publish/</a></td><td>tessera-publish</td><td>Merges the workspace crates into the crates that go to crates.io</td></tr>
-<tr><td>&emsp;<a href="tools/ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
-<tr><td>&emsp;<a href="tools/ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
 <tr><td>&emsp;<a href="tools/ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
 <tr><td>&emsp;<a href="tools/shape">shape/</a></td><td>tessera-shape</td><td>Line shapes, with names, numbers and strings collapsed, and merge conflicts</td></tr>
 <tr><td>&emsp;<a href="tools/simcheck">simcheck/</a></td><td>tessera-simcheck</td><td>Fails on near-copies of code, found with EmbeddingGemma 2 embeddings</td></tr>

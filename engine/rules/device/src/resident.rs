@@ -1,12 +1,12 @@
 //! One persistent grid per rank, with its proxy beside it.
 
 use crate::layout::{
-    ARENAS, Barrier, ConventionRef, Counters, Fault, Item, Lane, Launch as Record, MAX_DEPTH,
-    MAX_GROUP, MAX_POOLS, PAGE, Pool, PoolSet, Ref, SIZES, Table, VALUES,
+    ARENAS, Barrier, ConventionRef, Counters, DTYPES, Fault, Item, Lane, Launch as Record,
+    MAX_DEPTH, MAX_GROUP, MAX_POOLS, PAGE, Pool, PoolSet, Ref, SIZES, STATUS, Table, VALUES,
 };
 use crate::proxy::page::Page;
 use crate::proxy::running::Running;
-use crate::proxy::wired::{CREDITS, FLAGS, Place, RECV, REGIONS, SEND, Wired};
+use crate::proxy::wired::{CREDITS, FLAGS, Place, RECV, REGIONS, SEND, Wired, regions};
 use crate::proxy::{self, Op, Proxy};
 use crate::{Backend, Options, flatten};
 use std::ffi::c_int;
@@ -83,7 +83,7 @@ impl Plan {
 
     /// The region sizes for the rank's link.
     pub fn regions(&self) -> [usize; REGIONS] {
-        Wired::<tessera_engine_comm::Memory>::regions(&self.proxy_pools(0), &self.bytes())
+        regions(&self.proxy_pools(0), &self.bytes())
     }
 }
 
@@ -93,16 +93,8 @@ pub struct Status(pub u32);
 
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names = [
-            "ok",
-            "abi mismatch",
-            "peer lost",
-            "bad input",
-            "timeout",
-            "protocol",
-        ];
-        match names.get(self.0 as usize) {
-            Some(name) => f.write_str(name),
+        match STATUS.get(self.0 as usize) {
+            Some(name) => f.write_str(&name.to_lowercase().replace('_', " ")),
             None => write!(f, "status {}", self.0),
         }
     }
@@ -197,6 +189,8 @@ pub struct Resident<D: Device, L> {
     page: u64,
     registered: Vec<*mut u8>,
     running: Option<Running<L>>,
+    /// A stopped proxy's link, kept until its pages unregister.
+    parked: Option<Wired<L>>,
     grid: u32,
     threads: u32,
     /// The device clock and the host instant it matches.
@@ -241,6 +235,7 @@ where
             page,
             registered: Vec::new(),
             running: None,
+            parked: None,
             grid,
             threads: plan.threads,
             clock: (0, Instant::now()),
@@ -431,11 +426,13 @@ where
         if !self.running.as_ref().is_none_or(Running::failed) {
             return Ok(());
         }
-        let stopped = self.running.take().map(Running::stop);
-        match stopped {
-            Some(Err(e)) => Err(e.into()),
-            _ => Err(plan("the proxy is gone")),
-        }
+        let Some((wired, ended)) = self.running.take().map(Running::stop) else {
+            return Err(plan("the proxy is gone"));
+        };
+        self.parked = wired;
+        Err(ended
+            .err()
+            .map_or_else(|| plan("the proxy is gone"), Error::from))
     }
 
     /// Stops the proxy and gives the link back.
@@ -444,14 +441,20 @@ where
             .running
             .take()
             .ok_or_else(|| plan("the proxy is gone"))?;
-        Ok(running.stop()?.into_link())
+        let (wired, ended) = running.stop();
+        let wired = wired.ok_or_else(|| plan("the proxy thread panicked"));
+        ended?;
+        Ok(wired?.into_link())
     }
 }
 
 impl<D: Device, L> Drop for Resident<D, L> {
     fn drop(&mut self) {
         // The proxy reads the page and regions until it stops.
-        drop(self.running.take());
+        if let Some(running) = self.running.take() {
+            self.parked = running.stop().0;
+        }
+        // Unregister before `parked` drops and its link unmaps.
         for host in self.registered.drain(..) {
             self.ctx.unregister(host);
         }
@@ -466,6 +469,9 @@ fn check(plan: &Plan, rank: u32) -> Result<(), Error> {
     if plan.arenas.len() > ARENAS - USER as usize {
         return Err(self::plan(format!("{} arenas", plan.arenas.len())));
     }
+    if let Some(l) = plan.lanes.iter().find(|l| l.elem as usize >= DTYPES.len()) {
+        return Err(self::plan(format!("a lane of dtype {}", l.elem)));
+    }
     for (p, pool) in plan.pools.iter().enumerate() {
         if !pool.group.contains(&rank) {
             return Err(self::plan(format!("rank {rank} is not in pool {p}")));
@@ -474,13 +480,9 @@ fn check(plan: &Plan, rank: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// Bytes per element of a `dtype`.
+/// Bytes per element of a `dtype`. `check` refused unknown ones.
 fn width(elem: u32) -> u32 {
-    match elem {
-        1 | 2 => 2,
-        3 | 5 | 6 => 1,
-        _ => 4,
-    }
+    DTYPES[elem as usize].1
 }
 
 fn lane(plan: &Plan, l: &LanePlan, rank: u32) -> Lane {

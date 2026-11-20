@@ -72,12 +72,12 @@ fn fit(what: String) -> Error {
     Error::Fit(what)
 }
 
-impl<L: Comm> Wired<L> {
-    /// Region sizes for pools with these slot sizes.
-    pub fn regions(pools: &[Pool], bytes: &[(usize, usize)]) -> [usize; REGIONS] {
-        layout(pools, bytes).1
-    }
+/// Region sizes for pools with these slot sizes.
+pub fn regions(pools: &[Pool], bytes: &[(usize, usize)]) -> [usize; REGIONS] {
+    layout(pools, bytes).1
+}
 
+impl<L: Comm> Wired<L> {
     /// `link` holds `regions(pools, bytes)`.
     pub fn new(
         link: L,

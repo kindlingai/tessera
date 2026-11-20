@@ -79,12 +79,12 @@ fn broken_rule_caught() {
 
 #[test]
 fn wired_puts_and_credits() {
-    use crate::proxy::wired::{CREDITS, FLAGS, RECV, SEND, Wired};
+    use crate::proxy::wired::{CREDITS, FLAGS, RECV, SEND, Wired, regions};
     use crate::proxy::{Link, Part, Sent};
     use tessera_engine_comm::{Link as _, Memory, Span};
     let pools = [pool(2, false, 2), pool(2, true, 2)];
     let bytes = [(32, 32), (32, 32)];
-    let regions = Wired::<Memory>::regions(&pools, &bytes);
+    let regions = regions(&pools, &bytes);
     let wire = |link| Wired::new(link, &pools, &bytes, vec![vec![0, 1], vec![0, 1]]).unwrap();
     let mut links = Memory::ranks(2, &regions).into_iter().map(wire);
     let (mut a, mut b) = (links.next().unwrap(), links.next().unwrap());
@@ -148,13 +148,13 @@ fn device_rounds(page: &[std::sync::atomic::AtomicU64], regions: [usize; 3], me:
 fn page_over_shm() {
     use crate::proxy::page::Page;
     use crate::proxy::running::Running;
-    use crate::proxy::wired::{FLAGS, RECV, SEND, Wired};
+    use crate::proxy::wired::{FLAGS, RECV, SEND, Wired, regions};
     use crate::proxy::{Lane, Proxy};
     use std::sync::atomic::AtomicU64;
     use tessera_engine_comm::{Link as _, ShmLink};
     let pools = [pool(2, false, 2)];
     let bytes = [(16, 16)];
-    let regions = Wired::<ShmLink>::regions(&pools, &bytes);
+    let regions = regions(&pools, &bytes);
     let path = tessera_testkit::scratch(&format!("page-{}", std::process::id()));
     let file = std::fs::File::create_new(&path).unwrap();
     file.set_len(ShmLink::room(2, &regions) as u64).unwrap();
@@ -194,6 +194,6 @@ fn page_over_shm() {
     });
     std::fs::remove_file(&path).unwrap();
     for (running, ..) in ranks {
-        running.stop().unwrap();
+        running.stop().1.unwrap();
     }
 }

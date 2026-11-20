@@ -133,6 +133,10 @@ fn headers_match_rust() {
         ("DOORBELL_ABORT", DOORBELL_ABORT),
         ("DOORBELL_SENT", DOORBELL_SENT),
     ];
+    let names = DTYPES.iter().map(|d| d.0).enumerate();
+    for (code, name) in names.chain(STATUS.into_iter().enumerate()) {
+        assert_eq!(headers.number(name), code, "{name}");
+    }
     for (name, value) in numbers {
         assert_eq!(headers.number(name), value, "{name}");
     }
