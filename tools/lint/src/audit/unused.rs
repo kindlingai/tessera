@@ -70,7 +70,7 @@ fn skipped(attrs: &[Attribute]) -> bool {
     })
 }
 
-fn exported(attrs: &[Attribute]) -> bool {
+pub fn exported(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| a.path().is_ident("macro_export"))
 }
 

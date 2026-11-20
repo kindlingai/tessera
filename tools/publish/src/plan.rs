@@ -6,22 +6,22 @@ use std::path::PathBuf;
 use crate::Result;
 use crate::meta::{Meta, Package};
 
-pub const ENGINE: &str = "sensai-engine";
-pub const FRONTEND: &str = "sensai";
-pub const CLI: &str = "sensaix";
+pub(crate) const ENGINE: &str = "sensai-engine";
+pub(crate) const FRONTEND: &str = "sensai";
+pub(crate) const CLI: &str = "sensaix";
 /// The second name the binary answers to.
-pub const CLI_ALIAS: &str = "sensai";
+pub(crate) const CLI_ALIAS: &str = "sensai";
 const CLI_SOURCE: &str = "sensai-cli";
 
 #[derive(PartialEq)]
-pub enum Kind {
+pub(crate) enum Kind {
     Lib,
     Macro,
     Bin,
 }
 
 /// One crate to publish.
-pub struct Out {
+pub(crate) struct Out {
     pub name: String,
     pub kind: Kind,
     pub description: String,
@@ -33,7 +33,7 @@ pub struct Out {
 }
 
 /// A workspace crate inside a published crate.
-pub struct Member {
+pub(crate) struct Member {
     pub pkg: usize,
     /// Its module, or empty when it is the whole crate.
     pub module: String,
@@ -41,7 +41,7 @@ pub struct Member {
     pub to: PathBuf,
 }
 
-pub fn plan(meta: &Meta) -> Result<Vec<Out>> {
+pub(crate) fn plan(meta: &Meta) -> Result<Vec<Out>> {
     let find = |name: &str| meta.packages.iter().position(|p| p.name == name);
     let engine = find(ENGINE).ok_or("no sensai-engine package")?;
     let cli = find(CLI_SOURCE).ok_or("no sensai-cli package")?;

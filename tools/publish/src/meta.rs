@@ -9,13 +9,13 @@ use serde::Deserialize;
 use crate::Result;
 
 #[derive(Deserialize)]
-pub struct Meta {
+pub(crate) struct Meta {
     pub packages: Vec<Package>,
     pub workspace_root: PathBuf,
 }
 
 #[derive(Deserialize)]
-pub struct Package {
+pub(crate) struct Package {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
@@ -28,7 +28,7 @@ pub struct Package {
 }
 
 #[derive(Deserialize, Clone)]
-pub struct Dep {
+pub(crate) struct Dep {
     pub name: String,
     pub req: String,
     pub kind: Option<String>,
@@ -40,7 +40,7 @@ pub struct Dep {
 }
 
 #[derive(Deserialize)]
-pub struct Target {
+pub(crate) struct Target {
     pub name: String,
     pub kind: Vec<String>,
     pub src_path: PathBuf,
@@ -78,7 +78,7 @@ impl Dep {
     }
 }
 
-pub fn load(root: &Path) -> Result<Meta> {
+pub(crate) fn load(root: &Path) -> Result<Meta> {
     let out = Command::new("cargo")
         .args([
             "metadata",

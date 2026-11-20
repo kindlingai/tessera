@@ -17,7 +17,13 @@ use crate::rewrite::{Moves, exports, rewrite};
 /// Directories a published crate leaves out.
 const SKIP: [&str; 4] = ["tests", "benches", "examples", "target"];
 
-pub fn emit(meta: &Meta, out: &Out, owners: &Owners, rel: &Release, base: &Path) -> Result<()> {
+pub(crate) fn emit(
+    meta: &Meta,
+    out: &Out,
+    owners: &Owners,
+    rel: &Release,
+    base: &Path,
+) -> Result<()> {
     let dir = base.join(&out.name);
     let mut mods = Vec::new();
     for m in &out.members {

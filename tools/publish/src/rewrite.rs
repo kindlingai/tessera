@@ -6,7 +6,7 @@ use std::ops::Range;
 use crate::tokens::{Cursor, Tok, apply, tokens};
 
 /// How the paths in one crate's files change.
-pub struct Moves<'a> {
+pub(crate) struct Moves<'a> {
     /// The module `crate::` now names, or empty.
     pub module: &'a str,
     /// Crate names and the paths that replace them.
@@ -19,7 +19,7 @@ pub struct Moves<'a> {
 
 type Edit = (Range<usize>, String);
 
-pub fn rewrite(src: &str, moves: &Moves) -> Result<String, String> {
+pub(crate) fn rewrite(src: &str, moves: &Moves) -> Result<String, String> {
     let toks = tokens(src)?;
     let t = Cursor(&toks);
     let mut edits = Vec::new();
@@ -143,7 +143,7 @@ fn included(src: &str, t: &Cursor, i: usize, m: &Moves) -> Option<Edit> {
 }
 
 /// Names of the `#[macro_export]` macros in `src`.
-pub fn exports(src: &str) -> Result<Vec<String>, String> {
+pub(crate) fn exports(src: &str) -> Result<Vec<String>, String> {
     let toks = tokens(src)?;
     let t = Cursor(&toks);
     let mut out = Vec::new();

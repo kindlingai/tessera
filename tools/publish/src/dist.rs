@@ -10,20 +10,20 @@ use crate::Result;
 use crate::plan::Out;
 
 /// What a release names in every package it writes.
-pub struct Release {
+pub(crate) struct Release {
     pub version: String,
     pub repository: Option<String>,
 }
 
 /// npm platform, CPU and C library for each binary build.
-pub const PLATFORMS: [(&str, &str, Option<&str>); 3] = [
+pub(crate) const PLATFORMS: [(&str, &str, Option<&str>); 3] = [
     ("linux", "x64", Some("glibc")),
     ("linux", "arm64", Some("glibc")),
     ("darwin", "arm64", None),
 ];
 
 /// A maturin `pyproject.toml` that ships the binary in a wheel.
-pub fn pyproject(out: &Out, rel: &Release, dir: &Path) -> Result<()> {
+pub(crate) fn pyproject(out: &Out, rel: &Release, dir: &Path) -> Result<()> {
     let mut project = Table::new();
     project.insert("name".into(), out.name.clone().into());
     project.insert("description".into(), out.description.clone().into());
@@ -54,7 +54,7 @@ pub fn pyproject(out: &Out, rel: &Release, dir: &Path) -> Result<()> {
 }
 
 /// npm packages per platform, plus a launcher that picks one.
-pub fn npm(out: &Out, rel: &Release, launcher: &Path, base: &Path) -> Result<()> {
+pub(crate) fn npm(out: &Out, rel: &Release, launcher: &Path, base: &Path) -> Result<()> {
     let name = &out.name;
     let mut optional = serde_json::Map::new();
     for (os, cpu, libc) in PLATFORMS {

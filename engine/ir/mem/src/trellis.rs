@@ -6,10 +6,12 @@ use sensai_graph::{DType, E4M3, F16};
 /// The mcg codebook's multiplier.
 pub const MCG: u32 = 0xCBAC_1FED;
 
-/// The mul1 codebook's multiplier, scale and offset.
+/// The mul1 codebook's multiplier.
 pub const MUL1: u32 = 0x83DC_D12D;
-pub const MUL1_SCALE: f32 = 0.006_767_273;
-pub const MUL1_OFFSET: f32 = -10.382_812_5;
+
+/// mul1's scale and offset, as the format gives them.
+pub const MUL1_SCALE: f32 = F16(0x1EEE).to_f32();
+pub const MUL1_OFFSET: f32 = F16(0xC931).to_f32();
 
 /// Header words: `in`, `out`, the sharded side, `1 / in`.
 pub const HEAD: usize = 16;
