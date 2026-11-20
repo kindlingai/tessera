@@ -72,6 +72,7 @@ sensai-testkit = { path = "engine/ir/testkit" }
 sensai-trace = { path = "engine/ir/trace" }
 sensai-trace-derive = { path = "engine/ir/trace-derive" }
 sensai-wasm = { path = "engine/rules/wasm" }
+tessera-publish = { path = "tools/publish" }
 
 # The host executor interprets whole kernels, so tests need it optimized.
 [profile.dev.package.sensai-host]

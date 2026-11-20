@@ -10,7 +10,7 @@ use crate::meta::{Dep, Meta};
 use crate::plan::{Kind, Out};
 
 /// The published crate that holds each workspace package.
-pub type Owners<'a> = BTreeMap<usize, &'a str>;
+pub(crate) type Owners<'a> = BTreeMap<usize, &'a str>;
 
 /// One dependency, merged over the members that name it.
 struct Want {
@@ -22,7 +22,7 @@ struct Want {
     optional: bool,
 }
 
-pub fn manifest(meta: &Meta, out: &Out, owners: &Owners, rel: &Release) -> Result<Table> {
+pub(crate) fn manifest(meta: &Meta, out: &Out, owners: &Owners, rel: &Release) -> Result<Table> {
     let version = rel.version.as_str();
     let first = &meta.packages[out.members[0].pkg];
     let mut package = Table::new();

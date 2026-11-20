@@ -5,7 +5,7 @@ use std::ops::Range;
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Tok {
+pub(crate) enum Tok {
     Ident(String),
     /// A punctuation character, and whether the next one joins it.
     Punct(char, bool),
@@ -14,12 +14,12 @@ pub enum Tok {
     Close,
 }
 
-pub struct Token {
+pub(crate) struct Token {
     pub tok: Tok,
     pub at: Range<usize>,
 }
 
-pub fn tokens(src: &str) -> Result<Vec<Token>, String> {
+pub(crate) fn tokens(src: &str) -> Result<Vec<Token>, String> {
     let stream: TokenStream = src
         .parse()
         .map_err(|e: proc_macro2::LexError| e.to_string())?;
@@ -55,7 +55,7 @@ fn flatten(stream: TokenStream, out: &mut Vec<Token>) {
 }
 
 /// Reads tokens by index, with misses past either end.
-pub struct Cursor<'a>(pub &'a [Token]);
+pub(crate) struct Cursor<'a>(pub &'a [Token]);
 
 impl Cursor<'_> {
     pub fn ident(&self, i: usize) -> Option<&str> {
@@ -90,7 +90,7 @@ impl Cursor<'_> {
 }
 
 /// Applies non-overlapping edits to `src`.
-pub fn apply(src: &str, mut edits: Vec<(Range<usize>, String)>) -> Result<String, String> {
+pub(crate) fn apply(src: &str, mut edits: Vec<(Range<usize>, String)>) -> Result<String, String> {
     edits.sort_by_key(|(at, _)| at.start);
     let mut out = String::with_capacity(src.len());
     let mut from = 0;
