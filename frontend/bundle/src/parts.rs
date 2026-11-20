@@ -98,7 +98,7 @@ pub fn open(dir: &Path, name: &str, size: &dyn Fn(DimName) -> Option<u64>) -> Re
             (eg2::program::<Linear>(&c), Source::Eg2(dir, layers))
         }
         Kind::Decoder => {
-            let (arch, c) = config(&dir, seqs, at(Context, 256))?;
+            let (arch, c) = config(&dir, [seqs, at(Context, 256)], none)?;
             let graph = stepper(&arch, &c)
                 .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
             (graph, Source::Decoder(dir, c.stack.layers))
