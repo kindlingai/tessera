@@ -388,7 +388,7 @@ impl<'a> Tree<'a> {
         step(Term::Stage(Stage::Mul), vec![back, svh], true)
     }
 
-    /// The part of a split weight this rank holds.
+    /// This rank's part of a split weight.
     pub fn share(&self, t: T) -> Option<Share> {
         self.shares[t.0 as usize]
     }

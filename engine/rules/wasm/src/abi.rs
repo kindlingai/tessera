@@ -7,7 +7,7 @@ use serde::Deserialize;
 /// The version of this exchange the host reads.
 pub(crate) use sensai_guest::ABI;
 
-/// What `manifest()` returns.
+/// The return value of `manifest()`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {

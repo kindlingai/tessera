@@ -101,7 +101,7 @@ pub trait Form: Sync {
         offset / self.dtype().bytes()
     }
 
-    /// Bytes `elements` take.
+    /// The size of `elements`, in bytes.
     fn bytes(&self, elements: usize) -> usize {
         elements * self.dtype().bytes()
     }

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
-/// Which OpenAI shape an answer takes.
+/// An answer's OpenAI shape.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Text,

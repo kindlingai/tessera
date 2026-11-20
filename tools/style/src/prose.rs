@@ -18,6 +18,31 @@ pub fn is_prose_file(path: &str) -> bool {
     PROSE_EXTS.contains(&extension(path))
 }
 
+/// Words in a string literal that reads as prose.
+const STRING_WORDS: std::ops::RangeInclusive<usize> = 3..=12;
+
+/// Short string literals in a code line, before any comment.
+pub fn strings(path: &str, line: &str) -> Vec<String> {
+    if is_prose_file(path) || HASH_EXTS.contains(&extension(path)) {
+        return Vec::new();
+    }
+    let code = match comment(path, line) {
+        Some(c) => &line[..line.len() - c.len()],
+        None => line,
+    };
+    let literal = Regex::new(r#"(?<![A-Za-z0-9_#])"((?:[^"\\]|\\.)*)""#).expect("valid");
+    let held = Regex::new(r"`[^`]*`|\{[^}]*\}").expect("valid");
+    let mut out = Vec::new();
+    for c in literal.captures_iter(code).filter_map(Result::ok) {
+        let text = held.replace_all(c[1].trim(), "Foo");
+        let words = text.split_whitespace().count();
+        if STRING_WORDS.contains(&words) && text.starts_with(char::is_alphabetic) {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
 /// A crate's `description` value, which reads as prose.
 fn description(path: &str, line: &str) -> Option<String> {
     let value = line.strip_prefix("description")?.trim_start();

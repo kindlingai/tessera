@@ -1,0 +1,7 @@
+Bytes one element takes.
+---
+Rows the pool holds.
+---
+The ids each reply carries.
+---
+Registers a thread may hold.

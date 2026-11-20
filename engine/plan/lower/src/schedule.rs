@@ -2,7 +2,7 @@
 
 use crate::select::{Home, Selected, Val};
 
-/// What an order needs to know about each value.
+/// Facts an order needs about each value.
 struct Lives<'a> {
     s: &'a Selected,
     /// Per value: ops yet to read it. Outputs stay positive.

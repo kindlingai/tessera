@@ -1,4 +1,4 @@
-//! What launches cost on one device, from timed samples.
+//! Launch costs on one device, from timed samples.
 
 use crate::form::Pins;
 use crate::kernel::Kernel;

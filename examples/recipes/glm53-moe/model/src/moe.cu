@@ -4,7 +4,7 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 typedef const unsigned char* bytes;
 
-// Most picks per row, and rows one expert block takes.
+// Most picks per row, and rows per expert block.
 #define PICKS 8
 #define ROWS 4
 #define WARPS 8
@@ -296,7 +296,7 @@ struct __align__(16) Space {
   u64 at[ROWS];
 };
 
-// What one expert block computes.
+// One expert block's work.
 struct Job {
   bytes gate, up, down;
   u32 m, c, n, hidden;

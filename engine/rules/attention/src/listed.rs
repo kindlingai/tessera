@@ -156,7 +156,7 @@ pub(crate) struct Sizes {
     pub len: usize,
     /// Queries per sequence. Ragged rows have one each.
     pub queries: usize,
-    /// Each slot's keys, as many as the launch holds.
+    /// Each slot's keys, up to the launch's capacity.
     pub keys: Extent,
     pub heads: usize,
     pub kv_heads: usize,

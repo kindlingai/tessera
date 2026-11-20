@@ -1,4 +1,4 @@
-//! The rows of a prompt that kept rows already hold.
+//! A prompt's rows already in kept rows.
 
 /// Why a prompt skips the rows it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

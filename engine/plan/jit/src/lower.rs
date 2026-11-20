@@ -22,7 +22,7 @@ pub(crate) fn trusted() -> MemFlagsData {
     MemFlagsData::trusted()
 }
 
-/// What a name in scope is.
+/// The kind of a name in scope.
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
     /// One value per thread, in a lane array.
@@ -679,7 +679,7 @@ impl Lowerer<'_, '_> {
         Ok((addr, self.iconst(self.ptr, len as i64)))
     }
 
-    /// `f` once per sum index `e` a lane holds.
+    /// `f` once per sum index `e` of a lane.
     fn each_sum<F>(&mut self, tiles: Value, f: F) -> Res
     where
         F: FnOnce(&mut Self, Value) -> Res,

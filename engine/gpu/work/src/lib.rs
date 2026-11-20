@@ -1,6 +1,6 @@
-//! What a launch does: ops per trip, and its load.
+//! A launch's work: ops per trip, and its load.
 
-/// What one thread does on each trip of its loop.
+/// One thread's work on each trip of its loop.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Ops {
     /// Float adds, multiplies and multiply-adds.
@@ -27,7 +27,7 @@ pub struct Ops {
     pub e2m1: f64,
 }
 
-/// Integer and float ops one widening by arithmetic takes.
+/// Integer and float ops for one widening by arithmetic.
 const WIDEN: (f64, f64) = (6.0, 2.0);
 
 impl Ops {
@@ -66,7 +66,7 @@ pub struct Load {
     pub written: f64,
     /// Bytes one thread waits on at a time.
     pub flight: f64,
-    /// Group memory each group of threads takes.
+    /// Group memory for each group of threads.
     pub group_bytes: f64,
 }
 

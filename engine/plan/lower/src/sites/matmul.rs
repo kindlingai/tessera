@@ -10,7 +10,7 @@ use sensai_graph::{Op, Select, View};
 pub struct Picked {
     /// The matrix index per output row.
     pub ids: T,
-    /// Matrices in the set, and the rows each holds.
+    /// Matrices in the set, and each one's rows.
     pub count: usize,
     pub stride: usize,
     /// The first row read of each matrix.

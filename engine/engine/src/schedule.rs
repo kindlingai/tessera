@@ -25,7 +25,7 @@ pub struct Seq {
     /// Tokens to feed: the prompt, then picked and forced tokens.
     pending: VecDeque<u32>,
     made: usize,
-    /// What the next pick may choose from.
+    /// Choices for the next pick.
     next: Allowed,
 }
 

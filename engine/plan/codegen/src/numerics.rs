@@ -13,7 +13,7 @@ pub enum Operand {
     F16x2,
 }
 
-/// What a backend's tile multiply rounds away.
+/// The error a backend's tile multiply rounds away.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Precision {
     pub operand: Operand,

@@ -32,7 +32,7 @@ pub struct Attn {
 }
 
 impl Attn {
-    /// What an attention kernel's time depends on.
+    /// Inputs to an attention kernel's time.
     pub fn sizes(&self) -> Vec<usize> {
         let keys = self.keys.most();
         vec![

@@ -1,4 +1,4 @@
-//! What one group of threads gets on a device.
+//! Limits for one group of threads on a device.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct Limits {
     /// Threads that execute together and can exchange values.
     pub lanes: usize,
-    /// Bytes of group memory one group may hold.
+    /// The most group memory one group may use, in bytes.
     pub group_bytes: usize,
     /// The most threads in one group.
     pub group_threads: usize,

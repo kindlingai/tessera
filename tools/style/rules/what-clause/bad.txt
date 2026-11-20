@@ -2,6 +2,6 @@ What a launch feeds before its picks.
 ---
 What the kernel needs: device addresses and the round.
 ---
-What one pass over the layers shares.
+What runs the graph.
 ---
-What the loaded model serves.
+What to favor, bar and pin when lowering a model.

@@ -5,7 +5,7 @@ use sensai_lower::{Plan, Slot};
 use sensai_mem::{Buffer, View, ViewMut};
 use std::collections::HashMap;
 
-/// What owns a buffer that outlives a plan.
+/// The owner of a buffer that outlives a plan.
 #[derive(Clone, Copy)]
 enum Owner {
     Weight((u32, Option<u8>)),

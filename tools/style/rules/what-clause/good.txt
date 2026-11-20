@@ -1,7 +1,5 @@
 Inputs a launch feeds before its picks.
 ---
-What to favor, bar and pin when lowering a model.
+The graph's runner.
 ---
-What runs the graph.
----
-The kernel's arguments: device addresses and the round.
+Checks what the cache holds before a fetch.

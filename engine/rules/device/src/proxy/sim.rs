@@ -27,7 +27,7 @@ impl Rng {
     }
 }
 
-/// The value word `j` of `rank`'s part for `ordinal` holds.
+/// The value in word `j` of `rank`'s part for `ordinal`.
 fn word(rank: u32, ordinal: u64, j: usize) -> u64 {
     (u64::from(rank) << 48) ^ (ordinal << 16) ^ j as u64
 }

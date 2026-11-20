@@ -38,7 +38,7 @@ pub enum Home {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Value {
-    /// Elements it holds.
+    /// Its element count.
     pub len: usize,
     pub home: Home,
     /// The zone it lies in.

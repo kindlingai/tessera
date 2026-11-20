@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pool {
     pub name: String,
-    /// Seconds an empty launch takes.
+    /// The seconds for an empty launch.
     pub floor: Const,
     /// Seconds each started thread adds.
     pub spawn: Const,
@@ -35,7 +35,7 @@ pub struct Pool {
     pub tile: Const,
     /// Compute units. Zero: every thread resident at once.
     pub cores: Const,
-    /// Bytes of registers and group memory one core holds.
+    /// Registers and group memory per core, in bytes.
     pub store: Const,
     /// Threads one core keeps resident.
     pub resident: Const,
@@ -142,7 +142,7 @@ impl Fit {
 
 /// How a launch's groups share the cores.
 struct Residency {
-    /// Rounds of resident groups the launch takes.
+    /// Rounds of resident groups for the launch.
     waves: f64,
     /// Threads resident across the chip.
     threads: f64,

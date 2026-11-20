@@ -7,7 +7,7 @@ use sensai_graph::Stage as Row;
 pub struct Stage {
     pub stage: sensai_graph::Stage,
     pub x: T,
-    /// The stage's argument, and how many elements it holds.
+    /// The stage's argument, and its element count.
     pub operand: Option<(T, usize)>,
     pub len: usize,
     pub width: usize,

@@ -119,7 +119,7 @@ pub(crate) fn parts(total: usize, lanes: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// What a rank tells the others about one queue pair.
+/// A rank's message to the others about one queue pair.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub(crate) struct Lane {
     pub qpn: u32,

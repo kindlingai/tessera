@@ -7,7 +7,7 @@ use sensai_trace::{
     Norm, Pairs, Role, Size, Tensor, TensorType, Weights,
 };
 
-/// What a query or key head passes through before RoPE.
+/// Steps a query or key head passes through before RoPE.
 pub trait HeadNorm: Weights {
     fn apply(&self, x: Tensor, eps: f32) -> Tensor;
 }
@@ -213,7 +213,7 @@ pub struct Decoder<N: HeadNorm, M: Mlp> {
 /// One layer's kept keys and values.
 type Cache = [Kept; 2];
 
-/// What one pass over the layers shares.
+/// State one pass over the layers shares.
 struct Pass<'a> {
     m: &'a Model,
     c: &'a Config,

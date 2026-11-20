@@ -337,7 +337,7 @@ fn kept_rows_resume() {
         batch.budget(1);
         let first = reference(&g, &weights, &[3, 9, 4], 3);
         let longer = [&[3, 9, 4], &first[..]].concat();
-        // Each prompt, and the steps its new rows take.
+        // Each prompt, and the step count for its new rows.
         let cases: [(&[u32], usize); 3] = [(&[3, 9, 4], 5), (&longer, 3), (&[3, 9, 7, 1], 4)];
         for (prompt, steps) in cases {
             let want = reference(&g, &weights, prompt, 3);

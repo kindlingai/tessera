@@ -140,7 +140,7 @@ fn changed_files(root: &Path, base: Option<&str>) -> Result<HashSet<String>> {
     Ok(diff.lines().map(String::from).collect())
 }
 
-/// What a `check` run embeds, and if it fails.
+/// A `check` run's embedding scope, and if it fails.
 #[derive(Default)]
 struct Mode {
     /// Uncached windows to embed outside changed files. `None` embeds all.

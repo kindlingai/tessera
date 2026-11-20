@@ -34,7 +34,7 @@ use std::error::Error;
 use std::path::Path;
 use tokenize::hf::Hf;
 
-/// What the graph needs from a Hugging Face `config.json`.
+/// Fields the graph needs from a Hugging Face `config.json`.
 #[derive(Deserialize)]
 struct HfConfig {
     model_type: String,

@@ -60,7 +60,7 @@ pub(crate) mod entry {
     pub(crate) type Elapsed = unsafe extern "C" fn(*mut f32, Handle, Handle) -> c_int;
 }
 
-/// What a handle to free is.
+/// The kind of handle to free.
 pub enum Kind {
     Module,
     Exec,

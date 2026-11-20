@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 /// Tokens per text, `<bos>` and `<eos>` included.
 const MAX_TOKENS: usize = 1024;
-/// The most texts a launch carries.
+/// The most texts in one launch.
 const SEQS: usize = 16;
-/// The most padded rows a launch carries.
+/// The most padded rows in one launch.
 const ROWS: usize = 4096;
 
 pub struct Embedder {

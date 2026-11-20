@@ -25,7 +25,7 @@ impl Offered {
 /// Why the keys and the offers do not pair off.
 #[derive(Debug, Default, PartialEq)]
 pub struct Unresolved {
-    /// Keys no offer holds.
+    /// Keys absent from every offer.
     pub missing: Vec<String>,
     /// Keys one offer holds under aliases that differ.
     pub ambiguous: Vec<(String, Vec<String>)>,
@@ -93,7 +93,7 @@ impl<'a> Keys<'a> {
         }
     }
 
-    /// Records a value the caller found the model cannot take.
+    /// Records a value the caller found the model refuses.
     pub fn misfit(&mut self, path: &str, why: impl Into<String>) {
         self.unresolved.misfit.push((path.into(), why.into()));
     }

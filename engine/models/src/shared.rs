@@ -167,7 +167,7 @@ pub struct Stack {
     pub heads: u64,
     pub head_dim: u64,
     pub ffn: u64,
-    /// Most sequences one launch may carry.
+    /// The most sequences in one launch.
     pub max_seqs: u64,
     pub max_context: u64,
     /// Step entries also take a mask of allowed tokens.

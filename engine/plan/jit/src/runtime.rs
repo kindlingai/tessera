@@ -1,4 +1,4 @@
-//! What compiled bodies call: buffers, math, shuffles and tiles.
+//! Calls for compiled bodies: buffers, math, shuffles and tiles.
 
 use sensai_codegen::Precision;
 use sensai_codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, Form, LOADS, Load, U8, U32};
@@ -21,7 +21,7 @@ pub struct Arg {
     pub bits: u32,
 }
 
-/// What one launch hands every group.
+/// Values one launch hands every group.
 #[repr(C)]
 pub struct Ctx {
     pub bufs: *const Buf,

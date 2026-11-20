@@ -1,7 +1,7 @@
 use crate::Term;
 use sensai_graph::{Parts, Shape};
 
-/// What no rule lowers.
+/// Ops with no lowering rule.
 #[derive(Debug, thiserror::Error)]
 pub enum Unsupported {
     #[error("entry {0}")]

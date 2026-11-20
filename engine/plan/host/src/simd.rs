@@ -364,7 +364,7 @@ pub(crate) fn reduce(acc: &Lanes) -> [[f32; 4]; 4] {
     acc.map(|line| line.map(|lanes| lanes.iter().sum()))
 }
 
-/// Columns one packed block holds.
+/// Columns in one packed block.
 pub(crate) const WIDE: usize = 32;
 
 /// Depth one packed panel holds, so it stays in cache.

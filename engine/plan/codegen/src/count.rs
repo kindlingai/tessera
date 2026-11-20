@@ -384,7 +384,7 @@ fn special(n: f64) -> Ops {
 macro_rules! costs {
     ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:tt)*) $(-> $ret:ident)?
         { device: $dev:expr, text: $text:expr, wgsl: $wgsl:expr, host: $host:expr, count: $count:expr $(,)? })*) => {
-        /// What a call adds. True for a float value.
+        /// The count a call adds. True for a float value.
         fn cost(i: Intrinsic) -> fn(&mut Counter, &[Expr]) -> bool {
             match i {
                 $(Intrinsic::$var => $count,)*

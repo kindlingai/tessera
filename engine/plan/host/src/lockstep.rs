@@ -1,4 +1,4 @@
-//! What compiled lockstep kernels call: reads, shuffles and tiles.
+//! Calls for compiled lockstep kernels: reads, shuffles and tiles.
 
 use crate::exec::{ArgVal, Grid};
 use crate::simd::{Block, Level, WIDE, block_at, dot_at, mix_at, panel_at, reduce};
@@ -7,7 +7,7 @@ use sensai_codegen::numerics::Precision;
 use sensai_codegen::stage::{Row, apply};
 use sensai_graph::{E2M1, E4M3, F16};
 
-/// The most threads one compiled group holds.
+/// The most threads in one compiled group.
 pub const THREADS: usize = 256;
 
 /// A compiled body. False means the grid was too wide.
@@ -224,7 +224,7 @@ impl Tiles {
         }
     }
 
-    /// Sums each lane holds.
+    /// Each lane's sums.
     pub fn per(&self) -> usize {
         (self.rows * self.cols).div_ceil(self.lanes)
     }

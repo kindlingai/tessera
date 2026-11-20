@@ -1,4 +1,4 @@
-//! What every backend's plan runner does.
+//! Work every backend's plan runner does.
 
 use crate::Error;
 use crate::held::Held;
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
-/// What every runner keeps: a plan, its buffers and sizes.
+/// State every runner keeps: a plan, its buffers and sizes.
 #[derive(Default)]
 pub struct Base {
     pub(crate) plan: Plan,
@@ -23,7 +23,7 @@ pub struct Base {
     pub(crate) bound: HashMap<DimName, u32>,
     /// Each step's launches before binding, built once.
     launches: Vec<OnceLock<Vec<Launch>>>,
-    /// Bytes a plan may hold. `None` checks nothing.
+    /// The most bytes a plan may use. `None` checks nothing.
     pub(crate) budget: Option<u64>,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
@@ -150,7 +150,7 @@ pub trait Run {
     fn compiled(&self) -> (usize, usize) {
         (0, 0)
     }
-    /// What the hardware gives one group of threads.
+    /// The hardware's limits for one group of threads.
     fn limits(&self) -> Limits {
         self.platform().limits
     }

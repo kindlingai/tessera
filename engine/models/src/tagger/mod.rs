@@ -12,7 +12,7 @@ pub const KEYS: u64 = 4;
 pub const PIECES: u64 = 3;
 /// Thinc's zero rows on each side of a text.
 pub const PAD: u64 = 4;
-/// The fewest rows a launch carries.
+/// The fewest rows in one launch.
 const LEAST: usize = 8;
 /// An id past every row. It gathers zeros.
 const NONE: u32 = u32::MAX;

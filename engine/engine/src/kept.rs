@@ -6,7 +6,7 @@ use sensai_kv::{Pool, Prefixes, RunId, Stats, Tag};
 const TAG: Tag = Tag(0);
 
 crate::metric_registry!(KV = "kv");
-crate::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows the kept-row pool holds.");
+crate::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows in the kept-row pool.");
 crate::metric!(ACTIVE in KV = Gauge "vllm:kv_active_tokens", "Rows in pages live answers hold.");
 crate::metric!(WORST in KV = Gauge "tessera:kv_worst_tokens", "Rows live answers may grow to.");
 crate::metric!(LIVE in KV = Gauge "tessera:kv_live_runs", "Answers that hold kept rows.");
@@ -64,7 +64,7 @@ impl Kept {
         }
     }
 
-    /// A slot for `prompt`, and the rows it already holds.
+    /// A slot for `prompt`, and its rows so far.
     pub fn admit(&mut self, prompt: &[u32]) -> Option<(u32, usize)> {
         // The last prompt row is always fed.
         let limit = prompt.len() - 1;
@@ -142,7 +142,7 @@ impl Kept {
         Ok(more.then_some(pages))
     }
 
-    /// Keeps a slot's rows under the tokens they hold.
+    /// Keeps a slot's rows under their tokens.
     pub fn finish(&mut self, slot: u32, history: Vec<u32>) {
         let Some(run) = self.runs[slot as usize].take() else {
             return;

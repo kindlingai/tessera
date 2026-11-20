@@ -130,7 +130,7 @@ impl Attend {
         })
     }
 
-    /// Elements the output holds.
+    /// The output's element count.
     pub fn out(&self) -> usize {
         self.sizes.queries * self.sizes.heads * self.sizes.width
     }

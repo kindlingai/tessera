@@ -1,4 +1,4 @@
-//! What a checkpoint offers: named slices, read when claimed.
+//! A checkpoint's offer: named slices, read when claimed.
 
 use crate::Error;
 use sensai_engine::storage::Form;

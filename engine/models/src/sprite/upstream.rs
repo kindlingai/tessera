@@ -4,7 +4,7 @@ use super::tables::COLOR_FREQS;
 use super::{Config, HEAD_DIM, REGISTERS, TEXT};
 use serde::Deserialize;
 
-/// What `model_config.json` holds. The graph fixes some of it.
+/// The fields of `model_config.json`. The graph fixes some.
 #[derive(Deserialize)]
 struct Upstream {
     vocab_size: u64,

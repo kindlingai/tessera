@@ -1,4 +1,4 @@
-//! What every matmul kernel shares.
+//! Parts every matmul kernel shares.
 
 use sensai_codegen::hash;
 use sensai_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};

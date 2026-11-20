@@ -1,0 +1,5 @@
+The size of one element, in bytes.
+---
+Seconds per kernel since the last take.
+---
+The pool holds rows for live runs.

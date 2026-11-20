@@ -8,7 +8,7 @@ use sensai_trace::Graph;
 /// Two sequences of five tokens.
 const TOKENS: [u32; 10] = [1, 5, 2, 7, 0, 3, 3, 6, 4, 1];
 
-/// What a separately written forward pass gave for them.
+/// Outputs from a separately written forward pass.
 const WANT: [f32; 80] = [
     -0.5819097,
     0.9464245,

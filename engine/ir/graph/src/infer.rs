@@ -517,7 +517,7 @@ fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
     )?;
     let mut shape = x.shape.0.clone();
     shape.remove(axis as usize);
-    // Each rank sums the rows it holds.
+    // Each rank sums its own rows.
     let placement = match x.placement {
         Placement::Routed => Placement::Partial,
         p => p,

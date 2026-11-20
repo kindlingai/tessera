@@ -51,7 +51,7 @@ impl Const {
     }
 }
 
-/// What bounds a launch's time.
+/// The bound on a launch's time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Limit {
     /// Starting the launch and its threads.

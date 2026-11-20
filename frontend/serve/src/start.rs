@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
-/// The flags `Options::flag` and `Options::switch` take.
+/// The flags for `Options::flag` and `Options::switch`.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
 [--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix]";
 
-/// What the loaded model serves.
+/// The loaded model's task.
 #[derive(Clone, Copy, PartialEq)]
 enum Task {
     Generate,

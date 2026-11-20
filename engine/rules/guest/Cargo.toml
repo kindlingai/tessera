@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "What a recipe module links: memory hand-off and the table format"
+description = "The recipe module ABI: memory hand-off and the table format"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -229,7 +229,7 @@ enum Keys<'a> {
     Pick(&'a Indexer),
 }
 
-/// What one pass over the layers shares.
+/// State one pass over the layers shares.
 struct Pass<'a> {
     m: &'a Model,
     c: &'a Config,

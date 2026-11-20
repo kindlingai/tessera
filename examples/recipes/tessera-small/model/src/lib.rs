@@ -4,7 +4,7 @@ use sensai_guest::{encode, input, output};
 use sensai_models::sprite::{self, Config};
 use serde::Deserialize;
 
-/// What the host passes to `graph` and `tables`.
+/// Inputs the host passes to `graph` and `tables`.
 #[derive(Deserialize)]
 struct Build {
     config: serde_json::Value,

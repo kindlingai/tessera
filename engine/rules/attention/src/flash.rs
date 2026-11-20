@@ -14,7 +14,7 @@ use std::collections::HashMap;
 /// Queries one group handles.
 const BQ: u32 = 32;
 
-/// Keys one block of the stream holds.
+/// Keys per block of the stream.
 const BK: u32 = 16;
 
 /// Four SIMD groups: two form scores, four apply them.

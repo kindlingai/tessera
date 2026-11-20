@@ -112,7 +112,7 @@ fn finished(mut body: Body, after: &After, operands_at: usize) -> Body {
     body
 }
 
-/// The stages after each sum the thread's block holds.
+/// The stages after each sum in the thread's block.
 fn tiled_finish(mut body: Body, after: &After) -> Body {
     if after.stages.is_empty() {
         return body;

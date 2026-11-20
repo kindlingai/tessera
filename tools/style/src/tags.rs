@@ -2,7 +2,7 @@
 
 use crate::diff::Hunk;
 use crate::pattern;
-use crate::prose::{comment, is_prose_file};
+use crate::prose::{comment, is_prose_file, strings};
 use fancy_regex::Regex;
 use sensai_tasks::{Error, Tagger};
 use std::path::Path;
@@ -62,10 +62,28 @@ fn prose_lines(h: &Hunk) -> Vec<(usize, String)> {
     out
 }
 
+/// Short strings on added lines, each its own text.
+fn string_lines(h: &Hunk) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (n, raw) in h.numbered() {
+        let (mark, line) = raw.split_at(1);
+        if mark != "+" {
+            continue;
+        }
+        for s in strings(&h.path, line) {
+            out.push((n, s));
+        }
+    }
+    out
+}
+
 /// Tag-rule hits on added prose, by comment block.
 pub fn check(h: &Hunk, tagger: &mut Tagger, rules: &[Rule]) -> Result<Vec<Hit>, Error> {
     let lines = prose_lines(h);
     let mut out = Vec::new();
+    for (n, text) in string_lines(h) {
+        out.extend(block(&[(n, text)], tagger, rules)?);
+    }
     let mut start = 0;
     for i in 1..=lines.len() {
         if i == lines.len() || lines[i].0 != lines[i - 1].0 + 1 {
@@ -87,6 +105,10 @@ fn block(
         starts.push((text.len(), *n));
         text.push_str(line);
         text.push(' ');
+    }
+    // Descriptions and strings end without a stop. Rules expect one.
+    if !text.trim_end().ends_with(['.', '!', '?', ':']) {
+        text = format!("{}. ", text.trim_end());
     }
     let line_of = |at: usize| {
         starts

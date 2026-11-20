@@ -6,7 +6,7 @@ use sensai_codegen::kept::{self, Layout};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
-/// What to favor, bar and pin when lowering a model.
+/// Choices to favor, bar and pin when lowering a model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
     /// The form each weight is stored in.

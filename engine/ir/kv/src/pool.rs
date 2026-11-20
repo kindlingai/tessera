@@ -29,7 +29,7 @@ pub enum Error {
     NoRoom(usize),
     #[error("{rows} rows pass the run's worst case of {worst}")]
     PastWorst { rows: usize, worst: usize },
-    #[error("a run takes at most the {0} rows its source holds")]
+    #[error("a run takes at most its source's {0} rows")]
     PastSource(usize),
     #[error("{0:?} is live")]
     Live(RunId),
@@ -57,9 +57,9 @@ struct Slot {
 /// A pool's totals. Row counts are whole pages.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Rows the pool holds.
+    /// The pool's row count.
     pub size: usize,
-    /// Rows in pages that live runs hold.
+    /// Rows in pages of live runs.
     pub active: usize,
     /// Rows live runs may grow to.
     pub worst: usize,

@@ -3,7 +3,7 @@
 use crate::{EDITION, Import};
 use std::fmt;
 
-/// What is wrong, without the place.
+/// The fault, without the place.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Problem {
     #[error("<{0}> names no edition: write <tessera/{EDITION}/...>")]

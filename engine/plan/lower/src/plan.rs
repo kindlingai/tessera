@@ -108,7 +108,7 @@ pub struct Loaded {
     pub slot: Slot,
     /// Set when each rank loads its own slice.
     pub share: Option<Share>,
-    /// Which part of a split file this slot holds.
+    /// This slot's part of a split file.
     pub part: Option<u8>,
 }
 

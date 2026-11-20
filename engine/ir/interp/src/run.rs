@@ -508,7 +508,7 @@ struct Context<'a> {
     entry: usize,
     inputs: &'a [Tensor],
     weights: &'a [Cow<'a, Tensor>],
-    /// The first row of a routed table this rank holds.
+    /// This rank's first row of a routed table.
     first: usize,
 }
 

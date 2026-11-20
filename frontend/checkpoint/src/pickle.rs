@@ -3,7 +3,7 @@
 use crate::Error;
 use std::collections::HashMap;
 
-/// The most bytes a pickle may hold.
+/// The largest pickle, in bytes.
 pub(crate) const MAX_PICKLE: usize = 64 << 20;
 const MAX_DEPTH: u32 = 64;
 /// The most value nodes memo reads may copy.

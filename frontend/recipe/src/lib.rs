@@ -17,7 +17,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// What stops a recipe from opening.
+/// Errors that stop a recipe from opening.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}: {1}")]

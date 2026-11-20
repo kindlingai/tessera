@@ -3,13 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// What every launch is guessed to cost before any work.
+/// The guessed cost of every launch before any work.
 pub const FIXED: f64 = 1e-4;
 
 /// How many samples one estimate blends.
 const NEAR: usize = 3;
 
-/// What a plan uses of each resource.
+/// A plan's use of each resource.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Cost {
     pub seconds: f64,

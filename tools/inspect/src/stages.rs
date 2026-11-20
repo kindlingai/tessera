@@ -69,7 +69,7 @@ pub struct Pass {
     pub texts: Vec<Text>,
 }
 
-/// What the views need to lower each rank.
+/// Inputs the views need to lower each rank.
 pub struct Setup<'a> {
     pub model: &'a Model,
     pub specs: &'a [Spec],

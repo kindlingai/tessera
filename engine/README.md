@@ -34,7 +34,7 @@ and tokens.
 <tr><td>&emsp;<a href="rules/attention">sensai-attention</a></td><td>Attention kernels for the CPU and the GPU, registered as lowering rules</td></tr>
 <tr><td>&emsp;<a href="rules/cpu">sensai-cpu</a></td><td>CPU kernels for matmuls: short bodies over a dot primitive</td></tr>
 <tr><td>&emsp;<a href="rules/device">sensai-device</a></td><td>Device headers, import scanner and host proxy for whole-model recipe kernels</td></tr>
-<tr><td>&emsp;<a href="rules/guest">sensai-guest</a></td><td>What a recipe module links: memory hand-off and the table format</td></tr>
+<tr><td>&emsp;<a href="rules/guest">sensai-guest</a></td><td>The recipe module ABI: memory hand-off and the table format</td></tr>
 <tr><td>&emsp;<a href="rules/kernels">sensai-kernels</a></td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td>&emsp;<a href="rules/linear">sensai-linear</a></td><td>Generated matmul kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;<a href="rules/rules">sensai-rules</a></td><td>Links every lowering rule crate</td></tr>

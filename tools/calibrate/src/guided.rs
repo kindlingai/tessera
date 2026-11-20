@@ -36,7 +36,7 @@ type Shape = (&'static str, fn(u64) -> Config);
 
 const SHAPES: [Shape; 2] = [("qwen3-0.6b", qwen3), ("gemma3-270m", gemma)];
 
-/// What each pick may choose from.
+/// Choices for each pick.
 #[derive(Clone, Copy)]
 enum Case {
     /// A graph with no mask port.

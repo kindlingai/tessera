@@ -78,7 +78,7 @@ pub struct Module {
     graph: bool,
 }
 
-/// What `graph` and `tables` are given.
+/// The inputs to `graph` and `tables`.
 #[derive(serde::Serialize)]
 struct Build<'a> {
     config: &'a serde_json::value::RawValue,

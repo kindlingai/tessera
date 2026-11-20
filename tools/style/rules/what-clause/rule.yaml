@@ -1,2 +1,2 @@
 name: 'What-clause label'
-description: 'A comment that opens with "What a <noun> <verbs>" ("What a launch feeds before its picks") names a question, not the thing. Say what the item is.'
+description: 'A comment, string or description that opens with "What" ("What the kernel needs", "What runs the graph") names a question, not the thing. Say what the item is.'

@@ -9,7 +9,7 @@ use toml::{Table, Value};
 use crate::Result;
 use crate::plan::Out;
 
-/// What a release names in every package it writes.
+/// Names a release puts in every package it writes.
 pub(crate) struct Release {
     pub version: String,
     pub repository: Option<String>,

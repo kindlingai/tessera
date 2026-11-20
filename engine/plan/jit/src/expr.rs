@@ -41,7 +41,7 @@ pub(crate) fn clif(ty: Ty) -> Type {
     }
 }
 
-/// Bytes one lane's value of `ty` takes.
+/// The size of one lane's `ty` value, in bytes.
 pub(crate) fn elem_size(ty: Ty) -> usize {
     match ty {
         Ty::F32 | Ty::U32 => 4,

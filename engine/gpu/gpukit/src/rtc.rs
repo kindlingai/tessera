@@ -28,10 +28,10 @@ pub(crate) struct Rtc {
     pub(crate) name: &'static str,
     /// The prefix on each symbol.
     pub(crate) prefix: &'static str,
-    /// What its symbols call the compiled code.
+    /// The name its symbols use for compiled code.
     pub(crate) code: &'static str,
     pub(crate) libraries: &'static [&'static str],
-    /// What to install when no library loads.
+    /// The install hint when no library loads.
     pub(crate) install: &'static str,
     pub(crate) error: fn(String) -> Error,
     pub(crate) lib: OnceLock<Result<Fns, String>>,

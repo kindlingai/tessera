@@ -13,7 +13,7 @@ struct Planned {
     plans: Cache,
 }
 
-/// What runs the graph.
+/// The graph's runner.
 enum Executor {
     Planned(Box<Planned>),
     /// The interpreter, for graphs no rule lowers yet.

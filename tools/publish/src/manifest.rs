@@ -103,7 +103,7 @@ fn dependencies(meta: &Meta, out: &Out, owners: &Owners, version: &str) -> Resul
                 Some(q) if owners.get(&q) == Some(&out.name.as_str()) => continue,
                 Some(q) => {
                     let other = owners.get(&q).ok_or(format!(
-                        "{} needs {}, which no crate holds",
+                        "{} needs {}, which is in no crate",
                         pkg.name, d.name
                     ))?;
                     (other.to_string(), linked(d, other, version))

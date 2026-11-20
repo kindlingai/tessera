@@ -5,7 +5,7 @@ use sensai_engine::{Engine, Graph, Place, Recipe, Settings};
 use sensai_frontend_comm::{join, meet, ports};
 use std::net::SocketAddr;
 
-/// The flags `Ranks::flag` takes.
+/// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
 [--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...]]";
 

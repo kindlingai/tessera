@@ -10,7 +10,7 @@ pub(crate) struct Sm {
     pub schedulers: Const,
     /// 32-bit registers per multiprocessor.
     pub registers: Const,
-    /// Registers a thread is assumed to hold.
+    /// The registers assumed per thread.
     pub held: Const,
     /// Threads one multiprocessor keeps resident.
     pub threads: Const,
@@ -39,13 +39,13 @@ pub(crate) struct Sm {
     pub write: Const,
     /// How much reads and writes slow each other.
     pub mixed: Const,
-    /// Seconds a load from memory takes.
+    /// The seconds for a load from memory.
     pub wait: Const,
     /// Bytes of cache that stay usable.
     pub cache: Const,
     /// Bytes a second from cache to all multiprocessors.
     pub cached: Const,
-    /// Seconds a load from cache takes.
+    /// The seconds for a load from cache.
     pub near: Const,
     /// Seconds from one launch's end to the next's start.
     pub floor: Const,
@@ -59,9 +59,9 @@ pub(crate) struct Sm {
     pub fp8: Const,
     /// One, where one instruction widens an e4m3.
     pub cvt8: Const,
-    /// Bytes of group memory one multiprocessor holds.
+    /// Group memory per multiprocessor, in bytes.
     pub group_memory: Const,
-    /// Registers a thread may hold.
+    /// The most registers per thread.
     pub cap: Const,
     /// Seconds a thread waits per float from group memory.
     pub staged: Const,

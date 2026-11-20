@@ -1,9 +1,9 @@
-//! What an HTTP front end asks of a loaded model.
+//! Calls an HTTP front end makes on a loaded model.
 
 use crate::Error;
 use sensai_bundle::Message;
 
-/// The served model's name, and the tokens one answer holds.
+/// The served model's name and context size.
 #[derive(Clone, Debug)]
 pub struct Info {
     pub name: String,
@@ -21,17 +21,17 @@ pub trait Chat: Send + Sync {
     fn render(&self, messages: &[Message], think: bool) -> Result<String, Error>;
 }
 
-/// What one answer may do beyond the prompt.
+/// Settings for one answer, beyond the prompt.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Params {
     pub max_tokens: usize,
     /// Strings that end the answer, excluded from its text.
     pub stop: Vec<String>,
-    /// The shape the answer must take. None allows any text.
+    /// The answer's required shape. `None` allows any text.
     pub format: Option<Format>,
 }
 
-/// A shape an answer must take.
+/// A required shape for an answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Format {
     /// Any JSON object.

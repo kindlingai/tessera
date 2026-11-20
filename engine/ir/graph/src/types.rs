@@ -15,7 +15,7 @@ pub enum DType {
 }
 
 impl DType {
-    /// Bytes one element takes.
+    /// The size of one element, in bytes.
     pub fn bytes(self) -> usize {
         match self {
             DType::F32 | DType::I32 | DType::U32 => 4,

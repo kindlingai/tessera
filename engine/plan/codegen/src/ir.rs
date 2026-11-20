@@ -101,7 +101,7 @@ macro_rules! ty {
     };
 }
 
-/// What a kernel may call besides arithmetic, from the table.
+/// Calls a kernel may make besides arithmetic, from the table.
 macro_rules! intrinsics {
     ($($(#[$doc:meta])* $var:ident = $kind:ident $($name:ident)::+ ($($arg:ident),*)
         $(-> $ret:ident)? { device: $dev:expr, text: $text:expr, wgsl: $wgsl:expr, host: $host:expr,

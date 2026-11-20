@@ -37,7 +37,7 @@ pub enum Codebook {
 }
 
 impl Codebook {
-    /// What a release appends to its tensor names.
+    /// The suffix a release appends to its tensor names.
     pub fn suffix(self) -> &'static str {
         match self {
             Codebook::Mcg => "",
@@ -164,7 +164,7 @@ impl<const K: u32> Trellis<K> {
         )
     }
 
-    /// Bytes one tile of 256 codes takes.
+    /// The size of one tile of 256 codes, in bytes.
     const TILE: usize = 32 * K as usize;
 
     /// The code at stream position `j` of a tile.

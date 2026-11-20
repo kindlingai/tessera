@@ -57,13 +57,13 @@ pub trait Kernel: fmt::Debug + Send + Sync {
         let _ = input;
         !form.narrow()
     }
-    /// What it asks of a thread group. Zero asks nothing.
+    /// Its needs from a thread group. Zero needs nothing.
     fn needs(&self) -> Needs {
         Needs::default()
     }
 }
 
-/// What a kernel asks of the device to run.
+/// A kernel's needs from the device to run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Needs {
     /// Exactly this many lanes together, or zero for any.

@@ -27,7 +27,7 @@ pub trait Pinning: Send + Sync {
     fn unpin(&self, pinned: Pinned);
 }
 
-/// What the kernel needs: device addresses and the round.
+/// The kernel's arguments: device addresses and the round.
 pub struct Reduce {
     pub send: u64,
     pub recv: u64,

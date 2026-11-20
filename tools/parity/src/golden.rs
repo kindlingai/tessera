@@ -62,7 +62,7 @@ pub const LOGITS: Golden = Golden {
     anywhere: false,
 };
 
-/// What a reference holds: weights, and inputs with outputs.
+/// A reference's contents: weights, and inputs with outputs.
 pub struct Reference {
     pub weights: Vec<Tensor>,
     pub cases: Vec<Case>,

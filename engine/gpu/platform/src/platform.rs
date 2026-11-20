@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// One JSON file per architecture, matched by platform id.
 pub(crate) static TABLE: Dir = include_dir!("$CARGO_MANIFEST_DIR/platforms");
 
-/// What a driver cannot say about an architecture.
+/// Architecture facts a driver cannot report.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     /// Ids this row covers. A trailing star takes any rest.

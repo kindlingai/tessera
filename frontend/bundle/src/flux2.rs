@@ -11,7 +11,7 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-/// What the graph needs from `transformer/config.json`.
+/// Fields the graph needs from `transformer/config.json`.
 #[derive(Deserialize)]
 struct Sizes {
     num_attention_heads: u64,

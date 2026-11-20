@@ -6,7 +6,7 @@ use sensai_graph::{Composite, DimName, PathSeg};
 use sensai_lower::kernels::AllReduce;
 use sensai_lower::{Arg, Draft, Extent, Home, Read, T, Term, Tree, sites};
 
-/// What a site's offers may read.
+/// Data a site's offers may read.
 pub(crate) struct Reads {
     pub nodes: Vec<T>,
     pub kept: Vec<sites::Appended>,

@@ -6,7 +6,7 @@ use sensai_graph::{DType, E2M1, E4M3, E8M0, F16};
 /// A code: what one element stores, before its block's scale.
 pub trait Code: Sync {
     const BITS: u32;
-    /// The largest magnitude a code holds.
+    /// A code's largest magnitude.
     const MAX: f32;
     fn encode(scaled: f32) -> u32;
     fn decode(code: u32) -> f32;
@@ -20,7 +20,7 @@ pub trait Code: Sync {
 /// A scale: a narrow float before each block's codes.
 pub trait Scale: Sync {
     const BYTES: usize;
-    /// The largest scale the type holds.
+    /// The type's largest scale.
     const MAX: f32;
     fn put(scale: f32, into: &mut [u8]);
     fn get(from: &[u8]) -> f32;

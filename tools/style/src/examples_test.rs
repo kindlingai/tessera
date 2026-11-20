@@ -58,6 +58,7 @@ fn rules_load() {
             "agent-passive",
             "chained-clause",
             "echo-clause",
+            "end-verb",
             "hidden-negation",
             "what-clause"
         ]

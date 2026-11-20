@@ -1,4 +1,4 @@
-//! Pins: which registered form each weight takes.
+//! Pins: the registered form for each weight.
 
 use sensai_graph::PathSeg;
 use sensai_mem::Tensor;

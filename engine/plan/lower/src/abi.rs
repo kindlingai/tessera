@@ -1,4 +1,4 @@
-//! What a kernel declares: its arguments, shape and source.
+//! A kernel's declaration: its arguments, shape and source.
 
 use crate::extent::Extent;
 use crate::plan::{Slot, Step};

@@ -158,7 +158,7 @@ pub(crate) struct StreamOptions {
     extra: Bag,
 }
 
-/// The shape an answer must take.
+/// The required shape of an answer.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponseFormat {
@@ -194,7 +194,7 @@ pub(crate) struct JsonSchema {
     extra: Bag,
 }
 
-/// What completions and chat share.
+/// Fields completions and chat share.
 #[derive(Deserialize)]
 pub(crate) struct Common {
     pub(crate) max_tokens: Option<usize>,
@@ -335,7 +335,7 @@ impl Bagged for Chat {
     }
 }
 
-/// What `/tokenize` takes: a prompt or messages.
+/// The `/tokenize` body: a prompt or messages.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Tokenize {
@@ -379,7 +379,7 @@ macro_rules! single {
     };
 }
 
-/// What `/v1/images/generations` takes. `seed` is ours.
+/// The `/v1/images/generations` body. `seed` is ours.
 #[derive(Deserialize)]
 pub(crate) struct Images {
     pub(crate) prompt: String,

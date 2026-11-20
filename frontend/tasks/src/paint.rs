@@ -61,7 +61,7 @@ pub struct Painter {
     denoiser: Model,
     /// RGB per palette id. Id 0 is transparent.
     pub palette: Vec<[u8; 3]>,
-    /// The most canvases one launch carries.
+    /// The most canvases in one launch.
     most: usize,
 }
 

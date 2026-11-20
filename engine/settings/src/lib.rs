@@ -21,7 +21,7 @@ pub enum Pick {
     Gpu(Backend),
 }
 
-/// How many bytes one plan may hold.
+/// The most bytes one plan may use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Memory {
     /// Most of what the device reports.

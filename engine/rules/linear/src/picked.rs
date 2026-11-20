@@ -60,7 +60,7 @@ fn picked(
 }
 
 impl Picked {
-    /// The pick this product carries.
+    /// This product's pick.
     fn pick(&self) -> Pick {
         self.product.picked.expect("a picked product")
     }

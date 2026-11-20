@@ -33,7 +33,7 @@ macro_rules! table {
                 host: |g, _, _| (0..g.threads).map(|t| Val::U((t % g.lanes) as u32)).collect(),
                 count: |_, _| false,
             }
-            /// `shfl_xor(value, mask)`: what the lane `mask` away holds.
+            /// `shfl_xor(value, mask)`: the value in the lane `mask` away.
             ShflXor = fn shfl_xor(f32, u32) -> f32 {
                 // HIP leaves out the mask.
                 device: spelled(

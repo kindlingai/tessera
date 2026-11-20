@@ -1,4 +1,4 @@
-//! What a recipe module links: memory hand-off, the table format.
+//! The recipe module ABI: memory hand-off, the table format.
 
 pub mod site;
 

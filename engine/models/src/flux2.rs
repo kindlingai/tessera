@@ -28,7 +28,7 @@ pub struct Config {
     pub single: u64,
     pub theta: f32,
     pub max_seqs: u64,
-    /// Most image rows one launch carries.
+    /// The most image rows in one launch.
     pub max_rows: u64,
 }
 

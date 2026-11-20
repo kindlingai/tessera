@@ -93,7 +93,7 @@ pub enum Error {
     Mask,
     #[error("kept rows: {0}")]
     Kept(#[from] sensai_kv::Error),
-    #[error("a slot's next row is in a page another run holds")]
+    #[error("a slot's next row is in another run's page")]
     SharedPage,
 }
 
@@ -118,7 +118,7 @@ pub struct Engine {
     profile: Option<[u64; 2]>,
 }
 
-/// What a launch feeds before its picks.
+/// Inputs a launch feeds before its picks.
 enum Head {
     /// Entry 0, with each pick's mask words. None allows all.
     Full(Option<Vec<u32>>),

@@ -15,7 +15,7 @@ pub struct Message {
     pub content: String,
 }
 
-/// What `tokenizer_config.json` says about chat.
+/// Chat settings from `tokenizer_config.json`.
 #[derive(Deserialize)]
 struct TokenizerConfig {
     chat_template: Option<String>,
