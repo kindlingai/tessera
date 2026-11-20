@@ -52,6 +52,14 @@ pub fn trim(g: &Graph, entry: usize) -> Result<Graph, VerifyError> {
         }
     }
     let mut out = rebuild(g, entry, &need, &anchors);
+    // A layer or model with picked rows splits apart.
+    let regions = std::mem::take(&mut out.regions);
+    for (r, was) in regions.into_iter().zip(&g.regions) {
+        let mut span = was.start.0 as usize..was.end.0 as usize;
+        if was.kind.block() || !span.any(|i| need[i] == Need::Picked) {
+            out.regions.push(r);
+        }
+    }
     if !out.dims.iter().any(|d| d.name == Picks) {
         out.dims.push(Dim {
             name: Picks,
@@ -70,7 +78,8 @@ fn earliest(was: &mut Option<usize>, at: usize) {
 /// Gathers for reader `i` go before its outermost region.
 fn hoist(g: &Graph, i: usize) -> usize {
     let id = NodeId(i as u32);
-    let around = g.regions.iter().filter(|r| r.start <= id && id < r.end);
+    let around = g.regions.iter().filter(|r| r.kind.block());
+    let around = around.filter(|r| r.start <= id && id < r.end);
     around.map(|r| r.start.0 as usize).fold(i, usize::min)
 }
 
@@ -87,7 +96,7 @@ fn needs(g: &Graph, entry: usize) -> Vec<Need> {
     loop {
         let need = sweep(g, entry, &forced);
         let mut more = false;
-        for r in &g.regions {
+        for r in g.regions.iter().filter(|r| r.kind.block()) {
             let span = r.start.0 as usize..r.end.0 as usize;
             let all = span
                 .clone()

@@ -57,7 +57,22 @@ fn one() -> usize {
     1
 }
 
-/// One launch `propose` offers. `null` offers none.
+/// One entry `propose` offers. `null` offers none.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Entry {
+    Launch(Offer),
+    Sum(Sum),
+}
+
+/// Sums draft `all_reduce` across ranks, as a new draft.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Sum {
+    pub all_reduce: usize,
+}
+
+/// One launch. Its reads are all it depends on.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Offer {

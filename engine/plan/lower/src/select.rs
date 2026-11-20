@@ -213,6 +213,7 @@ pub(crate) fn select_upto(
                 }
                 let covers = tree.covered(t, &reads(&choice.drafts));
                 let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());
+                let mut written = Vec::new();
                 let last = choice.drafts.len() - 1;
                 for (i, d) in choice.drafts.into_iter().enumerate() {
                     let mut reads = Vec::with_capacity(d.reads.len());
@@ -224,10 +225,25 @@ pub(crate) fn select_upto(
                         });
                     }
                     // The last launch writes the node's own type.
-                    let form = if i == last { n.form } else { form::F32_FORM };
+                    let form = match d.writes {
+                        Some(w) => tree.node(w).form,
+                        None if i == last => n.form,
+                        None => form::F32_FORM,
+                    };
+                    let writes = d.writes;
                     made.push(e.op(d, choice.rule, reads, &covers, zone, form));
+                    if let Some(w) = writes {
+                        written.push((w, made[i]));
+                    }
                 }
-                *made.last().expect("a rule proposes at least one launch")
+                let mut own = *made.last().expect("a rule proposes at least one launch");
+                for (w, v) in written {
+                    match w == t {
+                        true => own = v,
+                        false => vals[w.0 as usize] = Some(v),
+                    }
+                }
+                own
             }
         };
         vals[t.0 as usize] = Some(made);

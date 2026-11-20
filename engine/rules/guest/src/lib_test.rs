@@ -14,7 +14,7 @@ fn tables_round_trip() {
 
 #[test]
 fn ask_parses() {
-    let text = r#"{"rule": "r", "site": {"region": {"kind": "moe", "len": 8, "kept": [],
+    let text = r#"{"rule": "r", "site": {"region": {"kind": "moe", "outputs": [8], "kept": [], "sums": 0,
         "inputs": [{"shape": [2, 4], "dims": ["Rows", null], "form": "f32"}]}}}"#;
     let ask: Ask = serde_json::from_str(text).unwrap();
     let Site::Region { kind, inputs, .. } = ask.site else {

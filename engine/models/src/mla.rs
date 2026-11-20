@@ -257,42 +257,71 @@ pub fn forward<R: Routed>(
 impl Pass<'_> {
     fn logits<R: Routed>(&self, w: &Mla<R>, tokens: &Tensor) -> Tensor {
         let (m, c) = (self.m, self.c);
-        let mut x = m.embed(tokens, &w.embed);
-        let mut indexers = w.indexers.iter();
-        let mut keys: Option<Tensor> = None;
-        for (l, a) in w.attn.iter().enumerate() {
-            let h = x.rms_norm(&a.norm, c.eps);
-            let reused = keys.clone().filter(|_| !c.indexes(l as u64));
-            let read = match (reused, &c.index) {
-                (Some(k), _) => Keys::Given(k),
-                (None, None) => Keys::All,
-                (None, Some(_)) => {
-                    Keys::Pick(indexers.next().expect("an indexer per indexing layer"))
-                }
-            };
-            let attn = match read {
-                Keys::Pick(_) => {
-                    let [out, k] = m.composite(Composite::Attention, || {
-                        let (out, k) = self.mla(l, a, &h, read);
-                        [out, k.expect("picked keys")]
-                    });
-                    keys = Some(k);
-                    [out]
-                }
-                _ => m.composite(Composite::Attention, || [self.mla(l, a, &h, read).0]),
-            };
-            x = x.add(&attn[0]);
-            let h = x.rms_norm(&w.mlp_norm[l], c.eps);
-            let mlp = match l.checked_sub(w.dense.len()) {
-                None => {
-                    let d = &w.dense[l];
-                    m.composite(Composite::Mlp, || [swiglu(&h, [&d.gate, &d.up, &d.down])])
-                }
-                Some(i) => m.composite(Composite::Moe, || [w.moe[i].apply(m, c, &h)]),
-            };
-            x = x.add(&mlp[0]);
+        let [logits] = m.composite(Composite::Model, || {
+            let mut x = m.embed(tokens, &w.embed);
+            let mut indexers = w.indexers.iter();
+            let mut keys: Option<Tensor> = None;
+            for l in 0..w.attn.len() {
+                let reused = keys.clone().filter(|_| !c.indexes(l as u64));
+                let read = match (reused, &c.index) {
+                    (Some(k), _) => Keys::Given(k),
+                    (None, None) => Keys::All,
+                    (None, Some(_)) => {
+                        Keys::Pick(indexers.next().expect("an indexer per indexing layer"))
+                    }
+                };
+                let picks = matches!(read, Keys::Pick(_));
+                let layer = || self.layer(w, l, &x, read);
+                let (out, picked) = self.region(Composite::Layer, picks, layer);
+                x = out;
+                keys = picked.or(keys);
+            }
+            [x.rms_norm(&w.norm, c.eps).matmul(&w.head)]
+        });
+        logits
+    }
+
+    /// One decoder layer, and the keys its attention picked.
+    fn layer<R: Routed>(
+        &self,
+        w: &Mla<R>,
+        l: usize,
+        x: &Tensor,
+        read: Keys,
+    ) -> (Tensor, Option<Tensor>) {
+        let (m, c, a) = (self.m, self.c, &w.attn[l]);
+        let h = x.rms_norm(&a.norm, c.eps);
+        let picks = matches!(read, Keys::Pick(_));
+        let attend = || self.mla(l, a, &h, read);
+        let (attn, keys) = self.region(Composite::Attention, picks, attend);
+        let x = x.add(&attn);
+        let h = x.rms_norm(&w.mlp_norm[l], c.eps);
+        let [mlp] = match l.checked_sub(w.dense.len()) {
+            None => {
+                let d = &w.dense[l];
+                m.composite(Composite::Mlp, || [swiglu(&h, [&d.gate, &d.up, &d.down])])
+            }
+            Some(i) => m.composite(Composite::Moe, || [w.moe[i].apply(m, c, &h)]),
+        };
+        (x.add(&mlp), keys)
+    }
+
+    /// `body` as a `kind` region. Picked keys are output two.
+    fn region(
+        &self,
+        kind: Composite,
+        picks: bool,
+        body: impl FnOnce() -> (Tensor, Option<Tensor>),
+    ) -> (Tensor, Option<Tensor>) {
+        if !picks {
+            let [out] = self.m.composite(kind, || [body().0]);
+            return (out, None);
         }
-        x.rms_norm(&w.norm, c.eps).matmul(&w.head)
+        let [out, keys] = self.m.composite(kind, || {
+            let (out, keys) = body();
+            [out, keys.expect("picked keys")]
+        });
+        (out, Some(keys))
     }
 
     /// The axes before a row's features: `[Seqs, Context]`, or `[Rows]`.

@@ -9,7 +9,9 @@ use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 use sensai_codegen::kept::Layout;
-use sensai_graph::{DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Shape, Stage};
+use sensai_graph::{
+    DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Shape, Stage,
+};
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -444,15 +446,23 @@ impl<'a> Tree<'a> {
 
     /// Region outputs a rule in `rules` covers become roots.
     pub(crate) fn end_regions(&mut self, rules: &[&Rule]) {
-        let outputs = self.g.regions.iter().filter_map(|r| match r.outputs[..] {
-            [o] => self.of(o),
-            _ => None,
-        });
-        let outputs: Vec<T> = outputs.collect();
-        for t in outputs {
-            let claimed = rules.iter().any(|r| r.propose.at(self, t).is_some());
-            self.ends[t.0 as usize] = claimed;
+        let mut ends = Vec::new();
+        for region in &self.g.regions {
+            let Some(t) = self.anchor(region) else {
+                continue;
+            };
+            if rules.iter().any(|r| r.propose.at(self, t).is_some()) {
+                ends.extend(region.outputs.iter().filter_map(|o| self.of(*o)));
+            }
         }
+        for t in ends {
+            self.ends[t.0 as usize] = true;
+        }
+    }
+
+    /// Where a cover of `region` sits: its last output.
+    pub fn anchor(&self, region: &Region) -> Option<T> {
+        self.of(*region.outputs.iter().max()?)
     }
 
     /// The tree node holding graph node `id`'s value.
@@ -480,14 +490,15 @@ impl<'a> Tree<'a> {
     }
 
     /// Roots inside a cover at `t`. `None` if one leaks.
-    pub(crate) fn absorbs(&self, t: T, reads: &[T]) -> Option<Vec<T>> {
+    pub(crate) fn absorbs(&self, t: T, reads: &[T], writes: &[T]) -> Option<Vec<T>> {
         let inside = self.inside(t, reads);
         let roots: Vec<T> = inside
             .iter()
             .copied()
             .filter(|n| *n != t && self.root(*n))
             .collect();
-        for &r in &roots {
+        // Outside readers may read the outputs it writes.
+        for &r in roots.iter().filter(|r| !writes.contains(r)) {
             let args = inside.iter().flat_map(|n| &self.node(*n).args);
             let seen = args.filter(|a| **a == r).count();
             if seen != self.readers[r.0 as usize] as usize {

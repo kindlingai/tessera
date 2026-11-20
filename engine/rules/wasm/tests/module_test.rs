@@ -6,13 +6,14 @@ use sensai_linear as _;
 
 use sensai_graph::DimName::{Context, Ffn, Hidden, Rows, Seqs};
 use sensai_graph::{Act, Composite};
+use sensai_graph::{Parts, shard};
 use sensai_interp::{Store, Tensor, run_kept};
 use sensai_lower::kept::{self, Layout};
 use sensai_lower::{
-    Arg, Cache, Device, Extent, Limits, Plan, Platform, Rule, Shape, Source, lower,
+    Arg, Cache, Cluster, Device, Extent, Limits, Plan, Platform, Rule, Shape, Source, lower,
 };
-use sensai_run::Run;
 use sensai_run::testing::{host, runs};
+use sensai_run::{Loopback, Run};
 use sensai_testkit::{Noise, graphs, max_abs_diff};
 use sensai_trace::{DType, Dim, EntryKind, Graph, Linear, Model, Port, Role, TensorType, Weights};
 use serde_json::{Value, json};
@@ -28,16 +29,22 @@ fn graph(region: bool) -> Graph {
     sized(region, 64, 32)
 }
 
-fn sized(region: bool, hidden: u64, ffn: u64) -> Graph {
+/// A model of `hidden` by `ffn`, with weights and rows.
+fn traced<W: Weights>(hidden: u64, ffn: u64) -> (Model, W, sensai_trace::Tensor) {
     let m = Model::new(vec![
         Dim::bounded(Rows, 16),
         Dim::fixed(Hidden, hidden),
         Dim::fixed(Ffn, ffn),
     ]);
-    let w: Layer = sensai_trace::declare(&m);
+    let w: W = sensai_trace::declare(&m);
     let ty = TensorType::new([Rows, Hidden], DType::F32);
     let role = Role::Logits;
     let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
+    (m, w, x)
+}
+
+fn sized(region: bool, hidden: u64, ffn: u64) -> Graph {
+    let (m, w, x) = traced::<Layer>(hidden, ffn);
     if !region {
         return m.finish([(Role::Logits, &x.matmul(&w.w))]);
     }
@@ -87,7 +94,7 @@ const ACT_CUDA: &str = "extern \"C\" __global__ void act(const float* a, float* 
 }";
 
 /// The version these modules speak.
-const ABI: u32 = 4;
+const ABI: u32 = 5;
 
 /// `kernels`, and one rule at `site`.
 fn declare(abi: u32, site: &str, kernels: Value) -> Value {
@@ -107,22 +114,27 @@ fn manifest(abi: u32, site: &str) -> Value {
     declare(abi, site, kernels)
 }
 
-/// `x w`, with its rows read at launch.
-fn gemm() -> Value {
+/// `x w` over 4 rows. Rows are read at launch.
+fn gemm(reads: Value, n: usize, k: usize) -> Value {
     json!({
-        "kernel": "wasm_gemm", "reads": [0, 1], "len": 128,
-        "counts": [{"dim": "Rows"}, 32, 64],
-        "shape": {"grid": {"across": 1, "down": 4, "threads": 32}},
-        "work": 8192, "guess": 1e-15,
+        "kernel": "wasm_gemm", "reads": reads, "len": 4 * n,
+        "counts": [{"dim": "Rows"}, n, k],
+        "shape": {"grid": {"across": n.div_ceil(32), "down": 4, "threads": 32}},
+        "work": 4 * n * k, "guess": 1e-15,
     })
 }
 
-/// `silu(a) * a` over the first launch's output.
-fn act() -> Value {
+/// The plain `x w` of `graph`.
+fn matmul() -> Value {
+    gemm(json!([0, 1]), 32, 64)
+}
+
+/// `silu(a) * a` over 4 rows of `n`.
+fn act(a: Value, n: usize) -> Value {
     json!({
-        "kernel": "wasm_act", "reads": [{"draft": 0}], "len": 128,
-        "counts": [{"dim": "Rows", "mul": 32}], "shape": {"line": 128},
-        "work": 128, "guess": 1e-15,
+        "kernel": "wasm_act", "reads": [a], "len": 4 * n,
+        "counts": [{"dim": "Rows", "mul": n}], "shape": {"line": 4 * n},
+        "work": 4 * n, "guess": 1e-15,
     })
 }
 
@@ -188,7 +200,7 @@ fn rules(plan: &Plan) -> Vec<&'static str> {
 
 #[test]
 fn module_matmul_wins() {
-    let rule = load("matmul", json!([gemm()]));
+    let rule = load("matmul", json!([matmul()]));
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
     assert_eq!(rules(&plan), ["wasm_matmul"]);
     // The host lacks a compiler.
@@ -216,7 +228,7 @@ fn module_matmul_wins() {
 #[test]
 fn cuda_alone_opens() {
     let kernels = json!([{"name": "wasm_gemm", "entry": "gemm", "cuda": GEMM_CUDA}]);
-    let bytes = module(&declare(ABI, "matmul", kernels), &json!([gemm()]), "");
+    let bytes = module(&declare(ABI, "matmul", kernels), &json!([matmul()]), "");
     let rule = sensai_wasm::load(&bytes).unwrap()[0];
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
     let Source::Fixed { metal, cuda, .. } = plan.steps[0].kernel.source() else {
@@ -227,7 +239,7 @@ fn cuda_alone_opens() {
 
 #[test]
 fn module_region_wins() {
-    let rule = load("mlp", json!([gemm(), act()]));
+    let rule = load("mlp", json!([matmul(), act(json!({"draft": 0}), 32)]));
     let g = graph(true);
     let device = compiling().adding(rule);
     let mut cache = Cache::default();
@@ -242,6 +254,120 @@ fn module_region_wins() {
         "{size:?}"
     );
     on_gpus(&g, rule);
+}
+
+/// A layer writes `a = x w` and `silu(a) * a`.
+fn layer() -> Graph {
+    let (m, w, x) = traced::<Layer>(64, 32);
+    let [a, y] = m.composite(Composite::Layer, || {
+        let a = x.matmul(&w.w);
+        let [y] = m.composite(Composite::Mlp, || [a.act(Act::Silu).mul(&a)]);
+        [a, y]
+    });
+    m.finish([(Role::Logits, &y.add(&a))])
+}
+
+#[test]
+fn module_layer_wins() {
+    let g = layer();
+    let rule = load("layer", json!([matmul(), act(json!({"draft": 0}), 32)]));
+    let plan = lower(&g, 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
+    assert_eq!(&rules(&plan)[..2], ["wasm_layer", "wasm_layer"]);
+    // The add after it reads both outputs.
+    let [a, y] = [0, 1].map(|i| plan.steps[i].write);
+    assert!(plan.steps[2..].iter().any(|s| s.reads == [y, a]));
+    on_gpus(&g, rule);
+}
+
+const ADD_METAL: &str = "#include <metal_stdlib>
+using namespace metal;
+kernel void add(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+    device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+  if (i < n) y[i] = a[i] + b[i];
+}";
+
+const ADD_CUDA: &str = "extern \"C\" __global__ void add(const float* a, const float* b,
+    float* y, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a[i] + b[i];
+}";
+
+#[derive(Weights)]
+struct Split {
+    #[shape(Hidden, Ffn)]
+    up: Linear,
+    #[shape(Ffn, Hidden)]
+    down: Linear,
+}
+
+/// A residual MLP layer, to split over two ranks.
+fn split_layer() -> Graph {
+    let (m, w, x) = traced::<Split>(64, 32);
+    let [y] = m.composite(Composite::Layer, || {
+        let a = x.matmul(&w.up);
+        [x.add(&a.act(Act::Silu).mul(&a).matmul(&w.down))]
+    });
+    m.finish([(Role::Logits, &y)])
+}
+
+/// Each rank's half of the layer, summed by the engine.
+fn halves() -> &'static Rule {
+    let kernels = json!([
+        {"name": "wasm_gemm", "entry": "gemm", "metal": GEMM_METAL, "cuda": GEMM_CUDA},
+        {"name": "wasm_act", "entry": "act", "metal": ACT_METAL, "cuda": ACT_CUDA},
+        {"name": "wasm_add", "entry": "add", "metal": ADD_METAL, "cuda": ADD_CUDA},
+    ]);
+    let add = json!({
+        "kernel": "wasm_add", "reads": [0, {"draft": 3}], "len": 256,
+        "counts": [{"dim": "Rows", "mul": 64}], "shape": {"line": 256},
+        "work": 256, "guess": 1e-15,
+    });
+    let up = gemm(json!([0, 1]), 16, 64);
+    let act = act(json!({"draft": 0}), 16);
+    let down = gemm(json!([{"draft": 1}, 2]), 64, 16);
+    let offers = json!([up, act, down, {"all_reduce": 2}, add]);
+    let bytes = module(&declare(ABI, "layer", kernels), &offers, "");
+    sensai_wasm::load(&bytes).unwrap()[0]
+}
+
+/// Both ranks' plans of `g`, with `rule`.
+fn ranks(g: &Graph, device: Device, rule: &'static Rule) -> [Plan; 2] {
+    let device = device.adding(rule).zoned(Cluster::two("a", "b"));
+    let device = device.ranked(vec![0, 1]);
+    [0, 1].map(|r| lower(g, 0, &[(Rows, 4)], &device.clone().as_rank(r)).unwrap())
+}
+
+/// Noise of `shape`.
+fn drawn(draws: &mut Noise, shape: Vec<usize>) -> Tensor {
+    let len = shape.iter().product();
+    Tensor::f32(shape, (0..len).map(|_| draws.draw()).collect())
+}
+
+#[test]
+fn module_sums_shards() {
+    let g = split_layer();
+    let sharded = shard(&g, &Parts::even(2)).unwrap().graph;
+    let rule = halves();
+    for plan in ranks(&sharded, compiling(), rule) {
+        assert!(rules(&plan).iter().all(|r| *r == "wasm_layer"));
+        assert_eq!(plan.steps[3].kernel.name(), "all_reduce");
+    }
+    let mut draws = Noise(7);
+    let [up, down, x] = [vec![32, 64], vec![64, 32], vec![4, 64]].map(|s| drawn(&mut draws, s));
+    let weights = [up, down];
+    let want = sensai_interp::run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
+    // Only a GPU runs fixed text.
+    for settings in runs().iter().filter(|s| s.gpu().is_some()) {
+        let plans = ranks(&sharded, Device::guess(settings), rule);
+        let mut ranks = Loopback::open(&plans, settings).unwrap();
+        for (at, w) in weights.iter().enumerate() {
+            ranks.load(at as u32, w.view()).unwrap();
+        }
+        let got = ranks.run(&[x.view()]).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-4, "{:?}: off by {off:e}", settings.gpu());
+    }
 }
 
 #[test]
@@ -269,11 +395,11 @@ fn module_reads_parts() {
 
 #[test]
 fn bad_modules_fail() {
-    let offer = json!([gemm()]);
+    let offer = json!([matmul()]);
     let newer = module(&manifest(ABI + 1, "matmul"), &offer, "");
     assert!(matches!(
         sensai_wasm::load(&newer),
-        Err(sensai_wasm::Error::Abi(5))
+        Err(sensai_wasm::Error::Abi(6))
     ));
     // An endless loop runs out of fuel.
     let spin = module(&manifest(ABI, "matmul"), &offer, "(loop (br 0))");

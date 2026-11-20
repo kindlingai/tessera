@@ -26,17 +26,22 @@ pub trait Pattern: Sized {
     fn find(tree: &Tree, at: T) -> Option<Self>;
 }
 
-/// A traced region with one output, met at that output.
+/// A traced region, met at its last output.
 #[derive(Clone, Debug)]
 pub struct Region {
     pub kind: Composite,
     /// The values it reads, weights included, in first-read order.
     pub inputs: Vec<T>,
+    /// Its outputs in the order the composite returns them.
+    pub outputs: Vec<T>,
+    /// Elements of the node met.
     pub len: usize,
     /// Kept rows it appends to. Its launches write them.
     pub kept: Vec<Appended>,
     /// Per rotated input: its place, then `suh` and `svh`.
     pub parts: Vec<(usize, [T; 2])>,
+    /// Sums across ranks inside it.
+    pub sums: usize,
 }
 
 /// Kept rows a region appends to, as `Read::Kept` names them.
@@ -53,19 +58,39 @@ pub struct Appended {
 
 impl Pattern for Region {
     fn find(tree: &Tree, at: T) -> Option<Self> {
-        let from = tree.node(at).from;
-        let region = tree.g.regions.iter().find(|r| r.outputs == [from])?;
-        if tree.of(from)? != at {
-            return None;
-        }
+        // Sums stay with the engine.
+        Self::of(tree, at, None).filter(|r| r.sums == 0)
+    }
+}
+
+impl Region {
+    /// Its inputs, then its kept rows.
+    pub fn reads(&self) -> Vec<Read> {
+        let inputs = self.inputs.iter().map(|t| Read::Node(*t));
+        let kept = self.kept.iter().map(|k| Read::Kept(k.index));
+        inputs.chain(kept).collect()
+    }
+
+    /// The innermost region met at `at`, of `kind` if given.
+    pub fn of(tree: &Tree, at: T, kind: Option<Composite>) -> Option<Self> {
+        let met = |r: &&sensai_graph::Region| {
+            kind.is_none_or(|k| r.kind == k) && tree.anchor(r) == Some(at)
+        };
+        let region = tree.g.regions.iter().find(met)?;
         let inputs: Option<Vec<T>> = region.inputs.iter().map(|i| tree.of(*i)).collect();
         let inputs = inputs?;
-        let (mut kept, mut parts) = (Vec::new(), Vec::new());
-        // Sums stay with the engine.
-        for n in tree.inside(at, &inputs) {
+        let outputs: Option<Vec<T>> = region.outputs.iter().map(|o| tree.of(*o)).collect();
+        let outputs = outputs?;
+        let inside = tree.inside(at, &inputs);
+        // A cover computes only what lies below its node.
+        if !outputs.iter().all(|o| inside.contains(o)) {
+            return None;
+        }
+        let (mut kept, mut parts, mut sums) = (Vec::new(), Vec::new(), 0);
+        for n in inside {
             let node = tree.node(n);
             if node.term == Term::Stage(Step::AllReduce) {
-                return None;
+                sums += 1;
             }
             for a in &node.args {
                 if !tree.leaf(*a) || inputs.contains(a) {
@@ -99,9 +124,11 @@ impl Pattern for Region {
         Some(Self {
             kind: region.kind,
             inputs,
+            outputs,
             len,
             kept,
             parts,
+            sums,
         })
     }
 }
@@ -114,13 +141,4 @@ fn scale(tree: &Tree, inputs: &[T], t: T) -> Option<(usize, usize)> {
     let codes = Term::Leaf(Home::Part(weight, 0));
     let place = inputs.iter().position(|i| tree.node(*i).term == codes)?;
     Some((place, part as usize - 1))
-}
-
-impl Region {
-    /// Its inputs, then its kept rows.
-    pub fn reads(&self) -> Vec<Read> {
-        let inputs = self.inputs.iter().map(|t| Read::Node(*t));
-        let kept = self.kept.iter().map(|k| Read::Kept(k.index));
-        inputs.chain(kept).collect()
-    }
 }

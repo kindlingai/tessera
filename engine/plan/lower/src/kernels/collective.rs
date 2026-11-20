@@ -16,3 +16,8 @@ use crate::kernels::Map;
 pub struct AllReduce {
     pub len: usize,
 }
+
+impl AllReduce {
+    /// Its kernel name. Runners find sums by it.
+    pub const NAME: &'static str = "all_reduce";
+}

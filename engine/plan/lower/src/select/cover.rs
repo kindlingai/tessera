@@ -37,6 +37,11 @@ pub(crate) fn reads(drafts: &[Draft]) -> Vec<T> {
         .collect()
 }
 
+/// The region outputs a cover writes.
+pub(crate) fn writes(drafts: &[Draft]) -> Vec<T> {
+    drafts.iter().filter_map(|d| d.writes).collect()
+}
+
 /// Leaves and outputs lie where the runner feeds and reads.
 pub(crate) const EDGE: u32 = 0;
 
@@ -173,8 +178,9 @@ impl Cover<'_> {
                     continue;
                 }
                 runnable.push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
-                let seconds = |d: &Draft| self.device.seconds_in(zone, &*d.kernel, d.len);
-                let mut cost: f64 = drafts.iter().map(seconds).sum();
+                let Some(mut cost) = drafts.iter().map(|d| self.seconds(zone, d)).sum() else {
+                    continue;
+                };
                 cost += self.widening(zone, &drafts);
                 let below = reads(&drafts).into_iter().map(|r| self.need(r, zone));
                 let Some(below) = below.sum::<Option<f64>>() else {
@@ -182,7 +188,7 @@ impl Cover<'_> {
                 };
                 cost += below;
                 // Roots a cover absorbs no longer cost their own.
-                let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts)) else {
+                let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts), &writes(&drafts)) else {
                     continue;
                 };
                 for r in absorbed {
@@ -229,6 +235,14 @@ impl Cover<'_> {
         found.copied().unwrap_or(root)
     }
 
+    /// Seconds for one draft. A module's sum costs the engine's.
+    fn seconds(&self, zone: u32, d: &Draft) -> Option<f64> {
+        if d.kernel.name() == AllReduce::NAME {
+            return self.device.all_reduce(d.len * 4);
+        }
+        Some(self.device.seconds_in(zone, &*d.kernel, d.len))
+    }
+
     /// Seconds to widen reads the drafts cannot take as stored.
     fn widening(&self, zone: u32, drafts: &[Draft]) -> f64 {
         let mut seconds = 0.0;
@@ -270,7 +284,8 @@ impl Cover<'_> {
     pub(crate) fn absorbed(&self, t: T, zone: u32) -> Vec<T> {
         match &self.best[t.0 as usize][zone as usize] {
             Some(Some(c)) if !c.drafts.is_empty() => {
-                self.tree.absorbs(t, &reads(&c.drafts)).unwrap_or_default()
+                let (reads, writes) = (reads(&c.drafts), writes(&c.drafts));
+                self.tree.absorbs(t, &reads, &writes).unwrap_or_default()
             }
             _ => Vec::new(),
         }

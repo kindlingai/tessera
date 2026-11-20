@@ -25,7 +25,8 @@ pub extern "C" fn alloc(len: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn manifest() -> i64 {
-    output(br#"{"abi": 4, "graph": true}"#.to_vec())
+    let manifest = serde_json::json!({"abi": sensai_guest::ABI, "graph": true});
+    output(manifest.to_string().into_bytes())
 }
 
 /// The graph as JSON, else why the config is refused.

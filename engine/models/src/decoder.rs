@@ -261,8 +261,11 @@ impl Pass<'_> {
         tokens: &Tensor,
         kept: Option<&[Cache]>,
     ) -> Tensor {
-        let h = self.hidden(w, tokens, kept);
-        scaled(h.unembed(&w.embed), self.c.scales.logits)
+        let [logits] = self.m.composite(Composite::Model, || {
+            let h = self.hidden(w, tokens, kept);
+            [scaled(h.unembed(&w.embed), self.c.scales.logits)]
+        });
+        logits
     }
 
     /// Each row's normed state, before the unembed.
@@ -288,13 +291,16 @@ impl Pass<'_> {
         let s = &c.scales;
         let mut x = scaled(m.embed(tokens, &w.embed), s.embed);
         for (i, l) in w.layers.iter().enumerate() {
-            let h = x.rms_norm(&l.ln1, c.eps);
-            let attend = || [self.attention(l, &h, kept.map(|k| &k[i]))];
-            let [attn] = m.composite(Composite::Attention, attend);
-            x = scaled(attn, s.residual).add(&x);
-            let h = x.rms_norm(&l.ln2, c.eps);
-            let [mlp] = m.composite(M::KIND, || [l.mlp.apply(m, &h)]);
-            x = scaled(mlp, s.residual).add(&x);
+            let [out] = m.composite(Composite::Layer, || {
+                let h = x.rms_norm(&l.ln1, c.eps);
+                let attend = || [self.attention(l, &h, kept.map(|k| &k[i]))];
+                let [attn] = m.composite(Composite::Attention, attend);
+                let x = scaled(attn, s.residual).add(&x);
+                let h = x.rms_norm(&l.ln2, c.eps);
+                let [mlp] = m.composite(M::KIND, || [l.mlp.apply(m, &h)]);
+                [scaled(mlp, s.residual).add(&x)]
+            });
+            x = out;
             tap(i as u64 + 1, &x);
         }
         x

@@ -145,6 +145,8 @@ pub struct Draft {
     pub len: usize,
     /// Drafts sharing a choice form one way. The cheapest wins.
     pub choice: usize,
+    /// The region output it writes, for readers past the cover.
+    pub writes: Option<T>,
 }
 
 impl Draft {
@@ -158,7 +160,14 @@ impl Draft {
             reads: reads.into_iter().map(Into::into).collect(),
             len,
             choice: 0,
+            writes: None,
         }
+    }
+
+    /// The same draft, writing region output `t`.
+    pub fn writes(mut self, t: T) -> Self {
+        self.writes = Some(t);
+        self
     }
 
     /// The same draft, as part of way `choice`.

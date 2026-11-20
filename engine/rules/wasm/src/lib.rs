@@ -5,7 +5,7 @@ mod guest;
 mod site;
 mod text;
 
-use abi::{ABI, Ask, Kind, Manifest, Offer, Site};
+use abi::{ABI, Ask, Entry, Kind, Manifest, Site};
 use guest::{BUILD_FUEL, FUEL, Guest};
 use sensai_graph::Graph;
 use sensai_lower::{Draft, Propose, Rule, T, Tree};
@@ -42,7 +42,7 @@ struct Asking {
 
 impl Asking {
     /// The module's offers, or the reason it gave none.
-    fn ask(&self, site: Site) -> Result<Option<Vec<Offer>>, Error> {
+    fn ask(&self, site: Site) -> Result<Option<Vec<Entry>>, Error> {
         let rule = self.rule.into();
         let input = serde_json::to_vec(&Ask { rule, site })?;
         let output = self.guest.call("propose", Some(&input), FUEL)?;

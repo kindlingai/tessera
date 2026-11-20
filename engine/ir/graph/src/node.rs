@@ -303,6 +303,17 @@ pub enum Composite {
     Attention,
     Mlp,
     Moe,
+    /// One decoder layer: norms, attention, MLP, residual adds.
+    Layer,
+    /// Embedding to logits.
+    Model,
+}
+
+impl Composite {
+    /// Whether it spans one block at most. Trims keep it.
+    pub fn block(self) -> bool {
+        !matches!(self, Composite::Layer | Composite::Model)
+    }
 }
 
 /// A way into the graph, with typed ports.

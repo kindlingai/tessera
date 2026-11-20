@@ -82,10 +82,14 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let Site::Region {
         kind: Kind::Moe,
         inputs,
-        len,
+        outputs,
         kept,
+        sums: 0,
     } = site
     else {
+        return None;
+    };
+    let [len] = outputs[..] else {
         return None;
     };
     let (x, rest) = inputs.split_first()?;
@@ -202,7 +206,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             part(2, 2),
             Place::Draft { draft: 1 },
         ],
-        len: *len,
+        len,
         counts: fixed(&[
             rows,
             hidden,
@@ -218,7 +222,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             down: rows,
             threads: 128,
         },
-        work: *len as f64,
+        work: len as f64,
         guess: 1e-12,
     };
     Some(vec![route, experts_offer, finish])

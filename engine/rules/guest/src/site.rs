@@ -45,6 +45,10 @@ pub enum Kind {
     Mlp,
     Moe,
     Attention,
+    /// One decoder layer.
+    Layer,
+    /// Embedding to logits.
+    Model,
 }
 
 /// The input of `propose`.
@@ -69,8 +73,11 @@ pub enum Site {
     Region {
         kind: Kind,
         inputs: Vec<Input>,
-        len: usize,
+        /// Elements per output. The last offers write them, in order.
+        outputs: Vec<usize>,
         kept: Vec<Kept>,
+        /// Sums across ranks inside. Offers place as many all-reduces.
+        sums: usize,
     },
 }
 
@@ -134,7 +141,24 @@ pub enum Count {
     Dim { dim: String, mul: usize },
 }
 
-/// One launch `propose` offers. `null` offers none.
+/// One entry `propose` offers. `null` offers none.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum Entry {
+    Launch(Offer),
+    /// Sums an earlier draft across ranks. Later entries read it.
+    AllReduce {
+        all_reduce: usize,
+    },
+}
+
+impl From<Offer> for Entry {
+    fn from(offer: Offer) -> Self {
+        Entry::Launch(offer)
+    }
+}
+
+/// One launch. Its reads are all it depends on.
 #[derive(Debug, Serialize)]
 pub struct Offer {
     pub kernel: &'static str,

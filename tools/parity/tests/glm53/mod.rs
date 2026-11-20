@@ -6,7 +6,7 @@ mod shard_test;
 
 use sensai_models::mla::{Config, RotatedMoe, program, stepper};
 use sensai_parity::{Spec, Stepper, suite};
-use sensai_trace::Composite::{Attention, Mlp, Moe};
+use sensai_trace::Composite::{Attention, Layer, Mlp, Model, Moe};
 use sensai_trace::Graph;
 
 fn small() -> Graph {
@@ -27,7 +27,13 @@ const SPEC: Spec = Spec {
     name: "glm53",
     release,
     parameters: 743_849_800_704,
-    regions: &[(Attention, 78), (Mlp, 3), (Moe, 75)],
+    regions: &[
+        (Attention, 78),
+        (Mlp, 3),
+        (Moe, 75),
+        (Layer, 78),
+        (Model, 1),
+    ],
     stepper: Some(STEPPER),
     small: Some(small),
     files: &[],

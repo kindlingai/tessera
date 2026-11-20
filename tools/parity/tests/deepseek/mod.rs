@@ -2,7 +2,7 @@
 
 use sensai_models::mla::{Config, Moe as Experts, program, stepper};
 use sensai_parity::{Spec, Stepper, suite};
-use sensai_trace::Composite::{Attention, Mlp, Moe};
+use sensai_trace::Composite::{Attention, Layer, Mlp, Model, Moe};
 use sensai_trace::Graph;
 
 fn small() -> Graph {
@@ -23,7 +23,13 @@ const SPEC: Spec = Spec {
     name: "deepseek",
     release,
     parameters: 671_026_419_200,
-    regions: &[(Attention, 61), (Mlp, 3), (Moe, 58)],
+    regions: &[
+        (Attention, 61),
+        (Mlp, 3),
+        (Moe, 58),
+        (Layer, 61),
+        (Model, 1),
+    ],
     stepper: Some(STEPPER),
     small: Some(small),
     files: &[],
