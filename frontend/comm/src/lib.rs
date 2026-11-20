@@ -63,7 +63,11 @@ pub fn join(
     let (rank, ranks) = (met.rank(), met.ranks());
     let pinning = tessera_engine::pinning(settings);
     let verbs = Verbs::connect(rank, ranks, fabric, CAPACITY, &mut *met, pinning)?;
-    eprintln!("rank {rank}: sums over {} RDMA lanes", fabric.lanes());
+    let lanes = fabric.lanes();
+    eprintln!(
+        "rank {rank}: sums over {lanes} RDMA lanes: {}",
+        roce::describe(fabric)
+    );
     Ok([Box::new(verbs), met])
 }
 

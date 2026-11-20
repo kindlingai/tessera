@@ -43,7 +43,7 @@ pub(crate) struct Wiring {
 
 impl Fabric {
     /// Every port, in lane order.
-    pub(crate) fn ports(&self) -> Vec<Port> {
+    pub fn ports(&self) -> Vec<Port> {
         match self {
             Fabric::Mesh(ports) => ports.clone(),
             Fabric::Ring { prev, next } => [prev.clone(), next.clone()].concat(),

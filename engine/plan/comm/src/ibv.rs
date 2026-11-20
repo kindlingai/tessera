@@ -7,6 +7,8 @@ use tessera_dl::message;
 
 pub(crate) const QPT_RC: u32 = 2;
 const WR_RDMA_WRITE: u32 = 0;
+/// The completion status when a peer never answers.
+const RETRY_EXCEEDED: u32 = 12;
 pub(crate) const SEND_SIGNALED: u32 = 2;
 pub(crate) const SEND_INLINE: u32 = 8;
 pub(crate) const QPS_INIT: u32 = 1;
@@ -313,6 +315,10 @@ impl Lib {
     }
 
     pub(crate) fn status(&self, code: u32) -> String {
-        unsafe { message((self.wc_status_str)(code as c_int)) }
+        let text = unsafe { message((self.wc_status_str)(code as c_int)) };
+        match code {
+            RETRY_EXCEEDED => format!("{text}. Check that each port's GID reaches its peer"),
+            _ => text,
+        }
     }
 }
