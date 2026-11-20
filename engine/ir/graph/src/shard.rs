@@ -40,6 +40,9 @@ pub fn shard(g: &Graph, parts: &Parts) -> Result<Sharded, VerifyError> {
     }
     let routed = route(&out);
     adopt(&mut out, routed, parts, &mut whole);
+    if let Ok(merged) = retype(&merge(&out)) {
+        out = merged;
+    }
     verify(&out)?;
     Ok(Sharded { graph: out, whole })
 }
@@ -147,6 +150,50 @@ fn route(g: &Graph) -> Graph {
         }
     }
     out
+}
+
+/// Whether `id` is a sum that only `reader` reads.
+fn lone_sum(g: &Graph, id: NodeId, reader: NodeId) -> bool {
+    let sum = Op::Row(Row(vec![Stage::AllReduce]));
+    let others = (g.nodes.iter().enumerate())
+        .filter(|(i, n)| *i != reader.0 as usize && n.args.contains(&id));
+    g.node(id).op == sum && others.count() == 0
+}
+
+/// Two sums an add reads become one, after any region.
+fn merge(g: &Graph) -> Graph {
+    let mut g = g.clone();
+    let add = Op::Row(Row(vec![Stage::Add]));
+    let mut at = 0;
+    while at < g.nodes.len() {
+        let id = NodeId(at as u32);
+        at += 1;
+        let node = g.node(id);
+        let [a, b] = node.args[..] else {
+            continue;
+        };
+        if node.op != add || !lone_sum(&g, a, id) || !lone_sum(&g, b, id) || a == b {
+            continue;
+        }
+        let parts = [g.node(a).args[0], g.node(b).args[0]];
+        g.nodes[at - 1].args = parts.to_vec();
+        let sum = Node {
+            op: Op::Row(Row(vec![Stage::AllReduce])),
+            args: vec![id],
+            ty: g.node(id).ty.clone(),
+            numerics: Some(Numerics::default()),
+        };
+        insert(&mut g, id, sum);
+        let new = NodeId(id.0 + 1);
+        for r in &mut g.regions {
+            if r.outputs == [new] && r.end == NodeId(new.0 + 1) {
+                r.outputs = vec![id];
+                r.end = new;
+            }
+        }
+        at += 1;
+    }
+    g
 }
 
 /// The node under any slices of `id`.

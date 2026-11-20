@@ -6,9 +6,10 @@ use sensai_engine::wasm::Module;
 use sensai_engine_settings::{Backend, Pick, Settings};
 use sensai_graph::DimName::{Context, Hidden, Picks, Rows, Segments, Seqs};
 use sensai_graph::{Composite, F16};
+use sensai_graph::{Parts, shard};
 use sensai_interp::{Tensor, run};
 use sensai_lower::form::{Load, named};
-use sensai_lower::{Device, Limits, Pins, Platform, Rule, Weight, lower};
+use sensai_lower::{Cluster, Device, Limits, Pins, Platform, Rule, Weight, lower};
 use sensai_models::mla::{Config, RotatedMoe, Routed, stepper};
 use sensai_recipe::Recipe;
 use sensai_run::open;
@@ -18,6 +19,7 @@ use sensai_trace::{DType, Dim, EntryKind, Graph, Model, Port, Role, TensorType, 
 use std::path::Path;
 
 const NAME: &str = "glm53_moe";
+const KERNELS: [&str; 3] = ["glm53_route", "glm53_experts", "glm53_finish"];
 const TEXT: &str = include_str!("../../../../examples/recipes/glm53-moe/model/src/moe.cu");
 const ROWS: usize = 3;
 
@@ -65,14 +67,18 @@ struct Block {
 
 /// One routed block alone, over rows.
 fn block() -> Graph {
-    let c = small();
+    block_of(&small())
+}
+
+/// One routed block of `c` alone, over rows.
+fn block_of(c: &Config) -> Graph {
     let rows = Dim::bounded(Rows, 16);
     let m = Model::new(c.dims().into_iter().chain([rows]).collect());
     let w: Block = sensai_trace::declare(&m);
     let ty = TensorType::new([Rows, Hidden], DType::F32);
     let role = Role::Logits;
     let [x] = m.entry(EntryKind::Forward, [Port { role, ty }]);
-    let [y] = m.composite(Composite::Moe, || [w.moe.apply(&m, &c, &x)]);
+    let [y] = m.composite(Composite::Moe, || [w.moe.apply(&m, c, &x)]);
     m.finish([(Role::Logits, &y)])
 }
 
@@ -111,9 +117,9 @@ fn stored(g: &Graph, draws: &mut Noise, book: &str) -> Vec<(Tensor, Option<Weigh
     out
 }
 
-/// Parameters of the kernel's entry, by its commas.
-fn parameters() -> usize {
-    let from = TEXT.find(&format!("void {NAME}(")).unwrap();
+/// Parameters of a kernel's entry, by its commas.
+fn parameters(entry: &str) -> usize {
+    let from = TEXT.find(&format!("void {entry}(")).unwrap();
     let upto = TEXT[from..].find(") {").unwrap();
     TEXT[from..from + upto].matches(',').count() + 1
 }
@@ -138,18 +144,56 @@ fn takes_routed(book: &str, id: u32) {
     let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
     let plan = lower(&step, 0, &sizes, &device).unwrap();
     let taken: Vec<_> = plan.steps.iter().filter(|s| s.rule == NAME).collect();
+    let kernels: Vec<&str> = taken.iter().map(|s| s.kernel.name()).collect();
     // The dense layer keeps the linked rules.
-    assert_eq!(taken.len() as u64, c.stack.layers - c.dense_layers);
-    for step in taken {
+    let routed = (c.stack.layers - c.dense_layers) as usize;
+    assert_eq!(kernels, KERNELS.repeat(routed));
+    for step in taken.iter().filter(|s| s.kernel.name() == KERNELS[1]) {
         let launches = step.launches();
         let [launch] = launches.as_slice() else {
-            panic!("one launch a block");
+            panic!("one launch a step");
         };
-        // Reads, the output, then the counts.
-        assert_eq!(step.reads.len(), 23);
-        assert_eq!(launch.args.len(), parameters());
-        let counts: Vec<u32> = launch.args[24..].iter().filter_map(|a| a.u32()).collect();
-        assert_eq!(counts, [ROWS as u32, 128, 128, 32, 2, 4, 4, id, id]);
+        assert_eq!(launch.args.len(), parameters(KERNELS[1]));
+        let counts: Vec<u32> = launch.args.iter().filter_map(|a| a.u32()).collect();
+        let sizes = [ROWS as u32, 128, 128, 32, 2, 4, 4, id, id, 0, 32, 128];
+        assert_eq!(counts, sizes);
+    }
+}
+
+/// Each rank's plan takes its share of every routed block.
+#[test]
+fn module_takes_shards() {
+    let mut c = small();
+    // Half the shared expert still holds whole rotations.
+    c.stack.ffn = 256;
+    let step = stepper::<RotatedMoe>(&c);
+    let sharded = shard(&step, &Parts::even(2)).unwrap().graph;
+    let mut device = Device::default()
+        .adding(rule())
+        .pinned(pins("_mul1"))
+        .favoring(NAME)
+        .zoned(Cluster::two("a", "b"))
+        .ranked(vec![0, 1]);
+    device.platform = Platform::assumed(Limits::assumed());
+    let routed = (c.stack.layers - c.dense_layers) as usize;
+    let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
+    for rank in 0..2u32 {
+        let plan = lower(&sharded, 0, &sizes, &device.clone().as_rank(rank)).unwrap();
+        let experts = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
+        let mut taken = 0;
+        for step in experts {
+            let launches = step.launches();
+            let counts: Vec<u32> = launches[0].args.iter().filter_map(|a| a.u32()).collect();
+            // This rank's experts, and its half of the shared one.
+            assert_eq!(counts[9..], [16 * rank, 16, 128]);
+            taken += 1;
+        }
+        assert_eq!(taken, routed);
+        let sums = plan
+            .steps
+            .iter()
+            .filter(|s| s.kernel.name() == "all_reduce");
+        assert!(sums.count() >= routed);
     }
 }
 
@@ -178,13 +222,18 @@ fn module_reaches_engine() {
         (Picks, 1),
     ];
     let plan = lower(&trimmed, 0, &sizes, &device).unwrap();
-    let named = |s: &&sensai_lower::Step| s.kernel.name() == NAME;
+    let named = |s: &&sensai_lower::Step| s.kernel.name() == KERNELS[1];
     assert_eq!(plan.steps.iter().filter(named).count(), routed);
     // The host plans without it: the kernel is CUDA text.
     for settings in runs() {
         let engine = Engine::open(step.clone(), 16, &choices, &settings).unwrap();
         let wanted = (settings.gpu() == Some(Backend::Cuda)).then_some(&routed);
-        assert_eq!(engine.kernels().get(NAME), wanted, "{}", engine.device());
+        assert_eq!(
+            engine.kernels().get(KERNELS[1]),
+            wanted,
+            "{}",
+            engine.device()
+        );
     }
 }
 
@@ -211,7 +260,7 @@ fn matches_interp(book: &str) {
         let device = Device::guess(settings).adding(rule()).pinned(pins(book));
         let plan = lower(&g, 0, &[(Rows, ROWS as u64)], &device).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.rule).collect();
-        assert_eq!(names, [NAME]);
+        assert_eq!(names, [NAME; 3]);
         let mut runner = open(plan, settings).unwrap();
         for (at, (floats, packed)) in stored.iter().enumerate() {
             match packed {
