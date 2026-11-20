@@ -223,6 +223,6 @@ impl Api for Driver {
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
         let (major, minor) = ctx.compute_capability();
         let arch = format!("--gpu-architecture=compute_{major}{minor}");
-        driver::NVRTC.compile(source, &[&arch, "--std=c++17"])
+        driver::NVRTC.compile(source, &[&arch, "--std=c++17", "--diag-suppress=177"])
     }
 }
