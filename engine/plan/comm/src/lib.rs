@@ -1,19 +1,5 @@
 //! Moves bytes between ranks over handles the front end opened.
 
-/// `poll` and `reset` for links whose work finishes at once.
-macro_rules! at_once {
-    () => {
-        fn poll(&mut self, done: &mut Vec<u64>) -> Result<(), Error> {
-            done.append(&mut self.done);
-            Ok(())
-        }
-
-        fn reset(&mut self) {
-            self.done.clear();
-        }
-    };
-}
-
 mod fabric;
 mod ibv;
 mod link;

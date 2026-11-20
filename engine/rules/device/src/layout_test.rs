@@ -123,6 +123,7 @@ fn headers_match_rust() {
     for h in &HEADERS {
         headers.read(h.text);
     }
+    assert_eq!(headers.number("MAX_GROUP"), MAX_GROUP);
     check::<Ref>(&headers);
     check::<Item>(&headers);
     check::<Form>(&headers);

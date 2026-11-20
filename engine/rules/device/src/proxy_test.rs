@@ -85,10 +85,10 @@ fn wired_puts_and_credits() {
     let pools = [pool(2, false, 2), pool(2, true, 2)];
     let bytes = [(32, 32), (32, 32)];
     let regions = Wired::<Memory>::regions(&pools, &bytes);
-    let wire = |link| Wired::new(link, &pools, &bytes, vec![vec![0, 1], vec![0, 1]]);
+    let wire = |link| Wired::new(link, &pools, &bytes, vec![vec![0, 1], vec![0, 1]]).unwrap();
     let mut links = Memory::ranks(2, &regions).into_iter().map(wire);
     let (mut a, mut b) = (links.next().unwrap(), links.next().unwrap());
-    a.link().write(Span::new(SEND, 32, 16), &[7; 16]);
+    a.link().write(Span::new(SEND, 32, 16), &[7; 16]).unwrap();
     let part = Part {
         pool: 0,
         slot: 1,
@@ -109,8 +109,10 @@ fn wired_puts_and_credits() {
         }]
     );
     let b = b.link();
-    assert_eq!(b.read(Span::new(RECV, 8 * 32, 16)), [7; 16]);
-    let flag = |at| b.load(Span::new(FLAGS, at, 8));
+    assert_eq!(b.read(Span::new(RECV, 8 * 32, 16)).unwrap(), [7; 16]);
+    let flag = |at| b.load(Span::new(FLAGS, at, 8)).unwrap();
     assert_eq!((flag(8 * 16), flag(8 * 16 + 8)), (9, 2));
-    assert_eq!(b.load(Span::new(CREDITS, 64, 8)), 5);
+    assert_eq!(b.load(Span::new(CREDITS, 64, 8)).unwrap(), 5);
+    let stray = Part { slot: 2, ..part };
+    assert!(a.put(stray).is_err());
 }

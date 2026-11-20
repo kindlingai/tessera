@@ -37,14 +37,29 @@ pub trait Link: Send {
     fn put(&mut self, put: Put) -> Result<(), Error>;
     /// Writes one word at rank `to`.
     fn word(&mut self, to: u32, at: Span, value: u64, tag: u64) -> Result<(), Error>;
-    /// Adds the tags of finished work to `done`.
+    /// Adds finished tags to `done`. It also moves work along.
     fn poll(&mut self, done: &mut Vec<u64>) -> Result<(), Error>;
     /// Drops or finishes all work in flight.
-    fn reset(&mut self);
+    fn reset(&mut self) -> Result<(), Error>;
+    /// This rank's region as host memory, if fixed.
+    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+        let _ = region;
+        None
+    }
     /// This rank's regions: an acquire load, then bytes.
-    fn load(&self, at: Span) -> u64;
-    fn read(&self, at: Span) -> Vec<u8>;
-    fn write(&mut self, at: Span, bytes: &[u8]);
+    fn load(&self, at: Span) -> Result<u64, Error>;
+    fn read(&self, at: Span) -> Result<Vec<u8>, Error>;
+    fn write(&mut self, at: Span, bytes: &[u8]) -> Result<(), Error>;
+}
+
+/// Checks `at` lies in its region, aligned to `align`.
+pub(crate) fn fits(sizes: &[usize], at: Span, align: usize) -> Result<(), Error> {
+    let size = sizes.get(at.region).copied();
+    let inside = size.is_some_and(|s| at.at.checked_add(at.len).is_some_and(|end| end <= s));
+    if !inside || !at.at.is_multiple_of(align) {
+        return Err(Error::Fit(format!("{at:?} lies outside its region")));
+    }
+    Ok(())
 }
 
 /// The regions `Blocking` needs, for `ranks` and `capacity`.
@@ -63,6 +78,8 @@ pub struct Blocking<L> {
     capacity: usize,
     round: u64,
     wait: Duration,
+    /// An exchange failed. Ranks must start again.
+    broken: bool,
 }
 
 impl<L: Link> Blocking<L> {
@@ -73,6 +90,7 @@ impl<L: Link> Blocking<L> {
             capacity,
             round: 0,
             wait,
+            broken: false,
         }
     }
 
@@ -85,27 +103,13 @@ impl<L: Link> Blocking<L> {
         let ranks = self.link.ranks() as usize;
         Span::new(RECV, (parity * ranks + rank as usize) * self.capacity, len)
     }
-}
 
-impl<L: Link> Transport for Blocking<L> {
-    fn rank(&self) -> u32 {
-        self.link.rank()
-    }
-
-    fn ranks(&self) -> u32 {
-        self.link.ranks()
-    }
-
-    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        if mine.len() > self.capacity {
-            let what = format!("{} bytes over a {} byte slot", mine.len(), self.capacity);
-            return Err(Error::Fit(what));
-        }
+    fn round(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         let round = self.round + 1;
         let parity = (round % 2) as usize;
         let (me, ranks) = (self.link.rank(), self.link.ranks());
         let from = Span::new(SEND, parity * self.capacity, mine.len());
-        self.link.write(from, mine);
+        self.link.write(from, mine)?;
         let words = [round, mine.len() as u64];
         for to in (0..ranks).filter(|&r| r != me) {
             let (into, flag) = (self.recv(parity, me, mine.len()), self.flag(parity, me));
@@ -120,6 +124,7 @@ impl<L: Link> Transport for Blocking<L> {
             self.link.put(put)?;
         }
         let start = Instant::now();
+        let late = |what: String| Error::Link(format!("{what} by round {round}"));
         let mut out = Vec::with_capacity(ranks as usize);
         let mut done = Vec::new();
         for r in 0..ranks {
@@ -128,24 +133,50 @@ impl<L: Link> Transport for Blocking<L> {
                 continue;
             }
             let flag = self.flag(parity, r);
-            while self.link.load(flag) < round {
+            while self.link.load(flag)? < round {
                 if start.elapsed() > self.wait {
-                    return Err(Error::Fit(format!("rank {r} never reached round {round}")));
+                    return Err(late(format!("rank {r} sent nothing")));
                 }
                 self.link.poll(&mut done)?;
                 std::thread::yield_now();
             }
-            let len = self.link.load(Span::new(FLAGS, flag.at + 8, 8)) as usize;
-            out.push(self.link.read(self.recv(parity, r, len)));
+            let len = self.link.load(Span::new(FLAGS, flag.at + 8, 8))? as usize;
+            if len > self.capacity {
+                return Err(Error::Fit(format!("rank {r} sent {len} bytes")));
+            }
+            out.push(self.link.read(self.recv(parity, r, len))?);
         }
         // The sends must land before this slot is written again.
         while done.iter().filter(|&&t| t == round).count() < ranks as usize - 1 {
             if start.elapsed() > self.wait {
-                return Err(Error::Fit(format!("round {round}'s sends never finished")));
+                return Err(late("this rank's sends never landed".into()));
             }
             self.link.poll(&mut done)?;
         }
         self.round = round;
         Ok(out)
+    }
+}
+
+impl<L: Link> Transport for Blocking<L> {
+    fn rank(&self) -> u32 {
+        self.link.rank()
+    }
+
+    fn ranks(&self) -> u32 {
+        self.link.ranks()
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        if self.broken {
+            return Err(Error::Link("an earlier exchange failed".into()));
+        }
+        if mine.len() > self.capacity {
+            let what = format!("{} bytes over a {} byte slot", mine.len(), self.capacity);
+            return Err(Error::Fit(what));
+        }
+        let out = self.round(mine);
+        self.broken = out.is_err();
+        out
     }
 }

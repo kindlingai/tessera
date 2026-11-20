@@ -27,9 +27,9 @@ fn sized(name: &str, len: usize) -> File {
 fn handles_must_fit() {
     assert_eq!(Shm::room(3, 8), 3 * (32 + 96 + 96));
     let short = sized("short", Shm::room(2, 8) - 1);
-    assert!(matches!(Shm::over(0, 2, short), Err(Error::Fit(_))));
+    assert!(matches!(Shm::over(0, 2, short, 8), Err(Error::Fit(_))));
     let late = sized("late", Shm::room(2, 8));
-    assert!(matches!(Shm::over(2, 2, late), Err(Error::Fit(_))));
+    assert!(matches!(Shm::over(2, 2, late, 8), Err(Error::Fit(_))));
     let own = Sockets::over(0, vec![None, None]);
     assert!(matches!(own, Err(Error::Fit(_))));
 }
@@ -86,21 +86,23 @@ fn sockets_exchange() {
 
 #[test]
 fn memory_exchange() {
-    let links = Memory::ranks(3, &exchange_regions(3, 16));
     let wait = std::time::Duration::from_secs(10);
-    rounds(
-        links
-            .into_iter()
-            .map(|l| Blocking::new(l, 16, wait))
-            .collect(),
-    );
+    let regions = exchange_regions(3, 16);
+    for links in [Memory::ranks(3, &regions), Memory::deferred(3, &regions)] {
+        rounds(
+            links
+                .into_iter()
+                .map(|l| Blocking::new(l, 16, wait))
+                .collect(),
+        );
+    }
 }
 
 #[test]
 fn shm_exchange() {
     let file = sized("shm", Shm::room(3, 16));
     let ranks = (0..3)
-        .map(|r| Shm::over(r, 3, file.try_clone().unwrap()).unwrap())
+        .map(|r| Shm::over(r, 3, file.try_clone().unwrap(), 16).unwrap())
         .collect();
     rounds(ranks);
 }

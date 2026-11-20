@@ -1,7 +1,7 @@
 //! Ranks on one box, writing into a mapped file.
 
-use crate::link::{Blocking, Link, Put, Span, exchange_regions};
-use crate::{Error, Transport};
+use crate::Error;
+use crate::link::{Blocking, Link, Put, Span, exchange_regions, fits};
 use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -33,6 +33,7 @@ fn padded(n: usize) -> usize {
 pub struct ShmLink {
     rank: u32,
     ranks: u32,
+    sizes: Vec<usize>,
     /// Region offsets in a rank's block, then its size.
     offsets: Vec<usize>,
     block: usize,
@@ -72,6 +73,7 @@ impl ShmLink {
         Ok(ShmLink {
             rank,
             ranks,
+            sizes: regions.to_vec(),
             offsets,
             block,
             base: base as *mut u8,
@@ -81,14 +83,20 @@ impl ShmLink {
         })
     }
 
-    fn at(&self, rank: u32, at: Span) -> *mut u8 {
+    /// The address of `at` in `rank`'s regions, checked.
+    fn at(&self, rank: u32, at: Span, align: usize) -> Result<*mut u8, Error> {
+        if rank >= self.ranks {
+            return Err(Error::Fit(format!("no rank {rank} of {}", self.ranks)));
+        }
+        fits(&self.sizes, at, align)?;
         let offset = rank as usize * self.block + self.offsets[at.region] + at.at;
-        unsafe { self.base.add(offset) }
+        Ok(unsafe { self.base.add(offset) })
     }
 
-    fn atomic(&self, rank: u32, at: Span) -> &AtomicU64 {
-        // Flags and words sit at multiples of 8.
-        unsafe { &*(self.at(rank, at) as *const AtomicU64) }
+    fn atomic(&self, rank: u32, at: Span) -> Result<&AtomicU64, Error> {
+        let word = self.at(rank, Span::new(at.region, at.at, 8), 8)?;
+        // Checked: in bounds and 8-byte aligned.
+        Ok(unsafe { &*(word as *const AtomicU64) })
     }
 }
 
@@ -108,75 +116,73 @@ impl Link for ShmLink {
     }
 
     fn put(&mut self, put: Put) -> Result<(), Error> {
-        let (from, into) = (self.at(self.rank, put.from), self.at(put.to, put.into));
+        if put.from.len != put.into.len || put.flag.len != 16 {
+            return Err(Error::Fit(format!("{put:?} has spans that differ")));
+        }
+        let from = self.at(self.rank, put.from, 1)?;
+        let into = self.at(put.to, put.into, 1)?;
+        let ordinal = self.atomic(put.to, put.flag)?;
+        let count = self.atomic(put.to, Span::new(put.flag.region, put.flag.at + 8, 8))?;
         unsafe { std::ptr::copy_nonoverlapping(from, into, put.from.len) };
-        let count = Span::new(put.flag.region, put.flag.at + 8, 8);
-        self.atomic(put.to, count)
-            .store(put.words[1], Ordering::Relaxed);
-        self.atomic(put.to, put.flag)
-            .store(put.words[0], Ordering::Release);
+        count.store(put.words[1], Ordering::Relaxed);
+        ordinal.store(put.words[0], Ordering::Release);
         self.done.push(put.tag);
         Ok(())
     }
 
     fn word(&mut self, to: u32, at: Span, value: u64, tag: u64) -> Result<(), Error> {
-        self.atomic(to, at).store(value, Ordering::Release);
+        self.atomic(to, at)?.store(value, Ordering::Release);
         self.done.push(tag);
         Ok(())
     }
 
-    at_once!();
-
-    fn load(&self, at: Span) -> u64 {
-        self.atomic(self.rank, at).load(Ordering::Acquire)
+    fn poll(&mut self, done: &mut Vec<u64>) -> Result<(), Error> {
+        done.append(&mut self.done);
+        Ok(())
     }
 
-    fn read(&self, at: Span) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(self.at(self.rank, at), at.len) }.to_vec()
+    fn reset(&mut self) -> Result<(), Error> {
+        self.done.clear();
+        Ok(())
     }
 
-    fn write(&mut self, at: Span, bytes: &[u8]) {
-        let into = self.at(self.rank, at);
+    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+        let size = *self.sizes.get(region)?;
+        let at = self.at(self.rank, Span::new(region, 0, size), 1).ok()?;
+        Some((at, size))
+    }
+
+    fn load(&self, at: Span) -> Result<u64, Error> {
+        Ok(self.atomic(self.rank, at)?.load(Ordering::Acquire))
+    }
+
+    fn read(&self, at: Span) -> Result<Vec<u8>, Error> {
+        let from = self.at(self.rank, at, 1)?;
+        let mut out = vec![0u8; at.len];
+        unsafe { std::ptr::copy_nonoverlapping(from, out.as_mut_ptr(), at.len) };
+        Ok(out)
+    }
+
+    fn write(&mut self, at: Span, bytes: &[u8]) -> Result<(), Error> {
+        let into = self.at(self.rank, Span::new(at.region, at.at, bytes.len()), 1)?;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), into, bytes.len()) };
+        Ok(())
     }
 }
 
 /// The exchange over a mapped file.
-pub struct Shm(Blocking<ShmLink>);
+pub type Shm = Blocking<ShmLink>;
 
-impl Shm {
+impl Blocking<ShmLink> {
     /// The file size `ranks` need for `capacity` byte slots.
     pub fn room(ranks: u32, capacity: usize) -> usize {
         ShmLink::room(ranks, &exchange_regions(ranks, padded(capacity)))
     }
 
-    /// Rank `rank` over `file`, zeroed and sized by `room`.
-    pub fn over(rank: u32, ranks: u32, file: File) -> Result<Self, Error> {
-        let len = file.metadata()?.len() as usize;
-        let n = ranks.max(1) as usize;
-        // Per rank: 2c send, 2nc receive, then 32n of flags.
-        let capacity = (len / n).saturating_sub(padded(32 * n)) / (2 + 2 * n);
-        let capacity = capacity / 16 * 16;
-        if ranks == 0 || Self::room(ranks, capacity) != len {
-            return Err(Error::Fit(format!(
-                "{len} bytes for rank {rank} of {ranks}"
-            )));
-        }
+    /// Rank `rank` over `file`, sized by `room` for `capacity`.
+    pub fn over(rank: u32, ranks: u32, file: File, capacity: usize) -> Result<Self, Error> {
+        let capacity = padded(capacity);
         let link = ShmLink::over(rank, ranks, file, &exchange_regions(ranks, capacity))?;
-        Ok(Shm(Blocking::new(link, capacity, ROUND)))
-    }
-}
-
-impl Transport for Shm {
-    fn rank(&self) -> u32 {
-        self.0.rank()
-    }
-
-    fn ranks(&self) -> u32 {
-        self.0.ranks()
-    }
-
-    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        self.0.exchange(mine)
+        Ok(Blocking::new(link, capacity, ROUND))
     }
 }

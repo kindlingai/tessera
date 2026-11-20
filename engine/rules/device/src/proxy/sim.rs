@@ -1,6 +1,7 @@
 //! Ranks, proxies and links under a seeded random schedule.
 
 use crate::proxy::{Fetched, Fetcher, Host, Lane, Link, Op, Part, Pool, Proxy, Sent, Word};
+use sensai_engine_comm::Error as CommError;
 use std::collections::{HashMap, VecDeque};
 
 /// Words in one part, and in one all-to-all block.
@@ -91,7 +92,7 @@ impl SimLink {
 }
 
 impl Link for SimLink {
-    fn put(&mut self, part: Part) -> Result<(), String> {
+    fn put(&mut self, part: Part) -> Result<(), CommError> {
         let Part {
             pool,
             slot,
@@ -114,7 +115,7 @@ impl Link for SimLink {
         Ok(())
     }
 
-    fn credit(&mut self, pool: u32, to: u32, ordinal: u64) -> Result<(), String> {
+    fn credit(&mut self, pool: u32, to: u32, ordinal: u64) -> Result<(), CommError> {
         let from = self.place(pool);
         let msg = Msg::Credit { from, ordinal };
         self.out
@@ -122,13 +123,14 @@ impl Link for SimLink {
         Ok(())
     }
 
-    fn sent(&mut self) -> Result<Vec<Sent>, String> {
+    fn sent(&mut self) -> Result<Vec<Sent>, CommError> {
         Ok(std::mem::take(&mut self.sent))
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<(), CommError> {
         self.out.clear();
         self.sent.clear();
+        Ok(())
     }
 }
 

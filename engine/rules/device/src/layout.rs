@@ -1,5 +1,8 @@
 //! The structs the host writes, laid out as the headers.
 
+/// The most ranks in one collective group.
+pub(crate) const MAX_GROUP: usize = 8;
+
 /// One field: its name, byte offset and size.
 pub type Field = (&'static str, usize, usize);
 

@@ -1,5 +1,7 @@
 //! The host proxy: reads the doorbell, moves parts, frees slots.
 
+use crate::layout::MAX_GROUP;
+use sensai_engine_comm::Error as CommError;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -106,12 +108,12 @@ pub struct Sent {
 /// Moves bytes. Each call starts work that `sent` reports.
 pub trait Link {
     /// Sends the part, then a flag, to `part.to`.
-    fn put(&mut self, part: Part) -> Result<(), String>;
+    fn put(&mut self, part: Part) -> Result<(), CommError>;
     /// Tells group rank `to` this rank read up to `ordinal`.
-    fn credit(&mut self, pool: u32, to: u32, ordinal: u64) -> Result<(), String>;
-    fn sent(&mut self) -> Result<Vec<Sent>, String>;
+    fn credit(&mut self, pool: u32, to: u32, ordinal: u64) -> Result<(), CommError>;
+    fn sent(&mut self) -> Result<Vec<Sent>, CommError>;
     /// Drops or finishes every put and credit in flight.
-    fn reset(&mut self);
+    fn reset(&mut self) -> Result<(), CommError>;
 }
 
 /// Rows a fetch wrote into its slot.
@@ -142,6 +144,10 @@ pub enum Error {
     Event { pool: u32, ordinal: u64 },
     #[error("bad plan: {0}")]
     Plan(&'static str),
+}
+
+fn linked(e: CommError) -> Error {
+    Error::Link(e.to_string())
 }
 
 /// The bit every trigger word sets, and the lane count.
@@ -192,7 +198,7 @@ fn check(pools: &[Pool], lanes: &[Lane], base: u64) -> Result<(), Error> {
     let bad = |pool: &Pool| {
         !(1..=4).contains(&pool.depth)
             || pool.me >= pool.group
-            || pool.group > 8
+            || pool.group as usize > MAX_GROUP
             || (pool.one_way && pool.group != 2)
     };
     if base == 0 || pools.len() > 4 || pools.iter().any(bad) {
@@ -234,7 +240,7 @@ impl Proxy {
         if base == 0 {
             return Err(Error::Plan("base 0"));
         }
-        link.reset();
+        link.reset().map_err(linked)?;
         fetcher.reset();
         self.clear(host, base);
         Ok(())
@@ -309,7 +315,7 @@ impl Proxy {
                 busy |= self.credits(p, host, link)?;
             }
         }
-        for s in link.sent().map_err(Error::Link)? {
+        for s in link.sent().map_err(linked)? {
             busy = true;
             self.finish(s.pool, s.ordinal, s.to)?;
         }
@@ -410,8 +416,7 @@ impl Proxy {
             return Ok(false);
         }
         track.credit = most;
-        link.credit(pool_id, 1 - pool.me, most)
-            .map_err(Error::Link)?;
+        link.credit(pool_id, 1 - pool.me, most).map_err(linked)?;
         Ok(true)
     }
 
@@ -495,7 +500,7 @@ impl Job {
                 from,
                 bytes,
             };
-            link.put(part).map_err(Error::Link)?;
+            link.put(part).map_err(linked)?;
         }
         Ok(())
     }

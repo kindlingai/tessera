@@ -132,7 +132,7 @@ pub fn shm(path: &Path, rank: u32, ranks: u32, capacity: usize) -> Result<Shm, E
             Err(e) => return Err(e.into()),
         }
     };
-    Shm::over(rank, ranks, file)
+    Shm::over(rank, ranks, file, capacity)
 }
 
 #[cfg(test)]
