@@ -2,7 +2,9 @@
 
 use crate::Error;
 use crate::kernels::Kernels;
+use crate::marks;
 use crate::overrides::{self, Overrides};
+use crate::profile::Marks;
 use crate::run::{Base, Reload, Run};
 use sensai_codegen::Dialect;
 use sensai_engine_settings::Settings;
@@ -31,6 +33,10 @@ pub(crate) struct Runner<D: Device> {
     entries: Vec<(String, usize)>,
     /// Each step's place in `entries`.
     uses: Vec<usize>,
+    /// Kernels compiled with marks, by their marked text.
+    marked: HashMap<String, D::Kernel>,
+    /// Where marked kernels write, made on first use.
+    ledger: Option<DeviceBuffer<D>>,
     compiled: Kernels<D::Kernel>,
     /// The whole plan's launches per binding, recorded once.
     graphs: HashMap<Vec<(DimName, u32)>, D::Graph>,
@@ -66,6 +72,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             overrides: settings.kernels.as_ref().map(files),
             entries: Vec::new(),
             uses: Vec::new(),
+            marked: HashMap::new(),
+            ledger: None,
             compiled: Kernels::default(),
             graphs: HashMap::new(),
             launching: Launching::default(),
@@ -271,6 +279,30 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         Ok(())
     }
 
+    /// Reads the ledger after one launch into `found`.
+    fn collect(&self, ledger: u64, found: &mut Marks) -> Result<(), Error> {
+        let mut bytes = vec![0u8; marks::COUNTS];
+        self.ctx.download(ledger, &mut bytes)?;
+        let counts: Vec<u32> = bytes
+            .as_chunks()
+            .0
+            .iter()
+            .map(|b| u32::from_ne_bytes(*b))
+            .collect();
+        let blocks = counts.iter().rposition(|c| *c > 0).map_or(0, |at| at + 1);
+        let mut bytes = vec![0u8; marks::records(blocks)];
+        self.ctx
+            .download(ledger + marks::COUNTS as u64, &mut bytes)?;
+        let records: Vec<u64> = bytes
+            .as_chunks()
+            .0
+            .iter()
+            .map(|b| u64::from_ne_bytes(*b))
+            .collect();
+        marks::read(&counts[..blocks], &records, self.ctx.ticks(), found);
+        Ok(())
+    }
+
     /// Every launch of `steps`, in order.
     fn launch_all(&self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
@@ -354,7 +386,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         for (entry, step) in &self.entries {
             let planned =
                 || overrides::text(&plan.steps[*step].kernel.source(), dialect(D::BACKEND));
-            let compile = |text: &str| Ok(ctx.compile(text, entry)?);
+            let compile = |text: &str| Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?);
             reloads.extend(files.check(entry, planned, compile));
         }
         if !reloads.is_empty() {
@@ -363,6 +395,49 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             self.apply();
         }
         Ok(reloads)
+    }
+
+    fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
+        if dialect(D::BACKEND) == Dialect::Metal {
+            return Ok(None);
+        }
+        let source = self.base.plan.steps[step].kernel.source();
+        let entry = overrides::entry(&source).to_string();
+        let loaded = self.overrides.as_ref().and_then(|f| f.text(&entry));
+        let text = loaded.map_or_else(|| overrides::text(&source, Dialect::Cuda), str::to_string);
+        if !text.contains("TS_MARK") {
+            return Ok(Some(Marks::default()));
+        }
+        let marked = format!("{}{text}", marks::ON);
+        let kernel = match self.marked.get(&marked) {
+            Some(kernel) => kernel.clone(),
+            None => {
+                let kernel = self.ctx.compile(&marked, &entry)?;
+                self.marked.insert(marked, kernel.clone());
+                kernel
+            }
+        };
+        let Some(at) = self.ctx.global(&kernel, "tessera_marks")? else {
+            return Ok(None);
+        };
+        if self.ledger.is_none() {
+            let bytes = marks::COUNTS + marks::records(marks::BLOCKS);
+            self.ledger = Some(DeviceBuffer::alloc(self.ctx, bytes)?);
+        }
+        let ledger = self.ledger.as_ref().map_or(0, DeviceBuffer::device_ptr);
+        self.ctx.finish()?;
+        self.ctx.upload(at, &ledger.to_ne_bytes())?;
+        let mut found = Marks::default();
+        // Counts restart per launch, so launches never mix.
+        for launch in self.base.launches(step)? {
+            self.ctx.zero(ledger, marks::COUNTS)?;
+            self.ctx.programmatic(false);
+            let mut args = self.bound(&launch.args)?;
+            self.fire(&kernel, launch.shape, &mut args)?;
+            self.ctx.finish()?;
+            self.collect(ledger, &mut found)?;
+        }
+        Ok(Some(found))
     }
 
     fn dump(&self) -> Result<Vec<PathBuf>, Error> {

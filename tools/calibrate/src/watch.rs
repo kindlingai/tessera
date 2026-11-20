@@ -233,6 +233,28 @@ impl Watch {
                 r.entry
             );
         }
+        for &at in which {
+            let row = &self.rows[at];
+            let Some(found) = runner.marks(row.steps[0])? else {
+                continue;
+            };
+            for region in &found.regions {
+                let (middle, most) = region.spread();
+                let (from, to, times) = (region.from, region.to, region.seconds.len());
+                println!(
+                    "    {} lines {from}-{to}: {:.2} us middle, {:.2} us most, {times} times",
+                    row.entry,
+                    middle * 1e6,
+                    most * 1e6
+                );
+            }
+            if found.lost > 0 {
+                println!(
+                    "    {}: {} marks past room, not kept",
+                    row.entry, found.lost
+                );
+            }
+        }
         let alone: f64 = self.rows.iter().map(|r| r.seconds).sum();
         println!(
             "plan {:.1} us, steps alone {:.1} us, error {worst:.3e} of {most:.3e}",

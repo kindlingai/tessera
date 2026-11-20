@@ -111,6 +111,7 @@ sensai_dl::library! {
         pub(crate) cu_event_record: entry::Replay = "cuEventRecord",
         pub(crate) cu_event_elapsed_time: entry::Elapsed = "cuEventElapsedTime",
         pub(crate) cu_event_destroy: entry::OnHandle = "cuEventDestroy_v2",
+        pub(crate) cu_module_get_global: entry::Global = "cuModuleGetGlobal_v2",
         cu_get_error_name: CuGetErrorName = "cuGetErrorName",
         cu_get_error_string: CuGetErrorString = "cuGetErrorString",
     }
