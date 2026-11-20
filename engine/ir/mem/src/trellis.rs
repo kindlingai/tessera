@@ -8,7 +8,7 @@ pub const MCG: u32 = 0xCBAC_1FED;
 
 /// The mul1 codebook's multiplier, scale and offset.
 pub const MUL1: u32 = 0x83DC_D12D;
-pub const MUL1_SCALE: f32 = 0.006_767_272_949_218_75;
+pub const MUL1_SCALE: f32 = 0.006_767_273;
 pub const MUL1_OFFSET: f32 = -10.382_812_5;
 
 /// Header words: `in`, `out`, the sharded side, `1 / in`.
