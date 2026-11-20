@@ -111,6 +111,14 @@ minifloat! {
     F16(u16): 5, 10, inf = true, nan = true
 }
 
+impl F16 {
+    /// Little-endian halves as floats.
+    pub fn floats(bytes: &[u8]) -> Vec<f32> {
+        let half = |b: &[u8; 2]| f32::from(F16(u16::from_le_bytes(*b)));
+        bytes.as_chunks::<2>().0.iter().map(half).collect()
+    }
+}
+
 minifloat! {
     /// OCP float8 e4m3: no infinities, 448 at most.
     E4M3(u8): 4, 3, inf = false, nan = true

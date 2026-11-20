@@ -40,9 +40,7 @@ fn record(f: &File, name: &str) -> Result<Record, Error> {
 }
 
 fn halves(f: &File, name: &str) -> Result<Vec<f32>, Error> {
-    let bytes = f.bytes(name)?;
-    let half = |b: &[u8; 2]| f32::from(F16(u16::from_le_bytes(*b)));
-    Ok(bytes.as_chunks::<2>().0.iter().map(half).collect())
+    Ok(F16::floats(&f.bytes(name)?))
 }
 
 fn e4m3(bits: u8) -> f32 {

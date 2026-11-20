@@ -160,10 +160,7 @@ fn check(
     let allow = Allow::parse(include_str!("../allow.toml"))?;
     let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
     let wins = all_windows(&root, &s)?;
-    let mut cache = match cache_file {
-        Some(f) => Cache::load(f)?,
-        None => Cache::default(),
-    };
+    let mut cache = Cache::open(cache_file)?;
     let changed = changed_files(&root, base)?;
     let found = embed(model, &wins, &mut cache, &changed, mode.budget)?;
     if let Some(f) = cache_file {
@@ -280,10 +277,7 @@ fn tree(model: &Path, cache_file: Option<&Path>) -> Result<Tree> {
     let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
     let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
     let wins = all_windows(&root, &s)?;
-    let mut cache = match cache_file {
-        Some(f) => Cache::load(f)?,
-        None => Cache::default(),
-    };
+    let mut cache = Cache::open(cache_file)?;
     // `far` and `place` need every window.
     let found = embed(model, &wins, &mut cache, &HashSet::new(), None)?;
     let embs: Vec<Vec<f32>> = found.into_iter().map(|e| e.expect("embedded")).collect();

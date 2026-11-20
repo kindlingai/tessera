@@ -643,6 +643,26 @@ macro_rules! hosts {
 
 crate::intrinsic::table!(hosts);
 
+/// An integer `op`. Sums, differences and products wrap.
+macro_rules! integer {
+    ($op:expr, $x:expr, $y:expr) => {{
+        let (x, y) = ($x, $y);
+        match $op {
+            BinOp::Add => x.wrapping_add(y),
+            BinOp::Sub => x.wrapping_sub(y),
+            BinOp::Mul => x.wrapping_mul(y),
+            BinOp::Div => x / y,
+            BinOp::Rem => x % y,
+            BinOp::Shl => x << y,
+            BinOp::Shr => x >> y,
+            BinOp::BitAnd => x & y,
+            BinOp::BitOr => x | y,
+            BinOp::BitXor => x ^ y,
+            other => panic!("{other:?} on integers"),
+        }
+    }};
+}
+
 /// Integers wrap. Anything with a float is a float.
 fn binary(op: BinOp, a: Val, b: Val) -> Val {
     let float = matches!(a, Val::F(_)) || matches!(b, Val::F(_));
@@ -678,38 +698,8 @@ fn binary(op: BinOp, a: Val, b: Val) -> Val {
                 other => panic!("{other:?} on floats"),
             })
         }
-        _ if long => {
-            let (x, y) = (a.l(), b.l());
-            Val::L(match op {
-                BinOp::Add => x.wrapping_add(y),
-                BinOp::Sub => x.wrapping_sub(y),
-                BinOp::Mul => x.wrapping_mul(y),
-                BinOp::Div => x / y,
-                BinOp::Rem => x % y,
-                BinOp::Shl => x << y,
-                BinOp::Shr => x >> y,
-                BinOp::BitAnd => x & y,
-                BinOp::BitOr => x | y,
-                BinOp::BitXor => x ^ y,
-                other => panic!("{other:?} on integers"),
-            })
-        }
-        _ => {
-            let (x, y) = (a.u(), b.u());
-            Val::U(match op {
-                BinOp::Add => x.wrapping_add(y),
-                BinOp::Sub => x.wrapping_sub(y),
-                BinOp::Mul => x.wrapping_mul(y),
-                BinOp::Div => x / y,
-                BinOp::Rem => x % y,
-                BinOp::Shl => x << y,
-                BinOp::Shr => x >> y,
-                BinOp::BitAnd => x & y,
-                BinOp::BitOr => x | y,
-                BinOp::BitXor => x ^ y,
-                other => panic!("{other:?} on integers"),
-            })
-        }
+        _ if long => Val::L(integer!(op, a.l(), b.l())),
+        _ => Val::U(integer!(op, a.u(), b.u())),
     }
 }
 

@@ -49,8 +49,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let shape = &tree.node(w).shape;
     // Gathers of kept rows are ours, not picked weights.
     let wn = tree.node(w);
-    let kept = |t: T| matches!(tree.node(t).term, Term::Op(Op::Append(_)));
-    let picked = matches!(wn.term, Term::Op(Op::Select(_))) && !kept(wn.args[0]);
+    let picked = matches!(wn.term, Term::Op(Op::Select(_))) && !tree.appends(wn.args[0]);
     if picked || shape.len() < 3 || !floats(x) || !floats(w) {
         return None;
     }

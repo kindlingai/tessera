@@ -155,6 +155,17 @@ pub enum Mask {
     Within(u64),
 }
 
+impl Mask {
+    /// Keys a query sees before and after. `far` is all.
+    pub fn window(self, far: usize) -> (usize, usize) {
+        match self {
+            Mask::Causal => (far, 0),
+            Mask::Bidirectional => (far, far),
+            Mask::Within(n) => (n as usize, n as usize),
+        }
+    }
+}
+
 /// Stages fused into one pass over each row.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Row(pub Vec<Stage>);

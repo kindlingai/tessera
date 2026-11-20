@@ -149,8 +149,7 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     };
     let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
-    let kept = |t: T| matches!(tree.node(t).term, Term::Op(Op::Append(_)));
-    if !a.ragged || kept(k) || kept(v) {
+    if !a.ragged || tree.appends(k) || tree.appends(v) {
         return None;
     }
     let wide = |t: T| &tree.node(t).shape;
@@ -197,7 +196,7 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> Option<Vec<Draft>> {
         ragged: false,
         from_list: true,
         scale: site.scale,
-        window: crate::window(a.mask, keys),
+        window: a.mask.window(keys),
     };
     // Slots and positions go unread, so the list stands in.
     let reads = [site.q, site.k, site.v, ids, ids, ids];

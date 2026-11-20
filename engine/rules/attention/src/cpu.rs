@@ -74,7 +74,7 @@ pub(crate) struct Attend {
 impl Attend {
     /// Keys before and after a query's position that it sees.
     fn window(&self) -> (u32, u32) {
-        let (before, after) = crate::window(self.sizes.mask, self.sizes.keys.most());
+        let (before, after) = self.sizes.mask.window(self.sizes.keys.most());
         (before as u32, after as u32)
     }
 

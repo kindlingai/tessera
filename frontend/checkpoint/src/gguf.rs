@@ -371,12 +371,7 @@ impl Gguf {
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
-            _ => bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| f32::from(sensai_engine::F16(u16::from_le_bytes(*b))))
-                .collect(),
+            _ => sensai_engine::F16::floats(&bytes),
         })
     }
 }

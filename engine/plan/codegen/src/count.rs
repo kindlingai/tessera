@@ -33,6 +33,14 @@ impl Advance {
         }
     }
 
+    /// `n` units a trip, times `by` if constant.
+    fn scaled(n: f64, by: &Expr) -> Advance {
+        match by {
+            Expr::Int(c) => Advance::By(n * *c as f64),
+            _ => Advance::Jumps,
+        }
+    }
+
     fn times(self, by: f64) -> Advance {
         match self {
             Advance::By(a) => Advance::By(a * by),
@@ -119,14 +127,8 @@ impl Counter {
             Expr::Bin(BinOp::Sub, a, b) => self.advance(a, l).add(self.advance(b, l).times(-1.0)),
             Expr::Bin(BinOp::Mul, a, b) => match (self.advance(a, l), self.advance(b, l)) {
                 (Advance::Still, Advance::Still) => Advance::Still,
-                (Advance::By(n), Advance::Still) => match &**b {
-                    Expr::Int(c) => Advance::By(n * *c as f64),
-                    _ => Advance::Jumps,
-                },
-                (Advance::Still, Advance::By(n)) => match &**a {
-                    Expr::Int(c) => Advance::By(n * *c as f64),
-                    _ => Advance::Jumps,
-                },
+                (Advance::By(n), Advance::Still) => Advance::scaled(n, b),
+                (Advance::Still, Advance::By(n)) => Advance::scaled(n, a),
                 _ => Advance::Jumps,
             },
             Expr::Bin(..) | Expr::Call(..) | Expr::Fn(..) | Expr::Select(..) | Expr::Index(..) => {

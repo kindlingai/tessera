@@ -105,6 +105,11 @@ fn write_file(path: &Path, dim: usize, entries: &Entries) -> Result<()> {
 }
 
 impl Cache {
+    /// The cache in `dir`, or an empty one.
+    pub fn open(dir: Option<&Path>) -> Result<Cache> {
+        dir.map_or_else(|| Ok(Cache::default()), Cache::load)
+    }
+
     /// Every shard in `dir`, or the older single file `dir.bin`.
     pub fn load(dir: &Path) -> Result<Cache> {
         let mut c = Cache::default();

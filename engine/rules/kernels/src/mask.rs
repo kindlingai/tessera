@@ -1,7 +1,7 @@
 //! Scores a query cannot see, set to -inf.
 
 use sensai_codegen::prelude::*;
-use sensai_graph::{Mask, Op};
+use sensai_graph::Op;
 use sensai_lower::{Draft, Kernel, T, Term, Tree};
 
 /// One thread per score over `[.., queries, keys]`.
@@ -51,12 +51,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let [.., queries, keys] = shape[..] else {
         return None;
     };
-    let far = u32::MAX as usize;
-    let (back, ahead) = match kind {
-        Mask::Causal => (far, 0),
-        Mask::Bidirectional => (far, far),
-        Mask::Within(n) => (n as usize, n as usize),
-    };
+    let (back, ahead) = kind.window(u32::MAX as usize);
     let len = tree.elements(at);
     let masked = Masked {
         len,

@@ -415,13 +415,18 @@ impl<'a> Tree<'a> {
         matches!(self.node(t).term, Term::Leaf(_))
     }
 
+    /// Whether `t` is kept rows: an `Append`.
+    pub fn appends(&self, t: T) -> bool {
+        matches!(self.node(t).term, Term::Op(Op::Append(_)))
+    }
+
     fn output(&self, t: T) -> bool {
         self.outputs.iter().any(|(o, _)| *o == t)
     }
 
     /// Whether the value must have a buffer of its own.
     pub fn root(&self, t: T) -> bool {
-        let kept = matches!(self.node(t).term, Term::Leaf(_) | Term::Op(Op::Append(_)));
+        let kept = self.leaf(t) || self.appends(t);
         let end = self.ends[t.0 as usize];
         kept || end || self.readers[t.0 as usize] != 1 || self.output(t)
     }

@@ -12,20 +12,21 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn section(self) -> &'static str {
+    /// The manifest table, and the verb a message uses.
+    fn names(self) -> (&'static str, &'static str) {
         match self {
-            Kind::Normal => "[dependencies]",
-            Kind::Dev => "[dev-dependencies]",
-            Kind::Build => "[build-dependencies]",
+            Kind::Normal => ("[dependencies]", "depends on"),
+            Kind::Dev => ("[dev-dependencies]", "dev-depends on"),
+            Kind::Build => ("[build-dependencies]", "build-depends on"),
         }
     }
 
+    pub fn section(self) -> &'static str {
+        self.names().0
+    }
+
     pub fn verb(self) -> &'static str {
-        match self {
-            Kind::Normal => "depends on",
-            Kind::Dev => "dev-depends on",
-            Kind::Build => "build-depends on",
-        }
+        self.names().1
     }
 }
 

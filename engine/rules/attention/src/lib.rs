@@ -5,18 +5,8 @@ mod cpu;
 mod flash;
 mod listed;
 
-use sensai_graph::Mask;
 use sensai_lower::kernels::{Map, MapStage};
 use sensai_lower::{Draft, T, Tree, sites};
-
-/// Keys before and after a query's position that it sees.
-fn window(mask: Mask, keys: usize) -> (usize, usize) {
-    match mask {
-        Mask::Causal => (keys, 0),
-        Mask::Bidirectional => (keys, keys),
-        Mask::Within(n) => (n as usize, n as usize),
-    }
-}
 
 /// A listed site with all keys present, and its picks.
 fn fixed_list(tree: &Tree, (site, ids): (sites::Attend, T)) -> Option<(sites::Attend, T, usize)> {

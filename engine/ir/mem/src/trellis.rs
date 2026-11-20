@@ -117,12 +117,12 @@ impl<const K: u32> Trellis<K> {
     fn parts(bytes: &[u8]) -> (&[u8], Vec<f32>, Vec<f32>) {
         let shape = Shape::read(bytes);
         let end = HEAD + shape.inp * shape.out * K as usize / 8;
-        let half = |b: &[u8]| -> Vec<f32> {
-            let word = |c: &[u8; 2]| f32::from(F16(u16::from_le_bytes(*c)));
-            b.as_chunks::<2>().0.iter().map(word).collect()
-        };
         let (suh, svh) = bytes[end..].split_at(2 * shape.inp);
-        (&bytes[..end], half(suh), half(&svh[..2 * shape.out]))
+        (
+            &bytes[..end],
+            F16::floats(suh),
+            F16::floats(&svh[..2 * shape.out]),
+        )
     }
 
     /// Bytes one tile of 256 codes takes.

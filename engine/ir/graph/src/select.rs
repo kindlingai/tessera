@@ -17,11 +17,11 @@ pub(crate) fn select(
     }
 }
 
-/// Whether each rank holds complete last-axis rows.
-fn whole(t: &TensorType) -> bool {
+/// Whether each rank holds the last `axes` axes whole.
+fn whole(t: &TensorType, axes: usize) -> bool {
     match t.placement {
         Placement::Replicated => true,
-        Placement::Split { axis } => (axis as usize) + 1 < t.rank(),
+        Placement::Split { axis } => (axis as usize) + axes < t.rank(),
         Placement::Partial | Placement::Routed => false,
     }
 }
@@ -79,7 +79,7 @@ fn take(dims: &[Dim], x: &TensorType, ids: &TensorType) -> Result<TensorType, Ty
         format!("take indices must be integers, got {:?}", ids.dtype)
     })?;
     need(
-        whole(x) && ids.placement == x.placement,
+        whole(x, 1) && ids.placement == x.placement,
         ErrorKind::Placement,
         || format!("take cannot read {:?} at {:?}", x.placement, ids.placement),
     )?;
@@ -99,7 +99,7 @@ fn top_k(dims: &[Dim], k: &DimExpr, x: &TensorType) -> Result<TensorType, TypeEr
     need(fixed, ErrorKind::Shape, || {
         format!("top-k needs a fixed positive count, got {k}")
     })?;
-    need(whole(x), ErrorKind::Placement, || {
+    need(whole(x, 1), ErrorKind::Placement, || {
         format!("top-k needs whole rows, got {:?}", x.placement)
     })?;
     let mut shape = x.shape.0.clone();
@@ -116,12 +116,7 @@ pub(crate) fn mask(x: &TensorType) -> Result<TensorType, TypeError> {
         format!("a mask takes [.., Queries, Keys], got {}", x.shape)
     })?;
     floats(x, "a mask")?;
-    let ok = match x.placement {
-        Placement::Replicated => true,
-        Placement::Split { axis } => (axis as usize) + 2 < x.rank(),
-        Placement::Partial | Placement::Routed => false,
-    };
-    need(ok, ErrorKind::Placement, || {
+    need(whole(x, 2), ErrorKind::Placement, || {
         format!("a mask needs whole score rows, got {:?}", x.placement)
     })?;
     Ok(x.clone())
