@@ -197,7 +197,6 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         guides,
     });
     let (queue, jobs) = mpsc::channel::<Job>();
-    let kv = crate::metrics::Shared::default();
     let queued = Queued {
         generate: generate.clone(),
         jobs: Mutex::new(queue),
@@ -210,7 +209,6 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         embed: None,
         image: None,
         strict: o.strict,
-        kv: kv.clone(),
     };
     let _ = slot.set(model);
     let mut batch = Batch::new(&mut engine, Box::new(Fair));
@@ -231,9 +229,6 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
             continue;
         }
         batch.step().map_err(|e| e.to_string())?;
-        if let Ok(mut seen) = kv.lock() {
-            *seen = batch.totals();
-        }
     }
 }
 
@@ -261,7 +256,6 @@ fn load(options: Options, slot: Slot) {
             embed,
             image,
             strict,
-            kv: Default::default(),
         };
         let _ = slot.set(model);
     };

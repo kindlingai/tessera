@@ -23,6 +23,7 @@ sensai-lower = { workspace = true }
 sensai-mem = { workspace = true }
 sensai-models = { workspace = true }
 sensai-run = { workspace = true }
+scattered-collect = "0.22"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 sensai-trace = { workspace = true }

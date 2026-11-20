@@ -11,7 +11,7 @@ mod images;
 mod images_test;
 #[cfg(test)]
 mod lib_test;
-pub mod metrics;
+mod metrics;
 #[cfg(test)]
 mod mocks;
 pub mod ranks;
@@ -41,8 +41,6 @@ pub struct Model {
     pub image: Option<Arc<dyn GenerateImage>>,
     /// Unknown request fields refuse the request. Else they warn.
     pub strict: bool,
-    /// The kept rows' totals, for `/metrics`.
-    pub kv: metrics::Shared,
 }
 
 /// The model once it loads. Until then routes answer 503.
@@ -147,7 +145,7 @@ pub fn route(slot: &Slot, request: &Request) -> Response {
         ("GET", "/health" | "/v1/health" | "/v1/health/ready" | "/ping") => health(slot),
         ("GET", "/version") => Response::json(200, &json!({"version": env!("CARGO_PKG_VERSION")})),
         ("GET", "/v1/models") => models(slot),
-        ("GET", "/metrics") => metrics::metrics(slot),
+        ("GET", "/metrics") => metrics::metrics(),
         ("POST", "/tokenize") => tokenize(slot, body),
         ("POST", "/detokenize") => detokenize(slot, body),
         ("POST", "/v1/embeddings") => embeddings(slot, body),

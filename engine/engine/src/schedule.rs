@@ -4,6 +4,12 @@ use crate::kept::{Kept, Totals};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
+crate::metrics::registry!(REQUESTS = "requests");
+crate::metrics::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
+crate::metrics::metric!(RUNNING in REQUESTS = Gauge "tessera:requests_running", "Answers that hold a slot.");
+crate::metrics::metric!(PROMPT in REQUESTS = Counter "tessera:prompt_tokens_total", "Prompt tokens of admitted answers.");
+crate::metrics::metric!(MADE in REQUESTS = Counter "tessera:generation_tokens_total", "Tokens the answers made.");
+
 /// Takes each event. `false` ends the answer early.
 pub type Sink = Box<dyn FnMut(Event) -> bool + Send>;
 
@@ -68,6 +74,7 @@ impl Seq {
     /// Sends an answer token.
     fn emit(&mut self, id: u32) -> Option<Reason> {
         self.made += 1;
+        MADE.add(1);
         if !(self.sink)(Event::Token(id)) {
             return Some(Reason::Stop);
         }
@@ -223,6 +230,7 @@ impl<'a> Batch<'a> {
     fn admit(&mut self) {
         while let Some((slot, skip)) = self.place() {
             let (request, sink) = self.waiting.pop_front().expect("a waiting answer");
+            PROMPT.add(request.tokens.len() as u64);
             let mut seq = Seq {
                 slot,
                 pending: request.tokens[skip..].iter().copied().collect(),
@@ -315,6 +323,16 @@ impl<'a> Batch<'a> {
 
     /// One step of the policy's rows. False when nothing ran.
     pub fn step(&mut self) -> Result<bool, Error> {
+        let ran = self.turn();
+        WAITING.set(self.waiting.len() as u64);
+        RUNNING.set(self.active.len() as u64);
+        if let Some(kept) = &self.kept {
+            kept.publish();
+        }
+        ran
+    }
+
+    fn turn(&mut self) -> Result<bool, Error> {
         self.admit();
         self.fit();
         let rows = self.policy.pick(&self.active, self.budget);

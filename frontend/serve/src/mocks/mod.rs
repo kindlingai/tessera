@@ -31,7 +31,6 @@ pub fn loaded(generator: &Arc<MockGenerator>, strict: bool) -> Slot {
         embed: Some(Arc::new(MockEmbed)),
         image: Some(Arc::new(MockImage)),
         strict,
-        kv: Default::default(),
     });
     slot
 }

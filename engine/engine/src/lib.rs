@@ -13,6 +13,9 @@ use std::sync::mpsc;
 mod guide;
 mod kept;
 mod lanes;
+pub mod metrics;
+#[cfg(test)]
+mod metrics_test;
 mod model;
 mod ranks;
 mod schedule;

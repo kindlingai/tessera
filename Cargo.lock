@@ -1663,6 +1663,7 @@ version = "0.1.0"
 name = "sensai-engine"
 version = "0.1.0"
 dependencies = [
+ "scattered-collect",
  "sensai-engine-comm",
  "sensai-engine-settings",
  "sensai-graph",
