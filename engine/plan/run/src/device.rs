@@ -2,9 +2,10 @@
 
 use crate::Error;
 use crate::kernels::Kernels;
-use crate::run::{Base, Run};
+use crate::overrides::{self, Overrides};
+use crate::run::{Base, Reload, Run};
 use sensai_codegen::Dialect;
-use sensai_engine_settings::Memory;
+use sensai_engine_settings::Settings;
 use sensai_gpukit::backend::Backend;
 use sensai_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use sensai_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
@@ -14,12 +15,22 @@ use sensai_mem::Buffer;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::time::Instant;
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
     base: Base,
+    /// Each step's running kernel: a file's, else the plan's.
     kernels: Vec<D::Kernel>,
+    /// Each step's kernel as planned.
+    planned: Vec<D::Kernel>,
+    /// Kernel files in place of planned kernels, when set.
+    overrides: Option<Overrides<D::Kernel>>,
+    /// Each distinct entry, with its first step.
+    entries: Vec<(String, usize)>,
+    /// Each step's place in `entries`.
+    uses: Vec<usize>,
     compiled: Kernels<D::Kernel>,
     /// The whole plan's launches per binding, recorded once.
     graphs: HashMap<Vec<(DimName, u32)>, D::Graph>,
@@ -44,12 +55,17 @@ fn dialect(backend: Backend) -> Dialect {
 }
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
-    pub fn new(plan: Plan, memory: Memory) -> Result<Self, Error> {
+    pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
+        let files = |dir: &PathBuf| Overrides::new(dir.clone(), dialect(D::BACKEND));
         let mut runner = Self {
             ctx,
-            base: Base::new(memory, &ctx.platform()),
+            base: Base::new(settings.memory, &ctx.platform()),
             kernels: Vec::new(),
+            planned: Vec::new(),
+            overrides: settings.kernels.as_ref().map(files),
+            entries: Vec::new(),
+            uses: Vec::new(),
             compiled: Kernels::default(),
             graphs: HashMap::new(),
             launching: Launching::default(),
@@ -219,6 +235,42 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.waited(timed, |r| Ok(r.ctx.replay(&r.graphs[&key])?))
     }
 
+    /// Notes each step's entry, once per distinct entry.
+    fn index(&mut self, plan: &Plan) {
+        (self.entries, self.uses) = (Vec::new(), Vec::new());
+        if self.overrides.is_none() {
+            return;
+        }
+        for (i, step) in plan.steps.iter().enumerate() {
+            let source = step.kernel.source();
+            let entry = overrides::entry(&source);
+            let at = self.entries.iter().position(|(e, _)| e == entry);
+            self.uses.push(at.unwrap_or(self.entries.len()));
+            if at.is_none() {
+                self.entries.push((entry.to_string(), i));
+            }
+        }
+    }
+
+    /// Gives each step its file's kernel, else the plan's.
+    fn apply(&mut self) {
+        let Some(files) = &self.overrides else {
+            return;
+        };
+        for (i, kernel) in self.kernels.iter_mut().enumerate() {
+            let entry = &self.entries[self.uses[i]].0;
+            *kernel = files.kernel(entry).unwrap_or(&self.planned[i]).clone();
+        }
+    }
+
+    /// Rereads changed kernel files, and says what changed.
+    fn reread(&mut self) -> Result<(), Error> {
+        for reload in self.refresh()? {
+            eprintln!("tessera: {reload}");
+        }
+        Ok(())
+    }
+
     /// Every launch of `steps`, in order.
     fn launch_all(&self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
@@ -286,8 +338,44 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             self.kernels.push(kernel);
             self.waits.push(generated);
         }
+        self.planned = self.kernels.clone();
+        self.index(plan);
+        self.apply();
         self.base.adopt(plan);
         Ok(())
+    }
+
+    fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
+        let (ctx, plan) = (self.ctx, &self.base.plan);
+        let Some(files) = self.overrides.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut reloads = Vec::new();
+        for (entry, step) in &self.entries {
+            let planned =
+                || overrides::text(&plan.steps[*step].kernel.source(), dialect(D::BACKEND));
+            let compile = |text: &str| Ok(ctx.compile(text, entry)?);
+            reloads.extend(files.check(entry, planned, compile));
+        }
+        if !reloads.is_empty() {
+            // Recorded launches name the kernels they replaced.
+            self.graphs.clear();
+            self.apply();
+        }
+        Ok(reloads)
+    }
+
+    fn dump(&self) -> Result<Vec<PathBuf>, Error> {
+        let Some(files) = &self.overrides else {
+            return Ok(Vec::new());
+        };
+        let mut written = Vec::new();
+        for (entry, step) in &self.entries {
+            let source = self.base.plan.steps[*step].kernel.source();
+            let text = overrides::text(&source, dialect(D::BACKEND));
+            written.extend(files.write(entry, &text)?);
+        }
+        Ok(written)
     }
 
     fn launching(&mut self, launching: Launching) {
@@ -316,6 +404,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
+        self.reread()?;
         self.ctx.finish()?;
         let start = Instant::now();
         let launches = self.base.launches(step)?;
@@ -348,6 +437,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.reread()?;
         if self.base.profile.is_some() {
             return self.profiled(steps);
         }
@@ -355,6 +445,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
+        self.reread()?;
         if self.base.profile.is_some() {
             return self.profiled(steps).map(|_| None);
         }

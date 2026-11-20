@@ -58,6 +58,8 @@ pub struct Settings {
     pub hf_token: Option<String>,
     /// Launches per profile report. `None` times nothing.
     pub profile: Option<u64>,
+    /// Kernel files that replace planned kernels, named by entry.
+    pub kernels: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -75,6 +77,7 @@ impl Default for Settings {
             hub: None,
             hf_token: None,
             profile: None,
+            kernels: None,
         }
     }
 }

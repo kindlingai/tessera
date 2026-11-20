@@ -19,6 +19,7 @@ struct Env {
     memory: Option<String>,
     /// Launches per profile report.
     profile: Option<u64>,
+    kernels: Option<PathBuf>,
 }
 
 /// Reads the `TESSERA_` variables. Bad values panic.
@@ -53,6 +54,7 @@ pub fn read() -> Settings {
         hub,
         hf_token: token(&var, std::env::home_dir()),
         profile: env.profile.filter(|n| *n > 0),
+        kernels: env.kernels,
     }
 }
 

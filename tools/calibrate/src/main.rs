@@ -150,6 +150,7 @@ fn main() -> ExitCode {
         Some("bench") => marks(&settings, &args[1..]),
         Some("probe") => probe(&settings),
         Some("plans") => plans(&settings),
+        Some("watch") => sensai_calibrate::watch::watch(&settings, &args[1..]),
         Some("guided") => guided::report(
             &settings,
             args.get(1)

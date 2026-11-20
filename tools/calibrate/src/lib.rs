@@ -5,6 +5,7 @@ mod grid;
 pub mod guided;
 pub mod plans;
 pub mod probe;
+pub mod watch;
 
 // Linking the crates registers their rules.
 use sensai_rules as _;

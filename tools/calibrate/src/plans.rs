@@ -23,10 +23,10 @@ const NEW: usize = 32;
 const CONTEXT: usize = 128;
 
 /// A model at a few layers, with random weights.
-struct Subject {
-    name: &'static str,
-    graph: Graph,
-    pins: Pins,
+pub(crate) struct Subject {
+    pub(crate) name: &'static str,
+    pub(crate) graph: Graph,
+    pub(crate) pins: Pins,
 }
 
 /// Checks that missed. The run reports them and fails.
@@ -38,7 +38,7 @@ fn qwen3_config(max_context: u64) -> decoder::Config {
     c
 }
 
-fn subjects() -> [Subject; 2] {
+pub(crate) fn subjects() -> [Subject; 2] {
     let mut c = eg2::Config::release(1, 1024);
     (c.stack.layers, c.stack.vocab) = (6, 16_384);
     [
@@ -59,7 +59,7 @@ fn subjects() -> [Subject; 2] {
 type Sizes = [(DimName, u64); 4];
 
 /// One sequence's launch of `rows`, reaching back `context`.
-fn sizes(rows: u64, context: u64) -> Sizes {
+pub(crate) fn sizes(rows: u64, context: u64) -> Sizes {
     [(Seqs, 1), (Rows, rows), (Context, context), (Segments, 1)]
 }
 
@@ -70,6 +70,29 @@ struct Timed {
     steps: Vec<f64>,
     /// Seconds for the plan, its output read back.
     whole: f64,
+}
+
+/// Noise for each input of `g`, with empty slots.
+pub(crate) fn feeds(
+    g: &Graph,
+    at: &[(DimName, u64)],
+    noise: &mut Noise,
+) -> Result<Vec<Tensor>, Error> {
+    let ports = g.entries[0].inputs.iter();
+    let fed = ports.map(|p| {
+        let unsized_shape = || {
+            Error::from(sensai_lower::Error::from(sensai_lower::Size::Shape(
+                p.ty.shape.clone(),
+            )))
+        };
+        let t = fill(g, &p.ty, at, noise).ok_or_else(unsized_shape)?;
+        // One sequence: noise slots would read past its rows.
+        Ok(match p.role {
+            Role::Slots => Tensor::zeros(t.shape.clone(), t.dtype()),
+            _ => t,
+        })
+    });
+    fed.collect()
 }
 
 /// A runner with weights loaded, and its device.
@@ -105,25 +128,6 @@ impl<'a> Bench<'a> {
             device,
             learned: 0,
         })
-    }
-
-    fn feeds(&self, at: &Sizes, noise: &mut Noise) -> Result<Vec<Tensor>, Error> {
-        let g = &self.s.graph;
-        let ports = g.entries[0].inputs.iter();
-        let fed = ports.map(|p| {
-            let unsized_shape = || {
-                Error::from(sensai_lower::Error::from(sensai_lower::Size::Shape(
-                    p.ty.shape.clone(),
-                )))
-            };
-            let t = fill(g, &p.ty, at, noise).ok_or_else(unsized_shape)?;
-            // One sequence: noise slots would read past its rows.
-            Ok(match p.role {
-                Role::Slots => Tensor::zeros(t.shape.clone(), t.dtype()),
-                _ => t,
-            })
-        });
-        fed.collect()
     }
 
     /// Runs `rows` as planned for `device`, and times each launch.
@@ -257,7 +261,7 @@ fn launches(
     misses: &mut Misses,
 ) -> Result<(), Error> {
     for at in at {
-        let fed = b.feeds(at, noise)?;
+        let fed = feeds(&b.s.graph, at, noise)?;
         let feeds: Vec<View> = fed.iter().map(Tensor::view).collect();
         b.learn(at, &feeds)?;
         let device = b.device.clone();

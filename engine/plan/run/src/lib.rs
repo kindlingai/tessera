@@ -7,6 +7,10 @@ mod held;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
+#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
+mod overrides;
+#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+mod overrides_test;
 mod profile;
 mod rank;
 mod run;
@@ -16,7 +20,7 @@ pub use held::Held;
 pub use loopback::Loopback;
 pub use profile::{Profile, Spent};
 pub use rank::Rank;
-pub use run::{Base, Run};
+pub use run::{Base, Outcome, Reload, Run};
 
 /// A failure while loading or running a plan.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +56,8 @@ pub enum Error {
     Zones,
     #[error("a fixed kernel on this runner")]
     FixedKernel,
+    #[error("kernel file {0}: {1}")]
+    KernelFile(std::path::PathBuf, std::io::Error),
     #[error("weight {weight} does not fit {form}")]
     WeightSize { weight: u32, form: &'static str },
     #[error("weight {0} has the wrong length")]
@@ -134,15 +140,15 @@ pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     match settings.gpu() {
         #[cfg(target_os = "macos")]
         Some(Backend::Metal) => Ok(Box::new(
-            device::Runner::<sensai_gpukit::metal::Context>::new(plan, settings.memory)?,
+            device::Runner::<sensai_gpukit::metal::Context>::new(plan, settings)?,
         )),
         #[cfg(feature = "cuda")]
         Some(Backend::Cuda) => Ok(Box::new(
-            device::Runner::<sensai_gpukit::cuda::Context>::new(plan, settings.memory)?,
+            device::Runner::<sensai_gpukit::cuda::Context>::new(plan, settings)?,
         )),
         #[cfg(feature = "rocm")]
         Some(Backend::Rocm) => Ok(Box::new(
-            device::Runner::<sensai_gpukit::rocm::Context>::new(plan, settings.memory)?,
+            device::Runner::<sensai_gpukit::rocm::Context>::new(plan, settings)?,
         )),
         _ => Ok(Box::new(cpu::Runner::new(
             plan,

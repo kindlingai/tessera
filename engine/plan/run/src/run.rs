@@ -11,7 +11,9 @@ use sensai_lower::form::{F32_FORM, Load};
 use sensai_lower::{Arg, Launch, Launching, Loaded, Plan, Shape, Share, Slot, Weight};
 use sensai_mem::{Tensor, View, copy};
 use std::collections::HashMap;
+use std::fmt;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// State every runner keeps: a plan, its buffers and sizes.
@@ -87,6 +89,35 @@ pub(crate) fn line(count: usize) -> (usize, usize) {
     (count.div_ceil(threads), threads)
 }
 
+/// The effect of a kernel file's last change.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// Its kernel runs in place of the planned one.
+    Loaded,
+    /// The planned kernel runs again.
+    Planned,
+    /// It did not compile. The kernel before it still runs.
+    Failed(String),
+}
+
+/// A kernel file whose change altered what runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reload {
+    pub path: PathBuf,
+    pub outcome: Outcome,
+}
+
+impl fmt::Display for Reload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = self.path.display();
+        match &self.outcome {
+            Outcome::Loaded => write!(f, "{path}: loaded"),
+            Outcome::Planned => write!(f, "{path}: planned kernel"),
+            Outcome::Failed(why) => write!(f, "{path}: {why}"),
+        }
+    }
+}
+
 /// A plan with its buffers allocated and kernels compiled.
 pub trait Run {
     fn base(&self) -> &Base;
@@ -108,6 +139,14 @@ pub trait Run {
     }
     /// Runs these steps in order and waits for them.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error>;
+    /// Rereads kernel files that changed. Returns what changed.
+    fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
+        Ok(Vec::new())
+    }
+    /// Writes each planned kernel's text where no file holds it.
+    fn dump(&self) -> Result<Vec<PathBuf>, Error> {
+        Ok(Vec::new())
+    }
     /// Runs these steps as `submit` does, timed by the device.
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
         self.submit(steps).map(|_| None)
