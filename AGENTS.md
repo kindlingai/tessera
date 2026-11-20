@@ -35,8 +35,11 @@ tagging @mmastrac.
 While implementing your feature, analyze the code you are working on, code it
 interacts with and other related code for:
 
- - opportunities to simplify and refactor to reduce the overall code volume.
- - any hardcoded constants, sites, model names, etc in the code where there shouldn't be. Is there anywhere we have accidentally tied the code to a specific model where it should be generic (ie: hoisting names into recipes).
+ - opportunities to simplify and refactor to reduce the overall code volume. Can code
+   be combined or migrated to macros?
+ - any hardcoded constants, sites, model names, etc in the code where there shouldn't
+   be. Is there anywhere we have accidentally tied the code to a specific model where it
+   should be generic?
 
 Tag @mmastrac with any of these or other self-improvement ideas in any PR.
 
