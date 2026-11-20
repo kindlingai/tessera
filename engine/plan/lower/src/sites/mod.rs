@@ -40,8 +40,8 @@ pub struct Region {
     pub kept: Vec<Appended>,
     /// Per rotated input: its place, then `suh` and `svh`.
     pub parts: Vec<(usize, [T; 2])>,
-    /// Sums across ranks inside it.
-    pub sums: usize,
+    /// Elements of each sum across ranks inside it, in order.
+    pub sums: Vec<usize>,
 }
 
 /// Kept rows a region appends to, as `Read::Kept` names them.
@@ -59,7 +59,7 @@ pub struct Appended {
 impl Pattern for Region {
     fn find(tree: &Tree, at: T) -> Option<Self> {
         // Sums stay with the engine.
-        Self::of(tree, at, None).filter(|r| r.sums == 0)
+        Self::of(tree, at, None).filter(|r| r.sums.is_empty())
     }
 }
 
@@ -86,11 +86,11 @@ impl Region {
         if !outputs.iter().all(|o| inside.contains(o)) {
             return None;
         }
-        let (mut kept, mut parts, mut sums) = (Vec::new(), Vec::new(), 0);
+        let (mut kept, mut parts, mut sums) = (Vec::new(), Vec::new(), Vec::new());
         for n in inside {
             let node = tree.node(n);
             if node.term == Term::Stage(Step::AllReduce) {
-                sums += 1;
+                sums.push(tree.elements(n));
             }
             for a in &node.args {
                 if !tree.leaf(*a) || inputs.contains(a) {

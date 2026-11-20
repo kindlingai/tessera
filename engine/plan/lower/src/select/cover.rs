@@ -2,6 +2,7 @@
 
 use crate::abi::Source;
 use crate::cost::Device;
+use crate::form::F32_FORM;
 use crate::kernels::{AllReduce, Scatter, Widen};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
@@ -238,7 +239,8 @@ impl Cover<'_> {
     /// Seconds for one draft. A module's sum costs the engine's.
     fn seconds(&self, zone: u32, d: &Draft) -> Option<f64> {
         if d.kernel.name() == AllReduce::NAME {
-            return self.device.all_reduce(d.len * 4);
+            let form = d.writes.map_or(F32_FORM, |w| self.tree.node(w).form);
+            return self.device.all_reduce(form.bytes(d.len));
         }
         Some(self.device.seconds_in(zone, &*d.kernel, d.len))
     }

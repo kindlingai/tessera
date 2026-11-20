@@ -256,13 +256,13 @@ fn module_region_wins() {
     on_gpus(&g, rule);
 }
 
-/// A layer writes `a = x w` and `silu(a) * a`.
+/// A layer returns `silu(a) * a`, then `a = x w`.
 fn layer() -> Graph {
     let (m, w, x) = traced::<Layer>(64, 32);
-    let [a, y] = m.composite(Composite::Layer, || {
+    let [y, a] = m.composite(Composite::Layer, || {
         let a = x.matmul(&w.w);
         let [y] = m.composite(Composite::Mlp, || [a.act(Act::Silu).mul(&a)]);
-        [a, y]
+        [y, a]
     });
     m.finish([(Role::Logits, &y.add(&a))])
 }
@@ -270,7 +270,9 @@ fn layer() -> Graph {
 #[test]
 fn module_layer_wins() {
     let g = layer();
-    let rule = load("layer", json!([matmul(), act(json!({"draft": 0}), 32)]));
+    let mut offers = [matmul(), act(json!({"draft": 0}), 32)];
+    (offers[0]["writes"], offers[1]["writes"]) = (json!(1), json!(0));
+    let rule = load("layer", json!(offers));
     let plan = lower(&g, 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
     assert_eq!(&rules(&plan)[..2], ["wasm_layer", "wasm_layer"]);
     // The add after it reads both outputs.
@@ -592,6 +594,7 @@ fn module_speaks_guest() {
         shape: site::Shape::Line(128),
         work: 8192.0,
         guess: 1e-15,
+        writes: None,
     };
     let bytes = module(&json!(manifest), &json!([offer]), "");
     let rule = sensai_wasm::load(&bytes).unwrap()[0];

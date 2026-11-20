@@ -1,6 +1,6 @@
 //! Sites for the module, and its offers as drafts.
 
-use crate::abi::{Count, Entry, Input, Kept, Kind, Place, Site};
+use crate::abi::{Count, Entry, Input, Kept, Kind, Offer, Place, Site};
 use crate::text::{Fixed, Text};
 use sensai_graph::{Composite, DimName, PathSeg};
 use sensai_lower::kernels::AllReduce;
@@ -14,8 +14,8 @@ pub(crate) struct Reads {
     pub parts: Vec<(usize, [T; 2])>,
     /// Region outputs. The last offers write them.
     pub outputs: Vec<T>,
-    /// All-reduces the offers must place.
-    pub sums: usize,
+    /// Elements of each all-reduce the offers must place.
+    pub sums: Vec<usize>,
 }
 
 impl Reads {
@@ -56,7 +56,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         inputs,
         outputs,
         kept,
-        sums: reads.sums,
+        sums: reads.sums.clone(),
     };
     Some((site, reads))
 }
@@ -74,7 +74,7 @@ fn matmul(tree: &Tree, at: T) -> Option<(Site, Reads)> {
         kept: Vec::new(),
         parts: Vec::new(),
         outputs: Vec::new(),
-        sums: 0,
+        sums: Vec::new(),
     };
     m.picked.is_none().then_some((site, reads))
 }
@@ -141,7 +141,7 @@ fn arg(tree: &Tree, nodes: &[T], count: Count) -> Option<Arg> {
     Some(Arg::size(extent))
 }
 
-/// Drafts for the entries. `None` on unknown names.
+/// The entries as drafts. `None` if they do not fit.
 pub(crate) fn drafts(
     entries: Vec<Entry>,
     kernels: &'static [Fixed],
@@ -149,53 +149,78 @@ pub(crate) fn drafts(
     from: &Reads,
 ) -> Option<Vec<Draft>> {
     let mut drafts: Vec<Draft> = Vec::with_capacity(entries.len());
-    let mut sums = 0;
+    let (mut sums, mut written) = (0, vec![None; from.outputs.len()]);
     for entry in entries {
-        let offer = match entry {
-            Entry::Launch(offer) => offer,
+        let (draft, writes) = match entry {
+            Entry::Launch(offer) => (
+                launch(&offer, kernels, tree, from, drafts.len())?,
+                offer.writes,
+            ),
             Entry::Sum(sum) => {
                 let len = drafts.get(sum.all_reduce)?.len;
-                let read = [Read::Draft(sum.all_reduce)];
-                drafts.push(Draft::new(AllReduce { len }, read, len));
+                // Ranks pair sums by order, so each length must match.
+                if from.sums.get(sums) != Some(&len) {
+                    return None;
+                }
                 sums += 1;
-                continue;
+                let read = [Read::Draft(sum.all_reduce)];
+                (Draft::new(AllReduce { len }, read, len), sum.writes)
             }
         };
-        let fixed = kernels.iter().find(|k| k.name == offer.kernel)?;
-        let mut reads = Vec::with_capacity(offer.reads.len());
-        let mut kept = None;
-        for place in &offer.reads {
-            reads.push(match *place {
-                Place::Read(i) => Read::Node(*from.nodes.get(i)?),
-                Place::Draft { draft } if draft < drafts.len() => Read::Draft(draft),
-                Place::Draft { .. } => return None,
-                Place::Part { part: [i, 0] } => Read::Node(*from.nodes.get(i)?),
-                Place::Part { part: [i, p] } => Read::Node(*from.scales(i)?.get(p - 1)?),
-                Place::Kept { kept: i } => {
-                    let k = from.kept.get(i)?;
-                    kept = Some(*k);
-                    Read::Kept(k.index)
-                }
-            });
+        if let Some(o) = writes
+            && written.get_mut(o)?.replace(drafts.len()).is_some()
+        {
+            return None;
         }
-        let mut args = Vec::with_capacity(offer.counts.len());
-        for count in &offer.counts {
-            args.push(arg(tree, &from.nodes, *count)?);
-        }
-        let mut text = Text::new(fixed, &offer, args);
-        text.kept = kept.map(|k| {
-            let values = tree.kept.values(k.slots, k.context);
-            let values = values.into_iter().map(|v| Arg::count(v as usize));
-            (tree.kept, values.collect())
-        });
-        drafts.push(Draft::new(text, reads, offer.len));
+        drafts.push(draft);
     }
-    if sums != from.sums {
+    if sums != from.sums.len() {
         return None;
     }
-    let first = drafts.len().checked_sub(from.outputs.len())?;
-    for (d, t) in drafts[first..].iter_mut().zip(&from.outputs) {
-        d.writes = Some(*t);
+    // One output defaults to the last entry.
+    if let [last @ None] = written.as_mut_slice() {
+        *last = drafts.len().checked_sub(1);
+    }
+    for (o, d) in written.into_iter().enumerate() {
+        drafts[d?].writes = Some(from.outputs[o]);
     }
     Some(drafts)
+}
+
+/// One offer's launch, after `made` earlier drafts.
+fn launch(
+    offer: &Offer,
+    kernels: &'static [Fixed],
+    tree: &Tree,
+    from: &Reads,
+    made: usize,
+) -> Option<Draft> {
+    let fixed = kernels.iter().find(|k| k.name == offer.kernel)?;
+    let mut reads = Vec::with_capacity(offer.reads.len());
+    let mut kept = None;
+    for place in &offer.reads {
+        reads.push(match *place {
+            Place::Read(i) => Read::Node(*from.nodes.get(i)?),
+            Place::Draft { draft } if draft < made => Read::Draft(draft),
+            Place::Draft { .. } => return None,
+            Place::Part { part: [i, 0] } => Read::Node(*from.nodes.get(i)?),
+            Place::Part { part: [i, p] } => Read::Node(*from.scales(i)?.get(p - 1)?),
+            Place::Kept { kept: i } => {
+                let k = from.kept.get(i)?;
+                kept = Some(*k);
+                Read::Kept(k.index)
+            }
+        });
+    }
+    let mut args = Vec::with_capacity(offer.counts.len());
+    for count in &offer.counts {
+        args.push(arg(tree, &from.nodes, *count)?);
+    }
+    let mut text = Text::new(fixed, offer, args);
+    text.kept = kept.map(|k| {
+        let values = tree.kept.values(k.slots, k.context);
+        let values = values.into_iter().map(|v| Arg::count(v as usize));
+        (tree.kept, values.collect())
+    });
+    Some(Draft::new(text, reads, offer.len))
 }

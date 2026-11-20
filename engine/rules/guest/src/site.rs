@@ -73,11 +73,11 @@ pub enum Site {
     Region {
         kind: Kind,
         inputs: Vec<Input>,
-        /// Elements per output. The last offers write them, in order.
+        /// Elements per output. Entries name the output they write.
         outputs: Vec<usize>,
         kept: Vec<Kept>,
-        /// Sums across ranks inside. Offers place as many all-reduces.
-        sums: usize,
+        /// Elements per sum across ranks, in order. Offers place each.
+        sums: Vec<usize>,
     },
 }
 
@@ -149,6 +149,8 @@ pub enum Entry {
     /// Sums an earlier draft across ranks. Later entries read it.
     AllReduce {
         all_reduce: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        writes: Option<usize>,
     },
 }
 
@@ -159,19 +161,24 @@ impl From<Offer> for Entry {
 }
 
 /// One launch. Its reads are all it depends on.
-#[derive(Debug, Serialize)]
-pub struct Offer {
-    pub kernel: &'static str,
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Offer<K = &'static str, C = Count> {
+    pub kernel: K,
     /// In kernel argument order.
     pub reads: Vec<Place>,
     /// Elements written.
     pub len: usize,
     /// u32 arguments after the output.
-    pub counts: Vec<Count>,
+    #[serde(default = "Vec::new")]
+    pub counts: Vec<C>,
     pub shape: Shape,
     /// Work units, and seconds per unit until measured.
     pub work: f64,
     pub guess: f64,
+    /// The region output it writes. Defaults to the last entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

@@ -70,22 +70,9 @@ pub(crate) enum Entry {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Sum {
     pub all_reduce: usize,
+    #[serde(default)]
+    pub writes: Option<usize>,
 }
 
-/// One launch. Its reads are all it depends on.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Offer {
-    pub kernel: String,
-    /// In kernel argument order.
-    pub reads: Vec<Place>,
-    /// Elements written.
-    pub len: usize,
-    /// u32 arguments after the output.
-    #[serde(default)]
-    pub counts: Vec<Count>,
-    pub shape: Shape,
-    /// Work units, and seconds per unit until measured.
-    pub work: f64,
-    pub guess: f64,
-}
+/// One launch, as the host reads it.
+pub(crate) type Offer = sensai_guest::site::Offer<String, Count>;
