@@ -36,10 +36,15 @@ fn picks(experts: usize) -> Option<u32> {
     }
 }
 
-/// The code width a trellis form names.
-fn bits(input: &Input) -> Option<u32> {
-    let k: u32 = input.form.strip_prefix("trellis_k")?.parse().ok()?;
-    (2..=4).contains(&k).then_some(k)
+/// A trellis form's width and codebook: 0 mcg, 1 mul1.
+fn bits(input: &Input) -> Option<[u32; 2]> {
+    let rest = input.form.strip_prefix("trellis_k")?;
+    let (k, book) = match rest.strip_suffix("_mul1") {
+        Some(k) => (k, 1),
+        None => (rest, 0),
+    };
+    let k: u32 = k.parse().ok()?;
+    (2..=4).contains(&k).then_some([k, book])
 }
 
 /// Whether `input` is the whole weight `field`.
@@ -48,8 +53,8 @@ fn named(input: &Input, field: &str) -> bool {
     path.ends_with(&format!(".{field}")) && input.share.is_none()
 }
 
-/// One width for all of `codes`.
-fn width(codes: &[&Input]) -> Option<u32> {
+/// One width and codebook for all of `codes`.
+fn width(codes: &[&Input]) -> Option<[u32; 2]> {
     let k = bits(codes.first()?)?;
     codes.iter().all(|c| bits(c) == Some(k)).then_some(k)
 }
@@ -91,10 +96,10 @@ fn offer(site: &Site) -> Option<Offer> {
     if !(plain && turned && fits && sized) {
         return None;
     }
-    let k = width(&[&routed[4], &routed[7], &routed[10]])?;
-    let shared_k = width(&shared.iter().collect::<Vec<_>>())?;
+    let [k, book] = width(&[&routed[4], &routed[7], &routed[10]])?;
+    let [shared_k, shared_book] = width(&shared.iter().collect::<Vec<_>>())?;
     let sizes = [rows, hidden, ffn, experts].map(|n| n as u32);
-    let counts = [picks(experts)?, k, shared_k];
+    let counts = [picks(experts)?, k, shared_k, book, shared_book];
     let whole = (0..=ROUTED.len()).map(Place::Read);
     let parts = (0..SHARED.len()).flat_map(|i| {
         (0..3).map(move |p| Place::Part {

@@ -40,9 +40,9 @@ fn rule() -> &'static Rule {
     module.rules[0]
 }
 
-/// Experts as the release stores them.
-fn pins() -> Pins {
-    let [codes, turned] = ["trellis_k4", "trellis_k4_rot"].map(|n| named(n).unwrap());
+/// Experts as the release stores them, in codebook `book`.
+fn pins(book: &str) -> Pins {
+    let [codes, turned] = ["", "_rot"].map(|end| named(&format!("trellis_k4{book}{end}")).unwrap());
     Pins::default()
         .pin("*moe*.gate", codes)
         .pin("*moe*.up", codes)
@@ -54,7 +54,7 @@ fn pins() -> Pins {
 fn choices() -> sensai_lower::Recipe {
     let mut lower = recipe().lower.unwrap();
     lower.rules.push(rule());
-    lower.pins = pins();
+    lower.pins = pins("");
     lower
 }
 
@@ -94,8 +94,8 @@ fn codes(shape: &[usize], form: &dyn Load, draws: &mut Noise) -> Vec<u8> {
 }
 
 /// Each weight as floats, and the pinned ones as stored.
-fn stored(g: &Graph, draws: &mut Noise) -> Vec<(Tensor, Option<Weight>)> {
-    let pins = pins();
+fn stored(g: &Graph, draws: &mut Noise, book: &str) -> Vec<(Tensor, Option<Weight>)> {
+    let pins = pins(book);
     let floats = weights(g, draws);
     let mut out = Vec::new();
     for (w, t) in g.weights.iter().zip(floats) {
@@ -120,12 +120,19 @@ fn parameters() -> usize {
 
 #[test]
 fn module_takes_routed() {
+    for (book, id) in [("", 0), ("_mul1", 1)] {
+        takes_routed(book, id);
+    }
+}
+
+/// Each routed block takes the kernel, codebook in its counts.
+fn takes_routed(book: &str, id: u32) {
     let c = small();
     let step = stepper::<RotatedMoe>(&c);
     // A compiler is assumed, so the CPU can plan.
     let mut device = Device::default()
         .adding(rule())
-        .pinned(pins())
+        .pinned(pins(book))
         .favoring(NAME);
     device.platform = Platform::assumed(Limits::assumed());
     let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
@@ -142,7 +149,7 @@ fn module_takes_routed() {
         assert_eq!(step.reads.len(), 23);
         assert_eq!(launch.args.len(), parameters());
         let counts: Vec<u32> = launch.args[24..].iter().filter_map(|a| a.u32()).collect();
-        assert_eq!(counts, [ROWS as u32, 128, 128, 32, 2, 4, 4]);
+        assert_eq!(counts, [ROWS as u32, 128, 128, 32, 2, 4, 4, id, id]);
     }
 }
 
@@ -184,9 +191,16 @@ fn module_reaches_engine() {
 /// On a CUDA GPU alone: the kernel is CUDA text.
 #[test]
 fn module_matches_interp() {
+    for book in ["", "_mul1"] {
+        matches_interp(book);
+    }
+}
+
+/// The kernel against the interpreter, with codes in codebook `book`.
+fn matches_interp(book: &str) {
     let g = block();
     let mut draws = Noise(7);
-    let stored = stored(&g, &mut draws);
+    let stored = stored(&g, &mut draws, book);
     let floats: Vec<Tensor> = stored.iter().map(|(t, _)| t.clone()).collect();
     let hidden = small().stack.hidden as usize;
     let noise = (0..ROWS * hidden).map(|_| draws.draw()).collect();
@@ -194,7 +208,7 @@ fn module_matches_interp() {
     let want = run(&g, &floats, 0, std::slice::from_ref(&x)).unwrap();
     let want = want[0].floats().unwrap();
     for settings in runs().iter().filter(|s| s.gpu() == Some(Backend::Cuda)) {
-        let device = Device::guess(settings).adding(rule()).pinned(pins());
+        let device = Device::guess(settings).adding(rule()).pinned(pins(book));
         let plan = lower(&g, 0, &[(Rows, ROWS as u64)], &device).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.rule).collect();
         assert_eq!(names, [NAME]);
@@ -209,7 +223,7 @@ fn module_matches_interp() {
         let got = got.floats().unwrap();
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let (off, cos) = (max_abs_diff(got, want) / scale, cosine_f32(got, want));
-        eprintln!("{}: off {off:e} cos {cos}", runner.device());
+        eprintln!("{}{book}: off {off:e} cos {cos}", runner.device());
         assert!(off < 1e-3 && cos > 0.9999, "off {off:e} cos {cos}");
     }
 }

@@ -16,6 +16,7 @@ typedef const unsigned char* bytes;
 #define HEAD 16
 #define INPUT_SIDE 2u
 #define MCG 0xCBAC1FEDu
+#define MUL1 0x83DCD12Du
 
 static __device__ inline u32 word(bytes p, u32 at) {
   return *(const u32*)(p + at);
@@ -50,8 +51,24 @@ static __device__ inline u32 window(bytes tile, u32 k, u32 s) {
   return (high << shift) | (word(tile, 4 * ((q + 1) % (8 * k))) >> (32 - shift));
 }
 
+// A state's weight in codebook `book`: 0 mcg, 1 mul1.
+static __device__ inline float value(u32 book, u32 state) {
+  float v;
+  if (book == 1) {
+    u32 x = (state & 0xFFFFu) * MUL1;
+    u32 sum = (x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + (x >> 24);
+    // Exact in f32: one rounding to f16.
+    v = rounded(5, 10, 65504.0f, (float)(1024u + sum) * half(0x1EEEu) + half(0xC931u));
+  } else {
+    u32 x = (state & 0xFFFFu) * MCG;
+    u32 y = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    v = rounded(5, 10, 65504.0f, half(y & 0xFFFFu) + half(y >> 16));
+  }
+  return rounded(4, 3, 448.0f, v);
+}
+
 // `T[at][row]` of the `k`-bit codes at `p`.
-static __device__ inline float weight(bytes p, u32 k, u32 row, u32 at) {
+static __device__ inline float weight(bytes p, u32 k, u32 book, u32 row, u32 at) {
   u32 inp = word(p, 0), out = word(p, 4);
   u32 col = at % out;
   u64 first = (u64)(at / out) * (inp / 16) * (out / 16);
@@ -64,10 +81,7 @@ static __device__ inline float weight(bytes p, u32 k, u32 row, u32 at) {
   // A state spans `span` codes ending at `j`.
   u32 span = (16 + k - 1) / k;
   u32 state = window(tile, k, ((j + 257 - span) % 256) * k + (span * k - 16)) >> 16;
-  u32 x = (state & 0xFFFFu) * MCG;
-  u32 y = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;
-  float v = rounded(5, 10, 65504.0f, half(y & 0xFFFFu) + half(y >> 16));
-  return rounded(4, 3, 448.0f, v);
+  return value(book, state);
 }
 
 // The Walsh-Hadamard transform of each 128 values of `v`.
@@ -94,11 +108,11 @@ static __device__ void enter(const float* x, const float* signs, const float* sc
 }
 
 // `to = turn(T from)`, `T` matrix `e` at `w`.
-static __device__ void product(bytes w, u32 k, u32 e, const float* from, float* to) {
+static __device__ void product(bytes w, u32 k, u32 book, u32 e, const float* from, float* to) {
   u32 inp = word(w, 0), out = word(w, 4);
   for (u32 o = threadIdx.x; o < out; o += blockDim.x) {
     float s = 0.0f;
-    for (u32 i = 0; i < inp; i++) s += weight(w, k, i, e * out + o) * from[i];
+    for (u32 i = 0; i < inp; i++) s += weight(w, k, book, i, e * out + o) * from[i];
     to[o] = s;
   }
   __syncthreads();
@@ -110,16 +124,16 @@ struct Expert {
   bytes gate, up, down;
   const float *gate_su, *up_su, *down_su;
   const float *gate_sv, *up_sv;
-  u32 k, e;
+  u32 k, book, e;
 };
 
 // `a = down(silu(gate(x)) * up(x))`, before the last scale.
 static __device__ void apply(const Expert& w, const float* x, const float* signs,
     u32 hidden, u32 ffn, float* a, float* g, float* u) {
   enter(x, signs, w.gate_su, a, hidden);
-  product(w.gate, w.k, w.e, a, g);
+  product(w.gate, w.k, w.book, w.e, a, g);
   enter(x, signs, w.up_su, a, hidden);
-  product(w.up, w.k, w.e, a, u);
+  product(w.up, w.k, w.book, w.e, a, u);
   for (u32 o = threadIdx.x; o < ffn; o += blockDim.x) {
     float gate = g[o] * w.gate_sv[o] * TURNED;
     float inner = gate / (1.0f + expf(-gate)) * (u[o] * w.up_sv[o] * TURNED);
@@ -127,7 +141,7 @@ static __device__ void apply(const Expert& w, const float* x, const float* signs
   }
   __syncthreads();
   turn(g, ffn);
-  product(w.down, w.k, w.e, g, a);
+  product(w.down, w.k, w.book, w.e, g, a);
 }
 
 // The best `picks` of `score + bias`. Ties take the lower.
@@ -161,7 +175,8 @@ extern "C" __global__ void glm53_moe(
     bytes shared_gate, const float* shared_gate_su, const float* shared_gate_sv,
     bytes shared_up, const float* shared_up_su, const float* shared_up_sv,
     bytes shared_down, const float* shared_down_su, const float* shared_down_sv,
-    float* y, u32 rows, u32 hidden, u32 ffn, u32 experts, u32 picks, u32 k, u32 shared_k) {
+    float* y, u32 rows, u32 hidden, u32 ffn, u32 experts, u32 picks, u32 k, u32 shared_k,
+    u32 book, u32 shared_book) {
   __shared__ float a[WIDE];
   __shared__ float g[NARROW];
   __shared__ float u[NARROW];
@@ -181,7 +196,7 @@ extern "C" __global__ void glm53_moe(
   __syncthreads();
   // The shared expert first: it reads the plain row.
   Expert all = {shared_gate, shared_up, shared_down, shared_gate_su, shared_up_su,
-      shared_down_su, shared_gate_sv, shared_up_sv, shared_k, 0};
+      shared_down_su, shared_gate_sv, shared_up_sv, shared_k, shared_book, 0};
   apply(all, h, 0, hidden, ffn, a, g, u);
   for (u32 o = threadIdx.x; o < hidden; o += blockDim.x) {
     out[o] = a[o] * shared_down_sv[o] * TURNED;
@@ -190,7 +205,7 @@ extern "C" __global__ void glm53_moe(
   for (u32 p = 0; p < picks; p++) {
     u32 e = ids[p];
     Expert one = {gate, up, down, gate_su + (u64)e * hidden, up_su + (u64)e * hidden,
-        down_su + (u64)e * ffn, gate_sv + (u64)e * ffn, up_sv + (u64)e * ffn, k, e};
+        down_su + (u64)e * ffn, gate_sv + (u64)e * ffn, up_sv + (u64)e * ffn, k, book, e};
     apply(one, h, signs_in, hidden, ffn, a, g, u);
     const float* sv = down_sv + (u64)e * hidden;
     for (u32 o = threadIdx.x; o < hidden; o += blockDim.x) {
