@@ -55,6 +55,8 @@ pub(crate) mod entry {
     pub(crate) type Capture = unsafe extern "C" fn(Handle, c_int) -> c_int;
     pub(crate) type EndCapture = unsafe extern "C" fn(Handle, *mut Handle) -> c_int;
     pub(crate) type Replay = unsafe extern "C" fn(Handle, Handle) -> c_int;
+    /// Milliseconds between two events.
+    pub(crate) type Elapsed = unsafe extern "C" fn(*mut f32, Handle, Handle) -> c_int;
 }
 
 /// What a handle to free is.
@@ -63,6 +65,7 @@ pub enum Kind {
     Exec,
     Graph,
     Stream,
+    Event,
 }
 
 /// One kernel launch.
@@ -145,6 +148,10 @@ pub trait Api: Sync + Sized + 'static {
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
+    /// A timing event, recorded on the default stream.
+    fn event(&self) -> Result<Handle, Error>;
+    /// Milliseconds from `from` to `to`, once both are done.
+    fn elapsed(&self, from: Handle, to: Handle) -> Result<f32, Error>;
     /// A loadable image of `source` for this device.
     fn compile(ctx: &Context<Self>, source: &str) -> Result<Vec<u8>, Error>;
 
@@ -199,6 +206,8 @@ struct Inner<A: Api> {
     modules: Mutex<HashMap<u64, Arc<Module<A>>>>,
     /// Held through a capture, and by every other device call.
     exclusive: Mutex<()>,
+    /// Events recorded since the last read, as addresses.
+    stamps: Mutex<Vec<usize>>,
 }
 
 // The driver is thread-safe. Calls set the device first.
@@ -224,6 +233,7 @@ impl<A: Api> Context<A> {
             name,
             modules: Mutex::new(HashMap::new()),
             exclusive: Mutex::new(()),
+            stamps: Mutex::new(Vec::new()),
         }))
     }
 
@@ -266,6 +276,30 @@ impl<A: Api> Context<A> {
     /// Waits for the default stream, where all plain work runs.
     pub fn synchronize(&self) -> Result<(), Error> {
         self.locked(|a| a.synchronize())
+    }
+
+    /// Records a timing event after the work queued so far.
+    pub fn stamp(&self) -> Result<(), Error> {
+        let event = self.locked(|a| a.event())?;
+        let mut stamps = self.0.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        stamps.push(event as usize);
+        Ok(())
+    }
+
+    /// Seconds between each pair of stamps. Waits, then forgets them.
+    pub fn stamps(&self) -> Result<Vec<f64>, Error> {
+        self.synchronize()?;
+        let taken = std::mem::take(&mut *self.0.stamps.lock().unwrap_or_else(|e| e.into_inner()));
+        let events: Vec<Handle> = taken.into_iter().map(|e| e as Handle).collect();
+        let gaps = self.locked(|a| {
+            let pairs = events.windows(2);
+            let ms: Result<Vec<f32>, Error> = pairs.map(|w| a.elapsed(w[0], w[1])).collect();
+            for e in &events {
+                a.destroy(Kind::Event, *e);
+            }
+            ms
+        })?;
+        Ok(gaps.into_iter().map(|ms| ms as f64 / 1e3).collect())
     }
 
     /// Runs `record` and keeps its launches as one graph.
@@ -480,6 +514,14 @@ impl<A: Api> Device for Context<A> {
         Ok(None)
     }
 
+    fn stamp(&self) -> Result<bool, Error> {
+        Context::stamp(self).map(|_| true)
+    }
+
+    fn stamps(&self) -> Result<Vec<f64>, Error> {
+        Context::stamps(self)
+    }
+
     fn programmatic(&self, on: bool) {
         A::programmatic(on);
     }
@@ -547,6 +589,7 @@ macro_rules! shared_api {
         end_capture: ($end:ident, $end_label:literal),
         replay: ($replay:ident, $replay_label:literal),
         unload: ($module:ident, $exec:ident, $graph:ident, $stream:ident),
+        events: ($event:ident, $record:ident, $elapsed:ident, $unevent:ident),
         load: ($load:ident, $load_label:literal),
         function: ($func:ident, $func_label:literal),
         alloc: ($alloc:ident, $alloc_label:literal),
@@ -617,6 +660,7 @@ macro_rules! shared_api {
                 $crate::api::Kind::Exec => self.$exec,
                 $crate::api::Kind::Graph => self.$graph,
                 $crate::api::Kind::Stream => self.$stream,
+                $crate::api::Kind::Event => self.$unevent,
             };
             unsafe { free(handle) };
         }
@@ -663,6 +707,24 @@ macro_rules! shared_api {
 
         fn zero(&self, ptr: u64, size: usize) -> Result<(), $crate::Error> {
             self.check(unsafe { (self.$zero)(ptr, 0, size) }, $zero_label)
+        }
+
+        fn event(&self) -> Result<$crate::api::Handle, $crate::Error> {
+            let event = self.out(stringify!($event), |e| unsafe { (self.$event)(e, 0) })?;
+            let code = unsafe { (self.$record)(event, ::std::ptr::null_mut()) };
+            self.check(code, stringify!($record))?;
+            Ok(event)
+        }
+
+        fn elapsed(
+            &self,
+            from: $crate::api::Handle,
+            to: $crate::api::Handle,
+        ) -> Result<f32, $crate::Error> {
+            let mut ms = 0.0;
+            let code = unsafe { (self.$elapsed)(&mut ms, from, to) };
+            self.check(code, stringify!($elapsed))?;
+            Ok(ms)
         }
     };
 }

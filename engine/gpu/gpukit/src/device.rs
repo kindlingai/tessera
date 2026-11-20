@@ -35,6 +35,16 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// Lets this thread's launches overlap the one before.
     fn programmatic(&self, _on: bool) {}
 
+    /// Records a timing stamp. False where the device keeps none.
+    fn stamp(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Seconds between each pair of stamps. Waits, then forgets them.
+    fn stamps(&self) -> Result<Vec<f64>, Error> {
+        Ok(Vec::new())
+    }
+
     /// The bytes at `ptr`, when the host addresses them.
     fn mapped(&self, _ptr: u64, _size: usize) -> Option<NonNull<u8>> {
         None

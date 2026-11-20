@@ -171,9 +171,12 @@ impl Run for Runner {
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
+            let start = Instant::now();
             for launch in self.base.launches(i)? {
                 self.launch(i, &launch)?;
             }
+            let name = self.base.plan.steps[i].kernel.name();
+            self.note(name, start.elapsed().as_secs_f64());
         }
         Ok(())
     }

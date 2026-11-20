@@ -148,6 +148,7 @@ impl Api for Runtime {
         end_capture: (hip_stream_end_capture, "hipStreamEndCapture"),
         replay: (hip_graph_launch, "hipGraphLaunch"),
         unload: (hip_module_unload, hip_graph_exec_destroy, hip_graph_destroy, hip_stream_destroy),
+        events: (hip_event_create, hip_event_record, hip_event_elapsed_time, hip_event_destroy),
         load: (hip_module_load_data, "hipModuleLoadData"),
         function: (hip_module_get_function, "hipModuleGetFunction"),
         alloc: (hip_malloc, "hipMalloc"),

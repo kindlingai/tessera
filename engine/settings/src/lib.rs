@@ -56,6 +56,8 @@ pub struct Settings {
     pub hub: Option<PathBuf>,
     /// The Hugging Face access token, for gated repositories.
     pub hf_token: Option<String>,
+    /// Launches per profile report. `None` times nothing.
+    pub profile: Option<u64>,
 }
 
 impl Default for Settings {
@@ -72,6 +74,7 @@ impl Default for Settings {
             memory: Memory::Device,
             hub: None,
             hf_token: None,
+            profile: None,
         }
     }
 }

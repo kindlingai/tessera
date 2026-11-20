@@ -146,6 +146,34 @@ fn answers_match(settings: &Settings) {
     );
 }
 
+/// Profiling names every step's kernel and every launch.
+#[test]
+fn profile_counts_launches() {
+    for settings in runs() {
+        let settings = Settings {
+            profile: Some(1000),
+            ..settings
+        };
+        let (g, weights, mut engine) = open(17, 1, &settings);
+        let prompt = [3u32, 9, 4];
+        let want = reference(&g, &weights, &prompt, 3);
+        let request = Request {
+            tokens: prompt.to_vec(),
+            max_tokens: 3,
+            ..Request::default()
+        };
+        assert_eq!(ids(&events(&mut engine, request)), want);
+        let profile = engine.take_profile().unwrap();
+        assert_eq!(profile.spent["engine: launch"].count, 3);
+        let kernels: f64 = engine
+            .kernels()
+            .keys()
+            .map(|k| profile.spent[*k].seconds)
+            .sum();
+        assert!(kernels > 0.0, "{}", engine.device());
+    }
+}
+
 #[test]
 fn rows_mix_slots() {
     // The interpreter keeps rows densely. Layouts and rules must agree.

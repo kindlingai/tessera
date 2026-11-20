@@ -17,6 +17,8 @@ struct Env {
     verbs: Option<String>,
     /// Bytes, maybe suffixed K, M, G or T, or `off`.
     memory: Option<String>,
+    /// Launches per profile report.
+    profile: Option<u64>,
 }
 
 /// Reads the `TESSERA_` variables. Bad values panic.
@@ -50,6 +52,7 @@ pub fn read() -> Settings {
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
         hub,
         hf_token: token(&var, std::env::home_dir()),
+        profile: env.profile.filter(|n| *n > 0),
     }
 }
 

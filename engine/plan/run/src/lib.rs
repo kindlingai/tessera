@@ -7,12 +7,14 @@ mod held;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
+mod profile;
 mod rank;
 mod run;
 pub mod testing;
 
 pub use held::Held;
 pub use loopback::Loopback;
+pub use profile::{Profile, Spent};
 pub use rank::Rank;
 pub use run::{Base, Run};
 

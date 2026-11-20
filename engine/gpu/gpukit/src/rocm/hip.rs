@@ -77,6 +77,10 @@ sensai_dl::library! {
         pub hip_graph_launch: entry::Replay = "hipGraphLaunch",
         pub hip_graph_exec_destroy: entry::OnHandle = "hipGraphExecDestroy",
         pub hip_graph_destroy: entry::OnHandle = "hipGraphDestroy",
+        pub hip_event_create: entry::Stream = "hipEventCreateWithFlags",
+        pub hip_event_record: entry::Replay = "hipEventRecord",
+        pub hip_event_elapsed_time: entry::Elapsed = "hipEventElapsedTime",
+        pub hip_event_destroy: entry::OnHandle = "hipEventDestroy",
         hip_get_error_name: HipGetErrorName = "hipGetErrorName",
         hip_get_error_string: HipGetErrorString = "hipGetErrorString",
     }

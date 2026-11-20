@@ -107,6 +107,34 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.fire(&self.kernels[step], launch.shape, &mut args)
     }
 
+    /// Times each step by device stamps, else by waiting.
+    fn profiled(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        let stamped = self.ctx.stamp()?;
+        let mut waited = Vec::new();
+        for i in steps.clone() {
+            let start = Instant::now();
+            for launch in self.base.launches(i)? {
+                self.launch(i, &launch)?;
+            }
+            match stamped {
+                true => _ = self.ctx.stamp()?,
+                false => {
+                    let clocked = self.ctx.finish()?;
+                    waited.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
+                }
+            }
+        }
+        let seconds = match stamped {
+            true => self.ctx.stamps()?,
+            false => waited,
+        };
+        for (i, s) in steps.zip(seconds) {
+            let name = self.base.plan.steps[i].kernel.name();
+            self.note(name, s);
+        }
+        Ok(())
+    }
+
     /// Every launch of `steps`, in order.
     fn launch_all(&self, steps: Range<usize>) -> Result<(), Error> {
         for i in steps {
@@ -235,6 +263,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     /// Launches every step, as a recorded graph when whole.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        if self.base.profile.is_some() {
+            return self.profiled(steps);
+        }
         let whole = self.launching.graphs
             && self.ctx.graphs()
             && self.base.plan.id != 0

@@ -107,6 +107,10 @@ sensai_dl::library! {
         pub(crate) cu_graph_launch: entry::Replay = "cuGraphLaunch",
         pub(crate) cu_graph_exec_destroy: entry::OnHandle = "cuGraphExecDestroy",
         pub(crate) cu_graph_destroy: entry::OnHandle = "cuGraphDestroy",
+        pub(crate) cu_event_create: entry::Stream = "cuEventCreate",
+        pub(crate) cu_event_record: entry::Replay = "cuEventRecord",
+        pub(crate) cu_event_elapsed_time: entry::Elapsed = "cuEventElapsedTime",
+        pub(crate) cu_event_destroy: entry::OnHandle = "cuEventDestroy_v2",
         cu_get_error_name: CuGetErrorName = "cuGetErrorName",
         cu_get_error_string: CuGetErrorString = "cuGetErrorString",
     }

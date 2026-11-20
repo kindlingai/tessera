@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::held::Held;
+use crate::profile::Profile;
 use sensai_codegen::Precision;
 use sensai_engine_settings::Memory;
 use sensai_gpukit::{Limits, Platform};
@@ -24,6 +25,8 @@ pub struct Base {
     launches: Vec<OnceLock<Vec<Launch>>>,
     /// Bytes a plan may hold. `None` checks nothing.
     pub(crate) budget: Option<u64>,
+    /// Seconds per step kernel, while profiling.
+    pub(crate) profile: Option<Profile>,
 }
 
 impl Base {
@@ -121,6 +124,20 @@ pub trait Run {
     }
     /// How to launch from now on, where the device can.
     fn launching(&mut self, _: Launching) {}
+    /// Starts or stops timing each step.
+    fn profiling(&mut self, on: bool) {
+        self.base_mut().profile = on.then(Profile::default);
+    }
+    /// The seconds gathered since the last take.
+    fn take_profile(&mut self) -> Option<Profile> {
+        self.base_mut().profile.as_mut().map(std::mem::take)
+    }
+    /// Adds `seconds` to `name`, while profiling.
+    fn note(&mut self, name: &str, seconds: f64) {
+        if let Some(p) = self.base_mut().profile.as_mut() {
+            p.add(name, seconds);
+        }
+    }
     /// Runs one step `times` over. Returns seconds per run.
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error>;
     /// The backend and the hardware it drives.

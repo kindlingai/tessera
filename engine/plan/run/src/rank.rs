@@ -10,6 +10,7 @@ use sensai_gpukit::Platform;
 use sensai_lower::{Arg, Launching, Plan, Shape, Step};
 use sensai_mem::{DType, Tensor};
 use std::ops::Range;
+use std::time::Instant;
 
 /// One rank: its runner and its way to the others.
 pub struct Rank<T: Transport> {
@@ -117,10 +118,12 @@ impl<T: Transport> Run for Rank<T> {
             let step = step.clone();
             self.runner.submit(from..i)?;
             from = i + 1;
+            let start = Instant::now();
             match self.reduce {
                 Some(_) => self.reduce(&step)?,
                 None => self.exchange(&step)?,
             }
+            self.note("all_reduce", start.elapsed().as_secs_f64());
         }
         self.runner.submit(from..steps.end)
     }

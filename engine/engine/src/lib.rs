@@ -9,6 +9,7 @@ use sensai_run::{Run, open};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
+use std::time::Instant;
 
 mod guide;
 mod kept;
@@ -113,6 +114,8 @@ pub struct Engine {
     sparse: bool,
     /// Carries rank 0's launches to the other ranks.
     control: Option<Box<dyn comm::Transport>>,
+    /// Launches per profile report, and launches since the last.
+    profile: Option<[u64; 2]>,
 }
 
 /// What a launch feeds before its picks.
@@ -226,6 +229,7 @@ impl Engine {
         let lanes = lanes.map(|(table, page)| lanes::Lanes::new(page, table.len, slots));
         let mut runner = run(plan)?;
         runner.launching(recipe.launch);
+        runner.profiling(settings.profile.is_some());
         let device = Device::stored(runner.platform(), settings)
             .map_err(sensai_lower::Error::from)?
             .with(recipe);
@@ -243,6 +247,7 @@ impl Engine {
             words,
             sparse,
             control: None,
+            profile: settings.profile.map(|every| [every, 0]),
         })
     }
 
@@ -367,6 +372,7 @@ impl Engine {
                 1
             }
         };
+        let start = Instant::now();
         let (plan, bound) = self.plans.upto(
             &self.graph,
             entry,
@@ -376,6 +382,7 @@ impl Engine {
         )?;
         let out = plan.outputs[0].slot;
         self.runner.replan(plan)?;
+        let planned = Instant::now();
         let table = plan.table.zip(self.lanes.as_mut());
         if let Some((table, bytes)) = table.and_then(|(t, l)| Some((t, l.changed()?))) {
             self.runner.held_mut().upload(table, &bytes)?;
@@ -383,10 +390,47 @@ impl Engine {
         self.runner.bind_all(&bound);
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
         self.runner.feed(&views)?;
+        let fed = Instant::now();
         self.runner.submit(0..self.runner.plan().steps.len())?;
+        let ran = Instant::now();
         let mut ids = self.runner.ids(out)?;
         ids.truncate(picks.len());
+        let phases = [
+            ("engine: plan", start, planned),
+            ("engine: feed", planned, fed),
+            ("engine: steps", fed, ran),
+            ("engine: ids", ran, Instant::now()),
+            ("engine: launch", start, Instant::now()),
+        ];
+        for (name, from, to) in phases {
+            self.runner.note(name, (to - from).as_secs_f64());
+        }
+        self.report();
         Ok(ids)
+    }
+
+    /// Seconds per kernel and phase since the last take.
+    pub fn take_profile(&mut self) -> Option<sensai_run::Profile> {
+        self.runner.take_profile()
+    }
+
+    /// Prints the profile once every so many launches.
+    fn report(&mut self) {
+        let Some([every, done]) = &mut self.profile else {
+            return;
+        };
+        *done += 1;
+        if *done < *every {
+            return;
+        }
+        let launches = std::mem::take(done);
+        let rank = self.runner.plan().rank;
+        if let Some(profile) = self.take_profile() {
+            eprintln!(
+                "profile of {launches} launches, rank {rank}:\n{}",
+                profile.report(launches)
+            );
+        }
     }
 
     /// Decodes greedily after `request.tokens`, one event per token.
