@@ -5,14 +5,14 @@ use sensai_kv::{Pool, Prefixes, RunId, Stats, Tag};
 
 const TAG: Tag = Tag(0);
 
-crate::metrics::registry!(KV = "kv");
-crate::metrics::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows the kept-row pool holds.");
-crate::metrics::metric!(ACTIVE in KV = Gauge "vllm:kv_active_tokens", "Rows in pages live answers hold.");
-crate::metrics::metric!(WORST in KV = Gauge "tessera:kv_worst_tokens", "Rows live answers may grow to.");
-crate::metrics::metric!(LIVE in KV = Gauge "tessera:kv_live_runs", "Answers that hold kept rows.");
-crate::metrics::metric!(RETAINED in KV = Gauge "tessera:kv_kept_runs", "Finished answers whose rows stay.");
-crate::metrics::metric!(HITS in KV = Counter "tessera:kv_hits_total", "Prompts that started on kept rows.");
-crate::metrics::metric!(MISSES in KV = Counter "tessera:kv_misses_total", "Prompts that started with no rows.");
+crate::registry!(KV = "kv");
+crate::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows the kept-row pool holds.");
+crate::metric!(ACTIVE in KV = Gauge "vllm:kv_active_tokens", "Rows in pages live answers hold.");
+crate::metric!(WORST in KV = Gauge "tessera:kv_worst_tokens", "Rows live answers may grow to.");
+crate::metric!(LIVE in KV = Gauge "tessera:kv_live_runs", "Answers that hold kept rows.");
+crate::metric!(RETAINED in KV = Gauge "tessera:kv_kept_runs", "Finished answers whose rows stay.");
+crate::metric!(HITS in KV = Counter "tessera:kv_hits_total", "Prompts that started on kept rows.");
+crate::metric!(MISSES in KV = Counter "tessera:kv_misses_total", "Prompts that started with no rows.");
 
 /// The kept rows' pool, and how prompts met it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

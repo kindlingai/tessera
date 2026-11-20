@@ -7,6 +7,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+sensai_engine::registry!(HTTP = "http");
+sensai_engine::metric!(OPEN in HTTP = Gauge "tessera:http_connections_open", "Connections open now.");
+sensai_engine::metric!(REFUSED in HTTP = Counter "tessera:http_refused_total", "Connections refused past the limit.");
+sensai_engine::metric!(REQUESTS in HTTP = Counter "tessera:http_requests_total", "Requests read and routed.");
+sensai_engine::metric!(MALFORMED in HTTP = Counter "tessera:http_malformed_total", "Requests refused before routing.");
+sensai_engine::metric!(CLIENT in HTTP = Counter "tessera:http_client_errors_total", "Responses with a 4xx status.");
+sensai_engine::metric!(SERVER in HTTP = Counter "tessera:http_server_errors_total", "Responses with a 5xx status.");
+
 /// A request as the routes see it.
 pub struct Request {
     pub method: String,
@@ -109,6 +117,7 @@ struct Held(Arc<AtomicUsize>);
 impl Drop for Held {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+        OPEN.sub(1);
     }
 }
 
@@ -131,7 +140,9 @@ where
             }
         };
         let held = Held(open.clone());
+        OPEN.add(1);
         if open.fetch_add(1, Ordering::Relaxed) >= limits.max_connections {
+            REFUSED.add(1);
             let _ = stream.set_write_timeout(Some(limits.write_timeout));
             let _ = head(&mut stream, 503, "text/plain", Some(0), true);
             continue;
@@ -153,11 +164,18 @@ fn connection(mut stream: TcpStream, limits: &Limits, route: &dyn Fn(&Request) -
             Ok(Some(read)) => read,
             Ok(None) | Err(Fail::Gone) => return,
             Err(Fail::Status(status)) => {
+                MALFORMED.add(1);
                 let _ = head(&mut stream, status, "text/plain", Some(0), true);
                 return;
             }
         };
         let response = route(&request);
+        REQUESTS.add(1);
+        match response.status {
+            400..=499 => CLIENT.add(1),
+            500..=599 => SERVER.add(1),
+            _ => {}
+        }
         if answer(&mut stream, response, close, limits).is_err() || close {
             return;
         }

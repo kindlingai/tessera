@@ -4,11 +4,11 @@ use crate::kept::{Kept, Totals};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
-crate::metrics::registry!(REQUESTS = "requests");
-crate::metrics::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
-crate::metrics::metric!(RUNNING in REQUESTS = Gauge "tessera:requests_running", "Answers that hold a slot.");
-crate::metrics::metric!(PROMPT in REQUESTS = Counter "tessera:prompt_tokens_total", "Prompt tokens of admitted answers.");
-crate::metrics::metric!(MADE in REQUESTS = Counter "tessera:generation_tokens_total", "Tokens the answers made.");
+crate::registry!(REQUESTS = "requests");
+crate::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
+crate::metric!(RUNNING in REQUESTS = Gauge "tessera:requests_running", "Answers that hold a slot.");
+crate::metric!(PROMPT in REQUESTS = Counter "tessera:prompt_tokens_total", "Prompt tokens of admitted answers.");
+crate::metric!(MADE in REQUESTS = Counter "tessera:generation_tokens_total", "Tokens the answers made.");
 
 /// Takes each event. `false` ends the answer early.
 pub type Sink = Box<dyn FnMut(Event) -> bool + Send>;

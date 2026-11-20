@@ -35,6 +35,10 @@ impl Metric {
         self.value.fetch_add(n, Relaxed);
     }
 
+    pub fn sub(&self, n: u64) {
+        self.value.fetch_sub(n, Relaxed);
+    }
+
     pub fn set(&self, n: u64) {
         self.value.store(n, Relaxed);
     }
@@ -101,6 +105,7 @@ pub fn text() -> String {
 }
 
 /// Declares a registry: `registry!(NAME = "name")`.
+#[macro_export]
 macro_rules! registry {
     ($(#[$doc:meta])* $vis:vis $name:ident = $label:literal) => {
         $crate::metrics::gather! {
@@ -123,6 +128,7 @@ macro_rules! registry {
 }
 
 /// Adds a metric: `metric!(NAME in REGISTRY = Gauge "name", "Help.")`.
+#[macro_export]
 macro_rules! metric {
     ($(#[$doc:meta])* $vis:vis $name:ident in $registry:ident = $kind:ident $metric:literal, $help:literal) => {
         $crate::metrics::scatter! {
@@ -133,5 +139,3 @@ macro_rules! metric {
         }
     };
 }
-
-pub(crate) use {metric, registry};

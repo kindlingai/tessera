@@ -1,7 +1,7 @@
 use crate::metrics::text;
 
-crate::metrics::registry!(TESTED = "tested");
-crate::metrics::metric!(SEEN in TESTED = Counter "tessera:test_seen_total", "Calls seen.");
+crate::registry!(TESTED = "tested");
+crate::metric!(SEEN in TESTED = Counter "tessera:test_seen_total", "Calls seen.");
 
 #[test]
 fn text_lists_registries() {

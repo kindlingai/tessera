@@ -52,4 +52,6 @@ fn metrics_text() {
     assert_eq!(status, 200);
     assert!(has("# TYPE vllm:kv_cache_size_tokens gauge"));
     assert!(has("# TYPE tessera:requests_running gauge"));
+    assert!(has("# TYPE tessera:http_connections_open gauge"));
+    assert!(has("# TYPE tessera:completion_requests_total counter"));
 }
