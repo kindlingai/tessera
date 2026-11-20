@@ -152,12 +152,22 @@ impl File {
 
     /// A tensor's bytes as stored.
     pub fn bytes(&self, name: &str) -> Result<Vec<u8>, Error> {
+        self.bytes_at(name, 0, None)
+    }
+
+    /// `len` bytes of a tensor from `from`, or the rest.
+    pub fn bytes_at(&self, name: &str, from: u64, len: Option<u64>) -> Result<Vec<u8>, Error> {
         let e = self
             .entries
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
         let [start, end] = e.data_offsets;
-        self.read(start, end)
+        let at = start + from;
+        let to = len.map_or(end, |n| at + n);
+        if to > end {
+            return Err(format(format_args!("{name}: bytes {from}.. past its end")));
+        }
+        self.read(at, to)
     }
 
     /// A tensor's values, widened to f32.

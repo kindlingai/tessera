@@ -30,6 +30,11 @@ impl Loopback {
         &*self.ranks[r]
     }
 
+    /// Rank `r` alone, to take bytes cut for it.
+    pub fn rank_mut(&mut self, r: usize) -> &mut dyn Run {
+        &mut *self.ranks[r]
+    }
+
     /// Every rank takes its slice of the whole weight.
     pub fn load(&mut self, weight: u32, data: View) -> Result<(), Error> {
         for r in &mut self.ranks {

@@ -247,6 +247,11 @@ impl Engine {
         Ok(())
     }
 
+    /// This rank's first-axis rows of weight `at`, if split.
+    pub fn rows(&self, at: u32) -> Option<(usize, usize)> {
+        self.runner.plan().rows(at)
+    }
+
     /// Uploads weight `at` of the graph.
     pub fn load_weight(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
         Ok(self.runner.load_weight(at, w)?)

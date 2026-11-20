@@ -75,8 +75,22 @@ pub fn shards(spec: &Spec) {
     for settings in runs() {
         let mut ranks = Loopback::open(&plans, &settings).unwrap();
         for (at, w) in weights.iter().enumerate() {
-            let packed = Weight::Packed(BF16_FORM, BF16_FORM.pack(w.floats().unwrap()));
-            ranks.load_weight(at as u32, &packed).unwrap();
+            let bytes = BF16_FORM.pack(w.floats().unwrap());
+            let at = at as u32;
+            // Sets load as each rank's rows, cut before the runner.
+            if sharded.weights[at as usize].ty.rank() != 3 {
+                ranks
+                    .load_weight(at, &Weight::Packed(BF16_FORM, bytes))
+                    .unwrap();
+                continue;
+            }
+            for (r, plan) in plans.iter().enumerate() {
+                let (first, count) = plan.rows(at).expect("a set splits by matrix");
+                let stride = bytes.len() / w.view().shape()[0];
+                let cut = bytes[first * stride..(first + count) * stride].to_vec();
+                let cut = Weight::Packed(BF16_FORM, cut);
+                ranks.rank_mut(r).load_weight(at, &cut).unwrap();
+            }
         }
         let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
         let got = ranks.run(&feeds).unwrap();

@@ -74,4 +74,9 @@ pub trait Offer {
         let _ = rows;
         Err(Error::DType(format!("{name} is not read by rows")))
     }
+    /// A rank's rows of a packed slice, or the whole.
+    fn packed_share(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
+        let _ = rows;
+        self.packed(name)
+    }
 }

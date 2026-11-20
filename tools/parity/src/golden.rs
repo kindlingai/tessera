@@ -155,7 +155,7 @@ pub fn pulled(model: &str, g: &Graph, offer: &dyn Offer) -> Vec<Tensor> {
         let axis = |e: &sensai_graph::DimExpr| e.value(&g.dims, &|_| None).unwrap() as usize;
         g.weights[at].ty.shape.0.iter().map(axis).collect()
     };
-    sensai_bundle::each(g, offer, &[&rules], |w, _| {
+    sensai_bundle::each(g, offer, &[&rules], &|_| None, |w, _| {
         let shape = shape(out.len());
         out.push(match w {
             Weight::Floats(t) => t,

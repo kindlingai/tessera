@@ -246,5 +246,12 @@ fn glm_experts() {
         .packed(&format!("{at}experts.down.weight"), None)
         .unwrap();
     assert_eq!(down, trellis::packed(128, 128, trellis::INPUT_SIDE, &set));
+    // A rank's experts, read alone, match its share.
+    let name = format!("{at}experts.down.weight");
+    let second = release.packed_share(&name, (1, 1)).unwrap();
+    let k3 = trellis::form_for(3).unwrap();
+    assert_eq!(Some(second), k3.share(&down, [1, 2, 128 * 128], [1, 1]));
+    // The shared expert is not a set: it reads whole.
+    assert_eq!(release.packed_share(&gate, (0, 64)).unwrap(), file);
     std::fs::remove_dir_all(dir).unwrap();
 }

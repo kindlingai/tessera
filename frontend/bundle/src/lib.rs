@@ -81,6 +81,15 @@ impl Weights {
     /// Each weight in graph order, one held at a time.
     pub fn each<E: Into<Box<dyn Error + Send + Sync>>>(
         &self,
+        take: impl FnMut(u32, &Weight) -> Result<(), E>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.each_rows(|_| None, take)
+    }
+
+    /// As `each`. Streams read only the kept `rows`.
+    pub fn each_rows<E: Into<Box<dyn Error + Send + Sync>>>(
+        &self,
+        rows: impl Fn(u32) -> Option<(usize, usize)>,
         mut take: impl FnMut(u32, &Weight) -> Result<(), E>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         match self {
@@ -90,7 +99,9 @@ impl Weights {
                 }
                 Ok(())
             }
-            Weights::Streamed(release) => release.each(|at, w| take(at, &w).map_err(Into::into)),
+            Weights::Streamed(release) => {
+                release.each(&rows, |at, w| take(at, &w).map_err(Into::into))
+            }
         }
     }
 }
@@ -115,7 +126,7 @@ pub fn pull(
 ) -> Result<(Vec<Weight>, Pins), Box<dyn Error + Send + Sync>> {
     let mut weights = Vec::with_capacity(graph.weights.len());
     let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(graph.weights.len());
-    each(graph, offer, rules, |weight, form| {
+    each(graph, offer, rules, &|_| None, |weight, form| {
         weights.push(weight);
         forms.push(form);
         Ok(())
@@ -155,16 +166,17 @@ fn form(stored: Stored, set: bool) -> Result<&'static dyn Load, Box<dyn Error + 
     }
 }
 
-/// Each weight in graph order, read one at a time.
+/// Each weight in graph order, cut to `rows` where possible.
 pub fn each(
     graph: &Graph,
     offer: &dyn Offer,
     rules: &[&[Rule]],
+    rows: &dyn Fn(u32) -> Option<(usize, usize)>,
     mut take: impl FnMut(Weight, &'static dyn Load) -> Result<(), Box<dyn Error + Send + Sync>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let slices = offer.slices();
     let claims = names::resolve(graph, &slices, rules)?;
-    for (c, w) in claims.iter().zip(&graph.weights) {
+    for (at, (c, w)) in claims.iter().zip(&graph.weights).enumerate() {
         let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
         let axis = |e: &sensai_engine::DimExpr| e.value(&graph.dims, &|_| None).map(|n| n as usize);
         let shape: Option<Vec<usize>> = w.ty.shape.0.iter().map(axis).collect();
@@ -172,7 +184,10 @@ pub fn each(
         let weight = match (slice.stored, c.rows) {
             _ if !c.parts.is_empty() => stacked(offer, slice.stored, &c.parts, shape)?,
             (Stored::Form(_), Some(rows)) => Weight::Packed(f, offer.packed_rows(&c.name, rows)?),
-            (Stored::Form(_), None) => Weight::Packed(f, offer.packed(&c.name)?),
+            (Stored::Form(_), None) => match rows(at as u32) {
+                Some(keep) => Weight::Packed(f, offer.packed_share(&c.name, keep)?),
+                None => Weight::Packed(f, offer.packed(&c.name)?),
+            },
             (Stored::Bf16, _) => halves(offer, slice, c.rows)?,
             _ => floats(offer, slice, c.rows, shape)?,
         };

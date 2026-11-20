@@ -257,8 +257,13 @@ impl Release {
         self
     }
 
-    /// An expert's packed codes, from its layer's width file.
-    fn expert_codes(&self, layer: usize, local: &str) -> Result<Vec<u8>, Error> {
+    /// Packed expert codes. `set` keeps a range of routed experts.
+    fn expert_codes(
+        &self,
+        layer: usize,
+        local: &str,
+        set: Option<(usize, usize)>,
+    ) -> Result<Vec<u8>, Error> {
         let k = self.width;
         let sizes = self.with(&experts::index_file(layer), |f| {
             experts::sizes(f, k).ok_or_else(|| Error::Missing(local.into()))
@@ -267,7 +272,9 @@ impl Release {
         let width = if shared { experts::shared_width(k) } else { k };
         let [hidden, _, ffn] = sizes;
         let file = experts::codes_file(layer, width);
-        let mut bytes = self.with(&file, |f| experts::packed(f, local, [hidden, ffn]))?;
+        let set = set.filter(|_| !shared);
+        let read = |f: &File| experts::packed(f, local, [hidden, ffn], width, set);
+        let mut bytes = self.with(&file, read)?;
         // The shared expert is a rotated file: its rotations follow.
         if let Some(stem) = local.strip_suffix(".weight").filter(|_| shared) {
             let index = experts::index_file(layer);
@@ -318,7 +325,7 @@ impl Release {
     /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
     pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
         if let Some((layer, local)) = experts::split(name).filter(|_| self.glm) {
-            return self.expert_codes(layer, local);
+            return self.expert_codes(layer, local, rows);
         }
         let (file, local) = self.place(name);
         let matrix = local
@@ -531,6 +538,12 @@ impl Offer for Release {
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         Release::packed(self, name, Some(rows))
     }
+
+    /// Routed experts are cut. Other matrices are read whole.
+    fn packed_share(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
+        let routed = experts::split(name).is_some_and(|(_, l)| l.starts_with("experts."));
+        Release::packed(self, name, (routed && self.glm).then_some(rows))
+    }
 }
 
 /// GLM's routed and shared experts at one trellis width.
@@ -667,11 +680,13 @@ mod experts {
         }
     }
 
-    /// A set or shared matrix as packed trellis codes.
+    /// A set or shared matrix as `k`-bit trellis codes.
     pub(crate) fn packed(
         codes: &File,
         local: &str,
         [hidden, ffn]: [usize; 2],
+        k: u32,
+        set: Option<(usize, usize)>,
     ) -> Result<Vec<u8>, Error> {
         let missing = || Error::Missing(local.into());
         let (tensor, p) = match local.strip_prefix("shared_experts.") {
@@ -685,7 +700,13 @@ mod experts {
             true => format!("shared.trellis.{p}"),
             false => format!("trellis.{p}"),
         };
-        let entries = codes.bytes(&name)?;
+        let entries = match set {
+            None => codes.bytes(&name)?,
+            Some((first, count)) => {
+                let matrix = (hidden * ffn * k as usize / 8) as u64;
+                codes.bytes_at(&name, first as u64 * matrix, Some(count as u64 * matrix))?
+            }
+        };
         Ok(match p {
             "down" => trellis::packed(ffn, hidden, trellis::INPUT_SIDE, &entries),
             _ => trellis::packed(hidden, ffn, 1, &entries),

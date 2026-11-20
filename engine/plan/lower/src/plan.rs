@@ -152,6 +152,13 @@ impl Plan {
         IDS.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// This rank's first-axis rows of `weight`, if split there.
+    pub fn rows(&self, weight: u32) -> Option<(usize, usize)> {
+        let l = self.weights.iter().find(|l| l.weight == weight)?;
+        let share = l.share.filter(|s| s.axis == 0 && l.part.is_none())?;
+        Some((share.first, share.count))
+    }
+
     /// The weakest order any of its kernels sums in.
     pub fn order(&self) -> Order {
         let orders = self.steps.iter().map(|s| s.kernel.order());

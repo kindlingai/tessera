@@ -162,7 +162,11 @@ pub trait Run {
         }
         // A file stored whole loads into other forms decoded.
         let whole = form.split(bytes).is_some();
-        let part = match loaded.first().and_then(|l| l.share) {
+        // Bytes a reader already cut fill the slot.
+        let cut = loaded
+            .first()
+            .is_some_and(|l| form.bytes(l.slot.len) == bytes.len());
+        let part = match loaded.first().and_then(|l| l.share).filter(|_| !cut) {
             None => None,
             Some(share) => match share.of(*form, bytes) {
                 Some(part) => Some(part),

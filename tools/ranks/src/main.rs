@@ -250,8 +250,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("rank {}: on {}, sums {sums}", args.rank, rank.device());
     let start = Instant::now();
-    // Each rank cuts its part from the packed bytes.
-    let loading = weights.each(|at, w| rank.load_weight(at, w));
+    let count = g.weights.len() as u32;
+    let rows: Vec<_> = (0..count).map(|at| rank.plan().rows(at)).collect();
+    let rows = |at: u32| rows[at as usize];
+    let loading = weights.each_rows(rows, |at, w| rank.load_weight(at, w));
     loading.map_err(|e| e.to_string())?;
     eprintln!(
         "rank {}: loaded in {:.1} s",
