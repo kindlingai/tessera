@@ -49,9 +49,13 @@ fn measure(
     if device.platform != runner.platform() {
         *device = device.clone().on(runner.platform());
     }
-    // The same pins, or the weights would load again.
-    let pins = device.pins.clone();
-    let guess = || Device::guess(settings).pinned(pins.clone());
+    // Same pins and platform: weights stay, device kernels compete.
+    let (pins, platform) = (device.pins.clone(), runner.platform());
+    let guess = || {
+        Device::guess(settings)
+            .on(platform.clone())
+            .pinned(pins.clone())
+    };
     let mut added = Vec::new();
     for choice in choices((g, entry), sizes, &guess)? {
         let plan = lower(g, entry, sizes, &choice)?;

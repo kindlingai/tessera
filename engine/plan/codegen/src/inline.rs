@@ -351,6 +351,8 @@ impl Rename<'_> {
                 b_at,
                 stride,
                 depth,
+                parts,
+                apart,
             } => Stmt::TileBlock {
                 acc: self.name(acc),
                 a: self.expr(a),
@@ -359,6 +361,8 @@ impl Rename<'_> {
                 b_at: self.expr(b_at),
                 stride: self.expr(stride),
                 depth: *depth,
+                parts: *parts,
+                apart: self.expr(apart),
             },
             Stmt::TileEach { acc, body } => Stmt::TileEach {
                 acc: self.name(acc),

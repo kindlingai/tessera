@@ -443,6 +443,8 @@ pub unsafe extern "C" fn tiles_block(
     b_at: *const Lanes<u32>,
     stride: *const Lanes<u32>,
     depth: usize,
+    parts: usize,
+    apart: *const Lanes<u32>,
     mask: *const Lanes<bool>,
     n: usize,
     precision: *const Precision,
@@ -453,6 +455,9 @@ pub unsafe extern "C" fn tiles_block(
             std::slice::from_raw_parts(a, a_len),
             std::slice::from_raw_parts(b, b_len),
         );
-        (*t).block(a, &*a_at, b, &*b_at, &*stride, depth, &*mask, n, *precision);
+        let parts = (parts, &*apart);
+        (*t).block(
+            a, &*a_at, b, &*b_at, &*stride, depth, parts, &*mask, n, *precision,
+        );
     }
 }

@@ -6,24 +6,29 @@ use tessera_kernels as _;
 use std::path::Path;
 use std::process::Command;
 use tessera_gpukit::platform::{backend_of, rows};
-use tessera_linear::{Product, SCHEDULES, Tiled};
+use tessera_linear::{PARTS, Product, SCHEDULES, Schedule, Tiled};
 use tessera_lower::sites::After;
 use tessera_lower::{Dialect, Kernel, Source};
 use tessera_testkit::scratch;
 
 /// The tiled kernel's text and entry name.
-fn tiled_text(dialect: Dialect) -> (String, String) {
+fn tiled_text(dialect: Dialect, (schedule, parts): (Schedule, u32)) -> (String, String) {
+    let form = match parts {
+        0 => tessera_lower::form::F32_FORM,
+        _ => tessera_lower::form::BF16_FORM,
+    };
     let tiled = Tiled {
         product: Product {
             m: 64,
             n: 64,
             k: 64,
-            form: tessera_lower::form::F32_FORM,
+            form,
             after: After::default(),
             picked: None,
             near: None,
         },
-        schedule: SCHEDULES[0],
+        schedule,
+        parts,
     };
     let Source::Made(body) = tiled.source() else {
         panic!("tiled is generated");
@@ -81,9 +86,11 @@ fn toolkits_agree() {
     };
     let dir = scratch("platforms");
     std::fs::create_dir_all(&dir).unwrap();
-    let (cuda, _) = tiled_text(Dialect::Cuda);
-    let (metal, entry) = tiled_text(Dialect::Metal);
+    let (cuda, _) = tiled_text(Dialect::Cuda, (SCHEDULES[0], 0));
+    let (parts, _) = tiled_text(Dialect::Cuda, (PARTS[1], 3));
+    let (metal, entry) = tiled_text(Dialect::Metal, (SCHEDULES[0], 0));
     std::fs::write(dir.join("tiled.cu"), cuda).unwrap();
+    std::fs::write(dir.join("parts.cu"), parts).unwrap();
     std::fs::write(dir.join("probe.cpp"), hip_probe()).unwrap();
     std::fs::write(dir.join("tiled.metal"), metal).unwrap();
     std::fs::write(dir.join("tiled.mtlp-json"), pipeline_script(&entry)).unwrap();
@@ -94,7 +101,10 @@ fn toolkits_agree() {
         }
         for target in &row.check {
             match backend.as_str() {
-                "cuda" => check_cuda(&row.tile, row.pdl, target, &dir),
+                "cuda" => {
+                    check_cuda(&row.tile, row.pdl, target, &dir);
+                    check_parts(row.bf16_tile.is_some(), target, &dir);
+                }
                 "rocm" => check_rocm(&row.tile, target, &dir),
                 "metal" => check_metal(&row.tile, target, &dir),
                 other => panic!("no toolkit check for {other}"),
@@ -134,6 +144,22 @@ fn check_cuda(tile: &Option<[usize; 3]>, pdl: bool, target: &str, dir: &Path) {
         ptx.contains("griddepcontrol.wait"),
         pdl,
         "{target}: dependent launch"
+    );
+}
+
+/// nvcc builds the bf16 parts text where listed.
+fn check_parts(listed: bool, target: &str, dir: &Path) {
+    if !listed {
+        return;
+    }
+    let arch = format!("-arch={target}");
+    let args = [&arch, "-cubin", "-o", "parts.cubin", "parts.cu"];
+    let (built, log) = run("nvcc", &args, dir);
+    assert!(built, "{target}: {log}");
+    let (_, sass) = run("cuobjdump", &["-sass", "parts.cubin"], dir);
+    assert!(
+        sass.contains("HMMA.16816"),
+        "{target}: no 16x8x16 bf16 tile"
     );
 }
 

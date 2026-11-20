@@ -22,6 +22,9 @@ fn table_resolves() {
     assert_eq!(tile("metal applegpu_g15p"), Some([8, 8, 8]));
     assert_eq!(tile("metal apple9"), Some([8, 8, 8]));
     assert!(row_for("cuda sm_90").is_some_and(|r| r.pdl));
+    let bf16 = |id: &str| row_for(id).and_then(|r| r.bf16_tile);
+    assert_eq!(bf16("cuda sm_121"), Some([16, 8, 16]));
+    assert_eq!(bf16("rocm gfx11_5"), None);
     assert!(row_for("cuda sm_89").is_some_and(|r| !r.pdl));
     for row in rows() {
         assert!(!row.matches.is_empty(), "{row:?}");

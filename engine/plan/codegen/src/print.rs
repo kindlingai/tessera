@@ -264,6 +264,43 @@ impl<'a> Printer<'a> {
         format!("{name}({})", args.join(", "))
     }
 
+    /// A tile block from bf16 pairs, lowest part first.
+    fn parts(
+        &mut self,
+        acc: &str,
+        [a, b, stride, apart]: [&str; 4],
+        (tm, tn): (&str, &str),
+        parts: usize,
+        depth: usize,
+    ) {
+        self.line("#pragma unroll".into());
+        self.line(format!("for (u32 kk = 0; kk < {}; kk += 8) {{", depth / 2));
+        self.line(format!("    u32 tb[{tn}][2];"));
+        self.line("    #pragma unroll".into());
+        self.line(format!("    for (u32 j = 0; j < {tn}; j += 2) {{"));
+        self.line(format!(
+            "        tile_ldm_b(tb[j], tb[j + 1], {b} + (j * TILE_N + (lane / 16) * 8 + lane % 8) * ({stride}) + kk + ((lane / 8) % 2) * 4);"
+        ));
+        self.line("    }".into());
+        self.line("    #pragma unroll".into());
+        self.line(format!("    for (int p = {}; p >= 0; p--) {{", parts - 1));
+        self.line("        #pragma unroll".into());
+        self.line(format!("        for (u32 i = 0; i < {tm}; i++) {{"));
+        self.line("            u32 ta[4];".into());
+        self.line(format!(
+            "            tile_ldm_a(ta, {a} + p * ({apart}) + (i * TILE_M + lane % 8 + ((lane / 8) % 2) * 8) * ({stride}) + kk + (lane / 16) * 4);"
+        ));
+        self.line("            #pragma unroll".into());
+        self.line(format!("            for (u32 j = 0; j < {tn}; j++) {{"));
+        self.line(format!(
+            "                tile_mma_bf16({acc}_t[i][j], ta, tb[j]);"
+        ));
+        self.line("            }".into());
+        self.line("        }".into());
+        self.line("    }".into());
+        self.line("}".into());
+    }
+
     fn block(&mut self, stmts: &[Stmt]) {
         self.scope.push(HashMap::new());
         self.indent += 1;
@@ -429,6 +466,8 @@ impl<'a> Printer<'a> {
                 b_at,
                 stride,
                 depth,
+                parts,
+                apart,
             } => {
                 let Kind::Tiles(rows, cols) = self.kind(acc) else {
                     panic!("`{acc}` is not a tile block");
@@ -444,32 +483,37 @@ impl<'a> Printer<'a> {
                 self.line(format!("        TILE_ZERO({acc}_t[i][j]);"));
                 self.line("    }".into());
                 self.line("}".into());
-                self.line("#pragma unroll".into());
-                self.line(format!("for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"));
-                self.line(format!("    tile_a ta[{tm}];"));
-                self.line(format!("    tile_b tb[{tn}];"));
-                self.line("    #pragma unroll".into());
-                self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
-                self.line(format!(
-                    "        TILE_LOAD_A(ta[i], {a} + i * TILE_M * ({stride}) + kk, {stride});"
-                ));
-                self.line("    }".into());
-                self.line("    #pragma unroll".into());
-                self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
-                self.line(format!(
-                    "        TILE_LOAD_B(tb[j], {b} + j * TILE_N * ({stride}) + kk, {stride});"
-                ));
-                self.line("    }".into());
-                self.line("    #pragma unroll".into());
-                self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
-                self.line("        #pragma unroll".into());
-                self.line(format!("        for (u32 j = 0; j < {tn}; j++) {{"));
-                self.line(format!(
-                    "            TILE_MMA({acc}_t[i][j], ta[i], tb[j]);"
-                ));
-                self.line("        }".into());
-                self.line("    }".into());
-                self.line("}".into());
+                if *parts > 0 {
+                    let apart = self.expr(apart);
+                    self.parts(acc, [&a, &b, &stride, &apart], (&tm, &tn), *parts, *depth);
+                } else {
+                    self.line("#pragma unroll".into());
+                    self.line(format!("for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"));
+                    self.line(format!("    tile_a ta[{tm}];"));
+                    self.line(format!("    tile_b tb[{tn}];"));
+                    self.line("    #pragma unroll".into());
+                    self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+                    self.line(format!(
+                        "        TILE_LOAD_A(ta[i], {a} + i * TILE_M * ({stride}) + kk, {stride});"
+                    ));
+                    self.line("    }".into());
+                    self.line("    #pragma unroll".into());
+                    self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
+                    self.line(format!(
+                        "        TILE_LOAD_B(tb[j], {b} + j * TILE_N * ({stride}) + kk, {stride});"
+                    ));
+                    self.line("    }".into());
+                    self.line("    #pragma unroll".into());
+                    self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
+                    self.line("        #pragma unroll".into());
+                    self.line(format!("        for (u32 j = 0; j < {tn}; j++) {{"));
+                    self.line(format!(
+                        "            TILE_MMA({acc}_t[i][j], ta[i], tb[j]);"
+                    ));
+                    self.line("        }".into());
+                    self.line("    }".into());
+                    self.line("}".into());
+                }
                 // The unit's sums truncate, so blocks add up in floats.
                 self.line("#pragma unroll".into());
                 self.line(format!("for (u32 i = 0; i < {tm}; i++) {{"));

@@ -15,6 +15,9 @@ pub struct Row {
     /// The matrix unit's tile: rows, columns, depth. None: no unit.
     #[serde(default)]
     pub tile: Option<[usize; 3]>,
+    /// The unit's bf16 tile with f32 sums, if any.
+    #[serde(default)]
+    pub bf16_tile: Option<[usize; 3]>,
     /// Whether a launch may overlap the one before it.
     #[serde(default)]
     pub pdl: bool,
@@ -101,12 +104,17 @@ impl Platform {
 
     /// The host, whose executor plays a small matrix unit.
     pub fn host(limits: Limits) -> Self {
-        Self {
+        let mut host = Self {
             backend: "host".into(),
             arch: "cpu".into(),
             memory: host_memory(),
             ..Self::assumed(limits)
+        };
+        // The executor also reads bf16 parts.
+        if let Some(row) = host.row.as_mut() {
+            row.bf16_tile = Some([16, 8, 16]);
         }
+        host
     }
 
     /// A device not asked yet, with `limits` and a unit.
@@ -136,6 +144,11 @@ impl Platform {
     /// The matrix unit's tile, if the table lists one.
     pub fn tile(&self) -> Option<[usize; 3]> {
         self.row.as_ref()?.tile
+    }
+
+    /// The bf16 tile, if the table lists one.
+    pub fn bf16_tile(&self) -> Option<[usize; 3]> {
+        self.row.as_ref()?.bf16_tile
     }
 }
 

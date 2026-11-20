@@ -18,7 +18,7 @@ typedef simdgroup_float8x8 tile_b;
 
 ";
 
-/// CUDA: tf32 `mma.sync`, split three ways to keep f32.
+/// CUDA: tf32 `mma.sync` in three parts, and bf16 helpers.
 const CUDA: &str = "#define TILE_M 16
 #define TILE_N 8
 #define TILE_K 8
@@ -52,6 +52,22 @@ __device__ __forceinline__ void tile_one(tile_acc &c, const u32 *a, const u32 *b
 #define TILE_LOAD_A(f, p, s) tile_load_a(f, p, s, lane)
 #define TILE_LOAD_B(f, p, s) tile_load_b(f, p, s, lane)
 #define TILE_MMA(c, a, b) do { tile_one(c, (a).lo, (b).hi); tile_one(c, (a).hi, (b).lo); tile_one(c, (a).hi, (b).hi); } while (0)
+__device__ __forceinline__ void tile_ldm_a(u32 *r, const u32 *p) {
+    u32 at = (u32)__cvta_generic_to_shared(p);
+    asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\"
+                 : \"=r\"(r[0]), \"=r\"(r[1]), \"=r\"(r[2]), \"=r\"(r[3]) : \"r\"(at));
+}
+__device__ __forceinline__ void tile_ldm_b(u32 *b0, u32 *b1, const u32 *p) {
+    u32 r[4];
+    tile_ldm_a(r, p);
+    b0[0] = r[0]; b0[1] = r[1]; b1[0] = r[2]; b1[1] = r[3];
+}
+__device__ __forceinline__ void tile_mma_bf16(tile_acc &c, const u32 *a, const u32 *b) {
+    asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 \"
+                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"
+                 : \"+f\"(c.v[0]), \"+f\"(c.v[1]), \"+f\"(c.v[2]), \"+f\"(c.v[3])
+                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b[0]), \"r\"(b[1]));
+}
 #define TILE_COUNT 4
 #define TILE_ROW(e) ((lane / 4) + ((e) / 2) * 8)
 #define TILE_COL(e) ((lane % 4) * 2 + ((e) % 2))

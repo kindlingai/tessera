@@ -1,6 +1,6 @@
 //! Runs a body on the host, each group in lockstep.
 
-use crate::lockstep::products;
+use crate::lockstep::Slabs;
 use std::collections::HashMap;
 use tessera_codegen::form::Load;
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
@@ -45,6 +45,14 @@ impl Val {
             Val::L(x) => x as f32,
             Val::B(b) => b as u32 as f32,
             Val::V(_) => panic!("a float4 where a scalar was due"),
+        }
+    }
+
+    /// A float's bits, or a word as stored.
+    fn bits(self) -> u32 {
+        match self {
+            Val::F(x) => x.to_bits(),
+            other => other.u(),
         }
     }
 
@@ -562,15 +570,18 @@ impl Group<'_, '_> {
                 b_at,
                 stride,
                 depth,
+                parts,
+                apart,
             } => {
                 let (rows, cols, _) = self.tile_shape(acc);
                 let (Expr::Var(a), Expr::Var(b)) = (a, b) else {
                     panic!("tiles multiply group memory by name");
                 };
-                let (a_at, b_at, stride) = (
+                let (a_at, b_at, stride, apart) = (
                     self.eval(a_at, mask),
                     self.eval(b_at, mask),
                     self.eval(stride, mask),
+                    self.eval(apart, mask),
                 );
                 let simds = n.div_ceil(self.lanes);
                 for s in 0..simds {
@@ -580,20 +591,18 @@ impl Group<'_, '_> {
                     else {
                         continue;
                     };
-                    let (a0, b0, ld) = (
-                        a_at[t].u() as usize,
-                        b_at[t].u() as usize,
-                        stride[t].u() as usize,
-                    );
+                    let at = Slabs {
+                        a: a_at[t].u() as usize,
+                        b: b_at[t].u() as usize,
+                        stride: stride[t].u() as usize,
+                        parts: *parts,
+                        apart: apart[t].u() as usize,
+                    };
                     let (sa, sb) = (&self.shared[a], &self.shared[b]);
                     let mut block =
                         std::mem::take(&mut self.tiles.get_mut(acc).expect("tile sums").2[s]);
-                    let (p, ra, rb) = (
-                        self.precision,
-                        |i: usize| sa[a0 + i].f(),
-                        |i: usize| sb[b0 + i].f(),
-                    );
-                    products(p, rows, cols, ld, *depth, ra, rb, &mut block);
+                    let (ra, rb) = (|i: usize| sa[i].bits(), |i: usize| sb[i].bits());
+                    at.products(self.precision, rows, cols, *depth, ra, rb, &mut block);
                     self.tiles.get_mut(acc).expect("tile sums").2[s] = block;
                 }
             }

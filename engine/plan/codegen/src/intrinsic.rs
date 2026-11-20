@@ -271,16 +271,24 @@ macro_rules! table {
             }
             /// `p.word(offset)`: the u32 at a byte offset.
             Word = method word(self, u32) -> u32 {
-                device: define("f_u32(p)", "(*(device const u32 *)(p))", "(*(const u32 *)(p))"),
-                text: |p, args| format!("f_u32(({} + {}))", p.expr(&args[0]), p.expr(&args[1])),
+                device: define(
+                    "f_word(p, o)",
+                    "(*(device const u32 *)((device const u8 *)(p) + (o)))",
+                    "(*(const u32 *)((const u8 *)(p) + (o)))",
+                ),
+                text: |p, args| p.spell("f_word", args),
                 wgsl: None,
                 host: |g, args, mask| g.read(args, mask, 4),
                 count: |_, _| false,
             }
             /// `p.half(offset)`: the u16 at a byte offset.
             Half = method half(self, u32) -> u32 {
-                device: define("f_u16(p)", "(*(device const u16 *)(p))", "(*(const u16 *)(p))"),
-                text: |p, args| format!("f_u16(({} + {}))", p.expr(&args[0]), p.expr(&args[1])),
+                device: define(
+                    "f_half(p, o)",
+                    "(*(device const u16 *)((device const u8 *)(p) + (o)))",
+                    "(*(const u16 *)((const u8 *)(p) + (o)))",
+                ),
+                text: |p, args| p.spell("f_half", args),
                 wgsl: None,
                 host: |g, args, mask| g.read(args, mask, 2),
                 count: |_, _| false,

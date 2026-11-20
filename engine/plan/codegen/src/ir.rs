@@ -257,6 +257,10 @@ pub enum Stmt {
         b_at: Expr,
         stride: Expr,
         depth: usize,
+        /// Zero: f32. Else bf16 pairs, A in `parts` slabs.
+        parts: usize,
+        /// Words between A's slabs.
+        apart: Expr,
     },
     /// Runs `body` per sum this lane holds: `r`, `c`, `v`.
     TileEach {

@@ -11,20 +11,25 @@ mod common;
 use common::{linear, noise, terms};
 use tessera_gpukit::platform::{Asked, Platform};
 use tessera_graph::F16;
-use tessera_linear::{SCHEDULES, Schedule};
+use tessera_linear::{PARTS, SCHEDULES, Schedule};
 use tessera_lower::form::{BF16_FORM, LOADS, named};
 use tessera_lower::{Device, Dialect, Pins, Settings, Source, Weight, lower, select};
 use tessera_run::open;
 use tessera_run::testing::{emulations, host, runs};
 use tessera_testkit::{Noise, cosine_f32, max_abs_diff};
 
-/// A device that can only choose schedule `at`.
-fn only(at: usize, settings: &Settings) -> Device {
-    let others = SCHEDULES.iter().enumerate().filter(|(i, _)| *i != at);
-    let bar = |d: Device, (_, s): (usize, &Schedule)| {
-        LOADS.iter().fold(d, |d, f| d.without(f.suffixed(s.name)))
-    };
-    others.fold(Device::guess(settings).favoring("tiled"), bar)
+/// A device on `platform` that can only choose schedule `name`.
+fn only(name: &str, settings: &Settings, platform: &Platform) -> Device {
+    let others = SCHEDULES.iter().chain(&PARTS).filter(|s| s.name != name);
+    let bar = |d: Device, s: &Schedule| LOADS.iter().fold(d, |d, f| d.without(f.suffixed(s.name)));
+    let device = Device::guess(settings).on(platform.clone());
+    others.fold(device.favoring("tiled"), bar)
+}
+
+/// The platform a runner for `settings` reports.
+fn platform(settings: &Settings) -> Platform {
+    let plan = lower(&linear(4, 4), 0, &[(Rows, 1)], &Device::guess(settings)).unwrap();
+    open(plan, settings).unwrap().platform()
 }
 
 /// Calibrate reads the ways to time each schedule.
@@ -61,6 +66,7 @@ fn tiles_match_cpu() {
         (256, 512, 1024),
     ];
     let runs = emulations();
+    let platforms: Vec<Platform> = runs.iter().map(platform).collect();
     for (m, n, k) in sizes {
         let g = linear(k, n);
         let x = noise(vec![m as usize, k as usize], &mut draws);
@@ -70,14 +76,21 @@ fn tiles_match_cpu() {
             let rounded = form.roundtrip(w.floats().unwrap());
             let weights = [Tensor::f32(w.shape.clone(), rounded)];
             let want = run(&g, &weights, 0, std::slice::from_ref(&x)).unwrap();
-            for ((at, schedule), settings) in SCHEDULES.iter().enumerate().zip(runs.iter().cycle())
-            {
+            // bf16 weights also multiply from parts.
+            let parts = PARTS.iter().filter(|_| form.name() == BF16_FORM.name());
+            let cases = || runs.iter().zip(&platforms).cycle();
+            let listed = SCHEDULES.iter().zip(cases()).chain(parts.zip(cases()));
+            for (schedule, (settings, platform)) in listed {
+                let is_parts = PARTS.contains(schedule);
+                if is_parts && platform.bf16_tile().is_none() {
+                    continue;
+                }
                 // The host skips the largest size and the timing.
                 let host = settings.gpu().is_none();
                 if host && (m, n, k) == sizes[sizes.len() - 1] {
                     continue;
                 }
-                let device = only(at, settings).pinned(Pins::all(form));
+                let device = only(schedule.name, settings, platform).pinned(Pins::all(form));
                 let plan = lower(&g, 0, &[(Rows, m)], &device).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
                 let name = form.suffixed(schedule.name);

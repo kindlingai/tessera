@@ -64,7 +64,7 @@ const NAMES: &[(&str, &str, &str)] = &[
     (
         "f_group(ty, name, n)",
         "threadgroup ty name[n]",
-        "__shared__ ty name[n]",
+        "__shared__ __align__(16) ty name[n]",
     ),
     (
         "f_u32x2(p)",

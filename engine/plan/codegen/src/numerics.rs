@@ -80,6 +80,15 @@ impl Precision {
         if self.truncates { 2.0 * unit } else { unit }
     }
 
+    /// The unit on bf16 parts: exact products, 16 a sum.
+    pub fn parts(self) -> Self {
+        Self {
+            operand: Operand::F32,
+            depth: 16,
+            ..self
+        }
+    }
+
     /// `x` in the tile's form: `(hi, lo)` pieces.
     pub fn split(&self, x: f32) -> (f32, f32) {
         match self.operand {

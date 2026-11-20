@@ -286,6 +286,22 @@ impl Tiles {
         device()
     }
 
+    /// The same from bf16 pairs, `a` in `parts` slabs.
+    #[allow(clippy::too_many_arguments, reason = "mirrors the tile statement")]
+    pub fn parts(
+        &mut self,
+        _: &Shared<u32>,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: &Shared<u32>,
+        _: u32,
+        _: u32,
+        _: u32,
+    ) {
+        device()
+    }
+
     /// Calls `f` per sum this lane holds: row, column, value.
     pub fn each(&self, _: impl FnMut(u32, u32, f32)) {
         device()

@@ -582,6 +582,34 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
                 b_at: #b_at,
                 stride: #stride,
                 depth: (#depth_expr) as usize,
+                parts: 0,
+                apart: Expr::Int(0),
+            }))
+        }
+        Expr::MethodCall(m) if m.method == "parts" => {
+            let acc = named(&m.receiver)?;
+            let args: Vec<Tokens> = m
+                .args
+                .iter()
+                .map(|a| expr(a, ctx))
+                .collect::<Result<_, _>>()?;
+            let [a, a_at, apart, _, b, b_at, stride, _] = args.as_slice() else {
+                return Err(Error::new(
+                    m.span(),
+                    "`acc.parts(a, a_at, apart, parts, b, b_at, stride, depth)`",
+                ));
+            };
+            let (parts, depth) = (&m.args[3], &m.args[7]);
+            Ok(quote!(Stmt::TileBlock {
+                acc: #acc.into(),
+                a: #a,
+                a_at: #a_at,
+                b: #b,
+                b_at: #b_at,
+                stride: #stride,
+                depth: (#depth) as usize,
+                parts: (#parts) as usize,
+                apart: #apart,
             }))
         }
         Expr::MethodCall(m) if m.method == "zero" => {

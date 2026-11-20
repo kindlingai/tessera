@@ -605,6 +605,8 @@ impl Lowerer<'_, '_> {
                 b_at,
                 stride,
                 depth,
+                parts,
+                apart,
             } => {
                 let tiles = self.tiles_of(acc)?;
                 let (a, a_len) = self.shared_of(a)?;
@@ -612,7 +614,9 @@ impl Lowerer<'_, '_> {
                 let a_at = self.lane_array(a_at, Ty::U32)?;
                 let b_at = self.lane_array(b_at, Ty::U32)?;
                 let stride = self.lane_array(stride, Ty::U32)?;
+                let apart = self.lane_array(apart, Ty::U32)?;
                 let depth = self.iconst(self.ptr, *depth as i64);
+                let parts = self.iconst(self.ptr, *parts as i64);
                 let args = [
                     tiles,
                     a,
@@ -623,6 +627,8 @@ impl Lowerer<'_, '_> {
                     self.slot_addr(b_at),
                     self.slot_addr(stride),
                     depth,
+                    parts,
+                    self.slot_addr(apart),
                     self.slot_addr(mask),
                     self.n,
                     self.precision,

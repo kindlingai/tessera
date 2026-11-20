@@ -75,6 +75,8 @@ pub struct Needs {
     pub lacks: &'static [&'static str],
     /// Tiles on a matrix unit.
     pub tile: bool,
+    /// bf16 tiles with f32 sums.
+    pub bf16_tile: bool,
 }
 
 impl Needs {
@@ -103,6 +105,7 @@ impl Needs {
             && (!self.compiler || limits.compiler)
             && !self.lacks.contains(&platform.backend.as_str())
             && (!self.tile || platform.tile().is_some())
+            && (!self.bf16_tile || platform.bf16_tile().is_some())
     }
 }
 

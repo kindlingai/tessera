@@ -328,16 +328,23 @@ impl Counter {
             Stmt::Expr(e) => {
                 self.expr(e);
             }
-            Stmt::TileBlock { acc, depth, .. } => {
+            Stmt::TileBlock {
+                acc, depth, parts, ..
+            } => {
                 let Some((rows, cols)) = self.tiles.get(acc).copied() else {
                     panic!("`{acc}` is not a tile block");
                 };
                 let lane = |n: usize| n as f64 / LANES as f64;
+                // Each part of A multiplies once. Words hold two bf16.
+                let (times, shared) = match parts {
+                    0 => (1, (rows + cols) * depth),
+                    p => (*p, (rows * p + cols) * depth / 2),
+                };
                 // A lane's share of the block's multiply-adds, as tile flops.
                 self.add(Ops {
-                    tile_flops: lane(2 * rows * cols * depth),
+                    tile_flops: lane(2 * rows * cols * depth * times),
                     float: lane(rows * cols),
-                    shared: lane((rows + cols) * depth),
+                    shared: lane(shared),
                     ..Ops::default()
                 });
                 // Sums twice over, and every unrolled operand at once.

@@ -271,6 +271,7 @@ impl Tiles {
         b_at: &[u32; THREADS],
         stride: &[u32; THREADS],
         depth: usize,
+        (parts, apart): (usize, &[u32; THREADS]),
         mask: &[bool; THREADS],
         n: usize,
         p: Precision,
@@ -281,20 +282,70 @@ impl Tiles {
             let Some(t) = range.into_iter().find(|t| mask[*t]) else {
                 continue;
             };
-            let (a0, b0, ld) = (a_at[t] as usize, b_at[t] as usize, stride[t] as usize);
-            let sa = |i: usize| a[a0 + i];
-            let sb = |i: usize| b[b0 + i];
-            products(
-                p,
-                self.rows,
-                self.cols,
-                ld,
-                depth,
-                sa,
-                sb,
-                &mut self.blocks[s],
-            );
+            let at = Slabs {
+                a: a_at[t] as usize,
+                b: b_at[t] as usize,
+                stride: stride[t] as usize,
+                parts,
+                apart: apart[t] as usize,
+            };
+            let (a, b) = (|i: usize| a[i].to_bits(), |i: usize| b[i].to_bits());
+            at.products(p, self.rows, self.cols, depth, a, b, &mut self.blocks[s]);
         }
+    }
+}
+
+/// Where a SIMD group's tile operands sit in group memory.
+pub(crate) struct Slabs {
+    pub a: usize,
+    pub b: usize,
+    /// Elements a row, or words for bf16 pairs.
+    pub stride: usize,
+    /// Zero for f32. Else A sums this many bf16 slabs.
+    pub parts: usize,
+    pub apart: usize,
+}
+
+impl Slabs {
+    /// `block += a * b` over `depth` columns, reading words by index.
+    #[allow(clippy::too_many_arguments, reason = "every tile operand")]
+    pub(crate) fn products(
+        &self,
+        p: Precision,
+        rows: usize,
+        cols: usize,
+        depth: usize,
+        a: impl Fn(usize) -> u32,
+        b: impl Fn(usize) -> u32,
+        block: &mut [f32],
+    ) {
+        let Slabs {
+            a: a0,
+            b: b0,
+            stride,
+            parts,
+            apart,
+        } = *self;
+        if parts == 0 {
+            let (fa, fb) = (
+                |i: usize| f32::from_bits(a(a0 + i)),
+                |i: usize| f32::from_bits(b(b0 + i)),
+            );
+            return products(p, rows, cols, stride, depth, fa, fb, block);
+        }
+        let ld = 2 * stride;
+        // Element `i` sits at `(i / ld, i % ld)`.
+        let value = |word: &dyn Fn(usize) -> u32, base: usize, parts: usize, i: usize| {
+            let (r, k) = (i / ld, i % ld);
+            let mut v = 0.0f32;
+            for part in (0..parts).rev() {
+                let w = word(base + part * apart + r * stride + k / 2);
+                v += f32::from_bits(if k % 2 == 0 { w << 16 } else { w & 0xffff_0000 });
+            }
+            v
+        };
+        let (fa, fb) = (|i| value(&a, a0, parts, i), |i| value(&b, b0, 1, i));
+        products(p.parts(), rows, cols, ld, depth, fa, fb, block);
     }
 }
 
