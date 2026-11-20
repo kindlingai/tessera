@@ -163,6 +163,19 @@ fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     recipe
 }
 
+/// The image pipelines this server runs, by `_class_name`.
+const KLEIN: &str = "Flux2KleinPipeline";
+const SPRITE: &str = "TesseraSmallPipeline";
+
+/// The image pipeline's class: the recipe's, else `model_index.json`'s.
+pub(crate) fn pipeline(options: &Options) -> Result<String, String> {
+    const FILE: &str = "model_index.json";
+    let index = options.model.join(FILE);
+    let path = index.is_file().then_some(index.as_path());
+    let class = (options.config).read(FILE, path, |k| k.need::<String>(&["_class_name"]));
+    class.map_err(|e| format!("--task image needs a class in {FILE} or the recipe:\n{e}"))
+}
+
 /// Loads the generator, fills `slot`, then steps jobs.
 fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
     let start = Instant::now();
@@ -274,21 +287,25 @@ fn load(options: Options, slot: Slot) {
                 set(info, e.clone(), Some(e as Arc<dyn Embed>), None);
             })
             .map_err(|e| e.to_string()),
-        Task::Image if options.model.join("model_index.json").is_file() => {
-            Worker::<Klein>::open(options.model, settings, options.image_size, options.config)
-                .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
-                .map_err(|e| e.to_string())
-        }
-        Task::Image => Worker::<Painter>::open(
-            options.model,
-            options.clip,
-            options.module,
-            settings,
-            options.slots,
-            options.config,
-        )
-        .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
-        .map_err(|e| e.to_string()),
+        Task::Image => match pipeline(&options) {
+            Ok(class) if class == KLEIN => {
+                Worker::<Klein>::open(options.model, settings, options.image_size, options.config)
+                    .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
+                    .map_err(|e| e.to_string())
+            }
+            Ok(class) if class == SPRITE => Worker::<Painter>::open(
+                options.model,
+                options.clip,
+                options.module,
+                settings,
+                options.slots,
+                options.config,
+            )
+            .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
+            .map_err(|e| e.to_string()),
+            Ok(class) => Err(format!("{class} is not an image pipeline this server runs")),
+            Err(e) => Err(e),
+        },
     };
     if let Err(e) = failed {
         eprintln!("tesserax: {e}");
