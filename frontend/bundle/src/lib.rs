@@ -28,6 +28,7 @@ use names::Rule;
 use sensai_checkpoint::{File, Offer, Stored};
 use sensai_engine::decoder::{self, Config, Moe, Scales, Swiglu};
 use sensai_engine::form::{BF16_FORM, F32_FORM, Load, named};
+use sensai_engine::keys::{Keys, Offered};
 use sensai_engine::{Graph, Norm, Pins, Stack, Tensor, Weight};
 use serde::Deserialize;
 use std::error::Error;
@@ -115,6 +116,19 @@ pub struct Bundle {
     pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
+}
+
+/// The config `build` reads from the JSON file at `path`.
+pub(crate) fn configured<T>(
+    path: &Path,
+    build: impl FnOnce(&mut Keys) -> T,
+) -> Result<T, Box<dyn Error + Send + Sync>> {
+    let text = std::fs::read_to_string(path)?;
+    let offers = [Offered::parse(&path.display().to_string(), &text)?];
+    let mut keys = Keys::new(&offers);
+    let config = build(&mut keys);
+    keys.finish()?;
+    Ok(config)
 }
 
 /// The weights and their forms, in `offer`'s layout.

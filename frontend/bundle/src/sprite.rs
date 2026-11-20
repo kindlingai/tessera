@@ -1,8 +1,8 @@
 //! The sprite denoiser and its CLIP text tower.
 
+use crate::configured;
 use crate::tokenize::hf::Hf;
 use sensai_checkpoint::{File, Offer, Torch};
-use sensai_engine::keys::{Keys, Offered};
 use sensai_engine::wasm::Module;
 use sensai_engine::{Graph, PathSeg, Tensor, Weight, bind, clip, fold, sprite};
 use std::collections::HashMap;
@@ -131,11 +131,9 @@ fn hf_name(path: &[PathSeg]) -> String {
 
 /// CLIP's text tower in `dir`, cut to `context` tokens.
 pub fn text_tower(dir: &Path, seqs: u64, context: u64) -> Result<Clip> {
-    let text = std::fs::read_to_string(dir.join("config.json"))?;
-    let offers = [Offered::parse("config.json", &text)?];
-    let mut keys = Keys::new(&offers);
-    let config = clip::Config::read(&mut keys, seqs, context);
-    keys.finish()?;
+    let config = configured(&dir.join("config.json"), |k| {
+        clip::Config::read(k, seqs, context)
+    })?;
     let graph = clip::program(&config);
     let path = clip_weights(dir).ok_or_else(|| format!("no CLIP weights in {}", dir.display()))?;
     let file: Box<dyn Offer> = match path.extension().is_some_and(|x| x == "bin") {

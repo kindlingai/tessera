@@ -1,20 +1,20 @@
 //! FLUX.2's flow transformer: double-stream blocks, then single-stream.
 
+use crate::keys::Keys;
 use crate::shared::{join, spread};
 use sensai_trace::DimName::*;
 use sensai_trace::{
     Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Port,
     Role, Tensor, TensorType, Weights,
 };
+use serde_json::json;
 
 /// Channels per latent token.
 pub const LATENT: u64 = 128;
 /// Sinusoid channels the host computes from the timestep.
 pub const TIME: u64 = 256;
-/// RoPE axes: time, height, width, layer. Each turns `AXIS` channels.
+/// RoPE axes: time, height, width, layer.
 pub const AXES: usize = 4;
-const AXIS: u64 = 32;
-const EPS: f32 = 1e-6;
 
 pub struct Config {
     pub hidden: u64,
@@ -27,23 +27,45 @@ pub struct Config {
     pub double: u64,
     pub single: u64,
     pub theta: f32,
+    /// Channels each RoPE axis turns, in order.
+    pub axes: [u64; AXES],
+    pub eps: f32,
     pub max_seqs: u64,
     /// The most image rows in one launch.
     pub max_rows: u64,
 }
 
 impl Config {
-    /// FLUX.2 klein 4B.
-    pub fn klein(max_seqs: u64, text: u64, max_rows: u64) -> Self {
+    /// The transformer `k` describes, `text` rows and up to `max_rows`.
+    pub fn read(k: &mut Keys, max_seqs: u64, text: u64, max_rows: u64) -> Self {
+        k.fixed("in_channels", json!(LATENT));
+        k.fixed("patch_size", json!(1));
+        k.fixed("guidance_embeds", json!(false));
+        k.fixed("timestep_guidance_channels", json!(TIME));
+        let heads: u64 = k.need(&["num_attention_heads"]);
+        let head_dim: u64 = k.need(&["attention_head_dim"]);
+        let hidden = heads * head_dim;
+        let ratio: f32 = k.need(&["mlp_ratio"]);
+        let axes: Vec<u64> = k.need(&["axes_dims_rope"]);
+        let axes = match <[u64; AXES]>::try_from(axes) {
+            Ok(a) if a.iter().sum::<u64>() == head_dim => a,
+            _ => {
+                let why = format!("the graph takes {AXES} axes that fill attention_head_dim");
+                k.misfit("axes_dims_rope", why);
+                [0; AXES]
+            }
+        };
         Self {
-            hidden: 3072,
-            heads: 24,
-            ffn: 9216,
-            text_dim: 7680,
+            hidden,
+            heads,
+            ffn: (hidden as f32 * ratio) as u64,
+            text_dim: k.need(&["joint_attention_dim"]),
             text,
-            double: 5,
-            single: 20,
-            theta: 2000.0,
+            double: k.need(&["num_layers"]),
+            single: k.need(&["num_single_layers"]),
+            theta: k.need(&["rope_theta"]),
+            axes,
+            eps: k.need(&["eps"]),
             max_seqs,
             max_rows,
         }
@@ -200,6 +222,7 @@ fn inputs(m: &Model) -> Inputs {
 struct Mods<'a> {
     all: &'a Tensor,
     rows: DimExpr,
+    eps: f32,
 }
 
 impl Mods<'_> {
@@ -209,7 +232,7 @@ impl Mods<'_> {
 
     /// `(1 + scale) * layer_norm(x) + shift`, the set at `at`.
     fn apply(&self, x: &Tensor, at: u64, hidden: u64) -> Tensor {
-        let n = x.center().rms(EPS);
+        let n = x.center().rms(self.eps);
         n.mul(&self.part(at + 1, hidden))
             .add(&n)
             .add(&self.part(at, hidden))
@@ -223,10 +246,10 @@ fn glu(x: &Tensor, ffn: u64) -> Tensor {
 }
 
 /// Rows as heads, each normed, then rows again.
-fn normed(x: &Tensor, norm: &Norm, rows: DimExpr) -> Tensor {
+fn normed(x: &Tensor, norm: &Norm, rows: DimExpr, eps: f32) -> Tensor {
     let heads = vec![Seqs.into(), rows.clone(), Heads.into(), HeadDim.into()];
     let flat = vec![Seqs.into(), rows, Hidden.into()];
-    x.reshape(heads).rms_norm(norm, EPS).reshape(flat)
+    x.reshape(heads).rms_norm(norm, eps).reshape(flat)
 }
 
 /// Joint attention. Each RoPE axis turns its own channels.
@@ -236,7 +259,8 @@ fn attend(m: &Model, c: &Config, [q, k, v]: [&Tensor; 3], ids: &[Tensor; AXES]) 
     let turn = |x: &Tensor| {
         let x = x.reshape(heads.clone());
         let axis = |a: usize| {
-            x.slice(3, a as u64 * AXIS, AXIS)
+            let at: u64 = c.axes[..a].iter().sum();
+            x.slice(3, at, c.axes[a])
                 .rope(&ids[a], c.theta, Pairs::Adjacent)
         };
         (1..AXES).fold(axis(0), |all, a| all.concat(&axis(a)))
@@ -264,7 +288,7 @@ fn double(
     let (nt, ni) = (tm.apply(&text, 0, h), im.apply(&image, 0, h));
     let side = |x: &Tensor, w: &Linear, norm: Option<&Norm>, rows: DimExpr| {
         let y = x.matmul(w);
-        norm.map_or(y.clone(), |n| normed(&y, n, rows))
+        norm.map_or(y.clone(), |n| normed(&y, n, rows, c.eps))
     };
     let (ctx, img): (DimExpr, DimExpr) = (Context.into(), Rows.into());
     let q = join(
@@ -300,8 +324,8 @@ fn single(
     let h = c.hidden;
     let rows: DimExpr = Context + Rows;
     let f = mods.apply(&x, 0, h).matmul(&s.fused);
-    let q = normed(&f.slice(2, 0u64, h), &s.q_norm, rows.clone());
-    let k = normed(&f.slice(2, h, h), &s.k_norm, rows);
+    let q = normed(&f.slice(2, 0u64, h), &s.q_norm, rows.clone(), c.eps);
+    let k = normed(&f.slice(2, h, h), &s.k_norm, rows, c.eps);
     let a = attend(m, c, [&q, &k, &f.slice(2, 2 * h, h)], ids);
     let mlp = glu(&f.slice(2, 3 * h, 2 * c.ffn), c.ffn);
     x.add(&a.concat(&mlp).matmul(&s.out).mul(&mods.part(2, h)))
@@ -321,7 +345,8 @@ pub fn forward(
     let (tm, tr) = set(&w.text_mod, Context.into());
     let (sm, sr) = set(&w.single_mod, Context + Rows);
     let (om, or) = set(&w.out_mod, Rows.into());
-    let mods = |all, rows| Mods { all, rows };
+    let eps = c.eps;
+    let mods = |all, rows| Mods { all, rows, eps };
     let (im, tm, sm, om) = (mods(&im, ir), mods(&tm, tr), mods(&sm, sr), mods(&om, or));
     let mut streams = [x.text.matmul(&w.text_in), x.image.matmul(&w.image_in)];
     for d in doubles {
@@ -333,7 +358,7 @@ pub fn forward(
         xs = single(m, c, s, xs, &sm, &x.ids);
     }
     let image = xs.slice(1, c.text, Rows);
-    let n = image.center().rms(EPS);
+    let n = image.center().rms(c.eps);
     let shifted = n
         .mul(&om.part(0, c.hidden))
         .add(&n)

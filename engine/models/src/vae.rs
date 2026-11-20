@@ -1,10 +1,12 @@
 //! FLUX.2's VAE decoder: transformer latents to RGB.
 
+use crate::keys::Keys;
 use sensai_trace::DimName::*;
 use sensai_trace::{
     Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, PathSeg, Port, Role, Tensor,
     TensorType, Vector, Weights,
 };
+use serde_json::json;
 
 /// Channels per transformer token: 32 latent channels in 2x2 patches.
 pub const TOKEN: u64 = 128;
@@ -13,6 +15,8 @@ const GROUPS: u64 = 32;
 const EPS: f32 = 1e-6;
 /// Neighbours a 3x3 convolution reads.
 pub const TAPS: u64 = 9;
+/// Up blocks the graph builds.
+const LEVELS: usize = 4;
 
 pub struct Config {
     /// Transformer tokens per side. The latent is twice that.
@@ -21,16 +25,40 @@ pub struct Config {
     pub widths: Vec<u64>,
     /// Resnets per up block.
     pub depth: u64,
+    /// The batch norm's floor under the variance.
+    pub bn_eps: f32,
     pub max_seqs: u64,
 }
 
 impl Config {
-    /// FLUX.2's VAE, `side` tokens a side.
-    pub fn flux2(side: u64, max_seqs: u64) -> Self {
+    /// The decoder `k` describes, `side` tokens a side.
+    pub fn read(k: &mut Keys, side: u64, max_seqs: u64) -> Self {
+        k.fixed("latent_channels", json!(LATENT));
+        k.fixed("norm_num_groups", json!(GROUPS));
+        k.fixed("patch_size", json!([2, 2]));
+        k.fixed("act_fn", json!("silu"));
+        k.fixed("out_channels", json!(3));
+        k.fixed("mid_block_add_attention", json!(true));
+        k.fixed("use_post_quant_conv", json!(true));
+        let mut widths: Vec<u64> = k.need(&["block_out_channels"]);
+        widths.reverse();
+        if widths.len() != LEVELS || widths.iter().any(|w| !w.is_multiple_of(GROUPS)) {
+            let why = format!("the graph takes {LEVELS} widths, each split in {GROUPS} groups");
+            k.misfit("block_out_channels", why);
+        }
+        let types: Vec<String> = k.need(&["up_block_types"]);
+        if types.len() != widths.len() || types.iter().any(|t| t != "UpDecoderBlock2D") {
+            k.misfit(
+                "up_block_types",
+                "the graph takes one UpDecoderBlock2D per width",
+            );
+        }
+        let layers: u64 = k.need(&["layers_per_block"]);
         Self {
             side,
-            widths: vec![512, 512, 256, 128],
-            depth: 3,
+            widths,
+            depth: layers + 1,
+            bn_eps: k.need(&["batch_norm_eps"]),
             max_seqs,
         }
     }
@@ -315,7 +343,8 @@ pub fn program(c: &Config) -> Graph {
             DType::U32,
         ));
     }
-    let entry: [Tensor; 5] = m.entry(EntryKind::Forward, ports.try_into().expect("four levels"));
+    let entry: [Tensor; LEVELS + 1] =
+        m.entry(EntryKind::Forward, ports.try_into().expect("four levels"));
     let rgb = forward(&m, c, &d, &entry[0], &entry[1..]);
     m.finish([(Role::Logits, &rgb)])
 }
