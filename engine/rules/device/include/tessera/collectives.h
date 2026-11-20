@@ -4,7 +4,7 @@
 
 // Rule: every thread runs the same prepares, in order.
 
-// Rule: trigger every prepare, and wait in ordinal order.
+// Rule: trigger every prepare. Trigger and wait in ordinal order.
 
 // Rule: two-way pools read o before triggering o + depth/2.
 
@@ -212,7 +212,7 @@ TESSERA_FN bool trigger(ticket& r, u32 elements, bool wrote = true) {
     if (wrote) prim::fence_sys();
     if (!grid_sync(t)) return false;
     if (prim::leader()) {
-        u64 word = u64(r.index) << 48 | (r.ordinal & 0xFFFFull) << 32 | elements;
+        u64 word = 1ull << 63 | u64(r.index) << 48 | (r.ordinal & 0xFFFFull) << 32 | elements;
         prim::store_relaxed_sys(detail::slot_words(t, r.l->pool, r.slot), word);
     }
     r.s->bump();

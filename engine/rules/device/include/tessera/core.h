@@ -118,6 +118,8 @@ struct fault {
 };
 
 // Doorbell page offsets, in bytes.
+
+// A trigger word: valid bit, 15-bit lane, low ordinal, count.
 constexpr u32 DOORBELL_SLOTS = 64;
 constexpr u32 DOORBELL_ABORT = 4032;
 constexpr u32 DOORBELL_SENT = 4040;

@@ -1,6 +1,6 @@
 //! The host proxy: reads the doorbell, moves parts, frees slots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 pub(crate) mod sim;
@@ -77,21 +77,15 @@ pub struct Lane {
     pub pool: u32,
 }
 
-/// Work a link finished.
+/// A put that reached group rank `to`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Event {
-    /// One put of `ordinal` reached its peer.
-    Sent { pool: u32, ordinal: u64 },
-    /// A fetch wrote `rows` rows into the slot.
-    Fetched {
-        pool: u32,
-        slot: u32,
-        ordinal: u64,
-        rows: u32,
-    },
+pub struct Sent {
+    pub pool: u32,
+    pub ordinal: u64,
+    pub to: u32,
 }
 
-/// Moves bytes. Each call starts work that `events` reports.
+/// Moves bytes. Each call starts work that `sent` reports.
 pub trait Link {
     /// Sends the slot's part, then a flag, to `to`.
     fn put(
@@ -102,11 +96,27 @@ pub trait Link {
         ordinal: u64,
         count: u32,
     ) -> Result<(), String>;
-    /// Tells group rank `to` this rank read `ordinal`.
+    /// Tells group rank `to` this rank read up to `ordinal`.
     fn credit(&mut self, pool: u32, to: u32, ordinal: u64) -> Result<(), String>;
-    /// Reads `requests` from `slot` and writes the rows.
+    fn sent(&mut self) -> Vec<Sent>;
+    /// Drops or finishes every put and credit in flight.
+    fn reset(&mut self);
+}
+
+/// Rows a fetch wrote into its slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fetched {
+    pub pool: u32,
+    pub slot: u32,
+    pub ordinal: u64,
+    pub rows: u32,
+}
+
+/// Reads kept rows from other tiers into a fetch slot.
+pub trait Fetcher {
     fn fetch(&mut self, pool: u32, slot: u32, ordinal: u64, requests: u32) -> Result<(), String>;
-    fn events(&mut self) -> Vec<Event>;
+    fn fetched(&mut self) -> Vec<Fetched>;
+    fn reset(&mut self);
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -117,17 +127,26 @@ pub enum Error {
     Order { pool: u32, ordinal: u64 },
     #[error("no lane {0}")]
     Lane(u32),
+    #[error("pool {pool}: an event for ordinal {ordinal} no work awaits")]
+    Event { pool: u32, ordinal: u64 },
+    #[error("bad plan: {0}")]
+    Plan(&'static str),
 }
+
+/// The bit every trigger word sets, and the lane count.
+const VALID: u64 = 1 << 63;
+const LANES: usize = 1 << 15;
 
 /// One pool's progress.
 #[derive(Clone, Debug)]
 struct Track {
     next: u64,
-    /// The trigger and done words last seen, per slot.
+    /// The trigger word last seen, per slot.
     trigger: Vec<u64>,
-    done: Vec<u64>,
-    /// Puts or fetches still out, by ordinal.
-    open: BTreeMap<u64, u32>,
+    /// The last credit sent.
+    credit: u64,
+    /// Destinations still due, by ordinal.
+    open: BTreeMap<u64, BTreeSet<u32>>,
 }
 
 impl Track {
@@ -135,7 +154,7 @@ impl Track {
         Track {
             next: base,
             trigger: vec![0; depth as usize],
-            done: vec![0; depth as usize],
+            credit: base - 1,
             open: BTreeMap::new(),
         }
     }
@@ -148,20 +167,70 @@ pub struct Proxy {
     tracks: Vec<Track>,
 }
 
+/// The group ranks one trigger's work goes to.
+fn targets(op: Op, pool: Pool) -> BTreeSet<u32> {
+    match op {
+        Op::Recv => BTreeSet::new(),
+        Op::Fetch => BTreeSet::from([pool.me]),
+        Op::Send => BTreeSet::from([1 - pool.me]),
+        _ => (0..pool.group).filter(|&k| k != pool.me).collect(),
+    }
+}
+
+fn check(pools: &[Pool], lanes: &[Lane], base: u64) -> Result<(), Error> {
+    let bad = |pool: &Pool| {
+        !(1..=4).contains(&pool.depth)
+            || pool.me >= pool.group
+            || pool.group > 8
+            || (pool.one_way && pool.group != 2)
+    };
+    if base == 0 || pools.len() > 4 || pools.iter().any(bad) {
+        return Err(Error::Plan("pool shape"));
+    }
+    if lanes.len() > LANES || lanes.iter().any(|l| l.pool as usize >= pools.len()) {
+        return Err(Error::Plan("lane pools"));
+    }
+    Ok(())
+}
+
 impl Proxy {
-    /// A proxy whose pools all start at ordinal `base`.
-    pub fn new(pools: Vec<Pool>, lanes: Vec<Lane>, base: u64) -> Self {
-        let tracks = pools.iter().map(|p| Track::new(p.depth, base)).collect();
-        Proxy {
+    /// A proxy with pools at ordinal `base`. Clears the page.
+    pub fn new(
+        host: &mut dyn Host,
+        pools: Vec<Pool>,
+        lanes: Vec<Lane>,
+        base: u64,
+    ) -> Result<Self, Error> {
+        check(&pools, &lanes, base)?;
+        let mut proxy = Proxy {
             pools,
             lanes,
             epoch: 0,
-            tracks,
-        }
+            tracks: Vec::new(),
+        };
+        proxy.clear(host, base);
+        Ok(proxy)
     }
 
-    /// After a resync: every pool restarts at `base`.
-    pub fn reset(&mut self, host: &mut dyn Host, base: u64) {
+    /// After a resync: drains the links, then restarts at `base`.
+    pub fn reset(
+        &mut self,
+        host: &mut dyn Host,
+        link: &mut dyn Link,
+        fetcher: &mut dyn Fetcher,
+        base: u64,
+    ) -> Result<(), Error> {
+        if base == 0 {
+            return Err(Error::Plan("base 0"));
+        }
+        link.reset();
+        fetcher.reset();
+        self.clear(host, base);
+        Ok(())
+    }
+
+    fn clear(&mut self, host: &mut dyn Host, base: u64) {
+        self.tracks.clear();
         for (p, pool) in self.pools.iter().enumerate() {
             let pool_id = p as u32;
             for slot in 0..pool.depth {
@@ -190,33 +259,70 @@ impl Proxy {
                     base - 1,
                 );
             }
-            self.tracks[p] = Track::new(pool.depth, base);
+            self.tracks.push(Track::new(pool.depth, base));
         }
         self.epoch = host.load(Word::Epoch);
     }
 
-    /// One pass: true if it did work. Errors set abort.
-    pub fn step(&mut self, host: &mut dyn Host, link: &mut dyn Link) -> Result<bool, Error> {
-        let done = self.pass(host, link);
+    /// Whether puts or fetches are still out.
+    pub fn open(&self) -> bool {
+        self.tracks.iter().any(|t| !t.open.is_empty())
+    }
+
+    /// One pass. True if it did work. Errors set abort.
+    pub fn step(
+        &mut self,
+        host: &mut dyn Host,
+        link: &mut dyn Link,
+        fetcher: &mut dyn Fetcher,
+    ) -> Result<bool, Error> {
+        let done = self.pass(host, link, fetcher);
         if done.is_err() {
             host.store(Word::Abort, 1);
         }
         done
     }
 
-    fn pass(&mut self, host: &mut dyn Host, link: &mut dyn Link) -> Result<bool, Error> {
+    fn pass(
+        &mut self,
+        host: &mut dyn Host,
+        link: &mut dyn Link,
+        fetcher: &mut dyn Fetcher,
+    ) -> Result<bool, Error> {
         let mut busy = false;
         let epoch = host.load(Word::Epoch);
         if epoch != self.epoch {
             self.epoch = epoch;
             for p in 0..self.pools.len() {
-                busy |= self.triggers(p, host, link)?;
+                busy |= self.triggers(p, host, link, fetcher)?;
                 busy |= self.credits(p, host, link)?;
             }
         }
-        for event in link.events() {
+        for s in link.sent() {
             busy = true;
-            self.finish(event, host);
+            self.finish(s.pool, s.ordinal, s.to)?;
+        }
+        for f in fetcher.fetched() {
+            busy = true;
+            let me = self.pools.get(f.pool as usize).map_or(0, |p| p.me);
+            self.finish(f.pool, f.ordinal, me)?;
+            let (pool, slot) = (f.pool, f.slot);
+            host.store(
+                Word::Count {
+                    pool,
+                    slot,
+                    rank: 0,
+                },
+                u64::from(f.rows),
+            );
+            host.store(
+                Word::Flag {
+                    pool,
+                    slot,
+                    rank: 0,
+                },
+                f.ordinal,
+            );
         }
         for p in 0..self.pools.len() {
             self.release(p, host);
@@ -230,6 +336,7 @@ impl Proxy {
         p: usize,
         host: &mut dyn Host,
         link: &mut dyn Link,
+        fetcher: &mut dyn Fetcher,
     ) -> Result<bool, Error> {
         let (pool, pool_id) = (self.pools[p], p as u32);
         let mut busy = false;
@@ -244,7 +351,7 @@ impl Proxy {
             if word == track.trigger[slot as usize] {
                 return Ok(busy);
             }
-            if (word >> 32) & 0xFFFF != ordinal & 0xFFFF {
+            if word & VALID == 0 || (word >> 32) & 0xFFFF != ordinal & 0xFFFF {
                 return Err(Error::Order {
                     pool: pool_id,
                     ordinal,
@@ -252,8 +359,8 @@ impl Proxy {
             }
             track.trigger[slot as usize] = word;
             track.next += 1;
-            let lane = (word >> 48) as u32;
-            let op = self.lanes.get(lane as usize).ok_or(Error::Lane(lane))?.op;
+            let lane = ((word >> 48) as usize) & (LANES - 1);
+            let op = self.lanes.get(lane).ok_or(Error::Lane(lane as u32))?.op;
             let job = Job {
                 op,
                 pool,
@@ -262,13 +369,13 @@ impl Proxy {
                 ordinal,
                 count: word as u32,
             };
-            let out = job.start(host, link)?;
-            self.tracks[p].open.insert(ordinal, out);
+            job.start(host, link, fetcher)?;
+            self.tracks[p].open.insert(ordinal, targets(op, pool));
             busy = true;
         }
     }
 
-    /// One-way pools: sends each new done word as a credit.
+    /// One-way pools: credits the largest new done word.
     fn credits(
         &mut self,
         p: usize,
@@ -276,63 +383,44 @@ impl Proxy {
         link: &mut dyn Link,
     ) -> Result<bool, Error> {
         let (pool, pool_id) = (self.pools[p], p as u32);
-        let mut busy = false;
-        for slot in 0..pool.depth {
-            let word = host.load(Word::Done {
+        if !pool.one_way {
+            return Ok(false);
+        }
+        let track = &mut self.tracks[p];
+        let words = (0..pool.depth).map(|slot| {
+            host.load(Word::Done {
                 pool: pool_id,
                 slot,
-            });
-            let seen = &mut self.tracks[p].done[slot as usize];
-            if pool.one_way && word != *seen && word != 0 {
-                link.credit(pool_id, 1 - pool.me, word)
-                    .map_err(Error::Link)?;
-                busy = true;
-            }
-            *seen = word;
+            })
+        });
+        let most = words.fold(track.credit, u64::max);
+        if most == track.credit {
+            return Ok(false);
         }
-        Ok(busy)
+        track.credit = most;
+        link.credit(pool_id, 1 - pool.me, most)
+            .map_err(Error::Link)?;
+        Ok(true)
     }
 
-    fn finish(&mut self, event: Event, host: &mut dyn Host) {
-        let (pool, ordinal) = match event {
-            Event::Sent { pool, ordinal } => (pool, ordinal),
-            Event::Fetched {
-                pool,
-                slot,
-                ordinal,
-                rows,
-            } => {
-                host.store(
-                    Word::Count {
-                        pool,
-                        slot,
-                        rank: 0,
-                    },
-                    u64::from(rows),
-                );
-                host.store(
-                    Word::Flag {
-                        pool,
-                        slot,
-                        rank: 0,
-                    },
-                    ordinal,
-                );
-                (pool, ordinal)
-            }
-        };
-        if let Some(left) = self.tracks[pool as usize].open.get_mut(&ordinal) {
-            *left = left.saturating_sub(1);
+    fn finish(&mut self, pool: u32, ordinal: u64, to: u32) -> Result<(), Error> {
+        let open = self.tracks.get_mut(pool as usize).map(|t| &mut t.open);
+        let due = open.and_then(|o| o.get_mut(&ordinal));
+        if !due.is_some_and(|d| d.remove(&to)) {
+            return Err(Error::Event { pool, ordinal });
         }
+        Ok(())
     }
 
     /// Advances `sent` over the finished ordinals at the front.
     fn release(&mut self, p: usize, host: &mut dyn Host) {
         let open = &mut self.tracks[p].open;
         let mut last = None;
-        while let Some((&ordinal, &0)) = open.first_key_value() {
-            open.pop_first();
-            last = Some(ordinal);
+        while open
+            .first_key_value()
+            .is_some_and(|(_, due)| due.is_empty())
+        {
+            last = open.pop_first().map(|(ordinal, _)| ordinal);
         }
         if let Some(ordinal) = last {
             host.store(Word::Sent { pool: p as u32 }, ordinal);
@@ -352,8 +440,12 @@ struct Job {
 }
 
 impl Job {
-    /// Starts the work. Returns how many events to await.
-    fn start(&self, host: &dyn Host, link: &mut dyn Link) -> Result<u32, Error> {
+    fn start(
+        &self,
+        host: &dyn Host,
+        link: &mut dyn Link,
+        fetcher: &mut dyn Fetcher,
+    ) -> Result<(), Error> {
         let Job {
             op,
             pool,
@@ -362,37 +454,25 @@ impl Job {
             ordinal,
             count,
         } = *self;
-        let mut out = 0;
-        match op {
-            Op::Recv => {}
-            Op::Fetch => {
-                link.fetch(pool_id, slot, ordinal, count)
-                    .map_err(Error::Link)?;
-                out = 1;
-            }
-            Op::Send => {
-                link.put(pool_id, slot, 1 - pool.me, ordinal, count)
-                    .map_err(Error::Link)?;
-                out = 1;
-            }
-            Op::Sum | Op::Gather | Op::AllToAll => {
-                for to in (0..pool.group).filter(|&k| k != pool.me) {
-                    let size = Word::Size {
-                        pool: pool_id,
-                        slot,
-                        rank: to,
-                    };
-                    let n = if op == Op::AllToAll {
-                        host.load(size) as u32
-                    } else {
-                        count
-                    };
-                    link.put(pool_id, slot, to, ordinal, n)
-                        .map_err(Error::Link)?;
-                    out += 1;
-                }
-            }
+        if op == Op::Fetch {
+            return fetcher
+                .fetch(pool_id, slot, ordinal, count)
+                .map_err(Error::Link);
         }
-        Ok(out)
+        for to in targets(op, pool) {
+            let size = Word::Size {
+                pool: pool_id,
+                slot,
+                rank: to,
+            };
+            let n = if op == Op::AllToAll {
+                host.load(size) as u32
+            } else {
+                count
+            };
+            link.put(pool_id, slot, to, ordinal, n)
+                .map_err(Error::Link)?;
+        }
+        Ok(())
     }
 }
