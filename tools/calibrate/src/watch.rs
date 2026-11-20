@@ -54,7 +54,8 @@ fn flux2(args: &[String]) -> Result<Subject, Box<dyn Error>> {
         [rows, text] => (*rows, *text),
         _ => return Err(USAGE.into()),
     };
-    let t = transformer(Path::new(dir), [1, text, rows]).map_err(|e| e as Box<dyn Error>)?;
+    let t = transformer(Path::new(dir), [1, text, rows], &Default::default())
+        .map_err(|e| e as Box<dyn Error>)?;
     Ok(Subject {
         g: t.graph,
         sizes: vec![(Seqs, 1), (Rows, rows)],
