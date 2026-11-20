@@ -6,7 +6,7 @@ pub mod site;
 mod lib_test;
 
 /// The version of the JSON exchange with the host.
-pub const ABI: u32 = 5;
+pub const ABI: u32 = 6;
 
 /// Room for `len` bytes, kept until the module ends.
 pub fn alloc(len: i32) -> i32 {

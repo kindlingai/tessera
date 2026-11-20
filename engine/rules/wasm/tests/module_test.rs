@@ -94,7 +94,7 @@ const ACT_CUDA: &str = "extern \"C\" __global__ void act(const float* a, float* 
 }";
 
 /// The version these modules speak.
-const ABI: u32 = 5;
+const ABI: u32 = 6;
 
 /// `kernels`, and one rule at `site`.
 fn declare(abi: u32, site: &str, kernels: Value) -> Value {
@@ -231,10 +231,13 @@ fn cuda_alone_opens() {
     let bytes = module(&declare(ABI, "matmul", kernels), &json!([matmul()]), "");
     let rule = sensai_wasm::load(&bytes).unwrap()[0];
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
-    let Source::Fixed { metal, cuda, .. } = plan.steps[0].kernel.source() else {
+    let Source::Fixed {
+        metal, cuda, hip, ..
+    } = plan.steps[0].kernel.source()
+    else {
         panic!("module kernels are fixed text");
     };
-    assert!(metal.is_empty() && cuda == GEMM_CUDA);
+    assert!(metal.is_empty() && cuda == GEMM_CUDA && hip == GEMM_CUDA);
 }
 
 #[test]
@@ -401,7 +404,7 @@ fn bad_modules_fail() {
     let newer = module(&manifest(ABI + 1, "matmul"), &offer, "");
     assert!(matches!(
         sensai_wasm::load(&newer),
-        Err(sensai_wasm::Error::Abi(6))
+        Err(sensai_wasm::Error::Abi(7))
     ));
     // An endless loop runs out of fuel.
     let spin = module(&manifest(ABI, "matmul"), &offer, "(loop (br 0))");
@@ -570,17 +573,21 @@ fn module_attention_writes_kept() {
     }
 }
 
-#[test]
-fn module_speaks_guest() {
+/// A module of `kernel`, `files` and a matmul offer.
+fn guest(
+    kernel: sensai_guest::site::Kernel,
+    files: Vec<sensai_guest::site::File>,
+) -> Result<&'static Rule, sensai_wasm::Error> {
     use sensai_guest::site::{self, Count, Kind, Manifest, Offer, Place};
     let manifest = Manifest {
         abi: sensai_guest::ABI,
-        kernels: vec![site::kernel("wasm_gemm", "gemm", GEMM_CUDA)],
+        kernels: vec![kernel],
         rules: vec![site::Rule {
             name: "wasm_matmul",
             site: Kind::Matmul,
         }],
         graph: false,
+        files,
     };
     let rows = Count::Dim {
         dim: "Rows".into(),
@@ -597,8 +604,48 @@ fn module_speaks_guest() {
         writes: None,
     };
     let bytes = module(&json!(manifest), &json!([offer]), "");
-    let rule = sensai_wasm::load(&bytes).unwrap()[0];
+    Ok(sensai_wasm::load(&bytes)?[0])
+}
+
+#[test]
+fn module_speaks_guest() {
+    let kernel = sensai_guest::site::kernel("wasm_gemm", "gemm", GEMM_CUDA);
+    let rule = guest(kernel, Vec::new()).unwrap();
     let device = Device::default().adding(rule);
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &device).unwrap();
     assert_eq!(rules(&plan), ["wasm_matmul"]);
+}
+
+#[test]
+fn module_flattens_imports() {
+    use sensai_guest::site::{File, imports};
+    let kernel = || imports("wasm_gemm", "gemm", "gemm.kernel");
+    let main = || File {
+        path: "gemm.kernel",
+        text: "#include <tessera/1/grid>\n#include \"row.h\"\nint body;\n",
+    };
+    let row = |text| File {
+        path: "row.h",
+        text,
+    };
+    let rule = guest(kernel(), vec![main(), row("int row;\n")]).unwrap();
+    let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
+    let Source::Fixed {
+        metal, cuda, hip, ..
+    } = plan.steps[0].kernel.source()
+    else {
+        panic!("module kernels are fixed text");
+    };
+    // Metal has no grid barrier.
+    assert!(metal.is_empty());
+    for (text, define) in [(cuda, "TESSERA_CUDA"), (hip, "TESSERA_HIP")] {
+        assert!(text.starts_with(&format!("#define {define} 1\n")), "{text}");
+        assert!(text.contains("int row;") && !text.contains("#include <tessera"));
+    }
+    let late = row("int row;\n#include \"x.h\"\n");
+    let refused = guest(kernel(), vec![main(), late]).unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "row.h:2: includes belong in the block at the top"
+    );
 }

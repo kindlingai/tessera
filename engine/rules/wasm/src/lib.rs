@@ -24,6 +24,8 @@ pub enum Error {
     Abi(u32),
     #[error("an earlier call panicked")]
     Poisoned,
+    #[error(transparent)]
+    Kernel(#[from] sensai_device::Error),
 }
 
 impl Error {
@@ -67,7 +69,7 @@ impl Propose for Asking {
     }
 }
 
-fn leak(text: String) -> &'static str {
+pub(crate) fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
@@ -96,12 +98,7 @@ impl Module {
         }
         let mut kernels = Vec::with_capacity(manifest.kernels.len());
         for k in manifest.kernels {
-            kernels.push(Fixed {
-                name: leak(k.name),
-                entry: leak(k.entry),
-                metal: leak(k.metal),
-                cuda: leak(k.cuda),
-            });
+            kernels.push(Fixed::open(k, &manifest.files)?);
         }
         let kernels: &'static [Fixed] = kernels.leak();
         let mut rules = Vec::with_capacity(manifest.rules.len());

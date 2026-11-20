@@ -10,6 +10,8 @@ pub struct Manifest {
     pub rules: Vec<Rule>,
     /// Whether the module exports `graph` and `tables`.
     pub graph: bool,
+    /// Recipe files that kernels from files read.
+    pub files: Vec<File>,
 }
 
 /// One kernel's source, the same for every launch.
@@ -19,6 +21,8 @@ pub struct Kernel {
     pub entry: &'static str,
     pub metal: &'static str,
     pub cuda: &'static str,
+    /// A recipe file the host flattens into the texts.
+    pub file: &'static str,
 }
 
 /// A kernel with CUDA text alone.
@@ -28,7 +32,26 @@ pub fn kernel(name: &'static str, entry: &'static str, cuda: &'static str) -> Ke
         entry,
         metal: "",
         cuda,
+        file: "",
     }
+}
+
+/// A kernel from recipe file `file`. It imports tessera headers.
+pub fn imports(name: &'static str, entry: &'static str, file: &'static str) -> Kernel {
+    Kernel {
+        name,
+        entry,
+        metal: "",
+        cuda: "",
+        file,
+    }
+}
+
+/// One recipe file, by its path inside the recipe.
+#[derive(Debug, Serialize)]
+pub struct File {
+    pub path: &'static str,
+    pub text: &'static str,
 }
 
 /// A rule, and the site kind it is asked at.

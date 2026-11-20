@@ -1,8 +1,10 @@
 //! Kernel files that replace planned kernels, read again on change.
 
 use crate::Error;
+use crate::kernels::{dialect, fixed_text};
 use crate::run::{Outcome, Reload};
 use sensai_codegen::Dialect;
+use sensai_gpukit::backend::Backend;
 use sensai_lower::Source;
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -47,11 +49,10 @@ pub(crate) fn entry(source: &Source) -> &str {
 }
 
 /// A planned kernel's text.
-pub(crate) fn text(source: &Source, dialect: Dialect) -> String {
-    match source {
-        Source::Fixed { metal, .. } if dialect == Dialect::Metal => metal.to_string(),
-        Source::Fixed { cuda, .. } => cuda.to_string(),
-        Source::Made(body) => body.text().render(dialect),
+pub(crate) fn text(source: &Source, backend: Backend) -> String {
+    match (source, fixed_text(source, backend)) {
+        (Source::Made(body), _) => body.text().render(dialect(backend)),
+        (_, fixed) => fixed.unwrap_or_default().0.to_string(),
     }
 }
 

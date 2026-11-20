@@ -19,6 +19,8 @@ pub(crate) struct Manifest {
     /// Whether it exports `graph` and `tables`.
     #[serde(default)]
     pub graph: bool,
+    #[serde(default)]
+    pub files: Vec<File>,
 }
 
 /// One kernel's source, the same for every launch.
@@ -30,7 +32,19 @@ pub(crate) struct Text {
     /// Empty when the kernel has no Metal text.
     #[serde(default)]
     pub metal: String,
+    #[serde(default)]
     pub cuda: String,
+    /// A recipe file to flatten, in place of the texts.
+    #[serde(default)]
+    pub file: String,
+}
+
+/// One recipe file, by its path inside the recipe.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct File {
+    pub path: String,
+    pub text: String,
 }
 
 /// A rule, and the site kind it is asked at.

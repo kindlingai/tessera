@@ -1,8 +1,10 @@
 //! A module's kernel text, launched with plain arguments.
 
-use crate::abi::{Offer, Shape};
+use crate::abi::{File, Offer, Shape};
+use crate::leak;
+use sensai_device::{Backend, Options, Problem, flatten};
 use sensai_lower::kept::Layout;
-use sensai_lower::{Arg, Dialect, Kernel, Launch, Needs, Source, Step};
+use sensai_lower::{Arg, Kernel, Launch, Needs, Source, Step};
 use std::fmt;
 
 /// A module kernel's text, never freed.
@@ -12,6 +14,68 @@ pub struct Fixed {
     pub entry: &'static str,
     pub metal: &'static str,
     pub cuda: &'static str,
+    pub hip: &'static str,
+    /// Platform backends with no text.
+    lacks: &'static [&'static str],
+}
+
+/// Metal, CUDA and HIP text of `file`, or empty.
+fn flat(file: &str, files: &[File]) -> Result<[String; 3], sensai_device::Error> {
+    let load = |path: &str| {
+        files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.text.clone())
+    };
+    let text = load(file).ok_or_else(|| sensai_device::Error {
+        file: file.into(),
+        line: 0,
+        problem: Problem::Missing(file.into()),
+    })?;
+    let mut out: [String; 3] = Default::default();
+    let mut skipped = None;
+    let backends = [Backend::Metal, Backend::Cuda, Backend::Hip];
+    for (slot, backend) in out.iter_mut().zip(backends) {
+        // No remote rows or marks yet.
+        let options = Options {
+            backend,
+            remote_kv: false,
+            marks: false,
+        };
+        match flatten(file, &text, &load, &options) {
+            Ok(flat) => *slot = flat.text,
+            Err(e) if matches!(e.problem, Problem::Extension(_) | Problem::Unsupported(..)) => {
+                skipped = Some(e)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match skipped {
+        Some(e) if out.iter().all(String::is_empty) => Err(e),
+        _ => Ok(out),
+    }
+}
+
+impl Fixed {
+    /// Kernel `k`, with any recipe file flattened per backend.
+    pub fn open(k: crate::abi::Text, files: &[File]) -> Result<Self, sensai_device::Error> {
+        let [metal, cuda, hip] = if k.file.is_empty() {
+            let cuda = leak(k.cuda);
+            [leak(k.metal), cuda, cuda]
+        } else {
+            flat(&k.file, files)?.map(leak)
+        };
+        let texts = [("metal", metal), ("cuda", cuda), ("rocm", hip)];
+        let lacks = texts.iter().filter(|t| t.1.is_empty()).map(|t| t.0);
+        Ok(Fixed {
+            name: leak(k.name),
+            entry: leak(k.entry),
+            metal,
+            cuda,
+            hip,
+            lacks: lacks.collect::<Vec<_>>().leak(),
+        })
+    }
 }
 
 /// One launch of a module kernel: reads, output, then `args`.
@@ -67,9 +131,18 @@ impl Kernel for Text {
 
     fn source(&self) -> Source {
         let Fixed {
-            entry, metal, cuda, ..
+            entry,
+            metal,
+            cuda,
+            hip,
+            ..
         } = *self.fixed;
-        Source::Fixed { metal, cuda, entry }
+        Source::Fixed {
+            metal,
+            cuda,
+            hip,
+            entry,
+        }
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {
@@ -108,15 +181,10 @@ impl Kernel for Text {
         true
     }
 
-    /// A module may bring text for one dialect only.
+    /// A module may bring text for some backends only.
     fn needs(&self) -> Needs {
-        let lacks = match (self.fixed.metal.is_empty(), self.fixed.cuda.is_empty()) {
-            (true, false) => Some(Dialect::Metal),
-            (false, true) => Some(Dialect::Cuda),
-            _ => None,
-        };
         Needs {
-            lacks,
+            lacks: self.fixed.lacks,
             ..Needs::text()
         }
     }

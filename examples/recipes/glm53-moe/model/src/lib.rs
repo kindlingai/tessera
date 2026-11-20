@@ -251,6 +251,7 @@ pub extern "C" fn manifest() -> i64 {
             site: Kind::Moe,
         }],
         graph: false,
+        files: Vec::new(),
     };
     output(serde_json::to_vec(&manifest).unwrap_or_default())
 }

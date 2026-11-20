@@ -173,10 +173,11 @@ impl Launch {
 
 /// Where a kernel's source comes from.
 pub enum Source {
-    /// Hand-written, with one text per dialect.
+    /// Hand-written, with one text per backend.
     Fixed {
         metal: &'static str,
         cuda: &'static str,
+        hip: &'static str,
         entry: &'static str,
     },
     /// A tree, rendered per dialect or run on the host.
@@ -193,7 +194,12 @@ impl Source {
     /// Changes whenever the kernel's text does.
     pub fn hash(&self) -> u64 {
         match self {
-            Source::Fixed { metal, cuda, entry } => [metal, cuda, entry]
+            Source::Fixed {
+                metal,
+                cuda,
+                hip,
+                entry,
+            } => [metal, cuda, hip, entry]
                 .iter()
                 .fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text)),
             Source::Made(body) => hash(&body.text().render(Dialect::Cuda)),

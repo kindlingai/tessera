@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Lowering rules a sandboxed wasm module proposes, over JSON"
 
 [dependencies]
+sensai-device = { workspace = true }
 sensai-graph = { workspace = true }
 sensai-guest = { workspace = true }
 sensai-lower = { workspace = true }

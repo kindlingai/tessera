@@ -2119,6 +2119,7 @@ dependencies = [
 name = "sensai-wasm"
 version = "0.1.0"
 dependencies = [
+ "sensai-device",
  "sensai-graph",
  "sensai-guest",
  "sensai-interp",

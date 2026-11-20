@@ -87,9 +87,12 @@ fn text_of(step: &Step, spec: &Spec) -> (&'static str, String) {
         _ => "cuda",
     };
     let text = match step.kernel.source() {
-        Source::Fixed { metal, cuda, .. } => match dialect {
-            sensai_lower::Dialect::Metal => metal.to_string(),
-            sensai_lower::Dialect::Cuda => cuda.to_string(),
+        Source::Fixed {
+            metal, cuda, hip, ..
+        } => match name {
+            "metal" => metal.to_string(),
+            "hip" => hip.to_string(),
+            _ => cuda.to_string(),
         },
         Source::Made(body) => body.text().render(dialect),
     };

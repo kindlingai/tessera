@@ -2,7 +2,6 @@
 
 use crate::abi::{Launch, Source};
 use crate::plan::Step;
-use sensai_codegen::Dialect;
 use sensai_graph::Order;
 use sensai_platform::Platform;
 use sensai_sim::ZoneKind;
@@ -72,8 +71,8 @@ pub struct Needs {
     pub group_threads: usize,
     /// Hand-written text, for a backend with a compiler.
     pub compiler: bool,
-    /// A dialect the hand-written text leaves out.
-    pub lacks: Option<Dialect>,
+    /// Platform backends the hand-written text leaves out.
+    pub lacks: &'static [&'static str],
     /// Tiles on a matrix unit.
     pub tile: bool,
 }
@@ -102,17 +101,8 @@ impl Needs {
             && self.group_bytes <= limits.group_bytes
             && self.group_threads <= limits.group_threads
             && (!self.compiler || limits.compiler)
-            && (self.lacks.is_none() || self.lacks != speaks(platform))
+            && !self.lacks.contains(&platform.backend.as_str())
             && (!self.tile || platform.tile().is_some())
-    }
-}
-
-/// The dialect `platform` compiles, if it compiles one.
-fn speaks(platform: &Platform) -> Option<Dialect> {
-    match platform.backend.as_str() {
-        "metal" => Some(Dialect::Metal),
-        "cuda" | "rocm" => Some(Dialect::Cuda),
-        _ => None,
     }
 }
 
