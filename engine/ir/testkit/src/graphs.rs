@@ -25,6 +25,13 @@ struct Turned {
     svh: Vector,
 }
 
+/// Per head: key rows, then value rows.
+#[derive(Weights)]
+struct Blocks {
+    #[shape(Latent, Heads * (Nope + HeadDim))]
+    w: Linear,
+}
+
 #[derive(Weights)]
 struct Scale {
     #[shape(Hidden)]
@@ -90,6 +97,25 @@ pub fn linear(bounded: &[Dim], k: u64, n: u64) -> Graph {
     let w: Layer = declare(&m);
     let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
     m.finish([(Role::Logits, &x.matmul(&w.w))])
+}
+
+/// Per-head blocks of one matrix, one side swapped.
+pub fn blocks(bounded: &[Dim], [heads, key, value]: [u64; 3]) -> Graph {
+    let fixed = [
+        (Heads, heads),
+        (Nope, key),
+        (HeadDim, value),
+        (Latent, value),
+    ];
+    let m = model(bounded, &fixed);
+    let w: Blocks = declare(&m);
+    let ports = [floats([Heads, Rows, Nope]), floats([Heads, Rows, Latent])];
+    let [q, o] = m.entry(EntryKind::Forward, ports);
+    let shape = || vec![Heads.into(), Nope + HeadDim, Latent.into()];
+    let set = || w.w.stored().reshape(shape());
+    let keys = q.matmul_rows(&set().slice(1, 0u64, Nope).permute(&[0, 2, 1]));
+    let values = o.matmul_rows(&set().slice(1, Nope, HeadDim));
+    m.finish([(Role::Logits, &keys), (Role::Logits, &values)])
 }
 
 /// Norms, maps, centering, unit sum, softmax, mask, argmax, mean.

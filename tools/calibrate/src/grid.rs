@@ -8,7 +8,8 @@ use sensai_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use sensai_run::{Run, open};
 use sensai_testkit::Noise;
 use sensai_testkit::graphs::{
-    attention, indexed, indexed_rows, linear, neighbours, rotation, routed, rows, table, turned,
+    attention, blocks, indexed, indexed_rows, linear, neighbours, rotation, routed, rows, table,
+    turned,
 };
 use sensai_trace::{Dim, Graph, TensorType};
 
@@ -172,6 +173,7 @@ impl Grid {
         cases.push(by_rows(rotation(&one)));
         cases.push(by_rows(turned(&one)));
         cases.push(by_rows(indexed_rows(&one, [2, 16, 2])));
+        cases.push(pinned(blocks(&one, [2, 16, 16]), Pins::all(BF16_FORM)));
         cases.extend(
             self.widths
                 .iter()
