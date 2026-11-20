@@ -36,6 +36,8 @@ pub(crate) struct Runner<D: Device> {
     marked: HashMap<String, D::Kernel>,
     /// Where marked kernels write, made on first use.
     ledger: Option<DeviceBuffer<D>>,
+    /// Reloads that launches applied, for the next `refresh`.
+    missed: Vec<Reload>,
     compiled: Kernels<D::Kernel>,
     /// The whole plan's launches per binding, recorded once.
     graphs: HashMap<Vec<(DimName, u32)>, D::Graph>,
@@ -65,6 +67,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             uses: Vec::new(),
             marked: HashMap::new(),
             ledger: None,
+            missed: Vec::new(),
             compiled: Kernels::default(),
             graphs: HashMap::new(),
             launching: Launching::default(),
@@ -262,12 +265,34 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
-    /// Rereads changed kernel files, and says what changed.
+    /// Rereads changed files before a launch. Keeps what changed.
     fn reread(&mut self) -> Result<(), Error> {
-        for reload in self.refresh()? {
+        let found = self.reload()?;
+        for reload in &found {
             eprintln!("tessera: {reload}");
         }
+        self.missed.extend(found);
         Ok(())
+    }
+
+    /// Recompiles kernel files that changed. Returns what changed.
+    fn reload(&mut self) -> Result<Vec<Reload>, Error> {
+        let (ctx, plan) = (self.ctx, &self.base.plan);
+        let Some(files) = self.overrides.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut reloads = Vec::new();
+        for (entry, step) in &self.entries {
+            let planned = || overrides::text(&plan.steps[*step].kernel.source(), D::BACKEND);
+            let compile = |text: &str| Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?);
+            reloads.extend(files.check(entry, planned, compile));
+        }
+        if !reloads.is_empty() {
+            // Recorded launches name the kernels they replaced.
+            self.graphs.clear();
+            self.apply();
+        }
+        Ok(reloads)
     }
 
     /// Reads the ledger after one launch into `found`.
@@ -369,22 +394,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
-        let (ctx, plan) = (self.ctx, &self.base.plan);
-        let Some(files) = self.overrides.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let mut reloads = Vec::new();
-        for (entry, step) in &self.entries {
-            let planned = || overrides::text(&plan.steps[*step].kernel.source(), D::BACKEND);
-            let compile = |text: &str| Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?);
-            reloads.extend(files.check(entry, planned, compile));
-        }
-        if !reloads.is_empty() {
-            // Recorded launches name the kernels they replaced.
-            self.graphs.clear();
-            self.apply();
-        }
-        Ok(reloads)
+        let mut all = std::mem::take(&mut self.missed);
+        all.extend(self.reload()?);
+        Ok(all)
     }
 
     fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
