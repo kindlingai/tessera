@@ -176,7 +176,7 @@ pub struct Offer<K = &'static str, C = Count> {
     /// Work units, and seconds per unit until measured.
     pub work: f64,
     pub guess: f64,
-    /// The region output it writes. Defaults to the last entry.
+    /// Output index it writes. With one output, the last entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writes: Option<usize>,
 }

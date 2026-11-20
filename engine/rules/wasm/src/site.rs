@@ -12,7 +12,7 @@ pub(crate) struct Reads {
     pub kept: Vec<sites::Appended>,
     /// Per rotated input: its place, then `suh` and `svh`.
     pub parts: Vec<(usize, [T; 2])>,
-    /// Region outputs. The last offers write them.
+    /// Region outputs. Entries name the one they write.
     pub outputs: Vec<T>,
     /// Elements of each all-reduce the offers must place.
     pub sums: Vec<usize>,
