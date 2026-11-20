@@ -3,14 +3,13 @@
 use sensai_codegen::prelude::*;
 use sensai_graph::Op;
 use sensai_lower::sites::Attend;
-use sensai_lower::{Attn, Draft, Extent, Kernel, Launch, Shape, Step, T, Term, Tree};
+use sensai_lower::{Attn, Draft, Extent, Kernel, Launch, Read, Shape, Step, T, Term, Tree};
 
-/// One thread per output: the peak, then the weighted sum.
+/// One thread per pick: its scaled score, or -inf.
 #[kernel]
-fn listed(
+fn listed_scores(
     q: Buf<F32>,
     k: Buf<F32>,
-    v: Buf<F32>,
     ids: Buf<U32>,
     slots: Buf<U32>,
     positions: Buf<U32>,
@@ -31,9 +30,9 @@ fn listed(
     if gid() >= len {
         return;
     }
-    let d = gid() % width;
-    let head = (gid() / width) % heads;
-    let row = gid() / (width * heads);
+    let p = gid() % picks;
+    let head = (gid() / picks) % heads;
+    let row = gid() / (picks * heads);
     // Whole sequences end together. Ragged rows carry slot and position.
     let mut first = row / queries * keys;
     let mut position = keys - queries + row % queries;
@@ -52,32 +51,69 @@ fn listed(
     } else {
         keys
     };
+    let mut j = p;
+    if from_list == 1 {
+        j = ids[row as u64 * picks as u64 + p as u64];
+    }
+    let mut score = f32::NEG_INFINITY;
+    if j >= from && j < to {
+        let kv_head = head / (heads / kv_heads);
+        let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+        let q_at = (row * heads + head) as u64 * width as u64;
+        score = q.dot(q_at, k, k_at, width) * scale;
+    }
+    out[gid() as u64] = score;
+}
+
+/// One thread per output: the peak, then the weighted sum.
+#[kernel]
+fn listed_mix(
+    scores: Buf<F32>,
+    v: Buf<F32>,
+    ids: Buf<U32>,
+    slots: Buf<U32>,
+    mut out: BufMut<F32>,
+    len: u32,
+    queries: u32,
+    keys: u32,
+    heads: u32,
+    kv_heads: u32,
+    width: u32,
+    picks: u32,
+    flags: u32,
+) {
+    if gid() >= len {
+        return;
+    }
+    // Bit 0: ragged rows. Bit 1: picks from the list.
+    let ragged = flags & 1;
+    let from_list = flags / 2;
+    let d = gid() % width;
+    let head = (gid() / width) % heads;
+    let row = gid() / (width * heads);
+    let mut first = row / queries * keys;
+    if ragged == 1 {
+        first = slots[row as u64] * keys;
+    }
     let kv_head = head / (heads / kv_heads);
-    let list = row as u64 * picks as u64;
-    let q_at = (gid() - d) as u64;
+    let at = (row * heads + head) as u64 * picks as u64;
     let mut peak = f32::NEG_INFINITY;
     for p in 0..picks {
-        let mut j = p;
-        if from_list == 1 {
-            j = ids[list + p as u64];
-        }
-        if j >= from && j < to {
-            let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
-            peak = max(peak, q.dot(q_at, k, k_at, width) * scale);
-        }
+        peak = max(peak, scores[at + p as u64]);
     }
     let mut total = 0.0f32;
     let mut sum = 0.0f32;
     for p in 0..picks {
-        let mut j = p;
-        if from_list == 1 {
-            j = ids[list + p as u64];
-        }
-        if j >= from && j < to {
-            let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
-            let e = exp(q.dot(q_at, k, k_at, width) * scale - peak);
+        let score = scores[at + p as u64];
+        if score > f32::NEG_INFINITY {
+            let mut j = p;
+            if from_list == 1 {
+                j = ids[row as u64 * picks as u64 + p as u64];
+            }
+            let v_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+            let e = exp(score - peak);
             total += e;
-            sum += e * v[k_at + d as u64];
+            sum += e * v[v_at + d as u64];
         }
     }
     let mut o = 0.0f32;
@@ -107,39 +143,82 @@ pub(crate) struct Sizes {
     pub window: (usize, usize),
 }
 
-/// Whole sequences over listed keys, or ragged rows by slot.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    listed,
-    name = "listed",
-    sizes = [self.0.len, self.0.keys.most(), self.0.picks],
-    work = self.0.len * self.0.picks * self.0.width,
-    launches = listed_launches,
-)]
-pub(crate) struct Listed(pub Sizes);
+impl Sizes {
+    /// One score per row, head and pick.
+    fn scores(&self) -> usize {
+        self.len / self.width * self.picks
+    }
 
-fn listed_launches(k: &Listed, step: &Step) -> Vec<Launch> {
-    let s = &k.0;
-    let flags = [
-        usize::from(s.ragged),
-        usize::from(s.from_list),
-        s.window.0,
-        s.window.1,
-    ];
-    let counts = [s.heads, s.kv_heads, s.width, s.picks];
-    let mut launch = Launch::plain(step, &[s.len], Shape::Line(s.len));
-    launch
-        .args
-        .insert(launch.args.len() - 1, sensai_lower::Arg::value(&s.scale));
-    launch.args.push(sensai_lower::Arg::count(s.queries));
-    launch.args.push(sensai_lower::Arg::size(s.keys));
-    launch.args.extend(
-        counts
+    /// The launch of `step` over `len` threads, `scale` if given.
+    fn launch(&self, step: &Step, len: usize, scale: Option<f32>) -> Vec<Launch> {
+        let mut launch = Launch::plain(step, &[len], Shape::Line(len));
+        if let Some(scale) = scale {
+            let at = launch.args.len() - 1;
+            launch.args.insert(at, sensai_lower::Arg::value(&scale));
+        }
+        launch.args.push(sensai_lower::Arg::count(self.queries));
+        launch.args.push(sensai_lower::Arg::size(self.keys));
+        let counts = [self.heads, self.kv_heads, self.width, self.picks];
+        let (ragged, listed) = (usize::from(self.ragged), usize::from(self.from_list));
+        let flags = match scale {
+            Some(_) => vec![ragged, listed, self.window.0, self.window.1],
+            None => vec![ragged | listed << 1],
+        };
+        let args = counts
             .into_iter()
             .chain(flags)
-            .map(sensai_lower::Arg::count),
-    );
-    vec![launch]
+            .map(sensai_lower::Arg::count);
+        launch.args.extend(args);
+        vec![launch]
+    }
+
+    /// Scores, then the mix that reads them.
+    fn drafts(self, [q, k, v, ids, slots, positions]: [T; 6]) -> Vec<Draft> {
+        let mix = [
+            Read::Draft(0),
+            Read::Node(v),
+            Read::Node(ids),
+            Read::Node(slots),
+        ];
+        vec![
+            Draft::new(
+                ListedScores(self),
+                [q, k, ids, slots, positions],
+                self.scores(),
+            ),
+            Draft::new(ListedMix(self), mix, self.len),
+        ]
+    }
+}
+
+/// Each listed key's score, for whole sequences or ragged rows.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    listed_scores,
+    name = "listed_scores",
+    sizes = [self.0.len, self.0.keys.most(), self.0.picks],
+    work = self.0.scores() * self.0.width,
+    launches = scores_launches,
+)]
+pub(crate) struct ListedScores(pub Sizes);
+
+fn scores_launches(k: &ListedScores, step: &Step) -> Vec<Launch> {
+    k.0.launch(step, k.0.scores(), Some(k.0.scale))
+}
+
+/// The softmax of the scores over the listed values.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    listed_mix,
+    name = "listed_mix",
+    sizes = [self.0.len, self.0.keys.most(), self.0.picks],
+    work = self.0.len * self.0.picks,
+    launches = mix_launches,
+)]
+pub(crate) struct ListedMix(pub Sizes);
+
+fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
+    k.0.launch(step, k.0.len, None)
 }
 
 /// Ragged rows over computed keys, not kept rows.
@@ -177,8 +256,7 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         scale: a.scale,
         window: (most, 0),
     };
-    let reads = [q, k, v, ids, slots, positions];
-    Some(vec![Draft::new(Listed(sizes), reads, sizes.len)])
+    Some(sizes.drafts([q, k, v, ids, slots, positions]))
 }
 
 /// Sequences whose keys are all present, under any mask.
@@ -199,8 +277,7 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> Option<Vec<Draft>> {
         window: a.mask.window(keys),
     };
     // Slots and positions go unread, so the list stands in.
-    let reads = [site.q, site.k, site.v, ids, ids, ids];
-    Some(vec![Draft::new(Listed(sizes), reads, sizes.len)])
+    Some(sizes.drafts([site.q, site.k, site.v, ids, ids, ids]))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
