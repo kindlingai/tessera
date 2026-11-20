@@ -127,6 +127,19 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     if !(whole && sized) {
         return None;
     }
+    // Floats are f32, but the router may be bf16.
+    let floats = routed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| ![0, 4, 7, 10].contains(i));
+    if x.form != "f32" || floats.map(|(_, r)| &r.form).any(|f| f != "f32") {
+        return None;
+    }
+    let bf16 = match routed[0].form.as_str() {
+        "f32" => 0,
+        "bf16" => 1,
+        _ => return None,
+    };
     let [k, book] = width(&codes)?;
     let [shared_k, shared_book] = width(&shared.iter().collect::<Vec<_>>())?;
     let picks = picks(experts)?;
@@ -139,7 +152,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         kernel: ROUTE,
         reads: vec![Place::Read(0), Place::Read(1)],
         len: rows * experts,
-        counts: fixed(&[rows, hidden, experts]),
+        counts: fixed(&[rows, hidden, experts, bf16]),
         shape: Shape::Grid {
             across: experts.div_ceil(8),
             down: 1,

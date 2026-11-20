@@ -254,17 +254,24 @@ static __device__ void route(const float* score, const float* bias, u32 experts,
   __syncwarp();
 }
 
+// Four router weights from `at`, f32 or bf16.
+static __device__ inline float4 weights4(const void* router, u64 at, u32 bf16) {
+  if (!bf16) return *(const float4*)((const float*)router + at);
+  uint2 h = *(const uint2*)((const unsigned short*)router + at);
+  return make_float4(__uint_as_float(h.x << 16), __uint_as_float(h.x & 0xFFFF0000u),
+      __uint_as_float(h.y << 16), __uint_as_float(h.y & 0xFFFF0000u));
+}
+
 // `scores = sigmoid(x router)`. One warp per expert.
-extern "C" __global__ void glm53_route(const float* x, const float* router, float* scores,
-    u32 rows, u32 hidden, u32 experts) {
+extern "C" __global__ void glm53_route(const float* x, const void* router, float* scores,
+    u32 rows, u32 hidden, u32 experts, u32 bf16) {
   u32 lane = threadIdx.x % 32;
   u32 e = blockIdx.x * WARPS + threadIdx.x / 32;
   if (e >= experts) return;
-  const float* w = router + (u64)e * hidden;
   for (u32 r0 = 0; r0 < rows; r0 += 8) {
     float s[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (u32 i = 4 * lane; i < hidden; i += 128) {
-      float4 a = *(const float4*)(w + i);
+      float4 a = weights4(router, (u64)e * hidden + i, bf16);
 #pragma unroll
       for (u32 r = 0; r < 8; r++) {
         if (r0 + r >= rows) break;

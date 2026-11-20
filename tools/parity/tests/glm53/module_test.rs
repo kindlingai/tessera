@@ -240,16 +240,36 @@ fn module_reaches_engine() {
 /// On a CUDA GPU alone: the kernel is CUDA text.
 #[test]
 fn module_matches_interp() {
-    for book in ["", "_mul1"] {
-        matches_interp(book);
+    // The release stores its router as bf16.
+    for (book, bf16) in [("", false), ("_mul1", false), ("_mul1", true)] {
+        matches_interp(book, bf16);
     }
 }
 
+/// `v` at bf16 precision, rounded to nearest even.
+fn bf16(v: f32) -> f32 {
+    let bits = v.to_bits();
+    f32::from_bits((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000)
+}
+
 /// The kernel against the interpreter, with codes in codebook `book`.
-fn matches_interp(book: &str) {
+fn matches_interp(book: &str, router_bf16: bool) {
     let g = block();
     let mut draws = Noise(7);
-    let stored = stored(&g, &mut draws, book);
+    let mut stored = stored(&g, &mut draws, book);
+    let mut pins = pins(book);
+    if router_bf16 {
+        pins = pins.pin("*moe*.router", named("bf16").unwrap());
+        let at = g
+            .weights
+            .iter()
+            .position(|w| pins.form(&w.path).name() == "bf16");
+        let (t, _) = &mut stored[at.unwrap()];
+        *t = Tensor::f32(
+            t.shape.clone(),
+            t.floats().unwrap().iter().map(|v| bf16(*v)).collect(),
+        );
+    }
     let floats: Vec<Tensor> = stored.iter().map(|(t, _)| t.clone()).collect();
     let hidden = small().stack.hidden as usize;
     let noise = (0..ROWS * hidden).map(|_| draws.draw()).collect();
@@ -257,7 +277,7 @@ fn matches_interp(book: &str) {
     let want = run(&g, &floats, 0, std::slice::from_ref(&x)).unwrap();
     let want = want[0].floats().unwrap();
     for settings in runs().iter().filter(|s| s.gpu() == Some(Backend::Cuda)) {
-        let device = Device::guess(settings).adding(rule()).pinned(pins(book));
+        let device = Device::guess(settings).adding(rule()).pinned(pins.clone());
         let plan = lower(&g, 0, &[(Rows, ROWS as u64)], &device).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.rule).collect();
         assert_eq!(names, [NAME; 3]);
