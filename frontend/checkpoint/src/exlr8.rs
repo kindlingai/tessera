@@ -3,6 +3,7 @@
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored};
 use sensai_engine::storage::Form;
+use sensai_engine::trellis::Codebook;
 pub use sensai_engine::trellis::rotated;
 use sensai_engine::{E4M3, F16, block, trellis};
 use std::cell::RefCell;
@@ -57,7 +58,8 @@ fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
 
 /// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
 fn decoded(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
-    let form = trellis::form_for(r.k).ok_or_else(|| Error::DType(format!("{name}: K{}", r.k)))?;
+    let form = trellis::form_for(r.k, Codebook::Mcg)
+        .ok_or_else(|| Error::DType(format!("{name}: K{}", r.k)))?;
     let bytes = packed(f, name, r)?;
     Ok(form.unpack_all(&bytes))
 }
@@ -442,11 +444,11 @@ impl Release {
                 continue;
             };
             let k = (entries[0] * entries[1] * 8 / (inp * outp)) as u32;
-            let Some(form) = trellis::form_for(k) else {
+            let Some(form) = trellis::form_for(k, Codebook::Mcg) else {
                 continue;
             };
             // GLM keeps the matrix packed, its rotations beside the codes.
-            let whole = match (glm, trellis::turned_for(k)) {
+            let whole = match (glm, trellis::turned_for(k, Codebook::Mcg)) {
                 (true, Some(turned)) => Stored::Form(turned),
                 _ => Stored::F32,
             };
@@ -520,8 +522,15 @@ impl Offer for Release {
             {
                 break;
             }
+            let k = self.width;
+            let book = |w| self.with(&experts::codes_file(layer, w), experts::codebook);
+            let (Ok(routed), Ok(shared)) = (book(k), book(experts::shared_width(k))) else {
+                continue;
+            };
             let index = experts::index_file(layer);
-            let found = self.with(&index, |f| Ok(experts::offered(f, layer, self.width)));
+            let found = self.with(&index, |f| {
+                Ok(experts::offered(f, layer, k, [routed, shared]))
+            });
             out.extend(found.unwrap_or_default());
         }
         out
@@ -548,7 +557,7 @@ impl Offer for Release {
 
 /// GLM's routed and shared experts at one trellis width.
 mod experts {
-    use super::{Error, File, Slice, Stored, trellis};
+    use super::{Codebook, Error, File, Slice, Stored, trellis};
 
     /// Channels one rotation block scale covers.
     const BLOCK: usize = 128;
@@ -586,12 +595,30 @@ mod experts {
         Some([hidden, experts, ffn])
     }
 
+    /// A codes file's codebook, from its tensor names.
+    pub(crate) fn codebook(codes: &File) -> Result<Codebook, Error> {
+        for book in [Codebook::Mcg, Codebook::Mul1] {
+            if codes
+                .shape(&format!("trellis.gate{}", book.suffix()))
+                .is_some()
+            {
+                return Ok(book);
+            }
+        }
+        Err(Error::Missing("trellis.gate in a known codebook".into()))
+    }
+
     /// The layer's slices: codes as trellis sets, rotations as floats.
-    pub(crate) fn offered(idx: &File, layer: usize, k: u32) -> Vec<Slice> {
+    pub(crate) fn offered(
+        idx: &File,
+        layer: usize,
+        k: u32,
+        [routed, shared]: [Codebook; 2],
+    ) -> Vec<Slice> {
         let (Some([hidden, experts, ffn]), Some(routed), Some(shared)) = (
             sizes(idx, k),
-            trellis::form_for(k),
-            trellis::turned_for(shared_width(k)),
+            trellis::form_for(k, routed),
+            trellis::turned_for(shared_width(k), shared),
         ) else {
             return Vec::new();
         };
@@ -696,9 +723,10 @@ mod experts {
                 (false, rest.strip_suffix(".weight").ok_or_else(missing)?)
             }
         };
+        let suffix = codebook(codes)?.suffix();
         let name = match tensor {
-            true => format!("shared.trellis.{p}"),
-            false => format!("trellis.{p}"),
+            true => format!("shared.trellis.{p}{suffix}"),
+            false => format!("trellis.{p}{suffix}"),
         };
         let entries = match set {
             None => codes.bytes(&name)?,

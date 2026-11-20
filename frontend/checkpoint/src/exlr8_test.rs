@@ -249,9 +249,22 @@ fn glm_experts() {
     // A rank's experts, read alone, match its share.
     let name = format!("{at}experts.down.weight");
     let second = release.packed_share(&name, (1, 1)).unwrap();
-    let k3 = trellis::form_for(3).unwrap();
+    let k3 = trellis::form_for(3, trellis::Codebook::Mcg).unwrap();
     assert_eq!(Some(second), k3.share(&down, [1, 2, 128 * 128], [1, 1]));
     // The shared expert is not a set: it reads whole.
     assert_eq!(release.packed_share(&gate, (0, 64)).unwrap(), file);
+    // A `.mul1` suffix selects mul1 forms for the same bytes.
+    let marked: Vec<(String, Vec<u8>)> = (stored.iter())
+        .map(|(n, _, _, b)| (format!("{n}.mul1"), b.clone()))
+        .collect();
+    let marked: Vec<Tensor> = (marked.iter())
+        .map(|(n, b)| (n.as_str(), "U8", vec![b.len()], b.clone()))
+        .collect();
+    write(&dir.join("experts/exlr8-layer-001.k3.safetensors"), &marked);
+    let release = Release::open(&dir).width(3);
+    let offered = release.slices().into_iter().find(|s| s.name == name);
+    let form = offered.map(|s| s.stored);
+    assert!(matches!(form, Some(Stored::Form(f)) if f.name() == "trellis_k3_mul1"));
+    assert_eq!(release.packed(&name, None).unwrap(), down);
     std::fs::remove_dir_all(dir).unwrap();
 }

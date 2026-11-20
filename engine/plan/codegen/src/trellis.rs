@@ -4,10 +4,7 @@ use crate as sensai_codegen;
 use crate::form::{Load, form, named};
 use crate::ir::Helper;
 use crate::prelude::{Bits, Buf, F32x4, U8, helper};
-use sensai_mem::trellis::{HEAD, INPUT_SIDE, MCG, Trellis};
-use sensai_mem::trellis::{
-    TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_K3, TRELLIS_K3_ROT, TRELLIS_K4, TRELLIS_K4_ROT,
-};
+use sensai_mem::trellis::*;
 
 pub use sensai_mem::trellis::packed;
 
@@ -61,10 +58,19 @@ fn start<const K: u32>(#[build] name: &'static str, j: u32) -> u32 {
 
 /// A state's weight: hashed, then rounded to f16 and e4m3.
 #[helper("form_{name}_value")]
-fn value(#[build] name: &'static str, state: u32) -> f32 {
-    let x = (state & 0xFFFF) * MCG;
+fn value(#[build] name: &'static str, #[build] mul1: u32, state: u32) -> f32 {
+    let s = state & 0xFFFF;
+    let x = s * MCG;
     let y = (x & 0x8FFF8FFF) ^ 0x3B603B60;
-    let v = rounding("f_round_f16", 5, 10, 65504.0, y.f16(0) + y.f16(16));
+    let z = s * MUL1;
+    let sum = (z & 0xFF) + ((z >> 8) & 0xFF) + ((z >> 16) & 0xFF) + (z >> 24);
+    let scaled = (1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET;
+    let raw = if mul1 != 0 {
+        scaled
+    } else {
+        y.f16(0) + y.f16(16)
+    };
+    let v = rounding("f_round_f16", 5, 10, 65504.0, raw);
     rounding("f_round_e4m3", 4, 3, 448.0, v)
 }
 
@@ -107,19 +113,24 @@ fn slot(#[build] name: &'static str, r: u32, c: u32) -> u32 {
 
 /// Element `i` of a `[out][in]` matrix at `p`.
 #[helper("form_{name}")]
-fn one<const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> f32 {
+fn one<const K: u32>(#[build] name: &'static str, #[build] mul1: u32, p: Buf<U8>, i: u64) -> f32 {
     let inp = p.word(0);
     let n = i as u32;
     let c = col(name, p, n, inp);
     let row = n - c * inp;
     let t = tile::<K>(name, p, row, c);
     let j = slot(name, row % 16, c % 16);
-    value(name, win::<K>(name, t, start::<K>(name, j)) >> 16)
+    value(name, mul1, win::<K>(name, t, start::<K>(name, j)) >> 16)
 }
 
 /// Four along a row: codes `j`, `j+1`, `j+8`, `j+9`.
 #[helper("form_{name}_x4")]
-fn four<const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> F32x4 {
+fn four<const K: u32>(
+    #[build] name: &'static str,
+    #[build] mul1: u32,
+    p: Buf<U8>,
+    i: u64,
+) -> F32x4 {
     let inp = p.word(0);
     let n = i as u32;
     let c = col(name, p, n, inp);
@@ -129,16 +140,16 @@ fn four<const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> F32x4 
     let a = win::<K>(name, t, start::<K>(name, j));
     let b = win::<K>(name, t, start::<K>(name, j + 8));
     F32x4::new(
-        value(name, a >> 16),
-        value(name, a >> (16 - K)),
-        value(name, b >> 16),
-        value(name, b >> (16 - K)),
+        value(name, mul1, a >> 16),
+        value(name, mul1, a >> (16 - K)),
+        value(name, mul1, b >> 16),
+        value(name, mul1, b >> (16 - K)),
     )
 }
 
 impl<const K: u32> Load for Trellis<K> {
     fn codes(&self) -> Option<&'static dyn Load> {
-        form_for(K).filter(|_| self.rotated)
+        form_for(K, self.codebook).filter(|_| self.rotated)
     }
     fn ty(&self) -> &'static str {
         "u8"
@@ -154,13 +165,14 @@ impl<const K: u32> Load for Trellis<K> {
         format!("form_{}_x4({name}, {index})", self.name)
     }
     fn header(&self) -> Vec<Helper> {
-        vec![one_ir::<K>(self.name), four_ir::<K>(self.name)]
+        let mul1 = u32::from(self.codebook == Codebook::Mul1);
+        vec![one_ir::<K>(self.name, mul1), four_ir::<K>(self.name, mul1)]
     }
 }
 
-/// The form for `k` bits a weight.
-pub fn form_for(k: u32) -> Option<&'static dyn Load> {
-    named(sensai_mem::trellis::form_for(k)?.name())
+/// The form for `k` bits a weight in `codebook`.
+pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Load> {
+    named(sensai_mem::trellis::form_for(k, codebook)?.name())
 }
 
 form!(TRELLIS_K2);
@@ -169,3 +181,9 @@ form!(TRELLIS_K4);
 form!(TRELLIS_K2_ROT);
 form!(TRELLIS_K3_ROT);
 form!(TRELLIS_K4_ROT);
+form!(TRELLIS_K2_MUL1);
+form!(TRELLIS_K3_MUL1);
+form!(TRELLIS_K4_MUL1);
+form!(TRELLIS_K2_MUL1_ROT);
+form!(TRELLIS_K3_MUL1_ROT);
+form!(TRELLIS_K4_MUL1_ROT);

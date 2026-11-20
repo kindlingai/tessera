@@ -3,8 +3,13 @@
 use crate::form::{Form, Read, form};
 use sensai_graph::{DType, E4M3, F16};
 
-/// The codebook multiplier.
+/// The mcg codebook's multiplier.
 pub const MCG: u32 = 0xCBAC_1FED;
+
+/// The mul1 codebook's multiplier, scale and offset.
+pub const MUL1: u32 = 0x83DC_D12D;
+pub const MUL1_SCALE: f32 = 0.006_767_272_949_218_75;
+pub const MUL1_OFFSET: f32 = -10.382_812_5;
 
 /// Header words: `in`, `out`, the sharded side, `1 / in`.
 pub const HEAD: usize = 16;
@@ -19,6 +24,46 @@ const ENTRY: usize = 128;
 pub struct Trellis<const K: u32> {
     pub name: &'static str,
     pub rotated: bool,
+    pub codebook: Codebook,
+}
+
+/// The hash from a trellis state to its weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codebook {
+    Mcg,
+    Mul1,
+}
+
+impl Codebook {
+    /// What a release appends to its tensor names.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Codebook::Mcg => "",
+            Codebook::Mul1 => ".mul1",
+        }
+    }
+
+    /// A state's weight: the hash, then E4M3 rounding.
+    pub fn value(self, state: u32) -> f32 {
+        let state = state & 0xFFFF;
+        let v = match self {
+            Codebook::Mcg => {
+                let x = state.wrapping_mul(MCG);
+                let x = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+                let low = f32::from(F16((x & 0xFFFF) as u16));
+                let high = f32::from(F16((x >> 16) as u16));
+                f32::from(F16::from(low + high))
+            }
+            Codebook::Mul1 => {
+                let x = state.wrapping_mul(MUL1);
+                let sum: u32 = x.to_le_bytes().iter().map(|b| u32::from(*b)).sum();
+                // Exact in f32: one rounding, like a fused multiply-add.
+                let v = (1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET;
+                f32::from(F16::from(v))
+            }
+        };
+        f32::from(E4M3::from(v.clamp(-448.0, 448.0)))
+    }
 }
 
 /// The matrix's shape and side, from the header.
@@ -87,29 +132,21 @@ fn bit(tile: &[u8], b: usize) -> u32 {
     u32::from(w >> (15 - b % 16)) & 1
 }
 
-/// A state's weight: the mcg hash, then E4M3 rounding.
-fn codebook(state: u32) -> f32 {
-    let x = (state & 0xFFFF).wrapping_mul(MCG);
-    let x = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
-    let low = f32::from(F16((x & 0xFFFF) as u16));
-    let high = f32::from(F16((x >> 16) as u16));
-    let sum = f32::from(F16::from(low + high));
-    f32::from(E4M3::from(sum.clamp(-448.0, 448.0)))
-}
-
 impl<const K: u32> Trellis<K> {
-    pub const fn named(name: &'static str) -> Self {
+    pub const fn named(name: &'static str, codebook: Codebook) -> Self {
         Self {
             name,
             rotated: false,
+            codebook,
         }
     }
 
     /// Codes between rotations: `diag(suh) H T H diag(svh)`.
-    pub const fn turned(name: &'static str) -> Self {
+    pub const fn turned(name: &'static str, codebook: Codebook) -> Self {
         Self {
             name,
             rotated: true,
+            codebook,
         }
     }
 
@@ -141,7 +178,7 @@ impl<const K: u32> Trellis<K> {
     }
 
     /// Element `index` of a `[out][in]` matrix in `bytes`.
-    fn decode(bytes: &[u8], index: usize) -> f32 {
+    fn decode(&self, bytes: &[u8], index: usize) -> f32 {
         let shape = Shape::read(bytes);
         let (col, row) = (index / shape.inp, index % shape.inp);
         let at = HEAD + shape.tile(row, col) * Self::TILE;
@@ -152,7 +189,7 @@ impl<const K: u32> Trellis<K> {
         for t in 0..16usize.div_ceil(K as usize) {
             state |= Self::code(tile, (j + 256 - t) % 256) << (t * K as usize);
         }
-        codebook(state)
+        self.codebook.value(state)
     }
 }
 
@@ -204,7 +241,7 @@ impl<const K: u32> Form for Trellis<K> {
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         match self.rotated {
             true => self.unpack_all(bytes)[index],
-            false => Self::decode(bytes, index),
+            false => self.decode(bytes, index),
         }
     }
     fn unpack_all(&self, bytes: &[u8]) -> Vec<f32> {
@@ -213,7 +250,7 @@ impl<const K: u32> Form for Trellis<K> {
             true => shape.inp * shape.out,
             false => self.elements(bytes.len()),
         };
-        let t: Vec<f32> = (0..n).map(|i| Self::decode(bytes, i)).collect();
+        let t: Vec<f32> = (0..n).map(|i| self.decode(bytes, i)).collect();
         if !self.rotated {
             return t;
         }
@@ -299,22 +336,28 @@ pub fn packed(inp: usize, out: usize, side: u32, entries: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// The form for `k` bits a weight.
-pub fn form_for(k: u32) -> Option<&'static dyn Form> {
-    match k {
-        2 => Some(&TRELLIS_K2),
-        3 => Some(&TRELLIS_K3),
-        4 => Some(&TRELLIS_K4),
+/// The form for `k` bits a weight in `codebook`.
+pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
+    match (k, codebook) {
+        (2, Codebook::Mcg) => Some(&TRELLIS_K2),
+        (3, Codebook::Mcg) => Some(&TRELLIS_K3),
+        (4, Codebook::Mcg) => Some(&TRELLIS_K4),
+        (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1),
+        (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1),
+        (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1),
         _ => None,
     }
 }
 
-/// The rotated form for `k` bits a weight.
-pub fn turned_for(k: u32) -> Option<&'static dyn Form> {
-    match k {
-        2 => Some(&TRELLIS_K2_ROT),
-        3 => Some(&TRELLIS_K3_ROT),
-        4 => Some(&TRELLIS_K4_ROT),
+/// The rotated form for `k` bits a weight in `codebook`.
+pub fn turned_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
+    match (k, codebook) {
+        (2, Codebook::Mcg) => Some(&TRELLIS_K2_ROT),
+        (3, Codebook::Mcg) => Some(&TRELLIS_K3_ROT),
+        (4, Codebook::Mcg) => Some(&TRELLIS_K4_ROT),
+        (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1_ROT),
+        (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1_ROT),
+        (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1_ROT),
         _ => None,
     }
 }
@@ -368,41 +411,29 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     back
 }
 
-/// A trellis form as a registered constant.
+/// The four trellis forms at width `$k`, mcg and mul1.
 macro_rules! trellis {
-    ($(#[$doc:meta])* $name:ident = $text:literal, $k:literal, $make:ident) => {
-        $(#[$doc])*
-        pub const $name: Trellis<$k> = Trellis::$make($text);
-        form!($name);
-    };
+    ($($k:literal: $plain:ident, $turned:ident, $mul1:ident, $mul1_turned:ident;)*) => {$(
+        #[doc = concat!("exlr8 at ", $k, " bits a weight.")]
+        pub const $plain: Trellis<$k> = Trellis::named(concat!("trellis_k", $k), Codebook::Mcg);
+        #[doc = concat!("exlr8 at ", $k, " bits, between its rotations.")]
+        pub const $turned: Trellis<$k> =
+            Trellis::turned(concat!("trellis_k", $k, "_rot"), Codebook::Mcg);
+        #[doc = concat!("exlr8 at ", $k, " bits a weight, mul1 codebook.")]
+        pub const $mul1: Trellis<$k> =
+            Trellis::named(concat!("trellis_k", $k, "_mul1"), Codebook::Mul1);
+        #[doc = concat!("exlr8 at ", $k, " bits, mul1, between its rotations.")]
+        pub const $mul1_turned: Trellis<$k> =
+            Trellis::turned(concat!("trellis_k", $k, "_mul1_rot"), Codebook::Mul1);
+        form!($plain);
+        form!($turned);
+        form!($mul1);
+        form!($mul1_turned);
+    )*};
 }
 
 trellis! {
-    /// exlr8 at two bits a weight.
-    TRELLIS_K2 = "trellis_k2", 2, named
-}
-
-trellis! {
-    /// exlr8 at two bits, between its rotations.
-    TRELLIS_K2_ROT = "trellis_k2_rot", 2, turned
-}
-
-trellis! {
-    /// exlr8 at three bits a weight.
-    TRELLIS_K3 = "trellis_k3", 3, named
-}
-
-trellis! {
-    /// exlr8 at three bits, between its rotations.
-    TRELLIS_K3_ROT = "trellis_k3_rot", 3, turned
-}
-
-trellis! {
-    /// exlr8 at four bits a weight.
-    TRELLIS_K4 = "trellis_k4", 4, named
-}
-
-trellis! {
-    /// exlr8 at four bits, between its rotations.
-    TRELLIS_K4_ROT = "trellis_k4_rot", 4, turned
+    2: TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
+    3: TRELLIS_K3, TRELLIS_K3_ROT, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
+    4: TRELLIS_K4, TRELLIS_K4_ROT, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
 }

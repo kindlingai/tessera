@@ -1,6 +1,6 @@
 use crate::block_test::same_part;
 use crate::form::Form;
-use crate::trellis::{INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, packed, rotated};
+use crate::trellis::{Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, packed, rotated};
 use sensai_graph::F16;
 
 /// Each side's cuts, and a set's, decode as the whole.
@@ -55,4 +55,22 @@ fn rotated_trellis_splits() {
     let parts = TRELLIS_K2_ROT.split(&file).unwrap();
     assert_eq!(parts, [codes, floats(&suh), floats(&svh)]);
     assert!(TRELLIS_K2.split(&file).is_none());
+}
+
+/// mul1 weights match a decode written from the format alone.
+#[test]
+fn mul1_values() {
+    let want = [
+        (0, -3.5),
+        (1, 0.625),
+        (0x1234, -0.5625),
+        (0x8000, -0.875),
+        (0xBEEF, 0.15625),
+        (0xFFFF, -0.625),
+        (0x7A5C, -0.9375),
+        (0x0F0F, 0.6875),
+    ];
+    for (state, v) in want {
+        assert_eq!(Codebook::Mul1.value(state), v, "state {state:#x}");
+    }
 }

@@ -119,8 +119,17 @@ fn codes_match_decode() {
     let mut draws = Noise(3);
     let (inp, out) = (512, 256);
     // Rotated files add f16 `suh` and `svh` after the codes.
-    for (k, turned) in [(2, false), (3, false), (4, false), (2, true), (4, true)] {
-        let codes = trellis::form_for(k).unwrap();
+    let forms = [
+        (2, false, ""),
+        (3, false, ""),
+        (4, false, ""),
+        (2, true, ""),
+        (4, true, ""),
+        (3, false, "_mul1"),
+        (3, true, "_mul1"),
+    ];
+    for (k, turned, book) in forms {
+        let codes = named(&format!("trellis_k{k}{book}")).unwrap();
         let entries: Vec<u8> = (0..out * inp * k as usize / 8)
             .map(|_| (draws.draw() * 256.0) as u8)
             .collect();
