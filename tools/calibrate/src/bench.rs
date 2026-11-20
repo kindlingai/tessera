@@ -139,3 +139,22 @@ pub fn slower(marks: &[Mark], base: &str, slack: f64) -> Vec<String> {
     }
     out
 }
+
+/// Shapes timed before and after a calibration, to see drift.
+const SENTINELS: [[u64; 3]; 2] = [[16, 4096, 4096], [1, 4096, 4096]];
+
+/// Each sentinel shape's best whole-plan time.
+pub fn sentinels(settings: &Settings) -> Result<Vec<f64>, Error> {
+    let one = bounded(&[Rows]);
+    let mut seconds = Vec::new();
+    for [m, k, n] in SENTINELS {
+        seconds.push(timed(&linear(&one, k, n), &[(Rows, m)], settings)?);
+    }
+    Ok(seconds)
+}
+
+/// The largest change between two sentinel runs, as a share.
+pub fn drift(first: &[f64], last: &[f64]) -> f64 {
+    let change = first.iter().zip(last).map(|(a, b)| (b / a - 1.0).abs());
+    change.fold(0.0, f64::max)
+}

@@ -290,7 +290,7 @@ fn near_samples_estimate() {
         (&mapped(64), 3e-3),
     ]);
     assert_eq!(device.samples(), 2);
-    assert!((seconds(&device, 64) - 3e-3).abs() < 1e-9, "the median");
+    assert!((seconds(&device, 64) - 2e-3).abs() < 1e-9, "a low quartile");
     assert!(seconds(&device.clone().without("map"), 64).is_infinite());
 }
 

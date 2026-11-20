@@ -28,6 +28,9 @@ pub struct Sample {
     pub sizes: Vec<usize>,
     pub work: f64,
     pub seconds: f64,
+    /// The middle half of the tries, over the kept time.
+    #[serde(default)]
+    pub spread: f64,
     /// Logarithms of the sizes and the work.
     #[serde(skip)]
     at: Vec<f64>,
@@ -48,6 +51,7 @@ impl Sample {
             sizes,
             work,
             seconds,
+            spread: 0.0,
         }
     }
 
@@ -94,13 +98,27 @@ impl Timings {
             }
         }
         for (name, mut sample, mut all) in seen {
-            // The median shrugs off one slow launch.
+            // Noise only adds time, so a low quartile is kept.
             all.sort_by(f64::total_cmp);
-            sample.seconds = all[all.len() / 2];
+            let (low, high) = (all[(all.len() - 1) / 4], all[3 * (all.len() - 1) / 4]);
+            sample.seconds = low;
+            sample.spread = (high - low) / low.max(f64::MIN_POSITIVE);
             let timed = self.0.entry(name.to_string()).or_default();
             timed.retain(|old| !old.same(&sample));
             timed.push(sample);
         }
+    }
+
+    /// The share of sampled seconds whose spread passes `above`.
+    pub fn noisy(&self, above: f64) -> f64 {
+        let (mut all, mut noisy) = (0.0, 0.0);
+        for s in self.0.values().flatten() {
+            all += s.seconds;
+            if s.spread > above {
+                noisy += s.seconds;
+            }
+        }
+        if all > 0.0 { noisy / all } else { 0.0 }
     }
 
     /// Rebuilds what loading skipped.

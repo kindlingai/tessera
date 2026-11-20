@@ -396,6 +396,11 @@ impl Device {
         self.timed.record(timed);
     }
 
+    /// The share of sampled seconds whose spread passes `above`.
+    pub fn noisy(&self, above: f64) -> f64 {
+        self.timed.noisy(above)
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), Error> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;

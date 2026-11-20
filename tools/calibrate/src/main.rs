@@ -43,9 +43,15 @@ fn hops(cluster: &Cluster) {
     }
 }
 
+/// A sample whose tries spread past this counts as noisy.
+const NOISY: f64 = 0.2;
+/// Sentinel drift past this share refuses the run.
+const DRIFT: f64 = 0.1;
+
 /// Probes the chip, times the grid, restarts the stored file.
 fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
+    let first = bench::sentinels(settings)?;
     let readings = read(&suite(), settings)?;
     let cluster = links(settings)?;
     let mut device = Device::guess(settings);
@@ -57,6 +63,7 @@ fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     };
     let mut host = Device::guess(&cpu);
     Grid::host().run(&mut host, &cpu)?;
+    let last = bench::sentinels(settings)?;
     let seconds = start.elapsed().as_secs_f64();
     let launches = timed.len();
     println!(
@@ -74,6 +81,20 @@ fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     }
     room(&pool, &timed);
     hops(&cluster);
+    let (noisy, drift) = (device.noisy(NOISY), bench::drift(&first, &last));
+    println!(
+        "{:.0}% of timed seconds spread past {:.0}%; sentinels moved {:.1}%",
+        noisy * 100.0,
+        NOISY * 100.0,
+        drift * 100.0
+    );
+    if drift > DRIFT {
+        let moved = format!("{:.0}%", drift * 100.0);
+        return Err(format!(
+            "the device changed speed by {moved} during the run, so nothing is saved"
+        )
+        .into());
+    }
     // The stored device carries the fit, for unmeasured kernels.
     let device = device.fitted(fit).zoned(cluster).hosted(&host);
     let path = Device::path(settings, &device.platform).ok_or("no home: set TESSERA_COSTS")?;

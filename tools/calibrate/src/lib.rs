@@ -19,19 +19,25 @@ use tessera_lower::{Device, Settings, Step, View, ZoneKind, lower, select};
 use tessera_run::Run;
 use tessera_sim::Chip;
 
-/// Whole passes over a plan, each step timed once.
-const PASSES: usize = 3;
+/// Timed tries of each step. `fit` keeps a low one.
+const TRIES: usize = 5;
+/// Launches back to back in one try, at most.
+const BURST: usize = 16;
+/// Seconds one try aims to fill.
+const AIM: f64 = 1e-3;
 
 /// Times every launch of the plan, its inputs already fed.
 pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
     let steps = runner.plan().steps.clone();
     // The first run pays for anything set up lazily.
     runner.submit(0..steps.len())?;
-    let mut timed = Vec::with_capacity(PASSES * steps.len());
-    // In plan order, so a launch finds its weights cold.
-    for _ in 0..PASSES {
-        for (i, step) in steps.iter().enumerate() {
-            timed.push((step.clone(), runner.repeat(i, 1)?));
+    let mut timed = Vec::with_capacity(TRIES * steps.len());
+    // Bursts keep the clocks up, as a running plan does.
+    for (i, step) in steps.iter().enumerate() {
+        let once = runner.repeat(i, 1)?;
+        let times = (AIM / once.max(1e-7)).clamp(1.0, BURST as f64) as usize;
+        for _ in 0..TRIES {
+            timed.push((step.clone(), runner.repeat(i, times)?));
         }
     }
     Ok(timed)
