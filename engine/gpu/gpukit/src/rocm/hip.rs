@@ -25,6 +25,8 @@ pub(crate) const ATTR_MEMORY_BUS_WIDTH: c_int = 59;
 pub(crate) const ATTR_MEMORY_CLOCK_RATE: c_int = 60;
 pub(crate) const ATTR_COMPUTE_CAPABILITY_MINOR: c_int = 61;
 pub(crate) const ATTR_MULTIPROCESSOR_COUNT: c_int = 63;
+/// AMD attributes start at 10000.
+pub(crate) const ATTR_WALL_CLOCK_RATE: c_int = 10017;
 pub(crate) const HIP_STREAM_NON_BLOCKING: u32 = 1;
 /// Other threads may still synchronize while a capture is open.
 pub(crate) const HIP_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
@@ -81,6 +83,7 @@ sensai_dl::library! {
         pub hip_event_record: entry::Replay = "hipEventRecord",
         pub hip_event_elapsed_time: entry::Elapsed = "hipEventElapsedTime",
         pub hip_event_destroy: entry::OnHandle = "hipEventDestroy",
+        pub hip_module_get_global: entry::Global = "hipModuleGetGlobal",
         hip_get_error_name: HipGetErrorName = "hipGetErrorName",
         hip_get_error_string: HipGetErrorString = "hipGetErrorString",
     }

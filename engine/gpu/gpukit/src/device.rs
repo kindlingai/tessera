@@ -53,6 +53,16 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// Ends a `gate`.
     fn release(&self) {}
 
+    /// The device address of `kernel`'s global `name`, where kept.
+    fn global(&self, _kernel: &Self::Kernel, _name: &str) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
+    /// Ticks per second of the clock kernels read.
+    fn ticks(&self) -> f64 {
+        1e9
+    }
+
     /// The bytes at `ptr`, when the host addresses them.
     fn mapped(&self, _ptr: u64, _size: usize) -> Option<NonNull<u8>> {
         None

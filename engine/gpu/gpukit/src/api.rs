@@ -58,6 +58,9 @@ pub(crate) mod entry {
     pub(crate) type Replay = unsafe extern "C" fn(Handle, Handle) -> c_int;
     /// Milliseconds between two events.
     pub(crate) type Elapsed = unsafe extern "C" fn(*mut f32, Handle, Handle) -> c_int;
+    /// A module global's address and size, by name.
+    pub(crate) type Global =
+        unsafe extern "C" fn(*mut u64, *mut usize, Handle, *const c_char) -> c_int;
 }
 
 /// The kind of handle to free.
@@ -153,6 +156,12 @@ pub trait Api: Sync + Sized + 'static {
     fn event(&self) -> Result<Handle, Error>;
     /// Milliseconds from `from` to `to`, once both are done.
     fn elapsed(&self, from: Handle, to: Handle) -> Result<f32, Error>;
+    /// The address of `module`'s global `name`, if it has one.
+    fn global(&self, module: Handle, name: &CStr) -> Option<u64>;
+    /// Ticks per second of the clock kernels read.
+    fn ticks(_ctx: &Context<Self>) -> f64 {
+        1e9
+    }
     /// A loadable image of `source` for this device.
     fn compile(ctx: &Context<Self>, source: &str) -> Result<Vec<u8>, Error>;
 
@@ -309,6 +318,13 @@ impl<A: Api> Context<A> {
             ms
         })?;
         Ok(gaps.into_iter().map(|ms| ms as f64 / 1e3).collect())
+    }
+
+    /// The device address of `kernel`'s module global `name`.
+    pub fn global(&self, kernel: &Kernel<A>, name: &str) -> Result<Option<u64>, Error> {
+        let name = CString::new(name).map_err(|e| A::error(format!("global {name:?}: {e}")))?;
+        let module = kernel._module.raw;
+        self.locked(|a| Ok(a.global(module, &name)))
     }
 
     /// Holds the default stream until `release`.
@@ -554,6 +570,14 @@ impl<A: Api> Device for Context<A> {
         Context::gate(self).map(|_| true)
     }
 
+    fn global(&self, kernel: &Kernel<A>, name: &str) -> Result<Option<u64>, Error> {
+        Context::global(self, kernel, name)
+    }
+
+    fn ticks(&self) -> f64 {
+        A::ticks(self)
+    }
+
     fn release(&self) {
         Context::release(self);
     }
@@ -626,6 +650,7 @@ macro_rules! shared_api {
         replay: ($replay:ident, $replay_label:literal),
         unload: ($module:ident, $exec:ident, $graph:ident, $stream:ident),
         events: ($event:ident, $record:ident, $elapsed:ident, $unevent:ident),
+        global: $global:ident,
         load: ($load:ident, $load_label:literal),
         function: ($func:ident, $func_label:literal),
         alloc: ($alloc:ident, $alloc_label:literal),
@@ -750,6 +775,12 @@ macro_rules! shared_api {
             let code = unsafe { (self.$record)(event, ::std::ptr::null_mut()) };
             self.check(code, stringify!($record))?;
             Ok(event)
+        }
+
+        fn global(&self, module: $crate::api::Handle, name: &::std::ffi::CStr) -> Option<u64> {
+            let (mut at, mut size) = (0, 0);
+            let code = unsafe { (self.$global)(&mut at, &mut size, module, name.as_ptr()) };
+            self.check(code, stringify!($global)).ok().map(|_| at)
         }
 
         fn elapsed(

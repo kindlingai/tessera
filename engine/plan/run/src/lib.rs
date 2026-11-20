@@ -8,6 +8,10 @@ mod held;
 mod kernels;
 mod loopback;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
+mod marks;
+#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+mod marks_test;
+#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod overrides;
 #[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
 mod overrides_test;
@@ -18,7 +22,7 @@ pub mod testing;
 
 pub use held::Held;
 pub use loopback::Loopback;
-pub use profile::{Profile, Spent};
+pub use profile::{Marks, Profile, Region, Spent};
 pub use rank::Rank;
 pub use run::{Base, Outcome, Reload, Run};
 

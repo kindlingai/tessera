@@ -164,6 +164,7 @@ impl Api for Driver {
         replay: (cu_graph_launch, "cuGraphLaunch"),
         unload: (cu_module_unload, cu_graph_exec_destroy, cu_graph_destroy, cu_stream_destroy),
         events: (cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy),
+        global: cu_module_get_global,
         load: (cu_module_load_data, "cuModuleLoadData"),
         function: (cu_module_get_function, "cuModuleGetFunction"),
         alloc: (cu_mem_alloc, "cuMemAlloc"),

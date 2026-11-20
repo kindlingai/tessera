@@ -56,10 +56,10 @@ pub(crate) fn text(source: &Source, backend: Backend) -> String {
     }
 }
 
-/// A file's last seen version, and its compiled kernel.
+/// A file's last seen version, and its kernel and text.
 struct File<K> {
     seen: Option<Version>,
-    kernel: Option<K>,
+    kernel: Option<(K, String)>,
 }
 
 /// Kernel files in one directory.
@@ -112,7 +112,7 @@ impl<K> Overrides<K> {
             }
             Some(text) => match compile(&text) {
                 Ok(kernel) => {
-                    file.kernel = Some(kernel);
+                    file.kernel = Some((kernel, text));
                     Outcome::Loaded
                 }
                 Err(e) => Outcome::Failed(e.to_string()),
@@ -122,7 +122,12 @@ impl<K> Overrides<K> {
     }
 
     pub(crate) fn kernel(&self, entry: &str) -> Option<&K> {
-        self.files.get(entry)?.kernel.as_ref()
+        Some(&self.files.get(entry)?.kernel.as_ref()?.0)
+    }
+
+    /// The text of `entry`'s loaded file.
+    pub(crate) fn text(&self, entry: &str) -> Option<&str> {
+        Some(&self.files.get(entry)?.kernel.as_ref()?.1)
     }
 
     /// Writes `text` as `entry`'s file, unless one exists.

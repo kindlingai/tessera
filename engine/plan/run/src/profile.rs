@@ -62,3 +62,28 @@ impl fmt::Display for Report<'_> {
         Ok(())
     }
 }
+
+/// Seconds between two `TS_MARK()` lines, once per block and pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Region {
+    pub from: u32,
+    pub to: u32,
+    pub seconds: Vec<f64>,
+}
+
+impl Region {
+    /// The middle and the largest of `seconds`.
+    pub fn spread(&self) -> (f64, f64) {
+        let mut sorted = self.seconds.clone();
+        sorted.sort_by(f64::total_cmp);
+        let last = sorted.last().copied().unwrap_or(0.0);
+        (sorted.get(sorted.len() / 2).copied().unwrap_or(0.0), last)
+    }
+}
+
+/// A kernel's marked regions, and marks past each block's room.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Marks {
+    pub regions: Vec<Region>,
+    pub lost: u64,
+}

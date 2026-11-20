@@ -149,6 +149,7 @@ impl Api for Runtime {
         replay: (hip_graph_launch, "hipGraphLaunch"),
         unload: (hip_module_unload, hip_graph_exec_destroy, hip_graph_destroy, hip_stream_destroy),
         events: (hip_event_create, hip_event_record, hip_event_elapsed_time, hip_event_destroy),
+        global: hip_module_get_global,
         load: (hip_module_load_data, "hipModuleLoadData"),
         function: (hip_module_get_function, "hipModuleGetFunction"),
         alloc: (hip_malloc, "hipMalloc"),
@@ -159,6 +160,12 @@ impl Api for Runtime {
         ),
         host_free: hip_host_free,
         zero: (hip_memset, "hipMemset"),
+    }
+
+    fn ticks(ctx: &Context) -> f64 {
+        // `wall_clock64` counts at this rate, in kHz.
+        ctx.attr(hip::ATTR_WALL_CLOCK_RATE)
+            .map_or(1e8, |khz| khz as f64 * 1e3)
     }
 
     fn set_current(&self, _: &Own, device: c_int) -> Result<(), Error> {

@@ -147,6 +147,10 @@ pub trait Run {
     fn dump(&self) -> Result<Vec<PathBuf>, Error> {
         Ok(Vec::new())
     }
+    /// Times `step`'s `TS_MARK()` gaps. `None` on Metal and hosts.
+    fn marks(&mut self, _step: usize) -> Result<Option<crate::Marks>, Error> {
+        Ok(None)
+    }
     /// Runs these steps as `submit` does, timed by the device.
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
         self.submit(steps).map(|_| None)
