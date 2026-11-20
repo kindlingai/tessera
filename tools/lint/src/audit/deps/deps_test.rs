@@ -74,16 +74,23 @@ fn testing_paths() {
     let lib = "use big::{A, B};\nfn f() { crate::testing::ci(); }\n\
                #[cfg(test)]\nmod t { use big::testing::x; }\n";
     let test = ("e/user/src/lib_test.rs", "use kit::testing::y;\n");
-    let found = run(&[("e/user/src/lib.rs", lib), test]);
+    let main = ("e/user/src/main.rs", "fn main() {}\n");
+    let found = run(&[("e/user/src/lib.rs", lib), test, main]);
     assert_eq!(rules(&found), ["testing-path"]);
+    let harness = run(&[("e/user/src/lib.rs", lib), test]);
+    assert!(!rules(&harness).contains(&"testing-path"));
 }
 
 #[test]
 fn reexports() {
     let lib = "pub use big::{A, B};\npub use low::C;\npub use own::D;\n";
-    let user = ("e/kit/src/lib.rs", "fn f() { user::A; user::C; }\n");
+    let user = (
+        "e/kit/src/lib.rs",
+        "use user::m::*;\nfn f() { user::A; user::C; }\n",
+    );
     let found = run(&[
         ("e/user/src/lib.rs", lib),
+        ("e/user/src/m.rs", "pub use big::E;\n"),
         user,
         ("e/user/tests/t.rs", "use kit::k;\n"),
     ]);

@@ -1,6 +1,6 @@
 use crate::Dialect;
-use crate::block::Q4_0;
 use crate::ir::{Body, Param};
+use sensai_mem::block::Q4_0;
 
 /// A kernel reading a block form carries its decode functions.
 #[test]

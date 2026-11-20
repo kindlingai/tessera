@@ -1,11 +1,13 @@
 #!/bin/sh
 # Fails on Co-Authored-By trailers that credit an AI tool or bot.
+# A bot has a known name, or an address no person reads.
 # Usage: check-coauthors.sh <rev-range>
 #        check-coauthors.sh --message <file>
 set -e
 
 bots='anthropic|claude|openai|chatgpt|codex|z\.ai|zhipu|glm|copilot|gemini|cursor|devin|aider|\[bot\]'
-pattern="^[[:space:]]*co-authored-by:.*($bots)"
+unread='<(no-?reply|bot)@|\.(invalid|example|test|localhost)>'
+pattern="^[[:space:]]*co-authored-by:.*($bots|$unread)"
 
 # Prints offending lines from stdin. True if any.
 offending() {

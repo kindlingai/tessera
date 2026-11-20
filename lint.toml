@@ -52,10 +52,14 @@ extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", 
 hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]
 
 # Rules that report in the findings and do not fail the run.
-warn_rules = ["thin-edge", "testing-path", "reexport", "placement"]
+warn_rules = ["thin-edge", "placement"]
 
 # Statements in a function body before a copy elsewhere counts.
 min_repeat_statements = 4
+
+# A `match` or closure with `min_tokens` tokens and `min_paths` names after
+# `::` fails when its shape, names collapsed, is in `min_places` places.
+repeat_exprs = { min_tokens = 24, min_paths = 2, min_places = 3 }
 
 # Test files here may time code. Other test files may not.
 timing_exempt = ["tools/calibrate/"]

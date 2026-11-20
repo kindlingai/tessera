@@ -57,6 +57,7 @@ pub struct Limits {
     pub thin_edge: audit::Thin,
     pub warn_rules: Vec<String>,
     pub min_repeat_statements: usize,
+    pub repeat_exprs: audit::Exprs,
     pub timing_exempt: Vec<String>,
 }
 

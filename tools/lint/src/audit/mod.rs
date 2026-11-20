@@ -24,6 +24,7 @@ use crate::{LIMITS, Violation};
 
 pub use deps::Thin;
 pub use layers::{Allow, Facade};
+pub use repeats::Exprs;
 
 /// Rules in `warn_rules` only advise.
 pub fn level(rule: &str, warn: &[String]) -> Level {
@@ -48,5 +49,6 @@ pub fn check(
     unused::check(dirs, sources, out);
     suite::check(&pkgs, sources, out);
     repeats::check(sources, out);
+    repeats::exprs(sources, &LIMITS.repeat_exprs, out);
     Ok(())
 }

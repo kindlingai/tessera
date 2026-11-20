@@ -1,4 +1,4 @@
-use super::repeats::check;
+use super::repeats::{Exprs, check, exprs};
 use crate::files::Source;
 
 fn flagged(files: &[(&str, &str)]) -> Vec<String> {
@@ -12,6 +12,12 @@ fn flagged(files: &[(&str, &str)]) -> Vec<String> {
         .collect();
     let mut out = Vec::new();
     check(&sources, &mut out);
+    let limits = Exprs {
+        min_tokens: 24,
+        min_paths: 2,
+        min_places: 3,
+    };
+    exprs(&sources, &limits, &mut out);
     out.into_iter().map(|v| v.path).collect()
 }
 
@@ -56,4 +62,13 @@ fn tests_and_traits_pass() {
         ])
         .is_empty()
     );
+}
+
+#[test]
+fn matches_thrice_fail() {
+    let f = "fn f(p: &[S]) -> String {\n    let seg = |s: &S| match s {\n        \
+             S::Field(f) => f.clone(),\n        S::Index(i) => i.to_string(),\n    };\n    \
+             p.iter().map(seg).collect()\n}\n";
+    assert!(flagged(&[("a.rs", f), ("b.rs", f)]).is_empty());
+    assert_eq!(flagged(&[("a.rs", f), ("b.rs", f), ("c.rs", f)]), ["a.rs"]);
 }

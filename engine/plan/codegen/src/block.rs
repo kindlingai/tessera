@@ -7,8 +7,7 @@ use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use sensai_graph::{E2M1, E4M3, E8M0, F16};
 use sensai_mem::block::{Block, Code, I8, Nibble, Scale};
-
-pub use sensai_mem::block::{INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
+use sensai_mem::block::{INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
 
 /// A code as kernel text reads it.
 pub trait LoadCode: Code {

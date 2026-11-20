@@ -177,9 +177,19 @@ fn files<'a>(pkgs: &'a [Pkg], sources: &'a [Source]) -> Vec<File<'a>> {
     found
 }
 
+/// A test harness: a library without dependents or binaries.
+fn harness(pkgs: &[Pkg], files: &[File], pkg: &Pkg) -> bool {
+    let used = pkgs
+        .iter()
+        .flat_map(|p| &p.deps)
+        .any(|d| d.name == pkg.name);
+    let bin = |f: &File| f.rel == "src/main.rs" || f.rel.starts_with("src/bin/");
+    !used && !files.iter().any(|f| f.pkg.name == pkg.name && bin(f))
+}
+
 /// Only test code names `testing` modules.
-fn testing(files: &[File], out: &mut Vec<Violation>) {
-    for f in files {
+fn testing(pkgs: &[Pkg], files: &[File], out: &mut Vec<Violation>) {
+    for f in files.iter().filter(|f| !harness(pkgs, files, f.pkg)) {
         let mut lines = BTreeSet::new();
         for n in f
             .code
@@ -210,6 +220,6 @@ pub fn check(
 ) {
     let files = files(pkgs, sources);
     edges::check(pkgs, &files, base, thin, out);
-    testing(&files, out);
+    testing(pkgs, &files, out);
     reexport::check(pkgs, &files, out);
 }
