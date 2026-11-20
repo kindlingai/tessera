@@ -134,9 +134,9 @@ impl Run for Runner {
         if !self.base.fresh(plan)? {
             return Ok(());
         }
-        self.base.held.bind(plan, |zone, bytes| {
-            Ok(Buffer::new(zone, Host::new(bytes.max(4))))
-        })?;
+        self.base
+            .held
+            .bind(plan, |zone, bytes| Ok(Buffer::new(zone, Host::new(bytes))))?;
         self.bodies = plan
             .steps
             .iter()

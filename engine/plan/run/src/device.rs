@@ -345,7 +345,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.graphs.clear();
         let ctx = self.ctx;
         self.base.held.bind(plan, |zone, bytes| {
-            let buffer = DeviceBuffer::alloc(ctx, bytes.max(4))?;
+            let buffer = DeviceBuffer::alloc(ctx, bytes)?;
             // Kernels may read what they are about to write.
             buffer.zero()?;
             Ok(Buffer::new(zone, buffer))

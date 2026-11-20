@@ -499,3 +499,27 @@ fn unlinked_rules_fail() {
     };
     assert!(what.to_string().contains("use rules as _;"), "{what}");
 }
+
+/// A weight under four bytes keeps its values on replan.
+#[test]
+fn small_weights_stay() {
+    let dims = vec![
+        Dim::bounded(Seqs, 4),
+        Dim::bounded(Rows, 8),
+        Dim::fixed(Hidden, 1),
+    ];
+    let m = Model::new(dims);
+    let w: Gains = declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [floats([Seqs, Rows, Hidden])]);
+    let g = m.finish([(Role::Logits, &x.mul_vector(&w.a).mul_vector(&w.b))]);
+    let device = Device::guess(&host()).pinned(Pins::all(BF16_FORM));
+    let plan = |rows| lower(&g, 0, &[(Seqs, 1), (Rows, rows)], &device).unwrap();
+    let mut runner = open(plan(2), &host()).unwrap();
+    runner
+        .load(0, Tensor::f32(vec![1], vec![0.5]).view())
+        .unwrap();
+    runner.replan(&plan(3)).unwrap();
+    let slot = runner.plan().weights[0].slot;
+    assert_eq!(runner.plan().buffers[slot.buffer as usize], 2);
+    assert_eq!(runner.read(slot).unwrap().view().to_f32().unwrap(), [0.5]);
+}

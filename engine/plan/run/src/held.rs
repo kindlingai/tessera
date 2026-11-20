@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use tessera_lower::{Plan, Slot};
 use tessera_mem::{Buffer, View, ViewMut};
 
+/// Bytes a buffer holds at least, as zero-byte allocations fail.
+const LEAST: usize = 4;
+
 /// The owner of a buffer that outlives a plan.
 #[derive(Clone, Copy)]
 enum Owner {
@@ -99,14 +102,14 @@ impl Held {
                     self.all.len() - 1
                 }),
             };
-            let same = |buffer: &Buffer| buffer.zone == zone && buffer.bytes() == bytes;
+            let same = |buffer: &Buffer| buffer.zone == zone && buffer.bytes() == bytes.max(LEAST);
             let at = match held.filter(|at| owner.is_none() || same(&self.all[*at])) {
                 Some(at) => at,
                 None => {
                     // Scratch grows in steps, so a growing context reuses it.
                     let want = match owner {
-                        Some(_) => bytes,
-                        None => bytes.next_power_of_two(),
+                        Some(_) => bytes.max(LEAST),
+                        None => bytes.max(LEAST).next_power_of_two(),
                     };
                     self.all.push(alloc(zone, want)?);
                     self.all.len() - 1
