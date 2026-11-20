@@ -8,7 +8,6 @@ use crate::profile::Marks;
 use crate::run::{Base, Reload, Run};
 use sensai_codegen::Dialect;
 use sensai_engine_settings::Settings;
-use sensai_gpukit::backend::Backend;
 use sensai_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use sensai_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use sensai_graph::DimName;
@@ -495,11 +494,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn precision(&self) -> sensai_codegen::Precision {
-        crate::precision(match D::BACKEND {
-            Backend::Metal => sensai_engine_settings::Backend::Metal,
-            Backend::Cuda => sensai_engine_settings::Backend::Cuda,
-            Backend::Rocm => sensai_engine_settings::Backend::Rocm,
-        })
+        crate::precision(D::BACKEND)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

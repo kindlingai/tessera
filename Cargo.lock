@@ -1703,6 +1703,7 @@ dependencies = [
 name = "sensai-engine-settings"
 version = "0.1.0"
 dependencies = [
+ "derive_more",
  "serde",
 ]
 
@@ -1765,14 +1766,13 @@ dependencies = [
 name = "sensai-gpukit"
 version = "0.1.0"
 dependencies = [
- "derive_more",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "sensai-dl",
+ "sensai-engine-settings",
  "sensai-mem",
  "sensai-platform",
- "serde",
  "thiserror",
 ]
 

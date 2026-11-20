@@ -2,9 +2,10 @@
 
 use std::path::PathBuf;
 
-/// A GPU that runs kernels. gpukit has its own copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+/// A GPU that runs kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, derive_more::Display)]
 #[serde(rename_all = "lowercase")]
+#[display(rename_all = "lowercase")]
 pub enum Backend {
     Metal,
     Cuda,

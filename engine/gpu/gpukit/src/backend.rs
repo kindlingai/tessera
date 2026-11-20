@@ -1,14 +1,6 @@
 //! Which GPU backend this build dispatches to.
 
-/// A backend that can run kernels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, derive_more::Display)]
-#[serde(rename_all = "lowercase")]
-#[display(rename_all = "lowercase")]
-pub enum Backend {
-    Metal,
-    Cuda,
-    Rocm,
-}
+pub use sensai_engine_settings::Backend;
 
 /// The backend this build uses, if any.
 pub fn available() -> Option<Backend> {

@@ -105,12 +105,7 @@ use std::sync::Arc;
 
 /// This build's GPU, when it can run kernels here.
 pub fn gpu() -> Option<Backend> {
-    use sensai_gpukit::backend as gk;
-    Some(match gk::picked()? {
-        gk::Backend::Metal => Backend::Metal,
-        gk::Backend::Cuda => Backend::Cuda,
-        gk::Backend::Rocm => Backend::Rocm,
-    })
+    sensai_gpukit::backend::picked()
 }
 
 /// How `backend`'s tiles round.

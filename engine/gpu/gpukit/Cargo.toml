@@ -15,9 +15,8 @@ rocm = []
 
 [dependencies]
 thiserror = "2"
-derive_more = { version = "2.1", features = ["display"] }
-serde = { version = "1", features = ["derive"] }
 sensai-dl = { workspace = true }
+sensai-engine-settings = { workspace = true }
 sensai-mem = { workspace = true }
 sensai-platform = { workspace = true }
 
