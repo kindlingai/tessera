@@ -31,3 +31,11 @@ fn strftime_reads_clock() {
     let t = Template::with_clock("{{ strftime_now('%d %B %Y') }}".into(), clock).unwrap();
     assert_eq!(t.render(&[], true).unwrap(), "04 March 2026");
 }
+
+#[test]
+fn stops_at_break() {
+    let source = "{% for m in messages %}{% if m.role == 'user' %}{% break %}{% endif %}{{ m.role }}{% endfor %}";
+    let t = Template::new(source.into()).unwrap();
+    let turns = [say("system", ""), say("user", ""), say("tool", "")];
+    assert_eq!(t.render(&turns, true).unwrap(), "system");
+}
