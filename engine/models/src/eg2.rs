@@ -1,11 +1,15 @@
 //! EmbeddingGemma 2: a bidirectional encoder with per-layer embeddings.
 
+use crate::keys::Keys;
 use crate::shared::{Attend, Dense, Side, Stack, listed as listed_ports, tokens};
 use sensai_trace::DimName::*;
 use sensai_trace::{
     Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, Role, Scalar, Tensor,
     Weights, each,
 };
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::BTreeMap;
 
 pub struct Config {
     /// Its `head_dim` is a sliding layer's.
@@ -39,6 +43,46 @@ impl Config {
             theta: 1e4,
             full_theta: 1e6,
             eps: 1e-6,
+        }
+    }
+
+    /// The config `k` holds, for these launch bounds.
+    pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        k.fixed("text_config.model_type", json!("embedding_gemma2_text"));
+        k.fixed("text_config.hidden_activation", json!("gelu_pytorch_tanh"));
+        k.fixed("text_config.attention_bias", json!(false));
+        for kind in ["sliding_attention", "full_attention"] {
+            let path = format!("text_config.rope_parameters.{kind}.rope_type");
+            k.fixed(&path, json!("default"));
+        }
+        let sizes = [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "head_dim",
+            "intermediate_size",
+        ]
+        .map(|key| k.need(&[&format!("text_config.{key}")]));
+        let layers = sizes[2];
+        let (full_every, full_head_dim) = (full_layers(k, layers), full_heads(k, layers));
+        Self {
+            stack: Stack::sized(sizes, max_seqs, max_context),
+            kv_heads: k.need(&["text_config.num_key_value_heads"]),
+            full_every,
+            full_head_dim,
+            per_layer: k.need(&["text_config.hidden_size_per_layer_input"]),
+            embedding: k.need(&["text_config.embedding_dim"]),
+            window: k.need(&["text_config.sliding_window"]),
+            theta: k.need(&[
+                "text_config.rope_parameters.sliding_attention.rope_theta",
+                "text_config.rope_local_base_freq",
+            ]),
+            full_theta: k.need(&[
+                "text_config.rope_parameters.full_attention.rope_theta",
+                "text_config.rope_theta",
+            ]),
+            eps: k.need(&["text_config.rms_norm_eps"]),
         }
     }
 
@@ -257,4 +301,49 @@ pub fn batched<D: Dense>(c: &Config) -> Graph {
 /// The residual stream after the last layer, for parity checks.
 pub fn probe<D: Dense>(c: &Config) -> Graph {
     staged(c, trunk::<D>)
+}
+
+const TYPES: &str = "text_config.layer_types";
+
+/// The full layers' spacing. The graph takes one every n.
+fn full_layers(k: &mut Keys, layers: u64) -> u64 {
+    let types: Vec<String> = k.need(&[TYPES]);
+    let full: Vec<bool> = types.iter().map(|t| t == "full_attention").collect();
+    let every = full.iter().position(|&f| f).map_or(0, |p| p as u64 + 1);
+    let spaced =
+        (0..layers).all(|l| full.get(l as usize) == Some(&(every > 0 && (l + 1) % every == 0)));
+    let known = types
+        .iter()
+        .all(|t| t == "full_attention" || t == "sliding_attention");
+    if !(spaced && known && types.len() as u64 == layers) {
+        k.misfit(TYPES, "the graph takes one full layer every n");
+    }
+    every
+}
+
+/// One layer's own sizes in `per_layer_config`.
+#[derive(Default, Deserialize, PartialEq)]
+struct Own {
+    head_dim: u64,
+    num_key_value_heads: u64,
+}
+
+/// A full layer's head width. Each has one key head.
+fn full_heads(k: &mut Keys, layers: u64) -> u64 {
+    const OWN: &str = "text_config.per_layer_config";
+    let own: BTreeMap<String, Own> = k.need(&[OWN]);
+    let types: Vec<String> = k.or(&[TYPES], Vec::new());
+    let width = own.values().next().map_or(0, |o| o.head_dim);
+    for l in 0..layers as usize {
+        let entry = own.get(&format!("{l:02}"));
+        let full = types.get(l).is_some_and(|t| t == "full_attention");
+        let fits = match entry {
+            Some(o) => full && o.head_dim == width && o.num_key_value_heads == 1,
+            None => !full,
+        };
+        if !fits {
+            k.misfit(OWN, format!("layer {l} does not fit the graph"));
+        }
+    }
+    width
 }

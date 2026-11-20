@@ -35,7 +35,7 @@ pub use sensai_interp::{Tensor, bind, fold};
 pub use sensai_lower::{Pick, Pins, Recipe, Settings, Weight, form};
 pub use sensai_mem::form as storage;
 pub use sensai_mem::{block, trellis};
-pub use sensai_models::{Stack, clip, decoder, eg2, flux2, mla, sprite, tagger, vae};
+pub use sensai_models::{Stack, clip, decoder, eg2, flux2, keys, mla, sprite, tagger, vae};
 pub use sensai_run::{gpu, pinning};
 pub use sensai_trace::{Linear, Norm};
 pub use sensai_wasm as wasm;
