@@ -1,7 +1,11 @@
 use crate::socket_link::SocketLink;
-use crate::{Blocking, Error, Memory, Shm, Sockets, Transport, exchange_regions, summed};
+use crate::{
+    Blocking, Error, Link, Memory, Put, Shm, Sockets, Span, Transport, exchange_regions, summed,
+};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 #[test]
 fn rank_order() {
@@ -105,6 +109,64 @@ fn socket_link_exchange() {
     let link = |(r, peers)| SocketLink::over(r as u32, peers, &regions).unwrap();
     let links = connected().into_iter().enumerate().map(link);
     rounds(links.map(|l| Blocking::new(l, 64, wait)).collect());
+}
+
+#[test]
+fn socket_link_bad_frames() {
+    let header = |len: u64| [0u64, 0, len].map(u64::to_le_bytes).concat();
+    for (bytes, close) in [
+        (header(65), false),
+        ([header(8), vec![1; 4]].concat(), true),
+    ] {
+        let mut pair = connected();
+        let mut raw = pair[1][0].take().unwrap();
+        let mut link = SocketLink::over(0, vec![None, pair[0][1].take()], &[64]).unwrap();
+        raw.write_all(&bytes).unwrap();
+        if close {
+            drop(raw);
+        }
+        let failed = (0..10_000).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(1));
+            link.poll(&mut Vec::new()).err()
+        });
+        assert!(matches!(failed, Some(Error::Link(_))), "{failed:?}");
+    }
+}
+
+#[test]
+fn socket_link_reset_drains() {
+    let mut pair = connected();
+    let links: Vec<_> = (0..2)
+        .map(|r| {
+            let peers = vec![pair[r][0].take(), pair[r][1].take()];
+            SocketLink::over(r as u32, peers, &[4096, 16]).unwrap()
+        })
+        .collect();
+    let landed: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let runs: Vec<_> = (links.into_iter().enumerate())
+            .map(|(r, mut link)| {
+                s.spawn(move || {
+                    let mine = Span::new(0, 0, 4096);
+                    link.write(mine, &[r as u8 + 1; 4096]).unwrap();
+                    let put = Put {
+                        to: 1 - r as u32,
+                        from: mine,
+                        into: mine,
+                        flag: Span::new(1, 0, 16),
+                        words: [1, 1],
+                        tag: 7,
+                    };
+                    for _ in 0..8 {
+                        link.put(put).unwrap();
+                    }
+                    link.reset().unwrap();
+                    link.read(mine).unwrap()
+                })
+            })
+            .collect();
+        runs.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    assert_eq!(landed, [vec![2; 4096], vec![1; 4096]]);
 }
 
 #[test]

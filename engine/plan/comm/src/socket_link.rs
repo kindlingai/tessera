@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::link::{Link, Put, Span, fits};
+use crate::verbs::Region;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -10,34 +11,45 @@ use std::time::{Duration, Instant};
 
 /// A frame: region, offset, length as u64s, then bytes.
 const FRAME: usize = 24;
-/// How long `reset` waits for sends to drain.
+/// A control frame's region word. Its offset says which.
+const CONTROL: u64 = u64::MAX;
+const MARK: u64 = 0;
+const ACK: u64 = 1;
+/// How long `reset` waits for each peer's ack.
 const DRAIN: Duration = Duration::from_secs(10);
 
 /// One peer's stream, bytes still to write, and bytes read.
 struct Peer {
     stream: TcpStream,
     out: VecDeque<u8>,
-    /// Tags, by bytes written when each is done.
-    tags: VecDeque<(u64, u64)>,
-    written: u64,
-    queued: u64,
     input: Vec<u8>,
     /// The peer closed its end. Frames it sent still land.
     closed: bool,
+    /// Acks to this rank's marks.
+    acks: u64,
 }
 
 /// Regions this rank owns, written by peers through `poll`.
 pub(crate) struct SocketLink {
     rank: u32,
     peers: Vec<Option<Peer>>,
-    /// Each region as u64 words, so flags are aligned.
-    regions: Vec<Vec<u64>>,
+    regions: Vec<Region>,
     sizes: Vec<usize>,
     done: Vec<u64>,
 }
 
+// Each rank owns its regions and streams.
+unsafe impl Send for SocketLink {}
+
 fn io(e: std::io::Error) -> Error {
     Error::Io(e)
+}
+
+fn queue(out: &mut VecDeque<u8>, words: [u64; 3], bytes: &[u8]) {
+    for word in words {
+        out.extend(word.to_le_bytes());
+    }
+    out.extend(bytes);
 }
 
 impl SocketLink {
@@ -64,29 +76,24 @@ impl SocketLink {
                     Some(Peer {
                         stream,
                         out: VecDeque::new(),
-                        tags: VecDeque::new(),
-                        written: 0,
-                        queued: 0,
                         input: Vec::new(),
                         closed: false,
+                        acks: 0,
                     })
                 }
             });
         }
+        let mut owned = Vec::with_capacity(regions.len());
+        for &len in regions {
+            owned.push(Region::new(len, None)?);
+        }
         Ok(SocketLink {
             rank,
             peers: wired,
-            regions: regions.iter().map(|&n| vec![0u64; n.div_ceil(8)]).collect(),
+            regions: owned,
             sizes: regions.to_vec(),
             done: Vec::new(),
         })
-    }
-
-    fn bytes(&mut self, region: usize) -> &mut [u8] {
-        let words = &mut self.regions[region];
-        let len = words.len() * 8;
-        // Plain bytes over owned u64 words.
-        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, len) }
     }
 
     fn peer(&mut self, to: u32) -> Result<&mut Peer, Error> {
@@ -96,49 +103,32 @@ impl SocketLink {
 
     /// Queues one frame: `bytes` for `at` at rank `to`.
     fn frame(&mut self, to: u32, at: Span, bytes: &[u8]) -> Result<(), Error> {
-        let peer = self.peer(to)?;
-        for word in [at.region as u64, at.at as u64, bytes.len() as u64] {
-            peer.out.extend(word.to_le_bytes());
-        }
-        peer.out.extend(bytes);
-        peer.queued += (FRAME + bytes.len()) as u64;
+        let words = [at.region as u64, at.at as u64, bytes.len() as u64];
+        queue(&mut self.peer(to)?.out, words, bytes);
         Ok(())
     }
 
-    fn finish(&mut self, to: u32, tag: u64) -> Result<(), Error> {
-        let peer = self.peer(to)?;
-        let at = peer.queued;
-        peer.tags.push_back((at, tag));
-        Ok(())
-    }
-
-    /// Writes what each stream takes now, and notes finished tags.
+    /// Writes what each stream accepts now.
     fn flush(&mut self) -> Result<(), Error> {
         for peer in self.peers.iter_mut().flatten() {
             while !peer.out.is_empty() {
                 let (head, _) = peer.out.as_slices();
                 match peer.stream.write(head) {
                     Ok(0) => return Err(Error::Link("a peer closed its stream".into())),
-                    Ok(n) => {
-                        peer.out.drain(..n);
-                        peer.written += n as u64;
-                    }
+                    Ok(n) => drop(peer.out.drain(..n)),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) => return Err(io(e)),
                 }
-            }
-            while peer.tags.front().is_some_and(|&(at, _)| at <= peer.written) {
-                let (_, tag) = peer.tags.pop_front().expect("a tag");
-                self.done.push(tag);
             }
         }
         Ok(())
     }
 
-    /// Reads what each stream holds, and applies whole frames.
+    /// Reads each stream, and applies whole frames in order.
     fn receive(&mut self) -> Result<(), Error> {
-        let mut frames = Vec::new();
-        for peer in self.peers.iter_mut().flatten() {
+        let (regions, sizes) = (&self.regions, &self.sizes);
+        for (r, peer) in self.peers.iter_mut().enumerate() {
+            let Some(peer) = peer else { continue };
             let mut chunk = [0u8; 1 << 16];
             while !peer.closed {
                 match peer.stream.read(&mut chunk) {
@@ -149,40 +139,56 @@ impl SocketLink {
                 }
             }
             let mut at = 0;
+            let mut acks = 0;
             while peer.input.len() - at >= FRAME {
                 let word = |i: usize| {
                     let start = at + 8 * i;
                     u64::from_le_bytes(peer.input[start..start + 8].try_into().expect("8 bytes"))
                 };
-                let (region, offset, len) = (word(0) as usize, word(1) as usize, word(2) as usize);
-                if peer.input.len() - at - FRAME < len {
+                let (region, offset, len) = (word(0), word(1), word(2));
+                if region == CONTROL {
+                    match offset {
+                        MARK => acks += 1,
+                        ACK => peer.acks += 1,
+                        _ => return Err(Error::Link(format!("rank {r} sent control {offset}"))),
+                    }
+                    at += FRAME;
+                    continue;
+                }
+                let span = Span::new(region as usize, offset as usize, len as usize);
+                fits(sizes, span, 1).map_err(|e| Error::Link(format!("rank {r}: {e}")))?;
+                if peer.input.len() - at - FRAME < span.len {
                     break;
                 }
-                let body = peer.input[at + FRAME..at + FRAME + len].to_vec();
-                frames.push((Span::new(region, offset, len), body));
-                at += FRAME + len;
+                apply(
+                    &regions[span.region],
+                    span,
+                    &peer.input[at + FRAME..][..span.len],
+                );
+                at += FRAME + span.len;
             }
             peer.input.drain(..at);
-        }
-        for (span, body) in frames {
-            self.apply(span, &body)?;
+            for _ in 0..acks {
+                queue(&mut peer.out, [CONTROL, ACK, 0], &[]);
+            }
+            if peer.closed && !peer.input.is_empty() {
+                return Err(Error::Link(format!("rank {r} closed in a frame")));
+            }
         }
         Ok(())
     }
+}
 
-    /// One frame. Whole aligned words land as release stores.
-    fn apply(&mut self, at: Span, body: &[u8]) -> Result<(), Error> {
-        fits(&self.sizes, at, 1)?;
-        if body.len() == 8 && at.at.is_multiple_of(8) {
-            let value = u64::from_le_bytes(body.try_into().expect("8 bytes"));
-            let word = &mut self.regions[at.region][at.at / 8];
-            // An aligned word other threads may read.
-            unsafe { AtomicU64::from_ptr(word as *mut u64) }.store(value, Ordering::Release);
-            return Ok(());
-        }
-        self.bytes(at.region)[at.at..at.at + body.len()].copy_from_slice(body);
-        Ok(())
+/// One frame. Whole aligned words land as release stores.
+fn apply(region: &Region, at: Span, body: &[u8]) {
+    let to = region.at(at.at);
+    if body.len() == 8 && at.at.is_multiple_of(8) {
+        let value = u64::from_le_bytes(body.try_into().expect("8 bytes"));
+        // An aligned word other threads may read.
+        unsafe { AtomicU64::from_ptr(to as *mut u64) }.store(value, Ordering::Release);
+        return;
     }
+    unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), to, body.len()) };
 }
 
 impl Link for SocketLink {
@@ -204,14 +210,14 @@ impl Link for SocketLink {
         self.frame(put.to, count, &put.words[1].to_le_bytes())?;
         let ordinal = Span::new(put.flag.region, put.flag.at, 8);
         self.frame(put.to, ordinal, &put.words[0].to_le_bytes())?;
-        self.finish(put.to, put.tag)?;
+        self.done.push(put.tag);
         self.flush()
     }
 
     fn word(&mut self, to: u32, at: Span, value: u64, tag: u64) -> Result<(), Error> {
         let at = Span::new(at.region, at.at, 8);
         self.frame(to, at, &value.to_le_bytes())?;
-        self.finish(to, tag)?;
+        self.done.push(tag);
         self.flush()
     }
 
@@ -222,42 +228,53 @@ impl Link for SocketLink {
         Ok(())
     }
 
+    /// Marks each stream, then waits for every ack.
     fn reset(&mut self) -> Result<(), Error> {
+        let mut want = Vec::with_capacity(self.peers.len());
+        for peer in self.peers.iter_mut() {
+            want.push(peer.as_mut().map(|p| {
+                queue(&mut p.out, [CONTROL, MARK, 0], &[]);
+                p.acks + 1
+            }));
+        }
         let start = Instant::now();
-        while self.peers.iter().flatten().any(|p| !p.out.is_empty()) {
+        let acked =
+            |p: &Option<Peer>, w: &Option<u64>| p.as_ref().is_none_or(|p| Some(p.acks) >= *w);
+        while !self.peers.iter().zip(&want).all(|(p, w)| acked(p, w)) {
             if start.elapsed() > DRAIN {
-                return Err(Error::Link("sends did not drain".into()));
+                return Err(Error::Link("a peer did not ack the reset".into()));
             }
             self.flush()?;
+            self.receive()?;
             std::thread::yield_now();
         }
+        self.flush()?;
         self.done.clear();
         Ok(())
     }
 
     fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
-        let words = self.regions.get(region)?;
-        Some((words.as_ptr() as *mut u8, None, self.sizes[region]))
+        let region = self.regions.get(region)?;
+        Some((region.base, None, region.len))
     }
 
     fn load(&self, at: Span) -> Result<u64, Error> {
         fits(&self.sizes, Span::new(at.region, at.at, 8), 8)?;
-        let word = &self.regions[at.region][at.at / 8] as *const u64 as *mut u64;
+        let word = self.regions[at.region].at(at.at) as *mut u64;
         // An aligned word `apply` stores atomically.
         Ok(unsafe { AtomicU64::from_ptr(word) }.load(Ordering::Acquire))
     }
 
     fn read(&self, at: Span) -> Result<Vec<u8>, Error> {
         fits(&self.sizes, at, 1)?;
-        let words = &self.regions[at.region];
-        let bytes =
-            unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) };
-        Ok(bytes[at.at..at.at + at.len].to_vec())
+        let from = self.regions[at.region].at(at.at);
+        Ok(unsafe { std::slice::from_raw_parts(from, at.len) }.to_vec())
     }
 
     fn write(&mut self, at: Span, bytes: &[u8]) -> Result<(), Error> {
-        fits(&self.sizes, Span::new(at.region, at.at, bytes.len()), 1)?;
-        self.bytes(at.region)[at.at..at.at + bytes.len()].copy_from_slice(bytes);
+        let at = Span::new(at.region, at.at, bytes.len());
+        fits(&self.sizes, at, 1)?;
+        apply(&self.regions[at.region], at, bytes);
         Ok(())
     }
 }
