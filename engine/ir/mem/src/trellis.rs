@@ -9,7 +9,7 @@ pub const MCG: u32 = 0xCBAC_1FED;
 /// The mul1 codebook's multiplier.
 pub const MUL1: u32 = 0x83DC_D12D;
 
-/// mul1's scale and offset, as the format gives them.
+/// mul1's scale and offset, copied from the format.
 pub const MUL1_SCALE: f32 = F16(0x1EEE).to_f32();
 pub const MUL1_OFFSET: f32 = F16(0xC931).to_f32();
 
@@ -329,7 +329,7 @@ impl<const K: u32> Form for Trellis<K> {
     }
 }
 
-/// The header, then the entries as the release stores them.
+/// The header, then the entries in the release's layout.
 pub fn packed(inp: usize, out: usize, side: u32, entries: &[u8]) -> Vec<u8> {
     let shape = Shape { inp, out, side };
     let mut bytes = Vec::with_capacity(HEAD + entries.len());

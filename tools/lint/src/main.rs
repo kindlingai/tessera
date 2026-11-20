@@ -1,4 +1,4 @@
-//! The repository's code-shape rules. AGENTS.md lists them.
+//! The repository's code-shape rules, listed in AGENTS.md.
 
 mod audit;
 mod comments;

@@ -81,7 +81,7 @@ pub enum Site {
     },
 }
 
-/// Kept rows a region appends to. Its launches write them.
+/// Kept rows a region's launches append to.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Kept {
     pub index: u32,

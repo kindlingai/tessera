@@ -1,4 +1,4 @@
-//! Rules propose kernels for a site. Link time collects them.
+//! Rules propose kernels for a site, collected at link time.
 
 use crate::abi::{Arg, Launch, Shape};
 use crate::extent::Extent;
@@ -132,7 +132,7 @@ pub enum Read {
     Node(T),
     #[from(ignore)]
     Draft(usize),
-    /// Kept rows by index. The launch may also write them.
+    /// Kept rows by index. The launch may also write these.
     #[from(ignore)]
     Kept(u32),
 }

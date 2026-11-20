@@ -63,7 +63,7 @@ fn lanes_match_cpu() {
             .zip(runs().iter().cycle())
             .zip(forms)
         {
-            // The reference sees the weights as the kernel stores them.
+            // The reference sees the weights in the kernel's stored form.
             let rounded = form.roundtrip(w.floats().unwrap());
             let weights = [Tensor::f32(w.shape.clone(), rounded)];
             let x = noise(vec![m, k as usize], &mut draws);
@@ -120,7 +120,7 @@ fn picked_matches_cpu() {
             let device = Device::guess(&settings)
                 .favoring("picked")
                 .pinned(Pins::all(form));
-            // The interpreter sees the weights as the form keeps them.
+            // The interpreter sees the weights after the form's round trip.
             let kept: Vec<Tensor> = (drawn.iter())
                 .map(|t| Tensor::f32(t.shape.clone(), form.roundtrip(t.floats().unwrap())))
                 .collect();

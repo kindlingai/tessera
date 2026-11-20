@@ -112,7 +112,7 @@ fn maps_match_cpu() {
         .collect();
     let forms = [F32_FORM, BF16_FORM];
     for (settings, form) in runs().iter().flat_map(|s| forms.map(|f| (s, f))) {
-        // The reference sees the weights as the plan stores them.
+        // The reference sees the weights in the plan's stored form.
         let kept: Vec<Tensor> = (weights.iter())
             .map(|t| Tensor::f32(t.shape.clone(), form.roundtrip(t.floats().unwrap())))
             .collect();

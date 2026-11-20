@@ -10,7 +10,7 @@ pub struct Info {
     pub context: usize,
 }
 
-/// Text to ids and back, as generation sees them.
+/// Text to ids and back, for generation.
 pub trait Tokens: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<u32>, Error>;
     fn decode(&self, ids: &[u32]) -> String;
@@ -133,7 +133,7 @@ pub struct Sizes {
 /// Prompts to pictures. Calls can block.
 pub trait GenerateImage: Send + Sync {
     fn sizes(&self) -> Sizes;
-    /// `n` pictures, `size` a side. A seed repeats them.
+    /// `n` pictures, `size` a side, repeatable from `seed`.
     fn generate(&self, prompt: &str, n: usize, seed: u32, size: usize)
     -> Result<Vec<Image>, Error>;
 }

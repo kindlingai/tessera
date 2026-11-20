@@ -16,7 +16,7 @@ pub struct Generate {
     pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
-    /// Guides for answers with a format. None refuses them.
+    /// Guides for answers with a format. `None` refuses formats.
     pub guides: Option<Arc<dyn Guides>>,
 }
 

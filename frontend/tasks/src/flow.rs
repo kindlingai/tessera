@@ -12,7 +12,7 @@ pub struct Flow {
     text: usize,
 }
 
-/// The timestep's sinusoids, cosines first, as diffusers makes them.
+/// The timestep's sinusoids, cosines first, matching diffusers.
 fn sinusoids(t: f32) -> Vec<f32> {
     let half = TIME as usize / 2;
     let at = |i: usize| t * 1000.0 * (-(10_000f32).ln() * i as f32 / half as f32).exp();

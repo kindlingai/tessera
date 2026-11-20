@@ -36,7 +36,7 @@ pub struct Region {
     pub outputs: Vec<T>,
     /// Elements of the node met.
     pub len: usize,
-    /// Kept rows it appends to. Its launches write them.
+    /// Kept rows its launches append to.
     pub kept: Vec<Appended>,
     /// Per rotated input: its place, then `suh` and `svh`.
     pub parts: Vec<(usize, [T; 2])>,
@@ -44,7 +44,7 @@ pub struct Region {
     pub sums: Vec<usize>,
 }
 
-/// Kept rows a region appends to, as `Read::Kept` names them.
+/// Kept rows a region appends to, in `Read::Kept` numbering.
 #[derive(Clone, Copy, Debug)]
 pub struct Appended {
     pub index: u32,

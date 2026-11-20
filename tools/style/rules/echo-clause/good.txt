@@ -5,3 +5,9 @@ The rule reading a weight owns its views.
 The caller frees them after the launch.
 ---
 Paths that replace crate names.
+---
+Selects kernels, orders them, then assigns buffers.
+---
+The interpreter reads weights in the form's packed layout.
+---
+One string, or a list of strings.

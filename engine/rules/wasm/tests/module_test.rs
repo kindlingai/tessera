@@ -386,7 +386,7 @@ fn module_reads_parts() {
         .pinned(sensai_lower::Pins::all(rotated));
     let plan = lower(&sized(true, 128, 128), 0, &[(Rows, 4)], &device).unwrap();
     assert_eq!(rules(&plan), ["wasm_mlp"]);
-    // Codes, `suh`, then `svh`, as the offer names them.
+    // Codes, `suh`, then `svh`, in the offer's order.
     let parts: Vec<_> = (0..3).map(|p| plan.weights[p].slot).collect();
     assert_eq!(
         plan.weights.iter().map(|w| w.part).collect::<Vec<_>>(),

@@ -21,7 +21,7 @@ fn levels_match_sums() {
         let want: Vec<f32> = (0..len).map(|i| x[2][i] * 0.5 + 2.0 * w[0][i]).collect();
         assert_eq!(out, want, "{level:?} mix");
         let mut acc = vec![[0.0f32; WIDE]; 3];
-        // Two spans, added as a long depth adds them.
+        // Two spans, added in the order a long depth uses.
         if !panel_at(level, &x, &w, &mut acc) {
             for col in (0..WIDE).step_by(16) {
                 let mut sums: Block = [[[[[0.0; 16]; 4]; 4]; 4]; 4];

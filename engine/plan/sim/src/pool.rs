@@ -51,7 +51,7 @@ pub struct Pool {
     pub spill: Const,
 }
 
-/// A pool's constants as plain numbers, as probes fit them.
+/// A pool's constants as plain numbers, fitted from probes.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Fit {
     pub floor: f64,

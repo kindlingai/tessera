@@ -174,7 +174,7 @@ pub fn traces(spec: &Spec) {
     assert_eq!(parameters, spec.parameters, "{} parameters", spec.name);
 }
 
-/// A real file's slices, as `tessera-eval --slices` wrote them.
+/// A real file's slices, from `tessera-eval --slices` output.
 pub fn slices(json: &str) -> Vec<Slice> {
     let entries: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
     let slice = |e: &serde_json::Value| Slice {
@@ -223,7 +223,7 @@ fn faux_check(
 ) -> Box<dyn Run> {
     let (weights, inputs) = data;
     let form = device.pins.form(&[]);
-    // The interpreter sees the weights as the form keeps them.
+    // The interpreter sees the weights after the form's round trip.
     let kept: Vec<Tensor> = (weights.iter())
         .map(|t| Tensor::f32(t.shape.clone(), form.roundtrip(t.floats().unwrap())))
         .collect();

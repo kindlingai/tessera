@@ -133,7 +133,7 @@ pub(crate) fn parse<T: DeserializeOwned + Bagged>(
     Ok(parsed)
 }
 
-/// One string or a list of them.
+/// One string, or a list of strings.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Strings {

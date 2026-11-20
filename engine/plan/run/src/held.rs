@@ -49,7 +49,7 @@ impl Held {
             .view(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
-    /// `bytes` into the slot, as the form packed them.
+    /// `bytes`, packed in the form, into the slot.
     pub fn upload(&mut self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
         let at = self.bound[slot.buffer as usize];
         Ok(self.all[at].backing_mut().upload(slot.start(), bytes)?)

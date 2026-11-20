@@ -181,7 +181,7 @@ pub struct F32;
 pub struct Bf16;
 /// Unsigned 32-bit ids.
 pub struct U32;
-/// Raw bytes, as a decode helper walks them.
+/// Raw bytes, for a decode helper to walk.
 pub struct U8;
 
 /// The methods naming a form and its element.

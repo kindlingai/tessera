@@ -3,7 +3,7 @@
 use crate::types::DType;
 use serde::{Deserialize, Serialize};
 
-/// Tracing sets the strongest values. Passes may only weaken them.
+/// Tracing sets the strongest values. Passes can lower, never raise.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Numerics {

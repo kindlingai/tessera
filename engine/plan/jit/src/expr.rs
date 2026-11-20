@@ -52,7 +52,7 @@ pub(crate) fn elem_size(ty: Ty) -> usize {
     }
 }
 
-/// The wider of two types, as C promotes them.
+/// The wider of two types, under C's promotion rules.
 fn wider(a: Ty, b: Ty) -> Ty {
     match (a, b) {
         (Ty::Bytes, _) | (_, Ty::Bytes) => Ty::Bytes,

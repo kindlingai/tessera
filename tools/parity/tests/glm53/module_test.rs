@@ -42,7 +42,7 @@ fn rule() -> &'static Rule {
     module.rules[0]
 }
 
-/// Experts as the release stores them, in codebook `book`.
+/// Experts in the release's layout, in codebook `book`.
 fn pins(book: &str) -> Pins {
     let [codes, turned] = ["", "_rot"].map(|end| named(&format!("trellis_k4{book}{end}")).unwrap());
     Pins::default()

@@ -26,7 +26,7 @@ const VERSION: u32 = 1;
 pub struct Device {
     /// The hardware that ran the samples.
     pub name: String,
-    /// The chip's constants, as probes fitted them.
+    /// The chip's constants, fitted from probes.
     pub fit: Option<Fit>,
     /// A known chip's table, else the fitted model.
     #[serde(skip)]

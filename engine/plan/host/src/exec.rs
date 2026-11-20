@@ -20,7 +20,7 @@ pub enum ArgVal {
     F32(f32),
 }
 
-/// Groups of threads, as the launch laid them out.
+/// The launch's layout of thread groups.
 #[derive(Clone, Copy, Debug)]
 pub struct Grid {
     pub groups: usize,
@@ -151,7 +151,7 @@ impl Group<'_, '_> {
         }
     }
 
-    /// Writes store f32 or ids. No form packs them.
+    /// Writes store plain f32 or ids, never packed.
     fn store(&mut self, arg: &Arg, index: u64, value: Val) {
         let at = (arg.skip + index as usize) * 4;
         let bytes = &mut self.buffers[arg.buffer];

@@ -109,7 +109,7 @@ fn home<'a>(pkgs: &'a [Pkg], path: &'a str) -> Option<(&'a Pkg, &'a str)> {
     Some((best, &path[best.dir.len()..]))
 }
 
-/// A `tests/` file alone, or a folder of them.
+/// A `tests/` file alone, or a folder of test files.
 fn group(pkg: &Pkg, rel: &str) -> String {
     let below = rel.strip_prefix("tests/").unwrap_or(rel);
     match below.split_once('/') {

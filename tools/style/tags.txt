@@ -8,3 +8,6 @@ hidden-negation: ^ only <Det>* <Adj|Noun|Possessive|Hyphen>* <Noun> <Adverb>? <V
 chained-clause: <Verb|Prep> <Word>*? <Noun> , (which|whose|who) !<Be>
 what-clause: ^ what !<Verb-Finite> !<Prep> <Word>*? <Noun> <Adverb>? <Verb-Finite>
 echo-clause: <Noun> (that|which) <Adverb>? <Verb> <Prep>? them
+echo-clause: as <Det>* <Adj|Noun>* <Noun> <Adverb>? <Verb-Finite>? <Adverb>? <Verb> them
+echo-clause: <Noun> of them
+echo-clause: ^ <Det>? <Adj|Noun>* <Noun> <Adverb>? <Verb-Finite>? <Adverb>? <Verb> them (.)

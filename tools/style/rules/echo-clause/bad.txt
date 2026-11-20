@@ -5,3 +5,13 @@ Counters and gauges, gathered from the code that sets them.
 Weight views belong to the rules that read them.
 ---
 Kernel names that outlive the forms that made them.
+---
+The interpreter sees the weights as the form keeps them.
+---
+Kept rows span the whole context, as buffers hold them.
+---
+`n` pictures, `size` a side. A seed repeats them.
+---
+One string or a list of them.
+---
+The token tree and the tokenizer, as llguidance reads them.

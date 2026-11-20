@@ -7,7 +7,7 @@ use sensai_bundle::tokenize::hf::Hf;
 use std::sync::Arc;
 use toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 
-/// The token tree and the tokenizer, as llguidance reads them.
+/// The token tree and the tokenizer, in llguidance's types.
 struct Env {
     trie: TokTrie,
     hf: Hf,

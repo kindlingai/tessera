@@ -92,7 +92,7 @@ fn planned(name: &str, step: &Graph, weights: &[Tensor], tokens: &[u32], want: &
         let device = Device::guess(&settings);
         let mut plans = Cache::default();
         let mut runner: Option<Box<dyn Run>> = None;
-        // Kept rows span the whole context, as buffers hold them.
+        // Kept rows span the whole context, like their buffers.
         let context = step
             .dims
             .iter()

@@ -117,7 +117,7 @@ pub struct Bundle {
     pub stop: Vec<u32>,
 }
 
-/// The weights and their forms, as `offer` stores them.
+/// The weights and their forms, in `offer`'s layout.
 pub fn pull(
     graph: &Graph,
     offer: &dyn Offer,

@@ -65,7 +65,7 @@ fn tiles_match_cpu() {
         let g = linear(k, n);
         let x = noise(vec![m as usize, k as usize], &mut draws);
         for form in common::forms(k as usize) {
-            // The reference sees the weights as the kernel stores them.
+            // The reference sees the weights in the kernel's stored form.
             let w = noise(vec![n as usize, k as usize], &mut draws);
             let rounded = form.roundtrip(w.floats().unwrap());
             let weights = [Tensor::f32(w.shape.clone(), rounded)];

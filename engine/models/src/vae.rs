@@ -92,7 +92,7 @@ pub struct Decoder {
     pub conv_out: Affine,
 }
 
-/// Declares weights under one path, as diffusers names them.
+/// Declares weights under one path, with diffusers' names.
 struct At<'a> {
     m: &'a Model,
     path: Vec<PathSeg>,

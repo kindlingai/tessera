@@ -35,7 +35,7 @@ pub struct Grid {
 struct Case {
     g: Graph,
     sizes: Vec<Sizes>,
-    /// Weight forms, as a checkpoint would pin them.
+    /// Weight forms, the same pins a checkpoint would set.
     pins: Pins,
 }
 

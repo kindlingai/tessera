@@ -14,7 +14,7 @@ fn windows_follow_content() {
         .into_iter()
         .map(|w| w.text)
         .collect();
-    // Inserted lines move anchors only within one run of them.
+    // Inserted lines move anchors only within their own run.
     for w in before.iter().filter(|w| w.line > 2 * SPACING) {
         assert!(after.contains(&w.text), "window at line {} moved", w.line);
     }

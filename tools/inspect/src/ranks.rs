@@ -1,4 +1,4 @@
-//! Ranks as the command line names them, with devices.
+//! Ranks by their command-line names, with devices.
 
 use sensai_lower::{Cluster, Device, Limits, Link, Pins, Platform, Zone, ZoneKind};
 use sensai_platform::platform::Asked;
