@@ -4,10 +4,11 @@ use crate::layout::MAX_GROUP;
 use std::collections::{BTreeMap, BTreeSet};
 use tessera_engine_comm::Error as CommError;
 
+pub mod page;
+pub mod running;
 #[cfg(test)]
 pub(crate) mod sim;
-#[cfg(test)]
-pub(crate) mod wired;
+pub mod wired;
 
 /// A lane's operation, numbered as in `collectives.h`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

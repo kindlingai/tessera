@@ -5,7 +5,7 @@ mod roce;
 pub use roce::{port, ports};
 
 use std::cell::RefCell;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -113,7 +113,12 @@ fn call(addr: SocketAddr) -> io::Result<TcpStream> {
 
 /// Rank 0 lays `path` out. The others wait for it.
 pub fn shm(path: &Path, rank: u32, ranks: u32, capacity: usize) -> Result<Shm, Error> {
-    let len = Shm::room(ranks, capacity);
+    let file = shared(path, rank, Shm::room(ranks, capacity))?;
+    Shm::over(rank, ranks, file, capacity)
+}
+
+/// A zeroed file of `len` bytes that rank 0 makes.
+pub fn shared(path: &Path, rank: u32, len: usize) -> Result<File, Error> {
     let start = Instant::now();
     let file = loop {
         if rank == 0 {
@@ -136,7 +141,7 @@ pub fn shm(path: &Path, rank: u32, ranks: u32, capacity: usize) -> Result<Shm, E
             Err(e) => return Err(e.into()),
         }
     };
-    Shm::over(rank, ranks, file, capacity)
+    Ok(file)
 }
 
 #[cfg(test)]

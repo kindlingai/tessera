@@ -75,6 +75,18 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     fn unpin(&self, _host: u64) {}
 
+    /// Maps existing host memory for the device. Returns its address.
+    fn register(&self, _host: *mut u8, _size: usize) -> Result<u64, Error> {
+        Err(Self::error("this device cannot map host memory".into()))
+    }
+
+    fn unregister(&self, _host: *mut u8) {}
+
+    /// Blocks of `kernel` one unit holds at once.
+    fn resident(&self, _kernel: &Self::Kernel, _threads: u32, _shared: u32) -> Result<u32, Error> {
+        Err(Self::error("this device has no persistent grids".into()))
+    }
+
     /// Whether `capture` records launches here.
     fn graphs(&self) -> bool {
         false

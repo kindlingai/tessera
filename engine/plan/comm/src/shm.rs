@@ -25,8 +25,19 @@ const MAP_SHARED: c_int = 1;
 /// How long a rank waits at a round.
 const ROUND: Duration = Duration::from_secs(300);
 
+/// Each rank's block starts on its own 64 KiB page.
+const BLOCK: usize = 1 << 16;
+
 fn padded(n: usize) -> usize {
     n.next_multiple_of(16)
+}
+
+fn block(regions: &[usize]) -> usize {
+    regions
+        .iter()
+        .map(|&n| padded(n))
+        .sum::<usize>()
+        .next_multiple_of(BLOCK)
 }
 
 /// A mapped file: each rank's regions, one rank after another.
@@ -49,7 +60,7 @@ unsafe impl Send for ShmLink {}
 impl ShmLink {
     /// The file size `ranks` need for these region sizes.
     pub fn room(ranks: u32, regions: &[usize]) -> usize {
-        ranks as usize * regions.iter().map(|&n| padded(n)).sum::<usize>()
+        ranks as usize * block(regions)
     }
 
     /// Rank `rank` over `file`, zeroed and sized by `room`.
@@ -60,10 +71,10 @@ impl ShmLink {
             return Err(Error::Fit(what));
         }
         let mut offsets = Vec::with_capacity(regions.len());
-        let mut block = 0;
+        let mut at = 0;
         for &n in regions {
-            offsets.push(block);
-            block += padded(n);
+            offsets.push(at);
+            at += padded(n);
         }
         let (prot, fd) = (PROT_READ_WRITE, file.as_raw_fd());
         let base = unsafe { mmap(std::ptr::null_mut(), len, prot, MAP_SHARED, fd, 0) };
@@ -75,7 +86,7 @@ impl ShmLink {
             ranks,
             sizes: regions.to_vec(),
             offsets,
-            block,
+            block: block(regions),
             base: base as *mut u8,
             len,
             done: Vec::new(),

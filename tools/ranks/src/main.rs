@@ -21,10 +21,12 @@ use tessera_trace::Norm;
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
+  [--stub ROUNDS]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
-  at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.";
+  at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
+  --stub runs ROUNDS sums in one persistent grid per rank instead of a model.";
 
 struct Args {
     rank: u32,
@@ -43,6 +45,8 @@ struct Args {
     repeat: usize,
     /// RDMA ports, after the ranks meet.
     fabric: Option<Fabric>,
+    /// Sums for the persistent-grid stub, instead of a model.
+    stub: Option<u32>,
 }
 
 fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
@@ -59,6 +63,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         form: None,
         repeat: 1,
         fabric: None,
+        stub: None,
     };
     while let Some(flag) = given.next() {
         let value = given.next()?;
@@ -76,6 +81,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--backend" => args.host = value == "host" || value == "cpu",
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
+            "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -95,6 +101,21 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
     ((args.rank as usize) < args.ranks).then_some(args)
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+mod stub;
+
+/// The persistent-grid stub, where a GPU backend is built in.
+fn stub(args: &Args, rounds: u32) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    return stub::run(args, rounds);
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    return Err(format!(
+        "--stub {rounds} for rank {} needs a cuda or rocm build",
+        args.rank
+    )
+    .into());
+}
+
 #[cfg(test)]
 mod eg2_test;
 #[cfg(test)]
@@ -105,7 +126,11 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match run(&args) {
+    let ran = match args.stub {
+        Some(rounds) => stub(&args, rounds),
+        None => run(&args),
+    };
+    match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("tessera-ranks: {e}");

@@ -1855,6 +1855,8 @@ name = "tessera-device"
 version = "0.1.0"
 dependencies = [
  "tessera-engine-comm",
+ "tessera-gpukit",
+ "tessera-testkit",
  "thiserror",
 ]
 
@@ -2201,9 +2203,11 @@ version = "0.1.0"
 dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
+ "tessera-device",
  "tessera-engine-comm",
  "tessera-frontend-comm",
  "tessera-frontend-settings",
+ "tessera-gpukit",
  "tessera-graph",
  "tessera-interp",
  "tessera-lower",

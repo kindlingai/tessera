@@ -174,6 +174,11 @@ impl Api for Driver {
             cu_mem_host_get_device_pointer, "cuMemHostGetDevicePointer"
         ),
         host_free: cu_mem_free_host,
+        register: (
+            cu_mem_host_register, "cuMemHostRegister", driver::CU_MEMHOSTREGISTER_DEVICEMAP,
+            cu_mem_host_unregister
+        ),
+        occupancy: (cu_occupancy, "cuOccupancyMaxActiveBlocksPerMultiprocessor"),
         zero: (cu_memset_d8, "cuMemsetD8"),
     }
 

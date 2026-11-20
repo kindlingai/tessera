@@ -5,10 +5,11 @@ use crate::layout::MAX_GROUP;
 use tessera_engine_comm::{Error, Link as Comm, Put, Span};
 
 /// The regions, in order: send, receive, flags, credits.
-pub(crate) const SEND: usize = 0;
-pub(crate) const RECV: usize = 1;
-pub(crate) const FLAGS: usize = 2;
+pub const SEND: usize = 0;
+pub const RECV: usize = 1;
+pub const FLAGS: usize = 2;
 pub(crate) const CREDITS: usize = 3;
+pub const REGIONS: usize = 4;
 
 /// A tag: pool, then destination, then the ordinal's low bits.
 const ORDINAL: u64 = (1 << 48) - 1;
@@ -18,13 +19,13 @@ const POOLS: usize = 0xFF;
 
 /// One pool's offset in each region, and its slot sizes.
 #[derive(Clone, Copy, Debug)]
-struct Place {
-    send: usize,
-    recv: usize,
-    flags: usize,
-    credits: usize,
-    send_bytes: usize,
-    recv_bytes: usize,
+pub(crate) struct Place {
+    pub send: usize,
+    pub recv: usize,
+    pub flags: usize,
+    pub credits: usize,
+    pub send_bytes: usize,
+    pub recv_bytes: usize,
     depth: usize,
 }
 
@@ -58,7 +59,7 @@ fn layout(pools: &[Pool], bytes: &[(usize, usize)]) -> (Vec<Place>, [usize; 4]) 
 }
 
 /// The proxy's puts and credits, as comm puts and words.
-pub(crate) struct Wired<L> {
+pub struct Wired<L> {
     link: L,
     places: Vec<Place>,
     /// Each pool's group, as global ranks, and this rank's place.
@@ -73,12 +74,12 @@ fn fit(what: String) -> Error {
 
 impl<L: Comm> Wired<L> {
     /// Region sizes for pools with these slot sizes.
-    pub(crate) fn regions(pools: &[Pool], bytes: &[(usize, usize)]) -> [usize; 4] {
+    pub fn regions(pools: &[Pool], bytes: &[(usize, usize)]) -> [usize; REGIONS] {
         layout(pools, bytes).1
     }
 
     /// `link` holds `regions(pools, bytes)`.
-    pub(crate) fn new(
+    pub fn new(
         link: L,
         pools: &[Pool],
         bytes: &[(usize, usize)],
@@ -102,8 +103,16 @@ impl<L: Comm> Wired<L> {
         })
     }
 
-    pub(crate) fn link(&mut self) -> &mut L {
+    pub fn link(&mut self) -> &mut L {
         &mut self.link
+    }
+
+    pub fn into_link(self) -> L {
+        self.link
+    }
+
+    pub(crate) fn place(&self, pool: usize) -> Option<Place> {
+        self.places.get(pool).copied()
     }
 
     /// Pool `pool`'s place, this rank's group rank, and `to`'s rank.

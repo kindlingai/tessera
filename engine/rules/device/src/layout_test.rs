@@ -123,7 +123,22 @@ fn headers_match_rust() {
     for h in &HEADERS {
         headers.read(h.text);
     }
-    assert_eq!(headers.number("MAX_GROUP"), MAX_GROUP);
+    let numbers = [
+        ("ARENAS", ARENAS),
+        ("MAX_GROUP", MAX_GROUP),
+        ("MAX_POOLS", MAX_POOLS),
+        ("MAX_DEPTH", MAX_DEPTH),
+        ("VALUES", VALUES),
+        ("DOORBELL_SLOTS", DOORBELL_SLOTS),
+        ("DOORBELL_ABORT", DOORBELL_ABORT),
+        ("DOORBELL_SENT", DOORBELL_SENT),
+    ];
+    for (name, value) in numbers {
+        assert_eq!(headers.number(name), value, "{name}");
+    }
+    let slots = DOORBELL_SLOTS + MAX_POOLS * MAX_DEPTH * 16;
+    let sizes = SIZES + MAX_POOLS * MAX_DEPTH * MAX_GROUP * 4;
+    assert!(slots <= SIZES && sizes <= DOORBELL_ABORT);
     check::<Ref>(&headers);
     check::<Item>(&headers);
     check::<Form>(&headers);

@@ -116,3 +116,84 @@ fn wired_puts_and_credits() {
     let stray = Part { slot: 2, ..part };
     assert!(a.put(stray).is_err());
 }
+
+/// Emulates one rank's device: sums `rounds` parts with its peer.
+fn device_rounds(page: &[std::sync::atomic::AtomicU64], regions: [usize; 3], me: u32, rounds: u64) {
+    use crate::layout::{DOORBELL_SENT, DOORBELL_SLOTS, MAX_GROUP};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let [send, recv, flags] = regions.map(|r| r as *mut u8);
+    let peer = 1 - me as usize;
+    for o in 1..=rounds {
+        let slot = (o % 2) as usize;
+        while o > 2 && page[DOORBELL_SENT / 8].load(Acquire) < o - 2 {
+            std::hint::spin_loop();
+        }
+        let part = [o as u32 * 10 + me; 4];
+        unsafe { std::ptr::copy_nonoverlapping(part.as_ptr().cast(), send.add(slot * 16), 16) };
+        let word = 1 << 63 | (o & 0xFFFF) << 32 | 4;
+        page[DOORBELL_SLOTS / 8 + slot * 2].store(word, Release);
+        page[0].store(o, Release);
+        let at = slot * MAX_GROUP + peer;
+        let flag = unsafe { std::sync::atomic::AtomicU64::from_ptr(flags.add(at * 16).cast()) };
+        while flag.load(Acquire) != o {
+            std::hint::spin_loop();
+        }
+        let mut got = [0u32; 4];
+        unsafe { std::ptr::copy_nonoverlapping(recv.add(at * 16), got.as_mut_ptr().cast(), 16) };
+        assert_eq!(got, [o as u32 * 10 + peer as u32; 4], "rank {me} round {o}");
+    }
+}
+
+#[test]
+fn page_over_shm() {
+    use crate::proxy::page::Page;
+    use crate::proxy::running::Running;
+    use crate::proxy::wired::{FLAGS, RECV, SEND, Wired};
+    use crate::proxy::{Lane, Proxy};
+    use std::sync::atomic::AtomicU64;
+    use tessera_engine_comm::{Link as _, ShmLink};
+    let pools = [pool(2, false, 2)];
+    let bytes = [(16, 16)];
+    let regions = Wired::<ShmLink>::regions(&pools, &bytes);
+    let path = tessera_testkit::scratch(&format!("page-{}", std::process::id()));
+    let file = std::fs::File::create_new(&path).unwrap();
+    file.set_len(ShmLink::room(2, &regions) as u64).unwrap();
+    let lanes = vec![Lane {
+        width: 4,
+        ..lane(Op::Sum, 0)
+    }];
+    let ranks: Vec<_> = (0..2u32)
+        .map(|r| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let link = ShmLink::over(r, 2, file, &regions).unwrap();
+            let mut wired = Wired::new(
+                link,
+                &[Pool { me: r, ..pools[0] }],
+                &bytes,
+                vec![vec![0, 1]],
+            )
+            .unwrap();
+            let mut base = |region| wired.link().memory(region).unwrap().0 as usize;
+            let spans = [base(SEND), base(RECV), base(FLAGS)];
+            let page: Box<[AtomicU64]> = (0..512).map(|_| AtomicU64::new(0)).collect();
+            let mut host =
+                unsafe { Page::new(page.as_ptr().cast_mut().cast(), &mut wired).unwrap() };
+            let pools = vec![Pool { me: r, ..pools[0] }];
+            let proxy = Proxy::new(&mut host, pools, lanes.clone(), 1).unwrap();
+            (Running::spawn(proxy, host, wired), page, spans)
+        })
+        .collect();
+    std::thread::scope(|s| {
+        for (r, (_, page, spans)) in ranks.iter().enumerate() {
+            s.spawn(move || device_rounds(page, *spans, r as u32, 40));
+        }
+    });
+    std::fs::remove_file(&path).unwrap();
+    for (running, ..) in ranks {
+        running.stop().unwrap();
+    }
+}

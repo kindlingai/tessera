@@ -52,6 +52,9 @@ pub(crate) mod entry {
     pub(crate) type HostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> c_int;
     pub(crate) type HostMap = unsafe extern "C" fn(*mut u64, *mut c_void, u32) -> c_int;
     pub(crate) type HostFree = unsafe extern "C" fn(*mut c_void) -> c_int;
+    pub(crate) type Register = unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int;
+    /// Blocks of a function one unit holds: threads, shared bytes.
+    pub(crate) type Occupancy = unsafe extern "C" fn(*mut c_int, Handle, c_int, usize) -> c_int;
     pub(crate) type Stream = unsafe extern "C" fn(*mut Handle, u32) -> c_int;
     pub(crate) type Capture = unsafe extern "C" fn(Handle, c_int) -> c_int;
     pub(crate) type EndCapture = unsafe extern "C" fn(Handle, *mut Handle) -> c_int;
@@ -149,6 +152,10 @@ pub trait Api: Sync + Sized + 'static {
     /// Pinned host memory the device maps: (host, device).
     fn host_alloc(&self, size: usize) -> Result<(u64, u64), Error>;
     fn host_free(&self, host: u64);
+    /// Maps existing host memory for the device. Returns its address.
+    fn register(&self, host: *mut c_void, size: usize) -> Result<u64, Error>;
+    fn unregister(&self, host: *mut c_void);
+    fn occupancy(&self, kernel: Handle, threads: u32, shared: u32) -> Result<u32, Error>;
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
@@ -408,6 +415,23 @@ impl<A: Api> Context<A> {
         }
     }
 
+    /// Maps `size` bytes at `host` for the device.
+    pub fn register(&self, host: *mut u8, size: usize) -> Result<u64, Error> {
+        self.locked(|a| a.register(host.cast(), size))
+    }
+
+    pub fn unregister(&self, host: *mut u8) {
+        let _hold = self.hold();
+        if self.set_current().is_ok() {
+            self.0.api.unregister(host.cast());
+        }
+    }
+
+    /// Blocks of `kernel` one unit holds at once.
+    pub fn resident(&self, kernel: &Kernel<A>, threads: u32, shared: u32) -> Result<u32, Error> {
+        self.locked(|a| a.occupancy(kernel.raw, threads, shared))
+    }
+
     /// Compile for this device and resolve `entry`.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
         let image = A::compile(self, source)?;
@@ -594,6 +618,18 @@ impl<A: Api> Device for Context<A> {
         Context::unpin(self, host);
     }
 
+    fn register(&self, host: *mut u8, size: usize) -> Result<u64, Error> {
+        Context::register(self, host, size)
+    }
+
+    fn unregister(&self, host: *mut u8) {
+        Context::unregister(self, host);
+    }
+
+    fn resident(&self, kernel: &Kernel<A>, threads: u32, shared: u32) -> Result<u32, Error> {
+        Context::resident(self, kernel, threads, shared)
+    }
+
     fn graphs(&self) -> bool {
         true
     }
@@ -660,6 +696,8 @@ macro_rules! shared_api {
             $map:ident, $map_label:literal
         ),
         host_free: $host_free:ident,
+        register: ($reg:ident, $reg_label:literal, $reg_flags:expr, $unreg:ident),
+        occupancy: ($occ:ident, $occ_label:literal),
         zero: ($zero:ident, $zero_label:literal) $(,)?
     ) => {
         fn error(msg: String) -> $crate::Error {
@@ -768,6 +806,38 @@ macro_rules! shared_api {
 
         fn zero(&self, ptr: u64, size: usize) -> Result<(), $crate::Error> {
             self.check(unsafe { (self.$zero)(ptr, 0, size) }, $zero_label)
+        }
+
+        fn register(
+            &self,
+            host: *mut ::std::ffi::c_void,
+            size: usize,
+        ) -> Result<u64, $crate::Error> {
+            let code = unsafe { (self.$reg)(host, size, $reg_flags) };
+            self.check(code, $reg_label)?;
+            let mut device = 0;
+            let code = unsafe { (self.$map)(&mut device, host, 0) };
+            if let Err(e) = self.check(code, $map_label) {
+                self.unregister(host);
+                return Err(e);
+            }
+            Ok(device)
+        }
+
+        fn unregister(&self, host: *mut ::std::ffi::c_void) {
+            unsafe { (self.$unreg)(host) };
+        }
+
+        fn occupancy(
+            &self,
+            kernel: $crate::api::Handle,
+            threads: u32,
+            shared: u32,
+        ) -> Result<u32, $crate::Error> {
+            let blocks = self.int($occ_label, |n| unsafe {
+                (self.$occ)(n, kernel, threads as ::std::ffi::c_int, shared as usize)
+            })?;
+            Ok(blocks.max(0) as u32)
         }
 
         fn event(&self) -> Result<$crate::api::Handle, $crate::Error> {

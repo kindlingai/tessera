@@ -3,6 +3,7 @@
 mod flatten;
 pub mod layout;
 pub mod proxy;
+pub mod resident;
 mod scan;
 
 #[cfg(test)]

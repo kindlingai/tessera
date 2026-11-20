@@ -29,7 +29,8 @@ fn sized(name: &str, len: usize) -> File {
 
 #[test]
 fn handles_must_fit() {
-    assert_eq!(Shm::room(3, 8), 3 * (32 + 96 + 96));
+    // Each rank pads 224 bytes to one 64 KiB block.
+    assert_eq!(Shm::room(3, 8), 3 << 16);
     let short = sized("short", Shm::room(2, 8) - 1);
     assert!(matches!(Shm::over(0, 2, short, 8), Err(Error::Fit(_))));
     let late = sized("late", Shm::room(2, 8));

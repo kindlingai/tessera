@@ -1,0 +1,6 @@
+#include <tessera/1/grid>
+
+// Writes the clock the deadline uses.
+extern "C" __global__ void tessera_clock(tessera::u64* out) {
+    out[0] = tessera::prim::clock_ticks();
+}

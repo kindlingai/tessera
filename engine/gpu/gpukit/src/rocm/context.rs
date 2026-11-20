@@ -159,6 +159,10 @@ impl Api for Runtime {
             hip_host_get_device_pointer, "hipHostGetDevicePointer"
         ),
         host_free: hip_host_free,
+        register: (
+            hip_host_register, "hipHostRegister", hip::HOST_REGISTER_MAPPED, hip_host_unregister
+        ),
+        occupancy: (hip_occupancy, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor"),
         zero: (hip_memset, "hipMemset"),
     }
 

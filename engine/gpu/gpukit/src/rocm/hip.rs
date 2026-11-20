@@ -18,6 +18,7 @@ pub(crate) const HIP_SUCCESS: HipError = 0;
 pub(crate) const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const MEMCPY_DEVICE_TO_HOST: c_int = 2;
 pub(crate) const HOST_MALLOC_MAPPED: u32 = 2;
+pub(crate) const HOST_REGISTER_MAPPED: u32 = 2;
 /// `hipDeviceAttribute_t`, with HIP 6 and 7 numbering.
 pub(crate) const ATTR_INTEGRATED: c_int = 16;
 pub(crate) const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 23;
@@ -67,6 +68,9 @@ tessera_dl::library! {
         pub hip_host_malloc: entry::HostAlloc = "hipHostMalloc",
         pub hip_host_get_device_pointer: entry::HostMap = "hipHostGetDevicePointer",
         pub hip_host_free: entry::HostFree = "hipHostFree",
+        pub hip_host_register: entry::Register = "hipHostRegister",
+        pub hip_host_unregister: entry::HostFree = "hipHostUnregister",
+        pub hip_occupancy: entry::Occupancy = "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
         pub hip_memcpy: HipMemcpy = "hipMemcpy",
         pub hip_memset: HipMemset = "hipMemset",
         pub hip_module_launch_kernel: LaunchFn = "hipModuleLaunchKernel",
