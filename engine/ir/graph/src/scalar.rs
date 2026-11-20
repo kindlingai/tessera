@@ -42,18 +42,18 @@ impl<const E: u32, const M: u32, const INF: bool, const NAN: bool> Format<E, M, 
         sign | (exp << M) | ((r.to_bits() >> drop) & ((1 << M) - 1))
     }
 
-    fn widen(bits: u32) -> f32 {
+    const fn widen(bits: u32) -> f32 {
         let sign = if bits >> (E + M) & 1 == 1 { -1.0 } else { 1.0 };
         let (exp, man) = ((bits >> M) & ((1 << E) - 1), bits & ((1 << M) - 1));
         let all = (1 << E) - 1;
         sign * match exp {
-            0 => (f64::from(man) / Self::STEPS) as f32,
+            0 => (man as f64 / Self::STEPS) as f32,
             _ if exp == all && INF => match man {
                 0 => f32::INFINITY,
                 _ => f32::NAN,
             },
             _ if NAN && !INF && bits & Self::ONES == Self::ONES => f32::NAN,
-            _ => (1.0 + man as f32 / (1 << M) as f32) * 2f32.powi(exp as i32 - Self::BIAS),
+            _ => (1.0 + man as f32 / (1 << M) as f32) * pow2(exp as i32 - Self::BIAS) as f32,
         }
     }
 }
@@ -73,6 +73,11 @@ macro_rules! minifloat {
         impl $name {
             pub const EXPONENT: u32 = $e;
             pub const MANTISSA: u32 = $m;
+
+            /// The exact value as an f32.
+            pub const fn to_f32(self) -> f32 {
+                Format::<$e, $m, $inf, $nan>::widen(self.0 as u32)
+            }
         }
 
         impl From<f32> for $name {
@@ -83,7 +88,7 @@ macro_rules! minifloat {
 
         impl From<$name> for f32 {
             fn from(h: $name) -> f32 {
-                Format::<$e, $m, $inf, $nan>::widen(u32::from(h.0))
+                h.to_f32()
             }
         }
 
