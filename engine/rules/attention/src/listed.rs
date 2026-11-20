@@ -65,10 +65,40 @@ fn listed_scores(
     out[gid() as u64] = score;
 }
 
-/// One thread per output: the peak, then the weighted sum.
+/// One thread per list: peak, total, and kept picks.
+#[kernel]
+fn listed_stats(scores: Buf<F32>, mut out: BufMut<F32>, len: u32, picks: u32) {
+    if gid() >= len {
+        return;
+    }
+    let at = gid() as u64 * picks as u64;
+    let mut peak = f32::NEG_INFINITY;
+    let mut end = 0u32;
+    for p in 0..picks {
+        let score = scores[at + p as u64];
+        peak = max(peak, score);
+        if score > f32::NEG_INFINITY {
+            end = p + 1;
+        }
+    }
+    let mut total = 0.0f32;
+    for p in 0..end {
+        let score = scores[at + p as u64];
+        if score > f32::NEG_INFINITY {
+            total += exp(score - peak);
+        }
+    }
+    let to = gid() as u64 * 3;
+    out[to] = peak;
+    out[to + 1] = total;
+    out[to + 2] = end as f32;
+}
+
+/// One thread per output, summed up to the last pick.
 #[kernel]
 fn listed_mix(
     scores: Buf<F32>,
+    stats: Buf<F32>,
     v: Buf<F32>,
     ids: Buf<U32>,
     slots: Buf<U32>,
@@ -97,13 +127,12 @@ fn listed_mix(
     }
     let kv_head = head / (heads / kv_heads);
     let at = (row * heads + head) as u64 * picks as u64;
-    let mut peak = f32::NEG_INFINITY;
-    for p in 0..picks {
-        peak = max(peak, scores[at + p as u64]);
-    }
-    let mut total = 0.0f32;
+    let stat = (row * heads + head) as u64 * 3;
+    let peak = stats[stat];
+    let total = stats[stat + 1];
+    let end = stats[stat + 2] as u32;
     let mut sum = 0.0f32;
-    for p in 0..picks {
+    for p in 0..end {
         let score = scores[at + p as u64];
         if score > f32::NEG_INFINITY {
             let mut j = p;
@@ -111,9 +140,7 @@ fn listed_mix(
                 j = ids[row as u64 * picks as u64 + p as u64];
             }
             let v_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
-            let e = exp(score - peak);
-            total += e;
-            sum += e * v[v_at + d as u64];
+            sum += exp(score - peak) * v[v_at + d as u64];
         }
     }
     let mut o = 0.0f32;
@@ -146,7 +173,12 @@ pub(crate) struct Sizes {
 impl Sizes {
     /// One score per row, head and pick.
     fn scores(&self) -> usize {
-        self.len / self.width * self.picks
+        self.lists() * self.picks
+    }
+
+    /// One list of picks per row and head.
+    fn lists(&self) -> usize {
+        self.len / self.width
     }
 
     /// The launch of `step` over `len` threads, `scale` if given.
@@ -172,10 +204,11 @@ impl Sizes {
         vec![launch]
     }
 
-    /// Scores, then the mix that reads them.
+    /// Scores, their peaks and totals, then the mix.
     fn drafts(self, [q, k, v, ids, slots, positions]: [T; 6]) -> Vec<Draft> {
         let mix = [
             Read::Draft(0),
+            Read::Draft(1),
             Read::Node(v),
             Read::Node(ids),
             Read::Node(slots),
@@ -186,6 +219,7 @@ impl Sizes {
                 [q, k, ids, slots, positions],
                 self.scores(),
             ),
+            Draft::new(ListedStats(self), [Read::Draft(0)], self.lists() * 3),
             Draft::new(ListedMix(self), mix, self.len),
         ]
     }
@@ -204,6 +238,22 @@ pub(crate) struct ListedScores(pub Sizes);
 
 fn scores_launches(k: &ListedScores, step: &Step) -> Vec<Launch> {
     k.0.launch(step, k.0.scores(), Some(k.0.scale))
+}
+
+/// Each row and head's peak score, total, and kept picks.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    listed_stats,
+    name = "listed_stats",
+    sizes = [self.0.len, self.0.picks],
+    work = self.0.scores(),
+    launches = stats_launches,
+)]
+pub(crate) struct ListedStats(pub Sizes);
+
+fn stats_launches(k: &ListedStats, step: &Step) -> Vec<Launch> {
+    let len = k.0.lists();
+    vec![Launch::plain(step, &[len, k.0.picks], Shape::Line(len))]
 }
 
 /// The softmax of the scores over the listed values.
