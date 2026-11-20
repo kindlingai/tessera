@@ -2,7 +2,7 @@
 
 use crate::names::Rule;
 use crate::tokenize::hf::Hf;
-use crate::{Bundle, Template, head_dim, stepper};
+use crate::{Bundle, Template, stepper};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -199,4 +199,9 @@ pub(crate) fn load(
         template,
         stop,
     })
+}
+
+/// A head's width, where a file leaves it out.
+fn head_dim(given: Option<u64>, hidden: u64, heads: u64) -> u64 {
+    given.unwrap_or(hidden / heads)
 }

@@ -1,7 +1,7 @@
 //! A decoder's residual rows after chosen layers, as text features.
 
 use crate::tokenize::hf::Hf;
-use crate::{Template, config, pull};
+use crate::{Overrides, Template, config, pull};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
@@ -33,8 +33,9 @@ pub fn tapped(
     [dir, words]: [&Path; 2],
     [seqs, context]: [u64; 2],
     layers: &[u64],
+    overrides: &Overrides,
 ) -> Result<Tapped> {
-    let (arch, mut config) = config(dir, seqs, context)?;
+    let (arch, mut config) = config(dir, [seqs, context], overrides)?;
     let deepest = layers.iter().copied().max().ok_or("no layers to tap")?;
     if deepest > config.stack.layers {
         return Err(format!("layer {deepest} of {}", config.stack.layers).into());

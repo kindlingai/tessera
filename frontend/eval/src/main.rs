@@ -188,8 +188,13 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
         Some(path) => tessera_bundle::names::rules(&std::fs::read_to_string(path)?)?,
         None => Vec::new(),
     };
-    let loaded =
-        tessera_bundle::load_named(&args.model, slots, args.context as u64, &rules, false)?;
+    let loaded = tessera_bundle::load_named(
+        &args.model,
+        [slots, args.context as u64],
+        &rules,
+        false,
+        &Default::default(),
+    )?;
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {

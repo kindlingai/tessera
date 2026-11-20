@@ -107,6 +107,7 @@ impl Klein {
             &settings,
             &pipeline.layers,
             [1, pipeline.rows],
+            &config.under("text_encoder"),
         )?;
         let sizes = [1, pipeline.rows, largest * largest];
         let flow = Flow::open(&dir, &settings, sizes, &config)?;

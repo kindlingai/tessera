@@ -1,6 +1,8 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
+use crate::keys::Keys;
 use crate::shared::{Attend, Side, Stack, listed, pick, sparse_ports, step_ports, swiglu, tokens};
+use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
@@ -112,6 +114,46 @@ pub struct Config {
 }
 
 impl Config {
+    /// The decoder `k` describes, for these launch bounds.
+    pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        k.fixed("hidden_act", json!("silu"));
+        k.fixed("attention_bias", json!(false));
+        k.fixed("mlp_bias", json!(false));
+        k.fixed("rope_scaling", json!(null));
+        k.fixed("use_sliding_window", json!(false));
+        let types: Vec<String> = k.or(&["layer_types"], Vec::new());
+        if types.iter().any(|t| t != "full_attention") {
+            k.misfit(
+                "layer_types",
+                "the graph attends to every row in each layer",
+            );
+        }
+        let [vocab, hidden, layers, heads, ffn] = [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "intermediate_size",
+        ]
+        .map(|key| k.need::<u64>(&[key]));
+        let head_dim = k.or(&["head_dim"], hidden.checked_div(heads).unwrap_or(0));
+        let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
+        Self {
+            stack: Stack::sized(sizes, max_seqs, max_context),
+            kv_heads: k.need(&["num_key_value_heads"]),
+            rope_theta: k.need(&["rope_theta", "rope_parameters.rope_theta"]),
+            eps: k.need(&["rms_norm_eps"]),
+            experts: k.or(&["num_local_experts"], 0),
+            top_k: k.or(&["num_experts_per_tok"], 0),
+            scales: Scales {
+                embed: k.or(&["embedding_multiplier"], 1.0),
+                attention: k.or(&["attention_multiplier"], None),
+                residual: k.or(&["residual_multiplier"], 1.0),
+                logits: 1.0 / k.or(&["logits_scaling"], 1.0),
+            },
+        }
+    }
+
     /// Qwen3-0.6B's sizes. Its heads are normed.
     pub fn qwen3(max_seqs: u64, max_context: u64) -> Self {
         Self {

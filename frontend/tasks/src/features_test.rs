@@ -13,7 +13,8 @@ fn matches_torch() {
         ..Settings::default()
     };
     // The layers FLUX.2 klein reads.
-    let mut f = Features::open([&dir.join("model"); 2], &s, &[9, 18, 27], [2, 64]).unwrap();
+    let m = dir.join("model");
+    let mut f = Features::open([&m; 2], &s, &[9, 18, 27], [2, 64], &Default::default()).unwrap();
     let got = f.encode(&["a yellow rubber duck", "a red potion on a table"]);
     let (got, want) = (got.unwrap().concat(), r.floats("embeds").unwrap());
     // Each row by its own largest value: outliers reach thousands.

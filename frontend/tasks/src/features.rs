@@ -3,6 +3,7 @@
 use crate::Error;
 use std::path::Path;
 use tessera_bundle::Message;
+use tessera_bundle::Overrides;
 use tessera_bundle::taps::{Tapped, tapped};
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_engine::{Model, Recipe, Settings, Tensor};
@@ -21,8 +22,9 @@ impl Features {
         settings: &Settings,
         layers: &[u64],
         [seqs, rows]: [usize; 2],
+        config: &Overrides,
     ) -> Result<Self, Error> {
-        let t = tapped(dirs, [seqs as u64, rows as u64], layers)?;
+        let t = tapped(dirs, [seqs as u64, rows as u64], layers, config)?;
         let recipe = Recipe {
             pins: t.pins.clone(),
             ..Recipe::default()

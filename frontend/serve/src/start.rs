@@ -174,8 +174,9 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         None => Vec::new(),
     };
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
-    let loaded = tessera_bundle::load_named(&o.model, slots, context, &rules, o.guided)
-        .map_err(|e| e.to_string())?;
+    let loaded =
+        tessera_bundle::load_named(&o.model, [slots, context], &rules, o.guided, &o.config)
+            .map_err(|e| e.to_string())?;
     let recipe = lowering(o, loaded.pins);
     let at = (&recipe, settings);
     let count = loaded.graph.weights.len() as u32;

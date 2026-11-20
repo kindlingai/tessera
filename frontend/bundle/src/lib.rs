@@ -29,36 +29,12 @@ use names::Rule;
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{File, Offer, Stored};
-use tessera_engine::decoder::{self, Config, Moe, Scales, Swiglu};
+use tessera_checkpoint::{Offer, Shards, Stored};
+use tessera_engine::decoder::{self, Config, Moe, Swiglu};
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Norm, Pins, Stack, Tensor, Weight};
+use tessera_engine::{Graph, Norm, Pins, Tensor, Weight};
 use tokenize::hf::Hf;
-
-/// Fields the graph needs from a Hugging Face `config.json`.
-#[derive(Deserialize)]
-struct HfConfig {
-    model_type: String,
-    vocab_size: u64,
-    hidden_size: u64,
-    num_hidden_layers: u64,
-    num_attention_heads: u64,
-    num_key_value_heads: u64,
-    /// Older files leave it out: `hidden_size / num_attention_heads`.
-    head_dim: Option<u64>,
-    intermediate_size: u64,
-    rope_theta: f32,
-    rms_norm_eps: f32,
-    /// Routed models name their experts and the picks per row.
-    num_local_experts: Option<u64>,
-    num_experts_per_tok: Option<u64>,
-    /// Granite's multipliers.
-    embedding_multiplier: Option<f32>,
-    attention_multiplier: Option<f32>,
-    residual_multiplier: Option<f32>,
-    logits_scaling: Option<f32>,
-}
 
 /// One id or a list, the `generation_config.json` shape.
 #[derive(Deserialize)]
@@ -125,6 +101,18 @@ pub struct Overrides(serde_json::Map<String, serde_json::Value>);
 
 impl Overrides {
     pub fn new(files: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self(files)
+    }
+
+    /// The tables for files in `folder`, keyed from inside it.
+    pub fn under(&self, folder: &str) -> Self {
+        let prefix = format!("{folder}/");
+        let mut files = serde_json::Map::new();
+        for (key, table) in &self.0 {
+            if let Some(inner) = key.strip_prefix(&prefix) {
+                files.insert(inner.into(), table.clone());
+            }
+        }
         Self(files)
     }
 
@@ -303,43 +291,16 @@ pub(crate) fn stepper(arch: &str, c: &Config) -> Option<Graph> {
     })
 }
 
-/// A head's width, where a file leaves it out.
-pub(crate) fn head_dim(given: Option<u64>, hidden: u64, heads: u64) -> u64 {
-    given.unwrap_or(hidden / heads)
-}
-
 /// The architecture and graph sizes `dir/config.json` gives.
 pub(crate) fn config(
     dir: &Path,
-    slots: u64,
-    context: u64,
+    [slots, context]: [u64; 2],
+    overrides: &Overrides,
 ) -> Result<(String, Config), Box<dyn Error + Send + Sync>> {
-    let hf: HfConfig = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let config = Config {
-        stack: Stack {
-            vocab: hf.vocab_size,
-            hidden: hf.hidden_size,
-            layers: hf.num_hidden_layers,
-            heads: hf.num_attention_heads,
-            head_dim: head_dim(hf.head_dim, hf.hidden_size, hf.num_attention_heads),
-            ffn: hf.intermediate_size,
-            max_seqs: slots,
-            max_context: context,
-            masked: false,
-        },
-        kv_heads: hf.num_key_value_heads,
-        rope_theta: hf.rope_theta,
-        eps: hf.rms_norm_eps,
-        experts: hf.num_local_experts.unwrap_or(0),
-        top_k: hf.num_experts_per_tok.unwrap_or(0),
-        scales: Scales {
-            embed: hf.embedding_multiplier.unwrap_or(1.0),
-            attention: hf.attention_multiplier,
-            residual: hf.residual_multiplier.unwrap_or(1.0),
-            logits: 1.0 / hf.logits_scaling.unwrap_or(1.0),
-        },
-    };
-    Ok((hf.model_type, config))
+    let path = dir.join("config.json");
+    overrides.read("config.json", Some(&path), |k| {
+        (k.need(&["model_type"]), Config::read(k, slots, context))
+    })
 }
 
 /// The trellis width an exlr8 release's experts load at.
@@ -347,16 +308,16 @@ const WIDTH: u32 = 3;
 
 /// Reads a model directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
-    load_named(dir, slots, context, &[], false)
+    load_named(dir, [slots, context], &[], false, &Overrides::default())
 }
 
 /// The user's name rules go last. `masked` adds mask ports.
 pub fn load_named(
     dir: &Path,
-    slots: u64,
-    context: u64,
+    [slots, context]: [u64; 2],
     user: &[Rule],
     masked: bool,
+    overrides: &Overrides,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
         return gguf::load(dir, slots, context, user, masked);
@@ -367,12 +328,12 @@ pub fn load_named(
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
-    let (arch, mut config) = config(dir, slots, context)?;
+    let (arch, mut config) = config(dir, [slots, context], overrides)?;
     config.stack.masked = masked;
     let graph = stepper(&arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
-    let file = File::open(&dir.join("model.safetensors"))?;
-    let (weights, pins) = pull(&graph, &file, config.stack.layers, &[user])?;
+    let shards = Shards::open(dir)?;
+    let (weights, pins) = pull(&graph, &shards, config.stack.layers, &[user])?;
     dressed(dir, graph, Weights::Held(weights), pins)
 }
 
