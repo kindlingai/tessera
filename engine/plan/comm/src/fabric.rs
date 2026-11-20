@@ -129,6 +129,9 @@ pub(crate) struct Lane {
     pub gid: [u8; 16],
 }
 
+/// `Peer`'s first word. Change it with the format.
+const VERSION: u32 = 1;
+
 /// A rank's regions and queue pairs, for its peers.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub(crate) struct Peer {
@@ -140,7 +143,7 @@ pub(crate) struct Peer {
 
 impl Peer {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = VERSION.to_le_bytes().to_vec();
         out.extend_from_slice(&(self.regions.len() as u32).to_le_bytes());
         for region in &self.regions {
             out.extend_from_slice(&region.to_le_bytes());
@@ -161,8 +164,18 @@ impl Peer {
         out
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    /// Decodes a peer's bytes, or says why it cannot.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut at = Cursor(bytes);
+        match at.u32() {
+            Some(VERSION) => {}
+            Some(v) => return Err(format!("details version {v}, expected {VERSION}")),
+            None => return Err("no details version".into()),
+        }
+        Self::fields(at).ok_or_else(|| "details do not decode".into())
+    }
+
+    fn fields(mut at: Cursor) -> Option<Self> {
         let regions = (0..at.u32()?)
             .map(|_| at.u64())
             .collect::<Option<Vec<_>>>()?;

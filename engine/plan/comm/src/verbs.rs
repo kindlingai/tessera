@@ -502,7 +502,7 @@ impl Engine {
         let mine = engine.described();
         let all = boot.exchange(&mine.to_bytes())?;
         for (r, bytes) in all.iter().enumerate() {
-            let peer = Peer::from_bytes(bytes).ok_or(Error::Fit(format!("rank {r}'s details")))?;
+            let peer = Peer::from_bytes(bytes).map_err(|e| Error::Fit(format!("rank {r}: {e}")))?;
             engine.peers.push(peer);
         }
         for c in 0..engine.links.len() {

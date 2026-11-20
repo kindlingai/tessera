@@ -75,8 +75,11 @@ fn peer_round_trip() {
         channels,
     };
     let bytes = peer.to_bytes();
-    assert_eq!(bytes.len(), 4 + 2 * 8 + 4 + 3 * 4 + 3 * (12 + 12 + 16));
-    assert_eq!(Peer::from_bytes(&bytes), Some(peer));
-    assert_eq!(Peer::from_bytes(&bytes[..bytes.len() - 1]), None);
-    assert_eq!(Peer::from_bytes(&[bytes, vec![0]].concat()), None);
+    assert_eq!(bytes.len(), 8 + 2 * 8 + 4 + 3 * 4 + 3 * (12 + 12 + 16));
+    assert_eq!(Peer::from_bytes(&bytes), Ok(peer));
+    assert!(Peer::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    assert!(Peer::from_bytes(&[bytes.clone(), vec![0]].concat()).is_err());
+    let old = [&[0u8; 4][..], &bytes[4..]].concat();
+    let e = Peer::from_bytes(&old).unwrap_err();
+    assert_eq!(e, "details version 0, expected 1");
 }
