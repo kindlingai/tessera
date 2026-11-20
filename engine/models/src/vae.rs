@@ -4,8 +4,8 @@ use crate::keys::Keys;
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, PathSeg, Port, Role, Tensor,
-    TensorType, Vector, Weights,
+    Act, Composite, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, PathSeg, Port,
+    Role, Tensor, TensorType, Vector, Weights,
 };
 
 /// Channels per transformer token: 32 latent channels in 2x2 patches.
@@ -302,21 +302,26 @@ pub fn forward(m: &Model, c: &Config, d: &Decoder, tokens: &Tensor, ids: &[Tenso
     let x = d.post_quant.apply(&unpatchify(&x, c.side));
     let (mut side, mut level) = (sides[0], 0);
     let top = c.widths[0];
-    let mut x = d.conv_in.conv(&x, &ids[0], [side * side, LATENT]);
-    x = d.mid[0].apply(&x, &ids[0], [side * side, top, top]);
-    x = d.attention.apply(m, &x, [side * side, top]);
-    x = d.mid[1].apply(&x, &ids[0], [side * side, top, top]);
+    let x = d.conv_in.conv(&x, &ids[0], [side * side, LATENT]);
+    let [mut x] = m.composite(Composite::Layer, || {
+        let x = d.mid[0].apply(&x, &ids[0], [side * side, top, top]);
+        let x = d.attention.apply(m, &x, [side * side, top]);
+        [d.mid[1].apply(&x, &ids[0], [side * side, top, top])]
+    });
     let mut cin = top;
     for (up, &cout) in d.ups.iter().zip(&c.widths) {
-        for (j, r) in up.resnets.iter().enumerate() {
-            let from = if j == 0 { cin } else { cout };
-            x = r.apply(&x, &ids[level], [side * side, from, cout]);
-        }
-        if let Some(conv) = &up.upsample {
-            x = upsample(&x, [side, cout]);
-            (side, level) = (side * 2, level + 1);
-            x = conv.conv(&x, &ids[level], [side * side, cout]);
-        }
+        [x] = m.composite(Composite::Layer, || {
+            for (j, r) in up.resnets.iter().enumerate() {
+                let from = if j == 0 { cin } else { cout };
+                x = r.apply(&x, &ids[level], [side * side, from, cout]);
+            }
+            if let Some(conv) = &up.upsample {
+                x = upsample(&x, [side, cout]);
+                (side, level) = (side * 2, level + 1);
+                x = conv.conv(&x, &ids[level], [side * side, cout]);
+            }
+            [x]
+        });
         cin = cout;
     }
     let x = d.norm_out.apply(&x, [side * side, cin]).act(Act::Silu);

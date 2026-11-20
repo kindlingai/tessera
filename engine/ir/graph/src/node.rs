@@ -303,7 +303,7 @@ pub enum Composite {
     Attention,
     Mlp,
     Moe,
-    /// One decoder layer: norms, attention, MLP, residual adds.
+    /// One block a model repeats, such as a decoder layer.
     Layer,
     /// Embedding to logits.
     Model,

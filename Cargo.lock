@@ -1780,6 +1780,7 @@ name = "tessera-calibrate"
 version = "0.1.0"
 dependencies = [
  "naga",
+ "serde_json",
  "tessera-bundle",
  "tessera-codegen",
  "tessera-engine",

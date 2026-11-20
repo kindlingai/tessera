@@ -5,8 +5,8 @@ use crate::shared::{join, spread};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Port,
-    Role, Tensor, TensorType, Weights,
+    Act, Composite, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs,
+    PathSeg, Port, Role, Tensor, TensorType, Weights,
 };
 
 /// Channels per latent token.
@@ -350,12 +350,13 @@ pub fn forward(
     let (im, tm, sm, om) = (mods(&im, ir), mods(&tm, tr), mods(&sm, sr), mods(&om, or));
     let mut streams = [x.text.matmul(&w.text_in), x.image.matmul(&w.image_in)];
     for d in doubles {
-        streams = double(m, c, d, streams, [&tm, &im], &x.ids);
+        let block = || double(m, c, d, streams, [&tm, &im], &x.ids);
+        streams = m.composite(Composite::Layer, block);
     }
     let [text, image] = streams;
     let mut xs = join(&text, &image);
     for s in singles {
-        xs = single(m, c, s, xs, &sm, &x.ids);
+        [xs] = m.composite(Composite::Layer, || [single(m, c, s, xs, &sm, &x.ids)]);
     }
     let image = xs.slice(1, c.text, Rows);
     let n = image.center().rms(c.eps);

@@ -17,22 +17,28 @@ pub struct Transformer {
 }
 
 /// `dir/transformer`, with `text` rows and up to `rows` image rows.
-pub fn transformer(
-    dir: &Path,
-    [seqs, text, rows]: [u64; 3],
-    config: &Overrides,
-) -> Result<Transformer> {
-    const FILE: &str = "transformer/config.json";
-    let config = config.read(FILE, Some(&dir.join(FILE)), |k| {
-        Config::read(k, seqs, text, rows)
-    })?;
-    let graph = program(&config);
-    let file = File::open(&dir.join("transformer/diffusion_pytorch_model.safetensors"))?;
-    let rules = repo("flux2").unwrap_or_default();
-    let (weights, pins) = pull(&graph, &file, 0, &[&rules])?;
+pub fn transformer(dir: &Path, sizes: [u64; 3], overrides: &Overrides) -> Result<Transformer> {
+    let graph = graph(dir, sizes, overrides)?;
+    let (weights, pins) = weights(dir, &graph)?;
     Ok(Transformer {
         graph,
         weights,
         pins,
     })
+}
+
+/// The transformer `dir/transformer/config.json` describes.
+pub fn graph(dir: &Path, [seqs, text, rows]: [u64; 3], overrides: &Overrides) -> Result<Graph> {
+    const FILE: &str = "transformer/config.json";
+    let config = overrides.read(FILE, Some(&dir.join(FILE)), |k| {
+        Config::read(k, seqs, text, rows)
+    })?;
+    Ok(program(&config))
+}
+
+/// The weights `graph` reads from `dir/transformer`, and their forms.
+pub fn weights(dir: &Path, graph: &Graph) -> Result<(Vec<Weight>, Pins)> {
+    let file = File::open(&dir.join("transformer/diffusion_pytorch_model.safetensors"))?;
+    let rules = repo("flux2").unwrap_or_default();
+    pull(graph, &file, 0, &[&rules])
 }

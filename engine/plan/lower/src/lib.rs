@@ -24,7 +24,7 @@ pub use assign::assign;
 pub use body::{GUESS, small, source};
 pub use cache::Cache;
 pub use cost::Device;
-pub use cut::cut;
+pub use cut::{cut, cut_region};
 pub use error::{Size, Unsupported};
 pub use extent::Extent;
 pub use form::{Pins, Weight};

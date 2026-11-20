@@ -1,23 +1,24 @@
 //! Runs a plan again whenever a kernel file changes.
 
 use crate::grid::bounded;
-use crate::plans::{feeds, sizes, subjects};
+use crate::plans::feeds;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use tessera_bundle::flux2::transformer;
+use tessera_bundle::parts;
 use tessera_graph::DimName::{self, Context, Rows, Seqs};
-use tessera_graph::Graph;
-use tessera_lower::{Device, Pins, Plan, Settings, Source, Step, Tensor, View, Weight, lower};
+use tessera_graph::{Graph, Op, PathSeg, Region, Size};
+use tessera_lower::{
+    Device, Pins, Plan, Settings, Source, Step, Tensor, View, Weight, cut_region, lower,
+};
 use tessera_run::{Outcome, Reload, Run, open};
 use tessera_testkit::graphs::{attention, linear};
 use tessera_testkit::{Noise, weights};
 
 const USAGE: &str = "usage: tessera-calibrate watch <dir> \
     gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
-    qwen3 <rows> [<context>] | eg2 <rows> [<context>] | \
-    flux2 <model dir> <image rows> [<text rows>]";
+    model <model dir> [<part>] [--region <kind>.<n>] [--list] [<Dim>=<n> ...]";
 /// Time between checks for changed files.
 const POLL: Duration = Duration::from_millis(20);
 /// Device seconds to spend timing one step.
@@ -25,8 +26,6 @@ const SPEND: f64 = 0.01;
 const MOST: f64 = 64.0;
 /// Seconds of whole runs first, so clocks rise from idle.
 const WARM: Duration = Duration::from_millis(100);
-/// Text rows klein pads every prompt to.
-const TEXT: u64 = 512;
 
 /// A graph at fixed sizes, with its weight forms.
 struct Subject {
@@ -46,56 +45,140 @@ fn numbers(args: &[String]) -> Result<Vec<u64>, Box<dyn Error>> {
     Ok(n)
 }
 
-/// A FLUX.2 transformer from a diffusers directory, with its weights.
-fn flux2(args: &[String]) -> Result<Subject, Box<dyn Error>> {
-    let (dir, rest) = args.split_first().ok_or(USAGE)?;
-    let (rows, text) = match numbers(rest)?.as_slice() {
-        [rows] => (*rows, TEXT),
-        [rows, text] => (*rows, *text),
-        _ => return Err(USAGE.into()),
-    };
-    let t = transformer(Path::new(dir), [1, text, rows], &Default::default())
-        .map_err(|e| e as Box<dyn Error>)?;
-    Ok(Subject {
-        g: t.graph,
-        sizes: vec![(Seqs, 1), (Rows, rows)],
-        pins: t.pins,
-        loads: Some(t.weights),
-    })
+/// `Rows=64` or `rows=64` as a size.
+fn sized(arg: &str) -> Option<(DimName, u64)> {
+    let (name, n) = arg.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?.to_uppercase();
+    let name = serde_json::Value::String(first.chain(chars).collect());
+    Some((serde_json::from_value(name).ok()?, n.parse().ok()?))
 }
 
-fn subject(args: &[String]) -> Result<Subject, Box<dyn Error>> {
-    if args.first().map(String::as_str) == Some("flux2") {
-        return flux2(&args[1..]);
+/// Each region as `<kind>.<n>`, counted by kind in graph order.
+fn regions(g: &Graph) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, r) in g.regions.iter().enumerate() {
+        let n = g.regions[..at].iter().filter(|o| o.kind == r.kind).count();
+        names.push(format!("{:?}.{n}", r.kind).to_lowercase());
     }
-    let n = numbers(args.get(1..).unwrap_or_default())?;
+    names
+}
+
+/// The path that the weights `r` reads share.
+fn label(g: &Graph, r: &Region) -> String {
+    let mut shared: Option<&[PathSeg]> = None;
+    for id in &r.inputs {
+        let Op::Weight(w) = g.node(*id).op else {
+            continue;
+        };
+        let path = &g.weights[w as usize].path[..];
+        let same = shared.map_or(path.len(), |s| {
+            s.iter().zip(path).take_while(|(a, b)| a == b).count()
+        });
+        shared = Some(&path[..same]);
+    }
+    PathSeg::dotted(shared.unwrap_or_default())
+}
+
+/// A bundle's error, which may cross threads.
+type Failed = Box<dyn Error + Send + Sync>;
+
+/// Prints each part's dims and regions.
+fn list(dir: &Path, names: &[String], size: &dyn Fn(DimName) -> Option<u64>) -> Result<(), Failed> {
+    for name in names {
+        let g = parts::open(dir, name, size)?.graph;
+        println!(
+            "{name}: {} weights, {} nodes",
+            g.weights.len(),
+            g.nodes.len()
+        );
+        let mut dims = Vec::new();
+        for d in &g.dims {
+            dims.push(match d.size {
+                Size::Bounded(n) => format!("{:?}<={n}", d.name),
+                Size::Fixed(n) => format!("{:?}={n}", d.name),
+            });
+        }
+        println!("  {}", dims.join(" "));
+        for (r, region) in g.regions.iter().zip(regions(&g)) {
+            let nodes = r.end.0 - r.start.0;
+            println!("  {region:<14} {nodes:>6} nodes  {}", label(&g, r));
+        }
+    }
+    Ok(())
+}
+
+/// A part of the model in `args[0]`, or one region.
+fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
+    let (dir, rest) = args.split_first().ok_or(USAGE)?;
+    let dir = Path::new(dir);
+    let (mut part, mut region, mut listed, mut given) = (None, None, false, Vec::new());
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--list" => listed = true,
+            "--region" => region = Some(rest.next().ok_or(USAGE)?),
+            _ if arg.contains('=') => given.push(sized(arg).ok_or(USAGE)?),
+            _ if part.is_none() => part = Some(arg.clone()),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let size = |n: DimName| given.iter().find(|(d, _)| *d == n).map(|(_, v)| *v);
+    let all = parts::names(dir)?;
+    if listed {
+        list(dir, &part.map_or(all, |p| vec![p]), &size)?;
+        return Ok(None);
+    }
+    let part = match (part, all.as_slice()) {
+        (Some(part), _) => part,
+        (None, [one]) => one.clone(),
+        _ => return Err(format!("pick a part: {}", all.join(", ")).into()),
+    };
+    let p = parts::open(dir, &part, &size)?;
+    let g = match region {
+        Some(name) => {
+            let at = regions(&p.graph).iter().position(|n| n == name);
+            let at = at.ok_or_else(|| format!("{part} has no region {name}; see --list"))?;
+            cut_region(&p.graph, &p.graph.regions[at])
+        }
+        None => p.graph.clone(),
+    };
+    let (loads, pins) = p.weights(&g)?;
+    let mut sizes = given.clone();
+    for d in &g.dims {
+        if let (Size::Bounded(n), None) = (d.size, size(d.name)) {
+            sizes.push((d.name, n));
+        }
+    }
+    Ok(Some(Subject {
+        g,
+        sizes,
+        pins,
+        loads: Some(loads),
+    }))
+}
+
+fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>> {
+    let (kind, rest) = args.split_first().ok_or(USAGE)?;
+    if kind == "model" {
+        return model(rest).map_err(|e| e as Box<dyn Error>);
+    }
     let (default, matmul, attend) = (Pins::default(), [Rows], [Seqs, Rows, Context]);
-    Ok(match (args.first().map(String::as_str), n.as_slice()) {
-        (Some("gemm"), [m, k, width]) => Subject {
+    Ok(Some(match (kind.as_str(), numbers(rest)?.as_slice()) {
+        ("gemm", [m, k, width]) => Subject {
             g: linear(&bounded(&matmul), *k, *width),
             sizes: vec![(Rows, *m)],
             pins: default,
             loads: None,
         },
-        (Some("attend"), [heads, kv, width, queries, keys]) => Subject {
+        ("attend", [heads, kv, width, queries, keys]) => Subject {
             g: attention(&bounded(&attend), [*heads, *kv, *width]),
             sizes: vec![(Seqs, 1), (Rows, *queries), (Context, *keys)],
             pins: default,
             loads: None,
         },
-        (Some(model), [rows, context @ ..]) if context.len() < 2 => {
-            let found = subjects().into_iter().find(|s| s.name == model);
-            let s = found.ok_or(USAGE)?;
-            let context = context.first().unwrap_or(rows);
-            Subject {
-                g: s.graph,
-                sizes: sizes(*rows, *context).to_vec(),
-                pins: s.pins,
-                loads: None,
-            }
-        }
         _ => return Err(USAGE.into()),
-    })
+    }))
 }
 
 /// One kernel entry: its steps and what they cost.
@@ -304,7 +387,9 @@ impl Watch {
 /// Plans `args`, writes its kernel files, then reruns on change.
 pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>> {
     let (dir, rest) = args.split_first().ok_or(USAGE)?;
-    let mut s = subject(rest)?;
+    let Some(mut s) = subject(rest)? else {
+        return Ok(());
+    };
     let mut noise = Noise(7);
     let noisy = |noise: &mut Noise| weights(&s.g, noise).into_iter().map(Weight::Floats);
     let loads: Vec<Weight> = match s.loads.take() {

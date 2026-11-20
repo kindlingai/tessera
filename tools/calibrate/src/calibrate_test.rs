@@ -3,8 +3,11 @@ use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
 use crate::{Grid, headroom, judge};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::collections::{BTreeMap, BTreeSet};
+use tessera_graph::{Composite, NodeId, Op, verify};
 use tessera_lower::form::BF16_FORM;
-use tessera_lower::{Cluster, Device, Pick, Pins, Settings, Source, Zone, ZoneKind, rules};
+use tessera_lower::{
+    Cluster, Device, Pick, Pins, Settings, Source, Zone, ZoneKind, cut_region, lower, rules,
+};
 use tessera_sim::Chip;
 use tessera_testkit::scratch;
 
@@ -204,4 +207,19 @@ fn grid_prints_wgsl() {
     }
     println!("{} kernels, refused: {refused:#?}", seen.len());
     assert!(seen.len() > refused.values().sum::<usize>());
+}
+
+/// A layer cut from a model keeps its weights.
+#[test]
+fn one_layer_plans() {
+    let s = &crate::plans::subjects()[0];
+    let layer = s.graph.regions.iter().find(|r| r.kind == Composite::Layer);
+    let layer = layer.unwrap();
+    let g = cut_region(&s.graph, layer);
+    verify(&g).unwrap();
+    let weight = |i: &&NodeId| matches!(s.graph.node(**i).op, Op::Weight(_));
+    assert_eq!(g.weights.len(), layer.inputs.iter().filter(weight).count());
+    assert!(g.regions.iter().any(|r| r.kind == Composite::Attention));
+    let device = Device::guess(&settings()).pinned(s.pins.clone());
+    lower(&g, 0, &crate::plans::sizes(8, 8), &device).unwrap();
 }

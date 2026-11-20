@@ -89,6 +89,11 @@ pub(crate) fn feeds(
         // One sequence: noise slots would read past its rows.
         Ok(match p.role {
             Role::Slots => Tensor::zeros(t.shape.clone(), t.dtype()),
+            // Rows that share a position would race to append.
+            Role::Positions => {
+                let (n, last) = (t.len(), *t.shape.last().unwrap_or(&1));
+                Tensor::u32(t.shape.clone(), (0..n).map(|i| (i % last) as u32).collect())
+            }
             _ => t,
         })
     });

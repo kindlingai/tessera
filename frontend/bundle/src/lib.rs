@@ -11,6 +11,7 @@ mod mla_test;
 pub mod names;
 #[cfg(test)]
 mod names_test;
+pub mod parts;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]

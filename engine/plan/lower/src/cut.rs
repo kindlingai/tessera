@@ -1,34 +1,60 @@
-//! Cuts nodes out of a graph, to check one rule.
+//! Cuts nodes, or one region, out of a graph.
 
-use tessera_graph::{Entry, EntryKind, Graph, Node, NodeId, Op, Output, Port, Role};
+use tessera_graph::{Entry, EntryKind, Graph, Node, NodeId, Op, Output, Port, Region, Role};
 
 /// A graph of `nodes` alone. Their reads become its inputs.
 pub fn cut(g: &Graph, nodes: &[NodeId]) -> Graph {
+    let last = *nodes.last().expect("nodes to cut");
+    carve(g, nodes, &[last], false)
+}
+
+/// Region `r` alone, with its weights, roles and inner regions.
+pub fn cut_region(g: &Graph, r: &Region) -> Graph {
+    let nodes: Vec<NodeId> = (r.start.0..r.end.0).map(NodeId).collect();
+    carve(g, &nodes, &r.outputs, true)
+}
+
+/// `nodes` as a graph. `keep` keeps weights, roles and regions.
+fn carve(g: &Graph, nodes: &[NodeId], outputs: &[NodeId], keep: bool) -> Graph {
     let mut out = Graph::new(g.dims.clone());
     out.kept.clone_from(&g.kept);
-    let reads: Vec<NodeId> = nodes
-        .iter()
-        .flat_map(|n| &g.node(*n).args)
-        .filter(|a| !nodes.contains(a))
-        .fold(Vec::new(), |mut seen, a| {
-            if !seen.contains(a) {
-                seen.push(*a);
+    let mut reads: Vec<NodeId> = Vec::new();
+    for n in nodes {
+        for a in &g.node(*n).args {
+            if !nodes.contains(a) && !reads.contains(a) {
+                reads.push(*a);
             }
-            seen
-        });
-    let port = |id: &NodeId| Port {
-        role: Role::Tokens,
-        ty: g.node(*id).ty.clone(),
-    };
-    let inputs: Vec<Port> = reads.iter().map(port).collect();
-    for (at, p) in inputs.iter().enumerate() {
+        }
+    }
+    let mut inputs: Vec<Port> = Vec::new();
+    for id in &reads {
+        let node = g.node(*id);
+        let op = match node.op {
+            Op::Weight(w) if keep => {
+                out.weights.push(g.weights[w as usize].clone());
+                Op::Weight(out.weights.len() as u32 - 1)
+            }
+            _ => {
+                let role = match node.op {
+                    Op::Input { entry, port } if keep => {
+                        g.entries[entry as usize].inputs[port as usize].role
+                    }
+                    _ => Role::Tokens,
+                };
+                inputs.push(Port {
+                    role,
+                    ty: node.ty.clone(),
+                });
+                Op::Input {
+                    entry: 0,
+                    port: inputs.len() as u32 - 1,
+                }
+            }
+        };
         out.nodes.push(Node {
-            op: Op::Input {
-                entry: 0,
-                port: at as u32,
-            },
+            op,
             args: Vec::new(),
-            ty: p.ty.clone(),
+            ty: node.ty.clone(),
             numerics: None,
         });
     }
@@ -43,14 +69,27 @@ pub fn cut(g: &Graph, nodes: &[NodeId]) -> Graph {
         node.args = node.args.iter().map(moved).collect();
         out.nodes.push(node);
     }
-    let last = NodeId(out.nodes.len() as u32 - 1);
+    let (first, last) = (nodes[0], nodes[nodes.len() - 1]);
+    for r in &g.regions {
+        if !keep || r.start < first || r.end.0 > last.0 + 1 {
+            continue;
+        }
+        out.regions.push(Region {
+            kind: r.kind,
+            start: moved(&r.start),
+            end: NodeId(moved(&NodeId(r.end.0 - 1)).0 + 1),
+            inputs: r.inputs.iter().map(moved).collect(),
+            outputs: r.outputs.iter().map(moved).collect(),
+        });
+    }
+    let outputs = outputs.iter().map(|o| Output {
+        role: Role::Logits,
+        node: moved(o),
+    });
     out.entries.push(Entry {
         kind: EntryKind::Forward,
         inputs,
-        outputs: vec![Output {
-            role: Role::Logits,
-            node: last,
-        }],
+        outputs: outputs.collect(),
     });
     out
 }
