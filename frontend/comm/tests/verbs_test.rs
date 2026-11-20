@@ -31,7 +31,9 @@ fn rounds(fabric: &Fabric, ranks: u32, link: bool) {
                         ),
                         true => {
                             let regions = exchange_regions(ranks, cap);
-                            let l = VerbsLink::connect(r, ranks, fabric, &regions, &mut boot, None);
+                            let l = VerbsLink::connect(
+                                r, ranks, fabric, &regions, cap, &mut boot, None,
+                            );
                             let wait = std::time::Duration::from_secs(30);
                             Box::new(Blocking::new(l.unwrap(), cap, wait))
                         }
@@ -41,6 +43,8 @@ fn rounds(fabric: &Fabric, ranks: u32, link: bool) {
                     // Lengths differ by rank, and one is empty.
                     out.extend(t.exchange(&vec![r as u8 + 10; 5 * r as usize]).unwrap());
                     out.extend(t.exchange(&vec![r as u8 + 20; 40_000]).unwrap());
+                    // No rank drops its link mid-relay.
+                    boot.exchange(&[]).unwrap();
                     out
                 })
             })
@@ -78,7 +82,9 @@ fn ring_loopback() {
         prev: lanes.clone(),
         next: lanes,
     };
-    rounds(&fabric, 2, false);
-    rounds(&fabric, 3, false);
-    rounds(&fabric, 4, false);
+    for link in [false, true] {
+        rounds(&fabric, 2, link);
+        rounds(&fabric, 3, link);
+        rounds(&fabric, 4, link);
+    }
 }

@@ -111,7 +111,8 @@ impl<L: Link> Blocking<L> {
         let from = Span::new(SEND, parity * self.capacity, mine.len());
         self.link.write(from, mine)?;
         let words = [round, mine.len() as u64];
-        for to in (0..ranks).filter(|&r| r != me) {
+        // Farthest first: a relay then lands before a neighbour's flag.
+        for to in (1..ranks).rev().map(|k| (me + k) % ranks) {
             let (into, flag) = (self.recv(parity, me, mine.len()), self.flag(parity, me));
             let put = Put {
                 to,
@@ -146,6 +147,8 @@ impl<L: Link> Blocking<L> {
             }
             out.push(self.link.read(self.recv(parity, r, len))?);
         }
+        // Once more, so a relaying link forwards its relays.
+        self.link.poll(&mut done)?;
         // The sends must land before this slot is written again.
         while done.iter().filter(|&&t| t == round).count() < ranks as usize - 1 {
             if start.elapsed() > self.wait {

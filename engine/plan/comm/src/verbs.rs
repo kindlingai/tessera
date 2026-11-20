@@ -105,7 +105,7 @@ pub(crate) struct Engine {
     rank: u32,
     ranks: u32,
     pub(crate) lib: &'static Lib,
-    wiring: Wiring,
+    pub(crate) wiring: Wiring,
     lanes: usize,
     pub(crate) opened: Vec<Opened>,
     /// Per channel, per lane.
