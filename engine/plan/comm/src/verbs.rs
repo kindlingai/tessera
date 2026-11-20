@@ -106,8 +106,8 @@ const FLAGS: usize = 2;
 
 /// The queue pairs and slots, one thread at a time.
 pub(crate) struct Engine {
-    rank: u32,
-    ranks: u32,
+    pub(crate) rank: u32,
+    pub(crate) ranks: u32,
     pub(crate) lib: &'static Lib,
     pub(crate) wiring: Wiring,
     lanes: usize,

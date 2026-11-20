@@ -2,7 +2,7 @@
 
 use crate::fabric::Fabric;
 use crate::ibv::{self, SendWr, Sge, Wc};
-use crate::link::{Link, Put, Span, fits};
+use crate::link::{Link, Put, Span, fit};
 use crate::reduce::Pinning;
 use crate::verbs::{Engine, Region};
 use crate::{Error, Transport};
@@ -60,11 +60,7 @@ struct Relay {
 
 /// One-sided writes, relayed across a ring of four.
 pub struct VerbsLink {
-    rank: u32,
-    ranks: u32,
     engine: Engine,
-    /// The caller's regions. The relay's follow them.
-    sizes: Vec<usize>,
     relay: Relay,
     work: HashMap<u64, Work>,
     ids: u64,
@@ -118,10 +114,7 @@ impl VerbsLink {
         }
         let n = regions.len();
         Ok(VerbsLink {
-            rank,
-            ranks,
             engine,
-            sizes: regions.to_vec(),
             relay: Relay {
                 data: n,
                 head: n + 1,
@@ -138,22 +131,30 @@ impl VerbsLink {
         })
     }
 
-    /// Every region's size, the caller's and the relay's.
-    fn all(&self) -> Vec<usize> {
-        self.engine.regions.iter().map(|r| r.len).collect()
+    /// Checks `at` against the caller's regions, or all of them.
+    fn fits(&self, hidden: bool, at: Span, align: usize) -> Result<(), Error> {
+        let n = match hidden {
+            true => self.engine.regions.len(),
+            false => self.relay.data,
+        };
+        fit(
+            self.engine.regions[..n].get(at.region).map(|r| r.len),
+            at,
+            align,
+        )
     }
 
     /// The channel straight to `to`, if one exists.
     fn channel(&self, to: u32) -> Option<usize> {
         let direct = |c: &crate::fabric::Channel| c.peer == to && !c.ports.is_empty();
         let found = self.engine.wiring.channels.iter().position(direct);
-        found.filter(|_| to != self.rank)
+        found.filter(|_| to != self.engine.rank)
     }
 
     /// The neighbour a relayed write goes through, toward `to`.
     fn via(&self, to: u32) -> Result<u32, Error> {
-        let next = (self.rank + 1) % self.ranks;
-        match self.ranks == 4 && (next + 1) % self.ranks == to {
+        let next = (self.engine.rank + 1) % self.engine.ranks;
+        match self.engine.ranks == 4 && (next + 1) % self.engine.ranks == to {
             true => Ok(next),
             false => Err(unreachable(to)),
         }
@@ -183,7 +184,7 @@ impl VerbsLink {
 
     /// `at` in the regions of `to`, a direct neighbour.
     fn remote(&self, to: u32, at: Span, align: usize) -> Result<(u64, u32), Error> {
-        fits(&self.all(), at, align)?;
+        self.fits(true, at, align)?;
         let c = self.channel(to).ok_or_else(|| unreachable(to))?;
         let meets = self.engine.wiring.channels[c].meets;
         let peer = &self.engine.peers[to as usize];
@@ -194,7 +195,7 @@ impl VerbsLink {
 
     /// A local span as an Sge toward `to`.
     fn local(&self, to: u32, at: Span) -> Result<Sge, Error> {
-        fits(&self.all(), at, 1)?;
+        self.fits(true, at, 1)?;
         let length = u32::try_from(at.len).map_err(|_| Error::Fit(format!("{} bytes", at.len)))?;
         let c = self.channel(to).ok_or_else(|| unreachable(to))?;
         let port = self.engine.links[c][0].port;
@@ -204,7 +205,7 @@ impl VerbsLink {
     }
 
     fn word_at(&self, at: Span) -> Result<&AtomicU64, Error> {
-        fits(&self.all(), Span::new(at.region, at.at, 8), 8)?;
+        self.fits(true, Span::new(at.region, at.at, 8), 8)?;
         let word = self.engine.regions[at.region].at(at.at);
         // Checked: in bounds and 8-byte aligned.
         Ok(unsafe { &*(word as *const AtomicU64) })
@@ -212,7 +213,7 @@ impl VerbsLink {
 
     /// Copies `bytes` into any of this rank's regions.
     fn place(&mut self, at: Span, bytes: &[u8]) -> Result<(), Error> {
-        fits(&self.all(), Span::new(at.region, at.at, bytes.len()), 1)?;
+        self.fits(true, Span::new(at.region, at.at, bytes.len()), 1)?;
         let into = self.engine.regions[at.region].at(at.at);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), into, bytes.len()) };
         Ok(())
@@ -357,7 +358,7 @@ impl VerbsLink {
                 finished.push(c.wr_id);
             }
         }
-        let prev = (self.rank + self.ranks - 1) % self.ranks;
+        let prev = (self.engine.rank + self.engine.ranks - 1) % self.engine.ranks;
         for id in finished {
             match self.work.remove(&id) {
                 Some(Work::Tag(tag)) => done.push(tag),
@@ -375,11 +376,11 @@ impl VerbsLink {
 
 impl Link for VerbsLink {
     fn rank(&self) -> u32 {
-        self.rank
+        self.engine.rank
     }
 
     fn ranks(&self) -> u32 {
-        self.ranks
+        self.engine.ranks
     }
 
     fn put(&mut self, put: Put) -> Result<(), Error> {
@@ -387,7 +388,7 @@ impl Link for VerbsLink {
             return Err(Error::Fit(format!("{put:?} has spans that differ")));
         }
         for at in [put.from, put.into, put.flag] {
-            fits(&self.sizes, at, 1)?;
+            self.fits(false, at, 1)?;
         }
         if self.channel(put.to).is_some() {
             let spans = [put.from, put.into, put.flag];
@@ -411,7 +412,7 @@ impl Link for VerbsLink {
 
     fn word(&mut self, to: u32, at: Span, value: u64, tag: u64) -> Result<(), Error> {
         let at = Span::new(at.region, at.at, 8);
-        fits(&self.sizes, at, 8)?;
+        self.fits(false, at, 8)?;
         if self.channel(to).is_some() {
             return self.inline_word(to, at, value, Work::Tag(tag));
         }
@@ -452,18 +453,17 @@ impl Link for VerbsLink {
     }
 
     fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
-        let size = *self.sizes.get(region)?;
-        let region = &self.engine.regions[region];
-        Some((region.base, region.device(), size))
+        let region = self.engine.regions[..self.relay.data].get(region)?;
+        Some((region.base, region.device(), region.len))
     }
 
     fn load(&self, at: Span) -> Result<u64, Error> {
-        fits(&self.sizes, Span::new(at.region, at.at, 8), 8)?;
+        self.fits(false, Span::new(at.region, at.at, 8), 8)?;
         Ok(self.word_at(at)?.load(Ordering::Acquire))
     }
 
     fn read(&self, at: Span) -> Result<Vec<u8>, Error> {
-        fits(&self.sizes, at, 1)?;
+        self.fits(false, at, 1)?;
         let mut out = vec![0u8; at.len];
         let from = self.engine.regions[at.region].at(at.at);
         unsafe { std::ptr::copy_nonoverlapping(from, out.as_mut_ptr(), at.len) };
@@ -471,7 +471,7 @@ impl Link for VerbsLink {
     }
 
     fn write(&mut self, at: Span, bytes: &[u8]) -> Result<(), Error> {
-        fits(&self.sizes, Span::new(at.region, at.at, bytes.len()), 1)?;
+        self.fits(false, Span::new(at.region, at.at, bytes.len()), 1)?;
         self.place(at, bytes)
     }
 }

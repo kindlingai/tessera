@@ -54,7 +54,11 @@ pub trait Link: Send {
 
 /// Checks `at` lies in its region, aligned to `align`.
 pub(crate) fn fits(sizes: &[usize], at: Span, align: usize) -> Result<(), Error> {
-    let size = sizes.get(at.region).copied();
+    fit(sizes.get(at.region).copied(), at, align)
+}
+
+/// Checks `at` lies in a region of `size`, if any.
+pub(crate) fn fit(size: Option<usize>, at: Span, align: usize) -> Result<(), Error> {
     let inside = size.is_some_and(|s| at.at.checked_add(at.len).is_some_and(|end| end <= s));
     if !inside || !at.at.is_multiple_of(align) {
         return Err(Error::Fit(format!("{at:?} lies outside its region")));
