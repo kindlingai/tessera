@@ -70,10 +70,13 @@ impl Engine {
     /// Runs rank 0's launches until it dismisses the ranks.
     pub fn follow(&mut self) -> Result<(), Error> {
         while let Some(told) = self.told(&[])? {
-            let Some((rows, picks, head)) = decode(&told) else {
+            let Some(t) = decode(&told) else {
                 return Ok(());
             };
-            self.launch(&rows, &picks, head)?;
+            if let (Some(lanes), false) = (&mut self.lanes, t.table.is_empty()) {
+                lanes.replace(t.table);
+            }
+            self.launch(&t.rows, &t.picks, t.head)?;
         }
         Ok(())
     }
@@ -92,29 +95,32 @@ impl Engine {
         Ok(Some(parts.swap_remove(0)))
     }
 
-    /// Rank 0 tells the others its launch.
+    /// Rank 0 tells the others its launch and changed table.
     pub(super) fn announce(
         &mut self,
         rows: &[Row],
         picks: &[u32],
         head: &Head,
+        table: &[u32],
     ) -> Result<(), Error> {
         match &self.control {
             Some(control) if control.rank() == 0 => {}
             _ => return Ok(()),
         }
-        self.told(&encode(rows, picks, head)).map(|_| ())
+        self.told(&encode(rows, picks, head, table)).map(|_| ())
     }
 }
 
-/// A launch as words: counts, head, rows, picks, list.
-fn encode(rows: &[Row], picks: &[u32], head: &Head) -> Vec<u8> {
+/// A launch as words: counts, head, table, rows, picks, list.
+fn encode(rows: &[Row], picks: &[u32], head: &Head, table: &[u32]) -> Vec<u8> {
     let (tag, k, list): (u32, usize, &[u32]) = match head {
         Head::Full(None) => (0, 0, &[]),
         Head::Full(Some(masks)) => (1, 0, masks),
         Head::Sparse(ids, k) => (2, *k, ids),
     };
     let mut words = vec![rows.len() as u32, picks.len() as u32, tag, k as u32];
+    words.push(table.len() as u32);
+    words.extend(table);
     for r in rows {
         words.extend([r.slot, r.token, r.position]);
     }
@@ -123,15 +129,25 @@ fn encode(rows: &[Row], picks: &[u32], head: &Head) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// One launch from rank 0.
+struct Told {
+    rows: Vec<Row>,
+    picks: Vec<u32>,
+    head: Head,
+    /// The page table, or empty if it did not change.
+    table: Vec<u32>,
+}
+
 /// The launch `bytes` hold, if they hold one.
-fn decode(bytes: &[u8]) -> Option<(Vec<Row>, Vec<u32>, Head)> {
+fn decode(bytes: &[u8]) -> Option<Told> {
     let words: Vec<u32> = bytes
         .as_chunks::<4>()
         .0
         .iter()
         .map(|b| u32::from_le_bytes(*b))
         .collect();
-    let (&[rows, picks, tag, k], rest) = words.split_first_chunk::<4>()?;
+    let (&[rows, picks, tag, k, table], rest) = words.split_first_chunk::<5>()?;
+    let (table, rest) = rest.split_at_checked(table as usize)?;
     let (rows, rest) = rest.split_at_checked(3 * rows as usize)?;
     let (picks, list) = rest.split_at_checked(picks as usize)?;
     let row = |r: &[u32]| Row {
@@ -144,5 +160,10 @@ fn decode(bytes: &[u8]) -> Option<(Vec<Row>, Vec<u32>, Head)> {
         1 => Head::Full(Some(list.to_vec())),
         _ => Head::Sparse(list.to_vec(), k as usize),
     };
-    Some((rows.chunks(3).map(row).collect(), picks.to_vec(), head))
+    Some(Told {
+        rows: rows.chunks(3).map(row).collect(),
+        picks: picks.to_vec(),
+        head,
+        table: table.to_vec(),
+    })
 }

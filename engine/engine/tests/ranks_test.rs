@@ -1,10 +1,10 @@
 //! Two engines as ranks against one engine alone.
 
 use sensai_engine::comm::{Sockets, Transport};
-use sensai_engine::{Engine, Place, Row};
+use sensai_engine::{Batch, Engine, Event, Fair, Place, Request, Row};
 use sensai_graph::{Graph, Parts};
-use sensai_lower::{Cluster, Pick, Recipe, Settings, Weight};
-use sensai_models::decoder::{Swiglu, stepper};
+use sensai_lower::{Cluster, Pick, Recipe, Settings, Weight, kept};
+use sensai_models::decoder::{Config, Swiglu, stepper};
 use sensai_models::{mla, small};
 use sensai_testkit::{Noise, weights};
 use sensai_trace::Norm;
@@ -23,20 +23,30 @@ fn pair() -> [Sockets; 2] {
 
 /// A faux-weight engine, a rank over `links` if any.
 fn engine(graph: fn() -> Graph, links: Option<[Sockets; 2]>) -> Engine {
+    opened(graph, links, &Recipe::default(), 16)
+}
+
+/// As `engine`, with a recipe and a context.
+fn opened(
+    graph: fn() -> Graph,
+    links: Option<[Sockets; 2]>,
+    recipe: &Recipe,
+    context: usize,
+) -> Engine {
     let settings = Settings {
         backend: Pick::Host,
         ..Settings::default()
     };
-    let (g, recipe) = (graph(), Recipe::default());
+    let g = graph();
     let stored = weights(&g, &mut Noise(3)).into_iter().map(Weight::Floats);
     let stored: Vec<Weight> = stored.collect();
     let mut engine = match links {
         Some([sums, control]) => {
             let place = Place::new(Cluster::two("a", "b"), Parts::even(2));
             let control: Box<dyn Transport> = Box::new(control);
-            Engine::open_ranked(g, 16, (&recipe, &settings), place, sums, control).unwrap()
+            Engine::open_ranked(g, context, (recipe, &settings), place, sums, control).unwrap()
         }
-        None => Engine::open(g, 16, &recipe, &settings).unwrap(),
+        None => Engine::open(g, context, recipe, &settings).unwrap(),
     };
     engine.load(&stored).unwrap();
     engine
@@ -75,4 +85,60 @@ fn agree(graph: fn() -> Graph) {
 fn ranks_match_one() {
     agree(|| stepper::<Norm, Swiglu>(&small::qwen3()));
     agree(|| mla::stepper::<mla::RotatedMoe>(&small::glm53()));
+}
+
+/// Answers to a prompt, then two that continue it.
+fn continued(engine: &mut Engine) -> Vec<Vec<u32>> {
+    let mut batch = Batch::new(engine, Box::new(Fair));
+    batch.reuse();
+    batch.budget(1);
+    let base: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
+    let later = [
+        [&base[..18], &[1, 2]].concat(),
+        [&base[..17], &[5]].concat(),
+    ];
+    let mut answers = Vec::new();
+    for round in [vec![base.clone()], later.to_vec()] {
+        let mut taken = Vec::new();
+        for tokens in round {
+            let (events, receiver) = std::sync::mpsc::channel();
+            let request = Request {
+                tokens,
+                max_tokens: 3,
+                ..Request::default()
+            };
+            batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+            taken.push(receiver);
+        }
+        while batch.step().unwrap() {}
+        for r in taken {
+            let id = |e: Event| match e {
+                Event::Token(id) => Some(id),
+                _ => None,
+            };
+            answers.push(r.try_iter().filter_map(id).collect());
+        }
+    }
+    answers
+}
+
+#[test]
+fn ranks_share_pages() {
+    let recipe = Recipe {
+        kept: &kept::PAGED16,
+        ..Recipe::default()
+    };
+    let graph = || stepper::<Norm, Swiglu>(&Config::toy(2, 64));
+    let ([sums, others], [control, told]) = (pair(), pair());
+    let theirs = recipe.clone();
+    let follower = std::thread::spawn(move || {
+        opened(graph, Some([others, told]), &theirs, 64)
+            .follow()
+            .unwrap();
+    });
+    let mut lead = opened(graph, Some([sums, control]), &recipe, 64);
+    let mut alone = opened(graph, None, &recipe, 64);
+    assert_eq!(continued(&mut lead), continued(&mut alone));
+    lead.dismiss().unwrap();
+    follower.join().unwrap();
 }

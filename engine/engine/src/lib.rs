@@ -87,6 +87,10 @@ pub enum Error {
     Graph(#[from] sensai_graph::VerifyError),
     #[error("the masks do not fit the graph's mask port")]
     Mask,
+    #[error("kept rows: {0}")]
+    Kept(#[from] sensai_kv::Error),
+    #[error("a slot's next row is in a page another run holds")]
+    SharedPage,
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.
@@ -329,7 +333,9 @@ impl Engine {
         {
             return Err(Error::RowPlace);
         }
-        self.announce(rows, picks, &head)?;
+        let table = self.lanes.as_ref().and_then(lanes::Lanes::pending);
+        let table = table.map(<[u32]>::to_vec).unwrap_or_default();
+        self.announce(rows, picks, &head, &table)?;
         let (mut sizes, mut feeds) = launch_of(rows, picks, self.slots);
         let wanted = feeds[3].len();
         let entry = match head {

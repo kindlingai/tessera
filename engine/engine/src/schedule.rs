@@ -288,15 +288,16 @@ impl<'a> Batch<'a> {
     }
 
     /// Gives each fed slot the pages its rows need.
-    fn page(&mut self, rows: &[Row]) {
+    fn page(&mut self, rows: &[Row]) -> Result<(), Error> {
         let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.engine.lanes) else {
-            return;
+            return Ok(());
         };
         for r in rows {
-            if let Some(pages) = kept.grow(r.slot, r.position as usize + 1) {
+            if let Some(pages) = kept.grow(r.slot, r.position as usize + 1)? {
                 lanes.set(r.slot, pages);
             }
         }
+        Ok(())
     }
 
     fn finish(&mut self, i: usize) {
@@ -320,7 +321,7 @@ impl<'a> Batch<'a> {
         if rows.is_empty() {
             return Ok(false);
         }
-        self.page(&rows);
+        self.page(&rows)?;
         let ends = crate::ends(&rows);
         let ids = match self.allowed(&rows, &ends) {
             Some(allowed) => self.engine.last_guided(&rows, &allowed)?,

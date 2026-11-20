@@ -43,6 +43,19 @@ impl Lanes {
         self.stale = true;
     }
 
+    /// The table, if the device's copy is old.
+    pub fn pending(&self) -> Option<&[u32]> {
+        self.stale.then_some(&self.table)
+    }
+
+    /// Takes rank 0's table.
+    pub fn replace(&mut self, table: Vec<u32>) {
+        if table != self.table {
+            self.table = table;
+            self.stale = true;
+        }
+    }
+
     /// The table's bytes, if the device's copy is old.
     pub fn changed(&mut self) -> Option<Vec<u8>> {
         let stale = std::mem::take(&mut self.stale);

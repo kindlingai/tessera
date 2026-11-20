@@ -1,5 +1,6 @@
 //! Finished answers' rows, kept for prompts that continue them.
 
+use crate::Error;
 use sensai_kv::{Pool, Prefixes, RunId, Stats, Tag};
 
 const TAG: Tag = Tag(0);
@@ -106,15 +107,20 @@ impl Kept {
     }
 
     /// Paged: the slot's pages, if its lane lacks some.
-    pub fn grow(&mut self, slot: u32, rows: usize) -> Option<&[u32]> {
-        let laned = &mut self.laned.as_mut()?[slot as usize];
-        let run = self.runs[slot as usize]?;
-        let copies = self.pool.grow(run, rows).ok()?;
-        debug_assert!(copies.is_empty(), "runs share whole pages");
-        let pages = self.pool.pages(run).ok()?;
+    pub fn grow(&mut self, slot: u32, rows: usize) -> Result<Option<&[u32]>, Error> {
+        let Some(lanes) = &mut self.laned else {
+            return Ok(None);
+        };
+        let run = self.runs[slot as usize].ok_or(Error::RowPlace)?;
+        // Runs share only whole pages, so no row moves.
+        if !self.pool.grow(run, rows)?.is_empty() {
+            return Err(Error::SharedPage);
+        }
+        let pages = self.pool.pages(run)?;
+        let laned = &mut lanes[slot as usize];
         let more = pages.len() != *laned;
         *laned = pages.len();
-        more.then_some(pages)
+        Ok(more.then_some(pages))
     }
 
     /// Keeps a slot's rows under the tokens they hold.
