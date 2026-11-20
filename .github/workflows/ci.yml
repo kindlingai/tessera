@@ -210,7 +210,10 @@ jobs:
           workspaces: tools/simcheck
           # The job fails on near-copies. Keep the build anyway.
           cache-on-failure: true
-      - run: cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
+      # Names a stale base when only files outside this PR fail.
+      - env:
+          FMT_BASE: origin/${{ github.base_ref || 'main' }}
+        run: tools/scripts/fmt-check.sh --manifest-path tools/simcheck/Cargo.toml
       - run: cargo clippy --manifest-path tools/simcheck/Cargo.toml --all-targets
       - run: cargo test --manifest-path tools/simcheck/Cargo.toml
       # The checkpoint's text tower, pinned in tools/simcheck/src/fetch.rs.

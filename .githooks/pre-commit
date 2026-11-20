@@ -4,6 +4,6 @@
 # has put their models in ~/.cache/tessera/check.
 # Install: tools/scripts/install-hooks.sh
 set -e
-cargo fmt --all --check
-cargo fmt --manifest-path tools/simcheck/Cargo.toml --check
+tools/scripts/fmt-check.sh --all
+tools/scripts/fmt-check.sh --manifest-path tools/simcheck/Cargo.toml
 cargo run -q -p tessera-check -- run --staged
