@@ -3,6 +3,7 @@
 mod lanes;
 mod picked;
 mod product;
+mod stacked;
 mod thin;
 mod tiled;
 mod turned;

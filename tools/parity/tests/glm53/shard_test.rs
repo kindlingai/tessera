@@ -20,7 +20,7 @@ fn step_over_ranks() {
         }
         whole.sort();
         whole.dedup();
-        assert_eq!(whole, ["kv_a", "kv_b", "o", "q_b", "weights", "wk", "wq"]);
+        assert_eq!(whole, ["kv_a", "o", "q_b", "weights", "wk", "wq"]);
         let sets = weights.iter().filter(|w| w.ty.rank() == 3);
         let split = Placement::Split { axis: 0 };
         assert_eq!(sets.filter(|w| w.ty.placement == split).count(), 6);

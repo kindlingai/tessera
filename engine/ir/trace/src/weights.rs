@@ -76,6 +76,11 @@ impl Linear {
     pub fn of(t: Tensor) -> Self {
         Linear(t)
     }
+
+    /// The `[out, in]` matrix as stored.
+    pub fn stored(&self) -> &Tensor {
+        &self.0
+    }
 }
 
 impl Norm {

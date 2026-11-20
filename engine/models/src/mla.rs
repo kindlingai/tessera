@@ -319,9 +319,7 @@ impl Pass<'_> {
         };
         let q = heads.split(qr.matmul(&w.q_b), Heads, Nope + Rope);
         let head = feature + 1;
-        let q = q
-            .slice(head, 0u64, Nope)
-            .concat(&turn(q.slice(head, Nope, Rope)));
+        let (nope, rope) = (q.slice(head, 0u64, Nope), turn(q.slice(head, Nope, Rope)));
         let kv = h.matmul(&w.kv_a);
         let latent = kv.slice(feature, 0u64, Latent).rms_norm(&w.kv_norm, c.eps);
         // Every head shares one rotary key part.
@@ -329,14 +327,15 @@ impl Pass<'_> {
         let scale = 1.0 / ((c.nope + c.rope) as f32).sqrt();
         let out = match &self.step {
             None => {
+                let q = nope.concat(&rope);
                 let [k, v] = keys_values(w, &latent, &shared);
                 m.attend(Mask::Causal, scale, [&q, &k, &v], keys.as_ref())
             }
             Some((slots, caches)) => {
                 let by = [*slots, self.positions];
                 let latent = latent.append(&caches[l].latent, by);
-                let [k, v] = keys_values(w, &latent, &shared.append(&caches[l].rope, by));
-                m.attend_rows(scale, [&q, &k, &v], by, keys.as_ref())
+                let k = latent.concat(&shared.append(&caches[l].rope, by));
+                absorbed(m, w, [&nope, &rope], &k, (scale, by), keys.as_ref())
             }
         };
         (heads.merge(out), keys)
@@ -384,6 +383,33 @@ fn keys_values(w: &Attention, latent: &Tensor, shared: &Tensor) -> [Tensor; 2] {
     let shared = shared.reshape(one).expand(2, Heads);
     let k = per_head.slice(3, 0u64, Nope).concat(&shared);
     [k, per_head.slice(3, Nope, HeadDim)]
+}
+
+/// Attention over latent keys, with `kv_b` folded into each side.
+fn absorbed(
+    m: &Model,
+    w: &Attention,
+    [nope, rope]: [&Tensor; 2],
+    keys: &Tensor,
+    (scale, by): (f32, [&Tensor; 2]),
+    picked: Option<&Tensor>,
+) -> Tensor {
+    // Per head: key rows, then value rows, one view each.
+    let set = || {
+        w.kv_b
+            .stored()
+            .reshape(vec![Heads.into(), Nope + HeadDim, Latent.into()])
+    };
+    let swap = [1, 0, 2];
+    let to_latent = set().slice(1, 0u64, Nope).permute(&[0, 2, 1]);
+    let q = nope.permute(&swap).matmul_rows(&to_latent).permute(&swap);
+    let q = q.concat(rope);
+    // One key head serves every query head.
+    let k = keys.reshape(rows([DimExpr::Const(1), Latent + Rope]));
+    let out = m.attend_rows(scale, [&q, &k, &k], by, picked);
+    let out = out.slice(2, 0u64, Latent).permute(&swap);
+    out.matmul_rows(&set().slice(1, Nope, HeadDim))
+        .permute(&swap)
 }
 
 /// Routed experts and a shared one, however they are stored.
