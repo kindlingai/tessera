@@ -78,7 +78,7 @@ impl Pattern for Attend {
 }
 
 impl Attend {
-    /// Attention over listed keys, and the node that lists them.
+    /// Attention over listed keys, and the node listing those keys.
     pub fn listed(tree: &Tree, at: T) -> Option<(Self, T)> {
         let node = tree.node(at);
         let Term::Op(Op::Attend(a)) = &node.term else {

@@ -97,7 +97,7 @@ fn four(make: &str, each: impl Fn(u32) -> String) -> String {
     format!("{make}({}, {}, {}, {})", each(0), each(1), each(2), each(3))
 }
 
-/// Kernel names that outlive the forms that made them.
+/// Interned kernel names. They outlive their forms.
 static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
 fn interned(name: String) -> &'static str {

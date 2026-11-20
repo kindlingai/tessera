@@ -129,7 +129,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let Term::Op(Op::View(view)) = &node.term else {
         return None;
     };
-    // Weight views belong to the rules that read them.
+    // The rule reading a weight owns its views.
     let ours = |t: &T| {
         let n = tree.node(*t);
         n.form.name() == F32_FORM.name()

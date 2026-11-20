@@ -1,4 +1,4 @@
-//! Finished answers' rows, kept for prompts that continue them.
+//! Finished answers' rows, kept for follow-up prompts to reuse.
 
 use crate::Error;
 use sensai_kv::{Pool, Prefixes, RunId, Stats, Tag};

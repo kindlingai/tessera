@@ -1,0 +1,7 @@
+Crate names and the paths that replace them.
+---
+Counters and gauges, gathered from the code that sets them.
+---
+Weight views belong to the rules that read them.
+---
+Kernel names that outlive the forms that made them.

@@ -56,7 +56,7 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 <tr><td>&emsp;&emsp;<a href="engine/rules/attention">sensai-attention</a></td><td>Attention kernels for the CPU and the GPU, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/cpu">sensai-cpu</a></td><td>CPU kernels for matmuls: short bodies over a dot primitive</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/guest">sensai-guest</a></td><td>What a recipe module links: memory hand-off and the table format</td></tr>
-<tr><td>&emsp;&emsp;<a href="engine/rules/kernels">sensai-kernels</a></td><td>Kernels and the lowering rules that propose them</td></tr>
+<tr><td>&emsp;&emsp;<a href="engine/rules/kernels">sensai-kernels</a></td><td>Kernels and the lowering rules for each</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/linear">sensai-linear</a></td><td>Generated matmul kernels, registered as lowering rules</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/rules">sensai-rules</a></td><td>Links every lowering rule crate</td></tr>
 <tr><td>&emsp;&emsp;<a href="engine/rules/wasm">sensai-wasm</a></td><td>Lowering rules a sandboxed wasm module proposes, over JSON</td></tr>

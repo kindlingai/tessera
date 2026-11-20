@@ -9,7 +9,7 @@ use crate::tokens::{Cursor, Tok, apply, tokens};
 pub(crate) struct Moves<'a> {
     /// The module `crate::` now names, or empty.
     pub module: &'a str,
-    /// Crate names and the paths that replace them.
+    /// Replacement paths, by crate name.
     pub names: &'a BTreeMap<String, String>,
     /// The crate's directory in its package, or empty.
     pub dir: &'a str,

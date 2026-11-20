@@ -1,4 +1,4 @@
-//! Counters and gauges, gathered from the code that sets them.
+//! Counters and gauges, declared at their call sites, gathered here.
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

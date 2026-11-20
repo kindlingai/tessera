@@ -1,0 +1,7 @@
+Replacement paths, by crate name.
+---
+The rule reading a weight owns its views.
+---
+The caller frees them after the launch.
+---
+Paths that replace crate names.

@@ -419,7 +419,7 @@ impl Helper {
     }
 }
 
-/// Scalar names outlive the text that uses them.
+/// Leaks a scalar name, so it outlives its source text.
 fn leak(name: &str) -> &'static str {
     Box::leak(name.to_string().into_boxed_str())
 }

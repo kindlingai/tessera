@@ -57,6 +57,7 @@ fn rules_load() {
         [
             "agent-passive",
             "chained-clause",
+            "echo-clause",
             "hidden-negation",
             "what-clause"
         ]

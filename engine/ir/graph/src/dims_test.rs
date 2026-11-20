@@ -22,7 +22,7 @@ fn normal_form() {
     assert_eq!(p(Rows * Context), p(Context * Rows));
     let at_max = |_: DimName| Some(64);
     assert_eq!(p(Rows * Hidden + 1).eval(&at_max), Some(513));
-    // Slices may end inside an axis that covers them.
+    // A slice may end inside a covering axis.
     assert!(p(Hidden + Rows).covers(&p(Hidden.into())));
     assert!(!p(Hidden.into()).covers(&p(Hidden + Rows)));
     assert!(!p(Rows.into()).covers(&p(Context.into())));

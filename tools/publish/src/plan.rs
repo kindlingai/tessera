@@ -26,7 +26,7 @@ pub(crate) struct Out {
     pub kind: Kind,
     pub description: String,
     pub members: Vec<Member>,
-    /// Crate names and the paths that replace them.
+    /// Replacement paths, by crate name.
     pub names: BTreeMap<String, String>,
     /// A member whose items the root re-exports.
     pub glob: Option<String>,
