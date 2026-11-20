@@ -63,7 +63,7 @@ pub(crate) fn fits(sizes: &[usize], at: Span, align: usize) -> Result<(), Error>
 }
 
 /// The regions `Blocking` needs, for `ranks` and `capacity`.
-pub(crate) fn exchange_regions(ranks: u32, capacity: usize) -> [usize; 3] {
+pub fn exchange_regions(ranks: u32, capacity: usize) -> [usize; 3] {
     let ranks = ranks as usize;
     [2 * capacity, 2 * ranks * capacity, 2 * ranks * 16]
 }

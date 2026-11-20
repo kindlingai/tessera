@@ -1,5 +1,5 @@
-use crate::link::exchange_regions;
-use crate::{Blocking, Error, Memory, Shm, Sockets, Transport, summed};
+use crate::socket_link::SocketLink;
+use crate::{Blocking, Error, Memory, Shm, Sockets, Transport, exchange_regions, summed};
 use std::fs::{File, OpenOptions};
 use std::net::{TcpListener, TcpStream};
 
@@ -96,6 +96,15 @@ fn memory_exchange() {
                 .collect(),
         );
     }
+}
+
+#[test]
+fn socket_link_exchange() {
+    let wait = std::time::Duration::from_secs(10);
+    let regions = exchange_regions(3, 64);
+    let link = |(r, peers)| SocketLink::over(r as u32, peers, &regions).unwrap();
+    let links = connected().into_iter().enumerate().map(link);
+    rounds(links.map(|l| Blocking::new(l, 64, wait)).collect());
 }
 
 #[test]

@@ -6,16 +6,20 @@ mod link;
 mod memory;
 pub mod reduce;
 mod shm;
+#[cfg(test)]
+mod socket_link;
 mod sockets;
 mod verbs;
+mod verbs_link;
 
 pub use fabric::{Fabric, Port};
-pub use link::{Blocking, Link, Put, Span};
+pub use link::{Blocking, Link, Put, Span, exchange_regions};
 pub use memory::Memory;
 pub use reduce::{Pinned, Pinning, Reduce};
 pub use shm::{Shm, ShmLink};
 pub use sockets::Sockets;
 pub use verbs::Verbs;
+pub use verbs_link::VerbsLink;
 
 use std::io;
 

@@ -120,20 +120,20 @@ pub(crate) fn parts(total: usize, lanes: usize) -> Vec<(usize, usize)> {
 }
 
 /// What a rank tells the others about one queue pair.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub(crate) struct Lane {
     pub qpn: u32,
     pub mtu: u32,
-    pub recv_rkey: u32,
-    pub flag_rkey: u32,
+    /// The remote key of each region, on this lane's port.
+    pub rkeys: Vec<u32>,
     pub gid: [u8; 16],
 }
 
 /// A rank's regions and queue pairs, for its peers.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub(crate) struct Peer {
-    pub recv: u64,
-    pub flags: u64,
+    /// Each region's address.
+    pub regions: Vec<u64>,
     /// Per channel, per lane.
     pub channels: Vec<Vec<Lane>>,
 }
@@ -141,13 +141,18 @@ pub(crate) struct Peer {
 impl Peer {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&self.recv.to_le_bytes());
-        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&(self.regions.len() as u32).to_le_bytes());
+        for region in &self.regions {
+            out.extend_from_slice(&region.to_le_bytes());
+        }
         out.extend_from_slice(&(self.channels.len() as u32).to_le_bytes());
         for lanes in &self.channels {
             out.extend_from_slice(&(lanes.len() as u32).to_le_bytes());
             for l in lanes {
-                for word in [l.qpn, l.mtu, l.recv_rkey, l.flag_rkey] {
+                let words = [l.qpn, l.mtu, l.rkeys.len() as u32]
+                    .into_iter()
+                    .chain(l.rkeys.iter().copied());
+                for word in words {
                     out.extend_from_slice(&word.to_le_bytes());
                 }
                 out.extend_from_slice(&l.gid);
@@ -158,27 +163,28 @@ impl Peer {
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut at = Cursor(bytes);
-        let recv = at.u64()?;
-        let flags = at.u64()?;
+        let regions = (0..at.u32()?)
+            .map(|_| at.u64())
+            .collect::<Option<Vec<_>>>()?;
         let mut channels = Vec::new();
         for _ in 0..at.u32()? {
             let mut lanes = Vec::new();
             for _ in 0..at.u32()? {
+                let (qpn, mtu) = (at.u32()?, at.u32()?);
+                let rkeys = (0..at.u32()?)
+                    .map(|_| at.u32())
+                    .collect::<Option<Vec<_>>>()?;
+                let gid = at.take(16)?.try_into().ok()?;
                 lanes.push(Lane {
-                    qpn: at.u32()?,
-                    mtu: at.u32()?,
-                    recv_rkey: at.u32()?,
-                    flag_rkey: at.u32()?,
-                    gid: at.take(16)?.try_into().ok()?,
+                    qpn,
+                    mtu,
+                    rkeys,
+                    gid,
                 });
             }
             channels.push(lanes);
         }
-        at.0.is_empty().then_some(Self {
-            recv,
-            flags,
-            channels,
-        })
+        at.0.is_empty().then_some(Self { regions, channels })
     }
 }
 

@@ -66,18 +66,16 @@ fn peer_round_trip() {
     let lane = |qpn| Lane {
         qpn,
         mtu: 5,
-        recv_rkey: 7,
-        flag_rkey: 9,
+        rkeys: vec![7, 9, 11],
         gid: [qpn as u8; 16],
     };
     let channels = vec![vec![], vec![lane(1), lane(2)], vec![lane(3)]];
     let peer = Peer {
-        recv: 1 << 40,
-        flags: 1 << 41,
+        regions: vec![1 << 40, 1 << 41],
         channels,
     };
     let bytes = peer.to_bytes();
-    assert_eq!(bytes.len(), 16 + 4 + 3 * 4 + 3 * 32);
+    assert_eq!(bytes.len(), 4 + 2 * 8 + 4 + 3 * 4 + 3 * (12 + 12 + 16));
     assert_eq!(Peer::from_bytes(&bytes), Some(peer));
     assert_eq!(Peer::from_bytes(&bytes[..bytes.len() - 1]), None);
     assert_eq!(Peer::from_bytes(&[bytes, vec![0]].concat()), None);

@@ -85,7 +85,7 @@ pub(crate) struct Sge {
 /// `ibv_send_wr` with the RDMA write arm of its union.
 #[repr(C)]
 pub(crate) struct SendWr {
-    wr_id: u64,
+    pub(crate) wr_id: u64,
     pub(crate) next: *mut SendWr,
     sg_list: *mut Sge,
     num_sge: i32,
@@ -117,7 +117,7 @@ impl SendWr {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Wc {
-    wr_id: u64,
+    pub(crate) wr_id: u64,
     pub(crate) status: u32,
     opcode: u32,
     vendor_err: u32,

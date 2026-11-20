@@ -21,16 +21,16 @@ const BATCH: usize = 16;
 const SPIN: Duration = Duration::from_millis(200);
 
 /// Bytes the devices register, page aligned.
-struct Region {
-    base: *mut u8,
+pub(crate) struct Region {
+    pub(crate) base: *mut u8,
     /// The device's address, or 0 when host only.
     device: u64,
-    len: usize,
+    pub(crate) len: usize,
     pinning: Option<Arc<dyn Pinning>>,
 }
 
 impl Region {
-    fn new(len: usize, pinning: Option<&Arc<dyn Pinning>>) -> Result<Self, Error> {
+    pub(crate) fn new(len: usize, pinning: Option<&Arc<dyn Pinning>>) -> Result<Self, Error> {
         let Some(pinning) = pinning else {
             let layout = Layout::from_size_align(len.max(1), 4096).expect("a page");
             let base = unsafe { alloc_zeroed(layout) };
@@ -52,7 +52,7 @@ impl Region {
         })
     }
 
-    fn at(&self, offset: usize) -> *mut u8 {
+    pub(crate) fn at(&self, offset: usize) -> *mut u8 {
         unsafe { self.base.add(offset) }
     }
 
@@ -78,42 +78,44 @@ impl Drop for Region {
 }
 
 /// One port: its context, domain and registrations.
-struct Opened {
+pub(crate) struct Opened {
     ctx: *mut ibv::Context,
     pd: *mut ibv::Pd,
-    cq: *mut ibv::Cq,
-    /// The send, receive and flag regions.
-    mrs: [*mut Mr; 3],
+    pub(crate) cq: *mut ibv::Cq,
+    /// One registration per region.
+    pub(crate) mrs: Vec<*mut Mr>,
     gid: Gid,
     mtu: u32,
     sgid: u32,
 }
 
-struct Link {
-    qp: *mut ibv::Qp,
-    port: usize,
+pub(crate) struct Link {
+    pub(crate) qp: *mut ibv::Qp,
+    pub(crate) port: usize,
     posted: u64,
 }
 
+/// The exchange's regions: send, receive, then control and flags.
+const SEND: usize = 0;
+const RECV: usize = 1;
+const FLAGS: usize = 2;
+
 /// The queue pairs and slots, one thread at a time.
-struct Engine {
+pub(crate) struct Engine {
     rank: u32,
     ranks: u32,
-    lib: &'static Lib,
+    pub(crate) lib: &'static Lib,
     wiring: Wiring,
     lanes: usize,
-    opened: Vec<Opened>,
+    pub(crate) opened: Vec<Opened>,
     /// Per channel, per lane.
-    links: Vec<Vec<Link>>,
-    peers: Vec<Peer>,
+    pub(crate) links: Vec<Vec<Link>>,
+    pub(crate) peers: Vec<Peer>,
     /// Bytes per slot, header included.
     capacity: usize,
     /// The last round the relay forwarded.
     relayed: u64,
-    send: Region,
-    recv: Region,
-    /// Control words, then a flag per source and lane.
-    flags: Region,
+    pub(crate) regions: Vec<Region>,
 }
 
 // Each rank owns its queue pairs and regions.
@@ -132,12 +134,14 @@ impl Engine {
             return Err(failed("alloc_pd"));
         }
         let access = (ibv::ACCESS_LOCAL_WRITE | ibv::ACCESS_REMOTE_WRITE) as i32;
-        let mut mrs = [std::ptr::null_mut(); 3];
-        for (mr, region) in mrs.iter_mut().zip([&self.send, &self.recv, &self.flags]) {
-            *mr = unsafe { (lib.reg_mr)(pd, region.base as *mut c_void, region.len, access) };
+        let mut mrs = Vec::with_capacity(self.regions.len());
+        for region in &self.regions {
+            let len = region.len.max(1);
+            let mr = unsafe { (lib.reg_mr)(pd, region.base as *mut c_void, len, access) };
             if mr.is_null() {
                 return Err(failed("reg_mr"));
             }
+            mrs.push(mr);
         }
         let null = std::ptr::null_mut();
         let cq = unsafe { (lib.create_cq)(ctx, 4096, null, null, 0) };
@@ -220,14 +224,12 @@ impl Engine {
             Lane {
                 qpn: unsafe { (*link.qp).qp_num },
                 mtu: opened.mtu,
-                recv_rkey: unsafe { (*opened.mrs[1]).rkey },
-                flag_rkey: unsafe { (*opened.mrs[2]).rkey },
+                rkeys: opened.mrs.iter().map(|&mr| unsafe { (*mr).rkey }).collect(),
                 gid: opened.gid.0,
             }
         };
         Peer {
-            recv: self.recv.base as u64,
-            flags: self.flags.base as u64,
+            regions: self.regions.iter().map(|r| r.base as u64).collect(),
             channels: self
                 .links
                 .iter()
@@ -295,8 +297,7 @@ impl Engine {
     }
 
     fn flag(&self, source: u32, lane: usize) -> &AtomicU64 {
-        self.flags
-            .word(CTL_WORDS + source as usize * self.lanes + lane)
+        self.regions[FLAGS].word(CTL_WORDS + source as usize * self.lanes + lane)
     }
 
     /// Every lane's flag from `source` reached `seq`.
@@ -320,23 +321,20 @@ impl Engine {
         seq: u64,
     ) -> Result<(), Error> {
         let (which, at) = from;
-        let region = match which {
-            0 => &self.send,
-            _ => &self.recv,
-        };
+        let region = &self.regions[which];
         let c = &self.wiring.channels[channel];
         let peer = &self.peers[c.peer as usize];
         for (lane, (start, len)) in parts(total, self.lanes).into_iter().enumerate() {
             let link = &mut self.links[channel][lane];
-            let far = peer.channels[c.meets][lane];
+            let far = &peer.channels[c.meets][lane];
             let lkey = unsafe { (*self.opened[link.port].mrs[which]).lkey };
             let mut data = Sge {
                 addr: region.at(at + start) as u64,
                 length: len as u32,
                 lkey,
             };
-            let to = peer.recv + (slot + start) as u64;
-            let mut write = SendWr::write(&mut data, to, far.recv_rkey, 0);
+            let to = peer.regions[RECV] + (slot + start) as u64;
+            let mut write = SendWr::write(&mut data, to, far.rkeys[RECV], 0);
             let mut seq_word = seq;
             let mut word = Sge {
                 addr: &mut seq_word as *mut u64 as u64,
@@ -349,8 +347,8 @@ impl Engine {
                 bits |= ibv::SEND_SIGNALED;
             }
             let flag_at = CTL_WORDS + source as usize * self.lanes + lane;
-            let to = peer.flags + 8 * flag_at as u64;
-            let mut flag = SendWr::write(&mut word, to, far.flag_rkey, bits);
+            let to = peer.regions[FLAGS] + 8 * flag_at as u64;
+            let mut flag = SendWr::write(&mut word, to, far.rkeys[FLAGS], bits);
             let head = match len {
                 0 => &mut flag,
                 _ => {
@@ -409,7 +407,7 @@ impl Engine {
         while self.relayed < seq && self.arrived(source, self.relayed + 1) {
             let next = self.relayed + 1;
             let slot = self.slot((next % 2) as usize, source);
-            let total = HEADER + self.recv.word(slot / 8).load(Ordering::Relaxed) as usize;
+            let total = HEADER + self.regions[RECV].word(slot / 8).load(Ordering::Relaxed) as usize;
             self.relayed = next;
             self.post(to, (1, slot), total, slot, source, next)?;
             moved = true;
@@ -447,11 +445,70 @@ impl Engine {
     /// The round's bytes from `source`, as the slot header says.
     fn received(&self, seq: u64, source: u32) -> Result<&[u8], Error> {
         let slot = self.slot((seq % 2) as usize, source);
-        let len = self.recv.word(slot / 8).load(Ordering::Relaxed) as usize;
+        let len = self.regions[RECV].word(slot / 8).load(Ordering::Relaxed) as usize;
         if HEADER + len > self.capacity {
             return Err(Error::Link(format!("rank {source} sent {len} bytes")));
         }
-        Ok(unsafe { std::slice::from_raw_parts(self.recv.at(slot + HEADER), len) })
+        Ok(unsafe { std::slice::from_raw_parts(self.regions[RECV].at(slot + HEADER), len) })
+    }
+}
+
+impl Engine {
+    /// Opens `fabric`'s ports over `regions`, then wires every queue pair.
+    pub(crate) fn connect(
+        rank: u32,
+        ranks: u32,
+        fabric: &Fabric,
+        capacity: usize,
+        regions: Vec<Region>,
+        boot: &mut dyn Transport,
+    ) -> Result<Self, Error> {
+        let lib = Lib::get().map_err(Error::Link)?;
+        let wiring = fabric.wiring(rank, ranks)?;
+        if (boot.rank(), boot.ranks()) != (rank, ranks) {
+            let (r, n) = (boot.rank(), boot.ranks());
+            return Err(Error::Fit(format!(
+                "rank {rank} of {ranks} met over {r} of {n}"
+            )));
+        }
+        let mut engine = Engine {
+            rank,
+            ranks,
+            lib,
+            wiring,
+            lanes: fabric.lanes(),
+            opened: Vec::new(),
+            links: Vec::new(),
+            peers: Vec::new(),
+            capacity,
+            relayed: 0,
+            regions,
+        };
+        for port in fabric.ports() {
+            let opened = engine.open(&port.device, port.gid)?;
+            engine.opened.push(opened);
+        }
+        for c in 0..engine.wiring.channels.len() {
+            let mut links = Vec::new();
+            for lane in 0..engine.wiring.channels[c].ports.len() {
+                links.push(engine.link(c, lane)?);
+            }
+            engine.links.push(links);
+        }
+        let mine = engine.described();
+        let all = boot.exchange(&mine.to_bytes())?;
+        for (r, bytes) in all.iter().enumerate() {
+            let peer = Peer::from_bytes(bytes).ok_or(Error::Fit(format!("rank {r}'s details")))?;
+            engine.peers.push(peer);
+        }
+        for c in 0..engine.links.len() {
+            for lane in 0..engine.links[c].len() {
+                engine.wire(c, lane)?;
+            }
+        }
+        // A barrier: every rank can receive now.
+        boot.exchange(&[])?;
+        Ok(engine)
     }
 }
 
@@ -464,7 +521,7 @@ impl Drop for Engine {
             }
         }
         for opened in &self.opened {
-            for mr in opened.mrs {
+            for &mr in &opened.mrs {
                 unsafe { (lib.dereg_mr)(mr) };
             }
             unsafe { (lib.destroy_cq)(opened.cq) };
@@ -496,12 +553,11 @@ fn serve(engine: &Mutex<Engine>, stop: &AtomicBool) -> Result<(), Error> {
     let mut last = Instant::now();
     while !stop.load(Ordering::Acquire) {
         let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = e.flags.word(SEQ).load(Ordering::Acquire);
+        let seq = e.regions[FLAGS].word(SEQ).load(Ordering::Acquire);
         let mut busy = false;
         while posted < seq {
             posted += 1;
-            let bytes = e
-                .flags
+            let bytes = e.regions[FLAGS]
                 .word(BYTES + (posted % 2) as usize)
                 .load(Ordering::Relaxed);
             e.publish(posted, bytes as usize)?;
@@ -548,56 +604,14 @@ impl Verbs {
         boot: &mut dyn Transport,
         pinning: Option<Arc<dyn Pinning>>,
     ) -> Result<Self, Error> {
-        let lib = Lib::get().map_err(Error::Link)?;
-        let wiring = fabric.wiring(rank, ranks)?;
-        if (boot.rank(), boot.ranks()) != (rank, ranks) {
-            let (r, n) = (boot.rank(), boot.ranks());
-            return Err(Error::Fit(format!(
-                "rank {rank} of {ranks} met over {r} of {n}"
-            )));
-        }
         let capacity = (capacity.max(HEADER + 1) + 15) & !15;
-        let lanes = fabric.lanes();
-        let pin = pinning.as_ref();
-        let mut engine = Engine {
-            rank,
-            ranks,
-            lib,
-            wiring,
-            lanes,
-            opened: Vec::new(),
-            links: Vec::new(),
-            peers: Vec::new(),
-            capacity,
-            relayed: 0,
-            send: Region::new(2 * capacity, pin)?,
-            recv: Region::new(2 * ranks as usize * capacity, pin)?,
-            flags: Region::new(8 * (CTL_WORDS + ranks as usize * lanes), pin)?,
-        };
-        for port in fabric.ports() {
-            let opened = engine.open(&port.device, port.gid)?;
-            engine.opened.push(opened);
-        }
-        for c in 0..engine.wiring.channels.len() {
-            let mut links = Vec::new();
-            for lane in 0..engine.wiring.channels[c].ports.len() {
-                links.push(engine.link(c, lane)?);
-            }
-            engine.links.push(links);
-        }
-        let mine = engine.described();
-        let all = boot.exchange(&mine.to_bytes())?;
-        for (r, bytes) in all.iter().enumerate() {
-            let peer = Peer::from_bytes(bytes).ok_or(Error::Fit(format!("rank {r}'s details")))?;
-            engine.peers.push(peer);
-        }
-        for c in 0..engine.links.len() {
-            for lane in 0..engine.links[c].len() {
-                engine.wire(c, lane)?;
-            }
-        }
-        // A barrier: every rank can receive now.
-        boot.exchange(&[])?;
+        let (pin, lanes) = (pinning.as_ref(), fabric.lanes());
+        let regions = vec![
+            Region::new(2 * capacity, pin)?,
+            Region::new(2 * ranks as usize * capacity, pin)?,
+            Region::new(8 * (CTL_WORDS + ranks as usize * lanes), pin)?,
+        ];
+        let engine = Engine::connect(rank, ranks, fabric, capacity, regions, boot)?;
         Ok(Self {
             rank,
             ranks,
@@ -633,10 +647,16 @@ impl Transport for Verbs {
         }
         let next = self.generation + 1;
         let at = (next % 2) as usize * e.capacity;
-        e.send
+        e.regions[SEND]
             .word(at / 8)
             .store(mine.len() as u64, Ordering::Relaxed);
-        unsafe { std::ptr::copy_nonoverlapping(mine.as_ptr(), e.send.at(at + HEADER), mine.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mine.as_ptr(),
+                e.regions[SEND].at(at + HEADER),
+                mine.len(),
+            )
+        };
         e.publish(next, mine.len())?;
         e.wait(next)?;
         let mut out = Vec::with_capacity(self.ranks as usize);
@@ -657,10 +677,10 @@ impl Transport for Verbs {
         }
         let e = self.engine.lock().unwrap_or_else(|e| e.into_inner());
         let fields = [
-            e.send.device,
-            e.recv.device,
-            e.flags.device + 8 * CTL_WORDS as u64,
-            e.flags.device,
+            e.regions[SEND].device,
+            e.regions[RECV].device,
+            e.regions[FLAGS].device + 8 * CTL_WORDS as u64,
+            e.regions[FLAGS].device,
         ];
         let sizes = [e.lanes as u32, self.rank, self.ranks];
         let reduce = Reduce::new(fields, e.capacity, sizes);
@@ -676,7 +696,7 @@ impl Transport for Verbs {
                 if let Err(why) = serve(&engine, &stopping) {
                     *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
                     let e = engine.lock().unwrap_or_else(|e| e.into_inner());
-                    e.flags.word(ERR).store(1, Ordering::Release);
+                    e.regions[FLAGS].word(ERR).store(1, Ordering::Release);
                 }
             });
             self.proxy = Some(Proxy {
