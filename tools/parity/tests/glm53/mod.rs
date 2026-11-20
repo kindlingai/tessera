@@ -20,6 +20,7 @@ pub fn release() -> Graph {
 const STEPPER: Stepper = Stepper {
     small: || stepper::<RotatedMoe>(&sensai_models::small::glm53()),
     release: || stepper::<RotatedMoe>(&Config::glm53(1, 1024)),
+    drift: sensai_parity::MLA_DRIFT,
 };
 
 const SPEC: Spec = Spec {

@@ -16,6 +16,7 @@ pub fn release() -> Graph {
 const STEPPER: Stepper = Stepper {
     small: || stepper::<Experts>(&sensai_models::small::deepseek()),
     release: || stepper::<Experts>(&Config::deepseek_v3(1, 1024)),
+    drift: sensai_parity::MLA_DRIFT,
 };
 
 const SPEC: Spec = Spec {

@@ -47,7 +47,15 @@ pub struct Spec {
 pub struct Stepper {
     pub small: fn() -> Graph,
     pub release: fn() -> Graph,
+    /// How far steps may drift from the forward pass.
+    pub drift: f32,
 }
+
+/// Steps and the forward pass sum in the same order.
+pub const DRIFT: f32 = 1e-5;
+
+/// Absorbed MLA attention sums in another order.
+pub const MLA_DRIFT: f32 = 1e-4;
 
 /// Tokens and positions, `[seqs, len]` each.
 pub fn inputs(seqs: usize, tokens: &[u32]) -> [Tensor; 2] {
@@ -92,6 +100,7 @@ macro_rules! decoder {
         const STEPPER: Stepper = Stepper {
             small: || stepper::<$norm, $mlp>(&$small),
             release: || stepper::<$norm, $mlp>(&$release(1, 1024)),
+            drift: $crate::DRIFT,
         };
     };
 }
