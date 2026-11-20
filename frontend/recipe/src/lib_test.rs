@@ -18,6 +18,9 @@ favor = "flash"
 max_model_len = 2048
 task = "generate"
 reject_unknown_fields = true
+
+[config."vae/config.json"]
+layers_per_block = 2
 "#;
 
 #[test]
@@ -37,6 +40,7 @@ fn reads_a_recipe() {
         flag("--task", Some("generate")),
     ];
     assert_eq!(recipe.flags(), want);
+    assert_eq!(recipe.overrides()["vae/config.json"]["layers_per_block"], 2);
     recipe.weights.hf = Some("a/b@main".into());
     assert!(matches!(recipe.weights(None, None), Err(Error::Weights)));
     assert!(toml::from_str::<Recipe>("name = \"x\"\nranks = 4\n[weights]").is_err());

@@ -144,8 +144,13 @@ fn model(name: &str, fixture: &Path, n: u64) -> Result<Loaded, Box<dyn std::erro
             return Ok((graph, Weights::Streamed(Box::new(r)), pins));
         }
         "eg2" => {
-            let e = sensai_bundle::encoder::encoder(&fixture.join("exlr8"), [1, n], false)
-                .map_err(|e| e.to_string())?;
+            let e = sensai_bundle::encoder::encoder(
+                &fixture.join("exlr8"),
+                [1, n],
+                false,
+                &Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
             let pins = sensai_lower::Pins::default();
             return Ok((e.graph, Weights::Held(e.weights), pins));
         }

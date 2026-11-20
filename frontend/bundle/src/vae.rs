@@ -1,6 +1,6 @@
 //! FLUX.2's VAE decoder from a diffusers directory.
 
-use crate::configured;
+use crate::Overrides;
 use sensai_checkpoint::File;
 use sensai_engine::vae::{Config, program};
 use sensai_engine::{Graph, PathSeg, Tensor, Weight, bind};
@@ -29,11 +29,15 @@ fn taps(v: &[f32], shape: &[usize]) -> Vec<f32> {
 }
 
 /// `dir/vae`, `side` tokens a side, `seqs` per launch.
-pub fn decoder(dir: &Path, side: u64, seqs: u64) -> Result<Decoder, Box<dyn Error + Send + Sync>> {
-    let dir = dir.join("vae");
-    let config = configured(&dir.join("config.json"), |k| Config::read(k, side, seqs))?;
+pub fn decoder(
+    dir: &Path,
+    [side, seqs]: [u64; 2],
+    config: &Overrides,
+) -> Result<Decoder, Box<dyn Error + Send + Sync>> {
+    const FILE: &str = "vae/config.json";
+    let config = config.read(FILE, Some(&dir.join(FILE)), |k| Config::read(k, side, seqs))?;
     let graph = program(&config);
-    let file = File::open(&dir.join("diffusion_pytorch_model.safetensors"))?;
+    let file = File::open(&dir.join("vae/diffusion_pytorch_model.safetensors"))?;
     let find = |p: &[PathSeg]| {
         let name = PathSeg::dotted(p);
         let v = match name.as_str() {

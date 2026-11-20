@@ -1,4 +1,5 @@
 use crate::pictures::Pictures;
+use sensai_bundle::Overrides;
 use sensai_checkpoint::File;
 use sensai_engine::{Pick, Settings};
 
@@ -12,7 +13,7 @@ fn matches_torch() {
         backend: Pick::Cpu,
         ..Settings::default()
     };
-    let mut p = Pictures::open(&dir.join("model"), &s, 8, 1).unwrap();
+    let mut p = Pictures::open(&dir.join("model"), &s, [8, 1], &Overrides::default()).unwrap();
     let got = p.decode(&r.floats("tokens").unwrap()).unwrap().remove(0);
     // Torch's planes `[3, H, W]` against our RGBA rows.
     let (want, px) = (r.floats("image").unwrap(), got.width * got.height);

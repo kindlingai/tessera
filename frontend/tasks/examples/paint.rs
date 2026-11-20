@@ -44,6 +44,7 @@ fn main() -> Result<(), sensai_tasks::Error> {
         None,
         &sensai_frontend_settings::read(),
         n,
+        &Default::default(),
     )?;
     eprintln!("{}: opened in {:?}", painter.device(), started.elapsed());
     let started = Instant::now();

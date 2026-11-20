@@ -1,6 +1,7 @@
 //! Loads one model on a thread and serves HTTP.
 
 use crate::{Model, Slot};
+use sensai_bundle::Overrides;
 use sensai_engine::wasm::Module;
 use sensai_engine::{Batch, Fair, Pins, Recipe, Settings};
 use sensai_tasks::api::{Embed, GenerateImage, Info, Tokens};
@@ -64,6 +65,8 @@ pub struct Options {
     pub names: Option<PathBuf>,
     /// This rank and its peers. Empty serves alone.
     pub ranks: crate::ranks::Ranks,
+    /// Config values the recipe sets, by file.
+    pub config: Overrides,
 }
 
 impl Default for Options {
@@ -86,6 +89,7 @@ impl Default for Options {
             lower: None,
             names: None,
             ranks: Default::default(),
+            config: Overrides::default(),
         }
     }
 }
@@ -264,14 +268,14 @@ fn load(options: Options, slot: Slot) {
     };
     let failed = match options.task {
         Task::Generate => engine_thread(&options, &settings, info, &slot),
-        Task::Embed => Threaded::open(options.model, settings)
+        Task::Embed => Threaded::open(options.model, settings, options.config)
             .map(|e| {
                 let e = Arc::new(e);
                 set(info, e.clone(), Some(e as Arc<dyn Embed>), None);
             })
             .map_err(|e| e.to_string()),
         Task::Image if options.model.join("model_index.json").is_file() => {
-            Worker::<Klein>::open(options.model, settings, options.image_size)
+            Worker::<Klein>::open(options.model, settings, options.image_size, options.config)
                 .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
                 .map_err(|e| e.to_string())
         }
@@ -281,6 +285,7 @@ fn load(options: Options, slot: Slot) {
             options.module,
             settings,
             options.slots,
+            options.config,
         )
         .map(|p| painter(p, |t, p| set(info, t, None, Some(p))))
         .map_err(|e| e.to_string()),

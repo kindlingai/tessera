@@ -118,17 +118,36 @@ pub struct Bundle {
     pub stop: Vec<u32>,
 }
 
-/// The config `build` reads from the JSON file at `path`.
-pub(crate) fn configured<T>(
-    path: &Path,
-    build: impl FnOnce(&mut Keys) -> T,
-) -> Result<T, Box<dyn Error + Send + Sync>> {
-    let text = std::fs::read_to_string(path)?;
-    let offers = [Offered::parse(&path.display().to_string(), &text)?];
-    let mut keys = Keys::new(&offers);
-    let config = build(&mut keys);
-    keys.finish()?;
-    Ok(config)
+/// Config values a recipe sets, by the file they override.
+#[derive(Clone, Debug, Default)]
+pub struct Overrides(serde_json::Map<String, serde_json::Value>);
+
+impl Overrides {
+    pub fn new(files: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self(files)
+    }
+
+    /// The config `build` reads: the recipe's `key` table, then `path`.
+    pub fn read<T>(
+        &self,
+        key: &str,
+        path: Option<&Path>,
+        build: impl FnOnce(&mut Keys) -> T,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+        let mut offers = Vec::new();
+        if let Some(table) = self.0.get(key) {
+            let (name, root) = (format!("recipe [config.\"{key}\"]"), table.clone());
+            offers.push(Offered { name, root });
+        }
+        if let Some(path) = path {
+            let text = std::fs::read_to_string(path)?;
+            offers.push(Offered::parse(&path.display().to_string(), &text)?);
+        }
+        let mut keys = Keys::new(&offers);
+        let config = build(&mut keys);
+        keys.finish()?;
+        Ok(config)
+    }
 }
 
 /// The weights and their forms, in `offer`'s layout.

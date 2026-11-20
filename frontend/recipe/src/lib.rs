@@ -67,6 +67,9 @@ pub struct Recipe {
     /// Serve flags by name, with `_` for `-`.
     #[serde(default)]
     pub serve: toml::Table,
+    /// Config values by file, relative to the weights.
+    #[serde(default)]
+    pub config: toml::Table,
     /// The directory the recipe was read from.
     #[serde(skip)]
     pub dir: PathBuf,
@@ -132,6 +135,14 @@ impl Recipe {
             flags.push((format!("--{}", name.replace('_', "-")), dir));
         }
         Ok(flags)
+    }
+
+    /// `[config]` as JSON tables, by file.
+    pub fn overrides(&self) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::to_value(&self.config) {
+            Ok(serde_json::Value::Object(files)) => files,
+            _ => serde_json::Map::new(),
+        }
     }
 
     /// `[serve]` as `--flag` and value. `true` gives a bare flag.

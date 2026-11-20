@@ -2,7 +2,7 @@
 
 use crate::names::repo;
 use crate::tokenize::hf::Hf;
-use crate::{configured, pull};
+use crate::{Overrides, pull};
 use sensai_checkpoint::exlr8::Release;
 use sensai_engine::eg2::{Config, batched, program};
 use sensai_engine::{Graph, Linear, Weight};
@@ -20,8 +20,12 @@ pub fn encoder(
     dir: &Path,
     [seqs, context]: [u64; 2],
     padded: bool,
+    config: &Overrides,
 ) -> Result<Encoder, Box<dyn Error + Send + Sync>> {
-    let config = configured(&dir.join("config.json"), |k| Config::read(k, seqs, context))?;
+    let path = dir.join("config.json");
+    let config = config.read("config.json", Some(&path), |k| {
+        Config::read(k, seqs, context)
+    })?;
     let graph = match padded {
         true => batched::<Linear>(&config),
         false => program::<Linear>(&config),

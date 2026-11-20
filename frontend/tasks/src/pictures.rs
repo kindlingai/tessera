@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::api::Image;
+use sensai_bundle::Overrides;
 use sensai_bundle::vae::decoder;
 use sensai_engine::vae::{TAPS, TOKEN};
 use sensai_engine::{Model, Recipe, Settings, Tensor};
@@ -34,8 +35,13 @@ fn neighbours(side: usize) -> Vec<u32> {
 
 impl Pictures {
     /// The VAE in `dir`, sized for one launch.
-    pub fn open(dir: &Path, settings: &Settings, side: usize, seqs: usize) -> Result<Self, Error> {
-        let d = decoder(dir, side as u64, seqs as u64)?;
+    pub fn open(
+        dir: &Path,
+        settings: &Settings,
+        [side, seqs]: [usize; 2],
+        config: &Overrides,
+    ) -> Result<Self, Error> {
+        let d = decoder(dir, [side as u64, seqs as u64], config)?;
         let mut model = Model::open(d.graph, &Recipe::default(), settings)?;
         model.load(&d.weights)?;
         Ok(Self { model, side })

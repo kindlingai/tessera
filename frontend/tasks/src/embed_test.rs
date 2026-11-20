@@ -1,4 +1,5 @@
 use super::Embedder;
+use sensai_bundle::Overrides;
 use sensai_engine::{Pick, Settings};
 use sensai_testkit::cosine_f32;
 
@@ -12,7 +13,8 @@ fn eg2_cases() {
     let mut settings = Settings::default();
     // The host takes minutes on the long case.
     settings.backend = sensai_engine::gpu().map_or(settings.backend, Pick::Gpu);
-    let mut embedder = Embedder::open(&dir.join("exlr8"), &settings).unwrap();
+    let mut embedder =
+        Embedder::open(&dir.join("exlr8"), &settings, &Overrides::default()).unwrap();
     for entry in std::fs::read_dir(dir.join("cases")).unwrap() {
         let case = entry.unwrap().path();
         let ids = std::fs::read_to_string(case.join("tokens.txt")).unwrap();

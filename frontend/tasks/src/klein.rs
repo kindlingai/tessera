@@ -6,16 +6,13 @@ use crate::features::Features;
 use crate::flow::Flow;
 use crate::pictures::Pictures;
 use crate::worker::Worker;
+use sensai_bundle::Overrides;
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::Settings;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
-/// Text rows klein pads every prompt to.
-const ROWS: usize = 512;
-/// The Qwen3 layers klein reads.
-const LAYERS: [u64; 3] = [9, 18, 27];
 /// Channels per latent token.
 const LATENT: usize = 128;
 /// Pixels a side per latent token.
@@ -60,11 +57,31 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
     (0..n).map(|_| one(&mut uniform)).collect()
 }
 
+/// The recipe's `[config.pipeline]` table.
+struct Pipeline {
+    /// The text model's layers the transformer reads.
+    layers: Vec<u64>,
+    /// Text rows each prompt pads to.
+    rows: usize,
+    steps: usize,
+}
+
+impl Pipeline {
+    fn read(config: &Overrides) -> Result<Self, Error> {
+        config.read("pipeline", None, |k| Pipeline {
+            layers: k.need(&["text_layers"]),
+            rows: k.need(&["text_rows"]),
+            steps: k.need(&["steps"]),
+        })
+    }
+}
+
 /// The models, loaded once. Decoders open per size.
 pub struct Klein {
     /// The diffusers repository, in Hugging Face's layout.
     dir: PathBuf,
     settings: Settings,
+    config: Overrides,
     features: Features,
     flow: Flow,
     pictures: HashMap<usize, Pictures>,
@@ -75,24 +92,32 @@ pub struct Klein {
 
 impl Klein {
     /// The repository in `dir`, up to `largest` pixels a side.
-    pub fn open(dir: PathBuf, settings: Settings, largest: usize) -> Result<Self, Error> {
+    pub fn open(
+        dir: PathBuf,
+        settings: Settings,
+        largest: usize,
+        config: Overrides,
+    ) -> Result<Self, Error> {
         let largest = largest / PATCH;
+        let pipeline = Pipeline::read(&config)?;
         let words = [dir.join("text_encoder"), dir.join("tokenizer")];
         let features = Features::open(
             words.each_ref().map(|d| d.as_path()),
             &settings,
-            &LAYERS,
-            [1, ROWS],
+            &pipeline.layers,
+            [1, pipeline.rows],
         )?;
-        let flow = Flow::open(&dir, &settings, [1, ROWS, largest * largest])?;
+        let sizes = [1, pipeline.rows, largest * largest];
+        let flow = Flow::open(&dir, &settings, sizes, &config)?;
         Ok(Self {
             dir,
             settings,
+            config,
             features,
             flow,
             pictures: HashMap::new(),
             largest,
-            steps: 4,
+            steps: pipeline.steps,
         })
     }
 
@@ -117,7 +142,12 @@ impl Klein {
         }
         let pictures = match self.pictures.entry(side) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(Pictures::open(&self.dir, &self.settings, side, 1)?),
+            Entry::Vacant(e) => e.insert(Pictures::open(
+                &self.dir,
+                &self.settings,
+                [side, 1],
+                &self.config,
+            )?),
         };
         Ok(pictures.decode(&x)?.remove(0))
     }
@@ -125,9 +155,14 @@ impl Klein {
 
 impl Worker<Klein> {
     /// Opens klein on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings, largest: usize) -> Result<Self, Error> {
+    pub fn open(
+        dir: PathBuf,
+        settings: Settings,
+        largest: usize,
+        config: Overrides,
+    ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let klein = Klein::open(dir, settings, largest)?;
+            let klein = Klein::open(dir, settings, largest, config)?;
             eprintln!("klein loaded");
             Ok(klein)
         })

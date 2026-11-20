@@ -1,6 +1,7 @@
 //! FLUX.2's transformer as a velocity field over latent rows.
 
 use crate::Error;
+use sensai_bundle::Overrides;
 use sensai_bundle::flux2::transformer;
 use sensai_engine::flux2::{AXES, LATENT, TIME};
 use sensai_engine::{Model, Recipe, Settings, Tensor};
@@ -42,8 +43,9 @@ impl Flow {
         dir: &Path,
         settings: &Settings,
         [seqs, text, rows]: [usize; 3],
+        config: &Overrides,
     ) -> Result<Self, Error> {
-        let t = transformer(dir, [seqs as u64, text as u64, rows as u64])?;
+        let t = transformer(dir, [seqs as u64, text as u64, rows as u64], config)?;
         let recipe = Recipe {
             pins: t.pins,
             ..Recipe::default()

@@ -22,4 +22,5 @@ serde_json = "1"
 [dev-dependencies]
 sensai-checkpoint = { workspace = true }
 sensai-frontend-settings = { workspace = true }
+sensai-recipe = { workspace = true }
 sensai-testkit = { workspace = true }

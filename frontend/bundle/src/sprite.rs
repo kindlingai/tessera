@@ -1,6 +1,6 @@
 //! The sprite denoiser and its CLIP text tower.
 
-use crate::configured;
+use crate::Overrides;
 use crate::tokenize::hf::Hf;
 use sensai_checkpoint::{File, Offer, Torch};
 use sensai_engine::wasm::Module;
@@ -130,8 +130,9 @@ fn hf_name(path: &[PathSeg]) -> String {
 }
 
 /// CLIP's text tower in `dir`, cut to `context` tokens.
-pub fn text_tower(dir: &Path, seqs: u64, context: u64) -> Result<Clip> {
-    let config = configured(&dir.join("config.json"), |k| {
+pub fn text_tower(dir: &Path, [seqs, context]: [u64; 2], config: &Overrides) -> Result<Clip> {
+    let path = dir.join("config.json");
+    let config = config.read("clip/config.json", Some(&path), |k| {
         clip::Config::read(k, seqs, context)
     })?;
     let graph = clip::program(&config);

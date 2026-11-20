@@ -2086,6 +2086,7 @@ dependencies = [
  "sensai-engine",
  "sensai-frontend-settings",
  "sensai-grammar",
+ "sensai-recipe",
  "sensai-testkit",
  "serde_json",
 ]

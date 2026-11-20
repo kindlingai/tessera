@@ -20,7 +20,7 @@ pub struct Speed {
 pub fn embed(model: &Path, texts: &Path, vectors: Option<&Path>) -> Result<Speed, Failure> {
     let settings = sensai_frontend_settings::read();
     let start = Instant::now();
-    let mut embedder = Embedder::open(model, &settings)?;
+    let mut embedder = Embedder::open(model, &settings, &sensai_bundle::Overrides::default())?;
     let load_s = start.elapsed().as_secs_f64();
     let texts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(texts)?)?;
     let mut tokens = 0;

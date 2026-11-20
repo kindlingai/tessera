@@ -117,6 +117,7 @@ impl Source {
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
+            options.config = sensai_bundle::Overrides::new(r.overrides());
             if let Some(bytes) = r.module_bytes(cache)? {
                 let module = Module::open(&bytes).map_err(|e| Stop::Failed(e.to_string()))?;
                 let rules = module.rules.iter().copied();

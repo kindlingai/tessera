@@ -3,6 +3,7 @@
 use crate::Error;
 use crate::api::{GenerateImage, Image, Sizes, Tokens};
 use crate::worker::Worker;
+use sensai_bundle::Overrides;
 use sensai_bundle::sprite::{denoiser, text_tower};
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::wasm::Module;
@@ -88,9 +89,10 @@ impl Painter {
         module: Option<&Module>,
         settings: &Settings,
         most: usize,
+        config: &Overrides,
     ) -> Result<Self, Error> {
         let clip_dir = clip.map_or_else(|| dir.join("clip"), Path::to_path_buf);
-        let c = text_tower(&clip_dir, 1, TEXT as u64)?;
+        let c = text_tower(&clip_dir, [1, TEXT as u64], config)?;
         let mut clip = Model::open(c.graph, &Recipe::default(), settings)?;
         clip.load(&c.weights)?;
         let d = denoiser(dir, 2 * most as u64, module)?;
@@ -226,10 +228,11 @@ impl Worker<Painter> {
         module: Option<Arc<Module>>,
         settings: Settings,
         most: usize,
+        config: Overrides,
     ) -> Result<Self, Error> {
         Worker::spawn(move || {
             let module = module.as_deref();
-            let painter = Painter::open(&dir, clip.as_deref(), module, &settings, most)?;
+            let painter = Painter::open(&dir, clip.as_deref(), module, &settings, most, &config)?;
             eprintln!("{}: painter loaded", painter.device());
             Ok(painter)
         })

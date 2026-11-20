@@ -3,6 +3,7 @@
 use crate::Error;
 use crate::api::{Embed, Embedded, Tokens};
 use crate::worker::Worker;
+use sensai_bundle::Overrides;
 use sensai_bundle::encoder::encoder;
 use sensai_bundle::tokenize::hf::Hf;
 use sensai_engine::{Model, Recipe, Settings, Tensor};
@@ -53,10 +54,10 @@ fn unit(mut v: Vec<f32>) -> Vec<f32> {
 
 impl Embedder {
     /// Loads the exlr8 release in `dir` where `settings` say.
-    pub fn open(dir: &Path, settings: &Settings) -> Result<Self, Error> {
+    pub fn open(dir: &Path, settings: &Settings, config: &Overrides) -> Result<Self, Error> {
         // GPUs lack a fast kernel for listed keys.
         let padded = settings.gpu().is_none();
-        let e = encoder(dir, [SEQS as u64, MAX_TOKENS as u64], padded)?;
+        let e = encoder(dir, [SEQS as u64, MAX_TOKENS as u64], padded, config)?;
         let mut model = Model::open(e.graph, &Recipe::default(), settings)?;
         model.load(&e.weights)?;
         Ok(Self {
@@ -161,9 +162,9 @@ pub type Threaded = Worker<Embedder>;
 
 impl Worker<Embedder> {
     /// Opens the release in `dir` on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings) -> Result<Self, Error> {
+    pub fn open(dir: PathBuf, settings: Settings, config: Overrides) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let embedder = Embedder::open(&dir, &settings)?;
+            let embedder = Embedder::open(&dir, &settings, &config)?;
             eprintln!("{}: embedder loaded", embedder.device());
             Ok(embedder)
         })

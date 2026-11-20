@@ -37,7 +37,7 @@ fn close(name: &str, got: &[f32], want: &[f32]) {
 
 /// CLIP's states for the reference prompts.
 fn states(clip: &Path, r: &File) -> Vec<f32> {
-    let c = text_tower(clip, 2, TEXT as u64).unwrap();
+    let c = text_tower(clip, [2, TEXT as u64], &Default::default()).unwrap();
     let ids = ints(r, "clip.ids");
     for (row, text) in ids
         .chunks(TEXT)

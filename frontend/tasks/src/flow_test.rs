@@ -1,4 +1,5 @@
 use crate::flow::Flow;
+use sensai_bundle::Overrides;
 use sensai_checkpoint::File;
 use sensai_engine::{Pick, Settings};
 use sensai_testkit::cosine_f32;
@@ -13,7 +14,7 @@ fn matches_torch() {
         backend: Pick::Cpu,
         ..Settings::default()
     };
-    let mut flow = Flow::open(&dir.join("model"), &s, [1, 64, 256]).unwrap();
+    let mut flow = Flow::open(&dir.join("model"), &s, [1, 64, 256], &Overrides::default()).unwrap();
     let [latents, text, want] = ["latents", "text", "velocity"].map(|n| r.floats(n).unwrap());
     let got = flow.velocity(&latents, &text, 16, 0.7).unwrap();
     let cos = cosine_f32(&got, &want);

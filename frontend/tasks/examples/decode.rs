@@ -14,7 +14,12 @@ fn main() -> Result<(), sensai_tasks::Error> {
     };
     let tokens = File::open(file.as_ref())?.floats(name)?;
     let side: usize = side.parse()?;
-    let mut p = Pictures::open(dir.as_ref(), &sensai_frontend_settings::read(), side, 1)?;
+    let mut p = Pictures::open(
+        dir.as_ref(),
+        &sensai_frontend_settings::read(),
+        [side, 1],
+        &Default::default(),
+    )?;
     let started = Instant::now();
     let picture = p.decode(&tokens)?.remove(0);
     eprintln!(
