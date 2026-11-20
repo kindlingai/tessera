@@ -32,6 +32,10 @@ If your PR was stuck for a long time on a process or code failure that was
 preventable in an automated way, mention this in your PRs for self-improvement,
 tagging @mmastrac.
 
+While implementing your feature, analyze the code you are working on, code it
+interacts with and other related code for opportunities to simplify and refactor
+to reduce the overall code volume. Tag @mmastrac with those suggestions.
+
 ## Code shape
 
 `cargo run -p tessera-lint` checks these, and CI fails on any breach. The limits
