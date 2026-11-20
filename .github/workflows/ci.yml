@@ -6,8 +6,9 @@ on:
   pull_request:
   merge_group:
 
+# Each push to main runs to the end, so its macOS job is never dropped.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -30,10 +31,13 @@ jobs:
 
   changes:
     # Whether anything changed outside Markdown, lint code and lint.toml.
-    # The build jobs skip when nothing did.
+    # The build jobs skip when nothing did, and when a merge group holds
+    # the tree its pull request already passed.
     runs-on: ubuntu-slim
     outputs:
-      build: ${{ steps.paths.outputs.build }}
+      build: ${{ steps.reuse.outputs.build }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      macos: ${{ steps.reuse.outputs.macos }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,9 +53,31 @@ jobs:
             build=$(git diff --name-only "$BASE...$HEAD" | tools/scripts/build-needed.sh)
           fi
           echo "build=$build" | tee -a "$GITHUB_OUTPUT"
+      # A push to main runs the full macOS job when its merge group did
+      # not, so a reused landing still gets those tests.
+      - id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          BUILD: ${{ steps.paths.outputs.build }}
+        run: |
+          reuse=false
+          macos=true
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            reuse=$(tools/scripts/queue-reuse.sh)
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            ran=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=macos%20%2F%20build" \
+              --jq '[.check_runs[] | select(.conclusion == "success")] | length')
+            [ "$ran" -eq 0 ] || macos=false
+          fi
+          [ "$reuse" = false ] || BUILD=false
+          printf 'build=%s\nreuse=%s\nmacos=%s\n' "$BUILD" "$reuse" "$macos" | tee -a "$GITHUB_OUTPUT"
 
   lint:
     # Code-shape rules (tools/lint), their tests, and formatting.
+    needs: changes
+    if: needs.changes.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -152,9 +178,10 @@ jobs:
       - run: cargo test -p sensai-grammar --features llguidance
 
   macos:
-    # Pushes to main skip it, as the merge queue tested the same tree.
+    # Light on pull requests. A push to main runs it only when its merge
+    # group skipped it.
     needs: changes
-    if: needs.changes.outputs.build == 'true' && github.event_name != 'push'
+    if: needs.changes.outputs.build == 'true' && needs.changes.outputs.macos == 'true'
     uses: ./.github/workflows/macos.yml
     with:
       light: ${{ github.event_name == 'pull_request' }}
