@@ -3,7 +3,7 @@
 use crate::backend::{Backend, picked};
 use std::sync::LazyLock;
 
-/// The backend `TESSERA_REQUIRE_GPU` names. GPU boxes set it.
+/// The backend `TESSERA_REQUIRE_GPU` names. GPU boxes set the variable.
 #[allow(clippy::disallowed_methods, reason = "a test setting of the GPU boxes")]
 static REQUIRED: LazyLock<Option<Backend>> = LazyLock::new(|| {
     let name = std::env::var("TESSERA_REQUIRE_GPU")

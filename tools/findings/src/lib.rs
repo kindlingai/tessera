@@ -46,7 +46,7 @@ pub struct Finding {
     /// Code to show beside the message.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
-    /// A change that clears it, like a line to add.
+    /// A change that clears the finding, like a new line.
     #[serde(default)]
     pub fix: Option<String>,
 }

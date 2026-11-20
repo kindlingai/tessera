@@ -24,7 +24,7 @@ pub enum Term {
     Leaf(Home),
     /// One stage of a row.
     Stage(Stage),
-    /// Any other op, as the graph has it.
+    /// Any other op, unchanged from the graph.
     Op(Op),
 }
 

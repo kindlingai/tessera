@@ -1,12 +1,14 @@
 # Echo clause
 
-The clause ends on "them", so the reader goes back to find the noun it means,
-and finds only the noun it started from. Four shapes:
+The clause ends on "them" or "it", so the reader goes back to find the noun it
+means, and finds only the noun it started from. The shapes:
 
-- "that" or "which": "the code that sets them", "the paths that replace them".
-- "as": "as the form keeps them", "as llguidance reads them".
-- "of": "a list of them", "a folder of them".
-- A short sentence: "A seed repeats them.", "Its launches write them."
+- "that" or "which": "the code that sets them", "the zone that holds it".
+- "as": "as the form keeps them", "as HIP 6 and 7 number it".
+- "of": "a list of them", "left out of it".
+- "how": "how prompts met it".
+- "then": "Waits, then forgets them.", "then checks it."
+- A short sentence: "A seed repeats them.", "GPU boxes set it."
 
 Name what the clause means, or drop it. With "as", it is usually a layout or
 an order:
@@ -21,4 +23,5 @@ an order:
     /// One string, or a list of strings.
 
 "them" after a clear list in the same sentence stays legal: "Selects kernels,
-orders them, then assigns buffers."
+orders them, then assigns buffers." So does "it" as a subject: "the work it
+causes".

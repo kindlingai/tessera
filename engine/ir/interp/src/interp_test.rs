@@ -166,7 +166,7 @@ struct Proj {
     w: sensai_trace::Linear,
 }
 
-/// A matmul summing in `acc`, as a pass derives it.
+/// A matmul summing in `acc`, the form a pass derives.
 fn summing(acc: DType) -> Graph {
     let m = model();
     let p: Proj = sensai_trace::declare(&m);

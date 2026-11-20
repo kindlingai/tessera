@@ -74,5 +74,5 @@ pub(crate) struct Sum {
     pub writes: Option<usize>,
 }
 
-/// One launch, as the host reads it.
+/// One launch, in the host's form.
 pub(crate) type Offer = sensai_guest::site::Offer<String, Count>;

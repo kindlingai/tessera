@@ -40,7 +40,7 @@ pub trait Device: Clone + Send + Sync + 'static {
         Ok(false)
     }
 
-    /// Seconds between each pair of stamps. Waits, then forgets them.
+    /// Seconds between each pair of stamps. Waits, then frees all.
     fn stamps(&self) -> Result<Vec<f64>, Error> {
         Ok(Vec::new())
     }

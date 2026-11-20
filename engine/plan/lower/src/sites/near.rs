@@ -22,7 +22,7 @@ fn view(tree: &Tree, t: T, want: &View) -> Option<T> {
 }
 
 impl Pattern for Near {
-    /// `reshape(permute(gather(permute(src), ids)))`, as models trace it.
+    /// `reshape(permute(gather(permute(src), ids)))`, the shape models trace.
     fn find(tree: &Tree, at: T) -> Option<Self> {
         let Term::Op(Op::View(View::Reshape(_))) = &tree.node(at).term else {
             return None;

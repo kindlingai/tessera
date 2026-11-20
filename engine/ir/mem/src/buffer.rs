@@ -71,7 +71,7 @@ impl Backing for Host {
     }
 }
 
-/// An allocation, and the zone that holds it.
+/// An allocation and its zone.
 pub struct Buffer {
     pub zone: u32,
     backing: Box<dyn Backing>,

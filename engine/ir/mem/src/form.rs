@@ -80,7 +80,7 @@ pub trait Form: Sync {
             .collect()
     }
 
-    /// `data` as this form keeps it.
+    /// `data` in this form's layout.
     fn roundtrip(&self, data: &[f32]) -> Vec<f32> {
         let packed = self.pack(data);
         (0..data.len()).map(|i| self.unpack(&packed, i)).collect()

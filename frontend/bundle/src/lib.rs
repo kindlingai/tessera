@@ -58,7 +58,7 @@ struct HfConfig {
     logits_scaling: Option<f32>,
 }
 
-/// One id or a list, as `generation_config.json` writes it.
+/// One id or a list, the `generation_config.json` shape.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Ids {

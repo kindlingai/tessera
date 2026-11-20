@@ -127,7 +127,7 @@ impl After {
     }
 }
 
-/// A matmul with the stages that finish it, if any.
+/// A matmul with its finishing stages, if any.
 #[derive(Clone, Debug)]
 pub struct Finished {
     pub product: Matmul,

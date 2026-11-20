@@ -62,7 +62,7 @@ pub fn noise(seed: u64, n: usize) -> Vec<f32> {
 
 /// The models, loaded once. Decoders open per size.
 pub struct Klein {
-    /// The diffusers repository, as Hugging Face lays it out.
+    /// The diffusers repository, in Hugging Face's layout.
     dir: PathBuf,
     settings: Settings,
     features: Features,

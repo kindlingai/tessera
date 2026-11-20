@@ -152,7 +152,7 @@ pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
-/// An attention region appends K and V, then sums them.
+/// An attention region appends K and V, then sums both.
 pub fn appended(bounded: &[Dim], width: u64) -> Graph {
     let m = model(bounded, &[(Hidden, width)]);
     let slots = || Port {

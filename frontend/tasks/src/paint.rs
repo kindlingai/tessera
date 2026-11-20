@@ -42,7 +42,7 @@ impl Default for Options {
     }
 }
 
-/// mulberry32, as the sprite model's web demo seeds it.
+/// mulberry32, seeded like the sprite model's web demo.
 struct Rng(u32);
 
 impl Rng {

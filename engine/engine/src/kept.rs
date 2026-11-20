@@ -14,7 +14,7 @@ crate::metric!(RETAINED in KV = Gauge "tessera:kv_kept_runs", "Finished answers 
 crate::metric!(HITS in KV = Counter "tessera:kv_hits_total", "Prompts that started on kept rows.");
 crate::metric!(MISSES in KV = Counter "tessera:kv_misses_total", "Prompts that started with no rows.");
 
-/// The kept rows' pool, and how prompts met it.
+/// The kept rows' pool statistics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
     pub pool: Stats,

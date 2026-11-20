@@ -213,7 +213,7 @@ impl Engine {
         }
     }
 
-    /// This rank, as its peers must see it.
+    /// This rank, described for its peers.
     fn described(&self) -> Peer {
         let lane = |link: &Link| {
             let opened = &self.opened[link.port];

@@ -14,7 +14,7 @@ const CENTRAL: u32 = 0x0201_4b50;
 const LOCAL: u32 = 0x0403_4b50;
 const WIDE: u32 = u32::MAX;
 
-/// An entry's bytes: `len` of them from `start`.
+/// An entry's bytes: `len` bytes from `start`.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
     pub start: u64,

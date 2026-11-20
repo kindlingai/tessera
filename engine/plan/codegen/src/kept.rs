@@ -42,7 +42,7 @@ crate::form::gather! {
     pub static LAYOUTS: scattered_collect::ScatteredSlice<&'static dyn Layout>;
 }
 
-/// Registers a layout. Recipes then name it.
+/// Registers a layout for recipes to name.
 #[macro_export]
 macro_rules! layout {
     ($layout:expr) => {

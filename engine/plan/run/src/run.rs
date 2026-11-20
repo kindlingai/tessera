@@ -255,7 +255,7 @@ pub trait Run {
         }
     }
 
-    /// Uploads one graph weight, or this rank's slice of it.
+    /// Uploads one graph weight, or this rank's slice.
     fn load(&mut self, weight: u32, data: View) -> Result<(), Error> {
         let split = |l: &Loaded| l.weight == weight && l.part.is_some();
         if self.plan().weights.iter().any(split) {

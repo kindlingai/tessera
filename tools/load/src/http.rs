@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
-/// One completion as the client saw it.
+/// One completion, from the client's side.
 pub(crate) struct Sample {
     pub tokens: usize,
     pub ttft_ms: f64,

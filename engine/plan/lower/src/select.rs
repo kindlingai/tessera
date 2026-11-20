@@ -52,7 +52,7 @@ pub struct Value {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Op {
     pub kernel: KernelRef,
-    /// The rule that proposed it.
+    /// The proposing rule.
     pub rule: &'static str,
     pub reads: Vec<Val>,
     pub write: Val,

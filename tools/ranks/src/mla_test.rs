@@ -24,7 +24,7 @@ const CONFIG: &str = r#"{
   "routed_scaling_factor": 2.5, "rope_theta": 10000.0, "rms_norm_eps": 1e-6
 }"#;
 
-/// A weight's path as the name rules spell it.
+/// A weight's path, spelled by the name rules.
 fn path(segs: &[PathSeg]) -> String {
     let seg = |s: &PathSeg| match s {
         PathSeg::Field(f) => f.clone(),

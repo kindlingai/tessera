@@ -245,7 +245,7 @@ impl Pool {
         Ok(())
     }
 
-    /// Makes a live run reclaimable. Forks may still share it.
+    /// Makes a live run reclaimable. Forks may share its rows.
     pub fn retain(&mut self, run: RunId) -> Result<(), Error> {
         let at = self.live_at(run)?;
         self.retirements += 1;

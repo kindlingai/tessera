@@ -12,7 +12,7 @@ use crate::plan::{Kind, Out};
 /// The published crate that holds each workspace package.
 pub(crate) type Owners<'a> = BTreeMap<usize, &'a str>;
 
-/// One dependency, merged over the members that name it.
+/// One dependency, merged over its naming members.
 struct Want {
     req: String,
     path: Option<String>,

@@ -179,7 +179,7 @@ enum Phase {
     Stored,
 }
 
-/// One rank's kernel, as the rules allow it to run.
+/// One rank's kernel, run as the rules allow.
 struct Device {
     program: Vec<usize>,
     at: usize,

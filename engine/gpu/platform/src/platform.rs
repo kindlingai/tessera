@@ -49,7 +49,7 @@ pub fn backend_of(row: &Row) -> &str {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Platform {
     pub backend: String,
-    /// The architecture as the driver names it: sm_121, gfx11_5, apple9.
+    /// The driver's architecture name: sm_121, gfx11_5, apple9.
     pub arch: String,
     pub name: String,
     pub driver: String,

@@ -27,6 +27,8 @@ fn class(name: &str) -> Result<String, String> {
         "Prep" => tags("IN|TO"),
         "Possessive" => tags("POS"),
         "Hyphen" => tags("HYPH"),
+        "Num" => tags("CD"),
+        "Conj" => tags("CC"),
         "Verb" => tags(VERB),
         "Verb-Finite" => tags("VBD|VBP|VBZ|MD"),
         "Verb-PastParticiple" => tags("VBN"),

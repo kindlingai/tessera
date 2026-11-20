@@ -18,7 +18,7 @@ pub(crate) const HIP_SUCCESS: HipError = 0;
 pub(crate) const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const MEMCPY_DEVICE_TO_HOST: c_int = 2;
 pub(crate) const HOST_MALLOC_MAPPED: u32 = 2;
-/// `hipDeviceAttribute_t`, as HIP 6 and 7 number it.
+/// `hipDeviceAttribute_t`, with HIP 6 and 7 numbering.
 pub(crate) const ATTR_INTEGRATED: c_int = 16;
 pub(crate) const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 23;
 pub(crate) const ATTR_MEMORY_BUS_WIDTH: c_int = 59;

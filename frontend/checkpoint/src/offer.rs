@@ -9,7 +9,7 @@ pub enum Stored {
     F32,
     Bf16,
     F16,
-    /// A registered form's bytes, as `Form::pack` lays them out.
+    /// A registered form's bytes, in `Form::pack` layout.
     Form(&'static dyn Form),
     /// An element type no reader here widens.
     Other,
@@ -27,7 +27,7 @@ impl Stored {
         }
     }
 
-    /// The type `name` stands for, as `Stored::name` writes it.
+    /// The type `name` stands for, in `Stored::name` spelling.
     pub fn parse(name: &str) -> Result<Stored, Error> {
         match name {
             "f32" => Ok(Stored::F32),

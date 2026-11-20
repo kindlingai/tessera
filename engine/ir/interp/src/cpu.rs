@@ -5,7 +5,7 @@ use crate::tensor::Error;
 use sensai_graph::{Act, Attend, Mask, Numerics, Pairs, Stage};
 use sensai_mem::Tensor;
 
-/// The tanh approximation, as the GPU kernels compute it.
+/// The tanh approximation the GPU kernels use.
 fn gelu(x: f32) -> f32 {
     const COEF: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (COEF * (x + 0.044_715 * x * x * x)).tanh())

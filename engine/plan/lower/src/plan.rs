@@ -45,7 +45,7 @@ impl Slot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
     pub kernel: KernelRef,
-    /// The rule that proposed it.
+    /// The proposing rule.
     pub rule: &'static str,
     pub reads: Vec<Slot>,
     pub write: Slot,

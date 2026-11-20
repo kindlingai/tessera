@@ -7,7 +7,10 @@ hidden-negation: <ContentVerb> <Adverb>? no <Adj>* <Noun>
 hidden-negation: ^ only <Det>* <Adj|Noun|Possessive|Hyphen>* <Noun> <Adverb>? <Verb-Finite>
 chained-clause: <Verb|Prep> <Word>*? <Noun> , (which|whose|who) !<Be>
 what-clause: ^ what !<Verb-Finite> !<Prep> <Word>*? <Noun> <Adverb>? <Verb-Finite>
-echo-clause: <Noun> (that|which) <Adverb>? <Verb> <Prep>? them
-echo-clause: as <Det>* <Adj|Noun>* <Noun> <Adverb>? <Verb-Finite>? <Adverb>? <Verb> them
-echo-clause: <Noun> of them
-echo-clause: ^ <Det>? <Adj|Noun>* <Noun> <Adverb>? <Verb-Finite>? <Adverb>? <Verb> them (.)
+echo-clause: <Noun> (that|which) <Adverb>? <Verb> <Prep>? (them|it) !<Verb>
+echo-clause: as <Det>* <Adj|Noun|Possessive>* <Noun> <Num|Conj|Noun>* <Adverb>? <Verb-Finite>? <Adverb>? <Verb|Noun> (them|it) !<Verb>
+echo-clause: <Noun> of (them|it)
+echo-clause: ^ <Det>? <Adj|Noun>* <Noun> <Adverb>? <Verb-Finite>? <Adverb>? <Verb> (them|it) (.)
+echo-clause: (out) of it
+echo-clause: how <Det>* <Adj|Noun>* <Noun> <Adverb>? <Verb> (them|it)
+echo-clause: then <Adverb>? <Verb> (them|it) (.)

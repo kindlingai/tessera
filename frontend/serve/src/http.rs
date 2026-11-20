@@ -15,7 +15,7 @@ sensai_engine::metric!(MALFORMED in HTTP = Counter "tessera:http_malformed_total
 sensai_engine::metric!(CLIENT in HTTP = Counter "tessera:http_client_errors_total", "Responses with a 4xx status.");
 sensai_engine::metric!(SERVER in HTTP = Counter "tessera:http_server_errors_total", "Responses with a 5xx status.");
 
-/// A request as the routes see it.
+/// A request, in the routes' form.
 pub struct Request {
     pub method: String,
     pub path: String,

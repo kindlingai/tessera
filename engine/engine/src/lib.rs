@@ -45,7 +45,7 @@ pub use sensai_wasm as wasm;
 pub struct Request {
     pub tokens: Vec<u32>,
     pub max_tokens: usize,
-    /// Ids that end the answer, left out of it.
+    /// Ids that end the answer, excluded from its text.
     pub stop: Vec<u32>,
     /// Rules on each token. Masks need a mask port.
     #[serde(skip)]

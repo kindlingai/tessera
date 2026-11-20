@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Why a request was refused, as OpenAI reports it.
+/// Why a request was refused, in OpenAI's error format.
 #[derive(Debug)]
 pub(crate) struct Refusal {
     pub(crate) status: u16,

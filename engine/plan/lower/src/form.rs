@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub use sensai_codegen::form::{BF16_FORM, F32_FORM, LOADS, Load, U32_FORM, named};
 
-/// A weight as a file holds it.
+/// A weight in a file's layout.
 pub enum Weight {
     Floats(Tensor),
-    /// One form's bytes, as `Form::pack` lays them out.
+    /// One form's bytes, in `Form::pack` layout.
     Packed(&'static dyn Load, Vec<u8>),
 }
 

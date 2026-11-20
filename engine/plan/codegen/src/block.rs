@@ -9,7 +9,7 @@ use sensai_graph::{E2M1, E4M3, E8M0, F16};
 use sensai_mem::block::{Block, Code, I8, Nibble, Scale};
 use sensai_mem::block::{INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
 
-/// A code as kernel text reads it.
+/// A code, typed for kernel text.
 pub trait LoadCode: Code {
     /// Code at bit `low` of `w`, as a float.
     fn field(_: u32, _: u32) -> f32 {
@@ -20,7 +20,7 @@ pub trait LoadCode: Code {
     fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline;
 }
 
-/// A scale as kernel text reads it.
+/// A scale, typed for kernel text.
 pub trait LoadScale: Scale {
     /// The scale starting at byte `p`, in a kernel.
     fn load(_: Buf<U8>) -> f32 {
@@ -73,7 +73,7 @@ fn nibble_field(w: u32, low: u32) -> f32 {
     w.bits(low, 4) as f32 - 8.0
 }
 
-/// Each type's kernel reader, by the helper that decodes it.
+/// Each type's kernel reader, by its decode helper.
 macro_rules! reads {
     ($($trait:ident :: $method:ident for $t:ident = $helper:ident($($arg:ident),*);)*) => {$(
         impl $trait for $t {

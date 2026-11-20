@@ -2,7 +2,7 @@ use super::Pattern;
 use crate::kernels::MapStage;
 use crate::tree::{T, Term, Tree, map_stage};
 
-/// Elementwise stages over `reads[0]`. Operands follow it.
+/// Elementwise stages over `reads[0]`. Other operands come after.
 #[derive(Clone, Debug)]
 pub struct Chain {
     pub stages: Vec<MapStage>,

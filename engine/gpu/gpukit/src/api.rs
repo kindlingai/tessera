@@ -155,14 +155,14 @@ pub trait Api: Sync + Sized + 'static {
     /// A loadable image of `source` for this device.
     fn compile(ctx: &Context<Self>, source: &str) -> Result<Vec<u8>, Error>;
 
-    /// Calls `f` with a handle to fill, then checks it.
+    /// Fills a handle through `f`, then checks its code.
     fn out(&self, what: &str, f: impl FnOnce(&mut Handle) -> c_int) -> Result<Handle, Error> {
         let mut handle = std::ptr::null_mut();
         let code = f(&mut handle);
         self.check(code, what).map(|_| handle)
     }
 
-    /// Calls `f` with an int to fill, then checks it.
+    /// Fills an int through `f`, then checks its code.
     fn int(&self, what: &str, f: impl FnOnce(&mut c_int) -> c_int) -> Result<c_int, Error> {
         let mut value = 0;
         let code = f(&mut value);
@@ -286,7 +286,7 @@ impl<A: Api> Context<A> {
         Ok(())
     }
 
-    /// Seconds between each pair of stamps. Waits, then forgets them.
+    /// Seconds between each pair of stamps. Waits, then frees all.
     pub fn stamps(&self) -> Result<Vec<f64>, Error> {
         self.synchronize()?;
         let taken = std::mem::take(&mut *self.0.stamps.lock().unwrap_or_else(|e| e.into_inner()));

@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
 
-/// One step of a rank's plan, as views show it.
+/// One step of a rank's plan, for views.
 #[derive(Clone, Debug, Serialize)]
 pub struct StepView {
     pub kernel: &'static str,

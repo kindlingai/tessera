@@ -60,7 +60,7 @@ impl Spec {
         }
     }
 
-    /// The hardware as a driver reports it, with no device.
+    /// The hardware from a driver's report, with no device.
     pub fn platform(&self) -> Platform {
         if self.kind() == ZoneKind::Cpu {
             return Platform::host(Limits::host(8));

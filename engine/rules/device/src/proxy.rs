@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 pub(crate) mod sim;
 
-/// A lane's operation, as `collectives.h` numbers it.
+/// A lane's operation, numbered as in `collectives.h`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Sum,

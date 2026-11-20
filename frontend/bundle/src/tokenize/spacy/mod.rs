@@ -86,7 +86,7 @@ fn matches_start(re: &Option<Regex>, s: &str) -> Result<bool, Error> {
 }
 
 impl Spacy {
-    /// Reads `dir/tokenizer`, as a spaCy pipeline saves it.
+    /// Reads `dir/tokenizer`, in a spaCy pipeline's format.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         Self::from_saved(&std::fs::read(dir.join("tokenizer"))?)
     }

@@ -6,7 +6,7 @@ use crate::form::Load;
 use crate::print::{Kind, Printer};
 use crate::wgsl::store4;
 
-/// A value's type, as the printer needs it.
+/// A value's type, for the printer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     F32,

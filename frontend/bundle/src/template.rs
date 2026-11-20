@@ -1,4 +1,4 @@
-//! The model's chat template, as `tokenizer_config.json` carries it.
+//! The model's chat template, from `tokenizer_config.json`.
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::Serde;

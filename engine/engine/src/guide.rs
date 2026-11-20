@@ -20,7 +20,7 @@ pub enum Allowed {
 }
 
 impl Allowed {
-    /// A mask as the smallest tier that holds it.
+    /// A mask, stored in the smallest tier that fits.
     pub fn from_bits(bits: Vec<u32>) -> Self {
         let mut ids = Vec::new();
         for (w, &word) in bits.iter().enumerate() {

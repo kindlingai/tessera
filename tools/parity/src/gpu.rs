@@ -10,7 +10,7 @@ use sensai_trace::DimName::{self, Context, Rows, Segments, Seqs};
 use sensai_trace::Graph;
 use std::sync::MutexGuard;
 
-/// The model's reference, as its golden run reads it.
+/// The model's reference, for its golden run.
 struct Fixture {
     settings: Settings,
     weights: Vec<Tensor>,

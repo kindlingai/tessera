@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
 
-/// The loaded model, as the routes see it.
+/// The loaded model, from the routes' side.
 pub struct Model {
     pub info: Info,
     pub tokens: Arc<dyn Tokens>,
@@ -72,7 +72,7 @@ fn reply(slot: &Slot, f: impl FnOnce(&Model) -> Result<Value, Refusal>) -> Respo
     }
 }
 
-/// Ready or loading, as llama.cpp reports it.
+/// Ready or loading, matching llama.cpp's status.
 fn health(slot: &Slot) -> Response {
     match slot.get() {
         Some(_) => Response::json(200, &json!({"status": "ok"})),

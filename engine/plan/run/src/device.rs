@@ -62,7 +62,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             .expect("this runner allocates device buffers")
     }
 
-    /// Each argument by position, as the device takes it.
+    /// Each argument by position, in the device's form.
     fn bound(&self, args: &[Arg]) -> Result<KernelArgs, Error> {
         let mut bound = KernelArgs::new();
         for arg in args {

@@ -15,3 +15,11 @@ Kept rows span the whole context, as buffers hold them.
 One string or a list of them.
 ---
 The token tree and the tokenizer, as llguidance reads them.
+---
+The kept rows' pool, and how prompts met it.
+---
+Calls `f` with an int to fill, then checks it.
+---
+Ids that end the answer, left out of it.
+---
+`hipDeviceAttribute_t`, as HIP 6 and 7 number it.

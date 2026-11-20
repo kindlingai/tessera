@@ -26,7 +26,7 @@ pub struct Raw {
     pub semicolon: bool,
 }
 
-/// A comment as the rule counts it.
+/// A comment, as the rule counts words.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Comment {
     pub line: usize,

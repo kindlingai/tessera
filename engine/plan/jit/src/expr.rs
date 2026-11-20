@@ -209,7 +209,7 @@ impl Lowerer<'_, '_> {
         self.b.ins().fdiv(p, q)
     }
 
-    /// The registry index of `form`, for helpers that decode it.
+    /// The registry index of `form`, for its decode helpers.
     fn registered(&mut self, form: &'static dyn Load) -> Res<Value> {
         let Some(i) = LOADS.iter().position(|f| **f == *form) else {
             return Err(format!("the {} form is not registered", form.name()));

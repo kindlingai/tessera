@@ -114,7 +114,7 @@ fn interned(name: String) -> &'static str {
 
 sensai_mem::registry!(Load, LOADS);
 
-/// Registers a form's loads. Pins and recipes then name it.
+/// Registers a form's loads for pins and recipes to name.
 macro_rules! form {
     ($form:expr) => {
         sensai_mem::register!([$crate::form::LOADS] [$crate::form::Load] $form);

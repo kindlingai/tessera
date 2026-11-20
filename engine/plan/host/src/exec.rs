@@ -7,7 +7,7 @@ use sensai_codegen::numerics::Precision;
 use sensai_graph::{E2M1, E4M3, F16};
 use std::collections::HashMap;
 
-/// One argument of a launch, as the host sees it.
+/// One argument of a launch, on the host side.
 #[derive(Clone, Copy, Debug)]
 pub enum ArgVal {
     /// Buffer `at` in the launch's list, `skip` elements in.
@@ -318,7 +318,7 @@ impl Group<'_, '_> {
             .collect()
     }
 
-    /// The `bits` wide field at `args`, as `f` widens it.
+    /// The `bits` wide field at `args`, widened with `f`.
     fn narrow(&mut self, args: &[Expr], mask: &[bool], bits: u32, f: fn(u32) -> f32) -> Vec<Val> {
         let (w, l) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
         (0..self.threads)

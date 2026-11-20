@@ -49,7 +49,7 @@ impl Source {
     }
 }
 
-/// Fetches one commit beside `dir`, then renames it.
+/// Fetches one commit beside `dir`, then renames the fetched folder.
 fn clone(url: &str, commit: &str, dir: &Path) -> Result<(), Error> {
     let part = dir.with_extension("part");
     let _ = std::fs::remove_dir_all(&part);

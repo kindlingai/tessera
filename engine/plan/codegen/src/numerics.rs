@@ -80,7 +80,7 @@ impl Precision {
         if self.truncates { 2.0 * unit } else { unit }
     }
 
-    /// `x` as the tile holds it: `(hi, lo)` pieces.
+    /// `x` in the tile's form: `(hi, lo)` pieces.
     pub fn split(&self, x: f32) -> (f32, f32) {
         match self.operand {
             Operand::F32 => (x, 0.0),
@@ -95,7 +95,7 @@ impl Precision {
         }
     }
 
-    /// `acc + sum`, as the accumulator keeps it.
+    /// `acc + sum`, in the accumulator's precision.
     pub fn accumulate(&self, acc: f32, sum: f32) -> f32 {
         let total = acc + sum;
         if !self.truncates || total == 0.0 || !total.is_finite() {

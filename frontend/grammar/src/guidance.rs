@@ -29,7 +29,7 @@ impl TokenizerEnv for Env {
     }
 }
 
-/// One model's tokens. Build it once, then share it.
+/// One model's tokens, built once and shared.
 pub struct Vocab {
     factory: ParserFactory,
     stops: Arc<[u32]>,

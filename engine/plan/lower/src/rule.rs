@@ -211,7 +211,7 @@ impl Propose for ProposeFn {
 pub struct Rule {
     pub name: &'static str,
     pub propose: &'static dyn Propose,
-    /// The module that registered it.
+    /// The registering module.
     pub module: &'static str,
 }
 

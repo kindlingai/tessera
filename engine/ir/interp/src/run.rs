@@ -432,7 +432,7 @@ fn order(g: &Graph, needed: &[bool], picked: &[bool]) -> Vec<usize> {
     let leaf = |i: usize| g.nodes[i].args.is_empty();
     let (mut out, mut placed) = (Vec::new(), vec![false; g.nodes.len()]);
     for (i, n) in g.nodes.iter().enumerate() {
-        // A picked gather runs inside the matmul that reads it.
+        // A picked gather runs inside its consuming matmul.
         if !needed[i] || picked[i] || leaf(i) {
             continue;
         }

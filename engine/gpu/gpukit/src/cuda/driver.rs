@@ -39,7 +39,7 @@ pub(crate) struct LaunchAttribute {
     pub value: [u64; 8],
 }
 
-/// `CUlaunchConfig`, as the driver lays it out.
+/// `CUlaunchConfig`, in the driver's layout.
 #[repr(C)]
 pub(crate) struct LaunchConfig {
     pub grid: [u32; 3],

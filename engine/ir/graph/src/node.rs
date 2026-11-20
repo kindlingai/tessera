@@ -310,7 +310,7 @@ pub enum Composite {
 }
 
 impl Composite {
-    /// Whether it spans one block at most. Trims keep it.
+    /// Whether it spans one block at most, through any trim.
     pub fn block(self) -> bool {
         !matches!(self, Composite::Layer | Composite::Model)
     }

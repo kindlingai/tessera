@@ -67,7 +67,7 @@ pub fn tanh(x: f32) -> f32 {
     x * horner(&TANH_P) / horner(&TANH_Q)
 }
 
-/// GELU with the tanh estimate, as the graph spells it.
+/// GELU with the tanh estimate, in the graph's spelling.
 fn gelu(v: f32) -> f32 {
     let inner = v + 0.044_715 * (v * v * v);
     let t = 1.0 + tanh((0.797_884_6 * inner).clamp(-8.0, 8.0));

@@ -25,7 +25,7 @@ use sensai_testkit::{Noise, cosine_f32, fill, max_abs_diff};
 use sensai_trace::DimName::{Context, Seqs};
 use sensai_trace::{Composite, DimName, Graph, TensorType};
 
-/// One model as the suite sees it.
+/// One model, from the suite's side.
 pub struct Spec {
     pub name: &'static str,
     /// The graph at its released sizes.
