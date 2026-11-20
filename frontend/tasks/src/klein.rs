@@ -68,11 +68,12 @@ struct Pipeline {
 
 impl Pipeline {
     fn read(config: &Overrides) -> Result<Self, Error> {
-        config.read("pipeline", None, |k| Pipeline {
+        let read = config.read("pipeline", None, |k| Pipeline {
             layers: k.need(&["text_layers"]),
             rows: k.need(&["text_rows"]),
             steps: k.need(&["steps"]),
-        })
+        });
+        read.map_err(|e| format!("klein needs a recipe with [config.pipeline]:\n{e}").into())
     }
 }
 
