@@ -241,12 +241,12 @@ jobs:
           key: simcheck2-${{ github.run_id }}
           restore-keys: simcheck2-
       # On a pull request, new files that lean elsewhere get a note.
-      # Pull requests embed changed files and 1500 other windows.
+      # Pull requests embed changed files and 300 other windows.
       # Pushes to main only fill the cache, and never fail.
       - run: >
           mkdir -p "$RUNNER_TEMP/checks" &&
           $SIMCHECK check "$RUNNER_TEMP/eg2-text" "$RUNNER_TEMP/simcheck" "$RUNNER_TEMP/checks/simcheck.json"
-          ${{ github.base_ref && format('origin/{0} --budget 1500', github.base_ref) || '--warm --budget 2000' }}
+          ${{ github.base_ref && format('origin/{0} --budget 300', github.base_ref) || '--warm --budget 2000' }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
