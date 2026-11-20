@@ -11,7 +11,12 @@ fn pool(depth: u32, one_way: bool, group: u32) -> Pool {
 }
 
 fn lane(op: Op, pool: u32) -> Lane {
-    Lane { op, pool }
+    Lane {
+        op,
+        pool,
+        width: 8,
+        block: 2,
+    }
 }
 
 fn seeds(plan: &Plan) -> Result<(), String> {
@@ -70,4 +75,42 @@ fn broken_rule_caught() {
         resync: None,
     };
     assert!(seeds(&plan).unwrap_err().contains("overwrote"));
+}
+
+#[test]
+fn wired_puts_and_credits() {
+    use crate::proxy::wired::{CREDITS, FLAGS, RECV, SEND, Wired};
+    use crate::proxy::{Link, Part, Sent};
+    use sensai_engine_comm::{Link as _, Memory, Span};
+    let pools = [pool(2, false, 2), pool(2, true, 2)];
+    let bytes = [(32, 32), (32, 32)];
+    let regions = Wired::<Memory>::regions(&pools, &bytes);
+    let wire = |link| Wired::new(link, &pools, &bytes, vec![vec![0, 1], vec![0, 1]]);
+    let mut links = Memory::ranks(2, &regions).into_iter().map(wire);
+    let (mut a, mut b) = (links.next().unwrap(), links.next().unwrap());
+    a.link().write(Span::new(SEND, 32, 16), &[7; 16]);
+    let part = Part {
+        pool: 0,
+        slot: 1,
+        to: 1,
+        ordinal: 9,
+        count: 2,
+        from: 0,
+        bytes: 16,
+    };
+    a.put(part).unwrap();
+    a.credit(1, 1, 5).unwrap();
+    assert_eq!(
+        a.sent().unwrap(),
+        [Sent {
+            pool: 0,
+            ordinal: 9,
+            to: 1
+        }]
+    );
+    let b = b.link();
+    assert_eq!(b.read(Span::new(RECV, 8 * 32, 16)), [7; 16]);
+    let flag = |at| b.load(Span::new(FLAGS, at, 8));
+    assert_eq!((flag(8 * 16), flag(8 * 16 + 8)), (9, 2));
+    assert_eq!(b.load(Span::new(CREDITS, 64, 8)), 5);
 }

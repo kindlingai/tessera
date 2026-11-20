@@ -1,6 +1,6 @@
 //! Ranks, proxies and links under a seeded random schedule.
 
-use crate::proxy::{Fetched, Fetcher, Host, Lane, Link, Op, Pool, Proxy, Sent, Word};
+use crate::proxy::{Fetched, Fetcher, Host, Lane, Link, Op, Part, Pool, Proxy, Sent, Word};
 use std::collections::{HashMap, VecDeque};
 
 /// Words in one part, and in one all-to-all block.
@@ -91,14 +91,15 @@ impl SimLink {
 }
 
 impl Link for SimLink {
-    fn put(
-        &mut self,
-        pool: u32,
-        slot: u32,
-        to: u32,
-        ordinal: u64,
-        count: u32,
-    ) -> Result<(), String> {
+    fn put(&mut self, part: Part) -> Result<(), String> {
+        let Part {
+            pool,
+            slot,
+            to,
+            ordinal,
+            count,
+            ..
+        } = part;
         let from = self.place(pool);
         let block = self.split[pool as usize].then_some(to);
         let msg = Msg::Put {
@@ -121,8 +122,8 @@ impl Link for SimLink {
         Ok(())
     }
 
-    fn sent(&mut self) -> Vec<Sent> {
-        std::mem::take(&mut self.sent)
+    fn sent(&mut self) -> Result<Vec<Sent>, String> {
+        Ok(std::mem::take(&mut self.sent))
     }
 
     fn reset(&mut self) {

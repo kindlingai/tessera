@@ -1,15 +1,33 @@
 //! Moves bytes between ranks over handles the front end opened.
 
+/// `poll` and `reset` for links whose work finishes at once.
+macro_rules! at_once {
+    () => {
+        fn poll(&mut self, done: &mut Vec<u64>) -> Result<(), Error> {
+            done.append(&mut self.done);
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.done.clear();
+        }
+    };
+}
+
 mod fabric;
 mod ibv;
+mod link;
+mod memory;
 pub mod reduce;
 mod shm;
 mod sockets;
 mod verbs;
 
 pub use fabric::{Fabric, Port};
+pub use link::{Blocking, Link, Put, Span};
+pub use memory::Memory;
 pub use reduce::{Pinned, Pinning, Reduce};
-pub use shm::Shm;
+pub use shm::{Shm, ShmLink};
 pub use sockets::Sockets;
 pub use verbs::Verbs;
 

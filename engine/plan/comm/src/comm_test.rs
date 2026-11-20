@@ -1,4 +1,5 @@
-use crate::{Error, Shm, Sockets, Transport, summed};
+use crate::link::exchange_regions;
+use crate::{Blocking, Error, Memory, Shm, Sockets, Transport, summed};
 use std::fs::{File, OpenOptions};
 use std::net::{TcpListener, TcpStream};
 
@@ -24,7 +25,7 @@ fn sized(name: &str, len: usize) -> File {
 
 #[test]
 fn handles_must_fit() {
-    assert_eq!(Shm::room(3, 8), 72 + 48);
+    assert_eq!(Shm::room(3, 8), 3 * (32 + 96 + 96));
     let short = sized("short", Shm::room(2, 8) - 1);
     assert!(matches!(Shm::over(0, 2, short), Err(Error::Fit(_))));
     let late = sized("late", Shm::room(2, 8));
@@ -81,6 +82,18 @@ fn sockets_exchange() {
         .map(|(r, peers)| Sockets::over(r as u32, peers).unwrap())
         .collect();
     rounds(ranks);
+}
+
+#[test]
+fn memory_exchange() {
+    let links = Memory::ranks(3, &exchange_regions(3, 16));
+    let wait = std::time::Duration::from_secs(10);
+    rounds(
+        links
+            .into_iter()
+            .map(|l| Blocking::new(l, 16, wait))
+            .collect(),
+    );
 }
 
 #[test]

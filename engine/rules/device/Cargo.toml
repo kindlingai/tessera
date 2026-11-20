@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Device headers for whole-model recipe kernels, and their import scanner"
+description = "Device headers, import scanner and host proxy for whole-model recipe kernels"
 
 [dependencies]
+sensai-engine-comm = { workspace = true }
 thiserror = "2"
