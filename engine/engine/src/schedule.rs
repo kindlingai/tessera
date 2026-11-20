@@ -4,7 +4,7 @@ use crate::kept::{Kept, Totals};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 
-crate::registry!(REQUESTS = "requests");
+crate::metric_registry!(REQUESTS = "requests");
 crate::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
 crate::metric!(RUNNING in REQUESTS = Gauge "tessera:requests_running", "Answers that hold a slot.");
 crate::metric!(PROMPT in REQUESTS = Counter "tessera:prompt_tokens_total", "Prompt tokens of admitted answers.");

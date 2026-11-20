@@ -1,6 +1,6 @@
 use crate::metrics::text;
 
-crate::registry!(TESTED = "tested");
+crate::metric_registry!(TESTED = "tested");
 crate::metric!(SEEN in TESTED = Counter "tessera:test_seen_total", "Calls seen.");
 
 #[test]

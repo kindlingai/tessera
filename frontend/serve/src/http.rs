@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-sensai_engine::registry!(HTTP = "http");
+sensai_engine::metric_registry!(HTTP = "http");
 sensai_engine::metric!(OPEN in HTTP = Gauge "tessera:http_connections_open", "Connections open now.");
 sensai_engine::metric!(REFUSED in HTTP = Counter "tessera:http_refused_total", "Connections refused past the limit.");
 sensai_engine::metric!(REQUESTS in HTTP = Counter "tessera:http_requests_total", "Requests read and routed.");

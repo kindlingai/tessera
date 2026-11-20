@@ -104,9 +104,9 @@ pub fn text() -> String {
     out
 }
 
-/// Declares a registry: `registry!(NAME = "name")`.
+/// Declares a registry: `metric_registry!(NAME = "name")`.
 #[macro_export]
-macro_rules! registry {
+macro_rules! metric_registry {
     ($(#[$doc:meta])* $vis:vis $name:ident = $label:literal) => {
         $crate::metrics::gather! {
             #[gather]

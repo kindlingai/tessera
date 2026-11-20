@@ -138,7 +138,7 @@ fn embeddings(slot: &Slot, body: &[u8]) -> Response {
     })
 }
 
-sensai_engine::registry!(API = "api");
+sensai_engine::metric_registry!(API = "api");
 sensai_engine::metric!(COMPLETIONS in API = Counter "tessera:completion_requests_total", "Requests to /v1/completions.");
 sensai_engine::metric!(CHATS in API = Counter "tessera:chat_requests_total", "Requests to /v1/chat/completions.");
 sensai_engine::metric!(EMBEDS in API = Counter "tessera:embedding_requests_total", "Requests to /v1/embeddings.");
