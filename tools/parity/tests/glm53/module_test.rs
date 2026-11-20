@@ -85,7 +85,7 @@ fn block_of(c: &Config) -> Graph {
 /// Random codes for `[.., out, inp]`, with scales if rotated.
 fn codes(shape: &[usize], form: &dyn Load, draws: &mut Noise) -> Vec<u8> {
     let [.., out, inp] = *shape else {
-        panic!("a matrix, or a set of them");
+        panic!("a matrix, or a set of matrices");
     };
     let count = form.bytes(shape.iter().product()) - form.bytes(0);
     let entries: Vec<u8> = (0..count)

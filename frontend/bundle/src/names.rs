@@ -21,7 +21,7 @@ pub struct Claim {
 /// Why the weights and the slices do not pair off.
 #[derive(Debug, Default, PartialEq, thiserror::Error)]
 pub struct Unresolved {
-    /// Weights no slice fits.
+    /// Weights without a fitting slice.
     pub missing: Vec<String>,
     /// Weights several slices fit, with the slices.
     pub ambiguous: Vec<(String, Vec<String>)>,
@@ -32,7 +32,7 @@ pub struct Unresolved {
 impl fmt::Display for Unresolved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for path in &self.missing {
-            writeln!(f, "{path}: no slice fits")?;
+            writeln!(f, "{path}: unmatched by any slice")?;
         }
         for (path, slices) in &self.ambiguous {
             writeln!(f, "{path}: fits {}", slices.join(", "))?;

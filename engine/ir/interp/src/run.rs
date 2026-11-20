@@ -154,7 +154,7 @@ impl Held {
         // Rows read their slot's earlier positions.
         for (r, (&s, &p)) in slots.iter().zip(&positions).enumerate() {
             if let Some(gap) = (0..p).find(|&q| !written[s * len + q]) {
-                let msg = format!("row {r} at slot {s} reads position {gap}, which no row wrote");
+                let msg = format!("row {r} at slot {s} reads unwritten position {gap}");
                 return Err(Error::Mismatch(msg));
             }
         }

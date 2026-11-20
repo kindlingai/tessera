@@ -53,5 +53,5 @@ fn ipv4_gid(device: &str) -> Result<u32, Error> {
             return Ok(i);
         }
     }
-    Err(Error::Fit(format!("no RoCE v2 IPv4 GID on {device}")))
+    Err(Error::Fit(format!("{device} lacks a RoCE v2 IPv4 GID")))
 }

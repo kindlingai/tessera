@@ -13,6 +13,6 @@ id=$(gh api --paginate "$comments" \
 if [ -n "$id" ]; then
     gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@"$report" >/dev/null
 elif ! grep -q '^None found' "$report"; then
-    # A clean run with no earlier comment says nothing.
+    # A clean run without an earlier comment posts nothing.
     gh api "$comments" -F body=@"$report" >/dev/null
 fi

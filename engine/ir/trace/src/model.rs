@@ -133,7 +133,7 @@ impl Model {
         let outs = body();
         let mut g = self.g.borrow_mut();
         let end = NodeId(g.nodes.len() as u32);
-        assert!(start < end, "{kind:?} traced no nodes");
+        assert!(start < end, "{kind:?} traced zero nodes");
         let outputs = outs.iter().map(|t| t.id).collect::<Vec<_>>();
         let within = outputs.iter().all(|&o| start <= o && o < end);
         assert!(within, "{kind:?} must return values it computed");

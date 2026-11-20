@@ -151,7 +151,7 @@ impl Matcher {
         self.inner.is_accepting().unwrap_or(false)
     }
 
-    /// Whether the grammar ended or failed. No token fits after.
+    /// Whether the grammar ended or failed. Every later token fails.
     pub fn stopped(&self) -> bool {
         self.inner.is_stopped()
     }

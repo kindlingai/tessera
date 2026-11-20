@@ -22,7 +22,7 @@ pub enum Tag {
     Measured,
     /// Derived from a measurement and an assumption.
     Inferred,
-    /// A published or guessed value no probe has checked.
+    /// A published or guessed value, unchecked by probes.
     Assumed,
 }
 

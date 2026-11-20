@@ -13,6 +13,12 @@ sentence: "This call does not take the lock."
 Forms of be, have and do stay legal, since "the file has no header" is
 ordinary.
 
+## "No" before the subject
+
+"Keys no offer holds", "Ops that no rule lowers". The subject is a negation,
+so the sentence states a fact by its absence. Name the positive fact:
+"Keys absent from every offer", "Ops without a lowering rule".
+
 ## Only before the subject
 
 "Only X does Y" means nothing but X does Y. It also moves the topic to the end

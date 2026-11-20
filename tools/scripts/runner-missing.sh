@@ -1,6 +1,6 @@
 #!/bin/sh
 # Passes when each cancelled job in this run attempt was cancelled
-# because no hosted runner took it. Any other cancel fails, for
+# because a hosted runner never took it. Any other cancel fails, for
 # example a run that a newer run replaced.
 # Needs GH_TOKEN, GITHUB_REPOSITORY, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT.
 set -e

@@ -33,7 +33,7 @@ struct Def {
     path: String,
     line: usize,
     name: String,
-    /// Calls inside its own body, which do not count.
+    /// Calls inside its own body do not count.
     own: usize,
 }
 

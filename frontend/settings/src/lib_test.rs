@@ -1,6 +1,6 @@
 #[test]
 fn reads_variables() {
-    // SAFETY: this crate's only test, so no other thread reads.
+    // SAFETY: this crate has one test, so one thread reads.
     unsafe {
         std::env::set_var("TESSERA_LANES", "8");
         std::env::set_var("TESSERA_EMULATE", "cuda");

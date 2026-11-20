@@ -350,7 +350,7 @@ impl Lowerer<'_, '_> {
                         self.store_at(addr, ty, v);
                         Ok(())
                     }
-                    _ => Err(format!("`{name}` is not written by index")),
+                    _ => Err(format!("indexed writes to `{name}` are unsupported")),
                 }
             }
             Expr::Field(base, h) => {

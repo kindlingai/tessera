@@ -16,3 +16,5 @@ echo-clause: then <Adverb>? <Verb> (them|it) (.)
 what-clause: ^ what
 end-verb: (holds|takes|carries) (.)
 end-verb: !<Noun> (hold|take|carry) (.)
+hidden-negation: ^ no <Adj|Noun>* <Noun> <Adverb>? !<Be> <Verb-Finite>
+hidden-negation: !(unless) <Word> no <Adj|Noun>* <Noun> <Adverb>? !<Be> <Verb-Finite>

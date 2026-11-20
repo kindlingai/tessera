@@ -46,7 +46,7 @@ pub enum MapStage {
     Act(Act),
 }
 
-/// `out = stages(x, operands..)`. No stages makes a copy.
+/// `out = stages(x, operands..)`. Empty `stages` makes a copy.
 #[derive(Clone, Debug, Kernel)]
 #[launch(
     crate = crate,

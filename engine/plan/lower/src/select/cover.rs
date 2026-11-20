@@ -56,7 +56,7 @@ pub(crate) struct Cover<'a> {
     pub(crate) best: Vec<Vec<Option<Option<Choice>>>>,
     /// Per root: the zones its readers run in.
     pub(crate) wanted: Vec<Vec<u32>>,
-    /// Nodes no rule proposes at, deepest first.
+    /// Nodes without a proposing rule, deepest first.
     pub(crate) bare: Vec<T>,
 }
 
@@ -220,7 +220,7 @@ impl Cover<'_> {
         best.map(|b| Choice { offered, ways, ..b })
     }
 
-    /// The deepest node below `root` that no rule proposes at.
+    /// The deepest node below `root` without a proposing rule.
     pub(crate) fn uncovered(&self, root: T) -> T {
         let mut below = vec![false; self.tree.len()];
         let mut stack = vec![root];

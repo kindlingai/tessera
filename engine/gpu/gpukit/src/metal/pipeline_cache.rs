@@ -16,7 +16,7 @@ type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// Every pipeline compiled so far, by its label.
 #[derive(Default)]
 pub(crate) struct Pipelines {
-    /// Keyed by label, which must encode the full specialization.
+    /// Keyed by label. The label must encode the full specialization.
     compiled: Mutex<HashMap<String, Pipeline>>,
 }
 

@@ -32,7 +32,7 @@ enum op : u32 {
     FETCH = 5,
 };
 
-// As the NIC or proxy writes it.
+// In the layout the NIC or proxy writes.
 struct alignas(16) flag {
     u64 ordinal;
     u64 count;
@@ -102,7 +102,7 @@ struct session {
     u64 next[MAX_POOLS];
     u64 writes;
 
-    // Every thread calls it. Only block 0's leader stores.
+    // Every thread calls this. Block 0's leader alone stores.
     TESSERA_FN void bump() {
         if (prim::leader()) prim::store_release_sys(detail::page(t), writes);
         writes++;

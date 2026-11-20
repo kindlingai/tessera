@@ -127,7 +127,7 @@ fn check_cuda(tile: &Option<[usize; 3]>, pdl: bool, target: &str, dir: &Path) {
         .collect();
     assert!(
         sass.contains("HMMA.1688"),
-        "{target}: no 16x8x8 tf32 tile in the SASS, which has {ops:?}"
+        "{target}: no 16x8x8 tf32 tile in the SASS. It has {ops:?}"
     );
     let (_, ptx) = run("nvcc", &[&arch, "-ptx", "-o", "-", "tiled.cu"], dir);
     assert_eq!(

@@ -52,7 +52,7 @@ impl Transport for Sockets {
     fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         let mut out: Vec<Vec<u8>> = vec![Vec::new(); self.peers.len()];
         out[self.rank as usize] = mine.to_vec();
-        // Writers run aside, so no pair waits on each other.
+        // Writers run aside, so pairs never wait on each other.
         let mut writers: Vec<TcpStream> = Vec::new();
         for peer in self.peers.iter().flatten() {
             writers.push(peer.try_clone()?);

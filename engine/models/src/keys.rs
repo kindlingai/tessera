@@ -36,7 +36,7 @@ pub struct Unresolved {
 impl fmt::Display for Unresolved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for path in &self.missing {
-            writeln!(f, "{path}: no file offers it")?;
+            writeln!(f, "{path}: missing from every file")?;
         }
         for (path, held) in &self.ambiguous {
             writeln!(f, "{path}: differs across {}", held.join(", "))?;

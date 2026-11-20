@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fails on Co-Authored-By trailers that credit an AI tool or bot.
-# A bot has a known name, or an address no person reads.
+# A bot has a known name, or an unread address.
 # Usage: check-coauthors.sh <rev-range>
 #        check-coauthors.sh --message <file>
 set -e

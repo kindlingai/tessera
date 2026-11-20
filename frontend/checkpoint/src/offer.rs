@@ -11,7 +11,7 @@ pub enum Stored {
     F16,
     /// A registered form's bytes, in `Form::pack` layout.
     Form(&'static dyn Form),
-    /// An element type no reader here widens.
+    /// An element type without a widening reader here.
     Other,
 }
 
@@ -72,7 +72,7 @@ pub trait Offer {
     /// Rows `first..first + count` of a packed slice.
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         let _ = rows;
-        Err(Error::DType(format!("{name} is not read by rows")))
+        Err(Error::DType(format!("{name} cannot be read in rows")))
     }
     /// A rank's rows of a packed slice, or the whole.
     fn packed_share(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {

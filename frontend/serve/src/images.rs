@@ -89,7 +89,7 @@ pub(crate) fn generations(slot: &Slot, body: &[u8]) -> Response {
             .as_deref()
             .is_some_and(|f| f != "b64_json")
         {
-            return Err(bad("only `b64_json` is supported", "response_format"));
+            return Err(bad("`b64_json` is the supported format", "response_format"));
         }
         let size = side(r.size.as_deref(), paint.sizes())?;
         let seed = r.seed.unwrap_or_else(fresh);

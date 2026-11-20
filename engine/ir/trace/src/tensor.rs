@@ -37,7 +37,7 @@ impl Tensor {
         self.op(Op::Matmul, &[&table.0])
     }
 
-    /// Each row times `w[.., N, K]`, whose batch axes match.
+    /// Each row times `w[.., N, K]`. Batch axes match.
     pub fn matmul_rows(&self, w: &Tensor) -> Tensor {
         self.op(Op::Matmul, &[w])
     }

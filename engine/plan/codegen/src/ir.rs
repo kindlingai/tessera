@@ -274,7 +274,7 @@ pub enum Stmt {
     },
 }
 
-/// A kernel parameter. Only a callee takes the last two.
+/// A kernel parameter. The last two are for callees.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
     Buffer {

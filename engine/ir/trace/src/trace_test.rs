@@ -9,7 +9,7 @@ struct Block {
     qkv: Linear,
 }
 
-/// Named like a `DimName` variant, which the derive must allow.
+/// Named like a `DimName` variant, a name the derive allows.
 #[derive(Weights)]
 struct Experts {
     #[shape(Hidden)]

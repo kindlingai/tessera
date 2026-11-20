@@ -97,7 +97,7 @@ fn rules_match_cpu() {
         // A new rule needs a graph in `testkit::graphs`.
         for rule in ours() {
             let name = rule.name;
-            assert!(used.contains(&name), "no graph exercises {name}");
+            assert!(used.contains(&name), "{name} is never exercised");
         }
     }
 }
@@ -133,7 +133,7 @@ fn rotations_share_angles() {
 
 #[test]
 fn favoring_stays_local() {
-    // No rule competes with rope, so favoring it changes nothing.
+    // Rope has no competing rule, so favoring it changes nothing.
     let g = rotations();
     let plain = lower(&g, 0, &SIZES, &Device::guess(&host())).unwrap();
     let favored = Device::guess(&host()).favoring("rope");

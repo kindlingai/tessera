@@ -542,7 +542,7 @@ fn module_attention_writes_kept() {
                     }
                     None => runner.insert(sensai_run::open(plan, settings).unwrap()),
                 };
-                // Reversed pages: no row lies where a dense one would.
+                // Reversed pages: every row lies away from its dense place.
                 if let Some(table) = table {
                     let pages = (0..table.len as u32).rev().flat_map(u32::to_le_bytes);
                     r.held_mut()

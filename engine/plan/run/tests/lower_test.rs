@@ -477,7 +477,7 @@ fn uncovered_is_named() {
         Dim::fixed(Vocab, 64),
     ]);
     let [x] = m.entry(EntryKind::Forward, [floats([Seqs, Rows, Vocab])]);
-    // No rule takes a lone center, so the act fails.
+    // Every rule refuses a lone center, so the act fails.
     let g = m.finish([(Role::Logits, &x.center().act(Act::Silu))]);
     let Err(Error::Unsupported(what)) = lower(&g, 0, &SIZES, &Device::guess(&host())) else {
         panic!("a lone center lowered");
@@ -495,7 +495,7 @@ fn unlinked_rules_fail() {
         .filter(|r| r.module.starts_with("sensai_lower::"))
         .collect();
     let Err(Error::Unsupported(what)) = sensai_lower::linked(&own) else {
-        panic!("only this crate's rules passed as linked");
+        panic!("the linked rules were all this crate's");
     };
     assert!(what.to_string().contains("use rules as _;"), "{what}");
 }

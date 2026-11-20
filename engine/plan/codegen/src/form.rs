@@ -126,7 +126,7 @@ pub(crate) use form;
 /// The form that stores `dtype` as is.
 pub fn of(dtype: sensai_graph::DType) -> &'static dyn Load {
     let name = format!("{dtype:?}").to_lowercase();
-    named(&name).unwrap_or_else(|| panic!("no form stores {dtype:?}"))
+    named(&name).unwrap_or_else(|| panic!("unknown storage form for {dtype:?}"))
 }
 
 impl Load for F32 {

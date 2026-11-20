@@ -48,7 +48,7 @@ max_lean = 0.03
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]
 
-# Files with `#` comments. Only the semicolon rule reads these.
+# Files with `#` comments, read by the semicolon rule alone.
 hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]
 
 # Rules that report in the findings and do not fail the run.

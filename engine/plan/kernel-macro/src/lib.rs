@@ -133,7 +133,7 @@ fn tree(f: &mut ItemFn, helper: Option<Tokens>) -> Res {
     let (mut takes, mut binds, mut passes) = (Vec::new(), Vec::new(), Vec::new());
     for (n, arg) in f.sig.inputs.iter_mut().enumerate() {
         let FnArg::Typed(p) = arg else {
-            return Err(Error::new(arg.span(), "a kernel takes no self"));
+            return Err(Error::new(arg.span(), "a kernel cannot take self"));
         };
         let Pat::Ident(ident) = &*p.pat else {
             return Err(Error::new(p.pat.span(), "name each parameter"));

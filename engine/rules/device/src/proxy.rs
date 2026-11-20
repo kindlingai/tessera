@@ -140,7 +140,7 @@ pub enum Error {
     Order { pool: u32, ordinal: u64 },
     #[error("no lane {0}")]
     Lane(u32),
-    #[error("pool {pool}: an event for ordinal {ordinal} no work awaits")]
+    #[error("pool {pool}: an unexpected event for ordinal {ordinal}")]
     Event { pool: u32, ordinal: u64 },
     #[error("bad plan: {0}")]
     Plan(&'static str),

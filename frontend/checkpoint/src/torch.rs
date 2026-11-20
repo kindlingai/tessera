@@ -91,7 +91,7 @@ impl Torch {
         if let Some(order) = read("byteorder", 16)?
             && order != b"little"
         {
-            return Err(bad("only little-endian storages are read"));
+            return Err(bad("big-endian storages are unsupported"));
         }
         let pkl = read("data.pkl", MAX_PICKLE)?.expect("found above");
         let mut found = BTreeMap::new();

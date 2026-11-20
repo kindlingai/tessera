@@ -77,7 +77,7 @@ fn neutral(key: &str, value: &Value) -> Option<bool> {
     Some(value.is_null() || value.as_f64().is_some_and(|v| numbers.contains(&v)))
 }
 
-/// Fields a body names that no route reads.
+/// Fields a body names that every route ignores.
 pub(crate) type Bag = Map<String, Value>;
 
 /// A body that bags the fields it does not read.
@@ -168,7 +168,7 @@ pub(crate) enum ResponseFormat {
 }
 
 impl ResponseFormat {
-    /// The answer's shape. No schema allows any JSON.
+    /// The answer's shape. `None` allows any JSON.
     pub(crate) fn format(self) -> Option<Format> {
         match self {
             ResponseFormat::Text => None,
@@ -261,7 +261,7 @@ pub(crate) enum Content {
 pub(crate) struct Said {
     role: String,
     content: Content,
-    /// Earlier thinking. No template reads it yet.
+    /// Earlier thinking, unused by templates for now.
     #[serde(rename = "reasoning", alias = "reasoning_content")]
     _reasoning: Option<String>,
     #[serde(flatten)]

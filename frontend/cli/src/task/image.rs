@@ -77,7 +77,7 @@ pub fn run(source: Source, args: &[String]) -> Result<(), Stop> {
     options.slots = 1;
     let slot = load(options);
     let image = slot.get().and_then(|m| m.image.as_ref());
-    let image = image.ok_or_else(|| Stop::Failed("the model makes no pictures".into()))?;
+    let image = image.ok_or_else(|| Stop::Failed("the model cannot make pictures".into()))?;
     let sizes = image.sizes();
     let size = square(a.size.unwrap_or(sizes.default), sizes).map_err(Stop::Failed)?;
     let (n, seed) = (a.n.unwrap_or(1), a.seed.unwrap_or_else(fresh));

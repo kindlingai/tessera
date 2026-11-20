@@ -5,7 +5,7 @@
 pub enum Why {
     /// There is no history.
     First,
-    /// No common row may be skipped.
+    /// Every common row must be kept.
     NoLcp,
     /// The common rows end below one grid step.
     Grid,

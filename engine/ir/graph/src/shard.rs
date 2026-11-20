@@ -204,7 +204,7 @@ fn set_of(g: &Graph, mut id: NodeId) -> NodeId {
     id
 }
 
-/// A rank-two weight no earlier split has claimed.
+/// A rank-two weight that earlier splits left unclaimed.
 fn whole_weight(g: &Graph, id: NodeId) -> bool {
     let Op::Weight(w) = g.node(id).op else {
         return false;

@@ -112,7 +112,7 @@ impl Painter {
     /// CLIP's view of `text`, padded with `<|endoftext|>`.
     pub fn encode(&mut self, text: &str) -> Result<Prompt, Error> {
         let mut ids = self.tokenizer.encode_special(text)?;
-        let eos = *ids.last().ok_or("the tokenizer added no end token")?;
+        let eos = *ids.last().ok_or("the tokenizer left out the end token")?;
         if ids.len() > TEXT {
             ids.truncate(TEXT - 1);
             ids.push(eos);

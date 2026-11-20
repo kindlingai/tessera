@@ -26,7 +26,7 @@ pub enum Unsupported {
     Unlinked,
 }
 
-/// A node no rule covers, and the root above it.
+/// An uncovered node, and the root above it.
 #[derive(Debug, thiserror::Error)]
 #[error("{term:?} over {shape:?} from {reads:?}{}", under_text(.under))]
 pub struct Uncovered {

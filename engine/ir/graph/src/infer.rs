@@ -312,7 +312,7 @@ fn valued(q: &TensorType, v: &TensorType) -> TensorType {
     out
 }
 
-/// Positions must lead `x`, which keeps whole pairs.
+/// Positions must lead `x`. Then `x` keeps whole pairs.
 fn rope(dims: &[Dim], x: &TensorType, pos: &TensorType, p: Placement) -> Result<(), TypeError> {
     let width = poly(dims, x.shape.0.last().expect("rank checked"))?;
     let even = width.as_const().is_none_or(|w| w % 2 == 0);

@@ -31,7 +31,7 @@ pub(crate) struct Rtc {
     /// The name its symbols use for compiled code.
     pub(crate) code: &'static str,
     pub(crate) libraries: &'static [&'static str],
-    /// The install hint when no library loads.
+    /// The install hint when every library fails to load.
     pub(crate) install: &'static str,
     pub(crate) error: fn(String) -> Error,
     pub(crate) lib: OnceLock<Result<Fns, String>>,

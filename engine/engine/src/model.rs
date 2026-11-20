@@ -16,7 +16,7 @@ struct Planned {
 /// The graph's runner.
 enum Executor {
     Planned(Box<Planned>),
-    /// The interpreter, for graphs no rule lowers yet.
+    /// The interpreter, for graphs without a lowering rule yet.
     Interpreted(Vec<Tensor>),
 }
 

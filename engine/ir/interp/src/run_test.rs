@@ -90,7 +90,7 @@ fn store_keeps_rows() {
         &step(s, &[(0, 0, 1.), (0, 1, 3.), (1, 0, 10.)]),
         &[1., 2., 10.],
     );
-    // Without a store, no row wrote the earlier positions.
+    // Without a store, the earlier positions stay unwritten.
     let once = run(&g, &[], 0, &feeds(&[(0, 2, 5.)]));
     assert!(matches!(once, Err(Error::Mismatch(m)) if m.contains("position 0")));
     close(&step(s, &[(0, 2, 5.)]), &[3.]);

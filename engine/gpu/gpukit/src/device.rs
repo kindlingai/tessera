@@ -60,7 +60,7 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     /// Pinned host memory: its host and device addresses.
     fn pin(&self, _size: usize) -> Result<(u64, u64), Error> {
-        Err(Self::error("this device pins no host memory".into()))
+        Err(Self::error("this device cannot pin host memory".into()))
     }
 
     fn unpin(&self, _host: u64) {}
@@ -76,12 +76,12 @@ pub trait Device: Clone + Send + Sync + 'static {
         record: impl FnOnce() -> Result<(), E>,
     ) -> Result<Self::Graph, E> {
         let _ = record;
-        Err(Self::error("this device records no graphs".into()).into())
+        Err(Self::error("this device cannot record graphs".into()).into())
     }
 
     /// Runs a captured graph, after copies.
     fn replay(&self, _: &Self::Graph) -> Result<(), Error> {
-        Err(Self::error("this device records no graphs".into()))
+        Err(Self::error("this device cannot record graphs".into()))
     }
 }
 

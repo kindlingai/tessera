@@ -27,9 +27,9 @@ fn room(chip: &dyn Chip, timed: &[(Step, f64)]) {
     let all: f64 = timed.iter().map(|(_, seconds)| seconds).sum();
     for h in headroom(chip, timed) {
         let share = 100.0 * h.seconds / all;
-        let over = h.bound.map_or("no load stated".into(), |b| {
-            format!("{:.1}x", h.seconds / b)
-        });
+        let over = h
+            .bound
+            .map_or("load unknown".into(), |b| format!("{:.1}x", h.seconds / b));
         println!("  {:9} {share:5.1}% of the time  {over}", h.kernel);
     }
 }

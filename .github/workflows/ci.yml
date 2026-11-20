@@ -199,8 +199,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/eg2-text
           key: eg2-text-914f7f89142e33e77833254d9c9b90c3cef7303b
-      # The older single-file cache. simcheck reads it when no shard
-      # folder restores, and saves it as shards.
+      # The older single-file cache. simcheck reads it when the shard
+      # folder fails to restore, and saves it as shards.
       - uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/simcheck.bin
@@ -314,7 +314,7 @@ jobs:
 
   platforms:
     # The platform table against nvcc, cuobjdump and clang's amdgcn
-    # backend, with no GPU needed.
+    # backend, without a GPU.
     needs: changes
     if: needs.changes.outputs.build == 'true'
     # CUDA 13.0 packages target 24.04. Newer glibc breaks nvcc.
@@ -344,7 +344,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Skips come only from `changes`, so it must pass itself. A job
-      # that no hosted runner took counts as skipped, so a runner
+      # left without a hosted runner counts as skipped, so a runner
       # outage does not remove a merge queue entry.
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -356,7 +356,7 @@ jobs:
           for r in $RESULTS; do
             case "$r" in
             success | skipped) ;;
-            # A needed job that no runner took can show as abandoned.
+            # A needed job left without a runner can show as abandoned.
             cancelled | abandoned) cancelled=1 ;;
             *) exit 1 ;;
             esac

@@ -70,8 +70,8 @@ pub(crate) fn lower_upto(
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The graph uses something no rule covers yet.
-    #[error("no rule lowers {0}")]
+    /// The graph uses something without a rule yet.
+    #[error("{0} has no lowering rule")]
     Unsupported(#[from] Unsupported),
     /// A dimension has no size for this launch.
     #[error("{0} has no size in this launch")]

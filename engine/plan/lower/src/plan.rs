@@ -147,7 +147,7 @@ pub struct Plan {
 static IDS: AtomicU64 = AtomicU64::new(1);
 
 impl Plan {
-    /// An id no other plan has had in this process.
+    /// An id unique among plans in this process.
     pub fn fresh() -> u64 {
         IDS.fetch_add(1, Ordering::Relaxed)
     }
