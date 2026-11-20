@@ -89,6 +89,9 @@ const WIDE: u32 = 4;
 /// Pixels a 3x3 kernel reads.
 const TAPS: u32 = 9;
 
+/// Row blocks in one band when `x` outweighs `w`.
+const BAND: u32 = 8;
+
 /// Stages `span` rows of `src` from `r0`, `k0`, zero outside.
 #[kernel]
 fn stage<F: Elems<Elem = f32>>(
@@ -208,12 +211,25 @@ macro_rules! tiled_kernel {
             #[build] simds_n: u32,
             #[build] $threads: u32,
             #[build] $wide: bool,
+            #[build] wbits: u32,
             #[build] form: &'static dyn Stored,
         ) {
             let simd = lid() / LANES as u32;
             let group = gid() / $threads;
-            let $row0 = (group / ((n + bn - 1) / bn)) * $bm;
-            let col0 = (group % ((n + bn - 1) / bn)) * bn;
+            // Down a band, then across: groups share a weight block.
+            let tiles_m = ($m + $bm - 1) / $bm;
+            let mut band = BAND;
+            if n * wbits >= 32 * $m {
+                band = tiles_m;
+            }
+            let per_band = band * ((n + bn - 1) / bn);
+            let first = (group / per_band) * band;
+            let mut height = band;
+            if tiles_m - first < band {
+                height = tiles_m - first;
+            }
+            let $row0 = (first + (group % per_band) % height) * $bm;
+            let col0 = ((group % per_band) / height) * bn;
             let wm0 = (simd / simds_n) * wm;
             let wn0 = (simd % simds_n) * wn;
             let mut $a = shared::<f32>($bm * ($bk + PAD));
@@ -293,9 +309,10 @@ impl Tiled {
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
             let (wm, wn) = (s.simd().0 as u32, s.simd().1 as u32);
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
+            let wbits = weight_bits(form);
             match near {
-                true => tiled_near_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form),
-                false => tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, form),
+                true => tiled_near_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, form),
+                false => tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, form),
             }
         };
         let at = SCHEDULES.iter().position(|s| *s == self.schedule);
@@ -340,18 +357,33 @@ impl Tiled {
     }
 }
 
+/// Bits per weight, rounded down.
+fn weight_bits(form: &dyn Stored) -> u32 {
+    (form.bytes(1024) * 8 / 1024) as u32
+}
+
+/// Row blocks per band. The kernel computes the same count.
+fn band(m: usize, n: usize, bm: usize, form: &dyn Stored) -> usize {
+    let tiles_m = m.div_ceil(bm);
+    match n * weight_bits(form) as usize >= 32 * m {
+        true => tiles_m,
+        false => (BAND as usize).min(tiles_m),
+    }
+}
+
 fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
     let Product { m, n, k, form, .. } = t.product;
     let (mf, nf) = (m as f64, n as f64);
     let (gm, gn) = t.groups();
-    let (_, _, bk) = t.schedule.block;
-    // Neighbouring groups share `x` rows. `w` streams per row.
+    let (bm, _, bk) = t.schedule.block;
+    // `x` stays cached. `w` streams once per band.
     let rows = match t.product.near {
         Some(near) => 4.0 * mf * near.cin as f64,
         None => 4.0 * mf * k as f64,
     };
     let mut reads = vec![rows];
-    reads.extend((0..gm).map(|_| form.bytes(n * k) as f64));
+    let bands = gm.div_ceil(band(m, n, bm, form));
+    reads.extend((0..bands).map(|_| form.bytes(n * k) as f64));
     reads.extend(
         t.product
             .near

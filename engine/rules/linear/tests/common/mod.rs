@@ -24,7 +24,7 @@ pub fn linear(k: u64, n: u64) -> Graph {
 
 /// The same, with stages after the matmul.
 pub fn finished(k: u64, n: u64, finish: Finish) -> Graph {
-    let rows = Dim::bounded(Rows, 256);
+    let rows = Dim::bounded(Rows, 640);
     let m = Model::new(vec![rows, Dim::fixed(Hidden, k), Dim::fixed(Ffn, n)]);
     let w: Layer = tessera_trace::declare(&m);
     let ty = TensorType::new([Rows, Hidden], DType::F32);

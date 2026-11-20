@@ -52,12 +52,12 @@ fn rule_registers() {
 #[test]
 fn tiles_match_cpu() {
     let mut draws = Noise(29);
-    // Sizes off the block, on it, and beyond it.
+    // Sizes off the block, on it, beyond it, over bands.
     let sizes = [
         (1, 3, 4),
         (37, 50, 72),
         (64, 64, 64),
-        (130, 96, 1024),
+        (600, 40, 512),
         (256, 512, 1024),
     ];
     let runs = emulations();

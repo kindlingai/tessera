@@ -1,14 +1,9 @@
 //! RMS norm, a SIMD group per row, summed by shuffles.
 
+use crate::{AHEAD, WIDE, per_lane_row};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
-use tessera_lower::{Kernel, Load, Needs, stage_rule};
-
-/// Elements one wide load brings a lane.
-const WIDE: u32 = 4;
-
-/// Trips unrolled, so a lane keeps several loads in flight.
-const AHEAD: u32 = 4;
+use tessera_lower::{Kernel, Needs, stage_rule};
 
 /// Sums a row's squares, then scales the row.
 #[kernel]
@@ -69,20 +64,13 @@ fn norm_lanes<const WIDE: u32, const AHEAD: u32, const WEIGHTED: bool>(
     needs = Needs::lanes(),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
-    // The row is read twice, the gains once.
-    load = Some(Load {
-        threads: self.rows * LANES,
-        group: 256,
-        trips: (self.width / (LANES * WIDE as usize)) as f64,
-        trip: body.trip(),
-        reads: vec![
-            8.0 * (self.rows * self.width) as f64,
-            4.0 * (self.rows * self.width) as f64 * f64::from(self.weighted),
-        ],
-        written: 4.0 * len as f64,
-        flight: (4 * WIDE * AHEAD) as f64,
-        ..Load::default()
-    }),
+    // The gains are read once.
+    load = Some(per_lane_row(
+        self.rows,
+        self.width,
+        body.trip(),
+        4.0 * (self.rows * self.width) as f64 * f64::from(self.weighted),
+    )),
     unproven,
 )]
 pub(crate) struct LaneNorm {
