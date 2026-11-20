@@ -52,7 +52,13 @@ extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", 
 hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]
 
 # Rules that report in the findings and do not fail the run.
-warn_rules = ["thin-edge", "placement"]
+warn_rules = ["thin-edge", "placement", "type-copy"]
+
+# Types with the same members in two crates that are not one concept.
+allowed_type_copies = [
+    ["tools/findings/src/lib.rs::Snippet", "tools/simcheck/src/windows.rs::Window"],
+    ["engine/settings/src/lib.rs::Pick", "engine/plan/sim/src/zone.rs::ZoneKind"],
+]
 
 # Statements in a function body before a copy elsewhere counts.
 min_repeat_statements = 4

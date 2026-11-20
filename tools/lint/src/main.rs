@@ -7,6 +7,7 @@ mod kernel;
 mod macros;
 mod names;
 mod readme;
+mod repo;
 mod runs;
 mod rust;
 mod share;
@@ -59,6 +60,8 @@ pub struct Limits {
     pub min_repeat_statements: usize,
     pub repeat_exprs: audit::Exprs,
     pub timing_exempt: Vec<String>,
+    #[serde(default)]
+    pub allowed_type_copies: Vec<Vec<String>>,
 }
 
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
@@ -112,6 +115,8 @@ fn main() -> ExitCode {
     macros::check(&dirs, &sources, &mut found);
     files::check_crates(&dirs, &sources, &mut found);
     runs::check(&sources, &mut found);
+    repo::copies::check(&dirs, &sources, &mut found);
+    repo::revisions::check(&root, &sources, &mut found);
     match files::hash_sources(&root) {
         Ok(srcs) => srcs
             .iter()
