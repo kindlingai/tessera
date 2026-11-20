@@ -1596,6 +1596,7 @@ name = "sensai-calibrate"
 version = "0.1.0"
 dependencies = [
  "naga",
+ "sensai-bundle",
  "sensai-codegen",
  "sensai-engine",
  "sensai-frontend-settings",

@@ -2,20 +2,22 @@
 
 use crate::grid::bounded;
 use crate::plans::{feeds, sizes, subjects};
+use sensai_bundle::flux2::transformer;
 use sensai_graph::DimName::{self, Context, Rows, Seqs};
 use sensai_graph::Graph;
-use sensai_lower::{Device, Pins, Plan, Settings, Source, Step, Tensor, View, lower};
+use sensai_lower::{Device, Pins, Plan, Settings, Source, Step, Tensor, View, Weight, lower};
 use sensai_run::{Outcome, Reload, Run, open};
 use sensai_testkit::graphs::{attention, linear};
 use sensai_testkit::{Noise, weights};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: tessera-calibrate watch <dir> \
     gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
-    qwen3 <rows> [<context>] | eg2 <rows> [<context>]";
+    qwen3 <rows> [<context>] | eg2 <rows> [<context>] | \
+    flux2 <model dir> <image rows> [<text rows>]";
 /// Time between checks for changed files.
 const POLL: Duration = Duration::from_millis(20);
 /// Device seconds to spend timing one step.
@@ -23,30 +25,62 @@ const SPEND: f64 = 0.01;
 const MOST: f64 = 64.0;
 /// Seconds of whole runs first, so clocks rise from idle.
 const WARM: Duration = Duration::from_millis(100);
+/// Text rows klein pads every prompt to.
+const TEXT: u64 = 512;
 
 /// A graph at fixed sizes, with its weight forms.
 struct Subject {
     g: Graph,
     sizes: Vec<(DimName, u64)>,
     pins: Pins,
+    /// Weights from a checkpoint. Without them the run makes noise.
+    loads: Option<Vec<Weight>>,
+}
+
+/// Numbers in `args`, or the usage.
+fn numbers(args: &[String]) -> Result<Vec<u64>, Box<dyn Error>> {
+    let mut n = Vec::new();
+    for arg in args {
+        n.push(arg.parse::<u64>().map_err(|_| USAGE)?);
+    }
+    Ok(n)
+}
+
+/// A FLUX.2 transformer from a diffusers directory, with its weights.
+fn flux2(args: &[String]) -> Result<Subject, Box<dyn Error>> {
+    let (dir, rest) = args.split_first().ok_or(USAGE)?;
+    let (rows, text) = match numbers(rest)?.as_slice() {
+        [rows] => (*rows, TEXT),
+        [rows, text] => (*rows, *text),
+        _ => return Err(USAGE.into()),
+    };
+    let t = transformer(Path::new(dir), [1, text, rows]).map_err(|e| e as Box<dyn Error>)?;
+    Ok(Subject {
+        g: t.graph,
+        sizes: vec![(Seqs, 1), (Rows, rows)],
+        pins: t.pins,
+        loads: Some(t.weights),
+    })
 }
 
 fn subject(args: &[String]) -> Result<Subject, Box<dyn Error>> {
-    let mut n = Vec::new();
-    for arg in args.iter().skip(1) {
-        n.push(arg.parse::<u64>().map_err(|_| USAGE)?);
+    if args.first().map(String::as_str) == Some("flux2") {
+        return flux2(&args[1..]);
     }
+    let n = numbers(args.get(1..).unwrap_or_default())?;
     let (default, matmul, attend) = (Pins::default(), [Rows], [Seqs, Rows, Context]);
     Ok(match (args.first().map(String::as_str), n.as_slice()) {
         (Some("gemm"), [m, k, width]) => Subject {
             g: linear(&bounded(&matmul), *k, *width),
             sizes: vec![(Rows, *m)],
             pins: default,
+            loads: None,
         },
         (Some("attend"), [heads, kv, width, queries, keys]) => Subject {
             g: attention(&bounded(&attend), [*heads, *kv, *width]),
             sizes: vec![(Seqs, 1), (Rows, *queries), (Context, *keys)],
             pins: default,
+            loads: None,
         },
         (Some(model), [rows, context @ ..]) if context.len() < 2 => {
             let found = subjects().into_iter().find(|s| s.name == model);
@@ -56,6 +90,7 @@ fn subject(args: &[String]) -> Result<Subject, Box<dyn Error>> {
                 g: s.graph,
                 sizes: sizes(*rows, *context).to_vec(),
                 pins: s.pins,
+                loads: None,
             }
         }
         _ => return Err(USAGE.into()),
@@ -111,12 +146,12 @@ fn rows(plan: &Plan, device: &Device) -> Vec<Row> {
 /// A runner for `plan` with `loads` as its weights.
 fn opened(
     plan: Plan,
-    loads: &[Tensor],
+    loads: &[Weight],
     settings: &Settings,
 ) -> Result<Box<dyn Run>, Box<dyn Error>> {
     let mut runner = open(plan, settings)?;
     for (at, w) in loads.iter().enumerate() {
-        runner.load(at as u32, w.view())?;
+        runner.load_weight(at as u32, w)?;
     }
     Ok(runner)
 }
@@ -268,9 +303,13 @@ impl Watch {
 /// Plans `args`, writes its kernel files, then reruns on change.
 pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>> {
     let (dir, rest) = args.split_first().ok_or(USAGE)?;
-    let s = subject(rest)?;
+    let mut s = subject(rest)?;
     let mut noise = Noise(7);
-    let loads = weights(&s.g, &mut noise);
+    let noisy = |noise: &mut Noise| weights(&s.g, noise).into_iter().map(Weight::Floats);
+    let loads: Vec<Weight> = match s.loads.take() {
+        Some(loads) => loads,
+        None => noisy(&mut noise).collect(),
+    };
     let fed = feeds(&s.g, &s.sizes, &mut noise)?;
     let views: Vec<View> = fed.iter().map(Tensor::view).collect();
     // The reference runs the plan's own kernels.
@@ -293,6 +332,8 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
         ..settings.clone()
     };
     let runner = opened(plan.clone(), &loads, &files)?;
+    // A checkpoint's weights now live on the device.
+    drop(loads);
     for path in runner.dump()? {
         println!("wrote {}", path.display());
     }

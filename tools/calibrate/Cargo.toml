@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 sensai-testkit = { workspace = true }
+sensai-bundle = { workspace = true }
 sensai-codegen = { workspace = true }
 sensai-frontend-settings = { workspace = true }
 sensai-graph = { workspace = true }
