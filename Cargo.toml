@@ -53,6 +53,7 @@ sensai-kernel-macro = { path = "engine/plan/kernel-macro" }
 sensai-kernels = { path = "engine/rules/kernels" }
 sensai-kv = { path = "engine/ir/kv" }
 sensai-cpu = { path = "engine/rules/cpu" }
+sensai-device = { path = "engine/rules/device" }
 sensai-linear = { path = "engine/rules/linear" }
 sensai-attention = { path = "engine/rules/attention" }
 sensai-rules = { path = "engine/rules/rules" }

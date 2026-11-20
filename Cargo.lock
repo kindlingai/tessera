@@ -1656,6 +1656,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sensai-device"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "sensai-dl"
 version = "0.1.0"
 
