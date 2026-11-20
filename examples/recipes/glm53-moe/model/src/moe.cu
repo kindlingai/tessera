@@ -63,17 +63,24 @@ static __device__ inline u32 load(bytes p) {
   return r;
 }
 
+static __device__ inline void load4(bytes p, u32* r) {
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "l"(p));
+}
+
 // Two states' weights as f16. `BOOK`: 0 mcg, 1 mul1.
 template <u32 BOOK>
 static __device__ inline u32 pair(u32 a, u32 b) {
   if (BOOK == 1) {
-    u32 x = a * MUL1, y = b * MUL1;
+    // The f16 values 0x1EEE and 0xC931.
+    const float scale = 1774.0f / 262144.0f, offset = -1329.0f / 128.0f;
+    // The sum lands in the mantissa of 2^23 + 1024.
     u32 sx, sy;
-    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sx) : "r"(x), "r"(0x01010101u), "r"(0u));
-    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sy) : "r"(y), "r"(0x01010101u), "r"(0u));
-    // Exact in f32: one rounding to f16.
-    float scale = half(0x1EEEu), offset = half(0xC931u);
-    return narrowed(halves((float)(1024u + sx) * scale + offset, (float)(1024u + sy) * scale + offset));
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sx) : "r"(a * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sy) : "r"(b * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
+    // The f32 result is exact, so f16 rounds once.
+    const float base = offset - 8388608.0f * scale;
+    return narrowed(halves(fmaf(__uint_as_float(sx), scale, base), fmaf(__uint_as_float(sy), scale, base)));
   }
   u32 x = ((a * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
   u32 y = ((b * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
@@ -83,24 +90,30 @@ static __device__ inline u32 pair(u32 a, u32 b) {
   return narrowed(s);
 }
 
-// A tile into this lane's mma A fragment.
-template <u32 K, u32 BOOK>
-static __device__ inline void decode(u32 w, u32 lane, u32* a) {
-  const u32 words = 8 * K, span = (16 + K - 1) / K, bits = 256 * K;
+// The lanes and bit that hold this lane's first state.
+struct Lane {
+  u32 q0, q1, q2, shift;
+};
+
+template <u32 K>
+static __device__ inline Lane lanes(u32 lane) {
+  const u32 words = 8 * K, span = (16 + K - 1) / K;
   // A state spans `span` codes ending at its position.
   u32 first = ((8 * lane + 257 - span) % 256) * K + span * K - 16;
   u32 q = first / 32;
-  u32 w0 = __shfl_sync(0xFFFFFFFFu, w, q);
-  u32 w1 = __shfl_sync(0xFFFFFFFFu, w, (q + 1) % words);
-  u32 w2 = __shfl_sync(0xFFFFFFFFu, w, (q + 2) % words);
+  Lane l = {q, (q + 1) % words, (q + 2) % words, first % 32};
+  return l;
+}
+
+// A tile's words `t` into this lane's mma A fragment.
+template <u32 K, u32 BOOK>
+static __device__ inline void decode(const u32* t, const Lane& l, u32* a) {
+  u32 w0 = t[l.q0], w1 = t[l.q1], w2 = t[l.q2];
+  // 64 bits from the first state on.
+  u32 hi = funnel(w1, w0, l.shift), lo = funnel(w2, w1, l.shift);
   u32 st[8];
 #pragma unroll
-  for (u32 s = 0; s < 8; s++) {
-    u32 at = ((8 * lane + s + 257 - span) % 256) * K + span * K - 16;
-    u32 rel = (at + bits - 32 * q) % bits;
-    u32 hi = rel >= 32 ? w1 : w0, lo = rel >= 32 ? w2 : w1;
-    st[s] = funnel(lo, hi, rel % 32) >> 16;
-  }
+  for (u32 s = 0; s < 8; s++) st[s] = funnel(lo, hi, K * s) >> 16;
   a[0] = pair<BOOK>(st[0], st[1]);
   a[1] = pair<BOOK>(st[4], st[5]);
   a[2] = pair<BOOK>(st[2], st[3]);
@@ -135,8 +148,32 @@ static __device__ inline bytes tile(const Mat& w, u32 m, u32 i, u32 o) {
   return w.p + (first + t) * (32 * K);
 }
 
-static __device__ inline u32 lane_load(bytes p, u32 lane, u32 words) {
-  return lane < words ? load(p + 4 * lane) : 0u;
+// Eight tiles from input `16 i`, output `128 o`.
+template <u32 K>
+static __device__ inline void fetch(const Mat& w, u32 m, u32 i, u32 o, u32 lane, bool wide, u32* r) {
+  // The eight tiles lie in a row on both sides.
+  bytes p = tile<K>(w, m, i, 8 * o);
+  if (wide) {
+    load4(p + 16 * lane, r);
+    if (K > 2 && lane < 16 * K - 32) load4(p + 512 + 16 * lane, r + 4);
+    return;
+  }
+#pragma unroll
+  for (u32 mt = 0; mt < 8; mt++) r[mt] = lane < 8 * K ? load(p + 4 * (mt * 8 * K + lane)) : 0u;
+}
+
+// Stores the fetched words in the warp's tile words `s`.
+template <u32 K>
+static __device__ inline void put(const u32* r, u32 lane, bool wide, u32* s) {
+  if (wide) {
+    ((uint4*)s)[lane] = make_uint4(r[0], r[1], r[2], r[3]);
+    if (K > 2 && lane < 16 * K - 32) ((uint4*)s)[32 + lane] = make_uint4(r[4], r[5], r[6], r[7]);
+    return;
+  }
+#pragma unroll
+  for (u32 mt = 0; mt < 8; mt++) {
+    if (lane < 8 * K) s[mt * 8 * K + lane] = r[mt];
+  }
 }
 
 // Walsh-Hadamard transform of `n` runs of 128, one warp.
@@ -244,9 +281,12 @@ extern "C" __global__ void glm53_route(const float* x, const float* router, floa
 }
 
 // Shared memory of one expert block.
-struct Space {
-  float buf[WARPS][2][ROWS][128];
+struct __align__(16) Space {
+  float buf[WARPS][ROWS][128];
+  u32 words[WARPS][256];
   float vec[3][ROWS][128];
+  u32 rows[ROWS];
+  u64 at[ROWS];
 };
 
 // What one expert block computes.
@@ -254,74 +294,75 @@ struct Job {
   bytes gate, up, down;
   u32 m, c, n, hidden;
   const float *gate_su, *up_su, *gate_sv, *up_sv, *down_su, *signs;
-  u32 rows[ROWS];
-  u64 at[ROWS];
 };
 
 // Inner chunk `c` of one expert, then its down part.
 template <u32 K, u32 BOOK>
 static __device__ void expert(const Job& j, const float* x, float* partial, Space& sp) {
-  float(*buf)[2][ROWS][128] = sp.buf;
   float(*vec)[ROWS][128] = sp.vec;
-  const u32 words = 8 * K;
   u32 warp = threadIdx.x / 32, lane = threadIdx.x % 32, n = j.n, c = j.c;
-  Mat G = matrix(j.gate), U = matrix(j.up), D = matrix(j.down);
-  float acc[2][8][4];
+  Lane l = lanes<K>(lane);
+  Mat D = matrix(j.down);
+  // Even warps take the gate, odd warps the up.
+  u32 h = warp % 2;
+  Mat W = matrix(h ? j.up : j.gate);
+  const float* su = h ? j.up_su : j.gate_su;
+  float* b = &sp.buf[warp][0][0];
+  float acc[8][4];
 #pragma unroll
-  for (u32 h = 0; h < 2; h++)
-#pragma unroll
-    for (u32 mt = 0; mt < 8; mt++) acc[h][mt][0] = acc[h][mt][1] = acc[h][mt][2] = acc[h][mt][3] = 0.0f;
-  for (u32 q = warp; q < G.inp / 128; q += WARPS) {
-    float* bg = &buf[warp][0][0][0];
-    float* bu = &buf[warp][1][0][0];
-    for (u32 r = 0; r < n; r++) {
-      const float* row = x + (u64)j.rows[r] * j.hidden + q * 128;
-      for (u32 i = lane; i < 128; i += 32) {
-        u32 at = q * 128 + i;
-        float v = row[i] * (j.signs ? j.signs[at] : 1.0f) * TURNED;
-        bg[r * 128 + i] = v * j.gate_su[at];
-        bu[r * 128 + i] = v * j.up_su[at];
+  for (u32 mt = 0; mt < 8; mt++) acc[mt][0] = acc[mt][1] = acc[mt][2] = acc[mt][3] = 0.0f;
+  u32* held = sp.words[warp];
+  // 16 byte loads need 16 byte aligned tiles.
+  bool wide = ((u64)W.p & 15) == 0 && ((u64)D.p & 15) == 0;
+  // Each step loads the next step's eight tiles first.
+  u32 steps = (W.inp / 128 - warp / 2 + WARPS / 2 - 1) / (WARPS / 2) * 8;
+  u32 got[8];
+  fetch<K>(W, j.m, 8 * (warp / 2), c, lane, wide, got);
+  for (u32 t = 0; t < steps; t++) {
+    u32 q = warp / 2 + (t / 8) * (WARPS / 2), ks = t % 8;
+    if (ks == 0) {
+      __syncwarp();
+      for (u32 r = 0; r < n; r++) {
+        const float* row = x + (u64)sp.rows[r] * j.hidden + q * 128;
+        for (u32 i = lane; i < 128; i += 32) {
+          u32 at = q * 128 + i;
+          b[r * 128 + i] = row[i] * (j.signs ? j.signs[at] : 1.0f) * TURNED * su[at];
+        }
       }
+      __syncwarp();
+      turn_warp(b, n);
     }
     __syncwarp();
-    turn_warp(bg, n);
-    turn_warp(bu, n);
-    for (u32 ks = 0; ks < 8; ks++) {
-      u32 fg[2], fu[2], wg[8], wu[8];
-      fragment(bg, n, ks, lane, fg);
-      fragment(bu, n, ks, lane, fu);
-#pragma unroll
-      for (u32 mt = 0; mt < 8; mt++) {
-        wg[mt] = lane_load(tile<K>(G, j.m, q * 8 + ks, c * 8 + mt), lane, words);
-        wu[mt] = lane_load(tile<K>(U, j.m, q * 8 + ks, c * 8 + mt), lane, words);
-      }
-#pragma unroll
-      for (u32 mt = 0; mt < 8; mt++) {
-        u32 a[4];
-        decode<K, BOOK>(wg[mt], lane, a);
-        mma(acc[0][mt], a, fg);
-        decode<K, BOOK>(wu[mt], lane, a);
-        mma(acc[1][mt], a, fu);
-      }
-    }
+    put<K>(got, lane, wide, held);
     __syncwarp();
+    if (t + 1 < steps) {
+      u32 qn = warp / 2 + ((t + 1) / 8) * (WARPS / 2);
+      fetch<K>(W, j.m, 8 * qn + (t + 1) % 8, c, lane, wide, got);
+    }
+    u32 f[2];
+    fragment(b, n, ks, lane, f);
+#pragma unroll
+    for (u32 mt = 0; mt < 8; mt++) {
+      u32 a[4];
+      decode<K, BOOK>(held + mt * 8 * K, l, a);
+      mma(acc[mt], a, f);
+    }
   }
-  __syncthreads();
-  // Each warp's sums, then their total, in `vec`.
+  __syncwarp();
+  // Each warp's sums, then their totals, in `vec`.
   u32 r = lane % 4, g = lane / 4;
   if (r < n) {
 #pragma unroll
-    for (u32 h = 0; h < 2; h++)
-#pragma unroll
-      for (u32 mt = 0; mt < 8; mt++) {
-        buf[warp][h][r][mt * 16 + g] = acc[h][mt][0] + acc[h][mt][1];
-        buf[warp][h][r][mt * 16 + g + 8] = acc[h][mt][2] + acc[h][mt][3];
-      }
+    for (u32 mt = 0; mt < 8; mt++) {
+      b[r * 128 + mt * 16 + g] = acc[mt][0] + acc[mt][1];
+      b[r * 128 + mt * 16 + g + 8] = acc[mt][2] + acc[mt][3];
+    }
   }
   __syncthreads();
   for (u32 i = threadIdx.x; i < 2 * ROWS * 128; i += blockDim.x) {
+    u32 side = i / (ROWS * 128), at = i % (ROWS * 128);
     float s = 0.0f;
-    for (u32 w = 0; w < WARPS; w++) s += (&buf[w][0][0][0])[i];
+    for (u32 w = side; w < WARPS; w += 2) s += (&sp.buf[w][0][0])[at];
     (&vec[0][0][0])[i] = s;
   }
   __syncthreads();
@@ -334,26 +375,29 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
   }
   __syncthreads();
   turn_block(&vec[2][0][0], ROWS);
-  u32 fd[8][2];
+  u32 blocks = (D.out / 128 - warp + WARPS - 1) / WARPS * 8;
+  float out[8][4];
+  fetch<K>(D, j.m, 8 * c, warp, lane, wide, got);
+  for (u32 t = 0; t < blocks; t++) {
+    u32 ob = warp + (t / 8) * WARPS, ks = t % 8;
+    if (ks == 0) {
 #pragma unroll
-  for (u32 ks = 0; ks < 8; ks++) fragment(&vec[2][0][0], n, ks, lane, fd[ks]);
-  for (u32 ob = warp; ob < D.out / 128; ob += WARPS) {
-    float out[8][4];
-#pragma unroll
-    for (u32 mt = 0; mt < 8; mt++) out[mt][0] = out[mt][1] = out[mt][2] = out[mt][3] = 0.0f;
-    for (u32 ks = 0; ks < 8; ks++) {
-      u32 w[8];
-#pragma unroll
-      for (u32 mt = 0; mt < 8; mt++) w[mt] = lane_load(tile<K>(D, j.m, c * 8 + ks, ob * 8 + mt), lane, words);
-#pragma unroll
-      for (u32 mt = 0; mt < 8; mt++) {
-        u32 a[4];
-        decode<K, BOOK>(w[mt], lane, a);
-        mma(out[mt], a, fd[ks]);
-      }
+      for (u32 mt = 0; mt < 8; mt++) out[mt][0] = out[mt][1] = out[mt][2] = out[mt][3] = 0.0f;
     }
-    if (r < n) {
-      float* to = partial + j.at[r] + ob * 128;
+    __syncwarp();
+    put<K>(got, lane, wide, held);
+    __syncwarp();
+    if (t + 1 < blocks) fetch<K>(D, j.m, 8 * c + (t + 1) % 8, warp + ((t + 1) / 8) * WARPS, lane, wide, got);
+    u32 f[2];
+    fragment(&vec[2][0][0], n, ks, lane, f);
+#pragma unroll
+    for (u32 mt = 0; mt < 8; mt++) {
+      u32 a[4];
+      decode<K, BOOK>(held + mt * 8 * K, l, a);
+      mma(out[mt], a, f);
+    }
+    if (ks == 7 && r < n) {
+      float* to = partial + sp.at[r] + ob * 128;
 #pragma unroll
       for (u32 mt = 0; mt < 8; mt++) {
         to[mt * 16 + g] = out[mt][0] + out[mt][1];
@@ -371,7 +415,7 @@ static __device__ void expert_k(u32 k, const Job& j, const float* x, float* part
 }
 
 // Writes `partial[row][pick][chunk][hidden]`. Pick `picks` is shared.
-extern "C" __global__ void glm53_experts(
+extern "C" __global__ __launch_bounds__(256, 3) void glm53_experts(
     const float* x, const float* scores, const float* bias, const float* signs_in,
     const float* gate_su, bytes gate, const float* gate_sv,
     const float* up_su, bytes up, const float* up_sv,
@@ -432,34 +476,38 @@ extern "C" __global__ void glm53_experts(
     j.down_su = shared_down_su;
     j.signs = 0;
     for (u32 r = 0; r < n; r++) {
-      j.rows[j.n] = base + r;
-      j.at[j.n++] = (((u64)(base + r) * (picks + 1) + picks) * chunks + c) * hidden;
+      if (threadIdx.x == 0) {
+        sp.rows[j.n] = base + r;
+        sp.at[j.n] = (((u64)(base + r) * (picks + 1) + picks) * chunks + c) * hidden;
+      }
+      j.n++;
     }
-    if (shared_book) {
-      expert_k<1>(shared_k, j, x, partial, sp);
-    } else {
-      expert_k<0>(shared_k, j, x, partial, sp);
+    k = shared_k;
+    book = shared_book;
+  } else {
+    if (e == experts) return;
+    j.gate = gate;
+    j.up = up;
+    j.down = down;
+    j.m = e - first;
+    j.gate_su = gate_su + (u64)e * hidden;
+    j.up_su = up_su + (u64)e * hidden;
+    j.gate_sv = gate_sv + (u64)e * ffn;
+    j.up_sv = up_sv + (u64)e * ffn;
+    j.down_su = down_su + (u64)e * ffn;
+    j.signs = signs_in;
+    for (u32 r = 0; r < n; r++) {
+      for (u32 p = 0; p < picks; p++) {
+        if (ids[r][p] != e) continue;
+        if (threadIdx.x == 0) {
+          sp.rows[j.n] = base + r;
+          sp.at[j.n] = (((u64)(base + r) * (picks + 1) + p) * chunks + c) * hidden;
+        }
+        j.n++;
+      }
     }
-    return;
   }
-  if (e == experts) return;
-  j.gate = gate;
-  j.up = up;
-  j.down = down;
-  j.m = e - first;
-  j.gate_su = gate_su + (u64)e * hidden;
-  j.up_su = up_su + (u64)e * hidden;
-  j.gate_sv = gate_sv + (u64)e * ffn;
-  j.up_sv = up_sv + (u64)e * ffn;
-  j.down_su = down_su + (u64)e * ffn;
-  j.signs = signs_in;
-  for (u32 r = 0; r < n; r++) {
-    for (u32 p = 0; p < picks; p++) {
-      if (ids[r][p] != e) continue;
-      j.rows[j.n] = base + r;
-      j.at[j.n++] = (((u64)(base + r) * (picks + 1) + p) * chunks + c) * hidden;
-    }
-  }
+  __syncthreads();
   if (book) {
     expert_k<1>(k, j, x, partial, sp);
   } else {
