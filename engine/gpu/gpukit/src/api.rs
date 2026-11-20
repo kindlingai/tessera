@@ -9,6 +9,7 @@ use std::thread::LocalKey;
 use crate::backend::Backend;
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
+use crate::gate::Gate;
 use crate::launch::{KernelArgs, Launch};
 use crate::{Error, Platform};
 
@@ -208,6 +209,8 @@ struct Inner<A: Api> {
     exclusive: Mutex<()>,
     /// Events recorded since the last read, as addresses.
     stamps: Mutex<Vec<usize>>,
+    /// Made on first use.
+    gate: Mutex<Option<Gate<A>>>,
 }
 
 // The driver is thread-safe. Calls set the device first.
@@ -217,6 +220,11 @@ unsafe impl<A: Api> Sync for Inner<A> {}
 impl<A: Api> Drop for Inner<A> {
     fn drop(&mut self) {
         // Modules must unload before their context goes.
+        if let Ok(mut gate) = self.gate.lock()
+            && self.api.set_current(&self.own, self.device).is_ok()
+        {
+            gate.take();
+        }
         if let Ok(mut modules) = self.modules.lock() {
             modules.clear();
         }
@@ -234,6 +242,7 @@ impl<A: Api> Context<A> {
             modules: Mutex::new(HashMap::new()),
             exclusive: Mutex::new(()),
             stamps: Mutex::new(Vec::new()),
+            gate: Mutex::new(None),
         }))
     }
 
@@ -300,6 +309,25 @@ impl<A: Api> Context<A> {
             ms
         })?;
         Ok(gaps.into_iter().map(|ms| ms as f64 / 1e3).collect())
+    }
+
+    /// Holds the default stream until `release`.
+    pub fn gate(&self) -> Result<(), Error> {
+        let mut gate = self.0.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let _hold = self.hold();
+        self.set_current()?;
+        if gate.is_none() {
+            *gate = Some(Gate::new(self)?);
+        }
+        gate.as_ref().map_or(Ok(()), Gate::close)
+    }
+
+    /// Lets the default stream run past the gate.
+    pub fn release(&self) {
+        let gate = self.0.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gate) = gate.as_ref() {
+            gate.open();
+        }
     }
 
     /// Runs `record` and keeps its launches as one graph.
@@ -433,7 +461,7 @@ impl<A: Api> Drop for Module<A> {
 pub struct Kernel<A: Api> {
     /// Holding it keeps the module loaded.
     _module: Arc<Module<A>>,
-    raw: Handle,
+    pub(crate) raw: Handle,
     name: String,
 }
 
@@ -520,6 +548,14 @@ impl<A: Api> Device for Context<A> {
 
     fn stamps(&self) -> Result<Vec<f64>, Error> {
         Context::stamps(self)
+    }
+
+    fn gate(&self) -> Result<bool, Error> {
+        Context::gate(self).map(|_| true)
+    }
+
+    fn release(&self) {
+        Context::release(self);
     }
 
     fn programmatic(&self, on: bool) {

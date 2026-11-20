@@ -45,6 +45,14 @@ pub trait Device: Clone + Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Holds queued work until `release`. False where it cannot.
+    fn gate(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Ends a `gate`.
+    fn release(&self) {}
+
     /// The bytes at `ptr`, when the host addresses them.
     fn mapped(&self, _ptr: u64, _size: usize) -> Option<NonNull<u8>> {
         None

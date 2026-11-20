@@ -108,6 +108,10 @@ pub trait Run {
     }
     /// Runs these steps in order and waits for them.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error>;
+    /// Runs these steps as `submit` does, timed by the device.
+    fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
+        self.submit(steps).map(|_| None)
+    }
     /// Whether `launch_fixed` runs here.
     fn fixed(&self) -> bool {
         false

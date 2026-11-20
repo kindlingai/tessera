@@ -11,6 +11,7 @@ use sensai_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use sensai_graph::DimName;
 use sensai_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
 use sensai_mem::Buffer;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Instant;
@@ -27,7 +28,12 @@ pub(crate) struct Runner<D: Device> {
     overlaps: bool,
     /// Which steps' kernels wait on the one before them.
     waits: Vec<bool>,
+    /// Launches left before a closed gate opens. Zero when open.
+    gated: Cell<usize>,
 }
+
+/// Launches a closed gate holds, under any driver queue.
+const HELD: usize = 256;
 
 /// The kernel text a backend compiles.
 fn dialect(backend: Backend) -> Dialect {
@@ -50,6 +56,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             // Asked once: asking may launch, and captures come later.
             overlaps: ctx.platform().limits.pdl,
             waits: Vec::new(),
+            gated: Cell::new(0),
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -101,17 +108,36 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     /// Passes each argument by position, then enqueues.
     fn launch(&self, step: usize, launch: &Call) -> Result<(), Error> {
+        let left = self.gated.get();
+        if left == 1 {
+            self.ctx.release();
+        }
+        self.gated.set(left.saturating_sub(1));
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
         self.ctx.programmatic(overlap);
         let mut args = self.bound(&launch.args)?;
         self.fire(&self.kernels[step], launch.shape, &mut args)
     }
 
-    /// Times each step by device stamps, else by waiting.
-    fn profiled(&mut self, steps: Range<usize>) -> Result<(), Error> {
+    /// Holds the device queue for the next launches, if able.
+    fn close(&self) -> Result<(), Error> {
+        let held = self.ctx.gate()?;
+        self.gated.set(if held { HELD } else { 0 });
+        Ok(())
+    }
+
+    /// Lets held launches run.
+    fn open(&self) {
+        if self.gated.replace(0) > 0 {
+            self.ctx.release();
+        }
+    }
+
+    /// Each step's seconds by waiting, or `None` when stamped.
+    fn walk(&self, steps: Range<usize>) -> Result<Option<Vec<f64>>, Error> {
         let stamped = self.ctx.stamp()?;
         let mut waited = Vec::new();
-        for i in steps.clone() {
+        for i in steps {
             let start = Instant::now();
             for launch in self.base.launches(i)? {
                 self.launch(i, &launch)?;
@@ -124,15 +150,73 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 }
             }
         }
-        let seconds = match stamped {
-            true => self.ctx.stamps()?,
-            false => waited,
-        };
-        for (i, s) in steps.zip(seconds) {
+        Ok((!stamped).then_some(waited))
+    }
+
+    /// Opens the gate, then reads stamps. Errors discard stamps.
+    fn opened<T>(&self, done: Result<T, Error>) -> Result<(T, Vec<f64>), Error> {
+        self.open();
+        match done {
+            Ok(done) => Ok((done, self.ctx.stamps()?)),
+            Err(e) => {
+                _ = self.ctx.stamps();
+                Err(e)
+            }
+        }
+    }
+
+    /// Times each step by device stamps, else by waiting.
+    fn profiled(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.close()?;
+        let walked = self.walk(steps.clone());
+        let (waited, stamps) = self.opened(walked)?;
+        for (i, s) in steps.zip(waited.unwrap_or(stamps)) {
             let name = self.base.plan.steps[i].kernel.name();
             self.note(name, s);
         }
         Ok(())
+    }
+
+    /// Runs `work`, then waits. Returns the device's seconds, if kept.
+    fn waited(
+        &self,
+        timed: bool,
+        work: impl FnOnce(&Self) -> Result<(), Error>,
+    ) -> Result<Option<f64>, Error> {
+        if !timed {
+            work(self)?;
+            return Ok(self.ctx.finish()?);
+        }
+        self.close()?;
+        let stamped = self.ctx.stamp().map_err(Error::from).and_then(|stamped| {
+            work(self)?;
+            if stamped {
+                self.ctx.stamp()?;
+            }
+            Ok(stamped)
+        });
+        match self.opened(stamped)? {
+            (true, stamps) => Ok(stamps.first().copied()),
+            (false, _) => Ok(self.ctx.finish()?),
+        }
+    }
+
+    /// Launches every step, as a recorded graph when whole.
+    fn run(&mut self, steps: Range<usize>, timed: bool) -> Result<Option<f64>, Error> {
+        let whole = self.launching.graphs
+            && self.ctx.graphs()
+            && self.base.plan.id != 0
+            && steps == (0..self.base.plan.steps.len());
+        if !whole {
+            return self.waited(timed, |r| r.launch_all(steps));
+        }
+        let mut key: Vec<(DimName, u32)> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
+        key.sort_unstable();
+        if !self.graphs.contains_key(&key) {
+            let graph = self.ctx.capture(|| self.launch_all(steps.clone()))?;
+            self.graphs.insert(key.clone(), graph);
+        }
+        self.waited(timed, |r| Ok(r.ctx.replay(&r.graphs[&key])?))
     }
 
     /// Every launch of `steps`, in order.
@@ -235,12 +319,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.ctx.finish()?;
         let start = Instant::now();
         let launches = self.base.launches(step)?;
-        for _ in 0..times {
-            for launch in &launches {
-                self.launch(step, launch)?;
+        let clocked = self.waited(true, |r| {
+            for _ in 0..times {
+                for launch in &launches {
+                    r.launch(step, launch)?;
+                }
             }
-        }
-        let clocked = self.ctx.finish()?;
+            Ok(())
+        })?;
         let seconds = clocked.unwrap_or_else(|| start.elapsed().as_secs_f64());
         Ok(seconds / times as f64)
     }
@@ -261,28 +347,17 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         })
     }
 
-    /// Launches every step, as a recorded graph when whole.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         if self.base.profile.is_some() {
             return self.profiled(steps);
         }
-        let whole = self.launching.graphs
-            && self.ctx.graphs()
-            && self.base.plan.id != 0
-            && steps == (0..self.base.plan.steps.len());
-        if !whole {
-            self.launch_all(steps)?;
-            self.ctx.finish()?;
-            return Ok(());
+        self.run(steps, false).map(|_| ())
+    }
+
+    fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
+        if self.base.profile.is_some() {
+            return self.profiled(steps).map(|_| None);
         }
-        let mut key: Vec<(DimName, u32)> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
-        key.sort_unstable();
-        if !self.graphs.contains_key(&key) {
-            let graph = self.ctx.capture(|| self.launch_all(steps.clone()))?;
-            self.graphs.insert(key.clone(), graph);
-        }
-        self.ctx.replay(&self.graphs[&key])?;
-        self.ctx.finish()?;
-        Ok(())
+        self.run(steps, true)
     }
 }

@@ -72,8 +72,8 @@ fn timed(g: &Graph, sizes: &[(DimName, u64)], settings: &Settings) -> Result<f64
     let (mut best, mut spent) = (f64::INFINITY, 0.0);
     for _ in 0..MOST {
         let start = Instant::now();
-        runner.submit(steps.clone())?;
-        let seconds = start.elapsed().as_secs_f64();
+        let clocked = runner.clocked(steps.clone())?;
+        let seconds = clocked.unwrap_or_else(|| start.elapsed().as_secs_f64());
         best = best.min(seconds);
         spent += seconds;
         if spent > BUDGET {
