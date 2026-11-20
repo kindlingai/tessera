@@ -4,8 +4,8 @@ use crate::far::Lean;
 use crate::pairs::Hit;
 use crate::windows::Window;
 use anyhow::Result;
-use tessera_findings::{Finding, Level, Report, Rule, Snippet};
 use std::path::Path;
+use tessera_findings::{Finding, Level, Report, Rule, Snippet};
 
 const ALLOW: &str = "tools/simcheck/allow.toml";
 

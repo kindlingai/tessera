@@ -2,8 +2,8 @@ use crate::far::Lean;
 use crate::pairs::Hit;
 use crate::report::report;
 use crate::windows::cut;
-use tessera_findings::Level;
 use std::path::Path;
+use tessera_findings::Level;
 
 #[test]
 fn report_lists_each_kind() {
