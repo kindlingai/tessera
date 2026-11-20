@@ -5,6 +5,9 @@ tessera is an engine to build engines.
 In tessera, you define the shape of your model in code, and the engine makes an optimized engine for your
 hardware, automatically.
 
+If the automatic optimizer isn't good enough, you can write GPU-native code that makes use of the platform
+services to squeeze all of the performance out the hardware.
+
 ## State
 
 tessera is not alpha or beta. It's an experiment right now and no numbers are available.
@@ -18,8 +21,9 @@ tessera is not alpha or beta. It's an experiment right now and no numbers are av
 
 ## Supported Models
 
+ - GLM 5.3
  - Qwen 0.6B
- - Embedding Gemma 2
+ - EmbeddingGemma 2
  - spaCy
 
 ## Crates
