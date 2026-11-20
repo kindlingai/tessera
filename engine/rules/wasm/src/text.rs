@@ -2,7 +2,7 @@
 
 use crate::abi::{Offer, Shape};
 use sensai_lower::kept::Layout;
-use sensai_lower::{Arg, Kernel, Launch, Needs, Source, Step};
+use sensai_lower::{Arg, Dialect, Kernel, Launch, Needs, Source, Step};
 use std::fmt;
 
 /// A module kernel's text, never freed.
@@ -108,7 +108,16 @@ impl Kernel for Text {
         true
     }
 
+    /// A module may bring text for one dialect only.
     fn needs(&self) -> Needs {
-        Needs::text()
+        let lacks = match (self.fixed.metal.is_empty(), self.fixed.cuda.is_empty()) {
+            (true, false) => Some(Dialect::Metal),
+            (false, true) => Some(Dialect::Cuda),
+            _ => None,
+        };
+        Needs {
+            lacks,
+            ..Needs::text()
+        }
     }
 }

@@ -6,7 +6,7 @@ use crate::plan::{Plan, Step};
 use crate::recipe::Recipe;
 use crate::rule::{Rule, rules_with};
 use sensai_codegen::kept::Layout;
-use sensai_engine_settings::{Pick, Settings};
+use sensai_engine_settings::{Backend, Pick, Settings};
 use sensai_graph::Parts;
 use sensai_platform::{Limits, Platform};
 use sensai_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, known};
@@ -129,12 +129,25 @@ impl Default for Device {
     }
 }
 
+/// The name a runner's platform gives `backend`.
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Metal => "metal",
+        Backend::Cuda => "cuda",
+        Backend::Rocm => "rocm",
+    }
+}
+
 impl Device {
     /// The device `open` picks under `settings`, before any samples.
     pub fn guess(settings: &Settings) -> Self {
         let platform = match settings.gpu() {
             None => Platform::host(Limits::host(settings.host_lanes)),
-            Some(_) => Platform::assumed(Limits::assumed()),
+            // The backend name picks which kernel texts fit.
+            Some(b) => Platform {
+                backend: backend_name(b).into(),
+                ..Platform::assumed(Limits::assumed())
+            },
         };
         // Native kernels run where the zone is a CPU.
         let cluster = match settings.backend {
