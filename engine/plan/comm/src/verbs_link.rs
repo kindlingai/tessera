@@ -41,10 +41,22 @@ impl VerbsLink {
         if !matches!(fabric, Fabric::Mesh(_)) {
             return Err(Error::Fit("one-sided puts need a mesh fabric".into()));
         }
+        if regions.contains(&0) {
+            return Err(Error::Fit("a region of 0 bytes".into()));
+        }
         let pin = pinning.as_ref();
         let made: Result<Vec<Region>, Error> =
             regions.iter().map(|&n| Region::new(n, pin)).collect();
         let engine = Engine::connect(rank, ranks, fabric, 0, made?, boot)?;
+        // Every peer must describe the same regions on every lane.
+        let alike = |p: &crate::fabric::Peer| {
+            let lanes = p.channels.iter().flatten();
+            p.regions.len() == regions.len()
+                && lanes.clone().all(|l| l.rkeys.len() == regions.len())
+        };
+        if let Some(r) = engine.peers.iter().position(|p| !alike(p)) {
+            return Err(Error::Fit(format!("rank {r} describes other regions")));
+        }
         Ok(VerbsLink {
             rank,
             ranks,
@@ -119,6 +131,8 @@ impl Link for VerbsLink {
             return Err(Error::Fit(format!("{put:?} has spans that differ")));
         }
         fits(&self.sizes, put.from, 1)?;
+        let length = u32::try_from(put.from.len);
+        let length = length.map_err(|_| Error::Fit(format!("a {}-byte put", put.from.len)))?;
         let (into, data_key) = self.remote(put.to, put.into, 1)?;
         let (flag, flag_key) = self.remote(put.to, put.flag, 8)?;
         let port = self.lane(put.to)?.port;
@@ -126,7 +140,7 @@ impl Link for VerbsLink {
         let from = self.engine.regions[put.from.region].at(put.from.at) as u64;
         let mut data = Sge {
             addr: from,
-            length: put.from.len as u32,
+            length,
             lkey,
         };
         let [ordinal, count] = put.words;
@@ -175,7 +189,8 @@ impl Link for VerbsLink {
         let lib = self.engine.lib;
         for opened in &self.engine.opened {
             let n = unsafe { lib.poll_cq(opened.cq, &mut wc) };
-            for c in wc.iter().take(n.max(0) as usize) {
+            let n = usize::try_from(n).map_err(|_| Error::Link(format!("poll_cq: {n}")))?;
+            for c in wc.iter().take(n) {
                 if c.status != ibv::WC_SUCCESS {
                     return Err(Error::Link(format!("completion: {}", lib.status(c.status))));
                 }
