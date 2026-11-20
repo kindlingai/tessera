@@ -2,12 +2,15 @@
 
 mod flatten;
 pub mod layout;
+pub mod proxy;
 mod scan;
 
 #[cfg(test)]
 mod flatten_test;
 #[cfg(test)]
 mod layout_test;
+#[cfg(test)]
+mod proxy_test;
 #[cfg(test)]
 mod scan_test;
 
