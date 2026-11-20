@@ -20,15 +20,18 @@ fn tables_per_folder() {
     assert_eq!(keys, ["", "a/", "a/x/"]);
     let rows = [
         "<table>",
-        "<tr><th>Crate</th><th>Description</th></tr>",
-        "<tr><td>&emsp;<a href=\"a/two\">two</a></td><td>two &lt;text&gt;</td></tr>",
-        "<tr><td colspan=\"2\">&emsp;<a href=\"a/x\"><b>x/</b></a></td></tr>",
-        "<tr><td>&emsp;&emsp;<a href=\"a/x/one\">one</a></td><td>one &lt;text&gt;</td></tr>",
-        "<tr><td>&emsp;<a href=\"a/x-y\">dash</a></td><td>dash &lt;text&gt;</td></tr>",
+        "<tr><th>Folder</th><th>Crate</th><th>Description</th></tr>",
+        "<tr><td>&emsp;<a href=\"a/two\">two/</a></td><td>two</td><td>two &lt;text&gt;</td></tr>",
+        "<tr><td colspan=\"3\">&emsp;<a href=\"a/x\"><b>x/</b></a></td></tr>",
+        "<tr><td>&emsp;&emsp;<a href=\"a/x/one\">one/</a></td><td>one</td><td>one &lt;text&gt;</td></tr>",
+        "<tr><td>&emsp;<a href=\"a/x-y\">x-y/</a></td><td>dash</td><td>dash &lt;text&gt;</td></tr>",
         "</table>",
     ];
     let root = table("", &f[""]);
-    assert!(root.starts_with("<table>\n<tr><th>Crate</th><th>Description</th></tr>\n<tr><td colspan=\"2\"><a href=\"a\"><b>a/</b></a></td></tr>\n"));
+    let head = rows[..2].join("\n");
+    assert!(root.starts_with(&format!(
+        "{head}\n<tr><td colspan=\"3\"><a href=\"a\"><b>a/</b></a></td></tr>\n"
+    )));
     assert!(root.ends_with(&(rows[2..].join("\n") + "\n")));
 }
 

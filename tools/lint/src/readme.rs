@@ -60,12 +60,15 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The table's opening and header row.
+const HEAD: &str = "<table>\n<tr><th>Folder</th><th>Crate</th><th>Description</th></tr>\n";
+
 /// One indent step per folder level.
 fn indent(depth: usize) -> String {
     "&emsp;".repeat(depth)
 }
 
-/// `folder`'s crates as a tree. Folder rows span both columns.
+/// `folder`'s crates as a folder tree, then name and description.
 pub fn table(folder: &str, crates: &[&Crate]) -> String {
     let mut sorted: Vec<(Vec<&str>, &Crate)> = Vec::new();
     for c in crates {
@@ -73,7 +76,7 @@ pub fn table(folder: &str, crates: &[&Crate]) -> String {
         sorted.push((rel.split('/').collect(), c));
     }
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = String::from("<table>\n<tr><th>Crate</th><th>Description</th></tr>\n");
+    let mut out = String::from(HEAD);
     let mut open: Vec<&str> = Vec::new();
     for (parts, c) in &sorted {
         let (dirs, _) = parts.split_at(parts.len() - 1);
@@ -84,13 +87,13 @@ pub fn table(folder: &str, crates: &[&Crate]) -> String {
             let link = open.join("/");
             let pad = indent(depth);
             out.push_str(&format!(
-                "<tr><td colspan=\"2\">{pad}<a href=\"{link}\"><b>{name}/</b></a></td></tr>\n"
+                "<tr><td colspan=\"3\">{pad}<a href=\"{link}\"><b>{name}/</b></a></td></tr>\n"
             ));
         }
         let (link, pad, desc) = (parts.join("/"), indent(dirs.len()), escape(&c.description));
+        let (dir, name) = (parts[parts.len() - 1], escape(&c.name));
         out.push_str(&format!(
-            "<tr><td>{pad}<a href=\"{link}\">{}</a></td><td>{desc}</td></tr>\n",
-            escape(&c.name)
+            "<tr><td>{pad}<a href=\"{link}\">{dir}/</a></td><td>{name}</td><td>{desc}</td></tr>\n"
         ));
     }
     out.push_str("</table>\n");
