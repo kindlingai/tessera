@@ -1,10 +1,12 @@
 //! CLIP's text tower: learned positions, causal pre-norm blocks.
 
+use crate::keys::Keys;
 use crate::shared::{Attend, Dense, Stack, tokens};
 use sensai_trace::DimName::*;
 use sensai_trace::{
     Act, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Tensor, Vector, Weights,
 };
+use serde_json::json;
 
 pub struct Config {
     /// Its context bound is also the position table's length.
@@ -13,11 +15,36 @@ pub struct Config {
 }
 
 impl Config {
-    /// openai/clip-vit-base-patch32, cut to `context` tokens.
-    pub fn base(max_seqs: u64, context: u64) -> Self {
+    /// The text tower `k` describes, cut to `context` tokens.
+    pub fn read(k: &mut Keys, max_seqs: u64, context: u64) -> Self {
+        let mut text = |key: &str| -> u64 { k.need(&[&format!("text_config.{key}"), key]) };
+        let [vocab, hidden, layers, heads, ffn, positions] = [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "intermediate_size",
+            "max_position_embeddings",
+        ]
+        .map(&mut text);
+        if heads == 0 || !hidden.is_multiple_of(heads) {
+            k.misfit(
+                "text_config.num_attention_heads",
+                "heads must split hidden_size",
+            );
+        }
+        if context > positions {
+            let why = format!("{context} tokens exceed the {positions} positions");
+            k.misfit("text_config.max_position_embeddings", why);
+        }
+        for path in ["text_config.hidden_act", "hidden_act"] {
+            k.fixed(path, json!("quick_gelu"));
+        }
+        let head_dim = hidden.checked_div(heads).unwrap_or(0);
+        let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
-            stack: Stack::sized([49_408, 512, 12, 8, 64, 2048], max_seqs, context),
-            eps: 1e-5,
+            stack: Stack::sized(sizes, max_seqs, context),
+            eps: k.need(&["text_config.layer_norm_eps", "layer_norm_eps"]),
         }
     }
 
