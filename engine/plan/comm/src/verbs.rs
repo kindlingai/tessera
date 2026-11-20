@@ -52,6 +52,10 @@ impl Region {
         })
     }
 
+    pub(crate) fn device(&self) -> Option<u64> {
+        (self.device != 0).then_some(self.device)
+    }
+
     pub(crate) fn at(&self, offset: usize) -> *mut u8 {
         unsafe { self.base.add(offset) }
     }

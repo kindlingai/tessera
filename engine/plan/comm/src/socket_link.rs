@@ -235,9 +235,9 @@ impl Link for SocketLink {
         Ok(())
     }
 
-    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+    fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
         let words = self.regions.get(region)?;
-        Some((words.as_ptr() as *mut u8, self.sizes[region]))
+        Some((words.as_ptr() as *mut u8, None, self.sizes[region]))
     }
 
     fn load(&self, at: Span) -> Result<u64, Error> {

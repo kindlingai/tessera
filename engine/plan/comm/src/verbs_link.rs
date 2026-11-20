@@ -451,9 +451,10 @@ impl Link for VerbsLink {
         Ok(())
     }
 
-    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+    fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
         let size = *self.sizes.get(region)?;
-        Some((self.engine.regions[region].base, size))
+        let region = &self.engine.regions[region];
+        Some((region.base, region.device(), size))
     }
 
     fn load(&self, at: Span) -> Result<u64, Error> {

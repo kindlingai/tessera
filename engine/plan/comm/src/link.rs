@@ -41,8 +41,8 @@ pub trait Link: Send {
     fn poll(&mut self, done: &mut Vec<u64>) -> Result<(), Error>;
     /// Drops or finishes all work in flight.
     fn reset(&mut self) -> Result<(), Error>;
-    /// This rank's region as host memory, if fixed.
-    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+    /// This rank's region if fixed: host, device if pinned, length.
+    fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
         let _ = region;
         None
     }

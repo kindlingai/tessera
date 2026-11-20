@@ -146,10 +146,10 @@ impl Link for ShmLink {
         Ok(())
     }
 
-    fn memory(&self, region: usize) -> Option<(*mut u8, usize)> {
+    fn memory(&self, region: usize) -> Option<(*mut u8, Option<u64>, usize)> {
         let size = *self.sizes.get(region)?;
         let at = self.at(self.rank, Span::new(region, 0, size), 1).ok()?;
-        Some((at, size))
+        Some((at, None, size))
     }
 
     fn load(&self, at: Span) -> Result<u64, Error> {
