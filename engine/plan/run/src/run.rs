@@ -155,6 +155,10 @@ pub trait Run {
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
         self.submit(steps).map(|_| None)
     }
+    /// The slot's device address, where buffers have one.
+    fn address(&self, _slot: Slot) -> Option<u64> {
+        None
+    }
     /// Whether `launch_fixed` runs here.
     fn fixed(&self) -> bool {
         false

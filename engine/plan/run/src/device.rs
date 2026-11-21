@@ -460,6 +460,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.graphs.clear();
     }
 
+    fn address(&self, slot: Slot) -> Option<u64> {
+        Some(self.buffer(slot).device_ptr() + slot.at(0) as u64)
+    }
+
     /// Hand-written kernels are CUDA text.
     fn fixed(&self) -> bool {
         dialect(D::BACKEND) == Dialect::Cuda

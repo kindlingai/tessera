@@ -1856,6 +1856,7 @@ version = "0.1.0"
 dependencies = [
  "tessera-engine-comm",
  "tessera-gpukit",
+ "tessera-run",
  "tessera-testkit",
  "thiserror",
 ]
@@ -1870,6 +1871,7 @@ version = "0.1.0"
 dependencies = [
  "scattered-collect",
  "serde",
+ "tessera-device",
  "tessera-engine-comm",
  "tessera-engine-settings",
  "tessera-graph",

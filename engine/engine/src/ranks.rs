@@ -4,13 +4,15 @@ use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::Transport;
 use tessera_graph::{Graph, Parts, shard};
 use tessera_lower::{Cluster, Device, Recipe, Settings, ZoneKind};
-use tessera_run::{Rank, Run};
+use tessera_run::{Rank, Run, Sum};
 
 /// A rank's zones and each rank's share of split weights.
 pub struct Place {
     pub cluster: Cluster,
     pub parts: Parts,
     rank: u32,
+    /// A persistent grid for the sums, if any.
+    grid: Option<Box<dyn Sum>>,
 }
 
 impl Place {
@@ -21,7 +23,14 @@ impl Place {
             cluster,
             parts,
             rank,
+            grid: None,
         }
+    }
+
+    /// Runs the sums through `grid`.
+    pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
+        self.grid = grid;
+        self
     }
 
     /// A zone per rank, all linked. No `parts`: even shares.
@@ -61,7 +70,11 @@ impl Engine {
         control: Box<dyn Transport>,
     ) -> Result<Self, Error> {
         place.rank = sums.rank();
-        let run = |plan| Ok(Box::new(Rank::open(plan, settings, sums)?) as Box<dyn Run>);
+        let grid = place.grid.take();
+        let run = |plan| {
+            let rank = Rank::open(plan, settings, sums)?.with_grid(grid);
+            Ok(Box::new(rank) as Box<dyn Run>)
+        };
         let mut engine = Self::placed(graph, context, recipe, settings, Some(&place), run)?;
         engine.control = Some(control);
         Ok(engine)

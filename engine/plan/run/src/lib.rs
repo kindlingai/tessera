@@ -23,7 +23,7 @@ pub mod testing;
 pub use held::Held;
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Region, Spent};
-pub use rank::Rank;
+pub use rank::{Rank, Sum};
 pub use run::{Base, Outcome, Reload, Run};
 
 /// A failure while loading or running a plan.
@@ -54,6 +54,10 @@ pub enum Error {
         rank: u32,
         ranks: u32,
     },
+    #[error("sums: {0}")]
+    Sums(Box<dyn std::error::Error + Send + Sync>),
+    #[error("step {0} has no device address")]
+    Unaddressed(usize),
     #[error("a sum of {0} floats does not fit the device")]
     SumTooLong(usize),
     #[error("a plan over several zones")]

@@ -13,7 +13,8 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tessera_engine::Settings;
-use tessera_engine::comm::{Error, Fabric, Reduce, Shm, Sockets, Transport, Verbs};
+use tessera_engine::comm::{Error, Fabric, Reduce, Shm, Sockets, Transport, Verbs, VerbsLink};
+use tessera_engine::sums::{self, Sum};
 
 /// How long a rank waits for the others.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -69,6 +70,24 @@ pub fn join(
         roce::describe(fabric)
     );
     Ok([Box::new(verbs), met])
+}
+
+/// A persistent grid that sums over `fabric`, met through `met`.
+pub fn grid(
+    met: &mut dyn Transport,
+    fabric: &Fabric,
+    settings: &Settings,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    let (rank, ranks) = (met.rank(), met.ranks());
+    let regions = sums::regions(ranks);
+    let pinning = tessera_engine::pinning(settings);
+    let relay = sums::RELAY;
+    let link = VerbsLink::connect(rank, ranks, fabric, &regions, relay, met, pinning)?;
+    eprintln!(
+        "rank {rank}: sums in a persistent grid over {}",
+        roce::describe(fabric)
+    );
+    Ok(sums::open(settings.gpu(), link)?)
 }
 
 /// Joins rank `rank` of `addrs` on `listener`. Lower ranks call.

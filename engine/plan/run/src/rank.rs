@@ -12,12 +12,20 @@ use tessera_gpukit::Platform;
 use tessera_lower::{Arg, Launching, Plan, Shape, Step};
 use tessera_mem::{DType, Tensor};
 
+/// A sum across ranks between two device addresses.
+pub trait Sum {
+    /// Sums `len` floats at `from` into `to`. Waits for it.
+    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), Error>;
+}
+
 /// One rank: its runner and its way to the others.
 pub struct Rank<T: Transport> {
     runner: Box<dyn Run>,
     transport: T,
     /// The device's rounds, when it runs them itself.
     reduce: Option<Reduce>,
+    /// A persistent grid that runs the sums, if given.
+    grid: Option<Box<dyn Sum>>,
 }
 
 impl<T: Transport> Rank<T> {
@@ -42,12 +50,27 @@ impl<T: Transport> Rank<T> {
             runner,
             transport,
             reduce,
+            grid: None,
         })
+    }
+
+    /// Runs the sums through `grid` from now on.
+    pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
+        self.grid = grid;
+        self
     }
 
     /// Whether sums run on the device.
     pub fn on_device(&self) -> bool {
-        self.reduce.is_some()
+        self.reduce.is_some() || self.grid.is_some()
+    }
+
+    /// One sum through the persistent grid.
+    fn grid_sum(&mut self, i: usize, step: &Step) -> Result<(), Error> {
+        let at = |slot| self.runner.address(slot).ok_or(Error::Unaddressed(i));
+        let (from, to) = (at(step.reads[0])?, at(step.write)?);
+        let grid = self.grid.as_mut().expect("a grid");
+        grid.sum(from, to, step.write.len)
     }
 
     /// One sum on the device: copy, publish, wait and add.
@@ -119,9 +142,10 @@ impl<T: Transport> Run for Rank<T> {
             self.runner.submit(from..i)?;
             from = i + 1;
             let start = Instant::now();
-            match self.reduce {
-                Some(_) => self.reduce(&step)?,
-                None => self.exchange(&step)?,
+            match (&self.grid, &self.reduce) {
+                (Some(_), _) => self.grid_sum(i, &step)?,
+                (None, Some(_)) => self.reduce(&step)?,
+                (None, None) => self.exchange(&step)?,
             }
             self.note("all_reduce", start.elapsed().as_secs_f64());
         }
@@ -130,6 +154,10 @@ impl<T: Transport> Run for Rank<T> {
 
     fn fixed(&self) -> bool {
         self.runner.fixed()
+    }
+
+    fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {
+        self.runner.address(slot)
     }
 
     fn launch_fixed(
