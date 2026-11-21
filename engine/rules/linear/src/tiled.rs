@@ -238,7 +238,8 @@ fn fetch_rows(
         let i = lid() + j * threads;
         let r = i / (bk / WIDE);
         let c = (i % (bk / WIDE)) * WIDE;
-        let mut v = F32x4::zero();
+        // Past the block it reads 0. `zero()` leaves it unset.
+        let mut v = F32x4::new(0.0, 0.0, 0.0, 0.0);
         if r0 + r < limit && k0 + c < k {
             v = src.load4((r0 + r) as u64 * k as u64 + (k0 + c) as u64);
         }

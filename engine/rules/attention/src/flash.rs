@@ -29,6 +29,12 @@ const PAD: u32 = 4;
 /// Columns one group stages and owns at a time.
 const CW: u32 = 128;
 
+/// Floats one wide load brings.
+const WIDE: u32 = 4;
+
+/// Floats a thread holds while staging, at most.
+const HELD: usize = (BK * CW / THREADS) as usize;
+
 /// The widest head: four column slices.
 const WIDEST: usize = 512;
 
@@ -134,18 +140,35 @@ fn stage_kv<const TRANSPOSED: bool>(
     #[build] cw: u32,
     #[build] w: u32,
 ) {
-    for i in (lid()..BK * cw).by(THREADS) {
-        let t = i / cw;
-        let d = i % cw;
-        let v = if k0 + t < count {
-            src[((at + t) * hd.kv_heads + hd.kvh) as u64 * w as u64 + (d0 + d) as u64]
-        } else {
-            0.0
-        };
-        if TRANSPOSED {
-            st.kv_s[d * (BK + PAD) + t] = v;
-        } else {
-            st.kv_s[t * (cw + PAD) + d] = v;
+    // All loads, then all stores: the loads fly together.
+    let mut held = [0.0f32; HELD];
+    for j in 0..(BK * (cw / WIDE) + THREADS - 1) / THREADS {
+        let i = lid() + j * THREADS;
+        let t = i / (cw / WIDE);
+        let d = (i % (cw / WIDE)) * WIDE;
+        // Past `count` it reads 0. `zero()` leaves it unset.
+        let mut v = F32x4::new(0.0, 0.0, 0.0, 0.0);
+        if i < BK * (cw / WIDE) && k0 + t < count {
+            v = src.load4(((at + t) * hd.kv_heads + hd.kvh) as u64 * w as u64 + (d0 + d) as u64);
+        }
+        held[(4 * j) as usize] = v.x;
+        held[(4 * j + 1) as usize] = v.y;
+        held[(4 * j + 2) as usize] = v.z;
+        held[(4 * j + 3) as usize] = v.w;
+    }
+    for j in 0..(BK * (cw / WIDE) + THREADS - 1) / THREADS {
+        let i = lid() + j * THREADS;
+        let t = i / (cw / WIDE);
+        let d = (i % (cw / WIDE)) * WIDE;
+        if i < BK * (cw / WIDE) {
+            for e in 0..WIDE {
+                let v = held[(4 * j + e) as usize];
+                if TRANSPOSED {
+                    st.kv_s[(d + e) * (BK + PAD) + t] = v;
+                } else {
+                    st.kv_s[t * (cw + PAD) + d + e] = v;
+                }
+            }
         }
     }
 }
