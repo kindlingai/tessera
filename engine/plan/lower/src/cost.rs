@@ -83,8 +83,8 @@ fn sample(step: &Step, seconds: f64) -> Sample {
     Sample::new(kernel, source, sizes, work, seconds)
 }
 
-/// Seconds by zone kind, kernel name, sizes and work.
-type Memo = HashMap<(ZoneKind, &'static str, Vec<usize>, u64), f64>;
+/// Seconds by zone kind, kernel name, sizes, work and coldness.
+type Memo = HashMap<(ZoneKind, &'static str, Vec<usize>, u64, bool), f64>;
 
 /// Each generation is handed out once per process.
 static GENERATIONS: AtomicU64 = AtomicU64::new(1);
@@ -307,34 +307,45 @@ impl Device {
         self.favor.as_deref() == Some(rule)
     }
 
-    /// Seconds for one launch in `zone`, from its own samples.
-    pub fn seconds_in(&self, zone: u32, k: &dyn Kernel, len: usize) -> f64 {
+    /// Seconds for one launch in `zone`. Cold ones stream weights.
+    pub fn seconds_in(&self, zone: u32, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
         match (zone, self.cluster.kind(zone as usize)) {
-            (0, _) => self.seconds(k, len),
-            (_, ZoneKind::Cpu) => self.estimate(ZoneKind::Cpu, k, len),
+            (0, kind) | (_, kind @ ZoneKind::Cpu) => self.estimate(kind, k, len, cold),
             _ => FIXED + k.guess() * k.work(len),
         }
     }
 
-    /// Estimated seconds for one launch writing `len` elements.
+    /// Estimated seconds for one warm launch writing `len` elements.
     pub fn seconds(&self, k: &dyn Kernel, len: usize) -> f64 {
-        self.estimate(self.cluster.kind(0), k, len)
+        self.seconds_in(0, k, len, false)
+    }
+
+    /// Bytes the last cache holds between launches, if known.
+    pub fn cache(&self) -> Option<f64> {
+        let constants = self.model.as_ref()?.constants();
+        let cache = constants.iter().find(|(name, _)| *name == "cache");
+        cache.map(|(_, c)| c.value)
+    }
+
+    /// Whether `weights` bytes are too many for the cache.
+    pub fn streams(&self, weights: usize) -> bool {
+        self.cache().is_some_and(|cache| weights as f64 > cache)
     }
 
     /// Seconds from the samples of zones of `kind`.
-    fn estimate(&self, kind: ZoneKind, k: &dyn Kernel, len: usize) -> f64 {
+    fn estimate(&self, kind: ZoneKind, k: &dyn Kernel, len: usize, cold: bool) -> f64 {
         if self.barred.iter().any(|b| b == k.name()) {
             return f64::INFINITY;
         }
         let work = k.work(len);
-        let key = (kind, k.name(), k.sizes(), work.to_bits());
+        let key = (kind, k.name(), k.sizes(), work.to_bits(), cold);
         if let Some(seconds) = self.memo.borrow().get(&key) {
             return *seconds;
         }
         // A host zone beside a GPU has its own samples.
         let own = kind == self.cluster.kind(0);
         let timed = if own { &self.timed } else { &self.host };
-        let near = timed.estimate(k.name(), &key.2, work);
+        let near = timed.estimate(k.name(), &key.2, work, cold);
         // With no sample of this kernel, the chip model speaks.
         let chip = self.model.as_ref().filter(|_| own);
         let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
@@ -348,19 +359,24 @@ impl Device {
         Some(self.model.as_ref()?.bound(&k.load(len)?))
     }
 
+    /// Seconds for one step of `plan`, if its zones link.
+    pub fn step_seconds(&self, plan: &Plan, step: &Step) -> Option<f64> {
+        // A read in another zone makes the step a move.
+        let from = step.reads.first().map(|r| plan.zone(r.buffer));
+        let cold = plan.reads_weight(step) && self.streams(plan.weight_bytes());
+        match from.filter(|z| *z != step.zone) {
+            Some(from) => self.transfer(from, step.zone, step.write.bytes()),
+            None if step.kernel.name() == "all_reduce" => self.all_reduce(step.write.bytes()),
+            None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len, cold)),
+        }
+    }
+
     /// The plan's estimated use of each resource.
     pub fn cost(&self, plan: &Plan) -> Cost {
         let mut total = Cost::default();
         for step in &plan.steps {
             let moved: usize = step.reads.iter().map(|r| r.bytes()).sum();
-            // A read in another zone makes the step a move.
-            let from = step.reads.first().map(|r| plan.zone(r.buffer));
-            total.seconds += match from.filter(|z| *z != step.zone) {
-                Some(from) => self.transfer(from, step.zone, step.write.bytes()),
-                None if step.kernel.name() == "all_reduce" => self.all_reduce(step.write.bytes()),
-                None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len)),
-            }
-            .unwrap_or(f64::INFINITY);
+            total.seconds += self.step_seconds(plan, step).unwrap_or(f64::INFINITY);
             total.bytes += (moved + step.write.bytes()) as u64;
             total.launches += step.launches().len();
         }

@@ -221,7 +221,7 @@ fn rows(plan: &Plan, device: &Device) -> Vec<Row> {
         let (kernel, len) = (&*step.kernel, step.write.len);
         let row = &mut rows[at];
         row.steps.push(i);
-        row.planned += device.seconds(kernel, len);
+        row.planned += device.step_seconds(plan, step).unwrap_or(0.0);
         row.bound = row.bound.zip(device.bound(kernel, len)).map(|(a, b)| a + b);
     }
     rows
