@@ -108,6 +108,8 @@ helpers! {
     tiles_scale(P, P, P, F32);
     tiles_each(P, P, P, I8, P, P, P) -> I8;
     tiles_block(P, P, P, P, P, P, P, P, P, P, P, P, P, P);
+    tiles_hold(P, P, P, P, P, P, P);
+    tiles_block_held(P, P, P, P, P, P, P, P, P, P);
 }
 
 fn helper(name: &str) -> &'static Helper {

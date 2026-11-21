@@ -1,6 +1,6 @@
 //! Runs a body on the host, each group in lockstep.
 
-use crate::lockstep::{Slabs, bf16_pair};
+use crate::lockstep::{Slabs, bf16_pair, leaders};
 use std::collections::HashMap;
 use tessera_codegen::form::Load;
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
@@ -538,6 +538,30 @@ impl Group<'_, '_> {
                 let blocks = vec![vec![0.0f32; rows * cols]; simds];
                 self.tiles.insert(name.clone(), (*rows, *cols, blocks));
             }
+            Stmt::TileHeld { name, rows, depth } => {
+                let simds = n.div_ceil(self.lanes);
+                let slabs = vec![vec![0.0f32; rows * depth]; simds];
+                self.tiles.insert(name.clone(), (*rows, *depth, slabs));
+            }
+            Stmt::TileHold {
+                held,
+                a,
+                a_at,
+                stride,
+            } => {
+                let Expr::Var(a) = a else {
+                    panic!("a slab holds group memory by name");
+                };
+                let (a_at, stride) = (self.eval(a_at, mask), self.eval(stride, mask));
+                let (rows, depth, _) = self.tiles[held];
+                for (s, t) in leaders(self.lanes, n, mask) {
+                    let (at, stride) = (a_at[t].u() as usize, stride[t].u() as usize);
+                    let from: Vec<f32> = (0..rows * depth)
+                        .map(|i| self.shared[a][at + i / depth * stride + i % depth].f())
+                        .collect();
+                    self.tiles.get_mut(held).expect("held slab").2[s] = from;
+                }
+            }
             Stmt::TileZero { acc } => {
                 for block in &mut self.tiles.get_mut(acc).expect("tile sums").2 {
                     block.fill(0.0);
@@ -583,14 +607,7 @@ impl Group<'_, '_> {
                     self.eval(stride, mask),
                     self.eval(apart, mask),
                 );
-                let simds = n.div_ceil(self.lanes);
-                for s in 0..simds {
-                    // Any live lane of the SIMD group names its slabs.
-                    let Some(t) =
-                        (s * self.lanes..((s + 1) * self.lanes).min(n)).find(|t| mask[*t])
-                    else {
-                        continue;
-                    };
+                for (s, t) in leaders(self.lanes, n, mask) {
                     let at = Slabs {
                         a: a_at[t].u() as usize,
                         b: b_at[t].u() as usize,
@@ -598,11 +615,24 @@ impl Group<'_, '_> {
                         parts: *parts,
                         apart: apart[t].u() as usize,
                     };
-                    let (sa, sb) = (&self.shared[a], &self.shared[b]);
                     let mut block =
                         std::mem::take(&mut self.tiles.get_mut(acc).expect("tile sums").2[s]);
-                    let (ra, rb) = (|i: usize| sa[i].bits(), |i: usize| sb[i].bits());
-                    at.products(self.precision, rows, cols, *depth, ra, rb, &mut block);
+                    let sb = &self.shared[b];
+                    let rb = |i: usize| sb[i].bits();
+                    match self.tiles.get(a) {
+                        // A held slab: row `i / stride`, column `i % stride`.
+                        Some((_, held, slabs)) => {
+                            let (slab, at) = (&slabs[s], Slabs { a: 0, ..at });
+                            let ra =
+                                |i: usize| slab[i / at.stride * held + i % at.stride].to_bits();
+                            at.products(self.precision, rows, cols, *depth, ra, rb, &mut block);
+                        }
+                        None => {
+                            let sa = &self.shared[a];
+                            let ra = |i: usize| sa[i].bits();
+                            at.products(self.precision, rows, cols, *depth, ra, rb, &mut block);
+                        }
+                    }
                     self.tiles.get_mut(acc).expect("tile sums").2[s] = block;
                 }
             }

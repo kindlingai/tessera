@@ -75,13 +75,16 @@ fn flash_matches_cpu() {
             ];
             let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
             let mut device = Device::guess(settings).favoring("flash");
-            // Each key block in turn. The runner names the platform.
-            for (way, other) in [("flash", "flash_k32"), ("flash_k32", "flash")] {
-                let plan = lower(&g, 0, &sizes, &device.clone().without(other)).unwrap();
+            // Each way in turn. The runner names the platform.
+            let ways = ["flash", "flash_k32", "flash_held", "flash_k32_held"];
+            for way in ways {
+                let others = ways.into_iter().filter(|o| *o != way);
+                let barred = others.fold(device.clone(), |d, o| d.without(o));
+                let plan = lower(&g, 0, &sizes, &barred).unwrap();
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
                 let label = format!("{mask:?} {seqs}x{rows}x{keys} at {width}, {way}");
-                // Where 32 keys do not fit, 16 keys stay.
-                if names[1] != way && way == "flash_k32" {
+                // A way that does not fit leaves the first.
+                if names[1] != way && way != ways[0] {
                     continue;
                 }
                 assert_eq!(names, ["map", way], "{label}");

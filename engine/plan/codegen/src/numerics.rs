@@ -294,6 +294,8 @@ impl Walk<'_> {
             | Stmt::Return
             | Stmt::Barrier
             | Stmt::TileAcc { .. }
+            | Stmt::TileHeld { .. }
+            | Stmt::TileHold { .. }
             | Stmt::TileZero { .. } => {}
         }
         Some(())

@@ -226,7 +226,8 @@ fn declares(stmts: &[Stmt], out: &mut Vec<String>) {
             Stmt::Let { name, .. }
             | Stmt::Array { name, .. }
             | Stmt::Shared { name, .. }
-            | Stmt::TileAcc { name, .. } => out.push(name.clone()),
+            | Stmt::TileAcc { name, .. }
+            | Stmt::TileHeld { name, .. } => out.push(name.clone()),
             Stmt::For { var, body, .. } => {
                 out.push(var.clone());
                 declares(body, out);
@@ -342,6 +343,22 @@ impl Rename<'_> {
                 name: self.name(name),
                 rows: *rows,
                 cols: *cols,
+            },
+            Stmt::TileHeld { name, rows, depth } => Stmt::TileHeld {
+                name: self.name(name),
+                rows: *rows,
+                depth: *depth,
+            },
+            Stmt::TileHold {
+                held,
+                a,
+                a_at,
+                stride,
+            } => Stmt::TileHold {
+                held: self.name(held),
+                a: self.expr(a),
+                a_at: self.expr(a_at),
+                stride: self.expr(stride),
             },
             Stmt::TileBlock {
                 acc,
