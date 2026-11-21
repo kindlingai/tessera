@@ -9,7 +9,7 @@ mod shard;
 mod step;
 
 pub use golden::{Case, Check, Compare, Golden, LOGITS, Reference, Tolerance, golden};
-pub use golden::{pulled, turn, unit};
+pub use golden::{pulled, tensor, turn, unit};
 pub use gpu::gpu;
 pub use shard::{pair, shards, step_ranks};
 pub use step::steps;

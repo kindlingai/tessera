@@ -1,13 +1,14 @@
 //! Qwen3.5 pieces against tiny random Hugging Face modules.
 
 mod attention_test;
+mod checkpoint_test;
 mod deltanet_test;
 mod model_test;
 
 use std::path::{Path, PathBuf};
 use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
-use tessera_lower::{Device, lower};
+use tessera_lower::{Device, Pins, lower};
 use tessera_models::Stack;
 use tessera_models::qwen35::{Config, Mixing, Recurrent, program};
 use tessera_parity::{Spec, loaded, suite};
@@ -100,6 +101,17 @@ fn floats(dir: &Path, name: &str, shape: Vec<usize>) -> Tensor {
     Tensor::f32(shape, read(dir, name))
 }
 
+/// `tokens.u32` in `dir`, `[SEQS, LEN]`.
+fn tokens(dir: &Path) -> Tensor {
+    let bytes = std::fs::read(dir.join("tokens.u32")).unwrap();
+    let ids = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b));
+    Tensor::u32(vec![SEQS, LEN], ids.collect())
+}
+
 /// Each sequence's positions, from zero.
 fn positions() -> Tensor {
     let at = (0..SEQS * LEN).map(|i| (i % LEN) as u32).collect();
@@ -121,15 +133,20 @@ fn weights(g: &Graph, dir: &Path) -> Vec<Tensor> {
 
 /// `g` on the interpreter and each backend, against `want`.
 fn check(g: &Graph, dir: &Path, inputs: &[Tensor], want: &str) {
-    let weights = weights(g, dir);
-    let want = &read(dir, want)[..];
-    let got = run(g, &weights, 0, inputs).unwrap().remove(0);
+    let want = read(dir, want);
+    matches(g, &weights(g, dir), &Pins::default(), inputs, &want);
+}
+
+/// `g` with `weights` in their `pins` forms, against `want`.
+fn matches(g: &Graph, weights: &[Tensor], pins: &Pins, inputs: &[Tensor], want: &[f32]) {
+    let got = run(g, weights, 0, inputs).unwrap().remove(0);
     let off = max_abs_diff(got.floats().unwrap(), want);
     assert!(off < 1e-5, "interpreter: off by {off:e}");
     let sizes = [(Seqs, SEQS as u64), (Context, LEN as u64)];
     for settings in runs() {
-        let plan = lower(g, 0, &sizes, &Device::guess(&settings)).unwrap();
-        let mut runner = loaded(plan, g, &weights, &settings);
+        let device = Device::guess(&settings).pinned(pins.clone());
+        let plan = lower(g, 0, &sizes, &device).unwrap();
+        let mut runner = loaded(plan, g, weights, &settings);
         let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
         let got = runner.run(&views).unwrap().remove(0);
         let off = max_abs_diff(got.floats().unwrap(), want);

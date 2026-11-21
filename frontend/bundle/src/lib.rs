@@ -12,6 +12,7 @@ pub mod names;
 #[cfg(test)]
 mod names_test;
 pub mod parts;
+pub mod qwen35;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -136,6 +137,15 @@ impl Overrides {
         let config = build(&mut keys);
         keys.finish()?;
         Ok(config)
+    }
+
+    /// The config `build` reads from `dir/config.json`, as `read`.
+    pub fn config<T>(
+        &self,
+        dir: &Path,
+        build: impl FnOnce(&mut Keys) -> T,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+        self.read("config.json", Some(&dir.join("config.json")), build)
     }
 }
 
@@ -297,8 +307,7 @@ pub(crate) fn config(
     [slots, context]: [u64; 2],
     overrides: &Overrides,
 ) -> Result<(String, Config), Box<dyn Error + Send + Sync>> {
-    let path = dir.join("config.json");
-    overrides.read("config.json", Some(&path), |k| {
+    overrides.config(dir, |k| {
         (k.need(&["model_type"]), Config::read(k, slots, context))
     })
 }
