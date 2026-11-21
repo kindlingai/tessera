@@ -14,10 +14,11 @@ pub enum Row {
     Relu,
     Softplus,
     Exp,
+    Tanh,
 }
 
 impl Row {
-    const ALL: [Row; 9] = [
+    const ALL: [Row; 10] = [
         Row::Add,
         Row::Mul,
         Row::Scale,
@@ -27,6 +28,7 @@ impl Row {
         Row::Relu,
         Row::Softplus,
         Row::Exp,
+        Row::Tanh,
     ];
 
     pub fn code(self) -> u32 {
@@ -91,5 +93,6 @@ pub fn apply(stage: Row, out: &mut [f32], b: &[f32], s: f32) {
         Row::Relu => each(out, |v| v.max(0.0)),
         Row::Softplus => each(out, |v| v.max(0.0) + (-v.abs()).exp().ln_1p()),
         Row::Exp => each(out, f32::exp),
+        Row::Tanh => each(out, tanh),
     }
 }

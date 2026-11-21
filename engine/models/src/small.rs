@@ -84,6 +84,7 @@ pub fn gemma4() -> gemma4::Config {
         full_theta: 1e6,
         first_shared: 2,
         eps: 1e-6,
+        cap: Some(30.0),
     }
 }
 

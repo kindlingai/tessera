@@ -32,8 +32,9 @@ use std::path::Path;
 use tessera_checkpoint::{Offer, Shards, Stored};
 use tessera_engine::decoder::{self, Config, Moe, Swiglu};
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
+use tessera_engine::gemma4;
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Norm, Pins, Steps, Tensor, Weight};
+use tessera_engine::{Graph, Linear, Norm, Pins, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -42,6 +43,11 @@ use tokenize::hf::Hf;
 enum Ids {
     One(u32),
     Many(Vec<u32>),
+}
+
+#[derive(Deserialize)]
+struct Arch {
+    model_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -334,12 +340,27 @@ pub fn load_named(
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
-    let (arch, mut config) = config(dir, [slots, context], overrides)?;
-    config.stack.steps = steps;
-    let graph = stepper(&arch, &config)
-        .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
+    let arch = serde_json::from_str::<Arch>(&json)?.model_type;
+    let (graph, layers, rules) = match arch.as_deref() {
+        Some("gemma4") => {
+            let path = dir.join("config.json");
+            let mut c = overrides.read("config.json", Some(&path), |k| {
+                gemma4::Config::read(k, slots, context)
+            })?;
+            c.stack.steps = steps;
+            let rules = names::repo("gemma4").unwrap_or_default();
+            (gemma4::stepper::<Linear>(&c), c.stack.layers, rules)
+        }
+        _ => {
+            let (arch, mut config) = config(dir, [slots, context], overrides)?;
+            config.stack.steps = steps;
+            let graph = stepper(&arch, &config)
+                .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
+            (graph, config.stack.layers, Vec::new())
+        }
+    };
     let shards = Shards::open(dir)?;
-    let (weights, pins) = pull(&graph, &shards, config.stack.layers, &[user])?;
+    let (weights, pins) = pull(&graph, &shards, layers, &[&rules, user])?;
     dressed(dir, graph, Weights::Held(weights), pins)
 }
 

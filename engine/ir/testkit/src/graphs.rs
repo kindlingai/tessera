@@ -138,7 +138,7 @@ pub fn blocks(bounded: &[Dim], [heads, key, value]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &keys), (Role::Logits, &values)])
 }
 
-/// Norms, maps, exp, centering, unit sum, softmax, mask, argmax, mean.
+/// Norms, activations, centering, unit sum, softmax, mask, argmax, mean.
 pub fn rows(bounded: &[Dim], width: u64) -> Graph {
     let m = model(
         bounded,
@@ -149,7 +149,8 @@ pub fn rows(bounded: &[Dim], width: u64) -> Graph {
     let bits = rows_of(bounded, VocabWords, DType::U32);
     let [x, y, bits] = m.entry(EntryKind::Forward, [port(), port(), bits]);
     let gated = x.rms_norm(&w.norm, 1e-6).act(Act::Silu).mul(&y.rms(1e-6));
-    let sum = y.act(Act::Softplus).act(Act::Exp).add(&gated).center();
+    let tail = gated.act(Act::Tanh);
+    let sum = y.act(Act::Softplus).act(Act::Exp).add(&tail).center();
     let probs = sum.act(Act::Sigmoid).unit_sum().softmax();
     let ids = probs.allow(&bits).top_k(1u64);
     m.finish([(Role::Tokens, &ids), (Role::Logits, &sum.mean(0))])

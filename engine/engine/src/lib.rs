@@ -36,7 +36,9 @@ pub use tessera_interp::{Tensor, bind, fold};
 pub use tessera_lower::{Pick, Pins, Recipe, Settings, Weight, form};
 pub use tessera_mem::form as storage;
 pub use tessera_mem::{block, trellis};
-pub use tessera_models::{Stack, Steps, clip, decoder, eg2, flux2, keys, mla, sprite, tagger, vae};
+pub use tessera_models::{
+    Stack, Steps, clip, decoder, eg2, flux2, gemma4, keys, mla, sprite, tagger, vae,
+};
 pub use tessera_run::{gpu, pinning};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;

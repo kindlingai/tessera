@@ -178,6 +178,7 @@ fn act_values() {
         Act::GeluTanh,
         Act::Softplus,
         Act::Exp,
+        Act::Tanh,
     ];
     let out = rows(Hidden, vec![-2., 0., 1., 3.], |x| acts.map(|a| x.act(a)));
     close(&out[0], &[0., 0., 1., 3.]);
@@ -191,6 +192,7 @@ fn act_values() {
     );
     let e = std::f32::consts::E;
     close(&out[5], &[0.135_335_28, 1., e, 20.085_537]);
+    close(&out[6], &[-0.964_027_6, 0., 0.761_594_2, 0.995_055]);
 }
 
 #[test]
