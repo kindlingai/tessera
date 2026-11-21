@@ -12,9 +12,10 @@ use std::path::Path;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tessera_engine::Settings;
 use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
 use tessera_engine::sums::{self, Sum};
+use tessera_engine::whole;
+use tessera_engine::{Grid, Settings};
 
 /// How long a rank waits for the others.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -81,16 +82,42 @@ pub fn grid(
     fabric: &Fabric,
     settings: &Settings,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    let link = link(met, fabric, settings, (sums::regions, sums::RELAY), "sums")?;
+    Ok(sums::open(settings.gpu(), link)?)
+}
+
+/// A recipe's resident grid, its sums over `fabric`.
+pub fn resident(
+    met: &mut dyn Transport,
+    fabric: &Fabric,
+    settings: &Settings,
+) -> Result<Box<dyn Grid>, Box<dyn std::error::Error>> {
+    let link = link(
+        met,
+        fabric,
+        settings,
+        (whole::regions, whole::RELAY),
+        "steps",
+    )?;
+    Ok(whole::open(settings.gpu(), link, 1)?)
+}
+
+/// The fabric link a persistent grid of `what` runs over.
+fn link(
+    met: &mut dyn Transport,
+    fabric: &Fabric,
+    settings: &Settings,
+    (regions, relay): (fn(u32) -> Vec<usize>, usize),
+    what: &str,
+) -> Result<VerbsLink, Error> {
     let (rank, ranks) = (met.rank(), met.ranks());
-    let regions = sums::regions(ranks);
     let pinning = tessera_engine::pinning(settings);
-    let relay = sums::RELAY;
-    let link = VerbsLink::connect(rank, ranks, fabric, &regions, relay, met, pinning)?;
+    let link = VerbsLink::connect(rank, ranks, fabric, &regions(ranks), relay, met, pinning)?;
     eprintln!(
-        "rank {rank}: sums in a persistent grid over {}",
+        "rank {rank}: {what} in a persistent grid over {}",
         roce::describe(fabric)
     );
-    Ok(sums::open(settings.gpu(), link)?)
+    Ok(link)
 }
 
 /// Joins rank `rank` of `addrs` on `listener`. Lower ranks call.

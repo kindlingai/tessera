@@ -28,11 +28,12 @@ fn rule() -> &'static Rule {
     Module::open(&bytes).unwrap().rules[0]
 }
 
-/// Every form the kernel reads. Last pins win.
+/// Every form, two codebooks, forms by layer. Last pins win.
 const PINS: &str = "*q_a=mxfp8 *kv_a=mxfp8 *q_b=int4_g32 *kv_b=bf16 *.o=int4_g32 \
     *.wq=bf16 *.wk=mxfp8 *.weights=bf16 *dense*.gate=int4_g32 *dense*.up=int4_g32 \
     *dense*.down=mxfp8 *router=bf16 *moe*.gate=trellis_k3_mul1 *moe*.up=trellis_k3_mul1 \
-    *moe*.down=trellis_k2_mul1 *shared*=trellis_k4_mul1_rot embed=bf16 head=bf16";
+    *moe*.down=trellis_k2_mul1 *shared*=trellis_k4_rot moe.1.shared.down=trellis_k3_rot \
+    attn.1.q_b=bf16 attn.2.o=f32 embed=bf16 head=bf16";
 
 fn pins() -> Pins {
     let pairs = PINS.split_whitespace().filter_map(|p| p.split_once('='));

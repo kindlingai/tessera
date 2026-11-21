@@ -23,7 +23,7 @@ enum field : u32 {
     FIELD_END
 };
 
-// Form classes, four bits per field.
+// Form classes, read from each item's bytes.
 enum klass : u32 { K_F32, K_BF16, K_INT4, K_MXFP8, K_TRELLIS, K_TURNED };
 
 // Values, in the module's order.
@@ -34,8 +34,8 @@ struct sizes {
     u32 experts, held_first, held, topk;
     // Per layer: whether attention and the MLP split.
     u32 attn_split[3], mlp_split[3];
-    u32 book;
-    u32 forms[5];
+    // Per field: 1 where its trellis codebook is mul1.
+    u32 books[2];
     u32 width, layout, page;
     float eps, theta, route, scale;
     u32 kept;
@@ -48,34 +48,103 @@ static __device__ sizes read(const table* t) {
     return s;
 }
 
-static __device__ u32 klass_of(const sizes& s, u32 f) {
-    return (s.forms[f / 8] >> (4 * (f % 8))) & 15u;
-}
-
 static __device__ bool bit(const u32* words, u32 l) {
     return (words[l / 32] >> (l % 32)) & 1u;
-}
-
-// Items field `f` takes: three for rotated codes.
-static __device__ u32 span(const sizes& s, u32 f) {
-    return klass_of(s, f) == K_TURNED ? 3 : 1;
-}
-
-static __device__ u32 spans(const sizes& s, u32 from, u32 to) {
-    u32 n = 0;
-    for (u32 f = from; f < to; f++) n += span(s, f);
-    return n;
 }
 
 static __device__ bool indexes(const sizes& s, u32 l) {
     return l < s.dense || (l + 1 - s.dense) % s.every == 0;
 }
 
-// Items of layer `l`, after its first.
-static __device__ u32 layer_items(const sizes& s, u32 l) {
-    u32 n = spans(s, A_NORM, WQ);
-    if (indexes(s, l)) n += spans(s, WQ, D_GATE);
-    return n + (l < s.dense ? spans(s, D_GATE, ROUTER) : spans(s, ROUTER, FIELD_END));
+static __device__ bool codes_field(u32 f) {
+    return f == E_GATE || f == E_UP || f == E_DOWN;
+}
+
+// A field's rows, columns and matrices at sizes `s`.
+struct shape {
+    u32 out, in, sets;
+};
+
+static __device__ shape shape_of(const sizes& s, u32 f) {
+    u32 q = s.heads * (s.nope + s.rope), kv = s.heads * (s.nope + s.hd);
+    switch (f) {
+    case EMBED: case LM_HEAD: return {s.vocab, s.hidden, 1};
+    case NORM: case A_NORM: case MLP_NORM: case SIGNS_IN: case SIGNS_OUT: return {1, s.hidden, 1};
+    case Q_A: return {s.q_latent, s.hidden, 1};
+    case Q_NORM: return {1, s.q_latent, 1};
+    case Q_B: return {q, s.q_latent, 1};
+    case KV_A: return {s.latent + s.rope, s.hidden, 1};
+    case KV_NORM: return {1, s.latent, 1};
+    case KV_B: return {kv, s.latent, 1};
+    case O: return {s.hidden, s.heads * s.hd, 1};
+    case WQ: return {s.ih * s.idim, s.q_latent, 1};
+    case WK: return {s.idim, s.hidden, 1};
+    case K_NORM: case K_BIAS: return {1, s.idim, 1};
+    case I_WEIGHTS: return {s.ih, s.hidden, 1};
+    case D_GATE: case D_UP: return {s.dense_ffn, s.hidden, 1};
+    case D_DOWN: return {s.hidden, s.dense_ffn, 1};
+    case ROUTER: return {s.experts, s.hidden, 1};
+    case R_BIAS: return {1, s.experts, 1};
+    case E_GATE: case E_UP: return {s.effn, s.hidden, s.held};
+    case GATE_SU: case UP_SU: case DOWN_SV: return {s.experts, s.hidden, 1};
+    case GATE_SV: case UP_SV: case DOWN_SU: return {s.experts, s.effn, 1};
+    case E_DOWN: return {s.hidden, s.effn, s.held};
+    case S_GATE: case S_UP: return {s.ffn, s.hidden, 1};
+    default: return {s.hidden, s.ffn, 1};
+    }
+}
+
+static __device__ u64 bytes_of(const table* t, u32 item) {
+    return item_at(t, item)->shape[0];
+}
+
+// The form class of `n` elements in `bytes`.
+static __device__ u32 sniff(u64 bytes, u64 n) {
+    bool blocks = n % 32 == 0;
+    if (bytes == 4 * n) return K_F32;
+    if (bytes == 2 * n) return K_BF16;
+    if (blocks && bytes == n / 32 * 18) return K_INT4;
+    if (blocks && bytes == n / 32 * 33) return K_MXFP8;
+    return K_TRELLIS;
+}
+
+// Field `f`'s class at `item`. Trellis outside expert codes turns.
+static __device__ u32 klass_at(const table* t, const sizes& s, u32 item, u32 f) {
+    shape d = shape_of(s, f);
+    u32 k = sniff(bytes_of(t, item), u64(d.out) * d.in * d.sets);
+    return k == K_TRELLIS && !codes_field(f) ? K_TURNED : k;
+}
+
+// A layer's first item per field, and its kept rows.
+struct place {
+    u32 item[FIELD_END];
+    u32 next, kept, layer;
+};
+
+// Places fields `from..to` at `*at`. Rotated codes take three.
+static __device__ void lay_fields(const table* t, const sizes& s, place& pl, u32 from, u32 to,
+                                  u32* at) {
+    for (u32 f = from; f < to; f++) {
+        pl.item[f] = *at;
+        *at += klass_at(t, s, *at, f) == K_TURNED ? 3 : 1;
+    }
+}
+
+// Layer `l`'s places, from item `first`, at its sizes `s`.
+static __device__ place walk(const table* t, const sizes& s, u32 l, u32 first, u32 kept) {
+    place pl;
+    pl.kept = kept;
+    pl.layer = l;
+    u32 at = first;
+    lay_fields(t, s, pl, A_NORM, WQ, &at);
+    if (indexes(s, l)) lay_fields(t, s, pl, WQ, D_GATE, &at);
+    if (l < s.dense) {
+        lay_fields(t, s, pl, D_GATE, ROUTER, &at);
+    } else {
+        lay_fields(t, s, pl, ROUTER, FIELD_END, &at);
+    }
+    pl.next = at;
+    return pl;
 }
 
 // Every thread of the grid, as one line.
@@ -119,7 +188,7 @@ static __device__ float e4m3(u32 c) {
 // One weight matrix, or a set, in its form.
 struct mat {
     const u8* p;
-    u32 klass, in, out, k;
+    u32 klass, in, out, k, book;
     const float* suh;
     const float* svh;
 };
@@ -128,15 +197,15 @@ static __device__ u32 word(const u8* p, u32 at) {
     return *reinterpret_cast<const u32*>(p + at);
 }
 
-// Field `f` at `item`: `sets` matrices of `out` by `in`.
-static __device__ mat weight(const table* t, const sizes& s, u32 item, u32 f, u32 out, u32 in,
-                           u32 sets) {
-    mat w = {at<const u8>(t, item), klass_of(s, f), in, out, 0, nullptr, nullptr};
+// Field `f` at `item`, in the form its bytes show.
+static __device__ mat weight(const table* t, const sizes& s, u32 item, u32 f) {
+    shape d = shape_of(s, f);
+    u32 book = bit(s.books, f);
+    mat w = {at<const u8>(t, item), klass_at(t, s, item, f), d.in, d.out, 0, book, nullptr, nullptr};
     if (w.klass < K_TRELLIS) return w;
     w.in = word(w.p, 0);
     w.out = word(w.p, 4);
-    u64 codes = u64(item_at(t, item)->shape[0] - HEAD) * 8;
-    w.k = u32(codes / (u64(w.in) * w.out * sets));
+    w.k = u32((bytes_of(t, item) - HEAD) * 8 / (u64(w.in) * w.out * d.sets));
     if (w.klass == K_TURNED) {
         w.suh = at<const float>(t, item + 1);
         w.svh = at<const float>(t, item + 2);
@@ -151,7 +220,7 @@ static __device__ u32 tile_bit(const u8* tile, u32 b) {
 }
 
 // Trellis element of matrix `m` at input `row`, output `col`.
-static __device__ float trellis(const mat& w, u32 book, u64 m, u32 row, u32 col) {
+static __device__ float trellis(const mat& w, u64 m, u32 row, u32 col) {
     u32 r = row % 16, c = col % 16;
     u32 tile = word(w.p, 8) == INPUT_SIDE
                    ? (row / 128) * (w.out / 2) + 64 * (col / 128) + 8 * (row % 128 / 16) + col % 128 / 16
@@ -166,7 +235,7 @@ static __device__ float trellis(const mat& w, u32 book, u64 m, u32 row, u32 col)
         state |= code << (n * w.k);
     }
     state &= 0xFFFFu;
-    if (book == 1) {
+    if (w.book == 1) {
         u32 x = state * MUL1;
         u32 sum = (x & 255u) + (x >> 8 & 255u) + (x >> 16 & 255u) + (x >> 24);
         return narrow(__fadd_rn(__fmul_rn(float(1024 + sum), half(0x1EEE)), half(0xC931)));
@@ -176,7 +245,7 @@ static __device__ float trellis(const mat& w, u32 book, u64 m, u32 row, u32 col)
 }
 
 // Element `(o, i)` of matrix `m`, in any form.
-static __device__ float elem(const mat& w, u32 book, u64 m, u32 o, u32 i) {
+static __device__ float elem(const mat& w, u64 m, u32 o, u32 i) {
     u64 n = (m * w.out + o) * w.in + i;
     switch (w.klass) {
     case K_F32:
@@ -195,7 +264,7 @@ static __device__ float elem(const mat& w, u32 book, u64 m, u32 o, u32 i) {
         return scale * e4m3(b[1 + n % 32]);
     }
     default:
-        return trellis(w, book, m, i, o);
+        return trellis(w, m, i, o);
     }
 }
 
@@ -258,7 +327,7 @@ static __device__ void times(const ctx& c, const mat& w, const float* x, u32 xs,
         u32 o = u % out, r0 = u / out * 8, n = min(8u, rows - r0);
         float acc[8] = {};
         for (u32 i = 0; i < w.in; i++) {
-            float v = elem(w, c.s.book, 0, o, i);
+            float v = elem(w, 0, o, i);
             for (u32 r = 0; r < n; r++) acc[r] += x[u64(r0 + r) * xs + i] * v;
         }
         for (u32 r = 0; r < n; r++) y[u64(r0 + r) * ys + o] = acc[r];
@@ -318,7 +387,7 @@ static __device__ void rms(const ctx& c, const float* x, u32 xs, const mat& w, f
         for (u32 i = threadIdx.x; i < n; i += blockDim.x) sq += (row[i] - mean) * (row[i] - mean);
         float inv = 1.0f / sqrtf(block_sum(sq) / n + c.s.eps);
         for (u32 i = threadIdx.x; i < n; i += blockDim.x) {
-            y[u64(r) * ys + i] = (row[i] - mean) * (inv * elem(w, c.s.book, 0, 0, i));
+            y[u64(r) * ys + i] = (row[i] - mean) * (inv * elem(w, 0, 0, i));
         }
     }
 }
@@ -368,27 +437,14 @@ static __device__ bool add(const ctx& c, bool ranks) {
     return sync(c.t);
 }
 
-// Where one layer's items and kept rows start.
-struct place {
-    u32 item, kept, layer;
-};
-
-static __device__ u32 item_of(const ctx& c, const place& pl, u32 f) {
-    u32 from = f < WQ ? A_NORM : f < D_GATE ? WQ : f < ROUTER ? D_GATE : ROUTER;
-    u32 n = pl.item + spans(c.s, from, f);
-    if (from >= WQ) n += spans(c.s, A_NORM, WQ);
-    if (from >= D_GATE && indexes(c.s, pl.layer)) n += spans(c.s, WQ, D_GATE);
-    return n;
-}
-
-static __device__ mat field_mat(const ctx& c, const place& pl, u32 f, u32 out, u32 in) {
-    return weight(c.t, c.s, item_of(c, pl, f), f, out, in, 1);
+static __device__ mat field_mat(const ctx& c, const place& pl, u32 f) {
+    return weight(c.t, c.s, pl.item[f], f);
 }
 
 // Index keys: centred, normed, biased, then kept.
 static __device__ void index_keys(const ctx& c, const place& pl) {
     const sizes& s = c.s;
-    rms(c, c.p.b, s.idim, field_mat(c, pl, K_NORM, 1, s.idim), c.p.b, s.idim, s.rows, s.idim,
+    rms(c, c.p.b, s.idim, field_mat(c, pl, K_NORM), c.p.b, s.idim, s.rows, s.idim,
         nullptr, true);
 }
 
@@ -443,21 +499,21 @@ static __device__ void top(const float* v, u32 rows, u32 n, u32 k, u32* ids, boo
 static __device__ bool pick_keys(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     u32 r = s.rows;
-    mat wq = field_mat(c, pl, WQ, s.ih * s.idim, s.q_latent);
+    mat wq = field_mat(c, pl, WQ);
     if (!linear(c, wq, c.p.qr, s.q_latent, c.p.a, s.ih * s.idim, r, s.ih * s.idim)) return false;
-    mat wk = field_mat(c, pl, WK, s.idim, s.hidden);
+    mat wk = field_mat(c, pl, WK);
     if (!linear(c, wk, c.p.h, s.hidden, c.p.b, s.idim, r, s.idim)) return false;
-    mat by = field_mat(c, pl, I_WEIGHTS, s.ih, s.hidden);
+    mat by = field_mat(c, pl, I_WEIGHTS);
     if (!linear(c, by, c.p.h, s.hidden, c.p.c, s.ih, r, s.ih)) return false;
     PHASE(index_keys(c, pl));
     line l = threads();
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    mat bias = field_mat(c, pl, K_BIAS, 1, s.idim);
+    mat bias = field_mat(c, pl, K_BIAS);
     float* kept = at<float>(c.t, pl.kept + 2);
     for (u32 u = l.at; u < r * s.idim; u += l.step) {
         u32 row = u / s.idim, d = u % s.idim;
-        kept[kept_row(c, slot[row], pos[row]) * s.idim + d] = c.p.b[u] + elem(bias, s.book, 0, 0, d);
+        kept[kept_row(c, slot[row], pos[row]) * s.idim + d] = c.p.b[u] + elem(bias, 0, 0, d);
     }
     if (!sync(c.t)) return false;
     PHASE(index_scores(c, pl));
@@ -501,7 +557,7 @@ static __device__ void absorb(const ctx& c, const mat& kv_b) {
         if (i >= s.latent) {
             v = nope[s.nope + i - s.latent];
         } else {
-            for (u32 n = 0; n < s.nope; n++) v += nope[n] * elem(kv_b, s.book, 0, h * (s.nope + s.hd) + n, i);
+            for (u32 n = 0; n < s.nope; n++) v += nope[n] * elem(kv_b, 0, h * (s.nope + s.hd) + n, i);
         }
         c.p.b[u] = v;
     }
@@ -550,7 +606,7 @@ static __device__ void head_values(const ctx& c, const mat& kv_b) {
         u32 rh = u / s.hd, d = u % s.hd, h = rh % s.heads;
         const float* o = c.p.c + u64(rh) * s.latent;
         float v = 0.0f;
-        for (u32 i = 0; i < s.latent; i++) v += o[i] * elem(kv_b, s.book, 0, h * (s.nope + s.hd) + s.nope + d, i);
+        for (u32 i = 0; i < s.latent; i++) v += o[i] * elem(kv_b, 0, h * (s.nope + s.hd) + s.nope + d, i);
         c.p.d[u] = v;
     }
 }
@@ -558,25 +614,25 @@ static __device__ void head_values(const ctx& c, const mat& kv_b) {
 static __device__ bool attention(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     u32 r = s.rows, kv = s.latent + s.rope, q = s.heads * (s.nope + s.rope);
-    PHASE(rms(c, c.p.x, s.hidden, field_mat(c, pl, A_NORM, 1, s.hidden), c.p.h, s.hidden, r,
+    PHASE(rms(c, c.p.x, s.hidden, field_mat(c, pl, A_NORM), c.p.h, s.hidden, r,
               s.hidden, nullptr, false));
-    mat q_a = field_mat(c, pl, Q_A, s.q_latent, s.hidden);
+    mat q_a = field_mat(c, pl, Q_A);
     if (!linear(c, q_a, c.p.h, s.hidden, c.p.qr, s.q_latent, r, s.q_latent)) return false;
-    mat kv_a = field_mat(c, pl, KV_A, kv, s.hidden);
+    mat kv_a = field_mat(c, pl, KV_A);
     if (!linear(c, kv_a, c.p.h, s.hidden, c.p.kv, kv, r, kv)) return false;
-    PHASE(rms(c, c.p.qr, s.q_latent, field_mat(c, pl, Q_NORM, 1, s.q_latent), c.p.qr, s.q_latent,
+    PHASE(rms(c, c.p.qr, s.q_latent, field_mat(c, pl, Q_NORM), c.p.qr, s.q_latent,
               r, s.q_latent, nullptr, false));
-    PHASE(rms(c, c.p.kv, kv, field_mat(c, pl, KV_NORM, 1, s.latent), c.p.kv, kv, r, s.latent,
+    PHASE(rms(c, c.p.kv, kv, field_mat(c, pl, KV_NORM), c.p.kv, kv, r, s.latent,
               nullptr, false));
     if (indexes(s, pl.layer) && !pick_keys(c, pl)) return false;
-    mat q_b = field_mat(c, pl, Q_B, q, s.q_latent);
+    mat q_b = field_mat(c, pl, Q_B);
     if (!linear(c, q_b, c.p.qr, s.q_latent, c.p.a, q, r, q)) return false;
     PHASE(turn_keys(c, pl));
-    mat kv_b = field_mat(c, pl, KV_B, s.heads * (s.nope + s.hd), s.latent);
+    mat kv_b = field_mat(c, pl, KV_B);
     PHASE(absorb(c, kv_b));
     PHASE(attend(c, pl));
     PHASE(head_values(c, kv_b));
-    mat o = field_mat(c, pl, O, s.hidden, s.heads * s.hd);
+    mat o = field_mat(c, pl, O);
     if (!linear(c, o, c.p.d, s.heads * s.hd, c.p.part, s.hidden, r, s.hidden)) return false;
     return add(c, bit(s.attn_split, pl.layer));
 }
@@ -591,9 +647,9 @@ static __device__ void gated(const float* a, const float* b, float* y, u32 n) {
 static __device__ bool swiglu(const ctx& c, const place& pl, u32 gate, u32 inner) {
     const sizes& s = c.s;
     u32 r = s.rows;
-    mat g = field_mat(c, pl, gate, inner, s.hidden);
-    mat u = field_mat(c, pl, gate + 1, inner, s.hidden);
-    mat d = field_mat(c, pl, gate + 2, s.hidden, inner);
+    mat g = field_mat(c, pl, gate);
+    mat u = field_mat(c, pl, gate + 1);
+    mat d = field_mat(c, pl, gate + 2);
     if (!linear(c, g, c.p.h, s.hidden, c.p.a, inner, r, inner)) return false;
     if (!linear(c, u, c.p.h, s.hidden, c.p.b, inner, r, inner)) return false;
     PHASE(gated(c.p.a, c.p.b, c.p.c, r * inner));
@@ -605,13 +661,13 @@ static __device__ bool route(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     line l = threads();
     u32 r = s.rows, e = s.experts;
-    mat router = field_mat(c, pl, ROUTER, e, s.hidden);
+    mat router = field_mat(c, pl, ROUTER);
     if (!linear(c, router, c.p.h, s.hidden, c.p.a, e, r, e)) return false;
-    mat bias = field_mat(c, pl, R_BIAS, 1, e);
+    mat bias = field_mat(c, pl, R_BIAS);
     for (u32 u = l.at; u < r * e; u += l.step) {
         float v = 1.0f / (1.0f + expf(-c.p.a[u]));
         c.p.a[u] = v;
-        c.p.b[u] = v + elem(bias, s.book, 0, 0, u % e);
+        c.p.b[u] = v + elem(bias, 0, 0, u % e);
     }
     if (!sync(c.t)) return false;
     PHASE(top(c.p.b, r, e, s.topk, c.p.ids, false));
@@ -641,7 +697,7 @@ static __device__ void picked(const ctx& c, const mat& w, const float* x, float*
         u32 rk = u / out, o = u % out, m;
         if (!local_pick(c, rk, &m)) continue;
         float v = 0.0f;
-        for (u32 i = 0; i < in; i++) v += elem(w, c.s.book, m, o, i) * x[u64(rk) * in + i];
+        for (u32 i = 0; i < in; i++) v += elem(w, m, o, i) * x[u64(rk) * in + i];
         y[u] = v;
     }
 }
@@ -657,12 +713,12 @@ static __device__ void turn_picks(const ctx& c, const float* x, const float* sig
         const float* row = x + u64(sign ? rk / c.s.topk : rk) * n;
         float sum = 0.0f;
         for (u32 j = 0; j < 128; j++) {
-            float v = row[base + j] * (by.p ? elem(by, c.s.book, 0, e, base + j) : 1.0f);
+            float v = row[base + j] * (by.p ? elem(by, 0, e, base + j) : 1.0f);
             if (sign) v *= sign[base + j];
             sum += (__popc(o & j) & 1) ? -v : v;
         }
         float v = sum * (1.0f / sqrtf(128.0f));
-        if (after.p) v *= elem(after, c.s.book, 0, e, i);
+        if (after.p) v *= elem(after, 0, e, i);
         y[u] = also ? v * also[i] : v;
     }
 }
@@ -671,17 +727,17 @@ static __device__ bool routed(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     line l = threads();
     u32 h = s.hidden, f = s.effn, e = s.experts, rk = s.rows * s.topk;
-    mat none = {nullptr, K_F32, 0, 0, 0, nullptr, nullptr};
-    mat signs_in = field_mat(c, pl, SIGNS_IN, 1, h);
-    mat signs_out = field_mat(c, pl, SIGNS_OUT, 1, h);
+    mat none = {nullptr, K_F32, 0, 0, 0, 0, nullptr, nullptr};
+    mat signs_in = field_mat(c, pl, SIGNS_IN);
+    mat signs_out = field_mat(c, pl, SIGNS_OUT);
     const float* in_signs = reinterpret_cast<const float*>(signs_in.p);
     const float* out_signs = reinterpret_cast<const float*>(signs_out.p);
     mat su[3], sv[3], codes[3];
     for (u32 i = 0; i < 3; i++) {
-        u32 base = E_GATE + 3 * i, out = i < 2 ? f : h, in = i < 2 ? h : f;
-        codes[i] = weight(c.t, s, item_of(c, pl, base), base, out, in, s.held);
-        su[i] = field_mat(c, pl, base + 1, e, in);
-        sv[i] = field_mat(c, pl, base + 2, e, out);
+        u32 base = E_GATE + 3 * i;
+        codes[i] = field_mat(c, pl, base);
+        su[i] = field_mat(c, pl, base + 1);
+        sv[i] = field_mat(c, pl, base + 2);
     }
     PHASE(turn_picks(c, c.p.h, in_signs, su[0], none, nullptr, c.p.b, h);
           turn_picks(c, c.p.h, in_signs, su[1], none, nullptr, c.p.c, h));
@@ -727,7 +783,7 @@ static __device__ bool layer(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     bool split = bit(s.mlp_split, pl.layer);
     if (!attention(c, pl)) return false;
-    PHASE(rms(c, c.p.x, s.hidden, field_mat(c, pl, MLP_NORM, 1, s.hidden), c.p.h, s.hidden,
+    PHASE(rms(c, c.p.x, s.hidden, field_mat(c, pl, MLP_NORM), c.p.h, s.hidden,
               s.rows, s.hidden, nullptr, false));
     if (pl.layer < s.dense) return swiglu(c, pl, D_GATE, s.dense_ffn) && add(c, split);
     if (!route(c, pl) || !swiglu(c, pl, S_GATE, s.ffn) || !routed(c, pl)) return false;
@@ -741,32 +797,33 @@ extern "C" __global__ void glm53_whole(const table* t) {
     spans_t p = lay_out(t, s);
     session se = begin(t);
     ctx c = {t, s, p, se};
-    u32 globals = spans(s, EMBED, A_NORM);
-    u32 reads = IDS + globals, kept = 0;
+    u32 norm = IDS + (klass_at(t, s, IDS, EMBED) == K_TURNED ? 3 : 1);
+    u32 head = norm + (klass_at(t, s, norm, NORM) == K_TURNED ? 3 : 1);
+    u32 first = head + (klass_at(t, s, head, LM_HEAD) == K_TURNED ? 3 : 1);
+    u32 reads = first, kept = 0;
     for (u32 l = 0; l < s.layers; l++) {
-        reads += layer_items(s, l);
+        reads = walk(t, for_layer(s, l), l, reads, kept).next;
         kept += indexes(s, l) ? 3 : 2;
     }
     const u32* tokens = at<const u32>(t, 0);
-    mat embed = weight(t, s, IDS, EMBED, s.vocab, s.hidden, 1);
+    mat embed = weight(t, s, IDS, EMBED);
     line l = threads();
     for (u32 i = l.at; i < s.rows * s.hidden; i += l.step) {
-        p.x[i] = elem(embed, s.book, 0, tokens[i / s.hidden], i % s.hidden);
+        p.x[i] = elem(embed, 0, tokens[i / s.hidden], i % s.hidden);
     }
     if (!sync(t)) return;
-    place pl = {IDS + globals, reads, 0};
-    for (; pl.layer < s.layers; pl.layer++) {
-        sizes ls = for_layer(s, pl.layer);
+    for (u32 n = 0, from = first, rows = reads; n < s.layers; n++) {
+        sizes ls = for_layer(s, n);
         ctx lc = {t, ls, p, se};
+        place pl = walk(t, ls, n, from, rows);
         if (!layer(lc, pl)) return;
-        pl.item += layer_items(s, pl.layer);
-        pl.kept += indexes(s, pl.layer) ? 3 : 2;
+        from = pl.next;
+        rows += indexes(s, n) ? 3 : 2;
     }
-    u32 norm = IDS + spans(s, EMBED, NORM), head = IDS + spans(s, EMBED, LM_HEAD);
-    rms(c, p.x, s.hidden, weight(t, s, norm, NORM, 1, s.hidden, 1), p.h, s.hidden, s.picks, s.hidden,
+    rms(c, p.x, s.hidden, weight(t, s, norm, NORM), p.h, s.hidden, s.picks, s.hidden,
         at<const u32>(t, 3), false);
     if (!sync(t)) return;
-    times(c, weight(t, s, head, LM_HEAD, s.vocab, s.hidden, 1), p.h, s.hidden,
-          at<float>(t, reads + kept), s.vocab, s.picks, s.vocab);
+    times(c, weight(t, s, head, LM_HEAD), p.h, s.hidden, at<float>(t, reads + kept), s.vocab,
+          s.picks, s.vocab);
     end(se);
 }
