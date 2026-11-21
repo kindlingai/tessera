@@ -118,7 +118,7 @@ fn turned_load(t: &Turned, _: usize) -> Option<Load> {
     Some(Load {
         threads: n,
         group: BLOCK as usize,
-        trips: k as f64,
+        trips: (k / SPAN as usize) as f64,
         trip: turned_ir(m, form).trip(),
         reads: vec![
             4.0 * (m * k) as f64 * groups,

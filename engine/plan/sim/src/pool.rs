@@ -199,7 +199,7 @@ impl Chip for Pool {
     fn estimate(&self, l: &Load) -> Estimate {
         let (threads, t) = (l.threads as f64, &l.trip.priced(false));
         // The step already holds a loop's own index work.
-        let ops = t.float * self.step.value + t.special * self.curve.value;
+        let ops = t.steps() * self.step.value + t.special * self.curve.value;
         // Streams cross lines together, so their waits overlap.
         let fresh = if t.loads > 0.0 { t.fresh } else { 0.0 };
         let waits = fresh * self.wait.value + (1.0 - fresh) * t.loads * self.near.value;

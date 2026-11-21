@@ -7,6 +7,8 @@ pub struct Ops {
     pub float: f64,
     /// Integer and index arithmetic, compares and branches.
     pub int: f64,
+    /// Instructions that decode stored weights.
+    pub decode: f64,
     /// Divides, roots, exponentials and the like.
     pub special: f64,
     pub loads: f64,
@@ -27,10 +29,18 @@ pub struct Ops {
     pub e2m1: f64,
 }
 
+/// Decode instructions one probed trip costs, fitted on trellis kernels.
+const DECODED: f64 = 8.0;
+
 /// Integer and float ops for one widening by arithmetic.
 const WIDEN: (f64, f64) = (6.0, 2.0);
 
 impl Ops {
+    /// Float ops and decode instructions, as probed loop trips.
+    pub fn steps(&self) -> f64 {
+        self.float + self.decode / DECODED
+    }
+
     pub fn width(&self) -> f64 {
         if self.width > 0.0 { self.width } else { WORD }
     }

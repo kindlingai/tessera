@@ -200,7 +200,8 @@ macro_rules! table {
                         .collect()
                 },
                 count: |c, args| {
-                    let bytes = c.global(&args[0]).map_or(4.0, |f| f.element_bytes());
+                    let form = c.global(&args[0]);
+                    let bytes = form.map_or(4.0, |f| f.element_bytes());
                     let (at, mut l) = (&args[1], c.loops.pop());
                     // Four elements move the address by one of them.
                     let fresh = match &mut l {
@@ -213,6 +214,9 @@ macro_rules! table {
                     };
                     c.loops.extend(l);
                     let ops = Ops { loads: 1.0, fresh, width: 4.0 * bytes, ..Ops::default() };
+                    if let Some(form) = form {
+                        c.decode(form, true);
+                    }
                     c.tally(ops, true)
                 },
             }

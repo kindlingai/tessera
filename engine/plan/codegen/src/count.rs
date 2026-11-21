@@ -2,8 +2,9 @@
 
 use crate::LANES;
 use crate::form::Load;
-use crate::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use crate::ir::{BinOp, Body, Expr, Helper, Intrinsic, Param, Stmt, Ty};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tessera_work::Ops;
 
 /// Bytes in a cache line.
@@ -77,6 +78,10 @@ struct Counter {
     held: HashMap<String, (usize, usize)>,
     /// Global loads this statement has made, which repeats share.
     seen: Vec<Expr>,
+    /// Ops each named helper spends per call.
+    calls: HashMap<String, Ops>,
+    /// Passes of the strided loops inside the trip. Zero: none.
+    passes: f64,
 }
 
 impl Counter {
@@ -87,6 +92,7 @@ impl Counter {
         let (t, n) = (&mut self.trip, self.times);
         t.float += ops.float * n;
         t.int += ops.int * n;
+        t.decode += ops.decode * n;
         t.special += ops.special * n;
         t.loads += ops.loads * n;
         t.stores += ops.stores * n;
@@ -113,6 +119,14 @@ impl Counter {
             loads: 1.0,
             fresh,
             width: bytes,
+            ..Ops::default()
+        });
+    }
+
+    /// Decodes `form` once per pass of the strided loops.
+    fn decode(&mut self, form: &dyn Load, wide: bool) {
+        self.add(Ops {
+            decode: decoded(form, wide) * self.passes.max(1.0),
             ..Ops::default()
         });
     }
@@ -186,6 +200,7 @@ impl Counter {
                     if !self.seen.contains(e) {
                         self.seen.push(e.clone());
                         self.load(at, form.element_bytes());
+                        self.decode(form, false);
                     }
                 } else if matches!(&**base, Expr::Var(n) if self.shared.contains(n)) {
                     self.add(Ops {
@@ -206,9 +221,12 @@ impl Counter {
                 self.add(int(1.0));
                 fa || fb
             }
-            Expr::Fn(_, ty, args) => {
+            Expr::Fn(name, ty, args) => {
                 for a in args {
                     self.expr(a);
+                }
+                if let Some(ops) = self.calls.get(name).copied() {
+                    self.add(ops);
                 }
                 *ty == Ty::F32
             }
@@ -321,6 +339,12 @@ impl Counter {
                             Expr::Int(s) => Some(*s as f64),
                             _ => None,
                         };
+                        // A strided loop inside the trip decodes on every pass.
+                        let was = self.passes;
+                        if let (false, Expr::Int(to), Some(by)) = (self.loops.is_empty(), to, step)
+                        {
+                            self.passes = was.max(1.0) * (*to as f64 / by).ceil();
+                        }
                         self.loops.push(Loop {
                             var: var.clone(),
                             step,
@@ -332,6 +356,7 @@ impl Counter {
                         });
                         self.stmts(body);
                         self.loops.pop();
+                        self.passes = was;
                     }
                 }
             }
@@ -424,6 +449,43 @@ macro_rules! costs {
 }
 
 crate::intrinsic::table!(costs);
+
+/// Ops one call of `h` spends, its own calls included.
+fn helper_ops(h: &Helper) -> Ops {
+    let mut c = Counter {
+        times: 1.0,
+        straight: true,
+        ..Counter::default()
+    };
+    for inner in &h.body.helpers {
+        c.calls.insert(inner.name.clone(), helper_ops(inner));
+    }
+    c.stmts(&h.body.stmts);
+    if let Some(ret) = &h.body.ret {
+        c.expr(ret);
+    }
+    c.trip
+}
+
+/// Decode instructions per form and width, counted once each.
+static DECODES: Mutex<Vec<(&str, bool, f64)>> = Mutex::new(Vec::new());
+
+/// Instructions one `load`, or `load4` if `wide`, spends decoding.
+fn decoded(form: &dyn Load, wide: bool) -> f64 {
+    let mut known = DECODES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((.., n)) = known
+        .iter()
+        .find(|(name, w, _)| *name == form.name() && *w == wide)
+    {
+        return *n;
+    }
+    let n = form.decoder(wide).map_or(0.0, |h| {
+        let ops = helper_ops(&h).priced(false);
+        ops.int + ops.float + ops.special
+    });
+    known.push((form.name(), wide, n));
+    n
+}
 
 /// Whether any loop's bounds are read at launch.
 fn runtime_loops(stmts: &[Stmt]) -> bool {

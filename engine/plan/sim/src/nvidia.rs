@@ -161,7 +161,7 @@ impl Chip for Nvidia {
         let t = &l.trip.priced(s.cvt8.value > 0.0);
         let pipes = [
             (t.float + 1.0, s.float.value),
-            (t.int, s.int.value),
+            (t.int + t.decode, s.int.value),
             (t.special, s.special.value),
             (t.loads + t.stores + t.shared, s.memory.value),
         ];
@@ -183,7 +183,7 @@ impl Chip for Nvidia {
             false => s.gather.value,
         };
         let tiles = t.shared * s.staged.value + t.tile_flops * s.mma.value;
-        let waits = t.float * s.chain.value + t.loads * stall + tiles;
+        let waits = t.steps() * s.chain.value + t.loads * stall + tiles;
         let chain = rounds * l.trips * waits;
         let cold = |bytes: &&f64| **bytes > s.cache.value;
         let far: f64 = l.reads.iter().filter(cold).sum();

@@ -27,6 +27,11 @@ pub trait Load: Form {
         0
     }
 
+    /// Its decode helper for `load`, or `load4` if `wide`.
+    fn decoder(&self, _wide: bool) -> Option<Helper> {
+        None
+    }
+
     /// The helpers `load` calls, each defined once.
     fn header(&self) -> Vec<Helper> {
         Vec::new()

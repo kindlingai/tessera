@@ -190,6 +190,13 @@ impl<const K: u32> Load for Trellis<K> {
     fn load4(&self, name: &str, index: &str) -> String {
         format!("form_{}_x4({name}, {index})", self.name)
     }
+    fn decoder(&self, wide: bool) -> Option<Helper> {
+        let book = book(self.codebook);
+        Some(match wide {
+            true => four_ir::<K>(self.name, book),
+            false => one_ir::<K>(self.name, book),
+        })
+    }
     fn header(&self) -> Vec<Helper> {
         let book = book(self.codebook);
         vec![one_ir::<K>(self.name, book), four_ir::<K>(self.name, book)]
