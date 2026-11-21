@@ -30,18 +30,25 @@ pub struct Recurrent {
 
 impl Config {
     pub fn dims(&self) -> Vec<Dim> {
-        let (rest, l) = (self.stack.head_dim - self.rotary, &self.linear);
-        let own = [
+        let (width, l) = (self.stack.head_dim, &self.linear);
+        assert!(self.rotary <= width && self.rotary % 2 == 0, "rotary width");
+        let mut own = vec![
             (KvHeads, self.kv_heads),
-            (Rope, self.rotary),
-            (Nope, rest),
             (KeyHeads, l.key_heads),
             (ValueHeads, l.value_heads),
             (KeyDim, l.key_dim),
             (ValueDim, l.value_dim),
             (Window, l.window),
         ];
+        if self.partial() {
+            own.extend([(Rope, self.rotary), (Nope, width - self.rotary)]);
+        }
         self.stack.dims(&own)
+    }
+
+    /// Whether only part of each full-attention head rotates.
+    fn partial(&self) -> bool {
+        self.rotary < self.stack.head_dim
     }
 }
 
@@ -51,7 +58,7 @@ fn norm(x: &Tensor, gain: &Vector, eps: f32) -> Tensor {
     r.add(&r.mul_vector(gain))
 }
 
-/// Gated attention over every earlier row.
+/// Gated causal attention.
 #[derive(Weights)]
 pub struct Full {
     /// Each head's query, then its gate.
@@ -76,7 +83,7 @@ impl Full {
         let shape = [Heads.into(), KvHeads.into(), HeadDim.into()];
         let mut heads =
             Attend::new(&self.o, lead, shape).rotary(positions, c.rope_theta, Pairs::Halves);
-        if c.rotary < c.stack.head_dim {
+        if c.partial() {
             heads = heads.partial([Rope.into(), Nope.into()]);
         }
         let both = heads.split(h.matmul(&self.q), Heads, HeadDim * 2u64);

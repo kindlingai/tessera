@@ -24,8 +24,8 @@ fn tiny() -> Config {
     Config {
         stack: Stack::sized([64, 32, 4, 4, 16, 48], SEQS as u64, 8),
         kv_heads: 2,
-        rotary: 4,
-        rope_theta: 1e7,
+        rotary: 8,
+        rope_theta: 100.0,
         eps: 1e-6,
         linear: Recurrent {
             key_heads: 2,
