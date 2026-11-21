@@ -47,7 +47,12 @@ impl Place {
     }
 
     pub(crate) fn split(&self, g: &Graph) -> Result<Graph, Error> {
-        Ok(shard(g, &self.parts)?.graph)
+        let sharded = shard(g, &self.parts)?;
+        for w in sharded.whole.iter().filter(|_| self.rank == 0) {
+            let path = &g.weights[w.weight as usize].path;
+            eprintln!("tessera: {path:?} stays whole: {}", w.why);
+        }
+        Ok(sharded.graph)
     }
 
     /// `device`, lowering this rank's copy of the plan.

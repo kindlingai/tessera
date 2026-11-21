@@ -33,6 +33,8 @@ pub enum Error {
     Lower(#[from] tessera_lower::Error),
     #[error("gpu: {0}")]
     Gpu(#[from] tessera_gpukit::Error),
+    #[error("step {0} ({1}): {2}")]
+    Launch(usize, String, Box<Error>),
     #[error("memory: {0}")]
     Memory(#[from] tessera_mem::Error),
     #[error("comm: {0}")]

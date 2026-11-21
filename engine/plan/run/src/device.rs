@@ -134,7 +134,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
         self.ctx.programmatic(overlap);
         let mut args = self.bound(&launch.args)?;
-        self.fire(&self.kernels[step], launch.shape, &mut args)
+        let fired = self.fire(&self.kernels[step], launch.shape, &mut args);
+        fired.map_err(|e| {
+            let name = self.base.plan.steps[step].kernel.name().to_string();
+            Error::Launch(step, name, Box::new(e))
+        })
     }
 
     /// Holds the device queue for the next launches, if able.
