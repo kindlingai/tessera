@@ -40,9 +40,13 @@ pub unsafe fn answer(
 ) -> i64 {
     // SAFETY: the caller passes back what `alloc` returned.
     let bytes = unsafe { input(at, len) };
-    let ask = serde_json::from_slice::<site::Ask>(bytes).ok();
-    let offers = ask.and_then(|ask| offer(&ask.site));
-    output(serde_json::to_vec(&offers).unwrap_or_else(|_| b"null".to_vec()))
+    let answer = match serde_json::from_slice::<site::Ask>(bytes) {
+        Ok(ask) => serde_json::to_vec(&offer(&ask.site)),
+        Err(e) => serde_json::to_vec(&site::Unread {
+            unread: e.to_string(),
+        }),
+    };
+    output(answer.unwrap_or_else(|_| b"null".to_vec()))
 }
 
 /// `manifest` for the host.

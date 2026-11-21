@@ -74,6 +74,12 @@ pub enum Kind {
     Model,
 }
 
+/// A `propose` answer when the site JSON does not parse.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Unread {
+    pub unread: String,
+}
+
 /// The input of `propose`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Ask {
@@ -140,8 +146,10 @@ impl Site {
             return None;
         };
         let ids = |i: &usize| inputs[*i].form == "u32" && ![slots, positions].contains(i);
-        let mut ids = (0..inputs.len()).filter(ids);
-        let (tokens, picks) = (ids.next()?, ids.next()?);
+        // Exactly tokens then picks, else the site is new.
+        let &[tokens, picks] = &(0..inputs.len()).filter(ids).collect::<Vec<_>>()[..] else {
+            return None;
+        };
         Some(Step {
             inputs,
             len,
@@ -161,9 +169,11 @@ pub struct Scalar {
     pub value: f32,
 }
 
-/// The first value of `op`, if the region has one.
+/// The value of `op`, if present and unique.
 pub fn scalar(scalars: &[Scalar], op: &str) -> Option<f32> {
-    scalars.iter().find(|s| s.op == op).map(|s| s.value)
+    let mut values = scalars.iter().filter(|s| s.op == op).map(|s| s.value);
+    let value = values.next()?;
+    values.all(|v| v == value).then_some(value)
 }
 
 /// Kept rows a region's launches append to.

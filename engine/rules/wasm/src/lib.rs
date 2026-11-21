@@ -5,7 +5,7 @@ mod guest;
 mod site;
 mod text;
 
-use abi::{ABI, Ask, Entry, Kind, Manifest, Site};
+use abi::{ABI, Answer, Ask, Entry, Kind, Manifest, Site};
 use guest::{BUILD_FUEL, FUEL, Guest};
 use std::sync::Arc;
 use tessera_graph::Graph;
@@ -22,6 +22,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("the module speaks abi {0}, the host {ABI}")]
     Abi(u32),
+    #[error("the module could not read the site: {0}")]
+    Unread(String),
     #[error("an earlier call panicked")]
     Poisoned,
     #[error(transparent)]
@@ -48,7 +50,10 @@ impl Asking {
         let rule = self.rule.into();
         let input = serde_json::to_vec(&Ask { rule, site })?;
         let output = self.guest.call("propose", Some(&input), FUEL)?;
-        Ok(serde_json::from_slice(&output)?)
+        match serde_json::from_slice(&output)? {
+            Answer::Offers(offers) => Ok(offers),
+            Answer::Unread(e) => Err(Error::Unread(e.unread)),
+        }
     }
 }
 

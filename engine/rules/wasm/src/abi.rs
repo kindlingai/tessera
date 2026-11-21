@@ -2,7 +2,9 @@
 
 use serde::Deserialize;
 use tessera_graph::DimName;
-pub(crate) use tessera_guest::site::{Ask, Input, Kept, Kind, Lane, Place, Scalar, Shape, Site};
+pub(crate) use tessera_guest::site::{
+    Ask, Input, Kept, Kind, Lane, Place, Scalar, Shape, Site, Unread,
+};
 
 /// The version of this exchange the host reads.
 pub(crate) use tessera_guest::ABI;
@@ -69,6 +71,14 @@ pub(crate) enum Count {
 
 fn one() -> usize {
     1
+}
+
+/// The answer of `propose`: offers, or an unread site.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Answer {
+    Offers(Option<Vec<Entry>>),
+    Unread(Unread),
 }
 
 /// One entry `propose` offers. `null` offers none.
