@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use tessera_engine::comm::{Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Place, Recipe, Settings};
-use tessera_frontend_comm::{grid, join, meet, ports};
+use tessera_frontend_comm::{grid, grid_flag, join, meet, ports};
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
@@ -40,7 +40,7 @@ impl Ranks {
                 let parts = value.split(',').map(|p| p.parse().ok());
                 self.parts = parts.collect::<Option<_>>()?;
             }
-            "--sums" => self.grid = value == "grid",
+            "--sums" => self.grid = grid_flag(value)?,
             "--verbs" => self.fabric = Some(Fabric::Mesh(ports(value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -72,12 +72,16 @@ impl Ranks {
         }
         let mut met: Box<dyn Transport> =
             Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
-        if let (true, Some(fabric)) = (self.grid, &self.fabric) {
-            let sums = grid(&mut *met, fabric, settings).map_err(|e| e.to_string())?;
-            let both = join(met, None, settings).map_err(|e| e.to_string())?;
-            return Ok(Some((both, Some(sums))));
+        match (self.grid, &self.fabric) {
+            (true, None) => return Err("--sums grid needs --verbs or --ring".into()),
+            (true, Some(fabric)) => {
+                let sums = grid(&mut *met, fabric, settings).map_err(|e| e.to_string())?;
+                let both = join(met, None).map_err(|e| e.to_string())?;
+                return Ok(Some((both, Some(sums))));
+            }
+            (false, _) => {}
         }
-        let links = join(met, self.fabric.as_ref(), settings);
+        let links = join(met, self.fabric.as_ref());
         links.map(|l| Some((l, None))).map_err(|e| e.to_string())
     }
 

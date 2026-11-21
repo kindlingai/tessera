@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tessera_engine::Settings;
-use tessera_engine::comm::{Error, Fabric, Reduce, Shm, Sockets, Transport, Verbs, VerbsLink};
+use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
 use tessera_engine::sums::{self, Sum};
 
 /// How long a rank waits for the others.
@@ -45,31 +45,34 @@ impl Transport for Shared {
     fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         self.0.borrow_mut().exchange(mine)
     }
-
-    fn device(&mut self) -> Option<Reduce> {
-        self.0.borrow_mut().device()
-    }
 }
 
 /// The sums' transport, then control's. `fabric` sums over RDMA.
 pub fn join(
     mut met: Box<dyn Transport>,
     fabric: Option<&Fabric>,
-    settings: &Settings,
 ) -> Result<[Box<dyn Transport>; 2], Error> {
     let Some(fabric) = fabric else {
         let met = Rc::new(RefCell::new(met));
         return Ok([Box::new(Shared(met.clone())), Box::new(Shared(met))]);
     };
     let (rank, ranks) = (met.rank(), met.ranks());
-    let pinning = tessera_engine::pinning(settings);
-    let verbs = Verbs::connect(rank, ranks, fabric, CAPACITY, &mut *met, pinning)?;
+    let verbs = Verbs::connect(rank, ranks, fabric, CAPACITY, &mut *met)?;
     let lanes = fabric.lanes();
     eprintln!(
         "rank {rank}: sums over {lanes} RDMA lanes: {}",
         roce::describe(fabric)
     );
     Ok([Box::new(verbs), met])
+}
+
+/// `--sums grid` or `host`: whether sums run in a grid.
+pub fn grid_flag(value: &str) -> Option<bool> {
+    match value {
+        "grid" => Some(true),
+        "host" => Some(false),
+        _ => None,
+    }
 }
 
 /// A persistent grid that sums over `fabric`, met through `met`.

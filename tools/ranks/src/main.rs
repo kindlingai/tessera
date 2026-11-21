@@ -10,7 +10,7 @@ use std::time::Instant;
 use tessera_bundle::Weights;
 use tessera_device::sums::{self, Sum};
 use tessera_engine_comm::{Fabric, ShmLink, Transport};
-use tessera_frontend_comm::{CAPACITY, meet, ports, shared, shm};
+use tessera_frontend_comm::{CAPACITY, grid_flag, meet, ports, shared, shm};
 use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::shard;
 use tessera_interp::Tensor;
@@ -25,7 +25,7 @@ const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH 
   [--stub ROUNDS] [--sums host|grid]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
-  persistent grid per rank over that fabric.
+  persistent grid per rank, over that fabric or the file.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.";
@@ -86,7 +86,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--backend" => args.host = value == "host" || value == "cpu",
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
-            "--sums" => args.grid = value == "grid",
+            "--sums" => args.grid = grid_flag(&value)?,
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
@@ -217,7 +217,7 @@ fn join(
         };
         return Ok((met, Some(grid)));
     }
-    let [sums, _] = tessera_frontend_comm::join(met, args.fabric.as_ref(), settings)?;
+    let [sums, _] = tessera_frontend_comm::join(met, args.fabric.as_ref())?;
     Ok((sums, None))
 }
 

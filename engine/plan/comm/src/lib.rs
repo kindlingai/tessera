@@ -4,7 +4,7 @@ mod fabric;
 mod ibv;
 mod link;
 mod memory;
-pub mod reduce;
+mod pin;
 mod shm;
 #[cfg(test)]
 mod socket_link;
@@ -15,7 +15,7 @@ mod verbs_link;
 pub use fabric::{Fabric, Port};
 pub use link::{Blocking, Link, Put, Span, exchange_regions};
 pub use memory::Memory;
-pub use reduce::{Pinned, Pinning, Reduce};
+pub use pin::{Pinned, Pinning};
 pub use shm::{Shm, ShmLink};
 pub use sockets::Sockets;
 pub use verbs::Verbs;
@@ -29,10 +29,6 @@ pub trait Transport {
     fn ranks(&self) -> u32;
     /// Every rank's bytes, in rank order, `mine` among them.
     fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error>;
-    /// A device's way to run the rounds itself, if any.
-    fn device(&mut self) -> Option<Reduce> {
-        None
-    }
 }
 
 impl<T: Transport + ?Sized> Transport for Box<T> {
@@ -46,10 +42,6 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
     fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         (**self).exchange(mine)
-    }
-
-    fn device(&mut self) -> Option<Reduce> {
-        (**self).device()
     }
 }
 

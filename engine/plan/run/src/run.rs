@@ -13,7 +13,7 @@ use tessera_engine_settings::Memory;
 use tessera_gpukit::{Limits, Platform};
 use tessera_graph::DimName;
 use tessera_lower::form::{F32_FORM, Load};
-use tessera_lower::{Arg, Launch, Launching, Loaded, Plan, Shape, Share, Slot, Weight};
+use tessera_lower::{Launch, Launching, Loaded, Plan, Share, Slot, Weight};
 use tessera_mem::{Tensor, View, copy};
 
 /// State every runner keeps: a plan, its buffers and sizes.
@@ -158,20 +158,6 @@ pub trait Run {
     /// The slot's device address, where buffers have one.
     fn address(&self, _slot: Slot) -> Option<u64> {
         None
-    }
-    /// Whether `launch_fixed` runs here.
-    fn fixed(&self) -> bool {
-        false
-    }
-    /// Runs a hand-written kernel once and waits for it.
-    fn launch_fixed(
-        &self,
-        _source: &'static str,
-        _entry: &'static str,
-        _args: &[Arg],
-        _shape: Shape,
-    ) -> Result<(), Error> {
-        Err(Error::FixedKernel)
     }
     /// How to launch from now on, where the device can.
     fn launching(&mut self, _: Launching) {}

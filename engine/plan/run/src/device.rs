@@ -464,26 +464,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         Some(self.buffer(slot).device_ptr() + slot.at(0) as u64)
     }
 
-    /// Hand-written kernels are CUDA text.
-    fn fixed(&self) -> bool {
-        dialect(D::BACKEND) == Dialect::Cuda
-    }
-
-    fn launch_fixed(
-        &self,
-        source: &'static str,
-        entry: &'static str,
-        args: &[Arg],
-        shape: Shape,
-    ) -> Result<(), Error> {
-        let kernel = cached_source::<D>(source, entry)?;
-        self.ctx.programmatic(false);
-        let mut args = self.bound(args)?;
-        self.fire(&kernel, shape, &mut args)?;
-        self.ctx.finish()?;
-        Ok(())
-    }
-
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
         self.reread()?;
         self.ctx.finish()?;

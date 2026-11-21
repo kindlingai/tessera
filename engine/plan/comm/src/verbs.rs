@@ -2,13 +2,13 @@
 
 use crate::fabric::{Fabric, HEADER, Lane, Peer, Wiring, parts};
 use crate::ibv::{self, Gid, Lib, Mr, QpAttr, QpInitAttr, SendWr, Sge, Wc, mask};
-use crate::reduce::{BYTES, CTL_WORDS, ERR, Pinned, Pinning, Reduce, SEQ};
+use crate::pin::{Pinned, Pinning};
 use crate::{Error, Transport};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a rank waits at a round.
@@ -17,8 +17,6 @@ const ROUND: Duration = Duration::from_secs(300);
 const QP_TIMEOUT: u8 = 18;
 /// Completions per device per poll.
 const BATCH: usize = 16;
-/// The proxy spins this long after work, then naps.
-const SPIN: Duration = Duration::from_millis(200);
 
 /// Bytes the devices register, page aligned.
 pub(crate) struct Region {
@@ -301,7 +299,7 @@ impl Engine {
     }
 
     fn flag(&self, source: u32, lane: usize) -> &AtomicU64 {
-        self.regions[FLAGS].word(CTL_WORDS + source as usize * self.lanes + lane)
+        self.regions[FLAGS].word(source as usize * self.lanes + lane)
     }
 
     /// Every lane's flag from `source` reached `seq`.
@@ -350,7 +348,7 @@ impl Engine {
             if link.posted.is_multiple_of(32) {
                 bits |= ibv::SEND_SIGNALED;
             }
-            let flag_at = CTL_WORDS + source as usize * self.lanes + lane;
+            let flag_at = source as usize * self.lanes + lane;
             let to = peer.regions[FLAGS] + 8 * flag_at as u64;
             let mut flag = SendWr::write(&mut word, to, far.rkeys[FLAGS], bits);
             let head = match len {
@@ -535,67 +533,12 @@ impl Drop for Engine {
     }
 }
 
-/// The thread that posts what the device publishes.
-struct Proxy {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Drop for Proxy {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Posts each round the device publishes, until stopped.
-fn serve(engine: &Mutex<Engine>, stop: &AtomicBool) -> Result<(), Error> {
-    let mut posted = 0;
-    let mut waiting: Option<Instant> = None;
-    let mut last = Instant::now();
-    while !stop.load(Ordering::Acquire) {
-        let mut e = engine.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = e.regions[FLAGS].word(SEQ).load(Ordering::Acquire);
-        let mut busy = false;
-        while posted < seq {
-            posted += 1;
-            let bytes = e.regions[FLAGS]
-                .word(BYTES + (posted % 2) as usize)
-                .load(Ordering::Relaxed);
-            e.publish(posted, bytes as usize)?;
-            busy = true;
-        }
-        busy |= e.relay(posted)?;
-        e.poll()?;
-        match (posted > 0 && !e.complete(posted), waiting) {
-            (false, _) => waiting = None,
-            (true, None) => waiting = Some(Instant::now()),
-            (true, Some(since)) if since.elapsed() > ROUND => return Err(e.late(posted)),
-            _ => {}
-        }
-        drop(e);
-        if busy {
-            last = Instant::now();
-        } else if last.elapsed() > SPIN {
-            thread::sleep(Duration::from_micros(100));
-        } else {
-            thread::yield_now();
-        }
-    }
-    Ok(())
-}
-
 /// Two slots per source, by round parity.
 pub struct Verbs {
     rank: u32,
     ranks: u32,
-    engine: Arc<Mutex<Engine>>,
+    engine: Engine,
     generation: u64,
-    proxy: Option<Proxy>,
-    /// Whether the regions are pinned for a device.
-    pinned: bool,
 }
 
 impl Verbs {
@@ -606,23 +549,19 @@ impl Verbs {
         fabric: &Fabric,
         capacity: usize,
         boot: &mut dyn Transport,
-        pinning: Option<Arc<dyn Pinning>>,
     ) -> Result<Self, Error> {
         let capacity = (capacity.max(HEADER + 1) + 15) & !15;
-        let (pin, lanes) = (pinning.as_ref(), fabric.lanes());
         let regions = vec![
-            Region::new(2 * capacity, pin)?,
-            Region::new(2 * ranks as usize * capacity, pin)?,
-            Region::new(8 * (CTL_WORDS + ranks as usize * lanes), pin)?,
+            Region::new(2 * capacity, None)?,
+            Region::new(2 * ranks as usize * capacity, None)?,
+            Region::new(8 * ranks as usize * fabric.lanes(), None)?,
         ];
         let engine = Engine::connect(rank, ranks, fabric, capacity, regions, boot)?;
         Ok(Self {
             rank,
             ranks,
-            engine: Arc::new(Mutex::new(engine)),
+            engine,
             generation: 0,
-            proxy: None,
-            pinned: pinning.is_some(),
         })
     }
 }
@@ -637,10 +576,7 @@ impl Transport for Verbs {
     }
 
     fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-        if self.proxy.is_some() {
-            return Err(Error::Fit("a device owns the rounds".into()));
-        }
-        let mut e = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let e = &mut self.engine;
         if HEADER + mine.len() > e.capacity {
             let what = format!(
                 "{} bytes over a {} byte slot",
@@ -672,42 +608,5 @@ impl Transport for Verbs {
         }
         self.generation = next;
         Ok(out)
-    }
-
-    /// Starts the proxy. It posts the device's rounds.
-    fn device(&mut self) -> Option<Reduce> {
-        if !self.pinned {
-            return None;
-        }
-        let e = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let fields = [
-            e.regions[SEND].device,
-            e.regions[RECV].device,
-            e.regions[FLAGS].device + 8 * CTL_WORDS as u64,
-            e.regions[FLAGS].device,
-        ];
-        let sizes = [e.lanes as u32, self.rank, self.ranks];
-        let reduce = Reduce::new(fields, e.capacity, sizes);
-        drop(e);
-        if self.proxy.is_none() {
-            let stop = Arc::new(AtomicBool::new(false));
-            let (engine, stopping, failed) = (
-                Arc::clone(&self.engine),
-                Arc::clone(&stop),
-                Arc::clone(&reduce.failed),
-            );
-            let thread = thread::spawn(move || {
-                if let Err(why) = serve(&engine, &stopping) {
-                    *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
-                    let e = engine.lock().unwrap_or_else(|e| e.into_inner());
-                    e.regions[FLAGS].word(ERR).store(1, Ordering::Release);
-                }
-            });
-            self.proxy = Some(Proxy {
-                stop,
-                thread: Some(thread),
-            });
-        }
-        Some(reduce)
     }
 }

@@ -62,8 +62,6 @@ pub enum Error {
     SumTooLong(usize),
     #[error("a plan over several zones")]
     Zones,
-    #[error("a fixed kernel on this runner")]
-    FixedKernel,
     #[error("kernel file {0}: {1}")]
     KernelFile(std::path::PathBuf, std::io::Error),
     #[error("weight {weight} does not fit {form}")]
