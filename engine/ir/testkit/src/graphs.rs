@@ -152,6 +152,19 @@ pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// The gated delta rule, value heads over key heads.
+pub fn delta(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
+    let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
+    let m = model(bounded, &fixed);
+    let keys = || floats([Seqs, Context, KvHeads, HeadDim]);
+    let gates = || floats([Seqs, Context, Heads]);
+    let values = floats([Seqs, Context, Heads, HeadDim]);
+    let ports = [keys(), keys(), values, gates(), gates()];
+    let [q, k, v, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let out = m.delta(0.25, [&q, &k, &v], [&decay, &rate]);
+    m.finish([(Role::Logits, &out)])
+}
+
 /// An attention region appends K and V, then sums both.
 pub fn appended(bounded: &[Dim], width: u64) -> Graph {
     let m = model(bounded, &[(Hidden, width)]);
