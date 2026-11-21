@@ -51,7 +51,10 @@ fn lanes_match_cpu() {
     let plain = [(52, 7), (4, 3), (1024, 96)].map(|(k, n)| (k, n, linear(k, n), true));
     // The sum as an operand, then as the chain's input.
     let residual: Finish = |x, product| x.add(&product);
-    let gate: Finish = |x, product| product.act(Act::Softplus).act(Act::Silu).mul(x);
+    let gate: Finish = |x, product| {
+        let bounded = product.act(Act::Softplus).act(Act::Silu).act(Act::Sigmoid);
+        bounded.act(Act::Exp).mul(x)
+    };
     let fused = [residual, gate].map(|finish| (64, 64, finished(64, 64, finish), false));
     for (k, n, g, bare) in plain.into_iter().chain(fused) {
         let rows: DimName = Rows;

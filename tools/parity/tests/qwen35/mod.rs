@@ -18,12 +18,12 @@ use tessera_trace::{Graph, PathSeg};
 
 /// The fixture's sequences and their length.
 const SEQS: usize = 2;
-const LEN: usize = 7;
+const LEN: usize = 12;
 
 /// The tiny model's sizes.
 fn tiny() -> Config {
     Config {
-        stack: Stack::sized([64, 32, 4, 4, 16, 48], SEQS as u64, 8),
+        stack: Stack::sized([64, 32, 4, 4, 16, 48], SEQS as u64, 16),
         kv_heads: 2,
         rotary: 8,
         rope_theta: 100.0,
@@ -32,7 +32,7 @@ fn tiny() -> Config {
             key_heads: 2,
             value_heads: 4,
             key_dim: 8,
-            value_dim: 8,
+            value_dim: 6,
             window: 4,
         },
         layers: vec![Mixing::Linear, Mixing::Linear, Mixing::Linear, Mixing::Full],

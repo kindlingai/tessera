@@ -1,7 +1,7 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Act, Graph, Mask, Op, Select, Stage, View};
+use crate::node::{Graph, Mask, Op, Select, Stage, View};
 use crate::select;
 use crate::types::{DType, Placement, TensorType};
 
@@ -506,8 +506,7 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
             }
             (Stage::Act(a), _) => {
                 // Routed zeros stay zero only where the activation keeps zero.
-                let keeps_zero = *a != Act::Sigmoid;
-                let ok = p != Placement::Partial && (p != Placement::Routed || keeps_zero);
+                let ok = p != Placement::Partial && (p != Placement::Routed || a.keeps_zero());
                 need(ok, ErrorKind::Placement, || {
                     format!("{s:?} is nonlinear, so it cannot read {p:?} values")
                 })?;

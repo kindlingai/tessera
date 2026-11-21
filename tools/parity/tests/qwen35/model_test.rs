@@ -26,7 +26,7 @@ fn read(name: &str) -> Option<Config> {
     let none = Overrides::default();
     Some(
         none.read("config.json", Some(&path), |k| {
-            Config::read(k, SEQS as u64, 8)
+            Config::read(k, SEQS as u64, 16)
         })
         .unwrap(),
     )
