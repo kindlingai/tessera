@@ -1771,7 +1771,6 @@ dependencies = [
  "tessera-checkpoint",
  "tessera-engine",
  "tessera-testkit",
- "thiserror",
  "tokenizers",
 ]
 
