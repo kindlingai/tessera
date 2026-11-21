@@ -11,6 +11,7 @@ mod socket_link;
 mod sockets;
 mod verbs;
 mod verbs_link;
+mod words;
 
 pub use fabric::{Fabric, Port};
 pub use link::{Blocking, Link, Put, Span, exchange_regions};
@@ -20,6 +21,7 @@ pub use shm::{Shm, ShmLink};
 pub use sockets::Sockets;
 pub use verbs::Verbs;
 pub use verbs_link::VerbsLink;
+pub use words::{Reader, Writer};
 
 use std::io;
 

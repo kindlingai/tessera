@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use tessera_engine_comm::{Reader, Writer};
 
 /// Seconds and count per name, since the last take.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -30,34 +31,22 @@ impl Profile {
         rows
     }
 
-    /// Each name as its length, bytes, seconds and count.
+    /// Each name, then its seconds and count.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut words = Writer::default();
         for (name, s) in &self.spent {
-            bytes.extend((name.len() as u32).to_le_bytes());
-            bytes.extend(name.as_bytes());
-            bytes.extend(s.seconds.to_le_bytes());
-            bytes.extend(s.count.to_le_bytes());
+            words.bytes(name.as_bytes()).f64(s.seconds).u64(s.count);
         }
-        bytes
+        words.0
     }
 
     /// The profile `to_bytes` wrote. None when empty or malformed.
-    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
-        let mut profile = Self::default();
-        while !bytes.is_empty() {
-            let (len, rest) = bytes.split_first_chunk::<4>()?;
-            let (name, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
-            let (seconds, rest) = rest.split_first_chunk::<8>()?;
-            let (count, rest) = rest.split_first_chunk::<8>()?;
-            let spent = Spent {
-                seconds: f64::from_le_bytes(*seconds),
-                count: u64::from_le_bytes(*count),
-            };
-            profile
-                .spent
-                .insert(String::from_utf8(name.to_vec()).ok()?, spent);
-            bytes = rest;
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (mut words, mut profile) = (Reader(bytes), Self::default());
+        while !words.is_empty() {
+            let name = String::from_utf8(words.bytes()?.to_vec()).ok()?;
+            let (seconds, count) = (words.f64()?, words.u64()?);
+            profile.spent.insert(name, Spent { seconds, count });
         }
         (!profile.spent.is_empty()).then_some(profile)
     }

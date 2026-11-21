@@ -1,6 +1,6 @@
 //! Which ranks a rank reaches, and over which ports.
 
-use crate::Error;
+use crate::{Error, Reader, Writer};
 
 /// Slots start with the length, then pad to 16.
 pub(crate) const HEADER: usize = 16;
@@ -143,30 +143,21 @@ pub(crate) struct Peer {
 
 impl Peer {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut out = VERSION.to_le_bytes().to_vec();
-        out.extend_from_slice(&(self.regions.len() as u32).to_le_bytes());
-        for region in &self.regions {
-            out.extend_from_slice(&region.to_le_bytes());
-        }
-        out.extend_from_slice(&(self.channels.len() as u32).to_le_bytes());
+        let mut out = Writer::default();
+        out.u32(VERSION).u64s(&self.regions);
+        out.u32(self.channels.len() as u32);
         for lanes in &self.channels {
-            out.extend_from_slice(&(lanes.len() as u32).to_le_bytes());
+            out.u32(lanes.len() as u32);
             for l in lanes {
-                let words = [l.qpn, l.mtu, l.rkeys.len() as u32]
-                    .into_iter()
-                    .chain(l.rkeys.iter().copied());
-                for word in words {
-                    out.extend_from_slice(&word.to_le_bytes());
-                }
-                out.extend_from_slice(&l.gid);
+                out.u32(l.qpn).u32(l.mtu).u32s(&l.rkeys).raw(&l.gid);
             }
         }
-        out
+        out.0
     }
 
     /// Decodes a peer's bytes, or says why it cannot.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let mut at = Cursor(bytes);
+        let mut at = Reader(bytes);
         match at.u32() {
             Some(VERSION) => {}
             Some(v) => return Err(format!("details version {v}, expected {VERSION}")),
@@ -175,18 +166,14 @@ impl Peer {
         Self::fields(at).ok_or_else(|| "details do not decode".into())
     }
 
-    fn fields(mut at: Cursor) -> Option<Self> {
-        let regions = (0..at.u32()?)
-            .map(|_| at.u64())
-            .collect::<Option<Vec<_>>>()?;
+    fn fields(mut at: Reader) -> Option<Self> {
+        let regions = at.u64s()?;
         let mut channels = Vec::new();
         for _ in 0..at.u32()? {
             let mut lanes = Vec::new();
             for _ in 0..at.u32()? {
                 let (qpn, mtu) = (at.u32()?, at.u32()?);
-                let rkeys = (0..at.u32()?)
-                    .map(|_| at.u32())
-                    .collect::<Option<Vec<_>>>()?;
+                let rkeys = at.u32s()?;
                 let gid = at.take(16)?.try_into().ok()?;
                 lanes.push(Lane {
                     qpn,
@@ -197,24 +184,6 @@ impl Peer {
             }
             channels.push(lanes);
         }
-        at.0.is_empty().then_some(Self { regions, channels })
-    }
-}
-
-struct Cursor<'a>(&'a [u8]);
-
-impl Cursor<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let (head, rest) = self.0.split_at_checked(n)?;
-        self.0 = rest;
-        Some(head)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        at.is_empty().then_some(Self { regions, channels })
     }
 }
