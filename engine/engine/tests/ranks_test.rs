@@ -84,7 +84,7 @@ fn agree(graph: fn() -> Graph) {
     let ranks = lead.ranks().unwrap();
     let reduced = |p: &Option<Profile>| {
         p.as_ref()
-            .is_some_and(|p| p.spent.contains_key("all_reduce"))
+            .is_some_and(|p| p.spent.contains_key("all_reduce: wait"))
     };
     assert!(ranks.profiles.len() == 2 && ranks.profiles.iter().all(reduced));
 }
