@@ -2,13 +2,14 @@
 
 mod attention_test;
 mod deltanet_test;
+mod model_test;
 
 use std::path::{Path, PathBuf};
 use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
 use tessera_lower::{Device, lower};
 use tessera_models::Stack;
-use tessera_models::qwen35::{Config, Recurrent};
+use tessera_models::qwen35::{Config, Mixing, Recurrent};
 use tessera_parity::loaded;
 use tessera_run::testing::runs;
 use tessera_testkit::max_abs_diff;
@@ -34,6 +35,8 @@ fn tiny() -> Config {
             value_dim: 8,
             window: 4,
         },
+        layers: vec![Mixing::Linear, Mixing::Linear, Mixing::Linear, Mixing::Full],
+        tied: false,
     }
 }
 

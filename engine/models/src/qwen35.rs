@@ -1,9 +1,14 @@
 //! Qwen3.5: gated delta rule layers and gated full attention.
 
-use crate::shared::{Attend, Stack};
+use crate::decoder::{Mlp, Swiglu};
+use crate::keys::Keys;
+use crate::shared::{Attend, Stack, part, tokens};
+use serde::de::DeserializeOwned;
+use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, Dim, DimExpr, Linear, Mask, Model, Norm, Pairs, Taps, Tensor, Vector, Weights,
+    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
+    Taps, Tensor, Vector, Weights,
 };
 
 pub struct Config {
@@ -15,6 +20,18 @@ pub struct Config {
     pub rope_theta: f32,
     pub eps: f32,
     pub linear: Recurrent,
+    /// Each layer's token mixer, in order.
+    pub layers: Vec<Mixing>,
+    /// The output head is the embedding table.
+    pub tied: bool,
+}
+
+/// How a layer mixes its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mixing {
+    /// The gated delta rule.
+    Linear,
+    Full,
 }
 
 /// A linear-attention layer's sizes.
@@ -29,6 +46,53 @@ pub struct Recurrent {
 }
 
 impl Config {
+    /// The model `k` describes, for these launch bounds.
+    pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        let fixed = [
+            ("hidden_act", json!("silu")),
+            ("attention_bias", json!(false)),
+            ("attn_output_gate", json!(true)),
+            ("output_gate_type", json!("swish")),
+            ("mtp_num_hidden_layers", json!(0)),
+            ("rope_parameters.rope_type", json!("default")),
+        ];
+        for (key, want) in fixed {
+            k.fixed(&format!("text_config.{key}"), want.clone());
+            k.fixed(key, want);
+        }
+        let sizes = [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "head_dim",
+            "intermediate_size",
+        ]
+        .map(|key| text::<u64>(k, key));
+        let layers = mixing(k, sizes[2]);
+        let factor: f32 = text(k, "rope_parameters.partial_rotary_factor");
+        let linear = Recurrent {
+            key_heads: text(k, "linear_num_key_heads"),
+            value_heads: text(k, "linear_num_value_heads"),
+            key_dim: text(k, "linear_key_head_dim"),
+            value_dim: text(k, "linear_value_head_dim"),
+            window: text(k, "linear_conv_kernel_dim"),
+        };
+        Self {
+            stack: Stack::sized(sizes, max_seqs, max_context),
+            kv_heads: text(k, "num_key_value_heads"),
+            rotary: (sizes[4] as f32 * factor) as u64,
+            rope_theta: text(k, "rope_parameters.rope_theta"),
+            eps: text(k, "rms_norm_eps"),
+            linear,
+            layers,
+            tied: k.or(
+                &["text_config.tie_word_embeddings", "tie_word_embeddings"],
+                false,
+            ),
+        }
+    }
+
     pub fn dims(&self) -> Vec<Dim> {
         let (width, l) = (self.stack.head_dim, &self.linear);
         assert!(self.rotary <= width && self.rotary % 2 == 0, "rotary width");
@@ -176,3 +240,114 @@ impl DeltaNet {
 
 /// The epsilon under the unit norm of queries and keys.
 const L2_EPS: f32 = 1e-6;
+
+/// `key` under `text_config`, else at the top.
+fn text<T: DeserializeOwned + Default>(k: &mut Keys, key: &str) -> T {
+    k.need(&[&format!("text_config.{key}"), key])
+}
+
+/// Each layer's mixer, from `layer_types`.
+fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
+    let types: Vec<String> = text(k, "layer_types");
+    let mut out = Vec::new();
+    for t in &types {
+        match t.as_str() {
+            "linear_attention" => out.push(Mixing::Linear),
+            "full_attention" => out.push(Mixing::Full),
+            _ => k.misfit("layer_types", format!("no layer type {t}")),
+        }
+    }
+    if out.len() as u64 != layers {
+        k.misfit("layer_types", "one type per layer");
+    }
+    out
+}
+
+/// Weights every layer holds, whatever its mixer.
+#[derive(Weights)]
+pub struct Common {
+    #[shape(Hidden)]
+    pub ln1: Vector,
+    #[shape(Hidden)]
+    pub ln2: Vector,
+    pub mlp: Swiglu,
+}
+
+/// A layer's token mixer.
+pub enum Mixer {
+    Linear(DeltaNet),
+    Full(Full),
+}
+
+pub struct Layer {
+    pub common: Common,
+    pub mixer: Mixer,
+}
+
+#[derive(Weights)]
+pub struct Ends {
+    #[shape(Vocab, Hidden)]
+    pub embed: Embed,
+    #[shape(Hidden)]
+    pub norm: Vector,
+}
+
+pub struct Qwen35 {
+    pub ends: Ends,
+    pub layers: Vec<Layer>,
+    /// The output head, when not tied to the embedding.
+    pub head: Option<Embed>,
+}
+
+impl Qwen35 {
+    /// Every weight `c` names, each layer as its mixer needs.
+    pub fn declare(m: &Model, c: &Config) -> Self {
+        let ends: Ends = tessera_trace::declare(m);
+        let mut layers = Vec::new();
+        for (i, kind) in c.layers.iter().enumerate() {
+            let mut path = vec![PathSeg::Field("layers".into()), PathSeg::Index(i as u32)];
+            let common = Common::declare(m, &mut path, &[]);
+            let mixer = match kind {
+                Mixing::Linear => Mixer::Linear(part(m, &mut path, "linear", &[])),
+                Mixing::Full => Mixer::Full(part(m, &mut path, "attn", &[])),
+            };
+            layers.push(Layer { common, mixer });
+        }
+        let shape = [Vocab.into(), Hidden.into()];
+        let head = (!c.tied).then(|| part(m, &mut Vec::new(), "head", &shape));
+        Self { ends, layers, head }
+    }
+}
+
+/// Each row's logits, from tokens and positions `[Seqs, Context]`.
+pub fn forward(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Tensor) -> Tensor {
+    let [logits] = m.composite(Composite::Model, || {
+        let mut x = m.embed(tokens, &w.ends.embed);
+        for l in &w.layers {
+            let [out] = m.composite(Composite::Layer, || {
+                let h = norm(&x, &l.common.ln1, c.eps);
+                let mixed = match &l.mixer {
+                    Mixer::Linear(net) => net.apply(m, c, &h),
+                    Mixer::Full(attn) => attn.apply(m, c, &h, positions),
+                };
+                let x = x.add(&mixed);
+                let h = norm(&x, &l.common.ln2, c.eps);
+                let [mlp] = m.composite(Swiglu::KIND, || [l.common.mlp.apply(m, &h)]);
+                [x.add(&mlp)]
+            });
+            x = out;
+        }
+        let h = norm(&x, &w.ends.norm, c.eps);
+        [h.unembed(w.head.as_ref().unwrap_or(&w.ends.embed))]
+    });
+    logits
+}
+
+/// One forward entry: tokens and positions in, logits out.
+pub fn program(c: &Config) -> Graph {
+    let m = Model::new(c.dims());
+    let w = Qwen35::declare(&m, c);
+    let [tokens, positions] = tokens(&m);
+    let logits = forward(&m, c, &w, &tokens, &positions);
+    m.finish([(Role::Logits, &logits)])
+}

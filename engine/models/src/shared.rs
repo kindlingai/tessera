@@ -38,7 +38,12 @@ impl Weights for Rotated {
 }
 
 /// Field `name` under `path`, declared with `shape`.
-fn part<T: Weights>(m: &Model, path: &mut Vec<PathSeg>, name: &str, shape: &[DimExpr]) -> T {
+pub(crate) fn part<T: Weights>(
+    m: &Model,
+    path: &mut Vec<PathSeg>,
+    name: &str,
+    shape: &[DimExpr],
+) -> T {
     path.push(PathSeg::Field(name.into()));
     let value = T::declare(m, path, shape);
     path.pop();
