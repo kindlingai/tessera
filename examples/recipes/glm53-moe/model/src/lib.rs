@@ -244,14 +244,17 @@ pub extern "C" fn manifest() -> i64 {
     let manifest = Manifest {
         abi: tessera_guest::ABI,
         kernels: [ROUTE, EXPERTS, FINISH]
-            .map(|k| site::kernel(k, k, include_str!("moe.cu")))
+            .map(|k| site::imports(k, k, "moe.cu"))
             .into(),
         rules: vec![site::Rule {
             name: NAME,
             site: Kind::Moe,
         }],
         graph: false,
-        files: Vec::new(),
+        files: vec![site::File {
+            path: "moe.cu",
+            text: include_str!("moe.cu"),
+        }],
     };
     output(serde_json::to_vec(&manifest).unwrap_or_default())
 }
