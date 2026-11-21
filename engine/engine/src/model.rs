@@ -1,7 +1,7 @@
 //! A forward graph with its weights, launched as a whole.
 
 use crate::Error;
-use tessera_graph::{DimExpr, DimName, Graph, Size};
+use tessera_graph::{DimExpr, DimName, Graph, Shape, Size};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Weight};
 use tessera_run::{Run, open};
@@ -25,6 +25,8 @@ pub struct Model {
     executor: Executor,
     /// Dimensions each launch sizes from its inputs.
     bounded: Vec<DimName>,
+    /// Dimensions planned at power-of-two buckets.
+    buckets: Vec<DimName>,
 }
 
 /// Each bounded dimension's size, read off the inputs' shapes.
@@ -48,6 +50,42 @@ fn sizes_of(
         return Err(Error::InputAxis);
     }
     Ok(sizes)
+}
+
+/// `shape` at `sizes`.
+fn extents(g: &Graph, shape: &Shape, sizes: &[(DimName, u64)]) -> Vec<usize> {
+    let size = |name| sizes.iter().find(|(d, _)| *d == name).map(|(_, n)| *n);
+    let axis = |e: &DimExpr| e.value(&g.dims, &size).unwrap_or(1) as usize;
+    shape.0.iter().map(axis).collect()
+}
+
+/// `t` at `shape`, each axis cut or zero filled.
+fn fitted(t: &Tensor, shape: Vec<usize>) -> Tensor {
+    if t.shape == shape {
+        return t.clone();
+    }
+    let width = t.bytes().len() / t.len().max(1);
+    let mut out = Tensor::zeros(shape.clone(), t.dtype());
+    copy(t.bytes(), &t.shape, out.bytes_mut(), &shape, width);
+    out
+}
+
+/// The rows both shapes hold, from `from` into `to`.
+fn copy(from: &[u8], have: &[usize], to: &mut [u8], want: &[usize], width: usize) {
+    let (Some((&n, have)), Some((&m, want))) = (have.split_first(), want.split_first()) else {
+        return to.copy_from_slice(from);
+    };
+    let (a, b) = (
+        have.iter().product::<usize>(),
+        want.iter().product::<usize>(),
+    );
+    for i in 0..n.min(m) {
+        let (src, dst) = (
+            &from[i * a * width..][..a * width],
+            &mut to[i * b * width..],
+        );
+        copy(src, have, &mut dst[..b * width], want, width);
+    }
 }
 
 /// `w` as floats in the graph's shape.
@@ -89,7 +127,14 @@ impl Model {
             graph,
             executor,
             bounded,
+            buckets: Vec::new(),
         })
+    }
+
+    /// Plans per bucket of `dims`, for causal graphs only.
+    pub fn bucketed(mut self, dims: &[DimName]) -> Self {
+        self.buckets = dims.to_vec();
+        self
     }
 
     /// Takes the graph's weights, in its order.
@@ -137,15 +182,30 @@ impl Model {
                 tessera_interp::run(g, weights, 0, inputs).map_err(Error::from)
             }
             Executor::Planned(p) => {
-                let plan = p.plans.lower(g, 0, &sizes, &p.device)?;
-                p.runner.replan(&plan)?;
-                let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+                let (plan, bound) = p.plans.upto(g, 0, &sizes, &self.buckets, &p.device)?;
+                p.runner.replan(plan)?;
+                p.runner.bind_all(&bound);
+                // Inputs pad with zeros to the bucket.
+                let mut planned = sizes.clone();
+                for (name, n) in &bound {
+                    let at = planned.iter_mut().find(|(d, _)| d == name);
+                    at.expect("a bounded dimension").1 = u64::from(*n);
+                }
+                let entry = &g.entries[0];
+                let mut fed = Vec::with_capacity(inputs.len());
+                for (t, port) in inputs.iter().zip(&entry.inputs) {
+                    fed.push(fitted(t, extents(g, &port.ty.shape, &planned)));
+                }
+                let views: Vec<_> = fed.iter().map(Tensor::view).collect();
                 p.runner.feed(&views)?;
                 p.runner.submit(0..plan.steps.len())?;
-                plan.outputs
-                    .iter()
-                    .map(|o| Ok(p.runner.read(o.slot)?))
-                    .collect()
+                let mut out = Vec::with_capacity(plan.outputs.len());
+                for (o, at) in plan.outputs.iter().zip(&entry.outputs) {
+                    let shape = &g.nodes[at.node.0 as usize].ty.shape;
+                    let full = p.runner.read(o.slot)?.reshaped(extents(g, shape, &planned));
+                    out.push(fitted(&full, extents(g, shape, &sizes)));
+                }
+                Ok(out)
             }
         }
     }
