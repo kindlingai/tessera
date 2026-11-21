@@ -52,23 +52,23 @@ impl Runner {
         let Some(body) = &self.bodies[step] else {
             return Err(Error::Handwritten(self.base.plan.steps[step].kernel.name()));
         };
-        // Every buffer once, however many arguments point into it.
-        let mut buffers: Vec<u32> = Vec::new();
+        // Every distinct slot slice once, however many arguments use it.
+        let mut slices: Vec<(u32, usize, usize)> = Vec::new();
         let mut args = Vec::with_capacity(launch.args.len());
         for (arg, param) in launch.args.iter().zip(&body.params) {
             args.push(match (arg, param) {
                 (Arg::Buffer(slot, Extent::Fixed(skip)), Param::Buffer { form, .. }) => {
-                    let at = match buffers.iter().position(|b| *b == slot.buffer) {
+                    let key = (slot.buffer, slot.start(), self.base.held.span(*slot));
+                    let at = match slices.iter().position(|s| *s == key) {
                         Some(at) => at,
                         None => {
-                            buffers.push(slot.buffer);
-                            buffers.len() - 1
+                            slices.push(key);
+                            slices.len() - 1
                         }
                     };
-                    let skip = form.elements(slot.start()) + skip;
                     ArgVal::Buf {
                         at,
-                        skip,
+                        skip: *skip,
                         form: *form,
                     }
                 }
@@ -100,7 +100,7 @@ impl Runner {
             },
             Shape::Runtime(_) => unreachable!("bound before running"),
         };
-        let mut mapped = self.base.held.mapped_mut(&buffers);
+        let mut mapped = self.base.held.mapped_mut(&slices);
         if let Some(entry) = self.compiled[step]
             && grid.threads <= THREADS
         {

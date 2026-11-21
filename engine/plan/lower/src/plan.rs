@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tessera_codegen::kept::Layout;
 use tessera_graph::{NodeId, Order};
 
-/// `len` elements of one buffer, `offset` elements in.
+/// `len` elements of one buffer, `offset` bytes in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub buffer: u32,
@@ -29,7 +29,7 @@ impl Slot {
 
     /// The first byte's offset.
     pub fn start(&self) -> usize {
-        self.form.offset(self.offset)
+        self.offset
     }
 
     pub fn bytes(&self) -> usize {
@@ -38,7 +38,7 @@ impl Slot {
 
     /// The byte offset of element `skip`.
     pub fn at(&self, skip: usize) -> usize {
-        self.form.offset(self.offset + skip)
+        self.offset + self.form.offset(skip)
     }
 }
 
@@ -185,16 +185,24 @@ impl Plan {
         self.zones.iter().any(|z| *z != 0)
     }
 
-    /// Bytes in buffers no weight, input or kept row owns.
+    /// Bytes in buffers no weight, kept row or table owns.
     pub fn scratch(&self) -> usize {
-        let named = self
-            .weights
-            .iter()
-            .map(|l| &l.slot)
-            .chain(self.kept.iter().map(|(_, s)| s))
-            .chain(&self.table);
-        let owned = |s: &Slot| self.buffers[s.buffer as usize];
-        let held: usize = named.chain(&self.inputs).map(owned).sum();
-        self.buffers.iter().sum::<usize>() - held
+        let mut owned = vec![false; self.buffers.len()];
+        for l in &self.weights {
+            owned[l.slot.buffer as usize] = true;
+        }
+        for (_, s) in &self.kept {
+            owned[s.buffer as usize] = true;
+        }
+        if let Some(s) = self.table {
+            owned[s.buffer as usize] = true;
+        }
+        let mut total = 0;
+        for (&bytes, held) in self.buffers.iter().zip(owned) {
+            if !held {
+                total += bytes;
+            }
+        }
+        total
     }
 }

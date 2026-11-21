@@ -137,7 +137,8 @@ fn buffers_are_shared() {
     let plan = lower(&g, 0, &SIZES, &Device::guess(&host())).unwrap();
     assert_eq!(plan.order(), tessera_graph::Order::Fixed);
     for s in &plan.steps {
-        let in_place = s.reads.iter().any(|r| r.buffer == s.write.buffer);
+        let same = |r: &Slot| r.buffer == s.write.buffer && r.offset == s.write.offset;
+        let in_place = s.reads.iter().any(same);
         assert_eq!(in_place, s.kernel.overwrites());
     }
     let values = plan.weights.len() + plan.inputs.len() + plan.steps.len();
@@ -202,9 +203,10 @@ fn step(seqs: u64, rows: u64, all: u64) -> Result<Plan, Error> {
 fn kept_rows_fit() {
     let plan = step(1, 2, 5).unwrap();
     assert_eq!(plan.kept.len(), 2, "keys and values");
-    // Sixteen rows of sixteen, for up to sixteen rows.
-    for (_, slot) in &plan.kept {
-        assert_eq!((slot.len, plan.buffers[slot.buffer as usize]), (80, 1024));
+    // Sixteen rows of sixteen, two kept tensors in one arena.
+    for (i, (_, slot)) in plan.kept.iter().enumerate() {
+        let got = (slot.len, slot.offset, plan.buffers[slot.buffer as usize]);
+        assert_eq!(got, (80, i * 1024, 2048));
     }
     let appends = plan.steps.iter().filter(|s| s.kernel.name() == "scatter");
     for s in appends.clone() {
@@ -529,6 +531,231 @@ fn small_weights_stay() {
         .unwrap();
     runner.replan(&plan(3)).unwrap();
     let slot = runner.plan().weights[0].slot;
-    assert_eq!(runner.plan().buffers[slot.buffer as usize], 2);
+    assert_eq!(slot.bytes(), 2);
     assert_eq!(runner.read(slot).unwrap().view().to_f32().unwrap(), [0.5]);
+}
+
+#[derive(Weights)]
+struct Three {
+    #[shape(Hidden)]
+    a: Vector,
+    #[shape(Hidden)]
+    b: Vector,
+    #[shape(Hidden)]
+    c: Vector,
+}
+
+#[test]
+fn mixed_weights_pack() {
+    let q4 = tessera_lower::form::named("q4_0").unwrap();
+    let m = Model::new(vec![
+        Dim::bounded(Seqs, 2),
+        Dim::bounded(Rows, 4),
+        Dim::fixed(Hidden, 32),
+    ]);
+    let w: Three = declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [floats([Seqs, Rows, Hidden])]);
+    let out = x.mul_vector(&w.a).mul_vector(&w.b).mul_vector(&w.c);
+    let g = m.finish([(Role::Logits, &out)]);
+    let mut noise = Noise(9);
+    let sizes = [(Seqs, 1), (Rows, 2)];
+    let weights: Vec<Tensor> = g
+        .weights
+        .iter()
+        .map(|w| fill(&g, &w.ty, &sizes, &mut noise).unwrap())
+        .collect();
+    let input = fill(&g, &g.entries[0].inputs[0].ty, &sizes, &mut noise).unwrap();
+    let forms = [F32_FORM, BF16_FORM, q4];
+    let kept: Vec<Tensor> = weights
+        .iter()
+        .zip(forms)
+        .map(|(t, f)| Tensor::f32(t.shape.clone(), f.roundtrip(t.floats().unwrap())))
+        .collect();
+    let want = run(&g, &kept, 0, std::slice::from_ref(&input)).unwrap();
+    let pins = Pins::all(F32_FORM).pin("b", BF16_FORM).pin("c", q4);
+    for settings in runs() {
+        let device = Device::guess(&settings).pinned(pins.clone());
+        let plan = lower(&g, 0, &sizes, &device).unwrap();
+        assert_eq!(plan.weights.len(), 3);
+        let buf = plan.weights[0].slot.buffer;
+        assert!(plan.weights.iter().all(|l| l.slot.buffer == buf));
+        assert_eq!(
+            [
+                plan.weights[0].slot.offset,
+                plan.weights[1].slot.offset,
+                plan.weights[2].slot.offset,
+            ],
+            [0, 256, 512]
+        );
+        let mut runner = open(plan, &settings).unwrap();
+        for (at, t) in weights.iter().enumerate() {
+            runner.load(at as u32, t.view()).unwrap();
+        }
+        let got = runner.run(&[input.view()]).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-4, "off by {off:e}");
+    }
+}
+
+#[test]
+fn subset_weights_stay() {
+    let loaded = |weight, offset| tessera_lower::Loaded {
+        weight,
+        slot: Slot {
+            buffer: 0,
+            offset,
+            len: 4,
+            form: F32_FORM,
+        },
+        share: None,
+        part: None,
+    };
+    let full = Plan {
+        buffers: vec![768],
+        zones: vec![0],
+        weights: vec![loaded(0, 0), loaded(1, 256), loaded(2, 512)],
+        ..Plan::default()
+    };
+    let tail = Plan {
+        buffers: vec![512],
+        zones: vec![0],
+        weights: vec![loaded(0, 0), loaded(1, 256)],
+        ..Plan::default()
+    };
+    let middle = Plan {
+        buffers: vec![512],
+        zones: vec![0],
+        weights: vec![loaded(0, 0), loaded(2, 256)],
+        ..Plan::default()
+    };
+    let mut held = Held::default();
+    let allocs = std::cell::Cell::new(0usize);
+    let mut alloc = |z, n| {
+        allocs.set(allocs.get() + 1);
+        Ok(Buffer::host(z, n))
+    };
+    held.bind(&full, &mut alloc).unwrap();
+    for (i, l) in full.weights.iter().enumerate() {
+        let bytes = [(i as u8 + 1); 16];
+        held.upload(l.slot, &bytes).unwrap();
+    }
+    // Trailing subset reuses the same weight arena with zero allocs.
+    held.bind(&tail, &mut alloc).unwrap();
+    assert_eq!(allocs.get(), 1);
+    assert_eq!(
+        held.view(tail.weights[1].slot).bytes().unwrap().as_ref(),
+        [2; 16]
+    );
+    // Shifted subset copies preserved weight bytes.
+    held.bind(&middle, &mut alloc).unwrap();
+    assert_eq!(allocs.get(), 2);
+    assert_eq!(
+        held.view(middle.weights[1].slot).bytes().unwrap().as_ref(),
+        [3; 16]
+    );
+    // Switching back to full reuses the original arena intact.
+    held.bind(&full, &mut alloc).unwrap();
+    assert_eq!(allocs.get(), 2);
+    assert_eq!(
+        held.view(full.weights[1].slot).bytes().unwrap().as_ref(),
+        [2; 16]
+    );
+    assert_eq!(
+        held.view(full.weights[2].slot).bytes().unwrap().as_ref(),
+        [3; 16]
+    );
+}
+
+#[test]
+fn arenas_pack_zones() {
+    use tessera_lower::{Home, Op, Selected, Val, Value};
+    let val = |len, home, zone, form| Value {
+        len,
+        home,
+        zone,
+        form,
+        share: None,
+    };
+    let op = |reads, write, zone| Op {
+        kernel: KernelRef::new(Map::plain(Vec::new())),
+        rule: "map",
+        reads,
+        write,
+        covers: Vec::new(),
+        zone,
+    };
+    let q4 = tessera_lower::form::named("q4_0").unwrap();
+    let values = vec![
+        val(32, Home::Weight(2), 0, q4),
+        val(16, Home::Weight(0), 0, F32_FORM),
+        val(16, Home::Weight(1), 0, BF16_FORM),
+        val(
+            64,
+            Home::Kept {
+                index: 1,
+                room: 256,
+            },
+            0,
+            F32_FORM,
+        ),
+        val(
+            64,
+            Home::Kept {
+                index: 0,
+                room: 256,
+            },
+            0,
+            F32_FORM,
+        ),
+        val(64, Home::Input(0), 0, F32_FORM),
+        // Two adjacent temps coalesce for a wider temp.
+        val(64, Home::Temp, 0, F32_FORM),
+        val(64, Home::Temp, 0, F32_FORM),
+        val(64, Home::Temp, 0, F32_FORM),
+        val(128, Home::Temp, 0, F32_FORM),
+        // Second zone weight and scratch.
+        val(16, Home::Weight(3), 1, F32_FORM),
+        val(64, Home::Temp, 1, F32_FORM),
+    ];
+    let ops = vec![
+        op(vec![Val(5), Val(1)], Val(6), 0),
+        op(vec![Val(5), Val(2)], Val(7), 0),
+        op(vec![Val(6), Val(7)], Val(8), 0),
+        op(vec![Val(8)], Val(9), 0),
+        op(vec![Val(10)], Val(11), 1),
+    ];
+    let picked = Selected {
+        values,
+        ops,
+        inputs: vec![Val(5)],
+        outputs: vec![(Val(9), vec![128]), (Val(11), vec![64])],
+        table: 16,
+        ..Selected::default()
+    };
+    let plan = assign(&picked, &[0, 1, 2, 3, 4]);
+    let z0 = plan.zones.iter().filter(|&&z| z == 0).count();
+    let z1 = plan.zones.iter().filter(|&&z| z == 1).count();
+    assert!(z0 <= 4 && z1 <= 2, "zones: {z0}, {z1}");
+    let w0: Vec<_> = plan
+        .weights
+        .iter()
+        .filter(|l| plan.zone(l.slot.buffer) == 0)
+        .collect();
+    assert_eq!(w0.len(), 3);
+    assert_eq!((w0[0].weight, w0[1].weight, w0[2].weight), (0, 1, 2));
+    assert_eq!(
+        (w0[0].slot.offset, w0[1].slot.offset, w0[2].slot.offset),
+        (0, 256, 512)
+    );
+    assert!(w0.iter().all(|l| l.slot.buffer == w0[0].slot.buffer));
+    assert_eq!(plan.kept.len(), 2);
+    assert_eq!((plan.kept[0].0, plan.kept[1].0), (0, 1));
+    assert_eq!((plan.kept[0].1.offset, plan.kept[1].1.offset), (0, 1024));
+    assert_eq!(plan.kept[0].1.buffer, plan.kept[1].1.buffer);
+    for step in &plan.steps {
+        assert_eq!(step.write.offset % 256, 0);
+        assert!(step.reads.iter().all(|r| r.offset % 256 == 0));
+    }
+    let s0 = plan.buffers[plan.inputs[0].buffer as usize];
+    assert_eq!((s0, plan.outputs[0].slot.offset), (1024, 256));
 }
