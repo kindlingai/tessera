@@ -343,6 +343,12 @@ pub fn load_named(
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
+    let class = serde_json::from_str::<serde_json::Value>(&json)?["architectures"][0].take();
+    if class == qwen35::CLASS {
+        return Err(
+            format!("{class} has no step graph yet. tessera-eval --forward runs it").into(),
+        );
+    }
     let (arch, mut config) = config(dir, [slots, context], overrides)?;
     config.stack.steps = steps;
     let graph = stepper(&arch, &config)

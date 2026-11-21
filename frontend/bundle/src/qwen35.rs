@@ -10,6 +10,13 @@ use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+/// The Hugging Face class of a Qwen3.5 directory.
+pub(crate) const CLASS: &str = "Qwen3_5ForConditionalGeneration";
+
+fn rules() -> Vec<Rule> {
+    repo("qwen35").expect("the repository has Qwen3.5 rules")
+}
+
 /// The text model's logits graph, its forms and its files.
 pub struct Text {
     pub graph: Graph,
@@ -40,7 +47,7 @@ impl Text {
 pub fn open(dir: &Path, sizes: [u64; 2], overrides: &Overrides) -> Result<Text> {
     let c = config(dir, sizes, overrides)?;
     let graph = program(&c);
-    let (shards, rules) = (Shards::open(dir)?, repo("qwen35").unwrap_or_default());
+    let (shards, rules) = (Shards::open(dir)?, rules());
     let pins = pins(&graph, &shards, c.stack.layers, &[&rules])?;
     Ok(Text {
         graph,
@@ -57,6 +64,5 @@ pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> R
 
 /// Every weight `graph` reads from `dir`, held, and their forms.
 pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<(Vec<Weight>, Pins)> {
-    let rules = repo("qwen35").unwrap_or_default();
-    pull(graph, &Shards::open(dir)?, layers, &[&rules])
+    pull(graph, &Shards::open(dir)?, layers, &[&rules()])
 }

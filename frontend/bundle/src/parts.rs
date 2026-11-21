@@ -44,7 +44,7 @@ fn kind(dir: &Path) -> Option<Kind> {
         (Some("Flux2Transformer2DModel"), _) => Kind::Flux2,
         (Some("AutoencoderKLFlux2"), _) => Kind::Vae,
         (_, Some("EmbeddingGemma2Model")) => Kind::Eg2,
-        (_, Some("Qwen3_5ForConditionalGeneration")) => Kind::Qwen35,
+        (_, Some(qwen35::CLASS)) => Kind::Qwen35,
         _ => v["model_type"].as_str().map(|_| Kind::Decoder)?,
     })
 }
