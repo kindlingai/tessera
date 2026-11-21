@@ -1855,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "tessera-engine-comm",
  "tessera-gpukit",
+ "tessera-lower",
  "tessera-run",
  "tessera-testkit",
  "thiserror",
@@ -2165,6 +2166,7 @@ dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
  "tessera-codegen",
+ "tessera-device",
  "tessera-engine",
  "tessera-engine-settings",
  "tessera-graph",
@@ -2205,6 +2207,7 @@ dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
  "tessera-device",
+ "tessera-engine",
  "tessera-engine-comm",
  "tessera-frontend-comm",
  "tessera-frontend-settings",
@@ -2213,6 +2216,7 @@ dependencies = [
  "tessera-interp",
  "tessera-lower",
  "tessera-models",
+ "tessera-recipe",
  "tessera-rules",
  "tessera-run",
  "tessera-testkit",
@@ -2231,6 +2235,14 @@ dependencies = [
  "thiserror",
  "toml",
  "ureq",
+]
+
+[[package]]
+name = "tessera-resident-decoder-module"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tessera-guest",
 ]
 
 [[package]]

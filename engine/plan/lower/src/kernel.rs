@@ -60,6 +60,25 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn needs(&self) -> Needs {
         Needs::default()
     }
+    /// Set when one persistent grid runs the step.
+    fn resident(&self) -> Option<Resident> {
+        None
+    }
+}
+
+/// A persistent grid. Buffers become table items, u32s values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resident {
+    pub threads: u32,
+    /// Bytes of scratch the grid adds as its last item.
+    pub scratch: usize,
+    pub lanes: Vec<Collective>,
+}
+
+/// One collective lane's operation, over f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collective {
+    Sum,
 }
 
 /// A kernel's needs from the device to run.

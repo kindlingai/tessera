@@ -194,9 +194,12 @@ impl Cover<'_> {
                 let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts), &writes(&drafts)) else {
                     continue;
                 };
-                for r in absorbed {
-                    cost -= self.solve(r, zone).unwrap_or(f64::INFINITY);
-                }
+                // The zone must also cover each root the drafts absorb.
+                let own = absorbed.into_iter().map(|r| self.solve(r, zone));
+                let Some(own) = own.sum::<Option<f64>>() else {
+                    continue;
+                };
+                cost -= own;
                 // A favored rule wins here. Readers see its true cost.
                 let favored = self.device.favors(rule.name);
                 let beaten = |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {

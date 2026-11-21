@@ -157,6 +157,10 @@ impl<T: Transport> Run for Rank<T> {
         self.runner.launching(how)
     }
 
+    fn persist(&mut self, grid: Box<dyn crate::Grid>) -> Result<(), Error> {
+        self.runner.persist(grid)
+    }
+
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
         self.runner.repeat(step, times)
     }

@@ -376,6 +376,31 @@ fn module_sums_shards() {
 }
 
 #[test]
+fn module_runs_resident() {
+    let g = split_layer();
+    let sharded = shard(&g, &Parts::even(2)).unwrap().graph;
+    let text = "extern \"C\" __global__ void whole(const void* t) {}";
+    let kernels = json!([{"name": "wasm_whole", "entry": "whole", "cuda": text}]);
+    let whole = json!({
+        "kernel": "wasm_whole", "reads": [0, 1, 2], "len": 256,
+        "counts": [{"dim": "Rows"}], "shape": {"line": 1}, "work": 256, "guess": 1e-15,
+        "resident": {"threads": 128, "scratch": 1024, "lanes": ["sum"]},
+    });
+    let bytes = module(&declare(ABI, "layer", kernels), &json!([whole]), "");
+    let rule = tessera_wasm::load(&bytes).unwrap()[0];
+    for plan in ranks(&sharded, compiling(), rule) {
+        // One grid, and the sum runs inside it.
+        let [step] = &plan.steps[..] else {
+            panic!("{:?}", rules(&plan));
+        };
+        let resident = step.kernel.resident().unwrap();
+        assert_eq!((resident.threads, resident.scratch), (128, 1024));
+        // Three reads and the output, then the row count.
+        assert_eq!(step.launches()[0].args.len(), 5);
+    }
+}
+
+#[test]
 fn module_reads_parts() {
     let whole = json!({
         "kernel": "wasm_gemm", "len": 512,
@@ -602,6 +627,7 @@ fn guest(
         work: 8192.0,
         guess: 1e-15,
         writes: None,
+        resident: None,
     };
     let bytes = module(&json!(manifest), &json!([offer]), "");
     Ok(tessera_wasm::load(&bytes)?[0])

@@ -22,13 +22,15 @@ use tessera_trace::Norm;
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--sums host|grid]
+  [--stub ROUNDS] [--sums host|grid] [--recipe DIR]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
   persistent grid per rank, over that fabric or the file.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
-  --stub runs ROUNDS sums in one persistent grid per rank instead of a model.";
+  --stub runs ROUNDS sums in one persistent grid per rank instead of a model.
+  --recipe runs the small decoder with the recipe's resident grid per rank,
+  over --shm or --verbs, and rank 0 checks it against one engine alone.";
 
 struct Args {
     rank: u32,
@@ -51,6 +53,8 @@ struct Args {
     stub: Option<u32>,
     /// The model's sums run in a persistent grid.
     grid: bool,
+    /// A recipe whose grid runs the small decoder.
+    recipe: Option<PathBuf>,
 }
 
 fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
@@ -69,6 +73,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         fabric: None,
         stub: None,
         grid: false,
+        recipe: None,
     };
     while let Some(flag) = given.next() {
         let value = given.next()?;
@@ -87,6 +92,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
             "--sums" => args.grid = grid_flag(&value)?,
+            "--recipe" => args.recipe = Some(value.into()),
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
@@ -107,6 +113,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
     ((args.rank as usize) < args.ranks).then_some(args)
 }
 
+mod resident;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod stub;
 
@@ -132,9 +139,10 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let ran = match args.stub {
-        Some(rounds) => stub(&args, rounds),
-        None => run(&args),
+    let ran = match (args.stub, &args.recipe) {
+        (Some(rounds), _) => stub(&args, rounds),
+        (None, Some(dir)) => resident::run(&args, dir),
+        (None, None) => run(&args),
     };
     match ran {
         Ok(()) => ExitCode::SUCCESS,

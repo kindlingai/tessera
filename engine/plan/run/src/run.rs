@@ -161,6 +161,11 @@ pub trait Run {
     }
     /// How to launch from now on, where the device can.
     fn launching(&mut self, _: Launching) {}
+    /// Runs resident steps through `grid` from now on.
+    fn persist(&mut self, grid: Box<dyn crate::Grid>) -> Result<(), Error> {
+        drop(grid);
+        Err(Error::NoGrids)
+    }
     /// Starts or stops timing each step.
     fn profiling(&mut self, on: bool) {
         self.base_mut().profile = on.then(Profile::default);

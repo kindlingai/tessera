@@ -29,15 +29,20 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// The most bytes in one relayed put.
 pub const RELAY: usize = ROOM as usize * 4;
 
+/// One two-way pool of every rank, slots of `RELAY` bytes.
+pub(crate) fn pool(ranks: u32) -> PoolPlan {
+    PoolPlan {
+        depth: 2,
+        one_way: false,
+        group: (0..ranks).collect(),
+        send_bytes: RELAY as u32,
+        recv_bytes: RELAY as u32,
+    }
+}
+
 fn plan(ranks: u32) -> Plan {
     Plan {
-        pools: vec![PoolPlan {
-            depth: 2,
-            one_way: false,
-            group: (0..ranks).collect(),
-            send_bytes: RELAY as u32,
-            recv_bytes: RELAY as u32,
-        }],
+        pools: vec![pool(ranks)],
         lanes: vec![LanePlan {
             op: Op::Sum,
             elem: crate::layout::F32,

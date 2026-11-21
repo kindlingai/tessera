@@ -39,7 +39,7 @@ pub use tessera_mem::{block, trellis};
 pub use tessera_models::{
     Stack, Steps, clip, decoder, eg2, flux2, gemma4, keys, mla, sprite, tagger, vae,
 };
-pub use tessera_run::{gpu, pinning};
+pub use tessera_run::{Grid, gpu, pinning};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;
 
@@ -272,6 +272,11 @@ impl Engine {
             held: None,
             ranks: None,
         })
+    }
+
+    /// Runs resident steps through `grid` from now on.
+    pub fn persist(&mut self, grid: Box<dyn Grid>) -> Result<(), Error> {
+        Ok(self.runner.persist(grid)?)
     }
 
     /// Uploads the graph's weights, in its order.

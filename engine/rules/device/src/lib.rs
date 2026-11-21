@@ -6,6 +6,7 @@ pub mod proxy;
 pub mod resident;
 mod scan;
 pub mod sums;
+pub mod whole;
 
 #[cfg(test)]
 mod flatten_test;

@@ -2,7 +2,7 @@
 
 use crate::dims::{Dim, DimExpr, DimName, Shape};
 use crate::infer::{ErrorKind, TypeError, infer};
-use crate::node::{EntryKind, Graph, Node, NodeId, Op, Port, Role, Select, View};
+use crate::node::{Composite, EntryKind, Graph, Node, NodeId, Op, Port, Role, Select, View};
 use crate::types::{DType, TensorType};
 use crate::verify::{VerifyError, verify};
 use DimName::{Picks, Rows};
@@ -52,11 +52,12 @@ pub fn trim(g: &Graph, entry: usize) -> Result<Graph, VerifyError> {
         }
     }
     let mut out = rebuild(g, entry, &need, &anchors);
-    // A layer or model with picked rows splits apart.
+    // A layer with picked rows splits apart. Models read picks.
     let regions = std::mem::take(&mut out.regions);
     for (r, was) in regions.into_iter().zip(&g.regions) {
         let mut span = was.start.0 as usize..was.end.0 as usize;
-        if was.kind.block() || !span.any(|i| need[i] == Need::Picked) {
+        let whole = was.kind.block() || was.kind == Composite::Model;
+        if whole || !span.any(|i| need[i] == Need::Picked) {
             out.regions.push(r);
         }
     }
@@ -266,15 +267,17 @@ fn rebuild(g: &Graph, entry: usize, need: &[Need], anchors: &[Option<usize>]) ->
     let mut map: Vec<NodeId> = Vec::with_capacity(g.nodes.len());
     let mut gathered: Vec<Option<NodeId>> = vec![None; g.nodes.len()];
     let mut picks = None;
+    let ahead = early(g, anchors);
+    let input = Op::Input {
+        entry: entry as u32,
+        port,
+    };
     for (i, sources) in due.iter().enumerate() {
+        if Some(i) == ahead {
+            picks = Some(push(&mut out, input.clone(), Vec::new()));
+        }
         for &s in sources {
-            let ids = *picks.get_or_insert_with(|| {
-                let op = Op::Input {
-                    entry: entry as u32,
-                    port,
-                };
-                push(&mut out, op, Vec::new())
-            });
+            let ids = *picks.get_or_insert_with(|| push(&mut out, input.clone(), Vec::new()));
             let op = Op::Select(Select::Gather);
             gathered[s] = Some(push(&mut out, op, vec![map[s], ids]));
         }
@@ -308,6 +311,22 @@ fn rebuild(g: &Graph, entry: usize, need: &[Need], anchors: &[Option<usize>]) ->
         out.regions[k].inputs = out.reads(start, end);
     }
     out
+}
+
+/// Where picks go: before a model region that gathers.
+fn early(g: &Graph, anchors: &[Option<usize>]) -> Option<usize> {
+    let first = anchors.iter().flatten().min().copied()?;
+    let start = |r: &crate::node::Region| r.start.0 as usize;
+    let holds = |r: &&crate::node::Region| {
+        r.kind == Composite::Model && (start(r)..r.end.0 as usize).contains(&first)
+    };
+    Some(
+        g.regions
+            .iter()
+            .filter(holds)
+            .map(start)
+            .fold(first, usize::min),
+    )
 }
 
 /// Appends a node, typed later by `retype`.

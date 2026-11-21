@@ -28,7 +28,7 @@ pub use cut::{cut, cut_region};
 pub use error::{Size, Unsupported};
 pub use extent::Extent;
 pub use form::{Pins, Weight};
-pub use kernel::{Kernel, KernelRef, Needs, UNPROVEN};
+pub use kernel::{Collective, Kernel, KernelRef, Needs, Resident, UNPROVEN};
 pub use plan::{Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{Launching, Recipe};
 pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};

@@ -152,10 +152,14 @@ pub(crate) fn drafts(
     let (mut sums, mut written) = (0, vec![None; from.outputs.len()]);
     for entry in entries {
         let (draft, writes) = match entry {
-            Entry::Launch(offer) => (
-                launch(&offer, kernels, tree, from, drafts.len())?,
-                offer.writes,
-            ),
+            Entry::Launch(offer) => {
+                // A resident grid runs every sum itself.
+                if offer.resident.is_some() {
+                    sums += from.sums.len();
+                }
+                let made = drafts.len();
+                (launch(&offer, kernels, tree, from, made)?, offer.writes)
+            }
             Entry::Sum(sum) => {
                 let len = drafts.get(sum.all_reduce)?.len;
                 // Ranks pair sums by order, so each length must match.

@@ -1,12 +1,13 @@
 //! Replays a plan on any GPU over the device traits.
 
 use crate::Error;
+use crate::grid::{self, Grid};
 use crate::kernels::{Kernels, dialect};
 use crate::marks;
 use crate::overrides::{self, Overrides};
 use crate::profile::Marks;
 use crate::run::{Base, Reload, Run};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -48,6 +49,10 @@ pub(crate) struct Runner<D: Device> {
     waits: Vec<bool>,
     /// Launches left before a closed gate opens. Zero when open.
     gated: Cell<usize>,
+    /// Runs resident steps, once given.
+    grid: RefCell<Option<Box<dyn Grid>>>,
+    /// Which steps a persistent grid runs.
+    resident: Vec<bool>,
 }
 
 /// Launches a closed gate holds, under any driver queue.
@@ -75,6 +80,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             overlaps: ctx.platform().limits.pdl,
             waits: Vec::new(),
             gated: Cell::new(0),
+            grid: RefCell::new(None),
+            resident: Vec::new(),
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -132,13 +139,41 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         self.gated.set(left.saturating_sub(1));
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
-        self.ctx.programmatic(overlap);
-        let mut args = self.bound(&launch.args)?;
-        let fired = self.fire(&self.kernels[step], launch.shape, &mut args);
+        self.ctx.programmatic(overlap && !self.resident[step]);
+        let fired = match self.resident[step] {
+            true => self.persistent(step, launch),
+            false => {
+                let mut args = self.bound(&launch.args)?;
+                self.fire(&self.kernels[step], launch.shape, &mut args)
+            }
+        };
         fired.map_err(|e| {
             let name = self.base.plan.steps[step].kernel.name().to_string();
             Error::Launch(step, name, Box::new(e))
         })
+    }
+
+    /// One grid launch. It waits, so held launches go first.
+    fn persistent(&self, step: usize, launch: &Call) -> Result<(), Error> {
+        self.open();
+        let base = |slot| self.buffer(slot).device_ptr();
+        let (items, values) = table(launch, base)?;
+        let mut grid = self.grid.borrow_mut();
+        let grid = grid.as_mut().ok_or(Error::Gridless(step))?;
+        grid.launch(&items, &values)
+    }
+
+    /// Opens the grid for each resident step of `plan`.
+    fn ready(&mut self, plan: &Plan) -> Result<(), Error> {
+        let grid = self.grid.get_mut();
+        for (i, step) in plan.steps.iter().enumerate() {
+            let (Some(grid), true) = (grid.as_mut(), self.resident[i]) else {
+                continue;
+            };
+            let items = step.launches().iter().map(items).max();
+            grid.open(&step.kernel, items.unwrap_or(0))?;
+        }
+        Ok(())
     }
 
     /// Holds the device queue for the next launches, if able.
@@ -225,8 +260,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     /// Launches every step, as a recorded graph when whole.
     fn run(&mut self, steps: Range<usize>, timed: bool) -> Result<Option<f64>, Error> {
+        // A recorded graph cannot hold a grid that waits.
         let whole = self.launching.graphs
             && self.ctx.graphs()
+            && !self.resident.contains(&true)
             && self.base.plan.id != 0
             && steps == (0..self.base.plan.steps.len());
         if !whole {
@@ -355,6 +392,30 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     }
 }
 
+/// A bound launch as items and values, by argument order.
+fn table(
+    launch: &Call,
+    address: impl Fn(Slot) -> u64,
+) -> Result<(Vec<grid::Item>, Vec<u32>), Error> {
+    let (mut items, mut values) = (Vec::new(), Vec::new());
+    for arg in &launch.args {
+        match arg {
+            Arg::Buffer(slot, Extent::Fixed(skip)) => items.push(grid::Item {
+                at: address(*slot) + slot.at(*skip) as u64,
+                bytes: slot.bytes() - (slot.at(*skip) - slot.start()),
+            }),
+            arg => values.push(arg.u32().ok_or(tessera_lower::Error::Unbound)?),
+        }
+    }
+    Ok((items, values))
+}
+
+/// Items in a step's launch, before binding.
+fn items(launch: &Call) -> usize {
+    let buffer = |a: &&Arg| matches!(a, Arg::Buffer(..));
+    launch.args.iter().filter(buffer).count()
+}
+
 /// Pinned host memory from the shared context.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) struct Pin<D: Device>(pub(crate) &'static D);
@@ -402,6 +463,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         })?;
         self.kernels.clear();
         self.waits.clear();
+        self.resident = plan
+            .steps
+            .iter()
+            .map(|s| s.kernel.resident().is_some())
+            .collect();
         for step in &plan.steps {
             let fixed = |text, entry| -> Result<_, Error> { Ok(cached_source::<D>(text, entry)?) };
             let made =
@@ -414,6 +480,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.planned = self.kernels.clone();
         self.index(plan);
         self.apply();
+        self.ready(plan)?;
         self.base.adopt(plan);
         Ok(())
     }
@@ -425,7 +492,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
-        if dialect(D::BACKEND) == Dialect::Metal {
+        if dialect(D::BACKEND) == Dialect::Metal || self.resident[step] {
             return Ok(None);
         }
         let source = self.base.plan.steps[step].kernel.source();
@@ -475,6 +542,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     fn launching(&mut self, launching: Launching) {
         self.launching = launching;
         self.graphs.clear();
+    }
+
+    fn persist(&mut self, grid: Box<dyn Grid>) -> Result<(), Error> {
+        *self.grid.get_mut() = Some(grid);
+        let plan = self.base.plan.clone();
+        self.ready(&plan)
     }
 
     fn address(&self, slot: Slot) -> Option<u64> {

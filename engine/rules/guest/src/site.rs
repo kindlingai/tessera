@@ -202,6 +202,28 @@ pub struct Offer<K = &'static str, C = Count> {
     /// Output index it writes. With one output, the last entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writes: Option<usize>,
+    /// Set when the launch is one persistent grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident: Option<Resident>,
+}
+
+/// One grid per launch, over a table, with sums inside.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Resident {
+    pub threads: u32,
+    /// Bytes of scratch, the last table item.
+    #[serde(default)]
+    pub scratch: usize,
+    /// The collective lanes, in kernel lane order.
+    pub lanes: Vec<Lane>,
+}
+
+/// One collective lane's operation, over f32.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    Sum,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

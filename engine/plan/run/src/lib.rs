@@ -3,6 +3,7 @@
 mod cpu;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod device;
+mod grid;
 mod held;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
@@ -20,6 +21,7 @@ mod rank;
 mod run;
 pub mod testing;
 
+pub use grid::{Grid, Item};
 pub use held::Held;
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
@@ -58,6 +60,12 @@ pub enum Error {
     },
     #[error("sums: {0}")]
     Sums(Box<dyn std::error::Error + Send + Sync>),
+    #[error("grid: {0}")]
+    Grid(Box<dyn std::error::Error + Send + Sync>),
+    #[error("step {0} runs in a persistent grid, and none is given")]
+    Gridless(usize),
+    #[error("this runner has no persistent grids")]
+    NoGrids,
     #[error("step {0} has no device address")]
     Unaddressed(usize),
     #[error("a sum of {0} floats does not fit the device")]

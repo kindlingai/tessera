@@ -1,11 +1,11 @@
 //! A module's kernel text, launched with plain arguments.
 
-use crate::abi::{File, Offer, Shape};
+use crate::abi::{File, Lane, Offer, Shape};
 use crate::leak;
 use std::fmt;
 use tessera_device::{Backend, Options, Problem, flatten};
 use tessera_lower::kept::Layout;
-use tessera_lower::{Arg, Kernel, Launch, Needs, Source, Step};
+use tessera_lower::{Arg, Collective, Kernel, Launch, Needs, Resident, Source, Step};
 
 /// A module kernel's text, never freed.
 #[derive(Debug)]
@@ -88,6 +88,7 @@ pub struct Text {
     pub guess: f64,
     /// For kept-row launches: the layout and its scalars.
     pub kept: Option<(&'static dyn Layout, Vec<Arg>)>,
+    pub resident: Option<Resident>,
 }
 
 impl Text {
@@ -104,6 +105,11 @@ impl Text {
                 threads,
             },
         };
+        let resident = offer.resident.as_ref().map(|r| Resident {
+            threads: r.threads,
+            scratch: r.scratch,
+            lanes: r.lanes.iter().map(|Lane::Sum| Collective::Sum).collect(),
+        });
         Self {
             fixed,
             args,
@@ -111,6 +117,7 @@ impl Text {
             work: offer.work,
             guess: offer.guess,
             kept: None,
+            resident,
         }
     }
 }
@@ -120,7 +127,11 @@ impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Fixed { name, .. } = self.fixed;
         let layout = self.kept.as_ref().map(|(l, _)| l.name());
-        write!(f, "{name}{:?}{:?}{layout:?}", self.args, self.shape)
+        write!(f, "{name}{:?}{:?}{layout:?}", self.args, self.shape)?;
+        match &self.resident {
+            Some(r) => write!(f, "{r:?}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -179,6 +190,10 @@ impl Kernel for Text {
     /// The module saw each read's form before it offered.
     fn accepts(&self, _: usize, _: &dyn tessera_lower::form::Load) -> bool {
         true
+    }
+
+    fn resident(&self) -> Option<Resident> {
+        self.resident.clone()
     }
 
     /// A module may bring text for some backends only.

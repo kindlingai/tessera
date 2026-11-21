@@ -14,6 +14,7 @@ rocm = ["tessera-gpukit/rocm"]
 [dependencies]
 tessera-engine-comm = { workspace = true }
 tessera-gpukit = { workspace = true }
+tessera-lower = { workspace = true }
 tessera-run = { workspace = true }
 thiserror = "2"
 

@@ -168,6 +168,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         work: (rows * experts * hidden) as f64,
         guess: 1e-12,
         writes: None,
+        resident: None,
     };
     let reads = [Place::Read(0), scores].into_iter();
     let reads = reads.chain((2..=11).map(Place::Read));
@@ -200,6 +201,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         work: (groups * slots * 3 * hidden * ffn) as f64,
         guess: 1e-15,
         writes: None,
+        resident: None,
     };
     let finish = Offer {
         kernel: FINISH,
@@ -230,6 +232,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         work: len as f64,
         guess: 1e-12,
         writes: None,
+        resident: None,
     };
     Some(vec![route, experts_offer, finish])
 }

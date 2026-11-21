@@ -26,8 +26,8 @@ const DOORBELL: u32 = 1;
 const LINK: u32 = 2;
 /// The first arena a plan's items name.
 pub const USER: u32 = LINK + REGIONS as u32;
-/// Every pool starts at this ordinal.
-const BASE: u64 = 1;
+/// A first grid's pools start at this ordinal.
+pub(crate) const BASE: u64 = 1;
 
 const CLOCK: &str = include_str!("clock.kernel");
 
@@ -153,6 +153,8 @@ fn zeroed<T>() -> T {
 struct Places {
     launch: u64,
     status: u64,
+    items: u64,
+    counters: u64,
 }
 
 pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
@@ -199,6 +201,8 @@ pub struct Resident<D: Device, L> {
     clock: (u64, Instant),
     seq: u64,
     broken: bool,
+    /// The table's item count.
+    items: usize,
     /// A grid started apart, until `join`.
     apart: Option<Box<dyn Apart>>,
 }
@@ -210,9 +214,21 @@ where
 {
     /// Compiles `text`, lays out `plan` and starts the proxy.
     pub fn open(ctx: &D, text: &str, entry: &str, link: L, plan: &Plan) -> Result<Self, Error> {
+        let kernel = ctx.compile(text, entry)?;
+        Self::compiled(ctx, kernel, entry, link, plan, BASE)
+    }
+
+    /// The same, compiled, with pools from ordinal `base`.
+    pub fn compiled(
+        ctx: &D,
+        kernel: <D as Device>::Kernel,
+        entry: &str,
+        link: L,
+        plan: &Plan,
+        base: u64,
+    ) -> Result<Self, Error> {
         let rank = link.rank();
         check(plan, rank)?;
-        let kernel = ctx.compile(text, entry)?;
         let fit = ctx.resident(&kernel, plan.threads, 0)?;
         if fit == 0 {
             let threads = plan.threads;
@@ -235,6 +251,8 @@ where
             places: Places {
                 launch: 0,
                 status: 0,
+                items: 0,
+                counters: 0,
             },
             page,
             registered: Vec::new(),
@@ -245,6 +263,7 @@ where
             clock: (0, Instant::now()),
             seq: 0,
             broken: false,
+            items: 0,
             apart: None,
         };
         let mut arenas = [0u64; ARENAS];
@@ -259,8 +278,8 @@ where
             width: width(l.elem),
             block: l.block,
         });
-        let proxy = Proxy::new(&mut page_words, pools, proxy_lanes.collect(), BASE)?;
-        made.lay_out(&wired, plan, [rank, ranks], arenas)?;
+        let proxy = Proxy::new(&mut page_words, pools, proxy_lanes.collect(), base)?;
+        made.lay_out(&wired, plan, [rank.into(), ranks.into(), base], arenas)?;
         made.clock = (clock(ctx)?, Instant::now());
         made.running = Some(Running::spawn(proxy, page_words, wired));
         Ok(made)
@@ -316,9 +335,10 @@ where
         &mut self,
         wired: &Wired<L>,
         plan: &Plan,
-        [rank, ranks]: [u32; 2],
+        [rank, ranks, base]: [u64; 3],
         arenas: [u64; ARENAS],
     ) -> Result<(), Error> {
+        let (rank, ranks) = (rank as u32, ranks as u32);
         let mut block = Block::default();
         let table_at = block.put(&[zeroed::<Table>()]);
         let launch = block.put(&[zeroed::<Record>()]);
@@ -332,10 +352,11 @@ where
             set.pools[p] = pool_record(pool, p, place);
         }
         let mut counters: Counters = zeroed();
-        counters.next = [BASE; MAX_POOLS];
+        counters.next = [base; MAX_POOLS];
         // The first bump must differ from the page's zero.
         counters.writes = 1;
-        set.state = Ref::at(CONTROL, block.put(&[counters]));
+        let counted = block.put(&[counters]);
+        set.state = Ref::at(CONTROL, counted);
         let pools = block.put(&[set]);
         let barrier = block.put(&[zeroed::<Barrier>()]);
         let status = block.put(&[zeroed::<Fault>()]);
@@ -371,8 +392,34 @@ where
         block.0[table_at as usize..][..size_of::<Table>()].copy_from_slice(bytes(&[table]));
         control.write_bytes(&block.0)?;
         self.control = control;
-        self.places = Places { launch, status };
+        self.places = Places {
+            launch,
+            status,
+            items,
+            counters: counted,
+        };
+        self.items = plan.items.len();
         Ok(())
+    }
+
+    /// The next free ordinal, the largest over the pools.
+    pub fn next(&self) -> Result<u64, Error> {
+        let mut next = [0u64; MAX_POOLS];
+        let raw =
+            unsafe { std::slice::from_raw_parts_mut(next.as_mut_ptr().cast(), 8 * MAX_POOLS) };
+        self.ctx
+            .download(self.table() + self.places.counters, raw)?;
+        Ok(next.into_iter().max().unwrap_or(BASE))
+    }
+
+    /// Replaces the items, as many as the plan laid out.
+    pub fn refill(&mut self, items: &[Item]) -> Result<(), Error> {
+        if items.len() != self.items {
+            let laid = self.items;
+            return Err(plan(format!("{} items, laid out for {laid}", items.len())));
+        }
+        let at = self.table() + self.places.items;
+        Ok(self.ctx.upload(at, bytes(items))?)
     }
 
     /// Blocks in the grid.

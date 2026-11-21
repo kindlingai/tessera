@@ -12,6 +12,8 @@ pub(crate) const DOORBELL_ABORT: usize = 4032;
 pub(crate) const DOORBELL_SENT: usize = 4040;
 /// The `dtype` code of `F32`, first in `DTYPES`.
 pub(crate) const F32: u32 = 0;
+/// The `dtype` code of untyped bytes.
+pub(crate) const BYTES: u32 = 6;
 /// `dtype` names in code order, with bytes per element.
 pub(crate) const DTYPES: [(&str, u32); 7] = [
     ("F32", 4),

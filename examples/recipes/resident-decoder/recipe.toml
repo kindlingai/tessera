@@ -1,0 +1,10 @@
+# A small Qwen3-shaped decoder as one persistent kernel per step.
+# The rule fits the tests' small model, not a release.
+name = "resident-decoder"
+module = "model"
+
+[weights]
+path = "weights"
+
+[lower]
+favor = "resident_decoder"
