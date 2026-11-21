@@ -171,13 +171,20 @@ fn softmax_rows() {
 
 #[test]
 fn act_values() {
-    let acts = [Act::Relu, Act::Sigmoid, Act::Silu, Act::GeluTanh];
+    let acts = [
+        Act::Relu,
+        Act::Sigmoid,
+        Act::Silu,
+        Act::GeluTanh,
+        Act::Softplus,
+    ];
     let out = rows(Hidden, vec![-2., 0., 1., 3.], |x| acts.map(|a| x.act(a)));
     close(&out[0], &[0., 0., 1., 3.]);
     close(&out[1], &[0.119_202_92, 0.5, 0.731_058_6, 0.952_574_1]);
     close(&out[2], &[-0.238_405_84, 0., 0.731_058_6, 2.857_722_4]);
     // The tanh form. Exact erf gives 0.841_345 at 1.
     close(&out[3], &[-0.045_402_3, 0., 0.841_192, 2.996_362_6]);
+    close(&out[4], &[0.126_928, 0.693_147_2, 1.313_261_7, 3.048_587_4]);
 }
 
 #[test]

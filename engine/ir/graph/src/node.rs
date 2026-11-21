@@ -258,6 +258,8 @@ pub enum Act {
     Silu,
     Sigmoid,
     Relu,
+    /// `ln(1 + e^x)`.
+    Softplus,
 }
 
 /// Data-dependent picks.

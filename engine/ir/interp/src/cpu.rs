@@ -11,12 +11,18 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (COEF * (x + 0.044_715 * x * x * x)).tanh())
 }
 
+/// Exact for large `x`, where `e^x` overflows.
+fn softplus(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
 fn act(a: Act, x: f32) -> f32 {
     match a {
         Act::GeluTanh => gelu(x),
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Sigmoid => 1.0 / (1.0 + (-x).exp()),
         Act::Relu => x.max(0.0),
+        Act::Softplus => softplus(x),
     }
 }
 

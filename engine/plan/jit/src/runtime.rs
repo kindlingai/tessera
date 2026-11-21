@@ -343,6 +343,10 @@ pub extern "C" fn max(a: f32, b: f32) -> f32 {
     a.max(b)
 }
 
+pub extern "C" fn log(x: f32) -> f32 {
+    x.ln()
+}
+
 pub extern "C" fn pow(a: f32, b: f32) -> f32 {
     a.powf(b)
 }

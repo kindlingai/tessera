@@ -87,6 +87,14 @@ macro_rules! table {
                 host: |g, args, mask| g.unary(args, mask, f32::exp),
                 count: |c, _| c.tally(special(1.0), true),
             }
+            /// The natural log.
+            Log = fn log(f32) -> f32 {
+                device: define("f_log(x)", "precise::log(x)", "logf(x)"),
+                text: |p, args| p.spell("f_log", args),
+                wgsl: call("f_log(x: f32)", "f32", "log(x)"),
+                host: |g, args, mask| g.unary(args, mask, f32::ln),
+                count: |c, _| c.tally(special(1.0), true),
+            }
             Tanh = fn tanh(f32) -> f32 {
                 device: define("f_tanh(x)", "tanh(x)", "tanhf(x)"),
                 text: |p, args| p.spell("f_tanh", args),

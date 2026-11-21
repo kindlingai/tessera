@@ -12,10 +12,11 @@ pub enum Row {
     Silu,
     Sigmoid,
     Relu,
+    Softplus,
 }
 
 impl Row {
-    const ALL: [Row; 7] = [
+    const ALL: [Row; 8] = [
         Row::Add,
         Row::Mul,
         Row::Scale,
@@ -23,6 +24,7 @@ impl Row {
         Row::Silu,
         Row::Sigmoid,
         Row::Relu,
+        Row::Softplus,
     ];
 
     pub fn code(self) -> u32 {
@@ -85,5 +87,6 @@ pub fn apply(stage: Row, out: &mut [f32], b: &[f32], s: f32) {
         Row::Silu => each(out, |v| v / (1.0 + (-v).exp())),
         Row::Sigmoid => each(out, |v| 1.0 / (1.0 + (-v).exp())),
         Row::Relu => each(out, |v| v.max(0.0)),
+        Row::Softplus => each(out, |v| v.max(0.0) + (-v.abs()).exp().ln_1p()),
     }
 }

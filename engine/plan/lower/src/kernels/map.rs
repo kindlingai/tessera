@@ -69,6 +69,7 @@ impl MapStage {
             MapStage::Act(Act::Silu) => (Row::Silu, 0.0),
             MapStage::Act(Act::Sigmoid) => (Row::Sigmoid, 0.0),
             MapStage::Act(Act::Relu) => (Row::Relu, 0.0),
+            MapStage::Act(Act::Softplus) => (Row::Softplus, 0.0),
         }
     }
 }
@@ -96,6 +97,12 @@ fn act_expr(a: Act) -> Expr {
             Expr::bin(BinOp::Div, lit(1.0), den)
         }
         Act::Relu => call(Intrinsic::Max, vec![v(), lit(0.0)]),
+        Act::Softplus => {
+            let most = call(Intrinsic::Max, vec![v(), neg(v())]);
+            let tail = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Exp, vec![neg(most)]));
+            let floor = call(Intrinsic::Max, vec![v(), lit(0.0)]);
+            Expr::bin(BinOp::Add, floor, call(Intrinsic::Log, vec![tail]))
+        }
         Act::GeluTanh => {
             let cube = Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, v(), v()), v());
             let inner = Expr::bin(BinOp::Add, v(), Expr::bin(BinOp::Mul, lit(0.044715), cube));
