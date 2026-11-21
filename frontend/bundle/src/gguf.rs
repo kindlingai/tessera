@@ -49,6 +49,7 @@ fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, F
         experts: 0,
         top_k: 0,
         scales: Scales::default(),
+        tied: true,
     };
     if vocab == 0
         || slots == 0
@@ -169,14 +170,12 @@ pub(crate) fn load(
         .ok_or("a GGUF file names its architecture")?;
     let mut config = config(&gguf, arch, slots, context)?;
     config.stack.steps = steps;
+    // An output table unlike the embedding is the head's own.
+    config.tied = !gguf.has("output.weight")
+        || gguf.bytes("output.weight")? == gguf.bytes("token_embd.weight")?;
     let graph = stepper(arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let layers = config.stack.layers;
-    if gguf.has("output.weight")
-        && gguf.bytes("output.weight")? != gguf.bytes("token_embd.weight")?
-    {
-        return Err("an untied output.weight is not supported".into());
-    }
     let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
     let template = gguf
         .str("tokenizer.chat_template")

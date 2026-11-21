@@ -8,7 +8,7 @@ use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
-    Norm, Pairs, Role, Size, Tensor, TensorType, Weights,
+    Norm, Pairs, PathSeg, Role, Size, Tensor, TensorType, Weights,
 };
 
 /// Steps a query or key head passes through before RoPE.
@@ -113,6 +113,8 @@ pub struct Config {
     pub experts: u64,
     pub top_k: u64,
     pub scales: Scales,
+    /// The embedding table is also the output head.
+    pub tied: bool,
 }
 
 impl Config {
@@ -153,6 +155,7 @@ impl Config {
                 residual: k.or(&["residual_multiplier"], 1.0),
                 logits: 1.0 / k.or(&["logits_scaling"], 1.0),
             },
+            tied: k.or(&["tie_word_embeddings"], false),
         }
     }
 
@@ -166,6 +169,7 @@ impl Config {
             experts: 0,
             top_k: 0,
             scales: Scales::default(),
+            tied: true,
         }
     }
 
@@ -179,6 +183,7 @@ impl Config {
             experts: 0,
             top_k: 0,
             scales: Scales::default(),
+            tied: true,
         }
     }
 
@@ -197,6 +202,7 @@ impl Config {
                 residual: 0.22,
                 logits: 1.0 / 6.0,
             },
+            tied: true,
         }
     }
 
@@ -210,6 +216,7 @@ impl Config {
             experts: 0,
             top_k: 0,
             scales: Scales::default(),
+            tied: true,
         }
     }
 
@@ -243,7 +250,7 @@ pub struct Layer<N: HeadNorm, M: Mlp> {
     pub mlp: M,
 }
 
-/// The embedding table is also the output head.
+/// The trunk's weights. Untied heads are declared beside them.
 #[derive(Weights)]
 pub struct Decoder<N: HeadNorm, M: Mlp> {
     #[shape(Vocab, Hidden)]
@@ -254,6 +261,15 @@ pub struct Decoder<N: HeadNorm, M: Mlp> {
     pub norm: Norm,
 }
 
+/// The trunk's weights, and the head's own table when untied.
+fn declared<N: HeadNorm, M: Mlp>(m: &Model, c: &Config) -> (Decoder<N, M>, Option<Embed>) {
+    let w = tessera_trace::declare(m);
+    let mut path = vec![PathSeg::Field("head".into())];
+    let shape = [Vocab.into(), Hidden.into()];
+    let head = (!c.tied).then(|| Embed::declare(m, &mut path, &shape));
+    (w, head)
+}
+
 /// One layer's kept keys and values.
 type Cache = [Kept; 2];
 
@@ -261,6 +277,8 @@ type Cache = [Kept; 2];
 struct Pass<'a> {
     m: &'a Model,
     c: &'a Config,
+    /// The table rows unembed against.
+    head: &'a Embed,
     positions: &'a Tensor,
     /// The axis this launch's rows lie on.
     rows: DimName,
@@ -281,7 +299,7 @@ fn scaled(x: Tensor, by: f32) -> Tensor {
 pub fn forward<N: HeadNorm, M: Mlp>(
     m: &Model,
     c: &Config,
-    w: &Decoder<N, M>,
+    (w, head): (&Decoder<N, M>, Option<&Embed>),
     tokens: &Tensor,
     positions: &Tensor,
 ) -> Tensor {
@@ -289,6 +307,7 @@ pub fn forward<N: HeadNorm, M: Mlp>(
     let pass = Pass {
         m,
         c,
+        head: head.unwrap_or(&w.embed),
         positions,
         rows,
         slots: None,
@@ -307,7 +326,7 @@ impl Pass<'_> {
     ) -> Tensor {
         let [logits] = self.m.composite(Composite::Model, || {
             let h = self.hidden(w, tokens, kept);
-            [scaled(h.unembed(&w.embed), self.c.scales.logits)]
+            [scaled(h.unembed(self.head), self.c.scales.logits)]
         });
         logits
     }
@@ -392,21 +411,22 @@ impl Pass<'_> {
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let w: Decoder<N, M> = tessera_trace::declare(&m);
+    let (w, head) = declared::<N, M>(&m, c);
     let [tokens, positions] = tokens(&m);
-    let logits = forward(&m, c, &w, &tokens, &positions);
+    let logits = forward(&m, c, (&w, head.as_ref()), &tokens, &positions);
     m.finish([(Role::Logits, &logits)])
 }
 
 /// Residual rows after `layers`, joined on the last axis.
 pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
     let m = Model::new(c.dims());
-    let w: Decoder<N, M> = tessera_trace::declare(&m);
+    let (w, _) = declared::<N, M>(&m, c);
     // Key lists keep padding out of each row's attention.
     let [tokens, positions, keys] = listed(&m);
     let pass = Pass {
         m: &m,
         c,
+        head: &w.embed,
         positions: &positions,
         rows: Context,
         slots: None,
@@ -430,7 +450,7 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let size = Size::Bounded(c.stack.max_context);
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
-    let w: Decoder<N, M> = tessera_trace::declare(&m);
+    let (w, head) = declared::<N, M>(&m, c);
     let masked = c.stack.steps == Steps::Masked;
     let ([tokens, positions, slots], allowed) = step_ports(&m, masked);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
@@ -440,6 +460,7 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let pass = Pass {
         m: &m,
         c,
+        head: head.as_ref().unwrap_or(&w.embed),
         positions,
         rows,
         slots: Some(&slots),
@@ -461,7 +482,7 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let one = DimExpr::Const(1);
     let h = pass.hidden(&w, &tokens, Some(&kept));
     let h = h.reshape(vec![Rows.into(), one, Hidden.into()]);
-    let rows = m.embed(&ids, &w.embed);
+    let rows = m.embed(&ids, pass.head);
     let logits = h.matmul_rows(&rows).reshape([Rows, Candidates]);
     let logits = scaled(logits, c.scales.logits);
     let at = logits.top_k(1u64).reshape([Rows]);

@@ -1,16 +1,23 @@
+use crate::Overrides;
 use crate::names::{resolve, rules};
-use tessera_checkpoint::{Slice, Stored};
+use serde_json::json;
+use std::path::Path;
+use tessera_checkpoint::{Shards, Slice, Stored};
 use tessera_engine::decoder::{Config, Swiglu, stepper};
 use tessera_engine::keys::Unresolved;
-use tessera_engine::{Graph, Norm, PathSeg};
+use tessera_engine::{Graph, Norm, PathSeg, Weight};
 
+/// The toy decoder, with its own head.
 fn graph() -> Graph {
-    stepper::<Norm, Swiglu>(&Config::toy(1, 8))
+    let mut c = Config::toy(1, 8);
+    c.tied = false;
+    stepper::<Norm, Swiglu>(&c)
 }
 
 /// Each field's Hugging Face and GGUF spellings.
-const SPELLINGS: [(&str, &str, &str); 13] = [
+const SPELLINGS: [(&str, &str, &str); 14] = [
     ("embed", "model.embed_tokens", "token_embd"),
+    ("head", "lm_head", "output"),
     ("norm", "model.norm", "output_norm"),
     ("ln1", "input_layernorm", "attn_norm"),
     ("ln2", "post_attention_layernorm", "ffn_norm"),
@@ -133,4 +140,52 @@ fn rules_decide() {
             .to_string()
             .contains("norm: model.layers.0.self_attn.query.weight")
     );
+}
+
+/// `slices` as f32 safetensors. Each slice's values are its index.
+fn written(dir: &Path, slices: &[Slice]) {
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (at, s) in slices.iter().enumerate() {
+        let from = data.len();
+        for _ in 0..s.shape.iter().product::<usize>() {
+            data.extend_from_slice(&(at as f32).to_le_bytes());
+        }
+        let entry = json!({"dtype": "F32", "shape": s.shape, "data_offsets": [from, data.len()]});
+        header.insert(s.name.clone(), entry);
+    }
+    let mut text = serde_json::to_string(&header).unwrap();
+    while !text.len().is_multiple_of(8) {
+        text.push(' ');
+    }
+    let mut bytes = (text.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(text.as_bytes());
+    bytes.extend(data);
+    std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+}
+
+#[test]
+fn untied_head_loads() {
+    let dir = tessera_testkit::scratch(&format!("untied-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = json!({
+        "model_type": "qwen3", "vocab_size": 32, "hidden_size": 16, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "head_dim": 8, "intermediate_size": 32,
+        "num_key_value_heads": 2, "rope_theta": 1e4, "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": false
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let (arch, c) = crate::config(&dir, [1, 8], &Overrides::default()).unwrap();
+    let g = crate::stepper(&arch, &c).unwrap();
+    written(&dir, &offered(&g, false));
+    let shards = Shards::open(&dir).unwrap();
+    let (weights, _) = crate::pull(&g, &shards, c.stack.layers, &[]).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let head = [PathSeg::Field("head".into())];
+    let at = g.weights.iter().position(|w| w.path == head).unwrap();
+    let Weight::Floats(t) = &weights[at] else {
+        panic!("f32 slices load as floats");
+    };
+    // lm_head's values, not the embedding's.
+    assert!(t.floats().unwrap().iter().all(|v| *v == at as f32));
 }

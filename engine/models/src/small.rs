@@ -19,6 +19,7 @@ pub fn qwen3() -> Config {
         experts: 0,
         top_k: 0,
         scales: Scales::default(),
+        tied: true,
     }
 }
 
@@ -37,6 +38,7 @@ pub fn granite() -> Config {
             residual: 0.5,
             logits: 0.25,
         },
+        tied: true,
     }
 }
 
@@ -49,6 +51,7 @@ pub fn smollm2() -> Config {
         experts: 0,
         top_k: 0,
         scales: Scales::default(),
+        tied: true,
     }
 }
 

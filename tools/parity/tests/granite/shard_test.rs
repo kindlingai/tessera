@@ -45,6 +45,7 @@ fn quarters() -> Config {
             residual: 0.5,
             logits: 0.25,
         },
+        tied: true,
     }
 }
 

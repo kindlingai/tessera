@@ -172,7 +172,7 @@ fn packed_engine() {
 }
 
 #[test]
-fn tied_output() {
+fn output_table() {
     let mut fixture = Fixture::new(named("q8_0").unwrap());
     let mut output = fixture
         .tensors
@@ -182,16 +182,14 @@ fn tied_output() {
         .clone();
     output.name = "output.weight".into();
     fixture.tensors.push(output);
-    assert!(fixture.load().is_ok());
+    let head = |b: &crate::Bundle| {
+        let path = [tessera_engine::PathSeg::Field("head".into())];
+        b.graph.weights.iter().any(|w| w.path == path)
+    };
+    assert!(!head(&fixture.load().unwrap()));
+    // An output table unlike the embedding is the head's own.
     fixture.tensors.last_mut().unwrap().bytes[4] ^= 1;
-    assert!(
-        fixture
-            .load()
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("untied output.weight")
-    );
+    assert!(head(&fixture.load().unwrap()));
     fixture.tensors.pop();
     fixture.meta[0].1 = Meta::Str("other".into());
     assert!(fixture.load().is_err());

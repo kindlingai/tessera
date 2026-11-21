@@ -72,6 +72,7 @@ const ROLES: &[(&str, &[&[&str]])] = &[
             &["wte"],
         ],
     ),
+    ("head", &[&["lm", "head"], &["output"]]),
     (
         "norm",
         &[
