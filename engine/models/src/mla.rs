@@ -435,7 +435,7 @@ fn absorbed(
     let q = q.concat(rope);
     // One key head serves every query head.
     let k = keys.reshape(rows([DimExpr::Const(1), Latent + Rope]));
-    let out = m.attend_rows(scale, [&q, &k, &k], by, picked);
+    let out = m.attend_rows(Mask::Causal, scale, [&q, &k, &k], by, picked);
     let out = out.slice(2, 0u64, Latent).permute(&swap);
     out.matmul_rows(&set().slice(1, Nope, HeadDim))
         .permute(&swap)

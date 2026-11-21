@@ -97,6 +97,40 @@ fn widen(name: &str, e: u32, m: u32) -> String {
     )
 }
 
+/// `name` rounds to nearest even, `e` and `m` bits.
+fn rounder(name: &str, [e, m]: [u32; 2], top: f32, [from, to]: [&str; 2]) -> String {
+    let steps = (125 + (1u32 << (e - 1)) + m) << 23;
+    let least = (129 - (1u32 << (e - 1))) << 23;
+    let (keep, low) = ((1u32 << (22 - m)) - 1, (1u32 << (23 - m)) - 1);
+    format!(
+        "f_fn float {name}(float x) {{
+    float a = x < 0.0f ? -x : x;
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float steps = {from}({steps}u);
+    float small = (a * steps + 8388608.0f) - 8388608.0f;
+    u32 bits = {to}(a);
+    u32 nudge = {keep}u + ((bits >> {}u) & 1u);
+    float r = {from}((bits + nudge) & ~{low}u);
+    float big = r > {top:?}f ? {top:?}f : r;
+    return sign * (a < {from}({least}u) ? small / steps : big);
+}}
+",
+        23 - m
+    )
+}
+
+/// `f_{call}(x)` by soft rounding, or CUDA's own text from `arch`.
+fn rounded(call: &str, eb: [u32; 2], top: f32, arch: u32, cuda: &str) -> [String; 2] {
+    let name = format!("f_rounded_{call}");
+    let metal = rounder(&name, eb, top, ["as_type<float>", "as_type<u32>"]);
+    let soft = rounder(&name, eb, top, ["__uint_as_float", "__float_as_uint"]);
+    let gated = format!(
+        "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= {arch}\n{cuda}#else\n{soft}#endif\n"
+    );
+    let alias = format!("#define f_round_{call}(x) {name}(x)\n");
+    [metal + &alias, hip(&soft, &gated) + &alias]
+}
+
 /// `f_pair_bf16` in integer steps, reading float bits with `bits`.
 fn pair_bits(bits: &str) -> String {
     format!(

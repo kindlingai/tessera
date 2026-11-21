@@ -68,15 +68,31 @@ impl<T: Transport> Rank<T> {
         grid.sum(from, to, step.write.len)
     }
 
-    /// One sum on the host, over the transport.
+    /// A host sum. Profiling first waits for all ranks.
     fn exchange(&mut self, step: &Step) -> Result<(), Error> {
+        let start = Instant::now();
         let part = self.runner.read(step.reads[0])?;
+        let mut at = self.lap("all_reduce: read", start);
+        if self.base().profile.is_some() {
+            self.transport.exchange(&[])?;
+            at = self.lap("all_reduce: wait", at);
+        }
         let parts = self.transport.exchange(part.bytes())?;
+        at = self.lap("all_reduce: transfer", at);
         let floats = |p: &Vec<u8>| Tensor::from_bytes(vec![p.len() / 4], DType::F32, p);
         let parts: Vec<Tensor> = parts.iter().map(floats).collect();
         let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
         let sum = Tensor::f32(vec![step.write.len], sum);
-        self.runner.write(step.write, sum.view())
+        self.runner.write(step.write, sum.view())?;
+        self.lap("all_reduce: sum", at);
+        Ok(())
+    }
+
+    /// Notes the seconds since `from` as `name`. Returns now.
+    fn lap(&mut self, name: &str, from: Instant) -> Instant {
+        let now = Instant::now();
+        self.note(name, (now - from).as_secs_f64());
+        now
     }
 }
 

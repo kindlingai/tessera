@@ -225,6 +225,7 @@ fn layout_and_rope() {
     let rope = Op::Row(Row(vec![Stage::Rope {
         theta: 1e4,
         pairs: Pairs::Halves,
+        turned: None,
     }]));
     assert!(result(vec![x.clone(), pos.clone()], rope.clone()).is_ok());
     let rows = TensorType::new([Rows], DType::U32);

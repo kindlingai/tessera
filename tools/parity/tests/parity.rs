@@ -2,6 +2,7 @@
 
 mod deepseek;
 mod eg2;
+mod gemma4;
 mod glm53;
 mod granite;
 mod nanogpt;

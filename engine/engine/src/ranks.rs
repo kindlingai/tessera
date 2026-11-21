@@ -1,10 +1,10 @@
 //! An engine as one rank of several.
 
 use crate::{Engine, Error, Head, Row};
-use tessera_engine_comm::Transport;
+use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::{Graph, Parts, shard};
 use tessera_lower::{Cluster, Device, Recipe, Settings, ZoneKind};
-use tessera_run::{Rank, Run, Sum};
+use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 
 /// A rank's zones and each rank's share of split weights.
 pub struct Place {
@@ -82,7 +82,11 @@ impl Engine {
 
     /// Runs rank 0's launches until it dismisses the ranks.
     pub fn follow(&mut self) -> Result<(), Error> {
-        while let Some(told) = self.told(&[])? {
+        loop {
+            let held = self.held.take();
+            let Some(told) = self.told(&held.map_or(Vec::new(), |(_, p)| p.to_bytes()))? else {
+                return Ok(());
+            };
             let Some(t) = decode(&told) else {
                 return Ok(());
             };
@@ -91,7 +95,6 @@ impl Engine {
             }
             self.launch(&t.rows, &t.picks, t.head)?;
         }
-        Ok(())
     }
 
     /// Ends each other rank's `follow`.
@@ -104,8 +107,21 @@ impl Engine {
         let Some(control) = &mut self.control else {
             return Ok(None);
         };
+        let lead = control.rank() == 0;
         let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
+        if let (true, Some((launches, own))) = (lead, self.held.take()) {
+            let mut profiles = vec![Some(own)];
+            profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
+            let ranks = Ranks { launches, profiles };
+            eprintln!("profile of {launches} launches:\n{ranks}");
+            self.ranks = Some(ranks);
+        }
         Ok(Some(parts.swap_remove(0)))
+    }
+
+    /// The last profiles rank 0 gathered, one per rank.
+    pub fn ranks(&self) -> Option<&Ranks> {
+        self.ranks.as_ref()
     }
 
     /// Rank 0 tells the others its launch and changed table.
@@ -124,22 +140,26 @@ impl Engine {
     }
 }
 
-/// A launch as words: counts, head, table, rows, picks, list.
+/// A launch as words: head, table, rows, picks, list.
 fn encode(rows: &[Row], picks: &[u32], head: &Head, table: &[u32]) -> Vec<u8> {
     let (tag, k, list): (u32, usize, &[u32]) = match head {
         Head::Full(None) => (0, 0, &[]),
         Head::Full(Some(masks)) => (1, 0, masks),
         Head::Sparse(ids, k) => (2, *k, ids),
     };
-    let mut words = vec![rows.len() as u32, picks.len() as u32, tag, k as u32];
-    words.push(table.len() as u32);
-    words.extend(table);
-    for r in rows {
-        words.extend([r.slot, r.token, r.position]);
-    }
-    words.extend(picks);
-    words.extend(list);
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    let flat: Vec<u32> = rows
+        .iter()
+        .flat_map(|r| [r.slot, r.token, r.position])
+        .collect();
+    let mut words = Writer::default();
+    words
+        .u32(tag)
+        .u32(k as u32)
+        .u32s(table)
+        .u32s(&flat)
+        .u32s(picks)
+        .u32s(list);
+    words.0
 }
 
 /// One launch from rank 0.
@@ -153,30 +173,23 @@ struct Told {
 
 /// The launch `bytes` hold, if they hold one.
 fn decode(bytes: &[u8]) -> Option<Told> {
-    let words: Vec<u32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| u32::from_le_bytes(*b))
-        .collect();
-    let (&[rows, picks, tag, k, table], rest) = words.split_first_chunk::<5>()?;
-    let (table, rest) = rest.split_at_checked(table as usize)?;
-    let (rows, rest) = rest.split_at_checked(3 * rows as usize)?;
-    let (picks, list) = rest.split_at_checked(picks as usize)?;
-    let row = |r: &[u32]| Row {
-        slot: r[0],
-        token: r[1],
-        position: r[2],
+    let mut words = Reader(bytes);
+    let (tag, k, table) = (words.u32()?, words.u32()?, words.u32s()?);
+    let (rows, picks, list) = (words.u32s()?, words.u32s()?, words.u32s()?);
+    let row = |&[slot, token, position]: &[u32; 3]| Row {
+        slot,
+        token,
+        position,
     };
     let head = match tag {
         0 => Head::Full(None),
-        1 => Head::Full(Some(list.to_vec())),
-        _ => Head::Sparse(list.to_vec(), k as usize),
+        1 => Head::Full(Some(list)),
+        _ => Head::Sparse(list, k as usize),
     };
     Some(Told {
-        rows: rows.chunks(3).map(row).collect(),
-        picks: picks.to_vec(),
+        rows: rows.as_chunks::<3>().0.iter().map(row).collect(),
+        picks,
         head,
-        table: table.to_vec(),
+        table,
     })
 }

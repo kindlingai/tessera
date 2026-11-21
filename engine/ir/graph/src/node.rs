@@ -165,6 +165,8 @@ pub enum Mask {
     Bidirectional,
     /// Both ways, keys at most this far from the query.
     Within(u64),
+    /// Causal, keys at most this far back.
+    Back(u64),
 }
 
 impl Mask {
@@ -174,7 +176,13 @@ impl Mask {
             Mask::Causal => (far, 0),
             Mask::Bidirectional => (far, far),
             Mask::Within(n) => (n as usize, n as usize),
+            Mask::Back(n) => (n as usize, 0),
         }
+    }
+
+    /// Whether query and key ends align.
+    pub fn causal(self) -> bool {
+        matches!(self, Mask::Causal | Mask::Back(_))
     }
 }
 
@@ -208,6 +216,9 @@ pub enum Stage {
         /// Pair `j` turns by `position * theta^(-2j/width)`.
         theta: f32,
         pairs: Pairs,
+        /// Pairs from this one on stay still. `None` turns all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turned: Option<u32>,
     },
     Act(Act),
     /// Interpreter only: fold it away before lowering.

@@ -216,6 +216,15 @@ pub fn appended(bounded: &[Dim], width: u64) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// Heads of `width` with a quarter of their pairs turning.
+pub fn partial_rope(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Heads, 2), (HeadDim, width)]);
+    let ports = [floats([Seqs, Rows, Heads, HeadDim]), ids([Seqs, Rows])];
+    let [x, at] = m.entry(EntryKind::Forward, ports);
+    let turned = (width / 8) as u32;
+    m.finish([(Role::Logits, &x.rope_part(&at, 1e6, Pairs::Halves, turned))])
+}
+
 /// Rows of 256, rotated in two blocks of 128.
 pub fn rotation(bounded: &[Dim]) -> Graph {
     let m = model(bounded, &[(Hidden, 256)]);
@@ -347,6 +356,12 @@ pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
     ];
     let [q, k, v, scores, slots, at] = m.entry(EntryKind::Forward, ports);
     let picked = scores.causal(&at).top_k(IndexKeep);
-    let out = m.attend_rows(0.25, [&q, &k, &v], [&slots, &at], Some(&picked));
+    let out = m.attend_rows(
+        Mask::Causal,
+        0.25,
+        [&q, &k, &v],
+        [&slots, &at],
+        Some(&picked),
+    );
     m.finish([(Role::Logits, &out)])
 }

@@ -304,7 +304,7 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         ragged: true,
         from_list: a.picked,
         scale: a.scale,
-        window: (most, 0),
+        window: a.mask.window(most),
     };
     Some(sizes.drafts([q, k, v, ids, slots, positions]))
 }

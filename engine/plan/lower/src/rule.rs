@@ -48,20 +48,14 @@ impl Attn {
     /// The most keys one query sees.
     pub fn seen(&self) -> usize {
         let keys = self.keys.most();
-        match self.mask {
-            Mask::Within(n) => keys.min(2 * n as usize + 1),
-            _ => keys,
-        }
+        let (back, ahead) = self.mask.window(keys);
+        keys.min(back.saturating_add(ahead).saturating_add(1))
     }
 
     /// How far back and ahead a query sees.
     pub fn reach(&self) -> [Arg; 2] {
         let far = u32::MAX as usize;
-        let (back, ahead) = match self.mask {
-            Mask::Causal => (far, 0),
-            Mask::Bidirectional => (far, far),
-            Mask::Within(n) => (n as usize, n as usize),
-        };
+        let (back, ahead) = self.mask.window(far);
         [Arg::count(back), Arg::count(ahead)]
     }
 
@@ -112,6 +106,11 @@ impl Attn {
         ];
         let table = step.kept(self.kept);
         buffers.into_iter().chain(table).chain(sizes).collect()
+    }
+
+    /// Keys before its own that a row sees.
+    pub fn back(&self) -> Arg {
+        Arg::count(self.mask.window(u32::MAX as usize).0)
     }
 
     /// Queries, keys, the keys before the queries, heads, kv heads.

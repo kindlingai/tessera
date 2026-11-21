@@ -35,7 +35,14 @@ fn rope<const ADJACENT: bool>(
 
 /// One thread per position and pair: its cosine and sine.
 #[kernel]
-fn angles(positions: Buf<U32>, mut out: BufMut<F32>, count: u32, width: u32, theta: f32) {
+fn angles(
+    positions: Buf<U32>,
+    mut out: BufMut<F32>,
+    count: u32,
+    width: u32,
+    theta: f32,
+    turned: u32,
+) {
     let pairs = width / 2;
     let at = gid() / pairs;
     let pair = gid() % pairs;
@@ -43,7 +50,12 @@ fn angles(positions: Buf<U32>, mut out: BufMut<F32>, count: u32, width: u32, the
         return;
     }
     let turn = pow(theta, -((2 * pair) as f32) / width as f32);
-    let angle = positions[at as u64] as f32 * turn;
+    // Pairs past `turned` keep angle zero.
+    let angle = if pair < turned {
+        positions[at as u64] as f32 * turn
+    } else {
+        0.0
+    };
     out[(at * width + 2 * pair) as u64] = cos(angle);
     out[(at * width + 2 * pair + 1) as u64] = sin(angle);
 }
@@ -55,6 +67,7 @@ pub(crate) struct Angles {
     pub count: usize,
     pub width: usize,
     pub theta: f32,
+    pub turned: usize,
 }
 
 /// Rotates pairs in place, by the second input's angles.
@@ -78,7 +91,11 @@ pub struct Rope {
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let sites::Stage {
-        stage: Stage::Rope { theta, pairs },
+        stage: Stage::Rope {
+            theta,
+            pairs,
+            turned,
+        },
         x,
         operand: Some((at, positions)),
         len,
@@ -91,6 +108,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         count: positions,
         width,
         theta,
+        turned: turned.map_or(width / 2, |t| t as usize),
     };
     let rope = Rope {
         positions,

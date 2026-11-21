@@ -3,7 +3,7 @@ use crate::kernel::Kernel;
 use crate::kernels::{Map, MapStage};
 use crate::rule::{Attn, Draft, Read};
 use crate::tree::{T, Term, Tree};
-use tessera_graph::{DimName, Mask, Op};
+use tessera_graph::{DimName, Op};
 
 /// Attention with `scale` on the scores.
 #[derive(Clone, Copy, Debug)]
@@ -59,7 +59,7 @@ impl Pattern for Attend {
                 context,
                 kept: tree.kept,
                 segments,
-                mask: Mask::Causal,
+                mask: a.mask,
             };
             return Some(Self {
                 scale: a.scale,

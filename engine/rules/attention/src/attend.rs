@@ -135,6 +135,7 @@ fn attend_rows(
     heads: u32,
     kv_heads: u32,
     width: u32,
+    back: u32,
 ) {
     let group = gid() / THREADS;
     let row = group / heads;
@@ -150,13 +151,14 @@ fn attend_rows(
     let mut state = [0.0f32; 2];
     state[0] = f32::NEG_INFINITY;
     let mut acc = [0.0f32; 2];
-    // The row sees its slot up to its own position.
+    // The row sees its own key and `back` before it.
     let last = if position + 1 < keys {
         position + 1
     } else {
         keys
     };
-    for t in 0..last {
+    let first = if position > back { position - back } else { 0 };
+    for t in first..last {
         let kv_off = ((kept_row(slot, t) * kv_heads + kvh) * width) as u64;
         let dot = group_dot(q, k, q_off, kv_off, width, &mut red);
         take_key(&mut state, &mut acc, dot, v, kv_off, width);
@@ -186,7 +188,7 @@ fn rows_source(k: &AttendRows) -> Source {
 fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
     let a = &k.0;
     let mut args = a.rows_args(step);
-    args.push(Arg::count(a.width));
+    args.extend([Arg::count(a.width), a.back()]);
     args.extend(a.kept_args());
     vec![Launch {
         args,

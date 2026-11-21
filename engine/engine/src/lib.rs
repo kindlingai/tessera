@@ -131,6 +131,10 @@ pub struct Engine {
     control: Option<Box<dyn comm::Transport>>,
     /// Launches per profile report, and launches since the last.
     profile: Option<[u64; 2]>,
+    /// A ranked profile until the next control round carries it.
+    held: Option<(u64, tessera_run::Profile)>,
+    /// The last profiles rank 0 gathered from all ranks.
+    ranks: Option<tessera_run::Ranks>,
 }
 
 /// Inputs a launch feeds before its picks.
@@ -263,6 +267,8 @@ impl Engine {
             sparse,
             control: None,
             profile: settings.profile.map(|every| [every, 0]),
+            held: None,
+            ranks: None,
         })
     }
 
@@ -474,12 +480,15 @@ impl Engine {
             return;
         }
         let launches = std::mem::take(done);
-        let rank = self.runner.plan().rank;
-        if let Some(profile) = self.take_profile() {
-            eprintln!(
-                "profile of {launches} launches, rank {rank}:\n{}",
+        let Some(profile) = self.take_profile() else {
+            return;
+        };
+        match self.control {
+            Some(_) => self.held = Some((launches, profile)),
+            None => eprintln!(
+                "profile of {launches} launches:\n{}",
                 profile.report(launches)
-            );
+            ),
         }
     }
 

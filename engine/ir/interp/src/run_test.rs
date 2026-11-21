@@ -2,7 +2,7 @@ use crate::cpu_test::{close, eval, model, port};
 use crate::*;
 use tessera_trace::DType::{self, F32, I32, U32};
 use tessera_trace::DimName::*;
-use tessera_trace::{EntryKind, Graph, Role, TensorType};
+use tessera_trace::{EntryKind, Graph, Mask, Role, TensorType};
 
 /// One kept layer: rows write `x`, then read their slot.
 fn kept() -> Graph {
@@ -17,7 +17,10 @@ fn kept() -> Graph {
     let rows = m.kept(TensorType::new([Seqs, Context, KvHeads, HeadDim], F32));
     let by = [&slots, &positions];
     let kv = x.append(&rows, by);
-    m.finish([(Role::Logits, &m.attend_rows(1.0, [&q, &kv, &kv], by, None))])
+    m.finish([(
+        Role::Logits,
+        &m.attend_rows(Mask::Causal, 1.0, [&q, &kv, &kv], by, None),
+    )])
 }
 
 /// Zero queries average the rows their slot sees.

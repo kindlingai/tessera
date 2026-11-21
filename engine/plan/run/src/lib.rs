@@ -22,7 +22,7 @@ pub mod testing;
 
 pub use held::Held;
 pub use loopback::Loopback;
-pub use profile::{Marks, Profile, Region, Spent};
+pub use profile::{Marks, Profile, Ranks, Region, Spent};
 pub use rank::{Rank, Sum};
 pub use run::{Base, Outcome, Reload, Run};
 

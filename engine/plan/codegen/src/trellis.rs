@@ -3,32 +3,10 @@
 use crate as tessera_codegen;
 use crate::form::{Load, form, named};
 use crate::ir::Helper;
-use crate::prelude::{Bits, Buf, F32x4, U8, helper};
+use crate::prelude::{Bits, Buf, F32x4, U8, helper, round_e4m3, round_f16};
 use tessera_mem::trellis::*;
 
 pub use tessera_mem::trellis::packed;
-
-/// `x` rounded to nearest even, `e` and `m` bits.
-#[helper("{name}")]
-fn rounding(
-    #[build] name: &'static str,
-    #[build] e: u32,
-    #[build] m: u32,
-    #[build] top: f32,
-    x: f32,
-) -> f32 {
-    let a = if x < 0.0 { -x } else { x };
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    // A subnormal: in units of its step, rounded through 2^23.
-    let steps = f32::from_bits((125 + (1u32 << (e - 1)) + m) << 23);
-    let small = (a * steps + 8388608.0) - 8388608.0;
-    let bits = a.to_bits();
-    let nudge = ((1u32 << (22 - m)) - 1) + ((bits >> (23 - m)) & 1);
-    let r = f32::from_bits((bits + nudge) & !((1u32 << (23 - m)) - 1));
-    let big = if r > top { top } else { r };
-    let least = f32::from_bits((129 - (1u32 << (e - 1))) << 23);
-    sign * if a < least { small / steps } else { big }
-}
 
 /// A swapped word pair as 32 stream bits.
 #[helper("form_{name}_pair")]
@@ -70,8 +48,7 @@ fn value(#[build] name: &'static str, #[build] mul1: u32, state: u32) -> f32 {
     } else {
         y.f16(0) + y.f16(16)
     };
-    let v = rounding("f_round_f16", 5, 10, 65504.0, raw);
-    rounding("f_round_e4m3", 4, 3, 448.0, v)
+    round_e4m3(round_f16(raw))
 }
 
 /// Element `n`'s column: a float estimate, corrected by one.

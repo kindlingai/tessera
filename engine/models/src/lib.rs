@@ -4,6 +4,7 @@ pub mod clip;
 pub mod decoder;
 pub mod eg2;
 pub mod flux2;
+pub mod gemma4;
 pub mod keys;
 pub mod mla;
 pub mod nanogpt;

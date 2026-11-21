@@ -104,7 +104,28 @@ impl Tensor {
     }
 
     pub fn rope(&self, positions: &Tensor, theta: f32, pairs: Pairs) -> Tensor {
-        self.stage(Stage::Rope { theta, pairs }, &[positions])
+        let turned = None;
+        self.stage(
+            Stage::Rope {
+                theta,
+                pairs,
+                turned,
+            },
+            &[positions],
+        )
+    }
+
+    /// The same, with only the first `turned` pairs rotating.
+    pub fn rope_part(&self, positions: &Tensor, theta: f32, pairs: Pairs, turned: u32) -> Tensor {
+        let turned = Some(turned);
+        self.stage(
+            Stage::Rope {
+                theta,
+                pairs,
+                turned,
+            },
+            &[positions],
+        )
     }
 
     /// Entries past each row's position become -inf.

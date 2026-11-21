@@ -105,13 +105,14 @@ impl Model {
     /// Query rows by slot and position, or their listed keys.
     pub fn attend_rows(
         &self,
+        mask: Mask,
         scale: f32,
         [q, k, v]: [&Tensor; 3],
         [slots, positions]: [&Tensor; 2],
         keys: Option<&Tensor>,
     ) -> Tensor {
         let op = Op::Attend(Attend {
-            mask: Mask::Causal,
+            mask,
             scale,
             picked: keys.is_some(),
             ragged: true,
