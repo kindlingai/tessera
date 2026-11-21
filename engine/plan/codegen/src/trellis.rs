@@ -27,23 +27,66 @@ fn win<const K: u32>(#[build] name: &'static str, t: Buf<U8>, s: u32) -> u32 {
     }
 }
 
-/// A state's first bit, for the code at `j`.
+/// Build code of the mul1 codebook.
+const MUL1_BOOK: u32 = 1;
+/// Build code of pmcgx. Its states hold pairs.
+const PAIRS: u32 = 2;
+
+/// A codebook's build code.
+fn book(codebook: Codebook) -> u32 {
+    match codebook {
+        Codebook::Mcg => 0,
+        Codebook::Mul1 => MUL1_BOOK,
+        Codebook::Pmcgx => PAIRS,
+    }
+}
+
+/// The first bit of code `j`'s state.
 #[helper("form_{name}_start")]
-fn start<const K: u32>(#[build] name: &'static str, j: u32) -> u32 {
-    // A state spans `16 / K` codes, wrapping at 256.
-    ((j + (257 - (16 + K - 1) / K)) % 256) * K + ((16 + K - 1) / K * K - 16)
+fn first<const K: u32>(#[build] name: &'static str, #[build] book: u32, j: u32) -> u32 {
+    if book == PAIRS {
+        // A pair's 20 bits end at bit 2K(p+1), wrapping.
+        (2 * K * (j / 2 + 1) + 256 * K - 20) % (256 * K)
+    } else {
+        // A state spans `16 / K` codes, wrapping at 256.
+        ((j + (257 - (16 + K - 1) / K)) % 256) * K + ((16 + K - 1) / K * K - 16)
+    }
+}
+
+/// Weight `odd` of a pair state: two hashes, then rounded.
+#[helper("form_{name}_pair_value")]
+fn pair_value(#[build] name: &'static str, state: u32, odd: u32) -> f32 {
+    let w = state & 0xFFFFF;
+    let x = ((w * MCG) & 0x8FFF8FFF) ^ 0x3B603B60;
+    let y = ((w * PMCG2) & 0x8FFF8FFF) ^ 0x3B603B60;
+    let raw = if odd != 0 {
+        x.f16(16) + y.f16(0)
+    } else {
+        x.f16(0) + y.f16(16)
+    };
+    round_e4m3(round_f16(raw))
+}
+
+/// Weight `odd` of window `w`: pair half, or next code.
+#[helper("form_{name}_lane")]
+fn lane<const K: u32>(#[build] name: &'static str, #[build] book: u32, w: u32, odd: u32) -> f32 {
+    if book == PAIRS {
+        pair_value(name, w >> 12, odd)
+    } else {
+        value(name, book, w >> (16 - K * odd))
+    }
 }
 
 /// A state's weight: hashed, then rounded to f16 and e4m3.
 #[helper("form_{name}_value")]
-fn value(#[build] name: &'static str, #[build] mul1: u32, state: u32) -> f32 {
+fn value(#[build] name: &'static str, #[build] book: u32, state: u32) -> f32 {
     let s = state & 0xFFFF;
     let x = s * MCG;
     let y = (x & 0x8FFF8FFF) ^ 0x3B603B60;
     let z = s * MUL1;
     let sum = (z & 0xFF) + ((z >> 8) & 0xFF) + ((z >> 16) & 0xFF) + (z >> 24);
     let scaled = (1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET;
-    let raw = if mul1 != 0 {
+    let raw = if book == MUL1_BOOK {
         scaled
     } else {
         y.f16(0) + y.f16(16)
@@ -90,21 +133,27 @@ fn slot(#[build] name: &'static str, r: u32, c: u32) -> u32 {
 
 /// Element `i` of a `[out][in]` matrix at `p`.
 #[helper("form_{name}")]
-fn one<const K: u32>(#[build] name: &'static str, #[build] mul1: u32, p: Buf<U8>, i: u64) -> f32 {
+fn one<const K: u32>(#[build] name: &'static str, #[build] book: u32, p: Buf<U8>, i: u64) -> f32 {
     let inp = p.word(0);
     let n = i as u32;
     let c = col(name, p, n, inp);
     let row = n - c * inp;
     let t = tile::<K>(name, p, row, c);
     let j = slot(name, row % 16, c % 16);
-    value(name, mul1, win::<K>(name, t, start::<K>(name, j)) >> 16)
+    let odd = if book == PAIRS { j % 2 } else { 0 };
+    lane::<K>(
+        name,
+        book,
+        win::<K>(name, t, first::<K>(name, book, j)),
+        odd,
+    )
 }
 
 /// Four along a row: codes `j`, `j+1`, `j+8`, `j+9`.
 #[helper("form_{name}_x4")]
 fn four<const K: u32>(
     #[build] name: &'static str,
-    #[build] mul1: u32,
+    #[build] book: u32,
     p: Buf<U8>,
     i: u64,
 ) -> F32x4 {
@@ -114,13 +163,13 @@ fn four<const K: u32>(
     let row = n - c * inp;
     let t = tile::<K>(name, p, row, c);
     let j = slot(name, row % 16, c % 16);
-    let a = win::<K>(name, t, start::<K>(name, j));
-    let b = win::<K>(name, t, start::<K>(name, j + 8));
+    let a = win::<K>(name, t, first::<K>(name, book, j));
+    let b = win::<K>(name, t, first::<K>(name, book, j + 8));
     F32x4::new(
-        value(name, mul1, a >> 16),
-        value(name, mul1, a >> (16 - K)),
-        value(name, mul1, b >> 16),
-        value(name, mul1, b >> (16 - K)),
+        lane::<K>(name, book, a, 0),
+        lane::<K>(name, book, a, 1),
+        lane::<K>(name, book, b, 0),
+        lane::<K>(name, book, b, 1),
     )
 }
 
@@ -142,8 +191,8 @@ impl<const K: u32> Load for Trellis<K> {
         format!("form_{}_x4({name}, {index})", self.name)
     }
     fn header(&self) -> Vec<Helper> {
-        let mul1 = u32::from(self.codebook == Codebook::Mul1);
-        vec![one_ir::<K>(self.name, mul1), four_ir::<K>(self.name, mul1)]
+        let book = book(self.codebook);
+        vec![one_ir::<K>(self.name, book), four_ir::<K>(self.name, book)]
     }
 }
 
@@ -164,3 +213,9 @@ form!(TRELLIS_K4_MUL1);
 form!(TRELLIS_K2_MUL1_ROT);
 form!(TRELLIS_K3_MUL1_ROT);
 form!(TRELLIS_K4_MUL1_ROT);
+form!(TRELLIS_K2_PMCGX);
+form!(TRELLIS_K3_PMCGX);
+form!(TRELLIS_K4_PMCGX);
+form!(TRELLIS_K2_PMCGX_ROT);
+form!(TRELLIS_K3_PMCGX_ROT);
+form!(TRELLIS_K4_PMCGX_ROT);

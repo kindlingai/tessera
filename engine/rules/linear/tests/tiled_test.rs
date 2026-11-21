@@ -140,6 +140,9 @@ fn codes_match_decode() {
         (4, true, ""),
         (3, false, "_mul1"),
         (3, true, "_mul1"),
+        (2, false, "_pmcgx"),
+        (3, true, "_pmcgx"),
+        (4, true, "_pmcgx"),
     ];
     for (k, turned, book) in forms {
         let codes = named(&format!("trellis_k{k}{book}")).unwrap();

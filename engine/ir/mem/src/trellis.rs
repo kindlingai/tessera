@@ -7,7 +7,7 @@ use tessera_graph::{DType, E4M3, F16};
 pub const MCG: u32 = 0xCBAC_1FED;
 
 /// pmcgx's second multiplier.
-const PMCG2: u32 = 0xBCA1_4C51;
+pub const PMCG2: u32 = 0xBCA1_4C51;
 
 /// The mul1 codebook's multiplier.
 pub const MUL1: u32 = 0x83DC_D12D;
@@ -462,6 +462,9 @@ pub fn turned_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
         (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1_ROT),
         (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1_ROT),
         (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1_ROT),
+        (2, Codebook::Pmcgx) => Some(&TRELLIS_K2_PMCGX_ROT),
+        (3, Codebook::Pmcgx) => Some(&TRELLIS_K3_PMCGX_ROT),
+        (4, Codebook::Pmcgx) => Some(&TRELLIS_K4_PMCGX_ROT),
         _ => None,
     }
 }
@@ -511,45 +514,34 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     back
 }
 
-/// The four trellis forms at width `$k`, mcg and mul1.
+/// A codebook's plain and rotated forms at each width `$k`.
 macro_rules! trellis {
-    ($($k:literal: $plain:ident, $turned:ident, $mul1:ident, $mul1_turned:ident;)*) => {$(
-        #[doc = concat!("exlr8 at ", $k, " bits a weight.")]
-        pub const $plain: Trellis<$k> = Trellis::named(concat!("trellis_k", $k), Codebook::Mcg);
-        #[doc = concat!("exlr8 at ", $k, " bits, between its rotations.")]
+    ($book:ident, $suffix:literal: $($k:literal: $plain:ident, $turned:ident;)*) => {$(
+        #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]
+        pub const $plain: Trellis<$k> =
+            Trellis::named(concat!("trellis_k", $k, $suffix), Codebook::$book);
+        #[doc = concat!("exlr8 at ", $k, " bits, ", stringify!($book), ", between rotations.")]
         pub const $turned: Trellis<$k> =
-            Trellis::turned(concat!("trellis_k", $k, "_rot"), Codebook::Mcg);
-        #[doc = concat!("exlr8 at ", $k, " bits a weight, mul1 codebook.")]
-        pub const $mul1: Trellis<$k> =
-            Trellis::named(concat!("trellis_k", $k, "_mul1"), Codebook::Mul1);
-        #[doc = concat!("exlr8 at ", $k, " bits, mul1, between its rotations.")]
-        pub const $mul1_turned: Trellis<$k> =
-            Trellis::turned(concat!("trellis_k", $k, "_mul1_rot"), Codebook::Mul1);
+            Trellis::turned(concat!("trellis_k", $k, $suffix, "_rot"), Codebook::$book);
         form!($plain);
         form!($turned);
-        form!($mul1);
-        form!($mul1_turned);
     )*};
 }
 
-/// pmcgx at width `$k`, decoded on the host only.
-macro_rules! pmcgx {
-    ($($k:literal: $plain:ident;)*) => {$(
-        #[doc = concat!("exlr8 at ", $k, " bits a weight, pmcgx codebook.")]
-        pub const $plain: Trellis<$k> =
-            Trellis::named(concat!("trellis_k", $k, "_pmcgx"), Codebook::Pmcgx);
-        form!($plain);
-    )*};
+trellis! { Mcg, "":
+    2: TRELLIS_K2, TRELLIS_K2_ROT;
+    3: TRELLIS_K3, TRELLIS_K3_ROT;
+    4: TRELLIS_K4, TRELLIS_K4_ROT;
 }
 
-pmcgx! {
-    2: TRELLIS_K2_PMCGX;
-    3: TRELLIS_K3_PMCGX;
-    4: TRELLIS_K4_PMCGX;
+trellis! { Mul1, "_mul1":
+    2: TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
+    3: TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
+    4: TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
 }
 
-trellis! {
-    2: TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
-    3: TRELLIS_K3, TRELLIS_K3_ROT, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
-    4: TRELLIS_K4, TRELLIS_K4_ROT, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
+trellis! { Pmcgx, "_pmcgx":
+    2: TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT;
+    3: TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT;
+    4: TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT;
 }
