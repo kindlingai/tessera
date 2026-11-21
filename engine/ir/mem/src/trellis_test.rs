@@ -1,6 +1,6 @@
 use crate::block_test::same_part;
 use crate::form::Form;
-use crate::trellis::{Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, packed, rotated};
+use crate::trellis::{Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, form_for, packed, rotated};
 use tessera_graph::F16;
 
 /// Each side's cuts, and a set's, decode as the whole.
@@ -72,5 +72,57 @@ fn mul1_values() {
     ];
     for (state, v) in want {
         assert_eq!(Codebook::Mul1.value(state), v, "state {state:#x}");
+    }
+}
+
+/// pmcgx pairs match the exlr8 loader's table.
+#[test]
+fn pmcgx_values() {
+    let want = [
+        (0, [1.875, 1.875]),
+        (1, [-0.203_125, 0.3125]),
+        (74565, [1.625, -2.25]),
+        (524287, [-2.5, 0.005_859_375]),
+        (782069, [-1.25, 2.25]),
+    ];
+    for (state, pair) in want {
+        let got = [false, true].map(|odd| Codebook::Pmcgx.weight(state, odd));
+        assert_eq!(got, pair, "state {state}");
+    }
+}
+
+/// A tile of bytes `37j+11` decodes as exlr8's loader does.
+#[test]
+fn pmcgx_tiles() {
+    let at = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (8, 0),
+        (0, 8),
+        (9, 9),
+        (15, 15),
+        (7, 12),
+    ];
+    let want: [(u32, [f32; 8]); 3] = [
+        (
+            2,
+            [0.171_875, -2.25, -0.875, -2.25, -2.0, -1.375, -0.3125, 0.5],
+        ),
+        (
+            3,
+            [2.0, -1.0, 0.9375, 0.109_375, -0.156_25, -1.0, -1.25, 0.75],
+        ),
+        (
+            4,
+            [-0.625, -2.5, 0.085_937_5, -1.5, -1.625, 0.6875, 1.625, 0.75],
+        ),
+    ];
+    for (k, values) in want {
+        let tile: Vec<u8> = (0..32 * k as usize).map(|j| (37 * j + 11) as u8).collect();
+        let form = form_for(k, Codebook::Pmcgx).unwrap();
+        let t = form.unpack_all(&packed(16, 16, 1, &tile));
+        let got = at.map(|(row, col)| t[col * 16 + row]);
+        assert_eq!(got, values, "K{k}");
     }
 }

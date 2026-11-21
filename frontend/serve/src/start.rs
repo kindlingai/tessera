@@ -16,7 +16,8 @@ use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
 /// The flags for `Options::flag` and `Options::switch`.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
-[--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix]";
+[--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix] \
+[--manifest <name>]";
 
 /// The loaded model's task.
 #[derive(Clone, Copy, PartialEq)]
@@ -67,6 +68,8 @@ pub struct Options {
     pub ranks: crate::ranks::Ranks,
     /// Config values the recipe sets, by file.
     pub config: Overrides,
+    /// The exlr8 manifest that picks the widths.
+    pub manifest: Option<String>,
 }
 
 impl Default for Options {
@@ -90,6 +93,7 @@ impl Default for Options {
             names: None,
             ranks: Default::default(),
             config: Overrides::default(),
+            manifest: None,
         }
     }
 }
@@ -113,6 +117,7 @@ impl Options {
             "--port" => self.port = value.parse().ok()?,
             "--max-model-len" => self.max_model_len = value.parse().ok()?,
             "--slots" => self.slots = value.parse().ok()?,
+            "--manifest" => self.manifest = Some(value),
             "--max-connections" => self.max_connections = value.parse().ok()?,
             "--served-model-name" => self.name = Some(value),
             "--task" if value == "generate" => self.task = Task::Generate,
@@ -193,7 +198,9 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         (false, true) => Steps::Scored,
         (false, false) => Steps::Plain,
     };
-    let loaded = tessera_bundle::load_named(&o.model, [slots, context], &rules, steps, &o.config)
+    let at = [slots, context];
+    let manifest = o.manifest.as_deref();
+    let loaded = tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
         .map_err(|e| e.to_string())?;
     let scores = loaded.graph.entries.len() > 1;
     let recipe = lowering(o, loaded.pins);

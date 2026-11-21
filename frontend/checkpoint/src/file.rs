@@ -53,6 +53,8 @@ pub struct File {
     /// Where tensor bytes start.
     data: u64,
     entries: BTreeMap<String, Entry>,
+    /// The header's `__metadata__` strings.
+    meta: BTreeMap<String, String>,
 }
 
 /// How a safetensors dtype name lies in the file.
@@ -114,7 +116,10 @@ impl File {
         let len = header.len() as u64;
         let mut all: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(header).map_err(format)?;
-        all.remove("__metadata__");
+        let meta = match all.remove("__metadata__") {
+            Some(m) => serde_json::from_value(m).map_err(format)?,
+            None => BTreeMap::new(),
+        };
         let data = 8 + len;
         let mut entries = BTreeMap::new();
         for (name, value) in all {
@@ -129,6 +134,7 @@ impl File {
             backing,
             data,
             entries,
+            meta,
         })
     }
 
@@ -144,6 +150,11 @@ impl File {
             }
             Backing::Web(url) => fetch(url, self.data + start, end - start),
         }
+    }
+
+    /// A `__metadata__` value.
+    pub fn meta(&self, key: &str) -> Option<&str> {
+        self.meta.get(key).map(String::as_str)
     }
 
     pub fn shape(&self, name: &str) -> Option<&[usize]> {

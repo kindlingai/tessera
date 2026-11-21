@@ -1,4 +1,4 @@
-//! exlr8 v2 releases: trellis, block and fp8 matrices.
+//! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored};
@@ -48,16 +48,30 @@ fn e4m3(bits: u8) -> f32 {
     f32::from(E4M3(bits))
 }
 
+/// Matrix `name`'s trellis tensor, and the codebook its name gives.
+fn trellis_of(f: &File, name: &str) -> Result<(String, Codebook), Error> {
+    for book in [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx] {
+        let tensor = format!("{name}.trellis{}", book.suffix());
+        if f.shape(&tensor).is_some() {
+            return Ok((tensor, book));
+        }
+    }
+    Err(Error::Missing(format!(
+        "{name}.trellis in a known codebook"
+    )))
+}
+
 /// Trellis matrix `name` packed: a header, then its entries.
 fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
-    let entries = f.bytes(&format!("{name}.trellis"))?;
+    let entries = f.bytes(&trellis_of(f, name)?.0)?;
     Ok(trellis::packed(r.inp, r.out, r.side as u32, &entries))
 }
 
 /// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
 fn decoded(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
-    let form = trellis::form_for(r.k, Codebook::Mcg)
-        .ok_or_else(|| Error::DType(format!("{name}: K{}", r.k)))?;
+    let book = trellis_of(f, name)?.1;
+    let form = trellis::form_for(r.k, book)
+        .ok_or_else(|| Error::DType(format!("{name}: K{} {book:?}", r.k)))?;
     let bytes = packed(f, name, r)?;
     Ok(form.unpack_all(&bytes))
 }
@@ -93,7 +107,7 @@ fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Ve
             "{name}: rows {first}.. are not whole entries"
         )));
     }
-    let entries = f.bytes(&format!("{name}.trellis"))?;
+    let entries = f.bytes(&trellis_of(f, name)?.0)?;
     let at = first / 128 * entry;
     let slice = &entries[at..at + count / 128 * entry];
     Ok(trellis::packed(r.inp, count, r.side as u32, slice))
@@ -190,21 +204,54 @@ pub struct Release {
     /// A directory, or a URL prefix ending in `/`.
     at: Where,
     files: RefCell<HashMap<String, File>>,
-    /// GLM's layout: `dense/` files, layer names without their prefix.
-    glm: bool,
+    /// GLM's and later layouts: layer files under `dense/`.
+    dense: Option<Dense>,
     /// The trellis width GLM's routed experts load at.
     width: u32,
 }
 
-/// GLM's vocabulary file, which marks its layout.
-const GLM_VOCAB: &str = "dense/exlr8-vocab";
+/// The `dense/` layout's vocabulary file. Its presence marks the layout.
+const VOCAB: &str = "dense/exlr8-vocab";
+
+/// Names in the `dense/` layout.
+struct Dense {
+    /// Before a layer's index, from the files' `tensor_prefix`.
+    prefix: String,
+    /// Vocabulary file stems and their HF names.
+    vocab: Vec<(String, String)>,
+    /// Files that hold whole HF names.
+    extras: Vec<String>,
+    /// The manifest's width for each `(layer, matrix)` stored at several.
+    widths: HashMap<(usize, String), u32>,
+}
+
+impl Dense {
+    /// Layer `layer`'s stored name for `local`, at its picked width.
+    fn stored(&self, layer: usize, local: &str) -> String {
+        let Some((matrix, part)) = local.rsplit_once('.') else {
+            return local.into();
+        };
+        match self.widths.get(&(layer, matrix.to_string())) {
+            Some(k) => format!("{matrix}.k{k}.{part}"),
+            None => local.into(),
+        }
+    }
+}
+
+/// `name` past `stem`, where `stem` is a whole first part.
+fn past<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
+    let end = name.strip_prefix(stem)?;
+    (end.is_empty() || end.starts_with('.')).then_some(end)
+}
 
 /// One file, and how its names become HF names.
 struct Shard {
     file: String,
     prefix: String,
-    /// Names kept as they are.
-    bare: &'static [&'static str],
+    /// Stems that take other HF names.
+    renames: Vec<(String, String)>,
+    /// Widths of matrices stored at several, by stem.
+    picked: Vec<(String, u32)>,
 }
 
 impl Shard {
@@ -212,15 +259,32 @@ impl Shard {
         Self {
             file,
             prefix,
-            bare: &[],
+            renames: Vec::new(),
+            picked: Vec::new(),
         }
     }
 
     fn name(&self, local: &str) -> String {
-        match self.bare.iter().any(|b| local.starts_with(b)) {
-            true => local.into(),
-            false => format!("{}{local}", self.prefix),
+        for (stem, hf) in &self.renames {
+            if let Some(end) = past(local, stem) {
+                return format!("{hf}{end}");
+            }
         }
+        format!("{}{local}", self.prefix)
+    }
+
+    /// A stem's matrix, or `None` for an unpicked width.
+    fn matrix<'a>(&self, stem: &'a str) -> Option<&'a str> {
+        let Some((matrix, width)) = stem.rsplit_once(".k") else {
+            return Some(stem);
+        };
+        let Ok(k) = width.parse::<u32>() else {
+            return Some(stem);
+        };
+        self.picked
+            .iter()
+            .any(|(m, w)| m == matrix && *w == k)
+            .then_some(matrix)
     }
 }
 
@@ -244,11 +308,127 @@ impl Release {
         let mut release = Self {
             at,
             files: RefCell::new(HashMap::new()),
-            glm: false,
+            dense: None,
             width: 3,
         };
-        release.glm = release.with(GLM_VOCAB, |_| Ok(())).is_ok();
+        release.dense = release.read_dense().ok();
         release
+    }
+
+    /// The `dense/` layout's names, if the release has that layout.
+    fn read_dense(&self) -> Result<Dense, Error> {
+        let glm = [
+            ("embed_tokens", "model.embed_tokens"),
+            ("norm", "model.norm"),
+        ];
+        let glm = [glm.as_slice(), &[("lm_head", "lm_head")]].concat();
+        let hf: Option<String> = self.with(VOCAB, |f| Ok(f.meta("hf_names").map(Into::into)))?;
+        let vocab = match hf {
+            Some(json) => serde_json::from_str::<HashMap<String, String>>(&json)
+                .map_err(|e| Error::DType(format!("{VOCAB} hf_names: {e}")))?
+                .into_iter()
+                .collect(),
+            None => glm
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        };
+        let first = "dense/exlr8-dense-000";
+        let prefix = self.with(first, |f| Ok(f.meta("tensor_prefix").map(Into::into)));
+        let mut extras = Vec::new();
+        if let Where::Dir(dir) = &self.at
+            && let Ok(listed) = std::fs::read_dir(dir.join("dense"))
+        {
+            for entry in listed.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".safetensors")
+                    && stem.starts_with("exlr8-extra-")
+                {
+                    extras.push(format!("dense/{stem}"));
+                }
+            }
+        }
+        extras.sort();
+        Ok(Dense {
+            prefix: prefix
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "model.layers.".into()),
+            vocab,
+            extras,
+            widths: HashMap::new(),
+        })
+    }
+
+    /// The manifests a local release holds, by name.
+    pub fn manifests(&self) -> Vec<String> {
+        let Where::Dir(dir) = &self.at else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir.join("manifests"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(n) = name
+                .strip_prefix("exlr8-manifest-")
+                .and_then(|n| n.strip_suffix(".json"))
+            {
+                out.push(n.to_string());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Dense matrices at the widths manifest `name` picks.
+    pub fn manifest(mut self, name: &str) -> Result<Self, Error> {
+        let Where::Dir(dir) = &self.at else {
+            return Err(Error::Missing(format!(
+                "manifest {name} of a remote release"
+            )));
+        };
+        let path = dir.join(format!("manifests/exlr8-manifest-{name}.json"));
+        let bad = |why: String| Error::DType(format!("{}: {why}", path.display()));
+        let text = std::fs::read_to_string(&path)?;
+        let m: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
+        let needs = m["requires"]["trellis"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for need in needs {
+            let need = need.as_str().unwrap_or_default();
+            let known = need.split_once(' ').is_some_and(|(width, book)| {
+                let k = width.strip_prefix('k').and_then(|k| k.parse().ok());
+                let book = match book {
+                    "mcg" => Codebook::Mcg,
+                    "mul1" => Codebook::Mul1,
+                    "pmcgx" => Codebook::Pmcgx,
+                    _ => return false,
+                };
+                k.is_some_and(|k| trellis::form_for(k, book).is_some())
+            });
+            if !known {
+                return Err(bad(format!("needs trellis {need}: this engine lacks it")));
+            }
+        }
+        let dense = self
+            .dense
+            .as_mut()
+            .ok_or_else(|| bad("no dense/ files".into()))?;
+        let layers = m["dense"].as_object().cloned().unwrap_or_default();
+        for (layer, matrices) in layers {
+            let layer: usize = layer.parse().map_err(|_| bad(format!("layer {layer}")))?;
+            for (matrix, k) in matrices.as_object().cloned().unwrap_or_default() {
+                let k = k
+                    .as_u64()
+                    .ok_or_else(|| bad(format!("{layer}.{matrix} width")))?;
+                dense.widths.insert((layer, matrix), k as u32);
+            }
+        }
+        Ok(self)
     }
 
     /// GLM's routed experts at `k` bits: 2, 3 or 4.
@@ -289,8 +469,8 @@ impl Release {
 
     /// The file holding `name`, and the name inside it.
     fn place(&self, name: &str) -> (String, String) {
-        if self.glm {
-            return glm_place(name);
+        if let Some(d) = &self.dense {
+            return self.dense_place(d, name);
         }
         if let Some(rest) = name.strip_prefix("language_model.layers.") {
             let (layer, local) = rest.split_once('.').expect("a layer index");
@@ -324,7 +504,7 @@ impl Release {
 
     /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
     pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
-        if let Some((layer, local)) = experts::split(name).filter(|_| self.glm) {
+        if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
             return self.expert_codes(layer, local, rows);
         }
         let (file, local) = self.place(name);
@@ -344,7 +524,7 @@ impl Release {
 
     /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.
     pub fn read(&self, name: &str) -> Result<Vec<f32>, Error> {
-        if let Some((layer, local)) = experts::split(name).filter(|_| self.glm) {
+        if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
             let k = self.width;
             return self.with(&experts::index_file(layer), |f| {
                 experts::floats(f, local, k)
@@ -368,29 +548,50 @@ impl Release {
     }
 }
 
-/// GLM: layer files under `dense/`, and one vocabulary file.
-fn glm_place(name: &str) -> (String, String) {
-    if let Some(rest) = name.strip_prefix("model.layers.") {
-        let (layer, local) = rest.split_once('.').expect("a layer index");
-        let layer: usize = layer.parse().expect("a layer index");
-        return (format!("dense/exlr8-dense-{layer:03}"), local.into());
-    }
-    let local = name.strip_prefix("model.").unwrap_or(name);
-    (GLM_VOCAB.into(), local.into())
-}
-
 impl Release {
+    /// The `dense/` file holding `name`, and its stored name.
+    fn dense_place(&self, d: &Dense, name: &str) -> (String, String) {
+        if let Some(rest) = name.strip_prefix(&d.prefix)
+            && let Some((layer, local)) = rest.split_once('.')
+            && let Ok(layer) = layer.parse::<usize>()
+        {
+            return (
+                format!("dense/exlr8-dense-{layer:03}"),
+                d.stored(layer, local),
+            );
+        }
+        for (stem, hf) in &d.vocab {
+            if let Some(end) = past(name, hf) {
+                return (VOCAB.into(), format!("{stem}{end}"));
+            }
+        }
+        let matrix = name.strip_suffix(".weight").unwrap_or(name);
+        for extra in &d.extras {
+            let holds = |f: &File| {
+                Ok(f.shape(name).is_some() || f.shape(&format!("{matrix}.record")).is_some())
+            };
+            if self.with(extra, holds).unwrap_or(false) {
+                return (extra.clone(), name.into());
+            }
+        }
+        (VOCAB.into(), name.into())
+    }
+
     /// Every shard, and how its names become HF names.
     fn shards(&self) -> Vec<Shard> {
-        let (mut out, layers, prefix) = match self.glm {
-            true => {
+        let (mut out, layers, prefix) = match &self.dense {
+            Some(d) => {
                 let vocab = Shard {
-                    bare: &["lm_head"],
-                    ..Shard::new(GLM_VOCAB.into(), "model.".into())
+                    renames: d.vocab.clone(),
+                    ..Shard::new(VOCAB.into(), "model.".into())
                 };
-                (vec![vocab], "dense/exlr8-dense-", "model.layers.")
+                let mut out = vec![vocab];
+                for extra in &d.extras {
+                    out.push(Shard::new(extra.clone(), String::new()));
+                }
+                (out, "dense/exlr8-dense-", d.prefix.as_str())
             }
-            false => (
+            None => (
                 vec![
                     Shard::new("exlr8-vocab".into(), "language_model.".into()),
                     Shard::new("exlr8-dense-global-000".into(), String::new()),
@@ -404,28 +605,36 @@ impl Release {
             if self.with(&file, |_| Ok(())).is_err() {
                 break;
             }
-            out.push(Shard::new(file, format!("{prefix}{layer}.")));
+            let mut shard = Shard::new(file, format!("{prefix}{layer}."));
+            for ((at, matrix), k) in self.dense.iter().flat_map(|d| &d.widths) {
+                if *at == layer {
+                    shard.picked.push((matrix.clone(), *k));
+                }
+            }
+            out.push(shard);
         }
         out
     }
 
     /// A shard's slices. GLM's take their most compact forms.
-    fn offered(f: &File, shard: &Shard, glm: bool) -> Vec<Slice> {
+    fn offered(f: &File, shard: &Shard, dense: bool) -> Vec<Slice> {
         let raw = f.slices();
         let shape = |name: &str| raw.iter().find(|s| s.name == name).map(|s| s.shape.clone());
         let mut out = Vec::new();
         for s in &raw {
-            let Some(matrix) = s.name.strip_suffix(".record") else {
+            let Some(stem) = s.name.strip_suffix(".record") else {
+                continue;
+            };
+            let Some(matrix) = shard.matrix(stem) else {
                 continue;
             };
             let name = |part: &str| shard.name(&format!("{matrix}.{part}"));
-            let (Some(suh), Some(svh)) = (
-                shape(&format!("{matrix}.suh")),
-                shape(&format!("{matrix}.svh")),
-            ) else {
+            let (Some(suh), Some(svh)) =
+                (shape(&format!("{stem}.suh")), shape(&format!("{stem}.svh")))
+            else {
                 // Other formats decode to the HF weight.
-                if let Ok(r) = record(f, matrix) {
-                    let stored = match (glm, r.format) {
+                if let Ok(r) = record(f, stem) {
+                    let stored = match (dense, r.format) {
                         (false, _) | (true, FP32) => Stored::F32,
                         (true, format) => block_form(format).map_or(Stored::Bf16, Stored::Form),
                     };
@@ -438,15 +647,18 @@ impl Release {
                 continue;
             };
             let (inp, outp) = (suh[0], svh[0]);
-            let Some(entries) = shape(&format!("{matrix}.trellis")) else {
+            let Ok((tensor, book)) = trellis_of(f, stem) else {
+                continue;
+            };
+            let Some(entries) = shape(&tensor) else {
                 continue;
             };
             let k = (entries[0] * entries[1] * 8 / (inp * outp)) as u32;
-            let Some(form) = trellis::form_for(k, Codebook::Mcg) else {
+            let Some(form) = trellis::form_for(k, book) else {
                 continue;
             };
             // GLM keeps the matrix packed, its rotations beside the codes.
-            let whole = match (glm, trellis::turned_for(k, Codebook::Mcg)) {
+            let whole = match (dense, trellis::turned_for(k, book)) {
                 (true, Some(turned)) => Stored::Form(turned),
                 _ => Stored::F32,
             };
@@ -488,6 +700,7 @@ impl Release {
             ]
             .iter()
             .any(|p| n.ends_with(p))
+                || n.contains(".trellis.")
                 || n.starts_with("__pad")
         };
         for s in raw {
@@ -506,10 +719,11 @@ impl Offer for Release {
     fn slices(&self) -> Vec<Slice> {
         let mut out = Vec::new();
         for shard in self.shards() {
-            let slices = self.with(&shard.file, |f| Ok(Self::offered(f, &shard, self.glm)));
+            let dense = self.dense.is_some();
+            let slices = self.with(&shard.file, |f| Ok(Self::offered(f, &shard, dense)));
             out.extend(slices.unwrap_or_default());
         }
-        if !self.glm {
+        if self.dense.is_none() {
             return out;
         }
         // GLM's routed layers keep their experts apart.
@@ -542,6 +756,25 @@ impl Offer for Release {
         Release::packed(self, name, None)
     }
 
+    /// BF16 matrices and tensors as stored, others narrowed.
+    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
+        let (file, local) = self.place(name);
+        let matrix = local.strip_suffix(".weight").unwrap_or(&local).to_string();
+        let stored = self.with(&file, |f| {
+            let bf16 = |s: &Slice| s.name == local && s.stored == Stored::Bf16;
+            match record(f, &matrix) {
+                Ok(r) if r.format == BF16 => f.bytes(&format!("{matrix}.bf16")).map(Some),
+                Err(_) if f.slices().iter().any(bf16) => f.bytes(&local).map(Some),
+                _ => Ok(None),
+            }
+        })?;
+        if let Some(bytes) = stored {
+            return Ok(bytes);
+        }
+        let narrow = |x: &f32| tessera_engine::Bf16::from(*x).0.to_le_bytes();
+        Ok(self.read(name)?.iter().flat_map(narrow).collect())
+    }
+
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         Release::packed(self, name, Some(rows))
     }
@@ -549,7 +782,7 @@ impl Offer for Release {
     /// Routed experts are cut. Other matrices are read whole.
     fn packed_share(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         let routed = experts::split(name).is_some_and(|(_, l)| l.starts_with("experts."));
-        Release::packed(self, name, (routed && self.glm).then_some(rows))
+        Release::packed(self, name, (routed && self.dense.is_some()).then_some(rows))
     }
 }
 

@@ -29,7 +29,7 @@ use names::Rule;
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Stored};
+use tessera_checkpoint::{Offer, Shards, Stored, exlr8};
 use tessera_engine::decoder::{self, Config, Moe, Swiglu};
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::gemma4;
@@ -320,16 +320,18 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
         &[],
         Steps::Plain,
         &Overrides::default(),
+        None,
     )
 }
 
-/// The user's name rules go last. `steps` adds entry ports.
+/// User rules go last. `manifest` picks exlr8 widths.
 pub fn load_named(
     dir: &Path,
     [slots, context]: [u64; 2],
     user: &[Rule],
     steps: Steps,
     overrides: &Overrides,
+    manifest: Option<&str>,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
         return gguf::load(dir, slots, context, user, steps);
@@ -359,9 +361,27 @@ pub fn load_named(
             (graph, config.stack.layers, Vec::new())
         }
     };
-    let shards = Shards::open(dir)?;
-    let (weights, pins) = pull(&graph, &shards, layers, &[&rules, user])?;
+    let offer: Box<dyn Offer> = match dir.join("dense/exlr8-vocab.safetensors").exists() {
+        true => Box::new(release(dir, manifest)?),
+        false => Box::new(Shards::open(dir)?),
+    };
+    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[&rules, user])?;
     dressed(dir, graph, Weights::Held(weights), pins)
+}
+
+/// `dir`'s exlr8 release at `name`, or its only manifest.
+fn release(dir: &Path, name: Option<&str>) -> Result<exlr8::Release, Box<dyn Error + Send + Sync>> {
+    let release = exlr8::Release::open(dir);
+    let all = release.manifests();
+    let name = match (name, all.as_slice()) {
+        (Some(name), _) => name.to_string(),
+        (None, []) => return Ok(release),
+        (None, [one]) => one.clone(),
+        (None, many) => {
+            return Err(format!("the release has manifests {}: pick one", many.join(", ")).into());
+        }
+    };
+    Ok(release.manifest(&name)?)
 }
 
 /// The graph and weights with `dir`'s tokenizer, template, stops.

@@ -194,6 +194,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
         &rules,
         Steps::Plain,
         &Default::default(),
+        None,
     )?;
     let recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
