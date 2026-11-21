@@ -152,11 +152,17 @@ fn four<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const HEA
         (4 * (j / (B / 2) as u64)) as u32
     };
     let c = b + (S::BYTES as u64 + at);
+    // Packed nibbles: four codes fill two bytes, not four.
+    let wide = C::BITS == 8 || HALVES;
     // Scales of two bytes keep the codes two-aligned.
-    let w = if S::BYTES == 2 {
+    let w = if S::BYTES == 2 && wide {
         c.half(0) | (c.half(2) << 16)
-    } else {
+    } else if S::BYTES == 2 {
+        c.half(0)
+    } else if wide {
         c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
+    } else {
+        c[0] as u32 | ((c[1] as u32) << 8)
     };
     let head = if HEAD { f32::from_bits(p.word(0)) } else { 1.0 };
     let scale = head * S::load(b);
