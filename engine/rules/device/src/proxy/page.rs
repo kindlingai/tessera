@@ -66,6 +66,11 @@ impl Page {
         unsafe { AtomicU64::from_ptr(at) }
     }
 
+    /// The word the device bumps after each trigger.
+    pub(super) fn epoch(&self) -> &AtomicU64 {
+        self.word(Word::Epoch)
+    }
+
     fn size(&self, pool: u32, slot: u32, rank: u32) -> u64 {
         let index = (pool as usize * MAX_DEPTH + slot as usize) * MAX_GROUP + rank as usize;
         let at = unsafe { self.page.cast::<u8>().add(SIZES + index * 4) };
