@@ -7,6 +7,7 @@ use tessera_graph::{Graph, Parts};
 use tessera_lower::{Cluster, Pick, Recipe, Settings, Weight, kept};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::{mla, small};
+use tessera_run::Profile;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
 
@@ -35,6 +36,7 @@ fn opened(
 ) -> Engine {
     let settings = Settings {
         backend: Pick::Host,
+        profile: Some(1),
         ..Settings::default()
     };
     let g = graph();
@@ -79,6 +81,12 @@ fn agree(graph: fn() -> Graph) {
     assert!(lead.kernels().contains_key("all_reduce"));
     lead.dismiss().unwrap();
     follower.join().unwrap();
+    let ranks = lead.ranks().unwrap();
+    let reduced = |p: &Option<Profile>| {
+        p.as_ref()
+            .is_some_and(|p| p.spent.contains_key("all_reduce"))
+    };
+    assert!(ranks.profiles.len() == 2 && ranks.profiles.iter().all(reduced));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::Transport;
 use tessera_graph::{Graph, Parts, shard};
 use tessera_lower::{Cluster, Device, Recipe, Settings, ZoneKind};
-use tessera_run::{Rank, Run, Sum};
+use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 
 /// A rank's zones and each rank's share of split weights.
 pub struct Place {
@@ -82,7 +82,11 @@ impl Engine {
 
     /// Runs rank 0's launches until it dismisses the ranks.
     pub fn follow(&mut self) -> Result<(), Error> {
-        while let Some(told) = self.told(&[])? {
+        loop {
+            let held = self.held.take();
+            let Some(told) = self.told(&held.map_or(Vec::new(), |(_, p)| p.to_bytes()))? else {
+                return Ok(());
+            };
             let Some(t) = decode(&told) else {
                 return Ok(());
             };
@@ -91,7 +95,6 @@ impl Engine {
             }
             self.launch(&t.rows, &t.picks, t.head)?;
         }
-        Ok(())
     }
 
     /// Ends each other rank's `follow`.
@@ -104,8 +107,21 @@ impl Engine {
         let Some(control) = &mut self.control else {
             return Ok(None);
         };
+        let lead = control.rank() == 0;
         let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
+        if let (true, Some((launches, own))) = (lead, self.held.take()) {
+            let mut profiles = vec![Some(own)];
+            profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
+            let ranks = Ranks { launches, profiles };
+            eprintln!("profile of {launches} launches:\n{ranks}");
+            self.ranks = Some(ranks);
+        }
         Ok(Some(parts.swap_remove(0)))
+    }
+
+    /// The last profiles rank 0 gathered, one per rank.
+    pub fn ranks(&self) -> Option<&Ranks> {
+        self.ranks.as_ref()
     }
 
     /// Rank 0 tells the others its launch and changed table.
