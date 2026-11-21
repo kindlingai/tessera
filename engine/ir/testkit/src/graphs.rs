@@ -5,7 +5,8 @@ use tessera_graph::{
     Composite, DType, Dim, DimExpr, DimName, Graph, PathSeg, Port, Role, TensorType,
 };
 use tessera_trace::{
-    Act, Embed, EntryKind, Linear, Linears, Mask, Model, Norm, Pairs, Vector, Weights, declare,
+    Act, Embed, EntryKind, Linear, Linears, Mask, Model, Norm, Pairs, Taps, Vector, Weights,
+    declare,
 };
 
 #[derive(Weights)]
@@ -152,15 +153,23 @@ pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
-/// The gated delta rule, value heads over key heads.
+/// Filtered values, then the delta rule over key heads.
 pub fn delta(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
-    let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
+    let fixed = [
+        (Heads, heads),
+        (KvHeads, kv_heads),
+        (HeadDim, width),
+        (Hidden, heads * width),
+    ];
     let m = model(bounded, &fixed);
     let keys = || floats([Seqs, Context, KvHeads, HeadDim]);
     let gates = || floats([Seqs, Context, Heads]);
-    let values = floats([Seqs, Context, Heads, HeadDim]);
+    let values = floats([Seqs, Context, Hidden]);
     let ports = [keys(), keys(), values, gates(), gates()];
-    let [q, k, v, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let [q, k, x, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let mut path = vec![PathSeg::Field("taps".into())];
+    let taps = Taps::declare(&m, &mut path, &[Hidden.into(), 4u64.into()]);
+    let v = x.conv(&taps).reshape([Seqs, Context, Heads, HeadDim]);
     let out = m.delta(0.25, [&q, &k, &v], [&decay, &rate]);
     m.finish([(Role::Logits, &out)])
 }
