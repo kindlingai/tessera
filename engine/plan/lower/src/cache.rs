@@ -4,7 +4,7 @@ use crate::cost::Device;
 use crate::plan::Plan;
 use crate::{Error, lower_upto};
 use std::collections::HashMap;
-use tessera_graph::{DimName, Graph};
+use tessera_graph::{DimName, Graph, Size};
 
 /// A plan holds while its graph and device stay unchanged.
 type Key = (u64, usize, Vec<(DimName, u64)>, Vec<DimName>, u64);
@@ -59,10 +59,16 @@ impl Cache {
         device: &Device,
     ) -> Result<(&Plan, Bound), Error> {
         let mut bound = Vec::with_capacity(upto.len());
+        // A bucket never passes its dimension's bound.
+        let most = |name: DimName| match g.dims.iter().find(|d| d.name == name)?.size {
+            Size::Bounded(m) => Some(m),
+            _ => None,
+        };
+        let capped = |name: DimName, n: u64| most(name).map_or(n, |m| n.min(m));
         let bucket = |(name, n): &(DimName, u64)| match upto.contains(name) {
             // Segment counts start at one, contexts at the least plan.
-            true if *name == DimName::Segments => (*name, n.next_power_of_two()),
-            true => (*name, n.next_power_of_two().max(LEAST)),
+            true if *name == DimName::Segments => (*name, capped(*name, n.next_power_of_two())),
+            true => (*name, capped(*name, n.next_power_of_two().max(LEAST))),
             false => (*name, *n),
         };
         let rounded: Vec<(DimName, u64)> = sizes.iter().map(bucket).collect();

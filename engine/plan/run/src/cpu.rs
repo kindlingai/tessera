@@ -147,13 +147,13 @@ impl Run for Runner {
             .collect();
         // A tree that does not compile runs in lockstep instead.
         let mut compiled = Vec::with_capacity(plan.steps.len());
-        for (step, body) in plan.steps.iter().zip(&self.bodies) {
+        for body in &self.bodies {
             let Some(body) = body else {
                 compiled.push(None);
                 continue;
             };
-            // Printing a kernel is cheaper than hashing its text.
-            let key = format!("{:?}", step.kernel);
+            // Bodies share an entry name when their text matches.
+            let key = body.entry.clone();
             let entry = match self.known.get(&key) {
                 Some(entry) => *entry,
                 None => {

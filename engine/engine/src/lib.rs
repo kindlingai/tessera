@@ -112,6 +112,8 @@ pub enum Error {
     SharedPage,
     #[error("the graph has no entry that scores these ids")]
     Scores,
+    #[error("a bucketed dimension sits inside a larger axis")]
+    BucketAxis,
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.

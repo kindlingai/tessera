@@ -21,7 +21,7 @@ fn delta_rule(
     mut out: BufMut<F32>,
     scale: f32,
     jobs: u32,
-    #[build] rows: u32,
+    rows: u32,
     #[build] heads: u32,
     #[build] kv_heads: u32,
     #[build] key_width: u32,
@@ -64,7 +64,7 @@ fn delta_rule(
 #[launch(
     crate = tessera_lower,
     name = self.name(),
-    sizes = vec![self.site.seqs, self.site.rows, self.site.heads, self.site.width],
+    sizes = vec![self.site.seqs, self.site.rows.most(), self.site.heads, self.site.width],
     work = self.site.out() * self.site.key_width * 4,
     guess = GUESS,
     runs_on = self.zone,
@@ -90,13 +90,13 @@ impl Delta {
 
     fn body(&self) -> tessera_codegen::ir::Body {
         let d = &self.site;
-        let [rows, heads, kv_heads] = [d.rows, d.heads, d.kv_heads].map(|n| n as u32);
+        let [heads, kv_heads] = [d.heads, d.kv_heads].map(|n| n as u32);
         let [key_width, width] = [d.key_width, d.width].map(|n| n as u32);
-        delta_rule_ir(rows, heads, kv_heads, key_width, width)
+        delta_rule_ir(heads, kv_heads, key_width, width)
     }
 }
 
-/// One launch, the scale before the job count.
+/// One launch: the scale, the job count, then the rows.
 fn launches(k: &Delta, step: &Step) -> Vec<Launch> {
     let jobs = k.jobs();
     let shape = match k.zone {
@@ -110,6 +110,7 @@ fn launches(k: &Delta, step: &Step) -> Vec<Launch> {
     let mut launch = Launch::plain(step, &[jobs], shape);
     let at = launch.args.len() - 1;
     launch.args.insert(at, Arg::value(&k.site.scale));
+    launch.args.push(Arg::size(k.site.rows));
     vec![launch]
 }
 

@@ -1,4 +1,5 @@
 use super::Pattern;
+use crate::extent::Extent;
 use crate::kernel::Kernel;
 use crate::kernels::{Map, MapStage};
 use crate::rule::{Attn, Draft, Read};
@@ -154,14 +155,15 @@ impl Attend {
     }
 }
 
-/// The gated delta rule over whole sequences of fixed length.
+/// The gated delta rule over whole sequences.
 #[derive(Clone, Copy, Debug)]
 pub struct Delta {
     pub scale: f32,
     /// Queries, keys, values, log decays and write rates.
     pub reads: [T; 5],
     pub seqs: usize,
-    pub rows: usize,
+    /// Each sequence's rows, read at launch in a runtime plan.
+    pub rows: Extent,
     /// Value heads. Each key head serves a contiguous group.
     pub heads: usize,
     pub kv_heads: usize,
@@ -177,11 +179,12 @@ impl Pattern for Delta {
         };
         let reads: [T; 5] = node.args[..].try_into().ok()?;
         let (q, v) = (tree.node(reads[0]), tree.node(reads[2]));
-        if q.extents[1].runtime() {
+        // An extent holds one runtime dimension: the rows.
+        if q.extents[0].runtime() {
             return None;
         }
-        let (&[seqs, rows, kv_heads, key_width], &[_, _, heads, width]) =
-            (&q.shape[..], &v.shape[..])
+        let rows = q.extents[1];
+        let (&[seqs, _, kv_heads, key_width], &[_, _, heads, width]) = (&q.shape[..], &v.shape[..])
         else {
             return None;
         };
@@ -199,8 +202,8 @@ impl Pattern for Delta {
 }
 
 impl Delta {
-    /// The output's element count.
+    /// Output elements at the most rows.
     pub fn out(&self) -> usize {
-        self.seqs * self.rows * self.heads * self.width
+        self.seqs * self.rows.most() * self.heads * self.width
     }
 }
