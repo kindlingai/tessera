@@ -7,7 +7,7 @@ use tessera_graph::DimName::{Context, HeadDim, Heads, Hidden, KvHeads, Rows, Seg
 use tessera_graph::{DType, Dim, Graph, Size, TensorType};
 use tessera_interp::{Store, Tensor, run, run_kept};
 use tessera_lower::kept::{self, Layout};
-use tessera_lower::{Device, Pick, Settings, View, lower, rules};
+use tessera_lower::{Cache, Device, Pick, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, fill, graphs, max_abs_diff};
@@ -318,7 +318,70 @@ fn delta_matches_interp() {
     let out = m.delta(0.25, [&q, &k, &v], [&decay, &rate]);
     let g = m.finish([(Role::Logits, &out)]);
     let mut draws = Noise(7);
-    let (seqs, len) = (2, 50);
+    let taps = noise(vec![48, 4], &mut draws);
+    let native = Settings {
+        backend: Pick::Cpu,
+        ..host()
+    };
+    for settings in runs().into_iter().chain([native]) {
+        let device = Device::guess(&settings);
+        let inputs = delta_inputs(50, &mut draws);
+        let want = run(&g, std::slice::from_ref(&taps), 0, &inputs).unwrap();
+        let plan = lower(&g, 0, &[(Seqs, 2), (Context, 50)], &device).unwrap();
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+        let ours = |n: &&str| n.ends_with("delta") || n.ends_with("conv");
+        assert!(names.iter().all(ours), "{names:?}");
+        let mut runner = open(plan, &settings).unwrap();
+        runner.load(0, taps.view()).unwrap();
+        let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(off < 1e-4, "{:?}: off by {off:e}", settings.backend);
+        // One 64-row plan. Each sequence pads to 64.
+        let mut plans = Cache::default();
+        for len in [50, 33] {
+            let inputs = delta_inputs(len, &mut draws);
+            let want = run(&g, std::slice::from_ref(&taps), 0, &inputs).unwrap();
+            let sizes = [(Seqs, 2), (Context, len as u64)];
+            let (plan, bound) = plans.upto(&g, 0, &sizes, &[Context], &device).unwrap();
+            let slot = plan.outputs[0].slot;
+            runner.replan(plan).unwrap();
+            runner.bind_all(&bound);
+            let rows = bound[0].1 as usize;
+            let fed: Vec<Tensor> = inputs.iter().map(|t| padded(t, rows)).collect();
+            let views: Vec<_> = fed.iter().map(|t| t.view()).collect();
+            runner.feed(&views).unwrap();
+            runner.submit(0..runner.plan().steps.len()).unwrap();
+            let got = padded(&runner.read(slot).unwrap().reshaped(vec![2, rows, 48]), len);
+            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+            assert!(
+                off < 1e-4,
+                "{len} rows on {:?}: off by {off:e}",
+                settings.backend
+            );
+        }
+        assert_eq!(plans.len(), 1);
+    }
+}
+
+/// `t`, `[seqs, len, ..]`, cut or zero filled to `rows`.
+fn padded(t: &Tensor, rows: usize) -> Tensor {
+    let [seqs, len] = [t.shape[0], t.shape[1]];
+    let row = t.len() / (seqs * len);
+    let x = t.floats().unwrap();
+    let mut out = vec![0.0; seqs * rows * row];
+    let kept = len.min(rows) * row;
+    for s in 0..seqs {
+        out[s * rows * row..][..kept].copy_from_slice(&x[s * len * row..][..kept]);
+    }
+    let mut shape = t.shape.clone();
+    shape[1] = rows;
+    Tensor::f32(shape, out)
+}
+
+/// Two sequences of `len` rows: unit keys, decays and rates.
+fn delta_inputs(len: usize, draws: &mut Noise) -> [Tensor; 5] {
+    let seqs = 2;
     // Unit keys and rates below one keep the state bounded.
     let unit = |draws: &mut Noise| {
         let t = noise(vec![seqs, len, 2, 16], draws);
@@ -333,34 +396,11 @@ fn delta_matches_interp() {
         let x = (0..seqs * len * 6).map(|_| f(draws.draw())).collect();
         Tensor::f32(vec![seqs, len, 6], x)
     };
-    let inputs = [
-        unit(&mut draws),
-        unit(&mut draws),
-        noise(vec![seqs, len, 48], &mut draws),
-        gate(&mut draws, |x| -x.abs()),
-        gate(&mut draws, |x| (x + 1.0) / 2.0),
-    ];
-    let taps = noise(vec![48, 4], &mut draws);
-    let want = run(&g, std::slice::from_ref(&taps), 0, &inputs).unwrap();
-    let sizes = [(Seqs, seqs as u64), (Context, len as u64)];
-    let native = Settings {
-        backend: Pick::Cpu,
-        ..host()
-    };
-    for settings in runs().into_iter().chain([native]) {
-        let plan = lower(&g, 0, &sizes, &Device::guess(&settings)).unwrap();
-        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-        let mut runner = open(plan, &settings).unwrap();
-        runner.load(0, taps.view()).unwrap();
-        let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
-        let got = runner.run(&views).unwrap().remove(0);
-        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-        let ours = |n: &&str| n.ends_with("delta") || n.ends_with("conv");
-        assert!(names.iter().all(ours), "{names:?}");
-        assert!(
-            off < 1e-4,
-            "{names:?} on {:?}: off by {off:e}",
-            settings.backend
-        );
-    }
+    [
+        unit(draws),
+        unit(draws),
+        noise(vec![seqs, len, 48], draws),
+        gate(draws, |x| -x.abs()),
+        gate(draws, |x| (x + 1.0) / 2.0),
+    ]
 }

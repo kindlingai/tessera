@@ -2,7 +2,7 @@
 
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
-use tessera_lower::{Draft, Kernel, T, Term, Tree};
+use tessera_lower::{Draft, Extent, Kernel, T, Term, Tree};
 
 /// One thread per element: its channel's last `taps` rows.
 #[kernel]
@@ -35,8 +35,8 @@ fn causal_conv(
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(causal_conv, name = "conv", threads = self.len)]
 pub(crate) struct Conv {
-    len: usize,
-    rows: usize,
+    len: Extent,
+    rows: Extent,
     width: usize,
     taps: usize,
 }
@@ -49,13 +49,15 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let [x, w] = node.args[..] else {
         return None;
     };
-    if tree.node(x).extents[1].runtime() {
-        return None;
-    }
-    let [_, rows, width] = node.shape[..] else {
+    // An extent holds one runtime dimension: the rows.
+    let [seqs, rows, _] = tree.node(x).extents[..] else {
         return None;
     };
-    let len = tree.elements(at);
+    if seqs.runtime() {
+        return None;
+    }
+    let width = *node.shape.last()?;
+    let len = rows.times(seqs.most() * width);
     let taps = tree.node(w).shape[1];
     let conv = Conv {
         len,
@@ -63,7 +65,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         width,
         taps,
     };
-    Some(vec![Draft::new(conv, [x, w], len)])
+    Some(vec![Draft::new(conv, [x, w], len.most())])
 }
 
 tessera_lower::rule!("conv", propose);
