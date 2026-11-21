@@ -28,6 +28,17 @@ pub fn rank_plan(g: &Graph, recipe: &Recipe, ranks: u32, rank: u32) -> Plan {
     lower(&g, 0, &sizes, &device).unwrap()
 }
 
+/// The plan's resident rules, its sums outside them, and zoning.
+pub fn taken(plan: &Plan) -> (Vec<&'static str>, usize, bool) {
+    let sums = plan
+        .steps
+        .iter()
+        .filter(|s| s.kernel.name() == "all_reduce");
+    let resident = plan.steps.iter().filter(|s| s.kernel.resident().is_some());
+    let rules = resident.map(|s| s.rule).collect();
+    (rules, sums.count(), plan.zoned())
+}
+
 /// A `prompt` of rows, then `steps` launches over two slots.
 pub fn launches(prompt: u32, steps: u32) -> Vec<Vec<Row>> {
     let row = |slot, token, position| Row {

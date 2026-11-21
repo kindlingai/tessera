@@ -7,9 +7,9 @@ use tessera_engine::wasm::Module;
 use tessera_engine::{Allowed, Backend, Engine, Steps};
 use tessera_graph::Graph;
 use tessera_lower::form::named;
-use tessera_lower::{Pins, Plan, Rule, Settings, Weight, kept};
+use tessera_lower::{Pins, Rule, Settings, Weight, kept};
 use tessera_models::mla::{RotatedMoe, stepper};
-use tessera_parity::{launches, rank_plan};
+use tessera_parity::{launches, rank_plan, taken};
 use tessera_recipe::Recipe;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
@@ -57,16 +57,6 @@ fn graph() -> Graph {
     c.stack.ffn = 256;
     c.stack.steps = Steps::Masked;
     stepper::<RotatedMoe>(&c)
-}
-
-/// The plan's resident rules, and its sums outside them.
-fn taken(plan: &Plan) -> (Vec<&'static str>, usize) {
-    let resident = plan.steps.iter().filter(|s| s.kernel.resident().is_some());
-    let sums = plan
-        .steps
-        .iter()
-        .filter(|s| s.kernel.name() == "all_reduce");
-    (resident.map(|s| s.rule).collect(), sums.count())
 }
 
 /// Each weight to load. Codes stay packed.
@@ -128,7 +118,7 @@ fn whole_matches_graph() {
     for (ranks, rank) in [(1, 0), (2, 1)] {
         assert_eq!(
             taken(&rank_plan(&graph(), &choices(kept::DENSE), ranks, rank)),
-            (vec![NAME], 0),
+            (vec![NAME], 0, false),
             "{ranks} ranks"
         );
     }

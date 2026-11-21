@@ -5,9 +5,9 @@ use tessera_device::whole;
 use tessera_engine::wasm::Module;
 use tessera_engine::{Backend, Engine};
 use tessera_graph::Graph;
-use tessera_lower::{Plan, Rule, Settings, Weight, kept};
+use tessera_lower::{Rule, Settings, Weight, kept};
 use tessera_models::decoder::{Swiglu, stepper};
-use tessera_parity::{launches, rank_plan};
+use tessera_parity::{launches, rank_plan, taken};
 use tessera_recipe::Recipe;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
@@ -39,25 +39,11 @@ fn graph() -> Graph {
     stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())
 }
 
-/// Resident rules, host sums, and any zone past 0.
-fn resident(plan: &Plan) -> (Vec<&'static str>, usize, bool) {
-    let resident = plan.steps.iter().filter(|s| s.kernel.resident().is_some());
-    let sums = plan
-        .steps
-        .iter()
-        .filter(|s| s.kernel.name() == "all_reduce");
-    (
-        resident.map(|s| s.rule).collect(),
-        sums.count(),
-        plan.zoned(),
-    )
-}
-
 #[test]
 fn resident_plans() {
     for (ranks, rank) in [(1, 0), (2, 1)] {
         assert_eq!(
-            resident(&rank_plan(&graph(), &choices(kept::DENSE), ranks, rank)),
+            taken(&rank_plan(&graph(), &choices(kept::DENSE), ranks, rank)),
             (vec![NAME], 0, false)
         );
     }
