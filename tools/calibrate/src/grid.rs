@@ -8,8 +8,8 @@ use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, indexed, indexed_rows, linear, neighbours, rotation, routed, rows, table,
-    turned,
+    attention, blocks, delta, indexed, indexed_rows, linear, neighbours, rotation, routed, rows,
+    table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -191,6 +191,15 @@ impl Grid {
             let g = attention(&three, heads);
             let pins = Pins::default();
             cases.push(Case { g, sizes, pins });
+            // Whole sequences, as long as the keys.
+            let span = |[_, keys]: &[u64; 2]| vec![(Seqs, 1), (Context, *keys)];
+            let sizes = self.spans.iter().map(span).collect();
+            let pins = Pins::default();
+            cases.push(Case {
+                g: delta(&three, heads),
+                sizes,
+                pins,
+            });
             // Picked keys: queries and keys alike, two kept.
             let span = |[_, keys]: &[u64; 2]| vec![(Seqs, 1), (Context, *keys)];
             let sizes = self.spans.iter().map(span).collect();
