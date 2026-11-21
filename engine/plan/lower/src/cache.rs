@@ -2,12 +2,12 @@
 
 use crate::cost::Device;
 use crate::plan::Plan;
-use crate::{Error, lower_upto};
+use crate::{Error, Wants, lower_upto};
 use std::collections::HashMap;
 use tessera_graph::{DimName, Graph, Size};
 
 /// A plan holds while its graph and device stay unchanged.
-type Key = (u64, usize, Vec<(DimName, u64)>, Vec<DimName>, u64);
+type Key = (u64, usize, Wants, Vec<(DimName, u64)>, Vec<DimName>, u64);
 
 /// Runtime dimensions are lowered at the next power of two.
 const LEAST: u64 = 16;
@@ -58,6 +58,19 @@ impl Cache {
         upto: &[DimName],
         device: &Device,
     ) -> Result<(&Plan, Bound), Error> {
+        self.wanting(g, entry, Wants::ALL, sizes, upto, device)
+    }
+
+    /// As `upto`, with only the `wants` outputs.
+    pub fn wanting(
+        &mut self,
+        g: &Graph,
+        entry: usize,
+        wants: Wants,
+        sizes: &[(DimName, u64)],
+        upto: &[DimName],
+        device: &Device,
+    ) -> Result<(&Plan, Bound), Error> {
         let mut bound = Vec::with_capacity(upto.len());
         // A bucket never passes its dimension's bound.
         let most = |name: DimName| match g.dims.iter().find(|d| d.name == name)?.size {
@@ -78,12 +91,13 @@ impl Cache {
         let key = (
             self.graph(g),
             entry,
+            wants,
             rounded,
             upto.to_vec(),
             device.generation(),
         );
         if !self.plans.contains_key(&key) {
-            let plan = lower_upto(g, entry, &key.2, upto, device)?;
+            let plan = lower_upto(g, entry, wants, &key.3, upto, device)?;
             self.plans.insert(key.clone(), plan);
         } else {
             self.hits += 1;

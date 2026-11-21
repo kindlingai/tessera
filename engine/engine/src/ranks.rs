@@ -3,7 +3,7 @@
 use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::{Graph, Parts, shard_aligned};
-use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, ZoneKind};
+use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 
 /// A rank's zones and each rank's share of split weights.
@@ -98,7 +98,10 @@ impl Engine {
             if let (Some(lanes), false) = (&mut self.lanes, t.table.is_empty()) {
                 lanes.replace(t.table);
             }
-            self.launch(&t.rows, &t.picks, t.head)?;
+            let outputs = self.run(&t.rows, &t.picks, t.head, t.wants)?;
+            // The read waits for the launch, as on rank 0.
+            self.runner.read(outputs[0])?;
+            self.report();
         }
     }
 
@@ -135,18 +138,20 @@ impl Engine {
         rows: &[Row],
         picks: &[u32],
         head: &Head,
+        wants: Wants,
         table: &[u32],
     ) -> Result<(), Error> {
         match &self.control {
             Some(control) if control.rank() == 0 => {}
             _ => return Ok(()),
         }
-        self.told(&encode(rows, picks, head, table)).map(|_| ())
+        self.told(&encode(rows, picks, head, wants, table))
+            .map(|_| ())
     }
 }
 
-/// A launch as words: head, table, rows, picks, list.
-fn encode(rows: &[Row], picks: &[u32], head: &Head, table: &[u32]) -> Vec<u8> {
+/// A launch as words: head, wants, table, rows, picks, list.
+fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32]) -> Vec<u8> {
     let (tag, k, list): (u32, usize, &[u32]) = match head {
         Head::Full(None) => (0, 0, &[]),
         Head::Full(Some(masks)) => (1, 0, masks),
@@ -160,6 +165,7 @@ fn encode(rows: &[Row], picks: &[u32], head: &Head, table: &[u32]) -> Vec<u8> {
     words
         .u32(tag)
         .u32(k as u32)
+        .u32(wants.0)
         .u32s(table)
         .u32s(&flat)
         .u32s(picks)
@@ -172,6 +178,7 @@ struct Told {
     rows: Vec<Row>,
     picks: Vec<u32>,
     head: Head,
+    wants: Wants,
     /// The page table, or empty if it did not change.
     table: Vec<u32>,
 }
@@ -179,7 +186,8 @@ struct Told {
 /// The launch `bytes` hold, if they hold one.
 fn decode(bytes: &[u8]) -> Option<Told> {
     let mut words = Reader(bytes);
-    let (tag, k, table) = (words.u32()?, words.u32()?, words.u32s()?);
+    let (tag, k) = (words.u32()?, words.u32()?);
+    let (wants, table) = (Wants(words.u32()?), words.u32s()?);
     let (rows, picks, list) = (words.u32s()?, words.u32s()?, words.u32s()?);
     let row = |&[slot, token, position]: &[u32; 3]| Row {
         slot,
@@ -195,6 +203,7 @@ fn decode(bytes: &[u8]) -> Option<Told> {
         rows: rows.as_chunks::<3>().0.iter().map(row).collect(),
         picks,
         head,
+        wants,
         table,
     })
 }

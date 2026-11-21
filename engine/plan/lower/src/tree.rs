@@ -10,8 +10,27 @@ use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 use tessera_codegen::kept::Layout;
 use tessera_graph::{
-    DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Shape, Stage,
+    DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Role, Shape, Stage,
 };
+
+/// Entry outputs a launch reads, one bit each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Wants(pub u32);
+
+impl Wants {
+    pub const ALL: Self = Self(u32::MAX);
+
+    /// The outputs of `entry` with `role`.
+    pub fn role(g: &Graph, entry: usize, role: Role) -> Self {
+        let outputs = g.entries.get(entry).map_or(&[][..], |e| &e.outputs);
+        let at = outputs.iter().enumerate().filter(|(_, o)| o.role == role);
+        Self(at.fold(0, |bits, (i, _)| bits | 1 << i))
+    }
+
+    fn has(self, output: usize) -> bool {
+        self.0 >> output & 1 == 1
+    }
+}
 
 /// A node of the view. Arguments come before their readers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -147,7 +166,8 @@ impl<'a> Tree<'a> {
         pins: &Pins,
         kept: &'static dyn Layout,
     ) -> Result<Self, Error> {
-        Self::upto(g, entry, sizes, &[], pins, kept, &Parts::even(1), 0)
+        let parts = &Parts::even(1);
+        Self::upto(g, entry, Wants::ALL, sizes, &[], pins, kept, parts, 0)
     }
 
     /// The same, `upto` read at launch, as `rank` of `parts`.
@@ -155,6 +175,7 @@ impl<'a> Tree<'a> {
     pub fn upto(
         g: &'a Graph,
         entry: usize,
+        wants: Wants,
         sizes: &[(DimName, u64)],
         upto: &[DimName],
         pins: &Pins,
@@ -165,7 +186,8 @@ impl<'a> Tree<'a> {
         let Some(e) = g.entries.get(entry) else {
             return Err(Unsupported::Entry(entry).into());
         };
-        let outputs: Vec<usize> = e.outputs.iter().map(|o| o.node.0 as usize).collect();
+        let wanted = e.outputs.iter().enumerate().filter(|(i, _)| wants.has(*i));
+        let outputs: Vec<usize> = wanted.map(|(_, o)| o.node.0 as usize).collect();
         let needed = needed(g, &outputs);
         let mut tree = Tree {
             g,

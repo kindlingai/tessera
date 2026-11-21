@@ -12,7 +12,7 @@ use crate::form::{self, Load};
 use crate::kernel::KernelRef;
 use crate::plan::Share;
 use crate::rule::{Read, Rule, linked};
-use crate::tree::{T, Term, Tree};
+use crate::tree::{T, Term, Tree, Wants};
 use crate::{Error, Unsupported};
 use std::collections::{BTreeMap, BTreeSet};
 use tessera_graph::{DimName, Graph, NodeId, View};
@@ -100,13 +100,14 @@ pub fn select(
     sizes: &[(DimName, u64)],
     device: &Device,
 ) -> Result<Selected, Error> {
-    select_upto(g, entry, sizes, &[], device)
+    select_upto(g, entry, Wants::ALL, sizes, &[], device)
 }
 
 /// The same, with `upto` dimensions read at launch.
 pub(crate) fn select_upto(
     g: &Graph,
     entry: usize,
+    wants: Wants,
     sizes: &[(DimName, u64)],
     upto: &[DimName],
     device: &Device,
@@ -117,6 +118,7 @@ pub(crate) fn select_upto(
     let mut tree = Tree::upto(
         g,
         entry,
+        wants,
         sizes,
         upto,
         &device.pins,

@@ -109,6 +109,7 @@ fn shapes(
     let tree = Tree::upto(
         g,
         0,
+        tessera_lower::Wants::ALL,
         sizes,
         &[],
         &device.pins,

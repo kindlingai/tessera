@@ -42,7 +42,7 @@ pub use tessera_mem::{Buffer, DType, Tensor, View};
 pub use tessera_platform::{Limits, Platform};
 pub use tessera_sim::{Cluster, Fit, Link, Zone, ZoneKind};
 pub use tessera_work::Load;
-pub use tree::{Node, T, Term, Tree};
+pub use tree::{Node, T, Term, Tree, Wants};
 
 use tessera_graph::{DimName, Graph};
 
@@ -53,18 +53,19 @@ pub fn lower(
     sizes: &[(DimName, u64)],
     device: &Device,
 ) -> Result<Plan, Error> {
-    lower_upto(g, entry, sizes, &[], device)
+    lower_upto(g, entry, Wants::ALL, sizes, &[], device)
 }
 
 /// The same, with `upto` dimensions read at launch.
 pub(crate) fn lower_upto(
     g: &Graph,
     entry: usize,
+    wants: Wants,
     sizes: &[(DimName, u64)],
     upto: &[DimName],
     device: &Device,
 ) -> Result<Plan, Error> {
-    let picked = select::select_upto(g, entry, sizes, upto, device)?;
+    let picked = select::select_upto(g, entry, wants, sizes, upto, device)?;
     Ok(assign(&picked, &schedule(&picked)))
 }
 

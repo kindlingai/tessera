@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
-use tessera_lower::{Cache, Device, Slot};
+use tessera_graph::Role;
+use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
 mod guide;
@@ -147,6 +148,15 @@ enum Head {
     Full(Option<Vec<u32>>),
     /// Entry 1, with `k` candidate ids per pick.
     Sparse(Vec<u32>, usize),
+}
+
+impl Head {
+    fn entry(&self) -> usize {
+        match self {
+            Head::Full(_) => 0,
+            Head::Sparse(..) => 1,
+        }
+    }
 }
 
 /// A token at a position, in a slot's sequence.
@@ -386,8 +396,10 @@ impl Engine {
         for list in ids {
             flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
         }
-        let outputs = self.run(rows, picks, Head::Sparse(flat, k))?;
-        let all = self.runner.read(outputs[1])?;
+        let head = Head::Sparse(flat, k);
+        let wants = Wants::role(&self.graph, head.entry(), Role::Logits);
+        let outputs = self.run(rows, picks, head, wants)?;
+        let all = self.runner.read(outputs[0])?;
         let all = all.floats().map_err(tessera_run::Error::from)?;
         let each = all.chunks(k).zip(ids);
         Ok(each.map(|(row, list)| row[..list.len()].to_vec()).collect())
@@ -395,7 +407,8 @@ impl Engine {
 
     /// One launch of `rows`, the likeliest ids after `picks`.
     fn launch(&mut self, rows: &[Row], picks: &[u32], head: Head) -> Result<Vec<u32>, Error> {
-        let outputs = self.run(rows, picks, head)?;
+        let wants = Wants::role(&self.graph, head.entry(), Role::Tokens);
+        let outputs = self.run(rows, picks, head, wants)?;
         let ran = Instant::now();
         let mut ids = self.runner.ids(outputs[0])?;
         ids.truncate(picks.len());
@@ -404,8 +417,14 @@ impl Engine {
         Ok(ids)
     }
 
-    /// One launch of `rows`. Returns the plan's output slots.
-    fn run(&mut self, rows: &[Row], picks: &[u32], head: Head) -> Result<Vec<Slot>, Error> {
+    /// One launch of `rows`. Returns the `wants` output slots.
+    fn run(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        head: Head,
+        wants: Wants,
+    ) -> Result<Vec<Slot>, Error> {
         if rows.is_empty() {
             return Err(Error::Rows);
         }
@@ -417,18 +436,18 @@ impl Engine {
         }
         let table = self.lanes.as_ref().and_then(lanes::Lanes::pending);
         let table = table.map(<[u32]>::to_vec).unwrap_or_default();
-        self.announce(rows, picks, &head, &table)?;
+        self.announce(rows, picks, &head, wants, &table)?;
         let (mut sizes, mut feeds) = launch_of(rows, picks, self.slots);
         let wanted = feeds[3].len();
-        let entry = match head {
-            Head::Full(None) if self.words.is_none() => 0,
+        let entry = head.entry();
+        match head {
+            Head::Full(None) if self.words.is_none() => {}
             Head::Full(masks) => {
                 let words = self.words.ok_or(Error::Mask)?;
                 // Unmasked and filler picks allow everything.
                 let mut bits = masks.unwrap_or_default();
                 bits.resize(wanted * words, u32::MAX);
                 feeds.insert(3, Tensor::u32(vec![wanted, words], bits));
-                0
             }
             Head::Sparse(mut ids, k) => {
                 // Filler picks repeat the last pick's list.
@@ -438,13 +457,13 @@ impl Engine {
                 }
                 feeds.insert(3, Tensor::u32(vec![wanted, k], ids));
                 sizes.push((Candidates, k as u64));
-                1
             }
-        };
+        }
         let start = Instant::now();
-        let (plan, bound) = self.plans.upto(
+        let (plan, bound) = self.plans.wanting(
             &self.graph,
             entry,
+            wants,
             &sizes,
             &[Context, Segments],
             &self.device,
