@@ -9,10 +9,11 @@ use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
 use tessera_lower::{Device, lower};
 use tessera_models::Stack;
-use tessera_models::qwen35::{Config, Mixing, Recurrent};
-use tessera_parity::loaded;
+use tessera_models::qwen35::{Config, Mixing, Recurrent, program};
+use tessera_parity::{Spec, loaded, suite};
 use tessera_run::testing::runs;
 use tessera_testkit::max_abs_diff;
+use tessera_trace::Composite::{Layer, Mlp, Model};
 use tessera_trace::DimName::{Context, Seqs};
 use tessera_trace::{Graph, PathSeg};
 
@@ -39,6 +40,47 @@ fn tiny() -> Config {
         tied: false,
     }
 }
+
+/// Clef's sizes.
+fn clef(max_seqs: u64, max_context: u64) -> Config {
+    let full = |i| match i % 4 {
+        3 => Mixing::Full,
+        _ => Mixing::Linear,
+    };
+    Config {
+        stack: Stack::sized([248_320, 5120, 64, 24, 256, 17_408], max_seqs, max_context),
+        kv_heads: 4,
+        rotary: 64,
+        rope_theta: 1e7,
+        eps: 1e-6,
+        linear: Recurrent {
+            key_heads: 16,
+            value_heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            window: 4,
+        },
+        layers: (0..64).map(full).collect(),
+        tied: false,
+    }
+}
+
+fn release() -> Graph {
+    program(&clef(1, 1024))
+}
+
+const SPEC: Spec = Spec {
+    name: "qwen35",
+    release,
+    parameters: 26_895_998_464,
+    regions: &[(Layer, 64), (Mlp, 64), (Model, 1)],
+    small: Some(|| program(&tessera_models::small::qwen35())),
+    stepper: None,
+    files: &[(include_str!("manifests/hf.json"), release)],
+    golden: None,
+};
+
+suite!(SPEC);
 
 /// The fixture for `part`, if this host has it.
 fn part(name: &str) -> Option<PathBuf> {

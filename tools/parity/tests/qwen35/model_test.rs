@@ -3,7 +3,7 @@
 use super::{LEN, SEQS, check, part, positions, tiny};
 use tessera_bundle::Overrides;
 use tessera_interp::Tensor;
-use tessera_models::qwen35::{Config, Mixing, program};
+use tessera_models::qwen35::{Config, program};
 
 #[test]
 fn logits_match_hf() {
@@ -39,14 +39,8 @@ fn configs_read() {
     };
     assert_eq!(program(&small).to_json(), program(&tiny()).to_json());
     // Clef nests its text model's keys under text_config.
-    let s = &clef.stack;
-    let sizes = [s.vocab, s.hidden, s.layers, s.heads, s.head_dim, s.ffn];
-    assert_eq!(sizes, [248_320, 5120, 64, 24, 256, 17_408]);
-    assert_eq!((clef.kv_heads, clef.rotary, clef.tied), (4, 64, false));
-    assert_eq!((clef.rope_theta, clef.eps), (1e7, 1e-6));
-    let l = &clef.linear;
-    let linear = [l.key_heads, l.value_heads, l.key_dim, l.value_dim, l.window];
-    assert_eq!(linear, [16, 48, 128, 128, 4]);
-    let full = |i: usize| clef.layers[i] == Mixing::Full;
-    assert!((0..64).all(|i| full(i) == (i % 4 == 3)));
+    assert_eq!(
+        program(&clef).to_json(),
+        program(&super::clef(SEQS as u64, 16)).to_json()
+    );
 }

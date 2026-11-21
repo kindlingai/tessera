@@ -2,6 +2,7 @@
 
 use crate::decoder::{Config, Scales};
 use crate::mla::{self, Index};
+use crate::qwen35::{self, Mixing, Recurrent};
 use crate::shared::Stack;
 use crate::{eg2, gemma4, nanogpt, tagger};
 
@@ -84,6 +85,26 @@ pub fn gemma4() -> gemma4::Config {
         full_theta: 1e6,
         first_shared: 2,
         eps: 1e-6,
+    }
+}
+
+/// A delta rule layer, then full attention with partial rotary.
+pub fn qwen35() -> qwen35::Config {
+    qwen35::Config {
+        stack: stack(64, 32, 128),
+        kv_heads: 1,
+        rotary: 16,
+        rope_theta: 1e4,
+        eps: 1e-6,
+        linear: Recurrent {
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 32,
+            value_dim: 32,
+            window: 4,
+        },
+        layers: vec![Mixing::Linear, Mixing::Full],
+        tied: false,
     }
 }
 

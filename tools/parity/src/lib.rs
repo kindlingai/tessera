@@ -17,13 +17,13 @@ pub use step::steps;
 use tessera_bundle::names::{repo, resolve};
 use tessera_checkpoint::{Slice, Stored};
 use tessera_interp::{Tensor, run};
-use tessera_lower::form::named;
+use tessera_lower::form::{F32_FORM, Load, named};
 use tessera_lower::{Device, Pick, Pins, Plan, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, cosine_f32, fill, max_abs_diff};
 use tessera_trace::DimName::{Context, Seqs};
-use tessera_trace::{Composite, DimName, Graph, TensorType};
+use tessera_trace::{Composite, DimName, Graph, PathSeg, TensorType};
 
 /// One model, from the suite's side.
 pub struct Spec {
@@ -213,6 +213,19 @@ fn faux_data(g: &Graph) -> (Vec<Tensor>, Vec<Tensor>) {
     (weights, inputs.collect())
 }
 
+/// `form` where a weight's rows hold whole blocks, else f32.
+fn fitted(g: &Graph, form: &'static dyn Load) -> Pins {
+    let mut pins = Pins::all(form);
+    for w in &g.weights {
+        let axes = &w.ty.shape.0;
+        let last = axes.last().and_then(|e| e.value(&g.dims, &|_| None));
+        if !last.is_none_or(|k| k.is_multiple_of(form.align() as u64)) {
+            pins = pins.pin(&PathSeg::dotted(&w.path), F32_FORM);
+        }
+    }
+    pins
+}
+
 /// One plan on the faux data against the interpreter.
 fn faux_check(
     label: &str,
@@ -222,11 +235,13 @@ fn faux_check(
     device: Device,
 ) -> Box<dyn Run> {
     let (weights, inputs) = data;
-    let form = device.pins.form(&[]);
-    // The interpreter sees the weights after the form's round trip.
-    let kept: Vec<Tensor> = (weights.iter())
-        .map(|t| Tensor::f32(t.shape.clone(), form.roundtrip(t.floats().unwrap())))
-        .collect();
+    // The interpreter sees the weights after their form's round trip.
+    let mut kept = Vec::with_capacity(weights.len());
+    for (t, w) in weights.iter().zip(&g.weights) {
+        let form = device.pins.form(&w.path);
+        let floats = form.roundtrip(t.floats().unwrap());
+        kept.push(Tensor::f32(t.shape.clone(), floats));
+    }
     let want = run(g, &kept, 0, inputs).unwrap();
     let plan = lower(g, 0, &FAUX, &device).unwrap();
     let mut runner = loaded(plan, g, &kept, settings);
@@ -253,7 +268,7 @@ pub fn native(spec: &Spec) {
         ..host()
     };
     for form in ["f32", "bf16", "q8_0", "q4_0", "nvfp4"] {
-        let device = Device::guess(&cpu).pinned(Pins::all(named(form).unwrap()));
+        let device = Device::guess(&cpu).pinned(fitted(&g, named(form).unwrap()));
         // A form the rows cannot take is not this test's.
         let Ok(plan) = lower(&g, 0, &FAUX, &device) else {
             continue;
@@ -275,7 +290,7 @@ pub fn faux(spec: &Spec) {
     let data = faux_data(&g);
     let forms = ["f32", "bf16", "q8_0", "q4_0", "nvfp4"];
     for (settings, form) in runs().iter().flat_map(|s| forms.map(|f| (s, f))) {
-        let device = Device::guess(settings).pinned(Pins::all(named(form).unwrap()));
+        let device = Device::guess(settings).pinned(fitted(&g, named(form).unwrap()));
         faux_check(
             &format!("{} as {form}", spec.name),
             &g,
