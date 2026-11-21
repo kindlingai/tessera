@@ -26,6 +26,11 @@ Prefer procedural loops over functional ones when heavily nested (eg `for` and
 Do not over-test. If lint flags excessive tests, assume you are over-testing and
 remove tests or refactor. Do not over-index on "byte identical".
 
+Do not ignore performance improvements because they are "within the noise floor"
+or "too small to be worth it". The project lives on improvements as small as 0.5%
+and human must always judge whether to drop an experiment that has a likelihood
+of success.
+
 ## Process Self-Improvement
 
 If your PR was stuck for a long time on a process or code failure that was
