@@ -381,8 +381,54 @@ impl<'a> Printer<'a> {
                 }
             }
             Stmt::Assign { target, op, value } => {
-                if self.wgsl && self.narrow(target) {
-                    self.refuse("a store narrower than a word".into());
+                if let Expr::Index(base, at) = target
+                    && let Expr::Var(name) = &**base
+                    && let Kind::Buffer(form) = self.kind(name)
+                {
+                    if self.wgsl && !matches!(form.name(), "f32" | "u32") {
+                        self.refuse("a store narrower than a word".into());
+                    } else if !self.wgsl && form.narrow() {
+                        let at = self.expr(at);
+                        let rhs = match op {
+                            Some(op) => {
+                                let combined = Expr::Bin(
+                                    *op,
+                                    Box::new(target.clone()),
+                                    Box::new(value.clone()),
+                                );
+                                self.expr(&combined)
+                            }
+                            None => self.expr(value),
+                        };
+                        self.line(format!("{};", form.store(name, &at, &rhs)));
+                        return;
+                    }
+                }
+                if op.is_none()
+                    && let Some(form) = self.wide(value)
+                    && let Expr::Var(name) = target
+                    && matches!(self.kind(name), Kind::Value(Ty::F32x4))
+                {
+                    let (t, v) = (self.expr(target), self.expr(value));
+                    self.uses(Intrinsic::Make4);
+                    let fields = ['x', 'y', 'z', 'w'];
+                    let parts = fields.map(|f| match self.wgsl {
+                        true => form.wgsl_part("w__", f),
+                        false => form.part("w__", f),
+                    });
+                    let [p0, p1, p2, p3] = parts;
+                    if self.wgsl {
+                        let ty = form.wgsl_wide();
+                        self.line(format!(
+                            "{{ let w__: {ty} = {v}; {t} = f_make4({p0}, {p1}, {p2}, {p3}); }}"
+                        ));
+                    } else {
+                        let ty = form.wide();
+                        self.line(format!(
+                            "{{ {ty} w__ = {v}; {t} = f_make4({p0}, {p1}, {p2}, {p3}); }}"
+                        ));
+                    }
+                    return;
                 }
                 let (t, v) = (self.expr(target), self.expr(value));
                 let op = op.map_or(String::new(), |op| op.c().into());
@@ -648,22 +694,6 @@ impl<'a> Printer<'a> {
                 let text = self.expr(e);
                 self.line(format!("{text};"));
             }
-        }
-    }
-}
-
-impl Printer<'_> {
-    /// Whether `target` stores into part of a word.
-    fn narrow(&self, target: &Expr) -> bool {
-        let Expr::Index(base, _) = target else {
-            return false;
-        };
-        match &**base {
-            Expr::Var(name) => match self.kind(name) {
-                Kind::Buffer(form) => !matches!(form.name(), "f32" | "u32"),
-                _ => false,
-            },
-            _ => false,
         }
     }
 }

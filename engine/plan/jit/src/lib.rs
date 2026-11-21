@@ -72,6 +72,7 @@ macro_rules! helpers {
 helpers! {
     rd_f32(P, P, P) -> F32;
     rd_bf16(P, P, P) -> F32;
+    rd_fp8(P, P, P) -> F32;
     rd_u32(P, P, P) -> I32;
     rd_u8(P, P, P) -> I32;
     rd_form(P, P, P, P) -> F32;
@@ -84,6 +85,8 @@ helpers! {
     dots_f32(P, P, P, P, P, P, P, P, P, P, P, P, P);
     dots_bf16(P, P, P, P, P, P, P, P, P, P, P, P, P);
     st_f32(P, P, P, F32);
+    st_bf16(P, P, P, F32);
+    st_fp8(P, P, P, F32);
     st_u32(P, P, P, I32);
     word(P, P, P) -> I32;
     half(P, P, P) -> I32;

@@ -2,6 +2,7 @@
 
 use crate::abi::{Arg, Launch, Shape};
 use crate::extent::Extent;
+use crate::form::Load;
 use crate::kernel::{Kernel, KernelRef};
 use crate::plan::Step;
 use crate::tree::{T, Tree};
@@ -29,6 +30,10 @@ pub struct Attn {
     /// Slots the query rows span, at most.
     pub segments: usize,
     pub mask: Mask,
+    /// Stored form of keys, values and outputs.
+    pub k_form: &'static dyn Load,
+    pub v_form: &'static dyn Load,
+    pub out_form: &'static dyn Load,
 }
 
 impl Attn {

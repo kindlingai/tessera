@@ -65,7 +65,7 @@ fn wider(a: Ty, b: Ty) -> Ty {
 
 fn element(form: &dyn Load) -> Ty {
     match form.read() {
-        Read::F32 | Read::Bf16 | Read::Decode => Ty::F32,
+        Read::F32 | Read::Bf16 | Read::Fp8 | Read::Decode => Ty::F32,
         Read::U32 | Read::U8 => Ty::U32,
     }
 }
@@ -176,6 +176,7 @@ impl Lowerer<'_, '_> {
                 return Ok(self.either(fits, load, check, Some(ty)).expect("a value"));
             }
             Read::Bf16 => "rd_bf16",
+            Read::Fp8 => "rd_fp8",
             Read::U8 => "rd_u8",
             Read::Decode => {
                 let form = self.registered(form)?;
@@ -463,8 +464,20 @@ impl Lowerer<'_, '_> {
                 let Expr::Var(name) = &args[0] else {
                     return Err("a store names its buffer".into());
                 };
-                let Kind::Buffer { ptr, len, skip, .. } = self.kind(name)? else {
+                let Kind::Buffer {
+                    form,
+                    ptr,
+                    len,
+                    skip,
+                } = self.kind(name)?
+                else {
                     return Err(format!("`{name}` is not a buffer"));
+                };
+                let st = match form.read() {
+                    Read::F32 => "st_f32",
+                    Read::Bf16 => "st_bf16",
+                    Read::Fp8 => "st_fp8",
+                    other => return Err(format!("cannot store4 into {other:?}")),
                 };
                 let idx = self.index(&args[1], t)?;
                 let at = self.b.ins().iadd(skip, idx);
@@ -472,7 +485,7 @@ impl Lowerer<'_, '_> {
                 for (k, part) in v.into_iter().enumerate() {
                     let k = self.iconst(self.ptr, k as i64);
                     let at = self.b.ins().iadd(at, k);
-                    self.call("st_f32", &[ptr, len, at, part]);
+                    self.call(st, &[ptr, len, at, part]);
                 }
                 Val::S(self.iconst(types::I8, 0))
             }
@@ -558,7 +571,7 @@ impl Lowerer<'_, '_> {
                 let sum = match fb.read() {
                     Read::F32 => self.call("dot_f32", &rows),
                     Read::Bf16 => self.call("dot_bf16", &rows),
-                    Read::U32 | Read::U8 | Read::Decode => {
+                    Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => {
                         let form = self.registered(fb)?;
                         self.call("dot_form", &[&[form][..], &rows].concat())
                     }

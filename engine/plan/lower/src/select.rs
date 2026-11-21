@@ -125,7 +125,8 @@ pub(crate) fn select_upto(
         device.kept,
         &parts,
         rank,
-    )?;
+    )?
+    .with_compute(device.compute);
     let whole: Vec<&Rule> = rules
         .iter()
         .copied()
@@ -254,6 +255,8 @@ pub(crate) fn select_upto(
     for (t, shape) in &tree.outputs {
         let val = vals[t.0 as usize].expect("outputs have values");
         let val = e.bring(val, EDGE);
+        let want = tree.node(*t).form;
+        let val = e.as_form(val, want);
         e.out.outputs.push((val, shape.clone()));
     }
     e.out.ranks = tree.parts.ranks() as u32;

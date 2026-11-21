@@ -3,7 +3,7 @@
 use crate::abi::Source;
 use crate::cost::Device;
 use crate::form::F32_FORM;
-use crate::kernels::{AllGather, AllReduce, Scatter, Widen};
+use crate::kernels::{AllGather, AllReduce, Narrow, Scatter, Widen};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
@@ -150,7 +150,6 @@ impl Cover<'_> {
             let len = self.tree.elements(t);
             // A gather costs as a sum of its bytes.
             let moved = self.device.all_reduce(self.tree.bytes(t))?;
-            let cost = moved + self.need(n.args[0], zone)?;
             let (rule, draft) = match stage {
                 Stage::AllReduce => (
                     AllReduce::NAME,
@@ -162,9 +161,12 @@ impl Cover<'_> {
                     (AllGather::NAME, Draft::new(gather, [n.args[0]], len))
                 }
             };
+            let drafts = vec![draft];
+            let cast = self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
+            let cost = moved + cast + self.need(n.args[0], zone)?;
             return Some(Choice {
                 rule,
-                drafts: vec![draft],
+                drafts,
                 cost,
                 offered: vec![rule],
                 ways: Vec::new(),
@@ -196,7 +198,7 @@ impl Cover<'_> {
                 let Some(mut cost) = drafts.iter().map(|d| self.seconds(zone, d)).sum() else {
                     continue;
                 };
-                cost += self.widening(zone, &drafts);
+                cost += self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
                 let below = reads(&drafts).into_iter().map(|r| self.need(r, zone));
                 let Some(below) = below.sum::<Option<f64>>() else {
                     continue;
@@ -269,14 +271,40 @@ impl Cover<'_> {
         let mut seconds = 0.0;
         for d in drafts {
             for (i, r) in d.reads.iter().enumerate() {
-                let Read::Node(t) = r else { continue };
-                let form = self.tree.node(*t).form;
+                let (form, len, cold) = match r {
+                    Read::Node(t) => (
+                        self.tree.node(*t).form,
+                        self.tree.elements(*t),
+                        self.streams && self.tree.weighed(*t),
+                    ),
+                    Read::Kept(index) => match self.tree.kept_rows(*index) {
+                        Some((t, _)) => (self.tree.node(t).form, self.tree.elements(t), false),
+                        None => continue,
+                    },
+                    Read::Draft(_) => continue,
+                };
                 if form.narrow() && !d.kernel.accepts(i, form) {
-                    let len = self.tree.elements(*t);
                     let widen = Widen { len, form };
-                    let cold = self.streams && self.tree.weighed(*t);
                     seconds += self.device.seconds_in(zone, &widen, len, cold);
                 }
+            }
+        }
+        seconds
+    }
+
+    /// Seconds to narrow outputs the drafts write as floats.
+    fn narrowing(&self, zone: u32, t: T, drafts: &[Draft]) -> f64 {
+        let mut seconds = 0.0;
+        let last = drafts.len().saturating_sub(1);
+        for (i, d) in drafts.iter().enumerate() {
+            let form = match d.writes {
+                Some(w) => self.tree.node(w).form,
+                None if i == last => self.tree.node(t).form,
+                None => F32_FORM,
+            };
+            if form.narrow() && !d.kernel.emits(form) {
+                let narrow = Narrow { len: d.len, form };
+                seconds += self.device.seconds_in(zone, &narrow, d.len, false);
             }
         }
         seconds

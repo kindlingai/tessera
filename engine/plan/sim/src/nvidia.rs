@@ -182,7 +182,7 @@ impl Chip for Nvidia {
             true => s.gather.value + (s.scatter.value - s.gather.value) * apart,
             false => s.gather.value,
         };
-        let tiles = t.shared * s.staged.value + t.tile_flops * s.mma.value;
+        let tiles = t.shared * s.staged.value + (t.tile_flops + t.bf16_flops / SPLIT) * s.mma.value;
         let waits = t.steps() * s.chain.value + t.loads * stall + tiles;
         let chain = rounds * l.trips * waits;
         let cold = |bytes: &&f64| **bytes > s.cache.value;
@@ -196,11 +196,11 @@ impl Chip for Nvidia {
         }
         let cached = l.loaded() / through(s.cached.value, s.near.value);
         let seconds = |cycles: f64| rounds * cycles / s.clock.value;
-        let tiled = l.threads as f64 * l.trips * t.tile_flops;
+        let tiled = l.threads as f64 * l.trips * (t.tile_flops * SPLIT + t.bf16_flops);
         let limits = [
             (Limit::Issue, seconds(issue)),
             (Limit::Pipe, seconds(pipe)),
-            (Limit::Compute, tiled * SPLIT / s.fp16.value),
+            (Limit::Compute, tiled / s.fp16.value),
             (Limit::Chain, chain),
             (Limit::Read, moved),
             (Limit::Cache, cached),

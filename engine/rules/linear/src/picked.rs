@@ -15,6 +15,7 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Shape, Step, T, Tree};
     sizes = self.product.sizes(),
     work = self.product.work(),
     accepts = self.product.accepts(input, form),
+    emits = self.product.emits(form),
     source = self.product.source(self.tree(), "picked"),
     launches = picked_launches,
     load = picked_load,
@@ -27,10 +28,10 @@ pub(crate) struct Picked {
 /// One thread per output element, along its row's matrix.
 #[kernel]
 fn picked(
-    x: Buf<F32>,
+    #[form(x_form)] x: Buf<Dyn>,
     #[form(form)] w: Buf<Dyn>,
     ids: Buf<U32>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     rows: u32,
     n: u32,
     k: u32,
@@ -39,7 +40,9 @@ fn picked(
     offset: u32,
     repeat: u32,
     first: u32,
+    #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     if gid() >= rows * n {
         return;
@@ -67,9 +70,14 @@ impl Picked {
 
     /// The kernel with the chain's operands and its store added.
     fn tree(&self) -> Body {
-        let form = self.product.form;
-        let key: Variant = ("picked", 0, form.name(), false);
-        let mut body = self.product.tree(key, || picked_ir(form));
+        let Product {
+            x_form,
+            form,
+            out_form,
+            ..
+        } = self.product;
+        let key: Variant = ("picked", 0, x_form.name(), form.name(), out_form.name(), 0);
+        let mut body = self.product.tree(key, || picked_ir(x_form, form, out_form));
         let gid = Expr::Call(Intrinsic::Gid, Vec::new());
         let at = Expr::cast(Ty::U64, gid);
         let sum = Expr::index(Expr::var("sums"), Expr::Int(0));
@@ -81,15 +89,29 @@ impl Picked {
 
 /// One thread per output element loops over all of `k`.
 fn picked_load(k: &Picked, _: usize) -> Option<Load> {
-    let Product { m, n, k: depth, .. } = k.product;
-    let form = k.product.form;
+    let Product {
+        m,
+        n,
+        k: depth,
+        x_form,
+        form,
+        out_form,
+        ..
+    } = k.product;
+    let mut reads = vec![
+        form.bytes(m * n * depth) as f64,
+        x_form.bytes(m * depth) as f64,
+    ];
+    for other in &k.product.other_forms {
+        reads.push(other.bytes(m * n) as f64);
+    }
     Some(Load {
         threads: m * n,
         group: 256,
         trips: depth as f64,
         trip: k.tree().trip(),
-        reads: vec![form.bytes(m * n * depth) as f64, (4 * m * depth) as f64],
-        written: 4.0 * (m * n) as f64,
+        reads,
+        written: out_form.bytes(m * n) as f64,
         flight: 64.0,
         ..Load::default()
     })

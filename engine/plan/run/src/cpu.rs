@@ -105,7 +105,7 @@ impl Runner {
             && grid.threads <= THREADS
         {
             let step = &self.base.plan.steps[step];
-            let work = step.kernel.work(step.write.bytes() / 4);
+            let work = step.kernel.work(step.write.len);
             return compiled(
                 entry,
                 &args,

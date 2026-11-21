@@ -2,16 +2,23 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use tessera_codegen::hash;
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
-use tessera_lower::form::Load as Stored;
-use tessera_lower::kernels::{add_operands, finish};
+use tessera_codegen::{Dialect, hash};
+use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
+use tessera_lower::kernels::{add_operand_forms, finish};
 use tessera_lower::sites;
 use tessera_lower::sites::{After, Near, Picked};
 use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree};
 
-/// Kernel, rows or schedule, form, wide loads.
-pub(crate) type Variant = (&'static str, usize, &'static str, bool);
+/// Kernel, schedule, forms for `x`, `w`, `out`, and flags.
+pub(crate) type Variant = (
+    &'static str,
+    usize,
+    &'static str,
+    &'static str,
+    &'static str,
+    u8,
+);
 
 thread_local! {
     /// Each kernel per variant, built once.
@@ -25,6 +32,9 @@ pub struct Product {
     pub n: usize,
     pub k: usize,
     pub form: &'static dyn Stored,
+    pub x_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
+    pub other_forms: Vec<&'static dyn Stored>,
     pub after: After,
     /// Set when each row reads its own matrix.
     pub picked: Option<Picked>,
@@ -44,6 +54,7 @@ impl Product {
     pub(crate) fn find(tree: &Tree, at: T) -> Option<(Self, Vec<Read>)> {
         let site: sites::Finished = tree.site(at)?;
         let sites::Matmul {
+            x,
             m,
             n,
             k,
@@ -51,6 +62,16 @@ impl Product {
             picked,
             ..
         } = site.product;
+        let x_form = plain(tree.node(x).form);
+        let out_form = writable(tree.node(at).form);
+        let mut other_forms = Vec::with_capacity(site.others.len());
+        for read in &site.others {
+            let form = match *read {
+                Read::Node(t) => plain(tree.node(t).form),
+                Read::Kept(_) | Read::Draft(_) => F32_FORM,
+            };
+            other_forms.push(form);
+        }
         let after = site.after.clone();
         Some((
             Self {
@@ -58,6 +79,9 @@ impl Product {
                 n,
                 k,
                 form,
+                x_form,
+                out_form,
+                other_forms,
                 after,
                 picked,
                 near: None,
@@ -71,7 +95,7 @@ impl Product {
         let mut body = TREES.with(|t| t.borrow_mut().entry(key).or_insert_with(build).clone());
         // The operands sit between the weights and the output.
         let at = 2 + usize::from(self.picked.is_some()) + usize::from(self.near.is_some());
-        add_operands(&mut body, at, self.after.others());
+        add_operand_forms(&mut body, at, &self.other_forms);
         body
     }
 
@@ -90,7 +114,7 @@ impl Product {
 
     /// The tree under an entry name that hashes its text.
     pub(crate) fn source(&self, mut body: Body, kind: &str) -> Source {
-        let hashed = hash(&body.text().body);
+        let hashed = hash(&body.text().render(Dialect::Cuda));
         body.entry = format!("{kind}_{}_{hashed:x}", self.form.name());
         Source::Made(body)
     }
@@ -113,6 +137,30 @@ impl Product {
     }
 
     pub(crate) fn accepts(&self, input: usize, form: &dyn Stored) -> bool {
-        self.form.taken(input, 1, form)
+        let extra = usize::from(self.picked.is_some()) + usize::from(self.near.is_some());
+        match input {
+            0 => form.name() == self.x_form.name(),
+            1 => form.name() == self.form.name(),
+            i if i < 2 + extra => !form.narrow(),
+            i => self
+                .other_forms
+                .get(i - 2 - extra)
+                .is_some_and(|f| form.name() == f.name()),
+        }
+    }
+
+    pub(crate) fn emits(&self, form: &dyn Stored) -> bool {
+        form.name() == self.out_form.name()
+    }
+
+    pub(crate) fn read_bytes(&self) -> Vec<f64> {
+        let mut reads = vec![
+            self.x_form.bytes(self.m * self.k) as f64,
+            self.form.bytes(self.n * self.k) as f64,
+        ];
+        for other in &self.other_forms {
+            reads.push(other.bytes(self.m * self.n) as f64);
+        }
+        reads
     }
 }

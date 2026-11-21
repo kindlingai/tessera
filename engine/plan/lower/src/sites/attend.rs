@@ -1,7 +1,8 @@
 use super::Pattern;
 use crate::extent::Extent;
+use crate::form::{Load, plain, writable};
 use crate::kernel::Kernel;
-use crate::kernels::{Map, MapStage};
+use crate::kernels::Map;
 use crate::rule::{Attn, Draft, Read};
 use crate::tree::{T, Term, Tree};
 use tessera_graph::{DimName, Op};
@@ -13,6 +14,7 @@ pub struct Attend {
     pub q: T,
     pub k: T,
     pub v: T,
+    pub q_form: &'static dyn Load,
     pub sizes: Attn,
     /// Ragged rows: each query's slot and position.
     pub rows: Option<[T; 2]>,
@@ -61,12 +63,16 @@ impl Pattern for Attend {
                 kept: tree.kept,
                 segments,
                 mask: a.mask,
+                k_form: plain(tree.node(k).form),
+                v_form: plain(tree.node(v).form),
+                out_form: writable(node.form),
             };
             return Some(Self {
                 scale: a.scale,
                 q,
                 k,
                 v,
+                q_form: plain(tree.node(q).form),
                 sizes,
                 rows: Some([node.args[3], node.args[4]]),
             });
@@ -120,12 +126,16 @@ impl Attend {
             kept: tree.kept,
             segments: 1,
             mask: a.mask,
+            k_form: plain(tree.node(k).form),
+            v_form: plain(tree.node(v).form),
+            out_form: writable(node.form),
         };
         Some(Self {
             scale: a.scale,
             q,
             k,
             v,
+            q_form: plain(tree.node(q).form),
             sizes,
             rows: None,
         })
@@ -140,7 +150,7 @@ impl Attend {
     pub fn ragged(&self, kernel: impl Kernel + 'static) -> Option<Vec<Draft>> {
         let [slots, positions] = self.rows?;
         let out = self.out();
-        let scale = Map::plain(vec![MapStage::Scale(self.scale)]);
+        let scale = Map::scaled(self.scale, self.q_form);
         let reads = [
             Read::Draft(0),
             Read::Node(self.k),

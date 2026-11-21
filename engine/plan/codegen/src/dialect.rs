@@ -71,6 +71,11 @@ const NAMES: &[(&str, &str, &str)] = &[
         "(*(device const uint2 *)(p))",
         "(*(const uint2 *)(p))",
     ),
+    (
+        "f_u32(p)",
+        "(*(device const u32 *)(p))",
+        "(*(const u32 *)(p))",
+    ),
 ];
 
 /// Hopper on: wait for the last kernel, release the next.
@@ -181,6 +186,89 @@ macro_rules! devices {
 
 crate::intrinsic::table!(devices);
 
+/// Portable float-to-e4m3 byte conversion, matching OCP e4m3.
+const SOFT_TO_E4M3: &str = "f_fn u8 f_to_e4m3(float x) {
+    u32 bits = f_asbits(x);
+    u32 sign = (bits >> 24) & 0x80u;
+    u32 mag = bits & 0x7fffffffu;
+    if (mag > 0x7f800000u) { return (u8)(sign | 0x7fu); }
+    if (mag >= 0x43e00000u) { return (u8)(sign | 0x7eu); }
+    if (mag < 0x3c800000u) {
+        float a = f_bits(mag);
+        float s = (a * 512.0f + 8388608.0f) - 8388608.0f;
+        return (u8)(sign | (u32)s);
+    }
+    u32 nudge = 0x7ffffu + ((mag >> 20) & 1u);
+    u32 r = (mag + nudge) & ~0xfffffu;
+    if (r >= 0x43e00000u) { return (u8)(sign | 0x7eu); }
+    u32 exp = (r >> 23) - 120u;
+    u32 man = (r >> 20) & 7u;
+    return (u8)(sign | (exp << 3) | man);
+}
+";
+
+/// Portable float-to-bf16 halfword conversion.
+const SOFT_TO_BF16: &str = "f_fn u16 f_to_bf16(float x) {
+    u32 b = f_asbits(x);
+    return (u16)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+";
+
+/// Store helpers for bf16 and fp8 buffers.
+fn narrow_stores(metal: bool) -> String {
+    let (addr, make_u2) = match metal {
+        true => ("device ", "uint2"),
+        false => ("", "make_uint2"),
+    };
+    let store4_bf16 = format!(
+        "f_fn void f_store4_bf16({addr}u16 *p, float4 v) {{
+    *({addr}uint2 *)p = {make_u2}(f_bf16_pair(v.y, v.x), f_bf16_pair(v.w, v.z));
+}}
+"
+    );
+    let soft_store4_e4m3 = format!(
+        "f_fn void f_store4_e4m3({addr}u8 *p, float4 v) {{
+    *({addr}u32 *)p = (u32)f_to_e4m3(v.x) | ((u32)f_to_e4m3(v.y) << 8)
+        | ((u32)f_to_e4m3(v.z) << 16) | ((u32)f_to_e4m3(v.w) << 24);
+}}
+"
+    );
+    if metal {
+        return format!("{SOFT_TO_BF16}{SOFT_TO_E4M3}{store4_bf16}{soft_store4_e4m3}");
+    }
+    let cuda_bf16 = format!(
+        "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+f_fn u16 f_to_bf16(float x) {{
+    u32 d;
+    asm(\"cvt.rn.bf16x2.f32 %0, %1, %2;\" : \"=r\"(d) : \"f\"(0.0f), \"f\"(x));
+    return (u16)d;
+}}
+#else
+{SOFT_TO_BF16}#endif
+"
+    );
+    let cuda_e4m3 = format!(
+        "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+f_fn u8 f_to_e4m3(float x) {{
+    unsigned short e;
+    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(e) : \"f\"(0.0f), \"f\"(x));
+    return (u8)(e & 0xffu);
+}}
+f_fn void f_store4_e4m3(u8 *p, float4 v) {{
+    unsigned short lo, hi;
+    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(lo) : \"f\"(v.y), \"f\"(v.x));
+    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(hi) : \"f\"(v.w), \"f\"(v.z));
+    *(u32 *)p = (u32)lo | ((u32)hi << 16);
+}}
+#else
+{SOFT_TO_E4M3}{soft_store4_e4m3}#endif
+"
+    );
+    let bf16 = hip(SOFT_TO_BF16, &cuda_bf16);
+    let e4m3 = hip(&format!("{SOFT_TO_E4M3}{soft_store4_e4m3}"), &cuda_e4m3);
+    format!("{bf16}{e4m3}{store4_bf16}")
+}
+
 /// The text before every kernel in `dialect`.
 fn head(dialect: Dialect) -> String {
     let metal = dialect == Dialect::Metal;
@@ -204,6 +292,7 @@ fn head(dialect: Dialect) -> String {
         let [for_metal, for_cuda] = device(*i);
         text.push_str(if metal { &for_metal } else { &for_cuda });
     }
+    text.push_str(&narrow_stores(metal));
     if !metal {
         text.push_str(CUDA_PDL);
     }

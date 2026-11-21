@@ -2,11 +2,13 @@
 
 use std::sync::{Arc, Mutex};
 use tessera_engine::{
-    Allowed, Batch, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row, Steps,
+    Allowed, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row,
+    Site, Steps,
 };
 use tessera_graph::{Graph, Op};
 use tessera_interp::{Store, Tensor, run_kept};
-use tessera_lower::{Recipe, Settings, Weight, kept, rules};
+use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
+use tessera_lower::{Pins, Recipe, Settings, Weight, kept, rules};
 use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
 use tessera_models::{mla, small};
 use tessera_run::testing::runs;
@@ -572,4 +574,89 @@ fn failures_stay_local() {
     let ends: Vec<_> = taken.iter().map(last).collect();
     let want = [Reason::Guide, Reason::Length].map(|r| Some(Event::Done(r)));
     assert_eq!(ends, want);
+}
+
+/// Pinned bf16 activations and bf16/fp8 KV match f32 logits.
+#[test]
+fn pinned_decoder_matches() {
+    use tessera_testkit::cosine_f32;
+    let prompt = [3u32, 11, 5, 2];
+    let configs = [
+        (
+            Pins::all(BF16_FORM)
+                .activations(BF16_FORM)
+                .kept(BF16_FORM)
+                .site(Site::Norm, F32_FORM)
+                .site(Site::Logits, F32_FORM),
+            Compute::Bf16,
+            0.999f32,
+        ),
+        (
+            Pins::all(F32_FORM)
+                .activations(BF16_FORM)
+                .kept(FP8_FORM)
+                .site(Site::Norm, F32_FORM)
+                .site(Site::Logits, F32_FORM),
+            Compute::Exact,
+            0.98f32,
+        ),
+    ];
+    for (pins, compute, min_cos) in configs {
+        let recipe = Recipe {
+            pins: pins.clone(),
+            compute,
+            ..Recipe::default()
+        };
+        for settings in runs() {
+            let (g, weights, mut engine) = open_on(41, 1, Steps::Scored, recipe.clone(), &settings);
+            let prefill: Vec<Row> = prompt
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| row(0, t, i as u32))
+                .collect();
+            let mut store = Store::default();
+            let want = run_kept(&g, &weights, &mut store, 0, &feeds(&prefill)).unwrap();
+            let want_logits = want[1].floats().unwrap();
+            let vocab: Vec<u32> = (0..32).collect();
+            let reads: Vec<Read> = (0..prompt.len() as u32)
+                .map(|row| Read {
+                    row,
+                    ids: vocab.clone(),
+                })
+                .collect();
+            let score_req = Request {
+                tokens: prompt.to_vec(),
+                reads,
+                ..Request::default()
+            };
+            let got = events(&mut engine, score_req);
+            let Event::Scores(scores) = &got[0] else {
+                panic!("{got:?}");
+            };
+            let flat: Vec<f32> = scores.iter().flatten().copied().collect();
+            let cos = cosine_f32(&flat, want_logits);
+            assert!(
+                cos > min_cos,
+                "{} on {:?}: cos {cos}",
+                pins.kept.name(),
+                settings.backend
+            );
+            // Multi-step decode through the narrow KV cache completes cleanly.
+            let gen_req = Request {
+                tokens: prompt.to_vec(),
+                max_tokens: 4,
+                ..Request::default()
+            };
+            let decoded = ids(&events(&mut engine, gen_req));
+            assert_eq!(decoded.len(), 4, "{decoded:?}");
+            let want_ids = reference(&g, &weights, &prompt, 4);
+            if pins.kept == BF16_FORM {
+                assert_eq!(
+                    decoded, want_ids,
+                    "bf16 greedy decode on {:?}",
+                    settings.backend
+                );
+            }
+        }
+    }
 }

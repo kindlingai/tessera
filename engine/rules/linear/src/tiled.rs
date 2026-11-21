@@ -1,14 +1,13 @@
 //! A matmul on the matrix unit, staged through group memory.
 
 use crate::product::{Product, Variant, place};
-use tessera_codegen::form::F32_FORM;
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
-use tessera_lower::form::{BF16_FORM, Load as Stored};
+use tessera_lower::form::{BF16_FORM, Load as Stored, plain};
 use tessera_lower::kernels::finish;
 use tessera_lower::sites::Near;
-use tessera_lower::{Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree};
+use tessera_lower::{Compute, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Tree};
 
 /// How a block of the output is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +42,12 @@ pub const SCHEDULES: [Schedule; 7] = [
 pub const PARTS: [Schedule; 2] = [
     Schedule::new((64, 64, 32), (2, 4), "parts_64x64", ""),
     Schedule::new((128, 128, 32), (2, 4), "parts_128x128", ""),
+];
+
+/// One-pass bf16 schedules. SIMD groups own multiples of 16.
+pub const BF16: [Schedule; 2] = [
+    Schedule::new((64, 64, 32), (2, 4), "bf16_64x64", ""),
+    Schedule::new((128, 128, 32), (2, 4), "bf16_128x128", ""),
 ];
 
 /// Slabs of `x` in bf16. Three hold an f32 exactly.
@@ -225,7 +230,7 @@ fn stash_bf16(
 #[kernel]
 fn fetch_rows(
     regs: &mut [f32; FLOATS],
-    src: Buf<F32>,
+    #[form(form)] src: Buf<Dyn>,
     r0: u32,
     k0: u32,
     limit: u32,
@@ -233,6 +238,7 @@ fn fetch_rows(
     #[build] count: u32,
     #[build] bk: u32,
     #[build] threads: u32,
+    #[build] form: &'static dyn Stored,
 ) {
     for j in 0..count / 4 {
         let i = lid() + j * threads;
@@ -283,7 +289,7 @@ macro_rules! tiled_kernel {
         $(#[$doc:meta])* $name:ident,
         [$x:ident, $a:ident, $row0:ident, $k0:ident, $m:ident, $k:ident],
         [$bm:ident, $bk:ident, $threads:ident, $wide:ident],
-        [$w:ident, $b:ident, $col0:ident, $n:ident, $bn:ident, $wm0:ident, $wn0:ident, $acc:ident, $form:ident],
+        [$w:ident, $b:ident, $col0:ident, $n:ident, $bn:ident, $wm0:ident, $wn0:ident, $acc:ident, $x_form:ident, $form:ident, $out_form:ident],
         [$($bufs:tt)*],
         [$($scalars:tt)*],
         [$($builds:tt)*],
@@ -294,10 +300,10 @@ macro_rules! tiled_kernel {
         $(#[$doc])*
         #[kernel]
         fn $name(
-            $x: Buf<F32>,
+            #[form($x_form)] $x: Buf<Dyn>,
             #[form($form)] $w: Buf<Dyn>,
             $($bufs)*
-            out: BufMut<F32>,
+            #[form($out_form)] out: BufMut<Dyn>,
             $m: u32,
             $n: u32,
             $k: u32,
@@ -312,7 +318,9 @@ macro_rules! tiled_kernel {
             #[build] $wide: bool,
             #[build] wbits: u32,
             $($builds)*
+            #[build] $x_form: &'static dyn Stored,
             #[build] $form: &'static dyn Stored,
+            #[build] $out_form: &'static dyn Stored,
         ) {
             let simd = lid() / LANES as u32;
             let group = gid() / $threads;
@@ -349,7 +357,7 @@ tiled_kernel!(
     tiled,
     [x, a_s, row0, k0, m, k],
     [bm, bk, threads, wide],
-    [w, b_s, col0, n, bn, wm0, wn0, acc, form],
+    [w, b_s, col0, n, bn, wm0, wn0, acc, x_form, form, out_form],
     [],
     [],
     [],
@@ -358,7 +366,7 @@ tiled_kernel!(
         let mut b_s = shared::<f32>(bn * (bk + PAD));
     ],
     [
-        stage(&mut a_s, x, row0, k0, m, k, bm, bk, threads, wide, F32_FORM);
+        stage(&mut a_s, x, row0, k0, m, k, bm, bk, threads, wide, x_form);
         stage(&mut b_s, w, col0, k0, n, k, bn, bk, threads, wide, form);
     ],
     [acc.block(&a_s, wm0 * (bk + PAD), &b_s, wn0 * (bk + PAD), bk + PAD, bk);]
@@ -369,7 +377,7 @@ tiled_kernel!(
     tiled_near,
     [x, a_s, row0, k0, m, k],
     [bm, bk, threads, wide],
-    [w, b_s, col0, n, bn, wm0, wn0, acc, form],
+    [w, b_s, col0, n, bn, wm0, wn0, acc, x_form, form, out_form],
     [ids: Buf<U32>,],
     [pixels: u32, cin: u32,],
     [],
@@ -378,38 +386,64 @@ tiled_kernel!(
         let mut b_s = shared::<f32>(bn * (bk + PAD));
     ],
     [
-        stage_near(&mut a_s, x, ids, row0, k0, m, pixels, cin, bm, bk, threads, F32_FORM);
+        stage_near(&mut a_s, x, ids, row0, k0, m, pixels, cin, bm, bk, threads, x_form);
         stage(&mut b_s, w, col0, k0, n, k, bn, bk, threads, wide, form);
     ],
     [acc.block(&a_s, wm0 * (bk + PAD), &b_s, wn0 * (bk + PAD), bk + PAD, bk);]
 );
 
 tiled_kernel!(
-    /// `tiled` for bf16 weights: `x` in exact bf16 parts.
+    /// `tiled` on bf16 matrix units, in one or three passes.
     tiled_parts,
     [x, a_s, row0, k0, m, k],
     [bm, bk, threads, _wide],
-    [w, b_s, col0, n, bn, wm0, wn0, acc, form],
+    [w, b_s, col0, n, bn, wm0, wn0, acc, x_form, form, out_form],
     [],
     [],
-    [#[build] parts: u32,],
+    [#[build] parts: u32, #[build] direct_x: bool, #[build] direct_w: bool,],
     [
         let mut a_s = shared::<u32>(parts * bm * (bk / 2 + PAD));
         let mut b_s = shared::<u32>(bn * (bk / 2 + PAD));
         // The next block's loads fly while this one multiplies.
         let mut xr = [0.0f32; FLOATS];
-        let mut wr = [0u32; WORDS];
-        fetch_rows(&mut xr, x, row0, 0, m, k, bm * bk / threads, bk, threads);
-        fetch_bf16(&mut wr, w, col0, 0, n, k, bn * bk / 2 / threads, bk, threads, form);
+        let mut xw = [0u32; WORDS];
+        let mut wr = [0.0f32; FLOATS];
+        let mut ww = [0u32; WORDS];
+        if direct_x {
+            fetch_bf16(&mut xw, x, row0, 0, m, k, bm * bk / 2 / threads, bk, threads, x_form);
+        } else {
+            fetch_rows(&mut xr, x, row0, 0, m, k, bm * bk / threads, bk, threads, x_form);
+        }
+        if direct_w {
+            fetch_bf16(&mut ww, w, col0, 0, n, k, bn * bk / 2 / threads, bk, threads, form);
+        } else {
+            fetch_rows(&mut wr, w, col0, 0, n, k, bn * bk / threads, bk, threads, form);
+        }
     ],
     [
-        stash_parts(&mut a_s, &mut xr, bm * bk / threads, bm, bk, threads, parts);
-        stash_bf16(&mut b_s, &mut wr, bn * bk / 2 / threads, bk, threads);
+        if direct_x {
+            stash_bf16(&mut a_s, &mut xw, bm * bk / 2 / threads, bk, threads);
+        } else {
+            stash_parts(&mut a_s, &mut xr, bm * bk / threads, bm, bk, threads, parts);
+        }
+        if direct_w {
+            stash_bf16(&mut b_s, &mut ww, bn * bk / 2 / threads, bk, threads);
+        } else {
+            stash_parts(&mut b_s, &mut wr, bn * bk / threads, bn, bk, threads, 1);
+        }
     ],
     [
         if k0 + bk < k {
-            fetch_rows(&mut xr, x, row0, k0 + bk, m, k, bm * bk / threads, bk, threads);
-            fetch_bf16(&mut wr, w, col0, k0 + bk, n, k, bn * bk / 2 / threads, bk, threads, form);
+            if direct_x {
+                fetch_bf16(&mut xw, x, row0, k0 + bk, m, k, bm * bk / 2 / threads, bk, threads, x_form);
+            } else {
+                fetch_rows(&mut xr, x, row0, k0 + bk, m, k, bm * bk / threads, bk, threads, x_form);
+            }
+            if direct_w {
+                fetch_bf16(&mut ww, w, col0, k0 + bk, n, k, bn * bk / 2 / threads, bk, threads, form);
+            } else {
+                fetch_rows(&mut wr, w, col0, k0 + bk, n, k, bn * bk / threads, bk, threads, form);
+            }
         }
         acc.parts(
         &a_s,
@@ -430,6 +464,7 @@ tiled_kernel!(
     sizes = self.product.sizes(),
     work = self.product.work(),
     accepts = self.product.accepts(input, form),
+    emits = self.product.emits(form),
     needs = tiled_needs(&self.schedule, self.parts),
     // Each device's tiles sum in their own order.
     order = Order::PerConfig,
@@ -455,7 +490,11 @@ impl Tiled {
 
     /// Where the schedule sits in its list.
     fn at(&self) -> usize {
-        let list: &[Schedule] = if self.parts > 0 { &PARTS } else { &SCHEDULES };
+        let list: &[Schedule] = match self.parts {
+            0 => &SCHEDULES,
+            1 => &BF16,
+            _ => &PARTS,
+        };
         let at = list.iter().position(|s| *s == self.schedule);
         at.expect("a listed schedule")
     }
@@ -467,9 +506,19 @@ impl Tiled {
 
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let Product { k, form, .. } = self.product;
+        let Product {
+            m,
+            n,
+            k,
+            x_form,
+            form,
+            out_form,
+            ..
+        } = self.product;
         let wide = k.is_multiple_of(WIDE as usize);
         let near = self.product.near.is_some();
+        let direct_x = self.parts == 1 && bf16_fits(x_form, m * k);
+        let direct_w = bf16_fits(form, n * k);
         let build = || {
             let s = &self.schedule;
             let (bm, bn, bk) = (s.block.0 as u32, s.block.1 as u32, s.block.2 as u32);
@@ -477,19 +526,36 @@ impl Tiled {
             let (simds_n, threads) = (s.simds.1 as u32, s.threads() as u32);
             let (wbits, parts) = (weight_bits(form), self.parts);
             match (near, parts) {
-                (true, _) => tiled_near_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, form),
-                (false, 0) => tiled_ir(bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, form),
+                (true, _) => tiled_near_ir(
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, x_form, form, out_form,
+                ),
+                (false, 0) => tiled_ir(
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, x_form, form, out_form,
+                ),
                 _ => tiled_parts_ir(
-                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, parts, form,
+                    bm, bn, bk, wm, wn, simds_n, threads, wide, wbits, parts, direct_x, direct_w,
+                    x_form, form, out_form,
                 ),
             }
         };
         let kind = match (near, self.parts) {
             (true, _) => "tiled_near",
             (false, 0) => "tiled",
+            (false, 1) => "tiled_bf16",
             _ => "tiled_parts",
         };
-        let key: Variant = (kind, self.at(), form.name(), wide);
+        let flags = u8::from(wide)
+            | (u8::from(direct_x) << 1)
+            | (u8::from(direct_w) << 2)
+            | ((self.parts as u8) << 3);
+        let key: Variant = (
+            kind,
+            self.at(),
+            x_form.name(),
+            form.name(),
+            out_form.name(),
+            flags,
+        );
         let mut body = self.product.tree(key, build);
         body.stmts.push(self.stores());
         body
@@ -529,6 +595,11 @@ impl Tiled {
     }
 }
 
+/// Whether `form` of `elems` fits direct bf16 word loads.
+fn bf16_fits(form: &dyn Stored, elems: usize) -> bool {
+    form.name() == BF16_FORM.name() && (form.bytes(elems) as u64) < (1 << 32)
+}
+
 /// Bits per weight, rounded down.
 fn weight_bits(form: &dyn Stored) -> u32 {
     (form.bytes(1024) * 8 / 1024) as u32
@@ -544,14 +615,21 @@ fn band(m: usize, n: usize, bm: usize, form: &dyn Stored) -> usize {
 }
 
 fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
-    let Product { m, n, k, form, .. } = t.product;
-    let (mf, nf) = (m as f64, n as f64);
+    let Product {
+        m,
+        n,
+        k,
+        x_form,
+        form,
+        out_form,
+        ..
+    } = t.product;
     let (gm, gn) = t.groups();
     let (bm, _, bk) = t.schedule.block;
     // `x` stays cached. `w` streams once per band.
     let rows = match t.product.near {
-        Some(near) => 4.0 * mf * near.cin as f64,
-        None => 4.0 * mf * k as f64,
+        Some(near) => x_form.bytes(m * near.cin) as f64,
+        None => x_form.bytes(m * k) as f64,
     };
     let mut reads = vec![rows];
     let bands = gm.div_ceil(band(m, n, bm, form));
@@ -561,14 +639,16 @@ fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
             .near
             .map(|near| (4 * near.pixels * near.taps) as f64),
     );
-    reads.extend((0..t.product.after.others()).map(|_| 4.0 * mf * nf));
+    for other in &t.product.other_forms {
+        reads.push(other.bytes(m * n) as f64);
+    }
     Some(Load {
         threads: gm * gn * t.schedule.threads(),
         group: t.schedule.threads(),
         trips: (k.div_ceil(bk)) as f64,
         trip: t.tree().trip(),
         reads,
-        written: 4.0 * mf * nf,
+        written: out_form.bytes(m * n) as f64,
         flight: 16.0,
         ..Load::default()
     })
@@ -625,9 +705,10 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let mut drafts: Vec<Draft> = (SCHEDULES.iter().enumerate())
         .map(|c| draft(&product, &reads, c))
         .collect();
+    let direct_x = bf16_fits(product.x_form, product.m * product.k);
+    let direct_w = bf16_fits(product.form, product.n * product.k);
     // bf16 weights multiply as stored, against `x` split exactly.
-    let words = (product.form.bytes(product.n * product.k) as u64) < 1 << 32;
-    if product.form.name() == BF16_FORM.name() && product.k.is_multiple_of(2) && words {
+    if direct_w && product.k.is_multiple_of(WIDE as usize) {
         for (i, schedule) in PARTS.iter().enumerate() {
             let tiled = Tiled {
                 product: product.clone(),
@@ -638,9 +719,27 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             drafts.push(Draft::new(tiled, reads.to_vec(), product.outputs()).choice(choice));
         }
     }
+    // One-pass bf16 tiles when precision allows or both are bf16.
+    let aligned = if direct_x && direct_w {
+        product.k.is_multiple_of(2)
+    } else {
+        product.k.is_multiple_of(WIDE as usize)
+    };
+    if aligned && (tree.compute == Compute::Bf16 || (direct_x && direct_w)) {
+        let base = 2 * SCHEDULES.len() + PARTS.len();
+        for (i, schedule) in BF16.iter().enumerate() {
+            let tiled = Tiled {
+                product: product.clone(),
+                schedule: *schedule,
+                parts: 1,
+            };
+            drafts.push(Draft::new(tiled, reads.to_vec(), product.outputs()).choice(base + i));
+        }
+    }
     // Neighbours gathered while staged: the nine-fold input is never made.
     if let Some((near, reads)) = gathered(tree, &product, &reads) {
         let product = Product {
+            x_form: plain(tree.node(near.src).form),
             near: Some(near),
             ..product.clone()
         };

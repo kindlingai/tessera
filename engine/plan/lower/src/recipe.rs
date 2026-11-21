@@ -6,12 +6,26 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 use tessera_codegen::kept::{self, Layout};
 
+/// Operand precision a matrix unit may round to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Compute {
+    /// Keep f32 precision through multi-pass splits.
+    #[default]
+    Exact,
+    /// Native 1-pass bf16 MMA with f32 accumulation.
+    Bf16,
+}
+
 /// Choices to favor, bar and pin when lowering a model.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
-    /// The form each weight is stored in.
+    /// The form each weight, activation, kept row and output uses.
     #[serde(default)]
     pub pins: Pins,
+    /// Operand precision for matrix-unit kernels.
+    #[serde(default)]
+    pub compute: Compute,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(default)]
     pub favor: Option<String>,
@@ -69,6 +83,7 @@ impl Default for Recipe {
     fn default() -> Self {
         Self {
             pins: Pins::default(),
+            compute: Compute::default(),
             favor: None,
             barred: Vec::new(),
             launch: Launching::default(),

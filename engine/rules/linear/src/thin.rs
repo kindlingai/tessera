@@ -17,6 +17,7 @@ pub(crate) const THIN_ROWS: usize = 32;
     sizes = self.product.sizes(),
     work = self.product.work(),
     accepts = self.product.accepts(input, form),
+    emits = self.product.emits(form),
     order = Order::PerConfig,
     // The text holds the stages. The name hashes the text.
     source = self.product.source(self.tree(), "thin"),
@@ -31,13 +32,15 @@ pub(crate) struct Thin {
 /// One thread per column with one sum per row.
 #[kernel]
 fn thin(
-    x: Buf<F32>,
+    #[form(x_form)] x: Buf<Dyn>,
     #[form(form)] w: Buf<Dyn>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     if gid() >= n {
         return;
@@ -57,9 +60,17 @@ fn thin(
 impl Thin {
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let Product { m, form, .. } = self.product;
-        let key: Variant = ("thin", m, form.name(), false);
-        let mut body = self.product.tree(key, || thin_ir(m, form));
+        let Product {
+            m,
+            x_form,
+            form,
+            out_form,
+            ..
+        } = self.product;
+        let key: Variant = ("thin", m, x_form.name(), form.name(), out_form.name(), 0);
+        let mut body = self
+            .product
+            .tree(key, || thin_ir(m, x_form, form, out_form));
         let gid = Expr::Call(Intrinsic::Gid, Vec::new());
         body.stmts.push(self.product.rows("row", "sums", gid));
         body
@@ -72,7 +83,7 @@ fn thin_load(k: &Thin, _: usize) -> Option<Load> {
         m,
         n,
         k: depth,
-        form,
+        out_form,
         ..
     } = k.product;
     Some(Load {
@@ -80,8 +91,8 @@ fn thin_load(k: &Thin, _: usize) -> Option<Load> {
         group: 256,
         trips: depth as f64,
         trip: k.tree().trip(),
-        reads: form.matmul_bytes(m, n, depth),
-        written: 4.0 * (m * n) as f64,
+        reads: k.product.read_bytes(),
+        written: out_form.bytes(m * n) as f64,
         flight: 64.0,
         ..Load::default()
     })

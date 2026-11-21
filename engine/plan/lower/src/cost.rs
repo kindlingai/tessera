@@ -4,7 +4,7 @@ use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::kernels::crosses;
 use crate::plan::{Plan, Step};
-use crate::recipe::Recipe;
+use crate::recipe::{Compute, Recipe};
 use crate::rule::{Rule, rules_with};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -61,9 +61,12 @@ pub struct Device {
     /// Rules made at run time, beside the linked ones.
     #[serde(skip)]
     made: Vec<&'static Rule>,
-    /// The form each weight is stored in.
+    /// The form each weight, activation and kept row uses.
     #[serde(skip)]
     pub pins: Pins,
+    /// Operand precision for matrix-unit kernels.
+    #[serde(skip)]
+    pub compute: Compute,
     /// Where kept rows lie.
     #[serde(skip, default = "dense")]
     pub kept: &'static dyn Layout,
@@ -123,6 +126,7 @@ impl Default for Device {
             barred: Vec::new(),
             made: Vec::new(),
             pins: Pins::default(),
+            compute: Compute::default(),
             kept: dense(),
             generation: 0,
             memo: RefCell::default(),
@@ -186,6 +190,7 @@ impl Device {
     /// The same device, choosing as `recipe` says.
     pub fn with(mut self, recipe: &Recipe) -> Self {
         self.pins = recipe.pins.clone();
+        self.compute = recipe.compute;
         self.favor = recipe.favor.clone();
         self.barred = recipe.barred.clone();
         self.made = recipe.rules.clone();
@@ -222,9 +227,15 @@ impl Device {
         self.generation
     }
 
-    /// The same device, with weights stored as `pins` say.
+    /// The same device, with storage forms as `pins` say.
     pub fn pinned(mut self, pins: Pins) -> Self {
         self.pins = pins;
+        self.changed()
+    }
+
+    /// The same device, using `compute` matrix-unit precision.
+    pub fn with_compute(mut self, compute: Compute) -> Self {
+        self.compute = compute;
         self.changed()
     }
 

@@ -2,33 +2,46 @@
 
 use crate::Kernel;
 use crate::abi::{Arg, Launch, Shape, Source};
-use crate::form::F32_FORM;
+use crate::form::{F32_FORM, Load as Stored, plain, writable};
 use crate::plan::Step;
 use crate::rule::Draft;
 use crate::sites;
 use crate::sites::After;
 use crate::tree::{T, Tree};
 use std::cmp::Ordering;
-use tessera_codegen::hash;
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
 use tessera_codegen::prelude::*;
 use tessera_codegen::stage::Row;
+use tessera_codegen::{Dialect, hash};
 use tessera_graph::Act;
 use tessera_work::Load;
 
 /// Adds `count` f32 operands `a0..` to `body`, at `at`.
 pub fn add_operands(body: &mut Body, at: usize, count: usize) {
-    let operand = |k: usize| Param::Buffer {
+    let forms = vec![F32_FORM; count];
+    add_operand_forms(body, at, &forms);
+}
+
+/// Adds operands `a0..` with each form to `body`, at `at`.
+pub fn add_operand_forms(body: &mut Body, at: usize, forms: &[&'static dyn Stored]) {
+    let operand = |(k, form): (usize, &&'static dyn Stored)| Param::Buffer {
         name: format!("a{k}"),
-        form: F32_FORM,
+        form: *form,
         writes: false,
     };
-    body.params.splice(at..at, (0..count).map(operand));
+    body.params
+        .splice(at..at, forms.iter().enumerate().map(operand));
 }
 
 /// One thread per element. The stages follow, then the store.
 #[kernel]
-fn map(x: Buf<F32>, out: BufMut<F32>, len: u32) {
+fn map(
+    #[form(x_form)] x: Buf<Dyn>,
+    #[form(out_form)] out: BufMut<Dyn>,
+    len: u32,
+    #[build] x_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) {
     if gid() >= len {
         return;
     }
@@ -52,11 +65,18 @@ pub enum MapStage {
     crate = crate,
     name = "map",
     work = len * (1 + self.0.len()),
+    accepts = map_accepts,
+    emits = map_emits,
     load = map_load,
     source = map_source,
     launches = map_launches,
 )]
-pub struct Map(pub Vec<MapStage>, pub Vec<Option<usize>>);
+pub struct Map(
+    pub Vec<MapStage>,
+    pub Vec<Option<usize>>,
+    pub Vec<&'static dyn Stored>,
+    pub &'static dyn Stored,
+);
 
 impl MapStage {
     /// The host row call for this stage, and its scale.
@@ -77,10 +97,30 @@ impl MapStage {
 }
 
 impl Map {
-    /// Stages whose operands are as long as the input.
+    /// Stages whose operands are f32 and match input length.
     pub fn plain(stages: Vec<MapStage>) -> Self {
         let count = operands(&stages);
-        Self(stages, vec![None; count])
+        Self(
+            stages,
+            vec![None; count],
+            vec![F32_FORM; 1 + count],
+            F32_FORM,
+        )
+    }
+
+    /// A copy from `from` into `to`.
+    pub fn copy(from: &'static dyn Stored, to: &'static dyn Stored) -> Self {
+        Self(Vec::new(), Vec::new(), vec![plain(from)], writable(to))
+    }
+
+    /// Scales a `from` input by `by` into f32.
+    pub fn scaled(by: f32, from: &'static dyn Stored) -> Self {
+        Self(
+            vec![MapStage::Scale(by)],
+            Vec::new(),
+            vec![plain(from)],
+            F32_FORM,
+        )
     }
 }
 
@@ -184,26 +224,38 @@ pub fn operands(stages: &[MapStage]) -> usize {
     stages.iter().filter(reads).count()
 }
 
+fn map_accepts(k: &Map, input: usize, form: &dyn Stored) -> bool {
+    k.2.get(input).is_some_and(|f| f.name() == form.name())
+}
+
+fn map_emits(k: &Map, form: &dyn Stored) -> bool {
+    k.3.name() == form.name()
+}
+
 /// One thread per element, each on its own lines.
 fn map_load(k: &Map, len: usize) -> Option<Load> {
-    let span = |s: &Option<usize>| 4.0 * s.unwrap_or(len) as f64;
-    let inputs = 1 + operands(&k.0);
-    let reads = [4.0 * len as f64].into_iter().chain(k.1.iter().map(span));
+    let x_bytes = k.2[0].bytes(len) as f64;
+    let op_bytes =
+        |(s, f): (&Option<usize>, &&'static dyn Stored)| f.bytes(s.unwrap_or(len)) as f64;
+    let reads = [x_bytes]
+        .into_iter()
+        .chain(k.1.iter().zip(&k.2[1..]).map(op_bytes));
+    let flight: f64 = k.2.iter().map(|f| f.element_bytes()).sum();
     Some(Load {
         threads: len,
         group: 256,
         trips: 1.0,
         trip: k.tree().trip(),
         reads: reads.collect(),
-        written: 4.0 * len as f64,
-        flight: 4.0 * inputs as f64,
+        written: k.3.bytes(len) as f64,
+        flight,
         ..Load::default()
     })
 }
 
 fn map_source(k: &Map) -> Source {
     let mut body = k.tree();
-    body.entry = format!("map_{:x}", hash(&body.text().body));
+    body.entry = format!("map_{:x}", hash(&body.text().render(Dialect::Cuda)));
     Source::Made(body)
 }
 
@@ -220,9 +272,9 @@ fn map_launches(_: &Map, step: &Step) -> Vec<Launch> {
 impl Map {
     /// The skeleton with the stages and the store appended.
     fn tree(&self) -> tessera_codegen::ir::Body {
-        let mut body = map_ir();
+        let mut body = map_ir(self.2[0], self.3);
         // The operands sit between the input and the output.
-        add_operands(&mut body, 1, operands(&self.0));
+        add_operand_forms(&mut body, 1, &self.2[1..]);
         let gid = || Expr::Call(Intrinsic::Gid, Vec::new());
         let at = || Expr::cast(tessera_codegen::ir::Ty::U64, gid());
         // A repeating operand is read within its span.
@@ -254,7 +306,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         len,
         spans,
     } = tree.site(at)?;
-    Some(vec![Draft::new(Map(stages, spans), reads, len)])
+    let forms: Vec<&'static dyn Stored> = reads.iter().map(|r| plain(tree.node(*r).form)).collect();
+    let out = writable(tree.node(at).form);
+    Some(vec![Draft::new(Map(stages, spans, forms, out), reads, len)])
 }
 
 crate::rule!("map", propose);

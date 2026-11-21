@@ -19,13 +19,15 @@ const ROWS: usize = 32;
 /// Lanes sum parts of every row, then the group reduces.
 #[kernel]
 fn linear<const WIDE: u32, const AHEAD: u32>(
-    x: Buf<F32>,
+    #[form(x_form)] x: Buf<Dyn>,
     #[form(form)] w: Buf<Dyn>,
-    out: BufMut<F32>,
+    #[form(out_form)] out: BufMut<Dyn>,
     n: u32,
     k: u32,
     #[build] m: usize,
+    #[build] x_form: &'static dyn Stored,
     #[build] form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
     #[build] gap: u32,
     #[build] per: u32,
     #[build] span: u32,
@@ -71,6 +73,7 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
     sizes = self.product.sizes(),
     work = self.product.work(),
     accepts = self.product.accepts(input, form),
+    emits = self.product.emits(form),
     needs = Needs::lanes(),
     // The lanes sum in one fixed tree on every device.
     order = Order::PerConfig,
@@ -86,15 +89,21 @@ pub(crate) struct Lanes {
 impl Lanes {
     /// The kernel with the chain's operands and its stores added.
     fn tree(&self) -> Body {
-        let Product { m, form, .. } = self.product;
+        let Product {
+            m,
+            x_form,
+            form,
+            out_form,
+            ..
+        } = self.product;
         let gap = form.pairs() as u32;
         let (per, span) = ((gap / WIDE).max(1), (2 * gap).max(WIDE));
         let build = || match (gap, form.heavy()) {
-            (0, true) => linear_ir::<WIDE, 1>(m, form, gap, per, span),
-            (0, false) => linear_ir::<WIDE, AHEAD>(m, form, gap, per, span),
-            _ => linear_ir::<WIDE, 2>(m, form, gap, per, span),
+            (0, true) => linear_ir::<WIDE, 1>(m, x_form, form, out_form, gap, per, span),
+            (0, false) => linear_ir::<WIDE, AHEAD>(m, x_form, form, out_form, gap, per, span),
+            _ => linear_ir::<WIDE, 2>(m, x_form, form, out_form, gap, per, span),
         };
-        let key: Variant = ("lanes", m, form.name(), false);
+        let key: Variant = ("lanes", m, x_form.name(), form.name(), out_form.name(), 0);
         let mut body = self.product.tree(key, build);
         body.stmts
             .push(self.product.rows("r", "s", Expr::var("col")));
@@ -108,6 +117,7 @@ fn lanes_load(k: &Lanes, _: usize) -> Option<Load> {
         n,
         k: depth,
         form,
+        out_form,
         ..
     } = k.product;
     let loads = 1 + usize::from(form.pairs() > 0);
@@ -117,8 +127,8 @@ fn lanes_load(k: &Lanes, _: usize) -> Option<Load> {
         group: 256,
         trips: (depth / (LANES * WIDE as usize * loads)) as f64,
         trip: k.tree().trip(),
-        reads: form.matmul_bytes(m, n, depth),
-        written: (4 * m * n) as f64,
+        reads: k.product.read_bytes(),
+        written: out_form.bytes(m * n) as f64,
         flight: (bytes * AHEAD as usize) as f64,
         ..Load::default()
     })

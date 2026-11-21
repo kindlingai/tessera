@@ -6,8 +6,9 @@ use tessera_kernels as _;
 use tessera_graph::DimName::{Context, HeadDim, Heads, Hidden, KvHeads, Rows, Segments, Seqs};
 use tessera_graph::{DType, Dim, Graph, Size, TensorType};
 use tessera_interp::{Store, Tensor, run, run_kept};
+use tessera_lower::form::{BF16_FORM, FP8_FORM};
 use tessera_lower::kept::{self, Layout};
-use tessera_lower::{Cache, Device, Pick, Settings, View, lower, rules};
+use tessera_lower::{Cache, Device, Pick, Pins, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, fill, graphs, max_abs_diff};
@@ -142,6 +143,35 @@ fn rows(runs: &[(u32, u32, u32)]) -> (Vec<u32>, Vec<u32>) {
     (slots.collect(), positions.collect())
 }
 
+/// Runs one plan on the runner.
+fn step_plan(
+    runner: &mut Option<Box<dyn Run>>,
+    plan: tessera_lower::Plan,
+    settings: &Settings,
+    inputs: &[Tensor],
+) -> Tensor {
+    let r = match runner {
+        Some(r) => {
+            r.replan(&plan).unwrap();
+            r
+        }
+        None => {
+            let table = plan.table;
+            let r = runner.insert(open(plan, settings).unwrap());
+            if let Some(table) = table {
+                let pages: Vec<u8> = (0..table.len as u32)
+                    .rev()
+                    .flat_map(u32::to_le_bytes)
+                    .collect();
+                r.held_mut().upload(table, &pages).unwrap();
+            }
+            r
+        }
+    };
+    let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
+    r.run(&views).unwrap().remove(0)
+}
+
 #[test]
 fn ragged_rows_match_cpu() {
     let mut draws = Noise(43);
@@ -152,12 +182,6 @@ fn ragged_rows_match_cpu() {
     ];
     // Reversed pages: no slot's rows lie where dense ones would.
     let layouts: [&'static dyn Layout; 2] = [kept::DENSE, &kept::PAGED16];
-    let reversed = |n: usize| {
-        (0..n as u32)
-            .rev()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<u8>>()
-    };
     let shapes = [
         (Mask::Causal, 2u64, 2u64, 16u64),
         (Mask::Causal, 4, 2, 64),
@@ -209,22 +233,7 @@ fn ragged_rows_match_cpu() {
                 let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
                 let kernel = format!("{favored}_rows");
                 assert!(names.contains(&kernel.as_str()), "{names:?}");
-                let r = match &mut runner {
-                    Some(r) => {
-                        r.replan(&plan).unwrap();
-                        r
-                    }
-                    None => {
-                        let table = plan.table;
-                        let r = runner.insert(open(plan, settings).unwrap());
-                        if let Some(table) = table {
-                            r.held_mut().upload(table, &reversed(table.len)).unwrap();
-                        }
-                        r
-                    }
-                };
-                let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
-                let got = r.run(&views).unwrap().remove(0);
+                let got = step_plan(&mut runner, plan, settings, &inputs);
                 let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
                 assert!(
                     off < 1e-3,
@@ -417,4 +426,65 @@ fn delta_inputs(len: usize, draws: &mut Noise) -> [Tensor; 5] {
         gate(draws, |x| -x.abs()),
         gate(draws, |x| (x + 1.0) / 2.0),
     ]
+}
+
+/// Narrow KV caches shrink kept buffers and attend natively.
+#[test]
+fn narrow_kept_matches() {
+    let g = ragged(Mask::Causal, 4, 2, 32);
+    let layouts: [&'static dyn Layout; 4] = [
+        kept::DENSE,
+        kept::INTERLEAVED,
+        kept::named("paged").unwrap(),
+        &kept::PAGED16,
+    ];
+    let forms = [(BF16_FORM, 2e-2f32), (FP8_FORM, 0.25f32)];
+    let mut draws = Noise(91);
+    for (form, tol) in forms {
+        let pins = Pins::default().activations(BF16_FORM).kept(form);
+        for &layout in &layouts {
+            for favored in ["attend", "flash"] {
+                for settings in runs() {
+                    let (mut store, mut runner): (Store, Option<Box<dyn Run>>) =
+                        (Store::default(), None);
+                    for runs in [&[(0u32, 0u32, 6u32)][..], &[(0, 6, 1)][..]] {
+                        let (slots, positions) = rows(runs);
+                        let n = slots.len();
+                        let furthest = *positions.iter().max().unwrap() as u64 + 1;
+                        let inputs = [
+                            noise(vec![n, 4, 32], &mut draws),
+                            noise(vec![n, 2, 32], &mut draws),
+                            noise(vec![n, 2, 32], &mut draws),
+                            Tensor::u32(vec![n], slots),
+                            Tensor::u32(vec![n], positions),
+                        ];
+                        let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+                        let sizes = [
+                            (Seqs, 4),
+                            (Rows, n as u64),
+                            (Context, furthest),
+                            (Segments, runs.len() as u64),
+                        ];
+                        let mut device = Device::guess(&settings)
+                            .favoring(favored)
+                            .pinned(pins.clone());
+                        device.kept = layout;
+                        let plan = lower(&g, 0, &sizes, &device).unwrap();
+                        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                        assert!(!names.contains(&"widen"), "{names:?}");
+                        assert!(!names.contains(&"narrow"), "{names:?}");
+                        assert!(plan.kept.iter().all(|k| k.1.form == form));
+                        let got = step_plan(&mut runner, plan, &settings, &inputs);
+                        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+                        assert!(
+                            off < tol,
+                            "{} {favored} {layout:?} on {:?}: off by {off:e}",
+                            form.name(),
+                            settings.backend
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

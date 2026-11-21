@@ -315,26 +315,39 @@ impl Lowerer<'_, '_> {
                         len,
                         skip,
                     } => {
-                        if form.narrow() {
-                            return Err("kernels write only f32".into());
-                        }
-                        let (st, ty) = match form.dtype().is_float() {
-                            true => ("st_f32", Ty::F32),
-                            false => ("st_u32", Ty::U32),
-                        };
                         let idx = self.index(at, t)?;
                         let at = self.b.ins().iadd(skip, idx);
-                        let Val::S(v) = self.expr_as(&combined, ty, t)? else {
-                            return Err("a four-wide value stored by index".into());
-                        };
-                        // Stores in range skip the helper and its checks.
-                        let [fits, addr] = self.guarded([ptr, len, at], 4);
-                        let store = |s: &mut Self| {
-                            s.b.ins().store(MemFlagsData::new(), v, addr, 0);
-                            None
-                        };
-                        let check = |s: &mut Self| s.call(st, &[ptr, len, at, v]);
-                        self.either(fits, store, check, None);
+                        match form.read() {
+                            tessera_codegen::form::Read::F32 | tessera_codegen::form::Read::U32 => {
+                                let (st, ty) = match form.read() {
+                                    tessera_codegen::form::Read::F32 => ("st_f32", Ty::F32),
+                                    _ => ("st_u32", Ty::U32),
+                                };
+                                let Val::S(v) = self.expr_as(&combined, ty, t)? else {
+                                    return Err("a four-wide value stored by index".into());
+                                };
+                                // Stores in range skip the helper and its checks.
+                                let [fits, addr] = self.guarded([ptr, len, at], 4);
+                                let store = |s: &mut Self| {
+                                    s.b.ins().store(MemFlagsData::new(), v, addr, 0);
+                                    None
+                                };
+                                let check = |s: &mut Self| s.call(st, &[ptr, len, at, v]);
+                                self.either(fits, store, check, None);
+                            }
+                            tessera_codegen::form::Read::Bf16
+                            | tessera_codegen::form::Read::Fp8 => {
+                                let st = match form.read() {
+                                    tessera_codegen::form::Read::Bf16 => "st_bf16",
+                                    _ => "st_fp8",
+                                };
+                                let Val::S(v) = self.expr_as(&combined, Ty::F32, t)? else {
+                                    return Err("a four-wide value stored by index".into());
+                                };
+                                self.call(st, &[ptr, len, at, v]);
+                            }
+                            other => return Err(format!("cannot write form {other:?}")),
+                        }
                         Ok(())
                     }
                     Kind::Shared(ty, slot, _) => {

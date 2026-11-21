@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use tessera_codegen::Precision;
-use tessera_codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, Form, LOADS, Load, U8, U32};
+use tessera_codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, Form, Fp8, LOADS, Load, U8, U32};
 use tessera_host::lockstep::{self, THREADS, Tiles};
 
 /// A buffer as the compiled code sees it.
@@ -72,6 +72,7 @@ macro_rules! readers {
 readers! {
     rd_f32 = rd_f32: f32, F32;
     rd_bf16 = rd_bf16: f32, Bf16;
+    rd_fp8 = rd_fp8: f32, Fp8;
     rd_u32 = rd_u32: u32, U32;
     rd_u8 = rd_u8: u32, U8;
 }
@@ -143,11 +144,22 @@ pub unsafe extern "C" fn dot_form(
     unsafe { dot_in(LOADS[form], a, a_len, a_at, b, b_len, b_at, n) }
 }
 
-pub unsafe extern "C" fn st_f32(p: *mut u8, len: usize, at: usize, v: f32) {
-    if unsafe { within(p, len, at * 4 + 4) }.is_some() {
-        // SAFETY: checked above.
-        lockstep::st_f32(unsafe { std::slice::from_raw_parts_mut(p, len) }, at, v);
-    }
+macro_rules! writers {
+    ($($name:ident = $write:ident : $ty:ty, $form:expr;)*) => {$(
+        pub unsafe extern "C" fn $name(p: *mut u8, len: usize, at: usize, v: $ty) {
+            if unsafe { within(p, len, Form::bytes(&$form, at + 1)) }.is_some() {
+                // SAFETY: checked above.
+                lockstep::$write(unsafe { std::slice::from_raw_parts_mut(p, len) }, at, v);
+            }
+        }
+    )*};
+}
+
+writers! {
+    st_f32 = st_f32: f32, F32;
+    st_bf16 = st_bf16: f32, Bf16;
+    st_fp8 = st_fp8: f32, Fp8;
+    st_u32 = st_u32: u32, U32;
 }
 
 macro_rules! tiles {
@@ -299,13 +311,6 @@ pub unsafe extern "C" fn mix_f32(
         // SAFETY: checked above.
         let out = unsafe { std::slice::from_raw_parts_mut(out, out_len) };
         lockstep::mix_f32(out, at, keep, p, b, b_at, n);
-    }
-}
-
-pub unsafe extern "C" fn st_u32(p: *mut u8, len: usize, at: usize, v: u32) {
-    if unsafe { within(p, len, at * 4 + 4) }.is_some() {
-        // SAFETY: checked above.
-        lockstep::st_u32(unsafe { std::slice::from_raw_parts_mut(p, len) }, at, v);
     }
 }
 

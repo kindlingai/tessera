@@ -34,7 +34,7 @@ pub use tessera_engine_comm as comm;
 pub use tessera_engine_settings::{Backend, Memory};
 pub use tessera_graph::{Bf16, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
 pub use tessera_interp::{Tensor, bind, fold};
-pub use tessera_lower::{Pick, Pins, Recipe, Settings, Weight, form};
+pub use tessera_lower::{Compute, Pick, Pins, Recipe, Settings, Site, Weight, form};
 pub use tessera_mem::form as storage;
 pub use tessera_mem::{block, trellis};
 pub use tessera_models::{

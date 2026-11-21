@@ -9,5 +9,5 @@ mod tiled;
 mod turned;
 
 pub use product::Product;
-pub use tiled::{PARTS, SCHEDULES, Schedule, Tiled};
+pub use tiled::{BF16, PARTS, SCHEDULES, Schedule, Tiled};
 pub use turned::Turned;

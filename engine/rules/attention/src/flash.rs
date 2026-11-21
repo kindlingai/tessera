@@ -6,6 +6,7 @@ use tessera_codegen::ir::Body;
 use tessera_codegen::kept;
 use tessera_codegen::prelude::*;
 use tessera_graph::{Mask, Order};
+use tessera_lower::form::Load as Stored;
 use tessera_lower::sites;
 use tessera_lower::{
     Arg, Attn, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Tree,
@@ -43,9 +44,19 @@ fn chunk(w: usize) -> usize {
     w.min(CW as usize)
 }
 
+type Key = (
+    u32,
+    bool,
+    u32,
+    bool,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
 thread_local! {
-    /// Each kernel tree, by width, raggedness and key block.
-    static TREES: RefCell<HashMap<(u32, bool, u32, bool), Body>> = RefCell::new(HashMap::new());
+    /// Each kernel tree, by width, raggedness, block and forms.
+    static TREES: RefCell<HashMap<Key, Body>> = RefCell::new(HashMap::new());
 }
 
 /// Group memory and tile sums the key stream passes through.
@@ -155,7 +166,7 @@ fn stage_q(
 #[kernel]
 fn stage_kv<const TRANSPOSED: bool>(
     dst: &mut Shared<f32>,
-    src: Buf<F32>,
+    #[form(kv_form)] src: Buf<Dyn>,
     hd: &Head,
     at: u32,
     k0: u32,
@@ -164,6 +175,7 @@ fn stage_kv<const TRANSPOSED: bool>(
     #[build] cw: u32,
     #[build] w: u32,
     #[build] bk: u32,
+    #[build] kv_form: &'static dyn Stored,
 ) {
     // All loads, then all stores: the loads fly together.
     let mut held = [0.0f32; HELD];
@@ -312,11 +324,12 @@ fn fold_pair(
 fn write_pair(
     top: &Tiles,
     bottom: &Tiles,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     st: &Stream,
     hd: &Head,
     col: u32,
     #[build] w: u32,
+    #[build] out_form: &'static dyn Stored,
 ) {
     top.each(|r, c, v| {
         if st.to_s[r] > st.from_s[r] {
@@ -336,7 +349,7 @@ fn write_pair(
 #[kernel]
 fn take_block(
     st: &mut Stream,
-    values: Buf<F32>,
+    #[form(v_form)] values: Buf<Dyn>,
     hd: &Head,
     at: u32,
     k0: u32,
@@ -346,6 +359,7 @@ fn take_block(
     #[build] w: u32,
     #[build] bk: u32,
     #[build] held_q: bool,
+    #[build] v_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     scores(st, simd, k0, bk);
@@ -354,7 +368,19 @@ fn take_block(
     barrier();
     // Held queries made room: values staged with the keys.
     if !held_q {
-        stage_kv::<true>(&mut st.kv_s, values, hd, at, k0, count, d0, cw, w, bk);
+        stage_kv::<true>(
+            &mut st.kv_s,
+            values,
+            hd,
+            at,
+            k0,
+            count,
+            d0,
+            cw,
+            w,
+            bk,
+            v_form,
+        );
         barrier();
     }
     // Each SIMD group owns up to two column pieces.
@@ -389,11 +415,12 @@ fn take_block(
 #[kernel]
 fn write_all(
     st: &mut Stream,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     hd: &Head,
     d0: u32,
     #[build] cw: u32,
     #[build] w: u32,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     for i in 0..ROWS {
@@ -404,10 +431,19 @@ fn write_all(
     barrier();
     // The first column, then each SIMD group's pieces.
     if simd * 16 < cw {
-        write_pair(&st.o00, &st.o01, out, st, hd, d0 + simd * 16, w);
+        write_pair(&st.o00, &st.o01, out, st, hd, d0 + simd * 16, w, out_form);
     }
     if (simd + 4) * 16 < cw {
-        write_pair(&st.o10, &st.o11, out, st, hd, d0 + (simd + 4) * 16, w);
+        write_pair(
+            &st.o10,
+            &st.o11,
+            out,
+            st,
+            hd,
+            d0 + (simd + 4) * 16,
+            w,
+            out_form,
+        );
     }
 }
 
@@ -415,9 +451,9 @@ fn write_all(
 #[kernel]
 fn flash(
     q: Buf<F32>,
-    k: Buf<F32>,
-    values: Buf<F32>,
-    mut out: BufMut<F32>,
+    #[form(k_form)] k: Buf<Dyn>,
+    #[form(v_form)] values: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     queries: u32,
     keys: u32,
     past: u32,
@@ -429,6 +465,9 @@ fn flash(
     #[build] w: u32,
     #[build] bk: u32,
     #[build] held_q: bool,
+    #[build] k_form: &'static dyn Stored,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     // A group owns `cw` columns and scores the whole head.
@@ -487,27 +526,41 @@ fn flash(
                 stage_q(&mut st.q_s, q, &hd, d0, cw, w);
             }
             if held_q {
-                stage_kv::<false>(&mut st.k_s, k, &hd, k0, k0, keys, d0, cw, w, bk);
-                stage_kv::<true>(&mut st.kv_s, values, &hd, k0, k0, keys, start, cw, w, bk);
+                stage_kv::<false>(&mut st.k_s, k, &hd, k0, k0, keys, d0, cw, w, bk, k_form);
+                stage_kv::<true>(
+                    &mut st.kv_s,
+                    values,
+                    &hd,
+                    k0,
+                    k0,
+                    keys,
+                    start,
+                    cw,
+                    w,
+                    bk,
+                    v_form,
+                );
             } else {
-                stage_kv::<false>(&mut st.kv_s, k, &hd, k0, k0, keys, d0, cw, w, bk);
+                stage_kv::<false>(&mut st.kv_s, k, &hd, k0, k0, keys, d0, cw, w, bk, k_form);
             }
             barrier();
             score_chunk(&mut st, simd, cw, bk, held_q);
             barrier();
         }
-        take_block(&mut st, values, &hd, k0, k0, keys, start, cw, w, bk, held_q);
+        take_block(
+            &mut st, values, &hd, k0, k0, keys, start, cw, w, bk, held_q, v_form,
+        );
     }
-    write_all(&mut st, out, &hd, start, cw, w);
+    write_all(&mut st, out, &hd, start, cw, w, out_form);
 }
 
 /// Ragged rows: a pass per slot in the block.
 #[kernel]
 fn flash_rows(
     q: Buf<F32>,
-    k: Buf<F32>,
-    values: Buf<F32>,
-    mut out: BufMut<F32>,
+    #[form(k_form)] k: Buf<Dyn>,
+    #[form(v_form)] values: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     slots: Buf<U32>,
     positions: Buf<U32>,
     queries: u32,
@@ -517,6 +570,9 @@ fn flash_rows(
     #[build] w: u32,
     #[build] bk: u32,
     #[build] held_q: bool,
+    #[build] k_form: &'static dyn Stored,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let simd = lid() / LANES as u32;
     let hd = head_at(gid() / THREADS, queries, heads, kv_heads);
@@ -567,13 +623,15 @@ fn flash_rows(
             for b in 0..(last + bk - 1) / bk {
                 let k0 = b * bk;
                 let at = kept_row(slot, k0);
-                stage_kv::<false>(&mut st.kv_s, k, &hd, at, k0, last, 0, w, w, bk);
+                stage_kv::<false>(&mut st.kv_s, k, &hd, at, k0, last, 0, w, w, bk, k_form);
                 barrier();
                 st.s_t.zero();
                 score_chunk(&mut st, simd, w, bk, held_q);
-                take_block(&mut st, values, &hd, at, k0, last, 0, w, w, bk, held_q);
+                take_block(
+                    &mut st, values, &hd, at, k0, last, 0, w, w, bk, held_q, v_form,
+                );
             }
-            write_all(&mut st, out, &hd, 0, w, w);
+            write_all(&mut st, out, &hd, 0, w, w, out_form);
             barrier();
         }
     }
@@ -587,12 +645,30 @@ fn flash_rows(
     sizes = self.0.sizes(),
     work = self.0.seqs * self.0.heads * self.0.queries * self.0.seen() * self.0.width,
     needs = flash_needs(&self.0, self.1, self.2),
+    accepts = flash_accepts,
+    emits = flash_emits,
     source = flash_source,
     launches = flash_launches,
     load = flash_load,
     unproven,
 )]
 pub(crate) struct Flash(pub Attn, pub u32, pub bool);
+
+fn kv_accepts(a: &Attn, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        1 => form.name() == a.k_form.name(),
+        2 => form.name() == a.v_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn flash_accepts(k: &Flash, input: usize, form: &dyn Stored) -> bool {
+    kv_accepts(&k.0, input, form)
+}
+
+fn flash_emits(k: &Flash, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
 
 /// The kernel name of a way.
 fn way_name(bk: u32, held: bool) -> &'static str {
@@ -606,11 +682,31 @@ fn way_name(bk: u32, held: bool) -> &'static str {
 
 impl Flash {
     fn tree(&self) -> Body {
-        let (w, bk, held) = (self.0.width, self.1, self.2);
+        let a = &self.0;
+        let (w, bk, held) = (a.width, self.1, self.2);
+        let key = (
+            w as u32,
+            false,
+            bk,
+            held,
+            a.k_form.name(),
+            a.v_form.name(),
+            a.out_form.name(),
+        );
         TREES.with(|t| {
             t.borrow_mut()
-                .entry((w as u32, false, bk, held))
-                .or_insert_with(|| flash_ir(chunk(w) as u32, w as u32, bk, held))
+                .entry(key)
+                .or_insert_with(|| {
+                    flash_ir(
+                        chunk(w) as u32,
+                        w as u32,
+                        bk,
+                        held,
+                        a.k_form,
+                        a.v_form,
+                        a.out_form,
+                    )
+                })
                 .clone()
         })
     }
@@ -628,7 +724,8 @@ fn flash_load(k: &Flash, len: usize) -> Option<Load> {
     // Each query block and slice reads the keys and values.
     let slices = (a.width / chunk(a.width)) as f64;
     let blocks = a.queries.div_ceil(BQ as usize) as f64 * slices;
-    let per_seq = 4.0 * keys * side * blocks;
+    let k_seq = a.k_form.element_bytes() * keys * side * blocks;
+    let v_seq = a.v_form.element_bytes() * keys * side * blocks;
     Some(Load {
         threads: a.seqs * k.groups() * THREADS as usize,
         group: THREADS as usize,
@@ -636,18 +733,26 @@ fn flash_load(k: &Flash, len: usize) -> Option<Load> {
         trip: k.tree().trip(),
         reads: vec![
             4.0 * len as f64,
-            per_seq * a.seqs as f64,
-            per_seq * a.seqs as f64,
+            k_seq * a.seqs as f64,
+            v_seq * a.seqs as f64,
         ],
-        written: 4.0 * len as f64,
+        written: a.out_form.bytes(len) as f64,
         flight: 16.0,
         ..Load::default()
     })
 }
 
+fn form_suffix(a: &Attn) -> String {
+    match (a.k_form.name(), a.v_form.name(), a.out_form.name()) {
+        ("f32", "f32", "f32") => String::new(),
+        (kf, vf, of) => format!("_{kf}_{vf}_{of}"),
+    }
+}
+
 fn flash_source(k: &Flash) -> Source {
     let way = &way_name(k.1, k.2)["flash".len()..];
-    Source::named(k.tree(), format!("flash_{}{way}", k.0.width))
+    let suffix = form_suffix(&k.0);
+    Source::named(k.tree(), format!("flash_{}{way}{suffix}", k.0.width))
 }
 
 /// One launch per sequence, each at its own offset.
@@ -693,19 +798,41 @@ fn flash_needs(a: &Attn, bk: u32, held: bool) -> Needs {
     sizes = self.0.sizes(),
     work = self.0.heads * self.0.queries * self.0.keys.most() * self.0.width * self.passes(),
     needs = rows_needs(&self.0),
+    accepts = rows_accepts,
+    emits = rows_emits,
     source = rows_source,
     launches = rows_launches,
     load = rows_load,
 )]
 pub(crate) struct FlashRows(pub Attn);
 
+fn rows_accepts(k: &FlashRows, input: usize, form: &dyn Stored) -> bool {
+    kv_accepts(&k.0, input, form)
+}
+
+fn rows_emits(k: &FlashRows, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
 impl FlashRows {
     fn tree(&self) -> Body {
-        let w = self.0.width as u32;
+        let a = &self.0;
+        let w = a.width as u32;
+        let key = (
+            w,
+            true,
+            WAYS[0].0,
+            false,
+            a.k_form.name(),
+            a.v_form.name(),
+            a.out_form.name(),
+        );
         TREES.with(|t| {
             t.borrow_mut()
-                .entry((w, true, WAYS[0].0, false))
-                .or_insert_with(|| flash_rows_ir(w, WAYS[0].0, false))
+                .entry(key)
+                .or_insert_with(|| {
+                    flash_rows_ir(w, WAYS[0].0, false, a.k_form, a.v_form, a.out_form)
+                })
                 .clone()
         })
     }
@@ -726,14 +853,15 @@ fn rows_load(k: &FlashRows, len: usize) -> Option<Load> {
     let (keys, side) = (a.keys.most() as f64, (a.kv_heads * a.width) as f64);
     let blocks = a.queries.div_ceil(BQ as usize) as f64;
     let passes = k.passes() as f64;
-    let streamed = 4.0 * keys * side * blocks * passes;
+    let k_stream = a.k_form.element_bytes() * keys * side * blocks * passes;
+    let v_stream = a.v_form.element_bytes() * keys * side * blocks * passes;
     Some(Load {
         threads: k.groups() * THREADS as usize,
         group: THREADS as usize,
         trips: passes * keys / WAYS[0].0 as f64,
         trip: k.tree().trip(),
-        reads: vec![4.0 * len as f64, streamed, streamed],
-        written: 4.0 * len as f64,
+        reads: vec![4.0 * len as f64, k_stream, v_stream],
+        written: a.out_form.bytes(len) as f64,
         flight: 16.0,
         ..Load::default()
     })
@@ -741,7 +869,8 @@ fn rows_load(k: &FlashRows, len: usize) -> Option<Load> {
 
 fn rows_source(k: &FlashRows) -> Source {
     let body = kept::attach(k.tree(), k.0.kept);
-    let entry = format!("flash_rows_{}_{}", k.0.width, k.0.kept.name());
+    let suffix = form_suffix(&k.0);
+    let entry = format!("flash_rows_{}_{}{suffix}", k.0.width, k.0.kept.name());
     Source::named(body, entry)
 }
 

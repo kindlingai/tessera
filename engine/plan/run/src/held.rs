@@ -101,6 +101,18 @@ impl Held {
             .view(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
+    /// Raw packed bytes of `slot`, copied onto the host.
+    pub fn bytes(&self, slot: Slot) -> Result<Vec<u8>, Error> {
+        let (start, len) = (slot.start(), slot.bytes());
+        let backing = self.get(slot).backing();
+        if let Some(all) = backing.mapped() {
+            return Ok(all[start..start + len].to_vec());
+        }
+        let mut out = vec![0u8; len];
+        backing.download(start, &mut out)?;
+        Ok(out)
+    }
+
     /// `bytes`, packed in the form, into the slot.
     pub fn upload(&mut self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
         let at = self.bound[slot.buffer as usize];

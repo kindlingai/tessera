@@ -3,6 +3,7 @@
 use tessera_codegen::kept;
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
+use tessera_lower::form::{F32_FORM, Load as Stored};
 use tessera_lower::kernels::Join;
 use tessera_lower::sites;
 use tessera_lower::{Arg, Attn, Draft, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Tree};
@@ -17,11 +18,12 @@ const WIDEST: u32 = 2 * THREADS;
 #[kernel]
 fn group_dot(
     q: Buf<F32>,
-    k: Buf<F32>,
+    #[form(k_form)] k: Buf<Dyn>,
     q_off: u64,
     k_off: u64,
     width: u32,
     red: &mut Shared<f32>,
+    #[build] k_form: &'static dyn Stored,
 ) -> f32 {
     let mut partial = 0.0f32;
     for d in (lid()..width).by(THREADS) {
@@ -47,9 +49,10 @@ fn take_key(
     state: &mut [f32; 2],
     acc: &mut [f32; 2],
     dot: f32,
-    v: Buf<F32>,
+    #[form(v_form)] v: Buf<Dyn>,
     v_off: u64,
     width: u32,
+    #[build] v_form: &'static dyn Stored,
 ) {
     let m_new = max(state[0], dot);
     let corr = exp(state[0] - m_new);
@@ -66,7 +69,14 @@ fn take_key(
 
 /// Writes `acc` over the sum in `state` as the row.
 #[kernel]
-fn write_row(state: &[f32; 2], acc: &[f32; 2], mut out: BufMut<F32>, q_off: u64, width: u32) {
+fn write_row(
+    state: &[f32; 2],
+    acc: &[f32; 2],
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    q_off: u64,
+    width: u32,
+    #[build] out_form: &'static dyn Stored,
+) {
     let inv = if state[1] > 0.0 { 1.0 / state[1] } else { 0.0 };
     for i in 0..2 {
         let d = lid() + i * THREADS;
@@ -80,8 +90,8 @@ fn write_row(state: &[f32; 2], acc: &[f32; 2], mut out: BufMut<F32>, q_off: u64,
 #[kernel]
 fn attend(
     q: Buf<F32>,
-    kv: Buf<F32>,
-    mut out: BufMut<F32>,
+    #[form(F32_FORM)] kv: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     queries: u32,
     keys: u32,
     past: u32,
@@ -90,6 +100,7 @@ fn attend(
     width: u32,
     back: u32,
     ahead: u32,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let group = gid() / THREADS;
     let tok = group / heads;
@@ -114,20 +125,20 @@ fn attend(
     for t in first..last {
         // A joined row: every head's key, then every head's value.
         let k_off = ((t * kv_heads * 2 + kvh) * width) as u64;
-        let dot = group_dot(q, kv, q_off, k_off, width, &mut red);
+        let dot = group_dot(q, kv, q_off, k_off, width, &mut red, F32_FORM);
         let v_off = k_off + (kv_heads * width) as u64;
-        take_key(&mut state, &mut acc, dot, kv, v_off, width);
+        take_key(&mut state, &mut acc, dot, kv, v_off, width, F32_FORM);
     }
-    write_row(&state, &acc, out, q_off, width);
+    write_row(&state, &acc, out, q_off, width, out_form);
 }
 
 /// A group per query row and head, within its slot.
 #[kernel]
 fn attend_rows(
     q: Buf<F32>,
-    k: Buf<F32>,
-    v: Buf<F32>,
-    mut out: BufMut<F32>,
+    #[form(k_form)] k: Buf<Dyn>,
+    #[form(v_form)] v: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     slots: Buf<U32>,
     positions: Buf<U32>,
     rows: u32,
@@ -136,6 +147,9 @@ fn attend_rows(
     kv_heads: u32,
     width: u32,
     back: u32,
+    #[build] k_form: &'static dyn Stored,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let group = gid() / THREADS;
     let row = group / heads;
@@ -160,10 +174,10 @@ fn attend_rows(
     let first = if position > back { position - back } else { 0 };
     for t in first..last {
         let kv_off = ((kept_row(slot, t) * kv_heads + kvh) * width) as u64;
-        let dot = group_dot(q, k, q_off, kv_off, width, &mut red);
-        take_key(&mut state, &mut acc, dot, v, kv_off, width);
+        let dot = group_dot(q, k, q_off, kv_off, width, &mut red, k_form);
+        take_key(&mut state, &mut acc, dot, v, kv_off, width, v_form);
     }
-    write_row(&state, &acc, out, q_off, width);
+    write_row(&state, &acc, out, q_off, width, out_form);
 }
 
 /// Scaled query rows over kept keys, by slot and position.
@@ -174,14 +188,33 @@ fn attend_rows(
     sizes = self.0.sizes(),
     work = self.0.heads * self.0.queries * self.0.keys.most() * self.0.width,
     needs = group_needs(),
+    accepts = rows_accepts,
+    emits = rows_emits,
     source = rows_source,
     launches = rows_launches,
 )]
 pub(crate) struct AttendRows(pub Attn);
 
+fn rows_accepts(k: &AttendRows, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        1 => form.name() == k.0.k_form.name(),
+        2 => form.name() == k.0.v_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn rows_emits(k: &AttendRows, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
 fn rows_source(k: &AttendRows) -> Source {
-    let body = kept::attach(attend_rows_ir(), k.0.kept);
-    Source::named(body, format!("plan_attend_rows_{}", k.0.kept.name()))
+    let a = &k.0;
+    let body = kept::attach(attend_rows_ir(a.k_form, a.v_form, a.out_form), a.kept);
+    let entry = match (a.k_form.name(), a.v_form.name(), a.out_form.name()) {
+        ("f32", "f32", "f32") => format!("plan_attend_rows_{}", a.kept.name()),
+        (kf, vf, of) => format!("plan_attend_rows_{}_{kf}_{vf}_{of}", a.kept.name()),
+    };
+    Source::named(body, entry)
 }
 
 /// One launch over every row.
@@ -203,15 +236,29 @@ fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
 /// Reads scaled queries, and keys joined with values. Any mask.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    attend,
+    attend(self.0.out_form),
     name = "attend",
     order = Order::PerConfig,
     sizes = self.0.sizes(),
     work = self.0.seqs * self.0.heads * self.0.queries * self.0.seen() * self.0.width,
     needs = group_needs(),
+    emits = attend_emits,
+    source = attend_source,
     launches = attend_launches,
 )]
 pub(crate) struct Attend(pub Attn);
+
+fn attend_emits(k: &Attend, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
+fn attend_source(k: &Attend) -> Source {
+    let entry = match k.0.out_form.name() {
+        "f32" => "plan_attend".into(),
+        of => format!("plan_attend_{of}"),
+    };
+    Source::named(attend_ir(k.0.out_form), entry)
+}
 
 /// One launch per sequence, each at its own offset.
 fn attend_launches(k: &Attend, step: &Step) -> Vec<Launch> {
@@ -258,6 +305,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         left: side,
         right: side,
         rows: sizes.keys.times(sizes.seqs),
+        a_form: sizes.k_form,
+        b_form: sizes.v_form,
+        out_form: F32_FORM,
     };
     let joined = 2 * sizes.seqs * sizes.keys.most() * side;
     Some(vec![

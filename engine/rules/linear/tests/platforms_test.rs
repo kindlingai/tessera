@@ -6,7 +6,8 @@ use tessera_kernels as _;
 use std::path::Path;
 use std::process::Command;
 use tessera_gpukit::platform::{backend_of, rows};
-use tessera_linear::{PARTS, Product, SCHEDULES, Schedule, Tiled};
+use tessera_linear::{BF16, PARTS, Product, SCHEDULES, Schedule, Tiled};
+use tessera_lower::form::{BF16_FORM, F32_FORM};
 use tessera_lower::sites::After;
 use tessera_lower::{Dialect, Kernel, Source};
 use tessera_testkit::scratch;
@@ -14,8 +15,12 @@ use tessera_testkit::scratch;
 /// The tiled kernel's text and entry name.
 fn tiled_text(dialect: Dialect, (schedule, parts): (Schedule, u32)) -> (String, String) {
     let form = match parts {
-        0 => tessera_lower::form::F32_FORM,
-        _ => tessera_lower::form::BF16_FORM,
+        0 => F32_FORM,
+        _ => BF16_FORM,
+    };
+    let x_form = match parts {
+        1 => BF16_FORM,
+        _ => F32_FORM,
     };
     let tiled = Tiled {
         product: Product {
@@ -23,6 +28,9 @@ fn tiled_text(dialect: Dialect, (schedule, parts): (Schedule, u32)) -> (String, 
             n: 64,
             k: 64,
             form,
+            x_form,
+            out_form: x_form,
+            other_forms: Vec::new(),
             after: After::default(),
             picked: None,
             near: None,
@@ -88,9 +96,11 @@ fn toolkits_agree() {
     std::fs::create_dir_all(&dir).unwrap();
     let (cuda, _) = tiled_text(Dialect::Cuda, (SCHEDULES[0], 0));
     let (parts, _) = tiled_text(Dialect::Cuda, (PARTS[1], 3));
+    let (bf16, _) = tiled_text(Dialect::Cuda, (BF16[1], 1));
     let (metal, entry) = tiled_text(Dialect::Metal, (SCHEDULES[0], 0));
     std::fs::write(dir.join("tiled.cu"), cuda).unwrap();
     std::fs::write(dir.join("parts.cu"), parts).unwrap();
+    std::fs::write(dir.join("bf16.cu"), bf16).unwrap();
     std::fs::write(dir.join("probe.cpp"), hip_probe()).unwrap();
     std::fs::write(dir.join("tiled.metal"), metal).unwrap();
     std::fs::write(dir.join("tiled.mtlp-json"), pipeline_script(&entry)).unwrap();
@@ -103,7 +113,8 @@ fn toolkits_agree() {
             match backend.as_str() {
                 "cuda" => {
                     check_cuda(&row.tile, row.pdl, target, &dir);
-                    check_parts(row.bf16_tile.is_some(), target, &dir);
+                    check_parts(row.bf16_tile.is_some(), target, "parts.cu", &dir);
+                    check_parts(row.bf16_tile.is_some(), target, "bf16.cu", &dir);
                 }
                 "rocm" => check_rocm(&row.tile, target, &dir),
                 "metal" => check_metal(&row.tile, target, &dir),
@@ -148,12 +159,12 @@ fn check_cuda(tile: &Option<[usize; 3]>, pdl: bool, target: &str, dir: &Path) {
 }
 
 /// nvcc builds the bf16 parts text where listed.
-fn check_parts(listed: bool, target: &str, dir: &Path) {
+fn check_parts(listed: bool, target: &str, file: &str, dir: &Path) {
     if !listed {
         return;
     }
     let arch = format!("-arch={target}");
-    let args = [&arch, "-cubin", "-o", "parts.cubin", "parts.cu"];
+    let args = [&arch, "-cubin", "-o", "parts.cubin", file];
     let (built, log) = run("nvcc", &args, dir);
     assert!(built, "{target}: {log}");
     let (_, sass) = run("cuobjdump", &["-sass", "parts.cubin"], dir);

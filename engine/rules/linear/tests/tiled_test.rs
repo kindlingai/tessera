@@ -11,16 +11,20 @@ mod common;
 use common::{linear, noise, terms};
 use tessera_gpukit::platform::{Asked, Platform};
 use tessera_graph::F16;
-use tessera_linear::{PARTS, SCHEDULES, Schedule};
+use tessera_linear::{BF16, PARTS, SCHEDULES, Schedule};
 use tessera_lower::form::{BF16_FORM, LOADS, named};
-use tessera_lower::{Device, Dialect, Pins, Settings, Source, Weight, lower, select};
+use tessera_lower::{Compute, Device, Dialect, Pins, Settings, Source, Weight, lower, select};
 use tessera_run::open;
 use tessera_run::testing::{emulations, host, runs};
 use tessera_testkit::{Noise, cosine_f32, max_abs_diff};
 
 /// A device on `platform` that can only choose schedule `name`.
 fn only(name: &str, settings: &Settings, platform: &Platform) -> Device {
-    let others = SCHEDULES.iter().chain(&PARTS).filter(|s| s.name != name);
+    let others = SCHEDULES
+        .iter()
+        .chain(&PARTS)
+        .chain(&BF16)
+        .filter(|s| s.name != name);
     let bar = |d: Device, s: &Schedule| LOADS.iter().fold(d, |d, f| d.without(f.suffixed(s.name)));
     let device = Device::guess(settings).on(platform.clone());
     others.fold(device.favoring("tiled"), bar)
@@ -221,6 +225,53 @@ fn tables_pick_schedules() {
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         assert_eq!(names, ["tiled_64x64_w32x16_bf16"], "{name}");
     }
+}
+
+/// Bf16 compute selects one-pass bf16 MMA and runs accurately.
+#[test]
+fn bf16_one_pass() {
+    let gb10 = Platform::new(Asked {
+        backend: "cuda",
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        driver: String::new(),
+        limits: tessera_gpukit::Limits::assumed(),
+        units: 0,
+        bandwidth: 0.0,
+        integrated: true,
+        memory: 0,
+    });
+    let pins = Pins::all(BF16_FORM).activations(BF16_FORM);
+    let device = Device::guess(&host())
+        .on(gb10)
+        .pinned(pins.clone())
+        .with_compute(Compute::Bf16);
+    let plan = lower(&linear(3072, 3072), 0, &[(Rows, 256)], &device).unwrap();
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("bf16_"), "{names:?}");
+
+    // One-pass bf16 tiles match the reference on emulated CUDA.
+    let g = linear(64, 64);
+    let mut draws = Noise(53);
+    let x = noise(vec![64, 64], &mut draws);
+    let w = noise(vec![64, 64], &mut draws);
+    let want = run(&g, std::slice::from_ref(&w), 0, std::slice::from_ref(&x)).unwrap();
+    let cuda = emulations()
+        .into_iter()
+        .find(|s| platform(s).bf16_tile().is_some())
+        .unwrap();
+    let device = only("bf16_64x64", &cuda, &platform(&cuda))
+        .pinned(pins)
+        .with_compute(Compute::Bf16);
+    let plan = lower(&g, 0, &[(Rows, 64)], &device).unwrap();
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(names, ["bf16_64x64_bf16"]);
+    let mut runner = open(plan, &cuda).unwrap();
+    runner.load(0, w.view()).unwrap();
+    let got = runner.run(&[x.view()]).unwrap().remove(0);
+    let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+    assert!(cos > 0.9999, "one-pass bf16 cos {cos}");
 }
 
 /// Neighbours gathered while staged, against the interpreter.

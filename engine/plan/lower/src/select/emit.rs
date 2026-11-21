@@ -5,7 +5,7 @@ use crate::Unsupported;
 use crate::form::{self, Load};
 use crate::kept;
 use crate::kernel::{Kernel, KernelRef};
-use crate::kernels::{Move, Scatter, Widen};
+use crate::kernels::{Move, Narrow, Scatter, Widen};
 use crate::rule::Draft;
 use crate::select::cover::EDGE;
 use crate::select::{Home, Op, Selected, Val, Value};
@@ -73,10 +73,19 @@ impl Emit {
 
     /// The value as floats, unless `k` reads it as stored.
     fn widen(&mut self, v: Val, input: usize, k: &dyn Kernel) -> Val {
+        let form = self.out.values[v.0 as usize].form;
+        if !form.narrow() || k.accepts(input, form) {
+            return v;
+        }
+        self.widen_val(v)
+    }
+
+    /// `v` widened to f32, cached once per value.
+    fn widen_val(&mut self, v: Val) -> Val {
         let Value {
             len, zone, form, ..
         } = self.out.values[v.0 as usize];
-        if !form.narrow() || k.accepts(input, form) {
+        if !form.narrow() {
             return v;
         }
         if let Some(wide) = self.widened.get(&v) {
@@ -93,6 +102,34 @@ impl Emit {
         });
         self.widened.insert(v, write);
         write
+    }
+
+    /// `v` narrowed from f32 into `form`.
+    fn narrow(&mut self, v: Val, form: &'static dyn Load) -> Val {
+        let Value { len, zone, .. } = self.out.values[v.0 as usize];
+        let write = self.value(len, Home::Temp, zone, form);
+        self.out.ops.push(Op {
+            kernel: KernelRef::new(Narrow { len, form }),
+            rule: "narrow",
+            reads: vec![v],
+            write,
+            covers: Vec::new(),
+            zone,
+        });
+        write
+    }
+
+    /// `v` converted to `want` if its form differs.
+    pub(crate) fn as_form(&mut self, v: Val, want: &'static dyn Load) -> Val {
+        let have = self.out.values[v.0 as usize].form;
+        if have.name() == want.name() {
+            return v;
+        }
+        let wide = self.widen_val(v);
+        match want.narrow() {
+            true => self.narrow(wide, want),
+            false => wide,
+        }
     }
 
     /// Adds an op writing a new value, or shares one.
@@ -119,10 +156,13 @@ impl Emit {
         if let Some(same) = key.as_ref().and_then(|k| self.shared.get(k)) {
             return *same;
         }
-        let write = self.value(d.len, Home::Temp, zone, form);
-        if let Some(key) = key {
-            self.shared.insert(key, write);
-        }
+        let same_in = !d.kernel.overwrites()
+            || reads
+                .first()
+                .is_some_and(|r| self.out.values[r.0 as usize].form.name() == form.name());
+        let native = (!form.narrow() || d.kernel.emits(form)) && same_in;
+        let out_form = if native { form } else { form::F32_FORM };
+        let write = self.value(d.len, Home::Temp, zone, out_form);
         self.out.ops.push(Op {
             kernel: d.kernel,
             rule,
@@ -131,7 +171,14 @@ impl Emit {
             covers: covers.to_vec(),
             zone,
         });
-        write
+        let result = match native {
+            true => write,
+            false => self.narrow(write, form),
+        };
+        if let Some(key) = key {
+            self.shared.insert(key, result);
+        }
+        result
     }
 
     /// The kept rows of `index`, made once.
@@ -140,13 +187,14 @@ impl Emit {
             return Ok(*val);
         }
         let (t, context) = tree.kept_rows(index).ok_or(Unsupported::KeptRows)?;
-        let all = &tree.node(t).shape;
+        let node = tree.node(t);
+        let all = &node.shape;
         let width: usize = all[2..].iter().product();
         let room = tree.kept.rows(all[0], context) * width;
         let entries = kept::entries(tree.kept, all[0], context);
         self.out.table = self.out.table.max(entries);
         let len: usize = all.iter().product();
-        let val = self.value(len, Home::Kept { index, room }, EDGE, form::F32_FORM);
+        let val = self.value(len, Home::Kept { index, room }, EDGE, node.form);
         self.kept.insert(index, val);
         Ok(val)
     }
@@ -162,6 +210,7 @@ impl Emit {
         let write = self.kept(tree, index)?;
         let kernel = Scatter::at(tree, t, index).ok_or(Unsupported::KeptRows)?;
         let [rows, slots, positions] = args.map(|v| self.bring(v, EDGE));
+        let rows = self.widen(rows, 0, &kernel);
         self.out.ops.push(Op {
             kernel: KernelRef::new(kernel),
             rule: "append",

@@ -7,7 +7,7 @@ mod delta;
 mod flash;
 mod listed;
 
-use tessera_lower::kernels::{Map, MapStage};
+use tessera_lower::kernels::Map;
 use tessera_lower::{Draft, T, Tree, sites};
 
 /// A listed site with all keys present, and its picks.
@@ -26,6 +26,6 @@ fn scaled(site: &sites::Attend) -> Option<(Draft, usize)> {
         return None;
     }
     let out = a.seqs * site.out();
-    let scale = Map::plain(vec![MapStage::Scale(site.scale)]);
+    let scale = Map::scaled(site.scale, site.q_form);
     Some((Draft::new(scale, [site.q], out), out))
 }

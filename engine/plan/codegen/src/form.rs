@@ -3,7 +3,7 @@
 use crate::ir::Helper;
 use std::sync::Mutex;
 
-pub use tessera_mem::form::{Bf16, F32, Form, Read, U8, U32};
+pub use tessera_mem::form::{Bf16, F32, Form, Fp8, Read, U8, U32};
 pub(crate) use tessera_mem::form::{gather, scatter};
 
 /// Decodes its elements in kernel text.
@@ -50,6 +50,21 @@ pub trait Load: Form {
     /// Kernel text: part `h` of a `wide()`, as a float.
     fn part(&self, wide: &str, h: char) -> String {
         format!("{wide}.{h}")
+    }
+
+    /// Whether kernels can store directly into this form.
+    fn stores(&self) -> bool {
+        false
+    }
+
+    /// Kernel text: stores `value` at `index` of `name`.
+    fn store(&self, name: &str, index: &str, value: &str) -> String {
+        format!("{name}[{index}] = {value}")
+    }
+
+    /// Kernel text: stores four floats `value` from `index`.
+    fn store4(&self, name: &str, index: &str, value: &str) -> String {
+        format!("f_f32x4({name} + {index}) = {value}")
     }
 
     /// Its WGSL element type. None: WGSL cannot read it.
@@ -144,6 +159,9 @@ impl Load for F32 {
     fn load4(&self, name: &str, index: &str) -> String {
         format!("f_f32x4({name} + {index})")
     }
+    fn stores(&self) -> bool {
+        true
+    }
     fn wgsl_ty(&self) -> Option<&'static str> {
         Some("f32")
     }
@@ -167,6 +185,15 @@ impl Load for Bf16 {
     fn part(&self, wide: &str, h: char) -> String {
         bf16_part("f_bits", wide, h)
     }
+    fn stores(&self) -> bool {
+        true
+    }
+    fn store(&self, name: &str, index: &str, value: &str) -> String {
+        format!("{name}[{index}] = f_to_bf16({value})")
+    }
+    fn store4(&self, name: &str, index: &str, value: &str) -> String {
+        format!("f_store4_bf16({name} + {index}, {value})")
+    }
     fn wgsl_ty(&self) -> Option<&'static str> {
         Some("u32")
     }
@@ -186,6 +213,40 @@ impl Load for Bf16 {
     }
 }
 
+impl Load for Fp8 {
+    fn ty(&self) -> &'static str {
+        "u8"
+    }
+    fn load(&self, name: &str, index: &str) -> String {
+        format!("f_e4m3((u32){name}[{index}], 0)")
+    }
+    /// Four e4m3 bytes as one word, decoded on use.
+    fn load4(&self, name: &str, index: &str) -> String {
+        format!("f_u32({name} + {index})")
+    }
+    fn wide(&self) -> &'static str {
+        "u32"
+    }
+    fn part(&self, wide: &str, h: char) -> String {
+        let shift = match h {
+            'x' => 0,
+            'y' => 8,
+            'z' => 16,
+            _ => 24,
+        };
+        format!("f_e4m3({wide}, {shift})")
+    }
+    fn stores(&self) -> bool {
+        true
+    }
+    fn store(&self, name: &str, index: &str, value: &str) -> String {
+        format!("{name}[{index}] = f_to_e4m3({value})")
+    }
+    fn store4(&self, name: &str, index: &str, value: &str) -> String {
+        format!("f_store4_e4m3({name} + {index}, {value})")
+    }
+}
+
 /// Part `h` of four bf16 in two words.
 fn bf16_part(bits: &str, wide: &str, h: char) -> String {
     match h {
@@ -198,13 +259,16 @@ fn bf16_part(bits: &str, wide: &str, h: char) -> String {
 
 /// Integer forms: a plain index, under the kernel type `$ty`.
 macro_rules! plain {
-    ($($form:ident = $ty:literal),*) => {$(
+    ($($form:ident = $ty:literal, $writes:literal);*) => {$(
         impl Load for $form {
             fn ty(&self) -> &'static str {
                 $ty
             }
             fn load(&self, name: &str, index: &str) -> String {
                 format!("{name}[{index}]")
+            }
+            fn stores(&self) -> bool {
+                $writes
             }
             fn wgsl_ty(&self) -> Option<&'static str> {
                 Some("u32")
@@ -216,7 +280,7 @@ macro_rules! plain {
     )*};
 }
 
-plain!(U32 = "u32", U8 = "u8");
+plain!(U32 = "u32", true; U8 = "u8", false);
 
 /// WGSL stores words, so a byte is a field.
 fn wgsl_plain(ty: &str, name: &str, index: &str) -> String {
@@ -228,10 +292,12 @@ fn wgsl_plain(ty: &str, name: &str, index: &str) -> String {
 
 form!(F32);
 form!(Bf16);
+form!(Fp8);
 form!(U32);
 
 /// The builtin forms, by name.
 pub const F32_FORM: &dyn Load = &F32;
 pub const BF16_FORM: &dyn Load = &Bf16;
+pub const FP8_FORM: &dyn Load = &Fp8;
 pub const U32_FORM: &dyn Load = &U32;
 pub(crate) const U8_FORM: &dyn Load = &U8;

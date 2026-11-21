@@ -1,6 +1,6 @@
 //! Storage forms: how buffers hold elements, and how bytes decode.
 
-use tessera_graph::{Bf16 as Half, DType};
+use tessera_graph::{Bf16 as Half, DType, E4M3};
 
 pub use scattered_collect::ScatteredSlice;
 pub use scattered_collect::declarative::{gather, scatter};
@@ -10,6 +10,7 @@ pub use scattered_collect::declarative::{gather, scatter};
 pub enum Read {
     F32,
     Bf16,
+    Fp8,
     U32,
     U8,
     /// Through the form's own `unpack` and `dot`, as an f32.
@@ -152,7 +153,8 @@ macro_rules! registry {
 
         /// The registered form called `name`.
         pub fn named(name: &str) -> Option<&'static dyn $form> {
-            $all.iter().copied().find(|f| f.name() == name)
+            let key = if name == "e4m3" { "fp8" } else { name };
+            $all.iter().copied().find(|f| f.name() == key)
         }
     };
 }
@@ -185,6 +187,8 @@ pub(crate) use form;
 pub struct F32;
 /// bf16, widened to f32 on read.
 pub struct Bf16;
+/// OCP float8 e4m3, widened to f32 on read.
+pub struct Fp8;
 /// Unsigned 32-bit ids.
 pub struct U32;
 /// Raw bytes, for a decode helper to walk.
@@ -236,6 +240,42 @@ impl Form for Bf16 {
     }
 }
 
+impl Form for Fp8 {
+    fn name(&self) -> &'static str {
+        "fp8"
+    }
+    fn dtype(&self) -> DType {
+        DType::F32
+    }
+    fn read(&self) -> Read {
+        Read::Fp8
+    }
+    fn bits(&self) -> u32 {
+        4
+    }
+    fn narrow(&self) -> bool {
+        true
+    }
+    fn element_bytes(&self) -> f64 {
+        1.0
+    }
+    fn offset(&self, index: usize) -> usize {
+        index
+    }
+    fn elements(&self, offset: usize) -> usize {
+        offset
+    }
+    fn bytes(&self, elements: usize) -> usize {
+        elements
+    }
+    fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
+        E4M3(bytes[index]).into()
+    }
+    fn pack(&self, data: &[f32]) -> Vec<u8> {
+        data.iter().map(|x| E4M3::from(*x).0).collect()
+    }
+}
+
 impl Form for U32 {
     element!("u32", U32, 32);
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
@@ -260,4 +300,5 @@ impl Form for U8 {
 
 form!(F32);
 form!(Bf16);
+form!(Fp8);
 form!(U32);

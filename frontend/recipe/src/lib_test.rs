@@ -1,7 +1,7 @@
 use crate::{Error, Recipe};
 use std::path::{Path, PathBuf};
-use tessera_engine::sprite;
 use tessera_engine::wasm::Module;
+use tessera_engine::{Compute, Site, sprite};
 
 const TEXT: &str = r#"
 name = "small"
@@ -13,6 +13,14 @@ extra = { clip = "a/b@main" }
 
 [lower]
 favor = "flash"
+compute = "bf16"
+
+[lower.pins]
+weights = "bf16"
+activations = "bf16"
+kept = "fp8"
+outputs = "f32"
+sites = { norm = "f32", logits = "f32" }
 
 [serve]
 max_model_len = 2048
@@ -33,6 +41,19 @@ fn reads_a_recipe() {
     assert!(matches!(recipe.extras(None, None), Err(Error::NoCache)));
     let lower = recipe.lower.as_ref().unwrap();
     assert_eq!(lower.favor.as_deref(), Some("flash"));
+    assert_eq!(lower.compute, Compute::Bf16);
+    assert_eq!(lower.pins.weights.name(), "bf16");
+    assert_eq!(lower.pins.activations.name(), "bf16");
+    assert_eq!(lower.pins.kept.name(), "fp8");
+    assert_eq!(lower.pins.outputs.name(), "f32");
+    assert_eq!(
+        lower.pins.site_form(Site::Norm).map(|f| f.name()),
+        Some("f32")
+    );
+    assert_eq!(
+        lower.pins.site_form(Site::Logits).map(|f| f.name()),
+        Some("f32")
+    );
     let flag = |f: &str, v: Option<&str>| (f.to_string(), v.map(String::from));
     let want = vec![
         flag("--max-model-len", Some("2048")),

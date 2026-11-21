@@ -2,7 +2,6 @@
 
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
-use tessera_lower::form::F32_FORM;
 use tessera_lower::sites::Near;
 use tessera_lower::{Draft, Kernel, Load, T, Term, Tree};
 
@@ -75,7 +74,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let (flat, w) = (node.args[0], node.args[1]);
     let near: Near = tree.site(flat)?;
-    let plain = tree.node(w).form.name() == F32_FORM.name();
+    let plain = tree.node(w).form.dtype().is_float();
     if !(near.taps == TAPS as usize && plain) {
         return None;
     }

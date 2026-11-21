@@ -9,7 +9,8 @@ mod widen;
 
 pub use collective::{AllGather, AllReduce, crosses};
 pub use join::Join;
-pub use map::{Map, MapStage, add_operands, finish, operands};
+pub use map::{Map, MapStage, add_operand_forms, add_operands, finish, operands};
 pub(crate) use moves::Move;
 pub(crate) use scatter::Scatter;
+pub(crate) use widen::Narrow;
 pub use widen::Widen;

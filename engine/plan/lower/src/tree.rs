@@ -1,16 +1,18 @@
 //! An entry as trees: values with one reader join it.
 
 use crate::extent::Extent;
-use crate::form::{Load, Pins};
+use crate::form::{F32_FORM, Load, Pins, Site};
 use crate::kernels::MapStage;
 use crate::plan::Share;
+use crate::recipe::Compute;
 use crate::rule::Rule;
 use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 use tessera_codegen::kept::Layout;
 use tessera_graph::{
-    DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Role, Shape, Stage,
+    Composite, DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Role, Shape,
+    Stage, View,
 };
 
 /// Entry outputs a launch reads, one bit each.
@@ -75,6 +77,8 @@ pub struct Tree<'a> {
     pub(crate) sizes: Vec<(DimName, u64)>,
     /// Where kept rows lie.
     pub kept: &'static dyn Layout,
+    /// Operand precision for matrix-unit kernels.
+    pub compute: Compute,
     /// How split axes divide, and which part this plan is.
     pub(crate) parts: Parts,
     pub(crate) rank: u32,
@@ -94,6 +98,77 @@ pub(crate) fn map_stage(s: &Stage) -> Option<MapStage> {
         Stage::Act(a) => Some(MapStage::Act(*a)),
         _ => None,
     }
+}
+
+/// The pinned form for a float node or stage.
+fn pinned_form(
+    pins: &Pins,
+    op: &Op,
+    stage: Option<&Stage>,
+    role: Option<Role>,
+    in_moe: bool,
+) -> &'static dyn Load {
+    if matches!(op, Op::Append(_)) {
+        return pins.kept;
+    }
+    if matches!(stage, Some(Stage::AllReduce | Stage::AllGather)) {
+        return F32_FORM;
+    }
+    if let Some(role) = role {
+        if role == Role::Logits
+            && let Some(form) = pins.site_form(Site::Logits)
+        {
+            return form;
+        }
+        return pins.outputs;
+    }
+    let site = match (op, stage) {
+        (_, Some(Stage::RmsNorm { .. } | Stage::Rms { .. } | Stage::Center)) => Some(Site::Norm),
+        (_, Some(Stage::Softmax | Stage::UnitSum)) => {
+            if in_moe && pins.site_form(Site::Router).is_some() {
+                Some(Site::Router)
+            } else {
+                Some(Site::Softmax)
+            }
+        }
+        (_, Some(Stage::Add)) => Some(Site::Residual),
+        (Op::Mix(_), _) => Some(Site::Router),
+        (Op::Attend(_) | Op::Delta(_), _) => Some(Site::Attention),
+        (Op::Matmul, _) => Some(Site::Matmul),
+        _ if in_moe => Some(Site::Router),
+        _ => None,
+    };
+    site.and_then(|s| pins.site_form(s))
+        .unwrap_or(pins.activations)
+}
+
+/// Output role per graph node, propagated back through reshapes.
+fn output_roles(g: &Graph, entry: usize) -> Vec<Option<Role>> {
+    let mut roles = vec![None; g.nodes.len()];
+    for o in &g.entries[entry].outputs {
+        let mut id = o.node.0 as usize;
+        loop {
+            roles[id] = Some(o.role);
+            let Op::View(View::Reshape(_)) = g.nodes[id].op else {
+                break;
+            };
+            id = g.nodes[id].args[0].0 as usize;
+        }
+    }
+    roles
+}
+
+/// Which graph nodes lie inside a MoE region.
+fn moe_nodes(g: &Graph) -> Vec<bool> {
+    let mut mask = vec![false; g.nodes.len()];
+    for region in &g.regions {
+        if region.kind == Composite::Moe {
+            for slot in &mut mask[region.start.0 as usize..region.end.0 as usize] {
+                *slot = true;
+            }
+        }
+    }
+    mask
 }
 
 /// Which nodes the outputs depend on.
@@ -189,6 +264,8 @@ impl<'a> Tree<'a> {
         let wanted = e.outputs.iter().enumerate().filter(|(i, _)| wants.has(*i));
         let outputs: Vec<usize> = wanted.map(|(_, o)| o.node.0 as usize).collect();
         let needed = needed(g, &outputs);
+        let roles = output_roles(g, entry);
+        let in_moe = moe_nodes(g);
         let mut tree = Tree {
             g,
             nodes: Vec::new(),
@@ -197,6 +274,7 @@ impl<'a> Tree<'a> {
             ports: Vec::new(),
             sizes: sizes.to_vec(),
             kept,
+            compute: Compute::default(),
             parts: parts.clone(),
             rank,
             shares: Vec::new(),
@@ -251,7 +329,10 @@ impl<'a> Tree<'a> {
             let args = args?;
             let form = match &n.op {
                 Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
-                _ => tessera_codegen::form::of(n.ty.dtype),
+                Op::Input { .. } => tessera_codegen::form::of(n.ty.dtype),
+                Op::View(View::Reshape(_)) => tree.node(args[0]).form,
+                _ if !n.ty.dtype.is_float() => tessera_codegen::form::of(n.ty.dtype),
+                op => pinned_form(pins, op, None, roles[i], in_moe[i]),
             };
             // Kernels read whole blocks, so a row holds whole ones.
             if !shape.last().is_none_or(|k| k.is_multiple_of(form.align())) {
@@ -276,17 +357,17 @@ impl<'a> Tree<'a> {
             }
             let weight = n.args.get(1).filter(|_| n.op == Op::Matmul);
             if let Some(parts) = weight.and_then(|w| turned[w.0 as usize]) {
-                at[i] = Some(tree.turn(args[0], parts, (&shape, &extents), from));
+                at[i] = Some(tree.turn(args[0], parts, (&shape, &extents), form, from));
                 continue;
             }
-            let mut push = |term: Term, args: Vec<T>| {
+            let mut push = |term: Term, args: Vec<T>, node_form: &'static dyn Load| {
                 let (shape, extents) = (shape.clone(), extents.clone());
                 tree.nodes.push(Node {
                     term,
                     args,
                     shape,
                     extents,
-                    form,
+                    form: node_form,
                     from,
                 });
                 tree.shares
@@ -295,24 +376,31 @@ impl<'a> Tree<'a> {
             };
             at[i] = Some(match &n.op {
                 Op::Input { entry: e, port } if *e as usize == entry => {
-                    push(Term::Leaf(Home::Input(*port)), args)
+                    push(Term::Leaf(Home::Input(*port)), args, form)
                 }
-                Op::Weight(w) => push(Term::Leaf(Home::Weight(*w)), args),
+                Op::Weight(w) => push(Term::Leaf(Home::Weight(*w)), args, form),
                 Op::Input { .. } => return Err(Unsupported::EntryInput.into()),
                 Op::Row(r) => {
                     let (mut cur, mut rest) = (args[0], args[1..].iter());
                     // One rank holds the whole value already.
                     let crossing = |s: &Stage| matches!(s, Stage::AllReduce | Stage::AllGather);
-                    let summed = |s: &&Stage| ranks > 1 || !crossing(s);
-                    for stage in r.0.iter().filter(summed) {
+                    let stages: Vec<&Stage> =
+                        r.0.iter().filter(|s| ranks > 1 || !crossing(s)).collect();
+                    let last = stages.len().saturating_sub(1);
+                    for (idx, stage) in stages.into_iter().enumerate() {
                         let operand = (stage.operands() == 1).then(|| rest.next());
                         let operand = operand.flatten().copied();
                         let args = [cur].into_iter().chain(operand).collect();
-                        cur = push(Term::Stage(stage.clone()), args);
+                        let stage_role = (idx == last).then_some(roles[i]).flatten();
+                        let stage_form = match n.ty.dtype.is_float() {
+                            true => pinned_form(pins, &n.op, Some(stage), stage_role, in_moe[i]),
+                            false => tessera_codegen::form::of(n.ty.dtype),
+                        };
+                        cur = push(Term::Stage(stage.clone()), args, stage_form);
                     }
                     cur
                 }
-                op => push(Term::Op(op.clone()), args),
+                op => push(Term::Op(op.clone()), args, form),
             });
         }
         tree.at = at;
@@ -331,6 +419,12 @@ impl<'a> Tree<'a> {
                 .push((t, shape.iter().map(Extent::most).collect()));
         }
         Ok(tree)
+    }
+
+    /// The same tree, with matrix-unit precision `compute`.
+    pub(crate) fn with_compute(mut self, compute: Compute) -> Self {
+        self.compute = compute;
+        self
     }
 
     fn add(&mut self, node: Node, share: Option<Share>) -> T {
@@ -384,16 +478,16 @@ impl<'a> Tree<'a> {
         x: T,
         [codes, suh, svh]: [T; 3],
         (shape, extents): (&[usize], &[Extent]),
+        out_form: &'static dyn Load,
         from: NodeId,
     ) -> T {
         let (rows, wide) = (self.node(x).shape.clone(), self.node(x).extents.clone());
         let turn = Stage::Hadamard { block: 128 };
-        let mut step = |term: Term, args: Vec<T>, out: bool| {
+        let mut step = |term: Term, args: Vec<T>, out: bool, form: &'static dyn Load| {
             let (shape, extents) = match out {
                 true => (shape.to_vec(), extents.to_vec()),
                 false => (rows.clone(), wide.clone()),
             };
-            let form = crate::form::F32_FORM;
             let node = Node {
                 term,
                 args,
@@ -404,11 +498,12 @@ impl<'a> Tree<'a> {
             };
             self.add(node, None)
         };
-        let scaled = step(Term::Stage(Stage::Mul), vec![x, suh], false);
-        let turned = step(Term::Stage(turn.clone()), vec![scaled], false);
-        let product = step(Term::Op(Op::Matmul), vec![turned, codes], true);
-        let back = step(Term::Stage(turn), vec![product], true);
-        step(Term::Stage(Stage::Mul), vec![back, svh], true)
+        let f32 = F32_FORM;
+        let scaled = step(Term::Stage(Stage::Mul), vec![x, suh], false, f32);
+        let turned = step(Term::Stage(turn.clone()), vec![scaled], false, f32);
+        let product = step(Term::Op(Op::Matmul), vec![turned, codes], true, f32);
+        let back = step(Term::Stage(turn), vec![product], true, f32);
+        step(Term::Stage(Stage::Mul), vec![back, svh], true, out_form)
     }
 
     /// This rank's part of a split weight.

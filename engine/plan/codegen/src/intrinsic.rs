@@ -227,10 +227,15 @@ macro_rules! table {
                     let Expr::Var(name) = &args[0] else {
                         panic!("a store names its buffer");
                     };
-                    let (at, v) = (p.expr(&args[1]), p.expr(&args[2]));
+                    let (form, at, v) = (p.buffer(&args[0]), p.expr(&args[1]), p.expr(&args[2]));
                     match p.wgsl {
-                        true => store4(&p.c_name(name), &at, &v),
-                        false => format!("f_f32x4({name} + {at}) = {v}"),
+                        true => {
+                            if form.narrow() {
+                                p.refuse("a store narrower than a word".into());
+                            }
+                            store4(&p.c_name(name), &at, &v)
+                        }
+                        false => form.store4(name, &at, &v),
                     }
                 },
                 wgsl: bare(),

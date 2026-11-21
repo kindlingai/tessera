@@ -97,6 +97,7 @@ impl Counter {
         t.loads += ops.loads * n;
         t.stores += ops.stores * n;
         t.tile_flops += ops.tile_flops * n;
+        t.bf16_flops += ops.bf16_flops * n;
         t.shared += ops.shared * n;
         t.f16 += ops.f16 * n;
         t.e4m3 += ops.e4m3 * n;
@@ -383,16 +384,30 @@ impl Counter {
                 // A held slab reads only B from group memory.
                 let held = matches!(a, Expr::Var(n) if self.held.contains_key(n));
                 // Each part of A multiplies once. Words hold two bf16.
-                let (times, shared) = match parts {
-                    0 if held => (1, cols * depth),
-                    0 => (1, (rows + cols) * depth),
-                    p => (*p, (rows * p + cols) * depth / 2),
+                let (tile_flops, bf16_flops, shared) = match parts {
+                    0 if held => (lane(2 * rows * cols * depth), 0.0, lane(cols * depth)),
+                    0 => (
+                        lane(2 * rows * cols * depth),
+                        0.0,
+                        lane((rows + cols) * depth),
+                    ),
+                    1 => (
+                        0.0,
+                        lane(2 * rows * cols * depth),
+                        lane((rows + cols) * depth / 2),
+                    ),
+                    p => (
+                        lane(2 * rows * cols * depth * p),
+                        0.0,
+                        lane((rows * p + cols) * depth / 2),
+                    ),
                 };
                 // A lane's share of the block's multiply-adds, as tile flops.
                 self.add(Ops {
-                    tile_flops: lane(2 * rows * cols * depth * times),
+                    tile_flops,
+                    bf16_flops,
                     float: lane(rows * cols),
-                    shared: lane(shared),
+                    shared,
                     ..Ops::default()
                 });
                 // Sums twice over, and every unrolled operand at once.

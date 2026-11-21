@@ -279,7 +279,9 @@ pub trait Run {
 
     /// A plain slot copies. Any other packs through its form.
     fn write(&mut self, slot: Slot, src: View) -> Result<(), Error> {
-        let plain = slot.form.block() == 1 && src.dtype() == slot.form.dtype();
+        let plain = slot.form.block() == 1
+            && src.dtype() == slot.form.dtype()
+            && slot.form.bytes(1) == src.dtype().bytes();
         if plain {
             return Ok(copy(src, &mut self.held_mut().view_mut(slot))?);
         }
@@ -289,7 +291,11 @@ pub trait Run {
 
     /// The slot's values on the host, as one row.
     fn read(&self, slot: Slot) -> Result<Tensor, Error> {
-        Ok(self.held().view(slot).to_tensor()?)
+        if !slot.form.narrow() {
+            return Ok(self.held().view(slot).to_tensor()?);
+        }
+        let bytes = self.held().bytes(slot)?;
+        Ok(Tensor::f32(vec![slot.len], slot.form.unpack_all(&bytes)))
     }
 
     fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {

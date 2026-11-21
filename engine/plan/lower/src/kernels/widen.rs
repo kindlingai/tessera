@@ -59,3 +59,57 @@ fn widen_load(k: &Widen, _: usize) -> Option<Load> {
 fn widen_accepts(k: &Widen, _: usize, form: &dyn Stored) -> bool {
     form.name() == k.form.name()
 }
+
+/// One thread per element, narrowed from f32.
+#[kernel]
+fn narrow(
+    x: Buf<F32>,
+    #[form(form)] mut out: BufMut<Dyn>,
+    len: u32,
+    #[build] form: &'static dyn Stored,
+) {
+    if gid() >= len {
+        return;
+    }
+    out[gid() as u64] = x[gid() as u64];
+}
+
+/// Narrows `len` floats into `form`.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    narrow(self.form),
+    crate = crate,
+    name = "narrow",
+    threads = self.len,
+    sizes = [],
+    source = narrow_source,
+    load = narrow_load,
+    emits = narrow_emits,
+)]
+pub(crate) struct Narrow {
+    pub len: usize,
+    pub form: &'static dyn Stored,
+}
+
+fn narrow_source(k: &Narrow) -> Source {
+    let entry = format!("plan_narrow_{}", k.form.name());
+    Source::named(narrow_ir(k.form), entry)
+}
+
+fn narrow_load(k: &Narrow, _: usize) -> Option<Load> {
+    let len = k.len as f64;
+    Some(Load {
+        threads: k.len,
+        group: 256,
+        trips: 1.0,
+        trip: narrow_ir(k.form).trip(),
+        reads: vec![4.0 * len],
+        written: k.form.bytes(k.len) as f64,
+        flight: 4.0,
+        ..Load::default()
+    })
+}
+
+fn narrow_emits(k: &Narrow, form: &dyn Stored) -> bool {
+    form.name() == k.form.name()
+}

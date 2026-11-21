@@ -2,7 +2,6 @@
 
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
-use tessera_lower::form::F32_FORM;
 use tessera_lower::{Draft, Kernel, T, Term, Tree};
 
 /// One thread per output. Batches of `w` serve rows.
@@ -45,7 +44,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let (x, w) = (node.args[0], node.args[1]);
-    let floats = |t: T| tree.node(t).form.name() == F32_FORM.name();
+    let floats = |t: T| tree.node(t).form.dtype().is_float();
     let shape = &tree.node(w).shape;
     // Gathers of kept rows are ours, not picked weights.
     let wn = tree.node(w);

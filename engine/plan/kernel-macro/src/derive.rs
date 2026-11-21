@@ -11,9 +11,9 @@ use syn::{
 };
 
 /// Keys that take `= expr`.
-const VALUES: [&str; 14] = [
-    "name", "threads", "sizes", "work", "needs", "order", "load", "accepts", "guess", "runs_on",
-    "source", "launches", "crate", "variant",
+const VALUES: [&str; 15] = [
+    "name", "threads", "sizes", "work", "needs", "order", "load", "accepts", "emits", "guess",
+    "runs_on", "source", "launches", "crate", "variant",
 ];
 
 /// Keys that stand alone.
@@ -282,6 +282,10 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
         let call = applied(e, &[quote!(self), quote!(input), quote!(form)]);
         quote!(fn accepts(&self, input: usize, form: &dyn #krate::form::Load) -> bool { #call })
     });
+    let emits = line.expr("emits").map(|e| {
+        let call = applied(e, &[quote!(self), quote!(form)]);
+        quote!(fn emits(&self, form: &dyn #krate::form::Load) -> bool { #call })
+    });
     Ok(quote! {
         #[allow(clippy::all, unused_variables)]
         impl #krate::Kernel for #ty {
@@ -299,6 +303,7 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
             #order
             #load
             #accepts
+            #emits
             #runs_on
             #shared
             #overwrite

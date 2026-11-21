@@ -3,12 +3,12 @@
 use tessera_graph::DimName::{self, Context, Hidden, Rows, Seqs};
 use tessera_graph::{Act, DType, Dim, Graph, TensorType};
 use tessera_interp::{Tensor, run};
-use tessera_lower::form::{BF16_FORM, F32_FORM};
+use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
 use tessera_lower::kernels::{Map, MapStage, Widen};
 use tessera_lower::sites;
 use tessera_lower::{
-    Arg, Buffer, Device, Dialect, Draft, Error, Fit, Kernel, KernelRef, Pins, Plan, Slot, Source,
-    Step, T, Tree,
+    Arg, Buffer, Compute, Device, Dialect, Draft, Error, Fit, Kernel, KernelRef, Pins, Plan,
+    Recipe, Site, Slot, Source, Step, T, Tree,
 };
 use tessera_lower::{assign, lower, peak, rules, schedule, select};
 use tessera_run::testing::{host, runs};
@@ -424,17 +424,105 @@ fn pinned_weights_narrow() {
         let kept = l.weight == 0;
         assert_eq!(l.slot.form == F32_FORM, kept, "weight {}", l.weight);
     }
-    // Maps read floats, so the narrow weight widens once.
+    // Maps read plain narrow weights directly without widening.
+    assert_eq!(count(&plan, "widen"), 0);
+    // Block forms still widen once before maps.
+    let block = named("nvfp4").unwrap();
+    let one = Pins::all(block).pin("a", F32_FORM);
+    let plan = lower(&g, 0, &SIZES, &Device::guess(&host()).pinned(one)).unwrap();
     assert_eq!(count(&plan, "widen"), 1);
     let both = lower(
         &g,
         0,
         &SIZES,
-        &Device::guess(&host()).pinned(Pins::all(BF16_FORM)),
-    );
-    assert_eq!(count(&both.unwrap(), "widen"), 2);
+        &Device::guess(&host()).pinned(Pins::all(block)),
+    )
+    .unwrap();
+    assert_eq!(count(&both, "widen"), 2);
     let wide = lower(&g, 0, &SIZES, &Device::guess(&host())).unwrap();
     assert_eq!(count(&wide, "widen"), 0);
+}
+
+#[test]
+fn pins_narrow_activations() {
+    // Legacy pins without activation fields deserialize with f32 defaults.
+    let legacy: Pins = serde_json::from_str(r#"{"weights":"bf16","named":[]}"#).unwrap();
+    assert_eq!(legacy, Pins::all(BF16_FORM));
+    let full = Pins::all(BF16_FORM)
+        .activations(BF16_FORM)
+        .kept(FP8_FORM)
+        .outputs(F32_FORM)
+        .site(Site::Norm, F32_FORM);
+    let text = serde_json::to_string(&full).unwrap();
+    assert_eq!(serde_json::from_str::<Pins>(&text).unwrap(), full);
+    let recipe = Recipe {
+        pins: full.clone(),
+        compute: Compute::Bf16,
+        ..Recipe::default()
+    };
+    let rtext = serde_json::to_string(&recipe).unwrap();
+    assert_eq!(serde_json::from_str::<Recipe>(&rtext).unwrap(), recipe);
+
+    // Narrow activations shrink buffers and run natively without casts.
+    let g = ladder();
+    let mut draws = Noise(19);
+    let draw = |shape: Vec<usize>, d: &mut Noise| {
+        let n = shape.iter().product();
+        Tensor::f32(shape, (0..n).map(|_| d.draw()).collect())
+    };
+    let weights = [draw(vec![16], &mut draws), draw(vec![16], &mut draws)];
+    let inputs = [
+        draw(vec![2, 3, 16], &mut draws),
+        draw(vec![2, 3, 16], &mut draws),
+    ];
+    let want = run(&g, &weights, 0, &inputs).unwrap();
+    for (form, tol) in [(BF16_FORM, 5e-2f32), (FP8_FORM, 0.5f32)] {
+        let pins = Pins::default().activations(form).outputs(form);
+        for settings in runs() {
+            let plan = lower(
+                &g,
+                0,
+                &SIZES,
+                &Device::guess(&settings).pinned(pins.clone()),
+            )
+            .unwrap();
+            assert_eq!(count(&plan, "widen"), 0);
+            assert_eq!(count(&plan, "narrow"), 0);
+            assert_eq!(plan.outputs[0].slot.form, form);
+            assert_eq!(plan.outputs[0].slot.bytes(), form.bytes(2 * 3 * 16));
+            let mut runner = open(plan, &settings).unwrap();
+            for (i, w) in weights.iter().enumerate() {
+                runner.load(i as u32, w.view()).unwrap();
+            }
+            let got = runner
+                .run(&[inputs[0].view(), inputs[1].view()])
+                .unwrap()
+                .remove(0);
+            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+            assert!(
+                off < tol,
+                "{} on {:?}: off by {off:e}",
+                form.name(),
+                settings.backend
+            );
+        }
+    }
+
+    // Narrow kept rows shrink kept buffers and scatter natively.
+    let g = appended();
+    let sizes = [(Seqs, 4), (Rows, 2), (Context, 4)];
+    for form in [BF16_FORM, FP8_FORM] {
+        let pins = Pins::default().kept(form);
+        let plan = lower(&g, 0, &sizes, &Device::guess(&host()).pinned(pins)).unwrap();
+        assert_eq!(count(&plan, "narrow"), 0);
+        assert!(plan.kept.iter().all(|k| k.1.form == form));
+        let active = form.bytes(4 * 4 * 16);
+        let full = form.bytes(4 * 16 * 16).next_multiple_of(256);
+        for (_, slot) in &plan.kept {
+            assert_eq!(slot.bytes(), active);
+            assert_eq!(plan.buffers[slot.buffer as usize], plan.kept.len() * full);
+        }
+    }
 }
 
 #[test]

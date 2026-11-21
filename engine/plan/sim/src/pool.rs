@@ -204,12 +204,12 @@ impl Chip for Pool {
         let fresh = if t.loads > 0.0 { t.fresh } else { 0.0 };
         let waits = fresh * self.wait.value + (1.0 - fresh) * t.loads * self.near.value;
         let r = self.residency(l);
-        let tiles = t.shared * self.shared.value + t.tile_flops * self.mma.value;
+        let tiles = t.shared * self.shared.value + (t.tile_flops + t.bf16_flops) * self.mma.value;
         let spills = r.spilled * self.spill.value;
         let chain = r.waves * l.trips * (ops + waits + tiles + spills);
         let compute = threads * l.trips * ops / self.step.value / self.rate.value;
         // Without a matrix unit, tile flops run as floats.
-        let tiled = threads * l.trips * t.tile_flops;
+        let tiled = threads * l.trips * (t.tile_flops + t.bf16_flops);
         let compute = match self.tile.value > 0.0 {
             true => compute + tiled / self.tile.value,
             false => compute + tiled / self.rate.value,
@@ -242,7 +242,7 @@ impl Chip for Pool {
         let floats = l.threads as f64 * l.trips * t.float;
         let ops =
             floats + l.threads as f64 * l.trips * t.special * self.curve.value / self.step.value;
-        let tiled = l.threads as f64 * l.trips * t.tile_flops;
+        let tiled = l.threads as f64 * l.trips * (t.tile_flops + t.bf16_flops);
         let best_rate = self.rate.value.max(self.tile.value);
         let ops = ops + tiled * self.rate.value / best_rate;
         let best = self.read.value.max(self.scan.value);

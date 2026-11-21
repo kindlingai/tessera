@@ -3,10 +3,10 @@
 use crate::lockstep::{Slabs, bf16_pair, leaders, round_e4m3, round_f16};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use tessera_codegen::form::Load;
+use tessera_codegen::form::{Load, Read};
 use tessera_codegen::ir::{BinOp, Body, Expr, Helper, Intrinsic, Param, Stmt, Ty, gather};
 use tessera_codegen::numerics::Precision;
-use tessera_graph::{E2M1, E4M3, F16};
+use tessera_graph::{Bf16, E2M1, E4M3, F16};
 
 /// One argument of a launch, on the host side.
 #[derive(Clone, Copy, Debug)]
@@ -178,17 +178,29 @@ impl Group<'_, '_> {
         }
     }
 
-    /// Writes store plain f32 or ids, never packed.
+    /// Stores one element into a writable buffer form.
     fn store(&mut self, arg: &Arg, index: u64, value: Val) {
-        let at = (arg.skip + index as usize) * 4;
+        let idx = arg.skip + index as usize;
         let bytes = &mut self.buffers[arg.buffer];
-        let Some(raw) = bytes.get_mut(at..at + 4) else {
-            panic!("a write {index} elements past buffer {}", arg.buffer);
-        };
-        match arg.form.dtype().is_float() {
-            true if arg.form.narrow() => panic!("kernels write only f32"),
-            true => raw.copy_from_slice(&value.f().to_le_bytes()),
-            false => raw.copy_from_slice(&value.u().to_le_bytes()),
+        let fail = || panic!("a write {index} elements past buffer {}", arg.buffer);
+        match arg.form.read() {
+            Read::F32 => {
+                let raw = bytes.get_mut(idx * 4..idx * 4 + 4).unwrap_or_else(fail);
+                raw.copy_from_slice(&value.f().to_le_bytes());
+            }
+            Read::Bf16 => {
+                let raw = bytes.get_mut(idx * 2..idx * 2 + 2).unwrap_or_else(fail);
+                raw.copy_from_slice(&Bf16::from(value.f()).0.to_le_bytes());
+            }
+            Read::Fp8 => {
+                let raw = bytes.get_mut(idx..idx + 1).unwrap_or_else(fail);
+                raw[0] = E4M3::from(value.f()).0;
+            }
+            Read::U32 => {
+                let raw = bytes.get_mut(idx * 4..idx * 4 + 4).unwrap_or_else(fail);
+                raw.copy_from_slice(&value.u().to_le_bytes());
+            }
+            other => panic!("cannot write form {other:?}"),
         }
     }
 
