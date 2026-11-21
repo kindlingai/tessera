@@ -20,6 +20,9 @@ const BK: u32 = 16;
 /// Four SIMD groups: two form scores, four apply them.
 const THREADS: u32 = 128;
 
+/// Query rows each SIMD group softens.
+const ROWS: u32 = BQ / (THREADS / LANES as u32);
+
 /// Floats of padding after each staged row, against bank conflicts.
 const PAD: u32 = 4;
 
@@ -56,8 +59,8 @@ struct Stream {
     o01: Tiles,
     o10: Tiles,
     o11: Tiles,
-    /// Each row's peak and sum.
-    state: [f32; 2],
+    /// Peaks, then sums, of the rows this SIMD group softens.
+    state: [f32; 16],
 }
 
 /// The query block and head one group serves.
@@ -100,7 +103,7 @@ fn stream(#[build] cw: u32) -> Stream {
         o01: tiles(16, 16),
         o10: tiles(16, 16),
         o11: tiles(16, 16),
-        state: [0.0f32; 2],
+        state: [0.0f32; 16],
     }
 }
 
@@ -169,32 +172,52 @@ fn scores(st: &mut Stream, simd: u32, k0: u32) {
     }
 }
 
-/// A row's softmax step. `state` holds its peak and sum.
+/// A softmax step. A SIMD group takes `ROWS` rows.
 #[kernel]
 fn soften(st: &mut Stream) {
-    let row = lid();
-    if row < BQ {
-        let mut top = f32::NEG_INFINITY;
-        for c in 0..BK {
-            top = max(top, st.p_s[row * (BK + PAD) + c]);
-        }
-        let m_new = max(st.state[0], top);
+    let simd = lid() / LANES as u32;
+    for i in 0..ROWS {
+        let row = simd * ROWS + i;
+        let at = row * (BK + PAD) + lane();
+        let s = if lane() < BK {
+            st.p_s[at]
+        } else {
+            f32::NEG_INFINITY
+        };
+        let mut top = s;
+        top = max(top, shfl_xor(top, 16));
+        top = max(top, shfl_xor(top, 8));
+        top = max(top, shfl_xor(top, 4));
+        top = max(top, shfl_xor(top, 2));
+        top = max(top, shfl_xor(top, 1));
+        let m_new = max(st.state[i as usize], top);
         // A row that has seen nothing keeps zero sums.
         let safe = if m_new == f32::NEG_INFINITY {
             0.0
         } else {
             m_new
         };
-        let alpha = exp(st.state[0] - safe);
-        let mut sum = 0.0f32;
-        for c in 0..BK {
-            let p = exp(st.p_s[row * (BK + PAD) + c] - safe);
-            st.p_s[row * (BK + PAD) + c] = p;
-            sum += p;
+        let alpha = exp(st.state[i as usize] - safe);
+        let p = exp(s - safe);
+        let mut sum = p;
+        sum = sum32(sum);
+        if lane() < BK {
+            st.p_s[at] = p;
         }
-        st.state[1] = st.state[1] * alpha + sum;
-        st.state[0] = m_new;
-        st.alpha_s[row] = alpha;
+        st.state[(ROWS + i) as usize] = st.state[(ROWS + i) as usize] * alpha + sum;
+        st.state[i as usize] = m_new;
+        if lane() == 0 {
+            st.alpha_s[row] = alpha;
+        }
+    }
+}
+
+/// Starts each softened row with no peak and no sum.
+#[kernel]
+fn restart(st: &mut Stream) {
+    for i in 0..ROWS {
+        st.state[i as usize] = f32::NEG_INFINITY;
+        st.state[(ROWS + i) as usize] = 0.0;
     }
 }
 
@@ -296,8 +319,10 @@ fn write_all(
     #[build] w: u32,
 ) {
     let simd = lid() / LANES as u32;
-    if lid() < BQ {
-        st.l_s[lid()] = st.state[1];
+    for i in 0..ROWS {
+        if lane() == i {
+            st.l_s[simd * ROWS + i] = st.state[(ROWS + i) as usize];
+        }
     }
     barrier();
     // The first column, then each SIMD group's pieces.
@@ -361,15 +386,21 @@ fn flash(
             }
         }
     }
-    st.state[0] = f32::NEG_INFINITY;
+    restart(&mut st);
     // The slice's first column.
     let start = slice * cw;
+    // One slice holds the whole head: its queries stay staged.
+    if slices == 1 {
+        stage_q(&mut st, q, &hd, 0, cw, w);
+    }
     for b in lo / BK..(hi + BK - 1) / BK {
         let k0 = b * BK;
         st.s_t.zero();
         for c in 0..slices {
             let d0 = c * cw;
-            stage_q(&mut st, q, &hd, d0, cw, w);
+            if slices > 1 {
+                stage_q(&mut st, q, &hd, d0, cw, w);
+            }
             stage_kv::<false>(&mut st, k, &hd, k0, k0, keys, d0, cw, w);
             barrier();
             score_chunk(&mut st, simd, cw);
@@ -436,8 +467,7 @@ fn flash_rows(
             if last > keys {
                 last = keys;
             }
-            st.state[0] = f32::NEG_INFINITY;
-            st.state[1] = 0.0;
+            restart(&mut st);
             st.o00.zero();
             st.o01.zero();
             st.o10.zero();
