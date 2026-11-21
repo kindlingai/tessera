@@ -73,16 +73,26 @@ fn flash_matches_cpu() {
                 (Rows, rows as u64),
                 (Context, keys as u64),
             ];
-            let device = Device::guess(settings).favoring("flash");
-            let plan = lower(&g, 0, &sizes, &device).unwrap();
-            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-            let label = format!("{mask:?} {seqs}x{rows}x{keys} at {width}");
-            assert_eq!(names, ["map", "flash"], "{label}");
-            let mut runner = open(plan, settings).unwrap();
             let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
-            let got = runner.run(&views).unwrap().remove(0);
-            let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-            assert!(off < 1e-3, "{label}: off by {off:e}");
+            let mut device = Device::guess(settings).favoring("flash");
+            // Each key block in turn. The runner names the platform.
+            for (way, other) in [("flash", "flash_k32"), ("flash_k32", "flash")] {
+                let plan = lower(&g, 0, &sizes, &device.clone().without(other)).unwrap();
+                let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                let label = format!("{mask:?} {seqs}x{rows}x{keys} at {width}, {way}");
+                // Where 32 keys do not fit, 16 keys stay.
+                if names[1] != way && way == "flash_k32" {
+                    continue;
+                }
+                assert_eq!(names, ["map", way], "{label}");
+                let mut runner = open(plan, settings).unwrap();
+                let got = runner.run(&views).unwrap().remove(0);
+                let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+                assert!(off < 1e-3, "{label}: off by {off:e}");
+                if settings.gpu().is_some() {
+                    device = device.on(runner.platform());
+                }
+            }
         }
     }
 }
