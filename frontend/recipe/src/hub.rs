@@ -4,6 +4,7 @@ use crate::{Error, io, pinned};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tessera_frontend_settings::{HUB, resolve};
 
 /// File endings a model directory needs. Other files stay remote.
 const KEEP: [&str; 5] = [".json", ".safetensors", ".jinja", ".txt", ".model"];
@@ -42,7 +43,7 @@ pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, E
 
 /// The repository's files at `revision`.
 fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error> {
-    let api = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
+    let api = format!("https://{HUB}/api/models/{repo}/revision/{revision}");
     let response = get(&api, token).map_err(|e| match *e {
         ureq::Error::Status(401 | 404, _) => {
             let why = "not found, or gated: set HF_TOKEN";
@@ -197,7 +198,7 @@ fn fetch_file(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    let url = format!("https://huggingface.co/{repo}/resolve/{commit}/{name}");
+    let url = resolve(repo, commit, name);
     download(&url, &path, token)
 }
 

@@ -58,6 +58,14 @@ pub fn read() -> Settings {
     }
 }
 
+/// The Hugging Face host.
+pub const HUB: &str = "huggingface.co";
+
+/// The hub URL of `file` in `repo` at `revision`.
+pub fn resolve(repo: &str, revision: &str, file: &str) -> String {
+    format!("https://{HUB}/{repo}/resolve/{revision}/{file}")
+}
+
 /// The proxy for `host`, or `None` to fetch directly.
 #[allow(clippy::disallowed_methods, reason = "the one sanctioned reader")]
 pub fn proxy(host: &str) -> Option<String> {
