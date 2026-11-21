@@ -82,6 +82,8 @@ pub struct Attend<'a, D: Dense> {
     head_dim: DimExpr,
     /// Positions, theta and pairing, if queries and keys rotate.
     rope: Option<(&'a Tensor, f32, Pairs)>,
+    /// The leading width that rotates, and the width kept after.
+    part: Option<[DimExpr; 2]>,
 }
 
 impl<'a, D: Dense> Attend<'a, D> {
@@ -95,6 +97,7 @@ impl<'a, D: Dense> Attend<'a, D> {
             kv_heads,
             head_dim,
             rope: None,
+            part: None,
         }
     }
 
@@ -102,6 +105,26 @@ impl<'a, D: Dense> Attend<'a, D> {
     pub fn rotary(mut self, positions: &'a Tensor, theta: f32, pairs: Pairs) -> Self {
         self.rope = Some((positions, theta, pairs));
         self
+    }
+
+    /// Only each head's first `turned` rotates. The `kept` rest stays.
+    pub fn partial(mut self, [turned, kept]: [DimExpr; 2]) -> Self {
+        self.part = Some([turned, kept]);
+        self
+    }
+
+    /// Heads `t`, rotated as `rotary` and `partial` set.
+    pub fn rotate(&self, t: Tensor) -> Tensor {
+        let Some((positions, theta, pairs)) = self.rope else {
+            return t;
+        };
+        let Some([turned, kept]) = &self.part else {
+            return t.rope(positions, theta, pairs);
+        };
+        let last = t.ty().rank() as u32 - 1;
+        let front = t.slice(last, 0u64, turned.clone());
+        let back = t.slice(last, turned.clone(), kept.clone());
+        front.rope(positions, theta, pairs).concat(&back)
     }
 
     /// `lead`, then `rest`.
@@ -126,11 +149,9 @@ impl<'a, D: Dense> Attend<'a, D> {
                 self.split(w.apply(h), heads.clone(), self.head_dim.clone()),
                 side,
             );
-            match (self.rope, side) {
-                (Some((positions, theta, pairs)), Side::Query | Side::Key) => {
-                    t.rope(positions, theta, pairs)
-                }
-                _ => t,
+            match side {
+                Side::Query | Side::Key => self.rotate(t),
+                Side::Value => t,
             }
         };
         [
