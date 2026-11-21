@@ -1,7 +1,7 @@
 //! EmbeddingGemma 2: a bidirectional encoder with per-layer embeddings.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Dense, Side, Stack, listed as listed_ports, tokens};
+use crate::shared::{Attend, Dense, SIZES, Side, Stack, listed as listed_ports, tokens};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -55,15 +55,7 @@ impl Config {
             let path = format!("text_config.rope_parameters.{kind}.rope_type");
             k.fixed(&path, json!("default"));
         }
-        let sizes = [
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "head_dim",
-            "intermediate_size",
-        ]
-        .map(|key| k.need(&[&format!("text_config.{key}")]));
+        let sizes = SIZES.map(|key| k.need(&[&format!("text_config.{key}")]));
         let layers = sizes[2];
         let (full_every, full_head_dim) = (full_layers(k, layers), full_heads(k, layers));
         Self {

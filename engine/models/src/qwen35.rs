@@ -2,7 +2,7 @@
 
 use crate::decoder::{Mlp, Swiglu};
 use crate::keys::Keys;
-use crate::shared::{Attend, Stack, part, tokens};
+use crate::shared::{Attend, SIZES, Stack, part, tokens};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tessera_trace::DimName::*;
@@ -53,24 +53,17 @@ impl Config {
             ("attention_bias", json!(false)),
             ("attn_output_gate", json!(true)),
             ("output_gate_type", json!("swish")),
-            ("mtp_num_hidden_layers", json!(0)),
+            ("rope_scaling", json!(null)),
             ("rope_parameters.rope_type", json!("default")),
+            ("rope_parameters.type", json!("default")),
         ];
         for (key, want) in fixed {
             k.fixed(&format!("text_config.{key}"), want.clone());
             k.fixed(key, want);
         }
-        let sizes = [
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "head_dim",
-            "intermediate_size",
-        ]
-        .map(|key| text::<u64>(k, key));
+        let sizes = SIZES.map(|key| text::<u64>(k, key));
         let layers = mixing(k, sizes[2]);
-        let factor: f32 = text(k, "rope_parameters.partial_rotary_factor");
+        let rotary = rotary(k, sizes[4]);
         let linear = Recurrent {
             key_heads: text(k, "linear_num_key_heads"),
             value_heads: text(k, "linear_num_value_heads"),
@@ -81,8 +74,8 @@ impl Config {
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
             kv_heads: text(k, "num_key_value_heads"),
-            rotary: (sizes[4] as f32 * factor) as u64,
-            rope_theta: text(k, "rope_parameters.rope_theta"),
+            rotary,
+            rope_theta: either(k, "rope_parameters.rope_theta", "rope_theta", 1e4),
             eps: text(k, "rms_norm_eps"),
             linear,
             layers,
@@ -95,7 +88,10 @@ impl Config {
 
     pub fn dims(&self) -> Vec<Dim> {
         let (width, l) = (self.stack.head_dim, &self.linear);
-        assert!(self.rotary <= width && self.rotary % 2 == 0, "rotary width");
+        assert!(
+            self.rotary <= width && self.rotary.is_multiple_of(2),
+            "rotary width"
+        );
         let mut own = vec![
             (KvHeads, self.kv_heads),
             (KeyHeads, l.key_heads),
@@ -246,9 +242,38 @@ fn text<T: DeserializeOwned + Default>(k: &mut Keys, key: &str) -> T {
     k.need(&[&format!("text_config.{key}"), key])
 }
 
-/// Each layer's mixer, from `layer_types`.
+/// `first`, else `then`, else `default`, as Hugging Face reads.
+fn either<T: DeserializeOwned>(k: &mut Keys, first: &str, then: &str, default: T) -> T {
+    let then = k.or(&[&format!("text_config.{then}"), then], default);
+    k.or(&[&format!("text_config.{first}"), first], then)
+}
+
+/// The rotary width of a head `width` wide.
+fn rotary(k: &mut Keys, width: u64) -> u64 {
+    let path = "rope_parameters.partial_rotary_factor";
+    let factor: f64 = either(k, path, "partial_rotary_factor", 0.25);
+    let turned = (width as f64 * factor) as u64;
+    if turned > width || !turned.is_multiple_of(2) {
+        k.misfit(path, format!("{turned} of {width} cannot rotate in pairs"));
+    }
+    turned
+}
+
+/// Each layer's mixer, from `layer_types` or the full-layer interval.
 fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
-    let types: Vec<String> = text(k, "layer_types");
+    let types: Vec<String> = k.or(&["text_config.layer_types", "layer_types"], Vec::new());
+    if types.is_empty() {
+        let path = [
+            "text_config.full_attention_interval",
+            "full_attention_interval",
+        ];
+        let every: u64 = k.or(&path, 4);
+        let kind = |l: u64| match (l + 1).is_multiple_of(every.max(1)) {
+            true => Mixing::Full,
+            false => Mixing::Linear,
+        };
+        return (0..layers).map(kind).collect();
+    }
     let mut out = Vec::new();
     for t in &types {
         match t.as_str() {
@@ -322,25 +347,30 @@ impl Qwen35 {
 /// Each row's logits, from tokens and positions `[Seqs, Context]`.
 pub fn forward(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Tensor) -> Tensor {
     let [logits] = m.composite(Composite::Model, || {
-        let mut x = m.embed(tokens, &w.ends.embed);
-        for l in &w.layers {
-            let [out] = m.composite(Composite::Layer, || {
-                let h = norm(&x, &l.common.ln1, c.eps);
-                let mixed = match &l.mixer {
-                    Mixer::Linear(net) => net.apply(m, c, &h),
-                    Mixer::Full(attn) => attn.apply(m, c, &h, positions),
-                };
-                let x = x.add(&mixed);
-                let h = norm(&x, &l.common.ln2, c.eps);
-                let [mlp] = m.composite(Swiglu::KIND, || [l.common.mlp.apply(m, &h)]);
-                [x.add(&mlp)]
-            });
-            x = out;
-        }
-        let h = norm(&x, &w.ends.norm, c.eps);
+        let h = hidden(m, c, w, tokens, positions);
         [h.unembed(w.head.as_ref().unwrap_or(&w.ends.embed))]
     });
     logits
+}
+
+/// Each row's state after the final norm, before the head.
+pub fn hidden(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Tensor) -> Tensor {
+    let mut x = m.embed(tokens, &w.ends.embed);
+    for l in &w.layers {
+        let [out] = m.composite(Composite::Layer, || {
+            let h = norm(&x, &l.common.ln1, c.eps);
+            let mixed = match &l.mixer {
+                Mixer::Linear(net) => net.apply(m, c, &h),
+                Mixer::Full(attn) => attn.apply(m, c, &h, positions),
+            };
+            let x = x.add(&mixed);
+            let h = norm(&x, &l.common.ln2, c.eps);
+            let [mlp] = m.composite(Swiglu::KIND, || [l.common.mlp.apply(m, &h)]);
+            [x.add(&mlp)]
+        });
+        x = out;
+    }
+    norm(&x, &w.ends.norm, c.eps)
 }
 
 /// One forward entry: tokens and positions in, logits out.

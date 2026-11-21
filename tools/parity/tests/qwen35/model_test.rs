@@ -43,6 +43,7 @@ fn configs_read() {
     let sizes = [s.vocab, s.hidden, s.layers, s.heads, s.head_dim, s.ffn];
     assert_eq!(sizes, [248_320, 5120, 64, 24, 256, 17_408]);
     assert_eq!((clef.kv_heads, clef.rotary, clef.tied), (4, 64, false));
+    assert_eq!((clef.rope_theta, clef.eps), (1e7, 1e-6));
     let l = &clef.linear;
     let linear = [l.key_heads, l.value_heads, l.key_dim, l.value_dim, l.window];
     assert_eq!(linear, [16, 48, 128, 128, 4]);

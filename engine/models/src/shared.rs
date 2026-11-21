@@ -210,6 +210,16 @@ pub struct Stack {
     pub steps: Steps,
 }
 
+/// Config keys for `Stack::sized`'s sizes, in its order.
+pub(crate) const SIZES: [&str; 6] = [
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "head_dim",
+    "intermediate_size",
+];
+
 impl Stack {
     /// `[vocab, hidden, layers, heads, head_dim, ffn]`, then the launch bounds.
     pub fn sized(
