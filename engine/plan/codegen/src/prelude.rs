@@ -280,9 +280,31 @@ pub fn tiles(_: u32, _: u32) -> Tiles {
     device()
 }
 
+/// A tile operand: group memory, or a held slab.
+pub trait Slab {}
+
+impl Slab for Shared<f32> {}
+
+/// A SIMD group's slab of A, kept in registers.
+pub struct Held;
+
+impl Slab for Held {}
+
+/// An empty `rows` by `depth` slab, both fixed when built.
+pub fn held(_: u32, _: u32) -> Held {
+    device()
+}
+
+impl Held {
+    /// Copies the slab from `a` at `at`, by `stride`.
+    pub fn hold(&mut self, _: &Shared<f32>, _: u32, _: u32) {
+        device()
+    }
+}
+
 impl Tiles {
     /// Adds `depth` staged columns of `a` times `b`.
-    pub fn block(&mut self, _: &Shared<f32>, _: u32, _: &Shared<f32>, _: u32, _: u32, _: u32) {
+    pub fn block(&mut self, _: &impl Slab, _: u32, _: &Shared<f32>, _: u32, _: u32, _: u32) {
         device()
     }
 

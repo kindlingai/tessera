@@ -58,6 +58,8 @@ pub(crate) struct Cover<'a> {
     pub(crate) wanted: Vec<Vec<u32>>,
     /// Nodes without a proposing rule, deepest first.
     pub(crate) bare: Vec<T>,
+    /// Whether weights are too many for the cache.
+    pub(crate) streams: bool,
 }
 
 impl Cover<'_> {
@@ -134,7 +136,7 @@ impl Cover<'_> {
             if let Term::Op(Op::Append(index)) = n.term {
                 let scatter = Scatter::at(self.tree, t, index)?;
                 let len = scatter.rows * scatter.width;
-                cost += self.device.seconds_in(zone, &scatter, len);
+                cost += self.device.seconds_in(zone, &scatter, len, false);
             }
             return Some(Choice {
                 rule: "append",
@@ -242,7 +244,9 @@ impl Cover<'_> {
             let form = d.writes.map_or(F32_FORM, |w| self.tree.node(w).form);
             return self.device.all_reduce(form.bytes(d.len));
         }
-        Some(self.device.seconds_in(zone, &*d.kernel, d.len))
+        let weight = |r: &Read| matches!(r, Read::Node(t) if self.tree.weighed(*t));
+        let cold = self.streams && d.reads.iter().any(weight);
+        Some(self.device.seconds_in(zone, &*d.kernel, d.len, cold))
     }
 
     /// Seconds to widen reads the drafts cannot take as stored.
@@ -255,7 +259,8 @@ impl Cover<'_> {
                 if form.narrow() && !d.kernel.accepts(i, form) {
                     let len = self.tree.elements(*t);
                     let widen = Widen { len, form };
-                    seconds += self.device.seconds_in(zone, &widen, len);
+                    let cold = self.streams && self.tree.weighed(*t);
+                    seconds += self.device.seconds_in(zone, &widen, len, cold);
                 }
             }
         }

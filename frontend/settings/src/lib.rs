@@ -22,11 +22,12 @@ struct Env {
     kernels: Option<PathBuf>,
 }
 
-/// Reads the `TESSERA_` variables. Bad values panic.
+/// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
 #[allow(clippy::disallowed_methods, reason = "the one sanctioned reader")]
 pub fn read() -> Settings {
+    let set = std::env::vars().filter(|(_, v)| !v.is_empty());
     let env: Env = envy::prefixed("TESSERA_")
-        .from_env()
+        .from_iter(set)
         .unwrap_or_else(|e| panic!("TESSERA_ environment: {e}"));
     let backend = match env.backend.as_deref() {
         Some("host") => Pick::Host,
@@ -56,6 +57,14 @@ pub fn read() -> Settings {
         profile: env.profile.filter(|n| *n > 0),
         kernels: env.kernels,
     }
+}
+
+/// The Hugging Face host.
+pub const HUB: &str = "huggingface.co";
+
+/// The hub URL of `file` in `repo` at `revision`.
+pub fn resolve(repo: &str, revision: &str, file: &str) -> String {
+    format!("https://{HUB}/{repo}/resolve/{revision}/{file}")
 }
 
 /// The proxy for `host`, or `None` to fetch directly.

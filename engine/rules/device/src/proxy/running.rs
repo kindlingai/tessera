@@ -3,8 +3,10 @@
 use super::page::Page;
 use super::wired::Wired;
 use super::{Error, Fetched, Fetcher, Proxy};
+#[cfg(target_arch = "aarch64")]
+use std::arch::asm;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tessera_engine_comm::Link as Comm;
@@ -65,11 +67,36 @@ fn serve<L: Comm>(
                 return Err(Error::Link("puts still in flight at stop".into()));
             }
         }
-        match idle > SPINS {
-            true => std::thread::yield_now(),
-            false => std::hint::spin_loop(),
+        match (idle > SPINS, proxy.open()) {
+            (true, false) => nap(page.epoch(), proxy.epoch),
+            (true, true) => std::thread::yield_now(),
+            (false, _) => std::hint::spin_loop(),
         }
     }
+}
+
+/// Waits until `word` moves from `seen`, or an event comes.
+#[cfg(target_arch = "aarch64")]
+fn nap(word: &AtomicU64, seen: u64) {
+    let now: u64;
+    // The exclusive load arms the monitor that wakes `wfe`.
+    unsafe { asm!("ldaxr {now}, [{at}]", now = out(reg) now, at = in(reg) word.as_ptr()) };
+    if now == seen {
+        unsafe { asm!("wfe") };
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn nap(_: &AtomicU64, _: u64) {
+    std::thread::yield_now();
+}
+
+/// Wakes a thread in `nap`.
+fn wake() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!("sev")
+    };
 }
 
 impl<L: Comm + 'static> Running<L> {
@@ -100,6 +127,7 @@ impl<L> Running<L> {
     /// Waits for puts in flight, then ends the thread.
     pub fn stop(mut self) -> Stopped<L> {
         self.stop.store(true, Ordering::Release);
+        wake();
         let thread = self.thread.take().expect("a running thread");
         match thread.join() {
             Ok((wired, ended)) => (Some(wired), ended),
@@ -111,6 +139,7 @@ impl<L> Running<L> {
 impl<L> Drop for Running<L> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        wake();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

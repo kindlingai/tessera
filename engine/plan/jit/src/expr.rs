@@ -714,6 +714,10 @@ impl Lowerer<'_, '_> {
                 self.call("mix_f32", &call);
                 Val::S(self.iconst(types::I8, 0))
             }
+            Intrinsic::Bf16Pair => {
+                let v = self.floats(args, t)?;
+                Val::S(self.call("bf16_pair", &[v[0], v[1]]).expect("a word"))
+            }
             Intrinsic::F16 | Intrinsic::E4M3 | Intrinsic::E2M1 => {
                 let v = self.u32s(args, t)?;
                 let f = match i {

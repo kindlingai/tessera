@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
-use tessera_lower::{Cache, Device};
+use tessera_lower::{Cache, Device, Slot};
 use tessera_run::{Run, open};
 
 mod guide;
@@ -28,6 +28,7 @@ pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 
 // The front end reaches the engine crates only through these.
+pub use tessera_device::sums;
 pub use tessera_engine_comm as comm;
 pub use tessera_engine_settings::{Backend, Memory};
 pub use tessera_graph::{Bf16, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
@@ -35,7 +36,7 @@ pub use tessera_interp::{Tensor, bind, fold};
 pub use tessera_lower::{Pick, Pins, Recipe, Settings, Weight, form};
 pub use tessera_mem::form as storage;
 pub use tessera_mem::{block, trellis};
-pub use tessera_models::{Stack, clip, decoder, eg2, flux2, keys, mla, sprite, tagger, vae};
+pub use tessera_models::{Stack, Steps, clip, decoder, eg2, flux2, keys, mla, sprite, tagger, vae};
 pub use tessera_run::{gpu, pinning};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;
@@ -50,6 +51,16 @@ pub struct Request {
     /// Rules on each token. Masks need a mask port.
     #[serde(skip)]
     pub guide: Option<Box<dyn Guide>>,
+    /// Prompt rows to score. Any reads replace decoding.
+    #[serde(default)]
+    pub reads: Vec<Read>,
+}
+
+/// The logits after prompt row `row`, over `ids`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Read {
+    pub row: u32,
+    pub ids: Vec<u32>,
 }
 
 /// Why an answer ended.
@@ -64,11 +75,13 @@ pub enum Reason {
 }
 
 /// One decoded token, or the end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     /// Prompt rows that kept rows cover. Sent before any token.
     Kept(usize),
     Token(u32),
+    /// Each read's logits, in the request's order.
+    Scores(Vec<Vec<f32>>),
     Done(Reason),
 }
 
@@ -95,6 +108,8 @@ pub enum Error {
     Kept(#[from] tessera_kv::Error),
     #[error("a slot's next row is in another run's page")]
     SharedPage,
+    #[error("the graph has no entry that scores these ids")]
+    Scores,
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.
@@ -335,8 +350,47 @@ impl Engine {
         self.launch(rows, &picks, Head::Full(Some(bits)))
     }
 
+    /// Each pick's logits over its `ids`, in one launch.
+    pub fn scores(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        ids: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        let fits = |l: &Vec<u32>| !l.is_empty() && l.len() <= FEW;
+        if !self.sparse || ids.len() != picks.len() || !ids.iter().all(fits) {
+            return Err(Error::Scores);
+        }
+        let k = ids
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .next_power_of_two();
+        let mut flat = Vec::with_capacity(ids.len() * k);
+        for list in ids {
+            flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
+        }
+        let outputs = self.run(rows, picks, Head::Sparse(flat, k))?;
+        let all = self.runner.read(outputs[1])?;
+        let all = all.floats().map_err(tessera_run::Error::from)?;
+        let each = all.chunks(k).zip(ids);
+        Ok(each.map(|(row, list)| row[..list.len()].to_vec()).collect())
+    }
+
     /// One launch of `rows`, the likeliest ids after `picks`.
     fn launch(&mut self, rows: &[Row], picks: &[u32], head: Head) -> Result<Vec<u32>, Error> {
+        let outputs = self.run(rows, picks, head)?;
+        let ran = Instant::now();
+        let mut ids = self.runner.ids(outputs[0])?;
+        ids.truncate(picks.len());
+        self.runner.note("engine: ids", ran.elapsed().as_secs_f64());
+        self.report();
+        Ok(ids)
+    }
+
+    /// One launch of `rows`. Returns the plan's output slots.
+    fn run(&mut self, rows: &[Row], picks: &[u32], head: Head) -> Result<Vec<Slot>, Error> {
         if rows.is_empty() {
             return Err(Error::Rows);
         }
@@ -380,7 +434,7 @@ impl Engine {
             &[Context, Segments],
             &self.device,
         )?;
-        let out = plan.outputs[0].slot;
+        let outputs = plan.outputs.iter().map(|o| o.slot).collect();
         self.runner.replan(plan)?;
         let planned = Instant::now();
         let table = plan.table.zip(self.lanes.as_mut());
@@ -393,20 +447,16 @@ impl Engine {
         let fed = Instant::now();
         self.runner.submit(0..self.runner.plan().steps.len())?;
         let ran = Instant::now();
-        let mut ids = self.runner.ids(out)?;
-        ids.truncate(picks.len());
         let phases = [
             ("engine: plan", start, planned),
             ("engine: feed", planned, fed),
             ("engine: steps", fed, ran),
-            ("engine: ids", ran, Instant::now()),
-            ("engine: launch", start, Instant::now()),
+            ("engine: launch", start, ran),
         ];
         for (name, from, to) in phases {
             self.runner.note(name, (to - from).as_secs_f64());
         }
-        self.report();
-        Ok(ids)
+        Ok(outputs)
     }
 
     /// Seconds per kernel and phase since the last take.

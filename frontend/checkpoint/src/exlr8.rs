@@ -236,7 +236,7 @@ impl Release {
 
     /// Streams `owner/name` on Hugging Face at `revision`.
     pub fn remote(repo: &str, revision: &str) -> Self {
-        let url = format!("https://huggingface.co/{repo}/resolve/{revision}/");
+        let url = tessera_frontend_settings::resolve(repo, revision, "");
         Self::new(Where::Url(url))
     }
 

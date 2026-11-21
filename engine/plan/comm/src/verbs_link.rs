@@ -3,7 +3,7 @@
 use crate::fabric::Fabric;
 use crate::ibv::{self, SendWr, Sge, Wc};
 use crate::link::{Link, Put, Span, fit};
-use crate::reduce::Pinning;
+use crate::pin::Pinning;
 use crate::verbs::{Engine, Region};
 use crate::{Error, Transport};
 use std::collections::HashMap;

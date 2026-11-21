@@ -367,6 +367,10 @@ pub extern "C" fn e2m1(w: u32, low: u32) -> f32 {
     lockstep::e2m1(w, low)
 }
 
+pub extern "C" fn bf16_pair(hi: f32, lo: f32) -> u32 {
+    lockstep::bf16_pair(hi, lo)
+}
+
 /// Lane arrays, as compiled code keeps them on its stack.
 type Lanes<T> = [T; THREADS];
 
@@ -434,6 +438,45 @@ pub unsafe extern "C" fn tiles_each(
         *v = value;
     }
     u8::from(on)
+}
+
+/// Group memory that compiled code passes.
+unsafe fn group<'a>(p: *const f32, len: usize) -> &'a [f32] {
+    // SAFETY: compiled code passes its own memory.
+    unsafe { std::slice::from_raw_parts(p, len) }
+}
+
+pub unsafe extern "C" fn tiles_hold(
+    h: *mut Tiles,
+    a: *const f32,
+    a_len: usize,
+    a_at: *const Lanes<u32>,
+    stride: *const Lanes<u32>,
+    mask: *const Lanes<bool>,
+    n: usize,
+) {
+    // SAFETY: compiled code passes its own lane arrays.
+    unsafe { (*h).hold(group(a, a_len), &*a_at, &*stride, &*mask, n) }
+}
+
+#[allow(clippy::too_many_arguments, reason = "mirrors the tile statement")]
+pub unsafe extern "C" fn tiles_block_held(
+    t: *mut Tiles,
+    h: *const Tiles,
+    b: *const f32,
+    b_len: usize,
+    b_at: *const Lanes<u32>,
+    stride: *const Lanes<u32>,
+    depth: usize,
+    mask: *const Lanes<bool>,
+    n: usize,
+    precision: *const Precision,
+) {
+    // SAFETY: the tile objects outlive the group.
+    unsafe {
+        let b = group(b, b_len);
+        (*t).block_held(&*h, b, &*b_at, &*stride, depth, &*mask, n, *precision);
+    }
 }
 
 #[allow(clippy::too_many_arguments, reason = "mirrors the tile statement")]

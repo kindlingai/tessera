@@ -6,9 +6,15 @@ license.workspace = true
 publish.workspace = true
 description = "Device headers, import scanner, host proxy and launcher for recipe kernels"
 
+[features]
+default = []
+cuda = ["tessera-gpukit/cuda"]
+rocm = ["tessera-gpukit/rocm"]
+
 [dependencies]
 tessera-engine-comm = { workspace = true }
 tessera-gpukit = { workspace = true }
+tessera-run = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]

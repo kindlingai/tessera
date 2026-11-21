@@ -1,7 +1,9 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Side, Stack, listed, pick, sparse_ports, step_ports, swiglu, tokens};
+use crate::shared::{
+    Attend, Side, Stack, Steps, listed, pick, sparse_ports, step_ports, swiglu, tokens,
+};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -429,7 +431,8 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
     let w: Decoder<N, M> = tessera_trace::declare(&m);
-    let ([tokens, positions, slots], allowed) = step_ports(&m, c.stack.masked);
+    let masked = c.stack.steps == Steps::Masked;
+    let ([tokens, positions, slots], allowed) = step_ports(&m, masked);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
     let cache = |_: &Layer<N, M>| [m.kept(ty.clone()), m.kept(ty.clone())];
     let kept: Vec<Cache> = w.layers.iter().map(cache).collect();
@@ -444,7 +447,7 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     };
     let logits = pass.logits(&w, &tokens, Some(&kept));
     let full = pick(&m, &logits, allowed.as_ref());
-    if !c.stack.masked {
+    if c.stack.steps == Steps::Plain {
         return full;
     }
     // A second entry picks among candidate ids.

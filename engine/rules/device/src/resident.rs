@@ -153,7 +153,7 @@ struct Places {
     status: u64,
 }
 
-fn backend<D: Device>() -> Result<Backend, Error> {
+pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
     match D::BACKEND {
         Gpu::Cuda => Ok(Backend::Cuda),
         Gpu::Rocm => Ok(Backend::Hip),

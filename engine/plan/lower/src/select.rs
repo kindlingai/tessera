@@ -141,6 +141,7 @@ pub(crate) fn select_upto(
             .collect(),
         wanted: vec![Vec::new(); tree.len()],
         bare: Vec::new(),
+        streams: device.streams(tree.weight_bytes()),
     };
     for (t, _) in &tree.outputs {
         cover.wanted[t.0 as usize].push(EDGE);

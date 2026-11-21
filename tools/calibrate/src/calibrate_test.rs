@@ -81,7 +81,7 @@ fn cpu_matmuls_compete() {
         .hosted(&host);
     let (step, _) = &timed[0];
     let (k, len) = (&*step.kernel, step.write.len);
-    assert_eq!(gpu.seconds_in(1, k, len), host.seconds(k, len));
+    assert_eq!(gpu.seconds_in(1, k, len, false), host.seconds(k, len));
 }
 
 /// A saved bench reads back, and names what got slower.

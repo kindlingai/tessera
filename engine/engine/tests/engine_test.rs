@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 use tessera_engine::{
-    Allowed, Batch, Engine, Event, Fair, Fault, Guide, Prefix, Reason, Request, Row,
+    Allowed, Batch, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row, Steps,
 };
 use tessera_graph::{Graph, Op};
 use tessera_interp::{Store, Tensor, run_kept};
@@ -54,32 +54,32 @@ fn reference(g: &Graph, weights: &[Tensor], prompt: &[u32], n: usize) -> Vec<u32
 
 /// A toy engine with `slots` lanes, its graph and weights.
 fn open(seed: u64, slots: u64, settings: &Settings) -> (Graph, Vec<Tensor>, Engine) {
-    open_on(seed, slots, false, Recipe::default(), settings)
+    open_on(seed, slots, Steps::Plain, Recipe::default(), settings)
 }
 
-/// The graph stays unmasked. The engine's takes masks if `masked`.
+/// The graph stays plain. The engine's takes `steps`.
 fn open_on(
     seed: u64,
     slots: u64,
-    masked: bool,
+    steps: Steps,
     recipe: Recipe,
     settings: &Settings,
 ) -> (Graph, Vec<Tensor>, Engine) {
-    open_sized(seed, [slots, 16], masked, recipe, settings)
+    open_sized(seed, [slots, 16], steps, recipe, settings)
 }
 
 /// As `open_on`, with `[slots, context]`.
 fn open_sized(
     seed: u64,
     [slots, context]: [u64; 2],
-    masked: bool,
+    steps: Steps,
     recipe: Recipe,
     settings: &Settings,
 ) -> (Graph, Vec<Tensor>, Engine) {
     let mut c = Config::toy(slots, context);
     let g = stepper::<Norm, Swiglu>(&c);
     let weights = weights(&g, &mut Noise(seed));
-    c.stack.masked = masked;
+    c.stack.steps = steps;
     let graph = stepper::<Norm, Swiglu>(&c);
     let mut engine = Engine::open(graph, context as usize, &recipe, settings).unwrap();
     let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
@@ -97,7 +97,7 @@ fn events(engine: &mut Engine, request: Request) -> Vec<Event> {
 fn ids(events: &[Event]) -> Vec<u32> {
     let id = |e: &Event| match e {
         Event::Token(id) => Some(*id),
-        Event::Kept(_) | Event::Done(_) => None,
+        _ => None,
     };
     events.iter().filter_map(id).collect()
 }
@@ -126,7 +126,7 @@ fn answers_match(settings: &Settings) {
         tokens: prompt.to_vec(),
         max_tokens,
         stop,
-        guide: None,
+        ..Request::default()
     };
     let got = events(&mut engine, request(6, Vec::new()));
     assert_eq!(
@@ -195,7 +195,7 @@ fn rows_mix_slots() {
         .iter()
         .flat_map(|s| recipes.iter().map(move |r| (s, r)));
     for (settings, recipe) in pairs {
-        let (g, weights, mut engine) = open_on(13, 4, false, recipe.clone(), settings);
+        let (g, weights, mut engine) = open_on(13, 4, Steps::Plain, recipe.clone(), settings);
         // Two prompts at once, decodes side by side, then alone.
         let launches = [
             vec![row(2, 5, 0), row(2, 7, 1), row(0, 9, 0)],
@@ -237,7 +237,7 @@ fn batched(seed: u64, slots: u64, budget: usize, cancel_after: Option<usize>, s:
             tokens: prompt.to_vec(),
             max_tokens: 3 + i,
             stop: Vec::new(),
-            guide: None,
+            ..Request::default()
         };
         let (events, receiver) = std::sync::mpsc::channel();
         let mut sent = 0;
@@ -366,7 +366,7 @@ fn paged_slots_share() {
         ..Recipe::default()
     };
     for s in runs() {
-        let (g, weights, mut engine) = open_sized(37, [2, 64], false, recipe.clone(), &s);
+        let (g, weights, mut engine) = open_sized(37, [2, 64], Steps::Plain, recipe.clone(), &s);
         let mut batch = Batch::new(&mut engine, Box::new(Fair));
         batch.reuse();
         batch.budget(1);
@@ -434,14 +434,44 @@ impl Guide for Fixed {
 }
 
 #[test]
+fn reads_score() {
+    for s in runs() {
+        let (g, weights, mut engine) = open_on(23, 1, Steps::Scored, Recipe::default(), &s);
+        let rows = [row(0, 3, 0), row(0, 9, 1), row(0, 4, 2)];
+        let full = run_kept(&g, &weights, &mut Store::default(), 0, &feeds(&rows)).unwrap();
+        let logits = full[1].floats().unwrap();
+        let read = |row, ids: &[u32]| Read {
+            row,
+            ids: ids.to_vec(),
+        };
+        let reads = vec![read(0, &[5, 2]), read(2, &[30, 1, 7])];
+        let request = Request {
+            tokens: vec![3, 9, 4],
+            reads: reads.clone(),
+            ..Request::default()
+        };
+        let got = events(&mut engine, request);
+        let [Event::Scores(scores), Event::Done(Reason::Stop)] = got.as_slice() else {
+            panic!("{got:?}");
+        };
+        for (read, scored) in reads.iter().zip(scores) {
+            for (id, s) in read.ids.iter().zip(scored) {
+                let want = logits[32 * read.row as usize + *id as usize];
+                assert!((want - s).abs() < 1e-3 * want.abs().max(1.0), "{want} {s}");
+            }
+        }
+    }
+}
+
+#[test]
 fn heads_agree() {
     let mut c = Config::toy(1, 16);
-    c.stack.masked = true;
+    c.stack.steps = Steps::Masked;
     let trimmed = tessera_graph::trim(&stepper::<Norm, Swiglu>(&c), 0).unwrap();
     assert_eq!(trimmed.entries[0].inputs[3].ty.shape.0[0], Picks.into());
     let set = [2u32, 11, 17, 30];
     for s in runs() {
-        let (g, weights, mut engine) = open_on(29, 1, true, Recipe::default(), &s);
+        let (g, weights, mut engine) = open_on(29, 1, Steps::Masked, Recipe::default(), &s);
         let rows = [row(0, 3, 0), row(0, 9, 1)];
         let got = run_kept(&g, &weights, &mut Store::default(), 0, &feeds(&rows)).unwrap();
         let logits = got[1].floats().unwrap();

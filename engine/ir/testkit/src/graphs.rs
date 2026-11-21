@@ -6,12 +6,19 @@ use tessera_graph::{
 };
 use tessera_trace::{
     Act, Embed, EntryKind, Linear, Linears, Mask, Model, Norm, Pairs, Taps, Vector, Weights,
-    declare,
+    declare, each,
 };
 
 #[derive(Weights)]
 struct Layer {
     #[shape(Hidden, Ffn)]
+    w: Linear,
+}
+
+/// The way back in a chain: from `Ffn` to `Hidden`.
+#[derive(Weights)]
+struct Back {
+    #[shape(Ffn, Hidden)]
     w: Linear,
 }
 
@@ -98,6 +105,18 @@ pub fn linear(bounded: &[Dim], k: u64, n: u64) -> Graph {
     let w: Layer = declare(&m);
     let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
     m.finish([(Role::Logits, &x.matmul(&w.w))])
+}
+
+/// `pairs` links of `k` to `n` and back, unshared weights.
+pub fn chain(bounded: &[Dim], k: u64, n: u64, pairs: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, k), (Ffn, n), (Layers, pairs)]);
+    let out: Vec<Layer> = each(&m, "out", Layers, |_| Vec::new());
+    let back: Vec<Back> = each(&m, "back", Layers, |_| Vec::new());
+    let [mut x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
+    for (o, b) in out.iter().zip(&back) {
+        x = x.matmul(&o.w).matmul(&b.w);
+    }
+    m.finish([(Role::Logits, &x)])
 }
 
 /// Per-head blocks of one matrix, one side swapped.

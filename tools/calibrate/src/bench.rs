@@ -153,6 +153,23 @@ pub fn sentinels(settings: &Settings) -> Result<Vec<f64>, Error> {
     Ok(seconds)
 }
 
+/// Sentinel sets timed again until two agree, so clocks settle.
+pub fn settled(settings: &Settings) -> Result<Vec<f64>, Error> {
+    let mut last = sentinels(settings)?;
+    for _ in 0..SETTLE {
+        let now = sentinels(settings)?;
+        if drift(&last, &now) < AGREE {
+            return Ok(now);
+        }
+        last = now;
+    }
+    Ok(last)
+}
+
+/// Most sentinel sets `settled` times, and the agreement it needs.
+const SETTLE: usize = 20;
+const AGREE: f64 = 0.02;
+
 /// The largest change between two sentinel runs, as a share.
 pub fn drift(first: &[f64], last: &[f64]) -> f64 {
     let change = first.iter().zip(last).map(|(a, b)| (b / a - 1.0).abs());

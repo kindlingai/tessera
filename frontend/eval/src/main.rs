@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 use tessera_checkpoint::exlr8::Release;
 use tessera_checkpoint::{File, Gguf, Offer};
-use tessera_engine::{Engine, Pins, Recipe, Row};
+use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -192,7 +192,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
         &args.model,
         [slots, args.context as u64],
         &rules,
-        false,
+        Steps::Plain,
         &Default::default(),
     )?;
     let recipe = match &args.recipe {

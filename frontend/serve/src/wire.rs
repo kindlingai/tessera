@@ -91,13 +91,17 @@ fn paths(path: &str, bag: &Bag) -> impl Iterator<Item = String> {
     bag.keys().map(move |k| format!("{path}.{k}"))
 }
 
-/// The body. Unknown fields warn, or refuse if strict.
+/// The body as one JSON object.
+pub(crate) fn object(body: &[u8]) -> Result<Map<String, Value>, Refusal> {
+    serde_json::from_slice(body).map_err(|e| refuse(400, e.to_string(), None))
+}
+
+/// The body, for this model only.
 pub(crate) fn parse<T: DeserializeOwned + Bagged>(
     model: &Model,
     body: &[u8],
 ) -> Result<T, Refusal> {
-    let body: Map<String, Value> =
-        serde_json::from_slice(body).map_err(|e| refuse(400, e.to_string(), None))?;
+    let body = object(body)?;
     match body.get("model") {
         None | Some(Value::Null) => {}
         Some(Value::String(m)) if *m == model.info.name => {}
@@ -107,6 +111,14 @@ pub(crate) fn parse<T: DeserializeOwned + Bagged>(
             return Err(refuse(404, message, Some("model")));
         }
     }
+    fields(model, body)
+}
+
+/// The body's fields. Unknown fields warn, or refuse if strict.
+pub(crate) fn fields<T: DeserializeOwned + Bagged>(
+    model: &Model,
+    body: Map<String, Value>,
+) -> Result<T, Refusal> {
     let parsed: T = serde_json::from_value(Value::Object(body))
         .map_err(|e| refuse(400, e.to_string(), None))?;
     let (top, nested) = parsed.bags();

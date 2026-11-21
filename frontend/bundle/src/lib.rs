@@ -33,7 +33,7 @@ use tessera_checkpoint::{Offer, Shards, Stored};
 use tessera_engine::decoder::{self, Config, Moe, Swiglu};
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Norm, Pins, Tensor, Weight};
+use tessera_engine::{Graph, Norm, Pins, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -308,28 +308,34 @@ const WIDTH: u32 = 3;
 
 /// Reads a model directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
-    load_named(dir, [slots, context], &[], false, &Overrides::default())
+    load_named(
+        dir,
+        [slots, context],
+        &[],
+        Steps::Plain,
+        &Overrides::default(),
+    )
 }
 
-/// The user's name rules go last. `masked` adds mask ports.
+/// The user's name rules go last. `steps` adds entry ports.
 pub fn load_named(
     dir: &Path,
     [slots, context]: [u64; 2],
     user: &[Rule],
-    masked: bool,
+    steps: Steps,
     overrides: &Overrides,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
-        return gguf::load(dir, slots, context, user, masked);
+        return gguf::load(dir, slots, context, user, steps);
     }
     let json = std::fs::read_to_string(dir.join("config.json"))?;
     if mla::config(&json, slots, context).is_ok() {
-        let release = mla::stepping(dir, [slots, context], WIDTH, user, masked)?;
+        let release = mla::stepping(dir, [slots, context], WIDTH, user, steps)?;
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
     let (arch, mut config) = config(dir, [slots, context], overrides)?;
-    config.stack.masked = masked;
+    config.stack.steps = steps;
     let graph = stepper(&arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let shards = Shards::open(dir)?;

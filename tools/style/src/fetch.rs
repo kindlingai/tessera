@@ -3,8 +3,9 @@
 use std::io::Read;
 use std::path::Path;
 
-const HOST: &str = "huggingface.co";
-const REPO: &str = "https://huggingface.co/spacy/en_core_web_sm/resolve";
+use tessera_frontend_settings::{HUB, proxy, resolve};
+
+const REPO: &str = "spacy/en_core_web_sm";
 /// en_core_web_sm 3.7.1. The parity tests check this revision.
 pub const REVISION: &str = "8fb6f8155286360bf5486fe399e2738d1df7ded2";
 /// Files for the tokenizer and the tagger.
@@ -16,9 +17,9 @@ const FILES: [&str; 5] = [
     "vocab/lookups.bin",
 ];
 
-/// An agent on the environment's proxy, if `HOST` has one.
+/// An agent on the hub's proxy, if any.
 fn agent() -> Result<ureq::Agent, String> {
-    match tessera_frontend_settings::proxy(HOST) {
+    match proxy(HUB) {
         None => Ok(ureq::Agent::new()),
         Some(url) => ureq::Proxy::new(&url)
             .map(|p| ureq::AgentBuilder::new().proxy(p).build())
@@ -29,7 +30,7 @@ fn agent() -> Result<ureq::Agent, String> {
 pub fn fetch(dir: &Path) -> Result<(), String> {
     let agent = agent()?;
     for name in FILES {
-        let url = format!("{REPO}/{REVISION}/{name}");
+        let url = resolve(REPO, REVISION, name);
         let mut bytes = Vec::new();
         let response = agent.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
         response

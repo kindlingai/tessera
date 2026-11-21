@@ -98,6 +98,7 @@ helpers! {
     f16(I32, I32) -> F32;
     e4m3(I32, I32) -> F32;
     e2m1(I32, I32) -> F32;
+    bf16_pair(F32, F32) -> I32;
     shfl_xor(P, P, P, P, P);
     sum32(P, P, P, P);
     tiles_new(P, P, P, P) -> P;
@@ -108,6 +109,8 @@ helpers! {
     tiles_scale(P, P, P, F32);
     tiles_each(P, P, P, I8, P, P, P) -> I8;
     tiles_block(P, P, P, P, P, P, P, P, P, P, P, P, P, P);
+    tiles_hold(P, P, P, P, P, P, P);
+    tiles_block_held(P, P, P, P, P, P, P, P, P, P);
 }
 
 fn helper(name: &str) -> &'static Helper {

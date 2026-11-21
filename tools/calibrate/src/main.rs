@@ -51,7 +51,7 @@ const DRIFT: f64 = 0.1;
 /// Probes the chip, times the grid, restarts the stored file.
 fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
-    let first = bench::sentinels(settings)?;
+    let first = bench::settled(settings)?;
     let readings = read(&suite(), settings)?;
     let cluster = links(settings)?;
     let mut device = Device::guess(settings);
@@ -81,12 +81,26 @@ fn run(settings: &Settings) -> Result<(), Box<dyn Error>> {
     }
     room(&pool, &timed);
     hops(&cluster);
+    println!("cold over warm, by kernel:");
+    for (kernel, count, ratio) in device.colder() {
+        println!("  {kernel:24} {count:4} samples  {ratio:.2}x");
+    }
     let (noisy, drift) = (device.noisy(NOISY), bench::drift(&first, &last));
     println!(
         "{:.0}% of timed seconds spread past {:.0}%; sentinels moved {:.1}%",
         noisy * 100.0,
         NOISY * 100.0,
         drift * 100.0
+    );
+    let us = |s: &[f64]| {
+        s.iter()
+            .map(|t| format!("{:.0}", t * 1e6))
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "sentinels first {:?} us, last {:?} us",
+        us(&first),
+        us(&last)
     );
     if drift > DRIFT {
         let moved = format!("{:.0}%", drift * 100.0);

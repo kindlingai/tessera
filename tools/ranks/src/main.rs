@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use tessera_bundle::Weights;
-use tessera_engine_comm::{Fabric, Transport};
-use tessera_frontend_comm::{CAPACITY, meet, ports, shm};
+use tessera_device::sums::{self, Sum};
+use tessera_engine_comm::{Fabric, ShmLink, Transport};
+use tessera_frontend_comm::{CAPACITY, grid_flag, meet, ports, shared, shm};
 use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::shard;
 use tessera_interp::Tensor;
@@ -21,9 +22,10 @@ use tessera_trace::Norm;
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS]
+  [--stub ROUNDS] [--sums host|grid]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
-  ranks meet over the sockets or the file.
+  ranks meet over the sockets or the file. --sums grid runs them in a
+  persistent grid per rank, over that fabric or the file.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.";
@@ -47,6 +49,8 @@ struct Args {
     fabric: Option<Fabric>,
     /// Sums for the persistent-grid stub, instead of a model.
     stub: Option<u32>,
+    /// The model's sums run in a persistent grid.
+    grid: bool,
 }
 
 fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
@@ -64,6 +68,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         repeat: 1,
         fabric: None,
         stub: None,
+        grid: false,
     };
     while let Some(flag) = given.next() {
         let value = given.next()?;
@@ -81,6 +86,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--backend" => args.host = value == "host" || value == "cpu",
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
+            "--sums" => args.grid = grid_flag(&value)?,
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
@@ -186,17 +192,33 @@ fn model(name: &str, fixture: &Path, n: u64) -> Result<Loaded, Box<dyn std::erro
     Ok((g, Weights::Held(weights), pins))
 }
 
+type Joined = (Box<dyn Transport>, Option<Box<dyn Sum>>);
+
 /// The sums' transport: RDMA when ports are given.
 fn join(
     args: &Args,
     settings: &tessera_lower::Settings,
-) -> Result<Box<dyn Transport>, Box<dyn std::error::Error>> {
-    let met: Box<dyn Transport> = match &args.shm {
+) -> Result<Joined, Box<dyn std::error::Error>> {
+    let mut met: Box<dyn Transport> = match &args.shm {
         Some(path) => Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?),
         None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
-    let [sums, _] = tessera_frontend_comm::join(met, args.fabric.as_ref(), settings)?;
-    Ok(sums)
+    if args.grid {
+        let grid = match (&args.shm, &args.fabric) {
+            (Some(path), _) => {
+                let (rank, ranks) = (args.rank, args.ranks as u32);
+                let regions = sums::regions(ranks);
+                let room = ShmLink::room(ranks, &regions);
+                let file = shared(&path.with_extension("grid"), rank, room)?;
+                sums::open(settings.gpu(), ShmLink::over(rank, ranks, file, &regions)?)?
+            }
+            (None, Some(fabric)) => tessera_frontend_comm::grid(&mut *met, fabric, settings)?,
+            (None, None) => return Err("--sums grid needs --shm or --verbs".into()),
+        };
+        return Ok((met, Some(grid)));
+    }
+    let [sums, _] = tessera_frontend_comm::join(met, args.fabric.as_ref())?;
+    Ok((sums, None))
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -272,8 +294,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         start.elapsed().as_secs_f64()
     );
 
-    let transport = join(args, &settings)?;
-    let mut rank = Rank::open(plan, &settings, transport)?;
+    let (transport, grid) = join(args, &settings)?;
+    let mut rank = Rank::open(plan, &settings, transport)?.with_grid(grid);
     let sums = match rank.on_device() {
         true => "on the device",
         false => "on the host",

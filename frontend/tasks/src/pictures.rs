@@ -12,6 +12,8 @@ pub struct Pictures {
     model: Model,
     /// Transformer tokens a side.
     side: usize,
+    /// Pixels a side at each level, the latent first.
+    sides: Vec<usize>,
 }
 
 /// Each pixel's 3x3 neighbours, row-major. Past the edge reads zero.
@@ -44,7 +46,8 @@ impl Pictures {
         let d = decoder(dir, [side as u64, seqs as u64], config)?;
         let mut model = Model::open(d.graph, &Recipe::default(), settings)?;
         model.load(&d.weights)?;
-        Ok(Self { model, side })
+        let sides = d.sides.iter().map(|&s| s as usize).collect();
+        Ok(Self { model, side, sides })
     }
 
     /// One picture per block of `side^2` tokens.
@@ -52,12 +55,11 @@ impl Pictures {
         let rows = self.side * self.side;
         let n = tokens.len() / (rows * TOKEN as usize);
         let mut inputs = vec![Tensor::f32(vec![n, rows, TOKEN as usize], tokens.to_vec())];
-        for level in 1..=4 {
-            let s = self.side << level;
+        for &s in &self.sides {
             inputs.push(Tensor::u32(vec![s * s, TAPS as usize], neighbours(s)));
         }
         let rgb = self.model.run(&inputs)?[0].floats()?.to_vec();
-        let side = self.side * 16;
+        let side = *self.sides.last().ok_or("a decoder with no levels")?;
         let byte = |v: f32| ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
         let picture = |px: &[f32]| Image {
             width: side,

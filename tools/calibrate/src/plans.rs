@@ -163,7 +163,7 @@ impl<'a> Bench<'a> {
             args.1,
             args.2,
             &mut self.device,
-            self.settings,
+            (self.settings, false),
         )?;
         self.learned += added.len();
         Ok(())

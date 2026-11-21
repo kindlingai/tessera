@@ -17,6 +17,8 @@ pub(crate) enum Kind {
     Array(Ty),
     /// Tile sums over this many rows and columns.
     Tiles(usize, usize),
+    /// A held slab of A: rows and depth.
+    Held(usize, usize),
 }
 
 /// Prints a body as the dialect-neutral text, or as WGSL.
@@ -458,6 +460,35 @@ impl<'a> Printer<'a> {
                 self.line("}".into());
                 self.bind(name, Kind::Tiles(*rows, *cols));
             }
+            Stmt::TileHeld { name, rows, depth } => {
+                self.lane = true;
+                let (tm, tk) = (format!("({rows}) / TILE_M"), format!("({depth}) / TILE_K"));
+                self.line(format!("tile_held {name}[{tm}][{tk}];"));
+                self.bind(name, Kind::Held(*rows, *depth));
+            }
+            Stmt::TileHold {
+                held,
+                a,
+                a_at,
+                stride,
+            } => {
+                let Kind::Held(rows, depth) = self.kind(held) else {
+                    panic!("`{held}` is not a held slab");
+                };
+                let a = format!("({} + {})", self.expr(a), self.expr(a_at));
+                let stride = self.expr(stride);
+                self.line("#pragma unroll".into());
+                self.line(format!("for (u32 i = 0; i < ({rows}) / TILE_M; i++) {{"));
+                self.line("    #pragma unroll".into());
+                self.line(format!(
+                    "    for (u32 kk = 0; kk < {depth}; kk += TILE_K) {{"
+                ));
+                self.line(format!(
+                    "        TILE_HOLD_A({held}[i][kk / TILE_K], {a} + i * TILE_M * ({stride}) + kk, {stride});"
+                ));
+                self.line("    }".into());
+                self.line("}".into());
+            }
             Stmt::TileBlock {
                 acc,
                 a,
@@ -471,6 +502,19 @@ impl<'a> Printer<'a> {
             } => {
                 let Kind::Tiles(rows, cols) = self.kind(acc) else {
                     panic!("`{acc}` is not a tile block");
+                };
+                let held = match a {
+                    Expr::Var(name) => match self.kind(name) {
+                        Kind::Held(r, d) => {
+                            assert!(
+                                r == rows && d >= *depth && *parts == 0,
+                                "`{name}` does not fit"
+                            );
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
                 };
                 let (tm, tn) = (format!("({rows}) / TILE_M"), format!("({cols}) / TILE_N"));
                 let a = format!("({} + {})", self.expr(a), self.expr(a_at));
@@ -493,9 +537,12 @@ impl<'a> Printer<'a> {
                     self.line(format!("    tile_b tb[{tn}];"));
                     self.line("    #pragma unroll".into());
                     self.line(format!("    for (u32 i = 0; i < {tm}; i++) {{"));
-                    self.line(format!(
-                        "        TILE_LOAD_A(ta[i], {a} + i * TILE_M * ({stride}) + kk, {stride});"
-                    ));
+                    self.line(match &held {
+                        Some(h) => format!("        TILE_HELD_A(ta[i], {h}[i][kk / TILE_K]);"),
+                        None => format!(
+                            "        TILE_LOAD_A(ta[i], {a} + i * TILE_M * ({stride}) + kk, {stride});"
+                        ),
+                    });
                     self.line("    }".into());
                     self.line("    #pragma unroll".into());
                     self.line(format!("    for (u32 j = 0; j < {tn}; j++) {{"));
@@ -626,7 +673,13 @@ fn tiles(s: &Stmt) -> bool {
     use Stmt::*;
     matches!(
         s,
-        TileAcc { .. } | TileBlock { .. } | TileEach { .. } | TileZero { .. } | TileScale { .. }
+        TileAcc { .. }
+            | TileHeld { .. }
+            | TileHold { .. }
+            | TileBlock { .. }
+            | TileEach { .. }
+            | TileZero { .. }
+            | TileScale { .. }
     )
 }
 

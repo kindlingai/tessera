@@ -2,15 +2,16 @@
 
 use std::net::SocketAddr;
 use tessera_engine::comm::{Fabric, Transport};
+use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Place, Recipe, Settings};
-use tessera_frontend_comm::{join, meet, ports};
+use tessera_frontend_comm::{grid, grid_flag, join, meet, ports};
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
-[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...]]";
+[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid]]";
 
-/// A rank's sums transport, then its control transport.
-pub(crate) type Links = [Box<dyn Transport>; 2];
+/// Sums and control transports, and a grid for sums.
+pub(crate) type Links = ([Box<dyn Transport>; 2], Option<Box<dyn Sum>>);
 
 /// This rank among its peers. No peers: one engine alone.
 #[derive(Default)]
@@ -22,6 +23,8 @@ pub struct Ranks {
     parts: Vec<u32>,
     /// RDMA ports for the sums, after the ranks meet.
     fabric: Option<Fabric>,
+    /// The sums run in a persistent grid over the fabric.
+    grid: bool,
 }
 
 impl Ranks {
@@ -37,6 +40,7 @@ impl Ranks {
                 let parts = value.split(',').map(|p| p.parse().ok());
                 self.parts = parts.collect::<Option<_>>()?;
             }
+            "--sums" => self.grid = grid_flag(value)?,
             "--verbs" => self.fabric = Some(Fabric::Mesh(ports(value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -46,6 +50,11 @@ impl Ranks {
             _ => return None,
         }
         Some(())
+    }
+
+    /// One engine, with no peers.
+    pub(crate) fn alone(&self) -> bool {
+        self.peers.is_empty() && self.rank == 0
     }
 
     /// This rank runs rank 0's launches and serves nothing.
@@ -61,9 +70,19 @@ impl Ranks {
         if self.rank as usize >= self.peers.len() {
             return Err(format!("--rank {} needs --peers with it", self.rank));
         }
-        let met = meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?;
-        let links = join(Box::new(met), self.fabric.as_ref(), settings);
-        links.map(Some).map_err(|e| e.to_string())
+        let mut met: Box<dyn Transport> =
+            Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
+        match (self.grid, &self.fabric) {
+            (true, None) => return Err("--sums grid needs --verbs or --ring".into()),
+            (true, Some(fabric)) => {
+                let sums = grid(&mut *met, fabric, settings).map_err(|e| e.to_string())?;
+                let both = join(met, None).map_err(|e| e.to_string())?;
+                return Ok(Some((both, Some(sums))));
+            }
+            (false, _) => {}
+        }
+        let links = join(met, self.fabric.as_ref());
+        links.map(|l| Some((l, None))).map_err(|e| e.to_string())
     }
 
     /// The engine, over `links` if the rank joined peers.
@@ -76,9 +95,10 @@ impl Ranks {
     ) -> Result<Engine, String> {
         let opened = match links {
             None => Engine::open(graph, context, recipe, settings),
-            Some([sums, control]) => {
+            Some(([sums, control], sums_grid)) => {
                 let gpu = settings.gpu().is_some();
                 let place = Place::mesh(self.peers.len(), self.parts.clone(), gpu);
+                let place = place.with_grid(sums_grid);
                 Engine::open_ranked(graph, context, (recipe, settings), place, sums, control)
             }
         };
