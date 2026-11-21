@@ -1,3 +1,4 @@
 #!/bin/sh
 # Refuses Co-Authored-By lines that credit AI tools.
+. "$(dirname "$0")/worktree.sh"
 exec tools/scripts/check-coauthors.sh --message "$1"
