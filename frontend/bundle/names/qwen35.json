@@ -1,0 +1,12 @@
+{
+  "layers.*.linear.qkv": "model.language_model.layers.*.linear_attn.in_proj_qkv",
+  "layers.*.linear.z": "model.language_model.layers.*.linear_attn.in_proj_z",
+  "layers.*.linear.b": "model.language_model.layers.*.linear_attn.in_proj_b",
+  "layers.*.linear.a": "model.language_model.layers.*.linear_attn.in_proj_a",
+  "layers.*.linear.conv": "model.language_model.layers.*.linear_attn.conv1d",
+  "layers.*.linear.dt_bias": "model.language_model.layers.*.linear_attn.dt_bias",
+  "layers.*.linear.a_log": "model.language_model.layers.*.linear_attn.A_log",
+  "layers.*.linear.norm": "model.language_model.layers.*.linear_attn.norm",
+  "layers.*.linear.out": "model.language_model.layers.*.linear_attn.out_proj",
+  "head": "lm_head"
+}

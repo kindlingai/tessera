@@ -156,18 +156,20 @@ pub fn pulled(model: &str, g: &Graph, offer: &dyn Offer) -> Vec<Tensor> {
         g.weights[at].ty.shape.0.iter().map(axis).collect()
     };
     tessera_bundle::each(g, offer, &[&rules], &|_| None, |w, _| {
-        let shape = shape(out.len());
-        out.push(match w {
-            Weight::Floats(t) => t,
-            Weight::Packed(f, bytes) if f.block() == 1 => {
-                Tensor::from_bytes(shape, f.dtype(), &bytes)
-            }
-            Weight::Packed(f, bytes) => Tensor::f32(shape, f.unpack_all(&bytes)),
-        });
+        out.push(tensor(shape(out.len()), w));
         Ok(())
     })
     .unwrap();
     out
+}
+
+/// A loaded weight as a tensor. Block forms decode.
+pub fn tensor(shape: Vec<usize>, w: Weight) -> Tensor {
+    match w {
+        Weight::Floats(t) => t,
+        Weight::Packed(f, bytes) if f.block() == 1 => Tensor::from_bytes(shape, f.dtype(), &bytes),
+        Weight::Packed(f, bytes) => Tensor::f32(shape, f.unpack_all(&bytes)),
+    }
 }
 
 /// `g`'s weights from the safetensors file at `path`.

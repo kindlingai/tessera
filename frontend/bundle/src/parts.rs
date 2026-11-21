@@ -1,6 +1,6 @@
 //! The parts of a model directory, by name.
 
-use crate::{Overrides, config, encoder, flux2, pull, stepper, vae};
+use crate::{Overrides, config, encoder, flux2, pull, qwen35, stepper, vae};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tessera_checkpoint::Shards;
@@ -17,6 +17,7 @@ enum Kind {
     Flux2,
     Vae,
     Eg2,
+    Qwen35,
     Decoder,
 }
 
@@ -25,6 +26,7 @@ enum Source {
     Flux2(PathBuf),
     Vae(PathBuf, f32),
     Eg2(PathBuf, u64),
+    Qwen35(PathBuf, u64),
     Decoder(PathBuf, u64),
 }
 
@@ -42,6 +44,7 @@ fn kind(dir: &Path) -> Option<Kind> {
         (Some("Flux2Transformer2DModel"), _) => Kind::Flux2,
         (Some("AutoencoderKLFlux2"), _) => Kind::Vae,
         (_, Some("EmbeddingGemma2Model")) => Kind::Eg2,
+        (_, Some(qwen35::CLASS)) => Kind::Qwen35,
         _ => v["model_type"].as_str().map(|_| Kind::Decoder)?,
     })
 }
@@ -97,6 +100,14 @@ pub fn open(dir: &Path, name: &str, size: &dyn Fn(DimName) -> Option<u64>) -> Re
             let layers = c.stack.layers;
             (eg2::program::<Linear>(&c), Source::Eg2(dir, layers))
         }
+        Kind::Qwen35 => {
+            let c = qwen35::config(&dir, [seqs, at(Context, 256)], none)?;
+            let layers = c.stack.layers;
+            (
+                tessera_engine::qwen35::program(&c),
+                Source::Qwen35(dir, layers),
+            )
+        }
         Kind::Decoder => {
             let (arch, c) = config(&dir, [seqs, at(Context, 256)], none)?;
             let graph = stepper(&arch, &c)
@@ -116,6 +127,7 @@ impl Part {
             Source::Eg2(dir, layers) => {
                 Ok((encoder::weights(dir, *layers, graph)?, Pins::default()))
             }
+            Source::Qwen35(dir, layers) => qwen35::weights(dir, *layers, graph),
             Source::Decoder(dir, layers) => pull(graph, &Shards::open(dir)?, *layers, &[]),
         }
     }

@@ -40,10 +40,7 @@ pub fn encoder(
 
 /// The text tower `dir/config.json` describes.
 pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> Result<Config> {
-    let path = dir.join("config.json");
-    overrides.read("config.json", Some(&path), |k| {
-        Config::read(k, seqs, context)
-    })
+    overrides.config(dir, |k| Config::read(k, seqs, context))
 }
 
 /// The weights `graph` reads from the release in `dir`.

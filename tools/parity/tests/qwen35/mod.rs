@@ -1,18 +1,20 @@
 //! Qwen3.5 pieces against tiny random Hugging Face modules.
 
 mod attention_test;
+mod checkpoint_test;
 mod deltanet_test;
 mod model_test;
 
 use std::path::{Path, PathBuf};
 use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
-use tessera_lower::{Device, lower};
+use tessera_lower::{Device, Pins, lower};
 use tessera_models::Stack;
-use tessera_models::qwen35::{Config, Mixing, Recurrent};
-use tessera_parity::loaded;
+use tessera_models::qwen35::{Config, Mixing, Recurrent, program};
+use tessera_parity::{Spec, loaded, suite};
 use tessera_run::testing::runs;
 use tessera_testkit::max_abs_diff;
+use tessera_trace::Composite::{Layer, Mlp, Model};
 use tessera_trace::DimName::{Context, Seqs};
 use tessera_trace::{Graph, PathSeg};
 
@@ -40,6 +42,47 @@ fn tiny() -> Config {
     }
 }
 
+/// Clef's sizes.
+fn clef(max_seqs: u64, max_context: u64) -> Config {
+    let full = |i| match i % 4 {
+        3 => Mixing::Full,
+        _ => Mixing::Linear,
+    };
+    Config {
+        stack: Stack::sized([248_320, 5120, 64, 24, 256, 17_408], max_seqs, max_context),
+        kv_heads: 4,
+        rotary: 64,
+        rope_theta: 1e7,
+        eps: 1e-6,
+        linear: Recurrent {
+            key_heads: 16,
+            value_heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            window: 4,
+        },
+        layers: (0..64).map(full).collect(),
+        tied: false,
+    }
+}
+
+fn release() -> Graph {
+    program(&clef(1, 1024))
+}
+
+const SPEC: Spec = Spec {
+    name: "qwen35",
+    release,
+    parameters: 26_895_998_464,
+    regions: &[(Layer, 64), (Mlp, 64), (Model, 1)],
+    small: Some(|| program(&tessera_models::small::qwen35())),
+    stepper: None,
+    files: &[(include_str!("manifests/hf.json"), release)],
+    golden: None,
+};
+
+suite!(SPEC);
+
 /// The fixture for `part`, if this host has it.
 fn part(name: &str) -> Option<PathBuf> {
     let dir = tessera_testkit::reference("qwen35-tiny")?.join(name);
@@ -56,6 +99,17 @@ fn read(dir: &Path, name: &str) -> Vec<f32> {
 /// `<name>.f32` in `dir`, as a tensor of `shape`.
 fn floats(dir: &Path, name: &str, shape: Vec<usize>) -> Tensor {
     Tensor::f32(shape, read(dir, name))
+}
+
+/// `tokens.u32` in `dir`, `[SEQS, LEN]`.
+fn tokens(dir: &Path) -> Tensor {
+    let bytes = std::fs::read(dir.join("tokens.u32")).unwrap();
+    let ids = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b));
+    Tensor::u32(vec![SEQS, LEN], ids.collect())
 }
 
 /// Each sequence's positions, from zero.
@@ -79,15 +133,20 @@ fn weights(g: &Graph, dir: &Path) -> Vec<Tensor> {
 
 /// `g` on the interpreter and each backend, against `want`.
 fn check(g: &Graph, dir: &Path, inputs: &[Tensor], want: &str) {
-    let weights = weights(g, dir);
-    let want = &read(dir, want)[..];
-    let got = run(g, &weights, 0, inputs).unwrap().remove(0);
+    let want = read(dir, want);
+    matches(g, &weights(g, dir), &Pins::default(), inputs, &want);
+}
+
+/// `g` with `weights` in their `pins` forms, against `want`.
+fn matches(g: &Graph, weights: &[Tensor], pins: &Pins, inputs: &[Tensor], want: &[f32]) {
+    let got = run(g, weights, 0, inputs).unwrap().remove(0);
     let off = max_abs_diff(got.floats().unwrap(), want);
     assert!(off < 1e-5, "interpreter: off by {off:e}");
     let sizes = [(Seqs, SEQS as u64), (Context, LEN as u64)];
     for settings in runs() {
-        let plan = lower(g, 0, &sizes, &Device::guess(&settings)).unwrap();
-        let mut runner = loaded(plan, g, &weights, &settings);
+        let device = Device::guess(&settings).pinned(pins.clone());
+        let plan = lower(g, 0, &sizes, &device).unwrap();
+        let mut runner = loaded(plan, g, weights, &settings);
         let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
         let got = runner.run(&views).unwrap().remove(0);
         let off = max_abs_diff(got.floats().unwrap(), want);

@@ -336,6 +336,7 @@ pub fn repo(model: &str) -> Option<Vec<Rule>> {
         "eg2" => include_str!("../names/eg2.json"),
         "flux2" => include_str!("../names/flux2.json"),
         "gemma4" => include_str!("../names/gemma4.json"),
+        "qwen35" => include_str!("../names/qwen35.json"),
         _ => return None,
     };
     Some(rules(json).expect("the repository's rules parse"))

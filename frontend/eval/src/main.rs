@@ -1,6 +1,7 @@
 //! `tessera-eval --model <path> [--recipe <json>] [--m 1,4]`: JSON out.
 
 mod embed;
+mod forward;
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -16,7 +17,7 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
-[--embed <texts.json> [--vectors <file>]]";
+[--embed <texts.json> [--vectors <file>]] [--forward true]";
 
 /// A checkpoint's slices, as a manifest for the model tests.
 fn manifest(model: &Path) -> Result<String, Failure> {
@@ -54,6 +55,8 @@ struct Args {
     embed: Option<PathBuf>,
     /// Where the embeddings go, as little-endian f32.
     vectors: Option<PathBuf>,
+    /// Run a Qwen3.5 prompt forward once, then stop.
+    forward: bool,
 }
 
 fn args() -> Option<Args> {
@@ -68,6 +71,7 @@ fn args() -> Option<Args> {
         slices: None,
         embed: None,
         vectors: None,
+        forward: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -89,6 +93,7 @@ fn args() -> Option<Args> {
             "--slices" => args.slices = Some(value.into()),
             "--embed" => args.embed = Some(value.into()),
             "--vectors" => args.vectors = Some(value.into()),
+            "--forward" => args.forward = value.parse().ok()?,
             _ => return None,
         }
     }
@@ -264,6 +269,9 @@ fn main() -> ExitCode {
     let report = match &args.embed {
         Some(texts) => embed::embed(&args.model, texts, args.vectors.as_deref())
             .map(|s| serde_json::to_string_pretty(&s)),
+        None if args.forward => {
+            forward::forward(&args.model, &args.prompt).map(|p| serde_json::to_string_pretty(&p))
+        }
         None => evaluate(&args).map(|r| serde_json::to_string_pretty(&r)),
     };
     match report {

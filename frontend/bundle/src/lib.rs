@@ -12,6 +12,7 @@ pub mod names;
 #[cfg(test)]
 mod names_test;
 pub mod parts;
+pub mod qwen35;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -142,6 +143,15 @@ impl Overrides {
         let config = build(&mut keys);
         keys.finish()?;
         Ok(config)
+    }
+
+    /// The config `build` reads from `dir/config.json`, as `read`.
+    pub fn config<T>(
+        &self,
+        dir: &Path,
+        build: impl FnOnce(&mut Keys) -> T,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+        self.read("config.json", Some(&dir.join("config.json")), build)
     }
 }
 
@@ -303,8 +313,7 @@ pub(crate) fn config(
     [slots, context]: [u64; 2],
     overrides: &Overrides,
 ) -> Result<(String, Config), Box<dyn Error + Send + Sync>> {
-    let path = dir.join("config.json");
-    overrides.read("config.json", Some(&path), |k| {
+    overrides.config(dir, |k| {
         (k.need(&["model_type"]), Config::read(k, slots, context))
     })
 }
@@ -345,13 +354,16 @@ pub fn load_named(
     let arch = serde_json::from_str::<Arch>(&json)?.model_type;
     let (graph, layers, rules) = match arch.as_deref() {
         Some("gemma4") => {
-            let path = dir.join("config.json");
-            let mut c = overrides.read("config.json", Some(&path), |k| {
-                gemma4::Config::read(k, slots, context)
-            })?;
+            let mut c = overrides.config(dir, |k| gemma4::Config::read(k, slots, context))?;
             c.stack.steps = steps;
             let rules = names::repo("gemma4").unwrap_or_default();
             (gemma4::stepper::<Linear>(&c), c.stack.layers, rules)
+        }
+        Some("qwen3_5") => {
+            let class = qwen35::CLASS;
+            return Err(
+                format!("{class} has no step graph yet. tessera-eval --forward runs it").into(),
+            );
         }
         _ => {
             let (arch, mut config) = config(dir, [slots, context], overrides)?;

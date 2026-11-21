@@ -94,20 +94,30 @@ impl Model {
 
     /// Takes the graph's weights, in its order.
     pub fn load(&mut self, weights: &[Weight]) -> Result<(), Error> {
+        for (at, w) in weights.iter().enumerate() {
+            self.load_one(at as u32, w)?;
+        }
+        Ok(())
+    }
+
+    /// Takes the weight at `at`, so weights can stream in.
+    pub fn load_one(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
         match &mut self.executor {
-            Executor::Planned(p) => {
-                for (at, w) in weights.iter().enumerate() {
-                    p.runner.load_weight(at as u32, w)?;
-                }
-            }
+            Executor::Planned(p) => p.runner.load_weight(at, w)?,
             Executor::Interpreted(kept) => {
-                let g = &self.graph;
-                *kept = (weights.iter().enumerate())
-                    .map(|(at, w)| floats(g, at, w))
-                    .collect();
+                let at = at as usize;
+                if kept.len() <= at {
+                    kept.resize(at + 1, Tensor::f32(vec![0], Vec::new()));
+                }
+                kept[at] = floats(&self.graph, at, w);
             }
         }
         Ok(())
+    }
+
+    /// Whether the interpreter runs the graph.
+    pub fn interpreted(&self) -> bool {
+        matches!(self.executor, Executor::Interpreted(_))
     }
 
     /// The backend and hardware under the runner, or the interpreter.
