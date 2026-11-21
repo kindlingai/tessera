@@ -165,6 +165,8 @@ pub enum Mask {
     Bidirectional,
     /// Both ways, keys at most this far from the query.
     Within(u64),
+    /// Causal, keys at most this far back.
+    Back(u64),
 }
 
 impl Mask {
@@ -174,7 +176,13 @@ impl Mask {
             Mask::Causal => (far, 0),
             Mask::Bidirectional => (far, far),
             Mask::Within(n) => (n as usize, n as usize),
+            Mask::Back(n) => (n as usize, 0),
         }
+    }
+
+    /// Whether query and key ends align.
+    pub fn causal(self) -> bool {
+        matches!(self, Mask::Causal | Mask::Back(_))
     }
 }
 

@@ -347,6 +347,12 @@ pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
     ];
     let [q, k, v, scores, slots, at] = m.entry(EntryKind::Forward, ports);
     let picked = scores.causal(&at).top_k(IndexKeep);
-    let out = m.attend_rows(0.25, [&q, &k, &v], [&slots, &at], Some(&picked));
+    let out = m.attend_rows(
+        Mask::Causal,
+        0.25,
+        [&q, &k, &v],
+        [&slots, &at],
+        Some(&picked),
+    );
     m.finish([(Role::Logits, &out)])
 }

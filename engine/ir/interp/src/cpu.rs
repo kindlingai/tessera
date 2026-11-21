@@ -59,21 +59,18 @@ fn softmax(acc: Acc, row: &mut [f32]) {
 pub(crate) fn past_keys(a: &Attend, queries: usize, keys: usize) -> Result<usize, Error> {
     match keys.checked_sub(queries) {
         Some(past) => Ok(past),
-        None if a.mask != Mask::Causal => Ok(0),
+        None if !a.mask.causal() => Ok(0),
         None => Err(Error::Mismatch(format!("{queries} queries, {keys} keys"))),
     }
 }
 
 /// The keys `[from, to)` a query at `position` sees.
 pub(crate) fn seen(mask: Mask, position: usize, keys: usize) -> (usize, usize) {
-    match mask {
-        Mask::Causal => (0, (position + 1).min(keys)),
-        Mask::Bidirectional => (0, keys),
-        Mask::Within(n) => {
-            let n = n as usize;
-            (position.saturating_sub(n), (position + n + 1).min(keys))
-        }
-    }
+    let (back, ahead) = mask.window(keys);
+    (
+        position.saturating_sub(back),
+        (position + ahead + 1).min(keys),
+    )
 }
 
 // These sum in fixed order with exact math.
@@ -318,18 +315,22 @@ pub(crate) fn attend_rows(
     let mut out = vec![0.0; rows * heads * dv];
     let mut p = Vec::with_capacity(keys);
     for r in 0..rows {
-        let (s, seen) = (slots[r], positions[r] + 1);
-        if seen > keys {
-            let msg = format!("row {r} at position {} is past {keys} keys", seen - 1);
+        let (s, at) = (slots[r], positions[r]);
+        if at >= keys {
+            let msg = format!("row {r} at position {at} is past {keys} keys");
             return Err(Error::Mismatch(msg));
         }
+        let (from, to) = seen(a.mask, at, keys);
         let all: Vec<usize> = match &lists {
             Some(ids) => {
                 let width = ids.len() / rows.max(1);
                 let list = &ids[r * width..][..width];
-                list.iter().copied().filter(|j| *j < seen).collect()
+                list.iter()
+                    .copied()
+                    .filter(|j| (from..to).contains(j))
+                    .collect()
             }
-            None => (0..seen).collect(),
+            None => (from..to).collect(),
         };
         for h in 0..heads {
             let row = r * heads + h;

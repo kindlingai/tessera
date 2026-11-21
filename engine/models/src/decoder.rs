@@ -376,7 +376,7 @@ impl Pass<'_> {
                 (Some([keys, values]), Some(slots)) => {
                     let by = [slots, self.positions];
                     let (k, v) = (k.append(keys, by), v.append(values, by));
-                    self.m.attend_rows(scale, [q, &k, &v], by, None)
+                    (self.m).attend_rows(Mask::Causal, scale, [q, &k, &v], by, None)
                 }
                 _ => match self.keys {
                     Some(keys) => self

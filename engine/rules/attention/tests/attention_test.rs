@@ -57,6 +57,7 @@ fn flash_matches_cpu() {
         Mask::Bidirectional,
         Mask::Within(5),
         Mask::Within(40),
+        Mask::Back(5),
     ];
     let shapes = [(2u64, 16u64), (4, 64), (2, 128)];
     for (mask, (heads, width)) in masks.into_iter().flat_map(|m| shapes.map(|s| (m, s))) {
@@ -101,7 +102,7 @@ fn flash_matches_cpu() {
 }
 
 /// Ragged rows over kept keys: `heads` query heads over `kv_heads`.
-fn ragged(heads: u64, kv_heads: u64, width: u64) -> Graph {
+fn ragged(mask: Mask, heads: u64, kv_heads: u64, width: u64) -> Graph {
     let dim = |name, size| Dim { name, size };
     let bounded = [(Seqs, 4), (Rows, 128), (Context, 256)];
     let mut dims: Vec<Dim> = bounded.map(|(n, max)| dim(n, Size::Bounded(max))).into();
@@ -128,7 +129,7 @@ fn ragged(heads: u64, kv_heads: u64, width: u64) -> Graph {
     let (keys, values) = (m.kept(kept.clone()), m.kept(kept));
     let by = [&slots, &positions];
     let (k, v) = (k.append(&keys, by), v.append(&values, by));
-    let out = m.attend_rows(0.125, [&q, &k, &v], by, None);
+    let out = m.attend_rows(mask, 0.125, [&q, &k, &v], by, None);
     m.finish([(Role::Logits, &out)])
 }
 
@@ -157,11 +158,21 @@ fn ragged_rows_match_cpu() {
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<u8>>()
     };
-    for (heads, kv_heads, width) in [(2u64, 2u64, 16u64), (4, 2, 64)] {
-        let g = ragged(heads, kv_heads, width);
+    let shapes = [
+        (Mask::Causal, 2u64, 2u64, 16u64),
+        (Mask::Causal, 4, 2, 64),
+        (Mask::Back(4), 4, 2, 64),
+    ];
+    for (mask, heads, kv_heads, width) in shapes {
+        let g = ragged(mask, heads, kv_heads, width);
         let mut cases = Vec::new();
         for settings in runs() {
-            for favored in ["flash", "attend"] {
+            // The flash rows kernel is causal only.
+            let favors = match mask {
+                Mask::Causal => &["flash", "attend"][..],
+                _ => &["attend"],
+            };
+            for &favored in favors {
                 for layout in layouts {
                     cases.push((settings.clone(), favored, layout));
                 }

@@ -1,7 +1,7 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Act, Graph, Mask, Op, Select, Stage, View};
+use crate::node::{Act, Graph, Op, Select, Stage, View};
 use crate::select;
 use crate::types::{DType, Placement, TensorType};
 
@@ -134,7 +134,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Conv => conv(&g.dims, args[0], args[1]),
         Op::Attend(a) if a.ragged => {
             finite(a.scale, "attention scale")?;
-            need(a.mask == Mask::Causal, ErrorKind::Value, || {
+            need(a.mask.causal(), ErrorKind::Value, || {
                 format!("ragged attention is causal only, got {:?}", a.mask)
             })?;
             attend_rows(&g.dims, args)
