@@ -31,6 +31,9 @@ pub struct Sample {
     /// The middle half of the tries, over the kept time.
     #[serde(default)]
     pub spread: f64,
+    /// Seconds when its weights come from memory, if timed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold: Option<f64>,
     /// Logarithms of the sizes and the work.
     #[serde(skip)]
     at: Vec<f64>,
@@ -52,6 +55,7 @@ impl Sample {
             work,
             seconds,
             spread: 0.0,
+            cold: None,
         }
     }
 
@@ -77,7 +81,17 @@ impl Timings {
 
     /// Whether `now` was timed with its current source.
     pub fn known(&self, name: &str, now: &Sample) -> bool {
-        let fresh = |s: &Sample| s.same(now) && s.source == now.source;
+        self.fresh(name, now, false)
+    }
+
+    /// Whether `now` has a cold time with its current source.
+    pub fn known_cold(&self, name: &str, now: &Sample) -> bool {
+        self.fresh(name, now, true)
+    }
+
+    fn fresh(&self, name: &str, now: &Sample, cold: bool) -> bool {
+        let fresh =
+            |s: &Sample| s.same(now) && s.source == now.source && (!cold || s.cold.is_some());
         self.0.get(name).is_some_and(|t| t.iter().any(fresh))
     }
 
@@ -104,9 +118,43 @@ impl Timings {
             sample.seconds = low;
             sample.spread = (high - low) / low.max(f64::MIN_POSITIVE);
             let timed = self.0.entry(name.to_string()).or_default();
+            // A warm sample timed again keeps its cold time.
+            sample.cold = timed
+                .iter()
+                .find(|old| old.same(&sample))
+                .and_then(|old| old.cold);
             timed.retain(|old| !old.same(&sample));
             timed.push(sample);
         }
+    }
+
+    /// Adds cold times to the samples they match.
+    pub fn record_cold(&mut self, samples: impl IntoIterator<Item = (&'static str, Sample)>) {
+        for (name, sample) in samples {
+            let timed = self.0.entry(name.to_string()).or_default();
+            let cold = Some(sample.seconds);
+            match timed.iter_mut().find(|old| old.same(&sample)) {
+                Some(old) => old.cold = cold,
+                None => timed.push(Sample { cold, ..sample }),
+            }
+        }
+    }
+
+    /// Per kernel: cold samples and the median cold over warm.
+    pub fn colder(&self) -> Vec<(&str, usize, f64)> {
+        let mut out = Vec::new();
+        for (name, timed) in &self.0 {
+            let mut ratios: Vec<f64> = timed
+                .iter()
+                .filter_map(|s| Some(s.cold? / s.seconds))
+                .collect();
+            if ratios.is_empty() {
+                continue;
+            }
+            ratios.sort_by(f64::total_cmp);
+            out.push((name.as_str(), ratios.len(), ratios[ratios.len() / 2]));
+        }
+        out
     }
 
     /// The share of sampled seconds whose spread passes `above`.

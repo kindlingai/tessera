@@ -372,6 +372,12 @@ impl Device {
         self.timed.known(step.kernel.name(), &sample(step, 0.0))
     }
 
+    /// Whether this launch has a cold time from its source.
+    pub fn known_cold(&self, step: &Step) -> bool {
+        self.timed
+            .known_cold(step.kernel.name(), &sample(step, 0.0))
+    }
+
     pub fn samples(&self) -> usize {
         self.timed.len()
     }
@@ -394,6 +400,21 @@ impl Device {
             .into_iter()
             .map(|(s, seconds)| (s.kernel.name(), sample(s, seconds)));
         self.timed.record(timed);
+    }
+
+    /// Adds cold times for launches already sampled warm.
+    pub fn fit_cold<'a>(&mut self, samples: impl IntoIterator<Item = (&'a Step, f64)>) {
+        self.generation = fresh();
+        self.memo.get_mut().clear();
+        let timed = samples
+            .into_iter()
+            .map(|(s, seconds)| (s.kernel.name(), sample(s, seconds)));
+        self.timed.record_cold(timed);
+    }
+
+    /// Per kernel: cold samples, and the middle cold over warm.
+    pub fn colder(&self) -> Vec<(&str, usize, f64)> {
+        self.timed.colder()
     }
 
     /// The share of sampled seconds whose spread passes `above`.
