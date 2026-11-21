@@ -370,6 +370,13 @@ impl<const K: u32> Form for Trellis<K> {
     fn pack(&self, _: &[f32]) -> Vec<u8> {
         panic!("{} codes are read from a release, never packed", self.name)
     }
+    /// A set's whole matrices, or a matrix's whole entries.
+    fn shares(&self, shape: &[usize], axis: usize, count: usize) -> bool {
+        match shape.len() {
+            2 => count.is_multiple_of(ENTRY),
+            _ => axis == 0,
+        }
+    }
     /// Whole matrices of a set, or whole stored-side entries.
     fn share(
         &self,

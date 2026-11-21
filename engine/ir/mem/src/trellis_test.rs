@@ -20,6 +20,7 @@ fn trellis_shares() {
     let inputs = packed(256, 128, INPUT_SIDE, &noise(128 * 256 * 2 / 8));
     same_part(&TRELLIS_K2, &inputs, [128, 256, 1], [128, 128]);
     assert!(TRELLIS_K2.share(&inputs, [1, 128, 256], [0, 64]).is_none());
+    assert!(!TRELLIS_K2.shares(&[128, 256], 0, 64));
     // Across the stored side: tiles from each entry.
     let rows = packed(256, 128, 1, &noise(256 * 128 * 2 / 8));
     same_part(&TRELLIS_K2, &rows, [128, 256, 1], [128, 128]);

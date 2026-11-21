@@ -12,7 +12,7 @@ use tessera_device::sums::{self, Sum};
 use tessera_engine_comm::{Fabric, ShmLink, Transport};
 use tessera_frontend_comm::{CAPACITY, grid_flag, meet, ports, shared, shm};
 use tessera_graph::DimName::{Context, Seqs};
-use tessera_graph::shard;
+use tessera_graph::shard_aligned;
 use tessera_interp::Tensor;
 use tessera_lower::{Cluster, Device, Pick, ZoneKind, lower};
 use tessera_models::decoder::{Config, Moe, Swiglu, program};
@@ -248,6 +248,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let n = tokens.len();
     let ranks = args.ranks;
     let (g, weights, mut pins) = model(&args.model, &fixture, n as u64)?;
+    if let Some(form) = &args.form {
+        let form = tessera_lower::form::named(form).ok_or_else(|| format!("no form `{form}`"))?;
+        pins = tessera_lower::Pins::all(form);
+    }
     let parts = match args.parts.is_empty() {
         true => tessera_graph::Parts::even(ranks),
         false => tessera_graph::Parts(args.parts.clone()),
@@ -255,7 +259,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let tessera_graph::Sharded {
         graph: sharded,
         whole,
-    } = shard(&g, &parts)?;
+    } = shard_aligned(&g, &parts, &pins.shares(&g))?;
     for w in &whole {
         let path = &g.weights[w.weight as usize].path;
         eprintln!("rank {}: {path:?} stays whole: {}", args.rank, w.why);
@@ -271,10 +275,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         g.weights.len()
     );
 
-    if let Some(form) = &args.form {
-        let form = tessera_lower::form::named(form).ok_or_else(|| format!("no form `{form}`"))?;
-        pins = tessera_lower::Pins::all(form);
-    }
     let device = device(&settings, pins, ranks, args.host).as_rank(args.rank);
     let device = device.uneven(parts.0);
     let sizes = [(Seqs, 1), (Context, n as u64)];

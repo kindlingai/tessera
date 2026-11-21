@@ -23,6 +23,15 @@ pub struct Whole {
 
 /// Splits residual-bound matmuls and gathered sets that `parts` divides.
 pub fn shard(g: &Graph, parts: &Parts) -> Result<Sharded, VerifyError> {
+    shard_aligned(g, parts, &|_, _, _, _| true)
+}
+
+/// Whether weight `w` shares `(w, shape, axis, count)` as bytes.
+pub type Shares<'a> = dyn Fn(u32, &[usize], usize, usize) -> bool + 'a;
+
+/// As `shard`. A split weight's form `shares` each part.
+pub fn shard_aligned(g: &Graph, parts: &Parts, shares: &Shares) -> Result<Sharded, VerifyError> {
+    let fit = &Fit { parts, shares };
     let mut out = g.clone();
     let mut whole = Vec::new();
     let mut at = 0;
@@ -34,12 +43,12 @@ pub fn shard(g: &Graph, parts: &Parts) -> Result<Sharded, VerifyError> {
         }
         let tried = settle(split(&out, id), &out);
         // The sum is the new node behind this one.
-        if adopt(&mut out, tried, parts, &mut whole) {
+        if adopt(&mut out, tried, fit, &mut whole) {
             at += 1;
         }
     }
     let routed = route(&out);
-    adopt(&mut out, routed, parts, &mut whole);
+    adopt(&mut out, routed, fit, &mut whole);
     if let Ok(merged) = retype(&merge(&out)) {
         out = merged;
     }
@@ -85,10 +94,10 @@ fn feeders(g: &Graph, at: usize) -> Vec<u32> {
     found
 }
 
-/// Takes `tried` if it types and fits `parts`.
-fn adopt(out: &mut Graph, tried: Graph, parts: &Parts, whole: &mut Vec<Whole>) -> bool {
+/// Takes `tried` if it types and fits `fit`.
+fn adopt(out: &mut Graph, tried: Graph, fit: &Fit, whole: &mut Vec<Whole>) -> bool {
     let why = match retype(&tried) {
-        Ok(typed) => match misfit(&typed, parts) {
+        Ok(typed) => match misfit(&typed, fit) {
             None => {
                 *out = typed;
                 return true;
@@ -110,21 +119,36 @@ fn adopt(out: &mut Graph, tried: Graph, parts: &Parts, whole: &mut Vec<Whole>) -
     false
 }
 
-/// The first split axis `parts` cannot divide.
-fn misfit(g: &Graph, parts: &Parts) -> Option<String> {
+/// The ranks' parts, and whether a weight's form shares them.
+struct Fit<'a> {
+    parts: &'a Parts,
+    shares: &'a Shares<'a>,
+}
+
+/// The first split `fit` cannot divide or share.
+fn misfit(g: &Graph, fit: &Fit) -> Option<String> {
     for n in &g.nodes {
         let Placement::Split { axis } = n.ty.placement else {
             continue;
         };
-        let size = poly(&g.dims, &n.ty.shape.0[axis as usize]).ok()?;
-        if size
-            .as_const()
-            .and_then(|s| parts.counts(s as usize))
-            .is_none()
-        {
-            let (shape, parts) = (&n.ty.shape, &parts.0);
+        let (shape, parts) = (&n.ty.shape, &fit.parts.0);
+        let at = axis as usize;
+        let whole = poly(&g.dims, &shape.0[at]).ok()?.as_const();
+        let Some(counts) = whole.and_then(|s| fit.parts.counts(s as usize)) else {
             return Some(format!(
                 "axis {axis} of {shape} does not divide by {parts:?}"
+            ));
+        };
+        let Op::Weight(w) = n.op else {
+            continue;
+        };
+        let size = |d| poly(&g.dims, d).ok()?.as_const().map(|s| s as usize);
+        let Some(sizes) = shape.0.iter().map(size).collect::<Option<Vec<usize>>>() else {
+            continue;
+        };
+        if counts.iter().any(|c| !(fit.shares)(w, &sizes, at, *c)) {
+            return Some(format!(
+                "axis {axis} of {shape} over {parts:?} cuts its form's blocks"
             ));
         }
     }

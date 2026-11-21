@@ -68,6 +68,12 @@ pub trait Form: Sync {
         Some(out)
     }
 
+    /// Whether `count` parts along `axis` of `shape` share as bytes.
+    fn shares(&self, shape: &[usize], axis: usize, count: usize) -> bool {
+        let inner: usize = shape[axis + 1..].iter().product();
+        (count * inner).is_multiple_of(self.block())
+    }
+
     /// Parts a file's bytes hold, each in its own form.
     fn split(&self, _bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
         None

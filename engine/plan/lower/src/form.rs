@@ -1,7 +1,7 @@
 //! Pins: the registered form for each weight.
 
 use serde::{Deserialize, Serialize};
-use tessera_graph::PathSeg;
+use tessera_graph::{Graph, PathSeg};
 use tessera_mem::Tensor;
 
 pub use tessera_codegen::form::{BF16_FORM, F32_FORM, LOADS, Load, U32_FORM, named};
@@ -40,6 +40,14 @@ impl Pins {
     pub fn pin(mut self, pattern: &str, form: &'static dyn Load) -> Self {
         self.named.push((pattern.into(), form));
         self
+    }
+
+    /// Whether a weight of `g` shares a part as bytes.
+    pub fn shares(&self, g: &Graph) -> impl Fn(u32, &[usize], usize, usize) -> bool {
+        move |w, shape, axis, count| {
+            let form = self.form(&g.weights[w as usize].path);
+            form.shares(shape, axis, count)
+        }
     }
 
     /// The form of the weight at `path`.

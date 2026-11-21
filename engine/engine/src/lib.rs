@@ -230,7 +230,7 @@ impl Engine {
             None => device,
         };
         if let Some(place) = place {
-            graph = place.split(&graph)?;
+            graph = place.split(&graph, &recipe.pins)?;
         }
         let device = ranked(Device::guess(settings).with(recipe));
         let mut plans = Cache::default();

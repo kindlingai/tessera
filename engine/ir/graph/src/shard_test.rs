@@ -109,3 +109,12 @@ fn uneven_stays_whole() {
     assert_eq!(placements(&g.graph), [Replicated, Replicated]);
     assert!(g.whole[0].why.contains("does not divide"), "{:?}", g.whole);
 }
+
+#[test]
+fn cut_runs_stay_whole() {
+    // Three of six columns per rank cut blocks of two.
+    let even = |w, _: &[usize], _, count| w == 0 || count % 2 == 0;
+    let g = shard_aligned(&mlp(Stage::Act(Act::Silu)), &Parts::even(2), &even).unwrap();
+    assert_eq!(placements(&g.graph), [Replicated, Replicated]);
+    assert!(g.whole[0].why.contains("cuts its form"), "{:?}", g.whole);
+}

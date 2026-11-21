@@ -2,8 +2,8 @@
 
 use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::{Graph, Parts, shard};
-use tessera_lower::{Cluster, Device, Recipe, Settings, ZoneKind};
+use tessera_graph::{Graph, Parts, shard_aligned};
+use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 
 /// A rank's zones and each rank's share of split weights.
@@ -46,8 +46,8 @@ impl Place {
         Self::new(Cluster::mesh(ranks, kind), parts)
     }
 
-    pub(crate) fn split(&self, g: &Graph) -> Result<Graph, Error> {
-        let sharded = shard(g, &self.parts)?;
+    pub(crate) fn split(&self, g: &Graph, pins: &Pins) -> Result<Graph, Error> {
+        let sharded = shard_aligned(g, &self.parts, &pins.shares(g))?;
         for w in sharded.whole.iter().filter(|_| self.rank == 0) {
             let path = &g.weights[w.weight as usize].path;
             eprintln!("tessera: {path:?} stays whole: {}", w.why);
