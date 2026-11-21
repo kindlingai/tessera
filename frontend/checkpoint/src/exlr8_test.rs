@@ -343,7 +343,7 @@ fn v4_release() {
     let slices = release.slices();
     let found = |name: &str| slices.iter().find(|s| s.name == name).map(|s| s.stored);
     let q = "model.text.layers.0.q.weight";
-    assert_eq!(found(q), Some(Stored::F32));
+    assert_eq!(found(q), Some(Stored::Form(&trellis::TRELLIS_K3_PMCGX_ROT)));
     assert_eq!(
         found("model.text.layers.0.q.codes"),
         Some(Stored::Form(&trellis::TRELLIS_K3_PMCGX))
