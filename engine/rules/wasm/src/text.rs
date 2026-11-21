@@ -107,6 +107,7 @@ impl Text {
         };
         let resident = offer.resident.as_ref().map(|r| Resident {
             threads: r.threads,
+            shared: r.shared,
             scratch: r.scratch,
             lanes: r.lanes.iter().map(|Lane::Sum| Collective::Sum).collect(),
         });

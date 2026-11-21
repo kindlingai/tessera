@@ -52,6 +52,7 @@ fn plan(ranks: u32) -> Plan {
         items: Vec::new(),
         arenas: Vec::new(),
         threads: THREADS,
+        shared: 0,
         share: SHARE,
     }
 }

@@ -100,6 +100,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         writes: None,
         resident: Some(Resident {
             threads: THREADS,
+            shared: 0,
             scratch: floats * 4,
             lanes: vec![Lane::Sum],
         }),

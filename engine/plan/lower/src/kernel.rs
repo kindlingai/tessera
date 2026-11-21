@@ -70,6 +70,8 @@ pub trait Kernel: fmt::Debug + Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resident {
     pub threads: u32,
+    /// Bytes of dynamic shared memory per block.
+    pub shared: u32,
     /// Bytes of scratch the grid adds as its last item.
     pub scratch: usize,
     pub lanes: Vec<Collective>,

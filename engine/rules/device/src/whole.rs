@@ -64,6 +64,7 @@ fn plan(kernel: &KernelRef, items: usize, ranks: u32, share: u32) -> Result<Plan
         // Base zero, so offsets are device addresses.
         arenas: vec![0],
         threads: resident.threads,
+        shared: resident.shared,
         share,
     })
 }
@@ -97,7 +98,7 @@ where
     fn open(&mut self, kernel: &KernelRef, items: usize) -> Result<(), Error> {
         self.scratch(kernel)?;
         // Counts and scratch change with sizes, not the grid.
-        let threads = kernel.resident().map(|r| (r.threads, r.lanes));
+        let threads = kernel.resident().map(|r| (r.threads, r.shared, r.lanes));
         let key = format!("{}/{threads:?}/{items}", kernel.name());
         if matches!(&self.held, Held::Open { key: k, .. } if *k == key) {
             return Ok(());

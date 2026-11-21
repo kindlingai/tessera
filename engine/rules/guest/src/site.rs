@@ -296,6 +296,9 @@ pub struct Offer<K = &'static str, C = Count> {
 #[serde(deny_unknown_fields)]
 pub struct Resident {
     pub threads: u32,
+    /// Bytes of dynamic shared memory per block.
+    #[serde(default)]
+    pub shared: u32,
     /// Bytes of scratch, the last table item.
     #[serde(default)]
     pub scratch: usize,

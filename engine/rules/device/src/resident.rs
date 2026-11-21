@@ -63,6 +63,8 @@ pub struct Plan {
     /// Device addresses of those arenas, in order.
     pub arenas: Vec<u64>,
     pub threads: u32,
+    /// Bytes of dynamic shared memory per block.
+    pub shared: u32,
     /// Grids that run on the device at once.
     pub share: u32,
 }
@@ -197,6 +199,7 @@ pub struct Resident<D: Device, L> {
     parked: Option<Wired<L>>,
     grid: u32,
     threads: u32,
+    shared: u32,
     /// The device clock and the host instant it matches.
     clock: (u64, Instant),
     seq: u64,
@@ -229,7 +232,7 @@ where
     ) -> Result<Self, Error> {
         let rank = link.rank();
         check(plan, rank)?;
-        let fit = ctx.resident(&kernel, plan.threads, 0)?;
+        let fit = ctx.resident(&kernel, plan.threads, plan.shared)?;
         if fit == 0 {
             let threads = plan.threads;
             return Err(self::plan(format!(
@@ -260,6 +263,7 @@ where
             parked: None,
             grid,
             threads: plan.threads,
+            shared: plan.shared,
             clock: (0, Instant::now()),
             seq: 0,
             broken: false,
@@ -434,7 +438,8 @@ where
         let mut args = KernelArgs::new();
         args.device_ptr(self.table());
         let (grid, threads) = ((self.grid, 1, 1), (self.threads, 1, 1));
-        self.ctx.launch(&self.kernel, grid, threads, 0, &mut args)?;
+        self.ctx
+            .launch(&self.kernel, grid, threads, self.shared, &mut args)?;
         self.ctx.finish()?;
         self.status()?;
         self.broken = false;

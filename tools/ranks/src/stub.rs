@@ -75,6 +75,7 @@ where
         items: vec![item],
         arenas: vec![out.device_ptr()],
         threads: THREADS,
+        shared: 0,
         share: if args.shm.is_some() { ranks * MPS } else { 1 },
     };
     let options = Options {
