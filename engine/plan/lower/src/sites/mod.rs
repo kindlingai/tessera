@@ -92,6 +92,10 @@ impl Region {
             if node.term == Term::Stage(Step::AllReduce) {
                 sums.push(tree.elements(n));
             }
+            // Gathers stay with the engine.
+            if node.term == Term::Stage(Step::AllGather) {
+                return None;
+            }
             for a in &node.args {
                 if !tree.leaf(*a) || inputs.contains(a) {
                     continue;

@@ -521,6 +521,14 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 })?;
                 p = Placement::Replicated;
             }
+            (Stage::AllGather, _) => {
+                need(
+                    p == Placement::Split { axis: last },
+                    ErrorKind::Placement,
+                    || format!("all-gather needs a split last axis, got {p:?}"),
+                )?;
+                p = Placement::Replicated;
+            }
             _ => {}
         }
     }

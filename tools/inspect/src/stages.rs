@@ -164,7 +164,7 @@ impl Setup<'_> {
                     covers,
                     bytes: step.write.bytes(),
                     seconds: device.step_seconds(&plan, step).unwrap_or(0.0),
-                    sum: step.kernel.name() == "all_reduce",
+                    sum: tessera_lower::kernels::crosses(step.kernel.name()),
                     text: at,
                 });
             }

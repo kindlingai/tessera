@@ -59,6 +59,19 @@ pub fn summed<'a>(parts: impl Iterator<Item = &'a [f32]>) -> Vec<f32> {
     sum.expect("a rank")
 }
 
+/// The parts' `rows` rows, joined in rank order.
+pub fn gathered<P: AsRef<[u8]>>(parts: &[P], rows: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|p| p.as_ref().len()).sum());
+    for r in 0..rows {
+        for p in parts {
+            let p = p.as_ref();
+            let width = p.len() / rows;
+            out.extend_from_slice(&p[r * width..(r + 1) * width]);
+        }
+    }
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("io: {0}")]

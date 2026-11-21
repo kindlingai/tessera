@@ -1,10 +1,11 @@
-//! Every rank in one process, summing through host memory.
+//! Every rank in one process, crossing through host memory.
 
 use crate::Error;
 use crate::Run;
 use crate::open;
-use tessera_engine_comm::summed;
+use tessera_engine_comm::{gathered, summed};
 use tessera_engine_settings::Settings;
+use tessera_lower::kernels::{AllGather, crosses};
 use tessera_lower::{Plan, Weight};
 use tessera_mem::{Tensor, View};
 
@@ -77,10 +78,23 @@ impl Loopback {
             for (r, rank) in self.ranks.iter().enumerate() {
                 parts.push(rank.read(step(r).reads[0])?);
             }
-            let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
+            let first = step(0);
+            let whole = match first.kernel.name() == AllGather::NAME {
+                true => {
+                    let joined = gathered(
+                        &parts.iter().map(Tensor::bytes).collect::<Vec<_>>(),
+                        first.kernel.sizes()[0],
+                    );
+                    Tensor::from_bytes(vec![first.write.len], parts[0].dtype(), &joined)
+                }
+                false => {
+                    let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
+                    Tensor::f32(vec![first.write.len], sum)
+                }
+            };
             for (r, rank) in self.ranks.iter_mut().enumerate() {
                 let write = rank.plan().steps[sums[r][at]].write;
-                rank.write(write, Tensor::f32(vec![write.len], sum.clone()).view())?;
+                rank.write(write, whole.view())?;
             }
         }
         let outputs = self.ranks[0].plan().outputs.clone();
@@ -98,9 +112,9 @@ impl Loopback {
     }
 }
 
-/// The steps of `plan` that sum over ranks, in order.
+/// The steps of `plan` that cross ranks, in order.
 fn sums(plan: &Plan) -> Vec<usize> {
     let steps = plan.steps.iter().enumerate();
-    let sums = steps.filter(|(_, s)| s.kernel.name() == "all_reduce");
+    let sums = steps.filter(|(_, s)| crosses(s.kernel.name()));
     sums.map(|(i, _)| i).collect()
 }

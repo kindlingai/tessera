@@ -5,9 +5,10 @@ use crate::{Base, Error, Run};
 use std::ops::Range;
 use std::time::Instant;
 use tessera_codegen::Precision;
-use tessera_engine_comm::{Transport, summed};
+use tessera_engine_comm::{Transport, gathered, summed};
 use tessera_engine_settings::Settings;
 use tessera_gpukit::Platform;
+use tessera_lower::kernels::{AllGather, crosses};
 use tessera_lower::{Launching, Plan, Step};
 use tessera_mem::{DType, Tensor};
 
@@ -95,6 +96,18 @@ impl<T: Transport> Rank<T> {
         Ok(())
     }
 
+    /// A host gather of each rank's rows.
+    fn gather(&mut self, step: &Step) -> Result<(), Error> {
+        let start = Instant::now();
+        let part = self.runner.read(step.reads[0])?;
+        let parts = self.transport.exchange(part.bytes())?;
+        let rows = step.kernel.sizes()[0];
+        let whole = Tensor::from_bytes(vec![step.write.len], part.dtype(), &gathered(&parts, rows));
+        self.runner.write(step.write, whole.view())?;
+        self.lap("all_gather", start);
+        Ok(())
+    }
+
     /// Notes the seconds since `from` as `name`. Returns now.
     fn lap(&mut self, name: &str, from: Instant) -> Instant {
         let now = Instant::now();
@@ -125,15 +138,17 @@ impl<T: Transport> Run for Rank<T> {
         let mut from = steps.start;
         for i in steps.clone() {
             let step = &self.runner.plan().steps[i];
-            if step.kernel.name() != "all_reduce" {
+            if !crosses(step.kernel.name()) {
                 continue;
             }
             let step = step.clone();
             self.runner.submit(from..i)?;
             from = i + 1;
-            match self.grid.is_some() {
-                true => self.grid_sum(i, &step)?,
-                false => self.exchange(&step)?,
+            // Gathers always cross on the host.
+            match (step.kernel.name() == AllGather::NAME, self.grid.is_some()) {
+                (true, _) => self.gather(&step)?,
+                (false, true) => self.grid_sum(i, &step)?,
+                (false, false) => self.exchange(&step)?,
             }
         }
         self.runner.submit(from..steps.end)?;

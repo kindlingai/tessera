@@ -49,6 +49,8 @@ pub fn shard_aligned(g: &Graph, parts: &Parts, shares: &Shares) -> Result<Sharde
     }
     let routed = route(&out);
     adopt(&mut out, routed, fit, &mut whole);
+    let gathered = gather(&out);
+    adopt(&mut out, gathered, fit, &mut whole);
     if let Ok(merged) = retype(&merge(&out)) {
         out = merged;
     }
@@ -212,6 +214,44 @@ fn route(g: &Graph) -> Graph {
         }
     }
     out
+}
+
+/// Returned matmuls of lone weights split by rows, then gather.
+fn gather(g: &Graph) -> Graph {
+    let mut out = g.clone();
+    let mut at = 0;
+    while at < out.nodes.len() {
+        let id = NodeId(at as u32);
+        at += 1;
+        let node = out.node(id);
+        let returned = (out.entries.iter().flat_map(|e| &e.outputs)).any(|o| o.node == id);
+        let weight = node.args.get(1).copied();
+        let Some(weight) = weight.filter(|_| returned && node.op == Op::Matmul) else {
+            continue;
+        };
+        if !whole_weight(&out, weight) || !lone(&out, weight, id) {
+            continue;
+        }
+        place(&mut out, weight, 0);
+        let joined = Node {
+            op: Op::Row(Row(vec![Stage::AllGather])),
+            args: vec![id],
+            ty: out.node(id).ty.clone(),
+            numerics: Some(Numerics::default()),
+        };
+        insert(&mut out, id, joined);
+        at += 1;
+    }
+    out
+}
+
+/// Whether only `reader` reads the weight at `weight`.
+fn lone(g: &Graph, weight: NodeId, reader: NodeId) -> bool {
+    let w = &g.node(weight).op;
+    let others = (g.nodes.iter().enumerate()).filter(|(i, _)| *i != reader.0 as usize);
+    !others
+        .flat_map(|(_, n)| &n.args)
+        .any(|a| g.node(*a).op == *w)
 }
 
 /// Whether `id` is a sum that only `reader` reads.

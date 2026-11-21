@@ -279,8 +279,9 @@ impl<'a> Tree<'a> {
                 Op::Input { .. } => return Err(Unsupported::EntryInput.into()),
                 Op::Row(r) => {
                     let (mut cur, mut rest) = (args[0], args[1..].iter());
-                    // One rank holds the whole sum already.
-                    let summed = |s: &&Stage| ranks > 1 || **s != Stage::AllReduce;
+                    // One rank holds the whole value already.
+                    let crossing = |s: &Stage| matches!(s, Stage::AllReduce | Stage::AllGather);
+                    let summed = |s: &&Stage| ranks > 1 || !crossing(s);
                     for stage in r.0.iter().filter(summed) {
                         let operand = (stage.operands() == 1).then(|| rest.next());
                         let operand = operand.flatten().copied();

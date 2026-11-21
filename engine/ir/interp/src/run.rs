@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tessera_graph::{
     DType, DimExpr, DimName, Graph, Mask, Node, NodeId, Numerics, Op, Parts, PathSeg, Placement,
-    Select, Shape, Size, Stage, View,
+    Row, Select, Shape, Size, Stage, View,
 };
 use tessera_mem::Tensor;
 
@@ -259,6 +259,20 @@ fn all_reduce(num: &Numerics, parts: &[Tensor]) -> Result<Tensor, Error> {
     Ok(sum)
 }
 
+/// The parts joined on their last axis, in rank order.
+fn all_gather(parts: &[Tensor]) -> Result<Tensor, Error> {
+    let mut whole = parts[0].clone();
+    for p in &parts[1..] {
+        whole = concat(&whole, p)?;
+    }
+    Ok(whole)
+}
+
+/// Where a row's sum or gather lies, if any.
+fn joins(row: &Row) -> Option<usize> {
+    (row.0.iter()).position(|s| matches!(s, Stage::AllReduce | Stage::AllGather))
+}
+
 fn run_on(
     g: &Graph,
     weights: &[Tensor],
@@ -364,21 +378,20 @@ fn run_on(
                     let rows = [args[0], args[1], args[2]];
                     store.rank(r).append(*i as usize, rows, seqs, ctx)?
                 }
-                Op::Row(row) if row.0.contains(&Stage::AllReduce) => {
-                    let at = row
-                        .0
-                        .iter()
-                        .position(|s| *s == Stage::AllReduce)
-                        .expect("found");
+                Op::Row(row) if joins(row).is_some() => {
+                    let at = joins(row).expect("found");
                     ctx(r, 0).stages(&num, &row.0[..at], &args)?
                 }
                 op => ctx(r, first).eval(&num, op, &args)?,
             });
         }
         if let Op::Row(row) = &n.op
-            && let Some(at) = row.0.iter().position(|s| *s == Stage::AllReduce)
+            && let Some(at) = joins(row)
         {
-            let sum = all_reduce(&num, &outs)?;
+            let sum = match row.0[at] {
+                Stage::AllReduce => all_reduce(&num, &outs)?,
+                _ => all_gather(&outs)?,
+            };
             let rest = &row.0[at + 1..];
             // Stages past the sum are operand-free.
             outs = (0..ranks)

@@ -3,7 +3,7 @@
 use crate::abi::Source;
 use crate::cost::Device;
 use crate::form::F32_FORM;
-use crate::kernels::{AllReduce, Scatter, Widen};
+use crate::kernels::{AllGather, AllReduce, Scatter, Widen};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
@@ -146,15 +146,27 @@ impl Cover<'_> {
                 ways: Vec::new(),
             });
         }
-        if n.term == Term::Stage(Stage::AllReduce) {
+        if let Term::Stage(stage @ (Stage::AllReduce | Stage::AllGather)) = &n.term {
             let len = self.tree.elements(t);
-            let summed = self.device.all_reduce(self.tree.bytes(t))?;
-            let cost = summed + self.need(n.args[0], zone)?;
+            // A gather costs as a sum of its bytes.
+            let moved = self.device.all_reduce(self.tree.bytes(t))?;
+            let cost = moved + self.need(n.args[0], zone)?;
+            let (rule, draft) = match stage {
+                Stage::AllReduce => (
+                    AllReduce::NAME,
+                    Draft::new(AllReduce { len }, [n.args[0]], len),
+                ),
+                _ => {
+                    let rows = len / n.shape.last().copied().unwrap_or(1).max(1);
+                    let gather = AllGather { len, rows };
+                    (AllGather::NAME, Draft::new(gather, [n.args[0]], len))
+                }
+            };
             return Some(Choice {
-                rule: "all_reduce",
-                drafts: vec![Draft::new(AllReduce { len }, [n.args[0]], len)],
+                rule,
+                drafts: vec![draft],
                 cost,
-                offered: vec!["all_reduce"],
+                offered: vec![rule],
                 ways: Vec::new(),
             });
         }

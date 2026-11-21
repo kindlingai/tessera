@@ -227,6 +227,8 @@ pub enum Stage {
     Cos,
     Softmax,
     AllReduce,
+    /// Joins each rank's part of the last axis.
+    AllGather,
     /// Entries past the position in the argument become -inf.
     Causal,
     /// Entry `i` becomes -inf where mask bit `i` is clear.
@@ -251,7 +253,7 @@ impl Stage {
         use Stage::*;
         matches!(
             self,
-            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce
+            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce | AllGather
         )
     }
 }
