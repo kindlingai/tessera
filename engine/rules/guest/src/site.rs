@@ -102,7 +102,7 @@ pub enum Site {
         /// Elements per sum across ranks, in order. Offers place each.
         sums: Vec<usize>,
         /// Each distinct op constant inside, in first-use order.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scalars: Vec<Scalar>,
     },
 }

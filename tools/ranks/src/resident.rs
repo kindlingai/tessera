@@ -7,8 +7,8 @@ use std::time::Instant;
 use tessera_device::whole;
 use tessera_engine::wasm::Module;
 use tessera_engine::{Engine, Place, Row};
-use tessera_engine_comm::{Link, ShmLink, Transport, VerbsLink};
-use tessera_frontend_comm::{CAPACITY, join, meet, shared, shm};
+use tessera_engine_comm::{ShmLink, Transport};
+use tessera_frontend_comm::{CAPACITY, join, meet, resident, shared, shm};
 use tessera_graph::Graph;
 use tessera_lower::{Recipe, Settings, Weight};
 use tessera_models::decoder::{Swiglu, stepper};
@@ -106,13 +106,7 @@ fn grid(
             let link = ShmLink::over(rank, ranks, file, &regions)?;
             Ok(whole::open(gpu, link, ranks * MPS)?)
         }
-        (None, Some(fabric)) => {
-            let pinning = tessera_engine::pinning(settings);
-            let relay = whole::RELAY;
-            let link = VerbsLink::connect(rank, ranks, fabric, &regions, relay, met, pinning)?;
-            eprintln!("rank {rank}: grid over {} ranks by RDMA", link.ranks());
-            Ok(whole::open(gpu, link, 1)?)
-        }
+        (None, Some(fabric)) => Ok(resident(met, fabric, settings)?),
         (None, None) => Err("a resident grid needs --shm or --verbs".into()),
     }
 }
