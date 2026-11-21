@@ -224,6 +224,11 @@ pub trait Run {
             None => None,
             Some(share) => match share.of(*form, bytes) {
                 Some(part) => Some(part),
+                // Decoding into the same form would round it twice.
+                None if loaded.iter().any(|l| l.slot.form.name() == form.name()) => {
+                    let (form, why) = (form.name(), "a share cuts its blocks");
+                    return Err(Error::WeightParts { weight, form, why });
+                }
                 None => return unpacked(self, weight, *form, bytes, share),
             },
         };
