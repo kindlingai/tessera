@@ -202,7 +202,6 @@ impl Pattern for Delta {
 }
 
 impl Delta {
-    /// The output's element count.
     /// Output elements at the most rows.
     pub fn out(&self) -> usize {
         self.seqs * self.rows.most() * self.heads * self.width

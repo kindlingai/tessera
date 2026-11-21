@@ -337,22 +337,29 @@ fn delta_matches_interp() {
         let got = runner.run(&views).unwrap().remove(0);
         let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
         assert!(off < 1e-4, "{:?}: off by {off:e}", settings.backend);
-        // One 64-row plan. Each sequence pads to 64.
+        // One 64-row plan. A cache launch binds the bucket.
         let mut plans = Cache::default();
         for len in [50, 33] {
             let inputs = delta_inputs(len, &mut draws);
             let want = run(&g, std::slice::from_ref(&taps), 0, &inputs).unwrap();
             let sizes = [(Seqs, 2), (Context, len as u64)];
             let (plan, bound) = plans.upto(&g, 0, &sizes, &[Context], &device).unwrap();
+            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+            assert!(names.iter().all(ours), "{names:?}");
             let slot = plan.outputs[0].slot;
             runner.replan(plan).unwrap();
             runner.bind_all(&bound);
-            let rows = bound[0].1 as usize;
-            let fed: Vec<Tensor> = inputs.iter().map(|t| padded(t, rows)).collect();
+            // Bound below the bucket, the kernels read the count.
+            let rows = if len == 33 { len } else { bound[0].1 as usize };
+            runner.bind(Context, rows as u32);
+            let fed: Vec<Tensor> = (inputs.iter().zip(&runner.plan().inputs))
+                .map(|(t, s)| flat(&padded(t, rows), s.len))
+                .collect();
             let views: Vec<_> = fed.iter().map(|t| t.view()).collect();
             runner.feed(&views).unwrap();
             runner.submit(0..runner.plan().steps.len()).unwrap();
-            let got = padded(&runner.read(slot).unwrap().reshaped(vec![2, rows, 48]), len);
+            let out = runner.read(slot).unwrap().floats().unwrap()[..2 * rows * 48].to_vec();
+            let got = padded(&Tensor::f32(vec![2, rows, 48], out), len);
             let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
             assert!(
                 off < 1e-4,
@@ -377,6 +384,13 @@ fn padded(t: &Tensor, rows: usize) -> Tensor {
     let mut shape = t.shape.clone();
     shape[1] = rows;
     Tensor::f32(shape, out)
+}
+
+/// `t`'s values, zero filled to `len`.
+fn flat(t: &Tensor, len: usize) -> Tensor {
+    let mut x = t.floats().unwrap().to_vec();
+    x.resize(len, 0.0);
+    Tensor::f32(vec![len], x)
 }
 
 /// Two sequences of `len` rows: unit keys, decays and rates.
