@@ -6,18 +6,21 @@ use crate::{Options, flatten};
 use std::time::Duration;
 use tessera_engine_comm::Link;
 use tessera_gpukit::backend::Backend as Gpu;
-use tessera_gpukit::device::Device;
-use tessera_gpukit::launch::Launch;
+use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::launch::{KernelArgs, Launch};
 
 pub use tessera_run::Sum;
 
 const KERNEL: &str = include_str!("sum.cu");
-const ENTRY: &str = "tessera_sum";
+const ENTRY: &str = "tessera_sums";
+const HAND: &str = "tessera_hand";
 /// Floats per round. A longer sum takes several.
 const ROOM: u32 = 64 << 10;
 const THREADS: u32 = 256;
-/// Sums need few blocks, so grids share the device.
-const SHARE: u32 = 8;
+/// The grid stays up, so it keeps few blocks.
+const SHARE: u32 = 64;
+/// Bytes of the job the hand kernel passes.
+const JOB: usize = 40;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -51,7 +54,56 @@ pub fn regions(ranks: u32) -> Vec<usize> {
     plan(ranks).regions().to_vec()
 }
 
-struct Grid<D: Device, L>(Resident<D, L>);
+/// A grid that stays up, and its hand kernel.
+struct Grid<D: Device, L> {
+    resident: Resident<D, L>,
+    ctx: D,
+    hand: <D as Device>::Kernel,
+    job: DeviceBuffer<D>,
+    seq: u64,
+    /// The grid runs, from a submit's first sum to `check`.
+    running: bool,
+}
+
+impl<D, L> Grid<D, L>
+where
+    D: Device + Launch<Kernel = <D as Device>::Kernel>,
+    L: Link + 'static,
+{
+    /// Queues the hand kernel. Zero floats stop the grid.
+    fn hand(&mut self, from: u64, to: u64, n: u32) -> Result<(), Error> {
+        self.seq += 1;
+        let mut args = KernelArgs::new();
+        args.device_ptr(self.resident.table())
+            .device_ptr(self.job.device_ptr())
+            .u64(from)
+            .u64(to)
+            .u32(n)
+            .u64(self.seq)
+            .u64(self.resident.deadline(TIMEOUT));
+        self.ctx.programmatic(false);
+        let one = (1, 1, 1);
+        Ok(self.ctx.launch(&self.hand, one, one, 0, &mut args)?)
+    }
+
+    /// Starts the grid unless it runs.
+    fn start(&mut self) -> Result<(), Error> {
+        if self.running {
+            return self.resident.alive();
+        }
+        let (at, next) = (self.job.device_ptr(), self.seq + 1);
+        let words = [
+            at as u32,
+            (at >> 32) as u32,
+            next as u32,
+            (next >> 32) as u32,
+        ];
+        self.resident
+            .start(&[ROOM, words[0], words[1], words[2], words[3]])?;
+        self.running = true;
+        Ok(())
+    }
+}
 
 impl<D, L> Sum for Grid<D, L>
 where
@@ -60,10 +112,19 @@ where
 {
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), tessera_run::Error> {
         let n = u32::try_from(len).map_err(|_| tessera_run::Error::SumTooLong(len))?;
-        let [a, b] = [from as u32, (from >> 32) as u32];
-        let [c, d] = [to as u32, (to >> 32) as u32];
-        let launched = self.0.launch(&[n, ROOM, a, b, c, d], TIMEOUT);
-        launched.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+        let queued = match n {
+            0 => Ok(()),
+            n => self.start().and_then(|_| self.hand(from, to, n)),
+        };
+        queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn check(&mut self) -> Result<(), tessera_run::Error> {
+        let status = match std::mem::take(&mut self.running) {
+            true => self.hand(0, 0, 0).and_then(|_| self.resident.join()),
+            false => self.resident.status(),
+        };
+        status.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 }
 
@@ -80,8 +141,18 @@ where
     };
     let text = flatten("sum.cu", KERNEL, &|_| None, &options)?.text;
     let plan = plan(link.ranks());
+    let hand = ctx.compile(&text, HAND)?;
+    let job = DeviceBuffer::alloc(ctx, JOB)?;
+    ctx.zero(job.device_ptr(), JOB)?;
     let resident = Resident::open(ctx, &text, ENTRY, link, &plan)?;
-    Ok(Box::new(Grid(resident)))
+    Ok(Box::new(Grid {
+        resident,
+        ctx: ctx.clone(),
+        hand,
+        job,
+        seq: 0,
+        running: false,
+    }))
 }
 
 /// Sums over `link` on the GPU `gpu` names.

@@ -22,6 +22,23 @@ pub trait Launch {
         shared_bytes: u32,
         args: &mut KernelArgs,
     ) -> Result<(), Error>;
+
+    /// Enqueues a launch on a stream of its own.
+    fn launch_apart(
+        &self,
+        _kernel: &Self::Kernel,
+        _grid: (u32, u32, u32),
+        _block: (u32, u32, u32),
+        _args: &mut KernelArgs,
+    ) -> Result<Box<dyn Apart>, Error> {
+        Err(Error::Gpu("this device has no separate streams"))
+    }
+}
+
+/// A launch on its own stream.
+pub trait Apart: Send {
+    /// Waits for the launch to end.
+    fn wait(&self) -> Result<(), Error>;
 }
 
 /// Typed kernel arguments in aligned slots.

@@ -1,8 +1,9 @@
 //! One persistent grid per rank, with its proxy beside it.
 
 use crate::layout::{
-    ARENAS, Barrier, ConventionRef, Counters, DTYPES, Fault, Item, Lane, Launch as Record,
-    MAX_DEPTH, MAX_GROUP, MAX_POOLS, PAGE, Pool, PoolSet, Ref, SIZES, STATUS, Table, VALUES,
+    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DTYPES, Fault, Item, Lane,
+    Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, PAGE, Pool, PoolSet, Ref, SIZES, STATUS,
+    Table, VALUES,
 };
 use crate::proxy::page::Page;
 use crate::proxy::running::Running;
@@ -11,12 +12,13 @@ use crate::proxy::{self, Op, Proxy};
 use crate::{Backend, Options, flatten};
 use std::ffi::c_int;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tessera_engine_comm::{Error as CommError, Link as Comm};
 use tessera_gpukit::Error as GpuError;
 use tessera_gpukit::backend::Backend as Gpu;
 use tessera_gpukit::device::{Device, DeviceBuffer};
-use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_gpukit::launch::{Apart, KernelArgs, Launch};
 
 /// Arenas the launcher fills: control, doorbell, then the link's.
 const CONTROL: u32 = 0;
@@ -197,6 +199,8 @@ pub struct Resident<D: Device, L> {
     clock: (u64, Instant),
     seq: u64,
     broken: bool,
+    /// A grid started apart, until `join`.
+    apart: Option<Box<dyn Apart>>,
 }
 
 impl<D, L> Resident<D, L>
@@ -241,6 +245,7 @@ where
             clock: (0, Instant::now()),
             seq: 0,
             broken: false,
+            apart: None,
         };
         let mut arenas = [0u64; ARENAS];
         arenas[DOORBELL as usize] = device_page;
@@ -377,6 +382,56 @@ where
 
     /// One launch with `values`. Waits for the grid to end.
     pub fn launch(&mut self, values: &[u32], timeout: Duration) -> Result<(), Error> {
+        let deadline = self.deadline(timeout);
+        self.record(values, deadline)?;
+        let mut args = KernelArgs::new();
+        args.device_ptr(self.table());
+        let (grid, threads) = ((self.grid, 1, 1), (self.threads, 1, 1));
+        self.ctx.launch(&self.kernel, grid, threads, 0, &mut args)?;
+        self.ctx.finish()?;
+        self.status()?;
+        self.broken = false;
+        Ok(())
+    }
+
+    /// Starts the grid on its own stream, with no deadline.
+    pub fn start(&mut self, values: &[u32]) -> Result<(), Error> {
+        if self.apart.is_some() {
+            return Err(plan("the grid already runs"));
+        }
+        self.record(values, 0)?;
+        let mut args = KernelArgs::new();
+        args.device_ptr(self.table());
+        let (grid, threads) = ((self.grid, 1, 1), (self.threads, 1, 1));
+        let apart = self
+            .ctx
+            .launch_apart(&self.kernel, grid, threads, &mut args)?;
+        self.apart = Some(apart);
+        self.broken = false;
+        Ok(())
+    }
+
+    /// Waits for a started grid, then reads its fault.
+    pub fn join(&mut self) -> Result<(), Error> {
+        if let Some(apart) = self.apart.take() {
+            apart.wait()?;
+        }
+        self.status()
+    }
+
+    /// The control table's device address, the kernel's argument.
+    pub fn table(&self) -> u64 {
+        self.control.device_ptr()
+    }
+
+    /// The device clock `timeout` from now.
+    pub fn deadline(&self, timeout: Duration) -> u64 {
+        let ahead = (self.clock.1.elapsed() + timeout).as_secs_f64() * self.ctx.ticks();
+        self.clock.0 + ahead as u64
+    }
+
+    /// Writes the launch record and clears the fault.
+    fn record(&mut self, values: &[u32], deadline: u64) -> Result<(), Error> {
         if self.broken {
             return Err(plan("an earlier launch failed"));
         }
@@ -386,43 +441,42 @@ where
         self.broken = true;
         self.alive()?;
         self.seq += 1;
-        let ahead = (self.clock.1.elapsed() + timeout).as_secs_f64() * self.ctx.ticks();
         let mut record = Record {
             seq: self.seq,
-            deadline: self.clock.0 + ahead as u64,
+            deadline,
             values: [0; VALUES],
         };
         record.values[..values.len()].copy_from_slice(values);
-        let base = self.control.device_ptr();
+        let base = self.table();
         self.ctx
             .upload(base + self.places.launch, bytes(&[record]))?;
         self.ctx
             .upload(base + self.places.status, bytes(&[zeroed::<Fault>()]))?;
-        let mut args = KernelArgs::new();
-        args.device_ptr(base);
-        let (grid, threads) = ((self.grid, 1, 1), (self.threads, 1, 1));
-        self.ctx.launch(&self.kernel, grid, threads, 0, &mut args)?;
-        self.ctx.finish()?;
+        Ok(())
+    }
+
+    /// The proxy's error, or the fault the grid recorded.
+    pub fn status(&mut self) -> Result<(), Error> {
         self.alive()?;
         let mut fault = [zeroed::<Fault>()];
         let raw = unsafe {
             std::slice::from_raw_parts_mut(fault.as_mut_ptr().cast(), size_of::<Fault>())
         };
-        self.ctx.download(base + self.places.status, raw)?;
+        self.ctx.download(self.table() + self.places.status, raw)?;
         let [fault] = fault;
         if fault.code != 0 {
+            self.broken = true;
             return Err(Error::Fault {
                 code: Status(fault.code),
                 pool: fault.pool,
                 ordinal: fault.ordinal,
             });
         }
-        self.broken = false;
         Ok(())
     }
 
     /// The proxy's error, if its thread stopped.
-    fn alive(&mut self) -> Result<(), Error> {
+    pub fn alive(&mut self) -> Result<(), Error> {
         if !self.running.as_ref().is_none_or(Running::failed) {
             return Ok(());
         }
@@ -450,6 +504,12 @@ where
 
 impl<D: Device, L> Drop for Resident<D, L> {
     fn drop(&mut self) {
+        // A grid still running sees the abort word and ends.
+        if let Some(apart) = self.apart.take() {
+            let abort = (self.page as usize + DOORBELL_ABORT) as *const AtomicU64;
+            unsafe { &*abort }.store(1, Ordering::Release);
+            let _ = apart.wait();
+        }
         // The proxy reads the page and regions until it stops.
         if let Some(running) = self.running.take() {
             self.parked = running.stop().0;

@@ -10,7 +10,7 @@ use crate::backend::Backend;
 use crate::device::{Caches, Device};
 use crate::dl::image_hash;
 use crate::gate::Gate;
-use crate::launch::{KernelArgs, Launch};
+use crate::launch::{self, KernelArgs, Launch};
 use crate::{Error, Platform};
 
 /// A driver handle: a module, function, stream or graph.
@@ -136,7 +136,10 @@ pub trait Api: Sync + Sized + 'static {
     fn check(&self, code: c_int, what: &str) -> Result<(), Error>;
     fn set_current(&self, own: &Self::Own, device: c_int) -> Result<(), Error>;
     /// Waits for the default stream, where all plain work runs.
-    fn synchronize(&self) -> Result<(), Error>;
+    fn synchronize(&self) -> Result<(), Error> {
+        self.wait(std::ptr::null_mut())
+    }
+    fn wait(&self, stream: Handle) -> Result<(), Error>;
     fn stream(&self) -> Result<Handle, Error>;
     fn begin_capture(&self, stream: Handle) -> Result<(), Error>;
     fn end_capture(&self, stream: Handle, graph: &mut Handle) -> Result<(), Error>;
@@ -462,6 +465,60 @@ impl<A: Api> Launch for Context<A> {
             })
         })
     }
+
+    fn launch_apart(
+        &self,
+        kernel: &Kernel<A>,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &mut KernelArgs,
+    ) -> Result<Box<dyn launch::Apart>, Error> {
+        self.locked(|api| {
+            let stream = Stream {
+                api,
+                raw: api.stream()?,
+            };
+            let mut params = args.pointers();
+            api.launch(&Call {
+                kernel: kernel.raw,
+                grid: [grid.0, grid.1, grid.2],
+                block: [block.0, block.1, block.2],
+                shared_bytes: 0,
+                stream: stream.raw,
+                params: params.as_mut_ptr(),
+            })?;
+            Ok(Box::new(Apart {
+                ctx: self.clone(),
+                stream,
+            }) as Box<dyn launch::Apart>)
+        })
+    }
+}
+
+/// A stream of its own, destroyed on drop.
+struct Stream<A: Api> {
+    api: &'static A,
+    raw: Handle,
+}
+
+unsafe impl<A: Api> Send for Stream<A> {}
+
+impl<A: Api> Drop for Stream<A> {
+    fn drop(&mut self) {
+        self.api.destroy(Kind::Stream, self.raw);
+    }
+}
+
+/// A launch on its own stream, with its context.
+struct Apart<A: Api> {
+    ctx: Context<A>,
+    stream: Stream<A>,
+}
+
+impl<A: Api> launch::Apart for Apart<A> {
+    fn wait(&self) -> Result<(), Error> {
+        self.ctx.locked(|a| a.wait(self.stream.raw))
+    }
 }
 
 /// A loaded module, unloaded when its last kernel drops.
@@ -729,8 +786,8 @@ macro_rules! shared_api {
             $check(self, code, what)
         }
 
-        fn synchronize(&self) -> Result<(), $crate::Error> {
-            let code = unsafe { (self.$sync)(::std::ptr::null_mut()) };
+        fn wait(&self, stream: $crate::api::Handle) -> Result<(), $crate::Error> {
+            let code = unsafe { (self.$sync)(stream) };
             self.check(code, $sync_label)
         }
 

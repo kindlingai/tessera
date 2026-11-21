@@ -13,8 +13,12 @@ use tessera_mem::{DType, Tensor};
 
 /// A sum across ranks between two device addresses.
 pub trait Sum {
-    /// Sums `len` floats at `from` into `to`. Waits for it.
+    /// Queues a sum of `len` floats at `from` into `to`.
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), Error>;
+    /// Fails if a queued sum failed. May wait.
+    fn check(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// One rank: its runner and its way to the others.
@@ -107,7 +111,11 @@ impl<T: Transport> Run for Rank<T> {
             }
             self.note("all_reduce", start.elapsed().as_secs_f64());
         }
-        self.runner.submit(from..steps.end)
+        self.runner.submit(from..steps.end)?;
+        match (&mut self.grid, from > steps.start) {
+            (Some(grid), true) => grid.check(),
+            _ => Ok(()),
+        }
     }
 
     fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {
