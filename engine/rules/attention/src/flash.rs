@@ -144,8 +144,13 @@ fn stage_kv<const TRANSPOSED: bool>(
     let mut held = [0.0f32; HELD];
     for j in 0..(BK * (cw / WIDE) + THREADS - 1) / THREADS {
         let i = lid() + j * THREADS;
-        let t = i / (cw / WIDE);
-        let d = (i % (cw / WIDE)) * WIDE;
+        // Transposed, keys run across lanes: no bank conflicts.
+        let t = if TRANSPOSED { i % BK } else { i / (cw / WIDE) };
+        let d = if TRANSPOSED {
+            (i / BK) * WIDE
+        } else {
+            (i % (cw / WIDE)) * WIDE
+        };
         // Past `count` it reads 0. `zero()` leaves it unset.
         let mut v = F32x4::new(0.0, 0.0, 0.0, 0.0);
         if i < BK * (cw / WIDE) && k0 + t < count {
@@ -158,8 +163,12 @@ fn stage_kv<const TRANSPOSED: bool>(
     }
     for j in 0..(BK * (cw / WIDE) + THREADS - 1) / THREADS {
         let i = lid() + j * THREADS;
-        let t = i / (cw / WIDE);
-        let d = (i % (cw / WIDE)) * WIDE;
+        let t = if TRANSPOSED { i % BK } else { i / (cw / WIDE) };
+        let d = if TRANSPOSED {
+            (i / BK) * WIDE
+        } else {
+            (i % (cw / WIDE)) * WIDE
+        };
         if i < BK * (cw / WIDE) {
             for e in 0..WIDE {
                 let v = held[(4 * j + e) as usize];
