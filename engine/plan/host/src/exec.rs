@@ -1,6 +1,6 @@
 //! Runs a body on the host, each group in lockstep.
 
-use crate::lockstep::Slabs;
+use crate::lockstep::{Slabs, bf16_pair};
 use std::collections::HashMap;
 use tessera_codegen::form::Load;
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};

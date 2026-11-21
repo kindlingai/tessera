@@ -664,7 +664,7 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
                 wgsl: None,
                 host: |g, args, mask| {
                     let (hi, lo) = (g.eval(&args[0], mask), g.eval(&args[1], mask));
-                    let pair = |(h, l): (Val, Val)| Val::U(crate::lockstep::bf16_pair(h.f(), l.f()));
+                    let pair = |(h, l): (Val, Val)| Val::U(bf16_pair(h.f(), l.f()));
                     hi.into_iter().zip(lo).map(pair).collect()
                 },
                 count: |c, _| c.tally(int(2.0), false),
