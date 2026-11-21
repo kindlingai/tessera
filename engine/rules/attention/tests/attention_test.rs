@@ -11,7 +11,7 @@ use tessera_lower::{Device, Pick, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, fill, graphs, max_abs_diff};
-use tessera_trace::{EntryKind, Mask, Model, Port, Role};
+use tessera_trace::{EntryKind, Mask, Model, PathSeg, Port, Role, Taps, Weights};
 
 /// Attention under `mask` over `heads` query heads of `width`.
 fn attention(mask: Mask, heads: u64, width: u64) -> Graph {
@@ -261,7 +261,7 @@ fn gpu_rules_match() {
     }
 }
 
-/// Two key heads serve six value heads of another width.
+/// Filtered values, then six value heads over two key heads.
 #[test]
 fn delta_matches_interp() {
     let dim = |name, size| Dim { name, size };
@@ -278,16 +278,19 @@ fn delta_matches_interp() {
         ty: TensorType::new(shape, DType::F32),
     };
     let (keys, rows) = ([Seqs, Context, KvHeads, HeadDim], [Seqs, Context, Heads]);
-    let values = [Seqs, Context, Heads, Hidden];
+    let channels = vec![Seqs.into(), Context.into(), 48u64.into()];
     let ports = [
         keys.into(),
         keys.into(),
-        values.into(),
+        channels.into(),
         rows.into(),
         rows.into(),
     ]
     .map(port);
-    let [q, k, v, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let [q, k, x, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let mut path = vec![PathSeg::Field("taps".into())];
+    let taps = Taps::declare(&m, &mut path, &[48u64.into(), 4u64.into()]);
+    let v = x.conv(&taps).reshape([Seqs, Context, Heads, Hidden]);
     let out = m.delta(0.25, [&q, &k, &v], [&decay, &rate]);
     let g = m.finish([(Role::Logits, &out)]);
     let mut draws = Noise(7);
@@ -309,11 +312,12 @@ fn delta_matches_interp() {
     let inputs = [
         unit(&mut draws),
         unit(&mut draws),
-        noise(vec![seqs, len, 6, 8], &mut draws),
+        noise(vec![seqs, len, 48], &mut draws),
         gate(&mut draws, |x| -x.abs()),
         gate(&mut draws, |x| (x + 1.0) / 2.0),
     ];
-    let want = run(&g, &[], 0, &inputs).unwrap();
+    let taps = noise(vec![48, 4], &mut draws);
+    let want = run(&g, std::slice::from_ref(&taps), 0, &inputs).unwrap();
     let sizes = [(Seqs, seqs as u64), (Context, len as u64)];
     let native = Settings {
         backend: Pick::Cpu,
@@ -323,10 +327,12 @@ fn delta_matches_interp() {
         let plan = lower(&g, 0, &sizes, &Device::guess(&settings)).unwrap();
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         let mut runner = open(plan, &settings).unwrap();
+        runner.load(0, taps.view()).unwrap();
         let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
         let got = runner.run(&views).unwrap().remove(0);
         let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
-        assert!(names.iter().all(|n| n.ends_with("delta")), "{names:?}");
+        let ours = |n: &&str| n.ends_with("delta") || n.ends_with("conv");
+        assert!(names.iter().all(ours), "{names:?}");
         assert!(
             off < 1e-4,
             "{names:?} on {:?}: off by {off:e}",

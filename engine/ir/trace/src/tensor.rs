@@ -1,7 +1,7 @@
 //! Traced tensors: each method appends one node.
 
 use crate::model::{Kept, Shared, push};
-use crate::weights::{Embed, Linear, Norm, Scalar, Vector};
+use crate::weights::{Embed, Linear, Norm, Scalar, Taps, Vector};
 use tessera_graph::{
     Act, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
 };
@@ -30,6 +30,11 @@ impl Tensor {
 
     pub fn matmul(&self, w: &Linear) -> Tensor {
         self.op(Op::Matmul, &[&w.0])
+    }
+
+    /// Each channel over its last rows, through `w`'s taps.
+    pub fn conv(&self, w: &Taps) -> Tensor {
+        self.op(Op::Conv, &[&w.0])
     }
 
     /// Logits over a table's rows, for tied embeddings.

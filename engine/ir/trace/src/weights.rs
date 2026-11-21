@@ -47,6 +47,9 @@ pub struct Scalar(pub(crate) Tensor);
 /// `#[shape(Rows, Width)]`: a table read by index.
 pub struct Embed(pub(crate) Tensor);
 
+/// `#[shape(Width, Taps)]`: each channel's causal filter.
+pub struct Taps(pub(crate) Tensor);
+
 /// `#[shape(Count, In, Out)]`, stored `[Count, Out, In]`.
 pub struct Linears(pub(crate) Tensor);
 
@@ -128,6 +131,12 @@ impl Weights for Linears {
         stored.reverse();
         stored.rotate_right(1);
         Linears(leaf(m, path, stored, 3))
+    }
+}
+
+impl Weights for Taps {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        Taps(leaf(m, path, shape.to_vec(), 2))
     }
 }
 

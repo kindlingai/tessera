@@ -224,6 +224,30 @@ pub(crate) fn attend(
     Ok(Tensor::f32(vec![seqs, ctx, heads, dv], out))
 }
 
+/// Rows before a sequence's first read as zero.
+pub(crate) fn conv(x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+    let [seqs, ctx, width] = x.shape[..] else {
+        return Err(Error::Mismatch("conv wants rank 3".into()));
+    };
+    let taps = w.shape[1];
+    let (xs, ws) = (x.floats()?, w.floats()?);
+    let mut out = vec![0.0; xs.len()];
+    for s in 0..seqs {
+        for t in 0..ctx {
+            let at = (s * ctx + t) * width;
+            for c in 0..width {
+                let mut sum = 0.0;
+                for j in (taps - 1).saturating_sub(t)..taps {
+                    let back = taps - 1 - j;
+                    sum += ws[c * taps + j] * xs[at - back * width + c];
+                }
+                out[at + c] = sum;
+            }
+        }
+    }
+    Ok(Tensor::f32(x.shape.clone(), out))
+}
+
 /// Holds each value head's state as key columns.
 pub(crate) fn delta(n: &Numerics, d: &Delta, args: [&Tensor; 5]) -> Result<Tensor, Error> {
     let acc = Acc::new(n.accumulate)?;

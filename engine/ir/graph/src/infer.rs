@@ -102,6 +102,7 @@ fn arity(op: &Op) -> usize {
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) | Op::Mix(_) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
         Op::Delta(_) => 5,
+        Op::Conv => 2,
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
         Op::View(_) => 1,
     }
@@ -130,6 +131,7 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             .map(|w| w.ty.clone())
             .ok_or_else(missing),
         Op::Matmul => matmul(&g.dims, args[0], args[1]),
+        Op::Conv => conv(&g.dims, args[0], args[1]),
         Op::Attend(a) if a.ragged => {
             finite(a.scale, "attention scale")?;
             need(a.mask == Mask::Causal, ErrorKind::Value, || {
@@ -290,6 +292,35 @@ fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
         key_lists(dims, ids, q, 2)?;
     }
     Ok(valued(q, v))
+}
+
+/// Rows `[Seqs, Context, C]` through taps `[C, K]`.
+fn conv(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, TypeError> {
+    let fits = x.rank() == 3 && w.rank() == 2 && same(dims, &x.shape.0[2], &w.shape.0[0])?;
+    need(fits, ErrorKind::Shape, || {
+        format!(
+            "conv takes x [Seqs, Context, C] and w [C, K], got {} and {}",
+            x.shape, w.shape
+        )
+    })?;
+    need(
+        x.dtype.is_float() && x.dtype == w.dtype,
+        ErrorKind::DType,
+        || {
+            format!(
+                "conv needs matching floats, got {:?} and {:?}",
+                x.dtype, w.dtype
+            )
+        },
+    )?;
+    let whole = [x, w].iter().all(|t| t.placement == Placement::Replicated);
+    need(whole, ErrorKind::Placement, || {
+        format!(
+            "conv takes whole tensors, got {:?} and {:?}",
+            x.placement, w.placement
+        )
+    })?;
+    Ok(x.clone())
 }
 
 /// Value heads group over the query and key heads.

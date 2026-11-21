@@ -109,6 +109,8 @@ pub enum Op {
     Attend(Attend),
     /// Queries, keys, values, log decays and write rates.
     Delta(Delta),
+    /// Each channel sums its last `K` rows, weighted by taps.
+    Conv,
     /// Scores `[.., Queries, Keys]`. Unseen keys become negative infinity.
     Mask(Mask),
     /// Appends rows to kept rows. The result holds all.

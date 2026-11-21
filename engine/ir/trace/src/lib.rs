@@ -14,7 +14,7 @@ pub use tessera_graph::{
     Role, Shape, Size, TensorType,
 };
 pub use tessera_trace_derive::Weights;
-pub use weights::{Embed, Linear, Linears, Norm, Scalar, Vector, Weights, declare, each};
+pub use weights::{Embed, Linear, Linears, Norm, Scalar, Taps, Vector, Weights, declare, each};
 
 #[cfg(test)]
 mod trace_test;
