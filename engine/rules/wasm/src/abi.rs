@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use tessera_graph::DimName;
-pub(crate) use tessera_guest::site::{Ask, Input, Kept, Kind, Lane, Place, Shape, Site};
+pub(crate) use tessera_guest::site::{Ask, Input, Kept, Kind, Lane, Place, Scalar, Shape, Site};
 
 /// The version of this exchange the host reads.
 pub(crate) use tessera_guest::ABI;

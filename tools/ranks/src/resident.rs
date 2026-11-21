@@ -12,6 +12,7 @@ use tessera_frontend_comm::{CAPACITY, join, meet, shared, shm};
 use tessera_graph::Graph;
 use tessera_lower::{Recipe, Settings, Weight};
 use tessera_models::decoder::{Swiglu, stepper};
+use tessera_models::mla::{self, RotatedMoe};
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
 
@@ -25,8 +26,18 @@ const MPS: u32 = 16;
 /// Decode steps after the prompt, timed.
 const STEPS: u32 = 32;
 
-fn graph() -> Graph {
-    stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())
+/// The small `model`. GLM keys span `CONTEXT`, experts split.
+fn graph(model: &str) -> Result<Graph, Box<dyn Error>> {
+    match model {
+        "qwen3" => Ok(stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())),
+        "glm53" => {
+            let mut c = tessera_models::small::glm53();
+            c.stack.ffn = 256;
+            c.stack.max_context = CONTEXT as u64;
+            Ok(mla::stepper::<RotatedMoe>(&c))
+        }
+        _ => Err(format!("--recipe runs qwen3 or glm53, not {model}").into()),
+    }
 }
 
 /// The recipe's choices, with its module's rules.
@@ -41,11 +52,11 @@ fn choices(dir: &Path) -> Result<Recipe, Box<dyn Error>> {
 
 /// A faux-weight engine: alone, or a rank over two transports.
 fn engine(
+    g: Graph,
     lower: &Recipe,
     settings: &Settings,
     ranked: Option<[Box<dyn Transport>; 2]>,
 ) -> Result<Engine, Box<dyn Error>> {
-    let g = graph();
     let stored: Vec<Weight> = weights(&g, &mut Noise(3))
         .into_iter()
         .map(Weight::Floats)
@@ -130,7 +141,12 @@ pub fn run(args: &Args, dir: &Path) -> Outcome {
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
     let grid = grid(args, &mut *met, &settings)?;
-    let mut ranked = engine(&lower, &settings, Some(join(met, None)?))?;
+    let mut ranked = engine(
+        graph(&args.model)?,
+        &lower,
+        &settings,
+        Some(join(met, None)?),
+    )?;
     ranked.persist(grid)?;
     if rank != 0 {
         ranked.follow()?;
@@ -140,7 +156,7 @@ pub fn run(args: &Args, dir: &Path) -> Outcome {
     let launches = launches();
     let (got, grid_s) = timed(&mut ranked, &launches)?;
     ranked.dismiss()?;
-    let mut alone = engine(&Recipe::default(), &settings, None)?;
+    let mut alone = engine(graph(&args.model)?, &Recipe::default(), &settings, None)?;
     let (want, alone_s) = timed(&mut alone, &launches)?;
     let same = got.iter().zip(&want).filter(|(a, b)| a == b).count();
     for (i, (a, b)) in got

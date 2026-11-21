@@ -1,0 +1,12 @@
+# GLM-5.3 embedding to logits as one persistent kernel per step.
+name = "glm53-whole"
+module = "model"
+
+[weights]
+path = "weights"
+
+[lower]
+favor = "glm53_whole"
+
+[serve]
+task = "generate"

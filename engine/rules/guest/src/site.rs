@@ -101,7 +101,69 @@ pub enum Site {
         kept: Vec<Kept>,
         /// Elements per sum across ranks, in order. Offers place each.
         sums: Vec<usize>,
+        /// Each distinct op constant inside, in first-use order.
+        #[serde(default)]
+        scalars: Vec<Scalar>,
     },
+}
+
+/// A model region's step: one output, kept rows by slot.
+pub struct Step<'a> {
+    pub inputs: &'a [Input],
+    /// Elements of the output.
+    pub len: usize,
+    pub kept: &'a [Kept],
+    pub sums: &'a [usize],
+    pub scalars: &'a [Scalar],
+    /// Input places of tokens, positions, slots and picks.
+    pub ids: [usize; 4],
+}
+
+impl Site {
+    /// This site as a model region's step.
+    pub fn step(&self) -> Option<Step<'_>> {
+        let Site::Region {
+            kind: Kind::Model,
+            inputs,
+            outputs,
+            kept,
+            sums,
+            scalars,
+        } = self
+        else {
+            return None;
+        };
+        let (&[len], Some(first)) = (&outputs[..], kept.first()) else {
+            return None;
+        };
+        let [Some(slots), Some(positions)] = first.by else {
+            return None;
+        };
+        let ids = |i: &usize| inputs[*i].form == "u32" && ![slots, positions].contains(i);
+        let mut ids = (0..inputs.len()).filter(ids);
+        let (tokens, picks) = (ids.next()?, ids.next()?);
+        Some(Step {
+            inputs,
+            len,
+            kept,
+            sums,
+            scalars,
+            ids: [tokens, positions, slots, picks],
+        })
+    }
+}
+
+/// One op constant: an eps, a theta or a scale.
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct Scalar {
+    /// `rms_norm`, `rope_adjacent`, `rope_halves`, `scale`, `attend` or `top_k`.
+    pub op: String,
+    pub value: f32,
+}
+
+/// The first value of `op`, if the region has one.
+pub fn scalar(scalars: &[Scalar], op: &str) -> Option<f32> {
+    scalars.iter().find(|s| s.op == op).map(|s| s.value)
 }
 
 /// Kept rows a region's launches append to.
@@ -119,6 +181,18 @@ pub struct Kept {
     pub values: Vec<u32>,
     /// Input places of the slot and position ids.
     pub by: [Option<usize>; 2],
+}
+
+impl Kept {
+    /// The resident layout code, and rows per page.
+    pub fn code(&self) -> Option<[u32; 2]> {
+        match (self.layout.as_str(), self.page) {
+            ("dense", None) => Some([0, 0]),
+            ("interleaved", None) => Some([1, 0]),
+            (_, Some(page)) if page.is_power_of_two() => Some([2, page as u32]),
+            _ => None,
+        }
+    }
 }
 
 /// One value a region reads.

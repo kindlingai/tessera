@@ -1,8 +1,8 @@
 //! Sites for the module, and its offers as drafts.
 
-use crate::abi::{Count, Entry, Input, Kept, Kind, Offer, Place, Site};
+use crate::abi::{Count, Entry, Input, Kept, Kind, Offer, Place, Scalar, Site};
 use crate::text::{Fixed, Text};
-use tessera_graph::{Composite, DimName, PathSeg};
+use tessera_graph::{Composite, DimName, Op, Pairs, PathSeg, Select, Stage};
 use tessera_lower::kernels::AllReduce;
 use tessera_lower::{Arg, Draft, Extent, Home, Read, T, Term, Tree, sites};
 
@@ -36,6 +36,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         Kind::Model => Composite::Model,
     };
     let r = sites::Region::of(tree, at, Some(wanted))?;
+    let scalars = scalars(tree, tree.inside(at, &r.inputs));
     let outputs = r.outputs.iter().map(|t| tree.elements(*t)).collect();
     let reads = Reads {
         nodes: r.inputs,
@@ -57,8 +58,38 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         outputs,
         kept,
         sums: reads.sums.clone(),
+        scalars,
     };
     Some((site, reads))
+}
+
+/// The distinct op constants of `nodes`, in order.
+fn scalars(tree: &Tree, nodes: Vec<T>) -> Vec<Scalar> {
+    let mut out: Vec<Scalar> = Vec::new();
+    for n in nodes {
+        let (op, value) = match &tree.node(n).term {
+            Term::Stage(Stage::RmsNorm { eps } | Stage::Rms { eps }) => ("rms_norm", *eps),
+            Term::Stage(Stage::Rope { theta, pairs, .. }) => match pairs {
+                Pairs::Adjacent => ("rope_adjacent", *theta),
+                Pairs::Halves => ("rope_halves", *theta),
+            },
+            Term::Stage(Stage::Scale(by)) => ("scale", *by),
+            Term::Op(Op::Attend(a)) => ("attend", a.scale),
+            Term::Op(Op::Select(Select::TopK { .. })) => {
+                let k = tree.node(n).shape.last().copied().unwrap_or(0);
+                ("top_k", k as f32)
+            }
+            _ => continue,
+        };
+        let scalar = Scalar {
+            op: op.into(),
+            value,
+        };
+        if !out.contains(&scalar) {
+            out.push(scalar);
+        }
+    }
+    out
 }
 
 fn matmul(tree: &Tree, at: T) -> Option<(Site, Reads)> {

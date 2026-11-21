@@ -3,6 +3,7 @@
 mod module_test;
 mod regions_test;
 mod shard_test;
+mod whole_test;
 
 use tessera_models::mla::{Config, RotatedMoe, program, stepper};
 use tessera_parity::{Spec, Stepper, suite};

@@ -16,6 +16,7 @@ serde_json = "1"
 tessera-bundle = { workspace = true }
 tessera-checkpoint = { workspace = true }
 tessera-device = { workspace = true }
+tessera-engine = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-interp = { workspace = true }
 tessera-rules = { workspace = true }
@@ -26,7 +27,6 @@ tessera-trace = { workspace = true }
 
 [dev-dependencies]
 tessera-codegen = { workspace = true }
-tessera-engine = { workspace = true }
 tessera-engine-settings = { workspace = true }
 tessera-models = { workspace = true }
 tessera-recipe = { workspace = true }

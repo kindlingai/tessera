@@ -1,7 +1,7 @@
 //! GLM-5.3's routed block as one CUDA kernel.
 
-use tessera_guest::site::{self, Ask, Count, Input, Kind, Manifest, Offer, Place, Shape, Site};
-use tessera_guest::{input, output};
+use tessera_guest::output;
+use tessera_guest::site::{self, Count, Input, Kind, Manifest, Offer, Place, Shape, Site};
 
 const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
@@ -85,6 +85,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         outputs,
         kept,
         sums,
+        ..
     } = site
     else {
         return None;
@@ -266,7 +267,5 @@ pub extern "C" fn manifest() -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn propose(at: i32, len: i32) -> i64 {
     // SAFETY: the host passes back what `alloc` returned.
-    let bytes = unsafe { input(at, len) };
-    let offers = (serde_json::from_slice::<Ask>(bytes).ok()).and_then(|ask| offer(&ask.site));
-    output(serde_json::to_vec(&offers).unwrap_or_else(|_| b"null".to_vec()))
+    unsafe { tessera_guest::answer(at, len, offer) }
 }

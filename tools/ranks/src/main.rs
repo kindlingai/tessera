@@ -29,8 +29,8 @@ const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH 
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.
-  --recipe runs the small decoder with the recipe's resident grid per rank,
-  over --shm or --verbs, and rank 0 checks it against one engine alone.";
+  --recipe runs the small qwen3 or glm53 with the recipe's resident grid per
+  rank, over --shm or --verbs, and rank 0 checks it against one engine alone.";
 
 struct Args {
     rank: u32,
@@ -53,7 +53,7 @@ struct Args {
     stub: Option<u32>,
     /// The model's sums run in a persistent grid.
     grid: bool,
-    /// A recipe whose grid runs the small decoder.
+    /// A recipe whose grid runs the small model.
     recipe: Option<PathBuf>,
 }
 
