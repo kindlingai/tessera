@@ -396,7 +396,7 @@ impl Body {
 }
 
 /// Adds each helper after the ones it calls, once each.
-pub(crate) fn gather(helpers: &[Helper], found: &mut Vec<Helper>) {
+pub fn gather(helpers: &[Helper], found: &mut Vec<Helper>) {
     for h in helpers {
         gather(&h.body.helpers, found);
         match found.iter().find(|f| f.name == h.name) {

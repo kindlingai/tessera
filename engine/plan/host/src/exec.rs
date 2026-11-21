@@ -2,8 +2,9 @@
 
 use crate::lockstep::{Slabs, bf16_pair, leaders, round_e4m3, round_f16};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use tessera_codegen::form::Load;
-use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt, Ty};
+use tessera_codegen::ir::{BinOp, Body, Expr, Helper, Intrinsic, Param, Stmt, Ty, gather};
 use tessera_codegen::numerics::Precision;
 use tessera_graph::{E2M1, E4M3, F16};
 
@@ -20,6 +21,20 @@ pub enum ArgVal {
     F32(f32),
 }
 
+impl ArgVal {
+    /// A buffer is a pointer to its first element.
+    fn val(self) -> Val {
+        match self {
+            ArgVal::Buf { at, skip, form } => Val::P(at, form.offset(skip)),
+            ArgVal::U32(v) => Val::U(v),
+            ArgVal::F32(v) => Val::F(v),
+        }
+    }
+}
+
+/// No arguments, for a helper's own scope.
+static NONE: LazyLock<HashMap<String, ArgVal>> = LazyLock::new(HashMap::new);
+
 /// The launch's layout of thread groups.
 #[derive(Clone, Copy, Debug)]
 pub struct Grid {
@@ -35,6 +50,8 @@ enum Val {
     L(u64),
     B(bool),
     V([f32; 4]),
+    /// A byte offset into a buffer.
+    P(usize, usize),
 }
 
 impl Val {
@@ -44,7 +61,7 @@ impl Val {
             Val::U(x) => x as f32,
             Val::L(x) => x as f32,
             Val::B(b) => b as u32 as f32,
-            Val::V(_) => panic!("a float4 where a scalar was due"),
+            Val::V(_) | Val::P(..) => panic!("{self:?} where a scalar was due"),
         }
     }
 
@@ -62,7 +79,7 @@ impl Val {
             Val::L(x) => x as u32,
             Val::F(x) => x as u32,
             Val::B(b) => b as u32,
-            Val::V(_) => panic!("a float4 where an index was due"),
+            Val::V(_) | Val::P(..) => panic!("{self:?} where an index was due"),
         }
     }
 
@@ -72,7 +89,7 @@ impl Val {
             Val::U(x) => u64::from(x),
             Val::F(x) => x as u64,
             Val::B(b) => b as u64,
-            Val::V(_) => panic!("a float4 where an index was due"),
+            Val::V(_) | Val::P(..) => panic!("{self:?} where an index was due"),
         }
     }
 
@@ -82,7 +99,7 @@ impl Val {
             Val::U(x) => x != 0,
             Val::L(x) => x != 0,
             Val::F(x) => x != 0.0,
-            Val::V(_) => panic!("a float4 where a condition was due"),
+            Val::V(_) | Val::P(..) => panic!("{self:?} where a condition was due"),
         }
     }
 
@@ -118,6 +135,8 @@ struct Group<'a, 'b> {
     done: Vec<bool>,
     args: &'b HashMap<String, ArgVal>,
     buffers: &'b mut [&'a mut [u8]],
+    /// The helpers a call may name.
+    helpers: &'b [Helper],
 }
 
 impl Group<'_, '_> {
@@ -190,9 +209,8 @@ impl Group<'_, '_> {
             Expr::Float(x) => vec![Val::F(*x as f32); n],
             Expr::Bool(b) => vec![Val::B(*b); n],
             Expr::Var(name) => match self.args.get(name) {
-                Some(ArgVal::U32(v)) => vec![Val::U(*v); n],
-                Some(ArgVal::F32(v)) => vec![Val::F(*v); n],
-                _ => self.lookup(name).to_vec(),
+                Some(arg) => vec![arg.val(); n],
+                None => self.lookup(name).to_vec(),
             },
             Expr::Neg(a) => {
                 let mut v = self.eval(a, mask);
@@ -267,8 +285,7 @@ impl Group<'_, '_> {
                             }
                         })
                         .collect()
-                } else {
-                    let arrays = &self.arrays[name];
+                } else if let Some(arrays) = self.arrays.get(name) {
                     (0..n)
                         .map(|t| {
                             if mask[t] {
@@ -278,6 +295,9 @@ impl Group<'_, '_> {
                             }
                         })
                         .collect()
+                } else {
+                    let base = self.lookup(name).to_vec();
+                    self.bytes(&base, &at, mask, 1)
                 }
             }
             Expr::Field(base, h) => {
@@ -292,7 +312,14 @@ impl Group<'_, '_> {
             }
             Expr::Select(c, a, b) => self.branch(c, a, b, mask),
             Expr::Call(i, args) => self.call(*i, args, mask),
-            Expr::Fn(name, ..) => panic!("`{name}` runs on the device: forms unpack on the host"),
+            Expr::Fn(name, _, args) => {
+                let helpers = self.helpers;
+                let Some(h) = helpers.iter().find(|h| h.name == *name) else {
+                    panic!("`{name}` is not a helper of this body");
+                };
+                let args = args.iter().map(|a| self.eval(a, mask)).collect();
+                self.enter(h, args, mask)
+            }
         }
     }
 
@@ -348,19 +375,51 @@ impl Group<'_, '_> {
 
     /// The `width` bytes at a byte offset, as a u32.
     fn read(&mut self, args: &[Expr], mask: &[bool], width: usize) -> Vec<Val> {
-        let Expr::Var(name) = &args[0] else {
-            panic!("a word read names its buffer");
-        };
-        let (arg, at) = (self.arg(name), self.eval(&args[1], mask));
-        let bytes = &self.buffers[arg.buffer];
-        (0..self.threads)
-            .map(|t| {
-                let at = arg.skip + at[t].u() as usize;
-                let mut raw = [0u8; 4];
-                raw[..width].copy_from_slice(&bytes[at..at + width]);
-                Val::U(u32::from_le_bytes(raw))
-            })
-            .collect()
+        let (base, at) = (self.eval(&args[0], mask), self.eval(&args[1], mask));
+        self.bytes(&base, &at, mask, width)
+    }
+
+    /// The `width` bytes `at` past each pointer, as a u32.
+    fn bytes(&self, base: &[Val], at: &[Val], mask: &[bool], width: usize) -> Vec<Val> {
+        let mut out = Vec::with_capacity(base.len());
+        for t in 0..base.len() {
+            if !mask[t] {
+                out.push(Val::U(0));
+                continue;
+            }
+            let Val::P(buffer, from) = base[t] else {
+                panic!("{:?} where bytes were due", base[t]);
+            };
+            let from = from + at[t].l() as usize;
+            let Some(raw) = self.buffers[buffer].get(from..from + width) else {
+                panic!("a {width}-byte read at byte {from}, past buffer {buffer}");
+            };
+            let mut word = [0u8; 4];
+            word[..width].copy_from_slice(raw);
+            out.push(Val::U(u32::from_le_bytes(word)));
+        }
+        out
+    }
+
+    /// Helper `h` with `args` for its parameters, under `mask`.
+    fn enter(&mut self, h: &Helper, args: Vec<Vec<Val>>, mask: &[bool]) -> Vec<Val> {
+        // A helper sees its own names only.
+        let named = std::mem::replace(&mut self.args, &NONE);
+        let arrays = std::mem::take(&mut self.arrays);
+        let shared = std::mem::take(&mut self.shared);
+        let depth = self.vars.len();
+        for (param, vals) in h.body.params.iter().zip(args) {
+            self.vars.push((param.name().to_string(), vals));
+        }
+        // Its locals stay in scope for the value.
+        for s in &h.body.stmts {
+            self.stmt(s, mask);
+        }
+        let ret = h.body.ret.as_ref().expect("a helper has a value");
+        let value = self.eval(ret, mask);
+        self.vars.truncate(depth);
+        (self.args, self.arrays, self.shared) = (named, arrays, shared);
+        value
     }
 
     /// Every thread's statements, under `mask`.
@@ -704,6 +763,10 @@ macro_rules! integer {
 
 /// Integers wrap. Anything with a float is a float.
 fn binary(op: BinOp, a: Val, b: Val) -> Val {
+    if let Val::P(buffer, at) = a {
+        assert_eq!(op, BinOp::Add, "a pointer only moves forward");
+        return Val::P(buffer, at + b.l() as usize);
+    }
     let float = matches!(a, Val::F(_)) || matches!(b, Val::F(_));
     let long = matches!(a, Val::L(_)) || matches!(b, Val::L(_));
     match op {
@@ -753,32 +816,62 @@ pub fn run(
 ) {
     assert_eq!(args.len(), body.params.len(), "one argument per parameter");
     let mut named = HashMap::new();
+    let mut helpers = Vec::new();
     for (param, arg) in body.params.iter().zip(args) {
-        let name = match param {
-            Param::Buffer { name, .. }
-            | Param::Scalar { name, .. }
-            | Param::Shared { name, .. }
-            | Param::Tiles { name }
-            | Param::Array { name, .. } => name.clone(),
-        };
-        named.insert(name, *arg);
+        if let Param::Buffer { form, .. } = param {
+            gather(&form.header(), &mut helpers);
+        }
+        named.insert(param.name().to_string(), *arg);
     }
+    gather(&body.helpers, &mut helpers);
     for g in 0..grid.groups {
-        let mut group = Group {
-            threads: grid.threads,
+        let mut group = Group::new(grid.threads, lanes, precision, &named, buffers, &helpers);
+        group.first = g * grid.threads;
+        let mask = vec![true; grid.threads];
+        group.block(&body.stmts, &mask);
+    }
+}
+
+/// Helper `h` on one thread, `args` for its parameters.
+pub fn call(h: &Helper, args: &[ArgVal], buffers: &mut [&mut [u8]]) -> Vec<f32> {
+    assert_eq!(
+        args.len(),
+        h.body.params.len(),
+        "one argument per parameter"
+    );
+    let mut helpers = Vec::new();
+    gather(std::slice::from_ref(h), &mut helpers);
+    let mut group = Group::new(1, 1, Precision::EXACT, &NONE, buffers, &helpers);
+    let vals = args.iter().map(|a| vec![a.val()]).collect();
+    match group.enter(h, vals, &[true])[0] {
+        Val::V(four) => four.to_vec(),
+        one => vec![one.f()],
+    }
+}
+
+impl<'a, 'b> Group<'a, 'b> {
+    fn new(
+        threads: usize,
+        lanes: usize,
+        precision: Precision,
+        args: &'b HashMap<String, ArgVal>,
+        buffers: &'b mut [&'a mut [u8]],
+        helpers: &'b [Helper],
+    ) -> Self {
+        Group {
+            threads,
             lanes,
             precision,
-            first: g * grid.threads,
+            first: 0,
             vars: Vec::new(),
             arrays: HashMap::new(),
             shared: HashMap::new(),
             tiles: HashMap::new(),
-            done: vec![false; grid.threads],
-            args: &named,
-            buffers: &mut *buffers,
-        };
-        let mask = vec![true; grid.threads];
-        group.block(&body.stmts, &mask);
+            done: vec![false; threads],
+            args,
+            buffers,
+            helpers,
+        }
     }
 }
 

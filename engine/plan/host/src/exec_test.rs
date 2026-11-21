@@ -221,3 +221,91 @@ fn groups_pass_by_field() {
     exec::run(&body, &args, &mut [&mut out], grid, LANES, Precision::EXACT);
     assert_eq!(f32::from_le_bytes(out[..4].try_into().unwrap()), 4.0);
 }
+
+/// Each form's kernel helpers match `unpack` within exact bytes.
+#[test]
+fn helpers_read_exact_bytes() {
+    use tessera_codegen::form::{LOADS, U8};
+    use tessera_codegen::trellis::{INPUT_SIDE, packed};
+    let mut seed = 1u32;
+    let mut draw = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        seed
+    };
+    let same = |got: &[f32], want: &[f32]| {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        bits(got) == bits(want) || got.iter().zip(want).all(|(a, b)| a.is_nan() && b.is_nan())
+    };
+    for &form in LOADS.iter() {
+        let header = form.header();
+        if header.is_empty() || form.codes().is_some() {
+            continue;
+        }
+        // An entry spans 128 channels of its side.
+        let shapes: &[(usize, usize, u32)] = match form.packs() {
+            true => &[(256, 4, 1)],
+            false => &[(16, 128, 1), (128, 128, INPUT_SIDE)],
+        };
+        for &(inp, out, side) in shapes {
+            let n = inp * out;
+            let mut bytes = if form.packs() {
+                let data: Vec<f32> = (0..n).map(|_| draw() as f32 / 4e9 - 0.5).collect();
+                form.pack(&data)
+            } else {
+                let entries: Vec<u8> = (form.bytes(0)..form.bytes(n))
+                    .map(|_| draw() as u8)
+                    .collect();
+                packed(inp, out, side, &entries)
+            };
+            assert_eq!(bytes.len(), form.bytes(n), "{form:?}");
+            let want: Vec<f32> = (0..n).map(|i| form.unpack(&bytes, i)).collect();
+            // Large shapes: every eighth element, and the last four.
+            let step = (n / 2048).max(1);
+            for i in (0..n).filter(|i| i % step == 0 || *i >= n - 4) {
+                let args = [
+                    ArgVal::Buf {
+                        at: 0,
+                        skip: 0,
+                        form: &U8,
+                    },
+                    ArgVal::U32(i as u32),
+                ];
+                let one = exec::call(&header[0], &args, &mut [bytes.as_mut_slice()]);
+                assert!(same(&one, &want[i..i + 1]), "{form:?} {i}: {one:?}");
+                if i % 4 == 0 {
+                    let four = exec::call(&header[1], &args, &mut [bytes.as_mut_slice()]);
+                    assert!(same(&four, &want[i..i + 4]), "{form:?} x4 {i}: {four:?}");
+                }
+            }
+        }
+    }
+}
+
+/// The two bytes of `w` from byte `n`.
+#[helper]
+fn two(w: Buf<U8>, n: u64) -> u32 {
+    let b = w + n;
+    b[0] | (b[1] << 8)
+}
+
+#[kernel]
+fn named(w: Buf<U8>, mut out: BufMut<F32>, n: u32) {
+    out[0] = (two(w, 1) + n) as f32;
+}
+
+/// A helper's `n` is its own, not the kernel's.
+#[test]
+fn helpers_keep_their_names() {
+    let (mut w, mut out) = ([9u8, 2, 1, 9], [0u8; 4]);
+    use tessera_codegen::form::{F32_FORM, U8};
+    let buf = |at, form| ArgVal::Buf { at, skip: 0, form };
+    let args = [buf(0, &U8), buf(1, F32_FORM), ArgVal::U32(3)];
+    let grid = Grid {
+        groups: 1,
+        threads: 1,
+    };
+    let body = named_ir();
+    let buffers: &mut [&mut [u8]] = &mut [&mut w, &mut out];
+    exec::run(&body, &args, buffers, grid, LANES, Precision::EXACT);
+    assert_eq!(f32::from_le_bytes(out), 261.0);
+}

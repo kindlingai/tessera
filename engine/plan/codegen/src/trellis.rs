@@ -6,7 +6,7 @@ use crate::ir::Helper;
 use crate::prelude::{Bits, Buf, F32x4, U8, helper, round_e4m3, round_f16};
 use tessera_mem::trellis::*;
 
-pub use tessera_mem::trellis::packed;
+pub use tessera_mem::trellis::{INPUT_SIDE, packed};
 
 /// A swapped word pair as 32 stream bits.
 #[helper("form_{name}_pair")]
