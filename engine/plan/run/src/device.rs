@@ -283,7 +283,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         };
         let mut reloads = Vec::new();
         for (entry, step) in &self.entries {
-            let planned = || overrides::text(&plan.steps[*step].kernel.source(), D::BACKEND);
+            let planned = || overrides::text(&plan.steps[*step], D::BACKEND);
             let compile = |text: &str| Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?);
             reloads.extend(files.check(entry, planned, compile));
         }
@@ -406,7 +406,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         let source = self.base.plan.steps[step].kernel.source();
         let entry = overrides::entry(&source).to_string();
         let loaded = self.overrides.as_ref().and_then(|f| f.text(&entry));
-        let text = loaded.map_or_else(|| overrides::text(&source, D::BACKEND), str::to_string);
+        let planned = || overrides::text(&self.base.plan.steps[step], D::BACKEND);
+        let text = loaded.map_or_else(planned, str::to_string);
         if !text.contains("TS_MARK") {
             return Ok(Some(Marks::default()));
         }
@@ -448,8 +449,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         };
         let mut written = Vec::new();
         for (entry, step) in &self.entries {
-            let source = self.base.plan.steps[*step].kernel.source();
-            let text = overrides::text(&source, D::BACKEND);
+            let text = overrides::text(&self.base.plan.steps[*step], D::BACKEND);
             written.extend(files.write(entry, &text)?);
         }
         Ok(written)

@@ -165,6 +165,11 @@ fn head(dialect: Dialect) -> String {
 
 impl Text {
     pub fn render(&self, dialect: Dialect) -> String {
+        self.bounded(dialect, None)
+    }
+
+    /// CUDA and HIP compile for at most `group` threads.
+    pub fn bounded(&self, dialect: Dialect, group: Option<usize>) -> String {
         let metal = dialect == Dialect::Metal;
         let mut params = Vec::new();
         for (at, (name, ty, writes)) in self.buffers.iter().enumerate() {
@@ -188,14 +193,18 @@ impl Text {
                 params.push("u32 lid [[thread_index_in_threadgroup]]".into());
                 (
                     format!("{}{}", head(dialect), crate::tile::METAL),
-                    "kernel void",
+                    "kernel void".into(),
                     "",
                 )
             }
             false => {
                 let index = "    f_pdl_wait();\n    f_pdl_go();\n    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
                 let head = format!("{}{}", head(dialect), crate::tile::cuda());
-                (head, "extern \"C\" __global__ void", index)
+                let kind = match group {
+                    Some(n) => format!("extern \"C\" __global__ void __launch_bounds__({n})"),
+                    None => "extern \"C\" __global__ void".into(),
+                };
+                (head, kind, index)
             }
         };
         let (entry, params, body) = (&self.entry, params.join(",\n    "), &self.body);
