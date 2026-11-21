@@ -128,7 +128,7 @@ jobs:
         with:
           pattern: bin-*
           path: bins
-      - name: Publish the platform packages, then the launcher
+      - name: Publish the platform packages, wait until npm serves them, then publish the launcher
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -139,4 +139,16 @@ jobs:
             install -D -m 755 "bins/bin-$p/tesserax" "$dir/bin/tesserax"
             (cd "$dir" && npm publish --access public --provenance "${dry[@]}")
           done
+          # npx caches an install that ran before a platform tarball was served.
+          if [ "$PUBLISH" = true ]; then
+            for p in linux-x64 linux-arm64 darwin-arm64; do
+              url="https://registry.npmjs.org/@kindlingai/tessera-$p/-/tessera-$p-$VERSION.tgz"
+              for i in $(seq 120); do
+                curl -sfI -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" >/dev/null && break
+                [ "$i" = 120 ] && { echo "$url not served after 30 minutes"; exit 1; }
+                sleep 15
+              done
+              echo "$url is served"
+            done
+          fi
           (cd target/publish/npm/@kindlingai/tessera && npm publish --access public --provenance "${dry[@]}")
