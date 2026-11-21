@@ -12,9 +12,6 @@ use tessera_engine::{DimName, Model, Recipe, Tensor};
 /// Picks reported after each prompt's last row.
 const TOP: usize = 5;
 
-/// The plan cache's least bucket.
-const LEAST: u64 = 16;
-
 #[derive(Serialize)]
 struct Pick {
     id: u32,
@@ -52,11 +49,10 @@ pub fn forward(dir: &Path, texts: &Path) -> Result<Picks, Failure> {
         }
         prompts.push(ids);
     }
-    // The longest prompt's bucket bounds the graph.
+    // The longest prompt bounds the graph and caps the buckets.
     let longest = prompts.iter().map(Vec::len).max().unwrap_or(1) as u64;
-    let context = longest.next_power_of_two().max(LEAST);
     let start = Instant::now();
-    let text = open(dir, [1, context], &Overrides::default())?;
+    let text = open(dir, [1, longest], &Overrides::default())?;
     let recipe = Recipe {
         pins: text.pins.clone(),
         ..Recipe::default()

@@ -114,8 +114,6 @@ pub enum Error {
     Scores,
     #[error("a bucketed dimension sits inside a larger axis")]
     BucketAxis,
-    #[error("{0:?}'s bucket passes its bound")]
-    BucketBound(DimName),
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.

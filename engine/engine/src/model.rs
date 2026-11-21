@@ -76,6 +76,9 @@ fn fitted(t: &Tensor, axes: &Shape, want: &[usize], buckets: &[DimName]) -> Resu
 
 /// The rows both shapes hold, from `from` into `to`.
 fn copy(from: &[u8], have: &[usize], to: &mut [u8], want: &[usize], width: usize) {
+    if have == want {
+        return to.copy_from_slice(from);
+    }
     let (Some((&n, have)), Some((&m, want))) = (have.split_first(), want.split_first()) else {
         return to.copy_from_slice(from);
     };
@@ -198,10 +201,6 @@ impl Model {
                 }
                 let mut planned = sizes.clone();
                 for (name, n) in &bound {
-                    let most = g.dims.iter().find(|d| d.name == *name).map(|d| d.size);
-                    if matches!(most, Some(Size::Bounded(m)) if u64::from(*n) > m) {
-                        return Err(Error::BucketBound(*name));
-                    }
                     let at = planned.iter_mut().find(|(d, _)| d == name);
                     at.expect("a bounded dimension").1 = u64::from(*n);
                 }
@@ -210,7 +209,7 @@ impl Model {
                 let mut fed = Vec::with_capacity(inputs.len());
                 for (at, (t, port)) in inputs.iter().zip(&entry.inputs).enumerate() {
                     let axes = &port.ty.shape;
-                    if t.shape != extents(g, axes, &sizes) {
+                    if !t.filled() || t.shape != extents(g, axes, &sizes) {
                         return Err(tessera_run::Error::InputShape(at).into());
                     }
                     let want = extents(g, axes, &planned);
@@ -225,8 +224,10 @@ impl Model {
                 let mut out = Vec::with_capacity(plan.outputs.len());
                 for (o, at) in plan.outputs.iter().zip(&entry.outputs) {
                     let axes = &g.nodes[at.node.0 as usize].ty.shape;
-                    let mut full = p.runner.read(o.slot)?;
-                    full.shape = extents(g, axes, &planned);
+                    let view = p.runner.held().view(o.slot);
+                    let view = view.reshape(extents(g, axes, &planned));
+                    let full = view.and_then(|v| v.to_tensor());
+                    let full = full.map_err(tessera_run::Error::from)?;
                     let want = extents(g, axes, &sizes);
                     out.push(match full.shape == want {
                         true => full,
