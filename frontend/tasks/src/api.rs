@@ -2,6 +2,7 @@
 
 use crate::Error;
 use tessera_bundle::Message;
+pub use tessera_engine::Read;
 
 /// The served model's name and context size.
 #[derive(Clone, Debug)]
@@ -80,6 +81,12 @@ pub type Sink = Box<dyn FnMut(Step) -> bool + Send>;
 /// Answers a prompt, a step at a time, into `sink`.
 pub trait Generator: Send + Sync {
     fn generate(&self, prompt: Vec<u32>, params: Params, sink: Sink) -> Result<(), Error>;
+}
+
+/// Logits after chosen prompt rows, with no decoding.
+pub trait Score: Send + Sync {
+    /// Each read's logits over its ids. Blocks.
+    fn score(&self, prompt: Vec<u32>, reads: Vec<Read>) -> Result<Vec<Vec<f32>>, Error>;
 }
 
 /// Vectors for texts, and the tokens they took.

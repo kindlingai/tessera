@@ -7,7 +7,7 @@ use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{File, Offer, exlr8};
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
-use tessera_engine::{Graph, Pins, Stack, Weight};
+use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
 
 /// The `config.json` keys a DeepSeek-V3 release sets.
 #[derive(Deserialize)]
@@ -209,9 +209,9 @@ pub(crate) fn stepping(
     sizes: [u64; 2],
     width: u32,
     user: &[Rule],
-    masked: bool,
+    steps: Steps,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(dir, sizes, width, Some((user, masked)))
+    open(dir, sizes, width, Some((user, steps)))
 }
 
 /// A `step` gives the step graph its rules and mask.
@@ -219,14 +219,14 @@ fn open(
     dir: &Path,
     [seqs, context]: [u64; 2],
     width: u32,
-    step: Option<(&[Rule], bool)>,
+    step: Option<(&[Rule], Steps)>,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
     let json = std::fs::read_to_string(dir.join("config.json"))?;
     let mut config = config(&json, seqs, context)?;
     let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
     let mut rules = rules(&config, exlr8);
-    if let Some((user, masked)) = step {
-        config.stack.masked = masked;
+    if let Some((user, steps)) = step {
+        config.stack.steps = steps;
         rules.extend(user.iter().cloned());
     }
     let graph = match (exlr8, step.is_some()) {

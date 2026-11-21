@@ -48,6 +48,11 @@ impl Ranks {
         Some(())
     }
 
+    /// One engine, with no peers.
+    pub(crate) fn alone(&self) -> bool {
+        self.peers.is_empty() && self.rank == 0
+    }
+
     /// This rank runs rank 0's launches and serves nothing.
     pub(crate) fn follows(&self) -> bool {
         self.rank != 0

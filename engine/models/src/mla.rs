@@ -1,6 +1,6 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
-use crate::shared::{Attend, Stack, pick, rows, step_ports, swiglu, tokens};
+use crate::shared::{Attend, Stack, Steps, pick, rows, step_ports, swiglu, tokens};
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
@@ -543,7 +543,7 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
     let w: Mla<R> = tessera_trace::declare(&m);
-    let ([tokens, positions, slots], allowed) = step_ports(&m, c.stack.masked);
+    let ([tokens, positions, slots], allowed) = step_ports(&m, c.stack.steps == Steps::Masked);
     let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
     let cache = |l| Cache {
         latent: kept(Latent),

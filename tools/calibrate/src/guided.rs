@@ -121,7 +121,7 @@ pub fn report(settings: &Settings, favor: Option<String>) -> Result<(), Error> {
             let mut cases = vec![Case::Plain, Case::Open, Case::Bits];
             cases.extend(KS.iter().filter(|&&k| k <= FEW).map(|&k| Case::Few(k)));
             let mut c = shape(picks);
-            c.stack.masked = true;
+            c.stack.steps = tessera_engine::Steps::Masked;
             let mut engines = [
                 opened(shape(picks), &w, &recipe, settings)?,
                 opened(c, &w, &recipe, settings)?,

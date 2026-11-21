@@ -13,4 +13,4 @@ pub mod sprite;
 pub mod tagger;
 pub mod vae;
 
-pub use shared::{Attend, Dense, FEW, Rotated, Side, Stack};
+pub use shared::{Attend, Dense, FEW, Rotated, Side, Stack, Steps};

@@ -4,7 +4,7 @@ use tessera_tasks::Error;
 use tessera_tasks::api::Tokens;
 
 /// One id per character: its code point.
-pub(super) struct MockTokens;
+pub(crate) struct MockTokens;
 
 impl Tokens for MockTokens {
     fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {

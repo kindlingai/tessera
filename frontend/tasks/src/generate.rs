@@ -1,12 +1,12 @@
 //! Generation through the engine thread's queue.
 
-use crate::api::{Chat, Finish, Generator, Params, Refused, Sink, Step, Tokens};
+use crate::api::{Chat, Finish, Generator, Params, Refused, Score, Sink, Step, Tokens};
 use crate::guided::Guides;
 use crate::{Error, Spool, Stops};
 use std::sync::{Arc, Mutex, mpsc};
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_bundle::{Message, Template};
-use tessera_engine::{Event, Reason, Request};
+use tessera_engine::{Event, Read, Reason, Request};
 
 /// A request for the engine thread, and its sink.
 pub type Job = (Request, tessera_engine::Sink);
@@ -64,6 +64,7 @@ impl Generator for Queued {
             max_tokens: params.max_tokens,
             stop: self.generate.stop.clone(),
             guide,
+            reads: Vec::new(),
         };
         let generate = self.generate.clone();
         let (mut spool, mut stops) = (Spool::default(), Stops::new(params.stop));
@@ -78,6 +79,7 @@ impl Generator for Queued {
                     cached = rows;
                     return true;
                 }
+                Event::Scores(_) => return true,
                 Event::Token(id) => {
                     tokens += 1;
                     let piece = spool.push(id, |ids| generate.tokenizer.decode(ids));
@@ -109,5 +111,28 @@ impl Generator for Queued {
         jobs.send((request, Box::new(each)))
             .map_err(|_| "the engine stopped")?;
         Ok(())
+    }
+}
+
+impl Score for Queued {
+    fn score(&self, prompt: Vec<u32>, reads: Vec<Read>) -> Result<Vec<Vec<f32>>, Error> {
+        let request = Request {
+            tokens: prompt,
+            reads,
+            ..Request::default()
+        };
+        let (sink, taken) = mpsc::channel();
+        let jobs = self.jobs.lock().map_err(|_| "the engine stopped")?;
+        jobs.send((request, Box::new(move |e| sink.send(e).is_ok())))
+            .map_err(|_| "the engine stopped")?;
+        drop(jobs);
+        for event in taken {
+            match event {
+                Event::Scores(scores) => return Ok(scores),
+                Event::Done(_) => break,
+                _ => {}
+            }
+        }
+        Err("the prompt and reads do not fit the context".into())
     }
 }
