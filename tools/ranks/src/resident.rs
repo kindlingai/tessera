@@ -87,11 +87,8 @@ fn grid(
     let gpu = settings.gpu();
     match (&args.shm, &args.fabric) {
         (Some(path), _) => {
-            let file = shared(
-                &path.with_extension("grid"),
-                rank,
-                ShmLink::room(ranks, &regions),
-            )?;
+            let room = ShmLink::room(ranks, &regions);
+            let file = shared(&path.with_extension("grid"), rank, ranks, room)?;
             let link = ShmLink::over(rank, ranks, file, &regions)?;
             Ok(whole::open(gpu, link, ranks * MPS)?)
         }

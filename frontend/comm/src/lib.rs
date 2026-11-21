@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::rc::Rc;
 use std::thread;
@@ -135,35 +136,81 @@ fn call(addr: SocketAddr) -> io::Result<TcpStream> {
 
 /// Rank 0 lays `path` out. The others wait for it.
 pub fn shm(path: &Path, rank: u32, ranks: u32, capacity: usize) -> Result<Shm, Error> {
-    let file = shared(path, rank, Shm::room(ranks, capacity))?;
+    let file = shared(path, rank, ranks, Shm::room(ranks, capacity))?;
     Shm::over(rank, ranks, file, capacity)
 }
 
-/// A zeroed file of `len` bytes that rank 0 makes.
-pub fn shared(path: &Path, rank: u32, len: usize) -> Result<File, Error> {
-    let start = Instant::now();
-    let file = loop {
-        if rank == 0 {
-            let _ = std::fs::remove_file(path);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)?;
-            file.set_len(len as u64)?;
-            break file;
-        }
-        match OpenOptions::new().read(true).write(true).open(path) {
-            Ok(file) if file.metadata()?.len() as usize == len => break file,
-            Ok(_) | Err(_) if start.elapsed() < PATIENCE => thread::sleep(Duration::from_millis(5)),
-            Ok(_) => {
-                let what = format!("{} has the wrong size", path.display());
-                return Err(Error::Fit(what));
-            }
-            Err(e) => return Err(e.into()),
-        }
+/// `len` zeroed bytes, then one mark byte per rank.
+pub fn shared(path: &Path, rank: u32, ranks: u32, len: usize) -> Result<File, Error> {
+    let room = (len + ranks as usize) as u64;
+    let file = match rank {
+        0 => lay_out(path, ranks, len, room)?,
+        _ => open(path, rank, len, room)?,
     };
     Ok(file)
+}
+
+/// Rank 0 waits for the other ranks' marks, then unlinks.
+fn lay_out(path: &Path, ranks: u32, len: usize, room: u64) -> Result<File, Error> {
+    let mut fresh = path.as_os_str().to_owned();
+    fresh.push(".new");
+    let _ = std::fs::remove_file(&fresh);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&fresh)?;
+    file.set_len(room)?;
+    std::fs::rename(&fresh, path)?;
+    let start = Instant::now();
+    let mut marks = vec![0u8; ranks as usize];
+    loop {
+        file.read_exact_at(&mut marks, len as u64)?;
+        let missing: Vec<usize> = (1..marks.len()).filter(|&r| marks[r] == 0).collect();
+        if missing.is_empty() {
+            break;
+        }
+        if start.elapsed() > PATIENCE {
+            let what = format!("ranks {missing:?} did not open {}", path.display());
+            return Err(Error::Fit(what));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::remove_file(path)?;
+    file.write_all_at(&[1], len as u64)?;
+    Ok(file)
+}
+
+/// Marks this rank's byte. Waits for rank 0's mark.
+fn open(path: &Path, rank: u32, len: usize, room: u64) -> Result<File, Error> {
+    let start = Instant::now();
+    let mut held: Option<File> = None;
+    while start.elapsed() < PATIENCE {
+        held = match held.take() {
+            Some(file) => {
+                let mut go = [0u8];
+                file.read_exact_at(&mut go, len as u64)?;
+                if go[0] == 1 {
+                    return Ok(file);
+                }
+                // Rank 0 replaced an earlier run's file.
+                let now = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+                let mine = file.metadata()?;
+                let stale = now.is_some_and(|now| now != (mine.dev(), mine.ino()));
+                (!stale).then_some(file)
+            }
+            None => match OpenOptions::new().read(true).write(true).open(path) {
+                Ok(file) if file.metadata()?.len() == room => {
+                    file.write_all_at(&[1], (len + rank as usize) as u64)?;
+                    Some(file)
+                }
+                _ => None,
+            },
+        };
+        thread::sleep(Duration::from_millis(1));
+    }
+    let what = format!("rank 0 did not lay out {}", path.display());
+    Err(Error::Fit(what))
 }
 
 #[cfg(test)]
