@@ -162,6 +162,16 @@ pub fn e2m1(w: u32, low: u32) -> f32 {
     f32::from(E2M1(field(w, low, 4) as u8))
 }
 
+/// `hi` and `lo` to bf16, nearest even, `hi` high.
+#[inline(always)]
+pub fn bf16_pair(hi: f32, lo: f32) -> u32 {
+    let round = |x: f32| {
+        let b = x.to_bits();
+        b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000
+    };
+    round(hi) | (round(lo) >> 16)
+}
+
 macro_rules! wide {
     ($($name:ident = $op:tt),*) => {$(
         #[inline(always)]

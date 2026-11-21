@@ -97,6 +97,7 @@ helpers! {
     f16(I32, I32) -> F32;
     e4m3(I32, I32) -> F32;
     e2m1(I32, I32) -> F32;
+    bf16_pair(F32, F32) -> I32;
     shfl_xor(P, P, P, P, P);
     sum32(P, P, P, P);
     tiles_new(P, P, P, P) -> P;

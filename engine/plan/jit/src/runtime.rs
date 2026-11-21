@@ -363,6 +363,10 @@ pub extern "C" fn e2m1(w: u32, low: u32) -> f32 {
     lockstep::e2m1(w, low)
 }
 
+pub extern "C" fn bf16_pair(hi: f32, lo: f32) -> u32 {
+    lockstep::bf16_pair(hi, lo)
+}
+
 /// Lane arrays, as compiled code keeps them on its stack.
 type Lanes<T> = [T; THREADS];
 

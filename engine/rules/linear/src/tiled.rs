@@ -269,13 +269,10 @@ fn stash_parts(
         let mut hi = regs[(2 * j + 1) as usize];
         // Each part rounds what the parts before it left over.
         for p in 0..parts {
-            let a = lo.to_bits();
-            let b = hi.to_bits();
-            let ra = (a + 0x7fff + ((a >> 16) & 1)) & 0xffff0000;
-            let rb = (b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000;
-            dst[p * span * words + at] = rb | (ra >> 16);
-            lo -= f32::from_bits(ra);
-            hi -= f32::from_bits(rb);
+            let d = bf16_pair(hi, lo);
+            dst[p * span * words + at] = d;
+            lo -= f32::from_bits(d << 16);
+            hi -= f32::from_bits(d & 0xffff0000);
         }
     }
 }

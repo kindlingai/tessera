@@ -97,6 +97,20 @@ fn widen(name: &str, e: u32, m: u32) -> String {
     )
 }
 
+/// `f_pair_bf16` in integer steps, reading float bits with `bits`.
+fn pair_bits(bits: &str) -> String {
+    format!(
+        "f_fn u32 f_pair_bf16(float hi, float lo) {{
+    u32 h = {bits}(hi);
+    u32 l = {bits}(lo);
+    h = (h + 0x7fffu + ((h >> 16) & 1u)) & 0xffff0000u;
+    l = (l + 0x7fffu + ((l >> 16) & 1u)) & 0xffff0000u;
+    return h | (l >> 16);
+}}
+"
+    )
+}
+
 /// `name` spelled one way per dialect: Metal, then CUDA.
 fn define(name: &str, metal: &str, cuda: &str) -> [String; 2] {
     [metal, cuda].map(|s| format!("#define {name} {s}\n"))
