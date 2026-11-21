@@ -432,6 +432,8 @@ impl Lowerer<'_, '_> {
             Intrinsic::Max => math(self, "max")?,
             Intrinsic::Pow => math(self, "pow")?,
             Intrinsic::Clamp => math(self, "clamp")?,
+            Intrinsic::RoundF16 => math(self, "round_f16")?,
+            Intrinsic::RoundE4M3 => math(self, "round_e4m3")?,
             Intrinsic::Rsqrt => {
                 let x = self.floats(args, t)?[0];
                 let root = self.b.ins().sqrt(x);

@@ -162,6 +162,31 @@ pub fn e2m1(w: u32, low: u32) -> f32 {
     f32::from(E2M1(field(w, low, 4) as u8))
 }
 
+/// `x` to `e` and `m` bits, as kernels round.
+#[inline(always)]
+fn round_to(x: f32, e: u32, m: u32, top: f32) -> f32 {
+    let a = x.abs();
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let steps = f32::from_bits((125 + (1u32 << (e - 1)) + m) << 23);
+    let small = (a * steps + 8388608.0) - 8388608.0;
+    let bits = a.to_bits();
+    let nudge = ((1u32 << (22 - m)) - 1) + ((bits >> (23 - m)) & 1);
+    let r = f32::from_bits(bits.wrapping_add(nudge) & !((1u32 << (23 - m)) - 1));
+    let big = if r > top { top } else { r };
+    let least = f32::from_bits((129 - (1u32 << (e - 1))) << 23);
+    sign * if a < least { small / steps } else { big }
+}
+
+#[inline(always)]
+pub fn round_f16(x: f32) -> f32 {
+    round_to(x, 5, 10, 65504.0)
+}
+
+#[inline(always)]
+pub fn round_e4m3(x: f32) -> f32 {
+    round_to(x, 4, 3, 448.0)
+}
+
 /// `hi` and `lo` to bf16, nearest even, `hi` high.
 #[inline(always)]
 pub fn bf16_pair(hi: f32, lo: f32) -> u32 {

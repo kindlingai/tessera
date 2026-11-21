@@ -677,6 +677,51 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
                 },
                 count: |c, _| c.tally(int(2.0), false),
             }
+            /// `round_f16(x)`: `x` to f16, nearest even, 65504 at most.
+            RoundF16 = fn round_f16(f32) -> f32 {
+                device: rounded(
+                    "f16",
+                    [5, 10],
+                    65504.0,
+                    530,
+                    "f_fn float f_rounded_f16(float x) {
+    unsigned short h;
+    float r;
+    asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(fminf(fmaxf(x, -65504.0f), 65504.0f)));
+    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(r) : \"h\"(h));
+    return r;
+}
+",
+                ),
+                text: |p, args| p.spell("f_round_f16", args),
+                wgsl: None,
+                host: |g, args, mask| g.unary(args, mask, round_f16),
+                count: |c, _| c.tally(Ops { f16: 2.0, ..Ops::default() }, true),
+            }
+            /// `round_e4m3(x)`: `x` to e4m3, nearest even, 448 at most.
+            // Ada on converts and saturates in one instruction.
+            RoundE4M3 = fn round_e4m3(f32) -> f32 {
+                device: rounded(
+                    "e4m3",
+                    [4, 3],
+                    448.0,
+                    890,
+                    "f_fn float f_rounded_e4m3(float x) {
+    unsigned short e;
+    u32 h;
+    float r;
+    asm(\"cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\" : \"=h\"(e) : \"f\"(0.0f), \"f\"(x));
+    asm(\"cvt.rn.f16x2.e4m3x2 %0, %1;\" : \"=r\"(h) : \"h\"(e));
+    asm(\"{.reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.f32.f16 %0, lo;}\" : \"=f\"(r) : \"r\"(h));
+    return r;
+}
+",
+                ),
+                text: |p, args| p.spell("f_round_e4m3", args),
+                wgsl: None,
+                host: |g, args, mask| g.unary(args, mask, round_e4m3),
+                count: |c, _| c.tally(Ops { e4m3: 2.0, ..Ops::default() }, true),
+            }
         }
     };
 }
