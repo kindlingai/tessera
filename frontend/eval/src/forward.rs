@@ -24,7 +24,7 @@ pub struct Picks {
     device: String,
     load_s: f64,
     prompt_tokens: usize,
-    /// The first pass compiles kernels. This is the second.
+    /// The second pass, with every row's logits read back.
     forward_ms: f64,
     top: Vec<Pick>,
 }
@@ -34,6 +34,9 @@ pub fn forward(dir: &Path, prompt: &str) -> Result<Picks, Failure> {
     let settings = tessera_frontend_settings::read();
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let ids = tokenizer.encode(prompt)?;
+    if ids.is_empty() {
+        return Err("the prompt is empty".into());
+    }
     let start = Instant::now();
     let text = open(dir, [1, ids.len() as u64], &Overrides::default())?;
     let recipe = Recipe {
@@ -52,13 +55,14 @@ pub fn forward(dir: &Path, prompt: &str) -> Result<Picks, Failure> {
         Tensor::u32(shape.clone(), ids.clone()),
         Tensor::u32(shape, positions),
     ];
-    let mut logits = Vec::new();
+    let mut out = Vec::new();
     let mut forward_ms = 0.0;
     for _ in 0..2 {
         let start = Instant::now();
-        logits = model.run(&inputs)?.remove(0).floats()?.to_vec();
+        out = model.run(&inputs)?;
         forward_ms = start.elapsed().as_secs_f64() * 1e3;
     }
+    let logits = out[0].floats()?;
     let vocab = logits.len() / ids.len();
     let last = &logits[logits.len() - vocab..];
     let most = last.iter().fold(f32::MIN, |m, v| m.max(*v));
