@@ -208,6 +208,9 @@ pub enum Stage {
         /// Pair `j` turns by `position * theta^(-2j/width)`.
         theta: f32,
         pairs: Pairs,
+        /// Pairs from this one on stay still. `None` turns all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turned: Option<u32>,
     },
     Act(Act),
     /// Interpreter only: fold it away before lowering.

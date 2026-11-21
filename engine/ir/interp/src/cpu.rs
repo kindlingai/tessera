@@ -31,9 +31,10 @@ pub(crate) fn angle(pos: usize, j: usize, width: usize, theta: f32) -> f32 {
     pos as f32 * theta.powf(-((2 * j) as f32) / width as f32)
 }
 
-fn turn(row: &mut [f32], pos: usize, theta: f32, pairs: Pairs) {
+/// Rotates the first `turned` pairs of `row`.
+fn turn(row: &mut [f32], pos: usize, theta: f32, pairs: Pairs, turned: usize) {
     let half = row.len() / 2;
-    for j in 0..half {
+    for j in 0..half.min(turned) {
         let (a, b) = match pairs {
             Pairs::Adjacent => (2 * j, 2 * j + 1),
             Pairs::Halves => (j, j + half),
@@ -389,13 +390,21 @@ pub(crate) fn stage(
         (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
         // One rank holds the whole sum already.
         (Stage::AllReduce, _) => {}
-        (Stage::Rope { theta, pairs }, Some(at)) => {
+        (
+            Stage::Rope {
+                theta,
+                pairs,
+                turned,
+            },
+            Some(at),
+        ) => {
+            let turned = turned.map_or(width, |t| t as usize);
             let at = at.indices()?;
             // Each position covers the same number of elements.
             let span = out.len() / at.len().max(1);
             for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
                 for row in block.chunks_mut(width) {
-                    turn(row, pos, *theta, *pairs);
+                    turn(row, pos, *theta, *pairs, turned);
                 }
             }
         }
