@@ -269,7 +269,7 @@ pub fn native(spec: &Spec) {
     };
     for form in ["f32", "bf16", "q8_0", "q4_0", "nvfp4"] {
         let device = Device::guess(&cpu).pinned(fitted(&g, named(form).unwrap()));
-        // A form the rows cannot take is not this test's.
+        // A form native kernels cannot plan is skipped.
         let Ok(plan) = lower(&g, 0, &FAUX, &device) else {
             continue;
         };

@@ -88,19 +88,21 @@ pub fn gemma4() -> gemma4::Config {
     }
 }
 
-/// A delta rule layer, then full attention with partial rotary.
+/// A delta rule layer, then full attention, heads in pairs.
 pub fn qwen35() -> qwen35::Config {
+    let mut stack = stack(64, 32, 128);
+    stack.heads = 4;
     qwen35::Config {
-        stack: stack(64, 32, 128),
-        kv_heads: 1,
+        stack,
+        kv_heads: 2,
         rotary: 16,
         rope_theta: 1e4,
         eps: 1e-6,
         linear: Recurrent {
-            key_heads: 1,
-            value_heads: 2,
-            key_dim: 32,
-            value_dim: 32,
+            key_heads: 2,
+            value_heads: 4,
+            key_dim: 16,
+            value_dim: 16,
             window: 4,
         },
         layers: vec![Mixing::Linear, Mixing::Full],
