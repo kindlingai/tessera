@@ -10,6 +10,8 @@ pub const NONE: u32 = u32::MAX;
 pub(crate) const DOORBELL_SLOTS: usize = 64;
 pub(crate) const DOORBELL_ABORT: usize = 4032;
 pub(crate) const DOORBELL_SENT: usize = 4040;
+/// The `dtype` code of `F32`, first in `DTYPES`.
+pub(crate) const F32: u32 = 0;
 /// `dtype` names in code order, with bytes per element.
 pub(crate) const DTYPES: [(&str, u32); 7] = [
     ("F32", 4),

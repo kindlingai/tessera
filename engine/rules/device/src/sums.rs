@@ -2,7 +2,7 @@
 
 use crate::proxy::Op;
 use crate::resident::{Error, LanePlan, Plan, PoolPlan, Resident};
-use crate::{Backend, Options, flatten};
+use crate::{Options, flatten};
 use std::time::Duration;
 use tessera_engine_comm::Link;
 use tessera_gpukit::backend::Backend as Gpu;
@@ -35,7 +35,7 @@ fn plan(ranks: u32) -> Plan {
         }],
         lanes: vec![LanePlan {
             op: Op::Sum,
-            elem: 0,
+            elem: crate::layout::F32,
             pool: 0,
             block: 0,
         }],
@@ -73,13 +73,8 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
-    let backend = match D::BACKEND {
-        Gpu::Cuda => Backend::Cuda,
-        Gpu::Rocm => Backend::Hip,
-        Gpu::Metal => return Err(Error::Plan("Metal has no persistent grids".into())),
-    };
     let options = Options {
-        backend,
+        backend: crate::resident::backend::<D>()?,
         remote_kv: false,
         marks: false,
     };
