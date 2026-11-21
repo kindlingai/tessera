@@ -19,6 +19,12 @@ pub trait Sum {
     fn check(&mut self) -> Result<(), Error> {
         Ok(())
     }
+    /// Gives later sums a barrier round, and times them.
+    fn timing(&mut self, _on: bool) {}
+    /// Seconds waiting and moving since the last call, if timed.
+    fn spent(&mut self) -> Result<Option<[f64; 2]>, Error> {
+        Ok(None)
+    }
 }
 
 /// One rank: its runner and its way to the others.
@@ -85,6 +91,7 @@ impl<T: Transport> Rank<T> {
         let sum = Tensor::f32(vec![step.write.len], sum);
         self.runner.write(step.write, sum.view())?;
         self.lap("all_reduce: sum", at);
+        self.lap("all_reduce", start);
         Ok(())
     }
 
@@ -111,6 +118,10 @@ impl<T: Transport> Run for Rank<T> {
 
     /// Runs these steps. Sums wait for every rank.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        let timed = self.base().profile.is_some();
+        if let Some(grid) = &mut self.grid {
+            grid.timing(timed);
+        }
         let mut from = steps.start;
         for i in steps.clone() {
             let step = &self.runner.plan().steps[i];
@@ -120,18 +131,22 @@ impl<T: Transport> Run for Rank<T> {
             let step = step.clone();
             self.runner.submit(from..i)?;
             from = i + 1;
-            let start = Instant::now();
             match self.grid.is_some() {
                 true => self.grid_sum(i, &step)?,
                 false => self.exchange(&step)?,
             }
-            self.note("all_reduce", start.elapsed().as_secs_f64());
         }
         self.runner.submit(from..steps.end)?;
-        match (&mut self.grid, from > steps.start) {
-            (Some(grid), true) => grid.check(),
-            _ => Ok(()),
+        let Some(grid) = self.grid.as_mut().filter(|_| from > steps.start) else {
+            return Ok(());
+        };
+        grid.check()?;
+        if let Some([wait, moved]) = grid.spent()? {
+            self.note("all_reduce: wait", wait);
+            self.note("all_reduce: transfer", moved);
+            self.note("all_reduce", wait + moved);
         }
+        Ok(())
     }
 
     fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {
