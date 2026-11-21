@@ -84,6 +84,35 @@ fn causal_first_row() {
 }
 
 #[test]
+fn delta_rule_replaces_values() {
+    let (keys, rows) = ([Seqs, Context, KvHeads, HeadDim], [Seqs, Context, Heads]);
+    let ports = [
+        typed(keys, DType::F32),
+        typed(keys, DType::F32),
+        typed([Seqs, Context, Heads, HeadDim], DType::F32),
+        typed(rows, DType::F32),
+        typed(rows, DType::F32),
+    ];
+    let half = 0.5f32.ln();
+    let inputs = [
+        Tensor::f32(vec![1, 3, 1, 2], vec![1., 0., 1., 0., 1., 0.]),
+        Tensor::f32(vec![1, 3, 1, 2], vec![1., 0., 0., 1., 1., 0.]),
+        Tensor::f32(
+            vec![1, 3, 2, 2],
+            vec![1., 2., 1., 2., 3., 4., 3., 4., 5., 6., 5., 6.],
+        ),
+        Tensor::f32(vec![1, 3, 2], vec![0., half, 0., half, 0., half]),
+        Tensor::f32(vec![1, 3, 2], vec![1., 0.5, 1., 0.5, 1., 0.5]),
+    ];
+    let out = eval(ports, &inputs, None, |m, [q, k, v, g, b]| {
+        [m.delta(2.0, [&q, &k, &v], [&g, &b])]
+    });
+    // Head 0 overwrites key one. Head 1 decays and half-writes.
+    let want = [2., 4., 1., 2., 2., 4., 0.5, 1., 10., 12., 5.125, 6.25];
+    close(&out.unwrap()[0], &want);
+}
+
+#[test]
 fn narrow_values() {
     let m = model();
     let shape = [Seqs, Context, Heads, HeadDim];

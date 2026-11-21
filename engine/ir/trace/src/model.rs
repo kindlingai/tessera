@@ -5,8 +5,8 @@ use crate::weights::{Embed, Linears};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tessera_graph::{
-    Attend, Composite, Dim, DimName, Entry, EntryKind, Graph, Mask, Node, NodeId, Numerics, Op,
-    Output, PathSeg, Port, Region, Role, Select, Size, TensorType, Weight, infer, verify,
+    Attend, Composite, Delta, Dim, DimName, Entry, EntryKind, Graph, Mask, Node, NodeId, Numerics,
+    Op, Output, PathSeg, Port, Region, Role, Select, Size, TensorType, Weight, infer, verify,
 };
 
 /// Shared by every tensor the description creates.
@@ -121,6 +121,16 @@ impl Model {
             .chain(keys)
             .collect();
         push(&self.g, op, &args)
+    }
+
+    /// The gated delta rule, with log decays and write rates.
+    pub fn delta(
+        &self,
+        scale: f32,
+        [q, k, v]: [&Tensor; 3],
+        [decay, rate]: [&Tensor; 2],
+    ) -> Tensor {
+        push(&self.g, Op::Delta(Delta { scale }), &[q, k, v, decay, rate])
     }
 
     /// Marks the nodes `body` traces as one composite region.

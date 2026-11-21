@@ -18,7 +18,7 @@ pub use dims::{Dim, DimExpr, DimName, Poly, Shape, Size};
 pub use infer::{ErrorKind, TypeError, infer};
 pub use json::{FormatError, VERSION};
 pub use node::{
-    Act, Attend, Composite, Entry, EntryKind, Graph, Mask, Node, NodeId, Op, Output, Pairs,
+    Act, Attend, Composite, Delta, Entry, EntryKind, Graph, Mask, Node, NodeId, Op, Output, Pairs,
     PathSeg, Port, Region, Role, Row, Select, Stage, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order};

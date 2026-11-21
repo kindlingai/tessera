@@ -532,6 +532,7 @@ impl Context<'_> {
                 )
             }
             Op::Attend(a) => cpu::attend(num, a, [args[0], args[1], args[2]], args.get(3).copied()),
+            Op::Delta(d) => cpu::delta(num, d, [args[0], args[1], args[2], args[3], args[4]]),
             Op::Mask(mask) => masked(*mask, args[0]),
             Op::Row(row) => self.stages(num, &row.0, args),
             Op::Select(Select::Gather) => cpu::gather(args[0], args[1], self.first),

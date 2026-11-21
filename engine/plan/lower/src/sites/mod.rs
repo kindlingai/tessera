@@ -8,7 +8,7 @@ mod near;
 mod stage;
 mod top;
 
-pub use attend::Attend;
+pub use attend::{Attend, Delta};
 pub use chain::Chain;
 pub use gather::Gather;
 pub use matmul::{After, Finished, Matmul, Picked};

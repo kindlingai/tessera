@@ -107,6 +107,8 @@ pub enum Op {
     /// `x[.., K]` times `w[.., N, K]` transposed.
     Matmul,
     Attend(Attend),
+    /// Queries, keys, values, log decays and write rates.
+    Delta(Delta),
     /// Scores `[.., Queries, Keys]`. Unseen keys become negative infinity.
     Mask(Mask),
     /// Appends rows to kept rows. The result holds all.
@@ -126,7 +128,7 @@ impl Op {
     /// Whether this op sums, so it carries `Numerics`.
     pub fn reduces(&self) -> bool {
         match self {
-            Op::Matmul | Op::Attend(_) | Op::Mean(_) | Op::Mix(_) => true,
+            Op::Matmul | Op::Attend(_) | Op::Delta(_) | Op::Mean(_) | Op::Mix(_) => true,
             Op::Row(r) => r.0.iter().any(Stage::reduces),
             _ => false,
         }
@@ -144,6 +146,14 @@ pub struct Attend {
     /// Query rows carry a slot and position: arguments four, five.
     #[serde(default)]
     pub ragged: bool,
+}
+
+/// The gated delta rule. Each value head keeps a state.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Delta {
+    /// On the queries.
+    pub scale: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

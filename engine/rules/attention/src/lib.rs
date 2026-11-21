@@ -2,6 +2,7 @@
 
 mod attend;
 mod cpu;
+mod delta;
 mod flash;
 mod listed;
 

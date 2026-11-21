@@ -183,7 +183,7 @@ fn rowwise(op: &Op, j: usize, arg: &TensorType) -> bool {
         Op::Matmul => j == 0 || arg.rank() >= 3,
         Op::Attend(_) => j != 1 && j != 2,
         Op::Mean(axis) | Op::Mix(axis) => *axis != 0,
-        Op::Input { .. } | Op::Weight(_) | Op::Mask(_) | Op::Append(_) => false,
+        Op::Input { .. } | Op::Weight(_) | Op::Mask(_) | Op::Append(_) | Op::Delta(_) => false,
     }
 }
 

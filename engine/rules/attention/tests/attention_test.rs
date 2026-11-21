@@ -3,11 +3,11 @@
 use tessera_attention as _;
 use tessera_kernels as _;
 
-use tessera_graph::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Segments, Seqs};
+use tessera_graph::DimName::{Context, HeadDim, Heads, Hidden, KvHeads, Rows, Segments, Seqs};
 use tessera_graph::{DType, Dim, Graph, Size, TensorType};
 use tessera_interp::{Store, Tensor, run, run_kept};
 use tessera_lower::kept::{self, Layout};
-use tessera_lower::{Device, Settings, View, lower, rules};
+use tessera_lower::{Device, Pick, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, fill, graphs, max_abs_diff};
@@ -258,5 +258,79 @@ fn gpu_rules_match() {
             let off = gap(&g, &inputs, rule.name, &settings);
             assert!(off < 1e-4, "{} is off by {off:e}", rule.name);
         }
+    }
+}
+
+/// Two key heads serve six value heads of another width.
+#[test]
+fn delta_matches_interp() {
+    let dim = |name, size| Dim { name, size };
+    let m = Model::new(vec![
+        dim(Seqs, Size::Bounded(2)),
+        dim(Context, Size::Bounded(64)),
+        dim(KvHeads, Size::Fixed(2)),
+        dim(Heads, Size::Fixed(6)),
+        dim(HeadDim, Size::Fixed(16)),
+        dim(Hidden, Size::Fixed(8)),
+    ]);
+    let port = |shape: tessera_graph::Shape| Port {
+        role: Role::Tokens,
+        ty: TensorType::new(shape, DType::F32),
+    };
+    let (keys, rows) = ([Seqs, Context, KvHeads, HeadDim], [Seqs, Context, Heads]);
+    let values = [Seqs, Context, Heads, Hidden];
+    let ports = [
+        keys.into(),
+        keys.into(),
+        values.into(),
+        rows.into(),
+        rows.into(),
+    ]
+    .map(port);
+    let [q, k, v, decay, rate] = m.entry(EntryKind::Forward, ports);
+    let out = m.delta(0.25, [&q, &k, &v], [&decay, &rate]);
+    let g = m.finish([(Role::Logits, &out)]);
+    let mut draws = Noise(7);
+    let (seqs, len) = (2, 50);
+    // Unit keys and rates below one keep the state bounded.
+    let unit = |draws: &mut Noise| {
+        let t = noise(vec![seqs, len, 2, 16], draws);
+        let mut x = t.floats().unwrap().to_vec();
+        for row in x.chunks_mut(16) {
+            let norm = row.iter().map(|a| a * a).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|a| *a /= norm);
+        }
+        Tensor::f32(t.shape.clone(), x)
+    };
+    let gate = |draws: &mut Noise, f: fn(f32) -> f32| {
+        let x = (0..seqs * len * 6).map(|_| f(draws.draw())).collect();
+        Tensor::f32(vec![seqs, len, 6], x)
+    };
+    let inputs = [
+        unit(&mut draws),
+        unit(&mut draws),
+        noise(vec![seqs, len, 6, 8], &mut draws),
+        gate(&mut draws, |x| -x.abs()),
+        gate(&mut draws, |x| (x + 1.0) / 2.0),
+    ];
+    let want = run(&g, &[], 0, &inputs).unwrap();
+    let sizes = [(Seqs, seqs as u64), (Context, len as u64)];
+    let native = Settings {
+        backend: Pick::Cpu,
+        ..host()
+    };
+    for settings in runs().into_iter().chain([native]) {
+        let plan = lower(&g, 0, &sizes, &Device::guess(&settings)).unwrap();
+        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+        let mut runner = open(plan, &settings).unwrap();
+        let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
+        let got = runner.run(&views).unwrap().remove(0);
+        let off = max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+        assert!(names.iter().all(|n| n.ends_with("delta")), "{names:?}");
+        assert!(
+            off < 1e-4,
+            "{names:?} on {:?}: off by {off:e}",
+            settings.backend
+        );
     }
 }

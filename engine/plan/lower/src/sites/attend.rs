@@ -153,3 +153,54 @@ impl Attend {
         ])
     }
 }
+
+/// The gated delta rule over whole sequences of fixed length.
+#[derive(Clone, Copy, Debug)]
+pub struct Delta {
+    pub scale: f32,
+    /// Queries, keys, values, log decays and write rates.
+    pub reads: [T; 5],
+    pub seqs: usize,
+    pub rows: usize,
+    /// Value heads. Each key head serves a contiguous group.
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub key_width: usize,
+    pub width: usize,
+}
+
+impl Pattern for Delta {
+    fn find(tree: &Tree, at: T) -> Option<Self> {
+        let node = tree.node(at);
+        let Term::Op(Op::Delta(d)) = &node.term else {
+            return None;
+        };
+        let reads: [T; 5] = node.args[..].try_into().ok()?;
+        let (q, v) = (tree.node(reads[0]), tree.node(reads[2]));
+        if q.extents[1].runtime() {
+            return None;
+        }
+        let (&[seqs, rows, kv_heads, key_width], &[_, _, heads, width]) =
+            (&q.shape[..], &v.shape[..])
+        else {
+            return None;
+        };
+        Some(Self {
+            scale: d.scale,
+            reads,
+            seqs,
+            rows,
+            heads,
+            kv_heads,
+            key_width,
+            width,
+        })
+    }
+}
+
+impl Delta {
+    /// The output's element count.
+    pub fn out(&self) -> usize {
+        self.seqs * self.rows * self.heads * self.width
+    }
+}

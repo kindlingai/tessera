@@ -101,6 +101,7 @@ fn arity(op: &Op) -> usize {
         Op::Append(_) => 3,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) | Op::Mix(_) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
+        Op::Delta(_) => 5,
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
         Op::View(_) => 1,
     }
@@ -139,6 +140,10 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         Op::Attend(a) => {
             finite(a.scale, "attention scale")?;
             attend(&g.dims, args)
+        }
+        Op::Delta(d) => {
+            finite(d.scale, "delta rule scale")?;
+            delta(&g.dims, args)
         }
         Op::Row(r) => row(&g.dims, &r.0, args),
         Op::Mask(_) => select::mask(args[0]),
@@ -285,6 +290,34 @@ fn attend(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
         key_lists(dims, ids, q, 2)?;
     }
     Ok(valued(q, v))
+}
+
+/// Value heads group over the query and key heads.
+fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
+    let (q, k, v) = (a[0], a[1], a[2]);
+    let fits = [q, k, v].iter().all(|t| t.rank() == 4)
+        && same_shape(dims, &q.shape, &k.shape)?
+        && same_shape(dims, &front(&q.shape, 2), &front(&v.shape, 2))?;
+    need(fits, ErrorKind::Shape, || {
+        format!(
+            "the delta rule takes [Seqs, Context, Heads, HeadDim] rows, got {}, {} and {}",
+            q.shape, k.shape, v.shape
+        )
+    })?;
+    heads_fit(dims, [v, q, k], 2)?;
+    for gate in &a[3..] {
+        let fits = same_shape(dims, &gate.shape, &front(&v.shape, 3))?;
+        need(fits, ErrorKind::Shape, || {
+            format!("gates {} do not match values {}", gate.shape, v.shape)
+        })?;
+        need(gate.dtype == v.dtype, ErrorKind::DType, || {
+            format!("gates are {:?}, values {:?}", gate.dtype, v.dtype)
+        })?;
+        need(gate.placement == v.placement, ErrorKind::Placement, || {
+            format!("gates are {:?}, values {:?}", gate.placement, v.placement)
+        })?;
+    }
+    Ok(v.clone())
 }
 
 /// One integer key list per query, over `lead` axes.

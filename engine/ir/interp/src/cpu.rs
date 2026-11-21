@@ -2,7 +2,7 @@
 
 use crate::round::Acc;
 use crate::tensor::Error;
-use tessera_graph::{Act, Attend, Mask, Numerics, Pairs, Stage};
+use tessera_graph::{Act, Attend, Delta, Mask, Numerics, Pairs, Stage};
 use tessera_mem::Tensor;
 
 /// The tanh approximation the GPU kernels use.
@@ -212,6 +212,47 @@ pub(crate) fn attend(
                     &mut p,
                     o,
                 );
+            }
+        }
+    }
+    Ok(Tensor::f32(vec![seqs, ctx, heads, dv], out))
+}
+
+/// Holds each value head's state as key columns.
+pub(crate) fn delta(n: &Numerics, d: &Delta, args: [&Tensor; 5]) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let [q, k, v, g, beta] = args;
+    let [seqs, ctx, kv_heads, dk] = q.shape[..] else {
+        return Err(Error::Mismatch("the delta rule wants rank 4".into()));
+    };
+    let (heads, dv) = (v.shape[2], v.shape[3]);
+    let group = heads / kv_heads;
+    let (qs, ks, vs) = (q.floats()?, k.floats()?, v.floats()?);
+    let (gs, rates) = (g.floats()?, beta.floats()?);
+    let mut out = vec![0.0; seqs * ctx * heads * dv];
+    let mut state = vec![0.0; dv * dk];
+    let mut query = vec![0.0; dk];
+    for s in 0..seqs {
+        for h in 0..heads {
+            state.fill(0.0);
+            for t in 0..ctx {
+                let row = (s * ctx + t) * heads + h;
+                let at = ((s * ctx + t) * kv_heads + h / group) * dk;
+                let key = &ks[at..at + dk];
+                for (qi, &x) in query.iter_mut().zip(&qs[at..at + dk]) {
+                    *qi = x * d.scale;
+                }
+                let decay = gs[row].exp();
+                let values = &vs[row * dv..(row + 1) * dv];
+                let o = &mut out[row * dv..(row + 1) * dv];
+                for ((col, &value), oj) in state.chunks_mut(dk).zip(values).zip(o) {
+                    col.iter_mut().for_each(|x| *x *= decay);
+                    let change = (value - acc.dot(col, key)) * rates[row];
+                    for (x, &ki) in col.iter_mut().zip(key) {
+                        *x += ki * change;
+                    }
+                    *oj = acc.dot(col, &query);
+                }
             }
         }
     }
