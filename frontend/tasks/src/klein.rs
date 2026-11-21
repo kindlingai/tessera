@@ -11,12 +11,11 @@ use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use tessera_bundle::Overrides;
 use tessera_bundle::tokenize::hf::Hf;
+use tessera_bundle::vae;
 use tessera_engine::Settings;
 
 /// Channels per latent token.
-const LATENT: usize = 128;
-/// Pixels a side per latent token.
-const PATCH: usize = 16;
+const LATENT: usize = tessera_engine::flux2::LATENT as usize;
 
 /// Diffusers' fitted shift for `tokens` rows over `steps`.
 fn mu(tokens: usize, steps: usize) -> f64 {
@@ -88,6 +87,8 @@ pub struct Klein {
     pictures: HashMap<usize, Pictures>,
     /// Latent tokens a side, at most.
     largest: usize,
+    /// Pixels a side per latent token.
+    patch: usize,
     pub steps: usize,
 }
 
@@ -99,7 +100,8 @@ impl Klein {
         largest: usize,
         config: Overrides,
     ) -> Result<Self, Error> {
-        let largest = largest / PATCH;
+        let patch = vae::config(&dir, [1, 1], &config)?.scale() as usize;
+        let largest = largest / patch;
         let pipeline = Pipeline::read(&config)?;
         let words = [dir.join("text_encoder"), dir.join("tokenizer")];
         let features = Features::open(
@@ -119,6 +121,7 @@ impl Klein {
             flow,
             pictures: HashMap::new(),
             largest,
+            patch,
             steps: pipeline.steps,
         })
     }
@@ -128,7 +131,7 @@ impl Klein {
         self.features.tokenizer()
     }
 
-    /// A picture `16 side` pixels a side, from `noise` latents.
+    /// A picture `patch * side` pixels a side, from `noise` latents.
     pub fn paint(&mut self, prompt: &str, side: usize, noise: &[f32]) -> Result<Image, Error> {
         let rows = side * side;
         if side > self.largest || noise.len() != rows * LATENT {
@@ -173,9 +176,11 @@ impl Worker<Klein> {
 
 impl GenerateImage for Worker<Klein> {
     fn sizes(&self) -> Sizes {
-        let largest = self.run(|k| k.largest * PATCH).unwrap_or(PATCH);
+        let (largest, patch) = self
+            .run(|k| (k.largest * k.patch, k.patch))
+            .unwrap_or((1, 1));
         Sizes {
-            step: PATCH,
+            step: patch,
             largest,
             default: largest.min(512),
         }
@@ -190,7 +195,7 @@ impl GenerateImage for Worker<Klein> {
     ) -> Result<Vec<Image>, Error> {
         let prompt = prompt.to_string();
         self.run(move |k| {
-            let side = size / PATCH;
+            let side = size / k.patch;
             let one = |i: usize| noise(u64::from(seed) + i as u64, side * side * LATENT);
             (0..n).map(|i| k.paint(&prompt, side, &one(i))).collect()
         })?
