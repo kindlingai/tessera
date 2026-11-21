@@ -98,6 +98,11 @@ impl Vector {
     pub fn of(t: Tensor) -> Self {
         Vector(t)
     }
+
+    /// The row as stored.
+    pub fn stored(&self) -> &Tensor {
+        &self.0
+    }
 }
 
 impl Weights for Linear {

@@ -262,6 +262,7 @@ pub enum Act {
     Relu,
     /// `ln(1 + e^x)`.
     Softplus,
+    Exp,
 }
 
 /// Data-dependent picks.

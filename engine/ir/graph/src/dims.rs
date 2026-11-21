@@ -54,6 +54,14 @@ pub enum DimName {
     VocabWords,
     /// Token ids one sparse pick chooses from.
     Candidates,
+    /// A linear-attention layer's query and key heads.
+    KeyHeads,
+    /// A linear-attention layer's value heads.
+    ValueHeads,
+    KeyDim,
+    ValueDim,
+    /// Rows a causal filter reads, its own included.
+    Window,
 }
 
 /// How a dimension gets its size.

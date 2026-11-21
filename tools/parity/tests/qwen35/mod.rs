@@ -1,18 +1,19 @@
 //! Qwen3.5 pieces against tiny random Hugging Face modules.
 
 mod attention_test;
+mod deltanet_test;
 
 use std::path::{Path, PathBuf};
 use tessera_checkpoint::File;
 use tessera_interp::{Tensor, run};
 use tessera_lower::{Device, lower};
 use tessera_models::Stack;
-use tessera_models::qwen35::Config;
-use tessera_parity::{loaded, pulled};
+use tessera_models::qwen35::{Config, Recurrent};
+use tessera_parity::loaded;
 use tessera_run::testing::runs;
 use tessera_testkit::max_abs_diff;
 use tessera_trace::DimName::{Context, Seqs};
-use tessera_trace::Graph;
+use tessera_trace::{Graph, PathSeg};
 
 /// The fixture's sequences and their length.
 const SEQS: usize = 2;
@@ -26,6 +27,13 @@ fn tiny() -> Config {
         rotary: 4,
         rope_theta: 1e7,
         eps: 1e-6,
+        linear: Recurrent {
+            key_heads: 2,
+            value_heads: 4,
+            key_dim: 8,
+            value_dim: 8,
+            window: 4,
+        },
     }
 }
 
@@ -53,10 +61,22 @@ fn positions() -> Tensor {
     Tensor::u32(vec![SEQS, LEN], at)
 }
 
+/// `g`'s weights, each named by its dotted path.
+fn weights(g: &Graph, dir: &Path) -> Vec<Tensor> {
+    let file = File::open(&dir.join("weights.safetensors")).unwrap();
+    let mut out = Vec::new();
+    for w in &g.weights {
+        let axis = |e: &tessera_trace::DimExpr| e.value(&g.dims, &|_| None).unwrap() as usize;
+        let shape = w.ty.shape.0.iter().map(axis).collect();
+        let name = PathSeg::dotted(&w.path);
+        out.push(Tensor::f32(shape, file.floats(&name).unwrap()));
+    }
+    out
+}
+
 /// `g` on the interpreter and each backend, against `want`.
 fn check(g: &Graph, dir: &Path, inputs: &[Tensor], want: &str) {
-    let file = File::open(&dir.join("weights.safetensors")).unwrap();
-    let weights = pulled("qwen35-tiny", g, &file);
+    let weights = weights(g, dir);
     let want = &read(dir, want)[..];
     let got = run(g, &weights, 0, inputs).unwrap().remove(0);
     let off = max_abs_diff(got.floats().unwrap(), want);

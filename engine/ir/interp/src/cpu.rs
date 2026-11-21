@@ -23,6 +23,7 @@ fn act(a: Act, x: f32) -> f32 {
         Act::Sigmoid => 1.0 / (1.0 + (-x).exp()),
         Act::Relu => x.max(0.0),
         Act::Softplus => softplus(x),
+        Act::Exp => x.exp(),
     }
 }
 
