@@ -1,6 +1,7 @@
-use crate::names::{Unresolved, resolve, rules};
+use crate::names::{resolve, rules};
 use tessera_checkpoint::{Slice, Stored};
 use tessera_engine::decoder::{Config, Swiglu, stepper};
+use tessera_engine::keys::Unresolved;
 use tessera_engine::{Graph, Norm, PathSeg};
 
 fn graph() -> Graph {

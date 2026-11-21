@@ -22,24 +22,41 @@ impl Offered {
     }
 }
 
-/// Why the keys and the offers do not pair off.
-#[derive(Debug, Default, PartialEq)]
+/// Why read paths and offered sources do not pair off.
+#[derive(Debug, PartialEq)]
 pub struct Unresolved {
-    /// Keys absent from every offer.
+    /// The kind of source, such as "file" or "slice".
+    pub source: &'static str,
+    /// Paths absent from every source.
     pub missing: Vec<String>,
-    /// Keys one offer holds under aliases that differ.
+    /// Paths more than one candidate fits, with the candidates.
     pub ambiguous: Vec<(String, Vec<String>)>,
-    /// Keys whose value the model cannot take, and why.
+    /// Paths whose value the model cannot take, and why.
     pub misfit: Vec<(String, String)>,
+}
+
+impl Unresolved {
+    pub fn new(source: &'static str) -> Self {
+        Self {
+            source,
+            missing: Vec::new(),
+            ambiguous: Vec::new(),
+            misfit: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.ambiguous.is_empty() && self.misfit.is_empty()
+    }
 }
 
 impl fmt::Display for Unresolved {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for path in &self.missing {
-            writeln!(f, "{path}: missing from every file")?;
+            writeln!(f, "{path}: in no {}", self.source)?;
         }
         for (path, held) in &self.ambiguous {
-            writeln!(f, "{path}: differs across {}", held.join(", "))?;
+            writeln!(f, "{path}: ambiguous across {}", held.join(", "))?;
         }
         for (path, why) in &self.misfit {
             writeln!(f, "{path}: {why}")?;
@@ -63,7 +80,7 @@ impl<'a> Keys<'a> {
         Self {
             offers,
             read: BTreeSet::new(),
-            unresolved: Unresolved::default(),
+            unresolved: Unresolved::new("file"),
         }
     }
 
@@ -100,9 +117,8 @@ impl<'a> Keys<'a> {
 
     /// Values beside read ones that nothing read, else the failures.
     pub fn finish(self) -> Result<Vec<String>, Unresolved> {
-        let u = self.unresolved;
-        if !(u.missing.is_empty() && u.ambiguous.is_empty() && u.misfit.is_empty()) {
-            return Err(u);
+        if !self.unresolved.is_empty() {
+            return Err(self.unresolved);
         }
         let mut unread = Vec::new();
         for (i, offer) in self.offers.iter().enumerate() {

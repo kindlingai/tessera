@@ -292,6 +292,15 @@ fn near_samples_estimate() {
     assert_eq!(device.samples(), 2);
     assert!((seconds(&device, 64) - 2e-3).abs() < 1e-9, "a low quartile");
     assert!(seconds(&device.clone().without("map"), 64).is_infinite());
+    // Cold launches scale by the nearest cold over warm.
+    let cold = |d: &Device, len: usize| d.seconds_in(0, &*mapped(len).kernel, len, true);
+    assert_eq!(cold(&device, 64), seconds(&device, 64), "no cold samples");
+    device.fit_cold([(&mapped(1024), 8e-3)]);
+    let warm = seconds(&device, 2048);
+    assert!(
+        (cold(&device, 2048) - 2.0 * warm).abs() < 1e-9,
+        "twice as slow"
+    );
 }
 
 #[test]

@@ -97,6 +97,20 @@ fn widen(name: &str, e: u32, m: u32) -> String {
     )
 }
 
+/// `f_pair_bf16` in integer steps, reading float bits with `bits`.
+fn pair_bits(bits: &str) -> String {
+    format!(
+        "f_fn u32 f_pair_bf16(float hi, float lo) {{
+    u32 h = {bits}(hi);
+    u32 l = {bits}(lo);
+    h = (h + 0x7fffu + ((h >> 16) & 1u)) & 0xffff0000u;
+    l = (l + 0x7fffu + ((l >> 16) & 1u)) & 0xffff0000u;
+    return h | (l >> 16);
+}}
+"
+    )
+}
+
 /// `name` spelled one way per dialect: Metal, then CUDA.
 fn define(name: &str, metal: &str, cuda: &str) -> [String; 2] {
     [metal, cuda].map(|s| format!("#define {name} {s}\n"))
@@ -165,6 +179,11 @@ fn head(dialect: Dialect) -> String {
 
 impl Text {
     pub fn render(&self, dialect: Dialect) -> String {
+        self.bounded(dialect, None)
+    }
+
+    /// CUDA and HIP compile for at most `group` threads.
+    pub fn bounded(&self, dialect: Dialect, group: Option<usize>) -> String {
         let metal = dialect == Dialect::Metal;
         let mut params = Vec::new();
         for (at, (name, ty, writes)) in self.buffers.iter().enumerate() {
@@ -188,14 +207,18 @@ impl Text {
                 params.push("u32 lid [[thread_index_in_threadgroup]]".into());
                 (
                     format!("{}{}", head(dialect), crate::tile::METAL),
-                    "kernel void",
+                    "kernel void".into(),
                     "",
                 )
             }
             false => {
                 let index = "    f_pdl_wait();\n    f_pdl_go();\n    u32 gid = blockIdx.x * blockDim.x + threadIdx.x;\n    u32 lid = threadIdx.x;\n";
                 let head = format!("{}{}", head(dialect), crate::tile::cuda());
-                (head, "extern \"C\" __global__ void", index)
+                let kind = match group {
+                    Some(n) => format!("extern \"C\" __global__ void __launch_bounds__({n})"),
+                    None => "extern \"C\" __global__ void".into(),
+                };
+                (head, kind, index)
             }
         };
         let (entry, params, body) = (&self.entry, params.join(",\n    "), &self.body);

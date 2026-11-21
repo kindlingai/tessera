@@ -5,7 +5,7 @@ use crate::ranks::{Spec, Wire, device};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
-use tessera_lower::{Device, Pins, Plan, Source, Step, Tree, assign, peak, schedule, select};
+use tessera_lower::{Device, Pins, Source, Step, Tree, assign, peak, schedule, select};
 
 /// One step of a rank's plan, for views.
 #[derive(Clone, Debug, Serialize)]
@@ -99,18 +99,6 @@ fn text_of(step: &Step, spec: &Spec) -> (&'static str, String) {
     (name, text)
 }
 
-/// Seconds for one step, from the device's cost model.
-fn seconds(device: &Device, plan: &Plan, step: &Step) -> f64 {
-    let from = step.reads.first().map(|r| plan.zone(r.buffer));
-    let bytes = step.write.bytes();
-    let time = match from.filter(|z| *z != step.zone) {
-        Some(from) => device.transfer(from, step.zone, bytes),
-        None if step.kernel.name() == "all_reduce" => device.all_reduce(bytes),
-        None => Some(device.seconds_in(step.zone, &*step.kernel, step.write.len)),
-    };
-    time.unwrap_or(0.0)
-}
-
 /// Each sharded node's shape on this rank, from the tree.
 fn shapes(
     model: &Model,
@@ -175,7 +163,7 @@ impl Setup<'_> {
                     zone: step.zone,
                     covers,
                     bytes: step.write.bytes(),
-                    seconds: seconds(&device, &plan, step),
+                    seconds: device.step_seconds(&plan, step).unwrap_or(0.0),
                     sum: step.kernel.name() == "all_reduce",
                     text: at,
                 });

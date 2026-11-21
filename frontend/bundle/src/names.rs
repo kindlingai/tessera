@@ -1,8 +1,8 @@
 //! Pairs the graph's weights with the slices a checkpoint offers.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use tessera_checkpoint::Slice;
+use tessera_engine::keys::Unresolved;
 use tessera_engine::{Graph, PathSeg};
 
 /// A weight path to a slice stem, `*` the layer index.
@@ -16,32 +16,6 @@ pub struct Claim {
     pub rows: Option<(usize, usize)>,
     /// Slices stacked on the first axis, one per matrix.
     pub parts: Vec<String>,
-}
-
-/// Why the weights and the slices do not pair off.
-#[derive(Debug, Default, PartialEq, thiserror::Error)]
-pub struct Unresolved {
-    /// Weights without a fitting slice.
-    pub missing: Vec<String>,
-    /// Weights several slices fit, with the slices.
-    pub ambiguous: Vec<(String, Vec<String>)>,
-    /// Weights a rule sent to a slice of another shape.
-    pub misfit: Vec<(String, String)>,
-}
-
-impl fmt::Display for Unresolved {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for path in &self.missing {
-            writeln!(f, "{path}: unmatched by any slice")?;
-        }
-        for (path, slices) in &self.ambiguous {
-            writeln!(f, "{path}: fits {}", slices.join(", "))?;
-        }
-        for (path, slice) in &self.misfit {
-            writeln!(f, "{path}: {slice} has another shape")?;
-        }
-        Ok(())
-    }
 }
 
 /// Name parts that say nothing about a weight's role.
@@ -262,7 +236,7 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Cla
     let roles: BTreeMap<&str, &[&[&str]]> = ROLES.iter().copied().collect();
     let parsed: Vec<Words> = slices.iter().map(|s| words(&s.name)).collect();
     let mut out = Vec::with_capacity(g.weights.len());
-    let mut failed = Unresolved::default();
+    let mut failed = Unresolved::new("slice");
     for w in &g.weights {
         let r = role(&w.path);
         let want = wanted(g, &w.ty.shape);
@@ -304,7 +278,9 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Cla
             });
             match (claim, named.first()) {
                 (Some(c), _) => out.push(c),
-                (None, Some(s)) => failed.misfit.push((r.text, s.name.clone())),
+                (None, Some(s)) => {
+                    (failed.misfit).push((r.text, format!("{} has another shape", s.name)))
+                }
                 (None, None) => failed.missing.push(r.text),
             }
             continue;
@@ -333,7 +309,7 @@ pub fn resolve(g: &Graph, slices: &[Slice], rules: &[&[Rule]]) -> Result<Vec<Cla
                 .push((r.text, many.iter().map(|s| (*s).into()).collect())),
         }
     }
-    match failed == Unresolved::default() {
+    match failed.is_empty() {
         true => Ok(out),
         false => Err(failed),
     }

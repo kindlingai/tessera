@@ -1,7 +1,7 @@
 //! Many answers in flight, one step feeding them all.
 
 use crate::kept::{Kept, Totals};
-use crate::{Allowed, Engine, Error, Event, Reason, Request, Row};
+use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
 use std::collections::VecDeque;
 
 crate::metric_registry!(REQUESTS = "requests");
@@ -159,6 +159,8 @@ pub struct Batch<'a> {
     policy: Box<dyn Policy>,
     waiting: VecDeque<(Request, Sink)>,
     active: Vec<Seq>,
+    /// Admitted reads, run before the next step.
+    reading: Vec<Seq>,
     free: Vec<u32>,
     /// Set when finished answers keep their rows.
     kept: Option<Kept>,
@@ -178,6 +180,7 @@ impl<'a> Batch<'a> {
             policy,
             waiting: VecDeque::new(),
             active: Vec::new(),
+            reading: Vec::new(),
             free,
             kept: None,
             budget,
@@ -201,11 +204,14 @@ impl<'a> Batch<'a> {
     /// Queues an answer. An unfit prompt ends at once.
     pub fn submit(&mut self, request: Request, mut sink: Sink) {
         let long = request.tokens.len() > self.engine.context;
-        if request.tokens.is_empty() || long {
+        let rows = request.reads.iter().map(|r| r.row);
+        let past = rows.clone().any(|r| r as usize >= request.tokens.len());
+        let sorted = rows.clone().zip(rows.skip(1)).all(|(a, b)| a < b);
+        if request.tokens.is_empty() || long || past || !sorted {
             sink(Event::Done(Reason::Context));
             return;
         }
-        if request.max_tokens == 0 {
+        if request.max_tokens == 0 && request.reads.is_empty() {
             sink(Event::Done(Reason::Length));
             return;
         }
@@ -219,9 +225,12 @@ impl<'a> Batch<'a> {
 
     /// A slot for the next answer, and its kept rows.
     fn place(&mut self) -> Option<(u32, usize)> {
-        let tokens = &self.waiting.front()?.0.tokens;
+        let request = &self.waiting.front()?.0;
+        // A read feeds its first read row at least.
+        let fed = request.reads.first().map(|r| r.row as usize);
+        let limit = fed.unwrap_or(request.tokens.len() - 1);
         match &mut self.kept {
-            Some(kept) => kept.admit(tokens),
+            Some(kept) => kept.admit(&request.tokens, limit),
             None => Some((self.free.pop()?, 0)),
         }
     }
@@ -243,6 +252,10 @@ impl<'a> Batch<'a> {
             };
             if skip > 0 {
                 (seq.sink)(Event::Kept(skip));
+            }
+            if !seq.request.reads.is_empty() {
+                self.reading.push(seq);
+                continue;
             }
             match seq.settle() {
                 Some(reason) => {
@@ -332,15 +345,48 @@ impl<'a> Batch<'a> {
         ran
     }
 
+    /// Feeds each admitted read's rows, then sends its scores.
+    fn read(&mut self) -> Result<bool, Error> {
+        let ran = !self.reading.is_empty();
+        while let Some(mut seq) = self.reading.pop() {
+            let mut scores = Vec::with_capacity(seq.request.reads.len());
+            while seq.pending() > 0 {
+                let n = seq.pending().min(self.budget);
+                let rows: Vec<Row> = (0..n).filter_map(|i| seq.row(i)).collect();
+                self.page(&rows)?;
+                let (mut picks, mut ids) = (Vec::new(), Vec::new());
+                for r in &seq.request.reads[scores.len()..] {
+                    let at = r.row as usize - seq.fed;
+                    if at >= n {
+                        break;
+                    }
+                    picks.push(at as u32);
+                    ids.push(r.ids.clone());
+                }
+                match picks.is_empty() {
+                    true => drop(self.engine.last(&rows)?),
+                    false => scores.extend(self.engine.scores(&rows, &picks, &ids)?),
+                }
+                seq.history.extend(seq.pending.drain(..n));
+                seq.fed += n;
+            }
+            (seq.sink)(Event::Scores(scores));
+            (seq.sink)(Event::Done(Reason::Stop));
+            self.retire(seq);
+        }
+        Ok(ran)
+    }
+
     fn turn(&mut self) -> Result<bool, Error> {
         self.admit();
+        let read = self.read()?;
         self.fit();
         let rows = self.policy.pick(&self.active, self.budget);
         if rows.is_empty() {
-            return Ok(false);
+            return Ok(read);
         }
         self.page(&rows)?;
-        let ends = crate::ends(&rows);
+        let ends = ends(&rows);
         let ids = match self.allowed(&rows, &ends) {
             Some(allowed) => self.engine.last_guided(&rows, &allowed)?,
             None => self.engine.last(&rows)?,

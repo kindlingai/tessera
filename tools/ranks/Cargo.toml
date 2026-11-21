@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["tessera-run/cuda", "tessera-gpukit/cuda"]
-rocm = ["tessera-run/rocm", "tessera-gpukit/rocm"]
+cuda = ["tessera-run/cuda", "tessera-gpukit/cuda", "tessera-device/cuda"]
+rocm = ["tessera-run/rocm", "tessera-gpukit/rocm", "tessera-device/rocm"]
 
 [dependencies]
 tessera-bundle = { workspace = true }

@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 use tessera_tasks::Error;
-use tessera_tasks::api::{Finish, Format, Generator, Params, Refused, Sink, Step};
+use tessera_tasks::api::{Finish, Format, Generator, Params, Read, Refused, Score, Sink, Step};
 
 /// Answers "hello" in two tokens. Keeps what it was asked.
 #[derive(Default)]
@@ -35,5 +35,13 @@ impl Generator for MockGenerator {
             cached: 3,
         });
         Ok(())
+    }
+}
+
+impl Score for MockGenerator {
+    /// Each read's logits favor its last id.
+    fn score(&self, _prompt: Vec<u32>, reads: Vec<Read>) -> Result<Vec<Vec<f32>>, Error> {
+        let rising = |r: &Read| (0..r.ids.len()).map(|i| i as f32).collect();
+        Ok(reads.iter().map(rising).collect())
     }
 }

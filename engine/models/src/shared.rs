@@ -159,6 +159,17 @@ impl<'a, D: Dense> Attend<'a, D> {
     }
 }
 
+/// The ports a step graph adds beyond its rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Steps {
+    #[default]
+    Plain,
+    /// A second entry scores candidate ids.
+    Scored,
+    /// The first entry takes masks. The second scores.
+    Masked,
+}
+
 /// Sizes every decoder stack here declares.
 pub struct Stack {
     pub vocab: u64,
@@ -170,8 +181,7 @@ pub struct Stack {
     /// The most sequences in one launch.
     pub max_seqs: u64,
     pub max_context: u64,
-    /// Step entries also take a mask of allowed tokens.
-    pub masked: bool,
+    pub steps: Steps,
 }
 
 impl Stack {
@@ -190,7 +200,7 @@ impl Stack {
             ffn,
             max_seqs,
             max_context,
-            masked: false,
+            steps: Steps::Plain,
         }
     }
 
@@ -211,8 +221,10 @@ impl Stack {
             bounded(Context, self.max_context),
         ];
         dims.extend(shared.iter().chain(own).map(fixed));
-        if self.masked {
+        if self.steps == Steps::Masked {
             dims.push(Dim::fixed(VocabWords, self.vocab.div_ceil(32)));
+        }
+        if self.steps != Steps::Plain {
             dims.push(bounded(Candidates, FEW));
         }
         dims

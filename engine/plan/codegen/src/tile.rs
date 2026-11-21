@@ -10,6 +10,9 @@ typedef simdgroup_float8x8 tile_b;
 #define TILE_ZERO(acc) acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f)
 #define TILE_LOAD_A(f, p, s) simdgroup_load(f, p, s)
 #define TILE_LOAD_B(f, p, s) simdgroup_load(f, p, s, ulong2(0, 0), true)
+typedef simdgroup_float8x8 tile_held;
+#define TILE_HOLD_A(h, p, s) simdgroup_load(h, p, s)
+#define TILE_HELD_A(f, h) f = h
 #define TILE_MMA(c, a, b) simdgroup_multiply_accumulate(c, a, b, c)
 #define TILE_COUNT 2
 #define TILE_ROW(e) (((lane / 4) & 4) + ((lane / 2) % 4))
@@ -51,6 +54,19 @@ __device__ __forceinline__ void tile_one(tile_acc &c, const u32 *a, const u32 *b
 }
 #define TILE_LOAD_A(f, p, s) tile_load_a(f, p, s, lane)
 #define TILE_LOAD_B(f, p, s) tile_load_b(f, p, s, lane)
+typedef struct { float v[4]; } tile_held;
+__device__ __forceinline__ void tile_hold_a(tile_held &h, const float *p, u32 s, u32 lane) {
+    u32 g = lane / 4, t = lane % 4;
+    h.v[0] = p[g * s + t];
+    h.v[1] = p[(g + 8) * s + t];
+    h.v[2] = p[g * s + t + 4];
+    h.v[3] = p[(g + 8) * s + t + 4];
+}
+__device__ __forceinline__ void tile_held_a(tile_a &f, const tile_held &h) {
+    for (u32 e = 0; e < 4; e++) tile_split(h.v[e], f.hi[e], f.lo[e]);
+}
+#define TILE_HOLD_A(h, p, s) tile_hold_a(h, p, s, lane)
+#define TILE_HELD_A(f, h) tile_held_a(f, h)
 #define TILE_MMA(c, a, b) do { tile_one(c, (a).lo, (b).hi); tile_one(c, (a).hi, (b).lo); tile_one(c, (a).hi, (b).hi); } while (0)
 __device__ __forceinline__ void tile_ldm_a(u32 *r, const u32 *p) {
     u32 at = (u32)__cvta_generic_to_shared(p);
@@ -93,6 +109,9 @@ __device__ __forceinline__ void tile_load_row(tile_a &f, const float *p, u32 s, 
 }
 #define TILE_LOAD_A(f, p, s) tile_load_row(f, p, s, lane)
 #define TILE_LOAD_B(f, p, s) tile_load_row(f, p, s, lane)
+typedef tile_a tile_held;
+#define TILE_HOLD_A(h, p, s) tile_load_row(h, p, s, lane)
+#define TILE_HELD_A(f, h) f = h
 #define TILE_MMA(c, a, b) do { \\
     c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((a).lo, (b).hi, c); \\
     c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((a).hi, (b).lo, c); \\

@@ -12,6 +12,8 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub struct Decoder {
     pub graph: Graph,
     pub weights: Vec<Weight>,
+    /// Pixels a side at each level, the latent first.
+    pub sides: Vec<u64>,
 }
 
 /// `[out, in, k, k]` kernels as `[out, k, k, in]`.
@@ -35,7 +37,12 @@ pub fn decoder(dir: &Path, sizes: [u64; 2], overrides: &Overrides) -> Result<Dec
     let config = config(dir, sizes, overrides)?;
     let graph = program(&config);
     let weights = weights(dir, config.bn_eps, &graph)?;
-    Ok(Decoder { graph, weights })
+    let sides = config.sides();
+    Ok(Decoder {
+        graph,
+        weights,
+        sides,
+    })
 }
 
 /// The decoder `dir/vae/config.json` describes.

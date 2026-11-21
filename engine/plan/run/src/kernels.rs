@@ -4,7 +4,8 @@ use crate::Error;
 use std::collections::HashMap;
 use tessera_codegen::Dialect;
 use tessera_gpukit::backend::Backend;
-use tessera_lower::{Source, Step};
+use tessera_gpukit::launch::THREADS_PER_BLOCK;
+use tessera_lower::{Launch, Shape, Source, Step};
 
 /// The kernel text a backend compiles.
 pub(crate) fn dialect(backend: Backend) -> Dialect {
@@ -36,7 +37,16 @@ pub(crate) fn fixed_text(
     Some((text, entry))
 }
 
-/// Compiled kernels, by how a kernel prints and by entry.
+/// The largest group among the launches of `step`.
+pub(crate) fn group(step: &Step) -> usize {
+    let threads = |l: Launch| match l.shape {
+        Shape::Grid { threads, .. } => threads,
+        Shape::Line(_) | Shape::Runtime(_) => THREADS_PER_BLOCK as usize,
+    };
+    step.launches().into_iter().map(threads).max().unwrap_or(1)
+}
+
+/// Compiled kernels, by group size and entry.
 pub(crate) struct Kernels<T> {
     made: HashMap<String, T>,
     /// With whether each was generated.
@@ -72,14 +82,19 @@ impl<T: Clone> Kernels<T> {
                 let (text, entry) = fixed_text(&source, backend).unwrap_or_default();
                 (fixed(text, entry)?, false)
             }
-            Source::Made(body) => match self.made.get(&body.entry) {
-                Some(compiled) => (compiled.clone(), true),
-                None => {
-                    let compiled = made(&body.text().render(dialect(backend)), &body.entry)?;
-                    self.made.insert(body.entry.clone(), compiled.clone());
-                    (compiled, true)
+            Source::Made(body) => {
+                let group = group(step);
+                let at = format!("{}/{group}", body.entry);
+                match self.made.get(&at) {
+                    Some(compiled) => (compiled.clone(), true),
+                    None => {
+                        let text = body.text().bounded(dialect(backend), Some(group));
+                        let compiled = made(&text, &body.entry)?;
+                        self.made.insert(at, compiled.clone());
+                        (compiled, true)
+                    }
                 }
-            },
+            }
         };
         self.known.insert(key, found.clone());
         Ok(found)

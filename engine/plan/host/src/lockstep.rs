@@ -162,6 +162,16 @@ pub fn e2m1(w: u32, low: u32) -> f32 {
     f32::from(E2M1(field(w, low, 4) as u8))
 }
 
+/// `hi` and `lo` to bf16, nearest even, `hi` high.
+#[inline(always)]
+pub fn bf16_pair(hi: f32, lo: f32) -> u32 {
+    let round = |x: f32| {
+        let b = x.to_bits();
+        b.wrapping_add(0x7fff + ((b >> 16) & 1)) & 0xffff_0000
+    };
+    round(hi) | (round(lo) >> 16)
+}
+
 macro_rules! wide {
     ($($name:ident = $op:tt),*) => {$(
         #[inline(always)]
@@ -261,6 +271,53 @@ impl Tiles {
         }
     }
 
+    /// Copies each SIMD group's slab from `a`.
+    pub fn hold(
+        &mut self,
+        a: &[f32],
+        a_at: &[u32; THREADS],
+        stride: &[u32; THREADS],
+        mask: &[bool; THREADS],
+        n: usize,
+    ) {
+        let cols = self.cols;
+        for (s, t) in leaders(self.lanes, n, mask) {
+            let (at, stride) = (a_at[t] as usize, stride[t] as usize);
+            for (i, v) in self.blocks[s].iter_mut().enumerate() {
+                *v = a[at + i / cols * stride + i % cols];
+            }
+        }
+    }
+
+    /// Adds `depth` columns of the slab `held` times `b`.
+    #[allow(clippy::too_many_arguments, reason = "mirrors the tile statement")]
+    pub fn block_held(
+        &mut self,
+        held: &Tiles,
+        b: &[f32],
+        b_at: &[u32; THREADS],
+        stride: &[u32; THREADS],
+        depth: usize,
+        mask: &[bool; THREADS],
+        n: usize,
+        p: Precision,
+    ) {
+        for (s, t) in leaders(self.lanes, n, mask) {
+            let stride = stride[t] as usize;
+            let at = Slabs {
+                a: 0,
+                b: b_at[t] as usize,
+                stride,
+                parts: 0,
+                apart: 0,
+            };
+            let slab = &held.blocks[s];
+            let a = |i: usize| slab[i / stride * held.cols + i % stride].to_bits();
+            let b = |i: usize| b[i].to_bits();
+            at.products(p, self.rows, self.cols, depth, a, b, &mut self.blocks[s]);
+        }
+    }
+
     /// Adds `depth` columns of `a` times `b`, unit rounded.
     #[allow(clippy::too_many_arguments, reason = "mirrors the tile statement")]
     pub fn block(
@@ -276,12 +333,7 @@ impl Tiles {
         n: usize,
         p: Precision,
     ) {
-        for s in 0..self.blocks.len() {
-            // Any live lane of the SIMD group names its slabs.
-            let range = s * self.lanes..((s + 1) * self.lanes).min(n);
-            let Some(t) = range.into_iter().find(|t| mask[*t]) else {
-                continue;
-            };
+        for (s, t) in leaders(self.lanes, n, mask) {
             let at = Slabs {
                 a: a_at[t] as usize,
                 b: b_at[t] as usize,
@@ -293,6 +345,16 @@ impl Tiles {
             at.products(p, self.rows, self.cols, depth, a, b, &mut self.blocks[s]);
         }
     }
+}
+
+/// Each SIMD group with a live lane, and that lane.
+pub(crate) fn leaders(
+    lanes: usize,
+    n: usize,
+    mask: &[bool],
+) -> impl Iterator<Item = (usize, usize)> {
+    let first = move |s: usize| (s * lanes..((s + 1) * lanes).min(n)).find(|t| mask[*t]);
+    (0..n.div_ceil(lanes)).filter_map(move |s| first(s).map(|t| (s, t)))
 }
 
 /// Where a SIMD group's tile operands sit in group memory.

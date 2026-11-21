@@ -563,7 +563,12 @@ impl Lowerer<'_, '_> {
                 let e = self.hoist(e)?;
                 self.lanes(Some(mask), |s, t| s.expr(&e, t).map(|_| ()))
             }
-            Stmt::TileAcc { name, rows, cols } => {
+            Stmt::TileAcc { name, rows, cols }
+            | Stmt::TileHeld {
+                name,
+                rows,
+                depth: cols,
+            } => {
                 let (rows, cols) = (
                     self.iconst(self.ptr, *rows as i64),
                     self.iconst(self.ptr, *cols as i64),
@@ -597,6 +602,28 @@ impl Lowerer<'_, '_> {
                     })
                 })
             }
+            Stmt::TileHold {
+                held,
+                a,
+                a_at,
+                stride,
+            } => {
+                let held = self.tiles_of(held)?;
+                let (a, a_len) = self.shared_of(a)?;
+                let a_at = self.lane_array(a_at, Ty::U32)?;
+                let stride = self.lane_array(stride, Ty::U32)?;
+                let args = [
+                    held,
+                    a,
+                    a_len,
+                    self.slot_addr(a_at),
+                    self.slot_addr(stride),
+                    self.slot_addr(mask),
+                    self.n,
+                ];
+                self.call("tiles_hold", &args);
+                Ok(())
+            }
             Stmt::TileBlock {
                 acc,
                 a,
@@ -609,13 +636,37 @@ impl Lowerer<'_, '_> {
                 apart,
             } => {
                 let tiles = self.tiles_of(acc)?;
-                let (a, a_len) = self.shared_of(a)?;
                 let (b, b_len) = self.shared_of(b)?;
-                let a_at = self.lane_array(a_at, Ty::U32)?;
                 let b_at = self.lane_array(b_at, Ty::U32)?;
                 let stride = self.lane_array(stride, Ty::U32)?;
-                let apart = self.lane_array(apart, Ty::U32)?;
                 let depth = self.iconst(self.ptr, *depth as i64);
+                let (b_at, stride, mask) = (
+                    self.slot_addr(b_at),
+                    self.slot_addr(stride),
+                    self.slot_addr(mask),
+                );
+                // A held slab is a tile object.
+                if let Expr::Var(name) = a
+                    && let Ok(Kind::Tiles(held)) = self.kind(name)
+                {
+                    let args = [
+                        tiles,
+                        held,
+                        b,
+                        b_len,
+                        b_at,
+                        stride,
+                        depth,
+                        mask,
+                        self.n,
+                        self.precision,
+                    ];
+                    self.call("tiles_block_held", &args);
+                    return Ok(());
+                }
+                let (a, a_len) = self.shared_of(a)?;
+                let a_at = self.lane_array(a_at, Ty::U32)?;
+                let apart = self.lane_array(apart, Ty::U32)?;
                 let parts = self.iconst(self.ptr, *parts as i64);
                 let args = [
                     tiles,
@@ -624,12 +675,12 @@ impl Lowerer<'_, '_> {
                     self.slot_addr(a_at),
                     b,
                     b_len,
-                    self.slot_addr(b_at),
-                    self.slot_addr(stride),
+                    b_at,
+                    stride,
                     depth,
                     parts,
                     self.slot_addr(apart),
-                    self.slot_addr(mask),
+                    mask,
                     self.n,
                     self.precision,
                 ];

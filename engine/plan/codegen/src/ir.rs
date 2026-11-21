@@ -248,10 +248,24 @@ pub enum Stmt {
         rows: usize,
         cols: usize,
     },
+    /// A SIMD group's slab of A, kept in registers.
+    TileHeld {
+        name: String,
+        rows: usize,
+        depth: usize,
+    },
+    /// Copies a slab of A from group memory into `held`.
+    TileHold {
+        held: String,
+        a: Expr,
+        a_at: Expr,
+        stride: Expr,
+    },
     /// Adds `depth` staged columns of A times B to `acc`.
     TileBlock {
         acc: String,
         a: Expr,
+        /// Ignored when `a` is a held slab.
         a_at: Expr,
         b: Expr,
         b_at: Expr,

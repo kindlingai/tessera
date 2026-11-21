@@ -3,6 +3,9 @@
 mod answer;
 #[cfg(test)]
 mod answer_test;
+mod decide;
+#[cfg(test)]
+mod decide_test;
 pub mod http;
 #[cfg(test)]
 mod http_test;
@@ -28,7 +31,7 @@ pub use images::{fresh, square};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::Message;
-use tessera_tasks::api::{Chat, Embed, GenerateImage, Generator, Info, Tokens};
+use tessera_tasks::api::{Chat, Embed, GenerateImage, Generator, Info, Score, Tokens};
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
 
 /// The loaded model, from the routes' side.
@@ -39,6 +42,7 @@ pub struct Model {
     pub generator: Option<Arc<dyn Generator>>,
     pub embed: Option<Arc<dyn Embed>>,
     pub image: Option<Arc<dyn GenerateImage>>,
+    pub score: Option<Arc<dyn Score>>,
     /// Unknown request fields refuse the request. Else they warn.
     pub strict: bool,
 }
@@ -142,6 +146,7 @@ tessera_engine::metric_registry!(API = "api");
 tessera_engine::metric!(COMPLETIONS in API = Counter "tessera:completion_requests_total", "Requests to /v1/completions.");
 tessera_engine::metric!(CHATS in API = Counter "tessera:chat_requests_total", "Requests to /v1/chat/completions.");
 tessera_engine::metric!(EMBEDS in API = Counter "tessera:embedding_requests_total", "Requests to /v1/embeddings.");
+tessera_engine::metric!(DECISIONS in API = Counter "tessera:systemone_requests_total", "Requests to /v1/systemone.");
 tessera_engine::metric!(IMAGES in API = Counter "tessera:image_requests_total", "Requests to /v1/images/generations.");
 
 /// Answers one request.
@@ -169,6 +174,10 @@ pub fn route(slot: &Slot, request: &Request) -> Response {
         ("POST", "/v1/chat/completions") => {
             CHATS.add(1);
             answer::chat_completions(slot, body)
+        }
+        ("POST", "/v1/systemone") => {
+            DECISIONS.add(1);
+            decide::systemone(slot, body)
         }
         _ => refuse(404, "no such route", None).into(),
     }

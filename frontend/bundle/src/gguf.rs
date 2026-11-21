@@ -9,7 +9,7 @@ use std::path::Path;
 use tessera_checkpoint::Gguf;
 use tessera_engine::decoder::{Config, Scales};
 use tessera_engine::form::{F32_FORM, Load, named};
-use tessera_engine::{Graph, PathSeg, Pins, Stack};
+use tessera_engine::{Graph, PathSeg, Pins, Stack, Steps};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -41,7 +41,7 @@ fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, F
             ffn: integer("feed_forward_length")?,
             max_seqs: slots,
             max_context: context,
-            masked: false,
+            steps: Steps::Plain,
         },
         kv_heads: integer("attention.head_count_kv")?,
         rope_theta: float("rope.freq_base")?,
@@ -161,14 +161,14 @@ pub(crate) fn load(
     slots: u64,
     context: u64,
     user: &[Rule],
-    masked: bool,
+    steps: Steps,
 ) -> Result<Bundle, Failure> {
     let gguf = Gguf::open(path)?;
     let arch = gguf
         .str("general.architecture")
         .ok_or("a GGUF file names its architecture")?;
     let mut config = config(&gguf, arch, slots, context)?;
-    config.stack.masked = masked;
+    config.stack.steps = steps;
     let graph = stepper(arch, &config)
         .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
     let layers = config.stack.layers;

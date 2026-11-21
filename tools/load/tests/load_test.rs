@@ -89,6 +89,8 @@ fn respond(socket: TcpStream, mode: Mode, state: &State) {
     let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(active, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(20));
+    // Before the reply, so a client's next request never overlaps.
+    state.active.fetch_sub(1, Ordering::SeqCst);
     let stream = events(tokens, mode);
     let sse = "Content-Type: text/event-stream\r\n";
     match mode {
@@ -114,7 +116,6 @@ fn respond(socket: TcpStream, mode: Mode, state: &State) {
             socket.write_all(b"0\r\n\r\n").unwrap();
         }
     }
-    state.active.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn events(tokens: usize, mode: Mode) -> String {

@@ -314,7 +314,7 @@ fn group_ty(ty: &Type) -> Option<&Type> {
         return None;
     };
     let head = path.path.segments.last()?.ident.to_string();
-    let known = ["Buf", "BufMut", "Shared", "Tiles"].contains(&head.as_str());
+    let known = ["Buf", "BufMut", "Shared", "Tiles", "Held"].contains(&head.as_str());
     (!known && scalar(ty).is_err()).then_some(ty)
 }
 
@@ -363,7 +363,7 @@ fn param(name: &Tokens, ty: &Type, picked: Option<Ident>) -> Res {
             let ty = scalar(t)?;
             quote!(Param::Shared { name: #name.into(), ty: #ty })
         }
-        "Tiles" => quote!(Param::Tiles { name: #name.into() }),
+        "Tiles" | "Held" => quote!(Param::Tiles { name: #name.into() }),
         _ => {
             let ty = scalar(ty)?;
             quote!(Param::Scalar { name: #name.into(), ty: #ty })
@@ -519,6 +519,16 @@ fn declare(name: &Tokens, init: &Expr, ctx: &Ctx) -> Res {
             cols: (#cols) as usize,
         }));
     }
+    if let Expr::Call(call) = init
+        && is_path(&call.func, "held")
+    {
+        let (rows, depth) = (&call.args[0], &call.args[1]);
+        return Ok(quote!(Stmt::TileHeld {
+            name: #name.into(),
+            rows: (#rows) as usize,
+            depth: (#depth) as usize,
+        }));
+    }
     if let Expr::Repeat(r) = init {
         let ty = match &*r.expr {
             Expr::Lit(ExprLit {
@@ -610,6 +620,23 @@ fn statement(e: &Expr, ctx: &Ctx) -> Res {
                 depth: (#depth) as usize,
                 parts: (#parts) as usize,
                 apart: #apart,
+            }))
+        }
+        Expr::MethodCall(m) if m.method == "hold" => {
+            let held = named(&m.receiver)?;
+            let args: Vec<Tokens> = m
+                .args
+                .iter()
+                .map(|a| expr(a, ctx))
+                .collect::<Result<_, _>>()?;
+            let [a, a_at, stride] = args.as_slice() else {
+                return Err(Error::new(m.span(), "`held.hold(a, a_at, stride)`"));
+            };
+            Ok(quote!(Stmt::TileHold {
+                held: #held.into(),
+                a: #a,
+                a_at: #a_at,
+                stride: #stride,
             }))
         }
         Expr::MethodCall(m) if m.method == "zero" => {

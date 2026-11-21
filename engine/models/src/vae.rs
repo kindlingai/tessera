@@ -63,6 +63,11 @@ impl Config {
         }
     }
 
+    /// Pixels a side per transformer token.
+    pub fn scale(&self) -> u64 {
+        2 << (self.widths.len() - 1)
+    }
+
     /// Pixels a side at each level, the latent first.
     pub fn sides(&self) -> Vec<u64> {
         (0..self.widths.len() as u32)

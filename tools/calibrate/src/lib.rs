@@ -13,6 +13,7 @@ use tessera_rules as _;
 pub use grid::Grid;
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 use tessera_engine::Error;
 use tessera_graph::{DimName, Graph};
 use tessera_lower::{Device, Settings, Step, View, ZoneKind, lower, select};
@@ -26,6 +27,23 @@ const BURST: usize = 16;
 /// Seconds one try aims to fill.
 const AIM: f64 = 1e-3;
 
+/// `TRIES` bursts of step `i`, each about `AIM` long.
+fn bursts(runner: &mut dyn Run, i: usize) -> Result<Vec<f64>, Error> {
+    let once = runner.repeat(i, 1)?;
+    let times = (AIM / once.max(1e-7)).clamp(1.0, BURST as f64) as usize;
+    let mut tries = Vec::with_capacity(TRIES);
+    for _ in 0..TRIES {
+        tries.push(runner.repeat(i, times)?);
+    }
+    Ok(tries)
+}
+
+/// The low quartile: noise only adds time.
+fn low(mut tries: Vec<f64>) -> f64 {
+    tries.sort_by(f64::total_cmp);
+    tries[(tries.len() - 1) / 4]
+}
+
 /// Times every launch of the plan, its inputs already fed.
 pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
     let steps = runner.plan().steps.clone();
@@ -34,23 +52,55 @@ pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
     let mut timed = Vec::with_capacity(TRIES * steps.len());
     // Bursts keep the clocks up, as a running plan does.
     for (i, step) in steps.iter().enumerate() {
-        let once = runner.repeat(i, 1)?;
-        let times = (AIM / once.max(1e-7)).clamp(1.0, BURST as f64) as usize;
-        for _ in 0..TRIES {
-            timed.push((step.clone(), runner.repeat(i, times)?));
+        for seconds in bursts(runner, i)? {
+            timed.push((step.clone(), seconds));
         }
     }
     Ok(timed)
 }
 
-/// Times `entry` under each competing rule. Returns the new launches.
+/// Each distinct launch's seconds with its weights read cold.
+fn time_cold(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
+    let steps = runner.plan().steps.clone();
+    let all = 0..steps.len();
+    runner.submit(all.clone())?;
+    // Each distinct launch alone, warm: its weights stay cached.
+    let mut kinds: Vec<(String, usize, f64)> = Vec::new();
+    let mut warm = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let key = format!("{:?}", step.kernel);
+        let seconds = match kinds.iter().find(|(k, ..)| *k == key) {
+            Some((_, _, seconds)) => *seconds,
+            None => {
+                let seconds = low(bursts(runner, i)?);
+                kinds.push((key, i, seconds));
+                seconds
+            }
+        };
+        warm.push(seconds);
+    }
+    let mut whole = Vec::with_capacity(TRIES);
+    for _ in 0..TRIES {
+        let start = Instant::now();
+        let clocked = runner.clocked(all.clone())?;
+        whole.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
+    }
+    // Both matmuls of a link read equal bytes.
+    let extra = (low(whole) - warm.iter().sum::<f64>()).max(0.0) / steps.len() as f64;
+    let cold = kinds
+        .into_iter()
+        .map(|(_, i, seconds)| (steps[i].clone(), seconds + extra));
+    Ok(cold.collect())
+}
+
+/// Times `entry` under each competing rule, cold if asked.
 fn measure(
     runner: &mut dyn Run,
     (g, entry): (&Graph, usize),
     sizes: &[(DimName, u64)],
     feeds: &[View],
     device: &mut Device,
-    settings: &Settings,
+    (settings, cold): (&Settings, bool),
 ) -> Result<Vec<(Step, f64)>, Error> {
     if device.platform != runner.platform() {
         *device = device.clone().on(runner.platform());
@@ -65,13 +115,28 @@ fn measure(
     let mut added = Vec::new();
     for choice in choices((g, entry), sizes, &guess)? {
         let plan = lower(g, entry, sizes, &choice)?;
-        if plan.steps.iter().all(|s| device.known(s)) {
+        let known = |s: &Step| {
+            if cold {
+                device.known_cold(s)
+            } else {
+                device.known(s)
+            }
+        };
+        if plan.steps.iter().all(known) {
             continue;
         }
         runner.replan(&plan)?;
         runner.feed(feeds)?;
-        let timed = time(runner)?;
-        device.fit(timed.iter().map(|(step, seconds)| (step, *seconds)));
+        let timed = if cold {
+            time_cold(runner)?
+        } else {
+            time(runner)?
+        };
+        let pairs = timed.iter().map(|(step, seconds)| (step, *seconds));
+        match cold {
+            true => device.fit_cold(pairs),
+            false => device.fit(pairs),
+        }
         added.extend(timed);
     }
     device.name = runner.device();

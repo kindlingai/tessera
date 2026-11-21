@@ -169,6 +169,17 @@ impl Plan {
         self.zones.get(buffer as usize).copied().unwrap_or(0)
     }
 
+    /// Bytes of every weight the plan reads.
+    pub fn weight_bytes(&self) -> usize {
+        self.weights.iter().map(|w| w.slot.bytes()).sum()
+    }
+
+    /// Whether `step` reads a weight.
+    pub fn reads_weight(&self, step: &Step) -> bool {
+        let weight = |r: &Slot| self.weights.iter().any(|w| w.slot.buffer == r.buffer);
+        step.reads.iter().any(weight)
+    }
+
     /// Whether any buffer lies outside zone 0.
     pub fn zoned(&self) -> bool {
         self.zones.iter().any(|z| *z != 0)

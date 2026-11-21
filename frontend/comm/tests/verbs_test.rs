@@ -26,9 +26,9 @@ fn rounds(fabric: &Fabric, ranks: u32, link: bool) {
                     let mut boot = sockets(r, listener, addrs).unwrap();
                     let cap = 1 << 16;
                     let mut t: Box<dyn Transport> = match link {
-                        false => Box::new(
-                            Verbs::connect(r, ranks, fabric, cap, &mut boot, None).unwrap(),
-                        ),
+                        false => {
+                            Box::new(Verbs::connect(r, ranks, fabric, cap, &mut boot).unwrap())
+                        }
                         true => {
                             let regions = exchange_regions(ranks, cap);
                             let l = VerbsLink::connect(

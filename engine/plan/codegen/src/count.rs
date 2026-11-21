@@ -73,6 +73,8 @@ struct Counter {
     buffers: HashMap<String, &'static dyn Load>,
     shared: Vec<String>,
     tiles: HashMap<String, (usize, usize)>,
+    /// Held slabs of A: rows and depth.
+    held: HashMap<String, (usize, usize)>,
     /// Global loads this statement has made, which repeats share.
     seen: Vec<Expr>,
 }
@@ -249,6 +251,20 @@ impl Counter {
             Stmt::TileAcc { name, rows, cols } => {
                 self.tiles.insert(name.clone(), (*rows, *cols));
             }
+            Stmt::TileHeld { name, rows, depth } => {
+                self.held.insert(name.clone(), (*rows, *depth));
+            }
+            Stmt::TileHold { held, .. } => {
+                let Some((rows, depth)) = self.held.get(held).copied() else {
+                    panic!("`{held}` is not a held slab");
+                };
+                let held = (rows * depth) as f64 / LANES as f64;
+                self.add(Ops {
+                    shared: held,
+                    ..Ops::default()
+                });
+                self.trip.held = self.trip.held.max(held + HELD);
+            }
             Stmt::Assign { target, op, value } => {
                 let is_float = self.expr(value);
                 // `acc += a * b` is one multiply-add.
@@ -329,14 +345,21 @@ impl Counter {
                 self.expr(e);
             }
             Stmt::TileBlock {
-                acc, depth, parts, ..
+                acc,
+                a,
+                depth,
+                parts,
+                ..
             } => {
                 let Some((rows, cols)) = self.tiles.get(acc).copied() else {
                     panic!("`{acc}` is not a tile block");
                 };
                 let lane = |n: usize| n as f64 / LANES as f64;
+                // A held slab reads only B from group memory.
+                let held = matches!(a, Expr::Var(n) if self.held.contains_key(n));
                 // Each part of A multiplies once. Words hold two bf16.
                 let (times, shared) = match parts {
+                    0 if held => (1, cols * depth),
                     0 => (1, (rows + cols) * depth),
                     p => (*p, (rows * p + cols) * depth / 2),
                 };

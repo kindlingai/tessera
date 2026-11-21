@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 use tessera_bundle::Overrides;
 use tessera_engine::wasm::Module;
-use tessera_engine::{Batch, Fair, Pins, Recipe, Settings};
-use tessera_tasks::api::{Embed, GenerateImage, Info, Tokens};
+use tessera_engine::{Batch, Fair, Pins, Recipe, Settings, Steps};
+use tessera_tasks::api::{Embed, GenerateImage, Info, Score, Tokens};
 use tessera_tasks::klein::Klein;
 use tessera_tasks::paint::Painter;
 use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
@@ -187,9 +187,15 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         None => Vec::new(),
     };
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
-    let loaded =
-        tessera_bundle::load_named(&o.model, [slots, context], &rules, o.guided, &o.config)
-            .map_err(|e| e.to_string())?;
+    // Ranks keep one entry, as they did before scoring.
+    let steps = match (o.guided, o.ranks.alone()) {
+        (true, _) => Steps::Masked,
+        (false, true) => Steps::Scored,
+        (false, false) => Steps::Plain,
+    };
+    let loaded = tessera_bundle::load_named(&o.model, [slots, context], &rules, steps, &o.config)
+        .map_err(|e| e.to_string())?;
+    let scores = loaded.graph.entries.len() > 1;
     let recipe = lowering(o, loaded.pins);
     let at = (&recipe, settings);
     let count = loaded.graph.weights.len() as u32;
@@ -218,17 +224,18 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
         guides,
     });
     let (queue, jobs) = mpsc::channel::<Job>();
-    let queued = Queued {
+    let queued = Arc::new(Queued {
         generate: generate.clone(),
         jobs: Mutex::new(queue),
-    };
+    });
     let model = Model {
         info,
         tokens: generate.clone(),
         chat: Some(generate),
-        generator: Some(Arc::new(queued)),
+        generator: Some(queued.clone()),
         embed: None,
         image: None,
+        score: scores.then_some(queued as Arc<dyn Score>),
         strict: o.strict,
     };
     let _ = slot.set(model);
@@ -276,6 +283,7 @@ fn load(options: Options, slot: Slot) {
             generator,
             embed,
             image,
+            score: None,
             strict,
         };
         let _ = slot.set(model);

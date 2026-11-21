@@ -639,6 +639,36 @@ f_fn float f_e4m3(u32 w, u32 l) {{
                 host: |g, args, mask| g.narrow(args, mask, 4, |x| f32::from(E2M1(x as u8))),
                 count: |c, _| c.tally(Ops { e2m1: 1.0, ..Ops::default() }, true),
             }
+            /// `bf16_pair(hi, lo)`: both rounded to bf16, nearest even, `hi` high.
+            Bf16Pair = fn bf16_pair(f32, f32) -> u32 {
+                device: {
+                    let soft = pair_bits("as_type<u32>");
+                    // Ampere on rounds a pair in one instruction.
+                    let cuda = format!(
+                        "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+f_fn u32 f_pair_bf16(float hi, float lo) {{
+    u32 d;
+    asm(\"cvt.rn.bf16x2.f32 %0, %1, %2;\" : \"=r\"(d) : \"f\"(hi), \"f\"(lo));
+    return d;
+}}
+#else
+{}#endif
+",
+                        pair_bits("__float_as_uint")
+                    );
+                    let call = "#define f_bf16_pair(hi, lo) f_pair_bf16(hi, lo)\n";
+                    let cuda = hip(&pair_bits("__float_as_uint"), &cuda);
+                    spelled(&format!("{soft}{call}"), &format!("{cuda}{call}"))
+                },
+                text: |p, args| p.spell("f_bf16_pair", args),
+                wgsl: None,
+                host: |g, args, mask| {
+                    let (hi, lo) = (g.eval(&args[0], mask), g.eval(&args[1], mask));
+                    let pair = |(h, l): (Val, Val)| Val::U(bf16_pair(h.f(), l.f()));
+                    hi.into_iter().zip(lo).map(pair).collect()
+                },
+                count: |c, _| c.tally(int(2.0), false),
+            }
         }
     };
 }

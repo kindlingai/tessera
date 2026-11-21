@@ -64,10 +64,8 @@ impl Kept {
         }
     }
 
-    /// A slot for `prompt`, and its rows so far.
-    pub fn admit(&mut self, prompt: &[u32]) -> Option<(u32, usize)> {
-        // The last prompt row is always fed.
-        let limit = prompt.len() - 1;
+    /// A slot for `prompt`, and at most `limit` kept rows.
+    pub fn admit(&mut self, prompt: &[u32], limit: usize) -> Option<(u32, usize)> {
         let hit = self.index.find(&self.pool, TAG, prompt, limit);
         let worst = self.context;
         let Some(laned) = &mut self.laned else {

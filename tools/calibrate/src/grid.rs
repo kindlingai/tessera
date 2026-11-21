@@ -8,10 +8,13 @@ use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, delta, indexed, indexed_rows, linear, neighbours, rotation, routed, rows,
-    table, turned,
+    attention, blocks, chain, delta, indexed, indexed_rows, linear, neighbours, rotation, routed,
+    rows, table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
+
+/// Weight bytes one chain run reads, past current caches.
+const STREAMED: u64 = 128 << 20;
 
 /// A timed plan holds at most this many elements.
 const ROOM: usize = 750_000_000;
@@ -37,6 +40,8 @@ struct Case {
     sizes: Vec<Sizes>,
     /// Weight forms, the same pins a checkpoint would set.
     pins: Pins,
+    /// Whether it is a chain that times weights cold.
+    cold: bool,
 }
 
 /// Every name bounded far past any size the grid uses.
@@ -91,7 +96,7 @@ impl Case {
                 sizes,
                 &feeds,
                 device,
-                settings,
+                (settings, self.cold),
             )?);
         }
         device.pins = given;
@@ -158,7 +163,12 @@ impl Grid {
     fn cases(&self) -> Vec<Case> {
         let pinned = |g: Graph, pins: Pins| {
             let sizes = self.rows.iter().map(|r| vec![(Rows, *r)]).collect();
-            Case { g, sizes, pins }
+            Case {
+                g,
+                sizes,
+                pins,
+                cold: false,
+            }
         };
         let by_rows = |g: Graph| pinned(g, Pins::default());
         let (one, three) = (bounded(&[Rows]), bounded(&[Seqs, Rows, Context]));
@@ -168,6 +178,22 @@ impl Grid {
             for &n in self.widths.iter().chain(&self.vocabs) {
                 cases.push(by_rows(linear(&one, k, n)));
                 cases.push(pinned(linear(&one, k, n), Pins::all(BF16_FORM)));
+            }
+        }
+        // Chains read more than any cache, for cold samples.
+        for (i, &k) in self.widths.iter().enumerate() {
+            for &n in &self.widths[i..] {
+                for (pins, bytes) in [(Pins::default(), 4), (Pins::all(BF16_FORM), 2)] {
+                    let weight = k * n * bytes;
+                    // A weight this large is cold in its own sample.
+                    if 4 * weight > STREAMED {
+                        continue;
+                    }
+                    let pairs = (STREAMED / (2 * weight)).clamp(1, 32);
+                    let mut case = pinned(chain(&one, k, n, pairs), pins);
+                    case.cold = true;
+                    cases.push(case);
+                }
             }
         }
         cases.push(by_rows(rotation(&one)));
@@ -190,22 +216,27 @@ impl Grid {
             let sizes = self.spans.iter().map(span).collect();
             let g = attention(&three, heads);
             let pins = Pins::default();
-            cases.push(Case { g, sizes, pins });
-            // Whole sequences, as long as the keys.
-            let span = |[_, keys]: &[u64; 2]| vec![(Seqs, 1), (Context, *keys)];
-            let sizes = self.spans.iter().map(span).collect();
-            let pins = Pins::default();
             cases.push(Case {
-                g: delta(&three, heads),
+                g,
                 sizes,
                 pins,
+                cold: false,
             });
-            // Picked keys: queries and keys alike, two kept.
+            // Picked keys, two kept, and the delta rule: whole sequences.
             let span = |[_, keys]: &[u64; 2]| vec![(Seqs, 1), (Context, *keys)];
-            let sizes = self.spans.iter().map(span).collect();
-            let g = indexed(&three, [heads[0], heads[2], 2]);
-            let pins = Pins::default();
-            cases.push(Case { g, sizes, pins });
+            let sizes: Vec<Sizes> = self.spans.iter().map(span).collect();
+            for g in [
+                indexed(&three, [heads[0], heads[2], 2]),
+                delta(&three, heads),
+            ] {
+                let (sizes, pins) = (sizes.clone(), Pins::default());
+                cases.push(Case {
+                    g,
+                    sizes,
+                    pins,
+                    cold: false,
+                });
+            }
         }
         cases
     }

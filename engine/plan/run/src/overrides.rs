@@ -1,7 +1,7 @@
 //! Kernel files that replace planned kernels, read again on change.
 
 use crate::Error;
-use crate::kernels::{dialect, fixed_text};
+use crate::kernels::{dialect, fixed_text, group};
 use crate::run::{Outcome, Reload};
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tessera_codegen::Dialect;
 use tessera_gpukit::backend::Backend;
-use tessera_lower::Source;
+use tessera_lower::{Source, Step};
 
 /// A file's change time, length and inode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,10 +48,11 @@ pub(crate) fn entry(source: &Source) -> &str {
     }
 }
 
-/// A planned kernel's text.
-pub(crate) fn text(source: &Source, backend: Backend) -> String {
-    match (source, fixed_text(source, backend)) {
-        (Source::Made(body), _) => body.text().render(dialect(backend)),
+/// A planned step's kernel text.
+pub(crate) fn text(step: &Step, backend: Backend) -> String {
+    let source = step.kernel.source();
+    match (&source, fixed_text(&source, backend)) {
+        (Source::Made(body), _) => body.text().bounded(dialect(backend), Some(group(step))),
         (_, fixed) => fixed.unwrap_or_default().0.to_string(),
     }
 }

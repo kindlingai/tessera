@@ -9,6 +9,7 @@ description = "A model, weights, and plan and serve settings, from disk or git"
 [dependencies]
 thiserror = "2"
 tessera-engine = { workspace = true }
+tessera-frontend-settings = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"

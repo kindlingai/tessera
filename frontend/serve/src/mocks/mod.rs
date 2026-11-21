@@ -15,7 +15,7 @@ use image::MockImage;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use tessera_tasks::api::Info;
-use tokens::MockTokens;
+pub(crate) use tokens::MockTokens;
 
 /// The mocks as model `m`, 16 tokens of context.
 pub fn loaded(generator: &Arc<MockGenerator>, strict: bool) -> Slot {
@@ -30,6 +30,7 @@ pub fn loaded(generator: &Arc<MockGenerator>, strict: bool) -> Slot {
         generator: Some(generator.clone()),
         embed: Some(Arc::new(MockEmbed)),
         image: Some(Arc::new(MockImage)),
+        score: Some(generator.clone()),
         strict,
     });
     slot

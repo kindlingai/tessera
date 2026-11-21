@@ -417,6 +417,28 @@ impl<'a> Tree<'a> {
         matches!(self.node(t).term, Term::Leaf(_))
     }
 
+    /// Whether `t` is a weight, or a view of one.
+    pub fn weighed(&self, mut t: T) -> bool {
+        loop {
+            let node = self.node(t);
+            match &node.term {
+                Term::Leaf(Home::Weight(_) | Home::Part(..)) => return true,
+                Term::Op(Op::View(_)) => t = node.args[0],
+                _ => return false,
+            }
+        }
+    }
+
+    /// Bytes of every weight the tree reads.
+    pub fn weight_bytes(&self) -> usize {
+        let weight = |t: &T| self.leaf(*t) && self.weighed(*t);
+        (0..self.len() as u32)
+            .map(T)
+            .filter(weight)
+            .map(|t| self.bytes(t))
+            .sum()
+    }
+
     /// Whether `t` is kept rows: an `Append`.
     pub fn appends(&self, t: T) -> bool {
         matches!(self.node(t).term, Term::Op(Op::Append(_)))
