@@ -160,7 +160,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let (items, values) = table(launch, base)?;
         let mut grid = self.grid.borrow_mut();
         let grid = grid.as_mut().ok_or(Error::Gridless(step))?;
-        grid.launch(&items, &values)
+        grid.launch(&self.base.plan.steps[step].kernel, &items, &values)
     }
 
     /// Opens the grid for each resident step of `plan`.

@@ -14,6 +14,6 @@ pub struct Item {
 pub trait Grid {
     /// Readies `kernel` for launches of `items` items.
     fn open(&mut self, kernel: &KernelRef, items: usize) -> Result<(), Error>;
-    /// One launch. It returns once the grid ends.
-    fn launch(&mut self, items: &[Item], values: &[u32]) -> Result<(), Error>;
+    /// One launch of `kernel`. It returns once the grid ends.
+    fn launch(&mut self, kernel: &KernelRef, items: &[Item], values: &[u32]) -> Result<(), Error>;
 }

@@ -122,20 +122,31 @@ where
         Ok(())
     }
 
-    fn launch(&mut self, items: &[Placed], values: &[u32]) -> Result<(), Error> {
+    fn launch(
+        &mut self,
+        kernel: &KernelRef,
+        items: &[Placed],
+        values: &[u32],
+    ) -> Result<(), Error> {
+        // Each step runs in the grid built for its kernel.
+        self.open(kernel, items.len())?;
+        let mut all = Vec::with_capacity(items.len() + 1);
+        let scratch = self.scratch.as_ref().map(|s| Placed {
+            at: s.device_ptr(),
+            bytes: s.size(),
+        });
+        for p in items.iter().chain(&scratch) {
+            let bytes = u32::try_from(p.bytes)
+                .map_err(|_| Error::Plan(format!("an item of {} bytes", p.bytes)))?;
+            all.push(Item {
+                at: Ref::at(USER, p.at),
+                shape: [bytes, 0, 0, 0],
+                ..blank()
+            });
+        }
         let Held::Open { resident, .. } = &mut self.held else {
             return Err(Error::Plan("no grid is open".into()));
         };
-        let item = |p: &Placed| Item {
-            at: Ref::at(USER, p.at),
-            shape: [u32::try_from(p.bytes).unwrap_or(u32::MAX), 0, 0, 0],
-            ..blank()
-        };
-        let mut all: Vec<Item> = items.iter().map(item).collect();
-        if let Some(scratch) = &self.scratch {
-            let (at, bytes) = (scratch.device_ptr(), scratch.size());
-            all.push(item(&Placed { at, bytes }));
-        }
         resident.refill(&all)?;
         resident.launch(values, TIMEOUT)
     }
@@ -165,8 +176,13 @@ where
         Whole::open(self, kernel, items).map_err(failed)
     }
 
-    fn launch(&mut self, items: &[Placed], values: &[u32]) -> Result<(), tessera_run::Error> {
-        Whole::launch(self, items, values).map_err(failed)
+    fn launch(
+        &mut self,
+        kernel: &KernelRef,
+        items: &[Placed],
+        values: &[u32],
+    ) -> Result<(), tessera_run::Error> {
+        Whole::launch(self, kernel, items, values).map_err(failed)
     }
 }
 
