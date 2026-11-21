@@ -71,6 +71,7 @@ impl MapStage {
             MapStage::Act(Act::Relu) => (Row::Relu, 0.0),
             MapStage::Act(Act::Softplus) => (Row::Softplus, 0.0),
             MapStage::Act(Act::Exp) => (Row::Exp, 0.0),
+            MapStage::Act(Act::Tanh) => (Row::Tanh, 0.0),
         }
     }
 }
@@ -99,6 +100,10 @@ fn act_expr(a: Act) -> Expr {
         }
         Act::Relu => call(Intrinsic::Max, vec![v(), lit(0.0)]),
         Act::Exp => call(Intrinsic::Exp, vec![v()]),
+        Act::Tanh => {
+            let clamped = call(Intrinsic::Clamp, vec![v(), lit(-8.0), lit(8.0)]);
+            call(Intrinsic::Tanh, vec![clamped])
+        }
         Act::Softplus => {
             let most = call(Intrinsic::Max, vec![v(), neg(v())]);
             let tail = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Exp, vec![neg(most)]));

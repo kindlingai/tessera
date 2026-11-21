@@ -30,11 +30,12 @@ use names::Rule;
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Stored};
+use tessera_checkpoint::{Offer, Shards, Stored, exlr8};
 use tessera_engine::decoder::{self, Config, Moe, Swiglu};
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
+use tessera_engine::gemma4;
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Norm, Pins, Steps, Tensor, Weight};
+use tessera_engine::{Graph, Linear, Norm, Pins, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -43,6 +44,11 @@ use tokenize::hf::Hf;
 enum Ids {
     One(u32),
     Many(Vec<u32>),
+}
+
+#[derive(Deserialize)]
+struct Arch {
+    model_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -323,16 +329,18 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
         &[],
         Steps::Plain,
         &Overrides::default(),
+        None,
     )
 }
 
-/// The user's name rules go last. `steps` adds entry ports.
+/// User rules go last. `manifest` picks exlr8 widths.
 pub fn load_named(
     dir: &Path,
     [slots, context]: [u64; 2],
     user: &[Rule],
     steps: Steps,
     overrides: &Overrides,
+    manifest: Option<&str>,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
         return gguf::load(dir, slots, context, user, steps);
@@ -343,19 +351,49 @@ pub fn load_named(
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
     }
-    let class = serde_json::from_str::<serde_json::Value>(&json)?["architectures"][0].take();
-    if class == qwen35::CLASS {
-        return Err(
-            format!("{class} has no step graph yet. tessera-eval --forward runs it").into(),
-        );
-    }
-    let (arch, mut config) = config(dir, [slots, context], overrides)?;
-    config.stack.steps = steps;
-    let graph = stepper(&arch, &config)
-        .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
-    let shards = Shards::open(dir)?;
-    let (weights, pins) = pull(&graph, &shards, config.stack.layers, &[user])?;
+    let arch = serde_json::from_str::<Arch>(&json)?.model_type;
+    let (graph, layers, rules) = match arch.as_deref() {
+        Some("gemma4") => {
+            let mut c = overrides.config(dir, |k| gemma4::Config::read(k, slots, context))?;
+            c.stack.steps = steps;
+            let rules = names::repo("gemma4").unwrap_or_default();
+            (gemma4::stepper::<Linear>(&c), c.stack.layers, rules)
+        }
+        Some("qwen3_5") => {
+            let class = qwen35::CLASS;
+            return Err(
+                format!("{class} has no step graph yet. tessera-eval --forward runs it").into(),
+            );
+        }
+        _ => {
+            let (arch, mut config) = config(dir, [slots, context], overrides)?;
+            config.stack.steps = steps;
+            let graph = stepper(&arch, &config)
+                .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
+            (graph, config.stack.layers, Vec::new())
+        }
+    };
+    let offer: Box<dyn Offer> = match dir.join("dense/exlr8-vocab.safetensors").exists() {
+        true => Box::new(release(dir, manifest)?),
+        false => Box::new(Shards::open(dir)?),
+    };
+    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[&rules, user])?;
     dressed(dir, graph, Weights::Held(weights), pins)
+}
+
+/// `dir`'s exlr8 release at `name`, or its only manifest.
+fn release(dir: &Path, name: Option<&str>) -> Result<exlr8::Release, Box<dyn Error + Send + Sync>> {
+    let release = exlr8::Release::open(dir);
+    let all = release.manifests();
+    let name = match (name, all.as_slice()) {
+        (Some(name), _) => name.to_string(),
+        (None, []) => return Ok(release),
+        (None, [one]) => one.clone(),
+        (None, many) => {
+            return Err(format!("the release has manifests {}: pick one", many.join(", ")).into());
+        }
+    };
+    Ok(release.manifest(&name)?)
 }
 
 /// The graph and weights with `dir`'s tokenizer, template, stops.

@@ -221,6 +221,8 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         (Split { axis }, Replicated) if (n..last).contains(&axis) => Split { axis },
         (Partial, Replicated) => Partial,
         (Split { axis }, Split { axis: k }) if axis == last && k == n + 1 => Partial,
+        // Both split along one shared batch axis: each part alone.
+        (Split { axis }, Split { axis: k }) if axis == k && (axis as usize) < own => Split { axis },
         (xp, wp) => {
             return Err(TypeError {
                 kind: ErrorKind::Placement,
@@ -238,7 +240,7 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
     })
 }
 
-/// Keys match values, heads group, all whole or head-split.
+/// Keys match values, heads group, split by query head.
 fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Result<(), TypeError> {
     // Values may be narrower than keys, as in MLA.
     need(
@@ -260,8 +262,10 @@ fn heads_fit(dims: &[Dim], [q, k, v]: [&TensorType; 3], q_heads: usize) -> Resul
     )?;
     let p = [q.placement, k.placement, v.placement];
     let split = [q_heads as u32, 2, 2].map(|axis| Placement::Split { axis });
+    // One key head serves query heads split any way.
+    let shared = kv_heads == Some(1) && p[1..] == [Placement::Replicated; 2] && p[0] == split[0];
     need(
-        p == [Placement::Replicated; 3] || p == split,
+        p == [Placement::Replicated; 3] || p == split || shared,
         ErrorKind::Placement,
         || format!("attention needs whole or head-split tensors, got {p:?}"),
     )

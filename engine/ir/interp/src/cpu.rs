@@ -24,6 +24,7 @@ fn act(a: Act, x: f32) -> f32 {
         Act::Relu => x.max(0.0),
         Act::Softplus => softplus(x),
         Act::Exp => x.exp(),
+        Act::Tanh => x.tanh(),
     }
 }
 

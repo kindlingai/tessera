@@ -32,7 +32,7 @@ pub fn shard(g: &Graph, parts: &Parts) -> Result<Sharded, VerifyError> {
         if !returns(&out, id) {
             continue;
         }
-        let tried = split(&out, id);
+        let tried = settle(split(&out, id), &out);
         // The sum is the new node behind this one.
         if adopt(&mut out, tried, parts, &mut whole) {
             at += 1;
@@ -45,6 +45,44 @@ pub fn shard(g: &Graph, parts: &Parts) -> Result<Sharded, VerifyError> {
     }
     verify(&out)?;
     Ok(Sharded { graph: out, whole })
+}
+
+/// Drops each split a failed op reads, until it types.
+fn settle(tried: Graph, was: &Graph) -> Graph {
+    let first = tried.clone();
+    let mut tried = tried;
+    loop {
+        let Err(at) = retype_at(&tried) else {
+            return tried;
+        };
+        let mut reverted = false;
+        for w in feeders(&tried, at) {
+            let placement = &mut tried.weights[w as usize].ty.placement;
+            let whole = was.weights[w as usize].ty.placement;
+            reverted |= std::mem::replace(placement, whole) != whole;
+        }
+        // Nothing left to drop: the first try keeps its reason.
+        if !reverted {
+            return first;
+        }
+    }
+}
+
+/// The weights `at` reads, through any ops.
+fn feeders(g: &Graph, at: usize) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut pending = vec![NodeId(at as u32)];
+    let mut seen = vec![false; g.nodes.len()];
+    while let Some(n) = pending.pop() {
+        if std::mem::replace(&mut seen[n.0 as usize], true) {
+            continue;
+        }
+        match g.node(n).op {
+            Op::Weight(w) => found.push(w),
+            _ => pending.extend(g.node(n).args.iter().copied()),
+        }
+    }
+    found
 }
 
 /// Takes `tried` if it types and fits `parts`.
@@ -227,6 +265,11 @@ fn split(g: &Graph, id: NodeId) -> Graph {
             place(&mut out, node.args[1], 0);
             continue;
         }
+        // A weight read through views splits with its readers.
+        if whole_weight(g, n) {
+            place(&mut out, n, 0);
+            continue;
+        }
         pending.extend(node.args.iter().copied());
     }
     place(&mut out, g.node(id).args[1], 1);
@@ -284,8 +327,18 @@ fn insert(g: &mut Graph, at: NodeId, node: Node) {
     }
 }
 
+/// The first op that fails to retype, if any.
+fn retype_at(g: &Graph) -> Result<(), usize> {
+    typed(g).map(|_| ()).map_err(|(at, _)| at)
+}
+
 /// Retypes every op in order. Kept rows follow their appends.
 fn retype(g: &Graph) -> Result<Graph, crate::infer::TypeError> {
+    typed(g).map_err(|(_, e)| e)
+}
+
+/// `retype`, with the index of the op that failed.
+fn typed(g: &Graph) -> Result<Graph, (usize, crate::infer::TypeError)> {
     let mut out = g.clone();
     for i in 0..out.nodes.len() {
         if let Op::Append(k) = out.nodes[i].op {
@@ -300,8 +353,7 @@ fn retype(g: &Graph) -> Result<Graph, crate::infer::TypeError> {
             .iter()
             .map(|a| &out.nodes[a.0 as usize].ty)
             .collect();
-        let ty = infer(&out, &out.nodes[i].op, &args)?;
-        out.nodes[i].ty = ty;
+        out.nodes[i].ty = infer(&out, &out.nodes[i].op, &args).map_err(|e| (i, e))?;
     }
     Ok(out)
 }

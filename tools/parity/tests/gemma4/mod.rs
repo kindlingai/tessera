@@ -22,6 +22,7 @@ fn sizes(max_seqs: u64, max_context: u64) -> Config {
         full_theta: 1e6,
         first_shared: 24,
         eps: 1e-6,
+        cap: Some(30.0),
     }
 }
 

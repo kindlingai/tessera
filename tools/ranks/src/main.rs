@@ -319,9 +319,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 1..args.repeat {
         rank.run(&feeds)?;
     }
+    rank.profiling(settings.profile.is_some());
     let start = Instant::now();
     let out = rank.run(&feeds)?;
     let seconds = start.elapsed().as_secs_f64();
+    if let Some(profile) = rank.take_profile() {
+        eprintln!("rank {}: last forward\n{}", args.rank, profile.report(1));
+    }
     let logits = out[0].floats()?;
     // An embedding is one short row.
     let vocab = (logits.len() / n).max(1);

@@ -6,7 +6,7 @@ use crate::shared::{self, Attend, Dense, Side, Stack};
 use serde_json::json;
 use tessera_trace as trace;
 use trace::DimName::{Context, FullHeadDim, HeadDim, Heads, KvHeads, PerLayer, Rows, Seqs};
-use trace::{Composite, Dim, DimExpr, Embed, Graph, Kept, Mask, Model, Norm, Pairs, PathSeg};
+use trace::{Act, Composite, Dim, DimExpr, Embed, Graph, Kept, Mask, Model, Norm, Pairs, PathSeg};
 use trace::{Role, Size, Tensor, TensorType, Weights};
 
 pub struct Config {
@@ -26,6 +26,8 @@ pub struct Config {
     /// Layers from this one on read an earlier layer's keys.
     pub first_shared: u64,
     pub eps: f32,
+    /// Logits become `cap * tanh(logits / cap)`.
+    pub cap: Option<f32>,
 }
 
 impl Config {
@@ -93,6 +95,7 @@ impl Config {
             full_theta: k.need(&["text_config.rope_parameters.full_attention.rope_theta"]),
             first_shared,
             eps: k.need(&["text_config.rms_norm_eps"]),
+            cap: k.or(&["text_config.final_logit_softcapping"], None),
         }
     }
 
@@ -300,7 +303,10 @@ impl Pass<'_> {
             let x = self.trunk(w, heads, tokens);
             [x.rms_norm(&w.norm, self.c.eps).unembed(&w.embed)]
         });
-        logits
+        match self.c.cap {
+            Some(cap) => logits.scale(cap.recip()).act(Act::Tanh).scale(cap),
+            None => logits,
+        }
     }
 }
 

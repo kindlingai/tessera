@@ -6,6 +6,9 @@ use tessera_graph::{DType, E4M3, F16};
 /// The mcg codebook's multiplier.
 pub const MCG: u32 = 0xCBAC_1FED;
 
+/// pmcgx's second multiplier.
+pub const PMCG2: u32 = 0xBCA1_4C51;
+
 /// The mul1 codebook's multiplier.
 pub const MUL1: u32 = 0x83DC_D12D;
 
@@ -34,6 +37,8 @@ pub struct Trellis<const K: u32> {
 pub enum Codebook {
     Mcg,
     Mul1,
+    /// Two weights share one 20-bit state.
+    Pmcgx,
 }
 
 impl Codebook {
@@ -42,19 +47,35 @@ impl Codebook {
         match self {
             Codebook::Mcg => "",
             Codebook::Mul1 => ".mul1",
+            Codebook::Pmcgx => ".pmcgx",
         }
     }
 
-    /// A state's weight: the hash, then E4M3 rounding.
+    /// Bits in a state.
+    fn state_bits(self) -> usize {
+        match self {
+            Codebook::Pmcgx => 20,
+            _ => 16,
+        }
+    }
+
+    /// A state's weight. pmcgx gives the pair's even one.
     pub fn value(self, state: u32) -> f32 {
-        let state = state & 0xFFFF;
+        self.weight(state, false)
+    }
+
+    /// Weight `odd` of a state's pair, or its only weight.
+    pub fn weight(self, state: u32, odd: bool) -> f32 {
+        let state = state & ((1 << self.state_bits()) - 1);
         let v = match self {
             Codebook::Mcg => {
-                let x = state.wrapping_mul(MCG);
-                let x = (x & 0x8FFF_8FFF) ^ 0x3B60_3B60;
-                let low = f32::from(F16((x & 0xFFFF) as u16));
-                let high = f32::from(F16((x >> 16) as u16));
+                let [low, high] = mcg_halves(state, MCG);
                 f32::from(F16::from(low + high))
+            }
+            Codebook::Pmcgx => {
+                let ([a, b], [c, d]) = (mcg_halves(state, MCG), mcg_halves(state, PMCG2));
+                let (x, y) = if odd { (b, c) } else { (a, d) };
+                f32::from(F16::from(x + y))
             }
             Codebook::Mul1 => {
                 let x = state.wrapping_mul(MUL1);
@@ -66,6 +87,12 @@ impl Codebook {
         };
         f32::from(E4M3::from(v.clamp(-448.0, 448.0)))
     }
+}
+
+/// `state` hashed by `by`, masked as mcg's, as two halves.
+fn mcg_halves(state: u32, by: u32) -> [f32; 2] {
+    let x = (state.wrapping_mul(by) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+    [F16((x & 0xFFFF) as u16), F16((x >> 16) as u16)].map(f32::from)
 }
 
 /// The matrix's shape and side, from the header.
@@ -186,6 +213,15 @@ impl<const K: u32> Trellis<K> {
         let at = HEAD + shape.tile(row, col) * Self::TILE;
         let tile = &bytes[at..at + Self::TILE];
         let j = position(row % 16, col % 16);
+        if self.codebook == Codebook::Pmcgx {
+            // A pair's 20-bit state ends at bit 2K(p+1), wrapping.
+            let (ring, end) = (256 * K as usize, 2 * K as usize * (j / 2 + 1));
+            let mut state = 0;
+            for b in 0..20 {
+                state |= bit(tile, (end + ring - 1 - b) % ring) << b;
+            }
+            return self.codebook.weight(state, j % 2 == 1);
+        }
         // A state: the 16 bits ending at its value, wrapping.
         let mut state = 0;
         for t in 0..16usize.div_ceil(K as usize) {
@@ -193,6 +229,69 @@ impl<const K: u32> Trellis<K> {
         }
         self.codebook.value(state)
     }
+
+    /// A tile's 256 weights, in stream order.
+    fn weights(&self, tile: &[u8]) -> [f32; 256] {
+        let ring = 256 * K as usize;
+        let pairs = self.codebook == Codebook::Pmcgx;
+        let step = if pairs { 2 * K as usize } else { K as usize };
+        // The ring wraps: its last bits lead the first state.
+        let mut state = (ring - 20..ring).fold(0, |s, b| (s << 1) | bit(tile, b));
+        let mut out = [0.0; 256];
+        let mut n = 0;
+        for b in 0..ring {
+            state = (state << 1) | bit(tile, b);
+            if (b + 1) % step != 0 {
+                continue;
+            }
+            if pairs {
+                out[n] = self.codebook.weight(state, false);
+                out[n + 1] = self.codebook.weight(state, true);
+                n += 2;
+            } else {
+                out[n] = self.codebook.value(state);
+                n += 1;
+            }
+        }
+        out
+    }
+
+    /// The first `n` decoded elements, a tile at a time.
+    fn decode_all(&self, bytes: &[u8], n: usize) -> Vec<f32> {
+        let shape = Shape::read(bytes);
+        let inp = shape.inp;
+        let mut t = vec![0.0; n];
+        // Sixteen outputs a piece: one column of tiles.
+        spread(&mut t, 16 * inp, |c16, piece| {
+            for r16 in 0..inp / 16 {
+                let at = HEAD + shape.tile(16 * r16, 16 * c16) * Self::TILE;
+                let w = self.weights(&bytes[at..at + Self::TILE]);
+                for c in 0..16 {
+                    for r in 0..16 {
+                        piece[c * inp + 16 * r16 + r] = w[position(r, c)];
+                    }
+                }
+            }
+        });
+        t
+    }
+}
+
+/// Runs `work` on each `size` piece, over all cores.
+fn spread<T: Send>(data: &mut [T], size: usize, work: impl Fn(usize, &mut [T]) + Sync) {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let count = data.len().div_ceil(size);
+    let share = count.div_ceil(cores) * size;
+    std::thread::scope(|s| {
+        for (i, part) in data.chunks_mut(share.max(size)).enumerate() {
+            let work = &work;
+            s.spawn(move || {
+                for (j, piece) in part.chunks_mut(size).enumerate() {
+                    work(i * share / size + j, piece);
+                }
+            });
+        }
+    });
 }
 
 impl<const K: u32> Form for Trellis<K> {
@@ -252,7 +351,7 @@ impl<const K: u32> Form for Trellis<K> {
             true => shape.inp * shape.out,
             false => self.elements(bytes.len()),
         };
-        let t: Vec<f32> = (0..n).map(|i| self.decode(bytes, i)).collect();
+        let t = self.decode_all(bytes, n);
         if !self.rotated {
             return t;
         }
@@ -347,6 +446,9 @@ pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
         (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1),
         (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1),
         (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1),
+        (2, Codebook::Pmcgx) => Some(&TRELLIS_K2_PMCGX),
+        (3, Codebook::Pmcgx) => Some(&TRELLIS_K3_PMCGX),
+        (4, Codebook::Pmcgx) => Some(&TRELLIS_K4_PMCGX),
         _ => None,
     }
 }
@@ -360,6 +462,9 @@ pub fn turned_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
         (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1_ROT),
         (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1_ROT),
         (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1_ROT),
+        (2, Codebook::Pmcgx) => Some(&TRELLIS_K2_PMCGX_ROT),
+        (3, Codebook::Pmcgx) => Some(&TRELLIS_K3_PMCGX_ROT),
+        (4, Codebook::Pmcgx) => Some(&TRELLIS_K4_PMCGX_ROT),
         _ => None,
     }
 }
@@ -389,21 +494,17 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     let mut w: Vec<f32> = (0..inp * out)
         .map(|i| t[(i % out) * inp + i / out])
         .collect();
-    for block in 0..inp / ENTRY {
+    spread(&mut w, ENTRY * out, |_, rows| {
         for col in 0..out {
-            hadamard(&mut w, ENTRY * block * out + col, out);
+            hadamard(rows, col, out);
         }
-    }
-    for (row, s) in suh.iter().enumerate() {
-        w[row * out..(row + 1) * out]
-            .iter_mut()
-            .for_each(|v| *v *= s);
-    }
-    for row in 0..inp {
+    });
+    spread(&mut w, out, |row, values| {
+        values.iter_mut().for_each(|v| *v *= suh[row]);
         for block in 0..out / ENTRY {
-            hadamard(&mut w, row * out + ENTRY * block, 1);
+            hadamard(values, ENTRY * block, 1);
         }
-    }
+    });
     let mut back = vec![0.0; inp * out];
     for row in 0..inp {
         for (col, s) in svh.iter().enumerate() {
@@ -413,29 +514,34 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     back
 }
 
-/// The four trellis forms at width `$k`, mcg and mul1.
+/// A codebook's plain and rotated forms at each width `$k`.
 macro_rules! trellis {
-    ($($k:literal: $plain:ident, $turned:ident, $mul1:ident, $mul1_turned:ident;)*) => {$(
-        #[doc = concat!("exlr8 at ", $k, " bits a weight.")]
-        pub const $plain: Trellis<$k> = Trellis::named(concat!("trellis_k", $k), Codebook::Mcg);
-        #[doc = concat!("exlr8 at ", $k, " bits, between its rotations.")]
+    ($book:ident, $suffix:literal: $($k:literal: $plain:ident, $turned:ident;)*) => {$(
+        #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]
+        pub const $plain: Trellis<$k> =
+            Trellis::named(concat!("trellis_k", $k, $suffix), Codebook::$book);
+        #[doc = concat!("exlr8 at ", $k, " bits, ", stringify!($book), ", between rotations.")]
         pub const $turned: Trellis<$k> =
-            Trellis::turned(concat!("trellis_k", $k, "_rot"), Codebook::Mcg);
-        #[doc = concat!("exlr8 at ", $k, " bits a weight, mul1 codebook.")]
-        pub const $mul1: Trellis<$k> =
-            Trellis::named(concat!("trellis_k", $k, "_mul1"), Codebook::Mul1);
-        #[doc = concat!("exlr8 at ", $k, " bits, mul1, between its rotations.")]
-        pub const $mul1_turned: Trellis<$k> =
-            Trellis::turned(concat!("trellis_k", $k, "_mul1_rot"), Codebook::Mul1);
+            Trellis::turned(concat!("trellis_k", $k, $suffix, "_rot"), Codebook::$book);
         form!($plain);
         form!($turned);
-        form!($mul1);
-        form!($mul1_turned);
     )*};
 }
 
-trellis! {
-    2: TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
-    3: TRELLIS_K3, TRELLIS_K3_ROT, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
-    4: TRELLIS_K4, TRELLIS_K4_ROT, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
+trellis! { Mcg, "":
+    2: TRELLIS_K2, TRELLIS_K2_ROT;
+    3: TRELLIS_K3, TRELLIS_K3_ROT;
+    4: TRELLIS_K4, TRELLIS_K4_ROT;
+}
+
+trellis! { Mul1, "_mul1":
+    2: TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
+    3: TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
+    4: TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
+}
+
+trellis! { Pmcgx, "_pmcgx":
+    2: TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT;
+    3: TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT;
+    4: TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT;
 }

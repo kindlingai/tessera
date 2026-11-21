@@ -54,6 +54,8 @@ impl Backend {
 /// A name a kernel may import after `<tessera/1/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Import {
+    /// Types and device primitives only.
+    Core,
     Grid,
     AllReduce,
     AllGather,
@@ -66,7 +68,8 @@ pub enum Import {
 }
 
 impl Import {
-    const ALL: [Import; 9] = [
+    const ALL: [Import; 10] = [
+        Import::Core,
         Import::Grid,
         Import::AllReduce,
         Import::AllGather,
@@ -80,6 +83,7 @@ impl Import {
 
     pub fn name(self) -> &'static str {
         match self {
+            Import::Core => "core",
             Import::Grid => "grid",
             Import::AllReduce => "all_reduce",
             Import::AllGather => "all_gather",

@@ -29,6 +29,11 @@ fn flattens_in_order() {
     ];
     let at: Vec<_> = order.iter().map(|w| flat.text.find(w).unwrap()).collect();
     assert!(at.is_sorted() && !flat.text.contains("#include"), "{at:?}");
+    // Core alone: types everywhere, primitives on devices.
+    let core = "#include <tessera/1/core>\nint body;\n";
+    let has = |b, h| run("k.kernel", core, &[], b).unwrap().text.contains(h);
+    assert!(has(Backend::Metal, "tessera/1/core.h") && !has(Backend::Metal, "backend.h"));
+    assert!(has(Backend::Cuda, "tessera/1/backend.h") && !has(Backend::Cuda, "grid.h"));
 }
 
 #[test]

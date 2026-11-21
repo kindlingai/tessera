@@ -10,7 +10,22 @@ type Tensor<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
 
 /// `tensors` as one safetensors file at `path`.
 fn write(path: &Path, tensors: &[Tensor]) {
+    write_meta(path, &[], tensors);
+}
+
+/// `tensors` and `meta` strings as one safetensors file at `path`.
+fn write_meta(path: &Path, meta: &[(&str, &str)], tensors: &[Tensor]) {
     let (mut header, mut data): (Vec<String>, Vec<u8>) = (Vec::new(), Vec::new());
+    if !meta.is_empty() {
+        let map: serde_json::Map<_, _> = meta
+            .iter()
+            .map(|(k, v)| (k.to_string(), (*v).into()))
+            .collect();
+        header.push(format!(
+            r#""__metadata__":{}"#,
+            serde_json::Value::Object(map)
+        ));
+    }
     for (name, dtype, shape, bytes) in tensors {
         let at = data.len();
         data.extend(bytes);
@@ -268,5 +283,80 @@ fn glm_experts() {
     let form = offered.map(|s| s.stored);
     assert!(matches!(form, Some(Stored::Form(f)) if f.name() == "trellis_k3_mul1"));
     assert_eq!(release.packed(&name, None).unwrap(), down);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// v4: the manifest picks widths, and metadata gives names.
+#[test]
+fn v4_release() {
+    let dir = tessera_testkit::scratch(&format!("{}-v4-exlr8", std::process::id()));
+    let width = |k: i64| {
+        let mut r = record(1, 128, 128, 1);
+        r[24..32].copy_from_slice(&k.to_le_bytes());
+        r
+    };
+    let (k2, k3) = (ramp(4096, 3), ramp(6144, 5));
+    let bf16 = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let side = halves(&[0.5; 128]);
+    write_meta(
+        &dir.join("dense/exlr8-dense-000.safetensors"),
+        &[("tensor_prefix", "model.text.layers.")],
+        &[
+            ("q.k2.record", "I64", vec![8], width(2)),
+            ("q.k2.trellis.pmcgx", "U8", vec![1, 4096], k2),
+            ("q.k2.suh", "F16", vec![128], side.clone()),
+            ("q.k2.svh", "F16", vec![128], side.clone()),
+            ("q.k3.record", "I64", vec![8], width(3)),
+            ("q.k3.trellis.pmcgx", "U8", vec![1, 6144], k3.clone()),
+            ("q.k3.suh", "F16", vec![128], side.clone()),
+            ("q.k3.svh", "F16", vec![128], side.clone()),
+            ("g.record", "I64", vec![8], record(6, 2, 2, 0)),
+            ("g.bf16", "BF16", vec![2, 2], bf16.clone()),
+        ],
+    );
+    let names = r#"{"embed_tokens": "model.text.embed_tokens"}"#;
+    write_meta(
+        &dir.join("dense/exlr8-vocab.safetensors"),
+        &[("hf_names", names)],
+        &[
+            ("embed_tokens.record", "I64", vec![8], record(7, 1, 2, 0)),
+            ("embed_tokens.fp32", "F32", vec![1, 2], floats(&[1.0, 2.0])),
+        ],
+    );
+    let extra = "model.text.extra.weight";
+    write(
+        &dir.join("dense/exlr8-extra-more.safetensors"),
+        &[(extra, "F32", vec![2], floats(&[3.0, 4.0]))],
+    );
+    let manifest = |name: &str, needs: &str| {
+        let text =
+            format!(r#"{{"requires": {{"trellis": ["{needs}"]}}, "dense": {{"0": {{"q": 3}}}}}}"#);
+        let path = dir.join(format!("manifests/exlr8-manifest-{name}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    manifest("k3", "k3 pmcgx");
+    manifest("k5", "k5 pmcgx");
+    assert_eq!(Release::open(&dir).manifests(), ["k3", "k5"]);
+    assert!(Release::open(&dir).manifest("k5").is_err());
+    let release = Release::open(&dir).manifest("k3").unwrap();
+    let slices = release.slices();
+    let found = |name: &str| slices.iter().find(|s| s.name == name).map(|s| s.stored);
+    let q = "model.text.layers.0.q.weight";
+    assert_eq!(found(q), Some(Stored::Form(&trellis::TRELLIS_K3_PMCGX_ROT)));
+    assert_eq!(
+        found("model.text.layers.0.q.codes"),
+        Some(Stored::Form(&trellis::TRELLIS_K3_PMCGX))
+    );
+    assert!(slices.iter().all(|s| !s.name.contains(".k2")));
+    assert_eq!(
+        release.floats("model.text.embed_tokens.weight").unwrap(),
+        [1.0, 2.0]
+    );
+    assert_eq!(release.floats(extra).unwrap(), [3.0, 4.0]);
+    assert_eq!(release.bf16("model.text.layers.0.g.weight").unwrap(), bf16);
+    let codes = trellis::TRELLIS_K3_PMCGX.unpack_all(&trellis::packed(128, 128, 1, &k3));
+    let want = trellis::rotated(&codes, 128, 128, &[0.5; 128], &[0.5; 128]);
+    assert_eq!(release.floats(q).unwrap(), want);
     std::fs::remove_dir_all(dir).unwrap();
 }

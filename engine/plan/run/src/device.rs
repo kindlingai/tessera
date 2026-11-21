@@ -134,7 +134,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
         self.ctx.programmatic(overlap);
         let mut args = self.bound(&launch.args)?;
-        self.fire(&self.kernels[step], launch.shape, &mut args)
+        let fired = self.fire(&self.kernels[step], launch.shape, &mut args);
+        fired.map_err(|e| {
+            let name = self.base.plan.steps[step].kernel.name().to_string();
+            Error::Launch(step, name, Box::new(e))
+        })
     }
 
     /// Holds the device queue for the next launches, if able.
@@ -252,6 +256,27 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 self.entries.push((entry.to_string(), i));
             }
         }
+        // A served model's kernels need files to edit too.
+        match self.write_files(plan) {
+            Ok(written) if !written.is_empty() => {
+                eprintln!("tessera: wrote {} kernel files", written.len())
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("tessera: kernel files: {e}"),
+        }
+    }
+
+    /// Writes `plan`'s kernel text as files, keeping existing ones.
+    fn write_files(&self, plan: &Plan) -> Result<Vec<PathBuf>, Error> {
+        let Some(files) = &self.overrides else {
+            return Ok(Vec::new());
+        };
+        let mut written = Vec::new();
+        for (entry, step) in &self.entries {
+            let text = overrides::text(&plan.steps[*step], D::BACKEND);
+            written.extend(files.write(entry, &text)?);
+        }
+        Ok(written)
     }
 
     /// Gives each step its file's kernel, else the plan's.
@@ -444,15 +469,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn dump(&self) -> Result<Vec<PathBuf>, Error> {
-        let Some(files) = &self.overrides else {
-            return Ok(Vec::new());
-        };
-        let mut written = Vec::new();
-        for (entry, step) in &self.entries {
-            let text = overrides::text(&self.base.plan.steps[*step], D::BACKEND);
-            written.extend(files.write(entry, &text)?);
-        }
-        Ok(written)
+        self.write_files(&self.base.plan)
     }
 
     fn launching(&mut self, launching: Launching) {

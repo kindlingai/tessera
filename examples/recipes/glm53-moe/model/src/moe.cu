@@ -1,7 +1,9 @@
 // GLM-5.3's routed block: route, experts, then finish.
+#include <tessera/1/core>
 
-typedef unsigned int u32;
-typedef unsigned long long u64;
+using tessera::u32;
+using tessera::u64;
+namespace prim = tessera::prim;
 typedef const unsigned char* bytes;
 
 // Most picks per row, and rows per expert block.
@@ -201,7 +203,7 @@ static __device__ void turn_block(float* v, u32 n) {
       v[i] = a + b;
       v[i + len] = a - b;
     }
-    __syncthreads();
+    prim::block_sync();
   }
 }
 
@@ -365,14 +367,14 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
       b[r * 128 + mt * 16 + g + 8] = acc[mt][2] + acc[mt][3];
     }
   }
-  __syncthreads();
+  prim::block_sync();
   for (u32 i = threadIdx.x; i < 2 * ROWS * 128; i += blockDim.x) {
     u32 side = i / (ROWS * 128), at = i % (ROWS * 128);
     float s = 0.0f;
     for (u32 w = side; w < WARPS; w += 2) s += (&sp.buf[w][0][0])[at];
     (&vec[0][0][0])[i] = s;
   }
-  __syncthreads();
+  prim::block_sync();
   turn_block(&vec[0][0][0], 2 * ROWS);
   for (u32 i = threadIdx.x; i < n * 128; i += blockDim.x) {
     u32 o = c * 128 + i % 128;
@@ -380,7 +382,7 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
     float up = (&vec[1][0][0])[i] * j.up_sv[o];
     (&vec[2][0][0])[i] = gate / (1.0f + expf(-gate)) * up * j.down_su[o] * TURNED;
   }
-  __syncthreads();
+  prim::block_sync();
   turn_block(&vec[2][0][0], ROWS);
   u32 blocks = (D.out / 128 - warp + WARPS - 1) / WARPS * 8;
   float out[8][4];
@@ -443,12 +445,12 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_experts(
   u32 base = group * ROWS, n = min(rows - base, ROWS);
   if (warp < n) route(scores + (u64)(base + warp) * experts, bias, experts, picks, ids[warp], gates[warp]);
   for (u32 i = threadIdx.x; i < 64; i += blockDim.x) mask[i] = 0u;
-  __syncthreads();
+  prim::block_sync();
   for (u32 i = threadIdx.x; i < n * picks; i += blockDim.x) {
     u32 e = ids[i / picks][i % picks];
     if (e >= first && e < first + count) atomicOr(&mask[e / 32], 1u << (e % 32));
   }
-  __syncthreads();
+  prim::block_sync();
   if (threadIdx.x == 0) {
     // The `slot - 1`-th picked expert, or `experts` if none.
     u32 left = slot - 1, e = experts;
@@ -463,7 +465,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_experts(
     }
     chosen = e;
   }
-  __syncthreads();
+  prim::block_sync();
   u32 e = chosen;
   u32 chunks = ffn / 128;
   Job j;
@@ -514,7 +516,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_experts(
       }
     }
   }
-  __syncthreads();
+  prim::block_sync();
   if (book) {
     expert_k<1>(k, j, x, partial, sp);
   } else {
@@ -533,7 +535,7 @@ extern "C" __global__ void glm53_finish(
   __shared__ float z[PICKS + 1][128];
   u32 o = threadIdx.x, at = blockIdx.x * 128 + o, row = blockIdx.y;
   if (threadIdx.x < 32) route(scores + (u64)row * experts, bias, experts, picks, ids, gates);
-  __syncthreads();
+  prim::block_sync();
   u32 chunks = ffn / 128;
   for (u32 p = 0; p <= picks; p++) {
     bool mine = p == picks || (ids[p] >= first && ids[p] < first + count);
@@ -543,7 +545,7 @@ extern "C" __global__ void glm53_finish(
     for (u32 c = 0; mine && c < upto; c++) s += from[(u64)c * hidden];
     z[p][o] = s;
   }
-  __syncthreads();
+  prim::block_sync();
   turn_block(&z[0][0], picks + 1);
   float out = z[picks][o] * shared_down_sv[at];
   for (u32 p = 0; p < picks; p++) {
