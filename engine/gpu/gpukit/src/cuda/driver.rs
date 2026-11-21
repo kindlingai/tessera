@@ -31,6 +31,7 @@ pub(crate) const CU_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
 pub(crate) const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 2;
 pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 1;
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 
 /// `CUlaunchAttribute`: an id, then a 64-byte value.
 #[repr(C)]
@@ -62,6 +63,7 @@ type CuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type CuMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
+type CuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type CuLaunchKernelEx = unsafe extern "C" fn(
     *const LaunchConfig,
     CUfunction,
@@ -98,6 +100,7 @@ tessera_dl::library! {
         pub(crate) cu_mem_host_unregister: entry::HostFree = "cuMemHostUnregister",
         pub(crate) cu_occupancy: entry::Occupancy =
             "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+        pub(crate) cu_func_set_attribute: CuFuncSetAttribute = "cuFuncSetAttribute",
         pub(crate) cu_memcpy_htod: CuMemcpyHtoD = "cuMemcpyHtoD_v2",
         pub(crate) cu_memcpy_dtoh: CuMemcpyDtoH = "cuMemcpyDtoH_v2",
         pub(crate) cu_memset_d8: CuMemsetD8 = "cuMemsetD8_v2",

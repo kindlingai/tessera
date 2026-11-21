@@ -9,6 +9,7 @@ use super::driver::{
     CU_DEVICE_ATTRIBUTE_INTEGRATED, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
     CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, CU_STREAM_CAPTURE_MODE_RELAXED,
     CU_STREAM_NON_BLOCKING, CUcontext, Driver, LaunchAttribute, LaunchConfig,
 };
@@ -213,6 +214,19 @@ impl Api for Driver {
         }
         let code = unsafe { api::plain(self.cu_launch_kernel, call) };
         self.check(code, "cuLaunchKernel")
+    }
+
+    fn allow_shared(&self, kernel: Handle, shared: u32) -> Result<(), Error> {
+        let bytes = c_int::try_from(shared)
+            .map_err(|_| Error::Cuda(format!("shared bytes {shared} out of range")))?;
+        let code = unsafe {
+            (self.cu_func_set_attribute)(
+                kernel,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        };
+        self.check(code, "cuFuncSetAttribute")
     }
 
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {

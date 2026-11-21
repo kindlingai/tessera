@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::LocalKey;
 
@@ -159,6 +160,10 @@ pub trait Api: Sync + Sized + 'static {
     fn register(&self, host: *mut c_void, size: usize) -> Result<u64, Error>;
     fn unregister(&self, host: *mut c_void);
     fn occupancy(&self, kernel: Handle, threads: u32, shared: u32) -> Result<u32, Error>;
+    /// Raises the dynamic shared memory limit on `kernel`.
+    fn allow_shared(&self, _kernel: Handle, _shared: u32) -> Result<(), Error> {
+        Ok(())
+    }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
@@ -432,7 +437,19 @@ impl<A: Api> Context<A> {
 
     /// Blocks of `kernel` one unit holds at once.
     pub fn resident(&self, kernel: &Kernel<A>, threads: u32, shared: u32) -> Result<u32, Error> {
-        self.locked(|a| a.occupancy(kernel.raw, threads, shared))
+        self.locked(|a| {
+            Self::opt_in(a, kernel, shared)?;
+            a.occupancy(kernel.raw, threads, shared)
+        })
+    }
+
+    fn opt_in(api: &A, kernel: &Kernel<A>, shared: u32) -> Result<(), Error> {
+        if shared <= kernel.shared.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        api.allow_shared(kernel.raw, shared)?;
+        kernel.shared.store(shared, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Compile for this device and resolve `entry`.
@@ -454,6 +471,7 @@ impl<A: Api> Launch for Context<A> {
         args: &mut KernelArgs,
     ) -> Result<(), Error> {
         self.locked(|api| {
+            Self::opt_in(api, kernel, shared_bytes)?;
             let mut params = args.pointers();
             api.launch(&Call {
                 kernel: kernel.raw,
@@ -540,9 +558,13 @@ impl<A: Api> Module<A> {
             _module: Arc::clone(self),
             raw,
             name: name.to_string(),
+            shared: Arc::new(AtomicU32::new(DEFAULT_SHARED)),
         })
     }
 }
+
+/// Dynamic shared memory available before opt-in.
+const DEFAULT_SHARED: u32 = 48 * 1024;
 
 // Thread-safe for the same reason as `Inner`.
 unsafe impl<A: Api> Send for Module<A> {}
@@ -560,6 +582,8 @@ pub struct Kernel<A: Api> {
     _module: Arc<Module<A>>,
     pub(crate) raw: Handle,
     name: String,
+    /// Highest dynamic shared size already opted into.
+    shared: Arc<AtomicU32>,
 }
 
 impl<A: Api> Clone for Kernel<A> {
@@ -568,6 +592,7 @@ impl<A: Api> Clone for Kernel<A> {
             _module: Arc::clone(&self._module),
             raw: self.raw,
             name: self.name.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
