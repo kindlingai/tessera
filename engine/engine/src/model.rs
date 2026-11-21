@@ -1,6 +1,7 @@
 //! A forward graph with its weights, launched as a whole.
 
 use crate::Error;
+use std::borrow::Cow;
 use tessera_graph::{DimExpr, DimName, Graph, Shape, Size};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Weight};
@@ -59,15 +60,18 @@ fn extents(g: &Graph, shape: &Shape, sizes: &[(DimName, u64)]) -> Vec<usize> {
     shape.0.iter().map(axis).collect()
 }
 
-/// `t` at `shape`, each axis cut or zero filled.
-fn fitted(t: &Tensor, shape: Vec<usize>) -> Tensor {
-    if t.shape == shape {
-        return t.clone();
+/// `t` at `want`, a bucketed axis cut or zero filled.
+fn fitted(t: &Tensor, axes: &Shape, want: &[usize], buckets: &[DimName]) -> Result<Tensor, Error> {
+    for (i, e) in axes.0.iter().enumerate() {
+        let whole = matches!(e, DimExpr::Dim(d) if buckets.contains(d));
+        if t.shape[i] != want[i] && !whole {
+            return Err(Error::BucketAxis);
+        }
     }
     let width = t.bytes().len() / t.len().max(1);
-    let mut out = Tensor::zeros(shape.clone(), t.dtype());
-    copy(t.bytes(), &t.shape, out.bytes_mut(), &shape, width);
-    out
+    let mut out = Tensor::zeros(want.to_vec(), t.dtype());
+    copy(t.bytes(), &t.shape, out.bytes_mut(), want, width);
+    Ok(out)
 }
 
 /// The rows both shapes hold, from `from` into `to`.
@@ -131,7 +135,7 @@ impl Model {
         })
     }
 
-    /// Plans per bucket of `dims`, for causal graphs only.
+    /// Plans per bucket of `dims`. Pads with zeros: causal only.
     pub fn bucketed(mut self, dims: &[DimName]) -> Self {
         self.buckets = dims.to_vec();
         self
@@ -185,25 +189,49 @@ impl Model {
                 let (plan, bound) = p.plans.upto(g, 0, &sizes, &self.buckets, &p.device)?;
                 p.runner.replan(plan)?;
                 p.runner.bind_all(&bound);
-                // Inputs pad with zeros to the bucket.
+                if bound.is_empty() {
+                    let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+                    p.runner.feed(&views)?;
+                    p.runner.submit(0..plan.steps.len())?;
+                    let read = |o: &tessera_lower::Output| Ok(p.runner.read(o.slot)?);
+                    return plan.outputs.iter().map(read).collect();
+                }
                 let mut planned = sizes.clone();
                 for (name, n) in &bound {
+                    let most = g.dims.iter().find(|d| d.name == *name).map(|d| d.size);
+                    if matches!(most, Some(Size::Bounded(m)) if u64::from(*n) > m) {
+                        return Err(Error::BucketBound(*name));
+                    }
                     let at = planned.iter_mut().find(|(d, _)| d == name);
                     at.expect("a bounded dimension").1 = u64::from(*n);
                 }
+                // Inputs pad with zeros to the bucket.
                 let entry = &g.entries[0];
                 let mut fed = Vec::with_capacity(inputs.len());
-                for (t, port) in inputs.iter().zip(&entry.inputs) {
-                    fed.push(fitted(t, extents(g, &port.ty.shape, &planned)));
+                for (at, (t, port)) in inputs.iter().zip(&entry.inputs).enumerate() {
+                    let axes = &port.ty.shape;
+                    if t.shape != extents(g, axes, &sizes) {
+                        return Err(tessera_run::Error::InputShape(at).into());
+                    }
+                    let want = extents(g, axes, &planned);
+                    fed.push(match t.shape == want {
+                        true => Cow::Borrowed(t),
+                        false => Cow::Owned(fitted(t, axes, &want, &self.buckets)?),
+                    });
                 }
-                let views: Vec<_> = fed.iter().map(Tensor::view).collect();
+                let views: Vec<_> = fed.iter().map(|t| t.view()).collect();
                 p.runner.feed(&views)?;
                 p.runner.submit(0..plan.steps.len())?;
                 let mut out = Vec::with_capacity(plan.outputs.len());
                 for (o, at) in plan.outputs.iter().zip(&entry.outputs) {
-                    let shape = &g.nodes[at.node.0 as usize].ty.shape;
-                    let full = p.runner.read(o.slot)?.reshaped(extents(g, shape, &planned));
-                    out.push(fitted(&full, extents(g, shape, &sizes)));
+                    let axes = &g.nodes[at.node.0 as usize].ty.shape;
+                    let mut full = p.runner.read(o.slot)?;
+                    full.shape = extents(g, axes, &planned);
+                    let want = extents(g, axes, &sizes);
+                    out.push(match full.shape == want {
+                        true => full,
+                        false => fitted(&full, axes, &want, &self.buckets)?,
+                    });
                 }
                 Ok(out)
             }
