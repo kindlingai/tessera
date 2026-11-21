@@ -63,11 +63,11 @@ impl ShmLink {
         ranks as usize * block(regions)
     }
 
-    /// Rank `rank` over `file`, zeroed and sized by `room`.
+    /// Rank `rank` over `file`, zeroed and at least `room` long.
     pub fn over(rank: u32, ranks: u32, file: File, regions: &[usize]) -> Result<Self, Error> {
-        let len = file.metadata()?.len() as usize;
-        if rank >= ranks || len != Self::room(ranks, regions) {
-            let what = format!("{len} bytes for rank {rank} of {ranks}");
+        let (have, len) = (file.metadata()?.len() as usize, Self::room(ranks, regions));
+        if rank >= ranks || have < len {
+            let what = format!("{have} bytes for rank {rank} of {ranks}");
             return Err(Error::Fit(what));
         }
         let mut offsets = Vec::with_capacity(regions.len());

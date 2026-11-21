@@ -217,7 +217,7 @@ fn join(
                 let (rank, ranks) = (args.rank, args.ranks as u32);
                 let regions = sums::regions(ranks);
                 let room = ShmLink::room(ranks, &regions);
-                let file = shared(&path.with_extension("grid"), rank, room)?;
+                let file = shared(&path.with_extension("grid"), rank, ranks, room)?;
                 sums::open(settings.gpu(), ShmLink::over(rank, ranks, file, &regions)?)?
             }
             (None, Some(fabric)) => tessera_frontend_comm::grid(&mut *met, fabric, settings)?,

@@ -86,7 +86,7 @@ where
     let regions = plan.regions();
     let sums = match &args.shm {
         Some(path) => {
-            let file = shared(path, rank, ShmLink::room(ranks, &regions))?;
+            let file = shared(path, rank, ranks, ShmLink::room(ranks, &regions))?;
             let link = ShmLink::over(rank, ranks, file, &regions)?;
             timed(ctx, &text, link, &plan, rounds)?
         }
