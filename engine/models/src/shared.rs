@@ -80,8 +80,8 @@ pub struct Attend<'a, D: Dense> {
     kv_heads: DimExpr,
     /// A value's width. Keys match unless split by hand.
     head_dim: DimExpr,
-    /// Positions, theta and pairing, if queries and keys rotate.
-    rope: Option<(&'a Tensor, f32, Pairs)>,
+    /// Positions, theta, pairing and pairs turned, if rotating.
+    rope: Option<(&'a Tensor, f32, Pairs, Option<u32>)>,
 }
 
 impl<'a, D: Dense> Attend<'a, D> {
@@ -100,7 +100,15 @@ impl<'a, D: Dense> Attend<'a, D> {
 
     /// Queries and keys rotate after their `turn`.
     pub fn rotary(mut self, positions: &'a Tensor, theta: f32, pairs: Pairs) -> Self {
-        self.rope = Some((positions, theta, pairs));
+        self.rope = Some((positions, theta, pairs, None));
+        self
+    }
+
+    /// Rotates the first `turned` pairs, when given.
+    pub fn turning(mut self, turned: Option<u32>) -> Self {
+        if let Some(rope) = &mut self.rope {
+            rope.3 = turned;
+        }
         self
     }
 
@@ -114,6 +122,30 @@ impl<'a, D: Dense> Attend<'a, D> {
         t.reshape(self.shape([heads.into(), width.into()]))
     }
 
+    /// `h` through `w` as `side`'s heads, `turn`ed, then rotated.
+    pub fn side(
+        &self,
+        w: &D,
+        h: &Tensor,
+        side: Side,
+        turn: impl Fn(Tensor, Side) -> Tensor,
+    ) -> Tensor {
+        let heads = match side {
+            Side::Query => self.heads.clone(),
+            Side::Key | Side::Value => self.kv_heads.clone(),
+        };
+        let t = turn(self.split(w.apply(h), heads, self.head_dim.clone()), side);
+        match (self.rope, side) {
+            (Some((positions, theta, pairs, None)), Side::Query | Side::Key) => {
+                t.rope(positions, theta, pairs)
+            }
+            (Some((positions, theta, pairs, Some(n))), Side::Query | Side::Key) => {
+                t.rope_part(positions, theta, pairs, n)
+            }
+            _ => t,
+        }
+    }
+
     /// `h` through `[q, k, v]`, each side `turn`ed, then rotated.
     pub fn heads(
         &self,
@@ -121,23 +153,8 @@ impl<'a, D: Dense> Attend<'a, D> {
         h: &Tensor,
         turn: impl Fn(Tensor, Side) -> Tensor,
     ) -> [Tensor; 3] {
-        let side = |w: &D, heads: &DimExpr, side: Side| {
-            let t = turn(
-                self.split(w.apply(h), heads.clone(), self.head_dim.clone()),
-                side,
-            );
-            match (self.rope, side) {
-                (Some((positions, theta, pairs)), Side::Query | Side::Key) => {
-                    t.rope(positions, theta, pairs)
-                }
-                _ => t,
-            }
-        };
-        [
-            side(q, &self.heads, Side::Query),
-            side(k, &self.kv_heads, Side::Key),
-            side(v, &self.kv_heads, Side::Value),
-        ]
+        let sides = [(q, Side::Query), (k, Side::Key), (v, Side::Value)];
+        sides.map(|(w, side)| self.side(w, h, side, &turn))
     }
 
     /// Heads joined back into rows, then projected.

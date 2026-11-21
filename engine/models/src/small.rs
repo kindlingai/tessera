@@ -3,7 +3,7 @@
 use crate::decoder::{Config, Scales};
 use crate::mla::{self, Index};
 use crate::shared::Stack;
-use crate::{eg2, nanogpt, tagger};
+use crate::{eg2, gemma4, nanogpt, tagger};
 
 /// Two layers of two heads over a vocabulary of 64.
 pub fn stack(hidden: u64, head_dim: u64, ffn: u64) -> Stack {
@@ -64,6 +64,25 @@ pub fn eg2() -> eg2::Config {
         window: 4,
         theta: 1e4,
         full_theta: 1e6,
+        eps: 1e-6,
+    }
+}
+
+/// Four layers, sliding then full. The last two share keys.
+pub fn gemma4() -> gemma4::Config {
+    let mut stack = stack(256, 128, 256);
+    stack.layers = 4;
+    gemma4::Config {
+        stack,
+        kv_heads: 1,
+        full_every: 2,
+        full_head_dim: 256,
+        full_turned: 32,
+        per_layer: 128,
+        window: 4,
+        theta: 1e4,
+        full_theta: 1e6,
+        first_shared: 2,
         eps: 1e-6,
     }
 }

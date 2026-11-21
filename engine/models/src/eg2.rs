@@ -199,8 +199,7 @@ fn listed<D: Dense>(
     let inputs = m.embed(tokens, &w.embed).scale(hidden.sqrt());
     let mut x = inputs.clone();
     for (l, layer) in w.layers.iter().enumerate() {
-        let ple = layer.ple_in.apply(&inputs).scale(hidden.powf(-0.5));
-        let ple = ple.rms_norm(&w.ple_norm, eps);
+        let ple = context(layer, &inputs, &w.ple_norm, [hidden, eps]);
         let attend = || {
             [attend(
                 m,
@@ -212,17 +211,38 @@ fn listed<D: Dense>(
             )]
         };
         let [attn] = m.composite(Composite::Attention, attend);
-        x = x.add(&attn);
-        let h = x.rms_norm(&layer.pre_ff, eps);
-        let [mlp] = m.composite(Composite::Mlp, || {
-            [geglu(&h, layer).rms_norm(&layer.post_ff, eps)]
-        });
-        x = x.add(&mlp);
-        let gated = layer.ple_gate.apply(&x).act(Act::GeluTanh).mul(&ple);
-        let o = layer.ple_proj.apply(&gated).rms_norm(&layer.ple_norm, eps);
-        x = x.add(&o).mul_scalar(&layer.scalar);
+        x = after(m, eps, layer, x.add(&attn), &ple);
     }
     x
+}
+
+/// The layer's per-layer input from the scaled embeddings, normed.
+pub(crate) fn context<D: Dense>(
+    layer: &Layer<D>,
+    inputs: &Tensor,
+    norm: &Norm,
+    [hidden, eps]: [f32; 2],
+) -> Tensor {
+    let ple = layer.ple_in.apply(inputs).scale(hidden.powf(-0.5));
+    ple.rms_norm(norm, eps)
+}
+
+/// The MLP, then the per-layer input, then the layer's scalar.
+pub(crate) fn after<D: Dense>(
+    m: &Model,
+    eps: f32,
+    layer: &Layer<D>,
+    x: Tensor,
+    ple: &Tensor,
+) -> Tensor {
+    let h = x.rms_norm(&layer.pre_ff, eps);
+    let [mlp] = m.composite(Composite::Mlp, || {
+        [geglu(&h, layer).rms_norm(&layer.post_ff, eps)]
+    });
+    let x = x.add(&mlp);
+    let gated = layer.ple_gate.apply(&x).act(Act::GeluTanh).mul(ple);
+    let o = layer.ple_proj.apply(&gated).rms_norm(&layer.ple_norm, eps);
+    x.add(&o).mul_scalar(&layer.scalar)
 }
 
 /// One embedding per text, `[Seqs, Embedding]`. Callers normalize.
@@ -306,7 +326,7 @@ pub fn probe<D: Dense>(c: &Config) -> Graph {
 const TYPES: &str = "text_config.layer_types";
 
 /// The full layers' spacing. The graph takes one every n.
-fn full_layers(k: &mut Keys, layers: u64) -> u64 {
+pub(crate) fn full_layers(k: &mut Keys, layers: u64) -> u64 {
     let types: Vec<String> = k.need(&[TYPES]);
     let full: Vec<bool> = types.iter().map(|t| t == "full_attention").collect();
     let every = full.iter().position(|&f| f).map_or(0, |p| p as u64 + 1);
