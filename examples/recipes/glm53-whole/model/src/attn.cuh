@@ -209,8 +209,8 @@ static __device__ bool pick_keys(const ctx& c, const place& pl) {
                 s.ih * s.idim)) {
         return false;
     }
-    if (!linear(c, field_mat(c, pl, WK), c.p.h, s.hidden, c.p.b, s.idim, r, s.idim)) return false;
-    if (!linear(c, field_mat(c, pl, I_WEIGHTS), c.p.h, s.hidden, c.p.c, s.ih, r, s.ih)) {
+    if (!linear_pair(c, field_mat(c, pl, WK), field_mat(c, pl, I_WEIGHTS), c.p.h, s.hidden, c.p.b,
+                     s.idim, s.idim, c.p.c, s.ih, s.ih, r)) {
         return false;
     }
     PHASE(index_keys(c, pl));
@@ -295,18 +295,21 @@ static __device__ void absorb(const ctx& c, const mat& kv_b) {
     }
 }
 
-// Block-parallel online softmax attention over picked kept rows.
-static __device__ void attend(const ctx& c, const place& pl) {
+// Block-parallel online softmax attention, single or split-K.
+static __device__ void attend_pass(const ctx& c, const place& pl, u32 splits) {
     const sizes& s = c.s;
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
     const kept* kt_l = kept_table(c.t, pl.kept);
     const kept* kt_r = kept_table(c.t, pl.kept + 1u);
-    u32 width = s.latent + s.rope;
+    u32 width = s.latent + s.rope, rh_cnt = s.rows * s.heads, stride = s.latent + 2u;
     bool stage = width <= ATTN_STAGE;
-    bool in_reg = s.latent <= 1024u;
-    for (u32 rh = blockIdx.x; rh < s.rows * s.heads; rh += gridDim.x) {
-        u32 r = rh / s.heads;
+    bool in_reg = s.latent <= 1024u && (s.latent & 3u) == 0u;
+    u32 d4 = threadIdx.x << 2, rope_vec = s.rope & ~3u;
+    for (u32 job = blockIdx.x; job < rh_cnt * splits; job += gridDim.x) {
+        u32 rh = splits > 1u ? (job / splits) : job;
+        u32 sp = splits > 1u ? (job % splits) : 0u;
+        u32 r = rh / s.heads, h = rh % s.heads;
         u32 pr = pos[r], sl = slot[r];
         const float* qg = c.p.b + u64(rh) * width;
         float* og = c.p.c + u64(rh) * s.latent;
@@ -315,32 +318,41 @@ static __device__ void attend(const ctx& c, const place& pl) {
             __syncthreads();
         }
         const float* q = stage ? c.sm.attn.q : qg;
+        bool q_vec = (reinterpret_cast<u64>(q) & 15u) == 0u;
+        bool rq_vec = q_vec && (s.latent & 3u) == 0u;
+        float q_reg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float o_reg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (!in_reg) {
+        if (in_reg) {
+            if (d4 < s.latent) load_vec4(q + d4, q_vec, q_reg);
+        } else {
             for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) og[d] = 0.0f;
         }
         float most = __int_as_float(0xFF800000u), total = 0.0f;
-        for (u32 n = 0; n < s.keep; n++) {
+        for (u32 n = sp; n < s.keep; n += splits) {
             u32 j = c.p.picked[u64(r) * s.keep + n];
             if (j >= s.context || j > pr) continue;
             const u8* kl = kept_row(c.t, kt_l, sl, j);
             const u8* kr = kept_row(c.t, kt_r, sl, j);
             float dot = 0.0f, kv_reg[4];
             if (in_reg) {
+                if (d4 < s.latent) {
+                    kv_load4(kl, kt_l->elem, d4, kv_reg);
 #pragma unroll
-                for (u32 t = 0; t < 4; t++) {
-                    u32 d = threadIdx.x + (t << 8);
-                    if (d < s.latent) {
-                        kv_reg[t] = kv_load(kl, kt_l->elem, d);
-                        dot = fmaf(q[d], kv_reg[t], dot);
-                    }
+                    for (u32 k = 0; k < 4; k++) dot = fmaf(q_reg[k], kv_reg[k], dot);
                 }
             } else {
                 for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) {
                     dot = fmaf(q[d], kv_load(kl, kt_l->elem, d), dot);
                 }
             }
-            for (u32 d = threadIdx.x; d < s.rope; d += blockDim.x) {
+            for (u32 d = d4; d < rope_vec; d += blockDim.x << 2) {
+                float rv[4], qr[4];
+                kv_load4(kr, kt_r->elem, d, rv);
+                load_vec4(q + s.latent + d, rq_vec, qr);
+#pragma unroll
+                for (u32 k = 0; k < 4; k++) dot = fmaf(qr[k], rv[k], dot);
+            }
+            for (u32 d = rope_vec + threadIdx.x; d < s.rope; d += blockDim.x) {
                 dot = fmaf(q[s.latent + d], kv_load(kr, kt_r->elem, d), dot);
             }
             float score = block_sum(c, dot) * s.scale;
@@ -349,10 +361,9 @@ static __device__ void attend(const ctx& c, const place& pl) {
             total = total * shrink + e;
             most = topmost;
             if (in_reg) {
+                if (d4 < s.latent) {
 #pragma unroll
-                for (u32 t = 0; t < 4; t++) {
-                    u32 d = threadIdx.x + (t << 8);
-                    if (d < s.latent) o_reg[t] = fmaf(o_reg[t], shrink, e * kv_reg[t]);
+                    for (u32 k = 0; k < 4; k++) o_reg[k] = fmaf(o_reg[k], shrink, e * kv_reg[k]);
                 }
             } else {
                 for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) {
@@ -360,17 +371,79 @@ static __device__ void attend(const ctx& c, const place& pl) {
                 }
             }
         }
-        if (in_reg) {
+        if (splits > 1u) {
+            float* dst = c.p.t1 + u64(r) * s.width + u64(h) * splits * stride + u64(sp) * stride;
+            if (threadIdx.x == 0u) {
+                dst[0] = most;
+                dst[1] = total;
+            }
+            if (d4 < s.latent) {
 #pragma unroll
-            for (u32 t = 0; t < 4; t++) {
-                u32 d = threadIdx.x + (t << 8);
-                if (d < s.latent) og[d] = o_reg[t] / total;
+                for (u32 k = 0; k < 4; k++) dst[2u + d4 + k] = o_reg[k];
+            }
+        } else if (in_reg) {
+            if (d4 < s.latent) {
+                float inv = 1.0f / total;
+                float out[4] = {o_reg[0] * inv, o_reg[1] * inv, o_reg[2] * inv, o_reg[3] * inv};
+                store_vec4(og + d4, (reinterpret_cast<u64>(og) & 15u) == 0u, out);
             }
         } else {
             for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) og[d] /= total;
         }
         if (stage) __syncthreads();
     }
+}
+
+// Merges split-K attention partials with exact online softmax.
+static __device__ void attend_merge(const ctx& c, u32 splits) {
+    const sizes& s = c.s;
+    u32 rh_cnt = s.rows * s.heads, stride = s.latent + 2u;
+    float neg_inf = __int_as_float(0xFF800000u);
+    for (u32 rh = blockIdx.x; rh < rh_cnt; rh += gridDim.x) {
+        u32 r = rh / s.heads, h = rh % s.heads;
+        const float* base = c.p.t1 + u64(r) * s.width + u64(h) * splits * stride;
+        float* og = c.p.c + u64(rh) * s.latent;
+        float m_all = neg_inf;
+        for (u32 sp = 0; sp < splits; sp++) {
+            float tot = base[u64(sp) * stride + 1u];
+            if (tot > 0.0f) m_all = fmaxf(m_all, base[u64(sp) * stride]);
+        }
+        float sum_t = 0.0f, w[8];
+        for (u32 sp = 0; sp < splits; sp++) {
+            float tot = base[u64(sp) * stride + 1u];
+            if (tot > 0.0f) {
+                float ms = base[u64(sp) * stride];
+                float sc = ms == m_all ? 1.0f : expf(ms - m_all);
+                w[sp] = sc;
+                sum_t = fmaf(tot, sc, sum_t);
+            } else {
+                w[sp] = 0.0f;
+            }
+        }
+        float inv = sum_t > 0.0f ? (1.0f / sum_t) : 0.0f;
+        for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) {
+            float acc = 0.0f;
+            for (u32 sp = 0; sp < splits; sp++) {
+                if (w[sp] != 0.0f) acc = fmaf(base[u64(sp) * stride + 2u + d], w[sp], acc);
+            }
+            og[d] = acc * inv;
+        }
+    }
+}
+
+static __device__ bool attend_run(const ctx& c, const place& pl) {
+    const sizes& s = c.s;
+    u32 rh_cnt = s.rows * s.heads, stride = s.latent + 2u;
+    u32 max_by_scratch = s.width / max(1u, s.heads * stride);
+    bool can_split = s.keep >= 32u && s.latent <= 1024u && (s.latent & 3u) == 0u;
+    u32 splits = can_split ? min(8u, min(gridDim.x / max(1u, rh_cnt), max_by_scratch)) : 1u;
+    if (splits > 1u) {
+        PHASE(attend_pass(c, pl, splits));
+        PHASE(attend_merge(c, splits));
+        return true;
+    }
+    PHASE(attend_pass(c, pl, 1u));
+    return true;
 }
 
 // Warp-parallel value projection, coalesced along latent.
@@ -435,19 +508,19 @@ static __device__ bool attention(const ctx& c, const place& pl) {
     u32 r = s.rows, kv = s.latent + s.rope, q = s.heads * (s.nope + s.rope);
     PHASE(rms(c, c.p.x, s.hidden, field_mat(c, pl, A_NORM), c.p.h, s.hidden, r, s.hidden, nullptr,
               false));
-    if (!linear(c, field_mat(c, pl, Q_A), c.p.h, s.hidden, c.p.qr, s.q_latent, r, s.q_latent)) {
+    if (!linear_pair(c, field_mat(c, pl, Q_A), field_mat(c, pl, KV_A), c.p.h, s.hidden, c.p.qr,
+                     s.q_latent, s.q_latent, c.p.kv, kv, kv, r)) {
         return false;
     }
-    if (!linear(c, field_mat(c, pl, KV_A), c.p.h, s.hidden, c.p.kv, kv, r, kv)) return false;
     PHASE(rms(c, c.p.qr, s.q_latent, field_mat(c, pl, Q_NORM), c.p.qr, s.q_latent, r, s.q_latent,
-              nullptr, false));
-    PHASE(rms(c, c.p.kv, kv, field_mat(c, pl, KV_NORM), c.p.kv, kv, r, s.latent, nullptr, false));
+              nullptr, false);
+          rms(c, c.p.kv, kv, field_mat(c, pl, KV_NORM), c.p.kv, kv, r, s.latent, nullptr, false));
     if (indexes(s, pl.layer) && !pick_keys(c, pl)) return false;
     if (!linear(c, field_mat(c, pl, Q_B), c.p.qr, s.q_latent, c.p.a, q, r, q)) return false;
     PHASE(turn_keys(c, pl));
     mat kv_b = field_mat(c, pl, KV_B);
     PHASE(absorb(c, kv_b));
-    PHASE(attend(c, pl));
+    if (!attend_run(c, pl)) return false;
     PHASE(head_values(c, kv_b));
     if (!linear(c, field_mat(c, pl, O), c.p.d, s.heads * s.hd, c.p.part, s.hidden, r, s.hidden)) {
         return false;

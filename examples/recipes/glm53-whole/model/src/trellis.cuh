@@ -4,11 +4,16 @@ struct bit_pos {
     u32 w0, w1, w2, bit;
 };
 
-template <u32 K>
+template <u32 K, u32 BOOK>
 static __device__ __forceinline__ bit_pos lane_map(u32 lane) {
     constexpr u32 total_words = 8u * K;
-    constexpr u32 span = (16u + K - 1u) / K;
-    u32 start = (((lane << 3) + 257u - span) & 255u) * K + (span * K - 16u);
+    u32 start;
+    if (BOOK == 2u) {
+        start = (2u * K * ((lane << 2) + 1u) + 256u * K - 20u) % (256u * K);
+    } else {
+        constexpr u32 span = (16u + K - 1u) / K;
+        start = (((lane << 3) + 257u - span) & 255u) * K + (span * K - 16u);
+    }
     u32 w = start >> 5;
     return {w, (w + 1u) % total_words, (w + 2u) % total_words, start & 31u};
 }
@@ -60,11 +65,29 @@ static __device__ __forceinline__ u32 book_pair(u32 s0, u32 s1) {
     return narrowed(halves(f0, f1));
 }
 
+static __device__ __forceinline__ u32 pmcgx_pair(u32 state) {
+    u32 x = ((state * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    u32 y = ((state * PMCG2) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    u32 sum;
+    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(sum) : "r"(x), "r"(byte_perm(y, 0u, 0x1032u)));
+    return narrowed(sum);
+}
+
 template <u32 K, u32 BOOK>
 static __device__ __forceinline__ void tile_decode(const u32* words, bit_pos pos, u32 frag[4]) {
     u32 a = words[pos.w0], b = words[pos.w1], c = words[pos.w2];
     u32 hi = shf_left(b, a, pos.bit);
     u32 lo = shf_left(c, b, pos.bit);
+    if (BOOK == 2u) {
+        u32 st[4];
+#pragma unroll
+        for (u32 q = 0; q < 4; q++) st[q] = shf_left(lo, hi, (2u * K) * q) >> 12;
+        frag[0] = pmcgx_pair(st[0]);
+        frag[1] = pmcgx_pair(st[2]);
+        frag[2] = pmcgx_pair(st[1]);
+        frag[3] = pmcgx_pair(st[3]);
+        return;
+    }
     u32 st[8];
 #pragma unroll
     for (u32 idx = 0; idx < 8; idx++) st[idx] = shf_left(lo, hi, K * idx) >> 16;
@@ -162,7 +185,7 @@ static __device__ __noinline__ void trellis_gemm(const ctx& c, const mat& w, con
                                                  u32 xs, float* y, u32 ys, u32 rows,
                                                  bool fuse_out) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    bit_pos pos = lane_map<K>(lane);
+    bit_pos pos = lane_map<K, BOOK>(lane);
     u32 row_groups = (rows + ROW_TILE - 1u) / ROW_TILE;
     u32 out_blocks = w.out >> 7;
     u32 in_blocks = w.in >> 7;
@@ -264,7 +287,9 @@ static __device__ void trellis_book(const ctx& c, const mat& w, const float* x, 
 
 static __device__ void trellis_run(const ctx& c, const mat& w, const float* x, u32 xs, float* y,
                                    u32 ys, u32 rows, bool fuse_out) {
-    if (w.book == 1u) {
+    if (w.book == 2u) {
+        trellis_book<2u>(c, w, x, xs, y, ys, rows, fuse_out);
+    } else if (w.book == 1u) {
         trellis_book<1u>(c, w, x, xs, y, ys, rows, fuse_out);
     } else {
         trellis_book<0u>(c, w, x, xs, y, ys, rows, fuse_out);

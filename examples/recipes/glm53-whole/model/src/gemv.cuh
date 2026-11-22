@@ -1,5 +1,10 @@
 // Warp-cooperative GEMV, linear dispatcher, norms, gating, and residual add.
 
+static __device__ __forceinline__ u32 warp_start(u64 cursor, u32 wid, u32 wstep) {
+    u32 rem = static_cast<u32>(cursor % wstep);
+    return wid >= rem ? (wid - rem) : (wid + wstep - rem);
+}
+
 static __device__ __forceinline__ void store_warp(float acc[8], u32 n, u32 r0, u32 o, float* y,
                                                   u32 ys, u32 lane) {
     for (u32 r = 0; r < n; r++) {
@@ -28,7 +33,7 @@ static __device__ __forceinline__ float load_w1(const u8* row_ptr, u32 i) {
 
 template <bool IS_BF16>
 static __device__ __noinline__ void gemv_dense(const mat& w, const float* x, u32 xs, float* y,
-                                               u32 ys, u32 rows, u32 out) {
+                                               u32 ys, u32 rows, u32 out, u64 cursor) {
     constexpr u32 elem_bytes = IS_BF16 ? 2u : 4u;
     constexpr u64 align_mask = IS_BF16 ? 7ull : 15ull;
     u32 wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -37,7 +42,7 @@ static __device__ __noinline__ void gemv_dense(const mat& w, const float* x, u32
     u32 chunks = (rows + 7u) >> 3;
     u32 vec_end = w.in & ~3u;
     bool x_vec = (reinterpret_cast<u64>(x) & 15u) == 0u && (xs & 3u) == 0u;
-    for (u32 u = wid; u < out * chunks; u += wstep) {
+    for (u32 u = warp_start(cursor, wid, wstep); u < out * chunks; u += wstep) {
         u32 o = u % out, r0 = (u / out) * 8u, n = min(8u, rows - r0);
         const u8* wr = w.p + u64(o) * w.in * elem_bytes;
         bool use_vec = x_vec && (reinterpret_cast<u64>(wr) & align_mask) == 0ull && vec_end > 0u;
@@ -69,7 +74,7 @@ static __device__ __noinline__ void gemv_dense(const mat& w, const float* x, u32
 
 template <bool IS_MXFP8>
 static __device__ __noinline__ void gemv_q32(const mat& w, const float* x, u32 xs, float* y,
-                                             u32 ys, u32 rows, u32 out) {
+                                             u32 ys, u32 rows, u32 out, u64 cursor) {
     constexpr u32 blk_bytes = IS_MXFP8 ? 33u : 18u;
     u32 wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     u32 wstep = (gridDim.x * blockDim.x) >> 5;
@@ -78,7 +83,7 @@ static __device__ __noinline__ void gemv_q32(const mat& w, const float* x, u32 x
     u32 blocks = w.in >> 5;
     bool aligned = (w.in & 31u) == 0u;
     u32 nib_byte = 2u + (lane >> 1), nib_shift = (lane & 1u) << 2;
-    for (u32 u = wid; u < out * chunks; u += wstep) {
+    for (u32 u = warp_start(cursor, wid, wstep); u < out * chunks; u += wstep) {
         u32 o = u % out, r0 = (u / out) * 8u, n = min(8u, rows - r0);
         float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         if (aligned) {
@@ -105,12 +110,12 @@ static __device__ __noinline__ void gemv_q32(const mat& w, const float* x, u32 x
 }
 
 static __device__ void gemv_any(const mat& w, const float* x, u32 xs, float* y, u32 ys, u32 rows,
-                                u32 out) {
+                                u32 out, u64 cursor) {
     u32 wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     u32 wstep = (gridDim.x * blockDim.x) >> 5;
     u32 lane = threadIdx.x & 31u;
     u32 chunks = (rows + 7u) >> 3;
-    for (u32 u = wid; u < out * chunks; u += wstep) {
+    for (u32 u = warp_start(cursor, wid, wstep); u < out * chunks; u += wstep) {
         u32 o = u % out, r0 = (u / out) * 8u, n = min(8u, rows - r0);
         float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (u32 i = lane; i < w.in; i += 32u) {
@@ -122,22 +127,22 @@ static __device__ void gemv_any(const mat& w, const float* x, u32 xs, float* y, 
 }
 
 static __device__ void times_plain(const mat& w, const float* x, u32 xs, float* y, u32 ys,
-                                   u32 rows, u32 out) {
+                                   u32 rows, u32 out, u64 cursor) {
     switch (w.klass) {
     case K_F32:
-        gemv_dense<false>(w, x, xs, y, ys, rows, out);
+        gemv_dense<false>(w, x, xs, y, ys, rows, out, cursor);
         return;
     case K_BF16:
-        gemv_dense<true>(w, x, xs, y, ys, rows, out);
+        gemv_dense<true>(w, x, xs, y, ys, rows, out, cursor);
         return;
     case K_INT4:
-        gemv_q32<false>(w, x, xs, y, ys, rows, out);
+        gemv_q32<false>(w, x, xs, y, ys, rows, out, cursor);
         return;
     case K_MXFP8:
-        gemv_q32<true>(w, x, xs, y, ys, rows, out);
+        gemv_q32<true>(w, x, xs, y, ys, rows, out, cursor);
         return;
     default:
-        gemv_any(w, x, xs, y, ys, rows, out);
+        gemv_any(w, x, xs, y, ys, rows, out, cursor);
         return;
     }
 }
@@ -152,7 +157,7 @@ static __device__ bool linear(const ctx& c, const mat& w, const float* x, u32 xs
             PHASE(trellis_run(c, w, c.p.t1, w.in, y, ys, rows, true));
             return true;
         }
-        PHASE(gemv_any(w, c.p.t1, w.in, c.p.t2, w.out, rows, w.out));
+        PHASE(gemv_any(w, c.p.t1, w.in, c.p.t2, w.out, rows, w.out, 0ull));
         PHASE(turn_rows(c.p.t2, w.out, nullptr, w.svh, y, ys, rows, w.out));
         return true;
     }
@@ -160,8 +165,22 @@ static __device__ bool linear(const ctx& c, const mat& w, const float* x, u32 xs
         PHASE(trellis_run(c, w, x, xs, y, ys, rows, false));
         return true;
     }
-    PHASE(times_plain(w, x, xs, y, ys, rows, out));
+    PHASE(times_plain(w, x, xs, y, ys, rows, out, 0ull));
     return true;
+}
+
+// Dual projections sharing x, fused when both are plain GEMV.
+static __device__ bool linear_pair(const ctx& c, const mat& w0, const mat& w1, const float* x,
+                                   u32 xs, float* y0, u32 ys0, u32 out0, float* y1, u32 ys1,
+                                   u32 out1, u32 rows) {
+    if (w0.klass <= K_MXFP8 && w1.klass <= K_MXFP8) {
+        u64 n0 = u64(out0) * ((rows + 7u) >> 3);
+        PHASE(times_plain(w0, x, xs, y0, ys0, rows, out0, 0ull);
+              times_plain(w1, x, xs, y1, ys1, rows, out1, n0));
+        return true;
+    }
+    return linear(c, w0, x, xs, y0, ys0, rows, out0)
+           && linear(c, w1, x, xs, y1, ys1, rows, out1);
 }
 
 // Block-parallel RMS norm with optional mean centering.

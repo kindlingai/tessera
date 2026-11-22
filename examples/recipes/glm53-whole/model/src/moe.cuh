@@ -10,16 +10,26 @@ static __device__ __forceinline__ bool local_pick(const ctx& c, u32 rk, u32* m) 
 static __device__ bool swiglu(const ctx& c, const place& pl, u32 gate, u32 inner) {
     const sizes& s = c.s;
     u32 r = s.rows;
-    if (!linear(c, field_mat(c, pl, gate), c.p.h, s.hidden, c.p.a, inner, r, inner)) return false;
-    if (!linear(c, field_mat(c, pl, gate + 1u), c.p.h, s.hidden, c.p.b, inner, r, inner)) {
+    if (!linear_pair(c, field_mat(c, pl, gate), field_mat(c, pl, gate + 1u), c.p.h, s.hidden, c.p.a,
+                     inner, inner, c.p.b, inner, inner, r)) {
         return false;
     }
     PHASE(gated(c.p.a, c.p.b, c.p.c, r * inner));
     return linear(c, field_mat(c, pl, gate + 2u), c.p.c, inner, c.p.part, s.hidden, r, s.hidden);
 }
 
-// Fused router sigmoid, bias top-k, gate norm, and `d` zeroing.
-static __device__ bool route(const ctx& c, const place& pl) {
+static __device__ void zero_buf(float* dst, u64 len) {
+    line l = threads();
+    bool vec = (reinterpret_cast<u64>(dst) & 15u) == 0u;
+    u64 vec_end = vec ? (len & ~3ull) : 0ull;
+    for (u64 i = u64(l.at) << 2; i < vec_end; i += u64(l.step) << 2) {
+        *reinterpret_cast<float4*>(dst + i) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    for (u64 i = vec_end + l.at; i < len; i += l.step) dst[i] = 0.0f;
+}
+
+// Fused router sigmoid, bias top-k, gate norm, and buffer zeroing.
+static __device__ bool route(const ctx& c, const place& pl, bool zero_t2) {
     const sizes& s = c.s;
     u32 r_cnt = s.rows, e = s.experts;
     if (!linear(c, field_mat(c, pl, ROUTER), c.p.h, s.hidden, c.p.a, e, r_cnt, e)) return false;
@@ -74,14 +84,8 @@ static __device__ bool route(const ctx& c, const place& pl) {
             out_gates[k] = scores[out_ids[k]] / sum * s.route;
         }
     }
-    line l = threads();
-    u64 d_len = u64(r_cnt) * s.topk * s.hidden;
-    bool d_vec = (reinterpret_cast<u64>(c.p.d) & 15u) == 0u;
-    u64 vec_end = d_vec ? (d_len & ~3ull) : 0ull;
-    for (u64 i = u64(l.at) << 2; i < vec_end; i += u64(l.step) << 2) {
-        *reinterpret_cast<float4*>(c.p.d + i) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    for (u64 i = vec_end + l.at; i < d_len; i += l.step) c.p.d[i] = 0.0f;
+    zero_buf(c.p.d, u64(r_cnt) * s.topk * s.hidden);
+    if (zero_t2) zero_buf(c.p.t2, u64(r_cnt) * s.hidden);
     return sync(c.t);
 }
 
@@ -94,11 +98,12 @@ static __device__ __noinline__ void routed_gu(const ctx& c, const mat& w, const 
     u32 in_blocks = h >> 7;
     u32 my_ibs = in_blocks > pair_id ? ((in_blocks - 1u - pair_id) / (WARPS >> 1) + 1u) : 0u;
     u32 steps = my_ibs << 3;
-    bit_pos pos = lane_map<K>(lane);
+    bit_pos pos = lane_map<K, BOOK>(lane);
     bool wide = (reinterpret_cast<u64>(w.p + HEAD) & 15u) == 0u;
     bool input_side = word(w.p, 8) == INPUT_SIDE;
     bool h_vec = (reinterpret_cast<u64>(c.p.h) & 15u) == 0u;
-    bool s_vec = (reinterpret_cast<u64>(in_signs) & 15u) == 0u;
+    bool s_vec = in_signs != nullptr && (reinterpret_cast<u64>(in_signs) & 15u) == 0u;
+    bool su_vec = w.suh != nullptr && (reinterpret_cast<u64>(w.suh) & 15u) == 0u;
     float* wbuf = &c.sm.moe.buf[warp][0][0];
     u32* wtiles = c.sm.moe.tiles[warp];
     float acc[8][4];
@@ -118,9 +123,14 @@ static __device__ __noinline__ void routed_gu(const ctx& c, const mat& w, const 
             if (ks == 0u) {
                 __syncwarp();
                 u32 base = (ib << 7) + (lane << 2);
-                float sg[4], sc[4];
-                load_vec4(in_signs + base, s_vec, sg);
-                for (u32 q = 0; q < 4; q++) sc[q] = sg[q] * vec_elem(su, e, base + q);
+                float sc[4];
+                if (in_signs != nullptr) {
+                    float sg[4];
+                    load_vec4(in_signs + base, s_vec, sg);
+                    for (u32 q = 0; q < 4; q++) sc[q] = sg[q] * vec_elem(su, e, base + q);
+                } else {
+                    load_vec4(w.suh + base, su_vec, sc);
+                }
                 for (u32 r = 0; r < n; r++) {
                     float v[4];
                     load_vec4(c.p.h + u64(c.sm.moe.rows[r]) * h + base, h_vec, v);
@@ -153,16 +163,16 @@ static __device__ __noinline__ void routed_gu(const ctx& c, const mat& w, const 
     store_acc(acc, n, lane, wbuf);
 }
 
-// One warp's down trellis MMA pass, accumulating into `d`.
+// One warp's down trellis MMA pass into `dst_buf`.
 template <u32 K, u32 BOOK>
 static __device__ __noinline__ void routed_down(const ctx& c, const mat& w, u32 m, u32 ch,
-                                                u32 chunks, u32 n) {
+                                                u32 chunks, u32 n, float* dst_buf) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     u32 h = c.s.hidden, out_blocks = h >> 7;
     u32 my_obs = out_blocks > warp ? ((out_blocks - 1u - warp) / WARPS + 1u) : 0u;
     u32 steps = my_obs << 3;
     if (steps == 0u) return;
-    bit_pos pos = lane_map<K>(lane);
+    bit_pos pos = lane_map<K, BOOK>(lane);
     bool wide = (reinterpret_cast<u64>(w.p + HEAD) & 15u) == 0u;
     bool input_side = word(w.p, 8) == INPUT_SIDE;
     u32* wtiles = c.sm.moe.tiles[warp];
@@ -199,7 +209,7 @@ static __device__ __noinline__ void routed_down(const ctx& c, const mat& w, u32 
             mma_tile(out[mt], fa, fb);
         }
         if (ks == 7u && r < n) {
-            float* dst = c.p.d + u64(c.sm.moe.picks[r]) * h + (ob << 7) + g;
+            float* dst = dst_buf + u64(c.sm.moe.picks[r]) * h + (ob << 7) + g;
 #pragma unroll
             for (u32 mt = 0; mt < 8; mt++) {
                 float v0 = out[mt][0] + out[mt][1];
@@ -216,38 +226,46 @@ static __device__ __noinline__ void routed_down(const ctx& c, const mat& w, u32 
     }
 }
 
+template <u32 BOOK>
+static __device__ void gu_book(const ctx& c, const mat& w, const mat& su, const float* in_signs,
+                               u32 m, u32 e, u32 ch, u32 n) {
+    if (w.k == 2u) routed_gu<2u, BOOK>(c, w, su, in_signs, m, e, ch, n);
+    else if (w.k == 3u) routed_gu<3u, BOOK>(c, w, su, in_signs, m, e, ch, n);
+    else routed_gu<4u, BOOK>(c, w, su, in_signs, m, e, ch, n);
+}
+
+template <u32 BOOK>
+static __device__ void down_book(const ctx& c, const mat& w, u32 m, u32 ch, u32 chunks, u32 n,
+                                 float* dst_buf) {
+    if (w.k == 2u) routed_down<2u, BOOK>(c, w, m, ch, chunks, n, dst_buf);
+    else if (w.k == 3u) routed_down<3u, BOOK>(c, w, m, ch, chunks, n, dst_buf);
+    else routed_down<4u, BOOK>(c, w, m, ch, chunks, n, dst_buf);
+}
+
 static __device__ void call_gu(const ctx& c, const mat& w, const mat& su, const float* in_signs,
                                u32 m, u32 e, u32 ch, u32 n) {
-    if (w.book == 1u) {
-        if (w.k == 2u) routed_gu<2u, 1u>(c, w, su, in_signs, m, e, ch, n);
-        else if (w.k == 3u) routed_gu<3u, 1u>(c, w, su, in_signs, m, e, ch, n);
-        else routed_gu<4u, 1u>(c, w, su, in_signs, m, e, ch, n);
-    } else {
-        if (w.k == 2u) routed_gu<2u, 0u>(c, w, su, in_signs, m, e, ch, n);
-        else if (w.k == 3u) routed_gu<3u, 0u>(c, w, su, in_signs, m, e, ch, n);
-        else routed_gu<4u, 0u>(c, w, su, in_signs, m, e, ch, n);
-    }
+    if (w.book == 2u) gu_book<2u>(c, w, su, in_signs, m, e, ch, n);
+    else if (w.book == 1u) gu_book<1u>(c, w, su, in_signs, m, e, ch, n);
+    else gu_book<0u>(c, w, su, in_signs, m, e, ch, n);
 }
 
-static __device__ void call_down(const ctx& c, const mat& w, u32 m, u32 ch, u32 chunks, u32 n) {
-    if (w.book == 1u) {
-        if (w.k == 2u) routed_down<2u, 1u>(c, w, m, ch, chunks, n);
-        else if (w.k == 3u) routed_down<3u, 1u>(c, w, m, ch, chunks, n);
-        else routed_down<4u, 1u>(c, w, m, ch, chunks, n);
-    } else {
-        if (w.k == 2u) routed_down<2u, 0u>(c, w, m, ch, chunks, n);
-        else if (w.k == 3u) routed_down<3u, 0u>(c, w, m, ch, chunks, n);
-        else routed_down<4u, 0u>(c, w, m, ch, chunks, n);
-    }
+static __device__ void call_down(const ctx& c, const mat& w, u32 m, u32 ch, u32 chunks, u32 n,
+                                 float* dst_buf) {
+    if (w.book == 2u) down_book<2u>(c, w, m, ch, chunks, n, dst_buf);
+    else if (w.book == 1u) down_book<1u>(c, w, m, ch, chunks, n, dst_buf);
+    else down_book<0u>(c, w, m, ch, chunks, n, dst_buf);
 }
 
-// Routed MoE phase 1: active expert chunks into `d`.
+// MoE phase 1: fused shared and routed expert chunks.
 static __device__ void routed_step(const ctx& c, const mat codes[3], const mat su[3],
-                                   const mat sv[3], const float* in_signs) {
+                                   const mat sv[3], const float* in_signs, const mat shared[3],
+                                   bool fuse_sh) {
     const sizes& s = c.s;
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     u32 groups = (s.rows + ROW_TILE - 1u) / ROW_TILE;
     u32 chunks = s.effn >> 7;
+    u32 sh_chunks = fuse_sh ? (s.ffn >> 7) : 0u;
+    mat none = {nullptr, K_F32, 0u, 0u, 0u, 0u, nullptr, nullptr};
     u32 cursor = 0u;
     for (u32 gr = 0; gr < groups; gr++) {
         u32 base = gr * ROW_TILE, nr = min(ROW_TILE, s.rows - base);
@@ -266,41 +284,58 @@ static __device__ void routed_step(const ctx& c, const mat codes[3], const mat s
             c.sm.moe.count = tot;
         }
         __syncthreads();
-        u32 jobs = c.sm.moe.count * chunks;
+        u32 jobs = sh_chunks + c.sm.moe.count * chunks;
         u32 rem = cursor % gridDim.x;
         u32 first = blockIdx.x >= rem ? (blockIdx.x - rem) : (blockIdx.x + gridDim.x - rem);
         for (u32 job = first; job < jobs; job += gridDim.x) {
-            u32 slot = job / chunks, ch = job % chunks;
-            if (threadIdx.x == 0u) {
-                u32 left = slot, exp_id = s.experts;
-                for (u32 i = 0; i < 64u && exp_id == s.experts; i++) {
-                    u32 bits = c.sm.moe.mask[i], have = __popc(bits);
-                    if (left < have) {
-                        for (u32 t = 0; t < left; t++) bits &= bits - 1u;
-                        exp_id = (i << 5) + u32(__ffs(bits) - 1);
-                    } else {
-                        left -= have;
-                    }
+            bool is_sh = job < sh_chunks;
+            u32 ch, e = 0u, m = 0u, n = nr;
+            if (is_sh) {
+                ch = job;
+                if (threadIdx.x < nr) {
+                    c.sm.moe.rows[threadIdx.x] = base + threadIdx.x;
+                    c.sm.moe.picks[threadIdx.x] = base + threadIdx.x;
                 }
-                u32 cnt = 0u;
-                for (u32 r = 0; r < nr; r++) {
-                    for (u32 k = 0; k < s.topk; k++) {
-                        u32 pick = (base + r) * s.topk + k;
-                        if (c.p.ids[pick] == exp_id && cnt < ROW_TILE) {
-                            c.sm.moe.rows[cnt] = base + r;
-                            c.sm.moe.picks[cnt] = pick;
-                            cnt++;
+                __syncthreads();
+            } else {
+                u32 rjob = job - sh_chunks;
+                u32 slot = rjob / chunks;
+                ch = rjob % chunks;
+                if (threadIdx.x == 0u) {
+                    u32 left = slot, exp_id = s.experts;
+                    for (u32 i = 0; i < 64u && exp_id == s.experts; i++) {
+                        u32 bits = c.sm.moe.mask[i], have = __popc(bits);
+                        if (left < have) {
+                            for (u32 t = 0; t < left; t++) bits &= bits - 1u;
+                            exp_id = (i << 5) + u32(__ffs(bits) - 1);
+                        } else {
+                            left -= have;
                         }
                     }
+                    u32 cnt = 0u;
+                    for (u32 r = 0; r < nr; r++) {
+                        for (u32 k = 0; k < s.topk; k++) {
+                            u32 pick = (base + r) * s.topk + k;
+                            if (c.p.ids[pick] == exp_id && cnt < ROW_TILE) {
+                                c.sm.moe.rows[cnt] = base + r;
+                                c.sm.moe.picks[cnt] = pick;
+                                cnt++;
+                            }
+                        }
+                    }
+                    c.sm.moe.chosen = exp_id | (cnt << 16);
                 }
-                c.sm.moe.chosen = exp_id | (cnt << 16);
+                __syncthreads();
+                e = c.sm.moe.chosen & 0xFFFFu;
+                n = c.sm.moe.chosen >> 16;
+                m = e - s.held_first;
             }
-            __syncthreads();
-            u32 e = c.sm.moe.chosen & 0xFFFFu;
-            u32 n = c.sm.moe.chosen >> 16;
-            u32 m = e - s.held_first;
             u32 side = warp & 1u;
-            call_gu(c, codes[side], su[side], in_signs, m, e, ch, n);
+            if (is_sh) {
+                call_gu(c, shared[side], none, nullptr, 0u, 0u, ch, n);
+            } else {
+                call_gu(c, codes[side], su[side], in_signs, m, e, ch, n);
+            }
             __syncthreads();
             if (warp < n) {
                 float gv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -325,16 +360,21 @@ static __device__ void routed_step(const ctx& c, const mat codes[3], const mat s
                 float act[4];
                 for (u32 q = 0; q < 4; q++) {
                     u32 o = o_base + q;
-                    float gval = gv[q] * vec_elem(sv[0], e, o);
-                    float uval = uv[q] * vec_elem(sv[1], e, o);
-                    act[q] = (gval / (1.0f + expf(-gval))) * uval * vec_elem(su[2], e, o);
+                    float gval = gv[q] * (is_sh ? shared[0].svh[o] : vec_elem(sv[0], e, o));
+                    float uval = uv[q] * (is_sh ? shared[1].svh[o] : vec_elem(sv[1], e, o));
+                    float dsu = is_sh ? shared[2].suh[o] : vec_elem(su[2], e, o);
+                    act[q] = (gval / (1.0f + expf(-gval))) * uval * dsu;
                 }
                 wht128_warp(act, INV_SQRT128);
                 *reinterpret_cast<float4*>(&c.sm.moe.vec[warp][lane << 2]) =
                     make_float4(act[0], act[1], act[2], act[3]);
             }
             __syncthreads();
-            call_down(c, codes[2], m, ch, chunks, n);
+            if (is_sh) {
+                call_down(c, shared[2], 0u, ch, sh_chunks, n, c.p.t2);
+            } else {
+                call_down(c, codes[2], m, ch, chunks, n, c.p.d);
+            }
             __syncthreads();
         }
         cursor += jobs;
@@ -342,20 +382,30 @@ static __device__ void routed_step(const ctx& c, const mat codes[3], const mat s
     }
 }
 
-// Routed MoE phase 2: WHT, scales, and `part` add.
-static __device__ void routed_out(const ctx& c, const mat& down_sv, const float* out_signs) {
+// MoE phase 2: WHT, scales, shared merge, and `part` write.
+static __device__ void routed_out(const ctx& c, const mat& down_sv, const float* out_signs,
+                                  const float* shared_svh) {
     const sizes& s = c.s;
     u32 h = s.hidden, ob_cnt = h >> 7;
     u32 wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     u32 wstep = (gridDim.x * blockDim.x) >> 5;
     u32 lane = threadIdx.x & 31u;
     bool d_vec = (reinterpret_cast<u64>(c.p.d) & 15u) == 0u;
+    bool t2_vec = (reinterpret_cast<u64>(c.p.t2) & 15u) == 0u;
     bool p_vec = (reinterpret_cast<u64>(c.p.part) & 15u) == 0u;
     bool s_vec = (reinterpret_cast<u64>(out_signs) & 15u) == 0u;
+    bool sh_vec = shared_svh != nullptr && (reinterpret_cast<u64>(shared_svh) & 15u) == 0u;
     for (u32 u = wid; u < s.rows * ob_cnt; u += wstep) {
         u32 r = u / ob_cnt, ob = u % ob_cnt;
         u32 base = (ob << 7) + (lane << 2);
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (shared_svh != nullptr) {
+            load_vec4(c.p.t2 + u64(r) * h + base, t2_vec, acc);
+            wht128_warp(acc, INV_SQRT128);
+            float shs[4];
+            load_vec4(shared_svh + base, sh_vec, shs);
+            for (u32 q = 0; q < 4; q++) acc[q] *= shs[q];
+        }
         float sg[4];
         load_vec4(out_signs + base, s_vec, sg);
         for (u32 k = 0; k < s.topk; k++) {
@@ -371,10 +421,14 @@ static __device__ void routed_out(const ctx& c, const mat& down_sv, const float*
             }
         }
         float* dst = c.p.part + u64(r) * h + base;
-        float cur[4];
-        load_vec4(dst, p_vec, cur);
-        for (u32 q = 0; q < 4; q++) cur[q] += acc[q];
-        store_vec4(dst, p_vec, cur);
+        if (shared_svh != nullptr) {
+            store_vec4(dst, p_vec, acc);
+        } else {
+            float cur[4];
+            load_vec4(dst, p_vec, cur);
+            for (u32 q = 0; q < 4; q++) cur[q] += acc[q];
+            store_vec4(dst, p_vec, cur);
+        }
     }
 }
 
@@ -448,23 +502,41 @@ static __device__ bool routed_slow(const ctx& c, const mat codes[3], const mat s
     return sync(c.t);
 }
 
-static __device__ bool routed(const ctx& c, const place& pl) {
+static __device__ bool can_fuse_moe(const ctx& c, const place& pl) {
+    const sizes& s = c.s;
+    if ((s.hidden & 127u) != 0u || (s.effn & 127u) != 0u || (s.ffn & 127u) != 0u || s.ffn == 0u
+        || s.experts > 2048u) {
+        return false;
+    }
+    for (u32 i = 0; i < 3u; i++) {
+        if (field_mat(c, pl, E_GATE + 3u * i).klass != K_TRELLIS) return false;
+        mat sh = field_mat(c, pl, S_GATE + i);
+        if (sh.klass != K_TURNED || sh.suh == nullptr || sh.svh == nullptr) return false;
+        u32 expect_in = i == 2u ? s.ffn : s.hidden;
+        u32 expect_out = i == 2u ? s.hidden : s.ffn;
+        if (sh.in != expect_in || sh.out != expect_out) return false;
+    }
+    return true;
+}
+
+static __device__ bool routed(const ctx& c, const place& pl, bool fuse_sh) {
     const sizes& s = c.s;
     const float* in_signs = reinterpret_cast<const float*>(field_mat(c, pl, SIGNS_IN).p);
     const float* out_signs = reinterpret_cast<const float*>(field_mat(c, pl, SIGNS_OUT).p);
-    mat su[3], sv[3], codes[3];
+    mat su[3], sv[3], codes[3], shared[3];
     for (u32 i = 0; i < 3; i++) {
         u32 base = E_GATE + 3u * i;
         codes[i] = field_mat(c, pl, base);
         su[i] = field_mat(c, pl, base + 1u);
         sv[i] = field_mat(c, pl, base + 2u);
+        shared[i] = field_mat(c, pl, S_GATE + i);
     }
     bool fast = codes[0].klass == K_TRELLIS && codes[1].klass == K_TRELLIS
                 && codes[2].klass == K_TRELLIS && (s.hidden & 127u) == 0u && (s.effn & 127u) == 0u
                 && s.experts <= 2048u;
     if (!fast) return routed_slow(c, codes, su, sv, in_signs, out_signs);
-    PHASE(routed_step(c, codes, su, sv, in_signs));
-    PHASE(routed_out(c, sv[2], out_signs));
+    PHASE(routed_step(c, codes, su, sv, in_signs, shared, fuse_sh));
+    PHASE(routed_out(c, sv[2], out_signs, fuse_sh ? shared[2].svh : nullptr));
     return true;
 }
 
@@ -500,15 +572,18 @@ static __device__ bool layer(const ctx& c, const place& pl) {
         }
         return ok;
     }
-    if (!route(c, pl)) return false;
+    bool fuse_sh = can_fuse_moe(c, pl);
+    if (!route(c, pl, fuse_sh)) return false;
     if (mark) {
         TS_MARK();
     }
-    if (!swiglu(c, pl, S_GATE, s.ffn)) return false;
-    if (mark) {
-        TS_MARK();
+    if (!fuse_sh) {
+        if (!swiglu(c, pl, S_GATE, s.ffn)) return false;
+        if (mark) {
+            TS_MARK();
+        }
     }
-    if (!routed(c, pl)) return false;
+    if (!routed(c, pl, fuse_sh)) return false;
     if (mark) {
         TS_MARK();
     }
