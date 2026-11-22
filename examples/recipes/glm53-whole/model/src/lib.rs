@@ -1,8 +1,8 @@
 //! GLM-5.3's whole step, embedding to logits, as one persistent kernel.
 
 use std::collections::HashMap;
-use tessera_guest::site::{Ask, Count, File, Input, Kind, Lane, Manifest, Offer, Unread};
-use tessera_guest::site::{Place, Resident, Rule, Scalar, Shape, Site};
+use tessera_guest::site::{Ask, Count, File, Input, Kind, Lane, Manifest, Offer};
+use tessera_guest::site::{Place, Resident, Rule, Scalar, Shape};
 
 const NAME: &str = "glm53_whole";
 const THREADS: u32 = 256;
@@ -216,19 +216,23 @@ fn every(indexing: &[usize], dense: usize, layers: usize) -> Option<usize> {
 }
 
 /// One resident offer for the whole step, else `None`.
-fn offer(site: &Site, config: Option<&serde_json::Value>) -> Option<Vec<Offer>> {
-    let step = site.step()?;
+fn offer(ask: &Ask) -> Option<Vec<Offer>> {
+    let step = ask.site.step()?;
     let (inputs, kept, sums, scalars, len) =
         (step.inputs, step.kept, step.sums, step.scalars, step.len);
     let [tokens, positions, slots, picks] = step.ids;
     let rows = inputs[tokens].shape[0];
-    if config
-        .and_then(|c| c.get("max_rows"))
-        .and_then(serde_json::Value::as_u64)
+    let cfg = |key| ask.config.as_ref()?.get(key);
+    if cfg("max_rows")
+        .and_then(|v| v.as_u64())
         .is_some_and(|max| rows as u64 > max)
     {
         return None;
     }
+    let lane = match cfg("sum_bf16").and_then(|v| v.as_bool()) {
+        Some(true) => Lane::SumBf16,
+        _ => Lane::Sum,
+    };
     let first = kept.first()?;
     let named = inputs.iter().enumerate();
     let paths = named.filter_map(|(i, input)| Some((input.weight.as_deref()?, i)));
@@ -413,7 +417,7 @@ fn offer(site: &Site, config: Option<&serde_json::Value>) -> Option<Vec<Offer>> 
             threads: THREADS,
             shared: 0,
             scratch: floats * 4,
-            lanes: vec![Lane::Sum],
+            lanes: vec![lane],
         }),
     }])
 }
@@ -449,12 +453,5 @@ pub extern "C" fn manifest() -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn propose(at: i32, len: i32) -> i64 {
     // SAFETY: the host passes back what `alloc` returned.
-    let bytes = unsafe { tessera_guest::input(at, len) };
-    let reply = match serde_json::from_slice::<Ask>(bytes) {
-        Ok(ask) => serde_json::to_vec(&offer(&ask.site, ask.config.as_ref())),
-        Err(e) => serde_json::to_vec(&Unread {
-            unread: e.to_string(),
-        }),
-    };
-    tessera_guest::output(reply.unwrap_or_else(|_| b"null".to_vec()))
+    unsafe { tessera_guest::answer_ask(at, len, offer) }
 }

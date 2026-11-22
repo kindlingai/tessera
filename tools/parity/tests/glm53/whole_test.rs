@@ -7,7 +7,7 @@ use tessera_engine::wasm::Module;
 use tessera_engine::{Allowed, Backend, Engine, Steps};
 use tessera_graph::Graph;
 use tessera_lower::form::named;
-use tessera_lower::{Pins, Rule, Settings, Weight, kept};
+use tessera_lower::{Collective, Pins, Rule, Settings, Weight, kept};
 use tessera_models::mla::{RotatedMoe, stepper};
 use tessera_parity::{launches, rank_plan, taken};
 use tessera_recipe::Recipe;
@@ -28,11 +28,12 @@ fn rule() -> &'static Rule {
     Module::open(&bytes).unwrap().rules[0]
 }
 
-/// Every form, two codebooks, forms by layer. Last pins win.
+/// Every form, three codebooks, forms by layer. Last pins win.
 const PINS: &str = "*q_a=mxfp8 *kv_a=mxfp8 *q_b=int4_g32 *kv_b=bf16 *.o=int4_g32 \
     *.wq=bf16 *.wk=mxfp8 *.weights=bf16 *dense*.gate=int4_g32 *dense*.up=int4_g32 \
     *dense*.down=mxfp8 *router=bf16 *moe*.gate=trellis_k3_mul1 *moe*.up=trellis_k3_mul1 \
     *moe*.down=trellis_k2_mul1 *shared*=trellis_k4_rot moe.1.shared.down=trellis_k3_rot \
+    moe.1.shared.up=trellis_k3_pmcgx_rot moe.0.down=trellis_k2_pmcgx \
     attn.1.q_b=bf16 attn.2.o=f32 embed=bf16 head=bf16";
 
 fn pins() -> Pins {
@@ -112,16 +113,45 @@ fn compare(settings: &Settings, layout: &'static dyn kept::Layout, stored: &[Wei
     assert_eq!(got.kernels().get(NAME), Some(&1));
 }
 
+/// Plans with optional config JSON, returning resident lanes if taken.
+fn plan_lanes(g: &Graph, ranks: u32, rank: u32, config: Option<&str>) -> Option<Vec<Collective>> {
+    let mut lower = choices(kept::DENSE);
+    lower.config = config.map(str::to_owned);
+    let plan = rank_plan(g, &lower, ranks, rank);
+    let took = taken(&plan);
+    if took.0.is_empty() {
+        return None;
+    }
+    assert_eq!(took, (vec![NAME], 0, false), "{ranks} ranks");
+    plan.steps
+        .iter()
+        .find_map(|s| s.kernel.resident())
+        .map(|r| r.lanes.clone())
+}
+
+/// Host plans for default, bf16 sum, and capped rows.
+fn check_plans() {
+    let g = graph();
+    let cases = [
+        (1, 0, None, Some(vec![Collective::Sum])),
+        (2, 1, None, Some(vec![Collective::Sum])),
+        (
+            2,
+            0,
+            Some(r#"{"sum_bf16":true}"#),
+            Some(vec![Collective::SumBf16]),
+        ),
+        (1, 0, Some(r#"{"max_rows":1}"#), None),
+    ];
+    for (ranks, rank, cfg, want) in cases {
+        assert_eq!(plan_lanes(&g, ranks, rank, cfg), want);
+    }
+}
+
 /// Host plans, then CUDA runs: the kernel is CUDA text.
 #[test]
 fn whole_matches_graph() {
-    for (ranks, rank) in [(1, 0), (2, 1)] {
-        assert_eq!(
-            taken(&rank_plan(&graph(), &choices(kept::DENSE), ranks, rank)),
-            (vec![NAME], 0, false),
-            "{ranks} ranks"
-        );
-    }
+    check_plans();
     for settings in runs().iter().filter(|s| s.gpu() == Some(Backend::Cuda)) {
         [kept::DENSE, &kept::PAGED16]
             .into_iter()

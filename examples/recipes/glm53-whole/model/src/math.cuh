@@ -1,14 +1,8 @@
-// Shared types, metadata readers, PTX numeric ops, and warp WHT.
+// Shared types, metadata readers, kept access, and row WHT.
 
 using namespace tessera;
 
 #define IDS 4u
-#define HEAD 16u
-#define INPUT_SIDE 2u
-#define MCG 0xCBAC1FEDu
-#define PMCG2 0xBCA14C51u
-#define MUL1 0x83DCD12Du
-#define INV_SQRT128 0.08838834764831844f
 #define WARPS 8u
 #define ROW_TILE 4u
 #define ATTN_STAGE 2048u
@@ -187,16 +181,7 @@ static __device__ __forceinline__ mat weight(const table* t, u32 item) {
     w.klass = turned ? K_TURNED : K_TRELLIS;
     w.in = word(w.p, 0);
     w.out = word(w.p, 4);
-    if (fm->kind >= FORM_TRELLIS_K2_PMCGX) {
-        w.k = (fm->kind - FORM_TRELLIS_K2_PMCGX) + 2u;
-        w.book = 2u;
-    } else if (fm->kind >= FORM_TRELLIS_K2_MUL1) {
-        w.k = (fm->kind - FORM_TRELLIS_K2_MUL1) + 2u;
-        w.book = 1u;
-    } else {
-        w.k = (fm->kind - FORM_TRELLIS_K2) + 2u;
-        w.book = 0u;
-    }
+    trellis::from_form_kind(fm->kind, &w.k, &w.book);
     if (turned) {
         w.suh = get<const float>(t, fm->suh);
         w.svh = get<const float>(t, fm->svh);
@@ -226,59 +211,6 @@ static __device__ spans_t lay_out(const table* t, const sizes& s) {
     return q;
 }
 
-// PTX numeric helpers.
-static __device__ __forceinline__ float half(u32 h) {
-    float r;
-    u16 b = static_cast<u16>(h);
-    asm("{.reg .b16 t; mov.b16 t, %1; cvt.f32.f16 %0, t;}" : "=f"(r) : "h"(b));
-    return r;
-}
-
-static __device__ __forceinline__ u32 halves(float lo, float hi) {
-    u32 r;
-    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
-    return r;
-}
-
-static __device__ __forceinline__ u32 narrowed(u32 h) {
-    u32 r;
-    asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}"
-        : "=r"(r) : "r"(h));
-    return r;
-}
-
-static __device__ __forceinline__ float narrow(float v) {
-    return half(narrowed(halves(v, v)) & 0xFFFFu);
-}
-
-static __device__ __forceinline__ float2 e4m3_two(u32 bytes2) {
-    u32 h;
-    u16 b = static_cast<u16>(bytes2);
-    asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h) : "h"(b));
-    return make_float2(half(h & 0xFFFFu), half(h >> 16));
-}
-
-static __device__ __forceinline__ float e4m3_one(u32 c) {
-    u32 h;
-    u16 b = static_cast<u16>(c & 0xFFu);
-    asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h) : "h"(b));
-    return half(h & 0xFFFFu);
-}
-
-static __device__ __forceinline__ u8 to_e4m3(float v) {
-    u32 h = halves(v, 0.0f);
-    u16 out;
-    asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; mov.b16 %0, t;}"
-        : "=h"(out) : "r"(h));
-    return static_cast<u8>(out & 0xFFu);
-}
-
-static __device__ __forceinline__ u16 to_bf16(float v) {
-    u16 out;
-    asm("{.reg .b16 t; cvt.rn.bf16.f32 t, %1; mov.b16 %0, t;}" : "=h"(out) : "f"(v));
-    return out;
-}
-
 static __device__ __forceinline__ float mxfp8_scale(u32 e) {
     if (e == 0u) return __int_as_float(0x00400000);
     if (e == 255u) return __int_as_float(0x7FC00000);
@@ -289,8 +221,8 @@ static __device__ __forceinline__ float mxfp8_scale(u32 e) {
 static __device__ __forceinline__ float kv_load(const u8* row, u32 elem_type, u32 d) {
     if (elem_type == F32) return reinterpret_cast<const float*>(row)[d];
     if (elem_type == BF16) return __uint_as_float(u32(reinterpret_cast<const u16*>(row)[d]) << 16);
-    if (elem_type == F16) return half(reinterpret_cast<const u16*>(row)[d]);
-    return e4m3_one(row[d]);
+    if (elem_type == F16) return trellis::f16_to_f32(reinterpret_cast<const u16*>(row)[d]);
+    return trellis::e4m3_to_f32(row[d]);
 }
 
 static __device__ __forceinline__ void kv_load4(const u8* row, u32 elem_type, u32 d, float v[4]) {
@@ -312,16 +244,16 @@ static __device__ __forceinline__ void kv_load4(const u8* row, u32 elem_type, u3
     }
     if (elem_type == F16 && (reinterpret_cast<u64>(row + (u64(d) << 1)) & 7u) == 0u) {
         uint2 h = *reinterpret_cast<const uint2*>(row + (u64(d) << 1));
-        v[0] = half(h.x & 0xFFFFu);
-        v[1] = half(h.x >> 16);
-        v[2] = half(h.y & 0xFFFFu);
-        v[3] = half(h.y >> 16);
+        v[0] = trellis::f16_to_f32(h.x & 0xFFFFu);
+        v[1] = trellis::f16_to_f32(h.x >> 16);
+        v[2] = trellis::f16_to_f32(h.y & 0xFFFFu);
+        v[3] = trellis::f16_to_f32(h.y >> 16);
         return;
     }
     if (elem_type == E4M3 && (reinterpret_cast<u64>(row + d) & 3u) == 0u) {
         u32 b = *reinterpret_cast<const u32*>(row + d);
-        float2 p0 = e4m3_two(b & 0xFFFFu);
-        float2 p1 = e4m3_two(b >> 16);
+        float2 p0 = trellis::e4m3x2_to_f32x2(b & 0xFFFFu);
+        float2 p1 = trellis::e4m3x2_to_f32x2(b >> 16);
         v[0] = p0.x;
         v[1] = p0.y;
         v[2] = p1.x;
@@ -336,59 +268,13 @@ static __device__ __forceinline__ void kv_store(u8* row, u32 elem_type, u32 d, f
     if (elem_type == F32) {
         reinterpret_cast<float*>(row)[d] = v;
     } else if (elem_type == BF16) {
-        reinterpret_cast<u16*>(row)[d] = to_bf16(v);
+        reinterpret_cast<u16*>(row)[d] = trellis::f32_to_bf16(v);
     } else if (elem_type == F16) {
-        reinterpret_cast<u16*>(row)[d] = static_cast<u16>(halves(v, 0.0f) & 0xFFFFu);
+        reinterpret_cast<u16*>(row)[d] =
+            static_cast<u16>(trellis::f32x2_to_f16x2(v, 0.0f) & 0xFFFFu);
     } else {
-        row[d] = to_e4m3(v);
+        row[d] = trellis::f32_to_e4m3(v);
     }
-}
-
-// Scalar trellis element fallback for unaligned dimensions.
-static __device__ float trellis_elem(const mat& w, u64 m, u32 row, u32 col) {
-    u32 r = row & 15u, c = col & 15u;
-    u32 tile = word(w.p, 8) == INPUT_SIDE
-                   ? (row >> 7) * (w.out >> 1) + 64u * (col >> 7)
-                         + 8u * ((row & 127u) >> 4) + ((col & 127u) >> 4)
-                   : (col >> 7) * (w.in >> 1) + 8u * (row >> 4) + ((col & 127u) >> 4);
-    u64 first = m * (u64(w.in >> 4) * (w.out >> 4));
-    const u8* bits = w.p + HEAD + (first + tile) * (32u * w.k);
-    u32 j = 8u * (4u * (c & 7u) + ((r & 7u) >> 1)) + 4u * (c >= 8u) + 2u * (r >= 8u) + (r & 1u);
-    if (w.book == 2u) {
-        u32 ring = 256u * w.k;
-        u32 end = 2u * w.k * ((j >> 1) + 1u);
-        u32 state = 0u;
-        for (u32 b = 0; b < 20u; b++) {
-            u32 bit_i = (end + ring - 1u - b) % ring;
-            u32 off = 2u * ((bit_i >> 4) ^ 1u);
-            u32 hw = bits[off] | (u32(bits[off + 1]) << 8);
-            state |= ((hw >> (15u - (bit_i & 15u))) & 1u) << b;
-        }
-        u32 x = ((state * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-        u32 y = ((state * PMCG2) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-        float sum = (j & 1u) ? __fadd_rn(half(x >> 16), half(y & 0xFFFFu))
-                             : __fadd_rn(half(x & 0xFFFFu), half(y >> 16));
-        return narrow(sum);
-    }
-    u32 state = 0u, span = (16u + w.k - 1u) / w.k;
-    for (u32 n = 0; n < span; n++) {
-        u32 at = ((j + 256u - n) & 255u) * w.k, code = 0u;
-        for (u32 b = 0; b < w.k; b++) {
-            u32 bit_i = at + b;
-            u32 off = 2u * ((bit_i >> 4) ^ 1u);
-            u32 hw = bits[off] | (u32(bits[off + 1]) << 8);
-            code = (code << 1) | ((hw >> (15u - (bit_i & 15u))) & 1u);
-        }
-        state |= code << (n * w.k);
-    }
-    state &= 0xFFFFu;
-    if (w.book == 1u) {
-        u32 x = state * MUL1;
-        u32 sum = (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
-        return narrow(__fadd_rn(__fmul_rn(float(1024u + sum), half(0x1EEE)), half(0xC931)));
-    }
-    u32 x = ((state * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-    return narrow(__fadd_rn(half(x & 0xFFFFu), half(x >> 16)));
 }
 
 static __device__ float elem(const mat& w, u64 m, u32 o, u32 i) {
@@ -401,15 +287,15 @@ static __device__ float elem(const mat& w, u64 m, u32 o, u32 i) {
     case K_INT4: {
         const u8* b = w.p + (n >> 5) * 18u;
         u32 j = static_cast<u32>(n & 31u);
-        return half(b[0] | (u32(b[1]) << 8))
+        return trellis::f16_to_f32(b[0] | (u32(b[1]) << 8))
                * (float((b[2 + (j >> 1)] >> (4u * (j & 1u))) & 15u) - 8.0f);
     }
     case K_MXFP8: {
         const u8* b = w.p + (n >> 5) * 33u;
-        return mxfp8_scale(b[0]) * e4m3_one(b[1 + (n & 31u)]);
+        return mxfp8_scale(b[0]) * trellis::e4m3_to_f32(b[1 + (n & 31u)]);
     }
     default:
-        return trellis_elem(w, m, i, o);
+        return trellis::scalar_elem(w.p, w.in, w.out, w.k, w.book, m, i, o);
     }
 }
 
@@ -436,28 +322,6 @@ static __device__ __forceinline__ float block_sum(const ctx& c, float v) {
     for (u32 w = 0; w < nw; w++) sum += c.sm.red[w];
     __syncthreads();
     return sum;
-}
-
-// Register-only 128-point Walsh-Hadamard transform for one warp.
-static __device__ __forceinline__ void wht128_warp(float v[4], float scale) {
-    u32 lane = threadIdx.x & 31u;
-    float s0 = v[0] + v[1], d0 = v[0] - v[1];
-    float s1 = v[2] + v[3], d1 = v[2] - v[3];
-    v[0] = s0 + s1;
-    v[1] = d0 + d1;
-    v[2] = s0 - s1;
-    v[3] = d0 - d1;
-#pragma unroll
-    for (u32 off = 1; off < 32; off <<= 1) {
-        bool hi = (lane & off) != 0u;
-#pragma unroll
-        for (u32 k = 0; k < 4; k++) {
-            float peer = __shfl_xor_sync(0xFFFFFFFFu, v[k], off);
-            v[k] = hi ? (peer - v[k]) : (v[k] + peer);
-        }
-    }
-#pragma unroll
-    for (u32 k = 0; k < 4; k++) v[k] *= scale;
 }
 
 static __device__ __forceinline__ void load_vec4(const float* p, bool aligned, float v[4]) {
@@ -502,7 +366,7 @@ static __device__ void turn_rows(const float* x, u32 xs, const float* by, const 
             load_vec4(by + base, bv, sc);
             for (u32 k = 0; k < 4; k++) v[k] *= sc[k];
         }
-        wht128_warp(v, INV_SQRT128);
+        trellis::wht128(v, trellis::INV_SQRT128);
         if (after != nullptr) {
             load_vec4(after + base, av, sc);
             for (u32 k = 0; k < 4; k++) v[k] *= sc[k];

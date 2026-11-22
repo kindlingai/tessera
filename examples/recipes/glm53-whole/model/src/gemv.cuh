@@ -91,9 +91,11 @@ static __device__ __noinline__ void gemv_q32(const mat& w, const float* x, u32 x
             for (u32 blk = 0; blk < blocks; blk++) {
                 const u8* b = w.p + (row_blk + blk) * blk_bytes;
                 float sc = 0.0f;
-                if (lane == 0u) sc = IS_MXFP8 ? mxfp8_scale(b[0]) : half(b[0] | (u32(b[1]) << 8));
+                if (lane == 0u) {
+                    sc = IS_MXFP8 ? mxfp8_scale(b[0]) : trellis::f16_to_f32(b[0] | (u32(b[1]) << 8));
+                }
                 sc = __shfl_sync(0xFFFFFFFFu, sc, 0);
-                float q = IS_MXFP8 ? e4m3_one(b[1u + lane])
+                float q = IS_MXFP8 ? trellis::e4m3_to_f32(b[1u + lane])
                                    : (float((b[nib_byte] >> nib_shift) & 15u) - 8.0f);
                 float wv = sc * q;
                 u32 col = (blk << 5) + lane;
@@ -271,13 +273,23 @@ static __device__ bool add(const ctx& c, bool ranks) {
         for (u32 i = vec_end + l.at; i < n; i += l.step) c.p.x[i] += c.p.part[i];
         return sync(c.t);
     }
-    u32 room = detail::pools(c.t)->pools[0].send_bytes >> 2;
+    const lane* ln = get<const lane>(c.t, c.t->lanes);
+    bool bf16 = ln->elem == BF16;
+    u32 room = detail::pools(c.t)->pools[ln->pool].send_bytes >> (bf16 ? 1u : 2u);
     for (u32 done = 0; done < n; done += room) {
         u32 len = min(room, n - done);
         ticket r = prepare(c.se, 0u);
-        float* sent = send_buffer<float>(r);
-        if (sent == nullptr) return false;
-        for (u32 i = l.at; i < len; i += l.step) sent[i] = c.p.part[done + i];
+        if (bf16) {
+            u16* sent = send_buffer<u16>(r);
+            if (sent == nullptr) return false;
+            for (u32 i = l.at; i < len; i += l.step) {
+                sent[i] = trellis::f32_to_bf16(c.p.part[done + i]);
+            }
+        } else {
+            float* sent = send_buffer<float>(r);
+            if (sent == nullptr) return false;
+            for (u32 i = l.at; i < len; i += l.step) sent[i] = c.p.part[done + i];
+        }
         if (!trigger(r, len) || !wait(r)) return false;
         parts got = received(r);
         for (u32 i = l.at; i < len; i += l.step) c.p.x[done + i] += got.sum(i);

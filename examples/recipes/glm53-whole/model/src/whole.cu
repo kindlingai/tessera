@@ -2,6 +2,7 @@
 #include <tessera/1/all_reduce>
 #include <tessera/1/grid>
 #include <tessera/1/kept>
+#include <tessera/1/trellis>
 #include "math.cuh"
 #include "trellis.cuh"
 #include "gemv.cuh"

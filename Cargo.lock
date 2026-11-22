@@ -1964,7 +1964,6 @@ dependencies = [
 name = "tessera-glm53-whole-module"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "tessera-guest",
 ]
 

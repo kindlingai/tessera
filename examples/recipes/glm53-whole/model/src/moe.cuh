@@ -98,25 +98,21 @@ static __device__ __noinline__ void routed_gu(const ctx& c, const mat& w, const 
     u32 in_blocks = h >> 7;
     u32 my_ibs = in_blocks > pair_id ? ((in_blocks - 1u - pair_id) / (WARPS >> 1) + 1u) : 0u;
     u32 steps = my_ibs << 3;
-    bit_pos pos = lane_map<K, BOOK>(lane);
-    bool wide = (reinterpret_cast<u64>(w.p + HEAD) & 15u) == 0u;
-    bool input_side = word(w.p, 8) == INPUT_SIDE;
+    trellis::lane_map pos = trellis::map_lane<K, BOOK>(lane);
+    bool wide = (reinterpret_cast<u64>(w.p + trellis::HEAD) & 15u) == 0u;
+    bool input_side = word(w.p, 8) == trellis::INPUT_SIDE;
     bool h_vec = (reinterpret_cast<u64>(c.p.h) & 15u) == 0u;
     bool s_vec = in_signs != nullptr && (reinterpret_cast<u64>(in_signs) & 15u) == 0u;
     bool su_vec = w.suh != nullptr && (reinterpret_cast<u64>(w.suh) & 15u) == 0u;
     float* wbuf = &c.sm.moe.buf[warp][0][0];
     u32* wtiles = c.sm.moe.tiles[warp];
     float acc[8][4];
-#pragma unroll
-    for (u32 mt = 0; mt < 8; mt++) {
-        acc[mt][0] = 0.0f;
-        acc[mt][1] = 0.0f;
-        acc[mt][2] = 0.0f;
-        acc[mt][3] = 0.0f;
-    }
+    zero_acc(acc);
     if (steps > 0u) {
         u32 reg[8];
-        tile_load<K>(tile_ptr<K>(w, m, pair_id << 3, ch, input_side), lane, wide, reg);
+        trellis::tile_load<K>(
+            trellis::tile_ptr<K>(w.p, w.in, w.out, m, pair_id << 3, ch, input_side), lane, wide,
+            reg);
         for (u32 st = 0; st < steps; st++) {
             u32 ib = pair_id + (st >> 3) * (WARPS >> 1);
             u32 ks = st & 7u;
@@ -135,32 +131,22 @@ static __device__ __noinline__ void routed_gu(const ctx& c, const mat& w, const 
                     float v[4];
                     load_vec4(c.p.h + u64(c.sm.moe.rows[r]) * h + base, h_vec, v);
                     for (u32 q = 0; q < 4; q++) v[q] *= sc[q];
-                    wht128_warp(v, INV_SQRT128);
+                    trellis::wht128(v, trellis::INV_SQRT128);
                     *reinterpret_cast<float4*>(wbuf + (r << 7) + (lane << 2)) =
                         make_float4(v[0], v[1], v[2], v[3]);
                 }
                 __syncwarp();
             }
-            __syncwarp();
-            tile_store<K>(reg, lane, wide, wtiles);
-            __syncwarp();
+            const u8* next = nullptr;
             if (st + 1u < steps) {
-                u32 nib = pair_id + ((st + 1u) >> 3) * (WARPS >> 1);
-                u32 nks = (st + 1u) & 7u;
-                tile_load<K>(tile_ptr<K>(w, m, (nib << 3) + nks, ch, input_side), lane, wide, reg);
+                u32 nti = ((pair_id + ((st + 1u) >> 3) * (WARPS >> 1)) << 3) + ((st + 1u) & 7u);
+                next = trellis::tile_ptr<K>(w.p, w.in, w.out, m, nti, ch, input_side);
             }
-            u32 fb[2];
-            act_frag(wbuf, n, ks, lane, fb);
-#pragma unroll
-            for (u32 mt = 0; mt < 8; mt++) {
-                u32 fa[4];
-                tile_decode<K, BOOK>(wtiles + mt * 8u * K, pos, fa);
-                mma_tile(acc[mt], fa, fb);
-            }
+            trellis_step<K, BOOK>(reg, next, lane, wide, wtiles, wbuf, n, ks, pos, acc);
         }
     }
     __syncwarp();
-    store_acc(acc, n, lane, wbuf);
+    trellis::store_acc(acc, n, lane, wbuf);
 }
 
 // One warp's down trellis MMA pass into `dst_buf`.
@@ -172,42 +158,26 @@ static __device__ __noinline__ void routed_down(const ctx& c, const mat& w, u32 
     u32 my_obs = out_blocks > warp ? ((out_blocks - 1u - warp) / WARPS + 1u) : 0u;
     u32 steps = my_obs << 3;
     if (steps == 0u) return;
-    bit_pos pos = lane_map<K, BOOK>(lane);
-    bool wide = (reinterpret_cast<u64>(w.p + HEAD) & 15u) == 0u;
-    bool input_side = word(w.p, 8) == INPUT_SIDE;
+    trellis::lane_map pos = trellis::map_lane<K, BOOK>(lane);
+    bool wide = (reinterpret_cast<u64>(w.p + trellis::HEAD) & 15u) == 0u;
+    bool input_side = word(w.p, 8) == trellis::INPUT_SIDE;
     u32* wtiles = c.sm.moe.tiles[warp];
     u32 reg[8];
-    tile_load<K>(tile_ptr<K>(w, m, ch << 3, warp, input_side), lane, wide, reg);
+    trellis::tile_load<K>(trellis::tile_ptr<K>(w.p, w.in, w.out, m, ch << 3, warp, input_side),
+                          lane, wide, reg);
     float out[8][4];
     u32 r = lane & 3u, g = lane >> 2;
     for (u32 st = 0; st < steps; st++) {
         u32 ob = warp + (st >> 3) * WARPS;
         u32 ks = st & 7u;
-        if (ks == 0u) {
-#pragma unroll
-            for (u32 mt = 0; mt < 8; mt++) {
-                out[mt][0] = 0.0f;
-                out[mt][1] = 0.0f;
-                out[mt][2] = 0.0f;
-                out[mt][3] = 0.0f;
-            }
-        }
-        __syncwarp();
-        tile_store<K>(reg, lane, wide, wtiles);
-        __syncwarp();
+        if (ks == 0u) zero_acc(out);
+        const u8* next = nullptr;
         if (st + 1u < steps) {
             u32 nob = warp + ((st + 1u) >> 3) * WARPS;
-            u32 nks = (st + 1u) & 7u;
-            tile_load<K>(tile_ptr<K>(w, m, (ch << 3) + nks, nob, input_side), lane, wide, reg);
+            next = trellis::tile_ptr<K>(w.p, w.in, w.out, m, (ch << 3) + ((st + 1u) & 7u), nob,
+                                        input_side);
         }
-        u32 fb[2];
-        act_frag(&c.sm.moe.vec[0][0], n, ks, lane, fb);
-#pragma unroll
-        for (u32 mt = 0; mt < 8; mt++) {
-            u32 fa[4];
-            tile_decode<K, BOOK>(wtiles + mt * 8u * K, pos, fa);
-            mma_tile(out[mt], fa, fb);
-        }
+        trellis_step<K, BOOK>(reg, next, lane, wide, wtiles, &c.sm.moe.vec[0][0], n, ks, pos, out);
         if (ks == 7u && r < n) {
             float* dst = dst_buf + u64(c.sm.moe.picks[r]) * h + (ob << 7) + g;
 #pragma unroll
@@ -244,16 +214,16 @@ static __device__ void down_book(const ctx& c, const mat& w, u32 m, u32 ch, u32 
 
 static __device__ void call_gu(const ctx& c, const mat& w, const mat& su, const float* in_signs,
                                u32 m, u32 e, u32 ch, u32 n) {
-    if (w.book == 2u) gu_book<2u>(c, w, su, in_signs, m, e, ch, n);
-    else if (w.book == 1u) gu_book<1u>(c, w, su, in_signs, m, e, ch, n);
-    else gu_book<0u>(c, w, su, in_signs, m, e, ch, n);
+    if (w.book == trellis::BOOK_PMCGX) gu_book<trellis::BOOK_PMCGX>(c, w, su, in_signs, m, e, ch, n);
+    else if (w.book == trellis::BOOK_MUL1) gu_book<trellis::BOOK_MUL1>(c, w, su, in_signs, m, e, ch, n);
+    else gu_book<trellis::BOOK_MCG>(c, w, su, in_signs, m, e, ch, n);
 }
 
 static __device__ void call_down(const ctx& c, const mat& w, u32 m, u32 ch, u32 chunks, u32 n,
                                  float* dst_buf) {
-    if (w.book == 2u) down_book<2u>(c, w, m, ch, chunks, n, dst_buf);
-    else if (w.book == 1u) down_book<1u>(c, w, m, ch, chunks, n, dst_buf);
-    else down_book<0u>(c, w, m, ch, chunks, n, dst_buf);
+    if (w.book == trellis::BOOK_PMCGX) down_book<trellis::BOOK_PMCGX>(c, w, m, ch, chunks, n, dst_buf);
+    else if (w.book == trellis::BOOK_MUL1) down_book<trellis::BOOK_MUL1>(c, w, m, ch, chunks, n, dst_buf);
+    else down_book<trellis::BOOK_MCG>(c, w, m, ch, chunks, n, dst_buf);
 }
 
 // MoE phase 1: fused shared and routed expert chunks.
@@ -354,8 +324,8 @@ static __device__ void routed_step(const ctx& c, const mat codes[3], const mat s
                     uv[2] += pu.z;
                     uv[3] += pu.w;
                 }
-                wht128_warp(gv, INV_SQRT128);
-                wht128_warp(uv, INV_SQRT128);
+                trellis::wht128(gv, trellis::INV_SQRT128);
+                trellis::wht128(uv, trellis::INV_SQRT128);
                 u32 o_base = (ch << 7) + (lane << 2);
                 float act[4];
                 for (u32 q = 0; q < 4; q++) {
@@ -365,7 +335,7 @@ static __device__ void routed_step(const ctx& c, const mat codes[3], const mat s
                     float dsu = is_sh ? shared[2].suh[o] : vec_elem(su[2], e, o);
                     act[q] = (gval / (1.0f + expf(-gval))) * uval * dsu;
                 }
-                wht128_warp(act, INV_SQRT128);
+                trellis::wht128(act, trellis::INV_SQRT128);
                 *reinterpret_cast<float4*>(&c.sm.moe.vec[warp][lane << 2]) =
                     make_float4(act[0], act[1], act[2], act[3]);
             }
@@ -401,7 +371,7 @@ static __device__ void routed_out(const ctx& c, const mat& down_sv, const float*
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         if (shared_svh != nullptr) {
             load_vec4(c.p.t2 + u64(r) * h + base, t2_vec, acc);
-            wht128_warp(acc, INV_SQRT128);
+            trellis::wht128(acc, trellis::INV_SQRT128);
             float shs[4];
             load_vec4(shared_svh + base, sh_vec, shs);
             for (u32 q = 0; q < 4; q++) acc[q] *= shs[q];
@@ -414,7 +384,7 @@ static __device__ void routed_out(const ctx& c, const mat& down_sv, const float*
             u32 e = m + s.held_first;
             float v[4];
             load_vec4(c.p.d + u64(pick) * h + base, d_vec, v);
-            wht128_warp(v, INV_SQRT128);
+            trellis::wht128(v, trellis::INV_SQRT128);
             float g = c.p.gates[pick];
             for (u32 q = 0; q < 4; q++) {
                 acc[q] = fmaf(g, v[q] * vec_elem(down_sv, e, base + q) * sg[q], acc[q]);
@@ -447,7 +417,7 @@ static __device__ void turn_picks(const ctx& c, const float* x, const float* sig
             if (sign) v *= sign[base + j];
             sum += (__popc(o & j) & 1) ? -v : v;
         }
-        float v = sum * INV_SQRT128;
+        float v = sum * trellis::INV_SQRT128;
         if (after.p) v *= vec_elem(after, e, i);
         y[u] = also ? v * also[i] : v;
     }
