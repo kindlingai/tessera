@@ -240,6 +240,7 @@ fn gather(g: &Graph) -> Graph {
             numerics: Some(Numerics::default()),
         };
         insert(&mut out, id, joined);
+        leave_region(&mut out, id);
         at += 1;
     }
     out
@@ -286,16 +287,21 @@ fn merge(g: &Graph) -> Graph {
             numerics: Some(Numerics::default()),
         };
         insert(&mut g, id, sum);
-        let new = NodeId(id.0 + 1);
-        for r in &mut g.regions {
-            if r.outputs == [new] && r.end == NodeId(new.0 + 1) {
-                r.outputs = vec![id];
-                r.end = new;
-            }
-        }
+        leave_region(&mut g, id);
         at += 1;
     }
     g
+}
+
+/// Keeps the node after `id` outside regions ending there.
+fn leave_region(g: &mut Graph, id: NodeId) {
+    let new = NodeId(id.0 + 1);
+    for r in &mut g.regions {
+        if r.outputs == [new] && r.end == NodeId(new.0 + 1) {
+            r.outputs = vec![id];
+            r.end = new;
+        }
+    }
 }
 
 /// The node under any slices of `id`.

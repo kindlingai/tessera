@@ -118,3 +118,26 @@ fn cut_runs_stay_whole() {
     assert_eq!(placements(&g.graph), [Replicated, Replicated]);
     assert!(g.whole[0].why.contains("cuts its form"), "{:?}", g.whole);
 }
+
+#[test]
+fn gather_leaves_region() {
+    let mut g = graph(&[[Ffn, Hidden]]);
+    let out = push(&mut g, Op::Matmul, &[NodeId(0), NodeId(1)]);
+    g.regions.push(Region {
+        kind: Composite::Model,
+        start: out,
+        end: NodeId(out.0 + 1),
+        inputs: vec![NodeId(0), NodeId(1)],
+        outputs: vec![out],
+    });
+    finish(&mut g, out);
+    let g = shard(&g, &Parts::even(2)).unwrap().graph;
+    assert_eq!(placements(&g), [Split { axis: 0 }]);
+    let gather = NodeId(out.0 + 1);
+    assert_eq!(g.node(gather).op, Op::Row(Row(vec![Stage::AllGather])));
+    assert_eq!(g.entries[0].outputs[0].node, gather);
+    assert_eq!(
+        (g.regions[0].end, &g.regions[0].outputs),
+        (gather, &vec![out])
+    );
+}

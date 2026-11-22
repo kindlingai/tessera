@@ -1,8 +1,7 @@
 //! GLM-5.3's whole step, embedding to logits, as one persistent kernel.
 
 use std::collections::HashMap;
-use tessera_guest::site::{Ask, Count, File, Input, Kind, Lane, Manifest, Offer};
-use tessera_guest::site::{Place, Resident, Rule, Scalar, Shape};
+use tessera_guest::site::{Ask, Count, Input, Kind, Lane, Offer, Place, Resident, Scalar, Shape};
 
 const NAME: &str = "glm53_whole";
 const THREADS: u32 = 256;
@@ -270,6 +269,13 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let [vocab, hidden] = global[0].shape[..] else {
         return None;
     };
+    part(global[2], 0, 1)?;
+    let [head_out, head_in] = global[2].shape[..] else {
+        return None;
+    };
+    if head_in != hidden || whole(global[2], 0) != vocab || head_out == 0 {
+        return None;
+    }
     let ix = indexers.first()?;
     let (index_heads, index_dim) = (ix[4].shape[0], ix[1].shape[0]);
     let r = routed.first()?;
@@ -295,9 +301,9 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         None => None,
     };
     let attended = count(&attn, s.heads)?;
-    let dense_all = mlps.first()?[2].shape[1];
+    let dense_all = whole(mlps.first()?[2], 1);
     let dense_ffn = count(&dense_parts, dense_all)?;
-    let ffn_all = r[15].shape[1];
+    let ffn_all = whole(r[15], 1);
     let shared: Vec<_> = moe_parts.iter().map(|p| p.map(|(_, s)| s)).collect();
     let ffn = count(&shared, ffn_all)?;
     let held = same(moe_parts.iter().flatten().map(|(h, _)| *h));
@@ -316,13 +322,13 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     };
     let attn_bits = bits(&mut attn.iter().map(Option::is_some));
     let mlp_bits = bits(&mut mlp_split.clone());
-    // Only heads, inner widths and experts split.
+    // Only heads, inner widths, experts and head split.
     let whole = |group: &[Vec<&Input>], split: &[usize]| {
         let kept = |(i, _): &(usize, &&Input)| !split.contains(i);
         let rest = group.iter().flat_map(|g| g.iter().enumerate().filter(kept));
         rest.into_iter().all(|(_, i)| i.share.is_none())
     };
-    let whole_rest = whole(std::slice::from_ref(&global), &[])
+    let whole_rest = whole(std::slice::from_ref(&global), &[2])
         && whole(&indexers, &[])
         && whole(&attention, &[3, 6, 7])
         && whole(&routed, &[4, 7, 10, 13, 14, 15]);
@@ -370,7 +376,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     };
     let mut counts = vec![dim(tokens), dim(picks)];
     let shape = [
-        vocab,
+        head_out,
         hidden,
         layers,
         dense,
@@ -422,36 +428,10 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     }])
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: i32) -> i32 {
-    tessera_guest::alloc(len)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn manifest() -> i64 {
-    let file = |path, text| File { path, text };
-    tessera_guest::declare(&Manifest {
-        abi: tessera_guest::ABI,
-        kernels: vec![tessera_guest::site::imports(NAME, NAME, "whole.cu")],
-        rules: vec![Rule {
-            name: NAME,
-            site: Kind::Model,
-        }],
-        graph: false,
-        files: vec![
-            file("whole.cu", include_str!("whole.cu")),
-            file("math.cuh", include_str!("math.cuh")),
-            file("trellis.cuh", include_str!("trellis.cuh")),
-            file("gemv.cuh", include_str!("gemv.cuh")),
-            file("attn.cuh", include_str!("attn.cuh")),
-            file("moe.cuh", include_str!("moe.cuh")),
-        ],
-    })
-}
-
-/// The offer for a site that fits, else `null`.
-#[unsafe(no_mangle)]
-pub extern "C" fn propose(at: i32, len: i32) -> i64 {
-    // SAFETY: the host passes back what `alloc` returned.
-    unsafe { tessera_guest::answer_ask(at, len, offer) }
-}
+tessera_guest::exports!(
+    ask: NAME,
+    Kind::Model,
+    "whole.cu",
+    offer,
+    ["math.cuh", "trellis.cuh", "gemv.cuh", "attn.cuh", "moe.cuh"]
+);

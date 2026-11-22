@@ -52,12 +52,17 @@ fn choices(layout: &'static dyn kept::Layout) -> tessera_lower::Recipe {
     lower
 }
 
-/// The small model: experts split, masks give ranks.
-fn graph() -> Graph {
+/// The small model with `steps` output mode.
+fn graph_for(steps: Steps) -> Graph {
     let mut c = tessera_models::small::glm53();
     c.stack.ffn = 256;
-    c.stack.steps = Steps::Masked;
+    c.stack.steps = steps;
     stepper::<RotatedMoe>(&c)
+}
+
+/// The small model: experts split, masks give ranks.
+fn graph() -> Graph {
+    graph_for(Steps::Masked)
 }
 
 /// Each weight to load. Codes stay packed.
@@ -146,6 +151,9 @@ fn check_plans() {
     for (ranks, rank, cfg, want) in cases {
         assert_eq!(plan_lanes(&g, ranks, rank, cfg), want);
     }
+    let plain = rank_plan(&graph_for(Steps::Plain), &choices(kept::DENSE), 2, 0);
+    assert_eq!(taken(&plain), (vec![NAME], 0, false));
+    assert!(plain.steps.iter().any(|s| s.kernel.name() == "all_gather"));
 }
 
 /// Host plans, then CUDA runs: the kernel is CUDA text.
