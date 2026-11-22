@@ -43,7 +43,6 @@ const ROUTED: [&str; 16] = [
     "shared.down",
 ];
 /// First field number of each group, in `whole.cu` order.
-const FIELDS: usize = AT_ROUTED + ROUTED.len();
 const AT_INDEXER: usize = GLOBAL.len() + ATTENTION.len();
 const AT_DENSE: usize = AT_INDEXER + INDEXER.len();
 const AT_ROUTED: usize = AT_DENSE + DENSE.len();
@@ -51,11 +50,11 @@ const AT_ROUTED: usize = AT_DENSE + DENSE.len();
 const CODES: [usize; 3] = [AT_ROUTED + 4, AT_ROUTED + 7, AT_ROUTED + 10];
 /// Signs `whole.cu` reads as plain f32.
 const SIGNS: [usize; 2] = [AT_ROUTED + 2, AT_ROUTED + 3];
-/// Form classes: f32, bf16, int4 g32, mxfp8, then trellis.
+/// Form class for trellis weights.
 const TRELLIS: u32 = 4;
 
-/// A form's class, and a trellis form's width and codebook.
-fn class(input: &Input) -> Option<(u32, Option<[usize; 2]>)> {
+/// Whether `whole.cu` decodes `input`'s form, and its class.
+fn class(input: &Input) -> Option<u32> {
     let form = input.form.as_str();
     let plain = match form {
         "f32" => Some(0),
@@ -65,48 +64,21 @@ fn class(input: &Input) -> Option<(u32, Option<[usize; 2]>)> {
         _ => None,
     };
     if let Some(c) = plain {
-        return input.parts.is_none().then_some((c, None));
+        return input.parts.is_none().then_some(c);
     }
     let rest = form.strip_suffix("_rot").unwrap_or(form);
     let rest = rest.strip_prefix("trellis_k")?;
-    let (k, book) = match rest.strip_suffix("_mul1") {
-        Some(k) => (k, 1),
-        None => (rest, 0),
-    };
-    let k: usize = k.parse().ok().filter(|k| (2..=4).contains(k))?;
-    Some((TRELLIS, Some([k, book])))
+    let k = rest.strip_suffix("_mul1").unwrap_or(rest);
+    let k: usize = k.parse().ok()?;
+    (2..=4).contains(&k).then_some(TRELLIS)
 }
 
-/// The class `whole.cu` reads from `bytes` for `n` elements.
-fn sniff(bytes: usize, n: usize) -> u32 {
-    let blocks = n.is_multiple_of(32);
-    match bytes {
-        b if b == 4 * n => 0,
-        b if b == 2 * n => 1,
-        b if blocks && b == n / 32 * 18 => 2,
-        b if blocks && b == n / 32 * 33 => 3,
-        _ => TRELLIS,
-    }
-}
-
-/// Bytes of `n` elements of a class, trellis width `k`.
-fn bytes(class: u32, n: usize, k: usize) -> usize {
-    match class {
-        0 => 4 * n,
-        1 => 2 * n,
-        2 => n / 32 * 18,
-        3 => n / 32 * 33,
-        _ => 16 + n * k / 8,
-    }
-}
-
-/// The reads, and each field's trellis codebook.
+/// The reads collected in kernel item order.
 struct Walk<'a> {
     inputs: &'a [Input],
     /// Each weight's input place, by path.
     paths: HashMap<&'a str, usize>,
     reads: Vec<Place>,
-    books: [Option<usize>; FIELDS],
 }
 
 impl<'a> Walk<'a> {
@@ -118,21 +90,12 @@ impl<'a> Walk<'a> {
     fn take(&mut self, path: &str, field: usize) -> Option<&'a Input> {
         let at = self.place(path)?;
         let input = &self.inputs[at];
-        let (c, trellis) = class(input)?;
-        let k = trellis.map_or(0, |[k, _]| k);
-        let n = input.shape.iter().product();
+        let c = class(input)?;
         let codes = CODES.contains(&field);
         // Rotated iff trellis outside the expert codes.
         let turned = c == TRELLIS && !codes;
-        let fits = sniff(bytes(c, n, k), n) == c
-            && turned == input.parts.is_some()
-            && (!SIGNS.contains(&field) || c == 0);
+        let fits = turned == input.parts.is_some() && (!SIGNS.contains(&field) || c == 0);
         if !fits {
-            return None;
-        }
-        if let Some(b) = trellis.map(|[_, b]| b)
-            && *self.books[field].get_or_insert(b) != b
-        {
             return None;
         }
         match turned {
@@ -255,7 +218,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let (inputs, kept, sums, scalars, len) =
         (step.inputs, step.kept, step.sums, step.scalars, step.len);
     let [tokens, positions, slots, picks] = step.ids;
-    let first = &kept[0];
+    let first = kept.first()?;
     let named = inputs.iter().enumerate();
     let paths = named.filter_map(|(i, input)| Some((input.weight.as_deref()?, i)));
     let mut w = Walk {
@@ -265,7 +228,6 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             .into_iter()
             .map(Place::Read)
             .collect(),
-        books: [None; FIELDS],
     };
     let global = w.group("", &GLOBAL, 0)?;
     let layers = (0..)
@@ -371,7 +333,6 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let theta = only(scalars, "rope_adjacent")?;
     let route = only(scalars, "scale")?;
     let scale = only(scalars, "attend")?;
-    let [code, page] = first.code()?;
     let context = first.context;
     let width = [
         hidden,
@@ -423,12 +384,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     ];
     counts.extend(shape.map(fixed));
     counts.extend(attn_bits.into_iter().chain(mlp_bits).map(Count::Fixed));
-    let mut books = [0u32; 2];
-    for (f, b) in w.books.iter().enumerate() {
-        books[f / 32] |= (b.unwrap_or(0) as u32) << (f % 32);
-    }
-    counts.extend(books.map(Count::Fixed));
-    counts.extend([fixed(width), Count::Fixed(code), Count::Fixed(page)]);
+    counts.push(fixed(width));
     counts.extend([eps, theta, route, scale].map(|f| Count::Fixed(f.to_bits())));
     let mut reads = w.reads;
     reads.extend((0..kept.len()).map(|kept| Place::Kept { kept }));

@@ -17,8 +17,9 @@ use tessera_engine_settings::Settings;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
-use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
+use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, Step};
 use tessera_mem::Buffer;
+use tessera_mem::form::Read;
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
@@ -156,11 +157,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     /// One grid launch. It waits, so held launches go first.
     fn persistent(&self, step: usize, launch: &Call) -> Result<(), Error> {
         self.open();
+        let plan = &self.base.plan;
         let base = |slot| self.buffer(slot).device_ptr();
-        let (items, values) = table(launch, base)?;
+        let (items, values) = table(plan, &plan.steps[step], launch, &base)?;
+        let kept = kept_tables(plan, &base);
         let mut grid = self.grid.borrow_mut();
         let grid = grid.as_mut().ok_or(Error::Gridless(step))?;
-        grid.launch(&self.base.plan.steps[step].kernel, &items, &values)
+        grid.launch(&plan.steps[step].kernel, &items, &kept, &values)
     }
 
     /// Opens the grid for each resident step of `plan`.
@@ -170,8 +173,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             let (Some(grid), true) = (grid.as_mut(), self.resident[i]) else {
                 continue;
             };
-            let items = step.launches().iter().map(items).max();
-            grid.open(&step.kernel, items.unwrap_or(0))?;
+            grid.open(&step.kernel, step_layout(plan, step))?;
         }
         Ok(())
     }
@@ -445,28 +447,155 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     }
 }
 
+/// Matrix rows and columns from a packed shape.
+fn matrix_dims(dims: u32, shape: [u32; 4]) -> (u32, u32) {
+    match dims {
+        0 => (0, 0),
+        1 => (1, shape[0]),
+        d => (shape[d as usize - 2], shape[d as usize - 1]),
+    }
+}
+
+/// Companion `suh` and `svh` device addresses for a rotated weight.
+fn companions(
+    plan: &Plan,
+    weight: u32,
+    address: &impl Fn(Slot) -> u64,
+) -> (Option<u64>, Option<u64>) {
+    let mut suh = None;
+    let mut svh = None;
+    for l in &plan.weights {
+        if l.weight != weight {
+            continue;
+        }
+        let at = address(l.slot) + l.slot.start() as u64;
+        match l.part {
+            Some(1) => suh = Some(at),
+            Some(2) => svh = Some(at),
+            _ => {}
+        }
+    }
+    (suh, svh)
+}
+
 /// A bound launch as items and values, by argument order.
 fn table(
+    plan: &Plan,
+    step: &Step,
     launch: &Call,
-    address: impl Fn(Slot) -> u64,
+    address: &impl Fn(Slot) -> u64,
 ) -> Result<(Vec<grid::Item>, Vec<u32>), Error> {
     let (mut items, mut values) = (Vec::new(), Vec::new());
+    let mut buf_index = 0usize;
     for arg in &launch.args {
         match arg {
-            Arg::Buffer(slot, Extent::Fixed(skip)) => items.push(grid::Item {
-                at: address(*slot) + slot.at(*skip) as u64,
-                bytes: slot.bytes() - (slot.at(*skip) - slot.start()),
-            }),
+            Arg::Buffer(slot, Extent::Fixed(skip)) => {
+                let kind = if buf_index == step.reads.len() && *slot == step.write {
+                    grid::ItemKind::Output
+                } else {
+                    grid::ItemKind::Input
+                };
+                let at = address(*slot) + slot.at(*skip) as u64;
+                let bytes = slot.bytes() - (slot.at(*skip) - slot.start());
+                let (dims, shape) = if *skip == 0 && slot.dims > 0 {
+                    (u32::from(slot.dims), slot.shape)
+                } else {
+                    (1, [bytes as u32, 0, 0, 0])
+                };
+                let loaded = plan
+                    .weights
+                    .iter()
+                    .find(|l| l.slot.buffer == slot.buffer && l.slot.offset == slot.offset);
+                let share = match loaded.and_then(|l| l.share) {
+                    Some(s) => [s.axis, s.first as u32, s.count as u32, s.whole as u32],
+                    None => [0; 4],
+                };
+                let form = if slot.form.read() == Read::Decode {
+                    let (rows, cols) = matrix_dims(dims, shape);
+                    let (suh, svh) = match loaded.filter(|l| l.part == Some(0)) {
+                        Some(l) => companions(plan, l.weight, address),
+                        None => (None, None),
+                    };
+                    Some(grid::FormMeta {
+                        name: slot.form.name(),
+                        rows,
+                        cols,
+                        suh,
+                        svh,
+                    })
+                } else {
+                    None
+                };
+                items.push(grid::Item {
+                    at,
+                    bytes,
+                    kind,
+                    elem: slot.form.name(),
+                    dims,
+                    shape,
+                    share,
+                    form,
+                });
+                buf_index += 1;
+            }
             arg => values.push(arg.u32().ok_or(tessera_lower::Error::Unbound)?),
         }
     }
     Ok((items, values))
 }
 
-/// Items in a step's launch, before binding.
-fn items(launch: &Call) -> usize {
-    let buffer = |a: &&Arg| matches!(a, Arg::Buffer(..));
-    launch.args.iter().filter(buffer).count()
+/// Kept-row table descriptors for the KV convention.
+fn kept_tables(plan: &Plan, address: &impl Fn(Slot) -> u64) -> Vec<grid::KeptDesc> {
+    let pages = plan.table.map(|t| address(t) + t.start() as u64);
+    let mut out = Vec::with_capacity(plan.kept.len());
+    for ((_, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+        let page_rows = info.page_rows.max(1);
+        out.push(grid::KeptDesc {
+            base: address(*slot) + slot.start() as u64,
+            pages,
+            len: None,
+            slots: info.slots,
+            context: info.context,
+            pages_per_slot: info.context.div_ceil(page_rows),
+            page_rows,
+            row_bytes: slot.form.bytes(info.width as usize) as u32,
+            elem: slot.form.name(),
+            interleaved: info.interleaved,
+        });
+    }
+    out
+}
+
+/// Control table counts for a resident step.
+fn step_layout(plan: &Plan, step: &Step) -> grid::Layout {
+    let mut items = 0usize;
+    let mut forms = 0usize;
+    for launch in step.launches() {
+        let mut n_items = 0;
+        let mut n_forms = 0;
+        for arg in &launch.args {
+            if let Arg::Buffer(slot, _) = arg {
+                n_items += 1;
+                if slot.form.read() == Read::Decode {
+                    n_forms += 1;
+                }
+            }
+        }
+        items = items.max(n_items);
+        forms = forms.max(n_forms);
+    }
+    let kept = plan.kept.len().min(plan.kept_info.len());
+    let pages = match (plan.table, plan.kept_info.first()) {
+        (None, Some(info)) if info.interleaved => (info.slots * info.context) as usize,
+        (None, Some(info)) => info.slots as usize,
+        _ => 0,
+    };
+    grid::Layout {
+        items,
+        forms,
+        kept,
+        pages,
+    }
 }
 
 /// Pinned host memory from the shared context.

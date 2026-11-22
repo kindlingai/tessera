@@ -85,6 +85,9 @@ pub struct Unread {
 pub struct Ask {
     pub rule: String,
     pub site: Site,
+    /// Model config JSON, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 /// A site's sizes. Offers name reads by place.

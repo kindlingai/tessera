@@ -100,6 +100,8 @@ pub struct Bundle {
     pub template: Option<Template>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
+    /// Model `config.json` with recipe overrides applied.
+    pub config: Option<String>,
 }
 
 /// Config values a recipe sets, by the file they override.
@@ -152,6 +154,33 @@ impl Overrides {
         build: impl FnOnce(&mut Keys) -> T,
     ) -> Result<T, Box<dyn Error + Send + Sync>> {
         self.read("config.json", Some(&dir.join("config.json")), build)
+    }
+
+    /// `path`'s JSON with the recipe's `key` table overlaid on top.
+    pub fn merged(&self, key: &str, path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let text = std::fs::read_to_string(path)?;
+        let Some(over) = self.0.get(key) else {
+            return Ok(text);
+        };
+        let mut base: serde_json::Value = serde_json::from_str(&text)?;
+        overlay(&mut base, over);
+        Ok(serde_json::to_string(&base)?)
+    }
+}
+
+/// Overlays JSON object keys from `over` onto `base`.
+fn overlay(base: &mut serde_json::Value, over: &serde_json::Value) {
+    if let (serde_json::Value::Object(dst), serde_json::Value::Object(src)) = (&mut *base, over) {
+        for (k, v) in src {
+            match dst.get_mut(k) {
+                Some(existing) => overlay(existing, v),
+                None => {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    } else {
+        *base = over.clone();
     }
 }
 
@@ -345,11 +374,17 @@ pub fn load_named(
     if dir.is_file() {
         return gguf::load(dir, slots, context, user, steps);
     }
-    let json = std::fs::read_to_string(dir.join("config.json"))?;
+    let json = overrides.merged("config.json", &dir.join("config.json"))?;
     if mla::config(&json, slots, context).is_ok() {
         let release = mla::stepping(dir, [slots, context], WIDTH, user, steps)?;
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
-        return dressed(dir, graph, Weights::Streamed(Box::new(release)), pins);
+        return dressed(
+            dir,
+            graph,
+            Weights::Streamed(Box::new(release)),
+            pins,
+            Some(json),
+        );
     }
     let arch = serde_json::from_str::<Arch>(&json)?.model_type;
     let (graph, layers, rules) = match arch.as_deref() {
@@ -378,7 +413,7 @@ pub fn load_named(
         false => Box::new(Shards::open(dir)?),
     };
     let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[&rules, user])?;
-    dressed(dir, graph, Weights::Held(weights), pins)
+    dressed(dir, graph, Weights::Held(weights), pins, Some(json))
 }
 
 /// `dir`'s exlr8 release at `name`, or its only manifest.
@@ -402,6 +437,7 @@ fn dressed(
     graph: Graph,
     weights: Weights,
     pins: Pins,
+    config: Option<String>,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let template = Template::load(dir)?;
@@ -420,5 +456,6 @@ fn dressed(
         tokenizer,
         template,
         stop,
+        config,
     })
 }

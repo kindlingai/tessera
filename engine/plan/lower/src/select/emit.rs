@@ -6,6 +6,7 @@ use crate::form::{self, Load};
 use crate::kept;
 use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{Move, Narrow, Scatter, Widen};
+use crate::plan::{KeptInfo, pack_shape};
 use crate::rule::Draft;
 use crate::select::cover::EDGE;
 use crate::select::{Home, Op, Selected, Val, Value};
@@ -34,6 +35,7 @@ impl Emit {
         home: Home,
         zone: u32,
         form: &'static dyn Load,
+        (dims, shape): (u8, [u32; 4]),
     ) -> Val {
         self.out.values.push(Value {
             len,
@@ -41,12 +43,10 @@ impl Emit {
             zone,
             form,
             share: None,
+            dims,
+            shape,
         });
         Val(self.out.values.len() as u32 - 1)
-    }
-
-    fn len(&self, v: Val) -> usize {
-        self.out.values[v.0 as usize].len
     }
 
     /// The value in `zone`, moved there if it lies elsewhere.
@@ -57,8 +57,8 @@ impl Emit {
         if let Some(copy) = self.moved.get(&(v, zone)) {
             return *copy;
         }
-        let (len, form) = (self.len(v), self.out.values[v.0 as usize].form);
-        let write = self.value(len, Home::Temp, zone, form);
+        let val = self.out.values[v.0 as usize];
+        let write = self.value(val.len, Home::Temp, zone, val.form, (val.dims, val.shape));
         self.out.ops.push(Op {
             kernel: KernelRef::new(Move),
             rule: "move",
@@ -83,7 +83,12 @@ impl Emit {
     /// `v` widened to f32, cached once per value.
     fn widen_val(&mut self, v: Val) -> Val {
         let Value {
-            len, zone, form, ..
+            len,
+            zone,
+            form,
+            dims,
+            shape,
+            ..
         } = self.out.values[v.0 as usize];
         if !form.narrow() {
             return v;
@@ -91,7 +96,7 @@ impl Emit {
         if let Some(wide) = self.widened.get(&v) {
             return *wide;
         }
-        let write = self.value(len, Home::Temp, zone, form::F32_FORM);
+        let write = self.value(len, Home::Temp, zone, form::F32_FORM, (dims, shape));
         self.out.ops.push(Op {
             kernel: KernelRef::new(Widen { len, form }),
             rule: "widen",
@@ -106,8 +111,14 @@ impl Emit {
 
     /// `v` narrowed from f32 into `form`.
     fn narrow(&mut self, v: Val, form: &'static dyn Load) -> Val {
-        let Value { len, zone, .. } = self.out.values[v.0 as usize];
-        let write = self.value(len, Home::Temp, zone, form);
+        let Value {
+            len,
+            zone,
+            dims,
+            shape,
+            ..
+        } = self.out.values[v.0 as usize];
+        let write = self.value(len, Home::Temp, zone, form, (dims, shape));
         self.out.ops.push(Op {
             kernel: KernelRef::new(Narrow { len, form }),
             rule: "narrow",
@@ -133,6 +144,7 @@ impl Emit {
     }
 
     /// Adds an op writing a new value, or shares one.
+    #[allow(clippy::too_many_arguments, reason = "op emission takes value shape")]
     pub(crate) fn op(
         &mut self,
         d: Draft,
@@ -141,6 +153,7 @@ impl Emit {
         covers: &[NodeId],
         zone: u32,
         form: &'static dyn Load,
+        shape: (u8, [u32; 4]),
     ) -> Val {
         let mut taken = Vec::with_capacity(reads.len());
         for (i, v) in reads.into_iter().enumerate() {
@@ -162,7 +175,7 @@ impl Emit {
                 .is_some_and(|r| self.out.values[r.0 as usize].form.name() == form.name());
         let native = (!form.narrow() || d.kernel.emits(form)) && same_in;
         let out_form = if native { form } else { form::F32_FORM };
-        let write = self.value(d.len, Home::Temp, zone, out_form);
+        let write = self.value(d.len, Home::Temp, zone, out_form, shape);
         self.out.ops.push(Op {
             kernel: d.kernel,
             rule,
@@ -194,7 +207,26 @@ impl Emit {
         let entries = kept::entries(tree.kept, all[0], context);
         self.out.table = self.out.table.max(entries);
         let len: usize = all.iter().product();
-        let val = self.value(len, Home::Kept { index, room }, EDGE, node.form);
+        let interleaved = tree.kept.name() == "interleaved";
+        let page_rows = match (tree.kept.page(), interleaved) {
+            (Some(page), _) => page as u32,
+            (None, true) => 1,
+            (None, false) => context as u32,
+        };
+        let info = KeptInfo {
+            slots: all[0] as u32,
+            context: context as u32,
+            width: width as u32,
+            page_rows,
+            interleaved,
+        };
+        let val = self.value(
+            len,
+            Home::Kept { index, room, info },
+            EDGE,
+            node.form,
+            pack_shape(all, len),
+        );
         self.kept.insert(index, val);
         Ok(val)
     }

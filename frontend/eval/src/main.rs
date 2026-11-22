@@ -220,6 +220,9 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
     if args.require_favored {
         recipe.require_favored = true;
     }
+    if recipe.config.is_none() {
+        recipe.config = loaded.config;
+    }
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
     (loaded.weights).each(|at, w| engine.load_weight(at, w))?;
     let (prompt, wanted) = match &args.reference {

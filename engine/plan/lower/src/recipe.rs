@@ -44,6 +44,9 @@ pub struct Recipe {
     /// Rules made at run time, beside the linked ones.
     #[serde(skip)]
     pub rules: Vec<&'static Rule>,
+    /// Model config JSON passed to runtime rules.
+    #[serde(skip)]
+    pub config: Option<String>,
 }
 
 fn dense() -> &'static dyn Layout {
@@ -93,6 +96,7 @@ impl Default for Recipe {
             launch: Launching::default(),
             kept: dense(),
             rules: Vec::new(),
+            config: None,
         }
     }
 }

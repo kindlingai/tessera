@@ -699,3 +699,54 @@ fn dumps_sites_jsonl() {
     assert_eq!(first["response"], Value::Null);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Offers `matmul()` when `propose` input contains `needle`.
+fn config_rule(needle: &str) -> &'static Rule {
+    let manifest = manifest(ABI, "matmul").to_string();
+    let offer = json!([matmul()]).to_string();
+    let packed = |at: u64, text: &str| (at << 32) | text.len() as u64;
+    let wat = format!(
+        r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{}")
+  (data (i32.const 16384) "{}")
+  (data (i32.const 24576) "null")
+  (data (i32.const 28672) "{}")
+  (func (export "alloc") (param i32) (result i32) (i32.const 32768))
+  (func (export "manifest") (result i64) (i64.const {}))
+  (func (export "propose") (param $p i32) (param $n i32) (result i64)
+    (local $i i32) (local $j i32) (local $m i32)
+    (local.set $m (i32.const {}))
+    (block $miss (loop $outer
+      (br_if $miss (i32.gt_u (i32.add (local.get $i) (local.get $m)) (local.get $n)))
+      (local.set $j (i32.const 0))
+      (block $next (loop $inner
+        (if (i32.eq (local.get $j) (local.get $m)) (then (return (i64.const {}))))
+        (br_if $next (i32.ne
+          (i32.load8_u (i32.add (local.get $p) (i32.add (local.get $i) (local.get $j))))
+          (i32.load8_u (i32.add (i32.const 28672) (local.get $j)))))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $inner)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $outer)))
+    (i64.const {})))"#,
+        quoted(&manifest),
+        quoted(&offer),
+        quoted(needle),
+        packed(0, &manifest),
+        needle.len(),
+        packed(16384, &offer),
+        packed(24576, "null"),
+    );
+    tessera_wasm::load(&wat::parse_str(wat).unwrap()).unwrap()[0]
+}
+
+#[test]
+fn ask_carries_config() {
+    let base = compiling().adding(config_rule(r#""config":{"hidden":64}"#));
+    let without = lower(&graph(false), 0, &[(Rows, 4)], &base).unwrap();
+    assert_ne!(rules(&without), ["wasm_matmul"]);
+    let cfg = base.configured(r#"{"hidden": 64}"#);
+    let with = lower(&graph(false), 0, &[(Rows, 4)], &cfg).unwrap();
+    assert_eq!(rules(&with), ["wasm_matmul"]);
+}

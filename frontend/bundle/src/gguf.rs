@@ -197,6 +197,7 @@ pub(crate) fn load(
         tokenizer: tokenizer(&gguf)?,
         template,
         stop,
+        config: None,
     })
 }
 

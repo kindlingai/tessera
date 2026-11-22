@@ -10,9 +10,13 @@ pub const NONE: u32 = u32::MAX;
 pub(crate) const DOORBELL_SLOTS: usize = 64;
 pub(crate) const DOORBELL_ABORT: usize = 4032;
 pub(crate) const DOORBELL_SENT: usize = 4040;
-/// The `dtype` code of `F32`, first in `DTYPES`.
+/// `dtype` codes matching `core.h`.
 pub(crate) const F32: u32 = 0;
-/// The `dtype` code of untyped bytes.
+pub(crate) const BF16: u32 = 1;
+pub(crate) const F16: u32 = 2;
+pub(crate) const E4M3: u32 = 3;
+pub(crate) const U32: u32 = 4;
+pub(crate) const FORM: u32 = 5;
 pub(crate) const BYTES: u32 = 6;
 /// `dtype` names in code order, with bytes per element.
 pub(crate) const DTYPES: [(&str, u32); 7] = [
@@ -24,6 +28,56 @@ pub(crate) const DTYPES: [(&str, u32); 7] = [
     ("FORM", 1),
     ("BYTES", 1),
 ];
+/// `item_kind` codes matching `core.h`.
+pub(crate) const INPUT: u32 = 0;
+pub(crate) const OUTPUT: u32 = 1;
+pub(crate) const SCRATCH: u32 = 2;
+/// `convention` code for KV tables.
+pub(crate) const KV: u32 = 1;
+/// `form_kind` header names and storage form names in code order.
+pub(crate) const FORM_KINDS: [(&str, &str); 17] = [
+    ("FORM_UNKNOWN", ""),
+    ("FORM_Q8_0", "q8_0"),
+    ("FORM_Q4_0", "q4_0"),
+    ("FORM_NVFP4", "nvfp4"),
+    ("FORM_MXFP8", "mxfp8"),
+    ("FORM_MXFP4", "mxfp4"),
+    ("FORM_INT4_G32", "int4_g32"),
+    ("FORM_INT4_G128", "int4_g128"),
+    ("FORM_TRELLIS_K2", "trellis_k2"),
+    ("FORM_TRELLIS_K3", "trellis_k3"),
+    ("FORM_TRELLIS_K4", "trellis_k4"),
+    ("FORM_TRELLIS_K2_MUL1", "trellis_k2_mul1"),
+    ("FORM_TRELLIS_K3_MUL1", "trellis_k3_mul1"),
+    ("FORM_TRELLIS_K4_MUL1", "trellis_k4_mul1"),
+    ("FORM_TRELLIS_K2_PMCGX", "trellis_k2_pmcgx"),
+    ("FORM_TRELLIS_K3_PMCGX", "trellis_k3_pmcgx"),
+    ("FORM_TRELLIS_K4_PMCGX", "trellis_k4_pmcgx"),
+];
+
+/// Plain form name as a `core.h` `dtype` code.
+pub(crate) fn dtype_code(name: &str) -> u32 {
+    match name {
+        "f32" => F32,
+        "bf16" => BF16,
+        "f16" => F16,
+        "e4m3" | "fp8" => E4M3,
+        "u32" => U32,
+        "form" => FORM,
+        _ => BYTES,
+    }
+}
+
+/// Packed form name as a `core.h` `form_kind` code.
+pub(crate) fn form_kind(name: &str) -> u32 {
+    let base = name.strip_suffix("_rot").unwrap_or(name);
+    for (code, &(_, form)) in FORM_KINDS.iter().enumerate() {
+        if !form.is_empty() && form == base {
+            return code as u32;
+        }
+    }
+    0
+}
 /// `status_code` names in code order.
 pub(crate) const STATUS: [&str; 6] = [
     "OK",

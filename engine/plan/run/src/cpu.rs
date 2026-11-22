@@ -80,7 +80,7 @@ impl Runner {
                     ArgVal::U32(arg.u32().unwrap())
                 }
                 (other, param) => {
-                    let (arg, param) = (other.clone(), param.clone());
+                    let (arg, param) = (Box::new(other.clone()), Box::new(param.clone()));
                     return Err(Error::HostArg { arg, param });
                 }
             });

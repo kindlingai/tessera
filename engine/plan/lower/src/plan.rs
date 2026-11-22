@@ -14,16 +14,39 @@ pub struct Slot {
     pub offset: usize,
     pub len: usize,
     pub form: &'static dyn Load,
+    pub dims: u8,
+    pub shape: [u32; 4],
+}
+
+/// Packs up to four tensor axes.
+pub(crate) fn pack_shape(axes: &[usize], len: usize) -> (u8, [u32; 4]) {
+    if axes.is_empty() || axes.len() > 4 {
+        return match u32::try_from(len) {
+            Ok(n) if len > 0 => (1, [n, 0, 0, 0]),
+            _ => (0, [0; 4]),
+        };
+    }
+    let mut shape = [0u32; 4];
+    for (dst, &src) in shape.iter_mut().zip(axes) {
+        let Ok(n) = u32::try_from(src) else {
+            return (0, [0; 4]);
+        };
+        *dst = n;
+    }
+    (axes.len() as u8, shape)
 }
 
 impl Slot {
     /// Elements from the start of a buffer, as f32.
     pub fn floats(buffer: u32, len: usize) -> Self {
+        let (dims, shape) = pack_shape(&[len], len);
         Self {
             buffer,
             offset: 0,
             len,
             form: F32_FORM,
+            dims,
+            shape,
         }
     }
 
@@ -112,6 +135,16 @@ pub struct Loaded {
     pub part: Option<u8>,
 }
 
+/// Geometry of one kept-row buffer in `Plan::kept`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KeptInfo {
+    pub slots: u32,
+    pub context: u32,
+    pub width: u32,
+    pub page_rows: u32,
+    pub interleaved: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Output {
     pub slot: Slot,
@@ -137,6 +170,8 @@ pub struct Plan {
     pub weights: Vec<Loaded>,
     /// Each kept-row buffer, holding this launch's rows too.
     pub kept: Vec<(u32, Slot)>,
+    /// Geometry for each entry of `kept`, in order.
+    pub kept_info: Vec<KeptInfo>,
     /// Each slot's pages, when kept rows are paged.
     pub table: Option<Slot>,
     /// One per input port of the entry.

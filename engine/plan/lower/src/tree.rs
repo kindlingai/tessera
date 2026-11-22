@@ -71,14 +71,16 @@ pub struct Tree<'a> {
     readers: Vec<u32>,
     /// The entry's outputs, with each one's graph shape.
     pub outputs: Vec<(T, Vec<usize>)>,
-    /// Elements and type of each input port, used or not.
-    pub ports: Vec<(usize, DType)>,
+    /// Elements, shape and type of each input port.
+    pub ports: Vec<(usize, Vec<usize>, DType)>,
     /// The sizes this tree was viewed at.
     pub(crate) sizes: Vec<(DimName, u64)>,
     /// Where kept rows lie.
     pub kept: &'static dyn Layout,
     /// Operand precision for matrix-unit kernels.
     pub compute: Compute,
+    /// Model config JSON for runtime rules.
+    pub config: Option<String>,
     /// How split axes divide, and which part this plan is.
     pub(crate) parts: Parts,
     pub(crate) rank: u32,
@@ -275,6 +277,7 @@ impl<'a> Tree<'a> {
             sizes: sizes.to_vec(),
             kept,
             compute: Compute::default(),
+            config: None,
             parts: parts.clone(),
             rank,
             shares: Vec::new(),
@@ -283,9 +286,10 @@ impl<'a> Tree<'a> {
         };
         let ranks = parts.ranks();
         for port in &e.inputs {
-            let shape = sized(g, sizes, upto, &port.ty.shape)?;
-            let len = shape.iter().map(Extent::most).product();
-            tree.ports.push((len, port.ty.dtype));
+            let extents = sized(g, sizes, upto, &port.ty.shape)?;
+            let shape: Vec<usize> = extents.iter().map(Extent::most).collect();
+            let len = shape.iter().product();
+            tree.ports.push((len, shape, port.ty.dtype));
         }
         // Each graph node's value, as a view node.
         let mut at: Vec<Option<T>> = vec![None; g.nodes.len()];

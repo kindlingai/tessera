@@ -690,10 +690,8 @@ fn subset_weights_stay() {
     let loaded = |weight, offset| tessera_lower::Loaded {
         weight,
         slot: Slot {
-            buffer: 0,
             offset,
-            len: 4,
-            form: F32_FORM,
+            ..Slot::floats(0, 4)
         },
         share: None,
         part: None,
@@ -756,13 +754,22 @@ fn subset_weights_stay() {
 
 #[test]
 fn arenas_pack_zones() {
-    use tessera_lower::{Home, Op, Selected, Val, Value};
+    use tessera_lower::{Home, KeptInfo, Op, Selected, Val, Value};
     let val = |len, home, zone, form| Value {
         len,
         home,
         zone,
         form,
         share: None,
+        dims: 1,
+        shape: [len as u32, 0, 0, 0],
+    };
+    let info = KeptInfo {
+        slots: 1,
+        context: 16,
+        width: 16,
+        page_rows: 16,
+        interleaved: false,
     };
     let op = |reads, write, zone| Op {
         kernel: KernelRef::new(Map::plain(Vec::new())),
@@ -782,6 +789,7 @@ fn arenas_pack_zones() {
             Home::Kept {
                 index: 1,
                 room: 256,
+                info,
             },
             0,
             F32_FORM,
@@ -791,6 +799,7 @@ fn arenas_pack_zones() {
             Home::Kept {
                 index: 0,
                 room: 256,
+                info,
             },
             0,
             F32_FORM,

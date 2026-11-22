@@ -2,7 +2,7 @@
 
 use crate::kernel::KernelRef;
 use crate::kernels::Map;
-use crate::plan::{Loaded, Output, Plan, Share, Slot, Step};
+use crate::plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step, pack_shape};
 use crate::select::{Home, Selected, Val, Value};
 use std::collections::BTreeMap;
 use tessera_graph::DType;
@@ -195,6 +195,8 @@ impl Buffers<'_> {
                 offset,
                 len: value.len,
                 form: value.form,
+                dims: value.dims,
+                shape: value.shape,
             };
             self.slots[v] = Some(slot);
             seen.push((key, slot));
@@ -212,15 +214,15 @@ impl Buffers<'_> {
 
     /// Packs kept rows into one contiguous arena per zone.
     fn pack_kept(&mut self) {
-        let mut items: Vec<(u32, u32, usize, usize)> = Vec::new();
+        let mut items: Vec<(u32, u32, usize, KeptInfo, usize)> = Vec::new();
         for (v, value) in self.s.values.iter().enumerate() {
-            if let Home::Kept { index, room } = value.home {
-                items.push((value.zone, index, room, v));
+            if let Home::Kept { index, room, info } = value.home {
+                items.push((value.zone, index, room, info, v));
             }
         }
         items.sort_unstable();
         let mut arenas: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
-        for (zone, index, room, v) in items {
+        for (zone, index, room, info, v) in items {
             let value = self.s.values[v];
             let (buffer, cursor) = match arenas.get_mut(&zone) {
                 Some(entry) => entry,
@@ -236,18 +238,24 @@ impl Buffers<'_> {
                 offset,
                 len: value.len,
                 form: value.form,
+                dims: value.dims,
+                shape: value.shape,
             };
             self.slots[v] = Some(slot);
             self.plan.kept.push((index, slot));
+            self.plan.kept_info.push(info);
             // One table beside kept rows names every lane's pages.
             if self.s.table > 0 && self.plan.table.is_none() {
                 let form = tessera_codegen::form::of(DType::U32);
                 let buffer = self.buffer(form.bytes(self.s.table), zone);
+                let (dims, shape) = pack_shape(&[self.s.table], self.s.table);
                 self.plan.table = Some(Slot {
                     buffer,
                     offset: 0,
                     len: self.s.table,
                     form,
+                    dims,
+                    shape,
                 });
             }
         }
@@ -259,7 +267,12 @@ impl Buffers<'_> {
     /// Sub-allocates `v` in its zone's scratch arena.
     fn alloc_scratch(&mut self, v: Val) -> Slot {
         let Value {
-            len, zone, form, ..
+            len,
+            zone,
+            form,
+            dims,
+            shape,
+            ..
         } = self.s.values[v.0 as usize];
         let bytes = form.bytes(len);
         if !self.scratch.contains_key(&zone) {
@@ -273,6 +286,8 @@ impl Buffers<'_> {
             offset,
             len,
             form,
+            dims,
+            shape,
         };
         self.slots[v.0 as usize] = Some(slot);
         slot

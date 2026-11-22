@@ -133,8 +133,16 @@ fn headers_match_rust() {
         ("DOORBELL_ABORT", DOORBELL_ABORT),
         ("DOORBELL_SENT", DOORBELL_SENT),
     ];
+    let item_kinds = ["INPUT", "OUTPUT", "SCRATCH"];
+    let conventions = ["LLM", "KV", "STATE", "IMAGE"];
     let names = DTYPES.iter().map(|d| d.0).enumerate();
-    for (code, name) in names.chain(STATUS.into_iter().enumerate()) {
+    let forms = FORM_KINDS.iter().map(|f| f.0).enumerate();
+    let all = names
+        .chain(STATUS.into_iter().enumerate())
+        .chain(item_kinds.into_iter().enumerate())
+        .chain(conventions.into_iter().enumerate())
+        .chain(forms);
+    for (code, name) in all {
         assert_eq!(headers.number(name), code, "{name}");
     }
     for (name, value) in numbers {

@@ -210,7 +210,10 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
     let loaded = tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
         .map_err(|e| e.to_string())?;
     let scores = loaded.graph.entries.len() > 1;
-    let recipe = lowering(o, loaded.pins);
+    let mut recipe = lowering(o, loaded.pins);
+    if recipe.config.is_none() {
+        recipe.config = loaded.config;
+    }
     let at = (&recipe, settings);
     let count = loaded.graph.weights.len() as u32;
     let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;

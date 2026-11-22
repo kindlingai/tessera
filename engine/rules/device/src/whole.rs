@@ -1,6 +1,8 @@
 //! A recipe's resident step: one grid per launch, sums inside.
 
-use crate::layout::{BYTES, Item, NONE, Ref};
+use crate::layout::{
+    BYTES, FORM, Form, INPUT, Item, Kept, NONE, OUTPUT, Ref, SCRATCH, dtype_code, form_kind,
+};
 use crate::proxy::Op;
 use crate::resident::{BASE, Error, LanePlan, Plan, Resident, USER, backend};
 use crate::sums::pool;
@@ -13,7 +15,7 @@ use tessera_gpukit::backend::Backend as Gpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats, cached_source};
 use tessera_gpukit::launch::Launch;
 use tessera_lower::{Collective, KernelRef, Source};
-use tessera_run::{Grid, Item as Placed, Marks, marks};
+use tessera_run::{Grid, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, Marks, marks};
 
 /// Ranks may still load when the first launch starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -90,8 +92,112 @@ fn failed(e: Error) -> tessera_run::Error {
     tessera_run::Error::Grid(Box::new(e))
 }
 
-/// The launcher's plan for `kernel` with `items` items.
-fn plan(kernel: &KernelRef, items: usize, ranks: u32, share: u32) -> Result<Plan, Error> {
+/// Synthetic page entries for unpaged kept rows.
+pub(crate) fn synth_pages(kept: &[KeptDesc]) -> Vec<u32> {
+    let Some(first) = kept.first() else {
+        return Vec::new();
+    };
+    if first.pages.is_some() {
+        return Vec::new();
+    }
+    if first.interleaved {
+        let mut out = Vec::with_capacity((first.slots * first.context) as usize);
+        for slot in 0..first.slots {
+            for pos in 0..first.context {
+                out.push(pos * first.slots + slot);
+            }
+        }
+        return out;
+    }
+    (0..first.slots).collect()
+}
+
+/// Packed control-table records for one launch.
+pub(crate) type Records = (Vec<Item>, Vec<Form>, Vec<Kept>);
+
+/// Converts run metadata into `core.h` items, forms and kept rows.
+pub(crate) fn pack_records(
+    items: &[Placed],
+    scratch: Option<(u64, usize)>,
+    kept: &[KeptDesc],
+    pages_ref: Ref,
+) -> Result<Records, Error> {
+    let mut out_items = Vec::with_capacity(items.len() + usize::from(scratch.is_some()));
+    let mut out_forms = Vec::new();
+    for p in items {
+        let kind = match p.kind {
+            ItemKind::Input => INPUT,
+            ItemKind::Output => OUTPUT,
+            ItemKind::Scratch => SCRATCH,
+        };
+        let (elem, form, forms) = match p.form {
+            Some(meta) => {
+                let idx = out_forms.len() as u32;
+                out_forms.push(Form {
+                    codes: Ref::at(USER, p.at),
+                    suh: meta.suh.map_or(Ref::NONE, |at| Ref::at(USER, at)),
+                    svh: meta.svh.map_or(Ref::NONE, |at| Ref::at(USER, at)),
+                    kind: form_kind(meta.name),
+                    rows: meta.rows,
+                    cols: meta.cols,
+                    unused: 0,
+                });
+                (FORM, idx, 1)
+            }
+            None => (dtype_code(p.elem), NONE, 0),
+        };
+        let (dims, shape) = if elem == BYTES || p.dims == 0 {
+            let bytes = u32::try_from(p.bytes)
+                .map_err(|_| Error::Plan(format!("an item of {} bytes", p.bytes)))?;
+            (1, [bytes, 0, 0, 0])
+        } else {
+            (p.dims, p.shape)
+        };
+        out_items.push(Item {
+            at: Ref::at(USER, p.at),
+            kind,
+            elem,
+            dims,
+            shape,
+            share: p.share,
+            form,
+            forms,
+            unused: 0,
+        });
+    }
+    if let Some((at, size)) = scratch {
+        let bytes =
+            u32::try_from(size).map_err(|_| Error::Plan(format!("an item of {size} bytes")))?;
+        out_items.push(Item {
+            at: Ref::at(USER, at),
+            kind: SCRATCH,
+            elem: BYTES,
+            dims: 1,
+            shape: [bytes, 0, 0, 0],
+            share: [0; 4],
+            form: NONE,
+            forms: 0,
+            unused: 0,
+        });
+    }
+    let mut out_kept = Vec::with_capacity(kept.len());
+    for k in kept {
+        out_kept.push(Kept {
+            base: Ref::at(USER, k.base),
+            host: Ref::NONE,
+            pages: k.pages.map_or(pages_ref, |at| Ref::at(USER, at)),
+            len: k.len.map_or(Ref::NONE, |at| Ref::at(USER, at)),
+            pages_per_slot: k.pages_per_slot,
+            page_rows: k.page_rows,
+            row_bytes: k.row_bytes,
+            elem: dtype_code(k.elem),
+        });
+    }
+    Ok((out_items, out_forms, out_kept))
+}
+
+/// The launcher's plan for `kernel` with `layout` counts.
+fn plan(kernel: &KernelRef, layout: GridLayout, ranks: u32, share: u32) -> Result<Plan, Error> {
     let resident = kernel
         .resident()
         .ok_or_else(|| Error::Plan(format!("{} is not resident", kernel.name())))?;
@@ -106,7 +212,10 @@ fn plan(kernel: &KernelRef, items: usize, ranks: u32, share: u32) -> Result<Plan
     Ok(Plan {
         pools: vec![pool(ranks)],
         lanes: resident.lanes.iter().map(lane).collect(),
-        items: vec![blank(); items],
+        items: vec![blank(); layout.items],
+        forms: vec![blank_form(); layout.forms],
+        kept: vec![blank_kept(); layout.kept],
+        pages: vec![0; layout.pages],
         // Base zero, so offsets are device addresses.
         arenas: vec![0],
         threads: resident.threads,
@@ -155,7 +264,7 @@ where
         Ok(true)
     }
 
-    fn open(&mut self, kernel: &KernelRef, items: usize) -> Result<(), Error> {
+    fn open(&mut self, kernel: &KernelRef, layout: GridLayout) -> Result<(), Error> {
         self.scratch(kernel)?;
         let Source::Fixed {
             cuda, hip, entry, ..
@@ -173,7 +282,14 @@ where
         // Counts and scratch change with sizes, not the grid.
         let threads = kernel.resident().map(|r| (r.threads, r.shared, r.lanes));
         let rev = self.revision;
-        let key = format!("{}/{threads:?}/{items}/{rev}/{want_marks}", kernel.name());
+        let key = format!(
+            "{}/{threads:?}/{}/{}/{}/{}/{rev}/{want_marks}",
+            kernel.name(),
+            layout.items,
+            layout.forms,
+            layout.kept,
+            layout.pages,
+        );
         if matches!(&self.held, Held::Open { key: k, .. } if *k == key) {
             return Ok(());
         }
@@ -183,7 +299,11 @@ where
         };
         // Ordinals go on, so the link's old flags never match.
         let (link, next) = self.link()?;
-        let plan = plan(kernel, items + 1, link.ranks(), self.share)?;
+        let sized = GridLayout {
+            items: layout.items + 1,
+            ..layout
+        };
+        let plan = plan(kernel, sized, link.ranks(), self.share)?;
         let resident = Resident::compiled(&self.ctx, compiled, entry, link, &plan, next)?;
         if self.profiling || replaced {
             let summary = format_summary(
@@ -212,24 +332,20 @@ where
         &mut self,
         kernel: &KernelRef,
         items: &[Placed],
+        kept: &[KeptDesc],
         values: &[u32],
     ) -> Result<(), Error> {
+        let synth = synth_pages(kept);
+        let forms = items.iter().filter(|p| p.form.is_some()).count();
+        let layout = GridLayout {
+            items: items.len(),
+            forms,
+            kept: kept.len(),
+            pages: synth.len(),
+        };
         // Each step runs in the grid built for its kernel.
-        self.open(kernel, items.len())?;
-        let mut all = Vec::with_capacity(items.len() + 1);
-        let scratch = self.scratch.as_ref().map(|s| Placed {
-            at: s.device_ptr(),
-            bytes: s.size(),
-        });
-        for p in items.iter().chain(&scratch) {
-            let bytes = u32::try_from(p.bytes)
-                .map_err(|_| Error::Plan(format!("an item of {} bytes", p.bytes)))?;
-            all.push(Item {
-                at: Ref::at(USER, p.at),
-                shape: [bytes, 0, 0, 0],
-                ..blank()
-            });
-        }
+        self.open(kernel, layout)?;
+        let scratch = self.scratch.as_ref().map(|s| (s.device_ptr(), s.size()));
         let ledger = self.ledger.as_ref().map(DeviceBuffer::device_ptr);
         let Held::Open {
             entry,
@@ -240,10 +356,12 @@ where
         else {
             return Err(Error::Plan("no grid is open".into()));
         };
+        let (all_items, all_forms, all_kept) =
+            pack_records(items, scratch, kept, resident.pages_ref())?;
         if *marked && let Some(ptr) = ledger {
             self.ctx.zero(ptr, marks::COUNTS)?;
         }
-        resident.refill(&all)?;
+        resident.refill(&all_items, &all_forms, &all_kept, &synth)?;
         resident.launch(values, TIMEOUT)?;
         if *marked && let Some(ptr) = ledger {
             let mut found = Marks::default();
@@ -258,7 +376,7 @@ where
 fn blank() -> Item {
     Item {
         at: Ref::NONE,
-        kind: 0,
+        kind: INPUT,
         elem: BYTES,
         dims: 1,
         shape: [0; 4],
@@ -269,22 +387,48 @@ fn blank() -> Item {
     }
 }
 
+fn blank_form() -> Form {
+    Form {
+        codes: Ref::NONE,
+        suh: Ref::NONE,
+        svh: Ref::NONE,
+        kind: 0,
+        rows: 0,
+        cols: 0,
+        unused: 0,
+    }
+}
+
+fn blank_kept() -> Kept {
+    Kept {
+        base: Ref::NONE,
+        host: Ref::NONE,
+        pages: Ref::NONE,
+        len: Ref::NONE,
+        pages_per_slot: 0,
+        page_rows: 0,
+        row_bytes: 0,
+        elem: 0,
+    }
+}
+
 impl<D, L> Grid for Whole<D, L>
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
-    fn open(&mut self, kernel: &KernelRef, items: usize) -> Result<(), tessera_run::Error> {
-        Whole::open(self, kernel, items).map_err(failed)
+    fn open(&mut self, kernel: &KernelRef, layout: GridLayout) -> Result<(), tessera_run::Error> {
+        Whole::open(self, kernel, layout).map_err(failed)
     }
 
     fn launch(
         &mut self,
         kernel: &KernelRef,
         items: &[Placed],
+        kept: &[KeptDesc],
         values: &[u32],
     ) -> Result<(), tessera_run::Error> {
-        Whole::launch(self, kernel, items, values).map_err(failed)
+        Whole::launch(self, kernel, items, kept, values).map_err(failed)
     }
 
     fn profiling(&mut self, on: bool) {

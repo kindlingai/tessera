@@ -44,6 +44,7 @@ fn graph(model: &str) -> Result<Graph, Box<dyn Error>> {
 fn choices(dir: &Path, settings: &Settings) -> Result<Recipe, Box<dyn Error>> {
     let recipe = tessera_recipe::Recipe::read(dir)?;
     let bytes = recipe.module_bytes(Some(Path::new("target/recipes")))?;
+    let overrides = recipe.overrides();
     let mut lower = recipe.lower.unwrap_or_default();
     let trace = Trace {
         dump: settings.dump_sites.clone(),
@@ -51,6 +52,9 @@ fn choices(dir: &Path, settings: &Settings) -> Result<Recipe, Box<dyn Error>> {
     };
     let module = Module::open_with(&bytes.ok_or("the recipe has no module")?, trace)?;
     lower.rules.extend(module.rules);
+    if let Some(cfg) = overrides.get("config.json") {
+        lower.config = Some(cfg.to_string());
+    }
     Ok(lower)
 }
 

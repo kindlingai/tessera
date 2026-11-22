@@ -20,7 +20,7 @@ mod rank;
 mod run;
 pub mod testing;
 
-pub use grid::{Grid, Item};
+pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
 pub use held::Held;
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
@@ -43,7 +43,7 @@ pub enum Error {
     #[error("{0} is hand-written")]
     Handwritten(&'static str),
     #[error("{arg:?} as {param:?} on the host")]
-    HostArg { arg: Arg, param: Param },
+    HostArg { arg: Box<Arg>, param: Box<Param> },
     #[error("jit: {0}")]
     Jit(&'static str),
     #[error("plans out of rank order")]

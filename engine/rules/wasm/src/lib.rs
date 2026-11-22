@@ -155,9 +155,17 @@ impl Asking {
 impl Propose for Asking {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
         let (site, reads) = site::find(tree, at, self.kind)?;
+        let config = match tree.config.as_deref().map(serde_json::from_str).transpose() {
+            Ok(config) => config,
+            Err(e) => {
+                self.warn(&e.to_string());
+                return None;
+            }
+        };
         let input = match serde_json::to_vec(&Ask {
             rule: self.rule.into(),
             site,
+            config,
         }) {
             Ok(input) => input,
             Err(e) => {

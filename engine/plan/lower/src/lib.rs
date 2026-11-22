@@ -29,7 +29,7 @@ pub use error::{Size, Unsupported};
 pub use extent::Extent;
 pub use form::{Pins, Site, Weight};
 pub use kernel::{Collective, Kernel, KernelRef, Needs, Resident, UNPROVEN};
-pub use plan::{Loaded, Output, Plan, Share, Slot, Step};
+pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{Compute, Launching, Recipe};
 pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};

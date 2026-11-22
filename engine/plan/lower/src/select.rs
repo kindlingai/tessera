@@ -10,7 +10,7 @@ use crate::cost::Device;
 use crate::error::Uncovered;
 use crate::form::{self, Load};
 use crate::kernel::KernelRef;
-use crate::plan::Share;
+use crate::plan::{KeptInfo, Share, pack_shape};
 use crate::rule::{Read, Rule, linked};
 use crate::tree::{T, Term, Tree, Wants};
 use crate::{Error, Unsupported};
@@ -31,6 +31,7 @@ pub enum Home {
     Kept {
         index: u32,
         room: usize,
+        info: KeptInfo,
     },
     /// Written by an op. Its buffer may be reused.
     Temp,
@@ -46,6 +47,8 @@ pub struct Value {
     pub form: &'static dyn Load,
     /// A split weight's part on this rank.
     pub share: Option<Share>,
+    pub dims: u8,
+    pub shape: [u32; 4],
 }
 
 /// One launch, before it has buffers.
@@ -127,6 +130,7 @@ pub(crate) fn select_upto(
         rank,
     )?
     .with_compute(device.compute);
+    tree.config = device.config.clone();
     let whole: Vec<&Rule> = rules
         .iter()
         .copied()
@@ -179,12 +183,13 @@ pub(crate) fn select_upto(
         }
     }
     let mut e = Emit::default();
-    for (port, &(len, dtype)) in tree.ports.iter().enumerate() {
+    for (port, (len, shape, dtype)) in tree.ports.iter().enumerate() {
         let val = e.value(
-            len,
+            *len,
             Home::Input(port as u32),
             EDGE,
-            tessera_codegen::form::of(dtype),
+            tessera_codegen::form::of(*dtype),
+            pack_shape(shape, *len),
         );
         e.out.inputs.push(val);
     }
@@ -196,7 +201,8 @@ pub(crate) fn select_upto(
         let made = match (&n.term, own[t.0 as usize]) {
             (Term::Leaf(Home::Input(port)), _) => e.out.inputs[*port as usize],
             (Term::Leaf(home), _) => {
-                let val = e.value(tree.elements(t), *home, EDGE, n.form);
+                let len = tree.elements(t);
+                let val = e.value(len, *home, EDGE, n.form, pack_shape(&n.shape, len));
                 e.out.values[val.0 as usize].share = tree.share(t);
                 val
             }
@@ -229,13 +235,16 @@ pub(crate) fn select_upto(
                         });
                     }
                     // The last launch writes the node's own type.
-                    let form = match d.writes {
-                        Some(w) => tree.node(w).form,
-                        None if i == last => n.form,
-                        None => form::F32_FORM,
+                    let (form, shape) = match d.writes {
+                        Some(w) => {
+                            let node = tree.node(w);
+                            (node.form, pack_shape(&node.shape, d.len))
+                        }
+                        None if i == last => (n.form, pack_shape(&n.shape, d.len)),
+                        None => (form::F32_FORM, pack_shape(&[d.len], d.len)),
                     };
                     let writes = d.writes;
-                    made.push(e.op(d, choice.rule, reads, &covers, zone, form));
+                    made.push(e.op(d, choice.rule, reads, &covers, zone, form, shape));
                     if let Some(w) = writes {
                         written.push((w, made[i]));
                     }

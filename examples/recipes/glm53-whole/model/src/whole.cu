@@ -1,6 +1,7 @@
 // GLM-5.3's whole step in one persistent grid, sums inside.
 #include <tessera/1/all_reduce>
 #include <tessera/1/grid>
+#include <tessera/1/kept>
 
 using namespace tessera;
 
@@ -23,7 +24,7 @@ enum field : u32 {
     FIELD_END
 };
 
-// Form classes, read from each item's bytes.
+// Form classes, read from `core.h` item and form metadata.
 enum klass : u32 { K_F32, K_BF16, K_INT4, K_MXFP8, K_TRELLIS, K_TURNED };
 
 // Values, in the module's order.
@@ -34,11 +35,8 @@ struct sizes {
     u32 experts, held_first, held, topk;
     // Per layer: whether attention and the MLP split.
     u32 attn_split[3], mlp_split[3];
-    // Per field: 1 where its trellis codebook is mul1.
-    u32 books[2];
-    u32 width, layout, page;
+    u32 width;
     float eps, theta, route, scale;
-    u32 kept;
 };
 
 static __device__ sizes read(const table* t) {
@@ -56,77 +54,23 @@ static __device__ bool indexes(const sizes& s, u32 l) {
     return l < s.dense || (l + 1 - s.dense) % s.every == 0;
 }
 
-static __device__ bool codes_field(u32 f) {
-    return f == E_GATE || f == E_UP || f == E_DOWN;
+// Whether `item` is a rotated packed form.
+static __device__ bool is_turned(const table* t, u32 item) {
+    const tessera::item* it = item_at(t, item);
+    return it->elem == FORM && form_of(t, item, 0)->suh.arena != NONE;
 }
 
-// A field's rows, columns and matrices at sizes `s`.
-struct shape {
-    u32 out, in, sets;
-};
-
-static __device__ shape shape_of(const sizes& s, u32 f) {
-    u32 q = s.heads * (s.nope + s.rope), kv = s.heads * (s.nope + s.hd);
-    switch (f) {
-    case EMBED: case LM_HEAD: return {s.vocab, s.hidden, 1};
-    case NORM: case A_NORM: case MLP_NORM: case SIGNS_IN: case SIGNS_OUT: return {1, s.hidden, 1};
-    case Q_A: return {s.q_latent, s.hidden, 1};
-    case Q_NORM: return {1, s.q_latent, 1};
-    case Q_B: return {q, s.q_latent, 1};
-    case KV_A: return {s.latent + s.rope, s.hidden, 1};
-    case KV_NORM: return {1, s.latent, 1};
-    case KV_B: return {kv, s.latent, 1};
-    case O: return {s.hidden, s.heads * s.hd, 1};
-    case WQ: return {s.ih * s.idim, s.q_latent, 1};
-    case WK: return {s.idim, s.hidden, 1};
-    case K_NORM: case K_BIAS: return {1, s.idim, 1};
-    case I_WEIGHTS: return {s.ih, s.hidden, 1};
-    case D_GATE: case D_UP: return {s.dense_ffn, s.hidden, 1};
-    case D_DOWN: return {s.hidden, s.dense_ffn, 1};
-    case ROUTER: return {s.experts, s.hidden, 1};
-    case R_BIAS: return {1, s.experts, 1};
-    case E_GATE: case E_UP: return {s.effn, s.hidden, s.held};
-    case GATE_SU: case UP_SU: case DOWN_SV: return {s.experts, s.hidden, 1};
-    case GATE_SV: case UP_SV: case DOWN_SU: return {s.experts, s.effn, 1};
-    case E_DOWN: return {s.hidden, s.effn, s.held};
-    case S_GATE: case S_UP: return {s.ffn, s.hidden, 1};
-    default: return {s.hidden, s.ffn, 1};
-    }
-}
-
-static __device__ u64 bytes_of(const table* t, u32 item) {
-    return item_at(t, item)->shape[0];
-}
-
-// The form class of `n` elements in `bytes`.
-static __device__ u32 sniff(u64 bytes, u64 n) {
-    bool blocks = n % 32 == 0;
-    if (bytes == 4 * n) return K_F32;
-    if (bytes == 2 * n) return K_BF16;
-    if (blocks && bytes == n / 32 * 18) return K_INT4;
-    if (blocks && bytes == n / 32 * 33) return K_MXFP8;
-    return K_TRELLIS;
-}
-
-// Field `f`'s class at `item`. Trellis outside expert codes turns.
-static __device__ u32 klass_at(const table* t, const sizes& s, u32 item, u32 f) {
-    shape d = shape_of(s, f);
-    u32 k = sniff(bytes_of(t, item), u64(d.out) * d.in * d.sets);
-    return k == K_TRELLIS && !codes_field(f) ? K_TURNED : k;
-}
-
-// A layer's first item per field, and its kept rows.
+// A layer's items, and its first kept table.
 struct place {
     u32 item[FIELD_END];
     u32 next, kept, layer;
 };
 
 // Places fields `from..to` at `*at`. Rotated codes take three.
-static __device__ void lay_fields(const table* t, const sizes& s, place& pl, u32 from, u32 to,
-                                  u32* at) {
+static __device__ void lay_fields(const table* t, place& pl, u32 from, u32 to, u32* at) {
     for (u32 f = from; f < to; f++) {
         pl.item[f] = *at;
-        *at += klass_at(t, s, *at, f) == K_TURNED ? 3 : 1;
+        *at += is_turned(t, *at) ? 3 : 1;
     }
 }
 
@@ -136,12 +80,12 @@ static __device__ place walk(const table* t, const sizes& s, u32 l, u32 first, u
     pl.kept = kept;
     pl.layer = l;
     u32 at = first;
-    lay_fields(t, s, pl, A_NORM, WQ, &at);
-    if (indexes(s, l)) lay_fields(t, s, pl, WQ, D_GATE, &at);
+    lay_fields(t, pl, A_NORM, WQ, &at);
+    if (indexes(s, l)) lay_fields(t, pl, WQ, D_GATE, &at);
     if (l < s.dense) {
-        lay_fields(t, s, pl, D_GATE, ROUTER, &at);
+        lay_fields(t, pl, D_GATE, ROUTER, &at);
     } else {
-        lay_fields(t, s, pl, ROUTER, FIELD_END, &at);
+        lay_fields(t, pl, ROUTER, FIELD_END, &at);
     }
     pl.next = at;
     return pl;
@@ -197,18 +141,36 @@ static __device__ u32 word(const u8* p, u32 at) {
     return *reinterpret_cast<const u32*>(p + at);
 }
 
-// Field `f` at `item`, in the form its bytes show.
-static __device__ mat weight(const table* t, const sizes& s, u32 item, u32 f) {
-    shape d = shape_of(s, f);
-    u32 book = bit(s.books, f);
-    mat w = {at<const u8>(t, item), klass_at(t, s, item, f), d.in, d.out, 0, book, nullptr, nullptr};
-    if (w.klass < K_TRELLIS) return w;
+// Weight at `item`, decoded from `core.h` item and form metadata.
+static __device__ mat weight(const table* t, u32 item) {
+    const tessera::item* it = item_at(t, item);
+    u32 out = it->dims >= 2 ? it->shape[it->dims - 2] : 1;
+    u32 in = it->dims >= 1 ? it->shape[it->dims - 1] : 0;
+    mat w = {at<const u8>(t, item), K_F32, in, out, 0, 0, nullptr, nullptr};
+    if (it->elem == F32) return w;
+    if (it->elem == BF16) {
+        w.klass = K_BF16;
+        return w;
+    }
+    const tessera::form* fm = form_of(t, item, 0);
+    if (fm->kind == FORM_INT4_G32) {
+        w.klass = K_INT4;
+        return w;
+    }
+    if (fm->kind == FORM_MXFP8) {
+        w.klass = K_MXFP8;
+        return w;
+    }
+    bool turned = fm->suh.arena != NONE;
+    w.klass = turned ? K_TURNED : K_TRELLIS;
     w.in = word(w.p, 0);
     w.out = word(w.p, 4);
-    w.k = u32((bytes_of(t, item) - HEAD) * 8 / (u64(w.in) * w.out * d.sets));
-    if (w.klass == K_TURNED) {
-        w.suh = at<const float>(t, item + 1);
-        w.svh = at<const float>(t, item + 2);
+    bool mul1 = fm->kind >= FORM_TRELLIS_K2_MUL1;
+    w.k = (mul1 ? fm->kind - FORM_TRELLIS_K2_MUL1 : fm->kind - FORM_TRELLIS_K2) + 2;
+    w.book = mul1 ? 1 : 0;
+    if (turned) {
+        w.suh = get<const float>(t, fm->suh);
+        w.svh = get<const float>(t, fm->svh);
     }
     return w;
 }
@@ -392,15 +354,9 @@ static __device__ void rms(const ctx& c, const float* x, u32 xs, const mat& w, f
     }
 }
 
-// The kept row of `pos` in `slot`, by the layout.
-static __device__ u64 kept_row(const ctx& c, u32 slot, u32 pos) {
-    const sizes& s = c.s;
-    if (s.layout == 0) return u64(slot) * s.kept + pos;
-    if (s.layout == 1) return u64(pos) * s.kept + slot;
-    const u32* pages = at<const u32>(c.t, c.t->items_len - 2);
-    u32 shift = __ffs(s.page) - 1;
-    u64 page = pages[slot * s.kept + (pos >> shift)];
-    return page << shift | (pos & (s.page - 1));
+// Kept row `(slot, pos)` via the KV convention.
+static __device__ float* kv_row(const ctx& c, u32 index, u32 slot, u32 pos) {
+    return reinterpret_cast<float*>(kept_row(c.t, kept_table(c.t, index), slot, pos));
 }
 
 // Pair `j` of a row `width` wide, turned to `pos`.
@@ -438,7 +394,7 @@ static __device__ bool add(const ctx& c, bool ranks) {
 }
 
 static __device__ mat field_mat(const ctx& c, const place& pl, u32 f) {
-    return weight(c.t, c.s, pl.item[f], f);
+    return weight(c.t, pl.item[f]);
 }
 
 // Index keys: centred, normed, biased, then kept.
@@ -454,12 +410,11 @@ static __device__ void index_scores(const ctx& c, const place& pl) {
     line l = threads();
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const float* kept = at<const float>(c.t, pl.kept + 2);
     for (u32 u = l.at; u < s.rows * s.context; u += l.step) {
         u32 r = u / s.context, j = u % s.context;
         float score = __int_as_float(0xff800000u);
         if (j <= pos[r]) {
-            const float* k = kept + kept_row(c, slot[r], j) * s.idim;
+            const float* k = kv_row(c, pl.kept + 2, slot[r], j);
             score = 0.0f;
             for (u32 h = 0; h < s.ih; h++) {
                 const float* q = c.p.a + (u64(r) * s.ih + h) * s.idim;
@@ -510,10 +465,9 @@ static __device__ bool pick_keys(const ctx& c, const place& pl) {
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
     mat bias = field_mat(c, pl, K_BIAS);
-    float* kept = at<float>(c.t, pl.kept + 2);
     for (u32 u = l.at; u < r * s.idim; u += l.step) {
         u32 row = u / s.idim, d = u % s.idim;
-        kept[kept_row(c, slot[row], pos[row]) * s.idim + d] = c.p.b[u] + elem(bias, 0, 0, d);
+        kv_row(c, pl.kept + 2, slot[row], pos[row])[d] = c.p.b[u] + elem(bias, 0, 0, d);
     }
     if (!sync(c.t)) return false;
     PHASE(index_scores(c, pl));
@@ -528,8 +482,6 @@ static __device__ void turn_keys(const ctx& c, const place& pl) {
     line l = threads();
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    float* latent = at<float>(c.t, pl.kept);
-    float* keys = at<float>(c.t, pl.kept + 1);
     u32 units = s.heads + 1, q = s.nope + s.rope;
     for (u32 u = l.at; u < s.rows * units; u += l.step) {
         u32 r = u / units, h = u % units;
@@ -539,9 +491,10 @@ static __device__ void turn_keys(const ctx& c, const place& pl) {
         }
         float* kv = c.p.kv + u64(r) * (s.latent + s.rope);
         rope(kv + s.latent, s.rope, pos[r], s.theta);
-        u64 row = kept_row(c, slot[r], pos[r]);
-        for (u32 d = 0; d < s.latent; d++) latent[row * s.latent + d] = kv[d];
-        for (u32 d = 0; d < s.rope; d++) keys[row * s.rope + d] = kv[s.latent + d];
+        float* latent = kv_row(c, pl.kept, slot[r], pos[r]);
+        float* keys = kv_row(c, pl.kept + 1, slot[r], pos[r]);
+        for (u32 d = 0; d < s.latent; d++) latent[d] = kv[d];
+        for (u32 d = 0; d < s.rope; d++) keys[d] = kv[s.latent + d];
     }
 }
 
@@ -569,8 +522,6 @@ static __device__ void attend(const ctx& c, const place& pl) {
     line l = threads();
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const float* latent = at<const float>(c.t, pl.kept);
-    const float* keys = at<const float>(c.t, pl.kept + 1);
     u32 width = s.latent + s.rope;
     for (u32 u = l.at; u < s.rows * s.heads; u += l.step) {
         u32 r = u / s.heads;
@@ -581,9 +532,8 @@ static __device__ void attend(const ctx& c, const place& pl) {
         for (u32 n = 0; n < s.keep; n++) {
             u32 j = c.p.picked[u64(r) * s.keep + n];
             if (j >= s.context || j > pos[r]) continue;
-            u64 row = kept_row(c, slot[r], j);
-            const float* kl = latent + row * s.latent;
-            const float* kr = keys + row * s.rope;
+            const float* kl = kv_row(c, pl.kept, slot[r], j);
+            const float* kr = kv_row(c, pl.kept + 1, slot[r], j);
             float score = 0.0f;
             for (u32 d = 0; d < s.latent; d++) score += q[d] * kl[d];
             for (u32 d = 0; d < s.rope; d++) score += q[s.latent + d] * kr[d];
@@ -797,22 +747,22 @@ extern "C" __global__ void glm53_whole(const table* t) {
     spans_t p = lay_out(t, s);
     session se = begin(t);
     ctx c = {t, s, p, se};
-    u32 norm = IDS + (klass_at(t, s, IDS, EMBED) == K_TURNED ? 3 : 1);
-    u32 head = norm + (klass_at(t, s, norm, NORM) == K_TURNED ? 3 : 1);
-    u32 first = head + (klass_at(t, s, head, LM_HEAD) == K_TURNED ? 3 : 1);
+    u32 norm = IDS + (is_turned(t, IDS) ? 3 : 1);
+    u32 head = norm + (is_turned(t, norm) ? 3 : 1);
+    u32 first = head + (is_turned(t, head) ? 3 : 1);
     u32 reads = first, kept = 0;
     for (u32 l = 0; l < s.layers; l++) {
         reads = walk(t, for_layer(s, l), l, reads, kept).next;
         kept += indexes(s, l) ? 3 : 2;
     }
     const u32* tokens = at<const u32>(t, 0);
-    mat embed = weight(t, s, IDS, EMBED);
+    mat embed = weight(t, IDS);
     line l = threads();
     for (u32 i = l.at; i < s.rows * s.hidden; i += l.step) {
         p.x[i] = elem(embed, 0, tokens[i / s.hidden], i % s.hidden);
     }
     if (!sync(t)) return;
-    for (u32 n = 0, from = first, rows = reads; n < s.layers; n++) {
+    for (u32 n = 0, from = first, rows = 0; n < s.layers; n++) {
         sizes ls = for_layer(s, n);
         ctx lc = {t, ls, p, se};
         place pl = walk(t, ls, n, from, rows);
@@ -820,10 +770,10 @@ extern "C" __global__ void glm53_whole(const table* t) {
         from = pl.next;
         rows += indexes(s, n) ? 3 : 2;
     }
-    rms(c, p.x, s.hidden, weight(t, s, norm, NORM), p.h, s.hidden, s.picks, s.hidden,
+    rms(c, p.x, s.hidden, weight(t, norm), p.h, s.hidden, s.picks, s.hidden,
         at<const u32>(t, 3), false);
     if (!sync(t)) return;
-    times(c, weight(t, s, head, LM_HEAD), p.h, s.hidden, at<float>(t, reads + kept), s.vocab,
+    times(c, weight(t, head), p.h, s.hidden, at<float>(t, reads + kept), s.vocab,
           s.picks, s.vocab);
     end(se);
 }

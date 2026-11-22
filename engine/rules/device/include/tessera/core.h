@@ -56,6 +56,26 @@ enum item_kind : u32 {
     SCRATCH = 2,
 };
 
+enum form_kind : u32 {
+    FORM_UNKNOWN = 0,
+    FORM_Q8_0 = 1,
+    FORM_Q4_0 = 2,
+    FORM_NVFP4 = 3,
+    FORM_MXFP8 = 4,
+    FORM_MXFP4 = 5,
+    FORM_INT4_G32 = 6,
+    FORM_INT4_G128 = 7,
+    FORM_TRELLIS_K2 = 8,
+    FORM_TRELLIS_K3 = 9,
+    FORM_TRELLIS_K4 = 10,
+    FORM_TRELLIS_K2_MUL1 = 11,
+    FORM_TRELLIS_K3_MUL1 = 12,
+    FORM_TRELLIS_K4_MUL1 = 13,
+    FORM_TRELLIS_K2_PMCGX = 14,
+    FORM_TRELLIS_K3_PMCGX = 15,
+    FORM_TRELLIS_K4_PMCGX = 16,
+};
+
 // One item the module declared, in its order.
 struct item {
     ref at;

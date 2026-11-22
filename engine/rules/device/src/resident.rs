@@ -1,9 +1,9 @@
 //! One persistent grid per rank, with its proxy beside it.
 
 use crate::layout::{
-    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DTYPES, Fault, Item, Lane,
-    Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, PAGE, Pool, PoolSet, Ref, SIZES, STATUS,
-    Table, VALUES,
+    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DTYPES, Fault, Form, Item, KV, Kept,
+    KvTables, Lane, Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, NONE, PAGE, Pool, PoolSet,
+    Ref, SIZES, STATUS, Table, VALUES,
 };
 use crate::proxy::page::Page;
 use crate::proxy::running::Running;
@@ -60,6 +60,12 @@ pub struct Plan {
     pub lanes: Vec<LanePlan>,
     /// Items whose refs name arenas from `USER` on.
     pub items: Vec<Item>,
+    /// Packed weight forms, indexed by `Item::form`.
+    pub forms: Vec<Form>,
+    /// Kept-row tables for the KV convention.
+    pub kept: Vec<Kept>,
+    /// Synthetic page entries kept in the control arena.
+    pub pages: Vec<u32>,
     /// Device addresses of those arenas, in order.
     pub arenas: Vec<u64>,
     pub threads: u32,
@@ -152,11 +158,117 @@ fn zeroed<T>() -> T {
 }
 
 /// Where each record sits in the control arena.
-struct Places {
-    launch: u64,
-    status: u64,
-    items: u64,
-    counters: u64,
+pub(crate) struct Places {
+    pub launch: u64,
+    pub status: u64,
+    pub items: u64,
+    pub forms: u64,
+    pub kept: u64,
+    pub pages: u64,
+    pub counters: u64,
+}
+
+/// Builds the host control arena bytes and record offsets.
+pub(crate) fn build_control(
+    plan: &Plan,
+    pool_places: &[Place],
+    [rank, ranks, base]: [u64; 3],
+    arenas: [u64; ARENAS],
+) -> (Vec<u8>, Places) {
+    let (rank, ranks) = (rank as u32, ranks as u32);
+    let mut block = Block::default();
+    let table_at = block.put(&[zeroed::<Table>()]);
+    let launch = block.put(&[zeroed::<Record>()]);
+    let items = block.put(&plan.items);
+    let (forms_at, forms_ref) = if plan.forms.is_empty() {
+        (0, Ref::NONE)
+    } else {
+        let at = block.put(&plan.forms);
+        (at, Ref::at(CONTROL, at))
+    };
+    let pages_at = if plan.pages.is_empty() {
+        0
+    } else {
+        block.put(&plan.pages)
+    };
+    let mut conventions = [ConventionRef {
+        at: Ref::NONE,
+        version: 0,
+        bytes: 0,
+    }; 16];
+    let kept_at = if plan.kept.is_empty() {
+        0
+    } else {
+        let mut tables = plan.kept.clone();
+        if !plan.pages.is_empty() {
+            for k in &mut tables {
+                if k.pages.arena == NONE {
+                    k.pages = Ref::at(CONTROL, pages_at);
+                }
+            }
+        }
+        let at = block.put(&tables);
+        let kv = KvTables {
+            count: tables.len() as u32,
+            unused: 0,
+            tables: Ref::at(CONTROL, at),
+        };
+        let kv_at = block.put(&[kv]);
+        conventions[KV as usize] = ConventionRef {
+            at: Ref::at(CONTROL, kv_at),
+            version: crate::EDITION,
+            bytes: size_of::<KvTables>() as u32,
+        };
+        at
+    };
+    let lanes: Vec<Lane> = plan.lanes.iter().map(|l| lane(plan, l, rank)).collect();
+    let lanes_at = block.put(&lanes);
+    let mut set: PoolSet = zeroed();
+    set.count = plan.pools.len() as u32;
+    for (p, (pool, &place)) in plan.pools.iter().zip(pool_places).enumerate() {
+        set.pools[p] = pool_record(pool, p, place);
+    }
+    let mut counters: Counters = zeroed();
+    counters.next = [base; MAX_POOLS];
+    // The first bump must differ from the page's zero.
+    counters.writes = 1;
+    let counted = block.put(&[counters]);
+    set.state = Ref::at(CONTROL, counted);
+    let pools = block.put(&[set]);
+    let barrier = block.put(&[zeroed::<Barrier>()]);
+    let status = block.put(&[zeroed::<Fault>()]);
+    let table = Table {
+        edition: crate::EDITION,
+        rank,
+        ranks,
+        items_len: plan.items.len() as u32,
+        forms_len: plan.forms.len() as u32,
+        lanes_len: lanes.len() as u32,
+        values_len: VALUES as u32,
+        unused: 0,
+        arenas,
+        now: Ref::at(CONTROL, launch),
+        items: Ref::at(CONTROL, items),
+        forms: forms_ref,
+        conventions,
+        lanes: Ref::at(CONTROL, lanes_at),
+        pools: Ref::at(CONTROL, pools),
+        doorbell: Ref::at(DOORBELL, 0),
+        barrier: Ref::at(CONTROL, barrier),
+        status: Ref::at(CONTROL, status),
+        marks: Ref::NONE,
+    };
+    block.0[table_at as usize..][..size_of::<Table>()].copy_from_slice(bytes(&[table]));
+    let places = Places {
+        launch,
+        status,
+        items,
+        forms: forms_at,
+        kept: kept_at,
+        pages: pages_at,
+        counters: counted,
+    };
+    (block.0, places)
 }
 
 pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
@@ -206,8 +318,11 @@ pub struct Resident<D: Device, L> {
     clock: (u64, Instant),
     seq: u64,
     broken: bool,
-    /// The table's item count.
+    /// The table's item, form, kept and synthetic page counts.
     items: usize,
+    forms: usize,
+    kept: usize,
+    pages: usize,
     /// A grid started apart, until `join`.
     apart: Option<Box<dyn Apart>>,
 }
@@ -257,6 +372,9 @@ where
                 launch: 0,
                 status: 0,
                 items: 0,
+                forms: 0,
+                kept: 0,
+                pages: 0,
                 counters: 0,
             },
             page,
@@ -271,6 +389,9 @@ where
             seq: 0,
             broken: false,
             items: 0,
+            forms: 0,
+            kept: 0,
+            pages: 0,
             apart: None,
         };
         let mut arenas = [0u64; ARENAS];
@@ -342,71 +463,33 @@ where
         &mut self,
         wired: &Wired<L>,
         plan: &Plan,
-        [rank, ranks, base]: [u64; 3],
+        ids: [u64; 3],
         arenas: [u64; ARENAS],
     ) -> Result<(), Error> {
-        let (rank, ranks) = (rank as u32, ranks as u32);
-        let mut block = Block::default();
-        let table_at = block.put(&[zeroed::<Table>()]);
-        let launch = block.put(&[zeroed::<Record>()]);
-        let items = block.put(&plan.items);
-        let lanes: Vec<Lane> = plan.lanes.iter().map(|l| lane(plan, l, rank)).collect();
-        let lanes_at = block.put(&lanes);
-        let mut set: PoolSet = zeroed();
-        set.count = plan.pools.len() as u32;
-        for (p, pool) in plan.pools.iter().enumerate() {
-            let place = wired.place(p).expect("a place per pool");
-            set.pools[p] = pool_record(pool, p, place);
+        let mut pool_places = Vec::with_capacity(plan.pools.len());
+        for p in 0..plan.pools.len() {
+            pool_places.push(wired.place(p).expect("a place per pool"));
         }
-        let mut counters: Counters = zeroed();
-        counters.next = [base; MAX_POOLS];
-        // The first bump must differ from the page's zero.
-        counters.writes = 1;
-        let counted = block.put(&[counters]);
-        set.state = Ref::at(CONTROL, counted);
-        let pools = block.put(&[set]);
-        let barrier = block.put(&[zeroed::<Barrier>()]);
-        let status = block.put(&[zeroed::<Fault>()]);
-        let none = ConventionRef {
-            at: Ref::NONE,
-            version: 0,
-            bytes: 0,
-        };
-        let table = Table {
-            edition: crate::EDITION,
-            rank,
-            ranks,
-            items_len: plan.items.len() as u32,
-            forms_len: 0,
-            lanes_len: lanes.len() as u32,
-            values_len: VALUES as u32,
-            unused: 0,
-            arenas,
-            now: Ref::at(CONTROL, launch),
-            items: Ref::at(CONTROL, items),
-            forms: Ref::NONE,
-            conventions: [none; 16],
-            lanes: Ref::at(CONTROL, lanes_at),
-            pools: Ref::at(CONTROL, pools),
-            doorbell: Ref::at(DOORBELL, 0),
-            barrier: Ref::at(CONTROL, barrier),
-            status: Ref::at(CONTROL, status),
-            marks: Ref::NONE,
-        };
-        let control = DeviceBuffer::alloc(&self.ctx, block.0.len())?;
-        let mut table = table;
-        table.arenas[CONTROL as usize] = control.device_ptr();
-        block.0[table_at as usize..][..size_of::<Table>()].copy_from_slice(bytes(&[table]));
-        control.write_bytes(&block.0)?;
+        let (mut raw, places) = build_control(plan, &pool_places, ids, arenas);
+        let control = DeviceBuffer::alloc(&self.ctx, raw.len())?;
+        let at = std::mem::offset_of!(Table, arenas) + CONTROL as usize * 8;
+        raw[at..at + 8].copy_from_slice(&control.device_ptr().to_ne_bytes());
+        control.write_bytes(&raw)?;
         self.control = control;
-        self.places = Places {
-            launch,
-            status,
-            items,
-            counters: counted,
-        };
+        self.places = places;
         self.items = plan.items.len();
+        self.forms = plan.forms.len();
+        self.kept = plan.kept.len();
+        self.pages = plan.pages.len();
         Ok(())
+    }
+
+    /// Ref to synthetic page entries in control memory, or `Ref::NONE`.
+    pub fn pages_ref(&self) -> Ref {
+        match self.pages {
+            0 => Ref::NONE,
+            _ => Ref::at(CONTROL, self.places.pages),
+        }
     }
 
     /// The next free ordinal, the largest over the pools.
@@ -419,14 +502,39 @@ where
         Ok(next.into_iter().max().unwrap_or(BASE))
     }
 
-    /// Replaces the items, as many as the plan laid out.
-    pub fn refill(&mut self, items: &[Item]) -> Result<(), Error> {
-        if items.len() != self.items {
-            let laid = self.items;
-            return Err(plan(format!("{} items, laid out for {laid}", items.len())));
+    /// Replaces items, forms, kept tables and pages in place.
+    pub fn refill(
+        &mut self,
+        items: &[Item],
+        forms: &[Form],
+        kept: &[Kept],
+        pages: &[u32],
+    ) -> Result<(), Error> {
+        let counts = [
+            ("items", items.len(), self.items),
+            ("forms", forms.len(), self.forms),
+            ("kept", kept.len(), self.kept),
+            ("pages", pages.len(), self.pages),
+        ];
+        for (what, got, laid) in counts {
+            if got != laid {
+                return Err(plan(format!("{got} {what}, laid out for {laid}")));
+            }
         }
-        let at = self.table() + self.places.items;
-        Ok(self.ctx.upload(at, bytes(items))?)
+        let base = self.table();
+        if !items.is_empty() {
+            self.ctx.upload(base + self.places.items, bytes(items))?;
+        }
+        if !forms.is_empty() {
+            self.ctx.upload(base + self.places.forms, bytes(forms))?;
+        }
+        if !kept.is_empty() {
+            self.ctx.upload(base + self.places.kept, bytes(kept))?;
+        }
+        if !pages.is_empty() {
+            self.ctx.upload(base + self.places.pages, bytes(pages))?;
+        }
+        Ok(())
     }
 
     /// Blocks in the grid.
