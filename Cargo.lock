@@ -1978,6 +1978,7 @@ dependencies = [
  "tessera-engine-settings",
  "tessera-mem",
  "tessera-platform",
+ "tessera-testkit",
  "thiserror",
 ]
 

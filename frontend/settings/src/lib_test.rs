@@ -7,6 +7,9 @@ fn reads_variables() {
         std::env::set_var("TESSERA_BACKEND", "host");
         std::env::set_var("TESSERA_CHECK", "/shared/check");
         std::env::set_var("TESSERA_MEMORY", "24G");
+        std::env::set_var("TESSERA_KERNEL_CACHE", "/tmp/kcache");
+        std::env::set_var("TESSERA_NVRTC", "--maxrregcount=128 -use_fast_math");
+        std::env::set_var("TESSERA_DUMP_SITES", "/tmp/sites.jsonl");
     }
     let s = crate::read();
     assert_eq!(s.host_lanes, 8);
@@ -14,6 +17,15 @@ fn reads_variables() {
     assert_eq!(s.gpu(), None);
     assert_eq!(s.memory, tessera_engine::Memory::Bytes(24 << 30));
     assert_eq!(s.check, Some(std::path::PathBuf::from("/shared/check")));
+    assert_eq!(
+        s.kernel_cache,
+        Some(std::path::PathBuf::from("/tmp/kcache"))
+    );
+    assert_eq!(s.nvrtc, vec!["--maxrregcount=128", "-use_fast_math"]);
+    assert_eq!(
+        s.dump_sites,
+        Some(std::path::PathBuf::from("/tmp/sites.jsonl"))
+    );
 }
 
 #[test]

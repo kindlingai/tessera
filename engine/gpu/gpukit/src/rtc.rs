@@ -113,10 +113,13 @@ impl Rtc {
     }
 
     fn build(&self, lib: &Fns, program: Program, options: &[&str]) -> Result<Vec<u8>, Error> {
-        let options: Vec<CString> = (options.iter())
-            .map(|o| CString::new(*o).expect("option"))
-            .collect();
-        let opts: Vec<*const c_char> = options.iter().map(|o| o.as_ptr()).collect();
+        let mut c_opts = Vec::with_capacity(options.len());
+        for opt in options {
+            let c_opt = CString::new(*opt)
+                .map_err(|e| (self.error)(format!("compiler option has a NUL: {e}")))?;
+            c_opts.push(c_opt);
+        }
+        let opts: Vec<*const c_char> = c_opts.iter().map(|o| o.as_ptr()).collect();
         let code = unsafe { (lib.compile)(program, opts.len() as c_int, opts.as_ptr()) };
         if code != SUCCESS {
             let log = program_log(lib, program);

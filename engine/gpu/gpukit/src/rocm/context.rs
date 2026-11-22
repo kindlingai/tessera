@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use super::hip::{self, Runtime};
 use crate::api::{self, Api, Call, Handle};
 use crate::backend::Backend;
+use crate::cache;
 use crate::device::Device;
 use crate::platform::{self, Asked, Platform};
 use crate::{Error, Limits};
@@ -56,6 +57,13 @@ impl Context {
         })
     }
 
+    /// Target architecture string, read directly from device attributes.
+    fn arch(&self) -> String {
+        let major = self.attr(hip::ATTR_COMPUTE_CAPABILITY_MAJOR).unwrap_or(0);
+        let minor = self.attr(hip::ATTR_COMPUTE_CAPABILITY_MINOR).unwrap_or(0);
+        format!("gfx{major}_{minor}")
+    }
+
     /// The device as asked, with its row. Zero when unasked.
     pub fn platform(&self) -> Platform {
         self.own()
@@ -64,17 +72,13 @@ impl Context {
                 let attr = |a| self.attr(a).unwrap_or(0);
                 let mut v: c_int = 0;
                 unsafe { (self.runtime().hip_runtime_get_version)(&mut v) };
-                let (major, minor) = (
-                    attr(hip::ATTR_COMPUTE_CAPABILITY_MAJOR),
-                    attr(hip::ATTR_COMPUTE_CAPABILITY_MINOR),
-                );
                 let mut total: usize = 0;
                 let device = self.device();
                 unsafe { (self.runtime().hip_device_total_mem)(&mut total, device) };
                 let integrated = attr(hip::ATTR_INTEGRATED) != 0;
                 Platform::new(Asked {
                     backend: "rocm",
-                    arch: format!("gfx{major}_{minor}"),
+                    arch: self.arch(),
                     name: self.name().to_string(),
                     driver: format!("{}.{}", v / 10_000_000, (v / 100_000) % 100),
                     limits: self.limits(),
@@ -211,7 +215,10 @@ impl Api for Runtime {
 
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
         ctx.set_current()?;
-        // With no --offload-arch, hiprtc targets the current device.
-        hip::HIPRTC.compile(source, &["-std=c++17"])
+        let arch = ctx.arch();
+        // Without --offload-arch, hiprtc targets the current device.
+        cache::current().load_or("rocm", &arch, "hsaco", &["-std=c++17"], source, |opts| {
+            hip::HIPRTC.compile(source, opts)
+        })
     }
 }

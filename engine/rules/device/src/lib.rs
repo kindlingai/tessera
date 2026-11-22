@@ -1,21 +1,22 @@
 //! Device headers for recipe kernels, and the import scanner.
 
 mod flatten;
-pub mod layout;
-pub mod proxy;
-pub mod resident;
-mod scan;
-pub mod sums;
-pub mod whole;
-
 #[cfg(test)]
 mod flatten_test;
+pub mod layout;
 #[cfg(test)]
 mod layout_test;
+pub mod proxy;
 #[cfg(test)]
 mod proxy_test;
+pub mod resident;
+mod scan;
 #[cfg(test)]
 mod scan_test;
+pub mod sums;
+pub mod whole;
+#[cfg(test)]
+mod whole_test;
 
 pub use flatten::{Flat, Options, flatten};
 pub use scan::{Error, Problem};

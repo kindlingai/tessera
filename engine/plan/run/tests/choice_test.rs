@@ -175,7 +175,12 @@ fn made_rules_compete() {
     let recipe = tessera_lower::Recipe {
         rules: vec![made(1e-6)],
         favor: Some("priced".into()),
+        require_favored: true,
         ..Default::default()
     };
     assert_eq!(names(&plan(&pair().with(&recipe))), ["priced"]);
+    // Requiring an unused favored rule fails lowering.
+    let missing = pair().favoring("unused_rule").requiring_favored(true);
+    let err = lower(&chain(), 0, &SIZES, &missing).unwrap_err();
+    assert!(matches!(err, tessera_lower::Error::FavoredUnused(r) if r == "unused_rule"));
 }

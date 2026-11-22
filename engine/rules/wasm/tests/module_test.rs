@@ -675,3 +675,27 @@ fn module_flattens_imports() {
         "row.h:2: includes belong in the block at the top"
     );
 }
+
+#[test]
+fn dumps_sites_jsonl() {
+    let dir = tessera_testkit::scratch(&format!("wasm-sites-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dump = dir.join("sites.jsonl");
+    let bytes = module(&manifest(ABI, "matmul"), &Value::Null, "");
+    let trace = tessera_wasm::Trace {
+        dump: Some(dump.clone()),
+        favor: Some("wasm_matmul".into()),
+    };
+    let loaded = tessera_wasm::Module::open_with(&bytes, trace).unwrap();
+    let device = Device::default()
+        .adding(loaded.rules[0])
+        .favoring("wasm_matmul")
+        .requiring_favored(true);
+    let err = lower(&graph(false), 0, &[(Rows, 4)], &device).unwrap_err();
+    assert!(matches!(err, tessera_lower::Error::FavoredUnused(r) if r == "wasm_matmul"));
+    let text = std::fs::read_to_string(&dump).unwrap();
+    let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(first["ask"]["rule"], "wasm_matmul");
+    assert_eq!(first["response"], Value::Null);
+    let _ = std::fs::remove_dir_all(&dir);
+}

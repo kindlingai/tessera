@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tessera_engine_comm::{Error as CommError, Link as Comm};
 use tessera_gpukit::Error as GpuError;
 use tessera_gpukit::backend::Backend as Gpu;
-use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats};
 use tessera_gpukit::launch::{Apart, KernelArgs, Launch};
 
 /// Arenas the launcher fills: control, doorbell, then the link's.
@@ -200,6 +200,8 @@ pub struct Resident<D: Device, L> {
     grid: u32,
     threads: u32,
     shared: u32,
+    /// Resident blocks per multiprocessor.
+    fit: u32,
     /// The device clock and the host instant it matches.
     clock: (u64, Instant),
     seq: u64,
@@ -264,6 +266,7 @@ where
             grid,
             threads: plan.threads,
             shared: plan.shared,
+            fit,
             clock: (0, Instant::now()),
             seq: 0,
             broken: false,
@@ -429,6 +432,26 @@ where
     /// Blocks in the grid.
     pub fn grid(&self) -> u32 {
         self.grid
+    }
+
+    /// Threads per block in the grid.
+    pub fn threads(&self) -> u32 {
+        self.threads
+    }
+
+    /// Resident blocks per multiprocessor.
+    pub fn fit(&self) -> u32 {
+        self.fit
+    }
+
+    /// The compiled kernel handle.
+    pub fn kernel(&self) -> &<D as Device>::Kernel {
+        &self.kernel
+    }
+
+    /// Static register and memory counts for this kernel.
+    pub fn stats(&self) -> Option<KernelStats> {
+        self.ctx.stats(&self.kernel)
     }
 
     /// One launch with `values`. Waits for the grid to end.

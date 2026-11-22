@@ -20,6 +20,9 @@ tessera-engine-settings = { workspace = true }
 tessera-mem = { workspace = true }
 tessera-platform = { workspace = true }
 
+[dev-dependencies]
+tessera-testkit = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-metal = { version = "0.3", default-features = false, features = [

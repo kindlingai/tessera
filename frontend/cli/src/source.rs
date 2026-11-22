@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tessera_engine::wasm::Module;
+use tessera_engine::wasm::{Module, Trace};
 use tessera_recipe::Recipe;
 use tessera_serve::start::Options;
 
@@ -81,6 +81,7 @@ pub struct Source {
     pub token: Option<String>,
     /// The snapshot directory, for a Hugging Face origin.
     pub fetched: Option<PathBuf>,
+    dump_sites: Option<PathBuf>,
 }
 
 impl Source {
@@ -88,7 +89,7 @@ impl Source {
     pub fn open(origin: Option<Origin>) -> Result<Source, Stop> {
         let origin = origin.ok_or(Stop::Usage)?;
         let settings = tessera_frontend_settings::read();
-        let (cache, token) = (settings.recipes, settings.hf_token);
+        let (cache, token, dump_sites) = (settings.recipes, settings.hf_token, settings.dump_sites);
         let mut fetched = None;
         let recipe = match &origin {
             Origin::Recipe(src) => Some(Recipe::open(src, cache.as_deref())?),
@@ -105,6 +106,7 @@ impl Source {
             cache,
             token,
             fetched,
+            dump_sites,
         })
     }
 
@@ -119,7 +121,12 @@ impl Source {
             options.names = r.names();
             options.config = tessera_bundle::Overrides::new(r.overrides());
             if let Some(bytes) = r.module_bytes(cache)? {
-                let module = Module::open(&bytes).map_err(|e| Stop::Failed(e.to_string()))?;
+                let trace = Trace {
+                    dump: self.dump_sites.clone(),
+                    favor: r.lower.as_ref().and_then(|l| l.favor.clone()),
+                };
+                let module =
+                    Module::open_with(&bytes, trace).map_err(|e| Stop::Failed(e.to_string()))?;
                 let rules = module.rules.iter().copied();
                 options.lower.get_or_insert_default().rules.extend(rules);
                 options.module = Some(Arc::new(module));

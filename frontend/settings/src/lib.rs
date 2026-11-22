@@ -20,6 +20,11 @@ struct Env {
     /// Launches per profile report.
     profile: Option<u64>,
     kernels: Option<PathBuf>,
+    /// Compiled image cache directory, or `off`.
+    kernel_cache: Option<String>,
+    /// Extra NVRTC or hiprtc flags, whitespace separated.
+    nvrtc: Option<String>,
+    dump_sites: Option<PathBuf>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -38,6 +43,16 @@ pub fn read() -> Settings {
     let costs = env.costs.or_else(|| cache("costs"));
     let check = env.check.or_else(|| cache("check"));
     let recipes = env.recipes.or_else(|| cache("recipes"));
+    let kernel_cache = match env.kernel_cache.as_deref() {
+        Some("off") => None,
+        Some(path) => Some(PathBuf::from(path)),
+        None => cache("kernels"),
+    };
+    let nvrtc = env
+        .nvrtc
+        .as_deref()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
     let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let hub = (var("HF_HUB_CACHE"))
         .or_else(|| var("HF_HOME").map(|h| h.join("hub")))
@@ -56,6 +71,9 @@ pub fn read() -> Settings {
         hf_token: token(&var, std::env::home_dir()),
         profile: env.profile.filter(|n| *n > 0),
         kernels: env.kernels,
+        kernel_cache,
+        nvrtc,
+        dump_sites: env.dump_sites,
     }
 }
 

@@ -6,6 +6,15 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
+/// Static register and memory counts for one compiled kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelStats {
+    pub regs: u32,
+    pub shared_bytes: u32,
+    pub local_bytes: u32,
+    pub max_threads: u32,
+}
+
 /// A backend context: memory, kernels and process-wide caches.
 pub trait Device: Clone + Send + Sync + 'static {
     type Kernel: Clone + Send + 'static;
@@ -85,6 +94,11 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// Blocks of `kernel` one unit holds at once.
     fn resident(&self, _kernel: &Self::Kernel, _threads: u32, _shared: u32) -> Result<u32, Error> {
         Err(Self::error("this device has no persistent grids".into()))
+    }
+
+    /// Static register and memory counts for `kernel`.
+    fn stats(&self, _kernel: &Self::Kernel) -> Option<KernelStats> {
+        None
     }
 
     /// Whether `capture` records launches here.

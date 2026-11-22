@@ -15,7 +15,7 @@ use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--m <list>] [--new <n>] \
+const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
 [--embed <texts.json> [--vectors <file>]] [--forward <texts.json>]";
 
@@ -57,6 +57,8 @@ struct Args {
     vectors: Option<PathBuf>,
     /// Run each text forward through a Qwen3.5 model, then stop.
     forward: Option<PathBuf>,
+    /// Fail lowering unless the favored rule covers a step.
+    require_favored: bool,
 }
 
 fn args() -> Option<Args> {
@@ -72,9 +74,14 @@ fn args() -> Option<Args> {
         embed: None,
         vectors: None,
         forward: None,
+        require_favored: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
+        if flag == "--require-favored" {
+            args.require_favored = true;
+            continue;
+        }
         let value = given.next()?;
         match flag.as_str() {
             "--model" => args.model = value.into(),
@@ -201,7 +208,7 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
         &Default::default(),
         None,
     )?;
-    let recipe = match &args.recipe {
+    let mut recipe = match &args.recipe {
         Some(path) => Recipe::load(path)?,
         None => Recipe {
             pins: loaded
@@ -210,6 +217,9 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
             ..Recipe::default()
         },
     };
+    if args.require_favored {
+        recipe.require_favored = true;
+    }
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
     (loaded.weights).each(|at, w| engine.load_weight(at, w))?;
     let (prompt, wanted) = match &args.reference {

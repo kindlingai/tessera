@@ -23,11 +23,14 @@ fn files_replace_kernels() {
     // Each write changes the length, whatever the clock's grain.
     std::fs::write(files.path("k"), "edited").unwrap();
     assert_eq!(check(&mut files), Some(Outcome::Loaded));
+    assert_eq!(files.text("k"), Some("edited"));
     std::fs::write(files.path("k"), "bad!!").unwrap();
     assert!(matches!(check(&mut files), Some(Outcome::Failed(_))));
     assert_eq!(files.kernel("k").map(String::as_str), Some("edited"));
+    assert_eq!(files.text("k"), Some("edited"));
     std::fs::remove_file(files.path("k")).unwrap();
     assert_eq!(check(&mut files), Some(Outcome::Planned));
     assert_eq!(files.kernel("k"), None);
+    assert_eq!(files.text("k"), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -5,7 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
 use tessera_device::whole;
-use tessera_engine::wasm::Module;
+use tessera_engine::wasm::{Module, Trace};
 use tessera_engine::{Engine, Place, Row};
 use tessera_engine_comm::{ShmLink, Transport};
 use tessera_frontend_comm::{CAPACITY, join, meet, resident, shared, shm};
@@ -41,11 +41,15 @@ fn graph(model: &str) -> Result<Graph, Box<dyn Error>> {
 }
 
 /// The recipe's choices, with its module's rules.
-fn choices(dir: &Path) -> Result<Recipe, Box<dyn Error>> {
+fn choices(dir: &Path, settings: &Settings) -> Result<Recipe, Box<dyn Error>> {
     let recipe = tessera_recipe::Recipe::read(dir)?;
     let bytes = recipe.module_bytes(Some(Path::new("target/recipes")))?;
-    let module = Module::open(&bytes.ok_or("the recipe has no module")?)?;
     let mut lower = recipe.lower.unwrap_or_default();
+    let trace = Trace {
+        dump: settings.dump_sites.clone(),
+        favor: lower.favor.clone(),
+    };
+    let module = Module::open_with(&bytes.ok_or("the recipe has no module")?, trace)?;
     lower.rules.extend(module.rules);
     Ok(lower)
 }
@@ -125,7 +129,10 @@ fn timed(engine: &mut Engine, launches: &[Vec<Row>]) -> Timed {
 /// Runs this rank. Rank 0 also runs the graph alone.
 pub fn run(args: &Args, dir: &Path) -> Outcome {
     let settings = tessera_frontend_settings::read();
-    let lower = choices(dir)?;
+    let mut lower = choices(dir, &settings)?;
+    if args.require_favored {
+        lower.require_favored = true;
+    }
     let (rank, ranks) = (args.rank, args.ranks as u32);
     let mut met: Box<dyn Transport> = match &args.shm {
         Some(path) => Box::new(shm(path, rank, ranks, CAPACITY)?),

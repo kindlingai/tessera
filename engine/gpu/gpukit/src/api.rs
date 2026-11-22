@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::LocalKey;
 
 use crate::backend::Backend;
-use crate::device::{Caches, Device};
+use crate::device::{Caches, Device, KernelStats};
 use crate::dl::image_hash;
 use crate::gate::Gate;
 use crate::launch::{self, KernelArgs, Launch};
@@ -163,6 +163,10 @@ pub trait Api: Sync + Sized + 'static {
     /// Raises the dynamic shared memory limit on `kernel`.
     fn allow_shared(&self, _kernel: Handle, _shared: u32) -> Result<(), Error> {
         Ok(())
+    }
+    /// Static register and memory counts for `kernel`.
+    fn stats(&self, _kernel: Handle) -> Option<KernelStats> {
+        None
     }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
@@ -452,6 +456,11 @@ impl<A: Api> Context<A> {
         Ok(())
     }
 
+    /// Static register and memory counts for `kernel`.
+    pub fn stats(&self, kernel: &Kernel<A>) -> Option<KernelStats> {
+        self.locked(|a| Ok(a.stats(kernel.raw))).ok().flatten()
+    }
+
     /// Compile for this device and resolve `entry`.
     pub fn compile_kernel(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
         let image = A::compile(self, source)?;
@@ -710,6 +719,10 @@ impl<A: Api> Device for Context<A> {
 
     fn resident(&self, kernel: &Kernel<A>, threads: u32, shared: u32) -> Result<u32, Error> {
         Context::resident(self, kernel, threads, shared)
+    }
+
+    fn stats(&self, kernel: &Kernel<A>) -> Option<KernelStats> {
+        Context::stats(self, kernel)
     }
 
     fn graphs(&self) -> bool {

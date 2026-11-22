@@ -86,4 +86,7 @@ pub enum Error {
     /// A stored device file could not be read.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A required favored rule did not cover any step.
+    #[error("favored rule `{0}` did not cover any step in the plan")]
+    FavoredUnused(String),
 }

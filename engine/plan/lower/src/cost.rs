@@ -55,6 +55,9 @@ pub struct Device {
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(skip)]
     favor: Option<String>,
+    /// Fail lowering unless `favor` covers at least one step.
+    #[serde(skip)]
+    require_favored: bool,
     /// Kernels never to choose.
     #[serde(skip)]
     barred: Vec<String>,
@@ -123,6 +126,7 @@ impl Default for Device {
             timed: Timings::default(),
             host: Timings::default(),
             favor: None,
+            require_favored: false,
             barred: Vec::new(),
             made: Vec::new(),
             pins: Pins::default(),
@@ -192,6 +196,7 @@ impl Device {
         self.pins = recipe.pins.clone();
         self.compute = recipe.compute;
         self.favor = recipe.favor.clone();
+        self.require_favored = recipe.require_favored;
         self.barred = recipe.barred.clone();
         self.made = recipe.rules.clone();
         self.kept = recipe.kept;
@@ -304,6 +309,12 @@ impl Device {
         self.changed()
     }
 
+    /// Fail lowering unless the favored rule covers a step.
+    pub fn requiring_favored(mut self, on: bool) -> Self {
+        self.require_favored = on;
+        self.changed()
+    }
+
     /// The same device, also asking `rule`.
     pub fn adding(mut self, rule: &'static Rule) -> Self {
         self.made.push(rule);
@@ -317,6 +328,13 @@ impl Device {
 
     pub fn favors(&self, rule: &str) -> bool {
         self.favor.as_deref() == Some(rule)
+    }
+
+    /// The favored rule when lowering requires it to cover steps.
+    pub fn required_favor(&self) -> Option<&str> {
+        self.require_favored
+            .then_some(self.favor.as_deref())
+            .flatten()
     }
 
     /// Seconds for one launch in `zone`. Cold ones stream weights.

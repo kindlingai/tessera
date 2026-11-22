@@ -231,6 +231,18 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             let name = self.base.plan.steps[i].kernel.name();
             self.note(name, s);
         }
+        let grid_marks = self
+            .grid
+            .get_mut()
+            .as_mut()
+            .map_or_else(Vec::new, |g| g.take_marks());
+        for (entry, found) in grid_marks {
+            for region in &found.regions {
+                let (middle, _) = region.spread();
+                let label = format!("mark {entry}: L{}-L{}", region.from, region.to);
+                self.note(&label, middle);
+            }
+        }
         Ok(())
     }
 
@@ -353,32 +365,73 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             // Recorded launches name the kernels they replaced.
             self.graphs.clear();
             self.apply();
+            self.sync_grid();
         }
         Ok(reloads)
     }
 
+    /// Passes profiling state and resident overrides to the grid.
+    fn sync_grid(&mut self) {
+        let Some(grid) = self.grid.get_mut().as_mut() else {
+            return;
+        };
+        grid.profiling(self.base.profile.is_some());
+        let Some(files) = &self.overrides else {
+            return;
+        };
+        for (entry, step) in &self.entries {
+            if self.resident[*step] {
+                grid.replace(entry, files.text(entry).map(str::to_string));
+            }
+        }
+    }
+
+    /// Collects mark regions from a resident step launch.
+    fn resident_marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
+        if self.grid.get_mut().is_none() {
+            return Ok(None);
+        }
+        let was_profiling = self.base.profile.is_some();
+        if !was_profiling && let Some(grid) = self.grid.get_mut().as_mut() {
+            grid.profiling(true);
+        }
+        let launches = self.base.launches(step)?;
+        let mut ran = Ok(());
+        for launch in &launches {
+            if let Err(e) = self.persistent(step, launch) {
+                ran = Err(e);
+                break;
+            }
+        }
+        let taken = self
+            .grid
+            .get_mut()
+            .as_mut()
+            .map_or_else(Vec::new, |g| g.take_marks());
+        if !was_profiling && let Some(grid) = self.grid.get_mut().as_mut() {
+            grid.profiling(false);
+        }
+        ran?;
+        let mut merged = Marks::default();
+        for (_, found) in taken {
+            merged.lost += found.lost;
+            for region in found.regions {
+                match merged
+                    .regions
+                    .iter_mut()
+                    .find(|r| (r.from, r.to) == (region.from, region.to))
+                {
+                    Some(existing) => existing.seconds.extend(region.seconds),
+                    None => merged.regions.push(region),
+                }
+            }
+        }
+        Ok(Some(merged))
+    }
+
     /// Reads the ledger after one launch into `found`.
     fn collect(&self, ledger: u64, found: &mut Marks) -> Result<(), Error> {
-        let mut bytes = vec![0u8; marks::COUNTS];
-        self.ctx.download(ledger, &mut bytes)?;
-        let counts: Vec<u32> = bytes
-            .as_chunks()
-            .0
-            .iter()
-            .map(|b| u32::from_ne_bytes(*b))
-            .collect();
-        let blocks = counts.iter().rposition(|c| *c > 0).map_or(0, |at| at + 1);
-        let mut bytes = vec![0u8; marks::records(blocks)];
-        self.ctx
-            .download(ledger + marks::COUNTS as u64, &mut bytes)?;
-        let records: Vec<u64> = bytes
-            .as_chunks()
-            .0
-            .iter()
-            .map(|b| u64::from_ne_bytes(*b))
-            .collect();
-        marks::read(&counts[..blocks], &records, self.ctx.ticks(), found);
-        Ok(())
+        Ok(marks::collect(self.ctx, ledger, found)?)
     }
 
     /// Every launch of `steps`, in order.
@@ -469,7 +522,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             .map(|s| s.kernel.resident().is_some())
             .collect();
         for step in &plan.steps {
-            let fixed = |text, entry| -> Result<_, Error> { Ok(cached_source::<D>(text, entry)?) };
+            let fixed = |text: &'static str, entry: &'static str| -> Result<_, Error> {
+                match text.contains("TS_MARK") {
+                    true => Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?),
+                    false => Ok(cached_source::<D>(text, entry)?),
+                }
+            };
             let made =
                 |source: &str, entry: &str| -> Result<_, Error> { Ok(ctx.compile(source, entry)?) };
             // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
@@ -480,6 +538,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.planned = self.kernels.clone();
         self.index(plan);
         self.apply();
+        self.sync_grid();
         self.ready(plan)?;
         self.base.adopt(plan);
         Ok(())
@@ -492,8 +551,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
-        if dialect(D::BACKEND) == Dialect::Metal || self.resident[step] {
+        if dialect(D::BACKEND) == Dialect::Metal {
             return Ok(None);
+        }
+        if self.resident[step] {
+            return self.resident_marks(step);
         }
         let source = self.base.plan.steps[step].kernel.source();
         let entry = overrides::entry(&source).to_string();
@@ -546,8 +608,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn persist(&mut self, grid: Box<dyn Grid>) -> Result<(), Error> {
         *self.grid.get_mut() = Some(grid);
+        self.sync_grid();
         let plan = self.base.plan.clone();
         self.ready(&plan)
+    }
+
+    fn profiling(&mut self, on: bool) {
+        self.base.profile = on.then(crate::Profile::default);
+        if let Some(grid) = self.grid.get_mut().as_mut() {
+            grid.profiling(on);
+        }
     }
 
     fn address(&self, slot: Slot) -> Option<u64> {

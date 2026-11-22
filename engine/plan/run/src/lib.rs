@@ -8,9 +8,8 @@ mod held;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
-mod marks;
-#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+pub mod marks;
+#[cfg(test)]
 mod marks_test;
 #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod overrides;
@@ -129,8 +128,14 @@ pub fn precision(backend: Backend) -> Precision {
     }
 }
 
+/// Applies cache and compiler settings to the GPU runtime.
+pub fn configure(settings: &Settings) {
+    tessera_gpukit::cache::configure(settings);
+}
+
 /// Pinned memory on the GPU `settings` picks, if any.
 pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
+    configure(settings);
     match settings.gpu() {
         #[cfg(feature = "cuda")]
         Some(Backend::Cuda) => {
@@ -148,6 +153,7 @@ pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
 
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
+    configure(settings);
     match settings.gpu() {
         #[cfg(target_os = "macos")]
         Some(Backend::Metal) => Ok(Box::new(

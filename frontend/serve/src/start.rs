@@ -17,7 +17,7 @@ use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
 [--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix] \
-[--manifest <name>]";
+[--require-favored] [--manifest <name>]";
 
 /// The loaded model's task.
 #[derive(Clone, Copy, PartialEq)]
@@ -53,6 +53,8 @@ pub struct Options {
     pub guided: bool,
     /// A prompt that continues an answer keeps its rows.
     pub reuse: bool,
+    /// Fail lowering unless the favored rule covers a step.
+    pub require_favored: bool,
     pub max_connections: usize,
     /// The largest picture klein paints, in pixels a side.
     pub image_size: usize,
@@ -85,6 +87,7 @@ impl Default for Options {
             strict: false,
             guided: false,
             reuse: false,
+            require_favored: false,
             max_connections: 64,
             image_size: 512,
             clip: None,
@@ -105,6 +108,7 @@ impl Options {
             "--reject-unknown-fields" => self.strict = true,
             "--guided" => self.guided = true,
             "--reuse-prefix" => self.reuse = true,
+            "--require-favored" => self.require_favored = true,
             _ => return false,
         }
         true
@@ -164,6 +168,9 @@ fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     let mut recipe = options.lower.clone().unwrap_or_default();
     if recipe.pins == Pins::default() {
         recipe.pins = pins.unwrap_or_else(|| Pins::all(tessera_engine::form::BF16_FORM));
+    }
+    if options.require_favored {
+        recipe.require_favored = true;
     }
     recipe
 }

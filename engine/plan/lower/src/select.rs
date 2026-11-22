@@ -259,6 +259,11 @@ pub(crate) fn select_upto(
         let val = e.as_form(val, want);
         e.out.outputs.push((val, shape.clone()));
     }
+    if let Some(favor) = device.required_favor()
+        && !e.out.ops.iter().any(|op| op.rule == favor)
+    {
+        return Err(Error::FavoredUnused(favor.to_string()));
+    }
     e.out.ranks = tree.parts.ranks() as u32;
     e.out.rank = tree.rank;
     Ok(e.out)

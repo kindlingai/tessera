@@ -5,12 +5,106 @@ mod guest;
 mod site;
 mod text;
 
-use abi::{ABI, Answer, Ask, Entry, Kind, Manifest, Site};
+use abi::{ABI, Answer, Ask, Kind, Manifest};
 use guest::{BUILD_FUEL, FUEL, Guest};
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tessera_graph::Graph;
 use tessera_lower::{Draft, Propose, Rule, T, Tree};
 use text::Fixed;
+
+static DUMP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Site-dump path and favored rule for wasm diagnostics.
+#[derive(Clone, Debug, Default)]
+pub struct Trace {
+    pub dump: Option<PathBuf>,
+    pub favor: Option<String>,
+}
+
+/// Sets the process-wide fallback site dump path.
+pub fn configure(dump: Option<PathBuf>) {
+    *DUMP.lock().unwrap_or_else(|e| e.into_inner()) = dump;
+}
+
+/// One JSONL record written when site dumping is enabled.
+#[derive(serde::Serialize)]
+struct Record<'a> {
+    ask: &'a serde_json::value::RawValue,
+    response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+struct Sink {
+    dump: Option<PathBuf>,
+    favor: Option<String>,
+    file: Mutex<Option<File>>,
+}
+
+impl Sink {
+    fn new(trace: Trace) -> Self {
+        Self {
+            dump: trace.dump,
+            favor: trace.favor,
+            file: Mutex::new(None),
+        }
+    }
+
+    fn path(&self) -> Option<PathBuf> {
+        self.dump
+            .clone()
+            .or_else(|| DUMP.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    fn record(&self, input: &[u8], raw: Option<&[u8]>, error: Option<&str>) {
+        let Some(target) = self.path() else {
+            return;
+        };
+        let Ok(ask_str) = std::str::from_utf8(input) else {
+            return;
+        };
+        let Ok(ask) = serde_json::value::RawValue::from_string(ask_str.to_string()) else {
+            return;
+        };
+        let response = match raw {
+            Some(bytes) => serde_json::from_slice(bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+            }),
+            None => serde_json::Value::Null,
+        };
+        let Ok(line) = serde_json::to_string(&Record {
+            ask: &ask,
+            response,
+            error,
+        }) else {
+            return;
+        };
+        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let path = match target.is_dir() {
+                true => target.join("sites.jsonl"),
+                false => target,
+            };
+            if let Some(dir) = path.parent()
+                && !dir.as_os_str().is_empty()
+            {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            *guard = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .ok();
+        }
+        if let Some(file) = guard.as_mut() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -42,17 +136,18 @@ struct Asking {
     rule: &'static str,
     kind: Kind,
     kernels: &'static [Fixed],
+    sink: Arc<Sink>,
 }
 
 impl Asking {
-    /// The module's offers, or the reason it gave none.
-    fn ask(&self, site: Site) -> Result<Option<Vec<Entry>>, Error> {
-        let rule = self.rule.into();
-        let input = serde_json::to_vec(&Ask { rule, site })?;
-        let output = self.guest.call("propose", Some(&input), FUEL)?;
-        match serde_json::from_slice(&output)? {
-            Answer::Offers(offers) => Ok(offers),
-            Answer::Unread(e) => Err(Error::Unread(e.unread)),
+    fn is_favored(&self) -> bool {
+        self.sink.favor.as_deref() == Some(self.rule)
+    }
+
+    fn warn(&self, msg: &str) {
+        match self.is_favored() {
+            true => eprintln!("wasm rule {} (favored): {msg}", self.rule),
+            false => eprintln!("wasm rule {}: {msg}", self.rule),
         }
     }
 }
@@ -60,11 +155,58 @@ impl Asking {
 impl Propose for Asking {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
         let (site, reads) = site::find(tree, at, self.kind)?;
-        match self.ask(site) {
-            Ok(offers) => site::drafts(offers?, self.kernels, tree, &reads),
+        let input = match serde_json::to_vec(&Ask {
+            rule: self.rule.into(),
+            site,
+        }) {
+            Ok(input) => input,
             Err(e) => {
-                eprintln!("wasm rule {}: {e}", self.rule);
+                self.warn(&e.to_string());
+                return None;
+            }
+        };
+        let output = match self.guest.call("propose", Some(&input), FUEL) {
+            Ok(output) => output,
+            Err(e) => {
+                let msg = e.to_string();
+                self.sink.record(&input, None, Some(&msg));
+                self.warn(&msg);
+                return None;
+            }
+        };
+        let answer: Answer = match serde_json::from_slice(&output) {
+            Ok(answer) => answer,
+            Err(e) => {
+                let msg = e.to_string();
+                self.sink.record(&input, Some(&output), Some(&msg));
+                self.warn(&msg);
+                return None;
+            }
+        };
+        match answer {
+            Answer::Unread(u) => {
+                let msg = Error::Unread(u.unread).to_string();
+                self.sink.record(&input, Some(&output), Some(&msg));
+                self.warn(&msg);
                 None
+            }
+            Answer::Offers(None) => {
+                self.sink.record(&input, Some(&output), None);
+                if self.is_favored() {
+                    self.warn("declined site");
+                }
+                None
+            }
+            Answer::Offers(Some(entries)) => {
+                let made = site::drafts(entries, self.kernels, tree, &reads);
+                let err = made.is_none().then_some("offer did not fit site");
+                self.sink.record(&input, Some(&output), err);
+                if let Some(msg) = err
+                    && self.is_favored()
+                {
+                    self.warn(msg);
+                }
+                made
             }
         }
     }
@@ -95,6 +237,11 @@ struct Build<'a> {
 impl Module {
     /// The module in `bytes`. Its rules are never freed.
     pub fn open(bytes: &[u8]) -> Result<Self, Error> {
+        Self::open_with(bytes, Trace::default())
+    }
+
+    /// Opens the module in `bytes` with diagnostic `trace`.
+    pub fn open_with(bytes: &[u8], trace: Trace) -> Result<Self, Error> {
         let guest = Arc::new(Guest::new(bytes)?);
         let manifest = guest.call("manifest", None, FUEL)?;
         let manifest: Manifest = serde_json::from_slice(&manifest)?;
@@ -106,6 +253,7 @@ impl Module {
             kernels.push(Fixed::open(k, &manifest.files)?);
         }
         let kernels: &'static [Fixed] = kernels.leak();
+        let sink = Arc::new(Sink::new(trace));
         let mut rules = Vec::with_capacity(manifest.rules.len());
         for r in manifest.rules {
             let rule = leak(r.name);
@@ -114,6 +262,7 @@ impl Module {
                 rule,
                 kind: r.site,
                 kernels,
+                sink: sink.clone(),
             };
             rules.push(Rule::made(rule, module_path!(), asking));
         }

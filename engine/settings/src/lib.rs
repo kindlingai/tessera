@@ -61,6 +61,12 @@ pub struct Settings {
     pub profile: Option<u64>,
     /// Kernel files that replace planned kernels, named by entry.
     pub kernels: Option<PathBuf>,
+    /// Directory for cached PTX and HSACO images.
+    pub kernel_cache: Option<PathBuf>,
+    /// Extra flags passed to NVRTC or hiprtc.
+    pub nvrtc: Vec<String>,
+    /// File path for wasm site and reply logs.
+    pub dump_sites: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -79,6 +85,9 @@ impl Default for Settings {
             hf_token: None,
             profile: None,
             kernels: None,
+            kernel_cache: None,
+            nvrtc: Vec::new(),
+            dump_sites: None,
         }
     }
 }

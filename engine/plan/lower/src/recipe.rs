@@ -29,6 +29,9 @@ pub struct Recipe {
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(default)]
     pub favor: Option<String>,
+    /// Fail lowering unless `favor` covers at least one step.
+    #[serde(default)]
+    pub require_favored: bool,
     /// Kernels never to choose, by name.
     #[serde(default)]
     pub barred: Vec<String>,
@@ -85,6 +88,7 @@ impl Default for Recipe {
             pins: Pins::default(),
             compute: Compute::default(),
             favor: None,
+            require_favored: false,
             barred: Vec::new(),
             launch: Launching::default(),
             kept: dense(),

@@ -5,6 +5,10 @@ pub use ::tessera_platform::{Limits, Platform, platform};
 pub use error::Error;
 
 pub mod backend;
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+pub mod cache;
+#[cfg(test)]
+mod cache_test;
 pub mod testing;
 
 #[cfg(target_os = "macos")]

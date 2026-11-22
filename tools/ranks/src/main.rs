@@ -22,7 +22,7 @@ use tessera_trace::Norm;
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--sums host|grid] [--recipe DIR]
+  [--stub ROUNDS] [--sums host|grid] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
   persistent grid per rank, over that fabric or the file.
@@ -55,6 +55,8 @@ struct Args {
     grid: bool,
     /// A recipe whose grid runs the small model.
     recipe: Option<PathBuf>,
+    /// Fail lowering unless the favored rule covers a step.
+    require_favored: bool,
 }
 
 fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
@@ -74,8 +76,13 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         stub: None,
         grid: false,
         recipe: None,
+        require_favored: false,
     };
     while let Some(flag) = given.next() {
+        if flag == "--require-favored" {
+            args.require_favored = true;
+            continue;
+        }
         let value = given.next()?;
         match flag.as_str() {
             "--rank" => args.rank = value.parse().ok()?,

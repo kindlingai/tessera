@@ -232,6 +232,8 @@ impl Engine {
         place: Option<&Place>,
         run: impl FnOnce(tessera_lower::Plan) -> Result<Box<dyn Run>, Error>,
     ) -> Result<Self, Error> {
+        tessera_run::configure(settings);
+        tessera_wasm::configure(settings.dump_sites.clone());
         let mut graph = tessera_graph::trim(&graph, 0)?;
         let sparse = graph.entries.len() > 1;
         if sparse {
