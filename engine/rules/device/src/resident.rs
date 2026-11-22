@@ -157,6 +157,15 @@ fn zeroed<T>() -> T {
     unsafe { std::mem::zeroed() }
 }
 
+/// Launch record and fault paired for one upload.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LaunchSlot {
+    launch: Record,
+    pad: u64,
+    status: Fault,
+}
+
 /// Where each record sits in the control arena.
 pub(crate) struct Places {
     pub launch: u64,
@@ -178,7 +187,8 @@ pub(crate) fn build_control(
     let (rank, ranks) = (rank as u32, ranks as u32);
     let mut block = Block::default();
     let table_at = block.put(&[zeroed::<Table>()]);
-    let launch = block.put(&[zeroed::<Record>()]);
+    let launch = block.put(&[zeroed::<LaunchSlot>()]);
+    let status = launch + std::mem::offset_of!(LaunchSlot, status) as u64;
     let items = block.put(&plan.items);
     let (forms_at, forms_ref) = if plan.forms.is_empty() {
         (0, Ref::NONE)
@@ -236,7 +246,6 @@ pub(crate) fn build_control(
     set.state = Ref::at(CONTROL, counted);
     let pools = block.put(&[set]);
     let barrier = block.put(&[zeroed::<Barrier>()]);
-    let status = block.put(&[zeroed::<Fault>()]);
     let table = Table {
         edition: crate::EDITION,
         rank,
@@ -624,17 +633,18 @@ where
         self.broken = true;
         self.alive()?;
         self.seq += 1;
-        let mut record = Record {
-            seq: self.seq,
-            deadline,
-            values: [0; VALUES],
+        let mut slot = LaunchSlot {
+            launch: Record {
+                seq: self.seq,
+                deadline,
+                values: [0; VALUES],
+            },
+            pad: 0,
+            status: zeroed(),
         };
-        record.values[..values.len()].copy_from_slice(values);
-        let base = self.table();
-        self.ctx
-            .upload(base + self.places.launch, bytes(&[record]))?;
-        self.ctx
-            .upload(base + self.places.status, bytes(&[zeroed::<Fault>()]))?;
+        slot.launch.values[..values.len()].copy_from_slice(values);
+        let at = self.table() + self.places.launch;
+        self.ctx.upload(at, bytes(&[slot]))?;
         Ok(())
     }
 

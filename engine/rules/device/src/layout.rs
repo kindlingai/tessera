@@ -105,7 +105,7 @@ macro_rules! layout {
     ($(#[$attr:meta])* $name:ident = $c:literal { $($field:ident: $ty:ty),* $(,)? }) => {
         #[repr(C)]
         $(#[$attr])*
-        #[derive(Clone, Copy, Debug)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name {
             $(pub $field: $ty),*
         }

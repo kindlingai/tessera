@@ -4,7 +4,9 @@ use crate::layout::{
 };
 use crate::proxy::Op;
 use crate::resident::{Plan, USER, build_control};
-use crate::whole::{format_summary, pack_records, plan, prepare_source, synth_pages};
+use crate::whole::{
+    RefillCache, TableBufs, fill_pages, format_summary, pack_into, plan, prepare_source,
+};
 use tessera_gpukit::device::KernelStats;
 use tessera_lower::{Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
 use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, marks};
@@ -107,20 +109,31 @@ fn sample_items() -> [Placed; 4] {
     ]
 }
 
+fn synth_pages(kept: &[KeptDesc]) -> Vec<u32> {
+    let mut out = Vec::new();
+    fill_pages(kept, &mut out);
+    out
+}
+
+fn pack_bufs(items: &[Placed], scratch: Option<(u64, usize)>, kept: &[KeptDesc]) -> TableBufs {
+    let mut bufs = TableBufs::default();
+    fill_pages(kept, &mut bufs.synth);
+    pack_into(items, scratch, kept, Ref::NONE, &mut bufs).unwrap();
+    bufs
+}
+
 #[test]
 fn packs_table_records() {
     let dense = sample_kept(None, 2, 16, false);
-    let pages = synth_pages(&[dense]);
-    assert_eq!(pages, [0, 1]);
-    let (items, forms, kept) =
-        pack_records(&sample_items(), Some((0x9000, 512)), &[dense], Ref::NONE).unwrap();
+    let bufs = pack_bufs(&sample_items(), Some((0x9000, 512)), &[dense]);
+    assert_eq!(bufs.synth, [0, 1]);
     let plan = Plan {
         pools: Vec::new(),
         lanes: Vec::new(),
-        items,
-        forms,
-        kept,
-        pages,
+        items: bufs.items,
+        forms: bufs.forms,
+        kept: bufs.kept,
+        pages: bufs.synth,
         arenas: vec![0],
         threads: 256,
         shared: 0,
@@ -129,6 +142,11 @@ fn packs_table_records() {
     let (raw, places) = build_control(&plan, &[], [0, 1, 1], [0; ARENAS]);
     let table: Table = read_at(&raw, 0);
     assert_eq!((table.items_len, table.forms_len), (5, 2));
+    assert_eq!(
+        (table.now.offset, table.status.offset),
+        (places.launch, places.status)
+    );
+    assert_eq!(places.status - places.launch, 256);
     let i0: Item = read_at(&raw, table.items.offset);
     let i1: Item = read_at(&raw, table.items.offset + size_of::<Item>() as u64);
     let i3: Item = read_at(&raw, table.items.offset + 3 * size_of::<Item>() as u64);
@@ -175,9 +193,12 @@ fn packs_table_records() {
 #[test]
 fn kv_page_modes() {
     let paged = sample_kept(Some(0xA000), 2, 32, false);
-    assert!(synth_pages(&[paged]).is_empty());
-    let (_, _, kept) = pack_records(&[], None, &[paged], Ref::NONE).unwrap();
-    assert_eq!((kept[0].pages.arena, kept[0].pages.offset), (USER, 0xA000));
+    let bufs = pack_bufs(&[], None, &[paged]);
+    assert!(bufs.synth.is_empty());
+    assert_eq!(
+        (bufs.kept[0].pages.arena, bufs.kept[0].pages.offset),
+        (USER, 0xA000)
+    );
     let inter = sample_kept(None, 2, 3, true);
     assert_eq!(synth_pages(&[inter]), [0, 2, 4, 1, 3, 5]);
 }
@@ -225,4 +246,38 @@ fn plans_collective_lanes() {
     let planned = plan(&kernel, layout, 2, 1).unwrap();
     let got: Vec<(Op, u32)> = planned.lanes.iter().map(|l| (l.op, l.elem)).collect();
     assert_eq!(got, [(Op::Sum, F32), (Op::Sum, BF16)]);
+}
+
+fn sample_bufs() -> TableBufs {
+    let dense = sample_kept(None, 2, 16, false);
+    pack_bufs(&sample_items(), Some((0x9000, 512)), &[dense])
+}
+
+#[test]
+fn caches_refill_records() {
+    let mut cache = RefillCache::default();
+    let mut first = sample_bufs();
+    assert!(cache.needs_refill(&first));
+    cache.store(&mut first);
+    assert!(!cache.needs_refill(&sample_bufs()));
+
+    let mut diff_item = sample_bufs();
+    diff_item.items[0].at.offset += 64;
+    assert!(cache.needs_refill(&diff_item));
+
+    let mut diff_form = sample_bufs();
+    diff_form.forms[0].suh.offset += 64;
+    assert!(cache.needs_refill(&diff_form));
+
+    let mut diff_kept = sample_bufs();
+    diff_kept.kept[0].base.offset += 64;
+    assert!(cache.needs_refill(&diff_kept));
+
+    let mut diff_pages = sample_bufs();
+    diff_pages.synth[1] = 2;
+    assert!(cache.needs_refill(&diff_pages));
+    cache.store(&mut diff_pages);
+    let mut updated = sample_bufs();
+    updated.synth[1] = 2;
+    assert!(!cache.needs_refill(&updated));
 }

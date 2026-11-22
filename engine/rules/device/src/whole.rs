@@ -23,15 +23,59 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// The regions a link must hold for `ranks`.
 pub use crate::sums::{RELAY, regions};
 
+/// Identity of an open resident grid.
+#[derive(PartialEq, Eq)]
+struct OpenKey {
+    name: &'static str,
+    threads: u32,
+    shared: u32,
+    lanes: Vec<Collective>,
+    layout: GridLayout,
+    revision: u64,
+    want_marks: bool,
+}
+
+/// Packed control-table buffers reused across launches.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct TableBufs {
+    pub items: Vec<Item>,
+    pub forms: Vec<Form>,
+    pub kept: Vec<Kept>,
+    pub synth: Vec<u32>,
+}
+
+/// Last control-table records uploaded to an open grid.
+#[derive(Default)]
+pub(crate) struct RefillCache {
+    last: TableBufs,
+    filled: bool,
+}
+
+impl RefillCache {
+    /// True when the uploaded table differs from `next`.
+    pub(crate) fn needs_refill(&self, next: &TableBufs) -> bool {
+        !self.filled || self.last != *next
+    }
+
+    /// Saves uploaded records by swapping with `next`.
+    pub(crate) fn store(&mut self, next: &mut TableBufs) {
+        std::mem::swap(&mut self.last, next);
+        self.filled = true;
+    }
+}
+
+struct OpenGrid<D: Device, L> {
+    key: OpenKey,
+    entry: String,
+    resident: Resident<D, L>,
+    marked: bool,
+    cache: RefillCache,
+}
+
 /// The idle link, or the open grid with the link.
 enum Held<D: Device, L> {
     Idle(L),
-    Open {
-        key: String,
-        entry: String,
-        resident: Box<Resident<D, L>>,
-        marked: bool,
-    },
+    Open(Box<OpenGrid<D, L>>),
     /// A failed open took the link.
     Gone,
 }
@@ -52,6 +96,8 @@ struct Whole<D: Device, L> {
     ledger: Option<DeviceBuffer<D>>,
     /// Mark samples gathered since the last take.
     marks: Vec<(String, Marks)>,
+    /// Reusable staging buffers for packed table records.
+    staged: TableBufs,
 }
 
 /// Selects source text and mark mode for one resident compile.
@@ -92,38 +138,41 @@ fn failed(e: Error) -> tessera_run::Error {
     tessera_run::Error::Grid(Box::new(e))
 }
 
-/// Synthetic page entries for unpaged kept rows.
-pub(crate) fn synth_pages(kept: &[KeptDesc]) -> Vec<u32> {
+/// Fills synthetic page entries for unpaged kept rows.
+pub(crate) fn fill_pages(kept: &[KeptDesc], out: &mut Vec<u32>) {
+    out.clear();
     let Some(first) = kept.first() else {
-        return Vec::new();
+        return;
     };
     if first.pages.is_some() {
-        return Vec::new();
+        return;
     }
     if first.interleaved {
-        let mut out = Vec::with_capacity((first.slots * first.context) as usize);
+        out.reserve((first.slots * first.context) as usize);
         for slot in 0..first.slots {
             for pos in 0..first.context {
                 out.push(pos * first.slots + slot);
             }
         }
-        return out;
+        return;
     }
-    (0..first.slots).collect()
+    out.extend(0..first.slots);
 }
 
-/// Packed control-table records for one launch.
-pub(crate) type Records = (Vec<Item>, Vec<Form>, Vec<Kept>);
-
-/// Converts run metadata into `core.h` items, forms and kept rows.
-pub(crate) fn pack_records(
+/// Packs run metadata into reusable control-table buffers.
+pub(crate) fn pack_into(
     items: &[Placed],
     scratch: Option<(u64, usize)>,
     kept: &[KeptDesc],
     pages_ref: Ref,
-) -> Result<Records, Error> {
-    let mut out_items = Vec::with_capacity(items.len() + usize::from(scratch.is_some()));
-    let mut out_forms = Vec::new();
+    bufs: &mut TableBufs,
+) -> Result<(), Error> {
+    bufs.items.clear();
+    bufs.forms.clear();
+    bufs.kept.clear();
+    bufs.items
+        .reserve(items.len() + usize::from(scratch.is_some()));
+    bufs.kept.reserve(kept.len());
     for p in items {
         let kind = match p.kind {
             ItemKind::Input => INPUT,
@@ -132,8 +181,8 @@ pub(crate) fn pack_records(
         };
         let (elem, form, forms) = match p.form {
             Some(meta) => {
-                let idx = out_forms.len() as u32;
-                out_forms.push(Form {
+                let idx = bufs.forms.len() as u32;
+                bufs.forms.push(Form {
                     codes: Ref::at(USER, p.at),
                     suh: meta.suh.map_or(Ref::NONE, |at| Ref::at(USER, at)),
                     svh: meta.svh.map_or(Ref::NONE, |at| Ref::at(USER, at)),
@@ -153,7 +202,7 @@ pub(crate) fn pack_records(
         } else {
             (p.dims, p.shape)
         };
-        out_items.push(Item {
+        bufs.items.push(Item {
             at: Ref::at(USER, p.at),
             kind,
             elem,
@@ -168,7 +217,7 @@ pub(crate) fn pack_records(
     if let Some((at, size)) = scratch {
         let bytes =
             u32::try_from(size).map_err(|_| Error::Plan(format!("an item of {size} bytes")))?;
-        out_items.push(Item {
+        bufs.items.push(Item {
             at: Ref::at(USER, at),
             kind: SCRATCH,
             elem: BYTES,
@@ -180,9 +229,8 @@ pub(crate) fn pack_records(
             unused: 0,
         });
     }
-    let mut out_kept = Vec::with_capacity(kept.len());
     for k in kept {
-        out_kept.push(Kept {
+        bufs.kept.push(Kept {
             base: Ref::at(USER, k.base),
             host: Ref::NONE,
             pages: k.pages.map_or(pages_ref, |at| Ref::at(USER, at)),
@@ -193,7 +241,7 @@ pub(crate) fn pack_records(
             elem: dtype_code(k.elem),
         });
     }
-    Ok((out_items, out_forms, out_kept))
+    Ok(())
 }
 
 /// The launcher's plan for `kernel` with `layout` counts.
@@ -242,9 +290,9 @@ where
     fn link(&mut self) -> Result<(L, u64), Error> {
         match std::mem::replace(&mut self.held, Held::Gone) {
             Held::Idle(link) => Ok((link, BASE)),
-            Held::Open { resident, .. } => {
-                let next = resident.next()?;
-                Ok(((*resident).close()?, next))
+            Held::Open(open) => {
+                let next = open.resident.next()?;
+                Ok((open.resident.close()?, next))
             }
             Held::Gone => Err(Error::Plan("an earlier open lost the link".into())),
         }
@@ -287,21 +335,24 @@ where
         };
         let overridden = self.overrides.get(entry).map(String::as_str);
         let replaced = overridden.is_some();
-        let (prepared, want_marks) = prepare_source(planned, overridden, self.profiling);
+        let want_marks = self.profiling && overridden.unwrap_or(planned).contains("TS_MARK");
+        let spec = kernel
+            .resident()
+            .ok_or_else(|| Error::Plan(format!("{} is not resident", kernel.name())))?;
         // Counts and scratch change with sizes, not the grid.
-        let threads = kernel.resident().map(|r| (r.threads, r.shared, r.lanes));
-        let rev = self.revision;
-        let key = format!(
-            "{}/{threads:?}/{}/{}/{}/{}/{rev}/{want_marks}",
-            kernel.name(),
-            layout.items,
-            layout.forms,
-            layout.kept,
-            layout.pages,
-        );
-        if matches!(&self.held, Held::Open { key: k, .. } if *k == key) {
+        let key = OpenKey {
+            name: kernel.name(),
+            threads: spec.threads,
+            shared: spec.shared,
+            lanes: spec.lanes,
+            layout,
+            revision: self.revision,
+            want_marks,
+        };
+        if matches!(&self.held, Held::Open(open) if open.key == key) {
             return Ok(());
         }
+        let (prepared, want_marks) = prepare_source(planned, overridden, self.profiling);
         let compiled = match prepared {
             Some(ref text) => self.ctx.compile(text, entry)?,
             None => cached_source::<D>(planned, entry)?,
@@ -328,12 +379,13 @@ where
             true => self.bind_marks(resident.kernel())?,
             false => false,
         };
-        self.held = Held::Open {
+        self.held = Held::Open(Box::new(OpenGrid {
             key,
             entry: entry.to_string(),
-            resident: Box::new(resident),
+            resident,
             marked,
-        };
+            cache: RefillCache::default(),
+        }));
         Ok(())
     }
 
@@ -344,38 +396,49 @@ where
         kept: &[KeptDesc],
         values: &[u32],
     ) -> Result<(), Error> {
-        let synth = synth_pages(kept);
+        fill_pages(kept, &mut self.staged.synth);
         let forms = items.iter().filter(|p| p.form.is_some()).count();
         let layout = GridLayout {
             items: items.len(),
             forms,
             kept: kept.len(),
-            pages: synth.len(),
+            pages: self.staged.synth.len(),
         };
         // Each step runs in the grid built for its kernel.
         self.open(kernel, layout)?;
         let scratch = self.scratch.as_ref().map(|s| (s.device_ptr(), s.size()));
         let ledger = self.ledger.as_ref().map(DeviceBuffer::device_ptr);
-        let Held::Open {
-            entry,
-            resident,
-            marked,
-            ..
-        } = &mut self.held
-        else {
+        let Held::Open(open) = &mut self.held else {
             return Err(Error::Plan("no grid is open".into()));
         };
-        let (all_items, all_forms, all_kept) =
-            pack_records(items, scratch, kept, resident.pages_ref())?;
-        if *marked && let Some(ptr) = ledger {
+        pack_into(
+            items,
+            scratch,
+            kept,
+            open.resident.pages_ref(),
+            &mut self.staged,
+        )?;
+        if open.marked
+            && let Some(ptr) = ledger
+        {
             self.ctx.zero(ptr, marks::COUNTS)?;
         }
-        resident.refill(&all_items, &all_forms, &all_kept, &synth)?;
-        resident.launch(values, TIMEOUT)?;
-        if *marked && let Some(ptr) = ledger {
+        if open.cache.needs_refill(&self.staged) {
+            open.resident.refill(
+                &self.staged.items,
+                &self.staged.forms,
+                &self.staged.kept,
+                &self.staged.synth,
+            )?;
+            open.cache.store(&mut self.staged);
+        }
+        open.resident.launch(values, TIMEOUT)?;
+        if open.marked
+            && let Some(ptr) = ledger
+        {
             let mut found = Marks::default();
             marks::collect(&self.ctx, ptr, &mut found)?;
-            self.marks.push((entry.clone(), found));
+            self.marks.push((open.entry.clone(), found));
         }
         Ok(())
     }
@@ -480,6 +543,7 @@ where
         revision: 0,
         ledger: None,
         marks: Vec::new(),
+        staged: TableBufs::default(),
     })
 }
 
