@@ -436,9 +436,7 @@ impl Engine {
         {
             return Err(Error::RowPlace);
         }
-        let table = self.lanes.as_ref().and_then(lanes::Lanes::pending);
-        let table = table.map(<[u32]>::to_vec).unwrap_or_default();
-        self.announce(rows, picks, &head, wants, &table)?;
+        self.announce(rows, picks, &head, wants)?;
         let (mut sizes, mut feeds) = launch_of(rows, picks, self.slots);
         let wanted = feeds[3].len();
         let entry = head.entry();

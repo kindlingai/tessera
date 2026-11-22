@@ -98,9 +98,7 @@ impl Engine {
             if let (Some(lanes), false) = (&mut self.lanes, t.table.is_empty()) {
                 lanes.replace(t.table);
             }
-            let outputs = self.run(&t.rows, &t.picks, t.head, t.wants)?;
-            // The read waits for the launch, as on rank 0.
-            self.runner.read(outputs[0])?;
+            self.run(&t.rows, &t.picks, t.head, t.wants)?;
             self.report();
         }
     }
@@ -139,14 +137,18 @@ impl Engine {
         picks: &[u32],
         head: &Head,
         wants: Wants,
-        table: &[u32],
     ) -> Result<(), Error> {
         match &self.control {
             Some(control) if control.rank() == 0 => {}
             _ => return Ok(()),
         }
-        self.told(&encode(rows, picks, head, wants, table))
-            .map(|_| ())
+        let table = self
+            .lanes
+            .as_ref()
+            .and_then(crate::lanes::Lanes::pending)
+            .unwrap_or(&[]);
+        let bytes = encode(rows, picks, head, wants, table);
+        self.told(&bytes).map(|_| ())
     }
 }
 
@@ -157,19 +159,18 @@ fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32])
         Head::Full(Some(masks)) => (1, 0, masks),
         Head::Sparse(ids, k) => (2, *k, ids),
     };
-    let flat: Vec<u32> = rows
-        .iter()
-        .flat_map(|r| [r.slot, r.token, r.position])
-        .collect();
-    let mut words = Writer::default();
+    let count = 7 + table.len() + rows.len() * 3 + picks.len() + list.len();
+    let mut words = Writer(Vec::with_capacity(count * 4));
     words
         .u32(tag)
         .u32(k as u32)
         .u32(wants.0)
         .u32s(table)
-        .u32s(&flat)
-        .u32s(picks)
-        .u32s(list);
+        .u32((rows.len() * 3) as u32);
+    for r in rows {
+        words.u32(r.slot).u32(r.token).u32(r.position);
+    }
+    words.u32s(picks).u32s(list);
     words.0
 }
 
@@ -188,19 +189,24 @@ fn decode(bytes: &[u8]) -> Option<Told> {
     let mut words = Reader(bytes);
     let (tag, k) = (words.u32()?, words.u32()?);
     let (wants, table) = (Wants(words.u32()?), words.u32s()?);
-    let (rows, picks, list) = (words.u32s()?, words.u32s()?, words.u32s()?);
-    let row = |&[slot, token, position]: &[u32; 3]| Row {
-        slot,
-        token,
-        position,
-    };
+    let count = words.u32()? as usize;
+    let mut raw = Reader(words.take(count.checked_mul(4)?)?);
+    let mut rows = Vec::with_capacity(count / 3);
+    for _ in 0..count / 3 {
+        rows.push(Row {
+            slot: raw.u32()?,
+            token: raw.u32()?,
+            position: raw.u32()?,
+        });
+    }
+    let (picks, list) = (words.u32s()?, words.u32s()?);
     let head = match tag {
         0 => Head::Full(None),
         1 => Head::Full(Some(list)),
         _ => Head::Sparse(list, k as usize),
     };
     Some(Told {
-        rows: rows.as_chunks::<3>().0.iter().map(row).collect(),
+        rows,
         picks,
         head,
         wants,
