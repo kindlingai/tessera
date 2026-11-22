@@ -62,6 +62,20 @@ TESSERA_FN u32 load_fresh(const u32* p) {
     return __ldcv(p);
 }
 
+TESSERA_FN float4 load_fresh4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+TESSERA_FN uint2 load_fresh4(const u16* p) {
+    uint2 v;
+    asm volatile("ld.global.cv.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+
 TESSERA_FN void pause() {
     __nanosleep(32);
 }
@@ -101,6 +115,16 @@ TESSERA_FN u32 fetch_add_gpu(u32* p, u32 v) {
 
 TESSERA_FN float load_fresh(const float* p) {
     return __uint_as_float(load_fresh(reinterpret_cast<const u32*>(p)));
+}
+
+TESSERA_FN float4 load_fresh4(const float* p) {
+    return make_float4(load_fresh(p), load_fresh(p + 1), load_fresh(p + 2), load_fresh(p + 3));
+}
+
+TESSERA_FN uint2 load_fresh4(const u16* p) {
+    u32 lo = u32(load_fresh(p)) | (u32(load_fresh(p + 1)) << 16);
+    u32 hi = u32(load_fresh(p + 2)) | (u32(load_fresh(p + 3)) << 16);
+    return make_uint2(lo, hi);
 }
 
 // Sleeps the whole wave. Use it in leader spins only.

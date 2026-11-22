@@ -236,7 +236,7 @@ TESSERA_FN bool ready(const ticket& r) {
 }
 
 // Waits in this block until ready. False means stop.
-TESSERA_FN bool wait(const ticket& r) {
+TESSERA_FN bool wait(const ticket& r, bool read = true) {
     __shared__ int ok;
     const table* t = r.s->t;
     u64* seen = &detail::shared(t)->arrived[r.l->pool][r.slot];
@@ -256,14 +256,14 @@ TESSERA_FN bool wait(const ticket& r) {
             if (ok) prim::store_release_gpu64(seen, r.ordinal);
         } else if (!detail::mirror(r, seen, r.ordinal, true)) {
             ok = 0;
-        } else if (!ready(r)) {
+        } else if (read && !ready(r)) {
             // One system-scope read orders this block's data reads.
             fail(t, PROTOCOL, r.l->pool, r.ordinal);
             ok = 0;
         }
     }
     prim::block_sync();
-    prim::fence_sys();
+    if (read) prim::fence_sys();
     return ok != 0;
 }
 
@@ -299,6 +299,29 @@ struct parts {
         return s;
     }
 
+    // Four aligned elements of the sum, in rank order.
+    TESSERA_FN float4 sum4(u32 i) const {
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (elem == BF16) {
+            for (u32 k = 0; k < count; k++) {
+                uint2 h = prim::load_fresh4(static_cast<const u16*>(part[k]) + i);
+                s.x += prim::from_bits(h.x << 16);
+                s.y += prim::from_bits(h.x & 0xFFFF0000u);
+                s.z += prim::from_bits(h.y << 16);
+                s.w += prim::from_bits(h.y & 0xFFFF0000u);
+            }
+            return s;
+        }
+        for (u32 k = 0; k < count; k++) {
+            float4 v = prim::load_fresh4(static_cast<const float*>(part[k]) + i);
+            s.x += v.x;
+            s.y += v.y;
+            s.z += v.z;
+            s.w += v.w;
+        }
+        return s;
+    }
+
     TESSERA_FN float load(u32 k, u32 i) const {
         if (elem == BF16) {
             u16 h = prim::load_fresh(static_cast<const u16*>(part[k]) + i);
@@ -327,7 +350,7 @@ TESSERA_FN parts received(const ticket& r) {
     for (u32 k = 0; k < l->group_size; k++) {
         if (k != l->group_rank) {
             p.part[p.count] = get<const void>(t, r.p->recv[r.slot * MAX_GROUP + k]);
-            p.size[p.count] = u32(prim::load_acquire_sys(&f[k].count));
+            p.size[p.count] = l->what == SUM ? r.elements : u32(prim::load_acquire_sys(&f[k].count));
             p.count++;
             continue;
         }

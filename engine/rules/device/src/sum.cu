@@ -54,8 +54,8 @@ extern "C" __global__ void tessera_sums(const table* t) {
             float* part = send_buffer<float>(b);
             if (part == nullptr) return;
             if (first == 0) part[0] = 0.0f;
-            if (!trigger(b, 1)) return;
-            if (!wait(b)) return;
+            if (!trigger(b, 1, first == 0)) return;
+            if (!wait(b, false)) return;
         }
         u64 met = prim::clock_ticks();
         const float* from = reinterpret_cast<const float*>(now.from);
@@ -65,11 +65,31 @@ extern "C" __global__ void tessera_sums(const table* t) {
             ticket r = prepare(s, 0);
             float* part = send_buffer<float>(r);
             if (part == nullptr) return;
-            for (u32 i = first; i < len; i += stride) part[i] = from[done + i];
-            if (!trigger(r, len)) return;
-            if (!wait(r)) return;
-            parts got = received(r);
-            for (u32 i = first; i < len; i += stride) to[done + i] = got.sum(i);
+            u64 align = reinterpret_cast<u64>(from + done) | reinterpret_cast<u64>(to + done)
+                        | reinterpret_cast<u64>(part);
+            bool vec4 = (len & 3u) == 0u && (align & 15ull) == 0ull;
+            bool active = vec4 ? ((blockIdx.x * blockDim.x) << 2) < len
+                               : (blockIdx.x * blockDim.x) < len;
+            if (vec4) {
+                for (u32 i = first << 2; i < len; i += stride << 2) {
+                    *reinterpret_cast<float4*>(part + i) =
+                        *reinterpret_cast<const float4*>(from + done + i);
+                }
+            } else {
+                for (u32 i = first; i < len; i += stride) part[i] = from[done + i];
+            }
+            if (!trigger(r, len, active)) return;
+            if (!wait(r, active)) return;
+            if (active) {
+                parts got = received(r);
+                if (vec4) {
+                    for (u32 i = first << 2; i < len; i += stride << 2) {
+                        *reinterpret_cast<float4*>(to + done + i) = got.sum4(i);
+                    }
+                } else {
+                    for (u32 i = first; i < len; i += stride) to[done + i] = got.sum(i);
+                }
+            }
         }
         u64 summed = prim::clock_ticks();
         __threadfence();
