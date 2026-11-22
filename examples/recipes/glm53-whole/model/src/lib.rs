@@ -1,8 +1,8 @@
 //! GLM-5.3's whole step, embedding to logits, as one persistent kernel.
 
 use std::collections::HashMap;
-use tessera_guest::site::{Count, Input, Kind, Lane, Offer};
-use tessera_guest::site::{Place, Resident, Scalar, Shape, Site};
+use tessera_guest::site::{Count, File, Input, Kind, Lane, Manifest, Offer};
+use tessera_guest::site::{Place, Resident, Rule, Scalar, Shape, Site};
 
 const NAME: &str = "glm53_whole";
 const THREADS: u32 = 256;
@@ -408,4 +408,36 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     }])
 }
 
-tessera_guest::exports!(NAME, Kind::Model, "whole.cu", offer);
+#[unsafe(no_mangle)]
+pub extern "C" fn alloc(len: i32) -> i32 {
+    tessera_guest::alloc(len)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn manifest() -> i64 {
+    let file = |path, text| File { path, text };
+    tessera_guest::declare(&Manifest {
+        abi: tessera_guest::ABI,
+        kernels: vec![tessera_guest::site::imports(NAME, NAME, "whole.cu")],
+        rules: vec![Rule {
+            name: NAME,
+            site: Kind::Model,
+        }],
+        graph: false,
+        files: vec![
+            file("whole.cu", include_str!("whole.cu")),
+            file("math.cuh", include_str!("math.cuh")),
+            file("trellis.cuh", include_str!("trellis.cuh")),
+            file("gemv.cuh", include_str!("gemv.cuh")),
+            file("attn.cuh", include_str!("attn.cuh")),
+            file("moe.cuh", include_str!("moe.cuh")),
+        ],
+    })
+}
+
+/// The offer for a site that fits, else `null`.
+#[unsafe(no_mangle)]
+pub extern "C" fn propose(at: i32, len: i32) -> i64 {
+    // SAFETY: the host passes back what `alloc` returned.
+    unsafe { tessera_guest::answer(at, len, offer) }
+}
