@@ -89,8 +89,12 @@ pub fn flatten(
     if imports.is_empty() {
         return Err(whole(Problem::NoImports));
     }
-    let persistent = imports.iter().find(|i| i.persistent());
-    if let Some(i) = persistent.filter(|_| backend == Backend::Metal) {
+    let no_metal = |i: &&Import| i.persistent() || **i == Import::Trellis;
+    if let Some(i) = imports
+        .iter()
+        .find(no_metal)
+        .filter(|_| backend == Backend::Metal)
+    {
         return Err(whole(Problem::Unsupported(backend, i.name())));
     }
     let collective = imports.iter().any(|i| i.collective());

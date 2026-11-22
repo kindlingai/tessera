@@ -67,10 +67,11 @@ pub enum Import {
     State,
     Llm,
     Image,
+    Trellis,
 }
 
 impl Import {
-    const ALL: [Import; 10] = [
+    const ALL: [Import; 11] = [
         Import::Core,
         Import::Grid,
         Import::AllReduce,
@@ -81,6 +82,7 @@ impl Import {
         Import::State,
         Import::Llm,
         Import::Image,
+        Import::Trellis,
     ];
 
     pub fn name(self) -> &'static str {
@@ -95,6 +97,7 @@ impl Import {
             Import::State => "state",
             Import::Llm => "llm",
             Import::Image => "image",
+            Import::Trellis => "trellis",
         }
     }
 
@@ -147,7 +150,7 @@ fn device(_: &[Import], backend: Backend) -> bool {
 }
 
 /// Every header, in the order a flattened kernel holds them.
-pub(crate) static HEADERS: [Header; 9] = [
+pub(crate) static HEADERS: [Header; 10] = [
     header!("core.h", None, |_, _| true),
     header!("backend.h", None, device),
     header!("status.h", None, device),
@@ -170,4 +173,7 @@ pub(crate) static HEADERS: [Header; 9] = [
         i,
         Import::Image
     )),
+    header!("trellis.h", Some("TESSERA_CAP_TRELLIS"), |i, b| {
+        has(i, Import::Trellis) && b != Backend::Metal
+    }),
 ];

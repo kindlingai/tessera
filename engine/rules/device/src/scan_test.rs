@@ -1,5 +1,5 @@
-use crate::Problem;
 use crate::scan::scan;
+use crate::{Import, Problem};
 
 fn problem(text: &str) -> Problem {
     scan("k.cu", text).unwrap_err().problem
@@ -41,4 +41,6 @@ fn includes_at_top() {
     }
     let quiet = "/* a\n b */\n#include <tessera/1/llm>\n/* #include <x>\n */ int x; // #include\n";
     assert_eq!(scan("k.cu", quiet).unwrap().includes, [2]);
+    let trellis = scan("k.cu", "#include <tessera/1/trellis>\n").unwrap();
+    assert_eq!(trellis.imports, [Import::Trellis]);
 }
