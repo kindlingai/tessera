@@ -76,7 +76,13 @@ pub fn declare(manifest: &site::Manifest) -> i64 {
 /// A one-kernel module's exports: kernel `$name` from `$file`.
 #[macro_export]
 macro_rules! exports {
+    (ask: $name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
+        $crate::exports!(@emit answer_ask, $name, $kind, $file, $offer $(, [$($extra),*])?);
+    };
     ($name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
+        $crate::exports!(@emit answer, $name, $kind, $file, $offer $(, [$($extra),*])?);
+    };
+    (@emit $answer:ident, $name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn alloc(len: i32) -> i32 {
             $crate::alloc(len)
@@ -111,7 +117,7 @@ macro_rules! exports {
         #[unsafe(no_mangle)]
         pub extern "C" fn propose(at: i32, len: i32) -> i64 {
             // SAFETY: the host passes back what `alloc` returned.
-            unsafe { $crate::answer_ask(at, len, |ask| $offer(&ask.site)) }
+            unsafe { $crate::$answer(at, len, $offer) }
         }
     };
 }

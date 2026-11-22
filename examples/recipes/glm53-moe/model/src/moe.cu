@@ -1,10 +1,13 @@
 // GLM-5.3's routed block: route, experts, then finish.
 #include <tessera/1/core>
+#include <tessera/1/trellis>
 
 using tessera::u32;
 using tessera::u64;
+using tessera::u8;
 namespace prim = tessera::prim;
-typedef const unsigned char* bytes;
+namespace trellis = tessera::trellis;
+typedef const u8* bytes;
 
 // Most picks per row, and rows per expert block.
 #define PICKS 8
@@ -14,168 +17,29 @@ typedef const unsigned char* bytes;
 #define ROUTE_SCALE 2.5f
 // Each rotation of 128 channels scales by 1 / 128 here.
 #define TURNED (1.0f / 128.0f)
-// Trellis header bytes, and the side word of input entries.
-#define HEAD 16
-#define INPUT_SIDE 2u
-#define MCG 0xCBAC1FEDu
-#define MUL1 0x83DCD12Du
 
 static __device__ inline u32 word(bytes p, u32 at) {
   return *(const u32*)(p + at);
 }
 
-static __device__ inline float half(u32 h) {
-  float r;
-  unsigned short s = (unsigned short)h;
-  asm("{.reg .b16 t; mov.b16 t, %1; cvt.f32.f16 %0, t;}" : "=f"(r) : "h"(s));
-  return r;
-}
-
-// `lo` and `hi` as f16, rounded to nearest even.
-static __device__ inline u32 halves(float lo, float hi) {
-  u32 r;
-  asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
-  return r;
-}
-
-// Two f16 values rounded to E4M3, saturated at 448.
-static __device__ inline u32 narrowed(u32 h) {
-  u32 r;
-  asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}"
-      : "=r"(r) : "r"(h));
-  return r;
-}
-
-static __device__ inline u32 perm(u32 a, u32 b, u32 s) {
-  u32 r;
-  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(s));
-  return r;
-}
-
-// The 32 bits from bit `s` of `hi` then `lo`.
-static __device__ inline u32 funnel(u32 lo, u32 hi, u32 s) {
-  u32 r;
-  asm("shf.l.clamp.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(lo), "r"(hi), "r"(s));
-  return r;
-}
-
-static __device__ inline u32 load(bytes p) {
-  u32 r;
-  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(r) : "l"(p));
-  return r;
-}
-
-static __device__ inline void load4(bytes p, u32* r) {
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "l"(p));
-}
-
-// Two states' weights as f16. `BOOK`: 0 mcg, 1 mul1.
-template <u32 BOOK>
-static __device__ inline u32 pair(u32 a, u32 b) {
-  if (BOOK == 1) {
-    // The f16 values 0x1EEE and 0xC931.
-    const float scale = 1774.0f / 262144.0f, offset = -1329.0f / 128.0f;
-    // The sum lands in the mantissa of 2^23 + 1024.
-    u32 sx, sy;
-    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sx) : "r"(a * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
-    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sy) : "r"(b * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
-    // The f32 result is exact, so f16 rounds once.
-    const float base = offset - 8388608.0f * scale;
-    return narrowed(halves(fmaf(__uint_as_float(sx), scale, base), fmaf(__uint_as_float(sy), scale, base)));
-  }
-  u32 x = ((a * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-  u32 y = ((b * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-  // The f16 sum of two halves is exact in f32.
-  u32 s;
-  asm("add.rn.f16x2 %0, %1, %2;" : "=r"(s) : "r"(perm(x, y, 0x5410)), "r"(perm(x, y, 0x7632)));
-  return narrowed(s);
-}
-
-// The lanes and bit that hold this lane's first state.
-struct Lane {
-  u32 q0, q1, q2, shift;
-};
-
-template <u32 K>
-static __device__ inline Lane lanes(u32 lane) {
-  const u32 words = 8 * K, span = (16 + K - 1) / K;
-  // A state spans `span` codes ending at its position.
-  u32 first = ((8 * lane + 257 - span) % 256) * K + span * K - 16;
-  u32 q = first / 32;
-  Lane l = {q, (q + 1) % words, (q + 2) % words, first % 32};
-  return l;
-}
-
-// A tile's words `t` into this lane's mma A fragment.
-template <u32 K, u32 BOOK>
-static __device__ inline void decode(const u32* t, const Lane& l, u32* a) {
-  u32 w0 = t[l.q0], w1 = t[l.q1], w2 = t[l.q2];
-  // 64 bits from the first state on.
-  u32 hi = funnel(w1, w0, l.shift), lo = funnel(w2, w1, l.shift);
-  u32 st[8];
-#pragma unroll
-  for (u32 s = 0; s < 8; s++) st[s] = funnel(lo, hi, K * s) >> 16;
-  a[0] = pair<BOOK>(st[0], st[1]);
-  a[1] = pair<BOOK>(st[4], st[5]);
-  a[2] = pair<BOOK>(st[2], st[3]);
-  a[3] = pair<BOOK>(st[6], st[7]);
-}
-
-// `c += a b` for one 16 by 8 output tile.
-static __device__ inline void mma(float* c, const u32* a, const u32* b) {
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-      "{%0,%1,%2,%3};"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-// A code set's tiles, matrix shape and side.
+// A code set's base, matrix shape and side.
 struct Mat {
-  bytes p;
-  u32 inp, out, side;
+  bytes base;
+  u32 inp, out;
+  bool input_side;
 };
 
 static __device__ inline Mat matrix(bytes p) {
-  Mat w = {p + HEAD, word(p, 0), word(p, 4), word(p, 8)};
+  Mat w = {p, word(p, 0), word(p, 4), word(p, 8) == trellis::INPUT_SIDE};
   return w;
 }
 
-// Tile of inputs `16 i`, outputs `16 o`, matrix `m`.
+// Loads eight tiles at input tile `i`, output block `o`.
 template <u32 K>
-static __device__ inline bytes tile(const Mat& w, u32 m, u32 i, u32 o) {
-  u32 t = w.side == INPUT_SIDE ? (i / 8) * (w.out / 2) + 64 * (o / 8) + 8 * (i % 8) + o % 8
-                               : (o / 8) * (w.inp / 2) + 8 * i + o % 8;
-  u64 first = (u64)m * (w.inp / 16) * (w.out / 16);
-  return w.p + (first + t) * (32 * K);
-}
-
-// Eight tiles from input `16 i`, output `128 o`.
-template <u32 K>
-static __device__ inline void fetch(const Mat& w, u32 m, u32 i, u32 o, u32 lane, bool wide, u32* r) {
-  // The eight tiles lie in a row on both sides.
-  bytes p = tile<K>(w, m, i, 8 * o);
-  if (wide) {
-    load4(p + 16 * lane, r);
-    if (K > 2 && lane < 16 * K - 32) load4(p + 512 + 16 * lane, r + 4);
-    return;
-  }
-#pragma unroll
-  for (u32 mt = 0; mt < 8; mt++) r[mt] = lane < 8 * K ? load(p + 4 * (mt * 8 * K + lane)) : 0u;
-}
-
-// Stores the fetched words in the warp's tile words `s`.
-template <u32 K>
-static __device__ inline void put(const u32* r, u32 lane, bool wide, u32* s) {
-  if (wide) {
-    ((uint4*)s)[lane] = make_uint4(r[0], r[1], r[2], r[3]);
-    if (K > 2 && lane < 16 * K - 32) ((uint4*)s)[32 + lane] = make_uint4(r[4], r[5], r[6], r[7]);
-    return;
-  }
-#pragma unroll
-  for (u32 mt = 0; mt < 8; mt++) {
-    if (lane < 8 * K) s[mt * 8 * K + lane] = r[mt];
-  }
+static __device__ inline void load_tiles(
+    const Mat& w, u32 m, u32 i, u32 o, u32 lane, bool wide, u32 reg[8]) {
+  bytes p = trellis::tile_ptr<K>(w.base, w.inp, w.out, m, i, o, w.input_side);
+  trellis::tile_load<K>(p, lane, wide, reg);
 }
 
 // Walsh-Hadamard transform of `n` runs of 128, one warp.
@@ -204,22 +68,6 @@ static __device__ void turn_block(float* v, u32 n) {
       v[i + len] = a - b;
     }
     prim::block_sync();
-  }
-}
-
-// B fragment of step `ks`: rows as f16, then remainders.
-static __device__ inline void fragment(const float* v, u32 n, u32 ks, u32 lane, u32* b) {
-  u32 col = lane / 4, r = col / 2;
-  if (r >= n) {
-    b[0] = b[1] = 0u;
-    return;
-  }
-  const float* at = v + r * 128 + 16 * ks + 2 * (lane % 4);
-#pragma unroll
-  for (u32 h = 0; h < 2; h++) {
-    float x0 = at[8 * h], x1 = at[8 * h + 1];
-    u32 hi = halves(x0, x1);
-    b[h] = col % 2 ? halves(x0 - half(hi & 0xFFFFu), x1 - half(hi >> 16)) : hi;
   }
 }
 
@@ -310,7 +158,7 @@ template <u32 K, u32 BOOK>
 static __device__ void expert(const Job& j, const float* x, float* partial, Space& sp) {
   float(*vec)[ROWS][128] = sp.vec;
   u32 warp = threadIdx.x / 32, lane = threadIdx.x % 32, n = j.n, c = j.c;
-  Lane l = lanes<K>(lane);
+  trellis::lane_map l = trellis::map_lane<K, BOOK>(lane);
   Mat D = matrix(j.down);
   // Even warps take the gate, odd warps the up.
   u32 h = warp % 2;
@@ -322,11 +170,11 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
   for (u32 mt = 0; mt < 8; mt++) acc[mt][0] = acc[mt][1] = acc[mt][2] = acc[mt][3] = 0.0f;
   u32* held = sp.words[warp];
   // 16 byte loads need 16 byte aligned tiles.
-  bool wide = ((u64)W.p & 15) == 0 && ((u64)D.p & 15) == 0;
+  bool wide = ((u64)W.base & 15) == 0 && ((u64)D.base & 15) == 0;
   // Each step loads the next step's eight tiles first.
   u32 steps = (W.inp / 128 - warp / 2 + WARPS / 2 - 1) / (WARPS / 2) * 8;
   u32 got[8];
-  fetch<K>(W, j.m, 8 * (warp / 2), c, lane, wide, got);
+  load_tiles<K>(W, j.m, 8 * (warp / 2), c, lane, wide, got);
   for (u32 t = 0; t < steps; t++) {
     u32 q = warp / 2 + (t / 8) * (WARPS / 2), ks = t % 8;
     if (ks == 0) {
@@ -342,31 +190,24 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
       turn_warp(b, n);
     }
     __syncwarp();
-    put<K>(got, lane, wide, held);
+    trellis::tile_store<K>(got, lane, wide, held);
     __syncwarp();
     if (t + 1 < steps) {
       u32 qn = warp / 2 + ((t + 1) / 8) * (WARPS / 2);
-      fetch<K>(W, j.m, 8 * qn + (t + 1) % 8, c, lane, wide, got);
+      load_tiles<K>(W, j.m, 8 * qn + (t + 1) % 8, c, lane, wide, got);
     }
     u32 f[2];
-    fragment(b, n, ks, lane, f);
+    trellis::act_frag(b, n, ks, lane, f);
 #pragma unroll
     for (u32 mt = 0; mt < 8; mt++) {
       u32 a[4];
-      decode<K, BOOK>(held + mt * 8 * K, l, a);
-      mma(acc[mt], a, f);
+      trellis::decode_frag<K, BOOK>(held + mt * 8 * K, l, a);
+      trellis::mma_m16n8k16(acc[mt], a, f);
     }
   }
   __syncwarp();
   // Each warp's sums, then their totals, in `vec`.
-  u32 r = lane % 4, g = lane / 4;
-  if (r < n) {
-#pragma unroll
-    for (u32 mt = 0; mt < 8; mt++) {
-      b[r * 128 + mt * 16 + g] = acc[mt][0] + acc[mt][1];
-      b[r * 128 + mt * 16 + g + 8] = acc[mt][2] + acc[mt][3];
-    }
-  }
+  trellis::store_acc(acc, n, lane, b);
   prim::block_sync();
   for (u32 i = threadIdx.x; i < 2 * ROWS * 128; i += blockDim.x) {
     u32 side = i / (ROWS * 128), at = i % (ROWS * 128);
@@ -386,7 +227,8 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
   turn_block(&vec[2][0][0], ROWS);
   u32 blocks = (D.out / 128 - warp + WARPS - 1) / WARPS * 8;
   float out[8][4];
-  fetch<K>(D, j.m, 8 * c, warp, lane, wide, got);
+  load_tiles<K>(D, j.m, 8 * c, warp, lane, wide, got);
+  u32 r = lane % 4, g = lane / 4;
   for (u32 t = 0; t < blocks; t++) {
     u32 ob = warp + (t / 8) * WARPS, ks = t % 8;
     if (ks == 0) {
@@ -394,16 +236,18 @@ static __device__ void expert(const Job& j, const float* x, float* partial, Spac
       for (u32 mt = 0; mt < 8; mt++) out[mt][0] = out[mt][1] = out[mt][2] = out[mt][3] = 0.0f;
     }
     __syncwarp();
-    put<K>(got, lane, wide, held);
+    trellis::tile_store<K>(got, lane, wide, held);
     __syncwarp();
-    if (t + 1 < blocks) fetch<K>(D, j.m, 8 * c + (t + 1) % 8, warp + ((t + 1) / 8) * WARPS, lane, wide, got);
+    if (t + 1 < blocks) {
+      load_tiles<K>(D, j.m, 8 * c + (t + 1) % 8, warp + ((t + 1) / 8) * WARPS, lane, wide, got);
+    }
     u32 f[2];
-    fragment(&vec[2][0][0], n, ks, lane, f);
+    trellis::act_frag(&vec[2][0][0], n, ks, lane, f);
 #pragma unroll
     for (u32 mt = 0; mt < 8; mt++) {
       u32 a[4];
-      decode<K, BOOK>(held + mt * 8 * K, l, a);
-      mma(out[mt], a, f);
+      trellis::decode_frag<K, BOOK>(held + mt * 8 * K, l, a);
+      trellis::mma_m16n8k16(out[mt], a, f);
     }
     if (ks == 7 && r < n) {
       float* to = partial + sp.at[r] + ob * 128;
@@ -518,9 +362,9 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_experts(
   }
   prim::block_sync();
   if (book) {
-    expert_k<1>(k, j, x, partial, sp);
+    expert_k<trellis::BOOK_MUL1>(k, j, x, partial, sp);
   } else {
-    expert_k<0>(k, j, x, partial, sp);
+    expert_k<trellis::BOOK_MCG>(k, j, x, partial, sp);
   }
 }
 
@@ -530,6 +374,7 @@ extern "C" __global__ void glm53_finish(
     const float* shared_down_sv, const float* partial,
     float* y, u32 rows, u32 hidden, u32 ffn, u32 experts, u32 picks, u32 first, u32 count,
     u32 shared_ffn) {
+  (void)rows;
   __shared__ u32 ids[PICKS];
   __shared__ float gates[PICKS];
   __shared__ float z[PICKS + 1][128];
