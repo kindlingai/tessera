@@ -309,11 +309,12 @@ pub struct Resident {
     pub lanes: Vec<Lane>,
 }
 
-/// One collective lane's operation, over f32.
+/// One collective lane's operation and element type.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Lane {
     Sum,
+    SumBf16,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

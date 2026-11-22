@@ -105,11 +105,15 @@ impl Text {
                 threads,
             },
         };
+        let lane = |l: &Lane| match l {
+            Lane::Sum => Collective::Sum,
+            Lane::SumBf16 => Collective::SumBf16,
+        };
         let resident = offer.resident.as_ref().map(|r| Resident {
             threads: r.threads,
             shared: r.shared,
             scratch: r.scratch,
-            lanes: r.lanes.iter().map(|Lane::Sum| Collective::Sum).collect(),
+            lanes: r.lanes.iter().map(lane).collect(),
         });
         Self {
             fixed,

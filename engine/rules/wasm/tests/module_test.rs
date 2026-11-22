@@ -11,7 +11,8 @@ use tessera_graph::{Parts, shard};
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::kept::{self, Layout};
 use tessera_lower::{
-    Arg, Cache, Cluster, Device, Extent, Limits, Plan, Platform, Rule, Shape, Source, lower,
+    Arg, Cache, Cluster, Collective, Device, Extent, Limits, Plan, Platform, Rule, Shape, Source,
+    lower,
 };
 use tessera_run::testing::{host, runs};
 use tessera_run::{Loopback, Run};
@@ -384,7 +385,7 @@ fn module_runs_resident() {
     let whole = json!({
         "kernel": "wasm_whole", "reads": [0, 1, 2], "len": 256,
         "counts": [{"dim": "Rows"}], "shape": {"line": 1}, "work": 256, "guess": 1e-15,
-        "resident": {"threads": 128, "scratch": 1024, "lanes": ["sum"]},
+        "resident": {"threads": 128, "scratch": 1024, "lanes": ["sum", "sum_bf16"]},
     });
     let bytes = module(&declare(ABI, "layer", kernels), &json!([whole]), "");
     let rule = tessera_wasm::load(&bytes).unwrap()[0];
@@ -395,6 +396,7 @@ fn module_runs_resident() {
         };
         let resident = step.kernel.resident().unwrap();
         assert_eq!((resident.threads, resident.scratch), (128, 1024));
+        assert_eq!(resident.lanes, [Collective::Sum, Collective::SumBf16]);
         // Three reads and the output, then the row count.
         assert_eq!(step.launches()[0].args.len(), 5);
     }

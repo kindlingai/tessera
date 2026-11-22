@@ -197,17 +197,26 @@ pub(crate) fn pack_records(
 }
 
 /// The launcher's plan for `kernel` with `layout` counts.
-fn plan(kernel: &KernelRef, layout: GridLayout, ranks: u32, share: u32) -> Result<Plan, Error> {
+pub(crate) fn plan(
+    kernel: &KernelRef,
+    layout: GridLayout,
+    ranks: u32,
+    share: u32,
+) -> Result<Plan, Error> {
     let resident = kernel
         .resident()
         .ok_or_else(|| Error::Plan(format!("{} is not resident", kernel.name())))?;
-    let lane = |c: &Collective| match c {
-        Collective::Sum => LanePlan {
+    let lane = |c: &Collective| {
+        let elem = match c {
+            Collective::Sum => crate::layout::F32,
+            Collective::SumBf16 => crate::layout::BF16,
+        };
+        LanePlan {
             op: Op::Sum,
-            elem: crate::layout::F32,
+            elem,
             pool: 0,
             block: 0,
-        },
+        }
     };
     Ok(Plan {
         pools: vec![pool(ranks)],

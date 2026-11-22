@@ -2,10 +2,12 @@ use crate::layout::{
     ARENAS, BF16, BYTES, F32, FORM, Form, INPUT, Item, KV, Kept, KvTables, NONE, OUTPUT, Ref,
     SCRATCH, Table, form_kind,
 };
+use crate::proxy::Op;
 use crate::resident::{Plan, USER, build_control};
-use crate::whole::{format_summary, pack_records, prepare_source, synth_pages};
+use crate::whole::{format_summary, pack_records, plan, prepare_source, synth_pages};
 use tessera_gpukit::device::KernelStats;
-use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, marks};
+use tessera_lower::{Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
+use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, marks};
 
 #[test]
 fn prepares_resident_sources() {
@@ -178,4 +180,49 @@ fn kv_page_modes() {
     assert_eq!((kept[0].pages.arena, kept[0].pages.offset), (USER, 0xA000));
     let inter = sample_kept(None, 2, 3, true);
     assert_eq!(synth_pages(&[inter]), [0, 2, 4, 1, 3, 5]);
+}
+
+#[derive(Debug)]
+struct Stub(Vec<Collective>);
+
+impl Kernel for Stub {
+    fn name(&self) -> &'static str {
+        "stub"
+    }
+
+    fn source(&self) -> Source {
+        Source::Fixed {
+            metal: "",
+            cuda: "",
+            hip: "",
+            entry: "stub",
+        }
+    }
+
+    fn launches(&self, _: &Step) -> Vec<Launch> {
+        Vec::new()
+    }
+
+    fn resident(&self) -> Option<Resident> {
+        Some(Resident {
+            threads: 64,
+            shared: 0,
+            scratch: 0,
+            lanes: self.0.clone(),
+        })
+    }
+}
+
+#[test]
+fn plans_collective_lanes() {
+    let kernel = KernelRef::new(Stub(vec![Collective::Sum, Collective::SumBf16]));
+    let layout = GridLayout {
+        items: 1,
+        forms: 0,
+        kept: 0,
+        pages: 0,
+    };
+    let planned = plan(&kernel, layout, 2, 1).unwrap();
+    let got: Vec<(Op, u32)> = planned.lanes.iter().map(|l| (l.op, l.elem)).collect();
+    assert_eq!(got, [(Op::Sum, F32), (Op::Sum, BF16)]);
 }

@@ -1,5 +1,13 @@
-use crate::site::{Ask, Kind, Site};
-use crate::{decode, encode};
+use crate::site::{Ask, Kind, Lane, Offer, Shape, Site};
+use crate::{decode, encode, respond};
+
+mod multi {
+    use crate::site::{Kind, Offer, Site};
+    fn offer(_: &Site) -> Option<Vec<Offer>> {
+        None
+    }
+    crate::exports!("multi", Kind::Model, "lib.rs", offer, ["site.rs"]);
+}
 
 #[test]
 fn tables_round_trip() {
@@ -21,10 +29,28 @@ fn ask_parses() {
         panic!("a region site");
     };
     assert!(*kind == Kind::Moe && inputs[0].dims[0].as_deref() == Some("Rows"));
-    assert!(ask.config.is_none());
-    let plain = serde_json::to_string(&ask).unwrap();
-    assert!(!plain.contains("\"config\""));
-    let with = r#"{"rule": "r", "site": {"matmul": {"m": 1, "n": 2, "k": 4, "form": "f32"}}, "config": {"hidden": 64}}"#;
-    let parsed: Ask = serde_json::from_str(with).unwrap();
-    assert_eq!(parsed.config.unwrap()["hidden"], 64);
+    assert!(ask.config.is_none() && !serde_json::to_string(&ask).unwrap().contains("\"config\""));
+    let with = br#"{"rule": "r", "site": {"matmul": {"m": 1, "n": 2, "k": 4, "form": "f32"}}, "config": {"hidden": 64}}"#;
+    let out = respond(with, |a| {
+        let len = a.config.as_ref()?["hidden"].as_u64()? as usize;
+        Some(vec![Offer {
+            kernel: "k",
+            reads: vec![],
+            len,
+            counts: vec![],
+            shape: Shape::Line(1),
+            work: 1.0,
+            guess: 1.0,
+            writes: None,
+            resident: None,
+        }])
+    });
+    let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(reply[0]["len"], 64);
+    let bad: serde_json::Value = serde_json::from_slice(&respond(b"{", |_| None)).unwrap();
+    assert!(bad["unread"].is_string());
+    for (lane, json) in [(Lane::Sum, "\"sum\""), (Lane::SumBf16, "\"sum_bf16\"")] {
+        assert_eq!(serde_json::to_string(&lane).unwrap(), json);
+        assert_eq!(serde_json::from_str::<Lane>(json).unwrap(), lane);
+    }
 }

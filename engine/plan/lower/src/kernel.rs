@@ -81,10 +81,11 @@ pub struct Resident {
     pub lanes: Vec<Collective>,
 }
 
-/// One collective lane's operation, over f32.
+/// One collective lane's operation and element type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Collective {
     Sum,
+    SumBf16,
 }
 
 /// A kernel's needs from the device to run.

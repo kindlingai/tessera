@@ -30,6 +30,32 @@ pub fn output(bytes: Vec<u8>) -> i64 {
     ((at << 32) | bytes.len() as u64) as i64
 }
 
+pub(crate) fn respond(
+    bytes: &[u8],
+    offer: impl Fn(&site::Ask) -> Option<Vec<site::Offer>>,
+) -> Vec<u8> {
+    let answer = match serde_json::from_slice::<site::Ask>(bytes) {
+        Ok(ask) => serde_json::to_vec(&offer(&ask)),
+        Err(e) => serde_json::to_vec(&site::Unread {
+            unread: e.to_string(),
+        }),
+    };
+    answer.unwrap_or_else(|_| b"null".to_vec())
+}
+
+/// # Safety
+///
+/// `at` and `len` must come from `alloc`.
+pub unsafe fn answer_ask(
+    at: i32,
+    len: i32,
+    offer: impl Fn(&site::Ask) -> Option<Vec<site::Offer>>,
+) -> i64 {
+    // SAFETY: the caller passes back what `alloc` returned.
+    let bytes = unsafe { input(at, len) };
+    output(respond(bytes, offer))
+}
+
 /// # Safety
 ///
 /// `at` and `len` must come from `alloc`.
@@ -39,14 +65,7 @@ pub unsafe fn answer(
     offer: impl Fn(&site::Site) -> Option<Vec<site::Offer>>,
 ) -> i64 {
     // SAFETY: the caller passes back what `alloc` returned.
-    let bytes = unsafe { input(at, len) };
-    let answer = match serde_json::from_slice::<site::Ask>(bytes) {
-        Ok(ask) => serde_json::to_vec(&offer(&ask.site)),
-        Err(e) => serde_json::to_vec(&site::Unread {
-            unread: e.to_string(),
-        }),
-    };
-    output(answer.unwrap_or_else(|_| b"null".to_vec()))
+    unsafe { answer_ask(at, len, |ask| offer(&ask.site)) }
 }
 
 /// `manifest` for the host.
@@ -57,7 +76,7 @@ pub fn declare(manifest: &site::Manifest) -> i64 {
 /// A one-kernel module's exports: kernel `$name` from `$file`.
 #[macro_export]
 macro_rules! exports {
-    ($name:expr, $kind:expr, $file:literal, $offer:path) => {
+    ($name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn alloc(len: i32) -> i32 {
             $crate::alloc(len)
@@ -73,10 +92,18 @@ macro_rules! exports {
                     site: $kind,
                 }],
                 graph: false,
-                files: vec![$crate::site::File {
-                    path: $file,
-                    text: include_str!($file),
-                }],
+                files: vec![
+                    $crate::site::File {
+                        path: $file,
+                        text: include_str!($file),
+                    },
+                    $($(
+                        $crate::site::File {
+                            path: $extra,
+                            text: include_str!($extra),
+                        },
+                    )*)?
+                ],
             })
         }
 
@@ -84,7 +111,7 @@ macro_rules! exports {
         #[unsafe(no_mangle)]
         pub extern "C" fn propose(at: i32, len: i32) -> i64 {
             // SAFETY: the host passes back what `alloc` returned.
-            unsafe { $crate::answer(at, len, $offer) }
+            unsafe { $crate::answer_ask(at, len, |ask| $offer(&ask.site)) }
         }
     };
 }
