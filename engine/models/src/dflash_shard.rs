@@ -2,10 +2,11 @@
 
 use tessera_graph::{
     DType, DimExpr, Graph, Node, NodeId, Numerics, Op, Parts, PathSeg, Placement, Row as GraphRow,
-    Select, Sharded, Shares, Stage, TensorType, VerifyError, View, infer, shard_mode, verify,
+    Select, Shape, Sharded, Shares, Stage, TensorType, VerifyError, View, infer, shard_mode,
+    verify,
 };
 
-fn insert_stage(g: &mut Graph, at: NodeId, stage: Stage) {
+pub(crate) fn insert_stage(g: &mut Graph, at: NodeId, stage: Stage) {
     let new = NodeId(at.0 + 1);
     let remap = |n: &mut NodeId| {
         n.0 += u32::from(*n >= new);
@@ -36,7 +37,7 @@ fn insert_stage(g: &mut Graph, at: NodeId, stage: Stage) {
     }
 }
 
-fn split_weight(g: &mut Graph, node: NodeId, axis: u32) -> bool {
+pub(crate) fn split_weight(g: &mut Graph, node: NodeId, axis: u32) -> bool {
     let Op::Weight(w) = g.node(node).op else {
         return false;
     };
@@ -48,7 +49,7 @@ fn split_weight(g: &mut Graph, node: NodeId, axis: u32) -> bool {
     true
 }
 
-fn adopt_split(out: &mut Graph, mut g: Graph, parts: &Parts, shares: &Shares) -> bool {
+pub(crate) fn adopt_split(out: &mut Graph, mut g: Graph, parts: &Parts, shares: &Shares) -> bool {
     for i in 0..g.nodes.len() {
         if let Op::Append(k) = g.nodes[i].op {
             let p = g.node(g.nodes[i].args[0]).ty.placement;
@@ -87,7 +88,7 @@ fn adopt_split(out: &mut Graph, mut g: Graph, parts: &Parts, shares: &Shares) ->
 }
 
 /// Replaces full-logits top-k with per-rank top-k and small gather.
-fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
+pub(crate) fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
     let nr = parts.ranks() as u64;
     if nr <= 1 || parts.0.windows(2).any(|w| w[0] != w[1]) {
         return;
@@ -118,9 +119,7 @@ fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
             continue;
         }
         let val = |d: &DimExpr| d.value(&out.dims, &|_| None);
-        let Some(rows) = val(&lnode.ty.shape.0[0]) else {
-            continue;
-        };
+        let n_expr = lnode.ty.shape.0[0].clone();
         let Some(vocab) = val(&lnode.ty.shape.0[1]) else {
             continue;
         };
@@ -140,15 +139,15 @@ fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
             (u.op == Op::Select(Select::Take) && u.args == [gather_id, cands_id])
                 .then_some(NodeId(j as u32))
         });
-        found = Some((local_id, cands_id, unary_id, rows, k_val));
+        found = Some((local_id, gather_id, cands_id, unary_id, n_expr, k_val));
         break;
     }
-    let Some((local_id, cands_id, unary_id, rows, k_val)) = found else {
+    let Some((local_id, gather_id, cands_id, unary_id, n_expr, k_val)) = found else {
         return;
     };
     let mut tried = out.clone();
     let pos = cands_id.0 as usize;
-    let mut built: Vec<Node> = Vec::with_capacity(14);
+    let mut built: Vec<Node> = Vec::with_capacity(16);
     let dummy = TensorType::new(Vec::<DimExpr>::new(), DType::F32);
     let mut push = |op: Op, args: Vec<NodeId>, reduces: bool| -> NodeId {
         let id = NodeId((pos + built.len()) as u32);
@@ -160,38 +159,45 @@ fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
         });
         id
     };
-    let n_expr = DimExpr::Const(rows);
     let rk = DimExpr::Const(nr * k_val);
+    let pair_in = Shape(vec![n_expr.clone(), rk.clone(), DimExpr::Const(1)]);
+    let flat = Shape(vec![n_expr, rk.clone()]);
     let local_idx = push(Op::Select(Select::TopK { k: rk }), vec![local_id], false);
     let local_val = push(Op::Select(Select::Take), vec![local_id, local_idx], false);
     let local_idx_f = push(Op::Cast(DType::F32), vec![local_idx], false);
-    let val_t = push(Op::View(View::Permute(vec![1, 0])), vec![local_val], false);
-    let idx_t = push(
-        Op::View(View::Permute(vec![1, 0])),
-        vec![local_idx_f],
+    let val_3 = push(
+        Op::View(View::Reshape(pair_in.clone())),
+        vec![local_val],
         false,
     );
-    let both_t = push(Op::View(View::Concat), vec![val_t, idx_t], false);
-    let both = push(Op::View(View::Permute(vec![1, 0])), vec![both_t], false);
+    let idx_3 = push(Op::View(View::Reshape(pair_in)), vec![local_idx_f], false);
+    let both_3 = push(Op::View(View::Concat), vec![val_3, idx_3], false);
+    let both = push(Op::View(View::Permute(vec![0, 2, 1])), vec![both_3], false);
     let gathered = push(Op::Row(GraphRow(vec![Stage::AllGather])), vec![both], true);
-    let all_val = push(
+    let all_val_3 = push(
         Op::View(View::Slice {
-            axis: 0,
+            axis: 1,
             start: 0u64.into(),
-            len: n_expr.clone(),
+            len: 1u64.into(),
         }),
         vec![gathered],
         false,
     );
-    let all_idx_f = push(
+    let all_val = push(
+        Op::View(View::Reshape(flat.clone())),
+        vec![all_val_3],
+        false,
+    );
+    let all_idx_3 = push(
         Op::View(View::Slice {
-            axis: 0,
-            start: n_expr.clone(),
-            len: n_expr,
+            axis: 1,
+            start: 1u64.into(),
+            len: 1u64.into(),
         }),
         vec![gathered],
         false,
     );
+    let all_idx_f = push(Op::View(View::Reshape(flat)), vec![all_idx_3], false);
     let pick = push(
         Op::Select(Select::TopK {
             k: DimExpr::Const(k_val),
@@ -225,6 +231,14 @@ fn shard_topk(out: &mut Graph, parts: &Parts, shares: &Shares) {
         remap(&mut o.node);
     }
     for r in &mut tried.regions {
+        if r.end == NodeId(gather_id.0 + 1) && r.outputs.contains(&gather_id) {
+            r.end = gather_id;
+            for o in &mut r.outputs {
+                if *o == gather_id {
+                    *o = local_id;
+                }
+            }
+        }
         if r.start.0 >= pos as u32 {
             r.start.0 += shift;
         }
