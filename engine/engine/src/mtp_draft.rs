@@ -1,6 +1,7 @@
 //! Native MTP speculative decoding: one-layer MLA drafter and loop.
 
 use crate::ranks::open_rank;
+use crate::spec_len::{CostModel, SpecLen};
 use crate::speculate::{
     DraftCore, TargetCmd, decode_target, draft_methods, run_speculate, run_target, taps_output,
     tell_ranks,
@@ -15,10 +16,10 @@ use tessera_models::mtp;
 use tessera_run::{Run, open};
 
 /// Control tag for an MTP step reading target taps.
-const MTP_FIRST_TAG: u32 = 4;
+pub(crate) const MTP_FIRST_TAG: u32 = 4;
 
 /// Control tag for a chained MTP step reading prior hidden.
-const MTP_CHAIN_TAG: u32 = 5;
+pub(crate) const MTP_CHAIN_TAG: u32 = 5;
 
 /// Runs an MTP one-layer MLA drafter with kept KV caches.
 pub struct MtpDrafter {
@@ -95,14 +96,16 @@ impl MtpDrafter {
         self.hidden
     }
 
-    fn wants(&self, keep_hidden: bool) -> Wants {
-        match keep_hidden {
-            true => Wants::roles(&self.core.graph, 0, &[Role::Tokens, Role::Taps]),
-            false => Wants::role(&self.core.graph, 0, Role::Tokens),
-        }
+    /// Number of cached plan hits in the MTP drafter.
+    pub fn plan_hits(&self) -> usize {
+        self.core.plans.hits
     }
 
-    fn read_last(
+    pub(crate) fn wants(&self) -> Wants {
+        Wants::roles(&self.core.graph, 0, &[Role::Tokens, Role::Taps])
+    }
+
+    pub(crate) fn read_last(
         &mut self,
         outputs: &[Slot],
         rows: usize,
@@ -119,7 +122,7 @@ impl MtpDrafter {
         Ok((token, floats[from..from + self.hidden].to_vec()))
     }
 
-    fn run(
+    pub(crate) fn run(
         &mut self,
         slot: u32,
         start_pos: u32,
@@ -173,41 +176,163 @@ impl MtpDrafter {
     }
 }
 
-enum MtpCmd {
-    Target(TargetCmd),
-    Step {
-        slot: u32,
-        start_pos: u32,
-        tokens: Vec<u32>,
-        wants: Wants,
-        chain: bool,
-    },
+/// Decoded MTP launch command from rank 0.
+pub(crate) struct MtpStep {
+    pub slot: u32,
+    pub start_pos: u32,
+    pub tokens: Vec<u32>,
+    pub wants: Wants,
+    pub chain: bool,
+    pub keep: bool,
 }
 
-fn encode_step(slot: u32, start_pos: u32, tokens: &[u32], wants: Wants, chain: bool) -> Vec<u8> {
+enum MtpCmd {
+    Target(TargetCmd),
+    Step(MtpStep),
+}
+
+pub(crate) fn encode_step(
+    slot: u32,
+    start_pos: u32,
+    tokens: &[u32],
+    wants: Wants,
+    chain: bool,
+    keep: bool,
+) -> Vec<u8> {
     let tag = if chain { MTP_CHAIN_TAG } else { MTP_FIRST_TAG };
-    let mut w = Writer(Vec::with_capacity(20 + tokens.len() * 4));
+    let mut w = Writer(Vec::with_capacity(24 + tokens.len() * 4));
     w.u32(tag)
         .u32(slot)
         .u32(start_pos)
         .u32(wants.0)
+        .u32(u32::from(keep))
         .u32s(tokens);
     w.0
+}
+
+pub(crate) fn decode_step(tag: u32, r: &mut Reader) -> Option<MtpStep> {
+    if tag != MTP_FIRST_TAG && tag != MTP_CHAIN_TAG {
+        return None;
+    }
+    Some(MtpStep {
+        slot: r.u32()?,
+        start_pos: r.u32()?,
+        wants: Wants(r.u32()?),
+        keep: r.u32()? != 0,
+        tokens: r.u32s()?,
+        chain: tag == MTP_CHAIN_TAG,
+    })
 }
 
 fn decode_mtp(bytes: &[u8]) -> Option<MtpCmd> {
     let mut r = Reader(bytes);
     let tag = r.u32()?;
-    if tag == MTP_FIRST_TAG || tag == MTP_CHAIN_TAG {
-        return Some(MtpCmd::Step {
-            slot: r.u32()?,
-            start_pos: r.u32()?,
-            wants: Wants(r.u32()?),
-            tokens: r.u32s()?,
-            chain: tag == MTP_CHAIN_TAG,
-        });
+    if let Some(step) = decode_step(tag, &mut r) {
+        return Some(MtpCmd::Step(step));
     }
     decode_target(tag, &mut r).map(MtpCmd::Target)
+}
+
+/// Runs one decoded MTP step on a follower rank.
+pub(crate) fn follow_mtp(
+    drafter: &mut MtpDrafter,
+    step: MtpStep,
+    last_taps: &[f32],
+    prev_hidden: &mut Vec<f32>,
+) -> Result<(), Error> {
+    let hidden = drafter.hidden();
+    let src = if step.chain {
+        prev_hidden.as_slice()
+    } else {
+        last_taps
+    };
+    let need = step.tokens.len() * hidden;
+    if src.len() < need {
+        return Err(Error::Rows);
+    }
+    let outputs = drafter.run(
+        step.slot,
+        step.start_pos,
+        &step.tokens,
+        &src[..need],
+        step.wants,
+    )?;
+    if step.keep
+        && let Some(at) = taps_output(&drafter.core.graph, 0, step.wants)
+    {
+        let raw = drafter.core.runner.read(outputs[at])?;
+        let floats = raw.floats().map_err(tessera_run::Error::from)?;
+        let from = (step.tokens.len() - 1) * hidden;
+        prev_hidden.clear();
+        prev_hidden.extend_from_slice(&floats[from..from + hidden]);
+    }
+    Ok(())
+}
+
+/// Runs one MTP step on rank 0, broadcasting if ranked.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_mtp(
+    target: &mut Engine,
+    drafter: &mut MtpDrafter,
+    start_pos: u32,
+    tokens: &[u32],
+    hid: &[f32],
+    keep: bool,
+    chain: bool,
+) -> Result<(u32, Vec<f32>), Error> {
+    let wants = drafter.wants();
+    if target.control.is_some() {
+        tell_ranks(
+            target,
+            &encode_step(0, start_pos, tokens, wants, chain, keep),
+        )?;
+    }
+    let outputs = drafter.run(0, start_pos, tokens, hid, wants)?;
+    drafter.read_last(&outputs, tokens.len(), keep)
+}
+
+/// Runs an MTP first-form pass plus adaptive chain steps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draft_mtp(
+    target: &mut Engine,
+    drafter: &mut MtpDrafter,
+    spec: &SpecLen,
+    start_pos: u32,
+    tokens: &[u32],
+    taps: &[f32],
+    start: usize,
+    avail: usize,
+) -> Result<(Vec<u32>, f64), Error> {
+    let chain_n = if !spec.is_adaptive() {
+        avail
+    } else {
+        let mut n = 1;
+        while n < avail && spec.more(None, n) {
+            n += 1;
+        }
+        n
+    };
+    let mut drafts = Vec::with_capacity(chain_n);
+    let (first, mut prev_hid) =
+        run_mtp(target, drafter, start_pos, tokens, taps, chain_n > 1, false)?;
+    drafts.push(first);
+    for j in 1..chain_n {
+        let pos = (start - 1 + j) as u32;
+        let (tok, next_hid) = run_mtp(
+            target,
+            drafter,
+            pos,
+            &[drafts[j - 1]],
+            &prev_hid,
+            j + 1 < chain_n,
+            true,
+        )?;
+        drafts.push(tok);
+        prev_hid = next_hid;
+    }
+    let (k, pred) = spec.choose(None, drafts.len(), drafts.len());
+    drafts.truncate(k);
+    Ok((drafts, pred))
 }
 
 /// Native MTP speculative decoding over a target and MTP pair.
@@ -215,6 +340,7 @@ pub struct MtpSpeculate<'a> {
     target: &'a mut Engine,
     drafter: &'a mut MtpDrafter,
     depth: usize,
+    spec_len: SpecLen,
 }
 
 impl<'a> MtpSpeculate<'a> {
@@ -233,11 +359,21 @@ impl<'a> MtpSpeculate<'a> {
         if width != drafter.hidden() {
             return Err(Error::Rows);
         }
+        let spec_len = SpecLen::fixed(depth)
+            .with_cost(CostModel::mtp())
+            .with_mtp_seeds();
         Ok(Self {
             target,
             drafter,
             depth,
+            spec_len,
         })
+    }
+
+    /// Configures adaptive or truncated draft length selection.
+    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
+        self.spec_len = spec_len;
+        self
     }
 
     /// Follows rank 0's target and MTP launches until dismissed.
@@ -257,28 +393,8 @@ impl<'a> MtpSpeculate<'a> {
             match decode_mtp(&told) {
                 None => return Ok(()),
                 Some(MtpCmd::Target(cmd)) => run_target(self.target, cmd, hidden, &mut last_taps)?,
-                Some(MtpCmd::Step {
-                    slot,
-                    start_pos,
-                    tokens,
-                    wants,
-                    chain,
-                }) => {
-                    let src = if chain { &prev_hidden } else { &last_taps };
-                    let need = tokens.len() * hidden;
-                    if src.len() < need {
-                        return Err(Error::Rows);
-                    }
-                    let outputs =
-                        self.drafter
-                            .run(slot, start_pos, &tokens, &src[..need], wants)?;
-                    if let Some(at) = taps_output(&self.drafter.core.graph, 0, wants) {
-                        let raw = self.drafter.core.runner.read(outputs[at])?;
-                        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-                        let from = (tokens.len() - 1) * hidden;
-                        prev_hidden.clear();
-                        prev_hidden.extend_from_slice(&floats[from..from + hidden]);
-                    }
+                Some(MtpCmd::Step(step)) => {
+                    follow_mtp(self.drafter, step, &last_taps, &mut prev_hidden)?;
                 }
             }
         }
@@ -294,64 +410,50 @@ impl<'a> MtpSpeculate<'a> {
         let hidden = self.drafter.hidden();
         let max_ctx = self.target.context().min(self.drafter.context());
         let drafter = &mut *self.drafter;
-        let run_step = |target: &mut Engine,
-                        drafter: &mut MtpDrafter,
-                        start_pos: u32,
-                        tokens: &[u32],
-                        hid: &[f32],
-                        keep: bool,
-                        chain: bool|
-         -> Result<(u32, Vec<f32>), Error> {
-            let wants = drafter.wants(keep);
-            if target.control.is_some() {
-                tell_ranks(target, &encode_step(0, start_pos, tokens, wants, chain))?;
-            }
-            let outputs = drafter.run(0, start_pos, tokens, hid, wants)?;
-            drafter.read_last(&outputs, tokens.len(), keep)
-        };
+        let spec = self.spec_len.fresh();
         run_speculate(
             self.target,
             request,
             emit,
             |prompt, anchor, taps| {
                 let pending: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
-                (0u32, pending, taps)
+                (0u32, pending, taps, spec, 1.0f64)
             },
-            |target, (pending_start, pending_tokens, pending_taps), start, _, remaining| {
-                let k = depth
+            |target,
+             (pending_start, pending_tokens, pending_taps, spec, last_pred),
+             start,
+             _,
+             remaining| {
+                let avail = depth
+                    .min(spec.max_k())
                     .min(remaining.saturating_sub(1))
                     .min(max_ctx.saturating_sub(start + 1));
-                if k == 0 {
+                if avail == 0 {
                     return Ok(None);
                 }
-                let mut drafts = Vec::with_capacity(k);
-                let (first, mut prev_hid) = run_step(
+                let (drafts, pred) = draft_mtp(
                     target,
                     drafter,
+                    spec,
                     *pending_start,
                     pending_tokens,
                     pending_taps,
-                    k > 1,
-                    false,
+                    start,
+                    avail,
                 )?;
-                drafts.push(first);
-                for j in 1..k {
-                    let pos = (start - 1 + j) as u32;
-                    let (tok, next_hid) = run_step(
-                        target,
-                        drafter,
-                        pos,
-                        &[drafts[j - 1]],
-                        &prev_hid,
-                        j + 1 < k,
-                        true,
-                    )?;
-                    drafts.push(tok);
-                    prev_hid = next_hid;
-                }
+                *last_pred = pred;
                 Ok(Some(drafts))
             },
-            |(pending_start, pending_tokens, pending_taps), start, commit, posterior, mut taps| {
+            |(pending_start, pending_tokens, pending_taps, spec, last_pred),
+             start,
+             drafted,
+             accepted,
+             posterior,
+             mut taps,
+             stats| {
+                spec.observe(drafted, accepted, None, *last_pred);
+                stats.mtp_steps += 1;
+                let commit = 1 + accepted;
                 *pending_start = start as u32;
                 *pending_tokens = posterior[..commit].to_vec();
                 taps.truncate(commit * hidden);

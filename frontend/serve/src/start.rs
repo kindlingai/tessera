@@ -10,8 +10,8 @@ use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::wasm::Module;
 use tessera_engine::{
-    Batch, Drafter, Engine, Fair, MtpDrafter, MtpSpeculate, Pins, Place, Recipe, Settings,
-    SpecStats, Speculate, Steps,
+    Batch, CostModel, Drafter, DualSelector, DualSpeculate, Engine, Fair, MtpDrafter, MtpSpeculate,
+    Pins, Place, Recipe, Settings, SpecLen, SpecStats, Speculate, Steps,
 };
 use tessera_tasks::api::{Embed, GenerateImage, Info, Score, Tokens};
 use tessera_tasks::klein::Klein;
@@ -21,8 +21,8 @@ use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
 /// The flags for `Options::flag` and `Options::switch`.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
-[--draft <dir>] [--mtp <k>] [--max-connections <n>] [--reject-unknown-fields] [--guided] \
-[--reuse-prefix] [--require-favored] [--manifest <name>]";
+[--draft <dir>] [--mtp <k>] [--spec-adaptive] [--spec-len <k>] [--max-connections <n>] \
+[--reject-unknown-fields] [--guided] [--reuse-prefix] [--require-favored] [--manifest <name>]";
 
 /// The loaded model's task.
 #[derive(Clone, Copy, PartialEq)]
@@ -69,6 +69,10 @@ pub struct Options {
     pub draft: Option<PathBuf>,
     /// Native MTP draft depth for speculative decoding.
     pub mtp: Option<usize>,
+    /// Enables deterministic adaptive draft length selection.
+    pub spec_adaptive: bool,
+    /// Optional fixed or maximum draft length cap.
+    pub spec_len: Option<usize>,
     /// A recipe module that may build the model's graph.
     pub module: Option<Arc<Module>>,
     /// Lowering choices. Empty pins take the model's own.
@@ -104,6 +108,8 @@ impl Default for Options {
             clip: None,
             draft: None,
             mtp: None,
+            spec_adaptive: false,
+            spec_len: None,
             module: None,
             lower: None,
             names: None,
@@ -123,6 +129,7 @@ impl Options {
             "--guided" => self.guided = true,
             "--reuse-prefix" => self.reuse = true,
             "--require-favored" => self.require_favored = true,
+            "--spec-adaptive" => self.spec_adaptive = true,
             _ => return false,
         }
         true
@@ -150,6 +157,13 @@ impl Options {
                     return None;
                 }
                 self.mtp = Some(depth);
+            }
+            "--spec-len" => {
+                let k: usize = value.parse().ok()?;
+                if k == 0 {
+                    return None;
+                }
+                self.spec_len = Some(k);
             }
             _ => {
                 if flag == "--parts" {
@@ -276,6 +290,47 @@ fn split_links(
     )
 }
 
+/// Shares `links`'s sums and grid across target and both drafters.
+fn split_dual_links(
+    links: Option<crate::ranks::Links>,
+) -> (
+    Option<crate::ranks::Links>,
+    Option<DraftLinks>,
+    Option<DraftLinks>,
+) {
+    let Some(([sums, control], grids)) = links else {
+        return (None, None, None);
+    };
+    let [target_sums, dflash_sums, mtp_sums] = Drafter::share_transports(sums);
+    let (target_grids, dflash_grid, mtp_grid) = match grids {
+        crate::ranks::Grids::Sums(grid) => {
+            let [g0, g1, g2] = Drafter::share_sums(grid);
+            (crate::ranks::Grids::Sums(g0), Some(g1), Some(g2))
+        }
+        other => (other, None, None),
+    };
+    (
+        Some(([target_sums, control], target_grids)),
+        Some((dflash_sums, dflash_grid)),
+        Some((mtp_sums, mtp_grid)),
+    )
+}
+
+/// Builds the draft-length policy for a speculative drafter.
+fn make_spec_len(o: &Options, limit: usize, cost: CostModel, mtp_seeds: bool) -> SpecLen {
+    let cap = o.spec_len.map_or(limit, |k| k.min(limit));
+    let spec = if o.spec_adaptive {
+        SpecLen::adaptive(cap, cost)
+    } else {
+        SpecLen::fixed(cap).with_cost(cost)
+    };
+    if mtp_seeds {
+        spec.with_mtp_seeds()
+    } else {
+        spec
+    }
+}
+
 /// Opens a single-rank or TP-sharded drafter and streams its weights.
 fn open_drafter(
     o: &Options,
@@ -399,12 +454,15 @@ fn serve_spec(
         if settings.profile.is_some() && stats.steps > 0 {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms total)",
+                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms, dflash {}, mtp {}, sw {})",
                 stats.emitted,
                 stats.steps,
                 stats.mean_step(),
                 ms / stats.steps as f64,
                 ms,
+                stats.dflash_steps,
+                stats.mtp_steps,
+                stats.switches,
             );
         }
     }
@@ -441,7 +499,10 @@ fn draft_thread(
         let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
+    let sl = make_spec_len(o, pair.block - 1, CostModel::dflash(), false);
+    let mut spec = Speculate::new(&mut engine, &mut drafter)
+        .map_err(|e| e.to_string())?
+        .with_spec_len(sl);
     serve_spec(o, settings, info, slot, target, "dflash", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
@@ -480,9 +541,78 @@ fn mtp_thread(
             MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let mut spec =
-        MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
+    let sl = make_spec_len(o, depth, CostModel::mtp(), true);
+    let mut spec = MtpSpeculate::new(&mut engine, &mut drafter, depth)
+        .map_err(|e| e.to_string())?
+        .with_spec_len(sl);
     serve_spec(o, settings, info, slot, target, "mtp", |req, sink| {
+        spec.generate(req, sink).map_err(|e| e.to_string())
+    })?;
+    let _ = engine.dismiss();
+    Ok(())
+}
+
+/// Loads an MLA target with DFlash and MTP drafters.
+fn dual_thread(
+    o: &Options,
+    draft_dir: &std::path::Path,
+    depth: usize,
+    settings: &Settings,
+    info: Info,
+    slot: &Slot,
+) -> Result<(), String> {
+    if o.guided {
+        return Err("--draft and --mtp cannot combine with --guided yet".into());
+    }
+    let start = Instant::now();
+    let (target_links, dflash_links, mtp_links) = split_dual_links(o.ranks.join(settings)?);
+    let rules = user_rules(settings)?;
+    let at = [1u64, o.max_model_len as u64];
+    let manifest = o.manifest.as_deref();
+    let (mut drafter, dflash_block, mut taps) = {
+        let pair =
+            tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
+                .map_err(|e| e.to_string())?;
+        let drafter = open_drafter(o, dflash_links, &pair, settings)?;
+        let taps: Vec<u64> = pair.target_layers.iter().map(|&l| l + 1).collect();
+        (drafter, pair.block, taps)
+    };
+    let (mut mtp, mtp_layer) = {
+        let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
+            .map_err(|e| e.to_string())?;
+        let mtp = open_mtp(o, mtp_links, &pair, settings)?;
+        (mtp, pair.layer)
+    };
+    taps.push(mtp_layer + 1);
+    let combined = tessera_bundle::load_tapped(
+        &o.model,
+        at,
+        &rules,
+        Steps::Plain,
+        &o.config,
+        manifest,
+        &taps,
+    )
+    .map_err(|e| e.to_string())?;
+    let (mut engine, target) = open_target(o, target_links, combined, settings)?;
+    let seconds = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{}: loaded target + dflash (block {}) + mtp (layer {}, depth {depth}) in {seconds:.1} s",
+        engine.device(),
+        dflash_block,
+        mtp_layer,
+    );
+    if o.ranks.follows() {
+        let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
+            .map_err(|e| e.to_string())?;
+        return spec.follow().map_err(|e| e.to_string());
+    }
+    let d_sl = make_spec_len(o, dflash_block - 1, CostModel::dual_dflash(), false);
+    let m_sl = make_spec_len(o, depth, CostModel::dual_mtp(), true);
+    let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
+        .map_err(|e| e.to_string())?
+        .with_selector(DualSelector::new(d_sl, m_sl));
+    serve_spec(o, settings, info, slot, target, "dual", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
     let _ = engine.dismiss();
@@ -491,8 +621,8 @@ fn mtp_thread(
 
 /// Loads the generator, fills `slot`, then steps jobs.
 fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
-    if o.draft.is_some() && o.mtp.is_some() {
-        return Err("--mtp cannot combine with --draft".into());
+    if let (Some(draft_dir), Some(depth)) = (&o.draft, o.mtp) {
+        return dual_thread(o, draft_dir, depth, settings, info, slot);
     }
     if let Some(draft_dir) = &o.draft {
         return draft_thread(o, draft_dir, settings, info, slot);

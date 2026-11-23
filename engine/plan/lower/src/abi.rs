@@ -4,6 +4,7 @@ use crate::extent::Extent;
 use crate::plan::{Slot, Step};
 use tessera_codegen::ir::{Body, Param};
 use tessera_codegen::{Dialect, hash};
+use tessera_engine_settings::ByBackend;
 use tessera_graph::DimName;
 
 /// One kernel argument, in the order its source declares.
@@ -175,9 +176,7 @@ impl Launch {
 pub enum Source {
     /// Hand-written, with one text per backend.
     Fixed {
-        metal: &'static str,
-        cuda: &'static str,
-        hip: &'static str,
+        text: ByBackend<&'static str>,
         entry: &'static str,
     },
     /// A tree, rendered per dialect or run on the host.
@@ -194,14 +193,9 @@ impl Source {
     /// Changes whenever the kernel's text does.
     pub fn hash(&self) -> u64 {
         match self {
-            Source::Fixed {
-                metal,
-                cuda,
-                hip,
-                entry,
-            } => [metal, cuda, hip, entry]
-                .iter()
-                .fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text)),
+            Source::Fixed { text, entry } => {
+                (text.0.iter().chain([entry])).fold(0, |h: u64, text| h.rotate_left(1) ^ hash(text))
+            }
             Source::Made(body) => hash(&body.text().render(Dialect::Cuda)),
         }
     }

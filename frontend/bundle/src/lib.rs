@@ -395,7 +395,7 @@ pub fn load_named(
 }
 
 /// As `load_named`, with 1-based layer `taps` on stepping.
-pub(crate) fn load_tapped(
+pub fn load_tapped(
     dir: &Path,
     [slots, context]: [u64; 2],
     user: &[Rule],

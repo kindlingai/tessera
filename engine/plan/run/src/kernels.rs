@@ -7,34 +7,15 @@ use tessera_gpukit::backend::Backend;
 use tessera_gpukit::launch::THREADS_PER_BLOCK;
 use tessera_lower::{Launch, Shape, Source, Step};
 
-/// The kernel text a backend compiles.
-pub(crate) fn dialect(backend: Backend) -> Dialect {
-    match backend {
-        Backend::Metal => Dialect::Metal,
-        Backend::Cuda | Backend::Rocm => Dialect::Cuda,
-    }
-}
-
 /// A fixed kernel's text for `backend`, and its entry.
 pub(crate) fn fixed_text(
     source: &Source,
     backend: Backend,
 ) -> Option<(&'static str, &'static str)> {
-    let Source::Fixed {
-        metal,
-        cuda,
-        hip,
-        entry,
-    } = *source
-    else {
+    let Source::Fixed { text, entry } = *source else {
         return None;
     };
-    let text = match backend {
-        Backend::Metal => metal,
-        Backend::Cuda => cuda,
-        Backend::Rocm => hip,
-    };
-    Some((text, entry))
+    Some((text[backend], entry))
 }
 
 /// The largest group among the launches of `step`.
@@ -88,7 +69,7 @@ impl<T: Clone> Kernels<T> {
                 match self.made.get(&at) {
                     Some(compiled) => (compiled.clone(), true),
                     None => {
-                        let text = body.text().bounded(dialect(backend), Some(group));
+                        let text = body.text().bounded(Dialect::of(backend), Some(group));
                         let compiled = made(&text, &body.entry)?;
                         self.made.insert(at, compiled.clone());
                         (compiled, true)

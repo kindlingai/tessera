@@ -23,9 +23,8 @@ pub fn runs() -> Vec<Settings> {
 
 /// `runs`, then the host imitating each GPU's rounding.
 pub fn emulations() -> Vec<Settings> {
-    let gpus = [Backend::Metal, Backend::Cuda, Backend::Rocm];
-    let imitated = gpus.map(|b| Settings {
-        emulate: Some(b),
+    let imitated = Backend::ALL.iter().map(|b| Settings {
+        emulate: Some(*b),
         ..host()
     });
     runs().into_iter().chain(imitated).collect()

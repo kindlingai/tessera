@@ -6,6 +6,8 @@ mod exlr8_test;
 mod file;
 #[cfg(test)]
 mod file_test;
+#[cfg(test)]
+mod gemma4_test;
 mod gguf;
 #[cfg(test)]
 mod gguf_test;

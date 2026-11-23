@@ -39,3 +39,12 @@ fn stops_at_break() {
     let turns = [say("system", ""), say("user", ""), say("tool", "")];
     assert_eq!(t.render(&turns, true).unwrap(), "system");
 }
+
+#[test]
+fn renders_reasoning_effort() {
+    let source = "{% set e = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' %}{{ e }}";
+    let t = Template::new(source.into()).unwrap();
+    assert_eq!(t.render_with(&[], true, None).unwrap(), "max");
+    assert_eq!(t.render_with(&[], true, Some("low")).unwrap(), "low");
+    assert_eq!(t.render_with(&[], true, Some("high")).unwrap(), "high");
+}

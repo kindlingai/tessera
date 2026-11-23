@@ -1,6 +1,27 @@
 //! Which GPU backend this build dispatches to.
 
+use crate::device::Device;
+use crate::launch::Launch;
 pub use tessera_engine_settings::Backend;
+
+/// Work generic over one backend's context type.
+pub trait OnGpu {
+    type Out;
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out;
+}
+
+/// Runs `work` on the context type `gpu` names, if built.
+pub fn dispatch<W: OnGpu>(gpu: Option<Backend>, work: W) -> Result<W::Out, W> {
+    match gpu {
+        #[cfg(target_os = "macos")]
+        Some(Backend::Metal) => Ok(work.on::<crate::metal::Context>()),
+        #[cfg(feature = "cuda")]
+        Some(Backend::Cuda) => Ok(work.on::<crate::cuda::Context>()),
+        #[cfg(feature = "rocm")]
+        Some(Backend::Rocm) => Ok(work.on::<crate::rocm::Context>()),
+        _ => Err(work),
+    }
+}
 
 /// The backend this build uses, if any.
 pub fn available() -> Option<Backend> {

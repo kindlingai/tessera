@@ -1,7 +1,7 @@
 //! Kernel files that replace planned kernels, read again on change.
 
 use crate::Error;
-use crate::kernels::{dialect, fixed_text, group};
+use crate::kernels::{fixed_text, group};
 use crate::run::{Outcome, Reload};
 use std::collections::HashMap;
 use std::fs::Metadata;
@@ -52,7 +52,7 @@ pub(crate) fn entry(source: &Source) -> &str {
 pub(crate) fn text(step: &Step, backend: Backend) -> String {
     let source = step.kernel.source();
     match (&source, fixed_text(&source, backend)) {
-        (Source::Made(body), _) => body.text().bounded(dialect(backend), Some(group(step))),
+        (Source::Made(body), _) => body.text().bounded(Dialect::of(backend), Some(group(step))),
         (_, fixed) => fixed.unwrap_or_default().0.to_string(),
     }
 }
@@ -80,11 +80,8 @@ impl<K> Overrides<K> {
     }
 
     pub(crate) fn path(&self, entry: &str) -> PathBuf {
-        let extension = match self.dialect {
-            Dialect::Metal => "metal",
-            _ => "cu",
-        };
-        self.dir.join(format!("{entry}.{extension}"))
+        self.dir
+            .join(format!("{entry}.{}", self.dialect.extension()))
     }
 
     /// Reads `entry`'s file again if it changed since last checked.

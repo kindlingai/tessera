@@ -42,6 +42,15 @@ pub enum Codebook {
 }
 
 impl Codebook {
+    /// Every codebook, in the order a reader tries them.
+    pub const ALL: [Codebook; 3] = [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx];
+
+    /// The codebook a manifest calls `name`.
+    pub fn named(name: &str) -> Option<Self> {
+        let named = |b: &Codebook| format!("{b:?}").eq_ignore_ascii_case(name);
+        Self::ALL.into_iter().find(named)
+    }
+
     /// The suffix a release appends to its tensor names.
     pub fn suffix(self) -> &'static str {
         match self {
@@ -230,32 +239,6 @@ impl<const K: u32> Trellis<K> {
         self.codebook.value(state)
     }
 
-    /// A tile's 256 weights, in stream order.
-    fn weights(&self, tile: &[u8]) -> [f32; 256] {
-        let ring = 256 * K as usize;
-        let pairs = self.codebook == Codebook::Pmcgx;
-        let step = if pairs { 2 * K as usize } else { K as usize };
-        // The ring wraps: its last bits lead the first state.
-        let mut state = (ring - 20..ring).fold(0, |s, b| (s << 1) | bit(tile, b));
-        let mut out = [0.0; 256];
-        let mut n = 0;
-        for b in 0..ring {
-            state = (state << 1) | bit(tile, b);
-            if (b + 1) % step != 0 {
-                continue;
-            }
-            if pairs {
-                out[n] = self.codebook.weight(state, false);
-                out[n + 1] = self.codebook.weight(state, true);
-                n += 2;
-            } else {
-                out[n] = self.codebook.value(state);
-                n += 1;
-            }
-        }
-        out
-    }
-
     /// The first `n` decoded elements, a tile at a time.
     fn decode_all(&self, bytes: &[u8], n: usize) -> Vec<f32> {
         let shape = Shape::read(bytes);
@@ -265,7 +248,11 @@ impl<const K: u32> Trellis<K> {
         spread(&mut t, 16 * inp, |c16, piece| {
             for r16 in 0..inp / 16 {
                 let at = HEAD + shape.tile(16 * r16, 16 * c16) * Self::TILE;
-                let w = self.weights(&bytes[at..at + Self::TILE]);
+                let pairs = self.codebook == Codebook::Pmcgx;
+                let tile = &bytes[at..at + Self::TILE];
+                let w = stream(K as usize, pairs, tile, |s, odd| {
+                    self.codebook.weight(s, odd)
+                });
                 for c in 0..16 {
                     for r in 0..16 {
                         piece[c * inp + 16 * r16 + r] = w[position(r, c)];
@@ -275,6 +262,66 @@ impl<const K: u32> Trellis<K> {
         });
         t
     }
+}
+
+/// A tile's 256 weights at `k` bits, in stream order.
+fn stream(k: usize, pairs: bool, tile: &[u8], weight: impl Fn(u32, bool) -> f32) -> [f32; 256] {
+    // Little-endian words hold 32 stream bits, high first.
+    let word = |w: usize| u32::from_le_bytes(tile[4 * w..4 * w + 4].try_into().expect("4 bytes"));
+    let step = if pairs { 2 * k } else { k };
+    // The ring wraps: its last bits lead the first state.
+    let mut bits = u64::from(word(8 * k - 1));
+    let (mut held, mut next, mut n) = (0, 0, 0);
+    let mut out = [0.0; 256];
+    while n < 256 {
+        if held < step {
+            bits = (bits << 32) | u64::from(word(next));
+            (held, next) = (held + 32, next + 1);
+        }
+        held -= step;
+        let state = (bits >> held) as u32;
+        out[n] = weight(state, false);
+        if pairs {
+            out[n + 1] = weight(state, true);
+        }
+        n += 1 + usize::from(pairs);
+    }
+    out
+}
+
+/// Row trellis rows `suh[c] (H v_r)[c] svh[r]`, through `each`.
+pub fn rows<T: Clone + Send>(
+    k: u32,
+    codebook: Codebook,
+    codes: &[u8],
+    [suh, svh]: [&[f32]; 2],
+    each: impl Fn(&f32) -> T + Sync,
+) -> Option<Vec<T>> {
+    // None for a width or codebook this engine lacks.
+    form_for(k, codebook)?;
+    let (k, width) = (k as usize, suh.len());
+    let (tile, pairs) = (32 * k, codebook == Codebook::Pmcgx);
+    let bytes = width / 256 * tile;
+    // Every state's weights, so a value is one lookup.
+    let mask = (1u32 << codebook.state_bits()) - 1;
+    let both = |s: u32| [false, true].map(|odd| codebook.weight(s, odd));
+    let table: Vec<[f32; 2]> = (0..=mask).map(both).collect();
+    let weight = |s: u32, odd: bool| table[(s & mask) as usize][usize::from(odd)];
+    let mut out = vec![each(&0.0); width * svh.len()];
+    spread(&mut out, width, |r, row| {
+        let mut values = vec![0.0; width];
+        let codes = &codes[r * bytes..(r + 1) * bytes];
+        for (t, part) in values.chunks_mut(256).enumerate() {
+            part.copy_from_slice(&stream(k, pairs, &codes[t * tile..(t + 1) * tile], weight));
+        }
+        for block in 0..width / ENTRY {
+            hadamard(&mut values, ENTRY * block, 1);
+        }
+        for ((o, v), s) in row.iter_mut().zip(values).zip(suh) {
+            *o = each(&(v * s * svh[r]));
+        }
+    });
+    Some(out)
 }
 
 /// Runs `work` on each `size` piece, over all cores.
