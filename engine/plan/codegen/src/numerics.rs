@@ -2,6 +2,7 @@
 
 use crate::ir::{BinOp, Body, Expr, Intrinsic, Stmt};
 use std::collections::HashMap;
+use tessera_engine_settings::Backend;
 
 /// How the tile keeps a float operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +52,15 @@ impl Precision {
         acc_bits: 22,
         truncates: true,
     };
+
+    /// How `backend`'s tiles round.
+    pub fn of(backend: Backend) -> Self {
+        match backend {
+            Backend::Metal => Self::METAL,
+            Backend::Cuda => Self::CUDA,
+            Backend::Rocm => Self::HIP,
+        }
+    }
 
     /// Significant bits an operand keeps.
     pub fn bits(&self) -> u32 {

@@ -330,7 +330,7 @@ where
             return Err(Error::Plan(format!("{} has no fixed text", kernel.name())));
         };
         let planned = match backend::<D>()? {
-            crate::Backend::Hip => hip,
+            crate::Backend::Rocm => hip,
             _ => cuda,
         };
         let overridden = self.overrides.get(entry).map(String::as_str);

@@ -300,7 +300,7 @@ impl Device for Context {
             _ => newest.map_or("apple", |(_, n)| n).into(),
         };
         Platform::new(Asked {
-            backend: "metal",
+            backend: crate::backend::Backend::Metal.name(),
             arch,
             name: self.name(),
             driver: String::new(),

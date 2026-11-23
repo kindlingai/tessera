@@ -34,7 +34,7 @@ pub(crate) fn cuda_source() -> &'static str {
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
-    HIP.get_or_init(|| flat(Backend::Hip))
+    HIP.get_or_init(|| flat(Backend::Rocm))
 }
 
 fn parse_trellis(name: &str) -> Option<(u32, u32)> {

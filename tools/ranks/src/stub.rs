@@ -34,7 +34,7 @@ pub fn run(args: &Args, rounds: u32) -> Outcome {
         #[cfg(feature = "rocm")]
         Some(tessera_gpukit::backend::Backend::Rocm) => {
             let ctx = tessera_gpukit::rocm::cached_context()?;
-            on(ctx, Backend::Hip, args, rounds)
+            on(ctx, Backend::Rocm, args, rounds)
         }
         _ => Err("the stub needs a CUDA or ROCm GPU".into()),
     }

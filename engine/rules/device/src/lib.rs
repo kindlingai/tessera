@@ -23,38 +23,10 @@ mod whole_test;
 
 pub use flatten::{Flat, Options, flatten};
 pub use scan::{Error, Problem};
+pub use tessera_gpukit::backend::Backend;
 
 /// The edition every import path names.
 pub(crate) const EDITION: u32 = 1;
-
-/// A compile target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Backend {
-    Cuda,
-    Hip,
-    Metal,
-}
-
-impl Backend {
-    /// The backends a kernel file's extension allows.
-    pub fn of(path: &str) -> &'static [Backend] {
-        match path.rsplit_once('.').map(|(_, e)| e) {
-            Some("cu") => &[Backend::Cuda],
-            Some("hip") => &[Backend::Hip],
-            Some("metal") => &[Backend::Metal],
-            Some("kernel") => &[Backend::Cuda, Backend::Hip, Backend::Metal],
-            _ => &[],
-        }
-    }
-
-    fn define(self) -> &'static str {
-        match self {
-            Backend::Cuda => "TESSERA_CUDA",
-            Backend::Hip => "TESSERA_HIP",
-            Backend::Metal => "TESSERA_METAL",
-        }
-    }
-}
 
 /// A name a kernel may import after `<tessera/1/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

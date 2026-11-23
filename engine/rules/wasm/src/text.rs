@@ -34,7 +34,7 @@ fn flat(file: &str, files: &[File]) -> Result<[String; 3], tessera_device::Error
     })?;
     let mut out: [String; 3] = Default::default();
     let mut skipped = None;
-    let backends = [Backend::Metal, Backend::Cuda, Backend::Hip];
+    let backends = [Backend::Metal, Backend::Cuda, Backend::Rocm];
     for (slot, backend) in out.iter_mut().zip(backends) {
         // No remote rows or marks yet.
         let options = Options {

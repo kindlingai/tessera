@@ -1835,6 +1835,7 @@ name = "tessera-codegen"
 version = "0.1.0"
 dependencies = [
  "scattered-collect",
+ "tessera-engine-settings",
  "tessera-graph",
  "tessera-kernel-macro",
  "tessera-mem",
