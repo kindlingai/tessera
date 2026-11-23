@@ -113,11 +113,31 @@ fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
 
-/// A commit message as one hunk, minus any diff.
+/// A `Key: value` line, such as `Signed-off-by: A <a@b>`.
+fn trailer(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(key, _)| {
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// A commit message, minus `#` lines, diff and trailers.
 fn message(path: &str) -> Result<Hunk, String> {
     let text = read(path)?;
-    let kept: Vec<&str> = text.lines().take_while(|l| !l.contains(" >8 ")).collect();
-    Ok(Hunk::file(path, &kept.join("\n")))
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().take_while(|l| !l.contains(" >8 ")) {
+        lines.push(if line.starts_with('#') { "" } else { line });
+    }
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(0);
+    let start = lines[..end].iter().rposition(|l| l.trim().is_empty());
+    if let Some(start) = start
+        && lines[start + 1..=end].iter().all(|l| trailer(l))
+    {
+        lines[start + 1..=end].fill("");
+    }
+    Ok(Hunk::file(path, &lines.join("\n")))
 }
 
 fn run(args: &[&str]) -> Result<bool, String> {

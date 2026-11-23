@@ -24,8 +24,9 @@ const USAGE: &str =
 
 `run` checks lint's comment rules on the changed files, style and simcheck when
 their models are in ~/.cache/tessera/check, and lint over the repository. It runs
-the fastest checks first and stops at the first failure. `message` checks a commit message for style. `render` reads the
-JSON each check writes. `tests` writes failed and slow tests from nextest's
+the fastest checks first. With `--staged` it stops at the first failure, and a
+range runs every check. `message` checks a commit message for style. `render`
+reads the JSON each check writes. `tests` writes failed and slow tests from nextest's
 JUnit file as such JSON. `fetch` downloads both models.";
 
 fn root() -> Result<PathBuf, String> {
@@ -65,16 +66,17 @@ fn split_markdown<'a>(args: &'a [&'a str]) -> (&'a [&'a str], &'a [&'a str]) {
     }
 }
 
-/// Runs each check, and stops at the first failure.
+/// Runs each check. Staged runs stop at the first failure.
 fn gate(changes: &Changes, checks: &[run::Check], markdown: &[&str]) -> Result<bool, String> {
     let dirs = dirs()?;
     std::fs::create_dir_all(&dirs.out).map_err(|e| format!("{}: {e}", dirs.out.display()))?;
+    let early = matches!(changes, Changes::Staged);
     let mut reports = Vec::new();
     for (i, check) in checks.iter().enumerate() {
         let report = check(&dirs, changes)?;
         let failed = report.fails() > 0;
         reports.push(report);
-        if failed && i + 1 < checks.len() {
+        if early && failed && i + 1 < checks.len() {
             eprintln!("tessera-check: stopped at the first failure; later checks did not run");
             break;
         }
