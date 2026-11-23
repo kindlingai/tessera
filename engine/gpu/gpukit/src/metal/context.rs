@@ -343,6 +343,17 @@ impl Device for Context {
         Ok(())
     }
 
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
+        if size == 0 || dst == src {
+            return Ok(());
+        }
+        self.finish()?;
+        let from = self.span(src, size)?;
+        let to = self.span(dst, size)?;
+        unsafe { std::ptr::copy(from.as_ptr(), to.as_ptr(), size) };
+        Ok(())
+    }
+
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
         self.finish()?;
         let at = self.span(ptr, size)?;

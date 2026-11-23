@@ -1,13 +1,11 @@
 //! Online dual-drafter selection combining DFlash and native MTP.
 
-use crate::mtp_draft::{MtpDrafter, MtpStep, decode_step, draft_mtp, follow_mtp, run_mtp};
+use crate::mtp_draft::{MtpDrafter, draft_mtp, run_mtp};
 use crate::spec_len::{CostModel, SpecLen};
-use crate::speculate::{
-    DRAFT_TAG, DraftCmd, Drafter, SpecStats, TargetCmd, decode_draft, decode_target, encode_draft,
-    run_speculate, taps_output, tell_ranks,
-};
+use crate::spec_loop::{TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::speculate::{Drafter, SpecStats};
 use crate::{Engine, Error, Event, Request};
-use tessera_engine_comm::Reader;
+use tessera_engine_comm::{Reader, Writer};
 
 #[derive(Clone, Debug, PartialEq)]
 struct PendingProbe {
@@ -174,6 +172,30 @@ impl DualSelector {
         self.feed_probe(committed);
     }
 
+    /// Encodes static selector settings for rank broadcast.
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        self.dflash.encode(w);
+        self.mtp.encode(w);
+        w.u32(self.dwell as u32)
+            .f64(self.margin)
+            .u32(self.probe_every as u32);
+    }
+
+    /// Decodes static selector settings sent by rank 0.
+    pub(crate) fn decode(r: &mut Reader) -> Option<Self> {
+        let dflash = SpecLen::decode(r)?;
+        let mtp = SpecLen::decode(r)?;
+        let dwell = r.u32()? as usize;
+        let margin = r.f64()?;
+        let probe_every = r.u32()? as usize;
+        Some(
+            Self::new(dflash, mtp)
+                .with_dwell(dwell)
+                .with_margin(margin)
+                .with_probe(probe_every),
+        )
+    }
+
     fn feed_probe(&mut self, committed: &[u32]) {
         let Some(mut p) = self.probe.take() else {
             return;
@@ -208,7 +230,6 @@ fn split_taps(taps: &[f32], rows: usize, d_width: usize, m_width: usize) -> (Vec
 }
 
 fn run_dflash(
-    target: &mut Engine,
     dflash: &mut Drafter,
     anchor: u32,
     start: usize,
@@ -216,29 +237,8 @@ fn run_dflash(
     pending: &[f32],
 ) -> Result<Vec<u32>, Error> {
     let wants = dflash.draft_wants();
-    if target.control.is_some() {
-        tell_ranks(target, &encode_draft(0, anchor, start, ctx_pos, wants))?;
-    }
-    let outputs = dflash.run(0, anchor, start, ctx_pos, pending, wants)?;
+    let outputs = dflash.run_taps(0, anchor, start, ctx_pos, TapsIn::Host(pending), wants)?;
     dflash.read_draft(&outputs)
-}
-
-enum DualCmd {
-    Target(TargetCmd),
-    Draft(DraftCmd),
-    Mtp(MtpStep),
-}
-
-fn decode_dual(bytes: &[u8]) -> Option<DualCmd> {
-    let mut r = Reader(bytes);
-    let tag = r.u32()?;
-    if tag == DRAFT_TAG {
-        return decode_draft(&mut r).map(DualCmd::Draft);
-    }
-    if let Some(step) = decode_step(tag, &mut r) {
-        return Some(DualCmd::Mtp(step));
-    }
-    decode_target(tag, &mut r).map(DualCmd::Target)
 }
 
 struct DualState {
@@ -298,228 +298,132 @@ impl<'a> DualSpeculate<'a> {
         self.selector = selector;
         self
     }
+}
 
-    /// Follows rank 0's target, DFlash and MTP launches until dismissed.
-    pub fn follow(&mut self) -> Result<(), Error> {
-        let d_width = self.dflash.tap_width();
-        let m_width = self.mtp.hidden();
-        let total = d_width + m_width;
-        let mut d_buf_start = 0usize;
-        let mut d_buf: Vec<f32> = Vec::new();
-        let mut m_buf_start = 0usize;
-        let mut m_buf: Vec<f32> = Vec::new();
-        let mut prev_hidden: Vec<f32> = Vec::new();
-        loop {
-            let mine = self
-                .target
-                .held
-                .take()
-                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-            let Some(told) = tell_ranks(self.target, &mine)? else {
-                return Ok(());
-            };
-            match decode_dual(&told) {
-                None => return Ok(()),
-                Some(DualCmd::Target(cmd)) => {
-                    if let Some(lanes) = &mut self.target.lanes
-                        && !cmd.table.is_empty()
-                    {
-                        lanes.replace(cmd.table);
-                    }
-                    let entry = self.target.entry(&cmd.head)?;
-                    let outputs = self
-                        .target
-                        .run(&cmd.rows, &cmd.picks, cmd.head, cmd.wants)?;
-                    if let Some(at) = taps_output(&self.target.graph, entry, cmd.wants) {
-                        let raw = self.target.runner.read(outputs[at])?;
-                        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-                        let n_rows = cmd.rows.len();
-                        let pos0 = cmd.rows[0].position as usize;
-                        if pos0 == 0 {
-                            d_buf_start = 0;
-                            d_buf.clear();
-                            m_buf_start = 0;
-                            m_buf.clear();
-                        } else {
-                            if pos0 >= d_buf_start {
-                                d_buf.truncate((pos0 - d_buf_start) * d_width);
-                            }
-                            if pos0 >= m_buf_start {
-                                m_buf.truncate((pos0 - m_buf_start) * m_width);
-                            }
-                        }
-                        for r in 0..n_rows {
-                            let base = r * total;
-                            d_buf.extend_from_slice(&floats[base..base + d_width]);
-                            m_buf.extend_from_slice(&floats[base + d_width..base + total]);
-                        }
-                    }
-                    self.target.report();
-                }
-                Some(DualCmd::Draft(cmd)) => {
-                    if cmd.ctx_pos != d_buf_start {
-                        return Err(Error::RowPlace);
-                    }
-                    let n_new = cmd.start.checked_sub(cmd.ctx_pos).ok_or(Error::RowPlace)?;
-                    let need = n_new * d_width;
-                    if d_buf.len() < need {
-                        return Err(Error::Rows);
-                    }
-                    self.dflash.run(
-                        cmd.slot,
-                        cmd.anchor,
-                        cmd.start,
-                        cmd.ctx_pos,
-                        &d_buf[..need],
-                        cmd.wants,
-                    )?;
-                    d_buf_start = cmd.start;
-                    d_buf.clear();
-                }
-                Some(DualCmd::Mtp(step)) => {
-                    if !step.chain {
-                        if step.start_pos as usize != m_buf_start {
-                            return Err(Error::RowPlace);
-                        }
-                        let n_new = step.tokens.len();
-                        let need = n_new * m_width;
-                        if m_buf.len() < need {
-                            return Err(Error::Rows);
-                        }
-                        follow_mtp(self.mtp, step, &m_buf[..need], &mut prev_hidden)?;
-                        m_buf_start += n_new;
-                        m_buf.clear();
-                    } else {
-                        follow_mtp(self.mtp, step, &[], &mut prev_hidden)?;
-                    }
-                }
+spec_entry!(
+    DualSpeculate<'a>,
+    DualSelector,
+    selector,
+    |s, target, req, sel, emit| run_dual_req(target, s.dflash, s.mtp, s.depth, req, sel, emit)
+);
+
+fn run_dual_req(
+    target: &mut Engine,
+    dflash: &mut Drafter,
+    mtp: &mut MtpDrafter,
+    depth: usize,
+    request: Request,
+    selector: DualSelector,
+    emit: &mut dyn FnMut(Event) -> bool,
+) -> Result<SpecStats, Error> {
+    let block = dflash.block();
+    let d_width = dflash.tap_width();
+    let m_width = mtp.hidden();
+    let total = d_width + m_width;
+    let max_ctx = target.context().min(dflash.context()).min(mtp.context());
+    run_speculate(
+        target,
+        request,
+        emit,
+        |target, prompt, anchor, taps| {
+            let raw = taps.into_host(&*target.runner, total)?;
+            let (d_pending, m_taps) = split_taps(&raw, prompt.len(), d_width, m_width);
+            let m_tokens: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
+            Ok(DualState {
+                selector,
+                d_ctx_pos: 0,
+                d_pending,
+                m_start: 0,
+                m_tokens,
+                m_taps,
+                round_mtp: false,
+                last_pred: 1.0,
+                last_mtp_d1: None,
+                switched: false,
+            })
+        },
+        |target, st, start, anchor, remaining| {
+            let rem_cap = remaining.saturating_sub(1);
+            let ctx_cap = max_ctx.saturating_sub(start + 1);
+            if rem_cap == 0 || ctx_cap == 0 {
+                return Ok(None);
             }
-        }
-    }
-
-    /// Greedy dual-drafter decoding matching target output token-for-token.
-    pub fn generate(
-        &mut self,
-        request: Request,
-        emit: &mut dyn FnMut(Event) -> bool,
-    ) -> Result<SpecStats, Error> {
-        let block = self.dflash.block();
-        let d_width = self.dflash.tap_width();
-        let m_width = self.mtp.hidden();
-        let depth = self.depth;
-        let max_ctx = self
-            .target
-            .context()
-            .min(self.dflash.context())
-            .min(self.mtp.context());
-        let dflash = &mut *self.dflash;
-        let mtp = &mut *self.mtp;
-        let template = self.selector.clone();
-        run_speculate(
-            self.target,
-            request,
-            emit,
-            |prompt, anchor, taps| {
-                let (d_pending, m_taps) = split_taps(&taps, prompt.len(), d_width, m_width);
-                let m_tokens: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
-                DualState {
-                    selector: template.fresh(),
-                    d_ctx_pos: 0,
-                    d_pending,
-                    m_start: 0,
-                    m_tokens,
-                    m_taps,
-                    round_mtp: false,
-                    last_pred: 1.0,
-                    last_mtp_d1: None,
-                    switched: false,
+            let can_dflash = start + block <= max_ctx;
+            let (use_mtp, switched) = st.selector.decide_next(can_dflash);
+            st.round_mtp = use_mtp;
+            st.switched = switched;
+            st.last_mtp_d1 = None;
+            if !use_mtp {
+                if st.selector.should_probe_mtp() {
+                    let (mtp_d1, _) = run_mtp(
+                        mtp,
+                        st.m_start,
+                        &st.m_tokens,
+                        TapsIn::Host(&st.m_taps),
+                        false,
+                    )?;
+                    st.m_start = start as u32;
+                    st.m_tokens.clear();
+                    st.m_taps.clear();
+                    st.last_mtp_d1 = Some(mtp_d1);
                 }
-            },
-            |target, st, start, anchor, remaining| {
-                let rem_cap = remaining.saturating_sub(1);
-                let ctx_cap = max_ctx.saturating_sub(start + 1);
-                if rem_cap == 0 || ctx_cap == 0 {
-                    return Ok(None);
-                }
-                let can_dflash = start + block <= max_ctx;
-                let (use_mtp, switched) = st.selector.decide_next(can_dflash);
-                st.round_mtp = use_mtp;
-                st.switched = switched;
-                st.last_mtp_d1 = None;
-                if !use_mtp {
-                    if st.selector.should_probe_mtp() {
-                        let (mtp_d1, _) = run_mtp(
-                            target,
-                            mtp,
-                            st.m_start,
-                            &st.m_tokens,
-                            &st.m_taps,
-                            false,
-                            false,
-                        )?;
-                        st.m_start = start as u32;
-                        st.m_tokens.clear();
-                        st.m_taps.clear();
-                        st.last_mtp_d1 = Some(mtp_d1);
-                    }
-                    let mut drafts =
-                        run_dflash(target, dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
-                    st.d_ctx_pos = start;
-                    st.d_pending.clear();
-                    let avail = drafts.len().min(rem_cap).min(ctx_cap);
-                    let (k, pred) = st.selector.dflash.choose(None, avail, drafts.len());
-                    st.last_pred = pred;
-                    drafts.truncate(k);
-                    return Ok(Some(drafts));
-                }
-                if st.selector.should_probe(can_dflash) {
-                    let probe =
-                        run_dflash(target, dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
-                    st.d_ctx_pos = start;
-                    st.d_pending.clear();
-                    st.selector.start_probe(probe);
-                }
-                let avail = depth.min(st.selector.mtp.max_k()).min(rem_cap).min(ctx_cap);
-                let (drafts, pred) = draft_mtp(
-                    target,
-                    mtp,
-                    &st.selector.mtp,
-                    st.m_start,
-                    &st.m_tokens,
-                    &st.m_taps,
-                    start,
-                    avail,
-                )?;
-                st.m_start = start as u32;
-                st.m_tokens.clear();
-                st.m_taps.clear();
+                let mut drafts = run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
+                st.d_ctx_pos = start;
+                st.d_pending.clear();
+                let avail = drafts.len().min(rem_cap).min(ctx_cap);
+                let (k, pred) = st.selector.dflash.choose(None, avail, drafts.len());
                 st.last_pred = pred;
-                Ok(Some(drafts))
-            },
-            |st, _start, drafted, accepted, posterior, block_taps, stats| {
-                let commit = 1 + accepted;
-                if st.switched {
-                    stats.switches += 1;
-                }
-                if st.round_mtp {
-                    stats.mtp_steps += 1;
-                    st.selector
-                        .observe_mtp(drafted, accepted, st.last_pred, &posterior[..commit]);
-                } else {
-                    stats.dflash_steps += 1;
-                    st.selector.observe_dflash(
-                        drafted,
-                        accepted,
-                        st.last_pred,
-                        st.last_mtp_d1,
-                        posterior[0],
-                    );
-                }
-                let (d_taps, m_taps) = split_taps(&block_taps, commit, d_width, m_width);
-                st.d_pending.extend_from_slice(&d_taps);
-                st.m_tokens.extend_from_slice(&posterior[..commit]);
-                st.m_taps.extend_from_slice(&m_taps);
-            },
-        )
-    }
+                drafts.truncate(k);
+                return Ok(Some(drafts));
+            }
+            if st.selector.should_probe(can_dflash) {
+                let probe = run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
+                st.d_ctx_pos = start;
+                st.d_pending.clear();
+                st.selector.start_probe(probe);
+            }
+            let avail = depth.min(st.selector.mtp.max_k()).min(rem_cap).min(ctx_cap);
+            let m_taps = TapsBuf::Host(std::mem::take(&mut st.m_taps));
+            let (drafts, pred) = draft_mtp(
+                target,
+                mtp,
+                &st.selector.mtp,
+                st.m_start,
+                &st.m_tokens,
+                &m_taps,
+                start,
+                avail,
+            )?;
+            st.m_start = start as u32;
+            st.m_tokens.clear();
+            st.last_pred = pred;
+            Ok(Some(drafts))
+        },
+        |target, st, _start, drafted, accepted, posterior, block_taps, stats| {
+            let commit = 1 + accepted;
+            if st.switched {
+                stats.switches += 1;
+            }
+            if st.round_mtp {
+                stats.mtp_steps += 1;
+                st.selector
+                    .observe_mtp(drafted, accepted, st.last_pred, &posterior[..commit]);
+            } else {
+                stats.dflash_steps += 1;
+                st.selector.observe_dflash(
+                    drafted,
+                    accepted,
+                    st.last_pred,
+                    st.last_mtp_d1,
+                    posterior[0],
+                );
+            }
+            let raw = block_taps.into_host(&*target.runner, total)?;
+            let (d_taps, m_taps) = split_taps(&raw, commit, d_width, m_width);
+            st.d_pending.extend_from_slice(&d_taps);
+            st.m_tokens.extend_from_slice(&posterior[..commit]);
+            st.m_taps.extend_from_slice(&m_taps);
+            Ok(())
+        },
+    )
 }

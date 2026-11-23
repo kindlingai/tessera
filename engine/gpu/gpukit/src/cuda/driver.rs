@@ -67,6 +67,8 @@ type CuCtxDestroy = unsafe extern "C" fn(CUcontext) -> CUresult;
 type CuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
 type CuMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+type CuMemcpyDtoDAsync =
+    unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
 type CuMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
 type CuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type CuLaunchKernelEx = unsafe extern "C" fn(
@@ -113,6 +115,7 @@ tessera_dl::library! {
         pub(crate) cu_func_get_attribute: CuFuncGetAttribute = "cuFuncGetAttribute",
         pub(crate) cu_memcpy_htod: CuMemcpyHtoD = "cuMemcpyHtoD_v2",
         pub(crate) cu_memcpy_dtoh: CuMemcpyDtoH = "cuMemcpyDtoH_v2",
+        pub(crate) cu_memcpy_dtod_async: CuMemcpyDtoDAsync = "cuMemcpyDtoDAsync_v2",
         pub(crate) cu_memset_d8: CuMemsetD8 = "cuMemsetD8_v2",
         pub(crate) cu_launch_kernel: LaunchFn = "cuLaunchKernel",
         pub(crate) cu_launch_kernel_ex: CuLaunchKernelEx = "cuLaunchKernelEx",

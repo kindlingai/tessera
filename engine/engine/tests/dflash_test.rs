@@ -3,6 +3,11 @@
 mod common;
 
 use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tessera_engine::comm::{Error as CommError, Sockets, Transport};
 use tessera_engine::{
     Drafter, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate, accept_greedy,
     accept_sample,
@@ -526,4 +531,144 @@ fn tp_drafter_matches_one() {
     });
     let d3_g = dflash::stepper::<Norm>(&d3_cfg);
     verify_tp_pair(&t_graph, 61, &d3_g, 73, true, false);
+}
+
+struct Counting(Sockets, Arc<AtomicUsize>);
+
+impl Transport for Counting {
+    fn rank(&self) -> u32 {
+        self.0.rank()
+    }
+
+    fn ranks(&self) -> u32 {
+        self.0.ranks()
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        self.1.fetch_add(1, Ordering::Relaxed);
+        self.0.exchange(mine)
+    }
+}
+
+#[test]
+fn tp_early_stop() {
+    let mut t_cfg = Config::toy(1, 24);
+    t_cfg.tied = false;
+    t_cfg.stack.taps = vec![1, 2];
+    let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
+    let spec = TargetSpec {
+        vocab: t_cfg.stack.vocab,
+        hidden: t_cfg.stack.hidden,
+        layers: t_cfg.stack.layers,
+        tied: false,
+    };
+    let d_graph = dflash::stepper::<Norm>(&dflash::Config::toy(&spec, 4, 0, 1, 24));
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
+    let follower = std::thread::spawn(move || {
+        let [ts1, ds1] = Drafter::share_transport(Box::new(s1));
+        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
+        let mut te = open_ranked_target(
+            tg_f.clone(),
+            24,
+            &s_f,
+            place(),
+            ts1,
+            c1,
+            &float_weights(&tg_f, 61),
+        );
+        let mut dr = Drafter::open_ranked(
+            dg_f.clone(),
+            24,
+            4,
+            0,
+            (&Recipe::default(), &s_f),
+            place(),
+            ds1,
+            None,
+        )
+        .unwrap();
+        dr.load(&float_weights(&dg_f, 67)).unwrap();
+        Speculate::new(&mut te, &mut dr).unwrap().follow().unwrap();
+    });
+    let [ts0, ds0] = Drafter::share_transport(Box::new(s0));
+    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
+    let mut target = open_ranked_target(
+        t_graph.clone(),
+        24,
+        &settings,
+        place(),
+        ts0,
+        Counting(c0, exchanges.clone()),
+        &float_weights(&t_graph, 61),
+    );
+    let mut drafter = Drafter::open_ranked(
+        d_graph.clone(),
+        24,
+        4,
+        0,
+        (&Recipe::default(), &settings),
+        place(),
+        ds0,
+        None,
+    )
+    .unwrap();
+    drafter.load(&float_weights(&d_graph, 67)).unwrap();
+    let mut spec = Speculate::new(&mut target, &mut drafter).unwrap();
+    // Normal multi-step request uses only request-start and end sync.
+    let mut full = Vec::new();
+    let stats = spec
+        .generate(
+            Request {
+                tokens: vec![2, 6, 1],
+                max_tokens: 7,
+                ..Request::default()
+            },
+            &mut |e| {
+                full.push(e);
+                true
+            },
+        )
+        .unwrap();
+    assert!(stats.steps >= 2);
+    assert_eq!(exchanges.load(Ordering::Relaxed), 2);
+    // Early emit stop avoids hangs and allows later requests.
+    let mut cut = Vec::new();
+    let cut_stats = spec
+        .generate(
+            Request {
+                tokens: vec![2, 6, 1],
+                max_tokens: 7,
+                ..Request::default()
+            },
+            &mut |e| {
+                cut.push(e);
+                collect_ids(&cut).len() < 2
+            },
+        )
+        .unwrap();
+    assert_eq!(cut_stats.emitted, 2);
+    assert_eq!(collect_ids(&cut), collect_ids(&full)[..2]);
+    assert_eq!(cut.last(), Some(&Event::Done(Reason::Stop)));
+    let mut after = Vec::new();
+    spec.generate(
+        Request {
+            tokens: vec![4, 1, 5],
+            max_tokens: 5,
+            ..Request::default()
+        },
+        &mut |e| {
+            after.push(e);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(collect_ids(&after).len(), 5);
+    target.dismiss().unwrap();
+    follower.join().unwrap();
 }

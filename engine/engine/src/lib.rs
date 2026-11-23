@@ -24,6 +24,7 @@ mod mtp_draft;
 mod ranks;
 mod schedule;
 mod spec_len;
+mod spec_loop;
 mod speculate;
 
 pub use dual::{DualSelector, DualSpeculate};
@@ -206,7 +207,7 @@ pub struct Engine {
 }
 
 /// Inputs a launch feeds before its picks.
-enum Head {
+pub(crate) enum Head {
     /// The full entry. Per-pick mask words, or None for all.
     Full(Option<Vec<u32>>),
     /// The sparse entry, with `k` candidate ids per pick.
@@ -428,6 +429,46 @@ impl Engine {
         Ok((ids, taps))
     }
 
+    /// Local-only step without control broadcast, for SPMD loops.
+    pub(crate) fn step_local(&mut self, rows: &[Row]) -> Result<Vec<u32>, Error> {
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let wants = Wants::role(&self.graph, 0, Role::Tokens);
+        let outputs = self.run_local(rows, &all, Head::Full(None), wants)?;
+        let mut ids = self.runner.ids(outputs[0])?;
+        ids.truncate(rows.len());
+        self.report();
+        Ok(ids)
+    }
+
+    /// Local-only tapped step keeping device taps resident when possible.
+    pub(crate) fn step_taps_local(
+        &mut self,
+        rows: &[Row],
+    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
+        let width = self.taps.ok_or(Error::Taps)?;
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let wants = Wants::roles(&self.graph, 0, &[Role::Tokens, Role::Taps]);
+        let outputs = self.run_local(rows, &all, Head::Full(None), wants)?;
+        let mut ids = self.runner.ids(outputs[0])?;
+        ids.truncate(rows.len());
+        let slot = outputs[1];
+        let taps = if slot.form.name() == "f32"
+            && let Some(addr) = self.runner.address(slot)
+        {
+            spec_loop::TapsBuf::Device {
+                slot,
+                addr,
+                rows: rows.len(),
+            }
+        } else {
+            let raw = self.runner.read(slot)?;
+            let floats = raw.floats().map_err(tessera_run::Error::from)?;
+            spec_loop::TapsBuf::Host(floats[..rows.len() * width].to_vec())
+        };
+        self.report();
+        Ok((ids, taps))
+    }
+
     /// One launch of `rows`: full logits and tapped states.
     pub fn step_logits(&mut self, rows: &[Row]) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let width = self.taps.ok_or(Error::Taps)?;
@@ -536,14 +577,7 @@ impl Engine {
         Ok(ids)
     }
 
-    /// One launch of `rows`. Returns the `wants` output slots.
-    fn run(
-        &mut self,
-        rows: &[Row],
-        picks: &[u32],
-        head: Head,
-        wants: Wants,
-    ) -> Result<Vec<Slot>, Error> {
+    fn check_rows(&self, rows: &[Row]) -> Result<(), Error> {
         if rows.is_empty() {
             return Err(Error::Rows);
         }
@@ -553,7 +587,31 @@ impl Engine {
         {
             return Err(Error::RowPlace);
         }
+        Ok(())
+    }
+
+    /// One launch of `rows`. Returns the `wants` output slots.
+    fn run(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        head: Head,
+        wants: Wants,
+    ) -> Result<Vec<Slot>, Error> {
+        self.check_rows(rows)?;
         self.announce(rows, picks, &head, wants)?;
+        self.run_local(rows, picks, head, wants)
+    }
+
+    /// Runs `rows` on this rank without control broadcast.
+    pub(crate) fn run_local(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        head: Head,
+        wants: Wants,
+    ) -> Result<Vec<Slot>, Error> {
+        self.check_rows(rows)?;
         let (mut sizes, [filled, wanted]) = launch_of(rows, picks, self.slots, self.context);
         let entry = self.entry(&head)?;
         // The last row fills out. Copies rewrite its kept row.

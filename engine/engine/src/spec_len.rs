@@ -1,5 +1,7 @@
 //! Deterministic adaptive draft length controller for speculative decoding.
 
+use tessera_engine_comm::{Reader, Writer};
+
 /// Speculative decoding telemetry for one generation call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpecStats {
@@ -430,6 +432,48 @@ impl SpecLen {
         self.chosen[k] += 1;
         self.pred_sum += predicted;
         self.got_sum += (accepted + 1) as f64;
+    }
+
+    /// Encodes static policy settings for rank broadcast.
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        let levels: Vec<u32> = self.levels.iter().map(|&k| k as u32).collect();
+        w.u32(u32::from(self.adaptive))
+            .u32(self.max_k as u32)
+            .u32s(&levels)
+            .f64(self.cost.base_ms)
+            .f64(self.cost.per_row_ms)
+            .f64(self.cost.draft_round_ms)
+            .f64(self.cost.draft_each_ms)
+            .f64s(&self.seed)
+            .f64(self.pos_decay)
+            .f64(self.bucket_decay)
+            .f64(self.prior);
+    }
+
+    /// Decodes static policy settings sent by rank 0.
+    pub(crate) fn decode(r: &mut Reader) -> Option<Self> {
+        let adaptive = r.u32()? != 0;
+        let max_k = r.u32()? as usize;
+        let levels: Vec<usize> = r.u32s()?.into_iter().map(|k| k as usize).collect();
+        let cost = CostModel {
+            base_ms: r.f64()?,
+            per_row_ms: r.f64()?,
+            draft_round_ms: r.f64()?,
+            draft_each_ms: r.f64()?,
+        };
+        let seed: [f64; MAX_K + 1] = r.f64s()?.try_into().ok()?;
+        let pos_decay = r.f64()?;
+        let bucket_decay = r.f64()?;
+        let prior = r.f64()?;
+        let mut s = Self::fixed(max_k);
+        s.adaptive = adaptive;
+        s.levels = levels;
+        s.cost = cost;
+        s.seed = seed;
+        s.pos_decay = pos_decay;
+        s.bucket_decay = bucket_decay;
+        s.prior = prior;
+        Some(s)
     }
 
     /// Deterministic FNV-1a decision hash for cross-rank verification.

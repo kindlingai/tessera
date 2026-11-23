@@ -55,6 +55,15 @@ pub trait Device: Clone + Send + Sync + 'static {
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
+    /// Copies `size` bytes from `src` to `dst` on device.
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
+        if size == 0 || dst == src {
+            return Ok(());
+        }
+        let mut tmp = vec![0u8; size];
+        self.download(src, &mut tmp)?;
+        self.upload(dst, &tmp)
+    }
     fn compile(&self, source: &str, entry: &str) -> Result<Self::Kernel, Error>;
     /// Waits for every launch. Returns the device's own seconds.
     fn finish(&self) -> Result<Option<f64>, Error>;

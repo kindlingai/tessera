@@ -177,6 +177,7 @@ pub trait Api: Sync + Sized + 'static {
     }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
     /// A timing event, recorded on the default stream.
     fn event(&self) -> Result<Handle, Error>;
@@ -801,6 +802,19 @@ impl<A: Api> Device for Context<A> {
 
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
         self.locked(|a| a.download(ptr, bytes))
+    }
+
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
+        if size == 0 || dst == src {
+            return Ok(());
+        }
+        let len = size as u64;
+        if src < dst + len && dst < src + len {
+            let mut tmp = vec![0u8; size];
+            self.download(src, &mut tmp)?;
+            return self.upload(dst, &tmp);
+        }
+        self.locked(|a| a.copy_d2d(dst, src, size))
     }
 
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {

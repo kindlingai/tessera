@@ -127,6 +127,27 @@ impl Held {
         Ok(out)
     }
 
+    /// Reads `count` little-endian `u32` values from `slot`'s start.
+    pub fn read_u32s(&self, slot: Slot, count: usize) -> Result<Vec<u32>, Error> {
+        let len = count * 4;
+        assert!(len <= slot.bytes(), "read_u32s past slot");
+        let start = slot.start();
+        let backing = self.get(slot).backing();
+        let raw = if let Some(all) = backing.mapped() {
+            all[start..start + len].to_vec()
+        } else {
+            let mut out = vec![0u8; len];
+            backing.download(start, &mut out)?;
+            out
+        };
+        Ok(raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
+            .collect())
+    }
+
     /// `bytes`, packed in the form, into the slot.
     pub fn upload(&mut self, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
         let at = self.bound[slot.buffer as usize];

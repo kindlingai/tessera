@@ -170,6 +170,16 @@ pub trait Run {
     fn address(&self, _slot: Slot) -> Option<u64> {
         None
     }
+    /// Copies `bytes` from device address `src_addr` into `dst`.
+    fn copy_from(
+        &mut self,
+        _dst: Slot,
+        _dst_byte_off: usize,
+        _src_addr: u64,
+        _bytes: usize,
+    ) -> Result<(), Error> {
+        Err(Error::Unaddressed(0))
+    }
     /// How to launch from now on, where the device can.
     fn launching(&mut self, _: Launching) {}
     /// Runs resident steps through `grid` from now on.

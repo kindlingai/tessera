@@ -34,6 +34,7 @@ struct State {
     compiles: usize,
     captures: usize,
     replays: usize,
+    d2d_copies: usize,
     recording: Option<(Vec<u64>, Vec<HandOp>)>,
     last_replayed: Vec<u64>,
     hand_job: u64,
@@ -105,6 +106,7 @@ impl MockDevice {
         s.compiles = 0;
         s.captures = 0;
         s.replays = 0;
+        s.d2d_copies = 0;
         s.last_replayed.clear();
         s.hand_job = 0;
         s.grid_running = false;
@@ -113,6 +115,10 @@ impl MockDevice {
     fn counts(&self) -> (usize, usize, usize, usize, usize) {
         let s = self.0.lock().unwrap();
         (s.allocs, s.frees, s.compiles, s.captures, s.replays)
+    }
+
+    fn d2d_copies(&self) -> usize {
+        self.0.lock().unwrap().d2d_copies
     }
 
     fn replayed(&self) -> Vec<u64> {
@@ -226,6 +232,17 @@ impl Device for MockDevice {
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), GpuError> {
         let s = self.0.lock().unwrap();
         bytes.copy_from_slice(buf_slice(&s.live, ptr, bytes.len()));
+        Ok(())
+    }
+
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), GpuError> {
+        if size == 0 || dst == src {
+            return Ok(());
+        }
+        let mut s = self.0.lock().unwrap();
+        let data = buf_slice(&s.live, src, size).to_vec();
+        buf_slice_mut(&mut s.live, dst, size).copy_from_slice(&data);
+        s.d2d_copies += 1;
         Ok(())
     }
 
@@ -836,4 +853,44 @@ fn sums_split_fallbacks() {
         drop(r1);
         drop(r2);
     }
+}
+
+#[test]
+fn d2d_copy_keeps_graphs() {
+    let src_plan = scratch_plan(&[64]);
+    let dst_plan = scratch_plan(&[64]);
+    let (_guard, mut dst, ctx) = open_mock(dst_plan.clone());
+    let settings = Settings {
+        memory: tessera_engine_settings::Memory::Off,
+        ..host()
+    };
+    let mut src = device::<MockDevice>(src_plan.clone(), &settings).unwrap();
+    let src_slot = src_plan.steps[0].write;
+    let dst_slot = dst_plan.steps[0].write;
+    let vals: Vec<f32> = (0..16).map(|i| i as f32 + 1.0).collect();
+    src.write(
+        src_slot,
+        tessera_mem::Tensor::f32(vec![16], vals.clone()).view(),
+    )
+    .unwrap();
+    // Capture graph on dst before D2D copy.
+    dst.submit(0..1).unwrap();
+    assert_eq!(ctx.counts().3, 1);
+
+    let src_addr = src.address(src_slot).unwrap();
+    dst.copy_from(dst_slot, 0, src_addr, 8 * 4).unwrap();
+    dst.copy_from(dst_slot, 8 * 4, src_addr + 8 * 4, 8 * 4)
+        .unwrap();
+    // Overlapping copy within dst works without error.
+    let dst_addr = dst.address(dst_slot).unwrap();
+    dst.copy_from(dst_slot, 4, dst_addr, 4 * 4).unwrap();
+    // Replaying graph after D2D copies needs zero re-captures.
+    dst.submit(0..1).unwrap();
+    assert_eq!(ctx.counts().3, 1);
+    assert_eq!(ctx.counts().4, 2);
+    assert_eq!(ctx.d2d_copies(), 3);
+    let got = dst.read(dst_slot).unwrap();
+    let floats = got.floats().unwrap();
+    assert_eq!(&floats[0..5], &[1.0, 1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(&floats[8..16], &vals[8..16]);
 }

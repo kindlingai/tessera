@@ -44,13 +44,13 @@ pub fn loopback_links() -> [[Sockets; 2]; 2] {
     })
 }
 
-pub fn open_ranked_target(
+pub fn open_ranked_target<C: tessera_engine::comm::Transport + 'static>(
     g: Graph,
     ctx: usize,
     settings: &Settings,
     place: Place,
     sums: Box<dyn tessera_engine::comm::Transport>,
-    control: Sockets,
+    control: C,
     w: &[Weight],
 ) -> Engine {
     let mut engine = Engine::open_ranked(

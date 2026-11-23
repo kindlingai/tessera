@@ -190,6 +190,8 @@ pub struct Rank<T: Transport> {
     grid: Option<Box<dyn Sum>>,
     /// Host-fallback gather steps cached for one `plan.id`.
     host_gathers: (u64, Vec<usize>),
+    /// Whether an async `queue` launched grid sums not yet checked.
+    queued_sums: bool,
 }
 
 impl<T: Transport> Drop for Rank<T> {
@@ -216,6 +218,7 @@ impl<T: Transport> Rank<T> {
             transport,
             grid: None,
             host_gathers: (0, Vec::new()),
+            queued_sums: false,
         })
     }
 
@@ -231,6 +234,7 @@ impl<T: Transport> Rank<T> {
             transport,
             grid: None,
             host_gathers: (0, Vec::new()),
+            queued_sums: false,
         })
     }
 
@@ -254,7 +258,7 @@ impl<T: Transport> Rank<T> {
     }
 
     /// Runs `steps` with crossing steps inside device graphs.
-    fn submit_graphed(&mut self, steps: Range<usize>) -> Result<bool, Error> {
+    fn submit_graphed(&mut self, steps: Range<usize>, wait: bool) -> Result<bool, Error> {
         let Inner::Device(dev) = &mut self.runner else {
             return Ok(false);
         };
@@ -284,10 +288,11 @@ impl<T: Transport> Rank<T> {
                     unreachable!()
                 };
                 let grid = self.grid.as_mut().expect("a grid");
-                let split = match dev.run_with(span, true, has_cross, grid.as_mut()) {
+                let sync = wait || next_host.is_some();
+                let split = match dev.run_with(span, sync, has_cross, grid.as_mut()) {
                     Ok(s) => s,
                     Err(e) => {
-                        if used_grid || has_cross {
+                        if used_grid || has_cross || std::mem::take(&mut self.queued_sums) {
                             let _ = grid.check();
                         }
                         return Err(e);
@@ -304,7 +309,7 @@ impl<T: Transport> Rank<T> {
             if let Some(at) = next_host {
                 let step = self.runner.run().plan().steps[at].clone();
                 if let Err(e) = self.gather(&step) {
-                    if used_grid {
+                    if used_grid || std::mem::take(&mut self.queued_sums) {
                         let _ = self.grid.as_mut().expect("a grid").check();
                     }
                     return Err(e);
@@ -314,7 +319,9 @@ impl<T: Transport> Rank<T> {
                 from = end;
             }
         }
-        if used_grid {
+        if !wait {
+            self.queued_sums |= used_grid;
+        } else if used_grid || std::mem::take(&mut self.queued_sums) {
             self.grid.as_mut().expect("a grid").check()?;
         }
         Ok(true)
@@ -372,33 +379,15 @@ impl<T: Transport> Rank<T> {
         self.note(name, (now - from).as_secs_f64());
         now
     }
-}
-
-impl<T: Transport> Run for Rank<T> {
-    fn base(&self) -> &Base {
-        self.runner.run().base()
-    }
-
-    fn base_mut(&mut self) -> &mut Base {
-        self.runner.run_mut().base_mut()
-    }
-
-    fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        match &mut self.runner {
-            Inner::Device(dev) => dev.replan_with(plan, self.grid.as_deref_mut()),
-            Inner::Plain(r) => r.replan(plan),
-        }
-    }
-
-    /// Runs these steps. Sums wait for every rank.
-    fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
+    /// Runs `steps`, omitting the trailing sync when `wait` is false.
+    fn run_steps(&mut self, steps: Range<usize>, wait: bool) -> Result<(), Error> {
         let timed = self.base().profile.is_some();
         if let Some(grid) = &mut self.grid {
             grid.timing(timed);
         }
         if !timed
             && self.grid.as_ref().is_some_and(|g| g.capturable())
-            && self.submit_graphed(steps.clone())?
+            && self.submit_graphed(steps.clone(), wait)?
         {
             return Ok(());
         }
@@ -424,8 +413,14 @@ impl<T: Transport> Run for Rank<T> {
                 (false, false) => self.exchange(&step)?,
             }
         }
+        let crossed = from > steps.start;
+        if !wait && self.grid.is_some() && !timed {
+            self.queued_sums |= crossed;
+            return self.run_span(from..steps.end, false);
+        }
         self.run_span(from..steps.end, true)?;
-        let Some(grid) = self.grid.as_mut().filter(|_| from > steps.start) else {
+        let need_check = crossed || std::mem::take(&mut self.queued_sums);
+        let Some(grid) = self.grid.as_mut().filter(|_| need_check) else {
             return Ok(());
         };
         grid.check()?;
@@ -436,9 +431,48 @@ impl<T: Transport> Run for Rank<T> {
         }
         Ok(())
     }
+}
+
+impl<T: Transport> Run for Rank<T> {
+    fn base(&self) -> &Base {
+        self.runner.run().base()
+    }
+
+    fn base_mut(&mut self) -> &mut Base {
+        self.runner.run_mut().base_mut()
+    }
+
+    fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
+        match &mut self.runner {
+            Inner::Device(dev) => dev.replan_with(plan, self.grid.as_deref_mut()),
+            Inner::Plain(r) => r.replan(plan),
+        }
+    }
+
+    /// Runs these steps. Sums wait for every rank.
+    fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.run_steps(steps, true)
+    }
+
+    /// Queues steps without trailing sync when using a device grid.
+    fn queue(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.run_steps(steps, false)
+    }
 
     fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {
         self.runner.run().address(slot)
+    }
+
+    fn copy_from(
+        &mut self,
+        dst: tessera_lower::Slot,
+        dst_byte_off: usize,
+        src_addr: u64,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        self.runner
+            .run_mut()
+            .copy_from(dst, dst_byte_off, src_addr, bytes)
     }
 
     fn launching(&mut self, how: Launching) {

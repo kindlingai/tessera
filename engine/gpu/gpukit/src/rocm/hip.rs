@@ -17,6 +17,7 @@ pub(crate) type HipGraphNode = *mut c_void;
 pub(crate) const HIP_SUCCESS: HipError = 0;
 pub(crate) const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const MEMCPY_DEVICE_TO_HOST: c_int = 2;
+pub(crate) const MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 pub(crate) const HOST_MALLOC_MAPPED: u32 = 2;
 pub(crate) const HOST_REGISTER_MAPPED: u32 = 2;
 pub(crate) const IPC_LAZY_ENABLE_PEER: u32 = 1;
@@ -35,6 +36,8 @@ pub(crate) const HIP_STREAM_CAPTURE_MODE_RELAXED: c_int = 2;
 
 type HipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
 type HipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipError;
+type HipMemcpyAsync =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, *mut c_void) -> HipError;
 type HipMemset = unsafe extern "C" fn(HipDeviceptr, c_int, usize) -> HipError;
 type HipGraphInstantiate = unsafe extern "C" fn(
     *mut HipGraphExec,
@@ -76,6 +79,7 @@ tessera_dl::library! {
         pub hip_ipc_close_mem_handle: entry::IpcClose = "hipIpcCloseMemHandle",
         pub hip_occupancy: entry::Occupancy = "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
         pub hip_memcpy: HipMemcpy = "hipMemcpy",
+        pub hip_memcpy_async: HipMemcpyAsync = "hipMemcpyAsync",
         pub hip_memset: HipMemset = "hipMemset",
         pub hip_module_launch_kernel: LaunchFn = "hipModuleLaunchKernel",
         pub hip_stream_create: entry::Stream = "hipStreamCreateWithFlags",

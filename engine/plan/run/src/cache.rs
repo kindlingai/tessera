@@ -2,6 +2,36 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::sync::OnceLock;
+use tessera_graph::DimName;
+use tessera_lower::{Launch as Call, Plan};
+
+/// Most inactive plans kept ready for instant switching.
+pub(crate) const MAX_PLANS: usize = 32;
+
+/// Most `(plan, bound)` graph sets kept alive at once.
+pub(crate) const MAX_GRAPHS: usize = 32;
+
+/// Plan id and bound dims sharing one graph set.
+pub(crate) type GraphKey = (u64, Vec<(DimName, u32)>);
+
+/// Recorded step ranges for one binding and its addresses.
+pub(crate) struct GraphSet<G> {
+    pub(crate) ptrs: Vec<u64>,
+    pub(crate) ranges: HashMap<(usize, usize), G>,
+}
+
+/// Compiled kernel and dispatch tables for one inactive plan.
+pub(crate) struct Prepared<K> {
+    pub(crate) plan: Plan,
+    pub(crate) launches: Vec<OnceLock<Vec<Call>>>,
+    pub(crate) kernels: Vec<K>,
+    pub(crate) planned: Vec<K>,
+    pub(crate) entries: Vec<(String, usize)>,
+    pub(crate) uses: Vec<usize>,
+    pub(crate) waits: Vec<bool>,
+    pub(crate) resident: Vec<bool>,
+}
 
 /// Bounded map evicting the least recently used entry.
 pub(crate) struct Lru<K, V> {

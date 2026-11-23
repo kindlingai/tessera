@@ -249,6 +249,12 @@ impl Api for Driver {
         self.check(code, "cuMemcpyDtoH")
     }
 
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
+        let stream = std::ptr::null_mut();
+        let code = unsafe { (self.cu_memcpy_dtod_async)(dst, src, size, stream) };
+        self.check(code, "cuMemcpyDtoDAsync")
+    }
+
     fn stats(&self, kernel: Handle) -> Option<KernelStats> {
         let attr = |which| {
             self.int("cuFuncGetAttribute", |v| unsafe {

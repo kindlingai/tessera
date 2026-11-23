@@ -219,6 +219,14 @@ impl Api for Runtime {
         self.check(code, "hipMemcpy to host")
     }
 
+    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
+        let (d, s) = (dst as *mut _, src as *const _);
+        let kind = hip::MEMCPY_DEVICE_TO_DEVICE;
+        let stream = std::ptr::null_mut();
+        let code = unsafe { (self.hip_memcpy_async)(d, s, size, kind, stream) };
+        self.check(code, "hipMemcpyAsync")
+    }
+
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
         ctx.set_current()?;
         let arch = ctx.arch();

@@ -1,7 +1,7 @@
 //! Replays a plan on any GPU over the device traits.
 
 use crate::Error;
-use crate::cache::Lru;
+use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared};
 use crate::grid::{self, Grid};
 use crate::held::Holds;
 use crate::kernels::Kernels;
@@ -14,44 +14,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::Settings;
 use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
-use tessera_graph::DimName;
 use tessera_lower::kernels::crosses;
 use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
 use tessera_mem::Buffer;
-
-/// Most inactive plans kept ready for instant switching.
-const MAX_PLANS: usize = 32;
-
-/// Most `(plan, bound)` graph sets kept alive at once.
-const MAX_GRAPHS: usize = 32;
-
-/// Plan id and bound dims sharing one graph set.
-type GraphKey = (u64, Vec<(DimName, u32)>);
-
-/// Recorded step ranges for one binding and its addresses.
-struct GraphSet<G> {
-    ptrs: Vec<u64>,
-    ranges: HashMap<(usize, usize), G>,
-}
-
-/// Compiled kernel and dispatch tables for one inactive plan.
-struct Prepared<K> {
-    plan: Plan,
-    launches: Vec<OnceLock<Vec<Call>>>,
-    kernels: Vec<K>,
-    planned: Vec<K>,
-    entries: Vec<(String, usize)>,
-    uses: Vec<usize>,
-    waits: Vec<bool>,
-    resident: Vec<bool>,
-}
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
@@ -830,6 +802,18 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn address(&self, slot: Slot) -> Option<u64> {
         Some(self.buffer(slot).device_ptr() + slot.at(0) as u64)
+    }
+
+    fn copy_from(
+        &mut self,
+        dst: Slot,
+        dst_byte_off: usize,
+        src_addr: u64,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        assert!(dst_byte_off + bytes <= dst.bytes(), "copy_from past slot");
+        let at = self.buffer(dst).device_ptr() + (dst.at(0) + dst_byte_off) as u64;
+        Ok(self.ctx.copy_d2d(at, src_addr, bytes)?)
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {

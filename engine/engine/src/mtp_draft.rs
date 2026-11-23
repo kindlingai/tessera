@@ -2,24 +2,16 @@
 
 use crate::ranks::open_rank;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::speculate::{
-    DraftCore, TargetCmd, decode_target, draft_methods, run_speculate, run_target, taps_output,
-    tell_ranks,
-};
+use crate::spec_loop::{D2dCopy, TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::speculate::{DraftCore, draft_methods};
 use crate::{Engine, Error, Event, Place, Request, SpecStats};
-use tessera_engine_comm::{Reader, Transport, Writer};
+use tessera_engine_comm::Transport;
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs};
 use tessera_graph::{Graph, Role};
 use tessera_interp::Tensor;
 use tessera_lower::{Recipe, Settings, Slot, Wants, Weight};
 use tessera_models::mtp;
 use tessera_run::{Run, open};
-
-/// Control tag for an MTP step reading target taps.
-pub(crate) const MTP_FIRST_TAG: u32 = 4;
-
-/// Control tag for a chained MTP step reading prior hidden.
-pub(crate) const MTP_CHAIN_TAG: u32 = 5;
 
 /// Runs an MTP one-layer MLA drafter with kept KV caches.
 pub struct MtpDrafter {
@@ -110,28 +102,46 @@ impl MtpDrafter {
         outputs: &[Slot],
         rows: usize,
         keep_hidden: bool,
-    ) -> Result<(u32, Vec<f32>), Error> {
+    ) -> Result<(u32, TapsBuf), Error> {
         let ids = self.core.runner.ids(outputs[0])?;
         let token = ids[rows - 1];
         if !keep_hidden {
-            return Ok((token, Vec::new()));
+            return Ok((token, TapsBuf::Host(Vec::new())));
         }
-        let raw = self.core.runner.read(outputs[1])?;
+        let slot = outputs[1];
+        if slot.form.name() == "f32"
+            && let Some(base) = self.core.runner.address(slot)
+        {
+            let addr = base + ((rows - 1) * self.hidden * 4) as u64;
+            return Ok((
+                token,
+                TapsBuf::Device {
+                    slot,
+                    addr,
+                    rows: 1,
+                },
+            ));
+        }
+        let raw = self.core.runner.read(slot)?;
         let floats = raw.floats().map_err(tessera_run::Error::from)?;
         let from = (rows - 1) * self.hidden;
-        Ok((token, floats[from..from + self.hidden].to_vec()))
+        Ok((
+            token,
+            TapsBuf::Host(floats[from..from + self.hidden].to_vec()),
+        ))
     }
 
-    pub(crate) fn run(
+    pub(crate) fn run_taps(
         &mut self,
         slot: u32,
         start_pos: u32,
         tokens: &[u32],
-        hidden: &[f32],
+        hidden: TapsIn<'_>,
         wants: Wants,
+        wait: bool,
     ) -> Result<Vec<Slot>, Error> {
         let m = tokens.len();
-        if m == 0 || hidden.len() != m * self.hidden {
+        if m == 0 {
             return Err(Error::Rows);
         }
         if slot as usize >= self.core.slots || start_pos as usize + m > self.core.context {
@@ -141,30 +151,55 @@ impl MtpDrafter {
         let mut tok_buf = Vec::with_capacity(filled);
         let mut pos_buf = Vec::with_capacity(filled);
         let mut scale_buf = Vec::with_capacity(filled);
-        let mut hid_buf = Vec::with_capacity(filled * self.hidden);
         for (i, &t) in tokens.iter().enumerate() {
             let p = start_pos + i as u32;
             tok_buf.push(t);
             pos_buf.push(p);
             scale_buf.push(if p == 0 { 0.0 } else { 1.0 });
         }
-        hid_buf.extend_from_slice(hidden);
         let last_tok = *tokens.last().expect("non-empty");
         let last_pos = start_pos + (m - 1) as u32;
         let last_scale = if last_pos == 0 { 0.0 } else { 1.0 };
-        let last_hid = &hidden[(m - 1) * self.hidden..];
         for _ in m..filled {
             tok_buf.push(last_tok);
             pos_buf.push(last_pos);
             scale_buf.push(last_scale);
-            hid_buf.extend_from_slice(last_hid);
         }
+        let (hid_tensor, d2d) = match hidden {
+            TapsIn::Host(h) => {
+                if h.len() != m * self.hidden {
+                    return Err(Error::Rows);
+                }
+                let mut hid_buf = Vec::with_capacity(filled * self.hidden);
+                hid_buf.extend_from_slice(h);
+                let last_hid = &h[(m - 1) * self.hidden..];
+                for _ in m..filled {
+                    hid_buf.extend_from_slice(last_hid);
+                }
+                (Some(Tensor::f32(vec![filled, self.hidden], hid_buf)), None)
+            }
+            TapsIn::Device { addr, rows } => {
+                if rows != m {
+                    return Err(Error::Rows);
+                }
+                (
+                    None,
+                    Some(D2dCopy {
+                        input: 3,
+                        src: addr,
+                        rows,
+                        filled,
+                        width: self.hidden,
+                    }),
+                )
+            }
+        };
         let feeds = [
-            Tensor::u32(vec![filled], tok_buf),
-            Tensor::u32(vec![filled], pos_buf),
-            Tensor::u32(vec![filled], vec![slot; filled]),
-            Tensor::f32(vec![filled, self.hidden], hid_buf),
-            Tensor::f32(vec![filled, 1], scale_buf),
+            Some(Tensor::u32(vec![filled], tok_buf)),
+            Some(Tensor::u32(vec![filled], pos_buf)),
+            Some(Tensor::u32(vec![filled], vec![slot; filled])),
+            hid_tensor,
+            Some(Tensor::f32(vec![filled, 1], scale_buf)),
         ];
         let sizes = [
             (Seqs, self.core.slots as u64),
@@ -175,123 +210,113 @@ impl MtpDrafter {
             ),
             (Segments, 1),
         ];
-        self.core.exec(&feeds, &sizes, wants)
+        self.core
+            .exec_tap(&feeds, d2d.as_slice(), &sizes, wants, wait)
+    }
+
+    /// Runs one chained MTP step from device token and hidden.
+    fn run_chain(
+        &mut self,
+        slot: u32,
+        pos: u32,
+        tok_addr: u64,
+        hid_addr: u64,
+        wants: Wants,
+        wait: bool,
+    ) -> Result<Vec<Slot>, Error> {
+        if slot as usize >= self.core.slots || pos as usize + 1 > self.core.context {
+            return Err(Error::RowPlace);
+        }
+        let scale = if pos == 0 { 0.0f32 } else { 1.0f32 };
+        let d2d = [
+            D2dCopy {
+                input: 3,
+                src: hid_addr,
+                rows: 1,
+                filled: 1,
+                width: self.hidden,
+            },
+            D2dCopy {
+                input: 0,
+                src: tok_addr,
+                rows: 1,
+                filled: 1,
+                width: 1,
+            },
+        ];
+        let feeds = [
+            None,
+            Some(Tensor::u32(vec![1], vec![pos])),
+            Some(Tensor::u32(vec![1], vec![slot])),
+            None,
+            Some(Tensor::f32(vec![1, 1], vec![scale])),
+        ];
+        let sizes = [
+            (Seqs, self.core.slots as u64),
+            (Rows, 1),
+            (
+                Context,
+                crate::context_bucket(pos as usize + 1, self.core.context),
+            ),
+            (Segments, 1),
+        ];
+        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
     }
 }
 
-/// Decoded MTP launch command from rank 0.
-pub(crate) struct MtpStep {
-    pub slot: u32,
-    pub start_pos: u32,
-    pub tokens: Vec<u32>,
-    pub wants: Wants,
-    pub chain: bool,
-    pub keep: bool,
-}
-
-enum MtpCmd {
-    Target(TargetCmd),
-    Step(MtpStep),
-}
-
-pub(crate) fn encode_step(
-    slot: u32,
+/// Runs one local MTP step, keeping output hidden when requested.
+pub(crate) fn run_mtp(
+    drafter: &mut MtpDrafter,
     start_pos: u32,
     tokens: &[u32],
-    wants: Wants,
-    chain: bool,
+    hid: TapsIn<'_>,
     keep: bool,
-) -> Vec<u8> {
-    let tag = if chain { MTP_CHAIN_TAG } else { MTP_FIRST_TAG };
-    let mut w = Writer(Vec::with_capacity(24 + tokens.len() * 4));
-    w.u32(tag)
-        .u32(slot)
-        .u32(start_pos)
-        .u32(wants.0)
-        .u32(u32::from(keep))
-        .u32s(tokens);
-    w.0
+) -> Result<(u32, TapsBuf), Error> {
+    let wants = drafter.wants();
+    let outputs = drafter.run_taps(0, start_pos, tokens, hid, wants, true)?;
+    drafter.read_last(&outputs, tokens.len(), keep)
 }
 
-pub(crate) fn decode_step(tag: u32, r: &mut Reader) -> Option<MtpStep> {
-    if tag != MTP_FIRST_TAG && tag != MTP_CHAIN_TAG {
-        return None;
-    }
-    Some(MtpStep {
-        slot: r.u32()?,
-        start_pos: r.u32()?,
-        wants: Wants(r.u32()?),
-        keep: r.u32()? != 0,
-        tokens: r.u32s()?,
-        chain: tag == MTP_CHAIN_TAG,
-    })
-}
-
-fn decode_mtp(bytes: &[u8]) -> Option<MtpCmd> {
-    let mut r = Reader(bytes);
-    let tag = r.u32()?;
-    if let Some(step) = decode_step(tag, &mut r) {
-        return Some(MtpCmd::Step(step));
-    }
-    decode_target(tag, &mut r).map(MtpCmd::Target)
-}
-
-/// Runs one decoded MTP step on a follower rank.
-pub(crate) fn follow_mtp(
-    drafter: &mut MtpDrafter,
-    step: MtpStep,
-    last_taps: &[f32],
-    prev_hidden: &mut Vec<f32>,
-) -> Result<(), Error> {
-    let hidden = drafter.hidden();
-    let src = if step.chain {
-        prev_hidden.as_slice()
-    } else {
-        last_taps
-    };
-    let need = step.tokens.len() * hidden;
-    if src.len() < need {
-        return Err(Error::Rows);
-    }
-    let outputs = drafter.run(
-        step.slot,
-        step.start_pos,
-        &step.tokens,
-        &src[..need],
-        step.wants,
-    )?;
-    if step.keep
-        && let Some(at) = taps_output(&drafter.core.graph, 0, step.wants)
-    {
-        let raw = drafter.core.runner.read(outputs[at])?;
-        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-        let from = (step.tokens.len() - 1) * hidden;
-        prev_hidden.clear();
-        prev_hidden.extend_from_slice(&floats[from..from + hidden]);
-    }
-    Ok(())
-}
-
-/// Runs one MTP step on rank 0, broadcasting if ranked.
+/// Queues `chain_n` MTP steps on GPU with one trailing sync.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_mtp(
+fn chain_gpu(
     target: &mut Engine,
     drafter: &mut MtpDrafter,
     start_pos: u32,
     tokens: &[u32],
-    hid: &[f32],
-    keep: bool,
-    chain: bool,
-) -> Result<(u32, Vec<f32>), Error> {
+    tap_slot: Slot,
+    tap_addr: u64,
+    start: usize,
+    chain_n: usize,
+) -> Result<Vec<u32>, Error> {
     let wants = drafter.wants();
-    if target.control.is_some() {
-        tell_ranks(
-            target,
-            &encode_step(0, start_pos, tokens, wants, chain, keep),
-        )?;
+    let m = tokens.len();
+    let hidden = drafter.hidden();
+    let first_in = TapsIn::Device {
+        addr: tap_addr,
+        rows: m,
+    };
+    let outputs = drafter.run_taps(0, start_pos, tokens, first_in, wants, false)?;
+    let addr_of = |r: &dyn Run, s: Slot| r.address(s).ok_or(tessera_run::Error::Unaddressed(0));
+    let mut tok_addr = addr_of(&*drafter.core.runner, outputs[0])? + ((m - 1) * 4) as u64;
+    let mut hid_addr = addr_of(&*drafter.core.runner, outputs[1])? + ((m - 1) * hidden * 4) as u64;
+    let mut last_out = outputs[0];
+    for j in 1..chain_n {
+        let off = (j - 1) * 4;
+        target.runner.copy_from(tap_slot, off, tok_addr, 4)?;
+        let saved_tok = tap_addr + off as u64;
+        let pos = (start - 1 + j) as u32;
+        let wait = j + 1 == chain_n;
+        let outs = drafter.run_chain(0, pos, saved_tok, hid_addr, wants, wait)?;
+        last_out = outs[0];
+        if !wait {
+            tok_addr = addr_of(&*drafter.core.runner, outs[0])?;
+            hid_addr = addr_of(&*drafter.core.runner, outs[1])?;
+        }
     }
-    let outputs = drafter.run(0, start_pos, tokens, hid, wants)?;
-    drafter.read_last(&outputs, tokens.len(), keep)
+    let mut drafts = target.runner.held().read_u32s(tap_slot, chain_n - 1)?;
+    drafts.push(drafter.core.runner.ids(last_out)?[0]);
+    Ok(drafts)
 }
 
 /// Runs an MTP first-form pass plus adaptive chain steps.
@@ -302,7 +327,7 @@ pub(crate) fn draft_mtp(
     spec: &SpecLen,
     start_pos: u32,
     tokens: &[u32],
-    taps: &[f32],
+    taps: &TapsBuf,
     start: usize,
     avail: usize,
 ) -> Result<(Vec<u32>, f64), Error> {
@@ -315,24 +340,32 @@ pub(crate) fn draft_mtp(
         }
         n
     };
-    let mut drafts = Vec::with_capacity(chain_n);
-    let (first, mut prev_hid) =
-        run_mtp(target, drafter, start_pos, tokens, taps, chain_n > 1, false)?;
-    drafts.push(first);
-    for j in 1..chain_n {
-        let pos = (start - 1 + j) as u32;
-        let (tok, next_hid) = run_mtp(
-            target,
-            drafter,
-            pos,
-            &[drafts[j - 1]],
-            &prev_hid,
-            j + 1 < chain_n,
-            true,
-        )?;
-        drafts.push(tok);
-        prev_hid = next_hid;
-    }
+    let mut drafts = if chain_n >= 2
+        && let TapsBuf::Device { slot, addr, rows } = *taps
+        && rows == tokens.len()
+        && slot.bytes() >= chain_n * 4
+    {
+        chain_gpu(
+            target, drafter, start_pos, tokens, slot, addr, start, chain_n,
+        )?
+    } else {
+        let mut out = Vec::with_capacity(chain_n);
+        let (first, mut prev_hid) = run_mtp(drafter, start_pos, tokens, taps.as_in(), chain_n > 1)?;
+        out.push(first);
+        for j in 1..chain_n {
+            let pos = (start - 1 + j) as u32;
+            let (tok, next_hid) = run_mtp(
+                drafter,
+                pos,
+                &[out[j - 1]],
+                prev_hid.as_in(),
+                j + 1 < chain_n,
+            )?;
+            out.push(tok);
+            prev_hid = next_hid;
+        }
+        out
+    };
     let (k, pred) = spec.choose(None, drafts.len(), drafts.len());
     drafts.truncate(k);
     Ok((drafts, pred))
@@ -378,90 +411,74 @@ impl<'a> MtpSpeculate<'a> {
         self.spec_len = spec_len;
         self
     }
+}
 
-    /// Follows rank 0's target and MTP launches until dismissed.
-    pub fn follow(&mut self) -> Result<(), Error> {
-        let mut last_taps: Vec<f32> = Vec::new();
-        let mut prev_hidden: Vec<f32> = Vec::new();
-        let hidden = self.drafter.hidden();
-        loop {
-            let mine = self
-                .target
-                .held
-                .take()
-                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-            let Some(told) = tell_ranks(self.target, &mine)? else {
-                return Ok(());
-            };
-            match decode_mtp(&told) {
-                None => return Ok(()),
-                Some(MtpCmd::Target(cmd)) => run_target(self.target, cmd, hidden, &mut last_taps)?,
-                Some(MtpCmd::Step(step)) => {
-                    follow_mtp(self.drafter, step, &last_taps, &mut prev_hidden)?;
-                }
+spec_entry!(
+    MtpSpeculate<'a>,
+    SpecLen,
+    spec_len,
+    |s, target, req, spec, emit| run_mtp_req(target, s.drafter, s.depth, req, spec, emit)
+);
+
+fn run_mtp_req(
+    target: &mut Engine,
+    drafter: &mut MtpDrafter,
+    depth: usize,
+    request: Request,
+    spec: SpecLen,
+    emit: &mut dyn FnMut(Event) -> bool,
+) -> Result<SpecStats, Error> {
+    let hidden = drafter.hidden();
+    let max_ctx = target.context().min(drafter.context());
+    run_speculate(
+        target,
+        request,
+        emit,
+        |_, prompt, anchor, taps| {
+            let pending: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
+            Ok((0u32, pending, taps, spec, 1.0f64))
+        },
+        |target,
+         (pending_start, pending_tokens, pending_taps, spec, last_pred),
+         start,
+         _,
+         remaining| {
+            let avail = depth
+                .min(spec.max_k())
+                .min(remaining.saturating_sub(1))
+                .min(max_ctx.saturating_sub(start + 1));
+            if avail == 0 {
+                return Ok(None);
             }
-        }
-    }
-
-    /// Greedy MTP speculative decoding matching target output token-for-token.
-    pub fn generate(
-        &mut self,
-        request: Request,
-        emit: &mut dyn FnMut(Event) -> bool,
-    ) -> Result<SpecStats, Error> {
-        let depth = self.depth;
-        let hidden = self.drafter.hidden();
-        let max_ctx = self.target.context().min(self.drafter.context());
-        let drafter = &mut *self.drafter;
-        let spec = self.spec_len.fresh();
-        run_speculate(
-            self.target,
-            request,
-            emit,
-            |prompt, anchor, taps| {
-                let pending: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
-                (0u32, pending, taps, spec, 1.0f64)
-            },
-            |target,
-             (pending_start, pending_tokens, pending_taps, spec, last_pred),
-             start,
-             _,
-             remaining| {
-                let avail = depth
-                    .min(spec.max_k())
-                    .min(remaining.saturating_sub(1))
-                    .min(max_ctx.saturating_sub(start + 1));
-                if avail == 0 {
-                    return Ok(None);
-                }
-                let (drafts, pred) = draft_mtp(
-                    target,
-                    drafter,
-                    spec,
-                    *pending_start,
-                    pending_tokens,
-                    pending_taps,
-                    start,
-                    avail,
-                )?;
-                *last_pred = pred;
-                Ok(Some(drafts))
-            },
-            |(pending_start, pending_tokens, pending_taps, spec, last_pred),
-             start,
-             drafted,
-             accepted,
-             posterior,
-             mut taps,
-             stats| {
-                spec.observe(drafted, accepted, None, *last_pred);
-                stats.mtp_steps += 1;
-                let commit = 1 + accepted;
-                *pending_start = start as u32;
-                *pending_tokens = posterior[..commit].to_vec();
-                taps.truncate(commit * hidden);
-                *pending_taps = taps;
-            },
-        )
-    }
+            let (drafts, pred) = draft_mtp(
+                target,
+                drafter,
+                spec,
+                *pending_start,
+                pending_tokens,
+                pending_taps,
+                start,
+                avail,
+            )?;
+            *last_pred = pred;
+            Ok(Some(drafts))
+        },
+        |_,
+         (pending_start, pending_tokens, pending_taps, spec, last_pred),
+         start,
+         drafted,
+         accepted,
+         posterior,
+         mut taps,
+         stats| {
+            spec.observe(drafted, accepted, None, *last_pred);
+            stats.mtp_steps += 1;
+            let commit = 1 + accepted;
+            *pending_start = start as u32;
+            *pending_tokens = posterior[..commit].to_vec();
+            taps.keep_rows(commit, hidden);
+            *pending_taps = taps;
+            Ok(())
+        },
+    )
 }

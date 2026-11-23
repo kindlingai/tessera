@@ -3,19 +3,17 @@
 use crate::ranks::open_rank;
 pub use crate::spec_len::SpecStats;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::{Engine, Error, Event, Head, Place, Reason, Request, Row};
+use crate::spec_loop::{D2dCopy, TapsIn, fill_d2d, run_speculate, spec_entry};
+use crate::{Engine, Error, Event, Place, Request};
 use std::cell::RefCell;
 use std::rc::Rc;
-use tessera_engine_comm::{Error as CommError, Reader, Transport, Writer};
+use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Role};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Slot, Wants, Weight};
 use tessera_models::dflash;
-use tessera_run::{Error as RunError, Profile, Ranks, Run, Sum, open};
-
-/// Wire tag identifying a drafter launch on the control channel.
-pub(crate) const DRAFT_TAG: u32 = 3;
+use tessera_run::{Error as RunError, Run, Sum, open};
 
 /// One transport shared by target and drafter in alternation.
 struct SharedTransport(Rc<RefCell<Box<dyn Transport>>>);
@@ -228,11 +226,13 @@ impl DraftCore {
         })
     }
 
-    pub(crate) fn exec(
+    pub(crate) fn exec_tap(
         &mut self,
-        feeds: &[Tensor],
+        feeds: &[Option<Tensor>],
+        d2d: &[D2dCopy],
         sizes: &[(tessera_graph::DimName, u64)],
         wants: Wants,
+        wait: bool,
     ) -> Result<Vec<Slot>, Error> {
         let (plan, bound) = self.plans.wanting(
             &self.graph,
@@ -243,11 +243,41 @@ impl DraftCore {
             &self.device,
         )?;
         let outputs = plan.outputs.iter().map(|o| o.slot).collect();
+        let inputs = plan.inputs.clone();
         self.runner.replan(plan)?;
         self.runner.bind_all(&bound);
-        let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
-        self.runner.feed(&views)?;
-        self.runner.submit(0..self.runner.plan().steps.len())?;
+        if feeds.len() != inputs.len() {
+            return Err(RunError::InputCount.into());
+        }
+        // D2D copies run before host writes.
+        for &copy in d2d {
+            let slot = *inputs
+                .get(copy.input)
+                .ok_or(RunError::InputShape(copy.input))?;
+            let plain4 = slot.form.block() == 1 && slot.form.bytes(1) == 4;
+            if !plain4 || slot.len != copy.filled * copy.width {
+                return Err(RunError::InputShape(copy.input).into());
+            }
+            fill_d2d(&mut *self.runner, slot, copy)?;
+        }
+        for (at, (slot, feed)) in inputs.into_iter().zip(feeds).enumerate() {
+            match feed {
+                Some(tensor) => {
+                    if tensor.len() != slot.len || tensor.dtype() != slot.form.dtype() {
+                        return Err(RunError::InputShape(at).into());
+                    }
+                    self.runner.write(slot, tensor.view())?;
+                }
+                None if d2d.iter().any(|c| c.input == at) => {}
+                None => return Err(RunError::InputShape(at).into()),
+            }
+        }
+        let range = 0..self.runner.plan().steps.len();
+        if wait {
+            self.runner.submit(range)?;
+        } else {
+            self.runner.queue(range)?;
+        }
         if let Some(every) = self.profile {
             self.launches += 1;
             if every > 0
@@ -514,7 +544,7 @@ impl Drafter {
         taps: &[f32],
     ) -> Result<Vec<u32>, Error> {
         let wants = self.draft_wants();
-        let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
+        let outputs = self.run_taps(slot, anchor, start, ctx_pos, TapsIn::Host(taps), wants)?;
         self.read_draft(&outputs)
     }
 
@@ -528,23 +558,23 @@ impl Drafter {
         taps: &[f32],
     ) -> Result<Vec<f32>, Error> {
         let wants = Wants::role(&self.core.graph, 0, Role::Logits);
-        let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
+        let outputs = self.run_taps(slot, anchor, start, ctx_pos, TapsIn::Host(taps), wants)?;
         let raw = self.core.runner.read(outputs[0])?;
         let logits = raw.floats().map_err(tessera_run::Error::from)?;
         Ok(logits[..(self.block - 1) * self.vocab].to_vec())
     }
 
-    pub(crate) fn run(
+    pub(crate) fn run_taps(
         &mut self,
         slot: u32,
         anchor: u32,
         start: usize,
         ctx_pos: usize,
-        taps: &[f32],
+        taps: TapsIn<'_>,
         wants: Wants,
     ) -> Result<Vec<Slot>, Error> {
         let n_new = start.checked_sub(ctx_pos).ok_or(Error::RowPlace)?;
-        if n_new == 0 || taps.len() != n_new * self.tap_width {
+        if n_new == 0 {
             return Err(Error::Rows);
         }
         if slot as usize >= self.core.slots || start + self.block > self.core.context {
@@ -555,12 +585,38 @@ impl Drafter {
         } else {
             n_new.next_power_of_two().min(self.core.context)
         };
-        let mut ctx_taps = Vec::with_capacity(filled * self.tap_width);
-        ctx_taps.extend_from_slice(taps);
-        let last = &taps[(n_new - 1) * self.tap_width..];
-        for _ in n_new..filled {
-            ctx_taps.extend_from_slice(last);
-        }
+        let (tap_tensor, d2d) = match taps {
+            TapsIn::Host(h) => {
+                if h.len() != n_new * self.tap_width {
+                    return Err(Error::Rows);
+                }
+                let mut ctx_taps = Vec::with_capacity(filled * self.tap_width);
+                ctx_taps.extend_from_slice(h);
+                let last = &h[(n_new - 1) * self.tap_width..];
+                for _ in n_new..filled {
+                    ctx_taps.extend_from_slice(last);
+                }
+                (
+                    Some(Tensor::f32(vec![filled, self.tap_width], ctx_taps)),
+                    None,
+                )
+            }
+            TapsIn::Device { addr, rows } => {
+                if rows != n_new {
+                    return Err(Error::Rows);
+                }
+                (
+                    None,
+                    Some(D2dCopy {
+                        input: 4,
+                        src: addr,
+                        rows,
+                        filled,
+                        width: self.tap_width,
+                    }),
+                )
+            }
+        };
         let kv_len = filled + self.block;
         let mut kv_pos = Vec::with_capacity(kv_len);
         for p in ctx_pos..start {
@@ -583,13 +639,13 @@ impl Drafter {
         };
         let kv_slots = vec![slot; kv_len];
         let feeds = [
-            Tensor::u32(vec![self.block], block_tokens),
-            Tensor::u32(vec![self.block], block_pos),
-            Tensor::u32(vec![self.block], block_slots),
-            Tensor::u32(vec![self.block], attend_pos),
-            Tensor::f32(vec![filled, self.tap_width], ctx_taps),
-            Tensor::u32(vec![kv_len], kv_pos),
-            Tensor::u32(vec![kv_len], kv_slots),
+            Some(Tensor::u32(vec![self.block], block_tokens)),
+            Some(Tensor::u32(vec![self.block], block_pos)),
+            Some(Tensor::u32(vec![self.block], block_slots)),
+            Some(Tensor::u32(vec![self.block], attend_pos)),
+            tap_tensor,
+            Some(Tensor::u32(vec![kv_len], kv_pos)),
+            Some(Tensor::u32(vec![kv_len], kv_slots)),
         ];
         let sizes = [
             (Seqs, self.core.slots as u64),
@@ -600,155 +656,9 @@ impl Drafter {
             ),
             (Segments, 1),
         ];
-        self.core.exec(&feeds, &sizes, wants)
+        self.core
+            .exec_tap(&feeds, d2d.as_slice(), &sizes, wants, true)
     }
-}
-
-/// Target launch decoded from rank 0's control message.
-pub(crate) struct TargetCmd {
-    pub rows: Vec<Row>,
-    pub picks: Vec<u32>,
-    pub head: Head,
-    pub wants: Wants,
-    pub table: Vec<u32>,
-}
-
-/// DFlash drafter launch decoded from rank 0's control message.
-pub(crate) struct DraftCmd {
-    pub slot: u32,
-    pub anchor: u32,
-    pub start: usize,
-    pub ctx_pos: usize,
-    pub wants: Wants,
-}
-
-/// One control message received by a speculative follower rank.
-enum Cmd {
-    Target(TargetCmd),
-    Draft(DraftCmd),
-}
-
-pub(crate) fn encode_draft(
-    slot: u32,
-    anchor: u32,
-    start: usize,
-    ctx_pos: usize,
-    wants: Wants,
-) -> Vec<u8> {
-    let mut w = Writer(Vec::with_capacity(24));
-    w.u32(DRAFT_TAG)
-        .u32(slot)
-        .u32(anchor)
-        .u32(start as u32)
-        .u32(ctx_pos as u32)
-        .u32(wants.0);
-    w.0
-}
-
-pub(crate) fn decode_draft(r: &mut Reader) -> Option<DraftCmd> {
-    Some(DraftCmd {
-        slot: r.u32()?,
-        anchor: r.u32()?,
-        start: r.u32()? as usize,
-        ctx_pos: r.u32()? as usize,
-        wants: Wants(r.u32()?),
-    })
-}
-
-pub(crate) fn decode_target(tag: u32, r: &mut Reader) -> Option<TargetCmd> {
-    let k = r.u32()? as usize;
-    let wants = Wants(r.u32()?);
-    let table = r.u32s()?;
-    let n_words = r.u32()? as usize;
-    let raw_bytes = r.take(n_words.checked_mul(4)?)?;
-    let mut rr = Reader(raw_bytes);
-    let mut rows = Vec::with_capacity(n_words / 3);
-    for _ in 0..n_words / 3 {
-        let slot = rr.u32()?;
-        let token = rr.u32()?;
-        let position = rr.u32()?;
-        rows.push(Row {
-            slot,
-            token,
-            position,
-        });
-    }
-    let picks = r.u32s()?;
-    let list = r.u32s()?;
-    let head = match tag {
-        0 => Head::Full(None),
-        1 => Head::Full(Some(list)),
-        _ => Head::Sparse(list, k),
-    };
-    Some(TargetCmd {
-        rows,
-        picks,
-        head,
-        wants,
-        table,
-    })
-}
-
-fn decode_cmd(bytes: &[u8]) -> Option<Cmd> {
-    let mut r = Reader(bytes);
-    let tag = r.u32()?;
-    if tag == DRAFT_TAG {
-        return decode_draft(&mut r).map(Cmd::Draft);
-    }
-    decode_target(tag, &mut r).map(Cmd::Target)
-}
-
-/// Output index of `Role::Taps` inside a `wants` subset.
-pub(crate) fn taps_output(g: &Graph, entry: usize, wants: Wants) -> Option<usize> {
-    g.entries
-        .get(entry)?
-        .outputs
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| (wants.0 >> i) & 1 == 1)
-        .position(|(_, o)| o.role == Role::Taps)
-}
-
-/// Exchanges control bytes and gathers rank profiles on rank 0.
-pub(crate) fn tell_ranks(target: &mut Engine, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let Some(control) = &mut target.control else {
-        return Ok(None);
-    };
-    let lead = control.rank() == 0;
-    let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
-    if lead && let Some((launches, own)) = target.held.take() {
-        let mut profiles = vec![Some(own)];
-        profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
-        let ranks = Ranks { launches, profiles };
-        eprintln!("profile of {launches} launches:\n{ranks}");
-        target.ranks = Some(ranks);
-    }
-    Ok(Some(parts.swap_remove(0)))
-}
-
-/// Executes one decoded target launch on a follower rank.
-pub(crate) fn run_target(
-    target: &mut Engine,
-    cmd: TargetCmd,
-    tap_width: usize,
-    last_taps: &mut Vec<f32>,
-) -> Result<(), Error> {
-    if let Some(lanes) = &mut target.lanes
-        && !cmd.table.is_empty()
-    {
-        lanes.replace(cmd.table);
-    }
-    let entry = target.entry(&cmd.head)?;
-    let outputs = target.run(&cmd.rows, &cmd.picks, cmd.head, cmd.wants)?;
-    if let Some(at) = taps_output(&target.graph, entry, cmd.wants) {
-        let raw = target.runner.read(outputs[at])?;
-        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-        let keep = cmd.rows.len() * tap_width;
-        last_taps.clear();
-        last_taps.extend_from_slice(&floats[..keep]);
-    }
-    target.report();
-    Ok(())
 }
 
 /// DFlash speculative decoding over a target and drafter pair.
@@ -780,209 +690,64 @@ impl<'a> Speculate<'a> {
         self.spec_len = spec_len;
         self
     }
-
-    /// Follows rank 0's target and drafter launches until dismissed.
-    pub fn follow(&mut self) -> Result<(), Error> {
-        let mut last_taps: Vec<f32> = Vec::new();
-        let tap_width = self.drafter.tap_width();
-        loop {
-            let mine = self
-                .target
-                .held
-                .take()
-                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-            let Some(told) = tell_ranks(self.target, &mine)? else {
-                return Ok(());
-            };
-            match decode_cmd(&told) {
-                None => return Ok(()),
-                Some(Cmd::Target(cmd)) => run_target(self.target, cmd, tap_width, &mut last_taps)?,
-                Some(Cmd::Draft(cmd)) => {
-                    let n_new = cmd.start.checked_sub(cmd.ctx_pos).ok_or(Error::RowPlace)?;
-                    let need = n_new * tap_width;
-                    if last_taps.len() < need {
-                        return Err(Error::Rows);
-                    }
-                    self.drafter.run(
-                        cmd.slot,
-                        cmd.anchor,
-                        cmd.start,
-                        cmd.ctx_pos,
-                        &last_taps[..need],
-                        cmd.wants,
-                    )?;
-                }
-            }
-        }
-    }
-
-    /// Greedy speculative decoding matching target output token-for-token.
-    pub fn generate(
-        &mut self,
-        request: Request,
-        emit: &mut dyn FnMut(Event) -> bool,
-    ) -> Result<SpecStats, Error> {
-        let block = self.drafter.block();
-        let tap_width = self.drafter.tap_width();
-        let max_ctx = self.target.context().min(self.drafter.context());
-        let drafter = &mut *self.drafter;
-        let spec = self.spec_len.fresh();
-        run_speculate(
-            self.target,
-            request,
-            emit,
-            |_, _, taps| (0usize, taps, spec, 1.0f64),
-            |target, (ctx_pos, pending, spec, last_pred), start, anchor, remaining| {
-                if remaining == 1 || start + block > max_ctx {
-                    return Ok(None);
-                }
-                let wants = drafter.draft_wants();
-                if target.control.is_some() {
-                    tell_ranks(target, &encode_draft(0, anchor, start, *ctx_pos, wants))?;
-                }
-                let outputs = drafter.run(0, anchor, start, *ctx_pos, pending, wants)?;
-                let mut drafts = drafter.read_draft(&outputs)?;
-                let avail = drafts
-                    .len()
-                    .min(remaining.saturating_sub(1))
-                    .min(max_ctx.saturating_sub(start + 1));
-                if avail == 0 {
-                    return Ok(None);
-                }
-                let (k, pred) = spec.choose(None, avail, drafts.len());
-                *last_pred = pred;
-                drafts.truncate(k);
-                Ok(Some(drafts))
-            },
-            |(ctx_pos, pending, spec, last_pred),
-             start,
-             drafted,
-             accepted,
-             _,
-             mut block_taps,
-             stats| {
-                spec.observe(drafted, accepted, None, *last_pred);
-                stats.dflash_steps += 1;
-                let commit = 1 + accepted;
-                *ctx_pos = start;
-                block_taps.truncate(commit * tap_width);
-                *pending = block_taps;
-            },
-        )
-    }
 }
 
-/// Shared greedy speculative decode loop for DFlash and MTP.
-pub(crate) fn run_speculate<S>(
+spec_entry!(
+    Speculate<'a>,
+    SpecLen,
+    spec_len,
+    |s, target, req, spec, emit| run_dflash_req(target, s.drafter, req, spec, emit)
+);
+
+fn run_dflash_req(
     target: &mut Engine,
+    drafter: &mut Drafter,
     request: Request,
+    spec: SpecLen,
     emit: &mut dyn FnMut(Event) -> bool,
-    init: impl FnOnce(&[u32], u32, Vec<f32>) -> S,
-    mut draft: impl FnMut(&mut Engine, &mut S, usize, u32, usize) -> Result<Option<Vec<u32>>, Error>,
-    mut advance: impl FnMut(&mut S, usize, usize, usize, &[u32], Vec<f32>, &mut SpecStats),
 ) -> Result<SpecStats, Error> {
-    let mut stats = SpecStats::default();
-    let prompt = &request.tokens;
-    if prompt.is_empty() || prompt.len() > target.context() {
-        let _ = emit(Event::Done(Reason::Context));
-        return Ok(stats);
-    }
-    if request.max_tokens == 0 {
-        let _ = emit(Event::Done(Reason::Length));
-        return Ok(stats);
-    }
-    let prefill: Vec<Row> = prompt
-        .iter()
-        .enumerate()
-        .map(|(i, &token)| Row {
-            slot: 0,
-            token,
-            position: i as u32,
-        })
-        .collect();
-    let (ids, taps) = target.step_taps(&prefill)?;
-    let mut anchor = *ids.last().expect("non-empty prompt");
-    if let Some(reason) = emit_one(&request, &mut stats, anchor, emit) {
-        let _ = emit(Event::Done(reason));
-        return Ok(stats);
-    }
-    let mut state = init(prompt, anchor, taps);
-    let mut start = prompt.len();
-    while stats.emitted < request.max_tokens {
-        if start >= target.context() {
-            let _ = emit(Event::Done(Reason::Context));
-            return Ok(stats);
-        }
-        let remaining = request.max_tokens - stats.emitted;
-        let Some(drafts) = draft(target, &mut state, start, anchor, remaining)? else {
-            let row = [Row {
-                slot: 0,
-                token: anchor,
-                position: start as u32,
-            }];
-            let next = target.step(&row)?[0];
-            start += 1;
-            if let Some(reason) = emit_one(&request, &mut stats, next, emit) {
-                let _ = emit(Event::Done(reason));
-                return Ok(stats);
+    let block = drafter.block();
+    let tap_width = drafter.tap_width();
+    let max_ctx = target.context().min(drafter.context());
+    run_speculate(
+        target,
+        request,
+        emit,
+        |_, _, _, taps| Ok((0usize, taps, spec, 1.0f64)),
+        |_, (ctx_pos, pending, spec, last_pred), start, anchor, remaining| {
+            if remaining == 1 || start + block > max_ctx {
+                return Ok(None);
             }
-            anchor = next;
-            continue;
-        };
-        let mut verify = Vec::with_capacity(drafts.len() + 1);
-        verify.push(Row {
-            slot: 0,
-            token: anchor,
-            position: start as u32,
-        });
-        for (i, &token) in drafts.iter().enumerate() {
-            verify.push(Row {
-                slot: 0,
-                token,
-                position: (start + 1 + i) as u32,
-            });
-        }
-        let (posterior, block_taps) = target.step_taps(&verify)?;
-        let (accepted, bonus) = accept_greedy(&drafts, &posterior);
-        stats.steps += 1;
-        stats.drafted += drafts.len();
-        stats.accepted += accepted;
-        for id in drafts[..accepted].iter().copied().chain([bonus]) {
-            if let Some(reason) = emit_one(&request, &mut stats, id, emit) {
-                let _ = emit(Event::Done(reason));
-                return Ok(stats);
+            let wants = drafter.draft_wants();
+            let outputs = drafter.run_taps(0, anchor, start, *ctx_pos, pending.as_in(), wants)?;
+            let mut drafts = drafter.read_draft(&outputs)?;
+            let avail = drafts
+                .len()
+                .min(remaining.saturating_sub(1))
+                .min(max_ctx.saturating_sub(start + 1));
+            if avail == 0 {
+                return Ok(None);
             }
-        }
-        let commit = 1 + accepted;
-        advance(
-            &mut state,
-            start,
-            drafts.len(),
-            accepted,
-            &posterior,
-            block_taps,
-            &mut stats,
-        );
-        start += commit;
-        anchor = bonus;
-    }
-    let _ = emit(Event::Done(Reason::Length));
-    Ok(stats)
-}
-
-/// Emits one token, returning the stop reason if finished.
-pub(crate) fn emit_one(
-    request: &Request,
-    stats: &mut SpecStats,
-    id: u32,
-    emit: &mut dyn FnMut(Event) -> bool,
-) -> Option<Reason> {
-    if request.stop.contains(&id) {
-        return Some(Reason::Stop);
-    }
-    stats.emitted += 1;
-    if !emit(Event::Token(id)) {
-        return Some(Reason::Stop);
-    }
-    (stats.emitted >= request.max_tokens).then_some(Reason::Length)
+            let (k, pred) = spec.choose(None, avail, drafts.len());
+            *last_pred = pred;
+            drafts.truncate(k);
+            Ok(Some(drafts))
+        },
+        |_,
+         (ctx_pos, pending, spec, last_pred),
+         start,
+         drafted,
+         accepted,
+         _,
+         mut block_taps,
+         stats| {
+            spec.observe(drafted, accepted, None, *last_pred);
+            stats.dflash_steps += 1;
+            let commit = 1 + accepted;
+            *ctx_pos = start;
+            block_taps.keep_rows(commit, tap_width);
+            *pending = block_taps;
+            Ok(())
+        },
+    )
 }
