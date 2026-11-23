@@ -1,6 +1,6 @@
 //! Online dual-drafter selection combining DFlash and native MTP.
 
-use crate::mtp::{MtpDrafter, MtpStep, decode_step, draft_mtp, follow_mtp, run_mtp};
+use crate::mtp_draft::{MtpDrafter, MtpStep, decode_step, draft_mtp, follow_mtp, run_mtp};
 use crate::spec_len::{CostModel, SpecLen};
 use crate::speculate::{
     DRAFT_TAG, DraftCmd, Drafter, SpecStats, TargetCmd, decode_draft, decode_target, encode_draft,
