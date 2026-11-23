@@ -9,22 +9,34 @@ use tessera_bundle::encoder::encoder;
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_engine::{Model, Recipe, Settings, Tensor};
 
-/// Tokens per text, `<bos>` and `<eos>` included.
-const MAX_TOKENS: usize = 1024;
-/// The most texts in one launch.
-const SEQS: usize = 16;
-/// The most padded rows in one launch.
-const ROWS: usize = 4096;
+/// The launch sizes an embedder plans for.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    /// Tokens per text, `<bos>` and `<eos>` included.
+    pub max_tokens: usize,
+    /// The most texts in one launch.
+    pub seqs: usize,
+    /// The most padded rows in one launch.
+    pub rows: usize,
+}
+
+/// EmbeddingGemma 2's sizes.
+pub const EG2: Shape = Shape {
+    max_tokens: 1024,
+    seqs: 16,
+    rows: 4096,
+};
 
 pub struct Embedder {
     model: Model,
     tokenizer: Hf,
     /// Texts of unlike length share launches, padded.
     padded: bool,
+    shape: Shape,
 }
 
 /// Texts that share a launch: shortest first, or equal unpadded.
-fn groups(ids: &[Vec<u32>], padded: bool) -> Vec<Vec<usize>> {
+fn groups(ids: &[Vec<u32>], padded: bool, shape: Shape) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..ids.len()).collect();
     order.sort_by_key(|&i| ids[i].len());
     let mut out: Vec<Vec<usize>> = Vec::new();
@@ -32,10 +44,10 @@ fn groups(ids: &[Vec<u32>], padded: bool) -> Vec<Vec<usize>> {
         let len = ids[i].len();
         let joins = out.last().is_some_and(|g| {
             let fits = match padded {
-                true => (g.len() + 1) * len <= ROWS,
+                true => (g.len() + 1) * len <= shape.rows,
                 false => ids[g[0]].len() == len,
             };
-            g.len() < SEQS && fits
+            g.len() < shape.seqs && fits
         });
         match out.last_mut() {
             Some(g) if joins => g.push(i),
@@ -55,15 +67,27 @@ fn unit(mut v: Vec<f32>) -> Vec<f32> {
 impl Embedder {
     /// Loads the exlr8 release in `dir` where `settings` say.
     pub fn open(dir: &Path, settings: &Settings, config: &Overrides) -> Result<Self, Error> {
+        Self::shaped(EG2, dir, settings, config)
+    }
+
+    /// The same, planned for `shape`.
+    pub fn shaped(
+        shape: Shape,
+        dir: &Path,
+        settings: &Settings,
+        config: &Overrides,
+    ) -> Result<Self, Error> {
         // GPUs lack a fast kernel for listed keys.
         let padded = settings.gpu().is_none();
-        let e = encoder(dir, [SEQS as u64, MAX_TOKENS as u64], padded, config)?;
+        let at = [shape.seqs as u64, shape.max_tokens as u64];
+        let e = encoder(dir, at, padded, config)?;
         let mut model = Model::open(e.graph, &Recipe::default(), settings)?;
         model.load(&e.weights)?;
         Ok(Self {
             model,
             tokenizer: e.tokenizer,
             padded,
+            shape,
         })
     }
 
@@ -75,9 +99,10 @@ impl Embedder {
     /// Ids of `text` between `<bos>` and `<eos>`, cut to fit.
     pub fn tokens(&self, text: &str) -> Result<Vec<u32>, Error> {
         let mut ids = self.tokenizer.encode_special(text)?;
-        if ids.len() > MAX_TOKENS {
+        let most = self.shape.max_tokens;
+        if ids.len() > most {
             let eos = ids[ids.len() - 1];
-            ids.truncate(MAX_TOKENS - 1);
+            ids.truncate(most - 1);
             ids.push(eos);
         }
         Ok(ids)
@@ -95,12 +120,12 @@ impl Embedder {
     /// The same for ids, a few texts per launch.
     pub fn embed_ids(&mut self, ids: &[Vec<u32>]) -> Result<Vec<Vec<f32>>, Error> {
         for (at, t) in ids.iter().enumerate() {
-            if t.is_empty() || t.len() > MAX_TOKENS {
+            if t.is_empty() || t.len() > self.shape.max_tokens {
                 return Err(format!("text {at} has {} tokens", t.len()).into());
             }
         }
         let mut out = vec![Vec::new(); ids.len()];
-        for group in groups(ids, self.padded) {
+        for group in groups(ids, self.padded, self.shape) {
             let got = self.launch(ids, &group)?;
             for (i, v) in group.into_iter().zip(got) {
                 out[i] = v;
@@ -162,9 +187,14 @@ pub type Threaded = Worker<Embedder>;
 
 impl Worker<Embedder> {
     /// Opens the release in `dir` on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings, config: Overrides) -> Result<Self, Error> {
+    pub fn open(
+        shape: Shape,
+        dir: PathBuf,
+        settings: Settings,
+        config: Overrides,
+    ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let embedder = Embedder::open(&dir, &settings, &config)?;
+            let embedder = Embedder::shaped(shape, &dir, &settings, &config)?;
             eprintln!("{}: embedder loaded", embedder.device());
             Ok(embedder)
         })
