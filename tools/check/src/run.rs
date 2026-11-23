@@ -69,15 +69,14 @@ fn skipped(tool: &str, title: &str, why: String) -> Report {
     }
 }
 
+/// A release build runs the whole-repository rules several times faster.
+const LINT: [&str; 5] = ["run", "-q", "--release", "-p", "tessera-lint"];
+
 pub fn lint(dirs: &Dirs, _: &Changes) -> Result<Report, String> {
     let json = dirs.out.join("lint.json");
     let path = json.to_string_lossy();
-    cargo(
-        dirs,
-        "lint",
-        &["run", "-q", "-p", "tessera-lint", "--", "--json", &path],
-        &json,
-    )
+    let args = [&LINT[..], &["--", "--json", &path]].concat();
+    cargo(dirs, "lint", &args, &json)
 }
 
 /// Paths the changes add or modify.
@@ -109,16 +108,7 @@ pub fn comments(dirs: &Dirs, changes: &Changes) -> Result<Report, String> {
     let json = dirs.out.join("comments.json");
     let path = json.to_string_lossy();
     let files = changed(dirs, changes)?;
-    let mut args = vec![
-        "run",
-        "-q",
-        "-p",
-        "tessera-lint",
-        "--",
-        "comments",
-        "--json",
-        &path,
-    ];
+    let mut args = [&LINT[..], &["--", "comments", "--json", &path]].concat();
     args.extend(files.iter().map(String::as_str));
     let mut report = cargo(dirs, "comments", &args, &json)?;
     report.tool = "comments".into();
