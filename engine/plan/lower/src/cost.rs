@@ -17,7 +17,7 @@ use tessera_codegen::kept::Layout;
 use tessera_engine_settings::{Pick, Settings};
 use tessera_graph::Parts;
 use tessera_platform::{Limits, Platform};
-use tessera_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, known};
+use tessera_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, generic, known};
 
 /// Bumped whenever a stored device changes meaning.
 const VERSION: u32 = 1;
@@ -103,12 +103,23 @@ fn fresh() -> u64 {
     GENERATIONS.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The table for `name`, else the model `fit` makes.
-fn model(name: &str, fit: Option<Fit>) -> Option<Arc<dyn Chip>> {
-    match known(name) {
-        Some(table) => Some(Arc::from(table)),
-        None => fit.map(|fit| Arc::new(fit.pool("fitted")) as Arc<dyn Chip>),
+/// The table for `name`, `fit`, or a scaled model.
+fn model(name: &str, fit: Option<Fit>, platform: &Platform) -> Option<Arc<dyn Chip>> {
+    if let Some(table) = known(name) {
+        return Some(Arc::from(table));
     }
+    if let Some(fit) = fit {
+        return Some(Arc::new(fit.pool("fitted")) as Arc<dyn Chip>);
+    }
+    let gb = platform.limits.group_bytes;
+    generic(
+        &platform.backend,
+        name,
+        platform.units,
+        platform.bandwidth,
+        gb,
+    )
+    .map(Arc::from)
 }
 
 fn dense() -> &'static dyn Layout {
@@ -212,14 +223,14 @@ impl Device {
             self.name = format!("{} {}", platform.backend, platform.name);
         }
         self.platform = platform;
-        self.model = model(&self.name, self.fit);
+        self.model = model(&self.name, self.fit, &self.platform);
         self.changed()
     }
 
     /// The same device, with a chip model for unmeasured kernels.
     pub fn fitted(mut self, fit: Fit) -> Self {
         self.fit = Some(fit);
-        self.model = model(&self.name, self.fit);
+        self.model = model(&self.name, self.fit, &self.platform);
         self.changed()
     }
 
@@ -490,7 +501,7 @@ impl Device {
         device.host.restore();
         // Files from before residency take the table's constants.
         device.fit = device.fit.map(|fit| fit.filled(&device.name));
-        device.model = model(&device.name, device.fit);
+        device.model = model(&device.name, device.fit, &device.platform);
         device.generation = fresh();
         Ok(device)
     }

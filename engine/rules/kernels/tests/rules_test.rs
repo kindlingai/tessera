@@ -170,8 +170,19 @@ fn limits_bar_kernels() {
         ..Limits::assumed()
     };
     let narrow = guess.on(Platform::assumed(wide));
-    let names = names(&lower(&g, 0, &SIZES, &narrow).unwrap());
-    assert!(names.contains(&"rms_norm") && !names.contains(&"lane_norm"));
+    let picked = names(&lower(&g, 0, &SIZES, &narrow).unwrap());
+    assert!(picked.contains(&"rms_norm") && !picked.contains(&"lane_norm"));
+    // An uncalibrated GPU picks lane_norm on wide rows.
+    let gpu = Platform {
+        backend: "cuda".into(),
+        name: "Test GPU".into(),
+        units: 128,
+        bandwidth: 1e12,
+        ..Platform::assumed(Limits::assumed())
+    };
+    let wide_rows = graphs::rows(&dims(), 600);
+    let plan = lower(&wide_rows, 0, &SIZES, &Device::default().on(gpu)).unwrap();
+    assert!(names(&plan).contains(&"lane_norm"));
 }
 
 #[test]
