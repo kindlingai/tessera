@@ -81,6 +81,8 @@ pub fn declare(manifest: &site::Manifest) -> i64 {
 pub struct Build {
     pub config: serde_json::Value,
     pub seqs: u64,
+    /// The most rows per sequence, when the host knows it.
+    pub context: Option<u64>,
 }
 
 /// One table: its dotted path and values.

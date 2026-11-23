@@ -1,20 +1,11 @@
 //! A Qwen3 step graph, built inside the recipe's sandbox.
 
-use serde::Deserialize;
-use tessera_guest::{input, output};
+use tessera_guest::{Build, Table};
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, Tensor,
     TensorType, Weights, pick, step_ports,
 };
-
-/// Inputs the host passes to `graph`.
-#[derive(Deserialize)]
-struct Build {
-    config: serde_json::Value,
-    seqs: u64,
-    context: Option<u64>,
-}
 
 /// The SwiGLU block after each attention block.
 #[derive(Weights)]
@@ -137,27 +128,17 @@ fn program(config: &serde_json::Value, seqs: u64, context: u64) -> Result<Graph,
 }
 
 /// The graph as JSON, or why the input is refused.
-fn built(at: i32, len: i32) -> Result<String, String> {
-    // SAFETY: the host passes back what `alloc` returned.
-    let bytes = unsafe { input(at, len) };
-    let b: Build = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+fn built(b: &Build) -> Result<String, String> {
     let context = b.context.ok_or("the build input needs a context size")?;
     Ok(program(&b.config, b.seqs, context)?.to_json())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: i32) -> i32 {
-    tessera_guest::alloc(len)
+/// The `tables` export: an empty list.
+fn none(_: &Build) -> Result<Vec<Table>, String> {
+    Ok(Vec::new())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn manifest() -> i64 {
-    let manifest = serde_json::json!({"abi": tessera_guest::ABI, "graph": true});
-    output(manifest.to_string().into_bytes())
-}
-
-/// The graph as JSON, else why the config is refused.
-#[unsafe(no_mangle)]
-pub extern "C" fn graph(at: i32, len: i32) -> i64 {
-    output(built(at, len).unwrap_or_else(|e| e).into_bytes())
+tessera_guest::exports! {
+    graph: built,
+    tables: none,
 }
