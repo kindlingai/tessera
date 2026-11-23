@@ -187,11 +187,17 @@ impl Plan {
         IDS.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// This rank's `(axis, first, count)` slice of `weight`, if split.
+    pub fn share(&self, weight: u32) -> Option<(u32, usize, usize)> {
+        let l = self.weights.iter().find(|l| l.weight == weight)?;
+        let s = l.share.filter(|_| l.part.is_none())?;
+        Some((s.axis, s.first, s.count))
+    }
+
     /// This rank's first-axis rows of `weight`, if split there.
     pub fn rows(&self, weight: u32) -> Option<(usize, usize)> {
-        let l = self.weights.iter().find(|l| l.weight == weight)?;
-        let share = l.share.filter(|s| s.axis == 0 && l.part.is_none())?;
-        Some((share.first, share.count))
+        let (axis, first, count) = self.share(weight)?;
+        (axis == 0).then_some((first, count))
     }
 
     /// The weakest order any of its kernels sums in.

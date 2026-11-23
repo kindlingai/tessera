@@ -437,12 +437,12 @@ impl Release {
         self
     }
 
-    /// Packed expert codes. `set` keeps a range of routed experts.
+    /// Packed expert codes, optionally sliced along an axis.
     fn expert_codes(
         &self,
         layer: usize,
         local: &str,
-        set: Option<(usize, usize)>,
+        slice: Option<(u32, usize, usize)>,
     ) -> Result<Vec<u8>, Error> {
         let k = self.width;
         let sizes = self.with(&experts::index_file(layer), |f| {
@@ -450,10 +450,9 @@ impl Release {
         })?;
         let shared = local.starts_with("shared_experts.");
         let width = if shared { experts::shared_width(k) } else { k };
-        let [hidden, _, ffn] = sizes;
         let file = experts::codes_file(layer, width);
-        let set = set.filter(|_| !shared);
-        let read = |f: &File| experts::packed(f, local, [hidden, ffn], width, set);
+        let slice = slice.filter(|_| !shared);
+        let read = |f: &File| experts::packed(f, local, sizes, width, slice);
         let mut bytes = self.with(&file, read)?;
         // The shared expert is a rotated file: its rotations follow.
         if let Some(stem) = local.strip_suffix(".weight").filter(|_| shared) {
@@ -505,7 +504,7 @@ impl Release {
     /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
     pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
         if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
-            return self.expert_codes(layer, local, rows);
+            return self.expert_codes(layer, local, rows.map(|(f, c)| (0, f, c)));
         }
         let (file, local) = self.place(name);
         let matrix = local
@@ -784,6 +783,17 @@ impl Offer for Release {
         let routed = experts::split(name).is_some_and(|(_, l)| l.starts_with("experts."));
         Release::packed(self, name, (routed && self.dense.is_some()).then_some(rows))
     }
+
+    /// Routed experts cut along expert or inner axis.
+    fn packed_axis(&self, name: &str, axis: u32, range: (usize, usize)) -> Result<Vec<u8>, Error> {
+        let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) else {
+            return Release::packed(self, name, None);
+        };
+        let slice = local
+            .starts_with("experts.")
+            .then_some((axis, range.0, range.1));
+        self.expert_codes(layer, local, slice)
+    }
 }
 
 /// GLM's routed and shared experts at one trellis width.
@@ -942,9 +952,9 @@ mod experts {
     pub(crate) fn packed(
         codes: &File,
         local: &str,
-        [hidden, ffn]: [usize; 2],
+        [hidden, experts, ffn]: [usize; 3],
         k: u32,
-        set: Option<(usize, usize)>,
+        slice: Option<(u32, usize, usize)>,
     ) -> Result<Vec<u8>, Error> {
         let missing = || Error::Missing(local.into());
         let (tensor, p) = match local.strip_prefix("shared_experts.") {
@@ -955,20 +965,32 @@ mod experts {
             }
         };
         let suffix = codebook(codes)?.suffix();
-        let name = match tensor {
-            true => format!("shared.trellis.{p}{suffix}"),
-            false => format!("trellis.{p}{suffix}"),
-        };
-        let entries = match set {
-            None => codes.bytes(&name)?,
-            Some((first, count)) => {
-                let matrix = (hidden * ffn * k as usize / 8) as u64;
-                codes.bytes_at(&name, first as u64 * matrix, Some(count as u64 * matrix))?
+        let head = if tensor { "shared." } else { "" };
+        let name = format!("{head}trellis.{p}{suffix}");
+        let matrix = (hidden * ffn * k as usize / 8) as u64;
+        let inner = if p == "down" { 2 } else { 1 };
+        let (entries, ffn_out) = match slice {
+            Some((0, f, c)) => {
+                let (at, n) = (f as u64 * matrix, c as u64 * matrix);
+                (codes.bytes_at(&name, at, Some(n))?, ffn)
             }
+            Some((ax, f, c))
+                if ax == inner && f.is_multiple_of(BLOCK) && c.is_multiple_of(BLOCK) =>
+            {
+                let entry = (hidden * BLOCK * k as usize / 8) as u64;
+                let (off, take) = ((f / BLOCK) as u64 * entry, (c / BLOCK) as u64 * entry);
+                let mut buf = Vec::with_capacity(experts * take as usize);
+                for m in 0..experts {
+                    let at = m as u64 * matrix + off;
+                    buf.extend_from_slice(&codes.bytes_at(&name, at, Some(take))?);
+                }
+                (buf, c)
+            }
+            _ => (codes.bytes(&name)?, ffn),
         };
         Ok(match p {
-            "down" => trellis::packed(ffn, hidden, trellis::INPUT_SIDE, &entries),
-            _ => trellis::packed(hidden, ffn, 1, &entries),
+            "down" => trellis::packed(ffn_out, hidden, trellis::INPUT_SIDE, &entries),
+            _ => trellis::packed(hidden, ffn_out, 1, &entries),
         })
     }
 }

@@ -79,4 +79,11 @@ pub trait Offer {
         let _ = rows;
         self.packed(name)
     }
+    /// One rank's slice of a packed tensor.
+    fn packed_axis(&self, name: &str, axis: u32, range: (usize, usize)) -> Result<Vec<u8>, Error> {
+        if axis == 0 {
+            return self.packed_share(name, range);
+        }
+        self.packed(name)
+    }
 }

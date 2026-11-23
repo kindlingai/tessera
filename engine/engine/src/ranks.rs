@@ -2,7 +2,7 @@
 
 use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::{Graph, Parts, shard_aligned};
+use tessera_graph::{Graph, Parts, shard_mode};
 use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 
@@ -13,6 +13,8 @@ pub struct Place {
     rank: u32,
     /// A persistent grid for the sums, if any.
     grid: Option<Box<dyn Sum>>,
+    /// Split routed experts along inner width, not experts.
+    moe_tp: bool,
 }
 
 impl Place {
@@ -24,12 +26,19 @@ impl Place {
             parts,
             rank,
             grid: None,
+            moe_tp: false,
         }
     }
 
     /// Runs the sums through `grid`.
     pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
         self.grid = grid;
+        self
+    }
+
+    /// Splits wide routed experts along inner width when `on`.
+    pub fn with_moe_tp(mut self, on: bool) -> Self {
+        self.moe_tp = on;
         self
     }
 
@@ -47,7 +56,7 @@ impl Place {
     }
 
     pub(crate) fn split(&self, g: &Graph, pins: &Pins) -> Result<Graph, Error> {
-        let sharded = shard_aligned(g, &self.parts, &pins.shares(g))?;
+        let sharded = shard_mode(g, &self.parts, &pins.shares(g), self.moe_tp)?;
         for w in sharded.whole.iter().filter(|_| self.rank == 0) {
             let path = &g.weights[w.weight as usize].path;
             eprintln!("tessera: {path:?} stays whole: {}", w.why);

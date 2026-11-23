@@ -6,8 +6,8 @@ use tessera_engine::Engine;
 use tessera_engine::wasm::Module;
 use tessera_engine_settings::{Backend, Pick, Settings};
 use tessera_graph::DimName::{Context, Hidden, Picks, Rows, Segments, Seqs};
+use tessera_graph::Parts;
 use tessera_graph::{Composite, F16};
-use tessera_graph::{Parts, shard};
 use tessera_interp::{Tensor, run};
 use tessera_lower::form::{Load, named};
 use tessera_lower::{Cluster, Device, Limits, Pins, Platform, Rule, Weight, lower};
@@ -84,6 +84,10 @@ fn block_of(c: &Config) -> Graph {
 
 /// Random codes for `[.., out, inp]`, with scales if rotated.
 pub(super) fn codes(shape: &[usize], form: &dyn Load, draws: &mut Noise) -> Vec<u8> {
+    codes_side(shape, form, draws, 1)
+}
+
+fn codes_side(shape: &[usize], form: &dyn Load, draws: &mut Noise, side: u32) -> Vec<u8> {
     let [.., out, inp] = *shape else {
         panic!("a matrix, or a set of matrices");
     };
@@ -91,7 +95,7 @@ pub(super) fn codes(shape: &[usize], form: &dyn Load, draws: &mut Noise) -> Vec<
     let entries: Vec<u8> = (0..count)
         .map(|_| ((draws.draw() + 1.0) * 128.0) as u8)
         .collect();
-    let mut bytes = packed(inp, out, 1, &entries);
+    let mut bytes = packed(inp, out, side, &entries);
     if form.name().ends_with("_rot") {
         let scale = |i: usize| F16::from(1.0 + (i % 7) as f32 / 8.0).0.to_le_bytes();
         bytes.extend((0..inp + out).flat_map(scale));
@@ -110,7 +114,14 @@ fn stored(g: &Graph, draws: &mut Noise, book: &str) -> Vec<(Tensor, Option<Weigh
             out.push((t, None));
             continue;
         }
-        let bytes = codes(&t.shape, form, draws);
+        let side = if matches!(w.path.last(), Some(tessera_graph::PathSeg::Field(f)) if f == "down")
+            && t.shape.len() == 3
+        {
+            tessera_codegen::trellis::INPUT_SIDE
+        } else {
+            1
+        };
+        let bytes = codes_side(&t.shape, form, draws, side);
         let decoded = Tensor::f32(t.shape, form.unpack_all(&bytes));
         out.push((decoded, Some(Weight::Packed(form, bytes))));
     }
@@ -163,37 +174,44 @@ fn takes_routed(book: &str, id: u32) {
 /// Each rank's plan takes its share of every routed block.
 #[test]
 fn module_takes_shards() {
-    let mut c = small();
-    // Half the shared expert still holds whole rotations.
-    c.stack.ffn = 256;
-    let step = stepper::<RotatedMoe>(&c);
-    let sharded = shard(&step, &Parts::even(2)).unwrap().graph;
-    let mut device = Device::default()
-        .adding(rule())
-        .pinned(pins("_mul1"))
-        .favoring(NAME)
-        .zoned(Cluster::two("a", "b"))
-        .ranked(vec![0, 1]);
-    device.platform = Platform::assumed(Limits::assumed());
-    let routed = (c.stack.layers - c.dense_layers) as usize;
-    let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
-    for rank in 0..2u32 {
-        let plan = lower(&sharded, 0, &sizes, &device.clone().as_rank(rank)).unwrap();
-        let experts = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
-        let mut taken = 0;
-        for step in experts {
-            let launches = step.launches();
-            let counts: Vec<u32> = launches[0].args.iter().filter_map(|a| a.u32()).collect();
-            // This rank's experts, and its half of the shared one.
-            assert_eq!(counts[9..], [16 * rank, 16, 128]);
-            taken += 1;
+    for (ffn, tp) in [(256, false), (512, true)] {
+        let mut c = small();
+        c.stack.ffn = ffn;
+        let step = stepper::<RotatedMoe>(&c);
+        let sharded = tessera_graph::shard_mode(&step, &Parts::even(2), &|_, _, _, _| true, tp)
+            .unwrap()
+            .graph;
+        let mut device = Device::default()
+            .adding(rule())
+            .pinned(pins("_mul1"))
+            .favoring(NAME)
+            .zoned(Cluster::two("a", "b"))
+            .ranked(vec![0, 1]);
+        device.platform = Platform::assumed(Limits::assumed());
+        let routed = (c.stack.layers - c.dense_layers) as usize;
+        let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
+        for rank in 0..2u32 {
+            let plan = lower(&sharded, 0, &sizes, &device.clone().as_rank(rank)).unwrap();
+            let experts = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
+            let mut taken = 0;
+            for step in experts {
+                let launches = step.launches();
+                let counts: Vec<u32> = launches[0].args.iter().filter_map(|a| a.u32()).collect();
+                let want = if tp {
+                    [0, 32, (ffn / 2) as u32]
+                } else {
+                    [16 * rank, 16, (ffn / 2) as u32]
+                };
+                assert_eq!(counts[9..], want);
+                taken += 1;
+            }
+            assert_eq!(taken, routed);
+            let sums = plan
+                .steps
+                .iter()
+                .filter(|s| s.kernel.name() == "all_reduce");
+            assert!(sums.count() >= routed);
         }
-        assert_eq!(taken, routed);
-        let sums = plan
-            .steps
-            .iter()
-            .filter(|s| s.kernel.name() == "all_reduce");
-        assert!(sums.count() >= routed);
     }
 }
 

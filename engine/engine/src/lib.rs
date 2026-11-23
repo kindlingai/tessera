@@ -301,6 +301,11 @@ impl Engine {
         Ok(())
     }
 
+    /// This rank's `(axis, first, count)` slice of `at`, if split.
+    pub fn share(&self, at: u32) -> Option<(u32, usize, usize)> {
+        self.runner.plan().share(at)
+    }
+
     /// This rank's first-axis rows of weight `at`, if split.
     pub fn rows(&self, at: u32) -> Option<(usize, usize)> {
         self.runner.plan().rows(at)

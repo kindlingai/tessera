@@ -268,6 +268,38 @@ fn glm_experts() {
     let second = release.packed_share(&name, (1, 1)).unwrap();
     let k3 = trellis::form_for(3, trellis::Codebook::Mcg).unwrap();
     assert_eq!(Some(second), k3.share(&down, [1, 2, 128 * 128], [1, 1]));
+    // FFN slices match Trellis::share on axes 1, 2.
+    let big = dir.join("ffn");
+    std::fs::create_dir_all(big.join("dense")).unwrap();
+    std::fs::create_dir_all(big.join("experts")).unwrap();
+    write(&big.join("dense/exlr8-vocab.safetensors"), &[]);
+    let idx = vec![
+        ("signs.in", "I8", vec![128], vec![1u8; 128]),
+        ("k3.gate.svh", "F16", vec![2, 256], halves(&vec![1.0; 512])),
+    ];
+    write(&big.join("experts/exlr8-layer-001.index.safetensors"), &idx);
+    let big_set = ramp(2 * 128 * 256 * 3 / 8, 13);
+    write(
+        &big.join("experts/exlr8-layer-001.k3.safetensors"),
+        &[
+            ("trellis.gate", "U8", vec![big_set.len()], big_set.clone()),
+            ("trellis.down", "U8", vec![big_set.len()], big_set.clone()),
+        ],
+    );
+    let brel = Release::open(&big).width(3);
+    let bg = format!("{at}experts.gate.weight");
+    let bd = format!("{at}experts.down.weight");
+    let gw = brel.packed(&bg, None).unwrap();
+    let dw = brel.packed(&bd, None).unwrap();
+    assert_eq!(
+        Some(brel.packed_axis(&bg, 1, (128, 128)).unwrap()),
+        k3.share(&gw, [2, 256, 128], [128, 128])
+    );
+    assert_eq!(
+        Some(brel.packed_axis(&bd, 2, (128, 128)).unwrap()),
+        k3.share(&dw, [2 * 128, 256, 1], [128, 128])
+    );
+    std::fs::remove_dir_all(big).unwrap();
     // The shared expert is not a set: it reads whole.
     assert_eq!(release.packed_share(&gate, (0, 64)).unwrap(), file);
     // A `.mul1` suffix selects mul1 forms for the same bytes.

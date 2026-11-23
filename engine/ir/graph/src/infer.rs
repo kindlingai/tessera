@@ -483,10 +483,6 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 need(fits, ErrorKind::Shape, || {
                     format!("rows of {width} do not hold whole blocks of {block}")
                 })?;
-                // Within a row, so routed zero rows stay zero.
-                if p != Placement::Routed {
-                    whole(p, last, s)?;
-                }
             }
             (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
             (Stage::Rope { theta, .. }, Some(pos)) => {
@@ -579,17 +575,22 @@ fn shift(q: Placement, lead: usize) -> Placement {
 
 /// `x` without `axis`, as a sum over whole values.
 fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
+    need(
+        x.placement != Placement::Partial,
+        ErrorKind::Placement,
+        || "a mean cannot read partial sums".into(),
+    )?;
+    collapse(axis, x)
+}
+
+/// Drops `axis` from `x`, turning routed slices into partial sums.
+fn collapse(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
     need(x.dtype.is_float(), ErrorKind::DType, || {
         format!("a mean needs floats, got {:?}", x.dtype)
     })?;
     need((axis as usize) < x.rank(), ErrorKind::Shape, || {
         format!("no axis {axis} in {}", x.shape)
     })?;
-    need(
-        x.placement != Placement::Partial,
-        ErrorKind::Placement,
-        || "a mean cannot read partial sums".into(),
-    )?;
     let mut shape = x.shape.0.clone();
     shape.remove(axis as usize);
     // Each rank sums its own rows.
@@ -606,7 +607,7 @@ fn mean(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
 
 /// `x` without `axis`, each slice scaled by `w[.., axis]`.
 fn mix(dims: &[Dim], axis: u32, x: &TensorType, w: &TensorType) -> Result<TensorType, TypeError> {
-    let out = mean(axis, x)?;
+    let out = collapse(axis, x)?;
     let lead = axis as usize + 1;
     let fits = w.rank() == lead && same_shape(dims, &front(&x.shape, lead), &w.shape)?;
     need(fits, ErrorKind::Shape, || {

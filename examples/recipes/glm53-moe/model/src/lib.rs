@@ -6,6 +6,7 @@ use tessera_guest::site::{self, Count, Input, Kind, Manifest, Offer, Place, Shap
 const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
 const EXPERTS: &str = "glm53_experts";
+const EXPERTS1: &str = "glm53_experts1";
 const FINISH: &str = "glm53_finish";
 
 /// The weights after the rows, in kernel argument order.
@@ -64,17 +65,28 @@ fn width(codes: &[&Input]) -> Option<[u32; 2]> {
     codes.iter().all(|c| bits(c) == Some(k)).then_some(k)
 }
 
-/// The experts this rank holds: first and count.
-fn held(codes: &[&Input], experts: usize) -> Option<[usize; 2]> {
-    let share = codes.first()?.share;
-    if codes.iter().any(|c| c.share != share) {
+/// Experts this rank holds: first and count.
+fn held(routed: &[Input], experts: usize, ffn: usize) -> Option<[usize; 2]> {
+    let ep = (routed.iter().enumerate()).all(|(i, r)| r.share.is_none() || [4, 7, 10].contains(&i));
+    if ep {
+        let share = routed[4].share;
+        if [7, 10].iter().any(|&i| routed[i].share != share) {
+            return None;
+        }
+        return match share {
+            None => Some([0, experts]),
+            Some([0, first, count, whole]) if whole == experts => Some([first, count]),
+            Some(_) => None,
+        };
+    }
+    let tp = (routed.iter().enumerate())
+        .all(|(i, r)| r.share.is_none() || [4, 5, 7, 8, 9, 10].contains(&i));
+    let Some([1, first, count, whole]) = routed[4].share else {
         return None;
-    }
-    match share {
-        None => Some([0, experts]),
-        Some([0, first, count, whole]) if whole == experts => Some([first, count]),
-        Some(_) => None,
-    }
+    };
+    let same = |i: usize, axis: usize| routed[i].share == Some([axis, first, count, whole]);
+    let ok = tp && count == ffn && [4, 5, 7, 8, 9].into_iter().all(|i| same(i, 1)) && same(10, 2);
+    ok.then_some([0, experts])
 }
 
 /// Route, experts, then finish over a rotated routed block.
@@ -116,10 +128,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         return None;
     };
     let codes = [&routed[4], &routed[7], &routed[10]];
-    // Only the code sets split: by expert.
-    let whole =
-        (routed.iter().enumerate()).all(|(i, r)| r.share.is_none() || [4, 7, 10].contains(&i));
-    let [first, count] = held(&codes, experts)?;
+    let [first, count] = held(routed, experts, ffn)?;
     let [inner, _] = shared[0].parts?;
     let wide = shared[0].parts?[1];
     let sized = routed[0].shape == [experts, hidden]
@@ -132,7 +141,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         && ffn % 128 == 0
         && wide % 128 == 0
         && wide <= ffn;
-    if !(whole && sized) {
+    if !sized {
         return None;
     }
     // Floats are f32, but the router may be bf16.
@@ -162,9 +171,9 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         len: rows * experts,
         counts: fixed(&[rows, hidden, experts, bf16]),
         shape: Shape::Grid {
-            across: experts.div_ceil(8),
+            across: experts.div_ceil(2),
             down: 1,
-            threads: 256,
+            threads: 64,
         },
         work: (rows * experts * hidden) as f64,
         guess: 1e-12,
@@ -175,9 +184,13 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let reads = reads.chain((2..=11).map(Place::Read));
     let reads = reads.chain((0..2).flat_map(|i| (0..3).map(move |p| part(i, p))));
     let groups = rows.div_ceil(ROWS);
-    let slots = count.min(ROWS * picks as usize) + 1;
+    let slots = count.min(ROWS.min(rows) * picks as usize) + 1;
     let experts_offer = Offer {
-        kernel: EXPERTS,
+        kernel: if rows == 1 && hidden >= 1024 {
+            EXPERTS1
+        } else {
+            EXPERTS
+        },
         reads: reads.chain([part(2, 0), part(2, 1)]).collect(),
         len: rows * (picks as usize + 1) * (ffn / 128) * hidden,
         counts: fixed(&[
@@ -247,7 +260,7 @@ pub extern "C" fn alloc(len: i32) -> i32 {
 pub extern "C" fn manifest() -> i64 {
     let manifest = Manifest {
         abi: tessera_guest::ABI,
-        kernels: [ROUTE, EXPERTS, FINISH]
+        kernels: [ROUTE, EXPERTS, EXPERTS1, FINISH]
             .map(|k| site::imports(k, k, "moe.cu"))
             .into(),
         rules: vec![site::Rule {

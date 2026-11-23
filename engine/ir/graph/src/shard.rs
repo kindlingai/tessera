@@ -31,6 +31,16 @@ pub type Shares<'a> = dyn Fn(u32, &[usize], usize, usize) -> bool + 'a;
 
 /// As `shard`. A split weight's form `shares` each part.
 pub fn shard_aligned(g: &Graph, parts: &Parts, shares: &Shares) -> Result<Sharded, VerifyError> {
+    shard_mode(g, parts, shares, false)
+}
+
+/// As `shard_aligned`, splitting wide experts along inner width.
+pub fn shard_mode(
+    g: &Graph,
+    parts: &Parts,
+    shares: &Shares,
+    moe_tp: bool,
+) -> Result<Sharded, VerifyError> {
     let fit = &Fit { parts, shares };
     let mut out = g.clone();
     let mut whole = Vec::new();
@@ -43,14 +53,28 @@ pub fn shard_aligned(g: &Graph, parts: &Parts, shares: &Shares) -> Result<Sharde
         }
         let tried = settle(split(&out, id), &out);
         // The sum is the new node behind this one.
-        if adopt(&mut out, tried, fit, &mut whole) {
+        if adopt(&mut out, tried, fit, Some(&mut whole)) {
             at += 1;
         }
     }
+    if moe_tp {
+        let mut at = 0;
+        while at < out.nodes.len() {
+            let id = NodeId(at as u32);
+            at += 1;
+            let Some(tried) = split_moe(&out, id, fit.parts) else {
+                continue;
+            };
+            let tried = settle(tried, &out);
+            if adopt(&mut out, tried, fit, None) {
+                at += 1;
+            }
+        }
+    }
     let routed = route(&out);
-    adopt(&mut out, routed, fit, &mut whole);
+    adopt(&mut out, routed, fit, Some(&mut whole));
     let gathered = gather(&out);
-    adopt(&mut out, gathered, fit, &mut whole);
+    adopt(&mut out, gathered, fit, Some(&mut whole));
     if let Ok(merged) = retype(&merge(&out)) {
         out = merged;
     }
@@ -97,7 +121,7 @@ fn feeders(g: &Graph, at: usize) -> Vec<u32> {
 }
 
 /// Takes `tried` if it types and fits `fit`.
-fn adopt(out: &mut Graph, tried: Graph, fit: &Fit, whole: &mut Vec<Whole>) -> bool {
+fn adopt(out: &mut Graph, tried: Graph, fit: &Fit, whole: Option<&mut Vec<Whole>>) -> bool {
     let why = match retype(&tried) {
         Ok(typed) => match misfit(&typed, fit) {
             None => {
@@ -107,6 +131,9 @@ fn adopt(out: &mut Graph, tried: Graph, fit: &Fit, whole: &mut Vec<Whole>) -> bo
             Some(why) => why,
         },
         Err(e) => e.to_string(),
+    };
+    let Some(whole) = whole else {
+        return false;
     };
     let claimed = (out.weights.iter().zip(&tried.weights))
         .enumerate()
@@ -141,6 +168,17 @@ fn misfit(g: &Graph, fit: &Fit) -> Option<String> {
                 "axis {axis} of {shape} does not divide by {parts:?}"
             ));
         };
+        if at + 1 == shape.0.len()
+            && let Op::Row(r) = &n.op
+        {
+            for s in &r.0 {
+                if let Stage::Hadamard { block } = *s
+                    && counts.iter().any(|c| !c.is_multiple_of(block as usize))
+                {
+                    return Some(format!("axis {axis} of {shape} cuts hadamard {block}"));
+                }
+            }
+        }
         let Op::Weight(w) = n.op else {
             continue;
         };
@@ -183,9 +221,84 @@ fn summed(g: &Graph, id: NodeId) -> bool {
     false
 }
 
+/// Replicated weight of rank `rank` gathered by `id`.
+fn gathered(g: &Graph, id: NodeId, rank: usize) -> Option<u32> {
+    if g.node(id).op != Op::Select(Select::Gather) {
+        return None;
+    }
+    let Op::Weight(w) = g.node(set_of(g, g.node(id).args[0])).op else {
+        return None;
+    };
+    let ty = &g.weights[w as usize].ty;
+    (ty.rank() == rank && ty.placement == Placement::Replicated).then_some(w)
+}
+
+/// The routed down matmul feeding `id`, through linear stages.
+fn down_matmul(g: &Graph, mut id: NodeId) -> Option<(NodeId, u32)> {
+    loop {
+        let node = g.node(id);
+        match &node.op {
+            Op::Matmul => return gathered(g, node.args[1], 3).map(|w| (id, w)),
+            Op::Row(r)
+                if r.0.iter().all(|s| {
+                    matches!(s, Stage::Hadamard { .. } | Stage::Mul | Stage::Scale(_))
+                }) =>
+            {
+                id = node.args[0];
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Splits wide routed experts along their inner width.
+fn split_moe(g: &Graph, id: NodeId, parts: &Parts) -> Option<Graph> {
+    if !matches!(g.node(id).op, Op::Mix(_)) || g.node(id).ty.placement != Placement::Replicated {
+        return None;
+    }
+    let (down, down_w) = down_matmul(g, g.node(id).args[0])?;
+    let whole = poly(&g.dims, &g.weights[down_w as usize].ty.shape.0[2])
+        .ok()?
+        .as_const()? as usize;
+    let counts = parts.counts(whole)?;
+    if counts.iter().any(|&c| c < 256) {
+        return None;
+    }
+    let mut out = g.clone();
+    let mut pending = vec![g.node(down).args[0]];
+    let mut seen = vec![false; g.nodes.len()];
+    while let Some(n) = pending.pop() {
+        if std::mem::replace(&mut seen[n.0 as usize], true) {
+            continue;
+        }
+        let node = g.node(n);
+        if node.op == Op::Matmul
+            && let Some(w) = gathered(g, node.args[1], 3)
+        {
+            out.weights[w as usize].ty.placement = Placement::Split { axis: 1 };
+            continue;
+        }
+        if let Some(w) = gathered(g, n, 2) {
+            out.weights[w as usize].ty.placement = Placement::Split { axis: 1 };
+            continue;
+        }
+        pending.extend(node.args.iter().copied());
+    }
+    out.weights[down_w as usize].ty.placement = Placement::Split { axis: 2 };
+    let sum = Node {
+        op: Op::Row(Row(vec![Stage::AllReduce])),
+        args: vec![id],
+        ty: g.node(id).ty.clone(),
+        numerics: Some(Numerics::default()),
+    };
+    insert(&mut out, id, sum);
+    Some(out)
+}
+
 /// Every gathered set split by matrix, each mix summed back.
 fn route(g: &Graph) -> Graph {
     let mut out = g.clone();
+    let mut changed = false;
     for n in &g.nodes {
         if n.op != Op::Select(Select::Gather) {
             continue;
@@ -196,13 +309,18 @@ fn route(g: &Graph) -> Graph {
         let ty = &g.weights[w as usize].ty;
         if ty.rank() == 3 && ty.placement == Placement::Replicated {
             out.weights[w as usize].ty.placement = Placement::Split { axis: 0 };
+            changed = true;
         }
+    }
+    if !changed {
+        return out;
     }
     let mut at = 0;
     while at < out.nodes.len() {
         let id = NodeId(at as u32);
         at += 1;
-        if let Op::Mix(_) = out.node(id).op {
+        if matches!(out.node(id).op, Op::Mix(_)) && out.node(id).ty.placement != Placement::Partial
+        {
             let sum = Node {
                 op: Op::Row(Row(vec![Stage::AllReduce])),
                 args: vec![id],

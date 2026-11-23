@@ -75,6 +75,15 @@ impl Weights {
     pub fn each_rows<E: Into<Box<dyn Error + Send + Sync>>>(
         &self,
         rows: impl Fn(u32) -> Option<(usize, usize)>,
+        take: impl FnMut(u32, &Weight) -> Result<(), E>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.each_share(|at| rows(at).map(|(f, c)| (0, f, c)), take)
+    }
+
+    /// As `each`. Streams read only the kept share slice.
+    pub fn each_share<E: Into<Box<dyn Error + Send + Sync>>>(
+        &self,
+        shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
         mut take: impl FnMut(u32, &Weight) -> Result<(), E>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         match self {
@@ -85,7 +94,7 @@ impl Weights {
                 Ok(())
             }
             Weights::Streamed(release) => {
-                release.each(&rows, |at, w| take(at, &w).map_err(Into::into))
+                release.each(&shares, |at, w| take(at, &w).map_err(Into::into))
             }
         }
     }
@@ -233,12 +242,12 @@ fn form(stored: Stored, set: bool) -> Result<&'static dyn Load, Box<dyn Error + 
     }
 }
 
-/// Each weight in graph order, cut to `rows` where possible.
+/// Each weight in graph order, cut to `shares` where possible.
 pub fn each(
     graph: &Graph,
     offer: &dyn Offer,
     rules: &[&[Rule]],
-    rows: &dyn Fn(u32) -> Option<(usize, usize)>,
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
     mut take: impl FnMut(Weight, &'static dyn Load) -> Result<(), Box<dyn Error + Send + Sync>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let slices = offer.slices();
@@ -252,8 +261,10 @@ pub fn each(
         let weight = match (slice.stored, c.rows) {
             _ if !c.parts.is_empty() => stacked(offer, slice.stored, &c.parts, shape)?,
             (Stored::Form(_), Some(rows)) => Weight::Packed(f, offer.packed_rows(&c.name, rows)?),
-            (Stored::Form(_), None) => match rows(at as u32) {
-                Some(keep) => Weight::Packed(f, offer.packed_share(&c.name, keep)?),
+            (Stored::Form(_), None) => match shares(at as u32) {
+                Some((ax, first, count)) => {
+                    Weight::Packed(f, offer.packed_axis(&c.name, ax, (first, count))?)
+                }
                 None => Weight::Packed(f, offer.packed(&c.name)?),
             },
             (Stored::Bf16, _) => halves(offer, slice, c.rows)?,

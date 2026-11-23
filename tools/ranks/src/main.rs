@@ -318,9 +318,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("rank {}: on {}, sums {sums}", args.rank, rank.device());
     let start = Instant::now();
     let count = g.weights.len() as u32;
-    let rows: Vec<_> = (0..count).map(|at| rank.plan().rows(at)).collect();
-    let rows = |at: u32| rows[at as usize];
-    let loading = weights.each_rows(rows, |at, w| rank.load_weight(at, w));
+    let shares: Vec<_> = (0..count).map(|at| rank.plan().share(at)).collect();
+    let shares = |at: u32| shares[at as usize];
+    let loading = weights.each_share(shares, |at, w| rank.load_weight(at, w));
     loading.map_err(|e| e.to_string())?;
     eprintln!(
         "rank {}: loaded in {:.1} s",

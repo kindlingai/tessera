@@ -217,9 +217,9 @@ fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> R
     let at = (&recipe, settings);
     let count = loaded.graph.weights.len() as u32;
     let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
-    let rows: Vec<_> = (0..count).map(|at| engine.rows(at)).collect();
-    let rows = |at: u32| rows[at as usize];
-    let loading = (loaded.weights).each_rows(rows, |at, w| engine.load_weight(at, w));
+    let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
+    let shares = |at: u32| shares[at as usize];
+    let loading = (loaded.weights).each_share(shares, |at, w| engine.load_weight(at, w));
     loading.map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());

@@ -374,6 +374,7 @@ impl<const K: u32> Form for Trellis<K> {
     fn shares(&self, shape: &[usize], axis: usize, count: usize) -> bool {
         match shape.len() {
             2 => count.is_multiple_of(ENTRY),
+            3 => axis == 0 || count.is_multiple_of(ENTRY),
             _ => axis == 0,
         }
     }
@@ -398,10 +399,13 @@ impl<const K: u32> Form for Trellis<K> {
         if !first.is_multiple_of(ENTRY) || !count.is_multiple_of(ENTRY) {
             return None;
         }
-        // Outputs lead, so an output split has one outer part.
-        let outputs = match (outer, inner) {
-            (1, i) if i == shape.inp => true,
-            (o, 1) if o == shape.out => false,
+        let body = bytes.len().checked_sub(HEAD)?;
+        // Outputs lead, so an output split has `matrices` outer parts.
+        let (outputs, matrices) = match (outer, inner) {
+            (m, i) if i == shape.inp && m * matrix == body => (true, m),
+            (o, 1) if o.is_multiple_of(shape.out) && (o / shape.out) * matrix == body => {
+                (false, o / shape.out)
+            }
             _ => return None,
         };
         let part = match outputs {
@@ -426,10 +430,13 @@ impl<const K: u32> Form for Trellis<K> {
             // Inputs of output entries: 8 tiles per 16 inputs.
             (false, false) => (shape.out / ENTRY, shape.inp / 2, first / 2, count / 2),
         };
-        let mut codes = Vec::with_capacity(entries * take * Self::TILE);
-        for g in 0..entries {
-            let from = HEAD + (g * per + at) * Self::TILE;
-            codes.extend_from_slice(&bytes[from..from + take * Self::TILE]);
+        let mut codes = Vec::with_capacity(matrices * entries * take * Self::TILE);
+        for m in 0..matrices {
+            let base = HEAD + m * matrix;
+            for g in 0..entries {
+                let from = base + (g * per + at) * Self::TILE;
+                codes.extend_from_slice(&bytes[from..from + take * Self::TILE]);
+            }
         }
         Some(packed(part.inp, part.out, part.side, &codes))
     }

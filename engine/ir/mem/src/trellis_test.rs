@@ -35,6 +35,14 @@ fn trellis_shares() {
         assert_eq!(got, TRELLIS_K2.unpack(&second, i), "element {i}");
     }
     same_part(&TRELLIS_K2, &set, [1, 2, 128 * 256], [1, 1]);
+    same_part(&TRELLIS_K2, &set, [2 * 128, 256, 1], [128, 128]);
+    let out_set = packed(
+        128,
+        256,
+        1,
+        &[noise(128 * 256 * 2 / 8), noise(128 * 256 * 2 / 8)].concat(),
+    );
+    same_part(&TRELLIS_K2, &out_set, [2, 256, 128], [128, 128]);
 }
 
 /// A rotated file splits into codes, `suh` and `svh`.

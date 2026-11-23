@@ -176,7 +176,7 @@ impl Release {
     /// Each weight in graph order, read one at a time.
     pub fn each(
         &self,
-        rows: &dyn Fn(u32) -> Option<(usize, usize)>,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
         mut take: impl FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut at = 0;
@@ -184,7 +184,7 @@ impl Release {
             &self.graph,
             &*self.offer,
             &[&self.rules],
-            rows,
+            shares,
             |weight, _| {
                 at += 1;
                 take(at - 1, weight)

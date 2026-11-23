@@ -8,7 +8,7 @@ use tessera_frontend_comm::{grid, grid_flag, join, meet, ports, resident};
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
-[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|whole]]";
+[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|whole] [--moe ep|tp]]";
 
 /// Sums and control transports, and any grid.
 pub(crate) type Links = ([Box<dyn Transport>; 2], Grids);
@@ -34,6 +34,8 @@ pub struct Ranks {
     grid: bool,
     /// The recipe's resident grid runs each step, sums inside.
     whole: bool,
+    /// Split wide routed experts along inner width instead of experts.
+    moe_tp: bool,
 }
 
 impl Ranks {
@@ -51,6 +53,11 @@ impl Ranks {
             }
             "--sums" if value == "whole" => self.whole = true,
             "--sums" => self.grid = grid_flag(value)?,
+            "--moe" => match value {
+                "ep" => self.moe_tp = false,
+                "tp" => self.moe_tp = true,
+                _ => return None,
+            },
             "--verbs" => self.fabric = Some(Fabric::Mesh(ports(value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -118,7 +125,7 @@ impl Ranks {
                     Grids::Sums(s) => (Some(s), None),
                     Grids::Steps(g) => (None, Some(g)),
                 };
-                let place = place.with_grid(sums_grid);
+                let place = place.with_grid(sums_grid).with_moe_tp(self.moe_tp);
                 let opened =
                     Engine::open_ranked(graph, context, (recipe, settings), place, sums, control);
                 opened.and_then(|mut e| {
