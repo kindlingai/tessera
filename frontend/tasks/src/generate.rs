@@ -32,6 +32,15 @@ impl Tokens for Generate {
 
 impl Chat for Generate {
     fn render(&self, messages: &[Message], think: bool) -> Result<String, Error> {
+        self.render_with(messages, think, None)
+    }
+
+    fn render_with(
+        &self,
+        messages: &[Message],
+        think: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String, Error> {
         let template = self
             .template
             .as_ref()
@@ -39,7 +48,7 @@ impl Chat for Generate {
         if messages.is_empty() {
             return Err("no messages".into());
         }
-        Ok(template.render(messages, think)?)
+        Ok(template.render_with(messages, think, reasoning_effort)?)
     }
 }
 
