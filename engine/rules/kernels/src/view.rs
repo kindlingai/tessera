@@ -6,7 +6,7 @@ use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::kernels::Join;
 use tessera_lower::{Draft, Extent, Home, Kernel, Source, T, Term, Tree};
 
-/// One thread per output `[outer, upper, mid, inner]`, strided reads.
+/// One thread per output or quad, strided reads.
 #[kernel]
 fn strided(
     #[form(in_form)] x: Buf<Dyn>,
@@ -22,23 +22,38 @@ fn strided(
     start: u32,
     #[build] in_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
+    #[build] wide: bool,
 ) {
-    if gid() >= len {
-        return;
+    if wide {
+        if gid() >= len / 4 {
+            return;
+        }
+        let inner4 = inner / 4;
+        let i = (gid() % inner4) * 4;
+        let m = (gid() / inner4) % mid;
+        let u = (gid() / (inner4 * mid)) % upper;
+        let o = gid() / (inner4 * mid * upper);
+        let at = start + o * outer_step + u * upper_step + m * mid_step + i;
+        let v = x.load4(at as u64);
+        out.store4((gid() * 4) as u64, v);
+    } else {
+        if gid() >= len {
+            return;
+        }
+        let i = gid() % inner;
+        let m = (gid() / inner) % mid;
+        let u = (gid() / (inner * mid)) % upper;
+        let o = gid() / (inner * mid * upper);
+        let at = start + o * outer_step + u * upper_step + m * mid_step + i * inner_step;
+        out[gid() as u64] = x[at as u64];
     }
-    let i = gid() % inner;
-    let m = (gid() / inner) % mid;
-    let u = (gid() / (inner * mid)) % upper;
-    let o = gid() / (inner * mid * upper);
-    let at = start + o * outer_step + u * upper_step + m * mid_step + i * inner_step;
-    out[gid() as u64] = x[at as u64];
 }
 
 /// A view as four nested axes over its input.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    strided(self.in_form, self.out_form),
-    threads = self.len,
+    strided(self.in_form, self.out_form, self.wide),
+    threads = if self.wide { self.len / 4 } else { self.len },
     accepts = strided_accepts,
     emits = strided_emits,
     source = strided_source,
@@ -55,6 +70,7 @@ pub(crate) struct Strided {
     pub start: usize,
     pub in_form: &'static dyn Stored,
     pub out_form: &'static dyn Stored,
+    pub wide: bool,
 }
 
 fn strided_accepts(k: &Strided, _: usize, form: &dyn Stored) -> bool {
@@ -66,11 +82,12 @@ fn strided_emits(k: &Strided, form: &dyn Stored) -> bool {
 }
 
 fn strided_source(k: &Strided) -> Source {
+    let suffix = if k.wide { "_x4" } else { "" };
     let entry = match (k.in_form.name(), k.out_form.name()) {
-        ("f32", "f32") => "plan_strided".into(),
-        (a, b) => format!("plan_strided_{a}_{b}"),
+        ("f32", "f32") => format!("plan_strided{suffix}"),
+        (a, b) => format!("plan_strided{suffix}_{a}_{b}"),
     };
-    Source::named(strided_ir(k.in_form, k.out_form), entry)
+    Source::named(strided_ir(k.in_form, k.out_form, k.wide), entry)
 }
 
 /// Output axes as `(size, input step)`, neighbours merged.
@@ -114,6 +131,14 @@ fn nested(
     else {
         return None;
     };
+    let wide = in_form.name() == "f32"
+        && out_form.name() == "f32"
+        && inner_step == 1
+        && inner.is_multiple_of(4)
+        && start.is_multiple_of(4)
+        && mid_step.is_multiple_of(4)
+        && upper_step.is_multiple_of(4)
+        && outer_step.is_multiple_of(4);
     Some(Strided {
         len,
         upper,
@@ -126,6 +151,7 @@ fn nested(
         start,
         in_form,
         out_form,
+        wide,
     })
 }
 
@@ -145,11 +171,7 @@ fn strides(
             // Starts are fixed sizes.
             let start = start.value(&tree.g.dims, &|_| None)? as usize;
             let mid = len / product(&shape[..a]) / inner;
-            let runs = [
-                (product(&shape[..a]), shape[a] * inner),
-                (mid, inner),
-                (inner, 1),
-            ];
+            let runs = [(product(&shape[..a]), shape[a] * inner), (mid * inner, 1)];
             nested(&runs, len, start * inner, forms.0, forms.1)
         }
         View::Expand { axis, .. } => {

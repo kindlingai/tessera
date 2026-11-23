@@ -189,6 +189,30 @@ fn needed(g: &Graph, outputs: &[usize]) -> Vec<bool> {
     needed
 }
 
+/// Whether `ids` is a causal `top_k` covering every key.
+fn all_causal(tree: &Tree, args: &[T]) -> bool {
+    let [_, k, _, _, positions, ids] = *args else {
+        return false;
+    };
+    let Some(&most) = tree.node(k).shape.get(1) else {
+        return false;
+    };
+    let top = tree.node(ids);
+    if !matches!(
+        top.term,
+        Term::Op(Op::Select(tessera_graph::Select::TopK { .. }))
+    ) {
+        return false;
+    }
+    if !top.shape.last().is_some_and(|&picks| most <= picks) {
+        return false;
+    }
+    let seen = tree.node(top.args[0]);
+    matches!(seen.term, Term::Stage(Stage::Causal))
+        && seen.shape.last() == Some(&most)
+        && seen.args.get(1) == Some(&positions)
+}
+
 /// Each axis of `s`, fixed or affine in `upto`.
 fn sized(
     g: &Graph,
@@ -364,6 +388,10 @@ impl<'a> Tree<'a> {
                 at[i] = Some(tree.turn(args[0], parts, (&shape, &extents), form, from));
                 continue;
             }
+            let bypass = matches!(
+                &n.op,
+                Op::Attend(a) if a.ragged && a.picked && a.mask == tessera_graph::Mask::Causal
+            ) && all_causal(&tree, &args);
             let mut push = |term: Term, args: Vec<T>, node_form: &'static dyn Load| {
                 let (shape, extents) = (shape.clone(), extents.clone());
                 tree.nodes.push(Node {
@@ -403,6 +431,11 @@ impl<'a> Tree<'a> {
                         cur = push(Term::Stage(stage.clone()), args, stage_form);
                     }
                     cur
+                }
+                Op::Attend(a) if bypass => {
+                    let mut plain = a.clone();
+                    plain.picked = false;
+                    push(Term::Op(Op::Attend(plain)), args[..5].to_vec(), form)
                 }
                 op => push(Term::Op(op.clone()), args, form),
             });
@@ -510,6 +543,31 @@ impl<'a> Tree<'a> {
         step(Term::Stage(Stage::Mul), vec![back, svh], true, out_form)
     }
 
+    /// Whether `t` reuses its input buffer without copying.
+    pub(crate) fn alias(&self, t: T) -> bool {
+        let n = self.node(t);
+        match &n.term {
+            Term::Op(Op::View(View::Reshape(_))) => true,
+            Term::Op(Op::View(View::Permute(order))) => {
+                let src = self.node(n.args[0]);
+                if src.form.name() != n.form.name() {
+                    return false;
+                }
+                let mut prev = None;
+                for &ax in order {
+                    if src.shape[ax as usize] > 1 {
+                        if prev.is_some_and(|p| ax <= p) {
+                            return false;
+                        }
+                        prev = Some(ax);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// This rank's part of a split weight.
     pub fn share(&self, t: T) -> Option<Share> {
         self.shares[t.0 as usize]
@@ -574,7 +632,7 @@ impl<'a> Tree<'a> {
     pub fn root(&self, t: T) -> bool {
         let kept = self.leaf(t) || self.appends(t);
         let end = self.ends[t.0 as usize];
-        kept || end || self.readers[t.0 as usize] != 1 || self.output(t)
+        kept || end || self.readers[t.0 as usize] > 1 || self.output(t)
     }
 
     /// The pattern `P` at `t`, if the node shows it.

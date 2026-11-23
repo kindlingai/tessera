@@ -15,7 +15,7 @@ use crate::rule::{Read, Rule, linked};
 use crate::tree::{T, Term, Tree, Wants};
 use crate::{Error, Unsupported};
 use std::collections::{BTreeMap, BTreeSet};
-use tessera_graph::{DimName, Graph, NodeId, View};
+use tessera_graph::{DimName, Graph, NodeId};
 
 /// A value some op writes, or the plan is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -161,8 +161,10 @@ pub(crate) fn select_upto(
         if absorbed[t.0 as usize] {
             continue;
         }
+        let live = tree.appends(t) || !cover.wanted[t.0 as usize].is_empty();
         let zone = match (tree.root(t), own[t.0 as usize]) {
-            (true, _) => cover.settle(t),
+            (true, _) if live => cover.settle(t),
+            (true, _) => continue,
             (false, placed) => placed,
         };
         let Some(zone) = zone else {
@@ -207,7 +209,7 @@ pub(crate) fn select_upto(
                 val
             }
             (_, None) => continue,
-            (Term::Op(tessera_graph::Op::View(View::Reshape(_))), _) => val(n.args[0]),
+            _ if tree.alias(t) => val(n.args[0]),
             (Term::Op(tessera_graph::Op::Append(index)), _) => {
                 let args = [n.args[0], n.args[1], n.args[2]].map(val);
                 e.append(&tree, t, *index, args)?

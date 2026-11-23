@@ -8,7 +8,7 @@ use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use tessera_graph::{Op, Stage, View};
+use tessera_graph::{Op, Stage};
 use tessera_sim::ZoneKind;
 
 /// The cheapest cover found at one node, in one zone.
@@ -125,8 +125,8 @@ impl Cover<'_> {
     /// Asks every rule, and keeps the cheapest proposal.
     fn choose(&mut self, t: T, zone: u32) -> Option<Choice> {
         let n = self.tree.node(t);
-        // A view or kept rows only pass their argument on.
-        let passes = matches!(n.term, Term::Op(Op::View(View::Reshape(_)) | Op::Append(_)));
+        // A zero-copy view or kept rows pass their argument on.
+        let passes = self.tree.alias(t) || matches!(n.term, Term::Op(Op::Append(_)));
         if passes {
             if matches!(n.term, Term::Op(Op::Append(_))) && zone != EDGE {
                 return None;
