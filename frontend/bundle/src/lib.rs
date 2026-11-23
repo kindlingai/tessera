@@ -460,6 +460,9 @@ pub fn load_module(
     overrides: &Overrides,
     module: &Module,
 ) -> Result<Option<Bundle>, Box<dyn Error + Send + Sync>> {
+    if !module.builds() || dir.is_file() {
+        return Ok(None);
+    }
     let json = overrides.merged("config.json", &dir.join("config.json"))?;
     let Some(graph) = module.graph(&json, sizes[0], Some(sizes[1]))? else {
         return Ok(None);

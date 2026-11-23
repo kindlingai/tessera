@@ -304,6 +304,11 @@ impl Module {
         Ok(Some(self.guest.call(name, Some(&input), BUILD_FUEL)?))
     }
 
+    /// Whether the module builds a graph.
+    pub fn builds(&self) -> bool {
+        self.graph
+    }
+
     /// The graph for `config` JSON, if the module builds one.
     pub fn graph(
         &self,
