@@ -231,7 +231,10 @@ pub fn pins(
 }
 
 /// A slice's form. A `set` joins many slices.
-fn form(stored: Stored, set: bool) -> Result<&'static dyn Load, Box<dyn Error + Send + Sync>> {
+pub(crate) fn form(
+    stored: Stored,
+    set: bool,
+) -> Result<&'static dyn Load, Box<dyn Error + Send + Sync>> {
     match stored {
         Stored::Bf16 => Ok(BF16_FORM),
         // Only a form without a header joins byte for byte.

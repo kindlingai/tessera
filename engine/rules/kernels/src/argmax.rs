@@ -5,7 +5,7 @@ use tessera_lower::sites;
 use tessera_lower::{Draft, Kernel, Read, T, Tree};
 
 /// The most threads that share one row's scan.
-const PARTS: usize = 256;
+const PARTS: usize = 512;
 
 /// The best index in each piece of each row.
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -23,6 +23,8 @@ pub(crate) struct Argmax {
     pub rows: usize,
     pub width: usize,
     pub parts: usize,
+    pub first: usize,
+    pub whole: usize,
 }
 
 /// One thread per entry or pick, whichever is more.
@@ -32,6 +34,8 @@ pub(crate) struct TopK {
     pub rows: usize,
     pub width: usize,
     pub k: usize,
+    pub first: usize,
+    pub whole: usize,
 }
 
 /// Top `k` indices inside each winning chunk of each row.
@@ -52,11 +56,13 @@ pub(crate) struct MergeTop {
     pub width: usize,
     pub total: usize,
     pub k: usize,
+    pub first: usize,
+    pub whole: usize,
 }
 
-/// Picks go by value, then index. Spare picks hold `width`.
+/// Picks go by value, then index. Spare picks hold `whole`.
 #[kernel]
-fn top_k(x: Buf<F32>, mut out: BufMut<U32>, rows: u32, width: u32, k: u32) {
+fn top_k(x: Buf<F32>, mut out: BufMut<U32>, rows: u32, width: u32, k: u32, first: u32, whole: u32) {
     let span = if width > k { width } else { k };
     if gid() >= rows * span {
         return;
@@ -82,10 +88,10 @@ fn top_k(x: Buf<F32>, mut out: BufMut<U32>, rows: u32, width: u32, k: u32) {
         }
     }
     if v > f32::NEG_INFINITY && place < k {
-        out[(row * k + place) as u64] = t;
+        out[(row * k + place) as u64] = first + t;
     }
     if t >= finite && t < k {
-        out[(row * k + t) as u64] = width;
+        out[(row * k + t) as u64] = whole;
     }
 }
 
@@ -114,9 +120,18 @@ fn peaks(x: Buf<F32>, mut out: BufMut<U32>, rows: u32, width: u32, parts: u32) {
     out[gid() as u64] = arg;
 }
 
-/// A piece with nothing finite holds the width.
+/// A piece with nothing finite holds `whole`.
 #[kernel]
-fn argmax(x: Buf<F32>, peaks: Buf<U32>, mut out: BufMut<U32>, rows: u32, width: u32, parts: u32) {
+fn argmax(
+    x: Buf<F32>,
+    peaks: Buf<U32>,
+    mut out: BufMut<U32>,
+    rows: u32,
+    width: u32,
+    parts: u32,
+    first: u32,
+    whole: u32,
+) {
     if gid() >= rows {
         return;
     }
@@ -130,7 +145,7 @@ fn argmax(x: Buf<F32>, peaks: Buf<U32>, mut out: BufMut<U32>, rows: u32, width: 
             arg = i;
         }
     }
-    out[gid() as u64] = arg;
+    out[gid() as u64] = if arg < width { first + arg } else { whole };
 }
 
 /// Top `k` indices inside each winning chunk.
@@ -164,9 +179,10 @@ fn chunk_top(
         width
     };
     let at = row as u64 * width as u64;
-    let mut cap = f32::INFINITY;
-    let mut prev = 0u32;
-    for p in 0..k {
+    out[dst] = win;
+    let mut cap = x[at + win as u64];
+    let mut prev = win;
+    for p in 1..k {
         let mut arg = width;
         let mut best = f32::NEG_INFINITY;
         for i in from..to {
@@ -195,6 +211,8 @@ fn merge_top(
     width: u32,
     total: u32,
     k: u32,
+    first: u32,
+    whole: u32,
 ) {
     if gid() >= rows * total {
         return;
@@ -226,18 +244,25 @@ fn merge_top(
         }
     }
     if val > f32::NEG_INFINITY && rank < k {
-        out[(row * k + rank) as u64] = idx;
+        out[(row * k + rank) as u64] = first + idx;
     }
     if t >= seen && t < k {
-        out[(row * k + t) as u64] = width;
+        out[(row * k + t) as u64] = whole;
     }
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let sites::Top { x, rows, width, k } = tree.site(at)?;
+    let sites::Top {
+        x,
+        rows,
+        width,
+        k,
+        first,
+        whole,
+    } = tree.site(at)?;
     if k > 1 {
-        if width > PARTS * 2 && k <= 32 {
-            let parts = PARTS.min(width).max(k);
+        if width > 512 && k <= 32 {
+            let parts = PARTS.min(width / 2).max(k);
             return Some(vec![
                 Draft::new(Peaks { rows, width, parts }, [x], rows * parts),
                 Draft::new(
@@ -246,6 +271,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                         width,
                         total: parts,
                         k,
+                        first: 0,
+                        whole: width,
                     },
                     [Read::Node(x), Read::Draft(0)],
                     rows * k,
@@ -266,19 +293,41 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                         width,
                         total: k * k,
                         k,
+                        first,
+                        whole,
                     },
                     [Read::Node(x), Read::Draft(2)],
                     rows * k,
                 ),
             ]);
         }
-        return Some(vec![Draft::new(TopK { rows, width, k }, [x], rows * k)]);
+        return Some(vec![Draft::new(
+            TopK {
+                rows,
+                width,
+                k,
+                first,
+                whole,
+            },
+            [x],
+            rows * k,
+        )]);
     }
     let parts = PARTS.min(width).max(1);
     let both = [Read::Node(x), Read::Draft(0)];
     Some(vec![
         Draft::new(Peaks { rows, width, parts }, [x], rows * parts),
-        Draft::new(Argmax { rows, width, parts }, both, rows),
+        Draft::new(
+            Argmax {
+                rows,
+                width,
+                parts,
+                first,
+                whole,
+            },
+            both,
+            rows,
+        ),
     ])
 }
 

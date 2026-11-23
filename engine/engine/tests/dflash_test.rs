@@ -6,9 +6,10 @@ use tessera_engine::{
     Drafter, Engine, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate,
     accept_greedy, accept_sample,
 };
-use tessera_graph::{Graph, Parts, PathSeg};
-use tessera_interp::{Store, Tensor, run_kept};
-use tessera_lower::{Cluster, Pick, Settings, Weight};
+use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
+use tessera_graph::{Graph, Parts, PathSeg, Role};
+use tessera_interp::{Store, Tensor, run, run_kept, run_ranks};
+use tessera_lower::{Cache, Cluster, Device, Pick, Settings, Wants, Weight};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::dflash::{self, TargetSpec};
 use tessera_models::{mla, small};
@@ -440,6 +441,82 @@ fn verify_tp_pair(
     follower.join().unwrap();
 }
 
+fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
+    let parts = Parts::even(2);
+    let sharded = dflash::shard(g, &parts, &|_, _, _, _| true).unwrap().graph;
+    let dim = |name| g.dims.iter().find(|d| d.name == name).unwrap().size.max() as usize;
+    let (vocab, tap_w) = (dim(Vocab), dim(Embedding));
+    let w = weights(g, &mut Noise(seed));
+    let feeds = vec![
+        Tensor::u32(vec![4], vec![2, 0, 0, 0]),
+        Tensor::u32(vec![4], vec![2, 3, 4, 5]),
+        Tensor::u32(vec![4], vec![0; 4]),
+        Tensor::u32(vec![4], vec![5; 4]),
+        Tensor::f32(vec![2, tap_w], vec![0.1; 2 * tap_w]),
+        Tensor::u32(vec![6], vec![0, 1, 2, 3, 4, 5]),
+        Tensor::u32(vec![6], vec![0; 6]),
+    ];
+    let want = run(g, &w, 0, &feeds).unwrap();
+    let got = run_ranks(&sharded, &w, 0, &feeds, 2).unwrap();
+    assert_eq!(got[0].indices().unwrap(), want[0].indices().unwrap());
+    for (a, b) in got[1]
+        .floats()
+        .unwrap()
+        .iter()
+        .zip(want[1].floats().unwrap())
+    {
+        assert!((a - b).abs() < 1e-3 * b.abs().max(1.0), "{a} vs {b}");
+    }
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let dev = Device::guess(&settings)
+        .zoned(Cluster::two("a", "b"))
+        .ranked(vec![0, 1])
+        .uneven(parts.0)
+        .as_rank(0);
+    let sizes = [(Seqs, 1), (Rows, 4), (Context, 4), (Segments, 1)];
+    let wants = match selector {
+        true => Wants::roles(&sharded, 0, &[Role::Candidates, Role::Taps]),
+        false => Wants::role(&sharded, 0, Role::Tokens),
+    };
+    let mut cache = Cache::default();
+    let (plan, _) = cache
+        .wanting(&sharded, 0, wants, &sizes, &[Context, Segments], &dev)
+        .unwrap();
+    let gathers: Vec<usize> = plan
+        .steps
+        .iter()
+        .filter(|s| s.kernel.name() == "all_gather")
+        .map(|s| s.write.len)
+        .collect();
+    assert!(
+        gathers.contains(&(2 * 3 * 2 * k)),
+        "missing top-k gather: {gathers:?}"
+    );
+    assert!(
+        !gathers.contains(&(3 * vocab)),
+        "full logits gather remained: {gathers:?}"
+    );
+    let (logits_plan, _) = cache
+        .wanting(
+            &sharded,
+            0,
+            Wants::role(&sharded, 0, Role::Logits),
+            &sizes,
+            &[Context, Segments],
+            &dev,
+        )
+        .unwrap();
+    assert!(
+        logits_plan
+            .steps
+            .iter()
+            .any(|s| s.kernel.name() == "all_gather" && s.write.len == 3 * vocab)
+    );
+}
+
 #[test]
 fn tp_drafter_matches_one() {
     let mut t_cfg = Config::toy(1, 24);
@@ -454,6 +531,7 @@ fn tp_drafter_matches_one() {
     };
     let d1_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
     let d1_g = dflash::stepper::<Norm>(&d1_cfg);
+    verify_local_topk(&d1_g, 67, 1, false);
     verify_tp_pair(&t_graph, 61, &d1_g, 67, false, true);
 
     let mut d2_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
@@ -464,6 +542,7 @@ fn tp_drafter_matches_one() {
     });
     d2_cfg.selector = Some(dflash::SelectorConfig { rank: 8, top_k: 4 });
     let d2_g = dflash::stepper::<Norm>(&d2_cfg);
+    verify_local_topk(&d2_g, 71, 4, true);
     verify_tp_pair(&t_graph, 61, &d2_g, 71, false, true);
 
     let mut d3_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);

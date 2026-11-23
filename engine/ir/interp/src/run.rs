@@ -365,7 +365,7 @@ fn run_on(
                 continue;
             }
             let args: Vec<&Tensor> = n.args.iter().map(value).collect();
-            let first = first_row(g, n, &sizes, parts, r)?;
+            let (first, whole_col) = split_range(g, n, &sizes, parts, r)?;
             outs.push(match &n.op {
                 Op::View(View::Reshape(_)) => args[0].reshaped(wants[r].clone()),
                 // Whole kept rows are the same on every rank.
@@ -377,6 +377,10 @@ fn run_on(
                     let (seqs, ctx) = (sizes.expr(&kept[0])?, sizes.expr(&kept[1])?);
                     let rows = [args[0], args[1], args[2]];
                     store.rank(r).append(*i as usize, rows, seqs, ctx)?
+                }
+                Op::Select(Select::TopK { .. }) => {
+                    let k = *wants[r].last().expect("verified rank");
+                    top_k(args[0], k, first, whole_col)?
                 }
                 Op::Row(row) if joins(row).is_some() => {
                     let at = joins(row).expect("found");
@@ -438,6 +442,28 @@ fn first_row(g: &Graph, n: &Node, sizes: &Sizes, parts: &Parts, r: usize) -> Res
         }
         _ => Ok(0),
     }
+}
+
+/// Global `(first, whole)` for a split select op.
+fn split_range(
+    g: &Graph,
+    n: &Node,
+    sizes: &Sizes,
+    parts: &Parts,
+    r: usize,
+) -> Result<(usize, usize), Error> {
+    if matches!(n.op, Op::Select(Select::TopK { .. } | Select::Take))
+        && let Some(x) = n.args.first().map(|a| g.node(*a))
+    {
+        let last = x.ty.rank().saturating_sub(1) as u32;
+        let whole = *sizes.shape(&x.ty.shape)?.last().unwrap_or(&0);
+        if x.ty.placement == (Placement::Split { axis: last }) {
+            let (first, _) = part(parts, last, whole, r)?;
+            return Ok((first, whole));
+        }
+        return Ok((0, whole));
+    }
+    Ok((first_row(g, n, sizes, parts, r)?, 0))
 }
 
 /// Run order: a leaf waits for its first reader.
@@ -550,8 +576,11 @@ impl Context<'_> {
             Op::Mask(mask) => masked(*mask, args[0]),
             Op::Row(row) => self.stages(num, &row.0, args),
             Op::Select(Select::Gather) => cpu::gather(args[0], args[1], self.first),
-            Op::Select(Select::Take) => cpu::take(args[0], args[1]),
-            Op::Select(Select::TopK { k }) => top_k(args[0], self.sizes.expr(k)?),
+            Op::Select(Select::Take) => cpu::take(args[0], args[1], self.first),
+            Op::Select(Select::TopK { k }) => {
+                let width = args[0].rows().1;
+                top_k(args[0], self.sizes.expr(k)?, 0, width)
+            }
             Op::Append(_) => lacks("kept rows outside a launch"),
             Op::View(View::Concat) => concat(args[0], args[1]),
             Op::View(v) => self.view(v, args[0]),
@@ -587,16 +616,21 @@ impl Context<'_> {
 }
 
 /// Each row's largest finite entries, best first.
-fn top_k(x: &Tensor, k: usize) -> Result<Tensor, Error> {
+fn top_k(x: &Tensor, k: usize, first: usize, whole: usize) -> Result<Tensor, Error> {
     let (_, width) = x.rows();
     let mut ids = Vec::with_capacity(x.len() / width.max(1) * k);
     for row in x.floats()?.chunks(width.max(1)) {
         let mut order: Vec<usize> = (0..width).filter(|i| row[*i] > f32::NEG_INFINITY).collect();
         // A stable sort keeps the lower index. 0.0 ties -0.0.
         order.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(Ordering::Equal));
-        // Spare slots hold the width.
-        order.resize(k, width);
-        ids.extend(order.into_iter().take(k).map(|i| i as u32));
+        let mut picks: Vec<u32> = order
+            .into_iter()
+            .take(k)
+            .map(|i| (first + i) as u32)
+            .collect();
+        // Spare slots hold the whole row width.
+        picks.resize(k, whole as u32);
+        ids.extend(picks);
     }
     let mut shape = x.shape.clone();
     *shape.last_mut().expect("verified rank") = k;

@@ -3,6 +3,7 @@
 pub mod clip;
 pub mod decoder;
 pub mod dflash;
+mod dflash_shard;
 pub mod eg2;
 pub mod flux2;
 pub mod gemma4;
