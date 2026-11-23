@@ -242,7 +242,7 @@ impl Golden {
     }
 
     /// Each probe's mean row on the interpreter, shortest case only.
-    fn probes(&self, model: &str, reference: &Reference) {
+    fn probes(&self, model: &str, release: &Graph, reference: &Reference) {
         let case = &reference.cases[0];
         for check in self.checks {
             let Compare::Layers(probe, layers) = check.compare else {
@@ -252,7 +252,8 @@ impl Golden {
             let want = case.output(check.name);
             for &n in layers {
                 let g = probe(n);
-                let w = safetensors(model, &g, file);
+                let w = reused(release, &reference.weights, &g);
+                let w = w.unwrap_or_else(|| safetensors(model, &g, file));
                 let out = interpreted(&g, &w, case.seqs, &case.tokens);
                 let got = mean_rows(&out, case.tokens.len());
                 let at = (n as usize - 1) * got.len();
@@ -263,6 +264,16 @@ impl Golden {
             }
         }
     }
+}
+
+/// `probe`'s weights from the release graph's, matched by path.
+fn reused(release: &Graph, weights: &[Tensor], probe: &Graph) -> Option<Vec<Tensor>> {
+    let mut out = Vec::with_capacity(probe.weights.len());
+    for w in &probe.weights {
+        let at = release.weights.iter().position(|r| r.path == w.path)?;
+        out.push(weights[at].clone());
+    }
+    Some(out)
 }
 
 pub fn unit(v: &[f32]) -> Vec<f32> {
@@ -289,11 +300,11 @@ pub fn golden(spec: &Spec) {
     let Some(reference) = golden.reference(spec.name, &g) else {
         return eprintln!("{}: no reference here; skipped", spec.name);
     };
-    for case in &reference.cases {
-        let out = interpreted(&g, &reference.weights, case.seqs, &case.tokens);
-        golden.release(&format!("{} cpu", case.name), &out, case);
-    }
-    golden.probes(spec.name, &reference);
+    // Slow on a real model: the plans check every case.
+    let case = &reference.cases[0];
+    let out = interpreted(&g, &reference.weights, case.seqs, &case.tokens);
+    golden.release(&format!("{} cpu", case.name), &out, case);
+    golden.probes(spec.name, &g, &reference);
     for settings in runs() {
         if settings.gpu().is_none() && !golden.anywhere {
             continue;
