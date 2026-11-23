@@ -13,9 +13,6 @@ use tessera_testkit::graphs::{
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
-/// Weight bytes one chain run reads, past current caches.
-const STREAMED: u64 = 128 << 20;
-
 /// A timed plan holds at most this many elements.
 const ROOM: usize = 750_000_000;
 
@@ -32,6 +29,8 @@ pub struct Grid {
     pub heads: Vec<[u64; 3]>,
     /// Queries and keys of one attention.
     pub spans: Vec<[u64; 2]>,
+    /// Weight bytes one chain run reads, past current caches.
+    pub streamed: u64,
 }
 
 /// A graph, with each size to time it at.
@@ -135,6 +134,7 @@ impl Grid {
                 [128, 128],
                 [512, 512],
             ],
+            streamed: 128 << 20,
         }
     }
 
@@ -146,17 +146,19 @@ impl Grid {
             vocabs: vec![32_768],
             heads: vec![[16, 8, 64]],
             spans: vec![[1, 16], [1, 128], [16, 16], [64, 64]],
+            streamed: 128 << 20,
         }
     }
 
-    /// Enough to reach every rule, in well under a second.
+    /// Enough to reach every rule, with short chains.
     pub fn tiny() -> Self {
         Self {
             rows: vec![1, 3],
             widths: vec![16],
-            vocabs: vec![300],
+            vocabs: vec![64],
             heads: vec![[4, 2, 16]],
             spans: vec![[1, 5], [4, 4]],
+            streamed: 4 << 10,
         }
     }
 
@@ -186,10 +188,10 @@ impl Grid {
                 for (pins, bytes) in [(Pins::default(), 4), (Pins::all(BF16_FORM), 2)] {
                     let weight = k * n * bytes;
                     // A weight this large is cold in its own sample.
-                    if 4 * weight > STREAMED {
+                    if 4 * weight > self.streamed {
                         continue;
                     }
-                    let pairs = (STREAMED / (2 * weight)).clamp(1, 32);
+                    let pairs = (self.streamed / (2 * weight)).clamp(1, 32);
                     let mut case = pinned(chain(&one, k, n, pairs), pins);
                     case.cold = true;
                     cases.push(case);

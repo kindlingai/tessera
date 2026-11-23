@@ -234,18 +234,18 @@ fn faux_check(
     g: &Graph,
     data: &(Vec<Tensor>, Vec<Tensor>),
     settings: &Settings,
-    device: Device,
+    pins: &Pins,
+    plan: Plan,
 ) -> Box<dyn Run> {
     let (weights, inputs) = data;
     // The interpreter sees the weights after their form's round trip.
     let mut kept = Vec::with_capacity(weights.len());
     for (t, w) in weights.iter().zip(&g.weights) {
-        let form = device.pins.form(&w.path);
+        let form = pins.form(&w.path);
         let floats = form.roundtrip(t.floats().unwrap());
         kept.push(Tensor::f32(t.shape.clone(), floats));
     }
     let want = run(g, &kept, 0, inputs).unwrap();
-    let plan = lower(g, 0, &FAUX, &device).unwrap();
     let mut runner = loaded(plan, g, &kept, settings);
     let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
     let got = runner.run(&feeds).unwrap().remove(0);
@@ -279,7 +279,7 @@ pub fn native(spec: &Spec) {
         let native = names.iter().filter(|n| n.starts_with("cpu_")).count();
         assert!(native > 0, "{}: no native kernels in {names:?}", spec.name);
         let label = format!("{} native as {form}", spec.name);
-        let runner = faux_check(&label, &g, &data, &cpu, device);
+        let runner = faux_check(&label, &g, &data, &cpu, &device.pins, plan);
         let (compiled, made) = runner.compiled();
         assert_eq!(compiled, made, "{label}: every tree compiles");
     }
@@ -293,13 +293,9 @@ pub fn faux(spec: &Spec) {
     let forms = ["f32", "bf16", "q8_0", "q4_0", "nvfp4"];
     for (settings, form) in runs().iter().flat_map(|s| forms.map(|f| (s, f))) {
         let device = Device::guess(settings).pinned(fitted(&g, named(form).unwrap()));
-        faux_check(
-            &format!("{} as {form}", spec.name),
-            &g,
-            &data,
-            settings,
-            device,
-        );
+        let plan = lower(&g, 0, &FAUX, &device).unwrap();
+        let label = format!("{} as {form}", spec.name);
+        faux_check(&label, &g, &data, settings, &device.pins, plan);
     }
 }
 
@@ -308,16 +304,21 @@ pub fn faux_rules(spec: &Spec) {
     let Some(small) = spec.small else { return };
     let g = small();
     let data = faux_data(&g);
-    let runs = runs();
-    let pairs = runs
-        .iter()
-        .flat_map(|s| rules().into_iter().map(move |r| (s, r)));
-    for (settings, rule) in pairs {
+    for settings in &runs() {
         for form in ["f32", "bf16"] {
-            let pins = Pins::all(named(form).unwrap());
-            let device = Device::guess(settings).favoring(rule.name).pinned(pins);
-            let label = format!("{} favoring {} as {form}", spec.name, rule.name);
-            faux_check(&label, &g, &data, settings, device);
+            let mut seen: Vec<Plan> = Vec::new();
+            for rule in rules() {
+                let pins = Pins::all(named(form).unwrap());
+                let device = Device::guess(settings).favoring(rule.name).pinned(pins);
+                let plan = lower(&g, 0, &FAUX, &device).unwrap();
+                // Equal plans run once.
+                if seen.contains(&plan) {
+                    continue;
+                }
+                seen.push(plan.clone());
+                let label = format!("{} favoring {} as {form}", spec.name, rule.name);
+                faux_check(&label, &g, &data, settings, &device.pins, plan);
+            }
         }
     }
 }

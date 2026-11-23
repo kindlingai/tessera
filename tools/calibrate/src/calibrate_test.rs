@@ -63,6 +63,7 @@ fn cpu_matmuls_compete() {
         vocabs: vec![64],
         heads: vec![[4, 2, 16]],
         spans: vec![[4, 4]],
+        streamed: 4 << 10,
     };
     let mut host = Device::guess(&cpu);
     let timed = grid.run(&mut host, &cpu).unwrap();
