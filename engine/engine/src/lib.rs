@@ -21,12 +21,14 @@ mod metrics_test;
 mod model;
 mod ranks;
 mod schedule;
+mod speculate;
 
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use kept::Totals;
 pub use model::Model;
 pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
+pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample};
 
 // The front end reaches the engine crates only through these.
 pub use tessera_device::{sums, whole};
@@ -38,7 +40,7 @@ pub use tessera_lower::{Compute, Pick, Pins, Recipe, Settings, Site, Weight, for
 pub use tessera_mem::form as storage;
 pub use tessera_mem::{block, trellis};
 pub use tessera_models::{
-    Stack, Steps, clip, decoder, eg2, flux2, gemma4, keys, mla, qwen35, sprite, tagger, vae,
+    Stack, Steps, clip, decoder, dflash, eg2, flux2, gemma4, keys, mla, qwen35, sprite, tagger, vae,
 };
 pub use tessera_run::{Grid, gpu, pinning};
 pub use tessera_trace::{Linear, Norm};
@@ -115,6 +117,25 @@ pub enum Error {
     Scores,
     #[error("a bucketed dimension sits inside a larger axis")]
     BucketAxis,
+    #[error("the graph has no tap output")]
+    Taps,
+}
+
+/// Width of each tapped row, if entry 0 emits taps.
+fn tap_width(g: &Graph) -> Option<usize> {
+    let out = g.entries[0].outputs.iter().find(|o| o.role == Role::Taps)?;
+    let last = g.node(out.node).ty.shape.0.last()?;
+    last.value(&g.dims, &|_| None).map(|n| n as usize)
+}
+
+/// Width of each logits row, if entry 0 emits logits.
+fn logits_width(g: &Graph) -> Option<usize> {
+    let out = g.entries[0]
+        .outputs
+        .iter()
+        .find(|o| o.role == Role::Logits)?;
+    let last = g.node(out.node).ty.shape.0.last()?;
+    last.value(&g.dims, &|_| None).map(|n| n as usize)
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.
@@ -132,6 +153,10 @@ pub struct Engine {
     words: Option<usize>,
     /// Whether entry 1 picks among candidate ids.
     sparse: bool,
+    /// Floats per tapped row, if entry 0 emits taps.
+    taps: Option<usize>,
+    /// Vocabulary width of entry 0's logits output.
+    vocab: Option<usize>,
     /// Carries rank 0's launches to the other ranks.
     control: Option<Box<dyn comm::Transport>>,
     /// Launches per profile report, and launches since the last.
@@ -271,6 +296,8 @@ impl Engine {
         let device = ranked(device);
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
+        let taps = tap_width(&graph);
+        let vocab = logits_width(&graph);
         Ok(Self {
             graph,
             runner,
@@ -281,6 +308,8 @@ impl Engine {
             lanes,
             words,
             sparse,
+            taps,
+            vocab,
             control: None,
             profile: settings.profile.map(|every| [every, 0]),
             held: None,
@@ -335,10 +364,52 @@ impl Engine {
         self.words
     }
 
+    /// Floats per tapped row, if entry 0 emits taps.
+    pub fn tap_width(&self) -> Option<usize> {
+        self.taps
+    }
+
+    /// Maximum sequence length in tokens.
+    pub fn context(&self) -> usize {
+        self.context
+    }
+
     /// One launch of `rows`: the likeliest token after each.
     pub fn step(&mut self, rows: &[Row]) -> Result<Vec<u32>, Error> {
         let all: Vec<u32> = (0..rows.len() as u32).collect();
         self.launch(rows, &all, Head::Full(None))
+    }
+
+    /// One launch of `rows`: likeliest tokens and tapped states.
+    pub fn step_taps(&mut self, rows: &[Row]) -> Result<(Vec<u32>, Vec<f32>), Error> {
+        let width = self.taps.ok_or(Error::Taps)?;
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let wants = Wants::roles(&self.graph, 0, &[Role::Tokens, Role::Taps]);
+        let outputs = self.run(rows, &all, Head::Full(None), wants)?;
+        let mut ids = self.runner.ids(outputs[0])?;
+        ids.truncate(rows.len());
+        let raw = self.runner.read(outputs[1])?;
+        let taps = raw.floats().map_err(tessera_run::Error::from)?;
+        let taps = taps[..rows.len() * width].to_vec();
+        self.report();
+        Ok((ids, taps))
+    }
+
+    /// One launch of `rows`: full logits and tapped states.
+    pub fn step_logits(&mut self, rows: &[Row]) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let width = self.taps.ok_or(Error::Taps)?;
+        let vocab = self.vocab.ok_or(Error::Scores)?;
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let wants = Wants::roles(&self.graph, 0, &[Role::Logits, Role::Taps]);
+        let outputs = self.run(rows, &all, Head::Full(None), wants)?;
+        let raw_logits = self.runner.read(outputs[0])?;
+        let logits = raw_logits.floats().map_err(tessera_run::Error::from)?;
+        let logits = logits[..rows.len() * vocab].to_vec();
+        let raw_taps = self.runner.read(outputs[1])?;
+        let taps = raw_taps.floats().map_err(tessera_run::Error::from)?;
+        let taps = taps[..rows.len() * width].to_vec();
+        self.report();
+        Ok((logits, taps))
     }
 
     /// One launch: the likeliest token after each slot's last row.

@@ -1,5 +1,8 @@
 //! A Hugging Face model directory: graph, weights, tokenizer, template.
 
+pub mod dflash;
+#[cfg(test)]
+mod dflash_test;
 pub mod encoder;
 pub mod flux2;
 mod gguf;
@@ -376,18 +379,34 @@ pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Erro
 /// User rules go last. `manifest` picks exlr8 widths.
 pub fn load_named(
     dir: &Path,
-    [slots, context]: [u64; 2],
+    sizes: [u64; 2],
     user: &[Rule],
     steps: Steps,
     overrides: &Overrides,
     manifest: Option<&str>,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
+    load_tapped(dir, sizes, user, steps, overrides, manifest, &[])
+}
+
+/// As `load_named`, with 1-based layer `taps` on stepping.
+pub(crate) fn load_tapped(
+    dir: &Path,
+    [slots, context]: [u64; 2],
+    user: &[Rule],
+    steps: Steps,
+    overrides: &Overrides,
+    manifest: Option<&str>,
+    taps: &[u64],
+) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     if dir.is_file() {
+        if !taps.is_empty() {
+            return Err("gguf checkpoints do not support step taps yet".into());
+        }
         return gguf::load(dir, slots, context, user, steps);
     }
     let json = overrides.merged("config.json", &dir.join("config.json"))?;
     if mla::config(&json, slots, context).is_ok() {
-        let release = mla::stepping(dir, [slots, context], WIDTH, user, steps)?;
+        let release = mla::stepping(dir, [slots, context], WIDTH, user, steps, taps)?;
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(
             dir,
@@ -400,6 +419,9 @@ pub fn load_named(
     let arch = serde_json::from_str::<Arch>(&json)?.model_type;
     let (graph, layers, rules) = match arch.as_deref() {
         Some("gemma4") => {
+            if !taps.is_empty() {
+                return Err("gemma4 does not support step taps yet".into());
+            }
             let mut c = overrides.config(dir, |k| gemma4::Config::read(k, slots, context))?;
             c.stack.steps = steps;
             let rules = names::repo("gemma4").unwrap_or_default();
@@ -414,6 +436,7 @@ pub fn load_named(
         _ => {
             let (arch, mut config) = config(dir, [slots, context], overrides)?;
             config.stack.steps = steps;
+            config.stack.taps = taps.to_vec();
             let graph = stepper(&arch, &config)
                 .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
             (graph, config.stack.layers, Vec::new())
@@ -428,7 +451,10 @@ pub fn load_named(
 }
 
 /// `dir`'s exlr8 release at `name`, or its only manifest.
-fn release(dir: &Path, name: Option<&str>) -> Result<exlr8::Release, Box<dyn Error + Send + Sync>> {
+pub(crate) fn release(
+    dir: &Path,
+    name: Option<&str>,
+) -> Result<exlr8::Release, Box<dyn Error + Send + Sync>> {
     let release = exlr8::Release::open(dir);
     let all = release.manifests();
     let name = match (name, all.as_slice()) {

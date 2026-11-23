@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 use tessera_bundle::Overrides;
 use tessera_engine::wasm::Module;
-use tessera_engine::{Batch, Fair, Pins, Recipe, Settings, Steps};
+use tessera_engine::{Batch, Drafter, Engine, Fair, Pins, Recipe, Settings, Speculate, Steps};
 use tessera_tasks::api::{Embed, GenerateImage, Info, Score, Tokens};
 use tessera_tasks::klein::Klein;
 use tessera_tasks::paint::Painter;
@@ -16,7 +16,7 @@ use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
 /// The flags for `Options::flag` and `Options::switch`.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
-[--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix] \
+[--draft <dir>] [--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix] \
 [--require-favored] [--manifest <name>]";
 
 /// The loaded model's task.
@@ -60,6 +60,8 @@ pub struct Options {
     pub image_size: usize,
     /// The CLIP text tower for `paint`. `None` takes `model/clip`.
     pub clip: Option<PathBuf>,
+    /// DFlash drafter directory for speculative decoding.
+    pub draft: Option<PathBuf>,
     /// A recipe module that may build the model's graph.
     pub module: Option<Arc<Module>>,
     /// Lowering choices. Empty pins take the model's own.
@@ -91,6 +93,7 @@ impl Default for Options {
             max_connections: 64,
             image_size: 512,
             clip: None,
+            draft: None,
             module: None,
             lower: None,
             names: None,
@@ -129,6 +132,7 @@ impl Options {
             "--task" if value == "image" => self.task = Task::Image,
             "--image-size" => self.image_size = value.parse().ok()?,
             "--clip" => self.clip = Some(value.into()),
+            "--draft" => self.draft = Some(value.into()),
             _ => return self.ranks.flag(flag, &value),
         }
         Some(())
@@ -188,16 +192,97 @@ pub(crate) fn pipeline(options: &Options) -> Result<String, String> {
     class.map_err(|e| format!("--task image needs a class in {FILE} or the recipe:\n{e}"))
 }
 
-/// Loads the generator, fills `slot`, then steps jobs.
-fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
-    let start = Instant::now();
-    let links = o.ranks.join(settings)?;
-    let rules = match &settings.names {
+/// Loads optional user weight-name rules from `settings`.
+fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::names::Rule>, String> {
+    match &settings.names {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
-            .and_then(|text| tessera_bundle::names::rules(&text).map_err(|e| e.to_string()))?,
-        None => Vec::new(),
-    };
+            .and_then(|text| tessera_bundle::names::rules(&text).map_err(|e| e.to_string())),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Loads a target and DFlash drafter, then answers requests.
+fn draft_thread(
+    o: &Options,
+    draft_dir: &std::path::Path,
+    settings: &Settings,
+    info: Info,
+    slot: &Slot,
+) -> Result<(), String> {
+    if o.guided || !o.ranks.alone() {
+        return Err("--draft cannot combine with --guided or multi-rank yet".into());
+    }
+    let start = Instant::now();
+    let rules = user_rules(settings)?;
+    let at = [1u64, o.max_model_len as u64];
+    let manifest = o.manifest.as_deref();
+    let pair = tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
+        .map_err(|e| e.to_string())?;
+    let mut recipe = lowering(o, pair.target.pins);
+    if recipe.config.is_none() {
+        recipe.config = pair.target.config;
+    }
+    let mut engine = Engine::open(pair.target.graph, o.max_model_len, &recipe, settings)
+        .map_err(|e| e.to_string())?;
+    pair.target
+        .weights
+        .each(|idx, w| engine.load_weight(idx, w))
+        .map_err(|e| e.to_string())?;
+    let draft_recipe = lowering(o, Some(pair.pins));
+    let mut drafter = Drafter::open(
+        pair.graph,
+        o.max_model_len,
+        pair.block,
+        pair.mask_token,
+        &draft_recipe,
+        settings,
+    )
+    .map_err(|e| e.to_string())?;
+    drafter.load(&pair.weights).map_err(|e| e.to_string())?;
+    let seconds = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{}: loaded target + dflash (block {}) in {seconds:.1} s",
+        engine.device(),
+        pair.block
+    );
+    let generate = Arc::new(Generate {
+        tokenizer: pair.target.tokenizer,
+        template: pair.target.template,
+        stop: pair.target.stop,
+        guides: None,
+    });
+    let (queue, jobs) = mpsc::channel::<Job>();
+    let queued = Arc::new(Queued {
+        generate: generate.clone(),
+        jobs: Mutex::new(queue),
+    });
+    let _ = slot.set(Model {
+        info,
+        tokens: generate.clone(),
+        chat: Some(generate),
+        generator: Some(queued),
+        embed: None,
+        image: None,
+        score: None,
+        strict: o.strict,
+    });
+    let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
+    while let Ok((request, mut sink)) = jobs.recv() {
+        spec.generate(request, &mut sink)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Loads the generator, fills `slot`, then steps jobs.
+fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
+    if let Some(draft_dir) = &o.draft {
+        return draft_thread(o, draft_dir, settings, info, slot);
+    }
+    let start = Instant::now();
+    let links = o.ranks.join(settings)?;
+    let rules = user_rules(settings)?;
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
     // Ranks keep one entry, as they did before scoring.
     let steps = match (o.guided, o.ranks.alone()) {

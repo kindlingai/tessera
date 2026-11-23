@@ -402,4 +402,6 @@ pub enum Role {
     Allowed,
     /// The token ids each pick chooses from.
     Candidates,
+    /// Residual rows tapped after chosen layers.
+    Taps,
 }

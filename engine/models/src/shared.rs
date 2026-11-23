@@ -2,8 +2,8 @@
 
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, DType, Dim, DimExpr, DimName, EntryKind, Graph, Linear, Model, Pairs, PathSeg, Port, Role,
-    Tensor, TensorType, Vector, Weights,
+    Act, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Linear, Model, Pairs, PathSeg,
+    Port, Role, Tensor, TensorType, Vector, Weights,
 };
 
 /// A matrix a row multiplies into, however it is stored.
@@ -215,6 +215,7 @@ pub enum Steps {
 }
 
 /// Sizes every decoder stack here declares.
+#[derive(Clone, Debug)]
 pub struct Stack {
     pub vocab: u64,
     pub hidden: u64,
@@ -226,6 +227,8 @@ pub struct Stack {
     pub max_seqs: u64,
     pub max_context: u64,
     pub steps: Steps,
+    /// 1-based layers tapped during stepping.
+    pub taps: Vec<u64>,
 }
 
 /// Config keys for `Stack::sized`'s sizes, in its order.
@@ -255,6 +258,7 @@ impl Stack {
             max_seqs,
             max_context,
             steps: Steps::Plain,
+            taps: Vec::new(),
         }
     }
 
@@ -285,10 +289,60 @@ impl Stack {
     }
 }
 
+/// Declares `W`, plus an untied output head when needed.
+pub(crate) fn with_head<W: Weights>(m: &Model, tied: bool) -> (W, Option<Embed>) {
+    let w = tessera_trace::declare(m);
+    let mut path = vec![PathSeg::Field("head".into())];
+    let shape = [Vocab.into(), Hidden.into()];
+    let head = (!tied).then(|| Embed::declare(m, &mut path, &shape));
+    (w, head)
+}
+
 /// `[Seqs, n, ..]` from `a` then `b`, joined on axis 1.
 pub(crate) fn join(a: &Tensor, b: &Tensor) -> Tensor {
     let swap = [0, 2, 1];
     a.permute(&swap).concat(&b.permute(&swap)).permute(&swap)
+}
+
+/// `[a, width]` then `[b, width]`, joined on axis 0.
+pub(crate) fn join_rows(a: &Tensor, b: &Tensor) -> Tensor {
+    let swap = [1, 0];
+    a.permute(&swap).concat(&b.permute(&swap)).permute(&swap)
+}
+
+/// Captures 1-based layer outputs in requested order.
+pub(crate) struct TapSink<'a> {
+    layers: &'a [u64],
+    taken: Vec<Option<Tensor>>,
+}
+
+impl<'a> TapSink<'a> {
+    pub fn new(layers: &'a [u64]) -> Self {
+        Self {
+            layers,
+            taken: vec![None; layers.len()],
+        }
+    }
+
+    pub fn record(&mut self, at: u64, x: &Tensor) {
+        for (slot, &want) in self.taken.iter_mut().zip(self.layers) {
+            if want == at {
+                *slot = Some(x.clone());
+            }
+        }
+    }
+
+    pub fn join(self) -> Option<Tensor> {
+        if self.layers.is_empty() {
+            return None;
+        }
+        let mut iter = self
+            .taken
+            .into_iter()
+            .map(|t| t.unwrap_or_else(|| panic!("taps {:?} past the layers", self.layers)));
+        let first = iter.next()?;
+        Some(iter.fold(first, |all, t| all.concat(&t)))
+    }
 }
 
 /// `[Seqs, Hidden]` as `[Seqs, rows, Hidden]`.
@@ -359,11 +413,23 @@ pub(crate) fn sparse_ports(m: &Model) -> [Tensor; 4] {
     m.entry(EntryKind::Step, [t, p, s, ids])
 }
 
-/// Each row's likeliest allowed token, and its logits.
-pub(crate) fn pick(m: &Model, logits: &Tensor, allowed: Option<&Tensor>) -> Graph {
+/// Each row's likeliest allowed token, logits and optional taps.
+pub(crate) fn pick(
+    m: &Model,
+    logits: &Tensor,
+    allowed: Option<&Tensor>,
+    taps: Option<&Tensor>,
+) -> Graph {
     let logits = allowed.map_or_else(|| logits.clone(), |bits| logits.allow(bits));
     let ids = logits.top_k(1u64).reshape([Rows]);
-    m.finish([(Role::Tokens, &ids), (Role::Logits, &logits)])
+    match taps {
+        Some(taps) => m.finish([
+            (Role::Tokens, &ids),
+            (Role::Logits, &logits),
+            (Role::Taps, taps),
+        ]),
+        None => m.finish([(Role::Tokens, &ids), (Role::Logits, &logits)]),
+    }
 }
 
 /// `[Seqs, Context]` followed by `rest`.

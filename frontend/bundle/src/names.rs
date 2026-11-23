@@ -63,6 +63,7 @@ const ROLES: &[(&str, &[&[&str]])] = &[
     ),
     ("q_norm", &[&["attn", "q", "norm"], &["q", "norm"]]),
     ("k_norm", &[&["attn", "k", "norm"], &["k", "norm"]]),
+    ("hidden_norm", &[&["hidden", "norm"]]),
     (
         "embed",
         &[

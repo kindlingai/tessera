@@ -42,6 +42,7 @@ fn config(gguf: &Gguf, arch: &str, slots: u64, context: u64) -> Result<Config, F
             max_seqs: slots,
             max_context: context,
             steps: Steps::Plain,
+            taps: Vec::new(),
         },
         kv_heads: integer("attention.head_count_kv")?,
         rope_theta: float("rope.freq_base")?,

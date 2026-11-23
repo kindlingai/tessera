@@ -210,23 +210,25 @@ pub(crate) fn stepping(
     width: u32,
     user: &[Rule],
     steps: Steps,
+    taps: &[u64],
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(dir, sizes, width, Some((user, steps)))
+    open(dir, sizes, width, Some((user, steps, taps)))
 }
 
-/// A `step` gives the step graph its rules and mask.
+/// A `step` sets the graph's rules, mask and taps.
 fn open(
     dir: &Path,
     [seqs, context]: [u64; 2],
     width: u32,
-    step: Option<(&[Rule], Steps)>,
+    step: Option<(&[Rule], Steps, &[u64])>,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
     let json = std::fs::read_to_string(dir.join("config.json"))?;
     let mut config = config(&json, seqs, context)?;
     let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
     let mut rules = rules(&config, exlr8);
-    if let Some((user, steps)) = step {
+    if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
+        config.stack.taps = taps.to_vec();
         rules.extend(user.iter().cloned());
     }
     let graph = match (exlr8, step.is_some()) {

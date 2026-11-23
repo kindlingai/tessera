@@ -351,5 +351,5 @@ pub fn stepper<D: Dense>(c: &Config) -> Graph {
         step: Some((&slots, &caches)),
     };
     let logits = pass.logits(&w, &heads, &tokens);
-    shared::pick(&m, &logits, allowed.as_ref())
+    shared::pick(&m, &logits, allowed.as_ref(), None)
 }

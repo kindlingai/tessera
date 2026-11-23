@@ -24,8 +24,16 @@ impl Wants {
 
     /// The outputs of `entry` with `role`.
     pub fn role(g: &Graph, entry: usize, role: Role) -> Self {
+        Self::roles(g, entry, &[role])
+    }
+
+    /// The outputs of `entry` matching any of `roles`.
+    pub fn roles(g: &Graph, entry: usize, roles: &[Role]) -> Self {
         let outputs = g.entries.get(entry).map_or(&[][..], |e| &e.outputs);
-        let at = outputs.iter().enumerate().filter(|(_, o)| o.role == role);
+        let at = outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| roles.contains(&o.role));
         Self(at.fold(0, |bits, (i, _)| bits | 1 << i))
     }
 

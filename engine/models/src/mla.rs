@@ -1,6 +1,6 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
-use crate::shared::{Attend, Stack, Steps, pick, rows, step_ports, swiglu, tokens};
+use crate::shared::{Attend, Stack, Steps, TapSink, pick, rows, step_ports, swiglu, tokens};
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
@@ -256,29 +256,60 @@ pub fn forward<R: Routed>(
 
 impl Pass<'_> {
     fn logits<R: Routed>(&self, w: &Mla<R>, tokens: &Tensor) -> Tensor {
-        let (m, c) = (self.m, self.c);
-        let [logits] = m.composite(Composite::Model, || {
-            let mut x = m.embed(tokens, &w.embed);
-            let mut indexers = w.indexers.iter();
-            let mut keys: Option<Tensor> = None;
-            for l in 0..w.attn.len() {
-                let reused = keys.clone().filter(|_| !c.indexes(l as u64));
-                let read = match (reused, &c.index) {
-                    (Some(k), _) => Keys::Given(k),
-                    (None, None) => Keys::All,
-                    (None, Some(_)) => {
-                        Keys::Pick(indexers.next().expect("an indexer per indexing layer"))
-                    }
-                };
-                let picks = matches!(read, Keys::Pick(_));
-                let layer = || self.layer(w, l, &x, read);
-                let (out, picked) = self.region(Composite::Layer, picks, layer);
-                x = out;
-                keys = picked.or(keys);
-            }
-            [x.rms_norm(&w.norm, c.eps).matmul(&w.head)]
+        self.logits_taps(w, tokens, &[]).0
+    }
+
+    /// Logits, and joined tapped layers when requested.
+    fn logits_taps<R: Routed>(
+        &self,
+        w: &Mla<R>,
+        tokens: &Tensor,
+        layers: &[u64],
+    ) -> (Tensor, Option<Tensor>) {
+        if layers.is_empty() {
+            let [logits] = self.m.composite(Composite::Model, || {
+                let x = self.trunk(w, tokens, |_, _| {});
+                [x.rms_norm(&w.norm, self.c.eps).matmul(&w.head)]
+            });
+            return (logits, None);
+        }
+        let [logits, tapped] = self.m.composite(Composite::Model, || {
+            let mut sink = TapSink::new(layers);
+            let x = self.trunk(w, tokens, |at, row| sink.record(at, row));
+            let logits = x.rms_norm(&w.norm, self.c.eps).matmul(&w.head);
+            [logits, sink.join().expect("tap layers")]
         });
-        logits
+        (logits, Some(tapped))
+    }
+
+    /// The residual rows. `tap` sees each layer's, counting from 1.
+    fn trunk<R: Routed>(
+        &self,
+        w: &Mla<R>,
+        tokens: &Tensor,
+        mut tap: impl FnMut(u64, &Tensor),
+    ) -> Tensor {
+        let (m, c) = (self.m, self.c);
+        let mut x = m.embed(tokens, &w.embed);
+        let mut indexers = w.indexers.iter();
+        let mut keys: Option<Tensor> = None;
+        for l in 0..w.attn.len() {
+            let reused = keys.clone().filter(|_| !c.indexes(l as u64));
+            let read = match (reused, &c.index) {
+                (Some(k), _) => Keys::Given(k),
+                (None, None) => Keys::All,
+                (None, Some(_)) => {
+                    Keys::Pick(indexers.next().expect("an indexer per indexing layer"))
+                }
+            };
+            let picks = matches!(read, Keys::Pick(_));
+            let layer = || self.layer(w, l, &x, read);
+            let (out, picked) = self.region(Composite::Layer, picks, layer);
+            x = out;
+            keys = picked.or(keys);
+            tap(l as u64 + 1, &x);
+        }
+        x
     }
 
     /// One decoder layer, and the keys its attention picked.
@@ -556,6 +587,6 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
         positions: &positions,
         step: Some((&slots, (0..c.stack.layers).map(cache).collect())),
     };
-    let logits = pass.logits(&w, &tokens);
-    pick(&m, &logits, allowed.as_ref())
+    let (logits, taps) = pass.logits_taps(&w, &tokens, &c.stack.taps);
+    pick(&m, &logits, allowed.as_ref(), taps.as_ref())
 }

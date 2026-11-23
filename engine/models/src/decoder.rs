@@ -2,13 +2,14 @@
 
 use crate::keys::Keys;
 use crate::shared::{
-    Attend, Side, Stack, Steps, listed, pick, sparse_ports, step_ports, swiglu, tokens,
+    Attend, Side, Stack, Steps, TapSink, listed, pick, sparse_ports, step_ports, swiglu, tokens,
+    with_head,
 };
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
-    Norm, Pairs, PathSeg, Role, Size, Tensor, TensorType, Weights,
+    Norm, Pairs, Role, Size, Tensor, TensorType, Weights,
 };
 
 /// Steps a query or key head passes through before RoPE.
@@ -261,15 +262,6 @@ pub struct Decoder<N: HeadNorm, M: Mlp> {
     pub norm: Norm,
 }
 
-/// The trunk's weights, and the head's own table when untied.
-fn declared<N: HeadNorm, M: Mlp>(m: &Model, c: &Config) -> (Decoder<N, M>, Option<Embed>) {
-    let w = tessera_trace::declare(m);
-    let mut path = vec![PathSeg::Field("head".into())];
-    let shape = [Vocab.into(), Hidden.into()];
-    let head = (!c.tied).then(|| Embed::declare(m, &mut path, &shape));
-    (w, head)
-}
-
 /// One layer's kept keys and values.
 type Cache = [Kept; 2];
 
@@ -324,11 +316,32 @@ impl Pass<'_> {
         tokens: &Tensor,
         kept: Option<&[Cache]>,
     ) -> Tensor {
-        let [logits] = self.m.composite(Composite::Model, || {
-            let h = self.hidden(w, tokens, kept);
-            [scaled(h.unembed(self.head), self.c.scales.logits)]
+        self.logits_taps(w, tokens, kept, &[]).0
+    }
+
+    /// Logits, and joined tapped layers when requested.
+    fn logits_taps<N: HeadNorm, M: Mlp>(
+        &self,
+        w: &Decoder<N, M>,
+        tokens: &Tensor,
+        kept: Option<&[Cache]>,
+        layers: &[u64],
+    ) -> (Tensor, Option<Tensor>) {
+        if layers.is_empty() {
+            let [logits] = self.m.composite(Composite::Model, || {
+                let h = self.hidden(w, tokens, kept);
+                [scaled(h.unembed(self.head), self.c.scales.logits)]
+            });
+            return (logits, None);
+        }
+        let [logits, tapped] = self.m.composite(Composite::Model, || {
+            let mut sink = TapSink::new(layers);
+            let x = self.trunk(w, tokens, kept, |at, row| sink.record(at, row));
+            let h = x.rms_norm(&w.norm, self.c.eps);
+            let logits = scaled(h.unembed(self.head), self.c.scales.logits);
+            [logits, sink.join().expect("tap layers")]
         });
-        logits
+        (logits, Some(tapped))
     }
 
     /// Each row's normed state, before the unembed.
@@ -411,7 +424,7 @@ impl Pass<'_> {
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
-    let (w, head) = declared::<N, M>(&m, c);
+    let (w, head) = with_head::<Decoder<N, M>>(&m, c.tied);
     let [tokens, positions] = tokens(&m);
     let logits = forward(&m, c, (&w, head.as_ref()), &tokens, &positions);
     m.finish([(Role::Logits, &logits)])
@@ -420,7 +433,7 @@ pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
 /// Residual rows after `layers`, joined on the last axis.
 pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
     let m = Model::new(c.dims());
-    let (w, _) = declared::<N, M>(&m, c);
+    let (w, _) = with_head::<Decoder<N, M>>(&m, c.tied);
     // Key lists keep padding out of each row's attention.
     let [tokens, positions, keys] = listed(&m);
     let pass = Pass {
@@ -432,15 +445,9 @@ pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
         slots: None,
         keys: Some(&keys),
     };
-    let mut taken: Vec<Tensor> = Vec::new();
-    pass.trunk(&w, &tokens, None, |at, x| {
-        if layers.contains(&at) {
-            taken.push(x.clone());
-        }
-    });
-    assert_eq!(taken.len(), layers.len(), "taps {layers:?} past the layers");
-    let first = taken[0].clone();
-    let joined = taken[1..].iter().fold(first, |all, t| all.concat(t));
+    let mut sink = TapSink::new(layers);
+    pass.trunk(&w, &tokens, None, |at, x| sink.record(at, x));
+    let joined = sink.join().expect("at least one tap layer");
     m.finish([(Role::Logits, &joined)])
 }
 
@@ -450,7 +457,7 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
     let size = Size::Bounded(c.stack.max_context);
     dims.push(Dim { name: Rows, size });
     let m = Model::new(dims);
-    let (w, head) = declared::<N, M>(&m, c);
+    let (w, head) = with_head::<Decoder<N, M>>(&m, c.tied);
     let masked = c.stack.steps == Steps::Masked;
     let ([tokens, positions, slots], allowed) = step_ports(&m, masked);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
@@ -466,8 +473,8 @@ pub fn stepper<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {
         slots: Some(&slots),
         keys: None,
     };
-    let logits = pass.logits(&w, &tokens, Some(&kept));
-    let full = pick(&m, &logits, allowed.as_ref());
+    let (logits, taps) = pass.logits_taps(&w, &tokens, Some(&kept), &c.stack.taps);
+    let full = pick(&m, &logits, allowed.as_ref(), taps.as_ref());
     if c.stack.steps == Steps::Plain {
         return full;
     }
