@@ -30,16 +30,10 @@ pub enum Origin {
     Default,
 }
 
-macro_rules! default_recipe {
-    () => {
-        "examples/recipes/gemma4-e4b/recipe.toml"
-    };
-}
-
-/// The recipe text verbs fall back to.
+/// The fallback recipe for text verbs: path and text.
 pub const DEFAULT: (&str, &str) = (
-    default_recipe!(),
-    include_str!(concat!("../../../", default_recipe!())),
+    "frontend/cli/recipe/recipe.toml",
+    include_str!("../recipe/recipe.toml"),
 );
 
 /// The repository in a `--model hf:<owner>/<name>[@<revision>]` value.
