@@ -8,6 +8,7 @@ pub mod flux2;
 pub mod gemma4;
 pub mod keys;
 pub mod mla;
+pub mod mtp;
 pub mod nanogpt;
 pub mod qwen35;
 mod shared;

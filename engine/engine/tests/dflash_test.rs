@@ -1,10 +1,11 @@
 //! DFlash speculative decoding and tapped step tests.
 
-use std::net::{TcpListener, TcpStream};
-use tessera_engine::comm::Sockets;
+mod common;
+
+use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
 use tessera_engine::{
-    Drafter, Engine, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate,
-    accept_greedy, accept_sample,
+    Drafter, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate, accept_greedy,
+    accept_sample,
 };
 use tessera_graph::{Graph, Parts, PathSeg};
 use tessera_interp::{Store, Tensor, run_kept};
@@ -27,23 +28,6 @@ fn row(slot: u32, token: u32, position: u32) -> Row {
 fn step_feeds(rows: &[Row]) -> Vec<Tensor> {
     let col = |of: fn(&Row) -> u32| Tensor::u32(vec![rows.len()], rows.iter().map(of).collect());
     vec![col(|r| r.token), col(|r| r.position), col(|r| r.slot)]
-}
-
-fn collect_ids(events: &[Event]) -> Vec<u32> {
-    let mut out = Vec::new();
-    for e in events {
-        if let Event::Token(id) = e {
-            out.push(*id);
-        }
-    }
-    out
-}
-
-fn open_target(g: &Graph, w: &[Tensor], ctx: usize, s: &tessera_lower::Settings) -> Engine {
-    let mut engine = Engine::open(g.clone(), ctx, &Recipe::default(), s).unwrap();
-    let stored: Vec<Weight> = w.iter().cloned().map(Weight::Floats).collect();
-    engine.load(&stored).unwrap();
-    engine
 }
 
 fn open_drafter(
@@ -331,36 +315,13 @@ fn verify_tp_pair(
         backend: Pick::Host,
         ..Settings::default()
     };
-    let to_w = |g: &Graph, seed: u64| -> Vec<Weight> {
-        weights(g, &mut Noise(seed))
-            .into_iter()
-            .map(Weight::Floats)
-            .collect()
-    };
-    let [[s0, s1], [c0, c1]] = std::array::from_fn(|_| {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        let (b, _) = l.accept().unwrap();
-        [
-            Sockets::over(0, vec![None, Some(a)]).unwrap(),
-            Sockets::over(1, vec![Some(b), None]).unwrap(),
-        ]
-    });
+    let [[s0, s1], [c0, c1]] = loopback_links();
     let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
     let follower = std::thread::spawn(move || {
         let [ts1, ds1] = Drafter::share_transport(Box::new(s1));
         let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-        let (tw_f, dw_f) = (to_w(&tg_f, t_seed), to_w(&dg_f, d_seed));
-        let mut te = Engine::open_ranked(
-            tg_f,
-            24,
-            (&Recipe::default(), &s_f),
-            place(),
-            ts1,
-            Box::new(c1),
-        )
-        .unwrap();
-        te.load(&tw_f).unwrap();
+        let (tw_f, dw_f) = (float_weights(&tg_f, t_seed), float_weights(&dg_f, d_seed));
+        let mut te = open_ranked_target(tg_f, 24, &s_f, place(), ts1, c1, &tw_f);
         let mut dr = Drafter::open_ranked(
             dg_f,
             24,
@@ -379,18 +340,9 @@ fn verify_tp_pair(
     let [ts0, ds0] = Drafter::share_transport(Box::new(s0));
     let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
     let t_weights = weights(t_graph, &mut Noise(t_seed));
-    let tw = to_w(t_graph, t_seed);
-    let dw = to_w(d_graph, d_seed);
-    let mut target = Engine::open_ranked(
-        t_graph.clone(),
-        24,
-        (&Recipe::default(), &settings),
-        place(),
-        ts0,
-        Box::new(c0),
-    )
-    .unwrap();
-    target.load(&tw).unwrap();
+    let tw = float_weights(t_graph, t_seed);
+    let dw = float_weights(d_graph, d_seed);
+    let mut target = open_ranked_target(t_graph.clone(), 24, &settings, place(), ts0, c0, &tw);
     let mut drafter = Drafter::open_ranked(
         d_graph.clone(),
         24,

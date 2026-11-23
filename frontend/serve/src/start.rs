@@ -10,7 +10,8 @@ use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::wasm::Module;
 use tessera_engine::{
-    Batch, Drafter, Engine, Fair, Pins, Place, Recipe, Settings, Speculate, Steps,
+    Batch, Drafter, Engine, Fair, MtpDrafter, MtpSpeculate, Pins, Place, Recipe, Settings,
+    SpecStats, Speculate, Steps,
 };
 use tessera_tasks::api::{Embed, GenerateImage, Info, Score, Tokens};
 use tessera_tasks::klein::Klein;
@@ -20,8 +21,8 @@ use tessera_tasks::{Generate, Job, Queued, Threaded, Worker};
 /// The flags for `Options::flag` and `Options::switch`.
 pub const FLAGS: &str = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--served-model-name <name>] [--task generate|embed|image] [--image-size <px>] [--clip <dir>] \
-[--draft <dir>] [--max-connections <n>] [--reject-unknown-fields] [--guided] [--reuse-prefix] \
-[--require-favored] [--manifest <name>]";
+[--draft <dir>] [--mtp <k>] [--max-connections <n>] [--reject-unknown-fields] [--guided] \
+[--reuse-prefix] [--require-favored] [--manifest <name>]";
 
 /// The loaded model's task.
 #[derive(Clone, Copy, PartialEq)]
@@ -66,6 +67,8 @@ pub struct Options {
     pub clip: Option<PathBuf>,
     /// DFlash drafter directory for speculative decoding.
     pub draft: Option<PathBuf>,
+    /// Native MTP draft depth for speculative decoding.
+    pub mtp: Option<usize>,
     /// A recipe module that may build the model's graph.
     pub module: Option<Arc<Module>>,
     /// Lowering choices. Empty pins take the model's own.
@@ -100,6 +103,7 @@ impl Default for Options {
             image_size: 512,
             clip: None,
             draft: None,
+            mtp: None,
             module: None,
             lower: None,
             names: None,
@@ -140,6 +144,13 @@ impl Options {
             "--image-size" => self.image_size = value.parse().ok()?,
             "--clip" => self.clip = Some(value.into()),
             "--draft" => self.draft = Some(value.into()),
+            "--mtp" => {
+                let depth: usize = value.parse().ok()?;
+                if depth == 0 {
+                    return None;
+                }
+                self.mtp = Some(depth);
+            }
             _ => {
                 if flag == "--parts" {
                     let parts = value.split(',').map(|p| p.parse().ok());
@@ -310,6 +321,96 @@ fn open_drafter(
     Ok(drafter)
 }
 
+/// Opens a single-rank or TP-sharded MTP drafter and loads weights.
+fn open_mtp(
+    o: &Options,
+    links: Option<DraftLinks>,
+    pair: &tessera_bundle::mtp::Mtp,
+    settings: &Settings,
+) -> Result<MtpDrafter, String> {
+    let mut recipe = o.lower.clone().unwrap_or_default();
+    recipe.pins = pair.pins.clone();
+    recipe.kept = Recipe::default().kept;
+    if o.require_favored {
+        recipe.require_favored = true;
+    }
+    if recipe.config.is_none() {
+        recipe.config = pair.target.config.clone();
+    }
+    let mut drafter = match links {
+        Some((sums, grid)) => {
+            let gpu = settings.gpu().is_some();
+            let place = Place::mesh(sums.ranks() as usize, o.parts.clone(), gpu)
+                .with_grid(grid)
+                .with_moe_tp(o.ranks.moe_tp());
+            MtpDrafter::open_ranked(
+                pair.graph.clone(),
+                o.max_model_len,
+                (&recipe, settings),
+                place,
+                sums,
+            )
+        }
+        None => MtpDrafter::open(pair.graph.clone(), o.max_model_len, &recipe, settings),
+    }
+    .map_err(|e| e.to_string())?;
+    let count = drafter.weight_count();
+    let shares: Vec<_> = (0..count).map(|at| drafter.share(at)).collect();
+    pair.weights
+        .each_share(|at| shares[at as usize], |at, w| drafter.load_weight(at, w))
+        .map_err(|e| e.to_string())?;
+    Ok(drafter)
+}
+
+/// Serves speculative decode jobs over one target and drafter.
+fn serve_spec(
+    o: &Options,
+    settings: &Settings,
+    info: Info,
+    slot: &Slot,
+    target: tessera_bundle::Bundle,
+    label: &str,
+    mut run: impl FnMut(tessera_engine::Request, &mut tessera_engine::Sink) -> Result<SpecStats, String>,
+) -> Result<(), String> {
+    let generate = Arc::new(Generate {
+        tokenizer: target.tokenizer,
+        template: target.template,
+        stop: target.stop,
+        guides: None,
+    });
+    let (queue, jobs) = mpsc::channel::<Job>();
+    let queued = Arc::new(Queued {
+        generate: generate.clone(),
+        jobs: Mutex::new(queue),
+    });
+    let _ = slot.set(Model {
+        info,
+        tokens: generate.clone(),
+        chat: Some(generate),
+        generator: Some(queued),
+        embed: None,
+        image: None,
+        score: None,
+        strict: o.strict,
+    });
+    while let Ok((request, mut sink)) = jobs.recv() {
+        let t0 = Instant::now();
+        let stats = run(request, &mut sink)?;
+        if settings.profile.is_some() && stats.steps > 0 {
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms total)",
+                stats.emitted,
+                stats.steps,
+                stats.mean_step(),
+                ms / stats.steps as f64,
+                ms,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Loads a target and DFlash drafter, then answers requests.
 fn draft_thread(
     o: &Options,
@@ -340,53 +441,64 @@ fn draft_thread(
         let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let generate = Arc::new(Generate {
-        tokenizer: target.tokenizer,
-        template: target.template,
-        stop: target.stop,
-        guides: None,
-    });
-    let (queue, jobs) = mpsc::channel::<Job>();
-    let queued = Arc::new(Queued {
-        generate: generate.clone(),
-        jobs: Mutex::new(queue),
-    });
-    let _ = slot.set(Model {
-        info,
-        tokens: generate.clone(),
-        chat: Some(generate),
-        generator: Some(queued),
-        embed: None,
-        image: None,
-        score: None,
-        strict: o.strict,
-    });
     let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
-    while let Ok((request, mut sink)) = jobs.recv() {
-        let t0 = Instant::now();
-        let stats = spec
-            .generate(request, &mut sink)
-            .map_err(|e| e.to_string())?;
-        if settings.profile.is_some() && stats.steps > 0 {
-            let ms = t0.elapsed().as_secs_f64() * 1e3;
-            eprintln!(
-                "dflash: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms total)",
-                stats.emitted,
-                stats.steps,
-                stats.mean_step(),
-                ms / stats.steps as f64,
-                ms,
-            );
-        }
+    serve_spec(o, settings, info, slot, target, "dflash", |req, sink| {
+        spec.generate(req, sink).map_err(|e| e.to_string())
+    })?;
+    let _ = engine.dismiss();
+    Ok(())
+}
+
+/// Loads an MLA target and its MTP layer, then serves.
+fn mtp_thread(
+    o: &Options,
+    depth: usize,
+    settings: &Settings,
+    info: Info,
+    slot: &Slot,
+) -> Result<(), String> {
+    if o.guided {
+        return Err("--mtp cannot combine with --guided yet".into());
     }
+    let start = Instant::now();
+    let (target_links, draft_links) = split_links(o.ranks.join(settings)?);
+    let rules = user_rules(settings)?;
+    let at = [1u64, o.max_model_len as u64];
+    let manifest = o.manifest.as_deref();
+    let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
+        .map_err(|e| e.to_string())?;
+    let mut drafter = open_mtp(o, draft_links, &pair, settings)?;
+    let (mut engine, target) = open_target(o, target_links, pair.target, settings)?;
+    let seconds = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{}: loaded target + mtp (layer {}, depth {depth}) in {seconds:.1} s",
+        engine.device(),
+        pair.layer
+    );
+    if o.ranks.follows() {
+        let mut spec =
+            MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
+        return spec.follow().map_err(|e| e.to_string());
+    }
+    let mut spec =
+        MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
+    serve_spec(o, settings, info, slot, target, "mtp", |req, sink| {
+        spec.generate(req, sink).map_err(|e| e.to_string())
+    })?;
     let _ = engine.dismiss();
     Ok(())
 }
 
 /// Loads the generator, fills `slot`, then steps jobs.
 fn engine_thread(o: &Options, settings: &Settings, info: Info, slot: &Slot) -> Result<(), String> {
+    if o.draft.is_some() && o.mtp.is_some() {
+        return Err("--mtp cannot combine with --draft".into());
+    }
     if let Some(draft_dir) = &o.draft {
         return draft_thread(o, draft_dir, settings, info, slot);
+    }
+    if let Some(depth) = o.mtp {
+        return mtp_thread(o, depth, settings, info, slot);
     }
     let start = Instant::now();
     let links = o.ranks.join(settings)?;

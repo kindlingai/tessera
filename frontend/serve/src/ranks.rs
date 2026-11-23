@@ -79,6 +79,11 @@ impl Ranks {
         self.rank != 0
     }
 
+    /// Whether routed experts split along inner width.
+    pub(crate) fn moe_tp(&self) -> bool {
+        self.moe_tp
+    }
+
     /// Joins the peers, if any, before a long load.
     pub(crate) fn join(&self, settings: &Settings) -> Result<Option<Links>, String> {
         if self.peers.is_empty() && self.rank == 0 {

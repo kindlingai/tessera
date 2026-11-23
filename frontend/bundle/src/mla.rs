@@ -82,83 +82,116 @@ pub fn config(json: &str, seqs: u64, context: u64) -> Result<Config, serde_json:
     })
 }
 
+const ATTENTION: [(&str, &str); 8] = [
+    ("norm", "input_layernorm"),
+    ("q_a", "self_attn.q_a_proj"),
+    ("q_norm", "self_attn.q_a_layernorm"),
+    ("q_b", "self_attn.q_b_proj"),
+    ("kv_a", "self_attn.kv_a_proj_with_mqa"),
+    ("kv_norm", "self_attn.kv_a_layernorm"),
+    ("kv_b", "self_attn.kv_b_proj"),
+    ("o", "self_attn.o_proj"),
+];
+
+const INDEXER: [(&str, &str); 5] = [
+    ("wq", "wq_b"),
+    ("wk", "wk"),
+    ("k_norm", "k_norm"),
+    ("k_bias", "k_norm.bias"),
+    ("weights", "weights_proj"),
+];
+
+const MLP: [(&str, &str); 3] = [
+    ("gate", "gate_proj"),
+    ("up", "up_proj"),
+    ("down", "down_proj"),
+];
+
+/// Adds attention, indexer and MLP norm rules for one layer.
+pub(crate) fn attn_rules(
+    layer: u64,
+    attn_prefix: &str,
+    mlp_norm: &str,
+    indexer_prefix: Option<&str>,
+    rules: &mut Vec<Rule>,
+) {
+    let at = format!("model.layers.{layer}");
+    for (field, stem) in ATTENTION {
+        rules.push((format!("{attn_prefix}.{field}"), format!("{at}.{stem}")));
+    }
+    rules.push((mlp_norm.into(), format!("{at}.post_attention_layernorm")));
+    if let Some(prefix) = indexer_prefix {
+        for (field, stem) in INDEXER {
+            rules.push((
+                format!("{prefix}.{field}"),
+                format!("{at}.self_attn.indexer.{stem}"),
+            ));
+        }
+    }
+}
+
+/// Adds routed and shared expert rules for one MoE layer.
+pub(crate) fn moe_rules(layer: u64, moe_prefix: &str, rotated: bool, rules: &mut Vec<Rule>) {
+    let at = format!("model.layers.{layer}");
+    rules.push((format!("{moe_prefix}.router"), format!("{at}.mlp.gate")));
+    rules.push((
+        format!("{moe_prefix}.router_bias"),
+        format!("{at}.mlp.gate.e_score_correction_bias"),
+    ));
+    for side in ["signs_in", "signs_out"].iter().filter(|_| rotated) {
+        rules.push((
+            format!("{moe_prefix}.{side}"),
+            format!("{at}.mlp.experts.{side}"),
+        ));
+    }
+    for (field, stem) in MLP {
+        let shared = format!("{at}.mlp.shared_experts.{stem}");
+        rules.push((format!("{moe_prefix}.shared.{field}"), shared));
+        if !rotated {
+            let experts = format!("{at}.mlp.experts.{{}}.{stem}");
+            rules.push((format!("{moe_prefix}.{field}"), experts));
+            continue;
+        }
+        let set = format!("{at}.mlp.experts.{field}");
+        for end in ["su", "sv"] {
+            rules.push((
+                format!("{moe_prefix}.{field}_{end}"),
+                format!("{set}.{end}"),
+            ));
+        }
+        rules.push((format!("{moe_prefix}.{field}"), set));
+    }
+}
+
 /// Each weight's HF slice. `rotated` names GLM's exlr8 experts.
 pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
     let mut rules: Vec<Rule> = Vec::new();
-    let mut add = |path: String, stem: String| rules.push((path, stem));
-    add("embed".into(), "model.embed_tokens".into());
-    add("norm".into(), "model.norm".into());
-    add("head".into(), "lm_head".into());
-    let attention = [
-        ("norm", "input_layernorm"),
-        ("q_a", "self_attn.q_a_proj"),
-        ("q_norm", "self_attn.q_a_layernorm"),
-        ("q_b", "self_attn.q_b_proj"),
-        ("kv_a", "self_attn.kv_a_proj_with_mqa"),
-        ("kv_norm", "self_attn.kv_a_layernorm"),
-        ("kv_b", "self_attn.kv_b_proj"),
-        ("o", "self_attn.o_proj"),
-    ];
-    let indexer = [
-        ("wq", "wq_b"),
-        ("wk", "wk"),
-        ("k_norm", "k_norm"),
-        ("k_bias", "k_norm.bias"),
-        ("weights", "weights_proj"),
-    ];
-    let mlp = [
-        ("gate", "gate_proj"),
-        ("up", "up_proj"),
-        ("down", "down_proj"),
-    ];
+    rules.push(("embed".into(), "model.embed_tokens".into()));
+    rules.push(("norm".into(), "model.norm".into()));
+    rules.push(("head".into(), "lm_head".into()));
     let mut indexers = 0;
     for l in 0..c.stack.layers {
-        let at = format!("model.layers.{l}");
-        for (field, stem) in attention {
-            add(format!("attn.{l}.{field}"), format!("{at}.{stem}"));
-        }
-        add(
-            format!("mlp_norm.{l}"),
-            format!("{at}.post_attention_layernorm"),
-        );
-        if c.indexes(l) {
-            for (field, stem) in indexer {
-                let path = format!("indexers.{indexers}.{field}");
-                add(path, format!("{at}.self_attn.indexer.{stem}"));
-            }
+        let idx = c.indexes(l).then(|| {
+            let p = format!("indexers.{indexers}");
             indexers += 1;
-        }
+            p
+        });
+        attn_rules(
+            l,
+            &format!("attn.{l}"),
+            &format!("mlp_norm.{l}"),
+            idx.as_deref(),
+            &mut rules,
+        );
         // Routed layers count from the first one.
         let Some(m) = l.checked_sub(c.dense_layers) else {
-            for (field, stem) in mlp {
-                add(format!("dense.{l}.{field}"), format!("{at}.mlp.{stem}"));
+            let at = format!("model.layers.{l}");
+            for (field, stem) in MLP {
+                rules.push((format!("dense.{l}.{field}"), format!("{at}.mlp.{stem}")));
             }
             continue;
         };
-        add(format!("moe.{m}.router"), format!("{at}.mlp.gate"));
-        let bias = format!("{at}.mlp.gate.e_score_correction_bias");
-        add(format!("moe.{m}.router_bias"), bias);
-        for side in ["signs_in", "signs_out"].iter().filter(|_| rotated) {
-            add(
-                format!("moe.{m}.{side}"),
-                format!("{at}.mlp.experts.{side}"),
-            );
-        }
-        for (field, stem) in mlp {
-            let shared = format!("{at}.mlp.shared_experts.{stem}");
-            add(format!("moe.{m}.shared.{field}"), shared);
-            if !rotated {
-                let experts = format!("{at}.mlp.experts.{{}}.{stem}");
-                add(format!("moe.{m}.{field}"), experts);
-                continue;
-            }
-            // One set per projection, and its scales on each side.
-            let set = format!("{at}.mlp.experts.{field}");
-            for end in ["su", "sv"] {
-                add(format!("moe.{m}.{field}_{end}"), format!("{set}.{end}"));
-            }
-            add(format!("moe.{m}.{field}"), set);
-        }
+        moe_rules(l, &format!("moe.{m}"), rotated, &mut rules);
     }
     rules
 }

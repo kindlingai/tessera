@@ -10,11 +10,11 @@ use tessera_run::{Profile, Rank, Ranks, Run, Sum};
 pub struct Place {
     pub cluster: Cluster,
     pub parts: Parts,
-    rank: u32,
+    pub(crate) rank: u32,
     /// A persistent grid for the sums, if any.
-    grid: Option<Box<dyn Sum>>,
+    pub(crate) grid: Option<Box<dyn Sum>>,
     /// Split routed experts along inner width, not experts.
-    moe_tp: bool,
+    pub(crate) moe_tp: bool,
 }
 
 impl Place {
@@ -73,6 +73,16 @@ impl Place {
     }
 }
 
+/// Opens a ranked runner with an optional persistent sum grid.
+pub(crate) fn open_rank<T: Transport + 'static>(
+    plan: tessera_lower::Plan,
+    settings: &Settings,
+    sums: T,
+    grid: Option<Box<dyn Sum>>,
+) -> Result<Box<dyn Run>, Error> {
+    Ok(Box::new(Rank::open(plan, settings, sums)?.with_grid(grid)))
+}
+
 impl Engine {
     /// Opens the rank `sums` names. Launches cross on `control`.
     pub fn open_ranked<T: Transport + 'static>(
@@ -85,10 +95,7 @@ impl Engine {
     ) -> Result<Self, Error> {
         place.rank = sums.rank();
         let grid = place.grid.take();
-        let run = |plan| {
-            let rank = Rank::open(plan, settings, sums)?.with_grid(grid);
-            Ok(Box::new(rank) as Box<dyn Run>)
-        };
+        let run = |plan| open_rank(plan, settings, sums, grid);
         let mut engine = Self::placed(graph, context, recipe, settings, Some(&place), run)?;
         engine.control = Some(control);
         Ok(engine)
