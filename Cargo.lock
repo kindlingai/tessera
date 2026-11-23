@@ -2211,6 +2211,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-qwen3-graph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tessera-guest",
+ "tessera-trace",
+]
+
+[[package]]
 name = "tessera-ranks"
 version = "0.1.0"
 dependencies = [
