@@ -1,0 +1,129 @@
+//! Text generation, batched over slots and ranks.
+
+use super::{Entry, Flag, Load, Pick};
+use crate::start::Options;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Instant;
+use tessera_engine::{Batch, Fair, Pins, Recipe, Settings, Steps};
+use tessera_tasks::api::Score;
+use tessera_tasks::{Generate, Job, Queued};
+
+pub static ENTRY: Entry = Entry {
+    task: "generate",
+    pick: Pick::Plain,
+    flags: &[
+        Flag::switch("--guided"),
+        Flag::switch("--reuse-prefix"),
+        Flag::text("--manifest", "<name>"),
+    ],
+    open,
+};
+
+/// The lowering choices, with the model's pins by default.
+pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
+    let mut recipe = options.lower.clone().unwrap_or_default();
+    if recipe.pins == Pins::default() {
+        recipe.pins = pins.unwrap_or_else(|| Pins::all(tessera_engine::form::BF16_FORM));
+    }
+    if options.require_favored {
+        recipe.require_favored = true;
+    }
+    recipe
+}
+
+/// Loads optional user weight-name rules from `settings`.
+pub(super) fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::names::Rule>, String> {
+    match &settings.names {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| tessera_bundle::names::rules(&text).map_err(|e| e.to_string())),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Fills the slot with `generate`. Returns the job queue.
+pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> mpsc::Receiver<Job> {
+    let generate = Arc::new(generate);
+    let (queue, jobs) = mpsc::channel::<Job>();
+    let queued = Arc::new(Queued {
+        generate: generate.clone(),
+        jobs: Mutex::new(queue),
+    });
+    load.fill(generate.clone(), |m| {
+        m.chat = Some(generate);
+        m.generator = Some(queued.clone());
+        m.score = score.then_some(queued as Arc<dyn Score>);
+    });
+    jobs
+}
+
+/// Loads the generator, fills the slot, then steps jobs.
+fn open(load: &Load, settings: Settings) -> Result<(), String> {
+    let o = load.options;
+    let guided = load.on("--guided");
+    let start = Instant::now();
+    let links = o.ranks.join(&settings)?;
+    let rules = user_rules(&settings)?;
+    let (slots, context) = (o.slots as u64, o.max_model_len as u64);
+    // Ranks keep one entry, as they did before scoring.
+    let steps = match (guided, o.ranks.alone()) {
+        (true, _) => Steps::Masked,
+        (false, true) => Steps::Scored,
+        (false, false) => Steps::Plain,
+    };
+    let at = [slots, context];
+    let manifest = load.given("--manifest");
+    let loaded = tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
+        .map_err(|e| e.to_string())?;
+    let scores = loaded.graph.entries.len() > 1;
+    let mut recipe = lowering(o, loaded.pins);
+    if recipe.config.is_none() {
+        recipe.config = loaded.config;
+    }
+    let at = (&recipe, &settings);
+    let count = loaded.graph.weights.len() as u32;
+    let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
+    let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
+    let shares = |at: u32| shares[at as usize];
+    let loading = (loaded.weights).each_share(shares, |at, w| engine.load_weight(at, w));
+    loading.map_err(|e| e.to_string())?;
+    let seconds = start.elapsed().as_secs_f64();
+    eprintln!("{}: loaded in {seconds:.1} s", engine.device());
+    if o.ranks.follows() {
+        return engine.follow().map_err(|e| e.to_string());
+    }
+    let guides = match (guided, engine.words()) {
+        (false, _) => None,
+        (true, None) => return Err("the model has no mask port".into()),
+        (true, Some(words)) => Some(
+            tessera_tasks::guides(&loaded.tokenizer, &loaded.stop, words)
+                .map_err(|e| e.to_string())?,
+        ),
+    };
+    let generate = Generate {
+        tokenizer: loaded.tokenizer,
+        template: loaded.template,
+        stop: loaded.stop,
+        guides,
+    };
+    let jobs = queue(load, generate, scores);
+    let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    if load.on("--reuse-prefix") {
+        batch.reuse();
+    }
+    loop {
+        // Takes every job that has arrived. Waits only when idle.
+        let job = match batch.busy() {
+            true => jobs.try_recv().ok(),
+            false => match jobs.recv() {
+                Ok(job) => Some(job),
+                Err(_) => return Ok(()),
+            },
+        };
+        if let Some((request, sink)) = job {
+            batch.submit(request, sink);
+            continue;
+        }
+        batch.step().map_err(|e| e.to_string())?;
+    }
+}

@@ -10,7 +10,7 @@ mod task;
 use source::{Source, Stop, split};
 use std::process::ExitCode;
 use tessera_serve::ranks::FLAGS as RANKS;
-use tessera_serve::start::FLAGS;
+use tessera_serve::start::flags;
 
 const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>
   serve [flags]  load the model and answer OpenAI-shaped requests
@@ -37,14 +37,14 @@ fn main() -> ExitCode {
         Err(Stop::Usage) => {
             let default = source::DEFAULT.0;
             eprintln!("{USAGE}\nserve, fetch, ask and chat default to {default}");
-            eprintln!("serve flags: {FLAGS} {RANKS}");
+            eprintln!("serve flags: {} {RANKS}", flags());
             ExitCode::from(2)
         }
         Err(Stop::Tasks(unknown)) => {
             if let Some(name) = unknown {
                 eprintln!("tesserax: unknown task {name}");
             }
-            eprintln!("{}", task::LIST);
+            eprintln!("{}", task::list());
             ExitCode::from(2)
         }
         Err(Stop::Failed(e)) => {

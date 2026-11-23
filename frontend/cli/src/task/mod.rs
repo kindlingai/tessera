@@ -17,13 +17,19 @@ use tessera_serve::start::{self, Options};
 use tessera_serve::{Model, Slot};
 use tessera_tasks::api::{Params, Step};
 
-pub const LIST: &str = "tasks:
+/// The task list, with the image pipelines' flags.
+pub fn list() -> String {
+    format!(
+        "tasks:
   ask [--max-tokens <n>] [prompt...]  answer one prompt, from stdin if none
   chat [--max-tokens <n>]             talk with the model, one line a turn
-  image [--n <k>] [--seed <s>] [--image-size <px>] [--clip <dir>] [-o <path>] [prompt...]
+  {}
                                       PNGs from a prompt, or from stdin
   embed [text]                        one JSON vector per line of text, from stdin if none
-  tag [text]                          one JSON line per token and its tag";
+  tag [text]                          one JSON line per token and its tag",
+        image::usage()
+    )
+}
 
 pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
     let Some((name, args)) = rest.split_first() else {

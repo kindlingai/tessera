@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 use tessera_serve::ranks::FLAGS as RANKS;
-use tessera_serve::start::{FLAGS, Options};
+use tessera_serve::start::{Options, flags};
 
 fn args() -> Option<Options> {
     let mut options = Options::default();
@@ -22,7 +22,7 @@ fn args() -> Option<Options> {
 
 fn main() -> ExitCode {
     let Some(options) = args() else {
-        eprintln!("usage: tessera-serve --model <dir> {FLAGS} {RANKS}");
+        eprintln!("usage: tessera-serve --model <dir> {} {RANKS}", flags());
         return ExitCode::from(2);
     };
     match tessera_serve::start::run(options) {

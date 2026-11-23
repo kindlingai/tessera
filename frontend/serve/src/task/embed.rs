@@ -1,0 +1,23 @@
+//! EmbeddingGemma 2 vectors from an exlr8 release.
+
+use super::{Entry, Load, Pick};
+use std::sync::Arc;
+use tessera_engine::Settings;
+use tessera_tasks::Threaded;
+use tessera_tasks::api::Embed;
+use tessera_tasks::embed::EG2;
+
+pub static ENTRY: Entry = Entry {
+    task: "embed",
+    pick: Pick::Plain,
+    flags: &[],
+    open,
+};
+
+fn open(load: &Load, settings: Settings) -> Result<(), String> {
+    let o = load.options;
+    let e = Threaded::open(EG2, o.model.clone(), settings, o.config.clone());
+    let e = Arc::new(e.map_err(|e| e.to_string())?);
+    load.fill(e.clone(), |m| m.embed = Some(e as Arc<dyn Embed>));
+    Ok(())
+}

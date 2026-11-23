@@ -84,6 +84,11 @@ impl Ranks {
         self.moe_tp
     }
 
+    /// Each rank's share of split weights, from `--parts`.
+    pub(crate) fn parts(&self) -> &[u32] {
+        &self.parts
+    }
+
     /// Joins the peers, if any, before a long load.
     pub(crate) fn join(&self, settings: &Settings) -> Result<Option<Links>, String> {
         if self.peers.is_empty() && self.rank == 0 {

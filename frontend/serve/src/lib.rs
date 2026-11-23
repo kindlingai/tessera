@@ -21,6 +21,7 @@ pub mod ranks;
 #[cfg(test)]
 mod ranks_test;
 pub mod start;
+pub mod task;
 
 mod wire;
 #[cfg(test)]

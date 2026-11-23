@@ -11,12 +11,17 @@ pub(super) struct Args {
     pub(super) n: Option<usize>,
     pub(super) seed: Option<u32>,
     pub(super) size: Option<usize>,
-    pub(super) clip: Option<String>,
+    /// Flags the image pipelines own, passed to the load.
+    pub(super) serve: Vec<String>,
     pub(super) out: Option<PathBuf>,
     pub(super) words: Vec<String>,
 }
 
+/// The serve task this task loads.
+const TASK: &str = "image";
+
 pub(super) fn parse(args: &[String]) -> Result<Args, Stop> {
+    let owned = tessera_serve::task::flags_of(TASK);
     let mut got = Args::default();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -28,17 +33,35 @@ pub(super) fn parse(args: &[String]) -> Result<Args, Stop> {
             got.words.push(arg.clone());
             continue;
         }
+        let flag = owned.iter().find(|f| f.name == arg);
+        if flag.is_some_and(|f| f.value.is_empty()) {
+            got.serve.push(arg.clone());
+            continue;
+        }
         let value = rest.next().ok_or(Stop::Usage)?;
         match arg.as_str() {
             "--n" => got.n = Some(value.parse().map_err(|_| Stop::Usage)?),
             "--seed" => got.seed = Some(value.parse().map_err(|_| Stop::Usage)?),
-            "--image-size" => got.size = Some(value.parse().map_err(|_| Stop::Usage)?),
-            "--clip" => got.clip = Some(value.clone()),
             "-o" => got.out = Some(value.into()),
-            _ => return Err(Stop::Usage),
+            _ if flag.is_none() => return Err(Stop::Usage),
+            _ => got.serve.extend([arg.clone(), value.clone()]),
+        }
+        // The load's largest size is also the request's size.
+        if arg == "--image-size" {
+            got.size = Some(value.parse().map_err(|_| Stop::Usage)?);
         }
     }
     Ok(got)
+}
+
+/// This task's line in the task list.
+pub(super) fn usage() -> String {
+    let mut flags = String::new();
+    for flag in tessera_serve::task::flags_of(TASK) {
+        flags += &flag.usage();
+        flags += " ";
+    }
+    format!("image [--n <k>] [--seed <s>] {flags}[-o <path>] [prompt...]")
 }
 
 /// Where picture `i` of `n` goes.
@@ -65,15 +88,8 @@ pub fn run(source: Source, args: &[String]) -> Result<(), Stop> {
     if prompt.is_empty() {
         return Err(Stop::Usage);
     }
-    let mut flags = Vec::new();
-    if let Some(size) = a.size {
-        flags.extend(["--image-size".into(), size.to_string()]);
-    }
-    if let Some(clip) = &a.clip {
-        flags.extend(["--clip".into(), clip.clone()]);
-    }
-    let mut options = source.options(&flags)?;
-    options.flag("--task", "image".into()).ok_or(Stop::Usage)?;
+    let mut options = source.options(&a.serve)?;
+    options.flag("--task", TASK.into()).ok_or(Stop::Usage)?;
     options.slots = 1;
     let slot = load(options);
     let image = slot.get().and_then(|m| m.image.as_ref());
