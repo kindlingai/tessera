@@ -4,6 +4,7 @@ use crate::abi::{Launch, Source};
 use crate::plan::Step;
 use std::fmt;
 use std::sync::Arc;
+use tessera_engine_settings::Backend;
 use tessera_graph::Order;
 use tessera_platform::Platform;
 use tessera_sim::ZoneKind;
@@ -98,7 +99,7 @@ pub struct Needs {
     /// Hand-written text, for a backend with a compiler.
     pub compiler: bool,
     /// Platform backends the hand-written text leaves out.
-    pub lacks: &'static [&'static str],
+    pub lacks: &'static [Backend],
     /// Tiles on a matrix unit.
     pub tile: bool,
     /// bf16 tiles with f32 sums.
@@ -129,7 +130,7 @@ impl Needs {
             && self.group_bytes <= limits.group_bytes
             && self.group_threads <= limits.group_threads
             && (!self.compiler || limits.compiler)
-            && !self.lacks.contains(&platform.backend.as_str())
+            && !Backend::named(&platform.backend).is_some_and(|b| self.lacks.contains(&b))
             && (!self.tile || platform.tile().is_some())
             && (!self.bf16_tile || platform.bf16_tile().is_some())
     }

@@ -394,7 +394,7 @@ fn cuda_needs(group_bytes: usize) -> Needs {
         group_bytes,
         group_threads: THREADS,
         compiler: true,
-        lacks: &["metal", "rocm"],
+        lacks: &[Backend::Metal, Backend::Rocm],
         ..Needs::default()
     }
 }
@@ -752,7 +752,7 @@ fn mm_needs(k: &FastMm) -> Needs {
         group_bytes: k.kind.smem(),
         group_threads: 128,
         compiler: true,
-        lacks: &["metal", "rocm"],
+        lacks: &[Backend::Metal, Backend::Rocm],
         bf16_tile: true,
         ..Needs::default()
     }

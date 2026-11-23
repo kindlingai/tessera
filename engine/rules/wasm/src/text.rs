@@ -16,7 +16,7 @@ pub struct Fixed {
     pub cuda: &'static str,
     pub hip: &'static str,
     /// Platform backends with no text.
-    lacks: &'static [&'static str],
+    lacks: &'static [Backend],
 }
 
 /// Metal, CUDA and HIP text of `file`, or empty.
@@ -65,8 +65,8 @@ impl Fixed {
         } else {
             flat(&k.file, files)?.map(leak)
         };
-        let texts = [("metal", metal), ("cuda", cuda), ("rocm", hip)];
-        let lacks = texts.iter().filter(|t| t.1.is_empty()).map(|t| t.0);
+        let texts = Backend::ALL.iter().zip([metal, cuda, hip]);
+        let lacks = texts.filter(|t| t.1.is_empty()).map(|t| *t.0);
         Ok(Fixed {
             name: leak(k.name),
             entry: leak(k.entry),
