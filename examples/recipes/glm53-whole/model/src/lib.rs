@@ -1,7 +1,6 @@
 //! GLM-5.3's whole step, embedding to logits, as one persistent kernel.
 
-use std::collections::HashMap;
-use tessera_guest::site::{Ask, Count, Input, Kind, Lane, Offer, Place, Resident, Scalar, Shape};
+use tessera_guest::site::{Ask, Count, Input, Kind, Lane, Offer, Place, Resident, Weights};
 
 const NAME: &str = "glm53_whole";
 const THREADS: u32 = 256;
@@ -77,36 +76,31 @@ fn class(input: &Input) -> Option<u32> {
 
 /// The reads collected in kernel item order.
 struct Walk<'a> {
-    inputs: &'a [Input],
-    /// Each weight's input place, by path.
-    paths: HashMap<&'a str, usize>,
+    weights: Weights<'a>,
     reads: Vec<Place>,
 }
 
 impl<'a> Walk<'a> {
     fn place(&self, path: &str) -> Option<usize> {
-        self.paths.get(path).copied()
+        Some(self.weights.get(path)?.at)
     }
 
     /// Reads weight `path` as field `field`, if `whole.cu` can.
     fn take(&mut self, path: &str, field: usize) -> Option<&'a Input> {
-        let at = self.place(path)?;
-        let input = &self.inputs[at];
-        let c = class(input)?;
+        let found = self.weights.get(path)?;
+        let c = class(&found)?;
         let codes = CODES.contains(&field);
         // Rotated iff trellis outside the expert codes.
         let turned = c == TRELLIS && !codes;
-        let fits = turned == input.parts.is_some() && (!SIGNS.contains(&field) || c == 0);
+        let fits = turned == found.parts.is_some() && (!SIGNS.contains(&field) || c == 0);
         if !fits {
             return None;
         }
         match turned {
-            true => self
-                .reads
-                .extend((0..3).map(|p| Place::Part { part: [at, p] })),
-            false => self.reads.push(Place::Read(at)),
+            true => self.reads.extend(found.parts()),
+            false => self.reads.push(found.read()),
         }
-        Some(input)
+        Some(found.input)
     }
 
     /// Reads each of `fields` under `prefix`, from field `first`.
@@ -119,37 +113,11 @@ impl<'a> Walk<'a> {
     }
 }
 
-/// An axis' whole size, from its share or its shape.
-fn whole(input: &Input, axis: usize) -> usize {
-    match input.share {
-        Some([a, _, _, w]) if a == axis => w,
-        _ => input.shape[axis],
-    }
-}
-
-/// The part along `axis` in `unit`s: first and count.
-fn part(input: &Input, axis: usize, unit: usize) -> Option<Option<[usize; 2]>> {
-    match input.share {
-        None => Some(None),
-        Some([a, first, count, _]) if a == axis && first % unit == 0 && count % unit == 0 => {
-            Some(Some([first / unit, count / unit]))
-        }
-        Some(_) => None,
-    }
-}
-
 /// One value for every entry of `parts`, else `None`.
 fn same<T: PartialEq + Copy>(parts: impl IntoIterator<Item = T>) -> Option<T> {
     let mut parts = parts.into_iter();
     let first = parts.next()?;
     parts.all(|p| p == first).then_some(first)
-}
-
-/// The one value of `op`, else `None`.
-fn only(scalars: &[Scalar], op: &str) -> Option<f32> {
-    let mut found = scalars.iter().filter(|s| s.op == op).map(|s| s.value);
-    let v = found.next()?;
-    found.next().is_none().then_some(v)
 }
 
 /// Model sizes from the first layer's weights.
@@ -166,7 +134,7 @@ struct Sizes {
 fn sizes(a: &[&Input]) -> Option<Sizes> {
     let (q_latent, latent) = (a[2].shape[0], a[5].shape[0]);
     let rope = a[4].shape[0].checked_sub(latent)?;
-    let [q, kv, o] = [whole(a[3], 0), whole(a[6], 0), whole(a[7], 1)];
+    let [q, kv, o] = [a[3].whole(0), a[6].whole(0), a[7].whole(1)];
     let heads = (q + o).checked_sub(kv)? / rope.max(1);
     let fits = heads > 0 && q % heads == 0 && o % heads == 0 && q / heads > rope;
     fits.then(|| Sizes {
@@ -182,15 +150,15 @@ fn sizes(a: &[&Input]) -> Option<Sizes> {
 
 /// This rank's heads: one part for `q_b`, `kv_b`, `o`.
 fn heads(a: &[&Input], s: &Sizes) -> Option<Option<[usize; 2]>> {
-    let q = part(a[3], 0, s.nope + s.rope)?;
-    let kv = part(a[6], 0, s.nope + s.head_dim)?;
-    let o = part(a[7], 1, s.head_dim)?;
+    let q = a[3].split(0, s.nope + s.rope)?;
+    let kv = a[6].split(0, s.nope + s.head_dim)?;
+    let o = a[7].split(1, s.head_dim)?;
     (q == kv && kv == o).then_some(o)
 }
 
 /// An MLP's part of its inner width, from all three.
 fn inner(m: &[&Input]) -> Option<Option<[usize; 2]>> {
-    let [g, u, d] = [part(m[0], 0, 1)?, part(m[1], 0, 1)?, part(m[2], 1, 1)?];
+    let [g, u, d] = [m[0].split(0, 1)?, m[1].split(0, 1)?, m[2].split(1, 1)?];
     (g == u && u == d).then_some(d)
 }
 
@@ -217,10 +185,8 @@ fn every(indexing: &[usize], dense: usize, layers: usize) -> Option<usize> {
 /// One resident offer for the whole step, else `None`.
 fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let step = ask.site.step()?;
-    let (inputs, kept, sums, scalars, len) =
-        (step.inputs, step.kept, step.sums, step.scalars, step.len);
-    let [tokens, positions, slots, picks] = step.ids;
-    let rows = inputs[tokens].shape[0];
+    let (kept, sums) = (step.kept, step.sums);
+    let rows = step.rows();
     let cfg = |key| ask.config.as_ref()?.get(key);
     if cfg("max_rows")
         .and_then(|v| v.as_u64())
@@ -233,15 +199,9 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         _ => Lane::Sum,
     };
     let first = kept.first()?;
-    let named = inputs.iter().enumerate();
-    let paths = named.filter_map(|(i, input)| Some((input.weight.as_deref()?, i)));
     let mut w = Walk {
-        inputs,
-        paths: paths.collect(),
-        reads: vec![tokens, positions, slots, picks]
-            .into_iter()
-            .map(Place::Read)
-            .collect(),
+        weights: Weights::new(step.inputs),
+        reads: step.id_reads(),
     };
     let global = w.group("", &GLOBAL, 0)?;
     let layers = (0..)
@@ -269,11 +229,11 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let [vocab, hidden] = global[0].shape[..] else {
         return None;
     };
-    part(global[2], 0, 1)?;
+    global[2].split(0, 1)?;
     let [head_out, head_in] = global[2].shape[..] else {
         return None;
     };
-    if head_in != hidden || whole(global[2], 0) != vocab || head_out == 0 {
+    if head_in != hidden || global[2].whole(0) != vocab || head_out == 0 {
         return None;
     }
     let ix = indexers.first()?;
@@ -288,7 +248,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let dense_parts: Vec<_> = mlps.iter().map(|m| inner(m)).collect::<Option<_>>()?;
     let mut moe_parts = Vec::with_capacity(routed.len());
     for m in &routed {
-        let held = same([4, 7, 10].map(|i| part(m[i], 0, 1)))??;
+        let held = same([4, 7, 10].map(|i| m[i].split(0, 1)))??;
         let shared = inner(&m[13..])?;
         if held.is_some() != shared.is_some() {
             return None;
@@ -301,9 +261,9 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         None => None,
     };
     let attended = count(&attn, s.heads)?;
-    let dense_all = whole(mlps.first()?[2], 1);
+    let dense_all = mlps.first()?[2].whole(1);
     let dense_ffn = count(&dense_parts, dense_all)?;
-    let ffn_all = whole(r[15], 1);
+    let ffn_all = r[15].whole(1);
     let shared: Vec<_> = moe_parts.iter().map(|p| p.map(|(_, s)| s)).collect();
     let ffn = count(&shared, ffn_all)?;
     let held = same(moe_parts.iter().flatten().map(|(h, _)| *h));
@@ -323,15 +283,15 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let attn_bits = bits(&mut attn.iter().map(Option::is_some));
     let mlp_bits = bits(&mut mlp_split.clone());
     // Only heads, inner widths, experts and head split.
-    let whole = |group: &[Vec<&Input>], split: &[usize]| {
+    let unsplit = |group: &[Vec<&Input>], split: &[usize]| {
         let kept = |(i, _): &(usize, &&Input)| !split.contains(i);
         let rest = group.iter().flat_map(|g| g.iter().enumerate().filter(kept));
         rest.into_iter().all(|(_, i)| i.share.is_none())
     };
-    let whole_rest = whole(std::slice::from_ref(&global), &[2])
-        && whole(&indexers, &[])
-        && whole(&attention, &[3, 6, 7])
-        && whole(&routed, &[4, 7, 10, 13, 14, 15]);
+    let whole_rest = unsplit(std::slice::from_ref(&global), &[2])
+        && unsplit(&indexers, &[])
+        && unsplit(&attention, &[3, 6, 7])
+        && unsplit(&routed, &[4, 7, 10, 13, 14, 15]);
     let summed = attn.iter().flatten().count() + mlp_split.filter(|on| *on).count();
     // Trimmed last layers sum picked rows. The grid sums all.
     let sums_fit = sums.len() == summed && sums.iter().all(|n| n % hidden == 0);
@@ -342,17 +302,12 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     if hidden != s.hidden || hidden % 128 != 0 {
         return None;
     }
-    let tops: Vec<f32> = scalars
-        .iter()
+    let tops: Vec<f32> = (step.scalars.iter())
         .filter(|s| s.op == "top_k")
         .map(|s| s.value)
         .collect();
     let keep = *tops.first()? as usize;
     let top_k = *tops.get(1).or(tops.first())? as usize;
-    let eps = only(scalars, "rms_norm")?;
-    let theta = only(scalars, "rope_adjacent")?;
-    let route = only(scalars, "scale")?;
-    let scale = only(scalars, "attend")?;
     let context = first.context;
     let width = [
         hidden,
@@ -366,15 +321,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         experts,
     ];
     let width = width.into_iter().max()?;
-    let fixed = |n: usize| Count::Fixed(n as u32);
-    let dim = |i: usize| match inputs[i].dims.first() {
-        Some(Some(dim)) => Count::Dim {
-            dim: dim.clone(),
-            mul: 1,
-        },
-        _ => fixed(inputs[i].shape[0]),
-    };
-    let mut counts = vec![dim(tokens), dim(picks)];
+    let mut counts = step.id_counts();
     let shape = [
         head_out,
         hidden,
@@ -402,36 +349,22 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         held,
         top_k,
     ];
-    counts.extend(shape.map(fixed));
+    counts.extend(shape.map(Count::from));
     counts.extend(attn_bits.into_iter().chain(mlp_bits).map(Count::Fixed));
-    counts.push(fixed(width));
-    counts.extend([eps, theta, route, scale].map(|f| Count::Fixed(f.to_bits())));
-    let mut reads = w.reads;
-    reads.extend((0..kept.len()).map(|kept| Place::Kept { kept }));
+    counts.push(width.into());
+    for op in ["rms_norm", "rope_adjacent", "scale", "attend"] {
+        counts.push(Count::bits(step.scalar(op)?));
+    }
     let floats =
         rows * (3 * hidden + s.q_latent + s.latent + s.rope + 6 * width + keep + 2 * top_k);
-    Some(vec![Offer {
-        kernel: NAME,
-        reads,
-        len,
-        counts,
-        shape: Shape::Line(1),
-        work: (rows * layers * hidden * (s.q_latent + s.heads * s.head_dim)) as f64,
-        guess: 1e-12,
-        writes: None,
-        resident: Some(Resident {
-            threads: THREADS,
-            shared: 0,
-            scratch: floats * 4,
-            lanes: vec![lane],
-        }),
-    }])
+    let work = (rows * layers * hidden * (s.q_latent + s.heads * s.head_dim)) as f64;
+    let resident = Resident::grid(THREADS, floats * 4, lane);
+    Some(vec![step.resident(NAME, w.reads, counts, work, resident)])
 }
 
-tessera_guest::exports!(
-    ask: NAME,
-    Kind::Model,
-    "whole.cu",
-    offer,
-    ["math.cuh", "trellis.cuh", "gemv.cuh", "attn.cuh", "moe.cuh"]
-);
+tessera_guest::exports! {
+    rules: { NAME => Kind::Model },
+    kernels: { "whole.cu": [NAME] },
+    files: ["math.cuh", "trellis.cuh", "gemv.cuh", "attn.cuh", "moe.cuh"],
+    ask: offer,
+}

@@ -1,7 +1,6 @@
 //! GLM-5.3's routed block as fused CUDA kernels.
 
-use tessera_guest::output;
-use tessera_guest::site::{self, Count, Input, Kind, Manifest, Offer, Place, Shape, Site};
+use tessera_guest::site::{Input, Kind, Offer, Place, Shape, Site, Weights, fixed};
 
 const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
@@ -10,7 +9,7 @@ const FC1: &str = "glm53_fc1";
 const FC2: &str = "glm53_fc2";
 const FINISH: &str = "glm53_finish";
 
-/// The weights after the rows, in kernel argument order.
+/// The routed weights, by field.
 const ROUTED: [&str; 13] = [
     "router",
     "router_bias",
@@ -27,6 +26,10 @@ const ROUTED: [&str; 13] = [
     "signs_out",
 ];
 const SHARED: [&str; 3] = ["shared.gate", "shared.up", "shared.down"];
+/// Expert codes: plain trellis, split by expert.
+const CODES: [&str; 3] = ["gate", "up", "down"];
+/// Weights a split of the inner width cuts.
+const INNER: [&str; 6] = ["gate", "gate_sv", "up", "up_sv", "down_su", "down"];
 
 /// Past these, the linked rules serve better or `moe.cu` cannot.
 const MOST_ROWS: usize = 16;
@@ -66,12 +69,6 @@ fn bits(input: &Input) -> Option<[u32; 2]> {
     (2..=4).contains(&k).then_some([k, book])
 }
 
-/// Whether `input` is the weight `field`.
-fn named(input: &Input, field: &str) -> bool {
-    let path = input.weight.as_deref().unwrap_or_default();
-    path.ends_with(&format!(".{field}"))
-}
-
 /// One width and codebook for all of `codes`.
 fn width(codes: &[&Input]) -> Option<[u32; 2]> {
     let k = bits(codes.first()?)?;
@@ -79,74 +76,78 @@ fn width(codes: &[&Input]) -> Option<[u32; 2]> {
 }
 
 /// Experts this rank holds: first and count.
-fn held(routed: &[Input], experts: usize, ffn: usize) -> Option<[usize; 2]> {
-    let ep = (routed.iter().enumerate()).all(|(i, r)| r.share.is_none() || [4, 7, 10].contains(&i));
-    if ep {
-        let share = routed[4].share;
-        if [7, 10].iter().any(|&i| routed[i].share != share) {
+fn held(w: &Weights, experts: usize, ffn: usize) -> Option<[usize; 2]> {
+    let share = |field: &str| w.get(field)?.share;
+    let whole_but =
+        |split: &[&str]| (ROUTED.iter()).all(|f| split.contains(f) || share(f).is_none());
+    if whole_but(&CODES) {
+        let held = share("gate");
+        if share("up") != held || share("down") != held {
             return None;
         }
-        return match share {
+        return match held {
             None => Some([0, experts]),
             Some([0, first, count, whole]) if whole == experts => Some([first, count]),
             Some(_) => None,
         };
     }
-    let tp = (routed.iter().enumerate())
-        .all(|(i, r)| r.share.is_none() || [4, 5, 7, 8, 9, 10].contains(&i));
-    let Some([1, first, count, whole]) = routed[4].share else {
+    let Some([1, first, count, whole]) = share("gate") else {
         return None;
     };
-    let same = |i: usize, axis: usize| routed[i].share == Some([axis, first, count, whole]);
-    let ok = tp && count == ffn && [4, 5, 7, 8, 9].into_iter().all(|i| same(i, 1)) && same(10, 2);
-    ok.then_some([0, experts])
+    let same = |field: &str, axis: usize| share(field) == Some([axis, first, count, whole]);
+    let cut = INNER[..5].iter().all(|f| same(f, 1)) && same("down", 2);
+    (whole_but(&INNER) && count == ffn && cut).then_some([0, experts])
 }
 
 /// Route, plan, fc1, fc2, then finish over a routed block.
 fn offer(site: &Site) -> Option<Vec<Offer>> {
-    let Site::Region {
-        kind: Kind::Moe,
-        inputs,
-        outputs,
-        kept,
-        sums,
-        ..
-    } = site
-    else {
+    let r = site.region(Kind::Moe)?;
+    let [len] = r.outputs[..] else {
         return None;
     };
-    if !sums.is_empty() {
-        return None;
-    }
-    let [len] = outputs[..] else {
-        return None;
-    };
-    let (x, rest) = inputs.split_first()?;
+    let x = r.inputs.first()?;
     let [rows, hidden] = *x.shape.as_slice() else {
         return None;
     };
-    let (routed, shared) = rest.split_at_checked(ROUTED.len())?;
+    let w = Weights::new(r.inputs);
+    let routed = w.all(ROUTED)?;
+    let shared = w.all(SHARED)?;
+    let [
+        router,
+        bias,
+        signs_in,
+        gate_su,
+        gate,
+        gate_sv,
+        up_su,
+        up,
+        up_sv,
+        down_su,
+        down,
+        down_sv,
+        signs_out,
+    ] = routed;
+    let [shared_gate, shared_up, shared_down] = shared;
     let plain = routed.iter().all(|i| i.parts.is_none());
     let turned = shared.iter().all(|i| i.parts.is_some());
-    let fields = ROUTED.iter().chain(&SHARED);
-    let fits = rest.len() == ROUTED.len() + SHARED.len()
-        && rest.iter().zip(fields).all(|(i, f)| named(i, f))
+    let fits = r.inputs.len() == 1 + ROUTED.len() + SHARED.len()
+        && w.len() == ROUTED.len() + SHARED.len()
+        && r.sums.is_empty()
         && x.weight.is_none()
         && x.dims.iter().all(Option::is_none)
-        && kept.is_empty();
+        && r.kept.is_empty();
     if !(plain && turned && fits) {
         return None;
     }
-    let [experts, ffn] = *routed[5].shape.as_slice() else {
+    let [experts, ffn] = *gate_sv.shape.as_slice() else {
         return None;
     };
-    let codes = [&routed[4], &routed[7], &routed[10]];
-    let [first, count] = held(routed, experts, ffn)?;
-    let [inner, wide] = shared[0].parts?;
-    let sized = routed[0].shape == [experts, hidden]
+    let [first, count] = held(&w, experts, ffn)?;
+    let [inner, wide] = shared_gate.parts?;
+    let sized = router.shape == [experts, hidden]
         && inner == hidden
-        && shared[1].parts == shared[0].parts
-        && shared[2].parts == Some([wide, hidden])
+        && shared_up.parts == shared_gate.parts
+        && shared_down.parts == Some([wide, hidden])
         && rows <= MOST_ROWS
         && experts <= MOST_EXPERTS
         && hidden % 128 == 0
@@ -157,29 +158,20 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         return None;
     }
     // Floats are f32, but the router may be bf16.
-    let floats = routed
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| ![0, 4, 7, 10].contains(i));
-    if x.form != "f32" || floats.map(|(_, r)| &r.form).any(|f| f != "f32") {
+    let mut floats = ROUTED.iter().zip(&routed);
+    let floats = floats.all(|(f, i)| *f == "router" || CODES.contains(f) || i.form == "f32");
+    if x.form != "f32" || !floats {
         return None;
     }
-    let bf16 = match routed[0].form.as_str() {
+    let bf16 = match router.form.as_str() {
         "f32" => 0,
         "bf16" => 1,
         _ => return None,
     };
-    let [k, book] = width(&codes)?;
-    let [shared_k, shared_book] = width(&shared.iter().collect::<Vec<_>>())?;
+    let [k, book] = width(&[gate.input, up.input, down.input])?;
+    let [shared_k, shared_book] = width(&shared.map(|s| s.input))?;
     let picks = picks(experts)? as usize;
-    let fixed = |n: &[usize]| n.iter().map(|&n| Count::Fixed(n as u32)).collect();
-    let part = |i: usize, p: usize| Place::Part {
-        part: [1 + ROUTED.len() + i, p],
-    };
-    let scores = Place::Draft { draft: 0 };
-    let plan = Place::Draft { draft: 1 };
-    let gpart = Place::Draft { draft: 2 };
-    let z = Place::Draft { draft: 3 };
+    let [scores, plan, gpart, z] = [0, 1, 2, 3].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
     let ibs = hidden / 128;
     let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
@@ -190,14 +182,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let max_col = rows.min(8);
     let route = Offer {
         kernel: ROUTE,
-        reads: vec![Place::Read(0), Place::Read(1)],
+        reads: vec![Place::Read(0), router.read()],
         len: rows * experts,
         counts: fixed(&[rows, hidden, experts, bf16]),
-        shape: Shape::Grid {
-            across: experts.div_ceil(2),
-            down: 1,
-            threads: 256,
-        },
+        shape: Shape::grid(experts.div_ceil(2), 1, 256),
         work: (rows * experts * hidden) as f64,
         guess: 1e-12,
         writes: None,
@@ -205,82 +193,45 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let plan_offer = Offer {
         kernel: PLAN,
-        reads: vec![scores, Place::Read(2)],
+        reads: vec![scores, bias.read()],
         len: PLAN_WORDS,
         counts: fixed(&[rows, experts, picks, first, count]),
-        shape: Shape::Grid {
-            across: 1,
-            down: 1,
-            threads: 256,
-        },
+        shape: Shape::grid(1, 1, 256),
         work: (rows * experts) as f64,
         guess: 1e-12,
         writes: None,
         resident: None,
     };
-    let fc_counts = [
-        rows,
-        hidden,
-        ffn,
-        picks,
-        k as usize,
-        shared_k as usize,
-        book as usize,
-        shared_book as usize,
-        first,
-        wide,
-        ks1,
-    ];
-    let mut fc2_counts = fc_counts.to_vec();
-    fc2_counts.push(ns2);
+    let codes = [k, shared_k, book, shared_book].map(|b| b as usize);
+    let fc_counts = [&[rows, hidden, ffn, picks][..], &codes, &[first, wide, ks1]].concat();
+    let mut reads = vec![Place::Read(0), plan];
+    reads.extend([signs_in, gate_su, gate, up_su, up].map(|f| f.read()));
+    reads.extend(
+        [shared_gate, shared_up]
+            .map(|f| [f.part(0), f.part(1)])
+            .concat(),
+    );
     let fc1 = Offer {
         kernel: FC1,
-        reads: vec![
-            Place::Read(0),
-            plan,
-            Place::Read(3),
-            Place::Read(4),
-            Place::Read(5),
-            Place::Read(7),
-            Place::Read(8),
-            part(0, 0),
-            part(0, 1),
-            part(1, 0),
-            part(1, 1),
-        ],
+        reads,
         len: total_slots * chunks * 2 * ks1 * max_col * 128,
         counts: fixed(&fc_counts),
-        shape: Shape::Grid {
-            across: chunks * 2 * ks1,
-            down: total_slots,
-            threads: 256,
-        },
+        shape: Shape::grid(chunks * 2 * ks1, total_slots, 256),
         work: (total_slots * 2 * hidden * ffn) as f64,
         guess: 1e-15,
         writes: None,
         resident: None,
     };
+    let mut reads = vec![plan, gpart];
+    reads.extend([gate_sv, up_sv, down_su, down].map(|f| f.read()));
+    reads.extend([shared_gate.part(2), shared_up.part(2)]);
+    reads.extend([shared_down.part(0), shared_down.part(1)]);
     let fc2 = Offer {
         kernel: FC2,
-        reads: vec![
-            plan,
-            gpart,
-            Place::Read(6),
-            Place::Read(9),
-            Place::Read(10),
-            Place::Read(11),
-            part(0, 2),
-            part(1, 2),
-            part(2, 0),
-            part(2, 1),
-        ],
+        reads,
         len: rows * (picks + 1) * chunks * hidden / 2,
-        counts: fixed(&fc2_counts),
-        shape: Shape::Grid {
-            across: chunks * ns2,
-            down: total_slots,
-            threads: 256,
-        },
+        counts: fixed(&[&fc_counts[..], &[ns2]].concat()),
+        shape: Shape::grid(chunks * ns2, total_slots, 256),
         work: (total_slots * hidden * ffn) as f64,
         guess: 1e-15,
         writes: None,
@@ -288,14 +239,16 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let finish = Offer {
         kernel: FINISH,
-        reads: vec![plan, Place::Read(12), Place::Read(13), part(2, 2), z],
+        reads: vec![
+            plan,
+            down_sv.read(),
+            signs_out.read(),
+            shared_down.part(2),
+            z,
+        ],
         len,
         counts: fixed(&[rows, hidden, ffn, picks, wide]),
-        shape: Shape::Grid {
-            across: hidden / 128,
-            down: rows,
-            threads: (picks + 1) * 32,
-        },
+        shape: Shape::grid(hidden / 128, rows, (picks + 1) * 32),
         work: len as f64,
         guess: 1e-12,
         writes: None,
@@ -304,34 +257,8 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     Some(vec![route, plan_offer, fc1, fc2, finish])
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: i32) -> i32 {
-    tessera_guest::alloc(len)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn manifest() -> i64 {
-    let manifest = Manifest {
-        abi: tessera_guest::ABI,
-        kernels: [ROUTE, PLAN, FC1, FC2, FINISH]
-            .map(|k| site::imports(k, k, "moe.cu"))
-            .into(),
-        rules: vec![site::Rule {
-            name: NAME,
-            site: Kind::Moe,
-        }],
-        graph: false,
-        files: vec![site::File {
-            path: "moe.cu",
-            text: include_str!("moe.cu"),
-        }],
-    };
-    output(serde_json::to_vec(&manifest).unwrap_or_default())
-}
-
-/// One offer for a site that fits, else `null`.
-#[unsafe(no_mangle)]
-pub extern "C" fn propose(at: i32, len: i32) -> i64 {
-    // SAFETY: the host passes back what `alloc` returned.
-    unsafe { tessera_guest::answer(at, len, offer) }
+tessera_guest::exports! {
+    rules: { NAME => Kind::Moe },
+    kernels: { "moe.cu": [ROUTE, PLAN, FC1, FC2, FINISH] },
+    propose: offer,
 }

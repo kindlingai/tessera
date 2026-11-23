@@ -4,13 +4,12 @@ fn offer(_: &Ask) -> Option<Vec<Offer>> {
     None
 }
 
-tessera_guest::exports!(
-    ask: "asked",
-    Kind::Model,
-    "exports_ask_test.rs",
-    offer,
-    ["../src/site.rs"]
-);
+tessera_guest::exports! {
+    rules: { "asked" => Kind::Model },
+    kernels: { "exports_ask_test.rs": ["asked"] },
+    files: ["../src/site.rs"],
+    ask: offer,
+}
 
 #[test]
 fn exports_ask_compiles() {

@@ -1,7 +1,10 @@
 //! The recipe module ABI: memory hand-off, the table format.
 
+mod kit;
 pub mod site;
 
+#[cfg(test)]
+mod kit_test;
 #[cfg(test)]
 mod lib_test;
 
@@ -73,16 +76,62 @@ pub fn declare(manifest: &site::Manifest) -> i64 {
     output(serde_json::to_vec(manifest).unwrap_or_default())
 }
 
-/// A one-kernel module's exports: kernel `$name` from `$file`.
+/// The host's input to `graph` and `tables`.
+#[derive(Debug, serde::Deserialize)]
+pub struct Build {
+    pub config: serde_json::Value,
+    pub seqs: u64,
+}
+
+/// One table: its dotted path and values.
+pub type Table = (String, Vec<f32>);
+
+/// # Safety
+///
+/// `at` and `len` must come from `alloc`.
+unsafe fn build(at: i32, len: i32) -> Result<Build, String> {
+    // SAFETY: the caller passes back what `alloc` returned.
+    let bytes = unsafe { input(at, len) };
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// # Safety
+///
+/// `at` and `len` must come from `alloc`.
+pub unsafe fn build_graph(
+    at: i32,
+    len: i32,
+    graph: impl Fn(&Build) -> Result<String, String>,
+) -> i64 {
+    // SAFETY: the caller passes back what `alloc` returned.
+    let text = unsafe { build(at, len) }.and_then(|b| graph(&b));
+    output(text.unwrap_or_else(|e| e).into_bytes())
+}
+
+/// # Safety
+///
+/// `at` and `len` must come from `alloc`.
+pub unsafe fn build_tables(
+    at: i32,
+    len: i32,
+    tables: impl Fn(&Build) -> Result<Vec<Table>, String>,
+) -> i64 {
+    // SAFETY: the caller passes back what `alloc` returned.
+    let made = unsafe { build(at, len) }.and_then(|b| tables(&b));
+    output(made.map(|t| encode(&t)).unwrap_or_default())
+}
+
+/// A module's exports. Sections are optional, in pattern order.
 #[macro_export]
 macro_rules! exports {
-    (ask: $name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
-        $crate::exports!(@emit answer_ask, $name, $kind, $file, $offer $(, [$($extra),*])?);
-    };
-    ($name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
-        $crate::exports!(@emit answer, $name, $kind, $file, $offer $(, [$($extra),*])?);
-    };
-    (@emit $answer:ident, $name:expr, $kind:expr, $file:literal, $offer:path $(, [$($extra:literal),* $(,)?])?) => {
+    (
+        $(rules: { $($rule:expr => $kind:expr),+ $(,)? },)?
+        $(kernels: { $($file:literal: [$($kernel:expr),+ $(,)?]),+ $(,)? },)?
+        $(files: [$($extra:literal),* $(,)?],)?
+        $(propose: $propose:path,)?
+        $(ask: $ask:path,)?
+        $(graph: $graph:path, tables: $tables:path,)?
+    ) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn alloc(len: i32) -> i32 {
             $crate::alloc(len)
@@ -92,17 +141,23 @@ macro_rules! exports {
         pub extern "C" fn manifest() -> i64 {
             $crate::declare(&$crate::site::Manifest {
                 abi: $crate::ABI,
-                kernels: vec![$crate::site::imports($name, $name, $file)],
-                rules: vec![$crate::site::Rule {
-                    name: $name,
-                    site: $kind,
-                }],
-                graph: false,
-                files: vec![
-                    $crate::site::File {
-                        path: $file,
-                        text: include_str!($file),
+                kernels: vec![$($($(
+                    $crate::site::Kernel::file($kernel, $kernel, $file),
+                )+)+)?],
+                rules: vec![$($(
+                    $crate::site::Rule {
+                        name: $rule,
+                        site: $kind,
                     },
+                )+)?],
+                graph: $crate::exports!(@has $($graph)?),
+                files: vec![
+                    $($(
+                        $crate::site::File {
+                            path: $file,
+                            text: include_str!($file),
+                        },
+                    )+)?
                     $($(
                         $crate::site::File {
                             path: $extra,
@@ -113,7 +168,33 @@ macro_rules! exports {
             })
         }
 
-        /// The offer for a site that fits, else `null`.
+        $($crate::exports!(@propose answer, $propose);)?
+        $($crate::exports!(@propose answer_ask, $ask);)?
+
+        $(
+            /// The graph JSON, else why the config is refused.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn graph(at: i32, len: i32) -> i64 {
+                // SAFETY: the host passes back what `alloc` returned.
+                unsafe { $crate::build_graph(at, len, $graph) }
+            }
+
+            /// The tables the graph reads, else nothing.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn tables(at: i32, len: i32) -> i64 {
+                // SAFETY: the host passes back what `alloc` returned.
+                unsafe { $crate::build_tables(at, len, $tables) }
+            }
+        )?
+    };
+    (@has) => {
+        false
+    };
+    (@has $graph:path) => {
+        true
+    };
+    (@propose $answer:ident, $offer:path) => {
+        /// The offers for a site that fits, else `null`.
         #[unsafe(no_mangle)]
         pub extern "C" fn propose(at: i32, len: i32) -> i64 {
             // SAFETY: the host passes back what `alloc` returned.
@@ -123,7 +204,7 @@ macro_rules! exports {
 }
 
 /// Named tables of floats, as one buffer the host decodes.
-pub fn encode(tables: &[(String, Vec<f32>)]) -> Vec<u8> {
+pub fn encode(tables: &[Table]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((tables.len() as u32).to_le_bytes());
     for (name, values) in tables {
@@ -136,7 +217,7 @@ pub fn encode(tables: &[(String, Vec<f32>)]) -> Vec<u8> {
 }
 
 /// The tables `encode` wrote, or `None` if bad.
-pub fn decode(bytes: &[u8]) -> Option<Vec<(String, Vec<f32>)>> {
+pub fn decode(bytes: &[u8]) -> Option<Vec<Table>> {
     let mut at = 0usize;
     let mut take = |n: usize| -> Option<&[u8]> {
         let part = bytes.get(at..at.checked_add(n)?)?;

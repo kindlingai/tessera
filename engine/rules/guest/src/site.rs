@@ -1,16 +1,20 @@
 //! The module's side of its JSON exchange with the host.
 
+pub use crate::kit::{Found, Region, Step, Weights, fixed};
 use serde::{Deserialize, Serialize};
 
 /// The output of `manifest()`.
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub abi: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kernels: Vec<Kernel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
     /// Whether the module exports `graph` and `tables`.
     pub graph: bool,
     /// Recipe files that kernels from files read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<File>,
 }
 
@@ -25,26 +29,54 @@ pub struct Kernel {
     pub file: &'static str,
 }
 
-/// A kernel with CUDA text alone.
-pub fn kernel(name: &'static str, entry: &'static str, cuda: &'static str) -> Kernel {
-    Kernel {
-        name,
-        entry,
-        metal: "",
-        cuda,
-        file: "",
+const BLANK: Kernel = Kernel {
+    name: "",
+    entry: "",
+    metal: "",
+    cuda: "",
+    file: "",
+};
+
+impl Kernel {
+    /// A kernel with CUDA text alone.
+    pub fn cuda(name: &'static str, entry: &'static str, text: &'static str) -> Self {
+        Kernel {
+            name,
+            entry,
+            cuda: text,
+            ..BLANK
+        }
+    }
+
+    /// A kernel with Metal text alone.
+    pub fn metal(name: &'static str, entry: &'static str, text: &'static str) -> Self {
+        Kernel {
+            name,
+            entry,
+            metal: text,
+            ..BLANK
+        }
+    }
+
+    /// A kernel from recipe file `path`, backend by extension.
+    pub fn file(name: &'static str, entry: &'static str, path: &'static str) -> Self {
+        Kernel {
+            name,
+            entry,
+            file: path,
+            ..BLANK
+        }
     }
 }
 
-/// A kernel from recipe file `file`. It imports tessera headers.
+/// As `Kernel::cuda`.
+pub fn kernel(name: &'static str, entry: &'static str, cuda: &'static str) -> Kernel {
+    Kernel::cuda(name, entry, cuda)
+}
+
+/// As `Kernel::file`.
 pub fn imports(name: &'static str, entry: &'static str, file: &'static str) -> Kernel {
-    Kernel {
-        name,
-        entry,
-        metal: "",
-        cuda: "",
-        file,
-    }
+    Kernel::file(name, entry, file)
 }
 
 /// One recipe file, by its path inside the recipe.
@@ -114,54 +146,6 @@ pub enum Site {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scalars: Vec<Scalar>,
     },
-}
-
-/// A model region's step: one output, kept rows by slot.
-pub struct Step<'a> {
-    pub inputs: &'a [Input],
-    /// Elements of the output.
-    pub len: usize,
-    pub kept: &'a [Kept],
-    pub sums: &'a [usize],
-    pub scalars: &'a [Scalar],
-    /// Input places of tokens, positions, slots and picks.
-    pub ids: [usize; 4],
-}
-
-impl Site {
-    /// This site as a model region's step.
-    pub fn step(&self) -> Option<Step<'_>> {
-        let Site::Region {
-            kind: Kind::Model,
-            inputs,
-            outputs,
-            kept,
-            sums,
-            scalars,
-        } = self
-        else {
-            return None;
-        };
-        let (&[len], Some(first)) = (&outputs[..], kept.first()) else {
-            return None;
-        };
-        let [Some(slots), Some(positions)] = first.by else {
-            return None;
-        };
-        let ids = |i: &usize| inputs[*i].form == "u32" && ![slots, positions].contains(i);
-        // Exactly tokens then picks, else the site is new.
-        let &[tokens, picks] = &(0..inputs.len()).filter(ids).collect::<Vec<_>>()[..] else {
-            return None;
-        };
-        Some(Step {
-            inputs,
-            len,
-            kept,
-            sums,
-            scalars,
-            ids: [tokens, positions, slots, picks],
-        })
-    }
 }
 
 /// One op constant: an eps, a theta or a scale.
