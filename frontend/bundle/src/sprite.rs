@@ -60,7 +60,7 @@ fn checkpoint(dir: &Path) -> Result<PathBuf> {
 fn graph(dir: &Path, seqs: u64, module: Option<&Module>) -> Result<(Graph, Tables)> {
     let text = std::fs::read_to_string(dir.join("model_config.json"))?;
     if let Some(m) = module
-        && let Some(graph) = m.graph(&text, seqs)?
+        && let Some(graph) = m.graph(&text, seqs, None)?
     {
         return Ok((graph, m.tables(&text)?));
     }

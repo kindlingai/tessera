@@ -1,7 +1,7 @@
 //! EmbeddingGemma 2: a bidirectional encoder with per-layer embeddings.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Dense, SIZES, Side, Stack, listed as listed_ports, tokens};
+use crate::shared::{Attend, Dense, SIZES, Side, Stack};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,6 +10,7 @@ use tessera_trace::{
     Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Mask, Model, Norm, Pairs, Role, Scalar,
     Tensor, Weights, each,
 };
+use tessera_trace::{listed as listed_ports, tokens};
 
 /// A full-attention layer's head width, where it differs.
 pub(crate) const FULL_HEAD_DIM: DimName = DimName::named("FullHeadDim");

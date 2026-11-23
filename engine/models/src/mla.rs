@@ -1,12 +1,12 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
-use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, pick, rows, step_ports};
-use crate::shared::{swiglu, tokens};
+use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, rows, swiglu};
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
     Norm, Pairs, Role, Size, Tensor, TensorType, Vector, Weights,
 };
+use tessera_trace::{pick, step_ports, tokens};
 
 /// Width of the low-rank query.
 const Q_LATENT: DimName = DimName::named("QLatent");

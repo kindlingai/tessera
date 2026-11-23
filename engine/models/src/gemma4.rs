@@ -2,7 +2,7 @@
 
 use crate::eg2::{Attention, FULL_HEAD_DIM, Layer, PER_LAYER, after, context, full_layers};
 use crate::keys::Keys;
-use crate::shared::{self, Attend, Dense, Side, Stack};
+use crate::shared::{Attend, Dense, Side, Stack};
 use serde_json::json;
 use tessera_trace as trace;
 use trace::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Seqs};
@@ -315,7 +315,7 @@ pub fn program<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());
     let w: Gemma4<D> = trace::declare(&m);
     let heads = attention(&m, c);
-    let [tokens, positions] = shared::tokens(&m);
+    let [tokens, positions] = tessera_trace::tokens(&m);
     let pass = Pass {
         m: &m,
         c,
@@ -335,7 +335,7 @@ pub fn stepper<D: Dense>(c: &Config) -> Graph {
     let w: Gemma4<D> = trace::declare(&m);
     let heads = attention(&m, c);
     let masked = c.stack.steps == crate::Steps::Masked;
-    let ([tokens, positions, slots], allowed) = shared::step_ports(&m, masked);
+    let ([tokens, positions, slots], allowed) = tessera_trace::step_ports(&m, masked);
     let mut caches = Vec::new();
     for l in 0..c.first_shared {
         let ty = TensorType::new(
@@ -351,5 +351,5 @@ pub fn stepper<D: Dense>(c: &Config) -> Graph {
         step: Some((&slots, &caches)),
     };
     let logits = pass.logits(&w, &heads, &tokens);
-    shared::pick(&m, &logits, allowed.as_ref(), None)
+    tessera_trace::pick(&m, &logits, allowed.as_ref(), None)
 }

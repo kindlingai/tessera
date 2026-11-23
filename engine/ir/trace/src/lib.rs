@@ -4,10 +4,12 @@
 extern crate self as tessera_trace;
 
 mod model;
+mod ports;
 mod tensor;
 mod weights;
 
 pub use model::{Kept, Model};
+pub use ports::{FEW, listed, pick, ports, sparse_ports, step_ports, tokens};
 pub use tensor::Tensor;
 pub use tessera_graph::{
     Act, Composite, DType, Dim, DimExpr, DimName, EntryKind, Graph, Mask, Pairs, PathSeg, Port,

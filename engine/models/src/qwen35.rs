@@ -2,10 +2,11 @@
 
 use crate::decoder::{Mlp, Swiglu};
 use crate::keys::Keys;
-use crate::shared::{Attend, NOPE, ROPE, SIZES, Stack, part, tokens};
+use crate::shared::{Attend, NOPE, ROPE, SIZES, Stack, part};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::tokens;
 use tessera_trace::{
     Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg,
     Role, Taps, Tensor, Vector, Weights,
