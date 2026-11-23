@@ -2,7 +2,7 @@
 
 use crate::{Backend, Options, flatten};
 use std::sync::OnceLock;
-use tessera_graph::{Op, Order, Stage, View};
+use tessera_graph::{Act, Op, Order, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
 
@@ -24,12 +24,12 @@ fn flat(backend: Backend) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
-fn cuda_source() -> &'static str {
+pub(crate) fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
     CUDA.get_or_init(|| flat(Backend::Cuda))
 }
 
-fn hip_source() -> &'static str {
+pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
     HIP.get_or_init(|| flat(Backend::Hip))
 }
@@ -600,17 +600,67 @@ fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(kernel, [x, leaf], len)])
 }
 
-/// Streaming BF16 Tensor-Core small-batch matmul for CUDA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MmKind {
+    Bf16,
+    Bf16Split,
+    Mxfp8,
+    Mxfp8Wide,
+}
+
+impl MmKind {
+    fn name(self) -> &'static str {
+        match self {
+            MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide => "fast_mm_mxfp8",
+        }
+    }
+
+    fn entry(self) -> &'static str {
+        match self {
+            MmKind::Bf16 => "tessera_mm_bf16",
+            MmKind::Bf16Split => "tessera_mm_bf16_ks2",
+            MmKind::Mxfp8 => "tessera_mm_mxfp8_r8",
+            MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
+        }
+    }
+
+    fn smem(self) -> usize {
+        match self {
+            MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
+            MmKind::Bf16Split => (4 * 16 * 36 + 4 * 8 * 36) * 4,
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide => 4 * 16 * 36 * 4,
+        }
+    }
+
+    fn grid(self, m: usize, n: usize) -> (usize, usize) {
+        match self {
+            MmKind::Bf16 => (n / 32, m.div_ceil(16)),
+            MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
+            MmKind::Mxfp8 => (n / 16, 1),
+        }
+    }
+
+    fn step(self) -> f64 {
+        match self {
+            MmKind::Bf16 => 64.0,
+            MmKind::Bf16Split => 128.0,
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide => 512.0,
+        }
+    }
+}
+
+/// Streaming BF16 and MXFP8 Tensor-Core small-batch matmul.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = "fast_mm_bf16",
+    name = self.kind.name(),
     sizes = [self.m, self.n, self.k],
     work = self.m * self.n * self.k,
     accepts = mm_accepts,
     emits = f32_only,
-    needs = mm_needs(),
+    needs = mm_needs(self),
     order = Order::PerConfig,
-    source = cuda_source_entry("tessera_mm_bf16"),
+    source = cuda_source_entry(self.kind.entry()),
     launches = mm_launches,
     load = mm_load,
     unproven,
@@ -619,7 +669,8 @@ struct FastMm {
     m: usize,
     n: usize,
     k: usize,
-    add_mode: u32,
+    mode: u32,
+    kind: MmKind,
     form: &'static dyn Stored,
 }
 
@@ -627,10 +678,10 @@ fn mm_accepts(k: &FastMm, input: usize, form: &dyn Stored) -> bool {
     weight_accepts(input, k.form, form)
 }
 
-fn mm_needs() -> Needs {
+fn mm_needs(k: &FastMm) -> Needs {
     Needs {
         lanes: 32,
-        group_bytes: (2 * 16 * 36 + 4 * 8 * 36) * 4,
+        group_bytes: k.kind.smem(),
         group_threads: 128,
         compiler: true,
         lacks: &["metal", "rocm"],
@@ -640,17 +691,18 @@ fn mm_needs() -> Needs {
 }
 
 fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
-    let groups = (k.n / 32) * k.m.div_ceil(16);
-    let mut reads = vec![(2 * k.n * k.k) as f64, (4 * k.m * k.k) as f64];
-    if k.add_mode == 1 {
+    let (across, down) = k.kind.grid(k.m, k.n);
+    let groups = across * down;
+    let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (4 * k.m * k.k) as f64];
+    if matches!(k.mode, 1 | 3 | 4) {
         reads.push((4 * k.m * k.n) as f64);
-    } else if k.add_mode == 2 {
+    } else if k.mode == 2 {
         reads.push((4 * k.n) as f64);
     }
     let mut load = Load {
         threads: groups * 128,
         group: 128,
-        trips: k.k as f64 / 64.0,
+        trips: k.k as f64 / k.kind.step(),
         reads,
         written: (4 * k.m * k.n) as f64,
         flight: 1024.0,
@@ -661,12 +713,13 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
 }
 
 fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
+    let (across, down) = k.kind.grid(k.m, k.n);
     let shape = Shape::Grid {
-        across: k.n / 32,
-        down: k.m.div_ceil(16),
+        across,
+        down,
         threads: 128,
     };
-    let add = if k.add_mode != 0 {
+    let other = if matches!(k.mode, 1..=4) {
         step.read(2)
     } else {
         step.read(0)
@@ -674,17 +727,45 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
     let args = vec![
         step.read(0),
         step.read(1),
-        add,
+        other,
         step.out(),
         Arg::count(k.m),
         Arg::count(k.n),
         Arg::count(k.k),
-        Arg::value(&k.add_mode),
+        Arg::value(&k.mode),
     ];
     vec![Launch { args, shape }]
 }
 
-fn mm_site(tree: &Tree, mat: T) -> Option<(T, T, usize, usize, usize, &'static dyn Stored)> {
+struct MmSite {
+    x: T,
+    w: T,
+    m: usize,
+    n: usize,
+    k: usize,
+    kind: MmKind,
+    form: &'static dyn Stored,
+}
+
+impl MmSite {
+    fn draft(self, mode: u32, other: Option<T>) -> Vec<Draft> {
+        let kernel = FastMm {
+            m: self.m,
+            n: self.n,
+            k: self.k,
+            mode,
+            kind: self.kind,
+            form: self.form,
+        };
+        let mut reads = vec![self.x, self.w];
+        if let Some(extra) = other {
+            reads.push(extra);
+        }
+        vec![Draft::new(kernel, reads, self.m * self.n)]
+    }
+}
+
+fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
     let node = tree.node(mat);
     if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
         return None;
@@ -696,8 +777,7 @@ fn mm_site(tree: &Tree, mat: T) -> Option<(T, T, usize, usize, usize, &'static d
     let [n, k] = tree.node(w).shape[..] else {
         return None;
     };
-    let form = tree.node(w).form;
-    if form.name() != "bf16" || n == 0 || !n.is_multiple_of(32) || !k.is_multiple_of(64) {
+    if n == 0 || k == 0 {
         return None;
     }
     let elems = tree.elements(x);
@@ -705,7 +785,37 @@ fn mm_site(tree: &Tree, mat: T) -> Option<(T, T, usize, usize, usize, &'static d
         return None;
     }
     let m = elems / k;
-    (2..=64).contains(&m).then_some((x, w, m, n, k, form))
+    if !(2..=64).contains(&m) {
+        return None;
+    }
+    let form = tree.node(w).form;
+    let kind = match form.name() {
+        "bf16"
+            if n.is_multiple_of(16)
+                && k.is_multiple_of(128)
+                && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < 144) =>
+        {
+            MmKind::Bf16Split
+        }
+        "bf16" if n.is_multiple_of(32) && k.is_multiple_of(64) => MmKind::Bf16,
+        "mxfp8" if n.is_multiple_of(16) && k.is_multiple_of(512) => {
+            if m <= 8 {
+                MmKind::Mxfp8
+            } else {
+                MmKind::Mxfp8Wide
+            }
+        }
+        _ => return None,
+    };
+    Some(MmSite {
+        x,
+        w,
+        m,
+        n,
+        k,
+        kind,
+        form,
+    })
 }
 
 fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -715,45 +825,83 @@ fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let (a, b) = (node.args[0], *node.args.get(1)?);
     for (mat, add) in [(a, b), (b, a)] {
-        if tree.root(mat) || tree.node(add).form.name() != "f32" {
+        if mat == add || tree.root(mat) || tree.node(add).form.name() != "f32" {
             continue;
         }
-        let Some((x, w, m, n, k, form)) = mm_site(tree, mat) else {
+        let Some(site) = mm_site(tree, mat) else {
             continue;
         };
+        let add_node = tree.node(add);
         let add_elems = tree.elements(add);
-        let add_mode = if add_elems == m * n {
+        let mode = if add_elems == site.m * site.n && add_node.shape == node.shape {
             1
-        } else if add_elems == n {
+        } else if add_elems == site.n && add_node.shape.last() == Some(&site.n) {
             2
         } else {
             continue;
         };
-        let kernel = FastMm {
-            m,
-            n,
-            k,
-            add_mode,
-            form,
-        };
-        return Some(vec![Draft::new(kernel, [x, w, add], m * n)]);
+        return Some(site.draft(mode, Some(add)));
     }
     None
 }
 
-fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn propose_mm_mul(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let node = tree.node(at);
+    if node.term != Term::Stage(Stage::Mul) || node.form.name() != "f32" {
+        return None;
+    }
+    let (a, b) = (node.args[0], *node.args.get(1)?);
+    let silu = Term::Stage(Stage::Act(Act::Silu));
+    for (cand, other) in [(a, b), (b, a)] {
+        if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
+            continue;
+        }
+        let cnode = tree.node(cand);
+        if cnode.term != silu || cnode.form.name() != "f32" {
+            continue;
+        }
+        let mat = cnode.args[0];
+        if mat == other || tree.root(mat) {
+            continue;
+        }
+        let Some(site) = mm_site(tree, mat) else {
+            continue;
+        };
+        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
+            return Some(site.draft(3, Some(other)));
+        }
+    }
+    for (mat, other) in [(a, b), (b, a)] {
+        if mat == other || tree.root(mat) || tree.node(other).form.name() != "f32" {
+            continue;
+        }
+        let Some(site) = mm_site(tree, mat) else {
+            continue;
+        };
+        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
+            return Some(site.draft(4, Some(other)));
+        }
+    }
+    None
+}
+
+pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if let Some(drafts) = propose_mm_add(tree, at) {
         return Some(drafts);
     }
-    let (x, w, m, n, k, form) = mm_site(tree, at)?;
-    let kernel = FastMm {
-        m,
-        n,
-        k,
-        add_mode: 0,
-        form,
-    };
-    Some(vec![Draft::new(kernel, [x, w], m * n)])
+    if let Some(drafts) = propose_mm_mul(tree, at) {
+        return Some(drafts);
+    }
+    let node = tree.node(at);
+    if node.term == Term::Stage(Stage::Act(Act::Silu)) && node.form.name() == "f32" {
+        let mat = node.args[0];
+        if !tree.root(mat)
+            && let Some(site) = mm_site(tree, mat)
+        {
+            return Some(site.draft(5, None));
+        }
+    }
+    Some(mm_site(tree, at)?.draft(0, None))
 }
 
 tessera_lower::rule!("trellis_mma", propose_trellis);

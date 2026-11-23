@@ -7,6 +7,8 @@ pub mod layout;
 #[cfg(test)]
 mod layout_test;
 mod linear;
+#[cfg(test)]
+mod linear_test;
 pub mod proxy;
 #[cfg(test)]
 mod proxy_test;

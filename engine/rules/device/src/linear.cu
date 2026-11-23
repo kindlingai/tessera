@@ -303,92 +303,314 @@ static __device__ __forceinline__ void fg_mma_bf16(float d[4], const u32 a[4], c
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
-extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
-    const float* x, const u16* w, const float* add, float* out, u32 m, u32 n, u32 k,
-    u32 add_mode) {
-    __shared__ __align__(16) u32 sxh[16][36];
-    __shared__ __align__(16) u32 sxl[16][36];
-    __shared__ __align__(16) u32 sw[4][8][36];
+static __device__ __forceinline__ float fg_silu(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+static __device__ __forceinline__ float fg_epilogue(float v, const float* other, u64 off, u32 col,
+                                                    u32 mode) {
+    if (mode == 1u) return v + other[off];
+    if (mode == 2u) return v + other[col];
+    if (mode == 3u) return fg_silu(v) * other[off];
+    if (mode == 4u) return v * other[off];
+    if (mode == 5u) return fg_silu(v);
+    return v;
+}
+
+static __device__ __forceinline__ float2 fg_epilogue2(float v0, float v1, const float* other,
+                                                      u64 off, u32 col, u32 mode) {
+    if (mode == 0u) return make_float2(v0, v1);
+    if (mode == 5u) return make_float2(fg_silu(v0), fg_silu(v1));
+    float2 b = *reinterpret_cast<const float2*>(other + (mode == 2u ? u64(col) : off));
+    if (mode == 1u || mode == 2u) return make_float2(v0 + b.x, v1 + b.y);
+    if (mode == 3u) return make_float2(fg_silu(v0) * b.x, fg_silu(v1) * b.y);
+    return make_float2(v0 * b.x, v1 * b.y);
+}
+
+static __device__ __forceinline__ u16 fg_u16_at(const u32* s, u32 byte_off) {
+    u32 w = byte_off >> 2;
+    u32 sh = (byte_off & 3u) << 3;
+    if (sh <= 16u) return static_cast<u16>(s[w] >> sh);
+    u32 out;
+    asm("shf.r.clamp.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(s[w]), "r"(s[w + 1u]), "r"(sh));
+    return static_cast<u16>(out);
+}
+
+static __device__ __forceinline__ u32 fg_e4m3_f16(u16 q) {
+    u32 h;
+    asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h) : "h"(q));
+    return h;
+}
+
+template <u32 KS>
+struct alignas(16) fg_bf16_smem {
+    u32 sxh[KS][16][36];
+    u32 sxl[KS][16][36];
+    union {
+        u32 sw[4][8][36];
+        float4 red[2][32];
+    } u;
+};
+
+template <u32 KS>
+static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, const float* other,
+                                                  float* out, u32 m, u32 n, u32 k, u32 mode,
+                                                  fg_bf16_smem<KS>& sm) {
+    constexpr u32 NTILES = 4u / KS;
+    constexpr u32 BN = 8u * NTILES;
+    constexpr u32 BK = 64u * KS;
     u32 warp = threadIdx.x >> 5;
     u32 lane = threadIdx.x & 31u;
     u32 g = lane >> 2;
     u32 t = lane & 3u;
+    u32 wt = warp % NTILES;
+    u32 kp = warp / NTILES;
     u32 r0 = blockIdx.y << 4;
-    u32 n0 = (blockIdx.x << 5) + (warp << 3);
-    const u16* wr = w + u64(n0 + g) * k;
+    u32 n0 = blockIdx.x * BN + (wt << 3);
+    const u16* wr = w + u64(n0 + g) * k + (kp << 6);
     u32 xr = threadIdx.x >> 4;
     u32 xc = (threadIdx.x & 15u) << 2;
     u32 xw = (threadIdx.x & 15u) << 1;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     uint4 cur0 = fg_ld_nc4(wr + (t << 3));
     uint4 cur1 = fg_ld_nc4(wr + 32u + (t << 3));
-    for (u32 k0 = 0u; k0 < k; k0 += 64u) {
+    for (u32 k0 = 0u; k0 < k; k0 += BK) {
 #pragma unroll
-        for (u32 dr = 0u; dr < 16u; dr += 8u) {
-            u32 r = xr + dr;
-            if (r0 + r < m) {
-                float4 xv = *reinterpret_cast<const float4*>(x + u64(r0 + r) * k + k0 + xc);
-                u32 h0 = fg_bf16x2(xv.x, xv.y);
-                u32 h1 = fg_bf16x2(xv.z, xv.w);
-                u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16),
-                                   xv.y - __uint_as_float(h0 & 0xFFFF0000u));
-                u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16),
-                                   xv.w - __uint_as_float(h1 & 0xFFFF0000u));
-                *reinterpret_cast<uint2*>(&sxh[r][xw]) = make_uint2(h0, h1);
-                *reinterpret_cast<uint2*>(&sxl[r][xw]) = make_uint2(l0, l1);
-            } else {
-                *reinterpret_cast<uint2*>(&sxh[r][xw]) = make_uint2(0u, 0u);
-                *reinterpret_cast<uint2*>(&sxl[r][xw]) = make_uint2(0u, 0u);
+        for (u32 s = 0u; s < KS; s++) {
+#pragma unroll
+            for (u32 dr = 0u; dr < 16u; dr += 8u) {
+                u32 r = xr + dr;
+                if (r0 + r < m) {
+                    const float* xp = x + u64(r0 + r) * k + k0 + (s << 6) + xc;
+                    float4 xv = *reinterpret_cast<const float4*>(xp);
+                    u32 h0 = fg_bf16x2(xv.x, xv.y);
+                    u32 h1 = fg_bf16x2(xv.z, xv.w);
+                    u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16),
+                                       xv.y - __uint_as_float(h0 & 0xFFFF0000u));
+                    u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16),
+                                       xv.w - __uint_as_float(h1 & 0xFFFF0000u));
+                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(h0, h1);
+                    *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(l0, l1);
+                } else {
+                    *reinterpret_cast<uint2*>(&sm.sxh[s][r][xw]) = make_uint2(0u, 0u);
+                    *reinterpret_cast<uint2*>(&sm.sxl[s][r][xw]) = make_uint2(0u, 0u);
+                }
             }
         }
-        *reinterpret_cast<uint4*>(&sw[warp][g][t << 2]) = cur0;
-        *reinterpret_cast<uint4*>(&sw[warp][g][16u + (t << 2)]) = cur1;
+        *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2]) = cur0;
+        *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][16u + (t << 2)]) = cur1;
         prim::block_sync();
-        if (k0 + 64u < k) {
-            cur0 = fg_ld_nc4(wr + k0 + 64u + (t << 3));
-            cur1 = fg_ld_nc4(wr + k0 + 96u + (t << 3));
+        if (k0 + BK < k) {
+            cur0 = fg_ld_nc4(wr + k0 + BK + (t << 3));
+            cur1 = fg_ld_nc4(wr + k0 + BK + 32u + (t << 3));
         }
 #pragma unroll
         for (u32 ks = 0u; ks < 4u; ks++) {
             u32 ah[4], al[4], b[2];
             u32 off = (ks << 3) + t;
-            ah[0] = sxh[g][off];
-            ah[1] = sxh[g + 8u][off];
-            ah[2] = sxh[g][off + 4u];
-            ah[3] = sxh[g + 8u][off + 4u];
-            al[0] = sxl[g][off];
-            al[1] = sxl[g + 8u][off];
-            al[2] = sxl[g][off + 4u];
-            al[3] = sxl[g + 8u][off + 4u];
-            b[0] = sw[warp][g][off];
-            b[1] = sw[warp][g][off + 4u];
+            ah[0] = sm.sxh[kp][g][off];
+            ah[1] = sm.sxh[kp][g + 8u][off];
+            ah[2] = sm.sxh[kp][g][off + 4u];
+            ah[3] = sm.sxh[kp][g + 8u][off + 4u];
+            al[0] = sm.sxl[kp][g][off];
+            al[1] = sm.sxl[kp][g + 8u][off];
+            al[2] = sm.sxl[kp][g][off + 4u];
+            al[3] = sm.sxl[kp][g + 8u][off + 4u];
+            b[0] = sm.u.sw[warp][g][off];
+            b[1] = sm.u.sw[warp][g][off + 4u];
             fg_mma_bf16(acc, ah, b);
             fg_mma_bf16(acc, al, b);
         }
         prim::block_sync();
     }
+    if constexpr (KS == 2u) {
+        if (kp == 1u) sm.u.red[wt][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        prim::block_sync();
+        if (kp != 0u) return;
+        float4 p = sm.u.red[wt][lane];
+        acc[0] += p.x;
+        acc[1] += p.y;
+        acc[2] += p.z;
+        acc[3] += p.w;
+    }
     u32 col = n0 + (t << 1);
     if (r0 + g < m) {
         u64 off = u64(r0 + g) * n + col;
-        float2 v = make_float2(acc[0], acc[1]);
-        if (add_mode != 0u) {
-            float2 b = *reinterpret_cast<const float2*>(add + (add_mode == 1u ? off : u64(col)));
-            v.x += b.x;
-            v.y += b.y;
-        }
-        *reinterpret_cast<float2*>(out + off) = v;
+        *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[0], acc[1], other, off, col, mode);
     }
     if (r0 + g + 8u < m) {
         u64 off = u64(r0 + g + 8u) * n + col;
-        float2 v = make_float2(acc[2], acc[3]);
-        if (add_mode != 0u) {
-            float2 b = *reinterpret_cast<const float2*>(add + (add_mode == 1u ? off : u64(col)));
-            v.x += b.x;
-            v.y += b.y;
-        }
-        *reinterpret_cast<float2*>(out + off) = v;
+        *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[2], acc[3], other, off, col, mode);
     }
+}
+
+// Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
+extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
+    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    __shared__ fg_bf16_smem<1u> sm;
+    fg_bf16_mm<1u>(x, w, other, out, m, n, k, mode, sm);
+}
+
+// Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
+extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_ks2(
+    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    __shared__ fg_bf16_smem<2u> sm;
+    fg_bf16_mm<2u>(x, w, other, out, m, n, k, mode, sm);
+}
+
+union alignas(16) fg_mx_smem {
+    u32 sw[4][16][36];
+    float red[4][16][17];
+};
+
+template <u32 NT>
+static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, const float* other,
+                                                   float* out, u32 m, u32 n, u32 k, u32 mode,
+                                                   fg_mx_smem& sm) {
+    u32 warp = threadIdx.x >> 5;
+    u32 lane = threadIdx.x & 31u;
+    u32 g = lane >> 2;
+    u32 t = lane & 3u;
+    u32 r0 = blockIdx.y * (NT << 3);
+    u32 n0 = blockIdx.x << 4;
+    u64 row_bytes = u64(k >> 5) * 33ull;
+    u32 chunks = k >> 9;
+    u32 w_base = warp << 7;
+    u32 shift = warp << 2;
+    u32 x_off = warp << 7;
+    u32 lr = lane >> 3;
+    u32 lc = (lane & 7u) << 4;
+    const u8* w0 = w + u64(n0) * row_bytes + w_base;
+    const u8* wp0 = w0 + u64(lr) * row_bytes + lc;
+    const u8* wp1 = wp0 + 4ull * row_bytes;
+    const u8* wp2 = wp0 + 8ull * row_bytes;
+    const u8* wp3 = wp0 + 12ull * row_bytes;
+    const u8* wp4 = w0 + u64(lane & 15u) * row_bytes + 128u;
+    float acc[NT][4];
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        acc[ti][0] = 0.0f;
+        acc[ti][1] = 0.0f;
+        acc[ti][2] = 0.0f;
+        acc[ti][3] = 0.0f;
+    }
+    uint4 cur0 = fg_ld_nc4(wp0);
+    uint4 cur1 = fg_ld_nc4(wp1);
+    uint4 cur2 = fg_ld_nc4(wp2);
+    uint4 cur3 = fg_ld_nc4(wp3);
+    uint4 cur4;
+    if (lane < 16u) cur4 = fg_ld_nc4(wp4);
+    const u32* sw0 = sm.sw[warp][g];
+    const u32* sw1 = sm.sw[warp][g + 8u];
+    const u8* sb0 = reinterpret_cast<const u8*>(sw0);
+    const u8* sb1 = reinterpret_cast<const u8*>(sw1);
+    for (u32 ch = 0u; ch < chunks; ch++) {
+        __syncwarp();
+        *reinterpret_cast<uint4*>(&sm.sw[warp][lr][lc >> 2]) = cur0;
+        *reinterpret_cast<uint4*>(&sm.sw[warp][lr + 4u][lc >> 2]) = cur1;
+        *reinterpret_cast<uint4*>(&sm.sw[warp][lr + 8u][lc >> 2]) = cur2;
+        *reinterpret_cast<uint4*>(&sm.sw[warp][lr + 12u][lc >> 2]) = cur3;
+        if (lane < 16u) *reinterpret_cast<uint4*>(&sm.sw[warp][lane][32u]) = cur4;
+        __syncwarp();
+        if (ch + 1u < chunks) {
+            u64 next_off = u64(ch + 1u) * 528ull;
+            cur0 = fg_ld_nc4(wp0 + next_off);
+            cur1 = fg_ld_nc4(wp1 + next_off);
+            cur2 = fg_ld_nc4(wp2 + next_off);
+            cur3 = fg_ld_nc4(wp3 + next_off);
+            if (lane < 16u) cur4 = fg_ld_nc4(wp4 + next_off);
+        }
+#pragma unroll
+        for (u32 blk = 0u; blk < 4u; blk++) {
+            u32 b_off = shift + blk * 33u;
+            u32 e0 = sb0[b_off];
+            u32 e1 = sb1[b_off];
+            float sc0 = __uint_as_float(e0 == 0u ? 0x00400000u : (e0 << 23));
+            float sc1 = __uint_as_float(e1 == 0u ? 0x00400000u : (e1 << 23));
+            float tmp[NT][4];
+#pragma unroll
+            for (u32 ti = 0u; ti < NT; ti++) {
+                tmp[ti][0] = 0.0f;
+                tmp[ti][1] = 0.0f;
+                tmp[ti][2] = 0.0f;
+                tmp[ti][3] = 0.0f;
+            }
+#pragma unroll
+            for (u32 ks = 0u; ks < 2u; ks++) {
+                u32 q_off = b_off + 1u + (ks << 4) + (t << 1);
+                u32 a[4];
+                a[0] = fg_e4m3_f16(fg_u16_at(sw0, q_off));
+                a[1] = fg_e4m3_f16(fg_u16_at(sw1, q_off));
+                a[2] = fg_e4m3_f16(fg_u16_at(sw0, q_off + 8u));
+                a[3] = fg_e4m3_f16(fg_u16_at(sw1, q_off + 8u));
+                u32 k_col = (ch << 9) + x_off + (blk << 5) + (ks << 4) + (t << 1);
+#pragma unroll
+                for (u32 ti = 0u; ti < NT; ti++) {
+                    u32 tok = r0 + (ti << 3) + g;
+                    u32 bh[2] = {0u, 0u};
+                    u32 bl[2] = {0u, 0u};
+                    if (tok < m) {
+                        const float* xp = x + u64(tok) * k + k_col;
+                        float2 v0 = *reinterpret_cast<const float2*>(xp);
+                        float2 v1 = *reinterpret_cast<const float2*>(xp + 8u);
+                        bh[0] = trellis::f32x2_to_f16x2(v0.x, v0.y);
+                        bh[1] = trellis::f32x2_to_f16x2(v1.x, v1.y);
+                        bl[0] = trellis::f32x2_to_f16x2(
+                            v0.x - trellis::f16_to_f32(bh[0] & 0xFFFFu),
+                            v0.y - trellis::f16_to_f32(bh[0] >> 16));
+                        bl[1] = trellis::f32x2_to_f16x2(
+                            v1.x - trellis::f16_to_f32(bh[1] & 0xFFFFu),
+                            v1.y - trellis::f16_to_f32(bh[1] >> 16));
+                    }
+                    trellis::mma_m16n8k16(tmp[ti], a, bh);
+                    trellis::mma_m16n8k16(tmp[ti], a, bl);
+                }
+            }
+#pragma unroll
+            for (u32 ti = 0u; ti < NT; ti++) {
+                acc[ti][0] = fmaf(sc0, tmp[ti][0], acc[ti][0]);
+                acc[ti][1] = fmaf(sc0, tmp[ti][1], acc[ti][1]);
+                acc[ti][2] = fmaf(sc1, tmp[ti][2], acc[ti][2]);
+                acc[ti][3] = fmaf(sc1, tmp[ti][3], acc[ti][3]);
+            }
+        }
+    }
+    prim::block_sync();
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        u32 tr = (ti << 3) + (t << 1);
+        sm.red[warp][tr][g] = acc[ti][0];
+        sm.red[warp][tr + 1u][g] = acc[ti][1];
+        sm.red[warp][tr][g + 8u] = acc[ti][2];
+        sm.red[warp][tr + 1u][g + 8u] = acc[ti][3];
+    }
+    prim::block_sync();
+    u32 col = threadIdx.x & 15u;
+    u32 tr0 = threadIdx.x >> 4;
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        u32 tr = tr0 + (ti << 3);
+        if (r0 + tr < m) {
+            float v = sm.red[0][tr][col] + sm.red[1][tr][col] + sm.red[2][tr][col] +
+                      sm.red[3][tr][col];
+            u64 off = u64(r0 + tr) * n + n0 + col;
+            out[off] = fg_epilogue(v, other, off, n0 + col, mode);
+        }
+    }
+}
+
+// Streaming MXFP8 Tensor-Core matmul, up to 8 rows per block.
+extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8(
+    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    __shared__ fg_mx_smem sm;
+    fg_mxfp8_mm<1u>(x, w, other, out, m, n, k, mode, sm);
+}
+
+// Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
+extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16(
+    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    __shared__ fg_mx_smem sm;
+    fg_mxfp8_mm<2u>(x, w, other, out, m, n, k, mode, sm);
 }
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
