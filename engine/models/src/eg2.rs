@@ -7,9 +7,14 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Mask, Model, Norm, Pairs, Role, Scalar, Tensor,
-    Weights, each,
+    Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Mask, Model, Norm, Pairs, Role, Scalar,
+    Tensor, Weights, each,
 };
+
+/// A full-attention layer's head width, where it differs.
+pub(crate) const FULL_HEAD_DIM: DimName = DimName::named("FullHeadDim");
+/// Width of a per-layer embedding.
+pub(crate) const PER_LAYER: DimName = DimName::named("PerLayer");
 
 pub struct Config {
     /// Its `head_dim` is a sliding layer's.
@@ -86,7 +91,7 @@ impl Config {
     /// Layer `l`'s head width and key head count.
     pub fn heads(&self, l: u64) -> [DimExpr; 2] {
         match self.full(l) {
-            true => [FullHeadDim.into(), 1u64.into()],
+            true => [FULL_HEAD_DIM.into(), 1u64.into()],
             false => [HeadDim.into(), KvHeads.into()],
         }
     }
@@ -94,8 +99,8 @@ impl Config {
     pub fn dims(&self) -> Vec<Dim> {
         self.stack.dims(&[
             (KvHeads, self.kv_heads),
-            (FullHeadDim, self.full_head_dim),
-            (PerLayer, self.per_layer),
+            (FULL_HEAD_DIM, self.full_head_dim),
+            (PER_LAYER, self.per_layer),
             (Embedding, self.embedding),
         ])
     }
@@ -135,11 +140,11 @@ pub struct Layer<D: Dense> {
     #[shape(Hidden)]
     pub post_ff: Norm,
     /// This layer's rows of the shared per-layer projection.
-    #[shape(Hidden, PerLayer)]
+    #[shape(Hidden, PER_LAYER)]
     pub ple_in: D,
-    #[shape(Hidden, PerLayer)]
+    #[shape(Hidden, PER_LAYER)]
     pub ple_gate: D,
-    #[shape(PerLayer, Hidden)]
+    #[shape(PER_LAYER, Hidden)]
     pub ple_proj: D,
     #[shape(Hidden)]
     pub ple_norm: Norm,
@@ -154,7 +159,7 @@ pub struct Eg2<D: Dense> {
     pub embed: Embed,
     #[shape(Layers)]
     pub layers: Vec<Layer<D>>,
-    #[shape(PerLayer)]
+    #[shape(PER_LAYER)]
     pub ple_norm: Norm,
     #[shape(Hidden)]
     pub norm: Norm,

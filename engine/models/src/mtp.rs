@@ -1,7 +1,7 @@
 //! Multi-Token Prediction (MTP) one-layer MLA drafter.
 
 use crate::dflash_shard::{adopt_split, insert_stage, shard_topk, split_weight};
-use crate::mla::{self, Attention, Config, Index, Indexer, Routed};
+use crate::mla::{self, Attention, Config, INDEX_LAYERS, Index, Indexer, Routed};
 use crate::shared::Steps;
 use tessera_graph::{
     Graph, NodeId, Op, Parts, PathSeg, Placement, Sharded, Shares, Stage, VerifyError, shard_mode,
@@ -44,7 +44,7 @@ pub struct Mtp<R: Routed> {
     #[shape(Hidden * 2, Hidden)]
     pub eh_proj: Linear,
     pub attn: Attention,
-    #[shape(IndexLayers)]
+    #[shape(INDEX_LAYERS)]
     pub indexers: Vec<Indexer>,
     #[shape(Hidden)]
     pub mlp_norm: Norm,

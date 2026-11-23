@@ -9,6 +9,10 @@ use tessera_trace::{
     declare, each,
 };
 
+const NOPE: DimName = DimName::named("Nope");
+const LATENT: DimName = DimName::named("Latent");
+const INDEX_KEEP: DimName = DimName::named("IndexKeep");
+
 #[derive(Weights)]
 struct Layer {
     #[shape(Hidden, Ffn)]
@@ -36,7 +40,7 @@ struct Turned {
 /// Per head: key rows, then value rows.
 #[derive(Weights)]
 struct Blocks {
-    #[shape(Latent, Heads * (Nope + HeadDim))]
+    #[shape(LATENT, Heads * (NOPE + HeadDim))]
     w: Linear,
 }
 
@@ -123,18 +127,18 @@ pub fn chain(bounded: &[Dim], k: u64, n: u64, pairs: u64) -> Graph {
 pub fn blocks(bounded: &[Dim], [heads, key, value]: [u64; 3]) -> Graph {
     let fixed = [
         (Heads, heads),
-        (Nope, key),
+        (NOPE, key),
         (HeadDim, value),
-        (Latent, value),
+        (LATENT, value),
     ];
     let m = model(bounded, &fixed);
     let w: Blocks = declare(&m);
-    let ports = [floats([Heads, Rows, Nope]), floats([Heads, Rows, Latent])];
+    let ports = [floats([Heads, Rows, NOPE]), floats([Heads, Rows, LATENT])];
     let [q, o] = m.entry(EntryKind::Forward, ports);
-    let shape = || vec![Heads.into(), Nope + HeadDim, Latent.into()];
+    let shape = || vec![Heads.into(), NOPE + HeadDim, LATENT.into()];
     let set = || w.w.stored().reshape(shape());
-    let keys = q.matmul_rows(&set().slice(1, 0u64, Nope).permute(&[0, 2, 1]));
-    let values = o.matmul_rows(&set().slice(1, Nope, HeadDim));
+    let keys = q.matmul_rows(&set().slice(1, 0u64, NOPE).permute(&[0, 2, 1]));
+    let values = o.matmul_rows(&set().slice(1, NOPE, HeadDim));
     m.finish([(Role::Logits, &keys), (Role::Logits, &values)])
 }
 
@@ -312,7 +316,7 @@ pub fn neighbours(bounded: &[Dim], [rows, taps, width]: [u64; 3]) -> Graph {
 
 /// Scores pick each query's best keys for attention.
 pub fn indexed(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
-    let fixed = [(Heads, heads), (HeadDim, width), (IndexKeep, keep)];
+    let fixed = [(Heads, heads), (HeadDim, width), (INDEX_KEEP, keep)];
     let m = model(bounded, &fixed);
     let heads = || floats([Seqs, Context, Heads, HeadDim]);
     let rows = floats([Seqs, Context, HeadDim]);
@@ -329,7 +333,7 @@ pub fn indexed(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
     let k = shared.slice(3, 0u64, half).concat(&v.slice(3, half, half));
     let scores = x.matmul_rows(&x);
     let scores = scores.add(&scores.permute(&[0, 2, 1]));
-    let ids = scores.mask(Mask::Causal).top_k(IndexKeep);
+    let ids = scores.mask(Mask::Causal).top_k(INDEX_KEEP);
     let out = m.attend(Mask::Causal, 0.25, [&q, &k, &v], Some(&ids));
     m.finish([(Role::Logits, &out)])
 }
@@ -343,7 +347,7 @@ pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
         (Context, 8),
         (Heads, heads),
         (HeadDim, width),
-        (IndexKeep, keep),
+        (INDEX_KEEP, keep),
     ];
     let m = model(&rows, &fixed);
     let keys = || floats([Seqs, Context, Heads, HeadDim]);
@@ -356,7 +360,7 @@ pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
         ids([Rows]),
     ];
     let [q, k, v, scores, slots, at] = m.entry(EntryKind::Forward, ports);
-    let picked = scores.causal(&at).top_k(IndexKeep);
+    let picked = scores.causal(&at).top_k(INDEX_KEEP);
     let out = m.attend_rows(
         Mask::Causal,
         0.25,

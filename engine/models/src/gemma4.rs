@@ -1,11 +1,11 @@
 //! Gemma 4 text: a causal decoder with per-layer embeddings.
 
-use crate::eg2::{Attention, Layer, after, context, full_layers};
+use crate::eg2::{Attention, FULL_HEAD_DIM, Layer, PER_LAYER, after, context, full_layers};
 use crate::keys::Keys;
 use crate::shared::{self, Attend, Dense, Side, Stack};
 use serde_json::json;
 use tessera_trace as trace;
-use trace::DimName::{Context, FullHeadDim, HeadDim, Heads, KvHeads, PerLayer, Rows, Seqs};
+use trace::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Seqs};
 use trace::{Act, Composite, Dim, DimExpr, Embed, Graph, Kept, Mask, Model, Norm, Pairs, PathSeg};
 use trace::{Role, Size, Tensor, TensorType, Weights};
 
@@ -113,7 +113,7 @@ impl Config {
     /// Layer `l`'s head width.
     pub fn width(&self, l: u64) -> DimExpr {
         match self.full(l) {
-            true => FullHeadDim.into(),
+            true => FULL_HEAD_DIM.into(),
             false => HeadDim.into(),
         }
     }
@@ -121,8 +121,8 @@ impl Config {
     pub fn dims(&self) -> Vec<Dim> {
         self.stack.dims(&[
             (KvHeads, self.kv_heads),
-            (FullHeadDim, self.full_head_dim),
-            (PerLayer, self.per_layer),
+            (FULL_HEAD_DIM, self.full_head_dim),
+            (PER_LAYER, self.per_layer),
         ])
     }
 }
@@ -154,11 +154,11 @@ struct Gemma4<D: Dense> {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
     /// Each token's per-layer input, the layers side by side.
-    #[shape(Vocab, Layers * PerLayer)]
+    #[shape(Vocab, Layers * PER_LAYER)]
     pub ple_embed: Embed,
     #[shape(Layers)]
     pub layers: Vec<Layer<D>>,
-    #[shape(PerLayer)]
+    #[shape(PER_LAYER)]
     pub ple_norm: Norm,
     #[shape(Hidden)]
     pub norm: Norm,

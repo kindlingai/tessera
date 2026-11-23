@@ -2,14 +2,23 @@
 
 use crate::decoder::{Mlp, Swiglu};
 use crate::keys::Keys;
-use crate::shared::{Attend, SIZES, Stack, part, tokens};
+use crate::shared::{Attend, NOPE, ROPE, SIZES, Stack, part, tokens};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, Composite, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg, Role,
-    Taps, Tensor, Vector, Weights,
+    Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg,
+    Role, Taps, Tensor, Vector, Weights,
 };
+
+/// A linear-attention layer's query and key heads.
+const KEY_HEADS: DimName = DimName::named("KeyHeads");
+/// A linear-attention layer's value heads.
+const VALUE_HEADS: DimName = DimName::named("ValueHeads");
+const KEY_DIM: DimName = DimName::named("KeyDim");
+const VALUE_DIM: DimName = DimName::named("ValueDim");
+/// Rows a causal filter reads, its own included.
+const WINDOW: DimName = DimName::named("Window");
 
 pub struct Config {
     /// `heads` and `head_dim` are the full-attention layers'.
@@ -94,14 +103,14 @@ impl Config {
         );
         let mut own = vec![
             (KvHeads, self.kv_heads),
-            (KeyHeads, l.key_heads),
-            (ValueHeads, l.value_heads),
-            (KeyDim, l.key_dim),
-            (ValueDim, l.value_dim),
-            (Window, l.window),
+            (KEY_HEADS, l.key_heads),
+            (VALUE_HEADS, l.value_heads),
+            (KEY_DIM, l.key_dim),
+            (VALUE_DIM, l.value_dim),
+            (WINDOW, l.window),
         ];
         if self.partial() {
-            own.extend([(Rope, self.rotary), (Nope, width - self.rotary)]);
+            own.extend([(ROPE, self.rotary), (NOPE, width - self.rotary)]);
         }
         self.stack.dims(&own)
     }
@@ -144,7 +153,7 @@ impl Full {
         let mut heads =
             Attend::new(&self.o, lead, shape).rotary(positions, c.rope_theta, Pairs::Halves);
         if c.partial() {
-            heads = heads.partial([Rope.into(), Nope.into()]);
+            heads = heads.partial([ROPE.into(), NOPE.into()]);
         }
         let both = heads.split(h.matmul(&self.q), Heads, HeadDim * 2u64);
         let q = norm(&both.slice(3, 0u64, HeadDim), &self.q_norm, c.eps);
@@ -166,27 +175,27 @@ impl Full {
 #[derive(Weights)]
 pub struct DeltaNet {
     /// Queries, keys, then values, all through the filter.
-    #[shape(Hidden, KeyHeads * KeyDim * 2 + ValueHeads * ValueDim)]
+    #[shape(Hidden, KEY_HEADS * KEY_DIM * 2 + VALUE_HEADS * VALUE_DIM)]
     pub qkv: Linear,
     /// The output gate.
-    #[shape(Hidden, ValueHeads * ValueDim)]
+    #[shape(Hidden, VALUE_HEADS * VALUE_DIM)]
     pub z: Linear,
     /// Write rates, before the sigmoid.
-    #[shape(Hidden, ValueHeads)]
+    #[shape(Hidden, VALUE_HEADS)]
     pub b: Linear,
     /// Decays, before the bias and softplus.
-    #[shape(Hidden, ValueHeads)]
+    #[shape(Hidden, VALUE_HEADS)]
     pub a: Linear,
-    #[shape(KeyHeads * KeyDim * 2 + ValueHeads * ValueDim, Window)]
+    #[shape(KEY_HEADS * KEY_DIM * 2 + VALUE_HEADS * VALUE_DIM, WINDOW)]
     pub conv: Taps,
-    #[shape(ValueHeads)]
+    #[shape(VALUE_HEADS)]
     pub dt_bias: Vector,
     /// The log of each value head's decay speed.
-    #[shape(ValueHeads)]
+    #[shape(VALUE_HEADS)]
     pub a_log: Vector,
-    #[shape(ValueDim)]
+    #[shape(VALUE_DIM)]
     pub norm: Norm,
-    #[shape(ValueHeads * ValueDim, Hidden)]
+    #[shape(VALUE_HEADS * VALUE_DIM, Hidden)]
     pub out: Linear,
 }
 
@@ -194,13 +203,13 @@ impl DeltaNet {
     /// Normed rows `h` `[Seqs, Context, Hidden]`.
     pub fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
         let rows = |a: DimExpr, b: DimExpr| vec![Seqs.into(), Context.into(), a, b];
-        let keys = KeyHeads * KeyDim;
-        let values = ValueHeads * ValueDim;
+        let keys = KEY_HEADS * KEY_DIM;
+        let values = VALUE_HEADS * VALUE_DIM;
         let mixed = h.matmul(&self.qkv).conv(&self.conv).act(Act::Silu);
         let split = |start: DimExpr, len: DimExpr, [heads, width]: [DimExpr; 2]| {
             mixed.slice(2, start, len).reshape(rows(heads, width))
         };
-        let key = [KeyHeads.into(), KeyDim.into()];
+        let key = [KEY_HEADS.into(), KEY_DIM.into()];
         let (q, k) = (
             split(0u64.into(), keys.clone(), key.clone()),
             split(keys.clone(), keys.clone(), key),
@@ -208,7 +217,7 @@ impl DeltaNet {
         let v = split(
             keys * 2u64,
             values.clone(),
-            [ValueHeads.into(), ValueDim.into()],
+            [VALUE_HEADS.into(), VALUE_DIM.into()],
         );
         // Unit rows: rms over the width, eps per element.
         let width = c.linear.key_dim as f32;
@@ -226,7 +235,7 @@ impl DeltaNet {
         let out = m.delta(width.recip(), [&q, &k, &v], [&decay, &rate]);
         let z = h
             .matmul(&self.z)
-            .reshape(rows(ValueHeads.into(), ValueDim.into()));
+            .reshape(rows(VALUE_HEADS.into(), VALUE_DIM.into()));
         let gated = out.rms_norm(&self.norm, c.eps).mul(&z.act(Act::Silu));
         gated
             .reshape(vec![Seqs.into(), Context.into(), values])

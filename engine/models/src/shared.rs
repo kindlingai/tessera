@@ -6,6 +6,11 @@ use tessera_trace::{
     Port, Role, Tensor, TensorType, Vector, Weights,
 };
 
+/// A head's width outside its rotary part.
+pub(crate) const NOPE: DimName = DimName::named("Nope");
+/// A head's rotary width.
+pub(crate) const ROPE: DimName = DimName::named("Rope");
+
 /// A matrix a row multiplies into, however it is stored.
 pub trait Dense: Weights {
     fn apply(&self, x: &Tensor) -> Tensor;

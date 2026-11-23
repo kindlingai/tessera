@@ -1,13 +1,37 @@
 //! Symbolic dimensions, shape expressions and their normal form.
 
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::{Add, Mul};
+use std::sync::Mutex;
 
-/// Every shape is written in these names.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DimName {
+/// Declares the built-in names and their spellings.
+macro_rules! dim_names {
+    ($($(#[$doc:meta])* $name:ident,)*) => {
+        /// Every shape is written in these names.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum DimName {
+            $($(#[$doc])* $name,)*
+            /// A name a model declares with [`DimName::named`].
+            Named(Name),
+        }
+
+        impl DimName {
+            const BUILT_IN: &[DimName] = &[$(DimName::$name),*];
+
+            /// The spelling in graph JSON and recipe modules.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(DimName::$name => stringify!($name),)*
+                    DimName::Named(name) => name.0,
+                }
+            }
+        }
+    };
+}
+
+dim_names! {
     Seqs,
     Rows,
     Context,
@@ -21,47 +45,97 @@ pub enum DimName {
     Heads,
     KvHeads,
     HeadDim,
-    /// A full-attention layer's head width, where it differs.
-    FullHeadDim,
-    /// Width of a per-layer embedding.
-    PerLayer,
     /// Width of a pooled embedding.
     Embedding,
-    /// A head's width outside its rotary part.
-    Nope,
-    /// A head's rotary width.
-    Rope,
-    /// Width of the low-rank query.
-    QLatent,
-    /// Width of the low-rank keys and values.
-    Latent,
     Ffn,
-    /// A dense layer's MLP width. Experts use `Ffn`.
-    DenseFfn,
     Vocab,
     Experts,
     TopK,
-    IndexHeads,
-    IndexDim,
-    /// Keys an indexer keeps for each query.
-    IndexKeep,
     Layers,
-    DenseLayers,
-    MoeLayers,
-    /// Layers that run their own indexer.
-    IndexLayers,
     /// `u32` words of a one-bit-per-token mask.
     VocabWords,
     /// Token ids one sparse pick chooses from.
     Candidates,
-    /// A linear-attention layer's query and key heads.
-    KeyHeads,
-    /// A linear-attention layer's value heads.
-    ValueHeads,
-    KeyDim,
-    ValueDim,
-    /// Rows a causal filter reads, its own included.
-    Window,
+}
+
+/// The spelling of a model's own dimension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Name(&'static str);
+
+impl DimName {
+    /// A model's own name. A built-in spelling panics.
+    pub const fn named(name: &'static str) -> DimName {
+        let mut i = 0;
+        while i < Self::BUILT_IN.len() {
+            assert!(
+                !same_text(Self::BUILT_IN[i].as_str(), name),
+                "use the built-in DimName"
+            );
+            i += 1;
+        }
+        DimName::Named(Name(name))
+    }
+
+    /// The name a spelling stands for, built-in or declared.
+    pub fn parse(text: &str) -> DimName {
+        for name in Self::BUILT_IN {
+            if name.as_str() == text {
+                return *name;
+            }
+        }
+        DimName::Named(Name(intern(text)))
+    }
+}
+
+const fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// One leaked copy of each spelling read at run time.
+fn intern(text: &str) -> &'static str {
+    static SEEN: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(known) = seen.get(text) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(text.into());
+    seen.insert(leaked);
+    leaked
+}
+
+impl Serialize for DimName {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DimName {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(DimName::parse(&String::deserialize(d)?))
+    }
+}
+
+impl fmt::Display for DimName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for DimName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 /// How a dimension gets its size.
