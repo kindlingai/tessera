@@ -1,11 +1,22 @@
 //! Products with blocks of a stored matrix, read in place.
 
 use tessera_codegen::prelude::*;
-use tessera_graph::{Op, View};
+use tessera_graph::{Op, Order, View};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, T, Term, Tree};
+use tessera_lower::{Draft, Kernel, Needs, T, Term, Tree};
 
-/// One thread per output. Batch `b` reads block `b`.
+/// Elements one wide load brings per lane.
+const WIDE: u32 = 4;
+
+/// Trips unrolled so each lane keeps loads in flight.
+const AHEAD: u32 = 4;
+
+/// Kernel mode: 0 scalar, 1 warp-laned, 2 wide-x.
+const MODE_SCALAR: u32 = 0;
+const MODE_LANES: u32 = 1;
+const MODE_WIDE: u32 = 2;
+
+/// Products with blocks of a stored matrix.
 #[kernel]
 fn stacked(
     x: Buf<F32>,
@@ -20,29 +31,68 @@ fn stacked(
     col_step: u32,
     k_step: u32,
     #[build] form: &'static dyn Stored,
+    #[build] mode: u32,
 ) {
-    if gid() >= len {
+    let idx = if mode == MODE_LANES {
+        gid() / LANES as u32
+    } else {
+        gid()
+    };
+    if idx >= len {
         return;
     }
-    let col = gid() % n;
-    let row = gid() / n;
+    let col = idx % n;
+    let row = idx / n;
     let at = (row / rows) as u64 * block as u64 + first as u64 + col as u64 * col_step as u64;
     let from = row as u64 * k as u64;
     let mut sum = 0.0f32;
-    for i in 0..k {
-        sum += x[from + i as u64] * w[at + i as u64 * k_step as u64];
+    if mode == MODE_LANES {
+        for i in (lane() * WIDE..k).by(LANES as u32 * WIDE).unroll(AHEAD) {
+            let c = w.load4(at + i as u64);
+            let v = x.load4(from + i as u64);
+            sum += v.x * c.x;
+            sum += v.y * c.y;
+            sum += v.z * c.z;
+            sum += v.w * c.w;
+        }
+        sum = sum32(sum);
+        if lane() == 0 {
+            out[idx as u64] = sum;
+        }
+    } else {
+        if mode == MODE_WIDE {
+            let ks = k_step as u64;
+            for i in (0..k).by(WIDE).unroll(AHEAD) {
+                let v = x.load4(from + i as u64);
+                let base = at + i as u64 * ks;
+                sum += v.x * w[base];
+                sum += v.y * w[base + ks];
+                sum += v.z * w[base + 2 * ks];
+                sum += v.w * w[base + 3 * ks];
+            }
+        } else {
+            for i in 0..k {
+                sum += x[from + i as u64] * w[at + i as u64 * k_step as u64];
+            }
+        }
+        out[idx as u64] = sum;
     }
-    out[gid() as u64] = sum;
 }
 
 /// `x[b, rows, k]` times block `b` of a stored matrix.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    stacked(self.form),
-    name = self.form.suffixed("stacked"),
-    threads = self.len,
+    stacked(self.form, self.mode),
+    name = self.form.suffixed(match self.mode {
+        MODE_LANES => "stacked_lanes",
+        MODE_WIDE => "stacked_wide",
+        _ => "stacked",
+    }),
+    threads = if self.mode == MODE_LANES { self.len * LANES } else { self.len },
     work = self.len * self.k,
     accepts = stacked_accepts,
+    needs = if self.mode == MODE_LANES { Needs::lanes() } else { Needs::default() },
+    order = Order::PerConfig,
 )]
 pub(crate) struct Stacked {
     pub len: usize,
@@ -56,6 +106,7 @@ pub(crate) struct Stacked {
     pub col_step: usize,
     pub k_step: usize,
     pub form: &'static dyn Stored,
+    pub mode: u32,
 }
 
 fn stacked_accepts(k: &Stacked, input: usize, form: &dyn Stored) -> bool {
@@ -117,6 +168,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         true => (1, b.width),
         false => (b.width, 1),
     };
+    let form = tree.node(b.leaf).form;
+    let mode = if !b.swapped && k.is_multiple_of(WIDE as usize) && form.pairs() == 0 {
+        MODE_LANES
+    } else if b.swapped && k.is_multiple_of(WIDE as usize) {
+        MODE_WIDE
+    } else {
+        MODE_SCALAR
+    };
     let kernel = Stacked {
         len: tree.elements(at),
         rows: xs[1],
@@ -126,7 +185,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         first: b.first * b.width,
         col_step,
         k_step,
-        form: tree.node(b.leaf).form,
+        form,
+        mode,
     };
     Some(vec![Draft::new(kernel, [x, b.leaf], kernel.len)])
 }

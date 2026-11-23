@@ -1,10 +1,22 @@
-//! RMS norm, a SIMD group per row, summed by shuffles.
+//! RMS norm, one SIMD group or one block per row.
 
 use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::Order;
 use tessera_lower::form::{Load as Stored, plain, writable};
-use tessera_lower::{Draft, Kernel, Load, Needs, Source, T, Tree, sites};
+use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Tree, sites};
+
+/// SIMD groups sharing one wide row in block mode.
+const WARPS: u32 = 8;
+
+/// Threads per row in block mode.
+const BLOCK_THREADS: u32 = WARPS * LANES as u32;
+
+/// Minimum width to split across a whole block.
+const BLOCK_MIN: usize = 512;
+
+/// Maximum rows where block-wide RMS norm wins.
+const BLOCK_ROWS: usize = 16;
 
 /// Sums a row's squares, then scales the row.
 #[kernel]
@@ -18,14 +30,17 @@ fn norm_lanes<const WIDE: u32, const AHEAD: u32, const WEIGHTED: bool>(
     #[build] x_form: &'static dyn Stored,
     #[build] w_form: &'static dyn Stored,
     #[build] out_form: &'static dyn Stored,
+    #[build] block: bool,
 ) {
-    let row = gid() / LANES as u32;
+    let group_w = if block { BLOCK_THREADS } else { LANES as u32 };
+    let row = gid() / group_w;
     if row >= rows {
         return;
     }
     let at = row as u64 * width as u64;
+    let first = if block { lid() } else { lane() };
     let mut acc = 0.0f32;
-    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+    for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
         let v = x.load4(at + i as u64);
         acc += v.x * v.x;
         acc += v.y * v.y;
@@ -33,8 +48,20 @@ fn norm_lanes<const WIDE: u32, const AHEAD: u32, const WEIGHTED: bool>(
         acc += v.w * v.w;
     }
     acc = sum32(acc);
-    let inv = rsqrt(acc / width as f32 + eps);
-    for i in (lane() * WIDE..width).by(LANES as u32 * WIDE).unroll(AHEAD) {
+    let mut tot = acc;
+    if block {
+        let mut red = shared::<f32>(WARPS);
+        if lane() == 0 {
+            red[lid() / LANES as u32] = acc;
+        }
+        barrier();
+        tot = 0.0;
+        for w_i in 0..WARPS {
+            tot += red[w_i];
+        }
+    }
+    let inv = rsqrt(tot / width as f32 + eps);
+    for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
         let v = x.load4(at + i as u64);
         let mut g = F32x4::zero();
         if WEIGHTED {
@@ -57,15 +84,17 @@ fn norm_lanes<const WIDE: u32, const AHEAD: u32, const WEIGHTED: bool>(
 /// An RMS norm over `rows` of `width`, one launch.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    norm_lanes::<WIDE, AHEAD>(self.x_form, self.w_form, self.out_form),
+    norm_lanes::<WIDE, AHEAD>(self.x_form, self.w_form, self.out_form, self.block),
     variant = self.weighted,
-    name = match self.weighted {
-        true => "lane_norm",
-        false => "lane_rms",
+    name = match (self.weighted, self.block) {
+        (true, true) => "block_norm",
+        (false, true) => "block_rms",
+        (true, false) => "lane_norm",
+        (false, false) => "lane_rms",
     },
-    threads = self.rows * LANES,
+    threads = norm_shape(self),
     work = self.rows * self.width,
-    needs = Needs::lanes(),
+    needs = norm_needs(self),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
     accepts = norm_accepts,
@@ -79,9 +108,35 @@ pub(crate) struct LaneNorm {
     pub width: usize,
     pub eps: f32,
     pub weighted: bool,
+    pub block: bool,
     pub x_form: &'static dyn Stored,
     pub w_form: &'static dyn Stored,
     pub out_form: &'static dyn Stored,
+}
+
+fn norm_shape(k: &LaneNorm) -> Shape {
+    if k.block {
+        Shape::Grid {
+            across: k.rows,
+            down: 1,
+            threads: BLOCK_THREADS as usize,
+        }
+    } else {
+        Shape::Line(k.rows * LANES)
+    }
+}
+
+fn norm_needs(k: &LaneNorm) -> Needs {
+    if k.block {
+        Needs {
+            lanes: LANES,
+            group_bytes: 4 * WARPS as usize,
+            group_threads: BLOCK_THREADS as usize,
+            ..Needs::default()
+        }
+    } else {
+        Needs::lanes()
+    }
 }
 
 fn norm_accepts(k: &LaneNorm, input: usize, form: &dyn Stored) -> bool {
@@ -96,11 +151,15 @@ fn norm_emits(k: &LaneNorm, form: &dyn Stored) -> bool {
     form.name() == k.out_form.name()
 }
 
+fn norm_body(k: &LaneNorm) -> tessera_codegen::ir::Body {
+    match k.weighted {
+        true => norm_lanes_ir::<WIDE, AHEAD, true>(k.x_form, k.w_form, k.out_form, k.block),
+        false => norm_lanes_ir::<WIDE, AHEAD, false>(k.x_form, k.w_form, k.out_form, k.block),
+    }
+}
+
 fn norm_source(k: &LaneNorm) -> Source {
-    let body = match k.weighted {
-        true => norm_lanes_ir::<WIDE, AHEAD, true>(k.x_form, k.w_form, k.out_form),
-        false => norm_lanes_ir::<WIDE, AHEAD, false>(k.x_form, k.w_form, k.out_form),
-    };
+    let body = norm_body(k);
     let base = k.name();
     let entry = match (k.x_form.name(), k.w_form.name(), k.out_form.name()) {
         ("f32", "f32", "f32") => format!("plan_{base}"),
@@ -110,20 +169,22 @@ fn norm_source(k: &LaneNorm) -> Source {
 }
 
 fn norm_load(k: &LaneNorm, _: usize) -> Option<Load> {
-    let body = match k.weighted {
-        true => norm_lanes_ir::<WIDE, AHEAD, true>(k.x_form, k.w_form, k.out_form),
-        false => norm_lanes_ir::<WIDE, AHEAD, false>(k.x_form, k.w_form, k.out_form),
-    };
+    let body = norm_body(k);
     let elems = k.rows * k.width;
     let x_bytes = k.x_form.bytes(elems) as f64;
     let mut reads = vec![x_bytes];
     if k.weighted {
         reads.push(k.w_form.bytes(k.width) as f64);
     }
+    let per_row = if k.block {
+        BLOCK_THREADS as usize
+    } else {
+        LANES
+    };
     Some(Load {
-        threads: k.rows * LANES,
-        group: 256,
-        trips: (k.width as f64 / (LANES * WIDE as usize) as f64).ceil(),
+        threads: k.rows * per_row,
+        group: BLOCK_THREADS as usize,
+        trips: (k.width as f64 / (per_row * WIDE as usize) as f64).ceil(),
         trip: body.trip(),
         reads,
         written: k.out_form.bytes(elems) as f64,
@@ -143,11 +204,14 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         .operand
         .map_or(x_form, |(o, _)| plain(tree.node(o).form));
     let out_form = writable(tree.node(at).form);
+    let rows = site.len / site.width;
+    let block = rows <= BLOCK_ROWS && site.width >= BLOCK_MIN;
     let kernel = LaneNorm {
-        rows: site.len / site.width,
+        rows,
         width: site.width,
         eps,
         weighted,
+        block,
         x_form,
         w_form,
         out_form,

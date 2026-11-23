@@ -1,9 +1,201 @@
 //! Masked attention over listed keys, or computed keys by row.
 
 use tessera_codegen::prelude::*;
-use tessera_graph::Op;
+use tessera_graph::{Op, Order};
 use tessera_lower::sites::Attend;
-use tessera_lower::{Attn, Draft, Extent, Kernel, Launch, Read, Shape, Step, T, Term, Tree};
+use tessera_lower::{
+    Attn, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
+};
+
+/// Elements one wide load brings per lane.
+const WIDE: u32 = 4;
+
+/// SIMD groups sharing one query row and head.
+const WARPS: u32 = 8;
+
+/// Threads in one fused attention group.
+const THREADS: u32 = WARPS * LANES as u32;
+
+/// Widest head handled by the fused warp kernel.
+const MAX_WIDTH: usize = 640;
+
+/// Per-lane register slots for `MAX_WIDTH` floats.
+const MAX_SLOTS: usize = MAX_WIDTH / LANES;
+
+/// Unroll bound for per-lane wide-load loops.
+const MAX_QUADS: u32 = (MAX_SLOTS / WIDE as usize) as u32;
+
+/// Fused split-K attention: one group per query and head.
+#[kernel]
+fn listed_attend(
+    q: Buf<F32>,
+    k: Buf<F32>,
+    v: Buf<F32>,
+    ids: Buf<U32>,
+    slots: Buf<U32>,
+    positions: Buf<U32>,
+    mut out: BufMut<F32>,
+    scale: f32,
+    lists: u32,
+    queries: u32,
+    keys: u32,
+    heads: u32,
+    kv_heads: u32,
+    picks: u32,
+    ragged: u32,
+    from_list: u32,
+    before: u32,
+    after: u32,
+    #[build] width: u32,
+) {
+    let list = gid() / THREADS;
+    if list >= lists {
+        return;
+    }
+    let head = list % heads;
+    let row = list / heads;
+    let warp = lid() / LANES as u32;
+    let l = lane();
+    let kv_head = head / (heads / kv_heads);
+    let mut first = row / queries * keys;
+    let mut position = keys - queries + row % queries;
+    if ragged == 1 {
+        first = slots[row as u64] * keys;
+        position = positions[row as u64];
+    }
+    let from = if position > before {
+        position - before
+    } else {
+        0
+    };
+    let to = if position + after < keys {
+        position + after + 1
+    } else {
+        keys
+    };
+    let q_at = list as u64 * width as u64;
+    let quads = (width + LANES as u32 * WIDE - 1) / (LANES as u32 * WIDE);
+    let mut qr = [0.0f32; MAX_SLOTS];
+    let mut acc = [0.0f32; MAX_SLOTS];
+    for s in (0..quads).unroll(MAX_QUADS) {
+        let d = s * (LANES as u32 * WIDE) + l * WIDE;
+        let b = (s * WIDE) as usize;
+        if d < width {
+            let qv = q.load4(q_at + d as u64);
+            qr[b] = qv.x;
+            qr[b + 1] = qv.y;
+            qr[b + 2] = qv.z;
+            qr[b + 3] = qv.w;
+        }
+        acc[b] = 0.0;
+        acc[b + 1] = 0.0;
+        acc[b + 2] = 0.0;
+        acc[b + 3] = 0.0;
+    }
+    let mut peak = f32::NEG_INFINITY;
+    let mut total = 0.0f32;
+    let start = if from_list == 0 { from } else { 0 };
+    let mut stop = if from_list == 0 && to < picks {
+        to
+    } else {
+        picks
+    };
+    if from_list == 1 && picks > 0 {
+        let base = row as u64 * picks as u64;
+        if ids[base + (picks - 1) as u64] >= keys {
+            let mut lo = 0u32;
+            let mut hi = picks;
+            for step in 0..16 {
+                let mid = (lo + hi) / 2;
+                if mid < hi {
+                    if ids[base + mid as u64] < keys {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+            }
+            stop = lo;
+        }
+    }
+    for p in (start + warp..stop).by(WARPS) {
+        let mut j = p;
+        if from_list == 1 {
+            j = ids[row as u64 * picks as u64 + p as u64];
+        }
+        if j >= from && j < to {
+            let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+            let mut dot = 0.0f32;
+            for s in (0..quads).unroll(MAX_QUADS) {
+                let d = s * (LANES as u32 * WIDE) + l * WIDE;
+                let b = (s * WIDE) as usize;
+                if d < width {
+                    let kv = k.load4(k_at + d as u64);
+                    dot += qr[b] * kv.x + qr[b + 1] * kv.y + qr[b + 2] * kv.z + qr[b + 3] * kv.w;
+                }
+            }
+            dot = sum32(dot);
+            let score = dot * scale;
+            let next = max(peak, score);
+            let corr = if total > 0.0 { exp(peak - next) } else { 0.0 };
+            let wt = exp(score - next);
+            peak = next;
+            total = total * corr + wt;
+            for s in (0..quads).unroll(MAX_QUADS) {
+                let d = s * (LANES as u32 * WIDE) + l * WIDE;
+                let b = (s * WIDE) as usize;
+                if d < width {
+                    let vv = v.load4(k_at + d as u64);
+                    acc[b] = acc[b] * corr + wt * vv.x;
+                    acc[b + 1] = acc[b + 1] * corr + wt * vv.y;
+                    acc[b + 2] = acc[b + 2] * corr + wt * vv.z;
+                    acc[b + 3] = acc[b + 3] * corr + wt * vv.w;
+                }
+            }
+        }
+    }
+    let mut m_s = shared::<f32>(WARPS);
+    let mut l_s = shared::<f32>(WARPS);
+    let mut o_s = shared::<f32>(WARPS * width);
+    if l == 0 {
+        m_s[warp] = peak;
+        l_s[warp] = total;
+    }
+    for s in (0..quads).unroll(MAX_QUADS) {
+        let d = s * (LANES as u32 * WIDE) + l * WIDE;
+        let b = (s * WIDE) as usize;
+        if d < width {
+            let o = warp * width + d;
+            o_s[o] = acc[b];
+            o_s[o + 1] = acc[b + 1];
+            o_s[o + 2] = acc[b + 2];
+            o_s[o + 3] = acc[b + 3];
+        }
+    }
+    barrier();
+    let mut best = f32::NEG_INFINITY;
+    for w in 0..WARPS {
+        if l_s[w] > 0.0 {
+            best = max(best, m_s[w]);
+        }
+    }
+    let mut denom = 0.0f32;
+    for w in 0..WARPS {
+        if l_s[w] > 0.0 {
+            denom += l_s[w] * exp(m_s[w] - best);
+        }
+    }
+    let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+    for d in (lid()..width).by(THREADS) {
+        let mut sum = 0.0f32;
+        for w in 0..WARPS {
+            if l_s[w] > 0.0 {
+                sum += o_s[w * width + d] * exp(m_s[w] - best);
+            }
+        }
+        out[q_at + d as u64] = sum * inv;
+    }
+}
 
 /// One thread per pick: its scaled score, or -inf.
 #[kernel]
@@ -204,8 +396,8 @@ impl Sizes {
         vec![launch]
     }
 
-    /// Scores, their peaks and totals, then the mix.
-    fn drafts(self, [q, k, v, ids, slots, positions]: [T; 6]) -> Vec<Draft> {
+    /// Three-pass listed attention for any backend.
+    fn passes(self, [q, k, v, ids, slots, positions]: [T; 6]) -> Vec<Draft> {
         let mix = [
             Read::Draft(0),
             Read::Draft(1),
@@ -223,6 +415,68 @@ impl Sizes {
             Draft::new(ListedMix(self), mix, self.len),
         ]
     }
+
+    /// Single-launch split-K attention when width fits.
+    fn fused(self, reads: [T; 6]) -> Option<Vec<Draft>> {
+        let fits = self.width.is_multiple_of(WIDE as usize) && self.width <= MAX_WIDTH;
+        fits.then(|| vec![Draft::new(ListedAttend(self), reads, self.len)])
+    }
+}
+
+/// Fused split-K attention over listed or ragged keys.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    listed_attend(self.0.width as u32),
+    name = "listed_attend",
+    sizes = [self.0.len, self.0.keys.most(), self.0.picks],
+    work = self.0.scores() * self.0.width,
+    needs = attend_needs(self),
+    order = Order::PerConfig,
+    source = attend_source,
+    launches = attend_launches,
+)]
+pub(crate) struct ListedAttend(pub Sizes);
+
+fn attend_source(k: &ListedAttend) -> Source {
+    let body = listed_attend_ir(k.0.width as u32);
+    Source::named(body, format!("plan_listed_attend_{}", k.0.width))
+}
+
+fn attend_needs(k: &ListedAttend) -> Needs {
+    Needs {
+        lanes: LANES,
+        group_bytes: 4 * (WARPS as usize * (k.0.width + 2)),
+        group_threads: THREADS as usize,
+        ..Needs::default()
+    }
+}
+
+fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
+    let s = k.0;
+    let lists = s.lists();
+    let shape = Shape::Grid {
+        across: lists,
+        down: 1,
+        threads: THREADS as usize,
+    };
+    let mut launch = Launch::plain(step, &[lists], shape);
+    let at = launch.args.len() - 1;
+    launch.args.insert(at, tessera_lower::Arg::value(&s.scale));
+    launch.args.push(tessera_lower::Arg::count(s.queries));
+    launch.args.push(tessera_lower::Arg::size(s.keys));
+    let counts = [
+        s.heads,
+        s.kv_heads,
+        s.picks,
+        usize::from(s.ragged),
+        usize::from(s.from_list),
+        s.window.0,
+        s.window.1,
+    ];
+    launch
+        .args
+        .extend(counts.into_iter().map(tessera_lower::Arg::count));
+    vec![launch]
 }
 
 /// Each listed key's score, for whole sequences or ragged rows.
@@ -272,7 +526,7 @@ fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
 }
 
 /// Ragged rows over computed keys, not kept rows.
-fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
@@ -306,11 +560,11 @@ fn rows(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         scale: a.scale,
         window: a.mask.window(most),
     };
-    Some(sizes.drafts([q, k, v, ids, slots, positions]))
+    Some((sizes, [q, k, v, ids, slots, positions]))
 }
 
 /// Sequences whose keys are all present, under any mask.
-fn whole((site, ids, picks): (Attend, T, usize)) -> Option<Vec<Draft>> {
+fn whole((site, ids, picks): (Attend, T, usize)) -> (Sizes, [T; 6]) {
     let a: Attn = site.sizes;
     let keys = a.keys.most();
     let sizes = Sizes {
@@ -327,14 +581,25 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> Option<Vec<Draft>> {
         window: a.mask.window(keys),
     };
     // Slots and positions go unread, so the list stands in.
-    Some(sizes.drafts([site.q, site.k, site.v, ids, ids, ids]))
+    (sizes, [site.q, site.k, site.v, ids, ids, ids])
 }
 
-fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn site(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
     match Attend::listed(tree, at) {
-        Some(found) => whole(crate::fixed_list(tree, found)?),
+        Some(found) => Some(whole(crate::fixed_list(tree, found)?)),
         None => rows(tree, at),
     }
 }
 
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (sizes, reads) = site(tree, at)?;
+    Some(sizes.passes(reads))
+}
+
+fn propose_fused(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (sizes, reads) = site(tree, at)?;
+    sizes.fused(reads)
+}
+
 tessera_lower::rule!("listed", propose);
+tessera_lower::rule!("listed_fused", propose_fused);
