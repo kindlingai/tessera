@@ -21,7 +21,7 @@ mod run;
 pub mod testing;
 
 pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
-pub use held::Held;
+pub use held::{Held, Holds};
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
 pub use rank::{Rank, Sum};
@@ -75,6 +75,8 @@ pub enum Error {
     KernelFile(std::path::PathBuf, std::io::Error),
     #[error("weight {weight} does not fit {form}")]
     WeightSize { weight: u32, form: &'static str },
+    #[error("weight {0}: {1}")]
+    WeightRead(u32, std::io::Error),
     #[error("weight {0} has the wrong length")]
     WeightLen(u32),
     #[error("weight {weight} as {form} split on axis {axis}")]
@@ -154,24 +156,26 @@ pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
-    match settings.gpu() {
+    let mut runner: Box<dyn Run> = match settings.gpu() {
         #[cfg(target_os = "macos")]
-        Some(Backend::Metal) => Ok(Box::new(
-            device::Runner::<tessera_gpukit::metal::Context>::new(plan, settings)?,
-        )),
+        Some(Backend::Metal) => Box::new(device::Runner::<tessera_gpukit::metal::Context>::new(
+            plan, settings,
+        )?),
         #[cfg(feature = "cuda")]
-        Some(Backend::Cuda) => Ok(Box::new(
-            device::Runner::<tessera_gpukit::cuda::Context>::new(plan, settings)?,
-        )),
+        Some(Backend::Cuda) => Box::new(device::Runner::<tessera_gpukit::cuda::Context>::new(
+            plan, settings,
+        )?),
         #[cfg(feature = "rocm")]
-        Some(Backend::Rocm) => Ok(Box::new(
-            device::Runner::<tessera_gpukit::rocm::Context>::new(plan, settings)?,
-        )),
-        _ => Ok(Box::new(cpu::Runner::new(
+        Some(Backend::Rocm) => Box::new(device::Runner::<tessera_gpukit::rocm::Context>::new(
+            plan, settings,
+        )?),
+        _ => Box::new(cpu::Runner::new(
             plan,
             settings.host_lanes,
             settings.emulate.map_or(Precision::EXACT, precision),
             settings.memory,
-        )?)),
-    }
+        )?),
+    };
+    runner.base_mut().reads = settings.reads;
+    Ok(runner)
 }

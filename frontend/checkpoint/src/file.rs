@@ -1,13 +1,15 @@
 //! One safetensors file: a JSON header, then tensor bytes.
 
+use crate::disk::{Disk, Span};
 use crate::offer::{Offer, Slice, Stored};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::Path;
-use tessera_engine::{Bf16, F16};
+use std::sync::Arc;
+use tessera_engine::{Bf16, F16, Filed, Reads};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,7 +42,7 @@ struct Entry {
 
 /// Where the bytes live.
 enum Backing {
-    Disk(fs::File),
+    Disk(Arc<Disk>),
     /// Read by range requests.
     Web(String),
 }
@@ -98,7 +100,8 @@ impl File {
         }
         let mut header = vec![0u8; len as usize];
         file.read_exact(&mut header)?;
-        Self::parse(Backing::Disk(file), &header, size)
+        let disk = Disk::new(path, file);
+        Self::parse(Backing::Disk(Arc::new(disk)), &header, size)
     }
 
     /// A file served over http, one tensor per request.
@@ -141,11 +144,9 @@ impl File {
     /// Bytes `start..end` of the tensor area.
     fn read(&self, start: u64, end: u64) -> Result<Vec<u8>, Error> {
         match &self.backing {
-            Backing::Disk(file) => {
+            Backing::Disk(disk) => {
                 let mut bytes = vec![0u8; (end - start) as usize];
-                let mut file = file;
-                file.seek(SeekFrom::Start(self.data + start))?;
-                file.read_exact(&mut bytes)?;
+                disk.read(self.data + start, &mut bytes, Reads::Cached)?;
                 Ok(bytes)
             }
             Backing::Web(url) => fetch(url, self.data + start, end - start),
@@ -234,6 +235,19 @@ impl Offer for File {
             _ => Err(Error::DType(format!("{name} is not bf16"))),
         }
     }
+
+    fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
+        let e = self.entries.get(name)?;
+        let Backing::Disk(disk) = &self.backing else {
+            return None;
+        };
+        let [start, end] = e.data_offsets;
+        Some(Arc::new(Span {
+            disk: disk.clone(),
+            at: self.data + start,
+            bytes: (end - start) as usize,
+        }))
+    }
 }
 
 /// One safetensors file, or a split one's shards.
@@ -280,5 +294,9 @@ impl Offer for Shards {
 
     fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
         Offer::bf16(self.holding(name)?, name)
+    }
+
+    fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
+        self.holding(name).ok()?.filed(name)
     }
 }

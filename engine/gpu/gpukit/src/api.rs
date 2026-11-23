@@ -709,6 +709,11 @@ impl<A: Api> Device for Context<A> {
         Context::unpin(self, host);
     }
 
+    fn unified(&self) -> bool {
+        let platform = A::describe(self);
+        platform.integrated && platform.row.is_some_and(|r| r.pinned)
+    }
+
     fn register(&self, host: *mut u8, size: usize) -> Result<u64, Error> {
         Context::register(self, host, size)
     }

@@ -84,6 +84,11 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     fn unpin(&self, _host: u64) {}
 
+    /// Whether pinned host memory serves kernels as device memory does.
+    fn unified(&self) -> bool {
+        false
+    }
+
     /// Maps existing host memory for the device. Returns its address.
     fn register(&self, _host: *mut u8, _size: usize) -> Result<u64, Error> {
         Err(Self::error("this device cannot map host memory".into()))
@@ -181,7 +186,13 @@ pub struct DeviceBuffer<D: Device> {
     ctx: D,
     ptr: u64,
     size: usize,
+    /// The host address, when the memory is pinned.
+    host: Option<NonNull<u8>>,
 }
+
+// The host address is plain memory the buffer owns.
+unsafe impl<D: Device> Send for DeviceBuffer<D> {}
+unsafe impl<D: Device> Sync for DeviceBuffer<D> {}
 
 impl<D: Device> DeviceBuffer<D> {
     /// Allocate one device buffer outside any pool.
@@ -190,7 +201,23 @@ impl<D: Device> DeviceBuffer<D> {
             ptr: ctx.alloc(size)?,
             ctx: ctx.clone(),
             size,
+            host: None,
         })
+    }
+
+    /// Pinned host memory the device maps.
+    pub fn pinned(ctx: &D, size: usize) -> Result<Self, Error> {
+        let (host, ptr) = ctx.pin(size)?;
+        Ok(Self {
+            ptr,
+            ctx: ctx.clone(),
+            size,
+            host: NonNull::new(host as *mut u8),
+        })
+    }
+
+    fn host(&self) -> Option<NonNull<u8>> {
+        self.host.or_else(|| self.ctx.mapped(self.ptr, self.size))
     }
 
     pub fn size(&self) -> usize {
@@ -248,18 +275,22 @@ impl<D: Device> tessera_mem::Backing for DeviceBuffer<D> {
     }
 
     fn mapped(&self) -> Option<&[u8]> {
-        let at = self.ctx.mapped(self.ptr, self.size)?;
+        let at = self.host()?;
         // The mapping lives as long as the allocation.
         Some(unsafe { std::slice::from_raw_parts(at.as_ptr(), self.size) })
     }
 
     fn mapped_mut(&mut self) -> Option<&mut [u8]> {
-        let at = self.ctx.mapped(self.ptr, self.size)?;
+        let at = self.host()?;
         Some(unsafe { std::slice::from_raw_parts_mut(at.as_ptr(), self.size) })
     }
 
     fn upload(&mut self, at: usize, bytes: &[u8]) -> Result<(), tessera_mem::Error> {
         self.assert_fits(at + bytes.len());
+        if let Some(all) = self.host.and(self.mapped_mut()) {
+            all[at..at + bytes.len()].copy_from_slice(bytes);
+            return Ok(());
+        }
         let ptr = self.ptr + at as u64;
         self.ctx
             .upload(ptr, bytes)
@@ -268,6 +299,10 @@ impl<D: Device> tessera_mem::Backing for DeviceBuffer<D> {
 
     fn download(&self, at: usize, out: &mut [u8]) -> Result<(), tessera_mem::Error> {
         self.assert_fits(at + out.len());
+        if let Some(all) = self.host.and(self.mapped()) {
+            out.copy_from_slice(&all[at..at + out.len()]);
+            return Ok(());
+        }
         let ptr = self.ptr + at as u64;
         self.ctx
             .download(ptr, out)
@@ -281,7 +316,10 @@ impl<D: Device> tessera_mem::Backing for DeviceBuffer<D> {
 
 impl<D: Device> Drop for DeviceBuffer<D> {
     fn drop(&mut self) {
-        self.ctx.free(self.ptr);
+        match self.host {
+            Some(host) => self.ctx.unpin(host.as_ptr() as u64),
+            None => self.ctx.free(self.ptr),
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::grid::{self, Grid};
+use crate::held::Holds;
 use crate::kernels::{Kernels, dialect};
 use crate::marks;
 use crate::overrides::{self, Overrides};
@@ -652,8 +653,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         // Buffers may move, so recorded launches go stale.
         self.graphs.clear();
         let ctx = self.ctx;
-        self.base.held.bind(plan, |zone, bytes| {
-            let buffer = DeviceBuffer::alloc(ctx, bytes)?;
+        let unified = ctx.unified();
+        self.base.held.bind(plan, |zone, bytes, holds| {
+            // The host reads weight files straight into pinned memory.
+            let buffer = match unified && holds == Holds::Weights {
+                true => DeviceBuffer::pinned(ctx, bytes)?,
+                false => DeviceBuffer::alloc(ctx, bytes)?,
+            };
             // Kernels may read what they are about to write.
             buffer.zero()?;
             Ok(Buffer::new(zone, buffer))

@@ -26,6 +26,8 @@ fn table_resolves() {
     assert_eq!(bf16("cuda sm_121"), Some([16, 8, 16]));
     assert_eq!(bf16("rocm gfx11_5"), None);
     assert!(row_for("cuda sm_89").is_some_and(|r| !r.pdl));
+    assert!(row_for("cuda sm_121").is_some_and(|r| r.pinned));
+    assert!(row_for("rocm gfx11_5").is_some_and(|r| !r.pinned));
     for row in rows() {
         assert!(!row.matches.is_empty(), "{row:?}");
     }

@@ -9,11 +9,11 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tessera_codegen::Precision;
-use tessera_engine_settings::Memory;
+use tessera_engine_settings::{Memory, Reads};
 use tessera_gpukit::{Limits, Platform};
 use tessera_graph::DimName;
 use tessera_lower::form::{F32_FORM, Load};
-use tessera_lower::{Launch, Launching, Loaded, Plan, Share, Slot, Weight};
+use tessera_lower::{Filed, Launch, Launching, Loaded, Plan, Share, Slot, Weight};
 use tessera_mem::{Tensor, View, copy};
 
 /// State every runner keeps: a plan, its buffers and sizes.
@@ -29,6 +29,7 @@ pub struct Base {
     pub(crate) budget: Option<u64>,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
+    pub(crate) reads: Reads,
 }
 
 impl Base {
@@ -212,9 +213,17 @@ pub trait Run {
 
     /// Uploads a weight as stored, widened where a slot differs.
     fn load_weight(&mut self, weight: u32, w: &Weight) -> Result<(), Error> {
-        let Weight::Packed(form, bytes) = w else {
-            let Weight::Floats(t) = w else { unreachable!() };
-            return self.load(weight, t.view());
+        let (form, bytes) = match w {
+            Weight::Floats(t) => return self.load(weight, t.view()),
+            Weight::Packed(form, bytes) => (form, bytes),
+            Weight::Filed(form, file) => {
+                if filed(self, weight, *form, file.as_ref())? {
+                    return Ok(());
+                }
+                let reads = self.base().reads;
+                let read = w.held(reads).map_err(|e| Error::WeightRead(weight, e))?;
+                return self.load_weight(weight, &read.expect("a filed weight"));
+            }
         };
         let loaded: Vec<Loaded> = (self.plan().weights.iter())
             .filter(|l| l.weight == weight)
@@ -362,6 +371,44 @@ pub trait Run {
         let steps = 0..self.plan().steps.len();
         steps.map(|i| self.repeat(i, 1)).collect()
     }
+}
+
+/// Reads a file's bytes into slots of its form.
+fn filed<R: Run + ?Sized>(
+    r: &mut R,
+    weight: u32,
+    form: &dyn Load,
+    file: &dyn Filed,
+) -> Result<bool, Error> {
+    let loaded: Vec<Loaded> = (r.plan().weights.iter())
+        .filter(|l| l.weight == weight)
+        .copied()
+        .collect();
+    let plain = |l: &Loaded| {
+        let slot = l.slot;
+        let whole = l.part.is_none() && l.share.is_none();
+        whole && slot.form.name() == form.name() && slot.bytes() == file.bytes()
+    };
+    let Some((first, rest)) = loaded.split_first() else {
+        return Ok(true);
+    };
+    if !loaded.iter().all(plain) {
+        return Ok(false);
+    }
+    let reads = r.base().reads;
+    let Some(into) = r.held_mut().mapped_slot(first.slot) else {
+        return Ok(false);
+    };
+    file.read(into, reads)
+        .map_err(|e| Error::WeightRead(weight, e))?;
+    if rest.is_empty() {
+        return Ok(true);
+    }
+    let bytes = r.held().bytes(first.slot)?;
+    for l in rest {
+        r.held_mut().upload(l.slot, &bytes)?;
+    }
+    Ok(true)
 }
 
 /// A split the form cannot cut, decoded before the cut.

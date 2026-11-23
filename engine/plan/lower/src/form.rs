@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tessera_engine_settings::Reads;
 use tessera_graph::{Graph, PathSeg};
 use tessera_mem::Tensor;
 
@@ -12,6 +14,27 @@ pub enum Weight {
     Floats(Tensor),
     /// One form's bytes, in `Form::pack` layout.
     Packed(&'static dyn Load, Vec<u8>),
+    /// One form's bytes, read from their file when loaded.
+    Filed(&'static dyn Load, Arc<dyn Filed>),
+}
+
+/// A weight's bytes where a file keeps them.
+pub trait Filed: Send + Sync {
+    fn bytes(&self) -> usize;
+    /// Fills `into`, which is `bytes()` long.
+    fn read(&self, into: &mut [u8], reads: Reads) -> std::io::Result<()>;
+}
+
+impl Weight {
+    /// This weight with a filed one's bytes read in.
+    pub fn held(&self, reads: Reads) -> std::io::Result<Option<Weight>> {
+        let Weight::Filed(form, file) = self else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0u8; file.bytes()];
+        file.read(&mut bytes, reads)?;
+        Ok(Some(Weight::Packed(*form, bytes)))
+    }
 }
 
 /// A site a pin override can target besides weights.

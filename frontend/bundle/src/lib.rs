@@ -270,7 +270,11 @@ pub fn each(
                 }
                 None => Weight::Packed(f, offer.packed(&c.name)?),
             },
-            (Stored::Bf16, _) => halves(offer, slice, c.rows)?,
+            (Stored::Bf16, None) => match offer.filed(&c.name) {
+                Some(file) => Weight::Filed(BF16_FORM, file),
+                None => halves(offer, slice, None)?,
+            },
+            (Stored::Bf16, rows) => halves(offer, slice, rows)?,
             _ => floats(offer, slice, c.rows, shape)?,
         };
         take(weight, f)?;

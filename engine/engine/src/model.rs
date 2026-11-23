@@ -1,6 +1,6 @@
 //! A forward graph with its weights, launched as a whole.
 
-use crate::Error;
+use crate::{Error, Reads};
 use std::borrow::Cow;
 use tessera_graph::{DimExpr, DimName, Graph, Shape, Size};
 use tessera_interp::Tensor;
@@ -102,6 +102,7 @@ fn floats(g: &Graph, at: usize, w: &Weight) -> Tensor {
     match w {
         Weight::Floats(t) => Tensor::f32(shape, t.floats().unwrap_or_default().to_vec()),
         Weight::Packed(f, bytes) => Tensor::f32(shape, f.unpack_all(bytes)),
+        Weight::Filed(..) => unreachable!("read before it gets here"),
     }
 }
 
@@ -157,6 +158,9 @@ impl Model {
         match &mut self.executor {
             Executor::Planned(p) => p.runner.load_weight(at, w)?,
             Executor::Interpreted(kept) => {
+                let read = w.held(Reads::Cached);
+                let read = read.map_err(|e| tessera_run::Error::WeightRead(at, e))?;
+                let w = read.as_ref().unwrap_or(w);
                 let at = at as usize;
                 if kept.len() <= at {
                     kept.resize(at + 1, Tensor::f32(vec![0], Vec::new()));

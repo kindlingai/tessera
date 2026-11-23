@@ -1,5 +1,6 @@
 use crate::{Error, File, Offer, Stored};
 use std::path::PathBuf;
+use tessera_engine::Reads;
 
 /// Writes a header and tensor bytes to a temporary file.
 fn write(name: &str, header: &str, data: &[u8]) -> PathBuf {
@@ -56,5 +57,25 @@ fn widens_f16() {
     // 0.1 is not exact in f16.
     assert_eq!(f.floats("h").unwrap(), [1.0, 0.099_975_586, -3.25]);
     assert_eq!(f.slices()[0].stored, Stored::F16);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn reads_filed_spans() {
+    // Two reader threads, starting off a block boundary.
+    let bytes = 10 << 20;
+    let header = format!(
+        r#"{{"w":{{"dtype":"BF16","shape":[{}],"data_offsets":[2,{}]}}}}"#,
+        bytes / 2,
+        2 + bytes
+    );
+    let data: Vec<u8> = (0..2 + bytes).map(|i| (i % 251) as u8).collect();
+    let path = write("filed", &header, &data);
+    let span = File::open(&path).unwrap().filed("w").unwrap();
+    for reads in [Reads::Cached, Reads::Direct] {
+        let mut got = vec![0u8; span.bytes()];
+        span.read(&mut got, reads).unwrap();
+        assert!(got == data[2..], "{reads:?} reads differ");
+    }
     std::fs::remove_file(path).unwrap();
 }

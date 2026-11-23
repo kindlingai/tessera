@@ -229,7 +229,7 @@ fn replans_hold_buffers() {
     let (first, next) = (step(1, 3, 3).unwrap(), step(1, 1, 4).unwrap());
     let mut held = Held::default();
     let mut made = 0;
-    let mut alloc = |zone: u32, bytes: usize| {
+    let mut alloc = |zone: u32, bytes: usize, _| {
         made += 1;
         Ok(Buffer::host(zone, bytes))
     };
@@ -250,7 +250,7 @@ fn replans_hold_buffers() {
     assert!(made < first.buffers.len() + next.buffers.len());
     // Binding the same plan again allocates nothing.
     let so_far = made;
-    held.bind(&next, |_, _| unreachable!("every buffer is held"))
+    held.bind(&next, |_, _, _| unreachable!("every buffer is held"))
         .unwrap();
     assert_eq!(made, so_far);
 }
@@ -716,7 +716,7 @@ fn subset_weights_stay() {
     };
     let mut held = Held::default();
     let allocs = std::cell::Cell::new(0usize);
-    let mut alloc = |z, n| {
+    let mut alloc = |z, n, _| {
         allocs.set(allocs.get() + 1);
         Ok(Buffer::host(z, n))
     };

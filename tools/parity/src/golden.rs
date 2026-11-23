@@ -8,7 +8,7 @@ use tessera_bundle::names::repo;
 use tessera_checkpoint::{File, Offer};
 use tessera_interp::Tensor;
 use tessera_lower::form::{BF16_FORM, Load};
-use tessera_lower::{Device, Pins, Weight, lower};
+use tessera_lower::{Device, Pins, Reads, Weight, lower};
 use tessera_run::Run;
 use tessera_testkit::{argmax, cosine_f32, max_abs_diff};
 use tessera_trace::DimName::{self, Context, Seqs};
@@ -169,6 +169,7 @@ pub fn tensor(shape: Vec<usize>, w: Weight) -> Tensor {
         Weight::Floats(t) => t,
         Weight::Packed(f, bytes) if f.block() == 1 => Tensor::from_bytes(shape, f.dtype(), &bytes),
         Weight::Packed(f, bytes) => Tensor::f32(shape, f.unpack_all(&bytes)),
+        Weight::Filed(..) => tensor(shape, w.held(Reads::Cached).unwrap().unwrap()),
     }
 }
 

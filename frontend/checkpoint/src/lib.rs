@@ -1,5 +1,6 @@
 //! Reads weights from safetensors, GGUF and PyTorch files.
 
+mod disk;
 pub mod exlr8;
 #[cfg(test)]
 mod exlr8_test;

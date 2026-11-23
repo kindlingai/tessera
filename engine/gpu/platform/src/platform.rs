@@ -21,6 +21,9 @@ pub struct Row {
     /// Whether a launch may overlap the one before it.
     #[serde(default)]
     pub pdl: bool,
+    /// Whether kernels read pinned host memory at full speed.
+    #[serde(default)]
+    pub pinned: bool,
     /// Compiler targets a toolkit check compiles the tile text for.
     #[serde(default)]
     pub check: Vec<String>,

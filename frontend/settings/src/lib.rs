@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
-use tessera_engine::{Backend, Memory, Pick, Settings};
+use tessera_engine::{Backend, Memory, Pick, Reads, Settings};
 
 /// The `TESSERA_` variables.
 #[derive(Deserialize)]
@@ -17,6 +17,8 @@ struct Env {
     verbs: Option<String>,
     /// Bytes, maybe suffixed K, M, G or T, or `off`.
     memory: Option<String>,
+    /// `cached` or `direct`.
+    reads: Option<String>,
     /// Launches per profile report.
     profile: Option<u64>,
     kernels: Option<PathBuf>,
@@ -67,6 +69,7 @@ pub fn read() -> Settings {
         emulate: env.emulate,
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
+        reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
         hf_token: token(&var, std::env::home_dir()),
         profile: env.profile.filter(|n| *n > 0),
@@ -143,6 +146,15 @@ fn memory(value: &str) -> Memory {
     match digits.parse::<u64>() {
         Ok(n) => Memory::Bytes(n << shift),
         Err(e) => panic!("TESSERA_MEMORY={value}: {e}"),
+    }
+}
+
+/// A `TESSERA_READS` value. Bad values panic.
+fn reads(value: &str) -> Reads {
+    match value {
+        "cached" => Reads::Cached,
+        "direct" => Reads::Direct,
+        _ => panic!("TESSERA_READS={value}: want cached or direct"),
     }
 }
 
