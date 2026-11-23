@@ -29,7 +29,7 @@ fn grid_reaches_rules() {
     let timed = Grid::tiny().run(&mut device, &settings).unwrap();
     assert!(device.samples() > 0 && !device.name.is_empty());
     // CPU and compiled device rules need matching hardware.
-    let device_rules = ["trellis_mma", "fast_gemv", "fast_stacked"];
+    let device_rules = ["trellis_mma", "fast_gemv", "fast_mm", "fast_stacked"];
     let skipped =
         |r: &&&tessera_lower::Rule| r.name.starts_with("cpu_") || device_rules.contains(&r.name);
     for rule in rules().iter().filter(|r| !skipped(r)) {

@@ -290,6 +290,107 @@ static __device__ __forceinline__ float fg_dot8_bf16(const float* x, const u16* 
     return fg_warp_sum(acc);
 }
 
+static __device__ __forceinline__ u32 fg_bf16x2(float lo, float hi) {
+    u32 out;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
+    return out;
+}
+
+static __device__ __forceinline__ void fg_mma_bf16(float d[4], const u32 a[4], const u32 b[2]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
+extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
+    const float* x, const u16* w, const float* add, float* out, u32 m, u32 n, u32 k,
+    u32 add_mode) {
+    __shared__ __align__(16) u32 sxh[16][36];
+    __shared__ __align__(16) u32 sxl[16][36];
+    __shared__ __align__(16) u32 sw[4][8][36];
+    u32 warp = threadIdx.x >> 5;
+    u32 lane = threadIdx.x & 31u;
+    u32 g = lane >> 2;
+    u32 t = lane & 3u;
+    u32 r0 = blockIdx.y << 4;
+    u32 n0 = (blockIdx.x << 5) + (warp << 3);
+    const u16* wr = w + u64(n0 + g) * k;
+    u32 xr = threadIdx.x >> 4;
+    u32 xc = (threadIdx.x & 15u) << 2;
+    u32 xw = (threadIdx.x & 15u) << 1;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint4 cur0 = fg_ld_nc4(wr + (t << 3));
+    uint4 cur1 = fg_ld_nc4(wr + 32u + (t << 3));
+    for (u32 k0 = 0u; k0 < k; k0 += 64u) {
+#pragma unroll
+        for (u32 dr = 0u; dr < 16u; dr += 8u) {
+            u32 r = xr + dr;
+            if (r0 + r < m) {
+                float4 xv = *reinterpret_cast<const float4*>(x + u64(r0 + r) * k + k0 + xc);
+                u32 h0 = fg_bf16x2(xv.x, xv.y);
+                u32 h1 = fg_bf16x2(xv.z, xv.w);
+                u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16),
+                                   xv.y - __uint_as_float(h0 & 0xFFFF0000u));
+                u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16),
+                                   xv.w - __uint_as_float(h1 & 0xFFFF0000u));
+                *reinterpret_cast<uint2*>(&sxh[r][xw]) = make_uint2(h0, h1);
+                *reinterpret_cast<uint2*>(&sxl[r][xw]) = make_uint2(l0, l1);
+            } else {
+                *reinterpret_cast<uint2*>(&sxh[r][xw]) = make_uint2(0u, 0u);
+                *reinterpret_cast<uint2*>(&sxl[r][xw]) = make_uint2(0u, 0u);
+            }
+        }
+        *reinterpret_cast<uint4*>(&sw[warp][g][t << 2]) = cur0;
+        *reinterpret_cast<uint4*>(&sw[warp][g][16u + (t << 2)]) = cur1;
+        prim::block_sync();
+        if (k0 + 64u < k) {
+            cur0 = fg_ld_nc4(wr + k0 + 64u + (t << 3));
+            cur1 = fg_ld_nc4(wr + k0 + 96u + (t << 3));
+        }
+#pragma unroll
+        for (u32 ks = 0u; ks < 4u; ks++) {
+            u32 ah[4], al[4], b[2];
+            u32 off = (ks << 3) + t;
+            ah[0] = sxh[g][off];
+            ah[1] = sxh[g + 8u][off];
+            ah[2] = sxh[g][off + 4u];
+            ah[3] = sxh[g + 8u][off + 4u];
+            al[0] = sxl[g][off];
+            al[1] = sxl[g + 8u][off];
+            al[2] = sxl[g][off + 4u];
+            al[3] = sxl[g + 8u][off + 4u];
+            b[0] = sw[warp][g][off];
+            b[1] = sw[warp][g][off + 4u];
+            fg_mma_bf16(acc, ah, b);
+            fg_mma_bf16(acc, al, b);
+        }
+        prim::block_sync();
+    }
+    u32 col = n0 + (t << 1);
+    if (r0 + g < m) {
+        u64 off = u64(r0 + g) * n + col;
+        float2 v = make_float2(acc[0], acc[1]);
+        if (add_mode != 0u) {
+            float2 b = *reinterpret_cast<const float2*>(add + (add_mode == 1u ? off : u64(col)));
+            v.x += b.x;
+            v.y += b.y;
+        }
+        *reinterpret_cast<float2*>(out + off) = v;
+    }
+    if (r0 + g + 8u < m) {
+        u64 off = u64(r0 + g + 8u) * n + col;
+        float2 v = make_float2(acc[2], acc[3]);
+        if (add_mode != 0u) {
+            float2 b = *reinterpret_cast<const float2*>(add + (add_mode == 1u ? off : u64(col)));
+            v.x += b.x;
+            v.y += b.y;
+        }
+        *reinterpret_cast<float2*>(out + off) = v;
+    }
+}
+
 // Streaming 8-BF16 decode GEMV, one warp per output row.
 extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16(
     const float* x, const u16* w, float* out, u32 n, u32 k) {

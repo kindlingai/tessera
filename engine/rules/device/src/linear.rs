@@ -600,6 +600,163 @@ fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(kernel, [x, leaf], len)])
 }
 
+/// Streaming BF16 Tensor-Core small-batch matmul for CUDA.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "fast_mm_bf16",
+    sizes = [self.m, self.n, self.k],
+    work = self.m * self.n * self.k,
+    accepts = mm_accepts,
+    emits = f32_only,
+    needs = mm_needs(),
+    order = Order::PerConfig,
+    source = cuda_source_entry("tessera_mm_bf16"),
+    launches = mm_launches,
+    load = mm_load,
+    unproven,
+)]
+struct FastMm {
+    m: usize,
+    n: usize,
+    k: usize,
+    add_mode: u32,
+    form: &'static dyn Stored,
+}
+
+fn mm_accepts(k: &FastMm, input: usize, form: &dyn Stored) -> bool {
+    weight_accepts(input, k.form, form)
+}
+
+fn mm_needs() -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes: (2 * 16 * 36 + 4 * 8 * 36) * 4,
+        group_threads: 128,
+        compiler: true,
+        lacks: &["metal", "rocm"],
+        bf16_tile: true,
+        ..Needs::default()
+    }
+}
+
+fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
+    let groups = (k.n / 32) * k.m.div_ceil(16);
+    let mut reads = vec![(2 * k.n * k.k) as f64, (4 * k.m * k.k) as f64];
+    if k.add_mode == 1 {
+        reads.push((4 * k.m * k.n) as f64);
+    } else if k.add_mode == 2 {
+        reads.push((4 * k.n) as f64);
+    }
+    let mut load = Load {
+        threads: groups * 128,
+        group: 128,
+        trips: k.k as f64 / 64.0,
+        reads,
+        written: (4 * k.m * k.n) as f64,
+        flight: 1024.0,
+        ..Load::default()
+    };
+    load.trip.fresh = 1.0;
+    Some(load)
+}
+
+fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: k.n / 32,
+        down: k.m.div_ceil(16),
+        threads: 128,
+    };
+    let add = if k.add_mode != 0 {
+        step.read(2)
+    } else {
+        step.read(0)
+    };
+    let args = vec![
+        step.read(0),
+        step.read(1),
+        add,
+        step.out(),
+        Arg::count(k.m),
+        Arg::count(k.n),
+        Arg::count(k.k),
+        Arg::value(&k.add_mode),
+    ];
+    vec![Launch { args, shape }]
+}
+
+fn mm_site(tree: &Tree, mat: T) -> Option<(T, T, usize, usize, usize, &'static dyn Stored)> {
+    let node = tree.node(mat);
+    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
+        return None;
+    }
+    let (x, w) = (node.args[0], node.args[1]);
+    if !tree.leaf(w) || tree.node(x).form.name() != "f32" {
+        return None;
+    }
+    let [n, k] = tree.node(w).shape[..] else {
+        return None;
+    };
+    let form = tree.node(w).form;
+    if form.name() != "bf16" || n == 0 || !n.is_multiple_of(32) || !k.is_multiple_of(64) {
+        return None;
+    }
+    let elems = tree.elements(x);
+    if !elems.is_multiple_of(k) {
+        return None;
+    }
+    let m = elems / k;
+    (2..=64).contains(&m).then_some((x, w, m, n, k, form))
+}
+
+fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let node = tree.node(at);
+    if node.term != Term::Stage(Stage::Add) || node.form.name() != "f32" {
+        return None;
+    }
+    let (a, b) = (node.args[0], *node.args.get(1)?);
+    for (mat, add) in [(a, b), (b, a)] {
+        if tree.root(mat) || tree.node(add).form.name() != "f32" {
+            continue;
+        }
+        let Some((x, w, m, n, k, form)) = mm_site(tree, mat) else {
+            continue;
+        };
+        let add_elems = tree.elements(add);
+        let add_mode = if add_elems == m * n {
+            1
+        } else if add_elems == n {
+            2
+        } else {
+            continue;
+        };
+        let kernel = FastMm {
+            m,
+            n,
+            k,
+            add_mode,
+            form,
+        };
+        return Some(vec![Draft::new(kernel, [x, w, add], m * n)]);
+    }
+    None
+}
+
+fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    if let Some(drafts) = propose_mm_add(tree, at) {
+        return Some(drafts);
+    }
+    let (x, w, m, n, k, form) = mm_site(tree, at)?;
+    let kernel = FastMm {
+        m,
+        n,
+        k,
+        add_mode: 0,
+        form,
+    };
+    Some(vec![Draft::new(kernel, [x, w], m * n)])
+}
+
 tessera_lower::rule!("trellis_mma", propose_trellis);
 tessera_lower::rule!("fast_gemv", propose_gemv);
+tessera_lower::rule!("fast_mm", propose_mm);
 tessera_lower::rule!("fast_stacked", propose_stacked);
