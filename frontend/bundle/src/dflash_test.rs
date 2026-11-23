@@ -102,7 +102,37 @@ fn config_and_names() {
     d2.push(sl("candidate_selector.successor_codebook", &[256, 16]));
     let g2 = stepper::<Norm>(&cfg2);
     let extra = extra_rules(&cfg2, &d2);
-    let (a2, b2) = (Mock(d2), Mock(tgt));
+    let (a2, b2) = (Mock(d2), Mock(tgt.clone()));
     let claims2 = names::resolve(&g2, &Overlay::new(&a2, &b2).slices(), &[&extra]).unwrap();
     assert_eq!(claims2.len(), g2.weights.len());
+
+    let json3 = r#"{"block_size":16,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"draft_block_causal":true,"mask_token_id":99,"target_layer_ids":[1,5],"selected_prefix_code_bridge":{"code_size":32,"rank":16,"eps":1e-6},"selected_prefix_last_write_refine":{"head_topk":4}}}"#;
+    let offer3 = Offered::parse("config.json", json3).unwrap();
+    let mut keys3 = Keys::new(std::slice::from_ref(&offer3));
+    let cfg3 = Config::read(&mut keys3, &target, 1, 64);
+    keys3.finish().unwrap();
+    assert!(cfg3.causal && cfg3.bridge.is_some());
+    let mut d3 = draft_slices(2);
+    d3.push(sl("selected_prefix_bridge.codebook", &[256, 32]));
+    d3.push(sl("selected_prefix_bridge.gate.weight", &[16, 32]));
+    d3.push(sl("selected_prefix_bridge.gate.bias", &[16]));
+    d3.push(sl(
+        "selected_prefix_bridge.predecessor_gate.weight",
+        &[16, 32],
+    ));
+    d3.push(sl("selected_prefix_bridge.prev.weight", &[16, 32]));
+    d3.push(sl(
+        "selected_prefix_bridge.early_read_weights",
+        &[1, 32, 64],
+    ));
+    d3.push(sl("selected_prefix_bridge.read_weight", &[32, 64]));
+    d3.push(sl(
+        "selected_prefix_bridge.feature_write_weights",
+        &[2, 64, 16],
+    ));
+    let g3 = stepper::<Norm>(&cfg3);
+    let extra3 = extra_rules(&cfg3, &d3);
+    let (a3, b3) = (Mock(d3), Mock(tgt));
+    let claims3 = names::resolve(&g3, &Overlay::new(&a3, &b3).slices(), &[&extra3]).unwrap();
+    assert_eq!(claims3.len(), g3.weights.len());
 }

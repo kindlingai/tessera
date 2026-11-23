@@ -2,6 +2,7 @@
 
 use crate::names::Rule;
 use crate::{Bundle, Overrides, load_tapped, pull, release};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Shards, Slice};
@@ -29,12 +30,38 @@ pub(crate) struct Overlay<'a> {
     fallback: &'a dyn Offer,
     slices: Vec<Slice>,
     primary_names: Vec<String>,
+    /// Virtual 2D layer slices carved from 3D stacked bridge weights.
+    stacked: HashMap<String, (String, usize, usize)>,
+}
+
+fn is_stacked_bridge(s: &Slice) -> bool {
+    s.shape.len() == 3
+        && (s.name.ends_with("early_read_weights") || s.name.ends_with("feature_write_weights"))
 }
 
 impl<'a> Overlay<'a> {
     pub fn new(primary: &'a dyn Offer, fallback: &'a dyn Offer) -> Self {
-        let mut slices = primary.slices();
-        let primary_names: Vec<String> = slices.iter().map(|s| s.name.clone()).collect();
+        let mut slices = Vec::new();
+        let mut primary_names = Vec::new();
+        let mut stacked = HashMap::new();
+        for s in primary.slices() {
+            primary_names.push(s.name.clone());
+            if is_stacked_bridge(&s) {
+                let count = s.shape[0];
+                let shape = vec![s.shape[1], s.shape[2]];
+                for i in 0..count {
+                    let vname = format!("{}.{i}", s.name);
+                    stacked.insert(vname.clone(), (s.name.clone(), i, count));
+                    slices.push(Slice {
+                        name: vname,
+                        shape: shape.clone(),
+                        stored: s.stored,
+                    });
+                }
+            } else {
+                slices.push(s);
+            }
+        }
         let has_embed = slices.iter().any(|s| is_embed(&s.name));
         let has_head = slices.iter().any(|s| is_head(&s.name));
         for s in fallback.slices() {
@@ -51,6 +78,7 @@ impl<'a> Overlay<'a> {
             fallback,
             slices,
             primary_names,
+            stacked,
         }
     }
 
@@ -62,20 +90,37 @@ impl<'a> Overlay<'a> {
     }
 }
 
+fn take_part<T: Copy>(data: &[T], index: usize, count: usize) -> Vec<T> {
+    let chunk = data.len() / count;
+    data[index * chunk..(index + 1) * chunk].to_vec()
+}
+
 impl Offer for Overlay<'_> {
     fn slices(&self) -> Vec<Slice> {
         self.slices.clone()
     }
 
     fn floats(&self, name: &str) -> std::result::Result<Vec<f32>, tessera_checkpoint::Error> {
+        if let Some((parent, i, count)) = self.stacked.get(name) {
+            let all = self.primary.floats(parent)?;
+            return Ok(take_part(&all, *i, *count));
+        }
         self.source(name).floats(name)
     }
 
     fn packed(&self, name: &str) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
+        if let Some((parent, i, count)) = self.stacked.get(name) {
+            let all = self.primary.packed(parent)?;
+            return Ok(take_part(&all, *i, *count));
+        }
         self.source(name).packed(name)
     }
 
     fn bf16(&self, name: &str) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
+        if let Some((parent, i, count)) = self.stacked.get(name) {
+            let all = self.primary.bf16(parent)?;
+            return Ok(take_part(&all, *i, *count));
+        }
         self.source(name).bf16(name)
     }
 
@@ -152,6 +197,54 @@ pub(crate) fn extra_rules(config: &Config, slices: &[Slice]) -> Vec<Rule> {
             rules.push((
                 format!("candidate_selector.{leaf}"),
                 format!("{prefix}candidate_selector.{leaf}"),
+            ));
+        }
+    }
+    if config.bridge.is_some() {
+        let tencent = slices
+            .iter()
+            .any(|s| s.name.contains("selected_prefix_bridge."));
+        if tencent {
+            let b = format!("{prefix}selected_prefix_bridge");
+            rules.push(("bridge.codebook".into(), format!("{b}.codebook")));
+            rules.push(("bridge.gate".into(), format!("{b}.gate")));
+            rules.push(("bridge.gate_bias".into(), format!("{b}.gate.bias")));
+            rules.push(("bridge.pred_gate".into(), format!("{b}.predecessor_gate")));
+            rules.push(("bridge.prev".into(), format!("{b}.prev")));
+            let last = config.stack.layers.saturating_sub(1);
+            for i in 0..last {
+                rules.push((
+                    format!("layers.{i}.bridge_read"),
+                    format!("{b}.early_read_weights.{i}"),
+                ));
+            }
+            rules.push((
+                format!("layers.{last}.bridge_read"),
+                format!("{b}.read_weight"),
+            ));
+            rules.push((
+                "layers.*.bridge_write".into(),
+                format!("{b}.feature_write_weights.*"),
+            ));
+        } else {
+            rules.push(("bridge.codebook".into(), format!("{prefix}transfer_codes")));
+            rules.push((
+                "bridge.gate".into(),
+                format!("{prefix}injection.receiver_gate"),
+            ));
+            rules.push(("bridge.gate_bias".into(), format!("{prefix}injection.bias")));
+            rules.push((
+                "bridge.pred_gate".into(),
+                format!("{prefix}injection.predecessor_gate"),
+            ));
+            rules.push(("bridge.prev".into(), format!("{prefix}injection.message")));
+            rules.push((
+                "layers.*.bridge_read".into(),
+                format!("{prefix}injection.readouts.*"),
+            ));
+            rules.push((
+                "layers.*.bridge_write".into(),
+                format!("{prefix}injection.writes.*"),
             ));
         }
     }

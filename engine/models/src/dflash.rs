@@ -7,7 +7,7 @@ use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, Embed, EntryKind, Graph, Kept, Linear, Mask, Model, Norm,
-    Pairs, PathSeg, Port, Role, Size, Tensor, TensorType, Weights,
+    Pairs, PathSeg, Port, Role, Size, Tensor, TensorType, Vector, Weights,
 };
 
 /// Dynamic grouped causal convolution dimensions for DFlash2 layers.
@@ -22,6 +22,15 @@ pub struct ConvConfig {
 pub struct SelectorConfig {
     pub rank: u64,
     pub top_k: u64,
+}
+
+/// Adjacent causal injection bridge dimensions for DSpine drafters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BridgeConfig {
+    pub code_size: u64,
+    pub rank: u64,
+    pub top_k: u64,
+    pub eps: f32,
 }
 
 /// Target model dimensions a drafter inherits when omitted.
@@ -56,6 +65,8 @@ pub struct Config {
     pub conv: Option<ConvConfig>,
     /// Optional candidate path selector over top-k logits (DFlash2).
     pub selector: Option<SelectorConfig>,
+    /// Optional adjacent causal injection bridge (DSpine).
+    pub bridge: Option<BridgeConfig>,
     pub output_multiplier: f32,
     pub logit_softcap: Option<f32>,
 }
@@ -122,10 +133,10 @@ impl Config {
         } else {
             None
         };
-        let causal = k
+        let explicit_causal = k
             .or::<Option<bool>>(&["dflash_config.causal"], None)
-            .or_else(|| k.or::<Option<bool>>(&["is_causal"], None))
-            .unwrap_or(false);
+            .or_else(|| k.or::<Option<bool>>(&["dflash_config.draft_block_causal"], None))
+            .or_else(|| k.or::<Option<bool>>(&["is_causal"], None));
         let taps: Option<u64> = k.or(&["dflash_config.conv_kernel_size"], None);
         let group_size: Option<u64> = k.or(&["dflash_config.conv_group_size"], None);
         let conv = match (taps, group_size) {
@@ -156,6 +167,53 @@ impl Config {
                 None
             }
         };
+        let bridge_code: Option<u64> = k.or(
+            &[
+                "dflash_config.selected_prefix_code_bridge.code_size",
+                "dspine_config.transfer_rank",
+            ],
+            None,
+        );
+        let bridge_rank: Option<u64> = k.or(
+            &[
+                "dflash_config.selected_prefix_code_bridge.rank",
+                "dspine_config.message_size",
+            ],
+            None,
+        );
+        let bridge = match (bridge_code, bridge_rank) {
+            (Some(code_size), Some(rank)) => {
+                let top_k = k.or(
+                    &[
+                        "dflash_config.selected_prefix_last_write_refine.head_topk",
+                        "dspine_config.top_k",
+                    ],
+                    16u64,
+                );
+                let b_eps = k.or(&["dflash_config.selected_prefix_code_bridge.eps"], eps);
+                if code_size == 0 || rank == 0 || top_k == 0 {
+                    k.misfit(
+                        "selected_prefix_code_bridge",
+                        "bridge sizes must be positive",
+                    );
+                }
+                Some(BridgeConfig {
+                    code_size,
+                    rank,
+                    top_k,
+                    eps: b_eps,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                k.misfit(
+                    "selected_prefix_code_bridge",
+                    "bridge needs code_size and rank",
+                );
+                None
+            }
+        };
+        let causal = explicit_causal.unwrap_or(bridge.is_some());
         let output_multiplier = k.or(&["dflash_config.output_multiplier"], 1.0f32);
         let logit_softcap = k
             .or::<Option<f32>>(&["dflash_config.final_logit_softcapping"], None)
@@ -175,6 +233,7 @@ impl Config {
             causal,
             conv,
             selector,
+            bridge,
             output_multiplier,
             logit_softcap,
         }
@@ -204,6 +263,7 @@ impl Config {
             causal: false,
             conv: None,
             selector: None,
+            bridge: None,
             output_multiplier: 1.0,
             logit_softcap: None,
         }
@@ -525,6 +585,163 @@ impl SelectorWeights {
     }
 }
 
+/// Weights for the DSpine adjacent causal injection bridge.
+struct BridgeWeights {
+    codebook: Tensor,
+    gate: Linear,
+    gate_bias: Vector,
+    pred_gate: Linear,
+    prev: Linear,
+    reads: Vec<Linear>,
+    writes: Vec<Linear>,
+}
+
+impl BridgeWeights {
+    fn declare(m: &Model, layers: u64, cfg: BridgeConfig) -> Self {
+        let bpath = |leaf: &str| vec![PathSeg::Field("bridge".into()), PathSeg::Field(leaf.into())];
+        let lpath = |i: u64, leaf: &str| {
+            vec![
+                PathSeg::Field("layers".into()),
+                PathSeg::Index(i as u32),
+                PathSeg::Field(leaf.into()),
+            ]
+        };
+        let codebook = m.weight(
+            &bpath("codebook"),
+            TensorType::new(vec![Vocab.into(), cfg.code_size.into()], DType::F32),
+        );
+        let rc = || TensorType::new(vec![cfg.rank.into(), cfg.code_size.into()], DType::F32);
+        let gate = Linear::of(m.weight(&bpath("gate"), rc()));
+        let gate_bias = Vector::of(m.weight(
+            &bpath("gate_bias"),
+            TensorType::new(vec![cfg.rank.into()], DType::F32),
+        ));
+        let pred_gate = Linear::of(m.weight(&bpath("pred_gate"), rc()));
+        let prev = Linear::of(m.weight(&bpath("prev"), rc()));
+        let mut reads = Vec::with_capacity(layers as usize);
+        let mut writes = Vec::with_capacity(layers as usize);
+        for i in 0..layers {
+            reads.push(Linear::of(m.weight(
+                &lpath(i, "bridge_read"),
+                TensorType::new(vec![cfg.code_size.into(), Hidden.into()], DType::F32),
+            )));
+            writes.push(Linear::of(m.weight(
+                &lpath(i, "bridge_write"),
+                TensorType::new(vec![Hidden.into(), cfg.rank.into()], DType::F32),
+            )));
+        }
+        Self {
+            codebook,
+            gate,
+            gate_bias,
+            pred_gate,
+            prev,
+            reads,
+            writes,
+        }
+    }
+
+    fn apply(
+        &self,
+        layer: usize,
+        raw: &Tensor,
+        block_tokens: &Tensor,
+        c: &Config,
+        cfg: BridgeConfig,
+    ) -> (Tensor, Tensor, Tensor) {
+        let (block, hidden, n) = (c.block_size, c.stack.hidden, c.block_size - 1);
+        let normed = raw.rms(cfg.eps);
+        let rms = raw
+            .mul(&normed)
+            .mean(1)
+            .reshape(vec![block.into(), 1u64.into()]);
+        let code_eps = (cfg.eps * cfg.eps / cfg.code_size as f32).max(1e-24);
+        let proj = normed.matmul(&self.reads[layer]).rms(code_eps);
+        let anchor = self
+            .codebook
+            .gather(block_tokens)
+            .slice(0, 0u64, 1u64)
+            .scale((cfg.code_size as f32).sqrt());
+        let codes = join_rows(&anchor, &proj.slice(0, 1u64, n));
+        let q = codes.matmul(&self.gate);
+        let s = codes.matmul(&self.pred_gate);
+        let v = codes.matmul(&self.prev);
+        let gate = q
+            .slice(0, 1u64, n)
+            .add(&s.slice(0, 0u64, n))
+            .add_vector(&self.gate_bias)
+            .act(Act::Sigmoid);
+        let delta = gate.mul(&v.slice(0, 0u64, n)).matmul(&self.writes[layer]);
+        let rms_tail = rms.slice(0, 1u64, n).expand(1, hidden);
+        let out_tail = raw.slice(0, 1u64, n).add(&rms_tail.mul(&delta));
+        let out = join_rows(&raw.slice(0, 0u64, 1u64), &out_tail);
+        (out, rms, q)
+    }
+
+    fn refine(
+        &self,
+        m: &Model,
+        c: &Config,
+        cfg: BridgeConfig,
+        (norm, head): (&Norm, &Embed),
+        (raw, rms, q): (&Tensor, &Tensor, &Tensor),
+        (logits, block_tokens): (&Tensor, &Tensor),
+    ) -> (Tensor, Tensor) {
+        let (n, k, cs, r, h) = (
+            c.block_size - 1,
+            cfg.top_k,
+            cfg.code_size,
+            cfg.rank,
+            c.stack.hidden,
+        );
+        let cands = logits.top_k(k);
+        let cands_flat = cands.reshape(vec![(n * k).into()]);
+        let anchor = self
+            .codebook
+            .gather(block_tokens)
+            .slice(0, 0u64, 1u64)
+            .expand(0, k);
+        let e = if n > 1 {
+            let prev = self
+                .codebook
+                .gather(&cands_flat)
+                .slice(0, 0u64, (n - 1) * k);
+            join_rows(&anchor, &prev)
+        } else {
+            anchor
+        }
+        .scale((cs as f32).sqrt())
+        .reshape(vec![n.into(), k.into(), cs.into()]);
+        let q_tail = q
+            .slice(0, 1u64, n)
+            .reshape(vec![n.into(), 1u64.into(), r.into()])
+            .expand(1, k);
+        let gate = q_tail
+            .add(&e.matmul(&self.pred_gate))
+            .add_vector(&self.gate_bias)
+            .act(Act::Sigmoid);
+        let val = e.matmul(&self.prev);
+        let delta = gate
+            .mul(&val)
+            .matmul(self.writes.last().expect("at least one layer"));
+        let rms_tail = rms
+            .slice(0, 1u64, n)
+            .reshape(vec![n.into(), 1u64.into(), 1u64.into()])
+            .expand(1, k)
+            .expand(2, h);
+        let raw_tail = raw
+            .slice(0, 1u64, n)
+            .reshape(vec![n.into(), 1u64.into(), h.into()])
+            .expand(1, k);
+        let refined = raw_tail.add(&rms_tail.mul(&delta)).rms_norm(norm, c.eps);
+        let head_rows = m
+            .embed(&cands_flat, head)
+            .reshape(vec![n.into(), k.into(), h.into()]);
+        let scores = refined.matmul_rows(&head_rows);
+        (cands_flat, scores)
+    }
+}
+
 /// Cached DFlash step graph: block plus taps in, drafts out.
 pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
     assert!(c.block_size >= 2, "dflash block_size must be at least 2");
@@ -545,6 +762,9 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
             .collect()
     });
     let selector = c.selector.map(|sel| SelectorWeights::declare(&m, sel));
+    let bridge = c
+        .bridge
+        .map(|cfg| BridgeWeights::declare(&m, c.stack.layers, cfg));
     let p = entry_ports(&m, c.block_size);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
     let kept: Vec<Cache> = w
@@ -554,8 +774,9 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
         .collect();
     let ctx = p.ctx_taps.matmul(&w.fc).rms_norm(&w.hidden_norm, c.eps);
     let mut x = m.embed(&p.block_tokens, &w.embed);
+    let mut stash: Option<(Tensor, Tensor, Tensor)> = None;
     for (i, l) in w.layers.iter().enumerate() {
-        let [out] = m.composite(Composite::Layer, || {
+        let [raw] = m.composite(Composite::Layer, || {
             let h = x.rms_norm(&l.ln1, c.eps);
             let attn = match (c.conv, &convs) {
                 (Some(cv), Some(cs)) => {
@@ -582,13 +803,34 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
             };
             [x.add(&mlp)]
         });
-        x = out;
+        if let (Some(b_cfg), Some(b)) = (c.bridge, &bridge) {
+            let (out, rms, q) = b.apply(i, &raw, &p.block_tokens, c, b_cfg);
+            x = out;
+            stash = Some((raw, rms, q));
+        } else {
+            x = raw;
+        }
     }
     let h = x.rms_norm(&w.norm, c.eps);
     let n = c.block_size - 1;
     let draft = h.slice(0, 1u64, n);
     let head = head.as_ref().unwrap_or(&w.embed);
     let logits = draft.unembed(head);
+    if let (Some(b_cfg), Some(b), Some((raw, rms, q))) = (c.bridge, &bridge, stash) {
+        let (cands, scores) = b.refine(
+            &m,
+            c,
+            b_cfg,
+            (&w.norm, head),
+            (&raw, &rms, &q),
+            (&logits, &p.block_tokens),
+        );
+        return m.finish([
+            (Role::Candidates, &cands),
+            (Role::Taps, &scores),
+            (Role::Logits, &logits),
+        ]);
+    }
     if let (Some(sel_cfg), Some(sel)) = (c.selector, &selector) {
         let (cands, scores) = sel.lattice(c, sel_cfg, &draft, &logits, &p.block_tokens);
         return m.finish([

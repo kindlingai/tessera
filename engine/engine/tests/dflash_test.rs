@@ -181,12 +181,14 @@ fn verify_pair(
     d_graph: &Graph,
     d_weights: &[Tensor],
     max_tokens: usize,
+    causal: bool,
 ) -> SpecStats {
     let mut last = SpecStats::default();
     for settings in runs() {
         let mut baseline = open_target(t_graph, t_weights, 24, &settings);
         let mut target = open_target(t_graph, t_weights, 24, &settings);
         let mut drafter = open_drafter(d_graph, d_weights, 24, 4, 0, &settings);
+        drafter.set_causal(causal);
         let req = || Request {
             tokens: vec![2, 6, 1],
             max_tokens,
@@ -232,7 +234,7 @@ fn dflash_accepts_and_mla() {
     let last_d = d_weights.len() - 1;
     zero_head(&mut t_weights[last_t]);
     zero_head(&mut d_weights[last_d]);
-    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 10);
+    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 10, false);
     assert!(
         stats.accepted > 0,
         "expected accepted drafts, got {stats:?}"
@@ -264,7 +266,38 @@ fn dflash2_selector() {
     let t_weights = weights(&t_graph, &mut Noise(41));
     let d_graph = dflash::stepper::<()>(&d_cfg);
     let d_weights = weights(&d_graph, &mut Noise(43));
-    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8);
+    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8, false);
+    assert!(stats.emitted == 8 && stats.steps > 0);
+}
+
+#[test]
+fn dspine_bridge() {
+    let mut t_cfg = Config::toy(1, 24);
+    t_cfg.stack.taps = vec![1, 2];
+    let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
+    let t_weights = weights(&t_graph, &mut Noise(47));
+    let spec = TargetSpec {
+        vocab: t_cfg.stack.vocab,
+        hidden: t_cfg.stack.hidden,
+        layers: t_cfg.stack.layers,
+        tied: t_cfg.tied,
+    };
+    let mut d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
+    d_cfg.stack.layers = 2;
+    d_cfg.causal = true;
+    d_cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    d_cfg.bridge = Some(dflash::BridgeConfig {
+        code_size: 16,
+        rank: 8,
+        top_k: 4,
+        eps: 1e-6,
+    });
+    let d_graph = dflash::stepper::<Norm>(&d_cfg);
+    let d_weights = weights(&d_graph, &mut Noise(53));
+    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8, true);
     assert!(stats.emitted == 8 && stats.steps > 0);
 }
 
