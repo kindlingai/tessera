@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 const KERNEL: &str = include_str!("linear.cu");
@@ -401,9 +401,7 @@ fn cuda_needs(group_bytes: usize) -> Needs {
 
 fn cuda_source_entry(entry: &'static str) -> Source {
     Source::Fixed {
-        metal: "",
-        cuda: cuda_source(),
-        hip: "",
+        text: ByBackend(["", cuda_source(), ""]),
         entry,
     }
 }

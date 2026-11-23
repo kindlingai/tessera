@@ -12,21 +12,10 @@ pub(crate) fn fixed_text(
     source: &Source,
     backend: Backend,
 ) -> Option<(&'static str, &'static str)> {
-    let Source::Fixed {
-        metal,
-        cuda,
-        hip,
-        entry,
-    } = *source
-    else {
+    let Source::Fixed { text, entry } = *source else {
         return None;
     };
-    let text = match backend {
-        Backend::Metal => metal,
-        Backend::Cuda => cuda,
-        Backend::Rocm => hip,
-    };
-    Some((text, entry))
+    Some((text[backend], entry))
 }
 
 /// The largest group among the launches of `step`.

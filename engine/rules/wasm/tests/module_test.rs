@@ -11,8 +11,8 @@ use tessera_graph::{Parts, shard};
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::kept::{self, Layout};
 use tessera_lower::{
-    Arg, Cache, Cluster, Collective, Device, Extent, Limits, Plan, Platform, Rule, Shape, Source,
-    lower,
+    Arg, Backend, Cache, Cluster, Collective, Device, Extent, Limits, Plan, Platform, Rule, Shape,
+    Source, lower,
 };
 use tessera_run::testing::{host, runs};
 use tessera_run::{Loopback, Run};
@@ -209,10 +209,10 @@ fn module_matmul_wins() {
     let plain = lower(&graph(false), 0, &[(Rows, 4)], &host).unwrap();
     assert!(!rules(&plain).contains(&"wasm_matmul"));
     let step = &plan.steps[0];
-    let Source::Fixed { entry, cuda, .. } = step.kernel.source() else {
+    let Source::Fixed { entry, text } = step.kernel.source() else {
         panic!("module kernels are fixed text");
     };
-    assert!(entry == "gemm" && cuda.contains("extern \"C\""));
+    assert!(entry == "gemm" && text[Backend::Cuda].contains("extern \"C\""));
     // Rows are fixed here, so the count is plain.
     let launch = &step.kernel.launches(step)[0];
     let counts: Vec<u32> = launch.args[3..].iter().filter_map(Arg::u32).collect();
@@ -232,13 +232,10 @@ fn cuda_alone_opens() {
     let bytes = module(&declare(ABI, "matmul", kernels), &json!([matmul()]), "");
     let rule = tessera_wasm::load(&bytes).unwrap()[0];
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
-    let Source::Fixed {
-        metal, cuda, hip, ..
-    } = plan.steps[0].kernel.source()
-    else {
+    let Source::Fixed { text, .. } = plan.steps[0].kernel.source() else {
         panic!("module kernels are fixed text");
     };
-    assert!(metal.is_empty() && cuda == GEMM_CUDA && hip == GEMM_CUDA);
+    assert_eq!(text.0, ["", GEMM_CUDA, GEMM_CUDA]);
 }
 
 #[test]
@@ -658,15 +655,16 @@ fn module_flattens_imports() {
     };
     let rule = guest(kernel(), vec![main(), row("int row;\n")]).unwrap();
     let plan = lower(&graph(false), 0, &[(Rows, 4)], &compiling().adding(rule)).unwrap();
-    let Source::Fixed {
-        metal, cuda, hip, ..
-    } = plan.steps[0].kernel.source()
-    else {
+    let Source::Fixed { text, .. } = plan.steps[0].kernel.source() else {
         panic!("module kernels are fixed text");
     };
     // Metal has no grid barrier.
-    assert!(metal.is_empty());
-    for (text, define) in [(cuda, "TESSERA_CUDA"), (hip, "TESSERA_HIP")] {
+    assert!(text[Backend::Metal].is_empty());
+    for (backend, define) in [
+        (Backend::Cuda, "TESSERA_CUDA"),
+        (Backend::Rocm, "TESSERA_HIP"),
+    ] {
+        let text = text[backend];
         assert!(text.starts_with(&format!("#define {define} 1\n")), "{text}");
         assert!(text.contains("int row;") && !text.contains("#include <tessera"));
     }

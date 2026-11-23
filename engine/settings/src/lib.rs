@@ -2,7 +2,7 @@
 
 mod backend;
 
-pub use backend::Backend;
+pub use backend::{Backend, ByBackend};
 use std::path::PathBuf;
 
 /// Where plans run.

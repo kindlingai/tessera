@@ -5,22 +5,22 @@ use crate::leak;
 use std::fmt;
 use tessera_device::{Backend, Options, Problem, flatten};
 use tessera_lower::kept::Layout;
-use tessera_lower::{Arg, Collective, Kernel, Launch, Needs, Resident, Source, Step};
+use tessera_lower::{
+    Arg, ByBackend, Collective, Dialect, Kernel, Launch, Needs, Resident, Source, Step,
+};
 
 /// A module kernel's text, never freed.
 #[derive(Debug)]
 pub struct Fixed {
     pub name: &'static str,
     pub entry: &'static str,
-    pub metal: &'static str,
-    pub cuda: &'static str,
-    pub hip: &'static str,
+    pub text: ByBackend<&'static str>,
     /// Platform backends with no text.
     lacks: &'static [Backend],
 }
 
-/// Metal, CUDA and HIP text of `file`, or empty.
-fn flat(file: &str, files: &[File]) -> Result<[String; 3], tessera_device::Error> {
+/// Each backend's text of `file`, or empty.
+fn flat(file: &str, files: &[File]) -> Result<ByBackend<String>, tessera_device::Error> {
     let load = |path: &str| {
         files
             .iter()
@@ -32,10 +32,9 @@ fn flat(file: &str, files: &[File]) -> Result<[String; 3], tessera_device::Error
         line: 0,
         problem: Problem::Missing(file.into()),
     })?;
-    let mut out: [String; 3] = Default::default();
+    let mut out = ByBackend::<String>::default();
     let mut skipped = None;
-    let backends = [Backend::Metal, Backend::Cuda, Backend::Rocm];
-    for (slot, backend) in out.iter_mut().zip(backends) {
+    for (slot, &backend) in out.0.iter_mut().zip(Backend::ALL) {
         // No remote rows or marks yet.
         let options = Options {
             backend,
@@ -51,7 +50,7 @@ fn flat(file: &str, files: &[File]) -> Result<[String; 3], tessera_device::Error
         }
     }
     match skipped {
-        Some(e) if out.iter().all(String::is_empty) => Err(e),
+        Some(e) if out.0.iter().all(String::is_empty) => Err(e),
         _ => Ok(out),
     }
 }
@@ -59,21 +58,22 @@ fn flat(file: &str, files: &[File]) -> Result<[String; 3], tessera_device::Error
 impl Fixed {
     /// Kernel `k`, with any recipe file flattened per backend.
     pub fn open(k: crate::abi::Text, files: &[File]) -> Result<Self, tessera_device::Error> {
-        let [metal, cuda, hip] = if k.file.is_empty() {
-            let cuda = leak(k.cuda);
-            [leak(k.metal), cuda, cuda]
+        let text = if k.file.is_empty() {
+            // CUDA text also serves HIP.
+            let (metal, cuda) = (leak(k.metal), leak(k.cuda));
+            ByBackend::from_fn(|b| match Dialect::of(b) {
+                Dialect::Metal => metal,
+                Dialect::Cuda => cuda,
+            })
         } else {
-            flat(&k.file, files)?.map(leak)
+            ByBackend(flat(&k.file, files)?.0.map(leak))
         };
-        let texts = Backend::ALL.iter().zip([metal, cuda, hip]);
-        let lacks = texts.filter(|t| t.1.is_empty()).map(|t| *t.0);
+        let lacks = Backend::ALL.iter().filter(|b| text[**b].is_empty());
         Ok(Fixed {
             name: leak(k.name),
             entry: leak(k.entry),
-            metal,
-            cuda,
-            hip,
-            lacks: lacks.collect::<Vec<_>>().leak(),
+            text,
+            lacks: lacks.copied().collect::<Vec<_>>().leak(),
         })
     }
 }
@@ -146,19 +146,8 @@ impl Kernel for Text {
     }
 
     fn source(&self) -> Source {
-        let Fixed {
-            entry,
-            metal,
-            cuda,
-            hip,
-            ..
-        } = *self.fixed;
-        Source::Fixed {
-            metal,
-            cuda,
-            hip,
-            entry,
-        }
+        let Fixed { entry, text, .. } = *self.fixed;
+        Source::Fixed { text, entry }
     }
 
     fn launches(&self, step: &Step) -> Vec<Launch> {

@@ -323,16 +323,10 @@ where
 
     fn open(&mut self, kernel: &KernelRef, layout: GridLayout) -> Result<(), Error> {
         self.scratch(kernel)?;
-        let Source::Fixed {
-            cuda, hip, entry, ..
-        } = kernel.source()
-        else {
+        let Source::Fixed { text, entry } = kernel.source() else {
             return Err(Error::Plan(format!("{} has no fixed text", kernel.name())));
         };
-        let planned = match backend::<D>()? {
-            crate::Backend::Rocm => hip,
-            _ => cuda,
-        };
+        let planned = text[backend::<D>()?];
         let overridden = self.overrides.get(entry).map(String::as_str);
         let replaced = overridden.is_some();
         let want_marks = self.profiling && overridden.unwrap_or(planned).contains("TS_MARK");

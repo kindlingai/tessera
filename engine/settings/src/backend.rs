@@ -10,6 +10,24 @@ pub enum Backend {
     Rocm,
 }
 
+/// One value per backend, indexed by it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ByBackend<T>(pub [T; Backend::ALL.len()]);
+
+impl<T> ByBackend<T> {
+    pub fn from_fn(mut f: impl FnMut(Backend) -> T) -> Self {
+        Self(std::array::from_fn(|i| f(Backend::ALL[i])))
+    }
+}
+
+impl<T> std::ops::Index<Backend> for ByBackend<T> {
+    type Output = T;
+
+    fn index(&self, backend: Backend) -> &T {
+        &self.0[backend as usize]
+    }
+}
+
 struct Facts {
     /// The spelling platform ids and calibration files use.
     name: &'static str,
@@ -23,8 +41,7 @@ struct Facts {
     pins: bool,
 }
 
-/// In `Backend` order.
-const FACTS: [Facts; 3] = [
+const FACTS: ByBackend<Facts> = ByBackend([
     Facts {
         name: "metal",
         extension: "metal",
@@ -46,17 +63,17 @@ const FACTS: [Facts; 3] = [
         persistent: true,
         pins: true,
     },
-];
+]);
 
 /// Kernel files with this extension build for every backend.
 const SHARED: &str = "kernel";
 
 impl Backend {
-    /// In declaration order.
+    /// In the order `ByBackend` holds them.
     pub const ALL: &'static [Backend] = &[Backend::Metal, Backend::Cuda, Backend::Rocm];
 
     pub fn name(self) -> &'static str {
-        FACTS[self as usize].name
+        FACTS[self].name
     }
 
     /// The backend whose `name()` is `name`.
@@ -65,19 +82,19 @@ impl Backend {
     }
 
     pub fn extension(self) -> &'static str {
-        FACTS[self as usize].extension
+        FACTS[self].extension
     }
 
     pub fn define(self) -> &'static str {
-        FACTS[self as usize].define
+        FACTS[self].define
     }
 
     pub fn persistent(self) -> bool {
-        FACTS[self as usize].persistent
+        FACTS[self].persistent
     }
 
     pub fn pins(self) -> bool {
-        FACTS[self as usize].pins
+        FACTS[self].pins
     }
 
     /// The backends a kernel file's extension allows.
