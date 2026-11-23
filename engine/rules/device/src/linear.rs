@@ -1,16 +1,18 @@
-//! Device-accelerated trellis MMA and streaming decode GEMV rules.
+//! Device-accelerated trellis MMA, streaming decode GEMV, and small-batch matmul rules.
 
 use crate::{Backend, Options, flatten};
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Stage, View};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
+use tessera_lower::{
+    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+};
 
 const KERNEL: &str = include_str!("linear.cu");
 const BLOCK: usize = 128;
-const ROWS: usize = 4;
 const THREADS: usize = 256;
 const WARPS: usize = 8;
+const DTR_SMEM: usize = 4096 * 4;
 
 fn flat(backend: Backend) -> &'static str {
     let options = Options {
@@ -29,33 +31,12 @@ pub(crate) fn cuda_source() -> &'static str {
     CUDA.get_or_init(|| flat(Backend::Cuda))
 }
 
+#[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
     HIP.get_or_init(|| flat(Backend::Hip))
 }
 
-fn trellis_choice(t: &TrellisMma) -> (&'static str, usize) {
-    let entry = match (t.m, t.bits, t.book, t.turned) {
-        (1, 4, 0, true) => "tessera_trellis_k4_mcg_t1",
-        (1, 4, 0, false) => "tessera_trellis_k4_mcg_p1",
-        (1, 3, 1, true) => "tessera_trellis_k3_mul1_t1",
-        (1, 4, 1, true) => "tessera_trellis_k4_mul1_t1",
-        (1, _, _, _) => "tessera_trellis_mma1",
-        _ => "tessera_trellis_mma",
-    };
-    (entry, WARPS)
-}
-
-fn trellis_source(t: &TrellisMma) -> Source {
-    Source::Fixed {
-        metal: "",
-        cuda: cuda_source(),
-        hip: hip_source(),
-        entry: trellis_choice(t).0,
-    }
-}
-
-/// Bit width and codebook index of a trellis form name.
 fn parse_trellis(name: &str) -> Option<(u32, u32)> {
     let rest = name.strip_prefix("trellis_k")?;
     let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
@@ -69,7 +50,47 @@ fn parse_trellis(name: &str) -> Option<(u32, u32)> {
     (2..=4).contains(&bits).then_some((bits, book))
 }
 
-/// Plain or rotated trellis matmul using tensor-core warp MMA.
+fn dtr_ks(m: usize, n: usize, k: usize) -> usize {
+    let ibs = k / BLOCK;
+    if m > 16 || ibs <= 1 {
+        return 1;
+    }
+    let target: usize = if m <= 2 { 288 } else { 128 };
+    let want = target.div_ceil(n / BLOCK).clamp(1, 16).min(ibs);
+    for d in want..=ibs.min(16) {
+        if ibs.is_multiple_of(d) {
+            return d;
+        }
+    }
+    for d in (1..want).rev() {
+        if ibs.is_multiple_of(d) {
+            return d;
+        }
+    }
+    1
+}
+
+fn dtr_entry(t: &TrellisMma) -> &'static str {
+    match (t.m <= 8, t.bits, t.book, t.turned, t.ks > 1) {
+        (true, 4, 0, true, true) => "dtr_k4_t1s",
+        (true, 4, 0, true, false) => "dtr_k4_t1",
+        (true, 4, 0, false, true) => "dtr_k4_p1s",
+        (true, 4, 0, false, false) => "dtr_k4_p1",
+        (false, 4, 0, true, true) => "dtr_k4_t2s",
+        (false, 4, 0, true, false) => "dtr_k4_t2",
+        (true, _, _, _, _) => "dtr_gen1",
+        (false, _, _, _, _) => "dtr_gen2",
+    }
+}
+
+fn dtr_needs(bytes: usize) -> Needs {
+    Needs {
+        bf16_tile: true,
+        ..cuda_needs(bytes)
+    }
+}
+
+/// Dense trellis matmul with warp-per-tile MMA and split-K.
 #[derive(Clone, Debug, Kernel)]
 #[launch(
     name = self.form.suffixed(if self.turned { "trellis_turned" } else { "trellis_mma" }),
@@ -77,9 +98,9 @@ fn parse_trellis(name: &str) -> Option<(u32, u32)> {
     work = self.m * self.n * self.k,
     accepts = mma_accepts,
     emits = f32_only,
-    needs = mma_needs(self),
+    needs = dtr_needs(DTR_SMEM),
     order = Order::PerConfig,
-    source = trellis_source(self),
+    source = cuda_source_entry(dtr_entry(self)),
     launches = mma_launches,
     load = mma_load,
     unproven,
@@ -88,6 +109,7 @@ struct TrellisMma {
     m: usize,
     n: usize,
     k: usize,
+    ks: usize,
     bits: u32,
     book: u32,
     turned: bool,
@@ -95,69 +117,116 @@ struct TrellisMma {
 }
 
 fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
-    match input {
-        1 => form.name() == k.form.name(),
-        _ => form.name() == "f32",
-    }
-}
-
-fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
-    form.name() == "f32"
-}
-
-fn mma_needs(t: &TrellisMma) -> Needs {
-    let warps = trellis_choice(t).1;
-    let rows = if t.m == 1 { 1 } else { ROWS };
-    Needs {
-        lanes: 32,
-        group_bytes: warps * 256 * 4 + warps * rows * 128 * 4,
-        group_threads: warps * 32,
-        compiler: true,
-        lacks: &["metal"],
-        bf16_tile: true,
-        ..Needs::default()
-    }
+    weight_accepts(input, k.form, form)
 }
 
 fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
-    let threads = trellis_choice(t).1 * 32;
-    let groups = (t.n / BLOCK) * t.m.div_ceil(ROWS);
+    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(if t.m <= 8 { 8 } else { 16 });
     let mut reads = vec![t.form.bytes(t.n * t.k) as f64, (4 * t.m * t.k) as f64];
     if t.turned {
         reads.push((4 * t.k) as f64);
-        reads.push((4 * t.n) as f64);
+        if t.ks == 1 {
+            reads.push((4 * t.n) as f64);
+        }
     }
     Some(Load {
-        threads: groups * threads,
-        group: threads,
-        trips: (t.k / 16) as f64 / 8.0,
+        threads: groups * THREADS,
+        group: THREADS,
+        trips: (t.k / BLOCK / t.ks) as f64,
         reads,
-        written: (4 * t.m * t.n) as f64,
-        flight: 512.0,
+        written: (4 * t.ks * t.m * t.n) as f64,
+        flight: 1024.0,
         ..Load::default()
     })
 }
 
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
-        across: t.n / BLOCK,
-        down: t.m.div_ceil(ROWS),
-        threads: trellis_choice(t).1 * 32,
+        across: (t.n / BLOCK) * t.ks,
+        down: t.m.div_ceil(if t.m <= 8 { 8 } else { 16 }),
+        threads: THREADS,
     };
-    let mut args = if t.turned {
-        vec![step.read(0), step.read(1), step.read(2), step.read(3)]
+    let suh = if t.turned { step.read(2) } else { step.read(0) };
+    let svh = if t.turned && t.ks == 1 {
+        step.read(3)
     } else {
-        vec![step.read(0), step.read(1), step.read(0), step.read(0)]
+        step.read(0)
     };
-    args.push(step.out());
-    args.extend([
+    let args = vec![
+        step.read(0),
+        step.read(1),
+        suh,
+        svh,
+        step.out(),
         Arg::count(t.m),
         Arg::count(t.n),
         Arg::count(t.k),
+        Arg::count(t.ks),
         Arg::value(&t.bits),
         Arg::value(&t.book),
         Arg::count(usize::from(t.turned)),
-    ]);
+    ];
+    vec![Launch { args, shape }]
+}
+
+/// Deterministic split-K reduction and optional output rotation.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "trellis_reduce",
+    sizes = [self.m, self.n, self.ks],
+    work = self.m * self.n * self.ks,
+    accepts = reduce_accepts,
+    emits = f32_only,
+    needs = dtr_needs(0),
+    order = Order::PerConfig,
+    source = cuda_source_entry("dtr_reduce"),
+    launches = reduce_launches,
+    load = reduce_load,
+    unproven,
+)]
+struct TrellisReduce {
+    m: usize,
+    n: usize,
+    ks: usize,
+    turned: bool,
+}
+
+fn reduce_accepts(_: &TrellisReduce, _: usize, form: &dyn Stored) -> bool {
+    form.name() == "f32"
+}
+
+fn reduce_load(r: &TrellisReduce, _: usize) -> Option<Load> {
+    let mut reads = vec![(4 * r.ks * r.m * r.n) as f64];
+    if r.turned {
+        reads.push((4 * r.n) as f64);
+    }
+    Some(Load {
+        threads: (r.n / BLOCK) * THREADS,
+        group: THREADS,
+        trips: r.ks as f64,
+        reads,
+        written: (4 * r.m * r.n) as f64,
+        flight: 512.0,
+        ..Load::default()
+    })
+}
+
+fn reduce_launches(r: &TrellisReduce, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: r.n / BLOCK,
+        down: 1,
+        threads: THREADS,
+    };
+    let svh = if r.turned { step.read(1) } else { step.read(0) };
+    let args = vec![
+        step.read(0),
+        svh,
+        step.out(),
+        Arg::count(r.m),
+        Arg::count(r.n),
+        Arg::count(r.ks),
+        Arg::count(usize::from(r.turned)),
+    ];
     vec![Launch { args, shape }]
 }
 
@@ -166,68 +235,31 @@ fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
     (node.term == term && !tree.root(t)).then_some(&node.args[..])
 }
 
-/// Rotated `Mul(Hadamard(Matmul(Hadamard(Mul(x, suh)), w)), svh)`.
-fn propose_turned(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let turn = || {
-        Term::Stage(Stage::Hadamard {
-            block: BLOCK as u32,
-        })
-    };
-    let mul = || Term::Stage(Stage::Mul);
-    let node = tree.node(at);
-    if node.term != mul() || node.form.name() != "f32" {
-        return None;
+fn trellis_drafts(t: TrellisMma, x: T, w: T, suh: Option<T>, svh: Option<T>) -> Vec<Draft> {
+    let (m, n, ks, turned) = (t.m, t.n, t.ks, t.turned);
+    if ks == 1 {
+        let mut reads = vec![x, w];
+        if let (Some(u), Some(v)) = (suh, svh) {
+            reads.extend([u, v]);
+        }
+        return vec![Draft::new(t, reads, m * n)];
     }
-    let (back, svh) = (node.args[0], *node.args.get(1)?);
-    let &[product] = step_args(tree, back, turn())? else {
-        return None;
-    };
-    let &[turned, w] = step_args(tree, product, Term::Op(Op::Matmul))? else {
-        return None;
-    };
-    let &[scaled] = step_args(tree, turned, turn())? else {
-        return None;
-    };
-    let &[x, suh] = step_args(tree, scaled, mul())? else {
-        return None;
-    };
-    let [n, k] = tree.node(w).shape[..] else {
-        return None;
-    };
-    let form = tree.node(w).form;
-    let (bits, book) = parse_trellis(form.name())?;
-    let m = tree.elements(x) / k;
-    let ok = tree.leaf(w)
-        && n.is_multiple_of(BLOCK)
-        && k.is_multiple_of(BLOCK)
-        && m > 0
-        && tree.elements(suh) == k
-        && tree.elements(svh) == n
-        && tree.node(x).form.name() == "f32"
-        && tree.node(suh).form.name() == "f32"
-        && tree.node(svh).form.name() == "f32";
-    if !ok {
-        return None;
+    let mut s_reads = vec![Read::Node(x), Read::Node(w)];
+    if let Some(u) = suh {
+        s_reads.push(Read::Node(u));
     }
-    let kernel = TrellisMma {
-        m,
-        n,
-        k,
-        bits,
-        book,
-        turned: true,
-        form,
-    };
-    Some(vec![Draft::new(kernel, [x, w, suh, svh], m * n)])
+    let mut r_reads = vec![Read::Draft(0)];
+    if let Some(v) = svh {
+        r_reads.push(Read::Node(v));
+    }
+    let red = TrellisReduce { m, n, ks, turned };
+    vec![
+        Draft::new(t, s_reads, ks * m * n),
+        Draft::new(red, r_reads, m * n),
+    ]
 }
 
-/// Plain trellis `Matmul(x, w)`.
-fn propose_plain(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let node = tree.node(at);
-    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
-        return None;
-    }
-    let (x, w) = (node.args[0], node.args[1]);
+fn trellis_kernel(tree: &Tree, x: T, w: T, turned: bool) -> Option<TrellisMma> {
     let [n, k] = tree.node(w).shape[..] else {
         return None;
     };
@@ -239,23 +271,59 @@ fn propose_plain(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         && k.is_multiple_of(BLOCK)
         && m > 0
         && tree.node(x).form.name() == "f32";
-    if !ok {
-        return None;
-    }
-    let kernel = TrellisMma {
+    ok.then(|| TrellisMma {
         m,
         n,
         k,
+        ks: dtr_ks(m, n, k),
         bits,
         book,
-        turned: false,
+        turned,
         form,
-    };
-    Some(vec![Draft::new(kernel, [x, w], m * n)])
+    })
 }
 
+/// Rotated or plain dense trellis matmul.
 fn propose_trellis(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    propose_turned(tree, at).or_else(|| propose_plain(tree, at))
+    let turn = Term::Stage(Stage::Hadamard {
+        block: BLOCK as u32,
+    });
+    let mul = Term::Stage(Stage::Mul);
+    let node = tree.node(at);
+    if node.form.name() != "f32" {
+        return None;
+    }
+    if node.term == mul {
+        let (back, svh) = (node.args[0], *node.args.get(1)?);
+        let &[product] = step_args(tree, back, turn.clone())? else {
+            return None;
+        };
+        let &[turned, w] = step_args(tree, product, Term::Op(Op::Matmul))? else {
+            return None;
+        };
+        let &[scaled] = step_args(tree, turned, turn)? else {
+            return None;
+        };
+        let &[x, suh] = step_args(tree, scaled, mul)? else {
+            return None;
+        };
+        let kernel = trellis_kernel(tree, x, w, true)?;
+        let ok = tree.elements(suh) == kernel.k
+            && tree.elements(svh) == kernel.n
+            && tree.node(suh).form.name() == "f32"
+            && tree.node(svh).form.name() == "f32";
+        return ok.then(|| trellis_drafts(kernel, x, w, Some(suh), Some(svh)));
+    }
+    if node.term == Term::Op(Op::Matmul) {
+        let (x, w) = (node.args[0], node.args[1]);
+        let kernel = trellis_kernel(tree, x, w, false)?;
+        return Some(trellis_drafts(kernel, x, w, None, None));
+    }
+    None
+}
+
+fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
+    form.name() == "f32"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

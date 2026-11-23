@@ -48,59 +48,6 @@ static __device__ inline Mat matrix(bytes p) {
   return w;
 }
 
-// Two 16-bit states to E4M3-rounded f16x2.
-template <u32 BOOK>
-static __device__ inline u32 decode_pair(u32 a, u32 b) {
-  if constexpr (BOOK == trellis::BOOK_MUL1) {
-    u32 s0, s1, v;
-    asm("dp4a.u32.u32 %0, %1, %2, %3;"
-        : "=r"(s0) : "r"(a * trellis::MUL1), "r"(0x01010101u), "r"(0x6400u));
-    asm("dp4a.u32.u32 %0, %1, %2, %3;"
-        : "=r"(s1) : "r"(b * trellis::MUL1), "r"(0x01010101u), "r"(0x6400u));
-    u32 h = trellis::prmt(s0, s1, 0x5410u);
-    asm("fma.rn.f16x2 %0, %1, %2, %3;"
-        : "=r"(v) : "r"(h), "r"(0x1EEE1EEEu), "r"(0xC931C931u));
-    return trellis::narrow_f16x2_e4m3(v);
-  } else {
-    u32 x = a * trellis::MCG, y = b * trellis::MCG, sum;
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(x) : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(y) : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-    asm("add.rn.f16x2 %0, %1, %2;"
-        : "=r"(sum)
-        : "r"(trellis::prmt(x, y, 0x5410u)), "r"(trellis::prmt(x, y, 0x7632u)));
-    return trellis::narrow_f16x2_e4m3(sum);
-  }
-}
-
-// Decodes one smem 16x16 tile into an MMA A fragment.
-template <u32 K, u32 BOOK>
-static __device__ inline void decode_tile(
-    const u32* words, const trellis::lane_map& lm, u32 frag[4]) {
-  u32 w0 = words[lm.q0], w1 = words[lm.q1], w2 = words[lm.q2];
-  u32 hi = trellis::shf_l(w1, w0, lm.shift);
-  u32 lo = trellis::shf_l(w2, w1, lm.shift);
-  u32 st[8];
-#pragma unroll
-  for (u32 s = 0u; s < 8u; s++) st[s] = trellis::shf_l(lo, hi, K * s) >> 16u;
-  frag[0] = decode_pair<BOOK>(st[0], st[1]);
-  frag[1] = decode_pair<BOOK>(st[4], st[5]);
-  frag[2] = decode_pair<BOOK>(st[2], st[3]);
-  frag[3] = decode_pair<BOOK>(st[6], st[7]);
-}
-
-// Stores one rotated 128-vector into MMA B fragment table.
-static __device__ inline void store_frag(u32* tab, u32 row, u32 lane, const float v[4]) {
-  u32 ks = lane >> 2u;
-  u32 q = lane & 3u;
-  u32 reg = q >> 1u;
-  u32 c = (q & 1u) << 1u;
-  u32* p = tab + ((ks * 32u + row * 4u + c) * 2u + reg);
-  p[0] = trellis::f32x2_to_f16x2(v[0], v[1]);
-  p[2] = trellis::f32x2_to_f16x2(v[2], v[3]);
-}
-
 // One warp's picks and gates. Ties take lower expert.
 static __device__ void route(
     const float* score, const float* bias, u32 experts, u32 picks, u32* ids, float* gates) {
@@ -142,59 +89,92 @@ static __device__ inline float4 weights4(const void* router, u64 at, u32 bf16) {
       __uint_as_float(h.y << 16u), __uint_as_float(h.y & 0xFFFF0000u));
 }
 
-// Scores via sigmoid(x router). One CTA per expert.
-extern "C" __global__ __launch_bounds__(256) void glm53_route(const float* x, const void* router,
+// Scores via sigmoid(x router). Two experts per CTA.
+extern "C" __global__ __launch_bounds__(256, 4) void glm53_route(const float* x, const void* router,
     float* scores, u32 rows, u32 hidden, u32 experts, u32 bf16) {
-  __shared__ float wsum[8][8];
+  __shared__ float wsum[2][8][8];
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
-  u32 e = blockIdx.x;
-  if (e >= experts) return;
+  u32 e0 = blockIdx.x * 2u;
+  if (e0 >= experts) return;
+  bool has1 = e0 + 1u < experts;
   bool fast = bf16 && (hidden & 255u) == 0u && (((u64)router) & 15ull) == 0ull;
-  const u8* wr = (const u8*)router + (u64)e * hidden * 2ull;
+  const u8* wr0 = (const u8*)router + (u64)e0 * hidden * 2ull;
+  const u8* wr1 = wr0 + (u64)hidden * 2ull;
   for (u32 r0 = 0u; r0 < rows; r0 += 8u) {
     u32 nr = min(rows - r0, 8u);
-    float s[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float s0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float s1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     if (fast) {
-      for (u32 i0 = warp * 256u; i0 < hidden; i0 += 2048u) {
-        u32 col = i0 + (lane << 3u);
-        u32 h[4];
-        trellis::ld_nc_v4(wr + (u64)col * 2ull, h);
-        float w0 = __uint_as_float(h[0] << 16u), w1 = __uint_as_float(h[0] & 0xFFFF0000u);
-        float w2 = __uint_as_float(h[1] << 16u), w3 = __uint_as_float(h[1] & 0xFFFF0000u);
-        float w4 = __uint_as_float(h[2] << 16u), w5 = __uint_as_float(h[2] & 0xFFFF0000u);
-        float w6 = __uint_as_float(h[3] << 16u), w7 = __uint_as_float(h[3] & 0xFFFF0000u);
+      u32 i0 = warp * 256u;
+      if (i0 < hidden) {
+        u32 na[4], nb[4];
+        u64 off0 = (u64)(i0 + (lane << 3u)) * 2ull;
+        trellis::ld_nc_v4(wr0 + off0, na);
+        if (has1) trellis::ld_nc_v4(wr1 + off0, nb);
+        for (; i0 < hidden; i0 += 2048u) {
+          u32 ha[4] = {na[0], na[1], na[2], na[3]};
+          u32 hb[4] = {nb[0], nb[1], nb[2], nb[3]};
+          if (i0 + 2048u < hidden) {
+            u64 noff = (u64)(i0 + 2048u + (lane << 3u)) * 2ull;
+            trellis::ld_nc_v4(wr0 + noff, na);
+            if (has1) trellis::ld_nc_v4(wr1 + noff, nb);
+          }
+          float a0 = __uint_as_float(ha[0] << 16u), a1 = __uint_as_float(ha[0] & 0xFFFF0000u);
+          float a2 = __uint_as_float(ha[1] << 16u), a3 = __uint_as_float(ha[1] & 0xFFFF0000u);
+          float a4 = __uint_as_float(ha[2] << 16u), a5 = __uint_as_float(ha[2] & 0xFFFF0000u);
+          float a6 = __uint_as_float(ha[3] << 16u), a7 = __uint_as_float(ha[3] & 0xFFFF0000u);
+          float b0 = __uint_as_float(hb[0] << 16u), b1 = __uint_as_float(hb[0] & 0xFFFF0000u);
+          float b2 = __uint_as_float(hb[1] << 16u), b3 = __uint_as_float(hb[1] & 0xFFFF0000u);
+          float b4 = __uint_as_float(hb[2] << 16u), b5 = __uint_as_float(hb[2] & 0xFFFF0000u);
+          float b6 = __uint_as_float(hb[3] << 16u), b7 = __uint_as_float(hb[3] & 0xFFFF0000u);
+          u32 col = i0 + (lane << 3u);
 #pragma unroll
-        for (u32 r = 0u; r < 8u; r++) {
-          if (r >= nr) break;
-          const float* xp = x + (u64)(r0 + r) * hidden + col;
-          float4 x0 = *(const float4*)xp;
-          float4 x1 = *(const float4*)(xp + 4u);
-          s[r] = fmaf(w0, x0.x, fmaf(w1, x0.y, fmaf(w2, x0.z, fmaf(w3, x0.w, s[r]))));
-          s[r] = fmaf(w4, x1.x, fmaf(w5, x1.y, fmaf(w6, x1.z, fmaf(w7, x1.w, s[r]))));
+          for (u32 r = 0u; r < 8u; r++) {
+            if (r >= nr) break;
+            const float* xp = x + (u64)(r0 + r) * hidden + col;
+            float4 x0 = *(const float4*)xp;
+            float4 x1 = *(const float4*)(xp + 4u);
+            s0[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, s0[r]))));
+            s0[r] = fmaf(a4, x1.x, fmaf(a5, x1.y, fmaf(a6, x1.z, fmaf(a7, x1.w, s0[r]))));
+            if (has1) {
+              s1[r] = fmaf(b0, x0.x, fmaf(b1, x0.y, fmaf(b2, x0.z, fmaf(b3, x0.w, s1[r]))));
+              s1[r] = fmaf(b4, x1.x, fmaf(b5, x1.y, fmaf(b6, x1.z, fmaf(b7, x1.w, s1[r]))));
+            }
+          }
         }
       }
     } else {
       for (u32 i = tid * 4u; i < hidden; i += 1024u) {
-        float4 a = weights4(router, (u64)e * hidden + i, bf16);
+        float4 a0 = weights4(router, (u64)e0 * hidden + i, bf16);
+        float4 a1 = has1 ? weights4(router, (u64)(e0 + 1u) * hidden + i, bf16)
+                         : make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
         for (u32 r = 0u; r < 8u; r++) {
           if (r >= nr) break;
           float4 b = *(const float4*)(x + (u64)(r0 + r) * hidden + i);
-          s[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+          s0[r] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+          if (has1) s1[r] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
         }
       }
     }
 #pragma unroll
     for (u32 r = 0u; r < 8u; r++) {
       if (r >= nr) break;
-      for (u32 off = 16u; off > 0u; off >>= 1u) s[r] += __shfl_xor_sync(0xFFFFFFFFu, s[r], off);
-      if (lane == 0u) wsum[r][warp] = s[r];
+      for (u32 off = 16u; off > 0u; off >>= 1u) {
+        s0[r] += __shfl_xor_sync(0xFFFFFFFFu, s0[r], off);
+        if (has1) s1[r] += __shfl_xor_sync(0xFFFFFFFFu, s1[r], off);
+      }
+      if (lane == 0u) {
+        wsum[0][r][warp] = s0[r];
+        if (has1) wsum[1][r][warp] = s1[r];
+      }
     }
     prim::block_sync();
-    if (warp == 0u && lane < nr) {
-      float tot = wsum[lane][0] + wsum[lane][1] + wsum[lane][2] + wsum[lane][3] +
-                  wsum[lane][4] + wsum[lane][5] + wsum[lane][6] + wsum[lane][7];
-      scores[(u64)(r0 + lane) * experts + e] = 1.0f / (1.0f + __expf(-tot));
+    if (warp < 2u && (warp == 0u || has1) && lane < nr) {
+      float tot = wsum[warp][lane][0] + wsum[warp][lane][1] + wsum[warp][lane][2] +
+                  wsum[warp][lane][3] + wsum[warp][lane][4] + wsum[warp][lane][5] +
+                  wsum[warp][lane][6] + wsum[warp][lane][7];
+      scores[(u64)(r0 + lane) * experts + e0 + warp] = 1.0f / (1.0f + __expf(-tot));
     }
     if (r0 + 8u < rows) prim::block_sync();
   }
@@ -282,118 +262,67 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
   if (tid == 0u) plan->n_slots = total;
 }
 
-union alignas(16) Fc1Smem {
-  struct {
-    u32 btab[8][512];
-    u32 wtiles[8][256];
-  } k;
-  float red[8][4][128];
+struct alignas(16) Fc1Smem {
+  u32 btab[2048];
+  u32 wtiles[2048];
 };
 
 struct alignas(16) Fc2Smem {
   u32 btab[512];
-  u32 wtiles[8][256];
+  u32 wtiles[2048];
 };
 
-// Runs 8 k-steps of one 128-wide block with 1-ahead prefetch.
-template <u32 K, u32 BOOK>
-static __device__ __forceinline__ void step_block(
-    bytes bptr, bytes next_blk, u32 lane, bool wide, u32 reg[8], u32* wtiles,
-    const u32* ha, const trellis::lane_map& pos, float acc[8][4]) {
-  for (u32 ks = 0u; ks < 8u; ks++) {
-    __syncwarp();
-    trellis::tile_store<K>(reg, lane, wide, wtiles);
-    __syncwarp();
-    if (ks + 1u < 8u) {
-      trellis::tile_load<K>(bptr + (u64)(ks + 1u) * (256u * K), lane, wide, reg);
-    } else if (next_blk != 0) {
-      trellis::tile_load<K>(next_blk, lane, wide, reg);
-    }
-    u32 fb[2] = {ha[ks * 64u], ha[ks * 64u + 1u]};
-#pragma unroll
-    for (u32 mt = 0u; mt < 8u; mt++) {
-      u32 fa[4];
-      decode_tile<K, BOOK>(wtiles + mt * 8u * K, pos, fa);
-      trellis::mma_m16n8k16(acc[mt], fa, fb);
-    }
-  }
-}
-
-// Split-K fc1 body with coalesced 128-bit tile loads.
+// Warp-per-tile split-K fc1 in 16 KiB shared memory.
 template <u32 K, u32 BOOK>
 static __device__ __forceinline__ void fc1_body(
     const float* x, const float* su, const float* signs, bytes wbytes, float* gpart,
     Fc1Smem& sm, u32 m, u32 c, u32 h, u32 mat, u32 slot, u32 chunks, u32 ks1, u32 max_col,
     u32 hidden, u32 n, u32 toks_pack) {
-  u32 warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+  constexpr u32 TB = 32u * K;
+  u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
   Mat W = matrix(wbytes);
   u32 nblk = (hidden >> 7u) / ks1;
   u32 blk0 = h * nblk;
-  u32 blk1 = blk0 + nblk;
-  bool wide = (reinterpret_cast<u64>(W.base + trellis::HEAD) & 15u) == 0u;
-  trellis::lane_map pos = trellis::map_lane<K, BOOK>(lane);
-  u32* wbtab = sm.k.btab[warp];
-  u32* wtiles = sm.k.wtiles[warp];
-  const u32* ha = wbtab + (lane << 1u);
-  float acc[8][4];
-#pragma unroll
-  for (u32 mt = 0u; mt < 8u; mt++) {
-    acc[mt][0] = 0.f; acc[mt][1] = 0.f; acc[mt][2] = 0.f; acc[mt][3] = 0.f;
-  }
-  if (blk0 + warp < blk1) {
-    u32 reg[8];
-    bytes wptr = trellis::tile_ptr<K>(W.base, W.inp, W.out, m, (blk0 + warp) << 3u, c, W.input_side);
-    trellis::tile_load<K>(wptr, lane, wide, reg);
-    for (u32 ib = blk0 + warp; ib < blk1; ib += 8u) {
-      u32 at = (ib << 7u) + (lane << 2u);
+  bool aligned = (reinterpret_cast<u64>(W.base + trellis::HEAD) & 15ull) == 0ull;
+  u64 sG = (W.input_side ? u64(W.out >> 1u) : 64ull) * u64(TB);
+  bytes gb = trellis::tile_ptr<K>(W.base, W.inp, W.out, m, blk0 << 3u, c, W.input_side);
+  u32 nw[8];
+  trellis::blk_load<K>(gb, tid, aligned, nw);
+  trellis::word_map wm = trellis::map_word<K>(lane);
+  float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
+  for (u32 c0 = 0u; c0 < nblk; c0 += 4u) {
+    u32 nb = min(4u, nblk - c0);
+    if (c0 > 0u) prim::block_sync();
+    u32 wpb = (nb <= 2u) ? (8u / nb) : 2u;
+    u32 b = j / wpb;
+    u32 r_base = j - b * wpb;
+    if (b < nb && r_base < n) {
+      u32 at = ((blk0 + c0 + b) << 7u) + (lane << 2u);
       float4 sv = *(const float4*)(su + at);
       float4 sg = signs ? *(const float4*)(signs + at) : make_float4(1.f, 1.f, 1.f, 1.f);
       float sc[4] = {sv.x * sg.x, sv.y * sg.y, sv.z * sg.z, sv.w * sg.w};
-      for (u32 r = 0u; r < n; r++) {
+      for (u32 r = r_base; r < n; r += wpb) {
         u32 tok = (toks_pack >> (r << 2u)) & 15u;
         float4 xv = *(const float4*)(x + (u64)tok * hidden + at);
         float v[4] = {xv.x * sc[0], xv.y * sc[1], xv.z * sc[2], xv.w * sc[3]};
         trellis::wht128(v, trellis::INV_SQRT128);
-        store_frag(wbtab, r, lane, v);
+        trellis::store_bfrag(sm.btab + b * 512u, r, lane, v);
       }
-      bytes bptr = trellis::tile_ptr<K>(W.base, W.inp, W.out, m, ib << 3u, c, W.input_side);
-      bytes next = ib + 8u < blk1
-          ? trellis::tile_ptr<K>(W.base, W.inp, W.out, m, (ib + 8u) << 3u, c, W.input_side)
-          : 0;
-      step_block<K, BOOK>(bptr, next, lane, wide, reg, wtiles, ha, pos, acc);
     }
+    trellis::blk_stream<K, BOOK, 1u>(
+        gb, sG, c0, nb, nblk, tid, j, lane, aligned, wm, nw, sm.wtiles, sm.btab + (lane << 1u), 0u,
+        acc);
   }
   float* gp = gpart + ((((u64)slot * chunks + c) * 2u + mat) * ks1 + h) * max_col * 128u;
-  u32 nl = lane >> 2u, col2 = (lane & 3u) << 1u;
-  for (u32 r0 = 0u; r0 < n; r0 += 4u) {
-    u32 nr = min(n - r0, 4u);
-    prim::block_sync();
-    if (col2 >= r0 && col2 < r0 + nr) {
-      float* dst = sm.red[warp][col2 - r0];
-#pragma unroll
-      for (u32 mt = 0u; mt < 8u; mt++) {
-        dst[mt * 16u + nl] = acc[mt][0];
-        dst[mt * 16u + nl + 8u] = acc[mt][2];
-      }
-    }
-    if (col2 + 1u >= r0 && col2 + 1u < r0 + nr) {
-      float* dst = sm.red[warp][col2 + 1u - r0];
-#pragma unroll
-      for (u32 mt = 0u; mt < 8u; mt++) {
-        dst[mt * 16u + nl] = acc[mt][1];
-        dst[mt * 16u + nl + 8u] = acc[mt][3];
-      }
-    }
-    prim::block_sync();
-    if (warp < nr) {
-      float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-#pragma unroll
-      for (u32 w = 0u; w < 8u; w++) {
-        float4 v = *(const float4*)(&sm.red[w][warp][lane << 2u]);
-        s0 += v.x; s1 += v.y; s2 += v.z; s3 += v.w;
-      }
-      *(float4*)(gp + (u64)(r0 + warp) * 128u + (lane << 2u)) = make_float4(s0, s1, s2, s3);
-    }
+  u32 col = (j << 4u) + (lane >> 2u);
+  u32 r2 = (lane & 3u) << 1u;
+  if (r2 < n) {
+    gp[(u64)r2 * 128u + col] = acc[0][0];
+    gp[(u64)r2 * 128u + col + 8u] = acc[0][2];
+  }
+  if (r2 + 1u < n) {
+    gp[(u64)(r2 + 1u) * 128u + col] = acc[0][1];
+    gp[(u64)(r2 + 1u) * 128u + col + 8u] = acc[0][3];
   }
 }
 
@@ -406,7 +335,7 @@ static __device__ __noinline__ void fc1_cold(
 }
 
 // Split-K gate and up projections for routed and shared slots.
-extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc1(
+extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
     const float* x, const float* plan_in, const float* signs_in,
     const float* gate_su, bytes gate, const float* up_su, bytes up,
     bytes shared_gate, const float* shared_gate_su,
@@ -419,10 +348,10 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc1(
   u32 slot = blockIdx.y;
   bool is_shared = slot < n_sh;
   u32 chunks = ffn >> 7u;
-  u32 h = blockIdx.x / (2u * chunks);
-  u32 mc = blockIdx.x % (2u * chunks);
-  u32 mat = mc / chunks;
-  u32 c = mc % chunks;
+  u32 c = blockIdx.x % chunks;
+  u32 hm = blockIdx.x / chunks;
+  u32 h = hm % ks1;
+  u32 mat = hm / ks1;
   if (is_shared) {
     if (c >= (shared_ffn >> 7u)) return;
   } else if (slot - n_sh >= plan->n_slots) {
@@ -470,35 +399,31 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc1(
   }
 }
 
-// Split-N fc2 body with coalesced 128-bit tile loads.
+// Warp-per-tile split-N fc2 with double-buffered 128-bit block prefetch.
 template <u32 K, u32 BOOK>
 static __device__ __forceinline__ void fc2_body(
     const float* gpart, const float* gate_sv, const float* up_sv, const float* down_su,
     bytes dbytes, u16* z, Fc2Smem& sm, u32 m, u32 c, u32 ns, u32 ns2, u32 slot, u32 chunks, u32 ks1,
     u32 max_col, u32 hidden, u32 n, u64 z_off0, u64 z_off1) {
-  u32 warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+  constexpr u32 TB = 32u * K;
+  u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
   Mat D = matrix(dbytes);
   u32 obs = hidden >> 7u;
   u32 ob_per = obs / ns2;
   u32 ob0 = ns * ob_per;
-  u32 ob1 = ob0 + ob_per;
-  bool wide = (reinterpret_cast<u64>(D.base + trellis::HEAD) & 15u) == 0u;
-  trellis::lane_map pos = trellis::map_lane<K, BOOK>(lane);
-  u32* wtiles = sm.wtiles[warp];
-  u32 reg[8];
-  if (ob0 + warp < ob1) {
-    trellis::tile_load<K>(
-        trellis::tile_ptr<K>(D.base, D.inp, D.out, m, c << 3u, ob0 + warp, D.input_side),
-        lane, wide, reg);
-  }
-  if (warp < n) {
+  bool aligned = (reinterpret_cast<u64>(D.base + trellis::HEAD) & 15ull) == 0ull;
+  u64 sO = (D.input_side ? 64ull : u64(D.inp >> 1u)) * u64(TB);
+  bytes gb = trellis::tile_ptr<K>(D.base, D.inp, D.out, m, c << 3u, ob0, D.input_side);
+  u32 nw[8];
+  trellis::blk_load<K>(gb, tid, aligned, nw);
+  if (j < n) {
     float g[4] = {0.f, 0.f, 0.f, 0.f}, u[4] = {0.f, 0.f, 0.f, 0.f};
     u64 base_gp = ((u64)slot * chunks + c) * 2u * ks1 * max_col * 128u;
-    const float* gg = gpart + base_gp + (u64)warp * 128u + (lane << 2u);
-    const float* gu = gpart + base_gp + (u64)ks1 * max_col * 128u + (u64)warp * 128u + (lane << 2u);
+    const float* gg = gpart + base_gp + (u64)j * 128u + (lane << 2u);
+    const float* gu = gpart + base_gp + (u64)ks1 * max_col * 128u + (u64)j * 128u + (lane << 2u);
     for (u32 h = 0u; h < ks1; h++) {
-      float4 gv = *(const float4*)(gg + (u64)h * max_col * 128u);
-      float4 uv = *(const float4*)(gu + (u64)h * max_col * 128u);
+      float4 gv = trellis::ld_cg_f4(gg + (u64)h * max_col * 128u);
+      float4 uv = trellis::ld_cg_f4(gu + (u64)h * max_col * 128u);
       g[0] += gv.x; g[1] += gv.y; g[2] += gv.z; g[3] += gv.w;
       u[0] += uv.x; u[1] += uv.y; u[2] += uv.z; u[3] += uv.w;
     }
@@ -515,39 +440,31 @@ static __device__ __forceinline__ void fc2_body(
 #pragma unroll
     for (u32 i = 0u; i < 4u; i++) a[i] = (gv[i] / (1.0f + __expf(-gv[i]))) * uv[i] * ds[i];
     trellis::wht128(a, trellis::INV_SQRT128);
-    store_frag(sm.btab, warp, lane, a);
+    trellis::store_bfrag(sm.btab, j, lane, a);
   }
-  prim::block_sync();
-  if (ob0 + warp >= ob1) return;
+  trellis::word_map wm = trellis::map_word<K>(lane);
   const u32* ha = sm.btab + (lane << 1u);
   u32 nl = lane >> 2u, col2 = (lane & 3u) << 1u;
-  for (u32 ob = ob0 + warp; ob < ob1; ob += 8u) {
-    float acc[8][4];
-#pragma unroll
-    for (u32 mt = 0u; mt < 8u; mt++) {
-      acc[mt][0] = 0.f; acc[mt][1] = 0.f; acc[mt][2] = 0.f; acc[mt][3] = 0.f;
+  for (u32 idx = 0u; idx < ob_per; idx++) {
+    if (idx > 0u) prim::block_sync();
+    trellis::blk_store<K>(nw, tid, sm.wtiles);
+    prim::block_sync();
+    if (idx + 1u < ob_per) {
+      gb += sO;
+      trellis::blk_load<K>(gb, tid, aligned, nw);
     }
-    bytes dptr = trellis::tile_ptr<K>(D.base, D.inp, D.out, m, c << 3u, ob, D.input_side);
-    bytes next = ob + 8u < ob1
-        ? trellis::tile_ptr<K>(D.base, D.inp, D.out, m, c << 3u, ob + 8u, D.input_side)
-        : 0;
-    step_block<K, BOOK>(dptr, next, lane, wide, reg, wtiles, ha, pos, acc);
-    u32 out_base = (ob << 7u) + nl;
+    float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
+    trellis::blk_mma<K, BOOK, 1u>(sm.wtiles, ha, 0u, j, lane, wm, acc);
+    u32 out_base = ((ob0 + idx) << 7u) + (j << 4u) + nl;
     if (col2 < n) {
       u16* dst = z + z_off0 + out_base;
-#pragma unroll
-      for (u32 mt = 0u; mt < 8u; mt++) {
-        dst[mt * 16u] = f32_to_f16(acc[mt][0]);
-        dst[mt * 16u + 8u] = f32_to_f16(acc[mt][2]);
-      }
+      dst[0] = f32_to_f16(acc[0][0]);
+      dst[8] = f32_to_f16(acc[0][2]);
     }
     if (col2 + 1u < n) {
       u16* dst = z + z_off1 + out_base;
-#pragma unroll
-      for (u32 mt = 0u; mt < 8u; mt++) {
-        dst[mt * 16u] = f32_to_f16(acc[mt][1]);
-        dst[mt * 16u + 8u] = f32_to_f16(acc[mt][3]);
-      }
+      dst[0] = f32_to_f16(acc[0][1]);
+      dst[8] = f32_to_f16(acc[0][3]);
     }
   }
 }
@@ -561,7 +478,7 @@ static __device__ __noinline__ void fc2_cold(
 }
 
 // SwiGLU and down projection into fp16 `z[row][pick][chunk][hidden]`.
-extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2(
+extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
     const float* plan_in, const float* gpart,
     const float* gate_sv, const float* up_sv, const float* down_su, bytes down,
     const float* shared_gate_sv, const float* shared_up_sv,

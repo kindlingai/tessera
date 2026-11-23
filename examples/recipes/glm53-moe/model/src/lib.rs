@@ -43,15 +43,11 @@ fn picks(experts: usize) -> Option<u32> {
     }
 }
 
-/// Largest divisor of `blocks / 8` up to `want`.
+/// Largest divisor of `blocks` up to `want`.
 fn split_dim(blocks: usize, want: usize) -> usize {
-    if !blocks.is_multiple_of(8) {
-        return 1;
-    }
-    let groups = blocks / 8;
-    let mut d = want.min(groups);
+    let mut d = want.min(blocks);
     while d > 1 {
-        if groups.is_multiple_of(d) {
+        if blocks.is_multiple_of(d) {
             return d;
         }
         d -= 1;
@@ -186,8 +182,8 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let z = Place::Draft { draft: 3 };
     let chunks = ffn / 128;
     let ibs = hidden / 128;
-    let ks1 = split_dim(ibs, if rows == 1 { 6 } else { 3 });
-    let ns2 = split_dim(ibs, if rows == 1 { 6 } else { 2 });
+    let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
+    let ns2 = split_dim(ibs, if rows == 1 { 8 } else { 3 });
     let n_sh = rows.div_ceil(8);
     let max_routed = (count * n_sh).min(rows * picks);
     let total_slots = n_sh + max_routed;
@@ -198,7 +194,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         len: rows * experts,
         counts: fixed(&[rows, hidden, experts, bf16]),
         shape: Shape::Grid {
-            across: experts,
+            across: experts.div_ceil(2),
             down: 1,
             threads: 256,
         },
