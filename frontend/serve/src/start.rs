@@ -269,8 +269,21 @@ fn draft_thread(
     });
     let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
     while let Ok((request, mut sink)) = jobs.recv() {
-        spec.generate(request, &mut sink)
+        let t0 = Instant::now();
+        let stats = spec
+            .generate(request, &mut sink)
             .map_err(|e| e.to_string())?;
+        if settings.profile.is_some() && stats.steps > 0 {
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "dflash: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms total)",
+                stats.emitted,
+                stats.steps,
+                stats.mean_step(),
+                ms / stats.steps as f64,
+                ms,
+            );
+        }
     }
     Ok(())
 }

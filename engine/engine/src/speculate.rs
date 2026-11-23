@@ -247,7 +247,11 @@ impl Drafter {
         if slot as usize >= self.slots || start + self.block > self.context {
             return Err(Error::RowPlace);
         }
-        let filled = n_new.next_power_of_two().min(self.context);
+        let filled = if n_new <= self.block {
+            self.block
+        } else {
+            n_new.next_power_of_two().min(self.context)
+        };
         let mut ctx_taps = Vec::with_capacity(filled * self.tap_width);
         ctx_taps.extend_from_slice(taps);
         let last = &taps[(n_new - 1) * self.tap_width..];
