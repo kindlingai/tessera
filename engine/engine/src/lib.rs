@@ -127,6 +127,8 @@ pub enum Error {
     Taps,
     #[error("entry {entry} has an input the engine does not fill: {role:?}")]
     Port { entry: usize, role: Role },
+    #[error("the graph has no step entry without candidates")]
+    Full,
 }
 
 /// Row width of `entry`'s `role` output, if any.
@@ -280,7 +282,10 @@ impl Engine {
         tessera_run::configure(settings);
         tessera_wasm::configure(settings.dump_sites.clone());
         let (full, sparse) = steps(&graph)?;
-        let full = full.unwrap_or(0);
+        let Some(full) = full else {
+            tessera_graph::trim(&graph, 0)?;
+            return Err(Error::Full);
+        };
         let mut graph = tessera_graph::trim(&graph, full)?;
         if let Some(at) = sparse {
             graph = tessera_graph::trim(&graph, at)?;
