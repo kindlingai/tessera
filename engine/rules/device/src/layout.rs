@@ -10,6 +10,7 @@ pub const NONE: u32 = u32::MAX;
 pub(crate) const DOORBELL_SLOTS: usize = 64;
 pub(crate) const DOORBELL_ABORT: usize = 4032;
 pub(crate) const DOORBELL_SENT: usize = 4040;
+pub(crate) const DOORBELL_FAULT: usize = 4072;
 /// `dtype` codes matching `core.h`.
 pub(crate) const F32: u32 = 0;
 pub(crate) const BF16: u32 = 1;

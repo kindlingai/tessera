@@ -1,9 +1,9 @@
 //! One persistent grid per rank, with its proxy beside it.
 
 use crate::layout::{
-    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DTYPES, Fault, Form, Item, KV, Kept,
-    KvTables, Lane, Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, NONE, PAGE, Pool, PoolSet,
-    Ref, SIZES, STATUS, Table, VALUES,
+    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DOORBELL_FAULT, DTYPES, Fault, Form,
+    Item, KV, Kept, KvTables, Lane, Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, NONE, PAGE,
+    Pool, PoolSet, Ref, SIZES, STATUS, Table, VALUES,
 };
 use crate::proxy::page::Page;
 use crate::proxy::running::Running;
@@ -643,6 +643,8 @@ where
         }
         self.broken = true;
         self.alive()?;
+        let fault = (self.page as usize + DOORBELL_FAULT) as *const AtomicU64;
+        unsafe { &*fault }.store(0, Ordering::Release);
         self.seq += 1;
         let mut slot = LaunchSlot {
             launch: Record {
@@ -679,6 +681,13 @@ where
         Ok(())
     }
 
+    /// Non-blocking fault check from the pinned doorbell page.
+    pub fn poll(&mut self) -> Result<bool, Error> {
+        self.alive()?;
+        let fault = (self.page as usize + DOORBELL_FAULT) as *const AtomicU64;
+        Ok(unsafe { &*fault }.load(Ordering::Acquire) == 0)
+    }
+
     /// The proxy's error, if its thread stopped.
     pub fn alive(&mut self) -> Result<(), Error> {
         if !self.running.as_ref().is_none_or(Running::failed) {
@@ -706,14 +715,21 @@ where
     }
 }
 
-impl<D: Device, L> Drop for Resident<D, L> {
-    fn drop(&mut self) {
-        // A grid still running sees the abort word and ends.
+impl<D: Device, L> Resident<D, L> {
+    /// Signals abort on a running grid and waits for it.
+    pub fn abort(&mut self) {
         if let Some(apart) = self.apart.take() {
             let abort = (self.page as usize + DOORBELL_ABORT) as *const AtomicU64;
             unsafe { &*abort }.store(1, Ordering::Release);
             let _ = apart.wait();
         }
+    }
+}
+
+impl<D: Device, L> Drop for Resident<D, L> {
+    fn drop(&mut self) {
+        // A grid still running sees the abort word and ends.
+        self.abort();
         // The proxy reads the page and regions until it stops.
         if let Some(running) = self.running.take() {
             self.parked = running.stop().0;

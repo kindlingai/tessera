@@ -1,34 +1,100 @@
 //! Multi-plan graph retention and scratch buffer stability on device runners.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_engine_settings::{Backend, Settings};
 use tessera_gpukit::device::{Caches, Device};
 use tessera_gpukit::launch::{Bound, KernelArgs, Launch};
 use tessera_gpukit::{Error as GpuError, Limits, Platform};
 use tessera_graph::DimName::Context;
-use tessera_lower::kernels::Map;
+use tessera_lower::kernels::{AllGather, AllReduce, Map};
 use tessera_lower::{KernelRef, Launching, Plan, Slot, Step};
+use tessera_mem::Tensor;
 use tessera_run::testing::{device, host};
+use tessera_run::{Error as RunError, Rank, Run, Sum};
+
+#[derive(Clone, Copy)]
+struct HandOp {
+    job: u64,
+    from: u64,
+    to: u64,
+    len: usize,
+    gather: bool,
+}
 
 #[derive(Default)]
 struct State {
     next_ptr: u64,
-    live: HashMap<u64, usize>,
+    live: HashMap<u64, Vec<u8>>,
     allocs: usize,
     frees: usize,
     compiles: usize,
     captures: usize,
     replays: usize,
-    recording: Option<Vec<u64>>,
+    recording: Option<(Vec<u64>, Vec<HandOp>)>,
     last_replayed: Vec<u64>,
+    hand_job: u64,
+    grid_running: bool,
 }
 
 #[derive(Clone)]
 struct MockDevice(Arc<Mutex<State>>);
 
 struct MockGraph {
+    state: Arc<Mutex<State>>,
     ptrs: Vec<u64>,
+    hands: Vec<HandOp>,
+}
+
+impl Drop for MockGraph {
+    fn drop(&mut self) {
+        let s = self.state.lock().unwrap();
+        assert!(!s.grid_running, "dropped graph while persistent grid ran");
+    }
+}
+
+fn buf_slice(live: &HashMap<u64, Vec<u8>>, ptr: u64, len: usize) -> &[u8] {
+    let (&base, buf) = live
+        .iter()
+        .find(|(b, v)| ptr >= **b && ptr + len as u64 <= **b + v.len() as u64)
+        .unwrap_or_else(|| panic!("invalid device read {ptr:#x} ({len} bytes)"));
+    let off = (ptr - base) as usize;
+    &buf[off..off + len]
+}
+
+fn buf_slice_mut(live: &mut HashMap<u64, Vec<u8>>, ptr: u64, len: usize) -> &mut [u8] {
+    let (&base, buf) = live
+        .iter_mut()
+        .find(|(b, v)| ptr >= **b && ptr + len as u64 <= **b + v.len() as u64)
+        .unwrap_or_else(|| panic!("invalid device write {ptr:#x} ({len} bytes)"));
+    let off = (ptr - base) as usize;
+    &mut buf[off..off + len]
+}
+
+fn run_hand(live: &mut HashMap<u64, Vec<u8>>, op: HandOp) {
+    let seq_bytes = buf_slice(live, op.job, 8);
+    let seq = u64::from_le_bytes(seq_bytes.try_into().unwrap()) + 1;
+    buf_slice_mut(live, op.job, 8).copy_from_slice(&seq.to_le_bytes());
+    if op.len == 0 {
+        return;
+    }
+    let src = buf_slice(live, op.from, op.len * 4).to_vec();
+    if op.gather {
+        let mut out = Vec::with_capacity(src.len() * 2);
+        out.extend_from_slice(&src);
+        out.extend_from_slice(&src);
+        buf_slice_mut(live, op.to, out.len()).copy_from_slice(&out);
+    } else {
+        let mut out = Vec::with_capacity(src.len());
+        for &chunk in src.as_chunks::<4>().0 {
+            let v = f32::from_le_bytes(chunk) * 2.0;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        buf_slice_mut(live, op.to, out.len()).copy_from_slice(&out);
+    }
 }
 
 impl MockDevice {
@@ -40,6 +106,8 @@ impl MockDevice {
         s.captures = 0;
         s.replays = 0;
         s.last_replayed.clear();
+        s.hand_job = 0;
+        s.grid_running = false;
     }
 
     fn counts(&self) -> (usize, usize, usize, usize, usize) {
@@ -49,6 +117,11 @@ impl MockDevice {
 
     fn replayed(&self) -> Vec<u64> {
         self.0.lock().unwrap().last_replayed.clone()
+    }
+
+    fn read_u64(&self, ptr: u64) -> u64 {
+        let s = self.0.lock().unwrap();
+        u64::from_le_bytes(buf_slice(&s.live, ptr, 8).try_into().unwrap())
     }
 }
 
@@ -64,15 +137,34 @@ impl Launch for MockDevice {
         args: &mut KernelArgs,
     ) -> Result<(), GpuError> {
         let mut s = self.0.lock().unwrap();
-        let ptrs: Vec<u64> = args
-            .bound()
-            .filter_map(|b| match b {
-                Bound::Pointer(p) => Some(p),
-                Bound::Bytes(_) => None,
-            })
-            .collect();
-        if let Some(rec) = &mut s.recording {
-            rec.extend_from_slice(&ptrs);
+        let mut ptrs = Vec::new();
+        let mut vals = Vec::new();
+        for b in args.bound() {
+            match b {
+                Bound::Pointer(p) => ptrs.push(p),
+                Bound::Bytes(bs) if bs.len() == 4 => {
+                    vals.push(u32::from_le_bytes(bs.try_into().unwrap()));
+                }
+                Bound::Bytes(_) => {}
+            }
+        }
+        let hand =
+            (s.hand_job != 0 && ptrs.first() == Some(&s.hand_job) && ptrs.len() == 3).then(|| {
+                HandOp {
+                    job: ptrs[0],
+                    from: ptrs[1],
+                    to: ptrs[2],
+                    len: vals[0] as usize,
+                    gather: vals[1] != 0,
+                }
+            });
+        if let Some((rec_ptrs, rec_hands)) = &mut s.recording {
+            rec_ptrs.extend_from_slice(&ptrs);
+            if let Some(op) = hand {
+                rec_hands.push(op);
+            }
+        } else if let Some(op) = hand {
+            run_hand(&mut s.live, op);
         }
         Ok(())
     }
@@ -110,33 +202,44 @@ impl Device for MockDevice {
 
     fn alloc(&self, size: usize) -> Result<u64, GpuError> {
         let mut s = self.0.lock().unwrap();
+        assert!(!s.grid_running, "alloc while persistent grid ran");
         let ptr = s.next_ptr;
         s.next_ptr += (size.max(4096) as u64).next_multiple_of(4096) + 4096;
-        s.live.insert(ptr, size);
+        s.live.insert(ptr, vec![0u8; size]);
         s.allocs += 1;
         Ok(ptr)
     }
 
     fn free(&self, ptr: u64) {
         let mut s = self.0.lock().unwrap();
+        assert!(!s.grid_running, "free while persistent grid ran");
         assert!(s.live.remove(&ptr).is_some(), "double free {ptr:#x}");
         s.frees += 1;
     }
 
-    fn upload(&self, _: u64, _: &[u8]) -> Result<(), GpuError> {
+    fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), GpuError> {
+        let mut s = self.0.lock().unwrap();
+        buf_slice_mut(&mut s.live, ptr, bytes.len()).copy_from_slice(bytes);
         Ok(())
     }
 
-    fn download(&self, _: u64, _: &mut [u8]) -> Result<(), GpuError> {
+    fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), GpuError> {
+        let s = self.0.lock().unwrap();
+        bytes.copy_from_slice(buf_slice(&s.live, ptr, bytes.len()));
         Ok(())
     }
 
-    fn zero(&self, _: u64, _: usize) -> Result<(), GpuError> {
+    fn zero(&self, ptr: u64, size: usize) -> Result<(), GpuError> {
+        let mut s = self.0.lock().unwrap();
+        assert!(!s.grid_running, "zero while persistent grid ran");
+        buf_slice_mut(&mut s.live, ptr, size).fill(0);
         Ok(())
     }
 
     fn compile(&self, _: &str, _: &str) -> Result<(), GpuError> {
-        self.0.lock().unwrap().compiles += 1;
+        let mut s = self.0.lock().unwrap();
+        assert!(!s.grid_running, "compile while persistent grid ran");
+        s.compiles += 1;
         Ok(())
     }
 
@@ -148,16 +251,28 @@ impl Device for MockDevice {
         true
     }
 
+    fn capturing(&self) -> bool {
+        self.0.lock().unwrap().recording.is_some()
+    }
+
     fn capture<E: From<GpuError>>(
         &self,
         record: impl FnOnce() -> Result<(), E>,
     ) -> Result<MockGraph, E> {
-        self.0.lock().unwrap().recording = Some(Vec::new());
+        {
+            let mut s = self.0.lock().unwrap();
+            assert!(!s.grid_running, "capture while persistent grid ran");
+            s.recording = Some((Vec::new(), Vec::new()));
+        }
         let done = record();
-        let ptrs = self.0.lock().unwrap().recording.take().unwrap_or_default();
+        let (ptrs, hands) = self.0.lock().unwrap().recording.take().unwrap_or_default();
         done?;
         self.0.lock().unwrap().captures += 1;
-        Ok(MockGraph { ptrs })
+        Ok(MockGraph {
+            state: self.0.clone(),
+            ptrs,
+            hands,
+        })
     }
 
     fn replay(&self, graph: &MockGraph) -> Result<(), GpuError> {
@@ -166,9 +281,12 @@ impl Device for MockDevice {
             assert!(
                 s.live
                     .iter()
-                    .any(|(&base, &len)| ptr >= base && ptr < base + len as u64),
+                    .any(|(&base, buf)| ptr >= base && ptr < base + buf.len() as u64),
                 "replayed stale pointer {ptr:#x}"
             );
+        }
+        for &op in &graph.hands {
+            run_hand(&mut s.live, op);
         }
         s.replays += 1;
         s.last_replayed = graph.ptrs.clone();
@@ -204,6 +322,8 @@ fn scratch_plan(sizes: &[usize]) -> Plan {
     }
 }
 
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn open_mock(
     plan: Plan,
 ) -> (
@@ -211,8 +331,7 @@ fn open_mock(
     Box<dyn tessera_run::Run>,
     &'static MockDevice,
 ) {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ctx = tessera_gpukit::device::cached_context::<MockDevice>().unwrap();
     ctx.reset();
     let settings = Settings {
@@ -296,4 +415,425 @@ fn growth_clears_graphs() {
     runner.submit(0..1).unwrap();
     let (allocs, frees, _, captures, replays) = ctx.counts();
     assert_eq!((allocs, frees, captures, replays), (2, 1, 3, 5));
+}
+
+struct MockTransport(Arc<Mutex<usize>>);
+
+impl Transport for MockTransport {
+    fn rank(&self) -> u32 {
+        0
+    }
+
+    fn ranks(&self) -> u32 {
+        2
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        *self.0.lock().unwrap() += 1;
+        Ok(vec![mine.to_vec(), mine.to_vec()])
+    }
+}
+
+#[derive(Default)]
+struct SumLog {
+    starts: usize,
+    stops: usize,
+    checks: usize,
+    timed: bool,
+}
+
+struct MockSum {
+    ctx: &'static MockDevice,
+    job: u64,
+    capturable: bool,
+    allow_gather: bool,
+    running: bool,
+    timed: bool,
+    log: Arc<Mutex<SumLog>>,
+}
+
+impl MockSum {
+    fn new(
+        ctx: &'static MockDevice,
+        capturable: bool,
+        allow_gather: bool,
+    ) -> (Self, Arc<Mutex<SumLog>>, u64) {
+        let job = ctx.alloc(64).unwrap();
+        ctx.0.lock().unwrap().hand_job = job;
+        let log = Arc::new(Mutex::new(SumLog::default()));
+        let sum = Self {
+            ctx,
+            job,
+            capturable,
+            allow_gather,
+            running: false,
+            timed: false,
+            log: log.clone(),
+        };
+        (sum, log, job)
+    }
+
+    fn start(&mut self) {
+        if !self.running {
+            self.running = true;
+            self.ctx.0.lock().unwrap().grid_running = true;
+            self.log.lock().unwrap().starts += 1;
+        }
+    }
+
+    fn stop(&mut self) {
+        if std::mem::take(&mut self.running) {
+            let _ = self.hand(self.job, self.job, 0, false);
+            self.ctx.0.lock().unwrap().grid_running = false;
+            self.log.lock().unwrap().stops += 1;
+        }
+    }
+
+    fn hand(&self, from: u64, to: u64, len: usize, gather: bool) -> Result<(), RunError> {
+        let mut args = KernelArgs::new();
+        args.device_ptr(self.job)
+            .device_ptr(from)
+            .device_ptr(to)
+            .u32(len as u32)
+            .u32(u32::from(gather));
+        self.ctx.launch(&(), (1, 1, 1), (1, 1, 1), 0, &mut args)?;
+        Ok(())
+    }
+}
+
+impl Drop for MockSum {
+    fn drop(&mut self) {
+        self.stop();
+        self.ctx.free(self.job);
+    }
+}
+
+impl Sum for MockSum {
+    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), RunError> {
+        if len == 0 {
+            self.start();
+            return Ok(());
+        }
+        if !self.ctx.capturing() {
+            self.start();
+        }
+        self.hand(from, to, len, false)
+    }
+
+    fn gather(
+        &mut self,
+        from: u64,
+        to: u64,
+        part: usize,
+        _: usize,
+        _: usize,
+    ) -> Result<bool, RunError> {
+        if !self.allow_gather {
+            return Ok(false);
+        }
+        if !self.ctx.capturing() {
+            self.start();
+        }
+        self.hand(from, to, part, true)?;
+        Ok(true)
+    }
+
+    fn capturable(&self) -> bool {
+        self.capturable
+    }
+
+    fn pause(&mut self) -> Result<(), RunError> {
+        self.stop();
+        Ok(())
+    }
+
+    fn check(&mut self) -> Result<(), RunError> {
+        self.log.lock().unwrap().checks += 1;
+        if self.timed {
+            self.stop();
+        }
+        Ok(())
+    }
+
+    fn timing(&mut self, on: bool) {
+        if self.timed != on {
+            self.stop();
+        }
+        self.timed = on;
+        self.log.lock().unwrap().timed = on;
+    }
+}
+
+fn ranked_plan(scratch_bytes: usize) -> Plan {
+    let a = Slot::floats(0, 4);
+    let b = Slot::floats(1, 4);
+    let c = Slot::floats(2, 8);
+    let step = |kernel, rule, reads, write| Step {
+        kernel,
+        rule,
+        reads,
+        write,
+        covers: Vec::new(),
+        zone: 0,
+        table: None,
+    };
+    Plan {
+        id: Plan::fresh(),
+        rank: 0,
+        ranks: 2,
+        buffers: vec![scratch_bytes, scratch_bytes, scratch_bytes.max(32)],
+        zones: vec![0, 0, 0],
+        steps: vec![
+            copy_step(0, 4),
+            step(
+                KernelRef::new(AllReduce { len: 4 }),
+                "all_reduce",
+                vec![a],
+                b,
+            ),
+            copy_step(1, 4),
+            step(
+                KernelRef::new(AllReduce { len: 4 }),
+                "all_reduce",
+                vec![b],
+                a,
+            ),
+            step(
+                KernelRef::new(AllGather { len: 8, rows: 1 }),
+                "all_gather",
+                vec![a],
+                c,
+            ),
+            copy_step(2, 8),
+        ],
+        ..Plan::default()
+    }
+}
+
+type RankFixture = (
+    MutexGuard<'static, ()>,
+    Rank<MockTransport>,
+    &'static MockDevice,
+    Arc<Mutex<usize>>,
+    Option<(Arc<Mutex<SumLog>>, u64)>,
+);
+
+fn open_rank(plan: Plan, grid: Option<(bool, bool)>) -> RankFixture {
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = tessera_gpukit::device::cached_context::<MockDevice>().unwrap();
+    ctx.reset();
+    let (sum, meta) = match grid {
+        Some((capturable, allow_gather)) => {
+            let (s, log, job) = MockSum::new(ctx, capturable, allow_gather);
+            (Some(Box::new(s) as Box<dyn Sum>), Some((log, job)))
+        }
+        None => (None, None),
+    };
+    let exchanges = Arc::new(Mutex::new(0));
+    let settings = Settings {
+        memory: tessera_engine_settings::Memory::Off,
+        ..host()
+    };
+    let mut rank =
+        Rank::open_device::<MockDevice>(plan, &settings, MockTransport(exchanges.clone()))
+            .unwrap()
+            .with_grid(sum);
+    rank.launching(Launching {
+        graphs: true,
+        pdl: false,
+    });
+    (guard, rank, ctx, exchanges, meta)
+}
+
+fn sum_counts(log: &Arc<Mutex<SumLog>>) -> (usize, usize, usize) {
+    let l = log.lock().unwrap();
+    (l.starts, l.stops, l.checks)
+}
+
+#[test]
+fn sums_capture_once() {
+    let plan = ranked_plan(256);
+    let (_guard, mut rank, ctx, _, meta) = open_rank(plan.clone(), Some((true, true)));
+    let (log, job) = meta.unwrap();
+
+    let input = Tensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+    rank.write(plan.steps[0].write, input.view()).unwrap();
+    rank.submit(0..plan.steps.len()).unwrap();
+    // All 6 steps capture into 1 graph.
+    assert_eq!((ctx.counts().3, ctx.counts().4), (1, 1));
+    assert_eq!(ctx.read_u64(job), 3);
+    assert_eq!(
+        rank.read(plan.steps[5].write).unwrap().floats().unwrap(),
+        [4.0, 8.0, 12.0, 16.0, 4.0, 8.0, 12.0, 16.0]
+    );
+
+    // Replays reuse the graph and keep the grid up.
+    for pass in 2..=3 {
+        rank.write(plan.steps[0].write, input.view()).unwrap();
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (1, pass));
+        assert_eq!(ctx.read_u64(job), pass as u64 * 3);
+    }
+    assert_eq!(sum_counts(&log), (1, 0, 3));
+
+    // Scratch growth pauses first, invalidates, then re-captures cleanly.
+    let large = ranked_plan(65_536);
+    rank.replan(&large).unwrap();
+    assert_eq!(sum_counts(&log), (1, 1, 3));
+    rank.write(large.steps[0].write, input.view()).unwrap();
+    rank.submit(0..large.steps.len()).unwrap();
+    assert_eq!((ctx.counts().3, ctx.counts().4), (2, 4));
+    assert_eq!(ctx.read_u64(job), 13);
+    assert_eq!(sum_counts(&log), (2, 1, 4));
+
+    // Warm replan reuses buffers and graphs without pausing.
+    let small = ranked_plan(256);
+    rank.replan(&small).unwrap();
+    rank.submit(0..small.steps.len()).unwrap();
+    assert_eq!(sum_counts(&log), (3, 2, 5));
+    for _ in 0..3 {
+        rank.replan(&large).unwrap();
+        rank.submit(0..large.steps.len()).unwrap();
+        rank.replan(&small).unwrap();
+        rank.submit(0..small.steps.len()).unwrap();
+    }
+    // Zero extra pauses or restarts across warm A <-> B switches.
+    assert_eq!(sum_counts(&log), (3, 2, 11));
+    assert_eq!((ctx.counts().3, ctx.counts().4), (3, 11));
+
+    // Dropping pauses the persistent grid before freeing buffers.
+    drop(rank);
+    assert_eq!(sum_counts(&log).1, 3);
+}
+
+#[test]
+fn sums_split_fallbacks() {
+    let plan = ranked_plan(256);
+    let input = Tensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+
+    // Non-capturable Sum splits and pauses on cold capture.
+    {
+        let (_guard, mut rank, ctx, _, meta) = open_rank(plan.clone(), Some((false, true)));
+        let (log, job) = meta.unwrap();
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (3, 3));
+        assert_eq!(ctx.read_u64(job), 5);
+        assert_eq!(sum_counts(&log), (2, 2, 1));
+        // Second pass hits all 3 graphs with zero pauses.
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (3, 6));
+        assert_eq!(ctx.read_u64(job), 8);
+        assert_eq!(sum_counts(&log), (3, 2, 2));
+    }
+
+    // Switching to profiling stops the grid and disables capture.
+    {
+        let (_guard, mut rank, ctx, _, meta) = open_rank(plan.clone(), Some((true, true)));
+        let (log, job) = meta.unwrap();
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!(sum_counts(&log), (1, 0, 1));
+        rank.profiling(true);
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (1, 1));
+        assert!(log.lock().unwrap().timed);
+        assert_eq!(sum_counts(&log), (2, 2, 2));
+        assert_eq!(ctx.read_u64(job), 8);
+    }
+
+    // Host-fallback AllGather splits while AllReduces capture together.
+    {
+        let (_guard, mut rank, ctx, exchanges, meta) = open_rank(plan.clone(), Some((true, false)));
+        let (log, job) = meta.unwrap();
+        rank.write(plan.steps[0].write, input.view()).unwrap();
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (2, 2));
+        assert_eq!(*exchanges.lock().unwrap(), 1);
+        assert_eq!(ctx.read_u64(job), 3);
+        assert_eq!(
+            rank.read(plan.steps[5].write).unwrap().floats().unwrap(),
+            [4.0, 8.0, 12.0, 16.0, 4.0, 8.0, 12.0, 16.0]
+        );
+        // Second pass reuses the cached split with zero pauses.
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (2, 4));
+        assert_eq!(sum_counts(&log), (2, 1, 2));
+    }
+
+    // Absent Sum grid falls back to host transport.
+    {
+        let (_guard, mut rank, ctx, exchanges, _) = open_rank(plan.clone(), None);
+        rank.write(plan.steps[0].write, input.view()).unwrap();
+        rank.submit(0..plan.steps.len()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (3, 3));
+        assert_eq!(*exchanges.lock().unwrap(), 3);
+    }
+
+    // Shared grid pauses on cold peer replan, stays hot warm.
+    {
+        struct Share(Rc<RefCell<MockSum>>);
+        impl Sum for Share {
+            fn sum(&mut self, f: u64, t: u64, n: usize) -> Result<(), RunError> {
+                self.0.borrow_mut().sum(f, t, n)
+            }
+            fn gather(
+                &mut self,
+                f: u64,
+                t: u64,
+                p: usize,
+                tot: usize,
+                r: usize,
+            ) -> Result<bool, RunError> {
+                self.0.borrow_mut().gather(f, t, p, tot, r)
+            }
+            fn capturable(&self) -> bool {
+                self.0.borrow().capturable()
+            }
+            fn pause(&mut self) -> Result<(), RunError> {
+                self.0.borrow_mut().pause()
+            }
+            fn check(&mut self) -> Result<(), RunError> {
+                self.0.borrow_mut().check()
+            }
+        }
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = tessera_gpukit::device::cached_context::<MockDevice>().unwrap();
+        ctx.reset();
+        let (mock_sum, log, job) = MockSum::new(ctx, true, true);
+        let shared = Rc::new(RefCell::new(mock_sum));
+        let settings = Settings {
+            memory: tessera_engine_settings::Memory::Off,
+            ..host()
+        };
+        let make = |p: Plan| {
+            let mut r = Rank::open_device::<MockDevice>(
+                p,
+                &settings,
+                MockTransport(Arc::new(Mutex::new(0))),
+            )
+            .unwrap()
+            .with_grid(Some(Box::new(Share(shared.clone()))));
+            r.launching(Launching {
+                graphs: true,
+                pdl: false,
+            });
+            r
+        };
+        let (p1, p2, p2_grow) = (ranked_plan(256), ranked_plan(256), ranked_plan(65_536));
+        let (mut r1, mut r2) = (make(p1.clone()), make(p2.clone()));
+        r1.submit(0..p1.steps.len()).unwrap();
+        // Peer cold replan + capture pauses the live grid first.
+        r2.replan(&p2_grow).unwrap();
+        r2.submit(0..p2_grow.steps.len()).unwrap();
+        let cold = sum_counts(&log);
+        // Alternating warm submits keep the shared grid running.
+        for _ in 0..3 {
+            r1.submit(0..p1.steps.len()).unwrap();
+            r2.submit(0..p2_grow.steps.len()).unwrap();
+        }
+        assert_eq!((sum_counts(&log).0, sum_counts(&log).1), (cold.0, cold.1));
+        assert!(ctx.read_u64(job) > 20);
+        // Dropping r1 while r2 lives pauses before freeing r1's buffers.
+        drop(r1);
+        drop(r2);
+    }
 }

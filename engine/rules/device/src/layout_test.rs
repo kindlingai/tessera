@@ -132,6 +132,7 @@ fn headers_match_rust() {
         ("DOORBELL_SLOTS", DOORBELL_SLOTS),
         ("DOORBELL_ABORT", DOORBELL_ABORT),
         ("DOORBELL_SENT", DOORBELL_SENT),
+        ("DOORBELL_FAULT", DOORBELL_FAULT),
     ];
     let item_kinds = ["INPUT", "OUTPUT", "SCRATCH"];
     let conventions = ["LLM", "KV", "STATE", "IMAGE"];
@@ -150,7 +151,13 @@ fn headers_match_rust() {
     }
     let slots = DOORBELL_SLOTS + MAX_POOLS * MAX_DEPTH * 16;
     let sizes = SIZES + MAX_POOLS * MAX_DEPTH * MAX_GROUP * 4;
-    assert!(slots <= SIZES && sizes <= DOORBELL_ABORT);
+    let sent = DOORBELL_SENT + MAX_POOLS * 8;
+    assert!(
+        slots <= SIZES
+            && sizes <= DOORBELL_ABORT
+            && sent <= DOORBELL_FAULT
+            && DOORBELL_FAULT + 8 <= PAGE
+    );
     check::<Ref>(&headers);
     check::<Item>(&headers);
     check::<Form>(&headers);

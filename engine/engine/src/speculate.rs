@@ -53,6 +53,14 @@ impl Sum for SharedSum {
         self.0.borrow_mut().gather(from, to, part, total, rows)
     }
 
+    fn capturable(&self) -> bool {
+        self.0.borrow().capturable()
+    }
+
+    fn pause(&mut self) -> Result<(), RunError> {
+        self.0.borrow_mut().pause()
+    }
+
     fn check(&mut self) -> Result<(), RunError> {
         self.0.borrow_mut().check()
     }

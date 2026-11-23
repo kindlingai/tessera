@@ -8,13 +8,16 @@ use tessera_codegen::Precision;
 use tessera_engine_comm::{Transport, gathered, summed};
 use tessera_engine_settings::Settings;
 use tessera_gpukit::Platform;
+use tessera_gpukit::backend::OnGpu;
+use tessera_gpukit::device::Device;
+use tessera_gpukit::launch::Launch;
 use tessera_lower::kernels::{AllGather, crosses};
 use tessera_lower::{Launching, Plan, Step};
 use tessera_mem::{DType, Tensor};
 
 /// A sum or gather across ranks between two device addresses.
 pub trait Sum {
-    /// Queues a sum of `len` floats at `from` into `to`.
+    /// Queues a sum of `len` floats. Zero starts the grid.
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), Error>;
     /// Queues a gather of `part` floats over `rows` rows.
     fn gather(
@@ -26,6 +29,14 @@ pub trait Sum {
         _rows: usize,
     ) -> Result<bool, Error> {
         Ok(false)
+    }
+    /// Whether launches capture into a device graph.
+    fn capturable(&self) -> bool {
+        false
+    }
+    /// Stops a running grid before context-syncing device calls.
+    fn pause(&mut self) -> Result<(), Error> {
+        Ok(())
     }
     /// Fails if a queued sum failed. May wait.
     fn check(&mut self) -> Result<(), Error> {
@@ -39,31 +50,187 @@ pub trait Sum {
     }
 }
 
+/// Aborts a capture cleanly on error or host-fallback gather.
+pub(crate) enum Capture {
+    Err(Error),
+    Split(usize),
+}
+
+impl Capture {
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Err(e) => e,
+            Self::Split(_) => unreachable!("plain launch never splits"),
+        }
+    }
+}
+
+impl From<tessera_gpukit::Error> for Capture {
+    fn from(e: tessera_gpukit::Error) -> Self {
+        Self::Err(e.into())
+    }
+}
+
+impl From<Error> for Capture {
+    fn from(e: Error) -> Self {
+        Self::Err(e)
+    }
+}
+
+/// A device runner that captures crossing steps in one graph.
+pub(crate) trait RankRun: Run {
+    fn can_graph(&self, steps: Range<usize>) -> bool;
+    fn replan_with(
+        &mut self,
+        plan: &Plan,
+        sum: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(), Error>;
+    fn run_with(
+        &mut self,
+        steps: Range<usize>,
+        wait: bool,
+        cross: bool,
+        sum: &mut (dyn Sum + 'static),
+    ) -> Result<Option<usize>, Error>;
+}
+
+impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::device::Runner<D> {
+    fn can_graph(&self, steps: Range<usize>) -> bool {
+        self.can_record(&steps)
+    }
+
+    fn replan_with(
+        &mut self,
+        plan: &Plan,
+        sum: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(), Error> {
+        self.replan_with(plan, sum)
+    }
+
+    fn run_with(
+        &mut self,
+        steps: Range<usize>,
+        wait: bool,
+        cross: bool,
+        sum: &mut (dyn Sum + 'static),
+    ) -> Result<Option<usize>, Error> {
+        self.run(steps, false, wait, cross, Some(sum))
+            .map(|(_, split)| split)
+    }
+}
+
+/// Queues one crossing step on `grid`. False means host fallback.
+pub(crate) fn grid_cross(
+    step: &Step,
+    from: u64,
+    to: u64,
+    grid: &mut dyn Sum,
+) -> Result<bool, Error> {
+    if step.kernel.name() != AllGather::NAME {
+        grid.sum(from, to, step.write.len)?;
+        return Ok(true);
+    }
+    let (src, dst) = (step.reads[0], step.write);
+    if src.form.name() != "f32" || dst.form.name() != "f32" {
+        return Ok(false);
+    }
+    let rows = step.kernel.sizes()[0];
+    grid.gather(from, to, src.len, dst.len, rows)
+}
+
+enum Inner {
+    Plain(Box<dyn Run>),
+    Device(Box<dyn RankRun>),
+}
+
+impl Inner {
+    fn run(&self) -> &dyn Run {
+        match self {
+            Self::Plain(r) => r.as_ref(),
+            Self::Device(r) => r.as_ref(),
+        }
+    }
+
+    fn run_mut(&mut self) -> &mut dyn Run {
+        match self {
+            Self::Plain(r) => r.as_mut(),
+            Self::Device(r) => r.as_mut(),
+        }
+    }
+}
+
+struct OpenRank<'a>(Plan, &'a Settings);
+
+impl OnGpu for OpenRank<'_> {
+    type Out = Result<Box<dyn RankRun>, Error>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        Ok(Box::new(crate::device::Runner::<D>::new(self.0, self.1)?))
+    }
+}
+
+fn check_rank<T: Transport>(plan: &Plan, transport: &T) -> Result<(), Error> {
+    let fits = plan.ranks.max(1) == transport.ranks() && plan.rank == transport.rank();
+    if !fits {
+        return Err(Error::RankMismatch {
+            plan: plan.rank,
+            plans: plan.ranks,
+            rank: transport.rank(),
+            ranks: transport.ranks(),
+        });
+    }
+    Ok(())
+}
+
 /// One rank: its runner and its way to the others.
 pub struct Rank<T: Transport> {
-    runner: Box<dyn Run>,
+    runner: Inner,
     transport: T,
     /// A persistent grid that runs the sums, if given.
     grid: Option<Box<dyn Sum>>,
+    /// Host-fallback gather steps cached for one `plan.id`.
+    host_gathers: (u64, Vec<usize>),
+}
+
+impl<T: Transport> Drop for Rank<T> {
+    fn drop(&mut self) {
+        // Stop any live persistent grid before dropping device buffers.
+        if let Some(grid) = &mut self.grid {
+            let _ = grid.pause();
+        }
+    }
 }
 
 impl<T: Transport> Rank<T> {
     /// A runner for the transport's rank of `plan`.
     pub fn open(plan: Plan, settings: &Settings, transport: T) -> Result<Self, Error> {
-        let fits = plan.ranks.max(1) == transport.ranks() && plan.rank == transport.rank();
-        if !fits {
-            return Err(Error::RankMismatch {
-                plan: plan.rank,
-                plans: plan.ranks,
-                rank: transport.rank(),
-                ranks: transport.ranks(),
-            });
-        }
-        let runner = open(plan, settings)?;
+        check_rank(&plan, &transport)?;
+        crate::configure(settings);
+        let runner =
+            match tessera_gpukit::backend::dispatch(settings.gpu(), OpenRank(plan, settings)) {
+                Ok(run) => Inner::Device(run?),
+                Err(OpenRank(plan, _)) => Inner::Plain(open(plan, settings)?),
+            };
         Ok(Self {
             runner,
             transport,
             grid: None,
+            host_gathers: (0, Vec::new()),
+        })
+    }
+
+    /// A ranked runner on any `Device`, for tests.
+    pub fn open_device<D>(plan: Plan, settings: &Settings, transport: T) -> Result<Self, Error>
+    where
+        D: Device + Launch<Kernel = <D as Device>::Kernel>,
+    {
+        check_rank(&plan, &transport)?;
+        let runner = Inner::Device(Box::new(crate::device::Runner::<D>::new(plan, settings)?));
+        Ok(Self {
+            runner,
+            transport,
+            grid: None,
+            host_gathers: (0, Vec::new()),
         })
     }
 
@@ -78,31 +245,98 @@ impl<T: Transport> Rank<T> {
         self.grid.is_some()
     }
 
-    /// One sum through the persistent grid.
-    fn grid_sum(&mut self, i: usize, step: &Step) -> Result<(), Error> {
-        let at = |slot| self.runner.address(slot).ok_or(Error::Unaddressed(i));
+    /// One crossing step through the persistent grid.
+    fn grid_step(&mut self, i: usize, step: &Step) -> Result<bool, Error> {
+        let at = |slot| self.runner.run().address(slot).ok_or(Error::Unaddressed(i));
         let (from, to) = (at(step.reads[0])?, at(step.write)?);
         let grid = self.grid.as_mut().expect("a grid");
-        grid.sum(from, to, step.write.len)
+        grid_cross(step, from, to, grid.as_mut())
     }
 
-    /// One gather through the persistent grid, if supported.
-    fn grid_gather(&mut self, i: usize, step: &Step) -> Result<bool, Error> {
-        let (src, dst) = (step.reads[0], step.write);
-        if src.form.name() != "f32" || dst.form.name() != "f32" {
+    /// Runs `steps` with crossing steps inside device graphs.
+    fn submit_graphed(&mut self, steps: Range<usize>) -> Result<bool, Error> {
+        let Inner::Device(dev) = &mut self.runner else {
+            return Ok(false);
+        };
+        if !dev.can_graph(steps.clone()) {
             return Ok(false);
         }
-        let at = |slot| self.runner.address(slot).ok_or(Error::Unaddressed(i));
-        let (from, to) = (at(src)?, at(dst)?);
-        let rows = step.kernel.sizes()[0];
-        let grid = self.grid.as_mut().expect("a grid");
-        grid.gather(from, to, src.len, dst.len, rows)
+        let plan_id = dev.plan().id;
+        if self.host_gathers.0 != plan_id {
+            self.host_gathers = (plan_id, Vec::new());
+        }
+        let mut from = steps.start;
+        let mut used_grid = false;
+        while from < steps.end {
+            let next_host = self
+                .host_gathers
+                .1
+                .iter()
+                .copied()
+                .find(|&at| at >= from && at < steps.end);
+            let end = next_host.unwrap_or(steps.end);
+            if from < end {
+                let span = from..end;
+                let has_cross = span
+                    .clone()
+                    .any(|i| crosses(self.runner.run().plan().steps[i].kernel.name()));
+                let Inner::Device(dev) = &mut self.runner else {
+                    unreachable!()
+                };
+                let grid = self.grid.as_mut().expect("a grid");
+                let split = match dev.run_with(span, true, has_cross, grid.as_mut()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if used_grid || has_cross {
+                            let _ = grid.check();
+                        }
+                        return Err(e);
+                    }
+                };
+                if let Some(at) = split {
+                    self.host_gathers.1.push(at);
+                    self.host_gathers.1.sort_unstable();
+                    self.host_gathers.1.dedup();
+                    continue;
+                }
+                used_grid |= has_cross;
+            }
+            if let Some(at) = next_host {
+                let step = self.runner.run().plan().steps[at].clone();
+                if let Err(e) = self.gather(&step) {
+                    if used_grid {
+                        let _ = self.grid.as_mut().expect("a grid").check();
+                    }
+                    return Err(e);
+                }
+                from = at + 1;
+            } else {
+                from = end;
+            }
+        }
+        if used_grid {
+            self.grid.as_mut().expect("a grid").check()?;
+        }
+        Ok(true)
+    }
+
+    /// Runs a plain span, pausing the grid on cold capture.
+    fn run_span(&mut self, span: Range<usize>, wait: bool) -> Result<(), Error> {
+        if self.base().profile.is_none()
+            && let (Inner::Device(dev), Some(grid)) = (&mut self.runner, self.grid.as_deref_mut())
+        {
+            return dev.run_with(span, wait, false, grid).map(|_| ());
+        }
+        match wait {
+            true => self.runner.run_mut().submit(span),
+            false => self.runner.run_mut().queue(span),
+        }
     }
 
     /// A host sum. Profiling first waits for all ranks.
     fn exchange(&mut self, step: &Step) -> Result<(), Error> {
         let start = Instant::now();
-        let part = self.runner.read(step.reads[0])?;
+        let part = self.runner.run().read(step.reads[0])?;
         let mut at = self.lap("all_reduce: read", start);
         if self.base().profile.is_some() {
             self.transport.exchange(&[])?;
@@ -114,7 +348,7 @@ impl<T: Transport> Rank<T> {
         let parts: Vec<Tensor> = parts.iter().map(floats).collect();
         let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
         let sum = Tensor::f32(vec![step.write.len], sum);
-        self.runner.write(step.write, sum.view())?;
+        self.runner.run_mut().write(step.write, sum.view())?;
         self.lap("all_reduce: sum", at);
         self.lap("all_reduce", start);
         Ok(())
@@ -123,11 +357,11 @@ impl<T: Transport> Rank<T> {
     /// A host gather of each rank's rows.
     fn gather(&mut self, step: &Step) -> Result<(), Error> {
         let start = Instant::now();
-        let part = self.runner.read(step.reads[0])?;
+        let part = self.runner.run().read(step.reads[0])?;
         let parts = self.transport.exchange(part.bytes())?;
         let rows = step.kernel.sizes()[0];
         let whole = Tensor::from_bytes(vec![step.write.len], part.dtype(), &gathered(&parts, rows));
-        self.runner.write(step.write, whole.view())?;
+        self.runner.run_mut().write(step.write, whole.view())?;
         self.lap("all_gather", start);
         Ok(())
     }
@@ -142,15 +376,18 @@ impl<T: Transport> Rank<T> {
 
 impl<T: Transport> Run for Rank<T> {
     fn base(&self) -> &Base {
-        self.runner.base()
+        self.runner.run().base()
     }
 
     fn base_mut(&mut self) -> &mut Base {
-        self.runner.base_mut()
+        self.runner.run_mut().base_mut()
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        self.runner.replan(plan)
+        match &mut self.runner {
+            Inner::Device(dev) => dev.replan_with(plan, self.grid.as_deref_mut()),
+            Inner::Plain(r) => r.replan(plan),
+        }
     }
 
     /// Runs these steps. Sums wait for every rank.
@@ -159,31 +396,35 @@ impl<T: Transport> Run for Rank<T> {
         if let Some(grid) = &mut self.grid {
             grid.timing(timed);
         }
+        if !timed
+            && self.grid.as_ref().is_some_and(|g| g.capturable())
+            && self.submit_graphed(steps.clone())?
+        {
+            return Ok(());
+        }
         let mut from = steps.start;
         for i in steps.clone() {
-            let step = &self.runner.plan().steps[i];
+            let step = &self.runner.run().plan().steps[i];
             if !crosses(step.kernel.name()) {
                 continue;
             }
             let step = step.clone();
-            if self.grid.is_some() && !timed {
-                self.runner.queue(from..i)?;
-            } else {
-                self.runner.submit(from..i)?;
-            }
+            self.run_span(from..i, !(self.grid.is_some() && !timed))?;
             from = i + 1;
             match (step.kernel.name() == AllGather::NAME, self.grid.is_some()) {
                 (true, true) => {
-                    if !self.grid_gather(i, &step)? {
+                    if !self.grid_step(i, &step)? {
                         self.gather(&step)?;
                     }
                 }
                 (true, false) => self.gather(&step)?,
-                (false, true) => self.grid_sum(i, &step)?,
+                (false, true) => {
+                    self.grid_step(i, &step)?;
+                }
                 (false, false) => self.exchange(&step)?,
             }
         }
-        self.runner.submit(from..steps.end)?;
+        self.run_span(from..steps.end, true)?;
         let Some(grid) = self.grid.as_mut().filter(|_| from > steps.start) else {
             return Ok(());
         };
@@ -197,34 +438,41 @@ impl<T: Transport> Run for Rank<T> {
     }
 
     fn address(&self, slot: tessera_lower::Slot) -> Option<u64> {
-        self.runner.address(slot)
+        self.runner.run().address(slot)
     }
 
     fn launching(&mut self, how: Launching) {
-        self.runner.launching(how)
+        if let Some(grid) = &mut self.grid {
+            let _ = grid.pause();
+        }
+        self.runner.run_mut().launching(how)
     }
 
     fn persist(&mut self, grid: Box<dyn crate::Grid>) -> Result<(), Error> {
-        self.runner.persist(grid)
+        self.runner.run_mut().persist(grid)
+    }
+
+    fn profiling(&mut self, on: bool) {
+        self.runner.run_mut().profiling(on)
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {
-        self.runner.repeat(step, times)
+        self.runner.run_mut().repeat(step, times)
     }
 
     fn device(&self) -> String {
-        self.runner.device()
+        self.runner.run().device()
     }
 
     fn compiled(&self) -> (usize, usize) {
-        self.runner.compiled()
+        self.runner.run().compiled()
     }
 
     fn platform(&self) -> Platform {
-        self.runner.platform()
+        self.runner.run().platform()
     }
 
     fn precision(&self) -> Precision {
-        self.runner.precision()
+        self.runner.run().precision()
     }
 }

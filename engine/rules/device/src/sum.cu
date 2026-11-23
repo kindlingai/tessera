@@ -150,7 +150,7 @@ __device__ bool run_gather(session& s, const float* from, float* to, u32 n, u32 
     return true;
 }
 
-// Values: floats per round, job, first seq. Zero floats stop.
+// Values: floats per round, job. Zero floats stop.
 extern "C" __global__ void tessera_sums(const table* t) {
     if (!check(t)) return;
     u32 room = value(t, 0);
@@ -161,7 +161,8 @@ extern "C" __global__ void tessera_sums(const table* t) {
     __shared__ int live;
     __shared__ u64 seen;
     session s = begin(t);
-    for (u64 seq = u64(value(t, 3)) | u64(value(t, 4)) << 32;; seq++) {
+    u64 seq = prim::load_acquire_gpu64(&j->done) + 1;
+    for (;; seq++) {
         if (prim::leader_thread()) {
             for (u32 spin = 1; prim::load_acquire_gpu64(&j->seq) < seq; spin++) {
                 if (failed(t, spin)) break;
@@ -178,7 +179,11 @@ extern "C" __global__ void tessera_sums(const table* t) {
         }
         prim::block_sync();
         if (live == 0) return;
-        if (now.n == 0) break;
+        if (now.n == 0) {
+            if (!grid_sync(t)) return;
+            if (prim::leader()) prim::store_release_gpu64(&j->done, seq);
+            break;
+        }
         if (now.timed != 0) {
             ticket b = prepare(s, 0);
             u16* part = send_buffer<u16>(b);
@@ -210,7 +215,8 @@ extern "C" __global__ void tessera_sums(const table* t) {
 
 // On the main stream: passes one job, then waits.
 extern "C" __global__ void tessera_hand(const table* t, job* j, u64 from, u64 to, u32 n,
-                                        u32 timed, u32 rows, u32 total, u64 seq, u64 deadline) {
+                                        u32 timed, u32 rows, u32 total, u64 timeout) {
+    u64 seq = prim::load_acquire_gpu64(&j->seq) + 1;
     j->from = from;
     j->to = to;
     j->n = n;
@@ -219,8 +225,16 @@ extern "C" __global__ void tessera_hand(const table* t, job* j, u64 from, u64 to
     j->total = total;
     prim::store_release_gpu64(&j->seq, seq);
     if (n == 0) return;
+    u64 deadline = prim::clock_ticks() + timeout;
     for (u32 spin = 1; prim::load_acquire_gpu64(&j->done) < seq; spin++) {
-        if (failed(t, spin)) return;
+        if (failed(t, spin)) {
+            u64* page = get<u64>(t, t->doorbell);
+            u32 code = *static_cast<volatile u32*>(&get<fault>(t, t->status)->code);
+            if (page != nullptr && code != OK) {
+                prim::store_release_sys(page + DOORBELL_FAULT / 8, u64(code));
+            }
+            return;
+        }
         if ((spin & 1023) == 0 && prim::clock_ticks() > deadline) {
             fail(t, TIMEOUT);
             return;

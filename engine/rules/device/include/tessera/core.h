@@ -143,6 +143,7 @@ struct fault {
 constexpr u32 DOORBELL_SLOTS = 64;
 constexpr u32 DOORBELL_ABORT = 4032;
 constexpr u32 DOORBELL_SENT = 4040;
+constexpr u32 DOORBELL_FAULT = 4072;
 
 struct table {
     u32 edition;

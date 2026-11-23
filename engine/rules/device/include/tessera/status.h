@@ -11,6 +11,8 @@ TESSERA_FN void fail(const table* t, status_code code, u32 pool = NONE, u64 ordi
     if (prim::cas(&f->code, OK, code) != OK) return;
     f->pool = pool;
     f->ordinal = ordinal;
+    u64* page = get<u64>(t, t->doorbell);
+    if (page != nullptr) prim::store_release_sys(page + DOORBELL_FAULT / 8, u64(code));
 }
 
 // Reads the code alone, from device memory.

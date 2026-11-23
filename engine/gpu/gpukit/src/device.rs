@@ -142,6 +142,11 @@ pub trait Device: Clone + Send + Sync + 'static {
         false
     }
 
+    /// Whether this thread is recording a device graph now.
+    fn capturing(&self) -> bool {
+        false
+    }
+
     /// Runs `record` and keeps its launches as one graph.
     fn capture<E: From<Error>>(
         &self,

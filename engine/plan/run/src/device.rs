@@ -8,6 +8,7 @@ use crate::kernels::Kernels;
 use crate::marks;
 use crate::overrides::{self, Overrides};
 use crate::profile::Marks;
+use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -21,9 +22,9 @@ use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
-use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, Step};
+use tessera_lower::kernels::crosses;
+use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
 use tessera_mem::Buffer;
-use tessera_mem::form::Read;
 
 /// Most inactive plans kept ready for instant switching.
 const MAX_PLANS: usize = 32;
@@ -249,8 +250,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.open();
         let plan = &self.base.plan;
         let base = |slot| self.buffer(slot).device_ptr();
-        let (items, values) = table(plan, &plan.steps[step], launch, &base)?;
-        let kept = kept_tables(plan, &base);
+        let (items, values) = grid::table(plan, &plan.steps[step], launch, &base)?;
+        let kept = grid::kept_tables(plan, &base);
         let mut grid = self.grid.borrow_mut();
         let grid = grid.as_mut().ok_or(Error::Gridless(step))?;
         grid.launch(&plan.steps[step].kernel, &items, &kept, &values)
@@ -263,7 +264,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         };
         for (i, step) in plan.steps.iter().enumerate() {
             if self.resident[i] {
-                grid.open(&step.kernel, step_layout(plan, step))?;
+                grid.open(&step.kernel, grid::step_layout(plan, step))?;
             }
         }
         Ok(())
@@ -315,6 +316,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
+    fn grid_marks(&mut self) -> Vec<(String, Marks)> {
+        self.grid
+            .get_mut()
+            .as_mut()
+            .map_or_else(Vec::new, |g| g.take_marks())
+    }
+
     /// Times each step by device stamps, else by waiting.
     fn profiled(&mut self, steps: Range<usize>) -> Result<(), Error> {
         self.close()?;
@@ -324,12 +332,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             let name = self.base.plan.steps[i].kernel.name();
             self.note(name, s);
         }
-        let grid_marks = self
-            .grid
-            .get_mut()
-            .as_mut()
-            .map_or_else(Vec::new, |g| g.take_marks());
-        for (entry, found) in grid_marks {
+        for (entry, found) in self.grid_marks() {
             for region in &found.regions {
                 let (middle, _) = region.spread();
                 let label = format!("mark {entry}: L{}-L{}", region.from, region.to);
@@ -339,15 +342,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         Ok(())
     }
 
-    /// Runs `work`, then waits. Returns the device's seconds, if kept.
+    /// Runs `work`, optionally waiting. Returns the device's seconds.
     fn waited(
         &self,
+        wait: bool,
         timed: bool,
         work: impl FnOnce(&Self) -> Result<(), Error>,
     ) -> Result<Option<f64>, Error> {
-        if !timed {
+        if !wait || !timed {
             work(self)?;
-            return Ok(self.ctx.finish()?);
+            return Ok(if wait { self.ctx.finish()? } else { None });
         }
         self.close()?;
         let stamped = self.ctx.stamp().map_err(Error::from).and_then(|stamped| {
@@ -363,69 +367,90 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
-    /// Launches every step, as a recorded graph when eligible.
-    fn run(&mut self, steps: Range<usize>, timed: bool, wait: bool) -> Result<Option<f64>, Error> {
-        if steps.is_empty() {
-            return Ok(None);
-        }
+    /// Whether `steps` can record into one device graph.
+    pub(crate) fn can_record(&self, steps: &Range<usize>) -> bool {
         // A recorded graph cannot hold a grid that waits.
-        let record = self.launching.graphs
+        self.base.profile.is_none()
+            && self.launching.graphs
             && self.ctx.graphs()
             && !self.resident[steps.clone()].contains(&true)
-            && self.base.plan.id != 0;
-        if !record {
-            if !wait {
-                self.launch_all(steps)?;
-                return Ok(None);
-            }
-            return self.waited(timed, |r| r.launch_all(steps));
+            && self.base.plan.id != 0
+    }
+
+    /// Launches every step, as a recorded graph when eligible.
+    pub(crate) fn run(
+        &mut self,
+        steps: Range<usize>,
+        timed: bool,
+        wait: bool,
+        cross: bool,
+        mut sums: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(Option<f64>, Option<usize>), Error> {
+        if self.overrides.is_some()
+            && let Some(grid) = sums.as_deref_mut()
+        {
+            grid.pause()?;
         }
-        let mut bound: Vec<(DimName, u32)> =
-            self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
+        self.reread()?;
+        if self.base.profile.is_some() {
+            return self.profiled(steps).map(|()| (None, None));
+        }
+        if steps.is_empty() {
+            return Ok((None, None));
+        }
+        if !self.can_record(&steps) {
+            let plain = |r: &Self| r.launch_all(steps, None).map_err(Capture::into_error);
+            return Ok((self.waited(wait, timed, plain)?, None));
+        }
+        let mut bound: Vec<_> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
         bound.sort_unstable();
-        let key = (self.base.plan.id, bound);
-        let range = (steps.start, steps.end);
+        let (key, range) = ((self.base.plan.id, bound), (steps.start, steps.end));
         let hit = self
             .graphs
             .get_mut(&key)
             .is_some_and(|s| s.ptrs == self.ptrs && s.ranges.contains_key(&range));
         if !hit {
-            let graph = self.ctx.capture(|| self.launch_all(steps.clone()))?;
+            if let Some(grid) = sums.as_deref_mut() {
+                grid.pause()?;
+            }
+            let graph = match self.ctx.capture(|| {
+                let cap = if cross { sums.as_deref_mut() } else { None };
+                self.launch_all(steps.clone(), cap)
+            }) {
+                Ok(graph) => graph,
+                Err(Capture::Split(at)) => return Ok((None, Some(at))),
+                Err(Capture::Err(e)) => return Err(e),
+            };
             let evicted = match self.graphs.get_mut(&key) {
                 Some(set) => {
-                    let stale = if set.ptrs != self.ptrs {
+                    let stale = (set.ptrs != self.ptrs).then(|| {
                         set.ptrs = self.ptrs.clone();
-                        Some(std::mem::take(&mut set.ranges))
-                    } else {
-                        None
-                    };
+                        std::mem::take(&mut set.ranges)
+                    });
                     set.ranges.insert(range, graph);
                     stale
                 }
                 None => {
-                    let mut ranges = HashMap::new();
-                    ranges.insert(range, graph);
                     let set = GraphSet {
                         ptrs: self.ptrs.clone(),
-                        ranges,
+                        ranges: HashMap::from([(range, graph)]),
                     };
                     self.graphs.insert(key.clone(), set).map(|old| old.ranges)
                 }
             };
             if evicted.is_some() {
                 self.ctx.finish()?;
+                drop(evicted);
             }
-            drop(evicted);
         }
-        if !wait {
-            let graph = &self.graphs.get(&key).expect("captured above").ranges[&range];
-            self.ctx.replay(graph)?;
-            return Ok(None);
+        if cross && let Some(grid) = sums {
+            grid.sum(0, 0, 0)?;
         }
-        self.waited(timed, |r| {
+        let replay = |r: &Self| {
             let graph = &r.graphs.get(&key).expect("captured above").ranges[&range];
             Ok(r.ctx.replay(graph)?)
-        })
+        };
+        Ok((self.waited(wait, timed, replay)?, None))
     }
 
     /// Notes each step's entry, once per distinct entry.
@@ -541,11 +566,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 break;
             }
         }
-        let taken = self
-            .grid
-            .get_mut()
-            .as_mut()
-            .map_or_else(Vec::new, |g| g.take_marks());
+        let taken = self.grid_marks();
         if !was_profiling && let Some(grid) = self.grid.get_mut().as_mut() {
             grid.profiling(false);
         }
@@ -567,170 +588,111 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         Ok(Some(merged))
     }
 
-    /// Reads the ledger after one launch into `found`.
-    fn collect(&self, ledger: u64, found: &mut Marks) -> Result<(), Error> {
-        Ok(marks::collect(self.ctx, ledger, found)?)
-    }
-
     /// Every launch of `steps`, in order.
-    fn launch_all(&self, steps: Range<usize>) -> Result<(), Error> {
+    fn launch_all(
+        &self,
+        steps: Range<usize>,
+        mut sums: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(), Capture> {
         for i in steps {
+            let step = &self.base.plan.steps[i];
+            if crosses(step.kernel.name())
+                && let Some(grid) = sums.as_deref_mut()
+            {
+                let at = |s: Slot| self.buffer(s).device_ptr() + s.at(0) as u64;
+                if !grid_cross(step, at(step.reads[0]), at(step.write), grid)? {
+                    return Err(Capture::Split(i));
+                }
+                continue;
+            }
             for launch in self.base.launches(i)? {
                 self.launch(i, &launch)?;
             }
         }
         Ok(())
     }
-}
 
-/// Matrix rows and columns from a packed shape.
-fn matrix_dims(dims: u32, shape: [u32; 4]) -> (u32, u32) {
-    match dims {
-        0 => (0, 0),
-        1 => (1, shape[0]),
-        d => (shape[d as usize - 2], shape[d as usize - 1]),
-    }
-}
-
-/// Companion `suh` and `svh` device addresses for a rotated weight.
-fn companions(
-    plan: &Plan,
-    weight: u32,
-    address: &impl Fn(Slot) -> u64,
-) -> (Option<u64>, Option<u64>) {
-    let mut suh = None;
-    let mut svh = None;
-    for l in &plan.weights {
-        if l.weight != weight {
-            continue;
+    /// Replans, pausing `sum` before any allocation or compilation.
+    pub(crate) fn replan_with(
+        &mut self,
+        plan: &Plan,
+        mut sum: Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(), Error> {
+        if !self.base.fresh(plan)? {
+            return Ok(());
         }
-        let at = address(l.slot) + l.slot.start() as u64;
-        match l.part {
-            Some(1) => suh = Some(at),
-            Some(2) => svh = Some(at),
-            _ => {}
-        }
-    }
-    (suh, svh)
-}
-
-/// A bound launch as items and values, by argument order.
-fn table(
-    plan: &Plan,
-    step: &Step,
-    launch: &Call,
-    address: &impl Fn(Slot) -> u64,
-) -> Result<(Vec<grid::Item>, Vec<u32>), Error> {
-    let (mut items, mut values) = (Vec::new(), Vec::new());
-    let mut buf_index = 0usize;
-    for arg in &launch.args {
-        match arg {
-            Arg::Buffer(slot, Extent::Fixed(skip)) => {
-                let kind = if buf_index == step.reads.len() && *slot == step.write {
-                    grid::ItemKind::Output
-                } else {
-                    grid::ItemKind::Input
-                };
-                let at = address(*slot) + slot.at(*skip) as u64;
-                let bytes = slot.bytes() - (slot.at(*skip) - slot.start());
-                let (dims, shape) = if *skip == 0 && slot.dims > 0 {
-                    (u32::from(slot.dims), slot.shape)
-                } else {
-                    (1, [bytes as u32, 0, 0, 0])
-                };
-                let loaded = plan
-                    .weights
-                    .iter()
-                    .find(|l| l.slot.buffer == slot.buffer && l.slot.offset == slot.offset);
-                let share = match loaded.and_then(|l| l.share) {
-                    Some(s) => [s.axis, s.first as u32, s.count as u32, s.whole as u32],
-                    None => [0; 4],
-                };
-                let form = if slot.form.read() == Read::Decode {
-                    let (rows, cols) = matrix_dims(dims, shape);
-                    let (suh, svh) = match loaded.filter(|l| l.part == Some(0)) {
-                        Some(l) => companions(plan, l.weight, address),
-                        None => (None, None),
-                    };
-                    Some(grid::FormMeta {
-                        name: slot.form.name(),
-                        rows,
-                        cols,
-                        suh,
-                        svh,
-                    })
-                } else {
-                    None
-                };
-                items.push(grid::Item {
-                    at,
-                    bytes,
-                    kind,
-                    elem: slot.form.name(),
-                    dims,
-                    shape,
-                    share,
-                    form,
-                });
-                buf_index += 1;
+        let (ctx, unified) = (self.ctx, self.ctx.unified());
+        let dropped = match self.base.held.bind(plan, |zone, bytes, holds| {
+            if let Some(g) = sum.as_deref_mut() {
+                g.pause()?;
             }
-            arg => values.push(arg.u32().ok_or(tessera_lower::Error::Unbound)?),
-        }
-    }
-    Ok((items, values))
-}
-
-/// Kept-row table descriptors for the KV convention.
-fn kept_tables(plan: &Plan, address: &impl Fn(Slot) -> u64) -> Vec<grid::KeptDesc> {
-    let pages = plan.table.map(|t| address(t) + t.start() as u64);
-    let mut out = Vec::with_capacity(plan.kept.len());
-    for ((_, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
-        let page_rows = info.page_rows.max(1);
-        out.push(grid::KeptDesc {
-            base: address(*slot) + slot.start() as u64,
-            pages,
-            len: None,
-            slots: info.slots,
-            context: info.context,
-            pages_per_slot: info.context.div_ceil(page_rows),
-            page_rows,
-            row_bytes: slot.form.bytes(info.width as usize) as u32,
-            elem: slot.form.name(),
-            interleaved: info.interleaved,
-        });
-    }
-    out
-}
-
-/// Control table counts for a resident step.
-fn step_layout(plan: &Plan, step: &Step) -> grid::Layout {
-    let mut items = 0usize;
-    let mut forms = 0usize;
-    for launch in step.launches() {
-        let mut n_items = 0;
-        let mut n_forms = 0;
-        for arg in &launch.args {
-            if let Arg::Buffer(slot, _) = arg {
-                n_items += 1;
-                if slot.form.read() == Read::Decode {
-                    n_forms += 1;
+            // The host reads weight files straight into pinned memory.
+            let buffer = match unified && holds == Holds::Weights {
+                true => DeviceBuffer::pinned(ctx, bytes)?,
+                false => DeviceBuffer::alloc(ctx, bytes)?,
+            };
+            // Kernels may read what they are about to write.
+            buffer.zero()?;
+            Ok(Buffer::new(zone, buffer))
+        }) {
+            Ok(dropped) => dropped,
+            Err(e) => {
+                if let Some(g) = sum.as_deref_mut() {
+                    let _ = g.pause();
                 }
+                self.clear_graphs();
+                return Err(e);
             }
+        };
+        if dropped {
+            // Dropped buffers leave recorded device addresses stale.
+            self.clear_graphs();
         }
-        items = items.max(n_items);
-        forms = forms.max(n_forms);
-    }
-    let kept = plan.kept.len().min(plan.kept_info.len());
-    let pages = match (plan.table, plan.kept_info.first()) {
-        (None, Some(info)) if info.interleaved => (info.slots * info.context) as usize,
-        (None, Some(info)) => info.slots as usize,
-        _ => 0,
-    };
-    grid::Layout {
-        items,
-        forms,
-        kept,
-        pages,
+        self.ptrs = self.bound_ptrs();
+        if plan.id != 0
+            && let Some(cached) = self.plans.remove(&plan.id)
+        {
+            self.stash_plan();
+            self.restore_plan(cached);
+            self.apply();
+            self.sync_grid();
+            self.ready(plan)?;
+            return Ok(());
+        }
+        if let Some(g) = sum {
+            g.pause()?;
+        }
+        let resident: Vec<bool> = plan
+            .steps
+            .iter()
+            .map(|s| s.kernel.resident().is_some())
+            .collect();
+        let mut kernels = Vec::with_capacity(plan.steps.len());
+        let mut waits = Vec::with_capacity(plan.steps.len());
+        for step in &plan.steps {
+            let fixed = |text: &'static str, entry: &'static str| -> Result<_, Error> {
+                match text.contains("TS_MARK") {
+                    true => Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?),
+                    false => Ok(cached_source::<D>(text, entry)?),
+                }
+            };
+            let made = |s: &str, e: &str| -> Result<_, Error> { Ok(ctx.compile(s, e)?) };
+            // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
+            let (kernel, generated) = self.compiled.get(step, D::BACKEND, fixed, made)?;
+            kernels.push(kernel);
+            waits.push(generated);
+        }
+        self.stash_plan();
+        self.planned = kernels.clone();
+        self.kernels = kernels;
+        self.waits = waits;
+        self.resident = resident;
+        self.index(plan);
+        self.apply();
+        self.sync_grid();
+        self.ready(plan)?;
+        self.base.adopt(plan);
+        Ok(())
     }
 }
 
@@ -787,74 +749,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
-        if !self.base.fresh(plan)? {
-            return Ok(());
-        }
-        let ctx = self.ctx;
-        let unified = ctx.unified();
-        let dropped = match self.base.held.bind(plan, |zone, bytes, holds| {
-            // The host reads weight files straight into pinned memory.
-            let buffer = match unified && holds == Holds::Weights {
-                true => DeviceBuffer::pinned(ctx, bytes)?,
-                false => DeviceBuffer::alloc(ctx, bytes)?,
-            };
-            // Kernels may read what they are about to write.
-            buffer.zero()?;
-            Ok(Buffer::new(zone, buffer))
-        }) {
-            Ok(dropped) => dropped,
-            Err(e) => {
-                self.clear_graphs();
-                return Err(e);
-            }
-        };
-        if dropped {
-            // Dropped buffers leave recorded device addresses stale.
-            self.clear_graphs();
-        }
-        self.ptrs = self.bound_ptrs();
-        if plan.id != 0
-            && let Some(cached) = self.plans.remove(&plan.id)
-        {
-            self.stash_plan();
-            self.restore_plan(cached);
-            self.apply();
-            self.sync_grid();
-            self.ready(plan)?;
-            return Ok(());
-        }
-        let resident: Vec<bool> = plan
-            .steps
-            .iter()
-            .map(|s| s.kernel.resident().is_some())
-            .collect();
-        let mut kernels = Vec::with_capacity(plan.steps.len());
-        let mut waits = Vec::with_capacity(plan.steps.len());
-        for step in &plan.steps {
-            let fixed = |text: &'static str, entry: &'static str| -> Result<_, Error> {
-                match text.contains("TS_MARK") {
-                    true => Ok(ctx.compile(&format!("{}{text}", marks::OFF), entry)?),
-                    false => Ok(cached_source::<D>(text, entry)?),
-                }
-            };
-            let made =
-                |source: &str, entry: &str| -> Result<_, Error> { Ok(ctx.compile(source, entry)?) };
-            // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
-            let (kernel, generated) = self.compiled.get(step, D::BACKEND, fixed, made)?;
-            kernels.push(kernel);
-            waits.push(generated);
-        }
-        self.stash_plan();
-        self.planned = kernels.clone();
-        self.kernels = kernels;
-        self.waits = waits;
-        self.resident = resident;
-        self.index(plan);
-        self.apply();
-        self.sync_grid();
-        self.ready(plan)?;
-        self.base.adopt(plan);
-        Ok(())
+        self.replan_with(plan, None)
     }
 
     fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
@@ -905,7 +800,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             let mut args = self.bound(&launch.args)?;
             self.fire(&kernel, launch.shape, &mut args)?;
             self.ctx.finish()?;
-            self.collect(ledger, &mut found)?;
+            marks::collect(self.ctx, ledger, &mut found)?;
         }
         Ok(Some(found))
     }
@@ -942,7 +837,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         self.ctx.finish()?;
         let start = Instant::now();
         let launches = self.base.launches(step)?;
-        let clocked = self.waited(true, |r| {
+        let clocked = self.waited(true, true, |r| {
             for _ in 0..times {
                 for launch in &launches {
                     r.launch(step, launch)?;
@@ -967,26 +862,15 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
-        self.reread()?;
-        if self.base.profile.is_some() {
-            return self.profiled(steps);
-        }
-        self.run(steps, false, true).map(|_| ())
+        self.run(steps, false, true, false, None).map(|_| ())
     }
 
     fn queue(&mut self, steps: Range<usize>) -> Result<(), Error> {
-        self.reread()?;
-        if self.base.profile.is_some() {
-            return self.profiled(steps);
-        }
-        self.run(steps, false, false).map(|_| ())
+        self.run(steps, false, false, false, None).map(|_| ())
     }
 
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
-        self.reread()?;
-        if self.base.profile.is_some() {
-            return self.profiled(steps).map(|_| None);
-        }
-        self.run(steps, true, true)
+        self.run(steps, true, true, false, None)
+            .map(|(secs, _)| secs)
     }
 }

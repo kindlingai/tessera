@@ -768,6 +768,10 @@ impl<A: Api> Device for Context<A> {
         true
     }
 
+    fn capturing(&self) -> bool {
+        !A::capturing().with(Cell::get).is_null()
+    }
+
     fn capture<E: From<Error>>(
         &self,
         record: impl FnOnce() -> Result<(), E>,

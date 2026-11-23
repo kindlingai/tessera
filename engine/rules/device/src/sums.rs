@@ -79,8 +79,7 @@ struct Grid<D: Device, L> {
     ctx: D,
     hand: <D as Device>::Kernel,
     job: DeviceBuffer<D>,
-    seq: u64,
-    /// The grid runs, from a submit's first sum to `check`.
+    /// The grid stays running across unprofiled submits until drop.
     running: bool,
     /// Whether sums take a barrier round and keep ticks.
     timed: bool,
@@ -95,7 +94,7 @@ where
 {
     /// Queues the hand kernel. Zero floats stop the grid.
     fn hand(&mut self, from: u64, to: u64, n: u32, rows: u32, total: u32) -> Result<(), Error> {
-        self.seq += 1;
+        let timeout = (TIMEOUT.as_secs_f64() * self.ctx.ticks()) as u64;
         let mut args = KernelArgs::new();
         args.device_ptr(self.resident.table())
             .device_ptr(self.job.device_ptr())
@@ -105,8 +104,7 @@ where
             .u32(self.timed as u32)
             .u32(rows)
             .u32(total)
-            .u64(self.seq)
-            .u64(self.resident.deadline(TIMEOUT));
+            .u64(timeout);
         self.ctx.programmatic(false);
         let one = (1, 1, 1);
         Ok(self.ctx.launch(&self.hand, one, one, 0, &mut args)?)
@@ -115,19 +113,37 @@ where
     /// Starts the grid unless it runs.
     fn start(&mut self) -> Result<(), Error> {
         if self.running {
-            return self.resident.alive();
+            return match self.resident.poll()? {
+                true => Ok(()),
+                false => {
+                    self.running = false;
+                    self.resident.join()
+                }
+            };
         }
-        let (at, next) = (self.job.device_ptr(), self.seq + 1);
-        let words = [
-            at as u32,
-            (at >> 32) as u32,
-            next as u32,
-            (next >> 32) as u32,
-        ];
-        self.resident
-            .start(&[ROOM, words[0], words[1], words[2], words[3]])?;
+        let at = self.job.device_ptr();
+        let words = [at as u32, (at >> 32) as u32];
+        self.resident.start(&[ROOM, words[0], words[1]])?;
         self.running = true;
         Ok(())
+    }
+
+    /// Stops a running grid and reads its fault.
+    fn stop(&mut self) -> Result<(), Error> {
+        if !std::mem::take(&mut self.running) {
+            return self.resident.status();
+        }
+        self.hand(0, 0, 0, 0, 0)?;
+        self.resident.join()
+    }
+}
+
+impl<D: Device, L> Drop for Grid<D, L> {
+    fn drop(&mut self) {
+        if std::mem::take(&mut self.running) {
+            self.resident.abort();
+            let _ = self.ctx.finish();
+        }
     }
 }
 
@@ -139,7 +155,8 @@ where
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), tessera_run::Error> {
         let n = u32::try_from(len).map_err(|_| tessera_run::Error::SumTooLong(len))?;
         let queued = match n {
-            0 => Ok(()),
+            0 => self.start(),
+            n if self.ctx.capturing() => self.hand(from, to, n, 0, 0),
             n => self.start().and_then(|_| self.hand(from, to, n, 0, 0)),
         };
         queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
@@ -169,21 +186,52 @@ where
         ) else {
             return Ok(false);
         };
-        self.start()
-            .and_then(|_| self.hand(from, to, n, rows, total))
-            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        let queued = match self.ctx.capturing() {
+            true => self.hand(from, to, n, rows, total),
+            false => self
+                .start()
+                .and_then(|_| self.hand(from, to, n, rows, total)),
+        };
+        queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
         Ok(true)
     }
 
+    fn capturable(&self) -> bool {
+        true
+    }
+
+    fn pause(&mut self) -> Result<(), tessera_run::Error> {
+        if self.running {
+            self.stop()
+                .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        }
+        Ok(())
+    }
+
     fn check(&mut self) -> Result<(), tessera_run::Error> {
-        let status = match std::mem::take(&mut self.running) {
-            true => self.hand(0, 0, 0, 0, 0).and_then(|_| self.resident.join()),
-            false => self.resident.status(),
+        let status = match (self.running, self.timed) {
+            (false, _) => self.resident.status(),
+            (true, true) => self.stop(),
+            (true, false) => match self.resident.poll() {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    self.running = false;
+                    self.resident.join()
+                }
+                Err(e) => {
+                    self.running = false;
+                    self.resident.abort();
+                    Err(e)
+                }
+            },
         };
         status.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 
     fn timing(&mut self, on: bool) {
+        if self.timed != on && self.running {
+            let _ = self.stop();
+        }
         self.timed = on;
     }
 
@@ -222,7 +270,6 @@ where
         ctx: ctx.clone(),
         hand,
         job,
-        seq: 0,
         running: false,
         timed: false,
         last: [0; 2],
