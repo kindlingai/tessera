@@ -25,6 +25,7 @@ struct Env {
     /// Extra NVRTC or hiprtc flags, whitespace separated.
     nvrtc: Option<String>,
     dump_sites: Option<PathBuf>,
+    device: Option<usize>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -34,6 +35,9 @@ pub fn read() -> Settings {
     let env: Env = envy::prefixed("TESSERA_")
         .from_iter(set)
         .unwrap_or_else(|e| panic!("TESSERA_ environment: {e}"));
+    if let Some(device) = env.device {
+        tessera_engine::select(device);
+    }
     let backend = match env.backend.as_deref() {
         Some("host") => Pick::Host,
         Some("cpu") => Pick::Cpu,
@@ -74,6 +78,7 @@ pub fn read() -> Settings {
         kernel_cache,
         nvrtc,
         dump_sites: env.dump_sites,
+        device: env.device,
     }
 }
 

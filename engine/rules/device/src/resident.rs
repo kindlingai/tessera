@@ -298,7 +298,9 @@ where
 }
 
 /// The device's clock now, from a one-thread kernel.
-fn clock<D: Device + Launch<Kernel = <D as Device>::Kernel>>(ctx: &D) -> Result<u64, Error> {
+pub(crate) fn clock<D: Device + Launch<Kernel = <D as Device>::Kernel>>(
+    ctx: &D,
+) -> Result<u64, Error> {
     let options = Options {
         backend: backend::<D>()?,
         remote_kv: false,

@@ -60,6 +60,8 @@ pub struct Settings {
     pub nvrtc: Vec<String>,
     /// File path for wasm site and reply logs.
     pub dump_sites: Option<PathBuf>,
+    /// GPU device ordinal. `None` picks device 0.
+    pub device: Option<usize>,
 }
 
 impl Default for Settings {
@@ -81,6 +83,7 @@ impl Default for Settings {
             kernel_cache: None,
             nvrtc: Vec::new(),
             dump_sites: None,
+            device: None,
         }
     }
 }

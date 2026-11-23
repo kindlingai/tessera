@@ -4,6 +4,7 @@ use crate::backend::Backend;
 use crate::{Error, Platform};
 use std::collections::HashMap;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Static register and memory counts for one compiled kernel.
@@ -13,6 +14,23 @@ pub struct KernelStats {
     pub shared_bytes: u32,
     pub local_bytes: u32,
     pub max_threads: u32,
+}
+
+/// Opaque 64-byte handle for GPU IPC memory sharing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcHandle(pub [u8; 64]);
+
+static ORDINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the GPU ordinal opened on first context use.
+pub fn select(ordinal: usize) {
+    ORDINAL.store(ordinal, Ordering::Relaxed);
+}
+
+/// The GPU ordinal selected for the process-wide context.
+pub fn ordinal() -> usize {
+    ORDINAL.load(Ordering::Relaxed)
 }
 
 /// A backend context: memory, kernels and process-wide caches.
@@ -90,6 +108,19 @@ pub trait Device: Clone + Send + Sync + 'static {
     }
 
     fn unregister(&self, _host: *mut u8) {}
+
+    /// Exports a device allocation for peer GPU processes.
+    fn ipc_export(&self, _ptr: u64) -> Result<IpcHandle, Error> {
+        Err(Self::error("this device has no GPU IPC".into()))
+    }
+
+    /// Maps a peer GPU allocation into this device's address space.
+    fn ipc_open(&self, _handle: IpcHandle) -> Result<u64, Error> {
+        Err(Self::error("this device has no GPU IPC".into()))
+    }
+
+    /// Unmaps a peer GPU allocation opened with `ipc_open`.
+    fn ipc_close(&self, _ptr: u64) {}
 
     /// Blocks of `kernel` one unit holds at once.
     fn resident(&self, _kernel: &Self::Kernel, _threads: u32, _shared: u32) -> Result<u32, Error> {

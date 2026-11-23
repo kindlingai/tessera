@@ -117,9 +117,17 @@ pub fn gpu() -> Option<Backend> {
     tessera_gpukit::backend::picked()
 }
 
-/// Applies cache and compiler settings to the GPU runtime.
+/// Applies cache, device and compiler settings to the GPU runtime.
 pub fn configure(settings: &Settings) {
+    if let Some(ordinal) = settings.device {
+        tessera_gpukit::device::select(ordinal);
+    }
     tessera_gpukit::cache::configure(settings);
+}
+
+/// Picks the GPU ordinal opened on first context use.
+pub fn select(ordinal: usize) {
+    tessera_gpukit::device::select(ordinal);
 }
 
 /// Pinned memory on the GPU `settings` picks, if any.

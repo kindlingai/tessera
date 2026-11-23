@@ -1,0 +1,229 @@
+#include <tessera/1/core>
+
+using namespace tessera;
+
+namespace p2p {
+
+constexpr u32 MAX_RANKS = 8;
+constexpr u32 MAX_FLOATS = 2u << 20;
+constexpr u64 MAX_BYTES = u64(MAX_FLOATS) * 4ull;
+constexpr u64 SLOT_BYTES = MAX_BYTES + 4096ull;
+constexpr u32 RING = 4;
+constexpr u32 CNT_STRIDE = MAX_RANKS + 2;
+
+TESSERA_FN u64 slot_off(u64 seq, u32 src, u32 nr) {
+    return ((seq & 1ull) * nr + src) * SLOT_BYTES;
+}
+
+TESSERA_FN u64* tail_of(u64 area, u64 seq, u32 src, u32 nr) {
+    return reinterpret_cast<u64*>(area + slot_off(seq, src, nr) + MAX_BYTES);
+}
+
+TESSERA_FN u64* ack_of(u64 area, u32 nr, u32 peer) {
+    return reinterpret_cast<u64*>(area + 2ull * nr * SLOT_BYTES) + peer;
+}
+
+TESSERA_FN float4 load_vec4(const float* p, u32 j, bool aligned) {
+    if (aligned) return reinterpret_cast<const float4*>(p)[j];
+    const float* q = p + j * 4;
+    return make_float4(q[0], q[1], q[2], q[3]);
+}
+
+TESSERA_FN void store_out4(float* p, u32 j, float4 v, bool aligned) {
+    if (aligned) {
+        reinterpret_cast<float4*>(p)[j] = v;
+        return;
+    }
+    float* q = p + j * 4;
+    q[0] = v.x;
+    q[1] = v.y;
+    q[2] = v.z;
+    q[3] = v.w;
+}
+
+#if defined(TESSERA_CUDA)
+
+TESSERA_FN float4 load_fresh4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+TESSERA_FN void store_vec4(float* p, float4 v) {
+    asm volatile("st.global.v4.f32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+                 : "memory");
+}
+
+#else
+
+TESSERA_FN float4 load_fresh4(const float* p) {
+    return make_float4(prim::load_fresh(p + 0), prim::load_fresh(p + 1),
+                       prim::load_fresh(p + 2), prim::load_fresh(p + 3));
+}
+
+TESSERA_FN void store_vec4(float* p, float4 v) {
+    *reinterpret_cast<float4*>(p) = v;
+}
+
+#endif
+
+// Spins in thread 0 until `*p >= want`.
+TESSERA_FN bool spin_ge(const u64* p, u64 want, u64 deadline, u32* fault, int* stop) {
+    if (prim::leader_thread()) {
+        for (u32 spin = 1; prim::load_acquire_sys(p) < want; spin++) {
+            if (*static_cast<volatile u32*>(fault) != 0) {
+                *stop = 1;
+                break;
+            }
+            if ((spin & 255) == 0 && deadline != 0 && prim::clock_ticks() > deadline) {
+                prim::cas(fault, 0u, TIMEOUT);
+                *stop = 1;
+                break;
+            }
+            prim::pause();
+        }
+    }
+    prim::block_sync();
+    return *stop == 0;
+}
+
+// True in the last CTA after flushing system writes.
+TESSERA_FN bool last_cta(u32* cnt) {
+    prim::fence_sys();
+    prim::block_sync();
+    __shared__ int is_last;
+    if (prim::leader_thread()) {
+        u32 prev = prim::fetch_add_gpu(cnt, 1u);
+        is_last = (prev + 1 == prim::blocks()) ? 1 : 0;
+        if (is_last) {
+            prim::store_relaxed_gpu(cnt, 0u);
+            prim::fence_sys();
+        }
+    }
+    prim::block_sync();
+    return is_last != 0;
+}
+
+TESSERA_FN void write_slice(u64 area, u64 seq, u32 me, u32 nr, const float* src, u32 n,
+                            u32 lo4, u32 hi4, bool aligned) {
+    float* dst = reinterpret_cast<float*>(area + slot_off(seq, me, nr));
+    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+        store_vec4(dst + j * 4, load_vec4(src, j, aligned));
+    }
+    if (prim::leader_block()) {
+        u32 base = (n / 4) * 4;
+        u32 rem = n - base;
+        if (threadIdx.x < rem) dst[base + threadIdx.x] = src[base + threadIdx.x];
+    }
+}
+
+TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float* src,
+                          float* dst, u32 n, u32 lo4, u32 hi4, bool aligned_src,
+                          bool aligned_dst) {
+    u64 mine = areas[me];
+    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (u32 r = 0; r < nr; r++) {
+            float4 v = (r == me)
+                ? load_vec4(src, j, aligned_src)
+                : load_fresh4(reinterpret_cast<const float*>(mine + slot_off(seq, r, nr)) + j * 4);
+            acc.x += v.x;
+            acc.y += v.y;
+            acc.z += v.z;
+            acc.w += v.w;
+        }
+        store_out4(dst, j, acc, aligned_dst);
+    }
+    if (prim::leader_block()) {
+        u32 base = (n / 4) * 4;
+        u32 rem = n - base;
+        if (threadIdx.x < rem) {
+            u32 idx = base + threadIdx.x;
+            float acc = 0.0f;
+            for (u32 r = 0; r < nr; r++) {
+                const float* peer = reinterpret_cast<const float*>(mine + slot_off(seq, r, nr));
+                acc += (r == me) ? src[idx] : prim::load_fresh(peer + idx);
+            }
+            dst[idx] = acc;
+        }
+    }
+}
+
+}  // namespace p2p
+
+// Direct P2P all-reduce: fan-out (sched 0) or rounds (sched 1).
+extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32* fault,
+                                           u64 from_ptr, u64 to_ptr, u32 total, u64 base_seq,
+                                           u32 nr, u32 me, u32 sched, u64 deadline) {
+    __shared__ int stop;
+    if (prim::leader_thread()) stop = (*static_cast<volatile u32*>(fault) != 0) ? 1 : 0;
+    prim::block_sync();
+    if (stop != 0) return;
+
+    u64 mine = areas[me];
+    bool pow2 = (nr & (nr - 1)) == 0;
+    u64 seq = base_seq;
+    for (u32 off = 0; off < total; off += p2p::MAX_FLOATS, seq++) {
+        u32 n = total - off;
+        if (n > p2p::MAX_FLOATS) n = p2p::MAX_FLOATS;
+        const float* src = reinterpret_cast<const float*>(from_ptr) + off;
+        float* dst_buf = reinterpret_cast<float*>(to_ptr) + off;
+        bool aligned_src = (reinterpret_cast<u64>(src) & 15ull) == 0;
+        bool aligned_dst = (reinterpret_cast<u64>(dst_buf) & 15ull) == 0;
+        u32 vec4s = n / 4;
+        u32 blocks = prim::blocks();
+        u32 per = (vec4s + blocks - 1) / blocks;
+        u32 lo4 = blockIdx.x * per;
+        u32 hi4 = lo4 + per;
+        if (lo4 > vec4s) lo4 = vec4s;
+        if (hi4 > vec4s) hi4 = vec4s;
+        u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
+
+        if (sched == 0) {
+            for (u32 k = 1; k < nr; k++) {
+                u32 peer = (me + k) % nr;
+                if (!p2p::spin_ge(p2p::ack_of(mine, nr, peer), seq - 2, deadline, fault, &stop))
+                    return;
+            }
+            for (u32 k = 1; k < nr; k++) {
+                u32 peer = (me + k) % nr;
+                p2p::write_slice(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
+            }
+            if (p2p::last_cta(ci + 0) && prim::leader_thread()) {
+                for (u32 k = 1; k < nr; k++) {
+                    u32 peer = (me + k) % nr;
+                    prim::store_release_sys(p2p::tail_of(areas[peer], seq, me, nr), seq);
+                }
+            }
+            for (u32 k = 1; k < nr; k++) {
+                u32 peer = (me + nr - k) % nr;
+                if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault, &stop))
+                    return;
+            }
+        } else {
+            for (u32 k = 1; k < nr; k++) {
+                u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
+                u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
+                if (!p2p::spin_ge(p2p::ack_of(mine, nr, dst), seq - 2, deadline, fault, &stop))
+                    return;
+                p2p::write_slice(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
+                if (p2p::last_cta(ci + 2 + k) && prim::leader_thread()) {
+                    prim::store_release_sys(p2p::tail_of(areas[dst], seq, me, nr), seq);
+                }
+                if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault, &stop))
+                    return;
+            }
+        }
+
+        p2p::sum_slice(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
+        if (p2p::last_cta(ci + 1) && prim::leader_thread()) {
+            for (u32 k = 1; k < nr; k++) {
+                u32 peer = (me + k) % nr;
+                prim::store_release_sys(p2p::ack_of(areas[peer], nr, me), seq);
+            }
+        }
+    }
+}

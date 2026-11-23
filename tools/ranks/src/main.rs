@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 use tessera_bundle::Weights;
+use tessera_device::p2p::Schedule;
 use tessera_device::sums::{self, Sum};
 use tessera_engine_comm::{Fabric, ShmLink, Transport};
-use tessera_frontend_comm::{CAPACITY, grid_flag, meet, ports, shared, shm};
+use tessera_frontend_comm::{CAPACITY, Sums, meet, p2p, ports, shared, shm, sums_flag};
 use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::shard_aligned;
 use tessera_interp::Tensor;
@@ -22,10 +23,11 @@ use tessera_trace::Norm;
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--sums host|grid] [--recipe DIR] [--require-favored]
+  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds] [--sums host|grid|p2p] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
-  persistent grid per rank, over that fabric or the file.
+  persistent grid per rank, over that fabric or the file. --sums p2p runs
+  direct GPU-to-GPU SM-store sums over IPC.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.
@@ -49,14 +51,27 @@ struct Args {
     repeat: usize,
     /// RDMA ports, after the ranks meet.
     fabric: Option<Fabric>,
-    /// Sums for the persistent-grid stub, instead of a model.
+    /// Sums for the stub, instead of a model.
     stub: Option<u32>,
-    /// The model's sums run in a persistent grid.
-    grid: bool,
+    /// Floats per stub sum.
+    size: u32,
+    /// P2P schedule override for stub runs.
+    sched: Schedule,
+    /// How the model's sums run across ranks.
+    sums: Sums,
     /// A recipe whose grid runs the small model.
     recipe: Option<PathBuf>,
     /// Fail lowering unless the favored rule covers a step.
     require_favored: bool,
+}
+
+fn sched_flag(value: &str) -> Option<Schedule> {
+    match value {
+        "auto" => Some(Schedule::Auto),
+        "fanout" => Some(Schedule::Fanout),
+        "rounds" => Some(Schedule::Rounds),
+        _ => None,
+    }
 }
 
 fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
@@ -74,7 +89,9 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         repeat: 1,
         fabric: None,
         stub: None,
-        grid: false,
+        size: 4096,
+        sched: Schedule::Auto,
+        sums: Sums::Host,
         recipe: None,
         require_favored: false,
     };
@@ -98,9 +115,11 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--backend" => args.host = value == "host" || value == "cpu",
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
-            "--sums" => args.grid = grid_flag(&value)?,
+            "--sums" => args.sums = sums_flag(&value)?,
             "--recipe" => args.recipe = Some(value.into()),
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
+            "--size" => args.size = value.parse().ok().filter(|n| *n > 0)?,
+            "--sched" => args.sched = sched_flag(&value)?,
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -218,7 +237,11 @@ fn join(
         Some(path) => Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?),
         None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
-    if args.grid {
+    if args.sums == Sums::P2p {
+        let sum = p2p(&mut *met, settings)?;
+        return Ok((met, Some(sum)));
+    }
+    if args.sums == Sums::Grid {
         let grid = match (&args.shm, &args.fabric) {
             (Some(path), _) => {
                 let (rank, ranks) = (args.rank, args.ranks as u32);

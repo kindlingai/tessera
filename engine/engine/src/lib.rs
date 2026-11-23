@@ -37,7 +37,7 @@ pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample};
 
 // The front end reaches the engine crates only through these.
-pub use tessera_device::{sums, whole};
+pub use tessera_device::{p2p, sums, whole};
 pub use tessera_engine_comm as comm;
 pub use tessera_engine_settings::{Backend, Memory};
 pub use tessera_graph::{Bf16, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
@@ -48,7 +48,7 @@ pub use tessera_mem::{block, trellis};
 // The front end's name for `mtp`.
 pub use tessera_models::mtp as mtp_model;
 pub use tessera_models::*;
-pub use tessera_run::{Grid, gpu, pinning};
+pub use tessera_run::{Grid, gpu, pinning, select};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;
 

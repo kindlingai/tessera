@@ -4,11 +4,11 @@ use std::net::SocketAddr;
 use tessera_engine::comm::{Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Grid, Place, Recipe, Settings};
-use tessera_frontend_comm::{grid, grid_flag, join, meet, ports, resident};
+use tessera_frontend_comm::{Sums, grid, join, meet, p2p, ports, resident, sums_flag};
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
-[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|whole] [--moe ep|tp]]";
+[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|p2p|whole] [--moe ep|tp]]";
 
 /// Sums and control transports, and any grid.
 pub(crate) type Links = ([Box<dyn Transport>; 2], Grids);
@@ -30,8 +30,8 @@ pub struct Ranks {
     parts: Vec<u32>,
     /// RDMA ports for the sums, after the ranks meet.
     fabric: Option<Fabric>,
-    /// The sums run in a persistent grid over the fabric.
-    grid: bool,
+    /// How sums run across ranks.
+    sums: Sums,
     /// The recipe's resident grid runs each step, sums inside.
     whole: bool,
     /// Split wide routed experts along inner width instead of experts.
@@ -52,7 +52,7 @@ impl Ranks {
                 self.parts = parts.collect::<Option<_>>()?;
             }
             "--sums" if value == "whole" => self.whole = true,
-            "--sums" => self.grid = grid_flag(value)?,
+            "--sums" => self.sums = sums_flag(value)?,
             "--moe" => match value {
                 "ep" => self.moe_tp = false,
                 "tp" => self.moe_tp = true,
@@ -94,13 +94,14 @@ impl Ranks {
         }
         let mut met: Box<dyn Transport> =
             Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
-        let grids = match (self.grid || self.whole, &self.fabric) {
-            (true, None) => return Err("--sums grid or whole needs --verbs or --ring".into()),
-            (true, Some(fabric)) if self.whole => {
-                resident(&mut *met, fabric, settings).map(Grids::Steps)
+        let grids = match (self.whole, self.sums, &self.fabric) {
+            (true, _, None) | (false, Sums::Grid, None) => {
+                return Err("--sums grid or whole needs --verbs or --ring".into());
             }
-            (true, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
-            (false, _) => {
+            (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
+            (false, Sums::P2p, _) => p2p(&mut *met, settings).map(Grids::Sums),
+            (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
+            (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());
                 return links
                     .map(|l| Some((l, Grids::None)))
