@@ -1,19 +1,17 @@
 //! Runs lowered plans on the host or a GPU.
 
+mod cache;
 mod cpu;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod device;
 mod grid;
 mod held;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
 pub mod marks;
 #[cfg(test)]
 mod marks_test;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod overrides;
-#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+#[cfg(test)]
 mod overrides_test;
 mod profile;
 mod rank;
@@ -127,7 +125,6 @@ pub fn configure(settings: &Settings) {
 /// Pinned memory on the GPU `settings` picks, if any.
 pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
     configure(settings);
-    #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
     if let Ok(pins) =
         tessera_gpukit::backend::dispatch(settings.gpu().filter(|b| b.pins()), device::Pins)
     {
@@ -139,7 +136,6 @@ pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
-    #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
     let plan = match tessera_gpukit::backend::dispatch(settings.gpu(), device::Open(plan, settings))
     {
         Ok(run) => return run,

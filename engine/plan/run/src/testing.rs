@@ -1,7 +1,18 @@
 //! The settings tests run under: host, then a ready GPU.
 
-use crate::gpu;
+use crate::{Error, Run, gpu};
 use tessera_engine_settings::{Backend, Pick, Settings};
+use tessera_gpukit::device::Device;
+use tessera_gpukit::launch::Launch;
+use tessera_lower::Plan;
+
+/// A device runner on any `Device`, for tests.
+pub fn device<D>(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error>
+where
+    D: Device + Launch<Kernel = <D as Device>::Kernel>,
+{
+    Ok(Box::new(crate::device::Runner::<D>::new(plan, settings)?))
+}
 
 /// Settings for plans on the host.
 pub fn host() -> Settings {

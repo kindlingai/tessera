@@ -53,6 +53,12 @@ impl Base {
         self.launches = (0..plan.steps.len()).map(|_| OnceLock::new()).collect();
     }
 
+    /// Swaps in a saved plan and its cached launches.
+    pub(crate) fn swap(&mut self, plan: &mut Plan, launches: &mut Vec<OnceLock<Vec<Launch>>>) {
+        std::mem::swap(&mut self.plan, plan);
+        std::mem::swap(&mut self.launches, launches);
+    }
+
     /// Whether `plan` is new here. Plans over several zones fail.
     pub(crate) fn fresh(&self, plan: &Plan) -> Result<bool, Error> {
         if plan.id != 0 && plan.id == self.plan.id {
