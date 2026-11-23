@@ -2,21 +2,53 @@
 
 use crate::mla::{self, attn_rules, moe_rules};
 use crate::names::Rule;
-use crate::{Bundle, Overrides, WIDTH, is_exlr8, load_tapped, pins, release};
+use crate::{Bundle, Overrides, WIDTH, is_exlr8, load_tapped, release};
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards};
+use tessera_checkpoint::{Offer, Shards, Stored};
+use tessera_engine::form::{Load, named};
 use tessera_engine::mla::{Moe, RotatedMoe};
 use tessera_engine::mtp_model;
-use tessera_engine::{Graph, Pins, Steps, Weight};
+use tessera_engine::{DimExpr, Graph, PathSeg, Pins, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Streamed MTP weights, cut per rank on load.
 pub struct MtpWeights {
-    graph: Graph,
-    offer: Box<dyn Offer>,
-    rules: Vec<Rule>,
+    pub(crate) graph: Graph,
+    pub(crate) offer: Box<dyn Offer>,
+    pub(crate) rules: Vec<Rule>,
+    pub(crate) pins: Pins,
+}
+
+fn head_shape(graph: &Graph, path: &[PathSeg], shape: &[DimExpr]) -> Option<[usize; 2]> {
+    if !matches!(path, [PathSeg::Field(f)] if f == "head") || shape.len() != 2 {
+        return None;
+    }
+    let val = |d: &DimExpr| d.value(&graph.dims, &|_| None).map(|n| n as usize);
+    Some([val(&shape[0])?, val(&shape[1])?])
+}
+
+/// MTP weight forms, quantizing eligible BF16 head to MXFP8.
+pub(crate) fn mtp_pins(graph: &Graph, offer: &dyn Offer, rules: &[&[Rule]]) -> Result<Pins> {
+    let slices = offer.slices();
+    let claims = crate::names::resolve(graph, &slices, rules)?;
+    let mxfp8 = named("mxfp8");
+    let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(claims.len());
+    for (c, w) in claims.iter().zip(&graph.weights) {
+        let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
+        let quantize = slice.stored == Stored::Bf16
+            && c.parts.is_empty()
+            && c.rows.is_none()
+            && head_shape(graph, &w.path, &w.ty.shape.0)
+                .is_some_and(|[n, k]| n.is_multiple_of(16) && k.is_multiple_of(512));
+        if quantize && let Some(form) = mxfp8 {
+            forms.push(form);
+        } else {
+            forms.push(crate::form(slice.stored, !c.parts.is_empty())?);
+        }
+    }
+    Ok(crate::gguf::pins(graph, &forms, 1))
 }
 
 impl MtpWeights {
@@ -26,6 +58,7 @@ impl MtpWeights {
         shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
         mut take: impl FnMut(u32, &Weight) -> std::result::Result<(), E>,
     ) -> Result<()> {
+        let mxfp8 = named("mxfp8");
         let mut at = 0u32;
         crate::each(
             &self.graph,
@@ -33,7 +66,21 @@ impl MtpWeights {
             &[&self.rules],
             &shares,
             |w, _| {
-                take(at, &w).map_err(Into::into)?;
+                let weight = &self.graph.weights[at as usize];
+                let packed = (self.pins.form(&weight.path).name() == "mxfp8")
+                    .then(|| {
+                        let (Some(form), Weight::Packed(src, bytes)) = (mxfp8, &w) else {
+                            return None;
+                        };
+                        let shape = (src.name() == "bf16")
+                            .then(|| head_shape(&self.graph, &weight.path, &weight.ty.shape.0))??;
+                        Some(Weight::Packed(
+                            form,
+                            crate::dflash::bf16_to_mxfp8(bytes, shape, shares(at), form),
+                        ))
+                    })
+                    .flatten();
+                take(at, packed.as_ref().unwrap_or(&w)).map_err(Into::into)?;
                 at += 1;
                 Ok(())
             },
@@ -104,7 +151,7 @@ pub fn load(
     };
     let mut all_rules = rules(layer, indexed, exlr8);
     all_rules.extend_from_slice(user);
-    let mtp_pins = pins(&graph, offer.as_ref(), 1, &[&all_rules])?;
+    let mtp_pins = mtp_pins(&graph, offer.as_ref(), &[&all_rules])?;
     let tap = [mtp_model::tap_layer(&target_cfg)];
     let target = load_tapped(
         dir,
@@ -119,6 +166,7 @@ pub fn load(
         graph: graph.clone(),
         offer,
         rules: all_rules,
+        pins: mtp_pins.clone(),
     };
     Ok(Mtp {
         target,

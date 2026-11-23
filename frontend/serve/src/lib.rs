@@ -63,8 +63,12 @@ fn render(model: &Model, m: Messages) -> Result<String, Refusal> {
         .as_ref()
         .ok_or_else(|| bad("the model has no chat template", "messages"))?;
     let messages: Vec<Message> = m.messages.into_iter().map(Message::from).collect();
-    let think = m.chat_template_kwargs.enable_thinking.unwrap_or(true);
-    chat.render(&messages, think)
+    let effort = m.chat_template_kwargs.reasoning_effort.as_deref();
+    let think = m
+        .chat_template_kwargs
+        .enable_thinking
+        .unwrap_or(effort != Some("none"));
+    chat.render_with(&messages, think, effort)
         .map_err(|e| bad(e.to_string(), "messages"))
 }
 

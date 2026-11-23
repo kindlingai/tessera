@@ -2,7 +2,7 @@
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::Serde;
-use minijinja::{Environment, Value, context};
+use minijinja::{Environment, Value};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -75,16 +75,28 @@ impl Template {
 
     /// The prompt for `messages`, ready for the assistant's turn.
     pub fn render(&self, messages: &[Message], think: bool) -> Result<String, minijinja::Error> {
+        self.render_with(messages, think, None)
+    }
+
+    /// As `render`, with an optional `reasoning_effort` template variable.
+    pub fn render_with(
+        &self,
+        messages: &[Message],
+        think: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String, minijinja::Error> {
         let template = self.env.get_template("chat")?;
         let messages = Value::from(Serde(messages));
+        let mut ctx = std::collections::BTreeMap::new();
+        ctx.insert("messages", messages);
+        ctx.insert("add_generation_prompt", Value::from(true));
         // Left undefined, `enable_thinking` means the model's default.
-        match think {
-            true => template.render(context! { messages, add_generation_prompt => true }),
-            false => template.render(context! {
-                messages,
-                add_generation_prompt => true,
-                enable_thinking => false,
-            }),
+        if !think {
+            ctx.insert("enable_thinking", Value::from(false));
         }
+        if let Some(effort) = reasoning_effort {
+            ctx.insert("reasoning_effort", Value::from(effort));
+        }
+        template.render(Value::from(ctx))
     }
 }

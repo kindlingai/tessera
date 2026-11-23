@@ -3,7 +3,10 @@
 use crate::{Error, io, pinned};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tessera_frontend_settings::{HUB, resolve};
 
 /// File endings a model directory needs. Other files stay remote.
@@ -26,8 +29,26 @@ struct Sibling {
 /// The file that marks an exlr8 release.
 const EXLR8: &str = "dense/exlr8-vocab.safetensors";
 
+/// Dense files of the towers the engine does not run.
+const TOWERS: [&str; 2] = ["exlr8-extra-audio.", "exlr8-extra-vision."];
+
 /// The expert width fetched when a recipe names none.
 const WIDTH: u32 = 3;
+
+/// Tries without progress before a download fails.
+const TRIES: u32 = 8;
+
+/// How long a read waits before the download resumes.
+const STALL: Duration = Duration::from_secs(60);
+
+/// How often a download checks its speed.
+const WINDOW: Duration = Duration::from_secs(20);
+
+/// Bytes a connection must bring in each `WINDOW`.
+const FLOOR: u64 = 8 << 20;
+
+/// Files fetched at once.
+const LANES: usize = 4;
 
 /// `owner/name[@revision]`. A loose revision is pinned and printed.
 pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, Error> {
@@ -66,12 +87,20 @@ fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error
 }
 
 fn get(url: &str, token: Option<&str>) -> Result<ureq::Response, Box<ureq::Error>> {
-    let request = ureq::get(url);
-    match token {
-        Some(t) => request.set("Authorization", &format!("Bearer {t}")).call(),
-        None => request.call(),
+    get_from(url, token, 0)
+}
+
+/// `url` from byte `from` on. A stalled read times out.
+fn get_from(url: &str, token: Option<&str>, from: u64) -> Result<ureq::Response, Box<ureq::Error>> {
+    let agent = ureq::AgentBuilder::new().timeout_read(STALL).build();
+    let mut request = agent.get(url);
+    if let Some(t) = token {
+        request = request.set("Authorization", &format!("Bearer {t}"));
     }
-    .map_err(Box::new)
+    if from > 0 {
+        request = request.set("Range", &format!("bytes={from}-"));
+    }
+    request.call().map_err(Box::new)
 }
 
 /// `owner/name@commit`, downloaded into `cache` once per `width`.
@@ -108,14 +137,41 @@ pub(crate) fn snapshot(
         true => exlr8(&names, width.unwrap_or(WIDTH)),
         false => wanted(&names, folders.as_deref()),
     };
-    for name in files {
-        if !safe_path(name) {
-            return Err(Error::Source(spec.into(), "unsafe file path in repository"));
-        }
-        fetch_file(repo, commit, name, &dir, token)?;
+    if !files.iter().all(|name| safe_path(name)) {
+        return Err(Error::Source(spec.into(), "unsafe file path in repository"));
     }
+    fetch_all(repo, commit, &files, &dir, token)?;
     std::fs::write(&done, b"").map_err(io(&done))?;
     Ok(dir)
+}
+
+/// Each of `names` into `dir`, `LANES` at a time.
+fn fetch_all(
+    repo: &str,
+    commit: &str,
+    names: &[&str],
+    dir: &Path,
+    token: Option<&str>,
+) -> Result<(), Error> {
+    let next = AtomicUsize::new(0);
+    let lane = || {
+        while let Some(name) = names.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if let Err(e) = fetch_file(repo, commit, name, dir, token) {
+                next.store(names.len(), Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+        Ok(())
+    };
+    std::thread::scope(|s| {
+        let lanes: Vec<_> = (0..LANES).map(|_| s.spawn(lane)).collect();
+        let mut result = Ok(());
+        for handle in lanes {
+            let done = handle.join().expect("a fetch lane panicked");
+            result = result.and(done);
+        }
+        result
+    })
 }
 
 /// Diffusers component folders that `model_index.json` names.
@@ -165,7 +221,10 @@ pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
     for name in names {
         let keep = match name.split_once('/') {
             None => KEEP.iter().any(|k| name.ends_with(k)),
-            Some(("dense", file)) => file.ends_with(".safetensors"),
+            Some(("dense", file)) => {
+                file.ends_with(".safetensors") && !TOWERS.iter().any(|t| file.starts_with(t))
+            }
+            Some(("manifests", file)) => file.ends_with(".json"),
             Some(("experts", file)) => {
                 file.ends_with(".index.safetensors")
                     || codes.iter().any(|c| file.ends_with(c.as_str()))
@@ -208,10 +267,58 @@ fn download(url: &str, path: &Path, token: Option<&str>) -> Result<(), Error> {
     let mut part = path.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
-    let response = get(url, token).map_err(|e| http(url)(*e))?;
-    let mut file = std::fs::File::create(&part).map_err(io(&part))?;
-    std::io::copy(&mut response.into_reader(), &mut file).map_err(io(&part))?;
+    // Tries since the file last grew.
+    let mut tries = 1;
+    loop {
+        let before = held(&part);
+        let Err(e) = resume(url, &part, token) else {
+            break;
+        };
+        if held(&part) > before {
+            tries = 0;
+        } else if tries == TRIES {
+            return Err(e);
+        }
+        eprintln!("tesserax: {e}: resuming");
+        std::thread::sleep(Duration::from_secs(tries.into()));
+        tries += 1;
+    }
     std::fs::rename(&part, path).map_err(io(path))
+}
+
+fn held(part: &Path) -> u64 {
+    std::fs::metadata(part).map_or(0, |m| m.len())
+}
+
+/// Adds the rest of `url` to `part`.
+fn resume(url: &str, part: &Path, token: Option<&str>) -> Result<(), Error> {
+    let have = held(part);
+    let response = match get_from(url, token, have) {
+        Err(e) if matches!(*e, ureq::Error::Status(416, _)) => return Ok(()),
+        other => other.map_err(|e| http(url)(*e))?,
+    };
+    let mut file = match response.status() {
+        206 => std::fs::OpenOptions::new().append(true).open(part),
+        _ => std::fs::File::create(part),
+    }
+    .map_err(io(part))?;
+    let mut reader = response.into_reader();
+    let mut buf = vec![0; 1 << 16];
+    let (mut since, mut brought) = (Instant::now(), 0);
+    loop {
+        let n = reader.read(&mut buf).map_err(io(part))?;
+        if n == 0 {
+            return Ok(());
+        }
+        file.write_all(&buf[..n]).map_err(io(part))?;
+        brought += n as u64;
+        if since.elapsed() >= WINDOW {
+            if brought < FLOOR {
+                return Err(Error::Http(url.into(), "slow connection".into()));
+            }
+            (since, brought) = (Instant::now(), 0);
+        }
+    }
 }
 
 fn http(url: &str) -> impl FnOnce(ureq::Error) -> Error + '_ {

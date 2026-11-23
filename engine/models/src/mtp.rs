@@ -1,10 +1,11 @@
 //! Multi-Token Prediction (MTP) one-layer MLA drafter.
 
+use crate::dflash_shard::{adopt_split, insert_stage, shard_topk, split_weight};
 use crate::mla::{self, Attention, Config, Index, Indexer, Routed};
 use crate::shared::Steps;
 use tessera_graph::{
-    Graph, Node, NodeId, Numerics, Op, Parts, PathSeg, Placement, Row as GraphRow, Sharded, Shares,
-    Stage, VerifyError, infer, shard_mode, verify,
+    Graph, NodeId, Op, Parts, PathSeg, Placement, Sharded, Shares, Stage, VerifyError, shard_mode,
+    verify,
 };
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -107,7 +108,7 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     ])
 }
 
-/// Shards an MTP graph, splitting `eh_proj` across ranks.
+/// Shards an MTP graph, splitting `eh_proj` and local argmax.
 pub fn shard(
     g: &Graph,
     parts: &Parts,
@@ -116,6 +117,7 @@ pub fn shard(
 ) -> Result<Sharded, VerifyError> {
     let mut sharded = shard_mode(g, parts, shares, moe_tp)?;
     split_eh_proj(&mut sharded.graph, parts, shares);
+    shard_topk(&mut sharded.graph, parts, shares);
     sharded
         .whole
         .retain(|w| sharded.graph.weights[w.weight as usize].ty.placement == Placement::Replicated);
@@ -134,74 +136,14 @@ fn split_eh_proj(g: &mut Graph, parts: &Parts, shares: &Shares) {
         };
         let wt = &g.weights[w as usize];
         let is_eh = matches!(wt.path.as_slice(), [PathSeg::Field(f)] if f == "eh_proj");
-        (is_eh && wt.ty.placement == Placement::Replicated).then_some((NodeId(i as u32), w))
+        (is_eh && wt.ty.placement == Placement::Replicated).then_some((NodeId(i as u32), n.args[1]))
     });
-    let Some((at, w)) = target else {
+    let Some((at, w_node)) = target else {
         return;
     };
-    let val = |d: &DimExpr| d.value(&g.dims, &|_| None).map(|v| v as usize);
-    let Some(sizes) = g.weights[w as usize]
-        .ty
-        .shape
-        .0
-        .iter()
-        .map(val)
-        .collect::<Option<Vec<_>>>()
-    else {
-        return;
-    };
-    let Some(counts) = parts.counts(sizes[0]) else {
-        return;
-    };
-    if counts.iter().any(|&c| !shares(w, &sizes, 0, c)) {
-        return;
-    }
     let mut tried = g.clone();
-    tried.weights[w as usize].ty.placement = Placement::Split { axis: 0 };
-    let new = NodeId(at.0 + 1);
-    let shift = |n: &mut NodeId| {
-        if *n >= new {
-            n.0 += 1;
-        } else if *n == at {
-            *n = new;
-        }
-    };
-    for node in &mut tried.nodes[new.0 as usize..] {
-        node.args.iter_mut().for_each(shift);
-    }
-    let gather = Node {
-        op: Op::Row(GraphRow(vec![Stage::AllGather])),
-        args: vec![at],
-        ty: tried.node(at).ty.clone(),
-        numerics: Some(Numerics::default()),
-    };
-    tried.nodes.insert(new.0 as usize, gather);
-    for e in &mut tried.entries {
-        for o in &mut e.outputs {
-            shift(&mut o.node);
-        }
-    }
-    for r in &mut tried.regions {
-        if r.start >= new {
-            r.start.0 += 1;
-        }
-        if r.end >= new {
-            r.end.0 += 1;
-        }
-        r.inputs.iter_mut().chain(&mut r.outputs).for_each(shift);
-    }
-    for i in 0..tried.nodes.len() {
-        let args: Vec<_> = tried.nodes[i]
-            .args
-            .iter()
-            .map(|a| &tried.node(*a).ty)
-            .collect();
-        let Ok(ty) = infer(&tried, &tried.nodes[i].op, &args) else {
-            return;
-        };
-        tried.nodes[i].ty = ty;
-    }
-    if verify(&tried).is_ok() {
-        *g = tried;
+    if split_weight(&mut tried, w_node, 0) {
+        insert_stage(&mut tried, at, Stage::AllGather);
+        adopt_split(g, tried, parts, shares);
     }
 }
