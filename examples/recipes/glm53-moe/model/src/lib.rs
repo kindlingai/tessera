@@ -1,12 +1,13 @@
-//! GLM-5.3's routed block as one CUDA kernel.
+//! GLM-5.3's routed block as fused CUDA kernels.
 
 use tessera_guest::output;
 use tessera_guest::site::{self, Count, Input, Kind, Manifest, Offer, Place, Shape, Site};
 
 const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
-const EXPERTS: &str = "glm53_experts";
-const EXPERTS1: &str = "glm53_experts1";
+const PLAN: &str = "glm53_plan";
+const FC1: &str = "glm53_fc1";
+const FC2: &str = "glm53_fc2";
 const FINISH: &str = "glm53_finish";
 
 /// The weights after the rows, in kernel argument order.
@@ -27,11 +28,11 @@ const ROUTED: [&str; 13] = [
 ];
 const SHARED: [&str; 3] = ["shared.gate", "shared.up", "shared.down"];
 
-/// Rows one expert block takes, as `ROWS` in `moe.cu`.
-const ROWS: usize = 4;
 /// Past these, the linked rules serve better or `moe.cu` cannot.
 const MOST_ROWS: usize = 16;
 const MOST_EXPERTS: usize = 2048;
+/// Words in `Plan` struct in `moe.cu`.
+const PLAN_WORDS: usize = 1 + 128 + 128 + 128 * 8 + 128 * 8 + 16 * 8 + 16 * 8;
 
 /// Experts each row takes, by expert count.
 fn picks(experts: usize) -> Option<u32> {
@@ -40,6 +41,22 @@ fn picks(experts: usize) -> Option<u32> {
         32 => Some(2),
         _ => None,
     }
+}
+
+/// Largest divisor of `blocks / 8` up to `want`.
+fn split_dim(blocks: usize, want: usize) -> usize {
+    if !blocks.is_multiple_of(8) {
+        return 1;
+    }
+    let groups = blocks / 8;
+    let mut d = want.min(groups);
+    while d > 1 {
+        if groups.is_multiple_of(d) {
+            return d;
+        }
+        d -= 1;
+    }
+    1
 }
 
 /// A trellis form's width and codebook: 0 mcg, 1 mul1.
@@ -89,7 +106,7 @@ fn held(routed: &[Input], experts: usize, ffn: usize) -> Option<[usize; 2]> {
     ok.then_some([0, experts])
 }
 
-/// Route, experts, then finish over a rotated routed block.
+/// Route, plan, fc1, fc2, then finish over a routed block.
 fn offer(site: &Site) -> Option<Vec<Offer>> {
     let Site::Region {
         kind: Kind::Moe,
@@ -129,8 +146,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let codes = [&routed[4], &routed[7], &routed[10]];
     let [first, count] = held(routed, experts, ffn)?;
-    let [inner, _] = shared[0].parts?;
-    let wide = shared[0].parts?[1];
+    let [inner, wide] = shared[0].parts?;
     let sized = routed[0].shape == [experts, hidden]
         && inner == hidden
         && shared[1].parts == shared[0].parts
@@ -159,96 +175,137 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let [k, book] = width(&codes)?;
     let [shared_k, shared_book] = width(&shared.iter().collect::<Vec<_>>())?;
-    let picks = picks(experts)?;
+    let picks = picks(experts)? as usize;
     let fixed = |n: &[usize]| n.iter().map(|&n| Count::Fixed(n as u32)).collect();
     let part = |i: usize, p: usize| Place::Part {
         part: [1 + ROUTED.len() + i, p],
     };
     let scores = Place::Draft { draft: 0 };
+    let plan = Place::Draft { draft: 1 };
+    let gpart = Place::Draft { draft: 2 };
+    let z = Place::Draft { draft: 3 };
+    let chunks = ffn / 128;
+    let ibs = hidden / 128;
+    let ks1 = split_dim(ibs, if rows == 1 { 6 } else { 3 });
+    let ns2 = split_dim(ibs, if rows == 1 { 6 } else { 2 });
+    let n_sh = rows.div_ceil(8);
+    let max_routed = (count * n_sh).min(rows * picks);
+    let total_slots = n_sh + max_routed;
+    let max_col = rows.min(8);
     let route = Offer {
         kernel: ROUTE,
         reads: vec![Place::Read(0), Place::Read(1)],
         len: rows * experts,
         counts: fixed(&[rows, hidden, experts, bf16]),
         shape: Shape::Grid {
-            across: experts.div_ceil(2),
+            across: experts,
             down: 1,
-            threads: 64,
+            threads: 256,
         },
         work: (rows * experts * hidden) as f64,
         guess: 1e-12,
         writes: None,
         resident: None,
     };
-    let reads = [Place::Read(0), scores].into_iter();
-    let reads = reads.chain((2..=11).map(Place::Read));
-    let reads = reads.chain((0..2).flat_map(|i| (0..3).map(move |p| part(i, p))));
-    let groups = rows.div_ceil(ROWS);
-    let slots = count.min(ROWS.min(rows) * picks as usize) + 1;
-    let experts_offer = Offer {
-        kernel: if rows == 1 && hidden >= 1024 {
-            EXPERTS1
-        } else {
-            EXPERTS
-        },
-        reads: reads.chain([part(2, 0), part(2, 1)]).collect(),
-        len: rows * (picks as usize + 1) * (ffn / 128) * hidden,
-        counts: fixed(&[
-            rows,
-            hidden,
-            ffn,
-            experts,
-            picks as usize,
-            k as usize,
-            shared_k as usize,
-            book as usize,
-            shared_book as usize,
-            first,
-            count,
-            wide,
-        ]),
+    let plan_offer = Offer {
+        kernel: PLAN,
+        reads: vec![scores, Place::Read(2)],
+        len: PLAN_WORDS,
+        counts: fixed(&[rows, experts, picks, first, count]),
         shape: Shape::Grid {
-            across: ffn / 128,
-            down: groups * slots,
+            across: 1,
+            down: 1,
             threads: 256,
         },
-        work: (groups * slots * 3 * hidden * ffn) as f64,
+        work: (rows * experts) as f64,
+        guess: 1e-12,
+        writes: None,
+        resident: None,
+    };
+    let fc_counts = [
+        rows,
+        hidden,
+        ffn,
+        picks,
+        k as usize,
+        shared_k as usize,
+        book as usize,
+        shared_book as usize,
+        first,
+        wide,
+        ks1,
+    ];
+    let mut fc2_counts = fc_counts.to_vec();
+    fc2_counts.push(ns2);
+    let fc1 = Offer {
+        kernel: FC1,
+        reads: vec![
+            Place::Read(0),
+            plan,
+            Place::Read(3),
+            Place::Read(4),
+            Place::Read(5),
+            Place::Read(7),
+            Place::Read(8),
+            part(0, 0),
+            part(0, 1),
+            part(1, 0),
+            part(1, 1),
+        ],
+        len: total_slots * chunks * 2 * ks1 * max_col * 128,
+        counts: fixed(&fc_counts),
+        shape: Shape::Grid {
+            across: chunks * 2 * ks1,
+            down: total_slots,
+            threads: 256,
+        },
+        work: (total_slots * 2 * hidden * ffn) as f64,
+        guess: 1e-15,
+        writes: None,
+        resident: None,
+    };
+    let fc2 = Offer {
+        kernel: FC2,
+        reads: vec![
+            plan,
+            gpart,
+            Place::Read(6),
+            Place::Read(9),
+            Place::Read(10),
+            Place::Read(11),
+            part(0, 2),
+            part(1, 2),
+            part(2, 0),
+            part(2, 1),
+        ],
+        len: rows * (picks + 1) * chunks * hidden / 2,
+        counts: fixed(&fc2_counts),
+        shape: Shape::Grid {
+            across: chunks * ns2,
+            down: total_slots,
+            threads: 256,
+        },
+        work: (total_slots * hidden * ffn) as f64,
         guess: 1e-15,
         writes: None,
         resident: None,
     };
     let finish = Offer {
         kernel: FINISH,
-        reads: vec![
-            scores,
-            Place::Read(2),
-            Place::Read(12),
-            Place::Read(13),
-            part(2, 2),
-            Place::Draft { draft: 1 },
-        ],
+        reads: vec![plan, Place::Read(12), Place::Read(13), part(2, 2), z],
         len,
-        counts: fixed(&[
-            rows,
-            hidden,
-            ffn,
-            experts,
-            picks as usize,
-            first,
-            count,
-            wide,
-        ]),
+        counts: fixed(&[rows, hidden, ffn, picks, wide]),
         shape: Shape::Grid {
             across: hidden / 128,
             down: rows,
-            threads: 128,
+            threads: (picks + 1) * 32,
         },
         work: len as f64,
         guess: 1e-12,
         writes: None,
         resident: None,
     };
-    Some(vec![route, experts_offer, finish])
+    Some(vec![route, plan_offer, fc1, fc2, finish])
 }
 
 #[unsafe(no_mangle)]
@@ -260,7 +317,7 @@ pub extern "C" fn alloc(len: i32) -> i32 {
 pub extern "C" fn manifest() -> i64 {
     let manifest = Manifest {
         abi: tessera_guest::ABI,
-        kernels: [ROUTE, EXPERTS, EXPERTS1, FINISH]
+        kernels: [ROUTE, PLAN, FC1, FC2, FINISH]
             .map(|k| site::imports(k, k, "moe.cu"))
             .into(),
         rules: vec![site::Rule {

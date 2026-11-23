@@ -13,13 +13,19 @@ use tessera_lower::form::{Load, named};
 use tessera_lower::{Cluster, Device, Limits, Pins, Platform, Rule, Weight, lower};
 use tessera_models::mla::{Config, RotatedMoe, Routed, stepper};
 use tessera_recipe::Recipe;
-use tessera_run::open;
+use tessera_run::Loopback;
 use tessera_run::testing::{host, runs};
 use tessera_testkit::{Noise, cosine_f32, max_abs_diff, weights};
 use tessera_trace::{DType, Dim, EntryKind, Graph, Model, Port, Role, TensorType, Weights};
 
 const NAME: &str = "glm53_moe";
-const KERNELS: [&str; 3] = ["glm53_route", "glm53_experts", "glm53_finish"];
+const KERNELS: [&str; 5] = [
+    "glm53_route",
+    "glm53_plan",
+    "glm53_fc1",
+    "glm53_fc2",
+    "glm53_finish",
+];
 const TEXT: &str = include_str!("../../../../examples/recipes/glm53-moe/model/src/moe.cu");
 const ROWS: usize = 3;
 
@@ -63,11 +69,6 @@ fn choices() -> tessera_lower::Recipe {
 #[derive(Weights)]
 struct Block {
     moe: RotatedMoe,
-}
-
-/// One routed block alone, over rows.
-fn block() -> Graph {
-    block_of(&small())
 }
 
 /// One routed block of `c` alone, over rows.
@@ -159,14 +160,14 @@ fn takes_routed(book: &str, id: u32) {
     // The dense layer keeps the linked rules.
     let routed = (c.stack.layers - c.dense_layers) as usize;
     assert_eq!(kernels, KERNELS.repeat(routed));
-    for step in taken.iter().filter(|s| s.kernel.name() == KERNELS[1]) {
+    for step in taken.iter().filter(|s| s.kernel.name() == KERNELS[2]) {
         let launches = step.launches();
         let [launch] = launches.as_slice() else {
             panic!("one launch a step");
         };
-        assert_eq!(launch.args.len(), parameters(KERNELS[1]));
+        assert_eq!(launch.args.len(), parameters(KERNELS[2]));
         let counts: Vec<u32> = launch.args.iter().filter_map(|a| a.u32()).collect();
-        let sizes = [ROWS as u32, 128, 128, 32, 2, 4, 4, id, id, 0, 32, 128];
+        let sizes = [ROWS as u32, 128, 128, 2, 4, 4, id, id, 0, 128, 1];
         assert_eq!(counts, sizes);
     }
 }
@@ -192,17 +193,13 @@ fn module_takes_shards() {
         let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
         for rank in 0..2u32 {
             let plan = lower(&sharded, 0, &sizes, &device.clone().as_rank(rank)).unwrap();
-            let experts = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
+            let planned = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
             let mut taken = 0;
-            for step in experts {
+            for step in planned {
                 let launches = step.launches();
                 let counts: Vec<u32> = launches[0].args.iter().filter_map(|a| a.u32()).collect();
-                let want = if tp {
-                    [0, 32, (ffn / 2) as u32]
-                } else {
-                    [16 * rank, 16, (ffn / 2) as u32]
-                };
-                assert_eq!(counts[9..], want);
+                let want = if tp { [0, 32] } else { [16 * rank, 16] };
+                assert_eq!(counts[3..], want);
                 taken += 1;
             }
             assert_eq!(taken, routed);
@@ -255,12 +252,19 @@ fn module_reaches_engine() {
     }
 }
 
+const CASES: [(&str, bool, bool); 4] = [
+    ("", false, false),
+    ("_mul1", false, false),
+    ("_mul1", true, false),
+    ("_mul1", false, true),
+];
+
 /// On a CUDA GPU alone: the kernel is CUDA text.
 #[test]
 fn module_matches_interp() {
     // The release stores its router as bf16.
-    for (book, bf16) in [("", false), ("_mul1", false), ("_mul1", true)] {
-        matches_interp(book, bf16);
+    for (book, bf16, tp) in CASES {
+        matches_interp(book, bf16, tp);
     }
 }
 
@@ -271,8 +275,13 @@ fn bf16(v: f32) -> f32 {
 }
 
 /// The kernel against the interpreter, with codes in codebook `book`.
-fn matches_interp(book: &str, router_bf16: bool) {
-    let g = block();
+fn matches_interp(book: &str, router_bf16: bool, tp: bool) {
+    let mut c = small();
+    if tp {
+        c.stack.hidden = 1024;
+        c.stack.ffn = 512;
+    }
+    let g = block_of(&c);
     let mut draws = Noise(7);
     let mut stored = stored(&g, &mut draws, book);
     let mut pins = pins(book);
@@ -281,36 +290,71 @@ fn matches_interp(book: &str, router_bf16: bool) {
         let at = g
             .weights
             .iter()
-            .position(|w| pins.form(&w.path).name() == "bf16");
-        let (t, _) = &mut stored[at.unwrap()];
-        *t = Tensor::f32(
-            t.shape.clone(),
-            t.floats().unwrap().iter().map(|v| bf16(*v)).collect(),
-        );
+            .position(|w| pins.form(&w.path).name() == "bf16")
+            .unwrap();
+        let vals = stored[at]
+            .0
+            .floats()
+            .unwrap()
+            .iter()
+            .map(|v| bf16(*v))
+            .collect();
+        stored[at].0 = Tensor::f32(stored[at].0.shape.clone(), vals);
     }
     let floats: Vec<Tensor> = stored.iter().map(|(t, _)| t.clone()).collect();
-    let hidden = small().stack.hidden as usize;
-    let noise = (0..ROWS * hidden).map(|_| draws.draw()).collect();
-    let x = Tensor::f32(vec![ROWS, hidden], noise);
-    let want = run(&g, &floats, 0, std::slice::from_ref(&x)).unwrap();
-    let want = want[0].floats().unwrap();
-    for settings in runs().iter().filter(|s| s.gpu() == Some(Backend::Cuda)) {
-        let device = Device::guess(settings).adding(rule()).pinned(pins.clone());
-        let plan = lower(&g, 0, &[(Rows, ROWS as u64)], &device).unwrap();
-        let names: Vec<&str> = plan.steps.iter().map(|s| s.rule).collect();
-        assert_eq!(names, [NAME; 3]);
-        let mut runner = open(plan, settings).unwrap();
-        for (at, (floats, packed)) in stored.iter().enumerate() {
-            match packed {
-                Some(p) => runner.load_weight(at as u32, p).unwrap(),
-                None => runner.load(at as u32, floats.view()).unwrap(),
+    let hidden = c.stack.hidden as usize;
+    let sharded = tp.then(|| {
+        tessera_graph::shard_mode(&g, &Parts::even(2), &|_, _, _, _| true, true)
+            .unwrap()
+            .graph
+    });
+    for &rows in if tp {
+        &[1usize, 8, 12][..]
+    } else {
+        &[ROWS][..]
+    } {
+        let gain = if tp { 0.25 } else { 1.0 };
+        let x = Tensor::f32(
+            vec![rows, hidden],
+            (0..rows * hidden).map(|_| draws.draw() * gain).collect(),
+        );
+        let want = run(&g, &floats, 0, std::slice::from_ref(&x)).unwrap();
+        let want = want[0].floats().unwrap();
+        for settings in runs().iter().filter(|s| s.gpu() == Some(Backend::Cuda)) {
+            let mut dev = Device::guess(settings).adding(rule()).pinned(pins.clone());
+            let mut plans = Vec::new();
+            if let Some(ref sg) = sharded {
+                dev = dev
+                    .favoring(NAME)
+                    .zoned(Cluster::two("a", "b"))
+                    .ranked(vec![0, 1]);
+                for r in 0..2u32 {
+                    plans.push(
+                        lower(sg, 0, &[(Rows, rows as u64)], &dev.clone().as_rank(r)).unwrap(),
+                    );
+                }
+                assert!(plans.iter().all(|p| p.steps.iter().any(|s| s.rule == NAME)));
+            } else {
+                let p = lower(&g, 0, &[(Rows, rows as u64)], &dev).unwrap();
+                assert_eq!(
+                    p.steps.iter().map(|s| s.rule).collect::<Vec<_>>(),
+                    [NAME; 5]
+                );
+                plans.push(p);
             }
+            let mut r = Loopback::open(&plans, settings).unwrap();
+            for (i, (f, p)) in stored.iter().enumerate() {
+                match p {
+                    Some(p) => r.load_weight(i as u32, p).unwrap(),
+                    None => r.load(i as u32, f.view()).unwrap(),
+                }
+            }
+            let got = r.run(&[x.view()]).unwrap().remove(0);
+            let got = got.floats().unwrap();
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let (off, cos) = (max_abs_diff(got, want) / scale, cosine_f32(got, want));
+            eprintln!("{book} tp={tp} rows={rows}: off {off:e} cos {cos}");
+            assert!(off < 1e-3 && cos > 0.9999, "off {off:e} cos {cos}");
         }
-        let got = runner.run(&[x.view()]).unwrap().remove(0);
-        let got = got.floats().unwrap();
-        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let (off, cos) = (max_abs_diff(got, want) / scale, cosine_f32(got, want));
-        eprintln!("{}{book}: off {off:e} cos {cos}", runner.device());
-        assert!(off < 1e-3 && cos > 0.9999, "off {off:e} cos {cos}");
     }
 }
