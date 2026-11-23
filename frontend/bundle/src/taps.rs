@@ -1,12 +1,12 @@
 //! A decoder's residual rows after chosen layers, as text features.
 
+use crate::arch::family;
 use crate::tokenize::hf::Hf;
 use crate::{Overrides, Template, config, pull};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
-use tessera_engine::decoder::{Swiglu, taps};
-use tessera_engine::{Graph, Norm, Pins, Weight};
+use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -41,11 +41,7 @@ pub fn tapped(
         return Err(format!("layer {deepest} of {}", config.stack.layers).into());
     }
     config.stack.layers = deepest;
-    let graph = match arch.as_str() {
-        "qwen3" => taps::<Norm, Swiglu>(&config, layers),
-        "llama" => taps::<(), Swiglu>(&config, layers),
-        _ => return Err(format!("{arch} has no taps here").into()),
-    };
+    let graph = (family(&arch)?.taps)(&config, layers);
     let (weights, pins) = pull(&graph, &Shards::open(dir)?, deepest, &[])?;
     let tokenizer = Hf::open(&words.join("tokenizer.json"))?;
     let template = Template::load(words)?.ok_or("no chat template")?;

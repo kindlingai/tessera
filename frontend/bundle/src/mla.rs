@@ -1,13 +1,29 @@
 //! DeepSeek-style releases: config, weight names, weights.
 
+use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{each, pins};
+use crate::{WIDTH, Weights, each, is_exlr8, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Shards};
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
+
+/// Whether `json` reads as a DeepSeek-style config.
+fn probe(json: &str) -> bool {
+    config(json, 1, 1).is_ok()
+}
+
+fn step(_: &Arch, ask: &Ask) -> Result<Built, Box<dyn Error + Send + Sync>> {
+    let step = Some((ask.user, ask.steps, ask.taps));
+    let (dir, json) = (ask.dir, Some(ask.json));
+    let release = open(dir, json, ask.sizes, WIDTH, ask.manifest, step)?;
+    let (graph, pins) = (release.graph.clone(), release.pins.clone());
+    Ok((graph, Weights::Streamed(Box::new(release)), pins))
+}
+
+arch!("mla", [Spot::Probe(probe)], step: step);
 
 /// The `config.json` keys a DeepSeek-V3 release sets.
 #[derive(Deserialize)]
@@ -236,25 +252,6 @@ pub fn release(
     open(dir, None, [seqs, context], width, None, None)
 }
 
-/// The step graph of `dir`. The `user` rules go last.
-pub(crate) fn stepping(
-    (dir, json, manifest): (&Path, &str, Option<&str>),
-    sizes: [u64; 2],
-    width: u32,
-    user: &[Rule],
-    steps: Steps,
-    taps: &[u64],
-) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(
-        dir,
-        Some(json),
-        sizes,
-        width,
-        manifest,
-        Some((user, steps, taps)),
-    )
-}
-
 /// A `step` sets the graph's rules, mask and taps.
 fn open(
     dir: &Path,
@@ -273,7 +270,7 @@ fn open(
         }
     };
     let mut config = config(json, seqs, context)?;
-    let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
+    let exlr8 = is_exlr8(dir);
     let mut rules = rules(&config, exlr8);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
