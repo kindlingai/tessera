@@ -43,7 +43,8 @@ use tessera_checkpoint::{Offer, Shards, Stored, exlr8};
 use tessera_engine::decoder::Config;
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Pins, Steps, Tensor, Weight};
+use tessera_engine::wasm::Module;
+use tessera_engine::{DimName, Graph, Pins, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -449,6 +450,34 @@ pub(crate) fn held(
     let offer = offer(ask.dir, ask.manifest)?;
     let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[rules, ask.user])?;
     Ok((graph, Weights::Held(weights), pins))
+}
+
+/// A module's step graph over `dir`'s weights, if built.
+pub fn load_module(
+    dir: &Path,
+    sizes: [u64; 2],
+    user: &[Rule],
+    overrides: &Overrides,
+    module: &Module,
+) -> Result<Option<Bundle>, Box<dyn Error + Send + Sync>> {
+    let json = overrides.merged("config.json", &dir.join("config.json"))?;
+    let Some(graph) = module.graph(&json, sizes[0], Some(sizes[1]))? else {
+        return Ok(None);
+    };
+    let layers = graph.dims.iter().find(|d| d.name == DimName::Layers);
+    let layers = layers.map_or(0, |d| d.size.max());
+    let ask = arch::Ask {
+        dir,
+        sizes,
+        user,
+        steps: Steps::Plain,
+        overrides,
+        manifest: None,
+        taps: &[],
+        json: &json,
+    };
+    let (graph, weights, pins) = held(&ask, graph, layers, &[])?;
+    dressed(dir, graph, weights, pins, Some(json)).map(Some)
 }
 
 /// `dir`'s exlr8 release at `name`, or its only manifest.
