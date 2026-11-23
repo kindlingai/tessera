@@ -6,6 +6,7 @@ mod flatten_test;
 pub mod layout;
 #[cfg(test)]
 mod layout_test;
+mod linear;
 pub mod proxy;
 #[cfg(test)]
 mod proxy_test;

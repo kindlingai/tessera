@@ -1855,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "tessera-engine-comm",
  "tessera-gpukit",
+ "tessera-graph",
  "tessera-lower",
  "tessera-run",
  "tessera-testkit",
@@ -2258,6 +2259,7 @@ version = "0.1.0"
 dependencies = [
  "tessera-attention",
  "tessera-cpu",
+ "tessera-device",
  "tessera-kernels",
  "tessera-linear",
 ]
