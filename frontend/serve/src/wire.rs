@@ -299,6 +299,7 @@ impl From<Said> for Message {
 #[derive(Deserialize, Default)]
 pub(crate) struct Kwargs {
     pub(crate) enable_thinking: Option<bool>,
+    pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
     extra: Bag,
 }

@@ -2,7 +2,7 @@
 
 use crate::Error;
 use crate::grid::{self, Grid};
-use crate::kernels::{Kernels, dialect};
+use crate::kernels::Kernels;
 use crate::marks;
 use crate::overrides::{self, Overrides};
 use crate::profile::Marks;
@@ -11,9 +11,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::Settings;
+use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_graph::DimName;
@@ -65,7 +67,7 @@ const HELD: usize = 256;
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
-        let files = |dir: &PathBuf| Overrides::new(dir.clone(), dialect(D::BACKEND));
+        let files = |dir: &PathBuf| Overrides::new(dir.clone(), Dialect::of(D::BACKEND));
         let mut runner = Self {
             ctx,
             base: Base::new(settings.memory, &ctx.platform()),
@@ -613,11 +615,31 @@ fn step_layout(plan: &Plan, step: &Step) -> grid::Layout {
     }
 }
 
-/// Pinned host memory from the shared context.
-#[cfg(any(feature = "cuda", feature = "rocm"))]
-pub(crate) struct Pin<D: Device>(pub(crate) &'static D);
+/// Opens a runner on the context type `on` names.
+pub(crate) struct Open<'a>(pub(crate) Plan, pub(crate) &'a Settings);
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl OnGpu for Open<'_> {
+    type Out = Result<Box<dyn Run>, Error>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        Ok(Box::new(Runner::<D>::new(self.0, self.1)?))
+    }
+}
+
+/// Pins host memory through the shared context.
+pub(crate) struct Pins;
+
+impl OnGpu for Pins {
+    type Out = Option<Arc<dyn tessera_engine_comm::Pinning>>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        Some(Arc::new(Pin(cached_context::<D>().ok()?)))
+    }
+}
+
+/// Pinned host memory from the shared context.
+struct Pin<D: Device>(&'static D);
+
 impl<D: Device> tessera_engine_comm::Pinning for Pin<D> {
     fn pin(&self, len: usize) -> Result<tessera_engine_comm::Pinned, tessera_engine_comm::Error> {
         let (host, device) = self
@@ -695,7 +717,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn marks(&mut self, step: usize) -> Result<Option<Marks>, Error> {
-        if dialect(D::BACKEND) == Dialect::Metal {
+        if Dialect::of(D::BACKEND) == Dialect::Metal {
             return Ok(None);
         }
         if self.resident[step] {
@@ -794,7 +816,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn precision(&self) -> tessera_codegen::Precision {
-        crate::precision(D::BACKEND)
+        tessera_codegen::Precision::of(D::BACKEND)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

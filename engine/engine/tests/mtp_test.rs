@@ -6,9 +6,10 @@ use common::{collect_ids, float_weights, loopback_links, open_ranked_target, ope
 use tessera_engine::{
     Drafter, Event, MtpDrafter, MtpSpeculate, Place, Reason, Recipe, Request, SpecStats,
 };
-use tessera_graph::{Graph, Parts, PathSeg};
-use tessera_interp::Tensor;
-use tessera_lower::{Cluster, Pick, Settings, Weight};
+use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs, Vocab};
+use tessera_graph::{Graph, Parts, PathSeg, Role};
+use tessera_interp::{Tensor, run, run_ranks};
+use tessera_lower::{Cache, Cluster, Device, Pick, Settings, Wants, Weight};
 use tessera_models::{mla, mtp, small};
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
@@ -191,11 +192,91 @@ fn mtp_matches_greedy() {
     assert!(stats.accepted > 0 && stats.steps < stats.emitted);
 }
 
+fn plan_gathers(g: &Graph, parts: &Parts, rows: u64, wants: Wants) -> Vec<usize> {
+    let mut dev = Device::guess(&Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    });
+    dev = dev
+        .zoned(Cluster::two("a", "b"))
+        .ranked(vec![0, 1])
+        .uneven(parts.0.clone())
+        .as_rank(0);
+    let mut cache = Cache::default();
+    let dims = [(Seqs, 1), (Rows, rows), (Context, rows), (Segments, 1)];
+    let (plan, _) = cache
+        .wanting(g, 0, wants, &dims, &[Context, Segments], &dev)
+        .unwrap();
+    let mut out = Vec::new();
+    for step in &plan.steps {
+        if step.kernel.name() == "all_gather" {
+            out.push(step.write.len);
+        }
+    }
+    out
+}
+
+fn verify_local_argmax(g: &Graph, seed: u64, moe_tp: bool) {
+    let parts = Parts::even(2);
+    let sharded = mtp::shard(g, &parts, &|_, _, _, _| true, moe_tp)
+        .unwrap()
+        .graph;
+    let dim = |name| g.dims.iter().find(|d| d.name == name).unwrap().size.max() as usize;
+    let (vocab, hidden) = (dim(Vocab), dim(Hidden));
+    let w = weights(g, &mut Noise(seed));
+    let mut tied = w.clone();
+    let head = g
+        .weights
+        .iter()
+        .position(|wt| matches!(wt.path.last(), Some(PathSeg::Field(f)) if f == "head"))
+        .unwrap();
+    tied[head] = Tensor::f32(tied[head].shape.clone(), vec![0.0; tied[head].len()]);
+    for rows in [1usize, 3] {
+        let feeds = vec![
+            Tensor::u32(vec![rows], (0..rows as u32).map(|i| i + 1).collect()),
+            Tensor::u32(vec![rows], (0..rows as u32).collect()),
+            Tensor::u32(vec![rows], vec![0; rows]),
+            Tensor::f32(vec![rows, hidden], vec![0.25; rows * hidden]),
+            Tensor::f32(vec![rows, 1], vec![1.0; rows]),
+        ];
+        let want = run(g, &w, 0, &feeds).unwrap();
+        let got = run_ranks(&sharded, &w, 0, &feeds, 2).unwrap();
+        assert_eq!(got[0].indices().unwrap(), want[0].indices().unwrap());
+        let want_tie = run(g, &tied, 0, &feeds).unwrap();
+        let got_tie = run_ranks(&sharded, &tied, 0, &feeds, 2).unwrap();
+        assert_eq!(
+            got_tie[0].indices().unwrap(),
+            want_tie[0].indices().unwrap()
+        );
+    }
+    for rows in [1u64, 4] {
+        let expect = vec![rows as usize * hidden, 2 * rows as usize * 2];
+        for wants in [
+            Wants::role(&sharded, 0, Role::Tokens),
+            Wants::roles(&sharded, 0, &[Role::Tokens, Role::Taps]),
+        ] {
+            let gathers = plan_gathers(&sharded, &parts, rows, wants);
+            assert_eq!(gathers, expect, "rows={rows}");
+            assert!(!gathers.contains(&(rows as usize * vocab)), "rows={rows}");
+        }
+        let logits_gathers = plan_gathers(
+            &sharded,
+            &parts,
+            rows,
+            Wants::role(&sharded, 0, Role::Logits),
+        );
+        assert!(logits_gathers.contains(&(rows as usize * vocab)));
+    }
+}
+
 #[test]
 fn mtp_tp_matches_baseline() {
-    let t_cfg = mla_cfg(true, 512);
+    let mut t_cfg = mla_cfg(true, 512);
+    t_cfg.stack.vocab = 128;
     let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
     let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, true));
+    verify_local_argmax(&m_graph, 67, false);
+    verify_local_argmax(&m_graph, 73, true);
     run_tp_pair(&t_graph, 61, &m_graph, 67, 2, false);
     run_tp_pair(&t_graph, 71, &m_graph, 73, 3, true);
 }

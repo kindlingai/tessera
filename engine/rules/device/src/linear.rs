@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 const KERNEL: &str = include_str!("linear.cu");
@@ -34,7 +34,7 @@ pub(crate) fn cuda_source() -> &'static str {
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
-    HIP.get_or_init(|| flat(Backend::Hip))
+    HIP.get_or_init(|| flat(Backend::Rocm))
 }
 
 fn parse_trellis(name: &str) -> Option<(u32, u32)> {
@@ -394,16 +394,14 @@ fn cuda_needs(group_bytes: usize) -> Needs {
         group_bytes,
         group_threads: THREADS,
         compiler: true,
-        lacks: &["metal", "rocm"],
+        lacks: &[Backend::Metal, Backend::Rocm],
         ..Needs::default()
     }
 }
 
 fn cuda_source_entry(entry: &'static str) -> Source {
     Source::Fixed {
-        metal: "",
-        cuda: cuda_source(),
-        hip: "",
+        text: ByBackend(["", cuda_source(), ""]),
         entry,
     }
 }
@@ -752,7 +750,7 @@ fn mm_needs(k: &FastMm) -> Needs {
         group_bytes: k.kind.smem(),
         group_threads: 128,
         compiler: true,
-        lacks: &["metal", "rocm"],
+        lacks: &[Backend::Metal, Backend::Rocm],
         bf16_tile: true,
         ..Needs::default()
     }

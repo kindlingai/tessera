@@ -79,7 +79,7 @@ impl Context {
         driver.check(asked, "cuDeviceTotalMem")?;
         let integrated = attr(CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0;
         let platform = Platform::new(Asked {
-            backend: "cuda",
+            backend: crate::backend::Backend::Cuda.name(),
             arch: format!("sm_{major}{minor}"),
             name: name.clone(),
             // 13000 is `13.0`.

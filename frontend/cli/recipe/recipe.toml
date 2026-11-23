@@ -3,9 +3,8 @@
 name = "gemma-4-e4b"
 
 [weights]
-# The loader reads release v0.1. Its per-layer embedding table is BF16.
-# v0.2 stores the table as row trellis codes.
-hf = "kindlingai/gemma-4-e4b-exlr8@5838957397dca48a37874adaa60ba06335e285bc"
+# Release v0.2. Its per-layer embedding table is a K4 row trellis.
+hf = "kindlingai/gemma-4-e4b-exlr8@0f1e200dba737d3f2162950ab04614ebce2ab501"
 
 [serve]
 # 3.09 bits a weight: of the release's profiles, the nearest to BF16.

@@ -1,7 +1,7 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
 use crate::file::{Error, File};
-use crate::offer::{Offer, Slice, Stored};
+use crate::offer::{Offer, Slice, Stored, narrow};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ const FP8_BLOCK: i64 = 4;
 const FP8_ROW: i64 = 5;
 const BF16: i64 = 6;
 const FP32: i64 = 7;
+const ROWS: i64 = 9;
 
 /// A matrix's record: format, shape, trellis width, sharded side.
 struct Record {
@@ -48,28 +49,40 @@ fn e4m3(bits: u8) -> f32 {
     f32::from(E4M3(bits))
 }
 
-/// Matrix `name`'s trellis tensor, and the codebook its name gives.
-fn trellis_of(f: &File, name: &str) -> Result<(String, Codebook), Error> {
-    for book in [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx] {
-        let tensor = format!("{name}.trellis{}", book.suffix());
+/// Tensor `stem` in a known codebook, and that codebook.
+fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
+    for book in Codebook::ALL {
+        let tensor = format!("{stem}{}", book.suffix());
         if f.shape(&tensor).is_some() {
             return Ok((tensor, book));
         }
     }
-    Err(Error::Missing(format!(
-        "{name}.trellis in a known codebook"
-    )))
+    Err(Error::Missing(format!("{stem} in a known codebook")))
+}
+
+/// Row trellis `name`, each value through `each`.
+fn rows<T: Clone + Send>(
+    f: &File,
+    name: &str,
+    r: &Record,
+    each: impl Fn(&f32) -> T + Sync,
+) -> Result<Vec<T>, Error> {
+    let (tensor, book) = coded(f, &format!("{name}.rows"))?;
+    let side = |s: &str| halves(f, &format!("{name}.{s}"));
+    let (suh, svh) = (side("suh")?, side("svh")?);
+    let width = || Error::DType(format!("{name}: K{} {book:?}", r.k));
+    trellis::rows(r.k, book, &f.bytes(&tensor)?, [&suh, &svh], each).ok_or_else(width)
 }
 
 /// Trellis matrix `name` packed: a header, then its entries.
 fn packed(f: &File, name: &str, r: &Record) -> Result<Vec<u8>, Error> {
-    let entries = f.bytes(&trellis_of(f, name)?.0)?;
+    let entries = f.bytes(&coded(f, &format!("{name}.trellis"))?.0)?;
     Ok(trellis::packed(r.inp, r.out, r.side as u32, &entries))
 }
 
 /// Trellis matrix `name` as f32 `[out][in]`, before its rotations.
 fn decoded(f: &File, name: &str, r: &Record) -> Result<Vec<f32>, Error> {
-    let book = trellis_of(f, name)?.1;
+    let book = coded(f, &format!("{name}.trellis"))?.1;
     let form = trellis::form_for(r.k, book)
         .ok_or_else(|| Error::DType(format!("{name}: K{} {book:?}", r.k)))?;
     let bytes = packed(f, name, r)?;
@@ -107,7 +120,7 @@ fn codes_packed(f: &File, name: &str, rows: Option<(usize, usize)>) -> Result<Ve
             "{name}: rows {first}.. are not whole entries"
         )));
     }
-    let entries = f.bytes(&trellis_of(f, name)?.0)?;
+    let entries = f.bytes(&coded(f, &format!("{name}.trellis"))?.0)?;
     let at = first / 128 * entry;
     let slice = &entries[at..at + count / 128 * entry];
     Ok(trellis::packed(r.inp, count, r.side as u32, slice))
@@ -144,6 +157,7 @@ fn plain(f: &File, name: &str, r: &Record, format: i64) -> Result<Vec<f32>, Erro
         }
         BF16 => f.floats(&format!("{name}.bf16")),
         FP32 => f.floats(&format!("{name}.fp32")),
+        ROWS => rows(f, name, r, |x| *x),
         other => Err(Error::DType(format!("{name} is in exlr8 format {other}"))),
     }
 }
@@ -320,8 +334,8 @@ impl Release {
         let glm = [
             ("embed_tokens", "model.embed_tokens"),
             ("norm", "model.norm"),
+            ("lm_head", "lm_head"),
         ];
-        let glm = [glm.as_slice(), &[("lm_head", "lm_head")]].concat();
         let hf: Option<String> = self.with(VOCAB, |f| Ok(f.meta("hf_names").map(Into::into)))?;
         let vocab = match hf {
             Some(json) => serde_json::from_str::<HashMap<String, String>>(&json)
@@ -402,13 +416,8 @@ impl Release {
             let need = need.as_str().unwrap_or_default();
             let known = need.split_once(' ').is_some_and(|(width, book)| {
                 let k = width.strip_prefix('k').and_then(|k| k.parse().ok());
-                let book = match book {
-                    "mcg" => Codebook::Mcg,
-                    "mul1" => Codebook::Mul1,
-                    "pmcgx" => Codebook::Pmcgx,
-                    _ => return false,
-                };
-                k.is_some_and(|k| trellis::form_for(k, book).is_some())
+                let found = k.zip(Codebook::named(book));
+                found.is_some_and(|(k, book)| trellis::form_for(k, book).is_some())
             });
             if !known {
                 return Err(bad(format!("needs trellis {need}: this engine lacks it")));
@@ -628,11 +637,12 @@ impl Release {
                 continue;
             };
             let name = |part: &str| shard.name(&format!("{matrix}.{part}"));
-            let (Some(suh), Some(svh)) =
-                (shape(&format!("{stem}.suh")), shape(&format!("{stem}.svh")))
-            else {
+            let r = record(f, stem);
+            let rows = r.as_ref().is_ok_and(|r| r.format == ROWS);
+            let side = |s: &str| shape(&format!("{stem}.{s}")).filter(|_| !rows);
+            let (Some(suh), Some(svh)) = (side("suh"), side("svh")) else {
                 // Other formats decode to the HF weight.
-                if let Ok(r) = record(f, stem) {
+                if let Ok(r) = r {
                     let stored = match (dense, r.format) {
                         (false, _) | (true, FP32) => Stored::F32,
                         (true, format) => block_form(format).map_or(Stored::Bf16, Stored::Form),
@@ -646,7 +656,7 @@ impl Release {
                 continue;
             };
             let (inp, outp) = (suh[0], svh[0]);
-            let Ok((tensor, book)) = trellis_of(f, stem) else {
+            let Ok((tensor, book)) = coded(f, &format!("{stem}.trellis")) else {
                 continue;
             };
             let Some(entries) = shape(&tensor) else {
@@ -682,24 +692,16 @@ impl Release {
                 stored: Stored::F16,
             });
         }
+        // Each matrix's stored parts, then codebook-named codes.
+        let parts = [
+            "record", "checksum", "trellis", "rows", "suh", "svh", "fp8", "scale", "q4", "s4",
+            "e8m0", "bf16", "fp32",
+        ];
         let part = |n: &str| {
-            [
-                ".record",
-                ".checksum",
-                ".trellis",
-                ".suh",
-                ".svh",
-                ".fp8",
-                ".scale",
-                ".q4",
-                ".s4",
-                ".e8m0",
-                ".bf16",
-                ".fp32",
-            ]
-            .iter()
-            .any(|p| n.ends_with(p))
+            n.rsplit_once('.')
+                .is_some_and(|(_, end)| parts.contains(&end))
                 || n.contains(".trellis.")
+                || n.contains(".rows.")
                 || n.starts_with("__pad")
         };
         for s in raw {
@@ -763,6 +765,9 @@ impl Offer for Release {
             let bf16 = |s: &Slice| s.name == local && s.stored == Stored::Bf16;
             match record(f, &matrix) {
                 Ok(r) if r.format == BF16 => f.bytes(&format!("{matrix}.bf16")).map(Some),
+                Ok(r) if r.format == ROWS => {
+                    Ok(Some(rows(f, &matrix, &r, narrow)?.into_flattened()))
+                }
                 Err(_) if f.slices().iter().any(bf16) => f.bytes(&local).map(Some),
                 _ => Ok(None),
             }
@@ -770,7 +775,6 @@ impl Offer for Release {
         if let Some(bytes) = stored {
             return Ok(bytes);
         }
-        let narrow = |x: &f32| tessera_engine::Bf16::from(*x).0.to_le_bytes();
         Ok(self.read(name)?.iter().flat_map(narrow).collect())
     }
 
@@ -838,15 +842,7 @@ mod experts {
 
     /// A codes file's codebook, from its tensor names.
     pub(crate) fn codebook(codes: &File) -> Result<Codebook, Error> {
-        for book in [Codebook::Mcg, Codebook::Mul1] {
-            if codes
-                .shape(&format!("trellis.gate{}", book.suffix()))
-                .is_some()
-            {
-                return Ok(book);
-            }
-        }
-        Err(Error::Missing("trellis.gate in a known codebook".into()))
+        Ok(super::coded(codes, "trellis.gate")?.1)
     }
 
     /// The layer's slices: codes as trellis sets, rotations as floats.

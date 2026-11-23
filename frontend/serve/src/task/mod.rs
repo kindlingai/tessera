@@ -8,14 +8,14 @@ use tessera_tasks::api::{GenerateImage, Info, Tokens};
 
 /// Declares each entry's module and lists its `ENTRY`.
 macro_rules! entries {
-    ($($module:ident),* $(,)?) => {
+    ($($module:ident),*; $($more:path),*) => {
         $(mod $module;)*
         /// Every entry, in the order the usage text lists flags.
-        pub static ENTRIES: &[&Entry] = &[$(&$module::ENTRY),*];
+        pub static ENTRIES: &[&Entry] = &[$(&$module::ENTRY,)* $(&$more),*];
     };
 }
 
-entries!(generate, draft, mtp, embed, klein, sprite);
+entries!(generate, draft, mtp, embed, klein, sprite; mtp::DUAL);
 
 #[cfg(test)]
 mod task_test;
@@ -61,8 +61,8 @@ impl Flag {
 pub enum Pick {
     /// Unless a `Given` entry runs.
     Plain,
-    /// When its flag is given.
-    Given(&'static str),
+    /// When all its flags are given. Most flags wins.
+    Given(&'static [&'static str]),
     /// When the model's `_class_name` is this.
     Class(&'static str),
 }
@@ -179,18 +179,26 @@ fn class(options: &Options) -> Result<String, String> {
 /// The entry the options pick.
 pub(crate) fn pick(options: &Options) -> Result<&'static Entry, String> {
     let mut plain = None;
-    let mut given: Option<(&str, &'static Entry)> = None;
+    let mut given: Option<(&[&str], &'static Entry)> = None;
+    let mut tie = None;
     let mut classes = Vec::new();
     for entry in ENTRIES.iter().filter(|e| e.task == options.task) {
         match (entry.pick, given) {
-            (Pick::Given(flag), _) if !options.given.contains_key(flag) => {}
-            (Pick::Given(flag), Some((first, _))) => {
-                return Err(format!("{flag} cannot combine with {first}"));
+            (Pick::Given(flags), _) if !flags.iter().all(|f| options.given.contains_key(f)) => {}
+            (Pick::Given(flags), Some((best, _))) if best.len() > flags.len() => {}
+            (Pick::Given(flags), Some((best, _))) if best.len() == flags.len() => {
+                tie = Some((best[0], flags[0]));
             }
-            (Pick::Given(flag), None) => given = Some((flag, *entry)),
+            (Pick::Given(flags), _) => {
+                given = Some((flags, *entry));
+                tie = None;
+            }
             (Pick::Plain, _) => plain = Some(*entry),
             (Pick::Class(class), _) => classes.push((class, *entry)),
         }
+    }
+    if let Some((first, flag)) = tie {
+        return Err(format!("{flag} cannot combine with {first}"));
     }
     if let Some((_, entry)) = given {
         return Ok(entry);

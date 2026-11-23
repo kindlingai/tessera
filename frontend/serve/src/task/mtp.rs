@@ -1,26 +1,34 @@
-//! Generation drafted by the model's own MTP layer, given `--mtp`.
+//! MTP drafting, given `--mtp`. DFlash joins when `--draft` is given.
 
-use super::draft::{DraftLinks, open_target, serve, split_links};
-use super::generate::user_rules;
+use super::draft::{
+    ADAPTIVE, begin, DraftLinks, SPEC_LEN, open_drafter, open_target, serve, spec_len, split_links,
+};
 use super::{Entry, Flag, Load, Pick};
+use crate::ranks::{Grids, Links};
 use crate::start::Options;
-use std::time::Instant;
 use tessera_bundle::mtp::Mtp;
-use tessera_engine::{MtpDrafter, MtpSpeculate, Place, Recipe, Settings};
+use tessera_engine::{
+    CostModel, Drafter, DualSelector, DualSpeculate, MtpDrafter, MtpSpeculate, Place, Recipe,
+    Settings, Steps,
+};
 
 pub static ENTRY: Entry = Entry {
     task: "generate",
-    pick: Pick::Given("--mtp"),
-    flags: &[Flag {
-        name: "--mtp",
-        value: "<k>",
-        check: |v| v.parse::<usize>().is_ok_and(|depth| depth > 0),
-    }],
+    pick: Pick::Given(&["--mtp"]),
+    flags: &[
+        Flag {
+            name: "--mtp",
+            value: "<k>",
+            check: |v| v.parse::<usize>().is_ok_and(|depth| depth > 0),
+        },
+        ADAPTIVE,
+        SPEC_LEN,
+    ],
     open,
 };
 
 /// Opens a single-rank or TP-sharded MTP drafter and loads weights.
-fn open_mtp(
+pub(super) fn open_mtp(
     o: &Options,
     links: Option<DraftLinks>,
     pair: &Mtp,
@@ -63,15 +71,10 @@ fn open_mtp(
 /// Loads an MLA target and its MTP layer, then serves.
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
-    if load.on("--guided") {
-        return Err("--mtp cannot combine with --guided yet".into());
-    }
     let depth = load.count("--mtp", 1);
-    let start = Instant::now();
-    let (target_links, draft_links) = split_links(o.ranks.join(&settings)?);
-    let rules = user_rules(&settings)?;
-    let at = [1u64, o.max_model_len as u64];
-    let manifest = load.given("--manifest");
+    let b = begin(load, &settings, "--mtp")?;
+    let (target_links, draft_links) = split_links(b.links);
+    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
     let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
         .map_err(|e| e.to_string())?;
     let mut drafter = open_mtp(o, draft_links, &pair, &settings)?;
@@ -82,12 +85,100 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         engine.device(),
         pair.layer
     );
-    let mut spec =
-        MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
     if o.ranks.follows() {
+        let mut spec =
+            MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
+    let sl = spec_len(load, depth, CostModel::mtp(), true);
+    let mut spec = MtpSpeculate::new(&mut engine, &mut drafter, depth)
+        .map_err(|e| e.to_string())?
+        .with_spec_len(sl);
     serve(load, &settings, target, "mtp", |req, sink| {
+        spec.generate(req, sink).map_err(|e| e.to_string())
+    })?;
+    let _ = engine.dismiss();
+    Ok(())
+}
+
+pub static DUAL: Entry = Entry {
+    task: "generate",
+    pick: Pick::Given(&["--draft", "--mtp"]),
+    flags: &[],
+    open: open_dual,
+};
+
+/// Shares `links`'s sums and grid across target and both drafters.
+fn split_dual(links: Option<Links>) -> (Option<Links>, Option<DraftLinks>, Option<DraftLinks>) {
+    let Some(([sums, control], grids)) = links else {
+        return (None, None, None);
+    };
+    let [target_sums, dflash_sums, mtp_sums] = Drafter::share_transports(sums);
+    let (target_grids, dflash_grid, mtp_grid) = match grids {
+        Grids::Sums(grid) => {
+            let [g0, g1, g2] = Drafter::share_sums(grid);
+            (Grids::Sums(g0), Some(g1), Some(g2))
+        }
+        other => (other, None, None),
+    };
+    (
+        Some(([target_sums, control], target_grids)),
+        Some((dflash_sums, dflash_grid)),
+        Some((mtp_sums, mtp_grid)),
+    )
+}
+
+/// Loads an MLA target with DFlash and MTP drafters.
+fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
+    let o = load.options;
+    let draft_dir = std::path::Path::new(load.given("--draft").unwrap_or_default());
+    let depth = load.count("--mtp", 1);
+    let b = begin(load, &settings, "--draft and --mtp")?;
+    let (target_links, dflash_links, mtp_links) = split_dual(b.links);
+    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
+    // Drop each pair before the next, to limit open files.
+    let (mut drafter, dflash_block, mut taps) = {
+        let pair =
+            tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
+                .map_err(|e| e.to_string())?;
+        let drafter = open_drafter(o, dflash_links, &pair, &settings)?;
+        let taps: Vec<u64> = pair.target_layers.iter().map(|&l| l + 1).collect();
+        (drafter, pair.block, taps)
+    };
+    let (mut mtp, mtp_layer) = {
+        let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
+            .map_err(|e| e.to_string())?;
+        let mtp = open_mtp(o, mtp_links, &pair, &settings)?;
+        (mtp, pair.layer)
+    };
+    taps.push(mtp_layer + 1);
+    let combined = tessera_bundle::load_tapped(
+        &o.model,
+        at,
+        &rules,
+        Steps::Plain,
+        &o.config,
+        manifest,
+        &taps,
+    )
+    .map_err(|e| e.to_string())?;
+    let (mut engine, target) = open_target(o, target_links, combined, &settings)?;
+    let seconds = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{}: loaded target + dflash (block {dflash_block}) + mtp (layer {mtp_layer}, depth {depth}) in {seconds:.1} s",
+        engine.device(),
+    );
+    if o.ranks.follows() {
+        let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
+            .map_err(|e| e.to_string())?;
+        return spec.follow().map_err(|e| e.to_string());
+    }
+    let d_sl = spec_len(load, dflash_block - 1, CostModel::dual_dflash(), false);
+    let m_sl = spec_len(load, depth, CostModel::dual_mtp(), true);
+    let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
+        .map_err(|e| e.to_string())?
+        .with_selector(DualSelector::new(d_sl, m_sl));
+    serve(load, &settings, target, "dual", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
     let _ = engine.dismiss();

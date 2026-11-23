@@ -1,6 +1,8 @@
 //! DFlash speculative decoding: cached drafter and verify loop.
 
 use crate::ranks::open_rank;
+pub use crate::spec_len::SpecStats;
+use crate::spec_len::{CostModel, SpecLen};
 use crate::{Engine, Error, Event, Head, Place, Reason, Request, Row};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,7 +15,7 @@ use tessera_models::dflash;
 use tessera_run::{Error as RunError, Profile, Ranks, Run, Sum, open};
 
 /// Wire tag identifying a drafter launch on the control channel.
-const DRAFT_TAG: u32 = 3;
+pub(crate) const DRAFT_TAG: u32 = 3;
 
 /// One transport shared by target and drafter in alternation.
 struct SharedTransport(Rc<RefCell<Box<dyn Transport>>>);
@@ -61,29 +63,6 @@ impl Sum for SharedSum {
 
     fn spent(&mut self) -> Result<Option<[f64; 2]>, RunError> {
         self.0.borrow_mut().spent()
-    }
-}
-
-/// Speculative decoding telemetry for one generation call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SpecStats {
-    /// Target verification launches run.
-    pub steps: usize,
-    /// Draft tokens proposed across verify steps.
-    pub drafted: usize,
-    /// Draft tokens accepted by the target model.
-    pub accepted: usize,
-    /// Total tokens emitted to the caller.
-    pub emitted: usize,
-}
-
-impl SpecStats {
-    /// Average tokens produced per speculative verify step.
-    pub fn mean_step(&self) -> f32 {
-        if self.steps == 0 {
-            return 0.0;
-        }
-        (self.accepted + self.steps) as f32 / self.steps as f32
     }
 }
 
@@ -354,22 +333,28 @@ fn selector_top_k(graph: &Graph, block: usize) -> Option<usize> {
 }
 
 impl Drafter {
+    /// Splits one transport into `N` alternating handles.
+    pub fn share_transports<const N: usize>(
+        transport: Box<dyn Transport>,
+    ) -> [Box<dyn Transport>; N] {
+        let shared = Rc::new(RefCell::new(transport));
+        std::array::from_fn(|_| Box::new(SharedTransport(shared.clone())) as Box<dyn Transport>)
+    }
+
     /// Splits one transport into two alternating handles.
     pub fn share_transport(transport: Box<dyn Transport>) -> [Box<dyn Transport>; 2] {
-        let shared = Rc::new(RefCell::new(transport));
-        [
-            Box::new(SharedTransport(shared.clone())),
-            Box::new(SharedTransport(shared)),
-        ]
+        Self::share_transports(transport)
+    }
+
+    /// Splits one persistent sum grid into `N` alternating handles.
+    pub fn share_sums<const N: usize>(grid: Box<dyn Sum>) -> [Box<dyn Sum>; N] {
+        let shared = Rc::new(RefCell::new(grid));
+        std::array::from_fn(|_| Box::new(SharedSum(shared.clone())) as Box<dyn Sum>)
     }
 
     /// Splits one persistent sum grid into two alternating handles.
     pub fn share_sum(grid: Box<dyn Sum>) -> [Box<dyn Sum>; 2] {
-        let shared = Rc::new(RefCell::new(grid));
-        [
-            Box::new(SharedSum(shared.clone())),
-            Box::new(SharedSum(shared)),
-        ]
+        Self::share_sums(grid)
     }
 
     /// Opens a compiled runner for a DFlash stepper graph.
@@ -492,14 +477,14 @@ impl Drafter {
         self.mask_token
     }
 
-    fn draft_wants(&self) -> Wants {
+    pub(crate) fn draft_wants(&self) -> Wants {
         match self.selector_k {
             Some(_) => Wants::roles(&self.core.graph, 0, &[Role::Candidates, Role::Taps]),
             None => Wants::role(&self.core.graph, 0, Role::Tokens),
         }
     }
 
-    fn read_draft(&mut self, outputs: &[Slot]) -> Result<Vec<u32>, Error> {
+    pub(crate) fn read_draft(&mut self, outputs: &[Slot]) -> Result<Vec<u32>, Error> {
         if let Some(k) = self.selector_k {
             let cands = self.core.runner.ids(outputs[0])?;
             let raw = self.core.runner.read(outputs[1])?;
@@ -541,7 +526,7 @@ impl Drafter {
         Ok(logits[..(self.block - 1) * self.vocab].to_vec())
     }
 
-    fn run(
+    pub(crate) fn run(
         &mut self,
         slot: u32,
         anchor: u32,
@@ -617,19 +602,28 @@ pub(crate) struct TargetCmd {
     pub table: Vec<u32>,
 }
 
+/// DFlash drafter launch decoded from rank 0's control message.
+pub(crate) struct DraftCmd {
+    pub slot: u32,
+    pub anchor: u32,
+    pub start: usize,
+    pub ctx_pos: usize,
+    pub wants: Wants,
+}
+
 /// One control message received by a speculative follower rank.
 enum Cmd {
     Target(TargetCmd),
-    Draft {
-        slot: u32,
-        anchor: u32,
-        start: usize,
-        ctx_pos: usize,
-        wants: Wants,
-    },
+    Draft(DraftCmd),
 }
 
-fn encode_draft(slot: u32, anchor: u32, start: usize, ctx_pos: usize, wants: Wants) -> Vec<u8> {
+pub(crate) fn encode_draft(
+    slot: u32,
+    anchor: u32,
+    start: usize,
+    ctx_pos: usize,
+    wants: Wants,
+) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(24));
     w.u32(DRAFT_TAG)
         .u32(slot)
@@ -638,6 +632,16 @@ fn encode_draft(slot: u32, anchor: u32, start: usize, ctx_pos: usize, wants: Wan
         .u32(ctx_pos as u32)
         .u32(wants.0);
     w.0
+}
+
+pub(crate) fn decode_draft(r: &mut Reader) -> Option<DraftCmd> {
+    Some(DraftCmd {
+        slot: r.u32()?,
+        anchor: r.u32()?,
+        start: r.u32()? as usize,
+        ctx_pos: r.u32()? as usize,
+        wants: Wants(r.u32()?),
+    })
 }
 
 pub(crate) fn decode_target(tag: u32, r: &mut Reader) -> Option<TargetCmd> {
@@ -678,13 +682,7 @@ fn decode_cmd(bytes: &[u8]) -> Option<Cmd> {
     let mut r = Reader(bytes);
     let tag = r.u32()?;
     if tag == DRAFT_TAG {
-        return Some(Cmd::Draft {
-            slot: r.u32()?,
-            anchor: r.u32()?,
-            start: r.u32()? as usize,
-            ctx_pos: r.u32()? as usize,
-            wants: Wants(r.u32()?),
-        });
+        return decode_draft(&mut r).map(Cmd::Draft);
     }
     decode_target(tag, &mut r).map(Cmd::Target)
 }
@@ -746,6 +744,7 @@ pub(crate) fn run_target(
 pub struct Speculate<'a> {
     target: &'a mut Engine,
     drafter: &'a mut Drafter,
+    spec_len: SpecLen,
 }
 
 impl<'a> Speculate<'a> {
@@ -757,7 +756,18 @@ impl<'a> Speculate<'a> {
         if width != drafter.tap_width() {
             return Err(Error::Rows);
         }
-        Ok(Self { target, drafter })
+        let spec_len = SpecLen::fixed(drafter.block() - 1).with_cost(CostModel::dflash());
+        Ok(Self {
+            target,
+            drafter,
+            spec_len,
+        })
+    }
+
+    /// Configures adaptive or truncated draft length selection.
+    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
+        self.spec_len = spec_len;
+        self
     }
 
     /// Follows rank 0's target and drafter launches until dismissed.
@@ -776,20 +786,20 @@ impl<'a> Speculate<'a> {
             match decode_cmd(&told) {
                 None => return Ok(()),
                 Some(Cmd::Target(cmd)) => run_target(self.target, cmd, tap_width, &mut last_taps)?,
-                Some(Cmd::Draft {
-                    slot,
-                    anchor,
-                    start,
-                    ctx_pos,
-                    wants,
-                }) => {
-                    let n_new = start.checked_sub(ctx_pos).ok_or(Error::RowPlace)?;
+                Some(Cmd::Draft(cmd)) => {
+                    let n_new = cmd.start.checked_sub(cmd.ctx_pos).ok_or(Error::RowPlace)?;
                     let need = n_new * tap_width;
                     if last_taps.len() < need {
                         return Err(Error::Rows);
                     }
-                    self.drafter
-                        .run(slot, anchor, start, ctx_pos, &last_taps[..need], wants)?;
+                    self.drafter.run(
+                        cmd.slot,
+                        cmd.anchor,
+                        cmd.start,
+                        cmd.ctx_pos,
+                        &last_taps[..need],
+                        cmd.wants,
+                    )?;
                 }
             }
         }
@@ -805,12 +815,13 @@ impl<'a> Speculate<'a> {
         let tap_width = self.drafter.tap_width();
         let max_ctx = self.target.context().min(self.drafter.context());
         let drafter = &mut *self.drafter;
+        let spec = self.spec_len.fresh();
         run_speculate(
             self.target,
             request,
             emit,
-            |_, _, taps| (0usize, taps),
-            |target, (ctx_pos, pending), start, anchor, remaining| {
+            |_, _, taps| (0usize, taps, spec, 1.0f64),
+            |target, (ctx_pos, pending, spec, last_pred), start, anchor, remaining| {
                 if remaining == 1 || start + block > max_ctx {
                     return Ok(None);
                 }
@@ -819,9 +830,29 @@ impl<'a> Speculate<'a> {
                     tell_ranks(target, &encode_draft(0, anchor, start, *ctx_pos, wants))?;
                 }
                 let outputs = drafter.run(0, anchor, start, *ctx_pos, pending, wants)?;
-                Ok(Some(drafter.read_draft(&outputs)?))
+                let mut drafts = drafter.read_draft(&outputs)?;
+                let avail = drafts
+                    .len()
+                    .min(remaining.saturating_sub(1))
+                    .min(max_ctx.saturating_sub(start + 1));
+                if avail == 0 {
+                    return Ok(None);
+                }
+                let (k, pred) = spec.choose(None, avail, drafts.len());
+                *last_pred = pred;
+                drafts.truncate(k);
+                Ok(Some(drafts))
             },
-            |(ctx_pos, pending), start, commit, _, mut block_taps| {
+            |(ctx_pos, pending, spec, last_pred),
+             start,
+             drafted,
+             accepted,
+             _,
+             mut block_taps,
+             stats| {
+                spec.observe(drafted, accepted, None, *last_pred);
+                stats.dflash_steps += 1;
+                let commit = 1 + accepted;
                 *ctx_pos = start;
                 block_taps.truncate(commit * tap_width);
                 *pending = block_taps;
@@ -837,7 +868,7 @@ pub(crate) fn run_speculate<S>(
     emit: &mut dyn FnMut(Event) -> bool,
     init: impl FnOnce(&[u32], u32, Vec<f32>) -> S,
     mut draft: impl FnMut(&mut Engine, &mut S, usize, u32, usize) -> Result<Option<Vec<u32>>, Error>,
-    mut advance: impl FnMut(&mut S, usize, usize, &[u32], Vec<f32>),
+    mut advance: impl FnMut(&mut S, usize, usize, usize, &[u32], Vec<f32>, &mut SpecStats),
 ) -> Result<SpecStats, Error> {
     let mut stats = SpecStats::default();
     let prompt = &request.tokens;
@@ -912,7 +943,15 @@ pub(crate) fn run_speculate<S>(
             }
         }
         let commit = 1 + accepted;
-        advance(&mut state, start, commit, &posterior, block_taps);
+        advance(
+            &mut state,
+            start,
+            drafts.len(),
+            accepted,
+            &posterior,
+            block_taps,
+            &mut stats,
+        );
         start += commit;
         anchor = bonus;
     }

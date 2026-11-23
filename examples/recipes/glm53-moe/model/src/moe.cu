@@ -11,8 +11,8 @@ namespace trellis = tessera::trellis;
 typedef const u8* bytes;
 
 #define PICKS 8
-#define MAX_ROWS 16
-#define MAX_SLOTS 128
+#define MAX_ROWS 64
+#define MAX_SLOTS 512
 #define ROUTE_SCALE 2.5f
 
 // Compact routing plan for one layer launch.
@@ -20,11 +20,12 @@ struct Plan {
   u32 n_slots;
   u32 slot_expert[MAX_SLOTS];
   u32 slot_count[MAX_SLOTS];
-  u32 slot_tok[MAX_SLOTS][8];
-  u32 slot_pick[MAX_SLOTS][8];
+  u32 slot_tok[MAX_SLOTS][2];
+  u8 slot_pick[MAX_SLOTS][8];
   u32 tok_expert[MAX_ROWS][PICKS];
   float tok_w[MAX_ROWS][PICKS];
 };
+static_assert(sizeof(Plan) == (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u) * 4u, "Plan size");
 
 static __device__ inline u32 word(bytes p, u32 at) {
   return *(const u32*)(p + at);
@@ -187,7 +188,7 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
   Plan* plan = reinterpret_cast<Plan*>(plan_out);
   __shared__ u32 ids[MAX_ROWS][PICKS];
   __shared__ float gates[MAX_ROWS][PICKS];
-  __shared__ u32 emask[2048];
+  __shared__ u32 emask[2][2048];
   __shared__ u32 slot_of[2048];
   __shared__ u32 wsum[8];
   __shared__ u32 total;
@@ -195,7 +196,10 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
   for (u32 r = warp; r < rows; r += 8u) {
     route(scores + (u64)r * experts, bias, experts, picks, ids[r], gates[r]);
   }
-  for (u32 i = tid; i < count; i += 256u) emask[i] = 0u;
+  for (u32 i = tid; i < count; i += 256u) {
+    emask[0][i] = 0u;
+    emask[1][i] = 0u;
+  }
   if (tid == 0u) total = 0u;
   prim::block_sync();
   for (u32 i = tid; i < rows * picks; i += 256u) {
@@ -204,13 +208,13 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
     bool mine = e >= first && e < first + count;
     plan->tok_expert[r][p] = mine ? e : 0xFFFFFFFFu;
     plan->tok_w[r][p] = gates[r][p];
-    if (mine) atomicOr(&emask[e - first], 1u << r);
+    if (mine) atomicOr(&emask[r >> 5u][e - first], 1u << (r & 31u));
   }
   prim::block_sync();
   for (u32 base = 0u; base < count; base += 256u) {
     u32 le = base + tid;
-    u32 m = le < count ? emask[le] : 0u;
-    u32 cnt = __popc(m);
+    u64 m = le < count ? ((u64)emask[0][le] | ((u64)emask[1][le] << 32u)) : 0ull;
+    u32 cnt = __popcll(m);
     u32 ns = (cnt + 7u) >> 3u;
     u32 incl = ns;
 #pragma unroll
@@ -236,17 +240,20 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
     if (ns > 0u) {
       u32 s0 = chunk_base + wsum[warp] + (incl - ns);
       slot_of[le] = s0;
-      u32 bits = m;
+      u64 bits = m;
       for (u32 sub = 0u; sub < ns; sub++) {
         u32 s = s0 + sub;
         u32 take = min(cnt - sub * 8u, 8u);
         plan->slot_expert[s] = first + le;
         plan->slot_count[s] = take;
+        u64 pack = 0ull;
         for (u32 k = 0u; k < take; k++) {
-          u32 r = __ffs(bits) - 1u;
-          bits &= bits - 1u;
-          plan->slot_tok[s][k] = r;
+          u32 r = (u32)(__ffsll((long long)bits) - 1);
+          bits &= bits - 1ull;
+          pack |= (u64)r << (k << 3u);
         }
+        plan->slot_tok[s][0] = (u32)pack;
+        plan->slot_tok[s][1] = (u32)(pack >> 32u);
       }
     }
     prim::block_sync();
@@ -256,8 +263,9 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
     u32 e = ids[r][p];
     if (e < first || e >= first + count) continue;
     u32 le = e - first;
-    u32 rank = __popc(emask[le] & ((1u << r) - 1u));
-    plan->slot_pick[slot_of[le] + (rank >> 3u)][rank & 7u] = p;
+    u64 em = (u64)emask[0][le] | ((u64)emask[1][le] << 32u);
+    u32 rank = __popcll(em & ((1ull << r) - 1ull));
+    plan->slot_pick[slot_of[le] + (rank >> 3u)][rank & 7u] = (u8)p;
   }
   if (tid == 0u) plan->n_slots = total;
 }
@@ -277,7 +285,7 @@ template <u32 K, u32 BOOK>
 static __device__ __forceinline__ void fc1_body(
     const float* x, const float* su, const float* signs, bytes wbytes, float* gpart,
     Fc1Smem& sm, u32 m, u32 c, u32 h, u32 mat, u32 slot, u32 chunks, u32 ks1, u32 max_col,
-    u32 hidden, u32 n, u32 toks_pack) {
+    u32 hidden, u32 n, u64 toks_pack) {
   constexpr u32 TB = 32u * K;
   u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
   Mat W = matrix(wbytes);
@@ -302,7 +310,7 @@ static __device__ __forceinline__ void fc1_body(
       float4 sg = signs ? *(const float4*)(signs + at) : make_float4(1.f, 1.f, 1.f, 1.f);
       float sc[4] = {sv.x * sg.x, sv.y * sg.y, sv.z * sg.z, sv.w * sg.w};
       for (u32 r = r_base; r < n; r += wpb) {
-        u32 tok = (toks_pack >> (r << 2u)) & 15u;
+        u32 tok = (u32)((toks_pack >> (r << 3u)) & 0xFFu);
         float4 xv = *(const float4*)(x + (u64)tok * hidden + at);
         float v[4] = {xv.x * sc[0], xv.y * sc[1], xv.z * sc[2], xv.w * sc[3]};
         trellis::wht128(v, trellis::INV_SQRT128);
@@ -330,7 +338,7 @@ template <u32 K, u32 BOOK>
 static __device__ __noinline__ void fc1_cold(
     const float* x, const float* su, const float* signs, bytes wbytes, float* gpart,
     Fc1Smem& sm, u32 m, u32 c, u32 h, u32 mat, u32 slot, u32 chunks, u32 ks1, u32 max_col,
-    u32 hidden, u32 n, u32 toks_pack) {
+    u32 hidden, u32 n, u64 toks_pack) {
   fc1_body<K, BOOK>(x, su, signs, wbytes, gpart, sm, m, c, h, mat, slot, chunks, ks1, max_col, hidden, n, toks_pack);
 }
 
@@ -358,7 +366,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
     return;
   }
   __shared__ Fc1Smem sm;
-  u32 toks_pack = 0u;
+  u64 toks_pack = 0ull;
   u32 n, m;
   bytes wbytes;
   const float* su;
@@ -366,7 +374,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
   if (is_shared) {
     u32 r0 = slot * 8u;
     n = min(rows - r0, 8u);
-    for (u32 r = 0u; r < n; r++) toks_pack |= (r0 + r) << (r << 2u);
+    for (u32 r = 0u; r < n; r++) toks_pack |= (u64)(r0 + r) << (r << 3u);
     m = 0u;
     wbytes = mat ? shared_up : shared_gate;
     su = mat ? shared_up_su : shared_gate_su;
@@ -376,7 +384,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
   } else {
     u32 rs = slot - n_sh;
     n = plan->slot_count[rs];
-    for (u32 r = 0u; r < n; r++) toks_pack |= plan->slot_tok[rs][r] << (r << 2u);
+    toks_pack = (u64)plan->slot_tok[rs][0] | ((u64)plan->slot_tok[rs][1] << 32u);
     u32 e = plan->slot_expert[rs];
     m = e - first;
     wbytes = mat ? up : gate;
@@ -524,12 +532,16 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
     usv = up_sv + (u64)e * ffn;
     dsu = down_su + (u64)e * ffn;
     dbytes = down;
+    u32 tp = plan->slot_tok[rs][col2 >> 2u];
+    u32 sh = (col2 & 3u) << 3u;
     if (col2 < n) {
-      u32 r = plan->slot_tok[rs][col2], p = plan->slot_pick[rs][col2];
+      u32 r = (tp >> sh) & 0xFFu;
+      u32 p = plan->slot_pick[rs][col2];
       z_off0 = (((u64)r * (picks + 1u) + p) * chunks + c) * hidden;
     }
     if (col2 + 1u < n) {
-      u32 r = plan->slot_tok[rs][col2 + 1u], p = plan->slot_pick[rs][col2 + 1u];
+      u32 r = (tp >> (sh + 8u)) & 0xFFu;
+      u32 p = plan->slot_pick[rs][col2 + 1u];
       z_off1 = (((u64)r * (picks + 1u) + p) * chunks + c) * hidden;
     }
   }

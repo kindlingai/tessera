@@ -29,10 +29,12 @@ const ROUTED: [&str; 13] = [
 const SHARED: [&str; 3] = ["shared.gate", "shared.up", "shared.down"];
 
 /// Past these, the linked rules serve better or `moe.cu` cannot.
-const MOST_ROWS: usize = 16;
+const MOST_ROWS: usize = 64;
 const MOST_EXPERTS: usize = 2048;
+const MAX_SLOTS: usize = 512;
+const PICKS: usize = 8;
 /// Words in `Plan` struct in `moe.cu`.
-const PLAN_WORDS: usize = 1 + 128 + 128 + 128 * 8 + 128 * 8 + 16 * 8 + 16 * 8;
+const PLAN_WORDS: usize = 1 + MAX_SLOTS * 6 + MOST_ROWS * PICKS * 2;
 
 /// Experts each row takes, by expert count.
 fn picks(experts: usize) -> Option<u32> {
@@ -185,7 +187,9 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
     let ns2 = split_dim(ibs, if rows == 1 { 8 } else { 3 });
     let n_sh = rows.div_ceil(8);
-    let max_routed = (count * n_sh).min(rows * picks);
+    let assigns = (rows * picks).min(count * rows);
+    let active = count.min(assigns);
+    let max_routed = (count * n_sh).min(active + (assigns - active) / 8);
     let total_slots = n_sh + max_routed;
     let max_col = rows.min(8);
     let route = Offer {
@@ -335,3 +339,6 @@ pub extern "C" fn propose(at: i32, len: i32) -> i64 {
     // SAFETY: the host passes back what `alloc` returned.
     unsafe { tessera_guest::answer(at, len, offer) }
 }
+
+#[cfg(test)]
+mod offer_test;

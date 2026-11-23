@@ -40,7 +40,7 @@ fn flattens_in_order() {
     let trellis = "#include <tessera/1/trellis>\nint body;\n";
     assert!(has(core, Backend::Metal, "core.h") && !has(core, Backend::Metal, "backend.h"));
     assert!(has(core, Backend::Cuda, "backend.h") && !has(core, Backend::Cuda, "grid.h"));
-    for b in [Backend::Cuda, Backend::Hip] {
+    for b in [Backend::Cuda, Backend::Rocm] {
         assert!(has(trellis, b, "TESSERA_CAP_TRELLIS") && has(trellis, b, "trellis.h"));
         assert!(!has(trellis, b, "grid.h"));
     }

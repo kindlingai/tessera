@@ -10,16 +10,42 @@ use tessera_bundle::dflash::DFlash;
 use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::{
-    Drafter, Engine, Place, Recipe, Request, Settings, Sink, SpecStats, Speculate,
+    CostModel, Drafter, Engine, Place, Recipe, Request, Settings, Sink, SpecLen, SpecStats,
+    Speculate,
 };
 use tessera_tasks::Generate;
 
 pub static ENTRY: Entry = Entry {
     task: "generate",
-    pick: Pick::Given("--draft"),
-    flags: &[Flag::text("--draft", "<dir>")],
+    pick: Pick::Given(&["--draft"]),
+    flags: &[Flag::text("--draft", "<dir>"), ADAPTIVE, SPEC_LEN],
     open,
 };
+
+/// Picks the draft length from measured acceptance.
+pub(super) const ADAPTIVE: Flag = Flag::switch("--spec-adaptive");
+
+/// A fixed or largest draft length.
+pub(super) const SPEC_LEN: Flag = Flag {
+    name: "--spec-len",
+    value: "<k>",
+    check: |v| v.parse::<usize>().is_ok_and(|k| k > 0),
+};
+
+/// The draft-length policy, at most `limit` tokens.
+pub(super) fn spec_len(load: &Load, limit: usize, cost: CostModel, mtp_seeds: bool) -> SpecLen {
+    let cap = load.count("--spec-len", limit).min(limit);
+    let spec = if load.on("--spec-adaptive") {
+        SpecLen::adaptive(cap, cost)
+    } else {
+        SpecLen::fixed(cap).with_cost(cost)
+    };
+    if mtp_seeds {
+        spec.with_mtp_seeds()
+    } else {
+        spec
+    }
+}
 
 /// Opens a ranked target engine and loads its sharded weights.
 pub(super) fn open_target(
@@ -47,6 +73,31 @@ pub(super) fn open_target(
     Ok((engine, target))
 }
 
+/// The timer, links and rules a speculative entry starts with.
+pub(super) struct Begin<'a> {
+    pub start: Instant,
+    pub links: Option<Links>,
+    pub rules: Vec<tessera_bundle::names::Rule>,
+    pub at: [u64; 2],
+    pub manifest: Option<&'a str>,
+}
+
+/// Refuses `--guided`, then joins the ranks and reads rules.
+pub(super) fn begin<'a>(load: &'a Load, settings: &Settings, what: &str) -> Result<Begin<'a>, String> {
+    if load.on("--guided") {
+        return Err(format!("{what} cannot combine with --guided yet"));
+    }
+    let start = Instant::now();
+    let links = load.options.ranks.join(settings)?;
+    Ok(Begin {
+        start,
+        links,
+        rules: user_rules(settings)?,
+        at: [1, load.options.max_model_len as u64],
+        manifest: load.given("--manifest"),
+    })
+}
+
 /// Transport and optional sum grid handed to a ranked drafter.
 pub(super) type DraftLinks = (Box<dyn Transport>, Option<Box<dyn Sum>>);
 
@@ -70,7 +121,7 @@ pub(super) fn split_links(links: Option<Links>) -> (Option<Links>, Option<DraftL
 }
 
 /// Opens a single-rank or TP-sharded drafter and streams its weights.
-fn open_drafter(
+pub(super) fn open_drafter(
     o: &Options,
     links: Option<DraftLinks>,
     pair: &DFlash,
@@ -117,15 +168,10 @@ fn open_drafter(
 /// Loads a target and DFlash drafter, then answers requests.
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
-    if load.on("--guided") {
-        return Err("--draft cannot combine with --guided yet".into());
-    }
     let draft_dir = std::path::Path::new(load.given("--draft").unwrap_or_default());
-    let start = Instant::now();
-    let (target_links, draft_links) = split_links(o.ranks.join(&settings)?);
-    let rules = user_rules(&settings)?;
-    let at = [1u64, o.max_model_len as u64];
-    let manifest = load.given("--manifest");
+    let b = begin(load, &settings, "--draft")?;
+    let (target_links, draft_links) = split_links(b.links);
+    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
     let pair = tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
         .map_err(|e| e.to_string())?;
     let mut drafter = open_drafter(o, draft_links, &pair, &settings)?;
@@ -140,7 +186,10 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
+    let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
+    let mut spec = Speculate::new(&mut engine, &mut drafter)
+        .map_err(|e| e.to_string())?
+        .with_spec_len(sl);
     serve(load, &settings, target, "dflash", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
@@ -169,12 +218,15 @@ pub(super) fn serve(
         if settings.profile.is_some() && stats.steps > 0 {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms total)",
+                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms, dflash {}, mtp {}, sw {})",
                 stats.emitted,
                 stats.steps,
                 stats.mean_step(),
                 ms / stats.steps as f64,
                 ms,
+                stats.dflash_steps,
+                stats.mtp_steps,
+                stats.switches,
             );
         }
     }

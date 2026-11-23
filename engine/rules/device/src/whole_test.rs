@@ -8,7 +8,7 @@ use crate::whole::{
     RefillCache, TableBufs, fill_pages, format_summary, pack_into, plan, prepare_source,
 };
 use tessera_gpukit::device::KernelStats;
-use tessera_lower::{Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
+use tessera_lower::{ByBackend, Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
 use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, marks};
 
 #[test]
@@ -213,9 +213,7 @@ impl Kernel for Stub {
 
     fn source(&self) -> Source {
         Source::Fixed {
-            metal: "",
-            cuda: "",
-            hip: "",
+            text: ByBackend::default(),
             entry: "stub",
         }
     }

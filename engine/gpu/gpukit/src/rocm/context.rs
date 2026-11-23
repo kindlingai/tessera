@@ -77,7 +77,7 @@ impl Context {
                 unsafe { (self.runtime().hip_device_total_mem)(&mut total, device) };
                 let integrated = attr(hip::ATTR_INTEGRATED) != 0;
                 Platform::new(Asked {
-                    backend: "rocm",
+                    backend: crate::backend::Backend::Rocm.name(),
                     arch: self.arch(),
                     name: self.name().to_string(),
                     driver: format!("{}.{}", v / 10_000_000, (v / 100_000) % 100),

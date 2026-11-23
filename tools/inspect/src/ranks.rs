@@ -1,6 +1,6 @@
 //! Ranks by their command-line names, with devices.
 
-use tessera_lower::{Cluster, Device, Limits, Link, Pins, Platform, Zone, ZoneKind};
+use tessera_lower::{Backend, Cluster, Device, Limits, Link, Pins, Platform, Zone, ZoneKind};
 use tessera_platform::platform::Asked;
 use tessera_sim::Tag;
 
@@ -23,7 +23,8 @@ const PRESETS: [(&str, &str, &str, f64); 4] = [
     ("cpu", "cpu", "cpu", 50e9),
 ];
 
-const BACKENDS: [&str; 4] = ["cuda", "rocm", "metal", "cpu"];
+/// The zone that runs native kernels on the host.
+const CPU: &str = "cpu";
 
 /// `strix:3` or `cuda/sm_90:1`. The part defaults to one.
 pub fn spec(text: &str) -> Option<Spec> {
@@ -42,7 +43,8 @@ pub fn spec(text: &str) -> Option<Spec> {
         });
     }
     let (backend, arch) = machine.split_once('/')?;
-    let backend = BACKENDS.iter().find(|b| **b == backend)?;
+    let gpu = Backend::named(backend).map(Backend::name);
+    let backend = gpu.or((backend == CPU).then_some(CPU))?;
     Some(Spec {
         name: machine.into(),
         backend,
@@ -55,7 +57,7 @@ pub fn spec(text: &str) -> Option<Spec> {
 impl Spec {
     pub fn kind(&self) -> ZoneKind {
         match self.backend {
-            "cpu" => ZoneKind::Cpu,
+            CPU => ZoneKind::Cpu,
             _ => ZoneKind::Gpu,
         }
     }
@@ -78,13 +80,9 @@ impl Spec {
         })
     }
 
-    /// Which text its kernels compile from.
-    pub fn dialect(&self) -> Option<tessera_lower::Dialect> {
-        match self.backend {
-            "metal" => Some(tessera_lower::Dialect::Metal),
-            "cuda" | "rocm" => Some(tessera_lower::Dialect::Cuda),
-            _ => None,
-        }
+    /// The GPU its kernels compile for, if any.
+    pub fn gpu(&self) -> Option<Backend> {
+        Backend::named(self.backend)
     }
 }
 
