@@ -161,8 +161,10 @@ pub fn simcheck(dirs: &Dirs, changes: &Changes) -> Result<Report, String> {
         &path,
     ];
     // New files count from the range's base.
-    if let Changes::Range(base, _) = changes {
-        args.push(base);
+    match changes {
+        Changes::Range(base, _) => args.push(base),
+        Changes::Staged => args.push("--staged"),
+        Changes::Message(_) => {}
     }
     cargo(dirs, "simcheck", &args, &json)
 }

@@ -27,14 +27,15 @@ use std::process::{Command, ExitCode};
 use windows::{Window, cut};
 
 const USAGE: &str = "usage: tessera-simcheck fetch <model_dir>
-       tessera-simcheck check <model_dir> [cache_dir [json_file [base_ref]]] [--budget <n>] [--warm]
+       tessera-simcheck check <model_dir> [cache_dir [json_file [base_ref]]] [--budget <n>] [--warm] [--staged]
        tessera-simcheck far <model_dir> [cache_dir]
        tessera-simcheck place <model_dir> <cache_dir> [paths_file]
 
 `check` writes its findings to <json_file> when given. It embeds every
 uncached window of files changed since <base_ref>, then at most <n> other
 uncached windows, and compares only embedded windows. `--warm` never fails.
-It also fails on allow.toml pairs that allow nothing.
+It also fails on allow.toml pairs that allow nothing. `--staged` compares only
+pairs that hold a window of a staged file, and skips the allow.toml check.
 With <base_ref>, it also reports new files nearer another crate.
 `far` lists crates whose code leans toward each other.
 `place` lists each file's lean toward another crate.";
@@ -131,12 +132,18 @@ fn embed(
         .collect())
 }
 
-/// Files changed between `base` and HEAD.
-fn changed_files(root: &Path, base: Option<&str>) -> Result<HashSet<String>> {
-    let Some(base) = base else {
-        return Ok(HashSet::new());
+/// Files staged, or changed between `base` and HEAD.
+fn changed_files(root: &Path, base: Option<&str>, staged: bool) -> Result<HashSet<String>> {
+    let range;
+    let which = match (staged, base) {
+        (true, _) => "--cached",
+        (false, Some(base)) => {
+            range = format!("{base}...HEAD");
+            &range
+        }
+        (false, None) => return Ok(HashSet::new()),
     };
-    let diff = git(root, &["diff", "--name-only", &format!("{base}...HEAD")])?;
+    let diff = git(root, &["diff", "--name-only", which])?;
     Ok(diff.lines().map(String::from).collect())
 }
 
@@ -147,6 +154,8 @@ struct Mode {
     budget: Option<usize>,
     /// Never fails. Builds on main set it.
     warm: bool,
+    /// Compares only pairs that hold a staged file's window.
+    staged: bool,
 }
 
 /// Changed files count from the `base` ref.
@@ -161,7 +170,7 @@ fn check(
     let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
     let wins = all_windows(&root, &s)?;
     let mut cache = Cache::open(cache_file)?;
-    let changed = changed_files(&root, base)?;
+    let changed = changed_files(&root, base, mode.staged)?;
     let found = embed(model, &wins, &mut cache, &changed, mode.budget)?;
     if let Some(f) = cache_file {
         let keys: Vec<u64> = wins.iter().map(|w| key(&w.text)).collect();
@@ -181,11 +190,15 @@ fn check(
     if let Some((done, all)) = coverage {
         println!("coverage: {done} of {all} windows embedded");
     }
-    let (hits, used) = near(&wins, &embs, s.similar_window, s.max_similarity, &allow);
-    // Allowed pairs may hold unembedded windows.
-    let stale = match coverage {
-        None => allow.stale(&used),
-        Some(_) => Vec::new(),
+    let focus: Option<Vec<bool>> = mode
+        .staged
+        .then(|| wins.iter().map(|w| changed.contains(&w.path)).collect());
+    let limits = (s.similar_window, s.max_similarity);
+    let (hits, used) = near(&wins, &embs, limits, &allow, focus.as_deref());
+    // Allowed pairs may hold unembedded or unfocused windows.
+    let stale = match (coverage, &focus) {
+        (None, None) => allow.stale(&used),
+        _ => Vec::new(),
     };
     let leans = new_leans(&root, &s, (&wins, &embs), base)?;
     for l in &leans {
@@ -205,7 +218,6 @@ fn check(
         println!("tools/simcheck/allow.toml: stale: {a} and {b} are not near-copies");
     }
     if let Some(path) = json {
-        let limits = (s.similar_window, s.max_similarity);
         let r = report::report((&hits, &stale, &leans), &wins, &root, (limits, coverage))?;
         r.write(path).map_err(anyhow::Error::msg)?;
     }
@@ -362,6 +374,7 @@ fn check_args<'a>(args: &[&'a str]) -> Option<(Vec<&'a str>, Mode)> {
         match *a {
             "--budget" => mode.budget = Some(it.next()?.parse().ok()?),
             "--warm" => mode.warm = true,
+            "--staged" => mode.staged = true,
             p => paths.push(p),
         }
     }
