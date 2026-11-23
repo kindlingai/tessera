@@ -90,7 +90,10 @@ jobs:
       - run: cargo fmt --all --check
       # The linux job skips when only lint changes, so lint tests run here.
       - run: cargo clippy -p tessera-lint --all-targets
-      - run: cargo test -q -p tessera-lint
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run -p tessera-lint --profile ci
       # Unused dependencies. It does not read dev-dependencies.
       - uses: taiki-e/install-action@v2
         with:
@@ -175,7 +178,10 @@ jobs:
         with:
           shared-key: grammar
       - run: cargo clippy -p tessera-grammar --all-targets --features llguidance
-      - run: cargo test -p tessera-grammar --features llguidance
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci
 
   macos:
     # Light on pull requests. A push to main runs it only when its merge
@@ -215,7 +221,11 @@ jobs:
           FMT_BASE: origin/${{ github.base_ref || 'main' }}
         run: tools/scripts/fmt-check.sh --manifest-path tools/simcheck/Cargo.toml
       - run: cargo clippy --manifest-path tools/simcheck/Cargo.toml --all-targets
-      - run: cargo test --manifest-path tools/simcheck/Cargo.toml
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      # A separate workspace, so name the root nextest config.
+      - run: cargo nextest run --manifest-path tools/simcheck/Cargo.toml --config-file .config/nextest.toml --profile ci
       # The checkpoint's text tower, pinned in tools/simcheck/src/fetch.rs.
       - id: model
         uses: actions/cache/restore@v4
@@ -363,7 +373,10 @@ jobs:
           sudo apt-get install -y -q cuda-nvcc-13-0 cuda-cuobjdump-13-0 cuda-nvdisasm-13-0 clang
           echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
       - run: which nvcc cuobjdump nvdisasm clang++
-      - run: cargo test -p tessera-linear --test platforms_test -- --nocapture
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
 
   success:
     # The one check to require: every job above passed or was skipped
