@@ -224,8 +224,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      # A separate workspace, so name the root nextest config.
-      - run: cargo nextest run --manifest-path tools/simcheck/Cargo.toml --config-file .config/nextest.toml --profile ci
+      # A separate workspace with its own .config/nextest.toml.
+      - run: cargo nextest run --manifest-path tools/simcheck/Cargo.toml
       # The checkpoint's text tower, pinned in tools/simcheck/src/fetch.rs.
       - id: model
         uses: actions/cache/restore@v4
