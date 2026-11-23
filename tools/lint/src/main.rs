@@ -79,30 +79,67 @@ pub struct Violation {
 const CONFLICT: &str = "unresolved merge conflict. Resolve it, then run lint again.";
 
 fn main() -> ExitCode {
+    tessera_findings::main_of("tessera-lint", run)
+}
+
+/// `[comments] [--json <file>] [<path>...]`, or `tables`.
+fn run(args: &[&str]) -> Result<bool, String> {
     let root = files::repo_root();
-    let sources = match files::sources(&root) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tessera-lint: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let dirs = match files::crate_dirs(&root) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("tessera-lint: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    if std::env::args().nth(1).as_deref() == Some("tables") {
-        return match readme::write(&root, &dirs) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("tessera-lint: {e}");
-                ExitCode::from(2)
-            }
-        };
+    if args == ["tables"] {
+        return readme::write(&root, &files::crate_dirs(&root)?).map(|()| true);
     }
+    let (only, rest) = match args {
+        ["comments", rest @ ..] => (true, rest),
+        _ => (false, args),
+    };
+    let (json, paths) = match rest {
+        ["--json", file, paths @ ..] => (Some(*file), paths),
+        _ => (None, rest),
+    };
+    let (mut found, count) = if only {
+        comment_rules(&root, paths)?
+    } else if paths.is_empty() {
+        every_rule(&root)?
+    } else {
+        return Err("usage: tessera-lint [comments] [--json <file>] [<path>...] | tables".into());
+    };
+    found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    for v in &found {
+        println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
+    }
+    if let Some(file) = json {
+        report(&found).write(std::path::Path::new(file))?;
+    }
+    let fails = found.iter().filter(|v| !is_note(v)).count();
+    let notes = found.len() - fails;
+    if fails == 0 {
+        eprintln!("tessera-lint: {count} files clean, {notes} notes");
+        return Ok(true);
+    }
+    eprintln!("tessera-lint: {fails} violations, {notes} notes");
+    Ok(false)
+}
+
+/// The comment rules alone, on `paths`.
+fn comment_rules(
+    root: &std::path::Path,
+    paths: &[&str],
+) -> Result<(Vec<Violation>, usize), String> {
+    let mut found = Vec::new();
+    let named = |s: &files::Source| paths.contains(&s.path.as_str());
+    let sources: Vec<files::Source> = files::sources(root)?.into_iter().filter(named).collect();
+    for src in &sources {
+        comments::check(src, src.path.ends_with(".rs"), &mut found);
+    }
+    for src in files::hash_sources(root)?.iter().filter(|s| named(s)) {
+        comments::check_hash(src, &mut found);
+    }
+    Ok((found, sources.len()))
+}
+
+fn every_rule(root: &std::path::Path) -> Result<(Vec<Violation>, usize), String> {
+    let sources = files::sources(root)?;
+    let dirs = files::crate_dirs(root)?;
     let (mut found, mut names, mut tests) = (Vec::new(), Vec::new(), Vec::new());
     for src in &sources {
         match tessera_shape::conflict(&src.text) {
@@ -116,44 +153,13 @@ fn main() -> ExitCode {
     files::check_crates(&dirs, &sources, &mut found);
     runs::check(&sources, &mut found);
     repo::copies::check(&dirs, &sources, &mut found);
-    repo::revisions::check(&root, &sources, &mut found);
-    match files::hash_sources(&root) {
-        Ok(srcs) => srcs
-            .iter()
-            .for_each(|s| comments::check_hash(s, &mut found)),
-        Err(e) => {
-            eprintln!("tessera-lint: {e}");
-            return ExitCode::from(2);
-        }
+    repo::revisions::check(root, &sources, &mut found);
+    for src in &files::hash_sources(root)? {
+        comments::check_hash(src, &mut found);
     }
-    if let Err(e) = readme::check(&root, &dirs, &mut found) {
-        eprintln!("tessera-lint: {e}");
-        return ExitCode::from(2);
-    }
-    if let Err(e) = audit::check(&root, &dirs, &sources, &mut found) {
-        eprintln!("tessera-lint: {e}");
-        return ExitCode::from(2);
-    }
-    found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    for v in &found {
-        println!("{}:{}: {}: {}", v.path, v.line, v.rule, v.message);
-    }
-    let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, path] = &args[..]
-        && flag == "--json"
-        && let Err(e) = report(&found).write(std::path::Path::new(path))
-    {
-        eprintln!("tessera-lint: {e}");
-        return ExitCode::from(2);
-    }
-    let fails = found.iter().filter(|v| !is_note(v)).count();
-    let notes = found.len() - fails;
-    if fails == 0 {
-        eprintln!("tessera-lint: {} files clean, {notes} notes", sources.len());
-        return ExitCode::SUCCESS;
-    }
-    eprintln!("tessera-lint: {fails} violations, {notes} notes");
-    ExitCode::FAILURE
+    readme::check(root, &dirs, &mut found)?;
+    audit::check(root, &dirs, &sources, &mut found)?;
+    Ok((found, sources.len()))
 }
 
 /// A note advises and does not fail the run.

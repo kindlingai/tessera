@@ -19,10 +19,12 @@ const USAGE: &str =
     "usage: tessera-check run [--staged | <base> <head>] [--markdown <file> [<link_base>]]
        tessera-check render <json>... [--markdown <file> [<link_base>]]
        tessera-check tests <junit_xml> <json>
+       tessera-check message <commit_msg_file>
        tessera-check fetch
 
-`run` checks lint over the repository, and style and simcheck when their
-models are in ~/.cache/tessera/check. It fails on any failure. `render` reads the
+`run` checks lint's comment rules on the changed files, style and simcheck when
+their models are in ~/.cache/tessera/check, and lint over the repository. It runs
+the fastest checks first and stops at the first failure. `message` checks a commit message for style. `render` reads the
 JSON each check writes. `tests` writes failed and slow tests from nextest's
 JUnit file as such JSON. `fetch` downloads both models.";
 
@@ -63,6 +65,24 @@ fn split_markdown<'a>(args: &'a [&'a str]) -> (&'a [&'a str], &'a [&'a str]) {
     }
 }
 
+/// Runs each check, and stops at the first failure.
+fn gate(changes: &Changes, checks: &[run::Check], markdown: &[&str]) -> Result<bool, String> {
+    let dirs = dirs()?;
+    std::fs::create_dir_all(&dirs.out).map_err(|e| format!("{}: {e}", dirs.out.display()))?;
+    let mut reports = Vec::new();
+    for (i, check) in checks.iter().enumerate() {
+        let report = check(&dirs, changes)?;
+        let failed = report.fails() > 0;
+        reports.push(report);
+        if failed && i + 1 < checks.len() {
+            eprintln!("tessera-check: stopped at the first failure; later checks did not run");
+            break;
+        }
+    }
+    show(&reports, markdown)?;
+    Ok(reports.iter().all(|r| r.fails() == 0))
+}
+
 fn run(args: &[&str]) -> Result<bool, String> {
     let (cmd, rest) = args.split_first().ok_or(USAGE)?;
     let (rest, markdown) = split_markdown(rest);
@@ -83,17 +103,13 @@ fn run(args: &[&str]) -> Result<bool, String> {
                 [base, head] => Changes::Range(base.to_string(), head.to_string()),
                 _ => return Err(USAGE.into()),
             };
-            let dirs = dirs()?;
-            std::fs::create_dir_all(&dirs.out)
-                .map_err(|e| format!("{}: {e}", dirs.out.display()))?;
-            let reports = vec![
-                run::lint(&dirs)?,
-                run::style(&dirs, &changes)?,
-                run::simcheck(&dirs, &changes)?,
-            ];
-            show(&reports, markdown)?;
-            Ok(reports.iter().all(|r| r.fails() == 0))
+            gate(
+                &changes,
+                &[run::comments, run::style, run::lint, run::simcheck],
+                markdown,
+            )
         }
+        ("message", [file]) => gate(&Changes::Message(file.to_string()), &[run::style], markdown),
         _ => Err(USAGE.into()),
     }
 }

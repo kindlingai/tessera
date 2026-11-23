@@ -1,6 +1,7 @@
 #!/bin/sh
-# Formatting, then lint, style and simcheck through tessera-check,
+# Formatting, then style, lint and simcheck through tessera-check,
 # then clippy on the crates that hold staged files.
+# tessera-check runs style first and stops at the first failure.
 # Style and simcheck run when `cargo run -p tessera-check -- fetch`
 # has put their models in ~/.cache/tessera/check.
 # Install: tools/scripts/install-hooks.sh

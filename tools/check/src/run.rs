@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tessera_findings::Report;
 
-/// Which lines style reads: staged, or a commit range.
+/// The text style reads: staged, a range, or a message.
 pub enum Changes {
     Staged,
     Range(String, String),
+    Message(String),
 }
+
+pub type Check = fn(&Dirs, &Changes) -> Result<Report, String>;
 
 /// Shared models and embeddings, and this checkout's reports.
 pub struct Dirs {
@@ -66,7 +69,7 @@ fn skipped(tool: &str, title: &str, why: String) -> Report {
     }
 }
 
-pub fn lint(dirs: &Dirs) -> Result<Report, String> {
+pub fn lint(dirs: &Dirs, _: &Changes) -> Result<Report, String> {
     let json = dirs.out.join("lint.json");
     let path = json.to_string_lossy();
     cargo(
@@ -75,6 +78,52 @@ pub fn lint(dirs: &Dirs) -> Result<Report, String> {
         &["run", "-q", "-p", "tessera-lint", "--", "--json", &path],
         &json,
     )
+}
+
+/// Paths the changes add or modify.
+fn changed(dirs: &Dirs, changes: &Changes) -> Result<Vec<String>, String> {
+    let mut args = vec!["diff", "--name-only", "--diff-filter=d"];
+    let range;
+    match changes {
+        Changes::Staged => args.push("--cached"),
+        Changes::Range(base, head) => {
+            range = format!("{base}...{head}");
+            args.push(&range);
+        }
+        Changes::Message(_) => return Ok(Vec::new()),
+    }
+    let out = Command::new("git")
+        .args(&args)
+        .current_dir(&dirs.root)
+        .output();
+    let out = out.map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git {} failed", args.join(" ")));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text.lines().map(String::from).collect())
+}
+
+/// Lint's comment rules, on the changed files only.
+pub fn comments(dirs: &Dirs, changes: &Changes) -> Result<Report, String> {
+    let json = dirs.out.join("comments.json");
+    let path = json.to_string_lossy();
+    let files = changed(dirs, changes)?;
+    let mut args = vec![
+        "run",
+        "-q",
+        "-p",
+        "tessera-lint",
+        "--",
+        "comments",
+        "--json",
+        &path,
+    ];
+    args.extend(files.iter().map(String::as_str));
+    let mut report = cargo(dirs, "comments", &args, &json)?;
+    report.tool = "comments".into();
+    report.title = "Comment rules on changed files".into();
+    Ok(report)
 }
 
 pub fn style(dirs: &Dirs, changes: &Changes) -> Result<Report, String> {
@@ -88,6 +137,7 @@ pub fn style(dirs: &Dirs, changes: &Changes) -> Result<Report, String> {
     match changes {
         Changes::Staged => args.extend(["staged", &spacy]),
         Changes::Range(base, head) => args.extend(["diff", &spacy, base, head]),
+        Changes::Message(file) => args.extend(["message", &spacy, file]),
     }
     args.push(&path);
     cargo(dirs, "style", &args, &json)
