@@ -1,7 +1,8 @@
 //! DFlash speculative decoding and tapped step tests.
 
 use tessera_engine::{
-    Drafter, Engine, Event, Reason, Recipe, Request, Row, Speculate, accept_greedy, accept_sample,
+    Drafter, Engine, Event, Reason, Recipe, Request, Row, SpecStats, Speculate, accept_greedy,
+    accept_sample,
 };
 use tessera_graph::Graph;
 use tessera_interp::{Store, Tensor, run_kept};
@@ -62,6 +63,7 @@ fn tapped_step_matches() {
     let mut dec_cfg = Config::toy(1, 16);
     dec_cfg.stack.taps = vec![1, 2];
     let mut mla_cfg = small::deepseek();
+    mla_cfg.stack.vocab = 600;
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 16;
     mla_cfg.stack.taps = vec![1, 2];
@@ -173,6 +175,38 @@ fn dflash_matches_greedy() {
     }
 }
 
+fn verify_pair(
+    t_graph: &Graph,
+    t_weights: &[Tensor],
+    d_graph: &Graph,
+    d_weights: &[Tensor],
+    max_tokens: usize,
+) -> SpecStats {
+    let mut last = SpecStats::default();
+    for settings in runs() {
+        let mut baseline = open_target(t_graph, t_weights, 24, &settings);
+        let mut target = open_target(t_graph, t_weights, 24, &settings);
+        let mut drafter = open_drafter(d_graph, d_weights, 24, 4, 0, &settings);
+        let req = || Request {
+            tokens: vec![2, 6, 1],
+            max_tokens,
+            ..Request::default()
+        };
+        let mut want_ev = Vec::new();
+        baseline.generate(req(), &mut |e| want_ev.push(e)).unwrap();
+        let mut got_ev = Vec::new();
+        last = Speculate::new(&mut target, &mut drafter)
+            .unwrap()
+            .generate(req(), &mut |e| {
+                got_ev.push(e);
+                true
+            })
+            .unwrap();
+        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
+    }
+    last
+}
+
 #[test]
 fn dflash_accepts_and_mla() {
     let mut mla_cfg = small::deepseek();
@@ -198,32 +232,40 @@ fn dflash_accepts_and_mla() {
     let last_d = d_weights.len() - 1;
     zero_head(&mut t_weights[last_t]);
     zero_head(&mut d_weights[last_d]);
-    for settings in runs() {
-        let mut baseline = open_target(&t_graph, &t_weights, 24, &settings);
-        let mut target = open_target(&t_graph, &t_weights, 24, &settings);
-        let mut drafter = open_drafter(&d_graph, &d_weights, 24, 4, 0, &settings);
-        let req = || Request {
-            tokens: vec![2, 6, 1],
-            max_tokens: 10,
-            ..Request::default()
-        };
-        let mut want_ev = Vec::new();
-        baseline.generate(req(), &mut |e| want_ev.push(e)).unwrap();
-        let mut got_ev = Vec::new();
-        let stats = Speculate::new(&mut target, &mut drafter)
-            .unwrap()
-            .generate(req(), &mut |e| {
-                got_ev.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
-        assert!(
-            stats.accepted > 0,
-            "expected accepted drafts, got {stats:?}"
-        );
-        assert!(stats.steps < stats.emitted);
-    }
+    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 10);
+    assert!(
+        stats.accepted > 0,
+        "expected accepted drafts, got {stats:?}"
+    );
+    assert!(stats.steps < stats.emitted);
+}
+
+#[test]
+fn dflash2_selector() {
+    let mut mla_cfg = small::deepseek();
+    mla_cfg.stack.vocab = 600;
+    mla_cfg.stack.max_seqs = 1;
+    mla_cfg.stack.max_context = 24;
+    let spec = TargetSpec {
+        vocab: mla_cfg.stack.vocab,
+        hidden: mla_cfg.stack.hidden,
+        layers: mla_cfg.stack.layers,
+        tied: false,
+    };
+    let mut d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
+    d_cfg.sliding_window = Some(16);
+    d_cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    d_cfg.selector = Some(dflash::SelectorConfig { rank: 8, top_k: 4 });
+    mla_cfg.stack.taps = d_cfg.tap_layers();
+    let t_graph = mla::stepper::<mla::Moe>(&mla_cfg);
+    let t_weights = weights(&t_graph, &mut Noise(41));
+    let d_graph = dflash::stepper::<()>(&d_cfg);
+    let d_weights = weights(&d_graph, &mut Noise(43));
+    let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8);
+    assert!(stats.emitted == 8 && stats.steps > 0);
 }
 
 #[test]

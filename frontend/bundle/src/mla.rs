@@ -5,7 +5,7 @@ use crate::{each, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{File, Offer, exlr8};
+use tessera_checkpoint::{Offer, Shards};
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
 
@@ -200,30 +200,46 @@ pub fn release(
     context: u64,
     width: u32,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(dir, [seqs, context], width, None)
+    open(dir, None, [seqs, context], width, None, None)
 }
 
 /// The step graph of `dir`. The `user` rules go last.
 pub(crate) fn stepping(
-    dir: &Path,
+    (dir, json, manifest): (&Path, &str, Option<&str>),
     sizes: [u64; 2],
     width: u32,
     user: &[Rule],
     steps: Steps,
     taps: &[u64],
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(dir, sizes, width, Some((user, steps, taps)))
+    open(
+        dir,
+        Some(json),
+        sizes,
+        width,
+        manifest,
+        Some((user, steps, taps)),
+    )
 }
 
 /// A `step` sets the graph's rules, mask and taps.
 fn open(
     dir: &Path,
+    merged: Option<&str>,
     [seqs, context]: [u64; 2],
     width: u32,
+    manifest: Option<&str>,
     step: Option<(&[Rule], Steps, &[u64])>,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    let json = std::fs::read_to_string(dir.join("config.json"))?;
-    let mut config = config(&json, seqs, context)?;
+    let owned;
+    let json = match merged {
+        Some(s) => s,
+        None => {
+            owned = std::fs::read_to_string(dir.join("config.json"))?;
+            &owned
+        }
+    };
+    let mut config = config(json, seqs, context)?;
     let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
     let mut rules = rules(&config, exlr8);
     if let Some((user, steps, taps)) = step {
@@ -238,8 +254,8 @@ fn open(
         (false, false) => program::<Moe>(&config),
     };
     let offer: Box<dyn Offer> = match exlr8 {
-        true => Box::new(exlr8::Release::open(dir).width(width)),
-        false => Box::new(File::open(&dir.join("model.safetensors"))?),
+        true => Box::new(crate::release(dir, manifest)?.width(width)),
+        false => Box::new(Shards::open(dir)?),
     };
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {

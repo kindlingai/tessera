@@ -202,6 +202,32 @@ fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::names::Rule>, S
     }
 }
 
+/// Opens a ranked target engine and loads its sharded weights.
+fn open_target(
+    o: &Options,
+    links: Option<crate::ranks::Links>,
+    target: tessera_bundle::Bundle,
+    settings: &Settings,
+) -> Result<(Engine, tessera_bundle::Bundle), String> {
+    let mut recipe = lowering(o, target.pins.clone());
+    if recipe.config.is_none() {
+        recipe.config = target.config.clone();
+    }
+    let count = target.graph.weights.len() as u32;
+    let mut engine = o.ranks.open(
+        links,
+        target.graph.clone(),
+        o.max_model_len,
+        (&recipe, settings),
+    )?;
+    let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
+    let shares = |at: u32| shares[at as usize];
+    (target.weights)
+        .each_share(shares, |at, w| engine.load_weight(at, w))
+        .map_err(|e| e.to_string())?;
+    Ok((engine, target))
+}
+
 /// Loads a target and DFlash drafter, then answers requests.
 fn draft_thread(
     o: &Options,
@@ -210,26 +236,38 @@ fn draft_thread(
     info: Info,
     slot: &Slot,
 ) -> Result<(), String> {
-    if o.guided || !o.ranks.alone() {
-        return Err("--draft cannot combine with --guided or multi-rank yet".into());
+    if o.guided {
+        return Err("--draft cannot combine with --guided yet".into());
     }
     let start = Instant::now();
+    let links = o.ranks.join(settings)?;
     let rules = user_rules(settings)?;
     let at = [1u64, o.max_model_len as u64];
     let manifest = o.manifest.as_deref();
+    if o.ranks.follows() {
+        let target = tessera_bundle::dflash::load_target(
+            [&o.model, draft_dir],
+            at,
+            &rules,
+            &o.config,
+            manifest,
+        )
+        .map_err(|e| e.to_string())?;
+        let (mut engine, _) = open_target(o, links, target, settings)?;
+        let seconds = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{}: loaded tapped target in {seconds:.1} s",
+            engine.device()
+        );
+        return engine.follow().map_err(|e| e.to_string());
+    }
     let pair = tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
         .map_err(|e| e.to_string())?;
-    let mut recipe = lowering(o, pair.target.pins);
-    if recipe.config.is_none() {
-        recipe.config = pair.target.config;
-    }
-    let mut engine = Engine::open(pair.target.graph, o.max_model_len, &recipe, settings)
-        .map_err(|e| e.to_string())?;
-    pair.target
-        .weights
-        .each(|idx, w| engine.load_weight(idx, w))
-        .map_err(|e| e.to_string())?;
-    let draft_recipe = lowering(o, Some(pair.pins));
+    let (mut engine, target) = open_target(o, links, pair.target, settings)?;
+    let draft_recipe = Recipe {
+        pins: pair.pins,
+        ..Recipe::default()
+    };
     let mut drafter = Drafter::open(
         pair.graph,
         o.max_model_len,
@@ -239,6 +277,7 @@ fn draft_thread(
         settings,
     )
     .map_err(|e| e.to_string())?;
+    drafter.set_causal(pair.causal);
     drafter.load(&pair.weights).map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!(
@@ -247,9 +286,9 @@ fn draft_thread(
         pair.block
     );
     let generate = Arc::new(Generate {
-        tokenizer: pair.target.tokenizer,
-        template: pair.target.template,
-        stop: pair.target.stop,
+        tokenizer: target.tokenizer,
+        template: target.template,
+        stop: target.stop,
         guides: None,
     });
     let (queue, jobs) = mpsc::channel::<Job>();
@@ -285,6 +324,7 @@ fn draft_thread(
             );
         }
     }
+    let _ = engine.dismiss();
     Ok(())
 }
 

@@ -406,7 +406,14 @@ pub(crate) fn load_tapped(
     }
     let json = overrides.merged("config.json", &dir.join("config.json"))?;
     if mla::config(&json, slots, context).is_ok() {
-        let release = mla::stepping(dir, [slots, context], WIDTH, user, steps, taps)?;
+        let release = mla::stepping(
+            (dir, &json, manifest),
+            [slots, context],
+            WIDTH,
+            user,
+            steps,
+            taps,
+        )?;
         let (graph, pins) = (release.graph.clone(), release.pins.clone());
         return dressed(
             dir,

@@ -6,9 +6,23 @@ use crate::shared::{Stack, join_rows, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Composite, DType, Dim, DimExpr, Embed, EntryKind, Graph, Kept, Linear, Mask, Model, Norm,
-    Pairs, Port, Role, Size, Tensor, TensorType, Weights,
+    Act, Composite, DType, Dim, DimExpr, Embed, EntryKind, Graph, Kept, Linear, Mask, Model, Norm,
+    Pairs, PathSeg, Port, Role, Size, Tensor, TensorType, Weights,
 };
+
+/// Dynamic grouped causal convolution dimensions for DFlash2 layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvConfig {
+    pub taps: u64,
+    pub group_size: u64,
+}
+
+/// Bilinear candidate path selector dimensions for DFlash2 outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectorConfig {
+    pub rank: u64,
+    pub top_k: u64,
+}
 
 /// Target model dimensions a drafter inherits when omitted.
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +48,16 @@ pub struct Config {
     pub target_hidden: u64,
     /// 0-based target layer indices whose states condition drafting.
     pub target_layers: Vec<u64>,
+    /// Sliding attention window, when enabled by the checkpoint.
+    pub sliding_window: Option<u64>,
+    /// Whether draft queries attend causally within the block.
+    pub causal: bool,
+    /// Optional per-layer grouped dynamic causal convolutions (DFlash2).
+    pub conv: Option<ConvConfig>,
+    /// Optional candidate path selector over top-k logits (DFlash2).
+    pub selector: Option<SelectorConfig>,
+    pub output_multiplier: f32,
+    pub logit_softcap: Option<f32>,
 }
 
 /// Evenly spaced 0-based target layer indices for `draft_layers`.
@@ -92,6 +116,50 @@ impl Config {
                 format!("layer id past target's {} layers", target.layers),
             );
         }
+        let use_window = k.or(&["use_sliding_window"], false);
+        let sliding_window: Option<u64> = if use_window {
+            k.or(&["sliding_window"], None).filter(|&w| w > 1)
+        } else {
+            None
+        };
+        let causal = k
+            .or::<Option<bool>>(&["dflash_config.causal"], None)
+            .or_else(|| k.or::<Option<bool>>(&["is_causal"], None))
+            .unwrap_or(false);
+        let taps: Option<u64> = k.or(&["dflash_config.conv_kernel_size"], None);
+        let group_size: Option<u64> = k.or(&["dflash_config.conv_group_size"], None);
+        let conv = match (taps, group_size) {
+            (Some(taps), Some(group_size)) => {
+                if taps == 0 || group_size == 0 || !hidden.is_multiple_of(group_size) {
+                    k.misfit("conv_group_size", "conv_group_size must divide hidden_size");
+                }
+                Some(ConvConfig { taps, group_size })
+            }
+            (None, None) => None,
+            _ => {
+                k.misfit("conv_kernel_size", "conv needs both kernel and group size");
+                None
+            }
+        };
+        let rank: Option<u64> = k.or(&["dflash_config.selector_rank"], None);
+        let top_k: Option<u64> = k.or(&["dflash_config.selector_top_k"], None);
+        let selector = match (rank, top_k) {
+            (Some(rank), Some(top_k)) => {
+                if rank == 0 || top_k == 0 {
+                    k.misfit("selector_top_k", "selector rank and top_k must be positive");
+                }
+                Some(SelectorConfig { rank, top_k })
+            }
+            (None, None) => None,
+            _ => {
+                k.misfit("selector_rank", "selector needs both rank and top_k");
+                None
+            }
+        };
+        let output_multiplier = k.or(&["dflash_config.output_multiplier"], 1.0f32);
+        let logit_softcap = k
+            .or::<Option<f32>>(&["dflash_config.final_logit_softcapping"], None)
+            .filter(|&v| v > 0.0);
         let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
@@ -103,6 +171,12 @@ impl Config {
             mask_token,
             target_hidden: target.hidden,
             target_layers,
+            sliding_window,
+            causal,
+            conv,
+            selector,
+            output_multiplier,
+            logit_softcap,
         }
     }
 
@@ -126,6 +200,12 @@ impl Config {
             mask_token,
             target_hidden: target.hidden,
             target_layers,
+            sliding_window: None,
+            causal: false,
+            conv: None,
+            selector: None,
+            output_multiplier: 1.0,
+            logit_softcap: None,
         }
     }
 
@@ -243,14 +323,206 @@ fn attention<N: HeadNorm>(
     let by = [&p.kv_slots, &p.kv_pos];
     let (k, v) = (k.append(keys, by), v.append(values, by));
     let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
+    let mask = match c.sliding_window {
+        Some(w) => Mask::Back(w - 1),
+        None => Mask::Causal,
+    };
     let attn = m.attend_rows(
-        Mask::Causal,
+        mask,
         scale,
         [&q, &k, &v],
         [&p.block_slots, &p.attend_pos],
         None,
     );
     attn.reshape(vec![blk, Heads * HeadDim]).matmul(&l.o)
+}
+
+/// Weights for one DFlash2 grouped dynamic causal convolution.
+struct ConvWeights {
+    base: Tensor,
+    proj: Linear,
+}
+
+impl ConvWeights {
+    fn declare(m: &Model, layer: u64, kind: &str, hidden: u64, conv: ConvConfig) -> Self {
+        let groups = hidden / conv.group_size;
+        let path = |leaf: &str| {
+            vec![
+                PathSeg::Field("layers".into()),
+                PathSeg::Index(layer as u32),
+                PathSeg::Field(kind.into()),
+                PathSeg::Field(leaf.into()),
+            ]
+        };
+        let base = m.weight(
+            &path("base_kernel"),
+            TensorType::new(
+                vec![2u64.into(), conv.taps.into(), Hidden.into()],
+                DType::F32,
+            ),
+        );
+        let proj = Linear::of(m.weight(
+            &path("kernel_projection"),
+            TensorType::new(
+                vec![(2 * conv.taps * groups).into(), Hidden.into()],
+                DType::F32,
+            ),
+        ));
+        Self { base, proj }
+    }
+
+    fn convolve(
+        &self,
+        x: &Tensor,
+        delta: &Tensor,
+        side: u64,
+        block: u64,
+        hidden: u64,
+        conv: ConvConfig,
+    ) -> Tensor {
+        let groups = hidden / conv.group_size;
+        let gs = conv.group_size;
+        let x_g = x.reshape(vec![block.into(), groups.into(), gs.into()]);
+        let base = self.base.scale(1.0);
+        let mut out: Option<Tensor> = None;
+        for tap in 0..conv.taps {
+            let b = base
+                .slice(0, side, 1u64)
+                .slice(1, tap, 1u64)
+                .reshape(vec![1u64.into(), groups.into(), gs.into()])
+                .expand(0, block);
+            let d = delta
+                .slice(1, tap, 1u64)
+                .reshape(vec![block.into(), groups.into(), 1u64.into()])
+                .expand(2, gs);
+            let shifted = if tap == 0 {
+                x_g.clone()
+            } else if tap < block {
+                let zeros = x.slice(0, 0u64, tap).scale(0.0);
+                let prev = x.slice(0, 0u64, block - tap);
+                join_rows(&zeros, &prev).reshape(vec![block.into(), groups.into(), gs.into()])
+            } else {
+                x_g.scale(0.0)
+            };
+            let term = b.add(&d).mul(&shifted);
+            out = Some(match out {
+                Some(acc) => acc.add(&term),
+                None => term,
+            });
+        }
+        out.expect("conv taps >= 1")
+            .reshape(vec![block.into(), Hidden.into()])
+    }
+
+    fn prepare(&self, x: &Tensor, block: u64, hidden: u64, conv: ConvConfig) -> (Tensor, Tensor) {
+        let groups = hidden / conv.group_size;
+        let coeff = x.matmul(&self.proj).reshape(vec![
+            block.into(),
+            2u64.into(),
+            conv.taps.into(),
+            groups.into(),
+        ]);
+        let d0 =
+            coeff
+                .slice(1, 0u64, 1u64)
+                .reshape(vec![block.into(), conv.taps.into(), groups.into()]);
+        let d1 =
+            coeff
+                .slice(1, 1u64, 1u64)
+                .reshape(vec![block.into(), conv.taps.into(), groups.into()]);
+        (self.convolve(x, &d0, 0, block, hidden, conv), d1)
+    }
+
+    fn finish(
+        &self,
+        x: &Tensor,
+        delta: &Tensor,
+        block: u64,
+        hidden: u64,
+        conv: ConvConfig,
+    ) -> Tensor {
+        self.convolve(x, delta, 1, block, hidden, conv)
+    }
+}
+
+/// Weights for the DFlash2 bilinear candidate path selector.
+struct SelectorWeights {
+    proj: Linear,
+    pred: Tensor,
+    succ: Tensor,
+}
+
+impl SelectorWeights {
+    fn declare(m: &Model, sel: SelectorConfig) -> Self {
+        let path = |leaf: &str| {
+            vec![
+                PathSeg::Field("candidate_selector".into()),
+                PathSeg::Field(leaf.into()),
+            ]
+        };
+        let proj = Linear::of(m.weight(
+            &path("hidden_projection"),
+            TensorType::new(vec![sel.rank.into(), Hidden.into()], DType::F32),
+        ));
+        let pred = m.weight(
+            &path("predecessor_codebook"),
+            TensorType::new(vec![Vocab.into(), sel.rank.into()], DType::F32),
+        );
+        let succ = m.weight(
+            &path("successor_codebook"),
+            TensorType::new(vec![Vocab.into(), sel.rank.into()], DType::F32),
+        );
+        Self { proj, pred, succ }
+    }
+
+    fn lattice(
+        &self,
+        c: &Config,
+        sel: SelectorConfig,
+        draft: &Tensor,
+        logits: &Tensor,
+        block_tokens: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let (n, k, r) = (c.block_size - 1, sel.top_k, sel.rank);
+        let cands = logits.top_k(k);
+        let mut unary = logits.take(&cands);
+        if c.output_multiplier != 1.0 {
+            unary = unary.scale(c.output_multiplier);
+        }
+        if let Some(cap) = c.logit_softcap {
+            unary = unary.scale(1.0 / cap).act(Act::Tanh).scale(cap);
+        }
+        let proj = draft.matmul(&self.proj);
+        let anchor = self
+            .pred
+            .gather(block_tokens)
+            .slice(0, 0u64, 1u64)
+            .expand(0, k);
+        let cands_flat = cands.reshape(vec![(n * k).into()]);
+        let pred = if n > 1 {
+            let prev = self.pred.gather(&cands_flat).slice(0, 0u64, (n - 1) * k);
+            join_rows(&anchor, &prev)
+        } else {
+            anchor
+        }
+        .reshape(vec![n.into(), k.into(), r.into()]);
+        let succ = self
+            .succ
+            .gather(&cands_flat)
+            .reshape(vec![n.into(), k.into(), r.into()]);
+        let lhs = pred.mul(
+            &proj
+                .reshape(vec![n.into(), 1u64.into(), r.into()])
+                .expand(1, k),
+        );
+        let pair = lhs.matmul_rows(&succ);
+        let scores = pair.add(
+            &unary
+                .reshape(vec![n.into(), 1u64.into(), k.into()])
+                .expand(1, k),
+        );
+        (cands_flat, scores)
+    }
 }
 
 /// Cached DFlash step graph: block plus taps in, drafts out.
@@ -262,6 +534,17 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
     );
     let m = Model::new(c.dims());
     let (w, head) = with_head::<Drafter<N>>(&m, c.tied);
+    let convs: Option<Vec<[ConvWeights; 2]>> = c.conv.map(|cv| {
+        (0..c.stack.layers)
+            .map(|i| {
+                [
+                    ConvWeights::declare(&m, i, "attention_conv", c.stack.hidden, cv),
+                    ConvWeights::declare(&m, i, "mlp_conv", c.stack.hidden, cv),
+                ]
+            })
+            .collect()
+    });
+    let selector = c.selector.map(|sel| SelectorWeights::declare(&m, sel));
     let p = entry_ports(&m, c.block_size);
     let ty = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
     let kept: Vec<Cache> = w
@@ -274,22 +557,46 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
     for (i, l) in w.layers.iter().enumerate() {
         let [out] = m.composite(Composite::Layer, || {
             let h = x.rms_norm(&l.ln1, c.eps);
-            let [attn] = m.composite(Composite::Attention, || {
-                [attention(&m, c, l, &ctx, &h, &p, &kept[i])]
-            });
+            let attn = match (c.conv, &convs) {
+                (Some(cv), Some(cs)) => {
+                    let (hc, k_attn) = cs[i][0].prepare(&h, c.block_size, c.stack.hidden, cv);
+                    let [a] = m.composite(Composite::Attention, || {
+                        [attention(&m, c, l, &ctx, &hc, &p, &kept[i])]
+                    });
+                    cs[i][0].finish(&a, &k_attn, c.block_size, c.stack.hidden, cv)
+                }
+                _ => m.composite(Composite::Attention, || {
+                    [attention(&m, c, l, &ctx, &h, &p, &kept[i])]
+                })[0]
+                    .clone(),
+            };
             let x = x.add(&attn);
             let h = x.rms_norm(&l.ln2, c.eps);
-            let [mlp] = m.composite(Swiglu::KIND, || [l.mlp.apply(&m, &h)]);
+            let mlp = match (c.conv, &convs) {
+                (Some(cv), Some(cs)) => {
+                    let (hc, k_mlp) = cs[i][1].prepare(&h, c.block_size, c.stack.hidden, cv);
+                    let [y] = m.composite(Swiglu::KIND, || [l.mlp.apply(&m, &hc)]);
+                    cs[i][1].finish(&y, &k_mlp, c.block_size, c.stack.hidden, cv)
+                }
+                _ => m.composite(Swiglu::KIND, || [l.mlp.apply(&m, &h)])[0].clone(),
+            };
             [x.add(&mlp)]
         });
         x = out;
     }
     let h = x.rms_norm(&w.norm, c.eps);
-    let draft = h.slice(0, 1u64, c.block_size - 1);
+    let n = c.block_size - 1;
+    let draft = h.slice(0, 1u64, n);
     let head = head.as_ref().unwrap_or(&w.embed);
     let logits = draft.unembed(head);
-    let ids = logits
-        .top_k(1u64)
-        .reshape(vec![DimExpr::Const(c.block_size - 1)]);
+    if let (Some(sel_cfg), Some(sel)) = (c.selector, &selector) {
+        let (cands, scores) = sel.lattice(c, sel_cfg, &draft, &logits, &p.block_tokens);
+        return m.finish([
+            (Role::Candidates, &cands),
+            (Role::Taps, &scores),
+            (Role::Logits, &logits),
+        ]);
+    }
+    let ids = logits.top_k(1u64).reshape(vec![DimExpr::Const(n)]);
     m.finish([(Role::Tokens, &ids), (Role::Logits, &logits)])
 }

@@ -1,4 +1,4 @@
-use crate::dflash::{Overlay, has_norms};
+use crate::dflash::{Overlay, extra_rules, has_norms};
 use crate::names;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
 use tessera_engine::Norm;
@@ -74,10 +74,35 @@ fn config_and_names() {
         sl("lm_head.weight", &[256, 64]),
         sl("model.norm.weight", &[64]),
     ];
-    let (a, b) = (Mock(draft), Mock(tgt));
+    let (a, b) = (Mock(draft), Mock(tgt.clone()));
     let graph = stepper::<Norm>(&cfg);
     let claims = names::resolve(&graph, &Overlay::new(&a, &b).slices(), &[]).unwrap();
     assert_eq!(claims.len(), graph.weights.len());
     assert_eq!(claims[0].name, "model.embed_tokens.weight");
     assert_eq!(claims.last().unwrap().name, "lm_head.weight");
+
+    let json2 = r#"{"block_size":8,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-5,"rope_parameters":{"rope_theta":1e6},"is_causal":false,"use_sliding_window":true,"sliding_window":2048,"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"mask_token_id":99,"selector_rank":16,"selector_top_k":4,"target_layer_ids":[1,5]}}"#;
+    let offer2 = Offered::parse("config.json", json2).unwrap();
+    let mut keys2 = Keys::new(std::slice::from_ref(&offer2));
+    let cfg2 = Config::read(&mut keys2, &target, 1, 64);
+    keys2.finish().unwrap();
+    assert!(!cfg2.causal && cfg2.sliding_window == Some(2048));
+    let mut d2 = draft_slices(2);
+    for i in 0..2 {
+        for kind in ["attention_conv", "mlp_conv"] {
+            d2.push(sl(format!("layers.{i}.{kind}.base_kernel"), &[2, 2, 64]));
+            d2.push(sl(
+                format!("layers.{i}.{kind}.kernel_projection.weight"),
+                &[16, 64],
+            ));
+        }
+    }
+    d2.push(sl("candidate_selector.hidden_projection.weight", &[16, 64]));
+    d2.push(sl("candidate_selector.predecessor_codebook", &[256, 16]));
+    d2.push(sl("candidate_selector.successor_codebook", &[256, 16]));
+    let g2 = stepper::<Norm>(&cfg2);
+    let extra = extra_rules(&cfg2, &d2);
+    let (a2, b2) = (Mock(d2), Mock(tgt));
+    let claims2 = names::resolve(&g2, &Overlay::new(&a2, &b2).slices(), &[&extra]).unwrap();
+    assert_eq!(claims2.len(), g2.weights.len());
 }

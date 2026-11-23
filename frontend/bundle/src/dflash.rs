@@ -18,6 +18,7 @@ pub struct DFlash {
     pub pins: Pins,
     pub block: usize,
     pub mask_token: u32,
+    pub causal: bool,
     /// 0-based target layer indices from the drafter config.
     pub target_layers: Vec<u64>,
 }
@@ -125,6 +126,60 @@ fn target_spec(dir: &Path, overrides: &Overrides) -> Result<TargetSpec> {
     })
 }
 
+/// Weight-name rules for DFlash2 convolutions and candidate selector.
+pub(crate) fn extra_rules(config: &Config, slices: &[Slice]) -> Vec<Rule> {
+    let prefix = match slices.iter().any(|s| s.name.starts_with("model.")) {
+        true => "model.",
+        false => "",
+    };
+    let mut rules = Vec::new();
+    if config.conv.is_some() {
+        for kind in ["attention_conv", "mlp_conv"] {
+            for leaf in ["base_kernel", "kernel_projection"] {
+                rules.push((
+                    format!("layers.*.{kind}.{leaf}"),
+                    format!("{prefix}layers.*.{kind}.{leaf}"),
+                ));
+            }
+        }
+    }
+    if config.selector.is_some() {
+        for leaf in [
+            "hidden_projection",
+            "predecessor_codebook",
+            "successor_codebook",
+        ] {
+            rules.push((
+                format!("candidate_selector.{leaf}"),
+                format!("{prefix}candidate_selector.{leaf}"),
+            ));
+        }
+    }
+    rules
+}
+
+/// Loads only the tapped target bundle, for multi-rank follower ranks.
+pub fn load_target(
+    [target_dir, draft_dir]: [&Path; 2],
+    [slots, context]: [u64; 2],
+    user: &[Rule],
+    overrides: &Overrides,
+    manifest: Option<&str>,
+) -> Result<Bundle> {
+    let spec = target_spec(target_dir, overrides)?;
+    let draft_over = overrides.under("draft");
+    let config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
+    load_tapped(
+        target_dir,
+        [slots, context],
+        user,
+        Steps::Plain,
+        overrides,
+        manifest,
+        &config.tap_layers(),
+    )
+}
+
 /// Loads a tapped target model and its DFlash drafter.
 pub fn load(
     [target_dir, draft_dir]: [&Path; 2],
@@ -158,7 +213,8 @@ pub fn load(
             false => Box::new(Shards::open(target_dir)?),
         };
     let combined = Overlay::new(&draft_offer, target_offer.as_ref());
-    let (weights, pins) = pull(&graph, &combined, config.stack.layers, &[user])?;
+    let extra = extra_rules(&config, &draft_slices);
+    let (weights, pins) = pull(&graph, &combined, config.stack.layers, &[&extra, user])?;
     Ok(DFlash {
         target,
         graph,
@@ -166,6 +222,7 @@ pub fn load(
         pins,
         block: config.block_size as usize,
         mask_token: config.mask_token,
+        causal: config.causal,
         target_layers: config.target_layers,
     })
 }

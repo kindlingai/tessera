@@ -98,6 +98,27 @@ fn sample_residual(target: &[f32], draft: &[f32], u: f32) -> u32 {
     target.len().saturating_sub(1) as u32
 }
 
+/// Greedy walk over a `[n, k, k]` candidate lattice.
+fn walk_lattice(cands: &[u32], scores: &[f32], n: usize, k: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    let mut pred = 0usize;
+    for slot in 0..n {
+        let base = (slot * k + pred) * k;
+        let mut best = 0usize;
+        let mut val = f32::NEG_INFINITY;
+        for c in 0..k {
+            let v = scores[base + c];
+            if v > val {
+                val = v;
+                best = c;
+            }
+        }
+        out.push(cands[slot * k + best]);
+        pred = best;
+    }
+    out
+}
+
 /// Runs a DFlash drafter graph with kept context KV.
 pub struct Drafter {
     graph: Graph,
@@ -110,6 +131,23 @@ pub struct Drafter {
     tap_width: usize,
     vocab: usize,
     mask_token: u32,
+    causal: bool,
+    selector_k: Option<usize>,
+    profile: Option<u64>,
+    launches: u64,
+}
+
+fn selector_top_k(graph: &Graph, block: usize) -> Option<usize> {
+    let entry = graph.entries.first()?;
+    let out = entry.outputs.iter().find(|o| o.role == Role::Candidates)?;
+    let n = block.checked_sub(1)?;
+    let total = graph.nodes[out.node.0 as usize]
+        .ty
+        .shape
+        .0
+        .first()?
+        .value(&graph.dims, &|_| None)? as usize;
+    (n > 0 && total.is_multiple_of(n)).then_some(total / n)
 }
 
 impl Drafter {
@@ -136,6 +174,7 @@ impl Drafter {
         let slots = dim(Seqs).unwrap_or(1);
         let tap_width = dim(Embedding).ok_or(Error::Taps)?;
         let vocab = dim(Vocab).ok_or(Error::Scores)?;
+        let selector_k = selector_top_k(&graph, block);
         let device = Device::guess(settings).with(recipe);
         let mut plans = Cache::default();
         let first = [
@@ -144,7 +183,10 @@ impl Drafter {
             (Context, block as u64),
             (Segments, 1),
         ];
-        let wants = Wants::role(&graph, 0, Role::Tokens);
+        let wants = match selector_k {
+            Some(_) => Wants::roles(&graph, 0, &[Role::Candidates, Role::Taps]),
+            None => Wants::role(&graph, 0, Role::Tokens),
+        };
         let (plan, _) = plans.wanting(&graph, 0, wants, &first, &[Context, Segments], &device)?;
         let mut runner = open(plan.clone(), settings)?;
         runner.launching(recipe.launch);
@@ -163,7 +205,16 @@ impl Drafter {
             tap_width,
             vocab,
             mask_token,
+            causal: false,
+            selector_k,
+            profile: settings.profile,
+            launches: 0,
         })
+    }
+
+    /// Sets whether draft block queries attend causally within the block.
+    pub fn set_causal(&mut self, causal: bool) {
+        self.causal = causal;
     }
 
     /// Uploads the drafter's weights, in graph order.
@@ -208,6 +259,14 @@ impl Drafter {
         ctx_pos: usize,
         taps: &[f32],
     ) -> Result<Vec<u32>, Error> {
+        if let Some(k) = self.selector_k {
+            let wants = Wants::roles(&self.graph, 0, &[Role::Candidates, Role::Taps]);
+            let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
+            let cands = self.runner.ids(outputs[0])?;
+            let raw = self.runner.read(outputs[1])?;
+            let scores = raw.floats().map_err(tessera_run::Error::from)?;
+            return Ok(walk_lattice(&cands, scores, self.block - 1, k));
+        }
         let wants = Wants::role(&self.graph, 0, Role::Tokens);
         let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
         let mut ids = self.runner.ids(outputs[0])?;
@@ -273,7 +332,11 @@ impl Drafter {
         block_tokens[0] = anchor;
         let block_pos: Vec<u32> = (start..start + self.block).map(|p| p as u32).collect();
         let block_slots = vec![slot; self.block];
-        let attend_pos = vec![(start + self.block - 1) as u32; self.block];
+        let attend_pos = if self.causal {
+            block_pos.clone()
+        } else {
+            vec![(start + self.block - 1) as u32; self.block]
+        };
         let kv_slots = vec![slot; kv_len];
         let feeds = [
             Tensor::u32(vec![self.block], block_tokens),
@@ -304,6 +367,15 @@ impl Drafter {
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
         self.runner.feed(&views)?;
         self.runner.submit(0..self.runner.plan().steps.len())?;
+        if let Some(every) = self.profile {
+            self.launches += 1;
+            if every > 0
+                && self.launches.is_multiple_of(every)
+                && let Some(p) = self.runner.take_profile()
+            {
+                eprintln!("drafter profile of {every} launches:\n{}", p.report(every));
+            }
+        }
         Ok(outputs)
     }
 }
