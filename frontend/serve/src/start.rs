@@ -6,8 +6,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 use tessera_bundle::Overrides;
+use tessera_engine::comm::Transport;
+use tessera_engine::sums::Sum;
 use tessera_engine::wasm::Module;
-use tessera_engine::{Batch, Drafter, Engine, Fair, Pins, Recipe, Settings, Speculate, Steps};
+use tessera_engine::{
+    Batch, Drafter, Engine, Fair, Pins, Place, Recipe, Settings, Speculate, Steps,
+};
 use tessera_tasks::api::{Embed, GenerateImage, Info, Score, Tokens};
 use tessera_tasks::klein::Klein;
 use tessera_tasks::paint::Painter;
@@ -70,6 +74,8 @@ pub struct Options {
     pub names: Option<PathBuf>,
     /// This rank and its peers. Empty serves alone.
     pub ranks: crate::ranks::Ranks,
+    /// Per-rank split weights mirrored from `--parts`.
+    parts: Vec<u32>,
     /// Config values the recipe sets, by file.
     pub config: Overrides,
     /// The exlr8 manifest that picks the widths.
@@ -98,6 +104,7 @@ impl Default for Options {
             lower: None,
             names: None,
             ranks: Default::default(),
+            parts: Vec::new(),
             config: Overrides::default(),
             manifest: None,
         }
@@ -133,7 +140,13 @@ impl Options {
             "--image-size" => self.image_size = value.parse().ok()?,
             "--clip" => self.clip = Some(value.into()),
             "--draft" => self.draft = Some(value.into()),
-            _ => return self.ranks.flag(flag, &value),
+            _ => {
+                if flag == "--parts" {
+                    let parts = value.split(',').map(|p| p.parse().ok());
+                    self.parts = parts.collect::<Option<_>>()?;
+                }
+                return self.ranks.flag(flag, &value);
+            }
         }
         Some(())
     }
@@ -228,6 +241,75 @@ fn open_target(
     Ok((engine, target))
 }
 
+/// Transport and optional sum grid handed to a ranked drafter.
+type DraftLinks = (Box<dyn Transport>, Option<Box<dyn Sum>>);
+
+/// Shares `links`'s sums and grid across target and drafter.
+fn split_links(
+    links: Option<crate::ranks::Links>,
+) -> (Option<crate::ranks::Links>, Option<DraftLinks>) {
+    let Some(([sums, control], grids)) = links else {
+        return (None, None);
+    };
+    let [target_sums, draft_sums] = Drafter::share_transport(sums);
+    let (target_grids, draft_grid) = match grids {
+        crate::ranks::Grids::Sums(grid) => {
+            let [g0, g1] = Drafter::share_sum(grid);
+            (crate::ranks::Grids::Sums(g0), Some(g1))
+        }
+        other => (other, None),
+    };
+    (
+        Some(([target_sums, control], target_grids)),
+        Some((draft_sums, draft_grid)),
+    )
+}
+
+/// Opens a single-rank or TP-sharded drafter and streams its weights.
+fn open_drafter(
+    o: &Options,
+    links: Option<DraftLinks>,
+    pair: &tessera_bundle::dflash::DFlash,
+    settings: &Settings,
+) -> Result<Drafter, String> {
+    let recipe = Recipe {
+        pins: pair.pins.clone(),
+        ..Recipe::default()
+    };
+    let mut drafter = match links {
+        Some((sums, grid)) => {
+            let gpu = settings.gpu().is_some();
+            let place = Place::mesh(sums.ranks() as usize, o.parts.clone(), gpu);
+            Drafter::open_ranked(
+                pair.graph.clone(),
+                o.max_model_len,
+                pair.block,
+                pair.mask_token,
+                (&recipe, settings),
+                place,
+                sums,
+                grid,
+            )
+        }
+        None => Drafter::open(
+            pair.graph.clone(),
+            o.max_model_len,
+            pair.block,
+            pair.mask_token,
+            &recipe,
+            settings,
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+    drafter.set_causal(pair.causal);
+    let count = drafter.weight_count();
+    let shares: Vec<_> = (0..count).map(|at| drafter.share(at)).collect();
+    pair.weights
+        .each_share(|at| shares[at as usize], |at, w| drafter.load_weight(at, w))
+        .map_err(|e| e.to_string())?;
+    Ok(drafter)
+}
+
 /// Loads a target and DFlash drafter, then answers requests.
 fn draft_thread(
     o: &Options,
@@ -240,51 +322,24 @@ fn draft_thread(
         return Err("--draft cannot combine with --guided yet".into());
     }
     let start = Instant::now();
-    let links = o.ranks.join(settings)?;
+    let (target_links, draft_links) = split_links(o.ranks.join(settings)?);
     let rules = user_rules(settings)?;
     let at = [1u64, o.max_model_len as u64];
     let manifest = o.manifest.as_deref();
-    if o.ranks.follows() {
-        let target = tessera_bundle::dflash::load_target(
-            [&o.model, draft_dir],
-            at,
-            &rules,
-            &o.config,
-            manifest,
-        )
-        .map_err(|e| e.to_string())?;
-        let (mut engine, _) = open_target(o, links, target, settings)?;
-        let seconds = start.elapsed().as_secs_f64();
-        eprintln!(
-            "{}: loaded tapped target in {seconds:.1} s",
-            engine.device()
-        );
-        return engine.follow().map_err(|e| e.to_string());
-    }
     let pair = tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
         .map_err(|e| e.to_string())?;
-    let (mut engine, target) = open_target(o, links, pair.target, settings)?;
-    let draft_recipe = Recipe {
-        pins: pair.pins,
-        ..Recipe::default()
-    };
-    let mut drafter = Drafter::open(
-        pair.graph,
-        o.max_model_len,
-        pair.block,
-        pair.mask_token,
-        &draft_recipe,
-        settings,
-    )
-    .map_err(|e| e.to_string())?;
-    drafter.set_causal(pair.causal);
-    drafter.load(&pair.weights).map_err(|e| e.to_string())?;
+    let mut drafter = open_drafter(o, draft_links, &pair, settings)?;
+    let (mut engine, target) = open_target(o, target_links, pair.target, settings)?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!(
         "{}: loaded target + dflash (block {}) in {seconds:.1} s",
         engine.device(),
         pair.block
     );
+    if o.ranks.follows() {
+        let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
+        return spec.follow().map_err(|e| e.to_string());
+    }
     let generate = Arc::new(Generate {
         tokenizer: target.tokenizer,
         template: target.template,

@@ -17,6 +17,9 @@ impl Offer for Mock {
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
         Err(Error::Format(name.into()))
     }
+    fn packed_axis(&self, name: &str, axis: u32, range: (usize, usize)) -> Result<Vec<u8>, Error> {
+        Ok(format!("{name}:{axis}:{}:{}", range.0, range.1).into_bytes())
+    }
 }
 
 fn sl(name: impl Into<String>, shape: &[usize]) -> Slice {
@@ -133,6 +136,15 @@ fn config_and_names() {
     let g3 = stepper::<Norm>(&cfg3);
     let extra3 = extra_rules(&cfg3, &d3);
     let (a3, b3) = (Mock(d3), Mock(tgt));
-    let claims3 = names::resolve(&g3, &Overlay::new(&a3, &b3).slices(), &[&extra3]).unwrap();
+    let overlay3 = Overlay::new(&a3, &b3);
+    let claims3 = names::resolve(&g3, &overlay3.slices(), &[&extra3]).unwrap();
     assert_eq!(claims3.len(), g3.weights.len());
+    assert_eq!(
+        overlay3.packed_axis("fc.weight", 0, (0, 32)).unwrap(),
+        b"fc.weight:0:0:32"
+    );
+    assert_eq!(
+        overlay3.packed_axis("lm_head.weight", 0, (64, 64)).unwrap(),
+        b"lm_head.weight:0:64:64"
+    );
 }

@@ -1,12 +1,14 @@
 //! DFlash speculative decoding and tapped step tests.
 
+use std::net::{TcpListener, TcpStream};
+use tessera_engine::comm::Sockets;
 use tessera_engine::{
-    Drafter, Engine, Event, Reason, Recipe, Request, Row, SpecStats, Speculate, accept_greedy,
-    accept_sample,
+    Drafter, Engine, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate,
+    accept_greedy, accept_sample,
 };
-use tessera_graph::Graph;
+use tessera_graph::{Graph, Parts, PathSeg};
 use tessera_interp::{Store, Tensor, run_kept};
-use tessera_lower::Weight;
+use tessera_lower::{Cluster, Pick, Settings, Weight};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::dflash::{self, TargetSpec};
 use tessera_models::{mla, small};
@@ -315,4 +317,168 @@ fn accept_rules() {
     // Accepts at u = 0.3 and draws bonus from p1.
     let (acc, bonus) = accept_sample(&[1], &[&q0], &[&p0, &p1], &[0.3, 0.5]);
     assert_eq!((acc, bonus), (1, 2));
+}
+
+fn verify_tp_pair(
+    t_graph: &Graph,
+    t_seed: u64,
+    d_graph: &Graph,
+    d_seed: u64,
+    causal: bool,
+    expect_head_split: bool,
+) {
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let to_w = |g: &Graph, seed: u64| -> Vec<Weight> {
+        weights(g, &mut Noise(seed))
+            .into_iter()
+            .map(Weight::Floats)
+            .collect()
+    };
+    let [[s0, s1], [c0, c1]] = std::array::from_fn(|_| {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (b, _) = l.accept().unwrap();
+        [
+            Sockets::over(0, vec![None, Some(a)]).unwrap(),
+            Sockets::over(1, vec![Some(b), None]).unwrap(),
+        ]
+    });
+    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
+    let follower = std::thread::spawn(move || {
+        let [ts1, ds1] = Drafter::share_transport(Box::new(s1));
+        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
+        let (tw_f, dw_f) = (to_w(&tg_f, t_seed), to_w(&dg_f, d_seed));
+        let mut te = Engine::open_ranked(
+            tg_f,
+            24,
+            (&Recipe::default(), &s_f),
+            place(),
+            ts1,
+            Box::new(c1),
+        )
+        .unwrap();
+        te.load(&tw_f).unwrap();
+        let mut dr = Drafter::open_ranked(
+            dg_f,
+            24,
+            4,
+            0,
+            (&Recipe::default(), &s_f),
+            place(),
+            ds1,
+            None,
+        )
+        .unwrap();
+        dr.set_causal(causal);
+        dr.load(&dw_f).unwrap();
+        Speculate::new(&mut te, &mut dr).unwrap().follow().unwrap();
+    });
+    let [ts0, ds0] = Drafter::share_transport(Box::new(s0));
+    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
+    let t_weights = weights(t_graph, &mut Noise(t_seed));
+    let tw = to_w(t_graph, t_seed);
+    let dw = to_w(d_graph, d_seed);
+    let mut target = Engine::open_ranked(
+        t_graph.clone(),
+        24,
+        (&Recipe::default(), &settings),
+        place(),
+        ts0,
+        Box::new(c0),
+    )
+    .unwrap();
+    target.load(&tw).unwrap();
+    let mut drafter = Drafter::open_ranked(
+        d_graph.clone(),
+        24,
+        4,
+        0,
+        (&Recipe::default(), &settings),
+        place(),
+        ds0,
+        None,
+    )
+    .unwrap();
+    drafter.set_causal(causal);
+    drafter.load(&dw).unwrap();
+    assert!(drafter.has_kernel("all_reduce"), "missing all_reduce");
+    assert!(drafter.has_kernel("all_gather"), "missing all_gather");
+    let at = |tail: &str| {
+        d_graph
+            .weights
+            .iter()
+            .position(|w| matches!(w.path.last(), Some(PathSeg::Field(f)) if f == tail))
+            .unwrap() as u32
+    };
+    for name in ["fc", "q", "k", "v", "o", "gate", "up", "down"] {
+        assert!(drafter.share(at(name)).is_some(), "{name} should shard");
+    }
+    assert_eq!(drafter.share(at("head")).is_some(), expect_head_split);
+    let mut baseline = open_target(t_graph, &t_weights, 24, &settings);
+    let mut spec = Speculate::new(&mut target, &mut drafter).unwrap();
+    for prompt in [vec![2u32, 6, 1], vec![4u32, 1, 5, 3]] {
+        let req = || Request {
+            tokens: prompt.clone(),
+            max_tokens: 7,
+            ..Request::default()
+        };
+        let (mut want_ev, mut got_ev) = (Vec::new(), Vec::new());
+        baseline.generate(req(), &mut |e| want_ev.push(e)).unwrap();
+        let stats = spec
+            .generate(req(), &mut |e| {
+                got_ev.push(e);
+                true
+            })
+            .unwrap();
+        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
+        assert!(stats.steps > 0);
+    }
+    target.dismiss().unwrap();
+    follower.join().unwrap();
+}
+
+#[test]
+fn tp_drafter_matches_one() {
+    let mut t_cfg = Config::toy(1, 24);
+    t_cfg.tied = false;
+    t_cfg.stack.taps = vec![1, 2];
+    let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
+    let spec = TargetSpec {
+        vocab: t_cfg.stack.vocab,
+        hidden: t_cfg.stack.hidden,
+        layers: t_cfg.stack.layers,
+        tied: false,
+    };
+    let d1_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
+    let d1_g = dflash::stepper::<Norm>(&d1_cfg);
+    verify_tp_pair(&t_graph, 61, &d1_g, 67, false, true);
+
+    let mut d2_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
+    d2_cfg.sliding_window = Some(16);
+    d2_cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    d2_cfg.selector = Some(dflash::SelectorConfig { rank: 8, top_k: 4 });
+    let d2_g = dflash::stepper::<Norm>(&d2_cfg);
+    verify_tp_pair(&t_graph, 61, &d2_g, 71, false, true);
+
+    let mut d3_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
+    d3_cfg.stack.layers = 2;
+    d3_cfg.causal = true;
+    d3_cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    d3_cfg.bridge = Some(dflash::BridgeConfig {
+        code_size: 16,
+        rank: 8,
+        top_k: 4,
+        eps: 1e-6,
+    });
+    let d3_g = dflash::stepper::<Norm>(&d3_cfg);
+    verify_tp_pair(&t_graph, 61, &d3_g, 73, true, false);
 }

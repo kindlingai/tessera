@@ -1,7 +1,7 @@
 //! DFlash speculative bundle: tapped target plus cached drafter.
 
 use crate::names::Rule;
-use crate::{Bundle, Overrides, load_tapped, pull, release};
+use crate::{Bundle, Overrides, load_tapped, pins, release};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
@@ -11,11 +11,36 @@ use tessera_engine::{Graph, Norm, Pins, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+/// Streamed drafter weights, cut per rank on load.
+pub struct DraftWeights {
+    graph: Graph,
+    draft: Shards,
+    target: Box<dyn Offer>,
+    rules: Vec<Rule>,
+}
+
+impl DraftWeights {
+    /// Each weight in graph order, sliced to `shares`.
+    pub fn each_share<E: Into<Box<dyn Error + Send + Sync>>>(
+        &self,
+        shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
+        mut take: impl FnMut(u32, &Weight) -> std::result::Result<(), E>,
+    ) -> Result<()> {
+        let combined = Overlay::new(&self.draft, self.target.as_ref());
+        let mut at = 0u32;
+        crate::each(&self.graph, &combined, &[&self.rules], &shares, |w, _| {
+            take(at, &w).map_err(Into::into)?;
+            at += 1;
+            Ok(())
+        })
+    }
+}
+
 /// Loaded target bundle paired with its DFlash drafter.
 pub struct DFlash {
     pub target: Bundle,
     pub graph: Graph,
-    pub weights: Vec<Weight>,
+    pub weights: DraftWeights,
     pub pins: Pins,
     pub block: usize,
     pub mask_token: u32,
@@ -139,6 +164,18 @@ impl Offer for Overlay<'_> {
     ) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
         self.source(name).packed_share(name, rows)
     }
+
+    fn packed_axis(
+        &self,
+        name: &str,
+        axis: u32,
+        range: (usize, usize),
+    ) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
+        if self.stacked.contains_key(name) {
+            return self.packed(name);
+        }
+        self.source(name).packed_axis(name, axis, range)
+    }
 }
 
 fn has_index(name: &str) -> bool {
@@ -251,28 +288,6 @@ pub(crate) fn extra_rules(config: &Config, slices: &[Slice]) -> Vec<Rule> {
     rules
 }
 
-/// Loads only the tapped target bundle, for multi-rank follower ranks.
-pub fn load_target(
-    [target_dir, draft_dir]: [&Path; 2],
-    [slots, context]: [u64; 2],
-    user: &[Rule],
-    overrides: &Overrides,
-    manifest: Option<&str>,
-) -> Result<Bundle> {
-    let spec = target_spec(target_dir, overrides)?;
-    let draft_over = overrides.under("draft");
-    let config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
-    load_tapped(
-        target_dir,
-        [slots, context],
-        user,
-        Steps::Plain,
-        overrides,
-        manifest,
-        &config.tap_layers(),
-    )
-}
-
 /// Loads a tapped target model and its DFlash drafter.
 pub fn load(
     [target_dir, draft_dir]: [&Path; 2],
@@ -305,14 +320,23 @@ pub fn load(
             true => Box::new(release(target_dir, manifest)?),
             false => Box::new(Shards::open(target_dir)?),
         };
-    let combined = Overlay::new(&draft_offer, target_offer.as_ref());
-    let extra = extra_rules(&config, &draft_slices);
-    let (weights, pins) = pull(&graph, &combined, config.stack.layers, &[&extra, user])?;
+    let mut rules = extra_rules(&config, &draft_slices);
+    rules.extend_from_slice(user);
+    let draft_pins = {
+        let combined = Overlay::new(&draft_offer, target_offer.as_ref());
+        pins(&graph, &combined, config.stack.layers, &[&rules])?
+    };
+    let weights = DraftWeights {
+        graph: graph.clone(),
+        draft: draft_offer,
+        target: target_offer,
+        rules,
+    };
     Ok(DFlash {
         target,
         graph,
         weights,
-        pins,
+        pins: draft_pins,
         block: config.block_size as usize,
         mask_token: config.mask_token,
         causal: config.causal,
