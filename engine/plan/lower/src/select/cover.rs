@@ -323,7 +323,11 @@ impl Cover<'_> {
             let Some(drafts) = favorite.propose.at(self.tree, n) else {
                 continue;
             };
-            if drafts.iter().all(|d| fits(d, kind)) {
+            let platform = &self.device.platform;
+            if drafts
+                .iter()
+                .all(|d| fits(d, kind) && d.kernel.needs().fits(platform))
+            {
                 return true;
             }
         }
