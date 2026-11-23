@@ -139,6 +139,10 @@ pub trait Run {
     }
     /// Runs these steps in order and waits for them.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error>;
+    /// Queues these steps in order without waiting when supported.
+    fn queue(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.submit(steps)
+    }
     /// Rereads kernel files that changed. Returns what changed.
     fn refresh(&mut self) -> Result<Vec<Reload>, Error> {
         Ok(Vec::new())

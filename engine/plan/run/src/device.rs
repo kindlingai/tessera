@@ -21,6 +21,9 @@ use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, S
 use tessera_mem::Buffer;
 use tessera_mem::form::Read;
 
+/// Recorded step range and its bound dims.
+type GraphKey = (usize, usize, Vec<(DimName, u32)>);
+
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
     base: Base,
@@ -41,8 +44,8 @@ pub(crate) struct Runner<D: Device> {
     /// Reloads that launches applied, for the next `refresh`.
     missed: Vec<Reload>,
     compiled: Kernels<D::Kernel>,
-    /// The whole plan's launches per binding, recorded once.
-    graphs: HashMap<Vec<(DimName, u32)>, D::Graph>,
+    /// Recorded step ranges per binding, captured once.
+    graphs: HashMap<GraphKey, D::Graph>,
     launching: Launching,
     /// Whether the device overlaps dependent launches at all.
     overlaps: bool,
@@ -272,22 +275,34 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
-    /// Launches every step, as a recorded graph when whole.
-    fn run(&mut self, steps: Range<usize>, timed: bool) -> Result<Option<f64>, Error> {
+    /// Launches every step, as a recorded graph when eligible.
+    fn run(&mut self, steps: Range<usize>, timed: bool, wait: bool) -> Result<Option<f64>, Error> {
+        if steps.is_empty() {
+            return Ok(None);
+        }
         // A recorded graph cannot hold a grid that waits.
-        let whole = self.launching.graphs
+        let record = self.launching.graphs
             && self.ctx.graphs()
-            && !self.resident.contains(&true)
-            && self.base.plan.id != 0
-            && steps == (0..self.base.plan.steps.len());
-        if !whole {
+            && !self.resident[steps.clone()].contains(&true)
+            && self.base.plan.id != 0;
+        if !record {
+            if !wait {
+                self.launch_all(steps)?;
+                return Ok(None);
+            }
             return self.waited(timed, |r| r.launch_all(steps));
         }
-        let mut key: Vec<(DimName, u32)> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
-        key.sort_unstable();
+        let mut bound: Vec<(DimName, u32)> =
+            self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
+        bound.sort_unstable();
+        let key = (steps.start, steps.end, bound);
         if !self.graphs.contains_key(&key) {
             let graph = self.ctx.capture(|| self.launch_all(steps.clone()))?;
             self.graphs.insert(key.clone(), graph);
+        }
+        if !wait {
+            self.ctx.replay(&self.graphs[&key])?;
+            return Ok(None);
         }
         self.waited(timed, |r| Ok(r.ctx.replay(&r.graphs[&key])?))
     }
@@ -787,7 +802,15 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         if self.base.profile.is_some() {
             return self.profiled(steps);
         }
-        self.run(steps, false).map(|_| ())
+        self.run(steps, false, true).map(|_| ())
+    }
+
+    fn queue(&mut self, steps: Range<usize>) -> Result<(), Error> {
+        self.reread()?;
+        if self.base.profile.is_some() {
+            return self.profiled(steps);
+        }
+        self.run(steps, false, false).map(|_| ())
     }
 
     fn clocked(&mut self, steps: Range<usize>) -> Result<Option<f64>, Error> {
@@ -795,6 +818,6 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         if self.base.profile.is_some() {
             return self.profiled(steps).map(|_| None);
         }
-        self.run(steps, true)
+        self.run(steps, true, true)
     }
 }

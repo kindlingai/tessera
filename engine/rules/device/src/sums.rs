@@ -15,14 +15,14 @@ const KERNEL: &str = include_str!("sum.cu");
 const ENTRY: &str = "tessera_sums";
 const HAND: &str = "tessera_hand";
 /// Floats per round. A longer sum takes several.
-const ROOM: u32 = 64 << 10;
+const ROOM: u32 = 256 << 10;
 const THREADS: u32 = 256;
 /// The grid stays up, so it keeps few blocks.
 const SHARE: u32 = 64;
 /// Bytes of the job the hand kernel passes.
-const JOB: usize = 56;
+const JOB: usize = 64;
 /// Where the job keeps its summed wait and move ticks.
-const TICKS: usize = 40;
+const TICKS: usize = 48;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -43,12 +43,20 @@ pub(crate) fn pool(ranks: u32) -> PoolPlan {
 fn plan(ranks: u32) -> Plan {
     Plan {
         pools: vec![pool(ranks)],
-        lanes: vec![LanePlan {
-            op: Op::Sum,
-            elem: crate::layout::F32,
-            pool: 0,
-            block: 0,
-        }],
+        lanes: vec![
+            LanePlan {
+                op: Op::Sum,
+                elem: crate::layout::F32,
+                pool: 0,
+                block: 0,
+            },
+            LanePlan {
+                op: Op::Gather,
+                elem: crate::layout::F32,
+                pool: 0,
+                block: 0,
+            },
+        ],
         items: Vec::new(),
         forms: Vec::new(),
         kept: Vec::new(),
@@ -86,7 +94,7 @@ where
     L: Link + 'static,
 {
     /// Queues the hand kernel. Zero floats stop the grid.
-    fn hand(&mut self, from: u64, to: u64, n: u32) -> Result<(), Error> {
+    fn hand(&mut self, from: u64, to: u64, n: u32, rows: u32, total: u32) -> Result<(), Error> {
         self.seq += 1;
         let mut args = KernelArgs::new();
         args.device_ptr(self.resident.table())
@@ -95,6 +103,8 @@ where
             .u64(to)
             .u32(n)
             .u32(self.timed as u32)
+            .u32(rows)
+            .u32(total)
             .u64(self.seq)
             .u64(self.resident.deadline(TIMEOUT));
         self.ctx.programmatic(false);
@@ -130,14 +140,44 @@ where
         let n = u32::try_from(len).map_err(|_| tessera_run::Error::SumTooLong(len))?;
         let queued = match n {
             0 => Ok(()),
-            n => self.start().and_then(|_| self.hand(from, to, n)),
+            n => self.start().and_then(|_| self.hand(from, to, n, 0, 0)),
         };
         queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 
+    fn gather(
+        &mut self,
+        from: u64,
+        to: u64,
+        part: usize,
+        total: usize,
+        rows: usize,
+    ) -> Result<bool, tessera_run::Error> {
+        let fits = rows > 0
+            && part > 0
+            && total > 0
+            && part.is_multiple_of(rows)
+            && total.is_multiple_of(rows)
+            && total / rows <= ROOM as usize;
+        if !fits {
+            return Ok(false);
+        }
+        let (Ok(n), Ok(rows), Ok(total)) = (
+            u32::try_from(part),
+            u32::try_from(rows),
+            u32::try_from(total),
+        ) else {
+            return Ok(false);
+        };
+        self.start()
+            .and_then(|_| self.hand(from, to, n, rows, total))
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        Ok(true)
+    }
+
     fn check(&mut self) -> Result<(), tessera_run::Error> {
         let status = match std::mem::take(&mut self.running) {
-            true => self.hand(0, 0, 0).and_then(|_| self.resident.join()),
+            true => self.hand(0, 0, 0, 0, 0).and_then(|_| self.resident.join()),
             false => self.resident.status(),
         };
         status.map_err(|e| tessera_run::Error::Sums(Box::new(e)))

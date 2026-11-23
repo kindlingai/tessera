@@ -263,7 +263,6 @@ TESSERA_FN bool wait(const ticket& r, bool read = true) {
         }
     }
     prim::block_sync();
-    if (read) prim::fence_sys();
     return ok != 0;
 }
 

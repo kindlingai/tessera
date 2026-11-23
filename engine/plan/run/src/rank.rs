@@ -12,10 +12,21 @@ use tessera_lower::kernels::{AllGather, crosses};
 use tessera_lower::{Launching, Plan, Step};
 use tessera_mem::{DType, Tensor};
 
-/// A sum across ranks between two device addresses.
+/// A sum or gather across ranks between two device addresses.
 pub trait Sum {
     /// Queues a sum of `len` floats at `from` into `to`.
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), Error>;
+    /// Queues a gather of `part` floats over `rows` rows.
+    fn gather(
+        &mut self,
+        _from: u64,
+        _to: u64,
+        _part: usize,
+        _total: usize,
+        _rows: usize,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
     /// Fails if a queued sum failed. May wait.
     fn check(&mut self) -> Result<(), Error> {
         Ok(())
@@ -73,6 +84,19 @@ impl<T: Transport> Rank<T> {
         let (from, to) = (at(step.reads[0])?, at(step.write)?);
         let grid = self.grid.as_mut().expect("a grid");
         grid.sum(from, to, step.write.len)
+    }
+
+    /// One gather through the persistent grid, if supported.
+    fn grid_gather(&mut self, i: usize, step: &Step) -> Result<bool, Error> {
+        let (src, dst) = (step.reads[0], step.write);
+        if src.form.name() != "f32" || dst.form.name() != "f32" {
+            return Ok(false);
+        }
+        let at = |slot| self.runner.address(slot).ok_or(Error::Unaddressed(i));
+        let (from, to) = (at(src)?, at(dst)?);
+        let rows = step.kernel.sizes()[0];
+        let grid = self.grid.as_mut().expect("a grid");
+        grid.gather(from, to, src.len, dst.len, rows)
     }
 
     /// A host sum. Profiling first waits for all ranks.
@@ -142,11 +166,19 @@ impl<T: Transport> Run for Rank<T> {
                 continue;
             }
             let step = step.clone();
-            self.runner.submit(from..i)?;
+            if self.grid.is_some() && !timed {
+                self.runner.queue(from..i)?;
+            } else {
+                self.runner.submit(from..i)?;
+            }
             from = i + 1;
-            // Gathers always cross on the host.
             match (step.kernel.name() == AllGather::NAME, self.grid.is_some()) {
-                (true, _) => self.gather(&step)?,
+                (true, true) => {
+                    if !self.grid_gather(i, &step)? {
+                        self.gather(&step)?;
+                    }
+                }
+                (true, false) => self.gather(&step)?,
                 (false, true) => self.grid_sum(i, &step)?,
                 (false, false) => self.exchange(&step)?,
             }
