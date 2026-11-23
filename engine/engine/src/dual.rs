@@ -326,7 +326,7 @@ impl<'a> DualSpeculate<'a> {
                     {
                         lanes.replace(cmd.table);
                     }
-                    let entry = cmd.head.entry();
+                    let entry = self.target.entry(&cmd.head)?;
                     let outputs = self
                         .target
                         .run(&cmd.rows, &cmd.picks, cmd.head, cmd.wants)?;

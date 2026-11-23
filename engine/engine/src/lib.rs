@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
-use tessera_graph::Role;
+use tessera_graph::{EntryKind, Role};
 use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
@@ -125,23 +125,51 @@ pub enum Error {
     BucketAxis,
     #[error("the graph has no tap output")]
     Taps,
+    #[error("entry {entry} has an input the engine does not fill: {role:?}")]
+    Port { entry: usize, role: Role },
 }
 
-/// Width of each tapped row, if entry 0 emits taps.
-fn tap_width(g: &Graph) -> Option<usize> {
-    let out = g.entries[0].outputs.iter().find(|o| o.role == Role::Taps)?;
+/// Row width of `entry`'s `role` output, if any.
+fn width(g: &Graph, entry: usize, role: Role) -> Option<usize> {
+    let out = g.entries[entry].outputs.iter().find(|o| o.role == role)?;
     let last = g.node(out.node).ty.shape.0.last()?;
     last.value(&g.dims, &|_| None).map(|n| n as usize)
 }
 
-/// Width of each logits row, if entry 0 emits logits.
-fn logits_width(g: &Graph) -> Option<usize> {
-    let out = g.entries[0]
-        .outputs
-        .iter()
-        .find(|o| o.role == Role::Logits)?;
-    let last = g.node(out.node).ty.shape.0.last()?;
-    last.value(&g.dims, &|_| None).map(|n| n as usize)
+/// Whether the engine fills input ports of `role`.
+fn fillable(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Tokens
+            | Role::Positions
+            | Role::Slots
+            | Role::Picks
+            | Role::Allowed
+            | Role::Candidates
+    )
+}
+
+/// The first plain and the first scoring step entries.
+fn steps(g: &Graph) -> Result<(Option<usize>, Option<usize>), Error> {
+    let (mut full, mut sparse) = (None, None);
+    for (at, e) in g.entries.iter().enumerate() {
+        if e.kind != EntryKind::Step {
+            continue;
+        }
+        let scored = e.inputs.iter().any(|p| p.role == Role::Candidates);
+        let found = if scored { &mut sparse } else { &mut full };
+        if found.is_some() {
+            continue;
+        }
+        if let Some(p) = e.inputs.iter().find(|p| !fillable(p.role)) {
+            return Err(Error::Port {
+                entry: at,
+                role: p.role,
+            });
+        }
+        *found = Some(at);
+    }
+    Ok((full, sparse))
 }
 
 /// Rows in, picked rows' likeliest ids out, on one runner.
@@ -157,11 +185,13 @@ pub struct Engine {
     lanes: Option<lanes::Lanes>,
     /// Mask words per pick, if the graph takes masks.
     words: Option<usize>,
-    /// Whether entry 1 picks among candidate ids.
-    sparse: bool,
-    /// Floats per tapped row, if entry 0 emits taps.
+    /// The step entry that reads every vocabulary row.
+    full: usize,
+    /// The step entry that picks among candidate ids, if any.
+    sparse: Option<usize>,
+    /// Floats per tapped row, if the full entry emits taps.
     taps: Option<usize>,
-    /// Vocabulary width of entry 0's logits output.
+    /// Vocabulary width of the full entry's logits output.
     vocab: Option<usize>,
     /// Carries rank 0's launches to the other ranks.
     control: Option<Box<dyn comm::Transport>>,
@@ -175,19 +205,10 @@ pub struct Engine {
 
 /// Inputs a launch feeds before its picks.
 enum Head {
-    /// Entry 0, with each pick's mask words. None allows all.
+    /// The full entry. Per-pick mask words, or None for all.
     Full(Option<Vec<u32>>),
-    /// Entry 1, with `k` candidate ids per pick.
+    /// The sparse entry, with `k` candidate ids per pick.
     Sparse(Vec<u32>, usize),
-}
-
-impl Head {
-    fn entry(&self) -> usize {
-        match self {
-            Head::Full(_) => 0,
-            Head::Sparse(..) => 1,
-        }
-    }
 }
 
 /// A token at a position, in a slot's sequence.
@@ -205,12 +226,12 @@ pub(crate) fn ends(rows: &[Row]) -> Vec<u32> {
     at.map(|(i, _)| i as u32).collect()
 }
 
-/// Sizes and inputs for a launch of `rows` returning `picks`.
+/// Sizes and padded counts for `rows` returning `picks`.
 fn launch_of(
     rows: &[Row],
     picks: &[u32],
     slots: usize,
-) -> (Vec<(tessera_graph::DimName, u64)>, Vec<Tensor>) {
+) -> (Vec<(tessera_graph::DimName, u64)>, [usize; 2]) {
     let furthest = rows.iter().map(|r| r.position).max().unwrap_or(0);
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
     seen.sort_unstable();
@@ -232,21 +253,7 @@ fn launch_of(
         (Segments, seen.len() as u64),
         (Picks, wanted as u64),
     ];
-    // The last row fills out. Copies rewrite its kept row.
-    let last = rows.last().copied().unwrap_or_default();
-    let column = |of: fn(&Row) -> u32| {
-        let values = rows.iter().chain(std::iter::repeat(&last));
-        Tensor::u32(vec![filled], values.take(filled).map(of).collect())
-    };
-    let tail = picks.last().copied().unwrap_or_default();
-    let picked = picks.iter().copied().chain(std::iter::repeat(tail));
-    let feeds = vec![
-        column(|r| r.token),
-        column(|r| r.position),
-        column(|r| r.slot),
-        Tensor::u32(vec![wanted], picked.take(wanted).collect()),
-    ];
-    (sizes, feeds)
+    (sizes, [filled, wanted])
 }
 
 impl Engine {
@@ -272,10 +279,11 @@ impl Engine {
     ) -> Result<Self, Error> {
         tessera_run::configure(settings);
         tessera_wasm::configure(settings.dump_sites.clone());
-        let mut graph = tessera_graph::trim(&graph, 0)?;
-        let sparse = graph.entries.len() > 1;
-        if sparse {
-            graph = tessera_graph::trim(&graph, 1)?;
+        let (full, sparse) = steps(&graph)?;
+        let full = full.unwrap_or(0);
+        let mut graph = tessera_graph::trim(&graph, full)?;
+        if let Some(at) = sparse {
+            graph = tessera_graph::trim(&graph, at)?;
         }
         let ranked = |device: Device| match place {
             Some(place) => place.device(device),
@@ -297,7 +305,7 @@ impl Engine {
             position: 0,
         }];
         let (sizes, _) = launch_of(&first, &[0], slots);
-        let plan = plans.lower(&graph, 0, &sizes, &device)?;
+        let plan = plans.lower(&graph, full, &sizes, &device)?;
         let lanes = plan.table.zip(recipe.kept.page());
         let lanes = lanes.map(|(table, page)| lanes::Lanes::new(page, table.len, slots));
         let mut runner = run(plan)?;
@@ -309,8 +317,8 @@ impl Engine {
         let device = ranked(device);
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
-        let taps = tap_width(&graph);
-        let vocab = logits_width(&graph);
+        let taps = width(&graph, full, Role::Taps);
+        let vocab = width(&graph, full, Role::Logits);
         Ok(Self {
             graph,
             runner,
@@ -320,6 +328,7 @@ impl Engine {
             slots,
             lanes,
             words,
+            full,
             sparse,
             taps,
             vocab,
@@ -377,7 +386,7 @@ impl Engine {
         self.words
     }
 
-    /// Floats per tapped row, if entry 0 emits taps.
+    /// Floats per tapped row, if the full entry emits taps.
     pub fn tap_width(&self) -> Option<usize> {
         self.taps
     }
@@ -397,7 +406,7 @@ impl Engine {
     pub fn step_taps(&mut self, rows: &[Row]) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let width = self.taps.ok_or(Error::Taps)?;
         let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let wants = Wants::roles(&self.graph, 0, &[Role::Tokens, Role::Taps]);
+        let wants = Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]);
         let outputs = self.run(rows, &all, Head::Full(None), wants)?;
         let mut ids = self.runner.ids(outputs[0])?;
         ids.truncate(rows.len());
@@ -413,7 +422,7 @@ impl Engine {
         let width = self.taps.ok_or(Error::Taps)?;
         let vocab = self.vocab.ok_or(Error::Scores)?;
         let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let wants = Wants::roles(&self.graph, 0, &[Role::Logits, Role::Taps]);
+        let wants = Wants::roles(&self.graph, self.full, &[Role::Logits, Role::Taps]);
         let outputs = self.run(rows, &all, Head::Full(None), wants)?;
         let raw_logits = self.runner.read(outputs[0])?;
         let logits = raw_logits.floats().map_err(tessera_run::Error::from)?;
@@ -453,7 +462,7 @@ impl Engine {
         let gathered = picks.len().next_power_of_two() * k;
         let words = self.words.ok_or(Error::Mask)?;
         // Past half the vocabulary, the full head reads less.
-        if self.sparse && lists.len() == allowed.len() && 2 * gathered <= 32 * words {
+        if self.sparse.is_some() && lists.len() == allowed.len() && 2 * gathered <= 32 * words {
             let mut ids = Vec::with_capacity(lists.len() * k);
             for list in &lists {
                 // Repeats of the first id never win over it.
@@ -474,7 +483,7 @@ impl Engine {
         ids: &[Vec<u32>],
     ) -> Result<Vec<Vec<f32>>, Error> {
         let fits = |l: &Vec<u32>| !l.is_empty() && l.len() <= FEW;
-        if !self.sparse || ids.len() != picks.len() || !ids.iter().all(fits) {
+        if self.sparse.is_none() || ids.len() != picks.len() || !ids.iter().all(fits) {
             return Err(Error::Scores);
         }
         let k = ids
@@ -488,7 +497,7 @@ impl Engine {
             flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
         }
         let head = Head::Sparse(flat, k);
-        let wants = Wants::role(&self.graph, head.entry(), Role::Logits);
+        let wants = Wants::role(&self.graph, self.entry(&head)?, Role::Logits);
         let outputs = self.run(rows, picks, head, wants)?;
         let all = self.runner.read(outputs[0])?;
         let all = all.floats().map_err(tessera_run::Error::from)?;
@@ -496,9 +505,17 @@ impl Engine {
         Ok(each.map(|(row, list)| row[..list.len()].to_vec()).collect())
     }
 
+    /// The entry `head` launches.
+    fn entry(&self, head: &Head) -> Result<usize, Error> {
+        match head {
+            Head::Full(_) => Ok(self.full),
+            Head::Sparse(..) => self.sparse.ok_or(Error::Scores),
+        }
+    }
+
     /// One launch of `rows`, the likeliest ids after `picks`.
     fn launch(&mut self, rows: &[Row], picks: &[u32], head: Head) -> Result<Vec<u32>, Error> {
-        let wants = Wants::role(&self.graph, head.entry(), Role::Tokens);
+        let wants = Wants::role(&self.graph, self.entry(&head)?, Role::Tokens);
         let outputs = self.run(rows, picks, head, wants)?;
         let ran = Instant::now();
         let mut ids = self.runner.ids(outputs[0])?;
@@ -526,27 +543,52 @@ impl Engine {
             return Err(Error::RowPlace);
         }
         self.announce(rows, picks, &head, wants)?;
-        let (mut sizes, mut feeds) = launch_of(rows, picks, self.slots);
-        let wanted = feeds[3].len();
-        let entry = head.entry();
-        match head {
-            Head::Full(None) if self.words.is_none() => {}
-            Head::Full(masks) => {
-                let words = self.words.ok_or(Error::Mask)?;
-                // Unmasked and filler picks allow everything.
-                let mut bits = masks.unwrap_or_default();
-                bits.resize(wanted * words, u32::MAX);
-                feeds.insert(3, Tensor::u32(vec![wanted, words], bits));
-            }
-            Head::Sparse(mut ids, k) => {
-                // Filler picks repeat the last pick's list.
-                let last = ids[ids.len() - k..].to_vec();
-                while ids.len() < wanted * k {
-                    ids.extend_from_slice(&last);
+        let (mut sizes, [filled, wanted]) = launch_of(rows, picks, self.slots);
+        let entry = self.entry(&head)?;
+        // The last row fills out. Copies rewrite its kept row.
+        let last = rows[rows.len() - 1];
+        let column = |of: fn(&Row) -> u32| {
+            let values = rows.iter().chain(std::iter::repeat(&last));
+            Tensor::u32(vec![filled], values.take(filled).map(of).collect())
+        };
+        let (mut masks, mut listed) = match head {
+            Head::Full(masks) => (masks, None),
+            Head::Sparse(ids, k) => (None, Some((ids, k))),
+        };
+        let mut feeds = Vec::new();
+        for port in &self.graph.entries[entry].inputs {
+            let feed = match port.role {
+                Role::Tokens => column(|r| r.token),
+                Role::Positions => column(|r| r.position),
+                Role::Slots => column(|r| r.slot),
+                Role::Picks => {
+                    let tail = picks.last().copied().unwrap_or_default();
+                    let picked = picks.iter().copied().chain(std::iter::repeat(tail));
+                    Tensor::u32(vec![wanted], picked.take(wanted).collect())
                 }
-                feeds.insert(3, Tensor::u32(vec![wanted, k], ids));
-                sizes.push((Candidates, k as u64));
-            }
+                Role::Allowed => {
+                    let words = self.words.ok_or(Error::Mask)?;
+                    // Unmasked and filler picks allow everything.
+                    let mut bits = masks.take().unwrap_or_default();
+                    bits.resize(wanted * words, u32::MAX);
+                    Tensor::u32(vec![wanted, words], bits)
+                }
+                Role::Candidates => {
+                    let (mut ids, k) = listed.take().ok_or(Error::Scores)?;
+                    // Filler picks repeat the last pick's list.
+                    let last = ids[ids.len() - k..].to_vec();
+                    while ids.len() < wanted * k {
+                        ids.extend_from_slice(&last);
+                    }
+                    sizes.push((Candidates, k as u64));
+                    Tensor::u32(vec![wanted, k], ids)
+                }
+                role => return Err(Error::Port { entry, role }),
+            };
+            feeds.push(feed);
+        }
+        if masks.is_some() {
+            return Err(Error::Mask);
         }
         let start = Instant::now();
         let (plan, bound) = self.plans.wanting(

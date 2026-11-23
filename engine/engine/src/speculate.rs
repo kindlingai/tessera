@@ -727,7 +727,7 @@ pub(crate) fn run_target(
     {
         lanes.replace(cmd.table);
     }
-    let entry = cmd.head.entry();
+    let entry = target.entry(&cmd.head)?;
     let outputs = target.run(&cmd.rows, &cmd.picks, cmd.head, cmd.wants)?;
     if let Some(at) = taps_output(&target.graph, entry, cmd.wants) {
         let raw = target.runner.read(outputs[at])?;
