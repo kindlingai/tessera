@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tessera_engine_comm::{Error as CommError, Link as Comm};
 use tessera_gpukit::Error as GpuError;
+use tessera_gpukit::backend::{OnGpu, dispatch};
 use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats};
 use tessera_gpukit::launch::{Apart, KernelArgs, Launch};
 
@@ -285,6 +286,15 @@ pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
         return Err(plan(format!("{backend} has no persistent grids")));
     }
     Ok(backend)
+}
+
+/// Runs `work` on `gpu` when it keeps persistent grids.
+pub(crate) fn persistent<T, W>(gpu: Option<Backend>, work: W) -> Result<T, Error>
+where
+    W: OnGpu<Out = Result<T, Error>>,
+{
+    let gpu = gpu.filter(|b| b.persistent());
+    dispatch(gpu, work).unwrap_or_else(|_| Err(plan("persistent grids need a CUDA or ROCm GPU")))
 }
 
 /// The device's clock now, from a one-thread kernel.

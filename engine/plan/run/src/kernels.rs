@@ -7,14 +7,6 @@ use tessera_gpukit::backend::Backend;
 use tessera_gpukit::launch::THREADS_PER_BLOCK;
 use tessera_lower::{Launch, Shape, Source, Step};
 
-/// The kernel text a backend compiles.
-pub(crate) fn dialect(backend: Backend) -> Dialect {
-    match backend {
-        Backend::Metal => Dialect::Metal,
-        Backend::Cuda | Backend::Rocm => Dialect::Cuda,
-    }
-}
-
 /// A fixed kernel's text for `backend`, and its entry.
 pub(crate) fn fixed_text(
     source: &Source,
@@ -88,7 +80,7 @@ impl<T: Clone> Kernels<T> {
                 match self.made.get(&at) {
                     Some(compiled) => (compiled.clone(), true),
                     None => {
-                        let text = body.text().bounded(dialect(backend), Some(group));
+                        let text = body.text().bounded(Dialect::of(backend), Some(group));
                         let compiled = made(&text, &body.entry)?;
                         self.made.insert(at, compiled.clone());
                         (compiled, true)

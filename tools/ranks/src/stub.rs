@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 use tessera_device::layout::{Item, NONE, Ref};
 use tessera_device::proxy::Op;
 use tessera_device::resident::{LanePlan, Plan, PoolPlan, Resident, USER};
-use tessera_device::{Backend, Options, flatten};
+use tessera_device::{Options, flatten};
 use tessera_engine_comm::{Link, ShmLink, Transport, VerbsLink};
 use tessera_frontend_comm::{meet, shared};
-use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::backend::OnGpu;
+use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::Launch;
 
 const STUB: &str = include_str!("all_reduce_stub.cu");
@@ -24,23 +25,23 @@ type Outcome = Result<(), Box<dyn Error>>;
 
 /// Runs `rounds` sums on the GPU the settings pick.
 pub fn run(args: &Args, rounds: u32) -> Outcome {
-    let settings = tessera_frontend_settings::read();
-    match settings.gpu() {
-        #[cfg(feature = "cuda")]
-        Some(tessera_gpukit::backend::Backend::Cuda) => {
-            let ctx = tessera_gpukit::cuda::cached_context()?;
-            on(ctx, Backend::Cuda, args, rounds)
-        }
-        #[cfg(feature = "rocm")]
-        Some(tessera_gpukit::backend::Backend::Rocm) => {
-            let ctx = tessera_gpukit::rocm::cached_context()?;
-            on(ctx, Backend::Rocm, args, rounds)
-        }
-        _ => Err("the stub needs a CUDA or ROCm GPU".into()),
+    let gpu = tessera_frontend_settings::read().gpu();
+    let stub = Stub(args, rounds);
+    tessera_gpukit::backend::dispatch(gpu.filter(|b| b.persistent()), stub)
+        .unwrap_or_else(|_| Err("the stub needs a CUDA or ROCm GPU".into()))
+}
+
+struct Stub<'a>(&'a Args, u32);
+
+impl OnGpu for Stub<'_> {
+    type Out = Outcome;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Outcome {
+        on(cached_context::<D>()?, self.0, self.1)
     }
 }
 
-fn on<D>(ctx: &D, backend: Backend, args: &Args, rounds: u32) -> Outcome
+fn on<D>(ctx: &D, args: &Args, rounds: u32) -> Outcome
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
@@ -82,7 +83,7 @@ where
         share: if args.shm.is_some() { ranks * MPS } else { 1 },
     };
     let options = Options {
-        backend,
+        backend: D::BACKEND,
         remote_kv: false,
         marks: false,
     };
