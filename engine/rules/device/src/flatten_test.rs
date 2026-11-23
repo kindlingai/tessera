@@ -44,6 +44,8 @@ fn flattens_in_order() {
         assert!(has(trellis, b, "TESSERA_CAP_TRELLIS") && has(trellis, b, "trellis.h"));
         assert!(!has(trellis, b, "grid.h"));
     }
+    let sum = run("sum.cu", include_str!("sum.cu"), &[], Backend::Cuda).unwrap();
+    assert!(sum.text.contains("stage_bf16") && sum.text.contains("cvt.rn.bf16x2.f32"));
 }
 
 #[test]

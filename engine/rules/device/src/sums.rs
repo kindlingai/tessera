@@ -40,13 +40,13 @@ pub(crate) fn pool(ranks: u32) -> PoolPlan {
     }
 }
 
-fn plan(ranks: u32) -> Plan {
+pub(crate) fn plan(ranks: u32) -> Plan {
     Plan {
         pools: vec![pool(ranks)],
         lanes: vec![
             LanePlan {
                 op: Op::Sum,
-                elem: crate::layout::F32,
+                elem: crate::layout::BF16,
                 pool: 0,
                 block: 0,
             },
