@@ -299,6 +299,15 @@ fn glm_experts() {
         Some(brel.packed_axis(&bd, 2, (128, 128)).unwrap()),
         k3.share(&dw, [2 * 128, 256, 1], [128, 128])
     );
+    // Sparse zero-filled experts fail closed under TP slicing.
+    let mut sparse = big_set.clone();
+    sparse[big_set.len() / 2..].fill(0);
+    write(
+        &big.join("experts/exlr8-layer-001.k3.safetensors"),
+        &[("trellis.gate", "U8", vec![sparse.len()], sparse)],
+    );
+    let srel = Release::open(&big).width(3);
+    assert!(srel.packed_axis(&bg, 1, (0, 128)).is_err());
     std::fs::remove_dir_all(big).unwrap();
     // The shared expert is not a set: it reads whole.
     assert_eq!(release.packed_share(&gate, (0, 64)).unwrap(), file);

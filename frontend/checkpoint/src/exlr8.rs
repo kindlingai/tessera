@@ -988,6 +988,10 @@ mod experts {
             }
             _ => (codes.bytes(&name)?, ffn),
         };
+        let per = hidden * ffn_out * k as usize / 8;
+        if !tensor && per >= 16 && entries.chunks_exact(per).any(|c| c[..16] == [0; 16]) {
+            return Err(Error::Format(format!("{name}: zero-filled expert slice")));
+        }
         Ok(match p {
             "down" => trellis::packed(ffn_out, hidden, trellis::INPUT_SIDE, &entries),
             _ => trellis::packed(hidden, ffn_out, 1, &entries),
