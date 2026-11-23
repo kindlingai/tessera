@@ -20,6 +20,15 @@ pub trait Tokens: Send + Sync {
 /// Messages to one prompt, in the model's chat layout.
 pub trait Chat: Send + Sync {
     fn render(&self, messages: &[Message], think: bool) -> Result<String, Error>;
+
+    fn render_with(
+        &self,
+        messages: &[Message],
+        think: bool,
+        _reasoning_effort: Option<&str>,
+    ) -> Result<String, Error> {
+        self.render(messages, think)
+    }
 }
 
 /// Settings for one answer, beyond the prompt.

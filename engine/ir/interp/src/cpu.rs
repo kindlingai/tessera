@@ -494,15 +494,19 @@ fn rms_inverse(acc: Acc, row: &[f32], eps: f32) -> f32 {
     1.0 / (mean + eps).sqrt()
 }
 
-/// Each row's entries at `ids`. Out-of-range ids read zero.
-pub(crate) fn take(x: &Tensor, ids: &Tensor) -> Result<Tensor, Error> {
+/// Each row's entries at `ids` from `first`. Others read zero.
+pub(crate) fn take(x: &Tensor, ids: &Tensor, first: usize) -> Result<Tensor, Error> {
     let (rows, width) = x.rows();
     let (xs, at) = (x.floats()?, ids.indices()?);
     let picks = at.len() / rows.max(1);
     let mut out = Vec::with_capacity(at.len());
     for (j, &i) in at.iter().enumerate() {
         let row = &xs[(j / picks.max(1)) * width..][..width];
-        out.push(row.get(i).copied().unwrap_or(0.0));
+        let v = i
+            .checked_sub(first)
+            .and_then(|at| row.get(at).copied())
+            .unwrap_or(0.0);
+        out.push(v);
     }
     Ok(Tensor::f32(ids.shape.clone(), out))
 }

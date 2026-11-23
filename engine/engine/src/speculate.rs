@@ -1,32 +1,68 @@
 //! DFlash speculative decoding: cached drafter and verify loop.
 
-use crate::{Engine, Error, Event, Reason, Request, Row};
+use crate::ranks::open_rank;
+pub use crate::spec_len::SpecStats;
+use crate::spec_len::{CostModel, SpecLen};
+use crate::{Engine, Error, Event, Head, Place, Reason, Request, Row};
+use std::cell::RefCell;
+use std::rc::Rc;
+use tessera_engine_comm::{Error as CommError, Reader, Transport, Writer};
 use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Role};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Slot, Wants, Weight};
-use tessera_run::{Run, open};
+use tessera_models::dflash;
+use tessera_run::{Error as RunError, Profile, Ranks, Run, Sum, open};
 
-/// Speculative decoding telemetry for one generation call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SpecStats {
-    /// Target verification launches run.
-    pub steps: usize,
-    /// Draft tokens proposed across verify steps.
-    pub drafted: usize,
-    /// Draft tokens accepted by the target model.
-    pub accepted: usize,
-    /// Total tokens emitted to the caller.
-    pub emitted: usize,
+/// Wire tag identifying a drafter launch on the control channel.
+pub(crate) const DRAFT_TAG: u32 = 3;
+
+/// One transport shared by target and drafter in alternation.
+struct SharedTransport(Rc<RefCell<Box<dyn Transport>>>);
+
+impl Transport for SharedTransport {
+    fn rank(&self) -> u32 {
+        self.0.borrow().rank()
+    }
+
+    fn ranks(&self) -> u32 {
+        self.0.borrow().ranks()
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        self.0.borrow_mut().exchange(mine)
+    }
 }
 
-impl SpecStats {
-    /// Average tokens produced per speculative verify step.
-    pub fn mean_step(&self) -> f32 {
-        if self.steps == 0 {
-            return 0.0;
-        }
-        (self.accepted + self.steps) as f32 / self.steps as f32
+/// One persistent sum grid shared by target and drafter.
+struct SharedSum(Rc<RefCell<Box<dyn Sum>>>);
+
+impl Sum for SharedSum {
+    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), RunError> {
+        self.0.borrow_mut().sum(from, to, len)
+    }
+
+    fn gather(
+        &mut self,
+        from: u64,
+        to: u64,
+        part: usize,
+        total: usize,
+        rows: usize,
+    ) -> Result<bool, RunError> {
+        self.0.borrow_mut().gather(from, to, part, total, rows)
+    }
+
+    fn check(&mut self) -> Result<(), RunError> {
+        self.0.borrow_mut().check()
+    }
+
+    fn timing(&mut self, on: bool) {
+        self.0.borrow_mut().timing(on);
+    }
+
+    fn spent(&mut self) -> Result<Option<[f64; 2]>, RunError> {
+        self.0.borrow_mut().spent()
     }
 }
 
@@ -119,23 +155,169 @@ fn walk_lattice(cands: &[u32], scores: &[f32], n: usize, k: usize) -> Vec<u32> {
     out
 }
 
+/// Shared runner, plan cache and profile state for drafters.
+pub(crate) struct DraftCore {
+    pub graph: Graph,
+    pub runner: Box<dyn Run>,
+    pub device: Device,
+    pub plans: Cache,
+    pub context: usize,
+    pub slots: usize,
+    pub profile: Option<u64>,
+    pub launches: u64,
+    pub label: &'static str,
+}
+
+impl DraftCore {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open(
+        graph: Graph,
+        context: usize,
+        first_rows: u64,
+        wants: Wants,
+        recipe: &Recipe,
+        settings: &Settings,
+        place: Option<&Place>,
+        label: &'static str,
+        run: impl FnOnce(tessera_lower::Plan) -> Result<Box<dyn Run>, Error>,
+    ) -> Result<Self, Error> {
+        let slots = graph
+            .dims
+            .iter()
+            .find(|d| d.name == Seqs)
+            .map_or(1, |d| d.size.max() as usize);
+        let ranked = |device: Device| match place {
+            Some(place) => place.device(device),
+            None => device,
+        };
+        let device = ranked(Device::guess(settings).with(recipe));
+        let mut plans = Cache::default();
+        let first = [
+            (Seqs, slots as u64),
+            (Rows, first_rows),
+            (Context, first_rows),
+            (Segments, 1),
+        ];
+        let (plan, _) = plans.wanting(&graph, 0, wants, &first, &[Context, Segments], &device)?;
+        let mut runner = run(plan.clone())?;
+        runner.launching(recipe.launch);
+        runner.profiling(settings.profile.is_some());
+        let device = ranked(
+            Device::stored(runner.platform(), settings)
+                .map_err(tessera_lower::Error::from)?
+                .with(recipe),
+        );
+        Ok(Self {
+            graph,
+            runner,
+            device,
+            plans,
+            context,
+            slots,
+            profile: settings.profile,
+            launches: 0,
+            label,
+        })
+    }
+
+    pub(crate) fn exec(
+        &mut self,
+        feeds: &[Tensor],
+        sizes: &[(tessera_graph::DimName, u64)],
+        wants: Wants,
+    ) -> Result<Vec<Slot>, Error> {
+        let (plan, bound) = self.plans.wanting(
+            &self.graph,
+            0,
+            wants,
+            sizes,
+            &[Context, Segments],
+            &self.device,
+        )?;
+        let outputs = plan.outputs.iter().map(|o| o.slot).collect();
+        self.runner.replan(plan)?;
+        self.runner.bind_all(&bound);
+        let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
+        self.runner.feed(&views)?;
+        self.runner.submit(0..self.runner.plan().steps.len())?;
+        if let Some(every) = self.profile {
+            self.launches += 1;
+            if every > 0
+                && self.launches.is_multiple_of(every)
+                && let Some(p) = self.runner.take_profile()
+                && self.runner.plan().rank == 0
+            {
+                eprintln!(
+                    "{} profile of {every} launches:\n{}",
+                    self.label,
+                    p.report(every)
+                );
+            }
+        }
+        Ok(outputs)
+    }
+}
+
+macro_rules! draft_methods {
+    ($ty:ty) => {
+        impl $ty {
+            /// This rank's `(axis, first, count)` slice of `at`, if split.
+            pub fn share(&self, at: u32) -> Option<(u32, usize, usize)> {
+                self.core.runner.plan().share(at)
+            }
+
+            /// Number of weights in the drafter graph.
+            pub fn weight_count(&self) -> u32 {
+                self.core.graph.weights.len() as u32
+            }
+
+            /// Whether the active plan launches kernel `name`.
+            pub fn has_kernel(&self, name: &str) -> bool {
+                self.core
+                    .runner
+                    .plan()
+                    .steps
+                    .iter()
+                    .any(|s| s.kernel.name() == name)
+            }
+
+            /// Uploads the drafter's weights, in graph order.
+            pub fn load(&mut self, weights: &[Weight]) -> Result<(), Error> {
+                for (at, w) in weights.iter().enumerate() {
+                    self.load_weight(at as u32, w)?;
+                }
+                Ok(())
+            }
+
+            /// Uploads weight `at` of the drafter graph.
+            pub fn load_weight(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
+                Ok(self.core.runner.load_weight(at, w)?)
+            }
+
+            pub fn context(&self) -> usize {
+                self.core.context
+            }
+
+            pub fn device(&self) -> String {
+                self.core.runner.device()
+            }
+        }
+    };
+}
+pub(crate) use draft_methods;
+
 /// Runs a DFlash drafter graph with kept context KV.
 pub struct Drafter {
-    graph: Graph,
-    runner: Box<dyn Run>,
-    device: Device,
-    plans: Cache,
-    context: usize,
-    slots: usize,
+    core: DraftCore,
     block: usize,
     tap_width: usize,
     vocab: usize,
     mask_token: u32,
     causal: bool,
     selector_k: Option<usize>,
-    profile: Option<u64>,
-    launches: u64,
 }
+
+draft_methods!(Drafter);
 
 fn selector_top_k(graph: &Graph, block: usize) -> Option<usize> {
     let entry = graph.entries.first()?;
@@ -151,6 +333,30 @@ fn selector_top_k(graph: &Graph, block: usize) -> Option<usize> {
 }
 
 impl Drafter {
+    /// Splits one transport into `N` alternating handles.
+    pub fn share_transports<const N: usize>(
+        transport: Box<dyn Transport>,
+    ) -> [Box<dyn Transport>; N] {
+        let shared = Rc::new(RefCell::new(transport));
+        std::array::from_fn(|_| Box::new(SharedTransport(shared.clone())) as Box<dyn Transport>)
+    }
+
+    /// Splits one transport into two alternating handles.
+    pub fn share_transport(transport: Box<dyn Transport>) -> [Box<dyn Transport>; 2] {
+        Self::share_transports(transport)
+    }
+
+    /// Splits one persistent sum grid into `N` alternating handles.
+    pub fn share_sums<const N: usize>(grid: Box<dyn Sum>) -> [Box<dyn Sum>; N] {
+        let shared = Rc::new(RefCell::new(grid));
+        std::array::from_fn(|_| Box::new(SharedSum(shared.clone())) as Box<dyn Sum>)
+    }
+
+    /// Splits one persistent sum grid into two alternating handles.
+    pub fn share_sum(grid: Box<dyn Sum>) -> [Box<dyn Sum>; 2] {
+        Self::share_sums(grid)
+    }
+
     /// Opens a compiled runner for a DFlash stepper graph.
     pub fn open(
         graph: Graph,
@@ -160,10 +366,64 @@ impl Drafter {
         recipe: &Recipe,
         settings: &Settings,
     ) -> Result<Self, Error> {
+        let run = |plan| Ok(open(plan, settings)?);
+        Self::placed(
+            graph, context, block, mask_token, recipe, settings, None, run,
+        )
+    }
+
+    /// Opens one rank of a TP-sharded DFlash drafter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_ranked<T: Transport + 'static>(
+        graph: Graph,
+        context: usize,
+        block: usize,
+        mask_token: u32,
+        (recipe, settings): (&Recipe, &Settings),
+        mut place: Place,
+        sums: T,
+        grid: Option<Box<dyn Sum>>,
+    ) -> Result<Self, Error> {
+        place.rank = sums.rank();
+        let run = |plan| open_rank(plan, settings, sums, grid);
+        Self::placed(
+            graph,
+            context,
+            block,
+            mask_token,
+            recipe,
+            settings,
+            Some(&place),
+            run,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn placed(
+        graph: Graph,
+        context: usize,
+        block: usize,
+        mask_token: u32,
+        recipe: &Recipe,
+        settings: &Settings,
+        place: Option<&Place>,
+        run: impl FnOnce(tessera_lower::Plan) -> Result<Box<dyn Run>, Error>,
+    ) -> Result<Self, Error> {
         if block < 2 || block > context {
             return Err(Error::Rows);
         }
         tessera_run::configure(settings);
+        let graph = match place {
+            Some(place) => {
+                let sharded = dflash::shard(&graph, &place.parts, &recipe.pins.shares(&graph))?;
+                for w in sharded.whole.iter().filter(|_| place.rank == 0) {
+                    let path = &graph.weights[w.weight as usize].path;
+                    eprintln!("tessera: drafter {path:?} stays whole: {}", w.why);
+                }
+                sharded.graph
+            }
+            None => graph,
+        };
         let dim = |name| {
             graph
                 .dims
@@ -171,44 +431,32 @@ impl Drafter {
                 .find(|d| d.name == name)
                 .map(|d| d.size.max() as usize)
         };
-        let slots = dim(Seqs).unwrap_or(1);
         let tap_width = dim(Embedding).ok_or(Error::Taps)?;
         let vocab = dim(Vocab).ok_or(Error::Scores)?;
         let selector_k = selector_top_k(&graph, block);
-        let device = Device::guess(settings).with(recipe);
-        let mut plans = Cache::default();
-        let first = [
-            (Seqs, slots as u64),
-            (Rows, 1),
-            (Context, block as u64),
-            (Segments, 1),
-        ];
         let wants = match selector_k {
             Some(_) => Wants::roles(&graph, 0, &[Role::Candidates, Role::Taps]),
             None => Wants::role(&graph, 0, Role::Tokens),
         };
-        let (plan, _) = plans.wanting(&graph, 0, wants, &first, &[Context, Segments], &device)?;
-        let mut runner = open(plan.clone(), settings)?;
-        runner.launching(recipe.launch);
-        runner.profiling(settings.profile.is_some());
-        let device = Device::stored(runner.platform(), settings)
-            .map_err(tessera_lower::Error::from)?
-            .with(recipe);
-        Ok(Self {
+        let core = DraftCore::open(
             graph,
-            runner,
-            device,
-            plans,
             context,
-            slots,
+            block as u64,
+            wants,
+            recipe,
+            settings,
+            place,
+            "drafter",
+            run,
+        )?;
+        Ok(Self {
+            core,
             block,
             tap_width,
             vocab,
             mask_token,
             causal: false,
             selector_k,
-            profile: settings.profile,
-            launches: 0,
         })
     }
 
@@ -217,25 +465,8 @@ impl Drafter {
         self.causal = causal;
     }
 
-    /// Uploads the drafter's weights, in graph order.
-    pub fn load(&mut self, weights: &[Weight]) -> Result<(), Error> {
-        for (at, w) in weights.iter().enumerate() {
-            self.load_weight(at as u32, w)?;
-        }
-        Ok(())
-    }
-
-    /// Uploads weight `at` of the drafter graph.
-    pub fn load_weight(&mut self, at: u32, w: &Weight) -> Result<(), Error> {
-        Ok(self.runner.load_weight(at, w)?)
-    }
-
     pub fn block(&self) -> usize {
         self.block
-    }
-
-    pub fn context(&self) -> usize {
-        self.context
     }
 
     pub fn tap_width(&self) -> usize {
@@ -246,8 +477,23 @@ impl Drafter {
         self.mask_token
     }
 
-    pub fn device(&self) -> String {
-        self.runner.device()
+    pub(crate) fn draft_wants(&self) -> Wants {
+        match self.selector_k {
+            Some(_) => Wants::roles(&self.core.graph, 0, &[Role::Candidates, Role::Taps]),
+            None => Wants::role(&self.core.graph, 0, Role::Tokens),
+        }
+    }
+
+    pub(crate) fn read_draft(&mut self, outputs: &[Slot]) -> Result<Vec<u32>, Error> {
+        if let Some(k) = self.selector_k {
+            let cands = self.core.runner.ids(outputs[0])?;
+            let raw = self.core.runner.read(outputs[1])?;
+            let scores = raw.floats().map_err(tessera_run::Error::from)?;
+            return Ok(walk_lattice(&cands, scores, self.block - 1, k));
+        }
+        let mut ids = self.core.runner.ids(outputs[0])?;
+        ids.truncate(self.block - 1);
+        Ok(ids)
     }
 
     /// Proposes `block - 1` greedy draft tokens after `anchor`.
@@ -259,19 +505,9 @@ impl Drafter {
         ctx_pos: usize,
         taps: &[f32],
     ) -> Result<Vec<u32>, Error> {
-        if let Some(k) = self.selector_k {
-            let wants = Wants::roles(&self.graph, 0, &[Role::Candidates, Role::Taps]);
-            let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
-            let cands = self.runner.ids(outputs[0])?;
-            let raw = self.runner.read(outputs[1])?;
-            let scores = raw.floats().map_err(tessera_run::Error::from)?;
-            return Ok(walk_lattice(&cands, scores, self.block - 1, k));
-        }
-        let wants = Wants::role(&self.graph, 0, Role::Tokens);
+        let wants = self.draft_wants();
         let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
-        let mut ids = self.runner.ids(outputs[0])?;
-        ids.truncate(self.block - 1);
-        Ok(ids)
+        self.read_draft(&outputs)
     }
 
     /// Computes `(block - 1) * vocab` draft logits after `anchor`.
@@ -283,14 +519,14 @@ impl Drafter {
         ctx_pos: usize,
         taps: &[f32],
     ) -> Result<Vec<f32>, Error> {
-        let wants = Wants::role(&self.graph, 0, Role::Logits);
+        let wants = Wants::role(&self.core.graph, 0, Role::Logits);
         let outputs = self.run(slot, anchor, start, ctx_pos, taps, wants)?;
-        let raw = self.runner.read(outputs[0])?;
+        let raw = self.core.runner.read(outputs[0])?;
         let logits = raw.floats().map_err(tessera_run::Error::from)?;
         Ok(logits[..(self.block - 1) * self.vocab].to_vec())
     }
 
-    fn run(
+    pub(crate) fn run(
         &mut self,
         slot: u32,
         anchor: u32,
@@ -303,13 +539,13 @@ impl Drafter {
         if n_new == 0 || taps.len() != n_new * self.tap_width {
             return Err(Error::Rows);
         }
-        if slot as usize >= self.slots || start + self.block > self.context {
+        if slot as usize >= self.core.slots || start + self.block > self.core.context {
             return Err(Error::RowPlace);
         }
         let filled = if n_new <= self.block {
             self.block
         } else {
-            n_new.next_power_of_two().min(self.context)
+            n_new.next_power_of_two().min(self.core.context)
         };
         let mut ctx_taps = Vec::with_capacity(filled * self.tap_width);
         ctx_taps.extend_from_slice(taps);
@@ -348,42 +584,167 @@ impl Drafter {
             Tensor::u32(vec![kv_len], kv_slots),
         ];
         let sizes = [
-            (Seqs, self.slots as u64),
+            (Seqs, self.core.slots as u64),
             (Rows, filled as u64),
             (Context, (start + self.block) as u64),
             (Segments, 1),
         ];
-        let (plan, bound) = self.plans.wanting(
-            &self.graph,
-            0,
-            wants,
-            &sizes,
-            &[Context, Segments],
-            &self.device,
-        )?;
-        let outputs = plan.outputs.iter().map(|o| o.slot).collect();
-        self.runner.replan(plan)?;
-        self.runner.bind_all(&bound);
-        let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
-        self.runner.feed(&views)?;
-        self.runner.submit(0..self.runner.plan().steps.len())?;
-        if let Some(every) = self.profile {
-            self.launches += 1;
-            if every > 0
-                && self.launches.is_multiple_of(every)
-                && let Some(p) = self.runner.take_profile()
-            {
-                eprintln!("drafter profile of {every} launches:\n{}", p.report(every));
-            }
-        }
-        Ok(outputs)
+        self.core.exec(&feeds, &sizes, wants)
     }
+}
+
+/// Target launch decoded from rank 0's control message.
+pub(crate) struct TargetCmd {
+    pub rows: Vec<Row>,
+    pub picks: Vec<u32>,
+    pub head: Head,
+    pub wants: Wants,
+    pub table: Vec<u32>,
+}
+
+/// DFlash drafter launch decoded from rank 0's control message.
+pub(crate) struct DraftCmd {
+    pub slot: u32,
+    pub anchor: u32,
+    pub start: usize,
+    pub ctx_pos: usize,
+    pub wants: Wants,
+}
+
+/// One control message received by a speculative follower rank.
+enum Cmd {
+    Target(TargetCmd),
+    Draft(DraftCmd),
+}
+
+pub(crate) fn encode_draft(
+    slot: u32,
+    anchor: u32,
+    start: usize,
+    ctx_pos: usize,
+    wants: Wants,
+) -> Vec<u8> {
+    let mut w = Writer(Vec::with_capacity(24));
+    w.u32(DRAFT_TAG)
+        .u32(slot)
+        .u32(anchor)
+        .u32(start as u32)
+        .u32(ctx_pos as u32)
+        .u32(wants.0);
+    w.0
+}
+
+pub(crate) fn decode_draft(r: &mut Reader) -> Option<DraftCmd> {
+    Some(DraftCmd {
+        slot: r.u32()?,
+        anchor: r.u32()?,
+        start: r.u32()? as usize,
+        ctx_pos: r.u32()? as usize,
+        wants: Wants(r.u32()?),
+    })
+}
+
+pub(crate) fn decode_target(tag: u32, r: &mut Reader) -> Option<TargetCmd> {
+    let k = r.u32()? as usize;
+    let wants = Wants(r.u32()?);
+    let table = r.u32s()?;
+    let n_words = r.u32()? as usize;
+    let raw_bytes = r.take(n_words.checked_mul(4)?)?;
+    let mut rr = Reader(raw_bytes);
+    let mut rows = Vec::with_capacity(n_words / 3);
+    for _ in 0..n_words / 3 {
+        let slot = rr.u32()?;
+        let token = rr.u32()?;
+        let position = rr.u32()?;
+        rows.push(Row {
+            slot,
+            token,
+            position,
+        });
+    }
+    let picks = r.u32s()?;
+    let list = r.u32s()?;
+    let head = match tag {
+        0 => Head::Full(None),
+        1 => Head::Full(Some(list)),
+        _ => Head::Sparse(list, k),
+    };
+    Some(TargetCmd {
+        rows,
+        picks,
+        head,
+        wants,
+        table,
+    })
+}
+
+fn decode_cmd(bytes: &[u8]) -> Option<Cmd> {
+    let mut r = Reader(bytes);
+    let tag = r.u32()?;
+    if tag == DRAFT_TAG {
+        return decode_draft(&mut r).map(Cmd::Draft);
+    }
+    decode_target(tag, &mut r).map(Cmd::Target)
+}
+
+/// Output index of `Role::Taps` inside a `wants` subset.
+pub(crate) fn taps_output(g: &Graph, entry: usize, wants: Wants) -> Option<usize> {
+    g.entries
+        .get(entry)?
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| (wants.0 >> i) & 1 == 1)
+        .position(|(_, o)| o.role == Role::Taps)
+}
+
+/// Exchanges control bytes and gathers rank profiles on rank 0.
+pub(crate) fn tell_ranks(target: &mut Engine, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let Some(control) = &mut target.control else {
+        return Ok(None);
+    };
+    let lead = control.rank() == 0;
+    let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
+    if lead && let Some((launches, own)) = target.held.take() {
+        let mut profiles = vec![Some(own)];
+        profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
+        let ranks = Ranks { launches, profiles };
+        eprintln!("profile of {launches} launches:\n{ranks}");
+        target.ranks = Some(ranks);
+    }
+    Ok(Some(parts.swap_remove(0)))
+}
+
+/// Executes one decoded target launch on a follower rank.
+pub(crate) fn run_target(
+    target: &mut Engine,
+    cmd: TargetCmd,
+    tap_width: usize,
+    last_taps: &mut Vec<f32>,
+) -> Result<(), Error> {
+    if let Some(lanes) = &mut target.lanes
+        && !cmd.table.is_empty()
+    {
+        lanes.replace(cmd.table);
+    }
+    let entry = cmd.head.entry();
+    let outputs = target.run(&cmd.rows, &cmd.picks, cmd.head, cmd.wants)?;
+    if let Some(at) = taps_output(&target.graph, entry, cmd.wants) {
+        let raw = target.runner.read(outputs[at])?;
+        let floats = raw.floats().map_err(tessera_run::Error::from)?;
+        let keep = cmd.rows.len() * tap_width;
+        last_taps.clear();
+        last_taps.extend_from_slice(&floats[..keep]);
+    }
+    target.report();
+    Ok(())
 }
 
 /// DFlash speculative decoding over a target and drafter pair.
 pub struct Speculate<'a> {
     target: &'a mut Engine,
     drafter: &'a mut Drafter,
+    spec_len: SpecLen,
 }
 
 impl<'a> Speculate<'a> {
@@ -395,7 +756,53 @@ impl<'a> Speculate<'a> {
         if width != drafter.tap_width() {
             return Err(Error::Rows);
         }
-        Ok(Self { target, drafter })
+        let spec_len = SpecLen::fixed(drafter.block() - 1).with_cost(CostModel::dflash());
+        Ok(Self {
+            target,
+            drafter,
+            spec_len,
+        })
+    }
+
+    /// Configures adaptive or truncated draft length selection.
+    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
+        self.spec_len = spec_len;
+        self
+    }
+
+    /// Follows rank 0's target and drafter launches until dismissed.
+    pub fn follow(&mut self) -> Result<(), Error> {
+        let mut last_taps: Vec<f32> = Vec::new();
+        let tap_width = self.drafter.tap_width();
+        loop {
+            let mine = self
+                .target
+                .held
+                .take()
+                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
+            let Some(told) = tell_ranks(self.target, &mine)? else {
+                return Ok(());
+            };
+            match decode_cmd(&told) {
+                None => return Ok(()),
+                Some(Cmd::Target(cmd)) => run_target(self.target, cmd, tap_width, &mut last_taps)?,
+                Some(Cmd::Draft(cmd)) => {
+                    let n_new = cmd.start.checked_sub(cmd.ctx_pos).ok_or(Error::RowPlace)?;
+                    let need = n_new * tap_width;
+                    if last_taps.len() < need {
+                        return Err(Error::Rows);
+                    }
+                    self.drafter.run(
+                        cmd.slot,
+                        cmd.anchor,
+                        cmd.start,
+                        cmd.ctx_pos,
+                        &last_taps[..need],
+                        cmd.wants,
+                    )?;
+                }
+            }
+        }
     }
 
     /// Greedy speculative decoding matching target output token-for-token.
@@ -404,97 +811,156 @@ impl<'a> Speculate<'a> {
         request: Request,
         emit: &mut dyn FnMut(Event) -> bool,
     ) -> Result<SpecStats, Error> {
-        let mut stats = SpecStats::default();
-        let prompt = &request.tokens;
-        if prompt.is_empty() || prompt.len() > self.target.context() {
-            let _ = emit(Event::Done(Reason::Context));
-            return Ok(stats);
-        }
-        if request.max_tokens == 0 {
-            let _ = emit(Event::Done(Reason::Length));
-            return Ok(stats);
-        }
-        let prefill: Vec<Row> = prompt
-            .iter()
-            .enumerate()
-            .map(|(i, &token)| Row {
-                slot: 0,
-                token,
-                position: i as u32,
-            })
-            .collect();
-        let (ids, mut pending_taps) = self.target.step_taps(&prefill)?;
-        let mut anchor = *ids.last().expect("non-empty prompt");
-        if let Some(reason) = emit_one(&request, &mut stats, anchor, emit) {
-            let _ = emit(Event::Done(reason));
-            return Ok(stats);
-        }
-        let mut start = prompt.len();
-        let mut ctx_pos = 0usize;
         let block = self.drafter.block();
         let tap_width = self.drafter.tap_width();
         let max_ctx = self.target.context().min(self.drafter.context());
-        while stats.emitted < request.max_tokens {
-            if start >= self.target.context() {
-                let _ = emit(Event::Done(Reason::Context));
-                return Ok(stats);
-            }
-            let remaining = request.max_tokens - stats.emitted;
-            if remaining == 1 || start + block > max_ctx {
-                let row = [Row {
-                    slot: 0,
-                    token: anchor,
-                    position: start as u32,
-                }];
-                let next = self.target.step(&row)?[0];
-                start += 1;
-                if let Some(reason) = emit_one(&request, &mut stats, next, emit) {
-                    let _ = emit(Event::Done(reason));
-                    return Ok(stats);
+        let drafter = &mut *self.drafter;
+        let spec = self.spec_len.fresh();
+        run_speculate(
+            self.target,
+            request,
+            emit,
+            |_, _, taps| (0usize, taps, spec, 1.0f64),
+            |target, (ctx_pos, pending, spec, last_pred), start, anchor, remaining| {
+                if remaining == 1 || start + block > max_ctx {
+                    return Ok(None);
                 }
-                anchor = next;
-                continue;
-            }
-            let drafts = self
-                .drafter
-                .draft(0, anchor, start, ctx_pos, &pending_taps)?;
-            let mut verify = Vec::with_capacity(block);
-            verify.push(Row {
-                slot: 0,
-                token: anchor,
-                position: start as u32,
-            });
-            for (i, &token) in drafts.iter().enumerate() {
-                verify.push(Row {
-                    slot: 0,
-                    token,
-                    position: (start + 1 + i) as u32,
-                });
-            }
-            let (posterior, block_taps) = self.target.step_taps(&verify)?;
-            let (accepted, bonus) = accept_greedy(&drafts, &posterior);
-            stats.steps += 1;
-            stats.drafted += drafts.len();
-            stats.accepted += accepted;
-            for id in drafts[..accepted].iter().copied().chain([bonus]) {
-                if let Some(reason) = emit_one(&request, &mut stats, id, emit) {
-                    let _ = emit(Event::Done(reason));
-                    return Ok(stats);
+                let wants = drafter.draft_wants();
+                if target.control.is_some() {
+                    tell_ranks(target, &encode_draft(0, anchor, start, *ctx_pos, wants))?;
                 }
-            }
-            let commit = 1 + accepted;
-            ctx_pos = start;
-            pending_taps = block_taps[..commit * tap_width].to_vec();
-            start += commit;
-            anchor = bonus;
-        }
-        let _ = emit(Event::Done(Reason::Length));
-        Ok(stats)
+                let outputs = drafter.run(0, anchor, start, *ctx_pos, pending, wants)?;
+                let mut drafts = drafter.read_draft(&outputs)?;
+                let avail = drafts
+                    .len()
+                    .min(remaining.saturating_sub(1))
+                    .min(max_ctx.saturating_sub(start + 1));
+                if avail == 0 {
+                    return Ok(None);
+                }
+                let (k, pred) = spec.choose(None, avail, drafts.len());
+                *last_pred = pred;
+                drafts.truncate(k);
+                Ok(Some(drafts))
+            },
+            |(ctx_pos, pending, spec, last_pred),
+             start,
+             drafted,
+             accepted,
+             _,
+             mut block_taps,
+             stats| {
+                spec.observe(drafted, accepted, None, *last_pred);
+                stats.dflash_steps += 1;
+                let commit = 1 + accepted;
+                *ctx_pos = start;
+                block_taps.truncate(commit * tap_width);
+                *pending = block_taps;
+            },
+        )
     }
 }
 
+/// Shared greedy speculative decode loop for DFlash and MTP.
+pub(crate) fn run_speculate<S>(
+    target: &mut Engine,
+    request: Request,
+    emit: &mut dyn FnMut(Event) -> bool,
+    init: impl FnOnce(&[u32], u32, Vec<f32>) -> S,
+    mut draft: impl FnMut(&mut Engine, &mut S, usize, u32, usize) -> Result<Option<Vec<u32>>, Error>,
+    mut advance: impl FnMut(&mut S, usize, usize, usize, &[u32], Vec<f32>, &mut SpecStats),
+) -> Result<SpecStats, Error> {
+    let mut stats = SpecStats::default();
+    let prompt = &request.tokens;
+    if prompt.is_empty() || prompt.len() > target.context() {
+        let _ = emit(Event::Done(Reason::Context));
+        return Ok(stats);
+    }
+    if request.max_tokens == 0 {
+        let _ = emit(Event::Done(Reason::Length));
+        return Ok(stats);
+    }
+    let prefill: Vec<Row> = prompt
+        .iter()
+        .enumerate()
+        .map(|(i, &token)| Row {
+            slot: 0,
+            token,
+            position: i as u32,
+        })
+        .collect();
+    let (ids, taps) = target.step_taps(&prefill)?;
+    let mut anchor = *ids.last().expect("non-empty prompt");
+    if let Some(reason) = emit_one(&request, &mut stats, anchor, emit) {
+        let _ = emit(Event::Done(reason));
+        return Ok(stats);
+    }
+    let mut state = init(prompt, anchor, taps);
+    let mut start = prompt.len();
+    while stats.emitted < request.max_tokens {
+        if start >= target.context() {
+            let _ = emit(Event::Done(Reason::Context));
+            return Ok(stats);
+        }
+        let remaining = request.max_tokens - stats.emitted;
+        let Some(drafts) = draft(target, &mut state, start, anchor, remaining)? else {
+            let row = [Row {
+                slot: 0,
+                token: anchor,
+                position: start as u32,
+            }];
+            let next = target.step(&row)?[0];
+            start += 1;
+            if let Some(reason) = emit_one(&request, &mut stats, next, emit) {
+                let _ = emit(Event::Done(reason));
+                return Ok(stats);
+            }
+            anchor = next;
+            continue;
+        };
+        let mut verify = Vec::with_capacity(drafts.len() + 1);
+        verify.push(Row {
+            slot: 0,
+            token: anchor,
+            position: start as u32,
+        });
+        for (i, &token) in drafts.iter().enumerate() {
+            verify.push(Row {
+                slot: 0,
+                token,
+                position: (start + 1 + i) as u32,
+            });
+        }
+        let (posterior, block_taps) = target.step_taps(&verify)?;
+        let (accepted, bonus) = accept_greedy(&drafts, &posterior);
+        stats.steps += 1;
+        stats.drafted += drafts.len();
+        stats.accepted += accepted;
+        for id in drafts[..accepted].iter().copied().chain([bonus]) {
+            if let Some(reason) = emit_one(&request, &mut stats, id, emit) {
+                let _ = emit(Event::Done(reason));
+                return Ok(stats);
+            }
+        }
+        let commit = 1 + accepted;
+        advance(
+            &mut state,
+            start,
+            drafts.len(),
+            accepted,
+            &posterior,
+            block_taps,
+            &mut stats,
+        );
+        start += commit;
+        anchor = bonus;
+    }
+    let _ = emit(Event::Done(Reason::Length));
+    Ok(stats)
+}
+
 /// Emits one token, returning the stop reason if finished.
-fn emit_one(
+pub(crate) fn emit_one(
     request: &Request,
     stats: &mut SpecStats,
     id: u32,

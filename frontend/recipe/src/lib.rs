@@ -86,8 +86,13 @@ impl Recipe {
     pub fn read(dir: &Path) -> Result<Self, Error> {
         let path = dir.join("recipe.toml");
         let text = std::fs::read_to_string(&path).map_err(io(&path))?;
-        let mut recipe: Recipe = toml::from_str(&text).map_err(|e| Error::Toml(path, e))?;
-        recipe.dir = dir.to_path_buf();
+        Self::parse(&text, &path)
+    }
+
+    /// `text` as the recipe file at `path`.
+    pub fn parse(text: &str, path: &Path) -> Result<Self, Error> {
+        let mut recipe: Recipe = toml::from_str(text).map_err(|e| Error::Toml(path.into(), e))?;
+        recipe.dir = path.parent().unwrap_or(path).to_path_buf();
         Ok(recipe)
     }
 

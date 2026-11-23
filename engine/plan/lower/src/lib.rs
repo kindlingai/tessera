@@ -36,7 +36,7 @@ pub use schedule::{peak, schedule};
 pub use select::{Home, Op, Selected, Val, Value, select};
 pub use tessera_codegen::kept;
 pub use tessera_codegen::{Dialect, Terms, hip_tiles, terms};
-pub use tessera_engine_settings::{Pick, Reads, Settings};
+pub use tessera_engine_settings::{Backend, ByBackend, Pick, Reads, Settings};
 pub use tessera_kernel_macro::Kernel;
 pub use tessera_mem::{Buffer, DType, Tensor, View};
 pub use tessera_platform::{Limits, Platform};

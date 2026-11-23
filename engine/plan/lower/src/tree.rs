@@ -581,6 +581,29 @@ impl<'a> Tree<'a> {
         self.shares[t.0 as usize]
     }
 
+    /// Global `(first, whole)` along `t`'s last axis.
+    pub fn row_share(&self, t: T) -> (usize, usize) {
+        let node = self.node(t);
+        let width = *node.shape.last().unwrap_or(&0);
+        let g = self.g.node(node.from);
+        let last = g.ty.rank().saturating_sub(1) as u32;
+        if g.ty.placement != (Placement::Split { axis: last }) || self.parts.ranks() <= 1 {
+            return (0, width);
+        }
+        let lookup = |d| self.sizes.iter().find(|(n, _)| *n == d).map(|(_, v)| *v);
+        let Some(whole) = g.ty.shape.0[last as usize]
+            .value(&self.g.dims, &lookup)
+            .map(|v| v as usize)
+        else {
+            return (0, width);
+        };
+        let first = self
+            .parts
+            .part(whole, self.rank as usize)
+            .map_or(0, |(f, _)| f);
+        (first, whole)
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }

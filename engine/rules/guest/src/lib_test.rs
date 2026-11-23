@@ -6,7 +6,12 @@ mod multi {
     fn offer(_: &Site) -> Option<Vec<Offer>> {
         None
     }
-    crate::exports!("multi", Kind::Model, "lib.rs", offer, ["site.rs"]);
+    crate::exports! {
+        rules: { "multi" => Kind::Model },
+        kernels: { "lib.rs": ["multi", "other"], "kit.rs": ["third"] },
+        files: ["site.rs"],
+        propose: offer,
+    }
 }
 
 #[test]

@@ -45,7 +45,10 @@ fn exlr8_one_width() {
     let names = owned(&[
         "config.json",
         "dense/exlr8-dense-000.safetensors",
+        "dense/exlr8-extra-audio.safetensors",
+        "dense/exlr8-extra-vision.safetensors",
         "dense/exlr8-vocab.safetensors",
+        "manifests/exlr8-manifest-bit309.json",
         "experts/exlr8-layer-001.index.safetensors",
         "experts/exlr8-layer-001.k2.safetensors",
         "experts/exlr8-layer-001.k3.safetensors",
@@ -54,7 +57,8 @@ fn exlr8_one_width() {
         "index-slices/tp4/k3/rank0.safetensors",
     ]);
     let at = |k| exlr8(&names, k).join(" ");
-    let head = "config.json dense/exlr8-dense-000.safetensors dense/exlr8-vocab.safetensors";
+    let head = "config.json dense/exlr8-dense-000.safetensors dense/exlr8-vocab.safetensors \
+                manifests/exlr8-manifest-bit309.json";
     let experts = "experts/exlr8-layer-001";
     assert_eq!(
         at(4),

@@ -39,3 +39,14 @@ fn options_carry_rules() {
     assert_eq!(lower.favor.as_deref(), Some("glm53_moe"));
     assert!(options.module.is_some());
 }
+
+/// The built-in recipe reads, with its weights and a manifest.
+#[test]
+fn default_recipe_reads() {
+    let Ok(source) = Source::open_or_default(None) else {
+        panic!("the default recipe opens");
+    };
+    let recipe = source.recipe.unwrap();
+    assert!(recipe.weights.hf.is_some());
+    assert!(recipe.flags().iter().any(|(flag, _)| flag == "--manifest"));
+}

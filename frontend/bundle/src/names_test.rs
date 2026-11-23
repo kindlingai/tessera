@@ -176,7 +176,7 @@ fn untied_head_loads() {
     });
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     let (arch, c) = crate::config(&dir, [1, 8], &Overrides::default()).unwrap();
-    let g = crate::stepper(&arch, &c).unwrap();
+    let g = (crate::arch::family(&arch).unwrap().step)(&c);
     written(&dir, &offered(&g, false));
     let shards = Shards::open(&dir).unwrap();
     let (weights, _) = crate::pull(&g, &shards, c.stack.layers, &[]).unwrap();

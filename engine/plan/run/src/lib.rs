@@ -1,19 +1,17 @@
 //! Runs lowered plans on the host or a GPU.
 
+mod cache;
 mod cpu;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod device;
 mod grid;
 mod held;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
 pub mod marks;
 #[cfg(test)]
 mod marks_test;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod overrides;
-#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+#[cfg(test)]
 mod overrides_test;
 mod profile;
 mod rank;
@@ -121,15 +119,6 @@ pub fn gpu() -> Option<Backend> {
     tessera_gpukit::backend::picked()
 }
 
-/// How `backend`'s tiles round.
-pub fn precision(backend: Backend) -> Precision {
-    match backend {
-        Backend::Metal => Precision::METAL,
-        Backend::Cuda => Precision::CUDA,
-        Backend::Rocm => Precision::HIP,
-    }
-}
-
 /// Applies cache and compiler settings to the GPU runtime.
 pub fn configure(settings: &Settings) {
     tessera_gpukit::cache::configure(settings);
@@ -138,41 +127,24 @@ pub fn configure(settings: &Settings) {
 /// Pinned memory on the GPU `settings` picks, if any.
 pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
     configure(settings);
-    match settings.gpu() {
-        #[cfg(feature = "cuda")]
-        Some(Backend::Cuda) => {
-            let ctx = tessera_gpukit::cuda::cached_context().ok()?;
-            Some(Arc::new(device::Pin(ctx)))
-        }
-        #[cfg(feature = "rocm")]
-        Some(Backend::Rocm) => {
-            let ctx = tessera_gpukit::rocm::cached_context().ok()?;
-            Some(Arc::new(device::Pin(ctx)))
-        }
-        _ => None,
+    if let Ok(pins) =
+        tessera_gpukit::backend::dispatch(settings.gpu().filter(|b| b.pins()), device::Pins)
+    {
+        return pins;
     }
+    None
 }
 
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
-    let mut runner: Box<dyn Run> = match settings.gpu() {
-        #[cfg(target_os = "macos")]
-        Some(Backend::Metal) => Box::new(device::Runner::<tessera_gpukit::metal::Context>::new(
-            plan, settings,
-        )?),
-        #[cfg(feature = "cuda")]
-        Some(Backend::Cuda) => Box::new(device::Runner::<tessera_gpukit::cuda::Context>::new(
-            plan, settings,
-        )?),
-        #[cfg(feature = "rocm")]
-        Some(Backend::Rocm) => Box::new(device::Runner::<tessera_gpukit::rocm::Context>::new(
-            plan, settings,
-        )?),
-        _ => Box::new(cpu::Runner::new(
+    let open = tessera_gpukit::backend::dispatch(settings.gpu(), device::Open(plan, settings));
+    let mut runner: Box<dyn Run> = match open {
+        Ok(run) => run?,
+        Err(device::Open(plan, _)) => Box::new(cpu::Runner::new(
             plan,
             settings.host_lanes,
-            settings.emulate.map_or(Precision::EXACT, precision),
+            settings.emulate.map_or(Precision::EXACT, Precision::of),
             settings.memory,
         )?),
     };

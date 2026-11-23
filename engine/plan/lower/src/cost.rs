@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tessera_codegen::kept::Layout;
-use tessera_engine_settings::{Backend, Pick, Settings};
+use tessera_engine_settings::{Pick, Settings};
 use tessera_graph::Parts;
 use tessera_platform::{Limits, Platform};
 use tessera_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, known};
@@ -142,15 +142,6 @@ impl Default for Device {
     }
 }
 
-/// The name a runner's platform gives `backend`.
-fn backend_name(backend: Backend) -> &'static str {
-    match backend {
-        Backend::Metal => "metal",
-        Backend::Cuda => "cuda",
-        Backend::Rocm => "rocm",
-    }
-}
-
 impl Device {
     /// The device `open` picks under `settings`, before any samples.
     pub fn guess(settings: &Settings) -> Self {
@@ -158,7 +149,7 @@ impl Device {
             None => Platform::host(Limits::host(settings.host_lanes)),
             // The backend name picks which kernel texts fit.
             Some(b) => Platform {
-                backend: backend_name(b).into(),
+                backend: b.name().into(),
                 ..Platform::assumed(Limits::assumed())
             },
         };

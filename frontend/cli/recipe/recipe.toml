@@ -1,0 +1,11 @@
+# google/gemma-4-E4B-it as exlr8 trellis codes: the default model of
+# tesserax.
+name = "gemma-4-e4b"
+
+[weights]
+# Release v0.2. Its per-layer embedding table is a K4 row trellis.
+hf = "kindlingai/gemma-4-e4b-exlr8@0f1e200dba737d3f2162950ab04614ebce2ab501"
+
+[serve]
+# 3.09 bits a weight: of the release's profiles, the nearest to BF16.
+manifest = "bit309"

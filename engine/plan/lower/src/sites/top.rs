@@ -9,6 +9,8 @@ pub struct Top {
     pub rows: usize,
     pub width: usize,
     pub k: usize,
+    pub first: usize,
+    pub whole: usize,
 }
 
 impl Pattern for Top {
@@ -21,6 +23,14 @@ impl Pattern for Top {
         let width = *tree.node(x).shape.last()?;
         let rows = tree.elements(x) / width;
         let k = tree.elements(at) * width / tree.elements(x);
-        Some(Self { x, rows, width, k })
+        let (first, whole) = tree.row_share(x);
+        Some(Self {
+            x,
+            rows,
+            width,
+            k,
+            first,
+            whole,
+        })
     }
 }

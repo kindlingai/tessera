@@ -26,7 +26,29 @@ struct job {
     u64 moved;
 };
 
-// Copies `len` floats into send buffer and returns activity.
+__device__ __forceinline__ u16 to_bf16(float x) {
+#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    u32 d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(0.0f), "f"(x));
+    return static_cast<u16>(d);
+#else
+    u32 b = __float_as_uint(x);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return static_cast<u16>((b >> 16) | 0x0040u);
+    return static_cast<u16>((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+#endif
+}
+
+__device__ __forceinline__ u32 to_bf16x2(float lo, float hi) {
+#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    u32 d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+#else
+    return u32(to_bf16(lo)) | (u32(to_bf16(hi)) << 16);
+#endif
+}
+
+// Copies `len` floats into the send buffer.
 __device__ bool stage_send(const float* src, float* dst, u32 len, u32 first, u32 stride) {
     u64 align = reinterpret_cast<u64>(src) | reinterpret_cast<u64>(dst);
     bool vec4 = (len & 3u) == 0u && (align & 15ull) == 0ull;
@@ -40,16 +62,33 @@ __device__ bool stage_send(const float* src, float* dst, u32 len, u32 first, u32
     return (blockIdx.x * blockDim.x) < len;
 }
 
+// Packs `len` floats as BF16 into the send buffer.
+__device__ bool stage_bf16(const float* src, u16* dst, u32 len, u32 first, u32 stride) {
+    bool vec4 = (len & 3u) == 0u && (reinterpret_cast<u64>(src) & 15ull) == 0ull
+                && (reinterpret_cast<u64>(dst) & 7ull) == 0ull;
+    if (vec4) {
+        for (u32 i = first << 2; i < len; i += stride << 2) {
+            float4 v = *reinterpret_cast<const float4*>(src + i);
+            uint2 h = make_uint2(to_bf16x2(v.x, v.y), to_bf16x2(v.z, v.w));
+            *reinterpret_cast<uint2*>(dst + i) = h;
+        }
+        return ((blockIdx.x * blockDim.x) << 2) < len;
+    }
+    for (u32 i = first; i < len; i += stride) dst[i] = to_bf16(src[i]);
+    return (blockIdx.x * blockDim.x) < len;
+}
+
 __device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first,
                         u32 stride) {
-    for (u32 done = 0; done < n; done += room) {
-        u32 len = min(room, n - done);
+    u32 sum_room = room << 1;
+    for (u32 done = 0; done < n; done += sum_room) {
+        u32 len = min(sum_room, n - done);
         ticket r = prepare(s, 0);
-        float* part = send_buffer<float>(r);
+        u16* part = send_buffer<u16>(r);
         if (part == nullptr) return false;
-        bool active = stage_send(from + done, part, len, first, stride);
-        u64 align = reinterpret_cast<u64>(to + done) | reinterpret_cast<u64>(part);
-        bool vec4 = (len & 3u) == 0u && (align & 15ull) == 0ull;
+        bool active = stage_bf16(from + done, part, len, first, stride);
+        bool vec4 = (len & 3u) == 0u && (reinterpret_cast<u64>(to + done) & 15ull) == 0ull
+                    && (reinterpret_cast<u64>(part) & 7ull) == 0ull;
         bool reads = vec4 ? ((blockIdx.x * blockDim.x) << 2) < len
                           : (blockIdx.x * blockDim.x) < len;
         if (!trigger(r, len, active)) return false;
@@ -142,9 +181,9 @@ extern "C" __global__ void tessera_sums(const table* t) {
         if (now.n == 0) break;
         if (now.timed != 0) {
             ticket b = prepare(s, 0);
-            float* part = send_buffer<float>(b);
+            u16* part = send_buffer<u16>(b);
             if (part == nullptr) return;
-            if (first == 0) part[0] = 0.0f;
+            if (first == 0) part[0] = 0u;
             if (!trigger(b, 1, first == 0)) return;
             if (!wait(b, false)) return;
         }

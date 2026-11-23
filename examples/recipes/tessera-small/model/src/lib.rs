@@ -1,49 +1,22 @@
 //! tessera-small's graph and tables, built inside the recipe's sandbox.
 
-use serde::Deserialize;
-use tessera_guest::{encode, input, output};
+use tessera_guest::{Build, Table};
 use tessera_models::sprite::{self, Config};
 
-/// Inputs the host passes to `graph` and `tables`.
-#[derive(Deserialize)]
-struct Build {
-    config: serde_json::Value,
-    seqs: u64,
-}
-
-fn config(at: i32, len: i32) -> Result<Config, String> {
-    // SAFETY: the host passes back what `alloc` returned.
-    let bytes = unsafe { input(at, len) };
-    let b: Build = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+fn config(b: &Build) -> Result<Config, String> {
     Config::upstream(&b.config.to_string(), b.seqs)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: i32) -> i32 {
-    tessera_guest::alloc(len)
+fn program(b: &Build) -> Result<String, String> {
+    Ok(sprite::program(&config(b)?).to_json())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn manifest() -> i64 {
-    let manifest = serde_json::json!({"abi": tessera_guest::ABI, "graph": true});
-    output(manifest.to_string().into_bytes())
+fn constants(b: &Build) -> Result<Vec<Table>, String> {
+    let tables = sprite::constants(&config(b)?).into_iter();
+    Ok(tables.map(|t| (t.path, t.data)).collect())
 }
 
-/// The graph as JSON, else why the config is refused.
-#[unsafe(no_mangle)]
-pub extern "C" fn graph(at: i32, len: i32) -> i64 {
-    let text = config(at, len).map_or_else(|e| e, |c| sprite::program(&c).to_json());
-    output(text.into_bytes())
-}
-
-/// The `const.` tables, or nothing if the config is refused.
-#[unsafe(no_mangle)]
-pub extern "C" fn tables(at: i32, len: i32) -> i64 {
-    let Ok(c) = config(at, len) else {
-        return output(Vec::new());
-    };
-    let tables: Vec<_> = (sprite::constants(&c).into_iter())
-        .map(|t| (t.path, t.data))
-        .collect();
-    output(encode(&tables))
+tessera_guest::exports! {
+    graph: program,
+    tables: constants,
 }

@@ -1,14 +1,32 @@
 //! A FLUX.2 transformer from a diffusers directory.
 
+use crate::arch::{Arch, Spot, arch};
 use crate::names::repo;
+use crate::parts::{Cut, Part};
 use crate::{Overrides, pull};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::File;
+use tessera_engine::DimName::Rows;
 use tessera_engine::flux2::{Config, program};
 use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+fn part(_: &Arch, cut: &Cut) -> Result<Part> {
+    let root = cut.root();
+    let [seqs, text] = cut.sized(512);
+    let sizes = [seqs, text, cut.at(Rows, 1024)];
+    let graph = graph(&root, sizes, &Overrides::default())?;
+    Ok(Part::new(graph, move |g| weights(&root, g)))
+}
+
+arch!(
+    "flux2",
+    [Spot::Class("Flux2Transformer2DModel")],
+    rules: include_str!("../names/flux2.json"),
+    part: part,
+);
 
 pub struct Transformer {
     pub graph: Graph,

@@ -8,7 +8,7 @@ use crate::whole::{
     RefillCache, TableBufs, fill_pages, format_summary, pack_into, plan, prepare_source,
 };
 use tessera_gpukit::device::KernelStats;
-use tessera_lower::{Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
+use tessera_lower::{ByBackend, Collective, Kernel, KernelRef, Launch, Resident, Source, Step};
 use tessera_run::{FormMeta, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, marks};
 
 #[test]
@@ -213,9 +213,7 @@ impl Kernel for Stub {
 
     fn source(&self) -> Source {
         Source::Fixed {
-            metal: "",
-            cuda: "",
-            hip: "",
+            text: ByBackend::default(),
             entry: "stub",
         }
     }
@@ -246,6 +244,10 @@ fn plans_collective_lanes() {
     let planned = plan(&kernel, layout, 2, 1).unwrap();
     let got: Vec<(Op, u32)> = planned.lanes.iter().map(|l| (l.op, l.elem)).collect();
     assert_eq!(got, [(Op::Sum, F32), (Op::Sum, BF16)]);
+    let sums = crate::sums::plan(4);
+    let lanes: Vec<(Op, u32)> = sums.lanes.iter().map(|l| (l.op, l.elem)).collect();
+    assert_eq!(lanes, [(Op::Sum, BF16), (Op::Gather, F32)]);
+    assert_eq!(sums.pools[0].send_bytes as usize, crate::sums::RELAY);
 }
 
 fn sample_bufs() -> TableBufs {

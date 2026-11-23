@@ -1,16 +1,9 @@
 //! Knobs the front end sets once and the engine reads.
 
-use std::path::PathBuf;
+mod backend;
 
-/// A GPU that runs kernels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, derive_more::Display)]
-#[serde(rename_all = "lowercase")]
-#[display(rename_all = "lowercase")]
-pub enum Backend {
-    Metal,
-    Cuda,
-    Rocm,
-}
+pub use backend::{Backend, ByBackend};
+use std::path::PathBuf;
 
 /// Where plans run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

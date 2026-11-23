@@ -1,12 +1,12 @@
 //! A plan's sums through a persistent grid and its proxy.
 
 use crate::proxy::Op;
-use crate::resident::{Error, LanePlan, Plan, PoolPlan, Resident};
+use crate::resident::{Error, LanePlan, Plan, PoolPlan, Resident, persistent};
 use crate::{Options, flatten};
 use std::time::Duration;
 use tessera_engine_comm::Link;
-use tessera_gpukit::backend::Backend as Gpu;
-use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
+use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
 
 pub use tessera_run::Sum;
@@ -40,13 +40,13 @@ pub(crate) fn pool(ranks: u32) -> PoolPlan {
     }
 }
 
-fn plan(ranks: u32) -> Plan {
+pub(crate) fn plan(ranks: u32) -> Plan {
     Plan {
         pools: vec![pool(ranks)],
         lanes: vec![
             LanePlan {
                 op: Op::Sum,
-                elem: crate::layout::F32,
+                elem: crate::layout::BF16,
                 pool: 0,
                 block: 0,
             },
@@ -229,18 +229,17 @@ where
     }))
 }
 
+struct Start<L>(L);
+
+impl<L: Link + 'static> OnGpu for Start<L> {
+    type Out = Result<Box<dyn Sum>, Error>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        on(cached_context::<D>()?, self.0)
+    }
+}
+
 /// Sums over `link` on the GPU `gpu` names.
 pub fn open<L: Link + 'static>(gpu: Option<Gpu>, link: L) -> Result<Box<dyn Sum>, Error> {
-    match gpu {
-        #[cfg(feature = "cuda")]
-        Some(Gpu::Cuda) => on(tessera_gpukit::cuda::cached_context()?, link),
-        #[cfg(feature = "rocm")]
-        Some(Gpu::Rocm) => on(tessera_gpukit::rocm::cached_context()?, link),
-        _ => {
-            drop(link);
-            Err(Error::Plan(
-                "persistent grids need a CUDA or ROCm GPU".into(),
-            ))
-        }
-    }
+    persistent(gpu, Start(link))
 }

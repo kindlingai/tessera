@@ -40,7 +40,7 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
         "chat" => chat::run,
         other => return Err(Stop::Tasks(Some(other.into()))),
     };
-    let source = Source::open(origin)?;
+    let source = Source::open_or_default(origin)?;
     let (max_tokens, args) = flags(args)?;
     let mut options = source.options(&[])?;
     options.slots = 1;

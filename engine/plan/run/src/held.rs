@@ -59,6 +59,8 @@ pub struct Held {
     kept_spans: HashMap<(usize, usize), usize>,
     /// The page table, when kept rows are paged.
     table: Option<usize>,
+    /// Grow-only scratch buffers in `all`, per zone.
+    scratch: HashMap<u32, Vec<usize>>,
     /// Where each of the plan's buffers lies in `all`.
     bound: Vec<usize>,
 }
@@ -66,6 +68,11 @@ pub struct Held {
 impl Held {
     pub fn get(&self, slot: Slot) -> &Buffer {
         &self.all[self.bound[slot.buffer as usize]]
+    }
+
+    /// Buffers bound for the active plan, in plan order.
+    pub(crate) fn bound(&self) -> impl Iterator<Item = &Buffer> + '_ {
+        self.bound.iter().map(|&at| &self.all[at])
     }
 
     /// Accessible bytes of `slot`: kept room, else `slot.bytes()`.
@@ -138,13 +145,12 @@ impl Held {
         self.all[at].view_mut(slot.start(), slot.form.dtype(), vec![slot.len])
     }
 
-    /// Binds `plan`'s buffers. Weights, kept rows and tables stay.
+    /// Binds `plan`'s buffers. Returns true if any buffer dropped.
     pub fn bind(
         &mut self,
         plan: &Plan,
         mut alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
-    ) -> Result<(), Error> {
-        let mut spare = self.compact();
+    ) -> Result<bool, Error> {
         let count = plan.buffers.len();
         let mut weights: Vec<Vec<(WeightKey, usize, usize)>> = vec![Vec::new(); count];
         for l in &plan.weights {
@@ -156,6 +162,8 @@ impl Held {
             kept[slot.buffer as usize].push((index, slot.start()));
         }
         self.bound.clear();
+        let mut seen: HashMap<u32, usize> = HashMap::new();
+        let mut replaced = false;
         for (b, &bytes) in plan.buffers.iter().enumerate() {
             let zone = plan.zone(b as u32);
             let is_table = plan.table.is_some_and(|s| s.buffer as usize == b);
@@ -167,33 +175,51 @@ impl Held {
             } else if is_table {
                 self.bind_table(zone, bytes, &mut alloc)?
             } else {
-                let fits = |buf: &Buffer| buf.zone == zone && buf.bytes() >= bytes;
-                match spare.iter().position(fits) {
-                    Some(pos) => {
-                        self.all.push(spare.swap_remove(pos));
-                        self.all.len() - 1
-                    }
-                    None => {
-                        // Scratch grows in steps, so a growing context reuses it.
-                        let want = bytes.max(LEAST).next_power_of_two();
-                        self.all.push(alloc(zone, want, Holds::Other)?);
-                        self.all.len() - 1
-                    }
-                }
+                let slot = seen.entry(zone).or_insert(0);
+                let idx = *slot;
+                *slot += 1;
+                self.bind_scratch(zone, idx, bytes, &mut alloc, &mut replaced)?
             };
             self.bound.push(at);
         }
+        let dropped = self.compact();
         self.kept_spans.clear();
         for p in self.kept.values() {
             self.kept_spans.insert((p.buffer, p.offset), p.bytes);
         }
-        Ok(())
+        Ok(replaced || dropped)
     }
 
-    /// Keeps persistent buffers in `all`, returning old scratch buffers.
-    fn compact(&mut self) -> Vec<Buffer> {
-        let old = std::mem::take(&mut self.all);
-        let mut keep = vec![false; old.len()];
+    /// Reuses a zone's `slot`-th scratch buffer, growing in place.
+    fn bind_scratch(
+        &mut self,
+        zone: u32,
+        slot: usize,
+        bytes: usize,
+        alloc: &mut impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
+        replaced: &mut bool,
+    ) -> Result<usize, Error> {
+        let slots = self.scratch.entry(zone).or_default();
+        if let Some(&at) = slots.get(slot) {
+            if self.all[at].bytes() >= bytes {
+                return Ok(at);
+            }
+            // Scratch grows in steps, so a growing context reuses it.
+            let want = bytes.max(LEAST).next_power_of_two();
+            self.all[at] = alloc(zone, want, Holds::Other)?;
+            *replaced = true;
+            return Ok(at);
+        }
+        let want = bytes.max(LEAST).next_power_of_two();
+        let at = self.all.len();
+        self.all.push(alloc(zone, want, Holds::Other)?);
+        slots.push(at);
+        Ok(at)
+    }
+
+    /// Drops unreferenced buffers in `all`. True if any dropped.
+    fn compact(&mut self) -> bool {
+        let mut keep = vec![false; self.all.len()];
         for places in self.weights.values() {
             for p in places {
                 keep[p.buffer] = true;
@@ -205,14 +231,23 @@ impl Held {
         if let Some(at) = self.table {
             keep[at] = true;
         }
+        for slots in self.scratch.values() {
+            for &at in slots {
+                keep[at] = true;
+            }
+        }
+        for &at in &self.bound {
+            keep[at] = true;
+        }
+        if keep.iter().all(|&k| k) {
+            return false;
+        }
+        let old = std::mem::take(&mut self.all);
         let mut remap = vec![0usize; old.len()];
-        let mut spare = Vec::new();
         for (at, buf) in old.into_iter().enumerate() {
             if keep[at] {
                 remap[at] = self.all.len();
                 self.all.push(buf);
-            } else {
-                spare.push(buf);
             }
         }
         for places in self.weights.values_mut() {
@@ -226,7 +261,15 @@ impl Held {
         if let Some(at) = &mut self.table {
             *at = remap[*at];
         }
-        spare
+        for slots in self.scratch.values_mut() {
+            for at in slots {
+                *at = remap[*at];
+            }
+        }
+        for at in &mut self.bound {
+            *at = remap[*at];
+        }
+        true
     }
 
     /// Reuses a matching weight arena, else allocates and copies.

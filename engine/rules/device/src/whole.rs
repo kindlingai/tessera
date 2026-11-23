@@ -4,15 +4,15 @@ use crate::layout::{
     BYTES, FORM, Form, INPUT, Item, Kept, NONE, OUTPUT, Ref, SCRATCH, dtype_code, form_kind,
 };
 use crate::proxy::Op;
-use crate::resident::{BASE, Error, LanePlan, Plan, Resident, USER, backend};
+use crate::resident::{BASE, Error, LanePlan, Plan, Resident, USER, backend, persistent};
 use crate::sums::pool;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::Duration;
 use tessera_engine_comm::{Link, ShmLink};
-use tessera_gpukit::backend::Backend as Gpu;
-use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats, cached_source};
+use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelStats, cached_context, cached_source};
 use tessera_gpukit::launch::Launch;
 use tessera_lower::{Collective, KernelRef, Source};
 use tessera_run::{Grid, Item as Placed, ItemKind, KeptDesc, Layout as GridLayout, Marks, marks};
@@ -323,16 +323,10 @@ where
 
     fn open(&mut self, kernel: &KernelRef, layout: GridLayout) -> Result<(), Error> {
         self.scratch(kernel)?;
-        let Source::Fixed {
-            cuda, hip, entry, ..
-        } = kernel.source()
-        else {
+        let Source::Fixed { text, entry } = kernel.source() else {
             return Err(Error::Plan(format!("{} has no fixed text", kernel.name())));
         };
-        let planned = match backend::<D>()? {
-            crate::Backend::Hip => hip,
-            _ => cuda,
-        };
+        let planned = text[backend::<D>()?];
         let overridden = self.overrides.get(entry).map(String::as_str);
         let replaced = overridden.is_some();
         let want_marks = self.profiling && overridden.unwrap_or(planned).contains("TS_MARK");
@@ -547,24 +541,23 @@ where
     })
 }
 
+struct Start<L>(L, u32);
+
+impl<L: Link + 'static> OnGpu for Start<L> {
+    type Out = Result<Box<dyn Grid>, Error>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        Ok(on(cached_context::<D>()?, self.0, self.1))
+    }
+}
+
 /// Resident steps over `link` on the GPU `gpu` names.
 pub fn open<L: Link + 'static>(
     gpu: Option<Gpu>,
     link: L,
     share: u32,
 ) -> Result<Box<dyn Grid>, Error> {
-    match gpu {
-        #[cfg(feature = "cuda")]
-        Some(Gpu::Cuda) => Ok(on(tessera_gpukit::cuda::cached_context()?, link, share)),
-        #[cfg(feature = "rocm")]
-        Some(Gpu::Rocm) => Ok(on(tessera_gpukit::rocm::cached_context()?, link, share)),
-        _ => {
-            drop((link, share));
-            Err(Error::Plan(
-                "persistent grids need a CUDA or ROCm GPU".into(),
-            ))
-        }
-    }
+    persistent(gpu, Start(link, share))
 }
 
 /// One rank alone, over a new file at `path`.

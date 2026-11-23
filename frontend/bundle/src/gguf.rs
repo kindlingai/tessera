@@ -2,7 +2,7 @@
 
 use crate::names::Rule;
 use crate::tokenize::hf::Hf;
-use crate::{Bundle, Template, stepper};
+use crate::{Bundle, Template};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -174,8 +174,7 @@ pub(crate) fn load(
     // An output table unlike the embedding is the head's own.
     config.tied = !gguf.has("output.weight")
         || gguf.bytes("output.weight")? == gguf.bytes("token_embd.weight")?;
-    let graph = stepper(arch, &config)
-        .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
+    let graph = (crate::arch::family(arch)?.step)(&config);
     let layers = config.stack.layers;
     let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
     let template = gguf

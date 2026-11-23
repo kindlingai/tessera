@@ -1,12 +1,31 @@
 //! Source text for generated kernels, in each backend's dialect.
 
 use crate::ir::Intrinsic;
+use tessera_engine_settings::Backend;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Metal,
     /// Also what hiprtc compiles for ROCm.
     Cuda,
+}
+
+impl Dialect {
+    /// The text `backend` compiles.
+    pub fn of(backend: Backend) -> Self {
+        match backend {
+            Backend::Metal => Dialect::Metal,
+            Backend::Cuda | Backend::Rocm => Dialect::Cuda,
+        }
+    }
+
+    /// The extension of a file in this dialect.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Dialect::Metal => "metal",
+            Dialect::Cuda => "cu",
+        }
+    }
 }
 
 /// One kernel: buffers, then scalars, then a body over `gid`.

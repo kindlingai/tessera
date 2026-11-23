@@ -117,6 +117,14 @@ TESSERA_FN void ld_nc_v4(const u8* p, u32 dst[4]) {
                  : "l"(p));
 }
 
+TESSERA_FN float4 ld_cg_f4(const float* p) {
+    float4 out;
+    asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w)
+                 : "l"(p));
+    return out;
+}
+
 // Register-only 128-point Walsh-Hadamard transform over one warp.
 TESSERA_FN void wht128(float v[4], float scale) {
     u32 lane = threadIdx.x & 31u;
@@ -189,21 +197,25 @@ TESSERA_FN lane_map map_lane(u32 lane) {
 template <u32 BOOK>
 TESSERA_FN u32 decode_pair(u32 a, u32 b) {
     if constexpr (BOOK == BOOK_MUL1) {
-        u32 sx, sy;
+        u32 sx, sy, v;
         asm("dp4a.u32.u32 %0, %1, %2, %3;"
             : "=r"(sx)
-            : "r"(a * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
+            : "r"(a * MUL1), "r"(0x01010101u), "r"(0x6400u));
         asm("dp4a.u32.u32 %0, %1, %2, %3;"
             : "=r"(sy)
-            : "r"(b * MUL1), "r"(0x01010101u), "r"(0x4B000400u));
-        constexpr float base = MUL1_OFFSET - 8388608.0f * MUL1_SCALE;
-        float lo = fmaf(__uint_as_float(sx), MUL1_SCALE, base);
-        float hi = fmaf(__uint_as_float(sy), MUL1_SCALE, base);
-        return narrow_f16x2_e4m3(f32x2_to_f16x2(lo, hi));
+            : "r"(b * MUL1), "r"(0x01010101u), "r"(0x6400u));
+        asm("fma.rn.f16x2 %0, %1, %2, %3;"
+            : "=r"(v)
+            : "r"(prmt(sx, sy, 0x5410u)), "r"(0x1EEE1EEEu), "r"(0xC931C931u));
+        return narrow_f16x2_e4m3(v);
     } else {
-        u32 x = ((a * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-        u32 y = ((b * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-        u32 sum;
+        u32 x = a * MCG, y = b * MCG, sum;
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+            : "=r"(x)
+            : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+            : "=r"(y)
+            : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
         asm("add.rn.f16x2 %0, %1, %2;"
             : "=r"(sum)
             : "r"(prmt(x, y, 0x5410u)), "r"(prmt(x, y, 0x7632u)));
@@ -212,11 +224,106 @@ TESSERA_FN u32 decode_pair(u32 a, u32 b) {
 }
 
 TESSERA_FN u32 decode_pmcgx(u32 w) {
-    u32 x = ((w * MCG) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-    u32 y = ((w * PMCG2) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-    u32 sum;
+    u32 x = w * MCG, y = w * PMCG2, sum;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+        : "=r"(x)
+        : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
+        : "=r"(y)
+        : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
     asm("add.rn.f16x2 %0, %1, %2;" : "=r"(sum) : "r"(x), "r"(prmt(y, y, 0x1032u)));
     return narrow_f16x2_e4m3(sum);
+}
+
+// Shuffle indices and bit shift for direct tile decode.
+struct word_map {
+    u32 i0, i1, sh;
+};
+
+template <u32 K>
+TESSERA_FN word_map map_word(u32 lane) {
+    u32 b0 = (lane * 8u + 1u) * K + 256u * K - 16u;
+    u32 i0 = (b0 >> 5u) % (8u * K);
+    return {i0, (i0 + 1u) % (8u * K), b0 & 31u};
+}
+
+// Loads one 64-tile block (2048*K bytes) cooperatively with 128-bit loads.
+template <u32 K>
+TESSERA_FN void blk_load(const u8* blk, u32 tid, bool aligned, u32 reg[8]) {
+    if (aligned) {
+        ld_nc_v4(blk + (tid << 4u), reg);
+        if constexpr (K == 3u) {
+            if (tid < 128u) ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
+        } else if constexpr (K == 4u) {
+            ld_nc_v4(blk + 4096u + (tid << 4u), reg + 4u);
+        }
+        return;
+    }
+#pragma unroll
+    for (u32 i = 0u; i < 4u; i++) reg[i] = ld_nc_u32(blk + (tid << 4u) + (i << 2u));
+    if constexpr (K == 3u) {
+        if (tid < 128u) {
+#pragma unroll
+            for (u32 i = 0u; i < 4u; i++) {
+                reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
+            }
+        }
+    } else if constexpr (K == 4u) {
+#pragma unroll
+        for (u32 i = 0u; i < 4u; i++) {
+            reg[4u + i] = ld_nc_u32(blk + 4096u + (tid << 4u) + (i << 2u));
+        }
+    }
+}
+
+// Stores one cooperatively loaded 64-tile block into shared memory.
+template <u32 K>
+TESSERA_FN void blk_store(const u32 reg[8], u32 tid, u32* smem) {
+    uint4* dst = reinterpret_cast<uint4*>(smem);
+    dst[tid] = make_uint4(reg[0], reg[1], reg[2], reg[3]);
+    if constexpr (K == 3u) {
+        if (tid < 128u) dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
+    } else if constexpr (K == 4u) {
+        dst[256u + tid] = make_uint4(reg[4], reg[5], reg[6], reg[7]);
+    }
+}
+
+// Decodes one warp-held tile word into an MMA A fragment.
+template <u32 K, u32 BOOK>
+TESSERA_FN void decode_word(u32 raw, const word_map& wm, u32 frag[4]) {
+    u32 a = __shfl_sync(0xFFFFFFFFu, raw, wm.i0);
+    u32 b = (K == 4u) ? raw : __shfl_sync(0xFFFFFFFFu, raw, wm.i1);
+    u32 s0 = (K == 4u) ? 20u : wm.sh;
+    if constexpr (BOOK == BOOK_PMCGX) {
+        u32 sp = s0 - (4u - K);
+        u32 hi = shf_l(b, a, sp);
+        u32 lo = b << sp;
+        frag[0] = decode_pmcgx(shf_l(lo, hi, 0u) >> 12u);
+        frag[2] = decode_pmcgx(shf_l(lo, hi, 2u * K) >> 12u);
+        frag[1] = decode_pmcgx(shf_l(lo, hi, 4u * K) >> 12u);
+        frag[3] = decode_pmcgx(shf_l(lo, hi, 6u * K) >> 12u);
+    } else {
+        u32 hi = shf_l(b, a, s0);
+        u32 lo = b << s0;
+        u32 st[8];
+#pragma unroll
+        for (u32 s = 0u; s < 8u; s++) st[s] = shf_l(lo, hi, K * s) >> 16u;
+        frag[0] = decode_pair<BOOK>(st[0], st[1]);
+        frag[1] = decode_pair<BOOK>(st[4], st[5]);
+        frag[2] = decode_pair<BOOK>(st[2], st[3]);
+        frag[3] = decode_pair<BOOK>(st[6], st[7]);
+    }
+}
+
+// Stores one 128-vector into an MMA B fragment table.
+TESSERA_FN void store_bfrag(u32* tab, u32 row, u32 lane, const float v[4]) {
+    u32 ks = lane >> 2u;
+    u32 q = lane & 3u;
+    u32 reg = q >> 1u;
+    u32 c = (q & 1u) << 1u;
+    u32* p = tab + ((ks * 32u + row * 4u + c) * 2u + reg);
+    p[0] = f32x2_to_f16x2(v[0], v[1]);
+    p[2] = f32x2_to_f16x2(v[2], v[3]);
 }
 
 // Decodes one 16x16 tile into an MMA A fragment.
@@ -269,6 +376,43 @@ TESSERA_FN void mma_m16n8k16(float d[4], const u32 a[4], const u32 b[2]) {
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Decodes one staged 64-tile block into `NT` MMA tiles.
+template <u32 K, u32 BOOK, u32 NT>
+TESSERA_FN void blk_mma(const u32* wtiles, const u32* xb, u32 xts, u32 j, u32 lane,
+                        const word_map& wm, float acc[NT][4]) {
+    constexpr u32 TW = 8u * K;
+#pragma unroll
+    for (u32 u = 0u; u < 8u; u++) {
+        u32 raw = (K == 4u || lane < TW) ? wtiles[(u * 8u + j) * TW + lane] : 0u;
+        u32 fa[4];
+        decode_word<K, BOOK>(raw, wm, fa);
+#pragma unroll
+        for (u32 ti = 0u; ti < NT; ti++) {
+            uint2 b2 = *reinterpret_cast<const uint2*>(xb + ti * xts + u * 64u);
+            u32 fb[2] = {b2.x, b2.y};
+            mma_m16n8k16(acc[ti], fa, fb);
+        }
+    }
+}
+
+// Streams `nb` 64-tile blocks through shared memory into MMA.
+template <u32 K, u32 BOOK, u32 NT>
+TESSERA_FN void blk_stream(const u8*& gb, u64 sG, u32 c0, u32 nb, u32 total, u32 tid, u32 j,
+                           u32 lane, bool aligned, const word_map& wm, u32 nw[8], u32* wtiles,
+                           const u32* xb, u32 xts, float acc[NT][4]) {
+    for (u32 g = 0u; g < nb; g++) {
+        if (g > 0u) prim::block_sync();
+        blk_store<K>(nw, tid, wtiles);
+        prim::block_sync();
+        if (c0 + g + 1u < total) {
+            gb += sG;
+            blk_load<K>(gb, tid, aligned, nw);
+        }
+        blk_mma<K, BOOK, NT>(wtiles, xb, xts, j, lane, wm, acc);
+        xb += 512u;
+    }
 }
 
 // Sums hi+lo accumulators for `n` rows into `buf`.

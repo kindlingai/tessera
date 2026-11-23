@@ -7,6 +7,7 @@ use tessera_trace::{
     Norm, Pairs, Role, Size, Tensor, TensorType, Vector, Weights,
 };
 
+#[derive(Clone)]
 pub struct Config {
     /// Its `ffn` is an expert's width. Values use `head_dim`.
     pub stack: Stack,
@@ -28,6 +29,7 @@ pub struct Config {
 }
 
 /// The indexer's shape, and which layers run one.
+#[derive(Clone, Copy)]
 pub struct Index {
     pub heads: u64,
     pub dim: u64,
@@ -276,7 +278,9 @@ impl Pass<'_> {
         let [logits, tapped] = self.m.composite(Composite::Model, || {
             let mut sink = TapSink::new(layers);
             let x = self.trunk(w, tokens, |at, row| sink.record(at, row));
-            let logits = x.rms_norm(&w.norm, self.c.eps).matmul(&w.head);
+            let h = x.rms_norm(&w.norm, self.c.eps);
+            sink.record(self.c.stack.layers + 1, &h);
+            let logits = h.matmul(&w.head);
             [logits, sink.join().expect("tap layers")]
         });
         (logits, Some(tapped))
@@ -589,4 +593,44 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     };
     let (logits, taps) = pass.logits_taps(&w, &tokens, &c.stack.taps);
     pick(&m, &logits, allowed.as_ref(), taps.as_ref())
+}
+
+/// One cached MLA and MoE layer pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_layer<R: Routed>(
+    m: &Model,
+    c: &Config,
+    attn: &Attention,
+    indexer: Option<&Indexer>,
+    mlp_norm: &Norm,
+    moe: &R,
+    x: &Tensor,
+    positions: &Tensor,
+    slots: &Tensor,
+) -> Tensor {
+    let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
+    let cache = Cache {
+        latent: kept(Latent),
+        rope: kept(Rope),
+        index: indexer.is_some().then(|| kept(IndexDim)),
+    };
+    let pass = Pass {
+        m,
+        c,
+        positions,
+        step: Some((slots, vec![cache])),
+    };
+    let read = match indexer {
+        Some(ix) => Keys::Pick(ix),
+        None => Keys::All,
+    };
+    let [out] = m.composite(Composite::Layer, || {
+        let h = x.rms_norm(&attn.norm, c.eps);
+        let [a] = m.composite(Composite::Attention, || [pass.mla(0, attn, &h, read).0]);
+        let x = x.add(&a);
+        let h = x.rms_norm(mlp_norm, c.eps);
+        let [mlp] = m.composite(Composite::Moe, || [moe.apply(m, c, &h)]);
+        [x.add(&mlp)]
+    });
+    out
 }

@@ -1,9 +1,10 @@
-use crate::dflash::{Overlay, extra_rules, has_norms};
+use crate::dflash::{Overlay, bf16_to_mxfp8, draft_pins, extra_rules, has_norms};
 use crate::names;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
-use tessera_engine::Norm;
-use tessera_engine::dflash::{Config, TargetSpec, default_layers, stepper};
+use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, default_layers, stepper};
+use tessera_engine::form::named;
 use tessera_engine::keys::{Keys, Offered};
+use tessera_engine::{Bf16, Norm, PathSeg};
 
 struct Mock(Vec<Slice>);
 
@@ -16,6 +17,9 @@ impl Offer for Mock {
     }
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
         Err(Error::Format(name.into()))
+    }
+    fn packed_axis(&self, name: &str, axis: u32, range: (usize, usize)) -> Result<Vec<u8>, Error> {
+        Ok(format!("{name}:{axis}:{}:{}", range.0, range.1).into_bytes())
     }
 }
 
@@ -102,7 +106,167 @@ fn config_and_names() {
     d2.push(sl("candidate_selector.successor_codebook", &[256, 16]));
     let g2 = stepper::<Norm>(&cfg2);
     let extra = extra_rules(&cfg2, &d2);
-    let (a2, b2) = (Mock(d2), Mock(tgt));
+    let (a2, b2) = (Mock(d2), Mock(tgt.clone()));
     let claims2 = names::resolve(&g2, &Overlay::new(&a2, &b2).slices(), &[&extra]).unwrap();
     assert_eq!(claims2.len(), g2.weights.len());
+
+    let json3 = r#"{"block_size":16,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"draft_block_causal":true,"mask_token_id":99,"target_layer_ids":[1,5],"selected_prefix_code_bridge":{"code_size":32,"rank":16,"eps":1e-6},"selected_prefix_last_write_refine":{"head_topk":4}}}"#;
+    let offer3 = Offered::parse("config.json", json3).unwrap();
+    let mut keys3 = Keys::new(std::slice::from_ref(&offer3));
+    let cfg3 = Config::read(&mut keys3, &target, 1, 64);
+    keys3.finish().unwrap();
+    assert!(cfg3.causal && cfg3.bridge.is_some());
+    let mut d3 = draft_slices(2);
+    d3.push(sl("selected_prefix_bridge.codebook", &[256, 32]));
+    d3.push(sl("selected_prefix_bridge.gate.weight", &[16, 32]));
+    d3.push(sl("selected_prefix_bridge.gate.bias", &[16]));
+    d3.push(sl(
+        "selected_prefix_bridge.predecessor_gate.weight",
+        &[16, 32],
+    ));
+    d3.push(sl("selected_prefix_bridge.prev.weight", &[16, 32]));
+    d3.push(sl(
+        "selected_prefix_bridge.early_read_weights",
+        &[1, 32, 64],
+    ));
+    d3.push(sl("selected_prefix_bridge.read_weight", &[32, 64]));
+    d3.push(sl(
+        "selected_prefix_bridge.feature_write_weights",
+        &[2, 64, 16],
+    ));
+    let g3 = stepper::<Norm>(&cfg3);
+    let extra3 = extra_rules(&cfg3, &d3);
+    let (a3, b3) = (Mock(d3), Mock(tgt));
+    let overlay3 = Overlay::new(&a3, &b3);
+    let claims3 = names::resolve(&g3, &overlay3.slices(), &[&extra3]).unwrap();
+    assert_eq!(claims3.len(), g3.weights.len());
+    assert_eq!(
+        overlay3.packed_axis("fc.weight", 0, (0, 32)).unwrap(),
+        b"fc.weight:0:0:32"
+    );
+    assert_eq!(
+        overlay3.packed_axis("lm_head.weight", 0, (64, 64)).unwrap(),
+        b"lm_head.weight:0:64:64"
+    );
+}
+
+fn mxfp8_slices() -> (Vec<Slice>, Vec<Slice>) {
+    let draft = vec![
+        sl("fc.weight", &[512, 1024]),
+        sl("hidden_norm.weight", &[512]),
+        sl("norm.weight", &[512]),
+        sl("layers.0.input_layernorm.weight", &[512]),
+        sl("layers.0.post_attention_layernorm.weight", &[512]),
+        sl("layers.0.self_attn.q_norm.weight", &[128]),
+        sl("layers.0.self_attn.k_norm.weight", &[128]),
+        sl("layers.0.self_attn.q_proj.weight", &[512, 512]),
+        sl("layers.0.self_attn.k_proj.weight", &[256, 512]),
+        sl("layers.0.self_attn.v_proj.weight", &[256, 512]),
+        sl("layers.0.self_attn.o_proj.weight", &[512, 512]),
+        sl("layers.0.mlp.gate_proj.weight", &[1024, 512]),
+        sl("layers.0.mlp.up_proj.weight", &[1024, 512]),
+        sl("layers.0.mlp.down_proj.weight", &[512, 1024]),
+        sl("layers.0.attention_conv.base_kernel", &[2, 2, 512]),
+        sl(
+            "layers.0.attention_conv.kernel_projection.weight",
+            &[32, 512],
+        ),
+        sl("layers.0.mlp_conv.base_kernel", &[2, 2, 512]),
+        sl("layers.0.mlp_conv.kernel_projection.weight", &[32, 512]),
+        sl("candidate_selector.hidden_projection.weight", &[16, 512]),
+        sl("candidate_selector.predecessor_codebook", &[64, 16]),
+        sl("candidate_selector.successor_codebook", &[64, 16]),
+    ];
+    let tgt = vec![
+        sl("model.embed_tokens.weight", &[64, 512]),
+        sl("lm_head.weight", &[64, 512]),
+    ];
+    (draft, tgt)
+}
+
+fn check_mxfp8_pack() {
+    let mxfp8 = named("mxfp8").unwrap();
+    let (rows, cols) = (32usize, 512usize);
+    let bf16_f32: Vec<f32> = (0..rows * cols)
+        .map(|i| {
+            let s = if i % 2 == 0 { 1.0 } else { -1.0 };
+            f32::from(Bf16::from(s * (((i * 37) % 1000) as f32 / 250.0)))
+        })
+        .collect();
+    let bf16_bytes: Vec<u8> = bf16_f32
+        .iter()
+        .flat_map(|&v| Bf16::from(v).0.to_le_bytes())
+        .collect();
+    let full = bf16_to_mxfp8(&bf16_bytes, [rows, cols], None, mxfp8);
+    assert_eq!(full, mxfp8.pack(&bf16_f32));
+    let round = mxfp8.unpack_all(&full);
+    let (mut dot, mut na, mut nb, mut max_rel) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
+    for (&x, &y) in bf16_f32.iter().zip(&round) {
+        dot += f64::from(x) * f64::from(y);
+        na += f64::from(x) * f64::from(x);
+        nb += f64::from(y) * f64::from(y);
+        if x.abs() > 1e-3 {
+            max_rel = max_rel.max((x - y).abs() / x.abs());
+        }
+    }
+    let cos = dot / (na.sqrt() * nb.sqrt());
+    assert!(cos > 0.999 && max_rel < 0.08, "cos={cos} max_rel={max_rel}");
+    let r_slice = bf16_to_mxfp8(&bf16_bytes, [rows, cols], Some((0, 8, 16)), mxfp8);
+    assert_eq!(r_slice, mxfp8.pack(&bf16_f32[8 * cols..24 * cols]));
+    let c_slice = bf16_to_mxfp8(&bf16_bytes, [rows, cols], Some((1, 256, 256)), mxfp8);
+    let want_col: Vec<f32> = (0..rows)
+        .flat_map(|r| bf16_f32[r * cols + 256..r * cols + 512].iter().copied())
+        .collect();
+    assert_eq!(c_slice, mxfp8.pack(&want_col));
+}
+
+#[test]
+fn mxfp8_quant() {
+    let target = TargetSpec {
+        vocab: 64,
+        hidden: 512,
+        layers: 8,
+        tied: false,
+    };
+    let json = r#"{"block_size":8,"hidden_size":512,"intermediate_size":1024,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":128,"num_hidden_layers":1,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"block_size":8,"conv_group_size":64,"conv_kernel_size":2,"mask_token_id":0,"selector_rank":16,"selector_top_k":4,"target_layer_ids":[1,5]}}"#;
+    let offer = Offered::parse("config.json", json).unwrap();
+    let mut keys = Keys::new(std::slice::from_ref(&offer));
+    let cfg = Config::read(&mut keys, &target, 1, 64);
+    keys.finish().unwrap();
+    let (draft, tgt) = mxfp8_slices();
+    let g = stepper::<Norm>(&cfg);
+    let extra = extra_rules(&cfg, &draft);
+    let (a, b) = (Mock(draft), Mock(tgt));
+    let ov = Overlay::new(&a, &b);
+    let pins = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8).unwrap();
+    let layer_mx = [
+        "head",
+        "layers.0.q",
+        "layers.0.k",
+        "layers.0.v",
+        "layers.0.o",
+        "layers.0.mlp.gate",
+        "layers.0.mlp.up",
+        "layers.0.mlp.down",
+        "layers.0.attention_conv.kernel_projection",
+        "layers.0.mlp_conv.kernel_projection",
+    ];
+    for w in &g.weights {
+        let dot = PathSeg::dotted(&w.path);
+        let want = if layer_mx.contains(&dot.as_str()) {
+            "mxfp8"
+        } else {
+            "bf16"
+        };
+        assert_eq!(pins.form(&w.path).name(), want, "weight {dot}");
+    }
+    let all_bf16 = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::Bf16).unwrap();
+    assert!(
+        g.weights
+            .iter()
+            .all(|w| all_bf16.form(&w.path).name() == "bf16")
+    );
+    let all_mx = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8All).unwrap();
+    assert_eq!(all_mx.form(&g.weights[1].path).name(), "mxfp8");
+    check_mxfp8_pack();
 }

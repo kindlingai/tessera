@@ -68,7 +68,6 @@ pub trait Offer {
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error>;
     /// A bf16 slice's bytes, as stored.
     fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        let narrow = |x: &f32| tessera_engine::Bf16::from(*x).0.to_le_bytes();
         Ok(self.floats(name)?.iter().flat_map(narrow).collect())
     }
     /// Slice `name` left on disk, as stored.
@@ -93,4 +92,9 @@ pub trait Offer {
         }
         self.packed(name)
     }
+}
+
+/// A float's bf16 bytes.
+pub(crate) fn narrow(x: &f32) -> [u8; 2] {
+    tessera_engine::Bf16::from(*x).0.to_le_bytes()
 }

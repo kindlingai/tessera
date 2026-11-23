@@ -12,6 +12,7 @@ use tessera_graph::Role;
 use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
+mod dual;
 mod guide;
 mod kept;
 mod lanes;
@@ -19,15 +20,20 @@ pub mod metrics;
 #[cfg(test)]
 mod metrics_test;
 mod model;
+mod mtp;
 mod ranks;
 mod schedule;
+mod spec_len;
 mod speculate;
 
+pub use dual::{DualSelector, DualSpeculate};
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use kept::Totals;
 pub use model::Model;
+pub use mtp::{MtpDrafter, MtpSpeculate};
 pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
+pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample};
 
 // The front end reaches the engine crates only through these.
@@ -40,7 +46,8 @@ pub use tessera_lower::{Compute, Filed, Pick, Pins, Recipe, Settings, Site, Weig
 pub use tessera_mem::form as storage;
 pub use tessera_mem::{block, trellis};
 pub use tessera_models::{
-    Stack, Steps, clip, decoder, dflash, eg2, flux2, gemma4, keys, mla, qwen35, sprite, tagger, vae,
+    Stack, Steps, clip, decoder, dflash, eg2, flux2, gemma4, keys, mla, mtp as mtp_model, qwen35,
+    sprite, tagger, vae,
 };
 pub use tessera_run::{Grid, gpu, pinning};
 pub use tessera_trace::{Linear, Norm};
@@ -209,9 +216,16 @@ fn launch_of(
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
     seen.sort_unstable();
     seen.dedup();
-    // Rows and picks round up to a power of two.
-    let filled = rows.len().next_power_of_two();
-    let wanted = picks.len().next_power_of_two();
+    // Small counts stay exact to skip wasted verify rows.
+    let pad = |n: usize| {
+        if n <= 16 {
+            n.max(1)
+        } else {
+            n.next_power_of_two()
+        }
+    };
+    let filled = pad(rows.len());
+    let wanted = pad(picks.len());
     let sizes = vec![
         (Seqs, slots as u64),
         (Rows, filled as u64),

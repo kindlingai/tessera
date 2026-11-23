@@ -79,7 +79,8 @@ fn take(dims: &[Dim], x: &TensorType, ids: &TensorType) -> Result<TensorType, Ty
         format!("take indices must be integers, got {:?}", ids.dtype)
     })?;
     need(
-        whole(x, 1) && ids.placement == x.placement,
+        matches!(x.placement, Placement::Replicated | Placement::Split { .. })
+            && ids.placement == x.placement,
         ErrorKind::Placement,
         || format!("take cannot read {:?} at {:?}", x.placement, ids.placement),
     )?;
@@ -99,9 +100,11 @@ fn top_k(dims: &[Dim], k: &DimExpr, x: &TensorType) -> Result<TensorType, TypeEr
     need(fixed, ErrorKind::Shape, || {
         format!("top-k needs a fixed positive count, got {k}")
     })?;
-    need(whole(x, 1), ErrorKind::Placement, || {
-        format!("top-k needs whole rows, got {:?}", x.placement)
-    })?;
+    need(
+        matches!(x.placement, Placement::Replicated | Placement::Split { .. }),
+        ErrorKind::Placement,
+        || format!("top-k cannot read {:?}", x.placement),
+    )?;
     let mut shape = x.shape.0.clone();
     *shape.last_mut().expect("rank checked") = k.clone();
     Ok(TensorType {

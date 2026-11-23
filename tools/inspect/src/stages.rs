@@ -5,7 +5,9 @@ use crate::ranks::{Spec, Wire, device};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::error::Error;
-use tessera_lower::{Device, Pins, Source, Step, Tree, assign, peak, schedule, select};
+use tessera_lower::{
+    Backend, Device, Dialect, Pins, Source, Step, Tree, assign, peak, schedule, select,
+};
 
 /// One step of a rank's plan, for views.
 #[derive(Clone, Debug, Serialize)]
@@ -79,24 +81,14 @@ pub struct Setup<'a> {
 
 /// The text a backend compiles, or the host's tree.
 fn text_of(step: &Step, spec: &Spec) -> (&'static str, String) {
-    let dialect = spec.dialect().unwrap_or(tessera_lower::Dialect::Cuda);
-    let name = match (spec.dialect(), dialect) {
-        (None, _) => "tree",
-        (_, tessera_lower::Dialect::Metal) => "metal",
-        _ if spec.backend == "rocm" => "hip",
-        _ => "cuda",
-    };
+    let gpu = spec.gpu();
+    // The host shows CUDA text.
+    let backend = gpu.unwrap_or(Backend::Cuda);
     let text = match step.kernel.source() {
-        Source::Fixed {
-            metal, cuda, hip, ..
-        } => match name {
-            "metal" => metal.to_string(),
-            "hip" => hip.to_string(),
-            _ => cuda.to_string(),
-        },
-        Source::Made(body) => body.text().render(dialect),
+        Source::Fixed { text, .. } => text[backend].to_string(),
+        Source::Made(body) => body.text().render(Dialect::of(backend)),
     };
-    (name, text)
+    (gpu.map_or("tree", Backend::name), text)
 }
 
 /// Each sharded node's shape on this rank, from the tree.
