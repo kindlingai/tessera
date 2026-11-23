@@ -43,6 +43,18 @@ pub struct TargetSpec {
     pub tied: bool,
 }
 
+/// On-load quantization mode for BF16 drafter linears.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DraftQuant {
+    /// Keep all BF16 weights in BF16.
+    Bf16,
+    /// Quantize layers and head, keep fc and selector BF16.
+    #[default]
+    MxFp8,
+    /// Quantize all eligible 2D BF16 linears.
+    MxFp8All,
+}
+
 /// DFlash drafter sizes and conditioning settings.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -70,6 +82,8 @@ pub struct Config {
     pub bridge: Option<BridgeConfig>,
     pub output_multiplier: f32,
     pub logit_softcap: Option<f32>,
+    /// On-load quantization mode for eligible BF16 linear weights.
+    pub quant: DraftQuant,
 }
 
 /// Evenly spaced 0-based target layer indices for `draft_layers`.
@@ -219,6 +233,18 @@ impl Config {
         let logit_softcap = k
             .or::<Option<f32>>(&["dflash_config.final_logit_softcapping"], None)
             .filter(|&v| v > 0.0);
+        let quant = match k
+            .or::<Option<String>>(&["dflash_config.quant"], None)
+            .as_deref()
+        {
+            None | Some("mxfp8") => DraftQuant::MxFp8,
+            Some("bf16") => DraftQuant::Bf16,
+            Some("mxfp8_all") => DraftQuant::MxFp8All,
+            Some(other) => {
+                k.misfit("quant", format!("unknown draft quant `{other}`"));
+                DraftQuant::MxFp8
+            }
+        };
         let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
@@ -237,6 +263,7 @@ impl Config {
             bridge,
             output_multiplier,
             logit_softcap,
+            quant,
         }
     }
 
@@ -267,6 +294,7 @@ impl Config {
             bridge: None,
             output_multiplier: 1.0,
             logit_softcap: None,
+            quant: DraftQuant::MxFp8,
         }
     }
 

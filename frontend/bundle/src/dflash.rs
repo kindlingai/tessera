@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Shards, Slice, Stored};
-use tessera_engine::dflash::{Config, TargetSpec, stepper};
+use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, stepper};
 use tessera_engine::form::{Load, named};
 use tessera_engine::{DimExpr, Graph, Norm, PathSeg, Pins, Steps, Weight};
 
@@ -58,11 +58,20 @@ fn fixed_2d(graph: &Graph, shape: &[DimExpr]) -> Option<[usize; 2]> {
     Some([val(&shape[0])?, val(&shape[1])?])
 }
 
-fn is_table(path: &[PathSeg]) -> bool {
-    matches!(
+fn keep_bf16(path: &[PathSeg], quant: DraftQuant) -> bool {
+    if matches!(
         path.last(),
         Some(PathSeg::Field(f)) if f == "embed" || f.ends_with("codebook")
-    )
+    ) {
+        return true;
+    }
+    if quant == DraftQuant::MxFp8 {
+        return matches!(
+            path.first(),
+            Some(PathSeg::Field(f)) if f == "fc" || f == "candidate_selector"
+        );
+    }
+    false
 }
 
 /// Pins eligible BF16 linear weights to MXFP8.
@@ -71,10 +80,13 @@ pub(crate) fn draft_pins(
     offer: &dyn Offer,
     layers: u64,
     rules: &[&[Rule]],
+    quant: DraftQuant,
 ) -> Result<Pins> {
     let slices = offer.slices();
     let claims = crate::names::resolve(graph, &slices, rules)?;
-    let mxfp8 = named("mxfp8");
+    let mxfp8 = (quant != DraftQuant::Bf16)
+        .then(|| named("mxfp8"))
+        .flatten();
     let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(claims.len());
     for (c, w) in claims.iter().zip(&graph.weights) {
         let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
@@ -82,7 +94,7 @@ pub(crate) fn draft_pins(
             && slice.stored == Stored::Bf16
             && c.parts.is_empty()
             && c.rows.is_none()
-            && !is_table(&w.path)
+            && !keep_bf16(&w.path, quant)
             && fixed_2d(graph, &w.ty.shape.0)
                 .is_some_and(|[n, k]| n.is_multiple_of(16) && k.is_multiple_of(512));
         if eligible {
@@ -432,7 +444,13 @@ pub fn load(
     rules.extend_from_slice(user);
     let draft_pins = {
         let combined = Overlay::new(&draft_offer, target_offer.as_ref());
-        draft_pins(&graph, &combined, config.stack.layers, &[&rules])?
+        draft_pins(
+            &graph,
+            &combined,
+            config.stack.layers,
+            &[&rules],
+            config.quant,
+        )?
     };
     let weights = DraftWeights {
         graph: graph.clone(),

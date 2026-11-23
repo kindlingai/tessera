@@ -1,7 +1,7 @@
 use crate::dflash::{Overlay, bf16_to_mxfp8, draft_pins, extra_rules, has_norms};
 use crate::names;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
-use tessera_engine::dflash::{Config, TargetSpec, default_layers, stepper};
+use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, default_layers, stepper};
 use tessera_engine::form::named;
 use tessera_engine::keys::{Keys, Offered};
 use tessera_engine::{Bf16, Norm, PathSeg};
@@ -237,9 +237,9 @@ fn mxfp8_quant() {
     let g = stepper::<Norm>(&cfg);
     let extra = extra_rules(&cfg, &draft);
     let (a, b) = (Mock(draft), Mock(tgt));
-    let pins = draft_pins(&g, &Overlay::new(&a, &b), cfg.stack.layers, &[&extra]).unwrap();
-    let mx_paths = [
-        "fc",
+    let ov = Overlay::new(&a, &b);
+    let pins = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8).unwrap();
+    let layer_mx = [
         "head",
         "layers.0.q",
         "layers.0.k",
@@ -250,16 +250,23 @@ fn mxfp8_quant() {
         "layers.0.mlp.down",
         "layers.0.attention_conv.kernel_projection",
         "layers.0.mlp_conv.kernel_projection",
-        "candidate_selector.hidden_projection",
     ];
     for w in &g.weights {
         let dot = PathSeg::dotted(&w.path);
-        let want = if mx_paths.contains(&dot.as_str()) {
+        let want = if layer_mx.contains(&dot.as_str()) {
             "mxfp8"
         } else {
             "bf16"
         };
         assert_eq!(pins.form(&w.path).name(), want, "weight {dot}");
     }
+    let all_bf16 = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::Bf16).unwrap();
+    assert!(
+        g.weights
+            .iter()
+            .all(|w| all_bf16.form(&w.path).name() == "bf16")
+    );
+    let all_mx = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8All).unwrap();
+    assert_eq!(all_mx.form(&g.weights[1].path).name(), "mxfp8");
     check_mxfp8_pack();
 }

@@ -467,6 +467,20 @@ fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
     {
         assert!((a - b).abs() < 1e-3 * b.abs().max(1.0), "{a} vs {b}");
     }
+    // Equal logits across ranks keep lower-index tie-breaking.
+    let mut tied = w.clone();
+    let head = g
+        .weights
+        .iter()
+        .position(|wt| matches!(wt.path.last(), Some(PathSeg::Field(f)) if f == "head"))
+        .unwrap();
+    tied[head] = Tensor::f32(tied[head].shape.clone(), vec![0.0; tied[head].len()]);
+    let want_tie = run(g, &tied, 0, &feeds).unwrap();
+    let got_tie = run_ranks(&sharded, &tied, 0, &feeds, 2).unwrap();
+    assert_eq!(
+        got_tie[0].indices().unwrap(),
+        want_tie[0].indices().unwrap()
+    );
     let settings = Settings {
         backend: Pick::Host,
         ..Settings::default()
