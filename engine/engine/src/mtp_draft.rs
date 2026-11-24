@@ -210,20 +210,38 @@ impl MtpDrafter {
         let hid_tensor = if all_dev {
             let mut off = 0usize;
             for (idx, s) in spans.iter().enumerate() {
-                let TapsIn::Device { addr, rows } = s.hidden else {
+                let TapsIn::Device { addr, rows, stride } = s.hidden else {
                     unreachable!();
                 };
                 if rows != s.tokens.len() {
                     return Err(Error::Rows);
                 }
-                d2d.push(D2dCopy {
-                    input: 3,
-                    src: addr,
-                    dst_row: off,
-                    rows,
-                    pad_to: if idx + 1 == spans.len() { filled } else { 0 },
-                    width: self.hidden,
-                });
+                let is_last_span = idx + 1 == spans.len();
+                if stride > self.hidden {
+                    for r in 0..rows {
+                        d2d.push(D2dCopy {
+                            input: 3,
+                            src: addr + (r * stride * 4) as u64,
+                            dst_row: off + r,
+                            rows: 1,
+                            pad_to: if is_last_span && r + 1 == rows {
+                                filled
+                            } else {
+                                0
+                            },
+                            width: self.hidden,
+                        });
+                    }
+                } else {
+                    d2d.push(D2dCopy {
+                        input: 3,
+                        src: addr,
+                        dst_row: off,
+                        rows,
+                        pad_to: if is_last_span { filled } else { 0 },
+                        width: self.hidden,
+                    });
+                }
                 off += rows;
             }
             None
@@ -392,6 +410,7 @@ fn chain_gpu(
     let first_in = TapsIn::Device {
         addr: tap_addr,
         rows: m,
+        stride: 0,
     };
     let outputs = drafter.run_taps(0, start_pos, tokens, first_in, wants, false)?;
     let addr_of = |r: &dyn Run, s: Slot| r.address(s).ok_or(tessera_run::Error::Unaddressed(0));

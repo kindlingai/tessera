@@ -606,7 +606,7 @@ impl Drafter {
                     None,
                 )
             }
-            TapsIn::Device { addr, rows } => {
+            TapsIn::Device { addr, rows, .. } => {
                 if rows != n_new {
                     return Err(Error::Rows);
                 }

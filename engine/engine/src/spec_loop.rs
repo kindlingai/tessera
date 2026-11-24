@@ -22,7 +22,11 @@ pub(crate) enum TapsBuf {
 /// Borrowed tap rows on device or host.
 #[derive(Clone, Copy)]
 pub(crate) enum TapsIn<'a> {
-    Device { addr: u64, rows: usize },
+    Device {
+        addr: u64,
+        rows: usize,
+        stride: usize,
+    },
     Host(&'a [f32]),
 }
 
@@ -43,6 +47,7 @@ impl TapsBuf {
             TapsBuf::Device { addr, rows, .. } => TapsIn::Device {
                 addr: *addr,
                 rows: *rows,
+                stride: 0,
             },
             TapsBuf::Host(v) => TapsIn::Host(v),
         }

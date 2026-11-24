@@ -295,22 +295,18 @@ impl<'a> BatchMtp<'a> {
             let last_chunk = pos0 + len == n;
             if !last_chunk {
                 let shifted = &request.tokens[pos0 + 1..pos0 + len + 1];
-                if let Some((d_w, _)) = dual_widths {
-                    let (dt, mt) = self.split_dual_taps(taps, len)?;
+                if let Some((d_w, m_w)) = dual_widths {
                     if solo_mode {
+                        let (dt, mt) = self.split_dual_taps(taps, len)?;
                         d_buf.extend_from_slice(&dt);
                         m_tok_buf.extend_from_slice(shifted);
                         m_tap_buf.extend_from_slice(&mt);
                     } else {
-                        push_tail(&mut d_buf, &dt, d_w);
-                        self.drafter.run_taps(
-                            slot,
-                            pos0 as u32,
-                            shifted,
-                            TapsIn::Host(&mt),
-                            wants,
-                            true,
-                        )?;
+                        if self.active.len() < 2 {
+                            let dt = self.read_dual_d_taps(&taps, len)?;
+                            push_tail(&mut d_buf, &dt, d_w);
+                        }
+                        self.run_mtp_prefill_chunk(slot, pos0 as u32, shifted, &taps, d_w, m_w)?;
                     }
                 } else {
                     self.drafter
@@ -385,13 +381,12 @@ impl<'a> BatchMtp<'a> {
                 self.solo_draft(idx)?;
                 return Ok(());
             }
-            let m_taps = if let Some((d_w, _)) = dual_widths {
-                let (dt, mt) = self.split_dual_taps(taps, len)?;
+            if let Some((d_w, _)) = dual_widths
+                && self.active.len() < 2
+            {
+                let dt = self.read_dual_d_taps(&taps, len)?;
                 push_tail(&mut d_buf, &dt, d_w);
-                TapsBuf::Host(mt)
-            } else {
-                taps
-            };
+            }
             let rem = request.max_tokens - 1;
             let ctx_rem = self.max_ctx - n;
             let avail = self
@@ -408,7 +403,9 @@ impl<'a> BatchMtp<'a> {
                     tap_row_off: 0,
                     avail,
                 };
-                self.draft_batch(&[job], &m_taps)?.pop().unwrap_or_default()
+                self.draft_batch(&[job], &taps, dual_widths.is_some())?
+                    .pop()
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -455,12 +452,6 @@ impl<'a> BatchMtp<'a> {
         }
         let (ids, raw_taps) = self.target.step_taps_local(&rows)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
-        let (d_all, taps) = if dual_info.is_some() {
-            let (dt, mt) = self.split_dual_taps(raw_taps, rows.len())?;
-            (dt, TapsBuf::Host(mt))
-        } else {
-            (Vec::new(), raw_taps)
-        };
         let ranked = self.target.control.is_some();
         let mut jobs: Vec<DraftJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
@@ -472,16 +463,10 @@ impl<'a> BatchMtp<'a> {
                 self.max_ctx,
                 &mut self.hash,
             );
-            let commit = committed.len();
             let seq = &mut self.active[i];
             if done.is_some() || (!ranked && seq.cancelled) {
                 finished[i] = true;
                 continue;
-            }
-            if let Some((d_w, _)) = dual_info {
-                let lo = off * d_w;
-                let hi = (off + commit) * d_w;
-                push_tail(&mut seq.d_tail, &d_all[lo..hi], d_w);
             }
             let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
             let ctx_rem = self.max_ctx.saturating_sub(seq.start);
@@ -504,21 +489,31 @@ impl<'a> BatchMtp<'a> {
         let survivors = finished.iter().filter(|&&f| !f).count();
         let promote = survivors == 1
             && jobs.len() == 1
-            && dual_info.is_some_and(|(d_w, block)| {
+            && dual_info.is_some_and(|(_, block)| {
                 let seq = &self.active[jobs[0].active_idx];
                 let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-                seq.start + block <= self.max_ctx
-                    && rem >= PROMOTE_MIN_REM
-                    && seq.d_tail.len() >= d_w
+                seq.start + block <= self.max_ctx && rem >= PROMOTE_MIN_REM
             });
         if promote {
             let job = jobs.remove(0);
-            let TapsBuf::Host(m_all) = &taps else {
-                unreachable!("dual mode uses host taps");
-            };
-            self.promote_solo(job, m_all)?;
+            let d_w = dual_info.expect("dual info").0;
+            let (d_all, m_all) = self.split_dual_taps(raw_taps, rows.len())?;
+            let lo = job.tap_row_off * d_w;
+            let hi = (job.tap_row_off + job.committed.len()) * d_w;
+            push_tail(&mut self.active[job.active_idx].d_tail, &d_all[lo..hi], d_w);
+            self.promote_solo(job, &m_all)?;
         } else if !jobs.is_empty() {
-            let drafts_all = self.draft_batch(&jobs, &taps)?;
+            if let Some((d_w, _)) = dual_info
+                && survivors <= 2
+            {
+                let d_all = self.read_dual_d_taps(&raw_taps, rows.len())?;
+                for job in &jobs {
+                    let lo = job.tap_row_off * d_w;
+                    let hi = (job.tap_row_off + job.committed.len()) * d_w;
+                    push_tail(&mut self.active[job.active_idx].d_tail, &d_all[lo..hi], d_w);
+                }
+            }
+            let drafts_all = self.draft_batch(&jobs, &raw_taps, dual_info.is_some())?;
             for (job, drafts) in jobs.into_iter().zip(drafts_all) {
                 self.active[job.active_idx].drafts = drafts;
             }
@@ -537,11 +532,46 @@ impl<'a> BatchMtp<'a> {
         Ok(())
     }
 
+    /// Feeds one non-final dual prefill chunk directly into `MtpDrafter`.
+    fn run_mtp_prefill_chunk(
+        &mut self,
+        slot: u32,
+        pos0: u32,
+        tokens: &[u32],
+        taps: &TapsBuf,
+        d_w: usize,
+        m_w: usize,
+    ) -> Result<(), Error> {
+        let wants = self.drafter.wants();
+        let stride = d_w + m_w;
+        match taps {
+            TapsBuf::Device { addr, .. } => {
+                let h = TapsIn::Device {
+                    addr: *addr + (d_w * 4) as u64,
+                    rows: tokens.len(),
+                    stride,
+                };
+                self.drafter.run_taps(slot, pos0, tokens, h, wants, true)?;
+            }
+            TapsBuf::Host(v) => {
+                let mut mt = Vec::with_capacity(tokens.len() * m_w);
+                for r in 0..tokens.len() {
+                    let lo = r * stride + d_w;
+                    mt.extend_from_slice(&v[lo..lo + m_w]);
+                }
+                self.drafter
+                    .run_taps(slot, pos0, tokens, TapsIn::Host(&mt), wants, true)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs batched first-form MTP plus shared chain steps for `jobs`.
     pub(crate) fn draft_batch(
         &mut self,
         jobs: &[DraftJob],
         taps: &TapsBuf,
+        strided: bool,
     ) -> Result<Vec<Vec<u32>>, Error> {
         let n = jobs.len();
         let chain_n = jobs.iter().map(|j| j.avail).min().unwrap_or(0);
@@ -550,6 +580,10 @@ impl<'a> BatchMtp<'a> {
         }
         let hidden = self.drafter.hidden();
         let wants = self.drafter.wants();
+        let (col_off, stride) = match (strided, self.dual.as_ref()) {
+            (true, Some(p)) => (p.d_width, p.d_width + p.m_width),
+            _ => (0, hidden),
+        };
         let mut end_rows = Vec::with_capacity(n);
         let mut total_rows = 0usize;
         for j in jobs {
@@ -562,14 +596,31 @@ impl<'a> BatchMtp<'a> {
         };
         let can_gpu_chain =
             chain_n >= 2 && dev_taps.is_some_and(|(slot, _)| slot.bytes() >= n * (chain_n - 1) * 4);
+        let host_slices: Vec<Vec<f32>> = match taps {
+            TapsBuf::Host(v) if col_off > 0 => jobs
+                .iter()
+                .map(|j| {
+                    let mut buf = Vec::with_capacity(j.committed.len() * hidden);
+                    for r in 0..j.committed.len() {
+                        let lo = (j.tap_row_off + r) * stride + col_off;
+                        buf.extend_from_slice(&v[lo..lo + hidden]);
+                    }
+                    buf
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let spans: Vec<MtpSpan<'_>> = jobs
             .iter()
-            .map(|j| {
+            .enumerate()
+            .map(|(i, j)| {
                 let h = match taps {
                     TapsBuf::Device { addr, .. } => TapsIn::Device {
-                        addr: *addr + (j.tap_row_off * hidden * 4) as u64,
+                        addr: *addr + ((j.tap_row_off * stride + col_off) * 4) as u64,
                         rows: j.committed.len(),
+                        stride: if col_off > 0 { stride } else { 0 },
                     },
+                    TapsBuf::Host(_) if col_off > 0 => TapsIn::Host(&host_slices[i]),
                     TapsBuf::Host(v) => {
                         let lo = j.tap_row_off * hidden;
                         let hi = lo + j.committed.len() * hidden;

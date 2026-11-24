@@ -166,6 +166,31 @@ impl<'a> BatchMtp<'a> {
         Ok(split_taps(&raw, rows, peer.d_width, peer.m_width))
     }
 
+    /// Reads DFlash taps for `rows` without consuming device `taps`.
+    pub(crate) fn read_dual_d_taps(&self, taps: &TapsBuf, rows: usize) -> Result<Vec<f32>, Error> {
+        let peer = self.dual.as_ref().expect("dual peer");
+        let total = peer.d_width + peer.m_width;
+        let d_width = peer.d_width;
+        let mut out = Vec::with_capacity(rows * d_width);
+        match taps {
+            TapsBuf::Host(v) => {
+                for r in 0..rows {
+                    let base = r * total;
+                    out.extend_from_slice(&v[base..base + d_width]);
+                }
+            }
+            TapsBuf::Device { slot, .. } => {
+                let raw = self.target.runner.read(*slot)?;
+                let floats = raw.floats().map_err(tessera_run::Error::from)?;
+                for r in 0..rows {
+                    let base = r * total;
+                    out.extend_from_slice(&floats[base..base + d_width]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Promotes a lone surviving stream into solo DFlash mode.
     pub(crate) fn promote_solo(&mut self, job: DraftJob, m_all: &[f32]) -> Result<(), Error> {
         let m_width = self.drafter.hidden();
@@ -357,7 +382,7 @@ impl<'a> BatchMtp<'a> {
         };
         let tail_taps = TapsBuf::Host(m_taps[split * m_width..].to_vec());
         let mut drafts = self
-            .draft_batch(&[job], &tail_taps)?
+            .draft_batch(&[job], &tail_taps, false)?
             .pop()
             .unwrap_or_default();
         let (k, pred) = self.active[idx]
