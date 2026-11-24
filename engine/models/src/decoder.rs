@@ -1,7 +1,8 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Dense, Side, Stack, Steps, TapSink, swiglu, with_head};
+pub use crate::shared::Swiglu;
+use crate::shared::{Attend, Dense, Side, Stack, Steps, TapSink, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -35,22 +36,11 @@ pub trait Mlp: Weights {
     fn apply(&self, m: &Model, h: &Tensor) -> Tensor;
 }
 
-/// A SwiGLU MLP every row passes through.
-#[derive(Weights)]
-pub struct Swiglu<D: Dense = Linear> {
-    #[shape(Hidden, Ffn)]
-    pub gate: D,
-    #[shape(Hidden, Ffn)]
-    pub up: D,
-    #[shape(Ffn, Hidden)]
-    pub down: D,
-}
-
 impl<D: Dense> Mlp for Swiglu<D> {
     const KIND: Composite = Composite::Mlp;
 
     fn apply(&self, _: &Model, h: &Tensor) -> Tensor {
-        swiglu(h, [&self.gate, &self.up, &self.down])
+        self.eval(h)
     }
 }
 

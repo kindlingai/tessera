@@ -1,7 +1,7 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
 use crate::shared::{
-    Attend, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink, rows, swiglu,
+    Attend, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, Swiglu, TapSink, rows,
 };
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -209,27 +209,6 @@ pub struct Indexer {
     pub weights: Linear,
 }
 
-#[derive(Weights)]
-pub struct DenseMlp {
-    #[shape(Hidden, DENSE_FFN)]
-    pub gate: Linear,
-    #[shape(Hidden, DENSE_FFN)]
-    pub up: Linear,
-    #[shape(DENSE_FFN, Hidden)]
-    pub down: Linear,
-}
-
-/// The expert every row uses.
-#[derive(Weights)]
-pub struct SharedMlp {
-    #[shape(Hidden, Ffn)]
-    pub gate: Linear,
-    #[shape(Hidden, Ffn)]
-    pub up: Linear,
-    #[shape(Ffn, Hidden)]
-    pub down: Linear,
-}
-
 /// Routed experts stored as `E`, and a shared one.
 #[derive(Weights)]
 pub struct MoeOf<E: ExpertSet> {
@@ -240,7 +219,7 @@ pub struct MoeOf<E: ExpertSet> {
     pub router_bias: Vector,
     #[flatten]
     pub experts: E,
-    pub shared: SharedMlp,
+    pub shared: Swiglu,
 }
 
 pub type Moe = MoeOf<PlainExperts>;
@@ -258,8 +237,8 @@ pub struct Mla<R: Routed> {
     pub indexers: Vec<Indexer>,
     #[shape(Layers, Hidden)]
     pub mlp_norm: Vec<Norm>,
-    #[shape(DENSE_LAYERS)]
-    pub dense: Vec<DenseMlp>,
+    #[shape(DENSE_LAYERS, Hidden, DENSE_FFN)]
+    pub dense: Vec<Swiglu>,
     #[shape(MOE_LAYERS)]
     pub moe: Vec<R>,
     #[shape(Hidden)]
@@ -384,10 +363,7 @@ impl Pass<'_> {
         let x = x.add(&attn);
         let h = x.rms_norm(&w.mlp_norm[l], c.eps);
         let [mlp] = match l.checked_sub(w.dense.len()) {
-            None => {
-                let d = &w.dense[l];
-                m.composite(Composite::Mlp, || [swiglu(&h, [&d.gate, &d.up, &d.down])])
-            }
+            None => m.composite(Composite::Mlp, || [w.dense[l].eval(&h)]),
             Some(i) => m.composite(Composite::Moe, || [w.moe[i].apply(m, c, &h)]),
         };
         (x.add(&mlp), keys)
@@ -547,8 +523,7 @@ impl<E: ExpertSet> Routed for MoeOf<E> {
     fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
         let [ids, gates] = route(c, &self.router, &self.router_bias, h);
         let routed = self.experts.apply(m, h, [&ids, &gates]);
-        let s = &self.shared;
-        routed.add(&swiglu(h, [&s.gate, &s.up, &s.down]))
+        routed.add(&self.shared.eval(h))
     }
 }
 

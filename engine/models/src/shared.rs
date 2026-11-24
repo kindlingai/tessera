@@ -385,6 +385,36 @@ pub(crate) fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
     lead.into_iter().chain(rest).collect()
 }
 
+/// A SwiGLU MLP with gate, up, and down projections.
+pub struct Swiglu<D: Dense = Linear> {
+    pub gate: D,
+    pub up: D,
+    pub down: D,
+}
+
+impl<D: Dense> Weights for Swiglu<D> {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        let [inp, inner]: [DimExpr; 2] = match shape {
+            [] => [Hidden.into(), Ffn.into()],
+            [inp, inner] => [inp.clone(), inner.clone()],
+            _ => panic!("{path:?}: Swiglu expects empty shape or [in, inner]"),
+        };
+        let wide = [inp.clone(), inner.clone()];
+        let narrow = [inner, inp];
+        Self {
+            gate: part(m, path, "gate", &wide),
+            up: part(m, path, "up", &wide),
+            down: part(m, path, "down", &narrow),
+        }
+    }
+}
+
+impl<D: Dense> Swiglu<D> {
+    pub(crate) fn eval(&self, h: &Tensor) -> Tensor {
+        swiglu(h, [&self.gate, &self.up, &self.down])
+    }
+}
+
 pub(crate) fn swiglu<D: Dense>(h: &Tensor, [gate, up, down]: [&D; 3]) -> Tensor {
     let inner = gate.apply(h).act(Act::Silu).mul(&up.apply(h));
     down.apply(&inner)
