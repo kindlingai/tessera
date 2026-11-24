@@ -58,7 +58,7 @@ fn ladder() -> Graph {
     let [x, y] = m.entry(EntryKind::Forward, [port(), port()]);
     let h1 = x.add(&y);
     let h2 = h1.act(Act::Silu).mul(&y.mul_vector(&w.a)).mul(&x);
-    let out = h2.mul_vector(&w.b).act(Act::Silu).add(&h1).add(&h2);
+    let out = h1.add(&h2.mul_vector(&w.b).act(Act::Silu)).add(&h2);
     m.finish([(Role::Logits, &out)])
 }
 
@@ -382,6 +382,11 @@ fn trees_cut_shared() {
         assert!(!tree.root(act) && reads.len() == 3);
         assert_eq!(tree.covered(*gate, reads).len(), 3);
     }
+    // An add joins its second argument past a shared first.
+    let tail = [MapStage::Mul, MapStage::Act(Act::Silu), MapStage::Add];
+    let tails = chains(&[&tail[..], &[MapStage::Add]].concat());
+    assert_eq!(tails.len(), 1);
+    assert_eq!(tree.covered(tails[0].0, &tails[0].1).len(), 4);
     // The sum of x and y has two readers.
     let sums = chains(&[MapStage::Add]);
     assert_eq!(sums.len(), 1);
