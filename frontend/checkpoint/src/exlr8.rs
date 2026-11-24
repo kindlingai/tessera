@@ -265,6 +265,27 @@ fn past<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
     (end.is_empty() || end.starts_with('.')).then_some(end)
 }
 
+/// The text before a layer index in `f`'s names.
+fn layer_prefix(f: &File) -> Option<String> {
+    if let Some(prefix) = f.meta("tensor_prefix") {
+        return Some(prefix.into());
+    }
+    // Else the most common `layers.` stem before a number.
+    let slices = f.slices();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for s in &slices {
+        for (at, stem) in s.name.match_indices("layers.") {
+            let end = at + stem.len();
+            if s.name[end..].starts_with(|c: char| c.is_ascii_digit()) {
+                *counts.entry(&s.name[..end]).or_default() += 1;
+                break;
+            }
+        }
+    }
+    let most = counts.into_iter().max_by_key(|&(stem, n)| (n, stem));
+    most.map(|(stem, _)| stem.into())
+}
+
 /// One file, and how its names become HF names.
 struct Shard {
     file: String,
@@ -363,28 +384,12 @@ impl Release {
                 .collect(),
         };
         let single_file = "dense/exlr8-dense";
-        let single_prefix = self
-            .with(single_file, |f| {
-                let lang = f
-                    .slices()
-                    .iter()
-                    .any(|s| s.name.starts_with("model.language_model.layers."));
-                Ok(if lang {
-                    "model.language_model.layers."
-                } else {
-                    "model.layers."
-                })
-            })
-            .ok();
-        let single = single_prefix.map(|_| single_file.to_string());
+        let found = self.with(single_file, |f| Ok(layer_prefix(f))).ok();
+        let single = found.is_some().then(|| single_file.to_string());
         let first = "dense/exlr8-dense-000";
-        let prefix = single_prefix
-            .map(String::from)
-            .or_else(|| {
-                self.with(first, |f| Ok(f.meta("tensor_prefix").map(Into::into)))
-                    .ok()
-                    .flatten()
-            })
+        let prefix = found
+            .flatten()
+            .or_else(|| self.with(first, |f| Ok(layer_prefix(f))).ok().flatten())
             .unwrap_or_else(|| "model.layers.".into());
         let mut extras = Vec::new();
         if let Some(s) = &single {
@@ -597,7 +602,7 @@ impl Release {
 
     /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
     pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
-        if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
+        if let Some((layer, local)) = self.expert(name) {
             return self.expert_codes(layer, local, rows.map(|(f, c)| (0, f, c)));
         }
         let (file, local) = self.place(name);
@@ -617,7 +622,7 @@ impl Release {
 
     /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.
     pub fn read(&self, name: &str) -> Result<Vec<f32>, Error> {
-        if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
+        if let Some((layer, local)) = self.expert(name) {
             let k = experts::target(local)
                 .map(|(shared, proj)| self.expert_width(layer, shared, proj))
                 .unwrap_or(self.width);
@@ -644,10 +649,9 @@ impl Release {
 }
 
 impl Release {
-    /// An `I64` tensor's values, read from its shard.
-    pub fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
-        let (file, local) = self.place(name);
-        self.with(&file, |f| f.i64s(&local))
+    /// A routed layer and expert name in the `dense/` layout.
+    fn expert<'a>(&self, name: &'a str) -> Option<(usize, &'a str)> {
+        experts::split(name, &self.dense.as_ref()?.prefix)
     }
 
     /// The `dense/` file holding `name`, and its stored name.
@@ -871,19 +875,26 @@ impl Offer for Release {
         Ok(self.read(name)?.iter().flat_map(narrow).collect())
     }
 
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        let (file, local) = self.place(name);
+        self.with(&file, |f| f.i64s(&local))
+    }
+
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         Release::packed(self, name, Some(rows))
     }
 
     /// Routed experts are cut. Other matrices are read whole.
     fn packed_share(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
-        let routed = experts::split(name).is_some_and(|(_, l)| l.starts_with("experts."));
-        Release::packed(self, name, (routed && self.dense.is_some()).then_some(rows))
+        let routed = self
+            .expert(name)
+            .is_some_and(|(_, l)| l.starts_with("experts."));
+        Release::packed(self, name, routed.then_some(rows))
     }
 
     /// Routed experts cut along expert or inner axis.
     fn packed_axis(&self, name: &str, axis: u32, range: (usize, usize)) -> Result<Vec<u8>, Error> {
-        let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) else {
+        let Some((layer, local)) = self.expert(name) else {
             return Release::packed(self, name, None);
         };
         let slice = local

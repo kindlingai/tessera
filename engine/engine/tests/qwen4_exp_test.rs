@@ -1,9 +1,8 @@
 //! End-to-end parity between qwen4_exp forward and ragged stepper.
 
 use std::io::Write;
-use tessera_engine::qwen4_exp::{
-    Config, LayerKind, LinearSizes, Moe, Ple, RotatedMoe, program, stepper,
-};
+use tessera_engine::qwen4_exp::{Config, Moe, Ple, RotatedMoe, program, stepper};
+use tessera_engine::qwen35::{Mixing, Recurrent};
 use tessera_engine::{
     Bf16, Engine, Pick, PleConfig, PleStore, Recipe, Row, Settings, Stack, Tensor, Weight,
 };
@@ -20,14 +19,14 @@ fn tiny_config() -> Config {
         experts: 4,
         top_k: 2,
         shared_ffn: 8,
-        linear: LinearSizes {
+        linear: Recurrent {
             key_heads: 2,
             value_heads: 4,
             key_dim: 4,
             value_dim: 4,
             window: 4,
         },
-        layers: vec![LayerKind::Linear, LayerKind::Full],
+        layers: vec![Mixing::Linear, Mixing::Full],
         ple: Some(Ple {
             layer: 1,
             dim: 16,
@@ -224,7 +223,7 @@ fn rotated_trims() {
         rotary: 16,
         hc_rank: 32,
         shared_ffn: 128,
-        linear: LinearSizes {
+        linear: Recurrent {
             key_dim: 32,
             value_dim: 32,
             ..tiny.linear

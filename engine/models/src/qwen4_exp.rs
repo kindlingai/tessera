@@ -2,8 +2,8 @@
 
 use crate::keys::Keys;
 use crate::qwen35::{
-    self, DeltaNet, Full, KEY_DIM, KEY_HEADS, L2_EPS, Mixing, Recurrent, VALUE_DIM, VALUE_HEADS,
-    WINDOW, either, mixing, norm, rotary, text,
+    DeltaNet, Full, KEY_DIM, KEY_HEADS, L2_EPS, Mixing, Recurrent, VALUE_DIM, VALUE_HEADS, WINDOW,
+    either, mixing, norm, rotary, text,
 };
 use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, part, rows, swiglu};
 use serde_json::json;
@@ -13,8 +13,6 @@ use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear, Linears,
     Mask, Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
 };
-
-pub use crate::qwen35::Mixing as LayerKind;
 
 const GDN_HIST: DimName = DimName::named("GdnHist");
 const HC: DimName = DimName::named("Hc");
@@ -81,12 +79,19 @@ impl Config {
             value_dim: text(k, "linear_value_head_dim"),
             window: text(k, "linear_conv_kernel_dim"),
         };
-        let ple_ids: Vec<u64> = k.or(&["text_config.ple_layer_ids", "ple_layer_ids"], Vec::new());
+        let ids = ["text_config.ple_layer_ids", "ple_layer_ids"];
+        let ple_ids: Vec<u64> = k.or(&ids, Vec::new());
+        if ple_ids.len() > 1 {
+            k.misfit(
+                ids[0],
+                format!("one PLE layer is supported, not {ple_ids:?}"),
+            );
+        }
         let ple = ple_ids.first().map(|&id| Ple {
             layer: id.saturating_sub(1),
-            dim: either(k, "ple_embed_dim", "ple_embed_dim", sizes[1]),
-            window: either(k, "ple_conv_kernel_size", "ple_conv_kernel_size", 4),
-            dilation: either::<u64>(k, "ngram_size", "ngram_size", 3) as u32,
+            dim: text(k, "ple_embed_dim"),
+            window: text(k, "ple_conv_kernel_size"),
+            dilation: text(k, "ngram_size"),
         });
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
@@ -94,8 +99,8 @@ impl Config {
             rotary,
             rope_theta: either(k, "rope_parameters.rope_theta", "rope_theta", 1e7),
             eps: text(k, "rms_norm_eps"),
-            hc_count: either(k, "hc_count", "hc_count", 4),
-            hc_rank: either(k, "hc_lowrank", "hc_lowrank", 320),
+            hc_count: text(k, "hc_count"),
+            hc_rank: text(k, "hc_lowrank"),
             experts: text(k, "num_experts"),
             top_k: text(k, "num_experts_per_tok"),
             shared_ffn: either(
@@ -107,7 +112,7 @@ impl Config {
             linear,
             layers,
             ple,
-            eos_token: either::<u64>(k, "eos_token_id", "bos_token_id", 248_044) as i32,
+            eos_token: text(k, "eos_token_id"),
             tied: k.or(
                 &["text_config.tie_word_embeddings", "tie_word_embeddings"],
                 false,
@@ -763,6 +768,3 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     );
     pick(&m, &logits, allowed.as_ref(), taps.as_ref())
 }
-
-// Re-export qwen35::Recurrent for external config builders.
-pub use qwen35::Recurrent as LinearSizes;

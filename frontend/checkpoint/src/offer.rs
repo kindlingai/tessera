@@ -70,6 +70,10 @@ pub trait Offer {
     fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
         Ok(self.floats(name)?.iter().flat_map(narrow).collect())
     }
+    /// An `I64` slice's values.
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        Err(Error::DType(format!("{name} cannot be read as I64")))
+    }
     /// Slice `name` left on disk, as stored.
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
         let _ = name;

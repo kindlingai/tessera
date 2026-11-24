@@ -260,6 +260,10 @@ impl Offer for File {
         }
     }
 
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        File::i64s(self, name)
+    }
+
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
         let e = self.entries.get(name)?;
         let Backing::Disk(disk) = &self.backing else {
@@ -318,6 +322,10 @@ impl Offer for Shards {
 
     fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
         Offer::bf16(self.holding(name)?, name)
+    }
+
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        self.holding(name)?.i64s(name)
     }
 
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {

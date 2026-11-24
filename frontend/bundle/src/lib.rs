@@ -462,14 +462,12 @@ pub fn load_tapped(
         taps,
         json: &json,
     };
-    let (graph, weights, pins) = step(arch, &ask)?;
-    let ple = match arch.name {
-        "qwen4_exp" => qwen4_exp::ple_config(dir, &ask)?,
-        _ => None,
+    let built = step(arch, &ask)?;
+    let ple = match arch.ple {
+        Some(ple) => ple(&ask)?,
+        None => None,
     };
-    let mut bundle = dressed(dir, graph, weights, pins, Some(json))?;
-    bundle.ple = ple;
-    Ok(bundle)
+    dressed(dir, built, Some(json), ple)
 }
 
 /// `graph`'s weights held from `ask`'s folder, `rules` first.
@@ -505,8 +503,8 @@ pub fn load_module(
         user,
         ..arch::Ask::plain(dir, sizes, overrides, &json)
     };
-    let (graph, weights, pins) = held(&ask, graph, layers, &[])?;
-    dressed(dir, graph, weights, pins, Some(json)).map(Some)
+    let built = held(&ask, graph, layers, &[])?;
+    dressed(dir, built, Some(json), None).map(Some)
 }
 
 /// `dir`'s whole-prompt graph, its weights and their forms.
@@ -543,10 +541,9 @@ pub(crate) fn release(
 /// The graph and weights with `dir`'s tokenizer, template, stops.
 fn dressed(
     dir: &Path,
-    graph: Graph,
-    weights: Weights,
-    pins: Pins,
+    (graph, weights, pins): arch::Built,
     config: Option<String>,
+    ple: Option<PleConfig>,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let template = Template::load(dir)?;
@@ -566,6 +563,6 @@ fn dressed(
         template,
         stop,
         config,
-        ple: None,
+        ple,
     })
 }
