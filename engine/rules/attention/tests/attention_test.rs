@@ -12,7 +12,7 @@ use tessera_lower::{Cache, Device, Pick, Pins, Settings, View, lower, rules};
 use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
 use tessera_testkit::{Noise, fill, graphs, max_abs_diff};
-use tessera_trace::{EntryKind, Mask, Model, PathSeg, Port, Role, Taps, Weights};
+use tessera_trace::{Act, EntryKind, Mask, Model, PathSeg, Port, Role, Taps, Weights};
 
 /// Attention under `mask` over `heads` query heads of `width`.
 fn attention(mask: Mask, heads: u64, width: u64) -> Graph {
@@ -486,5 +486,273 @@ fn narrow_kept_matches() {
                 }
             }
         }
+    }
+}
+
+/// Ragged Lightning Indexer over kept keys, causal or unmasked.
+fn indexer_ragged(heads: u64, dim: u64, max_ctx: u64, causal: bool) -> Graph {
+    let dim_of = |name, size| Dim { name, size };
+    let mut dims = vec![
+        dim_of(Seqs, Size::Bounded(4)),
+        dim_of(Rows, Size::Bounded(64)),
+        dim_of(Context, Size::Bounded(max_ctx)),
+        dim_of(Heads, Size::Fixed(heads)),
+        dim_of(HeadDim, Size::Fixed(dim)),
+    ];
+    dims.push(dim_of(Hidden, Size::Fixed(1)));
+    let m = Model::new(dims);
+    let port = |role, ty| Port { role, ty };
+    let ids = TensorType::new([Rows], DType::U32);
+    let [q, k, w, slots, positions] = m.entry(
+        EntryKind::Step,
+        [
+            port(
+                Role::Tokens,
+                TensorType::new([Rows, Heads, HeadDim], DType::F32),
+            ),
+            port(Role::Tokens, TensorType::new([Rows, HeadDim], DType::F32)),
+            port(
+                Role::Tokens,
+                TensorType::new([Rows, Hidden, Heads], DType::F32),
+            ),
+            port(Role::Slots, ids.clone()),
+            port(Role::Positions, ids),
+        ],
+    );
+    let kept = m.kept(TensorType::new([Seqs, Context, HeadDim], DType::F32));
+    let k = k.append(&kept, [&slots, &positions]).gather(&slots);
+    let hits = q.matmul_rows(&k).act(Act::Relu);
+    let scores = hits.permute(&[0, 2, 1]).matmul_rows(&w);
+    let out = match causal {
+        true => scores.reshape([Rows, Context]).causal(&positions),
+        false => scores,
+    };
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Whole-sequence Lightning Indexer, with optional mask.
+fn indexer_whole(heads: u64, dim: u64, mask: Option<Mask>) -> Graph {
+    let dim_of = |name, size| Dim { name, size };
+    let dims = vec![
+        dim_of(Seqs, Size::Bounded(4)),
+        dim_of(Context, Size::Bounded(64)),
+        dim_of(Heads, Size::Fixed(heads)),
+        dim_of(HeadDim, Size::Fixed(dim)),
+        dim_of(Hidden, Size::Fixed(1)),
+    ];
+    let m = Model::new(dims);
+    let port = |ty| Port {
+        role: Role::Tokens,
+        ty,
+    };
+    let [q, k, w] = m.entry(
+        EntryKind::Forward,
+        [
+            port(TensorType::new([Seqs, Context, Heads, HeadDim], DType::F32)),
+            port(TensorType::new([Seqs, Context, HeadDim], DType::F32)),
+            port(TensorType::new([Seqs, Context, Hidden, Heads], DType::F32)),
+        ],
+    );
+    let hits = q.matmul_rows(&k).act(Act::Relu);
+    let scores = hits.permute(&[0, 1, 3, 2]).matmul_rows(&w);
+    let out = match mask {
+        Some(kind) => scores.reshape([Seqs, Context, Context]).mask(kind),
+        None => scores,
+    };
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Checks score parity, requiring exact -inf on masked entries.
+fn check_scores(got: &[f32], want: &[f32], tol: f32, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: len mismatch");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        if w == f32::NEG_INFINITY {
+            assert_eq!(g, f32::NEG_INFINITY, "{label}[{i}]: expected -inf, got {g}");
+        } else {
+            let diff = (g - w).abs();
+            assert!(
+                diff < tol,
+                "{label}[{i}]: got {g}, want {w} (diff {diff:e})"
+            );
+        }
+    }
+}
+
+#[test]
+fn indexer_ragged_matches() {
+    let mut draws = Noise(53);
+    let launches: [&[(u32, u32, u32)]; 3] = [
+        &[(0, 0, 1)],
+        &[(0, 1, 12), (1, 0, 5), (2, 0, 9)],
+        &[(0, 13, 1), (1, 5, 1), (3, 0, 4), (2, 9, 1)],
+    ];
+    let layouts: [&'static dyn Layout; 3] =
+        [kept::DENSE, kept::named("paged").unwrap(), &kept::PAGED16];
+    // Includes odd width to cover plain fallback.
+    let shapes = [
+        (2u64, 32u64, true),
+        (8, 128, true),
+        (4, 6, true),
+        (4, 32, false),
+    ];
+    for (heads, dim, causal) in shapes {
+        let g = indexer_ragged(heads, dim, 128, causal);
+        for settings in runs() {
+            for &layout in &layouts {
+                for force_plain in [false, true] {
+                    if force_plain && dim == 6 {
+                        continue;
+                    }
+                    let (mut store, mut runner): (Store, Option<Box<dyn Run>>) =
+                        (Store::default(), None);
+                    for runs in launches {
+                        let (slots, positions) = rows(runs);
+                        let (n, h, d) = (slots.len(), heads as usize, dim as usize);
+                        let furthest = *positions.iter().max().unwrap() as u64 + 1;
+                        let inputs = [
+                            noise(vec![n, h, d], &mut draws),
+                            noise(vec![n, d], &mut draws),
+                            noise(vec![n, 1, h], &mut draws),
+                            Tensor::u32(vec![n], slots),
+                            Tensor::u32(vec![n], positions),
+                        ];
+                        let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+                        let sizes = [(Seqs, 4), (Rows, n as u64), (Context, furthest)];
+                        let mut device = Device::guess(&settings);
+                        device.kept = layout;
+                        if force_plain {
+                            device = device.without("indexer_warp");
+                        }
+                        let plan = lower(&g, 0, &sizes, &device).unwrap();
+                        let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                        let expect = if force_plain || dim == 6 {
+                            "indexer"
+                        } else {
+                            "indexer_warp"
+                        };
+                        assert_eq!(names, ["scatter", expect], "{layout:?} {heads}x{dim}");
+                        let got = step_plan(&mut runner, plan, &settings, &inputs);
+                        let label = format!("{expect} {layout:?} {heads}x{dim} causal={causal}");
+                        check_scores(
+                            got.floats().unwrap(),
+                            want[0].floats().unwrap(),
+                            1e-4,
+                            &label,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn indexer_narrow_kept() {
+    let g = indexer_ragged(4, 128, 128, true);
+    let layouts: [&'static dyn Layout; 3] = [kept::DENSE, kept::INTERLEAVED, &kept::PAGED16];
+    let forms = [(BF16_FORM, 5e-2f32), (FP8_FORM, 0.5f32)];
+    let mut draws = Noise(97);
+    for (form, tol) in forms {
+        let pins = Pins::default().activations(BF16_FORM).kept(form);
+        for &layout in &layouts {
+            for settings in runs() {
+                let (mut store, mut runner): (Store, Option<Box<dyn Run>>) =
+                    (Store::default(), None);
+                for runs in [
+                    &[(0u32, 0u32, 8u32), (1, 0, 5)][..],
+                    &[(0, 8, 1), (1, 5, 1)][..],
+                ] {
+                    let (slots, positions) = rows(runs);
+                    let n = slots.len();
+                    let furthest = *positions.iter().max().unwrap() as u64 + 1;
+                    let inputs = [
+                        noise(vec![n, 4, 128], &mut draws),
+                        noise(vec![n, 128], &mut draws),
+                        noise(vec![n, 1, 4], &mut draws),
+                        Tensor::u32(vec![n], slots),
+                        Tensor::u32(vec![n], positions),
+                    ];
+                    let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+                    let sizes = [(Seqs, 4), (Rows, n as u64), (Context, furthest)];
+                    let mut device = Device::guess(&settings).pinned(pins.clone());
+                    device.kept = layout;
+                    let plan = lower(&g, 0, &sizes, &device).unwrap();
+                    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                    assert_eq!(names, ["scatter", "indexer_warp"], "{names:?}");
+                    assert!(plan.kept.iter().all(|k| k.1.form == form));
+                    let got = step_plan(&mut runner, plan, &settings, &inputs);
+                    let label = format!("{} {layout:?}", form.name());
+                    check_scores(
+                        got.floats().unwrap(),
+                        want[0].floats().unwrap(),
+                        tol,
+                        &label,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn indexer_whole_matches() {
+    let mut draws = Noise(67);
+    let cases = [
+        (4u64, 32u64, Some(Mask::Causal)),
+        (4, 128, Some(Mask::Back(3))),
+        (2, 16, None),
+    ];
+    for (heads, dim, mask) in cases {
+        let g = indexer_whole(heads, dim, mask);
+        let (seqs, keys, h, d) = (2usize, 9usize, heads as usize, dim as usize);
+        let inputs = [
+            noise(vec![seqs, keys, h, d], &mut draws),
+            noise(vec![seqs, keys, d], &mut draws),
+            noise(vec![seqs, keys, 1, h], &mut draws),
+        ];
+        let want = run(&g, &[], 0, &inputs).unwrap();
+        let views: Vec<_> = inputs.iter().map(|t| t.view()).collect();
+        let sizes = [(Seqs, seqs as u64), (Context, keys as u64)];
+        for settings in runs() {
+            for force_plain in [false, true] {
+                let mut device = Device::guess(&settings);
+                if force_plain {
+                    device = device.without("indexer_warp");
+                }
+                let plan = lower(&g, 0, &sizes, &device).unwrap();
+                let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                let expect = if force_plain {
+                    "indexer"
+                } else {
+                    "indexer_warp"
+                };
+                assert_eq!(names, [expect]);
+                let mut runner = open(plan, &settings).unwrap();
+                let got = runner.run(&views).unwrap().remove(0);
+                check_scores(
+                    got.floats().unwrap(),
+                    want[0].floats().unwrap(),
+                    1e-4,
+                    expect,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn indexer_128k_scratch() {
+    let g = indexer_ragged(32, 128, 131_072, true);
+    let device = Device::guess(&host());
+    let bare = device.clone().without("indexer_warp").without("indexer");
+    for n in [1u64, 64] {
+        let sizes = [(Seqs, 1), (Rows, n), (Context, 131_072)];
+        let fused = lower(&g, 0, &sizes, &device).unwrap();
+        let unfused = lower(&g, 0, &sizes, &bare).unwrap();
+        let f_cost = device.cost(&fused);
+        let u_cost = bare.cost(&unfused);
+        assert_eq!(fused.steps.len(), 2);
+        assert!(fused.scratch() * 100 < unfused.scratch());
+        assert!(f_cost.bytes * 2 < u_cost.bytes);
     }
 }

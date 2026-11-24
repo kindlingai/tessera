@@ -347,6 +347,44 @@ fn mla_matches_interpreter() {
     }
 }
 
+/// GLM-5.3 lowers its indexer to one fused kernel without gather.
+#[test]
+fn mla_indexer_fused() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_context = 512;
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let sizes = [
+        (tessera_graph::DimName::Seqs, 4),
+        (tessera_graph::DimName::Rows, 4),
+        (tessera_graph::DimName::Context, 512),
+    ];
+    for settings in runs() {
+        let device = Device::guess(&settings);
+        let fused = tessera_lower::lower(&g, 0, &sizes, &device).unwrap();
+        let names: Vec<&str> = fused.steps.iter().map(|s| s.kernel.name()).collect();
+        assert!(names.contains(&"indexer_warp"), "{names:?}");
+        assert!(!names.contains(&"kept_gather"), "{names:?}");
+        let bare = device.without("indexer_warp").without("indexer");
+        let unfused = tessera_lower::lower(&g, 0, &sizes, &bare).unwrap();
+        assert!(fused.steps.len() < unfused.steps.len());
+        assert!(
+            fused.scratch() < unfused.scratch(),
+            "fused={} unfused={}",
+            fused.scratch(),
+            unfused.scratch()
+        );
+    }
+    let whole = mla::program::<mla::RotatedMoe>(&cfg);
+    let w_sizes = [
+        (tessera_graph::DimName::Seqs, 1),
+        (tessera_graph::DimName::Context, 8),
+    ];
+    let device = Device::guess(&Settings::default());
+    let plan = tessera_lower::lower(&whole, 0, &w_sizes, &device).unwrap();
+    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+    assert!(names.contains(&"indexer_warp"), "{names:?}");
+}
+
 /// Three ids after each prompt, and the steps they took.
 fn asked(batch: &mut Batch, prompts: &[&[u32]]) -> (Vec<Vec<u32>>, usize) {
     let mut taken = Vec::new();

@@ -5,6 +5,7 @@ mod conv;
 mod cpu;
 mod delta;
 mod flash;
+mod indexer;
 mod listed;
 mod slots;
 
