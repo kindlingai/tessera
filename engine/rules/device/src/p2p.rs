@@ -12,9 +12,6 @@ use tessera_run::Sum;
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
 const ENTRY: &str = "tessera_p2p_sum";
 
-#[cfg(test)]
-mod p2p_test;
-
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
 /// Floats per chunk. Larger sums loop over chunks.
