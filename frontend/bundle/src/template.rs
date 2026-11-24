@@ -1,7 +1,7 @@
 //! The model's chat template, from `tokenizer_config.json`.
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Serde, ValueKind};
+use minijinja::value::Serde;
 use minijinja::{Environment, Value};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::{Deserialize, Serialize};
@@ -87,27 +87,6 @@ struct TokenizerConfig {
     eos_token: Option<SpecialToken>,
 }
 
-/// Jinja2 `dictsort`: yields mapping items sorted by key.
-fn dictsort(value: Value) -> Result<Vec<Value>, minijinja::Error> {
-    if value.kind() != ValueKind::Map {
-        return Err(minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            "dictsort requires a mapping",
-        ));
-    }
-    let mut pairs: Vec<(String, Value, Value)> = Vec::new();
-    for key in value.try_iter()? {
-        let item = value.get_item(&key)?;
-        pairs.push((key.to_string(), key, item));
-    }
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = Vec::with_capacity(pairs.len());
-    for (_, k, v) in pairs {
-        out.push(Value::from(vec![k, v]));
-    }
-    Ok(out)
-}
-
 /// The time `strftime_now` reads. Tests and replays supply their own.
 pub type Clock = Arc<dyn Fn() -> jiff::Zoned + Send + Sync>;
 
@@ -163,10 +142,6 @@ impl Template {
         env.set_syntax(syntax);
         // Templates call Python string methods: split, strip, startswith.
         env.set_unknown_method_callback(unknown_method_callback);
-        env.add_global("True", Value::from(true));
-        env.add_global("False", Value::from(false));
-        env.add_global("None", Value::from(()));
-        env.add_filter("dictsort", dictsort);
         env.add_function("strftime_now", move |format: &str| {
             strftime_now(&clock, format)
         });
