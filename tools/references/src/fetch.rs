@@ -9,7 +9,7 @@ use tessera_recipe::{Error, fetch_as, safe_path};
 const DATASET: &str = "datasets/kindlingai/tessera-references";
 
 /// The dataset commit this checkout reads.
-const PINNED: &str = "d9876b2a31488b4e53887c8f98ebdee5974bf7a0";
+const PINNED: &str = "f17c23f549adfc4bee1f4bfe2cbc32c199a7a3f5";
 
 /// The file in the dataset that lists every reference file.
 const MANIFEST: &str = "manifest.json";
