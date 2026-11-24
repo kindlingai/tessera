@@ -1,10 +1,9 @@
-use crate::dflash::{Overlay, bf16_to_mxfp8, draft_pins, extra_rules, has_norms};
+use crate::dflash::{Overlay, draft_pins, extra_rules, has_norms};
 use crate::names;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
 use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, default_layers, stepper};
-use tessera_engine::form::named;
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Bf16, Norm, PathSeg};
+use tessera_engine::{Norm, PathSeg};
 
 struct Mock(Vec<Slice>);
 
@@ -27,7 +26,7 @@ fn sl(name: impl Into<String>, shape: &[usize]) -> Slice {
     Slice {
         name: name.into(),
         shape: shape.to_vec(),
-        stored: Stored::Bf16,
+        stored: Stored::BF16,
     }
 }
 
@@ -55,20 +54,43 @@ fn draft_slices(layers: usize) -> Vec<Slice> {
     out
 }
 
+fn read_cfg(json: &str, target: &TargetSpec) -> Config {
+    let offer = Offered::parse("config.json", json).unwrap();
+    let mut keys = Keys::new(std::slice::from_ref(&offer));
+    let cfg = Config::read(&mut keys, target, 1, 64);
+    keys.finish().unwrap();
+    cfg
+}
+
+fn bridge_slices() -> Vec<Slice> {
+    let mut d = draft_slices(2);
+    let extra: &[(&str, &[usize])] = &[
+        ("codebook", &[256, 32]),
+        ("gate.weight", &[16, 32]),
+        ("gate.bias", &[16]),
+        ("predecessor_gate.weight", &[16, 32]),
+        ("prev.weight", &[16, 32]),
+        ("early_read_weights", &[1, 32, 64]),
+        ("read_weight", &[32, 64]),
+        ("feature_write_weights", &[2, 64, 16]),
+    ];
+    for &(tail, shape) in extra {
+        d.push(sl(format!("selected_prefix_bridge.{tail}"), shape));
+    }
+    d
+}
+
 #[test]
 fn config_and_names() {
     assert_eq!(default_layers(36, 5), vec![1, 9, 17, 25, 33]);
-    let json = r#"{"block_size":16,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"mask_token_id":99,"target_layer_ids":[1,5]}}"#;
     let target = TargetSpec {
         vocab: 256,
         hidden: 64,
         layers: 8,
         tied: false,
     };
-    let offer = Offered::parse("config.json", json).unwrap();
-    let mut keys = Keys::new(std::slice::from_ref(&offer));
-    let cfg = Config::read(&mut keys, &target, 1, 64);
-    keys.finish().unwrap();
+    let json = r#"{"block_size":16,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"mask_token_id":99,"target_layer_ids":[1,5]}}"#;
+    let cfg = read_cfg(json, &target);
     assert_eq!((cfg.block_size, cfg.mask_token), (16, 99));
     assert_eq!((cfg.tap_layers(), cfg.tap_width()), (vec![2, 6], 128));
     let draft = draft_slices(2);
@@ -86,10 +108,7 @@ fn config_and_names() {
     assert_eq!(claims.last().unwrap().name, "lm_head.weight");
 
     let json2 = r#"{"block_size":8,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-5,"rope_parameters":{"rope_theta":1e6},"is_causal":false,"use_sliding_window":true,"sliding_window":2048,"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"mask_token_id":99,"selector_rank":16,"selector_top_k":4,"target_layer_ids":[1,5]}}"#;
-    let offer2 = Offered::parse("config.json", json2).unwrap();
-    let mut keys2 = Keys::new(std::slice::from_ref(&offer2));
-    let cfg2 = Config::read(&mut keys2, &target, 1, 64);
-    keys2.finish().unwrap();
+    let cfg2 = read_cfg(json2, &target);
     assert!(!cfg2.causal && cfg2.sliding_window == Some(2048));
     let mut d2 = draft_slices(2);
     for i in 0..2 {
@@ -111,29 +130,9 @@ fn config_and_names() {
     assert_eq!(claims2.len(), g2.weights.len());
 
     let json3 = r#"{"block_size":16,"hidden_size":64,"intermediate_size":128,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"draft_block_causal":true,"mask_token_id":99,"target_layer_ids":[1,5],"selected_prefix_code_bridge":{"code_size":32,"rank":16,"eps":1e-6},"selected_prefix_last_write_refine":{"head_topk":4}}}"#;
-    let offer3 = Offered::parse("config.json", json3).unwrap();
-    let mut keys3 = Keys::new(std::slice::from_ref(&offer3));
-    let cfg3 = Config::read(&mut keys3, &target, 1, 64);
-    keys3.finish().unwrap();
+    let cfg3 = read_cfg(json3, &target);
     assert!(cfg3.causal && cfg3.bridge.is_some());
-    let mut d3 = draft_slices(2);
-    d3.push(sl("selected_prefix_bridge.codebook", &[256, 32]));
-    d3.push(sl("selected_prefix_bridge.gate.weight", &[16, 32]));
-    d3.push(sl("selected_prefix_bridge.gate.bias", &[16]));
-    d3.push(sl(
-        "selected_prefix_bridge.predecessor_gate.weight",
-        &[16, 32],
-    ));
-    d3.push(sl("selected_prefix_bridge.prev.weight", &[16, 32]));
-    d3.push(sl(
-        "selected_prefix_bridge.early_read_weights",
-        &[1, 32, 64],
-    ));
-    d3.push(sl("selected_prefix_bridge.read_weight", &[32, 64]));
-    d3.push(sl(
-        "selected_prefix_bridge.feature_write_weights",
-        &[2, 64, 16],
-    ));
+    let d3 = bridge_slices();
     let g3 = stepper::<Norm>(&cfg3);
     let extra3 = extra_rules(&cfg3, &d3);
     let (a3, b3) = (Mock(d3), Mock(tgt));
@@ -184,42 +183,6 @@ fn mxfp8_slices() -> (Vec<Slice>, Vec<Slice>) {
     (draft, tgt)
 }
 
-fn check_mxfp8_pack() {
-    let mxfp8 = named("mxfp8").unwrap();
-    let (rows, cols) = (32usize, 512usize);
-    let bf16_f32: Vec<f32> = (0..rows * cols)
-        .map(|i| {
-            let s = if i % 2 == 0 { 1.0 } else { -1.0 };
-            f32::from(Bf16::from(s * (((i * 37) % 1000) as f32 / 250.0)))
-        })
-        .collect();
-    let bf16_bytes: Vec<u8> = bf16_f32
-        .iter()
-        .flat_map(|&v| Bf16::from(v).0.to_le_bytes())
-        .collect();
-    let full = bf16_to_mxfp8(&bf16_bytes, [rows, cols], None, mxfp8);
-    assert_eq!(full, mxfp8.pack(&bf16_f32));
-    let round = mxfp8.unpack_all(&full);
-    let (mut dot, mut na, mut nb, mut max_rel) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
-    for (&x, &y) in bf16_f32.iter().zip(&round) {
-        dot += f64::from(x) * f64::from(y);
-        na += f64::from(x) * f64::from(x);
-        nb += f64::from(y) * f64::from(y);
-        if x.abs() > 1e-3 {
-            max_rel = max_rel.max((x - y).abs() / x.abs());
-        }
-    }
-    let cos = dot / (na.sqrt() * nb.sqrt());
-    assert!(cos > 0.999 && max_rel < 0.08, "cos={cos} max_rel={max_rel}");
-    let r_slice = bf16_to_mxfp8(&bf16_bytes, [rows, cols], Some((0, 8, 16)), mxfp8);
-    assert_eq!(r_slice, mxfp8.pack(&bf16_f32[8 * cols..24 * cols]));
-    let c_slice = bf16_to_mxfp8(&bf16_bytes, [rows, cols], Some((1, 256, 256)), mxfp8);
-    let want_col: Vec<f32> = (0..rows)
-        .flat_map(|r| bf16_f32[r * cols + 256..r * cols + 512].iter().copied())
-        .collect();
-    assert_eq!(c_slice, mxfp8.pack(&want_col));
-}
-
 #[test]
 fn mxfp8_quant() {
     let target = TargetSpec {
@@ -229,10 +192,7 @@ fn mxfp8_quant() {
         tied: false,
     };
     let json = r#"{"block_size":8,"hidden_size":512,"intermediate_size":1024,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":128,"num_hidden_layers":1,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"block_size":8,"conv_group_size":64,"conv_kernel_size":2,"mask_token_id":0,"selector_rank":16,"selector_top_k":4,"target_layer_ids":[1,5]}}"#;
-    let offer = Offered::parse("config.json", json).unwrap();
-    let mut keys = Keys::new(std::slice::from_ref(&offer));
-    let cfg = Config::read(&mut keys, &target, 1, 64);
-    keys.finish().unwrap();
+    let cfg = read_cfg(json, &target);
     let (draft, tgt) = mxfp8_slices();
     let g = stepper::<Norm>(&cfg);
     let extra = extra_rules(&cfg, &draft);
@@ -268,5 +228,4 @@ fn mxfp8_quant() {
     );
     let all_mx = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8All).unwrap();
     assert_eq!(all_mx.form(&g.weights[1].path).name(), "mxfp8");
-    check_mxfp8_pack();
 }

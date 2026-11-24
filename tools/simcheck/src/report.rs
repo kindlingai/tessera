@@ -7,8 +7,6 @@ use anyhow::Result;
 use std::path::Path;
 use tessera_findings::{Finding, Level, Report, Rule, Snippet};
 
-const ALLOW: &str = "tools/simcheck/allow.toml";
-
 /// A window's lines as written, indentation kept.
 fn snippet(root: &Path, w: &Window, window: usize) -> Result<Snippet> {
     let text = std::fs::read_to_string(root.join(&w.path))?;
@@ -33,7 +31,7 @@ type Stale<'a> = &'a [&'a (String, String)];
 pub fn report(
     (hits, stale, leans): (&[Hit], Stale, &[Lean]),
     wins: &[Window],
-    root: &Path,
+    (root, allow_path): (&Path, &str),
     ((window, min), coverage): ((usize, f32), Option<(usize, usize)>),
 ) -> Result<Report> {
     let mut r = Report::new("simcheck", "Near-copies of code");
@@ -42,14 +40,14 @@ pub fn report(
             "near-copy",
             rule(
                 "Near-copy",
-                &format!("Share the code, or add the pair to `{ALLOW}`."),
+                &format!("Share the code, or add the pair to `{allow_path}`."),
             ),
         ),
         (
             "stale-allow",
             rule(
                 "Stale allow pair",
-                &format!("Remove the pair from `{ALLOW}`."),
+                &format!("Remove the pair from `{allow_path}`."),
             ),
         ),
         (
@@ -92,7 +90,7 @@ pub fn report(
             fix: Some(format!("[\"{}\", \"{}\"],", a.path, b.path)),
         });
     }
-    let allow = std::fs::read_to_string(root.join(ALLOW)).unwrap_or_default();
+    let allow = std::fs::read_to_string(root.join(allow_path)).unwrap_or_default();
     for (a, b) in stale {
         let at = allow
             .lines()
@@ -100,7 +98,7 @@ pub fn report(
         r.findings.push(Finding {
             rule: "stale-allow".into(),
             level: Level::Fail,
-            path: ALLOW.into(),
+            path: allow_path.into(),
             line: at.map_or(1, |i| i + 1),
             message: format!("{a} and {b} are not near-copies"),
             snippets: Vec::new(),

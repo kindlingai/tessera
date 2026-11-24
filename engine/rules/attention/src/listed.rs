@@ -438,10 +438,24 @@ impl Sizes {
         ]
     }
 
+    /// Checks whether `width` fits the single-launch split-K kernel.
+    fn check_fused(&self) -> Result<(), String> {
+        if !self.width.is_multiple_of(WIDE as usize) {
+            return Err(format!(
+                "head width {} is not a multiple of {WIDE}",
+                self.width
+            ));
+        }
+        if self.width > MAX_WIDTH {
+            return Err(format!("head width {} exceeds max {MAX_WIDTH}", self.width));
+        }
+        Ok(())
+    }
+
     /// Single-launch split-K attention when width fits.
     fn fused(self, reads: [T; 6]) -> Option<Vec<Draft>> {
-        let fits = self.width.is_multiple_of(WIDE as usize) && self.width <= MAX_WIDTH;
-        fits.then(|| vec![Draft::new(ListedAttend(self), reads, self.len)])
+        self.check_fused().ok()?;
+        Some(vec![Draft::new(ListedAttend(self), reads, self.len)])
     }
 }
 
@@ -653,5 +667,10 @@ fn propose_fused(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     sizes.fused(reads)
 }
 
+fn why_fused(tree: &Tree, at: T) -> Option<String> {
+    let (sizes, _) = site(tree, at)?;
+    sizes.check_fused().err()
+}
+
 tessera_lower::rule!("listed", propose);
-tessera_lower::rule!("listed_fused", propose_fused);
+tessera_lower::rule!("listed_fused", propose_fused, why = why_fused);

@@ -7,7 +7,6 @@ use crate::tokenize::hf::Hf;
 use crate::{Overrides, pull};
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::exlr8::Release;
 use tessera_engine::eg2::{Config, batched, program};
 use tessera_engine::{Graph, Linear, Pins, Weight};
 
@@ -99,5 +98,6 @@ pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> R
 /// The weights `graph` reads from the release in `dir`.
 pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<Vec<Weight>> {
     let rules = repo("eg2").unwrap_or_default();
-    Ok(pull(graph, &Release::open(dir), layers, &[&rules])?.0)
+    let offer = tessera_checkpoint::open(dir, None)?;
+    Ok(pull(graph, offer.as_ref(), layers, &[&rules])?.0)
 }

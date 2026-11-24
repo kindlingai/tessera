@@ -30,3 +30,20 @@ pub use gguf::{Gguf, GgufType, Meta};
 pub use gguf_write::{GgufTensor, write_gguf};
 pub use offer::{Offer, Slice, Stored};
 pub use torch::Torch;
+
+use std::path::Path;
+
+/// Opens a checkpoint file or directory as an `Offer`.
+pub fn open(path: &Path, manifest: Option<&str>) -> Result<Box<dyn Offer>, Error> {
+    if path.is_file() {
+        return match path.extension().and_then(|e| e.to_str()) {
+            Some("safetensors") => Ok(Box::new(File::open(path)?)),
+            Some("pt" | "pth" | "bin") => Ok(Box::new(Torch::open(path)?)),
+            _ => Ok(Box::new(Gguf::open(path)?)),
+        };
+    }
+    if exlr8::is_release(path) {
+        return Ok(Box::new(exlr8::open_manifest(path, manifest)?));
+    }
+    Ok(Box::new(Shards::open(path)?))
+}

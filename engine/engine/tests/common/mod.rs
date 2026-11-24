@@ -1,12 +1,12 @@
 //! Shared helpers for speculative decoding integration tests.
 
-use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 use tessera_engine::comm::Sockets;
 use tessera_engine::{Engine, Event, Place, Recipe};
 use tessera_graph::Graph;
 use tessera_interp::Tensor;
 use tessera_lower::{Settings, Weight};
-use tessera_testkit::{Noise, weights};
+use tessera_testkit::{Noise, tcp_pair, tcp_timeouts, weights};
 
 pub fn collect_ids(events: &[Event]) -> Vec<u32> {
     let mut out = Vec::new();
@@ -33,10 +33,11 @@ pub fn open_target(g: &Graph, w: &[Tensor], ctx: usize, s: &Settings) -> Engine 
 }
 
 pub fn loopback_links() -> [[Sockets; 2]; 2] {
+    let wait = Duration::from_secs(20);
     std::array::from_fn(|_| {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        let (b, _) = l.accept().unwrap();
+        let (a, b) = tcp_pair().unwrap();
+        tcp_timeouts(&a, wait).unwrap();
+        tcp_timeouts(&b, wait).unwrap();
         [
             Sockets::over(0, vec![None, Some(a)]).unwrap(),
             Sockets::over(1, vec![Some(b), None]).unwrap(),

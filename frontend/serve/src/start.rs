@@ -15,7 +15,7 @@ use tessera_tasks::api::Info;
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
 [--max-batch-rows <n>] [--served-model-name <name>]";
-    let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored]";
+    let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering]";
     format!("{head} {} {tail}", task::usage())
 }
 
@@ -38,6 +38,8 @@ pub struct Options {
     pub strict: bool,
     /// Fail lowering unless the favored rule covers a step.
     pub require_favored: bool,
+    /// Print top slow or unfused lowering sites on boot.
+    pub explain_lowering: bool,
     pub max_connections: usize,
     /// A recipe module that may build the model's graph.
     pub module: Option<Arc<Module>>,
@@ -65,6 +67,7 @@ impl Default for Options {
             given: BTreeMap::new(),
             strict: false,
             require_favored: false,
+            explain_lowering: false,
             max_connections: 64,
             module: None,
             lower: None,
@@ -81,6 +84,7 @@ impl Options {
         match flag {
             "--reject-unknown-fields" => self.strict = true,
             "--require-favored" => self.require_favored = true,
+            "--explain-lowering" => self.explain_lowering = true,
             _ => match task::owned(flag) {
                 Some(owned) if owned.value.is_empty() => {
                     self.given.insert(owned.name, String::new());

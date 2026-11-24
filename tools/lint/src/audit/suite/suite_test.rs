@@ -83,7 +83,7 @@ fn clocks_fail() {
     let found = flagged("x/a/tests/t.rs", &clock("a"));
     assert_eq!(
         found,
-        ["`Instant` in a test file: time code in a bench or tools/calibrate"]
+        ["`Instant` in a test file: time code in a bench or tools/calibrate/"]
     );
     assert!(flagged("tools/calibrate/tests/t.rs", &clock("cal")).is_empty());
     assert!(flagged("x/a/src/lib.rs", "use std::time::Instant;\n").is_empty());

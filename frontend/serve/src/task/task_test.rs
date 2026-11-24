@@ -1,11 +1,15 @@
 use super::{Pick, pick};
-use crate::start::Options;
+use crate::start::{Options, flags};
 
 /// Owned flags parse, and the most given flags pick.
 #[test]
 fn flags_pick_entries() {
     let mut o = Options::default();
     assert!(o.switch("--guided"));
+    assert!(!o.explain_lowering);
+    assert!(o.switch("--explain-lowering"));
+    assert!(o.explain_lowering);
+    assert!(flags().contains("--explain-lowering"));
     assert!(o.flag("--image-size", "big".into()).is_none());
     assert!(o.flag("--max-batch-rows", "0".into()).is_none());
     o.flag("--max-batch-rows", "64".into()).unwrap();

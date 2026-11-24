@@ -1,9 +1,8 @@
 use crate::ranks::Ranks;
-use std::net::TcpListener;
 use tessera_engine::decoder::{Swiglu, stepper};
 use tessera_engine::{Engine, Norm, Pick, Recipe, Row, Settings, Weight};
 use tessera_models::decoder;
-use tessera_testkit::{Noise, weights};
+use tessera_testkit::{Noise, tcp_bind, tcp_pair, weights};
 
 /// A faux-weight engine as `rank` of `peers`, or alone.
 fn engine(place: Option<(u32, &str)>) -> Engine {
@@ -28,10 +27,8 @@ fn engine(place: Option<(u32, &str)>) -> Engine {
 
 #[test]
 fn ranks_match() {
-    let free = || {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    };
+    tcp_pair().unwrap();
+    let free = || tcp_bind().unwrap().local_addr().unwrap().to_string();
     let peers = format!("{},{}", free(), free());
     let theirs = peers.clone();
     let follower = std::thread::spawn(move || {

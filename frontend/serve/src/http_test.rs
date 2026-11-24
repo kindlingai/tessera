@@ -2,20 +2,24 @@ use crate::http::{Limits, run};
 use crate::mocks::{MockGenerator, loaded};
 use crate::route;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::sync::Arc;
+use tessera_testkit::{TCP_TIMEOUT, tcp_bind, tcp_connect};
 
 /// A server over the mocks on a free loopback port.
 fn server() -> TcpStream {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_bind().unwrap();
     let address = listener.local_addr().unwrap();
     let slot = loaded(&Arc::new(MockGenerator::default()), false);
     let limits = Limits {
         max_body: 64,
+        head_timeout: TCP_TIMEOUT,
+        body_timeout: TCP_TIMEOUT,
+        write_timeout: TCP_TIMEOUT,
         ..Limits::default()
     };
     std::thread::spawn(move || run(listener, limits, move |r| route(&slot, r)));
-    TcpStream::connect(address).unwrap()
+    tcp_connect(address).unwrap()
 }
 
 /// Sends `request`, then reads until the server closes.

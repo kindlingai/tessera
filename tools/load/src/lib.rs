@@ -6,7 +6,7 @@ use http::Sample;
 use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -196,7 +196,10 @@ fn sweep(
 /// Checks health, warms up, then sweeps each client count.
 pub fn run(config: &Config) -> Result<Report, Failure> {
     config.validate()?;
-    let agent = ureq::Agent::new();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_write(Duration::from_secs(10))
+        .build();
     let url = config.url.trim_end_matches('/');
     let prompt = config
         .prompt

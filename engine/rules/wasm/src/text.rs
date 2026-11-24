@@ -16,7 +16,7 @@ pub struct Fixed {
     pub entry: &'static str,
     pub text: ByBackend<&'static str>,
     /// Platform backends with no text.
-    lacks: &'static [Backend],
+    pub(crate) lacks: &'static [Backend],
 }
 
 /// Each backend's text of `file`, or empty.
