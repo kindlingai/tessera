@@ -653,14 +653,7 @@ impl<'a> Tree<'a> {
 
     /// Whether `t` mutates kept rows or fixed state.
     pub fn appends(&self, t: T) -> bool {
-        matches!(
-            self.node(t).term,
-            Term::Op(
-                Op::Append(_)
-                    | Op::Conv(tessera_graph::Conv { state: Some(_), .. })
-                    | Op::Delta(tessera_graph::Delta { state: Some(_), .. })
-            )
-        )
+        matches!(&self.node(t).term, Term::Op(op) if op.keeps())
     }
 
     fn output(&self, t: T) -> bool {

@@ -677,9 +677,7 @@ pub struct Speculate<'a> {
 impl<'a> Speculate<'a> {
     /// Pairs a tapped target engine with its DFlash drafter.
     pub fn new(target: &'a mut Engine, drafter: &'a mut Drafter) -> Result<Self, Error> {
-        let Some(width) = target.tap_width() else {
-            return Err(Error::Taps);
-        };
+        let width = target.draft_taps()?;
         if width != drafter.tap_width() {
             return Err(Error::Rows);
         }

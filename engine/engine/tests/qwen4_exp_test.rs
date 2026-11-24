@@ -217,6 +217,25 @@ fn step_matches_forward() {
 }
 
 #[test]
+fn ple_slot_reuse() {
+    let (_, cfg) = make_ple_table();
+    let row = |token, position| Row {
+        slot: 0,
+        token,
+        position,
+    };
+    let fresh = [row(5, 0), row(7, 1)];
+    let want = PleStore::open(cfg.clone())
+        .unwrap()
+        .fill(&fresh, 2)
+        .unwrap();
+    let mut reused = PleStore::open(cfg).unwrap();
+    reused.fill(&[row(3, 0)], 1).unwrap();
+    let got = reused.fill(&fresh, 2).unwrap();
+    assert_eq!(got.floats().unwrap(), want.floats().unwrap());
+}
+
+#[test]
 fn rotated_trims() {
     let tiny = tiny_config();
     let c = Config {

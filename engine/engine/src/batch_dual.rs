@@ -69,9 +69,7 @@ impl<'a> BatchMtp<'a> {
         if depth == 0 {
             return Err(Error::Rows);
         }
-        let Some(width) = target.tap_width() else {
-            return Err(Error::Taps);
-        };
+        let width = target.draft_taps()?;
         let d_width = dflash.tap_width();
         let m_width = drafter.hidden();
         if width != d_width + m_width {
