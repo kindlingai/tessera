@@ -185,7 +185,9 @@ fn check_gemv(
     let form = tree.node(w).form;
     let kind = match form.name() {
         "bf16" if k.is_multiple_of(8) && n <= 64 && k >= 1024 => GemvKind::Bf16Narrow,
-        "bf16" if k.is_multiple_of(8) => GemvKind::Bf16,
+        "bf16" if k.is_multiple_of(256) => GemvKind::Bf16,
+        // A part trip leaves warp lanes idle: lanes is faster.
+        "bf16" if k.is_multiple_of(8) => return None,
         "bf16" => return Some(Err(format!("k={k} is not a multiple of 8 for bf16"))),
         "mxfp8" if mode == 0 && k.is_multiple_of(1024) => GemvKind::Mxfp8,
         "mxfp8" if mode != 0 => return None,
