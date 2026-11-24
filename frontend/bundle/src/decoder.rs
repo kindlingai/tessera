@@ -1,53 +1,64 @@
 //! Decoders over the shared decoder config, one line each.
 
-use crate::arch::{Arch, Ask, Built};
+use crate::arch::{Arch, Ask, Built, Spot, arch, find, known, unknown};
 use crate::parts::{Cut, Part};
 use crate::{Overrides, config, held, pull};
 use std::error::Error;
 use tessera_checkpoint::Shards;
-use tessera_engine::decoder::{Config, Moe, Swiglu};
+use tessera_engine::decoder::{Config, Moe, Swiglu, stepper, taps};
 use tessera_engine::{Graph, Norm};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-fn graph(arch: &Arch, c: &Config) -> Graph {
-    let family = arch.family.as_ref().expect("a decoder has a family");
-    (family.step)(c)
+/// Graphs over the shared decoder config.
+pub(crate) struct Family {
+    name: &'static str,
+    pub step: fn(&Config) -> Graph,
+    pub taps: fn(&Config, &[u64]) -> Graph,
+}
+
+/// The decoder family registered as `name`.
+pub(crate) fn family(name: &str) -> Result<&'static Family> {
+    let arch = find(name).ok_or_else(|| unknown(name))?;
+    FAMILIES
+        .iter()
+        .find(|f| f.name == arch.name)
+        .ok_or_else(|| format!("{name} is not a decoder. Known: {}", known()).into())
 }
 
 /// The step graph and held weights `ask` names.
-pub(crate) fn step(arch: &Arch, ask: &Ask) -> Result<Built> {
+fn step(arch: &Arch, ask: &Ask) -> Result<Built> {
     let (_, mut c) = config(ask.dir, ask.sizes, ask.overrides)?;
     c.stack.steps = ask.steps;
     c.stack.taps = ask.taps.to_vec();
-    held(ask, graph(arch, &c), c.stack.layers, &[])
+    let graph = (family(arch.name)?.step)(&c);
+    held(ask, graph, c.stack.layers, &[])
 }
 
 /// A part's step graph, its weights from shards.
-pub(crate) fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
+fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
     let (_, c) = config(&cut.dir, cut.sized(256), &Overrides::default())?;
     let (dir, layers) = (cut.dir.clone(), c.stack.layers);
-    Ok(Part::new(graph(arch, &c), move |g| {
+    Ok(Part::new((family(arch.name)?.step)(&c), move |g| {
         pull(g, &Shards::open(&dir)?, layers, &[])
     }))
 }
 
-/// Registers a decoder by `model_type`, head norm and MLP.
-macro_rules! decoder {
-    ($name:literal, $norm:ty, $mlp:ty) => {
-        $crate::arch::arch!(
-            $name,
-            [$crate::arch::Spot::Type($name)],
-            step: $crate::decoder::step,
-            part: $crate::decoder::part,
-            family: $crate::arch::Family {
-                step: tessera_engine::decoder::stepper::<$norm, $mlp>,
-                taps: tessera_engine::decoder::taps::<$norm, $mlp>,
-            },
-        );
+/// Registers decoders by `model_type`, head norm and MLP.
+macro_rules! decoders {
+    ($($name:literal: $norm:ty, $mlp:ty;)*) => {
+        $(arch!($name, [Spot::Type($name)], step: step, part: part);)*
+
+        const FAMILIES: &[Family] = &[$(Family {
+            name: $name,
+            step: stepper::<$norm, $mlp>,
+            taps: taps::<$norm, $mlp>,
+        }),*];
     };
 }
 
-decoder!("qwen3", Norm, Swiglu);
-decoder!("llama", (), Swiglu);
-decoder!("granitemoe", (), Moe);
+decoders! {
+    "qwen3": Norm, Swiglu;
+    "llama": (), Swiglu;
+    "granitemoe": (), Moe;
+}

@@ -1,31 +1,13 @@
-//! Texts to unit-length EmbeddingGemma 2 vectors.
+//! Texts to unit-length vectors.
 
 use crate::Error;
 use crate::api::{Embed, Embedded, Tokens};
 use crate::worker::Worker;
 use std::path::{Path, PathBuf};
 use tessera_bundle::Overrides;
-use tessera_bundle::encoder::encoder;
+use tessera_bundle::encoder::{self, Shape};
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_engine::{Model, Recipe, Settings, Tensor};
-
-/// The launch sizes an embedder plans for.
-#[derive(Clone, Copy, Debug)]
-pub struct Shape {
-    /// Tokens per text, `<bos>` and `<eos>` included.
-    pub max_tokens: usize,
-    /// The most texts in one launch.
-    pub seqs: usize,
-    /// The most padded rows in one launch.
-    pub rows: usize,
-}
-
-/// EmbeddingGemma 2's sizes.
-pub const EG2: Shape = Shape {
-    max_tokens: 1024,
-    seqs: 16,
-    rows: 4096,
-};
 
 pub struct Embedder {
     model: Model,
@@ -65,22 +47,11 @@ fn unit(mut v: Vec<f32>) -> Vec<f32> {
 }
 
 impl Embedder {
-    /// Loads the exlr8 release in `dir` where `settings` say.
+    /// Loads the model in `dir` where `settings` say.
     pub fn open(dir: &Path, settings: &Settings, config: &Overrides) -> Result<Self, Error> {
-        Self::shaped(EG2, dir, settings, config)
-    }
-
-    /// The same, planned for `shape`.
-    pub fn shaped(
-        shape: Shape,
-        dir: &Path,
-        settings: &Settings,
-        config: &Overrides,
-    ) -> Result<Self, Error> {
         // GPUs lack a fast kernel for listed keys.
         let padded = settings.gpu().is_none();
-        let at = [shape.seqs as u64, shape.max_tokens as u64];
-        let e = encoder(dir, at, padded, config)?;
+        let (shape, e) = encoder::open(dir, padded, config)?;
         let mut model = Model::open(e.graph, &Recipe::default(), settings)?;
         model.load(&e.weights)?;
         Ok(Self {
@@ -186,15 +157,10 @@ impl Embedder {
 pub type Threaded = Worker<Embedder>;
 
 impl Worker<Embedder> {
-    /// Opens the release in `dir` on a new thread.
-    pub fn open(
-        shape: Shape,
-        dir: PathBuf,
-        settings: Settings,
-        config: Overrides,
-    ) -> Result<Self, Error> {
+    /// Opens the model in `dir` on a new thread.
+    pub fn open(dir: PathBuf, settings: Settings, config: Overrides) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let embedder = Embedder::shaped(shape, &dir, &settings, &config)?;
+            let embedder = Embedder::open(&dir, &settings, &config)?;
             eprintln!("{}: embedder loaded", embedder.device());
             Ok(embedder)
         })
