@@ -206,6 +206,29 @@ jobs:
     with:
       light: ${{ github.event_name == 'pull_request' }}
 
+  arm64:
+    # The aarch64 host paths (SIMD, JIT, proxy) that the x86_64 jobs do
+    # not build, and the Metal crates checked for macOS, so the merge
+    # queue does not wait for a macOS runner. Their build scripts need
+    # no C toolchain, so no macOS SDK is needed.
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64
+      - run: cargo clippy --target aarch64-apple-darwin -p tessera-gpukit -p tessera-platform --all-targets
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run --workspace --profile ci
+
   similarity:
     # Near-copies of code (tools/simcheck), compared by embeddings,
     # and allow.toml pairs that allow nothing. The pull request ran it,
@@ -424,7 +447,7 @@ jobs:
     # The one check to require: every job above passed or was skipped
     # by `changes`, and no human step is pending.
     if: always()
-    needs: [changes, commits, lint, linux, features, grammar, macos, similarity, platforms, docker, style]
+    needs: [changes, commits, lint, linux, features, grammar, macos, arm64, similarity, platforms, docker, style]
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
