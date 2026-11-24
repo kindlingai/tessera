@@ -10,7 +10,7 @@ mod source;
 #[cfg(test)]
 mod source_test;
 
-pub use hub::{fetch as fetch_hf, fetch_as, safe_path};
+pub use hub::{check_hf, fetch as fetch_hf, fetch_as, safe_path, search_hf};
 pub use source::Source;
 
 use serde::Deserialize;
@@ -57,6 +57,8 @@ pub struct Weights {
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub name: String,
+    /// A short summary, for a reader that picks a model.
+    pub about: Option<String>,
     pub weights: Weights,
     /// Weight-name rules, relative to the recipe.
     pub names: Option<PathBuf>,

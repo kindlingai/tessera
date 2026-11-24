@@ -6,7 +6,12 @@ mod embed;
 mod image;
 #[cfg(test)]
 mod image_test;
+mod route;
+#[cfg(test)]
+mod route_test;
 mod tag;
+
+pub use route::run as route;
 
 use crate::source::{Origin, Source, Stop};
 use std::io::{Read, Write};
@@ -15,7 +20,7 @@ use std::time::Duration;
 use tessera_bundle::Message;
 use tessera_serve::start::{self, Options};
 use tessera_serve::{Model, Slot};
-use tessera_tasks::api::{Params, Step};
+use tessera_tasks::api::{Format, Params, Step};
 
 /// The task list, with the image pipelines' flags.
 pub fn list() -> String {
@@ -113,6 +118,11 @@ impl Talk {
 
     /// Prints the answer to `prompt` as it comes. Returns it.
     fn say(&self, prompt: &str) -> Result<String, Stop> {
+        self.answer(prompt, None, true)
+    }
+
+    /// The answer to `prompt` in `format`, printed if `echo`.
+    fn answer(&self, prompt: &str, format: Option<Format>, echo: bool) -> Result<String, Stop> {
         let model = self.model();
         let failed = |e: String| Stop::Failed(e);
         let generator = model.generator.as_ref();
@@ -129,7 +139,7 @@ impl Talk {
         let params = Params {
             max_tokens: self.max_tokens.map_or(room, |n| n.min(room)),
             stop: Vec::new(),
-            format: None,
+            format,
             raw: false,
         };
         let (sink, steps) = mpsc::channel();
@@ -144,8 +154,10 @@ impl Talk {
                 Step::Done { text, .. } => (text, true),
             };
             answer += &text;
-            let _ = write!(out, "{text}");
-            let _ = out.flush();
+            if echo {
+                let _ = write!(out, "{text}");
+                let _ = out.flush();
+            }
             if done {
                 return Ok(answer);
             }

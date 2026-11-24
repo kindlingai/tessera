@@ -62,6 +62,45 @@ pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, E
     snapshot(&pinned, cache, token, None)
 }
 
+/// Whether `owner/name[@revision]` exists with safetensors files.
+pub fn check_hf(spec: &str, token: Option<&str>) -> Result<(), Error> {
+    let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
+    lookup(repo, revision, token).map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct Found {
+    id: String,
+}
+
+/// The top owner's shortest repository that matches `words`.
+pub fn search_hf(words: &str, token: Option<&str>) -> Result<Option<String>, Error> {
+    let api = format!("https://{HUB}/api/models");
+    let mut request = ureq::get(&api).query("search", words);
+    for (key, value) in [("sort", "downloads"), ("direction", "-1"), ("limit", "20")] {
+        request = request.query(key, value);
+    }
+    request = request.query("filter", "safetensors");
+    if let Some(t) = token {
+        request = request.set("Authorization", &format!("Bearer {t}"));
+    }
+    let response = request.call().map_err(http(&api))?;
+    let found: Vec<Found> = response
+        .into_json()
+        .map_err(|e| Error::Http(api.clone(), e.to_string()))?;
+    let owner = |id: &str| id.split('/').next().unwrap_or_default().to_string();
+    let Some(lead) = found.first().map(|f| owner(&f.id)) else {
+        return Ok(None);
+    };
+    let mut best: Option<&str> = None;
+    for f in &found {
+        if owner(&f.id) == lead && best.is_none_or(|b| f.id.len() < b.len()) {
+            best = Some(&f.id);
+        }
+    }
+    Ok(best.map(String::from))
+}
+
 /// The repository's files at `revision`.
 fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error> {
     let api = format!("https://{HUB}/api/models/{repo}/revision/{revision}");

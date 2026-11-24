@@ -1,5 +1,6 @@
 # black-forest-labs/FLUX.2-klein-4B: a prompt to a picture.
 name = "flux2-klein"
+about = "FLUX.2 klein 4B: pictures from a text prompt"
 
 [weights]
 hf = "black-forest-labs/FLUX.2-klein-4B@e7b7dc27f91deacad38e78976d1f2b499d76a294"

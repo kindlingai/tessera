@@ -1,0 +1,9 @@
+# EmbeddingGemma 2 as exlr8 K4 trellis codes.
+name = "embeddinggemma-2"
+about = "EmbeddingGemma 2: one vector for each text, for search"
+
+[weights]
+hf = "kindlingai/embeddinggemma-2-exlr8-k4@89e1767badd6f15cb3b9cad8293e72019daa9d58"
+
+[serve]
+task = "embed"

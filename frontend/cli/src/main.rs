@@ -17,6 +17,9 @@ use tessera_serve::ranks::FLAGS as RANKS;
 use tessera_serve::start::flags;
 
 const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>
+  [--yes] <prompt>...
+                 answer one prompt. With no model flag, the default model may
+                 pick a command for it instead, and asks first on a terminal
   serve [flags]  load the model and answer OpenAI-shaped requests
   fetch          download the recipe and its weights, then print where they are
   task <task>    run one task on the model
@@ -38,7 +41,10 @@ fn run(given: &[String]) -> Result<(), Stop> {
         "fetch" => fetch::run(Source::open_or_default(origin)?, rest),
         "task" => task::run(origin, rest),
         "teleport" => teleport::run(rest),
-        _ => Err(Stop::Usage),
+        "-h" | "--help" | "help" => Err(Stop::Usage),
+        // Other words are a prompt for the default model.
+        _ if origin.is_none() => task::route(&args),
+        _ => task::run(origin, &[&["ask".to_string()], args.as_slice()].concat()),
     }
 }
 
@@ -47,8 +53,8 @@ fn main() -> ExitCode {
     match run(&given) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Stop::Usage) => {
-            let default = source::DEFAULT.0;
-            eprintln!("{USAGE}\nserve, fetch, ask and chat default to {default}");
+            let default = source::default_model();
+            eprintln!("{USAGE}\nwith neither flag, the model is {default}");
             eprintln!("serve flags: {} {RANKS}", flags());
             ExitCode::from(2)
         }
