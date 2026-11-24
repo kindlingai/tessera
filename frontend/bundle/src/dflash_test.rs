@@ -26,7 +26,7 @@ fn sl(name: impl Into<String>, shape: &[usize]) -> Slice {
     Slice {
         name: name.into(),
         shape: shape.to_vec(),
-        stored: Stored::Bf16,
+        stored: Stored::BF16,
     }
 }
 

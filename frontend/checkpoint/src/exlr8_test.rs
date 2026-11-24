@@ -126,7 +126,7 @@ fn glm_dense_formats() {
         found("model.layers.0.mx.weight").stored,
         Stored::Form(&MXFP8)
     );
-    assert_eq!(found("model.layers.0.blk.weight").stored, Stored::Bf16);
+    assert_eq!(found("model.layers.0.blk.weight").stored, Stored::BF16);
     assert_eq!(found("lm_head.weight").stored, Stored::F32);
     let turned = Stored::Form(&tessera_engine::trellis::TRELLIS_K2_ROT);
     assert_eq!(found("model.layers.0.tr.weight").stored, turned);
@@ -260,7 +260,10 @@ fn v4_release() {
         [1.0, 2.0]
     );
     assert_eq!(release.floats(extra).unwrap(), [3.0, 4.0]);
-    assert_eq!(release.bf16("model.text.layers.0.g.weight").unwrap(), bf16);
+    assert_eq!(
+        Offer::packed(&release, "model.text.layers.0.g.weight").unwrap(),
+        bf16
+    );
     let codes = trellis::TRELLIS_K3_PMCGX.unpack_all(&trellis::packed(128, 128, 1, &k3));
     let want = trellis::rotated(&codes, 128, 128, &[0.5; 128], &[0.5; 128]);
     assert_eq!(release.floats(q).unwrap(), want);

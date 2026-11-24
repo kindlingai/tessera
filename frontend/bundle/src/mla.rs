@@ -2,11 +2,11 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{Stream, Weights, is_exlr8, numbered, pins};
+use crate::{Stream, Weights, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::Offer;
+use tessera_checkpoint::{Offer, Slice};
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
 
@@ -241,6 +241,13 @@ pub fn release(
     open(dir, None, [seqs, context], Some(width), None, None)
 }
 
+/// Whether offered slices carry rotated MoE expert signs.
+pub(crate) fn has_rotated_experts(slices: &[Slice]) -> bool {
+    slices
+        .iter()
+        .any(|s| s.name.ends_with(".mlp.experts.signs_in"))
+}
+
 /// A `step` sets the graph's rules, mask and taps.
 fn open(
     dir: &Path,
@@ -259,22 +266,24 @@ fn open(
         }
     };
     let mut config = config(json, seqs, context)?;
-    let exlr8 = is_exlr8(dir);
-    let mut rules = rules(&config, exlr8);
+    let offer: Box<dyn Offer> = match width {
+        Some(w) if tessera_checkpoint::exlr8::is_release(dir) => {
+            Box::new(tessera_checkpoint::exlr8::open_manifest(dir, manifest)?.width(w))
+        }
+        _ => crate::offer(dir, manifest)?,
+    };
+    let rotated = has_rotated_experts(&offer.slices());
+    let mut rules = rules(&config, rotated);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
         config.stack.taps = taps.to_vec();
         rules.extend(user.iter().cloned());
     }
-    let graph = match (exlr8, step.is_some()) {
+    let graph = match (rotated, step.is_some()) {
         (true, true) => stepper::<RotatedMoe>(&config),
         (true, false) => program::<RotatedMoe>(&config),
         (false, true) => stepper::<Moe>(&config),
         (false, false) => program::<Moe>(&config),
-    };
-    let offer: Box<dyn Offer> = match (exlr8, width) {
-        (true, Some(w)) => Box::new(crate::release(dir, manifest)?.width(w)),
-        _ => crate::offer(dir, manifest)?,
     };
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {

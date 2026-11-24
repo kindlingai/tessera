@@ -3,7 +3,7 @@
 use crate::mla::{self, attn_rules, moe_rules};
 use crate::names::Rule;
 use crate::repack::{self, Repack, Streamed};
-use crate::{Bundle, Overrides, Weights, is_exlr8, load_tapped, offer};
+use crate::{Bundle, Overrides, Weights, load_tapped, offer};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Offer;
@@ -68,7 +68,6 @@ pub fn load(
     let target_cfg = mla::config(&json, slots, context)
         .map_err(|e| format!("--mtp requires an MLA checkpoint: {e}"))?;
     let layer = target_cfg.stack.layers;
-    let exlr8 = is_exlr8(dir);
     let offer = offer(dir, manifest)?;
     let slices = offer.slices();
     let eh = format!("model.layers.{layer}.eh_proj.weight");
@@ -78,12 +77,14 @@ pub fn load(
     let idx_prefix = format!("model.layers.{layer}.self_attn.indexer.");
     let indexed =
         target_cfg.index.is_some() && slices.iter().any(|s| s.name.starts_with(&idx_prefix));
+    let signs = format!("model.layers.{layer}.mlp.experts.signs_in");
+    let rotated = slices.iter().any(|s| s.name == signs);
     let mtp_cfg = mtp_model::config(&target_cfg, indexed);
-    let graph = match exlr8 {
+    let graph = match rotated {
         true => mtp_model::stepper::<RotatedMoe>(&mtp_cfg),
         false => mtp_model::stepper::<Moe>(&mtp_cfg),
     };
-    let mut all_rules = rules(layer, indexed, exlr8);
+    let mut all_rules = rules(layer, indexed, rotated);
     all_rules.extend_from_slice(user);
     let mtp_pins = mtp_pins(&graph, offer.as_ref(), &[&all_rules])?;
     let tap = [mtp_model::tap_layer(&target_cfg)];

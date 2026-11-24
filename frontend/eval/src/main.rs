@@ -8,8 +8,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use tessera_checkpoint::exlr8::Release;
-use tessera_checkpoint::{File, Gguf, Offer};
 use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 
 /// Anything that stops a run.
@@ -21,13 +19,7 @@ const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--req
 
 /// A checkpoint's slices, as a manifest for the model tests.
 fn manifest(model: &Path) -> Result<String, Failure> {
-    let offer: Box<dyn Offer> = if model.is_file() {
-        Box::new(Gguf::open(model)?)
-    } else if model.join("exlr8-vocab.safetensors").is_file() {
-        Box::new(Release::open(model))
-    } else {
-        Box::new(File::open(&model.join("model.safetensors"))?)
-    };
+    let offer = tessera_checkpoint::open(model, None)?;
     // One slice a line, so a manifest diffs by tensor.
     let mut lines = Vec::new();
     for s in offer.slices() {

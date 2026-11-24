@@ -4,7 +4,7 @@ use tessera_engine::storage::named;
 #[test]
 fn names_round_trip() {
     let form = Stored::Form(named("u32").unwrap());
-    for stored in [Stored::F32, Stored::Bf16, Stored::F16, Stored::Other] {
+    for stored in [Stored::F32, Stored::BF16, Stored::F16, Stored::Other] {
         assert_eq!(Stored::parse(stored.name()).unwrap(), stored);
     }
     assert_eq!(Stored::parse(form.name()).unwrap().name(), "u32");
@@ -13,7 +13,7 @@ fn names_round_trip() {
 #[test]
 fn names_keep_their_spelling() {
     let names = ["f32", "bf16", "f16", "other"];
-    let stored = [Stored::F32, Stored::Bf16, Stored::F16, Stored::Other];
+    let stored = [Stored::F32, Stored::BF16, Stored::F16, Stored::Other];
     for (name, stored) in names.iter().zip(stored) {
         assert_eq!(stored.name(), *name);
     }

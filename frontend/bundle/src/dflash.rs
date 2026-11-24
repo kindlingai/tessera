@@ -174,14 +174,6 @@ impl Offer for Overlay<'_> {
         self.source(name).packed(name)
     }
 
-    fn bf16(&self, name: &str) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
-        if let Some((parent, i, count)) = self.stacked.get(name) {
-            let all = self.primary.bf16(parent)?;
-            return Ok(take_part(&all, *i, *count));
-        }
-        self.source(name).bf16(name)
-    }
-
     fn packed_rows(
         &self,
         name: &str,

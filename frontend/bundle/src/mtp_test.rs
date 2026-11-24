@@ -36,10 +36,6 @@ impl Offer for MockOffer {
         };
         Ok(vec![0u8; f.bytes(s.elements())])
     }
-    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        let s = self.0.iter().find(|s| s.name == name).unwrap();
-        Ok(vec![0u8; s.elements() * 2])
-    }
 }
 
 fn mock_slices(
@@ -94,13 +90,13 @@ fn check_head_mxfp8() {
     let native = MockOffer(mock_slices(
         &g_small,
         &r,
-        Stored::Bf16,
+        Stored::BF16,
         Stored::Form(&MXFP8),
     ));
     let native_pins = mtp_pins(&g_small, &native, &[&r]).unwrap();
     assert_eq!(native_pins.form(&head_path).name(), "mxfp8");
     assert_eq!(native_pins.form(&embed_path).name(), "bf16");
-    let small_bf16 = MockOffer(mock_slices(&g_small, &r, Stored::Bf16, Stored::Bf16));
+    let small_bf16 = MockOffer(mock_slices(&g_small, &r, Stored::BF16, Stored::BF16));
     assert_eq!(
         mtp_pins(&g_small, &small_bf16, &[&r])
             .unwrap()
@@ -110,7 +106,7 @@ fn check_head_mxfp8() {
     );
     target.stack.hidden = 512;
     let g_wide = mtp_model::stepper::<RotatedMoe>(&mtp_model::config(&target, true));
-    let wide_bf16 = MockOffer(mock_slices(&g_wide, &r, Stored::Bf16, Stored::Bf16));
+    let wide_bf16 = MockOffer(mock_slices(&g_wide, &r, Stored::BF16, Stored::BF16));
     let wide_pins = mtp_pins(&g_wide, &wide_bf16, &[&r]).unwrap();
     assert_eq!(wide_pins.form(&head_path).name(), "mxfp8");
     assert_eq!(wide_pins.form(&embed_path).name(), "bf16");
@@ -165,10 +161,12 @@ fn mtp_names_resolve() {
     ] {
         assert!(rot_slices.iter().any(|s| s.name == expected), "{expected}");
     }
+    assert!(crate::mla::has_rotated_experts(&rot_slices));
     let std_cfg = mtp_model::config(&target, false);
     let std_g = mtp_model::stepper::<Moe>(&std_cfg);
     let std_rules = rules(layer, false, false);
     let std_slices = mock_slices(&std_g, &std_rules, Stored::F32, Stored::F32);
+    assert!(!crate::mla::has_rotated_experts(&std_slices));
     assert_eq!(
         resolve(&std_g, &std_slices, &[&std_rules]).unwrap().len(),
         std_g.weights.len()
