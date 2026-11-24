@@ -443,7 +443,7 @@ fn narrow_kept_matches() {
     for (form, tol) in forms {
         let pins = Pins::default().activations(BF16_FORM).kept(form);
         for &layout in &layouts {
-            for favored in ["attend", "flash"] {
+            for favored in ["attend", "flash", "listed_fused", "listed"] {
                 for settings in runs() {
                     let (mut store, mut runner): (Store, Option<Box<dyn Run>>) =
                         (Store::default(), None);
@@ -471,6 +471,11 @@ fn narrow_kept_matches() {
                         device.kept = layout;
                         let plan = lower(&g, 0, &sizes, &device).unwrap();
                         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+                        if favored == "listed_fused" {
+                            assert!(names.contains(&"listed_attend"), "{names:?}");
+                        } else if favored == "listed" {
+                            assert!(names.contains(&"listed_mix"), "{names:?}");
+                        }
                         assert!(!names.contains(&"widen"), "{names:?}");
                         assert!(!names.contains(&"narrow"), "{names:?}");
                         assert!(plan.kept.iter().all(|k| k.1.form == form));

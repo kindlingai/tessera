@@ -5,11 +5,15 @@ use tessera_engine::{
     Allowed, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row,
     Site, Steps,
 };
-use tessera_graph::{Dim, DimName::Rows, Graph, Op, Role};
+use tessera_graph::{
+    Dim,
+    DimName::{Context, Rows, Seqs},
+    Graph, Op, Role,
+};
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
 use tessera_lower::{
-    Device, Limits, Pins, Platform, Recipe, Settings, Weight, explain, kept, rules,
+    Device, Limits, Pins, Platform, Recipe, Settings, Weight, explain, kept, lower, rules,
 };
 use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
 use tessera_models::mla;
@@ -708,6 +712,71 @@ fn pinned_decoder_matches() {
                     "bf16 greedy decode on {:?}",
                     settings.backend
                 );
+            }
+        }
+    }
+}
+
+/// MLA with bf16/fp8 KV shrinks buffers and matches f32.
+#[test]
+fn mla_narrow_kept() {
+    use tessera_testkit::cosine_f32;
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.taps = vec![1];
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let w = weights(&g, &mut Noise(53));
+    let stored: Vec<Weight> = w.iter().cloned().map(Weight::Floats).collect();
+    let launches = [
+        vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0), row(0, 3, 1)],
+        vec![row(0, 4, 2), row(1, 3, 2)],
+        vec![row(1, 8, 3), row(0, 2, 3)],
+    ];
+    let sizes = [(Seqs, 4), (Rows, 4), (Context, 16)];
+    let kept_bytes = |plan: &tessera_lower::Plan| -> usize {
+        plan.kept
+            .iter()
+            .map(|(_, s)| plan.buffers[s.buffer as usize])
+            .sum()
+    };
+    let f32_plan = lower(&g, 0, &sizes, &Device::default()).unwrap();
+    let base_bytes = kept_bytes(&f32_plan);
+    let mut store = Store::default();
+    let want: Vec<Vec<f32>> = launches
+        .iter()
+        .map(|rows| {
+            let out = run_kept(&g, &w, &mut store, 0, &feeds(rows)).unwrap();
+            out[1].floats().unwrap().to_vec()
+        })
+        .collect();
+    let layouts: [&'static dyn kept::Layout; 2] = [kept::DENSE, &kept::PAGED16];
+    for (form, factor, min_cos) in [(BF16_FORM, 2usize, 0.999f32), (FP8_FORM, 4, 0.95)] {
+        let pins = Pins::default().kept(form);
+        for &layout in &layouts {
+            let mut dev = Device::default().pinned(pins.clone());
+            dev.kept = layout;
+            let plan = lower(&g, 0, &sizes, &dev).unwrap();
+            let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
+            assert!(names.contains(&"listed_attend"), "{names:?}");
+            assert!(!names.contains(&"widen"), "{names:?}");
+            assert_eq!(kept_bytes(&plan) * factor, base_bytes);
+            let recipe = Recipe {
+                pins: pins.clone(),
+                kept: layout,
+                ..Recipe::default()
+            };
+            for settings in runs() {
+                let mut engine = Engine::open(g.clone(), 16, &recipe, &settings).unwrap();
+                engine.load(&stored).unwrap();
+                for (step_idx, (rows, ref_logits)) in launches.iter().zip(&want).enumerate() {
+                    let (logits, _) = engine.step_logits(rows).unwrap();
+                    let cos = cosine_f32(&logits, ref_logits);
+                    assert!(
+                        cos > min_cos,
+                        "{} {layout:?} step {step_idx} on {:?}: cos {cos}",
+                        form.name(),
+                        settings.backend
+                    );
+                }
             }
         }
     }

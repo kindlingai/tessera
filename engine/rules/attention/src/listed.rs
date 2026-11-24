@@ -3,6 +3,7 @@
 use tessera_codegen::kept::{self, Dense, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
+use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::sites::Attend;
 use tessera_lower::{
     Arg, Attn, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
@@ -29,13 +30,13 @@ const MAX_QUADS: u32 = (MAX_SLOTS / WIDE as usize) as u32;
 /// Fused split-K attention: one group per query and head.
 #[kernel]
 fn listed_attend(
-    q: Buf<F32>,
-    k: Buf<F32>,
-    v: Buf<F32>,
+    #[form(q_form)] q: Buf<Dyn>,
+    #[form(k_form)] k: Buf<Dyn>,
+    #[form(v_form)] v: Buf<Dyn>,
     ids: Buf<U32>,
     slots: Buf<U32>,
     positions: Buf<U32>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     scale: f32,
     lists: u32,
     queries: u32,
@@ -48,6 +49,10 @@ fn listed_attend(
     before: u32,
     after: u32,
     #[build] width: u32,
+    #[build] q_form: &'static dyn Stored,
+    #[build] k_form: &'static dyn Stored,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     let list = gid() / THREADS;
     if list >= lists {
@@ -201,8 +206,8 @@ fn listed_attend(
 /// One thread per pick: its scaled score, or -inf.
 #[kernel]
 fn listed_scores(
-    q: Buf<F32>,
-    k: Buf<F32>,
+    #[form(q_form)] q: Buf<Dyn>,
+    #[form(k_form)] k: Buf<Dyn>,
     ids: Buf<U32>,
     slots: Buf<U32>,
     positions: Buf<U32>,
@@ -219,6 +224,8 @@ fn listed_scores(
     from_list: u32,
     before: u32,
     after: u32,
+    #[build] q_form: &'static dyn Stored,
+    #[build] k_form: &'static dyn Stored,
 ) {
     if gid() >= len {
         return;
@@ -253,7 +260,11 @@ fn listed_scores(
         let kv_head = head / (heads / kv_heads);
         let k_at = (kept_row(slot, j) * kv_heads + kv_head) as u64 * width as u64;
         let q_at = (row * heads + head) as u64 * width as u64;
-        score = q.dot(q_at, k, k_at, width) * scale;
+        let mut dot = 0.0f32;
+        for d in 0..width {
+            dot += q[q_at + d as u64] * k[k_at + d as u64];
+        }
+        score = dot * scale;
     }
     out[gid() as u64] = score;
 }
@@ -292,10 +303,10 @@ fn listed_stats(scores: Buf<F32>, mut out: BufMut<F32>, len: u32, picks: u32) {
 fn listed_mix(
     scores: Buf<F32>,
     stats: Buf<F32>,
-    v: Buf<F32>,
+    #[form(v_form)] v: Buf<Dyn>,
     ids: Buf<U32>,
     slots: Buf<U32>,
-    mut out: BufMut<F32>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
     len: u32,
     queries: u32,
     keys: u32,
@@ -304,6 +315,8 @@ fn listed_mix(
     width: u32,
     picks: u32,
     flags: u32,
+    #[build] v_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
 ) {
     if gid() >= len {
         return;
@@ -365,9 +378,26 @@ pub(crate) struct Sizes {
     pub scale: f32,
     /// Keys a query sees before and after its position.
     pub window: (usize, usize),
+    pub q_form: &'static dyn Stored,
+    pub k_form: &'static dyn Stored,
+    pub v_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
 }
 
 impl Sizes {
+    /// Suffix for narrow forms, empty when all are f32.
+    fn form_suffix(forms: &[&'static dyn Stored]) -> String {
+        if forms.iter().all(|f| !f.narrow()) {
+            return String::new();
+        }
+        let mut out = String::new();
+        for f in forms {
+            out.push('_');
+            out.push_str(f.name());
+        }
+        out
+    }
+
     /// One score per row, head and pick.
     fn scores(&self) -> usize {
         self.lists() * self.picks
@@ -462,22 +492,41 @@ impl Sizes {
 /// Fused split-K attention over listed or ragged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    listed_attend(self.0.width as u32),
     name = "listed_attend",
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.scores() * self.0.width,
     needs = attend_needs(self),
     order = Order::PerConfig,
+    accepts = attend_accepts,
+    emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
 )]
 pub(crate) struct ListedAttend(pub Sizes);
 
+fn attend_accepts(k: &ListedAttend, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 => form.name() == k.0.q_form.name(),
+        1 => form.name() == k.0.k_form.name(),
+        2 => form.name() == k.0.v_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn attend_emits(k: &ListedAttend, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
 fn attend_source(k: &ListedAttend) -> Source {
-    let body = kept::attach(listed_attend_ir(k.0.width as u32), k.0.kept);
+    let s = &k.0;
+    let body = kept::attach(
+        listed_attend_ir(s.width as u32, s.q_form, s.k_form, s.v_form, s.out_form),
+        s.kept,
+    );
+    let suffix = Sizes::form_suffix(&[s.q_form, s.k_form, s.v_form, s.out_form]);
     Source::named(
         body,
-        format!("plan_listed_attend_{}_{}", k.0.kept.name(), k.0.width),
+        format!("plan_listed_attend_{}_{}{suffix}", s.kept.name(), s.width),
     )
 }
 
@@ -523,14 +572,28 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
     name = "listed_scores",
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.scores() * self.0.width,
+    accepts = scores_accepts,
     source = scores_source,
     launches = scores_launches,
 )]
 pub(crate) struct ListedScores(pub Sizes);
 
+fn scores_accepts(k: &ListedScores, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 => form.name() == k.0.q_form.name(),
+        1 => form.name() == k.0.k_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
 fn scores_source(k: &ListedScores) -> Source {
-    let body = kept::attach(listed_scores_ir(), k.0.kept);
-    Source::named(body, format!("plan_listed_scores_{}", k.0.kept.name()))
+    let s = &k.0;
+    let body = kept::attach(listed_scores_ir(s.q_form, s.k_form), s.kept);
+    let suffix = Sizes::form_suffix(&[s.q_form, s.k_form]);
+    Source::named(
+        body,
+        format!("plan_listed_scores_{}{suffix}", s.kept.name()),
+    )
 }
 
 fn scores_launches(k: &ListedScores, step: &Step) -> Vec<Launch> {
@@ -559,14 +622,29 @@ fn stats_launches(k: &ListedStats, step: &Step) -> Vec<Launch> {
     name = "listed_mix",
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.len * self.0.picks,
+    accepts = mix_accepts,
+    emits = mix_emits,
     source = mix_source,
     launches = mix_launches,
 )]
 pub(crate) struct ListedMix(pub Sizes);
 
+fn mix_accepts(k: &ListedMix, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        2 => form.name() == k.0.v_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn mix_emits(k: &ListedMix, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
 fn mix_source(k: &ListedMix) -> Source {
-    let body = kept::attach(listed_mix_ir(), k.0.kept);
-    Source::named(body, format!("plan_listed_mix_{}", k.0.kept.name()))
+    let s = &k.0;
+    let body = kept::attach(listed_mix_ir(s.v_form, s.out_form), s.kept);
+    let suffix = Sizes::form_suffix(&[s.v_form, s.out_form]);
+    Source::named(body, format!("plan_listed_mix_{}{suffix}", s.kept.name()))
 }
 
 fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
@@ -622,6 +700,10 @@ fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
         from_list: a.picked,
         scale: a.scale,
         window: a.mask.window(most),
+        q_form: plain(tree.node(q).form),
+        k_form: plain(tree.node(k).form),
+        v_form: plain(tree.node(v).form),
+        out_form: writable(node.form),
     };
     Some((sizes, [q, k, v, ids, slots, positions]))
 }
@@ -645,6 +727,10 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> (Sizes, [T; 6]) {
         from_list: true,
         scale: site.scale,
         window: a.mask.window(keys),
+        q_form: site.q_form,
+        k_form: a.k_form,
+        v_form: a.v_form,
+        out_form: a.out_form,
     };
     // Slots and positions go unread, so the list stands in.
     (sizes, [site.q, site.k, site.v, ids, ids, ids])
