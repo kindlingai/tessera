@@ -298,7 +298,10 @@ pub fn golden(spec: &Spec) {
     let Some(golden) = &spec.golden else { return };
     let g = (spec.release)();
     let Some(reference) = golden.reference(spec.name, &g) else {
-        return eprintln!("{}: no reference here; skipped", spec.name);
+        let name = spec.name;
+        return eprintln!(
+            "{name}: no reference here, skipped. tools/parity/reference.py writes logits references"
+        );
     };
     // Slow on a real model: the plans check every case.
     let case = &reference.cases[0];
