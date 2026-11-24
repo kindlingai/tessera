@@ -151,6 +151,9 @@ fn segment_ok(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// Words a task id may begin with. A closed list.
+const LEADS: &[&str] = &["add"];
+
 /// Kebab-case, within the lint.toml limits.
 fn id_fault(id: &str) -> Option<String> {
     let parts: Vec<&str> = id.split('-').collect();
@@ -158,6 +161,9 @@ fn id_fault(id: &str) -> Option<String> {
     let word = |p: &&str| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase());
     if !parts.iter().all(word) {
         return Some(format!("id `{id}` is not kebab-case words"));
+    }
+    if !LEADS.contains(&parts[0]) {
+        return Some(format!("id `{id}` does not begin with one of {LEADS:?}"));
     }
     if parts.len() > segments || id.len() > chars {
         return Some(format!(
@@ -264,6 +270,9 @@ impl Map {
                 self.line,
                 format!("1 to {max} steps, at most {max} invariants"),
             ));
+        }
+        if steps.iter().all(|s| s.get_ref().verb == Verb::Run) {
+            out.push(self.fault(self.line, "needs a step other than `run`".into()));
         }
         for (n, step) in steps.iter().enumerate() {
             let line = line_of(text, step.span().start);
