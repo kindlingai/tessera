@@ -14,7 +14,6 @@
     16
   ],
   "pdl": true,
-  "pinned": true,
   "check": [
     "sm_100",
     "sm_120"
