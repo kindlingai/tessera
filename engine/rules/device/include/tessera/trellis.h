@@ -241,9 +241,15 @@ TESSERA_FN u32 decode_pair(u32 a, u32 b) {
         asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
             : "=r"(y)
             : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-        asm("add.rn.f16x2 %0, %1, %2;"
+        // Pair sums use FMA, not ALU: this decode is ALU-bound.
+        asm("{.reg .b16 xl, xh, yl, yh; .reg .b32 xhh, yll, yhh;\n"
+            " mov.b32 {xl, xh}, %1; mov.b32 {yl, yh}, %2;\n"
+            " mov.b32 xhh, {xh, xh}; mov.b32 yll, {yl, yl}; mov.b32 yhh, {yh, yh};\n"
+            " fma.rn.f16x2 %0, xhh, %3, %1;\n"
+            " fma.rn.f16x2 %0, yll, %4, %0;\n"
+            " fma.rn.f16x2 %0, yhh, %4, %0;}"
             : "=r"(sum)
-            : "r"(prmt(x, y, 0x5410u)), "r"(prmt(x, y, 0x7632u)));
+            : "r"(x), "r"(y), "r"(0xBC003C00u), "r"(0x3C000000u));
         return narrow_f16x2_e4m3(sum);
     }
 }
