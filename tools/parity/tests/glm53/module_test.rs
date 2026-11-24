@@ -19,13 +19,7 @@ use tessera_testkit::{Noise, cosine_f32, max_abs_diff, weights};
 use tessera_trace::{DType, Dim, EntryKind, Graph, Model, Port, Role, TensorType, Weights};
 
 const NAME: &str = "glm53_moe";
-const KERNELS: [&str; 5] = [
-    "glm53_route",
-    "glm53_plan",
-    "glm53_fc1",
-    "glm53_fc2",
-    "glm53_finish",
-];
+const KERNELS: [&str; 3] = ["glm53_route", "glm53_fc1", "glm53_fc2"];
 const TEXT: &str = include_str!("../../../../examples/recipes/glm53-moe/model/src/moe.cu");
 const ROWS: usize = 3;
 
@@ -160,15 +154,17 @@ fn takes_routed(book: &str, id: u32) {
     // The dense layer keeps the linked rules.
     let routed = (c.stack.layers - c.dense_layers) as usize;
     assert_eq!(kernels, KERNELS.repeat(routed));
-    for step in taken.iter().filter(|s| s.kernel.name() == KERNELS[2]) {
+    for step in &taken {
         let launches = step.launches();
         let [launch] = launches.as_slice() else {
             panic!("one launch a step");
         };
-        assert_eq!(launch.args.len(), parameters(KERNELS[2]));
-        let counts: Vec<u32> = launch.args.iter().filter_map(|a| a.u32()).collect();
-        let sizes = [ROWS as u32, 128, 128, 2, 4, 4, id, id, 0, 128, 1];
-        assert_eq!(counts, sizes);
+        assert_eq!(launch.args.len(), parameters(step.kernel.name()));
+        if step.kernel.name() == KERNELS[1] {
+            let counts: Vec<u32> = launch.args.iter().filter_map(|a| a.u32()).collect();
+            let sizes = [ROWS as u32, 128, 128, 2, 4, 4, id, id, 0, 128, 1];
+            assert_eq!(counts, sizes);
+        }
     }
 }
 
@@ -193,13 +189,13 @@ fn module_takes_shards() {
         let sizes = [(Seqs, 2), (Rows, ROWS as u64), (Context, 16)];
         for rank in 0..2u32 {
             let plan = lower(&sharded, 0, &sizes, &device.clone().as_rank(rank)).unwrap();
-            let planned = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[1]);
+            let planned = plan.steps.iter().filter(|s| s.kernel.name() == KERNELS[0]);
             let mut taken = 0;
             for step in planned {
                 let launches = step.launches();
                 let counts: Vec<u32> = launches[0].args.iter().filter_map(|a| a.u32()).collect();
                 let want = if tp { [0, 32] } else { [16 * rank, 16] };
-                assert_eq!(counts[3..], want);
+                assert_eq!(counts[5..], want);
                 taken += 1;
             }
             assert_eq!(taken, routed);
@@ -237,14 +233,14 @@ fn module_reaches_engine() {
         (Picks, 1),
     ];
     let plan = lower(&trimmed, 0, &sizes, &device).unwrap();
-    let named = |s: &&tessera_lower::Step| s.kernel.name() == KERNELS[1];
+    let named = |s: &&tessera_lower::Step| s.kernel.name() == KERNELS[0];
     assert_eq!(plan.steps.iter().filter(named).count(), routed);
     // The host plans without it: the kernel is CUDA text.
     for settings in runs() {
         let engine = Engine::open(step.clone(), 16, &choices, &settings).unwrap();
         let wanted = (settings.gpu() == Some(Backend::Cuda)).then_some(&routed);
         assert_eq!(
-            engine.kernels().get(KERNELS[1]),
+            engine.kernels().get(KERNELS[0]),
             wanted,
             "{}",
             engine.device()
@@ -338,7 +334,7 @@ fn matches_interp(book: &str, router_bf16: bool, tp: bool) {
                 let p = lower(&g, 0, &[(Rows, rows as u64)], &dev).unwrap();
                 assert_eq!(
                     p.steps.iter().map(|s| s.rule).collect::<Vec<_>>(),
-                    [NAME; 5]
+                    [NAME; 3]
                 );
                 plans.push(p);
             }

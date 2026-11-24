@@ -84,21 +84,22 @@ fn offer_row_bounds() {
     for rows in [1, 8, 16, 32, 64] {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
-            assert_eq!(got.len(), 5);
-            assert_eq!(got[1].len, PLAN_WORDS);
-            let Shape::Grid { down, .. } = got[2].shape else {
+            assert_eq!(got.len(), 3);
+            assert_eq!(got[0].len, PLAN_WORDS + rows * experts);
+            let Shape::Grid { down, .. } = got[1].shape else {
                 panic!("fc1 must be grid");
             };
             assert!(down <= rows.div_ceil(8) + MAX_SLOTS);
         }
     }
+    assert!(offer(&site(0, 256, 512, 256)).is_none());
     assert!(offer(&site(65, 256, 512, 256)).is_none());
     assert!(offer(&site(65, 32, 512, 256)).is_none());
-    let Shape::Grid { down: d256, .. } = offer(&site(64, 256, 512, 256)).unwrap()[2].shape else {
+    let Shape::Grid { down: d256, .. } = offer(&site(64, 256, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
     assert_eq!(d256, 8 + 288);
-    let Shape::Grid { down: d32, .. } = offer(&site(64, 32, 512, 256)).unwrap()[2].shape else {
+    let Shape::Grid { down: d32, .. } = offer(&site(64, 32, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
     assert_eq!(d32, 8 + 44);
@@ -125,11 +126,11 @@ fn mixed_fc_widths() {
     inputs[11].form = "trellis_k3_mul1".into();
     let got = offer(&s).expect("must accept mixed fc1/fc2");
     assert!(matches!(
-        got[2].counts[4],
+        got[1].counts[4],
         tessera_guest::site::Count::Fixed(2)
     ));
     assert!(matches!(
-        got[3].counts[4],
+        got[2].counts[4],
         tessera_guest::site::Count::Fixed(3)
     ));
 }

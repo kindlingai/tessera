@@ -1,4 +1,4 @@
-// GLM-5.3 routed block: route, plan, fc1, fc2, finish.
+// GLM-5.3 routed block: route+plan, fc1, fc2+finish.
 #include <tessera/1/core>
 #include <tessera/1/trellis>
 
@@ -15,6 +15,7 @@ typedef const u8* bytes;
 #define MAX_ROWS 64
 #define MAX_SLOTS 512
 #define ROUTE_SCALE 2.5f
+#define PLAN_WORDS (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u)
 
 // Compact routing plan for one layer launch.
 struct Plan {
@@ -26,7 +27,11 @@ struct Plan {
   u32 tok_expert[MAX_ROWS][PICKS];
   float tok_w[MAX_ROWS][PICKS];
 };
-static_assert(sizeof(Plan) == (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u) * 4u, "Plan size");
+static_assert(sizeof(Plan) == PLAN_WORDS * 4u, "Plan size");
+
+// Last-CTA completion counters, reset to zero by winner.
+static __device__ u32 route_done;
+static __device__ u32 fc2_done[MAX_ROWS][8];
 
 static __device__ inline u16 f32_to_f16(float v) {
   u16 out;
@@ -48,7 +53,7 @@ static __device__ inline Mat matrix(bytes p) {
 
 // One warp's picks and gates. Ties take lower expert.
 static __device__ void route(
-    const float* score, const float* bias, u32 experts, u32 picks, u32* ids, float* gates) {
+    const float* score, const float* bias, u32 experts, u32 picks, u16* ids, float* gates) {
   u32 lane = threadIdx.x & 31u;
   u64 taken = 0ull;
   float sum = 0.0f;
@@ -56,7 +61,7 @@ static __device__ void route(
     u32 best = experts;
     float most = 0.0f;
     for (u32 i = 0u, e = lane; e < experts; i++, e += 32u) {
-      float v = score[e] + bias[e];
+      float v = prim::load_fresh(score + e) + bias[e];
       if (!((taken >> i) & 1ull) && (best == experts || v > most)) {
         best = e;
         most = v;
@@ -72,10 +77,10 @@ static __device__ void route(
       }
     }
     if ((best & 31u) == lane) taken |= 1ull << (best >> 5u);
-    ids[p] = best;
-    sum += score[best];
+    ids[p] = (u16)best;
+    sum += prim::load_fresh(score + best);
   }
-  for (u32 p = 0u; p < picks; p++) gates[p] = score[ids[p]] / sum * ROUTE_SCALE;
+  for (u32 p = 0u; p < picks; p++) gates[p] = prim::load_fresh(score + ids[p]) / sum * ROUTE_SCALE;
   __syncwarp();
 }
 
@@ -87,130 +92,47 @@ static __device__ inline float4 weights4(const void* router, u64 at, u32 bf16) {
       __uint_as_float(h.y << 16u), __uint_as_float(h.y & 0xFFFF0000u));
 }
 
-// Scores via sigmoid(x router). Two experts per CTA.
-extern "C" __global__ __launch_bounds__(256, 4) void glm53_route(const float* x, const void* router,
-    float* scores, u32 rows, u32 hidden, u32 experts, u32 bf16) {
-  __shared__ float wsum[2][8][8];
-  u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
-  u32 e0 = blockIdx.x * 2u;
-  if (e0 >= experts) return;
-  bool has1 = e0 + 1u < experts;
-  bool fast = bf16 && (hidden & 255u) == 0u && (((u64)router) & 15ull) == 0ull;
-  const u8* wr0 = (const u8*)router + (u64)e0 * hidden * 2ull;
-  const u8* wr1 = wr0 + (u64)hidden * 2ull;
-  for (u32 r0 = 0u; r0 < rows; r0 += 8u) {
-    u32 nr = min(rows - r0, 8u);
-    float s0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    float s1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    if (fast) {
-      u32 i0 = warp * 256u;
-      if (i0 < hidden) {
-        u32 na[4], nb[4];
-        u64 off0 = (u64)(i0 + (lane << 3u)) * 2ull;
-        trellis::ld_nc_v4(wr0 + off0, na);
-        if (has1) trellis::ld_nc_v4(wr1 + off0, nb);
-        for (; i0 < hidden; i0 += 2048u) {
-          u32 ha[4] = {na[0], na[1], na[2], na[3]};
-          u32 hb[4] = {nb[0], nb[1], nb[2], nb[3]};
-          if (i0 + 2048u < hidden) {
-            u64 noff = (u64)(i0 + 2048u + (lane << 3u)) * 2ull;
-            trellis::ld_nc_v4(wr0 + noff, na);
-            if (has1) trellis::ld_nc_v4(wr1 + noff, nb);
-          }
-          float a0 = __uint_as_float(ha[0] << 16u), a1 = __uint_as_float(ha[0] & 0xFFFF0000u);
-          float a2 = __uint_as_float(ha[1] << 16u), a3 = __uint_as_float(ha[1] & 0xFFFF0000u);
-          float a4 = __uint_as_float(ha[2] << 16u), a5 = __uint_as_float(ha[2] & 0xFFFF0000u);
-          float a6 = __uint_as_float(ha[3] << 16u), a7 = __uint_as_float(ha[3] & 0xFFFF0000u);
-          float b0 = __uint_as_float(hb[0] << 16u), b1 = __uint_as_float(hb[0] & 0xFFFF0000u);
-          float b2 = __uint_as_float(hb[1] << 16u), b3 = __uint_as_float(hb[1] & 0xFFFF0000u);
-          float b4 = __uint_as_float(hb[2] << 16u), b5 = __uint_as_float(hb[2] & 0xFFFF0000u);
-          float b6 = __uint_as_float(hb[3] << 16u), b7 = __uint_as_float(hb[3] & 0xFFFF0000u);
-          u32 col = i0 + (lane << 3u);
-#pragma unroll
-          for (u32 r = 0u; r < 8u; r++) {
-            if (r >= nr) break;
-            const float* xp = x + (u64)(r0 + r) * hidden + col;
-            float4 x0 = *(const float4*)xp;
-            float4 x1 = *(const float4*)(xp + 4u);
-            s0[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, s0[r]))));
-            s0[r] = fmaf(a4, x1.x, fmaf(a5, x1.y, fmaf(a6, x1.z, fmaf(a7, x1.w, s0[r]))));
-            if (has1) {
-              s1[r] = fmaf(b0, x0.x, fmaf(b1, x0.y, fmaf(b2, x0.z, fmaf(b3, x0.w, s1[r]))));
-              s1[r] = fmaf(b4, x1.x, fmaf(b5, x1.y, fmaf(b6, x1.z, fmaf(b7, x1.w, s1[r]))));
-            }
-          }
-        }
-      }
-    } else {
-      for (u32 i = tid * 4u; i < hidden; i += 1024u) {
-        float4 a0 = weights4(router, (u64)e0 * hidden + i, bf16);
-        float4 a1 = has1 ? weights4(router, (u64)(e0 + 1u) * hidden + i, bf16)
-                         : make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-        for (u32 r = 0u; r < 8u; r++) {
-          if (r >= nr) break;
-          float4 b = *(const float4*)(x + (u64)(r0 + r) * hidden + i);
-          s0[r] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
-          if (has1) s1[r] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
-        }
-      }
-    }
-#pragma unroll
-    for (u32 r = 0u; r < 8u; r++) {
-      if (r >= nr) break;
-      for (u32 off = 16u; off > 0u; off >>= 1u) {
-        s0[r] += __shfl_xor_sync(0xFFFFFFFFu, s0[r], off);
-        if (has1) s1[r] += __shfl_xor_sync(0xFFFFFFFFu, s1[r], off);
-      }
-      if (lane == 0u) {
-        wsum[0][r][warp] = s0[r];
-        if (has1) wsum[1][r][warp] = s1[r];
-      }
-    }
-    prim::block_sync();
-    if (warp < 2u && (warp == 0u || has1) && lane < nr) {
-      float tot = wsum[warp][lane][0] + wsum[warp][lane][1] + wsum[warp][lane][2] +
-                  wsum[warp][lane][3] + wsum[warp][lane][4] + wsum[warp][lane][5] +
-                  wsum[warp][lane][6] + wsum[warp][lane][7];
-      scores[(u64)(r0 + lane) * experts + e0 + warp] = 1.0f / (1.0f + __expf(-tot));
-    }
-    if (r0 + 8u < rows) prim::block_sync();
-  }
-}
+struct PlanSmem {
+  u16 ids[MAX_ROWS][PICKS];
+  float gates[MAX_ROWS][PICKS];
+  u32 emask[2][2048];
+  u16 slot_of[2048];
+  u32 wsum[8];
+  u32 total;
+};
+
+union alignas(16) RouteSmem {
+  float wsum[2][8][8];
+  PlanSmem plan;
+};
 
 // Builds compact deduplicated expert slots across all rows.
-extern "C" __global__ __launch_bounds__(256) void glm53_plan(
-    const float* scores, const float* bias, float* plan_out,
+static __device__ __noinline__ void route_plan(
+    const float* scores, const float* bias, float* plan_out, PlanSmem& sm,
     u32 rows, u32 experts, u32 picks, u32 first, u32 count) {
   Plan* plan = reinterpret_cast<Plan*>(plan_out);
-  __shared__ u32 ids[MAX_ROWS][PICKS];
-  __shared__ float gates[MAX_ROWS][PICKS];
-  __shared__ u32 emask[2][2048];
-  __shared__ u32 slot_of[2048];
-  __shared__ u32 wsum[8];
-  __shared__ u32 total;
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
   for (u32 r = warp; r < rows; r += 8u) {
-    route(scores + (u64)r * experts, bias, experts, picks, ids[r], gates[r]);
+    route(scores + (u64)r * experts, bias, experts, picks, sm.ids[r], sm.gates[r]);
   }
   for (u32 i = tid; i < count; i += 256u) {
-    emask[0][i] = 0u;
-    emask[1][i] = 0u;
+    sm.emask[0][i] = 0u;
+    sm.emask[1][i] = 0u;
   }
-  if (tid == 0u) total = 0u;
+  if (tid == 0u) sm.total = 0u;
   prim::block_sync();
   for (u32 i = tid; i < rows * picks; i += 256u) {
     u32 r = i / picks, p = i % picks;
-    u32 e = ids[r][p];
+    u32 e = sm.ids[r][p];
     bool mine = e >= first && e < first + count;
     plan->tok_expert[r][p] = mine ? e : 0xFFFFFFFFu;
-    plan->tok_w[r][p] = gates[r][p];
-    if (mine) atomicOr(&emask[r >> 5u][e - first], 1u << (r & 31u));
+    plan->tok_w[r][p] = sm.gates[r][p];
+    if (mine) atomicOr(&sm.emask[r >> 5u][e - first], 1u << (r & 31u));
   }
   prim::block_sync();
   for (u32 base = 0u; base < count; base += 256u) {
     u32 le = base + tid;
-    u64 m = le < count ? ((u64)emask[0][le] | ((u64)emask[1][le] << 32u)) : 0ull;
+    u64 m = le < count ? ((u64)sm.emask[0][le] | ((u64)sm.emask[1][le] << 32u)) : 0ull;
     u32 cnt = __popcll(m);
     u32 ns = (cnt + 7u) >> 3u;
     u32 incl = ns;
@@ -219,24 +141,24 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
       u32 v = __shfl_up_sync(0xFFFFFFFFu, incl, d);
       if (lane >= d) incl += v;
     }
-    if (lane == 31u) wsum[warp] = incl;
+    if (lane == 31u) sm.wsum[warp] = incl;
     prim::block_sync();
-    u32 chunk_base = total;
+    u32 chunk_base = sm.total;
     if (warp == 0u) {
-      u32 wv = lane < 8u ? wsum[lane] : 0u;
+      u32 wv = lane < 8u ? sm.wsum[lane] : 0u;
       u32 wi = wv;
 #pragma unroll
       for (u32 d = 1u; d < 8u; d <<= 1u) {
         u32 v = __shfl_up_sync(0xFFFFFFFFu, wi, d);
         if (lane >= d) wi += v;
       }
-      if (lane < 8u) wsum[lane] = wi - wv;
-      if (lane == 7u) total = chunk_base + wi;
+      if (lane < 8u) sm.wsum[lane] = wi - wv;
+      if (lane == 7u) sm.total = chunk_base + wi;
     }
     prim::block_sync();
     if (ns > 0u) {
-      u32 s0 = chunk_base + wsum[warp] + (incl - ns);
-      slot_of[le] = s0;
+      u32 s0 = chunk_base + sm.wsum[warp] + (incl - ns);
+      sm.slot_of[le] = (u16)s0;
       u64 bits = m;
       for (u32 sub = 0u; sub < ns; sub++) {
         u32 s = s0 + sub;
@@ -257,14 +179,119 @@ extern "C" __global__ __launch_bounds__(256) void glm53_plan(
   }
   for (u32 i = tid; i < rows * picks; i += 256u) {
     u32 r = i / picks, p = i % picks;
-    u32 e = ids[r][p];
+    u32 e = sm.ids[r][p];
     if (e < first || e >= first + count) continue;
     u32 le = e - first;
-    u64 em = (u64)emask[0][le] | ((u64)emask[1][le] << 32u);
+    u64 em = (u64)sm.emask[0][le] | ((u64)sm.emask[1][le] << 32u);
     u32 rank = __popcll(em & ((1ull << r) - 1ull));
-    plan->slot_pick[slot_of[le] + (rank >> 3u)][rank & 7u] = (u8)p;
+    plan->slot_pick[(u32)sm.slot_of[le] + (rank >> 3u)][rank & 7u] = (u8)p;
   }
-  if (tid == 0u) plan->n_slots = total;
+  if (tid == 0u) plan->n_slots = sm.total;
+}
+
+// Scores via sigmoid(x router), then last CTA builds plan.
+extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
+    const float* x, const void* router, const float* bias, float* plan_out,
+    u32 rows, u32 hidden, u32 experts, u32 bf16, u32 picks, u32 first, u32 count) {
+  __shared__ RouteSmem sm;
+  __shared__ u32 is_last;
+  float* scores = plan_out + PLAN_WORDS;
+  u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
+  u32 e0 = blockIdx.x * 2u;
+  if (e0 < experts) {
+    bool has1 = e0 + 1u < experts;
+    bool fast = bf16 && (hidden & 255u) == 0u && (((u64)router) & 15ull) == 0ull;
+    const u8* wr0 = (const u8*)router + (u64)e0 * hidden * 2ull;
+    const u8* wr1 = wr0 + (u64)hidden * 2ull;
+    for (u32 r0 = 0u; r0 < rows; r0 += 8u) {
+      u32 nr = min(rows - r0, 8u);
+      float s0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      float s1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      if (fast) {
+        u32 i0 = warp * 256u;
+        if (i0 < hidden) {
+          u32 na[4], nb[4];
+          u64 off0 = (u64)(i0 + (lane << 3u)) * 2ull;
+          trellis::ld_nc_v4(wr0 + off0, na);
+          if (has1) trellis::ld_nc_v4(wr1 + off0, nb);
+          for (; i0 < hidden; i0 += 2048u) {
+            u32 ha[4] = {na[0], na[1], na[2], na[3]};
+            u32 hb[4] = {nb[0], nb[1], nb[2], nb[3]};
+            if (i0 + 2048u < hidden) {
+              u64 noff = (u64)(i0 + 2048u + (lane << 3u)) * 2ull;
+              trellis::ld_nc_v4(wr0 + noff, na);
+              if (has1) trellis::ld_nc_v4(wr1 + noff, nb);
+            }
+            float a0 = __uint_as_float(ha[0] << 16u), a1 = __uint_as_float(ha[0] & 0xFFFF0000u);
+            float a2 = __uint_as_float(ha[1] << 16u), a3 = __uint_as_float(ha[1] & 0xFFFF0000u);
+            float a4 = __uint_as_float(ha[2] << 16u), a5 = __uint_as_float(ha[2] & 0xFFFF0000u);
+            float a6 = __uint_as_float(ha[3] << 16u), a7 = __uint_as_float(ha[3] & 0xFFFF0000u);
+            float b0 = __uint_as_float(hb[0] << 16u), b1 = __uint_as_float(hb[0] & 0xFFFF0000u);
+            float b2 = __uint_as_float(hb[1] << 16u), b3 = __uint_as_float(hb[1] & 0xFFFF0000u);
+            float b4 = __uint_as_float(hb[2] << 16u), b5 = __uint_as_float(hb[2] & 0xFFFF0000u);
+            float b6 = __uint_as_float(hb[3] << 16u), b7 = __uint_as_float(hb[3] & 0xFFFF0000u);
+            u32 col = i0 + (lane << 3u);
+#pragma unroll
+            for (u32 r = 0u; r < 8u; r++) {
+              if (r >= nr) break;
+              const float* xp = x + (u64)(r0 + r) * hidden + col;
+              float4 x0 = *(const float4*)xp;
+              float4 x1 = *(const float4*)(xp + 4u);
+              s0[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, s0[r]))));
+              s0[r] = fmaf(a4, x1.x, fmaf(a5, x1.y, fmaf(a6, x1.z, fmaf(a7, x1.w, s0[r]))));
+              if (has1) {
+                s1[r] = fmaf(b0, x0.x, fmaf(b1, x0.y, fmaf(b2, x0.z, fmaf(b3, x0.w, s1[r]))));
+                s1[r] = fmaf(b4, x1.x, fmaf(b5, x1.y, fmaf(b6, x1.z, fmaf(b7, x1.w, s1[r]))));
+              }
+            }
+          }
+        }
+      } else {
+        for (u32 i = tid * 4u; i < hidden; i += 1024u) {
+          float4 a0 = weights4(router, (u64)e0 * hidden + i, bf16);
+          float4 a1 = has1 ? weights4(router, (u64)(e0 + 1u) * hidden + i, bf16)
+                           : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+          for (u32 r = 0u; r < 8u; r++) {
+            if (r >= nr) break;
+            float4 b = *(const float4*)(x + (u64)(r0 + r) * hidden + i);
+            s0[r] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+            if (has1) s1[r] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+          }
+        }
+      }
+#pragma unroll
+      for (u32 r = 0u; r < 8u; r++) {
+        if (r >= nr) break;
+        for (u32 off = 16u; off > 0u; off >>= 1u) {
+          s0[r] += __shfl_xor_sync(0xFFFFFFFFu, s0[r], off);
+          if (has1) s1[r] += __shfl_xor_sync(0xFFFFFFFFu, s1[r], off);
+        }
+        if (lane == 0u) {
+          sm.wsum[0][r][warp] = s0[r];
+          if (has1) sm.wsum[1][r][warp] = s1[r];
+        }
+      }
+      prim::block_sync();
+      if (warp < 2u && (warp == 0u || has1) && lane < nr) {
+        float tot = sm.wsum[warp][lane][0] + sm.wsum[warp][lane][1] + sm.wsum[warp][lane][2] +
+                    sm.wsum[warp][lane][3] + sm.wsum[warp][lane][4] + sm.wsum[warp][lane][5] +
+                    sm.wsum[warp][lane][6] + sm.wsum[warp][lane][7];
+        scores[(u64)(r0 + lane) * experts + e0 + warp] = 1.0f / (1.0f + __expf(-tot));
+      }
+      if (r0 + 8u < rows) prim::block_sync();
+    }
+  }
+  __threadfence();
+  prim::block_sync();
+  if (tid == 0u) {
+    u32 done = prim::fetch_add_gpu(&route_done, 1u) + 1u;
+    is_last = done == gridDim.x ? 1u : 0u;
+    if (is_last) prim::store_relaxed_gpu(&route_done, 0u);
+  }
+  prim::block_sync();
+  if (!is_last) return;
+  route_plan(scores, bias, plan_out, sm.plan, rows, experts, picks, first, count);
 }
 
 struct alignas(16) Fc1Smem {
@@ -272,9 +299,12 @@ struct alignas(16) Fc1Smem {
   u32 wtiles[2048];
 };
 
-struct alignas(16) Fc2Smem {
-  u32 btab[512];
-  u32 wtiles[2048];
+union alignas(16) Fc2Smem {
+  struct {
+    u32 btab[512];
+    u32 wtiles[2048];
+  } k;
+  float fin[PICKS + 1][128];
 };
 
 // Warp-per-tile split-K fc1 in 16 KiB shared memory.
@@ -446,21 +476,21 @@ static __device__ __forceinline__ void fc2_body(
 #pragma unroll
     for (u32 i = 0u; i < 4u; i++) a[i] = (gv[i] / (1.0f + __expf(-gv[i]))) * uv[i] * ds[i];
     trellis::wht128(a, trellis::INV_SQRT128);
-    trellis::store_bfrag(sm.btab, j, lane, a);
+    trellis::store_bfrag(sm.k.btab, j, lane, a);
   }
   trellis::word_map wm = trellis::map_word<K>(lane);
-  const u32* ha = sm.btab + (lane << 1u);
+  const u32* ha = sm.k.btab + (lane << 1u);
   u32 nl = lane >> 2u, col2 = (lane & 3u) << 1u;
   for (u32 idx = 0u; idx < ob_per; idx++) {
     if (idx > 0u) prim::block_sync();
-    trellis::blk_store<K>(nw, tid, sm.wtiles);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
     prim::block_sync();
     if (idx + 1u < ob_per) {
       gb += sO;
       trellis::blk_load<K>(gb, tid, aligned, nw);
     }
     float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
-    trellis::blk_mma<K, BOOK, 1u>(sm.wtiles, ha, 0u, j, lane, wm, acc);
+    trellis::blk_mma<K, BOOK, 1u>(sm.k.wtiles, ha, 0u, j, lane, wm, acc);
     u32 out_base = ((ob0 + idx) << 7u) + (j << 4u) + nl;
     if (col2 < n) {
       u16* dst = z + z_off0 + out_base;
@@ -483,13 +513,74 @@ static __device__ __noinline__ void fc2_cold(
   fc2_body<K, BOOK>(gpart, gate_sv, up_sv, down_su, dbytes, z, sm, m, c, ns, ns2, slot, chunks, ks1, max_col, hidden, n, z_off0, z_off1);
 }
 
-// SwiGLU and down projection into fp16 `z[row][pick][chunk][hidden]`.
+// Fixed-order reduction over picks for one finished row slice.
+static __device__ __noinline__ void fc2_finish(
+    const Plan* plan, const float* down_sv, const float* signs_out,
+    const float* shared_down_sv, const u16* z, float* y, float fin[PICKS + 1][128],
+    u32 hidden, u32 ffn, u32 picks, u32 shared_ffn, u32 ob0, u32 ob_per, u32 row) {
+  u32 warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+  u32 chunks = ffn >> 7u;
+  u32 sh_chunks = shared_ffn >> 7u;
+  for (u32 idx = 0u; idx < ob_per; idx++) {
+    u32 base = ((ob0 + idx) << 7u) + (lane << 2u);
+    for (u32 w = warp; w <= picks; w += 8u) {
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      bool is_shared = w == picks;
+      u32 e = is_shared ? 0u : plan->tok_expert[row][w];
+      if (is_shared || e != 0xFFFFFFFFu) {
+        u32 upto = is_shared ? sh_chunks : chunks;
+        const u16* from = z + ((u64)row * (picks + 1u) + w) * chunks * hidden + base;
+        float s[4] = {0.f, 0.f, 0.f, 0.f};
+        for (u32 c = 0u; c < upto; c++) {
+          uint2 h = prim::load_fresh4(from + (u64)c * hidden);
+          s[0] += trellis::f16_to_f32(h.x & 0xFFFFu);
+          s[1] += trellis::f16_to_f32(h.x >> 16u);
+          s[2] += trellis::f16_to_f32(h.y & 0xFFFFu);
+          s[3] += trellis::f16_to_f32(h.y >> 16u);
+        }
+        trellis::wht128(s, trellis::INV_SQRT128);
+        if (is_shared) {
+          float4 sv = *(const float4*)(shared_down_sv + base);
+          acc[0] = s[0] * sv.x;
+          acc[1] = s[1] * sv.y;
+          acc[2] = s[2] * sv.z;
+          acc[3] = s[3] * sv.w;
+        } else {
+          float gw = plan->tok_w[row][w];
+          float4 sv = *(const float4*)(down_sv + (u64)e * hidden + base);
+          float4 sg = *(const float4*)(signs_out + base);
+          acc[0] = gw * (s[0] * sv.x * sg.x);
+          acc[1] = gw * (s[1] * sv.y * sg.y);
+          acc[2] = gw * (s[2] * sv.z * sg.z);
+          acc[3] = gw * (s[3] * sv.w * sg.w);
+        }
+      }
+      *(float4*)(&fin[w][lane << 2u]) = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    }
+    prim::block_sync();
+    if (warp == 0u) {
+      float4 o = *(const float4*)(&fin[0][lane << 2u]);
+      for (u32 w = 1u; w <= picks; w++) {
+        float4 q = *(const float4*)(&fin[w][lane << 2u]);
+        o.x += q.x;
+        o.y += q.y;
+        o.z += q.z;
+        o.w += q.w;
+      }
+      *(float4*)(y + (u64)row * hidden + base) = o;
+    }
+    prim::block_sync();
+  }
+}
+
+// SwiGLU, down projection, and last-CTA output reduction.
 extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
     const float* plan_in, const float* gpart,
     const float* gate_sv, const float* up_sv, const float* down_su, bytes down,
+    const float* down_sv, const float* signs_out,
     const float* shared_gate_sv, const float* shared_up_sv,
-    bytes shared_down, const float* shared_down_su,
-    float* z_out, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k,
+    bytes shared_down, const float* shared_down_su, const float* shared_down_sv,
+    float* y, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k,
     u32 book, u32 shared_book, u32 first, u32 shared_ffn, u32 ks1, u32 ns2) {
   const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
   u32 n_sh = (rows + 7u) >> 3u;
@@ -545,8 +636,10 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
     }
   }
   __shared__ Fc2Smem sm;
+  __shared__ u32 won_mask;
   u32 max_col = min(rows, 8u);
-  u16* z = reinterpret_cast<u16*>(z_out);
+  u64 gpart_len = (u64)gridDim.y * chunks * 2ull * ks1 * max_col * 128ull;
+  u16* z = reinterpret_cast<u16*>(const_cast<float*>(gpart) + gpart_len);
   if (book && k == 3u) {
     fc2_body<3u, trellis::BOOK_MUL1>(gpart, gsv, usv, dsu, dbytes, z, sm, m, c, ns, ns2, slot, chunks, ks1, max_col, hidden, n, z_off0, z_off1);
   } else if (book && k == 4u) {
@@ -560,64 +653,37 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
   } else {
     fc2_cold<2u, trellis::BOOK_MCG>(gpart, gsv, usv, dsu, dbytes, z, sm, m, c, ns, ns2, slot, chunks, ks1, max_col, hidden, n, z_off0, z_off1);
   }
-}
-
-// Each row's fixed-order sum over picks, after output turn.
-extern "C" __global__ void glm53_finish(
-    const float* plan_in, const float* down_sv, const float* signs_out,
-    const float* shared_down_sv, const float* z_in,
-    float* y, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 shared_ffn) {
-  (void)rows;
-  const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
-  const u16* z = reinterpret_cast<const u16*>(z_in);
-  __shared__ float wsum[PICKS + 1][128];
-  u32 warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
-  u32 base = blockIdx.x * 128u + (lane << 2u), row = blockIdx.y;
-  u32 chunks = ffn >> 7u;
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
-  if (warp <= picks) {
-    bool is_shared = warp == picks;
-    u32 e = is_shared ? 0u : plan->tok_expert[row][warp];
-    if (is_shared || e != 0xFFFFFFFFu) {
-      u32 upto = is_shared ? (shared_ffn >> 7u) : chunks;
-      const u16* from = z + ((u64)row * (picks + 1u) + warp) * chunks * hidden + base;
-      float s[4] = {0.f, 0.f, 0.f, 0.f};
-      for (u32 c = 0u; c < upto; c++) {
-        uint2 h = *(const uint2*)(from + (u64)c * hidden);
-        s[0] += trellis::f16_to_f32(h.x & 0xFFFFu);
-        s[1] += trellis::f16_to_f32(h.x >> 16u);
-        s[2] += trellis::f16_to_f32(h.y & 0xFFFFu);
-        s[3] += trellis::f16_to_f32(h.y >> 16u);
-      }
-      trellis::wht128(s, trellis::INV_SQRT128);
-      if (is_shared) {
-        float4 sv = *(const float4*)(shared_down_sv + base);
-        acc[0] = s[0] * sv.x;
-        acc[1] = s[1] * sv.y;
-        acc[2] = s[2] * sv.z;
-        acc[3] = s[3] * sv.w;
-      } else {
-        float gw = plan->tok_w[row][warp];
-        float4 sv = *(const float4*)(down_sv + (u64)e * hidden + base);
-        float4 sg = *(const float4*)(signs_out + base);
-        acc[0] = gw * (s[0] * sv.x * sg.x);
-        acc[1] = gw * (s[1] * sv.y * sg.y);
-        acc[2] = gw * (s[2] * sv.z * sg.z);
-        acc[3] = gw * (s[3] * sv.w * sg.w);
-      }
+  __threadfence();
+  u32 tid = threadIdx.x;
+  if (tid == 0u) won_mask = 0u;
+  prim::block_sync();
+  if (tid < n) {
+    u32 row = is_shared
+        ? (slot * 8u + tid)
+        : ((plan->slot_tok[slot - n_sh][tid >> 2u] >> ((tid & 3u) << 3u)) & 0xFFu);
+    u32 mine = 0u;
+    for (u32 p = 0u; p < picks; p++) {
+      if (plan->tok_expert[row][p] != 0xFFFFFFFFu) mine++;
     }
-    *(float4*)(&wsum[warp][lane << 2u]) = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    u32 need = (shared_ffn >> 7u) + mine * chunks;
+    u32 done = prim::fetch_add_gpu(&fc2_done[row][ns], 1u) + 1u;
+    if (done == need) {
+      prim::store_relaxed_gpu(&fc2_done[row][ns], 0u);
+      atomicOr(&won_mask, 1u << tid);
+    }
   }
   prim::block_sync();
-  if (warp == 0u) {
-    float4 o = *(const float4*)(&wsum[0][lane << 2u]);
-    for (u32 w = 1u; w <= picks; w++) {
-      float4 q = *(const float4*)(&wsum[w][lane << 2u]);
-      o.x += q.x;
-      o.y += q.y;
-      o.z += q.z;
-      o.w += q.w;
-    }
-    *(float4*)(y + (u64)row * hidden + base) = o;
+  u32 mask = won_mask;
+  if (mask == 0u) return;
+  u32 ob_per = (hidden >> 7u) / ns2;
+  u32 ob0 = ns * ob_per;
+  while (mask != 0u) {
+    u32 r = (u32)(__ffs((int)mask) - 1);
+    mask &= mask - 1u;
+    u32 row = is_shared
+        ? (slot * 8u + r)
+        : ((plan->slot_tok[slot - n_sh][r >> 2u] >> ((r & 3u) << 3u)) & 0xFFu);
+    fc2_finish(plan, down_sv, signs_out, shared_down_sv, z, y, sm.fin, hidden, ffn, picks,
+        shared_ffn, ob0, ob_per, row);
   }
 }
