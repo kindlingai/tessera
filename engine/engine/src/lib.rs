@@ -236,6 +236,17 @@ pub(crate) fn context_bucket(needed: usize, cap: usize) -> u64 {
     needed.max(256).next_power_of_two().min(cap) as u64
 }
 
+/// Rounds a launch row count up to compact buckets.
+pub(crate) fn row_bucket(n: usize) -> usize {
+    if n <= 24 {
+        n.max(1)
+    } else if n <= 64 {
+        n.div_ceil(8) * 8
+    } else {
+        n.next_power_of_two()
+    }
+}
+
 /// Sizes and padded counts for `rows` returning `picks`.
 fn launch_of(
     rows: &[Row],
@@ -247,16 +258,8 @@ fn launch_of(
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
     seen.sort_unstable();
     seen.dedup();
-    // Small counts stay exact to skip wasted verify rows.
-    let pad = |n: usize| {
-        if n <= 16 {
-            n.max(1)
-        } else {
-            n.next_power_of_two()
-        }
-    };
-    let filled = pad(rows.len());
-    let wanted = pad(picks.len());
+    let filled = row_bucket(rows.len());
+    let wanted = row_bucket(picks.len());
     let sizes = vec![
         (Seqs, slots as u64),
         (Rows, filled as u64),

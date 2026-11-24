@@ -179,7 +179,7 @@ impl MtpDrafter {
             }
             max_end = max_end.max(end);
         }
-        let filled = if m <= 16 { m } else { m.next_power_of_two() }.min(self.core.context);
+        let filled = crate::row_bucket(m).min(self.core.context);
         let mut tok_buf = Vec::with_capacity(filled);
         let mut pos_buf = Vec::with_capacity(filled);
         let mut slot_buf = Vec::with_capacity(filled);
@@ -282,7 +282,7 @@ impl MtpDrafter {
             }
             max_end = max_end.max(pos as usize + 1);
         }
-        let filled = if m <= 16 { m } else { m.next_power_of_two() }.min(self.core.context);
+        let filled = crate::row_bucket(m).min(self.core.context);
         let mut pos_buf = Vec::with_capacity(filled);
         let mut slot_buf = Vec::with_capacity(filled);
         let mut scale_buf = Vec::with_capacity(filled);

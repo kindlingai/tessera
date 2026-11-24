@@ -74,6 +74,9 @@ fn linear_mm_entries() {
         "tessera_mm_bf16_ks2(",
         "tessera_mm_mxfp8_r8(",
         "tessera_mm_mxfp8_r16(",
+        "tessera_mm_mxfp8_r32(",
+        "DTR_DEF(dtr_k4_t4,",
+        "dtr_gen4(",
     ] {
         assert!(cuda.contains(entry), "missing {entry}");
     }
@@ -91,7 +94,7 @@ fn fast_mm_selection() {
         mm_entry(&linear(&rows, 12288, 4096), 16, "bf16"),
         Some(("fast_mm_bf16", "tessera_mm_bf16_ks2", 2))
     );
-    // MXFP8 picks r8 for M <= 8, r16 above.
+    // MXFP8 picks r8 for <= 8, r16 <= 16, r32 above.
     assert_eq!(
         mm_entry(&linear(&rows, 6144, 576), 8, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r8", 2))
@@ -99,6 +102,10 @@ fn fast_mm_selection() {
     assert_eq!(
         mm_entry(&linear(&rows, 12288, 6144), 16, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r16", 2))
+    );
+    assert_eq!(
+        mm_entry(&linear(&rows, 12288, 6144), 24, "mxfp8"),
+        Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r32", 2))
     );
     // Out-of-range M and unaligned K are rejected.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
