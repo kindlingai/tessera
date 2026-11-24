@@ -1,7 +1,7 @@
 # Rules that stickler checks in CI and in the pre-commit hook.
 
 # The stickler release that checks this repository.
-stickler.version = "0.4.2"
+stickler.version = "0.4.3"
 stickler.releases = "https://github.com/kindlingai/tessera-stickler/releases/download"
 
 # Words in one comment block. Adjacent comment lines are one block.
