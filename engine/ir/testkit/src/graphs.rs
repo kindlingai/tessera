@@ -363,6 +363,22 @@ pub fn indexed(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// Weighted ReLU scores over keys: the Lightning Indexer.
+pub fn indexer(bounded: &[Dim], [heads, width]: [u64; 2]) -> Graph {
+    let fixed = [(Heads, heads), (HeadDim, width), (Hidden, 1)];
+    let m = model(bounded, &fixed);
+    let ports = [
+        floats([Seqs, Context, Heads, HeadDim]),
+        floats([Seqs, Context, HeadDim]),
+        floats([Seqs, Context, Hidden, Heads]),
+    ];
+    let [q, k, w] = m.entry(EntryKind::Forward, ports);
+    let hits = q.matmul_rows(&k).act(Act::Relu);
+    let scores = hits.permute(&[0, 1, 3, 2]).matmul_rows(&w);
+    let out = scores.reshape([Seqs, Context, Context]).mask(Mask::Causal);
+    m.finish([(Role::Logits, &out)])
+}
+
 /// Ragged rows pick keys up to their position, then attend.
 pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
     let rows: Vec<Dim> = bounded.iter().filter(|d| d.name == Rows).cloned().collect();

@@ -8,8 +8,8 @@ use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, chain, delta, indexed, indexed_rows, linear, neighbours, picked, rotation,
-    routed, rows, table, turned,
+    attention, blocks, chain, delta, indexed, indexed_rows, indexer, linear, neighbours, picked,
+    rotation, routed, rows, table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -281,6 +281,7 @@ impl Grid {
             for g in [
                 indexed(&three, [heads[0], heads[2], 2]),
                 delta(&three, heads),
+                indexer(&three, [heads[0], heads[2]]),
             ] {
                 let (sizes, pins) = (sizes.clone(), Pins::default());
                 cases.push(Case {
