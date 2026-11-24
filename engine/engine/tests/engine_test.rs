@@ -385,6 +385,29 @@ fn mla_indexer_fused() {
     assert!(names.contains(&"indexer_warp"), "{names:?}");
 }
 
+/// Large `INDEX_KEEP` MLA uses `radix_top_k` and matches interpreter.
+#[test]
+fn mla_radix_index() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_seqs = 1;
+    cfg.stack.max_context = 128;
+    cfg.index.as_mut().unwrap().keep = 64;
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let weights = weights(&g, &mut Noise(13));
+    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let prefill: Vec<Row> = (0..72u32).map(|p| row(0, (p * 7 + 3) % 64, p)).collect();
+    let decode = [row(0, 11, 72)];
+    for settings in runs() {
+        let mut engine = Engine::open(g.clone(), 128, &Recipe::default(), &settings).unwrap();
+        engine.load(&stored).unwrap();
+        let mut store = Store::default();
+        for rows in [&prefill[..], &decode[..]] {
+            let want = step(&g, &weights, &mut store, rows);
+            assert_eq!(engine.step(rows).unwrap(), want);
+        }
+    }
+}
+
 /// Three ids after each prompt, and the steps they took.
 fn asked(batch: &mut Batch, prompts: &[&[u32]]) -> (Vec<Vec<u32>>, usize) {
     let mut taken = Vec::new();
