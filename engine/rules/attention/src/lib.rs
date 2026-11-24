@@ -6,11 +6,23 @@ mod cpu;
 mod delta;
 mod flash;
 mod indexer;
+mod join_rope;
+mod kv_prep;
 mod listed;
 mod slots;
 
+use tessera_lower::form::Load as Stored;
 use tessera_lower::kernels::Map;
 use tessera_lower::{Draft, T, Tree, sites};
+
+/// Checks a two-float-input kernel's accepted input forms.
+pub(crate) fn pair_accepts(forms: [&dyn Stored; 2], input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 => form.name() == forms[0].name(),
+        1 => form.name() == forms[1].name(),
+        _ => !form.narrow(),
+    }
+}
 
 /// A listed site with all keys present, and its picks.
 fn fixed_list(tree: &Tree, (site, ids): (sites::Attend, T)) -> Option<(sites::Attend, T, usize)> {

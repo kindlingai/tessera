@@ -92,8 +92,7 @@ fn strided_source(k: &Strided) -> Source {
 }
 
 /// Output axes as `(size, input step)`, neighbours merged.
-fn runs(order: &[u32], shape: &[usize]) -> Vec<(usize, usize)> {
-    let step = |a: usize| shape[a + 1..].iter().product::<usize>();
+fn runs(order: &[u32], shape: &[usize], steps: &[usize]) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut last = usize::MAX;
     for &a in order {
@@ -101,13 +100,23 @@ fn runs(order: &[u32], shape: &[usize]) -> Vec<(usize, usize)> {
         if shape[a] == 1 {
             continue;
         }
+        let step = steps[a];
         match out.last_mut() {
-            Some(run) if last.wrapping_add(1) == a => *run = (run.0 * shape[a], step(a)),
-            _ => out.push((shape[a], step(a))),
+            Some(run) if last.wrapping_add(1) == a && run.1 == shape[a] * step => {
+                *run = (run.0 * shape[a], step);
+            }
+            _ => out.push((shape[a], step)),
         }
         last = a;
     }
     out
+}
+
+/// Dense input strides for `shape`.
+fn dense_steps(shape: &[usize]) -> Vec<usize> {
+    (0..shape.len())
+        .map(|a| shape[a + 1..].iter().product::<usize>())
+        .collect()
 }
 
 /// Up to four runs as a kernel, outer runs first.
@@ -181,7 +190,10 @@ fn strides(
             let runs = [(product(&shape[..at(*axis)]), inner), (mid, 0), (inner, 1)];
             nested(&runs, len, 0, forms.0, forms.1)
         }
-        View::Permute(order) => nested(&runs(order, shape), len, 0, forms.0, forms.1),
+        View::Permute(order) => {
+            let steps = dense_steps(shape);
+            nested(&runs(order, shape, &steps), len, 0, forms.0, forms.1)
+        }
         View::Reshape(_) | View::Concat => None,
     }
 }
@@ -360,6 +372,30 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             out_form,
         };
         return Some(vec![Draft::new(join, [x, y], len)]);
+    }
+    // Fuse a single-reader slice followed by a permute.
+    if let View::Permute(order) = view
+        && !tree.root(x)
+        && let Term::Op(Op::View(View::Slice { axis, start, .. })) = &tree.node(x).term
+    {
+        let parent = tree.node(x).args[0];
+        if ours(&parent)
+            && let Some(off) = start.value(&tree.g.dims, &|_| None)
+        {
+            let p_shape = &tree.node(parent).shape;
+            let steps = dense_steps(p_shape);
+            let start = off as usize * steps[*axis as usize];
+            let p_form = plain(tree.node(parent).form);
+            if let Some(kernel) = nested(
+                &runs(order, &tree.node(x).shape, &steps),
+                len,
+                start,
+                p_form,
+                out_form,
+            ) {
+                return Some(vec![Draft::new(kernel, [parent], len)]);
+            }
+        }
     }
     let in_form = plain(tree.node(x).form);
     let kernel = strides(tree, view, &tree.node(x).shape, len, (in_form, out_form))?;

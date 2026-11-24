@@ -8,8 +8,8 @@ use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, chain, delta, indexed, indexed_rows, indexer, linear, neighbours, picked,
-    residual_norm, rotation, routed, rows, table, turned,
+    attention, blocks, chain, delta, indexed, indexed_rows, indexer, linear, mla_prep, neighbours,
+    picked, residual_norm, rotation, routed, rows, table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -264,6 +264,17 @@ impl Grid {
         cases.push(by_rows(rotation(&one)));
         cases.push(by_rows(turned(&one)));
         cases.push(by_rows(indexed_rows(&one, [2, 16, 2])));
+        let mla_sizes = self
+            .rows
+            .iter()
+            .map(|r| vec![(Rows, *r), (Context, 8)])
+            .collect();
+        cases.push(Case {
+            g: mla_prep(&one, [4, 16, 16]),
+            sizes: mla_sizes,
+            pins: Pins::default(),
+            cold: false,
+        });
         cases.push(pinned(blocks(&one, [2, 16, 16]), Pins::all(BF16_FORM)));
         cases.extend(
             self.widths

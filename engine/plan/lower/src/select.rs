@@ -240,77 +240,23 @@ fn select_with(
             }
             (_, None) => continue,
             _ if tree.alias(t) => val(n.args[0]),
-            (Term::Op(tessera_graph::Op::Append(index)), _) => {
-                let args = [n.args[0], n.args[1], n.args[2]].map(val);
-                e.append(&tree, t, *index, args)?
+            (Term::Op(tessera_graph::Op::Append(index)), Some(zone)) => {
+                let choice = cover.best[t.0 as usize][zone as usize].take().flatten();
+                let choice = choice.expect("solved above");
+                if choice.drafts.is_empty() {
+                    if choice.offered.len() > 1 {
+                        e.out.contested.extend(&choice.offered);
+                    }
+                    let args = [n.args[0], n.args[1], n.args[2]].map(val);
+                    e.append(&tree, t, *index, args)?
+                } else {
+                    emit_choice(&mut e, &tree, t, choice, zone, Some(*index), &mut vals)?
+                }
             }
             (_, Some(zone)) => {
                 let choice = cover.best[t.0 as usize][zone as usize].take().flatten();
                 let choice = choice.expect("solved above");
-                if choice.offered.len() > 1 {
-                    e.out.contested.extend(&choice.offered);
-                }
-                for (rule, way) in choice.ways {
-                    e.out.ways.entry(rule).or_default().insert(way);
-                }
-                let covers = tree.covered(t, &reads(&choice.drafts));
-                let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());
-                let mut written = Vec::new();
-                let last = choice.drafts.len() - 1;
-                for (i, d) in choice.drafts.into_iter().enumerate() {
-                    let mut reads = Vec::with_capacity(d.reads.len());
-                    for r in &d.reads {
-                        reads.push(match r {
-                            Read::Node(a) => val(*a),
-                            Read::Draft(at) => made[*at],
-                            Read::Kept(index) => e.kept(&tree, *index)?,
-                        });
-                    }
-                    // The last launch writes the node's own type.
-                    let (form, shape) = match d.writes {
-                        Some(w) => {
-                            let node = tree.node(w);
-                            (node.form, pack_shape(&node.shape, d.len))
-                        }
-                        None if i == last => (n.form, pack_shape(&n.shape, d.len)),
-                        None => (form::F32_FORM, pack_shape(&[d.len], d.len)),
-                    };
-                    let writes = d.writes;
-                    let also_nodes: Vec<T> = d.also.iter().map(|(w, _)| *w).collect();
-                    let also_specs: Vec<_> = d
-                        .also
-                        .iter()
-                        .map(|&(w, len)| {
-                            let node = tree.node(w);
-                            (len, node.form, pack_shape(&node.shape, len))
-                        })
-                        .collect();
-                    let (primary, extras) = e.op(
-                        d,
-                        choice.rule,
-                        reads,
-                        &covers,
-                        zone,
-                        form,
-                        shape,
-                        &also_specs,
-                    );
-                    made.push(primary);
-                    if let Some(w) = writes {
-                        written.push((w, made[i]));
-                    }
-                    for (w, v) in also_nodes.into_iter().zip(extras) {
-                        written.push((w, v));
-                    }
-                }
-                let mut own = *made.last().expect("a rule proposes at least one launch");
-                for (w, v) in written {
-                    match w == t {
-                        true => own = v,
-                        false => vals[w.0 as usize] = Some(v),
-                    }
-                }
-                own
+                emit_choice(&mut e, &tree, t, choice, zone, None, &mut vals)?
             }
         };
         vals[t.0 as usize] = Some(made);
@@ -331,6 +277,88 @@ fn select_with(
     e.out.rank = tree.rank;
     let report = scan.map(|s| finish_report(s, &cover, &e.out));
     Ok((e.out, report))
+}
+
+/// Emits one chosen cover's drafts, optionally targeting kept rows.
+fn emit_choice(
+    e: &mut Emit,
+    tree: &Tree,
+    t: T,
+    choice: cover::Choice,
+    zone: u32,
+    append: Option<u32>,
+    vals: &mut [Option<Val>],
+) -> Result<Val, Error> {
+    if choice.offered.len() > 1 {
+        e.out.contested.extend(&choice.offered);
+    }
+    for (rule, way) in choice.ways {
+        e.out.ways.entry(rule).or_default().insert(way);
+    }
+    let n = tree.node(t);
+    let covers = tree.covered(t, &reads(&choice.drafts));
+    let mut made: Vec<Val> = Vec::with_capacity(choice.drafts.len());
+    let mut written = Vec::new();
+    let last = choice.drafts.len() - 1;
+    for (i, d) in choice.drafts.into_iter().enumerate() {
+        let mut args = Vec::with_capacity(d.reads.len());
+        for r in &d.reads {
+            args.push(match r {
+                Read::Node(a) => vals[a.0 as usize].expect("arguments come first"),
+                Read::Draft(at) => made[*at],
+                Read::Kept(index) => e.kept(tree, *index)?,
+            });
+        }
+        // The last launch writes the node's own type.
+        let (form, shape) = match d.writes {
+            Some(w) => {
+                let node = tree.node(w);
+                (node.form, pack_shape(&node.shape, d.len))
+            }
+            None if i == last => (n.form, pack_shape(&n.shape, d.len)),
+            None => (form::F32_FORM, pack_shape(&[d.len], d.len)),
+        };
+        let target = match append {
+            Some(index) if i == last => Some(e.kept(tree, index)?),
+            _ => None,
+        };
+        let writes = d.writes;
+        let also_nodes: Vec<T> = d.also.iter().map(|(w, _)| *w).collect();
+        let also_specs: Vec<_> = d
+            .also
+            .iter()
+            .map(|&(w, len)| {
+                let node = tree.node(w);
+                (len, node.form, pack_shape(&node.shape, len))
+            })
+            .collect();
+        let (primary, extras) = e.op(
+            d,
+            choice.rule,
+            args,
+            &covers,
+            zone,
+            form,
+            shape,
+            &also_specs,
+            target,
+        );
+        made.push(primary);
+        if let Some(w) = writes {
+            written.push((w, made[i]));
+        }
+        for (w, v) in also_nodes.into_iter().zip(extras) {
+            written.push((w, v));
+        }
+    }
+    let mut own = *made.last().expect("a rule proposes at least one launch");
+    for (w, v) in written {
+        match w == t {
+            true => own = v,
+            false => vals[w.0 as usize] = Some(v),
+        }
+    }
+    Ok(own)
 }
 
 mod report {
@@ -825,13 +853,15 @@ mod report {
                 continue;
             };
             let t = T(idx as u32);
-            let n = cover.tree.node(t);
-            if cover.tree.alias(t) || matches!(n.term, Term::Op(Op::Append(_))) {
+            if cover.tree.alias(t) {
                 continue;
             }
             let Some(Some(choice)) = &cover.best[idx][zone as usize] else {
                 continue;
             };
+            if choice.drafts.is_empty() {
+                continue;
+            }
             let chosen_rule = cover.rules.iter().copied().find(|r| r.name == choice.rule);
             if chosen_rule.is_some_and(|r| r.propose.regions()) {
                 for inner in cover.tree.inside(t, &reads(&choice.drafts)) {

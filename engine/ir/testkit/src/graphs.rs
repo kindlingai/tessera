@@ -10,6 +10,7 @@ use tessera_trace::{
 };
 
 const NOPE: DimName = DimName::named("Nope");
+const ROPE: DimName = DimName::named("Rope");
 const LATENT: DimName = DimName::named("Latent");
 const INDEX_KEEP: DimName = DimName::named("IndexKeep");
 
@@ -421,6 +422,65 @@ pub fn indexed_rows(bounded: &[Dim], [heads, width, keep]: [u64; 3]) -> Graph {
         [&q, &k, &v],
         [&slots, &at],
         Some(&picked),
+    );
+    m.finish([(Role::Logits, &out)])
+}
+
+/// MLA Q partial-RoPE and KV-prep scatter into kept rows.
+pub fn mla_prep(bounded: &[Dim], [heads, latent, rope]: [u64; 3]) -> Graph {
+    let mut dims: Vec<Dim> = bounded.iter().filter(|d| d.name == Rows).cloned().collect();
+    dims.push(Dim::bounded(Context, 8));
+    let fixed = [
+        (Seqs, 8),
+        (Heads, heads),
+        (LATENT, latent),
+        (ROPE, rope),
+        (Hidden, latent),
+    ];
+    let m = model(&dims, &fixed);
+    let w: Scale = declare(&m);
+    let q_ty = TensorType::new(vec![Rows.into(), Heads.into(), LATENT + ROPE], DType::F32);
+    let kv_ty = TensorType::new(vec![Rows.into(), LATENT + ROPE], DType::F32);
+    let port = |role, ty| Port { role, ty };
+    let [q, kv, slots, positions] = m.entry(
+        EntryKind::Step,
+        [
+            port(Role::Logits, q_ty),
+            port(Role::Logits, kv_ty),
+            ids([Rows]),
+            ids([Rows]),
+        ],
+    );
+    let q_out = q
+        .slice(2, 0u64, LATENT)
+        .concat(
+            &q.slice(2, LATENT, ROPE)
+                .rope(&positions, 1e4, Pairs::Adjacent),
+        );
+    let kept_ty = TensorType::new(
+        vec![
+            Seqs.into(),
+            Context.into(),
+            DimExpr::Const(1),
+            LATENT + ROPE,
+        ],
+        DType::F32,
+    );
+    let kept = m.kept(kept_ty);
+    let lat = kv.slice(1, 0u64, LATENT).rms_norm(&w.norm, 1e-6);
+    let shared = kv
+        .slice(1, LATENT, ROPE)
+        .rope(&positions, 1e4, Pairs::Adjacent);
+    let kv_row = lat
+        .concat(&shared)
+        .reshape(vec![Rows.into(), DimExpr::Const(1), LATENT + ROPE]);
+    let kv_kept = kv_row.append(&kept, [&slots, &positions]);
+    let out = m.attend_rows(
+        Mask::Causal,
+        0.25,
+        [&q_out, &kv_kept, &kv_kept],
+        [&slots, &positions],
+        None,
     );
     m.finish([(Role::Logits, &out)])
 }

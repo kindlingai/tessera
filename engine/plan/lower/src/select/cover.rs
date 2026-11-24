@@ -128,19 +128,9 @@ impl Cover<'_> {
     /// Asks every rule, and keeps the cheapest proposal.
     fn choose(&mut self, t: T, zone: u32) -> Option<Choice> {
         let n = self.tree.node(t);
-        // A zero-copy view or kept rows pass their argument on.
-        let passes = self.tree.alias(t) || matches!(n.term, Term::Op(Op::Append(_)));
-        if passes {
-            if matches!(n.term, Term::Op(Op::Append(_))) && zone != EDGE {
-                return None;
-            }
-            let mut cost = self.need(n.args[0], zone)?;
-            // An append runs a scatter. An absorbing region saves it.
-            if let Term::Op(Op::Append(index)) = n.term {
-                let scatter = Scatter::at(self.tree, t, index)?;
-                let len = scatter.rows * scatter.width;
-                cost += self.device.seconds_in(zone, &scatter, len, false);
-            }
+        // A zero-copy view passes its argument on.
+        if self.tree.alias(t) {
+            let cost = self.need(n.args[0], zone)?;
             return Some(Choice {
                 rule: "append",
                 drafts: Vec::new(),
@@ -148,6 +138,13 @@ impl Cover<'_> {
                 offered: Vec::new(),
                 ways: Vec::new(),
             });
+        }
+        let append = match n.term {
+            Term::Op(Op::Append(index)) => Some(index),
+            _ => None,
+        };
+        if append.is_some() && zone != EDGE {
+            return None;
         }
         if let Term::Stage(stage @ (Stage::AllReduce | Stage::AllGather)) = &n.term {
             let len = self.tree.elements(t);
@@ -179,6 +176,24 @@ impl Cover<'_> {
         let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
         let mut runnable = Vec::new();
         let mut proposed = false;
+        // Default scatter cover for kept appends, competing with fused rules.
+        if let Some(index) = append {
+            proposed = true;
+            if let Some(below) = self.need(n.args[0], zone)
+                && let Some(scatter) = Scatter::at(self.tree, t, index)
+            {
+                let len = scatter.rows * scatter.width;
+                let cost = below + self.device.seconds_in(zone, &scatter, len, false);
+                offered.push("append");
+                best = Some(Choice {
+                    rule: "append",
+                    drafts: Vec::new(),
+                    cost,
+                    offered: Vec::new(),
+                    ways: Vec::new(),
+                });
+            }
+        }
         for rule in self.rules.clone() {
             let Some(drafts) = rule.propose.at(self.tree, t) else {
                 continue;
@@ -195,6 +210,18 @@ impl Cover<'_> {
                     .any(|d| d.reads.iter().any(|r| matches!(r, Read::Kept(_))));
                 if touches_kept && zone != EDGE {
                     continue;
+                }
+                // Fused appends write kept rows directly in their form.
+                if append.is_some() {
+                    let Some(last) = drafts.last() else {
+                        continue;
+                    };
+                    if last.kernel.overwrites()
+                        || (n.form.narrow() && !last.kernel.emits_at(0, n.form))
+                        || !last.also.is_empty()
+                    {
+                        continue;
+                    }
                 }
                 // A kernel the device cannot run is not a way.
                 let platform = &self.device.platform;

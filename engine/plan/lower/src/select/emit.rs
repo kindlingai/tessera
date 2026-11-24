@@ -149,7 +149,7 @@ impl Emit {
         }
     }
 
-    /// Adds an op writing outputs, or shares one.
+    /// Adds an op writing new, kept, or shared outputs.
     #[allow(clippy::too_many_arguments, reason = "op emission takes value shape")]
     pub(crate) fn op(
         &mut self,
@@ -161,6 +161,7 @@ impl Emit {
         form: &'static dyn Load,
         shape: (u8, [u32; 4]),
         also_specs: &[OutputSpec],
+        target: Option<Val>,
     ) -> (Val, Vec<Val>) {
         let mut taken = Vec::with_capacity(reads.len());
         for (i, v) in reads.into_iter().enumerate() {
@@ -168,6 +169,18 @@ impl Emit {
             taken.push(self.widen(v, i, &*d.kernel));
         }
         let reads = taken;
+        if let Some(write) = target {
+            self.out.ops.push(Op {
+                kernel: d.kernel,
+                rule,
+                reads,
+                write,
+                also: Vec::new(),
+                covers: covers.to_vec(),
+                zone,
+            });
+            return (write, Vec::new());
+        }
         // Printing kernels is slow, so shared ones alone are keyed.
         let key = (d.kernel.shared() && also_specs.is_empty())
             .then(|| (format!("{:?}", d.kernel), reads.clone()));
