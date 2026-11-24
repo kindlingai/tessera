@@ -195,10 +195,13 @@ jobs:
       - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci
 
   macos:
-    # Light on pull requests. A push to main runs it only when its merge
-    # group skipped it.
+    # Light on pull requests. The merge queue skips it, because macOS
+    # runners are scarce. A push to main runs the full job when its merge
+    # group did not.
     needs: changes
-    if: needs.changes.outputs.build == 'true' && needs.changes.outputs.macos == 'true'
+    if: >
+      github.event_name != 'merge_group' &&
+      needs.changes.outputs.build == 'true' && needs.changes.outputs.macos == 'true'
     uses: ./.github/workflows/macos.yml
     with:
       light: ${{ github.event_name == 'pull_request' }}

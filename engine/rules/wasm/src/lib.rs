@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tessera_graph::Graph;
-use tessera_lower::{Draft, Propose, Rule, T, Tree};
+use tessera_lower::{Backend, Draft, Propose, Rule, T, Tree};
 use text::Fixed;
 
 static DUMP: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -136,6 +136,7 @@ struct Asking {
     rule: &'static str,
     kind: Kind,
     kernels: &'static [Fixed],
+    lacks: &'static [Backend],
     sink: Arc<Sink>,
 }
 
@@ -150,16 +151,18 @@ impl Asking {
             false => eprintln!("wasm rule {}: {msg}", self.rule),
         }
     }
-}
 
-impl Propose for Asking {
-    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    /// Queries the guest at `at`, logging when `log` is set.
+    fn ask(&self, tree: &Tree, at: T, log: bool) -> Option<Result<Vec<Draft>, String>> {
         let (site, reads) = site::find(tree, at, self.kind)?;
         let config = match tree.config.as_deref().map(serde_json::from_str).transpose() {
             Ok(config) => config,
             Err(e) => {
-                self.warn(&e.to_string());
-                return None;
+                let msg = e.to_string();
+                if log {
+                    self.warn(&msg);
+                }
+                return Some(Err(msg));
             }
         };
         let input = match serde_json::to_vec(&Ask {
@@ -169,58 +172,92 @@ impl Propose for Asking {
         }) {
             Ok(input) => input,
             Err(e) => {
-                self.warn(&e.to_string());
-                return None;
+                let msg = e.to_string();
+                if log {
+                    self.warn(&msg);
+                }
+                return Some(Err(msg));
             }
         };
         let output = match self.guest.call("propose", Some(&input), FUEL) {
             Ok(output) => output,
             Err(e) => {
                 let msg = e.to_string();
-                self.sink.record(&input, None, Some(&msg));
-                self.warn(&msg);
-                return None;
+                if log {
+                    self.sink.record(&input, None, Some(&msg));
+                    self.warn(&msg);
+                }
+                return Some(Err(msg));
             }
         };
         let answer: Answer = match serde_json::from_slice(&output) {
             Ok(answer) => answer,
             Err(e) => {
                 let msg = e.to_string();
-                self.sink.record(&input, Some(&output), Some(&msg));
-                self.warn(&msg);
-                return None;
+                if log {
+                    self.sink.record(&input, Some(&output), Some(&msg));
+                    self.warn(&msg);
+                }
+                return Some(Err(msg));
             }
         };
         match answer {
             Answer::Unread(u) => {
                 let msg = Error::Unread(u.unread).to_string();
-                self.sink.record(&input, Some(&output), Some(&msg));
-                self.warn(&msg);
-                None
+                if log {
+                    self.sink.record(&input, Some(&output), Some(&msg));
+                    self.warn(&msg);
+                }
+                Some(Err(msg))
             }
             Answer::Offers(None) => {
-                self.sink.record(&input, Some(&output), None);
-                if self.is_favored() {
-                    self.warn("declined site");
+                if log {
+                    self.sink.record(&input, Some(&output), None);
+                    if self.is_favored() {
+                        self.warn("declined site");
+                    }
                 }
-                None
+                Some(Err("guest declined site".into()))
             }
             Answer::Offers(Some(entries)) => {
                 let made = site::drafts(entries, self.kernels, tree, &reads);
                 let err = made.is_none().then_some("offer did not fit site");
-                self.sink.record(&input, Some(&output), err);
-                if let Some(msg) = err
-                    && self.is_favored()
-                {
-                    self.warn(msg);
+                if log {
+                    self.sink.record(&input, Some(&output), err);
+                    if let Some(msg) = err
+                        && self.is_favored()
+                    {
+                        self.warn(msg);
+                    }
                 }
-                made
+                match made {
+                    Some(drafts) => Some(Ok(drafts)),
+                    None => Some(Err("offer did not fit site".into())),
+                }
             }
         }
+    }
+}
+
+impl Propose for Asking {
+    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        self.ask(tree, at, true).and_then(Result::ok)
     }
 
     fn regions(&self) -> bool {
         self.kind != Kind::Matmul
+    }
+
+    fn fast(&self) -> bool {
+        true
+    }
+
+    fn lacks(&self) -> &'static [Backend] {
+        self.lacks
+    }
+
+    fn why_not(&self, tree: &Tree, at: T) -> Option<String> {
+        self.ask(tree, at, false).and_then(Result::err)
     }
 }
 
@@ -263,6 +300,15 @@ impl Module {
             kernels.push(Fixed::open(k, &manifest.files)?);
         }
         let kernels: &'static [Fixed] = kernels.leak();
+        let lacks: &'static [Backend] = match kernels.is_empty() {
+            true => &[],
+            false => Backend::ALL
+                .iter()
+                .copied()
+                .filter(|b| kernels.iter().all(|k| k.lacks.contains(b)))
+                .collect::<Vec<_>>()
+                .leak(),
+        };
         let sink = Arc::new(Sink::new(trace));
         let mut rules = Vec::with_capacity(manifest.rules.len());
         for r in manifest.rules {
@@ -272,6 +318,7 @@ impl Module {
                 rule,
                 kind: r.site,
                 kernels,
+                lacks,
                 sink: sink.clone(),
             };
             rules.push(Rule::made(rule, module_path!(), asking));

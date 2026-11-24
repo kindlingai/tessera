@@ -1,6 +1,6 @@
 //! Generation with a DFlash drafter, when `--draft` is given.
 
-use super::generate::{lowering, queue, user_rules};
+use super::generate::{check_lowering, lowering, queue, user_rules};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -182,6 +182,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         engine.device(),
         pair.block
     );
+    check_lowering(o, &mut engine, Some(pair.block.min(16)));
     if o.ranks.follows() {
         let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());

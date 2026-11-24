@@ -3,28 +3,28 @@
 use crate::Error;
 use std::sync::Arc;
 use tessera_engine::Filed;
-use tessera_engine::storage::Form;
+use tessera_engine::storage::{Bf16, F32, Form};
 
 /// How a slice's elements lie in the file.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stored {
-    F32,
-    Bf16,
-    F16,
     /// A registered form's bytes, in `Form::pack` layout.
     Form(&'static dyn Form),
+    /// IEEE f16 bytes, widened to f32 on load.
+    F16,
     /// An element type without a widening reader here.
     Other,
 }
 
 impl Stored {
+    pub const F32: Self = Self::Form(&F32);
+    pub const BF16: Self = Self::Form(&Bf16);
+
     /// The name manifests write.
     pub fn name(&self) -> &'static str {
         match self {
-            Stored::F32 => "f32",
-            Stored::Bf16 => "bf16",
-            Stored::F16 => "f16",
             Stored::Form(f) => f.name(),
+            Stored::F16 => "f16",
             Stored::Other => "other",
         }
     }
@@ -32,8 +32,6 @@ impl Stored {
     /// The type `name` stands for, in `Stored::name` spelling.
     pub fn parse(name: &str) -> Result<Stored, Error> {
         match name {
-            "f32" => Ok(Stored::F32),
-            "bf16" => Ok(Stored::Bf16),
             "f16" => Ok(Stored::F16),
             "other" => Ok(Stored::Other),
             _ => match tessera_engine::storage::named(name) {
@@ -64,12 +62,8 @@ pub trait Offer {
     fn slices(&self) -> Vec<Slice>;
     /// Slice `name` widened to f32.
     fn floats(&self, name: &str) -> Result<Vec<f32>, Error>;
-    /// Slice `name` as its form's bytes. Floats have none.
+    /// Slice `name` as its form's bytes.
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error>;
-    /// A bf16 slice's bytes, as stored.
-    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        Ok(self.floats(name)?.iter().flat_map(narrow).collect())
-    }
     /// An `I64` slice's values.
     fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
         Err(Error::DType(format!("{name} cannot be read as I64")))

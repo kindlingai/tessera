@@ -900,23 +900,40 @@ fn rows_needs(a: &Attn) -> Needs {
     }
 }
 
-/// Scale the queries, then attend by tiles.
-fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let site: sites::Attend = tree.site(at)?;
-    // Tiles of sixteen along the head, in whole slices.
+/// Checks whether `site` satisfies flash attention shape and mask rules.
+fn check_flash(site: &sites::Attend) -> Result<(), String> {
     let w = site.sizes.width;
-    if !w.is_multiple_of(16) || w > WIDEST || (w > CW as usize && !w.is_multiple_of(CW as usize)) {
-        return None;
+    if !w.is_multiple_of(16) {
+        return Err(format!("head width {w} is not a multiple of 16"));
+    }
+    if w > WIDEST {
+        return Err(format!("head width {w} exceeds max {WIDEST}"));
+    }
+    if w > CW as usize && !w.is_multiple_of(CW as usize) {
+        return Err(format!("head width {w} is not a multiple of {CW}"));
     }
     if site.rows.is_some() {
-        if site.sizes.mask != Mask::Causal || w > CW as usize {
-            return None;
+        if site.sizes.mask != Mask::Causal {
+            return Err("ragged flash requires causal mask".into());
+        }
+        if w > CW as usize {
+            return Err(format!("head width {w} exceeds ragged limit {CW}"));
         }
         // Keys stage a block at a time, in one run.
         let run = site.sizes.kept.run(site.sizes.context);
         if !run.is_multiple_of(WAYS[0].0 as usize) {
-            return None;
+            return Err(format!("kept run {run} is not a multiple of {}", WAYS[0].0));
         }
+    }
+    Ok(())
+}
+
+/// Scale the queries, then attend by tiles.
+fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let site: sites::Attend = tree.site(at)?;
+    check_flash(&site).ok()?;
+    let w = site.sizes.width;
+    if site.rows.is_some() {
         return site.ragged(FlashRows(site.sizes));
     }
     // Each way: scaling, then flash. Held queries need one slice.
@@ -933,4 +950,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(drafts)
 }
 
-tessera_lower::rule!("flash", propose);
+fn why_not(tree: &Tree, at: T) -> Option<String> {
+    let site: sites::Attend = tree.site(at)?;
+    check_flash(&site).err()
+}
+
+tessera_lower::rule!("flash", propose, why = why_not);

@@ -1,14 +1,14 @@
 //! DFlash speculative bundle: tapped target plus cached drafter.
 
 use crate::names::Rule;
-use crate::{Bundle, Overrides, Stream, Weights, load_tapped, numbered, offer};
+use crate::repack::{self, Repack};
+use crate::{Bundle, Overrides, Stream, Weights, load_tapped, offer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Slice, Stored};
+use tessera_checkpoint::{Offer, Shards, Slice};
 use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, stepper};
-use tessera_engine::form::{Load, named};
-use tessera_engine::{DimExpr, Graph, Norm, PathSeg, Pins, Steps, Weight};
+use tessera_engine::{Graph, Norm, PathSeg, Pins, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -28,50 +28,15 @@ impl Stream for DraftWeights {
         take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
         let combined = Overlay::new(&self.draft, self.target.as_ref());
-        let shape = |g: &Graph, _: &[PathSeg], s: &[DimExpr]| fixed_2d(g, s);
-        let (g, rules, pins) = (&self.graph, &self.rules[..], &self.pins);
-        packing(g, &combined, rules, pins, shape, shares, take)
+        repack::stream(
+            &self.graph,
+            &combined,
+            &self.rules,
+            &self.pins,
+            shares,
+            take,
+        )
     }
-}
-
-/// Fixed 2D size of a weight that may pack.
-pub(crate) type Shape = fn(&Graph, &[PathSeg], &[DimExpr]) -> Option<[usize; 2]>;
-
-/// As `numbered`, packing pinned BF16 weights that `shape` sizes.
-pub(crate) fn packing(
-    graph: &Graph,
-    offer: &dyn Offer,
-    rules: &[Rule],
-    pins: &Pins,
-    shape: Shape,
-    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
-    take: &mut dyn FnMut(u32, Weight) -> Result<()>,
-) -> Result<()> {
-    let mxfp8 = named("mxfp8");
-    numbered(graph, offer, &[rules], shares, &mut |at, w| {
-        let weight = &graph.weights[at as usize];
-        let packed = if pins.form(&weight.path).name() == "mxfp8"
-            && let (Some(form), Weight::Packed(src, bytes)) = (mxfp8, &w)
-            && src.name() == "bf16"
-            && let Some(dims) = shape(graph, &weight.path, &weight.ty.shape.0)
-        {
-            Some(Weight::Packed(
-                form,
-                bf16_to_mxfp8(bytes, dims, shares(at), form),
-            ))
-        } else {
-            None
-        };
-        take(at, packed.unwrap_or(w))
-    })
-}
-
-fn fixed_2d(graph: &Graph, shape: &[DimExpr]) -> Option<[usize; 2]> {
-    if shape.len() != 2 {
-        return None;
-    }
-    let val = |d: &DimExpr| d.value(&graph.dims, &|_| None).map(|n| n as usize);
-    Some([val(&shape[0])?, val(&shape[1])?])
 }
 
 fn keep_bf16(path: &[PathSeg], quant: DraftQuant) -> bool {
@@ -90,7 +55,7 @@ fn keep_bf16(path: &[PathSeg], quant: DraftQuant) -> bool {
     false
 }
 
-/// Pins eligible BF16 linear weights to MXFP8.
+/// Pins eligible float linear weights to MXFP8 when `quant` asks.
 pub(crate) fn draft_pins(
     graph: &Graph,
     offer: &dyn Offer,
@@ -98,78 +63,10 @@ pub(crate) fn draft_pins(
     rules: &[&[Rule]],
     quant: DraftQuant,
 ) -> Result<Pins> {
-    let slices = offer.slices();
-    let claims = crate::names::resolve(graph, &slices, rules)?;
-    let mxfp8 = (quant != DraftQuant::Bf16)
-        .then(|| named("mxfp8"))
-        .flatten();
-    let mut forms: Vec<&'static dyn Load> = Vec::with_capacity(claims.len());
-    for (c, w) in claims.iter().zip(&graph.weights) {
-        let slice = slices.iter().find(|s| s.name == c.name).expect("resolved");
-        let eligible = mxfp8.is_some()
-            && slice.stored == Stored::Bf16
-            && c.parts.is_empty()
-            && c.rows.is_none()
-            && !keep_bf16(&w.path, quant)
-            && fixed_2d(graph, &w.ty.shape.0)
-                .is_some_and(|[n, k]| n.is_multiple_of(16) && k.is_multiple_of(512));
-        if eligible {
-            forms.push(mxfp8.expect("checked"));
-        } else {
-            forms.push(crate::form(slice.stored, !c.parts.is_empty())?);
-        }
-    }
-    Ok(crate::gguf::pins(graph, &forms, layers))
-}
-
-/// Packs a BF16 matrix slice into MXFP8 across CPU threads.
-pub(crate) fn bf16_to_mxfp8(
-    bytes: &[u8],
-    [rows, cols]: [usize; 2],
-    share: Option<(u32, usize, usize)>,
-    mxfp8: &'static dyn Load,
-) -> Vec<u8> {
-    let (r0, r_cnt, c0, c_cnt) = match share {
-        Some((0, first, count)) => (first, count, 0, cols),
-        Some((1, first, count)) => (0, rows, first, count),
-        _ => (0, rows, 0, cols),
-    };
-    let row_out = mxfp8.bytes(c_cnt);
-    let mut out = vec![0u8; r_cnt * row_out];
-    if r_cnt == 0 || c_cnt == 0 {
-        return out;
-    }
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(r_cnt);
-    let per = r_cnt.div_ceil(threads);
-    std::thread::scope(|scope| {
-        for (ti, chunk) in out.chunks_mut(per * row_out).enumerate() {
-            let start_r = r0 + ti * per;
-            let count_r = chunk.len() / row_out;
-            scope.spawn(move || {
-                let batch = (65_536 / c_cnt.max(1)).clamp(1, count_r);
-                let mut buf = vec![0.0f32; batch * c_cnt];
-                let mut done = 0;
-                while done < count_r {
-                    let take = batch.min(count_r - done);
-                    let floats = &mut buf[..take * c_cnt];
-                    for dr in 0..take {
-                        let base = ((start_r + done + dr) * cols + c0) * 2;
-                        let src = &bytes[base..base + c_cnt * 2];
-                        let dst = &mut floats[dr * c_cnt..(dr + 1) * c_cnt];
-                        for (o, &pair) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                            *o = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
-                        }
-                    }
-                    let packed = mxfp8.pack(floats);
-                    chunk[done * row_out..(done + take) * row_out].copy_from_slice(&packed);
-                    done += take;
-                }
-            });
-        }
-    });
-    out
+    let target = (quant != DraftQuant::Bf16).then(Repack::mxfp8).flatten();
+    repack::pins(graph, offer, layers, rules, target, |path| {
+        !keep_bf16(path, quant)
+    })
 }
 
 /// Loaded target bundle paired with its DFlash drafter.
@@ -275,14 +172,6 @@ impl Offer for Overlay<'_> {
             return Ok(take_part(&all, *i, *count));
         }
         self.source(name).packed(name)
-    }
-
-    fn bf16(&self, name: &str) -> std::result::Result<Vec<u8>, tessera_checkpoint::Error> {
-        if let Some((parent, i, count)) = self.stacked.get(name) {
-            let all = self.primary.bf16(parent)?;
-            return Ok(take_part(&all, *i, *count));
-        }
-        self.source(name).bf16(name)
     }
 
     fn packed_rows(

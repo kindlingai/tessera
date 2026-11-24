@@ -2,7 +2,7 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{Stream, Weights, is_exlr8, numbered, pins};
+use crate::{Stream, Weights, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
@@ -180,20 +180,20 @@ fn open(
     step: Option<(&[Rule], Steps, &[u64])>,
 ) -> Result<Release> {
     let mut config = parse_config(json, sizes)?;
-    let exlr8 = is_exlr8(dir);
-    let mut rules = rules(&config, exlr8);
+    let offer = crate::offer(dir, manifest)?;
+    let rotated = crate::mla::has_rotated_experts(&offer.slices());
+    let mut rules = rules(&config, rotated);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
         config.stack.taps = taps.to_vec();
         rules.extend(user.iter().cloned());
     }
-    let graph = match (exlr8, step.is_some()) {
+    let graph = match (rotated, step.is_some()) {
         (true, true) => stepper::<RotatedMoe>(&config),
         (true, false) => program::<RotatedMoe>(&config),
         (false, true) => stepper::<Moe>(&config),
         (false, false) => program::<Moe>(&config),
     };
-    let offer = crate::offer(dir, manifest)?;
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {
         config,

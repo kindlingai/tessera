@@ -23,6 +23,9 @@ mod names_test;
 pub mod parts;
 pub mod qwen35;
 pub mod qwen4_exp;
+pub(crate) mod repack;
+#[cfg(test)]
+mod repack_test;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -40,9 +43,9 @@ use names::Rule;
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Stored, exlr8};
+use tessera_checkpoint::{Offer, Stored};
 use tessera_engine::decoder::Config;
-use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
+use tessera_engine::form::{F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
 use tessera_engine::wasm::Module;
 use tessera_engine::{DimName, Graph, Pins, PleConfig, Steps, Tensor, Weight};
@@ -252,7 +255,7 @@ pub(crate) fn form(
     set: bool,
 ) -> Result<&'static dyn Load, Box<dyn Error + Send + Sync>> {
     match stored {
-        Stored::Bf16 => Ok(BF16_FORM),
+        Stored::Form(f) if f.name() == "f32" => Ok(F32_FORM),
         // Only a form without a header joins byte for byte.
         Stored::Form(f) if set && f.bytes(0) != 0 => {
             Err(format!("a set of {} matrices, each with a header", f.name()).into())
@@ -295,21 +298,18 @@ pub fn each(
             |e: &tessera_engine::DimExpr| e.value(&graph.dims, &|_| None).map(|n| n as usize);
         let shape: Option<Vec<usize>> = w.ty.shape.0.iter().map(axis).collect();
         let f = form(slice.stored, !c.parts.is_empty())?;
-        let weight = match (slice.stored, c.rows) {
+        let packed = matches!(slice.stored, Stored::Form(src) if src.name() != "f32");
+        let weight = match (packed, c.rows) {
             _ if !c.parts.is_empty() => stacked(offer, slice.stored, &c.parts, shape)?,
-            (Stored::Form(_), Some(rows)) => Weight::Packed(f, offer.packed_rows(&c.name, rows)?),
-            (Stored::Form(_), None) => match shares(at as u32) {
-                Some((ax, first, count)) => {
+            (true, Some(rows)) => Weight::Packed(f, offer.packed_rows(&c.name, rows)?),
+            (true, None) => match (shares(at as u32), offer.filed(&c.name)) {
+                (Some((ax, first, count)), None) => {
                     Weight::Packed(f, offer.packed_axis(&c.name, ax, (first, count))?)
                 }
-                None => Weight::Packed(f, offer.packed(&c.name)?),
+                (_, Some(file)) => Weight::Filed(f, file),
+                (None, None) => Weight::Packed(f, offer.packed(&c.name)?),
             },
-            (Stored::Bf16, None) => match offer.filed(&c.name) {
-                Some(file) => Weight::Filed(BF16_FORM, file),
-                None => halves(offer, slice, None)?,
-            },
-            (Stored::Bf16, rows) => halves(offer, slice, rows)?,
-            _ => floats(offer, slice, c.rows, shape)?,
+            (false, _) => floats(offer, slice, c.rows, shape)?,
         };
         take(weight, f)?;
     }
@@ -323,15 +323,9 @@ fn stacked(
     parts: &[String],
     shape: Option<Vec<usize>>,
 ) -> Result<Weight, Box<dyn Error + Send + Sync>> {
-    let mut all = Vec::new();
     match stored {
-        Stored::Bf16 => {
-            for p in parts {
-                all.extend(offer.bf16(p)?);
-            }
-            Ok(Weight::Packed(BF16_FORM, all))
-        }
-        Stored::Form(_) => {
+        Stored::Form(src) if src.name() != "f32" => {
+            let mut all = Vec::new();
             for p in parts {
                 all.extend(offer.packed(p)?);
             }
@@ -346,20 +340,6 @@ fn stacked(
             Ok(Weight::Floats(Tensor::f32(shape, floats)))
         }
     }
-}
-
-/// A bf16 slice's bytes, or its `rows`, kept packed.
-fn halves(
-    offer: &dyn Offer,
-    slice: &tessera_checkpoint::Slice,
-    rows: Option<(usize, usize)>,
-) -> Result<Weight, tessera_checkpoint::Error> {
-    let mut v = offer.bf16(&slice.name)?;
-    if let Some((first, count)) = rows {
-        let stride = 2 * slice.elements() / slice.shape[0];
-        v = v[first * stride..(first + count) * stride].to_vec();
-    }
-    Ok(Weight::Packed(BF16_FORM, v))
 }
 
 /// A slice's floats, or its `rows`, in the graph's shape.
@@ -389,23 +369,12 @@ pub(crate) fn config(
     })
 }
 
-/// The file whose presence marks an exlr8 release.
-const EXLR8: &str = "dense/exlr8-vocab.safetensors";
-
-/// Whether `dir` holds an exlr8 release.
-pub(crate) fn is_exlr8(dir: &Path) -> bool {
-    dir.join(EXLR8).is_file()
-}
-
-/// `dir`'s weights: an exlr8 release at `manifest`, or shards.
+/// Opens `dir`'s weights through the checkpoint format registry.
 pub(crate) fn offer(
     dir: &Path,
     manifest: Option<&str>,
 ) -> Result<Box<dyn Offer>, Box<dyn Error + Send + Sync>> {
-    Ok(match is_exlr8(dir) {
-        true => Box::new(release(dir, manifest)?),
-        false => Box::new(Shards::open(dir)?),
-    })
+    Ok(tessera_checkpoint::open(dir, manifest)?)
 }
 
 /// Reads a model directory: `slots` sequences of `context` rows.
@@ -518,24 +487,6 @@ pub fn forward(
         .forward
         .ok_or_else(|| format!("{} has no forward graph yet", arch.name))?;
     forward(arch, &arch::Ask::plain(dir, sizes, overrides, &json))
-}
-
-/// `dir`'s exlr8 release at `name`, or its only manifest.
-pub(crate) fn release(
-    dir: &Path,
-    name: Option<&str>,
-) -> Result<exlr8::Release, Box<dyn Error + Send + Sync>> {
-    let release = exlr8::Release::open(dir);
-    let all = release.manifests();
-    let name = match (name, all.as_slice()) {
-        (Some(name), _) => name.to_string(),
-        (None, []) => return Ok(release),
-        (None, [one]) => one.clone(),
-        (None, many) => {
-            return Err(format!("the release has manifests {}: pick one", many.join(", ")).into());
-        }
-    };
-    Ok(release.manifest(&name)?)
 }
 
 /// The graph and weights with `dir`'s tokenizer, template, stops.

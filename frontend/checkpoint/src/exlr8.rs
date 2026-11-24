@@ -335,6 +335,30 @@ enum Where {
     Url(String),
 }
 
+/// Whether `dir` holds an exlr8 release directory.
+pub fn is_release(dir: &Path) -> bool {
+    dir.join("dense/exlr8-vocab.safetensors").is_file()
+        || dir.join("exlr8-vocab.safetensors").is_file()
+}
+
+/// Opens an exlr8 release, picking `name` or its sole manifest.
+pub fn open_manifest(dir: &Path, name: Option<&str>) -> Result<Release, Error> {
+    let release = Release::open(dir);
+    let all = release.manifests();
+    let picked = match (name, all.as_slice()) {
+        (Some(name), _) => name.to_string(),
+        (None, []) => return Ok(release),
+        (None, [one]) => one.clone(),
+        (None, many) => {
+            return Err(Error::Format(format!(
+                "the release has manifests {}: pick one",
+                many.join(", ")
+            )));
+        }
+    };
+    release.manifest(&picked)
+}
+
 impl Release {
     pub fn open(dir: &Path) -> Self {
         Self::new(Where::Dir(dir.to_path_buf()))
@@ -600,10 +624,10 @@ impl Release {
         read(&files[file])
     }
 
-    /// The packed codes of `M.codes`, or `rows` as `(first, count)`.
-    pub fn packed(&self, name: &str, rows: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
+    /// Packed bytes of `name`, or `range` rows `(first, count)`.
+    pub fn packed(&self, name: &str, range: Option<(usize, usize)>) -> Result<Vec<u8>, Error> {
         if let Some((layer, local)) = self.expert(name) {
-            return self.expert_codes(layer, local, rows.map(|(f, c)| (0, f, c)));
+            return self.expert_codes(layer, local, range.map(|(f, c)| (0, f, c)));
         }
         let (file, local) = self.place(name);
         let matrix = local
@@ -611,12 +635,38 @@ impl Release {
             .or(local.strip_suffix(".weight"));
         let matrix = matrix.unwrap_or(&local).to_string();
         let whole = local.ends_with(".weight");
-        self.with(&file, |f| match record(f, &matrix)? {
-            r if block_form(r.format).is_some() => {
-                blocks(f, &matrix, &r, rows.unwrap_or((0, r.out)))
+        self.with(&file, |f| match record(f, &matrix) {
+            Ok(r) if block_form(r.format).is_some() => {
+                blocks(f, &matrix, &r, range.unwrap_or((0, r.out)))
             }
-            r if r.format == TRELLIS && whole => turned(f, &matrix),
-            _ => codes_packed(f, &matrix, rows),
+            Ok(r) if r.format == BF16 => {
+                let tensor = format!("{matrix}.bf16");
+                match range {
+                    Some((first, count)) => {
+                        let stride = 2 * r.inp as u64;
+                        f.bytes_at(&tensor, first as u64 * stride, Some(count as u64 * stride))
+                    }
+                    None => f.bytes(&tensor),
+                }
+            }
+            Ok(r) if r.format == ROWS => {
+                let mut all = rows(f, &matrix, &r, narrow)?;
+                if let Some((first, count)) = range {
+                    all = all.into_iter().skip(first).take(count).collect();
+                }
+                Ok(all.into_flattened())
+            }
+            Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix),
+            Ok(_) => codes_packed(f, &matrix, range),
+            Err(e) => {
+                if f.is_bf16(&local) {
+                    return match range {
+                        Some(r) => f.packed_rows(&local, r),
+                        None => f.bytes(&local),
+                    };
+                }
+                Err(e)
+            }
         })
     }
 
@@ -743,7 +793,7 @@ impl Release {
                 if let Ok(r) = r {
                     let stored = match (dense, r.format) {
                         (false, _) | (true, FP32) => Stored::F32,
-                        (true, format) => block_form(format).map_or(Stored::Bf16, Stored::Form),
+                        (true, format) => block_form(format).map_or(Stored::BF16, Stored::Form),
                     };
                     out.push(Slice {
                         name: name("weight"),
@@ -857,22 +907,6 @@ impl Offer for Release {
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
         Release::packed(self, name, None)
-    }
-
-    /// BF16 matrices and tensors as stored, others narrowed.
-    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        let (file, local) = self.place(name);
-        let matrix = local.strip_suffix(".weight").unwrap_or(&local).to_string();
-        let stored = self.with(&file, |f| match record(f, &matrix) {
-            Ok(r) if r.format == BF16 => f.bytes(&format!("{matrix}.bf16")).map(Some),
-            Ok(r) if r.format == ROWS => Ok(Some(rows(f, &matrix, &r, narrow)?.into_flattened())),
-            Err(_) if f.is_bf16(&local) => f.bytes(&local).map(Some),
-            _ => Ok(None),
-        })?;
-        if let Some(bytes) = stored {
-            return Ok(bytes);
-        }
-        Ok(self.read(name)?.iter().flat_map(narrow).collect())
     }
 
     fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {

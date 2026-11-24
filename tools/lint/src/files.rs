@@ -105,9 +105,9 @@ pub struct Exception {
 
 /// The `lint.toml` line that names `path`.
 fn config_line(path: &str) -> usize {
-    let text = include_str!("../../../lint.toml");
     let quoted = format!("\"{path}\"");
-    text.lines()
+    crate::CONFIG
+        .lines()
         .position(|l| l.contains(&quoted))
         .map_or(1, |i| i + 1)
 }

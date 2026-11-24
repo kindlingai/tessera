@@ -16,7 +16,7 @@ pub(crate) struct Choice {
     pub(crate) rule: &'static str,
     pub(crate) drafts: Vec<Draft>,
     /// Seconds for the drafts and for all they read.
-    cost: f64,
+    pub(crate) cost: f64,
     /// Every rule that proposed here.
     pub(crate) offered: Vec<&'static str>,
     /// Each runnable way here: its rule and kernel names.
@@ -263,7 +263,7 @@ impl Cover<'_> {
     }
 
     /// Seconds for one draft. A module's sum costs the engine's.
-    fn seconds(&self, zone: u32, d: &Draft) -> Option<f64> {
+    pub(crate) fn seconds(&self, zone: u32, d: &Draft) -> Option<f64> {
         if d.kernel.name() == AllReduce::NAME {
             let form = d.writes.map_or(F32_FORM, |w| self.tree.node(w).form);
             return self.device.all_reduce(form.bytes(d.len));
@@ -274,7 +274,7 @@ impl Cover<'_> {
     }
 
     /// Seconds to widen reads the drafts cannot take as stored.
-    fn widening(&self, zone: u32, drafts: &[Draft]) -> f64 {
+    pub(crate) fn widening(&self, zone: u32, drafts: &[Draft]) -> f64 {
         let mut seconds = 0.0;
         for d in drafts {
             for (i, r) in d.reads.iter().enumerate() {
@@ -300,7 +300,7 @@ impl Cover<'_> {
     }
 
     /// Seconds to narrow outputs the drafts write as floats.
-    fn narrowing(&self, zone: u32, t: T, drafts: &[Draft]) -> f64 {
+    pub(crate) fn narrowing(&self, zone: u32, t: T, drafts: &[Draft]) -> f64 {
         let mut seconds = 0.0;
         let last = drafts.len().saturating_sub(1);
         for (i, d) in drafts.iter().enumerate() {
@@ -318,7 +318,7 @@ impl Cover<'_> {
     }
 
     /// Whether a cover hides a node the favorite takes here.
-    fn swallows(&self, rule: &Rule, t: T, drafts: &[Draft], kind: ZoneKind) -> bool {
+    pub(crate) fn swallows(&self, rule: &Rule, t: T, drafts: &[Draft], kind: ZoneKind) -> bool {
         let Some(favorite) = self.favorite.filter(|f| f.name != rule.name) else {
             return false;
         };
@@ -373,7 +373,7 @@ impl Cover<'_> {
 }
 
 /// A tree runs on a CPU too, in lockstep.
-fn fits(d: &Draft, kind: ZoneKind) -> bool {
+pub(crate) fn fits(d: &Draft, kind: ZoneKind) -> bool {
     d.kernel.runs_on() == kind || (kind == ZoneKind::Cpu && made(d))
 }
 

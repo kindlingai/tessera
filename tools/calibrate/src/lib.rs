@@ -21,21 +21,24 @@ use tessera_run::Run;
 use tessera_sim::Chip;
 
 /// Timed tries of each step. `fit` keeps a low one.
-const TRIES: usize = 5;
+pub(crate) const TRIES: usize = 5;
 /// Launches back to back in one try, at most.
-const BURST: usize = 16;
+pub(crate) const BURST: usize = 16;
 /// Seconds one try aims to fill.
 const AIM: f64 = 1e-3;
 
-/// `TRIES` bursts of step `i`, each about `AIM` long.
-fn bursts(runner: &mut dyn Run, i: usize) -> Result<Vec<f64>, Error> {
+/// `tries` bursts of step `i`, each about `AIM` long.
+fn bursts(runner: &mut dyn Run, i: usize, tries: usize, burst: usize) -> Result<Vec<f64>, Error> {
     let once = runner.repeat(i, 1)?;
-    let times = (AIM / once.max(1e-7)).clamp(1.0, BURST as f64) as usize;
-    let mut tries = Vec::with_capacity(TRIES);
-    for _ in 0..TRIES {
-        tries.push(runner.repeat(i, times)?);
+    if tries == 1 && burst == 1 {
+        return Ok(vec![once]);
     }
-    Ok(tries)
+    let times = (AIM / once.max(1e-7)).clamp(1.0, burst as f64) as usize;
+    let mut got = Vec::with_capacity(tries);
+    for _ in 0..tries {
+        got.push(runner.repeat(i, times)?);
+    }
+    Ok(got)
 }
 
 /// The low quartile: noise only adds time.
@@ -44,23 +47,43 @@ fn low(mut tries: Vec<f64>) -> f64 {
     tries[(tries.len() - 1) / 4]
 }
 
-/// Times every launch of the plan, its inputs already fed.
-pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
+/// Times launches of the plan, skipping steps `skip` already knows.
+fn time_steps(
+    runner: &mut dyn Run,
+    skip: Option<&Device>,
+    (tries, burst): (usize, usize),
+) -> Result<Vec<(Step, f64)>, Error> {
     let steps = runner.plan().steps.clone();
     // The first run pays for anything set up lazily.
     runner.submit(0..steps.len())?;
-    let mut timed = Vec::with_capacity(TRIES * steps.len());
+    let mut timed = Vec::new();
+    let mut seen: Vec<(String, usize)> = Vec::new();
     // Bursts keep the clocks up, as a running plan does.
     for (i, step) in steps.iter().enumerate() {
-        for seconds in bursts(runner, i)? {
+        if let Some(device) = skip {
+            let key = (format!("{:?}", step.kernel), step.write.len);
+            if device.known(step) || seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+        }
+        for seconds in bursts(runner, i, tries, burst)? {
             timed.push((step.clone(), seconds));
         }
     }
     Ok(timed)
 }
 
+/// Times every launch of the plan, its inputs already fed.
+pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
+    time_steps(runner, None, (TRIES, BURST))
+}
+
 /// Each distinct launch's seconds with its weights read cold.
-fn time_cold(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
+fn time_cold(
+    runner: &mut dyn Run,
+    (tries, burst): (usize, usize),
+) -> Result<Vec<(Step, f64)>, Error> {
     let steps = runner.plan().steps.clone();
     let all = 0..steps.len();
     runner.submit(all.clone())?;
@@ -72,15 +95,15 @@ fn time_cold(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
         let seconds = match kinds.iter().find(|(k, ..)| *k == key) {
             Some((_, _, seconds)) => *seconds,
             None => {
-                let seconds = low(bursts(runner, i)?);
+                let seconds = low(bursts(runner, i, tries, burst)?);
                 kinds.push((key, i, seconds));
                 seconds
             }
         };
         warm.push(seconds);
     }
-    let mut whole = Vec::with_capacity(TRIES);
-    for _ in 0..TRIES {
+    let mut whole = Vec::with_capacity(tries);
+    for _ in 0..tries {
         let start = Instant::now();
         let clocked = runner.clocked(all.clone())?;
         whole.push(clocked.unwrap_or_else(|| start.elapsed().as_secs_f64()));
@@ -93,44 +116,57 @@ fn time_cold(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
     Ok(cold.collect())
 }
 
-/// Times `entry` under each competing rule, cold if asked.
-fn measure(
-    runner: &mut dyn Run,
+/// Whether `device` already has a sample for `step`.
+fn known(device: &Device, step: &Step, cold: bool) -> bool {
+    match cold {
+        true => device.known_cold(step),
+        false => device.known(step),
+    }
+}
+
+/// Plans for `(g, entry)` at `sizes` with unknown steps.
+fn pending(
     (g, entry): (&Graph, usize),
     sizes: &[(DimName, u64)],
-    feeds: &[View],
-    device: &mut Device,
-    (settings, cold): (&Settings, bool),
-) -> Result<Vec<(Step, f64)>, Error> {
-    if device.platform != runner.platform() {
-        *device = device.clone().on(runner.platform());
-    }
-    // Same pins and platform: weights stay, device kernels compete.
-    let (pins, platform) = (device.pins.clone(), runner.platform());
+    device: &Device,
+    settings: &Settings,
+    cold: bool,
+) -> Result<Vec<tessera_lower::Plan>, Error> {
+    let (pins, platform) = (device.pins.clone(), device.platform.clone());
     let guess = || {
         Device::guess(settings)
             .on(platform.clone())
             .pinned(pins.clone())
     };
-    let mut added = Vec::new();
+    let mut plans = Vec::new();
     for choice in choices((g, entry), sizes, &guess)? {
         let plan = lower(g, entry, sizes, &choice)?;
-        let known = |s: &Step| {
-            if cold {
-                device.known_cold(s)
-            } else {
-                device.known(s)
-            }
-        };
-        if plan.steps.iter().all(known) {
+        if !plan.steps.iter().all(|s| known(device, s, cold)) {
+            plans.push(plan);
+        }
+    }
+    Ok(plans)
+}
+
+/// Times each plan in `plans` that still has unknown steps.
+fn time_plans(
+    runner: &mut dyn Run,
+    plans: &[tessera_lower::Plan],
+    feeds: &[View],
+    device: &mut Device,
+    (cold, tries, burst): (bool, usize, usize),
+) -> Result<Vec<(Step, f64)>, Error> {
+    let mut added = Vec::new();
+    for plan in plans {
+        if plan.steps.iter().all(|s| known(device, s, cold)) {
             continue;
         }
-        runner.replan(&plan)?;
+        runner.replan(plan)?;
         runner.feed(feeds)?;
         let timed = if cold {
-            time_cold(runner)?
+            time_cold(runner, (tries, burst))?
         } else {
-            time(runner)?
+            time_steps(runner, Some(device), (tries, burst))?
         };
         let pairs = timed.iter().map(|(step, seconds)| (step, *seconds));
         match cold {
@@ -141,6 +177,43 @@ fn measure(
     }
     device.name = runner.device();
     Ok(added)
+}
+
+/// Times `entry` under each competing rule, cold if asked.
+fn measure(
+    runner: &mut dyn Run,
+    (g, entry): (&Graph, usize),
+    sizes: &[(DimName, u64)],
+    feeds: &[View],
+    device: &mut Device,
+    (settings, cold): (&Settings, bool),
+) -> Result<Vec<(Step, f64)>, Error> {
+    measure_with(
+        runner,
+        (g, entry),
+        sizes,
+        feeds,
+        device,
+        (settings, cold),
+        (TRIES, BURST),
+    )
+}
+
+/// Times `entry` with custom `tries` and `burst` limits.
+fn measure_with(
+    runner: &mut dyn Run,
+    (g, entry): (&Graph, usize),
+    sizes: &[(DimName, u64)],
+    feeds: &[View],
+    device: &mut Device,
+    (settings, cold): (&Settings, bool),
+    (tries, burst): (usize, usize),
+) -> Result<Vec<(Step, f64)>, Error> {
+    if device.platform != runner.platform() {
+        *device = device.clone().on(runner.platform());
+    }
+    let plans = pending((g, entry), sizes, device, settings, cold)?;
+    time_plans(runner, &plans, feeds, device, (cold, tries, burst))
 }
 
 /// The guess, each competing rule, then each rule's ways.

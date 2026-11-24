@@ -5,10 +5,12 @@ use tessera_engine::{
     Allowed, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row,
     Site, Steps,
 };
-use tessera_graph::{Graph, Op, Role};
+use tessera_graph::{Dim, DimName::Rows, Graph, Op, Role};
 use tessera_interp::{Store, Tensor, run_kept};
-use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
-use tessera_lower::{Pins, Recipe, Settings, Weight, kept, rules};
+use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
+use tessera_lower::{
+    Device, Limits, Pins, Platform, Recipe, Settings, Weight, explain, kept, rules,
+};
 use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
 use tessera_models::mla;
 use tessera_run::testing::runs;
@@ -709,4 +711,80 @@ fn pinned_decoder_matches() {
             }
         }
     }
+}
+
+/// Fast-path diagnostics report rule and hardware rejections accurately.
+#[test]
+fn lowering_report_diagnostics() {
+    let rows = [Dim::bounded(Rows, 128)];
+    let cuda = Platform {
+        backend: "cuda".into(),
+        ..Platform::host(Limits::assumed())
+    };
+    let cuda_no_bf16 = Platform {
+        backend: "cuda".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let metal = Platform {
+        backend: "metal".into(),
+        ..Platform::assumed(Limits::assumed())
+    };
+    let mxfp8 = named("mxfp8").expect("mxfp8 form");
+
+    // Aligned m=1 bf16 hits fast_gemv with no warning.
+    let g_ok = tessera_testkit::graphs::linear(&rows, 512, 256);
+    let dev = Device::default()
+        .on(cuda.clone())
+        .pinned(Pins::all(BF16_FORM));
+    let r = explain(&g_ok, 0, &[(Rows, 1)], &dev).unwrap();
+    assert!(!r.has_fallbacks(), "{}", r.format(10));
+    assert!(r.warning("--explain-lowering").is_none());
+
+    // Unaligned k=768 mxfp8 misses fast_gemv and emits boot warning.
+    let g_unaligned = tessera_testkit::graphs::linear(&rows, 768, 256);
+    let dev_mxfp8 = Device::default().on(cuda.clone()).pinned(Pins::all(mxfp8));
+    let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_mxfp8).unwrap();
+    assert!(r.has_fallbacks());
+    let msg = r.format(10);
+    assert!(msg.contains("fast_gemv"), "{msg}");
+    assert!(msg.contains("k=768 is not a multiple of 1024"), "{msg}");
+    let warn = r.warning("--explain-lowering").expect("warning");
+    assert!(
+        warn.contains("warning: lowering fell off fast path"),
+        "{warn}"
+    );
+    assert!(warn.contains("--explain-lowering"), "{warn}");
+
+    // Oversized m=80 exceeds fast_mm's 64-row limit.
+    let r = explain(&g_ok, 0, &[(Rows, 80)], &dev).unwrap();
+    assert!(r.has_fallbacks());
+    let msg = r.format(10);
+    assert!(msg.contains("fast_mm"), "{msg}");
+    assert!(msg.contains("m=80 exceeds max 64"), "{msg}");
+
+    // Missing bf16 tensor tiles reports hardware mismatch via Needs.
+    let dev_no_tile = Device::default()
+        .on(cuda_no_bf16)
+        .pinned(Pins::all(BF16_FORM));
+    let r = explain(&g_ok, 0, &[(Rows, 8)], &dev_no_tile).unwrap();
+    assert!(r.has_fallbacks());
+    let msg = r.format(10);
+    assert!(msg.contains("fast_mm"), "{msg}");
+    assert!(msg.contains("requires bf16 tensor tiles"), "{msg}");
+
+    // Metal ignores CUDA-only fast_gemv to avoid false boot warnings.
+    let dev_metal = Device::default().on(metal).pinned(Pins::all(mxfp8));
+    let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_metal).unwrap();
+    assert!(!r.has_fallbacks(), "{}", r.format(10));
+
+    // Engine::lowering_report works end to end and sets the row label.
+    let g = stepper::<Norm, Swiglu>(&Config::toy(1, 16));
+    let settings = Settings {
+        backend: tessera_engine::Pick::Cpu,
+        ..Settings::default()
+    };
+    let mut engine = Engine::open(g, 16, &Recipe::default(), &settings).unwrap();
+    let r = engine.lowering_report(1).unwrap();
+    assert_eq!(r.label, "rows=1");
+    assert!(r.total_ops > 0);
 }
