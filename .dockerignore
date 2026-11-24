@@ -6,3 +6,4 @@
 deploy
 Dockerfile
 .dockerignore
+cargo-mounts

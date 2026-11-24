@@ -47,6 +47,7 @@ jobs:
         env:
           # Files that can change the Docker image or the Kubernetes example.
           DOCKER_PATHS: '^(Dockerfile|\.dockerignore|deploy/|tools/scripts/image-libs\.sh$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
+          SOURCE_PATHS: '^(engine|frontend|examples|tools)/'
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
@@ -57,6 +58,8 @@ jobs:
             build=$(tools/scripts/build-needed.sh < "$RUNNER_TEMP/changed")
             docker=false
             if grep -qE "$DOCKER_PATHS" "$RUNNER_TEMP/changed"; then docker=true; fi
+            # Crate sources, which the image compiles.
+            if grep -E "$SOURCE_PATHS" "$RUNNER_TEMP/changed" | grep -qvE '^tools/scripts/|\.md$'; then docker=true; fi
           fi
           # Pushes to main build the image for any change.
           [ "$GITHUB_EVENT_NAME" != push ] || docker=$build
@@ -405,6 +408,28 @@ jobs:
           kubectl kustomize "deploy/k8s/${{ matrix.backend }}" |
           docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary -
       - uses: docker/setup-buildx-action@v3
+      # The Cargo registry and target/ cache mounts from the last push to
+      # main. Only pushes save them, so pull requests do not fill the cache.
+      - if: github.event_name == 'push'
+        uses: actions/cache@v4
+        with:
+          path: cargo-mounts
+          key: docker-mounts-${{ matrix.backend }}-${{ github.sha }}
+          restore-keys: docker-mounts-${{ matrix.backend }}-
+      - if: github.event_name != 'push'
+        uses: actions/cache/restore@v4
+        with:
+          path: cargo-mounts
+          key: docker-mounts-${{ matrix.backend }}-${{ github.sha }}
+          restore-keys: docker-mounts-${{ matrix.backend }}-
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {
+              "cargo-mounts/registry": "/usr/local/cargo/registry",
+              "cargo-mounts/target": "/src/target"
+            }
+          skip-extraction: ${{ github.event_name != 'push' }}
       # Layers from earlier runs, so an unchanged tree skips the build.
       - uses: docker/build-push-action@v6
         with:

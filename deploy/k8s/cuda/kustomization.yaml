@@ -1,5 +1,15 @@
 # The example for one NVIDIA GPU. ../rocm changes it for AMD GPUs.
+# An overlay sets the model with a tessera-model generator that has
+# behavior: merge, and the image tag with `kustomize edit set image`.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - deployment.yaml
+images:
+  - name: ghcr.io/kindlingai/tessera
+    newTag: latest
+configMapGenerator:
+  - name: tessera-model
+    literals:
+      - model=/models/Qwen3.8-Flash-Next-exlr8
+      - served-model-name=qwen3.8-flash-next
