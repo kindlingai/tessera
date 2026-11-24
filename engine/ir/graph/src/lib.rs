@@ -10,6 +10,7 @@ mod regions;
 mod scalar;
 mod select;
 mod shard;
+mod stages;
 mod trim;
 mod types;
 mod verify;
@@ -19,12 +20,15 @@ pub use infer::{ErrorKind, TypeError, infer};
 pub use json::{FormatError, VERSION};
 pub use node::{
     Act, Attend, Composite, Conv, Delta, Entry, EntryKind, Graph, Mask, Node, NodeId, Op, Output,
-    Pairs, PathSeg, Port, Region, Role, Row, Select, Stage, View, Weight,
+    Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order};
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};
+#[cfg(not(target_family = "wasm"))]
+pub use stages::STAGE_RULES;
+pub use stages::{Check, Facts, Lower, Pin, Place, STAGES, Stage, Takes};
 pub use trim::trim;
 pub use types::{DType, Placement, TensorType};
 pub use verify::{VerifyError, verify};

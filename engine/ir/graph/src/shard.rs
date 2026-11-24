@@ -1,9 +1,10 @@
 //! Tensor parallel splits matmuls. Expert parallel splits sets.
 
 use crate::infer::{infer, poly};
-use crate::node::{Graph, Node, NodeId, Op, Row, Select, Stage};
+use crate::node::{Graph, Node, NodeId, Op, Row, Select};
 use crate::numerics::Numerics;
 use crate::parts::Parts;
+use crate::stages::Stage;
 use crate::types::Placement;
 use crate::verify::{VerifyError, verify};
 

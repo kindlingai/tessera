@@ -1,8 +1,9 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Graph, Op, Select, Stage, View};
+use crate::node::{Graph, Op, Select, View};
 use crate::select;
+use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -493,16 +494,6 @@ fn valued(q: &TensorType, v: &TensorType) -> TensorType {
     out
 }
 
-/// Positions must lead `x`. Then `x` keeps whole pairs.
-fn rope(dims: &[Dim], x: &TensorType, pos: &TensorType, p: Placement) -> Result<(), TypeError> {
-    let width = poly(dims, x.shape.0.last().expect("rank checked"))?;
-    let even = width.as_const().is_none_or(|w| w % 2 == 0);
-    need(even, ErrorKind::Shape, || {
-        format!("rope needs an even width, got {}", x.shape)
-    })?;
-    positions(dims, x, pos, p)
-}
-
 /// Integer positions lead the rows of `x`, on every rank.
 fn positions(
     dims: &[Dim],
@@ -555,99 +546,24 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
         format!("row stages need floats, got {:?}", x.dtype)
     })?;
     let last = x.rank() as u32 - 1;
+    let width = x.shape.0.last().expect("rank checked");
     let mut p = x.placement;
     let mut rest = args[1..].iter();
     for s in stages {
-        let operand = (s.operands() == 1).then(|| rest.next().expect("arity checked"));
-        match (s, operand) {
-            (Stage::Add | Stage::Mul, Some(o)) => {
-                broadcast(dims, &x.shape, &o.shape)?;
-                need(o.dtype == x.dtype, ErrorKind::DType, || {
-                    format!("{s:?} mixes {:?} and {:?}", x.dtype, o.dtype)
-                })?;
-                p = combine(s, p, o.placement, x.rank() - o.rank())?;
-            }
-            (Stage::Scale(by), _) => finite(*by, "scale")?,
-            (Stage::RmsNorm { eps }, Some(w)) => {
-                finite(*eps, "norm epsilon")?;
-                let width = std::slice::from_ref(x.shape.0.last().expect("rank checked"));
-                need(
-                    same_shape(dims, &w.shape, &Shape(width.to_vec()))?,
-                    ErrorKind::Shape,
-                    || format!("norm weight {} does not match rows of {}", w.shape, x.shape),
-                )?;
-                need(w.dtype == x.dtype, ErrorKind::DType, || {
-                    "norm weight dtype differs".into()
-                })?;
-                need(
-                    w.placement == Placement::Replicated,
-                    ErrorKind::Placement,
-                    || "norm weights must be replicated".into(),
-                )?;
-                whole(p, last, s)?;
-            }
-            (Stage::Rms { eps }, _) => {
-                finite(*eps, "norm epsilon")?;
-                whole(p, last, s)?;
-            }
-            (Stage::Hadamard { block }, _) => {
-                let width = x.shape.0.last().expect("rank checked");
-                let fits = block.is_power_of_two() && blocks(dims, width, *block)?;
-                need(fits, ErrorKind::Shape, || {
-                    format!("rows of {width} do not hold whole blocks of {block}")
-                })?;
-            }
-            (Stage::Softmax | Stage::Center | Stage::UnitSum, _) => whole(p, last, s)?,
-            (Stage::Rope { theta, .. }, Some(pos)) => {
-                need(theta.is_finite() && *theta > 0.0, ErrorKind::Value, || {
-                    format!("rope base is {theta}")
-                })?;
-                rope(dims, x, pos, p)?;
-            }
-            (Stage::Causal, Some(pos)) => {
-                positions(dims, x, pos, p)?;
-                whole(p, last, s)?;
-            }
-            (Stage::Allow, Some(bits)) => {
-                allowed(dims, x, bits)?;
-                whole(p, last, s)?;
-            }
-            (Stage::Sin | Stage::Cos, _) => {
-                need(p == Placement::Replicated, ErrorKind::Placement, || {
-                    format!("{s:?} is nonlinear, so it cannot read {p:?} values")
-                })?;
-            }
-            (Stage::Act(a), _) => {
-                // Routed zeros stay zero only where the activation keeps zero.
-                let ok = p != Placement::Partial && (p != Placement::Routed || a.keeps_zero());
-                need(ok, ErrorKind::Placement, || {
-                    format!("{s:?} is nonlinear, so it cannot read {p:?} values")
-                })?;
-            }
-            (Stage::AllReduce, _) => {
-                need(p == Placement::Partial, ErrorKind::Placement, || {
-                    format!("all-reduce needs partial sums, got {p:?}")
-                })?;
-                p = Placement::Replicated;
-            }
-            (Stage::AllGather, _) => {
-                need(
-                    p == Placement::Split { axis: last },
-                    ErrorKind::Placement,
-                    || format!("all-gather needs a split last axis, got {p:?}"),
-                )?;
-                p = Placement::Replicated;
-            }
-            // Arity checks give these stages their operand.
-            (
-                Stage::Add
-                | Stage::Mul
-                | Stage::RmsNorm { .. }
-                | Stage::Rope { .. }
-                | Stage::Causal
-                | Stage::Allow,
-                None,
-            ) => {}
+        let f = s.facts();
+        f.check.holds()?;
+        let operand = (f.operand != Takes::Nothing).then(|| *rest.next().expect("arity checked"));
+        if let Some(o) = operand {
+            takes(dims, f.operand, s, x, o, p)?;
+        }
+        if f.blocks > 1 {
+            need(blocks(dims, width, f.blocks)?, ErrorKind::Shape, || {
+                format!("rows of {width} do not hold whole blocks of {}", f.blocks)
+            })?;
+        }
+        p = place(f.place, s, p, x, operand)?;
+        if f.whole {
+            whole(p, last, s)?;
         }
     }
     Ok(TensorType {
@@ -655,6 +571,97 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
         dtype: x.dtype,
         placement: p,
     })
+}
+
+impl Check {
+    fn holds(self) -> Result<(), TypeError> {
+        match self {
+            Check::Pass => Ok(()),
+            Check::Finite(x, what) => finite(x, what),
+            Check::Positive(x, what) => need(x.is_finite() && x > 0.0, ErrorKind::Value, || {
+                format!("{what} is {x}")
+            }),
+            Check::PowerOfTwo(n) => need(n.is_power_of_two(), ErrorKind::Shape, || {
+                format!("blocks of {n} are not a power of two")
+            }),
+        }
+    }
+}
+
+/// Checks operand `o` of stage `s` against row input `x`.
+fn takes(
+    dims: &[Dim],
+    kind: Takes,
+    s: &Stage,
+    x: &TensorType,
+    o: &TensorType,
+    p: Placement,
+) -> Result<(), TypeError> {
+    match kind {
+        Takes::Nothing => Ok(()),
+        Takes::Broadcast => {
+            broadcast(dims, &x.shape, &o.shape)?;
+            need(o.dtype == x.dtype, ErrorKind::DType, || {
+                format!("{s:?} mixes {:?} and {:?}", x.dtype, o.dtype)
+            })
+        }
+        Takes::RowWeight => {
+            let width = std::slice::from_ref(x.shape.0.last().expect("rank checked"));
+            need(
+                same_shape(dims, &o.shape, &Shape(width.to_vec()))?,
+                ErrorKind::Shape,
+                || format!("row weight {} does not match rows of {}", o.shape, x.shape),
+            )?;
+            need(o.dtype == x.dtype, ErrorKind::DType, || {
+                "row weight dtype differs".into()
+            })?;
+            need(
+                o.placement == Placement::Replicated,
+                ErrorKind::Placement,
+                || "row weights must be replicated".into(),
+            )
+        }
+        Takes::Positions => positions(dims, x, o, p),
+        Takes::Bits => allowed(dims, x, o),
+    }
+}
+
+/// The placement stage `s` gives a row at `p`.
+fn place(
+    rule: Place,
+    s: &Stage,
+    p: Placement,
+    x: &TensorType,
+    operand: Option<&TensorType>,
+) -> Result<Placement, TypeError> {
+    let nonlinear = |ok| {
+        need(ok, ErrorKind::Placement, || {
+            format!("{s:?} is nonlinear, so it cannot read {p:?} values")
+        })
+        .map(|()| p)
+    };
+    let last = x.rank() as u32 - 1;
+    match rule {
+        Place::Keep => Ok(p),
+        Place::Sum | Place::Product => {
+            let o = operand.expect("joining stages take an operand");
+            combine(rule == Place::Sum, s, p, o.placement, x.rank() - o.rank())
+        }
+        Place::Replicated => nonlinear(p == Placement::Replicated),
+        Place::Nonlinear(keeps_zero) => {
+            nonlinear(p != Placement::Partial && (p != Placement::Routed || keeps_zero))
+        }
+        Place::Reduce => need(p == Placement::Partial, ErrorKind::Placement, || {
+            format!("{s:?} needs partial sums, got {p:?}")
+        })
+        .map(|()| Placement::Replicated),
+        Place::Gather => need(
+            p == Placement::Split { axis: last },
+            ErrorKind::Placement,
+            || format!("{s:?} needs a split last axis, got {p:?}"),
+        )
+        .map(|()| Placement::Replicated),
+    }
 }
 
 /// The operand must match the row input's trailing axes.
@@ -669,13 +676,20 @@ fn broadcast(dims: &[Dim], x: &Shape, o: &Shape) -> Result<(), TypeError> {
     })
 }
 
-fn combine(s: &Stage, p: Placement, q: Placement, lead: usize) -> Result<Placement, TypeError> {
+/// A sum or product of `p` and operand placement `q`.
+fn combine(
+    sum: bool,
+    s: &Stage,
+    p: Placement,
+    q: Placement,
+    lead: usize,
+) -> Result<Placement, TypeError> {
     use Placement::*;
     match (p, q) {
-        (Partial, Partial) if *s == Stage::Add => Ok(Partial),
-        (Partial, Replicated) if *s == Stage::Mul => Ok(Partial),
+        (Partial, Partial) if sum => Ok(Partial),
+        (Partial, Replicated) if !sum => Ok(Partial),
         (Routed, Routed) => Ok(Routed),
-        (Routed, Replicated) | (Replicated, Routed) if *s == Stage::Mul => Ok(Routed),
+        (Routed, Replicated) | (Replicated, Routed) if !sum => Ok(Routed),
         (a, b) if shift(b, lead) == a && a != Partial => Ok(a),
         (Split { axis }, Replicated) if (axis as usize) < lead => Ok(p),
         _ => Err(TypeError {

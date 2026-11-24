@@ -1,0 +1,13 @@
+[task.add-stage]
+steps = [
+  { do = "register", with = "tessera_graph::stages::table!", like = "engine/ir/graph/src/stages.rs" },
+  { do = "define", with = "tessera_interp::cpu::stage", like = "engine/ir/interp/src/cpu.rs" },
+  { do = "define", with = "tessera_lower::kernels::MapStage", like = "engine/plan/lower/src/kernels/map.rs" },
+  { do = "register", with = "tessera_lower::stage_rule!", like = "engine/rules/kernels/src/softmax.rs" },
+  { do = "run", pkg = "tessera-graph", mode = "test" },
+  { do = "run", pkg = "tessera-interp", mode = "test" },
+  { do = "run", pkg = "tessera-kernels", mode = "test" },
+]
+each = [
+  { of = "tessera_graph::STAGE_RULES", has = "tessera_lower::rule::RULES" },
+]

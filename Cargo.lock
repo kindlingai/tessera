@@ -1974,6 +1974,7 @@ name = "tessera-graph"
 version = "0.1.0"
 dependencies = [
  "derive_more",
+ "scattered-collect",
  "serde",
  "serde_json",
  "thiserror",

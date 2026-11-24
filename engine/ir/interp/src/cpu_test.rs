@@ -218,3 +218,71 @@ fn mean_each_axis() {
     close(&out[1], &[2., 3., 8., 9.]);
     close(&out[2], &[0.5, 2.5, 4.5, 6.5, 8.5, 10.5]);
 }
+
+/// Each table row types, keeps its JSON form and runs.
+#[test]
+fn every_stage_runs() {
+    use tessera_graph::{Entry, Graph, Lower, Node, NodeId, Op, Output, Row, STAGES, Shape, Takes};
+    let x = Tensor::f32(vec![2, 8], (0..16).map(|i| i as f32 / 4.0 - 2.0).collect());
+    for s in STAGES {
+        let f = s.facts();
+        if f.lower == Lower::Crossing {
+            continue;
+        }
+        let mut ports = vec![port([Rows, Ffn], F32)];
+        let mut inputs = vec![x.clone()];
+        match f.operand {
+            Takes::Nothing => {}
+            Takes::Broadcast | Takes::RowWeight => {
+                ports.push(port([Ffn], F32));
+                inputs.push(Tensor::f32(vec![8], vec![0.5; 8]));
+            }
+            Takes::Positions => {
+                ports.push(port([Rows], U32));
+                inputs.push(Tensor::u32(vec![2], vec![1, 6]));
+            }
+            Takes::Bits => {
+                ports.push(port(Shape(vec![Rows.into(), 1u64.into()]), U32));
+                inputs.push(Tensor::u32(vec![2, 1], vec![0b1011, 0xff]));
+            }
+        }
+        let mut g = Graph::new(vec![Dim::bounded(Rows, 2), Dim::fixed(Ffn, 8)]);
+        let mut ids = Vec::new();
+        for (port, p) in (0..).zip(&ports) {
+            let op = Op::Input { entry: 0, port };
+            let ty = p.ty.clone();
+            let (args, numerics) = (Vec::new(), None);
+            g.nodes.push(Node {
+                op,
+                args,
+                ty,
+                numerics,
+            });
+            ids.push(NodeId(port));
+        }
+        let op = Op::Row(Row(vec![s.clone()]));
+        let tys: Vec<_> = ports.iter().map(|p| &p.ty).collect();
+        let ty = tessera_graph::infer(&g, &op, &tys).unwrap();
+        let numerics = op.reduces().then(Default::default);
+        g.nodes.push(Node {
+            op,
+            args: ids,
+            ty,
+            numerics,
+        });
+        let node = NodeId(ports.len() as u32);
+        let outputs = vec![Output {
+            role: Role::Logits,
+            node,
+        }];
+        let kind = EntryKind::Forward;
+        g.entries.push(Entry {
+            kind,
+            inputs: ports,
+            outputs,
+        });
+        let g = Graph::from_json(&g.to_json()).unwrap();
+        let out = run(&g, &[], 0, &inputs).unwrap();
+        assert_eq!(out[0].shape, vec![2, 8], "{s:?}");
+    }
+}

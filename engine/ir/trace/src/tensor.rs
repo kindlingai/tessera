@@ -83,50 +83,6 @@ impl Tensor {
         self.stage(Stage::Mul, &[&s.0])
     }
 
-    pub fn add(&self, other: &Tensor) -> Tensor {
-        self.stage(Stage::Add, &[other])
-    }
-
-    pub fn mul(&self, other: &Tensor) -> Tensor {
-        self.stage(Stage::Mul, &[other])
-    }
-
-    pub fn scale(&self, by: f32) -> Tensor {
-        self.stage(Stage::Scale(by), &[])
-    }
-
-    pub fn rms_norm(&self, w: &Norm, eps: f32) -> Tensor {
-        self.stage(Stage::RmsNorm { eps }, &[&w.0])
-    }
-
-    /// The row over its root mean square, with no weight.
-    pub fn rms(&self, eps: f32) -> Tensor {
-        self.stage(Stage::Rms { eps }, &[])
-    }
-
-    /// The scaled Walsh-Hadamard transform of each `block` of the row.
-    pub fn hadamard(&self, block: u32) -> Tensor {
-        self.stage(Stage::Hadamard { block }, &[])
-    }
-
-    /// Sine of each element. Only weight-only values may take it.
-    pub fn sin(&self) -> Tensor {
-        self.stage(Stage::Sin, &[])
-    }
-
-    /// Cosine of each element. Only weight-only values may take it.
-    pub fn cos(&self) -> Tensor {
-        self.stage(Stage::Cos, &[])
-    }
-
-    pub fn center(&self) -> Tensor {
-        self.stage(Stage::Center, &[])
-    }
-
-    pub fn unit_sum(&self) -> Tensor {
-        self.stage(Stage::UnitSum, &[])
-    }
-
     pub fn rope(&self, positions: &Tensor, theta: f32, pairs: Pairs) -> Tensor {
         let turned = None;
         self.stage(
@@ -150,24 +106,6 @@ impl Tensor {
             },
             &[positions],
         )
-    }
-
-    /// Entries past each row's position become -inf.
-    pub fn causal(&self, positions: &Tensor) -> Tensor {
-        self.stage(Stage::Causal, &[positions])
-    }
-
-    /// Entries whose bit in `mask` is clear become -inf.
-    pub fn allow(&self, mask: &Tensor) -> Tensor {
-        self.stage(Stage::Allow, &[mask])
-    }
-
-    pub fn act(&self, act: Act) -> Tensor {
-        self.stage(Stage::Act(act), &[])
-    }
-
-    pub fn softmax(&self) -> Tensor {
-        self.stage(Stage::Softmax, &[])
     }
 
     pub fn reshape(&self, shape: impl Into<Shape>) -> Tensor {
@@ -228,3 +166,50 @@ impl Tensor {
         self.op(Op::Cast(dtype), &[])
     }
 }
+
+/// Builders for rows with `as`: operand first, then parameters.
+macro_rules! builders {
+    ($(
+        $(#[$m:meta])*
+        $name:ident
+        $(($tb:ident: $tty:ty = $ts:expr))?
+        $({$($(#[$fm:meta])* $f:ident: $fty:ty = $fs:expr),* $(,)?})?
+        $(as $method:ident)?
+        => $lower:tt {$($col:tt)*}
+    )*) => {
+        impl Tensor {$(
+            builder! {
+                [$($method)?] [$(#[$m])*] $name
+                [$($tb: $tty)? $($($f: $fty),*)?]
+                [$(($tb))? $({$($f),*})?]
+                [$($col)*]
+            }
+        )*}
+    };
+}
+
+/// Finds the row's operand column, then writes the builder.
+macro_rules! builder {
+    ([] $($skip:tt)*) => {};
+    ($head:tt $docs:tt $name:ident $params:tt $ctor:tt [operand: $kind:ident $(, $($rest:tt)*)?]) => {
+        builder!(@emit $head $docs $name $params $ctor [$kind]);
+    };
+    ($head:tt $docs:tt $name:ident $params:tt $ctor:tt [$col:ident: $val:expr $(, $($rest:tt)*)?]) => {
+        builder!($head $docs $name $params $ctor [$($($rest)*)?]);
+    };
+    ($head:tt $docs:tt $name:ident $params:tt $ctor:tt []) => {
+        builder!(@emit $head $docs $name $params $ctor []);
+    };
+    (@emit [$method:ident] [$(#[$m:meta])*] $name:ident [$($p:ident: $pt:ty),*] [$($ctor:tt)*] [$($kind:ident)?]) => {
+        $(#[$m])*
+        pub fn $method(&self, $(operand: &builder!(@type $kind),)? $($p: $pt),*) -> Tensor {
+            self.stage(Stage::$name $($ctor)*, &[$(builder!(@arg $kind operand))?])
+        }
+    };
+    (@type RowWeight) => { Norm };
+    (@type $kind:ident) => { Tensor };
+    (@arg RowWeight $o:ident) => { &$o.0 };
+    (@arg $kind:ident $o:ident) => { $o };
+}
+
+tessera_graph::stages!(builders);

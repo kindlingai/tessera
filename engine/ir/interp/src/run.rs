@@ -6,8 +6,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use tessera_graph::{
-    DType, DimExpr, DimName, Graph, Mask, Node, NodeId, Numerics, Op, Parts, PathSeg, Placement,
-    Row, Select, Shape, Size, Stage, View,
+    DType, DimExpr, DimName, Graph, Lower, Mask, Node, NodeId, Numerics, Op, Parts, PathSeg,
+    Placement, Row, Select, Shape, Size, Stage, View,
 };
 use tessera_mem::Tensor;
 
@@ -288,7 +288,7 @@ fn all_gather(parts: &[Tensor]) -> Result<Tensor, Error> {
 
 /// Where a row's sum or gather lies, if any.
 fn joins(row: &Row) -> Option<usize> {
-    (row.0.iter()).position(|s| matches!(s, Stage::AllReduce | Stage::AllGather))
+    (row.0.iter()).position(|s| s.facts().lower == Lower::Crossing)
 }
 
 fn run_on(

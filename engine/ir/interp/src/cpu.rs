@@ -489,50 +489,51 @@ pub(crate) fn stage(
     let acc = Acc::new(n.accumulate)?;
     let mut out = x.floats()?.to_vec();
     let (_, width) = x.rows();
-    match (s, operand) {
-        (Stage::Add | Stage::Mul, Some(o)) => {
-            let o = o.floats()?;
+    let operand = || {
+        let missing = || Error::Mismatch(format!("{s:?} is missing its operand"));
+        operand.ok_or_else(missing)
+    };
+    match s {
+        Stage::Add | Stage::Mul => {
+            let o = operand()?.floats()?;
             for (i, v) in out.iter_mut().enumerate() {
                 let b = o[i % o.len()];
                 *v = if *s == Stage::Add { *v + b } else { *v * b };
             }
         }
-        (Stage::Scale(by), _) => out.iter_mut().for_each(|v| *v *= by),
-        (Stage::RmsNorm { eps }, Some(w)) => {
-            let w = w.floats()?;
+        Stage::Scale(by) => out.iter_mut().for_each(|v| *v *= by),
+        Stage::RmsNorm { eps } => {
+            let w = operand()?.floats()?;
             for row in out.chunks_mut(width) {
                 let inv = rms_inverse(acc, row, *eps);
                 row.iter_mut().zip(w).for_each(|(v, wi)| *v *= inv * wi);
             }
         }
-        (Stage::Hadamard { block }, _) => {
+        Stage::Hadamard { block } => {
             let block = *block as usize;
             for span in out.chunks_mut(block) {
                 hadamard(span);
             }
         }
-        (Stage::Rms { eps }, _) => {
+        Stage::Rms { eps } => {
             for row in out.chunks_mut(width) {
                 let inv = rms_inverse(acc, row, *eps);
                 row.iter_mut().for_each(|v| *v *= inv);
             }
         }
-        (Stage::Act(a), _) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
-        (Stage::Sin, _) => out.iter_mut().for_each(|v| *v = v.sin()),
-        (Stage::Cos, _) => out.iter_mut().for_each(|v| *v = v.cos()),
-        (Stage::Softmax, _) => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
+        Stage::Act(a) => out.iter_mut().for_each(|v| *v = act(*a, *v)),
+        Stage::Sin => out.iter_mut().for_each(|v| *v = v.sin()),
+        Stage::Cos => out.iter_mut().for_each(|v| *v = v.cos()),
+        Stage::Softmax => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
         // One rank holds the whole value already.
-        (Stage::AllReduce | Stage::AllGather, _) => {}
-        (
-            Stage::Rope {
-                theta,
-                pairs,
-                turned,
-            },
-            Some(at),
-        ) => {
+        Stage::AllReduce | Stage::AllGather => {}
+        Stage::Rope {
+            theta,
+            pairs,
+            turned,
+        } => {
             let turned = turned.map_or(width, |t| t as usize);
-            let at = at.indices()?;
+            let at = operand()?.indices()?;
             // Each position covers the same number of elements.
             let span = out.len() / at.len().max(1);
             for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
@@ -541,8 +542,8 @@ pub(crate) fn stage(
                 }
             }
         }
-        (Stage::Causal, Some(at)) => {
-            let at = at.indices()?;
+        Stage::Causal => {
+            let at = operand()?.indices()?;
             let span = out.len() / at.len().max(1);
             for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
                 for row in block.chunks_mut(width) {
@@ -552,8 +553,8 @@ pub(crate) fn stage(
                 }
             }
         }
-        (Stage::Allow, Some(bits)) => {
-            let bits = bits.indices()?;
+        Stage::Allow => {
+            let bits = operand()?.indices()?;
             let words = width.div_ceil(32);
             for (row, mask) in out.chunks_mut(width).zip(bits.chunks(words)) {
                 for (i, v) in row.iter_mut().enumerate() {
@@ -563,23 +564,14 @@ pub(crate) fn stage(
                 }
             }
         }
-        (Stage::Center, _) => out.chunks_mut(width).for_each(|r| {
+        Stage::Center => out.chunks_mut(width).for_each(|r| {
             let mean = acc.sum(r.iter().copied()) / width as f32;
             r.iter_mut().for_each(|v| *v -= mean);
         }),
-        (Stage::UnitSum, _) => out.chunks_mut(width).for_each(|r| {
+        Stage::UnitSum => out.chunks_mut(width).for_each(|r| {
             let sum = acc.sum(r.iter().copied());
             r.iter_mut().for_each(|v| *v /= sum);
         }),
-        (
-            Stage::Add
-            | Stage::Mul
-            | Stage::RmsNorm { .. }
-            | Stage::Rope { .. }
-            | Stage::Causal
-            | Stage::Allow,
-            None,
-        ) => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
     Ok(Tensor::f32(x.shape.clone(), out))
 }

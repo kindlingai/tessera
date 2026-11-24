@@ -3,6 +3,7 @@
 use crate::dims::{Dim, DimExpr, Shape};
 use crate::json::VERSION;
 use crate::numerics::Numerics;
+use crate::stages::Stage;
 use crate::types::{DType, TensorType};
 use serde::{Deserialize, Serialize};
 
@@ -290,95 +291,6 @@ impl Mask {
 /// Stages fused into one pass over each row.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Row(pub Vec<Stage>);
-
-/// One step over last-axis rows. Some take an argument.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum Stage {
-    Add,
-    Mul,
-    Scale(f32),
-    RmsNorm {
-        eps: f32,
-    },
-    /// Divides the row by its root mean square.
-    Rms {
-        eps: f32,
-    },
-    /// The scaled Walsh-Hadamard transform of each `block` of the row.
-    Hadamard {
-        block: u32,
-    },
-    /// Subtracts the row's mean.
-    Center,
-    /// Divides the row by its sum.
-    UnitSum,
-    /// Rotates pairs of elements. The argument holds positions.
-    Rope {
-        /// Pair `j` turns by `position * theta^(-2j/width)`.
-        theta: f32,
-        pairs: Pairs,
-        /// Pairs from this one on stay still. `None` turns all.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turned: Option<u32>,
-    },
-    Act(Act),
-    /// Interpreter only: fold it away before lowering.
-    Sin,
-    /// Interpreter only: fold it away before lowering.
-    Cos,
-    Softmax,
-    AllReduce,
-    /// Joins each rank's part of the last axis.
-    AllGather,
-    /// Entries past the position in the argument become -inf.
-    Causal,
-    /// Entry `i` becomes -inf where mask bit `i` is clear.
-    Allow,
-}
-
-impl Stage {
-    /// Arguments this stage reads besides the row itself.
-    pub fn operands(&self) -> usize {
-        match self {
-            Stage::Add
-            | Stage::Mul
-            | Stage::RmsNorm { .. }
-            | Stage::Rope { .. }
-            | Stage::Causal
-            | Stage::Allow => 1,
-            Stage::Scale(_)
-            | Stage::Rms { .. }
-            | Stage::Hadamard { .. }
-            | Stage::Center
-            | Stage::UnitSum
-            | Stage::Act(_)
-            | Stage::Sin
-            | Stage::Cos
-            | Stage::Softmax
-            | Stage::AllReduce
-            | Stage::AllGather => 0,
-        }
-    }
-
-    pub fn reduces(&self) -> bool {
-        use Stage::*;
-        match self {
-            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce | AllGather => {
-                true
-            }
-            Add
-            | Mul
-            | Scale(_)
-            | Hadamard { .. }
-            | Rope { .. }
-            | Act(_)
-            | Sin
-            | Cos
-            | Causal
-            | Allow => false,
-        }
-    }
-}
 
 /// Which two elements of a row rotate together.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

@@ -11,8 +11,8 @@ use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 use tessera_codegen::kept::Layout;
 use tessera_graph::{
-    Composite, DType, DimExpr, DimName, Graph, NodeId, Op, Parts, Placement, Region, Role, Shape,
-    Stage, View,
+    Composite, DType, DimExpr, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region,
+    Role, Shape, Stage, View,
 };
 
 /// Entry outputs a launch reads, one bit each.
@@ -100,16 +100,33 @@ pub struct Tree<'a> {
     ends: Vec<bool>,
 }
 
-/// Element-wise stages. Other stages lower unfused.
-pub(crate) fn map_stage(s: &Stage) -> Option<MapStage> {
-    match s {
-        Stage::Add => Some(MapStage::Add),
-        Stage::Mul => Some(MapStage::Mul),
-        Stage::Scale(by) => Some(MapStage::Scale(*by)),
-        Stage::Act(a) => Some(MapStage::Act(*a)),
-        _ => None,
-    }
+/// Rows that lower to `Map`. Other stages lower unfused.
+macro_rules! map_stages {
+    ($(
+        $(#[$m:meta])*
+        $name:ident
+        $(($tb:ident: $tty:ty = $ts:expr))?
+        $({$($(#[$fm:meta])* $f:ident: $fty:ty = $fs:expr),* $(,)?})?
+        $(as $method:ident)?
+        => $lower:tt {$($col:tt)*}
+    )*) => {
+        pub(crate) fn map_stage(s: &Stage) -> Option<MapStage> {
+            $(map_arm!($lower, s, $name [$(($tb))? $({$($f),*})?]);)*
+            None
+        }
+    };
 }
+
+macro_rules! map_arm {
+    (Map, $s:ident, $name:ident [$($bind:tt)*]) => {
+        if let Stage::$name $($bind)* = *$s {
+            return Some(MapStage::$name $($bind)*);
+        }
+    };
+    ($lower:tt, $($skip:tt)*) => {};
+}
+
+tessera_graph::stages!(map_stages);
 
 /// The pinned form for a float node or stage.
 fn pinned_form(
@@ -122,7 +139,8 @@ fn pinned_form(
     if matches!(op, Op::Append(_)) {
         return pins.kept;
     }
-    if matches!(stage, Some(Stage::AllReduce | Stage::AllGather)) {
+    let facts = stage.map(Stage::facts);
+    if facts.is_some_and(|f| f.lower == Lower::Crossing) {
         return F32_FORM;
     }
     if let Some(role) = role {
@@ -133,16 +151,16 @@ fn pinned_form(
         }
         return pins.outputs;
     }
-    let site = match (op, stage) {
-        (_, Some(Stage::RmsNorm { .. } | Stage::Rms { .. } | Stage::Center)) => Some(Site::Norm),
-        (_, Some(Stage::Softmax | Stage::UnitSum)) => {
+    let site = match (op, facts.map_or(Pin::Plain, |f| f.pin)) {
+        (_, Pin::Norm) => Some(Site::Norm),
+        (_, Pin::Prob) => {
             if in_moe && pins.site_form(Site::Router).is_some() {
                 Some(Site::Router)
             } else {
                 Some(Site::Softmax)
             }
         }
-        (_, Some(Stage::Add)) => Some(Site::Residual),
+        (_, Pin::Residual) => Some(Site::Residual),
         (Op::Mix(_), _) => Some(Site::Router),
         (Op::Attend(_) | Op::Delta(_), _) => Some(Site::Attention),
         (Op::Matmul, _) => Some(Site::Matmul),
@@ -424,7 +442,7 @@ impl<'a> Tree<'a> {
                 Op::Row(r) => {
                     let (mut cur, mut rest) = (args[0], args[1..].iter());
                     // One rank holds the whole value already.
-                    let crossing = |s: &Stage| matches!(s, Stage::AllReduce | Stage::AllGather);
+                    let crossing = |s: &Stage| s.facts().lower == Lower::Crossing;
                     let stages: Vec<&Stage> =
                         r.0.iter().filter(|s| ranks > 1 || !crossing(s)).collect();
                     let last = stages.len().saturating_sub(1);

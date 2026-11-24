@@ -11,3 +11,6 @@ thiserror = "2"
 derive_more = { version = "2.1", features = ["from"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+scattered-collect = "0.22"
