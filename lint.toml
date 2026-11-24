@@ -1,7 +1,7 @@
 # Rules that stickler checks in CI and in the pre-commit hook.
 
 # The stickler release that checks this repository.
-stickler.version = "0.4.1"
+stickler.version = "0.4.2"
 stickler.releases = "https://github.com/kindlingai/tessera-stickler/releases/download"
 
 # Words in one comment block. Adjacent comment lines are one block.
@@ -113,6 +113,18 @@ kernel_text.tokens = ["f_fn", "f_const(", "{{\\n"]
 kernel_text.allow = [
     "engine/plan/codegen/src/dialect.rs",
     "engine/plan/codegen/src/intrinsic.rs",
+]
+
+# Files that read as specifications, such as model definitions.
+# Near-copies between two of them pass simcheck, shape-runs,
+# repeated-fn and type-copy. Copies inside one file, or to
+# other files, still fail. A `!` glob removes files.
+spec_paths = [
+    "engine/models/src/*.rs",
+    "!engine/models/src/shared.rs",
+    "!engine/models/src/keys.rs",
+    "examples/recipes/*/model/",
+    "tools/parity/tests/*/mod.rs",
 ]
 
 # Test files here may time code. Other test files may not.
