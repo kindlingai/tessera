@@ -2257,6 +2257,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-references"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "tessera-frontend-settings",
+ "tessera-recipe",
+ "tessera-testkit",
+]
+
+[[package]]
 name = "tessera-resident-decoder-module"
 version = "0.1.0"
 dependencies = [

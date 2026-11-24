@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::files::{Source, check_crates, macro_dir};
+use crate::files::{Exception, Source, check_crates, check_paths, macro_dir};
 use crate::macros::{calls, check};
 
 fn source(path: &str, text: &str) -> Source {
@@ -83,4 +83,29 @@ fn macro_rules_checked() {
     for (i, (sources, want)) in cases().into_iter().enumerate() {
         assert_eq!(rules(&sources), want, "case {i}");
     }
+}
+
+fn found(paths: &[&str], exceptions: &[(&str, &str)], gone: &str) -> Vec<String> {
+    let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+    let allowed = ["*.rs".to_string(), ".githooks/*".to_string()];
+    let exceptions: Vec<Exception> = exceptions
+        .iter()
+        .map(|(path, reason)| Exception {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        })
+        .collect();
+    let mut out = Vec::new();
+    check_paths(&paths, &allowed, &exceptions, |p| p != gone, &mut out);
+    out.iter().map(|v| v.message.clone()).collect()
+}
+
+#[test]
+fn file_type_rule() {
+    let tree = ["a/b.rs", ".githooks/pre-commit", "t/ref.py"];
+    assert!(found(&tree, &[("t/ref.py", "why")], "").is_empty());
+    let bare = found(&tree, &[], "");
+    assert!(bare.len() == 1 && bare[0].contains("not allowed"));
+    let stale = found(&tree[..2], &[("t/ref.py", "")], "t/ref.py");
+    assert_eq!(stale.len(), 2);
 }

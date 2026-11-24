@@ -1,4 +1,4 @@
-//! Which files the rules read, and the per-crate totals.
+//! Allowed file types, files the rules read, and crate totals.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -94,6 +94,75 @@ fn read(root: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<Source>, String>
         out.push(Source { path, text, lines });
     }
     Ok(out)
+}
+
+/// One file whose type is not on the allow list.
+#[derive(serde::Deserialize)]
+pub struct Exception {
+    pub path: String,
+    pub reason: String,
+}
+
+/// The `lint.toml` line that names `path`.
+fn config_line(path: &str) -> usize {
+    let text = include_str!("../../../lint.toml");
+    let quoted = format!("\"{path}\"");
+    text.lines()
+        .position(|l| l.contains(&quoted))
+        .map_or(1, |i| i + 1)
+}
+
+fn config_violation(path: &str, message: String) -> Violation {
+    Violation {
+        path: "lint.toml".into(),
+        line: config_line(path),
+        rule: "file-type",
+        message,
+    }
+}
+
+/// `exists` says if an excepted path is in the tree.
+pub fn check_paths(
+    paths: &[String],
+    allowed: &[String],
+    exceptions: &[Exception],
+    exists: impl Fn(&str) -> bool,
+    out: &mut Vec<Violation>,
+) {
+    for path in paths {
+        if allowed.iter().any(|p| matches(p, path)) {
+            continue;
+        }
+        if exceptions.iter().any(|e| &e.path == path) {
+            continue;
+        }
+        out.push(Violation {
+            path: path.clone(),
+            line: 1,
+            rule: "file-type",
+            message: "this file type is not allowed. An exception needs \
+                      a maintainer's approval in lint.toml `file_type_exceptions`."
+                .into(),
+        });
+    }
+    for e in exceptions {
+        if e.reason.trim().is_empty() {
+            let message = format!("exception for {} needs a reason", e.path);
+            out.push(config_violation(&e.path, message));
+        }
+        if !exists(&e.path) {
+            let message = format!("exception for {} names a file that is gone", e.path);
+            out.push(config_violation(&e.path, message));
+        }
+    }
+}
+
+pub fn check_types(root: &Path, out: &mut Vec<Violation>) -> Result<(), String> {
+    let exists = |p: &str| root.join(p).exists();
+    let paths: Vec<String> = listed(root)?.into_iter().filter(|p| exists(p)).collect();
+    let (allowed, exceptions) = (&LIMITS.file_types, &LIMITS.file_type_exceptions);
+    check_paths(&paths, allowed, exceptions, exists, out);
+    Ok(())
 }
 
 /// Directories holding a package manifest.

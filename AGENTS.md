@@ -9,6 +9,11 @@ No design docs, plans or history in the repo, outside an explicit changelog.
 No `Co-Authored-By` lines that credit an AI tool or bot, in commits or PR
 bodies. CI and the commit-msg hook refuse them.
 
+Pull request titles must follow Conventional Commits (`feat:`, `fix:`, `perf:`,
+`docs:`, `ci:`, `refactor:`, `test:`, `chore:`, with optional scope such as
+`feat(serve):`). `release-please` derives version bumps and `CHANGELOG.md` from
+squash-merged titles on `main`.
+
 No mannered prose in comments, error messages or text. Avoid flamboyant speech
 and prefer ASD-STE100 where possible. No historical commentary. Comments are
 intentionally limited - code should be clearly written.

@@ -312,11 +312,10 @@ impl Engine {
         }
         let device = ranked(Device::guess(settings).with(recipe));
         let mut plans = Cache::default();
-        let slots = graph
-            .dims
-            .iter()
-            .find(|d| d.name == Seqs)
-            .map_or(1, |d| d.size.max() as usize);
+        let most = |name| graph.dims.iter().find(|d| d.name == name);
+        let slots = most(Seqs).map_or(1, |d| d.size.max() as usize);
+        // Kept rows end at the graph's context.
+        let context = most(Context).map_or(context, |d| context.min(d.size.max() as usize));
         let first = [Row {
             slot: 0,
             token: 0,
