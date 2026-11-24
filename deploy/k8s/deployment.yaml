@@ -1,0 +1,105 @@
+# Example Kubernetes Deployment and Service for tesserax serving an EXLR8 model
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera
+  labels:
+    app: tessera
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tessera
+  template:
+    metadata:
+      labels:
+        app: tessera
+    spec:
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: tessera
+          image: ghcr.io/kindlingai/tessera:latest
+          args:
+            - --model
+            - /models/Qwen3.8-Flash-Next-exlr8
+            - serve
+            - --manifest
+            - bit300
+            - --served-model-name
+            - qwen3.8-flash-next
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --slots
+            - "2"
+            - --max-model-len
+            - "8192"
+          env:
+            - name: HOME
+              value: /cache
+            - name: TESSERA_KERNEL_CACHE
+              value: /cache/kernels
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "2"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: tessera-models
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera
+  labels:
+    app: tessera
+spec:
+  selector:
+    app: tessera
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
