@@ -6,6 +6,8 @@ const CUDA: Options = Options {
     marks: false,
 };
 
+const WHOLE: &str = "#include <tessera/1/whole>\nint body;\n";
+
 fn run(name: &str, text: &str, files: &[(&str, &str)], backend: Backend) -> Result<Flat, Error> {
     let load = |p: &str| files.iter().find(|f| f.0 == p).map(|f| f.1.to_string());
     flatten(name, text, &load, &Options { backend, ..CUDA })
@@ -42,7 +44,7 @@ fn flattens_in_order() {
     assert!(has(core, Backend::Cuda, "backend.h") && !has(core, Backend::Cuda, "grid.h"));
     for b in [Backend::Cuda, Backend::Rocm] {
         assert!(has(trellis, b, "TESSERA_CAP_TRELLIS") && has(trellis, b, "trellis.h"));
-        assert!(!has(trellis, b, "grid.h"));
+        assert!(!has(trellis, b, "grid.h") && has(WHOLE, b, "TESSERA_WHOLE_H"));
     }
     let sum = run("sum.cu", include_str!("sum.cu"), &[], Backend::Cuda).unwrap();
     assert!(sum.text.contains("stage_bf16") && sum.text.contains("cvt.rn.bf16x2.f32"));

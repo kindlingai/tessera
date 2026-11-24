@@ -1,6 +1,6 @@
 //! A decoder's residual rows after chosen layers, as text features.
 
-use crate::arch::family;
+use crate::decoder::family;
 use crate::tokenize::hf::Hf;
 use crate::{Overrides, Template, config, pull};
 use std::error::Error;

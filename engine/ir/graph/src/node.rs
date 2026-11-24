@@ -132,7 +132,65 @@ impl Op {
         match self {
             Op::Matmul | Op::Attend(_) | Op::Delta(_) | Op::Mean(_) | Op::Mix(_) => true,
             Op::Row(r) => r.0.iter().any(Stage::reduces),
-            _ => false,
+            Op::Input { .. }
+            | Op::Weight(_)
+            | Op::Conv
+            | Op::Mask(_)
+            | Op::Append(_)
+            | Op::Select(_)
+            | Op::View(_)
+            | Op::Cast(_) => false,
+        }
+    }
+
+    /// Whether the result reads state besides its arguments.
+    pub fn stateful(&self) -> bool {
+        match self {
+            Op::Input { .. } | Op::Weight(_) | Op::Append(_) => true,
+            Op::Matmul
+            | Op::Attend(_)
+            | Op::Delta(_)
+            | Op::Conv
+            | Op::Mask(_)
+            | Op::Row(_)
+            | Op::Select(_)
+            | Op::View(_)
+            | Op::Cast(_)
+            | Op::Mean(_)
+            | Op::Mix(_) => false,
+        }
+    }
+
+    /// The op with `f` applied to each size it names.
+    pub fn map_dims(&self, f: impl Fn(&DimExpr) -> DimExpr) -> Op {
+        match self {
+            Op::View(View::Reshape(s)) => {
+                Op::View(View::Reshape(Shape(s.0.iter().map(f).collect())))
+            }
+            Op::View(View::Slice { axis, start, len }) => Op::View(View::Slice {
+                axis: *axis,
+                start: f(start),
+                len: f(len),
+            }),
+            Op::View(View::Expand { axis, to }) => Op::View(View::Expand {
+                axis: *axis,
+                to: f(to),
+            }),
+            Op::Select(Select::TopK { k }) => Op::Select(Select::TopK { k: f(k) }),
+            Op::View(View::Permute(_) | View::Concat)
+            | Op::Select(Select::Gather | Select::Take)
+            | Op::Input { .. }
+            | Op::Weight(_)
+            | Op::Matmul
+            | Op::Attend(_)
+            | Op::Delta(_)
+            | Op::Conv
+            | Op::Mask(_)
+            | Op::Append(_)
+            | Op::Row(_)
+            | Op::Cast(_)
+            | Op::Mean(_)
+            | Op::Mix(_) => self.clone(),
         }
     }
 }
@@ -245,16 +303,37 @@ impl Stage {
             | Stage::Rope { .. }
             | Stage::Causal
             | Stage::Allow => 1,
-            _ => 0,
+            Stage::Scale(_)
+            | Stage::Rms { .. }
+            | Stage::Hadamard { .. }
+            | Stage::Center
+            | Stage::UnitSum
+            | Stage::Act(_)
+            | Stage::Sin
+            | Stage::Cos
+            | Stage::Softmax
+            | Stage::AllReduce
+            | Stage::AllGather => 0,
         }
     }
 
     pub fn reduces(&self) -> bool {
         use Stage::*;
-        matches!(
-            self,
-            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce | AllGather
-        )
+        match self {
+            RmsNorm { .. } | Rms { .. } | Center | UnitSum | Softmax | AllReduce | AllGather => {
+                true
+            }
+            Add
+            | Mul
+            | Scale(_)
+            | Hadamard { .. }
+            | Rope { .. }
+            | Act(_)
+            | Sin
+            | Cos
+            | Causal
+            | Allow => false,
+        }
     }
 }
 

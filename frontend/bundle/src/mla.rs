@@ -2,7 +2,7 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{Weights, each, is_exlr8, pins};
+use crate::{Stream, Weights, is_exlr8, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
@@ -221,24 +221,13 @@ pub struct Release {
     rules: Vec<Rule>,
 }
 
-impl Release {
-    /// Each weight in graph order, read one at a time.
-    pub fn each(
+impl Stream for Release {
+    fn stream(
         &self,
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
-        mut take: impl FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut at = 0;
-        each(
-            &self.graph,
-            &*self.offer,
-            &[&self.rules],
-            shares,
-            |weight, _| {
-                at += 1;
-                take(at - 1, weight)
-            },
-        )
+        numbered(&self.graph, &*self.offer, &[&self.rules], shares, take)
     }
 }
 
