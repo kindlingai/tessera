@@ -1,50 +1,107 @@
+# Runs release-please on pushes to main to maintain a Release PR.
+# When a Release PR merges, release-please cuts the vX.Y.Z tag and
+# GitHub Release, then this workflow builds binaries and publishes
+# crates, npm packages and GitHub Release assets.
+# A manual run builds and dry-runs unless `publish` is true.
 name: release
 
-# A `v*` tag builds the binary, then publishes crates and npm.
-# A manual run builds and dry-runs unless `publish` is set.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: Version, without the v
+        description: Version, with or without leading v
         required: true
       publish:
-        description: Publish for real
+        description: Publish crates, npm packages and GitHub release assets
         type: boolean
         default: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
-  version:
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.event_name == 'push' && 'release-please' || format('release-dispatch-{0}', github.run_id) }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
+      run: ${{ steps.v.outputs.run }}
       version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      commit: ${{ steps.v.outputs.commit }}
       publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
+      - id: rp
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          # Use a PAT or App token when configured so Release PRs trigger CI.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
       - id: v
+        if: github.event_name == 'workflow_dispatch' || steps.rp.outputs.release_created == 'true'
         env:
-          INPUT: ${{ inputs.version }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CREATED: ${{ steps.rp.outputs.release_created }}
+          RP_TAG: ${{ steps.rp.outputs.tag_name }}
+          RP_VERSION: ${{ steps.rp.outputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
-          v="${INPUT:-${GITHUB_REF_NAME#v}}"
+          set -euo pipefail
+          if [ "$RELEASE_CREATED" = true ]; then
+            raw="${RP_TAG:-$RP_VERSION}"
+            publish=true
+          else
+            raw="$INPUT_VERSION"
+            publish="$INPUT_PUBLISH"
+          fi
+          v="${raw#v}"
           if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::not a version: $v"
+            echo "::error::not a version: $raw"
             exit 1
           fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          tag="v$v"
+          prerelease=false
+          if [[ "$v" == *-* ]]; then
+            prerelease=true
+          fi
+          tag_commit=""
+          if ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" 2>/dev/null) \
+            && jq -e --arg ref "refs/tags/$tag" 'type == "object" and .ref == $ref' >/dev/null <<< "$ref_json"; then
+            tag_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)
+          fi
+          if [ -n "$tag_commit" ]; then
+            commit="$tag_commit"
+          elif [ "$publish" = true ]; then
+            echo "::error::tag $tag does not exist"
+            exit 1
+          else
+            commit="$GITHUB_SHA"
+          fi
+          {
+            echo "run=true"
+            echo "version=$v"
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
   build:
-    # Each wheel holds the binary. npm takes it from the wheel.
-    needs: version
+    # Each wheel holds the binary. npm and GitHub releases take the binary from the wheel.
+    needs: release
+    if: needs.release.outputs.run == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -54,9 +111,11 @@ jobs:
           - { os: macos-15, target: aarch64-apple-darwin, npm: darwin-arm64, features: "" }
     runs-on: ${{ matrix.os }}
     env:
-      VERSION: ${{ needs.version.outputs.version }}
+      VERSION: ${{ needs.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.commit }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo run -q -p tessera-publish -- --version "$VERSION"
       - uses: PyO3/maturin-action@v1
@@ -82,14 +141,19 @@ jobs:
           path: bin/tesserax
 
   crates:
-    needs: [version, build]
+    needs: [release, build]
     runs-on: ubuntu-latest
     environment: release
+    concurrency:
+      group: release-crates-${{ needs.release.outputs.version }}
+      cancel-in-progress: false
     env:
-      VERSION: ${{ needs.version.outputs.version }}
-      PUBLISH: ${{ needs.version.outputs.publish }}
+      VERSION: ${{ needs.release.outputs.version }}
+      PUBLISH: ${{ needs.release.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.commit }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
         with:
@@ -99,25 +163,48 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
           flags=(--manifest-path target/publish/Cargo.toml --workspace --allow-dirty)
           if [ "$PUBLISH" = true ]; then
-            cargo publish "${flags[@]}"
+            # Skip crates already on crates.io so a retry finishes remaining packages.
+            crates=$(cargo metadata --no-deps --format-version 1 --manifest-path target/publish/Cargo.toml | jq -r '.packages[].name')
+            excluded=0
+            total=0
+            while IFS= read -r c; do
+              [ -n "$c" ] || continue
+              total=$((total + 1))
+              if curl -sf -A "tessera-release/$VERSION" "https://crates.io/api/v1/crates/$c/$VERSION" >/dev/null 2>&1; then
+                echo "$c $VERSION is already on crates.io, skipping"
+                flags+=(--exclude "$c")
+                excluded=$((excluded + 1))
+              fi
+            done <<< "$crates"
+            if [ "$excluded" -lt "$total" ]; then
+              cargo publish "${flags[@]}"
+            fi
           else
             cargo publish "${flags[@]}" --dry-run
           fi
 
   npm:
-    needs: [version, crates]
+    needs: [release, crates]
     runs-on: ubuntu-latest
     environment: release
+    concurrency:
+      group: release-npm-${{ needs.release.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
     env:
-      VERSION: ${{ needs.version.outputs.version }}
-      PUBLISH: ${{ needs.version.outputs.publish }}
+      VERSION: ${{ needs.release.outputs.version }}
+      PUBLISH: ${{ needs.release.outputs.publish }}
+      PRERELEASE: ${{ needs.release.outputs.prerelease }}
+      PUBLIC: ${{ github.event.repository.visibility == 'public' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.commit }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: actions/setup-node@v4
         with:
@@ -132,23 +219,135 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          dry=()
-          [ "$PUBLISH" = true ] || dry=(--dry-run)
+          set -euo pipefail
+          flags=(--access public)
+          if [ "$PUBLIC" = true ]; then
+            flags+=(--provenance)
+          fi
+          if [ "$PUBLISH" = true ]; then
+            if [ "$PRERELEASE" = true ]; then
+              flags+=(--tag next)
+            fi
+          else
+            flags+=(--dry-run)
+          fi
           for p in linux-x64 linux-arm64 darwin-arm64; do
-            dir="target/publish/npm/@kindlingai/tessera-$p"
+            pkg="@kindlingai/tessera-$p"
+            dir="target/publish/npm/$pkg"
             install -D -m 755 "bins/bin-$p/tesserax" "$dir/bin/tesserax"
-            (cd "$dir" && npm publish --access public --provenance "${dry[@]}")
+            if [ "$PUBLISH" = true ] && [ "$(npm view "$pkg@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+              echo "$pkg@$VERSION is already on npm, skipping"
+              continue
+            fi
+            (cd "$dir" && npm publish "${flags[@]}")
           done
-          # npx caches an install that ran before a platform tarball was served.
+          # npx caches an install that ran before a platform tarball became available.
           if [ "$PUBLISH" = true ]; then
             for p in linux-x64 linux-arm64 darwin-arm64; do
               url="https://registry.npmjs.org/@kindlingai/tessera-$p/-/tessera-$p-$VERSION.tgz"
               for i in $(seq 120); do
-                curl -sfI -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" >/dev/null && break
-                [ "$i" = 120 ] && { echo "$url not served after 30 minutes"; exit 1; }
+                curl -sfI --max-time 15 -H 'Cache-Control: no-cache' "$url?t=$(date +%s)" >/dev/null && break
+                if [ "$i" = 120 ]; then
+                  echo "::error::$url not served after 30 minutes"
+                  exit 1
+                fi
                 sleep 15
               done
               echo "$url is served"
             done
           fi
-          (cd target/publish/npm/@kindlingai/tessera && npm publish --access public --provenance "${dry[@]}")
+          pkg="@kindlingai/tessera"
+          if [ "$PUBLISH" = true ] && [ "$(npm view "$pkg@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+            echo "$pkg@$VERSION is already on npm, skipping"
+          else
+            (cd "target/publish/npm/$pkg" && npm publish "${flags[@]}")
+          fi
+
+  github-release:
+    # Uploads binaries, SHA256SUMS and provenance attestations to the GitHub Release.
+    needs: [release, build, crates, npm]
+    if: needs.release.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-github-${{ needs.release.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+      - name: Stage binaries and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for p in linux-x64 linux-arm64 darwin-arm64; do
+            install -m 755 "bins/bin-$p/tesserax" "dist/tesserax-$p"
+          done
+          (cd dist && sha256sum tesserax-linux-x64 tesserax-linux-arm64 tesserax-darwin-arm64 > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*"
+      - name: Upload release assets and update notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+          VERSION: ${{ needs.release.outputs.version }}
+          COMMIT: ${{ needs.release.outputs.commit }}
+          PRERELEASE: ${{ needs.release.outputs.prerelease }}
+          PUBLIC: ${{ github.event.repository.visibility == 'public' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "<!-- tessera-artifacts:start -->"
+            echo "### Artifacts"
+            echo
+            echo "- crates.io: \`tessera-engine\`, \`tessera-frontend\`, \`tessera-cli\`, \`tessera-trace-derive\`, \`tessera-kernel-macro\` (\`$VERSION\`)"
+            echo "- npm: \`npx @kindlingai/tessera@$VERSION\`"
+            echo "- Binaries: \`tesserax-linux-x64\`, \`tesserax-linux-arm64\`, \`tesserax-darwin-arm64\`, \`SHA256SUMS\` (commit \`$COMMIT\`)"
+            if [ "$PUBLIC" = true ]; then
+              echo
+              echo "### Verification"
+              echo
+              echo '```bash'
+              echo "gh attestation verify tesserax-linux-arm64 -R $GH_REPO"
+              echo '```'
+            fi
+            echo "<!-- tessera-artifacts:end -->"
+          } > artifacts.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release view "$TAG" --json body --jq .body > body.md
+            python3 - <<'PY'
+          import pathlib, re
+
+          body = pathlib.Path("body.md").read_text()
+          block = pathlib.Path("artifacts.md").read_text().strip()
+          pattern = re.compile(
+              r"<!-- tessera-artifacts:start -->.*?<!-- tessera-artifacts:end -->",
+              re.DOTALL,
+          )
+          if pattern.search(body):
+              updated = pattern.sub(lambda _: block, body, count=1)
+          elif body.strip():
+              updated = body.rstrip() + "\n\n" + block + "\n"
+          else:
+              updated = block + "\n"
+          pathlib.Path("updated_body.md").write_text(updated)
+          PY
+            gh release edit "$TAG" --notes-file updated_body.md
+          else
+            extra=()
+            if [ "$PRERELEASE" = true ]; then
+              extra+=(--prerelease)
+            fi
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" "${extra[@]}" \
+              --generate-notes --notes-file artifacts.md
+          fi

@@ -50,10 +50,27 @@ max_map_id_chars = 24
 max_map_steps = 12
 
 # File types the rules read.
-extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]
+extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip", "kernel"]
 
 # Files with `#` comments, read by the semicolon rule alone.
 hash_comment_files = ["*.toml", "*.yml", "*.yaml", "*.sh", ".githooks/*"]
+
+# File types the repository may hold, as `hash_comment_files` patterns.
+# The code is pure Rust, apart from GPU kernels.
+file_types = [
+    "*.rs", "*.metal", "*.cu", "*.cuh", "*.h", "*.kernel",
+    "*.toml", "*.lock", "*.md", "*.txt", "*.json", "*.yml", "*.yaml",
+    "*.sh", ".githooks/*", ".gitignore", "LICENSE",
+    "tools/inspect/src/page.css", "tools/inspect/src/pump.js", "tools/publish/npm/tesserax.js",
+]
+
+# Files outside `file_types`. Each needs a maintainer's approval and a reason.
+file_type_exceptions = [
+    { path = "tools/parity/reference.py", reason = """\
+The golden tests compare tessera with a reference from Hugging Face Transformers. \
+The reference must come from an implementation outside tessera, and Transformers is Python. \
+So this writer cannot be Rust.""" },
+]
 
 # Rules that report in the findings and do not fail the run.
 warn_rules = ["thin-edge", "placement", "type-copy"]

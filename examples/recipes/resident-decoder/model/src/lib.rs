@@ -65,6 +65,6 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
 
 tessera_guest::exports! {
     rules: { NAME => Kind::Model },
-    kernels: { "whole.cu": [NAME] },
+    kernels: { "whole.kernel": [NAME] },
     propose: offer,
 }

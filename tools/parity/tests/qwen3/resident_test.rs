@@ -35,8 +35,11 @@ fn choices(layout: &'static dyn kept::Layout) -> tessera_lower::Recipe {
     lower
 }
 
+/// The small model, with room for every launch's positions.
 fn graph() -> Graph {
-    stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())
+    let mut c = tessera_models::small::qwen3();
+    c.stack.max_context = 64;
+    stepper::<Norm, Swiglu>(&c)
 }
 
 #[test]

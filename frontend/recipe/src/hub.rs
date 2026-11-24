@@ -238,7 +238,8 @@ pub(crate) fn exlr8(names: &[String], width: u32) -> Vec<&str> {
     out
 }
 
-pub(crate) fn safe_path(name: &str) -> bool {
+/// A relative path that stays inside its directory.
+pub fn safe_path(name: &str) -> bool {
     !name.starts_with('/') && !name.contains('\\') && !name.split('/').any(|p| p == "..")
 }
 
@@ -254,11 +255,21 @@ fn fetch_file(
     if path.is_file() {
         return Ok(());
     }
+    fetch_as(repo, commit, name, &path, token)
+}
+
+/// `name` from `repo` at `revision`, saved as `path`.
+pub fn fetch_as(
+    repo: &str,
+    revision: &str,
+    name: &str,
+    path: &Path,
+    token: Option<&str>,
+) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io(parent))?;
     }
-    let url = resolve(repo, commit, name);
-    download(&url, &path, token)
+    download(&resolve(repo, revision, name), path, token)
 }
 
 /// Streams `url` to `path` through a `.part` file.

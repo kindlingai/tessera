@@ -63,6 +63,27 @@ TESSERA_FN float block_sum(float v, float* red) {
     return sum;
 }
 
+#elif defined(TESSERA_HIP)
+
+// Waves of `warpSize` lanes. Every lane gets the sum.
+TESSERA_FN float warp_sum(float v) {
+    for (u32 off = warpSize / 2; off > 0; off >>= 1) v += __shfl_xor(v, off);
+    return v;
+}
+
+// Block sum, fixed order. `red` holds one float per wave.
+TESSERA_FN float block_sum(float v, float* red) {
+    u32 lane = threadIdx.x % warpSize, wave = threadIdx.x / warpSize;
+    v = warp_sum(v);
+    if (lane == 0u) red[wave] = v;
+    __syncthreads();
+    u32 nw = blockDim.x / warpSize;
+    float sum = 0.0f;
+    for (u32 w = 0; w < nw; w++) sum += red[w];
+    __syncthreads();
+    return sum;
+}
+
 #endif
 
 }  // namespace tessera

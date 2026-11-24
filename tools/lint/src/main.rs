@@ -50,6 +50,9 @@ pub struct Limits {
     pub shape_steps: Vec<(usize, usize)>,
     pub extensions: Vec<String>,
     pub hash_comment_files: Vec<String>,
+    pub file_types: Vec<String>,
+    #[serde(default)]
+    pub file_type_exceptions: Vec<files::Exception>,
     pub layers: Vec<Vec<String>>,
     #[serde(default)]
     pub layer_allow: Vec<audit::Allow>,
@@ -154,6 +157,7 @@ fn every_rule(root: &std::path::Path) -> Result<(Vec<Violation>, usize), String>
     runs::check(&sources, &mut found);
     repo::copies::check(&dirs, &sources, &mut found);
     repo::revisions::check(root, &sources, &mut found);
+    files::check_types(root, &mut found)?;
     for src in &files::hash_sources(root)? {
         comments::check_hash(src, &mut found);
     }
