@@ -6,7 +6,7 @@ pub const COMMIT: Option<&str> = match option_env!("TESSERA_COMMIT") {
     None => option_env!("TESSERA_GIT_COMMIT"),
 };
 
-/// `<arch>-<os>`, as `teleport` matches it against `uname -sm`.
+/// The `<arch>-<os>` pair that `teleport` compares with `uname -sm`.
 pub fn platform() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
