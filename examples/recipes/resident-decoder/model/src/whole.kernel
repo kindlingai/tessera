@@ -13,7 +13,7 @@ using namespace tessera;
 #define NORM 5
 #define LAYER 6
 #define FIELDS 11
-#define WARPS 32
+#define THREADS 256
 
 // Layer fields, in item order.
 enum field { LN1, Q, Q_NORM, K, K_NORM, V, O, LN2, GATE, UP, DOWN };
@@ -53,15 +53,16 @@ static __device__ bool sync(const table* t) {
     return grid_sync(t);
 }
 
-// The block's sum of `v`, in a fixed order.
+// The block's sum of `v`, in a fixed order. Blocks are a power of two.
 static __device__ float block_sum(float v) {
-    __shared__ float warps[WARPS];
-    for (u32 o = 16; o > 0; o /= 2) v += __shfl_down_sync(0xffffffffu, v, o);
-    u32 lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    if (lane == 0) warps[warp] = v;
+    __shared__ float part[THREADS];
+    part[threadIdx.x] = v;
     __syncthreads();
-    float all = 0.0f;
-    for (u32 i = 0; i < blockDim.x / 32; i++) all += warps[i];
+    for (u32 n = blockDim.x / 2; n > 0; n /= 2) {
+        if (threadIdx.x < n) part[threadIdx.x] += part[threadIdx.x + n];
+        __syncthreads();
+    }
+    float all = part[0];
     __syncthreads();
     return all;
 }

@@ -117,6 +117,11 @@ static __device__ __forceinline__ bool indexes(const sizes& s, u32 l) {
     return l < s.dense || (l + 1 - s.dense) % s.every == 0;
 }
 
+// Kept tables of layer `l`: keys, then indexer keys.
+static __device__ __forceinline__ u32 kept_count(const sizes& s, u32 l) {
+    return indexes(s, l) ? 2u : 1u;
+}
+
 static __device__ __forceinline__ bool is_turned(const table* t, u32 item) {
     const tessera::item* it = item_at(t, item);
     return it->elem == FORM && form_of(t, item, 0)->suh.arena != NONE;

@@ -3,6 +3,7 @@
 use tessera_guest::site::{Count, Found, Kind, Lane, Offer, Resident, Site, Weights, fixed};
 
 const NAME: &str = "resident_decoder";
+/// Threads per block, as `THREADS` in `whole.kernel`.
 const THREADS: u32 = 256;
 /// The fields of one layer, in the kernel's item order.
 const LAYER: [&str; 11] = [
@@ -70,6 +71,6 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
 
 tessera_guest::exports! {
     rules: { NAME => Kind::Model },
-    kernels: { "whole.cu": [NAME] },
+    kernels: { "whole.kernel": [NAME] },
     propose: offer,
 }
