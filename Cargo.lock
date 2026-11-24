@@ -2033,7 +2033,6 @@ dependencies = [
  "tessera-platform",
  "tessera-rules",
  "tessera-sim",
- "tessera-trace",
 ]
 
 [[package]]
@@ -2240,7 +2239,6 @@ dependencies = [
  "tessera-rules",
  "tessera-run",
  "tessera-testkit",
- "tessera-trace",
 ]
 
 [[package]]
