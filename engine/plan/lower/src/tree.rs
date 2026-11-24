@@ -650,9 +650,16 @@ impl<'a> Tree<'a> {
             .sum()
     }
 
-    /// Whether `t` is kept rows: an `Append`.
+    /// Whether `t` mutates kept rows or fixed state.
     pub fn appends(&self, t: T) -> bool {
-        matches!(self.node(t).term, Term::Op(Op::Append(_)))
+        matches!(
+            self.node(t).term,
+            Term::Op(
+                Op::Append(_)
+                    | Op::Conv(tessera_graph::Conv { state: Some(_), .. })
+                    | Op::Delta(tessera_graph::Delta { state: Some(_), .. })
+            )
+        )
     }
 
     fn output(&self, t: T) -> bool {
@@ -715,6 +722,37 @@ impl<'a> Tree<'a> {
         // A slot holds the axis's bound, whatever this launch sees.
         let most = self.g.dims.iter().find(|d| d.name == *axis);
         Some((t, most.map_or(0, |d| d.size.max() as usize)))
+    }
+
+    /// Fixed shape of kept state `index`, split for this rank.
+    pub fn fixed_kept(&self, index: u32) -> Option<Vec<usize>> {
+        let k = self.g.kept.get(index as usize)?;
+        let size = |name| {
+            self.sizes
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .or_else(|| {
+                    self.g
+                        .dims
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(|d| d.size.max())
+                })
+        };
+        let mut shape: Vec<usize> = k
+            .shape
+            .0
+            .iter()
+            .map(|e| e.value(&self.g.dims, &size).map(|n| n as usize))
+            .collect::<Option<_>>()?;
+        if let Placement::Split { axis } = k.placement
+            && self.parts.ranks() > 1
+        {
+            let a = axis as usize;
+            shape[a] = self.parts.part(shape[a], self.rank as usize)?.1;
+        }
+        Some(shape)
     }
 
     /// A dimension's size in this view.

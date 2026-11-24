@@ -131,7 +131,24 @@ impl Model {
         [q, k, v]: [&Tensor; 3],
         [decay, rate]: [&Tensor; 2],
     ) -> Tensor {
-        push(&self.g, Op::Delta(Delta { scale }), &[q, k, v, decay, rate])
+        let op = Op::Delta(Delta { scale, state: None });
+        push(&self.g, op, &[q, k, v, decay, rate])
+    }
+
+    /// Ragged gated delta rule updating kept state per slot.
+    pub fn delta_rows(
+        &self,
+        scale: f32,
+        state: &Kept,
+        [q, k, v]: [&Tensor; 3],
+        [decay, rate]: [&Tensor; 2],
+        [slots, positions]: [&Tensor; 2],
+    ) -> Tensor {
+        let op = Op::Delta(Delta {
+            scale,
+            state: Some(state.0),
+        });
+        push(&self.g, op, &[q, k, v, decay, rate, slots, positions])
     }
 
     /// Marks the nodes `body` traces as one composite region.

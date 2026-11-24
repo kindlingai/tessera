@@ -9,6 +9,7 @@ mod layout_test;
 mod linear;
 #[cfg(test)]
 mod linear_test;
+mod moe;
 pub mod p2p;
 pub mod proxy;
 #[cfg(test)]

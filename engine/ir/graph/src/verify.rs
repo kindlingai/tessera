@@ -1,6 +1,6 @@
 //! Whole-graph checks: references, order and recorded types.
 
-use crate::dims::{Dim, DimExpr, Size};
+use crate::dims::{Dim, DimExpr, Shape, Size};
 use crate::infer::{ErrorKind, TypeError, elements, infer, need, same_shape};
 use crate::json::VERSION;
 use crate::node::{Graph, Op};
@@ -105,8 +105,43 @@ fn owners(g: &Graph) -> Vec<Option<u32>> {
     out
 }
 
-/// Kept rows: a bounded second axis, one append per entry.
+/// Kept rows: bounded context for appends, or fixed state.
 fn kept(g: &Graph, owners: &[Option<u32>], i: usize, k: &TensorType) -> Result<(), TypeError> {
+    let idx = i as u32;
+    let mut appends = Vec::new();
+    let mut states = Vec::new();
+    for (n, own) in g.nodes.iter().zip(owners) {
+        let is_state = match &n.op {
+            Op::Conv(c) => c.state == Some(idx),
+            Op::Delta(d) => d.state == Some(idx),
+            _ => false,
+        };
+        if n.op == Op::Append(idx) {
+            need(!appends.contains(own), ErrorKind::Reference, || {
+                format!("kept rows {i} are appended to twice")
+            })?;
+            appends.push(*own);
+        } else if is_state {
+            need(!states.contains(own), ErrorKind::Reference, || {
+                format!("kept state {i} is updated twice")
+            })?;
+            states.push(*own);
+        }
+    }
+    need(
+        appends.is_empty() || states.is_empty(),
+        ErrorKind::Reference,
+        || format!("kept {i} mixes appends and state"),
+    )?;
+    if !states.is_empty() {
+        let fixed = k.shape.0.len() >= 2
+            && elements(&g.dims, &Shape(k.shape.0[1..].to_vec()))?
+                .as_const()
+                .is_some();
+        return need(fixed, ErrorKind::Shape, || {
+            format!("kept state {} must have fixed tail", k.shape)
+        });
+    }
     let grows = match k.shape.0.get(1) {
         Some(DimExpr::Dim(name)) => g.dims.iter().find(|d| d.name == *name),
         _ => None,
@@ -114,18 +149,7 @@ fn kept(g: &Graph, owners: &[Option<u32>], i: usize, k: &TensorType) -> Result<(
     let bounded = grows.is_some_and(|d| matches!(d.size, Size::Bounded(_)));
     need(bounded, ErrorKind::Shape, || {
         format!("kept rows {} need a bounded second axis", k.shape)
-    })?;
-    let mut seen = Vec::new();
-    for (n, own) in g.nodes.iter().zip(owners) {
-        if n.op != Op::Append(i as u32) {
-            continue;
-        }
-        need(!seen.contains(own), ErrorKind::Reference, || {
-            format!("kept rows {i} are appended to twice")
-        })?;
-        seen.push(*own);
-    }
-    Ok(())
+    })
 }
 
 fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {

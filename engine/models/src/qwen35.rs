@@ -13,13 +13,13 @@ use tessera_trace::{
 };
 
 /// A linear-attention layer's query and key heads.
-const KEY_HEADS: DimName = DimName::named("KeyHeads");
+pub(crate) const KEY_HEADS: DimName = DimName::named("KeyHeads");
 /// A linear-attention layer's value heads.
-const VALUE_HEADS: DimName = DimName::named("ValueHeads");
-const KEY_DIM: DimName = DimName::named("KeyDim");
-const VALUE_DIM: DimName = DimName::named("ValueDim");
+pub(crate) const VALUE_HEADS: DimName = DimName::named("ValueHeads");
+pub(crate) const KEY_DIM: DimName = DimName::named("KeyDim");
+pub(crate) const VALUE_DIM: DimName = DimName::named("ValueDim");
 /// Rows a causal filter reads, its own included.
-const WINDOW: DimName = DimName::named("Window");
+pub(crate) const WINDOW: DimName = DimName::named("Window");
 
 pub struct Config {
     /// `heads` and `head_dim` are the full-attention layers'.
@@ -123,7 +123,7 @@ impl Config {
 }
 
 /// Rows over their root mean square, times one plus `gain`.
-fn norm(x: &Tensor, gain: &Vector, eps: f32) -> Tensor {
+pub(crate) fn norm(x: &Tensor, gain: &Vector, eps: f32) -> Tensor {
     let r = x.rms(eps);
     r.add(&r.mul_vector(gain))
 }
@@ -245,21 +245,21 @@ impl DeltaNet {
 }
 
 /// The epsilon under the unit norm of queries and keys.
-const L2_EPS: f32 = 1e-6;
+pub(crate) const L2_EPS: f32 = 1e-6;
 
 /// `key` under `text_config`, else at the top.
-fn text<T: DeserializeOwned + Default>(k: &mut Keys, key: &str) -> T {
+pub(crate) fn text<T: DeserializeOwned + Default>(k: &mut Keys, key: &str) -> T {
     k.need(&[&format!("text_config.{key}"), key])
 }
 
 /// `first`, else `then`, else `default`, as Hugging Face reads.
-fn either<T: DeserializeOwned>(k: &mut Keys, first: &str, then: &str, default: T) -> T {
+pub(crate) fn either<T: DeserializeOwned>(k: &mut Keys, first: &str, then: &str, default: T) -> T {
     let then = k.or(&[&format!("text_config.{then}"), then], default);
     k.or(&[&format!("text_config.{first}"), first], then)
 }
 
 /// The rotary width of a head `width` wide.
-fn rotary(k: &mut Keys, width: u64) -> u64 {
+pub(crate) fn rotary(k: &mut Keys, width: u64) -> u64 {
     let path = "rope_parameters.partial_rotary_factor";
     let factor: f64 = either(k, path, "partial_rotary_factor", 0.25);
     let turned = (width as f64 * factor) as u64;
@@ -270,7 +270,7 @@ fn rotary(k: &mut Keys, width: u64) -> u64 {
 }
 
 /// Each layer's mixer, from `layer_types` or the full-layer interval.
-fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
+pub(crate) fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
     let types: Vec<String> = k.or(&["text_config.layer_types", "layer_types"], Vec::new());
     if types.is_empty() {
         let path = [

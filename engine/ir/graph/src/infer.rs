@@ -101,8 +101,8 @@ fn arity(op: &Op) -> usize {
         Op::Append(_) => 3,
         Op::Matmul | Op::Select(_) | Op::View(View::Concat) | Op::Mix(_) => 2,
         Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
-        Op::Delta(_) => 5,
-        Op::Conv => 2,
+        Op::Delta(d) => 5 + 2 * usize::from(d.state.is_some()),
+        Op::Conv(c) => 2 + 2 * usize::from(c.state.is_some()),
         Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
         Op::View(_) => 1,
     }
@@ -131,7 +131,18 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
             .map(|w| w.ty.clone())
             .ok_or_else(missing),
         Op::Matmul => matmul(&g.dims, args[0], args[1]),
-        Op::Conv => conv(&g.dims, args[0], args[1]),
+        Op::Conv(c) => {
+            need(c.dilation >= 1, ErrorKind::Value, || {
+                format!("conv dilation is {}", c.dilation)
+            })?;
+            match c.state {
+                Some(i) => {
+                    let kept = g.kept.get(i as usize).ok_or_else(missing)?;
+                    conv_rows(&g.dims, kept, c.dilation, args)
+                }
+                None => conv(&g.dims, args[0], args[1]),
+            }
+        }
         Op::Attend(a) if a.ragged => {
             finite(a.scale, "attention scale")?;
             need(a.mask.causal(), ErrorKind::Value, || {
@@ -145,7 +156,13 @@ pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, Typ
         }
         Op::Delta(d) => {
             finite(d.scale, "delta rule scale")?;
-            delta(&g.dims, args)
+            match d.state {
+                Some(i) => {
+                    let kept = g.kept.get(i as usize).ok_or_else(missing)?;
+                    delta_rows(&g.dims, kept, args)
+                }
+                None => delta(&g.dims, args),
+            }
         }
         Op::Row(r) => row(&g.dims, &r.0, args),
         Op::Mask(_) => select::mask(args[0]),
@@ -307,6 +324,53 @@ fn conv(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Type
             x.shape, w.shape
         )
     })?;
+    conv_types(x, w)?;
+    Ok(x.clone())
+}
+
+/// Ragged `[Rows, C]` through taps `[C, K]` with kept state.
+fn conv_rows(
+    dims: &[Dim],
+    kept: &TensorType,
+    dilation: u32,
+    a: &[&TensorType],
+) -> Result<TensorType, TypeError> {
+    let (x, w, slots, positions) = (a[0], a[1], a[2], a[3]);
+    let taps = poly(dims, &w.shape.0[1])?.as_const();
+    let hist = kept
+        .shape
+        .0
+        .get(1)
+        .and_then(|e| poly(dims, e).ok()?.as_const());
+    let want = taps
+        .and_then(|k| k.checked_sub(1))
+        .map(|k| k * u64::from(dilation));
+    let fits = x.rank() == 2
+        && w.rank() == 2
+        && kept.rank() == 3
+        && same(dims, &x.shape.0[1], &w.shape.0[0])?
+        && same(dims, &x.shape.0[1], &kept.shape.0[2])?
+        && want.is_some_and(|n| n > 0 && hist == Some(n));
+    need(fits, ErrorKind::Shape, || {
+        format!(
+            "ragged conv takes x [Rows, C], w [C, K] and state [Seqs, (K-1)*d, C], got {}, {}, {}",
+            x.shape, w.shape, kept.shape
+        )
+    })?;
+    conv_types(x, w)?;
+    need(kept.dtype == DType::F32, ErrorKind::DType, || {
+        format!("conv state must be f32, got {:?}", kept.dtype)
+    })?;
+    need(
+        kept.placement == Placement::Replicated,
+        ErrorKind::Placement,
+        || format!("conv state must be replicated, got {:?}", kept.placement),
+    )?;
+    row_ids(dims, &x.shape, slots, positions)?;
+    Ok(x.clone())
+}
+
+fn conv_types(x: &TensorType, w: &TensorType) -> Result<(), TypeError> {
     need(
         x.dtype.is_float() && x.dtype == w.dtype,
         ErrorKind::DType,
@@ -323,8 +387,7 @@ fn conv(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Type
             "conv takes whole tensors, got {:?} and {:?}",
             x.placement, w.placement
         )
-    })?;
-    Ok(x.clone())
+    })
 }
 
 /// Value heads group over the query and key heads.
@@ -340,8 +403,58 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
         )
     })?;
     heads_fit(dims, [v, q, k], 2)?;
-    for gate in &a[3..] {
-        let fits = same_shape(dims, &gate.shape, &front(&v.shape, 3))?;
+    delta_gates(dims, v, &a[3..5], 3)?;
+    Ok(v.clone())
+}
+
+/// Ragged delta rule with kept per-slot state.
+fn delta_rows(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorType, TypeError> {
+    let (q, k, v) = (a[0], a[1], a[2]);
+    let fits = [q, k, v].iter().all(|t| t.rank() == 3)
+        && kept.rank() == 4
+        && same_shape(dims, &q.shape, &k.shape)?
+        && same(dims, &q.shape.0[0], &v.shape.0[0])?
+        && same(dims, &kept.shape.0[1], &v.shape.0[1])?
+        && same(dims, &kept.shape.0[2], &q.shape.0[2])?
+        && same(dims, &kept.shape.0[3], &v.shape.0[2])?;
+    need(fits, ErrorKind::Shape, || {
+        format!(
+            "ragged delta takes [Rows, Heads, Dim] and state [Seqs, Heads, Dk, Dv], got {}, {}, {}, {}",
+            q.shape, k.shape, v.shape, kept.shape
+        )
+    })?;
+    let heads = poly(dims, &v.shape.0[1])?.as_const();
+    let kv_heads = poly(dims, &q.shape.0[1])?.as_const();
+    if let (Some(h), Some(kv)) = (heads, kv_heads) {
+        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
+            format!("{h} value heads do not group over {kv} key heads")
+        })?;
+    }
+    need(
+        q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype && kept.dtype == DType::F32,
+        ErrorKind::DType,
+        || "ragged delta needs matching floats and f32 state".into(),
+    )?;
+    let p = [v.placement, q.placement, k.placement, kept.placement];
+    let split = [Placement::Split { axis: 1 }; 4];
+    need(
+        p == [Placement::Replicated; 4] || p == split,
+        ErrorKind::Placement,
+        || format!("ragged delta needs whole or head-split tensors, got {p:?}"),
+    )?;
+    delta_gates(dims, v, &a[3..5], 2)?;
+    row_ids(dims, &v.shape, a[5], a[6])?;
+    Ok(v.clone())
+}
+
+fn delta_gates(
+    dims: &[Dim],
+    v: &TensorType,
+    gates: &[&TensorType],
+    lead: usize,
+) -> Result<(), TypeError> {
+    for gate in gates {
+        let fits = same_shape(dims, &gate.shape, &front(&v.shape, lead))?;
         need(fits, ErrorKind::Shape, || {
             format!("gates {} do not match values {}", gate.shape, v.shape)
         })?;
@@ -352,7 +465,7 @@ fn delta(dims: &[Dim], a: &[&TensorType]) -> Result<TensorType, TypeError> {
             format!("gates are {:?}, values {:?}", gate.placement, v.placement)
         })?;
     }
-    Ok(v.clone())
+    Ok(())
 }
 
 /// One integer key list per query, over `lead` axes.

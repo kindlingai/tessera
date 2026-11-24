@@ -1,6 +1,9 @@
 //! Device-accelerated trellis MMA, streaming decode GEMV, and small-batch matmul rules.
 
+mod gemv;
+
 use crate::{Backend, Options, flatten};
+use gemv::propose_gemv;
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Stage, View};
 use tessera_lower::form::Load as Stored;
@@ -37,7 +40,7 @@ pub(crate) fn hip_source() -> &'static str {
     HIP.get_or_init(|| flat(Backend::Rocm))
 }
 
-fn parse_trellis(name: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_trellis(name: &str) -> Option<(u32, u32)> {
     let rest = name.strip_prefix("trellis_k")?;
     let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
         (k, 2u32)
@@ -326,68 +329,6 @@ fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
     form.name() == "f32"
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GemvKind {
-    Bf16,
-    Mxfp8,
-    Int4,
-}
-
-impl GemvKind {
-    fn entry(self) -> &'static str {
-        match self {
-            GemvKind::Bf16 => "tessera_gemv_bf16",
-            GemvKind::Mxfp8 => "tessera_gemv_mxfp8",
-            GemvKind::Int4 => "tessera_gemv_int4",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            GemvKind::Bf16 => "fast_gemv_bf16",
-            GemvKind::Mxfp8 => "fast_gemv_mxfp8",
-            GemvKind::Int4 => "fast_gemv_int4_g32",
-        }
-    }
-
-    fn smem(self) -> usize {
-        match self {
-            GemvKind::Bf16 => 0,
-            GemvKind::Mxfp8 => 512 * 4 + WARPS * 268 * 4,
-            GemvKind::Int4 => 512 * 4 + WARPS * 296 * 4,
-        }
-    }
-
-    fn groups(self, n: usize) -> usize {
-        match self {
-            GemvKind::Int4 => (n / 2).div_ceil(WARPS),
-            GemvKind::Bf16 | GemvKind::Mxfp8 => n.div_ceil(WARPS),
-        }
-    }
-}
-
-/// Streaming decode GEMV for BF16, MXFP8, and INT4_G32 weights.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    name = self.kind.name(),
-    sizes = [1, self.n, self.k],
-    work = self.n * self.k,
-    accepts = gemv_accepts,
-    emits = f32_only,
-    needs = gemv_needs(self),
-    order = Order::PerConfig,
-    source = gemv_source(self),
-    launches = gemv_launches,
-    load = gemv_load,
-    unproven,
-)]
-struct FastGemv {
-    n: usize,
-    k: usize,
-    kind: GemvKind,
-    form: &'static dyn Stored,
-}
-
 fn cuda_needs(group_bytes: usize) -> Needs {
     Needs {
         lanes: 32,
@@ -411,77 +352,6 @@ fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> boo
         1 => form.name() == expected.name(),
         _ => form.name() == "f32",
     }
-}
-
-fn gemv_accepts(k: &FastGemv, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
-}
-
-fn gemv_needs(k: &FastGemv) -> Needs {
-    cuda_needs(k.kind.smem())
-}
-
-fn gemv_source(k: &FastGemv) -> Source {
-    cuda_source_entry(k.kind.entry())
-}
-
-fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
-    let groups = k.kind.groups(k.n);
-    let step = match k.kind {
-        GemvKind::Bf16 => 256.0,
-        GemvKind::Mxfp8 | GemvKind::Int4 => 1024.0,
-    };
-    Some(Load {
-        threads: groups * THREADS,
-        group: THREADS,
-        trips: k.k as f64 / step,
-        reads: vec![k.form.bytes(k.n * k.k) as f64, (4 * k.k) as f64],
-        written: (4 * k.n) as f64,
-        flight: 512.0,
-        ..Load::default()
-    })
-}
-
-fn gemv_launches(k: &FastGemv, step: &Step) -> Vec<Launch> {
-    let shape = Shape::Grid {
-        across: k.kind.groups(k.n),
-        down: 1,
-        threads: THREADS,
-    };
-    let args = vec![
-        step.read(0),
-        step.read(1),
-        step.out(),
-        Arg::count(k.n),
-        Arg::count(k.k),
-    ];
-    vec![Launch { args, shape }]
-}
-
-fn propose_gemv(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let node = tree.node(at);
-    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
-        return None;
-    }
-    let (x, w) = (node.args[0], node.args[1]);
-    if !tree.leaf(w) || tree.node(x).form.name() != "f32" {
-        return None;
-    }
-    let [n, k] = tree.node(w).shape[..] else {
-        return None;
-    };
-    if tree.elements(x) != k || n == 0 {
-        return None;
-    }
-    let form = tree.node(w).form;
-    let kind = match form.name() {
-        "bf16" if k.is_multiple_of(256) => GemvKind::Bf16,
-        "mxfp8" if k.is_multiple_of(1024) => GemvKind::Mxfp8,
-        "int4_g32" if k.is_multiple_of(1024) && n.is_multiple_of(2) => GemvKind::Int4,
-        _ => return None,
-    };
-    let kernel = FastGemv { n, k, kind, form };
-    Some(vec![Draft::new(kernel, [x, w], n)])
 }
 
 /// Fast CUDA stacked BF16 matmul, transposed or row-major.

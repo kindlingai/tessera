@@ -165,14 +165,16 @@ impl Attend {
     }
 }
 
-/// The gated delta rule over whole sequences.
+/// The gated delta rule, whole or ragged with kept state.
 #[derive(Clone, Copy, Debug)]
 pub struct Delta {
     pub scale: f32,
     /// Queries, keys, values, log decays and write rates.
     pub reads: [T; 5],
+    /// Kept state index and `[slots, positions]` when ragged.
+    pub state: Option<(u32, [T; 2])>,
     pub seqs: usize,
-    /// Each sequence's rows, read at launch in a runtime plan.
+    /// Sequence or batch rows, runtime in dynamic plans.
     pub rows: Extent,
     /// Value heads. Each key head serves a contiguous group.
     pub heads: usize,
@@ -187,6 +189,28 @@ impl Pattern for Delta {
         let Term::Op(Op::Delta(d)) = &node.term else {
             return None;
         };
+        if let Some(idx) = d.state {
+            let [q_t, k_t, v_t, dec_t, rate_t, slots, positions] = node.args[..] else {
+                return None;
+            };
+            let (q, v) = (tree.node(q_t), tree.node(v_t));
+            let (&[_, kv_heads, key_width], &[_, heads, width]) = (&q.shape[..], &v.shape[..])
+            else {
+                return None;
+            };
+            let seqs = *tree.fixed_kept(idx)?.first()?;
+            return Some(Self {
+                scale: d.scale,
+                reads: [q_t, k_t, v_t, dec_t, rate_t],
+                state: Some((idx, [slots, positions])),
+                seqs,
+                rows: q.extents[0],
+                heads,
+                kv_heads,
+                key_width,
+                width,
+            });
+        }
         let reads: [T; 5] = node.args[..].try_into().ok()?;
         let (q, v) = (tree.node(reads[0]), tree.node(reads[2]));
         // An extent holds one runtime dimension: the rows.
@@ -201,6 +225,7 @@ impl Pattern for Delta {
         Some(Self {
             scale: d.scale,
             reads,
+            state: None,
             seqs,
             rows,
             heads,
@@ -214,6 +239,10 @@ impl Pattern for Delta {
 impl Delta {
     /// Output elements at the most rows.
     pub fn out(&self) -> usize {
-        self.seqs * self.rows.most() * self.heads * self.width
+        let count = match self.state {
+            Some(_) => self.rows.most(),
+            None => self.seqs * self.rows.most(),
+        };
+        count * self.heads * self.width
     }
 }

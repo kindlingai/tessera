@@ -186,6 +186,13 @@ impl Cover<'_> {
             }
             offered.push(rule.name);
             for drafts in ways(drafts) {
+                // Kept state lives in EDGE so mutations stay in place.
+                let touches_kept = drafts
+                    .iter()
+                    .any(|d| d.reads.iter().any(|r| matches!(r, Read::Kept(_))));
+                if touches_kept && zone != EDGE {
+                    continue;
+                }
                 // A kernel the device cannot run is not a way.
                 let platform = &self.device.platform;
                 if drafts.iter().any(|d| !d.kernel.needs().fits(platform)) {

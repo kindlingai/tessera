@@ -110,7 +110,7 @@ pub enum Op {
     /// Queries, keys, values, log decays and write rates.
     Delta(Delta),
     /// Each channel sums its last `K` rows, weighted by taps.
-    Conv,
+    Conv(Conv),
     /// Scores `[.., Queries, Keys]`. Unseen keys become negative infinity.
     Mask(Mask),
     /// Appends rows to kept rows. The result holds all.
@@ -150,12 +150,31 @@ pub struct Attend {
     pub ragged: bool,
 }
 
+fn one() -> u32 {
+    1
+}
+
+/// Causal depthwise filter along the sequence axis.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Conv {
+    /// Steps between adjacent taps.
+    #[serde(default = "one")]
+    pub dilation: u32,
+    /// Kept state `[Seqs, (K - 1) * dilation, C]`, for ragged rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<u32>,
+}
+
 /// The gated delta rule. Each value head keeps a state.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Delta {
     /// On the queries.
     pub scale: f32,
+    /// Kept state `[Seqs, Heads, KeyDim, ValueDim]`, for ragged rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,13 +296,15 @@ pub enum Act {
     Softplus,
     Exp,
     Tanh,
+    /// `sign(x) * sqrt(max(|x|, 1e-6))`.
+    SignedSqrt,
 }
 
 impl Act {
     /// Whether zero maps to zero.
     pub fn keeps_zero(self) -> bool {
         match self {
-            Act::GeluTanh | Act::Silu | Act::Relu | Act::Tanh => true,
+            Act::GeluTanh | Act::Silu | Act::Relu | Act::Tanh | Act::SignedSqrt => true,
             Act::Sigmoid | Act::Softplus | Act::Exp => false,
         }
     }
@@ -404,4 +425,6 @@ pub enum Role {
     Candidates,
     /// Residual rows tapped after chosen layers.
     Taps,
+    /// Per-layer n-gram embedding rows from the host.
+    Ple,
 }

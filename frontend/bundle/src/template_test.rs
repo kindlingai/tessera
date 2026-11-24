@@ -48,3 +48,11 @@ fn renders_reasoning_effort() {
     assert_eq!(t.render_with(&[], true, Some("low")).unwrap(), "low");
     assert_eq!(t.render_with(&[], true, Some("high")).unwrap(), "high");
 }
+
+#[test]
+fn strips_generation_tags() {
+    let source =
+        "{% for m in messages %}{%- generation %}{{ m.content }}{%- endgeneration %}{% endfor %}";
+    let t = Template::new(source.into()).unwrap();
+    assert_eq!(t.render(&[say("assistant", "ok")], true).unwrap(), "ok");
+}

@@ -92,6 +92,7 @@ impl MapStage {
             MapStage::Act(Act::Softplus) => (Row::Softplus, 0.0),
             MapStage::Act(Act::Exp) => (Row::Exp, 0.0),
             MapStage::Act(Act::Tanh) => (Row::Tanh, 0.0),
+            MapStage::Act(Act::SignedSqrt) => (Row::SignedSqrt, 0.0),
         }
     }
 }
@@ -157,6 +158,18 @@ fn act_expr(a: Act) -> Expr {
             let clamped = call(Intrinsic::Clamp, vec![scaled, lit(-8.0), lit(8.0)]);
             let t = Expr::bin(BinOp::Add, lit(1.0), call(Intrinsic::Tanh, vec![clamped]));
             Expr::bin(BinOp::Mul, Expr::bin(BinOp::Mul, lit(0.5), v()), t)
+        }
+        Act::SignedSqrt => {
+            let mag = call(Intrinsic::Max, vec![v(), neg(v())]);
+            let clamped = call(Intrinsic::Max, vec![mag, lit(1e-6)]);
+            let root = Expr::bin(
+                BinOp::Mul,
+                clamped.clone(),
+                call(Intrinsic::Rsqrt, vec![clamped]),
+            );
+            let neg_sign = Expr::select(Expr::bin(BinOp::Lt, v(), lit(0.0)), lit(-1.0), lit(0.0));
+            let sign = Expr::select(Expr::bin(BinOp::Gt, v(), lit(0.0)), lit(1.0), neg_sign);
+            Expr::bin(BinOp::Mul, sign, root)
         }
     }
 }

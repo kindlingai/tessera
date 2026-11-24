@@ -3,7 +3,7 @@
 use crate::model::{Kept, Shared, push};
 use crate::weights::{Embed, Linear, Norm, Scalar, Taps, Vector};
 use tessera_graph::{
-    Act, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
+    Act, Conv, DType, DimExpr, Mask, NodeId, Op, Pairs, Row, Select, Shape, Stage, TensorType, View,
 };
 
 #[derive(Clone)]
@@ -34,7 +34,31 @@ impl Tensor {
 
     /// Each channel over its last rows, through `w`'s taps.
     pub fn conv(&self, w: &Taps) -> Tensor {
-        self.op(Op::Conv, &[&w.0])
+        self.conv_dilated(w, 1)
+    }
+
+    /// Dilated causal filter over whole sequences.
+    pub fn conv_dilated(&self, w: &Taps, dilation: u32) -> Tensor {
+        let op = Op::Conv(Conv {
+            dilation,
+            state: None,
+        });
+        self.op(op, &[&w.0])
+    }
+
+    /// Ragged dilated causal filter updating kept state per slot.
+    pub fn conv_rows(
+        &self,
+        w: &Taps,
+        dilation: u32,
+        state: &Kept,
+        [slots, positions]: [&Tensor; 2],
+    ) -> Tensor {
+        let op = Op::Conv(Conv {
+            dilation,
+            state: Some(state.0),
+        });
+        self.op(op, &[&w.0, slots, positions])
     }
 
     /// Logits over a table's rows, for tied embeddings.

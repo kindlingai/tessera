@@ -12,6 +12,7 @@ pub mod mla;
 pub mod mtp;
 pub mod nanogpt;
 pub mod qwen35;
+pub mod qwen4_exp;
 mod shared;
 pub mod small;
 pub mod sprite;

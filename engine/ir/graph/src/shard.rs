@@ -535,6 +535,10 @@ fn typed(g: &Graph) -> Result<Graph, (usize, crate::infer::TypeError)> {
                 Placement::Split { axis } => Placement::Split { axis: axis + 1 },
                 p => p,
             };
+        } else if let Op::Delta(d) = out.nodes[i].op
+            && let Some(k) = d.state
+        {
+            out.kept[k as usize].placement = out.node(out.nodes[i].args[2]).ty.placement;
         }
         let args: Vec<_> = out.nodes[i]
             .args

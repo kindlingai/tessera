@@ -22,6 +22,7 @@ pub mod names;
 mod names_test;
 pub mod parts;
 pub mod qwen35;
+pub mod qwen4_exp;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -44,7 +45,7 @@ use tessera_engine::decoder::Config;
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
 use tessera_engine::wasm::Module;
-use tessera_engine::{DimName, Graph, Pins, Steps, Tensor, Weight};
+use tessera_engine::{DimName, Graph, Pins, PleConfig, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -60,10 +61,19 @@ struct Generation {
     eos_token_id: Option<Ids>,
 }
 
+/// Streams weights one at a time, sliced by rank share.
+pub trait Stream {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>;
+}
+
 /// A model's weights: held, or read as they load.
 pub enum Weights {
     Held(Vec<Weight>),
-    Streamed(Box<mla::Release>),
+    Streamed(Box<dyn Stream>),
 }
 
 impl Weights {
@@ -98,7 +108,8 @@ impl Weights {
                 Ok(())
             }
             Weights::Streamed(release) => {
-                release.each(&shares, |at, w| take(at, &w).map_err(Into::into))
+                let mut sink = |at, w: Weight| take(at, &w).map_err(Into::into);
+                release.stream(&shares, &mut sink)
             }
         }
     }
@@ -115,6 +126,23 @@ pub struct Bundle {
     pub stop: Vec<u32>,
     /// Model `config.json` with recipe overrides applied.
     pub config: Option<String>,
+    /// Host PLE table config, when needed.
+    pub ple: Option<PleConfig>,
+}
+
+/// Streams a graph's weights from `offer` using `rules`.
+pub(crate) fn stream_each(
+    graph: &Graph,
+    offer: &dyn Offer,
+    rules: &[Rule],
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+    mut take: impl FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut at = 0;
+    each(graph, offer, &[rules], shares, |weight, _| {
+        at += 1;
+        take(at - 1, weight)
+    })
 }
 
 /// Config values a recipe sets, by the file they override.
@@ -434,7 +462,13 @@ pub fn load_tapped(
         json: &json,
     };
     let (graph, weights, pins) = step(arch, &ask)?;
-    dressed(dir, graph, weights, pins, Some(json))
+    let ple = match arch.name {
+        "qwen4_exp" => qwen4_exp::ple_config(dir, &ask)?,
+        _ => None,
+    };
+    let mut bundle = dressed(dir, graph, weights, pins, Some(json))?;
+    bundle.ple = ple;
+    Ok(bundle)
 }
 
 /// `graph`'s weights held from `ask`'s folder, `rules` first.
@@ -524,5 +558,6 @@ fn dressed(
         template,
         stop,
         config,
+        ple: None,
     })
 }

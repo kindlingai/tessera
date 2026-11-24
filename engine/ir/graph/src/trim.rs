@@ -122,11 +122,21 @@ fn needs(g: &Graph, entry: usize) -> Vec<Need> {
     }
 }
 
+/// Whether `op` writes to kept rows or state.
+fn keeps(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Append(_)
+            | Op::Conv(crate::node::Conv { state: Some(_), .. })
+            | Op::Delta(crate::node::Delta { state: Some(_), .. })
+    )
+}
+
 /// One pass from the outputs back to the inputs.
 fn sweep(g: &Graph, entry: usize, forced: &[bool]) -> Vec<Need> {
     let mut need = vec![Need::Unused; g.nodes.len()];
     for (i, n) in g.nodes.iter().enumerate() {
-        if forced[i] || matches!(n.op, Op::Append(_)) {
+        if forced[i] || keeps(&n.op) {
             need[i] = Need::All;
         }
     }
@@ -143,7 +153,7 @@ fn sweep(g: &Graph, entry: usize, forced: &[bool]) -> Vec<Need> {
             let ty = &g.node(*a).ty;
             rowwise(&n.op, j, ty) && !by_rows(ty) && ty.shape.0.iter().any(|e| mentions(e, Rows))
         };
-        let fixed = matches!(n.op, Op::Input { .. } | Op::Weight(_) | Op::Append(_));
+        let fixed = matches!(n.op, Op::Input { .. } | Op::Weight(_)) || keeps(&n.op);
         let fixed = fixed && !follows(g, &n.op);
         if need[i] == Need::Picked
             && (fixed || !by_rows(&n.ty) || n.args.iter().enumerate().any(mixed))
@@ -189,7 +199,7 @@ fn rowwise(op: &Op, j: usize, arg: &TensorType) -> bool {
         | Op::Mask(_)
         | Op::Append(_)
         | Op::Delta(_)
-        | Op::Conv => false,
+        | Op::Conv(_) => false,
     }
 }
 

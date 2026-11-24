@@ -48,7 +48,7 @@ pub(crate) struct Widths {
 /// Trellis forms for one layer's routed and shared projections.
 pub(crate) struct Forms {
     pub(crate) routed: [&'static dyn Form; 3],
-    pub(crate) shared: [&'static dyn Form; 3],
+    pub(crate) shared: Option<[&'static dyn Form; 3]>,
 }
 
 impl Widths {
@@ -164,7 +164,9 @@ pub(crate) fn shared_width(k: u32) -> u32 {
 
 /// A layer and its expert name, under the layer's MLP.
 pub(crate) fn split(name: &str) -> Option<(usize, &str)> {
-    let rest = name.strip_prefix("model.layers.")?;
+    let rest = name
+        .strip_prefix("model.language_model.layers.")
+        .or_else(|| name.strip_prefix("model.layers."))?;
     let (layer, local) = rest.split_once('.')?;
     let local = local.strip_prefix("mlp.")?;
     let ours = local.starts_with("experts.") || local.starts_with("shared_experts.");
@@ -198,11 +200,17 @@ pub(crate) fn codebook(codes: &File, shared: bool, proj: Proj) -> Result<Codeboo
 }
 
 /// The layer's slices: codes as trellis sets, rotations as floats.
-pub(crate) fn offered(idx: &File, layer: usize, gate_k: u32, forms: Forms) -> Vec<Slice> {
+pub(crate) fn offered(
+    idx: &File,
+    prefix: &str,
+    layer: usize,
+    gate_k: u32,
+    forms: Forms,
+) -> Vec<Slice> {
     let Some([hidden, experts, ffn]) = sizes(idx, gate_k) else {
         return Vec::new();
     };
-    let at = format!("model.layers.{layer}.mlp.");
+    let at = format!("{prefix}{layer}.mlp.");
     let slice = |name: String, shape: Vec<usize>, stored| Slice {
         name: format!("{at}{name}"),
         shape,
@@ -225,12 +233,14 @@ pub(crate) fn offered(idx: &File, layer: usize, gate_k: u32, forms: Forms) -> Ve
         let (into, from) = (format!("experts.{name}.su"), format!("experts.{name}.sv"));
         out.push(slice(into, vec![experts, cols], Stored::F32));
         out.push(slice(from, vec![experts, rows], Stored::F32));
-        let stem = format!("shared_experts.{name}_proj");
-        out.push(slice(
-            format!("{stem}.weight"),
-            vec![rows, cols],
-            Stored::Form(forms.shared[p as usize]),
-        ));
+        if let Some(shared) = forms.shared {
+            let stem = format!("shared_experts.{name}_proj");
+            out.push(slice(
+                format!("{stem}.weight"),
+                vec![rows, cols],
+                Stored::Form(shared[p as usize]),
+            ));
+        }
     }
     for side in ["signs_in", "signs_out"] {
         out.push(slice(format!("experts.{side}"), vec![hidden], Stored::F32));
