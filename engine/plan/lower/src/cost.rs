@@ -11,8 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tessera_codegen::kept::Layout;
 use tessera_engine_settings::{Pick, Settings};
 use tessera_graph::Parts;
@@ -86,10 +86,24 @@ pub struct Device {
     memo: RefCell<Memo>,
 }
 
+/// Source hash for `step`, cached by its printed kernel.
+fn source_hash(step: &Step, kernel: &str) -> u64 {
+    static HASHES: OnceLock<Mutex<HashMap<(&'static str, String), u64>>> = OnceLock::new();
+    let cache = HASHES.get_or_init(Mutex::default);
+    let key = (step.kernel.name(), kernel.to_string());
+    if let Some(&hash) = cache.lock().expect("source hashes").get(&key) {
+        return hash;
+    }
+    let hash = step.kernel.source().hash();
+    cache.lock().expect("source hashes").insert(key, hash);
+    hash
+}
+
 /// A timed launch of `step`.
 fn sample(step: &Step, seconds: f64) -> Sample {
     let (sizes, work) = (step.kernel.sizes(), step.kernel.work(step.write.len));
-    let (kernel, source) = (format!("{:?}", step.kernel), step.kernel.source().hash());
+    let kernel = format!("{:?}", step.kernel);
+    let source = source_hash(step, &kernel);
     Sample::new(kernel, source, sizes, work, seconds)
 }
 
