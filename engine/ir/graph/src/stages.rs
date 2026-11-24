@@ -1,11 +1,6 @@
 //! Row stages: one table row each, with their facts.
 
 use crate::node::{Act, Pairs};
-#[cfg(not(target_family = "wasm"))]
-use scattered_collect::{
-    ScatteredSlice,
-    declarative::{gather, scatter},
-};
 use serde::{Deserialize, Serialize};
 
 /// The argument a stage reads besides the row.
@@ -103,106 +98,66 @@ impl Facts {
     };
 }
 
-// Wasm has no linker sections for this registry.
-#[cfg(not(target_family = "wasm"))]
-gather! {
-    /// The kernel rule each `Lower::Kernel` stage names.
-    #[gather]
-    pub static STAGE_RULES: ScatteredSlice<&'static str>;
-}
-
-/// Registers the rule a kernel stage names.
-macro_rules! kernel_rule {
-    ($rule:literal) => {
-        #[cfg(not(target_family = "wasm"))]
-        const _: () = {
-            scatter! {
-                #[scatter($crate::stages::STAGE_RULES)]
-                static RULE: &str = $rule;
-            }
-        };
-    };
-    ($class:ident) => {};
-}
-
-/// Defines `stages!` and registers kernel rules, from the rows.
-macro_rules! table {
-    ($d:tt $(
-        $(#[$($m:tt)*])*
-        $name:ident $(($($tp:tt)*))? $({$($sp:tt)*})? $(as $method:ident)?
-        => $lower:tt {$($col:tt)*}
-    )*) => {
-        /// Expands `$cb` over every row stage.
-        #[macro_export]
-        macro_rules! stages {
-            ($d cb:ident) => {
-                $d cb! {$(
-                    $(#[$($m)*])*
-                    $name $(($($tp)*))? $({$($sp)*})? $(as $method)?
-                    => $lower {$($col)*}
-                )*}
-            };
-        }
-
-        $(kernel_rule!($lower);)*
-    };
-}
-
+/// Expands `$cb` over every row stage.
 // Rows: `Variant params as builder => lowering { columns }`.
-table! {
-    $
-    Add as add => Map { operand: Broadcast, place: Sum, pin: Residual }
-    Mul as mul => Map { operand: Broadcast, place: Product }
-    Scale(by: f32 = 0.5) as scale => Map { check: Finite(by, "scale") }
-    RmsNorm { eps: f32 = 1e-6 } as rms_norm => "rms_norm" {
-        operand: RowWeight,
-        whole: true,
-        reduces: true,
-        check: Finite(eps, "norm epsilon"),
-        pin: Norm,
-    }
-    /// Divides the row by its root mean square.
-    Rms { eps: f32 = 1e-6 } as rms => "rms_norm" {
-        whole: true,
-        reduces: true,
-        check: Finite(eps, "norm epsilon"),
-        pin: Norm,
-    }
-    /// The scaled Walsh-Hadamard transform of each `block` of the row.
-    Hadamard { block: u32 = 4 } as hadamard => "hadamard" {
-        check: PowerOfTwo(block),
-        blocks: block,
-    }
-    /// Subtracts the row's mean.
-    Center as center => "by_sum" { whole: true, reduces: true, pin: Norm }
-    /// Divides the row by its sum.
-    UnitSum as unit_sum => "by_sum" { whole: true, reduces: true, pin: Prob }
-    /// Rotates pairs of elements. The argument holds positions.
-    Rope {
-        /// Pair `j` turns by `position * theta^(-2j/width)`.
-        theta: f32 = 10000.0,
-        pairs: Pairs = Pairs::Halves,
-        /// Pairs from this one on stay still. `None` turns all.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turned: Option<u32> = None,
-    } => "rope" {
-        operand: Positions,
-        check: Positive(theta, "rope base"),
-        blocks: 2,
-    }
-    Act(a: Act = Act::Silu) as act => Map { place: Nonlinear(a.keeps_zero()) }
-    /// Sine of each element. Fold it away before lowering.
-    Sin as sin => Fold { place: Replicated }
-    /// Cosine of each element. Fold it away before lowering.
-    Cos as cos => Fold { place: Replicated }
-    Softmax as softmax => "softmax" { whole: true, reduces: true, pin: Prob }
-    AllReduce => Crossing { reduces: true, place: Reduce }
-    /// Joins each rank's part of the last axis.
-    AllGather => Crossing { reduces: true, place: Gather }
-    /// Entries past the position in the argument become -inf.
-    Causal as causal => "causal" { operand: Positions, whole: true }
-    /// Entry `i` becomes -inf where mask bit `i` is clear.
-    Allow as allow => "allow" { operand: Bits, whole: true }
+#[macro_export]
+macro_rules! stages {
+    ($cb:ident) => {
+        $cb! {
+            Add as add => Map { operand: Broadcast, place: Sum, pin: Residual }
+            Mul as mul => Map { operand: Broadcast, place: Product }
+            Scale(by: f32 = 0.5) as scale => Map { check: Finite(by, "scale") }
+            RmsNorm { eps: f32 = 1e-6 } as rms_norm => "rms_norm" {
+                operand: RowWeight,
+                whole: true,
+                reduces: true,
+                check: Finite(eps, "norm epsilon"),
+                pin: Norm,
+            }
+            /// Divides the row by its root mean square.
+            Rms { eps: f32 = 1e-6 } as rms => "rms_norm" {
+                whole: true,
+                reduces: true,
+                check: Finite(eps, "norm epsilon"),
+                pin: Norm,
+            }
+            /// The scaled Walsh-Hadamard transform of each `block` of the row.
+            Hadamard { block: u32 = 4 } as hadamard => "hadamard" {
+                check: PowerOfTwo(block),
+                blocks: block,
+            }
+            /// Subtracts the row's mean.
+            Center as center => "by_sum" { whole: true, reduces: true, pin: Norm }
+            /// Divides the row by its sum.
+            UnitSum as unit_sum => "by_sum" { whole: true, reduces: true, pin: Prob }
+            /// Rotates pairs of elements. The argument holds positions.
+            Rope {
+                /// Pair `j` turns by `position * theta^(-2j/width)`.
+                theta: f32 = 10000.0,
+                pairs: Pairs = Pairs::Halves,
+                /// Pairs from this one on stay still. `None` turns all.
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                turned: Option<u32> = None,
+            } => "rope" {
+                operand: Positions,
+                check: Positive(theta, "rope base"),
+                blocks: 2,
+            }
+            Act(a: Act = Act::Silu) as act => Map { place: Nonlinear(a.keeps_zero()) }
+            /// Sine of each element. Fold it away before lowering.
+            Sin as sin => Fold { place: Replicated }
+            /// Cosine of each element. Fold it away before lowering.
+            Cos as cos => Fold { place: Replicated }
+            Softmax as softmax => "softmax" { whole: true, reduces: true, pin: Prob }
+            AllReduce => Crossing { reduces: true, place: Reduce }
+            /// Joins each rank's part of the last axis.
+            AllGather => Crossing { reduces: true, place: Gather }
+            /// Entries past the position in the argument become -inf.
+            Causal as causal => "causal" { operand: Positions, whole: true }
+            /// Entry `i` becomes -inf where mask bit `i` is clear.
+            Allow as allow => "allow" { operand: Bits, whole: true }
+        }
+    };
 }
 
 macro_rules! lowering {

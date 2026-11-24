@@ -196,3 +196,13 @@ fn tables_keep_forms() {
     let plan = lower(&g, 0, &SIZES, &guess.pinned(pins)).unwrap();
     assert_eq!(names(&plan), ["gather"]);
 }
+
+#[test]
+fn stage_rules() {
+    let rules = rules();
+    for s in tessera_graph::STAGES {
+        if let tessera_graph::Lower::Kernel(name) = s.facts().lower {
+            assert!(rules.iter().any(|r| r.name == name), "no rule {name}");
+        }
+    }
+}

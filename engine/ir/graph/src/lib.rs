@@ -26,8 +26,6 @@ pub use numerics::{Math, Numerics, Order};
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};
-#[cfg(not(target_family = "wasm"))]
-pub use stages::STAGE_RULES;
 pub use stages::{Check, Facts, Lower, Pin, Place, STAGES, Stage, Takes};
 pub use trim::trim;
 pub use types::{DType, Placement, TensorType};
