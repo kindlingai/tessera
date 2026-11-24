@@ -9,7 +9,7 @@ use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
     attention, blocks, chain, delta, indexed, indexed_rows, indexer, linear, neighbours, picked,
-    rotation, routed, rows, table, turned,
+    residual_norm, rotation, routed, rows, table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -265,6 +265,9 @@ impl Grid {
             cases.push(by_rows(rows(&one, width)));
             cases.push(by_rows(neighbours(&one, [16, 9, width])));
             cases.extend((self.vocabs.iter()).map(|v| by_rows(table(&one, *v, width))));
+        }
+        for &width in &self.widths {
+            cases.push(by_rows(residual_norm(&one, width)));
         }
         for &heads in &self.heads {
             let span =

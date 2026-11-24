@@ -186,6 +186,7 @@ impl Probe {
             rule: "probe",
             reads: vec![input],
             write: slot(1, write),
+            also: Vec::new(),
             covers: Vec::new(),
             zone: 0,
             table: None,

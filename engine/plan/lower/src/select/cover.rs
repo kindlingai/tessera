@@ -38,9 +38,12 @@ pub(crate) fn reads(drafts: &[Draft]) -> Vec<T> {
         .collect()
 }
 
-/// The region outputs a cover writes.
+/// The outputs a cover writes, besides its own root.
 pub(crate) fn writes(drafts: &[Draft]) -> Vec<T> {
-    drafts.iter().filter_map(|d| d.writes).collect()
+    drafts
+        .iter()
+        .flat_map(|d| d.writes.into_iter().chain(d.also.iter().map(|(t, _)| *t)))
+        .collect()
 }
 
 /// Leaves and outputs lie where the runner feeds and reads.
@@ -215,6 +218,9 @@ impl Cover<'_> {
                 let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts), &writes(&drafts)) else {
                     continue;
                 };
+                if !rule.propose.regions() && absorbed.iter().any(|r| self.tree.end(*r)) {
+                    continue;
+                }
                 // The zone must also cover each root the drafts absorb.
                 let own = absorbed.into_iter().map(|r| self.solve(r, zone));
                 let Some(own) = own.sum::<Option<f64>>() else {
@@ -309,9 +315,16 @@ impl Cover<'_> {
                 None if i == last => self.tree.node(t).form,
                 None => F32_FORM,
             };
-            if form.narrow() && !d.kernel.emits(form) {
+            if form.narrow() && !d.kernel.emits_at(0, form) {
                 let narrow = Narrow { len: d.len, form };
                 seconds += self.device.seconds_in(zone, &narrow, d.len, false);
+            }
+            for (k, &(w, len)) in d.also.iter().enumerate() {
+                let form = self.tree.node(w).form;
+                if form.narrow() && !d.kernel.emits_at(k + 1, form) {
+                    let narrow = Narrow { len, form };
+                    seconds += self.device.seconds_in(zone, &narrow, len, false);
+                }
             }
         }
         seconds

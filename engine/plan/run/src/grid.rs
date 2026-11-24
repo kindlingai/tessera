@@ -125,7 +125,9 @@ pub(crate) fn table(
     for arg in &launch.args {
         match arg {
             Arg::Buffer(slot, Extent::Fixed(skip)) => {
-                let kind = if buf_index == step.reads.len() && *slot == step.write {
+                let kind = if buf_index >= step.reads.len()
+                    && (*slot == step.write || step.also.contains(slot))
+                {
                     ItemKind::Output
                 } else {
                     ItemKind::Input

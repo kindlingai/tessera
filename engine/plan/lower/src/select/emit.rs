@@ -14,6 +14,9 @@ use crate::tree::{T, Tree};
 use std::collections::HashMap;
 use tessera_graph::NodeId;
 
+/// Extra output `(len, form, packed_shape)` for `Emit::op`.
+pub(crate) type OutputSpec = (usize, &'static dyn Load, (u8, [u32; 4]));
+
 /// The ops written, and the values they use.
 #[derive(Default)]
 pub(crate) struct Emit {
@@ -64,6 +67,7 @@ impl Emit {
             rule: "move",
             reads: vec![v],
             write,
+            also: Vec::new(),
             covers: Vec::new(),
             zone,
         });
@@ -102,6 +106,7 @@ impl Emit {
             rule: "widen",
             reads: vec![v],
             write,
+            also: Vec::new(),
             covers: Vec::new(),
             zone,
         });
@@ -124,6 +129,7 @@ impl Emit {
             rule: "narrow",
             reads: vec![v],
             write,
+            also: Vec::new(),
             covers: Vec::new(),
             zone,
         });
@@ -143,7 +149,7 @@ impl Emit {
         }
     }
 
-    /// Adds an op writing a new value, or shares one.
+    /// Adds an op writing outputs, or shares one.
     #[allow(clippy::too_many_arguments, reason = "op emission takes value shape")]
     pub(crate) fn op(
         &mut self,
@@ -154,7 +160,8 @@ impl Emit {
         zone: u32,
         form: &'static dyn Load,
         shape: (u8, [u32; 4]),
-    ) -> Val {
+        also_specs: &[OutputSpec],
+    ) -> (Val, Vec<Val>) {
         let mut taken = Vec::with_capacity(reads.len());
         for (i, v) in reads.into_iter().enumerate() {
             let v = self.bring(v, zone);
@@ -162,25 +169,32 @@ impl Emit {
         }
         let reads = taken;
         // Printing kernels is slow, so shared ones alone are keyed.
-        let key = d
-            .kernel
-            .shared()
+        let key = (d.kernel.shared() && also_specs.is_empty())
             .then(|| (format!("{:?}", d.kernel), reads.clone()));
         if let Some(same) = key.as_ref().and_then(|k| self.shared.get(k)) {
-            return *same;
+            return (*same, Vec::new());
         }
         let same_in = !d.kernel.overwrites()
             || reads
                 .first()
                 .is_some_and(|r| self.out.values[r.0 as usize].form.name() == form.name());
-        let native = (!form.narrow() || d.kernel.emits(form)) && same_in;
+        let native = (!form.narrow() || d.kernel.emits_at(0, form)) && same_in;
         let out_form = if native { form } else { form::F32_FORM };
         let write = self.value(d.len, Home::Temp, zone, out_form, shape);
+        let mut also = Vec::with_capacity(also_specs.len());
+        let mut also_native = Vec::with_capacity(also_specs.len());
+        for (k, &(len, extra_form, extra_shape)) in also_specs.iter().enumerate() {
+            let ok = !extra_form.narrow() || d.kernel.emits_at(k + 1, extra_form);
+            let stored = if ok { extra_form } else { form::F32_FORM };
+            also.push(self.value(len, Home::Temp, zone, stored, extra_shape));
+            also_native.push((ok, extra_form));
+        }
         self.out.ops.push(Op {
             kernel: d.kernel,
             rule,
             reads,
             write,
+            also: also.clone(),
             covers: covers.to_vec(),
             zone,
         });
@@ -188,10 +202,18 @@ impl Emit {
             true => write,
             false => self.narrow(write, form),
         };
+        let extras = also
+            .into_iter()
+            .zip(also_native)
+            .map(|(v, (ok, want))| match ok {
+                true => v,
+                false => self.narrow(v, want),
+            })
+            .collect();
         if let Some(key) = key {
             self.shared.insert(key, result);
         }
-        result
+        (result, extras)
     }
 
     /// The kept rows or state of `index`, made once.
@@ -260,6 +282,7 @@ impl Emit {
             rule: "append",
             reads: vec![rows, slots, positions],
             write,
+            also: Vec::new(),
             covers: vec![tree.node(t).from],
             zone: EDGE,
         });

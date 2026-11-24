@@ -49,7 +49,6 @@ fn ours() -> Vec<&'static tessera_lower::Rule> {
 
 /// Every rule's launches under `settings`. Returns the rules used.
 fn rules_match(settings: &Settings) -> Vec<&'static str> {
-    let mut noise = Noise(7);
     let d = dims();
     // Rows of 600: more entries than threads for the argmax.
     let graphs = [
@@ -63,10 +62,13 @@ fn rules_match(settings: &Settings) -> Vec<&'static str> {
         graphs::picks(&d, 16),
         graphs::indexed(&d, [2, 16, 2]),
         graphs::indexed_rows(&d, [2, 16, 2]),
+        graphs::residual_norm(&d, 32),
+        graphs::residual_norm(&d, 600),
     ];
     let ours = ours();
     let mut used: Vec<&str> = Vec::new();
     for (g, rule) in graphs.iter().flat_map(|g| ours.iter().map(move |r| (g, r))) {
+        let mut noise = Noise(7);
         let device = Device::guess(settings).favoring(rule.name);
         let plan = lower(g, 0, &SIZES, &device).unwrap();
         let mut seen: Vec<&[NodeId]> = Vec::new();

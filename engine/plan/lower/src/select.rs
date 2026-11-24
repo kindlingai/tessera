@@ -61,6 +61,8 @@ pub struct Op {
     pub rule: &'static str,
     pub reads: Vec<Val>,
     pub write: Val,
+    /// Extra values this launch also writes.
+    pub also: Vec<Val>,
     pub covers: Vec<NodeId>,
     pub zone: u32,
 }
@@ -274,9 +276,31 @@ fn select_with(
                         None => (form::F32_FORM, pack_shape(&[d.len], d.len)),
                     };
                     let writes = d.writes;
-                    made.push(e.op(d, choice.rule, reads, &covers, zone, form, shape));
+                    let also_nodes: Vec<T> = d.also.iter().map(|(w, _)| *w).collect();
+                    let also_specs: Vec<_> = d
+                        .also
+                        .iter()
+                        .map(|&(w, len)| {
+                            let node = tree.node(w);
+                            (len, node.form, pack_shape(&node.shape, len))
+                        })
+                        .collect();
+                    let (primary, extras) = e.op(
+                        d,
+                        choice.rule,
+                        reads,
+                        &covers,
+                        zone,
+                        form,
+                        shape,
+                        &also_specs,
+                    );
+                    made.push(primary);
                     if let Some(w) = writes {
                         written.push((w, made[i]));
+                    }
+                    for (w, v) in also_nodes.into_iter().zip(extras) {
+                        written.push((w, v));
                     }
                 }
                 let mut own = *made.last().expect("a rule proposes at least one launch");

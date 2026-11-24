@@ -322,6 +322,7 @@ impl Buffers<'_> {
                     rule: op.rule,
                     reads: vec![reads[0]],
                     write: copy,
+                    also: Vec::new(),
                     covers,
                     zone: op.zone,
                     table: self.plan.table,
@@ -334,11 +335,20 @@ impl Buffers<'_> {
             let held = self.slots[op.write.0 as usize];
             held.unwrap_or_else(|| self.alloc_scratch(op.write))
         };
+        let also: Vec<Slot> = op
+            .also
+            .iter()
+            .map(|&v| {
+                let held = self.slots[v.0 as usize];
+                held.unwrap_or_else(|| self.alloc_scratch(v))
+            })
+            .collect();
         self.plan.steps.push(Step {
             kernel: op.kernel.clone(),
             rule: op.rule,
             reads,
             write,
+            also,
             covers: op.covers.clone(),
             zone: op.zone,
             table: self.plan.table,

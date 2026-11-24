@@ -29,9 +29,15 @@ impl<'a> Lives<'a> {
 
     /// Temporary elements op `i` writes. Kept rows count zero.
     fn written(&self, i: usize) -> isize {
-        let write = self.s.ops[i].write;
-        let len = self.s.values[write.0 as usize].len as isize;
-        if self.temp(write) { len } else { 0 }
+        let op = &self.s.ops[i];
+        let count = |v: Val| {
+            if self.temp(v) {
+                self.s.values[v.0 as usize].len as isize
+            } else {
+                0
+            }
+        };
+        count(op.write) + op.also.iter().copied().map(count).sum::<isize>()
     }
 
     /// Elements op `i` allocates, less those it lets go.
@@ -62,6 +68,9 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
     let mut writer = vec![None; s.values.len()];
     for (i, op) in s.ops.iter().enumerate() {
         writer[op.write.0 as usize] = Some(i);
+        for &v in &op.also {
+            writer[v.0 as usize] = Some(i);
+        }
     }
     let mut after: Vec<Vec<usize>> = vec![Vec::new(); s.ops.len()];
     let mut waiting = vec![0; s.ops.len()];

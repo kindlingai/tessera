@@ -133,10 +133,13 @@ impl Launch {
         shape: Shape,
     ) -> Launch {
         let mut reads = 0..;
+        let mut writes = 0..;
         let mut args = Vec::with_capacity(body.params.len());
         for p in &body.params {
             args.push(match p {
-                Param::Buffer { writes: true, .. } if !overwrites => step.out(),
+                Param::Buffer { writes: true, .. } if !overwrites => {
+                    step.out_at(writes.next().expect("writes"))
+                }
                 Param::Buffer { .. } => step.read(reads.next().expect("reads")),
                 Param::Scalar { name, .. } => scalar(name),
                 _ => continue,

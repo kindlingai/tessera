@@ -262,6 +262,7 @@ fn mapped(len: usize) -> Step {
         rule: "map",
         reads: Vec::new(),
         write: Slot::floats(0, len),
+        also: Vec::new(),
         covers: Vec::new(),
         zone: 0,
         table: None,
@@ -781,6 +782,7 @@ fn arenas_pack_zones() {
         rule: "map",
         reads,
         write,
+        also: Vec::new(),
         covers: Vec::new(),
         zone,
     };

@@ -168,6 +168,9 @@ impl Layout {
                 *r = move_slot(*r);
             }
             step.write = move_slot(step.write);
+            for w in &mut step.also {
+                *w = move_slot(*w);
+            }
             step.table = step.table.map(move_slot);
         }
         out
