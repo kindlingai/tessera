@@ -1,6 +1,6 @@
 //! Two engines as ranks against one engine alone.
 
-use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 use tessera_engine::comm::{Sockets, Transport};
 use tessera_engine::{Batch, Engine, Event, Fair, Place, Request, Row};
 use tessera_graph::{Graph, Parts};
@@ -8,14 +8,15 @@ use tessera_lower::{Cluster, Pick, Recipe, Settings, Weight, kept};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::mla;
 use tessera_run::Profile;
-use tessera_testkit::{Noise, weights};
+use tessera_testkit::{Noise, tcp_pair, tcp_timeouts, weights};
 use tessera_trace::Norm;
 
 /// Both ends of one loopback stream, as two ranks.
 fn pair() -> [Sockets; 2] {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let caller = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (answer, _) = listener.accept().unwrap();
+    let wait = Duration::from_secs(20);
+    let (caller, answer) = tcp_pair().unwrap();
+    tcp_timeouts(&caller, wait).unwrap();
+    tcp_timeouts(&answer, wait).unwrap();
     [
         Sockets::over(0, vec![None, Some(caller)]).unwrap(),
         Sockets::over(1, vec![Some(answer), None]).unwrap(),

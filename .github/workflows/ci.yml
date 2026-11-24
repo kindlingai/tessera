@@ -47,7 +47,7 @@ jobs:
       - id: paths
         env:
           # Files that can change the Docker image or the Kubernetes example.
-          DOCKER_PATHS: '^(Dockerfile|\.dockerignore|deploy/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
+          DOCKER_PATHS: '^(Dockerfile|\.dockerignore|deploy/|tools/scripts/image-libs\.sh$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
@@ -195,10 +195,13 @@ jobs:
       - run: cargo nextest run -p tessera-grammar --features llguidance --profile ci
 
   macos:
-    # Light on pull requests. A push to main runs it only when its merge
-    # group skipped it.
+    # Light on pull requests. The merge queue skips it, because macOS
+    # runners are scarce. A push to main runs the full job when its merge
+    # group did not.
     needs: changes
-    if: needs.changes.outputs.build == 'true' && needs.changes.outputs.macos == 'true'
+    if: >
+      github.event_name != 'merge_group' &&
+      needs.changes.outputs.build == 'true' && needs.changes.outputs.macos == 'true'
     uses: ./.github/workflows/macos.yml
     with:
       light: ${{ github.event_name == 'pull_request' }}
@@ -390,16 +393,25 @@ jobs:
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
 
   docker:
-    # The CUDA image runs without a GPU, and the Kubernetes example
-    # matches its schemas.
+    # Each image runs without a GPU and finds the libraries tesserax
+    # opens. Each Kubernetes example matches its schemas.
+    name: docker (${{ matrix.backend }})
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cuda
+            libs: libnvrtc.so.13
+          - backend: rocm
+            libs: libamdhip64.so.7 libhiprtc.so.7
     steps:
       - uses: actions/checkout@v4
       - run: >
-          docker run --rm -v "$PWD/deploy:/deploy:ro" ghcr.io/yannh/kubeconform:v0.6.7
-          -strict -summary /deploy/k8s
+          kubectl kustomize "deploy/k8s/${{ matrix.backend }}" |
+          docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary -
       - uses: docker/setup-buildx-action@v3
       # Layers from earlier runs, so an unchanged tree skips the build.
       - uses: docker/build-push-action@v6
@@ -407,8 +419,13 @@ jobs:
           context: .
           load: true
           tags: tesserax:ci
-          cache-from: type=gha,scope=docker
-          cache-to: type=gha,scope=docker,mode=max
+          build-args: BACKEND=${{ matrix.backend }}
+          cache-from: type=gha,scope=docker-${{ matrix.backend }}
+          cache-to: type=gha,scope=docker-${{ matrix.backend }},mode=max
+      - run: docker image ls tesserax:ci --format 'image size {{.Size}}'
+      - run: >
+          docker run --rm -v "$PWD/tools/scripts:/scripts:ro" --entrypoint /bin/sh
+          tesserax:ci /scripts/image-libs.sh ${{ matrix.libs }}
       # With no verb, tesserax prints its usage and exits 2.
       - run: |
           code=0

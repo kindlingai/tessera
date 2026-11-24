@@ -63,7 +63,7 @@ pub struct File {
 fn stored(dtype: &str) -> Stored {
     match dtype {
         "F32" => Stored::F32,
-        "BF16" => Stored::Bf16,
+        "BF16" => Stored::BF16,
         "F16" => Stored::F16,
         _ => Stored::Other,
     }
@@ -165,7 +165,7 @@ impl File {
     pub fn is_bf16(&self, name: &str) -> bool {
         self.entries
             .get(name)
-            .is_some_and(|e| stored(&e.dtype) == Stored::Bf16)
+            .is_some_and(|e| stored(&e.dtype) == Stored::BF16)
     }
 
     /// An `I64` tensor's values, in little-endian order.
@@ -213,8 +213,8 @@ impl File {
         let unknown = || Error::DType(format!("{name} is {}", e.dtype));
         let kind = stored(&e.dtype);
         let width = match kind {
-            Stored::F32 => 4,
-            Stored::Bf16 | Stored::F16 => 2,
+            k if k == Stored::F32 => 4,
+            k if k == Stored::BF16 || k == Stored::F16 => 2,
             _ => return Err(unknown()),
         };
         let [start, end] = e.data_offsets;
@@ -225,10 +225,10 @@ impl File {
         let bytes = self.read(start, end)?;
         let halves = || (bytes.as_chunks::<2>().0.iter()).map(|b| u16::from_le_bytes(*b));
         Ok(match kind {
-            Stored::F32 => (bytes.as_chunks::<4>().0.iter())
+            k if k == Stored::F32 => (bytes.as_chunks::<4>().0.iter())
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
-            Stored::Bf16 => halves().map(|h| f32::from(Bf16(h))).collect(),
+            k if k == Stored::BF16 => halves().map(|h| f32::from(Bf16(h))).collect(),
             _ => halves().map(|h| f32::from(F16(h))).collect(),
         })
     }
@@ -250,14 +250,28 @@ impl Offer for File {
     }
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
-        Err(Error::DType(format!("{name} holds floats, not a form")))
+        match self.entries.get(name).map(|e| stored(&e.dtype)) {
+            Some(s) if s == Stored::BF16 => self.bytes(name),
+            Some(_) => Err(Error::DType(format!("{name} holds floats, not a form"))),
+            None => Err(Error::Missing(name.into())),
+        }
     }
 
-    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        match self.entries.get(name).map(|e| stored(&e.dtype)) {
-            Some(Stored::Bf16) => self.bytes(name),
-            _ => Err(Error::DType(format!("{name} is not bf16"))),
+    fn packed_rows(&self, name: &str, (first, count): (usize, usize)) -> Result<Vec<u8>, Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        if stored(&e.dtype) != Stored::BF16 {
+            return Err(Error::DType(format!("{name} cannot be read in rows")));
         }
+        let rows = *e.shape.first().unwrap_or(&0);
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let elems: usize = e.shape.iter().product();
+        let stride = (2 * elems / rows) as u64;
+        self.bytes_at(name, first as u64 * stride, Some(count as u64 * stride))
     }
 
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
@@ -316,8 +330,8 @@ impl Offer for Shards {
         Offer::packed(self.holding(name)?, name)
     }
 
-    fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
-        Offer::bf16(self.holding(name)?, name)
+    fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
+        Offer::packed_rows(self.holding(name)?, name, rows)
     }
 
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {

@@ -90,3 +90,16 @@ opt-level = 3
 # Reference checks run whole models through the interpreter.
 [profile.dev.package.tessera-interp]
 opt-level = 3
+
+# Host JIT compilation and helpers run inside every CPU test.
+[profile.dev.package.tessera-jit]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 2
+
+[profile.dev.package.regalloc2]
+opt-level = 2

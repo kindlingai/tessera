@@ -1,6 +1,6 @@
 //! Small graphs that reach every rule, at many sizes.
 
-use crate::{choices, measure};
+use crate::{BURST, TRIES, choices, measure_with, pending, time_plans};
 use tessera_engine::Error;
 use tessera_graph::DimName::{self, *};
 use tessera_lower::form::BF16_FORM;
@@ -31,6 +31,10 @@ pub struct Grid {
     pub spans: Vec<[u64; 2]>,
     /// Weight bytes one chain run reads, past current caches.
     pub streamed: u64,
+    /// Timed tries per step.
+    pub tries: usize,
+    /// Launches back to back in one try, at most.
+    pub burst: usize,
 }
 
 /// A graph, with each size to time it at.
@@ -70,6 +74,7 @@ impl Case {
         device: &mut Device,
         noise: &mut Noise,
         settings: &Settings,
+        (tries, burst): (usize, usize),
     ) -> Result<Vec<(Step, f64)>, Error> {
         let mut runner: Option<Box<dyn Run>> = None;
         let mut added = Vec::new();
@@ -80,23 +85,45 @@ impl Case {
             if plan.buffers.iter().sum::<usize>() > ROOM {
                 continue;
             }
+            // Skip opening a runner when every competing plan is known.
+            let pre = match device.name.is_empty() {
+                true => None,
+                false => Some(pending((&self.g, 0), sizes, device, settings, self.cold)?),
+            };
+            if pre.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
             let runner = match &mut runner {
                 Some(runner) => runner,
-                None => runner.insert(opened(&self.g, plan, noise, settings)?),
+                None => {
+                    let first = pre.as_ref().map_or(plan, |p| p[0].clone());
+                    runner.insert(opened(&self.g, first, noise, settings)?)
+                }
             };
             let ports = self.g.entries[0].inputs.iter();
             let fed: Result<Vec<Tensor>, Error> =
                 ports.map(|p| fill(&self.g, &p.ty, sizes, noise)).collect();
             let fed = fed?;
             let feeds: Vec<View> = fed.iter().map(Tensor::view).collect();
-            added.extend(measure(
-                &mut **runner,
-                (&self.g, 0),
-                sizes,
-                &feeds,
-                device,
-                (settings, self.cold),
-            )?);
+            let timed = match pre {
+                Some(plans) if device.platform == runner.platform() => time_plans(
+                    &mut **runner,
+                    &plans,
+                    &feeds,
+                    device,
+                    (self.cold, tries, burst),
+                )?,
+                _ => measure_with(
+                    &mut **runner,
+                    (&self.g, 0),
+                    sizes,
+                    &feeds,
+                    device,
+                    (settings, self.cold),
+                    (tries, burst),
+                )?,
+            };
+            added.extend(timed);
         }
         device.pins = given;
         Ok(added)
@@ -135,6 +162,8 @@ impl Grid {
                 [512, 512],
             ],
             streamed: 128 << 20,
+            tries: TRIES,
+            burst: BURST,
         }
     }
 
@@ -147,6 +176,8 @@ impl Grid {
             heads: vec![[16, 8, 64]],
             spans: vec![[1, 16], [1, 128], [16, 16], [64, 64]],
             streamed: 128 << 20,
+            tries: TRIES,
+            burst: BURST,
         }
     }
 
@@ -159,6 +190,8 @@ impl Grid {
             heads: vec![[4, 2, 16]],
             spans: vec![[1, 5], [4, 4]],
             streamed: 4 << 10,
+            tries: 1,
+            burst: 1,
         }
     }
 
@@ -262,7 +295,7 @@ impl Grid {
         let mut noise = Noise(17);
         let mut added = Vec::new();
         for case in self.cases() {
-            added.extend(case.run(device, &mut noise, settings)?);
+            added.extend(case.run(device, &mut noise, settings, (self.tries, self.burst))?);
         }
         Ok(added)
     }

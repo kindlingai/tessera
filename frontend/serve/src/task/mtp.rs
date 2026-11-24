@@ -3,7 +3,7 @@
 use super::draft::{
     ADAPTIVE, DraftLinks, SPEC_LEN, begin, open_drafter, open_target, serve, spec_len, split_links,
 };
-use super::generate::queue;
+use super::generate::{check_lowering, queue};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -138,6 +138,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.layer,
         o.slots,
     );
+    check_lowering(o, &mut engine, Some((o.slots * (depth + 1)).min(16)));
     if o.slots > 1 {
         return serve_batch(load, &mut engine, &mut drafter, target, depth);
     }
@@ -226,6 +227,7 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
         engine.device(),
         o.slots,
     );
+    check_lowering(o, &mut engine, Some(dflash_block.min(16)));
     let d_sl = spec_len(load, dflash_block - 1, CostModel::dual_dflash(), false);
     let m_sl = spec_len(load, depth, CostModel::dual_mtp(), true);
     let selector = DualSelector::new(d_sl, m_sl);

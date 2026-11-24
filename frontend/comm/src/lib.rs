@@ -6,11 +6,12 @@ pub use roce::{port, ports};
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
@@ -147,17 +148,35 @@ fn link(
 
 /// Joins rank `rank` of `addrs` on `listener`. Lower ranks call.
 pub fn sockets(rank: u32, listener: TcpListener, addrs: &[SocketAddr]) -> Result<Sockets, Error> {
+    sockets_within(rank, listener, addrs, PATIENCE, None)
+}
+
+/// Joins `rank` within `wait`, stopping when `abort` flips.
+pub fn sockets_within(
+    rank: u32,
+    listener: TcpListener,
+    addrs: &[SocketAddr],
+    wait: Duration,
+    abort: Option<&AtomicBool>,
+) -> Result<Sockets, Error> {
+    let deadline = Instant::now() + wait;
     let mut peers: Vec<Option<TcpStream>> = (0..addrs.len()).map(|_| None).collect();
     for (r, addr) in addrs.iter().enumerate().take(rank as usize) {
-        let mut stream = call(*addr)?;
+        let mut stream = call(*addr, deadline, abort)?;
+        stream.set_write_timeout(Some(remaining(deadline, abort)?))?;
         stream.write_all(&rank.to_le_bytes())?;
+        stream.set_write_timeout(None)?;
         peers[r] = Some(stream);
     }
+    if rank as usize + 1 < addrs.len() {
+        listener.set_nonblocking(true)?;
+    }
     for _ in rank as usize + 1..addrs.len() {
-        let (mut stream, _) = listener.accept()?;
-        stream.set_nodelay(true)?;
+        let mut stream = accept(&listener, deadline, abort)?;
+        stream.set_read_timeout(Some(remaining(deadline, abort)?))?;
         let mut who = [0u8; 4];
         stream.read_exact(&mut who)?;
+        stream.set_read_timeout(None)?;
         let who = u32::from_le_bytes(who) as usize;
         if who <= rank as usize || who >= addrs.len() || peers[who].is_some() {
             return Err(Error::Fit(format!("rank {who} called rank {rank}")));
@@ -167,18 +186,60 @@ pub fn sockets(rank: u32, listener: TcpListener, addrs: &[SocketAddr]) -> Result
     Sockets::over(rank, peers)
 }
 
-/// Connects to `addr`, retrying while it is not up yet.
-fn call(addr: SocketAddr) -> io::Result<TcpStream> {
-    let start = Instant::now();
+/// Whether a connect failure may clear once the peer binds.
+fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::Interrupted
+    )
+}
+
+fn remaining(deadline: Instant, abort: Option<&AtomicBool>) -> io::Result<Duration> {
+    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(ErrorKind::ConnectionAborted.into());
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(ErrorKind::TimedOut.into());
+    }
+    Ok(left)
+}
+
+/// Accepts one stream on nonblocking `listener` before `deadline`.
+fn accept(
+    listener: &TcpListener,
+    deadline: Instant,
+    abort: Option<&AtomicBool>,
+) -> io::Result<TcpStream> {
     loop {
-        match TcpStream::connect(addr) {
+        let _ = remaining(deadline, abort)?;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                let left = remaining(deadline, abort)?;
+                thread::sleep(Duration::from_millis(5).min(left));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Connects to `addr`, retrying while it is not up yet.
+fn call(addr: SocketAddr, deadline: Instant, abort: Option<&AtomicBool>) -> io::Result<TcpStream> {
+    loop {
+        let left = remaining(deadline, abort)?;
+        match TcpStream::connect_timeout(&addr, left) {
             Ok(stream) => {
                 stream.set_nodelay(true)?;
                 return Ok(stream);
             }
-            Err(e) if start.elapsed() < PATIENCE => {
-                let _ = e;
-                thread::sleep(Duration::from_millis(20));
+            Err(e) if transient(&e) => {
+                let left = remaining(deadline, abort)?;
+                thread::sleep(Duration::from_millis(20).min(left));
             }
             Err(e) => return Err(e),
         }

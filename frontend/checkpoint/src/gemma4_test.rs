@@ -12,9 +12,13 @@ fn row_trellis_table() {
     let release = Release::open(&dir);
     let slice = release.slices().into_iter().find(|s| s.name == name);
     let slice = slice.expect("the table is on offer");
-    assert_eq!(slice.stored, Stored::Bf16);
+    assert_eq!(slice.stored, Stored::BF16);
     let wide = |b: &[u8]| f32::from(Bf16(u16::from_le_bytes([b[0], b[1]])));
-    let got: Vec<f32> = release.bf16(name).unwrap().chunks(2).map(wide).collect();
+    let got: Vec<f32> = Offer::packed(&release, name)
+        .unwrap()
+        .chunks(2)
+        .map(wide)
+        .collect();
     let want = File::open(&dir.join("want.safetensors")).unwrap();
     let want: Vec<f32> = want.bytes("want").unwrap().chunks(2).map(wide).collect();
     assert_eq!(got.len(), want.len());

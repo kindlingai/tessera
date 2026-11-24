@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
 use tessera_graph::{EntryKind, Role};
-use tessera_lower::{Cache, Device, Slot, Wants};
+use tessera_lower::{Cache, Device, Report, Slot, Wants};
 use tessera_run::{Run, open};
 
 mod batch_dual;
@@ -427,6 +427,35 @@ impl Engine {
             *by.entry(step.kernel.name()).or_default() += step.launches().len();
         }
         by
+    }
+
+    /// Fast-path diagnostic report for a `rows`-row decode launch.
+    pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
+        let rows = rows.max(1);
+        let max_pos = self.context.saturating_sub(1);
+        let sample: Vec<Row> = (0..rows)
+            .map(|i| Row {
+                slot: (i % self.slots) as u32,
+                token: 0,
+                position: (i / self.slots).min(max_pos) as u32,
+            })
+            .collect();
+        let picks: Vec<u32> = (0..rows as u32).collect();
+        let (sizes, [filled, _]) = launch_of(&sample, &picks, self.slots, self.context);
+        let wants = match self.taps.is_some() {
+            true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
+            false => Wants::role(&self.graph, self.full, Role::Tokens),
+        };
+        let mut report = self.plans.explain(
+            &self.graph,
+            self.full,
+            wants,
+            &sizes,
+            &[Context, Segments],
+            &self.device,
+        )?;
+        report.label = format!("rows={filled}");
+        Ok(report)
     }
 
     /// Mask words per pick, if the graph takes masks.
