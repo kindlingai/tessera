@@ -218,6 +218,9 @@ fn v4_release() {
             ("q.k3.svh", "F16", vec![128], side.clone()),
             ("g.record", "I64", vec![8], record(6, 2, 2, 0)),
             ("g.bf16", "BF16", vec![2, 2], bf16.clone()),
+            ("b.record", "I64", vec![8], record(4, 2, 2, 0)),
+            ("b.fp8", "U8", vec![2, 2], vec![0x38, 0x40, 0x38, 0x40]),
+            ("b.scale", "F32", vec![1, 1], floats(&[2.0])),
         ],
     );
     let names = r#"{"embed_tokens": "model.text.embed_tokens"}"#;
@@ -264,6 +267,10 @@ fn v4_release() {
         Offer::packed(&release, "model.text.layers.0.g.weight").unwrap(),
         bf16
     );
+    let fp8_all = Offer::packed(&release, "model.text.layers.0.b.weight").unwrap();
+    let fp8_row = Offer::packed_rows(&release, "model.text.layers.0.b.weight", (1, 1)).unwrap();
+    assert_eq!(fp8_all.len(), 8);
+    assert_eq!(fp8_row, &fp8_all[4..8]);
     let codes = trellis::TRELLIS_K3_PMCGX.unpack_all(&trellis::packed(128, 128, 1, &k3));
     let want = trellis::rotated(&codes, 128, 128, &[0.5; 128], &[0.5; 128]);
     assert_eq!(release.floats(q).unwrap(), want);

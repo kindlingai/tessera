@@ -655,9 +655,21 @@ impl Release {
             Ok(r) if r.format == ROWS => {
                 let mut all = rows(f, &matrix, &r, narrow)?;
                 if let Some((first, count)) = range {
-                    all = all.into_iter().skip(first).take(count).collect();
+                    all = all
+                        .into_iter()
+                        .skip(first * r.inp)
+                        .take(count * r.inp)
+                        .collect();
                 }
                 Ok(all.into_flattened())
+            }
+            Ok(r) if r.format == FP8_BLOCK || r.format == FP8_ROW => {
+                let floats = plain(f, &matrix, &r, r.format)?;
+                let slice = match range {
+                    Some((first, count)) => &floats[first * r.inp..(first + count) * r.inp],
+                    None => &floats,
+                };
+                Ok(slice.iter().flat_map(narrow).collect())
             }
             Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix),
             Ok(_) => codes_packed(f, &matrix, range),
