@@ -64,6 +64,10 @@ pub trait Offer {
     fn floats(&self, name: &str) -> Result<Vec<f32>, Error>;
     /// Slice `name` as its form's bytes.
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error>;
+    /// An `I64` slice's values.
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        Err(Error::DType(format!("{name} cannot be read as I64")))
+    }
     /// Slice `name` left on disk, as stored.
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
         let _ = name;

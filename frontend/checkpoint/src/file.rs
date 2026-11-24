@@ -274,6 +274,10 @@ impl Offer for File {
         self.bytes_at(name, first as u64 * stride, Some(count as u64 * stride))
     }
 
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        File::i64s(self, name)
+    }
+
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
         let e = self.entries.get(name)?;
         let Backing::Disk(disk) = &self.backing else {
@@ -332,6 +336,10 @@ impl Offer for Shards {
 
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {
         Offer::packed_rows(self.holding(name)?, name, rows)
+    }
+
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        self.holding(name)?.i64s(name)
     }
 
     fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {

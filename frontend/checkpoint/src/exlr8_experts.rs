@@ -162,11 +162,9 @@ pub(crate) fn shared_width(k: u32) -> u32 {
     k.max(3)
 }
 
-/// A layer and its expert name, under the layer's MLP.
-pub(crate) fn split(name: &str) -> Option<(usize, &str)> {
-    let rest = name
-        .strip_prefix("model.language_model.layers.")
-        .or_else(|| name.strip_prefix("model.layers."))?;
+/// A layer and its expert name, past `prefix`.
+pub(crate) fn split<'a>(name: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+    let rest = name.strip_prefix(prefix)?;
     let (layer, local) = rest.split_once('.')?;
     let local = local.strip_prefix("mlp.")?;
     let ours = local.starts_with("experts.") || local.starts_with("shared_experts.");

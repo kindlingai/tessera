@@ -146,10 +146,34 @@ impl Op {
     /// Whether the result reads state besides its arguments.
     pub fn stateful(&self) -> bool {
         match self {
-            Op::Input { .. } | Op::Weight(_) | Op::Append(_) => true,
+            Op::Input { .. } | Op::Weight(_) => true,
+            Op::Append(_) | Op::Conv(_) | Op::Delta(_) => self.keeps(),
+            Op::Matmul
+            | Op::Attend(_)
+            | Op::Mask(_)
+            | Op::Row(_)
+            | Op::Select(_)
+            | Op::View(_)
+            | Op::Cast(_)
+            | Op::Mean(_)
+            | Op::Mix(_) => false,
+        }
+    }
+
+    /// Whether the op writes kept rows or state.
+    pub fn keeps(&self) -> bool {
+        matches!(self, Op::Append(_)) || self.recurrent()
+    }
+
+    /// Whether the op carries slot state across launches.
+    pub fn recurrent(&self) -> bool {
+        match self {
             Op::Conv(c) => c.state.is_some(),
             Op::Delta(d) => d.state.is_some(),
-            Op::Matmul
+            Op::Input { .. }
+            | Op::Weight(_)
+            | Op::Append(_)
+            | Op::Matmul
             | Op::Attend(_)
             | Op::Mask(_)
             | Op::Row(_)

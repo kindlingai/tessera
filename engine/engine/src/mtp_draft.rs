@@ -505,9 +505,7 @@ impl<'a> MtpSpeculate<'a> {
         if depth == 0 {
             return Err(Error::Rows);
         }
-        let Some(width) = target.tap_width() else {
-            return Err(Error::Taps);
-        };
+        let width = target.draft_taps()?;
         if width != drafter.hidden() {
             return Err(Error::Rows);
         }

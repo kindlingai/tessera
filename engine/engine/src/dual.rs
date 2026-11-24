@@ -279,9 +279,7 @@ impl<'a> DualSpeculate<'a> {
         if depth == 0 {
             return Err(Error::Rows);
         }
-        let Some(width) = target.tap_width() else {
-            return Err(Error::Taps);
-        };
+        let width = target.draft_taps()?;
         if width != dflash.tap_width() + mtp.hidden() {
             return Err(Error::Rows);
         }
