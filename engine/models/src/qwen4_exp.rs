@@ -5,13 +5,16 @@ use crate::qwen35::{
     DeltaNet, Full, KEY_DIM, KEY_HEADS, L2_EPS, Mixing, Recurrent, VALUE_DIM, VALUE_HEADS, WINDOW,
     either, mixing, norm, rotary, text,
 };
-use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, part, rows, swiglu};
+use crate::shared::{
+    Attend, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink, part, rows,
+    swiglu,
+};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::pick;
 use tessera_trace::{
-    Act, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear, Linears,
-    Mask, Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
+    Act, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear, Mask,
+    Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
 };
 
 const GDN_HIST: DimName = DimName::named("GdnHist");
@@ -409,85 +412,28 @@ pub trait Routed: Weights {
     }
 }
 
-/// Plain routed experts plus gated shared expert.
+/// Routed experts stored as `E`, plus gated shared expert.
 #[derive(Weights)]
-pub struct Moe {
+pub struct MoeOf<E: ExpertSet> {
     #[shape(Hidden, Experts)]
     router: Linear,
-    #[shape(Experts, Hidden, Ffn)]
-    gate: Linears,
-    #[shape(Experts, Hidden, Ffn)]
-    up: Linears,
-    #[shape(Experts, Ffn, Hidden)]
-    down: Linears,
+    #[flatten]
+    experts: E,
     shared: SharedMlp,
 }
 
-impl Routed for Moe {
+pub type Moe = MoeOf<PlainExperts>;
+pub type RotatedMoe = MoeOf<CodedExperts>;
+
+impl<E: ExpertSet> Routed for MoeOf<E> {
     fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
         let [ids, gates] = route(&self.router, h);
-        let on = |set: &Linears, x: &Tensor| x.matmul_rows(&m.pick(set, &ids));
-        let inner = on(&self.gate, h).act(Act::Silu).mul(&on(&self.up, h));
-        let picks = h.ty().rank() as u32 - 1;
-        let routed = on(&self.down, &inner).mix(picks, &gates);
-        routed.add(&self.shared.apply(h))
-    }
-}
-
-/// Trellis-rotated routed experts plus BF16 gated shared expert.
-#[derive(Weights)]
-pub struct RotatedMoe {
-    #[shape(Hidden, Experts)]
-    router: Linear,
-    #[shape(Hidden)]
-    signs_in: Vector,
-    #[shape(Hidden)]
-    signs_out: Vector,
-    #[shape(Experts, Hidden, Ffn)]
-    gate: Linears,
-    #[shape(Experts, Hidden)]
-    gate_su: Embed,
-    #[shape(Experts, Ffn)]
-    gate_sv: Embed,
-    #[shape(Experts, Hidden, Ffn)]
-    up: Linears,
-    #[shape(Experts, Hidden)]
-    up_su: Embed,
-    #[shape(Experts, Ffn)]
-    up_sv: Embed,
-    #[shape(Experts, Ffn, Hidden)]
-    down: Linears,
-    #[shape(Experts, Ffn)]
-    down_su: Embed,
-    #[shape(Experts, Hidden)]
-    down_sv: Embed,
-    shared: SharedMlp,
-}
-
-impl Routed for RotatedMoe {
-    fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
-        let [ids, gates] = route(&self.router, h);
-        let picks = h.ty().rank() as u32 - 1;
-        let lead = &h.ty().shape.0[..picks as usize];
-        let slots = h
-            .mul_vector(&self.signs_in)
-            .reshape(cat(lead, [1u64.into(), Hidden.into()]))
-            .expand(picks, TopK);
-        let on = |x: &Tensor, codes: &Linears, [su, sv]: [&Embed; 2]| {
-            let turned = x.mul(&m.embed(&ids, su)).hadamard(128);
-            let product = turned.matmul_rows(&m.pick(codes, &ids));
-            product.hadamard(128).mul(&m.embed(&ids, sv))
-        };
-        let gate = on(&slots, &self.gate, [&self.gate_su, &self.gate_sv]);
-        let up = on(&slots, &self.up, [&self.up_su, &self.up_sv]);
-        let inner = gate.act(Act::Silu).mul(&up);
-        let out = on(&inner, &self.down, [&self.down_su, &self.down_sv]);
-        let routed = out.mul_vector(&self.signs_out).mix(picks, &gates);
+        let routed = self.experts.apply(m, h, [&ids, &gates]);
         routed.add(&self.shared.apply(h))
     }
 
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
-        h.mul_vector(&self.signs_in).hadamard(128)
+        self.experts.tap_gauge(h)
     }
 }
 

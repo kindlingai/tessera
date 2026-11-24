@@ -5,21 +5,7 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
-union alignas(16) ptr_smem {
-    struct {
-        u32 btab[2048];
-        u32 wtiles[2048];
-    } k;
-    float out[128];
-};
-
-static __device__ __forceinline__ void ptr_load4(const float* p, float v[4]) {
-    float4 f = *reinterpret_cast<const float4*>(p);
-    v[0] = f.x;
-    v[1] = f.y;
-    v[2] = f.z;
-    v[3] = f.w;
-}
+using ptr_smem = trellis::stage_smem<float[128]>;
 
 template <u32 K, u32 BOOK, bool TURNED>
 static __device__ __forceinline__ void ptr_body(
@@ -59,10 +45,10 @@ static __device__ __forceinline__ void ptr_body(
         if (j < nb) {
             u32 col = ((c0 + j) << 7u) + (lane << 2u);
             float v[4];
-            ptr_load4(xr + col, v);
+            trellis::load4(xr + col, v);
             if constexpr (TURNED) {
                 float sc[4];
-                ptr_load4(sur + col, sc);
+                trellis::load4(sur + col, sc);
                 v[0] *= sc[0];
                 v[1] *= sc[1];
                 v[2] *= sc[2];
@@ -92,23 +78,23 @@ static __device__ __forceinline__ void ptr_body(
         if (j == 0u) {
             u32 base = (ob << 7u) + (lane << 2u);
             float v[4], sc[4];
-            ptr_load4(sm.out + (lane << 2u), v);
+            trellis::load4(sm.out + (lane << 2u), v);
             trellis::wht128(v, trellis::INV_SQRT128);
-            ptr_load4(sv + u64(e) * n + base, sc);
+            trellis::load4(sv + u64(e) * n + base, sc);
             v[0] *= sc[0];
             v[1] *= sc[1];
             v[2] *= sc[2];
             v[3] *= sc[3];
             if (post == 1u) {
                 float ex[4];
-                ptr_load4(extra + base, ex);
+                trellis::load4(extra + base, ex);
                 v[0] *= ex[0];
                 v[1] *= ex[1];
                 v[2] *= ex[2];
                 v[3] *= ex[3];
             } else if (post == 2u) {
                 float ex[4];
-                ptr_load4(extra + u64(r) * n + base, ex);
+                trellis::load4(extra + u64(r) * n + base, ex);
                 v[0] = (v[0] / (1.0f + expf(-v[0]))) * ex[0];
                 v[1] = (v[1] / (1.0f + expf(-v[1]))) * ex[1];
                 v[2] = (v[2] / (1.0f + expf(-v[2]))) * ex[2];

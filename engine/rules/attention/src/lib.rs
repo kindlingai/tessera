@@ -6,6 +6,7 @@ mod cpu;
 mod delta;
 mod flash;
 mod listed;
+mod slots;
 
 use tessera_lower::kernels::Map;
 use tessera_lower::{Draft, T, Tree, sites};

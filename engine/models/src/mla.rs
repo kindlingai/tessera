@@ -1,10 +1,12 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
-use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, rows, swiglu};
+use crate::shared::{
+    Attend, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink, rows, swiglu,
+};
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
-    Norm, Pairs, Role, Size, Tensor, TensorType, Vector, Weights,
+    Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Mask, Model, Norm,
+    Pairs, Role, Size, Tensor, TensorType, Vector, Weights,
 };
 use tessera_trace::{pick, step_ports, tokens};
 
@@ -228,21 +230,21 @@ pub struct SharedMlp {
     pub down: Linear,
 }
 
+/// Routed experts stored as `E`, and a shared one.
 #[derive(Weights)]
-pub struct Moe {
+pub struct MoeOf<E: ExpertSet> {
     #[shape(Hidden, Experts)]
     pub router: Linear,
     /// Added to scores for the pick only.
     #[shape(Experts)]
     pub router_bias: Vector,
-    #[shape(Experts, Hidden, Ffn)]
-    pub gate: Linears,
-    #[shape(Experts, Hidden, Ffn)]
-    pub up: Linears,
-    #[shape(Experts, Ffn, Hidden)]
-    pub down: Linears,
+    #[flatten]
+    pub experts: E,
     pub shared: SharedMlp,
 }
+
+pub type Moe = MoeOf<PlainExperts>;
+pub type RotatedMoe = MoeOf<CodedExperts>;
 
 /// Layer `l` uses `dense[l]`, or `moe[l - DENSE_LAYERS]`.
 #[derive(Weights)]
@@ -540,74 +542,11 @@ fn route(c: &Config, router: &Linear, bias: &Vector, h: &Tensor) -> [Tensor; 2] 
     [ids, gates]
 }
 
-impl Routed for Moe {
+impl<E: ExpertSet> Routed for MoeOf<E> {
     /// Each row's top experts, weighted, plus the shared expert.
     fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
         let [ids, gates] = route(c, &self.router, &self.router_bias, h);
-        // One output row per pick, each on its own expert.
-        let on = |set: &Linears, x: &Tensor| x.matmul_rows(&m.pick(set, &ids));
-        let inner = on(&self.gate, h).act(Act::Silu).mul(&on(&self.up, h));
-        let picks = h.ty().rank() as u32 - 1;
-        let routed = on(&self.down, &inner).mix(picks, &gates);
-        let s = &self.shared;
-        routed.add(&swiglu(h, [&s.gate, &s.up, &s.down]))
-    }
-}
-
-/// Experts as codes between 128-channel rotations.
-#[derive(Weights)]
-pub struct RotatedMoe {
-    #[shape(Hidden, Experts)]
-    pub router: Linear,
-    #[shape(Experts)]
-    pub router_bias: Vector,
-    /// Signs on the stream into the experts, and out.
-    #[shape(Hidden)]
-    pub signs_in: Vector,
-    #[shape(Hidden)]
-    pub signs_out: Vector,
-    #[shape(Experts, Hidden, Ffn)]
-    pub gate: Linears,
-    #[shape(Experts, Hidden)]
-    pub gate_su: Embed,
-    #[shape(Experts, Ffn)]
-    pub gate_sv: Embed,
-    #[shape(Experts, Hidden, Ffn)]
-    pub up: Linears,
-    #[shape(Experts, Hidden)]
-    pub up_su: Embed,
-    #[shape(Experts, Ffn)]
-    pub up_sv: Embed,
-    #[shape(Experts, Ffn, Hidden)]
-    pub down: Linears,
-    #[shape(Experts, Ffn)]
-    pub down_su: Embed,
-    #[shape(Experts, Hidden)]
-    pub down_sv: Embed,
-    pub shared: SharedMlp,
-}
-
-impl Routed for RotatedMoe {
-    fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
-        let [ids, gates] = route(c, &self.router, &self.router_bias, h);
-        let picks = h.ty().rank() as u32 - 1;
-        // One copy of each signed row per picked expert.
-        let lead: Vec<DimExpr> = h.ty().shape.0[..picks as usize].to_vec();
-        let one = lead.into_iter().chain([DimExpr::Const(1), Hidden.into()]);
-        let slots = h
-            .mul_vector(&self.signs_in)
-            .reshape(one.collect::<Vec<_>>());
-        let slots = slots.expand(picks, TopK);
-        let on = |x: &Tensor, codes: &Linears, [su, sv]: [&Embed; 2]| {
-            let turned = x.mul(&m.embed(&ids, su)).hadamard(128);
-            let product = turned.matmul_rows(&m.pick(codes, &ids));
-            product.hadamard(128).mul(&m.embed(&ids, sv))
-        };
-        let gate = on(&slots, &self.gate, [&self.gate_su, &self.gate_sv]);
-        let up = on(&slots, &self.up, [&self.up_su, &self.up_sv]);
-        let inner = gate.act(Act::Silu).mul(&up);
-        let out = on(&inner, &self.down, [&self.down_su, &self.down_sv]);
-        let routed = out.mul_vector(&self.signs_out).mix(picks, &gates);
+        let routed = self.experts.apply(m, h, [&ids, &gates]);
         let s = &self.shared;
         routed.add(&swiglu(h, [&s.gate, &s.up, &s.down]))
     }

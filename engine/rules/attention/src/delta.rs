@@ -1,5 +1,6 @@
 //! The gated delta rule: one thread per value column.
 
+use crate::slots::slot_scan;
 use tessera_codegen::prelude::*;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Read, Shape, Step, T, Tree, ZoneKind, sites};
 use tessera_lower::{GUESS, small, source};
@@ -59,96 +60,85 @@ fn delta_rule(
     }
 }
 
-/// Ragged delta rule updating kept per-slot state in place.
-#[kernel]
-fn delta_rule_rows(
-    q: Buf<F32>,
-    k: Buf<F32>,
-    v: Buf<F32>,
-    decay: Buf<F32>,
-    rate: Buf<F32>,
-    slots: Buf<U32>,
-    positions: Buf<U32>,
-    mut state: BufMut<F32>,
-    mut out: BufMut<F32>,
-    scale: f32,
-    jobs: u32,
-    rows: u32,
-    #[build] heads: u32,
-    #[build] kv_heads: u32,
-    #[build] key_width: u32,
-    #[build] width: u32,
-    #[build] seqs: u32,
-    #[build] snap: u32,
-) {
-    if gid() >= jobs {
-        return;
-    }
-    let j = gid() % width;
-    let sh = gid() / width;
-    let s = sh / heads;
-    let h = sh % heads;
-    let kh = h / (heads / kv_heads);
-    let mut col = [0.0f32; 128];
-    let mut loaded = 0u32;
-    let mut prev = 0xffff_ffffu32;
-    let mut last = 0.0f32;
-    let base = (sh * key_width) as u64 * width as u64 + j as u64;
-    for r in 0..rows {
-        if slots[r as u64] == s {
-            let pos = positions[r as u64];
-            if loaded == 0 {
-                loaded = 1;
-                if pos == 0 {
-                    for i in 0..key_width {
-                        col[i as usize] = 0.0;
-                    }
-                } else {
-                    for i in 0..key_width {
-                        col[i as usize] = state[base + (i * width) as u64];
-                    }
-                }
-            } else if pos == 0 && prev != 0 {
-                for i in 0..key_width {
-                    col[i as usize] = 0.0;
-                }
-            }
-            let row = r * heads + h;
-            let o = row as u64 * width as u64 + j as u64;
-            if pos == prev {
-                out[o] = last;
-            } else {
-                let at = (r * kv_heads + kh) as u64 * key_width as u64;
-                let fade = exp(decay[row as u64]);
-                let mut seen = 0.0f32;
-                for i in 0..key_width {
-                    col[i as usize] = col[i as usize] * fade;
-                    seen += col[i as usize] * k[at + i as u64];
-                }
-                let change = (v[o] - seen) * rate[row as u64];
-                let mut read = 0.0f32;
-                for i in 0..key_width {
-                    col[i as usize] += k[at + i as u64] * change;
-                    read += col[i as usize] * q[at + i as u64];
-                }
-                last = read * scale;
-                prev = pos;
-                out[o] = last;
-                if snap != 0 && s == 0 && rows > 1 && rows < seqs {
-                    let sb = (((r + 1) * heads + h) * key_width) as u64 * width as u64 + j as u64;
-                    for i in 0..key_width {
-                        state[sb + (i * width) as u64] = col[i as usize];
-                    }
-                }
-            }
+slot_scan!(
+    /// Ragged delta rule updating kept per-slot state in place.
+    fn delta_rule_rows(
+        q: Buf<F32>,
+        k: Buf<F32>,
+        v: Buf<F32>,
+        decay: Buf<F32>,
+        rate: Buf<F32>,
+        slots: Buf<U32>,
+        positions: Buf<U32>,
+        mut state: BufMut<F32>,
+        mut out: BufMut<F32>,
+        scale: f32,
+        jobs: u32,
+        rows: u32,
+        #[build] heads: u32,
+        #[build] kv_heads: u32,
+        #[build] key_width: u32,
+        #[build] width: u32,
+        #[build] seqs: u32,
+        #[build] snap: u32,
+    ),
+    [slots, positions, out, rows],
+    [s, r, pos, o, last],
+    setup: {
+        if gid() >= jobs {
+            return;
         }
-    }
-    if loaded != 0 {
+        let j = gid() % width;
+        let sh = gid() / width;
+        let s = sh / heads;
+        let h = sh % heads;
+        let kh = h / (heads / kv_heads);
+        let mut col = [0.0f32; 128];
+        let base = (sh * key_width) as u64 * width as u64 + j as u64;
+    },
+    open: {},
+    zero: {
+        for i in 0..key_width {
+            col[i as usize] = 0.0;
+        }
+    },
+    load: {
+        for i in 0..key_width {
+            col[i as usize] = state[base + (i * width) as u64];
+        }
+    },
+    store: {
         for i in 0..key_width {
             state[base + (i * width) as u64] = col[i as usize];
         }
-    }
-}
+    },
+    row: {
+        let row = r * heads + h;
+        let o = row as u64 * width as u64 + j as u64;
+    },
+    step: {
+        let at = (r * kv_heads + kh) as u64 * key_width as u64;
+        let fade = exp(decay[row as u64]);
+        let mut seen = 0.0f32;
+        for i in 0..key_width {
+            col[i as usize] = col[i as usize] * fade;
+            seen += col[i as usize] * k[at + i as u64];
+        }
+        let change = (v[o] - seen) * rate[row as u64];
+        let mut read = 0.0f32;
+        for i in 0..key_width {
+            col[i as usize] += k[at + i as u64] * change;
+            read += col[i as usize] * q[at + i as u64];
+        }
+        last = read * scale;
+        if snap != 0 && s == 0 && rows > 1 && rows < seqs {
+            let sb = (((r + 1) * heads + h) * key_width) as u64 * width as u64 + j as u64;
+            for i in 0..key_width {
+                state[sb + (i * width) as u64] = col[i as usize];
+            }
+        }
+    },
+);
 
 /// Whole or ragged sequences, on the CPU or a GPU.
 #[derive(Clone, Copy, Debug, Kernel)]

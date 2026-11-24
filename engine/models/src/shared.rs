@@ -2,7 +2,8 @@
 
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, Dim, DimExpr, DimName, Embed, FEW, Linear, Model, Pairs, PathSeg, Tensor, Vector, Weights,
+    Act, Dim, DimExpr, DimName, Embed, FEW, Linear, Linears, Model, Pairs, PathSeg, Tensor, Vector,
+    Weights,
 };
 
 /// A head's width outside its rotary part.
@@ -387,4 +388,90 @@ pub(crate) fn rows<const N: usize>(rest: [DimExpr; N]) -> Vec<DimExpr> {
 pub(crate) fn swiglu<D: Dense>(h: &Tensor, [gate, up, down]: [&D; 3]) -> Tensor {
     let inner = gate.apply(h).act(Act::Silu).mul(&up.apply(h));
     down.apply(&inner)
+}
+
+/// Routed experts, however they are stored.
+pub trait ExpertSet: Weights {
+    /// Each row's picked experts `ids`, mixed by `gates`.
+    fn apply(&self, m: &Model, h: &Tensor, picks: [&Tensor; 2]) -> Tensor;
+    /// Rotates a tap into the experts' input gauge, when present.
+    fn tap_gauge(&self, h: &Tensor) -> Tensor {
+        h.clone()
+    }
+}
+
+/// Experts as plain matrices.
+#[derive(Weights)]
+pub struct PlainExperts {
+    #[shape(Experts, Hidden, Ffn)]
+    pub gate: Linears,
+    #[shape(Experts, Hidden, Ffn)]
+    pub up: Linears,
+    #[shape(Experts, Ffn, Hidden)]
+    pub down: Linears,
+}
+
+impl ExpertSet for PlainExperts {
+    fn apply(&self, m: &Model, h: &Tensor, [ids, gates]: [&Tensor; 2]) -> Tensor {
+        // One output row per pick, each on its own expert.
+        let on = |set: &Linears, x: &Tensor| x.matmul_rows(&m.pick(set, ids));
+        let inner = on(&self.gate, h).act(Act::Silu).mul(&on(&self.up, h));
+        let picks = h.ty().rank() as u32 - 1;
+        on(&self.down, &inner).mix(picks, gates)
+    }
+}
+
+/// Experts as codes between 128-channel rotations.
+#[derive(Weights)]
+pub struct CodedExperts {
+    /// Signs on the stream into the experts, and out.
+    #[shape(Hidden)]
+    pub signs_in: Vector,
+    #[shape(Hidden)]
+    pub signs_out: Vector,
+    #[shape(Experts, Hidden, Ffn)]
+    pub gate: Linears,
+    #[shape(Experts, Hidden)]
+    pub gate_su: Embed,
+    #[shape(Experts, Ffn)]
+    pub gate_sv: Embed,
+    #[shape(Experts, Hidden, Ffn)]
+    pub up: Linears,
+    #[shape(Experts, Hidden)]
+    pub up_su: Embed,
+    #[shape(Experts, Ffn)]
+    pub up_sv: Embed,
+    #[shape(Experts, Ffn, Hidden)]
+    pub down: Linears,
+    #[shape(Experts, Ffn)]
+    pub down_su: Embed,
+    #[shape(Experts, Hidden)]
+    pub down_sv: Embed,
+}
+
+impl ExpertSet for CodedExperts {
+    fn apply(&self, m: &Model, h: &Tensor, [ids, gates]: [&Tensor; 2]) -> Tensor {
+        let picks = h.ty().rank() as u32 - 1;
+        // One copy of each signed row per picked expert.
+        let lead = h.ty().shape.0[..picks as usize].to_vec();
+        let one = lead.into_iter().chain([DimExpr::Const(1), Hidden.into()]);
+        let slots = h
+            .mul_vector(&self.signs_in)
+            .reshape(one.collect::<Vec<_>>())
+            .expand(picks, TopK);
+        let on = |x: &Tensor, codes: &Linears, [su, sv]: [&Embed; 2]| {
+            let turned = x.mul(&m.embed(ids, su)).hadamard(ROTATION);
+            let product = turned.matmul_rows(&m.pick(codes, ids));
+            product.hadamard(ROTATION).mul(&m.embed(ids, sv))
+        };
+        let gate = on(&slots, &self.gate, [&self.gate_su, &self.gate_sv]);
+        let up = on(&slots, &self.up, [&self.up_su, &self.up_sv]);
+        let inner = gate.act(Act::Silu).mul(&up);
+        let out = on(&inner, &self.down, [&self.down_su, &self.down_sv]);
+        out.mul_vector(&self.signs_out).mix(picks, gates)
+    }
+
+    fn tap_gauge(&self, h: &Tensor) -> Tensor {
+        h.mul_vector(&self.signs_in).hadamard(ROTATION)
+    }
 }

@@ -7,21 +7,7 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
-union alignas(16) dtr_smem {
-    struct {
-        u32 btab[2048];
-        u32 wtiles[2048];
-    } k;
-    float out[32][128];
-};
-
-static __device__ __forceinline__ void dtr_load4(const float* p, float v[4]) {
-    float4 f = *reinterpret_cast<const float4*>(p);
-    v[0] = f.x;
-    v[1] = f.y;
-    v[2] = f.z;
-    v[3] = f.w;
-}
+using dtr_smem = trellis::stage_smem<float[32][128]>;
 
 template <u32 K, u32 BOOK, u32 NT, bool TURNED, bool SPLIT>
 static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, const float* suh,
@@ -64,10 +50,10 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
         if (b < nb && r_base < nr) {
             u32 col = ((ib0 + c0 + b) << 7u) + (lane << 2u);
             float sc[4];
-            if constexpr (TURNED) dtr_load4(suh + col, sc);
+            if constexpr (TURNED) trellis::load4(suh + col, sc);
             for (u32 r = r_base; r < nr; r += wpb) {
                 float v[4];
-                dtr_load4(x + u64(r0 + r) * k + col, v);
+                trellis::load4(x + u64(r0 + r) * k + col, v);
                 if constexpr (TURNED) {
                     v[0] *= sc[0];
                     v[1] *= sc[1];
@@ -128,10 +114,10 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
         prim::block_sync();
         u32 base = (ob << 7u) + (lane << 2u);
         float sc[4];
-        dtr_load4(svh + base, sc);
+        trellis::load4(svh + base, sc);
         for (u32 r = j; r < nr; r += 8u) {
             float v[4];
-            dtr_load4(&sm.out[r][lane << 2u], v);
+            trellis::load4(&sm.out[r][lane << 2u], v);
             trellis::wht128(v, trellis::INV_SQRT128);
             v[0] *= sc[0];
             v[1] *= sc[1];
@@ -230,7 +216,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void dtr_reduce(
     u32 lane = threadIdx.x & 31u;
     u32 base = (ob << 7u) + (lane << 2u);
     float sc[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    if (turned != 0u) dtr_load4(svh + base, sc);
+    if (turned != 0u) trellis::load4(svh + base, sc);
     for (u32 r = warp; r < m; r += 8u) {
         const float* pb = part + u64(ob) * ks * m * 128u + u64(r) * 128u + (lane << 2u);
         float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};

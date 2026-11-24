@@ -453,6 +453,25 @@ TESSERA_FN void store_acc(const float acc[8][4], u32 n, u32 lane, float* buf) {
     }
 }
 
+// Staged codebook and weight tiles, or the output `Out`.
+template <typename Out>
+union alignas(16) stage_smem {
+    struct {
+        u32 btab[2048];
+        u32 wtiles[2048];
+    } k;
+    Out out;
+};
+
+// Reads four floats from 16-byte aligned `p`.
+TESSERA_FN void load4(const float* p, float v[4]) {
+    float4 f = *reinterpret_cast<const float4*>(p);
+    v[0] = f.x;
+    v[1] = f.y;
+    v[2] = f.z;
+    v[3] = f.w;
+}
+
 TESSERA_FN float half_to_f32(u32 h) {
     return f16_to_f32(h);
 }

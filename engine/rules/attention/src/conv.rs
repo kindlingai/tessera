@@ -1,5 +1,6 @@
 //! The causal filter per channel before linear attention.
 
+use crate::slots::slot_scan;
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
 use tessera_lower::{
@@ -36,88 +37,78 @@ fn causal_conv(
     out[gid() as u64] = sum;
 }
 
-/// One thread per `(slot, channel)`: updates kept history per row.
-#[kernel]
-fn causal_conv_rows(
-    x: Buf<F32>,
-    w: Buf<F32>,
-    slots: Buf<U32>,
-    positions: Buf<U32>,
-    mut state: BufMut<F32>,
-    mut out: BufMut<F32>,
-    jobs: u32,
-    rows: u32,
-    #[build] width: u32,
-    #[build] taps: u32,
-    #[build] dilation: u32,
-    #[build] seqs: u32,
-    #[build] snap: u32,
-) {
-    if gid() >= jobs {
-        return;
-    }
-    let s = gid() / width;
-    let c = gid() % width;
-    let hist_len = (taps - 1) * dilation;
-    let mut hist = [0.0f32; 16];
-    let mut taps_w = [0.0f32; 16];
-    let mut loaded = 0u32;
-    let mut prev = 0xffff_ffffu32;
-    let mut last = 0.0f32;
-    let base = (s * hist_len) as u64 * width as u64 + c as u64;
-    for r in 0..rows {
-        if slots[r as u64] == s {
-            let pos = positions[r as u64];
-            if loaded == 0 {
-                loaded = 1;
-                for j in 0..taps {
-                    taps_w[j as usize] = w[(c * taps + j) as u64];
-                }
-                if pos == 0 {
-                    for k in 0..hist_len {
-                        hist[k as usize] = 0.0;
-                    }
-                } else {
-                    for k in 0..hist_len {
-                        hist[k as usize] = state[base + (k * width) as u64];
-                    }
-                }
-            } else if pos == 0 && prev != 0 {
-                for k in 0..hist_len {
-                    hist[k as usize] = 0.0;
-                }
-            }
-            let at = (r * width + c) as u64;
-            if pos == prev {
-                out[at] = last;
-            } else {
-                let cur = x[at];
-                let mut sum = cur * taps_w[(taps - 1) as usize];
-                for j in 0..(taps - 1) {
-                    sum += hist[(j * dilation) as usize] * taps_w[j as usize];
-                }
-                for k in 0..(hist_len - 1) {
-                    hist[k as usize] = hist[(k + 1) as usize];
-                }
-                hist[(hist_len - 1) as usize] = cur;
-                last = sum;
-                prev = pos;
-                out[at] = sum;
-                if snap != 0 && s == 0 && rows > 1 && rows < seqs {
-                    let sb = ((r + 1) * hist_len) as u64 * width as u64 + c as u64;
-                    for k in 0..hist_len {
-                        state[sb + (k * width) as u64] = hist[k as usize];
-                    }
-                }
-            }
+slot_scan!(
+    /// One thread per `(slot, channel)`: updates kept history per row.
+    fn causal_conv_rows(
+        x: Buf<F32>,
+        w: Buf<F32>,
+        slots: Buf<U32>,
+        positions: Buf<U32>,
+        mut state: BufMut<F32>,
+        mut out: BufMut<F32>,
+        jobs: u32,
+        rows: u32,
+        #[build] width: u32,
+        #[build] taps: u32,
+        #[build] dilation: u32,
+        #[build] seqs: u32,
+        #[build] snap: u32,
+    ),
+    [slots, positions, out, rows],
+    [s, r, pos, at, last],
+    setup: {
+        if gid() >= jobs {
+            return;
         }
-    }
-    if loaded != 0 {
+        let s = gid() / width;
+        let c = gid() % width;
+        let hist_len = (taps - 1) * dilation;
+        let mut hist = [0.0f32; 16];
+        let mut taps_w = [0.0f32; 16];
+        let base = (s * hist_len) as u64 * width as u64 + c as u64;
+    },
+    open: {
+        for j in 0..taps {
+            taps_w[j as usize] = w[(c * taps + j) as u64];
+        }
+    },
+    zero: {
+        for k in 0..hist_len {
+            hist[k as usize] = 0.0;
+        }
+    },
+    load: {
+        for k in 0..hist_len {
+            hist[k as usize] = state[base + (k * width) as u64];
+        }
+    },
+    store: {
         for k in 0..hist_len {
             state[base + (k * width) as u64] = hist[k as usize];
         }
-    }
-}
+    },
+    row: {
+        let at = (r * width + c) as u64;
+    },
+    step: {
+        let cur = x[at];
+        let mut sum = cur * taps_w[(taps - 1) as usize];
+        for j in 0..(taps - 1) {
+            sum += hist[(j * dilation) as usize] * taps_w[j as usize];
+        }
+        for k in 0..(hist_len - 1) {
+            hist[k as usize] = hist[(k + 1) as usize];
+        }
+        hist[(hist_len - 1) as usize] = cur;
+        last = sum;
+        if snap != 0 && s == 0 && rows > 1 && rows < seqs {
+            let sb = ((r + 1) * hist_len) as u64 * width as u64 + c as u64;
+            for k in 0..hist_len {
+                state[sb + (k * width) as u64] = hist[k as usize];
+            }
+        }
+    },
+);
 
 /// Whole sequences of `rows`, each `width` channels.
 #[derive(Clone, Copy, Debug, Kernel)]

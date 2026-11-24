@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::{Data, DeriveInput, Expr, Fields, Ident, Token, parse_macro_input};
 
 /// `#[shape(..)]` in `DimName` terms, or `S0`.. from the parent.
-#[proc_macro_derive(Weights, attributes(shape))]
+#[proc_macro_derive(Weights, attributes(shape, flatten))]
 pub fn derive_weights(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(&input) {
@@ -37,16 +37,25 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let binds = passed.iter().map(|(ident, i)| {
             quote! { let #ident: ::tessera_trace::DimExpr = given[#i].clone(); }
         });
+        // A `#[flatten]` field's fields sit at this struct's path.
+        let flat = field.attrs.iter().any(|a| a.path().is_ident("flatten"));
+        let (push, pop) = match flat {
+            true => (quote! {}, quote! {}),
+            false => (
+                quote! { path.push(::tessera_trace::PathSeg::Field(#key.into())); },
+                quote! { path.pop(); },
+            ),
+        };
         inits.push(quote! {
             #name: {
-                path.push(::tessera_trace::PathSeg::Field(#key.into()));
+                #push
                 let shape = {
                     use ::tessera_trace::DimName::*;
                     #(#binds)*
                     [#(::tessera_trace::DimExpr::from(#dims)),*]
                 };
                 let value = <#ty as ::tessera_trace::Weights>::declare(m, path, &shape);
-                path.pop();
+                #pop
                 value
             }
         });
