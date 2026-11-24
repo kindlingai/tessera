@@ -44,7 +44,7 @@ pub struct Settings {
     pub host_lanes: usize,
     /// Where calibrate keeps cost samples. `None` stores nothing.
     pub costs: Option<PathBuf>,
-    /// Shared models and caches for tessera-check. `None` uses the checkout.
+    /// Shared models and caches for stickler. `None` uses the checkout.
     pub check: Option<PathBuf>,
     /// A JSON file of weight-name rules, applied last.
     pub names: Option<PathBuf>,
