@@ -733,6 +733,28 @@ impl OnGpu for Pins {
     }
 }
 
+/// The shared context's platform.
+struct Asked;
+
+impl OnGpu for Asked {
+    type Out = Option<tessera_gpukit::Platform>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        Some(cached_context::<D>().ok()?.platform())
+    }
+}
+
+/// The platform a runner for `settings` would report.
+fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
+    crate::configure(settings);
+    tessera_gpukit::backend::dispatch(settings.gpu(), Asked).ok()?
+}
+
+tessera_lower::rule::scatter! {
+    #[scatter(tessera_lower::ASKERS)]
+    static ASK: tessera_lower::Ask = asked;
+}
+
 /// Pinned host memory from the shared context.
 struct Pin<D: Device>(&'static D);
 

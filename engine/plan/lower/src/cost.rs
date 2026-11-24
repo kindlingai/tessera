@@ -5,16 +5,16 @@ use crate::kernel::Kernel;
 use crate::kernels::crosses;
 use crate::plan::{Plan, Step};
 use crate::recipe::{Compute, Recipe};
-use crate::rule::{Rule, rules_with};
+use crate::rule::{Rule, gather, rules_with};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use tessera_codegen::kept::Layout;
-use tessera_engine_settings::{Pick, Settings};
+use tessera_engine_settings::{Backend, Pick, Settings};
 use tessera_graph::Parts;
 use tessera_platform::{Limits, Platform};
 use tessera_sim::{Chip, Cluster, Cost, FIXED, Fit, Sample, Timings, ZoneKind, generic, known};
@@ -167,27 +167,55 @@ impl Default for Device {
     }
 }
 
+/// The platform of the GPU `settings` picks, if it opens.
+pub type Ask = fn(&Settings) -> Option<Platform>;
+
+gather! {
+    /// Each linked runtime may answer for its GPU.
+    #[gather]
+    pub static ASKERS: scattered_collect::ScatteredSlice<Ask>;
+}
+
+/// The GPU platform a linked runtime reports, if any.
+fn asked(settings: &Settings, backend: Backend) -> Option<Platform> {
+    if let Some(asked) = ASKERS.iter().find_map(|ask| ask(settings)) {
+        return Some(asked);
+    }
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "tessera: no {} platform to plan for, so rules that need a matrix unit stay off. \
+             Link tessera-run, or use Device::stored(runner.platform(), settings)",
+            backend.name()
+        )
+    });
+    None
+}
+
 impl Device {
     /// The device `open` picks under `settings`, before any samples.
     pub fn guess(settings: &Settings) -> Self {
-        let platform = match settings.gpu() {
-            None => Platform::host(Limits::host(settings.host_lanes)),
-            // The backend name picks which kernel texts fit.
-            Some(b) => Platform {
-                backend: b.name().into(),
-                ..Platform::assumed(Limits::assumed())
-            },
-        };
         // Native kernels run where the zone is a CPU.
         let cluster = match settings.backend {
             Pick::Cpu => Cluster::cpu("cpu"),
             _ => Cluster::default(),
         };
-        Self {
+        let device = |platform| Self {
             platform,
             cluster,
             ..Self::default()
+        };
+        let Some(b) = settings.gpu() else {
+            return device(Platform::host(Limits::host(settings.host_lanes)));
+        };
+        if let Some(platform) = asked(settings, b) {
+            return device(Platform::default()).on(platform);
         }
+        // The backend name picks which kernel texts fit.
+        device(Platform {
+            backend: b.name().into(),
+            ..Platform::assumed(Limits::assumed())
+        })
     }
 
     /// Where this machine keeps the samples for `platform`.

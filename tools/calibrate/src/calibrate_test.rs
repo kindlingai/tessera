@@ -3,12 +3,16 @@ use crate::probe::{Kind, Probe, Reading, fit, links, read, suite};
 use crate::{Grid, headroom, judge};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::collections::{BTreeMap, BTreeSet};
+use tessera_engine::trellis;
+use tessera_graph::DimName::Rows;
 use tessera_graph::{Composite, NodeId, Op, verify};
 use tessera_lower::form::BF16_FORM;
 use tessera_lower::{
-    Cluster, Device, Pick, Pins, Settings, Source, Zone, ZoneKind, cut_region, lower, rules,
+    Backend, Cluster, Device, Pick, Pins, Settings, Source, Zone, ZoneKind, cut_region, lower,
+    rules,
 };
 use tessera_sim::Chip;
+use tessera_testkit::graphs::picked;
 use tessera_testkit::scratch;
 
 /// This build's GPU when ready, else the host.
@@ -56,6 +60,25 @@ fn grid_reaches_rules() {
     let stored = Device::stored(device.platform.clone(), &costs).unwrap();
     assert!(stored == device, "a round trip");
     std::fs::remove_file(&file).unwrap();
+}
+
+/// A guessed CUDA device plans trellis experts like the engine.
+#[test]
+fn guess_picks_trellis() {
+    let settings = settings();
+    if settings.gpu() != Some(Backend::Cuda) {
+        return;
+    }
+    let pins = Pins::default().pin("set", &trellis::TRELLIS_K3_PMCGX);
+    let device = Device::guess(&settings).pinned(pins);
+    assert!(
+        device.platform.bf16_tile().is_some(),
+        "{:?}",
+        device.platform
+    );
+    let g = picked(&crate::grid::bounded(&[Rows]), [4, 128, 128]);
+    let plan = lower(&g, 0, &[(Rows, 1)], &device).unwrap();
+    assert!(plan.steps.iter().any(|s| s.rule == "picked_trellis"));
 }
 
 /// On a CPU zone, packed and plain matmuls are timed.
