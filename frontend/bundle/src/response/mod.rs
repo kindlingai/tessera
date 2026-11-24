@@ -235,6 +235,7 @@ impl ResponseParser {
             parser: self,
             parse_tools: parse_tools && self.tool_calls.is_some(),
             mode,
+            opening: false,
             buf: String::new(),
         }
     }
@@ -277,6 +278,8 @@ pub struct ResponseStream<'a> {
     parser: &'a ResponseParser,
     parse_tools: bool,
     mode: Mode,
+    /// `buf` starts with an unstripped pattern opener.
+    opening: bool,
     buf: String,
 }
 
@@ -306,7 +309,16 @@ impl<'a> ResponseStream<'a> {
             self.buf.clear();
             return;
         }
-        let rest = std::mem::take(&mut self.buf);
+        let mut rest = std::mem::take(&mut self.buf);
+        if std::mem::take(&mut self.opening) {
+            match self.opener_len(&rest) {
+                Some(cut) => drop(rest.drain(..cut)),
+                None => self.mode = Mode::Text,
+            }
+            if rest.is_empty() {
+                return;
+            }
+        }
         match self.mode {
             Mode::Thinking => out.push(ResponseEvent::Reasoning(rest)),
             Mode::Text | Mode::ToolCall => out.push(ResponseEvent::Content(rest)),
@@ -321,7 +333,12 @@ impl<'a> ResponseStream<'a> {
             }
             self.buf.drain(..at + skip);
             self.mode = match hit {
-                Hit::Thinking => Mode::Thinking,
+                Hit::Thinking => {
+                    let thinking = self.parser.thinking.as_ref();
+                    self.opening =
+                        thinking.is_some_and(|t| matches!(t.open, Opener::Pattern { .. }));
+                    Mode::Thinking
+                }
                 Hit::ToolCall => Mode::ToolCall,
                 Hit::Close => {
                     self.buf.clear();
@@ -359,6 +376,24 @@ impl<'a> ResponseStream<'a> {
             self.mode = Mode::Text;
             return true;
         };
+        if self.opening {
+            let close = find_close(&self.buf, &spec.close);
+            match (self.opener_len(&self.buf), close) {
+                // Text after the match shows that the opener is complete.
+                (Some(cut), _) if cut < self.buf.len() => {
+                    self.buf.drain(..cut);
+                    self.opening = false;
+                }
+                (None, Some((at, len))) => {
+                    out.push(ResponseEvent::Content(self.buf[..at + len].to_string()));
+                    self.buf.drain(..at + len);
+                    self.opening = false;
+                    self.mode = Mode::Text;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
         if let Some((at, len)) = find_close(&self.buf, &spec.close) {
             if at > 0 {
                 out.push(ResponseEvent::Reasoning(self.buf[..at].to_string()));
@@ -395,6 +430,13 @@ impl<'a> ResponseStream<'a> {
         self.buf.drain(..raw_end);
         self.mode = Mode::Text;
         true
+    }
+
+    /// Byte length of the thinking opener that starts `text`.
+    fn opener_len(&self, text: &str) -> Option<usize> {
+        let spec = self.parser.thinking.as_ref()?;
+        let (_, rest) = spec.open.strip(text)?;
+        Some(text.len() - rest.len())
     }
 
     fn find_hit(&self) -> Option<(usize, usize, Hit)> {

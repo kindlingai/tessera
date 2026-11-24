@@ -104,3 +104,25 @@ fn parses_standard_json_template() {
         "hi"
     );
 }
+
+#[test]
+fn strips_pattern_thinking_opener() {
+    let cfg = r#"{"response_template": {"fields": {
+      "thinking": {"open_pattern": "<think(?: \\w+)?>\n", "close": "</think>", "content": "text"}
+    }}}"#;
+    let parser = ResponseParser::from_config(cfg).unwrap().unwrap();
+    let mut stream = parser.stream(false, false);
+    let mut events = Vec::new();
+    for piece in ["a<thi", "nk deep>", "\n", "plan", "</think>b<think>", "\n"] {
+        stream.push(piece, &mut events);
+    }
+    stream.finish(&mut events);
+    let say = |s: &str| ResponseEvent::Content(s.into());
+    let plan = ResponseEvent::Reasoning("plan".into());
+    assert_eq!(events, [say("a"), plan, say("b")]);
+    let odd = parser.parse("<think!</think>x", false, false);
+    assert_eq!(
+        (odd.reasoning.as_str(), odd.content.as_str()),
+        ("", "<think!</think>x")
+    );
+}
