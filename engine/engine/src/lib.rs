@@ -228,11 +228,17 @@ pub(crate) fn ends(rows: &[Row]) -> Vec<u32> {
     at.map(|(i, _)| i as u32).collect()
 }
 
+/// Rounds a causal context length up to a power-of-two bucket.
+pub(crate) fn context_bucket(needed: usize, cap: usize) -> u64 {
+    needed.max(256).next_power_of_two().min(cap) as u64
+}
+
 /// Sizes and padded counts for `rows` returning `picks`.
 fn launch_of(
     rows: &[Row],
     picks: &[u32],
     slots: usize,
+    max_context: usize,
 ) -> (Vec<(tessera_graph::DimName, u64)>, [usize; 2]) {
     let furthest = rows.iter().map(|r| r.position).max().unwrap_or(0);
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
@@ -251,7 +257,7 @@ fn launch_of(
     let sizes = vec![
         (Seqs, slots as u64),
         (Rows, filled as u64),
-        (Context, furthest as u64 + 1),
+        (Context, context_bucket(furthest as usize + 1, max_context)),
         (Segments, seen.len() as u64),
         (Picks, wanted as u64),
     ];
@@ -309,7 +315,7 @@ impl Engine {
             token: 0,
             position: 0,
         }];
-        let (sizes, _) = launch_of(&first, &[0], slots);
+        let (sizes, _) = launch_of(&first, &[0], slots, context);
         let plan = plans.lower(&graph, full, &sizes, &device)?;
         let lanes = plan.table.zip(recipe.kept.page());
         let lanes = lanes.map(|(table, page)| lanes::Lanes::new(page, table.len, slots));
@@ -548,7 +554,7 @@ impl Engine {
             return Err(Error::RowPlace);
         }
         self.announce(rows, picks, &head, wants)?;
-        let (mut sizes, [filled, wanted]) = launch_of(rows, picks, self.slots);
+        let (mut sizes, [filled, wanted]) = launch_of(rows, picks, self.slots, self.context);
         let entry = self.entry(&head)?;
         // The last row fills out. Copies rewrite its kept row.
         let last = rows[rows.len() - 1];

@@ -169,7 +169,10 @@ impl MtpDrafter {
         let sizes = [
             (Seqs, self.core.slots as u64),
             (Rows, filled as u64),
-            (Context, (start_pos as usize + m) as u64),
+            (
+                Context,
+                crate::context_bucket(start_pos as usize + m, self.core.context),
+            ),
             (Segments, 1),
         ];
         self.core.exec(&feeds, &sizes, wants)

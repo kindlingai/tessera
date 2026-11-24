@@ -586,7 +586,10 @@ impl Drafter {
         let sizes = [
             (Seqs, self.core.slots as u64),
             (Rows, filled as u64),
-            (Context, (start + self.block) as u64),
+            (
+                Context,
+                crate::context_bucket(start + self.block, self.core.context),
+            ),
             (Segments, 1),
         ];
         self.core.exec(&feeds, &sizes, wants)
