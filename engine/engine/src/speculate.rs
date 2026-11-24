@@ -255,7 +255,8 @@ impl DraftCore {
                 .get(copy.input)
                 .ok_or(RunError::InputShape(copy.input))?;
             let plain4 = slot.form.block() == 1 && slot.form.bytes(1) == 4;
-            if !plain4 || slot.len != copy.filled * copy.width {
+            let need = copy.pad_to.max(copy.dst_row + copy.rows) * copy.width;
+            if !plain4 || need > slot.len {
                 return Err(RunError::InputShape(copy.input).into());
             }
             fill_d2d(&mut *self.runner, slot, copy)?;
@@ -334,6 +335,10 @@ macro_rules! draft_methods {
 
             pub fn context(&self) -> usize {
                 self.core.context
+            }
+
+            pub fn slots(&self) -> usize {
+                self.core.slots
             }
 
             pub fn device(&self) -> String {
@@ -610,8 +615,9 @@ impl Drafter {
                     Some(D2dCopy {
                         input: 4,
                         src: addr,
+                        dst_row: 0,
                         rows,
-                        filled,
+                        pad_to: filled,
                         width: self.tap_width,
                     }),
                 )

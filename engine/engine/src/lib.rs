@@ -12,6 +12,7 @@ use tessera_graph::{EntryKind, Role};
 use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
+mod batch_spec;
 mod dual;
 mod guide;
 mod kept;
@@ -27,6 +28,7 @@ mod spec_len;
 mod spec_loop;
 mod speculate;
 
+pub use batch_spec::BatchMtp;
 pub use dual::{DualSelector, DualSpeculate};
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use kept::Totals;
@@ -406,6 +408,10 @@ impl Engine {
     /// Maximum sequence length in tokens.
     pub fn context(&self) -> usize {
         self.context
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
     }
 
     /// One launch of `rows`: the likeliest token after each.

@@ -26,13 +26,14 @@ pub(crate) enum TapsIn<'a> {
     Host(&'a [f32]),
 }
 
-/// Device-to-device copy descriptor for one drafter input.
+/// Device-to-device copy descriptor for one drafter input span.
 #[derive(Clone, Copy)]
 pub(crate) struct D2dCopy {
     pub input: usize,
     pub src: u64,
+    pub dst_row: usize,
     pub rows: usize,
-    pub filled: usize,
+    pub pad_to: usize,
     pub width: usize,
 }
 
@@ -66,17 +67,23 @@ impl TapsBuf {
     }
 }
 
-/// Copies `rows` on device and pads tail rows to `filled`.
+/// Copies `rows` at `dst_row` and pads tail to `pad_to`.
 pub(crate) fn fill_d2d(runner: &mut dyn Run, dst: Slot, copy: D2dCopy) -> Result<(), Error> {
     let row_bytes = copy.width * 4;
-    runner.copy_from(dst, 0, copy.src, copy.rows * row_bytes)?;
-    if copy.rows < copy.filled {
+    runner.copy_from(
+        dst,
+        copy.dst_row * row_bytes,
+        copy.src,
+        copy.rows * row_bytes,
+    )?;
+    let end = copy.dst_row + copy.rows;
+    if copy.pad_to > end {
         let base = runner.address(dst).ok_or(RunError::Unaddressed(0))?;
-        let tail = copy.rows - 1;
+        let tail = end - 1;
         let tail_addr = base + (tail * row_bytes) as u64;
         let mut have = 1usize;
-        while tail + have < copy.filled {
-            let chunk = have.min(copy.filled - (tail + have));
+        while tail + have < copy.pad_to {
+            let chunk = have.min(copy.pad_to - (tail + have));
             runner.copy_from(dst, (tail + have) * row_bytes, tail_addr, chunk * row_bytes)?;
             have += chunk;
         }
@@ -84,14 +91,14 @@ pub(crate) fn fill_d2d(runner: &mut dyn Run, dst: Slot, copy: D2dCopy) -> Result
     Ok(())
 }
 
-fn fnv_u32(h: &mut u32, v: u32) {
+pub(crate) fn fnv_u32(h: &mut u32, v: u32) {
     for b in v.to_le_bytes() {
         *h = (*h ^ b as u32).wrapping_mul(16777619);
     }
 }
 
 /// Exchanges control bytes and gathers rank profiles on rank 0.
-fn tell_ranks(target: &mut Engine, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+pub(crate) fn tell_ranks(target: &mut Engine, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
     let Some(control) = &mut target.control else {
         return Ok(None);
     };

@@ -1,16 +1,19 @@
 //! MTP drafting, given `--mtp`. DFlash joins when `--draft` is given.
 
 use super::draft::{
-    ADAPTIVE, begin, DraftLinks, SPEC_LEN, open_drafter, open_target, serve, spec_len, split_links,
+    ADAPTIVE, DraftLinks, SPEC_LEN, begin, open_drafter, open_target, serve, spec_len, split_links,
 };
+use super::generate::queue;
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
+use tessera_bundle::Bundle;
 use tessera_bundle::mtp::Mtp;
 use tessera_engine::{
-    CostModel, Drafter, DualSelector, DualSpeculate, MtpDrafter, MtpSpeculate, Place, Recipe,
-    Settings, Steps,
+    BatchMtp, CostModel, Drafter, DualSelector, DualSpeculate, Engine, MtpDrafter, MtpSpeculate,
+    Place, Recipe, Settings, Steps,
 };
+use tessera_tasks::Generate;
 
 pub static ENTRY: Entry = Entry {
     task: "generate",
@@ -68,23 +71,71 @@ pub(super) fn open_mtp(
     Ok(drafter)
 }
 
+/// Serves continuous-batching MTP decoding across many slots.
+fn serve_batch(
+    load: &Load,
+    engine: &mut Engine,
+    drafter: &mut MtpDrafter,
+    target: Bundle,
+    depth: usize,
+) -> Result<(), String> {
+    let o = load.options;
+    let cap = load.count("--spec-len", depth).min(depth);
+    let mut batch = BatchMtp::new(engine, drafter, cap).map_err(|e| e.to_string())?;
+    if let Some(rows) = o.max_batch_rows {
+        batch = batch.with_prefill_chunk(rows);
+    }
+    if o.ranks.follows() {
+        return batch.follow().map_err(|e| e.to_string());
+    }
+    let generate = Generate {
+        tokenizer: target.tokenizer,
+        template: target.template,
+        stop: target.stop,
+        guides: None,
+    };
+    let jobs = queue(load, generate, false);
+    loop {
+        let job = match batch.busy() {
+            true => jobs.try_recv().ok(),
+            false => match jobs.recv() {
+                Ok(job) => Some(job),
+                Err(_) => break,
+            },
+        };
+        if let Some((request, sink)) = job {
+            batch.submit(request, sink);
+            continue;
+        }
+        batch.step().map_err(|e| e.to_string())?;
+    }
+    drop(batch);
+    let _ = engine.dismiss();
+    Ok(())
+}
+
 /// Loads an MLA target and its MTP layer, then serves.
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let depth = load.count("--mtp", 1);
     let b = begin(load, &settings, "--mtp")?;
     let (target_links, draft_links) = split_links(b.links);
-    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
+    let (start, rules, manifest) = (b.start, b.rules, b.manifest);
+    let at = [o.slots as u64, o.max_model_len as u64];
     let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
         .map_err(|e| e.to_string())?;
     let mut drafter = open_mtp(o, draft_links, &pair, &settings)?;
     let (mut engine, target) = open_target(o, target_links, pair.target, &settings)?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!(
-        "{}: loaded target + mtp (layer {}, depth {depth}) in {seconds:.1} s",
+        "{}: loaded target + mtp (layer {}, depth {depth}, slots {}) in {seconds:.1} s",
         engine.device(),
-        pair.layer
+        pair.layer,
+        o.slots,
     );
+    if o.slots > 1 {
+        return serve_batch(load, &mut engine, &mut drafter, target, depth);
+    }
     if o.ranks.follows() {
         let mut spec =
             MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
