@@ -9,6 +9,7 @@ use crate::tree::{T, Tree};
 use crate::{Error, Unsupported};
 use std::fmt;
 use tessera_codegen::kept::Layout;
+use tessera_engine_settings::Backend;
 use tessera_graph::Mask;
 
 pub use scattered_collect::declarative::{gather, scatter};
@@ -200,14 +201,54 @@ pub trait Propose: Send + Sync {
     fn regions(&self) -> bool {
         false
     }
+    /// Whether this rule is a fast or fused path.
+    fn fast(&self) -> bool {
+        false
+    }
+    /// Platform backends this rule does not target.
+    fn lacks(&self) -> &'static [Backend] {
+        &[]
+    }
+    /// Why this rule declined `at`, when `at` matches its op.
+    fn why_not(&self, _tree: &Tree, _at: T) -> Option<String> {
+        None
+    }
 }
 
 /// The form `rule!` registers.
 pub type ProposeFn = fn(&Tree, T) -> Option<Vec<Draft>>;
 
+/// Explains why a fast-path rule declined a matching site.
+pub type WhyNotFn = fn(&Tree, T) -> Option<String>;
+
 impl Propose for ProposeFn {
     fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
         self(tree, at)
+    }
+}
+
+/// A fast-path rule with rejection diagnostics and excluded backends.
+pub struct FastRule {
+    pub propose: ProposeFn,
+    pub why_not: WhyNotFn,
+    pub lacks: &'static [Backend],
+}
+
+impl Propose for FastRule {
+    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        (self.propose)(tree, at)
+    }
+
+    fn fast(&self) -> bool {
+        true
+    }
+
+    fn lacks(&self) -> &'static [Backend] {
+        self.lacks
+    }
+
+    fn why_not(&self, tree: &Tree, at: T) -> Option<String> {
+        (self.why_not)(tree, at)
     }
 }
 
@@ -258,6 +299,26 @@ macro_rules! rule {
                 static RULE: $crate::rule::Rule = $crate::rule::Rule {
                     name: $name,
                     propose: &($propose as $crate::rule::ProposeFn),
+                    module: module_path!(),
+                };
+            }
+        };
+    };
+    ($name:literal, $propose:path, why = $why:path) => {
+        $crate::rule!($name, $propose, why = $why, lacks = &[]);
+    };
+    ($name:literal, $propose:path, why = $why:path, lacks = $lacks:expr) => {
+        const _: () = {
+            static FAST: $crate::rule::FastRule = $crate::rule::FastRule {
+                propose: $propose,
+                why_not: $why,
+                lacks: $lacks,
+            };
+            $crate::rule::scatter! {
+                #[scatter($crate::rule::RULES)]
+                static RULE: $crate::rule::Rule = $crate::rule::Rule {
+                    name: $name,
+                    propose: &FAST,
                     module: module_path!(),
                 };
             }

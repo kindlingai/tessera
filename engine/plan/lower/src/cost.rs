@@ -343,6 +343,11 @@ impl Device {
         self.favor.as_deref() == Some(rule)
     }
 
+    /// The favored rule name, if one is set.
+    pub fn favored(&self) -> Option<&str> {
+        self.favor.as_deref()
+    }
+
     /// The favored rule when lowering requires it to cover steps.
     pub fn required_favor(&self) -> Option<&str> {
         self.require_favored

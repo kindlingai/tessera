@@ -15,7 +15,7 @@ use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--m <list>] [--new <n>] \
+const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
 [--embed <texts.json> [--vectors <file>]] [--forward <texts.json>]";
 
@@ -59,6 +59,8 @@ struct Args {
     forward: Option<PathBuf>,
     /// Fail lowering unless the favored rule covers a step.
     require_favored: bool,
+    /// Print top slow or unfused lowering sites on boot.
+    explain_lowering: bool,
 }
 
 fn args() -> Option<Args> {
@@ -75,11 +77,16 @@ fn args() -> Option<Args> {
         vectors: None,
         forward: None,
         require_favored: false,
+        explain_lowering: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
         if flag == "--require-favored" {
             args.require_favored = true;
+            continue;
+        }
+        if flag == "--explain-lowering" {
+            args.explain_lowering = true;
             continue;
         }
         let value = given.next()?;
@@ -225,6 +232,13 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
     }
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
     (loaded.weights).each(|at, w| engine.load_weight(at, w))?;
+    if let Ok(report) = engine.lowering_report(1) {
+        if args.explain_lowering {
+            eprintln!("{}", report.format(12));
+        } else if let Some(warning) = report.warning("--explain-lowering") {
+            eprintln!("{warning}");
+        }
+    }
     let (prompt, wanted) = match &args.reference {
         Some(dir) => {
             let (tokens, best) = reference(dir)?;

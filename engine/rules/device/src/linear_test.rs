@@ -1,4 +1,5 @@
-use crate::linear::{cuda_source, hip_source, propose_mm};
+use crate::linear::mm::propose_mm;
+use crate::linear::{cuda_source, hip_source};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
 use tessera_lower::form::named;

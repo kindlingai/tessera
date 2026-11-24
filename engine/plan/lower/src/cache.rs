@@ -2,7 +2,7 @@
 
 use crate::cost::Device;
 use crate::plan::Plan;
-use crate::{Error, Wants, lower_upto};
+use crate::{Error, Report, Wants, explain_upto, lower_upto};
 use std::collections::HashMap;
 use tessera_graph::{DimName, Graph, Size};
 
@@ -63,8 +63,8 @@ impl Cache {
         self.wanting(g, entry, Wants::ALL, sizes, upto, device)
     }
 
-    /// As `upto`, with only the `wants` outputs.
-    pub fn wanting(
+    /// Bucketed cache key and launch bindings for `sizes`.
+    fn key_for(
         &mut self,
         g: &Graph,
         entry: usize,
@@ -72,7 +72,7 @@ impl Cache {
         sizes: &[(DimName, u64)],
         upto: &[DimName],
         device: &Device,
-    ) -> Result<(&Plan, Bound), Error> {
+    ) -> (Key, Bound) {
         let mut bound = Vec::with_capacity(upto.len());
         // A bucket never passes its dimension's bound.
         let most = |name: DimName| match g.dims.iter().find(|d| d.name == name)?.size {
@@ -102,6 +102,20 @@ impl Cache {
             upto.to_vec(),
             device.generation(),
         );
+        (key, bound)
+    }
+
+    /// As `upto`, with only the `wants` outputs.
+    pub fn wanting(
+        &mut self,
+        g: &Graph,
+        entry: usize,
+        wants: Wants,
+        sizes: &[(DimName, u64)],
+        upto: &[DimName],
+        device: &Device,
+    ) -> Result<(&Plan, Bound), Error> {
+        let (key, bound) = self.key_for(g, entry, wants, sizes, upto, device);
         if !self.plans.contains_key(&key) {
             let plan = lower_upto(g, entry, wants, &key.3, upto, device)?;
             self.plans.insert(key.clone(), plan);
@@ -109,6 +123,22 @@ impl Cache {
             self.hits += 1;
         }
         Ok((&self.plans[&key], bound))
+    }
+
+    /// Lowers and caches the plan while returning a fast-path report.
+    pub fn explain(
+        &mut self,
+        g: &Graph,
+        entry: usize,
+        wants: Wants,
+        sizes: &[(DimName, u64)],
+        upto: &[DimName],
+        device: &Device,
+    ) -> Result<Report, Error> {
+        let (key, _) = self.key_for(g, entry, wants, sizes, upto, device);
+        let (plan, report) = explain_upto(g, entry, wants, &key.3, upto, device)?;
+        self.plans.entry(key).or_insert(plan);
+        Ok(report)
     }
 
     pub fn len(&self) -> usize {
