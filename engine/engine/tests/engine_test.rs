@@ -282,6 +282,42 @@ fn batch_matches_single() {
     }
 }
 
+/// Multi-slot MLA stays exact when context bucket < max_context.
+#[test]
+fn mla_multislot_bucketed() {
+    let mut cfg = mla::Config::glm53_small();
+    cfg.stack.max_context = 512;
+    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
+    let weights = weights(&g, &mut Noise(7));
+    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let prompts: [&[u32]; 4] = [&[3, 9, 4, 11], &[5, 2, 8], &[12, 1, 6, 7, 10], &[2, 14]];
+    for settings in runs() {
+        let mut solo = Engine::open(g.clone(), 512, &Recipe::default(), &settings).unwrap();
+        solo.load(&stored).unwrap();
+        let want: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let mut b = Batch::new(&mut solo, Box::new(Fair));
+                asked(&mut b, &[p]).0.pop().unwrap()
+            })
+            .collect();
+        for paged in [false, true] {
+            let mut recipe = Recipe::default();
+            if paged {
+                recipe.kept = &kept::PAGED16;
+            }
+            let mut multi = Engine::open(g.clone(), 512, &recipe, &settings).unwrap();
+            multi.load(&stored).unwrap();
+            let mut batch = Batch::new(&mut multi, Box::new(Fair));
+            if paged {
+                batch.reuse();
+            }
+            let (got, _) = asked(&mut batch, &prompts);
+            assert_eq!(got, want, "paged={paged}");
+        }
+    }
+}
+
 /// Low-rank attention computes its keys at each launch.
 #[test]
 fn mla_matches_interpreter() {

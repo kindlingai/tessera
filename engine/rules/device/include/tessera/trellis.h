@@ -12,6 +12,9 @@ namespace trellis {
 
 constexpr u32 HEAD = 16u;
 constexpr u32 INPUT_SIDE = 2u;
+constexpr u32 SIDE_MASK = 0xFFFFu;
+constexpr u32 PAGED = 0x80000000u;
+constexpr u32 TABLE = 24u;
 constexpr u32 MCG = 0xCBAC1FEDu;
 constexpr u32 MUL1 = 0x83DCD12Du;
 constexpr u32 PMCG2 = 0xBCA14C51u;
@@ -40,8 +43,25 @@ TESSERA_FN const u8* tile_ptr(const u8* base, u32 in_dim, u32 out_dim, u32 m, u3
                               bool input_side) {
     u64 local = input_side ? u64(ti / 8u) * (out_dim / 2u) + u64(ob) * 64u + (ti % 8u) * 8u
                            : u64(ob) * (in_dim / 2u) + u64(ti) * 8u;
+    u32 side = *reinterpret_cast<const u32*>(base + 8u);
+    if (side & PAGED) {
+        u64 delta = *reinterpret_cast<const u64*>(base + TABLE + u64(m) * 8u);
+        u64 addr = reinterpret_cast<u64>(base) + delta;
+        return reinterpret_cast<const u8*>(addr) + local * (32u * K);
+    }
     u64 first = u64(m) * (in_dim / 16u) * (out_dim / 16u);
     return base + HEAD + (first + local) * (32u * K);
+}
+
+// Records one activation of expert `m` when `base` is paged.
+TESSERA_FN void note_hit(const u8* base, u32 m) {
+    u32 side = *reinterpret_cast<const u32*>(base + 8u);
+    if (side & PAGED) {
+        u64 hits = *reinterpret_cast<const u64*>(base + HEAD);
+        if (hits != 0ull) {
+            atomicAdd(reinterpret_cast<u32*>(hits) + m, 1u);
+        }
+    }
 }
 
 #if defined(TESSERA_CUDA)
@@ -474,7 +494,7 @@ TESSERA_FN float narrow_f32(float v) {
 // Portable scalar decode of element `(row, col)` in matrix `m`.
 TESSERA_FN float scalar_elem(const u8* base, u32 in_dim, u32 out_dim, u32 k, u32 book, u64 m,
                              u32 row, u32 col) {
-    bool input_side = *reinterpret_cast<const u32*>(base + 8u) == INPUT_SIDE;
+    bool input_side = (*reinterpret_cast<const u32*>(base + 8u) & SIDE_MASK) == INPUT_SIDE;
     u32 ti = row >> 4u, to = col >> 4u;
     u64 local = input_side
                     ? u64(ti >> 3u) * (out_dim >> 1u) + u64(to >> 3u) * 64u + (ti & 7u) * 8u +

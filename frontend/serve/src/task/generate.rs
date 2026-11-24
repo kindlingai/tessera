@@ -113,6 +113,9 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     };
     let jobs = queue(load, generate, scores);
     let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    if let Some(rows) = o.max_batch_rows {
+        batch.budget(rows);
+    }
     if load.on("--reuse-prefix") {
         batch.reuse();
     }

@@ -449,6 +449,15 @@ impl<T: Transport> Run for Rank<T> {
         }
     }
 
+    fn upload_weight(
+        &mut self,
+        weight: u32,
+        slot: tessera_lower::Slot,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.runner.run_mut().upload_weight(weight, slot, bytes)
+    }
+
     /// Runs these steps. Sums wait for every rank.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         self.run_steps(steps, true)

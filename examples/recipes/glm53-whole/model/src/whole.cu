@@ -55,7 +55,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_whole(const table* t)
     u32 reads = first, kept = 0u;
     for (u32 l = 0; l < s.layers; l++) {
         reads = walk(t, for_layer(s, l), l, reads, kept).next;
-        kept += indexes(s, l) ? 3u : 2u;
+        kept += indexes(s, l) ? 2u : 1u;
     }
     TS_MARK();
     embed_rows(weight(t, IDS), at<const u32>(t, 0), p.x, s.rows, s.hidden);
