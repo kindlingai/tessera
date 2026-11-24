@@ -34,6 +34,7 @@ static LIMITS: LazyLock<Limits> =
 /// Map files live here, outside the protected paths.
 const DIR: &str = "maps/";
 
+#[derive(Clone)]
 pub struct Fault {
     pub path: String,
     pub line: usize,
@@ -103,8 +104,8 @@ impl Atlas {
     }
 
     /// Every fault: format, resolution, relation and invariant.
-    pub fn check(mut self) -> Vec<Fault> {
-        let mut out = std::mem::take(&mut self.faults);
+    pub fn check(&self) -> Vec<Fault> {
+        let mut out = self.faults.clone();
         let book = self.book();
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
         for map in &self.maps {
@@ -114,11 +115,11 @@ impl Atlas {
             for (n, step) in map.task.steps.iter().enumerate() {
                 let line = self.line(map, step.span().start);
                 let head = format!("step {} ({})", n + 1, step.get_ref().verb.name());
-                let mut like = None;
+                let mut like = Vec::new();
                 let mut resolved = true;
                 for (field, _, got) in self.refs(step.get_ref()) {
                     match got {
-                        Ok(items) if field == "like" => like = items.into_iter().next(),
+                        Ok(items) if field == "like" => like = items,
                         Ok(_) => {}
                         Err(why) => {
                             resolved = false;
@@ -126,7 +127,7 @@ impl Atlas {
                         }
                     }
                 }
-                if let (true, Err(why)) = (resolved, book.holds(step.get_ref(), like.as_ref())) {
+                if let (true, Err(why)) = (resolved, book.holds(step.get_ref(), &like)) {
                     out.push(map.fault(line, format!("{head} does not hold: {why}")));
                 }
             }

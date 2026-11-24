@@ -15,14 +15,17 @@ fn main() -> ExitCode {
 fn run(args: &[&str]) -> Result<bool, String> {
     let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let atlas = Atlas::open(&root)?;
-    let out = match args {
-        [] | ["check"] => {
-            let faults = atlas.check();
-            for f in &faults {
-                println!("{}:{}: map: {}", f.path, f.line, f.message);
-            }
-            return Ok(faults.is_empty());
+    let faults = atlas.check();
+    let check = matches!(args, [] | ["check"]);
+    for f in &faults {
+        let line = format!("{}:{}: map: {}", f.path, f.line, f.message);
+        match check {
+            true => println!("{line}"),
+            false => eprintln!("{line}"),
         }
+    }
+    let out = match args {
+        [] | ["check"] => return Ok(faults.is_empty()),
         ["show", id] => atlas.show(id)?,
         ["cites", path] => atlas.cites(path),
         ["registries"] => atlas.inventory(),

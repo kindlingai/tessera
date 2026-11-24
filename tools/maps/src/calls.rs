@@ -34,6 +34,8 @@ pub struct Scan {
     /// The trait name of each `impl Trait for Type`.
     pub impls: Vec<(usize, String)>,
     pub derives: Vec<(usize, String)>,
+    /// Lines of `#[test]` attributes.
+    pub tests: Vec<usize>,
     pub bodies: Vec<Body>,
 }
 
@@ -137,8 +139,14 @@ fn walk(ts: TokenStream, ctx: Ctx, out: &mut Scan) {
                         continue;
                     }
                 }
+                let item = [
+                    "struct", "enum", "union", "trait", "impl", "for", "mod", "fn",
+                ];
+                let defines =
+                    i > 0 && ident_of(toks.get(i - 1)).is_some_and(|p| item.contains(&p.as_str()));
                 if let Some(TokenTree::Group(g)) = toks.get(i + 1)
                     && g.delimiter() == Delimiter::Brace
+                    && !defines
                 {
                     out.bodies.push(Body {
                         name: s,
@@ -205,6 +213,9 @@ fn attr_of(ts: TokenStream, l: usize, out: &mut Scan) -> bool {
                 out.derives.push((l, id.to_string()));
             }
         }
+    }
+    if head.as_deref() == Some("test") && toks.len() == 1 {
+        out.tests.push(l);
     }
     head.as_deref() == Some("macro_export")
 }

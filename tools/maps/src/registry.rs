@@ -48,7 +48,7 @@ fn screaming(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-fn ident_of(repo: &Repo, file: &str) -> String {
+fn crate_of(repo: &Repo, file: &str) -> String {
     repo.owner(file)
         .map(|k| k.ident.clone())
         .unwrap_or_default()
@@ -56,8 +56,29 @@ fn ident_of(repo: &Repo, file: &str) -> String {
 
 /// A macro defined in `krate` is callable from `file`.
 fn reaches(repo: &Repo, file: &str, krate: &str, export: bool) -> bool {
-    let same = ident_of(repo, file) == krate;
+    let same = crate_of(repo, file) == krate;
     same || (export && repo.text(file).is_some_and(|t| t.contains(krate)))
+}
+
+/// Keys: a wrapper's constants, else literals. `fan` keeps all.
+fn keys_of(args: &proc_macro2::TokenStream, wrapper: bool, fan: bool) -> Vec<String> {
+    let idents = top_idents(args);
+    let lits: Vec<String> = top_lits(args)
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect();
+    let consts: Vec<String> = idents.iter().filter(|i| screaming(i)).cloned().collect();
+    let mut keys = match (wrapper, consts.is_empty()) {
+        (true, false) => consts,
+        _ => lits,
+    };
+    if !fan {
+        keys.truncate(1);
+    }
+    if keys.is_empty() {
+        keys.extend(idents.into_iter().take(1));
+    }
+    keys
 }
 
 pub fn derive(repo: &Repo) -> Inventory {
@@ -100,7 +121,7 @@ impl Inventory {
                     (Some(n), _) if !n.starts_with('$') => self.add(repo, file, call.line, n),
                     (Some(_), Some(d)) => {
                         let def = &scan.defs[d];
-                        declarers.push((def.name.clone(), ident_of(repo, file), def.export));
+                        declarers.push((def.name.clone(), crate_of(repo, file), def.export));
                     }
                     _ => {}
                 }
@@ -129,7 +150,7 @@ impl Inventory {
 
     /// The maker a call to `name` in `file` reaches.
     pub fn maker_for(&self, repo: &Repo, file: &str, name: &str) -> Option<usize> {
-        let krate = ident_of(repo, file);
+        let krate = crate_of(repo, file);
         let named = |m: &&Maker| m.name == name;
         let all: Vec<usize> = (0..self.makers.len())
             .filter(|&i| named(&&self.makers[i]))
@@ -166,7 +187,7 @@ impl Inventory {
             let Some(scan) = repo.scan(file) else {
                 continue;
             };
-            let krate = ident_of(repo, file);
+            let krate = crate_of(repo, file);
             for call in &scan.calls {
                 let Some(d) = call.def else {
                     continue;
@@ -218,7 +239,7 @@ impl Inventory {
                 if self.maker_for(repo, file, &name) != Some(at) {
                     continue;
                 }
-                let krate = ident_of(repo, file);
+                let krate = crate_of(repo, file);
                 let reg = match self.makers[at].target {
                     Target::Fixed(r) => Some(r),
                     Target::Open => self.named_in(&call.args, &krate),
@@ -227,18 +248,7 @@ impl Inventory {
                     continue;
                 };
                 let m = &self.makers[at];
-                let lits: Vec<String> = top_lits(&call.args)
-                    .into_iter()
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                let fan = m.wraps.is_some() && m.fan;
-                let mut keys: Vec<String> = lits
-                    .into_iter()
-                    .take(if fan { usize::MAX } else { 1 })
-                    .collect();
-                if keys.is_empty() {
-                    keys.extend(top_idents(&call.args).into_iter().take(1));
-                }
+                let keys = keys_of(&call.args, m.wraps.is_some(), m.fan);
                 for key in keys {
                     let (file, line) = (file.to_string(), call.line);
                     self.registries[reg].members.push(Member {

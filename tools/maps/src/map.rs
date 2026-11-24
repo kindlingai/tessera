@@ -155,8 +155,9 @@ fn segment_ok(s: &str) -> bool {
 fn id_fault(id: &str) -> Option<String> {
     let parts: Vec<&str> = id.split('-').collect();
     let (segments, chars) = (LIMITS.max_name_segments, LIMITS.max_map_id_chars);
-    if !parts.iter().all(|p| segment_ok(p)) {
-        return Some(format!("id `{id}` is not kebab-case"));
+    let word = |p: &&str| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase());
+    if !parts.iter().all(word) {
+        return Some(format!("id `{id}` is not kebab-case words"));
     }
     if parts.len() > segments || id.len() > chars {
         return Some(format!(
@@ -209,10 +210,11 @@ pub fn read(path: &str, text: &str, out: &mut Vec<Fault>) -> Vec<Map> {
         out.push(fault(path, line_of(text, at), why));
         return Vec::new();
     }
-    let stem = path.rsplit('/').next().unwrap_or(path);
-    if let Some(why) = id_fault(stem.trim_end_matches(".toml")) {
-        out.push(fault(path, 1, format!("file name: {why}")));
-    }
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".toml");
     let sheet: Sheet = match toml::from_str(text) {
         Ok(s) => s,
         Err(e) => {
@@ -221,6 +223,11 @@ pub fn read(path: &str, text: &str, out: &mut Vec<Fault>) -> Vec<Map> {
             return Vec::new();
         }
     };
+    if sheet.task.len() != 1 || !sheet.task.contains_key(stem) {
+        let why = format!("a map file holds one task, `[task.{stem}]`");
+        out.push(fault(path, 1, why));
+        return Vec::new();
+    }
     let mut maps = Vec::new();
     for (id, task) in sheet.task {
         let line = text
@@ -252,8 +259,11 @@ impl Map {
         }
         let max = LIMITS.max_map_steps;
         let (steps, each) = (&self.task.steps, &self.task.each);
-        if steps.len() > max || each.len() > max {
-            out.push(self.fault(self.line, format!("over {max} steps or invariants")));
+        if steps.is_empty() || steps.len() > max || each.len() > max {
+            out.push(self.fault(
+                self.line,
+                format!("1 to {max} steps, at most {max} invariants"),
+            ));
         }
         for (n, step) in steps.iter().enumerate() {
             let line = line_of(text, step.span().start);

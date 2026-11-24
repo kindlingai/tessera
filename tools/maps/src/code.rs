@@ -36,6 +36,8 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Item {
     pub name: String,
+    /// The first line, attributes included.
+    pub start: usize,
     pub kind: Kind,
     pub file: String,
     pub line: usize,
@@ -76,6 +78,26 @@ pub fn listed(root: &Path) -> Result<Vec<String>, String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let paths = text.split('\0').filter(|p| !p.is_empty());
     Ok(paths.map(String::from).collect())
+}
+
+/// The workspace members in the root manifest, as a test.
+fn members(root: &Path) -> Result<impl Fn(&str) -> bool, String> {
+    let text =
+        std::fs::read_to_string(root.join("Cargo.toml")).map_err(|e| format!("Cargo.toml: {e}"))?;
+    let table: toml::Table = text.parse().map_err(|e| format!("Cargo.toml: {e}"))?;
+    let list = |key: &str| -> Vec<String> {
+        let found = table
+            .get("workspace")
+            .and_then(|w| w.get(key))
+            .and_then(|m| m.as_array());
+        found
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    };
+    let (keep, drop) = (list("members"), list("exclude"));
+    Ok(move |dir: &str| keep.iter().any(|g| glob(g, dir)) && !drop.iter().any(|g| glob(g, dir)))
 }
 
 fn parent(path: &str) -> &str {
@@ -183,11 +205,31 @@ pub fn item(name: String, kind: Kind, file: &str, span: proc_macro2::Span) -> It
     let (line, end) = (span.start().line, span.end().line);
     Item {
         name,
+        start: line,
         kind,
         file: file.into(),
         line,
         end,
     }
+}
+
+/// `*` matches within one path segment.
+pub fn glob(pattern: &str, path: &str) -> bool {
+    fn seg(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => seg(&p[1..], s) || (!s.is_empty() && seg(p, &s[1..])),
+            (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    let (ps, ss): (Vec<&str>, Vec<&str>) =
+        (pattern.split('/').collect(), path.split('/').collect());
+    ps.len() == ss.len()
+        && ps
+            .iter()
+            .zip(&ss)
+            .all(|(p, s)| seg(p.as_bytes(), s.as_bytes()))
 }
 
 /// `macro_rules!` names, and statics declared inside macro calls.
@@ -214,6 +256,7 @@ impl Repo {
         files.retain(|p| root.join(p).exists());
         let mut sources = BTreeMap::new();
         let mut crates = BTreeMap::new();
+        let members = members(root)?;
         for path in &files {
             if path.ends_with(".rs") {
                 let text = std::fs::read_to_string(root.join(path)).unwrap_or_default();
@@ -228,9 +271,13 @@ impl Repo {
                 let Some(name) = manifest.get("package").and_then(|p| p.get("name")) else {
                     continue;
                 };
+                if !members(k.trim_end_matches('/')) {
+                    continue;
+                }
                 let lib = manifest.get("lib").and_then(|l| l.get("path"));
-                let lib = lib.and_then(|p| p.as_str()).map(|p| format!("{k}{p}"));
                 let found = |f: &str| files.iter().any(|x| x == f);
+                let lib = lib.and_then(|p| p.as_str()).map(|p| format!("{k}{p}"));
+                let lib = lib.filter(|f| found(f));
                 let main = format!("{k}src/main.rs");
                 let root_file = lib
                     .or_else(|| Some(format!("{k}src/lib.rs")).filter(|f| found(f)))
@@ -518,11 +565,16 @@ impl Repo {
 
     /// Whether the crate has tests: a tests directory or `#[test]`.
     pub fn has_tests(&self, k: &Krate) -> bool {
-        self.sources.iter().any(|(p, s)| {
-            p.starts_with(&k.dir)
-                && self.owner(p).is_some_and(|o| o.dir == k.dir)
-                && (p.starts_with(&format!("{}tests/", k.dir)) || s.text.contains("#[test]"))
-        })
+        for (p, s) in &self.sources {
+            let own = self.owner(p).is_some_and(|o| o.dir == k.dir);
+            if own
+                && s.text.contains("#[test]")
+                && self.scan(p).is_some_and(|x| !x.tests.is_empty())
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 

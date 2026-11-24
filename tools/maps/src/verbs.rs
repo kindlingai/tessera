@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::calls::{top_idents, top_lits};
-use crate::code::{Item, Kind, Repo};
+use crate::code::{Item, Kind, Repo, glob};
 use crate::map::{Class, Each, Mode, Step, Verb};
 use crate::registry::Inventory;
 
@@ -25,7 +25,7 @@ impl Scope {
         let (start, end) = if whole {
             (0, usize::MAX)
         } else {
-            (it.line, it.end)
+            (it.start, it.end)
         };
         let file = it.file.clone();
         Scope { file, start, end }
@@ -40,30 +40,12 @@ fn file_item(file: &str) -> Item {
     let (name, kind, file) = (file.to_string(), Kind::File, file.to_string());
     Item {
         name,
+        start: 1,
         kind,
         file,
         line: 1,
         end: 1,
     }
-}
-
-/// `*` matches within one path segment.
-pub fn glob(pattern: &str, path: &str) -> bool {
-    fn seg(p: &[u8], s: &[u8]) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => seg(&p[1..], s) || (!s.is_empty() && seg(p, &s[1..])),
-            (Some(a), Some(b)) if a == b => seg(&p[1..], &s[1..]),
-            _ => false,
-        }
-    }
-    let (ps, ss): (Vec<&str>, Vec<&str>) =
-        (pattern.split('/').collect(), path.split('/').collect());
-    ps.len() == ss.len()
-        && ps
-            .iter()
-            .zip(&ss)
-            .all(|(p, s)| seg(p.as_bytes(), s.as_bytes()))
 }
 
 /// `a/b/../c` as `a/c`.
@@ -100,7 +82,7 @@ impl Book<'_> {
                 {
                     let r = &self.inv.registries[r];
                     let mut it = file_item(&r.file);
-                    (it.kind, it.line, it.end) = (Kind::Item, r.line, r.line);
+                    (it.kind, it.start, it.line, it.end) = (Kind::Item, r.line, r.line, r.line);
                     items.push(it);
                 }
                 items
@@ -142,12 +124,13 @@ impl Book<'_> {
         if path.ends_with('!') && !called {
             return false;
         }
-        if self
+        let bare = |n: &str| scan.idents.iter().any(|(l, s)| inside(*l) && s == n);
+        let here = self
             .repo
             .resolve(path)
             .iter()
-            .any(|it| it.file == scope.file)
-        {
+            .any(|it| it.file == scope.file);
+        if here && bare(name) {
             return true;
         }
         let same = self
@@ -166,7 +149,6 @@ impl Book<'_> {
                 return true;
             }
         }
-        let bare = |n: &str| scan.idents.iter().any(|(l, s)| inside(*l) && s == n);
         for (local, raw) in self.repo.uses_in(&scope.file) {
             if !raw.first().is_some_and(|f| from(f)) {
                 continue;
@@ -179,11 +161,24 @@ impl Book<'_> {
         false
     }
 
-    /// Tests the step's relation. Each reference already resolved.
-    pub fn holds(&self, step: &Step, like: Option<&Item>) -> Result<(), String> {
+    /// Tests the step's relation against any `like` item.
+    pub fn holds(&self, step: &Step, likes: &[Item]) -> Result<(), String> {
+        if likes.is_empty() {
+            return self.holds_at(step, None);
+        }
+        let mut why = Ok(());
+        for like in likes {
+            why = self.holds_at(step, Some(Scope::of(like)));
+            if why.is_ok() {
+                break;
+            }
+        }
+        why
+    }
+
+    fn holds_at(&self, step: &Step, scope: Option<Scope>) -> Result<(), String> {
         let field = |f: &Option<String>| f.clone().unwrap_or_default();
         let (with, at) = (field(&step.with), field(&step.at));
-        let scope = like.map(Scope::of);
         let shown = field(&step.like);
         let fail = |what: String| Err(format!("`{shown}` {what}"));
         match (step.verb, scope) {
@@ -213,7 +208,10 @@ impl Book<'_> {
             return Err(format!("is cited, but `{with}` is not a registering macro"));
         };
         let scan = self.repo.scan(&s.file).ok_or("is not Rust")?;
-        for call in scan.calls.iter().filter(|c| s.holds(c.line)) {
+        for call in &scan.calls {
+            if call.def.is_some() || !s.holds(call.line) {
+                continue;
+            }
             let reached = self.inv.maker_for(self.repo, &s.file, &call.name);
             if reached.is_some_and(|m| self.inv.leads_to(m, maker)) {
                 return Ok(());
@@ -227,59 +225,64 @@ impl Book<'_> {
             return false;
         };
         let name = last_of(with);
-        let derive = self
-            .repo
-            .resolve(with)
-            .iter()
-            .any(|it| it.kind == Kind::Derive);
+        let resolved = self.repo.resolve(with);
+        let derive = resolved.iter().any(|it| it.kind == Kind::Derive);
         let impls = scan.impls.iter().any(|(l, t)| s.holds(*l) && t == name);
         let derives = derive && scan.derives.iter().any(|(l, t)| s.holds(*l) && t == name);
         (impls || derives) && self.mentions(s, with)
     }
 
-    /// A `mod` in `at`, or a call naming the module.
+    /// A `mod` in `at`, or a local `mod $` macro call.
     fn lists(&self, at: &str, file: &str) -> bool {
         let stem = file.trim_end_matches("/mod.rs").trim_end_matches(".rs");
         let stem = stem.rsplit('/').next().unwrap_or(stem);
-        let declared = self.repo.tree(at).is_some_and(|t| {
-            t.items.iter().any(|i| match i {
-                syn::Item::Mod(m) if m.content.is_none() => {
-                    self.repo
-                        .kid_file(at, &m.ident.to_string(), &m.attrs)
-                        .as_deref()
-                        == Some(file)
+        if self.repo.kid_file(at, stem, &[]).as_deref() != Some(file) {
+            return false;
+        }
+        if let Some(tree) = self.repo.tree(at) {
+            for i in &tree.items {
+                if let syn::Item::Mod(m) = i
+                    && m.content.is_none()
+                    && m.ident == stem
+                {
+                    return true;
                 }
-                _ => false,
-            })
-        });
-        let dir = file.rsplit_once('/').map_or("", |d| d.0);
-        let beside =
-            dir == at.rsplit_once('/').map_or("", |d| d.0) || dir.ends_with(&format!("/{stem}"));
-        let called = self.repo.scan(at).is_some_and(|scan| {
-            let names = |c: &&crate::calls::Call| top_idents(&c.args).iter().any(|i| i == stem);
-            scan.calls.iter().any(|c| names(&c))
-        });
-        declared || (beside && called)
+            }
+        }
+        let (Some(scan), Some(text)) = (self.repo.scan(at), self.repo.text(at)) else {
+            return false;
+        };
+        if !text.contains("mod $") {
+            return false;
+        }
+        for call in &scan.calls {
+            let local = scan.defs.iter().any(|d| d.name == call.name);
+            if local && call.def.is_none() && top_idents(&call.args).iter().any(|i| i == stem) {
+                return true;
+            }
+        }
+        false
     }
 
+    /// A string literal in scope names a file `at` matches.
     fn places(&self, s: &Scope, at: &str) -> bool {
         let Some(scan) = self.repo.scan(&s.file) else {
             return false;
         };
         let dir = s.file.rsplit_once('/').map_or("", |d| d.0);
         let krate = self.repo.owner(&s.file).map_or("", |k| k.dir.as_str());
-        let tail = at.rsplit('/').next().unwrap_or(at);
-        scan.lits
-            .iter()
-            .filter(|(l, _)| s.holds(*l))
-            .any(|(_, lit)| {
-                let tries = [format!("{dir}/{lit}"), format!("{krate}{lit}"), lit.clone()];
-                let hit = tries.iter().any(|t| {
-                    let t = normal(t);
-                    glob(at, &t) && self.repo.files.contains(&t)
-                });
-                hit || (!tail.contains('*') && lit == tail)
-            })
+        for (l, lit) in &scan.lits {
+            if !s.holds(*l) {
+                continue;
+            }
+            for t in [format!("{dir}/{lit}"), format!("{krate}{lit}"), lit.clone()] {
+                let t = normal(&t);
+                if glob(at, &t) && self.repo.files.contains(&t) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn tests(&self, s: &Scope, with: &str, via: Option<&str>) -> Result<(), String> {
@@ -290,8 +293,11 @@ impl Book<'_> {
         if !self.mentions(s, with) {
             return Err(format!("does not use `{with}`"));
         }
+        let scan = self.repo.scan(&s.file).ok_or("is not Rust")?;
         match via {
-            Some(v) if !self.mentions(s, v) => Err(format!("does not use `{v}`")),
+            Some(v) if !v.ends_with('!') => Err(format!("cites `{v}`, which is not a macro")),
+            Some(v) if !self.mentions(s, v) => Err(format!("does not call `{v}`")),
+            None if !scan.tests.iter().any(|l| s.holds(*l)) => Err("has no `#[test]`".into()),
             _ => Ok(()),
         }
     }

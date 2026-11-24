@@ -3,9 +3,9 @@
 use std::fmt::Write;
 
 use crate::Atlas;
-use crate::map::Map;
+use crate::code::glob;
+use crate::map::{Class, Map};
 use crate::registry::Target;
-use crate::verbs::glob;
 
 /// FNV-1a, 64 bits. Stable across builds and platforms.
 fn fnv(text: &str) -> u64 {
@@ -75,6 +75,19 @@ impl Atlas {
                             map.id,
                             n + 1
                         );
+                    }
+                }
+            }
+            for e in &map.task.each {
+                let e = e.get_ref();
+                for value in [&e.of, &e.has] {
+                    let got = self
+                        .book()
+                        .resolve(value, Class::Symbol)
+                        .unwrap_or_default();
+                    if got.iter().any(|it| it.file == path) {
+                        let line = self.line(map, 0).max(map.line);
+                        let _ = writeln!(out, "{}:{line}: {} each {value}", map.path, map.id);
                     }
                 }
             }

@@ -7,3 +7,7 @@ steps = [
   { do = "run", pkg = "tessera-mem", mode = "test" },
   { do = "run", pkg = "tessera-codegen", mode = "test" },
 ]
+each = [
+  { of = "tessera_mem::form::FORMS", has = "tessera_codegen::form::LOADS" },
+  { of = "tessera_codegen::form::LOADS", has = "tessera_mem::form::FORMS" },
+]
