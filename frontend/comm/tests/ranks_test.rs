@@ -5,15 +5,16 @@ use tessera_rules as _;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tessera_engine::comm::Transport;
-use tessera_frontend_comm::{shm, sockets};
+use tessera_frontend_comm::{shm, sockets_within};
 use tessera_frontend_settings::read as settings;
 use tessera_graph::{Graph, shard};
 use tessera_interp::{Tensor, run};
 use tessera_lower::{Cluster, Device, Pick, Plan, Settings, View, lower};
 use tessera_models::decoder::{Config, Swiglu, program};
 use tessera_run::{Rank, Run};
-use tessera_testkit::{Noise, fill, max_abs_diff};
+use tessera_testkit::{Noise, TCP_TIMEOUT, fill, max_abs_diff, tcp_bind, tcp_pair};
 use tessera_trace::DimName::{self, Context, Seqs};
 use tessera_trace::{Norm, TensorType};
 
@@ -36,9 +37,8 @@ fn carried(tensors: &[Tensor]) -> Vec<Plain> {
 
 /// `n` listeners on the loopback, with their addresses.
 fn listening(n: usize) -> (Vec<TcpListener>, Vec<SocketAddr>) {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
+    tcp_pair().unwrap();
+    let listeners: Vec<TcpListener> = (0..n).map(|_| tcp_bind().unwrap()).collect();
     let addrs = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
     (listeners, addrs)
 }
@@ -117,9 +117,16 @@ fn both<T: Transport + 'static>(open: impl Fn(u32) -> T + Sync) {
 fn two_sockets() {
     let (listeners, addrs) = listening(2);
     let listeners: Vec<_> = listeners.into_iter().map(std::sync::Mutex::new).collect();
+    let abort = AtomicBool::new(false);
     both(|r| {
         let listener = listeners[r as usize].lock().unwrap().try_clone().unwrap();
-        sockets(r, listener, &addrs).unwrap()
+        match sockets_within(r, listener, &addrs, TCP_TIMEOUT, Some(&abort)) {
+            Ok(s) => s,
+            Err(e) => {
+                abort.store(true, Ordering::Release);
+                panic!("rank {r} failed to join: {e}");
+            }
+        }
     });
 }
 

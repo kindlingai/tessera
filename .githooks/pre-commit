@@ -1,13 +1,12 @@
 #!/bin/sh
-# Formatting, then style, lint and simcheck through tessera-check,
+# Formatting, then style, lint and simcheck through stickler,
 # then clippy on the crates that hold staged files.
-# tessera-check runs style first and stops at the first failure.
-# Style and simcheck run when `cargo run -p tessera-check -- fetch`
+# stickler runs style first and stops at the first failure.
+# Style and simcheck run when `tools/scripts/stickler.sh fetch`
 # has put their models in ~/.cache/tessera/check.
 # Install: tools/scripts/install-hooks.sh
 . "$(dirname "$0")/worktree.sh"
 set -e
 tools/scripts/fmt-check.sh --all
-tools/scripts/fmt-check.sh --manifest-path tools/simcheck/Cargo.toml
-cargo run -q -p tessera-check -- run --staged
+tools/scripts/stickler.sh run --staged
 tools/scripts/clippy-staged.sh

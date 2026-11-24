@@ -33,7 +33,7 @@ pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{Compute, Launching, Recipe};
 pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};
-pub use select::{Home, Op, Selected, Val, Value, select};
+pub use select::{Finding, Home, Op, Rejection, Report, Selected, Val, Value, select};
 pub use tessera_codegen::kept;
 pub use tessera_codegen::{Dialect, Terms, hip_tiles, terms};
 pub use tessera_engine_settings::{Backend, ByBackend, Pick, Reads, Settings};
@@ -67,6 +67,30 @@ pub(crate) fn lower_upto(
 ) -> Result<Plan, Error> {
     let picked = select::select_upto(g, entry, wants, sizes, upto, device)?;
     Ok(assign(&picked, &schedule(&picked)))
+}
+
+/// Lowers `entry` and returns a fast-path diagnostic report.
+pub fn explain(
+    g: &Graph,
+    entry: usize,
+    sizes: &[(DimName, u64)],
+    device: &Device,
+) -> Result<Report, Error> {
+    Ok(explain_upto(g, entry, Wants::ALL, sizes, &[], device)?.1)
+}
+
+/// The same, with `upto` dimensions read at launch.
+pub(crate) fn explain_upto(
+    g: &Graph,
+    entry: usize,
+    wants: Wants,
+    sizes: &[(DimName, u64)],
+    upto: &[DimName],
+    device: &Device,
+) -> Result<(Plan, Report), Error> {
+    let (picked, report) = select::select_report(g, entry, wants, sizes, upto, device)?;
+    let plan = assign(&picked, &schedule(&picked));
+    Ok((plan, report))
 }
 
 #[derive(Debug, thiserror::Error)]

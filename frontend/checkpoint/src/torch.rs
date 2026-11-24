@@ -45,7 +45,7 @@ fn stored(dtype: DType) -> Stored {
     match dtype {
         DType::F32 => Stored::F32,
         DType::F16 => Stored::F16,
-        DType::Bf16 => Stored::Bf16,
+        DType::Bf16 => Stored::BF16,
         _ => Stored::Other,
     }
 }
@@ -165,6 +165,34 @@ impl Offer for Torch {
     }
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
+        let (view, _) = self
+            .views
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        if view.storage.dtype == DType::Bf16 {
+            return Ok(self
+                .floats(name)?
+                .iter()
+                .flat_map(crate::offer::narrow)
+                .collect());
+        }
         Err(Error::DType(format!("{name} holds floats, not a form")))
+    }
+
+    fn packed_rows(&self, name: &str, (first, count): (usize, usize)) -> Result<Vec<u8>, Error> {
+        let (view, _) = self
+            .views
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        if view.storage.dtype != DType::Bf16 {
+            return Err(Error::DType(format!("{name} cannot be read in rows")));
+        }
+        let rows = *view.shape.first().unwrap_or(&0);
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let stride = 2 * view.shape.iter().product::<usize>() / rows;
+        let all = self.packed(name)?;
+        Ok(all[first * stride..(first + count) * stride].to_vec())
     }
 }

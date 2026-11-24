@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
 use tessera_graph::{EntryKind, Role};
-use tessera_lower::{Cache, Device, Slot, Wants};
+use tessera_lower::{Cache, Device, Report, Slot, Wants};
 use tessera_run::{Run, open};
 
 mod batch_dual;
@@ -37,10 +37,6 @@ pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
-
-pub const fn ple_heads() -> usize {
-    ple::HEADS
-}
 pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 pub use spec_len::{CostModel, SpecLen};
@@ -61,6 +57,11 @@ pub use tessera_models::*;
 pub use tessera_run::{Grid, gpu, pinning, select};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;
+
+/// N-gram heads in a PLE row.
+pub const fn ple_heads() -> usize {
+    ple::HEADS
+}
 
 /// Tokens to continue, and when to stop.
 #[derive(Default, Serialize, Deserialize)]
@@ -141,6 +142,8 @@ pub enum Error {
     Full,
     #[error("ple store: {0}")]
     Ple(#[from] std::io::Error),
+    #[error("drafts rewind slot state that the graph cannot restore")]
+    Stateful,
 }
 
 /// Row width of `entry`'s `role` output, if any.
@@ -218,6 +221,8 @@ pub struct Engine {
     ranks: Option<tessera_run::Ranks>,
     /// Host n-gram embedding table for models with a PLE port.
     ple: Option<PleStore>,
+    /// Whether slots carry state that a kept prefix cannot restore.
+    stateful: bool,
 }
 
 /// Inputs a launch feeds before its picks.
@@ -347,6 +352,7 @@ impl Engine {
         let words = words.map(|d| d.size.max() as usize);
         let taps = width(&graph, full, Role::Taps);
         let vocab = width(&graph, full, Role::Logits);
+        let stateful = graph.nodes.iter().any(|n| n.op.recurrent());
         Ok(Self {
             graph,
             runner,
@@ -365,26 +371,19 @@ impl Engine {
             held: None,
             ranks: None,
             ple: None,
+            stateful,
         })
     }
 
     /// Attaches a host PLE store for `Role::Ple` graphs.
     pub fn set_ple(&mut self, store: PleStore) {
         self.ple = Some(store);
+        self.stateful = true;
     }
 
-    /// Whether the graph has recurrent state.
+    /// Whether slots carry state that a kept prefix cannot restore.
     pub fn stateful(&self) -> bool {
-        if self.ple.is_some() {
-            return true;
-        }
-        self.graph.nodes.iter().any(|n| {
-            matches!(
-                n.op,
-                tessera_graph::Op::Conv(tessera_graph::Conv { state: Some(_), .. })
-                    | tessera_graph::Op::Delta(tessera_graph::Delta { state: Some(_), .. })
-            )
-        })
+        self.stateful
     }
 
     /// Runs resident steps through `grid` from now on.
@@ -427,6 +426,43 @@ impl Engine {
             *by.entry(step.kernel.name()).or_default() += step.launches().len();
         }
         by
+    }
+
+    /// Floats per tapped row, if drafts may rewind slots.
+    pub(crate) fn draft_taps(&self) -> Result<usize, Error> {
+        if self.stateful {
+            return Err(Error::Stateful);
+        }
+        self.taps.ok_or(Error::Taps)
+    }
+
+    /// Fast-path diagnostic report for a `rows`-row decode launch.
+    pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
+        let rows = rows.max(1);
+        let max_pos = self.context.saturating_sub(1);
+        let sample: Vec<Row> = (0..rows)
+            .map(|i| Row {
+                slot: (i % self.slots) as u32,
+                token: 0,
+                position: (i / self.slots).min(max_pos) as u32,
+            })
+            .collect();
+        let picks: Vec<u32> = (0..rows as u32).collect();
+        let (sizes, [filled, _]) = launch_of(&sample, &picks, self.slots, self.context);
+        let wants = match self.taps.is_some() {
+            true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
+            false => Wants::role(&self.graph, self.full, Role::Tokens),
+        };
+        let mut report = self.plans.explain(
+            &self.graph,
+            self.full,
+            wants,
+            &sizes,
+            &[Context, Segments],
+            &self.device,
+        )?;
+        report.label = format!("rows={filled}");
+        Ok(report)
     }
 
     /// Mask words per pick, if the graph takes masks.

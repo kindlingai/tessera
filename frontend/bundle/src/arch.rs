@@ -6,7 +6,7 @@ use crate::parts::{Cut, Part};
 use crate::{Overrides, Weights};
 use std::error::Error;
 use std::path::Path;
-use tessera_engine::{Graph, Pins, Steps};
+use tessera_engine::{Graph, Pins, PleConfig, Steps};
 
 pub(crate) use scattered_collect::declarative::{gather, scatter};
 
@@ -58,6 +58,9 @@ pub(crate) type Built = (Graph, Weights, Pins);
 /// Builds a graph for an `Ask`.
 type Build = fn(&Arch, &Ask) -> Result<Built>;
 
+/// The host n-gram table a step graph reads, if any.
+type Table = fn(&Ask) -> Result<Option<PleConfig>>;
+
 pub(crate) struct Arch {
     pub name: &'static str,
     pub spot: &'static [Spot],
@@ -68,6 +71,7 @@ pub(crate) struct Arch {
     pub forward: Option<Build>,
     pub part: Option<fn(&Arch, &Cut) -> Result<Part>>,
     pub embed: Option<Embeds>,
+    pub ple: Option<Table>,
 }
 
 impl Arch {
@@ -79,6 +83,7 @@ impl Arch {
         forward: None,
         part: None,
         embed: None,
+        ple: None,
     };
 
     /// The weight name rules, or none.

@@ -134,6 +134,44 @@ impl Needs {
             && (!self.tile || platform.tile().is_some())
             && (!self.bf16_tile || platform.bf16_tile().is_some())
     }
+
+    /// First unmet hardware requirement for `platform`, if any.
+    pub fn mismatch(&self, platform: &Platform) -> Option<String> {
+        let limits = &platform.limits;
+        if let Some(b) = Backend::named(&platform.backend)
+            && self.lacks.contains(&b)
+        {
+            return Some(format!("backend {} not supported", platform.backend));
+        }
+        if self.compiler && !limits.compiler {
+            return Some("requires kernel compiler".into());
+        }
+        if self.bf16_tile && platform.bf16_tile().is_none() {
+            return Some("requires bf16 tensor tiles".into());
+        }
+        if self.tile && platform.tile().is_none() {
+            return Some("requires matrix tiles".into());
+        }
+        if self.lanes != 0 && self.lanes != limits.lanes {
+            return Some(format!(
+                "requires {} lanes, device has {}",
+                self.lanes, limits.lanes
+            ));
+        }
+        if self.group_bytes > limits.group_bytes {
+            return Some(format!(
+                "shared memory {} B exceeds {} B limit",
+                self.group_bytes, limits.group_bytes
+            ));
+        }
+        if self.group_threads > limits.group_threads {
+            return Some(format!(
+                "group threads {} exceeds {} limit",
+                self.group_threads, limits.group_threads
+            ));
+        }
+        None
+    }
 }
 
 /// A kernel a plan can hold, share and compare.

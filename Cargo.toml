@@ -11,17 +11,12 @@ members = [
     "examples/recipes/*/model",
     "frontend/*",
     "tools/calibrate",
-    "tools/check",
-    "tools/findings",
     "tools/inspect",
-    "tools/lint",
     "tools/load",
     "tools/parity",
     "tools/publish",
     "tools/ranks",
     "tools/references",
-    "tools/shape",
-    "tools/style",
 ]
 
 [workspace.package]
@@ -38,7 +33,6 @@ tessera-codegen = { path = "engine/plan/codegen" }
 tessera-engine-comm = { path = "engine/plan/comm" }
 tessera-engine = { path = "engine/engine" }
 tessera-engine-settings = { path = "engine/settings" }
-tessera-findings = { path = "tools/findings" }
 tessera-frontend-comm = { path = "frontend/comm" }
 tessera-frontend-settings = { path = "frontend/settings" }
 tessera-dl = { path = "engine/gpu/dl" }
@@ -67,7 +61,6 @@ tessera-references = { path = "tools/references" }
 tessera-parity = { path = "tools/parity" }
 tessera-run = { path = "engine/plan/run" }
 tessera-serve = { path = "frontend/serve" }
-tessera-shape = { path = "tools/shape" }
 tessera-sim = { path = "engine/plan/sim" }
 tessera-work = { path = "engine/gpu/work" }
 tessera-tasks = { path = "frontend/tasks" }
@@ -88,3 +81,16 @@ opt-level = 3
 # Reference checks run whole models through the interpreter.
 [profile.dev.package.tessera-interp]
 opt-level = 3
+
+# Host JIT compilation and helpers run inside every CPU test.
+[profile.dev.package.tessera-jit]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 2
+
+[profile.dev.package.regalloc2]
+opt-level = 2

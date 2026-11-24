@@ -1,0 +1,5 @@
+# The example for one NVIDIA GPU. ../rocm changes it for AMD GPUs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml

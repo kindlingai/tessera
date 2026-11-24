@@ -30,8 +30,15 @@ fn widens_to_f32() {
     assert!(matches!(f.floats("c"), Err(Error::DType(_))));
     assert!(matches!(f.floats("d"), Err(Error::Missing(_))));
     let stored: Vec<Stored> = f.slices().iter().map(|s| s.stored).collect();
-    assert_eq!(stored, [Stored::F32, Stored::Bf16, Stored::Other]);
+    assert_eq!(stored, [Stored::F32, Stored::BF16, Stored::Other]);
     assert!(matches!(Offer::packed(&f, "a"), Err(Error::DType(_))));
+    assert_eq!(Offer::packed(&f, "b").unwrap(), [0x80, 0x3f, 0x00, 0xbf]);
+    assert_eq!(
+        Offer::packed_rows(&f, "b", (0, 1)).unwrap(),
+        [0x80, 0x3f, 0x00, 0xbf]
+    );
+    let opened = crate::open(&path, None).unwrap();
+    assert_eq!(opened.packed("b").unwrap(), [0x80, 0x3f, 0x00, 0xbf]);
     std::fs::remove_file(path).unwrap();
 }
 

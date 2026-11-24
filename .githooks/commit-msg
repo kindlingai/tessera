@@ -4,4 +4,4 @@
 . "$(dirname "$0")/worktree.sh"
 set -e
 tools/scripts/check-coauthors.sh --message "$1"
-cargo run -q -p tessera-check -- message "$1"
+tools/scripts/stickler.sh message "$1"

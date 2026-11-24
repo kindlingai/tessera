@@ -1,0 +1,14 @@
+[task.add-model]
+steps = [
+  { do = "implement", with = "tessera_trace::Weights", like = "engine/models/src/nanogpt.rs" },
+  { do = "define", with = "tessera_trace::declare", like = "tessera_models::nanogpt::program" },
+  { do = "list", at = "engine/models/src/lib.rs", like = "engine/models/src/nanogpt.rs" },
+  { do = "register", with = "tessera_models::preset::preset!", like = "engine/models/src/nanogpt.rs" },
+  { do = "register", with = "tessera_bundle::arch::arch!", like = "frontend/bundle/src/qwen35.rs" },
+  { do = "list", at = "frontend/bundle/src/lib.rs", like = "frontend/bundle/src/qwen35.rs" },
+  { do = "place", at = "frontend/bundle/names/*.json", like = "frontend/bundle/src/qwen35.rs" },
+  { do = "test", with = "tessera_parity::Spec", like = "tools/parity/tests/qwen35/mod.rs", via = "tessera_parity::suite!" },
+  { do = "list", at = "tools/parity/tests/parity.rs", like = "tools/parity/tests/qwen35/mod.rs" },
+  { do = "run", pkg = "tessera-parity", mode = "test" },
+]
+each = [{ of = "tessera_models::preset::PRESETS", has = "tessera_parity::Spec" }]

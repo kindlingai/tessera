@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs clippy, as CI does, on each crate that holds a staged file.
 # Markdown and files outside a crate do not count.
-# tools/simcheck is its own workspace, so it runs alone.
+# A crate with its own workspace runs alone.
 set -e
 cd "$(git rev-parse --show-toplevel)"
 dirs=$(git diff --cached --name-only | grep -v '\.md$' | while IFS= read -r path; do

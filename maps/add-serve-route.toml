@@ -1,0 +1,7 @@
+[task.add-serve-route]
+steps = [
+  { do = "list", at = "frontend/serve/src/lib.rs", like = "frontend/serve/src/decide.rs" },
+  { do = "define", with = "tessera_serve::decide::systemone", like = "tessera_serve::route" },
+  { do = "register", with = "tessera_engine::metric!", like = "frontend/serve/src/lib.rs" },
+  { do = "run", pkg = "tessera-serve", mode = "test" },
+]

@@ -2,17 +2,19 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{Stream, Weights, is_exlr8, numbered, pins};
+use crate::{Stream, Weights, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{File, Offer};
-use tessera_engine::qwen4_exp::{Config, LayerKind, Moe, RotatedMoe, program, stepper};
+use tessera_checkpoint::Offer;
+use tessera_engine::qwen4_exp::{Config, Moe, RotatedMoe, program, stepper};
+use tessera_engine::qwen35::Mixing;
 use tessera_engine::{Graph, Pins, PleConfig, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const CLASS: &str = "Qwen4ExpForConditionalGeneration";
+const LM: &str = "model.language_model";
 
 fn step(_: &Arch, ask: &Ask) -> Result<Built> {
     let release = open(
@@ -30,13 +32,13 @@ arch!(
     "qwen4_exp",
     [Spot::Type("qwen4_exp"), Spot::Class(CLASS)],
     step: step,
+    ple: ple,
 );
 
 /// Maps every `qwen4_exp` weight path to its HF tensor stem.
 pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
     let mut rules = Vec::new();
-    let lm = "model.language_model";
-    rules.push(("embed".into(), format!("{lm}.embed_tokens")));
+    rules.push(("embed".into(), format!("{LM}.embed_tokens")));
     rules.push(("head".into(), "lm_head".into()));
     for (f, s) in [
         ("norm", "hc_norm"),
@@ -45,11 +47,11 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
     ] {
         rules.push((
             format!("final_hc.{f}"),
-            format!("{lm}.hyper_connection_mixer.{s}"),
+            format!("{LM}.hyper_connection_mixer.{s}"),
         ));
     }
     for (i, kind) in c.layers.iter().enumerate() {
-        let at = format!("{lm}.layers.{i}");
+        let at = format!("{LM}.layers.{i}");
         if c.ple.is_some_and(|p| p.layer == i as u64) {
             for (f, s) in [
                 ("key_proj", "key_proj"),
@@ -76,7 +78,7 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
             }
         }
         match kind {
-            LayerKind::Linear => {
+            Mixing::Linear => {
                 for (f, s) in [
                     ("qkv", "in_proj_qkv"),
                     ("z", "in_proj_z"),
@@ -94,7 +96,7 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
                     ));
                 }
             }
-            LayerKind::Full => {
+            Mixing::Full => {
                 for (f, s) in [
                     ("q", "q_proj"),
                     ("k", "k_proj"),
@@ -178,20 +180,20 @@ fn open(
     step: Option<(&[Rule], Steps, &[u64])>,
 ) -> Result<Release> {
     let mut config = parse_config(json, sizes)?;
-    let exlr8 = is_exlr8(dir);
-    let mut rules = rules(&config, exlr8);
+    let offer = crate::offer(dir, manifest)?;
+    let rotated = crate::mla::has_rotated_experts(&offer.slices());
+    let mut rules = rules(&config, rotated);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
         config.stack.taps = taps.to_vec();
         rules.extend(user.iter().cloned());
     }
-    let graph = match (exlr8, step.is_some()) {
+    let graph = match (rotated, step.is_some()) {
         (true, true) => stepper::<RotatedMoe>(&config),
         (true, false) => program::<RotatedMoe>(&config),
         (false, true) => stepper::<Moe>(&config),
         (false, false) => program::<Moe>(&config),
     };
-    let offer = crate::offer(dir, manifest)?;
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {
         config,
@@ -207,42 +209,42 @@ struct PleMeta {
     dim: usize,
 }
 
-/// Reads PLE binary path and hash parameters from `dir`.
-pub(crate) fn ple_config(dir: &Path, ask: &Ask) -> Result<Option<PleConfig>> {
+/// The config's host PLE table and hash parameters, if any.
+fn ple(ask: &Ask) -> Result<Option<PleConfig>> {
     let cfg = parse_config(ask.json, ask.sizes)?;
     let Some(ple) = cfg.ple else {
         return Ok(None);
     };
-    let bin = dir.join(format!("ple/exlr8-ple-L{:03}.bin", ple.layer));
+    let stem = ask.dir.join(format!("ple/exlr8-ple-L{:03}", ple.layer));
+    let bin = stem.with_extension("bin");
     if !bin.is_file() {
         return Err(format!("missing PLE table {}", bin.display()).into());
     }
-    let meta_path = dir.join(format!("ple/exlr8-ple-L{:03}.json", ple.layer));
-    let row_dim = match std::fs::read_to_string(&meta_path) {
-        Ok(text) => serde_json::from_str::<PleMeta>(&text)?.dim,
-        Err(_) => (ple.dim as usize) / tessera_engine::ple_heads(),
+    let meta = stem.with_extension("json");
+    let row_dim = match std::fs::read_to_string(&meta) {
+        Ok(text) => {
+            serde_json::from_str::<PleMeta>(&text)
+                .map_err(|e| format!("{}: {e}", meta.display()))?
+                .dim
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ple.dim as usize / tessera_engine::ple_heads()
+        }
+        Err(e) => return Err(format!("{}: {e}", meta.display()).into()),
     };
-    let dense = dir.join("dense/exlr8-dense.safetensors");
-    let file = File::open(&dense)?;
-    let base = format!(
-        "model.language_model.layers.{}.ple.ple_embedding",
-        ple.layer
-    );
-    let mult = file.i64s(&format!("{base}.layer_multipliers"))?;
-    let offs = file.i64s(&format!("{base}.ngram_heads_offsets"))?;
-    let vs = file.i64s(&format!("{base}.ngram_heads_vocab_sizes"))?;
+    let offer = crate::offer(ask.dir, ask.manifest)?;
+    let base = format!("{LM}.layers.{}.ple.ple_embedding", ple.layer);
+    let read = |field: &str| offer.i64s(&format!("{base}.{field}"));
+    let fixed = |field: &str, v: Vec<i64>| format!("{field} has {} values", v.len());
     Ok(Some(PleConfig {
         path: bin,
         eos_token: cfg.eos_token,
-        multipliers: mult
-            .try_into()
-            .map_err(|_| "layer_multipliers must have 3 values")?,
-        offsets: offs
-            .try_into()
-            .map_err(|_| "ngram_heads_offsets must have 16 values")?,
-        vocab_sizes: vs
-            .try_into()
-            .map_err(|_| "ngram_heads_vocab_sizes must have 16 values")?,
+        multipliers: (read("layer_multipliers")?.try_into())
+            .map_err(|v| fixed("layer_multipliers", v))?,
+        offsets: (read("ngram_heads_offsets")?.try_into())
+            .map_err(|v| fixed("ngram_heads_offsets", v))?,
+        vocab_sizes: (read("ngram_heads_vocab_sizes")?.try_into())
+            .map_err(|v| fixed("ngram_heads_vocab_sizes", v))?,
         row_dim,
         cache_rows: PleConfig::DEFAULT_CACHE_ROWS,
     }))

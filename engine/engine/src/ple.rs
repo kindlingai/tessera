@@ -121,6 +121,8 @@ impl PleStore {
         let dim = self.cfg.row_dim;
         let mut out = vec![0.0f32; filled * width];
         let mut row_buf = vec![0.0f32; width];
+        // Repeats count only within one launch.
+        self.prev_pos.fill(u32::MAX);
         for (r, row) in rows.iter().enumerate() {
             let s = row.slot as usize;
             self.ensure_slot(s);
@@ -142,9 +144,11 @@ impl PleStore {
             self.prev_pos[s] = row.position;
             dst.copy_from_slice(&row_buf);
         }
-        let last_off = (rows.len() - 1) * width;
-        for r in rows.len()..filled {
-            out.copy_within(last_off..last_off + width, r * width);
+        if let Some(last) = rows.len().checked_sub(1) {
+            let last_off = last * width;
+            for r in rows.len()..filled {
+                out.copy_within(last_off..last_off + width, r * width);
+            }
         }
         Ok(Tensor::f32(vec![filled, width], out))
     }

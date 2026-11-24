@@ -1,15 +1,19 @@
 //! Device-accelerated trellis MMA, streaming decode GEMV, and small-batch matmul rules.
 
 mod gemv;
+pub(crate) mod mm;
 
 use crate::{Backend, Options, flatten};
-use gemv::propose_gemv;
+use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
-use tessera_graph::{Act, Op, Order, Stage, View};
+use tessera_graph::{Op, Order, Stage, View};
+use tessera_lower::Backend as LowerBackend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
+
+pub(crate) const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBackend::Rocm];
 
 const KERNEL: &str = include_str!("linear.cu");
 const BLOCK: usize = 128;
@@ -274,19 +278,41 @@ fn trellis_drafts(t: TrellisMma, x: T, w: T, suh: Option<T>, svh: Option<T>) -> 
     ]
 }
 
-fn trellis_kernel(tree: &Tree, x: T, w: T, turned: bool) -> Option<TrellisMma> {
-    let [n, k] = tree.node(w).shape[..] else {
-        return None;
-    };
+fn check_trellis(tree: &Tree, x: T, w: T, turned: bool) -> Option<Result<TrellisMma, String>> {
     let form = tree.node(w).form;
-    let (bits, book) = parse_trellis(form.name())?;
+    if !form.name().starts_with("trellis") {
+        return None;
+    }
+    let Some((bits, book)) = parse_trellis(form.name()) else {
+        return Some(Err(format!("unsupported trellis form {}", form.name())));
+    };
+    let [n, k] = tree.node(w).shape[..] else {
+        return Some(Err("trellis weight is not 2D".into()));
+    };
+    if !tree.leaf(w) {
+        return Some(Err("trellis weight is not a direct leaf".into()));
+    }
+    if !n.is_multiple_of(BLOCK) {
+        return Some(Err(format!(
+            "n={n} is not a multiple of {BLOCK} for trellis"
+        )));
+    }
+    if !k.is_multiple_of(BLOCK) {
+        return Some(Err(format!(
+            "k={k} is not a multiple of {BLOCK} for trellis"
+        )));
+    }
+    if tree.node(x).form.name() != "f32" {
+        return Some(Err(format!(
+            "input form {} (requires f32)",
+            tree.node(x).form.name()
+        )));
+    }
     let m = tree.elements(x) / k;
-    let ok = tree.leaf(w)
-        && n.is_multiple_of(BLOCK)
-        && k.is_multiple_of(BLOCK)
-        && m > 0
-        && tree.node(x).form.name() == "f32";
-    ok.then(|| TrellisMma {
+    if m == 0 {
+        return Some(Err("m=0".into()));
+    }
+    Some(Ok(TrellisMma {
         m,
         n,
         k,
@@ -295,19 +321,16 @@ fn trellis_kernel(tree: &Tree, x: T, w: T, turned: bool) -> Option<TrellisMma> {
         book,
         turned,
         form,
-    })
+    }))
 }
 
 /// Rotated or plain dense trellis matmul.
-fn propose_trellis(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let turn = Term::Stage(Stage::Hadamard {
         block: BLOCK as u32,
     });
     let mul = Term::Stage(Stage::Mul);
     let node = tree.node(at);
-    if node.form.name() != "f32" {
-        return None;
-    }
     if node.term == mul {
         let (back, svh) = (node.args[0], *node.args.get(1)?);
         let &[product] = step_args(tree, back, turn.clone())? else {
@@ -322,22 +345,53 @@ fn propose_trellis(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         let &[x, suh] = step_args(tree, scaled, mul)? else {
             return None;
         };
-        let kernel = trellis_kernel(tree, x, w, true)?;
-        let ok = tree.elements(suh) == kernel.k
-            && tree.elements(svh) == kernel.n
-            && tree.node(suh).form.name() == "f32"
-            && tree.node(svh).form.name() == "f32";
-        return ok.then(|| trellis_drafts(kernel, x, w, Some(suh), Some(svh)));
+        if node.form.name() != "f32" {
+            return Some(Err(format!(
+                "output form {} (requires f32)",
+                node.form.name()
+            )));
+        }
+        let kernel = match check_trellis(tree, x, w, true)? {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        if tree.elements(suh) != kernel.k || tree.elements(svh) != kernel.n {
+            return Some(Err("rotation scale length mismatch".into()));
+        }
+        if tree.node(suh).form.name() != "f32" || tree.node(svh).form.name() != "f32" {
+            return Some(Err("rotation scales must be f32".into()));
+        }
+        return Some(Ok(trellis_drafts(kernel, x, w, Some(suh), Some(svh))));
     }
     if node.term == Term::Op(Op::Matmul) {
         let (x, w) = (node.args[0], node.args[1]);
-        let kernel = trellis_kernel(tree, x, w, false)?;
-        return Some(trellis_drafts(kernel, x, w, None, None));
+        if !tree.node(w).form.name().starts_with("trellis") {
+            return None;
+        }
+        if node.form.name() != "f32" {
+            return Some(Err(format!(
+                "output form {} (requires f32)",
+                node.form.name()
+            )));
+        }
+        let kernel = match check_trellis(tree, x, w, false)? {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(trellis_drafts(kernel, x, w, None, None)));
     }
     None
 }
 
-fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
+fn propose_trellis(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    eval_trellis(tree, at)?.ok()
+}
+
+fn why_trellis(tree: &Tree, at: T) -> Option<String> {
+    eval_trellis(tree, at)?.err()
+}
+
+pub(crate) fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
     form.name() == "f32"
 }
 
@@ -347,19 +401,19 @@ fn cuda_needs(group_bytes: usize) -> Needs {
         group_bytes,
         group_threads: THREADS,
         compiler: true,
-        lacks: &[Backend::Metal, Backend::Rocm],
+        lacks: CUDA_LACKS,
         ..Needs::default()
     }
 }
 
-fn cuda_source_entry(entry: &'static str) -> Source {
+pub(super) fn cuda_source_entry(entry: &'static str) -> Source {
     Source::Fixed {
         text: ByBackend(["", cuda_source(), ""]),
         entry,
     }
 }
 
-fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
+pub(super) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
     match input {
         1 => form.name() == expected.name(),
         _ => form.name() == "f32",
@@ -481,15 +535,12 @@ fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(at);
-    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
+    if node.term != Term::Op(Op::Matmul) {
         return None;
     }
     let (x, mut w) = (node.args[0], node.args[1]);
-    if tree.node(x).form.name() != "f32" {
-        return None;
-    }
     let &[batches, n, k] = tree.node(w).shape.as_slice() else {
         return None;
     };
@@ -498,6 +549,18 @@ fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     };
     if xb != batches || xk != k || rows == 0 {
         return None;
+    }
+    if node.form.name() != "f32" {
+        return Some(Err(format!(
+            "output form {} (requires f32)",
+            node.form.name()
+        )));
+    }
+    if tree.node(x).form.name() != "f32" {
+        return Some(Err(format!(
+            "input form {} (requires f32)",
+            tree.node(x).form.name()
+        )));
     }
     let swapped = matches!(
         &tree.node(w).term,
@@ -508,35 +571,53 @@ fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let mut first_row = 0usize;
     if let Term::Op(Op::View(View::Slice { axis: 1, start, .. })) = &tree.node(w).term {
-        first_row = start.value(&tree.g.dims, &|d| tree.size(d))? as usize;
+        let Some(offset) = start.value(&tree.g.dims, &|d| tree.size(d)) else {
+            return Some(Err("slice start is dynamic".into()));
+        };
+        first_row = offset as usize;
         w = tree.node(w).args[0];
     }
     if !matches!(&tree.node(w).term, Term::Op(Op::View(View::Reshape(_)))) {
-        return None;
+        return Some(Err("weight is not a reshaped 2D leaf".into()));
     }
     let leaf = tree.node(w).args[0];
     let &[_, block_rows, width] = tree.node(w).shape.as_slice() else {
-        return None;
+        return Some(Err("reshaped weight is not 3D".into()));
     };
     let &[_, stored_w] = tree.node(leaf).shape.as_slice() else {
-        return None;
+        return Some(Err("weight leaf is not 2D".into()));
     };
     let form = tree.node(leaf).form;
-    if !tree.leaf(leaf) || stored_w != width || form.name() != "bf16" {
-        return None;
+    if !tree.leaf(leaf) {
+        return Some(Err("weight source is not a direct leaf".into()));
+    }
+    if stored_w != width {
+        return Some(Err(format!(
+            "weight width {stored_w} differs from view width {width}"
+        )));
+    }
+    if form.name() != "bf16" {
+        return Some(Err(format!("weight form {} (supports bf16)", form.name())));
     }
     let (block, first) = (block_rows * width, first_row * width);
     let align = if swapped { 4 } else { 8 };
-    let ok = block.is_multiple_of(align)
-        && first.is_multiple_of(align)
-        && width.is_multiple_of(align)
-        && if swapped {
-            n.is_multiple_of(BLOCK) && k <= 512
-        } else {
-            k.is_multiple_of(8)
-        };
-    if !ok {
-        return None;
+    if !block.is_multiple_of(align) || !first.is_multiple_of(align) || !width.is_multiple_of(align)
+    {
+        return Some(Err(format!(
+            "strides (width={width}, block={block}, first={first}) not multiple of {align}"
+        )));
+    }
+    if swapped {
+        if !n.is_multiple_of(BLOCK) {
+            return Some(Err(format!(
+                "n={n} is not a multiple of {BLOCK} for transposed stacked"
+            )));
+        }
+        if k > 512 {
+            return Some(Err(format!("k={k} exceeds max 512 for transposed stacked")));
+        }
+    } else if !k.is_multiple_of(8) {
+        return Some(Err(format!("k={k} is not a multiple of 8 for stacked")));
     }
     let len = batches * rows * n;
     let kernel = FastStacked {
@@ -551,319 +632,32 @@ fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         wide: swapped,
         form,
     };
-    Some(vec![Draft::new(kernel, [x, leaf], len)])
+    Some(Ok(vec![Draft::new(kernel, [x, leaf], len)]))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MmKind {
-    Bf16,
-    Bf16Split,
-    Mxfp8,
-    Mxfp8Wide,
-    Mxfp8Tall,
+fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    check_stacked(tree, at)?.ok()
 }
 
-impl MmKind {
-    fn name(self) -> &'static str {
-        match self {
-            MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => "fast_mm_mxfp8",
-        }
-    }
-
-    fn entry(self) -> &'static str {
-        match self {
-            MmKind::Bf16 => "tessera_mm_bf16",
-            MmKind::Bf16Split => "tessera_mm_bf16_ks2",
-            MmKind::Mxfp8 => "tessera_mm_mxfp8_r8",
-            MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
-            MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r32",
-        }
-    }
-
-    fn smem(self) -> usize {
-        match self {
-            MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Bf16Split => (4 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => 4 * 16 * 36 * 4,
-        }
-    }
-
-    fn grid(self, m: usize, n: usize) -> (usize, usize) {
-        match self {
-            MmKind::Bf16 => (n / 32, m.div_ceil(16)),
-            MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
-            MmKind::Mxfp8 => (n / 16, 1),
-            MmKind::Mxfp8Tall => (n / 16, m.div_ceil(32)),
-        }
-    }
-
-    fn step(self) -> f64 {
-        match self {
-            MmKind::Bf16 => 64.0,
-            MmKind::Bf16Split => 128.0,
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => 512.0,
-        }
-    }
+fn why_stacked(tree: &Tree, at: T) -> Option<String> {
+    check_stacked(tree, at)?.err()
 }
 
-/// Streaming BF16 and MXFP8 Tensor-Core small-batch matmul.
-#[derive(Clone, Copy, Debug, Kernel)]
-#[launch(
-    name = self.kind.name(),
-    sizes = [self.m, self.n, self.k],
-    work = self.m * self.n * self.k,
-    accepts = mm_accepts,
-    emits = f32_only,
-    needs = mm_needs(self),
-    order = Order::PerConfig,
-    source = cuda_source_entry(self.kind.entry()),
-    launches = mm_launches,
-    load = mm_load,
-    unproven,
-)]
-struct FastMm {
-    m: usize,
-    n: usize,
-    k: usize,
-    mode: u32,
-    kind: MmKind,
-    form: &'static dyn Stored,
-}
-
-fn mm_accepts(k: &FastMm, input: usize, form: &dyn Stored) -> bool {
-    weight_accepts(input, k.form, form)
-}
-
-fn mm_needs(k: &FastMm) -> Needs {
-    Needs {
-        lanes: 32,
-        group_bytes: k.kind.smem(),
-        group_threads: 128,
-        compiler: true,
-        lacks: &[Backend::Metal, Backend::Rocm],
-        bf16_tile: true,
-        ..Needs::default()
-    }
-}
-
-fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
-    let (across, down) = k.kind.grid(k.m, k.n);
-    let groups = across * down;
-    let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (4 * k.m * k.k) as f64];
-    if matches!(k.mode, 1 | 3 | 4) {
-        reads.push((4 * k.m * k.n) as f64);
-    } else if k.mode == 2 {
-        reads.push((4 * k.n) as f64);
-    }
-    let mut load = Load {
-        threads: groups * 128,
-        group: 128,
-        trips: k.k as f64 / k.kind.step(),
-        reads,
-        written: (4 * k.m * k.n) as f64,
-        flight: 1024.0,
-        ..Load::default()
-    };
-    load.trip.fresh = 1.0;
-    Some(load)
-}
-
-fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
-    let (across, down) = k.kind.grid(k.m, k.n);
-    let shape = Shape::Grid {
-        across,
-        down,
-        threads: 128,
-    };
-    let other = if matches!(k.mode, 1..=4) {
-        step.read(2)
-    } else {
-        step.read(0)
-    };
-    let args = vec![
-        step.read(0),
-        step.read(1),
-        other,
-        step.out(),
-        Arg::count(k.m),
-        Arg::count(k.n),
-        Arg::count(k.k),
-        Arg::value(&k.mode),
-    ];
-    vec![Launch { args, shape }]
-}
-
-struct MmSite {
-    x: T,
-    w: T,
-    m: usize,
-    n: usize,
-    k: usize,
-    kind: MmKind,
-    form: &'static dyn Stored,
-}
-
-impl MmSite {
-    fn draft(self, mode: u32, other: Option<T>) -> Vec<Draft> {
-        let kernel = FastMm {
-            m: self.m,
-            n: self.n,
-            k: self.k,
-            mode,
-            kind: self.kind,
-            form: self.form,
-        };
-        let mut reads = vec![self.x, self.w];
-        if let Some(extra) = other {
-            reads.push(extra);
-        }
-        vec![Draft::new(kernel, reads, self.m * self.n)]
-    }
-}
-
-fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
-    let node = tree.node(mat);
-    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
-        return None;
-    }
-    let (x, w) = (node.args[0], node.args[1]);
-    if !tree.leaf(w) || tree.node(x).form.name() != "f32" {
-        return None;
-    }
-    let [n, k] = tree.node(w).shape[..] else {
-        return None;
-    };
-    if n == 0 || k == 0 {
-        return None;
-    }
-    let elems = tree.elements(x);
-    if !elems.is_multiple_of(k) {
-        return None;
-    }
-    let m = elems / k;
-    if !(2..=64).contains(&m) {
-        return None;
-    }
-    let form = tree.node(w).form;
-    let kind = match form.name() {
-        "bf16"
-            if n.is_multiple_of(16)
-                && k.is_multiple_of(128)
-                && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < 144) =>
-        {
-            MmKind::Bf16Split
-        }
-        "bf16" if n.is_multiple_of(32) && k.is_multiple_of(64) => MmKind::Bf16,
-        "mxfp8" if n.is_multiple_of(16) && k.is_multiple_of(512) => {
-            if m <= 8 {
-                MmKind::Mxfp8
-            } else if m <= 16 {
-                MmKind::Mxfp8Wide
-            } else {
-                MmKind::Mxfp8Tall
-            }
-        }
-        _ => return None,
-    };
-    Some(MmSite {
-        x,
-        w,
-        m,
-        n,
-        k,
-        kind,
-        form,
-    })
-}
-
-fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Add) || node.form.name() != "f32" {
-        return None;
-    }
-    let (a, b) = (node.args[0], *node.args.get(1)?);
-    for (mat, add) in [(a, b), (b, a)] {
-        if mat == add || tree.root(mat) || tree.node(add).form.name() != "f32" {
-            continue;
-        }
-        let Some(site) = mm_site(tree, mat) else {
-            continue;
-        };
-        let add_node = tree.node(add);
-        let add_elems = tree.elements(add);
-        let mode = if add_elems == site.m * site.n && add_node.shape == node.shape {
-            1
-        } else if add_elems == site.n && add_node.shape.last() == Some(&site.n) {
-            2
-        } else {
-            continue;
-        };
-        return Some(site.draft(mode, Some(add)));
-    }
-    None
-}
-
-fn propose_mm_mul(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    let node = tree.node(at);
-    if node.term != Term::Stage(Stage::Mul) || node.form.name() != "f32" {
-        return None;
-    }
-    let (a, b) = (node.args[0], *node.args.get(1)?);
-    let silu = Term::Stage(Stage::Act(Act::Silu));
-    for (cand, other) in [(a, b), (b, a)] {
-        if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
-            continue;
-        }
-        let cnode = tree.node(cand);
-        if cnode.term != silu || cnode.form.name() != "f32" {
-            continue;
-        }
-        let mat = cnode.args[0];
-        if mat == other || tree.root(mat) {
-            continue;
-        }
-        let Some(site) = mm_site(tree, mat) else {
-            continue;
-        };
-        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            return Some(site.draft(3, Some(other)));
-        }
-    }
-    for (mat, other) in [(a, b), (b, a)] {
-        if mat == other || tree.root(mat) || tree.node(other).form.name() != "f32" {
-            continue;
-        }
-        let Some(site) = mm_site(tree, mat) else {
-            continue;
-        };
-        if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            return Some(site.draft(4, Some(other)));
-        }
-    }
-    None
-}
-
-pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if let Some(drafts) = propose_mm_add(tree, at) {
-        return Some(drafts);
-    }
-    if let Some(drafts) = propose_mm_mul(tree, at) {
-        return Some(drafts);
-    }
-    let node = tree.node(at);
-    if node.term == Term::Stage(Stage::Act(Act::Silu)) && node.form.name() == "f32" {
-        let mat = node.args[0];
-        if !tree.root(mat)
-            && let Some(site) = mm_site(tree, mat)
-        {
-            return Some(site.draft(5, None));
-        }
-    }
-    Some(mm_site(tree, at)?.draft(0, None))
-}
-
-tessera_lower::rule!("trellis_mma", propose_trellis);
-tessera_lower::rule!("fast_gemv", propose_gemv);
-tessera_lower::rule!("fast_mm", propose_mm);
-tessera_lower::rule!("fast_stacked", propose_stacked);
+tessera_lower::rule!(
+    "trellis_mma",
+    propose_trellis,
+    why = why_trellis,
+    lacks = CUDA_LACKS
+);
+tessera_lower::rule!(
+    "fast_gemv",
+    propose_gemv,
+    why = why_gemv,
+    lacks = CUDA_LACKS
+);
+tessera_lower::rule!(
+    "fast_stacked",
+    propose_stacked,
+    why = why_stacked,
+    lacks = CUDA_LACKS
+);
