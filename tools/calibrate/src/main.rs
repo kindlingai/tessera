@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 use tessera_calibrate::probe::{fit, links, read, suite};
 use tessera_calibrate::{Grid, headroom, judge};
-use tessera_calibrate::{bench, guided, plans};
+use tessera_calibrate::{bench, guided, kernels, plans};
 use tessera_lower::{Cluster, Device, Pick, Settings, Step};
 use tessera_sim::{Chip, known};
 
@@ -132,12 +132,14 @@ fn probe(settings: &Settings) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Times whole plans. Fails if a check misses.
-fn plans(settings: &Settings) -> Result<(), Box<dyn Error>> {
+type Check = fn(&Settings) -> Result<Vec<String>, tessera_engine::Error>;
+
+/// Runs `check` on the GPU. Fails if a check misses.
+fn gpu_check(settings: &Settings, check: Check) -> Result<(), Box<dyn Error>> {
     if settings.gpu().is_none() {
-        return Err("no GPU here; plans are timed on one".into());
+        return Err("no GPU here; this check runs on one".into());
     }
-    let misses = plans::check(settings)?;
+    let misses = check(settings)?;
     for miss in &misses {
         println!("miss: {miss}");
     }
@@ -184,7 +186,8 @@ fn main() -> ExitCode {
     match match args.first().map(String::as_str) {
         Some("bench") => marks(&settings, &args[1..]),
         Some("probe") => probe(&settings),
-        Some("plans") => plans(&settings),
+        Some("plans") => gpu_check(&settings, plans::check),
+        Some("kernels") => gpu_check(&settings, kernels::check_all),
         Some("watch") => tessera_calibrate::watch::watch(&settings, &args[1..]),
         Some("guided") => guided::report(
             &settings,

@@ -3,7 +3,7 @@
 use crate::{BURST, TRIES, choices, measure_with, pending, time_plans};
 use tessera_engine::{Error, trellis};
 use tessera_graph::DimName::{self, *};
-use tessera_lower::form::BF16_FORM;
+use tessera_lower::form::{BF16_FORM, Load};
 use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
@@ -144,20 +144,23 @@ pub(crate) fn opened(
         // Releases write trellis codes. Here they are noise.
         let loaded = runner.plan().weights.iter().find(|l| l.weight == at);
         match loaded.map(|l| l.slot.form).filter(|f| !f.packs()) {
-            Some(form) => {
-                let [inp, out] = [2, 1].map(|end| data.shape[data.shape.len() - end]);
-                let side = trellis::INPUT_SIDE;
-                let head = trellis::packed(inp, out, side, &[]).len();
-                let len = form.bytes(data.len()) - head;
-                let codes: Vec<u8> = (0..len)
-                    .map(|_| (noise.draw() * 127.0) as i8 as u8)
-                    .collect();
-                runner.load_packed(at, &trellis::packed(inp, out, side, &codes))?;
-            }
+            Some(form) => runner.load_packed(at, &codes(form, &data, noise))?,
             None => runner.load(at, data.view())?,
         }
     }
     Ok(runner)
+}
+
+/// Noise trellis codes for a weight shaped as `data`.
+pub(crate) fn codes(form: &dyn Load, data: &Tensor, noise: &mut Noise) -> Vec<u8> {
+    let [inp, out] = [1, 2].map(|end| data.shape[data.shape.len() - end]);
+    let side = trellis::INPUT_SIDE;
+    let head = trellis::packed(inp, out, side, &[]).len();
+    let len = form.bytes(data.len()) - head;
+    let codes: Vec<u8> = (0..len)
+        .map(|_| (noise.draw() * 127.0) as i8 as u8)
+        .collect();
+    trellis::packed(inp, out, side, &codes)
 }
 
 impl Grid {

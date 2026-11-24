@@ -3,6 +3,7 @@
 pub mod bench;
 mod grid;
 pub mod guided;
+pub mod kernels;
 pub mod plans;
 pub mod probe;
 pub mod watch;
