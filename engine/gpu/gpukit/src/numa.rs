@@ -28,7 +28,7 @@ pub(crate) fn pci_bdf(raw: &str) -> Option<String> {
     Some(format!("{dom:04x}:{bus:02x}:{dev:02x}.{func:x}"))
 }
 
-/// Parses a sysfs `numa_node` file. Negative values mean no node.
+/// Parses a sysfs `numa_node` file. Negative values return `None`.
 pub(crate) fn parse_node(text: &str) -> Option<u32> {
     let value: i32 = text.trim().parse().ok()?;
     u32::try_from(value).ok()
