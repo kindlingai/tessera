@@ -4,8 +4,9 @@ use crate::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::time::Duration;
+use tessera_testkit::{TCP_TIMEOUT, tcp_pair};
 
 #[test]
 fn rank_order() {
@@ -72,9 +73,7 @@ fn rounds<T: Transport + Send>(ranks: Vec<T>) {
 fn connected() -> Vec<Vec<Option<TcpStream>>> {
     let mut peers: Vec<Vec<Option<TcpStream>>> = (0..3).map(|_| vec![None, None, None]).collect();
     for (a, b) in [(0, 1), (0, 2), (1, 2)] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let caller = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (answer, _) = listener.accept().unwrap();
+        let (caller, answer) = tcp_pair().unwrap();
         peers[a][b] = Some(caller);
         peers[b][a] = Some(answer);
     }
@@ -105,11 +104,10 @@ fn memory_exchange() {
 
 #[test]
 fn socket_link_exchange() {
-    let wait = std::time::Duration::from_secs(10);
     let regions = exchange_regions(3, 64);
     let link = |(r, peers)| SocketLink::over(r as u32, peers, &regions).unwrap();
     let links = connected().into_iter().enumerate().map(link);
-    rounds(links.map(|l| Blocking::new(l, 64, wait)).collect());
+    rounds(links.map(|l| Blocking::new(l, 64, TCP_TIMEOUT)).collect());
 }
 
 #[test]
@@ -126,7 +124,7 @@ fn socket_link_bad_frames() {
         if close {
             drop(raw);
         }
-        let failed = (0..10_000).find_map(|_| {
+        let failed = (0..2_000).find_map(|_| {
             std::thread::sleep(Duration::from_millis(1));
             link.poll(&mut Vec::new()).err()
         });
@@ -168,6 +166,10 @@ fn socket_link_reset_drains() {
         runs.into_iter().map(|t| t.join().unwrap()).collect()
     });
     assert_eq!(landed, [vec![2; 4096], vec![1; 4096]]);
+    let (a, b) = tcp_pair().unwrap();
+    let mut lone = SocketLink::over(0, vec![None, Some(a)], &[64]).unwrap();
+    drop(b);
+    assert!(matches!(lone.reset(), Err(Error::Link(_))));
 }
 
 #[test]

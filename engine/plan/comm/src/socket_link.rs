@@ -246,6 +246,14 @@ impl Link for SocketLink {
             }
             self.flush()?;
             self.receive()?;
+            for (p, w) in self.peers.iter().zip(&want) {
+                if let (Some(p), Some(w)) = (p, w)
+                    && p.closed
+                    && p.acks < *w
+                {
+                    return Err(Error::Link("a peer closed before acking reset".into()));
+                }
+            }
             std::thread::yield_now();
         }
         self.flush()?;

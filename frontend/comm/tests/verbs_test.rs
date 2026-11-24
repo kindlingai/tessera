@@ -2,8 +2,10 @@
 
 use std::net::TcpListener;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tessera_engine::comm::{Blocking, Fabric, Port, Transport, Verbs, VerbsLink, exchange_regions};
-use tessera_frontend_comm::{ports, sockets};
+use tessera_frontend_comm::{ports, sockets_within};
+use tessera_testkit::{TCP_TIMEOUT, tcp_bind, tcp_pair};
 
 /// The ports `TESSERA_VERBS` names, or none to skip.
 fn lanes() -> Option<Vec<Port>> {
@@ -12,18 +14,25 @@ fn lanes() -> Option<Vec<Port>> {
 
 /// Three rounds on threads, over `Blocking<VerbsLink>` if `link`.
 fn rounds(fabric: &Fabric, ranks: u32, link: bool) {
-    let listeners: Vec<TcpListener> = (0..ranks)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
+    tcp_pair().unwrap();
+    let listeners: Vec<TcpListener> = (0..ranks).map(|_| tcp_bind().unwrap()).collect();
     let addrs: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
     let listeners: Vec<_> = listeners.into_iter().map(Mutex::new).collect();
+    let abort = AtomicBool::new(false);
     let seen: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
         let runs: Vec<_> = (0..ranks)
             .map(|r| {
-                let (listeners, addrs, fabric) = (&listeners, &addrs, fabric);
+                let (listeners, addrs, fabric, abort) = (&listeners, &addrs, fabric, &abort);
                 s.spawn(move || {
                     let listener = listeners[r as usize].lock().unwrap().try_clone().unwrap();
-                    let mut boot = sockets(r, listener, addrs).unwrap();
+                    let mut boot =
+                        match sockets_within(r, listener, addrs, TCP_TIMEOUT, Some(abort)) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                abort.store(true, Ordering::Release);
+                                panic!("rank {r} failed to join: {e}");
+                            }
+                        };
                     let cap = 1 << 16;
                     let mut t: Box<dyn Transport> = match link {
                         false => {
