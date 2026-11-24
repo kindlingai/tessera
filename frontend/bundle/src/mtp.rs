@@ -1,8 +1,9 @@
 //! Native MTP speculative bundle: tapped MLA target plus MTP layer.
 
+use crate::dflash::packing;
 use crate::mla::{self, attn_rules, moe_rules};
 use crate::names::Rule;
-use crate::{Bundle, Overrides, is_exlr8, load_tapped, offer};
+use crate::{Bundle, Overrides, Stream, Weights, is_exlr8, load_tapped, offer};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Stored};
@@ -14,7 +15,7 @@ use tessera_engine::{DimExpr, Graph, PathSeg, Pins, Steps, Weight};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Streamed MTP weights, cut per rank on load.
-pub struct MtpWeights {
+pub(crate) struct MtpWeights {
     pub(crate) graph: Graph,
     pub(crate) offer: Box<dyn Offer>,
     pub(crate) rules: Vec<Rule>,
@@ -51,40 +52,14 @@ pub(crate) fn mtp_pins(graph: &Graph, offer: &dyn Offer, rules: &[&[Rule]]) -> R
     Ok(crate::gguf::pins(graph, &forms, 1))
 }
 
-impl MtpWeights {
-    /// Each weight in graph order, sliced to `shares`.
-    pub fn each_share<E: Into<Box<dyn Error + Send + Sync>>>(
+impl Stream for MtpWeights {
+    fn stream(
         &self,
-        shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
-        mut take: impl FnMut(u32, &Weight) -> std::result::Result<(), E>,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
-        let mxfp8 = named("mxfp8");
-        let mut at = 0u32;
-        crate::each(
-            &self.graph,
-            &*self.offer,
-            &[&self.rules],
-            &shares,
-            |w, _| {
-                let weight = &self.graph.weights[at as usize];
-                let packed = (self.pins.form(&weight.path).name() == "mxfp8")
-                    .then(|| {
-                        let (Some(form), Weight::Packed(src, bytes)) = (mxfp8, &w) else {
-                            return None;
-                        };
-                        let shape = (src.name() == "bf16")
-                            .then(|| head_shape(&self.graph, &weight.path, &weight.ty.shape.0))??;
-                        Some(Weight::Packed(
-                            form,
-                            crate::dflash::bf16_to_mxfp8(bytes, shape, shares(at), form),
-                        ))
-                    })
-                    .flatten();
-                take(at, packed.as_ref().unwrap_or(&w)).map_err(Into::into)?;
-                at += 1;
-                Ok(())
-            },
-        )
+        let (g, offer, rules) = (&self.graph, &*self.offer, &self.rules[..]);
+        packing(g, offer, rules, &self.pins, head_shape, shares, take)
     }
 }
 
@@ -92,7 +67,7 @@ impl MtpWeights {
 pub struct Mtp {
     pub target: Bundle,
     pub graph: Graph,
-    pub weights: MtpWeights,
+    pub weights: Weights,
     pub pins: Pins,
     pub layer: u64,
 }
@@ -159,12 +134,12 @@ pub fn load(
         manifest,
         &tap,
     )?;
-    let weights = MtpWeights {
+    let weights = Weights::Streamed(Box::new(MtpWeights {
         graph: graph.clone(),
         offer,
         rules: all_rules,
         pins: mtp_pins.clone(),
-    };
+    }));
     Ok(Mtp {
         target,
         graph,

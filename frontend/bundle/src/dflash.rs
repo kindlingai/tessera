@@ -1,7 +1,7 @@
 //! DFlash speculative bundle: tapped target plus cached drafter.
 
 use crate::names::Rule;
-use crate::{Bundle, Overrides, load_tapped, offer};
+use crate::{Bundle, Overrides, Stream, Weights, load_tapped, numbered, offer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
@@ -13,7 +13,7 @@ use tessera_engine::{DimExpr, Graph, Norm, PathSeg, Pins, Steps, Weight};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Streamed drafter weights, cut per rank on load.
-pub struct DraftWeights {
+pub(crate) struct DraftWeights {
     graph: Graph,
     draft: Shards,
     target: Box<dyn Offer>,
@@ -21,33 +21,49 @@ pub struct DraftWeights {
     pins: Pins,
 }
 
-impl DraftWeights {
-    /// Each weight in graph order, sliced to `shares`.
-    pub fn each_share<E: Into<Box<dyn Error + Send + Sync>>>(
+impl Stream for DraftWeights {
+    fn stream(
         &self,
-        shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
-        mut take: impl FnMut(u32, &Weight) -> std::result::Result<(), E>,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
         let combined = Overlay::new(&self.draft, self.target.as_ref());
-        let mxfp8 = named("mxfp8");
-        let mut at = 0u32;
-        crate::each(&self.graph, &combined, &[&self.rules], &shares, |w, _| {
-            let weight = &self.graph.weights[at as usize];
-            let want_mx = self.pins.form(&weight.path).name() == "mxfp8";
-            if want_mx
-                && let (Some(form), Weight::Packed(src, bytes)) = (mxfp8, &w)
-                && src.name() == "bf16"
-                && let Some(shape) = fixed_2d(&self.graph, &weight.ty.shape.0)
-            {
-                let packed = bf16_to_mxfp8(bytes, shape, shares(at), form);
-                take(at, &Weight::Packed(form, packed)).map_err(Into::into)?;
-            } else {
-                take(at, &w).map_err(Into::into)?;
-            }
-            at += 1;
-            Ok(())
-        })
+        let shape = |g: &Graph, _: &[PathSeg], s: &[DimExpr]| fixed_2d(g, s);
+        let (g, rules, pins) = (&self.graph, &self.rules[..], &self.pins);
+        packing(g, &combined, rules, pins, shape, shares, take)
     }
+}
+
+/// Fixed 2D size of a weight that may pack.
+pub(crate) type Shape = fn(&Graph, &[PathSeg], &[DimExpr]) -> Option<[usize; 2]>;
+
+/// As `numbered`, packing pinned BF16 weights that `shape` sizes.
+pub(crate) fn packing(
+    graph: &Graph,
+    offer: &dyn Offer,
+    rules: &[Rule],
+    pins: &Pins,
+    shape: Shape,
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+    take: &mut dyn FnMut(u32, Weight) -> Result<()>,
+) -> Result<()> {
+    let mxfp8 = named("mxfp8");
+    numbered(graph, offer, &[rules], shares, &mut |at, w| {
+        let weight = &graph.weights[at as usize];
+        let packed = if pins.form(&weight.path).name() == "mxfp8"
+            && let (Some(form), Weight::Packed(src, bytes)) = (mxfp8, &w)
+            && src.name() == "bf16"
+            && let Some(dims) = shape(graph, &weight.path, &weight.ty.shape.0)
+        {
+            Some(Weight::Packed(
+                form,
+                bf16_to_mxfp8(bytes, dims, shares(at), form),
+            ))
+        } else {
+            None
+        };
+        take(at, packed.unwrap_or(w))
+    })
 }
 
 fn fixed_2d(graph: &Graph, shape: &[DimExpr]) -> Option<[usize; 2]> {
@@ -160,7 +176,7 @@ pub(crate) fn bf16_to_mxfp8(
 pub struct DFlash {
     pub target: Bundle,
     pub graph: Graph,
-    pub weights: DraftWeights,
+    pub weights: Weights,
     pub pins: Pins,
     pub block: usize,
     pub mask_token: u32,
@@ -448,13 +464,13 @@ pub fn load(
             config.quant,
         )?
     };
-    let weights = DraftWeights {
+    let weights = Weights::Streamed(Box::new(DraftWeights {
         graph: graph.clone(),
         draft: draft_offer,
         target: target_offer,
         rules,
         pins: draft_pins.clone(),
-    };
+    }));
     Ok(DFlash {
         target,
         graph,
