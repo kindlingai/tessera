@@ -1,5 +1,6 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
+use crate::exlr8_experts as experts;
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored, narrow};
 use std::cell::RefCell;
@@ -50,7 +51,7 @@ fn e4m3(bits: u8) -> f32 {
 }
 
 /// Tensor `stem` in a known codebook, and that codebook.
-fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
+pub(crate) fn coded(f: &File, stem: &str) -> Result<(String, Codebook), Error> {
     for book in Codebook::ALL {
         let tensor = format!("{stem}{}", book.suffix());
         if f.shape(&tensor).is_some() {
@@ -220,7 +221,7 @@ pub struct Release {
     files: RefCell<HashMap<String, File>>,
     /// GLM's and later layouts: layer files under `dense/`.
     dense: Option<Dense>,
-    /// The trellis width GLM's routed experts load at.
+    /// Fallback trellis width for routed experts without a manifest.
     width: u32,
 }
 
@@ -237,6 +238,8 @@ struct Dense {
     extras: Vec<String>,
     /// The manifest's width for each `(layer, matrix)` stored at several.
     widths: HashMap<(usize, String), u32>,
+    /// The manifest's expert widths, by layer and projection.
+    experts: experts::Widths,
 }
 
 impl Dense {
@@ -371,6 +374,7 @@ impl Release {
             vocab,
             extras,
             widths: HashMap::new(),
+            experts: experts::Widths::default(),
         })
     }
 
@@ -397,7 +401,7 @@ impl Release {
         out
     }
 
-    /// Dense matrices at the widths manifest `name` picks.
+    /// Matrices and experts at the widths manifest `name` picks.
     pub fn manifest(mut self, name: &str) -> Result<Self, Error> {
         let Where::Dir(dir) = &self.at else {
             return Err(Error::Missing(format!(
@@ -427,6 +431,8 @@ impl Release {
             .dense
             .as_mut()
             .ok_or_else(|| bad("no dense/ files".into()))?;
+        dense.widths.clear();
+        dense.experts.clear();
         let layers = m["dense"].as_object().cloned().unwrap_or_default();
         for (layer, matrices) in layers {
             let layer: usize = layer.parse().map_err(|_| bad(format!("layer {layer}")))?;
@@ -437,13 +443,49 @@ impl Release {
                 dense.widths.insert((layer, matrix), k as u32);
             }
         }
+        dense.experts.parse(&m["layers"]).map_err(bad)?;
         Ok(self)
     }
 
-    /// GLM's routed experts at `k` bits: 2, 3 or 4.
+    /// Fallback trellis width for routed experts without a manifest.
     pub fn width(mut self, k: u32) -> Self {
         self.width = k;
         self
+    }
+
+    /// Trellis width for one layer's expert projection.
+    fn expert_width(&self, layer: usize, shared: bool, proj: experts::Proj) -> u32 {
+        match &self.dense {
+            Some(d) => d.experts.get(layer, shared, proj, self.width),
+            None if shared => experts::shared_width(self.width),
+            None => self.width,
+        }
+    }
+
+    /// Trellis forms for one routed layer's projections.
+    fn expert_forms(&self, layer: usize) -> Option<experts::Forms> {
+        let mut routed = Vec::with_capacity(3);
+        let mut shared = Vec::with_capacity(3);
+        for p in experts::Proj::ALL {
+            let kr = self.expert_width(layer, false, p);
+            let ks = self.expert_width(layer, true, p);
+            let rbook = self
+                .with(&experts::codes_file(layer, kr), |f| {
+                    experts::codebook(f, false, p)
+                })
+                .ok()?;
+            let sbook = self
+                .with(&experts::codes_file(layer, ks), |f| {
+                    experts::codebook(f, true, p)
+                })
+                .ok()?;
+            routed.push(trellis::form_for(kr, rbook)?);
+            shared.push(trellis::turned_for(ks, sbook)?);
+        }
+        Some(experts::Forms {
+            routed: routed.try_into().ok()?,
+            shared: shared.try_into().ok()?,
+        })
     }
 
     /// Packed expert codes, optionally sliced along an axis.
@@ -453,12 +495,12 @@ impl Release {
         local: &str,
         slice: Option<(u32, usize, usize)>,
     ) -> Result<Vec<u8>, Error> {
-        let k = self.width;
+        let (shared, proj) = experts::target(local).ok_or_else(|| Error::Missing(local.into()))?;
+        let width = self.expert_width(layer, shared, proj);
+        let gate_k = self.expert_width(layer, false, experts::Proj::Gate);
         let sizes = self.with(&experts::index_file(layer), |f| {
-            experts::sizes(f, k).ok_or_else(|| Error::Missing(local.into()))
+            experts::sizes(f, gate_k).ok_or_else(|| Error::Missing(local.into()))
         })?;
-        let shared = local.starts_with("shared_experts.");
-        let width = if shared { experts::shared_width(k) } else { k };
         let file = experts::codes_file(layer, width);
         let slice = slice.filter(|_| !shared);
         let read = |f: &File| experts::packed(f, local, sizes, width, slice);
@@ -468,7 +510,7 @@ impl Release {
             let index = experts::index_file(layer);
             for end in ["suh", "svh"] {
                 let name = format!("{stem}.{end}");
-                let v = self.with(&index, |f| experts::floats(f, &name, k))?;
+                let v = self.with(&index, |f| experts::floats(f, &name, width))?;
                 bytes.extend(v.iter().flat_map(|x| F16::from(*x).0.to_le_bytes()));
             }
         }
@@ -533,7 +575,9 @@ impl Release {
     /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.
     pub fn read(&self, name: &str) -> Result<Vec<f32>, Error> {
         if let Some((layer, local)) = experts::split(name).filter(|_| self.dense.is_some()) {
-            let k = self.width;
+            let k = experts::target(local)
+                .map(|(shared, proj)| self.expert_width(layer, shared, proj))
+                .unwrap_or(self.width);
             return self.with(&experts::index_file(layer), |f| {
                 experts::floats(f, local, k)
             });
@@ -727,7 +771,7 @@ impl Offer for Release {
         if self.dense.is_none() {
             return out;
         }
-        // GLM's routed layers keep their experts apart.
+        // Routed layers keep their experts apart.
         for layer in 0.. {
             if self
                 .with(&format!("dense/exlr8-dense-{layer:03}"), |_| Ok(()))
@@ -735,15 +779,15 @@ impl Offer for Release {
             {
                 break;
             }
-            let k = self.width;
-            let book = |w| self.with(&experts::codes_file(layer, w), experts::codebook);
-            let (Ok(routed), Ok(shared)) = (book(k), book(experts::shared_width(k))) else {
+            let index = experts::index_file(layer);
+            if self.with(&index, |_| Ok(())).is_err() {
+                continue;
+            }
+            let Some(forms) = self.expert_forms(layer) else {
                 continue;
             };
-            let index = experts::index_file(layer);
-            let found = self.with(&index, |f| {
-                Ok(experts::offered(f, layer, k, [routed, shared]))
-            });
+            let gate_k = self.expert_width(layer, false, experts::Proj::Gate);
+            let found = self.with(&index, |f| Ok(experts::offered(f, layer, gate_k, forms)));
             out.extend(found.unwrap_or_default());
         }
         out
@@ -797,200 +841,5 @@ impl Offer for Release {
             .starts_with("experts.")
             .then_some((axis, range.0, range.1));
         self.expert_codes(layer, local, slice)
-    }
-}
-
-/// GLM's routed and shared experts at one trellis width.
-mod experts {
-    use super::{Codebook, Error, File, Slice, Stored, trellis};
-
-    /// Channels one rotation block scale covers.
-    const BLOCK: usize = 128;
-
-    /// A layer's index file: side data for every width.
-    pub(crate) fn index_file(layer: usize) -> String {
-        format!("experts/exlr8-layer-{layer:03}.index")
-    }
-
-    /// A layer's trellis codes at width `k`.
-    pub(crate) fn codes_file(layer: usize, k: u32) -> String {
-        format!("experts/exlr8-layer-{layer:03}.k{k}")
-    }
-
-    /// The shared expert has no K2 codes.
-    pub(crate) fn shared_width(k: u32) -> u32 {
-        k.max(3)
-    }
-
-    /// A layer and its expert name, under the layer's MLP.
-    pub(crate) fn split(name: &str) -> Option<(usize, &str)> {
-        let rest = name.strip_prefix("model.layers.")?;
-        let (layer, local) = rest.split_once('.')?;
-        let local = local.strip_prefix("mlp.")?;
-        let ours = local.starts_with("experts.") || local.starts_with("shared_experts.");
-        ours.then_some((layer.parse().ok()?, local))
-    }
-
-    /// Hidden width, expert count and expert width, from the index.
-    pub(crate) fn sizes(idx: &File, k: u32) -> Option<[usize; 3]> {
-        let hidden = idx.shape("signs.in")?[0];
-        let &[experts, ffn] = idx.shape(&format!("k{k}.gate.svh"))? else {
-            return None;
-        };
-        Some([hidden, experts, ffn])
-    }
-
-    /// A codes file's codebook, from its tensor names.
-    pub(crate) fn codebook(codes: &File) -> Result<Codebook, Error> {
-        Ok(super::coded(codes, "trellis.gate")?.1)
-    }
-
-    /// The layer's slices: codes as trellis sets, rotations as floats.
-    pub(crate) fn offered(
-        idx: &File,
-        layer: usize,
-        k: u32,
-        [routed, shared]: [Codebook; 2],
-    ) -> Vec<Slice> {
-        let (Some([hidden, experts, ffn]), Some(routed), Some(shared)) = (
-            sizes(idx, k),
-            trellis::form_for(k, routed),
-            trellis::turned_for(shared_width(k), shared),
-        ) else {
-            return Vec::new();
-        };
-        let at = format!("model.layers.{layer}.mlp.");
-        let slice = |name: String, shape: Vec<usize>, stored| Slice {
-            name: format!("{at}{name}"),
-            shape,
-            stored,
-        };
-        let mut out = Vec::new();
-        for (p, shape) in [
-            ("gate", [ffn, hidden]),
-            ("up", [ffn, hidden]),
-            ("down", [hidden, ffn]),
-        ] {
-            let [rows, cols] = shape;
-            let set = vec![experts, rows, cols];
-            out.push(slice(
-                format!("experts.{p}.weight"),
-                set,
-                Stored::Form(routed),
-            ));
-            let (into, from) = (format!("experts.{p}.su"), format!("experts.{p}.sv"));
-            out.push(slice(into, vec![experts, cols], Stored::F32));
-            out.push(slice(from, vec![experts, rows], Stored::F32));
-            let stem = format!("shared_experts.{p}_proj");
-            out.push(slice(
-                format!("{stem}.weight"),
-                vec![rows, cols],
-                Stored::Form(shared),
-            ));
-        }
-        for side in ["signs_in", "signs_out"] {
-            out.push(slice(format!("experts.{side}"), vec![hidden], Stored::F32));
-        }
-        out
-    }
-
-    /// Each value repeated over its block of channels.
-    fn repeated(values: &[f32]) -> Vec<f32> {
-        values.iter().flat_map(|v| [*v; BLOCK]).collect()
-    }
-
-    /// The layer's signs, as floats.
-    fn signs(idx: &File, which: &str) -> Result<Vec<f32>, Error> {
-        let bytes = idx.bytes(&format!("signs.{which}"))?;
-        Ok(bytes.iter().map(|b| f32::from(*b as i8)).collect())
-    }
-
-    /// A rotation table or vector, from the index file.
-    pub(crate) fn floats(idx: &File, local: &str, k: u32) -> Result<Vec<f32>, Error> {
-        let half = |name: String| idx.floats(&name);
-        let signed = |which: &str, v: Vec<f32>| -> Result<Vec<f32>, Error> {
-            let s = signs(idx, which)?;
-            Ok(v.iter().zip(s).map(|(a, b)| a * b).collect())
-        };
-        let ks = shared_width(k);
-        match local {
-            "experts.signs_in" => signs(idx, "in"),
-            "experts.signs_out" => signs(idx, "out"),
-            "experts.gate.su" | "experts.up.su" => {
-                let p = &local["experts.".len()..local.len() - 3];
-                Ok(repeated(&half(format!("k{k}.{p}.su_block"))?))
-            }
-            "experts.gate.sv" | "experts.up.sv" => {
-                let p = &local["experts.".len()..local.len() - 3];
-                half(format!("k{k}.{p}.svh"))
-            }
-            "experts.down.su" => half(format!("k{k}.down.suh")),
-            "experts.down.sv" => Ok(repeated(&half(format!("k{k}.down.sv_block"))?)),
-            "shared_experts.gate_proj.suh" | "shared_experts.up_proj.suh" => {
-                let p = &local["shared_experts.".len()..local.len() - "_proj.suh".len()];
-                let block = repeated(&half(format!("shared.k{ks}.{p}.su_block"))?);
-                signed("in", block)
-            }
-            "shared_experts.gate_proj.svh" | "shared_experts.up_proj.svh" => {
-                let p = &local["shared_experts.".len()..local.len() - "_proj.svh".len()];
-                half(format!("shared.k{ks}.{p}.svh"))
-            }
-            "shared_experts.down_proj.suh" => half(format!("shared.k{ks}.down.suh")),
-            "shared_experts.down_proj.svh" => {
-                let block = repeated(&half(format!("shared.k{ks}.down.sv_block"))?);
-                signed("out", block)
-            }
-            _ => Err(Error::Missing(local.into())),
-        }
-    }
-
-    /// A set or shared matrix as `k`-bit trellis codes.
-    pub(crate) fn packed(
-        codes: &File,
-        local: &str,
-        [hidden, experts, ffn]: [usize; 3],
-        k: u32,
-        slice: Option<(u32, usize, usize)>,
-    ) -> Result<Vec<u8>, Error> {
-        let missing = || Error::Missing(local.into());
-        let (tensor, p) = match local.strip_prefix("shared_experts.") {
-            Some(rest) => (true, rest.strip_suffix("_proj.weight").ok_or_else(missing)?),
-            None => {
-                let rest = local.strip_prefix("experts.").ok_or_else(missing)?;
-                (false, rest.strip_suffix(".weight").ok_or_else(missing)?)
-            }
-        };
-        let suffix = codebook(codes)?.suffix();
-        let head = if tensor { "shared." } else { "" };
-        let name = format!("{head}trellis.{p}{suffix}");
-        let matrix = (hidden * ffn * k as usize / 8) as u64;
-        let inner = if p == "down" { 2 } else { 1 };
-        let (entries, ffn_out) = match slice {
-            Some((0, f, c)) => {
-                let (at, n) = (f as u64 * matrix, c as u64 * matrix);
-                (codes.bytes_at(&name, at, Some(n))?, ffn)
-            }
-            Some((ax, f, c))
-                if ax == inner && f.is_multiple_of(BLOCK) && c.is_multiple_of(BLOCK) =>
-            {
-                let entry = (hidden * BLOCK * k as usize / 8) as u64;
-                let (off, take) = ((f / BLOCK) as u64 * entry, (c / BLOCK) as u64 * entry);
-                let mut buf = Vec::with_capacity(experts * take as usize);
-                for m in 0..experts {
-                    let at = m as u64 * matrix + off;
-                    buf.extend_from_slice(&codes.bytes_at(&name, at, Some(take))?);
-                }
-                (buf, c)
-            }
-            _ => (codes.bytes(&name)?, ffn),
-        };
-        let per = hidden * ffn_out * k as usize / 8;
-        if !tensor && per >= 16 && entries.chunks_exact(per).any(|c| c[..16] == [0; 16]) {
-            return Err(Error::Format(format!("{name}: zero-filled expert slice")));
-        }
-        Ok(match p {
-            "down" => trellis::packed(ffn_out, hidden, trellis::INPUT_SIDE, &entries),
-            _ => trellis::packed(hidden, ffn_out, 1, &entries),
-        })
     }
 }

@@ -361,9 +361,6 @@ pub(crate) fn config(
 /// The file whose presence marks an exlr8 release.
 const EXLR8: &str = "dense/exlr8-vocab.safetensors";
 
-/// The trellis width an exlr8 release's experts load at.
-pub(crate) const WIDTH: u32 = 3;
-
 /// Whether `dir` holds an exlr8 release.
 pub(crate) fn is_exlr8(dir: &Path) -> bool {
     dir.join(EXLR8).is_file()

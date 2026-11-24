@@ -2,10 +2,10 @@
 
 use crate::mla::{self, attn_rules, moe_rules};
 use crate::names::Rule;
-use crate::{Bundle, Overrides, WIDTH, is_exlr8, load_tapped, release};
+use crate::{Bundle, Overrides, is_exlr8, load_tapped, offer};
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Stored};
+use tessera_checkpoint::{Offer, Stored};
 use tessera_engine::form::{Load, named};
 use tessera_engine::mla::{Moe, RotatedMoe};
 use tessera_engine::mtp_model;
@@ -132,10 +132,7 @@ pub fn load(
         .map_err(|e| format!("--mtp requires an MLA checkpoint: {e}"))?;
     let layer = target_cfg.stack.layers;
     let exlr8 = is_exlr8(dir);
-    let offer: Box<dyn Offer> = match exlr8 {
-        true => Box::new(release(dir, manifest)?.width(WIDTH)),
-        false => Box::new(Shards::open(dir)?),
-    };
+    let offer = offer(dir, manifest)?;
     let slices = offer.slices();
     let eh = format!("model.layers.{layer}.eh_proj.weight");
     if !slices.iter().any(|s| s.name == eh) {

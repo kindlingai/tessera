@@ -6,10 +6,10 @@ use tessera_engine::storage::Form;
 use tessera_engine::{E4M3, F16, trellis};
 
 /// One tensor: name, safetensors dtype, shape, bytes.
-type Tensor<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
+pub(crate) type Tensor<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
 
 /// `tensors` as one safetensors file at `path`.
-fn write(path: &Path, tensors: &[Tensor]) {
+pub(crate) fn write(path: &Path, tensors: &[Tensor]) {
     write_meta(path, &[], tensors);
 }
 
@@ -51,16 +51,16 @@ fn record(format: i64, out: usize, inp: usize, side: i64) -> Vec<u8> {
 }
 
 /// `n` bytes below 0x7F, the E4M3 NaN.
-fn ramp(n: usize, step: usize) -> Vec<u8> {
+pub(crate) fn ramp(n: usize, step: usize) -> Vec<u8> {
     (0..n).map(|i| (i * step % 120) as u8).collect()
 }
 
-fn halves(values: &[f32]) -> Vec<u8> {
+pub(crate) fn halves(values: &[f32]) -> Vec<u8> {
     let half = |v: &f32| F16::from(*v).0.to_le_bytes();
     values.iter().flat_map(half).collect()
 }
 
-fn floats(values: &[f32]) -> Vec<u8> {
+pub(crate) fn floats(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
@@ -189,141 +189,6 @@ fn glm_dense_formats() {
         let row = release.packed(&name, Some((1, 1))).unwrap();
         assert_eq!(form.unpack_all(&row), want[want.len() / 2..], "{name} row");
     }
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-/// A routed layer's sets and rotations, at one width.
-#[test]
-fn glm_experts() {
-    let dir = tessera_testkit::scratch(&format!("{}-glm-experts", std::process::id()));
-    let norm = || ("norm.weight", "F32", vec![1], floats(&[1.0]));
-    for file in ["exlr8-vocab", "exlr8-dense-000", "exlr8-dense-001"] {
-        write(&dir.join(format!("dense/{file}.safetensors")), &[norm()]);
-    }
-    let signs: Vec<u8> = (0..128)
-        .map(|i| if i % 3 == 0 { 0xFF } else { 1 })
-        .collect();
-    let ends = [
-        "gate.su_block",
-        "up.su_block",
-        "down.sv_block",
-        "gate.svh",
-        "up.svh",
-        "down.suh",
-    ];
-    let names: Vec<[String; 2]> = (ends.iter())
-        .map(|e| [format!("k3.{e}"), format!("shared.k3.{e}")])
-        .collect();
-    let mut index: Vec<Tensor> = vec![
-        ("signs.in", "I8", vec![128], signs.clone()),
-        ("signs.out", "I8", vec![128], signs),
-    ];
-    for (i, [own, shared]) in names.iter().enumerate() {
-        let (width, value) = (if i < 3 { 1 } else { 128 }, 0.5 * (i + 1) as f32);
-        index.push((own, "F16", vec![2, width], halves(&vec![value; 2 * width])));
-        index.push((shared, "F16", vec![1, width], halves(&vec![4.0; width])));
-    }
-    write(
-        &dir.join("experts/exlr8-layer-001.index.safetensors"),
-        &index,
-    );
-    let (set, one) = (ramp(2 * 128 * 128 * 3 / 8, 5), ramp(128 * 128 * 3 / 8, 9));
-    let codes: Vec<[String; 2]> = (["gate", "up", "down"].iter())
-        .map(|p| [format!("trellis.{p}"), format!("shared.trellis.{p}")])
-        .collect();
-    let mut stored: Vec<Tensor> = Vec::new();
-    for [own, shared] in &codes {
-        stored.push((own, "U8", vec![set.len()], set.clone()));
-        stored.push((shared, "U8", vec![one.len()], one.clone()));
-    }
-    write(&dir.join("experts/exlr8-layer-001.k3.safetensors"), &stored);
-    let release = Release::open(&dir).width(3);
-    let at = "model.layers.1.mlp.";
-    let gate = format!("{at}experts.gate.weight");
-    let offered = release
-        .slices()
-        .into_iter()
-        .find(|s| s.name == gate)
-        .unwrap();
-    assert_eq!(offered.shape, [2, 128, 128]);
-    let read = |name: &str| release.floats(&format!("{at}{name}")).unwrap();
-    let su = read("experts.gate.su");
-    assert_eq!((su.len(), su[0], su[128]), (256, 0.5, 0.5));
-    assert_eq!(read("experts.down.sv")[200], 1.5);
-    // The shared expert's input scales carry the signs.
-    let shared = read("shared_experts.gate_proj.suh");
-    assert_eq!((shared[0], shared[1]), (-4.0, 4.0));
-    let gate = format!("{at}shared_experts.gate_proj.weight");
-    let file = release.packed(&gate, None).unwrap();
-    let parts = tessera_engine::trellis::TRELLIS_K3_ROT
-        .split(&file)
-        .unwrap();
-    assert_eq!(parts[1][..8], [0, 0, 128, 192, 0, 0, 128, 64]);
-    let down = release
-        .packed(&format!("{at}experts.down.weight"), None)
-        .unwrap();
-    assert_eq!(down, trellis::packed(128, 128, trellis::INPUT_SIDE, &set));
-    // A rank's experts, read alone, match its share.
-    let name = format!("{at}experts.down.weight");
-    let second = release.packed_share(&name, (1, 1)).unwrap();
-    let k3 = trellis::form_for(3, trellis::Codebook::Mcg).unwrap();
-    assert_eq!(Some(second), k3.share(&down, [1, 2, 128 * 128], [1, 1]));
-    // FFN slices match Trellis::share on axes 1, 2.
-    let big = dir.join("ffn");
-    std::fs::create_dir_all(big.join("dense")).unwrap();
-    std::fs::create_dir_all(big.join("experts")).unwrap();
-    write(&big.join("dense/exlr8-vocab.safetensors"), &[]);
-    let idx = vec![
-        ("signs.in", "I8", vec![128], vec![1u8; 128]),
-        ("k3.gate.svh", "F16", vec![2, 256], halves(&vec![1.0; 512])),
-    ];
-    write(&big.join("experts/exlr8-layer-001.index.safetensors"), &idx);
-    let big_set = ramp(2 * 128 * 256 * 3 / 8, 13);
-    write(
-        &big.join("experts/exlr8-layer-001.k3.safetensors"),
-        &[
-            ("trellis.gate", "U8", vec![big_set.len()], big_set.clone()),
-            ("trellis.down", "U8", vec![big_set.len()], big_set.clone()),
-        ],
-    );
-    let brel = Release::open(&big).width(3);
-    let bg = format!("{at}experts.gate.weight");
-    let bd = format!("{at}experts.down.weight");
-    let gw = brel.packed(&bg, None).unwrap();
-    let dw = brel.packed(&bd, None).unwrap();
-    assert_eq!(
-        Some(brel.packed_axis(&bg, 1, (128, 128)).unwrap()),
-        k3.share(&gw, [2, 256, 128], [128, 128])
-    );
-    assert_eq!(
-        Some(brel.packed_axis(&bd, 2, (128, 128)).unwrap()),
-        k3.share(&dw, [2 * 128, 256, 1], [128, 128])
-    );
-    // Sparse zero-filled experts fail closed under TP slicing.
-    let mut sparse = big_set.clone();
-    sparse[big_set.len() / 2..].fill(0);
-    write(
-        &big.join("experts/exlr8-layer-001.k3.safetensors"),
-        &[("trellis.gate", "U8", vec![sparse.len()], sparse)],
-    );
-    let srel = Release::open(&big).width(3);
-    assert!(srel.packed_axis(&bg, 1, (0, 128)).is_err());
-    std::fs::remove_dir_all(big).unwrap();
-    // The shared expert is not a set: it reads whole.
-    assert_eq!(release.packed_share(&gate, (0, 64)).unwrap(), file);
-    // A `.mul1` suffix selects mul1 forms for the same bytes.
-    let marked: Vec<(String, Vec<u8>)> = (stored.iter())
-        .map(|(n, _, _, b)| (format!("{n}.mul1"), b.clone()))
-        .collect();
-    let marked: Vec<Tensor> = (marked.iter())
-        .map(|(n, b)| (n.as_str(), "U8", vec![b.len()], b.clone()))
-        .collect();
-    write(&dir.join("experts/exlr8-layer-001.k3.safetensors"), &marked);
-    let release = Release::open(&dir).width(3);
-    let offered = release.slices().into_iter().find(|s| s.name == name);
-    let form = offered.map(|s| s.stored);
-    assert!(matches!(form, Some(Stored::Form(f)) if f.name() == "trellis_k3_mul1"));
-    assert_eq!(release.packed(&name, None).unwrap(), down);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -2,11 +2,11 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{WIDTH, Weights, each, is_exlr8, pins};
+use crate::{Weights, each, is_exlr8, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards};
+use tessera_checkpoint::Offer;
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
 
@@ -18,7 +18,7 @@ fn probe(json: &str) -> bool {
 fn step(_: &Arch, ask: &Ask) -> Result<Built, Box<dyn Error + Send + Sync>> {
     let step = Some((ask.user, ask.steps, ask.taps));
     let (dir, json) = (ask.dir, Some(ask.json));
-    let release = open(dir, json, ask.sizes, WIDTH, ask.manifest, step)?;
+    let release = open(dir, json, ask.sizes, None, ask.manifest, step)?;
     let (graph, pins) = (release.graph.clone(), release.pins.clone());
     Ok((graph, Weights::Streamed(Box::new(release)), pins))
 }
@@ -249,7 +249,7 @@ pub fn release(
     context: u64,
     width: u32,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
-    open(dir, None, [seqs, context], width, None, None)
+    open(dir, None, [seqs, context], Some(width), None, None)
 }
 
 /// A `step` sets the graph's rules, mask and taps.
@@ -257,7 +257,7 @@ fn open(
     dir: &Path,
     merged: Option<&str>,
     [seqs, context]: [u64; 2],
-    width: u32,
+    width: Option<u32>,
     manifest: Option<&str>,
     step: Option<(&[Rule], Steps, &[u64])>,
 ) -> Result<Release, Box<dyn Error + Send + Sync>> {
@@ -283,9 +283,9 @@ fn open(
         (false, true) => stepper::<Moe>(&config),
         (false, false) => program::<Moe>(&config),
     };
-    let offer: Box<dyn Offer> = match exlr8 {
-        true => Box::new(crate::release(dir, manifest)?.width(width)),
-        false => Box::new(Shards::open(dir)?),
+    let offer: Box<dyn Offer> = match (exlr8, width) {
+        (true, Some(w)) => Box::new(crate::release(dir, manifest)?.width(w)),
+        _ => crate::offer(dir, manifest)?,
     };
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {
