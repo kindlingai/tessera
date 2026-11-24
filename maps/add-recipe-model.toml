@@ -1,0 +1,8 @@
+[task.add-recipe-model]
+steps = [
+  { do = "implement", with = "tessera_trace::Weights", like = "examples/recipes/qwen3-graph/model/src/lib.rs" },
+  { do = "define", with = "tessera_trace::declare", like = "examples/recipes/qwen3-graph/model/src/lib.rs" },
+  { do = "define", with = "tessera_guest::exports!", like = "examples/recipes/qwen3-graph/model/src/lib.rs" },
+  { do = "place", at = "examples/recipes/*/recipe.toml", like = "frontend/recipe/src/lib.rs" },
+  { do = "run", pkg = "tessera-qwen3-graph", mode = "build" },
+]

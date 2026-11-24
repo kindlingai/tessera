@@ -16,6 +16,7 @@ members = [
     "tools/inspect",
     "tools/lint",
     "tools/load",
+    "tools/maps",
     "tools/parity",
     "tools/publish",
     "tools/ranks",
@@ -38,6 +39,7 @@ tessera-engine-comm = { path = "engine/plan/comm" }
 tessera-engine = { path = "engine/engine" }
 tessera-engine-settings = { path = "engine/settings" }
 tessera-findings = { path = "tools/findings" }
+tessera-maps = { path = "tools/maps" }
 tessera-frontend-comm = { path = "frontend/comm" }
 tessera-frontend-settings = { path = "frontend/settings" }
 tessera-dl = { path = "engine/gpu/dl" }

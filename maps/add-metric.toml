@@ -1,0 +1,5 @@
+[task.add-metric]
+steps = [
+  { do = "register", with = "tessera_engine::metric_registry!", like = "frontend/serve/src/http.rs" },
+  { do = "register", with = "tessera_engine::metric!", like = "frontend/serve/src/http.rs" },
+]

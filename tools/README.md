@@ -11,6 +11,7 @@ Build tools that run as part of CI or pre-commit hooks.
 <tr><td><a href="inspect">inspect/</a></td><td>tessera-inspect</td><td>Draws a model's graph, its lowering per rank, and tokens between ranks</td></tr>
 <tr><td><a href="lint">lint/</a></td><td>tessera-lint</td><td>The repository's code-shape rules, run by CI and the pre-commit hook</td></tr>
 <tr><td><a href="load">load/</a></td><td>tessera-load</td><td>Drives concurrent requests against tessera-serve and reports throughput</td></tr>
+<tr><td><a href="maps">maps/</a></td><td>tessera-maps</td><td>Checks task maps: ordered verb steps over code references</td></tr>
 <tr><td><a href="parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
 <tr><td><a href="publish">publish/</a></td><td>tessera-publish</td><td>Merges the workspace crates into the crates that go to crates.io</td></tr>
 <tr><td><a href="ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>

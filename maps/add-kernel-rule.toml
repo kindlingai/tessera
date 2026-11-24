@@ -1,0 +1,8 @@
+[task.add-kernel-rule]
+steps = [
+  { do = "define", with = "tessera_codegen::prelude::kernel", like = "engine/rules/kernels/src/softmax.rs" },
+  { do = "implement", with = "tessera_lower::Kernel", like = "engine/rules/kernels/src/softmax.rs" },
+  { do = "register", with = "tessera_lower::rule!", like = "engine/rules/kernels/src/softmax.rs" },
+  { do = "list", at = "engine/rules/kernels/src/lib.rs", like = "engine/rules/kernels/src/softmax.rs" },
+  { do = "run", pkg = "tessera-kernels", mode = "test" },
+]

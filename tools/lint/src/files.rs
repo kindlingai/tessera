@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use tessera_maps::listed;
+
 use crate::{LIMITS, Violation};
 
 pub struct Source {
@@ -31,30 +33,6 @@ pub fn repo_root() -> PathBuf {
         Ok(o) if o.status.success() => PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()),
         _ => PathBuf::from("."),
     }
-}
-
-/// Tracked and untracked, unignored paths.
-fn listed(root: &Path) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("git ls-files: {e}"))?;
-    if !out.status.success() {
-        return Err("git ls-files failed".into());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .collect())
 }
 
 pub fn sources(root: &Path) -> Result<Vec<Source>, String> {

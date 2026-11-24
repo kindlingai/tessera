@@ -2116,6 +2116,7 @@ dependencies = [
  "serde_json",
  "syn 2.0.119",
  "tessera-findings",
+ "tessera-maps",
  "tessera-publish",
  "tessera-shape",
  "toml",
@@ -2147,6 +2148,17 @@ dependencies = [
  "tessera-sim",
  "tessera-work",
  "thiserror",
+]
+
+[[package]]
+name = "tessera-maps"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "syn 2.0.119",
+ "tessera-findings",
+ "toml",
 ]
 
 [[package]]

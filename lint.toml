@@ -45,6 +45,10 @@ max_similarity = 0.97
 # much gets a note in the pull request. It does not fail.
 max_lean = 0.03
 
+# Task maps under maps/. Ids also use max_name_segments.
+max_map_id_chars = 24
+max_map_steps = 12
+
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip"]
 

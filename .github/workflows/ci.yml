@@ -30,7 +30,7 @@ jobs:
         run: tools/scripts/check-coauthors.sh "$BASE..$HEAD"
 
   changes:
-    # Whether anything changed outside Markdown, lint code and lint.toml.
+    # Whether anything changed outside Markdown, lint code, maps and lint.toml.
     # The build jobs skip when nothing did, and when a merge group holds
     # the tree its pull request already passed.
     runs-on: ubuntu-slim
@@ -75,7 +75,7 @@ jobs:
           printf 'build=%s\nreuse=%s\nmacos=%s\n' "$BUILD" "$reuse" "$macos" | tee -a "$GITHUB_OUTPUT"
 
   lint:
-    # Code-shape rules (tools/lint), their tests, and formatting.
+    # Code-shape rules (tools/lint), task maps (tools/maps), their tests, and formatting.
     needs: changes
     if: needs.changes.outputs.reuse != 'true'
     runs-on: ubuntu-latest
@@ -89,11 +89,11 @@ jobs:
           shared-key: lint
       - run: cargo fmt --all --check
       # The linux job skips when only lint changes, so lint tests run here.
-      - run: cargo clippy -p tessera-lint --all-targets
+      - run: cargo clippy -p tessera-lint -p tessera-maps --all-targets
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run -p tessera-lint --profile ci
+      - run: cargo nextest run -p tessera-lint -p tessera-maps --profile ci
       # Unused dependencies. It does not read dev-dependencies.
       - uses: taiki-e/install-action@v2
         with:
