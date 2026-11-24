@@ -32,6 +32,10 @@ fn flattens_in_order() {
     assert_eq!(flat.imports, [Import::AllReduce, Import::Kept]);
     let order = [
         "TESSERA_CAP_KEPT",
+        "tessera/1/types.h",
+        "tessera/1/abi.h",
+        "struct kept {",
+        "tessera/1/core.h",
         "tessera/1/collectives.h",
         "int b;",
         "\"a.h\"",

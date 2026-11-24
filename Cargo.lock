@@ -1841,6 +1841,7 @@ dependencies = [
  "tessera-gpukit",
  "tessera-graph",
  "tessera-lower",
+ "tessera-mem",
  "tessera-run",
  "tessera-testkit",
  "thiserror",
@@ -2001,6 +2002,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tessera-device",
  "tessera-graph",
  "tessera-lower",
  "tessera-models",

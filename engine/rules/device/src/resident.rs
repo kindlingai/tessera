@@ -1,9 +1,9 @@
 //! One persistent grid per rank, with its proxy beside it.
 
 use crate::layout::{
-    ARENAS, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DOORBELL_FAULT, DTYPES, Fault, Form,
-    Item, KV, Kept, KvTables, Lane, Launch as Record, MAX_DEPTH, MAX_GROUP, MAX_POOLS, NONE, PAGE,
-    Pool, PoolSet, Ref, SIZES, STATUS, Table, VALUES,
+    ARENAS, BF16, BYTES, Barrier, ConventionRef, Counters, DOORBELL_ABORT, DOORBELL_FAULT, F16,
+    F32, Fault, Form, Item, KV, Kept, KvTables, Lane, Launch as Record, MAX_DEPTH, MAX_GROUP,
+    MAX_POOLS, NONE, PAGE, Pool, PoolSet, Ref, SIZES, STATUS, Table, U32, VALUES,
 };
 use crate::proxy::page::Page;
 use crate::proxy::running::Running;
@@ -97,13 +97,13 @@ impl Plan {
     }
 }
 
-/// A `status_code` from `core.h`.
+/// A `status_code`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status(pub u32);
 
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match STATUS.get(self.0 as usize) {
+        match STATUS.name(self.0) {
             Some(name) => f.write_str(&name.to_lowercase().replace('_', " ")),
             None => write!(f, "status {}", self.0),
         }
@@ -749,7 +749,7 @@ fn check(plan: &Plan, rank: u32) -> Result<(), Error> {
     if plan.arenas.len() > ARENAS - USER as usize {
         return Err(self::plan(format!("{} arenas", plan.arenas.len())));
     }
-    if let Some(l) = plan.lanes.iter().find(|l| l.elem as usize >= DTYPES.len()) {
+    if let Some(l) = plan.lanes.iter().find(|l| l.elem > BYTES) {
         return Err(self::plan(format!("a lane of dtype {}", l.elem)));
     }
     for (p, pool) in plan.pools.iter().enumerate() {
@@ -762,7 +762,11 @@ fn check(plan: &Plan, rank: u32) -> Result<(), Error> {
 
 /// Bytes per element of a `dtype`. `check` refused unknown ones.
 fn width(elem: u32) -> u32 {
-    DTYPES[elem as usize].1
+    match elem {
+        F32 | U32 => 4,
+        BF16 | F16 => 2,
+        _ => 1,
+    }
 }
 
 fn lane(plan: &Plan, l: &LanePlan, rank: u32) -> Lane {

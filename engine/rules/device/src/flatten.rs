@@ -117,7 +117,7 @@ pub fn flatten(
     }
     for h in headers {
         line(&mut out, 1, h.name);
-        out.push_str(h.text);
+        out.push_str((h.text)());
     }
     for (file, text, found) in &files.done {
         line(&mut out, 1, file);

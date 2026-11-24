@@ -1,6 +1,6 @@
 //! The host proxy: reads the doorbell, moves parts, frees slots.
 
-use crate::layout::MAX_GROUP;
+use crate::layout::{self, MAX_GROUP};
 use std::collections::{BTreeMap, BTreeSet};
 use tessera_engine_comm::Error as CommError;
 
@@ -10,15 +10,16 @@ pub mod running;
 pub(crate) mod sim;
 pub mod wired;
 
-/// A lane's operation, numbered as in `collectives.h`.
+/// A lane's operation, by its `op` code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
 pub enum Op {
-    Sum,
-    Gather,
-    AllToAll,
-    Send,
-    Recv,
-    Fetch,
+    Sum = layout::SUM,
+    Gather = layout::GATHER,
+    AllToAll = layout::ALL_TO_ALL,
+    Send = layout::SEND,
+    Recv = layout::RECV,
+    Fetch = layout::FETCH,
 }
 
 /// One word of host memory the proxy reads or writes.

@@ -9,16 +9,6 @@
 
 namespace tessera {
 
-struct image_step {
-    u32 batch;
-    u32 height;
-    u32 width;
-    u32 channels;
-    ref timestep;
-    ref guidance;
-    ref seed;
-};
-
 #if !defined(__METAL_VERSION__)
 
 TESSERA_FN const image_step* image(const table* t) {

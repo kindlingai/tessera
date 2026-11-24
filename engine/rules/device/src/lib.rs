@@ -1,5 +1,6 @@
 //! Device headers for recipe kernels, and the import scanner.
 
+pub mod abi;
 mod flatten;
 #[cfg(test)]
 mod flatten_test;
@@ -24,8 +25,7 @@ pub use flatten::{Error, Problem};
 pub use flatten::{Flat, Options, flatten};
 pub use tessera_gpukit::backend::Backend;
 
-/// The edition every import path names.
-pub(crate) const EDITION: u32 = 1;
+pub(crate) use layout::EDITION;
 
 /// A name a kernel may import after `<tessera/1/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,20 +100,26 @@ impl Import {
 #[derive(Debug)]
 pub(crate) struct Header {
     pub name: &'static str,
-    pub text: &'static str,
+    pub text: fn() -> &'static str,
     /// The macro the flattener defines before it.
     cap: Option<&'static str>,
     /// Whether the kernel's imports and backend need it.
     needed: fn(&[Import], Backend) -> bool,
+    /// This header's declarations in `abi.h`.
+    pub abi: fn() -> Vec<abi::Decl>,
 }
 
 macro_rules! header {
     ($file:literal, $cap:expr, $needed:expr) => {
+        header!($file, $cap, $needed, Vec::new)
+    };
+    ($file:literal, $cap:expr, $needed:expr, $abi:expr) => {
         Header {
             name: concat!("tessera/1/", $file),
-            text: include_str!(concat!("../include/tessera/", $file)),
+            text: || include_str!(concat!("../include/tessera/", $file)),
             cap: $cap,
             needed: $needed,
+            abi: $abi,
         }
     };
 }
@@ -127,29 +133,54 @@ fn device(_: &[Import], backend: Backend) -> bool {
 }
 
 /// Every header, in the order a flattened kernel holds them.
-pub(crate) static HEADERS: [Header; 11] = [
-    header!("core.h", None, |_, _| true),
+pub(crate) static HEADERS: [Header; 13] = [
+    header!("types.h", None, |_, _| true),
+    Header {
+        name: "tessera/1/abi.h",
+        text: abi::text,
+        cap: None,
+        needed: |_, _| true,
+        abi: Vec::new,
+    },
+    header!("core.h", None, |_, _| true, layout::core),
     header!("backend.h", None, device),
     header!("status.h", None, device),
-    header!("grid.h", Some("TESSERA_CAP_GRID"), |i, _| {
-        i.iter().any(|i| i.persistent())
-    }),
-    header!("collectives.h", Some("TESSERA_CAP_COLLECTIVES"), |i, _| {
-        i.iter().any(|i| i.collective())
-    }),
-    header!("kept.h", Some("TESSERA_CAP_KEPT"), |i, _| has(
-        i,
-        Import::Kept
-    )),
-    header!("state.h", Some("TESSERA_CAP_STATE"), |i, _| has(
-        i,
-        Import::State
-    )),
-    header!("llm.h", Some("TESSERA_CAP_LLM"), |i, _| has(i, Import::Llm)),
-    header!("image.h", Some("TESSERA_CAP_IMAGE"), |i, _| has(
-        i,
-        Import::Image
-    )),
+    header!(
+        "grid.h",
+        Some("TESSERA_CAP_GRID"),
+        |i, _| { i.iter().any(|i| i.persistent()) },
+        layout::grid
+    ),
+    header!(
+        "collectives.h",
+        Some("TESSERA_CAP_COLLECTIVES"),
+        |i, _| { i.iter().any(|i| i.collective()) },
+        layout::collectives
+    ),
+    header!(
+        "kept.h",
+        Some("TESSERA_CAP_KEPT"),
+        |i, _| has(i, Import::Kept),
+        layout::kept
+    ),
+    header!(
+        "state.h",
+        Some("TESSERA_CAP_STATE"),
+        |i, _| has(i, Import::State),
+        layout::state
+    ),
+    header!(
+        "llm.h",
+        Some("TESSERA_CAP_LLM"),
+        |i, _| has(i, Import::Llm),
+        layout::llm
+    ),
+    header!(
+        "image.h",
+        Some("TESSERA_CAP_IMAGE"),
+        |i, _| has(i, Import::Image),
+        layout::image
+    ),
     header!("trellis.h", Some("TESSERA_CAP_TRELLIS"), |i, b| {
         has(i, Import::Trellis) && b != Backend::Metal
     }),

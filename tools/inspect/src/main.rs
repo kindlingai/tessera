@@ -25,11 +25,14 @@ const USAGE: &str = "tessera-inspect [--model NAME] [--full] [--graph FILE.json]
   [--ranks strix:3,gb10:1] [--prompt N] [--tokens N] [--form q8_0]
   [--latency SECONDS] [--rate BYTES_PER_SECOND] [--out DIR]
   A rank is a preset (strix, gb10, m3, cpu) or BACKEND/ARCH, then :PART.
-  BACKEND is cuda, rocm, metal or cpu. No device is opened.";
+  BACKEND is cuda, rocm, metal or cpu. No device is opened.
+tessera-inspect --abi
+  Prints <tessera/1/abi.h>, the header kernels get from the engine.";
 
 struct Args {
     model: String,
     full: bool,
+    abi: bool,
     graph: Option<String>,
     specs: Vec<Spec>,
     prompt: u64,
@@ -43,6 +46,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
     let mut args = Args {
         model: "qwen3".into(),
         full: false,
+        abi: false,
         graph: None,
         specs: ["strix:3", "gb10:1"]
             .iter()
@@ -60,6 +64,10 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
     while let Some(flag) = given.next() {
         if flag == "--full" {
             args.full = true;
+            continue;
+        }
+        if flag == "--abi" {
+            args.abi = true;
             continue;
         }
         let value = given.next()?;
@@ -84,6 +92,10 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    if args.abi {
+        print!("{}", tessera_device::abi::text());
+        return ExitCode::SUCCESS;
+    }
     if let Err(e) = run(&args) {
         eprintln!("tessera-inspect: {e}");
         return ExitCode::FAILURE;

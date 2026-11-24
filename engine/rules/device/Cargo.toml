@@ -16,6 +16,7 @@ tessera-engine-comm = { workspace = true }
 tessera-gpukit = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-lower = { workspace = true }
+tessera-mem = { workspace = true }
 tessera-run = { workspace = true }
 thiserror = "2"
 

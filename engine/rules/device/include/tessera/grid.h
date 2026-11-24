@@ -13,11 +13,6 @@
 
 namespace tessera {
 
-struct barrier {
-    u32 count;
-    u32 round;
-};
-
 // Every thread of the grid calls it. False means stop.
 TESSERA_FN bool grid_sync(const table* t) {
     __shared__ int ok;

@@ -1,192 +1,98 @@
-use crate::HEADERS;
+use crate::abi::{self, Body, Layout};
 use crate::layout::*;
-use std::collections::HashMap;
+use crate::{HEADERS, Header};
+use std::io::Write;
+use std::process::{Command, Stdio};
 
-/// A header struct: its fields, then its `alignas`.
-type Declared = (Vec<(String, String, usize)>, usize);
-
-#[derive(Default)]
-struct Headers {
-    numbers: HashMap<String, usize>,
-    structs: HashMap<String, Declared>,
-}
-
-impl Headers {
-    fn number(&self, word: &str) -> usize {
-        let word = word.trim();
-        (word
-            .parse()
-            .ok()
-            .or_else(|| self.numbers.get(word).copied()))
-        .unwrap_or_else(|| panic!("no number {word:?}"))
-    }
-
-    /// The element count of `a[X][Y * Z]`, and the bare name.
-    fn field<'a>(&self, decl: &'a str) -> (&'a str, usize) {
-        let (name, dims) = decl.split_once('[').unwrap_or((decl, ""));
-        let mut count = 1;
-        for dim in dims.split(['[', ']']).filter(|d| !d.trim().is_empty()) {
-            count *= dim.split('*').map(|w| self.number(w)).product::<usize>();
-        }
-        (name.trim(), count)
-    }
-
-    fn read(&mut self, text: &str) {
-        let mut open: Option<(String, Declared)> = None;
-        let mut depth = 0;
-        for line in text.lines().map(str::trim) {
-            let number = line
-                .trim_start_matches("constexpr u32 ")
-                .trim_end_matches([';', ',']);
-            if let Some((name, value)) = number.split_once(" = ")
-                && let Ok(value) = value.parse()
-            {
-                self.numbers.insert(name.into(), value);
-            }
-            if let Some(head) = line
-                .strip_prefix("struct ")
-                .and_then(|l| l.strip_suffix(" {"))
-            {
-                let align = head
-                    .split_once("alignas(")
-                    .map_or(0, |(_, a)| self.number(&a[..a.find(')').unwrap()]));
-                let name = head.rsplit(' ').next().unwrap();
-                open = Some((name.into(), (Vec::new(), align)));
-                depth = 1;
-                continue;
-            }
-            let Some((_, (fields, _))) = open.as_mut() else {
-                continue;
-            };
-            depth += line.matches('{').count();
-            depth -= line.matches('}').count();
-            if depth == 0 {
-                let (name, declared) = open.take().unwrap();
-                self.structs.insert(name, declared);
-                continue;
-            }
-            if depth > 1 || line.contains('(') || line.starts_with("//") || !line.ends_with(';') {
-                continue;
-            }
-            let (ty, names) = line.trim_end_matches(';').split_once(' ').unwrap();
-            for decl in names.split(',') {
-                let (name, count) = self.field(decl);
-                fields.push((name.into(), ty.into(), count));
-            }
-        }
-    }
-
-    /// Size and alignment, by C's rules.
-    fn size(&self, ty: &str) -> (usize, usize) {
-        if let Some(n) = ["u8", "u16", "u32", "u64"].iter().position(|t| *t == ty) {
-            return (1 << n, 1 << n);
-        }
-        self.layout(ty).1
-    }
-
-    fn layout(&self, name: &str) -> (Vec<Field>, (usize, usize)) {
-        let (fields, align) = self
-            .structs
-            .get(name)
-            .unwrap_or_else(|| panic!("no struct {name}"));
-        let (mut at, mut most) = (0usize, (*align).max(1));
-        let mut out = Vec::new();
-        for (field, ty, count) in fields {
-            let (size, align) = self.size(ty);
-            at = at.next_multiple_of(align);
-            most = most.max(align);
-            out.push((leak(field), at, size * count));
-            at += size * count;
-        }
-        (out, (at.next_multiple_of(most), most))
+/// Asserts that the compiler lays out `T` as Rust does.
+fn check<T: Layout>(out: &mut String) {
+    let Body::Struct(s) = T::DECL.body else {
+        panic!("{:?} is no struct", T::DECL);
+    };
+    let name = s.name;
+    let align = align_of::<T>();
+    out.push_str(&format!(
+        "static_assert(sizeof({name}) == {} && alignof({name}) == {align}, \"{name}\");\n",
+        s.size
+    ));
+    for m in s.members {
+        let (field, at) = (m.name, m.offset);
+        out.push_str(&format!(
+            "static_assert(__builtin_offsetof({name}, {field}) == {at}, \"{name}.{field}\");\n"
+        ));
     }
 }
 
-fn leak(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+fn hand(name: &str) -> &'static str {
+    let found: Option<&Header> = HEADERS.iter().find(|h| h.name.ends_with(name));
+    (found.unwrap().text)()
 }
 
-fn check<T: Layout>(headers: &Headers) {
-    let (fields, (size, align)) = headers.layout(T::C);
-    assert_eq!(fields, T::FIELDS, "{} fields", T::C);
-    assert_eq!(
-        (size, align),
-        (size_of::<T>(), align_of::<T>()),
-        "{} size",
-        T::C
-    );
+/// The host compiler reads `abi.h`. Without one, this skips.
+#[test]
+fn compiler_agrees() {
+    let mut text = String::new();
+    for cap in HEADERS.iter().filter_map(|h| h.cap) {
+        text.push_str(&format!("#define {cap} 1\n"));
+    }
+    text.push_str(hand("types.h"));
+    text.push_str(abi::text());
+    text.push_str("namespace tessera {\n");
+    check::<Ref>(&mut text);
+    check::<Item>(&mut text);
+    check::<Form>(&mut text);
+    check::<Launch>(&mut text);
+    check::<ConventionRef>(&mut text);
+    check::<Fault>(&mut text);
+    check::<Table>(&mut text);
+    check::<Barrier>(&mut text);
+    check::<Flag>(&mut text);
+    check::<Lane>(&mut text);
+    check::<Pool>(&mut text);
+    check::<Counters>(&mut text);
+    check::<PoolSet>(&mut text);
+    check::<Kept>(&mut text);
+    check::<KvTables>(&mut text);
+    check::<Request>(&mut text);
+    check::<Held>(&mut text);
+    check::<StateTables>(&mut text);
+    check::<LlmStep>(&mut text);
+    check::<ImageStep>(&mut text);
+    text.push_str("}\n");
+    let args = ["-std=c++17", "-fsyntax-only", "-x", "c++", "-"];
+    let child = Command::new("c++")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else {
+        println!("no c++ here, skipped");
+        return;
+    };
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}\n{text}");
 }
 
 #[test]
-fn headers_match_rust() {
-    let mut headers = Headers::default();
-    for h in &HEADERS {
-        headers.read(h.text);
+fn form_kinds_hold() {
+    for pair in FORM_KINDS.windows(2) {
+        assert_ne!(pair[0].1, pair[1].1, "{pair:?} share a code");
     }
-    let numbers = [
-        ("ARENAS", ARENAS),
-        ("MAX_GROUP", MAX_GROUP),
-        ("MAX_POOLS", MAX_POOLS),
-        ("MAX_DEPTH", MAX_DEPTH),
-        ("VALUES", VALUES),
-        ("DOORBELL_SLOTS", DOORBELL_SLOTS),
-        ("DOORBELL_ABORT", DOORBELL_ABORT),
-        ("DOORBELL_SENT", DOORBELL_SENT),
-        ("DOORBELL_FAULT", DOORBELL_FAULT),
-    ];
-    let item_kinds = ["INPUT", "OUTPUT", "SCRATCH"];
-    let conventions = ["LLM", "KV", "STATE", "IMAGE"];
-    let names = DTYPES.iter().map(|d| d.0).enumerate();
-    let forms = FORM_KINDS.iter().map(|f| f.0).enumerate();
-    let all = names
-        .chain(STATUS.into_iter().enumerate())
-        .chain(item_kinds.into_iter().enumerate())
-        .chain(conventions.into_iter().enumerate())
-        .chain(forms);
-    for (code, name) in all {
-        assert_eq!(headers.number(name), code, "{name}");
-    }
+    // `trellis.h` reads these nine as one range.
+    let trellis = |e: &&abi::Entry| e.0.starts_with("FORM_TRELLIS_");
+    let codes: Vec<u32> = FORM_KINDS.iter().filter(trellis).map(|e| e.1).collect();
+    assert_eq!(codes, (8..=16).collect::<Vec<u32>>());
     for f in tessera_lower::form::LOADS.iter() {
         if dtype_code(f.name()) == BYTES {
-            assert_ne!(form_kind(f.name()), 0, "missing form_kind for {}", f.name());
+            assert_ne!(form_kind(f.name()), 0, "no form_kind for {}", f.name());
         }
     }
-    for &(_, name) in &FORM_KINDS[1..] {
-        assert!(
-            tessera_lower::form::named(name).is_some(),
-            "FORM_KINDS entry {name} is not registered"
-        );
-    }
-    for (name, value) in numbers {
-        assert_eq!(headers.number(name), value, "{name}");
-    }
-    let slots = DOORBELL_SLOTS + MAX_POOLS * MAX_DEPTH * 16;
-    let sizes = SIZES + MAX_POOLS * MAX_DEPTH * MAX_GROUP * 4;
-    let sent = DOORBELL_SENT + MAX_POOLS * 8;
-    assert!(
-        slots <= SIZES
-            && sizes <= DOORBELL_ABORT
-            && sent <= DOORBELL_FAULT
-            && DOORBELL_FAULT + 8 <= PAGE
-    );
-    check::<Ref>(&headers);
-    check::<Item>(&headers);
-    check::<Form>(&headers);
-    check::<Launch>(&headers);
-    check::<ConventionRef>(&headers);
-    check::<Fault>(&headers);
-    check::<Table>(&headers);
-    check::<Barrier>(&headers);
-    check::<Flag>(&headers);
-    check::<Lane>(&headers);
-    check::<Pool>(&headers);
-    check::<Counters>(&headers);
-    check::<PoolSet>(&headers);
-    check::<Kept>(&headers);
-    check::<KvTables>(&headers);
-    check::<Request>(&headers);
-    check::<Held>(&headers);
-    check::<StateTables>(&headers);
-    check::<LlmStep>(&headers);
-    check::<ImageStep>(&headers);
+    assert_eq!(form_kind("trellis_k4_rot"), form_kind("trellis_k4"));
 }

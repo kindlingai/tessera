@@ -1,64 +1,209 @@
-//! The structs the host writes, laid out as the headers.
+//! The structs, codes and limits the host and kernels share.
 
-/// Limits and doorbell page offsets from `core.h`.
-pub(crate) const ARENAS: usize = 16;
-pub(crate) const MAX_GROUP: usize = 8;
-pub(crate) const MAX_POOLS: usize = 4;
-pub const MAX_DEPTH: usize = 4;
-pub const VALUES: usize = 58;
-pub const NONE: u32 = u32::MAX;
-pub(crate) const DOORBELL_SLOTS: usize = 64;
-pub(crate) const DOORBELL_ABORT: usize = 4032;
-pub(crate) const DOORBELL_SENT: usize = 4040;
-pub(crate) const DOORBELL_FAULT: usize = 4072;
-/// `dtype` codes matching `core.h`.
-pub(crate) const F32: u32 = 0;
-pub(crate) const BF16: u32 = 1;
-pub(crate) const F16: u32 = 2;
-pub(crate) const E4M3: u32 = 3;
-pub(crate) const U32: u32 = 4;
-pub(crate) const FORM: u32 = 5;
-pub(crate) const BYTES: u32 = 6;
-/// `dtype` names in code order, with bytes per element.
-pub(crate) const DTYPES: [(&str, u32); 7] = [
-    ("F32", 4),
-    ("BF16", 2),
-    ("F16", 2),
-    ("E4M3", 1),
-    ("U32", 4),
-    ("FORM", 1),
-    ("BYTES", 1),
-];
-/// `item_kind` codes matching `core.h`.
-pub(crate) const INPUT: u32 = 0;
-pub(crate) const OUTPUT: u32 = 1;
-pub(crate) const SCRATCH: u32 = 2;
-/// `convention` code for KV tables.
-pub(crate) const KV: u32 = 1;
-/// `form_kind` header names and storage form names in code order.
-pub(crate) const FORM_KINDS: [(&str, &str); 19] = [
-    ("FORM_UNKNOWN", ""),
-    ("FORM_Q8_0", "q8_0"),
-    ("FORM_Q4_0", "q4_0"),
-    ("FORM_NVFP4", "nvfp4"),
-    ("FORM_MXFP8", "mxfp8"),
-    ("FORM_MXFP4", "mxfp4"),
-    ("FORM_INT4_G32", "int4_g32"),
-    ("FORM_INT4_G128", "int4_g128"),
-    ("FORM_TRELLIS_K2", "trellis_k2"),
-    ("FORM_TRELLIS_K3", "trellis_k3"),
-    ("FORM_TRELLIS_K4", "trellis_k4"),
-    ("FORM_TRELLIS_K2_MUL1", "trellis_k2_mul1"),
-    ("FORM_TRELLIS_K3_MUL1", "trellis_k3_mul1"),
-    ("FORM_TRELLIS_K4_MUL1", "trellis_k4_mul1"),
-    ("FORM_TRELLIS_K2_PMCGX", "trellis_k2_pmcgx"),
-    ("FORM_TRELLIS_K3_PMCGX", "trellis_k3_pmcgx"),
-    ("FORM_TRELLIS_K4_PMCGX", "trellis_k4_pmcgx"),
-    ("FORM_INT2_G32", "int2_g32"),
-    ("FORM_INT2_G128", "int2_g128"),
-];
+pub use crate::abi::Layout;
+use crate::abi::{Body, Decl, Entry, Member, Named, Struct};
+use std::sync::LazyLock;
+use tessera_mem::form::Form as Storage;
 
-/// Plain form name as a `core.h` `dtype` code.
+/// This file, for the generated header to name.
+pub(crate) const SOURCE: &str = file!();
+
+/// Declares `u32` constants for kernels, and typed ones here.
+macro_rules! numbers {
+    ($(#[doc = $about:literal])* $list:ident {
+        $($(#[doc = $doc:literal])* $name:ident: $ty:ty = $value:expr),* $(,)?
+    }) => {
+        $($(#[doc = $doc])* pub const $name: $ty = $value;)*
+
+        $(#[doc = $about])*
+        pub const $list: Decl = Decl {
+            about: &[$($about),*],
+            body: Body::Numbers(&[$((stringify!($name), $name as u32)),*]),
+        };
+    };
+}
+
+/// Declares enum `$c` for kernels, and its codes here.
+macro_rules! codes {
+    ($(#[doc = $about:literal])* $list:ident = $c:literal {
+        $($name:ident = $value:literal),* $(,)?
+    }) => {
+        $(pub const $name: u32 = $value;)*
+
+        $(#[doc = $about])*
+        pub const $list: Decl = Decl {
+            about: &[$($about),*],
+            body: Body::Codes($c, &[$((stringify!($name), $name)),*]),
+        };
+    };
+}
+
+/// One field of `$owner`. It peels array lengths, outermost first.
+macro_rules! member {
+    ($owner:ident, $field:ident, [$($dims:expr),*], [$elem:tt; $len:expr]) => {
+        member!($owner, $field, [$($dims,)* stringify!($len)], $elem)
+    };
+    ($owner:ident, $field:ident, [$($dims:expr),*], $elem:ty) => {
+        Member {
+            name: stringify!($field),
+            ty: <$elem as Named>::C,
+            dims: &[$($dims),*],
+            offset: std::mem::offset_of!($owner, $field),
+        }
+    };
+}
+
+/// Declares struct `$c` for kernels, and `$name` here.
+macro_rules! layout {
+    ($(#[doc = $about:literal])* $name:ident = $c:literal $(align($align:literal))? {
+        $($field:ident: $ty:tt),* $(,)?
+    }) => {
+        $(#[doc = $about])*
+        #[repr(C $(, align($align))?)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct $name {
+            $(pub $field: $ty),*
+        }
+
+        impl Named for $name {
+            const C: &'static str = $c;
+        }
+
+        impl Layout for $name {
+            const DECL: Decl = Decl {
+                about: &[$($about),*],
+                body: Body::Struct(Struct {
+                    name: $c,
+                    align: 0 $(+ $align)?,
+                    size: size_of::<$name>(),
+                    members: &[$(member!($name, $field, [], $ty)),*],
+                }),
+            };
+        }
+    };
+}
+
+numbers!(LIMITS {
+    /// The edition every import path names.
+    EDITION: u32 = 1,
+    ARENAS: usize = 16,
+    MAX_GROUP: usize = 8,
+    MAX_POOLS: usize = 4,
+    MAX_DEPTH: usize = 4,
+    VALUES: usize = 58,
+    CONVENTIONS: usize = 16,
+    NONE: u32 = u32::MAX,
+});
+
+numbers!(
+    /// Doorbell page offsets, in bytes.
+    DOORBELL {
+        /// A trigger word: valid bit, 15-bit lane, low ordinal, count.
+        DOORBELL_SLOTS: usize = 64,
+        DOORBELL_ABORT: usize = 4032,
+        DOORBELL_SENT: usize = 4040,
+        DOORBELL_FAULT: usize = 4072,
+    }
+);
+
+/// The page, and where the host puts all-to-all sizes.
+pub const PAGE: usize = 4096;
+pub const SIZES: usize = 1024;
+
+const _: () = assert!(
+    DOORBELL_SLOTS + MAX_POOLS * MAX_DEPTH * 16 <= SIZES
+        && SIZES + MAX_POOLS * MAX_DEPTH * MAX_GROUP * 4 <= DOORBELL_ABORT
+        && DOORBELL_SENT + MAX_POOLS * 8 <= DOORBELL_FAULT
+        && DOORBELL_FAULT + 8 <= PAGE
+);
+
+codes!(DTYPE = "dtype" {
+    F32 = 0,
+    BF16 = 1,
+    F16 = 2,
+    E4M3 = 3,
+    U32 = 4,
+    FORM = 5,
+    BYTES = 6,
+});
+
+codes!(ITEM_KIND = "item_kind" {
+    INPUT = 0,
+    OUTPUT = 1,
+    SCRATCH = 2,
+});
+
+codes!(CONVENTION = "convention" {
+    LLM = 0,
+    KV = 1,
+    STATE = 2,
+    IMAGE = 3,
+});
+
+codes!(STATUS = "status_code" {
+    OK = 0,
+    ABI_MISMATCH = 1,
+    PEER_LOST = 2,
+    BAD_INPUT = 3,
+    TIMEOUT = 4,
+    PROTOCOL = 5,
+});
+
+codes!(OP = "op" {
+    SUM = 0,
+    GATHER = 1,
+    ALL_TO_ALL = 2,
+    SEND = 3,
+    RECV = 4,
+    FETCH = 5,
+});
+
+/// A packed form: its header name, itself, its code.
+type Kind = (&'static str, &'static dyn Storage, u32);
+
+macro_rules! block_kinds {
+    ($(($name:ident, $text:literal, $kind:literal, $($rest:tt)*),)*) => {
+        const BLOCK_KINDS: &[Kind] = &[$((
+            concat!("FORM_", stringify!($name)),
+            &tessera_mem::block::$name,
+            $kind,
+        )),*];
+    };
+}
+
+macro_rules! trellis_kinds {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {
+        const TRELLIS_KINDS: &[Kind] = &[$((
+            concat!("FORM_", stringify!($plain)),
+            &tessera_mem::trellis::$plain,
+            $kind,
+        )),*];
+    };
+}
+
+tessera_mem::block_forms!(block_kinds);
+tessera_mem::trellis_forms!(trellis_kinds);
+
+fn kinds() -> impl Iterator<Item = &'static Kind> {
+    BLOCK_KINDS.iter().chain(TRELLIS_KINDS)
+}
+
+/// `form_kind`, in code order. Zero is no packed form.
+pub(crate) static FORM_KINDS: LazyLock<Vec<Entry>> = LazyLock::new(|| {
+    let mut list = vec![("FORM_UNKNOWN", 0)];
+    list.extend(kinds().map(|k| (k.0, k.2)));
+    list.sort_by_key(|e| e.1);
+    list
+});
+
+fn form_kinds() -> Decl {
+    Decl {
+        about: &[],
+        body: Body::Codes("form_kind", &FORM_KINDS),
+    }
+}
+
+/// Plain form name as a `dtype` code.
 pub(crate) fn dtype_code(name: &str) -> u32 {
     match name {
         "f32" => F32,
@@ -71,64 +216,72 @@ pub(crate) fn dtype_code(name: &str) -> u32 {
     }
 }
 
-/// Packed form name as a `core.h` `form_kind` code.
+/// Packed form name as a `form_kind`. Rotated forms share one.
 pub(crate) fn form_kind(name: &str) -> u32 {
     let base = name.strip_suffix("_rot").unwrap_or(name);
-    for (code, &(_, form)) in FORM_KINDS.iter().enumerate() {
-        if !form.is_empty() && form == base {
-            return code as u32;
-        }
+    let found = kinds().find(|k| k.1.name() == base);
+    found.map_or(0, |k| k.2)
+}
+
+/// The declarations `core.h` reads.
+pub(crate) fn core() -> Vec<Decl> {
+    vec![
+        LIMITS,
+        Ref::DECL,
+        DTYPE,
+        ITEM_KIND,
+        form_kinds(),
+        Item::DECL,
+        Form::DECL,
+        Launch::DECL,
+        CONVENTION,
+        ConventionRef::DECL,
+        STATUS,
+        Fault::DECL,
+        DOORBELL,
+        Table::DECL,
+    ]
+}
+
+pub(crate) fn grid() -> Vec<Decl> {
+    vec![Barrier::DECL]
+}
+
+pub(crate) fn collectives() -> Vec<Decl> {
+    vec![
+        OP,
+        Flag::DECL,
+        Lane::DECL,
+        Pool::DECL,
+        Counters::DECL,
+        PoolSet::DECL,
+    ]
+}
+
+pub(crate) fn kept() -> Vec<Decl> {
+    vec![Kept::DECL, KvTables::DECL, Request::DECL]
+}
+
+pub(crate) fn state() -> Vec<Decl> {
+    vec![Held::DECL, StateTables::DECL]
+}
+
+pub(crate) fn llm() -> Vec<Decl> {
+    vec![LlmStep::DECL]
+}
+
+pub(crate) fn image() -> Vec<Decl> {
+    vec![ImageStep::DECL]
+}
+
+layout!(
+    /// An arena and a byte offset, or arena NONE.
+    Ref = "ref" {
+        arena: u32,
+        unused: u32,
+        offset: u64,
     }
-    0
-}
-/// `status_code` names in code order.
-pub(crate) const STATUS: [&str; 6] = [
-    "OK",
-    "ABI_MISMATCH",
-    "PEER_LOST",
-    "BAD_INPUT",
-    "TIMEOUT",
-    "PROTOCOL",
-];
-/// The page, and where the host puts all-to-all sizes.
-pub const PAGE: usize = 4096;
-pub const SIZES: usize = 1024;
-
-/// One field: its name, byte offset and size.
-pub type Field = (&'static str, usize, usize);
-
-/// A struct the host and the headers share.
-pub trait Layout {
-    /// Its name in the headers.
-    const C: &'static str;
-    const FIELDS: &'static [Field];
-}
-
-macro_rules! layout {
-    ($(#[$attr:meta])* $name:ident = $c:literal { $($field:ident: $ty:ty),* $(,)? }) => {
-        #[repr(C)]
-        $(#[$attr])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub struct $name {
-            $(pub $field: $ty),*
-        }
-
-        impl Layout for $name {
-            const C: &'static str = $c;
-            const FIELDS: &'static [Field] = &[$((
-                stringify!($field),
-                std::mem::offset_of!($name, $field),
-                size_of::<$ty>(),
-            )),*];
-        }
-    };
-}
-
-layout!(Ref = "ref" {
-    arena: u32,
-    unused: u32,
-    offset: u64,
-});
+);
 
 impl Ref {
     pub const NONE: Ref = Ref::at(NONE, 0);
@@ -142,33 +295,42 @@ impl Ref {
     }
 }
 
-layout!(Item = "item" {
-    at: Ref,
-    kind: u32,
-    elem: u32,
-    dims: u32,
-    shape: [u32; 4],
-    share: [u32; 4],
-    form: u32,
-    forms: u32,
-    unused: u32,
-});
+layout!(
+    /// One item the module declared, in its order.
+    Item = "item" {
+        at: Ref,
+        kind: u32,
+        elem: u32,
+        dims: u32,
+        shape: [u32; 4],
+        share: [u32; 4],
+        form: u32,
+        forms: u32,
+        unused: u32,
+    }
+);
 
-layout!(Form = "form" {
-    codes: Ref,
-    suh: Ref,
-    svh: Ref,
-    kind: u32,
-    rows: u32,
-    cols: u32,
-    unused: u32,
-});
+layout!(
+    /// One packed weight matrix and its rotation parts.
+    Form = "form" {
+        codes: Ref,
+        suh: Ref,
+        svh: Ref,
+        kind: u32,
+        rows: u32,
+        cols: u32,
+        unused: u32,
+    }
+);
 
-layout!(Launch = "launch" {
-    seq: u64,
-    deadline: u64,
-    values: [u32; 58],
-});
+layout!(
+    /// Values the engine writes before each launch.
+    Launch = "launch" {
+        seq: u64,
+        deadline: u64,
+        values: [u32; VALUES],
+    }
+);
 
 layout!(ConventionRef = "convention_ref" {
     at: Ref,
@@ -176,11 +338,14 @@ layout!(ConventionRef = "convention_ref" {
     bytes: u32,
 });
 
-layout!(Fault = "fault" {
-    code: u32,
-    pool: u32,
-    ordinal: u64,
-});
+layout!(
+    /// The first failure. The engine reads it after the launch.
+    Fault = "fault" {
+        code: u32,
+        pool: u32,
+        ordinal: u64,
+    }
+);
 
 layout!(Table = "table" {
     edition: u32,
@@ -191,11 +356,11 @@ layout!(Table = "table" {
     lanes_len: u32,
     values_len: u32,
     unused: u32,
-    arenas: [u64; 16],
+    arenas: [u64; ARENAS],
     now: Ref,
     items: Ref,
     forms: Ref,
-    conventions: [ConventionRef; 16],
+    conventions: [ConventionRef; CONVENTIONS],
     lanes: Ref,
     pools: Ref,
     doorbell: Ref,
@@ -209,10 +374,13 @@ layout!(Barrier = "barrier" {
     round: u32,
 });
 
-layout!(#[repr(align(16))] Flag = "flag" {
-    ordinal: u64,
-    count: u64,
-});
+layout!(
+    /// In the layout the NIC or proxy writes.
+    Flag = "flag" align(16) {
+        ordinal: u64,
+        count: u64,
+    }
+);
 
 layout!(Lane = "lane" {
     what: u32,
@@ -230,25 +398,28 @@ layout!(Pool = "pool" {
     send_bytes: u32,
     recv_bytes: u32,
     unused: [u32; 4],
-    send: [Ref; 4],
-    recv: [Ref; 32],
+    send: [Ref; MAX_DEPTH],
+    recv: [Ref; MAX_DEPTH * MAX_GROUP],
     arrived: Ref,
     credit: Ref,
     sizes: Ref,
 });
 
-layout!(Counters = "counters" {
-    next: [u64; 4],
-    writes: u64,
-    arrived: [[u64; 4]; 4],
-    free: [u64; 4],
-});
+layout!(
+    /// Device memory. Block 0 copies host state here for others.
+    Counters = "counters" {
+        next: [u64; MAX_POOLS],
+        writes: u64,
+        arrived: [[u64; MAX_DEPTH]; MAX_POOLS],
+        free: [u64; MAX_POOLS],
+    }
+);
 
 layout!(PoolSet = "pool_set" {
     count: u32,
     unused: u32,
     state: Ref,
-    pools: [Pool; 4],
+    pools: [Pool; MAX_POOLS],
 });
 
 layout!(Kept = "kept" {
@@ -268,12 +439,15 @@ layout!(KvTables = "kv_tables" {
     tables: Ref,
 });
 
-layout!(#[repr(align(16))] Request = "request" {
-    kept: u32,
-    slot: u32,
-    pos: u32,
-    unused: u32,
-});
+layout!(
+    /// One fetch request. Kept NONE means skip.
+    Request = "request" align(16) {
+        kept: u32,
+        slot: u32,
+        pos: u32,
+        unused: u32,
+    }
+);
 
 layout!(Held = "held" {
     base: Ref,

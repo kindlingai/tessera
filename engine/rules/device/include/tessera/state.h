@@ -9,19 +9,6 @@
 
 namespace tessera {
 
-struct held {
-    ref base;
-    ref fresh;
-    u32 slot_bytes;
-    u32 elem;
-};
-
-struct state_tables {
-    u32 count;
-    u32 unused;
-    ref tables;
-};
-
 #if !defined(__METAL_VERSION__)
 
 TESSERA_FN const held* held_table(const table* t, u32 index) {

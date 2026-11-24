@@ -23,59 +23,6 @@
 
 namespace tessera {
 
-enum op : u32 {
-    SUM = 0,
-    GATHER = 1,
-    ALL_TO_ALL = 2,
-    SEND = 3,
-    RECV = 4,
-    FETCH = 5,
-};
-
-// In the layout the NIC or proxy writes.
-struct alignas(16) flag {
-    u64 ordinal;
-    u64 count;
-};
-
-struct lane {
-    u32 what;
-    u32 elem;
-    u32 group_size;
-    u32 group_rank;
-    u32 block;
-    u32 pool;
-    u32 unused[2];
-};
-
-struct pool {
-    u32 depth;
-    u32 one_way;
-    u32 send_bytes;
-    u32 recv_bytes;
-    u32 unused[4];
-    ref send[MAX_DEPTH];
-    ref recv[MAX_DEPTH * MAX_GROUP];
-    ref arrived;
-    ref credit;
-    ref sizes;
-};
-
-// Device memory. Block 0 copies host state here for others.
-struct counters {
-    u64 next[MAX_POOLS];
-    u64 writes;
-    u64 arrived[MAX_POOLS][MAX_DEPTH];
-    u64 free[MAX_POOLS];
-};
-
-struct pool_set {
-    u32 count;
-    u32 unused;
-    ref state;
-    pool pools[MAX_POOLS];
-};
-
 namespace detail {
 
 TESSERA_FN u64* page(const table* t) {

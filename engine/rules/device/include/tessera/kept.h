@@ -25,31 +25,6 @@ constexpr u32 TIER_UNMAPPED = 3;
 constexpr u32 PAGE_INDEX = (1u << TIER_SHIFT) - 1;
 constexpr u32 NO_PAGE = 0xFFFFFFFFu;
 
-struct kept {
-    ref base;
-    ref host;
-    ref pages;
-    ref len;
-    u32 pages_per_slot;
-    u32 page_rows;
-    u32 row_bytes;
-    u32 elem;
-};
-
-struct kv_tables {
-    u32 count;
-    u32 unused;
-    ref tables;
-};
-
-// One fetch request. Kept NONE means skip.
-struct alignas(16) request {
-    u32 kept;
-    u32 slot;
-    u32 pos;
-    u32 unused;
-};
-
 #if !defined(__METAL_VERSION__)
 
 TESSERA_FN bool unmapped(u32 entry) {

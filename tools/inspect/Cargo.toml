@@ -11,6 +11,7 @@ name = "tessera-inspect"
 path = "src/main.rs"
 
 [dependencies]
+tessera-device = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-lower = { workspace = true }
 tessera-models = { workspace = true }

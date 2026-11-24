@@ -506,26 +506,26 @@ pub fn packed(inp: usize, out: usize, side: u32, entries: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Expands `$each` over all trellis storage forms.
+/// All trellis forms for `$each`, each with its `form_kind`.
 #[macro_export]
 macro_rules! trellis_forms {
     ($each:ident) => {
         $each! {
-            (Mcg, "", 2, TRELLIS_K2, TRELLIS_K2_ROT),
-            (Mcg, "", 3, TRELLIS_K3, TRELLIS_K3_ROT),
-            (Mcg, "", 4, TRELLIS_K4, TRELLIS_K4_ROT),
-            (Mul1, "_mul1", 2, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT),
-            (Mul1, "_mul1", 3, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT),
-            (Mul1, "_mul1", 4, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT),
-            (Pmcgx, "_pmcgx", 2, TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT),
-            (Pmcgx, "_pmcgx", 3, TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT),
-            (Pmcgx, "_pmcgx", 4, TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT),
+            (Mcg, "", 2, TRELLIS_K2, TRELLIS_K2_ROT, 8),
+            (Mcg, "", 3, TRELLIS_K3, TRELLIS_K3_ROT, 9),
+            (Mcg, "", 4, TRELLIS_K4, TRELLIS_K4_ROT, 10),
+            (Mul1, "_mul1", 2, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT, 11),
+            (Mul1, "_mul1", 3, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT, 12),
+            (Mul1, "_mul1", 4, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT, 13),
+            (Pmcgx, "_pmcgx", 2, TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT, 14),
+            (Pmcgx, "_pmcgx", 3, TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT, 15),
+            (Pmcgx, "_pmcgx", 4, TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT, 16),
         }
     };
 }
 
 macro_rules! lookup_trellis {
-    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {
         /// The form for `k` bits a weight in `codebook`.
         pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
             match (k, codebook) {
@@ -592,7 +592,7 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
 }
 
 macro_rules! define_trellis {
-    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {$(
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {$(
         #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]
         pub const $plain: Trellis<$k> =
             Trellis::named(concat!("trellis_k", $k, $suffix), Codebook::$book);

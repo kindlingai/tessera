@@ -215,7 +215,7 @@ pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Load> {
 }
 
 macro_rules! register_trellis {
-    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident, $kind:literal),)*) => {
         $(
             form!(tessera_mem::trellis::$plain);
             form!(tessera_mem::trellis::$turned);

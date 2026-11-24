@@ -9,22 +9,6 @@
 
 namespace tessera {
 
-struct llm_step {
-    u32 rows;
-    u32 out_rows;
-    u32 vocab;
-    u32 unused;
-    ref token;
-    ref slot;
-    ref position;
-    ref out_row;
-    ref temperature;
-    ref top_k;
-    ref seed;
-    ref logits;
-    ref sampled;
-};
-
 #if !defined(__METAL_VERSION__)
 
 TESSERA_FN const llm_step* llm(const table* t) {
