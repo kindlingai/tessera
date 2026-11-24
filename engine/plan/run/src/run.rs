@@ -62,13 +62,18 @@ impl Base {
 
     /// Whether `plan` is new here. Plans over several zones fail.
     pub(crate) fn fresh(&self, plan: &Plan) -> Result<bool, Error> {
+        self.fresh_with(plan, 0)
+    }
+
+    /// As `fresh`, counting `extra` bytes held beside `plan`'s buffers.
+    pub(crate) fn fresh_with(&self, plan: &Plan, extra: u64) -> Result<bool, Error> {
         if plan.id != 0 && plan.id == self.plan.id {
             return Ok(false);
         }
         if plan.zoned() {
             return Err(Error::Zones);
         }
-        let planned: u64 = plan.buffers.iter().map(|b| *b as u64).sum();
+        let planned: u64 = plan.buffers.iter().map(|b| *b as u64).sum::<u64>() + extra;
         if let Some(budget) = self.budget
             && planned > budget
         {
@@ -227,6 +232,11 @@ pub trait Run {
         Ok(data.slice(share.axis as usize, share.first, share.count))
     }
 
+    /// Uploads packed bytes for `weight` into `slot`.
+    fn upload_weight(&mut self, _weight: u32, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        self.held_mut().upload(slot, bytes)
+    }
+
     /// Uploads a weight as stored, widened where a slot differs.
     fn load_weight(&mut self, weight: u32, w: &Weight) -> Result<(), Error> {
         let (form, bytes) = match w {
@@ -279,7 +289,7 @@ pub trait Run {
                 return Err(Error::WeightSize { weight, form });
             }
             if same {
-                self.held_mut().upload(slot, bytes)?;
+                self.upload_weight(weight, slot, bytes)?;
                 continue;
             }
             let floats = form.unpack_all(bytes);
@@ -301,7 +311,7 @@ pub trait Run {
                     form: slot.form.name(),
                 });
             }
-            self.held_mut().upload(slot, bytes)?;
+            self.upload_weight(weight, slot, bytes)?;
         }
         Ok(())
     }

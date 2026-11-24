@@ -170,12 +170,23 @@ impl Held {
     pub fn bind(
         &mut self,
         plan: &Plan,
+        alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
+    ) -> Result<bool, Error> {
+        self.bind_sized(plan, |_, _| None, alloc)
+    }
+
+    /// As `bind`, allowing custom byte spans for paged weight descriptors.
+    pub fn bind_sized(
+        &mut self,
+        plan: &Plan,
+        sized: impl Fn(u32, Option<u8>) -> Option<usize>,
         mut alloc: impl FnMut(u32, usize, Holds) -> Result<Buffer, Error>,
     ) -> Result<bool, Error> {
         let count = plan.buffers.len();
         let mut weights: Vec<Vec<(WeightKey, usize, usize)>> = vec![Vec::new(); count];
         for l in &plan.weights {
-            let entry = ((l.weight, l.part), l.slot.start(), l.slot.bytes());
+            let bytes = sized(l.weight, l.part).unwrap_or_else(|| l.slot.bytes());
+            let entry = ((l.weight, l.part), l.slot.start(), bytes);
             weights[l.slot.buffer as usize].push(entry);
         }
         let mut kept: Vec<Vec<(u32, usize)>> = vec![Vec::new(); count];

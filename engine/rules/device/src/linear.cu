@@ -41,7 +41,7 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
     u32 blk_per = (k >> 7u) / ks;
     u32 ib0 = p * blk_per;
     bool aligned = (reinterpret_cast<u64>(w + trellis::HEAD) & 15ull) == 0ull;
-    bool input_side = *reinterpret_cast<const u32*>(w + 8u) == trellis::INPUT_SIDE;
+    bool input_side = (*reinterpret_cast<const u32*>(w + 8u) & trellis::SIDE_MASK) == trellis::INPUT_SIDE;
     u64 sG = (input_side ? u64(n >> 1u) : 64ull) * u64(TB);
     const u8* gb = trellis::tile_ptr<K>(w, k, n, 0u, ib0 << 3u, ob, input_side);
     u32 nw[8];
