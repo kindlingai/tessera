@@ -209,8 +209,8 @@ jobs:
   arm64:
     # The aarch64 host paths (SIMD, JIT, proxy) that the x86_64 jobs do
     # not build, and the Metal crates checked for macOS, so the merge
-    # queue does not wait for a macOS runner. Their build scripts need
-    # no C toolchain, so no macOS SDK is needed.
+    # queue does not wait for a macOS runner. Their build scripts do
+    # not compile C, so the job does not need a macOS SDK.
     needs: changes
     if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
