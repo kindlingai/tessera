@@ -14,7 +14,7 @@ use tessera_tasks::api::Info;
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--served-model-name <name>]";
+[--max-batch-rows <n>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored]";
     format!("{head} {} {tail}", task::usage())
 }
@@ -27,6 +27,8 @@ pub struct Options {
     pub max_model_len: usize,
     /// Answers in flight at once.
     pub slots: usize,
+    /// Optional row cap per batched step.
+    pub max_batch_rows: Option<usize>,
     pub name: Option<String>,
     /// The `--task` value, one the registry lists.
     pub(crate) task: &'static str,
@@ -57,6 +59,7 @@ impl Default for Options {
             port: 8080,
             max_model_len: 4096,
             slots: 4,
+            max_batch_rows: None,
             name: None,
             task: "generate",
             given: BTreeMap::new(),
@@ -95,6 +98,13 @@ impl Options {
             "--port" => self.port = value.parse().ok()?,
             "--max-model-len" => self.max_model_len = value.parse().ok()?,
             "--slots" => self.slots = value.parse().ok()?,
+            "--max-batch-rows" => {
+                let n: usize = value.parse().ok()?;
+                if n == 0 {
+                    return None;
+                }
+                self.max_batch_rows = Some(n);
+            }
             "--max-connections" => self.max_connections = value.parse().ok()?,
             "--served-model-name" => self.name = Some(value),
             "--task" => self.task = task::names().into_iter().find(|t| *t == value)?,

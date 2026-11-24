@@ -124,32 +124,28 @@ pub trait Policy {
     fn pick(&mut self, seqs: &[Seq], budget: usize) -> Vec<Row>;
 }
 
-/// Decodes first, then a prompt token each in turn.
+/// Decodes first, then prompts contiguously within the budget.
 pub struct Fair;
 
 impl Policy for Fair {
     fn pick(&mut self, seqs: &[Seq], budget: usize) -> Vec<Row> {
-        let decodes = seqs.iter().filter(|s| !s.prefilling());
-        let mut rows: Vec<Row> = decodes.filter_map(|s| s.row(0)).collect();
-        let mut prompts: Vec<(&Seq, usize)> = seqs
+        let mut rows: Vec<Row> = seqs
             .iter()
-            .filter(|s| s.prefilling())
-            .map(|s| (s, 0))
+            .filter(|s| !s.prefilling())
+            .filter_map(|s| s.row(0))
             .collect();
-        loop {
-            let mut any = false;
-            for (s, fed) in &mut prompts {
-                let Some(row) = s.row(*fed).filter(|_| rows.len() < budget) else {
-                    continue;
-                };
-                rows.push(row);
-                *fed += 1;
-                any = true;
+        for s in seqs.iter().filter(|s| s.prefilling()) {
+            let room = budget.saturating_sub(rows.len());
+            if room == 0 {
+                break;
             }
-            if !any {
-                return rows;
+            for i in 0..room.min(s.pending()) {
+                if let Some(row) = s.row(i) {
+                    rows.push(row);
+                }
             }
         }
+        rows
     }
 }
 
