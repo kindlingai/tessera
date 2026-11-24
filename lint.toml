@@ -1,4 +1,4 @@
-# Rules for stickler, which CI and the hook run.
+# Rules that stickler checks in CI and in the pre-commit hook.
 
 # The stickler release that checks this repository.
 stickler.version = "0.4.0"
