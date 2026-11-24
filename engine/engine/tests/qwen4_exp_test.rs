@@ -218,33 +218,19 @@ fn step_matches_forward() {
 
 #[test]
 fn rotated_trims() {
+    let tiny = tiny_config();
     let c = Config {
         stack: Stack::sized([256, 128, 2, 2, 64, 128], 2, 16),
-        kv_heads: 1,
         rotary: 16,
-        rope_theta: 1e7,
-        eps: 1e-6,
-        hc_count: 4,
         hc_rank: 32,
-        experts: 4,
-        top_k: 2,
         shared_ffn: 128,
         linear: LinearSizes {
-            key_heads: 2,
-            value_heads: 4,
             key_dim: 32,
             value_dim: 32,
-            window: 4,
+            ..tiny.linear
         },
-        layers: vec![LayerKind::Linear, LayerKind::Full],
-        ple: Some(Ple {
-            layer: 1,
-            dim: 128,
-            window: 4,
-            dilation: 3,
-        }),
-        eos_token: 0,
-        tied: false,
+        ple: tiny.ple.map(|p| Ple { dim: 128, ..p }),
+        ..tiny
     };
     let g = stepper::<RotatedMoe>(&c);
     let trimmed = tessera_graph::trim(&g, 0).unwrap();
