@@ -65,11 +65,11 @@ Tag @mmastrac with any of these or other self-improvement ideas in any PR.
 
 ## Code shape
 
-`cargo run -p tessera-lint` checks these, and CI fails on any breach. The limits
+`tools/scripts/stickler.sh lint` checks these, and CI fails on any breach. The limits
 live in `lint.toml`.
 
 Run `tools/scripts/install-hooks.sh` once to check formatting, these rules and
-commit messages before each commit. `cargo run -p tessera-check -- fetch` adds
+commit messages before each commit. `tools/scripts/stickler.sh fetch` adds
 the style and near-copy checks to the hook.
 
 ## Code

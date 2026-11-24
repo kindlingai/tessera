@@ -1,4 +1,8 @@
-# Code-shape limits. tools/lint compiles these in, and CI and the hook enforce them.
+# Rules for stickler, which CI and the hook run.
+
+# The stickler release that checks this repository.
+stickler.version = "0.4.0"
+stickler.releases = "https://github.com/kindlingai/tessera-stickler/releases/download"
 
 # Words in one comment block. Adjacent comment lines are one block.
 max_comment_words = 10
@@ -36,7 +40,7 @@ max_module_test_percent = 25
 # Shapes collapse names and numbers. Struct fields keep their names.
 shape_steps = [[10, 3], [20, 2], [40, 1]]
 
-# tools/simcheck starts windows of lines at anchors its content picks,
+# stickler simcheck starts windows of lines at anchors its content picks,
 # about `similar_spacing` apart. Windows fail at `max_similarity` cosine.
 similar_window = 20
 similar_spacing = 7
@@ -45,7 +49,11 @@ max_similarity = 0.97
 # much gets a note in the pull request. It does not fail.
 max_lean = 0.03
 # Pairs of files that may be near-copies.
-similar_allow = "tools/simcheck/allow.toml"
+similar_allow = "stickler/allow.toml"
+
+# Style rule files and the tag patterns they use.
+style.rules = "stickler/style/rules"
+style.tags = "stickler/style/tags.txt"
 
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip", "kernel"]
@@ -81,7 +89,6 @@ warn_rules = ["thin-edge", "placement", "type-copy"]
 
 # Types with the same members in two crates that are not one concept.
 allowed_type_copies = [
-    ["tools/findings/src/lib.rs::Snippet", "tools/simcheck/src/windows.rs::Window"],
     ["engine/settings/src/lib.rs::Pick", "engine/plan/sim/src/zone.rs::ZoneKind"],
 ]
 

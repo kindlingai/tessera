@@ -94,16 +94,10 @@ Join us on discord (https://discord.gg/8EAvYPV2rE) to discuss larger features to
 <tr><td>&emsp;<a href="frontend/tasks">tasks/</a></td><td>tessera-tasks</td><td>Text in, answers out: generation and tagging over a loaded model</td></tr>
 <tr><td colspan="3"><a href="tools"><b>tools/</b></a></td></tr>
 <tr><td>&emsp;<a href="tools/calibrate">calibrate/</a></td><td>tessera-calibrate</td><td>Times kernels on this machine and stores what they cost</td></tr>
-<tr><td>&emsp;<a href="tools/check">check/</a></td><td>tessera-check</td><td>Runs the style checks, for the terminal or one PR comment</td></tr>
-<tr><td>&emsp;<a href="tools/findings">findings/</a></td><td>tessera-findings</td><td>The JSON each check writes, for tessera-check to render</td></tr>
 <tr><td>&emsp;<a href="tools/inspect">inspect/</a></td><td>tessera-inspect</td><td>Draws a model's graph, its lowering per rank, and tokens between ranks</td></tr>
-<tr><td>&emsp;<a href="tools/lint">lint/</a></td><td>tessera-lint</td><td>The repository's code-shape rules, run by CI and the pre-commit hook</td></tr>
 <tr><td>&emsp;<a href="tools/load">load/</a></td><td>tessera-load</td><td>Drives concurrent requests against tessera-serve and reports throughput</td></tr>
 <tr><td>&emsp;<a href="tools/parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
 <tr><td>&emsp;<a href="tools/publish">publish/</a></td><td>tessera-publish</td><td>Merges the workspace crates into the crates that go to crates.io</td></tr>
 <tr><td>&emsp;<a href="tools/ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
 <tr><td>&emsp;<a href="tools/references">references/</a></td><td>tessera-references</td><td>Fetches the reference files the parity tests read</td></tr>
-<tr><td>&emsp;<a href="tools/shape">shape/</a></td><td>tessera-shape</td><td>Line shapes, with names, numbers and strings collapsed, and merge conflicts</td></tr>
-<tr><td>&emsp;<a href="tools/simcheck">simcheck/</a></td><td>tessera-simcheck</td><td>Fails on near-copies of code, found with EmbeddingGemma 2 embeddings</td></tr>
-<tr><td>&emsp;<a href="tools/style">style/</a></td><td>tessera-style</td><td>Comment and prose style rules, as part-of-speech patterns</td></tr>
 </table>
