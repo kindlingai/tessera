@@ -249,11 +249,17 @@ fn position(r: usize, c: usize) -> usize {
     slot(r as u32, c as u32) as usize
 }
 
-/// Bit `b` of a tile: word pairs swapped, high first.
-fn bit(tile: &[u8], b: usize) -> u32 {
-    let word = (b / 16) ^ 1;
-    let w = u16::from_le_bytes([tile[2 * word], tile[2 * word + 1]]);
-    u32::from(w >> (15 - b % 16)) & 1
+/// 32 stream bits of a `k`-bit tile from bit `s`.
+fn window(k: u32, tile: &[u8], s: u32) -> u32 {
+    // Little-endian words hold 32 stream bits, high first.
+    let word = |q: u32| {
+        let at = 4 * (q % (8 * k)) as usize;
+        u64::from(u32::from_le_bytes(
+            tile[at..at + 4].try_into().expect("4 bytes"),
+        ))
+    };
+    let (q, sh) = (s >> 5, s & 31);
+    (((word(q) << 32 | word(q + 1)) << sh) >> 32) as u32
 }
 
 impl<const K: u32> Trellis<K> {
@@ -297,11 +303,7 @@ impl<const K: u32> Trellis<K> {
         let tile = &bytes[at..at + Self::TILE];
         let j = position(row % 16, col % 16) as u32;
         let (bits, pairs) = (self.codebook.state_bits(), self.codebook.pairs());
-        let first = start::<K>(bits, pairs, j);
-        let mut state = 0;
-        for b in 0..bits {
-            state = (state << 1) | bit(tile, ((first + b) % (256 * K)) as usize);
-        }
+        let state = window(K, tile, start::<K>(bits, pairs, j)) >> (32 - bits);
         self.codebook.weight(state, pairs && j % 2 == 1)
     }
 
