@@ -1,10 +1,11 @@
 //! Slices, repeats, swaps and joins, copied into a new buffer.
 
+use tessera_codegen::kept::{self, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, View};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::kernels::Join;
-use tessera_lower::{Draft, Extent, Home, Kernel, Source, T, Term, Tree};
+use tessera_lower::{Arg, Draft, Extent, Home, Kernel, Launch, Shape, Source, Step, T, Term, Tree};
 
 /// One thread per output or quad, strided reads.
 #[kernel]
@@ -185,6 +186,113 @@ fn strides(
     }
 }
 
+/// Joins two tensors where either may be kept.
+#[kernel]
+fn kept_join(
+    #[form(a_form)] a: Buf<Dyn>,
+    #[form(b_form)] b: Buf<Dyn>,
+    #[form(out_form)] mut out: BufMut<Dyn>,
+    rows: u32,
+    keys: u32,
+    left: u32,
+    right: u32,
+    #[build] a_kept: bool,
+    #[build] b_kept: bool,
+    #[build] a_form: &'static dyn Stored,
+    #[build] b_form: &'static dyn Stored,
+    #[build] out_form: &'static dyn Stored,
+) {
+    let total = left + right;
+    if gid() >= rows * total {
+        return;
+    }
+    let r = gid() / total;
+    let j = gid() % total;
+    let kr = kept_row(r / keys, r % keys);
+    let mut v = 0.0f32;
+    if j < left {
+        let ar = if a_kept { kr } else { r };
+        v = a[(ar * left + j) as u64];
+    } else {
+        let br = if b_kept { kr } else { r };
+        v = b[(br * right + (j - left)) as u64];
+    }
+    out[gid() as u64] = v;
+}
+
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "kept_join",
+    sizes = [],
+    work = self.rows * (self.left + self.right),
+    accepts = kept_join_accepts,
+    emits = kept_join_emits,
+    source = kept_join_source,
+    launches = kept_join_launches,
+)]
+pub(crate) struct KeptJoin {
+    pub rows: usize,
+    pub keys: usize,
+    pub left: usize,
+    pub right: usize,
+    pub slots: usize,
+    pub context: usize,
+    pub a_kept: bool,
+    pub b_kept: bool,
+    pub kept: &'static dyn Layout,
+    pub a_form: &'static dyn Stored,
+    pub b_form: &'static dyn Stored,
+    pub out_form: &'static dyn Stored,
+}
+
+fn kept_join_accepts(k: &KeptJoin, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 => form.name() == k.a_form.name(),
+        1 => form.name() == k.b_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn kept_join_emits(k: &KeptJoin, form: &dyn Stored) -> bool {
+    form.name() == k.out_form.name()
+}
+
+fn kept_join_source(k: &KeptJoin) -> Source {
+    let body = kept::attach(
+        kept_join_ir(k.a_kept, k.b_kept, k.a_form, k.b_form, k.out_form),
+        k.kept,
+    );
+    let flags = usize::from(k.a_kept) | (usize::from(k.b_kept) << 1);
+    let entry = format!(
+        "plan_kept_join_{}_{flags}_{}_{}_{}",
+        k.kept.name(),
+        k.a_form.name(),
+        k.b_form.name(),
+        k.out_form.name(),
+    );
+    Source::named(body, entry)
+}
+
+fn kept_join_launches(k: &KeptJoin, step: &Step) -> Vec<Launch> {
+    let total = k.rows * (k.left + k.right);
+    let sizes = [k.rows, k.keys, k.left, k.right].map(Arg::count);
+    let kept = k
+        .kept
+        .values(k.slots, k.context)
+        .into_iter()
+        .map(|v| Arg::count(v as usize));
+    let args = [step.read(0), step.read(1), step.out()]
+        .into_iter()
+        .chain(step.kept(k.kept))
+        .chain(sizes)
+        .chain(kept)
+        .collect();
+    vec![Launch {
+        args,
+        shape: Shape::Line(total),
+    }]
+}
+
 /// Views of computed or fed float values.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
@@ -205,6 +313,44 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if *view == View::Concat {
         let y = node.args[1];
         let side = |t: T| *tree.node(t).shape.last().unwrap_or(&1);
+        let kept_of = |t: T| match tree.node(t).term {
+            Term::Op(Op::Append(i)) => Some(i),
+            _ => None,
+        };
+        let (xk, yk) = (kept_of(x), kept_of(y));
+        if xk.is_some() || yk.is_some() {
+            let (xs, ys) = (&tree.node(x).shape, &tree.node(y).shape);
+            if xs.len() < 2 || ys.len() < 2 || xs[0] != ys[0] || xs[1] != ys[1] {
+                return None;
+            }
+            let ctx_x = xk.and_then(|i| tree.kept_rows(i).map(|(_, c)| c));
+            let ctx_y = yk.and_then(|i| tree.kept_rows(i).map(|(_, c)| c));
+            if let (Some(cx), Some(cy)) = (ctx_x, ctx_y)
+                && cx != cy
+            {
+                return None;
+            }
+            let context = ctx_x.or(ctx_y)?;
+            let left = side(x);
+            let right = side(y);
+            let rows = tree.elements(x) / left.max(1);
+            let keys = xs[1] * (rows / (xs[0] * xs[1]).max(1));
+            let kernel = KeptJoin {
+                rows,
+                keys,
+                left,
+                right,
+                slots: xs[0],
+                context,
+                a_kept: xk.is_some(),
+                b_kept: yk.is_some(),
+                kept: tree.kept,
+                a_form: plain(tree.node(x).form),
+                b_form: plain(tree.node(y).form),
+                out_form,
+            };
+            return Some(vec![Draft::new(kernel, [x, y], len)]);
+        }
         let join = Join {
             left: side(x),
             right: side(y),
