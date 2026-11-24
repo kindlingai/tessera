@@ -268,8 +268,11 @@ impl<D: Device> Pager<D> {
             hits_cur += s.experts;
         }
         let pct = (pool_used as f64 / total_paged.max(1) as f64) * 100.0;
+        let numa = ctx
+            .numa_node()
+            .map_or(String::new(), |n| format!(" (NUMA node {n})"));
         eprintln!(
-            "tessera: paging {} expert weights: {:.1} GiB VRAM cache ({pct:.0}% resident) + {:.1} GiB pinned host",
+            "tessera: paging {} expert weights: {:.1} GiB VRAM cache ({pct:.0}% resident) + {:.1} GiB pinned host{numa}",
             entries.len(),
             pool_used as f64 / (1u64 << 30) as f64,
             total_paged as f64 / (1u64 << 30) as f64,

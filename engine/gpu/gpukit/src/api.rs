@@ -240,6 +240,7 @@ struct Inner<A: Api> {
     own: A::Own,
     device: c_int,
     name: String,
+    numa_node: Option<u32>,
     modules: Mutex<HashMap<u64, Arc<Module<A>>>>,
     /// Held through a capture, and by every other device call.
     exclusive: Mutex<()>,
@@ -269,17 +270,39 @@ impl<A: Api> Drop for Inner<A> {
 }
 
 impl<A: Api> Context<A> {
-    pub(crate) fn made(api: &'static A, own: A::Own, device: c_int, name: String) -> Self {
+    pub(crate) fn made(
+        api: &'static A,
+        own: A::Own,
+        device: c_int,
+        name: String,
+        numa_node: Option<u32>,
+    ) -> Self {
+        if let Some(node) = numa_node {
+            crate::numa::bind_cpu(node);
+        }
         Self(Arc::new(Inner {
             api,
             own,
             device,
             name,
+            numa_node,
             modules: Mutex::new(HashMap::new()),
             exclusive: Mutex::new(()),
             stamps: Mutex::new(Vec::new()),
             gate: Mutex::new(None),
         }))
+    }
+
+    /// The device's NUMA node on multi-node hosts, if known.
+    pub fn numa_node(&self) -> Option<u32> {
+        self.0.numa_node
+    }
+
+    /// Narrows the calling thread to the device's NUMA CPUs.
+    pub fn bind_numa(&self) {
+        if let Some(node) = self.0.numa_node {
+            crate::numa::bind_cpu(node);
+        }
     }
 
     pub(crate) fn own(&self) -> &A::Own {
@@ -425,6 +448,7 @@ impl<A: Api> Context<A> {
 
     /// Pinned host memory the device maps: (host, device).
     pub fn pin(&self, size: usize) -> Result<(u64, u64), Error> {
+        let _policy = crate::numa::prefer(self.0.numa_node);
         self.locked(|a| a.host_alloc(size))
     }
 
@@ -735,6 +759,14 @@ impl<A: Api> Device for Context<A> {
     fn unified(&self) -> bool {
         let platform = A::describe(self);
         platform.integrated && platform.row.is_some_and(|r| r.pinned)
+    }
+
+    fn numa_node(&self) -> Option<u32> {
+        self.0.numa_node
+    }
+
+    fn bind_numa(&self) {
+        Context::bind_numa(self);
     }
 
     fn register(&self, host: *mut u8, size: usize) -> Result<u64, Error> {

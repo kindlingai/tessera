@@ -80,6 +80,7 @@ fn device_buf<D: Device>(buf: &Buffer) -> &DeviceBuffer<D> {
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
         let ctx = cached_context::<D>()?;
+        ctx.bind_numa();
         let files = |dir: &PathBuf| Overrides::new(dir.clone(), Dialect::of(D::BACKEND));
         let mut runner = Self {
             ctx,

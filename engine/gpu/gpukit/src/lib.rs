@@ -21,6 +21,13 @@ mod dl;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod gate;
 pub mod launch;
+#[cfg_attr(
+    not(all(target_os = "linux", any(feature = "cuda", feature = "rocm"))),
+    allow(dead_code)
+)]
+mod numa;
+#[cfg(test)]
+mod numa_test;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod rtc;
 

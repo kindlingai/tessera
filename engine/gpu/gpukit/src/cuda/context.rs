@@ -100,7 +100,15 @@ impl Context {
             limits: platform.limits,
             platform,
         };
-        Ok(Self::made(driver, own, device, name))
+        let pci = driver
+            .device_name(
+                driver.cu_device_get_pci_bus_id,
+                "cuDeviceGetPCIBusId",
+                device,
+            )
+            .ok();
+        let numa = pci.as_deref().and_then(crate::numa::device_node);
+        Ok(Self::made(driver, own, device, name, numa))
     }
 
     /// Lanes, group memory and group size, from the device.

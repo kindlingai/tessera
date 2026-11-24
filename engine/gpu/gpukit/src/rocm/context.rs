@@ -44,7 +44,15 @@ impl Context {
             lanes: OnceLock::new(),
             platform: OnceLock::new(),
         };
-        let ctx = Self::made(runtime, own, device, name);
+        let pci = runtime
+            .device_name(
+                runtime.hip_device_get_pci_bus_id,
+                "hipDeviceGetPCIBusId",
+                device,
+            )
+            .ok();
+        let numa = pci.as_deref().and_then(crate::numa::device_node);
+        let ctx = Self::made(runtime, own, device, name, numa);
         ctx.set_current()?;
         Ok(ctx)
     }

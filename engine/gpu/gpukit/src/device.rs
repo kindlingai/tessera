@@ -116,6 +116,14 @@ pub trait Device: Clone + Send + Sync + 'static {
         false
     }
 
+    /// The device's NUMA node on multi-node hosts, if known.
+    fn numa_node(&self) -> Option<u32> {
+        None
+    }
+
+    /// Narrows the calling thread to the device's NUMA CPUs.
+    fn bind_numa(&self) {}
+
     /// Maps existing host memory for the device. Returns its address.
     fn register(&self, _host: *mut u8, _size: usize) -> Result<u64, Error> {
         Err(Self::error("this device cannot map host memory".into()))

@@ -64,6 +64,7 @@ tessera_dl::library! {
         pub hip_get_device_count: entry::Int = "hipGetDeviceCount",
         pub hip_set_device: HipSetDevice = "hipSetDevice",
         pub hip_device_get_name: entry::Name = "hipDeviceGetName",
+        pub hip_device_get_pci_bus_id: entry::Name = "hipDeviceGetPCIBusId",
         pub hip_module_load_data: entry::Load = "hipModuleLoadData",
         pub hip_module_unload: entry::OnHandle = "hipModuleUnload",
         pub hip_module_get_function: entry::Function = "hipModuleGetFunction",
