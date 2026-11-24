@@ -36,8 +36,10 @@ fn grid_reaches_rules() {
         "fast_stacked",
         "picked_trellis",
     ];
-    let skipped =
-        |r: &&&tessera_lower::Rule| r.name.starts_with("cpu_") || device_rules.contains(&r.name);
+    // The grid's trellis experts reach picked trellis on CUDA.
+    let cuda = device.platform.backend == "cuda";
+    let device_only = |name| device_rules.contains(&name) && !(cuda && name == "picked_trellis");
+    let skipped = |r: &&&tessera_lower::Rule| r.name.starts_with("cpu_") || device_only(r.name);
     for rule in rules().iter().filter(|r| !skipped(r)) {
         let ran = timed.iter().any(|(step, _)| step.rule == rule.name);
         assert!(ran, "the grid never ran {}", rule.name);

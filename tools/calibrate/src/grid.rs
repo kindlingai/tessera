@@ -1,15 +1,15 @@
 //! Small graphs that reach every rule, at many sizes.
 
 use crate::{BURST, TRIES, choices, measure_with, pending, time_plans};
-use tessera_engine::Error;
+use tessera_engine::{Error, trellis};
 use tessera_graph::DimName::{self, *};
 use tessera_lower::form::BF16_FORM;
 use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, chain, delta, indexed, indexed_rows, linear, neighbours, rotation, routed,
-    rows, table, turned,
+    attention, blocks, chain, delta, indexed, indexed_rows, linear, neighbours, picked, rotation,
+    routed, rows, table, turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -139,8 +139,23 @@ pub(crate) fn opened(
 ) -> Result<Box<dyn Run>, Error> {
     let mut runner = open(plan, settings)?;
     for (at, w) in g.weights.iter().enumerate() {
+        let at = at as u32;
         let data = fill(g, &w.ty, &Vec::new(), noise)?;
-        runner.load(at as u32, data.view())?;
+        // Releases write trellis codes. Here they are noise.
+        let loaded = runner.plan().weights.iter().find(|l| l.weight == at);
+        match loaded.map(|l| l.slot.form).filter(|f| !f.packs()) {
+            Some(form) => {
+                let [inp, out] = [2, 1].map(|end| data.shape[data.shape.len() - end]);
+                let side = trellis::INPUT_SIDE;
+                let head = trellis::packed(inp, out, side, &[]).len();
+                let len = form.bytes(data.len()) - head;
+                let codes: Vec<u8> = (0..len)
+                    .map(|_| (noise.draw() * 127.0) as i8 as u8)
+                    .collect();
+                runner.load_packed(at, &trellis::packed(inp, out, side, &codes))?;
+            }
+            None => runner.load(at, data.view())?,
+        }
     }
     Ok(runner)
 }
@@ -240,6 +255,9 @@ impl Grid {
                 .iter()
                 .map(|&k| by_rows(routed(&one, [8, k, k]))),
         );
+        // Trellis experts, for picked trellis kernels.
+        let codes = Pins::default().pin("set", &trellis::TRELLIS_K3_PMCGX);
+        cases.push(pinned(picked(&one, [4, 128, 128]), codes));
         for &width in self.widths.iter().chain(&self.vocabs) {
             cases.push(by_rows(rows(&one, width)));
             cases.push(by_rows(neighbours(&one, [16, 9, width])));

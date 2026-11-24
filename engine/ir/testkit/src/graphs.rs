@@ -111,6 +111,19 @@ pub fn linear(bounded: &[Dim], k: u64, n: u64) -> Graph {
     m.finish([(Role::Logits, &x.matmul(&w.w))])
 }
 
+/// A product through `act`, then times and plus `y`.
+pub fn finished(bounded: &[Dim], [k, n]: [u64; 2], act: Act) -> Graph {
+    let m = model(bounded, &[(Hidden, k), (Ffn, n)]);
+    let w: Layer = declare(&m);
+    let ports = [
+        rows_of(bounded, Hidden, DType::F32),
+        rows_of(bounded, Ffn, DType::F32),
+    ];
+    let [x, y] = m.entry(EntryKind::Forward, ports);
+    let out = x.matmul(&w.w).scale(0.5).act(act).mul(&y).add(&y);
+    m.finish([(Role::Logits, &out)])
+}
+
 /// `pairs` links of `k` to `n` and back, unshared weights.
 pub fn chain(bounded: &[Dim], k: u64, n: u64, pairs: u64) -> Graph {
     let m = model(bounded, &[(Hidden, k), (Ffn, n), (Layers, pairs)]);
@@ -247,7 +260,16 @@ pub fn turned(bounded: &[Dim]) -> Graph {
 }
 
 /// Each row's top two experts, picked, applied and mixed.
-pub fn routed(bounded: &[Dim], [experts, width, out]: [u64; 3]) -> Graph {
+pub fn routed(bounded: &[Dim], sizes: [u64; 3]) -> Graph {
+    experts(bounded, sizes, true)
+}
+
+/// As `routed`, each expert one whole matrix with no gate.
+pub fn picked(bounded: &[Dim], sizes: [u64; 3]) -> Graph {
+    experts(bounded, sizes, false)
+}
+
+fn experts(bounded: &[Dim], [experts, width, out]: [u64; 3], gated: bool) -> Graph {
     let fixed = [(Experts, experts), (TopK, 2), (Hidden, width), (Ffn, out)];
     let m = model(bounded, &fixed);
     let w: Experts = declare(&m);
@@ -256,9 +278,12 @@ pub fn routed(bounded: &[Dim], [experts, width, out]: [u64; 3]) -> Graph {
     let ids = scores.top_k(TopK);
     let gates = scores.take(&ids).softmax();
     let on = |set: &Linears| x.matmul_rows(&m.pick(set, &ids));
-    let picks = on(&w.set.rows(0u64, Ffn))
-        .act(Act::Silu)
-        .mul(&on(&w.set.rows(Ffn, Ffn)));
+    let picks = match gated {
+        true => on(&w.set.rows(0u64, Ffn))
+            .act(Act::Silu)
+            .mul(&on(&w.set.rows(Ffn, Ffn))),
+        false => on(&w.set),
+    };
     let axis = bounded.len() as u32;
     m.finish([(Role::Logits, &picks.mix(axis, &gates))])
 }

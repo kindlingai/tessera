@@ -289,3 +289,34 @@ fn experts_and_manifests() {
     check_manifest_widths(&dir.join("manifest"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A lone dense file's common layer stem names the experts.
+#[test]
+fn single_file_prefix() {
+    let dir = tessera_testkit::scratch(&format!("{}-exlr8-single", std::process::id()));
+    let lm = "model.language_model.layers.";
+    let (norm0, norm1) = (format!("{lm}0.norm.weight"), format!("{lm}1.norm.weight"));
+    let mults = format!("{lm}1.ple.ple_embedding.layer_multipliers");
+    let ints: Vec<u8> = [3i64, -5, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
+    write(
+        &dir.join("dense/exlr8-dense.safetensors"),
+        &[
+            (&norm0, "F32", vec![1], floats(&[1.0])),
+            (&norm1, "F32", vec![1], floats(&[2.0])),
+            (&mults, "I64", vec![3], ints),
+            ("mtp.layers.0.norm.weight", "F32", vec![1], floats(&[3.0])),
+        ],
+    );
+    let norm = ("norm.weight", "F32", vec![1], floats(&[1.0]));
+    write(&dir.join("dense/exlr8-vocab.safetensors"), &[norm]);
+    write_layer(&dir, 0, &[3], "");
+    let release = Release::open(&dir).width(3);
+    let names: Vec<String> = release.slices().into_iter().map(|s| s.name).collect();
+    assert!(
+        names.contains(&format!("{lm}0.mlp.experts.gate.weight")),
+        "{names:?}"
+    );
+    assert_eq!(release.i64s(&mults).unwrap(), [3, -5, 7]);
+    assert_eq!(release.floats("mtp.layers.0.norm.weight").unwrap(), [3.0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
