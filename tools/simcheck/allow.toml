@@ -1,3 +1,6 @@
 # File pairs allowed to hold near-copies of each other.
 pairs = [
+    ["engine/models/src/mla.rs", "engine/models/src/qwen4_exp.rs"],
+    ["engine/rules/attention/src/conv.rs", "engine/rules/attention/src/delta.rs"],
+    ["engine/rules/device/src/linear/linear.cu", "engine/rules/device/src/moe/trellis.cu"],
 ]
