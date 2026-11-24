@@ -1,4 +1,5 @@
 use super::*;
+use tessera_guest::site::Input;
 
 fn input(shape: Vec<usize>, form: &str, weight: Option<&str>, parts: Option<[usize; 2]>) -> Input {
     Input {

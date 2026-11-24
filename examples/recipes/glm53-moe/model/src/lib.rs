@@ -1,6 +1,6 @@
 //! GLM-5.3's routed block as fused CUDA kernels.
 
-use tessera_guest::site::{Input, Kind, Offer, Place, Shape, Site, Weights, fixed};
+use tessera_guest::site::{Found, Kind, Offer, Place, Shape, Site, Weights, fixed, same, trellis};
 
 const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
@@ -60,21 +60,10 @@ fn split_dim(blocks: usize, want: usize) -> usize {
     1
 }
 
-/// A trellis form's width and codebook: 0 mcg, 1 mul1.
-fn bits(input: &Input) -> Option<[u32; 2]> {
-    let rest = input.form.strip_prefix("trellis_k")?;
-    let (k, book) = match rest.strip_suffix("_mul1") {
-        Some(k) => (k, 1),
-        None => (rest, 0),
-    };
-    let k: u32 = k.parse().ok()?;
-    (2..=4).contains(&k).then_some([k, book])
-}
-
-/// One width and codebook for all of `codes`.
-fn width(codes: &[&Input]) -> Option<[u32; 2]> {
-    let k = bits(codes.first()?)?;
-    codes.iter().all(|c| bits(c) == Some(k)).then_some(k)
+/// One width and mcg or mul1 codebook for all `codes`.
+fn width(codes: &[Found]) -> Option<[u32; 2]> {
+    let t = same(codes.iter().map(|c| trellis(&c.form)))??;
+    (!t.rotated && t.book < 2).then_some([t.k, t.book])
 }
 
 /// Experts this rank holds: first and count.
@@ -83,11 +72,7 @@ fn held(w: &Weights, experts: usize, ffn: usize) -> Option<[usize; 2]> {
     let whole_but =
         |split: &[&str]| (ROUTED.iter()).all(|f| split.contains(f) || share(f).is_none());
     if whole_but(&CODES) {
-        let held = share("gate");
-        if share("up") != held || share("down") != held {
-            return None;
-        }
-        return match held {
+        return match same(CODES.map(share))? {
             None => Some([0, experts]),
             Some([0, first, count, whole]) if whole == experts => Some([first, count]),
             Some(_) => None,
@@ -170,8 +155,8 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         "bf16" => 1,
         _ => return None,
     };
-    let [k, book] = width(&[gate.input, up.input, down.input])?;
-    let [shared_k, shared_book] = width(&shared.map(|s| s.input))?;
+    let [k, book] = width(&[gate, up, down])?;
+    let [shared_k, shared_book] = width(&shared)?;
     let picks = picks(experts)? as usize;
     let [scores, plan, gpart, z] = [0, 1, 2, 3].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
@@ -191,9 +176,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         counts: fixed(&[rows, hidden, experts, bf16]),
         shape: Shape::grid(experts.div_ceil(2), 1, 256),
         work: (rows * experts * hidden) as f64,
-        guess: 1e-12,
-        writes: None,
-        resident: None,
+        ..Offer::default()
     };
     let plan_offer = Offer {
         kernel: PLAN,
@@ -202,9 +185,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         counts: fixed(&[rows, experts, picks, first, count]),
         shape: Shape::grid(1, 1, 256),
         work: (rows * experts) as f64,
-        guess: 1e-12,
-        writes: None,
-        resident: None,
+        ..Offer::default()
     };
     let codes = [k, shared_k, book, shared_book].map(|b| b as usize);
     let fc_counts = [&[rows, hidden, ffn, picks][..], &codes, &[first, wide, ks1]].concat();
@@ -223,8 +204,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         shape: Shape::grid(chunks * 2 * ks1, total_slots, 256),
         work: (total_slots * 2 * hidden * ffn) as f64,
         guess: 1e-15,
-        writes: None,
-        resident: None,
+        ..Offer::default()
     };
     let mut reads = vec![plan, gpart];
     reads.extend([gate_sv, up_sv, down_su, down].map(|f| f.read()));
@@ -238,8 +218,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         shape: Shape::grid(chunks * ns2, total_slots, 256),
         work: (total_slots * hidden * ffn) as f64,
         guess: 1e-15,
-        writes: None,
-        resident: None,
+        ..Offer::default()
     };
     let finish = Offer {
         kernel: FINISH,
@@ -254,9 +233,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         counts: fixed(&[rows, hidden, ffn, picks, wide]),
         shape: Shape::grid(hidden / 128, rows, (picks + 1) * 32),
         work: len as f64,
-        guess: 1e-12,
-        writes: None,
-        resident: None,
+        ..Offer::default()
     };
     Some(vec![route, plan_offer, fc1, fc2, finish])
 }
