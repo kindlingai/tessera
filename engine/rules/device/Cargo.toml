@@ -21,4 +21,7 @@ tessera-run = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]
+tessera-codegen = { workspace = true }
+tessera-host = { workspace = true }
+tessera-mem = { workspace = true }
 tessera-testkit = { workspace = true }

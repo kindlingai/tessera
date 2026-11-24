@@ -80,7 +80,7 @@ fn mul1_values() {
         (0x0F0F, 0.6875),
     ];
     for (state, v) in want {
-        assert_eq!(Codebook::Mul1.value(state), v, "state {state:#x}");
+        assert_eq!(Codebook::Mul1.weight(state, false), v, "state {state:#x}");
     }
 }
 

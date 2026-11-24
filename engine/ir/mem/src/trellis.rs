@@ -32,81 +32,174 @@ pub struct Trellis<const K: u32> {
     pub codebook: Codebook,
 }
 
-/// The hash from a trellis state to its weight.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Codebook {
-    Mcg,
-    Mul1,
-    /// Two weights share one 20-bit state.
-    Pmcgx,
+/// Expands `$each` over all codebooks.
+// Row: variant, name, suffix, state bits, pairs, weight function.
+#[macro_export]
+macro_rules! codebooks {
+    ($each:ident) => {
+        $each! {
+            (Mcg, "mcg", "", 16, false, mcg),
+            (Mul1, "mul1", ".mul1", 16, false, mul1),
+            (Pmcgx, "pmcgx", ".pmcgx", 20, true, pmcgx),
+        }
+    };
 }
 
-impl Codebook {
-    /// Every codebook, in the order a reader tries them.
-    pub const ALL: [Codebook; 3] = [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx];
-
-    /// The codebook a manifest calls `name`.
-    pub fn named(name: &str) -> Option<Self> {
-        match name {
-            "mcg" => Some(Codebook::Mcg),
-            "mul1" => Some(Codebook::Mul1),
-            "pmcgx" => Some(Codebook::Pmcgx),
-            _ => None,
-        }
-    }
-
-    /// The suffix a release appends to its tensor names.
-    pub fn suffix(self) -> &'static str {
-        match self {
-            Codebook::Mcg => "",
-            Codebook::Mul1 => ".mul1",
-            Codebook::Pmcgx => ".pmcgx",
-        }
-    }
-
-    /// Bits in a state.
-    fn state_bits(self) -> usize {
-        match self {
-            Codebook::Pmcgx => 20,
-            _ => 16,
-        }
-    }
-
-    /// A state's weight. pmcgx gives the pair's even one.
-    pub fn value(self, state: u32) -> f32 {
-        self.weight(state, false)
-    }
-
-    /// Weight `odd` of a state's pair, or its only weight.
-    pub fn weight(self, state: u32, odd: bool) -> f32 {
-        let state = state & ((1 << self.state_bits()) - 1);
-        let v = match self {
-            Codebook::Mcg => {
-                let [low, high] = mcg_halves(state, MCG);
-                f32::from(F16::from(low + high))
+/// Expands `$each` over the shared host and kernel functions.
+// Bodies use only kernel operations. Strings name kernel helpers.
+#[macro_export]
+macro_rules! trellis_fns {
+    ($each:ident) => {
+        $each! {
+            /// An mcg state's weight: one hash, its halves summed.
+            "trellis_mcg"
+            fn mcg(state: u32, _odd: u32) -> f32 {
+                let x = ((state & 0xFFFF).wrapping_mul(MCG) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+                round_e4m3(round_f16(x.f16(0) + x.f16(16)))
             }
-            Codebook::Pmcgx => {
-                let ([a, b], [c, d]) = (mcg_halves(state, MCG), mcg_halves(state, PMCG2));
-                let (x, y) = if odd { (b, c) } else { (a, d) };
-                f32::from(F16::from(x + y))
+
+            /// A mul1 state's weight.
+            // Exact in f32: `round_f16` alone rounds, as fused f16 does.
+            "trellis_mul1"
+            fn mul1(state: u32, _odd: u32) -> f32 {
+                let z = (state & 0xFFFF).wrapping_mul(MUL1);
+                let sum = (z & 0xFF) + ((z >> 8) & 0xFF) + ((z >> 16) & 0xFF) + (z >> 24);
+                round_e4m3(round_f16((1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET))
             }
-            Codebook::Mul1 => {
-                let x = state.wrapping_mul(MUL1);
-                let sum: u32 = x.to_le_bytes().iter().map(|b| u32::from(*b)).sum();
-                // Exact in f32: one rounding, like a fused multiply-add.
-                let v = (1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET;
-                f32::from(F16::from(v))
+
+            /// Weight `odd` of a pmcgx pair: two hashes, halves crossed.
+            "trellis_pmcgx"
+            fn pmcgx(state: u32, odd: u32) -> f32 {
+                let w = state & 0xF_FFFF;
+                let x = (w.wrapping_mul(MCG) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+                let y = (w.wrapping_mul(PMCG2) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
+                let raw = if odd != 0 {
+                    x.f16(16) + y.f16(0)
+                } else {
+                    x.f16(0) + y.f16(16)
+                };
+                round_e4m3(round_f16(raw))
             }
-        };
-        f32::from(E4M3::from(v.clamp(-448.0, 448.0)))
+
+            /// Stream position of tile element `(r, c)`.
+            "trellis_slot"
+            fn slot(r: u32, c: u32) -> u32 {
+                8 * (4 * (c % 8) + (r % 8) / 2) + 4 * (c >= 8) as u32 + 2 * (r >= 8) as u32 + r % 2
+            }
+
+            /// The first bit of code `j`'s state, wrapping.
+            "trellis_start_k{K}_s{bits}_p{pairs}"
+            fn start<const K: u32>(#[build] bits: u32, #[build] pairs: bool, j: u32) -> u32 {
+                if pairs {
+                    // A pair's state ends at bit 2K(p+1).
+                    (2 * K * (j / 2 + 1) + 256 * K - bits) % (256 * K)
+                } else {
+                    // A state spans `bits / K` codes, rounded up.
+                    ((j + (256 - (bits - 1) / K)) % 256) * K + (((bits - 1) / K + 1) * K - bits)
+                }
+            }
+
+            /// The tile of `T[row][col]` within one matrix.
+            "trellis_local"
+            fn local(inp: u32, out: u32, side: u32, row: u32, col: u32) -> u32 {
+                // An entry: 128 channels by all of the other side.
+                let c = (col % 128) / 16;
+                if (side & 0xFFFF) == INPUT_SIDE {
+                    (row / 128) * (out / 2) + 64 * (col / 128) + 8 * ((row % 128) / 16) + c
+                } else {
+                    (col / 128) * (inp / 2) + 8 * (row / 16) + c
+                }
+            }
+        }
+    };
+}
+
+macro_rules! host_fns {
+    ($($(#[$doc:meta])* $kernel:literal
+        fn $name:ident $(<const $c:ident: $ct:ty>)?
+            ($($(#[$build:meta])* $arg:ident: $ty:tt),*) -> $ret:tt $body:block)*) => {$(
+        $(#[$doc])*
+        fn $name $(<const $c: $ct>)? ($($arg: $ty),*) -> $ret $body
+    )*};
+}
+
+crate::trellis_fns!(host_fns);
+
+/// Kernel bit reads of a word, for the shared bodies.
+trait Bits {
+    /// The 16 bits from `low` read as an f16.
+    fn f16(self, low: u32) -> f32;
+}
+
+impl Bits for u32 {
+    fn f16(self, low: u32) -> f32 {
+        F16((self >> low) as u16).into()
     }
 }
 
-/// `state` hashed by `by`, masked as mcg's, as two halves.
-fn mcg_halves(state: u32, by: u32) -> [f32; 2] {
-    let x = (state.wrapping_mul(by) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
-    [F16((x & 0xFFFF) as u16), F16((x >> 16) as u16)].map(f32::from)
+/// `x` to f16, nearest even.
+fn round_f16(x: f32) -> f32 {
+    F16::from(x).into()
 }
+
+/// `x` to e4m3, nearest even, 448 at most.
+fn round_e4m3(x: f32) -> f32 {
+    E4M3::from(x.clamp(-448.0, 448.0)).into()
+}
+
+macro_rules! define_codebook {
+    ($(($book:ident, $name:literal, $suffix:literal, $bits:literal, $pairs:literal,
+        $weight:ident),)*) => {
+        /// The hash from a trellis state to its weight.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Codebook {
+            $($book,)*
+        }
+
+        impl Codebook {
+            /// Every codebook, in the order a reader tries them.
+            pub const ALL: [Codebook; [$($name),*].len()] = [$(Codebook::$book),*];
+
+            /// The codebook a manifest calls `name`.
+            pub fn named(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Codebook::$book),)*
+                    _ => None,
+                }
+            }
+
+            /// The suffix a release appends to its tensor names.
+            pub fn suffix(self) -> &'static str {
+                match self {
+                    $(Codebook::$book => $suffix,)*
+                }
+            }
+
+            /// Bits in a state.
+            pub fn state_bits(self) -> u32 {
+                match self {
+                    $(Codebook::$book => $bits,)*
+                }
+            }
+
+            /// Whether a state holds two weights.
+            pub fn pairs(self) -> bool {
+                match self {
+                    $(Codebook::$book => $pairs,)*
+                }
+            }
+
+            /// Weight `odd` of a state's pair, or its only weight.
+            pub fn weight(self, state: u32, odd: bool) -> f32 {
+                match self {
+                    $(Codebook::$book => $weight(state, u32::from(odd)),)*
+                }
+            }
+        }
+    };
+}
+
+crate::codebooks!(define_codebook);
 
 /// The matrix's shape and side, from the header.
 struct Shape {
@@ -146,25 +239,14 @@ impl Shape {
 
     /// The tile within one matrix.
     fn local(&self, row: usize, col: usize) -> usize {
-        // An entry: 128 channels by all of the other side.
-        match self.side {
-            INPUT_SIDE => {
-                let (entry, r) = (row / ENTRY, row % ENTRY / 16);
-                entry * (self.out / 2) + 64 * (col / ENTRY) + 8 * r + col % ENTRY / 16
-            }
-            _ => {
-                let (entry, c) = (col / ENTRY, col % ENTRY / 16);
-                entry * (self.inp / 2) + 8 * (row / 16) + c
-            }
-        }
+        let [inp, out, row, col] = [self.inp, self.out, row, col].map(|v| v as u32);
+        local(inp, out, self.side, row, col) as usize
     }
 }
 
 /// Stream position of tile element `(r, c)`.
 fn position(r: usize, c: usize) -> usize {
-    let t = 4 * (c % 8) + (r % 8) / 2;
-    let s = 4 * usize::from(c >= 8) + 2 * usize::from(r >= 8) + r % 2;
-    8 * t + s
+    slot(r as u32, c as u32) as usize
 }
 
 /// Bit `b` of a tile: word pairs swapped, high first.
@@ -207,40 +289,20 @@ impl<const K: u32> Trellis<K> {
     /// The size of one tile of 256 codes, in bytes.
     const TILE: usize = 32 * K as usize;
 
-    /// The code at stream position `j` of a tile.
-    fn code(tile: &[u8], j: usize) -> u32 {
-        let (k, b) = (K as usize, j * K as usize);
-        if 16 % k != 0 {
-            return (0..k).fold(0, |v, i| (v << 1) | bit(tile, b + i));
-        }
-        // Codes that divide a word sit in one, high first.
-        let word = (b / 16) ^ 1;
-        let w = u16::from_le_bytes([tile[2 * word], tile[2 * word + 1]]);
-        u32::from(w >> (16 - k - b % 16)) & ((1 << k) - 1)
-    }
-
     /// Element `index` of a `[out][in]` matrix in `bytes`.
     fn decode(&self, bytes: &[u8], index: usize) -> f32 {
         let shape = Shape::read(bytes);
         let (col, row) = (index / shape.inp, index % shape.inp);
         let at = HEAD + shape.tile(row, col) * Self::TILE;
         let tile = &bytes[at..at + Self::TILE];
-        let j = position(row % 16, col % 16);
-        if self.codebook == Codebook::Pmcgx {
-            // A pair's 20-bit state ends at bit 2K(p+1), wrapping.
-            let (ring, end) = (256 * K as usize, 2 * K as usize * (j / 2 + 1));
-            let mut state = 0;
-            for b in 0..20 {
-                state |= bit(tile, (end + ring - 1 - b) % ring) << b;
-            }
-            return self.codebook.weight(state, j % 2 == 1);
-        }
-        // A state: the 16 bits ending at its value, wrapping.
+        let j = position(row % 16, col % 16) as u32;
+        let (bits, pairs) = (self.codebook.state_bits(), self.codebook.pairs());
+        let first = start::<K>(bits, pairs, j);
         let mut state = 0;
-        for t in 0..16usize.div_ceil(K as usize) {
-            state |= Self::code(tile, (j + 256 - t) % 256) << (t * K as usize);
+        for b in 0..bits {
+            state = (state << 1) | bit(tile, ((first + b) % (256 * K)) as usize);
         }
-        self.codebook.value(state)
+        self.codebook.weight(state, pairs && j % 2 == 1)
     }
 
     /// The first `n` decoded elements, a tile at a time.
@@ -252,7 +314,7 @@ impl<const K: u32> Trellis<K> {
         spread(&mut t, 16 * inp, |c16, piece| {
             for r16 in 0..inp / 16 {
                 let at = HEAD + shape.tile(16 * r16, 16 * c16) * Self::TILE;
-                let pairs = self.codebook == Codebook::Pmcgx;
+                let pairs = self.codebook.pairs();
                 let tile = &bytes[at..at + Self::TILE];
                 let w = stream(K as usize, pairs, tile, |s, odd| {
                     self.codebook.weight(s, odd)
@@ -304,7 +366,7 @@ pub fn rows<T: Clone + Send>(
     // None for a width or codebook this engine lacks.
     form_for(k, codebook)?;
     let (k, width) = (k as usize, suh.len());
-    let (tile, pairs) = (32 * k, codebook == Codebook::Pmcgx);
+    let (tile, pairs) = (32 * k, codebook.pairs());
     let bytes = width / 256 * tile;
     // Each row must hold whole tiles, else None.
     if !width.is_multiple_of(256) || codes.len() != svh.len() * bytes {

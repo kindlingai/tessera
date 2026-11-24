@@ -2,11 +2,81 @@
 
 use crate as tessera_codegen;
 use crate::form::{Load, form, named};
-use crate::ir::Helper;
-use crate::prelude::{Bits, Buf, F32x4, U8, helper, round_e4m3, round_f16};
+use crate::inline::{Inline, Pass};
+use crate::ir::{Expr, Helper};
+use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, round_e4m3, round_f16};
 use tessera_mem::trellis::*;
 
 pub use tessera_mem::trellis::{INPUT_SIDE, packed};
+
+/// Each shared trellis function as a helper, `name::body`.
+macro_rules! kernel_fns {
+    ($($(#[$doc:meta])* $kernel:literal
+        fn $name:ident $(<const $c:ident: $ct:ty>)?
+            ($($(#[$build:meta])* $arg:ident: $ty:tt),*) -> $ret:tt $body:block)*) => {$(
+        $(#[$doc])*
+        pub mod $name {
+            use super::*;
+            #[helper($kernel)]
+            pub fn body $(<const $c: $ct>)? ($($(#[$build])* $arg: $ty),*) -> $ret $body
+        }
+    )*};
+}
+
+tessera_mem::trellis_fns!(kernel_fns);
+
+/// A codebook, typed for kernel text.
+pub trait LoadBook {
+    /// Bits in a state.
+    const BITS: u32;
+    /// Whether a state holds two weights.
+    const PAIRS: bool;
+
+    /// Weight `odd` of `state`, in a kernel.
+    fn weight(_: u32, _: u32) -> f32 {
+        device()
+    }
+
+    /// `weight` as a tree.
+    fn weight_inline(state: impl Pass<Expr>, odd: impl Pass<Expr>) -> Inline;
+}
+
+/// Codebook types, and a form's helpers in each.
+macro_rules! kernel_books {
+    ($(($book:ident, $name:literal, $suffix:literal, $bits:literal, $pairs:literal,
+        $weight:ident),)*) => {
+        /// Codebooks as types.
+        pub mod book {
+            $(
+                #[doc = concat!("The ", $name, " codebook.")]
+                pub struct $book;
+            )*
+        }
+
+        $(
+            impl LoadBook for book::$book {
+                const BITS: u32 = $bits;
+                const PAIRS: bool = $pairs;
+
+                fn weight_inline(state: impl Pass<Expr>, odd: impl Pass<Expr>) -> Inline {
+                    $weight::body_inline(state, odd)
+                }
+            }
+        )*
+
+        /// The one-element and four-element helpers of a form.
+        fn decoders<const K: u32>(name: &'static str, codebook: Codebook) -> [Helper; 2] {
+            match codebook {
+                $(Codebook::$book => [
+                    one_ir::<book::$book, K>(name),
+                    four_ir::<book::$book, K>(name),
+                ],)*
+            }
+        }
+    };
+}
+
+tessera_mem::codebooks!(kernel_books);
 
 /// A swapped word pair as 32 stream bits.
 #[helper("form_{name}_pair")]
@@ -27,71 +97,14 @@ fn win<const K: u32>(#[build] name: &'static str, t: Buf<U8>, s: u32) -> u32 {
     }
 }
 
-/// Build code of the mul1 codebook.
-const MUL1_BOOK: u32 = 1;
-/// Build code of pmcgx. Its states hold pairs.
-const PAIRS: u32 = 2;
-
-/// A codebook's build code.
-fn book(codebook: Codebook) -> u32 {
-    match codebook {
-        Codebook::Mcg => 0,
-        Codebook::Mul1 => MUL1_BOOK,
-        Codebook::Pmcgx => PAIRS,
-    }
-}
-
-/// The first bit of code `j`'s state.
-#[helper("form_{name}_start")]
-fn first<const K: u32>(#[build] name: &'static str, #[build] book: u32, j: u32) -> u32 {
-    if book == PAIRS {
-        // A pair's 20 bits end at bit 2K(p+1), wrapping.
-        (2 * K * (j / 2 + 1) + 256 * K - 20) % (256 * K)
-    } else {
-        // A state spans `16 / K` codes, wrapping at 256.
-        ((j + (257 - (16 + K - 1) / K)) % 256) * K + ((16 + K - 1) / K * K - 16)
-    }
-}
-
-/// Weight `odd` of a pair state: two hashes, then rounded.
-#[helper("form_{name}_pair_value")]
-fn pair_value(#[build] name: &'static str, state: u32, odd: u32) -> f32 {
-    let w = state & 0xFFFFF;
-    let x = ((w * MCG) & 0x8FFF8FFF) ^ 0x3B603B60;
-    let y = ((w * PMCG2) & 0x8FFF8FFF) ^ 0x3B603B60;
-    let raw = if odd != 0 {
-        x.f16(16) + y.f16(0)
-    } else {
-        x.f16(0) + y.f16(16)
-    };
-    round_e4m3(round_f16(raw))
-}
-
 /// Weight `odd` of window `w`: pair half, or next code.
 #[helper("form_{name}_lane")]
-fn lane<const K: u32>(#[build] name: &'static str, #[build] book: u32, w: u32, odd: u32) -> f32 {
-    if book == PAIRS {
-        pair_value(name, w >> 12, odd)
+fn lane<B: LoadBook, const K: u32>(#[build] name: &'static str, w: u32, odd: u32) -> f32 {
+    if B::PAIRS {
+        B::weight(w >> (32 - B::BITS), odd)
     } else {
-        value(name, book, w >> (16 - K * odd))
+        B::weight(w >> (32 - B::BITS - K * odd), 0)
     }
-}
-
-/// A state's weight: hashed, then rounded to f16 and e4m3.
-#[helper("form_{name}_value")]
-fn value(#[build] name: &'static str, #[build] book: u32, state: u32) -> f32 {
-    let s = state & 0xFFFF;
-    let x = s * MCG;
-    let y = (x & 0x8FFF8FFF) ^ 0x3B603B60;
-    let z = s * MUL1;
-    let sum = (z & 0xFF) + ((z >> 8) & 0xFF) + ((z >> 16) & 0xFF) + (z >> 24);
-    let scaled = (1024 + sum) as f32 * MUL1_SCALE + MUL1_OFFSET;
-    let raw = if book == MUL1_BOOK {
-        scaled
-    } else {
-        y.f16(0) + y.f16(16)
-    };
-    round_e4m3(round_f16(raw))
 }
 
 /// Element `n`'s column: a float estimate, corrected by one.
@@ -118,11 +131,7 @@ fn tile<const K: u32>(#[build] name: &'static str, p: Buf<U8>, row: u32, at: u32
     // Columns past `out` lie in later matrices of a set.
     let col = at % out;
     let m = at / out;
-    let t = if (side & 0xFFFF) == INPUT_SIDE {
-        (row / 128) * (out / 2) + 64 * (col / 128) + 8 * ((row % 128) / 16) + (col % 128) / 16
-    } else {
-        (col / 128) * (inp / 2) + 8 * (row / 16) + (col % 128) / 16
-    };
+    let t = local::body(inp, out, side, row, col);
     let base = if (side & 0x8000_0000) != 0 {
         (p.word(24 + m * 8) as u64) | ((p.word(28 + m * 8) as u64) << 32)
     } else {
@@ -131,51 +140,39 @@ fn tile<const K: u32>(#[build] name: &'static str, p: Buf<U8>, row: u32, at: u32
     p + (base + t as u64 * (32 * K) as u64)
 }
 
-/// Stream position of tile element `(r, c)`.
-#[helper("form_{name}_j")]
-fn slot(#[build] name: &'static str, r: u32, c: u32) -> u32 {
-    8 * (4 * (c % 8) + (r % 8) / 2) + 4 * (c >= 8) as u32 + 2 * (r >= 8) as u32 + (r % 2)
-}
-
 /// Element `i` of a `[out][in]` matrix at `p`.
 #[helper("form_{name}")]
-fn one<const K: u32>(#[build] name: &'static str, #[build] book: u32, p: Buf<U8>, i: u64) -> f32 {
+fn one<B: LoadBook, const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> f32 {
     let inp = p.word(0);
     let n = i as u32;
     let c = col(name, p, n, inp);
     let row = n - c * inp;
     let t = tile::<K>(name, p, row, c);
-    let j = slot(name, row % 16, c % 16);
-    let odd = if book == PAIRS { j % 2 } else { 0 };
-    lane::<K>(
+    let j = slot::body(row % 16, c % 16);
+    let odd = if B::PAIRS { j % 2 } else { 0 };
+    lane::<B, K>(
         name,
-        book,
-        win::<K>(name, t, first::<K>(name, book, j)),
+        win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j)),
         odd,
     )
 }
 
 /// Four along a row: codes `j`, `j+1`, `j+8`, `j+9`.
 #[helper("form_{name}_x4")]
-fn four<const K: u32>(
-    #[build] name: &'static str,
-    #[build] book: u32,
-    p: Buf<U8>,
-    i: u64,
-) -> F32x4 {
+fn four<B: LoadBook, const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u64) -> F32x4 {
     let inp = p.word(0);
     let n = i as u32;
     let c = col(name, p, n, inp);
     let row = n - c * inp;
     let t = tile::<K>(name, p, row, c);
-    let j = slot(name, row % 16, c % 16);
-    let a = win::<K>(name, t, first::<K>(name, book, j));
-    let b = win::<K>(name, t, first::<K>(name, book, j + 8));
+    let j = slot::body(row % 16, c % 16);
+    let a = win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j));
+    let b = win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j + 8));
     F32x4::new(
-        lane::<K>(name, book, a, 0),
-        lane::<K>(name, book, a, 1),
-        lane::<K>(name, book, b, 0),
-        lane::<K>(name, book, b, 1),
+        lane::<B, K>(name, a, 0),
+        lane::<B, K>(name, a, 1),
+        lane::<B, K>(name, b, 0),
+        lane::<B, K>(name, b, 1),
     )
 }
 
@@ -197,15 +194,11 @@ impl<const K: u32> Load for Trellis<K> {
         format!("form_{}_x4({name}, {index})", self.name)
     }
     fn decoder(&self, wide: bool) -> Option<Helper> {
-        let book = book(self.codebook);
-        Some(match wide {
-            true => four_ir::<K>(self.name, book),
-            false => one_ir::<K>(self.name, book),
-        })
+        let [one, four] = decoders::<K>(self.name, self.codebook);
+        Some(if wide { four } else { one })
     }
     fn header(&self) -> Vec<Helper> {
-        let book = book(self.codebook);
-        vec![one_ir::<K>(self.name, book), four_ir::<K>(self.name, book)]
+        decoders::<K>(self.name, self.codebook).into()
     }
 }
 

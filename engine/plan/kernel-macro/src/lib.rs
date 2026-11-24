@@ -954,6 +954,10 @@ fn expr(e: &Expr, ctx: &Ctx) -> Res {
             let recv = sub(&m.receiver)?;
             let args: Vec<Tokens> = m.args.iter().map(sub).collect::<Result<_, _>>()?;
             let method = m.method.to_string();
+            // Kernel `u32` products wrap.
+            if let ("wrapping_mul", [by]) = (method.as_str(), args.as_slice()) {
+                return Ok(quote!(Expr::bin(BinOp::Mul, #recv, #by)));
+            }
             let Some(intrinsic) = variant(true, &method) else {
                 return Err(Error::new(m.method.span(), format!("no `{method}` here")));
             };

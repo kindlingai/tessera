@@ -17,6 +17,8 @@ pub mod proxy;
 mod proxy_test;
 pub mod resident;
 pub mod sums;
+#[cfg(test)]
+mod trellis_test;
 pub mod whole;
 #[cfg(test)]
 mod whole_test;

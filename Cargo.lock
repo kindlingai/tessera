@@ -1837,9 +1837,11 @@ dependencies = [
 name = "tessera-device"
 version = "0.1.0"
 dependencies = [
+ "tessera-codegen",
  "tessera-engine-comm",
  "tessera-gpukit",
  "tessera-graph",
+ "tessera-host",
  "tessera-lower",
  "tessera-mem",
  "tessera-run",
