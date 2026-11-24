@@ -162,6 +162,10 @@ impl File {
         self.entries.get(name).map(|e| e.shape.as_slice())
     }
 
+    pub(crate) fn dtype(&self, name: &str) -> Option<&str> {
+        self.entries.get(name).map(|e| e.dtype.as_str())
+    }
+
     pub fn is_bf16(&self, name: &str) -> bool {
         self.entries
             .get(name)
@@ -318,6 +322,28 @@ impl Shards {
     fn holding(&self, name: &str) -> Result<&File, Error> {
         let found = self.0.iter().find(|f| f.shape(name).is_some());
         found.ok_or_else(|| Error::Missing(name.into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_files(files: Vec<File>) -> Self {
+        Self(files)
+    }
+
+    pub(crate) fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.holding(name).ok()?.shape(name)
+    }
+
+    pub(crate) fn dtype(&self, name: &str) -> Option<&str> {
+        self.holding(name).ok()?.dtype(name)
+    }
+
+    pub(crate) fn bytes_at(
+        &self,
+        name: &str,
+        from: u64,
+        len: Option<u64>,
+    ) -> Result<Vec<u8>, Error> {
+        self.holding(name)?.bytes_at(name, from, len)
     }
 }
 

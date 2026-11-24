@@ -20,6 +20,9 @@ mod offer;
 #[cfg(test)]
 mod offer_test;
 mod pickle;
+mod quant;
+#[cfg(test)]
+mod quant_test;
 mod torch;
 #[cfg(test)]
 mod torch_test;
@@ -45,5 +48,5 @@ pub fn open(path: &Path, manifest: Option<&str>) -> Result<Box<dyn Offer>, Error
     if exlr8::is_release(path) {
         return Ok(Box::new(exlr8::open_manifest(path, manifest)?));
     }
-    Ok(Box::new(Shards::open(path)?))
+    quant::wrap(path, Shards::open(path)?)
 }
