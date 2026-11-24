@@ -48,6 +48,15 @@ struct Settings {
     max_similarity: f32,
     max_lean: f32,
     extensions: Vec<String>,
+    similar_allow: String,
+}
+
+/// The repository root, and its lint.toml.
+fn settings() -> Result<(PathBuf, Settings)> {
+    let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
+    let path = root.join("lint.toml");
+    let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    Ok((root, toml::from_str(&text)?))
 }
 
 /// Texts per call to the model, and per progress line.
@@ -165,9 +174,10 @@ fn check(
     (json, base): (Option<&Path>, Option<&str>),
     mode: &Mode,
 ) -> Result<bool> {
-    let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
-    let allow = Allow::parse(include_str!("../allow.toml"))?;
-    let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
+    let (root, s) = settings()?;
+    let allow =
+        std::fs::read_to_string(root.join(&s.similar_allow)).context(s.similar_allow.clone())?;
+    let allow = Allow::parse(&allow)?;
     let wins = all_windows(&root, &s)?;
     let mut cache = Cache::open(cache_file)?;
     let changed = changed_files(&root, base, mode.staged)?;
@@ -215,10 +225,18 @@ fn check(
         );
     }
     for (a, b) in &stale {
-        println!("tools/simcheck/allow.toml: stale: {a} and {b} are not near-copies");
+        println!(
+            "{}: stale: {a} and {b} are not near-copies",
+            s.similar_allow
+        );
     }
     if let Some(path) = json {
-        let r = report::report((&hits, &stale, &leans), &wins, &root, (limits, coverage))?;
+        let r = report::report(
+            (&hits, &stale, &leans),
+            &wins,
+            (&root, &s.similar_allow),
+            (limits, coverage),
+        )?;
         r.write(path).map_err(anyhow::Error::msg)?;
     }
     Ok(mode.warm || (hits.is_empty() && stale.is_empty()))
@@ -286,8 +304,7 @@ type Tree = (Vec<Window>, Vec<Vec<f32>>, Vec<String>);
 
 /// Embeds the tree.
 fn tree(model: &Path, cache_file: Option<&Path>) -> Result<Tree> {
-    let s: Settings = toml::from_str(include_str!("../../../lint.toml"))?;
-    let root = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?.trim());
+    let (root, s) = settings()?;
     let wins = all_windows(&root, &s)?;
     let mut cache = Cache::open(cache_file)?;
     // `far` and `place` need every window.

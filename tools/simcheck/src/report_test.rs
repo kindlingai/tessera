@@ -23,7 +23,13 @@ fn report_lists_each_kind() {
         other: "b".into(),
         near: 0.9,
     };
-    let r = report((&[hit], &[&pair], &[lean]), &wins, root, ((20, 0.97), None)).unwrap();
+    let r = report(
+        (&[hit], &[&pair], &[lean]),
+        &wins,
+        (root, "allow.toml"),
+        ((20, 0.97), None),
+    )
+    .unwrap();
     let rules: Vec<&str> = r.findings.iter().map(|f| f.rule.as_str()).collect();
     assert_eq!(rules, ["near-copy", "stale-allow", "new-file-lean"]);
     assert!(r.findings[0].snippets[0].text.starts_with("//! Downloads"));
