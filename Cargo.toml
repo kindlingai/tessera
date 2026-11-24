@@ -19,6 +19,7 @@ members = [
     "tools/parity",
     "tools/publish",
     "tools/ranks",
+    "tools/references",
     "tools/shape",
     "tools/style",
 ]
@@ -62,6 +63,7 @@ tessera-mem = { path = "engine/ir/mem" }
 tessera-models = { path = "engine/models" }
 tessera-platform = { path = "engine/gpu/platform" }
 tessera-recipe = { path = "frontend/recipe" }
+tessera-references = { path = "tools/references" }
 tessera-parity = { path = "tools/parity" }
 tessera-run = { path = "engine/plan/run" }
 tessera-serve = { path = "frontend/serve" }

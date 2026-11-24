@@ -10,7 +10,7 @@ mod source;
 #[cfg(test)]
 mod source_test;
 
-pub use hub::fetch as fetch_hf;
+pub use hub::{fetch as fetch_hf, fetch_as, safe_path};
 pub use source::Source;
 
 use serde::Deserialize;
