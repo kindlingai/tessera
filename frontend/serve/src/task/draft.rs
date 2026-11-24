@@ -213,6 +213,7 @@ pub(super) fn serve(
     let generate = Generate {
         tokenizer: target.tokenizer,
         template: target.template,
+        response: target.response,
         stop: target.stop,
         guides: None,
     };

@@ -31,7 +31,7 @@ use http::{Request, Response};
 pub use images::{fresh, square};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
-use tessera_bundle::Message;
+use tessera_bundle::RenderOptions;
 use tessera_tasks::api::{Chat, Embed, GenerateImage, Generator, Info, Score, Tokens};
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
 
@@ -58,19 +58,35 @@ fn with_model<T>(slot: &Slot, f: impl FnOnce(&Model) -> Result<T, Refusal>) -> R
 }
 
 /// The messages as one prompt, by the model's template.
-fn render(model: &Model, m: Messages) -> Result<String, Refusal> {
+fn render(model: &Model, m: Messages, allow_tools: bool) -> Result<(String, bool), Refusal> {
     let chat = model
         .chat
         .as_ref()
         .ok_or_else(|| bad("the model has no chat template", "messages"))?;
-    let messages: Vec<Message> = m.messages.into_iter().map(Message::from).collect();
+    let mut messages = Vec::with_capacity(m.messages.len());
+    for said in m.messages {
+        messages.push(said.into_message()?);
+    }
+    let mut tools = Vec::new();
+    if allow_tools && let Some(given) = m.tools {
+        for tool in given {
+            tools.push(tool.to_value()?);
+        }
+    }
     let effort = m.chat_template_kwargs.reasoning_effort.as_deref();
     let think = m
         .chat_template_kwargs
         .enable_thinking
-        .unwrap_or(effort != Some("none"));
-    chat.render_with(&messages, think, effort)
-        .map_err(|e| bad(e.to_string(), "messages"))
+        .or_else(|| (effort == Some("none")).then_some(false));
+    let options = RenderOptions {
+        think,
+        reasoning_effort: effort,
+        tools: &tools,
+    };
+    let prompt = chat
+        .render_options(&messages, &options)
+        .map_err(|e| bad(e.to_string(), "messages"))?;
+    Ok((prompt, !tools.is_empty()))
 }
 
 /// A JSON answer, or the refusal.
@@ -110,7 +126,7 @@ fn tokenize(slot: &Slot, body: &[u8]) -> Response {
     reply(slot, |m| {
         let text = match wire::parse(m, body)? {
             Tokenize::Prompt { prompt, .. } => prompt,
-            Tokenize::Chat { messages, .. } => render(m, messages)?,
+            Tokenize::Chat { messages, .. } => render(m, messages, true)?.0,
         };
         let tokens = m
             .tokens

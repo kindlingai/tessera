@@ -130,6 +130,7 @@ impl Talk {
             max_tokens: self.max_tokens.map_or(room, |n| n.min(room)),
             stop: Vec::new(),
             format: None,
+            raw: false,
         };
         let (sink, steps) = mpsc::channel();
         let send = Box::new(move |step| sink.send(step).is_ok());

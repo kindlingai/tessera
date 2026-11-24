@@ -83,6 +83,7 @@ fn run_batch_loop(load: &Load, mut batch: BatchMtp<'_>, target: Bundle) -> Resul
     let generate = Generate {
         tokenizer: target.tokenizer,
         template: target.template,
+        response: target.response,
         stop: target.stop,
         guides: None,
     };

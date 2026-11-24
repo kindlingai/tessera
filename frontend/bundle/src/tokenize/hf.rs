@@ -35,6 +35,11 @@ impl Hf {
         self.0.decode(ids, true).unwrap_or_default()
     }
 
+    /// The text of `ids`, keeping special tokens.
+    pub fn decode_raw(&self, ids: &[u32]) -> String {
+        self.0.decode(ids, false).unwrap_or_default()
+    }
+
     /// Each id whose text passes `keep`. Special tokens are empty.
     pub fn matching(&self, keep: impl Fn(&str) -> bool) -> Vec<u32> {
         let mut out = Vec::new();

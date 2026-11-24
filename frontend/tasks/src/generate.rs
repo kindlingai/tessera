@@ -5,7 +5,7 @@ use crate::guided::Guides;
 use crate::{Error, Spool, Stops};
 use std::sync::{Arc, Mutex, mpsc};
 use tessera_bundle::tokenize::hf::Hf;
-use tessera_bundle::{Message, Template};
+use tessera_bundle::{Message, RenderOptions, ResponseParser, Template};
 use tessera_engine::{Event, Read, Reason, Request};
 
 /// A request for the engine thread, and its sink.
@@ -14,6 +14,7 @@ pub type Job = (Request, tessera_engine::Sink);
 pub struct Generate {
     pub tokenizer: Hf,
     pub template: Option<Template>,
+    pub response: Option<ResponseParser>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
     /// Guides for answers with a format. `None` refuses formats.
@@ -41,6 +42,19 @@ impl Chat for Generate {
         think: bool,
         reasoning_effort: Option<&str>,
     ) -> Result<String, Error> {
+        let options = RenderOptions {
+            think: (!think).then_some(false),
+            reasoning_effort,
+            tools: &[],
+        };
+        self.render_options(messages, &options)
+    }
+
+    fn render_options(
+        &self,
+        messages: &[Message],
+        options: &RenderOptions<'_>,
+    ) -> Result<String, Error> {
         let template = self
             .template
             .as_ref()
@@ -48,7 +62,11 @@ impl Chat for Generate {
         if messages.is_empty() {
             return Err("no messages".into());
         }
-        Ok(template.render_with(messages, think, reasoning_effort)?)
+        Ok(template.render_options(messages, options)?)
+    }
+
+    fn response(&self) -> Option<&ResponseParser> {
+        self.response.as_ref()
     }
 }
 
@@ -76,6 +94,7 @@ impl Generator for Queued {
             reads: Vec::new(),
         };
         let generate = self.generate.clone();
+        let raw = params.raw;
         let (mut spool, mut stops) = (Spool::default(), Stops::new(params.stop));
         let (mut tokens, mut cached, mut ended) = (0, 0, false);
         // The engine sends `Done` after a sink refuses a token.
@@ -91,7 +110,10 @@ impl Generator for Queued {
                 Event::Scores(_) => return true,
                 Event::Token(id) => {
                     tokens += 1;
-                    let piece = spool.push(id, |ids| generate.tokenizer.decode(ids));
+                    let piece = spool.push(id, |ids| match raw {
+                        true => generate.tokenizer.decode_raw(ids),
+                        false => generate.tokenizer.decode(ids),
+                    });
                     let (text, cut) = stops.push(&piece);
                     match cut {
                         false => Step::Token { id, text },

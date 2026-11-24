@@ -308,10 +308,7 @@ fn layout(model: &Model, d: Decide) -> Result<(Vec<Question>, Laid), Refusal> {
     let chat = model.chat.as_ref();
     let chat = chat.ok_or_else(|| refuse(404, "the model has no chat template", None))?;
     let system = system(&questions, text(d.instructions.as_ref()).as_deref());
-    let said = |role: &str, content| Message {
-        role: role.into(),
-        content,
-    };
+    let said = |role: &str, content: String| Message::text(role, content);
     let failed = |e: tessera_tasks::Error| refuse(400, e.to_string(), None);
     let prompt = chat.render(&[said("system", system), said("user", state)], false);
     let mut tokens = model

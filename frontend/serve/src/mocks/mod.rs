@@ -14,11 +14,21 @@ pub use generator::MockGenerator;
 use image::MockImage;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
+use tessera_bundle::ResponseParser;
 use tessera_tasks::api::Info;
 pub(crate) use tokens::MockTokens;
 
 /// The mocks as model `m`, 16 tokens of context.
 pub fn loaded(generator: &Arc<MockGenerator>, strict: bool) -> Slot {
+    loaded_with(generator, strict, None)
+}
+
+/// Like `loaded`, with an optional response parser.
+pub(crate) fn loaded_with(
+    generator: &Arc<MockGenerator>,
+    strict: bool,
+    response: Option<ResponseParser>,
+) -> Slot {
     let slot: Slot = Arc::new(OnceLock::new());
     let _ = slot.set(Model {
         info: Info {
@@ -26,7 +36,7 @@ pub fn loaded(generator: &Arc<MockGenerator>, strict: bool) -> Slot {
             context: 16,
         },
         tokens: Arc::new(MockTokens),
-        chat: Some(Arc::new(MockChat)),
+        chat: Some(Arc::new(MockChat { response })),
         generator: Some(generator.clone()),
         embed: Some(Arc::new(MockEmbed)),
         image: Some(Arc::new(MockImage)),

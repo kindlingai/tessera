@@ -3,9 +3,10 @@
 use crate::http::{Body, Response};
 use crate::wire::{self, Chat, Common, Completion, Prompt, Refusal, ResponseFormat, bad, refuse};
 use crate::{Model, Slot, with_model};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use tessera_bundle::{ResponseEvent, ResponseParser, ToolCall};
 use tessera_tasks::api::{Finish, Params, Refused, Step};
 
 /// An answer's OpenAI shape.
@@ -13,6 +14,23 @@ use tessera_tasks::api::{Finish, Params, Refused, Step};
 enum Kind {
     Text,
     Chat,
+}
+
+/// How a chat answer parses structured output blocks.
+struct Parsing {
+    parser: Option<ResponseParser>,
+    tools: bool,
+    thinking: bool,
+}
+
+impl Parsing {
+    fn plain() -> Self {
+        Self {
+            parser: None,
+            tools: false,
+            thinking: false,
+        }
+    }
 }
 
 /// An answer in flight, and how to report it.
@@ -23,13 +41,15 @@ struct Started {
     prompt_tokens: usize,
     stream: bool,
     usage: bool,
+    parsing: Parsing,
     steps: mpsc::Receiver<Step>,
 }
 
-fn finish(f: Finish) -> &'static str {
-    match f {
-        Finish::Stop => "stop",
-        Finish::Length => "length",
+fn finish(f: Finish, called: bool) -> &'static str {
+    match (f, called) {
+        (Finish::Stop, true) => "tool_calls",
+        (Finish::Stop, false) => "stop",
+        (Finish::Length, _) => "length",
     }
 }
 
@@ -42,6 +62,35 @@ fn fresh_id(kind: Kind) -> String {
     };
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{:x}{n:x}", wire::now())
+}
+
+/// A tool-call id unique within this process.
+fn call_id(call: &ToolCall) -> String {
+    if let Some(id) = &call.id {
+        return id.clone();
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("call_{:x}{n:x}", wire::now())
+}
+
+/// Formats one tool call in OpenAI's JSON shape.
+fn format_call(call: &ToolCall, index: Option<usize>) -> Value {
+    let args = match &call.function.arguments {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".into()),
+    };
+    let mut obj = Map::new();
+    if let Some(i) = index {
+        obj.insert("index".into(), json!(i));
+    }
+    obj.insert("id".into(), json!(call_id(call)));
+    obj.insert("type".into(), json!(call.kind));
+    obj.insert(
+        "function".into(),
+        json!({"name": call.function.name, "arguments": args}),
+    );
+    Value::Object(obj)
 }
 
 /// The tokens asked for, or the room the context leaves.
@@ -72,6 +121,7 @@ fn start(
     prompt: Vec<u32>,
     asked: Option<usize>,
     common: Common,
+    parsing: Parsing,
 ) -> Result<Started, Refusal> {
     let generator = model
         .generator
@@ -84,6 +134,7 @@ fn start(
         max_tokens: budget(model, prompt.len(), asked)?,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
         format: common.response_format.and_then(ResponseFormat::format),
+        raw: parsing.parser.is_some(),
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
@@ -104,6 +155,7 @@ fn start(
         prompt_tokens,
         stream: common.stream,
         usage: common.stream_options.is_some_and(|o| o.include_usage),
+        parsing,
         steps,
     })
 }
@@ -120,18 +172,40 @@ fn complete(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
             _ => return Err(bad("give one prompt per request", "prompt")),
         },
     };
-    start(model, Kind::Text, prompt, c.common.max_tokens, c.common)
+    start(
+        model,
+        Kind::Text,
+        prompt,
+        c.common.max_tokens,
+        c.common,
+        Parsing::plain(),
+    )
 }
 
 fn chat(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
     let c: Chat = wire::parse(model, body)?;
-    let prompt = crate::render(model, c.messages)?;
+    let allow_tools = match &c.tool_choice {
+        Some(choice) => choice.allow()?,
+        None => true,
+    };
+    let parser = model.chat.as_ref().and_then(|ch| ch.response().cloned());
+    let has_tools = allow_tools && c.messages.tools.as_ref().is_some_and(|t| !t.is_empty());
+    if has_tools && parser.as_ref().is_none_or(|p| !p.supports_tools()) {
+        return Err(bad("this model does not support tool calling", "tools"));
+    }
+    let (prompt, tools) = crate::render(model, c.messages, allow_tools)?;
+    let thinking = parser.as_ref().is_some_and(|p| p.starts_thinking(&prompt));
     let prompt = model
         .tokens
         .encode(&prompt)
         .map_err(|e| bad(e.to_string(), "messages"))?;
     let asked = c.max_completion_tokens.or(c.common.max_tokens);
-    start(model, Kind::Chat, prompt, asked, c.common)
+    let parsing = Parsing {
+        parser,
+        tools,
+        thinking,
+    };
+    start(model, Kind::Chat, prompt, asked, c.common, parsing)
 }
 
 impl Started {
@@ -144,26 +218,62 @@ impl Started {
     }
 
     /// One choice: whole text, or a piece of a stream.
-    fn choice(&self, text: &str, finish: Option<Finish>) -> Value {
-        let reason = finish.map(self::finish);
+    fn choice(&self, text: &str, end: Option<Finish>) -> Value {
+        let reason = end.map(|f| finish(f, false));
         match (self.kind, self.stream) {
             (Kind::Text, _) => {
                 json!({"index": 0, "text": text, "logprobs": null, "finish_reason": reason})
             }
-            (Kind::Chat, false) => json!({
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "logprobs": null,
-                "finish_reason": reason,
-            }),
+            (Kind::Chat, false) => self.chat_choice(text, end),
             (Kind::Chat, true) => {
                 let delta = match text.is_empty() {
                     true => json!({}),
                     false => json!({"content": text}),
                 };
-                json!({"index": 0, "delta": delta, "logprobs": null, "finish_reason": reason})
+                self.delta_choice(delta, reason)
             }
         }
+    }
+
+    fn delta_choice(&self, delta: Value, reason: Option<&str>) -> Value {
+        json!({"index": 0, "delta": delta, "logprobs": null, "finish_reason": reason})
+    }
+
+    fn chat_choice(&self, text: &str, end: Option<Finish>) -> Value {
+        let Some(parser) = &self.parsing.parser else {
+            return json!({
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "logprobs": null,
+                "finish_reason": end.map(|f| finish(f, false)),
+            });
+        };
+        let parsed = parser.parse(text, self.parsing.tools, self.parsing.thinking);
+        let called = !parsed.tool_calls.is_empty();
+        let mut msg = Map::new();
+        msg.insert("role".into(), json!("assistant"));
+        let content = match (called, parsed.content.is_empty()) {
+            (true, true) => Value::Null,
+            _ => Value::String(parsed.content),
+        };
+        msg.insert("content".into(), content);
+        if !parsed.reasoning.is_empty() {
+            msg.insert("reasoning_content".into(), Value::String(parsed.reasoning));
+        }
+        if called {
+            let calls: Vec<Value> = parsed
+                .tool_calls
+                .iter()
+                .map(|c| format_call(c, None))
+                .collect();
+            msg.insert("tool_calls".into(), Value::Array(calls));
+        }
+        json!({
+            "index": 0,
+            "message": Value::Object(msg),
+            "logprobs": null,
+            "finish_reason": end.map(|f| finish(f, called)),
+        })
     }
 
     /// `usage` holds the answer's tokens and the cached prompt tokens.
@@ -218,6 +328,12 @@ impl Started {
                 return;
             }
         }
+        if self.kind == Kind::Chat
+            && let Some(parser) = self.parsing.parser.clone()
+        {
+            self.forward_parsed(&parser, out);
+            return;
+        }
         while let Ok(step) = self.steps.recv() {
             let (text, end) = match step {
                 Step::Token { text, .. } if text.is_empty() => continue,
@@ -242,6 +358,57 @@ impl Started {
             }
         }
         // The steps stopped before `Done`.
+        send(refuse(503, "the engine stopped", None).body());
+        let _ = out.send("[DONE]".into());
+    }
+
+    /// Streams parsed content, reasoning and tool calls.
+    fn forward_parsed(&self, parser: &ResponseParser, out: &mpsc::Sender<String>) {
+        let send = |v: Value| out.send(v.to_string()).is_ok();
+        let mut stream = parser.stream(self.parsing.tools, self.parsing.thinking);
+        let mut events = Vec::new();
+        let mut calls = 0usize;
+        while let Ok(step) = self.steps.recv() {
+            let (text, end) = match step {
+                Step::Token { text, .. } => (text, None),
+                Step::Done {
+                    text,
+                    finish,
+                    tokens,
+                    cached,
+                } => (text, Some((finish, (tokens, cached)))),
+            };
+            stream.push(&text, &mut events);
+            if end.is_some() {
+                stream.finish(&mut events);
+            }
+            for event in events.drain(..) {
+                let delta = match event {
+                    ResponseEvent::Content(s) => json!({"content": s}),
+                    ResponseEvent::Reasoning(s) => json!({"reasoning_content": s}),
+                    ResponseEvent::ToolCall(tc) => {
+                        let chunk = format_call(&tc, Some(calls));
+                        calls += 1;
+                        json!({"tool_calls": [chunk]})
+                    }
+                };
+                let choice = self.delta_choice(delta, None);
+                if !send(self.body(json!([choice]), None)) {
+                    return;
+                }
+            }
+            if let Some((reason, usage)) = end {
+                let choice = self.delta_choice(json!({}), Some(finish(reason, calls > 0)));
+                if !send(self.body(json!([choice]), None)) {
+                    return;
+                }
+                if self.usage {
+                    send(self.body(json!([]), Some(usage)));
+                }
+                let _ = out.send("[DONE]".into());
+                return;
+            }
+        }
         send(refuse(503, "the engine stopped", None).body());
         let _ = out.send("[DONE]".into());
     }

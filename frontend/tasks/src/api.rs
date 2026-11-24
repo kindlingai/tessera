@@ -1,7 +1,7 @@
 //! Calls an HTTP front end makes on a loaded model.
 
 use crate::Error;
-use tessera_bundle::Message;
+use tessera_bundle::{Message, RenderOptions, ResponseParser};
 pub use tessera_engine::Read;
 
 /// The served model's name and context size.
@@ -29,6 +29,22 @@ pub trait Chat: Send + Sync {
     ) -> Result<String, Error> {
         self.render(messages, think)
     }
+
+    fn render_options(
+        &self,
+        messages: &[Message],
+        options: &RenderOptions<'_>,
+    ) -> Result<String, Error> {
+        self.render_with(
+            messages,
+            options.think.unwrap_or(true),
+            options.reasoning_effort,
+        )
+    }
+
+    fn response(&self) -> Option<&ResponseParser> {
+        None
+    }
 }
 
 /// Settings for one answer, beyond the prompt.
@@ -39,6 +55,8 @@ pub struct Params {
     pub stop: Vec<String>,
     /// The answer's required shape. `None` allows any text.
     pub format: Option<Format>,
+    /// Keep special tokens in decoded output for response parsing.
+    pub raw: bool,
 }
 
 /// A required shape for an answer.

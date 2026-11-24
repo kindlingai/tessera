@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tessera_bundle::Message;
+use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_tasks::api::Format;
 
 /// Why a request was refused, in OpenAI's error format.
@@ -70,6 +70,7 @@ fn neutral(key: &str, value: &Value) -> Option<bool> {
         "tool_choice" => {
             return Some(value.is_null() || ["none", "auto"].map(Value::from).contains(value));
         }
+        "parallel_tool_calls" => return Some(value.is_null() || *value == json!(true)),
         "encoding_format" => return Some(value.is_null() || *value == json!("float")),
         "dimensions" => return Some(value.is_null()),
         _ => return None,
@@ -270,28 +271,161 @@ pub(crate) enum Content {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Said {
-    role: String,
-    content: Content,
-    /// Earlier thinking, unused by templates for now.
-    #[serde(rename = "reasoning", alias = "reasoning_content")]
-    _reasoning: Option<String>,
+pub(crate) struct WireFunction {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
     #[serde(flatten)]
     extra: Bag,
 }
 
-impl From<Said> for Message {
-    fn from(said: Said) -> Message {
-        let content = match said.content {
+#[derive(Deserialize)]
+pub(crate) struct WireToolCall {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: WireFunction,
+    #[serde(flatten)]
+    extra: Bag,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Said {
+    role: String,
+    #[serde(default)]
+    content: Option<Content>,
+    #[serde(rename = "reasoning", alias = "reasoning_content")]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(flatten)]
+    extra: Bag,
+}
+
+impl Said {
+    pub(crate) fn into_message(self) -> Result<Message, Refusal> {
+        let content = self.content.map(|c| match c {
             Content::Text(text) => text,
             Content::Parts(parts) => parts
                 .into_iter()
                 .map(|Part::Text { text, .. }| text)
                 .collect(),
+        });
+        let tool_calls = match self.tool_calls {
+            None => None,
+            Some(calls) => {
+                let mut out = Vec::with_capacity(calls.len());
+                for call in calls {
+                    out.push(call.into_call()?);
+                }
+                Some(out)
+            }
         };
-        Message {
-            role: said.role,
+        let content = match (content, &tool_calls) {
+            (None, None) => Some(String::new()),
+            (other, _) => other,
+        };
+        Ok(Message {
+            role: self.role,
             content,
+            reasoning: self.reasoning,
+            tool_calls,
+            tool_call_id: self.tool_call_id,
+            name: self.name,
+        })
+    }
+}
+
+impl WireToolCall {
+    fn into_call(self) -> Result<ToolCall, Refusal> {
+        let kind = self.kind.unwrap_or_else(|| "function".into());
+        if kind != "function" {
+            return Err(bad("tool call type must be \"function\"", "messages"));
+        }
+        let arguments = parse_args(self.function.arguments)?;
+        Ok(ToolCall {
+            id: self.id,
+            kind,
+            function: FunctionCall {
+                name: self.function.name,
+                arguments,
+            },
+        })
+    }
+}
+
+fn parse_args(value: Value) -> Result<Value, Refusal> {
+    match value {
+        Value::Null => Ok(json!({})),
+        Value::Object(map) => Ok(Value::Object(map)),
+        Value::String(s) if s.trim().is_empty() => Ok(json!({})),
+        Value::String(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(map)) => Ok(Value::Object(map)),
+            _ => Err(bad("tool call arguments must be a JSON object", "messages")),
+        },
+        _ => Err(bad("tool call arguments must be a JSON object", "messages")),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ToolFunction {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) parameters: Option<Value>,
+    #[serde(rename = "strict")]
+    _strict: Option<bool>,
+    #[serde(flatten)]
+    extra: Bag,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Tool {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) function: ToolFunction,
+    #[serde(flatten)]
+    extra: Bag,
+}
+
+impl Tool {
+    pub(crate) fn to_value(&self) -> Result<Value, Refusal> {
+        if self.kind != "function" {
+            return Err(bad("tool type must be \"function\"", "tools"));
+        }
+        if self.function.name.trim().is_empty() {
+            return Err(bad("tool function name is empty", "tools"));
+        }
+        let mut func = Map::new();
+        func.insert("name".into(), Value::String(self.function.name.clone()));
+        if let Some(desc) = &self.function.description {
+            func.insert("description".into(), Value::String(desc.clone()));
+        }
+        if let Some(params) = &self.function.parameters {
+            func.insert("parameters".into(), params.clone());
+        }
+        Ok(json!({"type": "function", "function": Value::Object(func)}))
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ToolChoice(Value);
+
+impl ToolChoice {
+    /// Returns whether tools stay enabled for this request.
+    pub(crate) fn allow(&self) -> Result<bool, Refusal> {
+        match self.0.as_str() {
+            Some("auto") => Ok(true),
+            Some("none") => Ok(false),
+            _ => Err(bad(
+                "`tool_choice` must be \"auto\" or \"none\"",
+                "tool_choice",
+            )),
         }
     }
 }
@@ -309,6 +443,8 @@ pub(crate) struct Kwargs {
 pub(crate) struct Messages {
     pub(crate) messages: Vec<Said>,
     #[serde(default)]
+    pub(crate) tools: Option<Vec<Tool>>,
+    #[serde(default)]
     pub(crate) chat_template_kwargs: Kwargs,
 }
 
@@ -316,9 +452,27 @@ impl Messages {
     fn nested(&self) -> Vec<String> {
         let mut out: Vec<String> =
             paths("chat_template_kwargs", &self.chat_template_kwargs.extra).collect();
+        if let Some(tools) = &self.tools {
+            for (i, tool) in tools.iter().enumerate() {
+                out.extend(paths(&format!("tools[{i}]"), &tool.extra));
+                out.extend(paths(&format!("tools[{i}].function"), &tool.function.extra));
+            }
+        }
         for (i, said) in self.messages.iter().enumerate() {
             out.extend(paths(&format!("messages[{i}]"), &said.extra));
-            let Content::Parts(parts) = &said.content else {
+            if let Some(calls) = &said.tool_calls {
+                for (j, call) in calls.iter().enumerate() {
+                    out.extend(paths(
+                        &format!("messages[{i}].tool_calls[{j}]"),
+                        &call.extra,
+                    ));
+                    out.extend(paths(
+                        &format!("messages[{i}].tool_calls[{j}].function"),
+                        &call.function.extra,
+                    ));
+                }
+            }
+            let Some(Content::Parts(parts)) = &said.content else {
                 continue;
             };
             for (j, Part::Text { extra, .. }) in parts.iter().enumerate() {
@@ -333,6 +487,8 @@ impl Messages {
 pub(crate) struct Chat {
     #[serde(flatten)]
     pub(crate) messages: Messages,
+    #[serde(default)]
+    pub(crate) tool_choice: Option<ToolChoice>,
     pub(crate) max_completion_tokens: Option<usize>,
     #[serde(flatten)]
     pub(crate) common: Common,

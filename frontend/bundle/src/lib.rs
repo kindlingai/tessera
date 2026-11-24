@@ -26,6 +26,7 @@ pub mod qwen4_exp;
 pub(crate) mod repack;
 #[cfg(test)]
 mod repack_test;
+mod response;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -37,7 +38,8 @@ mod template_test;
 pub mod tokenize;
 pub mod vae;
 
-pub use template::{Clock, Message, Template};
+pub use response::{ParsedResponse, ResponseEvent, ResponseParser, ResponseStream};
+pub use template::{Clock, FunctionCall, Message, RenderOptions, Template, ToolCall};
 
 use names::Rule;
 use serde::Deserialize;
@@ -127,6 +129,8 @@ pub struct Bundle {
     pub pins: Option<Pins>,
     pub tokenizer: Hf,
     pub template: Option<Template>,
+    /// Response parser from `tokenizer_config.json`, if declared.
+    pub response: Option<ResponseParser>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
     /// Model `config.json` with recipe overrides applied.
@@ -436,7 +440,7 @@ pub fn load_tapped(
         Some(ple) => ple(&ask)?,
         None => None,
     };
-    dressed(dir, built, Some(json), ple)
+    dressed(dir, built, Some(json), ple, overrides)
 }
 
 /// `graph`'s weights held from `ask`'s folder, `rules` first.
@@ -473,7 +477,7 @@ pub fn load_module(
         ..arch::Ask::plain(dir, sizes, overrides, &json)
     };
     let built = held(&ask, graph, layers, &[])?;
-    dressed(dir, built, Some(json), None).map(Some)
+    dressed(dir, built, Some(json), None, overrides).map(Some)
 }
 
 /// `dir`'s whole-prompt graph, its weights and their forms.
@@ -495,9 +499,12 @@ fn dressed(
     (graph, weights, pins): arch::Built,
     config: Option<String>,
     ple: Option<PleConfig>,
+    overrides: &Overrides,
 ) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
-    let template = Template::load(dir)?;
+    let tok_cfg = overrides.merged("tokenizer_config.json", &dir.join("tokenizer_config.json"))?;
+    let template = Template::from_config(dir, &tok_cfg)?;
+    let response = ResponseParser::from_config(&tok_cfg)?;
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
         Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
             Some(Ids::One(id)) => vec![id],
@@ -512,6 +519,7 @@ fn dressed(
         pins: Some(pins),
         tokenizer,
         template,
+        response,
         stop,
         config,
         ple,

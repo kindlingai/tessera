@@ -44,10 +44,7 @@ impl Features {
 
     /// The prompt as a user turn, without thinking.
     pub fn ids(&self, prompt: &str) -> Result<Vec<u32>, Error> {
-        let message = Message {
-            role: "user".into(),
-            content: prompt.into(),
-        };
+        let message = Message::text("user", prompt);
         let text = self.tapped.template.render(&[message], false)?;
         let mut ids = self.tapped.tokenizer.encode_special(&text)?;
         ids.truncate(self.rows);

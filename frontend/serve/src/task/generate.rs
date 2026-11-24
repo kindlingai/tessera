@@ -136,6 +136,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let generate = Generate {
         tokenizer: loaded.tokenizer,
         template: loaded.template,
+        response: loaded.response,
         stop: loaded.stop,
         guides,
     };

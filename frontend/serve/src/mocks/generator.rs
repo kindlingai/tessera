@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use tessera_tasks::Error;
 use tessera_tasks::api::{Finish, Format, Generator, Params, Read, Refused, Score, Sink, Step};
 
-/// Answers "hello" in two tokens. Keeps what it was asked.
+/// Answers "hello" in two tokens, or custom `pieces`.
 #[derive(Default)]
 pub struct MockGenerator {
     /// The params of the last answer.
     pub asked: Mutex<Option<Params>>,
+    /// Custom output chunks, with the last sent in `Done`.
+    pub pieces: Vec<String>,
 }
 
 impl Generator for MockGenerator {
@@ -20,6 +22,21 @@ impl Generator for MockGenerator {
             return Err(Box::new(Refused("a schema is an object".into())));
         }
         *self.asked.lock().unwrap() = Some(params);
+        if let Some((last, head)) = self.pieces.split_last() {
+            for (i, piece) in head.iter().enumerate() {
+                sink(Step::Token {
+                    id: i as u32 + 1,
+                    text: piece.clone(),
+                });
+            }
+            sink(Step::Done {
+                text: last.clone(),
+                finish: Finish::Stop,
+                tokens: self.pieces.len(),
+                cached: 0,
+            });
+            return Ok(());
+        }
         sink(Step::Token {
             id: 1,
             text: "he".into(),

@@ -33,3 +33,43 @@ fn bad_schemas_refused() {
         (400, &json!("response_format"))
     );
 }
+
+#[test]
+fn tool_wire_checks() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let tool = json!({"type": "function", "function": {"name": "ping"}});
+    let cases = [
+        (
+            json!({"messages": [{"role": "user", "content": "hi"}], "tools": [tool]}),
+            "tools",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}),
+            "tool_choice",
+        ),
+        (
+            json!({"messages": [{"role": "assistant", "tool_calls": [
+                {"id": "1", "function": {"name": "ping", "arguments": "bad"}}
+            ]}]}),
+            "messages",
+        ),
+    ];
+    for (body, param) in cases {
+        let (status, error) = json(&slot, "/v1/chat/completions", Some(body));
+        assert_eq!((status, &error["error"]["param"]), (400, &json!(param)));
+    }
+    let none_body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "none",
+        "tools": [tool],
+    });
+    assert_eq!(json(&slot, "/v1/chat/completions", Some(none_body)).0, 200);
+    let history = json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "ping", "arguments": "{\"x\":1}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "ping", "content": "ok"}
+    ]});
+    assert_eq!(json(&slot, "/tokenize", Some(history)).0, 200);
+}

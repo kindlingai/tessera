@@ -1,4 +1,5 @@
-use crate::{Message, Template};
+use crate::{FunctionCall, Message, RenderOptions, Template, ToolCall};
+use serde_json::json;
 
 const CHATML: &str = "{% for m in messages %}\
 {{ '<|im_start|>' + m.role + '\n' + m.content.strip() + '<|im_end|>\n' }}{% endfor %}\
@@ -6,10 +7,7 @@ const CHATML: &str = "{% for m in messages %}\
 {% if enable_thinking is defined and enable_thinking is false %}{{ '<think>\n\n</think>\n\n' }}{% endif %}{% endif %}";
 
 fn say(role: &str, content: &str) -> Message {
-    Message {
-        role: role.into(),
-        content: content.into(),
-    }
+    Message::text(role, content)
 }
 
 #[test]
@@ -55,4 +53,39 @@ fn strips_generation_tags() {
         "{% for m in messages %}{%- generation %}{{ m.content }}{%- endgeneration %}{% endfor %}";
     let t = Template::new(source.into()).unwrap();
     assert_eq!(t.render(&[say("assistant", "ok")], true).unwrap(), "ok");
+}
+
+#[test]
+fn renders_tools_and_dictsort() {
+    let source = "{{ bos_token }}{% for t in tools %}{{ t.function.name }}:\
+{% for k, v in t.function.parameters.properties | dictsort %}{{ k }}={{ v.type }},{% endfor %}{% endfor %}\
+{% for m in messages %}{% if m.get('tool_calls') %}{% for tc in m.tool_calls %}\
+call:{{ tc.function.name }}({% for k, v in tc.function.arguments | dictsort %}{{ k }}={{ v }}{% endfor %})\
+{% endfor %}{% endif %}{% endfor %}";
+    let t = Template::new(source.into())
+        .unwrap()
+        .with_tokens(Some("<bos>".into()), None);
+    let tools = [json!({"type": "function", "function": {
+        "name": "weather",
+        "parameters": {"properties": {"z": {"type": "int"}, "a": {"type": "string"}}}
+    }})];
+    let call = ToolCall {
+        id: Some("c1".into()),
+        kind: "function".into(),
+        function: FunctionCall {
+            name: "weather".into(),
+            arguments: json!({"city": "Tokyo"}),
+        },
+    };
+    let msg = Message {
+        role: "assistant".into(),
+        tool_calls: Some(vec![call]),
+        ..Default::default()
+    };
+    let opts = RenderOptions {
+        tools: &tools,
+        ..Default::default()
+    };
+    let got = t.render_options(&[msg], &opts).unwrap();
+    assert_eq!(got, "<bos>weather:a=string,z=int,call:weather(city=Tokyo)");
 }

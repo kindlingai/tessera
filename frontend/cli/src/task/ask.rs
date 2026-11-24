@@ -10,10 +10,7 @@ pub fn run(talk: Talk, words: &[String]) -> Result<(), Stop> {
     if prompt.is_empty() {
         return Err(Stop::Usage);
     }
-    let user = Message {
-        role: "user".into(),
-        content: prompt.into(),
-    };
+    let user = Message::text("user", prompt);
     let text = talk.render(&[user]).unwrap_or_else(|_| prompt.into());
     talk.say(&text)?;
     println!();

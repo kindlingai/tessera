@@ -6,10 +6,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use tessera_bundle::Message;
 
 fn message(role: &str, content: &str) -> Message {
-    Message {
-        role: role.into(),
-        content: content.into(),
-    }
+    Message::text(role, content)
 }
 
 pub fn run(talk: Talk, extra: &[String]) -> Result<(), Stop> {

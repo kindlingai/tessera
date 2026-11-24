@@ -196,6 +196,7 @@ pub(crate) fn load(
         pins: Some(pins),
         tokenizer: tokenizer(&gguf)?,
         template,
+        response: None,
         stop,
         config: None,
         ple: None,
