@@ -525,7 +525,16 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
                 )?;
                 p = Placement::Replicated;
             }
-            _ => {}
+            // Arity checks give these stages their operand.
+            (
+                Stage::Add
+                | Stage::Mul
+                | Stage::RmsNorm { .. }
+                | Stage::Rope { .. }
+                | Stage::Causal
+                | Stage::Allow,
+                None,
+            ) => {}
         }
     }
     Ok(TensorType {

@@ -44,10 +44,11 @@ pub enum Import {
     Llm,
     Image,
     Trellis,
+    Whole,
 }
 
 impl Import {
-    const ALL: [Import; 11] = [
+    const ALL: [Import; 12] = [
         Import::Core,
         Import::Grid,
         Import::AllReduce,
@@ -59,6 +60,7 @@ impl Import {
         Import::Llm,
         Import::Image,
         Import::Trellis,
+        Import::Whole,
     ];
 
     pub fn name(self) -> &'static str {
@@ -74,6 +76,7 @@ impl Import {
             Import::Llm => "llm",
             Import::Image => "image",
             Import::Trellis => "trellis",
+            Import::Whole => "whole",
         }
     }
 
@@ -91,7 +94,7 @@ impl Import {
 
     /// Whether it needs a grid barrier. Metal has none.
     pub fn persistent(self) -> bool {
-        self == Import::Grid || self.collective()
+        matches!(self, Import::Grid | Import::Whole) || self.collective()
     }
 }
 
@@ -126,7 +129,7 @@ fn device(_: &[Import], backend: Backend) -> bool {
 }
 
 /// Every header, in the order a flattened kernel holds them.
-pub(crate) static HEADERS: [Header; 10] = [
+pub(crate) static HEADERS: [Header; 11] = [
     header!("core.h", None, |_, _| true),
     header!("backend.h", None, device),
     header!("status.h", None, device),
@@ -151,5 +154,8 @@ pub(crate) static HEADERS: [Header; 10] = [
     )),
     header!("trellis.h", Some("TESSERA_CAP_TRELLIS"), |i, b| {
         has(i, Import::Trellis) && b != Backend::Metal
+    }),
+    header!("whole.h", Some("TESSERA_CAP_WHOLE"), |i, b| {
+        has(i, Import::Whole) && b != Backend::Metal
     }),
 ];

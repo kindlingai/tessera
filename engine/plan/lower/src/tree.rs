@@ -100,6 +100,7 @@ pub struct Tree<'a> {
     ends: Vec<bool>,
 }
 
+/// Element-wise stages. Other stages lower unfused.
 pub(crate) fn map_stage(s: &Stage) -> Option<MapStage> {
     match s {
         Stage::Add => Some(MapStage::Add),

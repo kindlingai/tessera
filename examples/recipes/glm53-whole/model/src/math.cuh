@@ -1,6 +1,7 @@
 // Shared types, metadata readers, kept access, and row WHT.
 
 using namespace tessera;
+using trellis::word;
 
 #define IDS 4u
 #define WARPS 8u
@@ -39,11 +40,6 @@ struct sizes {
 struct place {
     u32 item[FIELD_END];
     u32 next, kept, layer;
-};
-
-struct line {
-    u32 at;
-    u32 step;
 };
 
 struct mat {
@@ -102,19 +98,17 @@ struct ctx {
         if (!sync(c.t)) return false;  \
     } while (0)
 
-static __device__ __forceinline__ sizes read(const table* t) {
-    sizes s;
-    u32* w = reinterpret_cast<u32*>(&s);
-    for (u32 i = 0; i < sizeof(sizes) / 4; i++) w[i] = value(t, i);
-    return s;
-}
-
 static __device__ __forceinline__ bool bit(const u32* words, u32 l) {
     return (words[l >> 5] >> (l & 31u)) & 1u;
 }
 
 static __device__ __forceinline__ bool indexes(const sizes& s, u32 l) {
     return l < s.dense || (l + 1 - s.dense) % s.every == 0;
+}
+
+// Kept tables of layer `l`: keys, then indexer keys.
+static __device__ __forceinline__ u32 kept_count(const sizes& s, u32 l) {
+    return indexes(s, l) ? 2u : 1u;
 }
 
 static __device__ __forceinline__ bool is_turned(const table* t, u32 item) {
@@ -143,19 +137,6 @@ static __device__ place walk(const table* t, const sizes& s, u32 l, u32 first, u
     }
     pl.next = at;
     return pl;
-}
-
-static __device__ __forceinline__ line threads() {
-    return {blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x};
-}
-
-static __device__ __forceinline__ bool sync(const table* t) {
-    __threadfence();
-    return grid_sync(t);
-}
-
-static __device__ __forceinline__ u32 word(const u8* p, u32 at) {
-    return *reinterpret_cast<const u32*>(p + at);
 }
 
 static __device__ __forceinline__ mat weight(const table* t, u32 item) {
@@ -194,7 +175,7 @@ static __device__ __forceinline__ mat field_mat(const ctx& c, const place& pl, u
 }
 
 static __device__ spans_t lay_out(const table* t, const sizes& s) {
-    float* p = at<float>(t, t->items_len - 1);
+    float* p = scratch<float>(t);
     u64 r = s.rows, w = r * s.width;
     spans_t q;
     float** wide[6] = {&q.a, &q.b, &q.c, &q.d, &q.t1, &q.t2};
@@ -304,12 +285,6 @@ static __device__ __forceinline__ float vec_elem(const mat& w, u32 o, u32 i) {
     if (w.klass == K_F32) return reinterpret_cast<const float*>(w.p)[n];
     if (w.klass == K_BF16) return __uint_as_float(u32(reinterpret_cast<const u16*>(w.p)[n]) << 16);
     return elem(w, 0, o, i);
-}
-
-static __device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (u32 off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
-    return v;
 }
 
 static __device__ __forceinline__ float block_sum(const ctx& c, float v) {

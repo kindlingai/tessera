@@ -8,6 +8,7 @@ using tessera::u64;
 using tessera::u8;
 namespace prim = tessera::prim;
 namespace trellis = tessera::trellis;
+using trellis::word;
 typedef const u8* bytes;
 
 #define PICKS 8
@@ -26,10 +27,6 @@ struct Plan {
   float tok_w[MAX_ROWS][PICKS];
 };
 static_assert(sizeof(Plan) == (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u) * 4u, "Plan size");
-
-static __device__ inline u32 word(bytes p, u32 at) {
-  return *(const u32*)(p + at);
-}
 
 static __device__ inline u16 f32_to_f16(float v) {
   u16 out;

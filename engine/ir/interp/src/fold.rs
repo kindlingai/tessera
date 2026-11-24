@@ -14,9 +14,9 @@ fn fixed(g: &Graph) -> Vec<bool> {
         let sized = n.ty.shape.elements(&g.dims).ok().and_then(|p| p.as_const());
         fixed[i] = sized.is_some()
             && n.ty.dtype == DType::F32
-            && match n.op {
+            && match &n.op {
                 Op::Weight(_) => true,
-                Op::Input { .. } | Op::Append(_) => false,
+                op if op.stateful() => false,
                 _ => !n.args.is_empty() && n.args.iter().all(|a| fixed[a.0 as usize]),
             };
     }

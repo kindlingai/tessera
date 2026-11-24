@@ -1,11 +1,11 @@
 //! Model architectures, one record each, registered in their own files.
 
+use crate::encoder::Embeds;
 use crate::names::Rule;
 use crate::parts::{Cut, Part};
 use crate::{Overrides, Weights};
 use std::error::Error;
 use std::path::Path;
-use tessera_engine::decoder::Config;
 use tessera_engine::{Graph, Pins, Steps};
 
 pub(crate) use scattered_collect::declarative::{gather, scatter};
@@ -22,7 +22,7 @@ pub(crate) enum Spot {
     Probe(fn(&str) -> bool),
 }
 
-/// The inputs of a step graph load.
+/// The inputs of a graph load.
 pub(crate) struct Ask<'a> {
     pub dir: &'a Path,
     pub sizes: [u64; 2],
@@ -36,23 +36,38 @@ pub(crate) struct Ask<'a> {
     pub json: &'a str,
 }
 
-/// A step graph with its weights and their forms.
+impl<'a> Ask<'a> {
+    /// A graph load with no rules, steps, taps or manifest.
+    pub fn plain(dir: &'a Path, sizes: [u64; 2], overrides: &'a Overrides, json: &'a str) -> Self {
+        Ask {
+            dir,
+            sizes,
+            user: &[],
+            steps: Steps::Plain,
+            overrides,
+            manifest: None,
+            taps: &[],
+            json,
+        }
+    }
+}
+
+/// A graph with its weights and their forms.
 pub(crate) type Built = (Graph, Weights, Pins);
 
-/// Graphs over the shared decoder config.
-pub(crate) struct Family {
-    pub step: fn(&Config) -> Graph,
-    pub taps: fn(&Config, &[u64]) -> Graph,
-}
+/// Builds a graph for an `Ask`.
+type Build = fn(&Arch, &Ask) -> Result<Built>;
 
 pub(crate) struct Arch {
     pub name: &'static str,
     pub spot: &'static [Spot],
     /// The weight name rules, as JSON.
     pub rules: Option<&'static str>,
-    pub step: Option<fn(&Arch, &Ask) -> Result<Built>>,
+    pub step: Option<Build>,
+    /// The whole-prompt logits graph.
+    pub forward: Option<Build>,
     pub part: Option<fn(&Arch, &Cut) -> Result<Part>>,
-    pub family: Option<Family>,
+    pub embed: Option<Embeds>,
 }
 
 impl Arch {
@@ -61,8 +76,9 @@ impl Arch {
         spot: &[],
         rules: None,
         step: None,
+        forward: None,
         part: None,
-        family: None,
+        embed: None,
     };
 
     /// The weight name rules, or none.
@@ -149,10 +165,9 @@ pub(crate) fn spot(json: &str) -> Result<&'static Arch> {
     }
 }
 
-/// The decoder family registered as `name`.
-pub(crate) fn family(name: &str) -> Result<&'static Family> {
-    let arch = find(name).ok_or_else(|| unknown(name))?;
-    arch.family
-        .as_ref()
-        .ok_or_else(|| format!("{name} is not a decoder. Known: {}", known()).into())
+/// `dir/config.json` with overrides, and the architecture it names.
+pub(crate) fn read(dir: &Path, overrides: &Overrides) -> Result<(String, &'static Arch)> {
+    let json = overrides.merged("config.json", &dir.join("config.json"))?;
+    let arch = spot(&json)?;
+    Ok((json, arch))
 }

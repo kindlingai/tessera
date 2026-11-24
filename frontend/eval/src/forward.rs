@@ -1,12 +1,11 @@
-//! Qwen3.5 forward passes: each prompt's next-token picks.
+//! Forward passes: each prompt's next-token picks.
 
 use crate::Failure;
 use serde::Serialize;
 use std::path::Path;
 use std::time::Instant;
-use tessera_bundle::Overrides;
-use tessera_bundle::qwen35::open;
 use tessera_bundle::tokenize::hf::Hf;
+use tessera_bundle::{Overrides, forward as open};
 use tessera_engine::{DimName, Model, Recipe, Tensor};
 
 /// Picks reported after each prompt's last row.
@@ -52,17 +51,17 @@ pub fn forward(dir: &Path, texts: &Path) -> Result<Picks, Failure> {
     // The longest prompt bounds the graph and caps the buckets.
     let longest = prompts.iter().map(Vec::len).max().unwrap_or(1) as u64;
     let start = Instant::now();
-    let text = open(dir, [1, longest], &Overrides::default())?;
+    let (graph, weights, pins) = open(dir, [1, longest], &Overrides::default())?;
     let recipe = Recipe {
-        pins: text.pins.clone(),
+        pins,
         ..Recipe::default()
     };
-    let model = Model::open(text.graph.clone(), &recipe, &settings)?;
+    let model = Model::open(graph, &recipe, &settings)?;
     if model.interpreted() {
         return Err("the graph has no plan on this device".into());
     }
     let mut model = model.bucketed(&[DimName::Context]);
-    text.each(|at, w| Ok(model.load_one(at, &w)?))?;
+    weights.each(|at, w| model.load_one(at, w))?;
     let load_s = start.elapsed().as_secs_f64();
     let mut passes = Vec::with_capacity(prompts.len());
     for ids in &prompts {

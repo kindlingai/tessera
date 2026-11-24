@@ -10,7 +10,10 @@ services to squeeze all of the performance out the hardware.
 
 ## State
 
-tessera is not alpha or beta. It's an experiment right now and no numbers are available.
+tessera runs models, and many of them fast. PRs are welcome to add new model support, new weight format support,
+new hardware support, and missing features.
+
+Join us on discord (https://discord.gg/8EAvYPV2rE) to discuss larger features to help us land them more smoothly.
 
 ## Supported Hardware
 
