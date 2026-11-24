@@ -217,7 +217,12 @@ impl DualSelector {
     }
 }
 
-fn split_taps(taps: &[f32], rows: usize, d_width: usize, m_width: usize) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn split_taps(
+    taps: &[f32],
+    rows: usize,
+    d_width: usize,
+    m_width: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let total = d_width + m_width;
     let mut d_out = Vec::with_capacity(rows * d_width);
     let mut m_out = Vec::with_capacity(rows * m_width);
@@ -229,7 +234,7 @@ fn split_taps(taps: &[f32], rows: usize, d_width: usize, m_width: usize) -> (Vec
     (d_out, m_out)
 }
 
-fn run_dflash(
+pub(crate) fn run_dflash(
     dflash: &mut Drafter,
     anchor: u32,
     start: usize,

@@ -71,17 +71,9 @@ pub(super) fn open_mtp(
     Ok(drafter)
 }
 
-/// Serves continuous-batching MTP decoding across many slots.
-fn serve_batch(
-    load: &Load,
-    engine: &mut Engine,
-    drafter: &mut MtpDrafter,
-    target: Bundle,
-    depth: usize,
-) -> Result<(), String> {
+/// Runs rank 0's job loop or follower loop on `batch`.
+fn run_batch_loop(load: &Load, mut batch: BatchMtp<'_>, target: Bundle) -> Result<(), String> {
     let o = load.options;
-    let cap = load.count("--spec-len", depth).min(depth);
-    let mut batch = BatchMtp::new(engine, drafter, cap).map_err(|e| e.to_string())?;
     if let Some(rows) = o.max_batch_rows {
         batch = batch.with_prefill_chunk(rows);
     }
@@ -109,7 +101,20 @@ fn serve_batch(
         }
         batch.step().map_err(|e| e.to_string())?;
     }
-    drop(batch);
+    Ok(())
+}
+
+/// Serves continuous-batching MTP decoding across many slots.
+fn serve_batch(
+    load: &Load,
+    engine: &mut Engine,
+    drafter: &mut MtpDrafter,
+    target: Bundle,
+    depth: usize,
+) -> Result<(), String> {
+    let cap = load.count("--spec-len", depth).min(depth);
+    let batch = BatchMtp::new(engine, drafter, cap).map_err(|e| e.to_string())?;
+    run_batch_loop(load, batch, target)?;
     let _ = engine.dismiss();
     Ok(())
 }
@@ -186,18 +191,19 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
     let depth = load.count("--mtp", 1);
     let b = begin(load, &settings, "--draft and --mtp")?;
     let (target_links, dflash_links, mtp_links) = split_dual(b.links);
-    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
+    let (start, rules, at_solo, manifest) = (b.start, b.rules, b.at, b.manifest);
+    let at_batch = [o.slots as u64, o.max_model_len as u64];
     // Drop each pair before the next, to limit open files.
     let (mut drafter, dflash_block, mut taps) = {
         let pair =
-            tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
+            tessera_bundle::dflash::load([&o.model, draft_dir], at_solo, &rules, &o.config, manifest)
                 .map_err(|e| e.to_string())?;
         let drafter = open_drafter(o, dflash_links, &pair, &settings)?;
         let taps: Vec<u64> = pair.target_layers.iter().map(|&l| l + 1).collect();
         (drafter, pair.block, taps)
     };
     let (mut mtp, mtp_layer) = {
-        let pair = tessera_bundle::mtp::load(&o.model, at, &rules, &o.config, manifest)
+        let pair = tessera_bundle::mtp::load(&o.model, at_batch, &rules, &o.config, manifest)
             .map_err(|e| e.to_string())?;
         let mtp = open_mtp(o, mtp_links, &pair, &settings)?;
         (mtp, pair.layer)
@@ -205,7 +211,7 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
     taps.push(mtp_layer + 1);
     let combined = tessera_bundle::load_tapped(
         &o.model,
-        at,
+        at_batch,
         &rules,
         Steps::Plain,
         &o.config,
@@ -216,19 +222,28 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
     let (mut engine, target) = open_target(o, target_links, combined, &settings)?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!(
-        "{}: loaded target + dflash (block {dflash_block}) + mtp (layer {mtp_layer}, depth {depth}) in {seconds:.1} s",
+        "{}: loaded target + dflash (block {dflash_block}) + mtp (layer {mtp_layer}, depth {depth}, slots {}) in {seconds:.1} s",
         engine.device(),
+        o.slots,
     );
+    let d_sl = spec_len(load, dflash_block - 1, CostModel::dual_dflash(), false);
+    let m_sl = spec_len(load, depth, CostModel::dual_mtp(), true);
+    let selector = DualSelector::new(d_sl, m_sl);
+    if o.slots > 1 {
+        let batch = BatchMtp::new_dual(&mut engine, &mut drafter, &mut mtp, depth, selector)
+            .map_err(|e| e.to_string())?;
+        run_batch_loop(load, batch, target)?;
+        let _ = engine.dismiss();
+        return Ok(());
+    }
     if o.ranks.follows() {
         let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
             .map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let d_sl = spec_len(load, dflash_block - 1, CostModel::dual_dflash(), false);
-    let m_sl = spec_len(load, depth, CostModel::dual_mtp(), true);
     let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
         .map_err(|e| e.to_string())?
-        .with_selector(DualSelector::new(d_sl, m_sl));
+        .with_selector(selector);
     serve(load, &settings, target, "dual", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;

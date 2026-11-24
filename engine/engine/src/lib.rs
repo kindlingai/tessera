@@ -12,6 +12,7 @@ use tessera_graph::{EntryKind, Role};
 use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
+mod batch_dual;
 mod batch_spec;
 mod dual;
 mod guide;
