@@ -1,0 +1,26 @@
+# The example for one AMD GPU, through the AMD GPU device plugin.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../cuda
+images:
+  - name: ghcr.io/kindlingai/tessera
+    newTag: latest-rocm
+patches:
+  - target:
+      kind: Deployment
+      name: tessera
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/tolerations/0/key
+        value: amd.com/gpu
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/requests/nvidia.com~1gpu
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu
+      - op: add
+        path: /spec/template/spec/containers/0/resources/requests/amd.com~1gpu
+        value: "1"
+      - op: add
+        path: /spec/template/spec/containers/0/resources/limits/amd.com~1gpu
+        value: "1"

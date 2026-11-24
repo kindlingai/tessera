@@ -1,0 +1,7 @@
+[task.add-weight-loader]
+steps = [
+  { do = "implement", with = "tessera_checkpoint::Offer", like = "frontend/checkpoint/src/gguf.rs" },
+  { do = "list", at = "frontend/checkpoint/src/lib.rs", like = "frontend/checkpoint/src/gguf.rs" },
+  { do = "define", with = "tessera_checkpoint::Offer", like = "tessera_bundle::offer" },
+  { do = "run", pkg = "tessera-checkpoint", mode = "test" },
+]

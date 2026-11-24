@@ -149,32 +149,58 @@ fn gemv_epilogue(tree: &Tree, mut at: T) -> Option<(T, u32, f32, f32)> {
     (mode == 0 || !tree.root(at)).then_some((at, mode, a, b))
 }
 
-pub(super) fn propose_gemv(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if tree.node(at).form.name() != "f32" {
-        return None;
-    }
-    let (mat, mode, a, b) = gemv_epilogue(tree, at)?;
+fn check_gemv(
+    tree: &Tree,
+    mat: T,
+    mode: u32,
+    a: f32,
+    b: f32,
+) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(mat);
-    if node.term != Term::Op(Op::Matmul) || node.form.name() != "f32" {
+    if node.term != Term::Op(Op::Matmul) {
         return None;
     }
     let (x, w) = (node.args[0], node.args[1]);
-    if !tree.leaf(w) || tree.node(x).form.name() != "f32" {
-        return None;
-    }
     let [n, k] = tree.node(w).shape[..] else {
         return None;
     };
     if tree.elements(x) != k || n == 0 {
         return None;
     }
+    if node.form.name() != "f32" {
+        return Some(Err(format!(
+            "output form {} (requires f32)",
+            node.form.name()
+        )));
+    }
+    if !tree.leaf(w) {
+        return Some(Err("weight is not a direct leaf".into()));
+    }
+    if tree.node(x).form.name() != "f32" {
+        return Some(Err(format!(
+            "input form {} (requires f32)",
+            tree.node(x).form.name()
+        )));
+    }
     let form = tree.node(w).form;
     let kind = match form.name() {
         "bf16" if k.is_multiple_of(8) && n <= 64 && k >= 1024 => GemvKind::Bf16Narrow,
         "bf16" if k.is_multiple_of(8) => GemvKind::Bf16,
+        "bf16" => return Some(Err(format!("k={k} is not a multiple of 8 for bf16"))),
         "mxfp8" if mode == 0 && k.is_multiple_of(1024) => GemvKind::Mxfp8,
+        "mxfp8" if mode != 0 => return None,
+        "mxfp8" => return Some(Err(format!("k={k} is not a multiple of 1024 for mxfp8"))),
         "int4_g32" if mode == 0 && k.is_multiple_of(1024) && n.is_multiple_of(2) => GemvKind::Int4,
-        _ => return None,
+        "int4_g32" if mode != 0 => return None,
+        "int4_g32" if !k.is_multiple_of(1024) => {
+            return Some(Err(format!("k={k} is not a multiple of 1024 for int4_g32")));
+        }
+        "int4_g32" => return Some(Err(format!("n={n} is not even for int4_g32"))),
+        other => {
+            return Some(Err(format!(
+                "weight form {other} (supports bf16, mxfp8, int4_g32)"
+            )));
+        }
     };
     let kernel = FastGemv {
         n,
@@ -185,5 +211,17 @@ pub(super) fn propose_gemv(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         kind,
         form,
     };
-    Some(vec![Draft::new(kernel, [x, w], n)])
+    Some(Ok(vec![Draft::new(kernel, [x, w], n)]))
+}
+
+pub(super) fn propose_gemv(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    if tree.node(at).form.name() != "f32" {
+        return None;
+    }
+    let (mat, mode, a, b) = gemv_epilogue(tree, at)?;
+    check_gemv(tree, mat, mode, a, b)?.ok()
+}
+
+pub(super) fn why_gemv(tree: &Tree, at: T) -> Option<String> {
+    check_gemv(tree, at, 0, 1.0, 1.0)?.err()
 }

@@ -51,9 +51,17 @@ max_lean = 0.03
 # Pairs of files that may be near-copies.
 similar_allow = "stickler/allow.toml"
 
+# Run the crate-name clash audit over tessera-publish merge groups.
+publish_groups = true
+
 # Style rule files and the tag patterns they use.
 style.rules = "stickler/style/rules"
 style.tags = "stickler/style/tags.txt"
+
+# Task maps: their folder and limits. Ids also use max_name_segments.
+maps_dir = "maps/"
+max_map_id_chars = 24
+max_map_steps = 12
 
 # File types the rules read.
 extensions = ["rs", "metal", "cu", "cuh", "h", "hpp", "c", "cc", "cpp", "wgsl", "hip", "kernel"]

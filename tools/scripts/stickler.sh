@@ -40,7 +40,9 @@ if [ ! -x "$bin" ]; then
     else
         sum=(shasum -a 256)
     fi
-    (cd "$part" && grep " $zip\$" SHA256SUMS | "${sum[@]}" -c --status) || {
+    want=$(awk -v z="$zip" '$2 == z { print $1 }' "$part/SHA256SUMS")
+    got=$("${sum[@]}" "$part/$zip" | awk '{ print $1 }')
+    [ -n "$want" ] && [ "$want" = "$got" ] || {
         echo "stickler.sh: $base/$zip does not match SHA256SUMS" >&2
         exit 2
     }

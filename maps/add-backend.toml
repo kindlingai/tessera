@@ -1,0 +1,8 @@
+[task.add-backend]
+steps = [
+  { do = "define", with = "tessera_engine_settings::Backend", like = "tessera_gpukit::backend::dispatch" },
+  { do = "implement", with = "tessera_gpukit::device::Device", like = "engine/gpu/gpukit/src/metal/context.rs" },
+  { do = "implement", with = "tessera_gpukit::launch::Launch", like = "engine/gpu/gpukit/src/metal/context.rs" },
+  { do = "list", at = "engine/gpu/gpukit/src/lib.rs", like = "engine/gpu/gpukit/src/metal/mod.rs" },
+  { do = "run", pkg = "tessera-gpukit", mode = "test" },
+]

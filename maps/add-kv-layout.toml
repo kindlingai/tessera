@@ -1,0 +1,6 @@
+[task.add-kv-layout]
+steps = [
+  { do = "implement", with = "tessera_codegen::kept::Layout", like = "engine/plan/codegen/src/kept.rs" },
+  { do = "register", with = "tessera_codegen::layout!", like = "engine/plan/codegen/src/kept.rs" },
+  { do = "run", pkg = "tessera-codegen", mode = "test" },
+]

@@ -1,7 +1,7 @@
 name: macOS
 
 # The Metal backend. Pull requests run clippy and the platform table.
-# The merge queue and the daily run add the workspace tests. The daily
+# Pushes to main and the daily run add the workspace tests. The daily
 # run also keeps main's build cache current for pull requests.
 on:
   workflow_call:

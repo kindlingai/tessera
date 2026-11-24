@@ -4,7 +4,7 @@ use super::{Entry, Flag, Load, Pick};
 use crate::start::Options;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
-use tessera_engine::{Batch, Fair, Pins, PleStore, Recipe, Settings, Steps};
+use tessera_engine::{Batch, Engine, Fair, Pins, PleStore, Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
 use tessera_tasks::{Generate, Job, Queued};
 
@@ -38,6 +38,29 @@ pub(super) fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::name
             .map_err(|e| e.to_string())
             .and_then(|text| tessera_bundle::names::rules(&text).map_err(|e| e.to_string())),
         None => Ok(Vec::new()),
+    }
+}
+
+/// Prints lowering details or a boot warning on rank 0.
+pub(super) fn check_lowering(o: &Options, engine: &mut Engine, extra_rows: Option<usize>) {
+    if o.ranks.follows() {
+        return;
+    }
+    match engine.lowering_report(1) {
+        Ok(report) if o.explain_lowering => eprintln!("{}", report.format(12)),
+        Ok(report) => {
+            if let Some(warning) = report.warning("--explain-lowering") {
+                eprintln!("{warning}");
+            }
+        }
+        Err(e) => eprintln!("warning: lowering report failed: {e}"),
+    }
+    if o.explain_lowering
+        && let Some(rows) = extra_rows
+        && rows > 1
+        && let Ok(report) = engine.lowering_report(rows)
+    {
+        eprintln!("{}", report.format(12));
     }
 }
 
@@ -98,6 +121,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     loading.map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());
+    check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)));
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
     }

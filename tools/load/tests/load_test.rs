@@ -56,8 +56,11 @@ impl Mock {
 }
 
 const OK: &str = "HTTP/1.1 200 OK\r\nConnection: close\r\n";
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn respond(socket: TcpStream, mode: Mode, state: &State) {
+    socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+    socket.set_write_timeout(Some(TIMEOUT)).unwrap();
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
