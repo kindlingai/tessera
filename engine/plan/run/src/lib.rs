@@ -13,6 +13,9 @@ mod marks_test;
 mod overrides;
 #[cfg(test)]
 mod overrides_test;
+mod paged;
+#[cfg(test)]
+mod paged_test;
 mod profile;
 mod rank;
 mod run;

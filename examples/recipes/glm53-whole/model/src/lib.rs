@@ -261,7 +261,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let summed = attn.iter().flatten().count() + mlp_split.filter(|on| *on).count();
     // Trimmed last layers sum picked rows. The grid sums all.
     let sums_fit = sums.len() == summed && sums.iter().all(|n| n % hidden == 0);
-    let kept_fit = kept.len() == 2 * layers + index.len();
+    let kept_fit = kept.len() == layers + index.len();
     if !(whole_rest && sums_fit && kept_fit && layers <= 96) {
         return None;
     }

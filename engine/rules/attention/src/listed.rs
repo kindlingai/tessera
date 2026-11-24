@@ -1,10 +1,11 @@
 //! Masked attention over listed keys, or computed keys by row.
 
+use tessera_codegen::kept::{self, Dense, Layout};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order};
 use tessera_lower::sites::Attend;
 use tessera_lower::{
-    Attn, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, Attn, Draft, Extent, Kernel, Launch, Needs, Read, Shape, Source, Step, T, Term, Tree,
 };
 
 /// Elements one wide load brings per lane.
@@ -57,10 +58,10 @@ fn listed_attend(
     let warp = lid() / LANES as u32;
     let l = lane();
     let kv_head = head / (heads / kv_heads);
-    let mut first = row / queries * keys;
+    let mut slot = row / queries;
     let mut position = keys - queries + row % queries;
     if ragged == 1 {
-        first = slots[row as u64] * keys;
+        slot = slots[row as u64];
         position = positions[row as u64];
     }
     let from = if position > before {
@@ -124,7 +125,7 @@ fn listed_attend(
             j = ids[row as u64 * picks as u64 + p as u64];
         }
         if j >= from && j < to {
-            let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+            let k_at = (kept_row(slot, j) * kv_heads + kv_head) as u64 * width as u64;
             let mut dot = 0.0f32;
             for s in (0..quads).unroll(MAX_QUADS) {
                 let d = s * (LANES as u32 * WIDE) + l * WIDE;
@@ -226,10 +227,10 @@ fn listed_scores(
     let head = (gid() / picks) % heads;
     let row = gid() / (picks * heads);
     // Whole sequences end together. Ragged rows carry slot and position.
-    let mut first = row / queries * keys;
+    let mut slot = row / queries;
     let mut position = keys - queries + row % queries;
     if ragged == 1 {
-        first = slots[row as u64] * keys;
+        slot = slots[row as u64];
         position = positions[row as u64];
     }
     // Keys the mask lets this query see.
@@ -250,7 +251,7 @@ fn listed_scores(
     let mut score = f32::NEG_INFINITY;
     if j >= from && j < to {
         let kv_head = head / (heads / kv_heads);
-        let k_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+        let k_at = (kept_row(slot, j) * kv_heads + kv_head) as u64 * width as u64;
         let q_at = (row * heads + head) as u64 * width as u64;
         score = q.dot(q_at, k, k_at, width) * scale;
     }
@@ -313,9 +314,9 @@ fn listed_mix(
     let d = gid() % width;
     let head = (gid() / width) % heads;
     let row = gid() / (width * heads);
-    let mut first = row / queries * keys;
+    let mut slot = row / queries;
     if ragged == 1 {
-        first = slots[row as u64] * keys;
+        slot = slots[row as u64];
     }
     let kv_head = head / (heads / kv_heads);
     let at = (row * heads + head) as u64 * picks as u64;
@@ -331,7 +332,7 @@ fn listed_mix(
             if from_list == 1 {
                 j = ids[row as u64 * picks as u64 + p as u64];
             }
-            let v_at = ((first + j) * kv_heads + kv_head) as u64 * width as u64;
+            let v_at = (kept_row(slot, j) * kv_heads + kv_head) as u64 * width as u64;
             sum += exp(score - peak) * v[v_at + d as u64];
         }
     }
@@ -346,10 +347,14 @@ fn listed_mix(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sizes {
     pub len: usize,
+    pub seqs: usize,
     /// Queries per sequence. Ragged rows have one each.
     pub queries: usize,
     /// Each slot's keys, up to the launch's capacity.
     pub keys: Extent,
+    /// Slot capacity in `k`/`v`, for `kept_row`.
+    pub context: usize,
+    pub kept: &'static dyn Layout,
     pub heads: usize,
     pub kv_heads: usize,
     pub width: usize,
@@ -373,27 +378,44 @@ impl Sizes {
         self.len / self.width
     }
 
+    /// Buffer arguments, plus any page table for `kept`.
+    fn buffers(&self, step: &Step) -> Vec<Arg> {
+        (0..step.reads.len())
+            .map(|i| step.read(i))
+            .chain([step.out()])
+            .chain(step.kept(self.kept))
+            .collect()
+    }
+
+    /// Trailing scalar arguments for `kept`.
+    fn kept_scalars(&self) -> impl Iterator<Item = Arg> {
+        self.kept
+            .values(self.seqs, self.context)
+            .into_iter()
+            .map(|v| Arg::count(v as usize))
+    }
+
     /// The launch of `step` over `len` threads, `scale` if given.
     fn launch(&self, step: &Step, len: usize, scale: Option<f32>) -> Vec<Launch> {
-        let mut launch = Launch::plain(step, &[len], Shape::Line(len));
+        let mut args = self.buffers(step);
         if let Some(scale) = scale {
-            let at = launch.args.len() - 1;
-            launch.args.insert(at, tessera_lower::Arg::value(&scale));
+            args.push(Arg::value(&scale));
         }
-        launch.args.push(tessera_lower::Arg::count(self.queries));
-        launch.args.push(tessera_lower::Arg::size(self.keys));
+        args.push(Arg::count(len));
+        args.push(Arg::count(self.queries));
+        args.push(Arg::size(self.keys));
         let counts = [self.heads, self.kv_heads, self.width, self.picks];
         let (ragged, listed) = (usize::from(self.ragged), usize::from(self.from_list));
         let flags = match scale {
             Some(_) => vec![ragged, listed, self.window.0, self.window.1],
             None => vec![ragged | listed << 1],
         };
-        let args = counts
-            .into_iter()
-            .chain(flags)
-            .map(tessera_lower::Arg::count);
-        launch.args.extend(args);
-        vec![launch]
+        args.extend(counts.into_iter().chain(flags).map(Arg::count));
+        args.extend(self.kept_scalars());
+        vec![Launch {
+            args,
+            shape: Shape::Line(len),
+        }]
     }
 
     /// Three-pass listed attention for any backend.
@@ -438,8 +460,11 @@ impl Sizes {
 pub(crate) struct ListedAttend(pub Sizes);
 
 fn attend_source(k: &ListedAttend) -> Source {
-    let body = listed_attend_ir(k.0.width as u32);
-    Source::named(body, format!("plan_listed_attend_{}", k.0.width))
+    let body = kept::attach(listed_attend_ir(k.0.width as u32), k.0.kept);
+    Source::named(
+        body,
+        format!("plan_listed_attend_{}_{}", k.0.kept.name(), k.0.width),
+    )
 }
 
 fn attend_needs(k: &ListedAttend) -> Needs {
@@ -459,11 +484,11 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
         down: 1,
         threads: THREADS as usize,
     };
-    let mut launch = Launch::plain(step, &[lists], shape);
-    let at = launch.args.len() - 1;
-    launch.args.insert(at, tessera_lower::Arg::value(&s.scale));
-    launch.args.push(tessera_lower::Arg::count(s.queries));
-    launch.args.push(tessera_lower::Arg::size(s.keys));
+    let mut args = s.buffers(step);
+    args.push(Arg::value(&s.scale));
+    args.push(Arg::count(lists));
+    args.push(Arg::count(s.queries));
+    args.push(Arg::size(s.keys));
     let counts = [
         s.heads,
         s.kv_heads,
@@ -473,22 +498,26 @@ fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
         s.window.0,
         s.window.1,
     ];
-    launch
-        .args
-        .extend(counts.into_iter().map(tessera_lower::Arg::count));
-    vec![launch]
+    args.extend(counts.into_iter().map(Arg::count));
+    args.extend(s.kept_scalars());
+    vec![Launch { args, shape }]
 }
 
 /// Each listed key's score, for whole sequences or ragged rows.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    listed_scores,
     name = "listed_scores",
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.scores() * self.0.width,
+    source = scores_source,
     launches = scores_launches,
 )]
 pub(crate) struct ListedScores(pub Sizes);
+
+fn scores_source(k: &ListedScores) -> Source {
+    let body = kept::attach(listed_scores_ir(), k.0.kept);
+    Source::named(body, format!("plan_listed_scores_{}", k.0.kept.name()))
+}
 
 fn scores_launches(k: &ListedScores, step: &Step) -> Vec<Launch> {
     k.0.launch(step, k.0.scores(), Some(k.0.scale))
@@ -513,35 +542,52 @@ fn stats_launches(k: &ListedStats, step: &Step) -> Vec<Launch> {
 /// The softmax of the scores over the listed values.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    listed_mix,
     name = "listed_mix",
     sizes = [self.0.len, self.0.keys.most(), self.0.picks],
     work = self.0.len * self.0.picks,
+    source = mix_source,
     launches = mix_launches,
 )]
 pub(crate) struct ListedMix(pub Sizes);
+
+fn mix_source(k: &ListedMix) -> Source {
+    let body = kept::attach(listed_mix_ir(), k.0.kept);
+    Source::named(body, format!("plan_listed_mix_{}", k.0.kept.name()))
+}
 
 fn mix_launches(k: &ListedMix, step: &Step) -> Vec<Launch> {
     k.0.launch(step, k.0.len, None)
 }
 
-/// Ragged rows over computed keys, not kept rows.
+/// Ragged rows over kept or computed keys.
 fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
     };
     let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
-    if !a.ragged || tree.appends(k) || tree.appends(v) {
+    if !a.ragged {
         return None;
     }
     let wide = |t: T| &tree.node(t).shape;
-    let (&[rows, heads, width], &[_, most, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
+    let (&[rows, heads, width], &[seqs, most, kv_heads, _]) = (&wide(q)[..], &wide(k)[..]) else {
         return None;
     };
     if wide(v).last() != Some(&width) {
         return None;
     }
+    let (kept, context): (&'static dyn Layout, usize) =
+        match (&tree.node(k).term, &tree.node(v).term) {
+            (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
+                let (_, ctx) = tree.kept_rows(*ki)?;
+                if tree.kept_rows(*vi)?.1 != ctx {
+                    return None;
+                }
+                (tree.kept, ctx)
+            }
+            (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => return None,
+            _ => (&Dense, most),
+        };
     let [slots, positions] = [node.args[3], node.args[4]];
     let (ids, picks) = match node.args.get(5) {
         Some(&ids) => (ids, *wide(ids).last()?),
@@ -549,8 +595,11 @@ fn rows(tree: &Tree, at: T) -> Option<(Sizes, [T; 6])> {
     };
     let sizes = Sizes {
         len: rows * heads * width,
+        seqs,
         queries: 1,
         keys: tree.node(k).extents[1],
+        context,
+        kept,
         heads,
         kv_heads,
         width,
@@ -569,8 +618,11 @@ fn whole((site, ids, picks): (Attend, T, usize)) -> (Sizes, [T; 6]) {
     let keys = a.keys.most();
     let sizes = Sizes {
         len: a.seqs * a.queries * a.heads * a.width,
+        seqs: a.seqs,
         queries: a.queries,
         keys: Extent::Fixed(keys),
+        context: keys,
+        kept: &Dense,
         heads: a.heads,
         kv_heads: a.kv_heads,
         width: a.width,

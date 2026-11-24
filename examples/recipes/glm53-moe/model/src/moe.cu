@@ -45,7 +45,7 @@ struct Mat {
 };
 
 static __device__ inline Mat matrix(bytes p) {
-  Mat w = {p, word(p, 0), word(p, 4), word(p, 8) == trellis::INPUT_SIDE};
+  Mat w = {p, word(p, 0), word(p, 4), (word(p, 8) & trellis::SIDE_MASK) == trellis::INPUT_SIDE};
   return w;
 }
 
@@ -291,9 +291,9 @@ static __device__ __forceinline__ void fc1_body(
   Mat W = matrix(wbytes);
   u32 nblk = (hidden >> 7u) / ks1;
   u32 blk0 = h * nblk;
-  bool aligned = (reinterpret_cast<u64>(W.base + trellis::HEAD) & 15ull) == 0ull;
   u64 sG = (W.input_side ? u64(W.out >> 1u) : 64ull) * u64(TB);
   bytes gb = trellis::tile_ptr<K>(W.base, W.inp, W.out, m, blk0 << 3u, c, W.input_side);
+  bool aligned = (reinterpret_cast<u64>(gb) & 15ull) == 0ull;
   u32 nw[8];
   trellis::blk_load<K>(gb, tid, aligned, nw);
   trellis::word_map wm = trellis::map_word<K>(lane);
@@ -390,6 +390,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc1(
     wbytes = mat ? up : gate;
     su = (mat ? up_su : gate_su) + (u64)e * hidden;
     signs = signs_in;
+    if (c == 0u && h == 0u && threadIdx.x == 0u) trellis::note_hit(wbytes, m);
   }
   u32 max_col = min(rows, 8u);
   if (book && k == 3u) {
@@ -419,9 +420,9 @@ static __device__ __forceinline__ void fc2_body(
   u32 obs = hidden >> 7u;
   u32 ob_per = obs / ns2;
   u32 ob0 = ns * ob_per;
-  bool aligned = (reinterpret_cast<u64>(D.base + trellis::HEAD) & 15ull) == 0ull;
   u64 sO = (D.input_side ? 64ull : u64(D.inp >> 1u)) * u64(TB);
   bytes gb = trellis::tile_ptr<K>(D.base, D.inp, D.out, m, c << 3u, ob0, D.input_side);
+  bool aligned = (reinterpret_cast<u64>(gb) & 15ull) == 0ull;
   u32 nw[8];
   trellis::blk_load<K>(gb, tid, aligned, nw);
   if (j < n) {
@@ -532,6 +533,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
     usv = up_sv + (u64)e * ffn;
     dsu = down_su + (u64)e * ffn;
     dbytes = down;
+    if (c == 0u && ns == 0u && threadIdx.x == 0u) trellis::note_hit(dbytes, m);
     u32 tp = plan->slot_tok[rs][col2 >> 2u];
     u32 sh = (col2 & 3u) << 3u;
     if (col2 < n) {

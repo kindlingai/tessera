@@ -7,6 +7,9 @@ fn flags_pick_entries() {
     let mut o = Options::default();
     assert!(o.switch("--guided"));
     assert!(o.flag("--image-size", "big".into()).is_none());
+    assert!(o.flag("--max-batch-rows", "0".into()).is_none());
+    o.flag("--max-batch-rows", "64".into()).unwrap();
+    assert_eq!(o.max_batch_rows, Some(64));
     assert!(o.flag("--task", "paint".into()).is_none());
     assert!(matches!(pick(&o).map(|e| &e.pick), Ok(Pick::Plain)));
     o.flag("--draft", "d".into()).unwrap();

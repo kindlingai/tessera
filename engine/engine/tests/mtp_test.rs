@@ -4,7 +4,7 @@ mod common;
 
 use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
 use tessera_engine::{
-    Drafter, Event, MtpDrafter, MtpSpeculate, Place, Reason, Recipe, Request, SpecStats,
+    BatchMtp, Drafter, Event, MtpDrafter, MtpSpeculate, Place, Reason, Recipe, Request, SpecStats,
 };
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
@@ -92,6 +92,26 @@ fn run_single(
     last
 }
 
+fn open_mtp_rank<T: tessera_engine::comm::Transport + 'static>(
+    (t_graph, t_seed): (Graph, u64),
+    (m_graph, m_seed): (Graph, u64),
+    moe_tp: bool,
+    settings: &Settings,
+    (sum, ctl): (Box<dyn tessera_engine::comm::Transport>, T),
+) -> (tessera_engine::Engine, MtpDrafter) {
+    let [ts, ms] = Drafter::share_transport(sum);
+    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2)).with_moe_tp(moe_tp);
+    let (tw, mw) = (
+        float_weights(&t_graph, t_seed),
+        float_weights(&m_graph, m_seed),
+    );
+    let target = open_ranked_target(t_graph, 24, settings, place(), ts, ctl, &tw);
+    let mut drafter =
+        MtpDrafter::open_ranked(m_graph, 24, (&Recipe::default(), settings), place(), ms).unwrap();
+    drafter.load(&mw).unwrap();
+    (target, drafter)
+}
+
 fn run_tp_pair(
     t_graph: &Graph,
     t_seed: u64,
@@ -107,33 +127,26 @@ fn run_tp_pair(
     let [[s0, s1], [c0, c1]] = loopback_links();
     let (tg_f, mg_f, s_f) = (t_graph.clone(), m_graph.clone(), settings.clone());
     let follower = std::thread::spawn(move || {
-        let [ts1, ms1] = Drafter::share_transport(Box::new(s1));
-        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2)).with_moe_tp(moe_tp);
-        let (tw_f, mw_f) = (float_weights(&tg_f, t_seed), float_weights(&mg_f, m_seed));
-        let mut te = open_ranked_target(tg_f, 24, &s_f, place(), ts1, c1, &tw_f);
-        let mut dr =
-            MtpDrafter::open_ranked(mg_f, 24, (&Recipe::default(), &s_f), place(), ms1).unwrap();
-        dr.load(&mw_f).unwrap();
+        let (mut te, mut dr) = open_mtp_rank(
+            (tg_f, t_seed),
+            (mg_f, m_seed),
+            moe_tp,
+            &s_f,
+            (Box::new(s1), c1),
+        );
         MtpSpeculate::new(&mut te, &mut dr, depth)
             .unwrap()
             .follow()
             .unwrap();
     });
-    let [ts0, ms0] = Drafter::share_transport(Box::new(s0));
-    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2)).with_moe_tp(moe_tp);
     let t_weights = weights(t_graph, &mut Noise(t_seed));
-    let tw = float_weights(t_graph, t_seed);
-    let mw = float_weights(m_graph, m_seed);
-    let mut target = open_ranked_target(t_graph.clone(), 24, &settings, place(), ts0, c0, &tw);
-    let mut drafter = MtpDrafter::open_ranked(
-        m_graph.clone(),
-        24,
-        (&Recipe::default(), &settings),
-        place(),
-        ms0,
-    )
-    .unwrap();
-    drafter.load(&mw).unwrap();
+    let (mut target, mut drafter) = open_mtp_rank(
+        (t_graph.clone(), t_seed),
+        (m_graph.clone(), m_seed),
+        moe_tp,
+        &settings,
+        (Box::new(s0), c0),
+    );
     assert!(drafter.has_kernel("all_reduce"), "missing all_reduce");
     assert!(drafter.has_kernel("all_gather"), "missing all_gather");
     for name in ["eh_proj", "q_b", "kv_b", "o", "head"] {
@@ -279,4 +292,150 @@ fn mtp_tp_matches_baseline() {
     verify_local_argmax(&m_graph, 73, true);
     run_tp_pair(&t_graph, 61, &m_graph, 67, 2, false);
     run_tp_pair(&t_graph, 71, &m_graph, 73, 3, true);
+}
+
+#[test]
+fn batch_mtp_matches_target() {
+    let mut t_cfg = mla_cfg(true, 16);
+    t_cfg.stack.max_seqs = 3;
+    t_cfg.stack.max_context = 24;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, true));
+    let t_weights = weights(&t_graph, &mut Noise(83));
+    let m_weights = weights(&m_graph, &mut Noise(89));
+    let m_stored: Vec<Weight> = m_weights.iter().cloned().map(Weight::Floats).collect();
+    let prompts = [
+        (vec![3u32, 9, 4, 11, 2], 7usize),
+        (vec![7u32, 1, 5], 6),
+        (vec![2u32, 8, 12, 6], 5),
+        (vec![5u32, 4], 6),
+    ];
+    for settings in runs() {
+        let mut baseline = open_target(&t_graph, &t_weights, 24, &settings);
+        let mut expected = Vec::new();
+        for (toks, max_tokens) in &prompts {
+            let mut got = Vec::new();
+            let req = Request {
+                tokens: toks.clone(),
+                max_tokens: *max_tokens,
+                ..Request::default()
+            };
+            baseline.generate(req, &mut |e| got.push(e)).unwrap();
+            expected.push(collect_ids(&got));
+        }
+        let mut target = open_target(&t_graph, &t_weights, 24, &settings);
+        let mut drafter =
+            MtpDrafter::open(m_graph.clone(), 24, &Recipe::default(), &settings).unwrap();
+        drafter.load(&m_stored).unwrap();
+        let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
+            .unwrap()
+            .with_prefill_chunk(3);
+        let mut rxs = Vec::new();
+        for (toks, max_tokens) in &prompts {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let req = Request {
+                tokens: toks.clone(),
+                max_tokens: *max_tokens,
+                ..Request::default()
+            };
+            batch.submit(req, Box::new(move |e| tx.send(e).is_ok()));
+            rxs.push(rx);
+        }
+        while batch.step().unwrap() {}
+        for (rx, want) in rxs.into_iter().zip(&expected) {
+            let evs: Vec<_> = rx.try_iter().collect();
+            assert_eq!(&collect_ids(&evs), want);
+            assert_eq!(evs.last(), Some(&Event::Done(Reason::Length)));
+        }
+    }
+}
+
+#[test]
+fn batch_mtp_ranked_matches() {
+    let mut t_cfg = mla_cfg(true, 512);
+    t_cfg.stack.vocab = 128;
+    t_cfg.stack.max_seqs = 2;
+    t_cfg.stack.max_context = 24;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, true));
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let (tg_f, mg_f, s_f) = (t_graph.clone(), m_graph.clone(), settings.clone());
+    let follower = std::thread::spawn(move || {
+        let (mut te, mut dr) =
+            open_mtp_rank((tg_f, 97), (mg_f, 101), true, &s_f, (Box::new(s1), c1));
+        BatchMtp::new(&mut te, &mut dr, 2)
+            .unwrap()
+            .with_prefill_chunk(3)
+            .follow()
+            .unwrap();
+    });
+    let t_weights = weights(&t_graph, &mut Noise(97));
+    let (mut target, mut drafter) = open_mtp_rank(
+        (t_graph.clone(), 97),
+        (m_graph.clone(), 101),
+        true,
+        &settings,
+        (Box::new(s0), c0),
+    );
+    let mut baseline = open_target(&t_graph, &t_weights, 24, &settings);
+    let prompts = [
+        (vec![2u32, 6, 1, 9], 7usize, false),
+        (vec![4u32, 1, 5, 3], 7, true),
+        (vec![8u32, 3, 7], 6, false),
+    ];
+    let mut expected = Vec::new();
+    for (toks, max_tokens, _) in &prompts {
+        let mut got = Vec::new();
+        let req = Request {
+            tokens: toks.clone(),
+            max_tokens: *max_tokens,
+            ..Request::default()
+        };
+        baseline.generate(req, &mut |e| got.push(e)).unwrap();
+        expected.push(collect_ids(&got));
+    }
+    let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
+        .unwrap()
+        .with_prefill_chunk(3);
+    let mut rxs = Vec::new();
+    for (toks, max_tokens, cancel_early) in &prompts {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut seen = 0usize;
+        let cancel = *cancel_early;
+        let req = Request {
+            tokens: toks.clone(),
+            max_tokens: *max_tokens,
+            ..Request::default()
+        };
+        batch.submit(
+            req,
+            Box::new(move |e| {
+                if matches!(e, Event::Token(_)) {
+                    seen += 1;
+                }
+                let _ = tx.send(e);
+                !(cancel && seen >= 2)
+            }),
+        );
+        rxs.push(rx);
+    }
+    while batch.step().unwrap() {}
+    drop(batch);
+    target.dismiss().unwrap();
+    follower.join().unwrap();
+    for ((rx, want), (_, _, cancel)) in rxs.into_iter().zip(&expected).zip(&prompts) {
+        let evs: Vec<_> = rx.try_iter().collect();
+        let ids = collect_ids(&evs);
+        if *cancel {
+            assert_eq!(&ids[..2], &want[..2]);
+            assert_eq!(evs.last(), Some(&Event::Done(Reason::Stop)));
+        } else {
+            assert_eq!(&ids, want);
+            assert_eq!(evs.last(), Some(&Event::Done(Reason::Length)));
+        }
+    }
 }

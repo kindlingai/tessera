@@ -7,6 +7,7 @@ use crate::held::Holds;
 use crate::kernels::Kernels;
 use crate::marks;
 use crate::overrides::{self, Overrides};
+use crate::paged::{self, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
@@ -62,6 +63,8 @@ pub(crate) struct Runner<D: Device> {
     grid: RefCell<Option<Box<dyn Grid>>>,
     /// Which steps a persistent grid runs.
     resident: Vec<bool>,
+    /// Hot-cold expert weight pager, opened on VRAM overflow.
+    pager: Option<Pager<D>>,
 }
 
 /// Launches a closed gate holds, under any driver queue.
@@ -100,6 +103,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             gated: Cell::new(0),
             grid: RefCell::new(None),
             resident: Vec::new(),
+            pager: None,
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -349,6 +353,17 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             && self.base.plan.id != 0
     }
 
+    /// Promotes hot experts after a completed full-plan step.
+    fn maintain_pager(&mut self, wait: bool, end: usize) -> Result<(), Error> {
+        if wait
+            && end == self.base.plan.steps.len()
+            && let Some(pager) = &mut self.pager
+        {
+            pager.maintain(self.ctx)?;
+        }
+        Ok(())
+    }
+
     /// Launches every step, as a recorded graph when eligible.
     pub(crate) fn run(
         &mut self,
@@ -364,15 +379,21 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             grid.pause()?;
         }
         self.reread()?;
+        let end = steps.end;
         if self.base.profile.is_some() {
-            return self.profiled(steps).map(|()| (None, None));
+            self.profiled(steps)?;
+            self.maintain_pager(wait, end)?;
+            return Ok((None, None));
         }
         if steps.is_empty() {
+            self.maintain_pager(wait, end)?;
             return Ok((None, None));
         }
         if !self.can_record(&steps) {
             let plain = |r: &Self| r.launch_all(steps, None).map_err(Capture::into_error);
-            return Ok((self.waited(wait, timed, plain)?, None));
+            let secs = self.waited(wait, timed, plain)?;
+            self.maintain_pager(wait, end)?;
+            return Ok((secs, None));
         }
         let mut bound: Vec<_> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
         bound.sort_unstable();
@@ -422,7 +443,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             let graph = &r.graphs.get(&key).expect("captured above").ranges[&range];
             Ok(r.ctx.replay(graph)?)
         };
-        Ok((self.waited(wait, timed, replay)?, None))
+        let secs = self.waited(wait, timed, replay)?;
+        self.maintain_pager(wait, end)?;
+        Ok((secs, None))
     }
 
     /// Notes each step's entry, once per distinct entry.
@@ -590,23 +613,42 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         plan: &Plan,
         mut sum: Option<&mut (dyn Sum + 'static)>,
     ) -> Result<(), Error> {
-        if !self.base.fresh(plan)? {
+        if plan.id != 0 && plan.id == self.base.plan.id {
+            return Ok(());
+        }
+        if self.pager.is_none()
+            && self
+                .base
+                .budget
+                .is_some_and(|l| plan.buffers.iter().map(|&b| b as u64).sum::<u64>() > l)
+            && let Some(g) = sum.as_deref_mut()
+        {
+            g.pause()?;
+        }
+        let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, self.base.budget)?;
+        let plan = plan.as_ref();
+        if !self.base.fresh_with(plan, extra)? {
             return Ok(());
         }
         let (ctx, unified) = (self.ctx, self.ctx.unified());
-        let dropped = match self.base.held.bind(plan, |zone, bytes, holds| {
-            if let Some(g) = sum.as_deref_mut() {
-                g.pause()?;
-            }
-            // The host reads weight files straight into pinned memory.
-            let buffer = match unified && holds == Holds::Weights {
-                true => DeviceBuffer::pinned(ctx, bytes)?,
-                false => DeviceBuffer::alloc(ctx, bytes)?,
-            };
-            // Kernels may read what they are about to write.
-            buffer.zero()?;
-            Ok(Buffer::new(zone, buffer))
-        }) {
+        let pager = self.pager.as_ref();
+        let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
+        let dropped = match self
+            .base
+            .held
+            .bind_sized(plan, sized, |zone, bytes, holds| {
+                if let Some(g) = sum.as_deref_mut() {
+                    g.pause()?;
+                }
+                // The host reads weight files straight into pinned memory.
+                let buffer = match unified && holds == Holds::Weights {
+                    true => DeviceBuffer::pinned(ctx, bytes)?,
+                    false => DeviceBuffer::alloc(ctx, bytes)?,
+                };
+                // Kernels may read what they are about to write.
+                buffer.zero()?;
+                Ok(Buffer::new(zone, buffer))
+            }) {
             Ok(dropped) => dropped,
             Err(e) => {
                 if let Some(g) = sum.as_deref_mut() {
@@ -843,6 +885,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn precision(&self) -> tessera_codegen::Precision {
         tessera_codegen::Precision::of(D::BACKEND)
+    }
+
+    fn upload_weight(&mut self, weight: u32, slot: Slot, bytes: &[u8]) -> Result<(), Error> {
+        let desc_ptr = self.buffer(slot).device_ptr() + slot.at(0) as u64;
+        if let Some(pager) = &mut self.pager
+            && pager.upload(self.ctx, weight, slot, desc_ptr, bytes, &mut self.base.held)?
+        {
+            return Ok(());
+        }
+        self.held_mut().upload(slot, bytes)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

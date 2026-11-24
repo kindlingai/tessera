@@ -13,6 +13,14 @@ use tessera_lower::{Recipe, Settings, Slot, Wants, Weight};
 use tessera_models::mtp;
 use tessera_run::{Run, open};
 
+/// One session's rows fed to a batched MTP launch.
+pub(crate) struct MtpSpan<'a> {
+    pub slot: u32,
+    pub start_pos: u32,
+    pub tokens: &'a [u32],
+    pub hidden: TapsIn<'a>,
+}
+
 /// Runs an MTP one-layer MLA drafter with kept KV caches.
 pub struct MtpDrafter {
     core: DraftCore,
@@ -140,81 +148,211 @@ impl MtpDrafter {
         wants: Wants,
         wait: bool,
     ) -> Result<Vec<Slot>, Error> {
-        let m = tokens.len();
+        let span = MtpSpan {
+            slot,
+            start_pos,
+            tokens,
+            hidden,
+        };
+        self.run_batch(&[span], wants, wait)
+    }
+
+    /// Runs one batched MTP pass across session spans.
+    pub(crate) fn run_batch(
+        &mut self,
+        spans: &[MtpSpan<'_>],
+        wants: Wants,
+        wait: bool,
+    ) -> Result<Vec<Slot>, Error> {
+        let m: usize = spans.iter().map(|s| s.tokens.len()).sum();
         if m == 0 {
             return Err(Error::Rows);
         }
-        if slot as usize >= self.core.slots || start_pos as usize + m > self.core.context {
-            return Err(Error::RowPlace);
+        let mut max_end = 0usize;
+        for s in spans {
+            if s.tokens.is_empty() {
+                return Err(Error::Rows);
+            }
+            let end = s.start_pos as usize + s.tokens.len();
+            if s.slot as usize >= self.core.slots || end > self.core.context {
+                return Err(Error::RowPlace);
+            }
+            max_end = max_end.max(end);
         }
-        let filled = m.next_power_of_two().min(self.core.context);
+        let filled = crate::row_bucket(m).min(self.core.context);
         let mut tok_buf = Vec::with_capacity(filled);
         let mut pos_buf = Vec::with_capacity(filled);
+        let mut slot_buf = Vec::with_capacity(filled);
         let mut scale_buf = Vec::with_capacity(filled);
-        for (i, &t) in tokens.iter().enumerate() {
-            let p = start_pos + i as u32;
-            tok_buf.push(t);
-            pos_buf.push(p);
-            scale_buf.push(if p == 0 { 0.0 } else { 1.0 });
+        for s in spans {
+            for (i, &t) in s.tokens.iter().enumerate() {
+                let p = s.start_pos + i as u32;
+                tok_buf.push(t);
+                pos_buf.push(p);
+                slot_buf.push(s.slot);
+                scale_buf.push(if p == 0 { 0.0 } else { 1.0 });
+            }
         }
-        let last_tok = *tokens.last().expect("non-empty");
-        let last_pos = start_pos + (m - 1) as u32;
-        let last_scale = if last_pos == 0 { 0.0 } else { 1.0 };
+        let last_tok = *tok_buf.last().expect("non-empty");
+        let last_pos = *pos_buf.last().expect("non-empty");
+        let last_slot = *slot_buf.last().expect("non-empty");
+        let last_scale = *scale_buf.last().expect("non-empty");
         for _ in m..filled {
             tok_buf.push(last_tok);
             pos_buf.push(last_pos);
+            slot_buf.push(last_slot);
             scale_buf.push(last_scale);
         }
-        let (hid_tensor, d2d) = match hidden {
-            TapsIn::Host(h) => {
-                if h.len() != m * self.hidden {
+        let all_dev = spans
+            .iter()
+            .all(|s| matches!(s.hidden, TapsIn::Device { .. }));
+        let mut d2d = Vec::new();
+        let hid_tensor = if all_dev {
+            let mut off = 0usize;
+            for (idx, s) in spans.iter().enumerate() {
+                let TapsIn::Device { addr, rows, stride } = s.hidden else {
+                    unreachable!();
+                };
+                if rows != s.tokens.len() {
                     return Err(Error::Rows);
                 }
-                let mut hid_buf = Vec::with_capacity(filled * self.hidden);
-                hid_buf.extend_from_slice(h);
-                let last_hid = &h[(m - 1) * self.hidden..];
-                for _ in m..filled {
-                    hid_buf.extend_from_slice(last_hid);
-                }
-                (Some(Tensor::f32(vec![filled, self.hidden], hid_buf)), None)
-            }
-            TapsIn::Device { addr, rows } => {
-                if rows != m {
-                    return Err(Error::Rows);
-                }
-                (
-                    None,
-                    Some(D2dCopy {
+                let is_last_span = idx + 1 == spans.len();
+                if stride > self.hidden {
+                    for r in 0..rows {
+                        d2d.push(D2dCopy {
+                            input: 3,
+                            src: addr + (r * stride * 4) as u64,
+                            dst_row: off + r,
+                            rows: 1,
+                            pad_to: if is_last_span && r + 1 == rows {
+                                filled
+                            } else {
+                                0
+                            },
+                            width: self.hidden,
+                        });
+                    }
+                } else {
+                    d2d.push(D2dCopy {
                         input: 3,
                         src: addr,
+                        dst_row: off,
                         rows,
-                        filled,
+                        pad_to: if is_last_span { filled } else { 0 },
                         width: self.hidden,
-                    }),
-                )
+                    });
+                }
+                off += rows;
             }
+            None
+        } else {
+            let mut hid_buf = Vec::with_capacity(filled * self.hidden);
+            for s in spans {
+                let TapsIn::Host(h) = s.hidden else {
+                    return Err(Error::Rows);
+                };
+                if h.len() != s.tokens.len() * self.hidden {
+                    return Err(Error::Rows);
+                }
+                hid_buf.extend_from_slice(h);
+            }
+            let last_start = (m - 1) * self.hidden;
+            let last_hid = hid_buf[last_start..last_start + self.hidden].to_vec();
+            for _ in m..filled {
+                hid_buf.extend_from_slice(&last_hid);
+            }
+            Some(Tensor::f32(vec![filled, self.hidden], hid_buf))
         };
         let feeds = [
             Some(Tensor::u32(vec![filled], tok_buf)),
             Some(Tensor::u32(vec![filled], pos_buf)),
-            Some(Tensor::u32(vec![filled], vec![slot; filled])),
+            Some(Tensor::u32(vec![filled], slot_buf)),
             hid_tensor,
             Some(Tensor::f32(vec![filled, 1], scale_buf)),
         ];
         let sizes = [
             (Seqs, self.core.slots as u64),
             (Rows, filled as u64),
-            (
-                Context,
-                crate::context_bucket(start_pos as usize + m, self.core.context),
-            ),
-            (Segments, 1),
+            (Context, crate::context_bucket(max_end, self.core.context)),
+            (Segments, spans.len() as u64),
         ];
-        self.core
-            .exec_tap(&feeds, d2d.as_slice(), &sizes, wants, wait)
+        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
     }
 
-    /// Runs one chained MTP step from device token and hidden.
+    /// Runs one chained MTP step from device buffers.
+    pub(crate) fn run_chain_batch(
+        &mut self,
+        slots: &[u32],
+        positions: &[u32],
+        tok_addrs: &[u64],
+        hid_addrs: &[u64],
+        wants: Wants,
+        wait: bool,
+    ) -> Result<Vec<Slot>, Error> {
+        let m = slots.len();
+        if m == 0 || positions.len() != m || tok_addrs.len() != m || hid_addrs.len() != m {
+            return Err(Error::Rows);
+        }
+        let mut max_end = 0usize;
+        for (&slot, &pos) in slots.iter().zip(positions) {
+            if slot as usize >= self.core.slots || pos as usize + 1 > self.core.context {
+                return Err(Error::RowPlace);
+            }
+            max_end = max_end.max(pos as usize + 1);
+        }
+        let filled = crate::row_bucket(m).min(self.core.context);
+        let mut pos_buf = Vec::with_capacity(filled);
+        let mut slot_buf = Vec::with_capacity(filled);
+        let mut scale_buf = Vec::with_capacity(filled);
+        let mut d2d = Vec::with_capacity(m * 2);
+        for i in 0..m {
+            let p = positions[i];
+            pos_buf.push(p);
+            slot_buf.push(slots[i]);
+            scale_buf.push(if p == 0 { 0.0f32 } else { 1.0f32 });
+            let pad = if i + 1 == m { filled } else { 0 };
+            d2d.push(D2dCopy {
+                input: 3,
+                src: hid_addrs[i],
+                dst_row: i,
+                rows: 1,
+                pad_to: pad,
+                width: self.hidden,
+            });
+            d2d.push(D2dCopy {
+                input: 0,
+                src: tok_addrs[i],
+                dst_row: i,
+                rows: 1,
+                pad_to: pad,
+                width: 1,
+            });
+        }
+        let last_pos = *pos_buf.last().expect("non-empty");
+        let last_slot = *slot_buf.last().expect("non-empty");
+        let last_scale = *scale_buf.last().expect("non-empty");
+        for _ in m..filled {
+            pos_buf.push(last_pos);
+            slot_buf.push(last_slot);
+            scale_buf.push(last_scale);
+        }
+        let feeds = [
+            None,
+            Some(Tensor::u32(vec![filled], pos_buf)),
+            Some(Tensor::u32(vec![filled], slot_buf)),
+            None,
+            Some(Tensor::f32(vec![filled, 1], scale_buf)),
+        ];
+        let sizes = [
+            (Seqs, self.core.slots as u64),
+            (Rows, filled as u64),
+            (Context, crate::context_bucket(max_end, self.core.context)),
+            (Segments, m as u64),
+        ];
+        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
+    }
+
+    /// Runs one chained MTP step for one slot.
     fn run_chain(
         &mut self,
         slot: u32,
@@ -224,43 +362,20 @@ impl MtpDrafter {
         wants: Wants,
         wait: bool,
     ) -> Result<Vec<Slot>, Error> {
-        if slot as usize >= self.core.slots || pos as usize + 1 > self.core.context {
-            return Err(Error::RowPlace);
-        }
-        let scale = if pos == 0 { 0.0f32 } else { 1.0f32 };
-        let d2d = [
-            D2dCopy {
-                input: 3,
-                src: hid_addr,
-                rows: 1,
-                filled: 1,
-                width: self.hidden,
-            },
-            D2dCopy {
-                input: 0,
-                src: tok_addr,
-                rows: 1,
-                filled: 1,
-                width: 1,
-            },
-        ];
-        let feeds = [
-            None,
-            Some(Tensor::u32(vec![1], vec![pos])),
-            Some(Tensor::u32(vec![1], vec![slot])),
-            None,
-            Some(Tensor::f32(vec![1, 1], vec![scale])),
-        ];
-        let sizes = [
-            (Seqs, self.core.slots as u64),
-            (Rows, 1),
-            (
-                Context,
-                crate::context_bucket(pos as usize + 1, self.core.context),
-            ),
-            (Segments, 1),
-        ];
-        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
+        self.run_chain_batch(&[slot], &[pos], &[tok_addr], &[hid_addr], wants, wait)
+    }
+
+    pub(crate) fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
+        Ok(self.core.runner.ids(slot)?)
+    }
+
+    pub(crate) fn read_floats(&self, slot: Slot) -> Result<Vec<f32>, Error> {
+        let raw = self.core.runner.read(slot)?;
+        Ok(raw.floats().map_err(tessera_run::Error::from)?.to_vec())
+    }
+
+    pub(crate) fn address(&self, slot: Slot) -> Option<u64> {
+        self.core.runner.address(slot)
     }
 }
 
@@ -295,6 +410,7 @@ fn chain_gpu(
     let first_in = TapsIn::Device {
         addr: tap_addr,
         rows: m,
+        stride: 0,
     };
     let outputs = drafter.run_taps(0, start_pos, tokens, first_in, wants, false)?;
     let addr_of = |r: &dyn Run, s: Slot| r.address(s).ok_or(tessera_run::Error::Unaddressed(0));

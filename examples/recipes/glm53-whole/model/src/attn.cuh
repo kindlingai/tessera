@@ -41,7 +41,7 @@ static __device__ void index_keys(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const kept* kt = kept_table(c.t, pl.kept + 2u);
+    const kept* kt = kept_table(c.t, pl.kept + 1u);
     mat knorm = field_mat(c, pl, K_NORM);
     mat kbias = field_mat(c, pl, K_BIAS);
     for (u32 r = blockIdx.x; r < s.rows; r += gridDim.x) {
@@ -68,7 +68,7 @@ static __device__ void index_scores(const ctx& c, const place& pl) {
     const sizes& s = c.s;
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const kept* kt = kept_table(c.t, pl.kept + 2u);
+    const kept* kt = kept_table(c.t, pl.kept + 1u);
     u32 wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     u32 wstep = (gridDim.x * blockDim.x) >> 5;
     u32 lane = threadIdx.x & 31u;
@@ -234,8 +234,7 @@ static __device__ void turn_keys(const ctx& c, const place& pl) {
     line l = threads();
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const kept* kt_l = kept_table(c.t, pl.kept);
-    const kept* kt_r = kept_table(c.t, pl.kept + 1u);
+    const kept* kt = kept_table(c.t, pl.kept);
     u32 pairs = s.rope >> 1, q_stride = s.nope + s.rope, kv_stride = s.latent + s.rope;
     for (u32 u = l.at; u < s.rows * s.heads * pairs; u += l.step) {
         u32 j = u % pairs, rh = u / pairs, r = rh / s.heads;
@@ -257,14 +256,14 @@ static __device__ void turn_keys(const ctx& c, const place& pl) {
         float r0 = a * cs - b * sn, r1 = a * sn + b * cs;
         kv[0] = r0;
         kv[1] = r1;
-        u8* kr = kept_row(c.t, kt_r, slot[r], pos[r]);
-        kv_store(kr, kt_r->elem, j << 1, r0);
-        kv_store(kr, kt_r->elem, (j << 1) + 1u, r1);
+        u8* kr = kept_row(c.t, kt, slot[r], pos[r]);
+        kv_store(kr, kt->elem, s.latent + (j << 1), r0);
+        kv_store(kr, kt->elem, s.latent + (j << 1) + 1u, r1);
     }
     for (u32 u = l.at; u < s.rows * s.latent; u += l.step) {
         u32 r = u / s.latent, d = u % s.latent;
-        u8* kl = kept_row(c.t, kt_l, slot[r], pos[r]);
-        kv_store(kl, kt_l->elem, d, c.p.kv[u64(r) * kv_stride + d]);
+        u8* kl = kept_row(c.t, kt, slot[r], pos[r]);
+        kv_store(kl, kt->elem, d, c.p.kv[u64(r) * kv_stride + d]);
     }
 }
 
@@ -300,8 +299,7 @@ static __device__ void attend_pass(const ctx& c, const place& pl, u32 splits) {
     const sizes& s = c.s;
     const u32* pos = at<const u32>(c.t, 1);
     const u32* slot = at<const u32>(c.t, 2);
-    const kept* kt_l = kept_table(c.t, pl.kept);
-    const kept* kt_r = kept_table(c.t, pl.kept + 1u);
+    const kept* kt = kept_table(c.t, pl.kept);
     u32 width = s.latent + s.rope, rh_cnt = s.rows * s.heads, stride = s.latent + 2u;
     bool stage = width <= ATTN_STAGE;
     bool in_reg = s.latent <= 1024u && (s.latent & 3u) == 0u;
@@ -331,29 +329,28 @@ static __device__ void attend_pass(const ctx& c, const place& pl, u32 splits) {
         for (u32 n = sp; n < s.keep; n += splits) {
             u32 j = c.p.picked[u64(r) * s.keep + n];
             if (j >= s.context || j > pr) continue;
-            const u8* kl = kept_row(c.t, kt_l, sl, j);
-            const u8* kr = kept_row(c.t, kt_r, sl, j);
+            const u8* kv = kept_row(c.t, kt, sl, j);
             float dot = 0.0f, kv_reg[4];
             if (in_reg) {
                 if (d4 < s.latent) {
-                    kv_load4(kl, kt_l->elem, d4, kv_reg);
+                    kv_load4(kv, kt->elem, d4, kv_reg);
 #pragma unroll
                     for (u32 k = 0; k < 4; k++) dot = fmaf(q_reg[k], kv_reg[k], dot);
                 }
             } else {
                 for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) {
-                    dot = fmaf(q[d], kv_load(kl, kt_l->elem, d), dot);
+                    dot = fmaf(q[d], kv_load(kv, kt->elem, d), dot);
                 }
             }
             for (u32 d = d4; d < rope_vec; d += blockDim.x << 2) {
                 float rv[4], qr[4];
-                kv_load4(kr, kt_r->elem, d, rv);
+                kv_load4(kv, kt->elem, s.latent + d, rv);
                 load_vec4(q + s.latent + d, rq_vec, qr);
 #pragma unroll
                 for (u32 k = 0; k < 4; k++) dot = fmaf(qr[k], rv[k], dot);
             }
             for (u32 d = rope_vec + threadIdx.x; d < s.rope; d += blockDim.x) {
-                dot = fmaf(q[s.latent + d], kv_load(kr, kt_r->elem, d), dot);
+                dot = fmaf(q[s.latent + d], kv_load(kv, kt->elem, s.latent + d), dot);
             }
             float score = block_sum(c, dot) * s.scale;
             float topmost = fmaxf(most, score);
@@ -367,7 +364,7 @@ static __device__ void attend_pass(const ctx& c, const place& pl, u32 splits) {
                 }
             } else {
                 for (u32 d = threadIdx.x; d < s.latent; d += blockDim.x) {
-                    og[d] = fmaf(og[d], shrink, e * kv_load(kl, kt_l->elem, d));
+                    og[d] = fmaf(og[d], shrink, e * kv_load(kv, kt->elem, d));
                 }
             }
         }

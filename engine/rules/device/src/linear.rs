@@ -70,16 +70,28 @@ fn dtr_ks(m: usize, n: usize, k: usize) -> usize {
     1
 }
 
+fn dtr_tile(m: usize) -> usize {
+    if m <= 8 {
+        8
+    } else if m <= 16 {
+        16
+    } else {
+        32
+    }
+}
+
 fn dtr_entry(t: &TrellisMma) -> &'static str {
-    match (t.m <= 8, t.bits, t.book, t.turned, t.ks > 1) {
-        (true, 4, 0, true, true) => "dtr_k4_t1s",
-        (true, 4, 0, true, false) => "dtr_k4_t1",
-        (true, 4, 0, false, true) => "dtr_k4_p1s",
-        (true, 4, 0, false, false) => "dtr_k4_p1",
-        (false, 4, 0, true, true) => "dtr_k4_t2s",
-        (false, 4, 0, true, false) => "dtr_k4_t2",
-        (true, _, _, _, _) => "dtr_gen1",
-        (false, _, _, _, _) => "dtr_gen2",
+    match (dtr_tile(t.m), t.bits, t.book, t.turned, t.ks > 1) {
+        (8, 4, 0, true, true) => "dtr_k4_t1s",
+        (8, 4, 0, true, false) => "dtr_k4_t1",
+        (8, 4, 0, false, true) => "dtr_k4_p1s",
+        (8, 4, 0, false, false) => "dtr_k4_p1",
+        (16, 4, 0, true, true) => "dtr_k4_t2s",
+        (16, 4, 0, true, false) => "dtr_k4_t2",
+        (32, 4, 0, true, false) => "dtr_k4_t4",
+        (8, _, _, _, _) => "dtr_gen1",
+        (16, _, _, _, _) => "dtr_gen2",
+        (_, _, _, _, _) => "dtr_gen4",
     }
 }
 
@@ -121,7 +133,7 @@ fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
-    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(if t.m <= 8 { 8 } else { 16 });
+    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(dtr_tile(t.m));
     let mut reads = vec![t.form.bytes(t.n * t.k) as f64, (4 * t.m * t.k) as f64];
     if t.turned {
         reads.push((4 * t.k) as f64);
@@ -143,7 +155,7 @@ fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: (t.n / BLOCK) * t.ks,
-        down: t.m.div_ceil(if t.m <= 8 { 8 } else { 16 }),
+        down: t.m.div_ceil(dtr_tile(t.m)),
         threads: THREADS,
     };
     let suh = if t.turned { step.read(2) } else { step.read(0) };
@@ -517,7 +529,7 @@ fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn stacked_needs(k: &FastStacked) -> Needs {
-    cuda_needs(if k.wide { (512 + WARPS * 128) * 4 } else { 0 })
+    cuda_needs(if k.wide { WARPS * 128 * 4 } else { 0 })
 }
 
 fn stacked_source(k: &FastStacked) -> Source {
@@ -529,10 +541,15 @@ fn stacked_source(k: &FastStacked) -> Source {
 }
 
 fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
-    let groups = if k.wide {
-        (k.n / BLOCK) * k.batches * k.rows
+    let rtiles = if k.wide {
+        k.rows.div_ceil(4)
     } else {
-        k.len.div_ceil(WARPS)
+        k.rows.div_ceil(8)
+    };
+    let groups = if k.wide {
+        (k.n / BLOCK) * k.batches * rtiles
+    } else {
+        (k.batches * k.n).div_ceil(WARPS) * rtiles
     };
     let trips = if k.wide {
         k.k as f64 / WARPS as f64
@@ -544,7 +561,7 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
         group: THREADS,
         trips,
         reads: vec![
-            (2 * k.len * k.k) as f64,
+            (2 * k.batches * rtiles * k.n * k.k) as f64,
             (4 * k.batches * k.rows * k.k) as f64,
         ],
         written: (4 * k.len) as f64,
@@ -557,7 +574,7 @@ fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
     if k.wide {
         let shape = Shape::Grid {
             across: k.n / BLOCK,
-            down: k.batches * k.rows,
+            down: k.batches * k.rows.div_ceil(4),
             threads: THREADS,
         };
         let args = vec![
@@ -573,16 +590,17 @@ fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
         ];
         return vec![Launch { args, shape }];
     }
+    let bn = k.batches * k.n;
     let shape = Shape::Grid {
-        across: k.len.div_ceil(WARPS),
-        down: 1,
+        across: bn.div_ceil(WARPS),
+        down: k.rows.div_ceil(8),
         threads: THREADS,
     };
     let args = vec![
         step.read(0),
         step.read(1),
         step.out(),
-        Arg::count(k.len),
+        Arg::count(bn),
         Arg::count(k.rows),
         Arg::count(k.n),
         Arg::count(k.k),
@@ -672,13 +690,14 @@ enum MmKind {
     Bf16Split,
     Mxfp8,
     Mxfp8Wide,
+    Mxfp8Tall,
 }
 
 impl MmKind {
     fn name(self) -> &'static str {
         match self {
             MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide => "fast_mm_mxfp8",
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => "fast_mm_mxfp8",
         }
     }
 
@@ -688,6 +707,7 @@ impl MmKind {
             MmKind::Bf16Split => "tessera_mm_bf16_ks2",
             MmKind::Mxfp8 => "tessera_mm_mxfp8_r8",
             MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
+            MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r32",
         }
     }
 
@@ -695,7 +715,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
             MmKind::Bf16Split => (4 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide => 4 * 16 * 36 * 4,
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => 4 * 16 * 36 * 4,
         }
     }
 
@@ -704,6 +724,7 @@ impl MmKind {
             MmKind::Bf16 => (n / 32, m.div_ceil(16)),
             MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
             MmKind::Mxfp8 => (n / 16, 1),
+            MmKind::Mxfp8Tall => (n / 16, m.div_ceil(32)),
         }
     }
 
@@ -711,7 +732,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 => 64.0,
             MmKind::Bf16Split => 128.0,
-            MmKind::Mxfp8 | MmKind::Mxfp8Wide => 512.0,
+            MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => 512.0,
         }
     }
 }
@@ -867,8 +888,10 @@ fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
         "mxfp8" if n.is_multiple_of(16) && k.is_multiple_of(512) => {
             if m <= 8 {
                 MmKind::Mxfp8
-            } else {
+            } else if m <= 16 {
                 MmKind::Mxfp8Wide
+            } else {
+                MmKind::Mxfp8Tall
             }
         }
         _ => return None,

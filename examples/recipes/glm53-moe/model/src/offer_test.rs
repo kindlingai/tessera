@@ -112,3 +112,24 @@ fn plan_words_match() {
     assert_eq!(define(cu, "PICKS"), PICKS);
     assert_eq!(plan_bytes(cu), PLAN_WORDS * 4);
 }
+
+#[test]
+fn mixed_fc_widths() {
+    let mut s = site(1, 256, 512, 256);
+    let Site::Region { inputs, .. } = &mut s else {
+        panic!("region");
+    };
+    // Routed gate and up at K2, down at K3.
+    inputs[5].form = "trellis_k2_mul1".into();
+    inputs[8].form = "trellis_k2_mul1".into();
+    inputs[11].form = "trellis_k3_mul1".into();
+    let got = offer(&s).expect("must accept mixed fc1/fc2");
+    assert!(matches!(
+        got[2].counts[4],
+        tessera_guest::site::Count::Fixed(2)
+    ));
+    assert!(matches!(
+        got[3].counts[4],
+        tessera_guest::site::Count::Fixed(3)
+    ));
+}

@@ -114,15 +114,21 @@ fn col(#[build] name: &'static str, p: Buf<U8>, n: u32, inp: u32) -> u32 {
 fn tile<const K: u32>(#[build] name: &'static str, p: Buf<U8>, row: u32, at: u32) -> Buf<U8> {
     let inp = p.word(0);
     let out = p.word(4);
+    let side = p.word(8);
     // Columns past `out` lie in later matrices of a set.
     let col = at % out;
-    let first = (at / out) as u64 * (inp / 16) as u64 * (out / 16) as u64;
-    let t = if p.word(8) == INPUT_SIDE {
+    let m = at / out;
+    let t = if (side & 0xFFFF) == INPUT_SIDE {
         (row / 128) * (out / 2) + 64 * (col / 128) + 8 * ((row % 128) / 16) + (col % 128) / 16
     } else {
         (col / 128) * (inp / 2) + 8 * (row / 16) + (col % 128) / 16
     };
-    p + (HEAD as u64 + (first + t as u64) * (32 * K) as u64)
+    let base = if (side & 0x8000_0000) != 0 {
+        (p.word(24 + m * 8) as u64) | ((p.word(28 + m * 8) as u64) << 32)
+    } else {
+        HEAD as u64 + m as u64 * (inp / 16) as u64 * (out / 16) as u64 * (32 * K) as u64
+    };
+    p + (base + t as u64 * (32 * K) as u64)
 }
 
 /// Stream position of tile element `(r, c)`.
