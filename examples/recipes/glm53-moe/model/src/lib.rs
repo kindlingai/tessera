@@ -170,8 +170,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         "bf16" => 1,
         _ => return None,
     };
-    let [k, book] = width(&[gate.input, up.input, down.input])?;
-    let [shared_k, shared_book] = width(&shared.map(|s| s.input))?;
+    let [k1, book1] = width(&[gate.input, up.input])?;
+    let [k2, book2] = bits(down.input)?;
+    let [sh_k1, sh_book1] = width(&[shared_gate.input, shared_up.input])?;
+    let [sh_k2, sh_book2] = bits(shared_down.input)?;
     let picks = picks(experts)? as usize;
     let [scores, plan, gpart, z] = [0, 1, 2, 3].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
@@ -206,8 +208,20 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         writes: None,
         resident: None,
     };
-    let codes = [k, shared_k, book, shared_book].map(|b| b as usize);
-    let fc_counts = [&[rows, hidden, ffn, picks][..], &codes, &[first, wide, ks1]].concat();
+    let codes1 = [k1, sh_k1, book1, sh_book1].map(|b| b as usize);
+    let codes2 = [k2, sh_k2, book2, sh_book2].map(|b| b as usize);
+    let fc1_counts = [
+        &[rows, hidden, ffn, picks][..],
+        &codes1,
+        &[first, wide, ks1],
+    ]
+    .concat();
+    let fc2_counts = [
+        &[rows, hidden, ffn, picks][..],
+        &codes2,
+        &[first, wide, ks1, ns2],
+    ]
+    .concat();
     let mut reads = vec![Place::Read(0), plan];
     reads.extend([signs_in, gate_su, gate, up_su, up].map(|f| f.read()));
     reads.extend(
@@ -219,7 +233,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         kernel: FC1,
         reads,
         len: total_slots * chunks * 2 * ks1 * max_col * 128,
-        counts: fixed(&fc_counts),
+        counts: fixed(&fc1_counts),
         shape: Shape::grid(chunks * 2 * ks1, total_slots, 256),
         work: (total_slots * 2 * hidden * ffn) as f64,
         guess: 1e-15,
@@ -234,7 +248,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         kernel: FC2,
         reads,
         len: rows * (picks + 1) * chunks * hidden / 2,
-        counts: fixed(&[&fc_counts[..], &[ns2]].concat()),
+        counts: fixed(&fc2_counts),
         shape: Shape::grid(chunks * ns2, total_slots, 256),
         work: (total_slots * hidden * ffn) as f64,
         guess: 1e-15,
