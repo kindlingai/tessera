@@ -38,6 +38,7 @@ jobs:
       build: ${{ steps.reuse.outputs.build }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       macos: ${{ steps.reuse.outputs.macos }}
+      docker: ${{ steps.reuse.outputs.docker }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,14 +46,22 @@ jobs:
       # A push with no earlier commit to compare builds everything.
       - id: paths
         env:
+          # Files that can change the Docker image or the Kubernetes example.
+          DOCKER_PATHS: '^(Dockerfile|\.dockerignore|deploy/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
           build=true
+          docker=true
           if git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            build=$(git diff --name-only "$BASE...$HEAD" | tools/scripts/build-needed.sh)
+            git diff --name-only "$BASE...$HEAD" > "$RUNNER_TEMP/changed"
+            build=$(tools/scripts/build-needed.sh < "$RUNNER_TEMP/changed")
+            docker=false
+            if grep -qE "$DOCKER_PATHS" "$RUNNER_TEMP/changed"; then docker=true; fi
           fi
-          echo "build=$build" | tee -a "$GITHUB_OUTPUT"
+          # Pushes to main build the image for any change.
+          [ "$GITHUB_EVENT_NAME" != push ] || docker=$build
+          printf 'build=%s\ndocker=%s\n' "$build" "$docker" | tee -a "$GITHUB_OUTPUT"
       # A push to main runs the full macOS job when its merge group did
       # not, so a reused landing still gets those tests.
       - id: reuse
@@ -60,6 +69,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.event.merge_group.head_ref }}
           BUILD: ${{ steps.paths.outputs.build }}
+          DOCKER: ${{ steps.paths.outputs.docker }}
         run: |
           reuse=false
           macos=true
@@ -72,7 +82,8 @@ jobs:
             [ "$ran" -eq 0 ] || macos=false
           fi
           [ "$reuse" = false ] || BUILD=false
-          printf 'build=%s\nreuse=%s\nmacos=%s\n' "$BUILD" "$reuse" "$macos" | tee -a "$GITHUB_OUTPUT"
+          [ "$reuse" = false ] || DOCKER=false
+          printf 'build=%s\nreuse=%s\nmacos=%s\ndocker=%s\n' "$BUILD" "$reuse" "$macos" "$DOCKER" | tee -a "$GITHUB_OUTPUT"
 
   lint:
     # Code-shape rules (tools/lint), their tests, and formatting.
@@ -378,11 +389,39 @@ jobs:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture
 
+  docker:
+    # The CUDA image runs without a GPU, and the Kubernetes example
+    # matches its schemas.
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          docker run --rm -v "$PWD/deploy:/deploy:ro" ghcr.io/yannh/kubeconform:v0.6.7
+          -strict -summary /deploy/k8s
+      - uses: docker/setup-buildx-action@v3
+      # Layers from earlier runs, so an unchanged tree skips the build.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: tesserax:ci
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,scope=docker,mode=max
+      # With no verb, tesserax prints its usage and exits 2.
+      - run: |
+          code=0
+          docker run --rm tesserax:ci 2> "$RUNNER_TEMP/usage" || code=$?
+          cat "$RUNNER_TEMP/usage"
+          [ "$code" -eq 2 ]
+          grep -q '^usage: tesserax' "$RUNNER_TEMP/usage"
+
   success:
     # The one check to require: every job above passed or was skipped
     # by `changes`, and no human step is pending.
     if: always()
-    needs: [changes, commits, lint, linux, features, grammar, macos, similarity, platforms, style]
+    needs: [changes, commits, lint, linux, features, grammar, macos, similarity, platforms, docker, style]
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
