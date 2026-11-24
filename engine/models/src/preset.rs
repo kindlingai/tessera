@@ -23,25 +23,37 @@ impl Preset {
     };
 }
 
+// Wasm has no link sections, so no registry there.
+#[cfg(not(target_family = "wasm"))]
 gather! {
     #[gather]
     pub(crate) static PRESETS: scattered_collect::ScatteredSlice<Preset>;
 }
 
+/// The preset value: name, then `field: value` pairs.
+macro_rules! value {
+    ($name:literal $(, $field:ident: $value:expr)*) => {{
+        let mut p = $crate::preset::Preset::NONE;
+        p.name = $name;
+        $(p.$field = Some($value);)*
+        p
+    }};
+}
+pub(crate) use value;
+
 /// Registers a preset: name, then `field: value` pairs.
 macro_rules! preset {
     ($name:literal $(, $field:ident: $value:expr)* $(,)?) => {
+        #[cfg(not(target_family = "wasm"))]
         const _: () = {
             $crate::preset::scatter! {
                 #[scatter($crate::preset::PRESETS)]
-                static PRESET: $crate::preset::Preset = {
-                    let mut p = $crate::preset::Preset::NONE;
-                    p.name = $name;
-                    $(p.$field = Some($value);)*
-                    p
-                };
+                static PRESET: $crate::preset::Preset =
+                    $crate::preset::value!($name $(, $field: $value)*);
             }
         };
+        #[cfg(target_family = "wasm")]
+        const _: $crate::preset::Preset = $crate::preset::value!($name $(, $field: $value)*);
     };
 }
 pub(crate) use preset;
@@ -60,6 +72,7 @@ macro_rules! traced {
 pub(crate) use traced;
 
 /// The `name` preset, or an error listing known names.
+#[cfg(not(target_family = "wasm"))]
 pub fn named(name: &str) -> Result<&'static Preset, String> {
     if let Some(p) = PRESETS.iter().find(|p| p.name == name) {
         return Ok(p);
