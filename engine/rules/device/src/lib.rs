@@ -14,16 +14,13 @@ pub mod proxy;
 #[cfg(test)]
 mod proxy_test;
 pub mod resident;
-mod scan;
-#[cfg(test)]
-mod scan_test;
 pub mod sums;
 pub mod whole;
 #[cfg(test)]
 mod whole_test;
 
+pub use flatten::{Error, Problem};
 pub use flatten::{Flat, Options, flatten};
-pub use scan::{Error, Problem};
 pub use tessera_gpukit::backend::Backend;
 
 /// The edition every import path names.
