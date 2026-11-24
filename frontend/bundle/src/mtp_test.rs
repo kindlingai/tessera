@@ -1,6 +1,7 @@
 use crate::mla::config;
-use crate::mtp::{MtpWeights, mtp_pins, rules};
+use crate::mtp::{mtp_pins, rules};
 use crate::names::resolve;
+use crate::repack::Streamed;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
 use tessera_engine::block::MXFP8;
 use tessera_engine::form::named;
@@ -119,7 +120,7 @@ fn check_head_mxfp8() {
         .iter()
         .position(|w| w.path == head_path)
         .unwrap() as u32;
-    let mw = crate::Weights::Streamed(Box::new(MtpWeights {
+    let mw = crate::Weights::Streamed(Box::new(Streamed {
         graph: g_wide,
         offer: Box::new(wide_bf16),
         rules: r,

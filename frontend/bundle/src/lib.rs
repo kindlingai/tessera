@@ -23,6 +23,9 @@ mod names_test;
 pub mod parts;
 pub mod qwen35;
 pub mod qwen4_exp;
+pub(crate) mod repack;
+#[cfg(test)]
+mod repack_test;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
