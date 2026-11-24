@@ -284,5 +284,8 @@ fn every_stage_runs() {
         let g = Graph::from_json(&g.to_json()).unwrap();
         let out = run(&g, &[], 0, &inputs).unwrap();
         assert_eq!(out[0].shape, vec![2, 8], "{s:?}");
+        let got = out[0].floats().unwrap();
+        let fair = got.iter().all(|v| v.is_finite() || *v == f32::NEG_INFINITY);
+        assert!(fair && got != x.floats().unwrap(), "{s:?} gave {got:?}");
     }
 }

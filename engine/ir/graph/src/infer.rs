@@ -558,7 +558,7 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
         }
         if f.blocks > 1 {
             need(blocks(dims, width, f.blocks)?, ErrorKind::Shape, || {
-                format!("rows of {width} do not hold whole blocks of {}", f.blocks)
+                format!("{s:?} needs rows in blocks of {}, got {width}", f.blocks)
             })?;
         }
         p = place(f.place, s, p, x, operand)?;
