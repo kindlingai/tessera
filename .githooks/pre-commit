@@ -4,9 +4,17 @@
 # stickler runs style first and stops at the first failure.
 # Style and simcheck run when `tools/scripts/stickler.sh fetch`
 # has put their models in ~/.cache/tessera/check.
+# The cargo steps run only when a staged path can affect a build.
 # Install: tools/scripts/install-hooks.sh
 . "$(dirname "$0")/worktree.sh"
 set -e
-tools/scripts/fmt-check.sh --all
+no_build='\.md$|^\.github/|^\.githooks/|^tools/scripts/|^stickler/|^maps/|^lint\.toml$|release-please'
+cargo=false
+if git diff --cached --name-only --diff-filter=ACMRD | grep -qvE "$no_build"; then
+    cargo=true
+else
+    echo "pre-commit: no staged path affects a build, cargo steps skipped"
+fi
+if $cargo; then tools/scripts/fmt-check.sh --all; fi
 tools/scripts/stickler.sh run --staged
-tools/scripts/clippy-staged.sh
+if $cargo; then tools/scripts/clippy-staged.sh; fi
