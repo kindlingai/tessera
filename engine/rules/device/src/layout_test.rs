@@ -146,6 +146,17 @@ fn headers_match_rust() {
     for (code, name) in all {
         assert_eq!(headers.number(name), code, "{name}");
     }
+    for f in tessera_lower::form::LOADS.iter() {
+        if dtype_code(f.name()) == BYTES {
+            assert_ne!(form_kind(f.name()), 0, "missing form_kind for {}", f.name());
+        }
+    }
+    for &(_, name) in &FORM_KINDS[1..] {
+        assert!(
+            tessera_lower::form::named(name).is_some(),
+            "FORM_KINDS entry {name} is not registered"
+        );
+    }
     for (name, value) in numbers {
         assert_eq!(headers.number(name), value, "{name}");
     }

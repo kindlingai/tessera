@@ -36,7 +36,7 @@ pub(crate) const SCRATCH: u32 = 2;
 /// `convention` code for KV tables.
 pub(crate) const KV: u32 = 1;
 /// `form_kind` header names and storage form names in code order.
-pub(crate) const FORM_KINDS: [(&str, &str); 17] = [
+pub(crate) const FORM_KINDS: [(&str, &str); 19] = [
     ("FORM_UNKNOWN", ""),
     ("FORM_Q8_0", "q8_0"),
     ("FORM_Q4_0", "q4_0"),
@@ -54,6 +54,8 @@ pub(crate) const FORM_KINDS: [(&str, &str); 17] = [
     ("FORM_TRELLIS_K2_PMCGX", "trellis_k2_pmcgx"),
     ("FORM_TRELLIS_K3_PMCGX", "trellis_k3_pmcgx"),
     ("FORM_TRELLIS_K4_PMCGX", "trellis_k4_pmcgx"),
+    ("FORM_INT2_G32", "int2_g32"),
+    ("FORM_INT2_G128", "int2_g128"),
 ];
 
 /// Plain form name as a `core.h` `dtype` code.

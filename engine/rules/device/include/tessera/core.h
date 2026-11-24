@@ -74,6 +74,8 @@ enum form_kind : u32 {
     FORM_TRELLIS_K2_PMCGX = 14,
     FORM_TRELLIS_K3_PMCGX = 15,
     FORM_TRELLIS_K4_PMCGX = 16,
+    FORM_INT2_G32 = 17,
+    FORM_INT2_G128 = 18,
 };
 
 // One item the module declared, in its order.

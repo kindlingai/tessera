@@ -214,21 +214,13 @@ pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Load> {
     named(tessera_mem::trellis::form_for(k, codebook)?.name())
 }
 
-form!(TRELLIS_K2);
-form!(TRELLIS_K3);
-form!(TRELLIS_K4);
-form!(TRELLIS_K2_ROT);
-form!(TRELLIS_K3_ROT);
-form!(TRELLIS_K4_ROT);
-form!(TRELLIS_K2_MUL1);
-form!(TRELLIS_K3_MUL1);
-form!(TRELLIS_K4_MUL1);
-form!(TRELLIS_K2_MUL1_ROT);
-form!(TRELLIS_K3_MUL1_ROT);
-form!(TRELLIS_K4_MUL1_ROT);
-form!(TRELLIS_K2_PMCGX);
-form!(TRELLIS_K3_PMCGX);
-form!(TRELLIS_K4_PMCGX);
-form!(TRELLIS_K2_PMCGX_ROT);
-form!(TRELLIS_K3_PMCGX_ROT);
-form!(TRELLIS_K4_PMCGX_ROT);
+macro_rules! register_trellis {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {
+        $(
+            form!(tessera_mem::trellis::$plain);
+            form!(tessera_mem::trellis::$turned);
+        )*
+    };
+}
+
+tessera_mem::trellis_forms!(register_trellis);

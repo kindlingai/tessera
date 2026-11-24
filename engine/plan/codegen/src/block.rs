@@ -7,9 +7,6 @@ use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use tessera_graph::{E2M1, E4M3, E8M0, F16};
 use tessera_mem::block::{Block, Code, Crumb, I8, Nibble, Scale};
-use tessera_mem::block::{
-    INT2_G32, INT2_G128, INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0,
-};
 
 /// A code, typed for kernel text.
 pub trait LoadCode: Code {
@@ -229,12 +226,10 @@ impl<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const HEAD: 
     }
 }
 
-form!(Q8_0);
-form!(Q4_0);
-form!(NVFP4);
-form!(MXFP8);
-form!(MXFP4);
-form!(INT4_G32);
-form!(INT4_G128);
-form!(INT2_G32);
-form!(INT2_G128);
+macro_rules! register_blocks {
+    ($(($name:ident, $($rest:tt)*),)*) => {
+        $(form!(tessera_mem::block::$name);)*
+    };
+}
+
+tessera_mem::block_forms!(register_blocks);

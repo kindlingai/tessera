@@ -1,9 +1,9 @@
 [task.add-storage-form]
 steps = [
   { do = "implement", with = "tessera_mem::form::Form", like = "engine/ir/mem/src/block.rs" },
-  { do = "register", with = "tessera_mem::form::form!", like = "engine/ir/mem/src/block.rs" },
+  { do = "register", with = "tessera_mem::form::form!", like = "engine/ir/mem/src/form.rs" },
   { do = "implement", with = "tessera_codegen::form::Load", like = "engine/plan/codegen/src/block.rs" },
-  { do = "register", with = "tessera_codegen::form::form!", like = "engine/plan/codegen/src/block.rs" },
+  { do = "register", with = "tessera_codegen::form::form!", like = "engine/plan/codegen/src/form.rs" },
   { do = "run", pkg = "tessera-mem", mode = "test" },
   { do = "run", pkg = "tessera-codegen", mode = "test" },
 ]

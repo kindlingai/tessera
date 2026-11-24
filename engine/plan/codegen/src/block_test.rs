@@ -27,4 +27,15 @@ fn block_headers_render() {
         "codes come out as bit fields"
     );
     assert!(metal.contains("device const u8 *w"));
+    for f in tessera_mem::form::FORMS.iter() {
+        assert!(
+            crate::form::named(f.name()).is_some(),
+            "missing Load registration for form {}",
+            f.name()
+        );
+    }
+    assert_eq!(
+        tessera_mem::form::FORMS.iter().count(),
+        crate::form::LOADS.iter().count()
+    );
 }

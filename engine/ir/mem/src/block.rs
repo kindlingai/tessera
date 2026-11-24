@@ -261,56 +261,30 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool> Fo
     }
 }
 
-/// A block form as a registered constant.
-macro_rules! block {
-    ($(#[$doc:meta])* $name:ident = $text:literal, $scale:ty, $code:ty, $b:literal, halves = $halves:literal, head = $head:literal) => {
-        $(#[$doc])*
-        pub const $name: Block<$scale, $code, $b, $halves, $head> = Block::named($text);
-        form!($name);
+/// Expands `$each` over all block storage forms.
+#[macro_export]
+macro_rules! block_forms {
+    ($each:ident) => {
+        $each! {
+            (Q8_0, "q8_0", F16, I8, 32, true, false, "GGUF Q8_0: an f16 scale, then 32 signed bytes."),
+            (Q4_0, "q4_0", F16, Nibble, 32, true, false, "GGUF Q4_0: an f16 scale, then 32 nibbles."),
+            (NVFP4, "nvfp4", E4M3, E2M1, 16, false, true, "nvfp4: an f32 head, then e4m3 scales over e2m1 codes."),
+            (MXFP8, "mxfp8", E8M0, E4M3, 32, false, false, "OCP mxfp8: an e8m0 scale, then 32 e4m3 codes."),
+            (MXFP4, "mxfp4", E8M0, E2M1, 32, false, false, "OCP mxfp4: an e8m0 scale, then 32 e2m1 codes."),
+            (INT4_G32, "int4_g32", F16, Nibble, 32, false, false, "Group-wise int4: an f16 scale, then 32 nibbles."),
+            (INT4_G128, "int4_g128", F16, Nibble, 128, false, false, "`INT4_G32` with groups of 128."),
+            (INT2_G32, "int2_g32", F16, Crumb, 32, false, false, "Group-wise int2: an f16 scale, then 32 2-bit codes."),
+            (INT2_G128, "int2_g128", F16, Crumb, 128, false, false, "`INT2_G32` with groups of 128."),
+        }
     };
 }
 
-block! {
-    /// GGUF Q8_0: an f16 scale, then 32 signed bytes.
-    Q8_0 = "q8_0", F16, I8, 32, halves = true, head = false
+macro_rules! define_blocks {
+    ($(($name:ident, $text:literal, $scale:ty, $code:ty, $b:literal, $halves:literal, $head:literal, $doc:literal),)*) => {$(
+        #[doc = $doc]
+        pub const $name: Block<$scale, $code, $b, $halves, $head> = Block::named($text);
+        form!($name);
+    )*};
 }
 
-block! {
-    /// GGUF Q4_0: an f16 scale, then 32 nibbles.
-    Q4_0 = "q4_0", F16, Nibble, 32, halves = true, head = false
-}
-
-block! {
-    /// nvfp4: an f32 head, then e4m3 scales over e2m1 codes.
-    NVFP4 = "nvfp4", E4M3, E2M1, 16, halves = false, head = true
-}
-
-block! {
-    /// OCP mxfp8: an e8m0 scale, then 32 e4m3 codes.
-    MXFP8 = "mxfp8", E8M0, E4M3, 32, halves = false, head = false
-}
-
-block! {
-    /// OCP mxfp4: an e8m0 scale, then 32 e2m1 codes.
-    MXFP4 = "mxfp4", E8M0, E2M1, 32, halves = false, head = false
-}
-
-block! {
-    /// Group-wise int4: an f16 scale, then 32 nibbles.
-    INT4_G32 = "int4_g32", F16, Nibble, 32, halves = false, head = false
-}
-
-block! {
-    /// `INT4_G32` with groups of 128.
-    INT4_G128 = "int4_g128", F16, Nibble, 128, halves = false, head = false
-}
-
-block! {
-    /// Group-wise int2: an f16 scale, then 32 2-bit codes.
-    INT2_G32 = "int2_g32", F16, Crumb, 32, halves = false, head = false
-}
-
-block! {
-    /// `INT2_G32` with groups of 128.
-    INT2_G128 = "int2_g128", F16, Crumb, 128, halves = false, head = false
-}
+crate::block_forms!(define_blocks);

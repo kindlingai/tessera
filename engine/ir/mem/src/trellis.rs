@@ -506,37 +506,45 @@ pub fn packed(inp: usize, out: usize, side: u32, entries: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// The form for `k` bits a weight in `codebook`.
-pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
-    match (k, codebook) {
-        (2, Codebook::Mcg) => Some(&TRELLIS_K2),
-        (3, Codebook::Mcg) => Some(&TRELLIS_K3),
-        (4, Codebook::Mcg) => Some(&TRELLIS_K4),
-        (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1),
-        (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1),
-        (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1),
-        (2, Codebook::Pmcgx) => Some(&TRELLIS_K2_PMCGX),
-        (3, Codebook::Pmcgx) => Some(&TRELLIS_K3_PMCGX),
-        (4, Codebook::Pmcgx) => Some(&TRELLIS_K4_PMCGX),
-        _ => None,
-    }
+/// Expands `$each` over all trellis storage forms.
+#[macro_export]
+macro_rules! trellis_forms {
+    ($each:ident) => {
+        $each! {
+            (Mcg, "", 2, TRELLIS_K2, TRELLIS_K2_ROT),
+            (Mcg, "", 3, TRELLIS_K3, TRELLIS_K3_ROT),
+            (Mcg, "", 4, TRELLIS_K4, TRELLIS_K4_ROT),
+            (Mul1, "_mul1", 2, TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT),
+            (Mul1, "_mul1", 3, TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT),
+            (Mul1, "_mul1", 4, TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT),
+            (Pmcgx, "_pmcgx", 2, TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT),
+            (Pmcgx, "_pmcgx", 3, TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT),
+            (Pmcgx, "_pmcgx", 4, TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT),
+        }
+    };
 }
 
-/// The rotated form for `k` bits a weight in `codebook`.
-pub fn turned_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
-    match (k, codebook) {
-        (2, Codebook::Mcg) => Some(&TRELLIS_K2_ROT),
-        (3, Codebook::Mcg) => Some(&TRELLIS_K3_ROT),
-        (4, Codebook::Mcg) => Some(&TRELLIS_K4_ROT),
-        (2, Codebook::Mul1) => Some(&TRELLIS_K2_MUL1_ROT),
-        (3, Codebook::Mul1) => Some(&TRELLIS_K3_MUL1_ROT),
-        (4, Codebook::Mul1) => Some(&TRELLIS_K4_MUL1_ROT),
-        (2, Codebook::Pmcgx) => Some(&TRELLIS_K2_PMCGX_ROT),
-        (3, Codebook::Pmcgx) => Some(&TRELLIS_K3_PMCGX_ROT),
-        (4, Codebook::Pmcgx) => Some(&TRELLIS_K4_PMCGX_ROT),
-        _ => None,
-    }
+macro_rules! lookup_trellis {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {
+        /// The form for `k` bits a weight in `codebook`.
+        pub fn form_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
+            match (k, codebook) {
+                $(($k, Codebook::$book) => Some(&$plain),)*
+                _ => None,
+            }
+        }
+
+        /// The rotated form for `k` bits a weight in `codebook`.
+        pub fn turned_for(k: u32, codebook: Codebook) -> Option<&'static dyn Form> {
+            match (k, codebook) {
+                $(($k, Codebook::$book) => Some(&$turned),)*
+                _ => None,
+            }
+        }
+    };
 }
+
+crate::trellis_forms!(lookup_trellis);
 
 /// The scaled Walsh-Hadamard transform of 128 values at `stride`.
 fn hadamard(x: &mut [f32], start: usize, stride: usize) {
@@ -583,9 +591,8 @@ pub fn rotated(t: &[f32], inp: usize, out: usize, suh: &[f32], svh: &[f32]) -> V
     back
 }
 
-/// A codebook's plain and rotated forms at each width `$k`.
-macro_rules! trellis {
-    ($book:ident, $suffix:literal: $($k:literal: $plain:ident, $turned:ident;)*) => {$(
+macro_rules! define_trellis {
+    ($(($book:ident, $suffix:literal, $k:literal, $plain:ident, $turned:ident),)*) => {$(
         #[doc = concat!("exlr8 at ", $k, " bits a weight, ", stringify!($book), ".")]
         pub const $plain: Trellis<$k> =
             Trellis::named(concat!("trellis_k", $k, $suffix), Codebook::$book);
@@ -597,20 +604,4 @@ macro_rules! trellis {
     )*};
 }
 
-trellis! { Mcg, "":
-    2: TRELLIS_K2, TRELLIS_K2_ROT;
-    3: TRELLIS_K3, TRELLIS_K3_ROT;
-    4: TRELLIS_K4, TRELLIS_K4_ROT;
-}
-
-trellis! { Mul1, "_mul1":
-    2: TRELLIS_K2_MUL1, TRELLIS_K2_MUL1_ROT;
-    3: TRELLIS_K3_MUL1, TRELLIS_K3_MUL1_ROT;
-    4: TRELLIS_K4_MUL1, TRELLIS_K4_MUL1_ROT;
-}
-
-trellis! { Pmcgx, "_pmcgx":
-    2: TRELLIS_K2_PMCGX, TRELLIS_K2_PMCGX_ROT;
-    3: TRELLIS_K3_PMCGX, TRELLIS_K3_PMCGX_ROT;
-    4: TRELLIS_K4_PMCGX, TRELLIS_K4_PMCGX_ROT;
-}
+crate::trellis_forms!(define_trellis);
