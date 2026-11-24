@@ -2,7 +2,7 @@ use crate::{Backend, Options, flatten};
 use tessera_codegen::prelude::*;
 use tessera_codegen::trellis::{LoadBook, book};
 use tessera_codegen::{Precision, form::F32_FORM};
-use tessera_gpukit::backend::{OnGpu, available, dispatch};
+use tessera_gpukit::backend::{OnGpu, dispatch, picked};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
 use tessera_graph::F16;
@@ -71,7 +71,8 @@ fn trellis_states_match() {
     let text = flatten("trellis_states.cu", HAND, &|_| None, &options)
         .expect("flattens")
         .text;
-    let hand = match available() {
+    tessera_gpukit::testing::require_gpu();
+    let hand = match picked() {
         Some(Backend::Cuda) => dispatch(Some(Backend::Cuda), Hand(text)).ok(),
         _ => None,
     };
