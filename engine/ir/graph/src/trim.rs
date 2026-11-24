@@ -233,26 +233,6 @@ fn renamed(e: &DimExpr) -> DimExpr {
     }
 }
 
-/// `op` over picked rows: its sizes name `Picks` for `Rows`.
-fn picked(op: &Op) -> Op {
-    match op {
-        Op::View(View::Reshape(s)) => {
-            Op::View(View::Reshape(Shape(s.0.iter().map(renamed).collect())))
-        }
-        Op::View(View::Slice { axis, start, len }) => Op::View(View::Slice {
-            axis: *axis,
-            start: renamed(start),
-            len: renamed(len),
-        }),
-        Op::View(View::Expand { axis, to }) => Op::View(View::Expand {
-            axis: *axis,
-            to: renamed(to),
-        }),
-        Op::Select(Select::TopK { k }) => Op::Select(Select::TopK { k: renamed(k) }),
-        other => other.clone(),
-    }
-}
-
 /// The nodes again, with each gather before `anchors` names.
 fn rebuild(g: &Graph, entry: usize, need: &[Need], anchors: &[Option<usize>]) -> Graph {
     let mut out = g.clone();
@@ -300,7 +280,12 @@ fn rebuild(g: &Graph, entry: usize, need: &[Need], anchors: &[Option<usize>]) ->
             let via = gathered[a.0 as usize].filter(|_| pick && gathers(g, need, i, j));
             args.push(via.unwrap_or(map[a.0 as usize]));
         }
-        let op = if pick { picked(&n.op) } else { n.op.clone() };
+        // Over picked rows, sizes name `Picks` for `Rows`.
+        let op = if pick {
+            n.op.map_dims(renamed)
+        } else {
+            n.op.clone()
+        };
         let id = push(&mut out, op, args);
         out.nodes[id.0 as usize].numerics = n.numerics;
         map.push(id);

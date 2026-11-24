@@ -1,6 +1,6 @@
 // A small decoder's step in one persistent grid, sums inside.
 #include <tessera/1/all_reduce>
-#include <tessera/1/grid>
+#include <tessera/1/whole>
 
 using namespace tessera;
 
@@ -26,54 +26,19 @@ struct sizes {
     u32 kept;
 };
 
-static __device__ sizes read(const table* t) {
-    sizes s;
-    u32* w = reinterpret_cast<u32*>(&s);
-    for (u32 i = 0; i < sizeof(sizes) / 4; i++) w[i] = value(t, i);
-    return s;
-}
-
-// Every thread of the grid, as one line.
-struct line {
-    u32 at;
-    u32 step;
-};
-
-static __device__ line threads() {
-    return {blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x};
-}
-
 static __device__ const float* weight(const table* t, u32 layer, field f) {
     return at<const float>(t, LAYER + layer * FIELDS + f);
-}
-
-// A grid barrier after this thread's writes.
-static __device__ bool sync(const table* t) {
-    __threadfence();
-    return grid_sync(t);
-}
-
-// The block's sum of `v`, in a fixed order.
-static __device__ float block_sum(float v) {
-    __shared__ float warps[WARPS];
-    for (u32 o = 16; o > 0; o /= 2) v += __shfl_down_sync(0xffffffffu, v, o);
-    u32 lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    if (lane == 0) warps[warp] = v;
-    __syncthreads();
-    float all = 0.0f;
-    for (u32 i = 0; i < blockDim.x / 32; i++) all += warps[i];
-    __syncthreads();
-    return all;
 }
 
 // Rows of `x` normed by `w`, one block per row.
 static __device__ void rms(const float* x, const float* w, float* out, const u32* from, u32 rows,
                             u32 n, float eps) {
+    __shared__ float warps[WARPS];
     for (u32 r = blockIdx.x; r < rows; r += gridDim.x) {
         const float* row = x + u64(from ? from[r] : r) * n;
         float sq = 0.0f;
         for (u32 i = threadIdx.x; i < n; i += blockDim.x) sq += row[i] * row[i];
-        float inv = rsqrtf(block_sum(sq) / n + eps);
+        float inv = rsqrtf(block_sum(sq, warps) / n + eps);
         for (u32 i = threadIdx.x; i < n; i += blockDim.x) out[u64(r) * n + i] = row[i] * inv * w[i];
     }
 }
@@ -144,7 +109,7 @@ struct spans {
 };
 
 static __device__ spans lay_out(const table* t, const sizes& s) {
-    float* base = at<float>(t, t->items_len - 1);
+    float* base = scratch<float>(t);
     u32 r = s.rows, q = s.heads * s.width, kv = s.kv * s.width;
     spans p;
     p.x = base;
@@ -253,7 +218,7 @@ static __device__ bool layer(const table* t, session& se, const sizes& s, const 
 // Values: see `sizes`. Items: see the defines, then out.
 extern "C" __global__ void resident_decoder(const table* t) {
     if (!check(t)) return;
-    sizes s = read(t);
+    sizes s = values<sizes>(t);
     spans p = lay_out(t, s);
     session se = begin(t);
     const u32* tokens = at<const u32>(t, TOKENS);

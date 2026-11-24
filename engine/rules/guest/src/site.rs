@@ -1,6 +1,6 @@
 //! The module's side of its JSON exchange with the host.
 
-pub use crate::kit::{Found, Region, Step, Weights, fixed};
+pub use crate::kit::{Found, Region, Step, Trellis, Weights, agreed, fixed, layer, same, trellis};
 use serde::{Deserialize, Serialize};
 
 /// The output of `manifest()`.

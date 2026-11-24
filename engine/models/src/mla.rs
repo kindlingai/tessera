@@ -231,10 +231,9 @@ pub struct Mla<R: Routed> {
     pub head: Linear,
 }
 
-/// One layer's kept latent, rotary key and index keys.
+/// One layer's kept KV cache and optional index keys.
 struct Cache {
-    latent: Kept,
-    rope: Kept,
+    kv: Kept,
     index: Option<Kept>,
 }
 
@@ -413,8 +412,10 @@ impl Pass<'_> {
             }
             Some((slots, caches)) => {
                 let by = [*slots, self.positions];
-                let latent = latent.append(&caches[l].latent, by);
-                let k = latent.concat(&shared.append(&caches[l].rope, by));
+                let kv_row = latent
+                    .concat(&shared)
+                    .reshape(self.lead([DimExpr::Const(1), LATENT + ROPE]));
+                let k = kv_row.append(&caches[l].kv, by);
                 absorbed(m, w, [&nope, &rope], &k, (scale, by), keys.as_ref())
             }
         };
@@ -485,8 +486,7 @@ fn absorbed(
     let q = nope.permute(&swap).matmul_rows(&to_latent).permute(&swap);
     let q = q.concat(rope);
     // One key head serves every query head.
-    let k = keys.reshape(rows([DimExpr::Const(1), LATENT + ROPE]));
-    let out = m.attend_rows(Mask::Causal, scale, [&q, &k, &k], by, picked);
+    let out = m.attend_rows(Mask::Causal, scale, [&q, keys, keys], by, picked);
     let out = out.slice(2, 0u64, LATENT).permute(&swap);
     out.matmul_rows(&set().slice(1, NOPE, HeadDim))
         .permute(&swap)
@@ -595,11 +595,11 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     let m = Model::new(dims);
     let w: Mla<R> = tessera_trace::declare(&m);
     let ([tokens, positions, slots], allowed) = step_ports(&m, c.stack.steps == Steps::Masked);
-    let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
+    let kv_ty = TensorType::new(rows([DimExpr::Const(1), LATENT + ROPE]), DType::F32);
+    let idx_ty = TensorType::new(rows([INDEX_DIM.into()]), DType::F32);
     let cache = |l| Cache {
-        latent: kept(LATENT),
-        rope: kept(ROPE),
-        index: c.indexes(l).then(|| kept(INDEX_DIM)),
+        kv: m.kept(kv_ty.clone()),
+        index: c.indexes(l).then(|| m.kept(idx_ty.clone())),
     };
     let pass = Pass {
         m: &m,
@@ -624,11 +624,11 @@ pub(crate) fn step_layer<R: Routed>(
     positions: &Tensor,
     slots: &Tensor,
 ) -> Tensor {
-    let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
+    let kv_ty = TensorType::new(rows([DimExpr::Const(1), LATENT + ROPE]), DType::F32);
+    let idx_ty = TensorType::new(rows([INDEX_DIM.into()]), DType::F32);
     let cache = Cache {
-        latent: kept(LATENT),
-        rope: kept(ROPE),
-        index: indexer.is_some().then(|| kept(INDEX_DIM)),
+        kv: m.kept(kv_ty),
+        index: indexer.is_some().then(|| m.kept(idx_ty)),
     };
     let pass = Pass {
         m,

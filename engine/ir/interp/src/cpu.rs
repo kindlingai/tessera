@@ -571,7 +571,15 @@ pub(crate) fn stage(
             let sum = acc.sum(r.iter().copied());
             r.iter_mut().for_each(|v| *v /= sum);
         }),
-        _ => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
+        (
+            Stage::Add
+            | Stage::Mul
+            | Stage::RmsNorm { .. }
+            | Stage::Rope { .. }
+            | Stage::Causal
+            | Stage::Allow,
+            None,
+        ) => return Err(Error::Mismatch(format!("{s:?} is missing its operand"))),
     }
     Ok(Tensor::f32(x.shape.clone(), out))
 }

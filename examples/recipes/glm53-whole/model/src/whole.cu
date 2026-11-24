@@ -1,6 +1,6 @@
 // GLM-5.3's whole step in one persistent grid, sums inside.
 #include <tessera/1/all_reduce>
-#include <tessera/1/grid>
+#include <tessera/1/whole>
 #include <tessera/1/kept>
 #include <tessera/1/trellis>
 #include "math.cuh"
@@ -45,7 +45,7 @@ static __device__ void embed_rows(const mat& embed, const u32* tokens, float* x,
 extern "C" __global__ __launch_bounds__(256, 2) void glm53_whole(const table* t) {
     if (!check(t)) return;
     __shared__ Smem smem;
-    sizes s = read(t);
+    sizes s = values<sizes>(t);
     spans_t p = lay_out(t, s);
     session se = begin(t);
     ctx c = {t, s, p, se, smem};
@@ -55,7 +55,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_whole(const table* t)
     u32 reads = first, kept = 0u;
     for (u32 l = 0; l < s.layers; l++) {
         reads = walk(t, for_layer(s, l), l, reads, kept).next;
-        kept += indexes(s, l) ? 3u : 2u;
+        kept += indexes(s, l) ? 2u : 1u;
     }
     TS_MARK();
     embed_rows(weight(t, IDS), at<const u32>(t, 0), p.x, s.rows, s.hidden);

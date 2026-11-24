@@ -61,13 +61,16 @@ struct Generation {
     eos_token_id: Option<Ids>,
 }
 
-/// Streams weights one at a time, sliced by rank share.
+type Failure = Box<dyn Error + Send + Sync>;
+
+/// Weights read one at a time as they load.
 pub trait Stream {
+    /// Each weight in graph order, cut to `shares` where possible.
     fn stream(
         &self,
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
-        take: &mut dyn FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>>;
+        take: &mut dyn FnMut(u32, Weight) -> Result<(), Failure>,
+    ) -> Result<(), Failure>;
 }
 
 /// A model's weights: held, or read as they load.
@@ -107,9 +110,8 @@ impl Weights {
                 }
                 Ok(())
             }
-            Weights::Streamed(release) => {
-                let mut sink = |at, w: Weight| take(at, &w).map_err(Into::into);
-                release.stream(&shares, &mut sink)
+            Weights::Streamed(stream) => {
+                stream.stream(&shares, &mut |at, w| take(at, &w).map_err(Into::into))
             }
         }
     }
@@ -128,21 +130,6 @@ pub struct Bundle {
     pub config: Option<String>,
     /// Host PLE table config, when needed.
     pub ple: Option<PleConfig>,
-}
-
-/// Streams a graph's weights from `offer` using `rules`.
-pub(crate) fn stream_each(
-    graph: &Graph,
-    offer: &dyn Offer,
-    rules: &[Rule],
-    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
-    mut take: impl FnMut(u32, Weight) -> Result<(), Box<dyn Error + Send + Sync>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut at = 0;
-    each(graph, offer, &[rules], shares, |weight, _| {
-        at += 1;
-        take(at - 1, weight)
-    })
 }
 
 /// Config values a recipe sets, by the file they override.
@@ -275,6 +262,21 @@ pub(crate) fn form(
         }
         _ => Ok(F32_FORM),
     }
+}
+
+/// As `each`, with each weight's place in graph order.
+pub(crate) fn numbered(
+    graph: &Graph,
+    offer: &dyn Offer,
+    rules: &[&[Rule]],
+    shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+    take: &mut dyn FnMut(u32, Weight) -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    let mut at = 0;
+    each(graph, offer, rules, shares, |weight, _| {
+        at += 1;
+        take(at - 1, weight)
+    })
 }
 
 /// Each weight in graph order, cut to `shares` where possible.
@@ -446,8 +448,7 @@ pub fn load_tapped(
         }
         return gguf::load(dir, sizes[0], sizes[1], user, steps);
     }
-    let json = overrides.merged("config.json", &dir.join("config.json"))?;
-    let arch = arch::spot(&json)?;
+    let (json, arch) = arch::read(dir, overrides)?;
     let step = arch
         .step
         .ok_or_else(|| format!("{} has no step graph yet", arch.name))?;
@@ -501,17 +502,24 @@ pub fn load_module(
     let layers = graph.dims.iter().find(|d| d.name == DimName::Layers);
     let layers = layers.map_or(0, |d| d.size.max());
     let ask = arch::Ask {
-        dir,
-        sizes,
         user,
-        steps: Steps::Plain,
-        overrides,
-        manifest: None,
-        taps: &[],
-        json: &json,
+        ..arch::Ask::plain(dir, sizes, overrides, &json)
     };
     let (graph, weights, pins) = held(&ask, graph, layers, &[])?;
     dressed(dir, graph, weights, pins, Some(json)).map(Some)
+}
+
+/// `dir`'s whole-prompt graph, its weights and their forms.
+pub fn forward(
+    dir: &Path,
+    sizes: [u64; 2],
+    overrides: &Overrides,
+) -> Result<(Graph, Weights, Pins), Failure> {
+    let (json, arch) = arch::read(dir, overrides)?;
+    let forward = arch
+        .forward
+        .ok_or_else(|| format!("{} has no forward graph yet", arch.name))?;
+    forward(arch, &arch::Ask::plain(dir, sizes, overrides, &json))
 }
 
 /// `dir`'s exlr8 release at `name`, or its only manifest.

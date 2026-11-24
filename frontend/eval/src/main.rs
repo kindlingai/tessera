@@ -55,7 +55,7 @@ struct Args {
     embed: Option<PathBuf>,
     /// Where the embeddings go, as little-endian f32.
     vectors: Option<PathBuf>,
-    /// Run each text forward through a Qwen3.5 model, then stop.
+    /// Run each text forward through the model, then stop.
     forward: Option<PathBuf>,
     /// Fail lowering unless the favored rule covers a step.
     require_favored: bool,

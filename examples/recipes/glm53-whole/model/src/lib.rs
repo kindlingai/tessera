@@ -1,6 +1,8 @@
 //! GLM-5.3's whole step, embedding to logits, as one persistent kernel.
 
-use tessera_guest::site::{Ask, Count, Input, Kind, Lane, Offer, Place, Resident, Weights};
+use tessera_guest::site::{
+    Ask, Found, Input, Kind, Lane, Offer, Place, Resident, Weights, agreed, layer, same, trellis,
+};
 
 const NAME: &str = "glm53_whole";
 const THREADS: u32 = 256;
@@ -53,25 +55,17 @@ const TRELLIS: u32 = 4;
 
 /// Whether `whole.cu` decodes `input`'s form, and its class.
 fn class(input: &Input) -> Option<u32> {
-    let form = input.form.as_str();
-    let plain = match form {
+    let plain = match input.form.as_str() {
         "f32" => Some(0),
         "bf16" => Some(1),
         "int4_g32" => Some(2),
         "mxfp8" => Some(3),
         _ => None,
     };
-    if let Some(c) = plain {
-        return input.parts.is_none().then_some(c);
+    match plain {
+        Some(c) => input.parts.is_none().then_some(c),
+        None => trellis(&input.form).map(|_| TRELLIS),
     }
-    let rest = form.strip_suffix("_rot").unwrap_or(form);
-    let rest = rest.strip_prefix("trellis_k")?;
-    let k = rest
-        .strip_suffix("_mul1")
-        .or_else(|| rest.strip_suffix("_pmcgx"))
-        .unwrap_or(rest);
-    let k: usize = k.parse().ok()?;
-    (2..=4).contains(&k).then_some(TRELLIS)
 }
 
 /// The reads collected in kernel item order.
@@ -81,13 +75,8 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn place(&self, path: &str) -> Option<usize> {
-        Some(self.weights.get(path)?.at)
-    }
-
-    /// Reads weight `path` as field `field`, if `whole.cu` can.
-    fn take(&mut self, path: &str, field: usize) -> Option<&'a Input> {
-        let found = self.weights.get(path)?;
+    /// Reads `found` as field `field`, if `whole.cu` can.
+    fn take(&mut self, found: Found<'a>, field: usize) -> Option<&'a Input> {
         let c = class(&found)?;
         let codes = CODES.contains(&field);
         // Rotated iff trellis outside the expert codes.
@@ -105,19 +94,9 @@ impl<'a> Walk<'a> {
 
     /// Reads each of `fields` under `prefix`, from field `first`.
     fn group(&mut self, prefix: &str, fields: &[&str], first: usize) -> Option<Vec<&'a Input>> {
-        let mut out = Vec::with_capacity(fields.len());
-        for (i, f) in fields.iter().enumerate() {
-            out.push(self.take(&format!("{prefix}{f}"), first + i)?);
-        }
-        Some(out)
+        let found = self.weights.group(prefix, fields)?.into_iter().enumerate();
+        found.map(|(i, f)| self.take(f, first + i)).collect()
     }
-}
-
-/// One value for every entry of `parts`, else `None`.
-fn same<T: PartialEq + Copy>(parts: impl IntoIterator<Item = T>) -> Option<T> {
-    let mut parts = parts.into_iter();
-    let first = parts.next()?;
-    parts.all(|p| p == first).then_some(first)
 }
 
 /// Model sizes from the first layer's weights.
@@ -152,24 +131,23 @@ fn sizes(a: &[&Input]) -> Option<Sizes> {
 fn heads(a: &[&Input], s: &Sizes) -> Option<Option<[usize; 2]>> {
     let q = a[3].split(0, s.nope + s.rope)?;
     let kv = a[6].split(0, s.nope + s.head_dim)?;
-    let o = a[7].split(1, s.head_dim)?;
-    (q == kv && kv == o).then_some(o)
+    same([q, kv, a[7].split(1, s.head_dim)?])
 }
 
 /// An MLP's part of its inner width, from all three.
 fn inner(m: &[&Input]) -> Option<Option<[usize; 2]>> {
-    let [g, u, d] = [m[0].split(0, 1)?, m[1].split(0, 1)?, m[2].split(1, 1)?];
-    (g == u && u == d).then_some(d)
+    same([m[0].split(0, 1)?, m[1].split(0, 1)?, m[2].split(1, 1)?])
 }
 
 /// The indexing layers: where each indexer's `wq` is read.
-fn indexing(w: &Walk, layers: usize) -> Option<Vec<usize>> {
+fn indexing(w: &Weights, layers: usize) -> Option<Vec<usize>> {
     let mut out = Vec::new();
     for i in 0.. {
-        let Some(at) = w.place(&format!("indexers.{i}.wq")) else {
+        let Some(wq) = w.get(&format!("indexers.{i}.wq")) else {
             break;
         };
-        let before = |l: &usize| w.place(&format!("attn.{l}.q_a")).is_some_and(|q| q < at);
+        let q_a = |l: &usize| w.get(&format!("attn.{l}.q_a"));
+        let before = |l: &usize| q_a(l).is_some_and(|q| q.at < wq.at);
         out.push((0..layers).rfind(before)?);
     }
     Some(out)
@@ -201,22 +179,17 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let first = kept.first()?;
     let mut w = Walk {
         weights: Weights::new(step.inputs),
-        reads: step.id_reads(),
+        reads: Vec::new(),
     };
     let global = w.group("", &GLOBAL, 0)?;
-    let layers = (0..)
-        .take_while(|l| w.place(&format!("attn.{l}.q_a")).is_some())
-        .count();
-    let dense = (0..)
-        .take_while(|l| w.place(&format!("dense.{l}.gate")).is_some())
-        .count();
-    let index = indexing(&w, layers)?;
+    let layers = w.weights.layers("attn.{l}.q_a");
+    let dense = w.weights.layers("dense.{l}.gate");
+    let index = indexing(&w.weights, layers)?;
     let every = every(&index, dense, layers)?;
     let (mut attention, mut mlps, mut routed, mut indexers) = (vec![], vec![], vec![], vec![]);
     for l in 0..layers {
-        let fields = ATTENTION.map(|f| f.replace("{l}", &l.to_string()));
-        let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
-        attention.push(w.group("", &fields, GLOBAL.len())?);
+        let fields = ATTENTION.map(|f| layer(f, l));
+        attention.push(w.group("", &fields.each_ref().map(|f| f.as_str()), GLOBAL.len())?);
         if let Some(i) = index.iter().position(|&x| x == l) {
             indexers.push(w.group(&format!("indexers.{i}."), &INDEXER, AT_INDEXER)?);
         }
@@ -255,28 +228,21 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         }
         moe_parts.push(held.zip(shared));
     }
-    let count = |parts: &[Option<[usize; 2]>], all: usize| match same(parts.iter().flatten()) {
-        Some(p) => Some(p[1]),
-        None if parts.iter().all(Option::is_none) => Some(all),
-        None => None,
-    };
+    let count = |parts: &[Option<[usize; 2]>], all: usize| Some(agreed(parts, [0, all])?[1]);
     let attended = count(&attn, s.heads)?;
     let dense_all = mlps.first()?[2].whole(1);
     let dense_ffn = count(&dense_parts, dense_all)?;
     let ffn_all = r[15].whole(1);
     let shared: Vec<_> = moe_parts.iter().map(|p| p.map(|(_, s)| s)).collect();
     let ffn = count(&shared, ffn_all)?;
-    let held = same(moe_parts.iter().flatten().map(|(h, _)| *h));
-    if held.is_none() && moe_parts.iter().any(Option::is_some) {
-        return None;
-    }
-    let [held_first, held] = held.unwrap_or([0, experts]);
+    let held: Vec<_> = moe_parts.iter().map(|p| p.map(|(h, _)| h)).collect();
+    let [held_first, held] = agreed(&held, [0, experts])?;
     let mlp_split =
         (dense_parts.iter().map(Option::is_some)).chain(moe_parts.iter().map(Option::is_some));
     let bits = |split: &mut dyn Iterator<Item = bool>| {
-        let mut words = [0u32; 3];
+        let mut words = [0usize; 3];
         for (l, on) in split.enumerate() {
-            words[l / 32] |= u32::from(on) << (l % 32);
+            words[l / 32] |= usize::from(on) << (l % 32);
         }
         words
     };
@@ -295,7 +261,7 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
     let summed = attn.iter().flatten().count() + mlp_split.filter(|on| *on).count();
     // Trimmed last layers sum picked rows. The grid sums all.
     let sums_fit = sums.len() == summed && sums.iter().all(|n| n % hidden == 0);
-    let kept_fit = kept.len() == 2 * layers + index.len();
+    let kept_fit = kept.len() == layers + index.len();
     if !(whole_rest && sums_fit && kept_fit && layers <= 96) {
         return None;
     }
@@ -321,7 +287,6 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         experts,
     ];
     let width = width.into_iter().max()?;
-    let mut counts = step.id_counts();
     let shape = [
         head_out,
         hidden,
@@ -349,17 +314,14 @@ fn offer(ask: &Ask) -> Option<Vec<Offer>> {
         held,
         top_k,
     ];
-    counts.extend(shape.map(Count::from));
-    counts.extend(attn_bits.into_iter().chain(mlp_bits).map(Count::Fixed));
-    counts.push(width.into());
-    for op in ["rms_norm", "rope_adjacent", "scale", "attend"] {
-        counts.push(Count::bits(step.scalar(op)?));
-    }
+    let sizes = [&shape[..], &attn_bits, &mlp_bits, &[width]].concat();
+    let ops = ["rms_norm", "rope_adjacent", "scale", "attend"];
     let floats =
         rows * (3 * hidden + s.q_latent + s.latent + s.rope + 6 * width + keep + 2 * top_k);
     let work = (rows * layers * hidden * (s.q_latent + s.heads * s.head_dim)) as f64;
     let resident = Resident::grid(THREADS, floats * 4, lane);
-    Some(vec![step.resident(NAME, w.reads, counts, work, resident)])
+    let whole = step.resident(NAME, w.reads, &sizes, &ops, work, resident)?;
+    Some(vec![whole])
 }
 
 tessera_guest::exports! {

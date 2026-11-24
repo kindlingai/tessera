@@ -1,6 +1,6 @@
-//! An EmbeddingGemma 2 exlr8 release: graph, weights, tokenizer.
+//! Text embedding models, and the EmbeddingGemma 2 exlr8 release.
 
-use crate::arch::{Arch, Spot, arch};
+use crate::arch::{Arch, Spot, arch, read};
 use crate::names::repo;
 use crate::parts::{Cut, Part};
 use crate::tokenize::hf::Hf;
@@ -26,12 +26,48 @@ arch!(
     [Spot::Class("EmbeddingGemma2Model")],
     rules: include_str!("../names/eg2.json"),
     part: part,
+    embed: Embeds {
+        shape: Shape {
+            max_tokens: 1024,
+            seqs: 16,
+            rows: 4096,
+        },
+        open: encoder,
+    },
 );
+
+/// The launch sizes an embedder plans for.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    /// Tokens per text, `<bos>` and `<eos>` included.
+    pub max_tokens: usize,
+    /// The most texts in one launch.
+    pub seqs: usize,
+    /// The most padded rows in one launch.
+    pub rows: usize,
+}
+
+/// An embedding model's launch sizes and text tower.
+pub(crate) struct Embeds {
+    pub shape: Shape,
+    /// The tower at `[seqs, max_tokens]`, plain or padded.
+    pub open: fn(&Path, [u64; 2], bool, &Overrides) -> Result<Encoder>,
+}
 
 pub struct Encoder {
     pub graph: Graph,
     pub weights: Vec<Weight>,
     pub tokenizer: Hf,
+}
+
+/// The embedding model in `dir` at its own launch sizes.
+pub fn open(dir: &Path, padded: bool, overrides: &Overrides) -> Result<(Shape, Encoder)> {
+    let (_, arch) = read(dir, overrides)?;
+    let embeds = arch.embed.as_ref();
+    let embeds = embeds.ok_or_else(|| format!("{} is not an embedding model", arch.name))?;
+    let shape = embeds.shape;
+    let at = [shape.seqs as u64, shape.max_tokens as u64];
+    Ok((shape, (embeds.open)(dir, at, padded, overrides)?))
 }
 
 /// The text tower in `dir`, plain or padded.

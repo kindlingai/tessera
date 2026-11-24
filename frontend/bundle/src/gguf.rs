@@ -174,7 +174,7 @@ pub(crate) fn load(
     // An output table unlike the embedding is the head's own.
     config.tied = !gguf.has("output.weight")
         || gguf.bytes("output.weight")? == gguf.bytes("token_embd.weight")?;
-    let graph = (crate::arch::family(arch)?.step)(&config);
+    let graph = (crate::decoder::family(arch)?.step)(&config);
     let layers = config.stack.layers;
     let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
     let template = gguf

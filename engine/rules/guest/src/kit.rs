@@ -94,37 +94,49 @@ impl Step<'_> {
         self.inputs[self.ids[0]].shape[0]
     }
 
-    /// Tokens, positions, slots and picks, as reads.
-    pub fn id_reads(&self) -> Vec<Place> {
-        self.ids.map(Place::Read).into()
-    }
-
-    /// Launch counts of tokens and picks.
-    pub fn id_counts(&self) -> Vec<Count> {
-        let [tokens, _, _, picks] = self.ids;
-        vec![self.inputs[tokens].count(), self.inputs[picks].count()]
-    }
-
-    /// One persistent grid: `reads`, then every kept row.
+    /// Reads ids, `reads`, kept rows. Counts ids, `sizes`, op bits.
     pub fn resident(
         &self,
         kernel: &'static str,
-        mut reads: Vec<Place>,
-        counts: Vec<Count>,
+        reads: impl IntoIterator<Item = Place>,
+        sizes: &[usize],
+        ops: &[&str],
         work: f64,
         resident: Resident,
-    ) -> Offer {
-        reads.extend((0..self.kept.len()).map(|kept| Place::Kept { kept }));
-        Offer {
+    ) -> Option<Offer> {
+        let [tokens, _, _, picks] = self.ids;
+        let mut counts = vec![self.inputs[tokens].count(), self.inputs[picks].count()];
+        counts.extend(fixed(sizes));
+        for op in ops {
+            counts.push(Count::bits(self.scalar(op)?));
+        }
+        let mut all: Vec<Place> = self.ids.map(Place::Read).into();
+        all.extend(reads);
+        all.extend((0..self.kept.len()).map(|kept| Place::Kept { kept }));
+        Some(Offer {
             kernel,
-            reads,
+            reads: all,
             len: self.len,
             counts,
-            shape: Shape::Line(1),
             work,
+            resident: Some(resident),
+            ..Offer::default()
+        })
+    }
+}
+
+impl Default for Offer {
+    fn default() -> Self {
+        Offer {
+            kernel: "",
+            reads: Vec::new(),
+            len: 0,
+            counts: Vec::new(),
+            shape: Shape::Line(1),
+            work: 0.0,
             guess: 1e-12,
             writes: None,
-            resident: Some(resident),
+            resident: None,
         }
     }
 }
@@ -233,18 +245,21 @@ impl<'a> Weights<'a> {
         })
     }
 
-    /// As `get`, if the weight's form is `form`.
-    pub fn typed(&self, path: &str, form: &str) -> Option<Found<'a>> {
-        self.get(path).filter(|f| f.form == form)
-    }
-
     /// Each of `paths`, else `None`.
     pub fn all<const N: usize>(&self, paths: [&str; N]) -> Option<[Found<'a>; N]> {
-        let found = paths.map(|p| self.get(p));
-        found
-            .iter()
-            .all(Option::is_some)
-            .then(|| found.map(Option::unwrap))
+        self.group("", &paths)?.try_into().ok()
+    }
+
+    /// Each of `fields` under `prefix`, in order, else `None`.
+    pub fn group(&self, prefix: &str, fields: &[&str]) -> Option<Vec<Found<'a>>> {
+        let path = |f: &&str| self.get(&format!("{prefix}{f}"));
+        fields.iter().map(path).collect()
+    }
+
+    /// Layers from 0 up whose `pattern` path is a weight.
+    pub fn layers(&self, pattern: &str) -> usize {
+        let has = |l| self.get(&layer(pattern, l)).is_some();
+        (0..).take_while(|&l| has(l)).count()
     }
 
     /// Distinct weight paths.
@@ -255,6 +270,46 @@ impl<'a> Weights<'a> {
     pub fn is_empty(&self) -> bool {
         self.at.is_empty()
     }
+}
+
+/// `pattern` with each `{l}` set to layer `l`.
+pub fn layer(pattern: &str, l: usize) -> String {
+    pattern.replace("{l}", &l.to_string())
+}
+
+/// One value for every entry of `parts`, else `None`.
+pub fn same<T: PartialEq>(parts: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut parts = parts.into_iter();
+    let first = parts.next()?;
+    parts.all(|p| p == first).then_some(first)
+}
+
+/// The part all split entries share, `whole` if none split.
+pub fn agreed<T: PartialEq + Copy>(parts: &[Option<T>], whole: T) -> Option<T> {
+    let one = same(parts.iter().flatten()).copied();
+    one.or(parts.iter().all(Option::is_none).then_some(whole))
+}
+
+/// Trellis bits, codebook (0 mcg, 1 mul1, 2 pmcgx), rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trellis {
+    pub k: u32,
+    pub book: u32,
+    pub rotated: bool,
+}
+
+/// The trellis form `form` names, `k` from 2 to 4.
+pub fn trellis(form: &str) -> Option<Trellis> {
+    let rest = form.strip_suffix("_rot");
+    let rotated = rest.is_some();
+    let rest = rest.unwrap_or(form).strip_prefix("trellis_k")?;
+    let (k, book) = match (rest.strip_suffix("_mul1"), rest.strip_suffix("_pmcgx")) {
+        (Some(k), _) => (k, 1),
+        (_, Some(k)) => (k, 2),
+        _ => (rest, 0),
+    };
+    let k: u32 = k.parse().ok()?;
+    (2..=4).contains(&k).then_some(Trellis { k, book, rotated })
 }
 
 /// Bytes of the dotted prefix all `paths` share.

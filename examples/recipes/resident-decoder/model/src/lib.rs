@@ -1,6 +1,6 @@
 //! A small decoder's whole step as one persistent kernel.
 
-use tessera_guest::site::{Count, Found, Kind, Lane, Offer, Resident, Site, Weights, fixed};
+use tessera_guest::site::{Found, Kind, Lane, Offer, Resident, Site, Weights};
 
 const NAME: &str = "resident_decoder";
 const THREADS: u32 = 256;
@@ -14,14 +14,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let step = site.step()?;
     let (kept, sums) = (step.kept, step.sums);
     let w = Weights::new(step.inputs);
-    let weight = |path: &str| w.typed(path, "f32");
-    let layers = (0..).take_while(|l| weight(&format!("layers.{l}.q")).is_some());
-    let layers = layers.count();
-    let mut found = vec![weight("embed")?, weight("norm")?];
+    let layers = w.layers("layers.{l}.q");
+    let mut found = w.group("", &["embed", "norm"])?;
     for l in 0..layers {
-        for field in LAYER {
-            found.push(weight(&format!("layers.{l}.{field}"))?);
-        }
+        found.extend(w.group(&format!("layers.{l}."), &LAYER)?);
     }
     let at = |l: usize, f: usize| found[2 + l * LAYER.len() + f];
     let [vocab, hidden] = found[0].shape[..] else {
@@ -38,11 +34,11 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let summed = sums.len() == layers * per && sums.iter().all(|s| *s == rows * hidden);
     let paired = kept.len() == 2 * layers && kept.iter().all(|k| k.width == kv);
     let [code, page] = kept[0].code()?;
-    if !(summed && paired && kv > 0 && all_heads % all_kv.max(1) == 0) {
+    let f32s = found.iter().all(|f| f.form == "f32");
+    if !(f32s && summed && paired && kv > 0 && all_heads % all_kv.max(1) == 0) {
         return None;
     }
-    let mut counts = step.id_counts();
-    counts.extend(fixed(&[
+    let sizes = [
         vocab,
         hidden,
         layers,
@@ -55,17 +51,16 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         kv_first.map_or(0, |p| p[0]),
         split[0] as usize,
         split[1] as usize,
-    ]));
-    counts.extend([code, page].map(Count::Fixed));
-    for op in ["rms_norm", "rope_halves", "attend"] {
-        counts.push(Count::bits(step.scalar(op)?));
-    }
-    let mut reads = step.id_reads();
-    reads.extend(found.iter().map(Found::read));
+        code as usize,
+        page as usize,
+    ];
+    let ops = ["rms_norm", "rope_halves", "attend"];
+    let reads = found.iter().map(Found::read);
     let floats = rows * (3 * hidden + 2 * heads + 2 * kv + ffn);
     let work = (rows * layers * hidden * (heads + 2 * kv + 3 * ffn)) as f64;
     let resident = Resident::grid(THREADS, floats * 4, Lane::Sum);
-    Some(vec![step.resident(NAME, reads, counts, work, resident)])
+    let whole = step.resident(NAME, reads, &sizes, &ops, work, resident)?;
+    Some(vec![whole])
 }
 
 tessera_guest::exports! {

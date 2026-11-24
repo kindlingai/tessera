@@ -2,7 +2,7 @@
 
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::Rule;
-use crate::{Stream, Weights, is_exlr8, pins, stream_each};
+use crate::{Stream, Weights, is_exlr8, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
@@ -158,7 +158,7 @@ impl Stream for Release {
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
         take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
-        stream_each(&self.graph, &*self.offer, &self.rules, shares, take)
+        numbered(&self.graph, &*self.offer, &[&self.rules], shares, take)
     }
 }
 

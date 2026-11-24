@@ -22,6 +22,11 @@ constexpr float INV_SQRT128 = 0.08838834764831844f;
 constexpr float MUL1_SCALE = 1774.0f / 262144.0f;
 constexpr float MUL1_OFFSET = -1329.0f / 128.0f;
 
+// The u32 at byte `at`, such as a head word.
+TESSERA_FN u32 word(const u8* p, u32 at) {
+    return *reinterpret_cast<const u32*>(p + at);
+}
+
 enum codebook : u32 {
     BOOK_MCG = 0u,
     BOOK_MUL1 = 1u,

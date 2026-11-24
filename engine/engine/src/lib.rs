@@ -12,6 +12,8 @@ use tessera_graph::{EntryKind, Role};
 use tessera_lower::{Cache, Device, Slot, Wants};
 use tessera_run::{Run, open};
 
+mod batch_dual;
+mod batch_spec;
 mod dual;
 mod guide;
 mod kept;
@@ -28,6 +30,7 @@ mod spec_len;
 mod spec_loop;
 mod speculate;
 
+pub use batch_spec::BatchMtp;
 pub use dual::{DualSelector, DualSpeculate};
 pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use kept::Totals;
@@ -245,6 +248,17 @@ pub(crate) fn context_bucket(needed: usize, cap: usize) -> u64 {
     needed.max(256).next_power_of_two().min(cap) as u64
 }
 
+/// Rounds a launch row count up to compact buckets.
+pub(crate) fn row_bucket(n: usize) -> usize {
+    if n <= 24 {
+        n.max(1)
+    } else if n <= 64 {
+        n.div_ceil(8) * 8
+    } else {
+        n.next_power_of_two()
+    }
+}
+
 /// Sizes and padded counts for `rows` returning `picks`.
 fn launch_of(
     rows: &[Row],
@@ -256,16 +270,8 @@ fn launch_of(
     let mut seen: Vec<u32> = rows.iter().map(|r| r.slot).collect();
     seen.sort_unstable();
     seen.dedup();
-    // Small counts stay exact to skip wasted verify rows.
-    let pad = |n: usize| {
-        if n <= 16 {
-            n.max(1)
-        } else {
-            n.next_power_of_two()
-        }
-    };
-    let filled = pad(rows.len());
-    let wanted = pad(picks.len());
+    let filled = row_bucket(rows.len());
+    let wanted = row_bucket(picks.len());
     let sizes = vec![
         (Seqs, slots as u64),
         (Rows, filled as u64),
@@ -437,6 +443,10 @@ impl Engine {
     /// Maximum sequence length in tokens.
     pub fn context(&self) -> usize {
         self.context
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
     }
 
     /// One launch of `rows`: the likeliest token after each.

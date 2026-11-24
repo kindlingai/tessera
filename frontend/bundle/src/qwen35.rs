@@ -3,7 +3,7 @@
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::{Rule, repo};
 use crate::parts::{Cut, Part};
-use crate::{Overrides, each, pins, pull};
+use crate::{Overrides, Stream, Weights, numbered, pins, pull};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
@@ -23,6 +23,12 @@ fn step(_: &Arch, _: &Ask) -> Result<Built> {
     Err(format!("{CLASS} has no step graph yet. tessera-eval --forward runs it").into())
 }
 
+fn forward(_: &Arch, ask: &Ask) -> Result<Built> {
+    let text = open(ask.dir, ask.sizes, ask.overrides)?;
+    let (graph, pins) = (text.graph.clone(), text.pins.clone());
+    Ok((graph, Weights::Streamed(Box::new(text)), pins))
+}
+
 fn part(_: &Arch, cut: &Cut) -> Result<Part> {
     let c = config(&cut.dir, cut.sized(256), &Overrides::default())?;
     let (dir, layers) = (cut.dir.clone(), c.stack.layers);
@@ -34,6 +40,7 @@ arch!(
     [Spot::Class(CLASS), Spot::Type("qwen3_5")],
     rules: include_str!("../names/qwen35.json"),
     step: step,
+    forward: forward,
     part: part,
 );
 
@@ -48,18 +55,17 @@ pub struct Text {
 impl Text {
     /// Each weight in graph order, one read at a time.
     pub fn each(&self, mut take: impl FnMut(u32, Weight) -> Result<()>) -> Result<()> {
-        let mut at = 0;
-        each(
-            &self.graph,
-            &self.shards,
-            &[&self.rules],
-            &|_| None,
-            |w, _| {
-                take(at, w)?;
-                at += 1;
-                Ok(())
-            },
-        )
+        self.stream(&|_| None, &mut take)
+    }
+}
+
+impl Stream for Text {
+    fn stream(
+        &self,
+        shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
+        take: &mut dyn FnMut(u32, Weight) -> Result<()>,
+    ) -> Result<()> {
+        numbered(&self.graph, &self.shards, &[&self.rules], shares, take)
     }
 }
 
