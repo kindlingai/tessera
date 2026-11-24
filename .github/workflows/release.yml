@@ -120,6 +120,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       VERSION: ${{ needs.release.outputs.version }}
+      TESSERA_COMMIT: ${{ needs.release.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,6 +132,8 @@ jobs:
           working-directory: target/publish/tessera-cli
           target: ${{ matrix.target }}
           manylinux: "2_28"
+          # The manylinux container needs the commit for `tesserax --version`.
+          docker-options: -e TESSERA_COMMIT
           rust-toolchain: 1.99.1
           args: --release --out dist ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       - name: Take the binary out of the wheel
@@ -139,6 +142,7 @@ jobs:
           unzip -j -o target/publish/tessera-cli/dist/*.whl '*.data/scripts/tesserax' -d bin
           chmod +x bin/tesserax
           ./bin/tesserax 2>&1 | grep -q usage
+          ./bin/tesserax --version | grep -q "commit=$TESSERA_COMMIT"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.npm }}

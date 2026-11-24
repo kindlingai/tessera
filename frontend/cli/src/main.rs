@@ -6,6 +6,10 @@ mod source;
 #[cfg(test)]
 mod source_test;
 mod task;
+mod teleport;
+#[cfg(test)]
+mod teleport_test;
+mod version;
 
 use source::{Source, Stop, split};
 use std::process::ExitCode;
@@ -15,9 +19,16 @@ use tessera_serve::start::flags;
 const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>
   serve [flags]  load the model and answer OpenAI-shaped requests
   fetch          download the recipe and its weights, then print where they are
-  task <task>    run one task on the model";
+  task <task>    run one task on the model
+  teleport [--from <dir>] [--root <dir>] <user@host | local>...
+                 copy this build to other machines over ssh
+  --version      print version, commit, target and GPU features";
 
 fn run(given: &[String]) -> Result<(), Stop> {
+    if given == ["--version"] {
+        println!("{}", version::line());
+        return Ok(());
+    }
     let (origin, args) = split(given)?;
     let Some((verb, rest)) = args.split_first() else {
         return Err(Stop::Usage);
@@ -26,6 +37,7 @@ fn run(given: &[String]) -> Result<(), Stop> {
         "serve" => serve::run(Source::open_or_default(origin)?, rest),
         "fetch" => fetch::run(Source::open_or_default(origin)?, rest),
         "task" => task::run(origin, rest),
+        "teleport" => teleport::run(rest),
         _ => Err(Stop::Usage),
     }
 }
