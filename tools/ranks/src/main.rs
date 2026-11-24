@@ -1,4 +1,4 @@
-//! One rank of Qwen3-0.6B, sharded over TCP, against the fixture.
+//! One model rank, sharded over TCP, against the fixture.
 
 // Linking these registers their lowering rules.
 use tessera_rules as _;
@@ -16,12 +16,11 @@ use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::shard_aligned;
 use tessera_interp::Tensor;
 use tessera_lower::{Cluster, Device, Pick, ZoneKind, lower};
-use tessera_models::decoder::{Config, Moe, Swiglu, program};
+use tessera_models::preset;
 use tessera_run::{Rank, Run};
-use tessera_trace::Norm;
 
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
-  [--model qwen3|granite|eg2|deepseek|glm53] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
+  [--model NAME] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
   [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds] [--sums host|grid|p2p] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
@@ -31,8 +30,9 @@ const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH 
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.
-  --recipe runs the small qwen3 or glm53 with the recipe's resident grid per
-  rank, over --shm or --verbs, and rank 0 checks it against one engine alone.";
+  --recipe runs a small model, such as qwen3 or glm53, with the recipe's
+  resident grid per rank, over --shm or --verbs, and rank 0 checks it
+  against one engine alone.";
 
 struct Args {
     rank: u32,
@@ -201,8 +201,6 @@ type Loaded = (tessera_graph::Graph, Weights, tessera_lower::Pins);
 /// One sequence's graph for `n` tokens, its weights and forms.
 fn model(name: &str, fixture: &Path, n: u64) -> Result<Loaded, Box<dyn std::error::Error>> {
     let g = match name {
-        "qwen3" => program::<Norm, Swiglu>(&Config::qwen3(1, n)),
-        "granite" => program::<(), Moe>(&Config::granite(1, n)),
         "deepseek" | "glm53" => {
             let r = tessera_bundle::mla::release(fixture, 1, n, 3).map_err(|e| e.to_string())?;
             let (graph, pins) = (r.graph.clone(), r.pins.clone());
@@ -219,7 +217,10 @@ fn model(name: &str, fixture: &Path, n: u64) -> Result<Loaded, Box<dyn std::erro
             let pins = tessera_lower::Pins::default();
             return Ok((e.graph, Weights::Held(e.weights), pins));
         }
-        _ => return Err("a model this tool knows".into()),
+        _ => {
+            let forward = preset::named(name)?.forward;
+            forward.ok_or_else(|| format!("`{name}` has no forward graph"))?(n)
+        }
     };
     let file = tessera_checkpoint::File::open(&fixture.join("model.safetensors"))?;
     let (weights, pins) = tessera_bundle::pull(&g, &file, 0, &[]).map_err(|e| e.to_string())?;

@@ -75,7 +75,7 @@ const SPEC: Spec = Spec {
     release,
     parameters: 26_895_998_464,
     regions: &[(Layer, 64), (Mlp, 64), (Model, 1)],
-    small: Some(|| program(&tessera_models::small::qwen35())),
+    small: Some(|| program(&tessera_models::qwen35::small())),
     stepper: None,
     files: &[(include_str!("manifests/hf.json"), release)],
     golden: None,

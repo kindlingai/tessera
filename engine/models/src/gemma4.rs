@@ -310,6 +310,28 @@ impl Pass<'_> {
     }
 }
 
+/// Four layers, sliding then full. The last two share keys.
+pub fn small() -> Config {
+    let mut stack = Stack::small(256, 128, 256);
+    stack.layers = 4;
+    Config {
+        stack,
+        kv_heads: 1,
+        full_every: 2,
+        full_head_dim: 256,
+        full_turned: 32,
+        per_layer: 128,
+        window: 4,
+        theta: 1e4,
+        full_theta: 1e6,
+        first_shared: 2,
+        eps: 1e-6,
+        cap: Some(30.0),
+    }
+}
+
+crate::preset::preset!("gemma4", small: || stepper::<trace::Linear>(&small()));
+
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<D: Dense>(c: &Config) -> Graph {
     let m = Model::new(c.dims());

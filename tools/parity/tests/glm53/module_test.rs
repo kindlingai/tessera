@@ -30,7 +30,7 @@ const TEXT: &str = include_str!("../../../../examples/recipes/glm53-moe/model/sr
 const ROWS: usize = 3;
 
 fn small() -> Config {
-    tessera_models::small::glm53()
+    tessera_models::mla::Config::glm53_small()
 }
 
 fn recipe() -> Recipe {

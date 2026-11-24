@@ -383,6 +383,30 @@ pub fn hidden(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Te
     norm(&x, &w.ends.norm, c.eps)
 }
 
+/// A delta rule layer, then full attention, heads in pairs.
+pub fn small() -> Config {
+    let mut stack = Stack::small(64, 32, 128);
+    stack.heads = 4;
+    Config {
+        stack,
+        kv_heads: 2,
+        rotary: 16,
+        rope_theta: 1e4,
+        eps: 1e-6,
+        linear: Recurrent {
+            key_heads: 2,
+            value_heads: 4,
+            key_dim: 16,
+            value_dim: 16,
+            window: 4,
+        },
+        layers: vec![Mixing::Linear, Mixing::Full],
+        tied: false,
+    }
+}
+
+crate::preset::preset!("qwen35", small: || program(&small()));
+
 /// One forward entry: tokens and positions in, logits out.
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(c.dims());

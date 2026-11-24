@@ -101,6 +101,41 @@ impl Config {
         }
     }
 
+    /// Three layers of low-rank attention. Weight rows hold whole blocks.
+    pub fn deepseek_small() -> Self {
+        Self {
+            stack: Stack::sized([64, 64, 3, 2, 32, 32], 4, 16),
+            dense_layers: 1,
+            nope: 16,
+            rope: 16,
+            rope_theta: 1e4,
+            q_latent: 32,
+            latent: 32,
+            dense_ffn: 64,
+            experts: 32,
+            top_k: 2,
+            route_scale: 2.5,
+            index: None,
+            eps: 1e-6,
+        }
+    }
+
+    /// One dense layer, two routed. The middle reuses picked keys.
+    pub fn glm53_small() -> Self {
+        let index = Index {
+            heads: 2,
+            dim: 32,
+            keep: 4,
+            every: 2,
+        };
+        // Rotations turn 128 channels at a time.
+        Self {
+            stack: Stack::sized([64, 128, 3, 2, 32, 128], 4, 16),
+            index: Some(index),
+            ..Self::deepseek_small()
+        }
+    }
+
     /// Whether layer `l` picks keys. Others reuse the last pick.
     pub fn indexes(&self, l: u64) -> bool {
         let Some(index) = &self.index else {
@@ -577,6 +612,14 @@ impl Routed for RotatedMoe {
         routed.add(&swiglu(h, [&s.gate, &s.up, &s.down]))
     }
 }
+
+crate::preset::traced!(
+    "deepseek",
+    Config::deepseek_small,
+    Config::deepseek_v3,
+    [Moe]
+);
+crate::preset::traced!("glm53", Config::glm53_small, Config::glm53, [RotatedMoe]);
 
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<R: Routed>(c: &Config) -> Graph {

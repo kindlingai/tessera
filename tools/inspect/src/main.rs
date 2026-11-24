@@ -21,7 +21,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "tessera-inspect [--model qwen3|granite] [--full] [--graph FILE.json]
+const USAGE: &str = "tessera-inspect [--model NAME] [--full] [--graph FILE.json]
   [--ranks strix:3,gb10:1] [--prompt N] [--tokens N] [--form q8_0]
   [--latency SECONDS] [--rate BYTES_PER_SECOND] [--out DIR]
   A rank is a preset (strix, gb10, m3, cpu) or BACKEND/ARCH, then :PART.
@@ -109,7 +109,7 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     let (name, source) = match &args.graph {
         Some(path) => (path.clone(), model::read(path)?),
         None => {
-            let g = model::named(&args.model, args.full).ok_or("a model this tool knows")?;
+            let g = model::named(&args.model, args.full)?;
             (args.model.clone(), g)
         }
     };

@@ -6,7 +6,7 @@ use tessera_trace::Composite::{Attention, Layer, Mlp, Model, Moe};
 use tessera_trace::Graph;
 
 fn small() -> Graph {
-    program::<Experts>(&tessera_models::small::deepseek())
+    program::<Experts>(&Config::deepseek_small())
 }
 
 pub fn release() -> Graph {
@@ -14,7 +14,7 @@ pub fn release() -> Graph {
 }
 
 const STEPPER: Stepper = Stepper {
-    small: || stepper::<Experts>(&tessera_models::small::deepseek()),
+    small: || stepper::<Experts>(&Config::deepseek_small()),
     release: || stepper::<Experts>(&Config::deepseek_v3(1, 1024)),
     drift: tessera_parity::MLA_DRIFT,
 };

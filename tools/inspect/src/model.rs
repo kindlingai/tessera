@@ -2,9 +2,7 @@
 
 use std::error::Error;
 use tessera_graph::{DimName, EntryKind, Graph, NodeId, Op, Parts, Row, Size, Stage, Whole, shard};
-use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
-use tessera_models::small;
-use tessera_trace::Norm;
+use tessera_models::preset;
 
 /// A graph before and after the ranks split it.
 pub struct Model {
@@ -20,18 +18,13 @@ pub struct Model {
 }
 
 /// One step graph by name. `full` takes the released sizes.
-pub fn named(name: &str, full: bool) -> Option<Graph> {
-    let config = match (name, full) {
-        ("qwen3", false) => small::qwen3(),
-        ("qwen3", true) => Config::qwen3(1, 4096),
-        ("granite", false) => small::granite(),
-        ("granite", true) => Config::granite(1, 4096),
-        _ => return None,
+pub fn named(name: &str, full: bool) -> Result<Graph, String> {
+    let p = preset::named(name)?;
+    let graph = match full {
+        true => p.step.map(|step| step(4096)),
+        false => p.small.map(|small| small()),
     };
-    Some(match config.experts {
-        0 => stepper::<Norm, Swiglu>(&config),
-        _ => stepper::<(), Moe>(&config),
-    })
+    graph.ok_or_else(|| format!("`{name}` has no graph at these sizes"))
 }
 
 /// A graph from its JSON form.

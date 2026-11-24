@@ -2162,6 +2162,7 @@ dependencies = [
 name = "tessera-models"
 version = "0.1.0"
 dependencies = [
+ "scattered-collect",
  "serde",
  "serde_json",
  "tessera-graph",

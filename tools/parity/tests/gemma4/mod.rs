@@ -27,7 +27,7 @@ fn sizes(max_seqs: u64, max_context: u64) -> Config {
 }
 
 fn small() -> Graph {
-    program::<Linear>(&tessera_models::small::gemma4())
+    program::<Linear>(&tessera_models::gemma4::small())
 }
 
 fn release() -> Graph {
@@ -35,7 +35,7 @@ fn release() -> Graph {
 }
 
 const STEPPER: Stepper = Stepper {
-    small: || stepper::<Linear>(&tessera_models::small::gemma4()),
+    small: || stepper::<Linear>(&tessera_models::gemma4::small()),
     release: || stepper::<Linear>(&sizes(1, 1024)),
     drift: DRIFT,
 };

@@ -54,7 +54,7 @@ fn choices(layout: &'static dyn kept::Layout) -> tessera_lower::Recipe {
 
 /// The small model with `steps` output mode.
 fn graph_for(steps: Steps) -> Graph {
-    let mut c = tessera_models::small::glm53();
+    let mut c = tessera_models::mla::Config::glm53_small();
     c.stack.ffn = 256;
     c.stack.steps = steps;
     stepper::<RotatedMoe>(&c)

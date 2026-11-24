@@ -36,7 +36,7 @@ fn choices(layout: &'static dyn kept::Layout) -> tessera_lower::Recipe {
 }
 
 fn graph() -> Graph {
-    stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())
+    stepper::<Norm, Swiglu>(&tessera_models::decoder::Config::qwen3_small())
 }
 
 #[test]

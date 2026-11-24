@@ -10,12 +10,12 @@ use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
 use tessera_interp::{Tensor, run, run_ranks};
 use tessera_lower::{Cache, Cluster, Device, Pick, Settings, Wants, Weight};
-use tessera_models::{mla, mtp, small};
+use tessera_models::{mla, mtp};
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 
 fn mla_cfg(indexed: bool, ffn: u64) -> mla::Config {
-    let mut cfg = small::deepseek();
+    let mut cfg = mla::Config::deepseek_small();
     cfg.stack.max_seqs = 1;
     cfg.stack.max_context = 24;
     cfg.stack.ffn = ffn;

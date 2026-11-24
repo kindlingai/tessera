@@ -205,6 +205,51 @@ impl Config {
         }
     }
 
+    /// Gemma 3 270M sizes on Qwen3's layout. Mostly head weights.
+    pub fn gemma3(max_seqs: u64, max_context: u64) -> Self {
+        Self {
+            stack: Stack::sized([262_144, 640, 18, 4, 256, 2048], max_seqs, max_context),
+            kv_heads: 1,
+            ..Self::qwen3(max_seqs, max_context)
+        }
+    }
+
+    pub fn qwen3_small() -> Self {
+        Self {
+            stack: Stack::small(64, 32, 128),
+            kv_heads: 1,
+            rope_theta: 1e4,
+            eps: 1e-6,
+            experts: 0,
+            top_k: 0,
+            scales: Scales::default(),
+            tied: true,
+        }
+    }
+
+    pub fn smollm2_small() -> Self {
+        Self {
+            eps: 1e-5,
+            ..Self::qwen3_small()
+        }
+    }
+
+    /// Four experts, two per row, two KV heads.
+    pub fn granite_small() -> Self {
+        Self {
+            kv_heads: 2,
+            experts: 4,
+            top_k: 2,
+            scales: Scales {
+                embed: 2.0,
+                attention: Some(0.1),
+                residual: 0.5,
+                logits: 0.25,
+            },
+            ..Self::qwen3_small()
+        }
+    }
+
     /// A layout small enough to run in tests.
     pub fn toy(max_seqs: u64, max_context: u64) -> Self {
         Self {
@@ -418,6 +463,15 @@ impl Pass<'_> {
         })
     }
 }
+
+crate::preset::traced!("qwen3", Config::qwen3_small, Config::qwen3, [Norm, Swiglu]);
+crate::preset::traced!(
+    "smollm2",
+    Config::smollm2_small,
+    Config::smollm2,
+    [(), Swiglu]
+);
+crate::preset::traced!("granite", Config::granite_small, Config::granite, [(), Moe]);
 
 /// One forward entry: tokens and positions in, logits out.
 pub fn program<N: HeadNorm, M: Mlp>(c: &Config) -> Graph {

@@ -10,7 +10,7 @@ use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
 use tessera_lower::{Pins, Recipe, Settings, Weight, kept, rules};
 use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
-use tessera_models::{mla, small};
+use tessera_models::mla;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::DimName::Picks;
@@ -286,8 +286,8 @@ fn batch_matches_single() {
 #[test]
 fn mla_matches_interpreter() {
     let graphs = [
-        mla::stepper::<mla::Moe>(&small::deepseek()),
-        mla::stepper::<mla::RotatedMoe>(&small::glm53()),
+        mla::stepper::<mla::Moe>(&mla::Config::deepseek_small()),
+        mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
     ];
     let launches = [
         vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0)],
@@ -390,10 +390,10 @@ fn paged_slots_share() {
 #[test]
 fn trim_keeps_picks() {
     let graphs = [
-        stepper::<Norm, Swiglu>(&small::qwen3()),
-        stepper::<(), Moe>(&small::granite()),
-        mla::stepper::<mla::Moe>(&small::deepseek()),
-        mla::stepper::<mla::RotatedMoe>(&small::glm53()),
+        stepper::<Norm, Swiglu>(&Config::qwen3_small()),
+        stepper::<(), Moe>(&Config::granite_small()),
+        mla::stepper::<mla::Moe>(&mla::Config::deepseek_small()),
+        mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
     ];
     let launches = [
         (vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0)], vec![1, 2]),
