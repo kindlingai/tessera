@@ -16,6 +16,16 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
+fn signed_sqrt(x: f32) -> f32 {
+    if x > 0.0 {
+        x.max(1e-6).sqrt()
+    } else if x < 0.0 {
+        -(-x).max(1e-6).sqrt()
+    } else {
+        0.0
+    }
+}
+
 fn act(a: Act, x: f32) -> f32 {
     match a {
         Act::GeluTanh => gelu(x),
@@ -25,6 +35,7 @@ fn act(a: Act, x: f32) -> f32 {
         Act::Softplus => softplus(x),
         Act::Exp => x.exp(),
         Act::Tanh => x.tanh(),
+        Act::SignedSqrt => signed_sqrt(x),
     }
 }
 
@@ -225,7 +236,7 @@ pub(crate) fn attend(
 }
 
 /// Rows before a sequence's first read as zero.
-pub(crate) fn conv(x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
+pub(crate) fn conv(x: &Tensor, w: &Tensor, dilation: usize) -> Result<Tensor, Error> {
     let [seqs, ctx, width] = x.shape[..] else {
         return Err(Error::Mismatch("conv wants rank 3".into()));
     };
@@ -237,15 +248,134 @@ pub(crate) fn conv(x: &Tensor, w: &Tensor) -> Result<Tensor, Error> {
             let at = (s * ctx + t) * width;
             for c in 0..width {
                 let mut sum = 0.0;
-                for j in (taps - 1).saturating_sub(t)..taps {
-                    let back = taps - 1 - j;
-                    sum += ws[c * taps + j] * xs[at - back * width + c];
+                for j in 0..taps {
+                    let back = (taps - 1 - j) * dilation;
+                    if t >= back {
+                        sum += ws[c * taps + j] * xs[at - back * width + c];
+                    }
                 }
                 out[at + c] = sum;
             }
         }
     }
     Ok(Tensor::f32(x.shape.clone(), out))
+}
+
+/// Ragged causal conv updating `[Seqs, (K - 1) * d, C]` state.
+pub(crate) fn conv_rows(
+    args: [&Tensor; 4],
+    dilation: usize,
+    seqs: usize,
+    state: &mut [f32],
+) -> Result<Tensor, Error> {
+    let [x, w, slots, positions] = args;
+    let [rows, width] = x.shape[..] else {
+        return Err(Error::Mismatch("ragged conv wants rank 2".into()));
+    };
+    let taps = w.shape[1];
+    let hist = (taps - 1) * dilation;
+    let (xs, ws) = (x.floats()?, w.floats()?);
+    let (slots, positions) = (slots.indices()?, positions.indices()?);
+    let mut out = vec![0.0; rows * width];
+    let mut prev = vec![usize::MAX; seqs];
+    let mut last = vec![0.0f32; seqs * width];
+    for r in 0..rows {
+        let (s, pos) = (slots[r], positions[r]);
+        if s >= seqs {
+            return Err(Error::Mismatch(format!("slot {s} past {seqs}")));
+        }
+        let dst = &mut out[r * width..(r + 1) * width];
+        if pos == prev[s] {
+            dst.copy_from_slice(&last[s * width..(s + 1) * width]);
+            continue;
+        }
+        let st = &mut state[s * hist * width..(s + 1) * hist * width];
+        if pos == 0 {
+            st.fill(0.0);
+        }
+        let row = &xs[r * width..(r + 1) * width];
+        for c in 0..width {
+            let cur = row[c];
+            let mut sum = cur * ws[c * taps + taps - 1];
+            for j in 0..taps - 1 {
+                sum += st[j * dilation * width + c] * ws[c * taps + j];
+            }
+            for k in 0..hist - 1 {
+                st[k * width + c] = st[(k + 1) * width + c];
+            }
+            st[(hist - 1) * width + c] = cur;
+            dst[c] = sum;
+        }
+        last[s * width..(s + 1) * width].copy_from_slice(dst);
+        prev[s] = pos;
+    }
+    Ok(Tensor::f32(x.shape.clone(), out))
+}
+
+/// Ragged delta rule updating `[Seqs, Heads, KeyDim, ValueDim]` state.
+pub(crate) fn delta_rows(
+    n: &Numerics,
+    d: &Delta,
+    args: [&Tensor; 7],
+    seqs: usize,
+    state: &mut [f32],
+) -> Result<Tensor, Error> {
+    let acc = Acc::new(n.accumulate)?;
+    let [q, k, v, g, beta, slots, positions] = args;
+    let [rows, kv_heads, dk] = q.shape[..] else {
+        return Err(Error::Mismatch("ragged delta wants rank 3".into()));
+    };
+    let (heads, dv) = (v.shape[1], v.shape[2]);
+    let group = heads / kv_heads;
+    let (qs, ks, vs) = (q.floats()?, k.floats()?, v.floats()?);
+    let (gs, rates) = (g.floats()?, beta.floats()?);
+    let (slots, positions) = (slots.indices()?, positions.indices()?);
+    let mut out = vec![0.0; rows * heads * dv];
+    let mut prev = vec![usize::MAX; seqs];
+    let mut last = vec![0.0f32; seqs * heads * dv];
+    let mut query = vec![0.0; dk];
+    let mut col = vec![0.0; dk];
+    for r in 0..rows {
+        let (s, pos) = (slots[r], positions[r]);
+        if s >= seqs {
+            return Err(Error::Mismatch(format!("slot {s} past {seqs}")));
+        }
+        let dst = &mut out[r * heads * dv..(r + 1) * heads * dv];
+        if pos == prev[s] {
+            dst.copy_from_slice(&last[s * heads * dv..(s + 1) * heads * dv]);
+            continue;
+        }
+        let st = &mut state[s * heads * dk * dv..(s + 1) * heads * dk * dv];
+        if pos == 0 {
+            st.fill(0.0);
+        }
+        for h in 0..heads {
+            let row = r * heads + h;
+            let at = (r * kv_heads + h / group) * dk;
+            let key = &ks[at..at + dk];
+            for (qi, &x) in query.iter_mut().zip(&qs[at..at + dk]) {
+                *qi = x * d.scale;
+            }
+            let fade = gs[row].exp();
+            let values = &vs[row * dv..(row + 1) * dv];
+            let head_st = &mut st[h * dk * dv..(h + 1) * dk * dv];
+            let o = &mut dst[h * dv..(h + 1) * dv];
+            for j in 0..dv {
+                for i in 0..dk {
+                    col[i] = head_st[i * dv + j] * fade;
+                }
+                let change = (values[j] - acc.dot(&col, key)) * rates[row];
+                for i in 0..dk {
+                    col[i] += key[i] * change;
+                    head_st[i * dv + j] = col[i];
+                }
+                o[j] = acc.dot(&col, &query);
+            }
+        }
+        last[s * heads * dv..(s + 1) * heads * dv].copy_from_slice(dst);
+        prev[s] = pos;
+    }
+    Ok(Tensor::f32(vec![rows, heads, dv], out))
 }
 
 /// Holds each value head's state as key columns.

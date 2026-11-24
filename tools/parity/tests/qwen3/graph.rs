@@ -8,7 +8,7 @@ use tessera_graph::{Graph, PathSeg};
 use tessera_interp::Tensor;
 use tessera_parity::launches;
 
-/// `small::qwen3()`'s sizes in `config.json` keys.
+/// `decoder::Config::qwen3_small()`'s sizes in `config.json` keys.
 pub const SMALL: &str = r#"{"vocab_size": 64, "hidden_size": 64, "num_hidden_layers": 2,
     "num_attention_heads": 2, "head_dim": 32, "intermediate_size": 128,
     "num_key_value_heads": 1, "rope_theta": 10000.0, "rms_norm_eps": 1e-6}"#;

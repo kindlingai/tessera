@@ -15,7 +15,7 @@ use tessera_trace::{Graph, Linear};
 
 /// Two small layers, one sliding and one full.
 fn small() -> Graph {
-    program::<Linear>(&tessera_models::small::eg2())
+    program::<Linear>(&tessera_models::eg2::small())
 }
 
 fn release() -> Graph {

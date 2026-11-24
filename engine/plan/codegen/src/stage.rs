@@ -15,10 +15,11 @@ pub enum Row {
     Softplus,
     Exp,
     Tanh,
+    SignedSqrt,
 }
 
 impl Row {
-    const ALL: [Row; 10] = [
+    const ALL: [Row; 11] = [
         Row::Add,
         Row::Mul,
         Row::Scale,
@@ -29,6 +30,7 @@ impl Row {
         Row::Softplus,
         Row::Exp,
         Row::Tanh,
+        Row::SignedSqrt,
     ];
 
     pub fn code(self) -> u32 {
@@ -94,5 +96,14 @@ pub fn apply(stage: Row, out: &mut [f32], b: &[f32], s: f32) {
         Row::Softplus => each(out, |v| v.max(0.0) + (-v.abs()).exp().ln_1p()),
         Row::Exp => each(out, f32::exp),
         Row::Tanh => each(out, tanh),
+        Row::SignedSqrt => each(out, |v| {
+            if v > 0.0 {
+                v.max(1e-6).sqrt()
+            } else if v < 0.0 {
+                -(-v).max(1e-6).sqrt()
+            } else {
+                0.0
+            }
+        }),
     }
 }

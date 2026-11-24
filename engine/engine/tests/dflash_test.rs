@@ -18,7 +18,7 @@ use tessera_interp::{Store, Tensor, run, run_kept, run_ranks};
 use tessera_lower::{Cache, Cluster, Device, Pick, Settings, Wants, Weight};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::dflash::{self, TargetSpec};
-use tessera_models::{mla, small};
+use tessera_models::mla;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
@@ -54,7 +54,7 @@ fn open_drafter(
 fn tapped_step_matches() {
     let mut dec_cfg = Config::toy(1, 16);
     dec_cfg.stack.taps = vec![1, 2];
-    let mut mla_cfg = small::deepseek();
+    let mut mla_cfg = mla::Config::deepseek_small();
     mla_cfg.stack.vocab = 600;
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 16;
@@ -203,7 +203,7 @@ fn verify_pair(
 
 #[test]
 fn dflash_accepts_and_mla() {
-    let mut mla_cfg = small::deepseek();
+    let mut mla_cfg = mla::Config::deepseek_small();
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 24;
     let spec = TargetSpec {
@@ -236,7 +236,7 @@ fn dflash_accepts_and_mla() {
 
 #[test]
 fn dflash2_selector() {
-    let mut mla_cfg = small::deepseek();
+    let mut mla_cfg = mla::Config::deepseek_small();
     mla_cfg.stack.vocab = 600;
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 24;

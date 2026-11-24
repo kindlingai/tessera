@@ -11,10 +11,8 @@ use tessera_engine_comm::{ShmLink, Transport};
 use tessera_frontend_comm::{CAPACITY, join, meet, resident, shared, shm};
 use tessera_graph::Graph;
 use tessera_lower::{Recipe, Settings, Weight};
-use tessera_models::decoder::{Swiglu, stepper};
 use tessera_models::mla::{self, RotatedMoe};
 use tessera_testkit::{Noise, weights};
-use tessera_trace::Norm;
 
 type Outcome = Result<(), Box<dyn Error>>;
 /// Each launch's ids, and seconds per launch.
@@ -28,16 +26,16 @@ const STEPS: u32 = 32;
 
 /// The small `model`. GLM keys span `CONTEXT`, experts split.
 fn graph(model: &str) -> Result<Graph, Box<dyn Error>> {
-    match model {
-        "qwen3" => Ok(stepper::<Norm, Swiglu>(&tessera_models::small::qwen3())),
-        "glm53" => {
-            let mut c = tessera_models::small::glm53();
-            c.stack.ffn = 256;
-            c.stack.max_context = CONTEXT as u64;
-            Ok(mla::stepper::<RotatedMoe>(&c))
-        }
-        _ => Err(format!("--recipe runs qwen3 or glm53, not {model}").into()),
+    if model == "glm53" {
+        let mut c = mla::Config::glm53_small();
+        c.stack.ffn = 256;
+        c.stack.max_context = CONTEXT as u64;
+        return Ok(mla::stepper::<RotatedMoe>(&c));
     }
+    let small = tessera_models::preset::named(model)?.small;
+    Ok(small
+        .ok_or_else(|| format!("`{model}` has no small graph"))?(
+    ))
 }
 
 /// The recipe's choices, with its module's rules.

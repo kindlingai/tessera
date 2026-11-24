@@ -7,7 +7,7 @@ use tessera_parity::step_ranks;
 /// Two heads split over two ranks, not four.
 #[test]
 fn step_over_ranks() {
-    let g = stepper::<RotatedMoe>(&tessera_models::small::glm53());
+    let g = stepper::<RotatedMoe>(&tessera_models::mla::Config::glm53_small());
     for (ranks, heads) in [(2, true), (4, false)] {
         let sharded = step_ranks(&g, &Parts::even(ranks));
         let weights = &sharded.graph.weights;

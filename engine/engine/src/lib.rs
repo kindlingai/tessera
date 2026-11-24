@@ -23,6 +23,7 @@ pub mod metrics;
 mod metrics_test;
 mod model;
 mod mtp_draft;
+mod ple;
 mod ranks;
 mod schedule;
 mod spec_len;
@@ -35,6 +36,11 @@ pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
 pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
+pub use ple::{PleConfig, PleStore};
+
+pub const fn ple_heads() -> usize {
+    ple::HEADS
+}
 pub use ranks::Place;
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 pub use spec_len::{CostModel, SpecLen};
@@ -133,6 +139,8 @@ pub enum Error {
     Port { entry: usize, role: Role },
     #[error("the graph has no step entry without candidates")]
     Full,
+    #[error("ple store: {0}")]
+    Ple(#[from] std::io::Error),
 }
 
 /// Row width of `entry`'s `role` output, if any.
@@ -152,6 +160,7 @@ fn fillable(role: Role) -> bool {
             | Role::Picks
             | Role::Allowed
             | Role::Candidates
+            | Role::Ple
     )
 }
 
@@ -207,6 +216,8 @@ pub struct Engine {
     held: Option<(u64, tessera_run::Profile)>,
     /// The last profiles rank 0 gathered from all ranks.
     ranks: Option<tessera_run::Ranks>,
+    /// Host n-gram embedding table for models with a PLE port.
+    ple: Option<PleStore>,
 }
 
 /// Inputs a launch feeds before its picks.
@@ -353,6 +364,26 @@ impl Engine {
             profile: settings.profile.map(|every| [every, 0]),
             held: None,
             ranks: None,
+            ple: None,
+        })
+    }
+
+    /// Attaches a host PLE store for `Role::Ple` graphs.
+    pub fn set_ple(&mut self, store: PleStore) {
+        self.ple = Some(store);
+    }
+
+    /// Whether the graph has recurrent state.
+    pub fn stateful(&self) -> bool {
+        if self.ple.is_some() {
+            return true;
+        }
+        self.graph.nodes.iter().any(|n| {
+            matches!(
+                n.op,
+                tessera_graph::Op::Conv(tessera_graph::Conv { state: Some(_), .. })
+                    | tessera_graph::Op::Delta(tessera_graph::Delta { state: Some(_), .. })
+            )
         })
     }
 
@@ -661,6 +692,14 @@ impl Engine {
                     sizes.push((Candidates, k as u64));
                     Tensor::u32(vec![wanted, k], ids)
                 }
+                Role::Ple => self
+                    .ple
+                    .as_mut()
+                    .ok_or(Error::Port {
+                        entry,
+                        role: Role::Ple,
+                    })?
+                    .fill(rows, filled)?,
                 role => return Err(Error::Port { entry, role }),
             };
             feeds.push(feed);

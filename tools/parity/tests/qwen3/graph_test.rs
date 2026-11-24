@@ -7,7 +7,7 @@ use tessera_trace::Norm;
 
 #[test]
 fn module_steps() {
-    let want = stepper::<Norm, Swiglu>(&tessera_models::small::qwen3());
+    let want = stepper::<Norm, Swiglu>(&tessera_models::decoder::Config::qwen3_small());
     let got = module().graph(SMALL, 4, Some(16)).unwrap().unwrap();
     let noise = weights(&want, &mut Noise(1));
     for settings in runs() {

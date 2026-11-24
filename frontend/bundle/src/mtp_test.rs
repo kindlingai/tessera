@@ -119,12 +119,12 @@ fn check_head_mxfp8() {
         .iter()
         .position(|w| w.path == head_path)
         .unwrap() as u32;
-    let mw = MtpWeights {
+    let mw = crate::Weights::Streamed(Box::new(MtpWeights {
         graph: g_wide,
         offer: Box::new(wide_bf16),
         rules: r,
         pins: wide_pins,
-    };
+    }));
     let mut got_head = None;
     mw.each_share(
         |at| (at == head_at).then_some((0, 0, 32)),

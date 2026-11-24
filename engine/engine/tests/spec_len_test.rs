@@ -11,7 +11,7 @@ use tessera_graph::Parts;
 use tessera_interp::Tensor;
 use tessera_lower::{Cluster, Pick, Settings, Weight};
 use tessera_models::dflash::{self, TargetSpec};
-use tessera_models::{mla, mtp, small};
+use tessera_models::{mla, mtp};
 use tessera_testkit::{Noise, weights};
 
 fn zero_last(w: &mut [Tensor]) {
@@ -95,7 +95,7 @@ fn dual_selector_switching() {
 }
 
 fn toy_dual_cfgs(seqs: u64, ctx: u64) -> (mla::Config, dflash::Config) {
-    let mut t_cfg = small::deepseek();
+    let mut t_cfg = mla::Config::deepseek_small();
     t_cfg.stack.max_seqs = seqs;
     t_cfg.stack.max_context = ctx;
     let spec = TargetSpec {

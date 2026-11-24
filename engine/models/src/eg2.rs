@@ -300,6 +300,24 @@ fn staged<D: Dense>(c: &Config, stage: Stage<D>) -> Graph {
 
 type Stage<D> = fn(&Model, &Config, &Eg2<D>, &[Attention<D>], [&Tensor; 2]) -> Tensor;
 
+/// One sliding layer and one full.
+pub fn small() -> Config {
+    Config {
+        stack: Stack::small(256, 128, 256),
+        kv_heads: 1,
+        full_every: 2,
+        full_head_dim: 256,
+        per_layer: 128,
+        embedding: 128,
+        window: 4,
+        theta: 1e4,
+        full_theta: 1e6,
+        eps: 1e-6,
+    }
+}
+
+crate::preset::preset!("eg2", small: || program::<tessera_trace::Linear>(&small()));
+
 /// One forward entry: tokens and positions in, embeddings out.
 pub fn program<D: Dense>(c: &Config) -> Graph {
     staged(c, forward::<D>)

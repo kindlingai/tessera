@@ -266,6 +266,11 @@ impl Stack {
         }
     }
 
+    /// Two layers of two heads over a vocabulary of 64.
+    pub fn small(hidden: u64, head_dim: u64, ffn: u64) -> Self {
+        Self::sized([64, hidden, 2, 2, head_dim, ffn], 4, 16)
+    }
+
     /// These dimensions, followed by the model's `own`.
     pub(crate) fn dims(&self, own: &[(DimName, u64)]) -> Vec<Dim> {
         let bounded = Dim::bounded;

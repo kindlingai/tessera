@@ -450,7 +450,11 @@ f_fn float f_e4m3(u32 w, u32 l) {{
         }}
         else if (code == 4u) {{ v = v / (1.0f + exp(-v)); }}
         else if (code == 5u) {{ v = 1.0f / (1.0f + exp(-v)); }}
-        else {{ v = fmax(v, 0.0f); }}
+        else if (code == 6u) {{ v = fmax(v, 0.0f); }}
+        else if (code == 7u) {{ float m = fmax(v, -v); v = fmax(v, 0.0f) + log(1.0f + exp(-m)); }}
+        else if (code == 8u) {{ v = exp(v); }}
+        else if (code == 9u) {{ v = tanh(fmin(fmax(v, -8.0f), 8.0f)); }}
+        else {{ float a = fmax(fmax(v, -v), 1.0e-6f); v = (v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f)) * sqrt(a); }}
         o[i] = v;
     }}
 }}

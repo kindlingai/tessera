@@ -4,7 +4,7 @@ use super::{Entry, Flag, Load, Pick};
 use crate::start::Options;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
-use tessera_engine::{Batch, Fair, Pins, Recipe, Settings, Steps};
+use tessera_engine::{Batch, Fair, Pins, PleStore, Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
 use tessera_tasks::{Generate, Job, Queued};
 
@@ -88,6 +88,10 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let at = (&recipe, &settings);
     let count = loaded.graph.weights.len() as u32;
     let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
+    if let Some(ple) = loaded.ple {
+        let store = PleStore::open(ple).map_err(|e| format!("ple store: {e}"))?;
+        engine.set_ple(store);
+    }
     let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
     let shares = |at: u32| shares[at as usize];
     let loading = (loaded.weights).each_share(shares, |at, w| engine.load_weight(at, w));

@@ -2,7 +2,12 @@
 
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
-use tessera_lower::{Draft, Extent, Kernel, T, Term, Tree};
+use tessera_lower::{
+    Arg, Draft, Extent, GUESS, Kernel, Launch, Read, Shape, Step, T, Term, Tree, source,
+};
+
+/// Largest history depth held in thread registers.
+const MAX_HIST: usize = 16;
 
 /// One thread per element: its channel's last `taps` rows.
 #[kernel]
@@ -14,6 +19,7 @@ fn causal_conv(
     rows: u32,
     width: u32,
     taps: u32,
+    dilation: u32,
 ) {
     if gid() >= len {
         return;
@@ -22,13 +28,87 @@ fn causal_conv(
     let t = gid() / width % rows;
     let mut sum = 0.0f32;
     for j in 0..taps {
-        // Rows before the sequence's first read as zero.
-        if t + j + 1 >= taps {
-            let back = taps - 1 - j;
+        let back = (taps - 1 - j) * dilation;
+        if t >= back {
             sum += w[(c * taps + j) as u64] * x[(gid() - back * width) as u64];
         }
     }
     out[gid() as u64] = sum;
+}
+
+/// One thread per `(slot, channel)`: updates kept history per row.
+#[kernel]
+fn causal_conv_rows(
+    x: Buf<F32>,
+    w: Buf<F32>,
+    slots: Buf<U32>,
+    positions: Buf<U32>,
+    mut state: BufMut<F32>,
+    mut out: BufMut<F32>,
+    jobs: u32,
+    rows: u32,
+    #[build] width: u32,
+    #[build] taps: u32,
+    #[build] dilation: u32,
+) {
+    if gid() >= jobs {
+        return;
+    }
+    let s = gid() / width;
+    let c = gid() % width;
+    let hist_len = (taps - 1) * dilation;
+    let mut hist = [0.0f32; 16];
+    let mut taps_w = [0.0f32; 16];
+    let mut loaded = 0u32;
+    let mut prev = 0xffff_ffffu32;
+    let mut last = 0.0f32;
+    let base = (s * hist_len) as u64 * width as u64 + c as u64;
+    for r in 0..rows {
+        if slots[r as u64] == s {
+            let pos = positions[r as u64];
+            if loaded == 0 {
+                loaded = 1;
+                for j in 0..taps {
+                    taps_w[j as usize] = w[(c * taps + j) as u64];
+                }
+                if pos == 0 {
+                    for k in 0..hist_len {
+                        hist[k as usize] = 0.0;
+                    }
+                } else {
+                    for k in 0..hist_len {
+                        hist[k as usize] = state[base + (k * width) as u64];
+                    }
+                }
+            } else if pos == 0 && prev != 0 {
+                for k in 0..hist_len {
+                    hist[k as usize] = 0.0;
+                }
+            }
+            let at = (r * width + c) as u64;
+            if pos == prev {
+                out[at] = last;
+            } else {
+                let cur = x[at];
+                let mut sum = cur * taps_w[(taps - 1) as usize];
+                for j in 0..(taps - 1) {
+                    sum += hist[(j * dilation) as usize] * taps_w[j as usize];
+                }
+                for k in 0..(hist_len - 1) {
+                    hist[k as usize] = hist[(k + 1) as usize];
+                }
+                hist[(hist_len - 1) as usize] = cur;
+                last = sum;
+                prev = pos;
+                out[at] = sum;
+            }
+        }
+    }
+    if loaded != 0 {
+        for k in 0..hist_len {
+            state[base + (k * width) as u64] = hist[k as usize];
+        }
+    }
 }
 
 /// Whole sequences of `rows`, each `width` channels.
@@ -39,12 +119,68 @@ pub(crate) struct Conv {
     rows: Extent,
     width: usize,
     taps: usize,
+    dilation: usize,
+}
+
+/// Ragged rows updating fixed per-slot history.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    crate = tessera_lower,
+    name = "conv_rows",
+    sizes = vec![self.seqs, self.rows.most(), self.width, self.taps, self.dilation],
+    work = self.rows.most() * self.width * self.taps * 2,
+    guess = GUESS,
+    source = source("conv_rows", causal_conv_rows_ir(self.width as u32, self.taps as u32, self.dilation as u32)),
+    launches = rows_launches,
+)]
+pub(crate) struct ConvRows {
+    seqs: usize,
+    rows: Extent,
+    width: usize,
+    taps: usize,
+    dilation: usize,
+}
+
+fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
+    let jobs = k.seqs * k.width;
+    let mut launch = Launch::plain(step, &[jobs], Shape::Line(jobs));
+    launch.args.push(Arg::size(k.rows));
+    vec![launch]
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
-    if node.term != Term::Op(Op::Conv) {
+    let Term::Op(Op::Conv(c)) = node.term else {
         return None;
+    };
+    let dilation = c.dilation as usize;
+    if let Some(idx) = c.state {
+        let [x, w, slots, positions] = node.args[..] else {
+            return None;
+        };
+        let rows = tree.node(x).extents[0];
+        let width = *node.shape.last()?;
+        let taps = tree.node(w).shape[1];
+        let hist = taps.checked_sub(1)? * dilation;
+        if hist == 0 || hist > MAX_HIST || taps > MAX_HIST {
+            return None;
+        }
+        let seqs = *tree.fixed_kept(idx)?.first()?;
+        let conv = ConvRows {
+            seqs,
+            rows,
+            width,
+            taps,
+            dilation,
+        };
+        let reads = [
+            Read::Node(x),
+            Read::Node(w),
+            Read::Node(slots),
+            Read::Node(positions),
+            Read::Kept(idx),
+        ];
+        return Some(vec![Draft::new(conv, reads, rows.most() * width)]);
     }
     let [x, w] = node.args[..] else {
         return None;
@@ -64,6 +200,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         rows,
         width,
         taps,
+        dilation,
     };
     Some(vec![Draft::new(conv, [x, w], len.most())])
 }

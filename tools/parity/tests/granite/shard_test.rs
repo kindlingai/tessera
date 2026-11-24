@@ -108,7 +108,7 @@ fn uneven_step_heads() {
 fn one_expert() -> Config {
     Config {
         top_k: 1,
-        ..tessera_models::small::granite()
+        ..tessera_models::decoder::Config::granite_small()
     }
 }
 

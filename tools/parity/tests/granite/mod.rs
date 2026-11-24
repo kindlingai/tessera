@@ -7,7 +7,7 @@ use tessera_parity::{LOGITS, Spec, Stepper, decoder, suite};
 use tessera_trace::Composite::{Attention, Layer, Model, Moe as Routed};
 use tessera_trace::Graph;
 
-decoder!((), Moe, tessera_models::small::granite(), Config::granite);
+decoder!((), Moe, Config::granite_small(), Config::granite);
 
 const SPEC: Spec = Spec {
     name: "granite",

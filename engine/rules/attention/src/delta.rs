@@ -1,7 +1,7 @@
 //! The gated delta rule: one thread per value column.
 
 use tessera_codegen::prelude::*;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Shape, Step, T, Tree, ZoneKind, sites};
+use tessera_lower::{Arg, Draft, Kernel, Launch, Read, Shape, Step, T, Tree, ZoneKind, sites};
 use tessera_lower::{GUESS, small, source};
 
 /// Keys wider than this do not fit a thread's column.
@@ -59,7 +59,90 @@ fn delta_rule(
     }
 }
 
-/// Whole sequences, on the CPU or a GPU.
+/// Ragged delta rule updating kept per-slot state in place.
+#[kernel]
+fn delta_rule_rows(
+    q: Buf<F32>,
+    k: Buf<F32>,
+    v: Buf<F32>,
+    decay: Buf<F32>,
+    rate: Buf<F32>,
+    slots: Buf<U32>,
+    positions: Buf<U32>,
+    mut state: BufMut<F32>,
+    mut out: BufMut<F32>,
+    scale: f32,
+    jobs: u32,
+    rows: u32,
+    #[build] heads: u32,
+    #[build] kv_heads: u32,
+    #[build] key_width: u32,
+    #[build] width: u32,
+) {
+    if gid() >= jobs {
+        return;
+    }
+    let j = gid() % width;
+    let sh = gid() / width;
+    let s = sh / heads;
+    let h = sh % heads;
+    let kh = h / (heads / kv_heads);
+    let mut col = [0.0f32; 128];
+    let mut loaded = 0u32;
+    let mut prev = 0xffff_ffffu32;
+    let mut last = 0.0f32;
+    let base = (sh * key_width) as u64 * width as u64 + j as u64;
+    for r in 0..rows {
+        if slots[r as u64] == s {
+            let pos = positions[r as u64];
+            if loaded == 0 {
+                loaded = 1;
+                if pos == 0 {
+                    for i in 0..key_width {
+                        col[i as usize] = 0.0;
+                    }
+                } else {
+                    for i in 0..key_width {
+                        col[i as usize] = state[base + (i * width) as u64];
+                    }
+                }
+            } else if pos == 0 && prev != 0 {
+                for i in 0..key_width {
+                    col[i as usize] = 0.0;
+                }
+            }
+            let row = r * heads + h;
+            let o = row as u64 * width as u64 + j as u64;
+            if pos == prev {
+                out[o] = last;
+            } else {
+                let at = (r * kv_heads + kh) as u64 * key_width as u64;
+                let fade = exp(decay[row as u64]);
+                let mut seen = 0.0f32;
+                for i in 0..key_width {
+                    col[i as usize] = col[i as usize] * fade;
+                    seen += col[i as usize] * k[at + i as u64];
+                }
+                let change = (v[o] - seen) * rate[row as u64];
+                let mut read = 0.0f32;
+                for i in 0..key_width {
+                    col[i as usize] += k[at + i as u64] * change;
+                    read += col[i as usize] * q[at + i as u64];
+                }
+                last = read * scale;
+                prev = pos;
+                out[o] = last;
+            }
+        }
+    }
+    if loaded != 0 {
+        for i in 0..key_width {
+            state[base + (i * width) as u64] = col[i as usize];
+        }
+    }
+}
+
+/// Whole or ragged sequences, on the CPU or a GPU.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     crate = tessera_lower,
@@ -78,9 +161,11 @@ pub(crate) struct Delta {
 
 impl Delta {
     fn name(&self) -> &'static str {
-        match self.zone {
-            ZoneKind::Cpu => "cpu_delta",
-            _ => "delta",
+        match (self.zone, self.site.state.is_some()) {
+            (ZoneKind::Cpu, true) => "cpu_delta_rows",
+            (ZoneKind::Cpu, false) => "cpu_delta",
+            (_, true) => "delta_rows",
+            (_, false) => "delta",
         }
     }
 
@@ -92,7 +177,10 @@ impl Delta {
         let d = &self.site;
         let [heads, kv_heads] = [d.heads, d.kv_heads].map(|n| n as u32);
         let [key_width, width] = [d.key_width, d.width].map(|n| n as u32);
-        delta_rule_ir(heads, kv_heads, key_width, width)
+        match d.state {
+            Some(_) => delta_rule_rows_ir(heads, kv_heads, key_width, width),
+            None => delta_rule_ir(heads, kv_heads, key_width, width),
+        }
     }
 }
 
@@ -120,7 +208,11 @@ fn propose(zone: ZoneKind, tree: &Tree, at: T) -> Option<Vec<Draft>> {
         return None;
     }
     let len = site.out();
-    Some(vec![Draft::new(Delta { site, zone }, site.reads, len)])
+    let mut reads: Vec<Read> = site.reads.into_iter().map(Read::Node).collect();
+    if let Some((idx, [slots, positions])) = site.state {
+        reads.extend([Read::Node(slots), Read::Node(positions), Read::Kept(idx)]);
+    }
+    Some(vec![Draft::new(Delta { site, zone }, reads, len)])
 }
 
 fn on_cpu(tree: &Tree, at: T) -> Option<Vec<Draft>> {

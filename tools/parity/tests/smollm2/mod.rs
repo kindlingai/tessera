@@ -5,12 +5,7 @@ use tessera_parity::{LOGITS, Spec, Stepper, decoder, suite};
 use tessera_trace::Composite::{Attention, Layer, Mlp, Model};
 use tessera_trace::Graph;
 
-decoder!(
-    (),
-    Swiglu,
-    tessera_models::small::smollm2(),
-    Config::smollm2
-);
+decoder!((), Swiglu, Config::smollm2_small(), Config::smollm2);
 
 const SPEC: Spec = Spec {
     name: "smollm2",
