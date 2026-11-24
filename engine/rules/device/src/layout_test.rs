@@ -1,6 +1,7 @@
 use crate::abi::{self, Body, Layout};
 use crate::layout::*;
-use crate::{HEADERS, Header};
+use crate::p2p::{CROSSOVER, SLOT_BYTES, Schedule, ack_offset, area_bytes, pick};
+use crate::{Backend, HEADERS, Header, Options, flatten};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -95,4 +96,38 @@ fn form_kinds_hold() {
         }
     }
     assert_eq!(form_kind("trellis_k4_rot"), form_kind("trellis_k4"));
+}
+
+#[test]
+fn p2p_kernel_flattens() {
+    let source = include_str!("p2p/p2p.kernel");
+    for backend in [Backend::Cuda, Backend::Rocm] {
+        let options = Options {
+            backend,
+            remote_kv: false,
+            marks: false,
+        };
+        let flat = flatten("p2p.kernel", source, &|_| None, &options).unwrap();
+        assert!(flat.text.contains("tessera_p2p_sum"));
+        assert!(flat.text.contains("reduce_write"));
+        assert!(flat.text.contains("add_slice"));
+    }
+}
+
+#[test]
+fn p2p_layout_and_schedule() {
+    assert_eq!(ack_offset(4), 8 * SLOT_BYTES);
+    assert_eq!(area_bytes(4), 8 * SLOT_BYTES + 4096);
+    assert_eq!(pick(12 << 10, 4, Schedule::Auto), (0, 1));
+    assert_eq!(pick(CROSSOVER, 4, Schedule::Auto), (2, 4));
+    assert_eq!(pick(CROSSOVER, 8, Schedule::Auto), (2, 4));
+    assert_eq!(pick(CROSSOVER, 3, Schedule::Auto), (1, 4));
+    assert_eq!(pick(CROSSOVER, 6, Schedule::Auto), (1, 4));
+    assert_eq!(pick(CROSSOVER, 2, Schedule::Auto), (0, 4));
+    assert_eq!(pick(1 << 20, 4, Schedule::Fanout), (0, 4));
+    assert_eq!(pick(1024, 4, Schedule::Rounds), (1, 1));
+    assert_eq!(pick(1024, 4, Schedule::Butterfly), (2, 1));
+    assert_eq!(pick(1024, 8, Schedule::Butterfly), (2, 1));
+    assert_eq!(pick(1024, 3, Schedule::Butterfly), (1, 1));
+    assert_eq!(pick(1024, 2, Schedule::Butterfly), (0, 1));
 }

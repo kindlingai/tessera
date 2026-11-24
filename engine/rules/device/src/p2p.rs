@@ -33,13 +33,15 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// Schedule choice for P2P transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Schedule {
-    /// Fan-out below `CROSSOVER`, pairwise rounds from `CROSSOVER` up.
+    /// Fan-out below `CROSSOVER`, butterfly or rounds from `CROSSOVER` up.
     #[default]
     Auto,
     /// Every rank writes all peers at once.
     Fanout,
     /// One peer per round: XOR for power-of-two ranks, shift otherwise.
     Rounds,
+    /// Recursive doubling for power-of-two ranks, rounds otherwise.
+    Butterfly,
 }
 
 /// Bytes in one rank's IPC area.
@@ -55,6 +57,7 @@ pub(crate) const fn ack_offset(ranks: u32) -> usize {
 /// Picks `(sched_code, grid_blocks)` for `bytes` across `ranks`.
 pub(crate) const fn pick(bytes: usize, ranks: u32, schedule: Schedule) -> (u32, u32) {
     let large = bytes >= CROSSOVER;
+    let pow2 = ranks.is_power_of_two();
     let sched = match schedule {
         Schedule::Fanout => 0,
         Schedule::Rounds => {
@@ -64,8 +67,19 @@ pub(crate) const fn pick(bytes: usize, ranks: u32, schedule: Schedule) -> (u32, 
                 0
             }
         }
+        Schedule::Butterfly => {
+            if ranks >= 4 && pow2 {
+                2
+            } else if ranks > 2 {
+                1
+            } else {
+                0
+            }
+        }
         Schedule::Auto => {
-            if large && ranks > 2 {
+            if large && ranks >= 4 && pow2 {
+                2
+            } else if large && ranks > 2 {
                 1
             } else {
                 0
