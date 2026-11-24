@@ -66,6 +66,12 @@ file_type_exceptions = [
 The golden tests compare tessera with a reference from Hugging Face Transformers. \
 The reference must come from an implementation outside tessera, and Transformers is Python. \
 So this writer cannot be Rust.""" },
+    { path = "Dockerfile", reason = """\
+The container image for serving tesserax on Kubernetes. \
+Docker reads only this file format, so it cannot be Rust.""" },
+    { path = ".dockerignore", reason = """\
+Keeps target/, .git and worktrees out of the Docker build context. \
+Docker reads only this file format.""" },
 ]
 
 # Rules that report in the findings and do not fail the run.
