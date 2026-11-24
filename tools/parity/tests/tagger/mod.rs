@@ -6,7 +6,7 @@ use tessera_trace::Graph;
 
 /// Two features of eight rows, one window layer.
 fn small() -> Graph {
-    program(&tessera_models::small::tagger())
+    program(&tessera_models::tagger::small())
 }
 
 fn release() -> Graph {

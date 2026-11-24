@@ -22,6 +22,7 @@ pub mod names;
 mod names_test;
 pub mod parts;
 pub mod qwen35;
+pub mod qwen4_exp;
 pub mod spacy;
 pub mod sprite;
 #[cfg(test)]
@@ -44,7 +45,7 @@ use tessera_engine::decoder::Config;
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
 use tessera_engine::wasm::Module;
-use tessera_engine::{DimName, Graph, Pins, Steps, Tensor, Weight};
+use tessera_engine::{DimName, Graph, Pins, PleConfig, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -127,6 +128,8 @@ pub struct Bundle {
     pub stop: Vec<u32>,
     /// Model `config.json` with recipe overrides applied.
     pub config: Option<String>,
+    /// Host PLE table config, when needed.
+    pub ple: Option<PleConfig>,
 }
 
 /// Config values a recipe sets, by the file they override.
@@ -460,7 +463,13 @@ pub fn load_tapped(
         json: &json,
     };
     let (graph, weights, pins) = step(arch, &ask)?;
-    dressed(dir, graph, weights, pins, Some(json))
+    let ple = match arch.name {
+        "qwen4_exp" => qwen4_exp::ple_config(dir, &ask)?,
+        _ => None,
+    };
+    let mut bundle = dressed(dir, graph, weights, pins, Some(json))?;
+    bundle.ple = ple;
+    Ok(bundle)
 }
 
 /// `graph`'s weights held from `ask`'s folder, `rules` first.
@@ -557,5 +566,6 @@ fn dressed(
         template,
         stop,
         config,
+        ple: None,
     })
 }

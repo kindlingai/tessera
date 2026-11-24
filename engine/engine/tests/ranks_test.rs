@@ -6,7 +6,7 @@ use tessera_engine::{Batch, Engine, Event, Fair, Place, Request, Row};
 use tessera_graph::{Graph, Parts};
 use tessera_lower::{Cluster, Pick, Recipe, Settings, Weight, kept};
 use tessera_models::decoder::{Config, Swiglu, stepper};
-use tessera_models::{mla, small};
+use tessera_models::mla;
 use tessera_run::Profile;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
@@ -93,15 +93,18 @@ fn agree(graph: fn() -> Graph, moe_tp: bool) {
 }
 
 fn wide_glm53() -> Graph {
-    let mut c = small::glm53();
+    let mut c = mla::Config::glm53_small();
     c.stack.ffn = 512;
     mla::stepper::<mla::RotatedMoe>(&c)
 }
 
 #[test]
 fn ranks_match_one() {
-    agree(|| stepper::<Norm, Swiglu>(&small::qwen3()), false);
-    agree(|| mla::stepper::<mla::RotatedMoe>(&small::glm53()), false);
+    agree(|| stepper::<Norm, Swiglu>(&Config::qwen3_small()), false);
+    agree(
+        || mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+        false,
+    );
     agree(wide_glm53, true);
 }
 

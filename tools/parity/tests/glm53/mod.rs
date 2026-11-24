@@ -11,7 +11,7 @@ use tessera_trace::Composite::{Attention, Layer, Mlp, Model, Moe};
 use tessera_trace::Graph;
 
 fn small() -> Graph {
-    program::<RotatedMoe>(&tessera_models::small::glm53())
+    program::<RotatedMoe>(&Config::glm53_small())
 }
 
 pub fn release() -> Graph {
@@ -19,7 +19,7 @@ pub fn release() -> Graph {
 }
 
 const STEPPER: Stepper = Stepper {
-    small: || stepper::<RotatedMoe>(&tessera_models::small::glm53()),
+    small: || stepper::<RotatedMoe>(&Config::glm53_small()),
     release: || stepper::<RotatedMoe>(&Config::glm53(1, 1024)),
     drift: tessera_parity::MLA_DRIFT,
 };

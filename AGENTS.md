@@ -4,19 +4,15 @@ Agents may not touch any file named `README.md`. They may, however, call scripts
 that rewrite `README.md` as part of their required functionality to pass CI
 checks.
 
+## Docs
+
 No design docs, plans or history in the repo, outside an explicit changelog.
-
-No `Co-Authored-By` lines that credit an AI tool or bot, in commits or PR
-bodies. CI and the commit-msg hook refuse them.
-
-Pull request titles must follow Conventional Commits (`feat:`, `fix:`, `perf:`,
-`docs:`, `ci:`, `refactor:`, `test:`, `chore:`, with optional scope such as
-`feat(serve):`). `release-please` derives version bumps and `CHANGELOG.md` from
-squash-merged titles on `main`.
 
 No mannered prose in comments, error messages or text. Avoid flamboyant speech
 and prefer ASD-STE100 where possible. No historical commentary. Comments are
 intentionally limited - code should be clearly written.
+
+## Code
 
 Excessive code duplication is strictly checked. Use macros if duplicate
 detectors fire. Never change lint rules or add exceptions without a project
@@ -36,7 +32,21 @@ or "too small to be worth it". The project lives on improvements as small as 0.5
 and human must always judge whether to drop an experiment that has a likelihood
 of success.
 
-## Process Self-Improvement
+## Pull Requests
+
+Pull request titles must follow Conventional Commits (`feat:`, `fix:`, `perf:`,
+`docs:`, `ci:`, `refactor:`, `test:`, `chore:`, with optional scope such as
+`feat(serve):`). `release-please` derives version bumps and `CHANGELOG.md` from
+squash-merged titles on `main`.
+
+No `Co-Authored-By` lines that credit an AI tool or bot, in commits or PR
+bodies. CI and the commit-msg hook reject those lines.
+
+https://huggingface.co/datasets/kindlingai/tessera-references contains the
+golden references for a number of models. Use these to validate PRs against
+golden runs when you work near code that may break them.
+
+### Process Self-Improvement
 
 If your PR was stuck for a long time on a process or code failure that was
 preventable in an automated way, mention this in your PRs for self-improvement,

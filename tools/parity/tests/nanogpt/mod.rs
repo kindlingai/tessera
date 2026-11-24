@@ -10,7 +10,7 @@ use tessera_trace::Composite::{Attention, Mlp};
 use tessera_trace::Graph;
 
 pub fn config() -> Config {
-    tessera_models::small::nanogpt()
+    tessera_models::nanogpt::small()
 }
 
 pub fn release() -> Graph {

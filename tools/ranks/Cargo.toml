@@ -32,4 +32,3 @@ tessera-models = { workspace = true }
 tessera-recipe = { workspace = true }
 tessera-run = { workspace = true }
 tessera-testkit = { workspace = true }
-tessera-trace = { workspace = true }

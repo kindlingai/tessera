@@ -224,7 +224,11 @@ impl<'a> Batch<'a> {
         let request = &self.waiting.front()?.0;
         // A read feeds its first read row at least.
         let fed = request.reads.first().map(|r| r.row as usize);
-        let limit = fed.unwrap_or(request.tokens.len() - 1);
+        let limit = if self.engine.stateful() {
+            0
+        } else {
+            fed.unwrap_or(request.tokens.len() - 1)
+        };
         match &mut self.kept {
             Some(kept) => kept.admit(&request.tokens, limit),
             None => Some((self.free.pop()?, 0)),

@@ -300,22 +300,25 @@ static __device__ __forceinline__ void fg_stage_chunk(u32 x_h[512], const float*
     prim::block_sync();
 }
 
+static __device__ __forceinline__ float fg_dot8_step(float acc, const float* x, const u16* wr,
+                                                     u32 i) {
+    uint4 h = fg_ld_nc4(wr + i);
+    float4 x0 = *reinterpret_cast<const float4*>(x + i);
+    float4 x1 = *reinterpret_cast<const float4*>(x + i + 4u);
+    acc = fmaf(__uint_as_float(h.x << 16), x0.x,
+               fmaf(__uint_as_float(h.x & 0xFFFF0000u), x0.y,
+                    fmaf(__uint_as_float(h.y << 16), x0.z,
+                         fmaf(__uint_as_float(h.y & 0xFFFF0000u), x0.w, acc))));
+    return fmaf(__uint_as_float(h.z << 16), x1.x,
+                fmaf(__uint_as_float(h.z & 0xFFFF0000u), x1.y,
+                     fmaf(__uint_as_float(h.w << 16), x1.z,
+                          fmaf(__uint_as_float(h.w & 0xFFFF0000u), x1.w, acc))));
+}
+
 static __device__ __forceinline__ float fg_dot8_bf16(const float* x, const u16* wr, u32 k,
                                                      u32 lane) {
     float acc = 0.0f;
-    for (u32 i = lane << 3; i < k; i += 256u) {
-        uint4 h = fg_ld_nc4(wr + i);
-        float4 x0 = *reinterpret_cast<const float4*>(x + i);
-        float4 x1 = *reinterpret_cast<const float4*>(x + i + 4u);
-        acc = fmaf(__uint_as_float(h.x << 16), x0.x,
-                   fmaf(__uint_as_float(h.x & 0xFFFF0000u), x0.y,
-                        fmaf(__uint_as_float(h.y << 16), x0.z,
-                             fmaf(__uint_as_float(h.y & 0xFFFF0000u), x0.w, acc))));
-        acc = fmaf(__uint_as_float(h.z << 16), x1.x,
-                   fmaf(__uint_as_float(h.z & 0xFFFF0000u), x1.y,
-                        fmaf(__uint_as_float(h.w << 16), x1.z,
-                             fmaf(__uint_as_float(h.w & 0xFFFF0000u), x1.w, acc))));
-    }
+    for (u32 i = lane << 3; i < k; i += 256u) acc = fg_dot8_step(acc, x, wr, i);
     return fg_warp_sum(acc);
 }
 
@@ -642,6 +645,12 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16(
     fg_mxfp8_mm<2u>(x, w, other, out, m, n, k, mode, sm);
 }
 
+static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, float b) {
+    if (mode == 1u) return fg_silu(s * a);
+    if (mode == 2u) return (1.0f / (1.0f + expf(-(s * a)))) * b;
+    return s;
+}
+
 // Streaming MXFP8 Tensor-Core matmul, up to 32 rows per block.
 extern "C" __global__ __launch_bounds__(128, 2) void tessera_mm_mxfp8_r32(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
@@ -651,12 +660,31 @@ extern "C" __global__ __launch_bounds__(128, 2) void tessera_mm_mxfp8_r32(
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
 extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16(
-    const float* x, const u16* w, float* out, u32 n, u32 k) {
+    const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
     u32 row = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
     if (row >= n) return;
     u32 lane = threadIdx.x & 31u;
     float s = fg_dot8_bf16(x, w + u64(row) * k, k, lane);
-    if (lane == 0u) out[row] = s;
+    if (lane == 0u) out[row] = fg_gemv_act(s, mode, a, b);
+}
+
+// Streaming 8-BF16 narrow decode GEMV, one block per output row.
+extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16_narrow(
+    const float* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
+    __shared__ float part[TM_WARPS];
+    u32 row = blockIdx.x;
+    if (row >= n) return;
+    u32 tid = threadIdx.x;
+    const u16* wr = w + u64(row) * k;
+    float acc = 0.0f;
+    for (u32 i = tid << 3; i < k; i += 2048u) acc = fg_dot8_step(acc, x, wr, i);
+    float ws = fg_warp_sum(acc);
+    if ((tid & 31u) == 0u) part[tid >> 5] = ws;
+    prim::block_sync();
+    if (tid == 0u) {
+        float s = part[0] + part[1] + part[2] + part[3] + part[4] + part[5] + part[6] + part[7];
+        out[row] = fg_gemv_act(s, mode, a, b);
+    }
 }
 
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.

@@ -32,7 +32,7 @@ mod text_test;
 
 use std::process::ExitCode;
 
-/// The limits in the repository's lint.toml, compiled in.
+/// The limits in lint.toml at the repository root.
 #[derive(serde::Deserialize)]
 pub struct Limits {
     pub max_comment_words: usize,
@@ -65,10 +65,16 @@ pub struct Limits {
     pub timing_exempt: Vec<String>,
     #[serde(default)]
     pub allowed_type_copies: Vec<Vec<String>>,
+    pub kernel_text: text::Config,
 }
 
+pub static CONFIG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let path = files::repo_root().join("lint.toml");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+});
+
 pub static LIMITS: std::sync::LazyLock<Limits> = std::sync::LazyLock::new(|| {
-    toml::from_str(include_str!("../../../lint.toml")).expect("lint.toml")
+    toml::from_str(&CONFIG).unwrap_or_else(|e| panic!("lint.toml: {e}"))
 });
 
 pub struct Violation {

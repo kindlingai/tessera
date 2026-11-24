@@ -1,0 +1,151 @@
+//! Host-side n-gram embedding table for layer PLE inputs.
+
+use crate::Row;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
+use tessera_graph::Bf16;
+use tessera_mem::Tensor;
+
+/// Number of n-gram heads (8 bigram + 8 trigram).
+pub const HEADS: usize = 16;
+
+/// Configuration for an on-disk PLE table.
+#[derive(Clone, Debug)]
+pub struct PleConfig {
+    pub path: PathBuf,
+    pub eos_token: i32,
+    pub multipliers: [i64; 3],
+    pub offsets: [i64; HEADS],
+    pub vocab_sizes: [i64; HEADS],
+    pub row_dim: usize,
+    pub cache_rows: usize,
+}
+
+impl PleConfig {
+    /// Default cache size: 524,288 rows (~168 MB at 320 B/row).
+    pub const DEFAULT_CACHE_ROWS: usize = 1 << 19;
+
+    pub fn embed_dim(&self) -> usize {
+        self.row_dim * HEADS
+    }
+}
+
+/// Direct-mapped host cache and pread reader for BF16 PLE rows.
+pub struct PleStore {
+    file: File,
+    cfg: PleConfig,
+    row_bytes: usize,
+    tags: Vec<u64>,
+    data: Vec<u16>,
+    mask: usize,
+    scratch: Vec<u8>,
+    ctx: Vec<[i32; 2]>,
+    prev_pos: Vec<u32>,
+    last_row: Vec<Vec<f32>>,
+}
+
+impl PleStore {
+    pub fn open(cfg: PleConfig) -> io::Result<Self> {
+        let file = File::open(&cfg.path)?;
+        let cap = cfg.cache_rows.max(1).next_power_of_two();
+        let row_bytes = cfg.row_dim * 2;
+        Ok(Self {
+            file,
+            row_bytes,
+            tags: vec![u64::MAX; cap],
+            data: vec![0u16; cap * cfg.row_dim],
+            mask: cap - 1,
+            scratch: vec![0u8; row_bytes],
+            ctx: Vec::new(),
+            prev_pos: Vec::new(),
+            last_row: Vec::new(),
+            cfg,
+        })
+    }
+
+    /// Computes global row ids for `tok` and `ctx`.
+    pub fn hash_token(&self, tok: i32, ctx: [i32; 2]) -> [u64; HEADS] {
+        let eos = self.cfg.eos_token;
+        let s0 = i64::from(tok);
+        let (s1, s2) = if ctx[1] == eos {
+            (i64::from(eos), i64::from(eos))
+        } else if ctx[0] == eos {
+            (i64::from(ctx[1]), i64::from(eos))
+        } else {
+            (i64::from(ctx[1]), i64::from(ctx[0]))
+        };
+        let m = &self.cfg.multipliers;
+        let m2 = s0.wrapping_mul(m[0]) ^ s1.wrapping_mul(m[1]);
+        let m3 = m2 ^ s2.wrapping_mul(m[2]);
+        std::array::from_fn(|h| {
+            let mix = if h < 8 { m2 } else { m3 };
+            (mix.rem_euclid(self.cfg.vocab_sizes[h]) + self.cfg.offsets[h]) as u64
+        })
+    }
+
+    fn fetch_bf16(&mut self, row_id: u64, dst: &mut [f32]) -> io::Result<()> {
+        let dim = self.cfg.row_dim;
+        let idx = (row_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & self.mask;
+        let off = idx * dim;
+        if self.tags[idx] != row_id {
+            self.file
+                .read_exact_at(&mut self.scratch, row_id * self.row_bytes as u64)?;
+            let (pairs, _) = self.scratch.as_chunks::<2>();
+            for (d, b) in self.data[off..off + dim].iter_mut().zip(pairs) {
+                *d = u16::from_le_bytes(*b);
+            }
+            self.tags[idx] = row_id;
+        }
+        for (o, &bits) in dst.iter_mut().zip(&self.data[off..off + dim]) {
+            *o = f32::from(Bf16(bits));
+        }
+        Ok(())
+    }
+
+    fn ensure_slot(&mut self, slot: usize) {
+        if slot < self.ctx.len() {
+            return;
+        }
+        let n = slot + 1;
+        let width = self.cfg.embed_dim();
+        self.ctx.resize(n, [self.cfg.eos_token; 2]);
+        self.prev_pos.resize(n, u32::MAX);
+        self.last_row.resize_with(n, || vec![0.0; width]);
+    }
+
+    /// Fills `[filled, embed_dim]` f32 embeddings for `rows`, padding the tail.
+    pub fn fill(&mut self, rows: &[Row], filled: usize) -> io::Result<Tensor> {
+        let width = self.cfg.embed_dim();
+        let dim = self.cfg.row_dim;
+        let mut out = vec![0.0f32; filled * width];
+        let mut row_buf = vec![0.0f32; width];
+        for (r, row) in rows.iter().enumerate() {
+            let s = row.slot as usize;
+            self.ensure_slot(s);
+            let dst = &mut out[r * width..(r + 1) * width];
+            if row.position == self.prev_pos[s] {
+                dst.copy_from_slice(&self.last_row[s]);
+                continue;
+            }
+            if row.position == 0 {
+                self.ctx[s] = [self.cfg.eos_token; 2];
+            }
+            let tok = row.token as i32;
+            let ids = self.hash_token(tok, self.ctx[s]);
+            self.ctx[s] = [self.ctx[s][1], tok];
+            for (h, &id) in ids.iter().enumerate() {
+                self.fetch_bf16(id, &mut row_buf[h * dim..(h + 1) * dim])?;
+            }
+            self.last_row[s].copy_from_slice(&row_buf);
+            self.prev_pos[s] = row.position;
+            dst.copy_from_slice(&row_buf);
+        }
+        let last_off = (rows.len() - 1) * width;
+        for r in rows.len()..filled {
+            out.copy_within(last_off..last_off + width, r * width);
+        }
+        Ok(Tensor::f32(vec![filled, width], out))
+    }
+}

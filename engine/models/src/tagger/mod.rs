@@ -90,6 +90,19 @@ fn rows(x: &Tensor, len: DimExpr, width: u64, ids: &Tensor) -> Tensor {
     x.reshape(vec![Seqs * len, width.into()]).gather(ids)
 }
 
+/// Two features of eight rows, one window layer.
+pub fn small() -> Config {
+    Config {
+        rows: vec![8, 8],
+        width: 32,
+        depth: 1,
+        tags: 32,
+        max_context: 16,
+    }
+}
+
+crate::preset::preset!("tagger", small: || program(&small()));
+
 /// Logits for every padded row, `[Seqs, Context + 2 * PAD, tags]`.
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(vec![

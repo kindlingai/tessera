@@ -44,6 +44,8 @@ max_similarity = 0.97
 # A new file nearer another crate than its own by this
 # much gets a note in the pull request. It does not fail.
 max_lean = 0.03
+# Pairs of files that may be near-copies.
+similar_allow = "tools/simcheck/allow.toml"
 
 # Task maps under maps/. Ids also use max_name_segments.
 max_map_id_chars = 24
@@ -70,6 +72,12 @@ file_type_exceptions = [
 The golden tests compare tessera with a reference from Hugging Face Transformers. \
 The reference must come from an implementation outside tessera, and Transformers is Python. \
 So this writer cannot be Rust.""" },
+    { path = "Dockerfile", reason = """\
+The container image for serving tesserax on Kubernetes. \
+Docker reads only this file format, so it cannot be Rust.""" },
+    { path = ".dockerignore", reason = """\
+Keeps target/, .git and worktrees out of the Docker build context. \
+Docker reads only this file format.""" },
 ]
 
 # Rules that report in the findings and do not fail the run.
@@ -87,6 +95,14 @@ min_repeat_statements = 4
 # A `match` or closure with `min_tokens` tokens and `min_paths` names after
 # `::` fails when its shape, names collapsed, is in `min_places` places.
 repeat_exprs = { min_tokens = 24, min_paths = 2, min_places = 3 }
+
+# Kernel text belongs in the DSL. Strings outside `allow` and test
+# files may not hold `tokens`.
+kernel_text.tokens = ["f_fn", "f_const(", "{{\\n"]
+kernel_text.allow = [
+    "engine/plan/codegen/src/dialect.rs",
+    "engine/plan/codegen/src/intrinsic.rs",
+]
 
 # Test files here may time code. Other test files may not.
 timing_exempt = ["tools/calibrate/"]

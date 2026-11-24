@@ -2,7 +2,7 @@ use crate::ranks::Ranks;
 use std::net::TcpListener;
 use tessera_engine::decoder::{Swiglu, stepper};
 use tessera_engine::{Engine, Norm, Pick, Recipe, Row, Settings, Weight};
-use tessera_models::small;
+use tessera_models::decoder;
 use tessera_testkit::{Noise, weights};
 
 /// A faux-weight engine as `rank` of `peers`, or alone.
@@ -16,7 +16,7 @@ fn engine(place: Option<(u32, &str)>) -> Engine {
         backend: Pick::Host,
         ..Settings::default()
     };
-    let g = stepper::<Norm, Swiglu>(&small::qwen3());
+    let g = stepper::<Norm, Swiglu>(&decoder::Config::qwen3_small());
     let stored = weights(&g, &mut Noise(3)).into_iter().map(Weight::Floats);
     let stored: Vec<Weight> = stored.collect();
     let links = ranks.join(&settings).unwrap();

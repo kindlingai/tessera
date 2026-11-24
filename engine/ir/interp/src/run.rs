@@ -174,6 +174,24 @@ impl Held {
         shape.extend_from_slice(&rows.shape[1..]);
         Ok(Tensor::f32(shape, seen))
     }
+
+    /// Reads and updates a fixed per-slot state tensor.
+    fn state<R>(
+        &mut self,
+        i: usize,
+        shape: Vec<usize>,
+        f: impl FnOnce(&mut [f32]) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        self.kept.resize(self.kept.len().max(i + 1), None);
+        let len: usize = shape.iter().product();
+        let mut buf = match self.kept[i].as_ref() {
+            Some(old) if old.shape == shape => old.floats()?.to_vec(),
+            _ => vec![0.0f32; len],
+        };
+        let out = f(&mut buf)?;
+        self.kept[i] = Some(Tensor::f32(shape, buf));
+        Ok(out)
+    }
 }
 
 /// Runs `entry` with nothing kept from earlier launches.
@@ -378,6 +396,37 @@ fn run_on(
                     let rows = [args[0], args[1], args[2]];
                     store.rank(r).append(*i as usize, rows, seqs, ctx)?
                 }
+                Op::Conv(c) if c.state.is_some() => {
+                    if r > 0 && n.ty.placement == Placement::Replicated {
+                        outs[0].clone()
+                    } else {
+                        let idx = c.state.expect("checked") as usize;
+                        let shape = sizes.shape(&g.kept[idx].shape)?;
+                        let seqs = shape[0];
+                        let a = [args[0], args[1], args[2], args[3]];
+                        store.rank(r).state(idx, shape, |s| {
+                            cpu::conv_rows(a, c.dilation as usize, seqs, s)
+                        })?
+                    }
+                }
+                Op::Delta(d) if d.state.is_some() => {
+                    if r > 0 && n.ty.placement == Placement::Replicated {
+                        outs[0].clone()
+                    } else {
+                        let idx = d.state.expect("checked") as usize;
+                        let mut shape = sizes.shape(&g.kept[idx].shape)?;
+                        if let Placement::Split { axis } = g.kept[idx].placement {
+                            shape[axis as usize] = part(parts, axis, shape[axis as usize], r)?.1;
+                        }
+                        let seqs = shape[0];
+                        let a = [
+                            args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                        ];
+                        store
+                            .rank(r)
+                            .state(idx, shape, |s| cpu::delta_rows(&num, d, a, seqs, s))?
+                    }
+                }
                 Op::Select(Select::TopK { .. }) => {
                     let k = *wants[r].last().expect("verified rank");
                     top_k(args[0], k, first, whole_col)?
@@ -571,7 +620,7 @@ impl Context<'_> {
                 )
             }
             Op::Attend(a) => cpu::attend(num, a, [args[0], args[1], args[2]], args.get(3).copied()),
-            Op::Conv => cpu::conv(args[0], args[1]),
+            Op::Conv(c) => cpu::conv(args[0], args[1], c.dilation as usize),
             Op::Delta(d) => cpu::delta(num, d, [args[0], args[1], args[2], args[3], args[4]]),
             Op::Mask(mask) => masked(*mask, args[0]),
             Op::Row(row) => self.stages(num, &row.0, args),

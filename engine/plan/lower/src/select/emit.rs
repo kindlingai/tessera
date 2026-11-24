@@ -194,39 +194,51 @@ impl Emit {
         result
     }
 
-    /// The kept rows of `index`, made once.
+    /// The kept rows or state of `index`, made once.
     pub(crate) fn kept(&mut self, tree: &Tree, index: u32) -> Result<Val, Error> {
         if let Some(val) = self.kept.get(&index) {
             return Ok(*val);
         }
-        let (t, context) = tree.kept_rows(index).ok_or(Unsupported::KeptRows)?;
-        let node = tree.node(t);
-        let all = &node.shape;
-        let width: usize = all[2..].iter().product();
-        let room = tree.kept.rows(all[0], context) * width;
-        let entries = kept::entries(tree.kept, all[0], context);
-        self.out.table = self.out.table.max(entries);
-        let len: usize = all.iter().product();
-        let interleaved = tree.kept.name() == "interleaved";
-        let page_rows = match (tree.kept.page(), interleaved) {
-            (Some(page), _) => page as u32,
-            (None, true) => 1,
-            (None, false) => context as u32,
+        let (len, room, info, form, packed) = match tree.kept_rows(index) {
+            Some((t, context)) => {
+                let node = tree.node(t);
+                let all = &node.shape;
+                let width: usize = all[2..].iter().product();
+                let room = tree.kept.rows(all[0], context) * width;
+                let entries = kept::entries(tree.kept, all[0], context);
+                self.out.table = self.out.table.max(entries);
+                let len: usize = all.iter().product();
+                let interleaved = tree.kept.name() == "interleaved";
+                let page_rows = match (tree.kept.page(), interleaved) {
+                    (Some(page), _) => page as u32,
+                    (None, true) => 1,
+                    (None, false) => context as u32,
+                };
+                let info = KeptInfo {
+                    slots: all[0] as u32,
+                    context: context as u32,
+                    width: width as u32,
+                    page_rows,
+                    interleaved,
+                };
+                (len, room, info, node.form, pack_shape(all, len))
+            }
+            None => {
+                let all = tree.fixed_kept(index).ok_or(Unsupported::KeptRows)?;
+                let len: usize = all.iter().product();
+                let slots = all.first().copied().unwrap_or(1);
+                let width = len / slots.max(1);
+                let info = KeptInfo {
+                    slots: slots as u32,
+                    context: 1,
+                    width: width as u32,
+                    page_rows: 1,
+                    interleaved: false,
+                };
+                (len, len, info, form::F32_FORM, pack_shape(&all, len))
+            }
         };
-        let info = KeptInfo {
-            slots: all[0] as u32,
-            context: context as u32,
-            width: width as u32,
-            page_rows,
-            interleaved,
-        };
-        let val = self.value(
-            len,
-            Home::Kept { index, room, info },
-            EDGE,
-            node.form,
-            pack_shape(all, len),
-        );
+        let val = self.value(len, Home::Kept { index, room, info }, EDGE, form, packed);
         self.kept.insert(index, val);
         Ok(val)
     }

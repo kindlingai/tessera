@@ -84,6 +84,16 @@ fn attention(m: &Model, c: &Config, l: &Layer, h: &Tensor) -> Tensor {
     )
 }
 
+/// Two layers of two heads, four wide.
+pub fn small() -> Config {
+    Config {
+        stack: Stack::sized([8, 8, 2, 2, 4, 32], 4, 8),
+        eps: 1e-5,
+    }
+}
+
+crate::preset::preset!("nanogpt", small: || program(&small()));
+
 /// One forward entry: tokens and positions in, logits out.
 pub fn program(c: &Config) -> Graph {
     let m = Model::new(c.dims());

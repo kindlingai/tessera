@@ -12,7 +12,7 @@ use tessera_trace::Linear;
 /// Five and eight tokens, padded to eight, on every runner.
 #[test]
 fn padded_texts() {
-    let c = tessera_models::small::eg2();
+    let c = tessera_models::eg2::small();
     let (g, alone) = (batched::<Linear>(&c), program::<Linear>(&c));
     let w = weights_with(&g, &mut Noise(5), |_| (0.0, 0.2));
     let texts = [vec![2, 9, 4, 7, 1], vec![2, 3, 5, 8, 6, 11, 10, 1]];

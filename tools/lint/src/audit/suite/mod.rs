@@ -214,21 +214,17 @@ fn homes(all: &[Entry], pkgs: &[Pkg], out: &mut Vec<Violation>) {
 
 fn timing(all: &[Entry], out: &mut Vec<Violation>) {
     for e in all.iter().filter(|e| e.suite) {
-        let exempt = LIMITS.timing_exempt.iter();
-        if exempt
-            .into_iter()
-            .any(|d| e.src.path.starts_with(d.as_str()))
-        {
+        let exempt = &LIMITS.timing_exempt;
+        if exempt.iter().any(|d| e.src.path.starts_with(d.as_str())) {
             continue;
         }
         if let Some((line, name)) = &e.timed {
+            let dirs = exempt.join(" or ");
             out.push(Violation {
                 path: e.src.path.clone(),
                 line: *line,
                 rule: "test-timing",
-                message: format!(
-                    "`{name}` in a test file: time code in a bench or tools/calibrate"
-                ),
+                message: format!("`{name}` in a test file: time code in a bench or {dirs}"),
             });
         }
     }

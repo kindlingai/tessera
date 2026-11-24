@@ -2033,7 +2033,6 @@ dependencies = [
  "tessera-platform",
  "tessera-rules",
  "tessera-sim",
- "tessera-trace",
 ]
 
 [[package]]
@@ -2174,6 +2173,7 @@ dependencies = [
 name = "tessera-models"
 version = "0.1.0"
 dependencies = [
+ "scattered-collect",
  "serde",
  "serde_json",
  "tessera-graph",
@@ -2251,7 +2251,6 @@ dependencies = [
  "tessera-rules",
  "tessera-run",
  "tessera-testkit",
- "tessera-trace",
 ]
 
 [[package]]

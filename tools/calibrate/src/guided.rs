@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 use tessera_engine::form::BF16_FORM;
-use tessera_engine::{Allowed, Engine, Error, FEW, Pins, Recipe, Row, Settings, Stack, Weight};
+use tessera_engine::{Allowed, Engine, Error, FEW, Pins, Recipe, Row, Settings, Weight};
 use tessera_models::decoder::{self, Config, Swiglu};
 use tessera_testkit::{Noise, weights_with};
 use tessera_trace::Norm;
@@ -19,22 +19,13 @@ const KS: [usize; 6] = [1, 8, 32, 128, 512, 4096];
 /// Sequences stepped side by side.
 const PICKS: [u64; 2] = [1, 16];
 
-/// Gemma 3 270M sizes: the head holds most weights.
-fn gemma(max_seqs: u64) -> Config {
-    let mut c = Config::qwen3(max_seqs, CONTEXT);
-    c.stack = Stack::sized([262_144, 640, 18, 4, 256, 2048], max_seqs, CONTEXT);
-    c.kv_heads = 1;
-    c
-}
+/// A model's name, and its sizes for sequences and context.
+type Shape = (&'static str, fn(u64, u64) -> Config);
 
-fn qwen3(max_seqs: u64) -> Config {
-    Config::qwen3(max_seqs, CONTEXT)
-}
-
-/// A model's name, and its sizes for some sequences.
-type Shape = (&'static str, fn(u64) -> Config);
-
-const SHAPES: [Shape; 2] = [("qwen3-0.6b", qwen3), ("gemma3-270m", gemma)];
+const SHAPES: [Shape; 2] = [
+    ("qwen3-0.6b", Config::qwen3),
+    ("gemma3-270m", Config::gemma3),
+];
 
 /// Choices for each pick.
 #[derive(Clone, Copy)]
@@ -112,18 +103,18 @@ pub fn report(settings: &Settings, favor: Option<String>) -> Result<(), Error> {
         ..Recipe::default()
     };
     for (name, shape) in SHAPES {
-        let g = decoder::stepper::<Norm, Swiglu>(&shape(1));
+        let g = decoder::stepper::<Norm, Swiglu>(&shape(1, CONTEXT));
         // Small weights keep every value finite.
         let floats = weights_with(&g, &mut Noise(17), |_| (0.0, 0.02));
         let w: Vec<Weight> = floats.into_iter().map(Weight::Floats).collect();
-        let vocab = shape(1).stack.vocab;
+        let vocab = shape(1, CONTEXT).stack.vocab;
         for picks in PICKS {
             let mut cases = vec![Case::Plain, Case::Open, Case::Bits];
             cases.extend(KS.iter().filter(|&&k| k <= FEW).map(|&k| Case::Few(k)));
-            let mut c = shape(picks);
+            let mut c = shape(picks, CONTEXT);
             c.stack.steps = tessera_engine::Steps::Masked;
             let mut engines = [
-                opened(shape(picks), &w, &recipe, settings)?,
+                opened(shape(picks, CONTEXT), &w, &recipe, settings)?,
                 opened(c, &w, &recipe, settings)?,
             ];
             let slots = picks as usize;

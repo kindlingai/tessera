@@ -11,7 +11,7 @@ use tessera_parity::{LOGITS, Spec, Stepper, decoder, suite};
 use tessera_trace::Composite::{Attention, Layer, Mlp, Model};
 use tessera_trace::{Graph, Norm};
 
-decoder!(Norm, Swiglu, tessera_models::small::qwen3(), Config::qwen3);
+decoder!(Norm, Swiglu, Config::qwen3_small(), Config::qwen3);
 
 const SPEC: Spec = Spec {
     name: "qwen3",

@@ -162,6 +162,30 @@ impl File {
         self.entries.get(name).map(|e| e.shape.as_slice())
     }
 
+    pub fn is_bf16(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|e| stored(&e.dtype) == Stored::Bf16)
+    }
+
+    /// An `I64` tensor's values, in little-endian order.
+    pub fn i64s(&self, name: &str) -> Result<Vec<i64>, Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.into()))?;
+        if e.dtype != "I64" {
+            return Err(Error::DType(format!("{name} is {}, not I64", e.dtype)));
+        }
+        let bytes = self.bytes(name)?;
+        Ok(bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect())
+    }
+
     /// A tensor's bytes as stored.
     pub fn bytes(&self, name: &str) -> Result<Vec<u8>, Error> {
         self.bytes_at(name, 0, None)

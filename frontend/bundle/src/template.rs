@@ -30,6 +30,29 @@ fn strftime_now(clock: &Clock, format: &str) -> Result<String, minijinja::Error>
         .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
+/// Removes Hugging Face `generation` training-mask block tags.
+fn strip_generation(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("{%") {
+        let Some(end) = rest[start + 2..].find("%}") else {
+            break;
+        };
+        let tag_end = start + 2 + end + 2;
+        let inner =
+            rest[start + 2..start + 2 + end].trim_matches(|c: char| c.is_whitespace() || c == '-');
+        if matches!(inner, "generation" | "endgeneration") {
+            out.push_str(&rest[..start]);
+            rest = &rest[tag_end..];
+        } else {
+            out.push_str(&rest[..tag_end]);
+            rest = &rest[tag_end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub struct Template {
     env: Environment<'static>,
 }
@@ -54,7 +77,16 @@ impl Template {
         env.add_function("strftime_now", move |format: &str| {
             strftime_now(&clock, format)
         });
-        env.add_template_owned("chat", source)?;
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        env.add_template_owned("chat", strip_generation(&source))?;
         Ok(Self { env })
     }
 
