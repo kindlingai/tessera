@@ -38,7 +38,7 @@ pub(super) fn open_mtp(
     settings: &Settings,
 ) -> Result<MtpDrafter, String> {
     let mut recipe = o.lower.clone().unwrap_or_default();
-    recipe.pins = pair.pins.clone();
+    recipe.pins = super::generate::kv_pin(o, pair.pins.clone());
     recipe.kept = Recipe::default().kept;
     if o.require_favored {
         recipe.require_favored = true;

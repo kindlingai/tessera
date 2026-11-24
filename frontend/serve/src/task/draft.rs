@@ -132,7 +132,7 @@ pub(super) fn open_drafter(
     settings: &Settings,
 ) -> Result<Drafter, String> {
     let recipe = Recipe {
-        pins: pair.pins.clone(),
+        pins: super::generate::kv_pin(o, pair.pins.clone()),
         ..Recipe::default()
     };
     let mut drafter = match links {

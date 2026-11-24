@@ -19,12 +19,42 @@ pub static ENTRY: Entry = Entry {
     open,
 };
 
+/// Applies any `--kv-dtype` override to `pins`.
+pub(super) fn kv_pin(options: &Options, pins: Pins) -> Pins {
+    match options
+        .kv_dtype
+        .as_deref()
+        .and_then(tessera_engine::form::named)
+    {
+        Some(form) => pins.kept(form),
+        None => pins,
+    }
+}
+
 /// The lowering choices, with the model's pins by default.
 pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     let mut recipe = options.lower.clone().unwrap_or_default();
+    let base = pins.unwrap_or_else(|| Pins::all(tessera_engine::form::BF16_FORM));
     if recipe.pins == Pins::default() {
-        recipe.pins = pins.unwrap_or_else(|| Pins::all(tessera_engine::form::BF16_FORM));
+        recipe.pins = base;
+    } else if recipe.pins.weights.name() == "f32" && recipe.pins.named.is_empty() {
+        // Keep checkpoint weight forms when recipe overrides float pins.
+        let over = recipe.pins;
+        recipe.pins = base;
+        if over.activations.name() != "f32" {
+            recipe.pins = recipe.pins.activations(over.activations);
+        }
+        if over.kept.name() != "f32" {
+            recipe.pins = recipe.pins.kept(over.kept);
+        }
+        if over.outputs.name() != "f32" {
+            recipe.pins = recipe.pins.outputs(over.outputs);
+        }
+        for (site, form) in over.sites {
+            recipe.pins = recipe.pins.site(site, form);
+        }
     }
+    recipe.pins = kv_pin(options, recipe.pins);
     if options.require_favored {
         recipe.require_favored = true;
     }

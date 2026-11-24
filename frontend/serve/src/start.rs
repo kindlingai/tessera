@@ -14,7 +14,7 @@ use tessera_tasks::api::Info;
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--max-batch-rows <n>] [--served-model-name <name>]";
+[--max-batch-rows <n>] [--kv-dtype <f32|bf16|fp8>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering]";
     format!("{head} {} {tail}", task::usage())
 }
@@ -29,6 +29,8 @@ pub struct Options {
     pub slots: usize,
     /// Optional row cap per batched step.
     pub max_batch_rows: Option<usize>,
+    /// Optional KV cache float form: f32, bf16 or fp8.
+    pub kv_dtype: Option<String>,
     pub name: Option<String>,
     /// The `--task` value, one the registry lists.
     pub(crate) task: &'static str,
@@ -62,6 +64,7 @@ impl Default for Options {
             max_model_len: 4096,
             slots: 4,
             max_batch_rows: None,
+            kv_dtype: None,
             name: None,
             task: "generate",
             given: BTreeMap::new(),
@@ -108,6 +111,13 @@ impl Options {
                     return None;
                 }
                 self.max_batch_rows = Some(n);
+            }
+            "--kv-dtype" => {
+                let form = tessera_engine::form::named(&value)?;
+                if !(form.stores() && form.dtype().is_float()) {
+                    return None;
+                }
+                self.kv_dtype = Some(form.name().into());
             }
             "--max-connections" => self.max_connections = value.parse().ok()?,
             "--served-model-name" => self.name = Some(value),
