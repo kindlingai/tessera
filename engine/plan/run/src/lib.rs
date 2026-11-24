@@ -1,19 +1,17 @@
 //! Runs lowered plans on the host or a GPU.
 
+mod cache;
 mod cpu;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod device;
 mod grid;
 mod held;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod kernels;
 mod loopback;
 pub mod marks;
 #[cfg(test)]
 mod marks_test;
-#[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
 mod overrides;
-#[cfg(all(test, any(target_os = "macos", feature = "cuda", feature = "rocm")))]
+#[cfg(test)]
 mod overrides_test;
 mod profile;
 mod rank;
@@ -21,7 +19,7 @@ mod run;
 pub mod testing;
 
 pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
-pub use held::Held;
+pub use held::{Held, Holds};
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
 pub use rank::{Rank, Sum};
@@ -75,6 +73,8 @@ pub enum Error {
     KernelFile(std::path::PathBuf, std::io::Error),
     #[error("weight {weight} does not fit {form}")]
     WeightSize { weight: u32, form: &'static str },
+    #[error("weight {0}: {1}")]
+    WeightRead(u32, std::io::Error),
     #[error("weight {0} has the wrong length")]
     WeightLen(u32),
     #[error("weight {weight} as {form} split on axis {axis}")]
@@ -119,15 +119,22 @@ pub fn gpu() -> Option<Backend> {
     tessera_gpukit::backend::picked()
 }
 
-/// Applies cache and compiler settings to the GPU runtime.
+/// Applies cache, device and compiler settings to the GPU runtime.
 pub fn configure(settings: &Settings) {
+    if let Some(ordinal) = settings.device {
+        tessera_gpukit::device::select(ordinal);
+    }
     tessera_gpukit::cache::configure(settings);
+}
+
+/// Picks the GPU ordinal opened on first context use.
+pub fn select(ordinal: usize) {
+    tessera_gpukit::device::select(ordinal);
 }
 
 /// Pinned memory on the GPU `settings` picks, if any.
 pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
     configure(settings);
-    #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
     if let Ok(pins) =
         tessera_gpukit::backend::dispatch(settings.gpu().filter(|b| b.pins()), device::Pins)
     {
@@ -139,16 +146,16 @@ pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
-    #[cfg(any(target_os = "macos", feature = "cuda", feature = "rocm"))]
-    let plan = match tessera_gpukit::backend::dispatch(settings.gpu(), device::Open(plan, settings))
-    {
-        Ok(run) => return run,
-        Err(device::Open(plan, _)) => plan,
+    let open = tessera_gpukit::backend::dispatch(settings.gpu(), device::Open(plan, settings));
+    let mut runner: Box<dyn Run> = match open {
+        Ok(run) => run?,
+        Err(device::Open(plan, _)) => Box::new(cpu::Runner::new(
+            plan,
+            settings.host_lanes,
+            settings.emulate.map_or(Precision::EXACT, Precision::of),
+            settings.memory,
+        )?),
     };
-    Ok(Box::new(cpu::Runner::new(
-        plan,
-        settings.host_lanes,
-        settings.emulate.map_or(Precision::EXACT, Precision::of),
-        settings.memory,
-    )?))
+    runner.base_mut().reads = settings.reads;
+    Ok(runner)
 }

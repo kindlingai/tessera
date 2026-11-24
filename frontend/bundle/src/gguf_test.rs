@@ -109,6 +109,7 @@ fn widened(weights: &[Weight]) -> Vec<Weight> {
             ))
         }
         Weight::Floats(t) => Weight::Floats(t.clone()),
+        Weight::Filed(..) => unreachable!("a gguf file holds its weights"),
     };
     weights.iter().map(wide).collect()
 }

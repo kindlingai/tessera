@@ -1,7 +1,8 @@
 //! A tiny GPT: learned positions, GELU MLPs, causal attention.
 
-use crate::shared::{Attend, Stack, tokens};
+use crate::shared::{Attend, Stack};
 use tessera_trace::DimName::*;
+use tessera_trace::tokens;
 use tessera_trace::{
     Act, Composite, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Tensor, Weights,
 };

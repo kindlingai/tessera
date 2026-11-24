@@ -1,6 +1,8 @@
 //! A Qwen3.5 Hugging Face directory: its text model and weights.
 
+use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::{Rule, repo};
+use crate::parts::{Cut, Part};
 use crate::{Overrides, each, pins, pull};
 use std::error::Error;
 use std::path::Path;
@@ -11,11 +13,29 @@ use tessera_engine::{Graph, Pins, Weight};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// The Hugging Face class of a Qwen3.5 directory.
-pub(crate) const CLASS: &str = "Qwen3_5ForConditionalGeneration";
+const CLASS: &str = "Qwen3_5ForConditionalGeneration";
 
 fn rules() -> Vec<Rule> {
     repo("qwen35").expect("the repository has Qwen3.5 rules")
 }
+
+fn step(_: &Arch, _: &Ask) -> Result<Built> {
+    Err(format!("{CLASS} has no step graph yet. tessera-eval --forward runs it").into())
+}
+
+fn part(_: &Arch, cut: &Cut) -> Result<Part> {
+    let c = config(&cut.dir, cut.sized(256), &Overrides::default())?;
+    let (dir, layers) = (cut.dir.clone(), c.stack.layers);
+    Ok(Part::new(program(&c), move |g| weights(&dir, layers, g)))
+}
+
+arch!(
+    "qwen35",
+    [Spot::Class(CLASS), Spot::Type("qwen3_5")],
+    rules: include_str!("../names/qwen35.json"),
+    step: step,
+    part: part,
+);
 
 /// The text model's logits graph, its forms and its files.
 pub struct Text {

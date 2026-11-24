@@ -9,7 +9,7 @@ mod zone;
 use serde::{Deserialize, Serialize};
 
 pub use cost::{Cost, FIXED, Sample, Timings};
-pub use known::{known, m3_pro};
+pub use known::{generic, known, m3_pro};
 pub use pool::{Fit, Pool};
 pub use zone::{Cluster, Link, Zone, ZoneKind};
 

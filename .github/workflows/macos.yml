@@ -29,7 +29,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
       - run: cargo clippy --workspace --all-targets
       - if: ${{ !inputs.light }}
-        run: cargo test --workspace --no-fail-fast
-      - run: cargo test -p tessera-linear --test platforms_test -- --nocapture
+        run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture

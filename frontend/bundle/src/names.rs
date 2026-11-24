@@ -333,12 +333,6 @@ pub fn rules(json: &str) -> Result<Vec<Rule>, serde_json::Error> {
 
 /// The repository's rules for a model, where it needs any.
 pub fn repo(model: &str) -> Option<Vec<Rule>> {
-    let json = match model {
-        "eg2" => include_str!("../names/eg2.json"),
-        "flux2" => include_str!("../names/flux2.json"),
-        "gemma4" => include_str!("../names/gemma4.json"),
-        "qwen35" => include_str!("../names/qwen35.json"),
-        _ => return None,
-    };
-    Some(rules(json).expect("the repository's rules parse"))
+    let arch = crate::arch::find(model)?;
+    arch.rules.is_some().then(|| arch.rules())
 }

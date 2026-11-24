@@ -183,6 +183,12 @@ impl Api for Driver {
             cu_mem_host_register, "cuMemHostRegister", driver::CU_MEMHOSTREGISTER_DEVICEMAP,
             cu_mem_host_unregister
         ),
+        ipc: (
+            cu_ipc_get_mem_handle, "cuIpcGetMemHandle",
+            cu_ipc_open_mem_handle, "cuIpcOpenMemHandle",
+            driver::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
+            cu_ipc_close_mem_handle
+        ),
         occupancy: (cu_occupancy, "cuOccupancyMaxActiveBlocksPerMultiprocessor"),
         zero: (cu_memset_d8, "cuMemsetD8"),
     }

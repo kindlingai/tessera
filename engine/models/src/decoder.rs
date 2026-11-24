@@ -1,15 +1,13 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
 use crate::keys::Keys;
-use crate::shared::{
-    Attend, Side, Stack, Steps, TapSink, listed, pick, sparse_ports, step_ports, swiglu, tokens,
-    with_head,
-};
+use crate::shared::{Attend, Side, Stack, Steps, TapSink, swiglu, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
-    Norm, Pairs, Role, Size, Tensor, TensorType, Weights,
+    Norm, Pairs, Role, Size, Tensor, TensorType, Weights, listed, pick, sparse_ports, step_ports,
+    tokens,
 };
 
 /// Steps a query or key head passes through before RoPE.

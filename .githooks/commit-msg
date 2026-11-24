@@ -1,4 +1,7 @@
 #!/bin/sh
-# Refuses Co-Authored-By lines that credit AI tools.
+# Refuses Co-Authored-By lines that credit AI tools, then checks the
+# message for style when the spaCy pipeline is in ~/.cache/tessera/check.
 . "$(dirname "$0")/worktree.sh"
-exec tools/scripts/check-coauthors.sh --message "$1"
+set -e
+tools/scripts/check-coauthors.sh --message "$1"
+cargo run -q -p tessera-check -- message "$1"

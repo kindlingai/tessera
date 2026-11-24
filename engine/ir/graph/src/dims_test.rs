@@ -43,3 +43,12 @@ fn fixed_by_value() {
 fn undeclared_dim() {
     assert_eq!(DimExpr::from(Vocab).poly(&dims()), Err(Vocab));
 }
+
+#[test]
+fn dim_names_spelled() {
+    const WIDE: DimName = DimName::named("Wide");
+    let text = serde_json::to_string(&[Rows, WIDE]).unwrap();
+    assert_eq!(text, r#"["Rows","Wide"]"#);
+    let back: Vec<DimName> = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, [Rows, WIDE]);
+}

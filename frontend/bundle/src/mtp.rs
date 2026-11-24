@@ -2,7 +2,7 @@
 
 use crate::mla::{self, attn_rules, moe_rules};
 use crate::names::Rule;
-use crate::{Bundle, Overrides, WIDTH, load_tapped, release};
+use crate::{Bundle, Overrides, WIDTH, is_exlr8, load_tapped, release};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Shards, Stored};
@@ -131,7 +131,7 @@ pub fn load(
     let target_cfg = mla::config(&json, slots, context)
         .map_err(|e| format!("--mtp requires an MLA checkpoint: {e}"))?;
     let layer = target_cfg.stack.layers;
-    let exlr8 = dir.join("dense/exlr8-vocab.safetensors").is_file();
+    let exlr8 = is_exlr8(dir);
     let offer: Box<dyn Offer> = match exlr8 {
         true => Box::new(release(dir, manifest)?.width(WIDTH)),
         false => Box::new(Shards::open(dir)?),

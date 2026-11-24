@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
+use tessera_engine::p2p;
 use tessera_engine::sums::{self, Sum};
 use tessera_engine::whole;
 use tessera_engine::{Grid, Settings};
@@ -68,13 +69,36 @@ pub fn join(
     Ok([Box::new(verbs), met])
 }
 
-/// `--sums grid` or `host`: whether sums run in a grid.
-pub fn grid_flag(value: &str) -> Option<bool> {
+/// How ranks sum activations across devices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sums {
+    #[default]
+    Host,
+    Grid,
+    P2p,
+}
+
+/// Parses `--sums host|grid|p2p`.
+pub fn sums_flag(value: &str) -> Option<Sums> {
     match value {
-        "grid" => Some(true),
-        "host" => Some(false),
+        "host" => Some(Sums::Host),
+        "grid" => Some(Sums::Grid),
+        "p2p" => Some(Sums::P2p),
         _ => None,
     }
+}
+
+/// Direct GPU-to-GPU sums over IPC and SM stores.
+pub fn p2p(
+    met: &mut dyn Transport,
+    settings: &Settings,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    let rank = met.rank();
+    let device = settings.device.unwrap_or(rank as usize);
+    tessera_engine::select(device);
+    let sums = p2p::open(settings.gpu(), met)?;
+    eprintln!("rank {rank}: sums over direct GPU P2P (device {device})");
+    Ok(sums)
 }
 
 /// A persistent grid that sums over `fabric`, met through `met`.

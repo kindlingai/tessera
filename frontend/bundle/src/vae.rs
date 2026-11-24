@@ -1,13 +1,33 @@
 //! FLUX.2's VAE decoder from a diffusers directory.
 
 use crate::Overrides;
+use crate::arch::{Arch, Spot, arch};
+use crate::parts::{Cut, Part};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::File;
+use tessera_engine::DimName::{Rows, Seqs};
 use tessera_engine::vae::{Config, program};
-use tessera_engine::{Graph, PathSeg, Tensor, Weight, bind};
+use tessera_engine::{Graph, PathSeg, Pins, Tensor, Weight, bind};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+fn part(_: &Arch, cut: &Cut) -> Result<Part> {
+    // Rows count latent tokens, the transformer's output rows.
+    let rows = cut.at(Rows, 256);
+    let side = rows.isqrt();
+    if side * side != rows {
+        return Err(format!("{rows} rows do not make a square").into());
+    }
+    let root = cut.root();
+    let c = config(&root, [side, cut.at(Seqs, 1)], &Overrides::default())?;
+    let eps = c.bn_eps;
+    Ok(Part::new(program(&c), move |g| {
+        Ok((weights(&root, eps, g)?, Pins::default()))
+    }))
+}
+
+arch!("vae", [Spot::Class("AutoencoderKLFlux2")], part: part);
 
 pub struct Decoder {
     pub graph: Graph,

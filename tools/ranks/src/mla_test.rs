@@ -6,7 +6,7 @@ use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::{Graph, PathSeg, shard};
 use tessera_interp::{Tensor, run};
 use tessera_lower::form::BF16_FORM;
-use tessera_lower::lower;
+use tessera_lower::{Reads, Weight, lower};
 use tessera_run::Loopback;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, cosine_f32, max_abs_diff, weights};
@@ -134,8 +134,9 @@ fn mla_bundle() {
     let streamed = bundle.weights.each(|at, got| {
         read += 1;
         let want = BF16_FORM.pack(floats[at as usize].floats().unwrap());
-        match got {
-            tessera_lower::Weight::Packed(_, bytes) if *bytes == want => Ok(()),
+        let filed = got.held(Reads::Cached).map_err(|e| e.to_string())?;
+        match filed.as_ref().unwrap_or(got) {
+            Weight::Packed(_, bytes) if *bytes == want => Ok(()),
             _ => Err(format!("weight {at} is not its bf16 bytes")),
         }
     });

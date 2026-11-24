@@ -26,6 +26,16 @@ pub enum Memory {
     Off,
 }
 
+/// How weight files are read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reads {
+    /// Through the file cache.
+    #[default]
+    Cached,
+    /// Past the file cache, where the file system can.
+    Direct,
+}
+
 /// Settings for the planner, the runners and the tools.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -46,6 +56,7 @@ pub struct Settings {
     pub verbs: Option<String>,
     /// The plan size the runners refuse past.
     pub memory: Memory,
+    pub reads: Reads,
     /// The Hugging Face hub cache.
     pub hub: Option<PathBuf>,
     /// The Hugging Face access token, for gated repositories.
@@ -60,6 +71,8 @@ pub struct Settings {
     pub nvrtc: Vec<String>,
     /// File path for wasm site and reply logs.
     pub dump_sites: Option<PathBuf>,
+    /// GPU device ordinal. `None` picks device 0.
+    pub device: Option<usize>,
 }
 
 impl Default for Settings {
@@ -74,6 +87,7 @@ impl Default for Settings {
             emulate: None,
             verbs: None,
             memory: Memory::Device,
+            reads: Reads::Cached,
             hub: None,
             hf_token: None,
             profile: None,
@@ -81,6 +95,7 @@ impl Default for Settings {
             kernel_cache: None,
             nvrtc: Vec::new(),
             dump_sites: None,
+            device: None,
         }
     }
 }

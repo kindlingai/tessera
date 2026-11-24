@@ -1766,6 +1766,7 @@ dependencies = [
  "minijinja-contrib",
  "rmp-serde",
  "rmpv",
+ "scattered-collect",
  "serde",
  "serde_json",
  "tessera-checkpoint",
@@ -1958,7 +1959,6 @@ dependencies = [
 name = "tessera-glm53-moe-module"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "tessera-guest",
 ]
 
@@ -2211,6 +2211,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-qwen3-graph"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tessera-guest",
+ "tessera-trace",
+]
+
+[[package]]
 name = "tessera-ranks"
 version = "0.1.0"
 dependencies = [
@@ -2319,8 +2328,6 @@ dependencies = [
 name = "tessera-sprite-module"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
  "tessera-guest",
  "tessera-models",
 ]

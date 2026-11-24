@@ -132,6 +132,27 @@ pub(crate) fn gb10() -> Nvidia {
     }
 }
 
+/// An NVIDIA GPU scaled from driver-reported specs.
+pub(crate) fn scaled(name: &str, sms: usize, bandwidth: f64, group_bytes: usize) -> Nvidia {
+    let mut n = gb10();
+    let scale = sms as f64 / n.sm.sms.value;
+    let i = Const::inferred;
+    n.name = name.into();
+    n.sm.sms = i(sms as f64, "reported by the driver");
+    n.sm.read = i(bandwidth * 0.85, "scaled from bus bandwidth");
+    n.sm.scan = i(bandwidth * 0.50, "scaled from bus bandwidth");
+    n.sm.write = i(bandwidth * 0.70, "scaled from bus bandwidth");
+    let cached = (n.sm.cached.value * scale).max(bandwidth * 2.0);
+    n.sm.cached = i(cached, "scaled by SM count");
+    n.sm.fp32 = i(n.sm.fp32.value * scale, "scaled by SM count");
+    n.sm.fp16 = i(n.sm.fp16.value * scale, "scaled by SM count");
+    n.sm.fp8 = i(n.sm.fp8.value * scale, "scaled by SM count");
+    if group_bytes > 0 {
+        n.sm.group_memory = i(group_bytes as f64, "reported by the driver");
+    }
+    n
+}
+
 impl Chip for Nvidia {
     fn name(&self) -> &str {
         &self.name

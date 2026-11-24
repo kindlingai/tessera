@@ -1,11 +1,27 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
-use crate::shared::{Attend, Stack, Steps, TapSink, pick, rows, step_ports, swiglu, tokens};
+use crate::shared::{Attend, NOPE, ROPE, Stack, Steps, TapSink, rows, swiglu};
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
     Norm, Pairs, Role, Size, Tensor, TensorType, Vector, Weights,
 };
+use tessera_trace::{pick, step_ports, tokens};
+
+/// Width of the low-rank query.
+const Q_LATENT: DimName = DimName::named("QLatent");
+/// Width of the low-rank keys and values.
+const LATENT: DimName = DimName::named("Latent");
+/// A dense layer's MLP width. Experts use `Ffn`.
+const DENSE_FFN: DimName = DimName::named("DenseFfn");
+const INDEX_HEADS: DimName = DimName::named("IndexHeads");
+const INDEX_DIM: DimName = DimName::named("IndexDim");
+/// Keys an indexer keeps for each query.
+const INDEX_KEEP: DimName = DimName::named("IndexKeep");
+const DENSE_LAYERS: DimName = DimName::named("DenseLayers");
+const MOE_LAYERS: DimName = DimName::named("MoeLayers");
+/// Layers that run their own indexer.
+pub(crate) const INDEX_LAYERS: DimName = DimName::named("IndexLayers");
 
 #[derive(Clone)]
 pub struct Config {
@@ -98,22 +114,22 @@ impl Config {
         let layers = self.stack.layers;
         let indexing = (0..layers).filter(|&l| self.indexes(l)).count();
         let mut own = vec![
-            (Nope, self.nope),
-            (Rope, self.rope),
-            (QLatent, self.q_latent),
-            (Latent, self.latent),
-            (DenseFfn, self.dense_ffn),
+            (NOPE, self.nope),
+            (ROPE, self.rope),
+            (Q_LATENT, self.q_latent),
+            (LATENT, self.latent),
+            (DENSE_FFN, self.dense_ffn),
             (Experts, self.experts),
             (TopK, self.top_k),
-            (DenseLayers, self.dense_layers),
-            (MoeLayers, layers - self.dense_layers),
-            (IndexLayers, indexing as u64),
+            (DENSE_LAYERS, self.dense_layers),
+            (MOE_LAYERS, layers - self.dense_layers),
+            (INDEX_LAYERS, indexing as u64),
         ];
         if let Some(i) = &self.index {
             own.extend([
-                (IndexHeads, i.heads),
-                (IndexDim, i.dim),
-                (IndexKeep, i.keep),
+                (INDEX_HEADS, i.heads),
+                (INDEX_DIM, i.dim),
+                (INDEX_KEEP, i.keep),
             ]);
         }
         self.stack.dims(&own)
@@ -124,18 +140,18 @@ impl Config {
 pub struct Attention {
     #[shape(Hidden)]
     pub norm: Norm,
-    #[shape(Hidden, QLatent)]
+    #[shape(Hidden, Q_LATENT)]
     pub q_a: Linear,
-    #[shape(QLatent)]
+    #[shape(Q_LATENT)]
     pub q_norm: Norm,
-    #[shape(QLatent, Heads * (Nope + Rope))]
+    #[shape(Q_LATENT, Heads * (NOPE + ROPE))]
     pub q_b: Linear,
-    #[shape(Hidden, Latent + Rope)]
+    #[shape(Hidden, LATENT + ROPE)]
     pub kv_a: Linear,
-    #[shape(Latent)]
+    #[shape(LATENT)]
     pub kv_norm: Norm,
     /// Per head: an unrotated key part, then a value.
-    #[shape(Latent, Heads * (Nope + HeadDim))]
+    #[shape(LATENT, Heads * (NOPE + HeadDim))]
     pub kv_b: Linear,
     #[shape(Heads * HeadDim, Hidden)]
     pub o: Linear,
@@ -144,25 +160,25 @@ pub struct Attention {
 /// Scores every key cheaply, so attention reads only the best.
 #[derive(Weights)]
 pub struct Indexer {
-    #[shape(QLatent, IndexHeads * IndexDim)]
+    #[shape(Q_LATENT, INDEX_HEADS * INDEX_DIM)]
     pub wq: Linear,
-    #[shape(Hidden, IndexDim)]
+    #[shape(Hidden, INDEX_DIM)]
     pub wk: Linear,
-    #[shape(IndexDim)]
+    #[shape(INDEX_DIM)]
     pub k_norm: Norm,
-    #[shape(IndexDim)]
+    #[shape(INDEX_DIM)]
     pub k_bias: Vector,
-    #[shape(Hidden, IndexHeads)]
+    #[shape(Hidden, INDEX_HEADS)]
     pub weights: Linear,
 }
 
 #[derive(Weights)]
 pub struct DenseMlp {
-    #[shape(Hidden, DenseFfn)]
+    #[shape(Hidden, DENSE_FFN)]
     pub gate: Linear,
-    #[shape(Hidden, DenseFfn)]
+    #[shape(Hidden, DENSE_FFN)]
     pub up: Linear,
-    #[shape(DenseFfn, Hidden)]
+    #[shape(DENSE_FFN, Hidden)]
     pub down: Linear,
 }
 
@@ -193,7 +209,7 @@ pub struct Moe {
     pub shared: SharedMlp,
 }
 
-/// Layer `l` uses `dense[l]`, or `moe[l - DenseLayers]`.
+/// Layer `l` uses `dense[l]`, or `moe[l - DENSE_LAYERS]`.
 #[derive(Weights)]
 pub struct Mla<R: Routed> {
     #[shape(Vocab, Hidden)]
@@ -201,13 +217,13 @@ pub struct Mla<R: Routed> {
     #[shape(Layers)]
     pub attn: Vec<Attention>,
     /// One per indexing layer, in layer order.
-    #[shape(IndexLayers)]
+    #[shape(INDEX_LAYERS)]
     pub indexers: Vec<Indexer>,
     #[shape(Layers, Hidden)]
     pub mlp_norm: Vec<Norm>,
-    #[shape(DenseLayers)]
+    #[shape(DENSE_LAYERS)]
     pub dense: Vec<DenseMlp>,
-    #[shape(MoeLayers)]
+    #[shape(MOE_LAYERS)]
     pub moe: Vec<R>,
     #[shape(Hidden)]
     pub norm: Norm,
@@ -381,13 +397,13 @@ impl Pass<'_> {
             Keys::Given(k) => Some(k),
             Keys::Pick(ix) => Some(self.pick_keys(l, ix, &qr, h)),
         };
-        let q = heads.split(qr.matmul(&w.q_b), Heads, Nope + Rope);
+        let q = heads.split(qr.matmul(&w.q_b), Heads, NOPE + ROPE);
         let head = feature + 1;
-        let (nope, rope) = (q.slice(head, 0u64, Nope), turn(q.slice(head, Nope, Rope)));
+        let (nope, rope) = (q.slice(head, 0u64, NOPE), turn(q.slice(head, NOPE, ROPE)));
         let kv = h.matmul(&w.kv_a);
-        let latent = kv.slice(feature, 0u64, Latent).rms_norm(&w.kv_norm, c.eps);
+        let latent = kv.slice(feature, 0u64, LATENT).rms_norm(&w.kv_norm, c.eps);
         // Every head shares one rotary key part.
-        let shared = turn(kv.slice(feature, Latent, Rope));
+        let shared = turn(kv.slice(feature, LATENT, ROPE));
         let scale = 1.0 / ((c.nope + c.rope) as f32).sqrt();
         let out = match &self.step {
             None => {
@@ -405,12 +421,12 @@ impl Pass<'_> {
         (heads.merge(out), keys)
     }
 
-    /// Each query's best `IndexKeep` visible keys.
+    /// Each query's best `INDEX_KEEP` visible keys.
     fn pick_keys(&self, l: usize, w: &Indexer, qr: &Tensor, h: &Tensor) -> Tensor {
         let c = self.c;
         let q = qr
             .matmul(&w.wq)
-            .reshape(self.lead([IndexHeads.into(), IndexDim.into()]));
+            .reshape(self.lead([INDEX_HEADS.into(), INDEX_DIM.into()]));
         let k = h.matmul(&w.wk).center().rms_norm(&w.k_norm, c.eps);
         let k = k.add_vector(&w.k_bias);
         // A step reads its slot's kept keys.
@@ -425,7 +441,7 @@ impl Pass<'_> {
         let hits = q.matmul_rows(&k).act(Act::Relu);
         let by_head = h
             .matmul(&w.weights)
-            .reshape(self.lead([DimExpr::Const(1), IndexHeads.into()]));
+            .reshape(self.lead([DimExpr::Const(1), INDEX_HEADS.into()]));
         let rank = self.lead([]).len() as u32 + 2;
         let swap: Vec<u32> = (0..rank - 2).chain([rank - 1, rank - 2]).collect();
         let scores = hits.permute(&swap).matmul_rows(&by_head);
@@ -434,7 +450,7 @@ impl Pass<'_> {
             Some(_) => scores.causal(self.positions),
             None => scores.mask(Mask::Causal),
         };
-        seen.top_k(IndexKeep)
+        seen.top_k(INDEX_KEEP)
     }
 }
 
@@ -442,11 +458,11 @@ impl Pass<'_> {
 fn keys_values(w: &Attention, latent: &Tensor, shared: &Tensor) -> [Tensor; 2] {
     let per_head = latent
         .matmul(&w.kv_b)
-        .reshape(rows([Heads.into(), Nope + HeadDim]));
-    let one = rows([DimExpr::Const(1), Rope.into()]);
+        .reshape(rows([Heads.into(), NOPE + HeadDim]));
+    let one = rows([DimExpr::Const(1), ROPE.into()]);
     let shared = shared.reshape(one).expand(2, Heads);
-    let k = per_head.slice(3, 0u64, Nope).concat(&shared);
-    [k, per_head.slice(3, Nope, HeadDim)]
+    let k = per_head.slice(3, 0u64, NOPE).concat(&shared);
+    [k, per_head.slice(3, NOPE, HeadDim)]
 }
 
 /// Attention over latent keys, with `kv_b` folded into each side.
@@ -462,17 +478,17 @@ fn absorbed(
     let set = || {
         w.kv_b
             .stored()
-            .reshape(vec![Heads.into(), Nope + HeadDim, Latent.into()])
+            .reshape(vec![Heads.into(), NOPE + HeadDim, LATENT.into()])
     };
     let swap = [1, 0, 2];
-    let to_latent = set().slice(1, 0u64, Nope).permute(&[0, 2, 1]);
+    let to_latent = set().slice(1, 0u64, NOPE).permute(&[0, 2, 1]);
     let q = nope.permute(&swap).matmul_rows(&to_latent).permute(&swap);
     let q = q.concat(rope);
     // One key head serves every query head.
-    let k = keys.reshape(rows([DimExpr::Const(1), Latent + Rope]));
+    let k = keys.reshape(rows([DimExpr::Const(1), LATENT + ROPE]));
     let out = m.attend_rows(Mask::Causal, scale, [&q, &k, &k], by, picked);
-    let out = out.slice(2, 0u64, Latent).permute(&swap);
-    out.matmul_rows(&set().slice(1, Nope, HeadDim))
+    let out = out.slice(2, 0u64, LATENT).permute(&swap);
+    out.matmul_rows(&set().slice(1, NOPE, HeadDim))
         .permute(&swap)
 }
 
@@ -581,9 +597,9 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     let ([tokens, positions, slots], allowed) = step_ports(&m, c.stack.steps == Steps::Masked);
     let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
     let cache = |l| Cache {
-        latent: kept(Latent),
-        rope: kept(Rope),
-        index: c.indexes(l).then(|| kept(IndexDim)),
+        latent: kept(LATENT),
+        rope: kept(ROPE),
+        index: c.indexes(l).then(|| kept(INDEX_DIM)),
     };
     let pass = Pass {
         m: &m,
@@ -610,9 +626,9 @@ pub(crate) fn step_layer<R: Routed>(
 ) -> Tensor {
     let kept = |width: DimName| m.kept(TensorType::new(rows([width.into()]), DType::F32));
     let cache = Cache {
-        latent: kept(Latent),
-        rope: kept(Rope),
-        index: indexer.is_some().then(|| kept(IndexDim)),
+        latent: kept(LATENT),
+        rope: kept(ROPE),
+        index: indexer.is_some().then(|| kept(INDEX_DIM)),
     };
     let pass = Pass {
         m,

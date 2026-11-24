@@ -11,6 +11,8 @@ type Key = (u64, usize, Wants, Vec<(DimName, u64)>, Vec<DimName>, u64);
 
 /// Runtime dimensions are lowered at the next power of two.
 const LEAST: u64 = 16;
+/// Minimum Context bucket, capped to the graph's bound.
+const LEAST_CONTEXT: u64 = 256;
 
 /// Each runtime dimension's bucket, bound at launch.
 pub type Bound = Vec<(DimName, u32)>;
@@ -79,8 +81,12 @@ impl Cache {
         };
         let capped = |name: DimName, n: u64| most(name).map_or(n, |m| n.min(m));
         let bucket = |(name, n): &(DimName, u64)| match upto.contains(name) {
-            // Segment counts start at one, contexts at the least plan.
+            // Segment counts start at one, contexts at their floor.
             true if *name == DimName::Segments => (*name, capped(*name, n.next_power_of_two())),
+            true if *name == DimName::Context => (
+                *name,
+                capped(*name, n.next_power_of_two().max(LEAST_CONTEXT)),
+            ),
             true => (*name, capped(*name, n.next_power_of_two().max(LEAST))),
             false => (*name, *n),
         };

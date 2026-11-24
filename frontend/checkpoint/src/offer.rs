@@ -1,6 +1,8 @@
 //! A checkpoint's offer: named slices, read when claimed.
 
 use crate::Error;
+use std::sync::Arc;
+use tessera_engine::Filed;
 use tessera_engine::storage::Form;
 
 /// How a slice's elements lie in the file.
@@ -67,6 +69,11 @@ pub trait Offer {
     /// A bf16 slice's bytes, as stored.
     fn bf16(&self, name: &str) -> Result<Vec<u8>, Error> {
         Ok(self.floats(name)?.iter().flat_map(narrow).collect())
+    }
+    /// Slice `name` left on disk, as stored.
+    fn filed(&self, name: &str) -> Option<Arc<dyn Filed>> {
+        let _ = name;
+        None
     }
     /// Rows `first..first + count` of a packed slice.
     fn packed_rows(&self, name: &str, rows: (usize, usize)) -> Result<Vec<u8>, Error> {

@@ -5,7 +5,7 @@ use tessera_engine::{
     Allowed, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row,
     Site, Steps,
 };
-use tessera_graph::{Graph, Op};
+use tessera_graph::{Graph, Op, Role};
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
 use tessera_lower::{Pins, Recipe, Settings, Weight, kept, rules};
@@ -538,6 +538,20 @@ fn budget_refuses_plan() {
         ))
     ));
     assert!(open(tessera_engine::Memory::Off).is_ok());
+}
+
+#[test]
+fn unfilled_port_refuses() {
+    let mut g = stepper::<Norm, Swiglu>(&Config::toy(1, 16));
+    g.entries[0].inputs[2].role = Role::Keys;
+    let refused = Engine::open(g, 16, &Recipe::default(), &tessera_run::testing::host());
+    assert!(matches!(
+        refused,
+        Err(tessera_engine::Error::Port {
+            entry: 0,
+            role: Role::Keys
+        })
+    ));
 }
 
 /// Fails on its first pick.

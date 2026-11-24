@@ -240,6 +240,8 @@ pub struct Module {
 struct Build<'a> {
     config: &'a serde_json::value::RawValue,
     seqs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
 }
 
 impl Module {
@@ -283,7 +285,13 @@ impl Module {
     }
 
     /// Calls `name` with the config. `None` without a graph.
-    fn build(&self, name: &'static str, config: &str, seqs: u64) -> Result<Option<Vec<u8>>, Error> {
+    fn build(
+        &self,
+        name: &'static str,
+        config: &str,
+        seqs: u64,
+        context: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         if !self.graph {
             return Ok(None);
         }
@@ -291,13 +299,24 @@ impl Module {
         let input = serde_json::to_vec(&Build {
             config: &config,
             seqs,
+            context,
         })?;
         Ok(Some(self.guest.call(name, Some(&input), BUILD_FUEL)?))
     }
 
+    /// Whether the module builds a graph.
+    pub fn builds(&self) -> bool {
+        self.graph
+    }
+
     /// The graph for `config` JSON, if the module builds one.
-    pub fn graph(&self, config: &str, seqs: u64) -> Result<Option<Graph>, Error> {
-        let Some(out) = self.build("graph", config, seqs)? else {
+    pub fn graph(
+        &self,
+        config: &str,
+        seqs: u64,
+        context: Option<u64>,
+    ) -> Result<Option<Graph>, Error> {
+        let Some(out) = self.build("graph", config, seqs, context)? else {
             return Ok(None);
         };
         let text = std::str::from_utf8(&out).map_err(Error::wasm)?;
@@ -306,7 +325,7 @@ impl Module {
 
     /// The tables that graph reads, by dotted path.
     pub fn tables(&self, config: &str) -> Result<Vec<(String, Vec<f32>)>, Error> {
-        let Some(out) = self.build("tables", config, 1)? else {
+        let Some(out) = self.build("tables", config, 1, None)? else {
             return Ok(Vec::new());
         };
         tessera_guest::decode(&out).ok_or_else(|| Error::wasm("tables: a short or bad buffer"))

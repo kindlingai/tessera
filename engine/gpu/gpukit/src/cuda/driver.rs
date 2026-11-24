@@ -34,6 +34,7 @@ pub(crate) const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
 pub(crate) const CU_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
 pub(crate) const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 2;
+pub(crate) const CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: u32 = 1;
 pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 1;
 pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 
@@ -103,6 +104,9 @@ tessera_dl::library! {
         pub(crate) cu_mem_free_host: entry::HostFree = "cuMemFreeHost",
         pub(crate) cu_mem_host_register: entry::Register = "cuMemHostRegister_v2",
         pub(crate) cu_mem_host_unregister: entry::HostFree = "cuMemHostUnregister",
+        pub(crate) cu_ipc_get_mem_handle: entry::IpcExport = "cuIpcGetMemHandle",
+        pub(crate) cu_ipc_open_mem_handle: entry::IpcOpen = "cuIpcOpenMemHandle_v2",
+        pub(crate) cu_ipc_close_mem_handle: entry::IpcClose = "cuIpcCloseMemHandle",
         pub(crate) cu_occupancy: entry::Occupancy =
             "cuOccupancyMaxActiveBlocksPerMultiprocessor",
         pub(crate) cu_func_set_attribute: CuFuncSetAttribute = "cuFuncSetAttribute",

@@ -1,6 +1,8 @@
 //! Qwen3-0.6B.
 
 mod config_test;
+mod graph;
+mod graph_test;
 mod resident_test;
 mod shard_test;
 

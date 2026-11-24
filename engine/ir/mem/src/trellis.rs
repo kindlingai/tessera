@@ -47,8 +47,12 @@ impl Codebook {
 
     /// The codebook a manifest calls `name`.
     pub fn named(name: &str) -> Option<Self> {
-        let named = |b: &Codebook| format!("{b:?}").eq_ignore_ascii_case(name);
-        Self::ALL.into_iter().find(named)
+        match name {
+            "mcg" => Some(Codebook::Mcg),
+            "mul1" => Some(Codebook::Mul1),
+            "pmcgx" => Some(Codebook::Pmcgx),
+            _ => None,
+        }
     }
 
     /// The suffix a release appends to its tensor names.
@@ -302,6 +306,10 @@ pub fn rows<T: Clone + Send>(
     let (k, width) = (k as usize, suh.len());
     let (tile, pairs) = (32 * k, codebook == Codebook::Pmcgx);
     let bytes = width / 256 * tile;
+    // Each row must hold whole tiles, else None.
+    if !width.is_multiple_of(256) || codes.len() != svh.len() * bytes {
+        return None;
+    }
     // Every state's weights, so a value is one lookup.
     let mask = (1u32 << codebook.state_bits()) - 1;
     let both = |s: u32| [false, true].map(|odd| codebook.weight(s, odd));

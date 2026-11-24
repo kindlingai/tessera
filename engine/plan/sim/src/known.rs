@@ -48,3 +48,37 @@ pub fn known(device: &str) -> Option<Box<dyn Chip>> {
     let chips: [Box<dyn Chip>; 2] = [Box::new(gb10()), Box::new(m3_pro())];
     chips.into_iter().find(|c| c.name() == device)
 }
+
+/// A generic chip model from driver-reported specs.
+pub fn generic(
+    backend: &str,
+    name: &str,
+    units: usize,
+    bandwidth: f64,
+    group_bytes: usize,
+) -> Option<Box<dyn Chip>> {
+    if units == 0 || bandwidth <= 0.0 {
+        return None;
+    }
+    match backend {
+        "cuda" => Some(Box::new(crate::nvidia::scaled(
+            name,
+            units,
+            bandwidth,
+            group_bytes,
+        ))),
+        "metal" | "rocm" => {
+            let mut fit = m3_pro_fit();
+            let scale = units as f64 / fit.cores;
+            fit.cores = units as f64;
+            fit.read = bandwidth * 0.85;
+            fit.scan = bandwidth * 0.60;
+            fit.write = bandwidth * 0.75;
+            fit.cached = (fit.cached * scale).max(bandwidth * 2.0);
+            fit.rate *= scale;
+            fit.tile *= scale;
+            Some(Box::new(fit.pool(name)))
+        }
+        _ => None,
+    }
+}

@@ -1,9 +1,10 @@
 //! CLIP's text tower: learned positions, causal pre-norm blocks.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Dense, Stack, tokens};
+use crate::shared::{Attend, Dense, Stack};
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::tokens;
 use tessera_trace::{
     Act, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Tensor, Vector, Weights,
 };

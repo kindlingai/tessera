@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
-use tessera_engine::{Backend, Memory, Pick, Settings};
+use tessera_engine::{Backend, Memory, Pick, Reads, Settings};
 
 /// The `TESSERA_` variables.
 #[derive(Deserialize)]
@@ -17,6 +17,8 @@ struct Env {
     verbs: Option<String>,
     /// Bytes, maybe suffixed K, M, G or T, or `off`.
     memory: Option<String>,
+    /// `cached` or `direct`.
+    reads: Option<String>,
     /// Launches per profile report.
     profile: Option<u64>,
     kernels: Option<PathBuf>,
@@ -25,6 +27,7 @@ struct Env {
     /// Extra NVRTC or hiprtc flags, whitespace separated.
     nvrtc: Option<String>,
     dump_sites: Option<PathBuf>,
+    device: Option<usize>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -34,6 +37,9 @@ pub fn read() -> Settings {
     let env: Env = envy::prefixed("TESSERA_")
         .from_iter(set)
         .unwrap_or_else(|e| panic!("TESSERA_ environment: {e}"));
+    if let Some(device) = env.device {
+        tessera_engine::select(device);
+    }
     let backend = match env.backend.as_deref() {
         Some("host") => Pick::Host,
         Some("cpu") => Pick::Cpu,
@@ -67,6 +73,7 @@ pub fn read() -> Settings {
         emulate: env.emulate,
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
+        reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
         hf_token: token(&var, std::env::home_dir()),
         profile: env.profile.filter(|n| *n > 0),
@@ -74,6 +81,7 @@ pub fn read() -> Settings {
         kernel_cache,
         nvrtc,
         dump_sites: env.dump_sites,
+        device: env.device,
     }
 }
 
@@ -143,6 +151,15 @@ fn memory(value: &str) -> Memory {
     match digits.parse::<u64>() {
         Ok(n) => Memory::Bytes(n << shift),
         Err(e) => panic!("TESSERA_MEMORY={value}: {e}"),
+    }
+}
+
+/// A `TESSERA_READS` value. Bad values panic.
+fn reads(value: &str) -> Reads {
+    match value {
+        "cached" => Reads::Cached,
+        "direct" => Reads::Direct,
+        _ => panic!("TESSERA_READS={value}: want cached or direct"),
     }
 }
 

@@ -1,10 +1,13 @@
 //! A Hugging Face model directory: graph, weights, tokenizer, template.
 
+mod arch;
+mod decoder;
 pub mod dflash;
 #[cfg(test)]
 mod dflash_test;
 pub mod encoder;
 pub mod flux2;
+mod gemma4;
 mod gguf;
 #[cfg(test)]
 mod gguf_test;
@@ -37,11 +40,11 @@ use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Shards, Stored, exlr8};
-use tessera_engine::decoder::{self, Config, Moe, Swiglu};
+use tessera_engine::decoder::Config;
 use tessera_engine::form::{BF16_FORM, F32_FORM, Load, named};
-use tessera_engine::gemma4;
 use tessera_engine::keys::{Keys, Offered};
-use tessera_engine::{Graph, Linear, Norm, Pins, Steps, Tensor, Weight};
+use tessera_engine::wasm::Module;
+use tessera_engine::{DimName, Graph, Pins, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
 
 /// One id or a list, the `generation_config.json` shape.
@@ -50,11 +53,6 @@ use tokenize::hf::Hf;
 enum Ids {
     One(u32),
     Many(Vec<u32>),
-}
-
-#[derive(Deserialize)]
-struct Arch {
-    model_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,7 +274,11 @@ pub fn each(
                 }
                 None => Weight::Packed(f, offer.packed(&c.name)?),
             },
-            (Stored::Bf16, _) => halves(offer, slice, c.rows)?,
+            (Stored::Bf16, None) => match offer.filed(&c.name) {
+                Some(file) => Weight::Filed(BF16_FORM, file),
+                None => halves(offer, slice, None)?,
+            },
+            (Stored::Bf16, rows) => halves(offer, slice, rows)?,
             _ => floats(offer, slice, c.rows, shape)?,
         };
         take(weight, f)?;
@@ -346,16 +348,6 @@ fn floats(
     Ok(Weight::Floats(Tensor::f32(shape, v)))
 }
 
-/// The step graph for an architecture name.
-pub(crate) fn stepper(arch: &str, c: &Config) -> Option<Graph> {
-    Some(match arch {
-        "qwen3" => decoder::stepper::<Norm, Swiglu>(c),
-        "llama" => decoder::stepper::<(), Swiglu>(c),
-        "granitemoe" => decoder::stepper::<(), Moe>(c),
-        _ => return None,
-    })
-}
-
 /// The architecture and graph sizes `dir/config.json` gives.
 pub(crate) fn config(
     dir: &Path,
@@ -367,8 +359,27 @@ pub(crate) fn config(
     })
 }
 
+/// The file whose presence marks an exlr8 release.
+const EXLR8: &str = "dense/exlr8-vocab.safetensors";
+
 /// The trellis width an exlr8 release's experts load at.
-const WIDTH: u32 = 3;
+pub(crate) const WIDTH: u32 = 3;
+
+/// Whether `dir` holds an exlr8 release.
+pub(crate) fn is_exlr8(dir: &Path) -> bool {
+    dir.join(EXLR8).is_file()
+}
+
+/// `dir`'s weights: an exlr8 release at `manifest`, or shards.
+pub(crate) fn offer(
+    dir: &Path,
+    manifest: Option<&str>,
+) -> Result<Box<dyn Offer>, Box<dyn Error + Send + Sync>> {
+    Ok(match is_exlr8(dir) {
+        true => Box::new(release(dir, manifest)?),
+        false => Box::new(Shards::open(dir)?),
+    })
+}
 
 /// Reads a model directory: `slots` sequences of `context` rows.
 pub fn load(dir: &Path, slots: u64, context: u64) -> Result<Bundle, Box<dyn Error + Send + Sync>> {
@@ -397,7 +408,7 @@ pub fn load_named(
 /// As `load_named`, with 1-based layer `taps` on stepping.
 pub fn load_tapped(
     dir: &Path,
-    [slots, context]: [u64; 2],
+    sizes: [u64; 2],
     user: &[Rule],
     steps: Steps,
     overrides: &Overrides,
@@ -408,59 +419,68 @@ pub fn load_tapped(
         if !taps.is_empty() {
             return Err("gguf checkpoints do not support step taps yet".into());
         }
-        return gguf::load(dir, slots, context, user, steps);
+        return gguf::load(dir, sizes[0], sizes[1], user, steps);
     }
     let json = overrides.merged("config.json", &dir.join("config.json"))?;
-    if mla::config(&json, slots, context).is_ok() {
-        let release = mla::stepping(
-            (dir, &json, manifest),
-            [slots, context],
-            WIDTH,
-            user,
-            steps,
-            taps,
-        )?;
-        let (graph, pins) = (release.graph.clone(), release.pins.clone());
-        return dressed(
-            dir,
-            graph,
-            Weights::Streamed(Box::new(release)),
-            pins,
-            Some(json),
-        );
+    let arch = arch::spot(&json)?;
+    let step = arch
+        .step
+        .ok_or_else(|| format!("{} has no step graph yet", arch.name))?;
+    let ask = arch::Ask {
+        dir,
+        sizes,
+        user,
+        steps,
+        overrides,
+        manifest,
+        taps,
+        json: &json,
+    };
+    let (graph, weights, pins) = step(arch, &ask)?;
+    dressed(dir, graph, weights, pins, Some(json))
+}
+
+/// `graph`'s weights held from `ask`'s folder, `rules` first.
+pub(crate) fn held(
+    ask: &arch::Ask,
+    graph: Graph,
+    layers: u64,
+    rules: &[Rule],
+) -> Result<arch::Built, Box<dyn Error + Send + Sync>> {
+    let offer = offer(ask.dir, ask.manifest)?;
+    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[rules, ask.user])?;
+    Ok((graph, Weights::Held(weights), pins))
+}
+
+/// A module's step graph over `dir`'s weights, if built.
+pub fn load_module(
+    dir: &Path,
+    sizes: [u64; 2],
+    user: &[Rule],
+    overrides: &Overrides,
+    module: &Module,
+) -> Result<Option<Bundle>, Box<dyn Error + Send + Sync>> {
+    if !module.builds() || dir.is_file() {
+        return Ok(None);
     }
-    let arch = serde_json::from_str::<Arch>(&json)?.model_type;
-    let (graph, layers, rules) = match arch.as_deref() {
-        Some("gemma4") => {
-            if !taps.is_empty() {
-                return Err("gemma4 does not support step taps yet".into());
-            }
-            let mut c = overrides.config(dir, |k| gemma4::Config::read(k, slots, context))?;
-            c.stack.steps = steps;
-            let rules = names::repo("gemma4").unwrap_or_default();
-            (gemma4::stepper::<Linear>(&c), c.stack.layers, rules)
-        }
-        Some("qwen3_5") => {
-            let class = qwen35::CLASS;
-            return Err(
-                format!("{class} has no step graph yet. tessera-eval --forward runs it").into(),
-            );
-        }
-        _ => {
-            let (arch, mut config) = config(dir, [slots, context], overrides)?;
-            config.stack.steps = steps;
-            config.stack.taps = taps.to_vec();
-            let graph = stepper(&arch, &config)
-                .ok_or_else(|| format!("{arch} is not a model this engine traces"))?;
-            (graph, config.stack.layers, Vec::new())
-        }
+    let json = overrides.merged("config.json", &dir.join("config.json"))?;
+    let Some(graph) = module.graph(&json, sizes[0], Some(sizes[1]))? else {
+        return Ok(None);
     };
-    let offer: Box<dyn Offer> = match dir.join("dense/exlr8-vocab.safetensors").exists() {
-        true => Box::new(release(dir, manifest)?),
-        false => Box::new(Shards::open(dir)?),
+    let layers = graph.dims.iter().find(|d| d.name == DimName::Layers);
+    let layers = layers.map_or(0, |d| d.size.max());
+    let ask = arch::Ask {
+        dir,
+        sizes,
+        user,
+        steps: Steps::Plain,
+        overrides,
+        manifest: None,
+        taps: &[],
+        json: &json,
     };
-    let (weights, pins) = pull(&graph, offer.as_ref(), layers, &[&rules, user])?;
-    dressed(dir, graph, Weights::Held(weights), pins, Some(json))
+    let (graph, weights, pins) = held(&ask, graph, layers, &[])?;
+    dressed(dir, graph, weights, pins, Some(json)).map(Some)
 }
 
 /// `dir`'s exlr8 release at `name`, or its only manifest.

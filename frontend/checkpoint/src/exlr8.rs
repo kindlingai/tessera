@@ -70,8 +70,8 @@ fn rows<T: Clone + Send>(
     let (tensor, book) = coded(f, &format!("{name}.rows"))?;
     let side = |s: &str| halves(f, &format!("{name}.{s}"));
     let (suh, svh) = (side("suh")?, side("svh")?);
-    let width = || Error::DType(format!("{name}: K{} {book:?}", r.k));
-    trellis::rows(r.k, book, &f.bytes(&tensor)?, [&suh, &svh], each).ok_or_else(width)
+    let bad = || Error::DType(format!("{name}: unreadable K{} {book:?} rows", r.k));
+    trellis::rows(r.k, book, &f.bytes(&tensor)?, [&suh, &svh], each).ok_or_else(bad)
 }
 
 /// Trellis matrix `name` packed: a header, then its entries.

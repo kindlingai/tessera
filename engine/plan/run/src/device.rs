@@ -1,7 +1,9 @@
 //! Replays a plan on any GPU over the device traits.
 
 use crate::Error;
+use crate::cache::Lru;
 use crate::grid::{self, Grid};
+use crate::held::Holds;
 use crate::kernels::Kernels;
 use crate::marks;
 use crate::overrides::{self, Overrides};
@@ -11,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::Settings;
@@ -23,8 +25,32 @@ use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot, S
 use tessera_mem::Buffer;
 use tessera_mem::form::Read;
 
-/// Recorded step range and its bound dims.
-type GraphKey = (usize, usize, Vec<(DimName, u32)>);
+/// Most inactive plans kept ready for instant switching.
+const MAX_PLANS: usize = 32;
+
+/// Most `(plan, bound)` graph sets kept alive at once.
+const MAX_GRAPHS: usize = 32;
+
+/// Plan id and bound dims sharing one graph set.
+type GraphKey = (u64, Vec<(DimName, u32)>);
+
+/// Recorded step ranges for one binding and its addresses.
+struct GraphSet<G> {
+    ptrs: Vec<u64>,
+    ranges: HashMap<(usize, usize), G>,
+}
+
+/// Compiled kernel and dispatch tables for one inactive plan.
+struct Prepared<K> {
+    plan: Plan,
+    launches: Vec<OnceLock<Vec<Call>>>,
+    kernels: Vec<K>,
+    planned: Vec<K>,
+    entries: Vec<(String, usize)>,
+    uses: Vec<usize>,
+    waits: Vec<bool>,
+    resident: Vec<bool>,
+}
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
@@ -46,8 +72,12 @@ pub(crate) struct Runner<D: Device> {
     /// Reloads that launches applied, for the next `refresh`.
     missed: Vec<Reload>,
     compiled: Kernels<D::Kernel>,
-    /// Recorded step ranges per binding, captured once.
-    graphs: HashMap<GraphKey, D::Graph>,
+    /// Inactive plans' compiled tables, for fast switching.
+    plans: Lru<u64, Prepared<D::Kernel>>,
+    /// Active plan's bound device addresses, in buffer order.
+    ptrs: Vec<u64>,
+    /// Recorded step ranges per `(plan, bound)`, bounded by LRU.
+    graphs: Lru<GraphKey, GraphSet<D::Graph>>,
     launching: Launching,
     /// Whether the device overlaps dependent launches at all.
     overlaps: bool,
@@ -63,6 +93,13 @@ pub(crate) struct Runner<D: Device> {
 
 /// Launches a closed gate holds, under any driver queue.
 const HELD: usize = 256;
+
+fn device_buf<D: Device>(buf: &Buffer) -> &DeviceBuffer<D> {
+    buf.backing()
+        .as_any()
+        .downcast_ref::<DeviceBuffer<D>>()
+        .expect("this runner allocates device buffers")
+}
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     pub fn new(plan: Plan, settings: &Settings) -> Result<Self, Error> {
@@ -80,7 +117,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             ledger: None,
             missed: Vec::new(),
             compiled: Kernels::default(),
-            graphs: HashMap::new(),
+            plans: Lru::new(MAX_PLANS),
+            ptrs: Vec::new(),
+            graphs: Lru::new(MAX_GRAPHS),
             launching: Launching::default(),
             // Asked once: asking may launch, and captures come later.
             overlaps: ctx.platform().limits.pdl,
@@ -94,10 +133,56 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     }
 
     fn buffer(&self, slot: Slot) -> &DeviceBuffer<D> {
-        let backing = self.base.held.get(slot).backing().as_any();
-        backing
-            .downcast_ref::<DeviceBuffer<D>>()
-            .expect("this runner allocates device buffers")
+        device_buf::<D>(self.base.held.get(slot))
+    }
+
+    fn bound_ptrs(&self) -> Vec<u64> {
+        self.base
+            .held
+            .bound()
+            .map(|b| device_buf::<D>(b).device_ptr())
+            .collect()
+    }
+
+    /// Destroys all recorded graphs after draining the stream.
+    fn clear_graphs(&mut self) {
+        if !self.graphs.is_empty() {
+            let _ = self.ctx.finish();
+            self.graphs.clear();
+        }
+    }
+
+    /// Moves the active plan's tables into the plan cache.
+    fn stash_plan(&mut self) {
+        let id = self.base.plan.id;
+        if id == 0 {
+            return;
+        }
+        let mut plan = Plan::default();
+        let mut launches = Vec::new();
+        self.base.swap(&mut plan, &mut launches);
+        let saved = Prepared {
+            plan,
+            launches,
+            kernels: std::mem::take(&mut self.kernels),
+            planned: std::mem::take(&mut self.planned),
+            entries: std::mem::take(&mut self.entries),
+            uses: std::mem::take(&mut self.uses),
+            waits: std::mem::take(&mut self.waits),
+            resident: std::mem::take(&mut self.resident),
+        };
+        self.plans.insert(id, saved);
+    }
+
+    /// Installs a cached plan's tables as active.
+    fn restore_plan(&mut self, mut cached: Prepared<<D as Device>::Kernel>) {
+        self.base.swap(&mut cached.plan, &mut cached.launches);
+        self.kernels = cached.kernels;
+        self.planned = cached.planned;
+        self.entries = cached.entries;
+        self.uses = cached.uses;
+        self.waits = cached.waits;
+        self.resident = cached.resident;
     }
 
     /// Each argument by position, in the device's form.
@@ -173,12 +258,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
 
     /// Opens the grid for each resident step of `plan`.
     fn ready(&mut self, plan: &Plan) -> Result<(), Error> {
-        let grid = self.grid.get_mut();
+        let Some(grid) = self.grid.get_mut().as_mut() else {
+            return Ok(());
+        };
         for (i, step) in plan.steps.iter().enumerate() {
-            let (Some(grid), true) = (grid.as_mut(), self.resident[i]) else {
-                continue;
-            };
-            grid.open(&step.kernel, step_layout(plan, step))?;
+            if self.resident[i] {
+                grid.open(&step.kernel, step_layout(plan, step))?;
+            }
         }
         Ok(())
     }
@@ -297,16 +383,49 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let mut bound: Vec<(DimName, u32)> =
             self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
         bound.sort_unstable();
-        let key = (steps.start, steps.end, bound);
-        if !self.graphs.contains_key(&key) {
+        let key = (self.base.plan.id, bound);
+        let range = (steps.start, steps.end);
+        let hit = self
+            .graphs
+            .get_mut(&key)
+            .is_some_and(|s| s.ptrs == self.ptrs && s.ranges.contains_key(&range));
+        if !hit {
             let graph = self.ctx.capture(|| self.launch_all(steps.clone()))?;
-            self.graphs.insert(key.clone(), graph);
+            let evicted = match self.graphs.get_mut(&key) {
+                Some(set) => {
+                    let stale = if set.ptrs != self.ptrs {
+                        set.ptrs = self.ptrs.clone();
+                        Some(std::mem::take(&mut set.ranges))
+                    } else {
+                        None
+                    };
+                    set.ranges.insert(range, graph);
+                    stale
+                }
+                None => {
+                    let mut ranges = HashMap::new();
+                    ranges.insert(range, graph);
+                    let set = GraphSet {
+                        ptrs: self.ptrs.clone(),
+                        ranges,
+                    };
+                    self.graphs.insert(key.clone(), set).map(|old| old.ranges)
+                }
+            };
+            if evicted.is_some() {
+                self.ctx.finish()?;
+            }
+            drop(evicted);
         }
         if !wait {
-            self.ctx.replay(&self.graphs[&key])?;
+            let graph = &self.graphs.get(&key).expect("captured above").ranges[&range];
+            self.ctx.replay(graph)?;
             return Ok(None);
         }
-        self.waited(timed, |r| Ok(r.ctx.replay(&r.graphs[&key])?))
+        self.waited(timed, |r| {
+            let graph = &r.graphs.get(&key).expect("captured above").ranges[&range];
+            Ok(r.ctx.replay(graph)?)
+        })
     }
 
     /// Notes each step's entry, once per distinct entry.
@@ -382,7 +501,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
         if !reloads.is_empty() {
             // Recorded launches name the kernels they replaced.
-            self.graphs.clear();
+            self.clear_graphs();
             self.apply();
             self.sync_grid();
         }
@@ -671,22 +790,46 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         if !self.base.fresh(plan)? {
             return Ok(());
         }
-        // Buffers may move, so recorded launches go stale.
-        self.graphs.clear();
         let ctx = self.ctx;
-        self.base.held.bind(plan, |zone, bytes| {
-            let buffer = DeviceBuffer::alloc(ctx, bytes)?;
+        let unified = ctx.unified();
+        let dropped = match self.base.held.bind(plan, |zone, bytes, holds| {
+            // The host reads weight files straight into pinned memory.
+            let buffer = match unified && holds == Holds::Weights {
+                true => DeviceBuffer::pinned(ctx, bytes)?,
+                false => DeviceBuffer::alloc(ctx, bytes)?,
+            };
             // Kernels may read what they are about to write.
             buffer.zero()?;
             Ok(Buffer::new(zone, buffer))
-        })?;
-        self.kernels.clear();
-        self.waits.clear();
-        self.resident = plan
+        }) {
+            Ok(dropped) => dropped,
+            Err(e) => {
+                self.clear_graphs();
+                return Err(e);
+            }
+        };
+        if dropped {
+            // Dropped buffers leave recorded device addresses stale.
+            self.clear_graphs();
+        }
+        self.ptrs = self.bound_ptrs();
+        if plan.id != 0
+            && let Some(cached) = self.plans.remove(&plan.id)
+        {
+            self.stash_plan();
+            self.restore_plan(cached);
+            self.apply();
+            self.sync_grid();
+            self.ready(plan)?;
+            return Ok(());
+        }
+        let resident: Vec<bool> = plan
             .steps
             .iter()
             .map(|s| s.kernel.resident().is_some())
             .collect();
+        let mut kernels = Vec::with_capacity(plan.steps.len());
+        let mut waits = Vec::with_capacity(plan.steps.len());
         for step in &plan.steps {
             let fixed = |text: &'static str, entry: &'static str| -> Result<_, Error> {
                 match text.contains("TS_MARK") {
@@ -698,10 +841,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
                 |source: &str, entry: &str| -> Result<_, Error> { Ok(ctx.compile(source, entry)?) };
             // Generated kernels wait on `griddepcontrol`. Fixed ones do not.
             let (kernel, generated) = self.compiled.get(step, D::BACKEND, fixed, made)?;
-            self.kernels.push(kernel);
-            self.waits.push(generated);
+            kernels.push(kernel);
+            waits.push(generated);
         }
-        self.planned = self.kernels.clone();
+        self.stash_plan();
+        self.planned = kernels.clone();
+        self.kernels = kernels;
+        self.waits = waits;
+        self.resident = resident;
         self.index(plan);
         self.apply();
         self.sync_grid();
@@ -769,7 +916,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
 
     fn launching(&mut self, launching: Launching) {
         self.launching = launching;
-        self.graphs.clear();
+        self.clear_graphs();
     }
 
     fn persist(&mut self, grid: Box<dyn Grid>) -> Result<(), Error> {

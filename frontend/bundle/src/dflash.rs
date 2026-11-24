@@ -1,7 +1,7 @@
 //! DFlash speculative bundle: tapped target plus cached drafter.
 
 use crate::names::Rule;
-use crate::{Bundle, Overrides, load_tapped, release};
+use crate::{Bundle, Overrides, load_tapped, offer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
@@ -435,11 +435,7 @@ pub fn load(
         true => stepper::<Norm>(&config),
         false => stepper::<()>(&config),
     };
-    let target_offer: Box<dyn Offer> =
-        match target_dir.join("dense/exlr8-vocab.safetensors").exists() {
-            true => Box::new(release(target_dir, manifest)?),
-            false => Box::new(Shards::open(target_dir)?),
-        };
+    let target_offer = offer(target_dir, manifest)?;
     let mut rules = extra_rules(&config, &draft_slices);
     rules.extend_from_slice(user);
     let draft_pins = {

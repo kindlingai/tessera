@@ -82,7 +82,7 @@ fn module_graph_matches() {
     let module = Module::open(&bytes).unwrap();
     // The module builds exactly the graph the engine would.
     let config = sprite::Config::upstream(SMALL, 4).unwrap();
-    let graph = module.graph(SMALL, 4).unwrap();
+    let graph = module.graph(SMALL, 4, None).unwrap();
     assert_eq!(graph, Some(sprite::program(&config)));
     // Tables match to rounding: wasm's sin and cos differ.
     let got = module.tables(SMALL).unwrap();

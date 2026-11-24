@@ -73,8 +73,13 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     };
     let at = [slots, context];
     let manifest = load.given("--manifest");
-    let loaded = tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
-        .map_err(|e| e.to_string())?;
+    let module = o.module.as_deref();
+    let built = module.map(|m| tessera_bundle::load_module(&o.model, at, &rules, &o.config, m));
+    let loaded = match built.transpose().map_err(|e| e.to_string())?.flatten() {
+        Some(bundle) => bundle,
+        None => tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
+            .map_err(|e| e.to_string())?,
+    };
     let scores = loaded.graph.entries.len() > 1;
     let mut recipe = lowering(o, loaded.pins);
     if recipe.config.is_none() {

@@ -166,6 +166,12 @@ impl Api for Runtime {
         register: (
             hip_host_register, "hipHostRegister", hip::HOST_REGISTER_MAPPED, hip_host_unregister
         ),
+        ipc: (
+            hip_ipc_get_mem_handle, "hipIpcGetMemHandle",
+            hip_ipc_open_mem_handle, "hipIpcOpenMemHandle",
+            hip::IPC_LAZY_ENABLE_PEER,
+            hip_ipc_close_mem_handle
+        ),
         occupancy: (hip_occupancy, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor"),
         zero: (hip_memset, "hipMemset"),
     }

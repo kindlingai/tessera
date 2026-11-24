@@ -50,10 +50,12 @@ fn turned(
             xs[to + 3] = t.d;
         }
         barrier();
-        for i in 0..SPAN {
-            let c = w[col as u64 * k as u64 + (k0 + i) as u64];
+        for i in (0..SPAN).by(4) {
+            let c = w.load4(col as u64 * k as u64 + (k0 + i) as u64);
             for row in 0..m as u32 {
-                sums[row as usize] += xs[row * SPAN + i] * c;
+                let at = row * SPAN + i;
+                sums[row as usize] +=
+                    xs[at] * c.x + xs[at + 1] * c.y + xs[at + 2] * c.z + xs[at + 3] * c.w;
             }
         }
         barrier();

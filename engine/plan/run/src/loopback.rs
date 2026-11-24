@@ -46,6 +46,13 @@ impl Loopback {
 
     /// Every rank takes its part of the weight as stored.
     pub fn load_weight(&mut self, weight: u32, w: &Weight) -> Result<(), Error> {
+        // Ranks share one read of a weight file.
+        let read = match &self.ranks[..] {
+            [first, _, ..] => w.held(first.base().reads),
+            _ => Ok(None),
+        };
+        let read = read.map_err(|e| Error::WeightRead(weight, e))?;
+        let w = read.as_ref().unwrap_or(w);
         for r in &mut self.ranks {
             r.load_weight(weight, w)?;
         }

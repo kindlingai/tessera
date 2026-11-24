@@ -24,14 +24,19 @@ fn near_copies_found() {
         win("a.cu", 1),
     ];
     let embs = [unit(0.0), unit(0.0), unit(0.1), unit(1.0), unit(0.0)];
-    let (hits, _) = near(&wins, &embs, 20, 0.99, &Allow::parse("pairs = []").unwrap());
+    let none = Allow::parse("pairs = []").unwrap();
+    let (hits, _) = near(&wins, &embs, (20, 0.99), &none, None);
     // a.rs windows overlap. a.cu is another language.
     let found: Vec<_> = hits.iter().map(|h| (h.a, h.b, h.count)).collect();
     assert_eq!(found, [(0, 2, 2)]);
     let ab = Allow::parse(r#"pairs = [["b.rs", "a.rs"], ["c.rs", "a.rs"]]"#).unwrap();
-    let (hits, used) = near(&wins, &embs, 20, 0.99, &ab);
+    let (hits, used) = near(&wins, &embs, (20, 0.99), &ab, None);
     assert!(hits.is_empty());
     // c.rs is far from a.rs, so its pair allows nothing.
     let stale = ab.stale(&used);
     assert_eq!(stale, [&("c.rs".to_string(), "a.rs".to_string())]);
+    // Focus on c.rs skips the a.rs and b.rs pair.
+    let focus = [false, false, false, true, false];
+    let (hits, _) = near(&wins, &embs, (20, 0.99), &none, Some(&focus));
+    assert!(hits.is_empty());
 }
