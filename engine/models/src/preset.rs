@@ -2,6 +2,7 @@
 
 use tessera_trace::Graph;
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use scattered_collect::declarative::{gather, scatter};
 
 /// A model's graphs by name.
