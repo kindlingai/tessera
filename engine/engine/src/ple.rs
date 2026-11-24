@@ -41,7 +41,7 @@ pub struct PleStore {
     data: Vec<u16>,
     mask: usize,
     scratch: Vec<u8>,
-    ctx: Vec<[i32; 2]>,
+    tokens: Vec<Vec<i32>>,
     prev_pos: Vec<u32>,
     last_row: Vec<Vec<f32>>,
 }
@@ -58,7 +58,7 @@ impl PleStore {
             data: vec![0u16; cap * cfg.row_dim],
             mask: cap - 1,
             scratch: vec![0u8; row_bytes],
-            ctx: Vec::new(),
+            tokens: Vec::new(),
             prev_pos: Vec::new(),
             last_row: Vec::new(),
             cfg,
@@ -105,12 +105,12 @@ impl PleStore {
     }
 
     fn ensure_slot(&mut self, slot: usize) {
-        if slot < self.ctx.len() {
+        if slot < self.tokens.len() {
             return;
         }
         let n = slot + 1;
         let width = self.cfg.embed_dim();
-        self.ctx.resize(n, [self.cfg.eos_token; 2]);
+        self.tokens.resize_with(n, Vec::new);
         self.prev_pos.resize(n, u32::MAX);
         self.last_row.resize_with(n, || vec![0.0; width]);
     }
@@ -127,16 +127,33 @@ impl PleStore {
             let s = row.slot as usize;
             self.ensure_slot(s);
             let dst = &mut out[r * width..(r + 1) * width];
-            if row.position == self.prev_pos[s] {
+            let pos = row.position as usize;
+            let tok = row.token as i32;
+            if row.position == self.prev_pos[s] && self.tokens[s].get(pos).copied() == Some(tok) {
                 dst.copy_from_slice(&self.last_row[s]);
                 continue;
             }
-            if row.position == 0 {
-                self.ctx[s] = [self.cfg.eos_token; 2];
+            let eos = self.cfg.eos_token;
+            if pos == 0 {
+                self.tokens[s].clear();
             }
-            let tok = row.token as i32;
-            let ids = self.hash_token(tok, self.ctx[s]);
-            self.ctx[s] = [self.ctx[s][1], tok];
+            if self.tokens[s].len() <= pos {
+                self.tokens[s].resize(pos + 1, eos);
+            }
+            let ctx = [
+                if pos >= 2 {
+                    self.tokens[s][pos - 2]
+                } else {
+                    eos
+                },
+                if pos >= 1 {
+                    self.tokens[s][pos - 1]
+                } else {
+                    eos
+                },
+            ];
+            self.tokens[s][pos] = tok;
+            let ids = self.hash_token(tok, ctx);
             for (h, &id) in ids.iter().enumerate() {
                 self.fetch_bf16(id, &mut row_buf[h * dim..(h + 1) * dim])?;
             }

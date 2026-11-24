@@ -404,6 +404,9 @@ pub(crate) fn run_speculate<S>(
         }
         let (posterior, block_taps) = target.step_taps_local(&verify)?;
         let (accepted, bonus) = accept_greedy(&drafts, &posterior);
+        if accepted < drafts.len() && target.stateful() && target.slots() > 1 {
+            target.restore_recurrent_slot(accepted + 1)?;
+        }
         if lead && !st.stopped {
             st.stats.steps += 1;
             st.stats.drafted += drafts.len();

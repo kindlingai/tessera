@@ -375,7 +375,7 @@ pub fn hidden(m: &Model, c: &Config, w: &Qwen35, tokens: &Tensor, positions: &Te
             };
             let x = x.add(&mixed);
             let h = norm(&x, &l.common.ln2, c.eps);
-            let [mlp] = m.composite(Swiglu::KIND, || [l.common.mlp.apply(m, &h)]);
+            let [mlp] = m.composite(<Swiglu>::KIND, || [l.common.mlp.apply(m, &h)]);
             [x.add(&mlp)]
         });
         x = out;

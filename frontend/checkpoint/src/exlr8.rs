@@ -20,6 +20,7 @@ const FP8_ROW: i64 = 5;
 const BF16: i64 = 6;
 const FP32: i64 = 7;
 const ROWS: i64 = 9;
+const INT2: i64 = 10;
 
 /// A matrix's record: format, shape, trellis width, sharded side.
 struct Record {
@@ -167,6 +168,7 @@ fn plain(f: &File, name: &str, r: &Record, format: i64) -> Result<Vec<f32>, Erro
 fn block_form(format: i64) -> Option<&'static dyn Form> {
     match format {
         INT4 => Some(&block::INT4_G32),
+        INT2 => Some(&block::INT2_G32),
         MXFP8 => Some(&block::MXFP8),
         _ => None,
     }
@@ -182,6 +184,7 @@ fn blocks(
     // One scale and 32 codes per 32 inputs.
     let (scale_part, code_part, scale_bytes, code_bytes) = match r.format {
         INT4 => ("s4", "q4", 2, 16),
+        INT2 => ("s2", "q2", 2, 8),
         _ => ("e8m0", "fp8", 1, 32),
     };
     let scales = f.bytes(&format!("{name}.{scale_part}"))?;
@@ -721,7 +724,10 @@ impl Release {
                 return (VOCAB.into(), format!("{stem}{end}"));
             }
         }
-        let matrix = name.strip_suffix(".weight").unwrap_or(name);
+        let matrix = name
+            .strip_suffix(".weight")
+            .or_else(|| name.strip_suffix(".codes"))
+            .unwrap_or(name);
         for extra in &d.extras {
             let holds = |f: &File| {
                 Ok(f.shape(name).is_some() || f.shape(&format!("{matrix}.record")).is_some())
@@ -843,7 +849,7 @@ impl Release {
         // Each matrix's stored parts, then codebook-named codes.
         let parts = [
             "record", "checksum", "trellis", "rows", "suh", "svh", "fp8", "scale", "q4", "s4",
-            "e8m0", "bf16", "fp32",
+            "q2", "s2", "e8m0", "bf16", "fp32",
         ];
         let part = |n: &str| {
             n.rsplit_once('.')

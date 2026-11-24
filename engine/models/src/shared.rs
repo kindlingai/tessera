@@ -61,6 +61,24 @@ impl Dense for Rotated {
     }
 }
 
+/// Rotated matrix whose input is already Hadamard-rotated.
+pub(crate) struct PreRotated(Rotated);
+
+impl Weights for PreRotated {
+    fn declare(m: &Model, path: &mut Vec<PathSeg>, shape: &[DimExpr]) -> Self {
+        Self(Rotated::declare(m, path, shape))
+    }
+}
+
+impl Dense for PreRotated {
+    fn apply(&self, x: &Tensor) -> Tensor {
+        x.mul_vector(&self.0.suh)
+            .matmul(&self.0.w)
+            .hadamard(ROTATION)
+            .mul_vector(&self.0.svh)
+    }
+}
+
 /// Which projection a head transform is applied to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Side {

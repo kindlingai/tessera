@@ -1,8 +1,12 @@
 use crate::dflash::{Overlay, draft_pins, extra_rules, has_norms};
 use crate::names;
 use tessera_checkpoint::{Error, Offer, Slice, Stored};
-use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, default_layers, stepper};
+use tessera_engine::block::{INT2_G32, INT4_G32};
+use tessera_engine::dflash::{
+    Config, DraftQuant, TargetSpec, default_layers, stepper, stepper_rotated,
+};
 use tessera_engine::keys::{Keys, Offered};
+use tessera_engine::trellis::{Codebook, form_for};
 use tessera_engine::{Norm, PathSeg};
 
 struct Mock(Vec<Slice>);
@@ -228,4 +232,119 @@ fn mxfp8_quant() {
     );
     let all_mx = draft_pins(&g, &ov, cfg.stack.layers, &[&extra], DraftQuant::MxFp8All).unwrap();
     assert_eq!(all_mx.form(&g.weights[1].path).name(), "mxfp8");
+}
+
+fn rotated_slices() -> Vec<Slice> {
+    let k3 = Stored::Form(form_for(3, Codebook::Pmcgx).unwrap());
+    let k2 = Stored::Form(form_for(2, Codebook::Pmcgx).unwrap());
+    let slf = |name: String, shape: &[usize], stored: Stored| Slice {
+        name,
+        shape: shape.to_vec(),
+        stored,
+    };
+    let mut out = vec![
+        sl("hidden_norm.weight", &[512]),
+        sl("norm.weight", &[512]),
+        sl("layers.0.input_layernorm.weight", &[512]),
+        sl("layers.0.post_attention_layernorm.weight", &[512]),
+        sl("layers.0.self_attn.q_norm.weight", &[128]),
+        sl("layers.0.self_attn.k_norm.weight", &[128]),
+        sl("layers.0.attention_conv.base_kernel", &[2, 2, 512]),
+        sl(
+            "layers.0.attention_conv.kernel_projection.weight",
+            &[32, 512],
+        ),
+        sl("layers.0.mlp_conv.base_kernel", &[2, 2, 512]),
+        sl("layers.0.mlp_conv.kernel_projection.weight", &[32, 512]),
+        sl("tiered_head.proj.weight", &[256, 512]),
+        slf(
+            "tiered_head.hi.weight".into(),
+            &[256, 128],
+            Stored::Form(&INT4_G32),
+        ),
+        slf(
+            "tiered_head.lo.weight".into(),
+            &[256, 128],
+            Stored::Form(&INT2_G32),
+        ),
+        sl("candidate_selector.hidden_projection.weight", &[64, 512]),
+        slf(
+            "candidate_selector.pred_u.weight".into(),
+            &[256, 32],
+            Stored::Form(&INT4_G32),
+        ),
+        sl("candidate_selector.pred_v.weight", &[64, 32]),
+        slf(
+            "candidate_selector.succ_u.weight".into(),
+            &[256, 32],
+            Stored::Form(&INT4_G32),
+        ),
+        sl("candidate_selector.succ_v.weight", &[64, 32]),
+    ];
+    for (stem, shape, st) in [
+        ("fc", &[512usize, 1024][..], k3),
+        ("layers.0.self_attn.q_proj", &[512, 512], k3),
+        ("layers.0.self_attn.k_proj", &[256, 512], k3),
+        ("layers.0.self_attn.v_proj", &[256, 512], k3),
+        ("layers.0.self_attn.o_proj", &[512, 512], k3),
+        ("layers.0.mlp.gate_proj", &[1024, 512], k2),
+        ("layers.0.mlp.up_proj", &[1024, 512], k2),
+        ("layers.0.mlp.down_proj", &[512, 1024], k3),
+    ] {
+        out.push(slf(format!("{stem}.codes"), shape, st));
+        out.push(slf(format!("{stem}.suh"), &[shape[1]], Stored::F16));
+        out.push(slf(format!("{stem}.svh"), &[shape[0]], Stored::F16));
+    }
+    out
+}
+
+fn check_rotated_pins(cfg: &Config) {
+    let draft = rotated_slices();
+    let tgt = vec![
+        sl("model.embed_tokens.weight", &[256, 512]),
+        sl("lm_head.weight", &[256, 512]),
+    ];
+    let g = stepper_rotated::<Norm>(cfg);
+    let extra = extra_rules(cfg, &draft);
+    let (a, b) = (Mock(draft), Mock(tgt));
+    let pins = draft_pins(
+        &g,
+        &Overlay::new(&a, &b),
+        cfg.stack.layers,
+        &[&extra],
+        DraftQuant::MxFp8,
+    )
+    .unwrap();
+    let form_of = |dot: &str| {
+        g.weights
+            .iter()
+            .find(|w| PathSeg::dotted(&w.path) == dot)
+            .map(|w| pins.form(&w.path).name())
+    };
+    assert_eq!(form_of("head"), None);
+    for (dot, want) in [
+        ("tiered_head.hi", "int4_g32"),
+        ("tiered_head.lo", "int2_g32"),
+        ("candidate_selector.pred_u", "int4_g32"),
+        ("candidate_selector.succ_u", "int4_g32"),
+        ("fc.w", "trellis_k3_pmcgx"),
+        ("layers.0.mlp.gate.w", "trellis_k2_pmcgx"),
+        ("layers.0.mlp.down.w", "trellis_k3_pmcgx"),
+    ] {
+        assert_eq!(form_of(dot), Some(want), "weight {dot}");
+    }
+}
+
+#[test]
+fn rotated_pins() {
+    let target = TargetSpec {
+        vocab: 256,
+        hidden: 512,
+        layers: 8,
+        tied: false,
+    };
+    let json = r#"{"block_size":8,"hidden_size":512,"intermediate_size":1024,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":128,"num_hidden_layers":1,"rms_norm_eps":1e-6,"rope_theta":1e6,"dflash_config":{"block_size":8,"conv_group_size":64,"conv_kernel_size":2,"mask_token_id":0,"selector_rank":64,"selector_top_k":4,"selector_svd_rank":32,"shared_tap_gauge":true,"tiered_head":{"hi_dim":128,"lo_dim":128},"target_layer_ids":[1,5]}}"#;
+    let cfg = read_cfg(json, &target);
+    assert!(cfg.shared_tap_gauge && cfg.tap_layers() == vec![1002, 1006]);
+    check_rotated_pins(&cfg);
 }

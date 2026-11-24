@@ -3,7 +3,7 @@
 use crate::decoder::{HeadNorm, Layer, Mlp, Swiglu};
 pub use crate::dflash_shard::shard;
 use crate::keys::Keys;
-use crate::shared::{Stack, join_rows, with_head};
+use crate::shared::{Dense, PreRotated, Rotated, Stack, join_rows, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -23,6 +23,15 @@ pub struct ConvConfig {
 pub struct SelectorConfig {
     pub rank: u64,
     pub top_k: u64,
+    /// Optional SVD rank for compressed INT4 codebooks.
+    pub svd_rank: Option<u64>,
+}
+
+/// Tiered Act-PCA vocab shortlist head dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TieredHeadConfig {
+    pub hi_dim: u64,
+    pub lo_dim: u64,
 }
 
 /// Adjacent causal injection bridge dimensions for DSpine drafters.
@@ -80,6 +89,10 @@ pub struct Config {
     pub selector: Option<SelectorConfig>,
     /// Optional adjacent causal injection bridge (DSpine).
     pub bridge: Option<BridgeConfig>,
+    /// Optional tiered Act-PCA vocab head (4b+2b).
+    pub tiered_head: Option<TieredHeadConfig>,
+    /// True when target emits pre-rotated `x_had` taps.
+    pub shared_tap_gauge: bool,
     pub output_multiplier: f32,
     pub logit_softcap: Option<f32>,
     /// On-load quantization mode for eligible BF16 linear weights.
@@ -169,12 +182,17 @@ impl Config {
         };
         let rank: Option<u64> = k.or(&["dflash_config.selector_rank"], None);
         let top_k: Option<u64> = k.or(&["dflash_config.selector_top_k"], None);
+        let svd_rank: Option<u64> = k.or(&["dflash_config.selector_svd_rank"], None);
         let selector = match (rank, top_k) {
             (Some(rank), Some(top_k)) => {
                 if rank == 0 || top_k == 0 {
                     k.misfit("selector_top_k", "selector rank and top_k must be positive");
                 }
-                Some(SelectorConfig { rank, top_k })
+                Some(SelectorConfig {
+                    rank,
+                    top_k,
+                    svd_rank,
+                })
             }
             (None, None) => None,
             _ => {
@@ -182,6 +200,15 @@ impl Config {
                 None
             }
         };
+        let th_hi: Option<u64> = k.or(&["dflash_config.tiered_head.hi_dim"], None);
+        let th_lo: Option<u64> = k.or(&["dflash_config.tiered_head.lo_dim"], None);
+        let tiered_head = match (th_hi, th_lo) {
+            (Some(hi_dim), Some(lo_dim)) if hi_dim > 0 && lo_dim > 0 => {
+                Some(TieredHeadConfig { hi_dim, lo_dim })
+            }
+            _ => None,
+        };
+        let shared_tap_gauge: bool = k.or(&["dflash_config.shared_tap_gauge"], false);
         let bridge_code: Option<u64> = k.or(
             &[
                 "dflash_config.selected_prefix_code_bridge.code_size",
@@ -261,6 +288,8 @@ impl Config {
             conv,
             selector,
             bridge,
+            tiered_head,
+            shared_tap_gauge,
             output_multiplier,
             logit_softcap,
             quant,
@@ -292,15 +321,18 @@ impl Config {
             conv: None,
             selector: None,
             bridge: None,
+            tiered_head: None,
+            shared_tap_gauge: false,
             output_multiplier: 1.0,
             logit_softcap: None,
             quant: DraftQuant::MxFp8,
         }
     }
 
-    /// 1-based layer positions for `Stack::taps`.
+    /// 1-based layer positions for `Stack::taps` (offset +1000 for gauge taps).
     pub fn tap_layers(&self) -> Vec<u64> {
-        self.target_layers.iter().map(|&l| l + 1).collect()
+        let base = if self.shared_tap_gauge { 1001 } else { 1 };
+        self.target_layers.iter().map(|&l| l + base).collect()
     }
 
     /// Concatenated target tap width fed to `fc`.
@@ -322,15 +354,15 @@ impl Config {
 
 /// Drafter weights. Untied output heads sit beside them.
 #[derive(Weights)]
-pub struct Drafter<N: HeadNorm> {
+pub struct Drafter<N: HeadNorm, F: Dense = Linear, D: Dense = Linear> {
     #[shape(Vocab, Hidden)]
     pub embed: Embed,
     #[shape(Embedding, Hidden)]
-    pub fc: Linear,
+    pub fc: F,
     #[shape(Hidden)]
     pub hidden_norm: Norm,
     #[shape(Layers)]
-    pub layers: Vec<Layer<N, Swiglu>>,
+    pub layers: Vec<Layer<N, Swiglu<D>, D>>,
     #[shape(Hidden)]
     pub norm: Norm,
 }
@@ -380,10 +412,10 @@ fn entry_ports(m: &Model, block: u64) -> Ports {
 }
 
 /// Non-causal block attention over cached context and noise KV.
-fn attention<N: HeadNorm>(
+fn attention<N: HeadNorm, D: Dense>(
     m: &Model,
     c: &Config,
-    l: &Layer<N, Swiglu>,
+    l: &Layer<N, Swiglu<D>, D>,
     ctx: &Tensor,
     h: &Tensor,
     p: &Ports,
@@ -392,23 +424,23 @@ fn attention<N: HeadNorm>(
     let blk: DimExpr = c.block_size.into();
     let kv_rows: DimExpr = Rows + c.block_size;
     let kv_in = join_rows(ctx, h);
-    let q = h
-        .matmul(&l.q)
-        .reshape(vec![blk.clone(), Heads.into(), HeadDim.into()]);
+    let q =
+        l.q.apply(h)
+            .reshape(vec![blk.clone(), Heads.into(), HeadDim.into()]);
     let q = l
         .q_norm
         .apply(q, c.eps)
         .rope(&p.block_pos, c.rope_theta, Pairs::Halves);
-    let k = kv_in
-        .matmul(&l.k)
-        .reshape(vec![kv_rows.clone(), KvHeads.into(), HeadDim.into()]);
+    let k =
+        l.k.apply(&kv_in)
+            .reshape(vec![kv_rows.clone(), KvHeads.into(), HeadDim.into()]);
     let k = l
         .k_norm
         .apply(k, c.eps)
         .rope(&p.kv_pos, c.rope_theta, Pairs::Halves);
-    let v = kv_in
-        .matmul(&l.v)
-        .reshape(vec![kv_rows, KvHeads.into(), HeadDim.into()]);
+    let v =
+        l.v.apply(&kv_in)
+            .reshape(vec![kv_rows, KvHeads.into(), HeadDim.into()]);
     let by = [&p.kv_slots, &p.kv_pos];
     let (k, v) = (k.append(keys, by), v.append(values, by));
     let scale = 1.0 / (c.stack.head_dim as f32).sqrt();
@@ -423,7 +455,7 @@ fn attention<N: HeadNorm>(
         [&p.block_slots, &p.attend_pos],
         None,
     );
-    attn.reshape(vec![blk, Heads * HeadDim]).matmul(&l.o)
+    l.o.apply(&attn.reshape(vec![blk, Heads * HeadDim]))
 }
 
 /// Weights for one DFlash2 grouped dynamic causal convolution.
@@ -534,34 +566,88 @@ impl ConvWeights {
     }
 }
 
+/// Tiered Act-PCA + H128 vocab shortlist head (`4b@hi + 2b@lo`).
+struct TieredHeadWeights {
+    proj: Linear,
+    hi: Linear,
+    lo: Linear,
+}
+
+impl TieredHeadWeights {
+    fn declare(m: &Model, cfg: TieredHeadConfig) -> Self {
+        let wt = |leaf: &str, shape: Vec<DimExpr>| {
+            let p = [
+                PathSeg::Field("tiered_head".into()),
+                PathSeg::Field(leaf.into()),
+            ];
+            Linear::of(m.weight(&p, TensorType::new(shape, DType::F32)))
+        };
+        Self {
+            proj: wt(
+                "proj",
+                vec![(cfg.hi_dim + cfg.lo_dim).into(), Hidden.into()],
+            ),
+            hi: wt("hi", vec![Vocab.into(), cfg.hi_dim.into()]),
+            lo: wt("lo", vec![Vocab.into(), cfg.lo_dim.into()]),
+        }
+    }
+
+    fn apply(&self, draft: &Tensor, cfg: TieredHeadConfig) -> Tensor {
+        let x_rot = draft.matmul(&self.proj);
+        let hi = x_rot.slice(1, 0u64, cfg.hi_dim).matmul(&self.hi);
+        let lo = x_rot.slice(1, cfg.hi_dim, cfg.lo_dim).matmul(&self.lo);
+        hi.add(&lo)
+    }
+}
+
+/// Codebook table storage: dense BF16 or SVD-factored INT4.
+enum SelectorCodebooks {
+    Dense {
+        pred: Tensor,
+        succ: Tensor,
+    },
+    Svd {
+        pred_u: Tensor,
+        pred_v: Linear,
+        succ_u: Tensor,
+        succ_v: Linear,
+        svd_rank: u64,
+    },
+}
+
 /// Weights for the DFlash2 bilinear candidate path selector.
 struct SelectorWeights {
     proj: Linear,
-    pred: Tensor,
-    succ: Tensor,
+    books: SelectorCodebooks,
 }
 
 impl SelectorWeights {
     fn declare(m: &Model, sel: SelectorConfig) -> Self {
-        let path = |leaf: &str| {
-            vec![
+        let wt = |leaf: &str, shape: Vec<DimExpr>| {
+            let p = [
                 PathSeg::Field("candidate_selector".into()),
                 PathSeg::Field(leaf.into()),
-            ]
+            ];
+            m.weight(&p, TensorType::new(shape, DType::F32))
         };
-        let proj = Linear::of(m.weight(
-            &path("hidden_projection"),
-            TensorType::new(vec![sel.rank.into(), Hidden.into()], DType::F32),
+        let proj = Linear::of(wt(
+            "hidden_projection",
+            vec![sel.rank.into(), Hidden.into()],
         ));
-        let pred = m.weight(
-            &path("predecessor_codebook"),
-            TensorType::new(vec![Vocab.into(), sel.rank.into()], DType::F32),
-        );
-        let succ = m.weight(
-            &path("successor_codebook"),
-            TensorType::new(vec![Vocab.into(), sel.rank.into()], DType::F32),
-        );
-        Self { proj, pred, succ }
+        let books = match sel.svd_rank {
+            Some(r_svd) => SelectorCodebooks::Svd {
+                pred_u: wt("pred_u", vec![Vocab.into(), r_svd.into()]),
+                pred_v: Linear::of(wt("pred_v", vec![sel.rank.into(), r_svd.into()])),
+                succ_u: wt("succ_u", vec![Vocab.into(), r_svd.into()]),
+                succ_v: Linear::of(wt("succ_v", vec![sel.rank.into(), r_svd.into()])),
+                svd_rank: r_svd,
+            },
+            None => SelectorCodebooks::Dense {
+                pred: wt("predecessor_codebook", vec![Vocab.into(), sel.rank.into()]),
+                succ: wt("successor_codebook", vec![Vocab.into(), sel.rank.into()]),
+            },
+        };
+        Self { proj, books }
     }
 
     fn lattice(
@@ -582,23 +668,36 @@ impl SelectorWeights {
             unary = unary.scale(1.0 / cap).act(Act::Tanh).scale(cap);
         }
         let proj = draft.matmul(&self.proj);
-        let anchor = self
-            .pred
-            .gather(block_tokens)
-            .slice(0, 0u64, 1u64)
-            .expand(0, k);
         let cands_flat = cands.reshape(vec![(n * k).into()]);
-        let pred = if n > 1 {
-            let prev = self.pred.gather(&cands_flat).slice(0, 0u64, (n - 1) * k);
-            join_rows(&anchor, &prev)
-        } else {
-            anchor
-        }
-        .reshape(vec![n.into(), k.into(), r.into()]);
-        let succ = self
-            .succ
-            .gather(&cands_flat)
-            .reshape(vec![n.into(), k.into(), r.into()]);
+        let gather_side = |tbl: &Tensor, width: u64, with_anchor: bool| {
+            if with_anchor {
+                let anchor = tbl.gather(block_tokens).slice(0, 0u64, 1u64).expand(0, k);
+                if n > 1 {
+                    let prev = tbl.gather(&cands_flat).slice(0, 0u64, (n - 1) * k);
+                    join_rows(&anchor, &prev)
+                } else {
+                    anchor
+                }
+            } else {
+                tbl.gather(&cands_flat)
+            }
+            .reshape(vec![n.into(), k.into(), width.into()])
+        };
+        let (pred, succ) = match &self.books {
+            SelectorCodebooks::Dense { pred, succ } => {
+                (gather_side(pred, r, true), gather_side(succ, r, false))
+            }
+            SelectorCodebooks::Svd {
+                pred_u,
+                pred_v,
+                succ_u,
+                succ_v,
+                svd_rank,
+            } => (
+                gather_side(pred_u, *svd_rank, true).matmul(pred_v),
+                gather_side(succ_u, *svd_rank, false).matmul(succ_v),
+            ),
+        };
         let lhs = pred.mul(
             &proj
                 .reshape(vec![n.into(), 1u64.into(), r.into()])
@@ -771,15 +870,34 @@ impl BridgeWeights {
     }
 }
 
-/// Cached DFlash step graph: block plus taps in, drafts out.
+/// Cached DFlash step graph over plain BF16/MXFP8 linears.
 pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
+    stepper_with::<N, Linear, Linear>(c)
+}
+
+/// Cached DFlash step graph over rotated trellis linears.
+pub fn stepper_rotated<N: HeadNorm>(c: &Config) -> Graph {
+    if c.shared_tap_gauge {
+        stepper_with::<N, PreRotated, Rotated>(c)
+    } else {
+        stepper_with::<N, Rotated, Rotated>(c)
+    }
+}
+
+/// Cached DFlash step graph over generic `Dense` storage.
+fn stepper_with<N: HeadNorm, F: Dense, D: Dense>(c: &Config) -> Graph {
     assert!(c.block_size >= 2, "dflash block_size must be at least 2");
     assert!(
         !c.target_layers.is_empty(),
         "dflash requires at least one target layer"
     );
     let m = Model::new(c.dims());
-    let (w, head) = with_head::<Drafter<N>>(&m, c.tied);
+    let (w, head) = if c.tiered_head.is_some() {
+        (Drafter::<N, F, D>::declare(&m, &mut Vec::new(), &[]), None)
+    } else {
+        with_head::<Drafter<N, F, D>>(&m, c.tied)
+    };
+    let tiered = c.tiered_head.map(|th| TieredHeadWeights::declare(&m, th));
     let convs: Option<Vec<[ConvWeights; 2]>> = c.conv.map(|cv| {
         (0..c.stack.layers)
             .map(|i| {
@@ -801,7 +919,7 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
         .iter()
         .map(|_| [m.kept(ty.clone()), m.kept(ty.clone())])
         .collect();
-    let ctx = p.ctx_taps.matmul(&w.fc).rms_norm(&w.hidden_norm, c.eps);
+    let ctx = w.fc.apply(&p.ctx_taps).rms_norm(&w.hidden_norm, c.eps);
     let mut x = m.embed(&p.block_tokens, &w.embed);
     let mut stash: Option<(Tensor, Tensor, Tensor)> = None;
     for (i, l) in w.layers.iter().enumerate() {
@@ -825,10 +943,10 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
             let mlp = match (c.conv, &convs) {
                 (Some(cv), Some(cs)) => {
                     let (hc, k_mlp) = cs[i][1].prepare(&h, c.block_size, c.stack.hidden, cv);
-                    let [y] = m.composite(Swiglu::KIND, || [l.mlp.apply(&m, &hc)]);
+                    let [y] = m.composite(Swiglu::<D>::KIND, || [l.mlp.apply(&m, &hc)]);
                     cs[i][1].finish(&y, &k_mlp, c.block_size, c.stack.hidden, cv)
                 }
-                _ => m.composite(Swiglu::KIND, || [l.mlp.apply(&m, &h)])[0].clone(),
+                _ => m.composite(Swiglu::<D>::KIND, || [l.mlp.apply(&m, &h)])[0].clone(),
             };
             [x.add(&mlp)]
         });
@@ -843,9 +961,15 @@ pub fn stepper<N: HeadNorm>(c: &Config) -> Graph {
     let h = x.rms_norm(&w.norm, c.eps);
     let n = c.block_size - 1;
     let draft = h.slice(0, 1u64, n);
-    let head = head.as_ref().unwrap_or(&w.embed);
-    let logits = draft.unembed(head);
+    let logits = match (c.tiered_head, &tiered) {
+        (Some(th_cfg), Some(th)) => th.apply(&draft, th_cfg),
+        _ => {
+            let head = head.as_ref().unwrap_or(&w.embed);
+            draft.unembed(head)
+        }
+    };
     if let (Some(b_cfg), Some(b), Some((raw, rms, q))) = (c.bridge, &bridge, stash) {
+        let head = head.as_ref().unwrap_or(&w.embed);
         let (cands, scores) = b.refine(
             &m,
             c,

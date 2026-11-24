@@ -110,6 +110,20 @@ impl Code for Nibble {
     }
 }
 
+/// Symmetric int2: 2-bit levels {-1.5, -0.5, +0.5, +1.5}.
+pub struct Crumb;
+
+impl Code for Crumb {
+    const BITS: u32 = 2;
+    const MAX: f32 = 1.5;
+    fn encode(scaled: f32) -> u32 {
+        (scaled + 2.0).clamp(0.0, 3.0) as u32
+    }
+    fn decode(code: u32) -> f32 {
+        code as f32 - 1.5
+    }
+}
+
 /// `B` codes after one scale, after an optional `HEAD` f32.
 pub struct Block<S, C, const B: usize, const HALVES: bool, const HEAD: bool> {
     pub name: &'static str,
@@ -133,6 +147,7 @@ impl<S: Scale, C: Code, const B: usize, const HALVES: bool, const HEAD: bool>
     fn place(j: usize) -> (usize, u32) {
         match (C::BITS, HALVES) {
             (8, _) => (j, 0),
+            (2, _) => (j / 4, 2 * (j % 4) as u32),
             (_, true) => (j % (B / 2), 4 * (j / (B / 2)) as u32),
             _ => (j / 2, 4 * (j % 2) as u32),
         }
@@ -288,4 +303,14 @@ block! {
 block! {
     /// `INT4_G32` with groups of 128.
     INT4_G128 = "int4_g128", F16, Nibble, 128, halves = false, head = false
+}
+
+block! {
+    /// Group-wise int2: an f16 scale, then 32 2-bit codes.
+    INT2_G32 = "int2_g32", F16, Crumb, 32, halves = false, head = false
+}
+
+block! {
+    /// `INT2_G32` with groups of 128.
+    INT2_G128 = "int2_g128", F16, Crumb, 128, halves = false, head = false
 }

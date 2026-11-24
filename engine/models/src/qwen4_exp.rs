@@ -403,6 +403,10 @@ fn route(router: &Linear, h: &Tensor) -> [Tensor; 2] {
 /// A layer's routed MoE block.
 pub trait Routed: Weights {
     fn apply(&self, m: &Model, h: &Tensor) -> Tensor;
+    /// Rotates a tap into this layer's input gauge, when present.
+    fn tap_gauge(&self, h: &Tensor) -> Tensor {
+        h.clone()
+    }
 }
 
 /// Plain routed experts plus gated shared expert.
@@ -480,6 +484,10 @@ impl Routed for RotatedMoe {
         let out = on(&inner, &self.down, [&self.down_su, &self.down_sv]);
         let routed = out.mul_vector(&self.signs_out).mix(picks, &gates);
         routed.add(&self.shared.apply(h))
+    }
+
+    fn tap_gauge(&self, h: &Tensor) -> Tensor {
+        h.mul_vector(&self.signs_in).hadamard(128)
     }
 }
 
@@ -612,7 +620,14 @@ fn run<R: Routed>(
             });
             hyper = next;
             if !taps.is_empty() {
-                sink.record(i as u64 + 1, &hyper.reshape(cat(&lead, [HC * Hidden])));
+                let plain_id = i as u64 + 1;
+                let gauge_id = 1000 + plain_id;
+                if taps.contains(&plain_id) {
+                    sink.record(plain_id, &hyper.mean(axis));
+                }
+                if taps.contains(&gauge_id) {
+                    sink.record(gauge_id, &l.moe.tap_gauge(&hyper.mean(axis)));
+                }
             }
         }
         let h = w.final_hc.apply(&hyper, &lead, c.eps);

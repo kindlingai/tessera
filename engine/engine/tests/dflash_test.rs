@@ -252,7 +252,11 @@ fn dflash2_selector() {
         taps: 2,
         group_size: 4,
     });
-    d_cfg.selector = Some(dflash::SelectorConfig { rank: 8, top_k: 4 });
+    d_cfg.selector = Some(dflash::SelectorConfig {
+        rank: 8,
+        top_k: 4,
+        svd_rank: None,
+    });
     mla_cfg.stack.taps = d_cfg.tap_layers();
     let t_graph = mla::stepper::<mla::Moe>(&mla_cfg);
     let t_weights = weights(&t_graph, &mut Noise(41));
@@ -511,7 +515,11 @@ fn tp_drafter_matches_one() {
         taps: 2,
         group_size: 4,
     });
-    d2_cfg.selector = Some(dflash::SelectorConfig { rank: 8, top_k: 4 });
+    d2_cfg.selector = Some(dflash::SelectorConfig {
+        rank: 8,
+        top_k: 4,
+        svd_rank: None,
+    });
     let d2_g = dflash::stepper::<Norm>(&d2_cfg);
     verify_local_topk(&d2_g, 71, 4, true);
     verify_tp_pair(&t_graph, 61, &d2_g, 71, false, true);

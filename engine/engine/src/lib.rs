@@ -436,6 +436,14 @@ impl Engine {
         self.taps.ok_or(Error::Taps)
     }
 
+    /// Tap width for DFlash, allowing stateful rollback slots.
+    pub(crate) fn dflash_taps(&self, block: usize) -> Result<usize, Error> {
+        if self.stateful && self.slots <= block {
+            return Err(Error::Stateful);
+        }
+        self.taps.ok_or(Error::Taps)
+    }
+
     /// Fast-path diagnostic report for a `rows`-row decode launch.
     pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
         let rows = rows.max(1);
@@ -468,6 +476,31 @@ impl Engine {
     /// Mask words per pick, if the graph takes masks.
     pub fn words(&self) -> Option<usize> {
         self.words
+    }
+
+    /// Restores slot 0 recurrent state from `from_slot`.
+    pub(crate) fn restore_recurrent_slot(&mut self, from_slot: usize) -> Result<(), Error> {
+        if from_slot == 0 || from_slot >= self.slots {
+            return Ok(());
+        }
+        let plan = self.runner.plan();
+        let copies: Vec<(Slot, u64, usize)> = plan
+            .kept
+            .iter()
+            .zip(&plan.kept_info)
+            .filter_map(|(&(_, slot), info)| {
+                if info.context != 1 || (info.slots as usize) <= from_slot {
+                    return None;
+                }
+                let addr = self.runner.address(slot)?;
+                let per_slot = slot.bytes() / info.slots as usize;
+                Some((slot, addr + (from_slot * per_slot) as u64, per_slot))
+            })
+            .collect();
+        for (slot, src_addr, bytes) in copies {
+            self.runner.copy_from(slot, 0, src_addr, bytes)?;
+        }
+        Ok(())
     }
 
     /// Floats per tapped row, if the full entry emits taps.

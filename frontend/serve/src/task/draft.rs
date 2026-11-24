@@ -10,8 +10,8 @@ use tessera_bundle::dflash::DFlash;
 use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::{
-    CostModel, Drafter, Engine, Place, Recipe, Request, Settings, Sink, SpecLen, SpecStats,
-    Speculate,
+    CostModel, Drafter, Engine, Place, PleStore, Recipe, Request, Settings, Sink, SpecLen,
+    SpecStats, Speculate,
 };
 use tessera_tasks::Generate;
 
@@ -65,6 +65,10 @@ pub(super) fn open_target(
         o.max_model_len,
         (&recipe, settings),
     )?;
+    if let Some(ple) = target.ple.clone() {
+        let store = PleStore::open(ple).map_err(|e| format!("ple store: {e}"))?;
+        engine.set_ple(store);
+    }
     let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
     let shares = |at: u32| shares[at as usize];
     (target.weights)

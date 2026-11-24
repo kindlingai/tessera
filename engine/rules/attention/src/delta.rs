@@ -78,6 +78,8 @@ fn delta_rule_rows(
     #[build] kv_heads: u32,
     #[build] key_width: u32,
     #[build] width: u32,
+    #[build] seqs: u32,
+    #[build] snap: u32,
 ) {
     if gid() >= jobs {
         return;
@@ -132,6 +134,12 @@ fn delta_rule_rows(
                 last = read * scale;
                 prev = pos;
                 out[o] = last;
+                if snap != 0 && s == 0 && rows > 1 && rows < seqs {
+                    let sb = (((r + 1) * heads + h) * key_width) as u64 * width as u64 + j as u64;
+                    for i in 0..key_width {
+                        state[sb + (i * width) as u64] = col[i as usize];
+                    }
+                }
             }
         }
     }
@@ -157,6 +165,7 @@ fn delta_rule_rows(
 pub(crate) struct Delta {
     site: sites::Delta,
     zone: ZoneKind,
+    snap: bool,
 }
 
 impl Delta {
@@ -178,7 +187,14 @@ impl Delta {
         let [heads, kv_heads] = [d.heads, d.kv_heads].map(|n| n as u32);
         let [key_width, width] = [d.key_width, d.width].map(|n| n as u32);
         match d.state {
-            Some(_) => delta_rule_rows_ir(heads, kv_heads, key_width, width),
+            Some(_) => delta_rule_rows_ir(
+                heads,
+                kv_heads,
+                key_width,
+                width,
+                d.seqs as u32,
+                u32::from(self.snap),
+            ),
             None => delta_rule_ir(heads, kv_heads, key_width, width),
         }
     }
@@ -212,7 +228,8 @@ fn propose(zone: ZoneKind, tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if let Some((idx, [slots, positions])) = site.state {
         reads.extend([Read::Node(slots), Read::Node(positions), Read::Kept(idx)]);
     }
-    Some(vec![Draft::new(Delta { site, zone }, reads, len)])
+    let snap = tree.has_taps() && site.seqs > 1;
+    Some(vec![Draft::new(Delta { site, zone, snap }, reads, len)])
 }
 
 fn on_cpu(tree: &Tree, at: T) -> Option<Vec<Draft>> {

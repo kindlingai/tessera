@@ -50,6 +50,8 @@ fn causal_conv_rows(
     #[build] width: u32,
     #[build] taps: u32,
     #[build] dilation: u32,
+    #[build] seqs: u32,
+    #[build] snap: u32,
 ) {
     if gid() >= jobs {
         return;
@@ -101,6 +103,12 @@ fn causal_conv_rows(
                 last = sum;
                 prev = pos;
                 out[at] = sum;
+                if snap != 0 && s == 0 && rows > 1 && rows < seqs {
+                    let sb = ((r + 1) * hist_len) as u64 * width as u64 + c as u64;
+                    for k in 0..hist_len {
+                        state[sb + (k * width) as u64] = hist[k as usize];
+                    }
+                }
             }
         }
     }
@@ -130,7 +138,16 @@ pub(crate) struct Conv {
     sizes = vec![self.seqs, self.rows.most(), self.width, self.taps, self.dilation],
     work = self.rows.most() * self.width * self.taps * 2,
     guess = GUESS,
-    source = source("conv_rows", causal_conv_rows_ir(self.width as u32, self.taps as u32, self.dilation as u32)),
+    source = source(
+        "conv_rows",
+        causal_conv_rows_ir(
+            self.width as u32,
+            self.taps as u32,
+            self.dilation as u32,
+            self.seqs as u32,
+            u32::from(self.snap),
+        )
+    ),
     launches = rows_launches,
 )]
 pub(crate) struct ConvRows {
@@ -139,6 +156,7 @@ pub(crate) struct ConvRows {
     width: usize,
     taps: usize,
     dilation: usize,
+    snap: bool,
 }
 
 fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
@@ -172,6 +190,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             width,
             taps,
             dilation,
+            snap: tree.has_taps() && seqs > 1,
         };
         let reads = [
             Read::Node(x),

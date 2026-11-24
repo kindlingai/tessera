@@ -1,4 +1,4 @@
-use crate::block::{INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
+use crate::block::{INT2_G32, INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
 use crate::form::Form;
 
 /// Each form keeps `data` within a share of its largest.
@@ -15,6 +15,7 @@ fn blocks_round_trip() {
         (&MXFP4, 0.17),
         (&INT4_G32, 0.07),
         (&INT4_G128, 0.07),
+        (&INT2_G32, 0.35),
     ];
     for (form, share) in forms {
         let back = form.roundtrip(&data);

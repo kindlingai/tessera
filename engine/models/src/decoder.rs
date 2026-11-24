@@ -1,7 +1,7 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
 use crate::keys::Keys;
-use crate::shared::{Attend, Side, Stack, Steps, TapSink, swiglu, with_head};
+use crate::shared::{Attend, Dense, Side, Stack, Steps, TapSink, swiglu, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
 use tessera_trace::{
@@ -37,16 +37,16 @@ pub trait Mlp: Weights {
 
 /// A SwiGLU MLP every row passes through.
 #[derive(Weights)]
-pub struct Swiglu {
+pub struct Swiglu<D: Dense = Linear> {
     #[shape(Hidden, Ffn)]
-    pub gate: Linear,
+    pub gate: D,
     #[shape(Hidden, Ffn)]
-    pub up: Linear,
+    pub up: D,
     #[shape(Ffn, Hidden)]
-    pub down: Linear,
+    pub down: D,
 }
 
-impl Mlp for Swiglu {
+impl<D: Dense> Mlp for Swiglu<D> {
     const KIND: Composite = Composite::Mlp;
 
     fn apply(&self, _: &Model, h: &Tensor) -> Tensor {
@@ -274,21 +274,21 @@ impl Config {
 }
 
 #[derive(Weights)]
-pub struct Layer<N: HeadNorm, M: Mlp> {
+pub struct Layer<N: HeadNorm, M: Mlp, D: Dense = Linear> {
     #[shape(Hidden)]
     pub ln1: Norm,
     #[shape(Hidden, Heads * HeadDim)]
-    pub q: Linear,
+    pub q: D,
     #[shape(Hidden, KvHeads * HeadDim)]
-    pub k: Linear,
+    pub k: D,
     #[shape(Hidden, KvHeads * HeadDim)]
-    pub v: Linear,
+    pub v: D,
     #[shape(HeadDim)]
     pub q_norm: N,
     #[shape(HeadDim)]
     pub k_norm: N,
     #[shape(Heads * HeadDim, Hidden)]
-    pub o: Linear,
+    pub o: D,
     #[shape(Hidden)]
     pub ln2: Norm,
     pub mlp: M,

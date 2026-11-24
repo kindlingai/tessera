@@ -6,8 +6,8 @@ use crate::{Bundle, Overrides, Stream, Weights, load_tapped, offer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::{Offer, Shards, Slice};
-use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, stepper};
+use tessera_checkpoint::{Offer, Slice, exlr8};
+use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, stepper, stepper_rotated};
 use tessera_engine::{Graph, Norm, PathSeg, Pins, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -15,7 +15,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 /// Streamed drafter weights, cut per rank on load.
 pub(crate) struct DraftWeights {
     graph: Graph,
-    draft: Shards,
+    draft: Box<dyn Offer>,
     target: Box<dyn Offer>,
     rules: Vec<Rule>,
     pins: Pins,
@@ -27,7 +27,7 @@ impl Stream for DraftWeights {
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
         take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
-        let combined = Overlay::new(&self.draft, self.target.as_ref());
+        let combined = Overlay::new(self.draft.as_ref(), self.target.as_ref());
         repack::stream(
             &self.graph,
             &combined,
@@ -49,7 +49,8 @@ fn keep_bf16(path: &[PathSeg], quant: DraftQuant) -> bool {
     if quant == DraftQuant::MxFp8 {
         return matches!(
             path.first(),
-            Some(PathSeg::Field(f)) if f == "fc" || f == "candidate_selector"
+            Some(PathSeg::Field(f))
+                if f == "fc" || f == "candidate_selector" || f == "tiered_head"
         );
     }
     false
@@ -226,10 +227,13 @@ pub(crate) fn has_norms(slices: &[Slice]) -> bool {
 /// Reads the target's shared dimensions from `dir/config.json`.
 fn target_spec(dir: &Path, overrides: &Overrides) -> Result<TargetSpec> {
     overrides.config(dir, |k| TargetSpec {
-        vocab: k.need(&["vocab_size"]),
-        hidden: k.need(&["hidden_size"]),
-        layers: k.need(&["num_hidden_layers"]),
-        tied: k.or(&["tie_word_embeddings"], false),
+        vocab: k.need(&["vocab_size", "text_config.vocab_size"]),
+        hidden: k.need(&["hidden_size", "text_config.hidden_size"]),
+        layers: k.need(&["num_hidden_layers", "text_config.num_hidden_layers"]),
+        tied: k.or(
+            &["tie_word_embeddings", "text_config.tie_word_embeddings"],
+            false,
+        ),
     })
 }
 
@@ -250,15 +254,32 @@ pub(crate) fn extra_rules(config: &Config, slices: &[Slice]) -> Vec<Rule> {
             }
         }
     }
-    if config.selector.is_some() {
-        for leaf in [
-            "hidden_projection",
-            "predecessor_codebook",
-            "successor_codebook",
-        ] {
+    if let Some(sel) = config.selector {
+        rules.push((
+            "candidate_selector.hidden_projection".into(),
+            format!("{prefix}candidate_selector.hidden_projection"),
+        ));
+        if sel.svd_rank.is_some() {
+            for leaf in ["pred_u", "pred_v", "succ_u", "succ_v"] {
+                rules.push((
+                    format!("candidate_selector.{leaf}"),
+                    format!("{prefix}candidate_selector.{leaf}"),
+                ));
+            }
+        } else {
+            for leaf in ["predecessor_codebook", "successor_codebook"] {
+                rules.push((
+                    format!("candidate_selector.{leaf}"),
+                    format!("{prefix}candidate_selector.{leaf}"),
+                ));
+            }
+        }
+    }
+    if config.tiered_head.is_some() {
+        for leaf in ["proj", "hi", "lo"] {
             rules.push((
-                format!("candidate_selector.{leaf}"),
-                format!("{prefix}candidate_selector.{leaf}"),
+                format!("tiered_head.{leaf}"),
+                format!("{prefix}tiered_head.{leaf}"),
             ));
         }
     }
@@ -325,26 +346,37 @@ pub fn load(
     let draft_over = overrides.under("draft");
     let config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
     let tap_layers = config.tap_layers();
+    let stateful_target = std::fs::read_to_string(target_dir.join("config.json"))
+        .map(|s| s.contains("linear_attention") || s.contains("qwen4_exp") || s.contains("qwen3_5"))
+        .unwrap_or(false);
+    let target_slots = if stateful_target {
+        slots.max(config.block_size + 1)
+    } else {
+        slots
+    };
     let target = load_tapped(
         target_dir,
-        [slots, context],
+        [target_slots, context],
         user,
         Steps::Plain,
         overrides,
         manifest,
         &tap_layers,
     )?;
-    let draft_offer = Shards::open(draft_dir)?;
+    let draft_exlr8 = exlr8::is_release(draft_dir);
+    let draft_offer = offer(draft_dir, None)?;
     let draft_slices = draft_offer.slices();
-    let graph = match has_norms(&draft_slices) {
-        true => stepper::<Norm>(&config),
-        false => stepper::<()>(&config),
+    let graph = match (draft_exlr8, has_norms(&draft_slices)) {
+        (true, true) => stepper_rotated::<Norm>(&config),
+        (true, false) => stepper_rotated::<()>(&config),
+        (false, true) => stepper::<Norm>(&config),
+        (false, false) => stepper::<()>(&config),
     };
     let target_offer = offer(target_dir, manifest)?;
     let mut rules = extra_rules(&config, &draft_slices);
     rules.extend_from_slice(user);
     let draft_pins = {
-        let combined = Overlay::new(&draft_offer, target_offer.as_ref());
+        let combined = Overlay::new(draft_offer.as_ref(), target_offer.as_ref());
         draft_pins(
             &graph,
             &combined,

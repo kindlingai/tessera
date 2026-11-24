@@ -6,8 +6,10 @@ use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use tessera_graph::{E2M1, E4M3, E8M0, F16};
-use tessera_mem::block::{Block, Code, I8, Nibble, Scale};
-use tessera_mem::block::{INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
+use tessera_mem::block::{Block, Code, Crumb, I8, Nibble, Scale};
+use tessera_mem::block::{
+    INT2_G32, INT2_G128, INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0,
+};
 
 /// A code, typed for kernel text.
 pub trait LoadCode: Code {
@@ -73,6 +75,12 @@ fn nibble_field(w: u32, low: u32) -> f32 {
     w.bits(low, 4) as f32 - 8.0
 }
 
+/// A 2-bit crumb centered at 1.5.
+#[kernel]
+fn crumb_field(w: u32, low: u32) -> f32 {
+    w.bits(low, 2) as f32 - 1.5
+}
+
 /// Each type's kernel reader, by its decode helper.
 macro_rules! reads {
     ($($trait:ident :: $method:ident for $t:ident = $helper:ident($($arg:ident),*);)*) => {$(
@@ -92,6 +100,7 @@ reads! {
     LoadCode::field_inline for E2M1 = e2m1_field_inline(w, low);
     LoadCode::field_inline for I8 = i8_field_inline(w, low);
     LoadCode::field_inline for Nibble = nibble_field_inline(w, low);
+    LoadCode::field_inline for Crumb = crumb_field_inline(w, low);
 }
 
 /// Element `i` of `p`: head, block scale and code.
@@ -106,6 +115,8 @@ fn element<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const 
     // Code `j`'s byte and shift, paired by halves under `HALVES`.
     let byte = if C::BITS == 8 {
         j
+    } else if C::BITS == 2 {
+        j / 4
     } else if HALVES {
         j % (B / 2) as u64
     } else {
@@ -113,6 +124,8 @@ fn element<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const 
     };
     let shift = if C::BITS == 8 {
         0
+    } else if C::BITS == 2 {
+        (2 * (j % 4)) as u32
     } else if HALVES {
         (4 * (j / (B / 2) as u64)) as u32
     } else {
@@ -140,22 +153,32 @@ fn four<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const HEA
     // First byte of the codes, then each shift.
     let at = if C::BITS == 8 {
         j
+    } else if C::BITS == 2 {
+        j / 4
     } else if HALVES {
         j % (B / 2) as u64
     } else {
         j / 2
     };
-    let step = if C::BITS == 8 || HALVES { 8 } else { 4 };
-    let shift = if C::BITS == 8 || !HALVES {
+    let step = if C::BITS == 2 {
+        2
+    } else if C::BITS == 8 || HALVES {
+        8
+    } else {
+        4
+    };
+    let shift = if C::BITS == 8 || C::BITS == 2 || !HALVES {
         0
     } else {
         (4 * (j / (B / 2) as u64)) as u32
     };
     let c = b + (S::BYTES as u64 + at);
-    // Packed nibbles: four codes fill two bytes, not four.
+    // Four nibbles fill two bytes, four crumbs fill one.
     let wide = C::BITS == 8 || HALVES;
     // Scales of two bytes keep the codes two-aligned.
-    let w = if S::BYTES == 2 && wide {
+    let w = if C::BITS == 2 {
+        c[0] as u32
+    } else if S::BYTES == 2 && wide {
         c.half(0) | (c.half(2) << 16)
     } else if S::BYTES == 2 {
         c.half(0)
@@ -213,3 +236,5 @@ form!(MXFP8);
 form!(MXFP4);
 form!(INT4_G32);
 form!(INT4_G128);
+form!(INT2_G32);
+form!(INT2_G128);
