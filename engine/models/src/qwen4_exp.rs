@@ -32,7 +32,10 @@ pub struct Ple {
     pub layer: u64,
     pub dim: u64,
     pub window: u64,
+    /// The n-gram size, which is also the conv dilation.
     pub dilation: u32,
+    /// Hash heads: one group per n-gram order past unigrams.
+    pub heads: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,11 +93,16 @@ impl Config {
                 format!("one PLE layer is supported, not {ple_ids:?}"),
             );
         }
-        let ple = ple_ids.first().map(|&id| Ple {
-            layer: id.saturating_sub(1),
-            dim: text(k, "ple_embed_dim"),
-            window: text(k, "ple_conv_kernel_size"),
-            dilation: text(k, "ngram_size"),
+        let ple = ple_ids.first().map(|&id| {
+            let ngram: u32 = text(k, "ngram_size");
+            let per: u64 = text(k, "heads_per_ngram");
+            Ple {
+                layer: id.saturating_sub(1),
+                dim: text(k, "ple_embed_dim"),
+                window: text(k, "ple_conv_kernel_size"),
+                dilation: ngram,
+                heads: per * u64::from(ngram.saturating_sub(1)),
+            }
         });
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),

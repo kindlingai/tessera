@@ -59,7 +59,7 @@ pub(crate) type Built = (Graph, Weights, Pins);
 type Build = fn(&Arch, &Ask) -> Result<Built>;
 
 /// The host n-gram table a step graph reads, if any.
-type Table = fn(&Ask) -> Result<Option<PleConfig>>;
+type Table = fn(&Ask, &Weights) -> Result<Option<PleConfig>>;
 
 pub(crate) struct Arch {
     pub name: &'static str,

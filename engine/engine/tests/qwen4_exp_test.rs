@@ -1,11 +1,19 @@
 //! End-to-end parity between qwen4_exp forward and ragged stepper.
 
+mod common;
+
+use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
 use std::io::Write;
+use tessera_engine::Place;
+use tessera_engine::comm::Sockets;
 use tessera_engine::qwen4_exp::{Config, Moe, Ple, RotatedMoe, program, stepper};
 use tessera_engine::qwen35::{Mixing, Recurrent};
 use tessera_engine::{
-    Bf16, Engine, Pick, PleConfig, PleStore, Recipe, Row, Settings, Stack, Tensor, Weight,
+    Batch, Bf16, Engine, Event, Fair, Pick, PleConfig, PleStore, Recipe, Request, Row, Settings,
+    Stack, Tensor, Weight,
 };
+use tessera_graph::Parts;
+use tessera_lower::Cluster;
 
 fn tiny_config() -> Config {
     Config {
@@ -32,6 +40,7 @@ fn tiny_config() -> Config {
             dim: 16,
             window: 4,
             dilation: 3,
+            heads: 16,
         }),
         eos_token: 15,
         tied: false,
@@ -77,9 +86,9 @@ fn make_ple_table() -> (std::path::PathBuf, PleConfig) {
     let cfg = PleConfig {
         path: path.clone(),
         eos_token: 15,
-        multipliers: [100003, 200003, 300007],
-        offsets: std::array::from_fn(|h| (h as i64) * 8),
-        vocab_sizes: [8; 16],
+        multipliers: vec![100003, 200003, 300007],
+        offsets: (0..16).map(|h| h * 8).collect(),
+        vocab_sizes: vec![8; 16],
         row_dim,
         cache_rows: 64,
     };
@@ -253,4 +262,113 @@ fn rotated_trims() {
     let g = stepper::<RotatedMoe>(&c);
     let trimmed = tessera_graph::trim(&g, 0).unwrap();
     assert!(!trimmed.nodes.is_empty());
+}
+
+#[test]
+fn ple_hash_orders() {
+    let (_, base) = make_ple_table();
+    let cfg = PleConfig {
+        multipliers: vec![3, 5, 7, 11],
+        offsets: vec![0, 10, 20, 30, 40, 50],
+        vocab_sizes: vec![7, 9, 7, 9, 7, 9],
+        ..base.clone()
+    };
+    let store = PleStore::open(cfg).unwrap();
+    // The 4-gram reaches back to the EOS.
+    let mut ids = [0u64; 6];
+    store.hash_token(&[15, 4, 6, 8], &mut ids);
+    let two = (8 * 3) ^ (6 * 5);
+    let three = two ^ (4 * 7);
+    let four = three ^ (15 * 11);
+    let want = [two, two, three, three, four, four].map(|m: i64| m as u64);
+    let got: Vec<u64> = (0..6)
+        .map(|h| ids[h] - [0, 10, 20, 30, 40, 50][h])
+        .collect();
+    let sizes = [7, 9, 7, 9, 7, 9];
+    assert_eq!(got, (0..6).map(|h| want[h] % sizes[h]).collect::<Vec<_>>());
+    let uneven = PleConfig {
+        offsets: vec![0; 5],
+        vocab_sizes: vec![1; 5],
+        ..base
+    };
+    assert!(PleStore::open(uneven).is_err());
+}
+
+fn host() -> Settings {
+    Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    }
+}
+
+/// A tiny model rank with its own PLE store.
+fn ple_engine(links: Option<[Sockets; 2]>) -> Engine {
+    let g = stepper::<Moe>(&tiny_config());
+    let mut engine = match links {
+        Some([sums, control]) => {
+            let place = Place::new(Cluster::two("a", "b"), Parts::even(2));
+            let weights = float_weights(&g, 3);
+            open_ranked_target(g, 16, &host(), place, Box::new(sums), control, &weights)
+        }
+        None => {
+            let weights = tessera_testkit::weights(&g, &mut tessera_testkit::Noise(3));
+            open_target(&g, &weights, 16, &host())
+        }
+    };
+    engine.set_ple(PleStore::open(make_ple_table().1).unwrap());
+    engine
+}
+
+/// Two ranks with PLE step as one engine does.
+#[test]
+fn ranks_feed_ple() {
+    let [[sums, others], [control, told]] = loopback_links();
+    let follower = std::thread::spawn(move || ple_engine(Some([others, told])).follow().unwrap());
+    let mut lead = ple_engine(Some([sums, control]));
+    let mut alone = ple_engine(None);
+    let mut rows = Vec::new();
+    push_rows(&mut rows, 0, &[1, 3, 5, 2], 0..4);
+    push_rows(&mut rows, 1, &[4, 15, 11], 0..3);
+    let next = vec![Row {
+        slot: 0,
+        token: 7,
+        position: 4,
+    }];
+    for rows in [rows, next] {
+        assert_eq!(lead.step(&rows).unwrap(), alone.step(&rows).unwrap());
+    }
+    assert!(lead.kernels().contains_key("all_reduce"));
+    lead.dismiss().unwrap();
+    follower.join().unwrap();
+}
+
+/// The events of one answer.
+fn answer(batch: &mut Batch, tokens: Vec<u32>) -> Vec<Event> {
+    let (events, taken) = std::sync::mpsc::channel();
+    let request = Request {
+        tokens,
+        max_tokens: 3,
+        ..Request::default()
+    };
+    batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+    while batch.step().unwrap() {}
+    taken.try_iter().collect()
+}
+
+/// Stateful prompts never resume from kept rows.
+#[test]
+fn stateful_skips_no_prefix() {
+    let mut engine = ple_engine(None);
+    assert!(engine.stateful());
+    let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    batch.reuse();
+    let base = vec![1u32, 3, 5, 2, 7];
+    let first = collect_ids(&answer(&mut batch, base.clone()));
+    let longer = [&base[..], &first[..]].concat();
+    let events = answer(&mut batch, longer.clone());
+    assert!(!events.iter().any(|e| matches!(e, Event::Kept(_))));
+    assert_eq!(batch.totals().unwrap().hits, 0);
+    let mut fresh = ple_engine(None);
+    let want = answer(&mut Batch::new(&mut fresh, Box::new(Fair)), longer);
+    assert_eq!(collect_ids(&events), collect_ids(&want));
 }

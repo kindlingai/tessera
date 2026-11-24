@@ -58,11 +58,6 @@ pub use tessera_run::{Grid, gpu, pinning, select};
 pub use tessera_trace::{Linear, Norm};
 pub use tessera_wasm as wasm;
 
-/// N-gram heads in a PLE row.
-pub const fn ple_heads() -> usize {
-    ple::HEADS
-}
-
 /// Tokens to continue, and when to stop.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Request {

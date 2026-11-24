@@ -8,17 +8,17 @@ use std::path::PathBuf;
 use tessera_graph::Bf16;
 use tessera_mem::Tensor;
 
-/// Number of n-gram heads (8 bigram + 8 trigram).
-pub const HEADS: usize = 16;
-
 /// Configuration for an on-disk PLE table.
 #[derive(Clone, Debug)]
 pub struct PleConfig {
     pub path: PathBuf,
     pub eos_token: i32,
-    pub multipliers: [i64; 3],
-    pub offsets: [i64; HEADS],
-    pub vocab_sizes: [i64; HEADS],
+    /// One per n-gram place, the current token first.
+    pub multipliers: Vec<i64>,
+    /// Per head, its first row. Bigram heads come first.
+    pub offsets: Vec<i64>,
+    /// Per head, its row count.
+    pub vocab_sizes: Vec<i64>,
     pub row_dim: usize,
     pub cache_rows: usize,
 }
@@ -27,8 +27,38 @@ impl PleConfig {
     /// Default cache size: 524,288 rows (~168 MB at 320 B/row).
     pub const DEFAULT_CACHE_ROWS: usize = 1 << 19;
 
+    pub fn heads(&self) -> usize {
+        self.offsets.len()
+    }
+
     pub fn embed_dim(&self) -> usize {
-        self.row_dim * HEADS
+        self.row_dim * self.heads()
+    }
+
+    /// Why the hash parameters disagree, if they do.
+    fn misfit(&self) -> Option<String> {
+        let (heads, orders) = (self.heads(), self.multipliers.len().saturating_sub(1));
+        if orders == 0 {
+            return Some(format!(
+                "{} multipliers, want 2 or more",
+                self.multipliers.len()
+            ));
+        }
+        if self.vocab_sizes.len() != heads {
+            return Some(format!(
+                "{heads} offsets but {} vocab sizes",
+                self.vocab_sizes.len()
+            ));
+        }
+        if heads == 0 || !heads.is_multiple_of(orders) {
+            return Some(format!(
+                "{heads} heads do not split over {orders} n-gram orders"
+            ));
+        }
+        self.vocab_sizes
+            .iter()
+            .any(|v| *v <= 0)
+            .then(|| "a head has no rows".into())
     }
 }
 
@@ -48,6 +78,9 @@ pub struct PleStore {
 
 impl PleStore {
     pub fn open(cfg: PleConfig) -> io::Result<Self> {
+        if let Some(why) = cfg.misfit() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        }
         let file = File::open(&cfg.path)?;
         let cap = cfg.cache_rows.max(1).next_power_of_two();
         let row_bytes = cfg.row_dim * 2;
@@ -65,24 +98,27 @@ impl PleStore {
         })
     }
 
-    /// Computes global row ids for `tok` and `ctx`.
-    pub fn hash_token(&self, tok: i32, ctx: [i32; 2]) -> [u64; HEADS] {
-        let eos = self.cfg.eos_token;
-        let s0 = i64::from(tok);
-        let (s1, s2) = if ctx[1] == eos {
-            (i64::from(eos), i64::from(eos))
-        } else if ctx[0] == eos {
-            (i64::from(ctx[1]), i64::from(eos))
-        } else {
-            (i64::from(ctx[1]), i64::from(ctx[0]))
-        };
+    /// Each head's row id for the last token of `history`.
+    pub fn hash_token(&self, history: &[i32], ids: &mut [u64]) {
+        let eos = i64::from(self.cfg.eos_token);
         let m = &self.cfg.multipliers;
-        let m2 = s0.wrapping_mul(m[0]) ^ s1.wrapping_mul(m[1]);
-        let m3 = m2 ^ s2.wrapping_mul(m[2]);
-        std::array::from_fn(|h| {
-            let mix = if h < 8 { m2 } else { m3 };
-            (mix.rem_euclid(self.cfg.vocab_sizes[h]) + self.cfg.offsets[h]) as u64
-        })
+        let per = self.cfg.heads() / (m.len() - 1);
+        let (mut mix, mut ended) = (0i64, false);
+        for (j, &mj) in m.iter().enumerate() {
+            // Tokens at or before an EOS read as EOS.
+            let s = match history.len().checked_sub(j + 1) {
+                Some(at) if !ended => i64::from(history[at]),
+                _ => eos,
+            };
+            ended |= j > 0 && s == eos;
+            mix ^= s.wrapping_mul(mj);
+            let heads = j.saturating_sub(1) * per..j * per;
+            let sizes = self.cfg.vocab_sizes[heads.clone()].iter();
+            let rows = sizes.zip(&self.cfg.offsets[heads.clone()]);
+            for (id, (size, offset)) in ids[heads].iter_mut().zip(rows) {
+                *id = (mix.rem_euclid(*size) + offset) as u64;
+            }
+        }
     }
 
     fn fetch_bf16(&mut self, row_id: u64, dst: &mut [f32]) -> io::Result<()> {
@@ -121,6 +157,7 @@ impl PleStore {
         let dim = self.cfg.row_dim;
         let mut out = vec![0.0f32; filled * width];
         let mut row_buf = vec![0.0f32; width];
+        let mut ids = vec![0u64; self.cfg.heads()];
         // Repeats count only within one launch.
         self.prev_pos.fill(u32::MAX);
         for (r, row) in rows.iter().enumerate() {
@@ -140,20 +177,8 @@ impl PleStore {
             if self.tokens[s].len() <= pos {
                 self.tokens[s].resize(pos + 1, eos);
             }
-            let ctx = [
-                if pos >= 2 {
-                    self.tokens[s][pos - 2]
-                } else {
-                    eos
-                },
-                if pos >= 1 {
-                    self.tokens[s][pos - 1]
-                } else {
-                    eos
-                },
-            ];
             self.tokens[s][pos] = tok;
-            let ids = self.hash_token(tok, ctx);
+            self.hash_token(&self.tokens[s][..=pos], &mut ids);
             for (h, &id) in ids.iter().enumerate() {
                 self.fetch_bf16(id, &mut row_buf[h * dim..(h + 1) * dim])?;
             }

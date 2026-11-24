@@ -162,9 +162,13 @@ impl Stream for Release {
     ) -> Result<()> {
         numbered(&self.graph, &*self.offer, &[&self.rules], shares, take)
     }
+
+    fn i64s(&self, name: &str) -> Result<Vec<i64>> {
+        Ok(self.offer.i64s(name)?)
+    }
 }
 
-fn parse_config(json: &str, [seqs, context]: [u64; 2]) -> Result<Config> {
+pub(crate) fn parse_config(json: &str, [seqs, context]: [u64; 2]) -> Result<Config> {
     let offered = [tessera_engine::keys::Offered::parse("config.json", json)?];
     let mut keys = tessera_engine::keys::Keys::new(&offered);
     let config = Config::read(&mut keys, seqs, context);
@@ -210,7 +214,7 @@ struct PleMeta {
 }
 
 /// The config's host PLE table and hash parameters, if any.
-fn ple(ask: &Ask) -> Result<Option<PleConfig>> {
+pub(crate) fn ple(ask: &Ask, weights: &Weights) -> Result<Option<PleConfig>> {
     let cfg = parse_config(ask.json, ask.sizes)?;
     let Some(ple) = cfg.ple else {
         return Ok(None);
@@ -220,6 +224,7 @@ fn ple(ask: &Ask) -> Result<Option<PleConfig>> {
     if !bin.is_file() {
         return Err(format!("missing PLE table {}", bin.display()).into());
     }
+    let heads = ple.heads as usize;
     let meta = stem.with_extension("json");
     let row_dim = match std::fs::read_to_string(&meta) {
         Ok(text) => {
@@ -227,24 +232,30 @@ fn ple(ask: &Ask) -> Result<Option<PleConfig>> {
                 .map_err(|e| format!("{}: {e}", meta.display()))?
                 .dim
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            ple.dim as usize / tessera_engine::ple_heads()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ple.dim as usize / heads.max(1),
         Err(e) => return Err(format!("{}: {e}", meta.display()).into()),
     };
-    let offer = crate::offer(ask.dir, ask.manifest)?;
+    if row_dim * heads != ple.dim as usize {
+        let dim = ple.dim;
+        return Err(format!("PLE rows of {row_dim} over {heads} heads do not make {dim}").into());
+    }
+    let Weights::Streamed(release) = weights else {
+        return Err("PLE hash parameters need the open release".into());
+    };
     let base = format!("{LM}.layers.{}.ple.ple_embedding", ple.layer);
-    let read = |field: &str| offer.i64s(&format!("{base}.{field}"));
-    let fixed = |field: &str, v: Vec<i64>| format!("{field} has {} values", v.len());
+    let read = |field: &str, want: usize| -> Result<Vec<i64>> {
+        let v = release.i64s(&format!("{base}.{field}"))?;
+        if v.len() != want {
+            return Err(format!("{field} has {} values, want {want}", v.len()).into());
+        }
+        Ok(v)
+    };
     Ok(Some(PleConfig {
         path: bin,
         eos_token: cfg.eos_token,
-        multipliers: (read("layer_multipliers")?.try_into())
-            .map_err(|v| fixed("layer_multipliers", v))?,
-        offsets: (read("ngram_heads_offsets")?.try_into())
-            .map_err(|v| fixed("ngram_heads_offsets", v))?,
-        vocab_sizes: (read("ngram_heads_vocab_sizes")?.try_into())
-            .map_err(|v| fixed("ngram_heads_vocab_sizes", v))?,
+        multipliers: read("layer_multipliers", ple.dilation as usize)?,
+        offsets: read("ngram_heads_offsets", heads)?,
+        vocab_sizes: read("ngram_heads_vocab_sizes", heads)?,
         row_dim,
         cache_rows: PleConfig::DEFAULT_CACHE_ROWS,
     }))

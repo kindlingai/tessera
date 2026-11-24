@@ -6,14 +6,14 @@ pub mod dflash;
 #[cfg(test)]
 mod dflash_test;
 pub mod encoder;
+#[cfg(test)]
+mod exlr8_test;
 pub mod flux2;
 mod gemma4;
 mod gguf;
 #[cfg(test)]
 mod gguf_test;
 pub mod mla;
-#[cfg(test)]
-mod mla_test;
 pub mod mtp;
 #[cfg(test)]
 mod mtp_test;
@@ -74,6 +74,11 @@ pub trait Stream {
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
         take: &mut dyn FnMut(u32, Weight) -> Result<(), Failure>,
     ) -> Result<(), Failure>;
+
+    /// The integer tensor `name`, read whole.
+    fn i64s(&self, name: &str) -> Result<Vec<i64>, Failure> {
+        Err(format!("{name}: integer tensors need an open release").into())
+    }
 }
 
 /// A model's weights: held, or read as they load.
@@ -433,7 +438,7 @@ pub fn load_tapped(
     };
     let built = step(arch, &ask)?;
     let ple = match arch.ple {
-        Some(ple) => ple(&ask)?,
+        Some(ple) => ple(&ask, &built.1)?,
         None => None,
     };
     dressed(dir, built, Some(json), ple)
