@@ -41,15 +41,45 @@ pub(crate) struct Peaks {
     pub parts: usize,
 }
 
+/// Threads per row in the final argmax reduction.
+const ARGMAX_THREADS: u32 = 256;
+
 /// The best of each row's peaks.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(argmax, threads = self.rows, work = self.rows * self.parts)]
+#[launch(
+    argmax,
+    sizes = [self.rows, self.width, self.parts],
+    work = self.rows * self.parts,
+    needs = argmax_needs(),
+    launches = argmax_launches,
+)]
 pub(crate) struct Argmax {
     pub rows: usize,
     pub width: usize,
     pub parts: usize,
     pub first: usize,
     pub whole: usize,
+}
+
+fn argmax_needs() -> Needs {
+    Needs {
+        group_bytes: 8 * ARGMAX_THREADS as usize,
+        group_threads: ARGMAX_THREADS as usize,
+        ..Needs::default()
+    }
+}
+
+fn argmax_launches(k: &Argmax, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: k.rows,
+        down: 1,
+        threads: ARGMAX_THREADS as usize,
+    };
+    vec![Launch::plain(
+        step,
+        &[k.rows, k.width, k.parts, k.first, k.whole],
+        shape,
+    )]
 }
 
 /// One thread per entry or pick, whichever is more.
@@ -238,20 +268,47 @@ fn argmax(
     first: u32,
     whole: u32,
 ) {
-    if gid() >= rows {
+    let row = gid() / ARGMAX_THREADS;
+    if row >= rows {
         return;
     }
-    let at = gid() as u64 * width as u64;
+    let l = lid();
+    let at = row as u64 * width as u64;
     let mut arg = width;
     let mut best = f32::NEG_INFINITY;
-    for p in 0..parts {
-        let i = peaks[(gid() * parts + p) as u64];
-        if i < width && x[at + i as u64] > best {
-            best = x[at + i as u64];
-            arg = i;
+    for p in (l..parts).by(ARGMAX_THREADS) {
+        let i = peaks[(row * parts + p) as u64];
+        if i < width {
+            let v = x[at + i as u64];
+            if v > best || (v == best && i < arg) {
+                best = v;
+                arg = i;
+            }
         }
     }
-    out[gid() as u64] = if arg < width { first + arg } else { whole };
+    let mut val_s = shared::<f32>(ARGMAX_THREADS);
+    let mut idx_s = shared::<u32>(ARGMAX_THREADS);
+    val_s[l] = best;
+    idx_s[l] = arg;
+    barrier();
+    for shift in 0..8 {
+        let s = 128u32 >> shift;
+        if l < s {
+            let ov = val_s[l + s];
+            let oi = idx_s[l + s];
+            let cv = val_s[l];
+            let ci = idx_s[l];
+            if ov > cv || (ov == cv && oi < ci) {
+                val_s[l] = ov;
+                idx_s[l] = oi;
+            }
+        }
+        barrier();
+    }
+    if l == 0 {
+        let win = idx_s[0];
+        out[row as u64] = if win < width { first + win } else { whole };
+    }
 }
 
 /// Top `k` indices inside each winning chunk.
