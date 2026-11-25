@@ -1,10 +1,9 @@
 //! DeepSeek-style decoders: low-rank attention, MoE, indexed keys.
 
 use crate::shared::{
-    Attend, CodedExperts, Dense, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, Swiglu,
-    TapSink, routed_calib, rows,
+    Attend, CalibTaps, CodedExperts, Dense, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps,
+    Swiglu, TapSink, routed_calib, rows,
 };
-use std::cell::RefCell;
 use tessera_trace::DimName::*;
 use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Mask,
@@ -271,8 +270,8 @@ struct Pass<'a> {
     positions: &'a Tensor,
     /// When stepping: each row's slot, and every layer's kept rows.
     step: Option<(&'a Tensor, Vec<Cache>)>,
-    /// Calibration Gram taps recorded during tracing.
-    calib: Option<RefCell<Vec<(Role, Tensor)>>>,
+    /// Calibration taps recorded during tracing.
+    calib: CalibTaps,
 }
 
 pub fn forward<R: Routed>(
@@ -287,17 +286,16 @@ pub fn forward<R: Routed>(
         c,
         positions,
         step: None,
-        calib: None,
+        calib: CalibTaps::default(),
     };
     pass.logits(w, tokens)
 }
 
 impl Pass<'_> {
     fn note(&self, tap: CalibTap, t: &Tensor) {
-        if let Some(calib) = &self.calib {
-            calib.borrow_mut().push((Role::Calib(tap), t.clone()));
-        }
+        self.calib.note(tap, t);
     }
+
     fn logits<R: Routed>(&self, w: &Mla<R>, tokens: &Tensor) -> Tensor {
         self.logits_taps(w, tokens, &[]).0
     }
@@ -381,7 +379,7 @@ impl Pass<'_> {
                 [out]
             }),
             Some(i) => m.composite(Composite::Moe, || {
-                [w.moe[i].apply_calib(m, c, &h, &mut |tap, t| self.note(tap, t))]
+                [w.moe[i].apply_calib(m, c, &h, &self.calib)]
             }),
         };
         (x.add(&mlp), keys)
@@ -529,17 +527,11 @@ fn absorbed(
 
 /// Routed experts and a shared one, however they are stored.
 pub trait Routed: Weights {
-    fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor;
-    /// Same as `apply`, recording calibration taps via `note`.
-    fn apply_calib(
-        &self,
-        m: &Model,
-        c: &Config,
-        h: &Tensor,
-        note: &mut dyn FnMut(CalibTap, &Tensor),
-    ) -> Tensor {
-        let _ = note;
-        self.apply(m, c, h)
+    /// The block's output, recording calibration taps in `taps`.
+    fn apply_calib(&self, m: &Model, c: &Config, h: &Tensor, taps: &CalibTaps) -> Tensor;
+
+    fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
+        self.apply_calib(m, c, h, &CalibTaps::default())
     }
 }
 
@@ -553,19 +545,10 @@ fn route(c: &Config, router: &Linear, bias: &Vector, h: &Tensor) -> [Tensor; 2] 
 
 impl<E: ExpertSet> Routed for MoeOf<E> {
     /// Each row's top experts, weighted, plus the shared expert.
-    fn apply(&self, m: &Model, c: &Config, h: &Tensor) -> Tensor {
-        self.apply_calib(m, c, h, &mut |_, _| {})
-    }
-
-    fn apply_calib(
-        &self,
-        m: &Model,
-        c: &Config,
-        h: &Tensor,
-        note: &mut dyn FnMut(CalibTap, &Tensor),
-    ) -> Tensor {
+    fn apply_calib(&self, m: &Model, c: &Config, h: &Tensor, taps: &CalibTaps) -> Tensor {
         let picks = route(c, &self.router, &self.router_bias, h);
-        routed_calib(m, &self.experts, h, picks, self.shared.eval_tapped(h), note)
+        let shared = || self.shared.eval_tapped(h);
+        routed_calib(m, &self.experts, h, picks, shared, taps)
     }
 }
 
@@ -596,16 +579,10 @@ pub fn calib_program<R: Routed>(c: &Config) -> Graph {
         c,
         positions: &positions,
         step: None,
-        calib: Some(RefCell::new(Vec::new())),
+        calib: CalibTaps::on(),
     };
     let logits = pass.logits(&w, &tokens);
-    let taps = pass.calib.unwrap().into_inner();
-    let mut outs: Vec<(Role, &Tensor)> = Vec::with_capacity(1 + taps.len());
-    outs.push((Role::Logits, &logits));
-    for (role, t) in &taps {
-        outs.push((*role, t));
-    }
-    m.finish_many(&outs)
+    pass.calib.finish(&m, &logits)
 }
 
 /// One step entry: rows in, each row's likeliest token out.
@@ -627,7 +604,7 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
         c,
         positions: &positions,
         step: Some((&slots, (0..c.stack.layers).map(cache).collect())),
-        calib: None,
+        calib: CalibTaps::default(),
     };
     let (logits, taps) = pass.logits_taps(&w, &tokens, &c.stack.taps);
     pick(&m, &logits, allowed.as_ref(), taps.as_ref())
@@ -657,7 +634,7 @@ pub(crate) fn step_layer<R: Routed>(
         c,
         positions,
         step: Some((slots, vec![cache])),
-        calib: None,
+        calib: CalibTaps::default(),
     };
     let read = match indexer {
         Some(ix) => Keys::Pick(ix),

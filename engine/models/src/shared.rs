@@ -1,9 +1,10 @@
 //! Pieces every token model's program uses.
 
+use std::cell::RefCell;
 use tessera_trace::DimName::*;
 use tessera_trace::{
-    Act, CalibTap, Dim, DimExpr, DimName, Embed, FEW, Linear, Linears, Model, Pairs, PathSeg,
-    Tensor, Vector, Weights,
+    Act, CalibTap, Dim, DimExpr, DimName, Embed, FEW, Graph, Linear, Linears, Model, Pairs,
+    PathSeg, Role, Tensor, Vector, Weights,
 };
 
 /// A head's width outside its rotary part.
@@ -430,22 +431,50 @@ pub(crate) fn swiglu_tapped<D: Dense>(h: &Tensor, [gate, up, down]: [&D; 3]) -> 
     [down.apply(&inner), inner]
 }
 
-/// Runs routed experts with shared output and records calibration taps.
+/// Calibration taps a traced pass records, when asked to.
+#[derive(Default)]
+pub struct CalibTaps(Option<RefCell<Vec<(Role, Tensor)>>>);
+
+impl CalibTaps {
+    /// A recorder that keeps every tap.
+    pub fn on() -> Self {
+        Self(Some(RefCell::default()))
+    }
+
+    pub(crate) fn note(&self, tap: CalibTap, t: &Tensor) {
+        if let Some(taps) = &self.0 {
+            taps.borrow_mut().push((Role::Calib(tap), t.clone()));
+        }
+    }
+
+    /// Finishes `m` with `logits` first, then each tap in order.
+    pub(crate) fn finish(self, m: &Model, logits: &Tensor) -> Graph {
+        let taps = self.0.map(RefCell::into_inner).unwrap_or_default();
+        let mut outs = vec![(Role::Logits, logits)];
+        for (role, t) in &taps {
+            outs.push((*role, t));
+        }
+        m.finish_many(&outs)
+    }
+}
+
+/// Routed experts, then the shared expert, with calibration taps.
 pub(crate) fn routed_calib<E: ExpertSet>(
     m: &Model,
     experts: &E,
     h: &Tensor,
     [ids, gates]: [Tensor; 2],
-    [shared, sh_in]: [Tensor; 2],
-    note: &mut dyn FnMut(CalibTap, &Tensor),
+    shared: impl FnOnce() -> [Tensor; 2],
+    taps: &CalibTaps,
 ) -> Tensor {
-    note(CalibTap::RouterIds, &ids);
-    note(CalibTap::RouterGates, &gates);
+    taps.note(CalibTap::RouterIds, &ids);
+    taps.note(CalibTap::RouterGates, &gates);
     let (routed, inner) = experts.apply_calib(m, h, [&ids, &gates]);
     if let Some(inner) = inner {
-        note(CalibTap::RoutedInner, &inner);
+        taps.note(CalibTap::RoutedInner, &inner);
     }
-    note(CalibTap::SharedDownIn, &sh_in);
+    let [shared, sh_in] = shared();
+    taps.note(CalibTap::SharedDownIn, &sh_in);
     routed.add(&shared)
 }
 

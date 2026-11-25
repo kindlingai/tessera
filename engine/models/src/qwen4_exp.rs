@@ -6,11 +6,10 @@ use crate::qwen35::{
     either, mixing, norm, rotary, text,
 };
 use crate::shared::{
-    Attend, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink, part,
-    routed_calib, rows, swiglu_tapped,
+    Attend, CalibTaps, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink,
+    part, routed_calib, rows, swiglu_tapped,
 };
 use serde_json::json;
-use std::cell::RefCell;
 use tessera_trace::DimName::*;
 use tessera_trace::pick;
 use tessera_trace::{
@@ -415,16 +414,11 @@ fn route(router: &Linear, h: &Tensor) -> [Tensor; 2] {
 
 /// A layer's routed MoE block.
 pub trait Routed: Weights {
-    fn apply(&self, m: &Model, h: &Tensor) -> Tensor;
-    /// Same as `apply`, recording calibration taps via `note`.
-    fn apply_calib(
-        &self,
-        m: &Model,
-        h: &Tensor,
-        note: &mut dyn FnMut(CalibTap, &Tensor),
-    ) -> Tensor {
-        let _ = note;
-        self.apply(m, h)
+    /// The block's output, recording calibration taps in `taps`.
+    fn apply_calib(&self, m: &Model, h: &Tensor, taps: &CalibTaps) -> Tensor;
+
+    fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
+        self.apply_calib(m, h, &CalibTaps::default())
     }
     /// Rotates a tap into this layer's input gauge, when present.
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
@@ -446,25 +440,10 @@ pub type Moe = MoeOf<PlainExperts>;
 pub type RotatedMoe = MoeOf<CodedExperts>;
 
 impl<E: ExpertSet> Routed for MoeOf<E> {
-    fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
-        self.apply_calib(m, h, &mut |_, _| {})
-    }
-
-    fn apply_calib(
-        &self,
-        m: &Model,
-        h: &Tensor,
-        note: &mut dyn FnMut(CalibTap, &Tensor),
-    ) -> Tensor {
+    fn apply_calib(&self, m: &Model, h: &Tensor, taps: &CalibTaps) -> Tensor {
         let picks = route(&self.router, h);
-        routed_calib(
-            m,
-            &self.experts,
-            h,
-            picks,
-            self.shared.apply_tapped(h),
-            note,
-        )
+        let shared = || self.shared.apply_tapped(h);
+        routed_calib(m, &self.experts, h, picks, shared, taps)
     }
 
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
@@ -536,12 +515,13 @@ enum LayerCache {
 
 struct StepState<'a> {
     slots: &'a Tensor,
+    /// Layers whose mean hidden row the step also returns.
+    taps: &'a [u64],
     ple: Option<Kept>,
     layers: Vec<LayerCache>,
 }
 
 /// Runs all layers and returns logits, with optional taps.
-#[allow(clippy::too_many_arguments)]
 fn run<R: Routed>(
     m: &Model,
     c: &Config,
@@ -549,9 +529,9 @@ fn run<R: Routed>(
     [tokens, positions]: [&Tensor; 2],
     ple_in: Option<&Tensor>,
     step: Option<&StepState>,
-    taps: &[u64],
-    calib: Option<&RefCell<Vec<(Role, Tensor)>>>,
+    calib: &CalibTaps,
 ) -> (Tensor, Option<Tensor>) {
+    let taps = step.map_or(&[][..], |s| s.taps);
     let lead: Vec<DimExpr> = match step {
         Some(_) => vec![Rows.into()],
         None => vec![Seqs.into(), Context.into()],
@@ -598,15 +578,9 @@ fn run<R: Routed>(
                 });
                 let mid = HyperConn::post(&h_in, &attn_out, &inj, &lead);
                 let [mlp_in, mlp_inj] = l.mlp_hc.pre(&mid, &lead, c.eps);
-                let mut note = |tap: CalibTap, t: &Tensor| {
-                    if let Some(buf) = calib {
-                        buf.borrow_mut().push((Role::Calib(tap), t.clone()));
-                    }
-                };
-                note(CalibTap::MlpIn, &mlp_in);
-                let [mlp_out] = m.composite(Composite::Moe, || {
-                    [l.moe.apply_calib(m, &mlp_in, &mut note)]
-                });
+                calib.note(CalibTap::MlpIn, &mlp_in);
+                let [mlp_out] =
+                    m.composite(Composite::Moe, || [l.moe.apply_calib(m, &mlp_in, calib)]);
                 [HyperConn::post(&mid, &mlp_out, &mlp_inj, &lead)]
             });
             hyper = next;
@@ -675,47 +649,23 @@ fn forward_entry(m: &Model, c: &Config) -> (Tensor, Tensor, Option<Tensor>) {
     }
 }
 
-/// Whole-sequence forward graph.
-pub fn program<R: Routed>(c: &Config) -> Graph {
+fn traced<R: Routed>(c: &Config, calib: CalibTaps) -> Graph {
     let m = Model::new(c.dims());
     let w = Qwen4Exp::<R>::declare(&m, c);
     let (tokens, positions, ple) = forward_entry(&m, c);
-    let (logits, _) = run(
-        &m,
-        c,
-        &w,
-        [&tokens, &positions],
-        ple.as_ref(),
-        None,
-        &[],
-        None,
-    );
-    m.finish([(Role::Logits, &logits)])
+    let inputs = [&tokens, &positions];
+    let (logits, _) = run(&m, c, &w, inputs, ple.as_ref(), None, &calib);
+    calib.finish(&m, &logits)
+}
+
+/// Whole-sequence forward graph.
+pub fn program<R: Routed>(c: &Config) -> Graph {
+    traced::<R>(c, CalibTaps::default())
 }
 
 /// Whole-sequence forward graph with per-layer calibration taps.
 pub fn calib_program<R: Routed>(c: &Config) -> Graph {
-    let m = Model::new(c.dims());
-    let w = Qwen4Exp::<R>::declare(&m, c);
-    let (tokens, positions, ple) = forward_entry(&m, c);
-    let calib = RefCell::new(Vec::new());
-    let (logits, _) = run(
-        &m,
-        c,
-        &w,
-        [&tokens, &positions],
-        ple.as_ref(),
-        None,
-        &[],
-        Some(&calib),
-    );
-    let taps = calib.into_inner();
-    let mut outs: Vec<(Role, &Tensor)> = Vec::with_capacity(1 + taps.len());
-    outs.push((Role::Logits, &logits));
-    for (role, t) in &taps {
-        outs.push((*role, t));
-    }
-    m.finish_many(&outs)
+    traced::<R>(c, CalibTaps::on())
 }
 
 /// Ragged step graph with kept KV and recurrent states.
@@ -798,6 +748,7 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     }
     let state = StepState {
         slots: &slots,
+        taps: &c.stack.taps,
         ple: ple_state,
         layers,
     };
@@ -808,8 +759,7 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
         [&tokens, &positions],
         ple_in.as_ref(),
         Some(&state),
-        &c.stack.taps,
-        None,
+        &CalibTaps::default(),
     );
     pick(&m, &logits, allowed.as_ref(), taps.as_ref())
 }

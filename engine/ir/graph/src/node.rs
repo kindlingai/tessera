@@ -435,7 +435,6 @@ pub enum CalibTap {
     RouterIds,
     RouterGates,
     RoutedInner,
-    EhIn,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
