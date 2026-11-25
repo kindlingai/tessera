@@ -1,7 +1,7 @@
 //! Shared SPMD speculative decode loop and device tap helpers.
 
+use crate::sample::{Target, accept, take};
 use crate::spec_len::SpecStats;
-use crate::speculate::accept_greedy;
 use crate::{Engine, Error, Event, Reason, Request, Row};
 use tessera_engine_comm::{Reader, Writer};
 use tessera_lower::Slot;
@@ -304,16 +304,26 @@ struct LoopState {
     hash: u32,
 }
 
-fn prompt_rows(tokens: &[u32], pos: usize) -> Vec<Row> {
-    tokens
-        .iter()
-        .enumerate()
-        .map(|(i, &token)| Row {
-            slot: 0,
+/// Appends rows for `tokens` at positions from `start`.
+pub(crate) fn span(
+    rows: &mut Vec<Row>,
+    slot: u32,
+    start: usize,
+    tokens: impl IntoIterator<Item = u32>,
+) {
+    for (i, token) in tokens.into_iter().enumerate() {
+        rows.push(Row {
+            slot,
             token,
-            position: (pos + i) as u32,
-        })
-        .collect()
+            position: (start + i) as u32,
+        });
+    }
+}
+
+fn prompt_rows(tokens: &[u32], pos: usize) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(tokens.len());
+    span(&mut rows, 0, pos, tokens.iter().copied());
+    rows
 }
 
 fn accept_token(
@@ -323,18 +333,17 @@ fn accept_token(
     lead: bool,
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Option<Reason> {
-    if request.stop.contains(&id) {
-        return Some(Reason::Stop);
-    }
-    st.sim_emitted += 1;
-    if lead && !st.stopped {
-        st.stats.emitted += 1;
-        if !emit(Event::Token(id)) {
-            st.stopped = true;
-            let _ = emit(Event::Done(Reason::Stop));
+    let LoopState { stats, stopped, .. } = st;
+    take(request, &mut st.sim_emitted, id, || {
+        if lead && !*stopped {
+            stats.emitted += 1;
+            if !emit(Event::Token(id)) {
+                *stopped = true;
+                let _ = emit(Event::Done(Reason::Stop));
+            }
         }
-    }
-    (st.sim_emitted >= request.max_tokens).then_some(Reason::Length)
+        true
+    })
 }
 
 /// Shared SPMD greedy speculative decode loop for all drafters.
@@ -419,64 +428,40 @@ pub(crate) fn run_speculate<D, S>(
             break;
         }
         let remaining = request.max_tokens - st.sim_emitted;
-        let Some(drafts) = draft(target, drafter, &mut state, start, anchor, remaining)? else {
-            let row = [Row {
-                slot: 0,
-                token: anchor,
-                position: start as u32,
-            }];
-            let next = target.step_local(&row)?[0];
-            start += 1;
-            fnv_u32(&mut st.hash, start as u32);
-            fnv_u32(&mut st.hash, next);
-            round += 1;
-            if let Some(reason) = accept_token(&request, &mut st, next, lead, emit) {
-                done_reason = Some(reason);
-                break;
+        let drafts = draft(target, drafter, &mut state, start, anchor, remaining)?;
+        let block = drafts.as_deref().unwrap_or(&[]);
+        let mut verify = Vec::with_capacity(block.len() + 1);
+        span(
+            &mut verify,
+            0,
+            start,
+            [anchor].into_iter().chain(block.iter().copied()),
+        );
+        // A drafted round also reads taps.
+        let (posterior, block_taps) = match drafts {
+            Some(_) => {
+                let (ids, taps) = target.step_taps_local(&verify)?;
+                (ids, Some(taps))
             }
-            if !ranked && st.stopped {
-                return Ok(st.stats);
-            }
-            if ranked
-                && round.is_multiple_of(SYNC_EVERY)
-                && sync_ranks(target, st.stopped, st.hash)?
-            {
-                return Ok(st.stats);
-            }
-            anchor = next;
-            continue;
+            None => (target.step_local(&verify)?, None),
         };
-        let mut verify = Vec::with_capacity(drafts.len() + 1);
-        verify.push(Row {
-            slot: 0,
-            token: anchor,
-            position: start as u32,
-        });
-        for (i, &token) in drafts.iter().enumerate() {
-            verify.push(Row {
-                slot: 0,
-                token,
-                position: (start + 1 + i) as u32,
-            });
-        }
-        let (posterior, block_taps) = target.step_taps_local(&verify)?;
-        let (accepted, bonus) = accept_greedy(&drafts, &posterior);
-        if accepted < drafts.len() && target.stateful() && target.slots() > 1 {
+        let (accepted, bonus) = accept(block, Target::Ids(&posterior));
+        if accepted < block.len() && target.stateful() && target.slots() > 1 {
             target.restore_recurrent_slot(accepted + 1)?;
         }
-        if lead && !st.stopped {
+        if drafts.is_some() && lead && !st.stopped {
             st.stats.steps += 1;
-            st.stats.drafted += drafts.len();
+            st.stats.drafted += block.len();
             st.stats.accepted += accepted;
         }
         fnv_u32(&mut st.hash, start as u32);
-        fnv_u32(&mut st.hash, drafts.len() as u32);
-        for &d in &drafts {
+        fnv_u32(&mut st.hash, block.len() as u32);
+        for &d in block {
             fnv_u32(&mut st.hash, d);
         }
         fnv_u32(&mut st.hash, accepted as u32);
         fnv_u32(&mut st.hash, bonus);
-        for id in drafts[..accepted].iter().copied().chain([bonus]) {
+        for id in block[..accepted].iter().copied().chain([bonus]) {
             if let Some(reason) = accept_token(&request, &mut st, id, lead, emit) {
                 done_reason = Some(reason);
                 break;
@@ -493,25 +478,26 @@ pub(crate) fn run_speculate<D, S>(
         if ranked && round.is_multiple_of(SYNC_EVERY) && sync_ranks(target, st.stopped, st.hash)? {
             return Ok(st.stats);
         }
-        let commit = 1 + accepted;
-        let mut discard = SpecStats::default();
-        let stat_ref = if lead && !st.stopped {
-            &mut st.stats
-        } else {
-            &mut discard
-        };
-        advance(
-            target,
-            drafter,
-            &mut state,
-            start,
-            drafts.len(),
-            accepted,
-            &posterior,
-            block_taps,
-            stat_ref,
-        )?;
-        start += commit;
+        if let Some(block_taps) = block_taps {
+            let mut discard = SpecStats::default();
+            let stat_ref = if lead && !st.stopped {
+                &mut st.stats
+            } else {
+                &mut discard
+            };
+            advance(
+                target,
+                drafter,
+                &mut state,
+                start,
+                block.len(),
+                accepted,
+                &posterior,
+                block_taps,
+                stat_ref,
+            )?;
+        }
+        start += 1 + accepted;
         anchor = bonus;
     }
     if lead && !st.stopped {

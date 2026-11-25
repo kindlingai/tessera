@@ -1,9 +1,9 @@
 //! Many answers in flight, one step feeding them all.
 
-use crate::guide::{Edit, edit};
+use crate::guide::Edit;
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
-use crate::sample::Sampler;
+use crate::sample::{Sampler, Target, Weights, accept, take};
 use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
 use std::collections::VecDeque;
 
@@ -56,36 +56,32 @@ impl Seq {
         self.pending.len() > 1
     }
 
-    /// Counts `n` tokens fed. `id` follows the last one.
-    fn advance(&mut self, n: usize, id: u32) -> Option<Reason> {
+    /// Counts `n` tokens fed. `target` gives the token after them.
+    fn advance(&mut self, n: usize, target: Target) -> Option<Reason> {
         self.history.extend(self.pending.drain(..n));
         self.fed += n;
         if !self.pending.is_empty() {
             return None;
         }
+        let (_, id) = accept(&[], target);
         if let Some(guide) = &mut self.request.guide
             && guide.accept(id).is_err()
         {
             return Some(Reason::Guide);
         }
-        if self.request.stop.contains(&id) {
-            return Some(Reason::Stop);
-        }
-        if let Some(reason) = self.emit(id) {
+        if let Some(reason) = self.take(id) {
             return Some(reason);
         }
         self.pending.push_back(id);
         self.settle()
     }
 
-    /// Sends an answer token.
-    fn emit(&mut self, id: u32) -> Option<Reason> {
-        self.made += 1;
-        MADE.add(1);
-        if !(self.sink)(Event::Token(id)) {
-            return Some(Reason::Stop);
-        }
-        (self.made >= self.request.max_tokens).then_some(Reason::Length)
+    /// Takes an answer token and sends it.
+    fn take(&mut self, id: u32) -> Option<Reason> {
+        take(&self.request, &mut self.made, id, || {
+            MADE.add(1);
+            (self.sink)(Event::Token(id))
+        })
     }
 
     /// Adds forced and single-choice tokens, then reads the next set.
@@ -111,10 +107,7 @@ impl Seq {
                 false => Vec::new(),
             };
             for id in forced.into_iter().chain(one) {
-                if self.request.stop.contains(&id) {
-                    return Some(Reason::Stop);
-                }
-                if let Some(reason) = self.emit(id) {
+                if let Some(reason) = self.take(id) {
                     return Some(reason);
                 }
                 self.pending.push_back(id);
@@ -127,6 +120,22 @@ impl Seq {
                 self.edits = edits;
                 return None;
             }
+        }
+    }
+}
+
+/// One launch's result for each pick.
+enum Picked {
+    Ids(Vec<u32>),
+    Drawn(Vec<Weights>, Vec<f32>),
+}
+
+impl Picked {
+    /// The target of pick `k`.
+    fn target(&self, k: usize) -> Target<'_> {
+        match self {
+            Picked::Ids(ids) => Target::Ids(&ids[k..=k]),
+            Picked::Drawn(rows, units) => Target::Drawn(&rows[k..=k], &units[k..=k]),
         }
     }
 }
@@ -466,36 +475,33 @@ impl<'a> Batch<'a> {
         let edited = owners
             .iter()
             .any(|&(at, keep)| keep && !self.active[at].edits.is_empty());
-        let ids = match (sampling || edited, self.allowed(&owners)) {
+        let picked = match (sampling || edited, self.allowed(&owners)) {
             (true, allowed) => {
                 let (mut logits, vocab) = self.engine.last_logits(&rows)?;
-                let mut picked = Vec::with_capacity(ends.len());
+                let mut weights = Vec::with_capacity(ends.len());
+                let mut units = Vec::with_capacity(ends.len());
                 for (k, &(at, keep)) in owners.iter().enumerate() {
                     let seq = &mut self.active[at];
                     let row = &mut logits[k * vocab..(k + 1) * vocab];
-                    if keep {
-                        edit(row, &seq.edits);
-                    }
+                    let edits: &[Edit] = if keep { &seq.edits } else { &[] };
                     let mask = allowed.as_ref().map(|a| &a[k]);
-                    picked.push(seq.sampler.pick(row, mask));
+                    weights.push(seq.sampler.weights(row, mask, edits));
+                    units.push(seq.sampler.unit());
                 }
-                picked
+                Picked::Drawn(weights, units)
             }
-            (false, Some(allowed)) => self.engine.last_guided(&rows, &allowed)?,
-            (false, None) => self.engine.last(&rows)?,
+            (false, Some(allowed)) => Picked::Ids(self.engine.last_guided(&rows, &allowed)?),
+            (false, None) => Picked::Ids(self.engine.last(&rows)?),
         };
-        // Each answer takes its rows and its last id.
+        // Each answer takes its rows and its last pick.
         let mut i = 0;
         while i < self.active.len() {
             let slot = self.active[i].slot;
             let n = rows.iter().filter(|r| r.slot == slot).count();
-            let mine = ends
-                .iter()
-                .zip(&ids)
-                .find(|(e, _)| rows[**e as usize].slot == slot);
+            let mine = ends.iter().position(|e| rows[*e as usize].slot == slot);
             match mine {
                 None => i += 1,
-                Some((_, &last)) => match self.active[i].advance(n, last) {
+                Some(k) => match self.active[i].advance(n, picked.target(k)) {
                     Some(reason) => {
                         (self.active[i].sink)(Event::Done(reason));
                         self.finish(i);

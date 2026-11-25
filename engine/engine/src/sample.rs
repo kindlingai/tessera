@@ -1,6 +1,7 @@
-//! Token sampling from logits with temperature, top-k, top-p and min-p.
+//! Token choice: sampling from logits, draft acceptance and answer limits.
 
-use crate::Allowed;
+use crate::guide::{Edit, edit};
+use crate::{Allowed, Reason, Request};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -49,13 +50,19 @@ impl Sampler {
         }
     }
 
-    /// Picks one token from `logits`, respecting `allowed` when given.
-    pub(crate) fn pick(&mut self, logits: &[f32], allowed: Option<&Allowed>) -> u32 {
+    /// The candidate weights of one row, after `edits` and filters.
+    pub(crate) fn weights(
+        &self,
+        logits: &mut [f32],
+        allowed: Option<&Allowed>,
+        edits: &[Edit],
+    ) -> Weights {
+        edit(logits, edits);
         if let Some(Allowed::One(id)) = allowed {
-            return *id;
+            return Weights::one(*id);
         }
         if self.cfg.greedy() {
-            return argmax(logits, allowed);
+            return Weights::one(argmax(logits, allowed));
         }
         let mut max = f32::NEG_INFINITY;
         each_allowed(logits, allowed, |_, v| {
@@ -64,7 +71,7 @@ impl Sampler {
             }
         });
         if !max.is_finite() {
-            return argmax(logits, allowed);
+            return Weights::one(argmax(logits, allowed));
         }
         let temp = self.cfg.temperature;
         let mut floor = max - 20.0 * temp;
@@ -78,27 +85,17 @@ impl Sampler {
             }
         });
         if cands.is_empty() {
-            return argmax(logits, allowed);
+            return Weights::one(argmax(logits, allowed));
         }
         filter_top(&mut cands, self.cfg.top_k, self.cfg.top_p, max, temp);
-        let weights: Vec<f32> = cands
-            .iter()
-            .map(|&(_, v)| ((v - max) / temp).exp())
-            .collect();
-        let total: f32 = weights.iter().sum();
-        let target = self.next_unit() * total;
-        let mut acc = 0.0f32;
-        for (&(id, _), &w) in cands.iter().zip(&weights) {
-            acc += w;
-            if target < acc {
-                return id;
-            }
+        for c in &mut cands {
+            c.1 = ((c.1 - max) / temp).exp();
         }
-        cands[cands.len() - 1].0
+        Weights::of(cands)
     }
 
-    /// A uniform float in `[0, 1)` from SplitMix64.
-    fn next_unit(&mut self) -> f32 {
+    /// A uniform in `[0, 1)`. Each row draws one.
+    pub(crate) fn unit(&mut self) -> f32 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -106,6 +103,103 @@ impl Sampler {
         z ^= z >> 31;
         ((z >> 40) as f32) * (1.0 / ((1u32 << 24) as f32))
     }
+}
+
+/// One row's candidate ids and their unnormalized weights.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Weights {
+    cands: Vec<(u32, f32)>,
+    total: f32,
+}
+
+impl Weights {
+    /// All the weight on `id`.
+    pub fn one(id: u32) -> Self {
+        Self::of(vec![(id, 1.0)])
+    }
+
+    /// Weights from `(id, weight)` pairs.
+    pub fn of(cands: Vec<(u32, f32)>) -> Self {
+        let total = cands.iter().map(|c| c.1).sum();
+        Self { cands, total }
+    }
+
+    /// The share of the weight on `id`.
+    pub fn share(&self, id: u32) -> f32 {
+        let on = self.cands.iter().filter(|c| c.0 == id);
+        on.map(|c| c.1).sum::<f32>() / self.total
+    }
+
+    /// The id at `unit` of the weight.
+    pub fn draw(&self, unit: f32) -> u32 {
+        let target = unit * self.total;
+        let mut acc = 0.0f32;
+        for &(id, w) in &self.cands {
+            acc += w;
+            if target < acc {
+                return id;
+            }
+        }
+        self.cands.last().map_or(0, |c| c.0)
+    }
+
+    /// As `draw`, over the ids other than `id`.
+    fn redraw(&self, id: u32, unit: f32) -> u32 {
+        let rest = self.cands.iter().filter(|c| c.0 != id);
+        let rest = Self::of(rest.copied().collect());
+        match rest.total > 0.0 {
+            true => rest.draw(unit),
+            false => self.draw(unit),
+        }
+    }
+}
+
+/// The target's answer after each verify row.
+#[derive(Clone, Copy, Debug)]
+pub enum Target<'a> {
+    /// The likeliest id after each row.
+    Ids(&'a [u32]),
+    /// Each row's weights, and one uniform for each row.
+    Drawn(&'a [Weights], &'a [f32]),
+}
+
+/// The count of held drafts, and the next token.
+pub fn accept(drafts: &[u32], target: Target) -> (usize, u32) {
+    // Zero drafts is a plain pick.
+    let n = drafts.len();
+    match target {
+        Target::Ids(ids) => {
+            assert_eq!(ids.len(), n + 1);
+            let held = drafts.iter().zip(ids).take_while(|(d, i)| d == i).count();
+            (held, ids[held])
+        }
+        Target::Drawn(rows, units) => {
+            assert_eq!((rows.len(), units.len()), (n + 1, n + 1));
+            for (i, &draft) in drafts.iter().enumerate() {
+                if units[i] >= rows[i].share(draft) {
+                    return (i, rows[i].redraw(draft, units[n]));
+                }
+            }
+            (n, rows[n].draw(units[n]))
+        }
+    }
+}
+
+/// Counts `id` as an answer token, unless it stops.
+pub(crate) fn take(
+    request: &Request,
+    made: &mut usize,
+    id: u32,
+    send: impl FnOnce() -> bool,
+) -> Option<Reason> {
+    if request.stop.contains(&id) {
+        return Some(Reason::Stop);
+    }
+    *made += 1;
+    if !send() {
+        return Some(Reason::Stop);
+    }
+    (*made >= request.max_tokens).then_some(Reason::Length)
 }
 
 /// Calls `f` for every allowed finite `(id, logit)`.

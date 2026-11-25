@@ -2,9 +2,9 @@
 
 use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, SoloState, push_tail};
 use crate::mtp_draft::{MtpDrafter, MtpSpan};
+use crate::sample::{Target, accept, take};
 use crate::schedule::Sink;
-use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, tell_ranks};
-use crate::speculate::accept_greedy;
+use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span, tell_ranks};
 use crate::{Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 use tessera_engine_comm::{Reader, Writer};
@@ -45,35 +45,38 @@ impl ActiveSeq {
         max_ctx: usize,
         hash: &mut u32,
     ) -> (usize, Vec<u32>, Option<Reason>) {
-        let (accepted, bonus) = accept_greedy(&self.drafts[..k], &ids[..1 + k]);
+        let (accepted, bonus) = accept(&self.drafts[..k], Target::Ids(&ids[..1 + k]));
         fnv_u32(hash, accepted as u32);
         fnv_u32(hash, bonus);
         let commit = 1 + accepted;
         let mut committed = Vec::with_capacity(commit);
         committed.extend_from_slice(&self.drafts[..accepted]);
         committed.push(bonus);
-        let mut done = None;
-        for &tok in &committed {
-            if self.request.stop.contains(&tok) {
-                done = Some(Reason::Stop);
-                break;
-            }
-            self.emitted += 1;
-            if !self.cancelled
-                && let Some(cb) = &mut self.sink
-                && !cb(Event::Token(tok))
-            {
-                self.cancelled = true;
-                let _ = cb(Event::Done(Reason::Stop));
-            }
-            if self.emitted >= self.request.max_tokens {
-                done = Some(Reason::Length);
-                break;
-            }
-        }
         self.start += commit;
         self.anchor = bonus;
         self.drafts.clear();
+        let done = self.commit(&committed, max_ctx);
+        (accepted, committed, done)
+    }
+
+    /// Takes `tokens` and sends them. Returns the end, if any.
+    pub(crate) fn commit(&mut self, tokens: &[u32], max_ctx: usize) -> Option<Reason> {
+        let mut done = None;
+        for &tok in tokens {
+            done = take(&self.request, &mut self.emitted, tok, || {
+                if !self.cancelled
+                    && let Some(cb) = &mut self.sink
+                    && !cb(Event::Token(tok))
+                {
+                    self.cancelled = true;
+                    let _ = cb(Event::Done(Reason::Stop));
+                }
+                true
+            });
+            if done.is_some() {
+                break;
+            }
+        }
         if done.is_none() && self.start >= max_ctx {
             done = Some(Reason::Context);
         }
@@ -83,7 +86,25 @@ impl ActiveSeq {
         {
             let _ = cb(Event::Done(reason));
         }
-        (accepted, committed, done)
+        done
+    }
+
+    /// The room for drafts in the next verify.
+    pub(crate) fn room(&self, max_ctx: usize) -> usize {
+        let rem = self.request.max_tokens.saturating_sub(self.emitted);
+        let ctx_rem = max_ctx.saturating_sub(self.start);
+        rem.saturating_sub(1).min(ctx_rem.saturating_sub(1))
+    }
+
+    /// Appends the anchor's row and `k` draft rows.
+    pub(crate) fn verify(&self, rows: &mut Vec<Row>, k: usize) {
+        let block = self.drafts[..k].iter().copied();
+        span(
+            rows,
+            self.slot,
+            self.start,
+            [self.anchor].into_iter().chain(block),
+        );
     }
 }
 
@@ -309,13 +330,9 @@ impl<'a> BatchMtp<'a> {
         let len = (n - pos0).min(self.prefill_chunk);
         let wants = self.drafter.wants();
         let dual_widths = self.dual.as_ref().map(|p| (p.d_width, p.m_width));
-        let rows: Vec<Row> = (0..len)
-            .map(|i| Row {
-                slot: seq.slot,
-                token: seq.request.tokens[pos0 + i],
-                position: (pos0 + i) as u32,
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(len);
+        let chunk = &seq.request.tokens[pos0..pos0 + len];
+        span(&mut rows, seq.slot, pos0, chunk.iter().copied());
         let (ids, taps) = self.target.step_taps_local(&rows)?;
         if pos0 + len < n {
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
@@ -342,67 +359,46 @@ impl<'a> BatchMtp<'a> {
         }
         let anchor = *ids.last().expect("non-empty chunk");
         fnv_u32(&mut self.hash, anchor);
-        let mut cancelled = false;
-        let mut done = None;
-        if seq.request.stop.contains(&anchor) {
-            done = Some(Reason::Stop);
-        } else {
-            if let Some(cb) = &mut seq.sink
-                && !cb(Event::Token(anchor))
-            {
-                cancelled = true;
-                let _ = cb(Event::Done(Reason::Stop));
-            }
-            if 1 >= seq.request.max_tokens {
-                done = Some(Reason::Length);
-            } else if n >= self.max_ctx {
-                done = Some(Reason::Context);
-            }
-        }
-        if let Some(reason) = done {
-            if !cancelled && let Some(cb) = &mut seq.sink {
-                let _ = cb(Event::Done(reason));
-            }
-            self.free.push(seq.slot);
-            return Ok(());
-        }
-        if self.target.control.is_none() && cancelled {
-            self.free.push(seq.slot);
-            return Ok(());
-        }
         let mut shifted = Vec::with_capacity(len);
         shifted.extend_from_slice(&seq.request.tokens[pos0 + 1..]);
         shifted.push(anchor);
+        let mut act = ActiveSeq {
+            slot: seq.slot,
+            request: seq.request,
+            sink: seq.sink,
+            start: n,
+            anchor,
+            drafts: Vec::new(),
+            emitted: 0,
+            cancelled: false,
+            solo: None,
+            d_tail: Vec::new(),
+        };
+        let done = act.commit(&[anchor], self.max_ctx);
+        if done.is_some() || (self.target.control.is_none() && act.cancelled) {
+            self.free.push(act.slot);
+            return Ok(());
+        }
         if seq.solo_mode {
             let (dt, mt) = self.split_dual_taps(taps, len)?;
             seq.d_buf.extend_from_slice(&dt);
             seq.m_tok_buf.extend_from_slice(&shifted);
             seq.m_tap_buf.extend_from_slice(&mt);
             let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
-            self.active.push(ActiveSeq {
-                slot: seq.slot,
-                request: seq.request,
-                sink: seq.sink,
-                start: n,
-                anchor,
-                drafts: Vec::new(),
-                emitted: 1,
-                cancelled,
-                solo: Some(SoloState {
-                    selector,
-                    d_base: 0,
-                    d_ctx_pos: 0,
-                    d_pending: seq.d_buf,
-                    m_start: 0,
-                    m_tokens: seq.m_tok_buf,
-                    m_taps: seq.m_tap_buf,
-                    round_mtp: false,
-                    last_pred: 1.0,
-                    last_lp: None,
-                    last_mtp_d1: None,
-                }),
-                d_tail: Vec::new(),
+            act.solo = Some(SoloState {
+                selector,
+                d_base: 0,
+                d_ctx_pos: 0,
+                d_pending: seq.d_buf,
+                m_start: 0,
+                m_tokens: seq.m_tok_buf,
+                m_taps: seq.m_tap_buf,
+                round_mtp: false,
+                last_pred: 1.0,
+                last_lp: None,
+                last_mtp_d1: None,
             });
+            self.active.push(act);
             let idx = self.active.len() - 1;
             self.solo_draft(idx)?;
             return Ok(());
@@ -413,16 +409,11 @@ impl<'a> BatchMtp<'a> {
             let dt = self.read_dual_d_taps(&taps, len)?;
             push_tail(&mut seq.d_buf, &dt, d_w);
         }
-        let rem = seq.request.max_tokens - 1;
-        let ctx_rem = self.max_ctx - n;
-        let avail = self
-            .depth
-            .min(rem.saturating_sub(1))
-            .min(ctx_rem.saturating_sub(1));
-        let drafts = if avail > 0 {
+        let avail = self.depth.min(act.room(self.max_ctx));
+        act.drafts = if avail > 0 {
             let job = DraftJob {
                 active_idx: 0,
-                slot: seq.slot,
+                slot: act.slot,
                 old_start: pos0 as u32,
                 new_start: n,
                 committed: shifted,
@@ -435,18 +426,8 @@ impl<'a> BatchMtp<'a> {
         } else {
             Vec::new()
         };
-        self.active.push(ActiveSeq {
-            slot: seq.slot,
-            request: seq.request,
-            sink: seq.sink,
-            start: n,
-            anchor,
-            drafts,
-            emitted: 1,
-            cancelled,
-            solo: None,
-            d_tail: seq.d_buf,
-        });
+        act.d_tail = seq.d_buf;
+        self.active.push(act);
         Ok(())
     }
 
@@ -455,24 +436,9 @@ impl<'a> BatchMtp<'a> {
         let mut rows = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s_count);
         for seq in &self.active {
-            let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-            let ctx_rem = self.max_ctx.saturating_sub(seq.start);
-            let max_d = rem.saturating_sub(1).min(ctx_rem.saturating_sub(1));
-            let k = seq.drafts.len().min(max_d);
-            let off = rows.len();
-            rows.push(Row {
-                slot: seq.slot,
-                token: seq.anchor,
-                position: seq.start as u32,
-            });
-            for j in 0..k {
-                rows.push(Row {
-                    slot: seq.slot,
-                    token: seq.drafts[j],
-                    position: (seq.start + 1 + j) as u32,
-                });
-            }
-            spans.push((off, k));
+            let k = seq.drafts.len().min(seq.room(self.max_ctx));
+            spans.push((rows.len(), k));
+            seq.verify(&mut rows, k);
         }
         let (ids, raw_taps) = self.target.step_taps_local(&rows)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
@@ -492,12 +458,7 @@ impl<'a> BatchMtp<'a> {
                 finished[i] = true;
                 continue;
             }
-            let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-            let ctx_rem = self.max_ctx.saturating_sub(seq.start);
-            let avail = self
-                .depth
-                .min(rem.saturating_sub(1))
-                .min(ctx_rem.saturating_sub(1));
+            let avail = self.depth.min(seq.room(self.max_ctx));
             if avail > 0 {
                 jobs.push(DraftJob {
                     active_idx: i,

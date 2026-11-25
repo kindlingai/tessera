@@ -5,7 +5,7 @@ use crate::dual::{DualSelector, run_dflash, split_taps};
 use crate::mtp_draft::MtpDrafter;
 use crate::spec_loop::{TapsBuf, TapsIn};
 use crate::speculate::Drafter;
-use crate::{Engine, Error, Row};
+use crate::{Engine, Error};
 use std::collections::VecDeque;
 
 /// Context rows retained per slot for DFlash tail promotion.
@@ -243,23 +243,9 @@ impl<'a> BatchMtp<'a> {
     /// Verifies and re-drafts one solo sequence using DFlash or MTP.
     pub(crate) fn verify_solo(&mut self) -> Result<(), Error> {
         let seq = &self.active[0];
-        let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-        let ctx_rem = self.max_ctx.saturating_sub(seq.start);
-        let max_d = rem.saturating_sub(1).min(ctx_rem.saturating_sub(1));
-        let k = seq.drafts.len().min(max_d);
+        let k = seq.drafts.len().min(seq.room(self.max_ctx));
         let mut rows = Vec::with_capacity(1 + k);
-        rows.push(Row {
-            slot: seq.slot,
-            token: seq.anchor,
-            position: seq.start as u32,
-        });
-        for j in 0..k {
-            rows.push(Row {
-                slot: seq.slot,
-                token: seq.drafts[j],
-                position: (seq.start + 1 + j) as u32,
-            });
-        }
+        seq.verify(&mut rows, k);
         let (ids, taps) = self.target.step_taps_local(&rows)?;
         let (d_all, m_all) = self.split_dual_taps(taps, rows.len())?;
         let d_width = self.dual.as_ref().expect("dual peer").d_width;
@@ -299,13 +285,8 @@ impl<'a> BatchMtp<'a> {
     /// Proposes next drafts for solo sequence `idx` via `DualSelector`.
     pub(crate) fn solo_draft(&mut self, idx: usize) -> Result<(), Error> {
         let block = self.dual.as_ref().expect("dual peer").block;
-        let rem_cap = self.active[idx]
-            .request
-            .max_tokens
-            .saturating_sub(self.active[idx].emitted)
-            .saturating_sub(1);
-        let ctx_cap = self.max_ctx.saturating_sub(self.active[idx].start + 1);
-        if rem_cap == 0 || ctx_cap == 0 {
+        let room = self.active[idx].room(self.max_ctx);
+        if room == 0 {
             self.active[idx].drafts.clear();
             return Ok(());
         }
@@ -348,7 +329,7 @@ impl<'a> BatchMtp<'a> {
             };
             let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
             let (mut drafts, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
-            let avail = drafts.len().min(rem_cap).min(ctx_cap);
+            let avail = drafts.len().min(room);
             let (k, pred) = self.active[idx]
                 .solo
                 .as_ref()
@@ -383,11 +364,7 @@ impl<'a> BatchMtp<'a> {
             let solo = self.active[idx].solo.as_mut().expect("solo");
             let ms = solo.m_start;
             solo.m_start = start as u32;
-            let avail = self
-                .depth
-                .min(solo.selector.mtp.max_k())
-                .min(rem_cap)
-                .min(ctx_cap);
+            let avail = self.depth.min(solo.selector.mtp.max_k()).min(room);
             (
                 ms,
                 std::mem::take(&mut solo.m_tokens),

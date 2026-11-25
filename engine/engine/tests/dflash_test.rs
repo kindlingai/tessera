@@ -8,10 +8,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use tessera_engine::comm::{Error as CommError, Sockets, Transport};
-use tessera_engine::{
-    Drafter, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate, accept_greedy,
-    accept_sample,
-};
+use tessera_engine::{Drafter, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate};
 use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
 use tessera_interp::{Store, Tensor, run, run_kept, run_ranks};
@@ -316,22 +313,6 @@ fn dspine_bridge() {
     let d_weights = weights(&d_graph, &mut Noise(53));
     let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8, true);
     assert!(stats.emitted == 8 && stats.steps > 0);
-}
-
-#[test]
-fn accept_rules() {
-    assert_eq!(accept_greedy(&[1, 2, 3], &[1, 2, 3, 4]), (3, 4));
-    assert_eq!(accept_greedy(&[1, 2, 3], &[1, 9, 3, 4]), (1, 9));
-    assert_eq!(accept_greedy(&[1, 2, 3], &[8, 2, 3, 4]), (0, 8));
-    let q0 = [0.2f32, 0.8, 0.0];
-    let p0 = [0.5f32, 0.4, 0.1];
-    let p1 = [0.1f32, 0.2, 0.7];
-    // Ratio p/q = 0.5 rejects at u = 0.7.
-    let (acc, bonus) = accept_sample(&[1], &[&q0], &[&p0, &p1], &[0.7, 0.5]);
-    assert_eq!((acc, bonus), (0, 0));
-    // Accepts at u = 0.3 and draws bonus from p1.
-    let (acc, bonus) = accept_sample(&[1], &[&q0], &[&p0, &p1], &[0.3, 0.5]);
-    assert_eq!((acc, bonus), (1, 2));
 }
 
 fn verify_tp_pair(
