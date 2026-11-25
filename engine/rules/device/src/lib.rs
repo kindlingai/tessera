@@ -1,6 +1,7 @@
 //! Device headers for recipe kernels, and the import scanner.
 
 pub mod abi;
+mod attend;
 mod flatten;
 #[cfg(test)]
 mod flatten_test;
