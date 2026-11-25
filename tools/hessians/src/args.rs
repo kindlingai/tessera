@@ -39,6 +39,8 @@ pub struct Config {
     pub resume: bool,
     pub state: Option<PathBuf>,
     pub keep_hidden: bool,
+    pub gpu: bool,
+    pub device: Option<usize>,
     pub tile: usize,
 }
 
@@ -59,6 +61,46 @@ impl Config {
         self.route_log = set(&self.specs.route)?.into_iter().collect();
         Ok(())
     }
+}
+
+/// Kernel bench sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BenchShape {
+    pub experts: usize,
+    pub hidden: usize,
+    pub ffn: usize,
+    pub tokens: usize,
+    pub top_k: usize,
+    pub dense: usize,
+}
+
+impl Default for BenchShape {
+    fn default() -> Self {
+        Self {
+            experts: 256,
+            hidden: 6144,
+            ffn: 2048,
+            tokens: 32_768,
+            top_k: 8,
+            dense: 16_384,
+        }
+    }
+}
+
+/// Top-level mode: calibration, kernel bench, or parity check.
+#[derive(Clone, Debug)]
+pub enum Command {
+    Calib(Box<Config>),
+    BenchKernels {
+        device: Option<usize>,
+        shape: BenchShape,
+    },
+    VerifyParity {
+        got: PathBuf,
+        want: PathBuf,
+        layer: usize,
+        max_rel: f64,
+    },
 }
 
 /// A tokens file: `rows` by `seq_len` ids, and its hash.
@@ -255,6 +297,8 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         resume: false,
         state: None,
         keep_hidden: false,
+        gpu: false,
+        device: None,
         tile: TILE,
     };
     walk(args, |flag, value| {
@@ -278,6 +322,8 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             "--no-experts" => cfg.no_experts = true,
             "--resume" => cfg.resume = true,
             "--keep-hidden" => cfg.keep_hidden = true,
+            "--gpu" => cfg.gpu = true,
+            "--device" => cfg.device = Some(num(value()?, flag)?),
             other => return unknown(other),
         }
         Ok(())
@@ -287,4 +333,58 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     cfg.work = work.ok_or("missing --work")?;
     cfg.out = out.ok_or("missing --out")?;
     Ok(cfg)
+}
+
+fn parse_shape(spec: &str) -> Result<BenchShape, String> {
+    let dims: Vec<usize> = (spec.split(',').map(str::parse))
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("bad --shape `{spec}`"))?;
+    let &[experts, hidden, ffn, tokens, top_k, dense] = dims.as_slice() else {
+        return Err("--shape takes E,H,F,T,K,D".into());
+    };
+    Ok(BenchShape {
+        experts,
+        hidden,
+        ffn,
+        tokens,
+        top_k,
+        dense,
+    })
+}
+
+/// Parses flags into calibration, kernel bench, or parity mode.
+pub fn parse_command(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| a == "--bench-kernels") {
+        let (mut device, mut shape) = (None, BenchShape::default());
+        walk(args, |flag, value| {
+            match flag {
+                "--bench-kernels" => {}
+                "--device" => device = Some(num(value()?, flag)?),
+                "--shape" => shape = parse_shape(&value()?)?,
+                other => return unknown(other),
+            }
+            Ok(())
+        })?;
+        return Ok(Command::BenchKernels { device, shape });
+    }
+    if args.iter().any(|a| a == "--verify-parity") {
+        let (mut dirs, mut layer, mut max_rel) = (None, None, 5e-3f64);
+        walk(args, |flag, value| {
+            match flag {
+                "--verify-parity" => dirs = Some((PathBuf::from(value()?), value()?.into())),
+                "--layer" => layer = Some(num(value()?, flag)?),
+                "--max-rel" | "--max-rel-frob" => max_rel = num(value()?, flag)?,
+                other => return unknown(other),
+            }
+            Ok(())
+        })?;
+        let (got, want) = dirs.ok_or("missing --verify-parity <got> <want>")?;
+        return Ok(Command::VerifyParity {
+            got,
+            want,
+            layer: layer.ok_or("missing --layer")?,
+            max_rel,
+        });
+    }
+    Ok(Command::Calib(Box::new(parse_args(args)?)))
 }

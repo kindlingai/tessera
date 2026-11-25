@@ -13,14 +13,14 @@ use tessera_lower::{
 const KERNEL: &str = include_str!("grouped.cu");
 
 /// Block count for deterministic chunked expert counting sort.
-pub(crate) const SORT_BLOCKS: usize = 64;
+pub const SORT_BLOCKS: usize = 64;
 /// Maximum routed experts supported in shared-memory histograms.
-pub(crate) const MAX_EXPERTS: usize = 1024;
+pub const MAX_EXPERTS: usize = 1024;
 /// Tile side length for grouped SYRK and BF16 GEMM.
 pub const TILE: usize = 128;
 
 /// Flattened CUDA source for calibration SYRK and BF16 grouped MoE.
-pub(crate) fn cuda_source() -> &'static str {
+pub fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
     CUDA.get_or_init(|| flatten_cuda("calib_grouped.kernel", KERNEL))
 }

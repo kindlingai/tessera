@@ -2001,10 +2001,15 @@ dependencies = [
  "tessera-bundle",
  "tessera-checkpoint",
  "tessera-device",
+ "tessera-engine-settings",
+ "tessera-gpukit",
  "tessera-graph",
  "tessera-interp",
  "tessera-lower",
+ "tessera-mem",
  "tessera-models",
+ "tessera-rules",
+ "tessera-run",
  "tessera-testkit",
 ]
 

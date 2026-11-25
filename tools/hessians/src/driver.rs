@@ -535,6 +535,12 @@ pub(crate) fn load_config(cfg: &mut Config) -> Result<(mla::Config, Tokens), Str
 /// Runs layer-streaming MLA calibration from a checkpoint directory.
 pub fn run_dir(mut cfg: Config) -> Result<(), String> {
     let (mla_cfg, toks) = load_config(&mut cfg)?;
+    if cfg.gpu {
+        #[cfg(feature = "cuda")]
+        return crate::gpu::run_gpu(&cfg, &mla_cfg, toks);
+        #[cfg(not(feature = "cuda"))]
+        return Err("rebuild with --features cuda for --gpu".into());
+    }
     let plan = prepare_run(&cfg, &mla_cfg, toks)?;
     if plan.todo.is_empty() {
         return Ok(());
