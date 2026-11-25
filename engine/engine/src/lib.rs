@@ -25,7 +25,6 @@ pub mod metrics;
 mod metrics_test;
 mod model;
 mod mtp_draft;
-mod penalty;
 mod ple;
 pub mod progress;
 #[cfg(test)]
@@ -41,11 +40,13 @@ mod speculate;
 
 pub use batch_spec::BatchMtp;
 pub use dual::{DualSelector, DualSpeculate};
-pub use guide::{Allowed, Edit, FEW, Fault, Guide, Prefix, Stacked};
+pub use guide::{
+    Allowed, Edit, FEW, Fault, Guide, Move, Penalties, Prefix, Program, Scoped, Stacked, Tally,
+    Term,
+};
 pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
-pub use penalty::Penalties;
 pub use ple::{PleConfig, PleStore};
 pub use ranks::Place;
 pub use sample::Sampling;

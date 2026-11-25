@@ -1,5 +1,6 @@
-use crate::guide::{Allowed, Edit, Fault, Guide, Prefix, Stacked, edit};
-use crate::penalty::Penalties;
+use crate::guide::{
+    Allowed, Edit, Fault, Guide, Move, Prefix, Program, Scoped, Stacked, Tally, Term, edit,
+};
 use crate::sample::{Sampler, Sampling};
 
 /// Allows a fixed set and edits fixed ids.
@@ -81,20 +82,81 @@ fn edits_steer_host_pick() {
     assert_eq!(greedy.pick(&logits, Some(&Allowed::Few(vec![0, 1]))), 0);
 }
 
+fn moves() -> Vec<Move> {
+    vec![
+        Move {
+            from: 0,
+            id: 9,
+            to: 1,
+        },
+        Move {
+            from: 1,
+            id: 8,
+            to: 0,
+        },
+    ]
+}
+
 #[test]
-fn penalties_count_uses() {
-    let p = Penalties {
-        presence: 0.5,
-        frequency: 0.25,
-        repetition: 1.25,
+fn scopes_move() {
+    let program = Program {
+        moves: moves(),
+        terms: Vec::new(),
     };
-    let mut g = p.guide(&[3, 8, 3]).expect("a guide");
-    for id in [8, 9, 9] {
-        g.accept(id).unwrap();
+    let mut tally = Tally::new(&program, &[9], 1);
+    let mut seen = Vec::new();
+    for id in [9, 8, 5, 9] {
+        tally.step(&program, id);
+        seen.push((tally.scope, tally.since));
     }
-    let mut got = g.edits();
-    got.sort_by_key(|e| e.id);
-    let want = [add(3, 0.0, 1.25), add(8, -0.75, 1.25), add(9, -1.0, 1.25)];
-    assert_eq!(got, want);
-    assert!(Penalties::default().guide(&[1]).is_none());
+    assert_eq!(seen, [(1, 1), (0, 0), (0, 1), (1, 0)]);
+}
+
+#[test]
+fn counts_follow_scope() {
+    let terms = vec![
+        Term::Count {
+            presence: vec![1.0, 0.0],
+            frequency: vec![0.5, 2.0],
+        },
+        Term::Repeat {
+            repetition: vec![1.25, 1.0],
+        },
+    ];
+    let mut g = Scoped::new(
+        Program {
+            moves: moves(),
+            terms,
+        },
+        &[3],
+        0,
+    );
+    g.accept(4).unwrap();
+    g.accept(4).unwrap();
+    assert_eq!(g.edits(), [add(3, 0.0, 1.25), add(4, -2.0, 1.25)]);
+    g.accept(9).unwrap();
+    assert_eq!(g.edits(), [add(4, -4.0, 1.0), add(9, -2.0, 1.0)]);
+}
+
+#[test]
+fn ramp_is_bounded() {
+    let ramp = Term::Ramp {
+        id: 2,
+        scope: 1,
+        start: 2,
+        slope: 0.5,
+        max: 1.0,
+    };
+    let program = Program {
+        moves: moves(),
+        terms: vec![ramp],
+    };
+    let mut tally = Tally::new(&program, &[], 1);
+    let mut adds = Vec::new();
+    for id in [5, 5, 5, 5, 5, 8] {
+        tally.step(&program, id);
+        adds.push(program.edits(&tally).first().map(|e| e.add));
+    }
+    let want = [None, None, Some(0.5), Some(1.0), Some(1.0), None];
+    assert_eq!(adds, want);
 }
