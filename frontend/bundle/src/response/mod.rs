@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod response_test;
 
-use crate::template::{FunctionCall, ToolCall};
+use crate::template::{FunctionCall, Template, ToolCall};
 use fancy_regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -217,6 +217,17 @@ impl ResponseParser {
         Self::compile(template).map(Some)
     }
 
+    /// A family default, kept when `chat` writes its tool opener.
+    pub fn fallback(
+        json: &str,
+        chat: &Template,
+    ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        let parser = Self::compile(serde_json::from_str(json)?)?;
+        let opener = parser.tool_calls.as_ref().and_then(|t| t.open.trigger());
+        let written = opener.is_some_and(|o| chat.mentions(o.trim()));
+        Ok(written.then_some(parser))
+    }
+
     fn compile(template: ResponseTemplate) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut thinking = None;
         let mut tool_calls = None;
@@ -283,6 +294,7 @@ impl ResponseParser {
             mode,
             opening: false,
             buf: String::new(),
+            lead: false,
         }
     }
 
@@ -327,6 +339,8 @@ pub struct ResponseStream<'a> {
     /// `buf` starts with an unstripped pattern opener.
     opening: bool,
     buf: String,
+    /// Drops newlines that open the content after a thinking block.
+    lead: bool,
 }
 
 impl<'a> ResponseStream<'a> {
@@ -373,6 +387,14 @@ impl<'a> ResponseStream<'a> {
     }
 
     fn step_text(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+        if self.lead {
+            let kept = self.buf.trim_start_matches('\n').len();
+            self.buf.drain(..self.buf.len() - kept);
+            if self.buf.is_empty() {
+                return false;
+            }
+            self.lead = false;
+        }
         if let Some((at, skip, hit)) = self.find_hit() {
             if at > 0 {
                 out.push(ResponseEvent::Content(self.buf[..at].to_string()));
@@ -446,6 +468,7 @@ impl<'a> ResponseStream<'a> {
             }
             self.buf.drain(..at + len);
             self.mode = Mode::Text;
+            self.lead = true;
             return true;
         }
         let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();

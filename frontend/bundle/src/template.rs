@@ -58,6 +58,15 @@ impl Message {
     }
 }
 
+/// A message with `reasoning` also as `reasoning_content`.
+#[derive(Serialize)]
+struct Shown<'a> {
+    #[serde(flatten)]
+    message: &'a Message,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
+}
+
 /// Extra variables for rendering a chat prompt.
 #[derive(Clone, Debug, Default)]
 pub struct RenderOptions<'a> {
@@ -204,10 +213,10 @@ impl Template {
         env.set_syntax(syntax);
         // Templates call Python string methods: split, strip, startswith.
         env.set_unknown_method_callback(unknown_method_callback);
+        env.add_filter("tojson", tojson);
         env.add_function("strftime_now", move |format: &str| {
             strftime_now(&clock, format)
         });
-        env.add_filter("tojson", tojson);
         env.add_function(
             "raise_exception",
             |msg: String| -> Result<String, minijinja::Error> {
@@ -257,6 +266,13 @@ impl Template {
         })
     }
 
+    /// Whether the template source contains `text`.
+    pub fn mentions(&self, text: &str) -> bool {
+        self.env
+            .get_template("chat")
+            .is_ok_and(|t| t.source().contains(text))
+    }
+
     /// The prompt for `messages`, ready for the assistant's turn.
     pub fn render(&self, messages: &[Message], think: bool) -> Result<String, minijinja::Error> {
         self.render_with(messages, think, None)
@@ -284,7 +300,15 @@ impl Template {
         options: &RenderOptions<'_>,
     ) -> Result<String, minijinja::Error> {
         let template = self.env.get_template("chat")?;
-        let messages = Value::from(Serde(messages));
+        let mut shown = Vec::with_capacity(messages.len());
+        for message in messages {
+            let reasoning_content = message.reasoning.as_deref();
+            shown.push(Shown {
+                message,
+                reasoning_content,
+            });
+        }
+        let messages = Value::from(Serde(shown));
         let mut ctx = std::collections::BTreeMap::new();
         ctx.insert("messages", messages);
         ctx.insert("add_generation_prompt", Value::from(true));

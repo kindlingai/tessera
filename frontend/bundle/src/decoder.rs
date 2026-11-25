@@ -44,10 +44,10 @@ fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
     }))
 }
 
-/// Registers decoders by `model_type`, head norm and MLP.
+/// Registers decoders by `model_type`, head norm, MLP and extra fields.
 macro_rules! decoders {
-    ($($name:literal: $norm:ty, $mlp:ty;)*) => {
-        $(arch!($name, [Spot::Type($name)], step: step, part: part);)*
+    ($($name:literal: $norm:ty, $mlp:ty $(, $field:ident: $value:expr)*;)*) => {
+        $(arch!($name, [Spot::Type($name)], step: step, part: part $(, $field: $value)*);)*
 
         const FAMILIES: &[Family] = &[$(Family {
             name: $name,
@@ -58,7 +58,7 @@ macro_rules! decoders {
 }
 
 decoders! {
-    "qwen3": Norm, Swiglu;
+    "qwen3": Norm, Swiglu, response: include_str!("response/qwen3.json");
     "llama": (), Swiglu;
     "granitemoe": (), Moe;
 }

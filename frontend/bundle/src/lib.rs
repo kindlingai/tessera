@@ -509,7 +509,13 @@ fn dressed(
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let tok_cfg = overrides.merged("tokenizer_config.json", &dir.join("tokenizer_config.json"))?;
     let template = Template::from_config(dir, &tok_cfg)?;
-    let response = ResponseParser::from_config(&tok_cfg)?;
+    let mut response = ResponseParser::from_config(&tok_cfg)?;
+    let family = config.as_deref().and_then(|j| arch::spot(j).ok());
+    if response.is_none()
+        && let (Some(json), Some(chat)) = (family.and_then(|a| a.response), &template)
+    {
+        response = ResponseParser::fallback(json, chat)?;
+    }
     let stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
         Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
             Some(Ids::One(id)) => vec![id],

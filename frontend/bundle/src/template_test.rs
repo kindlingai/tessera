@@ -1,4 +1,4 @@
-use crate::{FunctionCall, Message, RenderOptions, Template, ToolCall};
+use crate::{FunctionCall, Message, RenderOptions, ResponseParser, Template, ToolCall};
 use serde_json::json;
 
 const CHATML: &str = "{% for m in messages %}\
@@ -92,4 +92,36 @@ call:{{ tc.function.name }}({% for k, v in tc.function.arguments | dictsort %}{{
         got,
         format!("<bos>weather:a=string,z=int,call:weather(city=Tokyo){json}")
     );
+}
+
+#[test]
+fn renders_like_hugging_face() {
+    let source = "{{ tools[0] | tojson }}|{{ tools[0] | tojson(indent=1) }}|\
+{{ messages[0].reasoning_content }}|<tool_call>";
+    let t = Template::new(source.into()).unwrap();
+    let tools = [json!({"z": "it's <a> & b", "a": [1, 2]})];
+    let msg = Message {
+        role: "assistant".into(),
+        reasoning: Some("why".into()),
+        ..Default::default()
+    };
+    let opts = RenderOptions {
+        tools: &tools,
+        ..Default::default()
+    };
+    let want = "{\"z\": \"it's <a> & b\", \"a\": [1, 2]}|\
+{\n \"z\": \"it's <a> & b\",\n \"a\": [\n  1,\n  2\n ]\n}|why|<tool_call>";
+    assert_eq!(t.render_options(&[msg], &opts).unwrap(), want);
+    let qwen3 = include_str!("response/qwen3.json");
+    let parser = ResponseParser::fallback(qwen3, &t).unwrap().unwrap();
+    let raw =
+        "<think>\nhm\n</think>\n\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>";
+    let parsed = parser.parse(raw, true, false);
+    assert_eq!(
+        (parsed.reasoning.as_str(), parsed.content.as_str()),
+        ("hm", "")
+    );
+    assert_eq!(parsed.tool_calls[0].function.name, "f");
+    let plain = Template::new("no tools".into()).unwrap();
+    assert!(ResponseParser::fallback(qwen3, &plain).unwrap().is_none());
 }
