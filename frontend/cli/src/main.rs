@@ -38,7 +38,7 @@ fn run(given: &[String]) -> Result<(), Stop> {
     match (verb.as_str(), task::find("", verb)) {
         // Words a command refuses may still be a prompt.
         (_, Some(command)) if origin.is_some() || (command.accepts)(rest) => {
-            (command.run)(origin, rest)
+            (command.call)(origin, rest, &mut task::Print::default())
         }
         ("task", _) => task::run(origin, rest),
         ("teleport", _) => teleport::run(rest),

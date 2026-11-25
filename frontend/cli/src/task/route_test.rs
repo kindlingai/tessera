@@ -1,4 +1,4 @@
-use super::route::{argv, prompt, schema, tools};
+use super::route::{argv, brief, prompt, schema, tools};
 use crate::source::{CATALOG, Origin, catalog, split};
 use serde_json::json;
 
@@ -54,4 +54,9 @@ fn picks_become_commands() {
     );
     let reply = argv(&json!({ "tool": "reply" }), &catalog, found);
     assert!(matches!(reply, Ok(None)));
+    // Long lists reach the model cut, with a count.
+    let vector = json!({ "records": [{ "embedding": vec![0.5; 768] }] });
+    let cut = brief(&vector)["records"][0]["embedding"].clone();
+    assert_eq!(cut.as_array().map(Vec::len), Some(9));
+    assert_eq!(cut[8], json!("760 more, 768 in all"));
 }

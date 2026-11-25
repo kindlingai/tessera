@@ -20,6 +20,9 @@ use tessera_tasks::{Error, Tagger};
 /// The word before a task's name.
 const TASK: &str = "task";
 
+/// Runs an entry on an origin and words.
+pub type Call = fn(Option<Origin>, &[String], &mut dyn Sink) -> Result<(), Stop>;
+
 /// One command or task, for the CLI and the router.
 pub struct Entry {
     /// [`TASK`] for a task, empty for a command.
@@ -38,7 +41,10 @@ pub struct Entry {
     pub usage: fn() -> String,
     /// Whether the arguments parse. Commands read no stdin.
     pub accepts: fn(&[String]) -> bool,
-    pub run: fn(Option<Origin>, &[String]) -> Result<(), Stop>,
+    /// Runs with output to the sink.
+    pub call: Call,
+    /// Whether it keeps running, as a server does.
+    pub stays: bool,
 }
 
 impl Entry {
@@ -51,7 +57,7 @@ impl Entry {
     }
 }
 
-const fn entry<T: Task, O: Target<T>>(group: &'static str) -> Entry {
+const fn entry<T: Task, O: Target<T>>(group: &'static str, stays: bool) -> Entry {
     Entry {
         group,
         name: T::NAME,
@@ -63,19 +69,20 @@ const fn entry<T: Task, O: Target<T>>(group: &'static str) -> Entry {
         tool_args: T::tool_args,
         usage: usage::<T, O>,
         accepts: accepts::<T, O>,
-        run: run_entry::<T, O>,
+        call: call_entry::<T, O>,
+        stays,
     }
 }
 
 /// Commands first, then tasks. The router keeps this order.
 pub static ENTRIES: [Entry; 7] = [
-    entry::<Serve, OnSource>(""),
-    entry::<Fetch, OnSource>(""),
-    entry::<Ask, OnModel>(TASK),
-    entry::<Chat, OnModel>(TASK),
-    entry::<Image, OnModel>(TASK),
-    entry::<Embed, OnModel>(TASK),
-    entry::<Tag, OnTagger>(TASK),
+    entry::<Serve, OnSource>("", true),
+    entry::<Fetch, OnSource>("", false),
+    entry::<Ask, OnModel>(TASK, false),
+    entry::<Chat, OnModel>(TASK, false),
+    entry::<Image, OnModel>(TASK, false),
+    entry::<Embed, OnModel>(TASK, false),
+    entry::<Tag, OnTagger>(TASK, false),
 ];
 
 /// The entry that `group` and `name` name.
@@ -89,7 +96,7 @@ trait Target<T: Task> {
     fn takes(flag: &str) -> Option<bool>;
     /// The extra flags' usage.
     fn extra() -> String;
-    fn run(task: T, source: Source) -> Result<(), Error>;
+    fn run(task: T, source: Source, sink: &mut dyn Sink) -> Result<(), Error>;
 }
 
 /// A model the serve loader fills.
@@ -114,14 +121,14 @@ impl<T: Task + for<'a> Run<&'a Model>> Target<T> for OnModel {
         out.join(" ")
     }
 
-    fn run(task: T, source: Source) -> Result<(), Error> {
+    fn run(task: T, source: Source, sink: &mut dyn Sink) -> Result<(), Error> {
         let mut options = source.options(&task.load_flags())?;
         if let Some(kind) = T::KIND {
             options.flag("--task", kind.into()).ok_or(Stop::Usage)?;
         }
         options.slots = 1;
         let slot = load(options);
-        task.run(model(&slot), &mut Print::default())
+        task.run(model(&slot), sink)
     }
 }
 
@@ -137,11 +144,11 @@ impl<T: Task + for<'a> Run<&'a mut Tagger>> Target<T> for OnTagger {
         String::new()
     }
 
-    fn run(task: T, source: Source) -> Result<(), Error> {
+    fn run(task: T, source: Source, sink: &mut dyn Sink) -> Result<(), Error> {
         let options = source.options(&[])?;
         let settings = tessera_frontend_settings::read();
         let mut tagger = Tagger::open(&options.model, &settings)?;
-        task.run(&mut tagger, &mut Print::default())
+        task.run(&mut tagger, sink)
     }
 }
 
@@ -157,8 +164,8 @@ impl<T: Task + Run<Source>> Target<T> for OnSource {
         "[flags]".into()
     }
 
-    fn run(task: T, source: Source) -> Result<(), Error> {
-        task.run(source, &mut Print::default())
+    fn run(task: T, source: Source, sink: &mut dyn Sink) -> Result<(), Error> {
+        task.run(source, sink)
     }
 }
 
@@ -170,10 +177,14 @@ fn accepts<T: Task, O: Target<T>>(args: &[String]) -> bool {
     T::parse(args, &O::takes).is_ok()
 }
 
-fn run_entry<T: Task, O: Target<T>>(origin: Option<Origin>, args: &[String]) -> Result<(), Stop> {
+fn call_entry<T: Task, O: Target<T>>(
+    origin: Option<Origin>,
+    args: &[String],
+    sink: &mut dyn Sink,
+) -> Result<(), Stop> {
     let task = T::parse(args, &O::takes);
     let task = task.map_err(|e| Stop::Tasks(Some(format!("{}: {e}", T::NAME))))?;
-    O::run(task, Source::open_or_kind(origin, T::KIND)?).map_err(stop)
+    O::run(task, Source::open_or_kind(origin, T::KIND)?, sink).map_err(stop)
 }
 
 /// A task's error as a `Stop`.
@@ -210,7 +221,11 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
     };
     let unknown = || Stop::Tasks(Some(format!("unknown task {name}")));
     let entry = find(TASK, name).ok_or_else(unknown)?;
-    (entry.run)(origin, args)
+    // Chat without a model flag may run tasks each turn.
+    if origin.is_none() && name == Chat::NAME {
+        return route::chat(args);
+    }
+    (entry.call)(origin, args, &mut Print::default())
 }
 
 /// Starts the load and waits for the model.

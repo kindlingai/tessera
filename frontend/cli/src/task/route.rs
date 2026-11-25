@@ -1,14 +1,23 @@
-//! A bare prompt: answered, or turned into a command.
+//! A prompt or chat turn: a reply or a task.
 
-use super::{ENTRIES, Entry, Print, load, model, stop};
+use super::{ENTRIES, Entry, Print, load, model};
 use crate::source::{self, Source, Stop, kind};
 use serde_json::{Map, Value, json};
 use std::io::{BufRead, IsTerminal};
-use tessera_bundle::Message;
+use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_recipe::Recipe;
-use tessera_serve::Model;
+use tessera_serve::{Model, Slot};
 use tessera_tasks::api::Format;
-use tessera_tasks::task::{Ask, Run, Task};
+use tessera_tasks::task::{Chat, Collect, Sink, Task};
+
+/// Whether this build can hold answers to a JSON schema.
+const GUIDED: bool = cfg!(feature = "guided");
+
+/// The most characters of a task's result the model reads.
+const RESULT: usize = 2000;
+
+/// The turn that asks for an answer from a result.
+const AFTER: &str = "Tell me the result of that task in a sentence or two.";
 
 /// A request for an outside model, and its words.
 const HUB_EXAMPLE: (&str, &str) = ("run llama 3.2 1b from Hugging Face", "llama 3.2 1b");
@@ -207,35 +216,202 @@ pub fn argv(
     Ok(Some(out))
 }
 
-/// Answers `words`, or runs the command the default model picks.
+/// Answers `words`, or runs the task the default model picks.
 pub fn run(words: &[String]) -> Result<(), Stop> {
     let route = Route::parse(words, &|_| None).map_err(|_| Stop::Usage)?;
-    let request = route.request.trim();
-    let source = Source::open_or_kind(None, None)?;
-    let guided = cfg!(feature = "guided");
-    let switches: &[String] = if guided { &["--guided".into()] } else { &[] };
-    let mut options = source.options(switches)?;
-    options.slots = 1;
-    let slot = load(options);
-    let model = model(&slot);
-    let token = source.token.as_deref();
-    let find = |words: &str| find(words, token);
-    let pick = match guided {
-        true => argv(
-            &pick(model, route.max_tokens, request)?,
-            &source::catalog(),
-            find,
-        )?,
-        false => None,
-    };
-    let Some(args) = pick else {
-        let ask = Ask {
-            max_tokens: route.max_tokens,
-            prompt: request.into(),
+    let mut session = Session::open(route.max_tokens, route.yes)?;
+    session.turn(route.request.trim())
+}
+
+/// `task chat` without a model flag. Turns may run tasks.
+pub fn chat(args: &[String]) -> Result<(), Stop> {
+    let chat = Chat::parse(args, &|_| None).map_err(|_| Stop::Usage)?;
+    let mut session = Session::open(chat.max_tokens, false)?;
+    let mut print = Print::default();
+    while let Some(line) = print.turn() {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        let mark = session.history.len();
+        if let Err(e) = session.turn(line) {
+            session.history.truncate(mark);
+            print.note(&describe(&e));
+        }
+    }
+    Ok(())
+}
+
+/// The default model, the chat so far, and settings.
+struct Session {
+    slot: Slot,
+    max_tokens: Option<usize>,
+    yes: bool,
+    token: Option<String>,
+    catalog: Vec<Recipe>,
+    history: Vec<Message>,
+}
+
+impl Session {
+    fn open(max_tokens: Option<usize>, yes: bool) -> Result<Self, Stop> {
+        let source = Source::open_or_kind(None, None)?;
+        let switches: &[String] = if GUIDED { &["--guided".into()] } else { &[] };
+        let mut options = source.options(switches)?;
+        options.slots = 1;
+        Ok(Session {
+            slot: load(options),
+            max_tokens,
+            yes,
+            token: source.token.clone(),
+            catalog: source::catalog(),
+            history: Vec::new(),
+        })
+    }
+
+    /// One request: a reply, or a task, then a reply.
+    fn turn(&mut self, request: &str) -> Result<(), Stop> {
+        let pick = match GUIDED {
+            true => pick(model(&self.slot), self.max_tokens, request)?,
+            false => json!({ "tool": "reply" }),
         };
-        return ask.run(model, &mut Print::default()).map_err(stop);
-    };
-    launch(&args, route.yes)
+        let token = self.token.as_deref();
+        let args = argv(&pick, &self.catalog, |words| find(words, token))?;
+        self.history.push(Message::text("user", request));
+        if let Some(args) = args
+            && !self.call(&pick, &args)?
+        {
+            self.history.pop();
+            return Ok(());
+        }
+        self.reply()
+    }
+
+    /// Runs the picked task. `false` when the person declines.
+    fn call(&mut self, pick: &Value, args: &[String]) -> Result<bool, Stop> {
+        let name = pick.get("tool").and_then(Value::as_str).unwrap_or_default();
+        let entry = ENTRIES.iter().find(|e| e.name == name);
+        let entry = entry.ok_or_else(|| Stop::Failed(format!("the model picked {pick}")))?;
+        if !confirm(args, self.yes)? {
+            return Ok(false);
+        }
+        if entry.stays {
+            return replace(args).map(|()| true);
+        }
+        let (origin, words) = source::split(args)?;
+        let rest = words.get(entry.words().len()..).unwrap_or_default();
+        let mut out = Both::default();
+        let result = match (entry.call)(origin, rest, &mut out) {
+            Ok(()) => out.collect.value(),
+            Err(e) => json!({ "error": describe(&e) }),
+        };
+        let mut arguments = pick.clone();
+        if let Value::Object(fields) = &mut arguments {
+            fields.remove("tool");
+        }
+        // The call and its result join the chat.
+        let id = format!("call_{}", self.history.len());
+        let call = ToolCall {
+            id: Some(id.clone()),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments,
+            },
+        };
+        self.history.push(Message {
+            role: "assistant".into(),
+            tool_calls: Some(vec![call]),
+            ..Message::default()
+        });
+        self.history.push(Message {
+            role: "tool".into(),
+            content: Some(short(&result)),
+            tool_call_id: Some(id),
+            name: Some(name.into()),
+            ..Message::default()
+        });
+        self.history.push(Message::text("user", AFTER));
+        Ok(true)
+    }
+
+    /// Prints the model's answer to the chat so far.
+    fn reply(&mut self) -> Result<(), Stop> {
+        let model = model(&self.slot);
+        let failed = |e: tessera_tasks::Error| Stop::Failed(e.to_string());
+        let text = model.render(&self.history).map_err(failed)?;
+        let mut print = Print::default();
+        let answer = model.answer(&text, self.max_tokens, None, &mut |t| print.text(t));
+        let answer = answer.map_err(failed)?;
+        self.history.push(Message::text("assistant", answer.trim()));
+        Ok(())
+    }
+}
+
+/// Output for the person, also kept for the model.
+#[derive(Default)]
+struct Both {
+    print: Print,
+    collect: Collect,
+}
+
+impl Sink for Both {
+    fn text(&mut self, piece: &str) {
+        self.print.text(piece);
+        self.collect.text(piece);
+    }
+
+    fn record(&mut self, record: Value) {
+        self.print.record(record.clone());
+        self.collect.record(record);
+    }
+
+    fn file(&mut self, path: &std::path::Path) {
+        self.print.file(path);
+        self.collect.file(path);
+    }
+
+    fn note(&mut self, text: &str) {
+        self.print.note(text);
+        self.collect.note(text);
+    }
+}
+
+/// The most items of a list the model reads.
+const ITEMS: usize = 8;
+
+/// `value` with long lists cut to [`ITEMS`] and a count.
+pub fn brief(value: &Value) -> Value {
+    match value {
+        Value::Array(items) if items.len() > ITEMS => {
+            let mut out: Vec<Value> = items[..ITEMS].iter().map(brief).collect();
+            let rest = items.len() - ITEMS;
+            out.push(json!(format!("{rest} more, {} in all", items.len())));
+            Value::Array(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(brief).collect()),
+        Value::Object(fields) => {
+            let fields = fields.iter().map(|(k, v)| (k.clone(), brief(v)));
+            Value::Object(fields.collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The result text the model reads, cut at [`RESULT`].
+fn short(result: &Value) -> String {
+    let text = brief(result).to_string();
+    match text.char_indices().nth(RESULT) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
+/// A stop as words for the person or the model.
+fn describe(stop: &Stop) -> String {
+    match stop {
+        Stop::Failed(why) | Stop::Tasks(Some(why)) => why.clone(),
+        _ => "the task refused its arguments".into(),
+    }
 }
 
 /// The Hub id for `words`: checked as given, or searched.
@@ -269,8 +445,8 @@ fn pick(model: &Model, max_tokens: Option<usize>, request: &str) -> Result<Value
     Ok(serde_json::from_str(json.trim()).unwrap_or_else(|_| json!({ "tool": "reply" })))
 }
 
-/// Runs tesserax with `args`, after a yes on a terminal.
-fn launch(args: &[String], yes: bool) -> Result<(), Stop> {
+/// Shows `args`, then asks on a terminal unless `yes`.
+fn confirm(args: &[String], yes: bool) -> Result<bool, Stop> {
     let quoted = |a: &String| match a.contains(' ') {
         true => format!("{a:?}"),
         false => a.clone(),
@@ -278,33 +454,36 @@ fn launch(args: &[String], yes: bool) -> Result<(), Stop> {
     let shown: Vec<String> = args.iter().map(quoted).collect();
     eprintln!("tesserax: the model picked `tesserax {}`", shown.join(" "));
     let stdin = std::io::stdin();
-    if !yes && stdin.is_terminal() {
-        eprint!("run it? [y/N] ");
-        let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| Stop::Failed(e.to_string()))?;
-        if !matches!(line.trim(), "y" | "Y" | "yes") {
-            return Ok(());
-        }
+    if yes || !stdin.is_terminal() {
+        return Ok(true);
     }
-    let exe = std::env::current_exe().map_err(|e| Stop::Failed(e.to_string()))?;
-    let mut command = std::process::Command::new(exe);
-    command.args(args);
-    replace(command)
+    eprint!("run it? [y/N] ");
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| Stop::Failed(e.to_string()))?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
-/// Replaces this process with `command` to free the routing model.
+/// Replaces this process with tesserax `args` to free the model.
 #[cfg(unix)]
-fn replace(mut command: std::process::Command) -> Result<(), Stop> {
+fn replace(args: &[String]) -> Result<(), Stop> {
     use std::os::unix::process::CommandExt;
-    Err(Stop::Failed(command.exec().to_string()))
+    let exe = std::env::current_exe().map_err(|e| Stop::Failed(e.to_string()))?;
+    Err(Stop::Failed(
+        std::process::Command::new(exe)
+            .args(args)
+            .exec()
+            .to_string(),
+    ))
 }
 
 #[cfg(not(unix))]
-fn replace(mut command: std::process::Command) -> Result<(), Stop> {
-    let status = command.status().map_err(|e| Stop::Failed(e.to_string()))?;
+fn replace(args: &[String]) -> Result<(), Stop> {
+    let exe = std::env::current_exe().map_err(|e| Stop::Failed(e.to_string()))?;
+    let status = std::process::Command::new(exe).args(args).status();
+    let status = status.map_err(|e| Stop::Failed(e.to_string()))?;
     match status.success() {
         true => Ok(()),
         false => Err(Stop::Failed(format!("the picked command failed: {status}"))),
