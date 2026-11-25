@@ -11,7 +11,7 @@ pub mod watch;
 // Linking the crates registers their rules.
 use tessera_rules as _;
 
-pub use grid::Grid;
+pub use grid::{Grid, Timing};
 
 use std::collections::BTreeMap;
 use std::time::Instant;

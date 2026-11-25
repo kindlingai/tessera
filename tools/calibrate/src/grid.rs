@@ -29,12 +29,26 @@ pub struct Grid {
     pub heads: Vec<[u64; 3]>,
     /// Queries and keys of one attention.
     pub spans: Vec<[u64; 2]>,
+    pub timing: Timing,
+}
+
+/// How long and how often the grid times each step.
+pub struct Timing {
     /// Weight bytes one chain run reads, past current caches.
     pub streamed: u64,
     /// Timed tries per step.
     pub tries: usize,
     /// Launches back to back in one try, at most.
     pub burst: usize,
+}
+
+impl Timing {
+    /// Enough tries and bursts for steady samples.
+    const FULL: Self = Self {
+        streamed: 128 << 20,
+        tries: TRIES,
+        burst: BURST,
+    };
 }
 
 /// A graph, with each size to time it at.
@@ -179,9 +193,7 @@ impl Grid {
                 [128, 128],
                 [512, 512],
             ],
-            streamed: 128 << 20,
-            tries: TRIES,
-            burst: BURST,
+            timing: Timing::FULL,
         }
     }
 
@@ -193,9 +205,7 @@ impl Grid {
             vocabs: vec![32_768],
             heads: vec![[16, 8, 64]],
             spans: vec![[1, 16], [1, 128], [16, 16], [64, 64]],
-            streamed: 128 << 20,
-            tries: TRIES,
-            burst: BURST,
+            timing: Timing::FULL,
         }
     }
 
@@ -207,9 +217,11 @@ impl Grid {
             vocabs: vec![64],
             heads: vec![[4, 2, 16]],
             spans: vec![[1, 5], [4, 4]],
-            streamed: 4 << 10,
-            tries: 1,
-            burst: 1,
+            timing: Timing {
+                streamed: 4 << 10,
+                tries: 1,
+                burst: 1,
+            },
         }
     }
 
@@ -239,10 +251,10 @@ impl Grid {
                 for (pins, bytes) in [(Pins::default(), 4), (Pins::all(BF16_FORM), 2)] {
                     let weight = k * n * bytes;
                     // A weight this large is cold in its own sample.
-                    if 4 * weight > self.streamed {
+                    if 4 * weight > self.timing.streamed {
                         continue;
                     }
-                    let pairs = (self.streamed / (2 * weight)).clamp(1, 32);
+                    let pairs = (self.timing.streamed / (2 * weight)).clamp(1, 32);
                     let mut case = pinned(chain(&one, k, n, pairs), pins);
                     case.cold = true;
                     cases.push(case);
@@ -317,7 +329,12 @@ impl Grid {
         let mut noise = Noise(17);
         let mut added = Vec::new();
         for case in self.cases() {
-            added.extend(case.run(device, &mut noise, settings, (self.tries, self.burst))?);
+            added.extend(case.run(
+                device,
+                &mut noise,
+                settings,
+                (self.timing.tries, self.timing.burst),
+            )?);
         }
         Ok(added)
     }
