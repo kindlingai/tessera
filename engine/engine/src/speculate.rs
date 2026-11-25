@@ -140,9 +140,10 @@ fn sample_residual(target: &[f32], draft: &[f32], u: f32) -> u32 {
     target.len().saturating_sub(1) as u32
 }
 
-/// Greedy walk over a `[n, k, k]` candidate lattice.
-fn walk_lattice(cands: &[u32], scores: &[f32], n: usize, k: usize) -> Vec<u32> {
+/// Greedy walk returning tokens and softmax log-probs.
+fn walk_lattice(cands: &[u32], scores: &[f32], n: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
     let mut out = Vec::with_capacity(n);
+    let mut lp = Vec::with_capacity(n);
     let mut pred = 0usize;
     for slot in 0..n {
         let base = (slot * k + pred) * k;
@@ -155,10 +156,17 @@ fn walk_lattice(cands: &[u32], scores: &[f32], n: usize, k: usize) -> Vec<u32> {
                 best = c;
             }
         }
+        let mut sum = 0.0f32;
+        if val.is_finite() {
+            for c in 0..k {
+                sum += (scores[base + c] - val).exp();
+            }
+        }
+        lp.push(if sum > 0.0 { -sum.ln() } else { f32::NAN });
         out.push(cands[slot * k + best]);
         pred = best;
     }
-    out
+    (out, lp)
 }
 
 /// Shared runner, plan cache and profile state for drafters.
@@ -527,16 +535,20 @@ impl Drafter {
         }
     }
 
-    pub(crate) fn read_draft(&mut self, outputs: &[Slot]) -> Result<Vec<u32>, Error> {
+    pub(crate) fn read_draft(
+        &mut self,
+        outputs: &[Slot],
+    ) -> Result<(Vec<u32>, Option<Vec<f32>>), Error> {
         if let Some(k) = self.selector_k {
             let cands = self.core.runner.ids(outputs[0])?;
             let raw = self.core.runner.read(outputs[1])?;
             let scores = raw.floats().map_err(tessera_run::Error::from)?;
-            return Ok(walk_lattice(&cands, scores, self.block - 1, k));
+            let (out, lp) = walk_lattice(&cands, scores, self.block - 1, k);
+            return Ok((out, Some(lp)));
         }
         let mut ids = self.core.runner.ids(outputs[0])?;
         ids.truncate(self.block - 1);
-        Ok(ids)
+        Ok((ids, None))
     }
 
     /// Proposes `block - 1` greedy draft tokens after `anchor`.
@@ -550,7 +562,7 @@ impl Drafter {
     ) -> Result<Vec<u32>, Error> {
         let wants = self.draft_wants();
         let outputs = self.run_taps(slot, anchor, start, ctx_pos, TapsIn::Host(taps), wants)?;
-        self.read_draft(&outputs)
+        Ok(self.read_draft(&outputs)?.0)
     }
 
     /// Computes `(block - 1) * vocab` draft logits after `anchor`.
@@ -717,14 +729,14 @@ fn run_dflash_req(
         target,
         request,
         emit,
-        |_, _, _, taps| Ok((0usize, taps, spec, 1.0f64)),
-        |_, (ctx_pos, pending, spec, last_pred), start, anchor, remaining| {
+        |_, _, _, taps| Ok((0usize, taps, spec, 1.0f64, None::<Vec<f32>>)),
+        |_, (ctx_pos, pending, spec, last_pred, last_lp), start, anchor, remaining| {
             if remaining == 1 || start + block > max_ctx {
                 return Ok(None);
             }
             let wants = drafter.draft_wants();
             let outputs = drafter.run_taps(0, anchor, start, *ctx_pos, pending.as_in(), wants)?;
-            let mut drafts = drafter.read_draft(&outputs)?;
+            let (mut drafts, lp) = drafter.read_draft(&outputs)?;
             let avail = drafts
                 .len()
                 .min(remaining.saturating_sub(1))
@@ -732,20 +744,21 @@ fn run_dflash_req(
             if avail == 0 {
                 return Ok(None);
             }
-            let (k, pred) = spec.choose(None, avail, drafts.len());
+            let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
             *last_pred = pred;
+            *last_lp = lp;
             drafts.truncate(k);
             Ok(Some(drafts))
         },
         |_,
-         (ctx_pos, pending, spec, last_pred),
+         (ctx_pos, pending, spec, last_pred, last_lp),
          start,
          drafted,
          accepted,
          _,
          mut block_taps,
          stats| {
-            spec.observe(drafted, accepted, None, *last_pred);
+            spec.observe(drafted, accepted, last_lp.as_deref(), *last_pred);
             stats.dflash_steps += 1;
             let commit = 1 + accepted;
             *ctx_pos = start;

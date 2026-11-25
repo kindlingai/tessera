@@ -36,6 +36,7 @@ pub(crate) struct SoloState {
     pub(crate) m_taps: Vec<f32>,
     pub(crate) round_mtp: bool,
     pub(crate) last_pred: f64,
+    pub(crate) last_lp: Option<Vec<f32>>,
     pub(crate) last_mtp_d1: Option<u32>,
 }
 
@@ -212,6 +213,7 @@ impl<'a> BatchMtp<'a> {
             m_taps,
             round_mtp: false,
             last_pred: 1.0,
+            last_lp: None,
             last_mtp_d1: None,
         });
         self.solo_draft(job.active_idx)
@@ -257,8 +259,14 @@ impl<'a> BatchMtp<'a> {
                 solo.selector
                     .observe_mtp(k, accepted, solo.last_pred, &committed);
             } else {
-                solo.selector
-                    .observe_dflash(k, accepted, solo.last_pred, solo.last_mtp_d1, ids[0]);
+                solo.selector.observe_dflash_lp(
+                    k,
+                    accepted,
+                    solo.last_pred,
+                    solo.last_lp.as_deref(),
+                    solo.last_mtp_d1,
+                    ids[0],
+                );
             }
         }
         solo.d_pending.extend_from_slice(&d_all[..commit * d_width]);
@@ -318,7 +326,7 @@ impl<'a> BatchMtp<'a> {
                 (cp, std::mem::take(&mut solo.d_pending))
             };
             let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
-            let mut drafts = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
+            let (mut drafts, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
             let avail = drafts.len().min(rem_cap).min(ctx_cap);
             let (k, pred) = self.active[idx]
                 .solo
@@ -326,8 +334,10 @@ impl<'a> BatchMtp<'a> {
                 .expect("solo")
                 .selector
                 .dflash
-                .choose(None, avail, drafts.len());
-            self.active[idx].solo.as_mut().expect("solo").last_pred = pred;
+                .choose(lp.as_deref(), avail, drafts.len());
+            let solo = self.active[idx].solo.as_mut().expect("solo");
+            solo.last_pred = pred;
+            solo.last_lp = lp;
             drafts.truncate(k);
             self.active[idx].drafts = drafts;
             return Ok(());
@@ -340,13 +350,13 @@ impl<'a> BatchMtp<'a> {
                 (cp, std::mem::take(&mut solo.d_pending))
             };
             let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
-            let probe = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
+            let (probe, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
             self.active[idx]
                 .solo
                 .as_mut()
                 .expect("solo")
                 .selector
-                .start_probe(probe);
+                .start_probe_lp(probe, lp);
         }
         let (m_start, m_toks, m_taps, avail) = {
             let solo = self.active[idx].solo.as_mut().expect("solo");

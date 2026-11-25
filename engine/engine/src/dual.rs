@@ -10,6 +10,7 @@ use tessera_engine_comm::{Reader, Writer};
 #[derive(Clone, Debug, PartialEq)]
 struct PendingProbe {
     drafts: Vec<u32>,
+    lp: Option<Vec<f32>>,
     matched: usize,
 }
 
@@ -147,7 +148,16 @@ impl DualSelector {
 
     /// Records DFlash probe drafts to score against upcoming commits.
     pub fn start_probe(&mut self, drafts: Vec<u32>) {
-        self.probe = Some(PendingProbe { drafts, matched: 0 });
+        self.start_probe_lp(drafts, None);
+    }
+
+    /// Records DFlash probe drafts and log-probs for upcoming commits.
+    pub fn start_probe_lp(&mut self, drafts: Vec<u32>, lp: Option<Vec<f32>>) {
+        self.probe = Some(PendingProbe {
+            drafts,
+            lp,
+            matched: 0,
+        });
     }
 
     /// Updates estimates after a DFlash round and optional MTP check.
@@ -159,7 +169,20 @@ impl DualSelector {
         mtp_d1: Option<u32>,
         first_post: u32,
     ) {
-        self.dflash.observe(drafted, accepted, None, pred);
+        self.observe_dflash_lp(drafted, accepted, pred, None, mtp_d1, first_post);
+    }
+
+    /// Updates estimates after a DFlash round with optional log-probs.
+    pub fn observe_dflash_lp(
+        &mut self,
+        drafted: usize,
+        accepted: usize,
+        pred: f64,
+        lp: Option<&[f32]>,
+        mtp_d1: Option<u32>,
+        first_post: u32,
+    ) {
+        self.dflash.observe(drafted, accepted, lp, pred);
         if let Some(d1) = mtp_d1 {
             self.mtp
                 .observe(1, usize::from(d1 == first_post), None, 0.0);
@@ -205,12 +228,13 @@ impl DualSelector {
                 p.matched += 1;
             } else {
                 let k_obs = (p.matched + 1).min(p.drafts.len());
-                self.dflash.observe(k_obs, p.matched, None, 0.0);
+                self.dflash.observe(k_obs, p.matched, p.lp.as_deref(), 0.0);
                 return;
             }
         }
         if p.matched >= p.drafts.len() {
-            self.dflash.observe(p.drafts.len(), p.matched, None, 0.0);
+            self.dflash
+                .observe(p.drafts.len(), p.matched, p.lp.as_deref(), 0.0);
         } else {
             self.probe = Some(p);
         }
@@ -240,7 +264,7 @@ pub(crate) fn run_dflash(
     start: usize,
     ctx_pos: usize,
     pending: &[f32],
-) -> Result<Vec<u32>, Error> {
+) -> Result<(Vec<u32>, Option<Vec<f32>>), Error> {
     let wants = dflash.draft_wants();
     let outputs = dflash.run_taps(0, anchor, start, ctx_pos, TapsIn::Host(pending), wants)?;
     dflash.read_draft(&outputs)
@@ -255,6 +279,7 @@ struct DualState {
     m_taps: Vec<f32>,
     round_mtp: bool,
     last_pred: f64,
+    last_lp: Option<Vec<f32>>,
     last_mtp_d1: Option<u32>,
     switched: bool,
 }
@@ -341,6 +366,7 @@ fn run_dual_req(
                 m_taps,
                 round_mtp: false,
                 last_pred: 1.0,
+                last_lp: None,
                 last_mtp_d1: None,
                 switched: false,
             })
@@ -370,20 +396,25 @@ fn run_dual_req(
                     st.m_taps.clear();
                     st.last_mtp_d1 = Some(mtp_d1);
                 }
-                let mut drafts = run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
+                let (mut drafts, lp) =
+                    run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
                 st.d_ctx_pos = start;
                 st.d_pending.clear();
                 let avail = drafts.len().min(rem_cap).min(ctx_cap);
-                let (k, pred) = st.selector.dflash.choose(None, avail, drafts.len());
+                let (k, pred) = st
+                    .selector
+                    .dflash
+                    .choose(lp.as_deref(), avail, drafts.len());
                 st.last_pred = pred;
+                st.last_lp = lp;
                 drafts.truncate(k);
                 return Ok(Some(drafts));
             }
             if st.selector.should_probe(can_dflash) {
-                let probe = run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
+                let (probe, lp) = run_dflash(dflash, anchor, start, st.d_ctx_pos, &st.d_pending)?;
                 st.d_ctx_pos = start;
                 st.d_pending.clear();
-                st.selector.start_probe(probe);
+                st.selector.start_probe_lp(probe, lp);
             }
             let avail = depth.min(st.selector.mtp.max_k()).min(rem_cap).min(ctx_cap);
             let m_taps = TapsBuf::Host(std::mem::take(&mut st.m_taps));
@@ -413,10 +444,11 @@ fn run_dual_req(
                     .observe_mtp(drafted, accepted, st.last_pred, &posterior[..commit]);
             } else {
                 stats.dflash_steps += 1;
-                st.selector.observe_dflash(
+                st.selector.observe_dflash_lp(
                     drafted,
                     accepted,
                     st.last_pred,
+                    st.last_lp.as_deref(),
                     st.last_mtp_d1,
                     posterior[0],
                 );

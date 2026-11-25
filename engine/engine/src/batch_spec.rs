@@ -371,6 +371,7 @@ impl<'a> BatchMtp<'a> {
                         m_taps: m_tap_buf,
                         round_mtp: false,
                         last_pred: 1.0,
+                        last_lp: None,
                         last_mtp_d1: None,
                     }),
                     d_tail: Vec::new(),
