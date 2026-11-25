@@ -73,6 +73,7 @@ struct Shown<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct RenderOptions<'a> {
     pub think: Option<bool>,
+    pub clear_thinking: Option<bool>,
     pub reasoning_effort: Option<&'a str>,
     pub tools: &'a [serde_json::Value],
 }
@@ -314,7 +315,7 @@ impl Template {
         let options = RenderOptions {
             think: (!think).then_some(false),
             reasoning_effort,
-            tools: &[],
+            ..RenderOptions::default()
         };
         self.render_options(messages, &options)
     }
@@ -365,6 +366,9 @@ impl Template {
         // Left undefined, `enable_thinking` means the model's default.
         if let Some(think) = options.think {
             ctx.insert("enable_thinking", Value::from(think));
+        }
+        if let Some(clear) = options.clear_thinking {
+            ctx.insert("clear_thinking", Value::from(clear));
         }
         if let Some(effort) = options.reasoning_effort {
             ctx.insert("reasoning_effort", Value::from(effort));

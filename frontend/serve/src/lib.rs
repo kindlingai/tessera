@@ -66,6 +66,7 @@ fn render(model: &Model, m: Messages, allow_tools: bool) -> Result<(String, bool
         .or_else(|| (effort == Some("none")).then_some(false));
     let options = RenderOptions {
         think,
+        clear_thinking: m.chat_template_kwargs.clear_thinking,
         reasoning_effort: effort,
         tools: &tools,
     };

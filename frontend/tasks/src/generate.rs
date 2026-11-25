@@ -45,7 +45,7 @@ impl Chat for Generate {
         let options = RenderOptions {
             think: (!think).then_some(false),
             reasoning_effort,
-            tools: &[],
+            ..RenderOptions::default()
         };
         self.render_options(messages, &options)
     }

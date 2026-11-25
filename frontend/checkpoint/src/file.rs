@@ -75,7 +75,7 @@ fn half(dtype: &str) -> bool {
 }
 
 /// Bytes `start..start + len` of `url`.
-fn fetch(url: &str, start: u64, len: u64) -> Result<Vec<u8>, Error> {
+fn fetch(url: &str, start: u64, len: u64, exact: bool) -> Result<Vec<u8>, Error> {
     let range = format!("bytes={start}-{}", start + len - 1);
     let net = |e: &dyn fmt::Display| Error::Net(format!("{url}: {e}"));
     let resp = ureq::get(url)
@@ -87,7 +87,7 @@ fn fetch(url: &str, start: u64, len: u64) -> Result<Vec<u8>, Error> {
     }
     let mut bytes = Vec::with_capacity(len as usize);
     resp.into_reader().take(len).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != len {
+    if exact && bytes.len() as u64 != len {
         return Err(net(&format_args!("{} of {len} bytes", bytes.len())));
     }
     Ok(bytes)
@@ -111,9 +111,12 @@ impl File {
 
     /// A file served over http, one tensor per request.
     pub fn remote(url: &str) -> Result<Self, Error> {
-        let first = fetch(url, 0, HEADER_PAD)?;
+        let first = fetch(url, 0, HEADER_PAD, false)?;
+        if first.len() < 8 {
+            return Err(format(format_args!("a {}-byte remote header", first.len())));
+        }
         let len = u64::from_le_bytes(first[..8].try_into().expect("8 bytes"));
-        if len + 8 > HEADER_PAD {
+        if len + 8 > first.len() as u64 {
             return Err(format(format_args!("a {len}-byte header past the pad")));
         }
         let header = &first[8..8 + len as usize];
@@ -154,7 +157,7 @@ impl File {
                 disk.read(self.data + start, &mut bytes, Reads::Cached)?;
                 Ok(bytes)
             }
-            Backing::Web(url) => fetch(url, self.data + start, end - start),
+            Backing::Web(url) => fetch(url, self.data + start, end - start, true),
         }
     }
 

@@ -124,3 +124,20 @@ fn renders_like_hugging_face() {
     let plain = Template::new("no tools".into()).unwrap();
     assert!(ResponseParser::builtin(&plain).unwrap().is_none());
 }
+
+#[test]
+fn forwards_clear_thinking() {
+    let source = "{% if clear_thinking is defined %}{{ clear_thinking }}{% else %}unset{% endif %}";
+    let t = Template::new(source.into()).unwrap();
+    let msg = [Message::text("user", "hi")];
+    let at = |clear_thinking| {
+        let opts = RenderOptions {
+            clear_thinking,
+            ..Default::default()
+        };
+        t.render_options(&msg, &opts).unwrap()
+    };
+    assert_eq!(at(None), "unset");
+    assert_eq!(at(Some(false)), "False");
+    assert_eq!(at(Some(true)), "True");
+}

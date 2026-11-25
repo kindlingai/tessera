@@ -73,3 +73,15 @@ fn tool_wire_checks() {
     ]});
     assert_eq!(json(&slot, "/tokenize", Some(history)).0, 200);
 }
+
+#[test]
+fn clear_thinking_forwards() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let body = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": {"clear_thinking": false},
+    });
+    let (status, got) = json(&slot, "/tokenize", Some(body));
+    assert_eq!(status, 200);
+    assert_eq!(got["count"], "user:hi|clear=false".len());
+}

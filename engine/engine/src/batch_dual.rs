@@ -97,6 +97,7 @@ impl<'a> BatchMtp<'a> {
             prefill_chunk: crate::batch_spec::DEFAULT_CHUNK,
             max_ctx,
             waiting: VecDeque::new(),
+            prefilling: VecDeque::new(),
             active: Vec::new(),
             free,
             hash: 2166136261,
@@ -114,6 +115,26 @@ impl<'a> BatchMtp<'a> {
         if let Some(peer) = &self.dual {
             push_tail(&mut self.active[0].d_tail, &solo.d_pending, peer.d_width);
         }
+        Ok(())
+    }
+
+    /// Flushes deferred MTP prefill rows when another request joins.
+    pub(crate) fn demote_prefill(&mut self) -> Result<(), Error> {
+        let Some(p) = self.prefilling.front_mut() else {
+            return Ok(());
+        };
+        if !p.solo_mode {
+            return Ok(());
+        }
+        p.solo_mode = false;
+        let slot = p.slot;
+        let m_toks = std::mem::take(&mut p.m_tok_buf);
+        let m_taps = std::mem::take(&mut p.m_tap_buf);
+        if let Some(peer) = &self.dual {
+            let raw = std::mem::take(&mut p.d_buf);
+            push_tail(&mut p.d_buf, &raw, peer.d_width);
+        }
+        self.flush_mtp(slot, 0, &m_toks, &m_taps)?;
         Ok(())
     }
 

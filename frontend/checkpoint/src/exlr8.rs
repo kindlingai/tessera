@@ -370,6 +370,15 @@ impl Release {
     /// Streams `owner/name` on Hugging Face at `revision`.
     pub fn remote(repo: &str, revision: &str) -> Self {
         let url = tessera_frontend_settings::resolve(repo, revision, "");
+        Self::from_url(url)
+    }
+
+    /// Streams an exlr8 release from an HTTP base URL.
+    pub fn from_url(base: impl Into<String>) -> Self {
+        let mut url = base.into();
+        if !url.ends_with('/') {
+            url.push('/');
+        }
         Self::new(Where::Url(url))
     }
 
@@ -475,14 +484,24 @@ impl Release {
 
     /// Matrices and experts at the widths manifest `name` picks.
     pub fn manifest(mut self, name: &str) -> Result<Self, Error> {
-        let Where::Dir(dir) = &self.at else {
-            return Err(Error::Missing(format!(
-                "manifest {name} of a remote release"
-            )));
+        let rel = format!("manifests/exlr8-manifest-{name}.json");
+        let (source, text) = match &self.at {
+            Where::Dir(dir) => {
+                let path = dir.join(&rel);
+                (path.display().to_string(), std::fs::read_to_string(&path)?)
+            }
+            Where::Url(base) => {
+                let url = format!("{base}{rel}");
+                let resp = ureq::get(&url)
+                    .call()
+                    .map_err(|e| Error::Net(format!("{url}: {e}")))?;
+                let text = resp
+                    .into_string()
+                    .map_err(|e| Error::Net(format!("{url}: {e}")))?;
+                (url, text)
+            }
         };
-        let path = dir.join(format!("manifests/exlr8-manifest-{name}.json"));
-        let bad = |why: String| Error::DType(format!("{}: {why}", path.display()));
-        let text = std::fs::read_to_string(&path)?;
+        let bad = |why: String| Error::DType(format!("{source}: {why}"));
         let m: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
         let needs = m["requires"]["trellis"]
             .as_array()

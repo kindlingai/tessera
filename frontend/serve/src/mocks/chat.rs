@@ -31,6 +31,9 @@ impl Chat for MockChat {
         if !options.tools.is_empty() {
             out.push_str("|tools");
         }
+        if let Some(clear) = options.clear_thinking {
+            out.push_str(&format!("|clear={clear}"));
+        }
         Ok(out)
     }
 

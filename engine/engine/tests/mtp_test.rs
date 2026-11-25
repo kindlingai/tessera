@@ -440,3 +440,83 @@ fn batch_mtp_ranked_matches() {
         }
     }
 }
+
+/// Active decode steps interleave with a new prompt's prefill chunks.
+#[test]
+fn chunked_prefill_interleaves() {
+    let settings = Settings {
+        backend: Pick::Host,
+        ..Settings::default()
+    };
+    let mut t_cfg = mla_cfg(false, 16);
+    t_cfg.stack.max_seqs = 2;
+    t_cfg.stack.max_context = 32;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, false));
+    let t_weights = weights(&t_graph, &mut Noise(131));
+    let m_weights = float_weights(&m_graph, 137);
+    let mut baseline = open_target(&t_graph, &t_weights, 32, &settings);
+    let short = vec![2u32, 5];
+    let long = vec![1u32, 3, 4, 6, 7, 8, 9, 10, 11];
+    let mut want_short = Vec::new();
+    let mut want_long = Vec::new();
+    baseline
+        .generate(
+            Request {
+                tokens: short.clone(),
+                max_tokens: 10,
+                ..Request::default()
+            },
+            &mut |e| want_short.push(e),
+        )
+        .unwrap();
+    baseline
+        .generate(
+            Request {
+                tokens: long.clone(),
+                max_tokens: 5,
+                ..Request::default()
+            },
+            &mut |e| want_long.push(e),
+        )
+        .unwrap();
+    let mut target = open_target(&t_graph, &t_weights, 32, &settings);
+    let mut drafter = MtpDrafter::open(m_graph, 32, &Recipe::default(), &settings).unwrap();
+    drafter.load(&m_weights).unwrap();
+    let mut batch = BatchMtp::new(&mut target, &mut drafter, 2)
+        .unwrap()
+        .with_prefill_chunk(3);
+    let (tx0, rx0) = std::sync::mpsc::channel();
+    batch.submit(
+        Request {
+            tokens: short,
+            max_tokens: 10,
+            ..Request::default()
+        },
+        Box::new(move |e| tx0.send(e).is_ok()),
+    );
+    assert!(batch.step().unwrap());
+    let before = rx0.try_iter().collect::<Vec<_>>();
+    let (tx1, rx1) = std::sync::mpsc::channel();
+    batch.submit(
+        Request {
+            tokens: long,
+            max_tokens: 5,
+            ..Request::default()
+        },
+        Box::new(move |e| tx1.send(e).is_ok()),
+    );
+    // One step runs one chunk plus active decode.
+    assert!(batch.step().unwrap());
+    let mid0: Vec<_> = rx0.try_iter().collect();
+    let mid1: Vec<_> = rx1.try_iter().collect();
+    assert!(!mid0.is_empty(), "active decode stalled during prefill");
+    assert!(mid1.is_empty(), "long prompt finished in one chunk");
+    while batch.step().unwrap() {}
+    let mut all0 = before;
+    all0.extend(mid0);
+    all0.extend(rx0.try_iter());
+    let all1: Vec<_> = rx1.try_iter().collect();
+    assert_eq!(collect_ids(&all0), collect_ids(&want_short));
+    assert_eq!(collect_ids(&all1), collect_ids(&want_long));
+}

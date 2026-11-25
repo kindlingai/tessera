@@ -276,3 +276,94 @@ fn v4_release() {
     assert_eq!(release.floats(q).unwrap(), want);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn remote_manifest_loads() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let dir = tessera_testkit::scratch(&format!("{}-remote-exlr8", std::process::id()));
+    let width = |k: i64| {
+        let mut r = record(1, 128, 128, 1);
+        r[24..32].copy_from_slice(&k.to_le_bytes());
+        r
+    };
+    let (k2, k3) = (ramp(4096, 3), ramp(6144, 5));
+    let side = halves(&[0.5; 128]);
+    write(
+        &dir.join("dense/exlr8-vocab.safetensors"),
+        &[("embed_tokens.weight", "F32", vec![2], floats(&[1.0, 2.0]))],
+    );
+    write(
+        &dir.join("dense/exlr8-dense-000.safetensors"),
+        &[
+            ("q.k2.record", "I64", vec![8], width(2)),
+            ("q.k2.trellis.pmcgx", "U8", vec![1, 4096], k2),
+            ("q.k2.suh", "F16", vec![128], side.clone()),
+            ("q.k2.svh", "F16", vec![128], side.clone()),
+            ("q.k3.record", "I64", vec![8], width(3)),
+            ("q.k3.trellis.pmcgx", "U8", vec![1, 6144], k3),
+            ("q.k3.suh", "F16", vec![128], side.clone()),
+            ("q.k3.svh", "F16", vec![128], side),
+        ],
+    );
+    let mpath = dir.join("manifests/exlr8-manifest-k3.json");
+    std::fs::create_dir_all(mpath.parent().unwrap()).unwrap();
+    std::fs::write(&mpath, r#"{"dense": {"0": {"q": 3}}}"#).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let root = dir.clone();
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let mut lines = req.lines();
+            let path = lines
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            if path == "/stop" {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                break;
+            }
+            let range = lines.find_map(|l| {
+                l.strip_prefix("Range: bytes=")
+                    .or_else(|| l.strip_prefix("range: bytes="))
+            });
+            let full = root.join(path.trim_start_matches('/'));
+            let Ok(bytes) = std::fs::read(&full) else {
+                let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            };
+            if let Some(r) = range {
+                let (a, b) = r.split_once('-').unwrap();
+                let start: usize = a.parse().unwrap();
+                let end = b.parse::<usize>().unwrap().min(bytes.len() - 1);
+                let slice = &bytes[start..=end];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                    slice.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(slice);
+            } else {
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&bytes);
+            }
+        }
+    });
+    let base = format!("http://{addr}");
+    let release = Release::from_url(&base).manifest("k3").unwrap();
+    let slices = release.slices();
+    let found = slices
+        .iter()
+        .find(|s| s.name == "model.layers.0.q.weight")
+        .map(|s| s.stored);
+    assert_eq!(found, Some(Stored::Form(&trellis::TRELLIS_K3_PMCGX_ROT)));
+    assert!(slices.iter().all(|s| !s.name.contains(".k2")));
+    let _ = ureq::get(&format!("{base}/stop")).call();
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

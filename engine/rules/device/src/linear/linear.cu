@@ -755,60 +755,91 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
     }
 }
 
-// Coalesced BF16 transposed stacked matmul, four rows per block.
-extern "C" __global__ __launch_bounds__(256, 4) void tessera_stacked_wide(
+struct alignas(16) fg_stacked_smem {
+    u32 sxh[16][18];
+    u32 sxl[16][18];
+    u16 sw[32][34];
+};
+
+// Tensor-Core BF16 transposed stacked matmul, 16x32 per CTA.
+extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
     const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
     u32 k_step) {
-    __shared__ __align__(16) float part[TM_WARPS][128];
+    __shared__ fg_stacked_smem sm;
     u32 tile = blockIdx.x;
-    u32 rtiles = (rows + 3u) >> 2u;
+    u32 rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles;
-    u32 r0 = (blockIdx.y % rtiles) * 4u;
-    u32 nr = min(rows - r0, 4u);
-    u32 grp = threadIdx.x >> 5;
-    u32 tid = threadIdx.x & 31u;
-    const float* xb = x + (u64(batch) * rows + r0) * k;
-    const uint2* w2 = reinterpret_cast<const uint2*>(w + u64(batch) * block + first);
-    u32 step4 = k_step >> 2;
-    u32 col4 = (tile << 5) + tid;
-    float a0[4] = {0.f, 0.f, 0.f, 0.f};
-    float a1[4] = {0.f, 0.f, 0.f, 0.f};
-    float a2[4] = {0.f, 0.f, 0.f, 0.f};
-    float a3[4] = {0.f, 0.f, 0.f, 0.f};
-    for (u32 i = grp; i < k; i += TM_WARPS) {
-        uint2 p = w2[u64(i) * step4 + col4];
-        float w0 = __uint_as_float(p.x << 16);
-        float w1 = __uint_as_float(p.x & 0xFFFF0000u);
-        float w2f = __uint_as_float(p.y << 16);
-        float w3 = __uint_as_float(p.y & 0xFFFF0000u);
-#pragma unroll
-        for (u32 r = 0u; r < 4u; r++) {
-            if (r >= nr) break;
-            float xv = xb[u64(r) * k + i];
-            a0[r] = fmaf(xv, w0, a0[r]);
-            a1[r] = fmaf(xv, w1, a1[r]);
-            a2[r] = fmaf(xv, w2f, a2[r]);
-            a3[r] = fmaf(xv, w3, a3[r]);
+    u32 r0 = (blockIdx.y % rtiles) * 16u;
+    u32 tid = threadIdx.x;
+    u32 wt = tid >> 5u;
+    u32 lane = tid & 31u;
+    u32 g = lane >> 2u;
+    u32 t = lane & 3u;
+    u32 xr = tid >> 3u;
+    u32 xc = (tid & 7u) << 2u;
+    u32 xw = (tid & 7u) << 1u;
+    u32 wk = tid >> 2u;
+    u32 wc = (tid & 3u) << 3u;
+    const float* xb = x + u64(batch) * rows * k;
+    const u16* wb = w + u64(batch) * block + first + (tile << 5u) + wc;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint4 cur = fg_ld_nc4(wb + u64(wk) * k_step);
+    for (u32 k0 = 0u; k0 < k; k0 += 32u) {
+        if (r0 + xr < rows) {
+            float4 xv = *reinterpret_cast<const float4*>(xb + u64(r0 + xr) * k + k0 + xc);
+            u32 h0 = fg_bf16x2(xv.x, xv.y);
+            u32 h1 = fg_bf16x2(xv.z, xv.w);
+            u32 l0 = fg_bf16x2(xv.x - __uint_as_float(h0 << 16u),
+                               xv.y - __uint_as_float(h0 & 0xFFFF0000u));
+            u32 l1 = fg_bf16x2(xv.z - __uint_as_float(h1 << 16u),
+                               xv.w - __uint_as_float(h1 & 0xFFFF0000u));
+            *reinterpret_cast<uint2*>(&sm.sxh[xr][xw]) = make_uint2(h0, h1);
+            *reinterpret_cast<uint2*>(&sm.sxl[xr][xw]) = make_uint2(l0, l1);
+        } else {
+            *reinterpret_cast<uint2*>(&sm.sxh[xr][xw]) = make_uint2(0u, 0u);
+            *reinterpret_cast<uint2*>(&sm.sxl[xr][xw]) = make_uint2(0u, 0u);
         }
-    }
-    for (u32 r = 0u; r < nr; r++) {
-        if (r > 0u) prim::block_sync();
-        *reinterpret_cast<float4*>(&part[grp][tid << 2]) =
-            make_float4(a0[r], a1[r], a2[r], a3[r]);
+        sm.sw[wc + 0u][wk] = static_cast<u16>(cur.x);
+        sm.sw[wc + 1u][wk] = static_cast<u16>(cur.x >> 16u);
+        sm.sw[wc + 2u][wk] = static_cast<u16>(cur.y);
+        sm.sw[wc + 3u][wk] = static_cast<u16>(cur.y >> 16u);
+        sm.sw[wc + 4u][wk] = static_cast<u16>(cur.z);
+        sm.sw[wc + 5u][wk] = static_cast<u16>(cur.z >> 16u);
+        sm.sw[wc + 6u][wk] = static_cast<u16>(cur.w);
+        sm.sw[wc + 7u][wk] = static_cast<u16>(cur.w >> 16u);
         prim::block_sync();
-        if (grp == 0u) {
-            float4 s = *reinterpret_cast<const float4*>(&part[0][tid << 2]);
-#pragma unroll
-            for (u32 widx = 1u; widx < TM_WARPS; widx++) {
-                float4 q = *reinterpret_cast<const float4*>(&part[widx][tid << 2]);
-                s.x += q.x;
-                s.y += q.y;
-                s.z += q.z;
-                s.w += q.w;
-            }
-            *reinterpret_cast<float4*>(
-                out + (u64(batch) * rows + r0 + r) * n + (tile << 7) + (tid << 2)) = s;
+        if (k0 + 32u < k) {
+            cur = fg_ld_nc4(wb + u64(k0 + 32u + wk) * k_step);
         }
+#pragma unroll
+        for (u32 ks = 0u; ks < 2u; ks++) {
+            u32 ah[4], al[4], b[2];
+            u32 off = (ks << 3u) + t;
+            ah[0] = sm.sxh[g][off];
+            ah[1] = sm.sxh[g + 8u][off];
+            ah[2] = sm.sxh[g][off + 4u];
+            ah[3] = sm.sxh[g + 8u][off + 4u];
+            al[0] = sm.sxl[g][off];
+            al[1] = sm.sxl[g + 8u][off];
+            al[2] = sm.sxl[g][off + 4u];
+            al[3] = sm.sxl[g + 8u][off + 4u];
+            u32 wc0 = (wt << 3u) + g;
+            u32 wk0 = (ks << 4u) + (t << 1u);
+            b[0] = *reinterpret_cast<const u32*>(&sm.sw[wc0][wk0]);
+            b[1] = *reinterpret_cast<const u32*>(&sm.sw[wc0][wk0 + 8u]);
+            fg_mma_bf16(acc, ah, b);
+            fg_mma_bf16(acc, al, b);
+        }
+        prim::block_sync();
+    }
+    u32 col = (tile << 5u) + (wt << 3u) + (t << 1u);
+    if (r0 + g < rows) {
+        *reinterpret_cast<float2*>(out + (u64(batch) * rows + r0 + g) * n + col) =
+            make_float2(acc[0], acc[1]);
+    }
+    if (r0 + g + 8u < rows) {
+        *reinterpret_cast<float2*>(out + (u64(batch) * rows + r0 + g + 8u) * n + col) =
+            make_float2(acc[2], acc[3]);
     }
 }
 

@@ -105,6 +105,18 @@ struct Admitted {
     sink: Option<Sink>,
 }
 
+/// Admitted sequence advancing through chunked prompt prefill.
+pub(crate) struct PrefillSeq {
+    pub(crate) slot: u32,
+    pub(crate) request: Request,
+    pub(crate) sink: Option<Sink>,
+    pub(crate) pos: usize,
+    pub(crate) solo_mode: bool,
+    pub(crate) d_buf: Vec<f32>,
+    pub(crate) m_tok_buf: Vec<u32>,
+    pub(crate) m_tap_buf: Vec<f32>,
+}
+
 /// Multi-slot continuous-batching MTP and optional DFlash decoder.
 pub struct BatchMtp<'a> {
     pub(crate) target: &'a mut Engine,
@@ -114,6 +126,7 @@ pub struct BatchMtp<'a> {
     pub(crate) prefill_chunk: usize,
     pub(crate) max_ctx: usize,
     pub(crate) waiting: VecDeque<(Request, Sink)>,
+    pub(crate) prefilling: VecDeque<PrefillSeq>,
     pub(crate) active: Vec<ActiveSeq>,
     pub(crate) free: Vec<u32>,
     pub(crate) hash: u32,
@@ -144,6 +157,7 @@ impl<'a> BatchMtp<'a> {
             prefill_chunk: DEFAULT_CHUNK,
             max_ctx,
             waiting: VecDeque::new(),
+            prefilling: VecDeque::new(),
             active: Vec::new(),
             free,
             hash: 2166136261,
@@ -169,9 +183,9 @@ impl<'a> BatchMtp<'a> {
         self.waiting.push_back((request, sink));
     }
 
-    /// Whether any answer is waiting or decoding.
+    /// Whether any answer is waiting, prefilling, or decoding.
     pub fn busy(&self) -> bool {
-        !self.waiting.is_empty() || !self.active.is_empty()
+        !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
     }
 
     /// Runs one round: admit, prefill, shared verify, and batched draft.
@@ -250,12 +264,32 @@ impl<'a> BatchMtp<'a> {
     }
 
     fn run_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
-        if !admitted.is_empty() && self.active.len() == 1 && self.active[0].solo.is_some() {
-            self.demote_solo()?;
+        if !admitted.is_empty() {
+            if self.active.len() == 1 && self.active[0].solo.is_some() {
+                self.demote_solo()?;
+            }
+            if self.prefilling.len() == 1 && self.prefilling[0].solo_mode {
+                self.demote_prefill()?;
+            }
+            let solo_admit = self.dual.is_some()
+                && self.active.is_empty()
+                && self.prefilling.is_empty()
+                && admitted.len() == 1;
+            for item in admitted {
+                self.prefilling.push_back(PrefillSeq {
+                    slot: item.slot,
+                    request: item.request,
+                    sink: item.sink,
+                    pos: 0,
+                    solo_mode: solo_admit,
+                    d_buf: Vec::new(),
+                    m_tok_buf: Vec::new(),
+                    m_tap_buf: Vec::new(),
+                });
+            }
         }
-        let solo_admit = self.dual.is_some() && self.active.is_empty() && admitted.len() == 1;
-        for item in admitted {
-            self.prefill_one(item, solo_admit)?;
+        if !self.prefilling.is_empty() {
+            self.prefill_step()?;
         }
         self.active.sort_by_key(|s| s.slot);
         if self.active.is_empty() {
@@ -267,161 +301,152 @@ impl<'a> BatchMtp<'a> {
         self.verify_and_draft()
     }
 
-    fn prefill_one(&mut self, item: Admitted, solo_mode: bool) -> Result<(), Error> {
-        let Admitted {
-            slot,
-            request,
-            mut sink,
-        } = item;
-        let n = request.tokens.len();
+    /// Advances the head prefilling sequence by one chunk.
+    fn prefill_step(&mut self) -> Result<(), Error> {
+        let mut seq = self.prefilling.pop_front().expect("prefill seq");
+        let n = seq.request.tokens.len();
+        let pos0 = seq.pos;
+        let len = (n - pos0).min(self.prefill_chunk);
         let wants = self.drafter.wants();
         let dual_widths = self.dual.as_ref().map(|p| (p.d_width, p.m_width));
-        let mut d_buf = Vec::new();
-        let mut m_tok_buf = Vec::new();
-        let mut m_tap_buf = Vec::new();
-        let mut pos0 = 0usize;
-        while pos0 < n {
-            let len = (n - pos0).min(self.prefill_chunk);
-            let rows: Vec<Row> = (0..len)
-                .map(|i| Row {
-                    slot,
-                    token: request.tokens[pos0 + i],
-                    position: (pos0 + i) as u32,
-                })
-                .collect();
-            let (ids, taps) = self.target.step_taps_local(&rows)?;
-            let last_chunk = pos0 + len == n;
-            if !last_chunk {
-                let shifted = &request.tokens[pos0 + 1..pos0 + len + 1];
-                if let Some((d_w, m_w)) = dual_widths {
-                    if solo_mode {
-                        let (dt, mt) = self.split_dual_taps(taps, len)?;
-                        d_buf.extend_from_slice(&dt);
-                        m_tok_buf.extend_from_slice(shifted);
-                        m_tap_buf.extend_from_slice(&mt);
-                    } else {
-                        if self.active.len() < 2 {
-                            let dt = self.read_dual_d_taps(&taps, len)?;
-                            push_tail(&mut d_buf, &dt, d_w);
-                        }
-                        self.run_mtp_prefill_chunk(slot, pos0 as u32, shifted, &taps, d_w, m_w)?;
-                    }
+        let rows: Vec<Row> = (0..len)
+            .map(|i| Row {
+                slot: seq.slot,
+                token: seq.request.tokens[pos0 + i],
+                position: (pos0 + i) as u32,
+            })
+            .collect();
+        let (ids, taps) = self.target.step_taps_local(&rows)?;
+        if pos0 + len < n {
+            let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
+            if let Some((d_w, m_w)) = dual_widths {
+                if seq.solo_mode {
+                    let (dt, mt) = self.split_dual_taps(taps, len)?;
+                    seq.d_buf.extend_from_slice(&dt);
+                    seq.m_tok_buf.extend_from_slice(shifted);
+                    seq.m_tap_buf.extend_from_slice(&mt);
                 } else {
-                    self.drafter
-                        .run_taps(slot, pos0 as u32, shifted, taps.as_in(), wants, true)?;
+                    if self.active.len() + self.prefilling.len() < 2 {
+                        let dt = self.read_dual_d_taps(&taps, len)?;
+                        push_tail(&mut seq.d_buf, &dt, d_w);
+                    }
+                    self.run_mtp_prefill_chunk(seq.slot, pos0 as u32, shifted, &taps, d_w, m_w)?;
                 }
-                pos0 += len;
-                continue;
-            }
-            let anchor = *ids.last().expect("non-empty chunk");
-            fnv_u32(&mut self.hash, anchor);
-            let mut cancelled = false;
-            let mut done = None;
-            if request.stop.contains(&anchor) {
-                done = Some(Reason::Stop);
             } else {
-                if let Some(cb) = &mut sink
-                    && !cb(Event::Token(anchor))
-                {
-                    cancelled = true;
-                    let _ = cb(Event::Done(Reason::Stop));
-                }
-                if 1 >= request.max_tokens {
-                    done = Some(Reason::Length);
-                } else if n >= self.max_ctx {
-                    done = Some(Reason::Context);
-                }
+                self.drafter
+                    .run_taps(seq.slot, pos0 as u32, shifted, taps.as_in(), wants, true)?;
             }
-            if let Some(reason) = done {
-                if !cancelled && let Some(cb) = &mut sink {
-                    let _ = cb(Event::Done(reason));
-                }
-                self.free.push(slot);
-                return Ok(());
-            }
-            if self.target.control.is_none() && cancelled {
-                self.free.push(slot);
-                return Ok(());
-            }
-            let mut shifted = Vec::with_capacity(len);
-            shifted.extend_from_slice(&request.tokens[pos0 + 1..]);
-            shifted.push(anchor);
-            if solo_mode {
-                let (dt, mt) = self.split_dual_taps(taps, len)?;
-                d_buf.extend_from_slice(&dt);
-                m_tok_buf.extend_from_slice(&shifted);
-                m_tap_buf.extend_from_slice(&mt);
-                let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
-                self.active.push(ActiveSeq {
-                    slot,
-                    request,
-                    sink,
-                    start: n,
-                    anchor,
-                    drafts: Vec::new(),
-                    emitted: 1,
-                    cancelled,
-                    solo: Some(SoloState {
-                        selector,
-                        d_base: 0,
-                        d_ctx_pos: 0,
-                        d_pending: d_buf,
-                        m_start: 0,
-                        m_tokens: m_tok_buf,
-                        m_taps: m_tap_buf,
-                        round_mtp: false,
-                        last_pred: 1.0,
-                        last_lp: None,
-                        last_mtp_d1: None,
-                    }),
-                    d_tail: Vec::new(),
-                });
-                let idx = self.active.len() - 1;
-                self.solo_draft(idx)?;
-                return Ok(());
-            }
-            if let Some((d_w, _)) = dual_widths
-                && self.active.len() < 2
-            {
-                let dt = self.read_dual_d_taps(&taps, len)?;
-                push_tail(&mut d_buf, &dt, d_w);
-            }
-            let rem = request.max_tokens - 1;
-            let ctx_rem = self.max_ctx - n;
-            let avail = self
-                .depth
-                .min(rem.saturating_sub(1))
-                .min(ctx_rem.saturating_sub(1));
-            let drafts = if avail > 0 {
-                let job = DraftJob {
-                    active_idx: 0,
-                    slot,
-                    old_start: pos0 as u32,
-                    new_start: n,
-                    committed: shifted,
-                    tap_row_off: 0,
-                    avail,
-                };
-                self.draft_batch(&[job], &taps, dual_widths.is_some())?
-                    .pop()
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            self.active.push(ActiveSeq {
-                slot,
-                request,
-                sink,
-                start: n,
-                anchor,
-                drafts,
-                emitted: 1,
-                cancelled,
-                solo: None,
-                d_tail: d_buf,
-            });
+            seq.pos = pos0 + len;
+            self.prefilling.push_front(seq);
             return Ok(());
         }
+        let anchor = *ids.last().expect("non-empty chunk");
+        fnv_u32(&mut self.hash, anchor);
+        let mut cancelled = false;
+        let mut done = None;
+        if seq.request.stop.contains(&anchor) {
+            done = Some(Reason::Stop);
+        } else {
+            if let Some(cb) = &mut seq.sink
+                && !cb(Event::Token(anchor))
+            {
+                cancelled = true;
+                let _ = cb(Event::Done(Reason::Stop));
+            }
+            if 1 >= seq.request.max_tokens {
+                done = Some(Reason::Length);
+            } else if n >= self.max_ctx {
+                done = Some(Reason::Context);
+            }
+        }
+        if let Some(reason) = done {
+            if !cancelled && let Some(cb) = &mut seq.sink {
+                let _ = cb(Event::Done(reason));
+            }
+            self.free.push(seq.slot);
+            return Ok(());
+        }
+        if self.target.control.is_none() && cancelled {
+            self.free.push(seq.slot);
+            return Ok(());
+        }
+        let mut shifted = Vec::with_capacity(len);
+        shifted.extend_from_slice(&seq.request.tokens[pos0 + 1..]);
+        shifted.push(anchor);
+        if seq.solo_mode {
+            let (dt, mt) = self.split_dual_taps(taps, len)?;
+            seq.d_buf.extend_from_slice(&dt);
+            seq.m_tok_buf.extend_from_slice(&shifted);
+            seq.m_tap_buf.extend_from_slice(&mt);
+            let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
+            self.active.push(ActiveSeq {
+                slot: seq.slot,
+                request: seq.request,
+                sink: seq.sink,
+                start: n,
+                anchor,
+                drafts: Vec::new(),
+                emitted: 1,
+                cancelled,
+                solo: Some(SoloState {
+                    selector,
+                    d_base: 0,
+                    d_ctx_pos: 0,
+                    d_pending: seq.d_buf,
+                    m_start: 0,
+                    m_tokens: seq.m_tok_buf,
+                    m_taps: seq.m_tap_buf,
+                    round_mtp: false,
+                    last_pred: 1.0,
+                    last_lp: None,
+                    last_mtp_d1: None,
+                }),
+                d_tail: Vec::new(),
+            });
+            let idx = self.active.len() - 1;
+            self.solo_draft(idx)?;
+            return Ok(());
+        }
+        if let Some((d_w, _)) = dual_widths
+            && self.active.len() + self.prefilling.len() < 2
+        {
+            let dt = self.read_dual_d_taps(&taps, len)?;
+            push_tail(&mut seq.d_buf, &dt, d_w);
+        }
+        let rem = seq.request.max_tokens - 1;
+        let ctx_rem = self.max_ctx - n;
+        let avail = self
+            .depth
+            .min(rem.saturating_sub(1))
+            .min(ctx_rem.saturating_sub(1));
+        let drafts = if avail > 0 {
+            let job = DraftJob {
+                active_idx: 0,
+                slot: seq.slot,
+                old_start: pos0 as u32,
+                new_start: n,
+                committed: shifted,
+                tap_row_off: 0,
+                avail,
+            };
+            self.draft_batch(&[job], &taps, dual_widths.is_some())?
+                .pop()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.active.push(ActiveSeq {
+            slot: seq.slot,
+            request: seq.request,
+            sink: seq.sink,
+            start: n,
+            anchor,
+            drafts,
+            emitted: 1,
+            cancelled,
+            solo: None,
+            d_tail: seq.d_buf,
+        });
         Ok(())
     }
 
@@ -487,6 +512,7 @@ impl<'a> BatchMtp<'a> {
         }
         let survivors = finished.iter().filter(|&&f| !f).count();
         let promote = survivors == 1
+            && self.prefilling.is_empty()
             && jobs.len() == 1
             && dual_info.is_some_and(|(_, block)| {
                 let seq = &self.active[jobs[0].active_idx];
@@ -503,7 +529,7 @@ impl<'a> BatchMtp<'a> {
             self.promote_solo(job, &m_all)?;
         } else if !jobs.is_empty() {
             if let Some((d_w, _)) = dual_info
-                && survivors <= 2
+                && survivors + self.prefilling.len() <= 2
             {
                 let d_all = self.read_dual_d_taps(&raw_taps, rows.len())?;
                 for job in &jobs {

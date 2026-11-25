@@ -18,6 +18,8 @@ pub(crate) const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBacke
 
 const KERNEL: &str = include_str!("linear.cu");
 const BLOCK: usize = 128;
+const WIDE_COLS: usize = 32;
+const WIDE_THREADS: usize = 128;
 const THREADS: usize = 256;
 const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
@@ -466,7 +468,19 @@ fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn stacked_needs(k: &FastStacked) -> Needs {
-    cuda_needs(if k.wide { WARPS * 128 * 4 } else { 0 })
+    if k.wide {
+        Needs {
+            lanes: 32,
+            group_bytes: 16 * 18 * 4 * 2 + 32 * 34 * 2,
+            group_threads: WIDE_THREADS,
+            compiler: true,
+            lacks: CUDA_LACKS,
+            bf16_tile: true,
+            ..Needs::default()
+        }
+    } else {
+        cuda_needs(0)
+    }
 }
 
 fn stacked_source(k: &FastStacked) -> Source {
@@ -479,32 +493,25 @@ fn stacked_source(k: &FastStacked) -> Source {
 
 fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
     let rtiles = if k.wide {
-        k.rows.div_ceil(4)
+        k.rows.div_ceil(16)
     } else {
         k.rows.div_ceil(8)
     };
-    let groups = if k.wide {
-        (k.n / BLOCK) * k.batches * rtiles
+    let (groups, group) = if k.wide {
+        ((k.n / WIDE_COLS) * k.batches * rtiles, WIDE_THREADS)
     } else {
-        (k.batches * k.n).div_ceil(WARPS) * rtiles
+        ((k.batches * k.n).div_ceil(WARPS) * rtiles, THREADS)
     };
     // A trip reads weights and each row's x.
     let (trips, trip) = if k.wide {
-        let r = k.rows.min(4);
-        // A warp shares each x, a quarter line a trip.
-        let trip = Ops {
-            width: (8.0 + r as f64 / 8.0) / (1 + r) as f64,
-            fresh: (1.0 + 0.25 * r as f64) / (1 + r) as f64,
-            ..trip(4 * r, 4, 1 + r, 0)
-        };
-        (k.k as f64 / WARPS as f64, trip)
+        (k.k as f64 / 32.0, Ops::default())
     } else {
         let r = k.rows.min(8);
         (k.k as f64 / 256.0, trip(8 * r, 8, 1 + 2 * r, 16 + 32 * r))
     };
     Some(Load {
-        threads: groups * THREADS,
-        group: THREADS,
+        threads: groups * group,
+        group,
         trips,
         trip,
         reads: vec![
@@ -520,9 +527,9 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
 fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
     if k.wide {
         let shape = Shape::Grid {
-            across: k.n / BLOCK,
-            down: k.batches * k.rows.div_ceil(4),
-            threads: THREADS,
+            across: k.n / WIDE_COLS,
+            down: k.batches * k.rows.div_ceil(16),
+            threads: WIDE_THREADS,
         };
         let args = vec![
             step.read(0),
@@ -623,7 +630,7 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         return Some(Err(format!("weight form {} (supports bf16)", form.name())));
     }
     let (block, first) = (block_rows * width, first_row * width);
-    let align = if swapped { 4 } else { 8 };
+    let align = 8;
     if !block.is_multiple_of(align) || !first.is_multiple_of(align) || !width.is_multiple_of(align)
     {
         return Some(Err(format!(
@@ -631,13 +638,13 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
         )));
     }
     if swapped {
-        if !n.is_multiple_of(BLOCK) {
+        if !n.is_multiple_of(WIDE_COLS) {
             return Some(Err(format!(
-                "n={n} is not a multiple of {BLOCK} for transposed stacked"
+                "n={n} is not a multiple of {WIDE_COLS} for transposed stacked"
             )));
         }
-        if k > 512 {
-            return Some(Err(format!("k={k} exceeds max 512 for transposed stacked")));
+        if !k.is_multiple_of(32) || k > 512 {
+            return Some(Err(format!("k={k} must be a multiple of 32 up to 512")));
         }
     } else if !k.is_multiple_of(8) {
         return Some(Err(format!("k={k} is not a multiple of 8 for stacked")));
