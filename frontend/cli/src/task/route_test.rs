@@ -46,6 +46,12 @@ fn picks_become_commands() {
         .flatten()
         .unwrap_or_default();
     assert_eq!(args, ["--recipe", "flux2-klein", "fetch"]);
+    let named = json!({ "tool": "fetch", "hub": "flux2-klein" });
+    let args = argv(&named, &catalog, found).ok().flatten();
+    assert_eq!(
+        args.unwrap_or_default(),
+        ["--recipe", "flux2-klein", "fetch"]
+    );
     let reply = argv(&json!({ "tool": "reply" }), &catalog, found);
     assert!(matches!(reply, Ok(None)));
 }

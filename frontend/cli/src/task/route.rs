@@ -148,6 +148,9 @@ pub fn prompt(catalog: &[Recipe], tools: &[&Entry], request: &str) -> String {
 
 /// The catalog model that words such as "image model" name.
 fn by_kind<'a>(catalog: &'a [Recipe], words: &str) -> Option<&'a str> {
+    if let Some(r) = catalog.iter().find(|r| r.name == words.trim()) {
+        return Some(&r.name);
+    }
     let mut named = Vec::new();
     for word in words.split_whitespace() {
         let word = word.to_lowercase();
