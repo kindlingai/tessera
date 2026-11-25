@@ -337,7 +337,7 @@ pub(crate) fn extra_rules(config: &Config, slices: &[Slice]) -> Vec<Rule> {
 /// Loads a tapped target model and its DFlash drafter.
 pub fn load(
     [target_dir, draft_dir]: [&Path; 2],
-    [slots, context]: [u64; 2],
+    ([slots, context], steps): ([u64; 2], Steps),
     user: &[Rule],
     overrides: &Overrides,
     manifest: Option<&str>,
@@ -350,7 +350,7 @@ pub fn load(
         target_dir,
         [slots, context],
         user,
-        Steps::Plain,
+        steps,
         overrides,
         manifest,
         &tap_layers,

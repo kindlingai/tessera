@@ -59,7 +59,7 @@ pub fn rules(layer: u64, indexed: bool, rotated: bool) -> Vec<Rule> {
 /// Loads a tapped MLA target and its native MTP layer.
 pub fn load(
     dir: &Path,
-    [slots, context]: [u64; 2],
+    ([slots, context], steps): ([u64; 2], Steps),
     user: &[Rule],
     overrides: &Overrides,
     manifest: Option<&str>,
@@ -92,7 +92,7 @@ pub fn load(
         dir,
         [slots, context],
         user,
-        Steps::Plain,
+        steps,
         overrides,
         manifest,
         &tap,

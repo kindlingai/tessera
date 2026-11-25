@@ -38,7 +38,7 @@ mod text_test;
 pub mod worker;
 
 pub use embed::{Embedder, Threaded};
-pub use generate::{Generate, Job, Queued};
+pub use generate::{Generate, Job, Queued, Steer};
 pub use guided::{Guides, guides};
 pub use tag::Tagger;
 pub(crate) use text::{Spool, Stops};

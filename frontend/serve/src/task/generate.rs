@@ -7,7 +7,8 @@ use std::time::Instant;
 use tessera_engine::progress::Unit;
 use tessera_engine::{Batch, Engine, Fair, Pins, PleStore, Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
-use tessera_tasks::{Generate, Job, Queued};
+use tessera_bundle::tokenize::hf::Hf;
+use tessera_tasks::{Generate, Guides, Job, Queued, Steer};
 
 pub static ENTRY: Entry = Entry {
     task: "generate",
@@ -107,6 +108,22 @@ pub(super) fn check_lowering(o: &Options, engine: &mut Engine, extra_rows: Optio
     }
 }
 
+/// Guides under `--guided`, sized by the engine's mask port.
+pub(super) fn guides(
+    load: &Load,
+    engine: &Engine,
+    tokenizer: &Hf,
+    stop: &[u32],
+) -> Result<Option<Arc<dyn Guides>>, String> {
+    match (load.on("--guided"), engine.words()) {
+        (false, _) => Ok(None),
+        (true, None) => Err("the model has no mask port".into()),
+        (true, Some(words)) => tessera_tasks::guides(tokenizer, stop, words)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 /// Fills the slot with `generate`. Returns the job queue.
 pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> mpsc::Receiver<Job> {
     let generate = Arc::new(generate);
@@ -173,21 +190,12 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
     }
-    let guides = match (guided, engine.words()) {
-        (false, _) => None,
-        (true, None) => return Err("the model has no mask port".into()),
-        (true, Some(words)) => Some(
-            tessera_tasks::guides(&loaded.tokenizer, &loaded.stop, words)
-                .map_err(|e| e.to_string())?,
-        ),
-    };
     let generate = Generate {
+        steer: Steer::Guided(guides(load, &engine, &loaded.tokenizer, &loaded.stop)?),
         tokenizer: loaded.tokenizer,
         template: loaded.template,
         response: loaded.response,
         stop: loaded.stop,
-        guides,
-        edits: true,
         sampling: true,
     };
     let jobs = queue(load, generate, scores);

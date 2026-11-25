@@ -18,14 +18,18 @@ pub struct Generate {
     pub response: Option<ResponseParser>,
     /// Ids that end an answer.
     pub stop: Vec<u32>,
-    /// Guides for answers with a format. `None` refuses formats.
-    pub guides: Option<Arc<dyn Guides>>,
-    /// Whether the engine applies guide edits. `false` refuses
-    /// penalties.
-    pub edits: bool,
+    pub steer: Steer,
     /// Whether the engine samples. `false` refuses a temperature
     /// above zero.
     pub sampling: bool,
+}
+
+/// The guides an engine thread applies.
+pub enum Steer {
+    /// Penalties, and formats when guides are given.
+    Guided(Option<Arc<dyn Guides>>),
+    /// None: the named serving mode cannot apply guides.
+    Unguided(&'static str),
 }
 
 impl Tokens for Generate {
@@ -91,23 +95,29 @@ pub struct Queued {
 impl Generator for Queued {
     fn generate(&self, prompt: Vec<u32>, params: Params, mut sink: Sink) -> Result<(), Error> {
         let mut guides = Vec::new();
-        match (&params.format, &self.generate.guides) {
+        let key = match params.penalties.neutral() {
+            true => params.thinking.key(),
+            false => Some("presence_penalty"),
+        };
+        let made = match &self.generate.steer {
+            Steer::Guided(made) => made.as_ref(),
+            Steer::Unguided(mode) => {
+                match params.format.as_ref().map(|_| "response_format").or(key) {
+                    Some(field) => {
+                        let why = format!("{mode} does not support formats or penalties");
+                        return Err(Box::new(Refused(why, field)));
+                    }
+                    None => None,
+                }
+            }
+        };
+        match (&params.format, made) {
             (None, _) => {}
             (Some(format), Some(made)) => guides.push(made.guide(format)?),
             (Some(_), None) => {
                 let why = "this model was loaded without guided decoding";
                 return Err(Box::new(Refused(why.into(), "response_format")));
             }
-        }
-        let key = match params.penalties.neutral() {
-            true => params.thinking.key(),
-            false => Some("presence_penalty"),
-        };
-        if let Some(key) = key
-            && !self.generate.edits
-        {
-            let why = "this model was loaded without logit edits";
-            return Err(Box::new(Refused(why.into(), key)));
         }
         if !params.sampling.greedy() && !self.generate.sampling {
             let why = "this model was loaded for greedy decoding only";

@@ -1,6 +1,6 @@
 //! Generation with a DFlash drafter, when `--draft` is given.
 
-use super::generate::{check_lowering, lowering, queue, user_rules};
+use super::generate::{check_lowering, guides, lowering, queue, user_rules};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -11,9 +11,9 @@ use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::{
     CostModel, Drafter, Engine, Place, PleStore, Recipe, Request, Settings, Sink, SpecLen,
-    SpecStats, Speculate,
+    SpecStats, Speculate, Steps,
 };
-use tessera_tasks::Generate;
+use tessera_tasks::{Generate, Steer};
 
 pub static ENTRY: Entry = Entry {
     task: "generate",
@@ -84,12 +84,23 @@ pub(super) struct Begin<'a> {
     pub rules: Vec<tessera_bundle::names::Rule>,
     pub at: [u64; 2],
     pub manifest: Option<&'a str>,
+    /// The serving mode that refuses guides, if any.
+    pub mode: Option<&'static str>,
+    pub steps: Steps,
 }
 
-/// Refuses `--guided`, then joins the ranks and reads rules.
-pub(super) fn begin<'a>(load: &'a Load, settings: &Settings, what: &str) -> Result<Begin<'a>, String> {
-    if load.on("--guided") {
-        return Err(format!("{what} cannot combine with --guided yet"));
+/// Refuses `--guided` where guides cannot run, then joins the ranks.
+pub(super) fn begin<'a>(load: &'a Load, settings: &Settings, batched: bool) -> Result<Begin<'a>, String> {
+    let mode = match (batched, load.options.ranks.alone()) {
+        (true, _) => Some("batched speculative decoding"),
+        (false, false) => Some("speculative decoding over ranks"),
+        (false, true) => None,
+    };
+    let guided = load.on("--guided");
+    if let Some(mode) = mode
+        && guided
+    {
+        return Err(format!("{mode} cannot combine with --guided"));
     }
     let start = Instant::now();
     let links = load.options.ranks.join(settings, &load.options.knobs())?;
@@ -99,6 +110,29 @@ pub(super) fn begin<'a>(load: &'a Load, settings: &Settings, what: &str) -> Resu
         rules: user_rules(settings)?,
         at: [1, load.options.max_model_len as u64],
         manifest: load.given("--manifest"),
+        mode,
+        steps: if guided { Steps::Masked } else { Steps::Plain },
+    })
+}
+
+/// The front for `target`, with guides when serving solo.
+pub(super) fn front(
+    load: &Load,
+    mode: Option<&'static str>,
+    engine: &Engine,
+    target: Bundle,
+) -> Result<Generate, String> {
+    let steer = match mode {
+        Some(mode) => Steer::Unguided(mode),
+        None => Steer::Guided(guides(load, engine, &target.tokenizer, &target.stop)?),
+    };
+    Ok(Generate {
+        tokenizer: target.tokenizer,
+        template: target.template,
+        response: target.response,
+        stop: target.stop,
+        steer,
+        sampling: false,
     })
 }
 
@@ -177,11 +211,17 @@ pub(super) fn open_drafter(
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let draft_dir = std::path::Path::new(load.given("--draft").unwrap_or_default());
-    let b = begin(load, &settings, "--draft")?;
+    let b = begin(load, &settings, false)?;
     let (target_links, draft_links) = split_links(b.links);
     let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
-    let pair = tessera_bundle::dflash::load([&o.model, draft_dir], at, &rules, &o.config, manifest)
-        .map_err(|e| e.to_string())?;
+    let pair = tessera_bundle::dflash::load(
+        [&o.model, draft_dir],
+        (at, b.steps),
+        &rules,
+        &o.config,
+        manifest,
+    )
+    .map_err(|e| e.to_string())?;
     let mut drafter = open_drafter(o, draft_links, &pair, &settings)?;
     let (mut engine, target) = open_target(o, target_links, pair.target, &settings)?;
     let seconds = start.elapsed().as_secs_f64();
@@ -191,6 +231,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.block
     );
     check_lowering(o, &mut engine, Some(pair.block.min(16)));
+    let generate = front(load, b.mode, &engine, target)?;
     let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
     if let Some(rows) = o.max_batch_rows {
         spec = spec.with_prefill_chunk(rows);
@@ -200,7 +241,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     }
     let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
     let mut spec = spec.with_spec_len(sl);
-    serve(load, &settings, target, "dflash", |req, sink| {
+    serve(load, &settings, generate, "dflash", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
     let _ = engine.dismiss();
@@ -211,19 +252,10 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
 pub(super) fn serve(
     load: &Load,
     settings: &Settings,
-    target: Bundle,
+    generate: Generate,
     label: &str,
     mut run: impl FnMut(Request, &mut Sink) -> Result<SpecStats, String>,
 ) -> Result<(), String> {
-    let generate = Generate {
-        tokenizer: target.tokenizer,
-        template: target.template,
-        response: target.response,
-        stop: target.stop,
-        guides: None,
-        edits: false,
-        sampling: false,
-    };
     let jobs = queue(load, generate, false);
     while let Ok((request, mut sink)) = jobs.recv() {
         let t0 = Instant::now();
