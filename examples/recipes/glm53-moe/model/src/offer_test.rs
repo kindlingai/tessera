@@ -81,12 +81,13 @@ fn plan_bytes(src: &str) -> usize {
 
 #[test]
 fn offer_row_bounds() {
-    for rows in [1, 8, 16, 32, 64] {
+    for rows in [1, 8, 16, 32, 64, 128, 256] {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
             assert_eq!(got.len(), 4);
             let nb = experts / 16;
-            let rks = split_dim(512 / 256, 128usize.div_ceil(nb).max(1));
+            let rm = rows.div_ceil(16);
+            let rks = split_dim(512 / 256, 128usize.div_ceil(nb * rm).max(1));
             assert_eq!(got[0].len, SCORES_OFF + rows * experts * rks);
             let Shape::Grid { down, .. } = got[1].shape else {
                 panic!("fc1 must be grid");
@@ -95,16 +96,16 @@ fn offer_row_bounds() {
         }
     }
     assert!(offer(&site(0, 256, 512, 256)).is_none());
-    assert!(offer(&site(65, 256, 512, 256)).is_none());
-    assert!(offer(&site(65, 32, 512, 256)).is_none());
-    let Shape::Grid { down: d256, .. } = offer(&site(64, 256, 512, 256)).unwrap()[1].shape else {
+    assert!(offer(&site(257, 256, 512, 256)).is_none());
+    assert!(offer(&site(257, 32, 512, 256)).is_none());
+    let Shape::Grid { down: d256, .. } = offer(&site(256, 256, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d256, 8 + 288);
-    let Shape::Grid { down: d32, .. } = offer(&site(64, 32, 512, 256)).unwrap()[1].shape else {
+    assert_eq!(d256, 32 + 480);
+    let Shape::Grid { down: d32, .. } = offer(&site(256, 32, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d32, 8 + 44);
+    assert_eq!(d32, 32 + 92);
 }
 
 #[test]

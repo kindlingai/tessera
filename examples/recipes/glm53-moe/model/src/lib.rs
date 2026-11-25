@@ -31,8 +31,8 @@ const CODES: [&str; 3] = ["gate", "up", "down"];
 const INNER: [&str; 6] = ["gate", "gate_sv", "up", "up_sv", "down_su", "down"];
 
 /// Past these, the linked rules serve better or `moe.cu` cannot.
-const MOST_ROWS: usize = 64;
-const MOST_EXPERTS: usize = 2048;
+const MOST_ROWS: usize = 256;
+const MOST_EXPERTS: usize = 256;
 const MAX_SLOTS: usize = 512;
 const PICKS: usize = 8;
 /// Words in `Plan` struct in `moe.cu`.
@@ -165,27 +165,46 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let [plan, gpart, z] = [0, 1, 2].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
     let ibs = hidden / 128;
-    let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
-    let ns2 = split_dim(ibs, if rows == 1 { 8 } else { 3 });
+    let ks1 = split_dim(
+        ibs,
+        if rows == 1 {
+            8
+        } else if rows < 64 {
+            4
+        } else {
+            1
+        },
+    );
+    let ns2 = split_dim(
+        ibs,
+        if rows == 1 {
+            8
+        } else if rows < 64 {
+            3
+        } else {
+            1
+        },
+    );
     let n_sh = rows.div_ceil(8);
     let assigns = (rows * picks).min(count * rows);
     let active = count.min(assigns);
     let max_routed = (count * n_sh).min(active + (assigns - active) / 8);
     let total_slots = n_sh + max_routed;
     let max_col = rows.min(8);
-    let (route_grid, rks) = if bf16 == 1 && experts % 16 == 0 && hidden % 256 == 0 {
+    let (route_x, route_y, rks) = if bf16 == 1 && experts % 16 == 0 && hidden % 256 == 0 {
         let nb = experts / 16;
-        let rks = split_dim(hidden / 256, 128usize.div_ceil(nb).max(1));
-        (nb * rks, rks)
+        let rm = rows.div_ceil(16);
+        let rks = split_dim(hidden / 256, 128usize.div_ceil(nb * rm).max(1));
+        (nb * rks, rm, rks)
     } else {
-        (experts.div_ceil(2), 1)
+        (experts.div_ceil(2), 1, 1)
     };
     let route = Offer {
         kernel: ROUTE,
         reads: vec![Place::Read(0), router.read(), bias.read()],
         len: SCORES_OFF + rows * experts * rks,
         counts: fixed(&[rows, hidden, experts, bf16, picks, first, count]),
-        shape: Shape::grid(route_grid, 1, 256),
+        shape: Shape::grid(route_x, route_y, 256),
         work: (rows * experts * hidden) as f64,
         ..Offer::default()
     };
