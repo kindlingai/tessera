@@ -12,6 +12,7 @@ enum MmKind {
     Mxfp8,
     Mxfp8Split,
     Mxfp8Wide,
+    Mxfp8WideSplit,
     Mxfp8Tall,
 }
 
@@ -20,7 +21,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
             MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => "fast_mm_mxfp8",
-            MmKind::Mxfp8Split => "fast_mm_mxfp8_sk",
+            MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => "fast_mm_mxfp8_sk",
         }
     }
 
@@ -31,6 +32,7 @@ impl MmKind {
             MmKind::Mxfp8 => "tessera_mm_mxfp8_r8",
             MmKind::Mxfp8Split => "tessera_mm_mxfp8_r8_sk",
             MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
+            MmKind::Mxfp8WideSplit => "tessera_mm_mxfp8_r16_sk",
             MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r32",
         }
     }
@@ -39,9 +41,11 @@ impl MmKind {
         match self {
             MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
             MmKind::Bf16Split => (4 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Mxfp8 | MmKind::Mxfp8Split | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => {
-                4 * 16 * 36 * 4
-            }
+            MmKind::Mxfp8
+            | MmKind::Mxfp8Split
+            | MmKind::Mxfp8Wide
+            | MmKind::Mxfp8WideSplit
+            | MmKind::Mxfp8Tall => 4 * 16 * 36 * 4,
         }
     }
 
@@ -50,7 +54,7 @@ impl MmKind {
             MmKind::Bf16 => (n / 32, m.div_ceil(16)),
             MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
             MmKind::Mxfp8 => (n / 16, 1),
-            MmKind::Mxfp8Split => ((n / 16) * ks, 1),
+            MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => ((n / 16) * ks, 1),
             MmKind::Mxfp8Tall => (n / 16, m.div_ceil(32)),
         }
     }
@@ -59,19 +63,29 @@ impl MmKind {
         match self {
             MmKind::Bf16 => 64.0,
             MmKind::Bf16Split => 128.0,
-            MmKind::Mxfp8 | MmKind::Mxfp8Split | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => 512.0,
+            MmKind::Mxfp8
+            | MmKind::Mxfp8Split
+            | MmKind::Mxfp8Wide
+            | MmKind::Mxfp8WideSplit
+            | MmKind::Mxfp8Tall => 512.0,
         }
+    }
+
+    fn is_split(self) -> bool {
+        matches!(self, MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit)
     }
 }
 
-fn mxfp8_ks(n: usize, k: usize) -> usize {
+fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
     let chunks = k / 512;
     let nb = n / 16;
-    if chunks <= 1 || nb >= 112 {
+    let max_nb = if wide { 112 } else { 256 };
+    if chunks <= 1 || nb >= max_nb {
         return 1;
     }
-    let want = 144usize.div_ceil(nb).clamp(1, 16).min(chunks);
-    for d in want..=chunks.min(16) {
+    let cap = if nb >= 32 { 6 } else { 12 }.min(chunks);
+    let want = 320usize.div_ceil(nb).clamp(1, cap);
+    for d in want..=cap {
         if chunks.is_multiple_of(d) {
             return d;
         }
@@ -169,7 +183,7 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
         Arg::count(k.k),
         Arg::value(&k.mode),
     ];
-    if k.kind == MmKind::Mxfp8Split {
+    if k.kind.is_split() {
         args.push(Arg::count(k.ks));
     }
     vec![Launch { args, shape }]
@@ -266,7 +280,7 @@ struct MmSite {
 
 impl MmSite {
     fn draft(self, mode: u32, other: Option<T>) -> Vec<Draft> {
-        if self.kind == MmKind::Mxfp8Split {
+        if self.kind.is_split() {
             let mm = FastMm {
                 m: self.m,
                 n: self.n,
@@ -364,14 +378,19 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         }
         "mxfp8" if n.is_multiple_of(16) && k.is_multiple_of(512) => {
             if m <= 8 {
-                let ks = mxfp8_ks(n, k);
+                let ks = mxfp8_ks(n, k, false);
                 if ks > 1 {
                     (MmKind::Mxfp8Split, ks)
                 } else {
                     (MmKind::Mxfp8, 1)
                 }
             } else if m <= 16 {
-                (MmKind::Mxfp8Wide, 1)
+                let ks = mxfp8_ks(n, k, true);
+                if ks > 1 {
+                    (MmKind::Mxfp8WideSplit, ks)
+                } else {
+                    (MmKind::Mxfp8Wide, 1)
+                }
             } else {
                 (MmKind::Mxfp8Tall, 1)
             }

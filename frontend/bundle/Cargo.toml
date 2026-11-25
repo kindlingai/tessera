@@ -22,4 +22,3 @@ tokenizers = { version = "0.22", default-features = false, features = ["unstable
 
 [dev-dependencies]
 tessera-testkit = { workspace = true }
-toml = "0.8"

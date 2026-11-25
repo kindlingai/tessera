@@ -112,8 +112,7 @@ fn renders_like_hugging_face() {
     let want = "{\"z\": \"it's <a> & b\", \"a\": [1, 2]}|\
 {\n \"z\": \"it's <a> & b\",\n \"a\": [\n  1,\n  2\n ]\n}|why|<tool_call>";
     assert_eq!(t.render_options(&[msg], &opts).unwrap(), want);
-    let qwen3 = include_str!("response/qwen3.json");
-    let parser = ResponseParser::fallback(qwen3, &t).unwrap().unwrap();
+    let parser = ResponseParser::builtin(&t).unwrap().unwrap();
     let raw =
         "<think>\nhm\n</think>\n\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>";
     let parsed = parser.parse(raw, true, false);
@@ -123,5 +122,5 @@ fn renders_like_hugging_face() {
     );
     assert_eq!(parsed.tool_calls[0].function.name, "f");
     let plain = Template::new("no tools".into()).unwrap();
-    assert!(ResponseParser::fallback(qwen3, &plain).unwrap().is_none());
+    assert!(ResponseParser::builtin(&plain).unwrap().is_none());
 }

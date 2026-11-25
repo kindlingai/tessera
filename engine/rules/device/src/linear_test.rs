@@ -75,6 +75,7 @@ fn linear_mm_entries() {
         "tessera_mm_bf16_ks2(",
         "tessera_mm_mxfp8_r8(",
         "tessera_mm_mxfp8_r8_sk(",
+        "tessera_mm_mxfp8_r16_sk(",
         "tessera_mm_reduce(",
         "tessera_mm_mxfp8_r16(",
         "tessera_mm_mxfp8_r32(",
@@ -103,7 +104,7 @@ fn fast_mm_selection() {
         Some(("fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r8_sk", 2))
     );
     assert_eq!(
-        mm_entry(&linear(&rows, 6144, 2048), 8, "mxfp8"),
+        mm_entry(&linear(&rows, 6144, 4096), 8, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r8", 2))
     );
     assert_eq!(

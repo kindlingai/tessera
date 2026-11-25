@@ -1765,7 +1765,6 @@ dependencies = [
  "tessera-engine",
  "tessera-testkit",
  "tokenizers",
- "toml",
 ]
 
 [[package]]

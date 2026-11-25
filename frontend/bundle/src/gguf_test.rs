@@ -44,7 +44,7 @@ impl Fixture {
             ("tokenizer.ggml.eot_token_id".into(), Meta::U64(2)),
             (
                 "tokenizer.chat_template".into(),
-                Meta::Str("{{ messages[0].content }}".into()),
+                Meta::Str("{{ messages[0].content }}<tool_call>".into()),
             ),
         ]);
         let tensors = g
@@ -128,6 +128,7 @@ fn compare(form: &'static dyn Load) {
     let loaded = Fixture::new(form).load().unwrap();
     assert_eq!(loaded.stop, [2]);
     assert!(loaded.template.is_some());
+    assert!(loaded.response.is_some_and(|r| r.supports_tools()));
     assert_eq!(loaded.tokenizer.encode("ab").unwrap(), [2]);
     let pins = loaded.pins.unwrap();
     assert_eq!(pins.weights.name(), form.name());

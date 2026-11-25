@@ -133,8 +133,7 @@ fn deepseek_family_default() {
 {{ '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + tool['function']['arguments'] }}\
 {% endfor %}{% endfor %}";
     let mut template = crate::Template::new(chat.into()).unwrap();
-    let json = include_str!("deepseek.json");
-    let parser = ResponseParser::fallback(json, &template).unwrap().unwrap();
+    let parser = ResponseParser::builtin(&template).unwrap().unwrap();
     template
         .with_tool_prompt(parser.tool_prompt().unwrap())
         .unwrap();
@@ -185,29 +184,40 @@ fn deepseek_family_default() {
 }
 
 #[test]
-fn glm53_recipes_parse_tags() {
+fn picks_builtin_format() {
+    let cases = [
+        ("{{ '<|tool_call>call:' + name }}", Some("gemma4")),
+        ("{{ '<｜tool▁call▁begin｜>' + name }}", Some("deepseek")),
+        ("{{ '<|tool_call|>' }}", Some("granite")),
+        ("{{ '<tool_call>\\n<function=' + name }}", Some("qwen35")),
+        ("{{ '<tool_call>' + name }}<arg_key>", Some("glm53")),
+        ("{{ '<tool_call>[' }}", Some("smollm2")),
+        ("{{ '<tool_call>\\n{\"name\": ' }}", Some("qwen3")),
+        ("no tools", None),
+    ];
+    for (source, want) in cases {
+        let chat = crate::Template::new(source.into()).unwrap();
+        let got = super::formats::pick(&chat).unwrap().map(|(name, _)| name);
+        assert_eq!(got, want, "{source}");
+    }
+}
+
+#[test]
+fn parses_arg_key_calls() {
     let raw = "<think>plan</think>Checking.<tool_call>f<arg_key>city</arg_key>\
 <arg_value>Paris, FR</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
-    for name in ["glm53-moe", "glm53-whole"] {
-        let path = format!(
-            "{}/../../examples/recipes/{name}/recipe.toml",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let recipe: serde_json::Value =
-            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let config = recipe["config"]["tokenizer_config.json"].to_string();
-        let parser = ResponseParser::from_config(&config).unwrap().unwrap();
-        let parsed = parser.parse(raw, true, false);
-        assert_eq!(
-            (parsed.reasoning.as_str(), parsed.content.as_str()),
-            ("plan", "Checking.")
-        );
-        assert_eq!(parsed.tool_calls[0].function.name, "f");
-        assert_eq!(
-            parsed.tool_calls[0].function.arguments,
-            json!({"city": "Paris, FR", "days": 3})
-        );
-    }
+    let cfg = format!(r#"{{"response_template": {}}}"#, include_str!("glm53.json"));
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let parsed = parser.parse(raw, true, false);
+    assert_eq!(
+        (parsed.reasoning.as_str(), parsed.content.as_str()),
+        ("plan", "Checking.")
+    );
+    assert_eq!(parsed.tool_calls[0].function.name, "f");
+    assert_eq!(
+        parsed.tool_calls[0].function.arguments,
+        json!({"city": "Paris, FR", "days": 3})
+    );
 }
 
 #[test]
