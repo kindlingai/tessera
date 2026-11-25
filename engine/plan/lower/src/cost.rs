@@ -4,7 +4,7 @@ use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::kernels::{crosses, moved};
 use crate::plan::{Plan, Step};
-use crate::recipe::{Compute, Recipe};
+use crate::recipe::{Compute, Knobs, Recipe};
 use crate::rule::{Rule, gather, rules_with};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -70,6 +70,9 @@ pub struct Device {
     /// Operand precision for matrix-unit kernels.
     #[serde(skip)]
     pub compute: Compute,
+    /// Kernel shape values the recipe set.
+    #[serde(skip)]
+    pub knobs: Knobs,
     /// Where kept rows lie.
     #[serde(skip, default = "dense")]
     pub kept: &'static dyn Layout,
@@ -162,6 +165,7 @@ impl Default for Device {
             made: Vec::new(),
             pins: Pins::default(),
             compute: Compute::default(),
+            knobs: Knobs::default(),
             kept: dense(),
             kept_rows: None,
             config: None,
@@ -247,6 +251,7 @@ impl Device {
     pub fn with(mut self, recipe: &Recipe) -> Self {
         self.pins = recipe.pins.clone();
         self.compute = recipe.compute;
+        self.knobs = recipe.shape.clone();
         self.favor = recipe.favor.clone();
         self.require_favored = recipe.require_favored;
         self.barred = recipe.barred.clone();

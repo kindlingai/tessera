@@ -3,14 +3,23 @@ use crate::linear::{cuda_source, hip_source};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
 use tessera_lower::form::named;
-use tessera_lower::{Device, Pins, Source, Tree, Wants};
+use tessera_lower::{Device, Knobs, Pins, Source, Tree, Wants};
 use tessera_testkit::graphs::linear;
 
 fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static str, usize)> {
+    mm_shaped(g, rows, form, Knobs::default())
+}
+
+fn mm_shaped(
+    g: &Graph,
+    rows: u64,
+    form: &str,
+    knobs: Knobs,
+) -> Option<(&'static str, &'static str, usize)> {
     let form = named(form).expect("known form");
     let dev = Device::default().pinned(Pins::all(form));
     let parts = dev.division();
-    let tree = Tree::upto(
+    let mut tree = Tree::upto(
         g,
         0,
         Wants::ALL,
@@ -22,6 +31,7 @@ fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static 
         0,
     )
     .expect("tree builds");
+    tree.knobs = knobs;
     let root = tree.outputs[0].0;
     let drafts = propose_mm(&tree, root)?;
     let d = &drafts[0];
@@ -103,6 +113,12 @@ fn fast_mm_selection() {
     assert_eq!(
         mm_entry(&linear(&rows, 36864, 1536), 8, "bf16"),
         Some(("fast_mm_bf16_sk", "tessera_mm_bf16_sk", 2))
+    );
+    let mut one = Knobs::default();
+    one.parse("fast_mm_bf16_sk:splits=1").unwrap();
+    assert_eq!(
+        mm_shaped(&linear(&rows, 36864, 1536), 8, "bf16", one),
+        Some(("fast_mm_bf16", "tessera_mm_bf16_ks2", 2))
     );
     // Narrow MXFP8 r8 uses split-K, wide N stays single-pass.
     assert_eq!(

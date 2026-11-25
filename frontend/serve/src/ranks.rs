@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use tessera_engine::DType;
 use tessera_engine::comm::{Fabric, Transport};
 use tessera_engine::sums::Sum;
-use tessera_engine::{Engine, Graph, Grid, Place, Recipe, Settings};
+use tessera_engine::{Engine, Graph, Grid, Knobs, Place, Recipe, Settings};
 use tessera_frontend_comm::{
     Sums, grid, join, meet, p2p, ports, resident, sum_wire_flag, sums_flag,
 };
@@ -102,7 +102,7 @@ impl Ranks {
     }
 
     /// Joins the peers, if any, before a long load.
-    pub(crate) fn join(&self, settings: &Settings) -> Result<Option<Links>, String> {
+    pub(crate) fn join(&self, settings: &Settings, knobs: &Knobs) -> Result<Option<Links>, String> {
         if self.peers.is_empty() && self.rank == 0 {
             return Ok(None);
         }
@@ -116,7 +116,7 @@ impl Ranks {
                 return Err("--sums grid or whole needs --verbs or --ring".into());
             }
             (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
-            (false, Sums::P2p, _) => p2p(&mut *met, settings).map(Grids::Sums),
+            (false, Sums::P2p, _) => p2p(&mut *met, settings, knobs).map(Grids::Sums),
             (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
             (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());

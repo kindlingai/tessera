@@ -19,7 +19,7 @@ fn engine(place: Option<(u32, &str)>, asks: Option<Asks>) -> Engine {
     let g = stepper::<Norm, Swiglu>(&decoder::Config::qwen3_small());
     let stored = weights(&g, &mut Noise(3)).into_iter().map(Weight::Floats);
     let stored: Vec<Weight> = stored.collect();
-    let links = ranks.join(&settings).unwrap();
+    let links = ranks.join(&settings, &Default::default()).unwrap();
     let at = (&Recipe::default(), &settings);
     let mut engine = ranks.open(links, g, 16, at).unwrap();
     engine.load(&stored).unwrap();

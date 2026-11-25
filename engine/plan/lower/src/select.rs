@@ -162,6 +162,7 @@ fn select_with(
     )?
     .with_compute(device.compute);
     tree.config = device.config.clone();
+    tree.knobs = device.knobs.clone();
     tree.kept_rows = device.kept_rows;
     let whole: Vec<&Rule> = rules
         .iter()

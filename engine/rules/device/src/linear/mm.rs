@@ -97,6 +97,15 @@ fn pick_divisor(chunks: usize, want: usize, cap: usize) -> usize {
     1
 }
 
+tessera_lower::knob!("fast_mm_bf16_sk", "splits", 1, 16);
+tessera_lower::knob!("fast_mm_mxfp8_sk", "splits", 1, 16);
+
+/// The split count a rule set, fitted to `chunks`.
+fn set_ks(tree: &Tree, kernel: &str, chunks: usize) -> Option<usize> {
+    let want = tree.knobs.get(kernel, "splits")?;
+    Some(pick_divisor(chunks, want, want))
+}
+
 fn bf16_ks(m: usize, n: usize, k: usize) -> usize {
     let chunks = k / 128;
     let base = (n / 16) * m.div_ceil(16);
@@ -390,7 +399,8 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
                 && k.is_multiple_of(128)
                 && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < 144) =>
         {
-            let ks = bf16_ks(m, n, k);
+            let set = set_ks(tree, "fast_mm_bf16_sk", k / 128);
+            let ks = set.unwrap_or_else(|| bf16_ks(m, n, k));
             if ks > 1 {
                 (MmKind::Bf16SplitK, ks)
             } else {
@@ -404,15 +414,16 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
             )));
         }
         "mxfp8" if n.is_multiple_of(16) && k.is_multiple_of(512) => {
+            let set = set_ks(tree, "fast_mm_mxfp8_sk", k / 512);
             if m <= 8 {
-                let ks = mxfp8_ks(n, k, false);
+                let ks = set.unwrap_or_else(|| mxfp8_ks(n, k, false));
                 if ks > 1 {
                     (MmKind::Mxfp8Split, ks)
                 } else {
                     (MmKind::Mxfp8, 1)
                 }
             } else if m <= 16 {
-                let ks = mxfp8_ks(n, k, true);
+                let ks = set.unwrap_or_else(|| mxfp8_ks(n, k, true));
                 if ks > 1 {
                     (MmKind::Mxfp8WideSplit, ks)
                 } else {

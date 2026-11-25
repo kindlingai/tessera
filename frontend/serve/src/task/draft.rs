@@ -92,7 +92,7 @@ pub(super) fn begin<'a>(load: &'a Load, settings: &Settings, what: &str) -> Resu
         return Err(format!("{what} cannot combine with --guided yet"));
     }
     let start = Instant::now();
-    let links = load.options.ranks.join(settings)?;
+    let links = load.options.ranks.join(settings, &load.options.knobs())?;
     Ok(Begin {
         start,
         links,

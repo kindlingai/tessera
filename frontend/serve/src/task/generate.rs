@@ -32,10 +32,11 @@ pub(super) fn kv_pin(options: &Options, pins: Pins) -> Pins {
     }
 }
 
-/// Folds the recipe's dtype rules, then the flags', into `recipe`.
+/// Folds the recipe's dtype and shape rules, then the flags'.
 pub(super) fn dtyped(options: &Options, mut recipe: Recipe) -> Recipe {
     let filed = options.lower.iter().flat_map(|r| r.dtype.iter());
     recipe.dtype = filed.chain(&options.dtypes).cloned().collect();
+    recipe.shape = options.knobs();
     recipe.settle();
     recipe
 }
@@ -127,7 +128,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let guided = load.on("--guided");
     let start = Instant::now();
-    let links = o.ranks.join(&settings)?;
+    let links = o.ranks.join(&settings, &o.knobs())?;
     let rules = user_rules(&settings)?;
     let (slots, context) = (o.slots as u64, o.max_model_len as u64);
     // Ranks keep one entry, as they did before scoring.

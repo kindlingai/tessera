@@ -63,7 +63,7 @@ where
     };
     let wire = args.sum_wire.unwrap_or(DType::F32);
     let bf16 = wire == DType::Bf16;
-    let mut p2p = P2p::on(ctx, &mut *boot)?.with_schedule(args.sched);
+    let mut p2p = P2p::on(ctx, &mut *boot, &args.shape)?.with_schedule(args.sched);
     let close = |got: f32, want: f32| {
         if bf16 {
             (got - want).abs() <= want.abs() * 0.02 + 1e-2

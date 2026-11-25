@@ -18,7 +18,7 @@ use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsL
 use tessera_engine::p2p;
 use tessera_engine::sums::{self, Sum};
 use tessera_engine::whole;
-use tessera_engine::{DType, Grid, Settings};
+use tessera_engine::{DType, Grid, Knobs, Settings};
 
 /// How long a rank waits for the others.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -103,11 +103,12 @@ pub fn sum_wire_flag(value: &str) -> Option<DType> {
 pub fn p2p(
     met: &mut dyn Transport,
     settings: &Settings,
+    knobs: &Knobs,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let rank = met.rank();
     let device = settings.device.unwrap_or(rank as usize);
     tessera_engine::select(device);
-    let sums = p2p::open(settings.gpu(), met)?;
+    let sums = p2p::open(settings.gpu(), met, knobs)?;
     eprintln!("rank {rank}: sums over direct GPU P2P (device {device})");
     Ok(sums)
 }

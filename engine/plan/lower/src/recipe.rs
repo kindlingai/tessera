@@ -1,7 +1,7 @@
 //! The choices lowering takes, as data a search can edit.
 
 use crate::form::{Load, Pins, Site, matches, named};
-use crate::rule::Rule;
+use crate::rule::{Rule, gather};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 use tessera_codegen::kept::{self, Layout};
@@ -33,6 +33,9 @@ pub struct Recipe {
     /// Dtype overrides by spot. `settle` folds them in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dtype: Vec<Dtype>,
+    /// Kernel shape values by `kernel:knob`.
+    #[serde(default, skip_serializing_if = "Knobs::is_empty")]
+    pub shape: Knobs,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(default)]
     pub favor: Option<String>,
@@ -146,6 +149,7 @@ impl Default for Recipe {
             sums: Wires::default(),
             compute: Compute::default(),
             dtype: Vec::new(),
+            shape: Knobs::default(),
             favor: None,
             require_favored: false,
             barred: Vec::new(),
@@ -317,5 +321,98 @@ impl TryFrom<(String, String)> for Dtype {
 impl From<Dtype> for (String, String) {
     fn from(d: Dtype) -> Self {
         (d.spot, d.value)
+    }
+}
+
+/// One shape number a kernel reads, with its legal range.
+pub struct Knob {
+    pub kernel: &'static str,
+    pub name: &'static str,
+    pub least: u64,
+    pub most: u64,
+}
+
+gather! {
+    #[gather]
+    pub static KNOBS: scattered_collect::ScatteredSlice<Knob>;
+}
+
+/// Declares a knob that shape rules may set.
+#[macro_export]
+macro_rules! knob {
+    ($kernel:literal, $name:literal, $least:expr, $most:expr) => {
+        const _: () = {
+            $crate::rule::scatter! {
+                #[scatter($crate::KNOBS)]
+                static KNOB: $crate::Knob = $crate::Knob {
+                    kernel: $kernel,
+                    name: $name,
+                    least: $least,
+                    most: $most,
+                };
+            }
+        };
+    };
+}
+
+/// Kernel shape values by `kernel:knob`. The last match wins.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<(String, u64)>", into = "Vec<(String, u64)>")]
+pub struct Knobs(Vec<(String, u64)>);
+
+impl Knobs {
+    /// Sets `spot`, a `kernel:knob`, to `value`.
+    pub fn set(&mut self, spot: &str, value: u64) -> Result<(), String> {
+        let named = |k: &&Knob| spot.split_once(':') == Some((k.kernel, k.name));
+        match KNOBS.iter().find(named) {
+            Some(k) if (k.least..=k.most).contains(&value) => {
+                self.0.push((spot.into(), value));
+                Ok(())
+            }
+            Some(k) => Err(format!("`{spot}` takes {} to {}", k.least, k.most)),
+            None => Err(format!("no kernel knob called `{spot}`")),
+        }
+    }
+
+    /// Parses `kernel:knob=value`, the flag form.
+    pub fn parse(&mut self, text: &str) -> Result<(), String> {
+        let pair = text.rsplit_once('=');
+        match pair.and_then(|(spot, v)| Some((spot, v.parse().ok()?))) {
+            Some((spot, value)) => self.set(spot, value),
+            None => Err(format!("`{text}` is not kernel:knob=value")),
+        }
+    }
+
+    /// The value set for `knob` of `kernel`, if any.
+    pub fn get(&self, kernel: &str, knob: &str) -> Option<usize> {
+        let named = |(spot, _): &&(String, u64)| spot.split_once(':') == Some((kernel, knob));
+        self.0.iter().rev().find(named).map(|(_, v)| *v as usize)
+    }
+
+    /// These values, then `later`'s.
+    pub fn then(&self, later: &Knobs) -> Knobs {
+        Knobs(self.0.iter().chain(&later.0).cloned().collect())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl TryFrom<Vec<(String, u64)>> for Knobs {
+    type Error = String;
+
+    fn try_from(pairs: Vec<(String, u64)>) -> Result<Self, String> {
+        let mut knobs = Knobs::default();
+        for (spot, value) in pairs {
+            knobs.set(&spot, value)?;
+        }
+        Ok(knobs)
+    }
+}
+
+impl From<Knobs> for Vec<(String, u64)> {
+    fn from(k: Knobs) -> Self {
+        k.0
     }
 }

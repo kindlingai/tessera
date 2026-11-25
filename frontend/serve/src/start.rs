@@ -15,7 +15,7 @@ use tessera_tasks::api::Info;
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
+[--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering]";
     format!("{head} {} {tail}", task::usage())
 }
@@ -34,6 +34,8 @@ pub struct Options {
     pub kv_dtype: Option<String>,
     /// Dtype overrides by spot, after the recipe's.
     pub dtypes: Vec<tessera_engine::Dtype>,
+    /// Kernel shape values, after the recipe's.
+    pub shapes: tessera_engine::Knobs,
     /// Optional shared paged KV row pool across all slots.
     pub kv_cache_tokens: Option<usize>,
     pub name: Option<String>,
@@ -73,6 +75,7 @@ impl Default for Options {
             max_batch_rows: None,
             kv_dtype: None,
             dtypes: Vec::new(),
+            shapes: Default::default(),
             kv_cache_tokens: None,
             name: None,
             task: "generate",
@@ -92,6 +95,12 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The recipe's kernel shape values, then the flags'.
+    pub fn knobs(&self) -> tessera_engine::Knobs {
+        let filed = self.lower.as_ref().map(|r| r.shape.clone());
+        filed.unwrap_or_default().then(&self.shapes)
+    }
+
     /// Takes a flag with no value. `false` if unknown.
     pub fn switch(&mut self, flag: &str) -> bool {
         match flag {
@@ -129,6 +138,7 @@ impl Options {
                 }
                 self.kv_dtype = Some(form.name().into());
             }
+            "--shape" => self.shapes.parse(&value).ok()?,
             "--dtype" => self.dtypes.push(tessera_engine::Dtype::parse(&value).ok()?),
             "--kv-cache-tokens" => {
                 let n: usize = value.parse().ok()?;

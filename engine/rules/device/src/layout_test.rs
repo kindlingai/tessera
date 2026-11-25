@@ -1,6 +1,6 @@
 use crate::abi::{self, Body, Layout};
 use crate::layout::*;
-use crate::p2p::{CROSSOVER, SLOT_BYTES, Schedule, ack_offset, area_bytes, pick};
+use crate::p2p::{CROSS, CROSSOVER, SLOT_BYTES, Schedule, ack_offset, area_bytes, pick};
 use crate::{Backend, HEADERS, Header, Options, flatten};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -140,21 +140,22 @@ fn indexer_kernel_flattens() {
 fn p2p_layout_and_schedule() {
     assert_eq!(ack_offset(4), 8 * SLOT_BYTES);
     assert_eq!(area_bytes(4), 8 * SLOT_BYTES + 4096);
-    assert_eq!(pick(12 << 10, 4, Schedule::Auto), (0, 1));
-    assert_eq!(pick(CROSSOVER, 4, Schedule::Auto), (2, 4));
-    assert_eq!(pick(CROSSOVER, 8, Schedule::Auto), (2, 4));
-    assert_eq!(pick(CROSSOVER, 3, Schedule::Auto), (1, 4));
-    assert_eq!(pick(CROSSOVER, 6, Schedule::Auto), (1, 4));
-    assert_eq!(pick(CROSSOVER, 2, Schedule::Auto), (0, 4));
-    assert_eq!(pick(1 << 20, 4, Schedule::Auto), (3, 4));
-    assert_eq!(pick(1 << 20, 8, Schedule::Auto), (2, 4));
-    assert_eq!(pick(1 << 20, 4, Schedule::Fanout), (0, 4));
-    assert_eq!(pick(128 << 10, 4, Schedule::Fanout), (0, 4));
-    assert_eq!(pick(1024, 4, Schedule::Rounds), (1, 1));
-    assert_eq!(pick(1024, 4, Schedule::Butterfly), (2, 1));
-    assert_eq!(pick(1024, 8, Schedule::Butterfly), (2, 1));
-    assert_eq!(pick(1024, 4, Schedule::Scatter), (3, 1));
-    assert_eq!(pick(1024, 8, Schedule::Scatter), (2, 1));
-    assert_eq!(pick(1024, 3, Schedule::Butterfly), (1, 1));
-    assert_eq!(pick(1024, 2, Schedule::Butterfly), (0, 1));
+    assert_eq!(pick(12 << 10, 4, Schedule::Auto, CROSS), (0, 1));
+    assert_eq!(pick(12 << 10, 4, Schedule::Auto, [0, 8 << 10]), (3, 4));
+    assert_eq!(pick(CROSSOVER, 4, Schedule::Auto, CROSS), (2, 4));
+    assert_eq!(pick(CROSSOVER, 8, Schedule::Auto, CROSS), (2, 4));
+    assert_eq!(pick(CROSSOVER, 3, Schedule::Auto, CROSS), (1, 4));
+    assert_eq!(pick(CROSSOVER, 6, Schedule::Auto, CROSS), (1, 4));
+    assert_eq!(pick(CROSSOVER, 2, Schedule::Auto, CROSS), (0, 4));
+    assert_eq!(pick(1 << 20, 4, Schedule::Auto, CROSS), (3, 4));
+    assert_eq!(pick(1 << 20, 8, Schedule::Auto, CROSS), (2, 4));
+    assert_eq!(pick(1 << 20, 4, Schedule::Fanout, CROSS), (0, 4));
+    assert_eq!(pick(128 << 10, 4, Schedule::Fanout, CROSS), (0, 4));
+    assert_eq!(pick(1024, 4, Schedule::Rounds, CROSS), (1, 1));
+    assert_eq!(pick(1024, 4, Schedule::Butterfly, CROSS), (2, 1));
+    assert_eq!(pick(1024, 8, Schedule::Butterfly, CROSS), (2, 1));
+    assert_eq!(pick(1024, 4, Schedule::Scatter, CROSS), (3, 1));
+    assert_eq!(pick(1024, 8, Schedule::Scatter, CROSS), (2, 1));
+    assert_eq!(pick(1024, 3, Schedule::Butterfly, CROSS), (1, 1));
+    assert_eq!(pick(1024, 2, Schedule::Butterfly, CROSS), (0, 1));
 }

@@ -17,14 +17,14 @@ use tessera_frontend_comm::{
 use tessera_graph::DimName::{Context, Seqs};
 use tessera_graph::{DType, shard_aligned};
 use tessera_interp::Tensor;
-use tessera_lower::{Cluster, Device, Pick, ZoneKind, lower};
+use tessera_lower::{Cluster, Device, Knobs, Pick, ZoneKind, lower};
 use tessera_models::preset;
 use tessera_run::{Rank, Run, sum_wire};
 
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model NAME] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--sums host|grid|p2p]
+  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--shape KERNEL:KNOB=N]... [--sums host|grid|p2p]
   [--sum-wire f32|bf16|f16] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
@@ -61,6 +61,7 @@ struct Args {
     size: u32,
     /// P2P schedule override for stub runs.
     sched: Schedule,
+    shape: Knobs,
     /// How the model's sums run across ranks.
     sums: Sums,
     /// The dtype each part crosses as. `None`: the transport's.
@@ -98,6 +99,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         stub: None,
         size: 4096,
         sched: Schedule::Auto,
+        shape: Knobs::default(),
         sums: Sums::Host,
         sum_wire: None,
         recipe: None,
@@ -129,6 +131,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--size" => args.size = value.parse().ok().filter(|n| *n > 0)?,
             "--sched" => args.sched = sched_flag(&value)?,
+            "--shape" => args.shape.parse(&value).ok()?,
             "--verbs" => args.fabric = Some(Fabric::Mesh(ports(&value).ok()?)),
             "--ring" => {
                 let (prev, next) = value.split_once('/')?;
@@ -248,7 +251,7 @@ fn join(
         None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
     if args.sums == Sums::P2p {
-        let sum = p2p(&mut *met, settings)?;
+        let sum = p2p(&mut *met, settings, &args.shape)?;
         return Ok((met, Some(sum)));
     }
     if args.sums == Sums::Grid {

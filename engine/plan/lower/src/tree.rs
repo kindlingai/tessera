@@ -4,7 +4,7 @@ use crate::extent::Extent;
 use crate::form::{F32_FORM, Load, Pins, Site};
 use crate::kernels::MapStage;
 use crate::plan::Share;
-use crate::recipe::Compute;
+use crate::recipe::{Compute, Knobs};
 use crate::rule::Rule;
 use crate::select::Home;
 use crate::sites::Pattern;
@@ -89,6 +89,8 @@ pub struct Tree<'a> {
     pub kept_rows: Option<usize>,
     /// Operand precision for matrix-unit kernels.
     pub compute: Compute,
+    /// Kernel shape values the recipe set.
+    pub knobs: Knobs,
     /// Model config JSON for runtime rules.
     pub config: Option<String>,
     /// How split axes divide, and which part this plan is.
@@ -332,6 +334,7 @@ impl<'a> Tree<'a> {
             kept,
             kept_rows: None,
             compute: Compute::default(),
+            knobs: Knobs::default(),
             config: None,
             parts: parts.clone(),
             rank,

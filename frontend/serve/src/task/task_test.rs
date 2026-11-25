@@ -74,4 +74,11 @@ fn dtypes_fold() {
     for bad in ["@sum=fp8", "@nowhere=bf16", "a.*@norm=bf16", "@kept"] {
         assert!(opts.flag("--dtype", bad.into()).is_none(), "{bad}");
     }
+    assert!(opts.flag("--shape", "p2p_sum:threads=256".into()).is_some());
+    assert!(opts.flag("--shape", "p2p_sum:threads=7".into()).is_none());
+    assert!(opts.flag("--shape", "p2p_sum:lanes=64".into()).is_none());
+    assert_eq!(
+        lowering(&opts, None).shape.get("p2p_sum", "threads"),
+        Some(256)
+    );
 }

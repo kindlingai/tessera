@@ -709,7 +709,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
 }  // namespace p2p
 
 // Direct P2P all-reduce: fan-out, rounds, butterfly, or scatter.
-extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum(
+extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_sum(
     const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
     u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     p2p::sum_body<p2p::Wire::F32>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr, me,
@@ -717,7 +717,7 @@ extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum(
 }
 
 // Direct P2P all-reduce using BF16 wire transport and FP32 sum.
-extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum_bf16(
+extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_sum_bf16(
     const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
     u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     p2p::sum_body<p2p::Wire::Bf16>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr,
@@ -725,7 +725,7 @@ extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum_bf16(
 }
 
 // Direct P2P all-reduce using FP16 wire transport and FP32 sum.
-extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum_fp16(
+extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_sum_fp16(
     const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
     u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     p2p::sum_body<p2p::Wire::Fp16>(areas, counters, fault, seq_ptr, from_ptr, to_ptr, total, nr,
@@ -733,7 +733,7 @@ extern "C" __global__ __launch_bounds__(512) void tessera_p2p_sum_fp16(
 }
 
 // Direct P2P all-gather: fan-out (0) or pairwise rounds (1+).
-extern "C" __global__ __launch_bounds__(512) void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
+extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
                                               u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 part,
                                               u32 total, u32 rows, u32 nr, u32 me, u32 sched,
                                               u64 timeout_ticks) {

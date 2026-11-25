@@ -7,6 +7,7 @@ use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, IpcHandle, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_lower::Knobs;
 use tessera_mem::DType;
 use tessera_run::Sum;
 
@@ -32,6 +33,12 @@ const BASE: u64 = 3;
 const RING: usize = 4;
 const CNT_STRIDE: usize = MAX_RANKS + 2;
 const MAX_THREADS: u32 = 512;
+/// Payload bytes where `Auto` leaves fan-out, then picks scatter.
+pub(crate) const CROSS: [usize; 2] = [CROSSOVER, SCATTER_CROSSOVER];
+
+tessera_lower::knob!("p2p_sum", "threads", 32, 1024);
+tessera_lower::knob!("p2p_sum", "crossover", 0, MAX_BYTES as u64);
+tessera_lower::knob!("p2p_sum", "scatter_crossover", 0, MAX_BYTES as u64);
 const LARGE_GRID: u32 = 4;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -63,9 +70,14 @@ pub(crate) const fn ack_offset(ranks: u32) -> usize {
 }
 
 /// Picks `(sched_code, grid_blocks)` for `bytes` across `ranks`.
-pub(crate) const fn pick(bytes: usize, ranks: u32, schedule: Schedule) -> (u32, u32) {
-    let large = bytes >= CROSSOVER;
-    let huge = bytes >= SCATTER_CROSSOVER;
+pub(crate) const fn pick(
+    bytes: usize,
+    ranks: u32,
+    schedule: Schedule,
+    cross: [usize; 2],
+) -> (u32, u32) {
+    let large = bytes >= cross[0];
+    let huge = bytes >= cross[1];
     let pow2 = ranks.is_power_of_two();
     let sched = match schedule {
         Schedule::Fanout => 0,
@@ -142,6 +154,7 @@ pub struct P2p<D: Device> {
     rank: u32,
     ranks: u32,
     threads: u32,
+    cross: [usize; 2],
     timeout_ticks: u64,
     schedule: Schedule,
     broken: bool,
@@ -194,7 +207,7 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
     /// Opens direct P2P on `ctx`, exchanging IPC handles over `boot`.
-    pub fn on(ctx: &D, boot: &mut dyn Transport) -> Result<Self, Error> {
+    pub fn on(ctx: &D, boot: &mut dyn Transport, knobs: &Knobs) -> Result<Self, Error> {
         let (rank, ranks) = (boot.rank(), boot.ranks());
         if ranks < 2 || ranks as usize > MAX_RANKS || rank >= ranks {
             let what = format!("p2p rank {rank} of {ranks} (supports 2..={MAX_RANKS})");
@@ -205,7 +218,19 @@ where
             remote_kv: false,
             marks: false,
         };
+        let most = knobs
+            .get("p2p_sum", "threads")
+            .map_or(MAX_THREADS, |t| t as u32);
+        let limit = ctx.platform().limits.group_threads as u32;
+        let threads = (limit.min(most) & !31).max(32);
+        let cross = [
+            knobs.get("p2p_sum", "crossover").unwrap_or(CROSS[0]),
+            knobs
+                .get("p2p_sum", "scatter_crossover")
+                .unwrap_or(CROSS[1]),
+        ];
         let text = flatten("p2p.kernel", KERNEL, &|_| None, &options)?.text;
+        let text = format!("#define P2P_THREADS {threads}\n{text}");
         let kernel = ctx.compile(&text, ENTRY)?;
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
         let bf16_kernel = ctx.compile(&text, BF16_ENTRY)?;
@@ -255,7 +280,6 @@ where
         // Wait until every peer opened all handles.
         boot.exchange(&[])?;
 
-        let threads = (ctx.platform().limits.group_threads as u32).clamp(1, MAX_THREADS);
         Ok(P2p {
             ctx: ctx.clone(),
             kernel,
@@ -271,6 +295,7 @@ where
             rank,
             ranks,
             threads,
+            cross,
             timeout_ticks,
             schedule: Schedule::Auto,
             broken: false,
@@ -293,7 +318,7 @@ where
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
-        let (sched, grid) = pick(n as usize * 4, self.ranks, self.schedule);
+        let (sched, grid) = pick(n as usize * 4, self.ranks, self.schedule, self.cross);
         let mut args = KernelArgs::new();
         args.device_ptr(self.areas.device_ptr())
             .device_ptr(self.counters.device_ptr())
@@ -328,7 +353,7 @@ where
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
-        let (sched, grid) = pick(total as usize * 4, self.ranks, self.schedule);
+        let (sched, grid) = pick(total as usize * 4, self.ranks, self.schedule, self.cross);
         let mut args = KernelArgs::new();
         args.device_ptr(self.areas.device_ptr())
             .device_ptr(self.counters.device_ptr())
@@ -443,17 +468,21 @@ where
     }
 }
 
-struct Start<'a>(&'a mut dyn Transport);
+struct Start<'a>(&'a mut dyn Transport, &'a Knobs);
 
 impl OnGpu for Start<'_> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Ok(Box::new(P2p::on(cached_context::<D>()?, self.0)?))
+        Ok(Box::new(P2p::on(cached_context::<D>()?, self.0, self.1)?))
     }
 }
 
 /// Direct P2P sums on the GPU `gpu` names.
-pub fn open(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot))
+pub fn open(
+    gpu: Option<Gpu>,
+    boot: &mut dyn Transport,
+    knobs: &Knobs,
+) -> Result<Box<dyn Sum>, Error> {
+    persistent(gpu, Start(boot, knobs))
 }
