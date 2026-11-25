@@ -1,9 +1,9 @@
-//! Tensor-Core grouped-Q split-K MLA and GQA attention rules for CUDA.
+//! Tensor-Core MLA, GQA, and Lightning Indexer rules for CUDA.
 
 use crate::linear::{CUDA_LACKS, f32_only};
 use crate::{Backend, Options, flatten};
 use std::sync::OnceLock;
-use tessera_graph::{Op, Order};
+use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, ByBackend, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term,
@@ -404,3 +404,222 @@ fn propose_gqa(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 
 tessera_lower::rule!("fast_mla_attend", propose_mla);
 tessera_lower::rule!("fast_gqa_attend", propose_gqa);
+
+const IDX_SM_WORDS: usize = 4608;
+const IDX_SMEM: usize = IDX_SM_WORDS * 8 + 128 * 4;
+const IDX_MAX_HEADS: usize = 128;
+
+fn idx_kv_entry(kv: &str) -> Option<&'static str> {
+    match kv {
+        "fp8" => Some("tessera_indexer_fp8"),
+        "bf16" => Some("tessera_indexer_bf16"),
+        "f32" => Some("tessera_indexer_f32"),
+        _ => None,
+    }
+}
+
+fn idx_tile_keys(rows: usize) -> usize {
+    if rows <= 4 { 64 } else { 256 }
+}
+
+/// Tensor-Core Lightning Indexer over dense kept keys.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "fast_indexer",
+    sizes = [self.rows, self.out_keys, self.heads, self.dim],
+    work = self.rows * self.out_keys * self.heads * self.dim,
+    accepts = idx_accepts,
+    emits = f32_only,
+    needs = idx_needs(),
+    order = Order::PerConfig,
+    source = attend_entry(self.entry),
+    launches = idx_launches,
+    load = idx_load,
+    unproven,
+)]
+struct FastIndexer {
+    rows: usize,
+    out_keys: usize,
+    keys: Extent,
+    context: usize,
+    heads: usize,
+    dim: usize,
+    masked: bool,
+    k_form: &'static dyn Stored,
+    entry: &'static str,
+}
+
+fn idx_accepts(k: &FastIndexer, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        0 | 2 => form.name() == "f32",
+        1 => form.name() == k.k_form.name(),
+        _ => form.name() == "u32",
+    }
+}
+
+fn idx_needs() -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes: IDX_SMEM,
+        group_threads: 128,
+        compiler: true,
+        lacks: CUDA_LACKS,
+        bf16_tile: true,
+        ..Needs::default()
+    }
+}
+
+fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
+    let tk = idx_tile_keys(k.rows);
+    let blocks_x = k.out_keys.div_ceil(tk);
+    let q_bytes = (4 * k.rows * k.heads * k.dim) as f64;
+    let k_bytes = k.k_form.bytes(k.rows * k.out_keys * k.dim) as f64;
+    let out_bytes = (4 * k.rows * k.out_keys) as f64;
+    Some(Load {
+        threads: blocks_x * k.rows * 128,
+        group: 128,
+        trips: tk.div_ceil(64) as f64 * (k.heads / 16) as f64,
+        reads: vec![k_bytes, q_bytes],
+        written: out_bytes,
+        flight: 1024.0,
+        ..Load::default()
+    })
+}
+
+fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
+    let tk = idx_tile_keys(k.rows);
+    let shape = Shape::Grid {
+        across: k.out_keys.div_ceil(tk),
+        down: k.rows,
+        threads: 128,
+    };
+    let args = vec![
+        step.read(0),
+        step.read(1),
+        step.read(2),
+        step.read(3),
+        step.read(4),
+        step.out(),
+        Arg::count(k.rows),
+        Arg::count(k.out_keys),
+        Arg::size(k.keys),
+        Arg::count(k.context),
+        Arg::count(k.heads),
+        Arg::count(k.dim),
+        Arg::count(usize::from(k.masked)),
+        Arg::count(tk),
+    ];
+    vec![Launch { args, shape }]
+}
+
+/// Matches the stepped ragged Lightning Indexer over dense kept keys.
+fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    if tree.kept.name() != "dense" {
+        return None;
+    }
+    let node = tree.node(at);
+    let (masked_pos, mut cur) = match &node.term {
+        Term::Stage(Stage::Causal) => (Some(node.args[1]), node.args[0]),
+        Term::Op(Op::Matmul) => (None, at),
+        _ => return None,
+    };
+    if matches!(tree.node(cur).term, Term::Op(Op::View(View::Reshape(_)))) {
+        cur = tree.node(cur).args[0];
+    }
+    let mm_node = tree.node(cur);
+    if mm_node.term != Term::Op(Op::Matmul) {
+        return None;
+    }
+    let (hits_perm, by_head) = (mm_node.args[0], mm_node.args[1]);
+    let perm_node = tree.node(hits_perm);
+    let Term::Op(Op::View(View::Permute(order))) = &perm_node.term else {
+        return None;
+    };
+    if perm_node.shape.len() != 3 || order.as_slice() != [0, 2, 1] {
+        return None;
+    }
+    let (rows, out_keys, heads) = (perm_node.shape[0], perm_node.shape[1], perm_node.shape[2]);
+    let w_node = tree.node(by_head);
+    if w_node.shape != [rows, 1, heads] || w_node.form.name() != "f32" {
+        return None;
+    }
+    let hits_relu = perm_node.args[0];
+    if tree.node(hits_relu).term != Term::Stage(Stage::Act(Act::Relu)) {
+        return None;
+    }
+    let hits_node = tree.node(tree.node(hits_relu).args[0]);
+    if hits_node.term != Term::Op(Op::Matmul) {
+        return None;
+    }
+    let (q, k_src) = (hits_node.args[0], hits_node.args[1]);
+    let q_node = tree.node(q);
+    if q_node.shape.len() != 3
+        || q_node.shape[0] != rows
+        || q_node.shape[1] != heads
+        || q_node.form.name() != "f32"
+        || q_node.extents[0].runtime()
+    {
+        return None;
+    }
+    let dim = q_node.shape[2];
+    if node.form.name() != "f32" || tree.elements(at) != rows * out_keys {
+        return None;
+    }
+    let stride = dim / 2 + 2;
+    if rows == 0
+        || !(16..=IDX_MAX_HEADS).contains(&heads)
+        || !heads.is_multiple_of(16)
+        || dim < 16
+        || !dim.is_multiple_of(16)
+        || heads * stride > IDX_SM_WORDS
+        || 64 * stride > IDX_SM_WORDS
+    {
+        return None;
+    }
+    let gather = tree.node(k_src);
+    if gather.term != Term::Op(Op::Select(Select::Gather)) {
+        return None;
+    }
+    let (k_append, slots) = (gather.args[0], gather.args[1]);
+    let k_node = tree.node(k_append);
+    let Term::Op(Op::Append(ki)) = k_node.term else {
+        return None;
+    };
+    let &[_, k_keys, k_dim] = &k_node.shape[..] else {
+        return None;
+    };
+    if k_keys != out_keys || k_dim != dim {
+        return None;
+    }
+    let entry = idx_kv_entry(k_node.form.name())?;
+    if tree.elements(slots) != rows || tree.node(slots).form.dtype() != DType::U32 {
+        return None;
+    }
+    let (_, context) = tree.kept_rows(ki)?;
+    let keys = k_node.extents[1];
+    let (masked, positions) = match masked_pos {
+        Some(pos) => {
+            if tree.elements(pos) != rows || tree.node(pos).form.dtype() != DType::U32 {
+                return None;
+            }
+            (true, pos)
+        }
+        None if !keys.runtime() => (false, slots),
+        None => return None,
+    };
+    let kernel = FastIndexer {
+        rows,
+        out_keys,
+        keys,
+        context,
+        heads,
+        dim,
+        masked,
+        k_form: k_node.form,
+        entry,
+    };
+    let reads = [q, k_append, by_head, slots, positions];
+    Some(vec![Draft::new(kernel, reads, rows * out_keys)])
+}
+
+tessera_lower::rule!("fast_indexer", propose_indexer);

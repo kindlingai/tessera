@@ -9,6 +9,14 @@ static __device__ __forceinline__ float attn_neg_inf() {
     return __int_as_float(0xff800000u);
 }
 
+static __device__ __forceinline__ void attn_fma4(float4& sum, const float* p, float w) {
+    float4 v = *reinterpret_cast<const float4*>(p);
+    sum.x = fmaf(v.x, w, sum.x);
+    sum.y = fmaf(v.y, w, sum.y);
+    sum.z = fmaf(v.z, w, sum.z);
+    sum.w = fmaf(v.w, w, sum.w);
+}
+
 static __device__ __forceinline__ u32 attn_e4m3_f16x2(u16 q) {
     u32 h;
     asm("{.reg .b16 t; mov.b16 t, %1; cvt.rn.f16x2.e4m3x2 %0, t;}" : "=r"(h) : "h"(q));
@@ -390,13 +398,7 @@ extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
         u32 d4 = tid << 2;
         for (u32 s = 0u; s < splits; s++) {
             float w = s_w[s];
-            if (w > 0.0f) {
-                float4 v = *reinterpret_cast<const float4*>(base + u64(s) * 580ull + d4);
-                sum.x = fmaf(v.x, w, sum.x);
-                sum.y = fmaf(v.y, w, sum.y);
-                sum.z = fmaf(v.z, w, sum.z);
-                sum.w = fmaf(v.w, w, sum.w);
-            }
+            if (w > 0.0f) attn_fma4(sum, base + u64(s) * 580ull + d4, w);
         }
         *reinterpret_cast<float4*>(out + u64(list) * 576ull + d4) =
             make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
@@ -615,16 +617,198 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_gqa_reduce(
     u32 d4 = lane << 2;
     for (u32 s = 0u; s < splits; s++) {
         float w = __shfl_sync(0xFFFFFFFFu, my_w, s);
-        if (w > 0.0f) {
-            float4 v = *reinterpret_cast<const float4*>(base + u64(s) * 132ull + d4);
-            sum.x = fmaf(v.x, w, sum.x);
-            sum.y = fmaf(v.y, w, sum.y);
-            sum.z = fmaf(v.z, w, sum.z);
-            sum.w = fmaf(v.w, w, sum.w);
-        }
+        if (w > 0.0f) attn_fma4(sum, base + u64(s) * 132ull + d4, w);
     }
     *reinterpret_cast<float4*>(out + u64(list) * 128ull + d4) =
         make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
+}
+
+constexpr u32 IDX_SM_WORDS = 4608u;
+
+struct alignas(16) idx_smem {
+    u32 q[IDX_SM_WORDS];
+    u32 k[IDX_SM_WORDS];
+    float w[128];
+};
+
+static __device__ __forceinline__ u32 idx_f32x2_bf16x2(float lo, float hi) {
+    u32 out;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
+    return out;
+}
+
+static __device__ __forceinline__ u32 idx_e4m3x2_bf16x2(u16 q) {
+    u32 h = attn_e4m3_f16x2(q);
+    return idx_f32x2_bf16x2(trellis::f16_to_f32(h & 0xFFFFu), trellis::f16_to_f32(h >> 16u));
+}
+
+static __device__ __forceinline__ void idx_mma_bf16(float d[4], const u32 a[4], const u32 b[2]) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template <u32 KV_FMT>
+static __device__ __forceinline__ void idx_load_k16(const void* k_ptr, u32* sk, u32 slot,
+                                                    u32 context, u32 dim, u32 stride, u32 j0,
+                                                    u32 to, u32 lane) {
+    u32 q_words = dim >> 2;
+    u32 total_k4 = q_words << 4;
+    const u8* k_u8 = static_cast<const u8*>(k_ptr);
+    const u16* k_u16 = static_cast<const u16*>(k_ptr);
+    const float* k_f32 = static_cast<const float*>(k_ptr);
+    for (u32 idx = lane; idx < total_k4; idx += 32u) {
+        u32 kr = idx / q_words;
+        u32 q4 = idx % q_words;
+        u32 j = j0 + kr;
+        uint2 pack = make_uint2(0u, 0u);
+        if (j < to) {
+            u64 base = (u64(slot) * context + j) * dim + (u64(q4) << 2);
+            if constexpr (KV_FMT == 0u) {
+                u32 raw = *reinterpret_cast<const u32*>(k_u8 + base);
+                pack = make_uint2(idx_e4m3x2_bf16x2(static_cast<u16>(raw)),
+                                  idx_e4m3x2_bf16x2(static_cast<u16>(raw >> 16)));
+            } else if constexpr (KV_FMT == 1u) {
+                pack = *reinterpret_cast<const uint2*>(k_u16 + base);
+            } else {
+                float4 v = *reinterpret_cast<const float4*>(k_f32 + base);
+                pack = make_uint2(idx_f32x2_bf16x2(v.x, v.y), idx_f32x2_bf16x2(v.z, v.w));
+            }
+        }
+        *reinterpret_cast<uint2*>(sk + kr * stride + (q4 << 1)) = pack;
+    }
+}
+
+template <u32 KV_FMT>
+static __device__ __forceinline__ void idx_body(const float* q, const void* k_ptr,
+                                                const float* weights, const u32* slots,
+                                                const u32* positions, float* out, u32 rows,
+                                                u32 out_keys, u32 live_keys, u32 context,
+                                                u32 heads, u32 dim, u32 masked, u32 tile_keys,
+                                                idx_smem& sm) {
+    u32 row = blockIdx.y;
+    if (row >= rows) return;
+    u32 j_begin = blockIdx.x * tile_keys;
+    u32 j_end = j_begin + tile_keys;
+    if (j_end > out_keys) j_end = out_keys;
+    if (j_begin >= j_end) return;
+
+    u32 tid = threadIdx.x;
+    u32 slot = slots[row];
+    u32 to = live_keys;
+    if (masked == 1u) {
+        u32 pos = positions[row];
+        if (pos < to) to = pos + 1u;
+    }
+    float* out_row = out + u64(row) * out_keys;
+    float neg = attn_neg_inf();
+
+    // Early exit for fully masked causal tiles.
+    if (j_begin >= to) {
+        for (u32 j = j_begin + tid; j < j_end; j += 128u) {
+            out_row[j] = neg;
+        }
+        return;
+    }
+
+    if (tid < heads) {
+        sm.w[tid] = weights[u64(row) * heads + tid];
+    }
+    u32 stride = (dim >> 1) + 2u;
+    u32 q_words = dim >> 2;
+    u32 total_q4 = heads * q_words;
+    const float* q_base = q + u64(row) * heads * dim;
+    for (u32 idx = tid; idx < total_q4; idx += 128u) {
+        u32 h = idx / q_words;
+        u32 q4 = idx % q_words;
+        float4 v = *reinterpret_cast<const float4*>(q_base + u64(h) * dim + (u64(q4) << 2));
+        uint2 pack = make_uint2(idx_f32x2_bf16x2(v.x, v.y), idx_f32x2_bf16x2(v.z, v.w));
+        *reinterpret_cast<uint2*>(sm.q + h * stride + (q4 << 1)) = pack;
+    }
+    prim::block_sync();
+
+    u32 warp = tid >> 5;
+    u32 lane = tid & 31u;
+    u32 g = lane >> 2;
+    u32 t = lane & 3u;
+    u32* sk = sm.k + warp * 16u * stride;
+    u32 d_steps = dim >> 4;
+
+    for (u32 j0 = j_begin + (warp << 4); j0 < j_end; j0 += 64u) {
+        if (j0 >= to) {
+            if (lane < 16u && j0 + lane < j_end) out_row[j0 + lane] = neg;
+            continue;
+        }
+        idx_load_k16<KV_FMT>(k_ptr, sk, slot, context, dim, stride, j0, to, lane);
+        __syncwarp();
+
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (u32 h0 = 0u; h0 < heads; h0 += 16u) {
+            float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (u32 ds = 0u; ds < d_steps; ds++) {
+                u32 k0 = ds << 3;
+                u32 a[4] = {
+                    sm.q[(h0 + g) * stride + k0 + t],
+                    sm.q[(h0 + g + 8u) * stride + k0 + t],
+                    sm.q[(h0 + g) * stride + k0 + t + 4u],
+                    sm.q[(h0 + g + 8u) * stride + k0 + t + 4u],
+                };
+                u32 b0[2] = {sk[g * stride + k0 + t], sk[g * stride + k0 + t + 4u]};
+                u32 b1[2] = {sk[(g + 8u) * stride + k0 + t], sk[(g + 8u) * stride + k0 + t + 4u]};
+                idx_mma_bf16(s0, a, b0);
+                idx_mma_bf16(s1, a, b1);
+            }
+            float w0 = sm.w[h0 + g];
+            float w1 = sm.w[h0 + g + 8u];
+            acc[0] += fmaxf(s0[0], 0.0f) * w0 + fmaxf(s0[2], 0.0f) * w1;
+            acc[1] += fmaxf(s0[1], 0.0f) * w0 + fmaxf(s0[3], 0.0f) * w1;
+            acc[2] += fmaxf(s1[0], 0.0f) * w0 + fmaxf(s1[2], 0.0f) * w1;
+            acc[3] += fmaxf(s1[1], 0.0f) * w0 + fmaxf(s1[3], 0.0f) * w1;
+        }
+#pragma unroll
+        for (u32 i = 0u; i < 4u; i++) {
+            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 4u);
+            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 8u);
+            acc[i] += __shfl_xor_sync(0xFFFFFFFFu, acc[i], 16u);
+        }
+        if (g == 0u) {
+            u32 k0 = j0 + (t << 1);
+            u32 k2 = j0 + 8u + (t << 1);
+            if (k0 < j_end) out_row[k0] = (k0 < to) ? acc[0] : neg;
+            if (k0 + 1u < j_end) out_row[k0 + 1u] = (k0 + 1u < to) ? acc[1] : neg;
+            if (k2 < j_end) out_row[k2] = (k2 < to) ? acc[2] : neg;
+            if (k2 + 1u < j_end) out_row[k2 + 1u] = (k2 + 1u < to) ? acc[3] : neg;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128) void tessera_indexer_fp8(
+    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
+    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
+    u32 tile_keys) {
+    __shared__ idx_smem sm;
+    idx_body<0u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
+                 dim, masked, tile_keys, sm);
+}
+
+extern "C" __global__ __launch_bounds__(128) void tessera_indexer_bf16(
+    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
+    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
+    u32 tile_keys) {
+    __shared__ idx_smem sm;
+    idx_body<1u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
+                 dim, masked, tile_keys, sm);
+}
+
+extern "C" __global__ __launch_bounds__(128) void tessera_indexer_f32(
+    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
+    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
+    u32 tile_keys) {
+    __shared__ idx_smem sm;
+    idx_body<2u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
+                 dim, masked, tile_keys, sm);
 }
 
 #endif

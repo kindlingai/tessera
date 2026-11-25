@@ -119,6 +119,24 @@ fn p2p_kernel_flattens() {
 }
 
 #[test]
+fn indexer_kernel_flattens() {
+    let source = include_str!("attend/mla.cu");
+    let options = Options {
+        backend: Backend::Cuda,
+        remote_kv: false,
+        marks: false,
+    };
+    let flat = flatten("mla.kernel", source, &|_| None, &options).unwrap();
+    for entry in [
+        "tessera_indexer_fp8",
+        "tessera_indexer_bf16",
+        "tessera_indexer_f32",
+    ] {
+        assert!(flat.text.contains(entry), "missing {entry}");
+    }
+}
+
+#[test]
 fn p2p_layout_and_schedule() {
     assert_eq!(ack_offset(4), 8 * SLOT_BYTES);
     assert_eq!(area_bytes(4), 8 * SLOT_BYTES + 4096);
