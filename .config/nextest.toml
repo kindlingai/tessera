@@ -12,6 +12,12 @@ filter = 'binary_id(tessera-parity::parity) & test(/::(golden|gpu|reference_chec
 test-group = 'checkpoint'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# One full klein transformer step on the host CPU.
+[[profile.default.overrides]]
+filter = 'binary_id(tessera-tasks) & test(=flow_test::matches_torch)'
+test-group = 'checkpoint'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 2 }
