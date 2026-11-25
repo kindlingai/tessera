@@ -1,5 +1,7 @@
 //! How reducing ops round and order their sums.
 
+use crate::node::{Graph, Op};
+use crate::stages::Stage;
 use crate::types::DType;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,9 @@ pub struct Numerics {
     pub accumulate: DType,
     pub order: Order,
     pub math: Math,
+    /// Each rank's part rounds to this before a cross-rank add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<DType>,
 }
 
 impl Default for Numerics {
@@ -19,6 +24,33 @@ impl Default for Numerics {
             accumulate: DType::F32,
             order: Order::Fixed,
             math: Math::Exact,
+            wire: None,
+        }
+    }
+}
+
+impl Numerics {
+    /// Exact sums whose parts cross ranks as `wire`.
+    pub fn pinned(wire: DType) -> Self {
+        Self {
+            wire: Some(wire),
+            ..Self::default()
+        }
+    }
+}
+
+/// Whether `op` sums parts across ranks.
+pub(crate) fn sums_ranks(op: &Op) -> bool {
+    matches!(op, Op::Row(r) if r.0.contains(&Stage::AllReduce))
+}
+
+impl Graph {
+    /// Gives every cross-rank sum the model left unpinned `wire`.
+    pub fn resolve_wire(&mut self, wire: DType) {
+        for n in &mut self.nodes {
+            if let (true, Some(num)) = (sums_ranks(&n.op), &mut n.numerics) {
+                num.wire.get_or_insert(wire);
+            }
         }
     }
 }

@@ -151,6 +151,17 @@ fn reduce_makes_partials_whole() {
     let whole = push(&mut g, Op::Row(Row(vec![Stage::AllReduce])), &[d]);
     push(&mut g, Op::Row(Row(vec![Stage::Add])), &[x, whole]);
     verify(&g).unwrap();
+    // Wires belong on cross-rank sums, as F32 or Bf16.
+    let sum = whole.0 as usize;
+    for (at, wire, ok) in [(sum, DType::F16, false), (d.0 as usize, DType::F32, false)] {
+        let mut bad = g.clone();
+        bad.nodes[at].numerics = Some(Numerics::pinned(wire));
+        assert_eq!(verify(&bad).is_ok(), ok, "{wire:?} on node {at}");
+    }
+    g.nodes[sum].numerics = Some(Numerics::pinned(DType::F32));
+    g.resolve_wire(DType::Bf16);
+    assert_eq!(g.nodes[sum].numerics.unwrap().wire, Some(DType::F32));
+    verify(&g).unwrap();
 }
 
 #[test]

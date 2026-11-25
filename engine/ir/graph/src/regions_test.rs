@@ -20,12 +20,14 @@ const STRICT: Numerics = Numerics {
     accumulate: DType::F32,
     order: Order::Fixed,
     math: Math::Exact,
+    wire: None,
 };
 
 const RELAXED: Numerics = Numerics {
     accumulate: DType::F16,
     order: Order::Any,
     math: Math::Approx,
+    wire: None,
 };
 
 const INT: Numerics = Numerics {

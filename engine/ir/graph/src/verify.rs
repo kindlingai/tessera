@@ -4,7 +4,7 @@ use crate::dims::{Dim, DimExpr, Shape, Size};
 use crate::infer::{ErrorKind, TypeError, elements, infer, need, same_shape};
 use crate::json::VERSION;
 use crate::node::{Graph, Op};
-use crate::numerics::Numerics;
+use crate::numerics::{Numerics, sums_ranks};
 use crate::regions;
 use crate::types::{DType, Placement, TensorType};
 use std::fmt;
@@ -160,6 +160,21 @@ fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {
     let acc = n.map(|n| n.accumulate);
     need(acc.is_none_or(DType::is_float), ErrorKind::Numerics, || {
         format!("accumulator {acc:?} is not a float")
+    })?;
+    let Some(Numerics {
+        accumulate,
+        wire: Some(wire),
+        ..
+    }) = n.copied()
+    else {
+        return Ok(());
+    };
+    need(sums_ranks(op), ErrorKind::Numerics, || {
+        format!("{op:?} sums on one rank but has a wire dtype")
+    })?;
+    let carried = matches!(wire, DType::F32 | DType::Bf16) && wire.bytes() <= accumulate.bytes();
+    need(carried, ErrorKind::Numerics, || {
+        format!("wire {wire:?} must be F32 or Bf16 and no wider than {accumulate:?}")
     })
 }
 
