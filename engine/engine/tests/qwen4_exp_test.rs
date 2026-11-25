@@ -408,6 +408,11 @@ fn commit_matches_steps() {
             assert_eq!(bits(&spec.recurrent_state().unwrap()), bits(&before));
             spec.commit(kept).unwrap();
             let (want_ids, want_taps) = plain.step_taps(&drafts[..kept]).unwrap();
+            // A commit with no verify before it stores nothing.
+            let stored = bits(&plain.recurrent_state().unwrap());
+            spec.commit(kept).unwrap();
+            plain.commit(kept).unwrap();
+            assert_eq!(bits(&plain.recurrent_state().unwrap()), stored);
             assert_eq!(ids[..kept], want_ids);
             assert_eq!(bits(&taps[..want_taps.len()]), bits(&want_taps));
             let (got, want) = (spec.recurrent_state(), plain.recurrent_state());
