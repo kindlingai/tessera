@@ -113,6 +113,55 @@ where
             wrong += usize::from(v != want);
         }
     }
+    // Verify multi-row P2P all-gather (direct and graphed).
+    let rows = if n >= 4 && n.is_multiple_of(4) { 4 } else { 1 };
+    let total = n * ranks as usize;
+    let g_out = DeviceBuffer::alloc(ctx, total * 4)?;
+    g_out.zero()?;
+    let g_ok = p2p.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
+    if g_ok {
+        p2p.check()?;
+        let mut g_got = vec![0f32; total];
+        g_out.read_f32(&mut g_got)?;
+        let local_w = n / rows;
+        let cols = total / rows;
+        for r in 0..rows {
+            for k in 0..ranks as usize {
+                for c in 0..local_w {
+                    let src_i = r * local_w + c;
+                    let want = ((k as u32 + 1) * (src_i as u32 % 97)) as f32;
+                    let got_v = g_got[r * cols + k * local_w + c];
+                    wrong += usize::from(got_v != want);
+                }
+            }
+        }
+        if ctx.graphs() && p2p.capturable() {
+            g_out.zero()?;
+            let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
+                p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
+                let ok = p2p.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
+                if !ok {
+                    return Err("p2p gather declined inside graph".into());
+                }
+                Ok(())
+            })?;
+            for _ in 0..4 {
+                ctx.replay(&graph)?;
+            }
+            p2p.check()?;
+            g_out.read_f32(&mut g_got)?;
+            for r in 0..rows {
+                for k in 0..ranks as usize {
+                    for c in 0..local_w {
+                        let src_i = r * local_w + c;
+                        let want = ((k as u32 + 1) * (src_i as u32 % 97)) as f32;
+                        let got_v = g_got[r * cols + k * local_w + c];
+                        wrong += usize::from(got_v != want);
+                    }
+                }
+            }
+        }
+    }
     let us = elapsed * 1e6 / f64::from(rounds);
     let gbs = (bytes as f64 * f64::from(ranks - 1)) / (us * 1e3);
     eprintln!(

@@ -11,6 +11,7 @@ use tessera_run::Sum;
 
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
 const ENTRY: &str = "tessera_p2p_sum";
+const GATHER_ENTRY: &str = "tessera_p2p_gather";
 
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
@@ -108,6 +109,7 @@ impl<D: Device> Drop for Peers<D> {
 pub struct P2p<D: Device> {
     ctx: D,
     kernel: D::Kernel,
+    gather_kernel: D::Kernel,
     _peers: Peers<D>,
     _area: DeviceBuffer<D>,
     areas: DeviceBuffer<D>,
@@ -182,6 +184,7 @@ where
         };
         let text = flatten("p2p.kernel", KERNEL, &|_| None, &options)?.text;
         let kernel = ctx.compile(&text, ENTRY)?;
+        let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
 
         let area = DeviceBuffer::alloc(ctx, area_bytes(ranks))?;
         area.zero()?;
@@ -231,6 +234,7 @@ where
         Ok(P2p {
             ctx: ctx.clone(),
             kernel,
+            gather_kernel,
             _peers: peers,
             _area: area,
             areas,
@@ -283,6 +287,40 @@ where
             .launch(&self.kernel, blocks, threads, 0, &mut args)?)
     }
 
+    fn launch_gather(
+        &mut self,
+        from: u64,
+        to: u64,
+        part: u32,
+        total: u32,
+        rows: u32,
+    ) -> Result<(), Error> {
+        if self.broken {
+            return Err(Error::Plan("an earlier p2p sum failed".into()));
+        }
+        let (sched, grid) = pick(total as usize * 4, self.ranks, self.schedule);
+        let mut args = KernelArgs::new();
+        args.device_ptr(self.areas.device_ptr())
+            .device_ptr(self.counters.device_ptr())
+            .device_ptr(self.fault.device_ptr())
+            .device_ptr(self.seq.device_ptr())
+            .u64(from)
+            .u64(to)
+            .u32(part)
+            .u32(total)
+            .u32(rows)
+            .u32(self.ranks)
+            .u32(self.rank)
+            .u32(sched)
+            .u64(self.timeout_ticks);
+        self.ctx.programmatic(false);
+        let blocks = (grid, 1, 1);
+        let threads = (self.threads, 1, 1);
+        Ok(self
+            .ctx
+            .launch(&self.gather_kernel, blocks, threads, 0, &mut args)?)
+    }
+
     fn status(&mut self) -> Result<(), Error> {
         self.ctx.finish()?;
         let mut raw = [0u8; 4];
@@ -316,6 +354,40 @@ where
         }
         self.launch_sum(from, to, n)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn gather(
+        &mut self,
+        from: u64,
+        to: u64,
+        part: usize,
+        total: usize,
+        rows: usize,
+    ) -> Result<bool, tessera_run::Error> {
+        if self.broken {
+            return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
+                "an earlier p2p sum failed".into(),
+            ))));
+        }
+        let fits = rows > 0
+            && part > 0
+            && total > 0
+            && part.is_multiple_of(rows)
+            && total.is_multiple_of(rows)
+            && total / rows <= MAX_FLOATS;
+        if !fits {
+            return Ok(false);
+        }
+        let (Ok(part), Ok(total), Ok(rows)) = (
+            u32::try_from(part),
+            u32::try_from(total),
+            u32::try_from(rows),
+        ) else {
+            return Ok(false);
+        };
+        self.launch_gather(from, to, part, total, rows)
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        Ok(true)
     }
 
     fn capturable(&self) -> bool {

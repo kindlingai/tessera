@@ -19,6 +19,10 @@ TESSERA_FN u64* tail_of(u64 area, u64 seq, u32 src, u32 nr) {
     return reinterpret_cast<u64*>(area + slot_off(seq, src, nr) + MAX_BYTES);
 }
 
+TESSERA_FN u64* size_of(u64 area, u64 seq, u32 src, u32 nr) {
+    return tail_of(area, seq, src, nr) + 1;
+}
+
 TESSERA_FN u64* ack_of(u64 area, u32 nr, u32 peer) {
     return reinterpret_cast<u64*>(area + 2ull * nr * SLOT_BYTES) + peer;
 }
@@ -195,6 +199,56 @@ TESSERA_FN void add_slice(u64 mine, u64 seq, u32 prev, u32 nr, float* dst_buf, u
     }
 }
 
+TESSERA_FN bool exchange_all(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u32 nr,
+                             u32 sched, bool pow2, const float* src, u32 n, u32 lo4, u32 hi4,
+                             bool aligned_src, u64 meta, u64 deadline, u32* fault, int* stop) {
+    if (sched == 0) {
+        for (u32 k = 1; k < nr; k++) {
+            u32 peer = (me + k) % nr;
+            if (!spin_ge(ack_of(mine, nr, peer), seq - 2, deadline, fault, stop)) return false;
+        }
+        for (u32 k = 1; k < nr; k++) {
+            u32 peer = (me + k) % nr;
+            write_slice(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
+        }
+        if (last_cta(ci + 0) && prim::leader_thread()) {
+            for (u32 k = 1; k < nr; k++) {
+                u32 peer = (me + k) % nr;
+                if (meta != 0) prim::store_release_sys(size_of(areas[peer], seq, me, nr), meta);
+                prim::store_release_sys(tail_of(areas[peer], seq, me, nr), seq);
+            }
+        }
+        for (u32 k = 1; k < nr; k++) {
+            u32 peer = (me + nr - k) % nr;
+            if (!spin_ge(tail_of(mine, seq, peer, nr), seq, deadline, fault, stop)) return false;
+        }
+        return true;
+    }
+    for (u32 k = 1; k < nr; k++) {
+        u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
+        u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
+        if (!spin_ge(ack_of(mine, nr, dst), seq - 2, deadline, fault, stop)) return false;
+        write_slice(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
+        if (last_cta(ci + 2 + k) && prim::leader_thread()) {
+            if (meta != 0) prim::store_release_sys(size_of(areas[dst], seq, me, nr), meta);
+            prim::store_release_sys(tail_of(areas[dst], seq, me, nr), seq);
+        }
+        if (!spin_ge(tail_of(mine, seq, peer, nr), seq, deadline, fault, stop)) return false;
+    }
+    return true;
+}
+
+TESSERA_FN void finish_chunk(const u64* areas, u32* ci, u64* seq_ptr, u64 seq, u32 me, u32 nr,
+                             bool is_last_chunk) {
+    if (last_cta(ci + 1) && prim::leader_thread()) {
+        if (is_last_chunk) prim::store_release_sys(seq_ptr, seq + 1);
+        for (u32 k = 1; k < nr; k++) {
+            u32 peer = (me + k) % nr;
+            prim::store_release_sys(ack_of(areas[peer], nr, me), seq);
+        }
+    }
+}
+
 }  // namespace p2p
 
 // Direct P2P all-reduce: fan-out (0), rounds (1), butterfly (2).
@@ -261,53 +315,95 @@ extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32*
             }
             p2p::add_slice(mine, seq, prev, nr, dst_buf, n, lo4, hi4, aligned_dst);
         } else {
-            if (sched == 0) {
-                for (u32 k = 1; k < nr; k++) {
-                    u32 peer = (me + k) % nr;
-                    if (!p2p::spin_ge(p2p::ack_of(mine, nr, peer), seq - 2, deadline, fault, &stop))
-                        return;
-                }
-                for (u32 k = 1; k < nr; k++) {
-                    u32 peer = (me + k) % nr;
-                    p2p::write_slice(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
-                }
-                if (p2p::last_cta(ci + 0) && prim::leader_thread()) {
-                    for (u32 k = 1; k < nr; k++) {
-                        u32 peer = (me + k) % nr;
-                        prim::store_release_sys(p2p::tail_of(areas[peer], seq, me, nr), seq);
-                    }
-                }
-                for (u32 k = 1; k < nr; k++) {
-                    u32 peer = (me + nr - k) % nr;
-                    if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault,
-                                      &stop))
-                        return;
-                }
-            } else {
-                for (u32 k = 1; k < nr; k++) {
-                    u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
-                    u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
-                    if (!p2p::spin_ge(p2p::ack_of(mine, nr, dst), seq - 2, deadline, fault, &stop))
-                        return;
-                    p2p::write_slice(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
-                    if (p2p::last_cta(ci + 2 + k) && prim::leader_thread()) {
-                        prim::store_release_sys(p2p::tail_of(areas[dst], seq, me, nr), seq);
-                    }
-                    if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault,
-                                      &stop))
-                        return;
-                }
-            }
+            if (!p2p::exchange_all(areas, ci, mine, seq, me, nr, sched, pow2, src, n, lo4, hi4,
+                                   aligned_src, 0ull, deadline, fault, &stop))
+                return;
             p2p::sum_slice(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
         }
-        if (p2p::last_cta(ci + 1) && prim::leader_thread()) {
-            if (total - off <= p2p::MAX_FLOATS) {
-                prim::store_release_sys(seq_ptr, seq + 1);
+        p2p::finish_chunk(areas, ci, seq_ptr, seq, me, nr, total - off <= p2p::MAX_FLOATS);
+    }
+}
+
+// Direct P2P all-gather: fan-out (0) or pairwise rounds (1+).
+extern "C" __global__ void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
+                                              u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 part,
+                                              u32 total, u32 rows, u32 nr, u32 me, u32 sched,
+                                              u64 timeout_ticks) {
+    __shared__ int stop;
+    __shared__ u64 base_seq;
+    u64 deadline = 0ull;
+    if (prim::leader_thread()) {
+        stop = (*static_cast<volatile u32*>(fault) != 0) ? 1 : 0;
+        base_seq = prim::load_acquire_sys(seq_ptr);
+        if (timeout_ticks != 0) deadline = prim::clock_ticks() + timeout_ticks;
+    }
+    prim::block_sync();
+    if (stop != 0) return;
+
+    u64 mine = areas[me];
+    bool pow2 = (nr & (nr - 1)) == 0;
+    u32 cols = total / rows;
+    u32 local_w = part / rows;
+    u32 step_rows = p2p::MAX_FLOATS / cols;
+    if (step_rows == 0) step_rows = 1;
+    const float* from = reinterpret_cast<const float*>(from_ptr);
+    float* to = reinterpret_cast<float*>(to_ptr);
+    u32 blocks = prim::blocks();
+    u32 first = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = blockDim.x * blocks;
+    u64 seq = base_seq;
+
+    for (u32 r0 = 0; r0 < rows; r0 += step_rows, seq++) {
+        u32 r_cnt = rows - r0;
+        if (r_cnt > step_rows) r_cnt = step_rows;
+        u32 n = r_cnt * local_w;
+        const float* src_chunk = from + u64(r0) * local_w;
+        bool aligned_src = (reinterpret_cast<u64>(src_chunk) & 15ull) == 0;
+        u32 vec4s = n / 4;
+        u32 per = (vec4s + blocks - 1) / blocks;
+        u32 lo4 = blockIdx.x * per;
+        u32 hi4 = lo4 + per;
+        if (lo4 > vec4s) lo4 = vec4s;
+        if (hi4 > vec4s) hi4 = vec4s;
+        u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
+
+        if (!p2p::exchange_all(areas, ci, mine, seq, me, nr, sched, pow2, src_chunk, n, lo4, hi4,
+                               aligned_src, u64(local_w), deadline, fault, &stop))
+            return;
+
+        u32 off = 0;
+        for (u32 r = 0; r < nr; r++) {
+            u32 rk_w = (r == me) ? local_w
+                                 : u32(prim::load_acquire_sys(p2p::size_of(mine, seq, r, nr)));
+            const float* src = (r == me)
+                ? src_chunk
+                : reinterpret_cast<const float*>(mine + p2p::slot_off(seq, r, nr));
+            float* dst_base = to + u64(r0) * cols + off;
+            bool vec4 = (rk_w & 3u) == 0u && (cols & 3u) == 0u &&
+                        (reinterpret_cast<u64>(dst_base) & 15ull) == 0ull &&
+                        (reinterpret_cast<u64>(src) & 15ull) == 0ull;
+            if (vec4) {
+                u32 q_w = rk_w >> 2;
+                u32 q_tot = r_cnt * q_w;
+                for (u32 q = first; q < q_tot; q += stride) {
+                    u32 row = q / q_w;
+                    u32 c4 = (q % q_w) << 2;
+                    const float* sp = src + u64(row) * rk_w + c4;
+                    float4 v = (r == me) ? *reinterpret_cast<const float4*>(sp)
+                                         : p2p::load_fresh4(sp);
+                    *reinterpret_cast<float4*>(dst_base + u64(row) * cols + c4) = v;
+                }
+            } else {
+                u32 e_tot = r_cnt * rk_w;
+                for (u32 e = first; e < e_tot; e += stride) {
+                    u32 row = e / rk_w;
+                    u32 c = e % rk_w;
+                    dst_base[u64(row) * cols + c] =
+                        (r == me) ? src[e] : prim::load_fresh(src + e);
+                }
             }
-            for (u32 k = 1; k < nr; k++) {
-                u32 peer = (me + k) % nr;
-                prim::store_release_sys(p2p::ack_of(areas[peer], nr, me), seq);
-            }
+            off += rk_w;
         }
+        p2p::finish_chunk(areas, ci, seq_ptr, seq, me, nr, r0 + step_rows >= rows);
     }
 }
