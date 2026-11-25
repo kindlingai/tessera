@@ -3,10 +3,10 @@
 #[cfg(test)]
 mod response_test;
 
-use crate::template::{FunctionCall, Template, ToolCall};
+use crate::template::{FunctionCall, Message, Template, ToolCall, spaced};
 use fancy_regex::Regex;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
@@ -55,7 +55,7 @@ struct ContentArgs {
 
 #[derive(Clone, Debug, Deserialize)]
 struct FieldSpec {
-    open: Option<String>,
+    open: Option<Strings>,
     open_pattern: Option<String>,
     close: Option<Strings>,
     content: Option<String>,
@@ -81,13 +81,17 @@ struct ConfigFile {
 
 #[derive(Clone)]
 enum Opener {
-    Literal(String),
-    Pattern { prefix: String, regex: Regex },
+    /// Any one of these strings.
+    Literal(Vec<String>),
+    Pattern {
+        prefix: String,
+        regex: Regex,
+    },
 }
 
 impl Opener {
     fn compile(
-        open: Option<String>,
+        open: Option<Strings>,
         pattern: Option<String>,
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         if let Some(pat) = pattern {
@@ -95,20 +99,22 @@ impl Opener {
             let regex = Regex::new(&pat)?;
             return Ok(Some(Opener::Pattern { prefix, regex }));
         }
-        Ok(open.filter(|s| !s.is_empty()).map(Opener::Literal))
+        let mut opens = open.map(Strings::list).unwrap_or_default();
+        opens.retain(|s| !s.is_empty());
+        Ok((!opens.is_empty()).then_some(Opener::Literal(opens)))
     }
 
-    fn trigger(&self) -> Option<&str> {
+    fn triggers(&self) -> Vec<&str> {
         match self {
-            Opener::Literal(s) => Some(s.as_str()),
-            Opener::Pattern { prefix, .. } if !prefix.is_empty() => Some(prefix.as_str()),
-            Opener::Pattern { .. } => None,
+            Opener::Literal(opens) => opens.iter().map(String::as_str).collect(),
+            Opener::Pattern { prefix, .. } if !prefix.is_empty() => vec![prefix.as_str()],
+            Opener::Pattern { .. } => Vec::new(),
         }
     }
 
     fn find(&self, text: &str) -> Option<(usize, usize)> {
         match self {
-            Opener::Literal(s) => text.find(s.as_str()).map(|at| (at, s.len())),
+            Opener::Literal(opens) => find_close(text, opens),
             Opener::Pattern { prefix, .. } if !prefix.is_empty() => {
                 text.find(prefix.as_str()).map(|at| (at, 0))
             }
@@ -121,7 +127,10 @@ impl Opener {
     /// Strips the opener at byte zero and returns captures.
     fn strip<'a>(&self, block: &'a str) -> Option<(BTreeMap<String, String>, &'a str)> {
         match self {
-            Opener::Literal(s) => Some((BTreeMap::new(), block.strip_prefix(s.as_str())?)),
+            Opener::Literal(opens) => {
+                let rest = opens.iter().find_map(|s| block.strip_prefix(s.as_str()))?;
+                Some((BTreeMap::new(), rest))
+            }
             Opener::Pattern { regex, .. } => {
                 let caps = regex.captures(block).ok()??;
                 let whole = caps.get(0)?;
@@ -229,7 +238,10 @@ impl ResponseParser {
         chat: &Template,
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let parser = Self::compile(serde_json::from_str(json)?)?;
-        let opener = parser.tool_calls.as_ref().and_then(|t| t.open.trigger());
+        let opener = parser
+            .tool_calls
+            .as_ref()
+            .and_then(|t| t.open.triggers().first().copied());
         let written = opener.is_some_and(|o| chat.mentions(o.trim()));
         Ok(written.then_some(parser))
     }
@@ -258,9 +270,6 @@ impl ResponseParser {
             let Some(open) = Opener::compile(spec.open, spec.open_pattern)? else {
                 continue;
             };
-            if close.is_empty() {
-                continue;
-            }
             let block = BlockSpec {
                 open,
                 close,
@@ -287,11 +296,50 @@ impl ResponseParser {
         self.tool_calls.is_some()
     }
 
+    /// `messages` with tool calls written into `content` as model text.
+    pub fn inline_calls(&self, messages: &[Message]) -> Vec<Message> {
+        let mut out = messages.to_vec();
+        let Some(BlockSpec {
+            open: Opener::Literal(opens),
+            close,
+            body: Body::Json(_),
+            transform: None,
+            ..
+        }) = &self.tool_calls
+        else {
+            return out;
+        };
+        let open = &opens[0];
+        for m in &mut out {
+            let Some(calls) = m.tool_calls.take() else {
+                continue;
+            };
+            let mut text = m.content.take().unwrap_or_default();
+            let mut plain = Vec::with_capacity(calls.len());
+            for call in &calls {
+                plain.push(
+                    json!({"name": call.function.name, "arguments": call.function.arguments}),
+                );
+            }
+            match close.first() {
+                Some(close) => {
+                    for call in plain {
+                        text += &format!("{open}{}{close}", spaced(&call));
+                    }
+                }
+                None => text += &format!("{open}{}", spaced(&Value::Array(plain))),
+            }
+            m.content = Some(text);
+        }
+        out
+    }
+
     /// Whether `prompt` already opened the thinking block.
     pub fn starts_thinking(&self, prompt: &str) -> bool {
         matches!(
             &self.thinking,
-            Some(BlockSpec { open: Opener::Literal(s), .. }) if prompt.ends_with(s.as_str())
+            Some(BlockSpec { open: Opener::Literal(opens), .. })
+                if opens.iter().any(|s| prompt.ends_with(s.as_str()))
         )
     }
 
@@ -398,6 +446,13 @@ impl<'a> ResponseStream<'a> {
                 return;
             }
         }
+        if self.mode == Mode::ToolCall
+            && let Some(spec) = &self.parser.tool_calls
+            && let Some(calls) = parse_tool(spec, &rest)
+        {
+            out.extend(calls.into_iter().map(ResponseEvent::ToolCall));
+            return;
+        }
         match self.mode {
             Mode::Thinking => out.push(ResponseEvent::Reasoning(rest)),
             Mode::Text | Mode::ToolCall | Mode::Calls => out.push(ResponseEvent::Content(rest)),
@@ -439,15 +494,13 @@ impl<'a> ResponseStream<'a> {
             return self.mode != Mode::Closed;
         }
         let mut needles: Vec<&str> = Vec::new();
-        if let Some(t) = &self.parser.thinking
-            && let Some(s) = t.open.trigger()
-        {
-            needles.push(s);
+        if let Some(t) = &self.parser.thinking {
+            needles.extend(t.open.triggers());
         }
         if self.parse_tools
             && let Some(t) = &self.parser.tool_calls
         {
-            needles.extend(t.open.trigger());
+            needles.extend(t.open.triggers());
             needles.extend(t.outer.as_ref().map(|[o, _]| o.as_str()));
         }
         for c in &self.parser.content_close {

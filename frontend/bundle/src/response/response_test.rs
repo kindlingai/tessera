@@ -227,3 +227,38 @@ fn parses_tagged_parameter_calls() {
         json!({"city": "New York", "days": 3, "note": "line one\nline two"})
     );
 }
+
+#[test]
+fn parses_open_blocks() {
+    let cfg = format!(
+        r#"{{"response_template": {}}}"#,
+        include_str!("granite.json")
+    );
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let calls = r#"[{"name": "weather", "arguments": {"city": "Paris"}}, {"name": "ping", "arguments": {}}]"#;
+    let mut stream = parser.stream(true, false);
+    let mut events = Vec::new();
+    stream.push("<tool", &mut events);
+    stream.push(&format!("_call>{calls}"), &mut events);
+    assert!(events.is_empty());
+    stream.finish(&mut events);
+    let parsed: Vec<_> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            ResponseEvent::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].function.arguments, json!({"city": "Paris"}));
+    let turn = crate::Message {
+        role: "assistant".into(),
+        tool_calls: Some(parsed),
+        ..Default::default()
+    };
+    let inlined = parser.inline_calls(&[turn]);
+    let text = inlined[0].content.as_deref().unwrap();
+    let round = parser.parse(text, true, false);
+    assert_eq!(round.tool_calls.len(), 2);
+    assert_eq!(round.tool_calls[1].function.name, "ping");
+}

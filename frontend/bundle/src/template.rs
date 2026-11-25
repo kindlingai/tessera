@@ -134,6 +134,14 @@ impl Formatter for Spaced {
     }
 }
 
+/// `value` as JSON text with Python's spacing.
+pub(crate) fn spaced(value: &serde_json::Value) -> String {
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, Spaced);
+    value.serialize(&mut ser).expect("JSON values serialize");
+    String::from_utf8(out).expect("JSON text is UTF-8")
+}
+
 /// Hugging Face's `tojson`: Python `json.dumps`, `ensure_ascii` off by default.
 fn tojson(value: &Value, kwargs: Kwargs) -> Result<Value, minijinja::Error> {
     let indent: Option<usize> = kwargs.get("indent")?;
