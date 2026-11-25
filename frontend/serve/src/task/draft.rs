@@ -10,8 +10,8 @@ use tessera_bundle::dflash::DFlash;
 use tessera_engine::comm::Transport;
 use tessera_engine::sums::Sum;
 use tessera_engine::{
-    CostModel, Drafter, Engine, Place, PleStore, Recipe, Request, Settings, Sink, SpecLen,
-    SpecStats, Speculate, Steps,
+    BatchDFlash, CostModel, Drafter, Engine, Place, PleStore, Recipe, Request, Settings, Sink,
+    SpecLen, SpecStats, Speculate, Steps,
 };
 use tessera_tasks::{Generate, Steer};
 
@@ -207,13 +207,83 @@ pub(super) fn open_drafter(
     Ok(drafter)
 }
 
+/// Drives a continuous-batching speculative decoder loop.
+pub(super) trait SpecBatch {
+    fn busy(&self) -> bool;
+    fn submit(&mut self, request: Request, sink: Sink);
+    fn step(&mut self) -> Result<bool, tessera_engine::Error>;
+    fn follow(&mut self) -> Result<(), tessera_engine::Error>;
+}
+
+impl SpecBatch for BatchDFlash<'_> {
+    fn busy(&self) -> bool {
+        self.busy()
+    }
+    fn submit(&mut self, request: Request, sink: Sink) {
+        self.submit(request, sink);
+    }
+    fn step(&mut self) -> Result<bool, tessera_engine::Error> {
+        self.step()
+    }
+    fn follow(&mut self) -> Result<(), tessera_engine::Error> {
+        self.follow()
+    }
+}
+
+/// Runs rank 0's job loop or follower loop on `batch`.
+pub(super) fn drive_batch(
+    load: &Load,
+    batch: &mut impl SpecBatch,
+    generate: Generate,
+) -> Result<(), String> {
+    if load.options.ranks.follows() {
+        return batch.follow().map_err(|e| e.to_string());
+    }
+    let jobs = queue(load, generate, false);
+    loop {
+        let job = match batch.busy() {
+            true => jobs.try_recv().ok(),
+            false => match jobs.recv() {
+                Ok(job) => Some(job),
+                Err(_) => break,
+            },
+        };
+        if let Some((request, sink)) = job {
+            batch.submit(request, sink);
+            continue;
+        }
+        batch.step().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Runs continuous-batching DFlash decoding across many slots.
+fn serve_batch(
+    load: &Load,
+    engine: &mut Engine,
+    drafter: &mut Drafter,
+    generate: Generate,
+    sl: SpecLen,
+) -> Result<(), String> {
+    let mut batch = BatchDFlash::new(engine, drafter)
+        .map_err(|e| e.to_string())?
+        .with_spec_len(sl);
+    if let Some(rows) = load.options.max_batch_rows {
+        batch = batch.with_prefill_chunk(rows);
+    }
+    drive_batch(load, &mut batch, generate)?;
+    let _ = engine.dismiss();
+    Ok(())
+}
+
 /// Loads a target and DFlash drafter, then answers requests.
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let draft_dir = std::path::Path::new(load.given("--draft").unwrap_or_default());
-    let b = begin(load, &settings, false)?;
+    let b = begin(load, &settings, o.slots > 1)?;
     let (target_links, draft_links) = split_links(b.links);
-    let (start, rules, at, manifest) = (b.start, b.rules, b.at, b.manifest);
+    let (start, rules, manifest) = (b.start, b.rules, b.manifest);
+    let at = [o.slots as u64, o.max_model_len as u64];
     let pair = tessera_bundle::dflash::load(
         [&o.model, draft_dir],
         (at, b.steps),
@@ -226,12 +296,17 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let (mut engine, target) = open_target(o, target_links, pair.target, &settings)?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!(
-        "{}: loaded target + dflash (block {}) in {seconds:.1} s",
+        "{}: loaded target + dflash (block {}, slots {}) in {seconds:.1} s",
         engine.device(),
-        pair.block
+        pair.block,
+        o.slots,
     );
-    check_lowering(o, &mut engine, Some(pair.block.min(16)));
+    check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)));
     let generate = front(load, b.mode, &engine, target)?;
+    let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
+    if o.slots > 1 {
+        return serve_batch(load, &mut engine, &mut drafter, generate, sl);
+    }
     let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
     if let Some(rows) = o.max_batch_rows {
         spec = spec.with_prefill_chunk(rows);
@@ -239,7 +314,6 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     if o.ranks.follows() {
         return spec.follow().map_err(|e| e.to_string());
     }
-    let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
     let mut spec = spec.with_spec_len(sl);
     serve(load, &settings, generate, "dflash", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())

@@ -1,10 +1,10 @@
 //! MTP drafting, given `--mtp`. DFlash joins when `--draft` is given.
 
 use super::draft::{
-    ADAPTIVE, DraftLinks, SPEC_LEN, begin, front, open_drafter, open_target, serve, spec_len,
-    split_links,
+    ADAPTIVE, DraftLinks, SPEC_LEN, SpecBatch, begin, drive_batch, front, open_drafter,
+    open_target, serve, spec_len, split_links,
 };
-use super::generate::{check_lowering, queue};
+use super::generate::check_lowering;
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -74,31 +74,27 @@ pub(super) fn open_mtp(
     Ok(drafter)
 }
 
+impl SpecBatch for BatchMtp<'_> {
+    fn busy(&self) -> bool {
+        self.busy()
+    }
+    fn submit(&mut self, request: tessera_engine::Request, sink: tessera_engine::Sink) {
+        self.submit(request, sink);
+    }
+    fn step(&mut self) -> Result<bool, tessera_engine::Error> {
+        self.step()
+    }
+    fn follow(&mut self) -> Result<(), tessera_engine::Error> {
+        self.follow()
+    }
+}
+
 /// Runs rank 0's job loop or follower loop on `batch`.
 fn run_batch_loop(load: &Load, mut batch: BatchMtp<'_>, generate: Generate) -> Result<(), String> {
-    let o = load.options;
-    if let Some(rows) = o.max_batch_rows {
+    if let Some(rows) = load.options.max_batch_rows {
         batch = batch.with_prefill_chunk(rows);
     }
-    if o.ranks.follows() {
-        return batch.follow().map_err(|e| e.to_string());
-    }
-    let jobs = queue(load, generate, false);
-    loop {
-        let job = match batch.busy() {
-            true => jobs.try_recv().ok(),
-            false => match jobs.recv() {
-                Ok(job) => Some(job),
-                Err(_) => break,
-            },
-        };
-        if let Some((request, sink)) = job {
-            batch.submit(request, sink);
-            continue;
-        }
-        batch.step().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    drive_batch(load, &mut batch, generate)
 }
 
 /// Serves continuous-batching MTP decoding across many slots.

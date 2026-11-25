@@ -1,11 +1,17 @@
-//! Solo DFlash acceleration, demotion, and tail promotion for `BatchMtp`.
+//! Multi-slot DFlash decoding and solo DFlash/MTP promotion.
 
-use crate::batch_spec::{BatchMtp, DraftJob};
+use crate::batch_spec::{
+    ActiveSeq, Admitted, BatchMtp, DEFAULT_CHUNK, DraftJob, RoundHost, drive_follow, drive_step,
+    queue_request, retire_from,
+};
 use crate::dual::{DualSelector, run_dflash, split_taps};
+use crate::kept::Kept;
 use crate::mtp_draft::MtpDrafter;
-use crate::spec_loop::{TapsBuf, TapsIn};
+use crate::schedule::Sink;
+use crate::spec_len::{CostModel, SpecLen};
+use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span};
 use crate::speculate::Drafter;
-use crate::{Engine, Error};
+use crate::{Engine, Error, Request, Row};
 use std::collections::VecDeque;
 
 /// Context rows retained per slot for DFlash tail promotion.
@@ -402,5 +408,397 @@ impl<'a> BatchMtp<'a> {
         drafts.truncate(k);
         self.active[idx].drafts = drafts;
         Ok(())
+    }
+}
+
+/// Headroom rows reserved before admitting another paged request.
+const PAGE_HEADROOM: usize = 2048;
+
+struct DFlashPrefill {
+    slot: u32,
+    request: Request,
+    sink: Option<Sink>,
+    pos: usize,
+}
+
+struct DFlashSeq {
+    seq: ActiveSeq,
+    spec: SpecLen,
+    last_pred: f64,
+    last_lp: Option<Vec<f32>>,
+}
+
+struct DFlashJob {
+    active_idx: usize,
+    slot: u32,
+    old_start: usize,
+    new_start: usize,
+    anchor: u32,
+    tap_row_off: usize,
+    commit: usize,
+    avail: usize,
+}
+
+/// Multi-slot continuous-batching DFlash decoder.
+pub struct BatchDFlash<'a> {
+    target: &'a mut Engine,
+    drafter: &'a mut Drafter,
+    spec_len: SpecLen,
+    prefill_chunk: usize,
+    max_ctx: usize,
+    block: usize,
+    tap_width: usize,
+    kept: Option<Kept>,
+    waiting: VecDeque<(Request, Sink)>,
+    prefilling: VecDeque<DFlashPrefill>,
+    active: Vec<DFlashSeq>,
+    free: Vec<u32>,
+    hash: u32,
+}
+
+impl<'a> BatchDFlash<'a> {
+    /// Pairs a multi-slot tapped target engine with its DFlash drafter.
+    pub fn new(target: &'a mut Engine, drafter: &'a mut Drafter) -> Result<Self, Error> {
+        let width = target.draft_taps()?;
+        if width != drafter.tap_width() {
+            return Err(Error::Rows);
+        }
+        let slots = target.slots().min(drafter.slots());
+        let max_ctx = target.context().min(drafter.context());
+        if let Some(lanes) = &mut target.lanes {
+            lanes.reset();
+        }
+        let kept = target
+            .lanes
+            .as_ref()
+            .map(|l| Kept::paged(slots, max_ctx, l.pages(), l.page));
+        let free = if kept.is_some() {
+            Vec::new()
+        } else {
+            (0..slots as u32).rev().collect()
+        };
+        let block = drafter.block();
+        let spec_len = SpecLen::fixed(block - 1).with_cost(CostModel::dflash());
+        Ok(Self {
+            target,
+            drafter,
+            spec_len,
+            prefill_chunk: DEFAULT_CHUNK,
+            max_ctx,
+            block,
+            tap_width: width,
+            kept,
+            waiting: VecDeque::new(),
+            prefilling: VecDeque::new(),
+            active: Vec::new(),
+            free,
+            hash: 2166136261,
+        })
+    }
+
+    /// Sets the maximum prompt rows per prefill step.
+    pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
+        self.prefill_chunk = rows.max(1);
+        self
+    }
+
+    /// Runs one round of admit, prefill, verify, and draft.
+    pub fn step(&mut self) -> Result<bool, Error> {
+        drive_step(self)
+    }
+
+    /// Follower rank loop executing rank 0's batched rounds.
+    pub fn follow(&mut self) -> Result<(), Error> {
+        drive_follow(self)
+    }
+
+    /// Configures adaptive or truncated draft length selection.
+    pub fn with_spec_len(mut self, spec_len: SpecLen) -> Self {
+        self.spec_len = spec_len;
+        self
+    }
+
+    /// Queues an answer. Unfit requests finish at once.
+    pub fn submit(&mut self, request: Request, sink: Sink) {
+        queue_request(&mut self.waiting, self.max_ctx, request, sink);
+    }
+
+    /// Whether any answer is waiting, prefilling, or decoding.
+    pub fn busy(&self) -> bool {
+        !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
+    }
+
+    fn free_slot(&mut self, slot: u32) {
+        if let Some(kept) = &mut self.kept {
+            kept.finish(slot, Vec::new());
+        } else {
+            self.free.push(slot);
+        }
+    }
+
+    fn ensure_pages(&mut self, rows: &[Row]) -> Result<(), Error> {
+        let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.target.lanes) else {
+            return Ok(());
+        };
+        for r in rows {
+            if let Some(pages) = kept.grow(r.slot, r.position as usize + 1)? {
+                lanes.set(r.slot, pages);
+            }
+        }
+        Ok(())
+    }
+
+    fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
+        for item in admitted {
+            if follower && let Some(kept) = &mut self.kept {
+                let Some((slot, _)) = kept.admit(&item.request.tokens, 0) else {
+                    return Err(Error::RowPlace);
+                };
+                debug_assert_eq!(slot, item.slot);
+            }
+            self.prefilling.push_back(DFlashPrefill {
+                slot: item.slot,
+                request: item.request,
+                sink: item.sink,
+                pos: 0,
+            });
+        }
+        if !self.prefilling.is_empty() {
+            self.prefill_step()?;
+        }
+        self.active.sort_by_key(|s| s.seq.slot);
+        if self.active.is_empty() {
+            return Ok(());
+        }
+        self.verify_and_draft()
+    }
+
+    fn prefill_step(&mut self) -> Result<(), Error> {
+        let mut seq = self.prefilling.pop_front().expect("prefill seq");
+        let n = seq.request.tokens.len();
+        let pos0 = seq.pos;
+        let len = (n - pos0).min(self.prefill_chunk);
+        let end = pos0 + len;
+        let mut rows = Vec::with_capacity(len);
+        span(
+            &mut rows,
+            seq.slot,
+            pos0,
+            seq.request.tokens[pos0..end].iter().copied(),
+        );
+        self.ensure_pages(&rows)?;
+        let (ids, taps) = self.target.step_taps_local(&rows)?;
+        let wants = self.drafter.draft_wants();
+        if end < n {
+            if n + self.block <= self.max_ctx {
+                self.drafter.run_taps(
+                    seq.slot,
+                    seq.request.tokens[end],
+                    end,
+                    pos0,
+                    taps.as_in(),
+                    wants,
+                )?;
+            }
+            seq.pos = end;
+            self.prefilling.push_front(seq);
+            return Ok(());
+        }
+        let anchor = *ids.last().expect("non-empty chunk");
+        fnv_u32(&mut self.hash, anchor);
+        let mut act = ActiveSeq {
+            slot: seq.slot,
+            request: seq.request,
+            sink: seq.sink,
+            start: n,
+            anchor,
+            drafts: Vec::new(),
+            emitted: 0,
+            cancelled: false,
+            solo: None,
+            d_tail: Vec::new(),
+        };
+        let done = act.commit(&[anchor], self.max_ctx);
+        if done.is_some() || (self.target.control.is_none() && act.cancelled) {
+            self.free_slot(act.slot);
+            return Ok(());
+        }
+        let spec = self.spec_len.fresh();
+        let mut last_pred = 1.0;
+        let mut last_lp = None;
+        let room = act.room(self.max_ctx);
+        if n + self.block <= self.max_ctx && room > 0 {
+            let outs = self
+                .drafter
+                .run_taps(act.slot, anchor, n, pos0, taps.as_in(), wants)?;
+            let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
+            let avail = drafts.len().min(room);
+            let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
+            drafts.truncate(k);
+            act.drafts = drafts;
+            last_pred = pred;
+            last_lp = lp;
+        }
+        self.active.push(DFlashSeq {
+            seq: act,
+            spec,
+            last_pred,
+            last_lp,
+        });
+        Ok(())
+    }
+
+    fn verify_and_draft(&mut self) -> Result<(), Error> {
+        let s_count = self.active.len();
+        let mut rows = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s_count);
+        for item in &self.active {
+            let k = item.seq.drafts.len().min(item.seq.room(self.max_ctx));
+            spans.push((rows.len(), k));
+            item.seq.verify(&mut rows, k);
+        }
+        self.ensure_pages(&rows)?;
+        let (ids, raw_taps) = self.target.step_taps_local(&rows)?;
+        let ranked = self.target.control.is_some();
+        let mut jobs: Vec<DFlashJob> = Vec::with_capacity(s_count);
+        let mut finished: Vec<bool> = vec![false; s_count];
+        for (i, &(off, k)) in spans.iter().enumerate() {
+            let old_start = self.active[i].seq.start;
+            let (accepted, _, done) = self.active[i].seq.apply_verify(
+                k,
+                &ids[off..off + 1 + k],
+                self.max_ctx,
+                &mut self.hash,
+            );
+            let item = &mut self.active[i];
+            if k > 0 {
+                item.spec
+                    .observe(k, accepted, item.last_lp.as_deref(), item.last_pred);
+            }
+            if done.is_some() || (!ranked && item.seq.cancelled) {
+                finished[i] = true;
+                continue;
+            }
+            let avail = item.seq.room(self.max_ctx);
+            if item.seq.start + self.block <= self.max_ctx && avail > 0 {
+                jobs.push(DFlashJob {
+                    active_idx: i,
+                    slot: item.seq.slot,
+                    old_start,
+                    new_start: item.seq.start,
+                    anchor: item.seq.anchor,
+                    tap_row_off: off,
+                    commit: 1 + accepted,
+                    avail,
+                });
+            }
+        }
+        let wants = self.drafter.draft_wants();
+        for job in jobs {
+            let taps_in = match &raw_taps {
+                TapsBuf::Device { addr, .. } => TapsIn::Device {
+                    addr: *addr + (job.tap_row_off * self.tap_width * 4) as u64,
+                    rows: job.commit,
+                    stride: 0,
+                },
+                TapsBuf::Host(v) => {
+                    let lo = job.tap_row_off * self.tap_width;
+                    let hi = lo + job.commit * self.tap_width;
+                    TapsIn::Host(&v[lo..hi])
+                }
+            };
+            let outs = self.drafter.run_taps(
+                job.slot,
+                job.anchor,
+                job.new_start,
+                job.old_start,
+                taps_in,
+                wants,
+            )?;
+            let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
+            let avail = drafts.len().min(job.avail);
+            let item = &mut self.active[job.active_idx];
+            let (k, pred) = item.spec.choose(lp.as_deref(), avail, drafts.len());
+            drafts.truncate(k);
+            item.seq.drafts = drafts;
+            item.last_pred = pred;
+            item.last_lp = lp;
+        }
+        let mut idx = 0usize;
+        let mut orig = 0usize;
+        while idx < self.active.len() {
+            if finished[orig] {
+                let item = self.active.remove(idx);
+                self.free_slot(item.seq.slot);
+            } else {
+                idx += 1;
+            }
+            orig += 1;
+        }
+        Ok(())
+    }
+}
+
+impl RoundHost for BatchDFlash<'_> {
+    fn target(&mut self) -> &mut Engine {
+        self.target
+    }
+    fn hash(&self) -> u32 {
+        self.hash
+    }
+    fn is_busy(&self) -> bool {
+        self.busy()
+    }
+    fn collect_cancelled(&self) -> Vec<u32> {
+        self.active
+            .iter()
+            .filter(|s| s.seq.cancelled)
+            .map(|s| s.seq.slot)
+            .collect()
+    }
+    fn admit_local(&mut self) -> Vec<Admitted> {
+        let mut out = Vec::new();
+        while let Some((req, _)) = self.waiting.front() {
+            let slot = if let Some(kept) = &mut self.kept {
+                let busy =
+                    !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
+                let pool = kept.totals().pool;
+                let free_rows = pool.size.saturating_sub(pool.active);
+                if busy && free_rows < req.tokens.len() + PAGE_HEADROOM {
+                    break;
+                }
+                let Some((slot, _)) = kept.admit(&req.tokens, 0) else {
+                    break;
+                };
+                slot
+            } else {
+                let Some(slot) = self.free.pop() else {
+                    break;
+                };
+                slot
+            };
+            let (request, sink) = self.waiting.pop_front().expect("waiting request");
+            out.push(Admitted {
+                slot,
+                request,
+                sink: Some(sink),
+            });
+        }
+        out
+    }
+    fn retire_slots(&mut self, slots: &[u32]) {
+        let (kept, free) = (&mut self.kept, &mut self.free);
+        retire_from(
+            &mut self.active,
+            slots,
+            |s| s.seq.slot,
+            |s| match kept {
+                Some(k) => k.finish(s, Vec::new()),
+                None => free.push(s),
+            },
+        );
+    }
+    fn run_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
+        self.exec_round(admitted, follower)
     }
 }

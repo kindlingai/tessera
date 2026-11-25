@@ -16,6 +16,98 @@ const BATCH_STEP_TAG: u32 = 2;
 /// Default maximum rows per prefill chunk.
 pub(crate) const DEFAULT_CHUNK: usize = tessera_device::FAST_MAX_ROWS;
 
+/// Shared coordinator and follower lifecycle for batched speculative loops.
+pub(crate) trait RoundHost {
+    fn target(&mut self) -> &mut Engine;
+    fn hash(&self) -> u32;
+    fn is_busy(&self) -> bool;
+    fn collect_cancelled(&self) -> Vec<u32>;
+    fn admit_local(&mut self) -> Vec<Admitted>;
+    fn retire_slots(&mut self, slots: &[u32]);
+    fn run_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error>;
+}
+
+/// Executes one coordinator round on `host`.
+pub(crate) fn drive_step(host: &mut impl RoundHost) -> Result<bool, Error> {
+    if !host.is_busy() {
+        return Ok(false);
+    }
+    host.target().settle()?;
+    let cancelled = host.collect_cancelled();
+    let admitted = host.admit_local();
+    let hash = host.hash();
+    if host.target().control.is_some() {
+        let msg = encode_round(hash, &cancelled, &admitted);
+        let _ = host.target().told(&msg)?;
+    }
+    host.retire_slots(&cancelled);
+    host.run_round(admitted, false)?;
+    host.target().settle()?;
+    Ok(true)
+}
+
+/// Runs the follower rank loop on `host`.
+pub(crate) fn drive_follow(host: &mut impl RoundHost) -> Result<(), Error> {
+    loop {
+        let mine = host
+            .target()
+            .held
+            .take()
+            .map_or_else(Vec::new, |(_, p)| p.to_bytes());
+        let Some(told) = host.target().told(&mine)? else {
+            return Ok(());
+        };
+        let Some((want_hash, cancelled, admitted)) = decode_round(&told) else {
+            return Ok(());
+        };
+        if want_hash != host.hash() {
+            return Err(RunError::OutputsDisagree.into());
+        }
+        host.retire_slots(&cancelled);
+        host.run_round(admitted, true)?;
+    }
+}
+
+/// Removes finished `slots` from `active` and notifies `on_free`.
+pub(crate) fn retire_from<T>(
+    active: &mut Vec<T>,
+    slots: &[u32],
+    slot_of: impl Fn(&T) -> u32,
+    mut on_free: impl FnMut(u32),
+) {
+    if slots.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i < active.len() {
+        let slot = slot_of(&active[i]);
+        if slots.contains(&slot) {
+            active.remove(i);
+            on_free(slot);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Validates and appends `request` to `waiting`, or finishes at once.
+pub(crate) fn queue_request(
+    waiting: &mut VecDeque<(Request, Sink)>,
+    max_ctx: usize,
+    request: Request,
+    mut sink: Sink,
+) {
+    if request.tokens.is_empty() || request.tokens.len() > max_ctx {
+        sink(Event::Done(Reason::Context));
+        return;
+    }
+    if request.max_tokens == 0 {
+        sink(Event::Done(Reason::Length));
+        return;
+    }
+    waiting.push_back((request, sink));
+}
+
 /// One active request decoded inside a shared speculative batch.
 pub(crate) struct ActiveSeq {
     pub(crate) slot: u32,
@@ -120,10 +212,10 @@ pub(crate) struct DraftJob {
 }
 
 /// Newly admitted session synchronized across ranks.
-struct Admitted {
-    slot: u32,
-    request: Request,
-    sink: Option<Sink>,
+pub(crate) struct Admitted {
+    pub(crate) slot: u32,
+    pub(crate) request: Request,
+    pub(crate) sink: Option<Sink>,
 }
 
 /// Admitted sequence advancing through chunked prompt prefill.
@@ -192,16 +284,8 @@ impl<'a> BatchMtp<'a> {
     }
 
     /// Queues an answer. Unfit requests finish at once.
-    pub fn submit(&mut self, request: Request, mut sink: Sink) {
-        if request.tokens.is_empty() || request.tokens.len() > self.max_ctx {
-            sink(Event::Done(Reason::Context));
-            return;
-        }
-        if request.max_tokens == 0 {
-            sink(Event::Done(Reason::Length));
-            return;
-        }
-        self.waiting.push_back((request, sink));
+    pub fn submit(&mut self, request: Request, sink: Sink) {
+        queue_request(&mut self.waiting, self.max_ctx, request, sink);
     }
 
     /// Whether any answer is waiting, prefilling, or decoding.
@@ -211,44 +295,25 @@ impl<'a> BatchMtp<'a> {
 
     /// Runs one round: admit, prefill, shared verify, and batched draft.
     pub fn step(&mut self) -> Result<bool, Error> {
-        if !self.busy() {
-            return Ok(false);
-        }
-        self.target.settle()?;
-        let cancelled = self.collect_cancelled();
-        let admitted = self.admit_local();
-        if self.target.control.is_some() {
-            let msg = encode_round(self.hash, &cancelled, &admitted);
-            let _ = self.target.told(&msg)?;
-        }
-        self.retire_slots(&cancelled);
-        self.run_round(admitted)?;
-        self.target.settle()?;
-        Ok(true)
+        drive_step(self)
     }
 
     /// Follower rank loop executing rank 0's batched rounds.
     pub fn follow(&mut self) -> Result<(), Error> {
-        loop {
-            let mine = self
-                .target
-                .held
-                .take()
-                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-            let Some(told) = self.target.told(&mine)? else {
-                return Ok(());
-            };
-            let Some((want_hash, cancelled, admitted)) = decode_round(&told) else {
-                return Ok(());
-            };
-            if want_hash != self.hash {
-                return Err(RunError::OutputsDisagree.into());
-            }
-            self.retire_slots(&cancelled);
-            self.run_round(admitted)?;
-        }
+        drive_follow(self)
     }
+}
 
+impl RoundHost for BatchMtp<'_> {
+    fn target(&mut self) -> &mut Engine {
+        self.target
+    }
+    fn hash(&self) -> u32 {
+        self.hash
+    }
+    fn is_busy(&self) -> bool {
+        self.busy()
+    }
     fn collect_cancelled(&self) -> Vec<u32> {
         self.active
             .iter()
@@ -256,7 +321,6 @@ impl<'a> BatchMtp<'a> {
             .map(|s| s.slot)
             .collect()
     }
-
     fn admit_local(&mut self) -> Vec<Admitted> {
         let mut out = Vec::new();
         while !self.waiting.is_empty() && !self.free.is_empty() {
@@ -270,23 +334,16 @@ impl<'a> BatchMtp<'a> {
         }
         out
     }
-
     fn retire_slots(&mut self, slots: &[u32]) {
-        if slots.is_empty() {
-            return;
-        }
-        let mut i = 0;
-        while i < self.active.len() {
-            if slots.contains(&self.active[i].slot) {
-                let seq = self.active.remove(i);
-                self.free.push(seq.slot);
-            } else {
-                i += 1;
-            }
-        }
+        retire_from(&mut self.active, slots, |s| s.slot, |s| self.free.push(s));
     }
+    fn run_round(&mut self, admitted: Vec<Admitted>, _follower: bool) -> Result<(), Error> {
+        self.exec_round(admitted)
+    }
+}
 
-    fn run_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
+impl BatchMtp<'_> {
+    fn exec_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
         if !admitted.is_empty() {
             if self.active.len() == 1 && self.active[0].solo.is_some() {
                 self.demote_solo()?;
@@ -731,7 +788,7 @@ impl<'a> BatchMtp<'a> {
     }
 }
 
-fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) -> Vec<u8> {
+pub(crate) fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) -> Vec<u8> {
     let mut w = Writer(Vec::new());
     w.u32(BATCH_STEP_TAG)
         .u32(hash)
@@ -746,7 +803,7 @@ fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) -> Vec<u8> 
     w.0
 }
 
-fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>)> {
+pub(crate) fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>)> {
     let mut r = Reader(bytes);
     if r.u32()? != BATCH_STEP_TAG {
         return None;

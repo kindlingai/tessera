@@ -38,6 +38,7 @@ mod spec_len;
 mod spec_loop;
 mod speculate;
 
+pub use batch_dual::BatchDFlash;
 pub use batch_spec::BatchMtp;
 pub use dual::{DualSelector, DualSpeculate};
 pub use guide::{
