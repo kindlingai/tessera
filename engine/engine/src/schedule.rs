@@ -175,7 +175,7 @@ impl<'a> Batch<'a> {
         if let Some(lanes) = &mut engine.lanes {
             lanes.reset();
         }
-        let budget = engine.context;
+        let budget = engine.context.min(tessera_device::FAST_MAX_ROWS);
         let mut batch = Self {
             engine,
             policy,

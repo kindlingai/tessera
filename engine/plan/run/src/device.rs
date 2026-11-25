@@ -344,6 +344,11 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         }
     }
 
+    /// Drains the device stream.
+    pub(crate) fn finish_ctx(&self) -> Result<(), Error> {
+        self.ctx.finish().map(|_| ()).map_err(Into::into)
+    }
+
     /// Whether `steps` can record into one device graph.
     pub(crate) fn can_record(&self, steps: &Range<usize>) -> bool {
         // A recorded graph cannot hold a grid that waits.

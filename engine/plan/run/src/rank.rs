@@ -100,6 +100,7 @@ pub(crate) trait RankRun: Run {
         cross: bool,
         sum: &mut (dyn Sum + 'static),
     ) -> Result<Option<usize>, Error>;
+    fn finish_device(&self) -> Result<(), Error>;
 }
 
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::device::Runner<D> {
@@ -124,6 +125,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::devi
     ) -> Result<Option<usize>, Error> {
         self.run(steps, false, wait, cross, Some(sum))
             .map(|(_, split)| split)
+    }
+
+    fn finish_device(&self) -> Result<(), Error> {
+        self.finish_ctx()
     }
 }
 
@@ -431,6 +436,7 @@ impl<T: Transport> Rank<T> {
             return Ok(());
         }
         let mut from = steps.start;
+        let mut sum_secs = 0.0f64;
         for i in steps.clone() {
             let step = &self.runner.run().plan().steps[i];
             if !crosses(step.kernel.name()) {
@@ -447,7 +453,15 @@ impl<T: Transport> Rank<T> {
                 }
                 (true, false) => self.gather(&step)?,
                 (false, true) => {
+                    let start = timed.then(Instant::now);
                     self.grid_step(i, &step)?;
+                    if let Some(t0) = start
+                        && self.grid.as_ref().is_some_and(|g| g.capturable())
+                        && let Inner::Device(dev) = &self.runner
+                    {
+                        dev.finish_device()?;
+                        sum_secs += t0.elapsed().as_secs_f64();
+                    }
                 }
                 (false, false) => self.exchange(&step)?,
             }
@@ -467,6 +481,8 @@ impl<T: Transport> Rank<T> {
             self.note("all_reduce: wait", wait);
             self.note("all_reduce: transfer", moved);
             self.note("all_reduce", wait + moved);
+        } else if timed && sum_secs > 0.0 {
+            self.note("all_reduce", sum_secs);
         }
         Ok(())
     }

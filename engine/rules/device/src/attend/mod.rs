@@ -334,7 +334,8 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
     if width != kind.width() || kw != width || tree.node(v).shape.last() != Some(&width) {
         return None;
     }
-    if rows == 0 || rows > 512 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+    if rows == 0 || rows > crate::FAST_MAX_ROWS || kv_heads == 0 || !heads.is_multiple_of(kv_heads)
+    {
         return None;
     }
     let [slots, positions] = [node.args[3], node.args[4]];
