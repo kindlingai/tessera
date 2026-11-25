@@ -38,6 +38,7 @@ fn grid_reaches_rules() {
         "fast_gemv",
         "fast_mm",
         "fast_stacked",
+        "fast_mla_attend",
         "picked_trellis",
     ];
     // The grid's trellis experts reach picked trellis on CUDA.
