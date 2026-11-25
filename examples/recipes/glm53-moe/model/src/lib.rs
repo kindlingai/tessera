@@ -31,12 +31,12 @@ const CODES: [&str; 3] = ["gate", "up", "down"];
 const INNER: [&str; 6] = ["gate", "gate_sv", "up", "up_sv", "down_su", "down"];
 
 /// Past these, the linked rules serve better or `moe.cu` cannot.
-const MOST_ROWS: usize = 256;
+const MOST_ROWS: usize = 512;
 const MOST_EXPERTS: usize = 256;
 const MAX_SLOTS: usize = 384;
 const PICKS: usize = 8;
 /// Words in `Plan` struct in `moe.cu`.
-const PLAN_WORDS: usize = 1 + MAX_SLOTS * 10 + MOST_ROWS * PICKS * 2;
+const PLAN_WORDS: usize = 1 + MAX_SLOTS * 26 + MOST_ROWS * PICKS * 2;
 /// 16-byte aligned word offset for router score scratch.
 const SCORES_OFF: usize = PLAN_WORDS.next_multiple_of(4);
 
@@ -185,12 +185,12 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             1
         },
     );
-    let n_sh = rows.div_ceil(16);
+    let n_sh = rows.div_ceil(32);
     let assigns = (rows * picks).min(count * rows);
     let active = count.min(assigns);
-    let max_routed = (count * n_sh).min(active + (assigns - active) / 16);
+    let max_routed = (count * n_sh).min(active + (assigns - active) / 32);
     let total_slots = n_sh + max_routed;
-    let max_col = rows.min(16);
+    let max_col = rows.min(32);
     let (route_x, route_y, rks) = if bf16 == 1 && experts % 16 == 0 && hidden % 256 == 0 {
         let nb = experts / 16;
         let rm = rows.div_ceil(16);
