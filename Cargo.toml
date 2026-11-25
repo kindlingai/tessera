@@ -11,6 +11,7 @@ members = [
     "examples/recipes/*/model",
     "frontend/*",
     "tools/calibrate",
+    "tools/hessians",
     "tools/inspect",
     "tools/load",
     "tools/parity",

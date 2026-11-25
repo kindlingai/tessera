@@ -16,6 +16,9 @@ mod gguf;
 #[cfg(test)]
 mod gguf_test;
 mod gguf_write;
+pub mod hessian;
+#[cfg(test)]
+mod hessian_test;
 mod offer;
 #[cfg(test)]
 mod offer_test;
@@ -23,6 +26,7 @@ mod pickle;
 mod quant;
 #[cfg(test)]
 mod quant_test;
+mod st_write;
 mod torch;
 #[cfg(test)]
 mod torch_test;

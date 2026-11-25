@@ -95,6 +95,7 @@ Join us on discord (https://discord.gg/8EAvYPV2rE) to discuss larger features to
 <tr><td>&emsp;<a href="frontend/tasks">tasks/</a></td><td>tessera-tasks</td><td>Text in, answers out: generation and tagging over a loaded model</td></tr>
 <tr><td colspan="3"><a href="tools"><b>tools/</b></a></td></tr>
 <tr><td>&emsp;<a href="tools/calibrate">calibrate/</a></td><td>tessera-calibrate</td><td>Times kernels on this machine and stores what they cost</td></tr>
+<tr><td>&emsp;<a href="tools/hessians">hessians/</a></td><td>tessera-hessians</td><td>Layer-streaming BF16 Hessian calibration generator for exlr8</td></tr>
 <tr><td>&emsp;<a href="tools/inspect">inspect/</a></td><td>tessera-inspect</td><td>Draws a model's graph, its lowering per rank, and tokens between ranks</td></tr>
 <tr><td>&emsp;<a href="tools/load">load/</a></td><td>tessera-load</td><td>Drives concurrent requests against tessera-serve and reports throughput</td></tr>
 <tr><td>&emsp;<a href="tools/parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
