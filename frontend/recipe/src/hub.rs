@@ -3,7 +3,7 @@
 use crate::{Error, io, pinned};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -226,7 +226,43 @@ fn fetch_header(
     file.write_all(&head).map_err(io(&part))?;
     file.write_all(&header).map_err(io(&part))?;
     file.set_len(size).map_err(io(&part))?;
+    // Readers may take shapes and scales from small tensors.
+    for (from, to) in small_spans(&header) {
+        let at = 8 + len + from;
+        let bytes = read_range(&url, token, at, to - from)?;
+        file.seek(std::io::SeekFrom::Start(at)).map_err(io(&part))?;
+        file.write_all(&bytes).map_err(io(&part))?;
+    }
     std::fs::rename(&part, path).map_err(io(path))
+}
+
+/// Header-only files keep tensors up to this size.
+const SMALL: u64 = 1 << 16;
+
+/// Small tensors' spans in `header`, joined over short gaps.
+fn small_spans(header: &[u8]) -> Vec<(u64, u64)> {
+    let table: BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(header).unwrap_or_default();
+    let mut spans = Vec::new();
+    for tensor in table.values() {
+        let at = tensor.get("data_offsets").and_then(|o| o.as_array());
+        let at: Option<Vec<u64>> = at.map(|o| o.iter().filter_map(|v| v.as_u64()).collect());
+        if let Some([from, to]) = at.as_deref()
+            && to - from <= SMALL
+        {
+            spans.push((*from, *to));
+        }
+    }
+    spans.sort_unstable();
+    let mut joined: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in spans {
+        match joined.last_mut() {
+            Some(last) if from <= last.1 + SMALL => last.1 = last.1.max(to),
+            _ => joined.push((from, to)),
+        }
+    }
+    joined.retain(|(from, to)| to > from);
+    joined
 }
 
 fn short(url: &str) -> Error {

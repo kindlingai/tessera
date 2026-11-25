@@ -825,6 +825,10 @@ impl<A: Api> Device for Context<A> {
     }
 
     fn free_memory(&self) -> Option<u64> {
+        // Integrated devices count reclaimable host pages as used.
+        if A::describe(self).integrated {
+            return None;
+        }
         self.locked(|a| a.free_memory()).ok()
     }
 

@@ -45,6 +45,11 @@ pub fn sizing() {
     sized.get_or_insert_default();
 }
 
+/// Whether `open` gives runners that only count bytes.
+pub fn counting() -> bool {
+    SIZED.lock().expect("sizes").is_some()
+}
+
 /// The bytes of every runner opened since `sizing`.
 pub fn sized() -> Sizes {
     let sized = SIZED.lock().expect("sizes");

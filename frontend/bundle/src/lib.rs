@@ -136,6 +136,11 @@ impl Weights {
         mut take: impl FnMut(u32, &Weight) -> Result<(), E>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let step = progress.step("weights", Unit::Items, Some(count.into()));
+        // Sizing runners only count bytes, so skip the reads.
+        if tessera_engine::sizer::counting() {
+            step.finish();
+            return Ok(());
+        }
         self.each_share(shares, |at, w| {
             take(at, w)?;
             step.add(1);
