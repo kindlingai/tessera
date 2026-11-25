@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
-use tessera_engine::Sampling;
+use tessera_engine::{Penalties, Sampling};
 use tessera_tasks::api::Format;
 
 /// Why a request was refused, in OpenAI's error format.
@@ -63,8 +63,7 @@ pub(crate) fn now() -> u64 {
 fn neutral(key: &str, value: &Value) -> Option<bool> {
     let numbers: &[f64] = match key {
         "user" => return Some(true),
-        "presence_penalty" | "frequency_penalty" => &[0.0],
-        "n" | "best_of" | "repetition_penalty" => &[1.0],
+        "n" | "best_of" => &[1.0],
         "logprobs" | "echo" => return Some(value.is_null() || *value == json!(false)),
         "tools" | "functions" => return Some(value.is_null() || *value == json!([])),
         "tool_choice" => {
@@ -221,6 +220,9 @@ pub(crate) struct Common {
     pub(crate) top_k: Option<i64>,
     pub(crate) min_p: Option<f32>,
     pub(crate) seed: Option<i64>,
+    pub(crate) presence_penalty: Option<f32>,
+    pub(crate) frequency_penalty: Option<f32>,
+    pub(crate) repetition_penalty: Option<f32>,
 }
 
 impl Common {
@@ -249,6 +251,26 @@ impl Common {
             top_k,
             min_p,
             seed: self.seed.map(|s| s as u64),
+        })
+    }
+
+    /// Validated logit penalties for this request.
+    pub(crate) fn penalties(&self) -> Result<Penalties, Refusal> {
+        let within = |v: Option<f32>, key| match v.unwrap_or(0.0) {
+            v if (-2.0..=2.0).contains(&v) => Ok(v),
+            _ => Err(bad(format!("{key} must be in [-2, 2]"), key)),
+        };
+        let repetition = self.repetition_penalty.unwrap_or(1.0);
+        if !repetition.is_finite() || repetition <= 0.0 {
+            return Err(bad(
+                "repetition_penalty must be positive",
+                "repetition_penalty",
+            ));
+        }
+        Ok(Penalties {
+            presence: within(self.presence_penalty, "presence_penalty")?,
+            frequency: within(self.frequency_penalty, "frequency_penalty")?,
+            repetition,
         })
     }
 

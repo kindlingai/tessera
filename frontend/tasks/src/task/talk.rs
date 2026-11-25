@@ -9,7 +9,7 @@ use tessera_bundle::Message;
 impl Model {
     /// The messages as one prompt, by the model's template.
     pub fn render(&self, messages: &[Message]) -> Result<String, Error> {
-        let none = || Refused("the model has no chat template".into());
+        let none = || Refused("the model has no chat template".into(), "messages");
         self.chat.as_ref().ok_or_else(none)?.render(messages, false)
     }
 
@@ -21,7 +21,7 @@ impl Model {
         format: Option<Format>,
         each: &mut dyn FnMut(&str),
     ) -> Result<String, Error> {
-        let none = || Refused("the model does not generate text".into());
+        let none = || Refused("the model does not generate text".into(), "model");
         let generator = self.generator.as_ref().ok_or_else(none)?;
         let ids = self.tokens.encode(prompt)?;
         let room = self.info.context.saturating_sub(ids.len());

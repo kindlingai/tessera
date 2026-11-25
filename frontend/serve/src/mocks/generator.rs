@@ -19,7 +19,10 @@ impl Generator for MockGenerator {
         if let Some(Format::Schema(schema)) = &params.format
             && !schema.is_object()
         {
-            return Err(Box::new(Refused("a schema is an object".into())));
+            return Err(Box::new(Refused(
+                "a schema is an object".into(),
+                "response_format",
+            )));
         }
         *self.asked.lock().unwrap() = Some(params);
         if let Some((last, head)) = self.pieces.split_last() {

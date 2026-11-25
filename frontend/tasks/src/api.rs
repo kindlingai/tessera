@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{Message, RenderOptions, ResponseParser};
 pub use tessera_engine::Read;
-use tessera_engine::Sampling;
+use tessera_engine::{Penalties, Sampling};
 
 /// The served model's name and context size.
 #[derive(Clone, Debug)]
@@ -62,6 +62,8 @@ pub struct Params {
     pub raw: bool,
     /// Sampling parameters. Default is greedy.
     pub sampling: Sampling,
+    /// Logit penalties for seen tokens. Default is none.
+    pub penalties: Penalties,
 }
 
 /// A required shape for an answer.
@@ -73,9 +75,9 @@ pub enum Format {
     Schema(serde_json::Value),
 }
 
-/// A request the model cannot answer as asked.
+/// A request the model cannot answer: why, and the field.
 #[derive(Debug)]
-pub struct Refused(pub String);
+pub struct Refused(pub String, pub &'static str);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

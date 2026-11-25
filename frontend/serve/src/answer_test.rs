@@ -65,7 +65,7 @@ fn refusals() {
         (json!({"model": "other", "prompt": "a"}), 404, "model"),
         (json!({"prompt": "a", "tools": [{}]}), 400, "tools"),
         (
-            json!({"prompt": "a", "presence_penalty": 0.7}),
+            json!({"prompt": "a", "presence_penalty": 2.5}),
             400,
             "presence_penalty",
         ),
@@ -158,6 +158,9 @@ fn sampling_params_accepted() {
         "top_k": 40,
         "min_p": 0.05,
         "seed": 42,
+        "presence_penalty": 0.5,
+        "frequency_penalty": -0.25,
+        "repetition_penalty": 1.1,
     });
     assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
 }

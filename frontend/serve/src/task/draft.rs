@@ -220,6 +220,7 @@ pub(super) fn serve(
         response: target.response,
         stop: target.stop,
         guides: None,
+        edits: false,
     };
     let jobs = queue(load, generate, false);
     while let Ok((request, mut sink)) = jobs.recv() {

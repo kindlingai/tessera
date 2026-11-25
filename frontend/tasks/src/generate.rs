@@ -6,7 +6,7 @@ use crate::{Error, Spool, Stops};
 use std::sync::{Arc, Mutex, mpsc};
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_bundle::{Message, RenderOptions, ResponseParser, Template};
-use tessera_engine::{Event, Read, Reason, Request};
+use tessera_engine::{Event, Read, Reason, Request, Stacked};
 
 /// A request for the engine thread, and its sink.
 pub type Job = (Request, tessera_engine::Sink);
@@ -19,6 +19,9 @@ pub struct Generate {
     pub stop: Vec<u32>,
     /// Guides for answers with a format. `None` refuses formats.
     pub guides: Option<Arc<dyn Guides>>,
+    /// Whether the engine applies guide edits. `false` refuses
+    /// penalties.
+    pub edits: bool,
 }
 
 impl Tokens for Generate {
@@ -83,19 +86,25 @@ pub struct Queued {
 
 impl Generator for Queued {
     fn generate(&self, prompt: Vec<u32>, params: Params, mut sink: Sink) -> Result<(), Error> {
-        let guide = match (&params.format, &self.generate.guides) {
-            (None, _) => None,
-            (Some(format), Some(guides)) => Some(guides.guide(format)?),
+        let mut guides = Vec::new();
+        match (&params.format, &self.generate.guides) {
+            (None, _) => {}
+            (Some(format), Some(made)) => guides.push(made.guide(format)?),
             (Some(_), None) => {
                 let why = "this model was loaded without guided decoding";
-                return Err(Box::new(Refused(why.into())));
+                return Err(Box::new(Refused(why.into(), "response_format")));
             }
-        };
+        }
+        if !params.penalties.neutral() && !self.generate.edits {
+            let why = "this model was loaded without logit edits";
+            return Err(Box::new(Refused(why.into(), "presence_penalty")));
+        }
+        guides.extend(params.penalties.guide(&prompt));
         let request = Request {
             tokens: prompt,
             max_tokens: params.max_tokens,
             stop: self.generate.stop.clone(),
-            guide,
+            guide: Stacked::of(guides),
             reads: Vec::new(),
             sampling: params.sampling,
         };

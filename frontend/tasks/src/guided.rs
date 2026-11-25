@@ -21,7 +21,10 @@ impl Guides for tessera_grammar::Vocab {
         };
         match made {
             Ok(matcher) => Ok(Box::new(matcher)),
-            Err(e) => Err(Box::new(crate::api::Refused(e.to_string()))),
+            Err(e) => Err(Box::new(crate::api::Refused(
+                e.to_string(),
+                "response_format",
+            ))),
         }
     }
 }

@@ -131,12 +131,14 @@ fn start(
         return Err(bad("the prompt is empty", "prompt"));
     }
     let sampling = common.sampling()?;
+    let penalties = common.penalties()?;
     let params = Params {
         max_tokens: budget(model, prompt.len(), asked)?,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
         format: common.response_format.and_then(ResponseFormat::format),
         raw: parsing.parser.is_some(),
         sampling,
+        penalties,
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
@@ -147,7 +149,7 @@ fn start(
             Box::new(move |step| sink.send(step).is_ok()),
         )
         .map_err(|e| match e.downcast_ref::<Refused>() {
-            Some(why) => bad(why.0.clone(), "response_format"),
+            Some(why) => bad(why.0.clone(), why.1),
             None => refuse(503, e.to_string(), None),
         })?;
     Ok(Started {
