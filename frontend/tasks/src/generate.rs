@@ -62,6 +62,11 @@ impl Chat for Generate {
         if messages.is_empty() {
             return Err("no messages".into());
         }
+        if let Some(parser) = &self.response
+            && !template.mentions("tool_calls")
+        {
+            return Ok(template.render_options(&parser.inline_calls(messages), options)?);
+        }
         Ok(template.render_options(messages, options)?)
     }
 

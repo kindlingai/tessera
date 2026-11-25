@@ -1,0 +1,6 @@
+{
+  "fields": {
+    "content": {"close": ["<|end_of_text|>", "<|start_of_role|>"], "content": "text"},
+    "tool_calls": {"open": ["<|tool_call|>", "<tool_call>"], "content": "json"}
+  }
+}
