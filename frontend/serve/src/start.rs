@@ -15,7 +15,7 @@ use tessera_tasks::api::Info;
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--max-batch-rows <n>] [--kv-dtype <f32|bf16|fp8>] [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
+[--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--reject-unknown-fields] [--require-favored] [--explain-lowering]";
     format!("{head} {} {tail}", task::usage())
 }
@@ -134,6 +134,12 @@ impl Options {
                 self.kv_cache_tokens = Some(n);
             }
             "--max-connections" => self.max_connections = value.parse().ok()?,
+            // Keeps the first n layers, for quick kernel timing.
+            "--layers" => {
+                let n: u64 = value.parse().ok().filter(|n| *n > 0)?;
+                self.config
+                    .set("config.json", "num_hidden_layers", n.into());
+            }
             "--served-model-name" => self.name = Some(value),
             "--task" => self.task = task::names().into_iter().find(|t| *t == value)?,
             _ => match task::owned(flag) {
