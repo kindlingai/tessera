@@ -1,6 +1,6 @@
-//! Built-in `response_template`s for checkpoints that ship none.
+//! Built-in `response_template`s, and the block markers of any.
 
-use super::ResponseParser;
+use super::{BlockSpec, ResponseParser};
 use crate::template::Template;
 use std::error::Error;
 
@@ -48,4 +48,32 @@ pub(super) fn pick(
         }
     }
     Ok(None)
+}
+
+/// Something for each marker that opens or closes a block.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Markers<T> {
+    pub think_open: T,
+    pub think_close: T,
+    pub call_open: T,
+    pub call_close: T,
+}
+
+impl ResponseParser {
+    /// Each marker's texts. Pattern openers give their fixed start.
+    pub fn markers(&self) -> Markers<Vec<&str>> {
+        fn open(b: &Option<BlockSpec>) -> Vec<&str> {
+            b.as_ref().map_or(Vec::new(), |b| b.open.triggers())
+        }
+        fn close(b: &Option<BlockSpec>) -> Vec<&str> {
+            b.as_ref()
+                .map_or(Vec::new(), |b| b.close.iter().map(String::as_str).collect())
+        }
+        Markers {
+            think_open: open(&self.thinking),
+            think_close: close(&self.thinking),
+            call_open: open(&self.tool_calls),
+            call_close: close(&self.tool_calls),
+        }
+    }
 }

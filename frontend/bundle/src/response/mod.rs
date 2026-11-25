@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
 
+pub use formats::Markers;
+
 /// One parsed piece from a model response.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponseEvent {

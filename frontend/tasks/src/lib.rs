@@ -25,6 +25,9 @@ pub mod pictures;
 #[cfg(test)]
 mod pictures_test;
 pub mod png;
+pub mod scopes;
+#[cfg(test)]
+mod scopes_test;
 pub mod tag;
 pub mod task;
 #[cfg(test)]

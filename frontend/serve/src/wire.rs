@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_engine::{Penalties, Sampling};
 use tessera_tasks::api::Format;
+use tessera_tasks::scopes::{Boost, Thinking};
 
 /// Why a request was refused, in OpenAI's error format.
 #[derive(Debug)]
@@ -223,6 +224,17 @@ pub(crate) struct Common {
     pub(crate) presence_penalty: Option<f32>,
     pub(crate) frequency_penalty: Option<f32>,
     pub(crate) repetition_penalty: Option<f32>,
+    pub(crate) thinking_presence_penalty: Option<f32>,
+    pub(crate) thinking_frequency_penalty: Option<f32>,
+    pub(crate) think_end_boost: Option<Switch>,
+}
+
+/// A spec string, or `false` for off.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Switch {
+    Flag(bool),
+    Spec(String),
 }
 
 impl Common {
@@ -256,10 +268,6 @@ impl Common {
 
     /// Validated logit penalties for this request.
     pub(crate) fn penalties(&self) -> Result<Penalties, Refusal> {
-        let within = |v: Option<f32>, key| match v.unwrap_or(0.0) {
-            v if (-2.0..=2.0).contains(&v) => Ok(v),
-            _ => Err(bad(format!("{key} must be in [-2, 2]"), key)),
-        };
         let repetition = self.repetition_penalty.unwrap_or(1.0);
         if !repetition.is_finite() || repetition <= 0.0 {
             return Err(bad(
@@ -274,6 +282,30 @@ impl Common {
         })
     }
 
+    /// Validated changes inside a think block.
+    pub(crate) fn thinking(&self) -> Result<Thinking, Refusal> {
+        const KEY: &str = "think_end_boost";
+        let boost = match &self.think_end_boost {
+            None | Some(Switch::Flag(false)) => None,
+            Some(Switch::Spec(s)) if s.trim() == "off" => None,
+            Some(Switch::Spec(s)) => {
+                Boost::parse(s).map_err(|e| bad(format!("{KEY}: {e}"), KEY))?
+            }
+            Some(Switch::Flag(true)) => {
+                let why = r#"think_end_boost must be a string like "start=0.5x,per1k=2,max=10", "off" or false"#;
+                return Err(bad(why, KEY));
+            }
+        };
+        Ok(Thinking {
+            presence: within(self.thinking_presence_penalty, "thinking_presence_penalty")?,
+            frequency: within(
+                self.thinking_frequency_penalty,
+                "thinking_frequency_penalty",
+            )?,
+            boost,
+        })
+    }
+
     fn nested(&self) -> Vec<String> {
         let options = self.stream_options.as_ref().map(|o| &o.extra);
         let mut out: Vec<String> =
@@ -282,6 +314,14 @@ impl Common {
             out.extend(paths("response_format.json_schema", &json_schema.extra));
         }
         out
+    }
+}
+
+/// A penalty in [-2, 2]. Missing is 0.
+fn within(v: Option<f32>, key: &str) -> Result<f32, Refusal> {
+    match v.unwrap_or(0.0) {
+        v if (-2.0..=2.0).contains(&v) => Ok(v),
+        _ => Err(bad(format!("{key} must be in [-2, 2]"), key)),
     }
 }
 

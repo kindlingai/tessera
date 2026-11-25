@@ -1,6 +1,7 @@
 //! Calls an HTTP front end makes on a loaded model.
 
 use crate::Error;
+use crate::scopes::Thinking;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{Message, RenderOptions, ResponseParser};
@@ -64,6 +65,10 @@ pub struct Params {
     pub sampling: Sampling,
     /// Logit penalties for seen tokens. Default is none.
     pub penalties: Penalties,
+    /// Changes inside a think block. Default is none.
+    pub thinking: Thinking,
+    /// Whether the prompt leaves a think block open.
+    pub starts_thinking: bool,
 }
 
 /// A required shape for an answer.

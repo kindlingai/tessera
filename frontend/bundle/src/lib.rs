@@ -38,7 +38,7 @@ mod template_test;
 pub mod tokenize;
 pub mod vae;
 
-pub use response::{ParsedResponse, ResponseEvent, ResponseParser, ResponseStream};
+pub use response::{Markers, ParsedResponse, ResponseEvent, ResponseParser, ResponseStream};
 pub use template::{Clock, FunctionCall, Message, RenderOptions, Template, ToolCall};
 
 use names::Rule;

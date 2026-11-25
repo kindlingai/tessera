@@ -85,3 +85,27 @@ fn clear_thinking_forwards() {
     assert_eq!(status, 200);
     assert_eq!(got["count"], "user:hi|clear=false".len());
 }
+
+#[test]
+fn thinking_keys() {
+    let mock = Arc::new(MockGenerator::default());
+    let slot = loaded(&mock, true);
+    let body = json!({"prompt": "a", "thinking_presence_penalty": 0.25,
+        "thinking_frequency_penalty": 0.5, "think_end_boost": "start=8|0.5x,per1k=2,max=10"});
+    assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
+    let thinking = mock.asked.lock().unwrap().clone().unwrap().thinking;
+    assert!(thinking.frequency == 0.5 && thinking.boost.is_some());
+    let bad = [
+        ("thinking_frequency_penalty", json!(-2.5)),
+        ("think_end_boost", json!(true)),
+        ("think_end_boost", json!("start=1,per1k=1,max=21")),
+    ];
+    for (key, value) in bad {
+        let (status, error) = json(
+            &slot,
+            "/v1/completions",
+            Some(json!({"prompt": "a", key: value})),
+        );
+        assert_eq!((status, &error["error"]["param"]), (400, &json!(key)));
+    }
+}

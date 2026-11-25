@@ -134,6 +134,7 @@ fn start(
     }
     let sampling = common.sampling()?;
     let penalties = common.penalties()?;
+    let thinking = common.thinking()?;
     let params = Params {
         max_tokens: budget(model, prompt.len(), asked)?,
         stop: common.stop.map(wire::Strings::list).unwrap_or_default(),
@@ -141,6 +142,8 @@ fn start(
         raw: parsing.parser.is_some(),
         sampling,
         penalties,
+        thinking,
+        starts_thinking: parsing.thinking,
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();

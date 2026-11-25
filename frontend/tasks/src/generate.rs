@@ -2,6 +2,7 @@
 
 use crate::api::{Chat, Finish, Generator, Params, Refused, Score, Sink, Step, Tokens};
 use crate::guided::Guides;
+use crate::scopes;
 use crate::{Error, Spool, Stops};
 use std::sync::{Arc, Mutex, mpsc};
 use tessera_bundle::tokenize::hf::Hf;
@@ -98,15 +99,29 @@ impl Generator for Queued {
                 return Err(Box::new(Refused(why.into(), "response_format")));
             }
         }
-        if !params.penalties.neutral() && !self.generate.edits {
+        let key = match params.penalties.neutral() {
+            true => params.thinking.key(),
+            false => Some("presence_penalty"),
+        };
+        if let Some(key) = key
+            && !self.generate.edits
+        {
             let why = "this model was loaded without logit edits";
-            return Err(Box::new(Refused(why.into(), "presence_penalty")));
+            return Err(Box::new(Refused(why.into(), key)));
         }
         if !params.sampling.greedy() && !self.generate.sampling {
             let why = "this model was loaded for greedy decoding only";
             return Err(Box::new(Refused(why.into(), "temperature")));
         }
-        guides.extend(params.penalties.guide(&prompt));
+        if key.is_some() {
+            let parser = self.generate.response.as_ref();
+            guides.push(scopes::guide(
+                parser,
+                &self.generate.tokenizer,
+                &params,
+                &prompt,
+            )?);
+        }
         let request = Request {
             tokens: prompt,
             max_tokens: params.max_tokens,
