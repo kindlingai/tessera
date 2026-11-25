@@ -42,6 +42,8 @@ impl Model {
             graph: sharded,
             whole,
         } = shard(&source, parts)?;
+        // With no transport, sums carry F32 as host sums do.
+        let sharded = sharded.wired(tessera_graph::DType::F32);
         let (mut origin, mut added) = (Vec::new(), Vec::new());
         let mut at = 0;
         for n in &sharded.nodes {

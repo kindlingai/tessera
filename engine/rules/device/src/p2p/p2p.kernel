@@ -75,7 +75,7 @@ TESSERA_FN uint2 pack_bf16x4(float4 v) {
 
 TESSERA_FN float4 unpack_bf16x4(uint2 p) {
     return make_float4(prim::from_bits(p.x << 16), prim::from_bits(p.x & 0xFFFF0000u),
-                       __uint_as_float(p.y << 16), __uint_as_float(p.y & 0xFFFF0000u));
+                       prim::from_bits(p.y << 16), prim::from_bits(p.y & 0xFFFF0000u));
 }
 
 template <bool BF16>
