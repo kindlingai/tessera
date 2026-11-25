@@ -143,8 +143,7 @@ fn sweep(g: &Graph, entry: usize, forced: &[bool]) -> Vec<Need> {
             let ty = &g.node(*a).ty;
             rowwise(&n.op, j, ty) && !by_rows(ty) && ty.shape.0.iter().any(|e| mentions(e, Rows))
         };
-        let fixed = matches!(n.op, Op::Input { .. } | Op::Weight(_)) || n.op.keeps();
-        let fixed = fixed && !follows(g, &n.op);
+        let fixed = n.op.stateful() && !follows(g, &n.op);
         if need[i] == Need::Picked
             && (fixed || !by_rows(&n.ty) || n.args.iter().enumerate().any(mixed))
         {

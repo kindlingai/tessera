@@ -5,6 +5,7 @@ mod infer;
 mod json;
 mod node;
 mod numerics;
+mod ops;
 mod parts;
 mod regions;
 mod scalar;
@@ -23,6 +24,7 @@ pub use node::{
     Output, Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order, sums_ranks};
+pub use ops::OpFacts;
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};

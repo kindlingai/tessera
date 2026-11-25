@@ -58,7 +58,7 @@ pub enum Lower {
     Kernel(&'static str),
 }
 
-/// The pinned form site for a stage's result.
+/// The pinned form site for a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pin {
     Plain,
@@ -66,6 +66,9 @@ pub enum Pin {
     /// Probabilities: softmax, or the router inside MoE.
     Prob,
     Residual,
+    Matmul,
+    Attention,
+    Router,
 }
 
 /// A stage's operand, checks, placement rule and lowering.

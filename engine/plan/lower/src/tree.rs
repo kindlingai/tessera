@@ -153,27 +153,19 @@ fn pinned_form(
         }
         return pins.outputs;
     }
-    let site = match (op, facts.map_or(Pin::Plain, |f| f.pin)) {
-        (_, Pin::Norm) => Some(Site::Norm),
-        (_, Pin::Prob) => {
-            if in_moe && pins.site_form(Site::Router).is_some() {
-                Some(Site::Router)
-            } else {
-                Some(Site::Softmax)
-            }
-        }
-        (_, Pin::Residual) => {
-            if in_moe && pins.site_form(Site::Router).is_some() {
-                Some(Site::Router)
-            } else {
-                Some(Site::Residual)
-            }
-        }
-        (Op::Mix(_), _) => Some(Site::Router),
-        (Op::Attend(_) | Op::Delta(_), _) => Some(Site::Attention),
-        (Op::Matmul, _) => Some(Site::Matmul),
-        _ if in_moe => Some(Site::Router),
-        _ => None,
+    let routed = in_moe && pins.site_form(Site::Router).is_some();
+    let pin = facts.map(|f| f.pin).filter(|p| *p != Pin::Plain);
+    let site = match pin.unwrap_or(op.facts().pin) {
+        Pin::Norm => Some(Site::Norm),
+        Pin::Prob if routed => Some(Site::Router),
+        Pin::Prob => Some(Site::Softmax),
+        Pin::Residual if routed => Some(Site::Router),
+        Pin::Residual => Some(Site::Residual),
+        Pin::Router => Some(Site::Router),
+        Pin::Attention => Some(Site::Attention),
+        Pin::Matmul => Some(Site::Matmul),
+        Pin::Plain if in_moe => Some(Site::Router),
+        Pin::Plain => None,
     };
     site.and_then(|s| pins.site_form(s))
         .unwrap_or(pins.activations)

@@ -3,8 +3,9 @@
 use crate::dims::{Dim, DimExpr, Shape};
 use crate::json::VERSION;
 use crate::numerics::Numerics;
+pub use crate::ops::Op;
 use crate::stages::Stage;
-use crate::types::{DType, TensorType};
+use crate::types::TensorType;
 use serde::{Deserialize, Serialize};
 
 /// A traced program: weights, nodes in order, entry points.
@@ -95,129 +96,6 @@ pub struct Node {
     /// Present exactly on ops that reduce.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numerics: Option<Numerics>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum Op {
-    /// An entry's input port.
-    Input {
-        entry: u32,
-        port: u32,
-    },
-    Weight(u32),
-    /// `x[.., K]` times `w[.., N, K]` transposed.
-    Matmul,
-    Attend(Attend),
-    /// Queries, keys, values, log decays and write rates.
-    Delta(Delta),
-    /// Each channel sums its last `K` rows, weighted by taps.
-    Conv(Conv),
-    /// Scores `[.., Queries, Keys]`. Unseen keys become negative infinity.
-    Mask(Mask),
-    /// Appends rows to kept rows. The result holds all.
-    Append(u32),
-    Row(Row),
-    Select(Select),
-    View(View),
-    /// Truncates toward zero. The value must fit the target type.
-    Cast(DType),
-    /// The mean over this axis. The axis goes away.
-    Mean(u32),
-    /// The sum over this axis, slices weighted by argument two.
-    Mix(u32),
-}
-
-impl Op {
-    /// Whether this op sums, so it carries `Numerics`.
-    pub fn reduces(&self) -> bool {
-        match self {
-            Op::Matmul | Op::Attend(_) | Op::Delta(_) | Op::Mean(_) | Op::Mix(_) => true,
-            Op::Row(r) => r.0.iter().any(Stage::reduces),
-            Op::Input { .. }
-            | Op::Weight(_)
-            | Op::Conv(_)
-            | Op::Mask(_)
-            | Op::Append(_)
-            | Op::Select(_)
-            | Op::View(_)
-            | Op::Cast(_) => false,
-        }
-    }
-
-    /// Whether the result reads state besides its arguments.
-    pub fn stateful(&self) -> bool {
-        match self {
-            Op::Input { .. } | Op::Weight(_) => true,
-            Op::Append(_) | Op::Conv(_) | Op::Delta(_) => self.keeps(),
-            Op::Matmul
-            | Op::Attend(_)
-            | Op::Mask(_)
-            | Op::Row(_)
-            | Op::Select(_)
-            | Op::View(_)
-            | Op::Cast(_)
-            | Op::Mean(_)
-            | Op::Mix(_) => false,
-        }
-    }
-
-    /// Whether the op writes kept rows or state.
-    pub fn keeps(&self) -> bool {
-        matches!(self, Op::Append(_)) || self.recurrent()
-    }
-
-    /// Whether the op carries slot state across launches.
-    pub fn recurrent(&self) -> bool {
-        match self {
-            Op::Conv(c) => c.state.is_some(),
-            Op::Delta(d) => d.state.is_some(),
-            Op::Input { .. }
-            | Op::Weight(_)
-            | Op::Append(_)
-            | Op::Matmul
-            | Op::Attend(_)
-            | Op::Mask(_)
-            | Op::Row(_)
-            | Op::Select(_)
-            | Op::View(_)
-            | Op::Cast(_)
-            | Op::Mean(_)
-            | Op::Mix(_) => false,
-        }
-    }
-
-    /// The op with `f` applied to each size it names.
-    pub fn map_dims(&self, f: impl Fn(&DimExpr) -> DimExpr) -> Op {
-        match self {
-            Op::View(View::Reshape(s)) => {
-                Op::View(View::Reshape(Shape(s.0.iter().map(f).collect())))
-            }
-            Op::View(View::Slice { axis, start, len }) => Op::View(View::Slice {
-                axis: *axis,
-                start: f(start),
-                len: f(len),
-            }),
-            Op::View(View::Expand { axis, to }) => Op::View(View::Expand {
-                axis: *axis,
-                to: f(to),
-            }),
-            Op::Select(Select::TopK { k }) => Op::Select(Select::TopK { k: f(k) }),
-            Op::View(View::Permute(_) | View::Concat)
-            | Op::Select(Select::Gather | Select::Take)
-            | Op::Input { .. }
-            | Op::Weight(_)
-            | Op::Matmul
-            | Op::Attend(_)
-            | Op::Delta(_)
-            | Op::Conv(_)
-            | Op::Mask(_)
-            | Op::Append(_)
-            | Op::Row(_)
-            | Op::Cast(_)
-            | Op::Mean(_)
-            | Op::Mix(_) => self.clone(),
-        }
-    }
 }
 
 /// Over `[Seqs, Context, Heads, HeadDim]`. Key heads serve contiguous groups.

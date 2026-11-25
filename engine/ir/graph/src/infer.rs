@@ -1,7 +1,7 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Graph, Op, Select, View};
+use crate::node::{Graph, Op, View};
 use crate::select;
 use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
@@ -95,23 +95,9 @@ fn moved_axis(dims: &[Dim], from: &Shape, to: &Shape, axis: u32) -> Result<Optio
     Ok(None)
 }
 
-fn arity(op: &Op) -> usize {
-    match op {
-        Op::Input { .. } | Op::Weight(_) => 0,
-        Op::Select(Select::TopK { .. }) | Op::Mask(_) | Op::Cast(_) | Op::Mean(_) => 1,
-        Op::Append(_) => 3,
-        Op::Matmul | Op::Select(_) | Op::View(View::Concat) | Op::Mix(_) => 2,
-        Op::Attend(a) => 3 + usize::from(a.picked) + 2 * usize::from(a.ragged),
-        Op::Delta(d) => 5 + 2 * usize::from(d.state.is_some()),
-        Op::Conv(c) => 2 + 2 * usize::from(c.state.is_some()),
-        Op::Row(r) => 1 + r.0.iter().map(Stage::operands).sum::<usize>(),
-        Op::View(_) => 1,
-    }
-}
-
 /// The type `op` gives `args`, or why they don't fit.
 pub fn infer(g: &Graph, op: &Op, args: &[&TensorType]) -> Result<TensorType, TypeError> {
-    let want = arity(op);
+    let want = op.facts().args;
     need(args.len() == want, ErrorKind::Arity, || {
         format!("{op:?} takes {want} arguments, got {}", args.len())
     })?;

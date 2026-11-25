@@ -111,11 +111,7 @@ fn kept(g: &Graph, owners: &[Option<u32>], i: usize, k: &TensorType) -> Result<(
     let mut appends = Vec::new();
     let mut states = Vec::new();
     for (n, own) in g.nodes.iter().zip(owners) {
-        let is_state = match &n.op {
-            Op::Conv(c) => c.state == Some(idx),
-            Op::Delta(d) => d.state == Some(idx),
-            _ => false,
-        };
+        let is_state = n.op.facts().state == Some(idx);
         if n.op == Op::Append(idx) {
             need(!appends.contains(own), ErrorKind::Reference, || {
                 format!("kept rows {i} are appended to twice")
