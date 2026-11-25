@@ -1,5 +1,8 @@
 //! Text in, answers out: tasks adapt text to a model.
 
+// The derive names this crate by path, even inside it.
+extern crate self as tessera_tasks;
+
 pub mod api;
 pub mod embed;
 #[cfg(test)]
@@ -21,6 +24,9 @@ pub mod pictures;
 mod pictures_test;
 pub mod png;
 pub mod tag;
+pub mod task;
+#[cfg(test)]
+mod task_test;
 mod text;
 #[cfg(test)]
 mod text_test;

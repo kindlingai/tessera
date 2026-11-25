@@ -7,12 +7,24 @@ use tessera_recipe::Recipe;
 use tessera_serve::start::Options;
 
 /// Why a run stops early.
+#[derive(Debug)]
 pub enum Stop {
     Usage,
-    /// The task list, after an unknown task name if given.
+    /// The task list, after a message if given.
     Tasks(Option<String>),
     Failed(String),
 }
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stop::Usage | Stop::Tasks(None) => f.write_str("bad usage"),
+            Stop::Tasks(Some(text)) | Stop::Failed(text) => f.write_str(text),
+        }
+    }
+}
+
+impl std::error::Error for Stop {}
 
 impl From<tessera_recipe::Error> for Stop {
     fn from(e: tessera_recipe::Error) -> Self {
@@ -49,6 +61,14 @@ pub fn builtin(name: &str) -> Option<Result<Recipe, Stop>> {
     let (_, text) = CATALOG.iter().find(|(n, _)| *n == name)?;
     let path = PathBuf::from(format!("builtin/{name}.toml"));
     Some(Recipe::parse(text, &path).map_err(Stop::from))
+}
+
+/// A recipe's kind: its serve task, or text generation.
+pub fn kind(r: &Recipe) -> &str {
+    r.serve
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("generate")
 }
 
 /// Every catalog recipe that reads.
@@ -154,9 +174,22 @@ impl Source {
         })
     }
 
-    /// Opens `origin`, or the default recipe when there is none.
-    pub fn open_or_default(origin: Option<Origin>) -> Result<Source, Stop> {
-        Self::open(Some(origin.unwrap_or(Origin::Builtin(CATALOG[0].0))))
+    /// Opens `origin`, else the first catalog recipe of `of`.
+    pub fn open_or_kind(origin: Option<Origin>, of: Option<&str>) -> Result<Source, Stop> {
+        if origin.is_some() {
+            return Self::open(origin);
+        }
+        for (name, _) in CATALOG {
+            let Some(Ok(recipe)) = builtin(name) else {
+                continue;
+            };
+            if of.is_none_or(|k| k == kind(&recipe)) {
+                return Self::open(Some(Origin::Builtin(name)));
+            }
+        }
+        let of = of.unwrap_or_default();
+        let none = format!("no built-in model does {of}: give --recipe or --model");
+        Err(Stop::Failed(none))
     }
 
     /// Serve options from the recipe, then from `rest`.

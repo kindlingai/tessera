@@ -4,8 +4,7 @@ use crate::http::Response;
 use crate::wire::{self, Images, Refusal, bad, refuse};
 use crate::{Slot, reply};
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tessera_tasks::api::Sizes;
+use tessera_tasks::api::{Sizes, fresh};
 use tessera_tasks::png;
 
 /// The most pictures one request may ask for.
@@ -32,17 +31,6 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// `side` if a painter with sizes `s` makes it.
-pub fn square(side: usize, s: Sizes) -> Result<usize, String> {
-    match side > 0 && side <= s.largest && side.is_multiple_of(s.step) {
-        true => Ok(side),
-        false => Err(format!(
-            "`size` must be square, a multiple of {} up to {}",
-            s.step, s.largest
-        )),
-    }
-}
-
 /// The side a square `size` ("WxH") asks for.
 fn side(size: Option<&str>, s: Sizes) -> Result<usize, Refusal> {
     let Some(size) = size else {
@@ -63,15 +51,9 @@ fn side(size: Option<&str>, s: Sizes) -> Result<usize, Refusal> {
         h.parse().map_err(|_| wrong())?,
     );
     match w == h {
-        true => square(w, s).map_err(|_| wrong()),
+        true => s.square(w).map_err(|_| wrong()),
         false => Err(wrong()),
     }
-}
-
-/// A seed from the clock, when the request gives none.
-pub fn fresh() -> u32 {
-    let since = SystemTime::now().duration_since(UNIX_EPOCH);
-    since.map_or(0, |d| d.subsec_nanos())
 }
 
 pub(crate) fn generations(slot: &Slot, body: &[u8]) -> Response {

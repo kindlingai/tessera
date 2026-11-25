@@ -1,74 +1,209 @@
-//! `task <name>`: one job on the loaded model.
+//! Commands and tasks: one list for CLI and router.
 
-mod ask;
-mod chat;
-mod embed;
-mod image;
-#[cfg(test)]
-mod image_test;
 mod route;
 #[cfg(test)]
 mod route_test;
-mod tag;
 
 pub use route::run as route;
 
+use crate::fetch::Fetch;
+use crate::serve::Serve;
 use crate::source::{Origin, Source, Stop};
-use std::io::{Read, Write};
-use std::sync::mpsc;
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::Path;
 use std::time::Duration;
-use tessera_bundle::Message;
 use tessera_serve::start::{self, Options};
 use tessera_serve::{Model, Slot};
-use tessera_tasks::api::{Format, Params, Step};
+use tessera_tasks::task::{Ask, Chat, Embed, Image, Run, Sink, Tag, Task, Usage, Value};
+use tessera_tasks::{Error, Tagger};
 
-/// The task list, with the image pipelines' flags.
+/// The word before a task's name.
+const TASK: &str = "task";
+
+/// One command or task, for the CLI and the router.
+pub struct Entry {
+    /// [`TASK`] for a task, empty for a command.
+    pub group: &'static str,
+    pub name: &'static str,
+    /// The catalog kind it runs on. `None` is any.
+    pub kind: Option<&'static str>,
+    pub about: &'static str,
+    /// A request it answers. Only these go to the router.
+    pub example: Option<&'static str>,
+    pub schema: fn() -> Value,
+    /// The arguments for `example`.
+    pub example_args: fn() -> Value,
+    /// A tool call's arguments as command-line words.
+    pub tool_args: fn(&Value) -> Result<Vec<String>, Usage>,
+    pub usage: fn() -> String,
+    pub run: fn(Option<Origin>, &[String]) -> Result<(), Stop>,
+}
+
+impl Entry {
+    /// The command words, after the model flags.
+    pub fn words(&self) -> Vec<String> {
+        let words = [self.group, self.name]
+            .into_iter()
+            .filter(|w| !w.is_empty());
+        words.map(String::from).collect()
+    }
+}
+
+const fn entry<T: Task, O: Target<T>>(group: &'static str) -> Entry {
+    Entry {
+        group,
+        name: T::NAME,
+        kind: T::KIND,
+        about: T::ABOUT,
+        example: T::EXAMPLE,
+        schema: T::schema,
+        example_args: T::example,
+        tool_args: T::tool_args,
+        usage: usage::<T, O>,
+        run: run_entry::<T, O>,
+    }
+}
+
+/// Commands first, then tasks. The router keeps this order.
+pub static ENTRIES: [Entry; 7] = [
+    entry::<Serve, OnSource>(""),
+    entry::<Fetch, OnSource>(""),
+    entry::<Ask, OnModel>(TASK),
+    entry::<Chat, OnModel>(TASK),
+    entry::<Image, OnModel>(TASK),
+    entry::<Embed, OnModel>(TASK),
+    entry::<Tag, OnTagger>(TASK),
+];
+
+/// The entry that `group` and `name` name.
+pub fn find(group: &str, name: &str) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|e| e.group == group && e.name == name)
+}
+
+/// A task's run target, and how the CLI opens one.
+trait Target<T: Task> {
+    /// Whether extra `flag` takes a value. `None` refuses the flag.
+    fn takes(flag: &str) -> Option<bool>;
+    /// The extra flags' usage.
+    fn extra() -> String;
+    fn run(task: T, source: Source) -> Result<(), Error>;
+}
+
+/// A model the serve loader fills.
+struct OnModel;
+
+impl<T: Task + for<'a> Run<&'a Model>> Target<T> for OnModel {
+    fn takes(flag: &str) -> Option<bool> {
+        let owned = tessera_serve::task::flags_of(T::KIND?);
+        owned
+            .iter()
+            .find(|f| f.name == flag)
+            .map(|f| !f.value.is_empty())
+    }
+
+    fn extra() -> String {
+        let mut out = Vec::new();
+        for flag in tessera_serve::task::flags_of(T::KIND.unwrap_or_default()) {
+            if !T::FIELDS.iter().any(|f| f.flag == flag.name) {
+                out.push(flag.usage());
+            }
+        }
+        out.join(" ")
+    }
+
+    fn run(task: T, source: Source) -> Result<(), Error> {
+        let mut options = source.options(&task.load_flags())?;
+        if let Some(kind) = T::KIND {
+            options.flag("--task", kind.into()).ok_or(Stop::Usage)?;
+        }
+        options.slots = 1;
+        let slot = load(options);
+        task.run(model(&slot), &mut Print::default())
+    }
+}
+
+/// A tagger opened from the model's files.
+struct OnTagger;
+
+impl<T: Task + for<'a> Run<&'a mut Tagger>> Target<T> for OnTagger {
+    fn takes(_: &str) -> Option<bool> {
+        None
+    }
+
+    fn extra() -> String {
+        String::new()
+    }
+
+    fn run(task: T, source: Source) -> Result<(), Error> {
+        let options = source.options(&[])?;
+        let settings = tessera_frontend_settings::read();
+        let mut tagger = Tagger::open(&options.model, &settings)?;
+        task.run(&mut tagger, &mut Print::default())
+    }
+}
+
+/// The opened recipe or model, for commands.
+struct OnSource;
+
+impl<T: Task + Run<Source>> Target<T> for OnSource {
+    fn takes(flag: &str) -> Option<bool> {
+        Some(!Options::default().switch(flag))
+    }
+
+    fn extra() -> String {
+        "[flags]".into()
+    }
+
+    fn run(task: T, source: Source) -> Result<(), Error> {
+        task.run(source, &mut Print::default())
+    }
+}
+
+fn usage<T: Task, O: Target<T>>() -> String {
+    T::usage(&O::extra())
+}
+
+fn run_entry<T: Task, O: Target<T>>(origin: Option<Origin>, args: &[String]) -> Result<(), Stop> {
+    let task = T::parse(args, &O::takes);
+    let task = task.map_err(|e| Stop::Tasks(Some(format!("{}: {e}", T::NAME))))?;
+    O::run(task, Source::open_or_kind(origin, T::KIND)?).map_err(stop)
+}
+
+/// A task's error as a `Stop`.
+fn stop(e: Error) -> Stop {
+    let e = match e.downcast::<Stop>() {
+        Ok(stop) => return *stop,
+        Err(e) => e,
+    };
+    match e.downcast::<Usage>() {
+        Ok(usage) => Stop::Tasks(Some(usage.0)),
+        Err(e) => Stop::Failed(e.to_string()),
+    }
+}
+
+/// Every command and task: its usage and what it does.
 pub fn list() -> String {
-    format!(
-        "tasks:
-  ask [--max-tokens <n>] [prompt...]  answer one prompt, from stdin if none
-  chat [--max-tokens <n>]             talk with the model, one line a turn
-  {}
-                                      PNGs from a prompt, or from stdin
-  embed [text]                        one JSON vector per line of text, from stdin if none
-  tag [text]                          one JSON line per token and its tag",
-        image::usage()
-    )
+    let mut out = String::from("commands and tasks:");
+    for e in &ENTRIES {
+        let mut words = e.words();
+        words.pop();
+        words.push((e.usage)());
+        let usage = words.join(" ");
+        match usage.len() < 36 {
+            true => out += &format!("\n  {usage:<36}{}", e.about),
+            false => out += &format!("\n  {usage}\n  {:<36}{}", "", e.about),
+        }
+    }
+    out
 }
 
 pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
     let Some((name, args)) = rest.split_first() else {
         return Err(Stop::Tasks(None));
     };
-    match name.as_str() {
-        "image" => return image::run(Source::open(origin)?, args),
-        "embed" => return embed::run(Source::open(origin)?, args),
-        "tag" => return tag::run(Source::open(origin)?, args),
-        _ => {}
-    }
-    let task = match name.as_str() {
-        "ask" => ask::run,
-        "chat" => chat::run,
-        other => return Err(Stop::Tasks(Some(other.into()))),
-    };
-    let source = Source::open_or_default(origin)?;
-    let (max_tokens, args) = flags(args)?;
-    let mut options = source.options(&[])?;
-    options.slots = 1;
-    task(Talk::open(options, max_tokens), args)
-}
-
-/// Takes `--max-tokens <n>` from the front.
-fn flags(args: &[String]) -> Result<(Option<usize>, &[String]), Stop> {
-    match args {
-        [flag, n, rest @ ..] if flag == "--max-tokens" => {
-            let n = n.parse().map_err(|_| Stop::Usage)?;
-            Ok((Some(n), rest))
-        }
-        [dashes, rest @ ..] if dashes == "--" => Ok((None, rest)),
-        [flag, ..] if flag.starts_with("--") => Err(Stop::Usage),
-        _ => Ok((None, args)),
-    }
+    let unknown = || Stop::Tasks(Some(format!("unknown task {name}")));
+    let entry = find(TASK, name).ok_or_else(unknown)?;
+    (entry.run)(origin, args)
 }
 
 /// Starts the load and waits for the model.
@@ -80,88 +215,67 @@ fn load(options: Options) -> Slot {
     slot
 }
 
-/// The prompt from `words`, or from stdin if none.
-fn text(words: &[String]) -> Result<String, Stop> {
-    let mut text = words.join(" ");
-    if words.is_empty() {
-        std::io::stdin()
-            .read_to_string(&mut text)
-            .map_err(|e| Stop::Failed(e.to_string()))?;
-    }
-    Ok(text)
+fn model(slot: &Slot) -> &Model {
+    slot.get().expect("the model loaded")
 }
 
-/// A loaded model that answers to stdout.
-pub struct Talk {
-    slot: Slot,
-    max_tokens: Option<usize>,
+/// Prints text as it comes, and results a line each.
+#[derive(Default)]
+pub struct Print {
+    /// Text ended without a newline.
+    open: bool,
 }
 
-impl Talk {
-    /// Loads the model and waits for it.
-    fn open(options: Options, max_tokens: Option<usize>) -> Talk {
-        let slot = load(options);
-        Talk { slot, max_tokens }
-    }
-
-    fn model(&self) -> &Model {
-        self.slot.get().expect("the model loaded")
-    }
-
-    /// The messages as one prompt, by the model's template.
-    fn render(&self, messages: &[Message]) -> Result<String, Stop> {
-        let chat = self.model().chat.as_ref();
-        let chat = chat.ok_or_else(|| Stop::Failed("the model has no chat template".into()))?;
-        chat.render(messages, false)
-            .map_err(|e| Stop::Failed(e.to_string()))
-    }
-
-    /// Prints the answer to `prompt` as it comes. Returns it.
-    fn say(&self, prompt: &str) -> Result<String, Stop> {
-        self.answer(prompt, None, true)
-    }
-
-    /// The answer to `prompt` in `format`, printed if `echo`.
-    fn answer(&self, prompt: &str, format: Option<Format>, echo: bool) -> Result<String, Stop> {
-        let model = self.model();
-        let failed = |e: String| Stop::Failed(e);
-        let generator = model.generator.as_ref();
-        let generator =
-            generator.ok_or_else(|| failed("the model does not generate text".into()))?;
-        let ids = model
-            .tokens
-            .encode(prompt)
-            .map_err(|e| failed(e.to_string()))?;
-        let room = model.info.context.saturating_sub(ids.len());
-        if ids.is_empty() || room == 0 {
-            return Err(failed("the prompt does not fit the context".into()));
+impl Print {
+    fn end_line(&mut self) {
+        if std::mem::take(&mut self.open) {
+            println!();
         }
-        let params = Params {
-            max_tokens: self.max_tokens.map_or(room, |n| n.min(room)),
-            stop: Vec::new(),
-            format,
-            raw: false,
-        };
-        let (sink, steps) = mpsc::channel();
-        let send = Box::new(move |step| sink.send(step).is_ok());
-        generator
-            .generate(ids, params, send)
-            .map_err(|e| failed(e.to_string()))?;
-        let (mut answer, mut out) = (String::new(), std::io::stdout());
-        while let Ok(step) = steps.recv() {
-            let (text, done) = match step {
-                Step::Token { text, .. } => (text, false),
-                Step::Done { text, .. } => (text, true),
-            };
-            answer += &text;
-            if echo {
-                let _ = write!(out, "{text}");
-                let _ = out.flush();
-            }
-            if done {
-                return Ok(answer);
-            }
+    }
+}
+
+impl Sink for Print {
+    fn text(&mut self, piece: &str) {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{piece}");
+        let _ = out.flush();
+        if !piece.is_empty() {
+            self.open = !piece.ends_with('\n');
         }
-        Err(failed("the engine stopped".into()))
+    }
+
+    fn record(&mut self, record: Value) {
+        self.end_line();
+        println!("{record}");
+    }
+
+    fn file(&mut self, path: &Path) {
+        self.end_line();
+        println!("{}", path.display());
+    }
+
+    fn note(&mut self, text: &str) {
+        self.end_line();
+        eprintln!("tesserax: {text}");
+    }
+
+    fn turn(&mut self) -> Option<String> {
+        self.end_line();
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprint!("> ");
+            let _ = std::io::stderr().flush();
+        }
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(n) if n > 0 => Some(line),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Print {
+    fn drop(&mut self) {
+        self.end_line();
     }
 }

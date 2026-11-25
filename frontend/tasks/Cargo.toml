@@ -17,7 +17,8 @@ guided = ["dep:tessera-grammar", "tessera-grammar/llguidance"]
 tessera-bundle = { workspace = true }
 tessera-engine = { workspace = true }
 tessera-grammar = { workspace = true, optional = true }
-serde_json = "1"
+tessera-task-derive = { workspace = true }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 tessera-checkpoint = { workspace = true }

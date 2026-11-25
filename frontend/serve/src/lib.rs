@@ -28,25 +28,11 @@ mod wire;
 mod wire_test;
 
 use http::{Request, Response};
-pub use images::{fresh, square};
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::RenderOptions;
-use tessera_tasks::api::{Chat, Embed, GenerateImage, Generator, Info, Score, Tokens};
+pub use tessera_tasks::api::Model;
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
-
-/// The loaded model, from the routes' side.
-pub struct Model {
-    pub info: Info,
-    pub tokens: Arc<dyn Tokens>,
-    pub chat: Option<Arc<dyn Chat>>,
-    pub generator: Option<Arc<dyn Generator>>,
-    pub embed: Option<Arc<dyn Embed>>,
-    pub image: Option<Arc<dyn GenerateImage>>,
-    pub score: Option<Arc<dyn Score>>,
-    /// Unknown request fields refuse the request. Else they warn.
-    pub strict: bool,
-}
 
 /// The model once it loads. Until then routes answer 503.
 pub type Slot = Arc<OnceLock<Model>>;

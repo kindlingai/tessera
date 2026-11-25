@@ -16,5 +16,6 @@ like text and images to tokens for the engine to work with.
 <tr><td><a href="recipe">recipe/</a></td><td>tessera-recipe</td><td>A model, weights, and plan and serve settings, from disk or git</td></tr>
 <tr><td><a href="serve">serve/</a></td><td>tessera-serve</td><td>OpenAI-shaped HTTP routes over generation, chat and embedding</td></tr>
 <tr><td><a href="settings">settings/</a></td><td>tessera-frontend-settings</td><td>Settings read once from the environment, passed down</td></tr>
+<tr><td><a href="task-derive">task-derive/</a></td><td>tessera-task-derive</td><td>#[derive(Task)] for tesserax task and command arguments</td></tr>
 <tr><td><a href="tasks">tasks/</a></td><td>tessera-tasks</td><td>Text in, answers out: generation and tagging over a loaded model</td></tr>
 </table>

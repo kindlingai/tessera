@@ -91,6 +91,7 @@ Join us on discord (https://discord.gg/8EAvYPV2rE) to discuss larger features to
 <tr><td>&emsp;<a href="frontend/recipe">recipe/</a></td><td>tessera-recipe</td><td>A model, weights, and plan and serve settings, from disk or git</td></tr>
 <tr><td>&emsp;<a href="frontend/serve">serve/</a></td><td>tessera-serve</td><td>OpenAI-shaped HTTP routes over generation, chat and embedding</td></tr>
 <tr><td>&emsp;<a href="frontend/settings">settings/</a></td><td>tessera-frontend-settings</td><td>Settings read once from the environment, passed down</td></tr>
+<tr><td>&emsp;<a href="frontend/task-derive">task-derive/</a></td><td>tessera-task-derive</td><td>#[derive(Task)] for tesserax task and command arguments</td></tr>
 <tr><td>&emsp;<a href="frontend/tasks">tasks/</a></td><td>tessera-tasks</td><td>Text in, answers out: generation and tagging over a loaded model</td></tr>
 <tr><td colspan="3"><a href="tools"><b>tools/</b></a></td></tr>
 <tr><td>&emsp;<a href="tools/calibrate">calibrate/</a></td><td>tessera-calibrate</td><td>Times kernels on this machine and stores what they cost</td></tr>

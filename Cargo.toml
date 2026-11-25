@@ -64,6 +64,7 @@ tessera-serve = { path = "frontend/serve" }
 tessera-sim = { path = "engine/plan/sim" }
 tessera-work = { path = "engine/gpu/work" }
 tessera-tasks = { path = "frontend/tasks" }
+tessera-task-derive = { path = "frontend/task-derive" }
 tessera-testkit = { path = "engine/ir/testkit" }
 tessera-trace = { path = "engine/ir/trace" }
 tessera-trace-derive = { path = "engine/ir/trace-derive" }

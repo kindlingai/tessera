@@ -2,18 +2,18 @@ use super::route::{argv, prompt, schema, tools};
 use crate::source::{CATALOG, Origin, catalog, split};
 use serde_json::json;
 
-/// Tools come from the verb table, and picks become commands.
+/// Tools come from the entry list, and picks become commands.
 #[test]
 fn picks_become_commands() {
     let catalog = catalog();
     assert_eq!(catalog.len(), CATALOG.len());
     let tools = tools(&catalog);
-    let words: Vec<&str> = tools.iter().map(|t| t.words).collect();
-    assert_eq!(words, ["serve", "fetch", "task image", "task embed"]);
+    let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
+    assert_eq!(names, ["serve", "fetch", "image", "embed"]);
     let branches = schema(&catalog, &tools)["anyOf"].as_array().map(Vec::len);
     assert_eq!(branches, Some(2 * tools.len() + 1));
     assert!(prompt(&catalog, &tools, "hi").ends_with("Request: hi\n"));
-    let image = json!({ "tool": "task image", "model": "flux2-klein", "prompt": "a fox", "n": 2 });
+    let image = json!({ "tool": "image", "model": "flux2-klein", "prompt": "a fox", "n": 2 });
     let found = |words: &str| Ok(format!("found/{}", words.replace(' ', "-")));
     let args = argv(&image, &catalog, found)
         .ok()

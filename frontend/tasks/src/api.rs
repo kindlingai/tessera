@@ -1,6 +1,8 @@
 //! Calls an HTTP front end makes on a loaded model.
 
 use crate::Error;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{Message, RenderOptions, ResponseParser};
 pub use tessera_engine::Read;
 
@@ -164,10 +166,42 @@ pub struct Sizes {
     pub default: usize,
 }
 
+impl Sizes {
+    /// `side` if a painter with these sizes makes it.
+    pub fn square(&self, side: usize) -> Result<usize, String> {
+        match side > 0 && side <= self.largest && side.is_multiple_of(self.step) {
+            true => Ok(side),
+            false => Err(format!(
+                "`size` must be square, a multiple of {} up to {}",
+                self.step, self.largest
+            )),
+        }
+    }
+}
+
+/// A seed from the clock, when the request gives none.
+pub fn fresh() -> u32 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    since.map_or(0, |d| d.subsec_nanos())
+}
+
 /// Prompts to pictures. Calls can block.
 pub trait GenerateImage: Send + Sync {
     fn sizes(&self) -> Sizes;
     /// `n` pictures, `size` a side, repeatable from `seed`.
     fn generate(&self, prompt: &str, n: usize, seed: u32, size: usize)
     -> Result<Vec<Image>, Error>;
+}
+
+/// A loaded model: each trait it serves.
+pub struct Model {
+    pub info: Info,
+    pub tokens: Arc<dyn Tokens>,
+    pub chat: Option<Arc<dyn Chat>>,
+    pub generator: Option<Arc<dyn Generator>>,
+    pub embed: Option<Arc<dyn Embed>>,
+    pub image: Option<Arc<dyn GenerateImage>>,
+    pub score: Option<Arc<dyn Score>>,
+    /// Unknown request fields refuse the request. Else they warn.
+    pub strict: bool,
 }

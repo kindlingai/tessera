@@ -43,7 +43,7 @@ fn options_carry_rules() {
 /// The built-in recipe reads, with its weights and a manifest.
 #[test]
 fn default_recipe_reads() {
-    let Ok(source) = Source::open_or_default(None) else {
+    let Ok(source) = Source::open_or_kind(None, None) else {
         panic!("the default recipe opens");
     };
     let recipe = source.recipe.unwrap();

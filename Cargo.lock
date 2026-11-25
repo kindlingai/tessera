@@ -2305,6 +2305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-task-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "tessera-tasks"
 version = "0.1.0"
 dependencies = [
@@ -2315,6 +2324,7 @@ dependencies = [
  "tessera-frontend-settings",
  "tessera-grammar",
  "tessera-recipe",
+ "tessera-task-derive",
  "tessera-testkit",
 ]
 

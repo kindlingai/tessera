@@ -1,81 +1,29 @@
 //! A bare prompt: answered, or turned into a command.
 
-use super::{Talk, ask, flags, text};
-use crate::source::{self, Source, Stop};
+use super::{ENTRIES, Entry, Print, load, model, stop};
+use crate::source::{self, Source, Stop, kind};
 use serde_json::{Map, Value, json};
 use std::io::{BufRead, IsTerminal};
 use tessera_bundle::Message;
 use tessera_recipe::Recipe;
+use tessera_serve::Model;
 use tessera_tasks::api::Format;
-
-/// A tesserax command the model may pick.
-pub struct Tool {
-    /// The verb words, as typed after the model flags.
-    pub words: &'static str,
-    /// The tool's kind of model. `None` is any kind.
-    pub kind: Option<&'static str>,
-    pub about: &'static str,
-    /// The argument that holds the request's text.
-    pub text: Option<&'static str>,
-    /// The flag that sets how many to make.
-    pub count: Option<&'static str>,
-    /// A request it answers, and that request's text.
-    pub example: (&'static str, &'static str),
-}
-
-/// The commands on offer, when the catalog holds their kind.
-pub const TOOLS: [Tool; 5] = [
-    Tool {
-        words: "serve",
-        kind: Some("generate"),
-        about: "start or run a text model as an OpenAI-compatible server",
-        text: None,
-        count: None,
-        example: ("start {model} as a server", ""),
-    },
-    Tool {
-        words: "fetch",
-        kind: None,
-        about: "download a model and print where it is",
-        text: None,
-        count: None,
-        example: ("download the {kind} model", ""),
-    },
-    Tool {
-        words: "task image",
-        kind: Some("image"),
-        about: "make PNG pictures from a prompt",
-        text: Some("prompt"),
-        count: Some("--n"),
-        example: ("draw two pictures of a red bicycle", "a red bicycle"),
-    },
-    Tool {
-        words: "task embed",
-        kind: Some("embed"),
-        about: "print an embedding vector for some text",
-        text: Some("text"),
-        count: None,
-        example: ("embed the text 'tea and toast'", "tea and toast"),
-    },
-    Tool {
-        words: "task tag",
-        kind: Some("tag"),
-        about: "print part-of-speech tags for some text",
-        text: Some("text"),
-        count: None,
-        example: ("tag the words in 'dogs bark'", "dogs bark"),
-    },
-];
+use tessera_tasks::task::{Ask, Run, Task};
 
 /// A request for an outside model, and its words.
 const HUB_EXAMPLE: (&str, &str) = ("run llama 3.2 1b from Hugging Face", "llama 3.2 1b");
 
-/// A recipe's kind: its serve task, or text generation.
-fn kind(r: &Recipe) -> &str {
-    r.serve
-        .get("task")
-        .and_then(|v| v.as_str())
-        .unwrap_or("generate")
+/// Answer a prompt, or run the command the model picks.
+#[derive(Task)]
+struct Route {
+    /// Run the picked command without asking.
+    yes: bool,
+    /// The most tokens in a reply.
+    #[arg(value = "<n>")]
+    max_tokens: Option<usize>,
+    /// The request, from stdin if none.
+    #[arg(positional)]
+    request: String,
 }
 
 /// Catalog names of `kind`, or every name.
@@ -89,19 +37,19 @@ fn names(catalog: &[Recipe], of: Option<&str>) -> Vec<String> {
     out
 }
 
-/// The tools with a catalog model of their kind.
-pub fn tools(catalog: &[Recipe]) -> Vec<&'static Tool> {
+/// Entries with an example and a catalog model to run.
+pub fn tools(catalog: &[Recipe]) -> Vec<&'static Entry> {
     let mut out = Vec::new();
-    for t in &TOOLS {
-        if !names(catalog, t.kind).is_empty() {
-            out.push(t);
+    for e in &ENTRIES {
+        if e.example.is_some() && !names(catalog, e.kind).is_empty() {
+            out.push(e);
         }
     }
     out
 }
 
 /// JSON for a reply, or a tool and its arguments.
-pub fn schema(catalog: &[Recipe], tools: &[&Tool]) -> Value {
+pub fn schema(catalog: &[Recipe], tools: &[&Entry]) -> Value {
     let only = |word: &str| json!({ "enum": [word] });
     let mut branches = vec![json!({
         "type": "object",
@@ -119,69 +67,64 @@ pub fn schema(catalog: &[Recipe], tools: &[&Tool]) -> Value {
     json!({ "anyOf": branches })
 }
 
-/// Tool `t`, its model under `key`, and other arguments.
-fn branch(t: &Tool, key: &str, model: Value) -> Value {
+/// Tool `t`, its model under `key`, and its arguments.
+fn branch(t: &Entry, key: &str, model: Value) -> Value {
+    let mut schema = (t.schema)();
     let mut props = Map::new();
-    props.insert("tool".into(), json!({ "enum": [t.words] }));
+    props.insert("tool".into(), json!({ "enum": [t.name] }));
     props.insert(key.into(), model);
-    let mut required = vec!["tool", key];
-    if let Some(text) = t.text {
-        let text_schema = json!({ "type": "string", "minLength": 1, "maxLength": 500 });
-        props.insert(text.into(), text_schema);
-        required.push(text);
+    if let Value::Object(args) = schema["properties"].take() {
+        props.extend(args);
     }
-    if t.count.is_some() {
-        let n = json!({ "type": "integer", "minimum": 1, "maximum": 8 });
-        props.insert("n".into(), n);
+    let mut required = vec![json!("tool"), json!(key)];
+    if let Value::Array(args) = schema["required"].take() {
+        required.extend(args);
     }
-    json!({
-        "type": "object",
-        "properties": props,
-        "required": required,
-        "additionalProperties": false,
-    })
+    schema["properties"] = Value::Object(props);
+    schema["required"] = Value::Array(required);
+    schema
 }
 
 /// `t`'s example request, and the pick it makes.
-fn example(catalog: &[Recipe], t: &Tool) -> (String, Value) {
+fn example(catalog: &[Recipe], t: &Entry) -> (String, Value) {
     let mut models: Vec<&Recipe> = Vec::new();
     for r in catalog {
         if t.kind.is_none_or(|k| k == kind(r)) {
             models.push(r);
         }
     }
+    let asked = t.example.unwrap_or_default();
     // A request by kind names the last model.
-    let by_kind = t.example.0.contains("{kind}");
+    let by_kind = asked.contains("{kind}");
     let recipe = if by_kind {
         models.last()
     } else {
         models.first()
     };
     let Some(recipe) = recipe else {
-        return (t.example.0.into(), json!({ "tool": "reply" }));
+        return (asked.into(), json!({ "tool": "reply" }));
     };
     let model = recipe.name.clone();
     let mut pick = Map::new();
-    pick.insert("tool".into(), t.words.into());
+    pick.insert("tool".into(), t.name.into());
     pick.insert("model".into(), model.clone().into());
-    if let Some(text) = t.text {
-        pick.insert(text.into(), t.example.1.into());
+    if let Value::Object(args) = (t.example_args)() {
+        pick.extend(args);
     }
-    if t.count.is_some() {
-        pick.insert("n".into(), 2.into());
-    }
-    let asked = t.example.0.replace("{kind}", kind(recipe));
+    let asked = asked.replace("{kind}", kind(recipe));
     (asked.replace("{model}", &model), Value::Object(pick))
 }
 
 /// The routing prompt for `request`.
-pub fn prompt(catalog: &[Recipe], tools: &[&Tool], request: &str) -> String {
+pub fn prompt(catalog: &[Recipe], tools: &[&Entry], request: &str) -> String {
     let mut out = String::from("Turn the request into one tesserax command, as JSON.\nTools:\n");
     out += "- reply: answer in text. Use it for questions, chat and anything else.\n";
     for t in tools {
-        let args = [Some("model or hub"), t.text, t.count.map(|_| "n")];
-        let args: Vec<&str> = args.into_iter().flatten().collect();
-        out += &format!("- {} ({}): {}\n", t.words, args.join(", "), t.about);
+        let mut args = vec!["model or hub".to_string()];
+        if let Value::Object(props) = &(t.schema)()["properties"] {
+            args.extend(props.keys().cloned());
+        }
+        out += &format!("- {} ({}): {}\n", t.name, args.join(", "), t.about);
     }
     out += "Models:\n";
     for r in catalog {
@@ -197,7 +140,7 @@ pub fn prompt(catalog: &[Recipe], tools: &[&Tool], request: &str) -> String {
         out += &format!("Request: {asked}\n{pick}\n");
     }
     if let Some(serve) = tools.iter().find(|t| t.kind == Some("generate")) {
-        let pick = json!({ "tool": serve.words, "hub": HUB_EXAMPLE.1 });
+        let pick = json!({ "tool": serve.name, "hub": HUB_EXAMPLE.1 });
         out += &format!("Request: {}\n{pick}\n", HUB_EXAMPLE.0);
     }
     out + &format!("Request: {request}\n")
@@ -232,11 +175,14 @@ pub fn argv(
 ) -> Result<Option<Vec<String>>, Stop> {
     let field = |k: &str| pick.get(k).and_then(Value::as_str);
     let bad = || Stop::Failed(format!("the model picked {pick}"));
-    let words = field("tool").ok_or_else(bad)?;
-    if words == "reply" {
+    let name = field("tool").ok_or_else(bad)?;
+    if name == "reply" {
         return Ok(None);
     }
-    let tool = TOOLS.iter().find(|t| t.words == words).ok_or_else(bad)?;
+    let tool = ENTRIES
+        .iter()
+        .find(|t| t.name == name && t.example.is_some());
+    let tool = tool.ok_or_else(bad)?;
     let mut out = match (field("model"), field("hub")) {
         (Some(model), _) if catalog.iter().any(|r| r.name == model) => {
             vec!["--recipe".to_string(), model.to_string()]
@@ -248,45 +194,45 @@ pub fn argv(
         },
         _ => return Err(bad()),
     };
-    out.extend(words.split(' ').map(String::from));
-    let n = pick.get("n").and_then(Value::as_u64);
-    if let (Some(flag), Some(n)) = (tool.count, n) {
-        out.extend([flag.to_string(), n.to_string()]);
+    out.extend(tool.words());
+    let mut args = pick.as_object().cloned().unwrap_or_default();
+    for key in ["tool", "model", "hub"] {
+        args.remove(key);
     }
-    if let Some(text) = tool.text {
-        out.push(field(text).ok_or_else(bad)?.to_string());
-    }
+    let args = (tool.tool_args)(&Value::Object(args));
+    out.extend(args.map_err(|e| Stop::Failed(format!("the model picked {pick}: {e}")))?);
     Ok(Some(out))
 }
 
 /// Answers `words`, or runs the command the default model picks.
 pub fn run(words: &[String]) -> Result<(), Stop> {
-    let (yes, words) = match words {
-        [flag, rest @ ..] if flag == "--yes" => (true, rest),
-        _ => (false, words),
-    };
-    let (max_tokens, words) = flags(words)?;
-    let request = text(words)?;
-    let request = request.trim();
-    if request.is_empty() {
-        return Err(Stop::Usage);
-    }
-    let source = Source::open_or_default(None)?;
+    let route = Route::parse(words, &|_| None).map_err(|_| Stop::Usage)?;
+    let request = route.request.trim();
+    let source = Source::open_or_kind(None, None)?;
     let guided = cfg!(feature = "guided");
     let switches: &[String] = if guided { &["--guided".into()] } else { &[] };
     let mut options = source.options(switches)?;
     options.slots = 1;
-    let talk = Talk::open(options, max_tokens);
+    let slot = load(options);
+    let model = model(&slot);
     let token = source.token.as_deref();
     let find = |words: &str| find(words, token);
     let pick = match guided {
-        true => argv(&pick(&talk, request)?, &source::catalog(), find)?,
+        true => argv(
+            &pick(model, route.max_tokens, request)?,
+            &source::catalog(),
+            find,
+        )?,
         false => None,
     };
-    match pick {
-        None => ask::run(talk, &[request.to_string()]),
-        Some(args) => launch(&args, yes),
-    }
+    let Some(args) = pick else {
+        let ask = Ask {
+            max_tokens: route.max_tokens,
+            prompt: request.into(),
+        };
+        return ask.run(model, &mut Print::default()).map_err(stop);
+    };
+    launch(&args, route.yes)
 }
 
 /// The Hub id for `words`: checked as given, or searched.
@@ -308,12 +254,15 @@ fn find(words: &str, token: Option<&str>) -> Result<String, Stop> {
 }
 
 /// The default model's pick. A bad pick is a reply.
-fn pick(talk: &Talk, request: &str) -> Result<Value, Stop> {
+fn pick(model: &Model, max_tokens: Option<usize>, request: &str) -> Result<Value, Stop> {
     let catalog = source::catalog();
     let tools = tools(&catalog);
     let user = Message::text("user", prompt(&catalog, &tools, request));
-    let format = Format::Schema(schema(&catalog, &tools));
-    let json = talk.answer(&talk.render(&[user])?, Some(format), false)?;
+    let format = Some(Format::Schema(schema(&catalog, &tools)));
+    let failed = |e: tessera_tasks::Error| Stop::Failed(e.to_string());
+    let text = model.render(&[user]).map_err(failed)?;
+    let json = model.answer(&text, max_tokens, format, &mut |_| {});
+    let json = json.map_err(failed)?;
     Ok(serde_json::from_str(json.trim()).unwrap_or_else(|_| json!({ "tool": "reply" })))
 }
 
