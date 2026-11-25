@@ -428,11 +428,12 @@ impl Penalties {
     }
 }
 
-/// Token `id` moves an answer from scope `from` to `to`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Ending in `ids`, an answer moves from `from` to `to`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Move {
     pub from: u8,
-    pub id: u32,
+    /// Oldest first. Every id is generated in scope `from`.
+    pub ids: Vec<u32>,
     pub to: u8,
 }
 
@@ -444,7 +445,7 @@ pub enum Term {
         presence: Vec<f32>,
         frequency: Vec<f32>,
     },
-    /// In `scope`, raises `id` by `slope` per token past `start`.
+    /// The scope's n-th pick raises `id` by `slope * (n - start)`.
     Ramp {
         id: u32,
         scope: u8,
@@ -474,6 +475,11 @@ impl Program {
     fn repeats(&self) -> bool {
         let reads = |t: &Term| matches!(t, Term::Repeat { repetition } if repetition.iter().any(|&r| r != 1.0));
         self.terms.iter().any(reads)
+    }
+
+    /// The most recent ids a move reads.
+    fn reach(&self) -> usize {
+        self.moves.iter().map(|m| m.ids.len()).max().unwrap_or(0)
     }
 
     /// Non-neutral edits for the next pick.
@@ -515,10 +521,12 @@ impl Program {
             else {
                 continue;
             };
-            if on != scope || tally.since <= start {
+            // The pick makes the scope's n-th token.
+            let n = tally.since + 1;
+            if on != scope || n <= start {
                 continue;
             }
-            let add = max.min(slope * (tally.since - start) as f32);
+            let add = max.min(slope * (n - start) as f32);
             match out.iter_mut().find(|e| e.id == id) {
                 Some(e) => e.add += add,
                 None => out.push(Edit { id, add, rep: 1.0 }),
@@ -538,6 +546,9 @@ pub struct Tally {
     counts: HashMap<u32, u32>,
     /// Seen ids, in first-seen order.
     seen: Vec<u32>,
+    /// The last answer ids, as many as the longest move.
+    recent: Vec<u32>,
+    reach: usize,
 }
 
 impl Tally {
@@ -545,6 +556,7 @@ impl Tally {
     pub fn new(program: &Program, prompt: &[u32], scope: u8) -> Self {
         let mut tally = Tally {
             scope,
+            reach: program.reach(),
             ..Tally::default()
         };
         if program.repeats() {
@@ -568,8 +580,19 @@ impl Tally {
     pub fn step(&mut self, program: &Program, id: u32) {
         *self.see(id) += 1;
         self.since += 1;
-        let scope = self.scope;
-        if let Some(m) = program.moves.iter().find(|m| m.from == scope && m.id == id) {
+        self.recent.push(id);
+        if self.recent.len() > self.reach {
+            self.recent.remove(0);
+        }
+        let mut best: Option<&Move> = None;
+        for m in &program.moves {
+            let fits = m.from == self.scope && !m.ids.is_empty() && self.recent.ends_with(&m.ids);
+            // The longest match wins, then the first listed.
+            if fits && best.is_none_or(|b| m.ids.len() > b.ids.len()) {
+                best = Some(m);
+            }
+        }
+        if let Some(m) = best {
             self.scope = m.to;
             self.since = 0;
         }

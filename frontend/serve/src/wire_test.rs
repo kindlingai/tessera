@@ -98,7 +98,7 @@ fn thinking_keys() {
     let bad = [
         ("thinking_frequency_penalty", json!(-2.5)),
         ("think_end_boost", json!(true)),
-        ("think_end_boost", json!("start=1,per1k=1,max=21")),
+        ("think_end_boost", json!("start=1,per1k=1,max=101")),
     ];
     for (key, value) in bad {
         let (status, error) = json(

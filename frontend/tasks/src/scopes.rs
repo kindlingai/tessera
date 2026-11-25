@@ -9,6 +9,8 @@ const ANSWER: u8 = 0;
 const THINKING: u8 = 1;
 /// Neutral: tool calls repeat names, quotes and braces by design.
 const TOOL: u8 = 2;
+/// Longer markers are plain text, spelled differently after a space.
+const LONGEST: usize = 4;
 
 /// Tokens, a share of `max_tokens`, or the smaller.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,7 +80,7 @@ impl Boost {
                     start.replace(limit).is_some()
                 }
                 "per1k" => per1k.replace(num(f32::MAX)?).is_some(),
-                "max" => max.replace(num(20.0)?).is_some(),
+                "max" => max.replace(num(100.0)?).is_some(),
                 _ => return Err(format!("{key:?}: want start, per1k or max")),
             };
             if slot {
@@ -116,27 +118,30 @@ impl Thinking {
     }
 }
 
-/// The ids of markers that are one token.
-type Marks = Markers<Option<u32>>;
+/// The ids of markers short enough to match.
+type Marks = Markers<Option<Vec<u32>>>;
 
-/// Each marker's first candidate that is one token.
+/// Each marker's shortest candidate of 1 to `LONGEST` ids.
 fn marks(parser: &ResponseParser, tokenizer: &Hf) -> Marks {
-    let one = |candidates: Vec<&str>| {
+    let short = |candidates: Vec<&str>| {
+        let mut best: Option<Vec<u32>> = None;
         for text in candidates {
-            if let Ok(ids) = tokenizer.encode(text.trim())
-                && let [id] = ids[..]
-            {
-                return Some(id);
+            let Ok(ids) = tokenizer.encode(text.trim()) else {
+                continue;
+            };
+            let fits = (1..=LONGEST).contains(&ids.len());
+            if fits && best.as_ref().is_none_or(|b| ids.len() < b.len()) {
+                best = Some(ids);
             }
         }
-        None
+        best
     };
     let m = parser.markers();
     Markers {
-        think_open: one(m.think_open),
-        think_close: one(m.think_close),
-        call_open: one(m.call_open),
-        call_close: one(m.call_close),
+        think_open: short(m.think_open),
+        think_close: short(m.think_close),
+        call_open: short(m.call_open),
+        call_close: short(m.call_close),
     }
 }
 
@@ -151,7 +156,8 @@ pub fn guide(
     if let Some(key) = params.thinking.key()
         && marks.think_close.is_none()
     {
-        let why = format!("{key} needs a model whose think-end marker is one token");
+        let why =
+            format!("{key} needs a model whose think-end marker is {LONGEST} tokens or fewer");
         return Err(Refused(why, key));
     }
     let start = match params.starts_thinking && marks.think_close.is_some() {
@@ -165,11 +171,14 @@ pub fn guide(
 /// The program for one answer of up to `max_tokens`.
 fn program(penalties: Penalties, thinking: Thinking, marks: Marks, max_tokens: usize) -> Program {
     let mut moves = Vec::new();
-    let mut step = |from, id: Option<u32>, to| moves.extend(id.map(|id| Move { from, id, to }));
-    step(THINKING, marks.think_close, ANSWER);
-    step(ANSWER, marks.think_open, THINKING);
-    step(ANSWER, marks.call_open, TOOL);
-    step(TOOL, marks.call_close, ANSWER);
+    let mut step = |from, ids: &Option<Vec<u32>>, to| {
+        let ids = ids.clone();
+        moves.extend(ids.map(|ids| Move { from, ids, to }));
+    };
+    step(THINKING, &marks.think_close, ANSWER);
+    step(ANSWER, &marks.think_open, THINKING);
+    step(ANSWER, &marks.call_open, TOOL);
+    step(TOOL, &marks.call_close, ANSWER);
     let p = penalties;
     let mut terms = vec![
         Term::Count {
@@ -180,7 +189,8 @@ fn program(penalties: Penalties, thinking: Thinking, marks: Marks, max_tokens: u
             repetition: vec![p.repetition, p.repetition, 1.0],
         },
     ];
-    if let (Some(b), Some(id)) = (thinking.boost, marks.think_close) {
+    // A longer think end raises only its first id.
+    if let (Some(b), Some(&id)) = (thinking.boost, marks.think_close.iter().flatten().next()) {
         terms.push(Term::Ramp {
             id,
             scope: THINKING,

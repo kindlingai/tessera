@@ -177,19 +177,16 @@ fn stack_shares_forced() {
     assert!(split.allowed().is_err());
 }
 
+fn go(from: u8, ids: &[u32], to: u8) -> Move {
+    Move {
+        from,
+        ids: ids.to_vec(),
+        to,
+    }
+}
+
 fn moves() -> Vec<Move> {
-    vec![
-        Move {
-            from: 0,
-            id: 9,
-            to: 1,
-        },
-        Move {
-            from: 1,
-            id: 8,
-            to: 0,
-        },
-    ]
+    vec![go(0, &[9], 1), go(1, &[8], 0)]
 }
 
 #[test]
@@ -205,6 +202,42 @@ fn scopes_move() {
         seen.push((tally.scope, tally.since));
     }
     assert_eq!(seen, [(1, 1), (0, 0), (0, 1), (1, 0)]);
+}
+
+#[test]
+fn sequences_move() {
+    let moves = vec![
+        go(0, &[7, 9], 1),
+        go(0, &[5, 7, 9], 2),
+        go(1, &[6, 6], 0),
+        go(2, &[6], 0),
+    ];
+    let program = Program {
+        moves: moves.clone(),
+        terms: Vec::new(),
+    };
+    let mut tally = Tally::new(&program, &[], 0);
+    let mut seen = Vec::new();
+    for id in [7, 9, 6, 6, 5, 7, 9, 6] {
+        tally.step(&program, id);
+        seen.push(tally.scope);
+    }
+    assert_eq!(seen, [0, 1, 1, 0, 0, 0, 2, 0]);
+    let terms = vec![Term::Count {
+        presence: vec![1.0, 2.0, 3.0],
+        frequency: Vec::new(),
+    }];
+    let mut g = Scoped::new(Program { moves, terms }, &[], 0);
+    g.accept(5).unwrap();
+    g.accept(7).unwrap();
+    // A fork taken inside a marker finishes it.
+    let mut fork = g.fork().unwrap();
+    for (id, presence) in [(9, -3.0), (6, -1.0)] {
+        g.accept(id).unwrap();
+        fork.accept(id).unwrap();
+        assert_eq!(fork.edits(), g.edits());
+        assert_eq!(g.edits()[0].add, presence);
+    }
 }
 
 #[test]
@@ -252,7 +285,8 @@ fn ramp_is_bounded() {
         tally.step(&program, id);
         adds.push(program.edits(&tally).first().map(|e| e.add));
     }
-    let want = [None, None, Some(0.5), Some(1.0), Some(1.0), None];
+    // The pick of token `start + 1` gets the first raise.
+    let want = [None, Some(0.5), Some(1.0), Some(1.0), Some(1.0), None];
     assert_eq!(adds, want);
 }
 

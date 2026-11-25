@@ -15,7 +15,7 @@ fn boost_specs() {
         "start",
         "start=0|0.5x",
         "start=1.5x",
-        "max=21",
+        "max=101",
         "max=1,max=2",
         "x=1",
     ] {
@@ -52,8 +52,8 @@ fn scoped_edits() {
     let mut guide = guide(parser.as_ref(), &tokenizer, &params, &[]).unwrap();
     let edit = |id, add| Edit { id, add, rep: 1.0 };
     let steps = [
-        (0, vec![edit(0, -1.5)]),
         (0, vec![edit(0, -1.5), edit(2, 1.0)]),
+        (0, vec![edit(0, -1.5), edit(2, 2.0)]),
         (2, vec![edit(0, -0.5), edit(2, -0.5)]),
         (3, vec![]),
     ];
