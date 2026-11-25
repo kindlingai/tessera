@@ -164,6 +164,27 @@ fn dflash_matches_greedy() {
             .unwrap();
         assert_eq!(collect_ids(&full_got), collect_ids(&full_want));
         assert_eq!(full_got.last(), Some(&Event::Done(Reason::Context)));
+        // Chunked prefill matches baseline for single and multi-token runs.
+        let mut chunked = Speculate::new(&mut target, &mut drafter)
+            .unwrap()
+            .with_prefill_chunk(3);
+        let long_prompt = vec![3u32, 9, 4, 11, 2, 7, 5, 1, 8, 6, 3, 10, 4];
+        for max_tokens in [1, 8] {
+            let creq = || Request {
+                tokens: long_prompt.clone(),
+                max_tokens,
+                ..Request::default()
+            };
+            let (mut cw, mut cg) = (Vec::new(), Vec::new());
+            baseline.generate(creq(), &mut |e| cw.push(e)).unwrap();
+            chunked
+                .generate(creq(), &mut |e| {
+                    cg.push(e);
+                    true
+                })
+                .unwrap();
+            assert_eq!(collect_ids(&cg), collect_ids(&cw));
+        }
     }
 }
 
@@ -380,8 +401,10 @@ fn verify_tp_pair(
     }
     assert_eq!(drafter.share(at("head")).is_some(), expect_head_split);
     let mut baseline = open_target(t_graph, &t_weights, 24, &settings);
-    let mut spec = Speculate::new(&mut target, &mut drafter).unwrap();
-    for prompt in [vec![2u32, 6, 1], vec![4u32, 1, 5, 3]] {
+    let mut spec = Speculate::new(&mut target, &mut drafter)
+        .unwrap()
+        .with_prefill_chunk(3);
+    for prompt in [vec![2u32, 6, 1], vec![4u32, 1, 5, 3, 7, 2, 8]] {
         let req = || Request {
             tokens: prompt.clone(),
             max_tokens: 7,

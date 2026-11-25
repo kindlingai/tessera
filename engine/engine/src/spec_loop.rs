@@ -153,13 +153,20 @@ fn sync_ranks(target: &mut Engine, stopped: bool, hash: u32) -> Result<bool, Err
     Ok(stop)
 }
 
+/// Speculative request paired with an optional prefill chunk limit.
+pub(crate) struct SpecReq {
+    pub request: Request,
+    pub chunk: Option<usize>,
+}
+
 /// Validates a request and broadcasts its header once to followers.
 pub(crate) fn start_req(
     target: &mut Engine,
-    request: &Request,
+    spec_req: &SpecReq,
     emit: &mut dyn FnMut(Event) -> bool,
     extra: impl FnOnce(&mut Writer),
 ) -> Result<bool, Error> {
+    let request = &spec_req.request;
     if request.tokens.is_empty() || request.tokens.len() > target.context() {
         let _ = emit(Event::Done(Reason::Context));
         return Ok(false);
@@ -177,6 +184,7 @@ pub(crate) fn start_req(
         let mut w = Writer(Vec::new());
         w.u32(SPEC_REQ_TAG)
             .u32(request.max_tokens as u32)
+            .u32(spec_req.chunk.unwrap_or(0) as u32)
             .u32s(&request.tokens)
             .u32s(&request.stop)
             .u32s(table);
@@ -189,21 +197,25 @@ pub(crate) fn start_req(
 fn decode_req<T>(
     bytes: &[u8],
     extra: impl FnOnce(&mut Reader) -> Option<T>,
-) -> Option<(Request, Vec<u32>, T)> {
+) -> Option<(SpecReq, Vec<u32>, T)> {
     let mut r = Reader(bytes);
     if r.u32()? != SPEC_REQ_TAG {
         return None;
     }
     let max_tokens = r.u32()? as usize;
+    let chunk = r.u32()? as usize;
     let tokens = r.u32s()?;
     let stop = r.u32s()?;
     let table = r.u32s()?;
     let policy = extra(&mut r)?;
-    let req = Request {
-        tokens,
-        max_tokens,
-        stop,
-        ..Request::default()
+    let req = SpecReq {
+        request: Request {
+            tokens,
+            max_tokens,
+            stop,
+            ..Request::default()
+        },
+        chunk: (chunk > 0).then_some(chunk),
     };
     Some((req, table, policy))
 }
@@ -212,7 +224,7 @@ fn decode_req<T>(
 pub(crate) fn follow_loop<T>(
     target: &mut Engine,
     mut decode: impl FnMut(&mut Reader) -> Option<T>,
-    mut run: impl FnMut(&mut Engine, Request, T) -> Result<(), Error>,
+    mut run: impl FnMut(&mut Engine, SpecReq, T) -> Result<(), Error>,
 ) -> Result<(), Error> {
     loop {
         let mine = target
@@ -242,6 +254,12 @@ macro_rules! spec_entry {
         |$this:ident, $target:ident, $req:ident, $p:ident, $emit:ident| $body:expr
     ) => {
         impl<'a> $ty {
+            /// Sets the maximum prompt rows per prefill step.
+            pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
+                self.prefill_chunk = Some(rows.max(1));
+                self
+            }
+
             /// Follows rank 0's speculative requests until dismissed.
             pub fn follow(&mut self) -> Result<(), $crate::Error> {
                 let $this = self;
@@ -264,10 +282,14 @@ macro_rules! spec_entry {
             ) -> Result<$crate::SpecStats, $crate::Error> {
                 let $this = self;
                 let $p = $this.$field.fresh();
-                if !$crate::spec_loop::start_req($this.target, &request, emit, |w| $p.encode(w))? {
+                let $req = $crate::spec_loop::SpecReq {
+                    request,
+                    chunk: $this.prefill_chunk,
+                };
+                if !$crate::spec_loop::start_req($this.target, &$req, emit, |w| $p.encode(w))? {
                     return Ok($crate::SpecStats::default());
                 }
-                let ($target, $req, $emit) = (&mut *$this.target, request, emit);
+                let ($target, $emit) = (&mut *$this.target, emit);
                 $body
             }
         }
@@ -280,6 +302,18 @@ struct LoopState {
     sim_emitted: usize,
     stopped: bool,
     hash: u32,
+}
+
+fn prompt_rows(tokens: &[u32], pos: usize) -> Vec<Row> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, &token)| Row {
+            slot: 0,
+            token,
+            position: (pos + i) as u32,
+        })
+        .collect()
 }
 
 fn accept_token(
@@ -304,14 +338,25 @@ fn accept_token(
 }
 
 /// Shared SPMD greedy speculative decode loop for all drafters.
-pub(crate) fn run_speculate<S>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_speculate<D, S>(
     target: &mut Engine,
-    request: Request,
+    drafter: &mut D,
+    spec_req: SpecReq,
     emit: &mut dyn FnMut(Event) -> bool,
-    init: impl FnOnce(&mut Engine, &[u32], u32, TapsBuf) -> Result<S, Error>,
-    mut draft: impl FnMut(&mut Engine, &mut S, usize, u32, usize) -> Result<Option<Vec<u32>>, Error>,
+    mut on_chunk: impl FnMut(&mut Engine, &mut D, usize, &[u32], usize, TapsBuf) -> Result<(), Error>,
+    init: impl FnOnce(&mut Engine, &mut D, usize, &[u32], u32, TapsBuf) -> Result<S, Error>,
+    mut draft: impl FnMut(
+        &mut Engine,
+        &mut D,
+        &mut S,
+        usize,
+        u32,
+        usize,
+    ) -> Result<Option<Vec<u32>>, Error>,
     mut advance: impl FnMut(
         &mut Engine,
+        &mut D,
         &mut S,
         usize,
         usize,
@@ -329,18 +374,29 @@ pub(crate) fn run_speculate<S>(
         stopped: false,
         hash: 2166136261,
     };
+    let request = spec_req.request;
     let prompt = &request.tokens;
-    let prefill: Vec<Row> = prompt
-        .iter()
-        .enumerate()
-        .map(|(i, &token)| Row {
-            slot: 0,
-            token,
-            position: i as u32,
-        })
-        .collect();
-    let (ids, taps) = target.step_taps_local(&prefill)?;
-    let mut anchor = *ids.last().expect("non-empty prompt");
+    let n = prompt.len();
+    let step = spec_req.chunk.unwrap_or(n).max(1);
+    let need_taps = request.max_tokens > 1;
+    let mut pos = 0usize;
+    while pos + step < n {
+        let rows = prompt_rows(&prompt[pos..pos + step], pos);
+        if need_taps {
+            let (_, taps) = target.step_taps_local(&rows)?;
+            on_chunk(target, drafter, pos, prompt, step, taps)?;
+        } else {
+            target.step_last_local(&rows)?;
+        }
+        pos += step;
+    }
+    let last_rows = prompt_rows(&prompt[pos..], pos);
+    let (mut anchor, taps) = if need_taps {
+        let (ids, taps) = target.step_taps_local(&last_rows)?;
+        (*ids.last().expect("non-empty prompt"), Some(taps))
+    } else {
+        (target.step_last_local(&last_rows)?, None)
+    };
     fnv_u32(&mut st.hash, anchor);
     if let Some(reason) = accept_token(&request, &mut st, anchor, lead, emit) {
         if lead && !st.stopped {
@@ -352,8 +408,9 @@ pub(crate) fn run_speculate<S>(
     if !ranked && st.stopped {
         return Ok(st.stats);
     }
-    let mut state = init(target, prompt, anchor, taps)?;
-    let mut start = prompt.len();
+    let taps = taps.expect("taps when max_tokens > 1");
+    let mut state = init(target, drafter, pos, prompt, anchor, taps)?;
+    let mut start = n;
     let mut round = 0usize;
     let mut done_reason: Option<Reason> = None;
     while st.sim_emitted < request.max_tokens {
@@ -362,7 +419,7 @@ pub(crate) fn run_speculate<S>(
             break;
         }
         let remaining = request.max_tokens - st.sim_emitted;
-        let Some(drafts) = draft(target, &mut state, start, anchor, remaining)? else {
+        let Some(drafts) = draft(target, drafter, &mut state, start, anchor, remaining)? else {
             let row = [Row {
                 slot: 0,
                 token: anchor,
@@ -445,6 +502,7 @@ pub(crate) fn run_speculate<S>(
         };
         advance(
             target,
+            drafter,
             &mut state,
             start,
             drafts.len(),

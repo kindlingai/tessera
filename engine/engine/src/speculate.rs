@@ -3,8 +3,8 @@
 use crate::ranks::open_rank;
 pub use crate::spec_len::SpecStats;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{D2dCopy, TapsIn, fill_d2d, run_speculate, spec_entry};
-use crate::{Engine, Error, Event, Place, Request};
+use crate::spec_loop::{D2dCopy, SpecReq, TapsIn, fill_d2d, run_speculate, spec_entry};
+use crate::{Engine, Error, Event, Place};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tessera_engine_comm::{Error as CommError, Transport};
@@ -693,6 +693,7 @@ pub struct Speculate<'a> {
     target: &'a mut Engine,
     drafter: &'a mut Drafter,
     spec_len: SpecLen,
+    prefill_chunk: Option<usize>,
 }
 
 impl<'a> Speculate<'a> {
@@ -707,6 +708,7 @@ impl<'a> Speculate<'a> {
             target,
             drafter,
             spec_len,
+            prefill_chunk: None,
         })
     }
 
@@ -727,7 +729,7 @@ spec_entry!(
 fn run_dflash_req(
     target: &mut Engine,
     drafter: &mut Drafter,
-    request: Request,
+    req: SpecReq,
     spec: SpecLen,
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<SpecStats, Error> {
@@ -736,10 +738,19 @@ fn run_dflash_req(
     let max_ctx = target.context().min(drafter.context());
     run_speculate(
         target,
-        request,
+        drafter,
+        req,
         emit,
-        |_, _, _, taps| Ok((0usize, taps, spec, 1.0f64, None::<Vec<f32>>)),
-        |_, (ctx_pos, pending, spec, last_pred, last_lp), start, anchor, remaining| {
+        |_, drafter, pos, prompt, len, taps| {
+            if prompt.len() + block <= max_ctx {
+                let wants = drafter.draft_wants();
+                let end = pos + len;
+                drafter.run_taps(0, prompt[end], end, pos, taps.as_in(), wants)?;
+            }
+            Ok(())
+        },
+        |_, _, pos, _, _, taps| Ok((pos, taps, spec, 1.0f64, None::<Vec<f32>>)),
+        |_, drafter, (ctx_pos, pending, spec, last_pred, last_lp), start, anchor, remaining| {
             if remaining == 1 || start + block > max_ctx {
                 return Ok(None);
             }
@@ -760,6 +771,7 @@ fn run_dflash_req(
             Ok(Some(drafts))
         },
         |_,
+         _,
          (ctx_pos, pending, spec, last_pred, last_lp),
          start,
          drafted,

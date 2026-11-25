@@ -313,7 +313,8 @@ fn dual_tp_matches_baseline() {
     .with_probe(2);
     let mut dual = DualSpeculate::new(&mut target, &mut dr, &mut mtp_dr, 2)
         .unwrap()
-        .with_selector(sel);
+        .with_selector(sel)
+        .with_prefill_chunk(3);
     let check_prompt =
         |tokens: Vec<u32>, base: &mut tessera_engine::Engine, d: &mut DualSpeculate| {
             let mut want = Vec::new();
@@ -339,7 +340,7 @@ fn dual_tp_matches_baseline() {
             assert!(stats.steps > 0);
         };
     check_prompt(vec![2, 6, 1], &mut baseline, &mut dual);
-    check_prompt(vec![4, 1, 5, 3], &mut baseline, &mut dual);
+    check_prompt(vec![4, 1, 5, 3, 2, 7, 1], &mut baseline, &mut dual);
     target.dismiss().unwrap();
     follower.join().unwrap();
 }

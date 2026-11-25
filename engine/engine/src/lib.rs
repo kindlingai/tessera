@@ -548,6 +548,16 @@ impl Engine {
         Ok(ids)
     }
 
+    /// Local-only step returning the last row's predicted token.
+    pub(crate) fn step_last_local(&mut self, rows: &[Row]) -> Result<u32, Error> {
+        let pick = [(rows.len() - 1) as u32];
+        let wants = Wants::role(&self.graph, self.full, Role::Tokens);
+        let outputs = self.run_local(rows, &pick, Head::Full(None), wants)?;
+        let ids = self.runner.ids(outputs[0])?;
+        self.report();
+        Ok(ids[0])
+    }
+
     /// Local-only tapped step keeping device taps resident when possible.
     pub(crate) fn step_taps_local(
         &mut self,

@@ -144,15 +144,16 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     if o.slots > 1 {
         return serve_batch(load, &mut engine, &mut drafter, target, depth);
     }
+    let mut spec =
+        MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
+    if let Some(rows) = o.max_batch_rows {
+        spec = spec.with_prefill_chunk(rows);
+    }
     if o.ranks.follows() {
-        let mut spec =
-            MtpSpeculate::new(&mut engine, &mut drafter, depth).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
     let sl = spec_len(load, depth, CostModel::mtp(), true);
-    let mut spec = MtpSpeculate::new(&mut engine, &mut drafter, depth)
-        .map_err(|e| e.to_string())?
-        .with_spec_len(sl);
+    let mut spec = spec.with_spec_len(sl);
     serve(load, &settings, target, "mtp", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;
@@ -240,14 +241,15 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
         let _ = engine.dismiss();
         return Ok(());
     }
+    let mut spec =
+        DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth).map_err(|e| e.to_string())?;
+    if let Some(rows) = o.max_batch_rows {
+        spec = spec.with_prefill_chunk(rows);
+    }
     if o.ranks.follows() {
-        let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
-            .map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
-    let mut spec = DualSpeculate::new(&mut engine, &mut drafter, &mut mtp, depth)
-        .map_err(|e| e.to_string())?
-        .with_selector(selector);
+    let mut spec = spec.with_selector(selector);
     serve(load, &settings, target, "dual", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;

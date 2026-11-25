@@ -88,6 +88,18 @@ fn run_single(
         .unwrap();
         assert_eq!(collect_ids(&cg), collect_ids(&cw));
         assert_eq!(cg.last(), Some(&Event::Done(Reason::Context)));
+        let mut chunked = spec.with_prefill_chunk(2);
+        let (mut mw, mut mg) = (Vec::new(), Vec::new());
+        baseline
+            .generate(req(8, Vec::new()), &mut |e| mw.push(e))
+            .unwrap();
+        chunked
+            .generate(req(8, Vec::new()), &mut |e| {
+                mg.push(e);
+                true
+            })
+            .unwrap();
+        assert_eq!(collect_ids(&mg), collect_ids(&mw));
     }
     last
 }

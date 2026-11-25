@@ -189,14 +189,15 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.block
     );
     check_lowering(o, &mut engine, Some(pair.block.min(16)));
+    let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
+    if let Some(rows) = o.max_batch_rows {
+        spec = spec.with_prefill_chunk(rows);
+    }
     if o.ranks.follows() {
-        let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
         return spec.follow().map_err(|e| e.to_string());
     }
     let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
-    let mut spec = Speculate::new(&mut engine, &mut drafter)
-        .map_err(|e| e.to_string())?
-        .with_spec_len(sl);
+    let mut spec = spec.with_spec_len(sl);
     serve(load, &settings, target, "dflash", |req, sink| {
         spec.generate(req, sink).map_err(|e| e.to_string())
     })?;

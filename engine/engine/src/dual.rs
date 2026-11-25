@@ -2,9 +2,9 @@
 
 use crate::mtp_draft::{MtpDrafter, draft_mtp, run_mtp};
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::spec_loop::{SpecReq, TapsBuf, TapsIn, run_speculate, spec_entry};
 use crate::speculate::{Drafter, SpecStats};
-use crate::{Engine, Error, Event, Request};
+use crate::{Engine, Error, Event};
 use tessera_engine_comm::{Reader, Writer};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +291,7 @@ pub struct DualSpeculate<'a> {
     mtp: &'a mut MtpDrafter,
     depth: usize,
     selector: DualSelector,
+    prefill_chunk: Option<usize>,
 }
 
 impl<'a> DualSpeculate<'a> {
@@ -318,6 +319,7 @@ impl<'a> DualSpeculate<'a> {
             mtp,
             depth,
             selector: DualSelector::new(d_len, m_len),
+            prefill_chunk: None,
         })
     }
 
@@ -340,7 +342,7 @@ fn run_dual_req(
     dflash: &mut Drafter,
     mtp: &mut MtpDrafter,
     depth: usize,
-    request: Request,
+    req: SpecReq,
     selector: DualSelector,
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<SpecStats, Error> {
@@ -349,19 +351,37 @@ fn run_dual_req(
     let m_width = mtp.hidden();
     let total = d_width + m_width;
     let max_ctx = target.context().min(dflash.context()).min(mtp.context());
+    let mut pair = (dflash, mtp);
     run_speculate(
         target,
-        request,
+        &mut pair,
+        req,
         emit,
-        |target, prompt, anchor, taps| {
+        |target, (dflash, mtp), pos, prompt, len, taps| {
             let raw = taps.into_host(&*target.runner, total)?;
-            let (d_pending, m_taps) = split_taps(&raw, prompt.len(), d_width, m_width);
-            let m_tokens: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
+            let (d_taps, m_taps) = split_taps(&raw, len, d_width, m_width);
+            let end = pos + len;
+            if prompt.len() + block <= max_ctx {
+                let wants = dflash.draft_wants();
+                dflash.run_taps(0, prompt[end], end, pos, TapsIn::Host(&d_taps), wants)?;
+            }
+            if prompt.len() <= max_ctx {
+                let shifted = &prompt[pos + 1..end + 1];
+                let wants = mtp.wants();
+                mtp.run_taps(0, pos as u32, shifted, TapsIn::Host(&m_taps), wants, true)?;
+            }
+            Ok(())
+        },
+        |target, _, pos, prompt, anchor, taps| {
+            let len = prompt.len() - pos;
+            let raw = taps.into_host(&*target.runner, total)?;
+            let (d_pending, m_taps) = split_taps(&raw, len, d_width, m_width);
+            let m_tokens: Vec<u32> = prompt[pos + 1..].iter().copied().chain([anchor]).collect();
             Ok(DualState {
                 selector,
-                d_ctx_pos: 0,
+                d_ctx_pos: pos,
                 d_pending,
-                m_start: 0,
+                m_start: pos as u32,
                 m_tokens,
                 m_taps,
                 round_mtp: false,
@@ -371,7 +391,7 @@ fn run_dual_req(
                 switched: false,
             })
         },
-        |target, st, start, anchor, remaining| {
+        |target, (dflash, mtp), st, start, anchor, remaining| {
             let rem_cap = remaining.saturating_sub(1);
             let ctx_cap = max_ctx.saturating_sub(start + 1);
             if rem_cap == 0 || ctx_cap == 0 {
@@ -433,7 +453,7 @@ fn run_dual_req(
             st.last_pred = pred;
             Ok(Some(drafts))
         },
-        |target, st, _start, drafted, accepted, posterior, block_taps, stats| {
+        |target, _, st, _start, drafted, accepted, posterior, block_taps, stats| {
             let commit = 1 + accepted;
             if st.switched {
                 stats.switches += 1;

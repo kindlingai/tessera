@@ -2,9 +2,9 @@
 
 use crate::ranks::open_rank;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{D2dCopy, TapsBuf, TapsIn, run_speculate, spec_entry};
+use crate::spec_loop::{D2dCopy, SpecReq, TapsBuf, TapsIn, run_speculate, spec_entry};
 use crate::speculate::{DraftCore, draft_methods};
-use crate::{Engine, Error, Event, Place, Request, SpecStats};
+use crate::{Engine, Error, Event, Place, SpecStats};
 use tessera_engine_comm::Transport;
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs};
 use tessera_graph::{Graph, Role};
@@ -494,6 +494,7 @@ pub struct MtpSpeculate<'a> {
     drafter: &'a mut MtpDrafter,
     depth: usize,
     spec_len: SpecLen,
+    prefill_chunk: Option<usize>,
 }
 
 impl<'a> MtpSpeculate<'a> {
@@ -518,6 +519,7 @@ impl<'a> MtpSpeculate<'a> {
             drafter,
             depth,
             spec_len,
+            prefill_chunk: None,
         })
     }
 
@@ -539,7 +541,7 @@ fn run_mtp_req(
     target: &mut Engine,
     drafter: &mut MtpDrafter,
     depth: usize,
-    request: Request,
+    req: SpecReq,
     spec: SpecLen,
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<SpecStats, Error> {
@@ -547,13 +549,23 @@ fn run_mtp_req(
     let max_ctx = target.context().min(drafter.context());
     run_speculate(
         target,
-        request,
+        drafter,
+        req,
         emit,
-        |_, prompt, anchor, taps| {
-            let pending: Vec<u32> = prompt[1..].iter().copied().chain([anchor]).collect();
-            Ok((0u32, pending, taps, spec, 1.0f64))
+        |_, drafter, pos, prompt, len, taps| {
+            if prompt.len() <= max_ctx {
+                let shifted = &prompt[pos + 1..pos + len + 1];
+                let wants = drafter.wants();
+                drafter.run_taps(0, pos as u32, shifted, taps.as_in(), wants, true)?;
+            }
+            Ok(())
+        },
+        |_, _, pos, prompt, anchor, taps| {
+            let pending: Vec<u32> = prompt[pos + 1..].iter().copied().chain([anchor]).collect();
+            Ok((pos as u32, pending, taps, spec, 1.0f64))
         },
         |target,
+         drafter,
          (pending_start, pending_tokens, pending_taps, spec, last_pred),
          start,
          _,
@@ -579,6 +591,7 @@ fn run_mtp_req(
             Ok(Some(drafts))
         },
         |_,
+         _,
          (pending_start, pending_tokens, pending_taps, spec, last_pred),
          start,
          drafted,
