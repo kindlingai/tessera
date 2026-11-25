@@ -179,9 +179,14 @@ impl Model {
 
     /// Sets the last entry's outputs and returns the verified graph.
     pub fn finish<const N: usize>(&self, outputs: [(Role, &Tensor); N]) -> Graph {
+        self.finish_many(&outputs)
+    }
+
+    /// Sets a slice of entry outputs and verifies the graph.
+    pub fn finish_many(&self, outputs: &[(Role, &Tensor)]) -> Graph {
         let mut shared = self.g.borrow_mut();
         let entry = shared.entries.last_mut().expect("finish needs an entry");
-        for (role, t) in outputs {
+        for &(role, t) in outputs {
             entry.outputs.push(Output { role, node: t.id });
         }
         let g = shared.clone();

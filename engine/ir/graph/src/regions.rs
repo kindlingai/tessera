@@ -1,7 +1,7 @@
 //! Checks that composite regions are sealed and nest.
 
 use crate::infer::{ErrorKind, TypeError};
-use crate::node::{Graph, NodeId, Region};
+use crate::node::{Graph, NodeId, Region, Role};
 
 fn inside(r: &Region, id: NodeId) -> bool {
     r.start <= id && id < r.end
@@ -27,10 +27,12 @@ pub(crate) fn check(g: &Graph) -> Result<(), TypeError> {
             return fail(i, format!("outputs {:?} must be inside it", r.outputs));
         }
         let later = g.nodes[r.end.0 as usize..].iter().flat_map(|n| &n.args);
-        let entries = g
-            .entries
-            .iter()
-            .flat_map(|e| e.outputs.iter().map(|o| &o.node));
+        let entries = g.entries.iter().flat_map(|e| {
+            e.outputs
+                .iter()
+                .filter(|o| !matches!(o.role, Role::Calib(_)))
+                .map(|o| &o.node)
+        });
         if let Some(leak) = later
             .chain(entries)
             .find(|&&a| inside(r, a) && !r.outputs.contains(&a))

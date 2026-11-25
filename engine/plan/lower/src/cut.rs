@@ -82,14 +82,27 @@ fn carve(g: &Graph, nodes: &[NodeId], outputs: &[NodeId], keep: bool) -> Graph {
             outputs: r.outputs.iter().map(moved).collect(),
         });
     }
-    let outputs = outputs.iter().map(|o| Output {
-        role: Role::Logits,
-        node: moved(o),
-    });
+    let mut out_list: Vec<Output> = outputs
+        .iter()
+        .map(|o| Output {
+            role: Role::Logits,
+            node: moved(o),
+        })
+        .collect();
+    if keep && let Some(entry) = g.entries.first() {
+        for o in &entry.outputs {
+            if matches!(o.role, Role::Calib(_)) && nodes.contains(&o.node) {
+                out_list.push(Output {
+                    role: o.role,
+                    node: moved(&o.node),
+                });
+            }
+        }
+    }
     out.entries.push(Entry {
         kind: EntryKind::Forward,
         inputs,
-        outputs: outputs.collect(),
+        outputs: out_list,
     });
     out
 }

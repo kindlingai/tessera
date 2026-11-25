@@ -12,8 +12,8 @@ pub use model::{Kept, Model};
 pub use ports::{FEW, listed, pick, ports, sparse_ports, step_ports, tokens};
 pub use tensor::Tensor;
 pub use tessera_graph::{
-    Act, Composite, DType, Dim, DimExpr, DimName, EntryKind, Graph, Mask, Pairs, PathSeg, Port,
-    Role, Shape, Size, TensorType,
+    Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, EntryKind, Graph, Mask, Pairs, PathSeg,
+    Port, Role, Shape, Size, TensorType,
 };
 pub use tessera_trace_derive::Weights;
 pub use weights::{Embed, Linear, Linears, Norm, Scalar, Taps, Vector, Weights, declare, each};

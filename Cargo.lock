@@ -2129,6 +2129,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tessera-graph",
+ "tessera-interp",
+ "tessera-lower",
+ "tessera-testkit",
  "tessera-trace",
 ]
 

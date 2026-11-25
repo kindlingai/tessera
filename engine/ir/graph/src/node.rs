@@ -422,6 +422,22 @@ pub struct Output {
     pub node: NodeId,
 }
 
+/// Activation or routing tensor tapped for Hessian calibration.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibTap {
+    AttnIn,
+    QResid,
+    KvLatent,
+    OIn,
+    MlpIn,
+    DenseDownIn,
+    SharedDownIn,
+    RouterIds,
+    RouterGates,
+    RoutedInner,
+    EhIn,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Tokens,
@@ -442,4 +458,6 @@ pub enum Role {
     Taps,
     /// Per-layer n-gram embedding rows from the host.
     Ple,
+    /// Per-layer Hessian calibration tap.
+    Calib(CalibTap),
 }

@@ -175,6 +175,9 @@ fn pinned_form(
 fn output_roles(g: &Graph, entry: usize) -> Vec<Option<Role>> {
     let mut roles = vec![None; g.nodes.len()];
     for o in &g.entries[entry].outputs {
+        if matches!(o.role, Role::Calib(_)) {
+            continue;
+        }
         let mut id = o.node.0 as usize;
         loop {
             roles[id] = Some(o.role);
