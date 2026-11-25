@@ -40,6 +40,7 @@ fn grid_reaches_rules() {
         "fast_stacked",
         "fast_mla_attend",
         "picked_trellis",
+        "picked_bf16",
     ];
     // The grid's trellis experts reach picked trellis on CUDA.
     let cuda = device.platform.backend == "cuda";

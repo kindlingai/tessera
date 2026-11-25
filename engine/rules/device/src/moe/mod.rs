@@ -1,7 +1,7 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
 use crate::linear::parse_trellis;
-use crate::{Backend, Options, flatten};
+use crate::{Backend, flatten_cuda};
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
@@ -16,17 +16,7 @@ const SMEM: usize = 4096 * 4;
 
 fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| {
-        let options = Options {
-            backend: Backend::Cuda,
-            remote_kv: false,
-            marks: false,
-        };
-        let text = flatten("moe_trellis.kernel", KERNEL, &|_| None, &options)
-            .expect("moe_trellis kernel flattens")
-            .text;
-        Box::leak(text.into_boxed_str())
-    })
+    CUDA.get_or_init(|| flatten_cuda("moe_trellis.kernel", KERNEL))
 }
 
 fn entry_name(k: &PickedTrellis) -> &'static str {

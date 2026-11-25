@@ -33,6 +33,19 @@ pub use tessera_gpukit::backend::Backend;
 
 pub(crate) use layout::EDITION;
 
+/// Flattens one built-in CUDA kernel source into a static string.
+pub(crate) fn flatten_cuda(name: &str, kernel: &str) -> &'static str {
+    let options = Options {
+        backend: Backend::Cuda,
+        remote_kv: false,
+        marks: false,
+    };
+    let text = flatten(name, kernel, &|_| None, &options)
+        .expect("cuda kernel flattens")
+        .text;
+    Box::leak(text.into_boxed_str())
+}
+
 /// A name a kernel may import after `<tessera/1/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Import {
