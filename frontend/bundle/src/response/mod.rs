@@ -49,6 +49,8 @@ struct ContentArgs {
     string_delims: Vec<[String; 2]>,
     #[serde(default)]
     unquoted_keys: bool,
+    /// `tags` content: a regex with `key` and `value` groups.
+    pattern: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -138,12 +140,57 @@ impl Opener {
     }
 }
 
+/// How a block's body becomes a value.
+#[derive(Clone)]
+enum Body {
+    Text,
+    Json(ContentArgs),
+    /// One object entry per `key`/`value` match.
+    Tags(Regex),
+}
+
+impl Body {
+    fn compile(
+        kind: Option<&str>,
+        args: ContentArgs,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Ok(match kind {
+            Some("json") => Body::Json(args),
+            Some("tags") => {
+                let pat = args
+                    .pattern
+                    .ok_or("tags content needs content_args.pattern")?;
+                Body::Tags(Regex::new(&pat)?)
+            }
+            _ => Body::Text,
+        })
+    }
+
+    fn parse(&self, body: &str) -> Option<Value> {
+        match self {
+            Body::Text => Some(Value::String(body.to_string())),
+            Body::Json(args) => parse_json(body.trim(), args),
+            Body::Tags(regex) => {
+                let mut map = Map::new();
+                for caps in regex.captures_iter(body) {
+                    let caps = caps.ok()?;
+                    let (key, value) = (caps.name("key")?, caps.name("value")?);
+                    // A value that parses as JSON keeps its type.
+                    let value = serde_json::from_str(value.as_str())
+                        .unwrap_or_else(|_| Value::String(value.as_str().to_string()));
+                    map.insert(key.as_str().to_string(), value);
+                }
+                Some(Value::Object(map))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BlockSpec {
     open: Opener,
     close: Vec<String>,
-    json: bool,
-    args: ContentArgs,
+    body: Body,
     transform: Option<Value>,
     outer: Option<[String; 2]>,
 }
@@ -217,8 +264,7 @@ impl ResponseParser {
             let block = BlockSpec {
                 open,
                 close,
-                json: spec.content.as_deref() == Some("json"),
-                args: spec.content_args,
+                body: Body::compile(spec.content.as_deref(), spec.content_args)?,
                 transform: spec.transform,
                 outer: spec.outer.filter(|[o, c]| !o.is_empty() && !c.is_empty()),
             };
@@ -456,11 +502,10 @@ impl<'a> ResponseStream<'a> {
         };
         let block = self.buf[..at].to_string();
         let raw_end = at + len;
-        let event = match parse_tool(spec, &block) {
-            Some(call) => ResponseEvent::ToolCall(call),
-            None => ResponseEvent::Content(self.buf[..raw_end].to_string()),
-        };
-        out.push(event);
+        match parse_tool(spec, &block) {
+            Some(calls) => out.extend(calls.into_iter().map(ResponseEvent::ToolCall)),
+            None => out.push(ResponseEvent::Content(self.buf[..raw_end].to_string())),
+        }
         self.buf.drain(..raw_end);
         self.mode = match self.calls {
             true => Mode::Calls,
@@ -600,17 +645,18 @@ fn literal_prefix(pattern: &str) -> String {
     out
 }
 
-fn parse_tool(spec: &BlockSpec, block: &str) -> Option<ToolCall> {
+/// Calls in one block, one per JSON list item.
+fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
     let (captures, rest) = spec.open.strip(block)?;
-    let parsed = match spec.json {
-        true => parse_json(rest.trim(), &spec.args)?,
-        false => Value::String(rest.to_string()),
-    };
+    let parsed = spec.body.parse(rest)?;
     let shaped = match &spec.transform {
         Some(tmpl) => apply_transform(tmpl, &captures, &parsed),
         None => parsed,
     };
-    to_call(shaped)
+    match shaped {
+        Value::Array(items) => items.into_iter().map(to_call).collect(),
+        one => to_call(one).map(|call| vec![call]),
+    }
 }
 
 fn apply_transform(tmpl: &Value, captures: &BTreeMap<String, String>, content: &Value) -> Value {

@@ -61,6 +61,13 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn emits(&self, form: &dyn crate::form::Load) -> bool {
         !form.narrow()
     }
+    /// Whether it writes output `output` as `form`.
+    fn emits_at(&self, output: usize, form: &dyn crate::form::Load) -> bool {
+        match output {
+            0 => self.emits(form),
+            _ => !form.narrow(),
+        }
+    }
     /// Its needs from a thread group. Zero needs nothing.
     fn needs(&self) -> Needs {
         Needs::default()

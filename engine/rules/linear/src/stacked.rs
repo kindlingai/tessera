@@ -3,7 +3,7 @@
 use tessera_codegen::prelude::*;
 use tessera_graph::{Op, Order, View};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Draft, Kernel, Needs, T, Term, Tree};
+use tessera_lower::{Draft, Kernel, Load, Needs, T, Term, Tree};
 
 /// Elements one wide load brings per lane.
 const WIDE: u32 = 4;
@@ -93,6 +93,7 @@ fn stacked(
     accepts = stacked_accepts,
     needs = if self.mode == MODE_LANES { Needs::lanes() } else { Needs::default() },
     order = Order::PerConfig,
+    load = stacked_load,
 )]
 pub(crate) struct Stacked {
     pub len: usize,
@@ -111,6 +112,39 @@ pub(crate) struct Stacked {
 
 fn stacked_accepts(k: &Stacked, input: usize, form: &dyn Stored) -> bool {
     k.form.taken(input, 1, form)
+}
+
+fn stacked_load(k: &Stacked, _: usize) -> Option<Load> {
+    let (threads, step, flight) = match k.mode {
+        MODE_LANES => (k.len * LANES, LANES * WIDE as usize, AHEAD as usize),
+        MODE_WIDE => (k.len, WIDE as usize, AHEAD as usize),
+        _ => (k.len, 1, 1),
+    };
+    let width = if k.mode == MODE_SCALAR {
+        1
+    } else {
+        WIDE as usize
+    };
+    let products = k.len / k.n;
+    let mut trip = stacked_ir(k.form, k.mode).trip();
+    if k.mode != MODE_LANES {
+        // Threads on columns of one row share its x.
+        let shared = (4 * width) as f64 * (1.0 - 1.0 / k.n.min(LANES) as f64);
+        trip.width -= shared / trip.loads;
+    }
+    Some(Load {
+        threads,
+        group: 256,
+        trips: k.k as f64 / step as f64,
+        trip,
+        reads: vec![
+            (4 * products * k.k) as f64,
+            k.form.bytes(products / k.rows * k.n * k.k) as f64,
+        ],
+        written: (4 * k.len) as f64,
+        flight: ((4 + k.form.bytes(1)) * width * flight) as f64,
+        ..Load::default()
+    })
 }
 
 /// A stored `[b*r, c]` matrix as `[b, r, c]` blocks.

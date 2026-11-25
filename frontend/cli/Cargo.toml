@@ -12,7 +12,9 @@ name = "tesserax"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["guided"]
+# A bare prompt picks a command through llguidance.
+guided = ["tessera-serve/guided"]
 cuda = ["tessera-serve/cuda"]
 rocm = ["tessera-serve/rocm"]
 

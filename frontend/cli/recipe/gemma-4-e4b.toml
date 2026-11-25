@@ -1,6 +1,7 @@
 # google/gemma-4-E4B-it as exlr8 trellis codes: the default model of
 # tesserax.
 name = "gemma-4-e4b"
+about = "Google Gemma 4 E4B: chat, questions and short writing tasks"
 
 [weights]
 # Release v0.2. Its per-layer embedding table is a K4 row trellis.

@@ -41,7 +41,7 @@ pub use tessera_kernel_macro::Kernel;
 pub use tessera_mem::{Buffer, DType, Tensor, View};
 pub use tessera_platform::{Limits, Platform};
 pub use tessera_sim::{Cluster, Fit, Link, Zone, ZoneKind};
-pub use tessera_work::Load;
+pub use tessera_work::{Load, Ops};
 pub use tree::{Node, T, Term, Tree, Wants};
 
 use tessera_graph::{DimName, Graph};

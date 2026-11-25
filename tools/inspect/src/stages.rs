@@ -155,7 +155,7 @@ impl Setup<'_> {
                     rule: step.rule,
                     zone: step.zone,
                     covers,
-                    bytes: step.write.bytes(),
+                    bytes: step.write.bytes() + step.also.iter().map(|s| s.bytes()).sum::<usize>(),
                     seconds: device.step_seconds(&plan, step).unwrap_or(0.0),
                     sum: tessera_lower::kernels::crosses(step.kernel.name()),
                     text: at,

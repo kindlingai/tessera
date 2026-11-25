@@ -1,9 +1,11 @@
 //! Streaming decode GEMV for BF16, MXFP8 and INT4 weights.
 
-use super::{THREADS, WARPS, cuda_needs, cuda_source_entry, f32_only, weight_accepts};
+use super::{THREADS, WARPS, cuda_needs, cuda_source_entry, f32_only, trip, weight_accepts};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
-use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Term, Tree};
+use tessera_lower::{
+    Arg, Draft, Kernel, Launch, Load, Needs, Ops, Shape, Source, Step, T, Term, Tree,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GemvKind {
@@ -37,6 +39,22 @@ impl GemvKind {
             GemvKind::Bf16Narrow => WARPS * 4,
             GemvKind::Mxfp8 => 512 * 4 + WARPS * 268 * 4,
             GemvKind::Int4 => 512 * 4 + WARPS * 296 * 4,
+        }
+    }
+
+    /// One lane's trip: 8 bf16 weights, or a staged chunk.
+    fn trip(self) -> Ops {
+        match self {
+            GemvKind::Bf16 | GemvKind::Bf16Narrow => trip(8, 8, 3, 48),
+            GemvKind::Mxfp8 => Ops {
+                shared: 24.0,
+                e4m3: 32.0,
+                ..trip(40, 48, 3, 48)
+            },
+            GemvKind::Int4 => Ops {
+                shared: 40.0,
+                ..trip(80, 160, 3, 48)
+            },
         }
     }
 
@@ -93,17 +111,16 @@ fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
         GemvKind::Bf16Narrow => 2048.0,
         GemvKind::Mxfp8 | GemvKind::Int4 => 1024.0,
     };
-    let mut load = Load {
+    Some(Load {
         threads: groups * THREADS,
         group: THREADS,
         trips: k.k as f64 / step,
+        trip: k.kind.trip(),
         reads: vec![k.form.bytes(k.n * k.k) as f64, (4 * k.k) as f64],
         written: (4 * k.n) as f64,
         flight: 512.0,
         ..Load::default()
-    };
-    load.trip.fresh = 1.0;
-    Some(load)
+    })
 }
 
 fn gemv_launches(k: &FastGemv, step: &Step) -> Vec<Launch> {

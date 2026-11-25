@@ -1,6 +1,6 @@
 //! Storage forms: how buffers hold elements, and how bytes decode.
 
-use tessera_graph::{Bf16 as Half, DType, E4M3};
+use tessera_graph::{DType, E4M3};
 
 pub use scattered_collect::ScatteredSlice;
 pub use scattered_collect::declarative::{gather, scatter};
@@ -10,6 +10,7 @@ pub use scattered_collect::declarative::{gather, scatter};
 pub enum Read {
     F32,
     Bf16,
+    F16,
     Fp8,
     U32,
     U8,
@@ -187,6 +188,8 @@ pub(crate) use form;
 pub struct F32;
 /// bf16, widened to f32 on read.
 pub struct Bf16;
+/// IEEE f16, widened to f32 on read.
+pub struct F16;
 /// OCP float8 e4m3, widened to f32 on read.
 pub struct Fp8;
 /// Unsigned 32-bit ids.
@@ -227,18 +230,25 @@ impl Form for F32 {
     }
 }
 
-impl Form for Bf16 {
-    element!("bf16", Bf16, 8);
-    fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
-        let at = index * 2;
-        Half(u16::from_le_bytes([bytes[at], bytes[at + 1]])).into()
-    }
-    fn pack(&self, data: &[f32]) -> Vec<u8> {
-        data.iter()
-            .flat_map(|x| Half::from(*x).0.to_le_bytes())
-            .collect()
-    }
+/// Half-width floats: two bytes each, low first.
+macro_rules! halves {
+    ($($form:ident = $name:literal, $bits:literal;)*) => {$(
+        impl Form for $form {
+            element!($name, $form, $bits);
+            fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
+                let at = index * 2;
+                tessera_graph::$form(u16::from_le_bytes([bytes[at], bytes[at + 1]])).into()
+            }
+            fn pack(&self, data: &[f32]) -> Vec<u8> {
+                data.iter()
+                    .flat_map(|x| tessera_graph::$form::from(*x).0.to_le_bytes())
+                    .collect()
+            }
+        }
+    )*};
 }
+
+halves!(Bf16 = "bf16", 8; F16 = "f16", 11;);
 
 impl Form for Fp8 {
     fn name(&self) -> &'static str {
@@ -300,5 +310,6 @@ impl Form for U8 {
 
 form!(F32);
 form!(Bf16);
+form!(F16);
 form!(Fp8);
 form!(U32);

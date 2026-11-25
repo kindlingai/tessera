@@ -183,3 +183,29 @@ fn deepseek_family_default() {
     }
     assert_eq!(names, ["get_weather", "ping"]);
 }
+
+#[test]
+fn glm53_recipes_parse_tags() {
+    let raw = "<think>plan</think>Checking.<tool_call>f<arg_key>city</arg_key>\
+<arg_value>Paris, FR</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
+    for name in ["glm53-moe", "glm53-whole"] {
+        let path = format!(
+            "{}/../../examples/recipes/{name}/recipe.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let recipe: serde_json::Value =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let config = recipe["config"]["tokenizer_config.json"].to_string();
+        let parser = ResponseParser::from_config(&config).unwrap().unwrap();
+        let parsed = parser.parse(raw, true, false);
+        assert_eq!(
+            (parsed.reasoning.as_str(), parsed.content.as_str()),
+            ("plan", "Checking.")
+        );
+        assert_eq!(parsed.tool_calls[0].function.name, "f");
+        assert_eq!(
+            parsed.tool_calls[0].function.arguments,
+            json!({"city": "Paris, FR", "days": 3})
+        );
+    }
+}

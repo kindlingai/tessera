@@ -1,0 +1,57 @@
+# HuggingFaceTB/SmolLM2-1.7B-Instruct with OpenAI tool calling.
+name = "smollm2"
+
+[weights]
+hf = "HuggingFaceTB/SmolLM2-1.7B-Instruct@31b70e2e869a7173562077fd711b654946d38674"
+
+# Tool prompt and call format from instructions_function_calling.md.
+[config."tokenizer_config.json"]
+chat_template = '''
+{%- macro tool_prompt() -%}
+You are an expert in composing functions. You are given a question and a set of possible functions.
+Based on the question, you will need to make one or more function/tool calls to achieve the purpose.
+If none of the functions can be used, point it out and refuse to answer.
+If the given question lacks the parameters required by the function, also point it out.
+
+You have access to the following tools:
+<tools>{{ tools | tojson }}</tools>
+
+The output MUST strictly adhere to the following format, and NO other text MUST be included.
+The example format is as follows. Please make sure the parameter type is correct. If no function call is needed, please make the tool calls an empty list '[]'.
+<tool_call>[
+{"name": "func_name1", "arguments": {"argument1": "value1", "argument2": "value2"}},
+... (more tool calls as required)
+]</tool_call>
+{%- endmacro -%}
+{%- for message in messages -%}
+{%- if loop.first and message.role != 'system' -%}
+{{ '<|im_start|>system\n' }}
+{%- if tools -%}{{ tool_prompt() }}
+{%- else -%}{{ 'You are a helpful AI assistant named SmolLM, trained by Hugging Face' }}
+{%- endif -%}
+{{ '<|im_end|>\n' }}
+{%- endif -%}
+{{ '<|im_start|>' + message.role + '\n' + (message.content or '') }}
+{%- if message.role == 'system' and tools -%}{{ '\n\n' + tool_prompt() }}{%- endif -%}
+{%- if message.tool_calls -%}
+{{ '<tool_call>[' }}
+{%- for call in message.tool_calls -%}
+{{ '{"name": ' + (call.function.name | tojson) + ', "arguments": ' + (call.function.arguments | tojson) + '}' }}
+{%- if not loop.last -%}{{ ', ' }}{%- endif -%}
+{%- endfor -%}
+{{ ']</tool_call>' }}
+{%- endif -%}
+{{ '<|im_end|>\n' }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{ '<|im_start|>assistant\n' }}{%- endif -%}
+'''
+
+[config."tokenizer_config.json".response_template.fields.content]
+close = "<|im_end|>"
+content = "text"
+
+# One block holds a JSON list of calls.
+[config."tokenizer_config.json".response_template.fields.tool_calls]
+open = "<tool_call>"
+close = "</tool_call>"
+content = "json"

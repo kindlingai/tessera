@@ -674,7 +674,7 @@ impl Release {
             Ok(r) if r.format == TRELLIS && whole => turned(f, &matrix),
             Ok(_) => codes_packed(f, &matrix, range),
             Err(e) => {
-                if f.is_bf16(&local) {
+                if f.is_half(&local) {
                     return match range {
                         Some(r) => f.packed_rows(&local, r),
                         None => f.bytes(&local),

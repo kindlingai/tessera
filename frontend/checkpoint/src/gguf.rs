@@ -400,9 +400,7 @@ impl Offer for Gguf {
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
         match self.tensor_type(name)? {
-            GgufType::F32 | GgufType::F16 => {
-                Err(Error::DType(format!("{name} holds floats, not a form")))
-            }
+            GgufType::F32 => Err(Error::DType(format!("{name} holds floats, not a form"))),
             _ => Ok(self.bytes(name)?.2),
         }
     }

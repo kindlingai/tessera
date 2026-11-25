@@ -152,9 +152,52 @@ TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float
     }
 }
 
+TESSERA_FN void reduce_write(u64 dst_area, u64 mine, u64 seq, u32 me, u32 prev, u32 nr,
+                             const float* in_ptr, float* dst_buf, u32 n, u32 lo4, u32 hi4,
+                             bool aligned_in, bool aligned_dst) {
+    float* remote = reinterpret_cast<float*>(dst_area + slot_off(seq, me, nr));
+    const float* peer = reinterpret_cast<const float*>(mine + slot_off(seq, prev, nr));
+    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+        float4 a = load_vec4(in_ptr, j, aligned_in);
+        float4 b = load_fresh4(peer + j * 4);
+        float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+        store_vec4(remote + j * 4, s);
+        store_out4(dst_buf, j, s, aligned_dst);
+    }
+    if (prim::leader_block()) {
+        u32 base = (n / 4) * 4;
+        u32 rem = n - base;
+        if (threadIdx.x < rem) {
+            u32 idx = base + threadIdx.x;
+            float s = in_ptr[idx] + prim::load_fresh(peer + idx);
+            remote[idx] = s;
+            dst_buf[idx] = s;
+        }
+    }
+}
+
+TESSERA_FN void add_slice(u64 mine, u64 seq, u32 prev, u32 nr, float* dst_buf, u32 n, u32 lo4,
+                          u32 hi4, bool aligned_dst) {
+    const float* peer = reinterpret_cast<const float*>(mine + slot_off(seq, prev, nr));
+    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+        float4 a = load_vec4(dst_buf, j, aligned_dst);
+        float4 b = load_fresh4(peer + j * 4);
+        float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+        store_out4(dst_buf, j, s, aligned_dst);
+    }
+    if (prim::leader_block()) {
+        u32 base = (n / 4) * 4;
+        u32 rem = n - base;
+        if (threadIdx.x < rem) {
+            u32 idx = base + threadIdx.x;
+            dst_buf[idx] = dst_buf[idx] + prim::load_fresh(peer + idx);
+        }
+    }
+}
+
 }  // namespace p2p
 
-// Direct P2P all-reduce: fan-out (sched 0) or rounds (sched 1).
+// Direct P2P all-reduce: fan-out (0), rounds (1), butterfly (2).
 extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32* fault,
                                            u64 from_ptr, u64 to_ptr, u32 total, u64 base_seq,
                                            u32 nr, u32 me, u32 sched, u64 deadline) {
@@ -165,6 +208,7 @@ extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32*
 
     u64 mine = areas[me];
     bool pow2 = (nr & (nr - 1)) == 0;
+    bool butterfly = sched == 2 && pow2 && nr >= 4;
     u64 seq = base_seq;
     for (u32 off = 0; off < total; off += p2p::MAX_FLOATS, seq++) {
         u32 n = total - off;
@@ -182,43 +226,74 @@ extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32*
         if (hi4 > vec4s) hi4 = vec4s;
         u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
 
-        if (sched == 0) {
-            for (u32 k = 1; k < nr; k++) {
-                u32 peer = (me + k) % nr;
+        if (butterfly) {
+            u32 peer0 = me ^ 1u;
+            if (!p2p::spin_ge(p2p::ack_of(mine, nr, peer0), seq - 2, deadline, fault, &stop))
+                return;
+            p2p::write_slice(areas[peer0], seq, me, nr, src, n, lo4, hi4, aligned_src);
+            if (p2p::last_cta(ci + 2) && prim::leader_thread()) {
+                prim::store_release_sys(p2p::tail_of(areas[peer0], seq, me, nr), seq);
+            }
+            if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer0, nr), seq, deadline, fault, &stop))
+                return;
+            u32 prev = peer0;
+            u32 ci_idx = 3;
+            for (u32 step = 2u; step < nr; step <<= 1, ci_idx++) {
+                u32 peer = me ^ step;
                 if (!p2p::spin_ge(p2p::ack_of(mine, nr, peer), seq - 2, deadline, fault, &stop))
                     return;
-            }
-            for (u32 k = 1; k < nr; k++) {
-                u32 peer = (me + k) % nr;
-                p2p::write_slice(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
-            }
-            if (p2p::last_cta(ci + 0) && prim::leader_thread()) {
-                for (u32 k = 1; k < nr; k++) {
-                    u32 peer = (me + k) % nr;
+                const float* in_ptr = (step == 2u) ? src : dst_buf;
+                bool in_aligned = (step == 2u) ? aligned_src : aligned_dst;
+                p2p::reduce_write(areas[peer], mine, seq, me, prev, nr, in_ptr, dst_buf, n, lo4,
+                                  hi4, in_aligned, aligned_dst);
+                if (p2p::last_cta(ci + ci_idx) && prim::leader_thread()) {
                     prim::store_release_sys(p2p::tail_of(areas[peer], seq, me, nr), seq);
                 }
-            }
-            for (u32 k = 1; k < nr; k++) {
-                u32 peer = (me + nr - k) % nr;
                 if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault, &stop))
                     return;
+                prev = peer;
             }
+            p2p::add_slice(mine, seq, prev, nr, dst_buf, n, lo4, hi4, aligned_dst);
         } else {
-            for (u32 k = 1; k < nr; k++) {
-                u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
-                u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
-                if (!p2p::spin_ge(p2p::ack_of(mine, nr, dst), seq - 2, deadline, fault, &stop))
-                    return;
-                p2p::write_slice(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
-                if (p2p::last_cta(ci + 2 + k) && prim::leader_thread()) {
-                    prim::store_release_sys(p2p::tail_of(areas[dst], seq, me, nr), seq);
+            if (sched == 0) {
+                for (u32 k = 1; k < nr; k++) {
+                    u32 peer = (me + k) % nr;
+                    if (!p2p::spin_ge(p2p::ack_of(mine, nr, peer), seq - 2, deadline, fault, &stop))
+                        return;
                 }
-                if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault, &stop))
-                    return;
+                for (u32 k = 1; k < nr; k++) {
+                    u32 peer = (me + k) % nr;
+                    p2p::write_slice(areas[peer], seq, me, nr, src, n, lo4, hi4, aligned_src);
+                }
+                if (p2p::last_cta(ci + 0) && prim::leader_thread()) {
+                    for (u32 k = 1; k < nr; k++) {
+                        u32 peer = (me + k) % nr;
+                        prim::store_release_sys(p2p::tail_of(areas[peer], seq, me, nr), seq);
+                    }
+                }
+                for (u32 k = 1; k < nr; k++) {
+                    u32 peer = (me + nr - k) % nr;
+                    if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault,
+                                      &stop))
+                        return;
+                }
+            } else {
+                for (u32 k = 1; k < nr; k++) {
+                    u32 dst = pow2 ? (me ^ k) : (me + k) % nr;
+                    u32 peer = pow2 ? (me ^ k) : (me + nr - k) % nr;
+                    if (!p2p::spin_ge(p2p::ack_of(mine, nr, dst), seq - 2, deadline, fault, &stop))
+                        return;
+                    p2p::write_slice(areas[dst], seq, me, nr, src, n, lo4, hi4, aligned_src);
+                    if (p2p::last_cta(ci + 2 + k) && prim::leader_thread()) {
+                        prim::store_release_sys(p2p::tail_of(areas[dst], seq, me, nr), seq);
+                    }
+                    if (!p2p::spin_ge(p2p::tail_of(mine, seq, peer, nr), seq, deadline, fault,
+                                      &stop))
+                        return;
+                }
             }
+            p2p::sum_slice(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
         }
-
-        p2p::sum_slice(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
         if (p2p::last_cta(ci + 1) && prim::leader_thread()) {
             for (u32 k = 1; k < nr; k++) {
                 u32 peer = (me + k) % nr;

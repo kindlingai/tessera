@@ -173,6 +173,19 @@ pub fn rows(bounded: &[Dim], width: u64) -> Graph {
     m.finish([(Role::Tokens, &ids), (Role::Logits, &sum.mean(0))])
 }
 
+/// Residual add + RMS norm: 2-output (residual kept) and 3-addend 1-output.
+pub fn residual_norm(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, width)]);
+    let w: Scale = declare(&m);
+    let port = || rows_of(bounded, Hidden, DType::F32);
+    let [x, a, b] = m.entry(EntryKind::Forward, [port(), port(), port()]);
+    let h = x.add(&a);
+    let n1 = h.rms_norm(&w.norm, 1e-6);
+    let h2 = h.add(&a.add(&b));
+    let n2 = h2.rms(1e-6);
+    m.finish([(Role::Logits, &n1.add(&n2))])
+}
+
 /// A rotation, then causal attention over `Seqs`, `Rows` and `Context`.
 pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];

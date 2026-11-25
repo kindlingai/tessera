@@ -3,7 +3,7 @@
 use crate::ir::Helper;
 use std::sync::Mutex;
 
-pub use tessera_mem::form::{Bf16, F32, Form, Fp8, Read, U8, U32};
+pub use tessera_mem::form::{Bf16, F16, F32, Form, Fp8, Read, U8, U32};
 pub(crate) use tessera_mem::form::{gather, scatter};
 
 /// Decodes its elements in kernel text.
@@ -167,50 +167,97 @@ impl Load for F32 {
     }
 }
 
-impl Load for Bf16 {
-    fn ty(&self) -> &'static str {
-        "u16"
+/// Half-width floats: two to a word, low half first.
+macro_rules! halves {
+    ($($form:ident = $text:ident, $wgsl:ident { $($more:tt)* })*) => {$(
+        impl Load for $form {
+            fn ty(&self) -> &'static str {
+                "u16"
+            }
+            fn load(&self, name: &str, index: &str) -> String {
+                $text(&format!("(u32){name}[{index}]"), 0)
+            }
+            /// Four halves as two words, decoded as they are used.
+            fn load4(&self, name: &str, index: &str) -> String {
+                format!("f_u32x2({name} + {index})")
+            }
+            fn wide(&self) -> &'static str {
+                "uint2"
+            }
+            fn part(&self, wide: &str, h: char) -> String {
+                let (word, low) = half_at(h);
+                $text(&format!("{wide}.{word}"), low)
+            }
+            fn wgsl_ty(&self) -> Option<&'static str> {
+                Some("u32")
+            }
+            fn wgsl_load(&self, name: &str, index: &str) -> String {
+                let word = format!("{name}[({index}) >> 1u]");
+                $wgsl(&format!("({word} >> ((({index}) & 1u) << 4u))"), 0)
+            }
+            /// Four elements start a word, so two words hold them.
+            fn wgsl_load4(&self, name: &str, index: &str) -> String {
+                format!("vec2<u32>({name}[({index}) >> 1u], {name}[(({index}) >> 1u) + 1u])")
+            }
+            fn wgsl_wide(&self) -> &'static str {
+                "vec2<u32>"
+            }
+            fn wgsl_part(&self, wide: &str, h: char) -> String {
+                let (word, low) = half_at(h);
+                $wgsl(&format!("{wide}.{word}"), low)
+            }
+            $($more)*
+        }
+    )*};
+}
+
+halves! {
+    Bf16 = bf16_text, bf16_wgsl {
+        fn stores(&self) -> bool {
+            true
+        }
+        fn store(&self, name: &str, index: &str, value: &str) -> String {
+            format!("{name}[{index}] = f_to_bf16({value})")
+        }
+        fn store4(&self, name: &str, index: &str, value: &str) -> String {
+            format!("f_store4_bf16({name} + {index}, {value})")
+        }
     }
-    fn load(&self, name: &str, index: &str) -> String {
-        format!("f_bits((u32){name}[{index}] << 16)")
+    F16 = f16_text, f16_wgsl {}
+}
+
+/// Part `h`'s word and low bit, for four halves.
+fn half_at(h: char) -> (char, u32) {
+    match h {
+        'x' => ('x', 0),
+        'y' => ('x', 16),
+        'z' => ('y', 0),
+        _ => ('y', 16),
     }
-    /// Four bf16 as two words, decoded as they are used.
-    fn load4(&self, name: &str, index: &str) -> String {
-        format!("f_u32x2({name} + {index})")
+}
+
+/// The bf16 at bit `low` of word `w`, through `bits`.
+fn bf16_bits(bits: &str, w: &str, low: u32) -> String {
+    match low {
+        0 => format!("{bits}({w} << 16)"),
+        _ => format!("{bits}({w} & 0xffff0000u)"),
     }
-    fn wide(&self) -> &'static str {
-        "uint2"
-    }
-    /// Two bf16 share each word: low half first.
-    fn part(&self, wide: &str, h: char) -> String {
-        bf16_part("f_bits", wide, h)
-    }
-    fn stores(&self) -> bool {
-        true
-    }
-    fn store(&self, name: &str, index: &str, value: &str) -> String {
-        format!("{name}[{index}] = f_to_bf16({value})")
-    }
-    fn store4(&self, name: &str, index: &str, value: &str) -> String {
-        format!("f_store4_bf16({name} + {index}, {value})")
-    }
-    fn wgsl_ty(&self) -> Option<&'static str> {
-        Some("u32")
-    }
-    fn wgsl_load(&self, name: &str, index: &str) -> String {
-        let word = format!("{name}[({index}) >> 1u]");
-        format!("bitcast<f32>(({word} >> ((({index}) & 1u) << 4u)) << 16u)")
-    }
-    /// Four elements start a word, so two words hold them.
-    fn wgsl_load4(&self, name: &str, index: &str) -> String {
-        format!("vec2<u32>({name}[({index}) >> 1u], {name}[(({index}) >> 1u) + 1u])")
-    }
-    fn wgsl_wide(&self) -> &'static str {
-        "vec2<u32>"
-    }
-    fn wgsl_part(&self, wide: &str, h: char) -> String {
-        bf16_part("bitcast<f32>", wide, h)
-    }
+}
+
+fn bf16_text(w: &str, low: u32) -> String {
+    bf16_bits("f_bits", w, low)
+}
+
+fn bf16_wgsl(w: &str, low: u32) -> String {
+    bf16_bits("bitcast<f32>", w, low)
+}
+
+fn f16_text(w: &str, low: u32) -> String {
+    format!("f_f16({w}, {low})")
+}
+
+fn f16_wgsl(w: &str, low: u32) -> String {
+    format!("unpack2x16float({w} >> {low}u).x")
 }
 
 impl Load for Fp8 {
@@ -244,16 +291,6 @@ impl Load for Fp8 {
     }
     fn store4(&self, name: &str, index: &str, value: &str) -> String {
         format!("f_store4_e4m3({name} + {index}, {value})")
-    }
-}
-
-/// Part `h` of four bf16 in two words.
-fn bf16_part(bits: &str, wide: &str, h: char) -> String {
-    match h {
-        'x' => format!("{bits}({wide}.x << 16)"),
-        'y' => format!("{bits}({wide}.x & 0xffff0000u)"),
-        'z' => format!("{bits}({wide}.y << 16)"),
-        _ => format!("{bits}({wide}.y & 0xffff0000u)"),
     }
 }
 
@@ -292,6 +329,7 @@ fn wgsl_plain(ty: &str, name: &str, index: &str) -> String {
 
 form!(F32);
 form!(Bf16);
+form!(F16);
 form!(Fp8);
 form!(U32);
 

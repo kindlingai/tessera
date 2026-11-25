@@ -361,6 +361,12 @@ impl Counter {
                     }
                 }
             }
+            // Settled at build time: only the kept branch runs.
+            Stmt::If {
+                cond: Expr::Bool(kept),
+                then,
+                els,
+            } => self.stmts(if *kept { then } else { els }),
             Stmt::If { cond, then, els } => {
                 self.expr(cond);
                 self.stmts(then);
@@ -515,6 +521,11 @@ fn runtime_loops(stmts: &[Stmt]) -> bool {
             let fixed = matches!((from, to, step), (Expr::Int(_), Expr::Int(_), Expr::Int(_)));
             !fixed || runtime_loops(body)
         }
+        Stmt::If {
+            cond: Expr::Bool(kept),
+            then,
+            els,
+        } => runtime_loops(if *kept { then } else { els }),
         Stmt::If { then, els, .. } => runtime_loops(then) || runtime_loops(els),
         Stmt::TileEach { body, .. } => runtime_loops(body),
         _ => false,

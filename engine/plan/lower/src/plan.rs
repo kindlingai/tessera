@@ -72,6 +72,8 @@ pub struct Step {
     pub rule: &'static str,
     pub reads: Vec<Slot>,
     pub write: Slot,
+    /// Extra outputs this launch writes.
+    pub also: Vec<Slot>,
     /// The graph nodes this launch computes, or helps compute.
     pub covers: Vec<NodeId>,
     /// The zone it runs in.
@@ -92,6 +94,14 @@ impl Step {
 
     pub fn out(&self) -> Arg {
         Arg::at(self.write, 0)
+    }
+
+    /// Output `i`: `0` is `write`, `1..` are `also`.
+    pub fn out_at(&self, i: usize) -> Arg {
+        match i {
+            0 => self.out(),
+            n => Arg::at(self.also[n - 1], 0),
+        }
     }
 
     /// The page table, if `layout` reads one.

@@ -69,6 +69,11 @@ fn stored(dtype: &str) -> Stored {
     }
 }
 
+/// Whether a safetensors dtype is a two-byte float.
+fn half(dtype: &str) -> bool {
+    matches!(dtype, "BF16" | "F16")
+}
+
 /// Bytes `start..start + len` of `url`.
 fn fetch(url: &str, start: u64, len: u64) -> Result<Vec<u8>, Error> {
     let range = format!("bytes={start}-{}", start + len - 1);
@@ -166,10 +171,9 @@ impl File {
         self.entries.get(name).map(|e| e.dtype.as_str())
     }
 
-    pub fn is_bf16(&self, name: &str) -> bool {
-        self.entries
-            .get(name)
-            .is_some_and(|e| stored(&e.dtype) == Stored::BF16)
+    /// Whether `name` holds two-byte floats, read as their form.
+    pub fn is_half(&self, name: &str) -> bool {
+        self.entries.get(name).is_some_and(|e| half(&e.dtype))
     }
 
     /// An `I64` tensor's values, in little-endian order.
@@ -254,8 +258,8 @@ impl Offer for File {
     }
 
     fn packed(&self, name: &str) -> Result<Vec<u8>, Error> {
-        match self.entries.get(name).map(|e| stored(&e.dtype)) {
-            Some(s) if s == Stored::BF16 => self.bytes(name),
+        match self.entries.get(name) {
+            Some(e) if half(&e.dtype) => self.bytes(name),
             Some(_) => Err(Error::DType(format!("{name} holds floats, not a form"))),
             None => Err(Error::Missing(name.into())),
         }
@@ -266,7 +270,7 @@ impl Offer for File {
             .entries
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
-        if stored(&e.dtype) != Stored::BF16 {
+        if !half(&e.dtype) {
             return Err(Error::DType(format!("{name} cannot be read in rows")));
         }
         let rows = *e.shape.first().unwrap_or(&0);

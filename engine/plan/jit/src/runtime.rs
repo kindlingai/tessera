@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use tessera_codegen::Precision;
-use tessera_codegen::form::{BF16_FORM, Bf16, F32, F32_FORM, Form, Fp8, LOADS, Load, U8, U32};
+use tessera_codegen::form::{BF16_FORM, Bf16, F16, F32, F32_FORM, Form, Fp8, LOADS, Load, U8, U32};
 use tessera_host::lockstep::{self, THREADS, Tiles};
 
 /// A buffer as the compiled code sees it.
@@ -72,6 +72,7 @@ macro_rules! readers {
 readers! {
     rd_f32 = rd_f32: f32, F32;
     rd_bf16 = rd_bf16: f32, Bf16;
+    rd_f16 = rd_f16: f32, F16;
     rd_fp8 = rd_fp8: f32, Fp8;
     rd_u32 = rd_u32: u32, U32;
     rd_u8 = rd_u8: u32, U8;

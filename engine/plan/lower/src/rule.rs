@@ -152,6 +152,8 @@ pub struct Draft {
     pub choice: usize,
     /// The region output it writes, for readers past the cover.
     pub writes: Option<T>,
+    /// Extra tree outputs `(node, len)` this launch also writes.
+    pub also: Vec<(T, usize)>,
 }
 
 impl Draft {
@@ -166,12 +168,19 @@ impl Draft {
             len,
             choice: 0,
             writes: None,
+            also: Vec::new(),
         }
     }
 
     /// The same draft, writing region output `t`.
     pub fn writes(mut self, t: T) -> Self {
         self.writes = Some(t);
+        self
+    }
+
+    /// The same draft, also writing node `t` (`len` elements).
+    pub fn also(mut self, t: T, len: usize) -> Self {
+        self.also.push((t, len));
         self
     }
 

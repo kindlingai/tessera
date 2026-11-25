@@ -7,16 +7,16 @@ use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::{Draft, Kernel, Load, Needs, Shape, Source, T, Tree, sites};
 
 /// SIMD groups sharing one wide row in block mode.
-const WARPS: u32 = 8;
+pub(crate) const WARPS: u32 = 8;
 
 /// Threads per row in block mode.
-const BLOCK_THREADS: u32 = WARPS * LANES as u32;
+pub(crate) const BLOCK_THREADS: u32 = WARPS * LANES as u32;
 
 /// Minimum width to split across a whole block.
-const BLOCK_MIN: usize = 512;
+pub(crate) const BLOCK_MIN: usize = 512;
 
 /// Maximum rows where block-wide RMS norm wins.
-const BLOCK_ROWS: usize = 16;
+pub(crate) const BLOCK_ROWS: usize = 16;
 
 /// Sums a row's squares, then scales the row.
 #[kernel]
@@ -92,9 +92,9 @@ fn norm_lanes<const WIDE: u32, const AHEAD: u32, const WEIGHTED: bool>(
         (true, false) => "lane_norm",
         (false, false) => "lane_rms",
     },
-    threads = norm_shape(self),
+    threads = row_shape(self.rows, self.block),
     work = self.rows * self.width,
-    needs = norm_needs(self),
+    needs = row_needs(self.block),
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
     accepts = norm_accepts,
@@ -114,20 +114,22 @@ pub(crate) struct LaneNorm {
     pub out_form: &'static dyn Stored,
 }
 
-fn norm_shape(k: &LaneNorm) -> Shape {
-    if k.block {
+/// Launch grid for `rows` in block or lane mode.
+pub(crate) fn row_shape(rows: usize, block: bool) -> Shape {
+    if block {
         Shape::Grid {
-            across: k.rows,
+            across: rows,
             down: 1,
             threads: BLOCK_THREADS as usize,
         }
     } else {
-        Shape::Line(k.rows * LANES)
+        Shape::Line(rows * LANES)
     }
 }
 
-fn norm_needs(k: &LaneNorm) -> Needs {
-    if k.block {
+/// Device requirements for block or lane row kernels.
+pub(crate) fn row_needs(block: bool) -> Needs {
+    if block {
         Needs {
             lanes: LANES,
             group_bytes: 4 * WARPS as usize,

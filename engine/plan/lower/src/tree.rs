@@ -693,6 +693,11 @@ impl<'a> Tree<'a> {
         kept || end || self.readers[t.0 as usize] > 1 || self.output(t)
     }
 
+    /// Whether a region rule claims `t` as an output.
+    pub(crate) fn end(&self, t: T) -> bool {
+        self.ends[t.0 as usize]
+    }
+
     /// The pattern `P` at `t`, if the node shows it.
     pub fn site<P: Pattern>(&self, t: T) -> Option<P> {
         P::find(self, t)
@@ -788,12 +793,21 @@ impl<'a> Tree<'a> {
             .copied()
             .filter(|n| *n != t && self.root(*n))
             .collect();
-        // Outside readers may read the outputs it writes.
-        for &r in roots.iter().filter(|r| !writes.contains(r)) {
-            let args = inside.iter().flat_map(|n| &self.node(*n).args);
-            let seen = args.filter(|a| **a == r).count();
-            if seen != self.readers[r.0 as usize] as usize {
-                return None;
+        // Outside readers may read written outputs after `t`.
+        for &r in &roots {
+            if writes.contains(&r) {
+                let early = (r.0 + 1..t.0)
+                    .map(T)
+                    .any(|u| !inside.contains(&u) && self.node(u).args.contains(&r));
+                if early {
+                    return None;
+                }
+            } else {
+                let args = inside.iter().flat_map(|n| &self.node(*n).args);
+                let seen = args.filter(|a| **a == r).count();
+                if seen != self.readers[r.0 as usize] as usize {
+                    return None;
+                }
             }
         }
         Some(roots)

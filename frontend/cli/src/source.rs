@@ -26,15 +26,46 @@ pub enum Origin {
     Model(String),
     /// `owner/name` or `owner/name@revision` on Hugging Face.
     Hub(String),
-    /// The recipe built into tesserax.
-    Default,
+    /// A recipe built into tesserax, by catalog name.
+    Builtin(&'static str),
 }
 
-/// The fallback recipe for text verbs: path and text.
-pub const DEFAULT: (&str, &str) = (
-    "frontend/cli/recipe/recipe.toml",
-    include_str!("../recipe/recipe.toml"),
-);
+macro_rules! catalog {
+    ($($name:literal),* $(,)?) => {
+        [$(($name, include_str!(concat!("../recipe/", $name, ".toml")))),*]
+    };
+}
+
+/// Built-in recipes by name. The first is the default.
+pub const CATALOG: [(&str, &str); 4] = catalog![
+    "gemma-4-e4b",
+    "qwen3-0.6b",
+    "flux2-klein",
+    "embeddinggemma-2",
+];
+
+/// Catalog recipe `name`.
+pub fn builtin(name: &str) -> Option<Result<Recipe, Stop>> {
+    let (_, text) = CATALOG.iter().find(|(n, _)| *n == name)?;
+    let path = PathBuf::from(format!("builtin/{name}.toml"));
+    Some(Recipe::parse(text, &path).map_err(Stop::from))
+}
+
+/// Every catalog recipe that reads.
+pub fn catalog() -> Vec<Recipe> {
+    let read = |(name, _): &(&str, &str)| builtin(name)?.ok();
+    CATALOG.iter().filter_map(read).collect()
+}
+
+/// The default recipe's name and Hugging Face repository.
+pub fn default_model() -> String {
+    let Some(Ok(recipe)) = builtin(CATALOG[0].0) else {
+        return CATALOG[0].0.into();
+    };
+    let hf = recipe.weights.hf.unwrap_or_default();
+    let repo = hf.split('@').next().unwrap_or_default();
+    format!("{} from {repo}", recipe.name)
+}
 
 /// The repository in a `--model hf:<owner>/<name>[@<revision>]` value.
 fn hub_spec(value: &str) -> Option<Result<String, Stop>> {
@@ -68,7 +99,11 @@ pub fn split(given: &[String]) -> Result<(Option<Origin>, Vec<String>), Stop> {
         }
         let value = args.next().ok_or(Stop::Usage)?.clone();
         let found = match arg.as_str() {
-            "--recipe" => Origin::Recipe(value),
+            // A directory or source wins over a catalog name.
+            "--recipe" => match CATALOG.iter().find(|(n, _)| *n == value) {
+                Some((name, _)) if !Path::new(&value).exists() => Origin::Builtin(name),
+                _ => Origin::Recipe(value),
+            },
             _ => match hub_spec(&value) {
                 Some(spec) => Origin::Hub(spec?),
                 None => Origin::Model(value),
@@ -101,7 +136,7 @@ impl Source {
         let mut fetched = None;
         let recipe = match &origin {
             Origin::Recipe(src) => Some(Recipe::open(src, cache.as_deref())?),
-            Origin::Default => Some(Recipe::parse(DEFAULT.1, Path::new(DEFAULT.0))?),
+            Origin::Builtin(name) => Some(builtin(name).ok_or(Stop::Usage)??),
             Origin::Model(_) => None,
             Origin::Hub(spec) => {
                 let dir = cache.as_deref().ok_or(tessera_recipe::Error::NoCache)?;
@@ -121,7 +156,7 @@ impl Source {
 
     /// Opens `origin`, or the default recipe when there is none.
     pub fn open_or_default(origin: Option<Origin>) -> Result<Source, Stop> {
-        Self::open(Some(origin.unwrap_or(Origin::Default)))
+        Self::open(Some(origin.unwrap_or(Origin::Builtin(CATALOG[0].0))))
     }
 
     /// Serve options from the recipe, then from `rest`.

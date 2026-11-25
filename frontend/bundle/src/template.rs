@@ -1,12 +1,14 @@
 //! The model's chat template, from `tokenizer_config.json`.
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::Serde;
-use minijinja::{Environment, Value};
+use minijinja::value::{Kwargs, Serde};
+use minijinja::{Environment, ErrorKind, Value};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::{Deserialize, Serialize};
+use serde_json::ser::{Formatter, PrettyFormatter};
 use std::borrow::Cow;
 use std::error::Error;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -98,6 +100,66 @@ fn strftime_now(clock: &Clock, format: &str) -> Result<String, minijinja::Error>
         .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
+/// Python's `json.dumps` spacing: `", "` between items, `": "` after keys.
+struct Spaced;
+
+impl Formatter for Spaced {
+    fn begin_array_value<W: ?Sized + io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+
+    fn begin_object_key<W: ?Sized + io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+
+    fn begin_object_value<W: ?Sized + io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+
+/// Hugging Face's `tojson`: Python `json.dumps`, `ensure_ascii` off by default.
+fn tojson(value: &Value, kwargs: Kwargs) -> Result<Value, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent")?;
+    let ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    kwargs.assert_all_used()?;
+    let mut out = Vec::new();
+    let done = match indent {
+        Some(n) => {
+            let pad = vec![b' '; n];
+            let fmt = PrettyFormatter::with_indent(&pad);
+            value.serialize(&mut serde_json::Serializer::with_formatter(&mut out, fmt))
+        }
+        None => value.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut out, Spaced,
+        )),
+    };
+    done.map_err(|e| minijinja::Error::new(ErrorKind::InvalidOperation, e.to_string()))?;
+    let text = String::from_utf8(out).unwrap_or_default();
+    if !ascii.unwrap_or(false) {
+        return Ok(Value::from_safe_string(text));
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            escaped.push(c);
+            continue;
+        }
+        let mut units = [0u16; 2];
+        for unit in c.encode_utf16(&mut units) {
+            escaped.push_str(&format!("\\u{unit:04x}"));
+        }
+    }
+    Ok(Value::from_safe_string(escaped))
+}
+
 /// Removes Hugging Face `generation` training-mask block tags.
 fn strip_generation(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
@@ -148,6 +210,7 @@ impl Template {
         env.add_function("strftime_now", move |format: &str| {
             strftime_now(&clock, format)
         });
+        env.add_filter("tojson", tojson);
         env.add_function(
             "raise_exception",
             |msg: String| -> Result<String, minijinja::Error> {

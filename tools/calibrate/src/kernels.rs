@@ -246,7 +246,9 @@ fn check(
         }
     }
     for w in &ways {
-        println!("    {:24} {:9.2} us", w.label, w.seconds * 1e6);
+        let guess = device.cost(&w.plan).seconds * 1e6;
+        let us = w.seconds * 1e6;
+        println!("    {:24} {us:9.2} us, estimated {guess:9.2} us", w.label);
     }
     let Some((planned, forced)) = ways.split_first() else {
         return Ok(());

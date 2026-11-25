@@ -65,7 +65,7 @@ fn wider(a: Ty, b: Ty) -> Ty {
 
 fn element(form: &dyn Load) -> Ty {
     match form.read() {
-        Read::F32 | Read::Bf16 | Read::Fp8 | Read::Decode => Ty::F32,
+        Read::F32 | Read::Bf16 | Read::F16 | Read::Fp8 | Read::Decode => Ty::F32,
         Read::U32 | Read::U8 => Ty::U32,
     }
 }
@@ -176,6 +176,7 @@ impl Lowerer<'_, '_> {
                 return Ok(self.either(fits, load, check, Some(ty)).expect("a value"));
             }
             Read::Bf16 => "rd_bf16",
+            Read::F16 => "rd_f16",
             Read::Fp8 => "rd_fp8",
             Read::U8 => "rd_u8",
             Read::Decode => {
@@ -571,7 +572,7 @@ impl Lowerer<'_, '_> {
                 let sum = match fb.read() {
                     Read::F32 => self.call("dot_f32", &rows),
                     Read::Bf16 => self.call("dot_bf16", &rows),
-                    Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => {
+                    Read::F16 | Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => {
                         let form = self.registered(fb)?;
                         self.call("dot_form", &[&[form][..], &rows].concat())
                     }
