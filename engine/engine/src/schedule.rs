@@ -1,5 +1,6 @@
 //! Many answers in flight, one step feeding them all.
 
+use crate::guide::{Edit, edit};
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
 use crate::sample::Sampler;
@@ -29,6 +30,8 @@ pub struct Seq {
     made: usize,
     /// Choices for the next pick.
     next: Allowed,
+    /// Changes to the next pick's logits.
+    edits: Vec<Edit>,
     /// Per-sequence token sampler.
     sampler: Sampler,
 }
@@ -103,6 +106,10 @@ impl Seq {
                 Allowed::One(id) => Some(id),
                 _ => None,
             };
+            let edits = match one.is_none() && !done {
+                true => guide.edits(),
+                false => Vec::new(),
+            };
             for id in forced.into_iter().chain(one) {
                 if self.request.stop.contains(&id) {
                     return Some(Reason::Stop);
@@ -117,6 +124,7 @@ impl Seq {
             }
             if one.is_none() {
                 self.next = next;
+                self.edits = edits;
                 return None;
             }
         }
@@ -282,6 +290,7 @@ impl<'a> Batch<'a> {
                 fed: skip,
                 made: 0,
                 next: Allowed::Any,
+                edits: Vec::new(),
                 sampler,
             };
             if skip > 0 {
@@ -321,21 +330,27 @@ impl<'a> Batch<'a> {
         }
     }
 
-    /// Each pick's allowed set, if any pick is limited.
-    fn allowed(&self, rows: &[Row], ends: &[u32]) -> Option<Vec<Allowed>> {
-        let mut out = vec![Allowed::Any; ends.len()];
+    /// Each pick's answer, and whether that answer keeps the pick.
+    fn owners(&self, rows: &[Row], ends: &[u32]) -> Vec<(usize, bool)> {
+        let mut out = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let slot = rows[end as usize].slot;
+            let at = self.active.iter().position(|s| s.slot == slot);
+            let at = at.expect("an active slot");
+            let mine = rows.iter().filter(|r| r.slot == slot).count();
+            out.push((at, mine == self.active[at].pending.len()));
+        }
+        out
+    }
+
+    /// Each pick's allowed set, if any kept pick is limited.
+    fn allowed(&self, owners: &[(usize, bool)]) -> Option<Vec<Allowed>> {
+        let mut out = vec![Allowed::Any; owners.len()];
         let mut limited = false;
-        for seq in &self.active {
-            if seq.next == Allowed::Any {
-                continue;
-            }
-            let Some(k) = ends.iter().position(|&e| rows[e as usize].slot == seq.slot) else {
-                continue;
-            };
-            // Only when the answer keeps this pick.
-            let mine = rows.iter().filter(|r| r.slot == seq.slot).count();
-            if mine == seq.pending.len() {
-                out[k] = seq.next.clone();
+        for (k, &(at, keep)) in owners.iter().enumerate() {
+            let next = &self.active[at].next;
+            if keep && *next != Allowed::Any {
+                out[k] = next.clone();
                 limited = true;
             }
         }
@@ -446,20 +461,22 @@ impl<'a> Batch<'a> {
             }
         };
         let ends = ends(&rows);
+        let owners = self.owners(&rows, &ends);
         let sampling = self.active.iter().any(|s| !s.request.sampling.greedy());
-        let ids = match (sampling, self.allowed(&rows, &ends)) {
+        let edited = owners
+            .iter()
+            .any(|&(at, keep)| keep && !self.active[at].edits.is_empty());
+        let ids = match (sampling || edited, self.allowed(&owners)) {
             (true, allowed) => {
-                let (logits, vocab) = self.engine.last_logits(&rows)?;
+                let (mut logits, vocab) = self.engine.last_logits(&rows)?;
                 let mut picked = Vec::with_capacity(ends.len());
-                for (k, &end) in ends.iter().enumerate() {
-                    let slot = rows[end as usize].slot;
-                    let seq = self
-                        .active
-                        .iter_mut()
-                        .find(|s| s.slot == slot)
-                        .expect("an active slot");
+                for (k, &(at, keep)) in owners.iter().enumerate() {
+                    let seq = &mut self.active[at];
+                    let row = &mut logits[k * vocab..(k + 1) * vocab];
+                    if keep {
+                        edit(row, &seq.edits);
+                    }
                     let mask = allowed.as_ref().map(|a| &a[k]);
-                    let row = &logits[k * vocab..(k + 1) * vocab];
                     picked.push(seq.sampler.pick(row, mask));
                 }
                 picked

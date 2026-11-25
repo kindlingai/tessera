@@ -16,6 +16,8 @@ mod batch_dual;
 mod batch_spec;
 mod dual;
 mod guide;
+#[cfg(test)]
+mod guide_test;
 mod kept;
 mod lanes;
 pub mod metrics;
@@ -23,6 +25,7 @@ pub mod metrics;
 mod metrics_test;
 mod model;
 mod mtp_draft;
+mod penalty;
 mod ple;
 pub mod progress;
 #[cfg(test)]
@@ -38,10 +41,11 @@ mod speculate;
 
 pub use batch_spec::BatchMtp;
 pub use dual::{DualSelector, DualSpeculate};
-pub use guide::{Allowed, FEW, Fault, Guide, Prefix};
+pub use guide::{Allowed, Edit, FEW, Fault, Guide, Prefix, Stacked};
 pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
+pub use penalty::Penalties;
 pub use ple::{PleConfig, PleStore};
 pub use ranks::Place;
 pub use sample::Sampling;

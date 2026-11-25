@@ -37,6 +37,66 @@ impl Allowed {
         }
     }
 
+    /// Whether the set holds `id`.
+    pub fn allows(&self, id: u32) -> bool {
+        let bit = |bits: &[u32]| {
+            bits.get(id as usize / 32)
+                .is_none_or(|w| w >> (id % 32) & 1 == 1)
+        };
+        match self {
+            Allowed::Any => true,
+            Allowed::One(one) => *one == id,
+            Allowed::Few(ids) => ids.contains(&id),
+            Allowed::Except(ids) => !ids.contains(&id),
+            Allowed::Bits(bits) => bit(bits),
+        }
+    }
+
+    /// The ids both sets hold. Empty is an empty `Few`.
+    pub fn meet(self, other: Allowed) -> Allowed {
+        match (self, other) {
+            (Allowed::Any, a) | (a, Allowed::Any) => a,
+            (Allowed::One(id), a) | (a, Allowed::One(id)) => match a.allows(id) {
+                true => Allowed::One(id),
+                false => Allowed::Few(Vec::new()),
+            },
+            (Allowed::Few(mut ids), a) | (a, Allowed::Few(mut ids)) => {
+                ids.retain(|&id| a.allows(id));
+                match ids[..] {
+                    [id] => Allowed::One(id),
+                    _ => Allowed::Few(ids),
+                }
+            }
+            (Allowed::Except(mut a), Allowed::Except(b)) => {
+                a.extend(b);
+                a.sort_unstable();
+                a.dedup();
+                Allowed::Except(a)
+            }
+            (Allowed::Bits(mut bits), Allowed::Except(ids))
+            | (Allowed::Except(ids), Allowed::Bits(mut bits)) => {
+                for id in ids {
+                    if let Some(word) = bits.get_mut(id as usize / 32) {
+                        *word &= !(1 << (id % 32));
+                    }
+                }
+                Allowed::from_bits(bits)
+            }
+            (Allowed::Bits(a), Allowed::Bits(b)) => {
+                let (mut long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                for (word, other) in long.iter_mut().zip(short) {
+                    *word &= other;
+                }
+                Allowed::from_bits(long)
+            }
+        }
+    }
+
+    /// Whether no id is allowed.
+    pub fn empty(&self) -> bool {
+        matches!(self, Allowed::Few(ids) if ids.is_empty())
+    }
+
     /// One bit per row, over `words` words.
     pub(crate) fn bits(&self, words: usize) -> Vec<u32> {
         let set = |out: &mut [u32], id: u32, on: bool| {
@@ -70,6 +130,24 @@ impl Allowed {
     }
 }
 
+/// Divides positive logits by `rep`, multiplies others, adds `add`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Edit {
+    pub id: u32,
+    pub add: f32,
+    pub rep: f32,
+}
+
+/// Applies `edits` to a row, skipping ids past its end.
+pub(crate) fn edit(row: &mut [f32], edits: &[Edit]) {
+    for e in edits {
+        if let Some(x) = row.get_mut(e.id as usize) {
+            let scaled = if *x > 0.0 { *x / e.rep } else { *x * e.rep };
+            *x = scaled + e.add;
+        }
+    }
+}
+
 /// One answer's rules on its next tokens.
 pub trait Guide: Send {
     /// The tokens the next pick may choose from.
@@ -86,6 +164,102 @@ pub trait Guide: Send {
     /// Whether the answer ends here.
     fn done(&self) -> bool {
         false
+    }
+
+    /// Changes to the next pick's logits.
+    fn edits(&mut self) -> Vec<Edit> {
+        Vec::new()
+    }
+}
+
+/// Several guides as one. Picks must suit every member.
+pub struct Stacked {
+    members: Vec<Box<dyn Guide>>,
+    /// A conflict over forced tokens, reported by the next `allowed`.
+    fault: Option<Fault>,
+}
+
+impl Stacked {
+    /// None, the only member, or a stack of `members`.
+    pub fn of(mut members: Vec<Box<dyn Guide>>) -> Option<Box<dyn Guide>> {
+        match members.len() {
+            0 => None,
+            1 => members.pop(),
+            _ => Some(Box::new(Stacked {
+                members,
+                fault: None,
+            })),
+        }
+    }
+}
+
+impl Guide for Stacked {
+    fn allowed(&mut self) -> Result<Allowed, Fault> {
+        if let Some(fault) = self.fault.take() {
+            return Err(fault);
+        }
+        let mut out = Allowed::Any;
+        for m in &mut self.members {
+            out = out.meet(m.allowed()?);
+        }
+        match out.empty() {
+            true => Err("the guides allow disjoint token sets".into()),
+            false => Ok(out),
+        }
+    }
+
+    /// Two members that force different tokens are a fault.
+    fn forced(&mut self) -> Vec<u32> {
+        let lists: Vec<Vec<u32>> = self.members.iter_mut().map(|m| m.forced()).collect();
+        let Some(first) = lists.iter().find(|l| !l.is_empty()).cloned() else {
+            return Vec::new();
+        };
+        for (m, list) in self.members.iter_mut().zip(&lists) {
+            if list.is_empty() {
+                for &id in &first {
+                    if let Err(e) = m.accept(id) {
+                        self.fault.get_or_insert(e);
+                    }
+                }
+            } else if *list != first {
+                self.fault
+                    .get_or_insert("the guides force different tokens".into());
+            }
+        }
+        first
+    }
+
+    fn accept(&mut self, id: u32) -> Result<(), Fault> {
+        let mut out = Ok(());
+        for m in &mut self.members {
+            let each = m.accept(id);
+            if out.is_ok() {
+                out = each;
+            }
+        }
+        out
+    }
+
+    /// A pending fault waits for `allowed` to report it.
+    fn done(&self) -> bool {
+        self.fault.is_none() && self.members.iter().any(|m| m.done())
+    }
+
+    /// Edits of one id combine: `add` sums, `rep` multiplies.
+    fn edits(&mut self) -> Vec<Edit> {
+        let mut all: Vec<Edit> = self.members.iter_mut().flat_map(|m| m.edits()).collect();
+        all.sort_by_key(|e| e.id);
+        let mut out: Vec<Edit> = Vec::with_capacity(all.len());
+        for e in all {
+            match out.last_mut() {
+                Some(last) if last.id == e.id => {
+                    last.add += e.add;
+                    last.rep *= e.rep;
+                }
+                _ => out.push(e),
+            }
+        }
+        out
     }
 }
 
