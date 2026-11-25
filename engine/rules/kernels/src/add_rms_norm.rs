@@ -7,6 +7,23 @@ use tessera_graph::{Order, Stage};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
 use tessera_lower::{Draft, Kernel, Launch, Load, Source, Step, T, Term, ToArg, Tree, sites};
 
+/// Maximum wide trips held in registers across passes.
+const CACHE_TRIPS: u32 = 8;
+
+/// Per-thread register slots for cached pass-1 sums.
+const CACHE_SLOTS: usize = (CACHE_TRIPS * WIDE) as usize;
+
+/// Trip count cached in registers, or zero when too wide.
+fn cache_trips(width: usize, block: bool) -> u32 {
+    let stride = if block { BLOCK_THREADS as usize } else { LANES } * WIDE as usize;
+    let trips = width.div_ceil(stride);
+    if trips <= CACHE_TRIPS as usize {
+        trips as u32
+    } else {
+        0
+    }
+}
+
 /// Sums two or three rows, optionally saves sum, norms sum.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
@@ -31,6 +48,8 @@ fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
     #[build] save_sum: bool,
     #[build] reload_sum: bool,
     #[build] block: bool,
+    #[build] use_cache: bool,
+    #[build] cached: u32,
 ) {
     let group_w = if block { BLOCK_THREADS } else { LANES as u32 };
     let row = gid() / group_w;
@@ -39,29 +58,64 @@ fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
     }
     let at = row as u64 * width as u64;
     let first = if block { lid() } else { lane() };
+    let mut buf = [0.0f32; CACHE_SLOTS];
     let mut acc = 0.0f32;
-    for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
-        let va = a.load4(at + i as u64);
-        let vb = b.load4(at + i as u64);
-        let mut s = F32x4::zero();
-        s.x = va.x + vb.x;
-        s.y = va.y + vb.y;
-        s.z = va.z + vb.z;
-        s.w = va.w + vb.w;
-        if add3 {
-            let vc = c.load4(at + i as u64);
-            s.x += vc.x;
-            s.y += vc.y;
-            s.z += vc.z;
-            s.w += vc.w;
+    if use_cache {
+        for t in (0..cached).unroll(CACHE_TRIPS) {
+            let i = first * WIDE + t * (group_w * WIDE);
+            if i < width {
+                let va = a.load4(at + i as u64);
+                let vb = b.load4(at + i as u64);
+                let mut s = F32x4::zero();
+                s.x = va.x + vb.x;
+                s.y = va.y + vb.y;
+                s.z = va.z + vb.z;
+                s.w = va.w + vb.w;
+                if add3 {
+                    let vc = c.load4(at + i as u64);
+                    s.x += vc.x;
+                    s.y += vc.y;
+                    s.z += vc.z;
+                    s.w += vc.w;
+                }
+                if save_sum {
+                    sum_out.store4(at + i as u64, s);
+                }
+                let idx = (t * WIDE) as usize;
+                buf[idx] = s.x;
+                buf[idx + 1] = s.y;
+                buf[idx + 2] = s.z;
+                buf[idx + 3] = s.w;
+                acc += s.x * s.x;
+                acc += s.y * s.y;
+                acc += s.z * s.z;
+                acc += s.w * s.w;
+            }
         }
-        if save_sum {
-            sum_out.store4(at + i as u64, s);
+    } else {
+        for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
+            let va = a.load4(at + i as u64);
+            let vb = b.load4(at + i as u64);
+            let mut s = F32x4::zero();
+            s.x = va.x + vb.x;
+            s.y = va.y + vb.y;
+            s.z = va.z + vb.z;
+            s.w = va.w + vb.w;
+            if add3 {
+                let vc = c.load4(at + i as u64);
+                s.x += vc.x;
+                s.y += vc.y;
+                s.z += vc.z;
+                s.w += vc.w;
+            }
+            if save_sum {
+                sum_out.store4(at + i as u64, s);
+            }
+            acc += s.x * s.x;
+            acc += s.y * s.y;
+            acc += s.z * s.z;
+            acc += s.w * s.w;
         }
-        acc += s.x * s.x;
-        acc += s.y * s.y;
-        acc += s.z * s.z;
-        acc += s.w * s.w;
     }
     acc = sum32(acc);
     let mut tot = acc;
@@ -77,40 +131,64 @@ fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
         }
     }
     let inv = rsqrt(tot / width as f32 + eps);
-    for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
-        let mut s = F32x4::zero();
-        if reload_sum {
-            s = sum_out.load4(at + i as u64);
-        } else {
-            let va = a.load4(at + i as u64);
-            let vb = b.load4(at + i as u64);
-            s.x = va.x + vb.x;
-            s.y = va.y + vb.y;
-            s.z = va.z + vb.z;
-            s.w = va.w + vb.w;
-            if add3 {
-                let vc = c.load4(at + i as u64);
-                s.x += vc.x;
-                s.y += vc.y;
-                s.z += vc.z;
-                s.w += vc.w;
+    if use_cache {
+        for t in (0..cached).unroll(CACHE_TRIPS) {
+            let i = first * WIDE + t * (group_w * WIDE);
+            if i < width {
+                let idx = (t * WIDE) as usize;
+                let mut g = F32x4::zero();
+                if weighted {
+                    g = w.load4(i as u64);
+                } else {
+                    g.x = 1.0;
+                    g.y = 1.0;
+                    g.z = 1.0;
+                    g.w = 1.0;
+                }
+                let mut o = F32x4::zero();
+                o.x = buf[idx] * inv * g.x;
+                o.y = buf[idx + 1] * inv * g.y;
+                o.z = buf[idx + 2] * inv * g.z;
+                o.w = buf[idx + 3] * inv * g.w;
+                out.store4(at + i as u64, o);
             }
         }
-        let mut g = F32x4::zero();
-        if weighted {
-            g = w.load4(i as u64);
-        } else {
-            g.x = 1.0;
-            g.y = 1.0;
-            g.z = 1.0;
-            g.w = 1.0;
+    } else {
+        for i in (first * WIDE..width).by(group_w * WIDE).unroll(AHEAD) {
+            let mut s = F32x4::zero();
+            if reload_sum {
+                s = sum_out.load4(at + i as u64);
+            } else {
+                let va = a.load4(at + i as u64);
+                let vb = b.load4(at + i as u64);
+                s.x = va.x + vb.x;
+                s.y = va.y + vb.y;
+                s.z = va.z + vb.z;
+                s.w = va.w + vb.w;
+                if add3 {
+                    let vc = c.load4(at + i as u64);
+                    s.x += vc.x;
+                    s.y += vc.y;
+                    s.z += vc.z;
+                    s.w += vc.w;
+                }
+            }
+            let mut g = F32x4::zero();
+            if weighted {
+                g = w.load4(i as u64);
+            } else {
+                g.x = 1.0;
+                g.y = 1.0;
+                g.z = 1.0;
+                g.w = 1.0;
+            }
+            let mut o = F32x4::zero();
+            o.x = s.x * inv * g.x;
+            o.y = s.y * inv * g.y;
+            o.z = s.z * inv * g.z;
+            o.w = s.w * inv * g.w;
+            out.store4(at + i as u64, o);
         }
-        let mut o = F32x4::zero();
-        o.x = s.x * inv * g.x;
-        o.y = s.y * inv * g.y;
-        o.z = s.z * inv * g.z;
-        o.w = s.w * inv * g.w;
-        out.store4(at + i as u64, o);
     }
 }
 
@@ -199,6 +277,7 @@ fn add_norm_emits_at(k: &AddLaneNorm, output: usize, form: &dyn Stored) -> bool 
 }
 
 fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
+    let cached = cache_trips(k.width, k.block);
     let mut body = add_norm_lanes_ir::<WIDE, AHEAD>(
         k.a_form,
         k.b_form,
@@ -211,6 +290,8 @@ fn add_norm_body(k: &AddLaneNorm) -> tessera_codegen::ir::Body {
         k.save_sum,
         k.reload_sum(),
         k.block,
+        cached > 0,
+        cached,
     );
     if !k.add3 {
         body.params.retain(|p| p.name() != "c");
@@ -244,6 +325,11 @@ fn add_norm_launches(k: &AddLaneNorm, step: &Step) -> Vec<Launch> {
 fn add_norm_source(k: &AddLaneNorm) -> Source {
     let body = add_norm_body(k);
     let base = k.name();
+    let cached = cache_trips(k.width, k.block);
+    let tag = match cached {
+        0 => String::new(),
+        n => format!("_c{n}"),
+    };
     let mut forms = vec![k.a_form.name(), k.b_form.name()];
     if k.add3 {
         forms.push(k.c_form.name());
@@ -256,8 +342,8 @@ fn add_norm_source(k: &AddLaneNorm) -> Source {
         forms.push(k.sum_form.name());
     }
     let entry = match forms.iter().all(|&f| f == "f32") {
-        true => format!("plan_{base}"),
-        false => format!("plan_{base}_{}", forms.join("_")),
+        true => format!("plan_{base}{tag}"),
+        false => format!("plan_{base}{tag}_{}", forms.join("_")),
     };
     Source::named(body, entry)
 }
@@ -286,10 +372,15 @@ fn add_norm_load(k: &AddLaneNorm, _: usize) -> Option<Load> {
     } else {
         LANES
     };
+    let trips = if cache_trips(k.width, k.block) > 0 {
+        1.0
+    } else {
+        (k.width as f64 / (per_row * WIDE as usize) as f64).ceil()
+    };
     Some(Load {
         threads: k.rows * per_row,
         group: BLOCK_THREADS as usize,
-        trips: (k.width as f64 / (per_row * WIDE as usize) as f64).ceil(),
+        trips,
         trip: body.trip(),
         reads,
         written,

@@ -142,6 +142,13 @@ fn two_output_parity() {
         assert_eq!(plan.steps[0].kernel.name(), "lane_add_rms_save");
         assert_eq!(plan.steps[0].also.len(), 1);
     });
+    // Wide row exceeding register cache falls back cleanly.
+    let g_huge = two_output_graph(9216, true, false);
+    assert_parity(&g_huge, 1, &device, 1e-4, |plan| {
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].kernel.name(), "block_add_norm_save");
+        assert_eq!(plan.steps[0].also.len(), 1);
+    });
 }
 
 #[test]
