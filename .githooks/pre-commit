@@ -5,8 +5,11 @@
 # Style and simcheck run when `tools/scripts/stickler.sh fetch`
 # has put their models in ~/.cache/tessera/check.
 # The cargo steps run only when a staged path can affect a build.
+# The hook stops after 60 s. TESSERA_HOOK_LIMIT sets another limit in seconds.
 # Install: tools/scripts/install-hooks.sh
 . "$(dirname "$0")/worktree.sh"
+hook_limit=60
+. "$(dirname "$0")/limit.sh"
 set -e
 no_build='\.md$|^\.github/|^\.githooks/|^tools/scripts/|^stickler/|^maps/|^lint\.toml$|release-please'
 cargo=false
