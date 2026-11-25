@@ -199,6 +199,14 @@ fn stop(e: Error) -> Stop {
     }
 }
 
+/// A stop as words for the person or the model.
+pub fn describe(stop: &Stop) -> String {
+    match stop {
+        Stop::Failed(why) | Stop::Tasks(Some(why)) => why.clone(),
+        _ => "the task refused its arguments".into(),
+    }
+}
+
 /// Every command and task: its usage and what it does.
 pub fn list() -> String {
     let mut out = String::from("commands and tasks:");

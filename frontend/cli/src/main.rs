@@ -1,6 +1,9 @@
 //! `tesserax [--recipe <src> | --model <dir | hf:<owner>/<name>[@<revision>]>] <verb>`.
 
 mod fetch;
+mod mcp;
+#[cfg(test)]
+mod mcp_test;
 mod serve;
 mod source;
 #[cfg(test)]
@@ -22,6 +25,7 @@ const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --mo
                  pick a command for it instead, and asks first on a terminal
   <command>      run one of the commands below
   task <task>    run one of the tasks below on the model
+  mcp            serve the commands and tasks as MCP tools on stdin and stdout
   teleport [--from <dir>] [--root <dir>] <user@host | local>...
                  copy this build to other machines over ssh
   --version      print version, commit, target and GPU features";
@@ -41,6 +45,7 @@ fn run(given: &[String]) -> Result<(), Stop> {
             (command.call)(origin, rest, &mut task::Print::default())
         }
         ("task", _) => task::run(origin, rest),
+        ("mcp", _) => mcp::run(origin, rest),
         ("teleport", _) => teleport::run(rest),
         ("-h" | "--help" | "help", _) => Err(Stop::Usage),
         // Other words are a prompt for the default model.

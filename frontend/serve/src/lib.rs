@@ -28,6 +28,7 @@ mod wire;
 mod wire_test;
 
 use http::{Request, Response};
+pub use images::base64;
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::RenderOptions;

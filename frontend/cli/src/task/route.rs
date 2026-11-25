@@ -1,6 +1,6 @@
 //! A prompt or chat turn: a reply or a task.
 
-use super::{ENTRIES, Entry, Print, load, model};
+use super::{ENTRIES, Entry, Print, describe, load, model};
 use crate::source::{self, Source, Stop, kind};
 use serde_json::{Map, Value, json};
 use std::io::{BufRead, IsTerminal};
@@ -403,14 +403,6 @@ fn short(result: &Value) -> String {
     match text.char_indices().nth(RESULT) {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text,
-    }
-}
-
-/// A stop as words for the person or the model.
-fn describe(stop: &Stop) -> String {
-    match stop {
-        Stop::Failed(why) | Stop::Tasks(Some(why)) => why.clone(),
-        _ => "the task refused its arguments".into(),
     }
 }
 
