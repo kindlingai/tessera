@@ -1,5 +1,6 @@
 //! Generic response parser driven by `tokenizer_config.json`.
 
+mod formats;
 #[cfg(test)]
 mod response_test;
 
@@ -232,18 +233,9 @@ impl ResponseParser {
         Self::compile(template).map(Some)
     }
 
-    /// A family default, kept when `chat` writes its tool opener.
-    pub fn fallback(
-        json: &str,
-        chat: &Template,
-    ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        let parser = Self::compile(serde_json::from_str(json)?)?;
-        let opener = parser
-            .tool_calls
-            .as_ref()
-            .and_then(|t| t.open.triggers().first().copied());
-        let written = opener.is_some_and(|o| chat.mentions(o.trim()));
-        Ok(written.then_some(parser))
+    /// The first built-in format whose markers `chat` writes.
+    pub fn builtin(chat: &Template) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        Ok(formats::pick(chat)?.map(|(_, parser)| parser))
     }
 
     /// Jinja that lists `tools` in the system prompt, if any.

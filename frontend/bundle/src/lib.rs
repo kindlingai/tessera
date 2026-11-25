@@ -510,11 +510,10 @@ fn dressed(
     let tok_cfg = overrides.merged("tokenizer_config.json", &dir.join("tokenizer_config.json"))?;
     let mut template = Template::from_config(dir, &tok_cfg)?;
     let mut response = ResponseParser::from_config(&tok_cfg)?;
-    let family = config.as_deref().and_then(|j| arch::spot(j).ok());
     if response.is_none()
-        && let (Some(json), Some(chat)) = (family.and_then(|a| a.response), &template)
+        && let Some(chat) = &template
     {
-        response = ResponseParser::fallback(json, chat)?;
+        response = ResponseParser::builtin(chat)?;
     }
     if let (Some(chat), Some(prompt)) = (
         &mut template,

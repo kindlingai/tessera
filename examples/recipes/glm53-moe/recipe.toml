@@ -11,19 +11,3 @@ favor = "glm53_moe"
 
 [serve]
 task = "generate"
-
-# The release's tokenizer config names no reply format. GLM writes
-# <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>.
-[config."tokenizer_config.json".response_template.fields.content]
-close = ["<|observation|>", "<|user|>", "<|endoftext|>"]
-
-[config."tokenizer_config.json".response_template.fields.thinking]
-open = "<think>"
-close = "</think>"
-
-[config."tokenizer_config.json".response_template.fields.tool_calls]
-open_pattern = '<tool_call>\s*(?P<name>[^<\s]+)'
-close = "</tool_call>"
-content = "tags"
-content_args.pattern = '<arg_key>(?P<key>[\s\S]*?)</arg_key>\s*<arg_value>(?P<value>[\s\S]*?)</arg_value>'
-transform = { type = "function", function = { name = "{name}", arguments = "{content}" } }
