@@ -1,6 +1,6 @@
 //! Direct GPU-to-GPU all-reduce over IPC and SM stores.
 
-use crate::resident::{Error, Status, backend, clock, persistent};
+use crate::resident::{Error, Status, backend, persistent};
 use crate::{Options, flatten};
 use std::time::{Duration, Instant};
 use tessera_engine_comm::{Error as CommError, Transport};
@@ -113,11 +113,11 @@ pub struct P2p<D: Device> {
     areas: DeviceBuffer<D>,
     counters: DeviceBuffer<D>,
     fault: DeviceBuffer<D>,
+    seq: DeviceBuffer<D>,
     rank: u32,
     ranks: u32,
     threads: u32,
-    seq: u64,
-    clock: (u64, Instant),
+    timeout_ticks: u64,
     schedule: Schedule,
     broken: bool,
 }
@@ -128,10 +128,18 @@ const DRAIN: Duration = Duration::from_secs(2);
 impl<D: Device> Drop for P2p<D> {
     fn drop(&mut self) {
         let _ = self.ctx.finish();
-        if self.broken || self.seq <= BASE {
+        if self.broken {
             return;
         }
-        let want = self.seq - 1;
+        let mut seq_raw = [0u8; 8];
+        if self.seq.read_bytes(&mut seq_raw).is_err() {
+            return;
+        }
+        let seq = u64::from_ne_bytes(seq_raw);
+        if seq <= BASE {
+            return;
+        }
+        let want = seq - 1;
         let ptr = self._area.device_ptr() + ack_offset(self.ranks) as u64;
         let mut raw = vec![0u8; self.ranks as usize * 8];
         let start = Instant::now();
@@ -213,7 +221,9 @@ where
         counters.zero()?;
         let fault = DeviceBuffer::alloc(ctx, size_of::<u32>())?;
         fault.zero()?;
-        let now = (clock(ctx)?, Instant::now());
+        let seq = DeviceBuffer::alloc(ctx, size_of::<u64>())?;
+        seq.write_bytes(&BASE.to_ne_bytes())?;
+        let timeout_ticks = (TIMEOUT.as_secs_f64() * ctx.ticks()) as u64;
         // Wait until every peer opened all handles.
         boot.exchange(&[])?;
 
@@ -226,11 +236,11 @@ where
             areas,
             counters,
             fault,
+            seq,
             rank,
             ranks,
             threads,
-            seq: BASE,
-            clock: now,
+            timeout_ticks,
             schedule: Schedule::Auto,
             broken: false,
         })
@@ -242,31 +252,29 @@ where
         self
     }
 
-    fn deadline(&self, timeout: Duration) -> u64 {
-        let ahead = (self.clock.1.elapsed() + timeout).as_secs_f64() * self.ctx.ticks();
-        self.clock.0 + ahead as u64
+    fn read_seq(&self) -> Result<u64, Error> {
+        let mut raw = [0u8; 8];
+        self.seq.read_bytes(&mut raw)?;
+        Ok(u64::from_ne_bytes(raw))
     }
 
     fn launch_sum(&mut self, from: u64, to: u64, n: u32) -> Result<(), Error> {
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
-        let chunks = n.div_ceil(MAX_FLOATS as u32) as u64;
-        let base_seq = self.seq;
-        self.seq += chunks;
         let (sched, grid) = pick(n as usize * 4, self.ranks, self.schedule);
         let mut args = KernelArgs::new();
         args.device_ptr(self.areas.device_ptr())
             .device_ptr(self.counters.device_ptr())
             .device_ptr(self.fault.device_ptr())
+            .device_ptr(self.seq.device_ptr())
             .u64(from)
             .u64(to)
             .u32(n)
-            .u64(base_seq)
             .u32(self.ranks)
             .u32(self.rank)
             .u32(sched)
-            .u64(self.deadline(TIMEOUT));
+            .u64(self.timeout_ticks);
         self.ctx.programmatic(false);
         let blocks = (grid, 1, 1);
         let threads = (self.threads, 1, 1);
@@ -285,7 +293,7 @@ where
             return Err(Error::Fault {
                 code: Status(code),
                 pool: 0,
-                ordinal: self.seq,
+                ordinal: self.read_seq().unwrap_or(BASE),
             });
         }
         Ok(())
@@ -297,12 +305,21 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
     fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), tessera_run::Error> {
+        if self.broken {
+            return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
+                "an earlier p2p sum failed".into(),
+            ))));
+        }
         let n = u32::try_from(len).map_err(|_| tessera_run::Error::SumTooLong(len))?;
         if n == 0 {
             return Ok(());
         }
         self.launch_sum(from, to, n)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn capturable(&self) -> bool {
+        true
     }
 
     fn check(&mut self) -> Result<(), tessera_run::Error> {

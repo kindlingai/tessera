@@ -199,10 +199,16 @@ TESSERA_FN void add_slice(u64 mine, u64 seq, u32 prev, u32 nr, float* dst_buf, u
 
 // Direct P2P all-reduce: fan-out (0), rounds (1), butterfly (2).
 extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32* fault,
-                                           u64 from_ptr, u64 to_ptr, u32 total, u64 base_seq,
-                                           u32 nr, u32 me, u32 sched, u64 deadline) {
+                                           u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 total,
+                                           u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
     __shared__ int stop;
-    if (prim::leader_thread()) stop = (*static_cast<volatile u32*>(fault) != 0) ? 1 : 0;
+    __shared__ u64 base_seq;
+    u64 deadline = 0ull;
+    if (prim::leader_thread()) {
+        stop = (*static_cast<volatile u32*>(fault) != 0) ? 1 : 0;
+        base_seq = prim::load_acquire_sys(seq_ptr);
+        if (timeout_ticks != 0) deadline = prim::clock_ticks() + timeout_ticks;
+    }
     prim::block_sync();
     if (stop != 0) return;
 
@@ -295,6 +301,9 @@ extern "C" __global__ void tessera_p2p_sum(const u64* areas, u32* counters, u32*
             p2p::sum_slice(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
         }
         if (p2p::last_cta(ci + 1) && prim::leader_thread()) {
+            if (total - off <= p2p::MAX_FLOATS) {
+                prim::store_release_sys(seq_ptr, seq + 1);
+            }
             for (u32 k = 1; k < nr; k++) {
                 u32 peer = (me + k) % nr;
                 prim::store_release_sys(p2p::ack_of(areas[peer], nr, me), seq);

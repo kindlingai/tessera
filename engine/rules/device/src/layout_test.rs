@@ -111,6 +111,8 @@ fn p2p_kernel_flattens() {
         assert!(flat.text.contains("tessera_p2p_sum"));
         assert!(flat.text.contains("reduce_write"));
         assert!(flat.text.contains("add_slice"));
+        assert!(flat.text.contains("seq_ptr"));
+        assert!(flat.text.contains("timeout_ticks"));
     }
 }
 

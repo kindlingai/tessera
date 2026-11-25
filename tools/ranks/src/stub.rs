@@ -96,6 +96,23 @@ where
         let want = (i % 97) as f32 * triangle * ranks as f32;
         wrong += usize::from(v != want);
     }
+    // Verify CUDA/HIP graph capture and repeated replay.
+    if ctx.graphs() && p2p.capturable() {
+        let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
+            p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
+            p2p.sum(to.device_ptr(), to.device_ptr(), n)?;
+            Ok(())
+        })?;
+        for _ in 0..4 {
+            ctx.replay(&graph)?;
+        }
+        p2p.check()?;
+        to.read_f32(&mut got)?;
+        for (i, &v) in got.iter().enumerate() {
+            let want = (i % 97) as f32 * triangle * ranks as f32;
+            wrong += usize::from(v != want);
+        }
+    }
     let us = elapsed * 1e6 / f64::from(rounds);
     let gbs = (bytes as f64 * f64::from(ranks - 1)) / (us * 1e3);
     eprintln!(
