@@ -174,7 +174,7 @@ impl Group<'_, '_> {
         }
         match arg.form.dtype().is_float() {
             true => Val::F(arg.form.unpack(bytes, at)),
-            false => Val::U(arg.form.unpack(bytes, at) as u32),
+            false => Val::U(arg.form.word(bytes, at)),
         }
     }
 

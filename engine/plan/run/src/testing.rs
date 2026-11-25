@@ -1,6 +1,7 @@
 //! The settings tests run under: host, then a ready GPU.
 
 use crate::{Error, Run, gpu};
+use tessera_codegen::Precision;
 use tessera_engine_settings::{Backend, Pick, Settings};
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
@@ -12,6 +13,13 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
     Ok(Box::new(crate::device::Runner::<D>::new(plan, settings)?))
+}
+
+/// A host runner that runs every tree in lockstep.
+pub fn lockstep(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
+    let (lanes, memory) = (settings.host_lanes, settings.memory);
+    let runner = crate::cpu::Runner::new(plan, lanes, Precision::EXACT, memory, false)?;
+    Ok(Box::new(runner))
 }
 
 /// Settings for plans on the host.

@@ -26,6 +26,8 @@ pub(crate) struct Runner {
     known: HashMap<String, Option<Entry>>,
     lanes: usize,
     precision: Precision,
+    /// Whether trees compile. If not, each runs in lockstep.
+    compiles: bool,
 }
 
 impl Runner {
@@ -34,6 +36,7 @@ impl Runner {
         lanes: usize,
         precision: Precision,
         memory: Memory,
+        compiles: bool,
     ) -> Result<Self, Error> {
         let mut runner = Self {
             base: Base::new(memory, &Platform::host(Limits::host(lanes))),
@@ -42,6 +45,7 @@ impl Runner {
             known: HashMap::new(),
             lanes,
             precision,
+            compiles,
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -148,7 +152,7 @@ impl Run for Runner {
         // A tree that does not compile runs in lockstep instead.
         let mut compiled = Vec::with_capacity(plan.steps.len());
         for body in &self.bodies {
-            let Some(body) = body else {
+            let Some(body) = body.as_ref().filter(|_| self.compiles) else {
                 compiled.push(None);
                 continue;
             };

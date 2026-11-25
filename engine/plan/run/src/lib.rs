@@ -165,6 +165,7 @@ pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
             settings.host_lanes,
             settings.emulate.map_or(Precision::EXACT, Precision::of),
             settings.memory,
+            true,
         )?),
     };
     runner.base_mut().reads = settings.reads;

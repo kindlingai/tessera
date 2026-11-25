@@ -281,6 +281,35 @@ fn helpers_read_exact_bytes() {
     }
 }
 
+/// Copies each word, and stores it again as float bits.
+#[kernel]
+fn words(x: Buf<U32>, mut out: BufMut<U32>, mut bits: BufMut<F32>) {
+    let w = x[gid() as u64];
+    out[gid() as u64] = w;
+    bits[gid() as u64] = f32::from_bits(w);
+}
+
+#[test]
+fn words_keep_all_bits() {
+    use tessera_codegen::form::{F32_FORM, U32_FORM};
+    let want = [0xdead_beefu32, 0x0100_0001, u32::MAX, 0x8000_0001];
+    let mut x: Vec<u8> = want.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let (mut out, mut bits) = (vec![0u8; x.len()], vec![0u8; x.len()]);
+    let buf = |at, form| ArgVal::Buf { at, skip: 0, form };
+    let args = [buf(0, U32_FORM), buf(1, U32_FORM), buf(2, F32_FORM)];
+    let grid = Grid {
+        groups: 1,
+        threads: want.len(),
+    };
+    let buffers: &mut [&mut [u8]] = &mut [&mut x, &mut out, &mut bits];
+    exec::run(&words_ir(), &args, buffers, grid, LANES, Precision::EXACT);
+    let read = |b: &[u8]| -> Vec<u32> {
+        let word = |c: &[u8]| u32::from_le_bytes(c.try_into().unwrap());
+        b.chunks(4).map(word).collect()
+    };
+    assert_eq!((read(&out), read(&bits)), (want.to_vec(), want.to_vec()));
+}
+
 /// The two bytes of `w` from byte `n`.
 #[helper]
 fn two(w: Buf<U8>, n: u64) -> u32 {

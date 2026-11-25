@@ -12,15 +12,13 @@ fn shape(g: &Graph, ty: &TensorType, sizes: &[(DimName, u64)]) -> Option<Vec<usi
     Some(out)
 }
 
-/// Mask words, then edits with sorted ids below 8.
+/// Full-range mask words, then edits with sorted ids below 8.
 fn edits(shape: &[usize], words: usize, noise: &mut Noise) -> Tensor {
     let k = (shape[shape.len() - 1] - words) / 3;
     let rows: usize = shape[..shape.len() - 1].iter().product();
     let mut out = Vec::with_capacity(rows * (words + 3 * k));
     for _ in 0..rows {
-        for _ in 0..words {
-            out.push(((noise.draw() + 1.0) * 4.0) as u32);
-        }
+        out.extend((0..words).map(|_| noise.word()));
         let first = ((noise.draw() + 1.0) * 2.0) as u32;
         out.extend((0..k as u32).map(|j| first + 2 * j));
         for _ in 0..k {

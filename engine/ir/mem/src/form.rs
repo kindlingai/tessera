@@ -32,6 +32,11 @@ pub trait Form: Sync {
     /// `data` as the bytes of this form.
     fn pack(&self, data: &[f32]) -> Vec<u8>;
 
+    /// Element `index` of `bytes`, with every bit. Integer forms only.
+    fn word(&self, _bytes: &[u8], _index: usize) -> u32 {
+        panic!("{} does not hold integers", self.name())
+    }
+
     /// Whether floats can become this form. Codes cannot.
     fn packs(&self) -> bool {
         true
@@ -296,6 +301,9 @@ impl Form for U32 {
             .flat_map(|x| (*x as u32).to_le_bytes())
             .collect()
     }
+    fn word(&self, bytes: &[u8], index: usize) -> u32 {
+        word(bytes, index)
+    }
 }
 
 impl Form for U8 {
@@ -305,6 +313,9 @@ impl Form for U8 {
     }
     fn pack(&self, data: &[f32]) -> Vec<u8> {
         data.iter().map(|x| *x as u8).collect()
+    }
+    fn word(&self, bytes: &[u8], index: usize) -> u32 {
+        u32::from(bytes[index])
     }
 }
 

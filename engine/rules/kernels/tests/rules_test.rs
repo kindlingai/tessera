@@ -10,7 +10,7 @@ use tessera_interp::{Tensor, run};
 use tessera_lower::form::{BF16_FORM, F32_FORM};
 use tessera_lower::{Device, Limits, Pins, Plan, Platform, Settings, View, cut, lower, rules};
 use tessera_run::open;
-use tessera_run::testing::{host, runs};
+use tessera_run::testing::{host, lockstep, runs};
 use tessera_testkit::graphs::{self, floats, ids};
 use tessera_testkit::{Noise, fill, max_abs_diff};
 use tessera_trace::{Act, EntryKind, Model, Pairs, Role};
@@ -26,18 +26,27 @@ fn dims() -> Vec<Dim> {
     ]
 }
 
-/// Runs entry 0 both ways. Returns the largest difference.
+/// Entry 0 against the interpreter. Returns the largest difference.
 fn gap(g: &Graph, inputs: &[Tensor], device: &Device, settings: &Settings) -> f32 {
     let want = run(g, &[], 0, inputs).unwrap();
-    let mut runner = open(lower(g, 0, &SIZES, device).unwrap(), settings).unwrap();
-    let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
-    let got = runner.run(&feeds).unwrap().remove(0);
-    if want[0].dtype() != DType::U32 {
-        return max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap());
+    let plan = || lower(g, 0, &SIZES, device).unwrap();
+    let mut runners = vec![open(plan(), settings).unwrap()];
+    // The host also runs each tree in lockstep.
+    if settings.gpu().is_none() {
+        runners.push(lockstep(plan(), settings).unwrap());
     }
-    // Indices must match exactly.
-    let same = got.indices().unwrap() == want[0].indices().unwrap();
-    if same { 0.0 } else { f32::INFINITY }
+    let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
+    let mut worst = 0.0f32;
+    for runner in &mut runners {
+        let got = runner.run(&feeds).unwrap().remove(0);
+        worst = worst.max(match want[0].dtype() {
+            // Indices must match exactly.
+            DType::U32 if got.indices().unwrap() == want[0].indices().unwrap() => 0.0,
+            DType::U32 => f32::INFINITY,
+            _ => max_abs_diff(got.floats().unwrap(), want[0].floats().unwrap()),
+        });
+    }
+    worst
 }
 
 /// The rules this crate registers.
