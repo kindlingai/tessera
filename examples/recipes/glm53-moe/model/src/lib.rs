@@ -37,6 +37,8 @@ const MAX_SLOTS: usize = 512;
 const PICKS: usize = 8;
 /// Words in `Plan` struct in `moe.cu`.
 const PLAN_WORDS: usize = 1 + MAX_SLOTS * 6 + MOST_ROWS * PICKS * 2;
+/// 16-byte aligned word offset for router score scratch.
+const SCORES_OFF: usize = PLAN_WORDS.next_multiple_of(4);
 
 /// Experts each row takes, by expert count.
 fn picks(experts: usize) -> Option<u32> {
@@ -171,12 +173,19 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let max_routed = (count * n_sh).min(active + (assigns - active) / 8);
     let total_slots = n_sh + max_routed;
     let max_col = rows.min(8);
+    let (route_grid, rks) = if bf16 == 1 && experts % 16 == 0 && hidden % 256 == 0 {
+        let nb = experts / 16;
+        let rks = split_dim(hidden / 256, 128usize.div_ceil(nb).max(1));
+        (nb * rks, rks)
+    } else {
+        (experts.div_ceil(2), 1)
+    };
     let route = Offer {
         kernel: ROUTE,
         reads: vec![Place::Read(0), router.read(), bias.read()],
-        len: PLAN_WORDS + rows * experts,
+        len: SCORES_OFF + rows * experts * rks,
         counts: fixed(&[rows, hidden, experts, bf16, picks, first, count]),
-        shape: Shape::grid(experts.div_ceil(2), 1, 256),
+        shape: Shape::grid(route_grid, 1, 256),
         work: (rows * experts * hidden) as f64,
         ..Offer::default()
     };

@@ -16,6 +16,7 @@ typedef const u8* bytes;
 #define MAX_SLOTS 512
 #define ROUTE_SCALE 2.5f
 #define PLAN_WORDS (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u)
+#define SCORES_OFF ((PLAN_WORDS + 3u) & ~3u)
 
 // Compact routing plan for one layer launch.
 struct Plan {
@@ -38,6 +39,30 @@ static __device__ inline u16 f32_to_f16(float v) {
   return out;
 }
 
+static __device__ inline u32 f32x2_to_bf16x2(float lo, float hi) {
+  u32 out;
+  asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(out) : "f"(lo), "f"(hi));
+  return out;
+}
+
+static __device__ inline void mma_bf16_m16n8k16(float d[4], const u32 a[4], const u32 b[2]) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+static __device__ inline uint4 load_bf16x8(const u16* p, bool aligned) {
+  if (aligned) {
+    u32 d[4];
+    trellis::ld_nc_v4(reinterpret_cast<const u8*>(p), d);
+    return make_uint4(d[0], d[1], d[2], d[3]);
+  }
+  return make_uint4(
+      u32(p[0]) | (u32(p[1]) << 16u), u32(p[2]) | (u32(p[3]) << 16u),
+      u32(p[4]) | (u32(p[5]) << 16u), u32(p[6]) | (u32(p[7]) << 16u));
+}
+
 // A code set's base, matrix shape and side.
 struct Mat {
   bytes base;
@@ -50,29 +75,98 @@ static __device__ inline Mat matrix(bytes p) {
   return w;
 }
 
+// One warp's picks and gates for 256 experts in registers.
+static __device__ void route_256(
+    const float* scores, const float* bias, u32 row, u32 rows, u32 rks, bool fused, u16* ids,
+    float* gates) {
+  u32 lane = threadIdx.x & 31u;
+  u32 e0 = lane << 2u;
+  float raw[8];
+  if (fused) {
+    u64 re = (u64)rows * 256ull;
+    float4 t0 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 t1 = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (u32 sp = 0u; sp < rks; sp++) {
+      const float* base = scores + (u64)sp * re + (u64)row * 256ull;
+      float4 v0 = prim::load_fresh4(base + e0);
+      float4 v1 = prim::load_fresh4(base + e0 + 128u);
+      t0.x += v0.x; t0.y += v0.y; t0.z += v0.z; t0.w += v0.w;
+      t1.x += v1.x; t1.y += v1.y; t1.z += v1.z; t1.w += v1.w;
+    }
+    raw[0] = 1.f / (1.f + __expf(-t0.x)); raw[1] = 1.f / (1.f + __expf(-t0.y));
+    raw[2] = 1.f / (1.f + __expf(-t0.z)); raw[3] = 1.f / (1.f + __expf(-t0.w));
+    raw[4] = 1.f / (1.f + __expf(-t1.x)); raw[5] = 1.f / (1.f + __expf(-t1.y));
+    raw[6] = 1.f / (1.f + __expf(-t1.z)); raw[7] = 1.f / (1.f + __expf(-t1.w));
+  } else {
+    const float* base = scores + (u64)row * 256ull;
+    float4 v0 = (rks == 1u) ? prim::load_fresh4(base + e0)
+                            : *reinterpret_cast<const float4*>(base + e0);
+    float4 v1 = (rks == 1u) ? prim::load_fresh4(base + e0 + 128u)
+                            : *reinterpret_cast<const float4*>(base + e0 + 128u);
+    raw[0] = v0.x; raw[1] = v0.y; raw[2] = v0.z; raw[3] = v0.w;
+    raw[4] = v1.x; raw[5] = v1.y; raw[6] = v1.z; raw[7] = v1.w;
+  }
+  float4 b0 = *reinterpret_cast<const float4*>(bias + e0);
+  float4 b1 = *reinterpret_cast<const float4*>(bias + e0 + 128u);
+  float biased[8] = {
+      raw[0] + b0.x, raw[1] + b0.y, raw[2] + b0.z, raw[3] + b0.w,
+      raw[4] + b1.x, raw[5] + b1.y, raw[6] + b1.z, raw[7] + b1.w,
+  };
+  u32 taken = 0u;
+  float sum = 0.0f;
+  for (u32 p = 0u; p < PICKS; p++) {
+    u32 best = 256u;
+    float most = 0.0f;
+    float best_raw = 0.0f;
+#pragma unroll
+    for (u32 i = 0u; i < 8u; i++) {
+      u32 e = (i < 4u) ? (e0 + i) : (e0 + 124u + i);
+      if (!(taken & (1u << i)) && (best == 256u || biased[i] > most)) {
+        best = e;
+        most = biased[i];
+        best_raw = raw[i];
+      }
+    }
+#pragma unroll
+    for (u32 off = 16u; off > 0u; off >>= 1u) {
+      float v = __shfl_xor_sync(0xFFFFFFFFu, most, off);
+      u32 e = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+      float r = __shfl_xor_sync(0xFFFFFFFFu, best_raw, off);
+      bool better = best == 256u || v > most || (v == most && e < best);
+      if (e < 256u && better) {
+        best = e;
+        most = v;
+        best_raw = r;
+      }
+    }
+    if (((best & 127u) >> 2u) == lane) {
+      taken |= 1u << (((best >> 7u) << 2u) | (best & 3u));
+    }
+    if (lane == 0u) {
+      ids[p] = (u16)best;
+      gates[p] = best_raw;
+    }
+    sum += best_raw;
+  }
+  __syncwarp();
+  if (lane < PICKS) gates[lane] *= ROUTE_SCALE / sum;
+  __syncwarp();
+}
+
 // One warp's picks and gates. Ties take lower expert.
 static __device__ void route(
-    const float* score, const float* bias, u32 experts, u32 picks, u16* ids, float* gates) {
+    const float* score, const float* bias, u32 experts, u32 picks, bool fresh, u16* ids,
+    float* gates) {
   u32 lane = threadIdx.x & 31u;
   u64 taken = 0ull;
   float sum = 0.0f;
-  float raw[8];
-  float biased[8];
-  bool cached = experts <= 256u;
-  if (cached) {
-    for (u32 i = 0u, e = lane; e < experts; i++, e += 32u) {
-      float s = prim::load_fresh(score + e);
-      raw[i] = s;
-      biased[i] = s + bias[e];
-    }
-  }
   for (u32 p = 0u; p < picks; p++) {
     u32 best = experts;
     float most = 0.0f;
     float best_raw = 0.0f;
     for (u32 i = 0u, e = lane; e < experts; i++, e += 32u) {
-      float s = cached ? raw[i] : prim::load_fresh(score + e);
-      float v = cached ? biased[i] : (s + bias[e]);
+      float s = fresh ? prim::load_fresh(score + e) : score[e];
+      float v = s + bias[e];
       if (!((taken >> i) & 1ull) && (best == experts || v > most)) {
         best = e;
         most = v;
@@ -91,12 +185,14 @@ static __device__ void route(
       }
     }
     if ((best & 31u) == lane) taken |= 1ull << (best >> 5u);
-    ids[p] = (u16)best;
-    gates[p] = best_raw;
+    if (lane == 0u) {
+      ids[p] = (u16)best;
+      gates[p] = best_raw;
+    }
     sum += best_raw;
   }
-  float inv = ROUTE_SCALE / sum;
-  for (u32 p = 0u; p < picks; p++) gates[p] *= inv;
+  __syncwarp();
+  if (lane < picks) gates[lane] *= ROUTE_SCALE / sum;
   __syncwarp();
 }
 
@@ -117,19 +213,132 @@ struct PlanSmem {
   u32 total;
 };
 
+struct RouteTcSmem {
+  u32 sxh[4][16][36];
+  u32 sxl[4][16][36];
+  union {
+    u32 sw[8][8][36];
+    float4 red[4][2][32];
+  } u;
+};
+
 union alignas(16) RouteSmem {
   float wsum[2][8][8];
+  RouteTcSmem tc;
   PlanSmem plan;
 };
+
+static __device__ inline void stage_x_bf16(
+    const float* x, u32 row, u32 rows, u32 hidden, u32 col, u32* dst_h, u32* dst_l) {
+  uint2 hi = make_uint2(0u, 0u);
+  uint2 lo = make_uint2(0u, 0u);
+  if (row < rows) {
+    float4 v = *reinterpret_cast<const float4*>(x + (u64)row * hidden + col);
+    hi.x = f32x2_to_bf16x2(v.x, v.y);
+    hi.y = f32x2_to_bf16x2(v.z, v.w);
+    lo.x = f32x2_to_bf16x2(v.x - __uint_as_float(hi.x << 16u),
+                           v.y - __uint_as_float(hi.x & 0xFFFF0000u));
+    lo.y = f32x2_to_bf16x2(v.z - __uint_as_float(hi.y << 16u),
+                           v.w - __uint_as_float(hi.y & 0xFFFF0000u));
+  }
+  *reinterpret_cast<uint2*>(dst_h) = hi;
+  *reinterpret_cast<uint2*>(dst_l) = lo;
+}
+
+// Tensor-Core split-K BF16 router projection, 16 experts per CTA.
+static __device__ __noinline__ void route_tc(
+    const float* x, const u16* router, float* scores, RouteTcSmem& sm,
+    u32 rows, u32 hidden, u32 experts, u32 nb, u32 rks) {
+  u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
+  u32 g = lane >> 2u, t = lane & 3u;
+  u32 wt = warp & 1u, kp = warp >> 1u;
+  u32 ob = blockIdx.x % nb;
+  u32 p = blockIdx.x / nb;
+  u32 n0 = ob << 4u;
+  u32 ch_per = (hidden >> 8u) / rks;
+  u32 k_start = (p * ch_per) << 8u;
+  u32 k_end = k_start + (ch_per << 8u);
+  bool aligned = (reinterpret_cast<u64>(router) & 15ull) == 0ull;
+  const u16* wr = router + (u64)(n0 + (wt << 3u) + g) * hidden + (kp << 6u);
+  u32 xs = tid >> 6u;
+  u32 xr = (tid >> 4u) & 3u;
+  u32 xc = (tid & 15u) << 2u;
+  u32 xw = (tid & 15u) << 1u;
+  float* dst = scores + (u64)p * rows * experts;
+  for (u32 r0 = 0u; r0 < rows; r0 += 16u) {
+    if (r0 > 0u) prim::block_sync();
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    uint4 cur0 = load_bf16x8(wr + k_start + (t << 3u), aligned);
+    uint4 cur1 = load_bf16x8(wr + k_start + 32u + (t << 3u), aligned);
+    for (u32 k0 = k_start; k0 < k_end; k0 += 256u) {
+#pragma unroll
+      for (u32 dr = 0u; dr < 16u; dr += 4u) {
+        u32 r = xr + dr;
+        stage_x_bf16(x, r0 + r, rows, hidden, k0 + (xs << 6u) + xc,
+                     &sm.sxh[xs][r][xw], &sm.sxl[xs][r][xw]);
+      }
+      *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2u]) = cur0;
+      *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][16u + (t << 2u)]) = cur1;
+      prim::block_sync();
+      if (k0 + 256u < k_end) {
+        cur0 = load_bf16x8(wr + k0 + 256u + (t << 3u), aligned);
+        cur1 = load_bf16x8(wr + k0 + 256u + 32u + (t << 3u), aligned);
+      }
+#pragma unroll
+      for (u32 ks = 0u; ks < 4u; ks++) {
+        u32 off = (ks << 3u) + t;
+        u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
+        u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off],
+                     sm.sxh[kp][g][off + 4u], sm.sxh[kp][g + 8u][off + 4u]};
+        u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off],
+                     sm.sxl[kp][g][off + 4u], sm.sxl[kp][g + 8u][off + 4u]};
+        mma_bf16_m16n8k16(acc, ah, b);
+        mma_bf16_m16n8k16(acc, al, b);
+      }
+      prim::block_sync();
+    }
+    sm.u.red[kp][wt][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    prim::block_sync();
+    if (kp == 0u) {
+      float4 s = sm.u.red[0][wt][lane];
+      float4 q1 = sm.u.red[1][wt][lane];
+      float4 q2 = sm.u.red[2][wt][lane];
+      float4 q3 = sm.u.red[3][wt][lane];
+      float v0 = s.x + q1.x + q2.x + q3.x;
+      float v1 = s.y + q1.y + q2.y + q3.y;
+      float v2 = s.z + q1.z + q2.z + q3.z;
+      float v3 = s.w + q1.w + q2.w + q3.w;
+      if (rks == 1u) {
+        v0 = 1.0f / (1.0f + __expf(-v0));
+        v1 = 1.0f / (1.0f + __expf(-v1));
+        v2 = 1.0f / (1.0f + __expf(-v2));
+        v3 = 1.0f / (1.0f + __expf(-v3));
+      }
+      u32 col = n0 + (wt << 3u) + (t << 1u);
+      if (r0 + g < rows) {
+        *reinterpret_cast<float2*>(dst + (u64)(r0 + g) * experts + col) = make_float2(v0, v1);
+      }
+      if (r0 + g + 8u < rows) {
+        *reinterpret_cast<float2*>(dst + (u64)(r0 + g + 8u) * experts + col) = make_float2(v2, v3);
+      }
+    }
+  }
+}
 
 // Builds compact deduplicated expert slots across all rows.
 static __device__ __noinline__ void route_plan(
     const float* scores, const float* bias, float* plan_out, PlanSmem& sm,
-    u32 rows, u32 experts, u32 picks, u32 first, u32 count) {
+    u32 rows, u32 experts, u32 picks, u32 first, u32 count, u32 rks, bool fused) {
   Plan* plan = reinterpret_cast<Plan*>(plan_out);
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
-  for (u32 r = warp; r < rows; r += 8u) {
-    route(scores + (u64)r * experts, bias, experts, picks, sm.ids[r], sm.gates[r]);
+  if (experts == 256u && picks == PICKS) {
+    for (u32 r = warp; r < rows; r += 8u) {
+      route_256(scores, bias, r, rows, rks, fused, sm.ids[r], sm.gates[r]);
+    }
+  } else {
+    for (u32 r = warp; r < rows; r += 8u) {
+      route(scores + (u64)r * experts, bias, experts, picks, rks == 1u, sm.ids[r], sm.gates[r]);
+    }
   }
   for (u32 i = tid; i < count; i += 256u) {
     sm.emask[0][i] = 0u;
@@ -211,58 +420,22 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
     u32 rows, u32 hidden, u32 experts, u32 bf16, u32 picks, u32 first, u32 count) {
   __shared__ RouteSmem sm;
   __shared__ u32 is_last;
-  float* scores = plan_out + PLAN_WORDS;
+  float* scores = plan_out + SCORES_OFF;
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
-  u32 e0 = blockIdx.x * 2u;
-  if (e0 < experts) {
-    bool has1 = e0 + 1u < experts;
-    bool fast = bf16 && (hidden & 255u) == 0u && (((u64)router) & 15ull) == 0ull;
-    const u8* wr0 = (const u8*)router + (u64)e0 * hidden * 2ull;
-    const u8* wr1 = wr0 + (u64)hidden * 2ull;
-    for (u32 r0 = 0u; r0 < rows; r0 += 8u) {
-      u32 nr = min(rows - r0, 8u);
-      float s0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-      float s1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-      if (fast) {
-        u32 i0 = warp * 256u;
-        if (i0 < hidden) {
-          u32 na[4], nb[4];
-          u64 off0 = (u64)(i0 + (lane << 3u)) * 2ull;
-          trellis::ld_nc_v4(wr0 + off0, na);
-          if (has1) trellis::ld_nc_v4(wr1 + off0, nb);
-          for (; i0 < hidden; i0 += 2048u) {
-            u32 ha[4] = {na[0], na[1], na[2], na[3]};
-            u32 hb[4] = {nb[0], nb[1], nb[2], nb[3]};
-            if (i0 + 2048u < hidden) {
-              u64 noff = (u64)(i0 + 2048u + (lane << 3u)) * 2ull;
-              trellis::ld_nc_v4(wr0 + noff, na);
-              if (has1) trellis::ld_nc_v4(wr1 + noff, nb);
-            }
-            float a0 = __uint_as_float(ha[0] << 16u), a1 = __uint_as_float(ha[0] & 0xFFFF0000u);
-            float a2 = __uint_as_float(ha[1] << 16u), a3 = __uint_as_float(ha[1] & 0xFFFF0000u);
-            float a4 = __uint_as_float(ha[2] << 16u), a5 = __uint_as_float(ha[2] & 0xFFFF0000u);
-            float a6 = __uint_as_float(ha[3] << 16u), a7 = __uint_as_float(ha[3] & 0xFFFF0000u);
-            float b0 = __uint_as_float(hb[0] << 16u), b1 = __uint_as_float(hb[0] & 0xFFFF0000u);
-            float b2 = __uint_as_float(hb[1] << 16u), b3 = __uint_as_float(hb[1] & 0xFFFF0000u);
-            float b4 = __uint_as_float(hb[2] << 16u), b5 = __uint_as_float(hb[2] & 0xFFFF0000u);
-            float b6 = __uint_as_float(hb[3] << 16u), b7 = __uint_as_float(hb[3] & 0xFFFF0000u);
-            u32 col = i0 + (lane << 3u);
-#pragma unroll
-            for (u32 r = 0u; r < 8u; r++) {
-              if (r >= nr) break;
-              const float* xp = x + (u64)(r0 + r) * hidden + col;
-              float4 x0 = *(const float4*)xp;
-              float4 x1 = *(const float4*)(xp + 4u);
-              s0[r] = fmaf(a0, x0.x, fmaf(a1, x0.y, fmaf(a2, x0.z, fmaf(a3, x0.w, s0[r]))));
-              s0[r] = fmaf(a4, x1.x, fmaf(a5, x1.y, fmaf(a6, x1.z, fmaf(a7, x1.w, s0[r]))));
-              if (has1) {
-                s1[r] = fmaf(b0, x0.x, fmaf(b1, x0.y, fmaf(b2, x0.z, fmaf(b3, x0.w, s1[r]))));
-                s1[r] = fmaf(b4, x1.x, fmaf(b5, x1.y, fmaf(b6, x1.z, fmaf(b7, x1.w, s1[r]))));
-              }
-            }
-          }
-        }
-      } else {
+  bool use_tc = bf16 && (experts & 15u) == 0u && (hidden & 255u) == 0u;
+  u32 nb = experts >> 4u;
+  u32 rks = use_tc ? (gridDim.x / nb) : 1u;
+  if (use_tc) {
+    route_tc(x, reinterpret_cast<const u16*>(router), scores, sm.tc, rows, hidden, experts, nb,
+             rks);
+  } else {
+    u32 e0 = blockIdx.x * 2u;
+    if (e0 < experts) {
+      bool has1 = e0 + 1u < experts;
+      for (u32 r0 = 0u; r0 < rows; r0 += 8u) {
+        u32 nr = min(rows - r0, 8u);
+        float s0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float s1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         for (u32 i = tid * 4u; i < hidden; i += 1024u) {
           float4 a0 = weights4(router, (u64)e0 * hidden + i, bf16);
           float4 a1 = has1 ? weights4(router, (u64)(e0 + 1u) * hidden + i, bf16)
@@ -275,27 +448,27 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
             if (has1) s1[r] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
           }
         }
-      }
 #pragma unroll
-      for (u32 r = 0u; r < 8u; r++) {
-        if (r >= nr) break;
-        for (u32 off = 16u; off > 0u; off >>= 1u) {
-          s0[r] += __shfl_xor_sync(0xFFFFFFFFu, s0[r], off);
-          if (has1) s1[r] += __shfl_xor_sync(0xFFFFFFFFu, s1[r], off);
+        for (u32 r = 0u; r < 8u; r++) {
+          if (r >= nr) break;
+          for (u32 off = 16u; off > 0u; off >>= 1u) {
+            s0[r] += __shfl_xor_sync(0xFFFFFFFFu, s0[r], off);
+            if (has1) s1[r] += __shfl_xor_sync(0xFFFFFFFFu, s1[r], off);
+          }
+          if (lane == 0u) {
+            sm.wsum[0][r][warp] = s0[r];
+            if (has1) sm.wsum[1][r][warp] = s1[r];
+          }
         }
-        if (lane == 0u) {
-          sm.wsum[0][r][warp] = s0[r];
-          if (has1) sm.wsum[1][r][warp] = s1[r];
+        prim::block_sync();
+        if (warp < 2u && (warp == 0u || has1) && lane < nr) {
+          float tot = sm.wsum[warp][lane][0] + sm.wsum[warp][lane][1] + sm.wsum[warp][lane][2] +
+                      sm.wsum[warp][lane][3] + sm.wsum[warp][lane][4] + sm.wsum[warp][lane][5] +
+                      sm.wsum[warp][lane][6] + sm.wsum[warp][lane][7];
+          scores[(u64)(r0 + lane) * experts + e0 + warp] = 1.0f / (1.0f + __expf(-tot));
         }
+        if (r0 + 8u < rows) prim::block_sync();
       }
-      prim::block_sync();
-      if (warp < 2u && (warp == 0u || has1) && lane < nr) {
-        float tot = sm.wsum[warp][lane][0] + sm.wsum[warp][lane][1] + sm.wsum[warp][lane][2] +
-                    sm.wsum[warp][lane][3] + sm.wsum[warp][lane][4] + sm.wsum[warp][lane][5] +
-                    sm.wsum[warp][lane][6] + sm.wsum[warp][lane][7];
-        scores[(u64)(r0 + lane) * experts + e0 + warp] = 1.0f / (1.0f + __expf(-tot));
-      }
-      if (r0 + 8u < rows) prim::block_sync();
     }
   }
   __threadfence();
@@ -307,7 +480,22 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
   }
   prim::block_sync();
   if (!is_last) return;
-  route_plan(scores, bias, plan_out, sm.plan, rows, experts, picks, first, count);
+  bool fused = use_tc && rks > 1u && experts == 256u && picks == PICKS;
+  if (use_tc && rks > 1u && !fused) {
+    u64 re = (u64)rows * experts;
+    for (u64 idx = tid * 4ull; idx < re; idx += 1024ull) {
+      float4 tot = make_float4(0.f, 0.f, 0.f, 0.f);
+      for (u32 sp = 0u; sp < rks; sp++) {
+        float4 v = prim::load_fresh4(scores + (u64)sp * re + idx);
+        tot.x += v.x; tot.y += v.y; tot.z += v.z; tot.w += v.w;
+      }
+      *reinterpret_cast<float4*>(scores + idx) = make_float4(
+          1.f / (1.f + __expf(-tot.x)), 1.f / (1.f + __expf(-tot.y)),
+          1.f / (1.f + __expf(-tot.z)), 1.f / (1.f + __expf(-tot.w)));
+    }
+    prim::block_sync();
+  }
+  route_plan(scores, bias, plan_out, sm.plan, rows, experts, picks, first, count, rks, fused);
 }
 
 struct alignas(16) Fc1Smem {

@@ -85,7 +85,9 @@ fn offer_row_bounds() {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
             assert_eq!(got.len(), 4);
-            assert_eq!(got[0].len, PLAN_WORDS + rows * experts);
+            let nb = experts / 16;
+            let rks = split_dim(512 / 256, 128usize.div_ceil(nb).max(1));
+            assert_eq!(got[0].len, SCORES_OFF + rows * experts * rks);
             let Shape::Grid { down, .. } = got[1].shape else {
                 panic!("fc1 must be grid");
             };

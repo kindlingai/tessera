@@ -249,11 +249,12 @@ fn module_reaches_engine() {
     }
 }
 
-const CASES: [(&str, bool, bool); 4] = [
+const CASES: [(&str, bool, bool); 5] = [
     ("", false, false),
     ("_mul1", false, false),
     ("_mul1", true, false),
     ("_mul1", false, true),
+    ("_mul1", true, true),
 ];
 
 /// On a CUDA GPU alone: the kernel is CUDA text.
