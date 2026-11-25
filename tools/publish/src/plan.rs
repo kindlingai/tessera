@@ -58,12 +58,16 @@ pub(crate) fn plan(meta: &Meta) -> Result<Vec<Out>> {
         .copied()
         .filter(|p| !macros.contains(p))
         .collect();
-    let front: Vec<usize> = (0..meta.packages.len())
+    let (front_macros, front): (Vec<usize>, Vec<usize>) = (0..meta.packages.len())
         .filter(|&p| under(meta, p, "frontend") && p != cli && meta.packages[p].lib().is_some())
-        .collect();
+        .partition(|&p| meta.packages[p].is_macro());
     let mut outs = Vec::new();
     for &m in &macros {
         let names = paths(meta, &core, |module| format!("tessera_engine::{module}"));
+        outs.push(single(meta, m, Kind::Macro, names));
+    }
+    for &m in &front_macros {
+        let names = paths(meta, &front, |module| format!("tessera_frontend::{module}"));
         outs.push(single(meta, m, Kind::Macro, names));
     }
     outs.push(merged(meta, ENGINE, &core, "engine")?);
