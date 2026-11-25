@@ -94,6 +94,7 @@ impl Vocab {
 }
 
 /// One answer's place in its grammar.
+#[derive(Clone)]
 pub struct Matcher {
     inner: llguidance::Matcher,
     stops: Arc<[u32]>,
@@ -174,5 +175,10 @@ impl tessera_engine::Guide for Matcher {
 
     fn done(&self) -> bool {
         self.stopped()
+    }
+
+    /// Copies the parse state. Lexer caches stay shared.
+    fn fork(&self) -> Option<Box<dyn tessera_engine::Guide>> {
+        Some(Box::new(self.clone()))
     }
 }

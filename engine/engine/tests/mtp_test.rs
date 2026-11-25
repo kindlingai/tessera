@@ -4,7 +4,8 @@ mod common;
 
 use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
 use tessera_engine::{
-    BatchMtp, Drafter, Event, MtpDrafter, MtpSpeculate, Place, Reason, Recipe, Request, SpecStats,
+    Allowed, BatchMtp, Drafter, Event, Fault, Guide, MtpDrafter, MtpSpeculate, Penalties, Place,
+    Prefix, Reason, Recipe, Request, SpecStats, Stacked, Steps,
 };
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
@@ -531,4 +532,126 @@ fn chunked_prefill_interleaves() {
     let all1: Vec<_> = rx1.try_iter().collect();
     assert_eq!(collect_ids(&all0), collect_ids(&want_short));
     assert_eq!(collect_ids(&all1), collect_ids(&want_long));
+}
+
+/// A guide for a prompt, or none.
+type MakeGuide = fn(&[u32]) -> Option<Box<dyn Guide>>;
+
+/// Bans 0 every third token and forces 1 every fifth.
+#[derive(Clone)]
+struct Thirds(usize);
+
+impl Guide for Thirds {
+    fn allowed(&mut self) -> Result<Allowed, Fault> {
+        match self.0 % 3 {
+            2 => Ok(Allowed::Except(vec![0])),
+            _ => Ok(Allowed::Any),
+        }
+    }
+
+    fn forced(&mut self) -> Vec<u32> {
+        if self.0 % 5 != 4 {
+            return Vec::new();
+        }
+        self.0 += 1;
+        vec![1]
+    }
+
+    fn accept(&mut self, _: u32) -> Result<(), Fault> {
+        self.0 += 1;
+        Ok(())
+    }
+
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+/// `Thirds` with no fork.
+struct Unforked(Thirds);
+
+impl Guide for Unforked {
+    fn allowed(&mut self) -> Result<Allowed, Fault> {
+        self.0.allowed()
+    }
+
+    fn forced(&mut self) -> Vec<u32> {
+        self.0.forced()
+    }
+
+    fn accept(&mut self, id: u32) -> Result<(), Fault> {
+        self.0.accept(id)
+    }
+}
+
+#[test]
+fn guided_mtp_matches() {
+    let mut t_cfg = mla_cfg(false, 16);
+    t_cfg.stack.steps = Steps::Masked;
+    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
+    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, false));
+    let prompt = vec![3u32, 9, 4, 11];
+    let guides: [MakeGuide; 5] = [
+        |_| None,
+        |_| Some(Box::new(Thirds(0))),
+        |p| penalties_guide(p),
+        |p| {
+            Stacked::of(vec![
+                Box::new(Prefix(vec![5, 0])),
+                penalties_guide(p).unwrap(),
+            ])
+        },
+        |_| Some(Box::new(Unforked(Thirds(0)))),
+    ];
+    // Zero heads draft 0 always, and the target holds most.
+    for zeroed in [false, true] {
+        let mut t_weights = weights(&t_graph, &mut Noise(11));
+        let mut m_weights: Vec<Weight> = float_weights(&m_graph, 29);
+        if zeroed {
+            let t = t_weights.last_mut().unwrap();
+            *t = Tensor::f32(t.shape.clone(), vec![0.0; t.len()]);
+            let Some(Weight::Floats(m)) = m_weights.last_mut() else {
+                unreachable!()
+            };
+            *m = Tensor::f32(m.shape.clone(), vec![0.0; m.len()]);
+        }
+        for settings in runs() {
+            let mut baseline = open_target(&t_graph, &t_weights, 24, &settings);
+            let mut target = open_target(&t_graph, &t_weights, 24, &settings);
+            let mut drafter =
+                MtpDrafter::open(m_graph.clone(), 24, &Recipe::default(), &settings).unwrap();
+            drafter.load(&m_weights).unwrap();
+            let mut spec = MtpSpeculate::new(&mut target, &mut drafter, 3).unwrap();
+            let mut unguided = Vec::new();
+            for guide in guides {
+                let req = || Request {
+                    tokens: prompt.clone(),
+                    max_tokens: 12,
+                    guide: guide(&prompt),
+                    ..Request::default()
+                };
+                let (mut want, mut got) = (Vec::new(), Vec::new());
+                baseline.generate(req(), &mut |e| want.push(e)).unwrap();
+                spec.generate(req(), &mut |e| {
+                    got.push(e);
+                    true
+                })
+                .unwrap();
+                assert_eq!(got, want);
+                // With tied logits every guide changes the answer.
+                assert!(!zeroed || unguided.is_empty() || want != unguided);
+                if unguided.is_empty() {
+                    unguided = want;
+                }
+            }
+        }
+    }
+}
+
+fn penalties_guide(prompt: &[u32]) -> Option<Box<dyn Guide>> {
+    let penalties = Penalties {
+        presence: 4.0,
+        ..Penalties::default()
+    };
+    penalties.guide(prompt)
 }

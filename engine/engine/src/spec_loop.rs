@@ -1,10 +1,12 @@
 //! Shared SPMD speculative decode loop and device tap helpers.
 
-use crate::sample::{Target, accept, take};
+use crate::guide::{Rules, settle, walk};
+use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::spec_len::SpecStats;
-use crate::{Engine, Error, Event, Reason, Request, Row};
+use crate::{Allowed, Edit, Engine, Error, Event, Guide, Head, Reason, Request, Row};
 use tessera_engine_comm::{Reader, Writer};
-use tessera_lower::Slot;
+use tessera_graph::Role;
+use tessera_lower::{Slot, Wants};
 use tessera_run::{Error as RunError, Profile, Run};
 
 /// Wire tag identifying an SPMD speculative request header.
@@ -146,6 +148,9 @@ pub(crate) fn start_req(
     extra: impl FnOnce(&mut Writer),
 ) -> Result<bool, Error> {
     let request = &spec_req.request;
+    if request.guide.is_some() && target.control.is_some() {
+        return Err(Error::Guided);
+    }
     if request.tokens.is_empty() || request.tokens.len() > target.context() {
         let _ = emit(Event::Done(Reason::Context));
         return Ok(false);
@@ -366,126 +371,368 @@ pub(crate) fn run_speculate<D, S>(
         stopped: false,
         hash: 2166136261,
     };
-    let request = spec_req.request;
-    let prompt = &request.tokens;
-    let n = prompt.len();
-    let step = spec_req.chunk.unwrap_or(n).max(1);
-    let need_taps = request.max_tokens > 1;
-    let mut pos = 0usize;
-    while pos + step < n {
-        let rows = prompt_rows(&prompt[pos..pos + step], pos);
-        if need_taps {
-            let (_, taps) = target.step_taps_local(&rows)?;
-            on_chunk(target, drafter, pos, prompt, step, taps)?;
-        } else {
-            target.step_last_local(&rows)?;
-        }
-        pos += step;
-    }
-    let last_rows = prompt_rows(&prompt[pos..], pos);
-    let (mut anchor, taps) = if need_taps {
-        let (ids, taps) = target.step_taps_local(&last_rows)?;
-        (*ids.last().expect("non-empty prompt"), Some(taps))
-    } else {
-        (target.step_last_local(&last_rows)?, None)
-    };
-    fnv_u32(&mut st.hash, anchor);
-    if let Some(reason) = accept_token(&request, &mut st, anchor, lead, emit) {
-        if lead && !st.stopped {
-            let _ = emit(Event::Done(reason));
-        }
-        sync_ranks(target, st.stopped, st.hash)?;
-        return Ok(st.stats);
-    }
-    if !ranked && st.stopped {
-        return Ok(st.stats);
-    }
-    let taps = taps.expect("taps when max_tokens > 1");
-    let mut state = init(target, drafter, pos, prompt, anchor, taps)?;
-    let mut start = n;
-    let mut round = 0usize;
-    let mut done_reason: Option<Reason> = None;
-    while st.sim_emitted < request.max_tokens {
-        if start >= target.context() {
-            done_reason = Some(Reason::Context);
-            break;
-        }
-        let remaining = request.max_tokens - st.sim_emitted;
-        let drafts = draft(target, drafter, &mut state, start, anchor, remaining)?;
-        let block = drafts.as_deref().unwrap_or(&[]);
-        let mut verify = Vec::with_capacity(block.len() + 1);
-        span(
-            &mut verify,
-            0,
-            start,
-            [anchor].into_iter().chain(block.iter().copied()),
-        );
-        // A drafted round also reads taps.
-        let (posterior, block_taps) = match drafts {
-            Some(_) => {
-                let (ids, taps) = target.verify_local(&verify)?;
-                (ids, Some(taps))
+    let mut request = spec_req.request;
+    let mut prompt = std::mem::take(&mut request.tokens);
+    let mut guided = request.guide.take().map(|guide| Guided {
+        forks: guide.fork().is_some(),
+        guide,
+        queue: Vec::new(),
+        next: (Allowed::Any, Vec::new()),
+    });
+    let done = 'run: {
+        if let Some(g) = &mut guided {
+            // Tokens forced before the first pick join the prompt.
+            if let Some(reason) = g.settle(&request, &mut st, lead, emit) {
+                break 'run Some(reason);
             }
-            None => (target.step_local(&verify)?, None),
+            prompt.append(&mut g.queue);
+        }
+        if prompt.len() > target.context() {
+            break 'run Some(Reason::Context);
+        }
+        let n = prompt.len();
+        let step = spec_req.chunk.unwrap_or(n).max(1);
+        let need_taps = request.max_tokens - st.sim_emitted > 1;
+        // Taps follow picks: a guided last chunk is one row.
+        let end = match guided {
+            Some(_) => n - 1,
+            None => (n - 1) / step * step,
         };
-        let (accepted, bonus) = accept(block, Target::Ids(&posterior));
-        if drafts.is_some() {
-            target.commit(accepted + 1)?;
-        }
-        if drafts.is_some() && lead && !st.stopped {
-            st.stats.steps += 1;
-            st.stats.drafted += block.len();
-            st.stats.accepted += accepted;
-        }
-        fnv_u32(&mut st.hash, start as u32);
-        fnv_u32(&mut st.hash, block.len() as u32);
-        for &d in block {
-            fnv_u32(&mut st.hash, d);
-        }
-        fnv_u32(&mut st.hash, accepted as u32);
-        fnv_u32(&mut st.hash, bonus);
-        for id in block[..accepted].iter().copied().chain([bonus]) {
-            if let Some(reason) = accept_token(&request, &mut st, id, lead, emit) {
-                done_reason = Some(reason);
-                break;
+        let mut pos = 0usize;
+        while pos < end {
+            let len = step.min(end - pos);
+            let rows = prompt_rows(&prompt[pos..pos + len], pos);
+            let all: Vec<u32> = (0..len as u32).collect();
+            let picks = if need_taps { &all[..] } else { &all[len - 1..] };
+            let (_, taps) =
+                target.launch_local(&rows, picks, Head::Full(None), need_taps, false)?;
+            if let Some(taps) = taps {
+                on_chunk(target, drafter, pos, &prompt, len, taps)?;
             }
+            pos += len;
         }
-        fnv_u32(&mut st.hash, st.sim_emitted as u32);
-        round += 1;
-        if done_reason.is_some() {
-            break;
+        let last_rows = prompt_rows(&prompt[pos..], pos);
+        let (mut anchor, taps) = match &guided {
+            Some(g) => target.pick_last(&last_rows, &g.next, need_taps)?,
+            None => {
+                let all: Vec<u32> = (0..last_rows.len() as u32).collect();
+                let picks = if need_taps {
+                    &all[..]
+                } else {
+                    &all[all.len() - 1..]
+                };
+                let (ids, taps) =
+                    target.launch_local(&last_rows, picks, Head::Full(None), need_taps, false)?;
+                (*ids.last().expect("non-empty prompt"), taps)
+            }
+        };
+        fnv_u32(&mut st.hash, anchor);
+        if let Some(reason) = take_one(&mut guided, &request, &mut st, anchor, lead, emit) {
+            break 'run Some(reason);
         }
         if !ranked && st.stopped {
             return Ok(st.stats);
         }
-        if ranked && round.is_multiple_of(SYNC_EVERY) && sync_ranks(target, st.stopped, st.hash)? {
-            return Ok(st.stats);
-        }
-        if let Some(block_taps) = block_taps {
-            let mut discard = SpecStats::default();
-            let stat_ref = if lead && !st.stopped {
-                &mut st.stats
-            } else {
-                &mut discard
+        let taps = taps.expect("taps when more tokens follow");
+        let mut state = init(target, drafter, pos, &prompt, anchor, taps)?;
+        let mut start = n;
+        let mut round = 0usize;
+        while st.sim_emitted < request.max_tokens {
+            let fixed = guided.as_ref().map_or(0, |g| g.queue.len());
+            if start + fixed >= target.context() {
+                break 'run Some(Reason::Context);
+            }
+            let remaining = request.max_tokens - st.sim_emitted;
+            let speculate = guided
+                .as_ref()
+                .is_none_or(|g| g.forks && device(target, &g.next));
+            let drafts = match speculate {
+                true => draft(target, drafter, &mut state, start, anchor, remaining)?,
+                false => None,
             };
-            advance(
-                target,
-                drafter,
-                &mut state,
+            let (drafted, block, rules) = match &guided {
+                Some(g) => g.block(target, drafts),
+                None => (drafts.is_some(), drafts.unwrap_or_default(), Vec::new()),
+            };
+            let mut verify = Vec::with_capacity(block.len() + 1);
+            span(
+                &mut verify,
+                0,
                 start,
-                block.len(),
-                accepted,
-                &posterior,
-                block_taps,
-                stat_ref,
-            )?;
+                [anchor].into_iter().chain(block.iter().copied()),
+            );
+            // A drafted round also reads taps.
+            let (mut posterior, block_taps) = match &guided {
+                Some(g) if !drafted => {
+                    let (id, _) = target.pick_last(&verify, &g.next, false)?;
+                    (block.iter().copied().chain([id]).collect(), None)
+                }
+                _ => {
+                    let all: Vec<u32> = (0..verify.len() as u32).collect();
+                    let head = head(target, &rules)?;
+                    // A drafted verify leaves its state for `commit`.
+                    target.launch_local(&verify, &all, head, drafted, drafted)?
+                }
+            };
+            posterior[..fixed].copy_from_slice(&block[..fixed]);
+            let (accepted, bonus) = accept(&block, Target::Ids(&posterior));
+            if drafted {
+                target.commit(accepted + 1)?;
+            }
+            if drafted && lead && !st.stopped {
+                st.stats.steps += 1;
+                st.stats.drafted += block.len() - fixed;
+                st.stats.accepted += accepted - fixed;
+            }
+            fnv_u32(&mut st.hash, start as u32);
+            fnv_u32(&mut st.hash, block.len() as u32);
+            for &d in &block {
+                fnv_u32(&mut st.hash, d);
+            }
+            fnv_u32(&mut st.hash, accepted as u32);
+            fnv_u32(&mut st.hash, bonus);
+            if let Some(g) = &mut guided {
+                g.queue.clear();
+            }
+            let mut ended = None;
+            for id in block[fixed..accepted].iter().copied().chain([bonus]) {
+                ended = take_one(&mut guided, &request, &mut st, id, lead, emit);
+                if ended.is_some() {
+                    break;
+                }
+            }
+            fnv_u32(&mut st.hash, st.sim_emitted as u32);
+            round += 1;
+            if ended.is_some() {
+                break 'run ended;
+            }
+            if !ranked && st.stopped {
+                return Ok(st.stats);
+            }
+            if ranked
+                && round.is_multiple_of(SYNC_EVERY)
+                && sync_ranks(target, st.stopped, st.hash)?
+            {
+                return Ok(st.stats);
+            }
+            if let Some(block_taps) = block_taps {
+                let mut discard = SpecStats::default();
+                let stat_ref = if lead && !st.stopped {
+                    &mut st.stats
+                } else {
+                    &mut discard
+                };
+                advance(
+                    target,
+                    drafter,
+                    &mut state,
+                    start,
+                    block.len(),
+                    accepted,
+                    &posterior,
+                    block_taps,
+                    stat_ref,
+                )?;
+            }
+            start += 1 + accepted;
+            anchor = bonus;
         }
-        start += 1 + accepted;
-        anchor = bonus;
-    }
+        None
+    };
     if lead && !st.stopped {
-        let _ = emit(Event::Done(done_reason.unwrap_or(Reason::Length)));
+        let _ = emit(Event::Done(done.unwrap_or(Reason::Length)));
     }
     sync_ranks(target, st.stopped, st.hash)?;
     Ok(st.stats)
+}
+
+/// A guided answer between verify rounds.
+struct Guided {
+    guide: Box<dyn Guide>,
+    /// Whether the guide forks, so drafts can be walked.
+    forks: bool,
+    /// Taken tokens to feed after the anchor.
+    queue: Vec<u32>,
+    /// The rules of the pick after the queue.
+    next: Rules,
+}
+
+impl Guided {
+    /// Queues forced tokens and reads the next rules.
+    fn settle(
+        &mut self,
+        request: &Request,
+        st: &mut LoopState,
+        lead: bool,
+        emit: &mut dyn FnMut(Event) -> bool,
+    ) -> Option<Reason> {
+        let queue = &mut self.queue;
+        let out = settle(&mut *self.guide, |id| {
+            let reason = accept_token(request, st, id, lead, emit);
+            if reason.is_none() {
+                queue.push(id);
+            }
+            reason
+        });
+        match out {
+            Ok(next) => {
+                self.next = next;
+                None
+            }
+            Err(reason) => Some(reason),
+        }
+    }
+
+    /// Whether the round drafts, its block, and each row's rules.
+    fn block(&self, target: &Engine, drafts: Option<Vec<u32>>) -> (bool, Vec<u32>, Vec<Rules>) {
+        let fixed = self.queue.len();
+        // A queue replaces the drafts when it fits in them.
+        if fixed > 0 {
+            let fits = drafts.is_some_and(|d| fixed <= d.len());
+            let mut rules = vec![(Allowed::Any, Vec::new()); fixed];
+            rules.push(self.next.clone());
+            return (fits, self.queue.clone(), rules);
+        }
+        let Some(mut drafts) = drafts else {
+            return (false, Vec::new(), vec![self.next.clone()]);
+        };
+        let rules = walk(&*self.guide, self.next.clone(), &drafts, |r| {
+            device(target, r)
+        });
+        drafts.truncate(rules.len() - 1);
+        (true, drafts, rules)
+    }
+}
+
+/// Takes answer token `id`, and moves the guide past it.
+fn take_one(
+    guided: &mut Option<Guided>,
+    request: &Request,
+    st: &mut LoopState,
+    id: u32,
+    lead: bool,
+    emit: &mut dyn FnMut(Event) -> bool,
+) -> Option<Reason> {
+    let Some(g) = guided else {
+        return accept_token(request, st, id, lead, emit);
+    };
+    if g.guide.accept(id).is_err() {
+        return Some(Reason::Guide);
+    }
+    accept_token(request, st, id, lead, emit).or_else(|| g.settle(request, st, lead, emit))
+}
+
+/// Whether the device head can apply `rules`.
+fn device(target: &Engine, rules: &Rules) -> bool {
+    match rules.1.is_empty() {
+        true => rules.0 == Allowed::Any || target.words().is_some(),
+        false => target.edits_fit(rules.1.len()),
+    }
+}
+
+/// A full head with each pick's mask and edits.
+fn head(target: &Engine, rules: &[Rules]) -> Result<Head, Error> {
+    if rules.iter().any(|r| !r.1.is_empty()) {
+        let allowed: Vec<&Allowed> = rules.iter().map(|r| &r.0).collect();
+        let edits: Vec<&[Edit]> = rules.iter().map(|r| &r.1[..]).collect();
+        return target.edited(&allowed, &edits);
+    }
+    Ok(match target.words() {
+        Some(words) if rules.iter().any(|r| r.0 != Allowed::Any) => {
+            Head::Full(Some(rules.iter().flat_map(|r| r.0.bits(words)).collect()))
+        }
+        _ => Head::Full(None),
+    })
+}
+
+impl Engine {
+    /// A local launch picking after every row, with taps.
+    pub(crate) fn step_taps_local(&mut self, rows: &[Row]) -> Result<(Vec<u32>, TapsBuf), Error> {
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let (ids, taps) = self.launch_local(rows, &all, Head::Full(None), true, false)?;
+        Ok((ids, taps.expect("taps were asked for")))
+    }
+
+    /// The ids after `picks` rows. Taps and peek on request.
+    pub(crate) fn launch_local(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        head: Head,
+        taps: bool,
+        peek: bool,
+    ) -> Result<(Vec<u32>, Option<TapsBuf>), Error> {
+        let (out, taps) = self.tapped(rows, picks, (head, peek), Role::Tokens, taps)?;
+        let mut ids = self.runner.ids(out)?;
+        ids.truncate(picks.len());
+        self.report();
+        Ok((ids, taps))
+    }
+
+    /// The pick after the last row, and its taps.
+    fn pick_last(
+        &mut self,
+        rows: &[Row],
+        rules: &Rules,
+        taps: bool,
+    ) -> Result<(u32, Option<TapsBuf>), Error> {
+        let last = [rows.len() as u32 - 1];
+        if device(self, rules) {
+            let head = head(self, std::slice::from_ref(rules))?;
+            let (ids, taps) = self.launch_local(rows, &last, head, taps, false)?;
+            return Ok((ids[0], taps));
+        }
+        // Rules the device head cannot apply run on the host.
+        let vocab = self.vocab.ok_or(Error::Scores)?;
+        let head = (Head::Full(None), false);
+        let (out, taps) = self.tapped(rows, &last, head, Role::Logits, taps)?;
+        let raw = self.runner.read(out)?;
+        let mut row = raw.floats().map_err(RunError::from)?[..vocab].to_vec();
+        let sampler = Sampler::new(Sampling::default());
+        let weights = sampler.weights(&mut row, Some(&rules.0), &rules.1);
+        self.report();
+        Ok((weights.draw(0.0), taps))
+    }
+
+    /// Runs `rows` locally: the `first` output, and taps if asked.
+    fn tapped(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        (head, peek): (Head, bool),
+        first: Role,
+        taps: bool,
+    ) -> Result<(Slot, Option<TapsBuf>), Error> {
+        let width = match taps {
+            true => self.taps.ok_or(Error::Taps)?,
+            false => 0,
+        };
+        let roles = &[first, Role::Taps][..1 + taps as usize];
+        let wants = Wants::roles(&self.graph, self.full, roles);
+        // Outputs come in the entry's order.
+        let order = &self.graph.entries[self.full].outputs;
+        let wanted = order.iter().filter(|o| roles.contains(&o.role));
+        let at = |role| wanted.clone().position(|o| o.role == role).unwrap_or(0);
+        let (out_at, taps_at) = (at(first), at(Role::Taps));
+        let outputs = self.run_local(rows, picks, head, wants, peek)?;
+        let out = outputs[out_at];
+        if !taps {
+            return Ok((out, None));
+        }
+        let slot = outputs[taps_at];
+        let buf = if slot.form.name() == "f32"
+            && let Some(addr) = self.runner.address(slot)
+        {
+            TapsBuf::Device {
+                slot,
+                addr,
+                rows: rows.len(),
+            }
+        } else {
+            let raw = self.runner.read(slot)?;
+            let floats = raw.floats().map_err(RunError::from)?;
+            TapsBuf::Host(floats[..rows.len() * width].to_vec())
+        };
+        Ok((out, Some(buf)))
+    }
 }

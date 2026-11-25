@@ -1,6 +1,6 @@
 //! Many answers in flight, one step feeding them all.
 
-use crate::guide::Edit;
+use crate::guide::{Edit, settle};
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
 use crate::sample::{Sampler, Target, Weights, accept, take};
@@ -86,41 +86,21 @@ impl Seq {
 
     /// Adds forced and single-choice tokens, then reads the next set.
     fn settle(&mut self) -> Option<Reason> {
-        loop {
-            let guide = self.request.guide.as_mut()?;
-            let forced = guide.forced();
-            let done = guide.done();
-            let next = match done {
-                true => Ok(Allowed::Any),
-                false => guide.allowed(),
-            };
-            let Ok(next) = next else {
-                return Some(Reason::Guide);
-            };
-            let one = match next {
-                Allowed::One(id) if guide.accept(id).is_err() => return Some(Reason::Guide),
-                Allowed::One(id) => Some(id),
-                _ => None,
-            };
-            let edits = match one.is_none() && !done {
-                // Host and device both see one edit per id.
-                true => crate::guide::merged(guide.edits()),
-                false => Vec::new(),
-            };
-            for id in forced.into_iter().chain(one) {
-                if let Some(reason) = self.take(id) {
-                    return Some(reason);
-                }
+        let mut guide = self.request.guide.take()?;
+        let out = settle(&mut *guide, |id| {
+            let reason = self.take(id);
+            if reason.is_none() {
                 self.pending.push_back(id);
             }
-            if done {
-                return Some(Reason::Stop);
+            reason
+        });
+        self.request.guide = Some(guide);
+        match out {
+            Ok((next, edits)) => {
+                (self.next, self.edits) = (next, edits);
+                None
             }
-            if one.is_none() {
-                self.next = next;
-                self.edits = edits;
-                return None;
-            }
+            Err(reason) => Some(reason),
         }
     }
 }

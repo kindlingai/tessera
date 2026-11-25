@@ -9,8 +9,8 @@ use tessera_engine::comm::Sockets;
 use tessera_engine::qwen4_exp::{Config, Moe, Ple, RotatedMoe, program, stepper};
 use tessera_engine::qwen35::{Mixing, Recurrent};
 use tessera_engine::{
-    Batch, Bf16, Drafter, Engine, Event, Fair, Pick, PleConfig, PleStore, Recipe, Request, Row,
-    Settings, Speculate, Stack, Tensor, Weight,
+    Batch, Bf16, Drafter, Engine, Event, Fair, Penalties, Pick, PleConfig, PleStore, Recipe,
+    Request, Row, Settings, Speculate, Stack, Steps, Tensor, Weight,
 };
 use tessera_graph::Parts;
 use tessera_lower::Cluster;
@@ -421,10 +421,11 @@ fn commit_matches_steps() {
     }
 }
 
-/// DFlash over recurrent state decodes as greedy does.
+/// Guided or not, stateful DFlash decodes as greedy does.
 #[test]
 fn stateful_dflash_greedy() {
     let mut c = tiny_config();
+    c.stack.steps = Steps::Masked;
     let spec = TargetSpec {
         vocab: c.stack.vocab,
         hidden: c.stack.hidden,
@@ -435,26 +436,35 @@ fn stateful_dflash_greedy() {
     c.stack.taps = d_cfg.tap_layers();
     let g = stepper::<Moe>(&c);
     let d_graph = dflash::stepper::<()>(&d_cfg);
-    let request = || Request {
+    let penalties = Penalties {
+        presence: 2.0,
+        ..Penalties::default()
+    };
+    let request = |guided: bool| Request {
         tokens: vec![1, 3, 5, 2],
         max_tokens: 10,
+        guide: penalties.guide(&[1, 3, 5, 2]).filter(|_| guided),
         ..Request::default()
     };
     for settings in runs() {
-        let mut baseline = tapped_engine(&g, &settings);
-        let mut target = tapped_engine(&g, &settings);
-        let recipe = Recipe::default();
-        let mut drafter = Drafter::open(d_graph.clone(), 16, 4, 0, &recipe, &settings).unwrap();
-        drafter.load(&float_weights(&d_graph, 23)).unwrap();
-        let (mut want, mut got) = (Vec::new(), Vec::new());
-        baseline.generate(request(), &mut |e| want.push(e)).unwrap();
-        let mut run = Speculate::new(&mut target, &mut drafter).unwrap();
-        let emit = &mut |e| {
-            got.push(e);
-            true
-        };
-        let stats = run.generate(request(), emit).unwrap();
-        assert_eq!(collect_ids(&got), collect_ids(&want));
-        assert!(stats.steps > 0);
+        for guided in [false, true] {
+            let mut baseline = tapped_engine(&g, &settings);
+            let mut target = tapped_engine(&g, &settings);
+            let recipe = Recipe::default();
+            let mut drafter = Drafter::open(d_graph.clone(), 16, 4, 0, &recipe, &settings).unwrap();
+            drafter.load(&float_weights(&d_graph, 23)).unwrap();
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            baseline
+                .generate(request(guided), &mut |e| want.push(e))
+                .unwrap();
+            let mut run = Speculate::new(&mut target, &mut drafter).unwrap();
+            let emit = &mut |e| {
+                got.push(e);
+                true
+            };
+            let stats = run.generate(request(guided), emit).unwrap();
+            assert_eq!(collect_ids(&got), collect_ids(&want));
+            assert!(stats.steps > 0);
+        }
     }
 }

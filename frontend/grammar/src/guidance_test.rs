@@ -74,3 +74,13 @@ fn split_characters_kept() {
     // The first byte of `é` stays itself, not U+FFFD.
     assert_eq!(vocab.tokenize(&[b'a', 0xC3]), [u32::from(b'a'), 0xC3]);
 }
+
+#[test]
+fn fork_leaves_original() {
+    let vocab = Vocab::new(&tokenizer(), &[EOS], ROWS).unwrap();
+    let mut m = vocab.regex("ab").unwrap();
+    let mut fork = m.fork().unwrap();
+    fork.accept(u32::from(b'a')).unwrap();
+    assert_eq!(fork.allowed().unwrap(), Allowed::One(u32::from(b'b')));
+    assert_eq!(m.allowed().unwrap(), Allowed::One(u32::from(b'a')));
+}

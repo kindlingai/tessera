@@ -156,6 +156,8 @@ pub enum Error {
     Ple(#[from] std::io::Error),
     #[error("drafts rewind slot state that the graph cannot restore")]
     Stateful,
+    #[error("guides need a single-rank speculative loop")]
+    Guided,
 }
 
 /// Row width of `entry`'s `role` output, if any.
@@ -251,8 +253,6 @@ pub(crate) enum Head {
     Sparse(Vec<u32>, usize),
     /// Full entry: masks, and `k` edits per pick.
     Edited(Vec<u32>, Vec<u32>, usize),
-    /// The full entry, leaving recurrent state for a commit.
-    Peek,
 }
 
 /// Packs `k` edits: ids, adds, reps. Pads are neutral.
@@ -585,78 +585,13 @@ impl Engine {
         Ok((ids, taps))
     }
 
-    /// Local-only step without control broadcast, for SPMD loops.
-    pub(crate) fn step_local(&mut self, rows: &[Row]) -> Result<Vec<u32>, Error> {
-        let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let wants = Wants::role(&self.graph, 0, Role::Tokens);
-        let outputs = self.run_local(rows, &all, Head::Full(None), wants)?;
-        let mut ids = self.runner.ids(outputs[0])?;
-        ids.truncate(rows.len());
-        self.report();
-        Ok(ids)
-    }
-
-    /// Local-only step returning the last row's predicted token.
-    pub(crate) fn step_last_local(&mut self, rows: &[Row]) -> Result<u32, Error> {
-        let pick = [(rows.len() - 1) as u32];
-        let wants = Wants::role(&self.graph, self.full, Role::Tokens);
-        let outputs = self.run_local(rows, &pick, Head::Full(None), wants)?;
-        let ids = self.runner.ids(outputs[0])?;
-        self.report();
-        Ok(ids[0])
-    }
-
-    /// Local-only tapped step keeping device taps resident when possible.
-    pub(crate) fn step_taps_local(
-        &mut self,
-        rows: &[Row],
-    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
-        self.tapped(rows, false)
-    }
-
-    /// As `step_taps_local`, leaving recurrent state for `commit`.
-    pub(crate) fn verify_local(
-        &mut self,
-        rows: &[Row],
-    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
-        self.tapped(rows, self.stateful)
-    }
-
     /// A tapped launch that leaves recurrent state for `commit`.
     pub fn verify(&mut self, rows: &[Row]) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let width = self.taps.ok_or(Error::Taps)?;
-        let (ids, taps) = self.verify_local(rows)?;
-        Ok((ids, taps.into_host(self.runner.as_ref(), width)?))
-    }
-
-    fn tapped(
-        &mut self,
-        rows: &[Row],
-        peek: bool,
-    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
-        let width = self.taps.ok_or(Error::Taps)?;
         let all: Vec<u32> = (0..rows.len() as u32).collect();
-        let wants = Wants::roles(&self.graph, 0, &[Role::Tokens, Role::Taps]);
-        let head = if peek { Head::Peek } else { Head::Full(None) };
-        let outputs = self.run_local(rows, &all, head, wants)?;
-        let mut ids = self.runner.ids(outputs[0])?;
-        ids.truncate(rows.len());
-        let slot = outputs[1];
-        let taps = if slot.form.name() == "f32"
-            && let Some(addr) = self.runner.address(slot)
-        {
-            spec_loop::TapsBuf::Device {
-                slot,
-                addr,
-                rows: rows.len(),
-            }
-        } else {
-            let raw = self.runner.read(slot)?;
-            let floats = raw.floats().map_err(tessera_run::Error::from)?;
-            spec_loop::TapsBuf::Host(floats[..rows.len() * width].to_vec())
-        };
-        self.report();
-        Ok((ids, taps))
+        let (ids, taps) = self.launch_local(rows, &all, Head::Full(None), true, true)?;
+        let taps = taps.expect("taps were asked for");
+        Ok((ids, taps.into_host(self.runner.as_ref(), width)?))
     }
 
     /// One launch of `rows`: full logits and tapped states.
@@ -743,8 +678,18 @@ impl Engine {
         edits: &[&[Edit]],
     ) -> Result<Vec<u32>, Error> {
         let picks = ends(rows);
+        if allowed.len() != picks.len() {
+            return Err(Error::Mask);
+        }
+        let allowed: Vec<&Allowed> = allowed.iter().collect();
+        let head = self.edited(&allowed, edits)?;
+        self.launch(rows, &picks, head)
+    }
+
+    /// A full head with each pick's mask and edits.
+    pub(crate) fn edited(&self, allowed: &[&Allowed], edits: &[&[Edit]]) -> Result<Head, Error> {
         let most = edits.iter().map(|e| e.len()).max().unwrap_or(0);
-        if allowed.len() != picks.len() || edits.len() != picks.len() || !self.edits_fit(most) {
+        if allowed.len() != edits.len() || !self.edits_fit(most) {
             return Err(Error::Mask);
         }
         let words = self.words.ok_or(Error::Mask)?;
@@ -757,7 +702,7 @@ impl Engine {
         for e in edits {
             pack(e, k, &mut packed);
         }
-        self.launch(rows, &picks, Head::Edited(bits, packed, k))
+        Ok(Head::Edited(bits, packed, k))
     }
 
     /// Each pick's logits over its `ids`, in one launch.
@@ -793,7 +738,7 @@ impl Engine {
     /// The entry `head` launches.
     fn entry(&self, head: &Head) -> Result<usize, Error> {
         match head {
-            Head::Full(_) | Head::Edited(..) | Head::Peek => Ok(self.full),
+            Head::Full(_) | Head::Edited(..) => Ok(self.full),
             Head::Sparse(..) => self.sparse.ok_or(Error::Scores),
         }
     }
@@ -833,7 +778,7 @@ impl Engine {
     ) -> Result<Vec<Slot>, Error> {
         self.check_rows(rows)?;
         self.announce(rows, picks, &head, wants)?;
-        self.run_local(rows, picks, head, wants)
+        self.run_local(rows, picks, head, wants, false)
     }
 
     /// Runs `rows` on this rank without control broadcast.
@@ -843,13 +788,19 @@ impl Engine {
         picks: &[u32],
         head: Head,
         wants: Wants,
+        peek: bool,
     ) -> Result<Vec<Slot>, Error> {
         self.check_rows(rows)?;
         let (mut sizes, [filled, wanted]) = launch_of(rows, picks, self.slots, self.context);
         // A promotion copies slot 0 alone.
         let solo = rows.iter().all(|r| r.slot == 0);
         let whole = if solo { rows.len() } else { usize::MAX };
-        self.verified = matches!(head, Head::Peek).then_some(whole);
+        // A stateful verify leaves its state for `commit`.
+        let peek = self.stateful && peek;
+        self.verified = peek.then_some(whole);
+        if peek {
+            sizes.push((PEEK, 1));
+        }
         let entry = self.entry(&head)?;
         // The last row fills out. Copies rewrite its kept row.
         let last = rows[rows.len() - 1];
@@ -861,10 +812,6 @@ impl Engine {
             Head::Full(masks) => (masks, None, None),
             Head::Sparse(ids, k) => (None, Some((ids, k)), None),
             Head::Edited(masks, packed, k) => (Some(masks), None, Some((packed, k))),
-            Head::Peek => {
-                sizes.push((PEEK, 1));
-                (None, None, None)
-            }
         };
         let mut feeds = Vec::new();
         for port in &self.graph.entries[entry].inputs {

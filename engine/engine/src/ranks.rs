@@ -289,7 +289,6 @@ fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32])
         Head::Full(Some(masks)) => (1, 0, masks, &[]),
         Head::Sparse(ids, k) => (2, *k, ids, &[]),
         Head::Edited(masks, edits, k) => (3, *k, masks, edits),
-        Head::Peek => (4, 0, &[], &[]),
     };
     let count = 8 + table.len() + rows.len() * 3 + picks.len() + list.len() + edits.len();
     let mut words = Writer(Vec::with_capacity(count * 4));
@@ -336,7 +335,6 @@ fn decode(bytes: &[u8]) -> Option<Told> {
         0 => Head::Full(None),
         1 => Head::Full(Some(list)),
         3 => Head::Edited(list, edits, k as usize),
-        4 => Head::Peek,
         _ => Head::Sparse(list, k as usize),
     };
     Some(Told {

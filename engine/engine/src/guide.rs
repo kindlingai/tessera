@@ -1,5 +1,6 @@
 //! Guides: per-answer rules on which tokens come next.
 
+use crate::Reason;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -173,6 +174,75 @@ pub trait Guide: Send {
     fn edits(&mut self) -> Vec<Edit> {
         Vec::new()
     }
+
+    /// A copy of this guide, if it can be copied.
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        None
+    }
+}
+
+/// One pick's allowed set and logit edits.
+pub(crate) type Rules = (Allowed, Vec<Edit>);
+
+/// Takes forced and single-choice tokens, then reads the next rules.
+pub(crate) fn settle(
+    guide: &mut dyn Guide,
+    mut take: impl FnMut(u32) -> Option<Reason>,
+) -> Result<Rules, Reason> {
+    loop {
+        let forced = guide.forced();
+        let done = guide.done();
+        let next = match done {
+            true => Allowed::Any,
+            false => guide.allowed().map_err(|_| Reason::Guide)?,
+        };
+        let one = match next {
+            Allowed::One(id) if guide.accept(id).is_err() => return Err(Reason::Guide),
+            Allowed::One(id) => Some(id),
+            _ => None,
+        };
+        let edits = match one.is_none() && !done {
+            // Host and device both see one edit per id.
+            true => merged(guide.edits()),
+            false => Vec::new(),
+        };
+        for id in forced.into_iter().chain(one) {
+            if let Some(reason) = take(id) {
+                return Err(reason);
+            }
+        }
+        if done {
+            return Err(Reason::Stop);
+        }
+        if one.is_none() {
+            return Ok((next, edits));
+        }
+    }
+}
+
+/// Each verify row's rules along `drafts`, read from a fork.
+pub(crate) fn walk(
+    guide: &dyn Guide,
+    first: Rules,
+    drafts: &[u32],
+    fits: impl Fn(&Rules) -> bool,
+) -> Vec<Rules> {
+    let mut rules = vec![first];
+    let open = drafts.first().is_some_and(|&d| rules[0].0.allows(d));
+    let Some(mut fork) = guide.fork().filter(|_| open) else {
+        return rules;
+    };
+    for &d in drafts {
+        if !rules[rules.len() - 1].0.allows(d) || fork.accept(d).is_err() {
+            break;
+        }
+        // Forced tokens, the end and unfit rules stop the walk.
+        match settle(&mut *fork, |_| Some(Reason::Stop)) {
+            Ok(next) if fits(&next) => rules.push(next),
+            _ => break,
+        }
+    }
+    rules
 }
 
 /// Several guides as one. Picks must suit every member.
@@ -251,6 +321,21 @@ impl Guide for Stacked {
     fn edits(&mut self) -> Vec<Edit> {
         merged(self.members.iter_mut().flat_map(|m| m.edits()).collect())
     }
+
+    /// Forks when every member forks and no fault waits.
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        if self.fault.is_some() {
+            return None;
+        }
+        let mut members = Vec::with_capacity(self.members.len());
+        for m in &self.members {
+            members.push(m.fork()?);
+        }
+        Some(Box::new(Stacked {
+            members,
+            fault: None,
+        }))
+    }
 }
 
 /// One edit per id, sorted: adds sum, reps multiply.
@@ -270,6 +355,7 @@ pub(crate) fn merged(mut all: Vec<Edit>) -> Vec<Edit> {
 }
 
 /// Fixed tokens first, then any.
+#[derive(Clone)]
 pub struct Prefix(pub Vec<u32>);
 
 impl Guide for Prefix {
@@ -283,6 +369,10 @@ impl Guide for Prefix {
 
     fn accept(&mut self, _: u32) -> Result<(), Fault> {
         Ok(())
+    }
+
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        Some(Box::new(self.clone()))
     }
 }
 
@@ -487,6 +577,7 @@ impl Tally {
 }
 
 /// A program and its tally, as a guide.
+#[derive(Clone)]
 pub struct Scoped {
     program: Program,
     tally: Tally,
@@ -512,5 +603,9 @@ impl Guide for Scoped {
 
     fn edits(&mut self) -> Vec<Edit> {
         self.program.edits(&self.tally)
+    }
+
+    fn fork(&self) -> Option<Box<dyn Guide>> {
+        Some(Box::new(self.clone()))
     }
 }
