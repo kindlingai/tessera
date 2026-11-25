@@ -209,3 +209,21 @@ fn glm53_recipes_parse_tags() {
         );
     }
 }
+
+#[test]
+fn parses_tagged_parameter_calls() {
+    let cfg = format!(
+        r#"{{"response_template": {}}}"#,
+        include_str!("qwen35.json")
+    );
+    let parser = ResponseParser::from_config(&cfg).unwrap().unwrap();
+    let raw = "Let me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nNew York\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=note>\nline one\nline two\n</parameter>\n</function>\n</tool_call><|im_end|>";
+    let parsed = parser.parse(raw, true, false);
+    assert_eq!(parsed.content, "Let me check.\n\n");
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].function.name, "get_weather");
+    assert_eq!(
+        parsed.tool_calls[0].function.arguments,
+        json!({"city": "New York", "days": 3, "note": "line one\nline two"})
+    );
+}

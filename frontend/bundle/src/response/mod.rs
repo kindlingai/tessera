@@ -308,6 +308,7 @@ impl ResponseParser {
             opening: false,
             calls: false,
             buf: String::new(),
+            lead: false,
         }
     }
 
@@ -356,6 +357,8 @@ pub struct ResponseStream<'a> {
     /// Inside an `outer` wrapper.
     calls: bool,
     buf: String,
+    /// Drops newlines that open the content after a thinking block.
+    lead: bool,
 }
 
 impl<'a> ResponseStream<'a> {
@@ -403,6 +406,14 @@ impl<'a> ResponseStream<'a> {
     }
 
     fn step_text(&mut self, out: &mut Vec<ResponseEvent>) -> bool {
+        if self.lead {
+            let kept = self.buf.trim_start_matches('\n').len();
+            self.buf.drain(..self.buf.len() - kept);
+            if self.buf.is_empty() {
+                return false;
+            }
+            self.lead = false;
+        }
         if let Some((at, skip, hit)) = self.find_hit() {
             if at > 0 {
                 out.push(ResponseEvent::Content(self.buf[..at].to_string()));
@@ -480,6 +491,7 @@ impl<'a> ResponseStream<'a> {
             }
             self.buf.drain(..at + len);
             self.mode = Mode::Text;
+            self.lead = true;
             return true;
         }
         let needles: Vec<&str> = spec.close.iter().map(String::as_str).collect();

@@ -1,0 +1,7 @@
+{
+  "fields": {
+    "content": {"close": "<|im_end|>", "content": "text"},
+    "thinking": {"open": "<think>\n", "close": ["\n</think>", "</think>"], "content": "text"},
+    "tool_calls": {"open": "<tool_call>\n", "close": "</tool_call>", "content": "json"}
+  }
+}

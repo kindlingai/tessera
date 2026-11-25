@@ -42,6 +42,7 @@ arch!(
     step: step,
     forward: forward,
     part: part,
+    response: include_str!("response/qwen35.json"),
 );
 
 /// The text model's logits graph, its forms and its files.
