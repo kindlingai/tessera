@@ -179,6 +179,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         stop: loaded.stop,
         guides,
         edits: true,
+        sampling: true,
     };
     let jobs = queue(load, generate, scores);
     let mut batch = Batch::new(&mut engine, Box::new(Fair));

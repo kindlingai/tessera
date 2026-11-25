@@ -22,6 +22,9 @@ pub struct Generate {
     /// Whether the engine applies guide edits. `false` refuses
     /// penalties.
     pub edits: bool,
+    /// Whether the engine samples. `false` refuses a temperature
+    /// above zero.
+    pub sampling: bool,
 }
 
 impl Tokens for Generate {
@@ -98,6 +101,10 @@ impl Generator for Queued {
         if !params.penalties.neutral() && !self.generate.edits {
             let why = "this model was loaded without logit edits";
             return Err(Box::new(Refused(why.into(), "presence_penalty")));
+        }
+        if !params.sampling.greedy() && !self.generate.sampling {
+            let why = "this model was loaded for greedy decoding only";
+            return Err(Box::new(Refused(why.into(), "temperature")));
         }
         guides.extend(params.penalties.guide(&prompt));
         let request = Request {
