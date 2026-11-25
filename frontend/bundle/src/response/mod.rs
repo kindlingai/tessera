@@ -422,11 +422,10 @@ impl<'a> ResponseStream<'a> {
         };
         let block = self.buf[..at].to_string();
         let raw_end = at + len;
-        let event = match parse_tool(spec, &block) {
-            Some(call) => ResponseEvent::ToolCall(call),
-            None => ResponseEvent::Content(self.buf[..raw_end].to_string()),
-        };
-        out.push(event);
+        match parse_tool(spec, &block) {
+            Some(calls) => out.extend(calls.into_iter().map(ResponseEvent::ToolCall)),
+            None => out.push(ResponseEvent::Content(self.buf[..raw_end].to_string())),
+        }
         self.buf.drain(..raw_end);
         self.mode = Mode::Text;
         true
@@ -528,7 +527,8 @@ fn literal_prefix(pattern: &str) -> String {
     out
 }
 
-fn parse_tool(spec: &BlockSpec, block: &str) -> Option<ToolCall> {
+/// Calls in one block, one per JSON list item.
+fn parse_tool(spec: &BlockSpec, block: &str) -> Option<Vec<ToolCall>> {
     let (captures, rest) = spec.open.strip(block)?;
     let parsed = match spec.json {
         true => parse_json(rest.trim(), &spec.args)?,
@@ -538,7 +538,10 @@ fn parse_tool(spec: &BlockSpec, block: &str) -> Option<ToolCall> {
         Some(tmpl) => apply_transform(tmpl, &captures, &parsed),
         None => parsed,
     };
-    to_call(shaped)
+    match shaped {
+        Value::Array(items) => items.into_iter().map(to_call).collect(),
+        one => to_call(one).map(|call| vec![call]),
+    }
 }
 
 fn apply_transform(tmpl: &Value, captures: &BTreeMap<String, String>, content: &Value) -> Value {
