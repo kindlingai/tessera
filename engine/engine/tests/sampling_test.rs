@@ -1,8 +1,8 @@
 //! Sampling, guides and logit edits.
 
 use tessera_engine::{
-    Allowed, Batch, Edit, Engine, Event, Fair, Fault, Guide, Move, Penalties, Prefix, Program,
-    Recipe, Request, Sampling, Scoped, Stacked, Steps, Tally, Term,
+    Allowed, Batch, DEPTH, Edit, Engine, Event, Fair, Fault, Guide, Move, Penalties, Prefix,
+    Program, Recipe, Request, Runs, Sampling, Scoped, Stacked, Steps, Tally, Term,
 };
 use tessera_lower::{Settings, Weight};
 use tessera_models::decoder::{Config, Swiglu, stepper};
@@ -288,6 +288,62 @@ fn ramp_is_bounded() {
     // The pick of token `start + 1` gets the first raise.
     let want = [None, Some(0.5), Some(1.0), Some(1.0), Some(1.0), None];
     assert_eq!(adds, want);
+}
+
+#[test]
+fn runs_find_copies() {
+    let runs = Runs::new(&[1, 2, 3, 9, 0, 1, 2, 3, 7, 0, 1, 2, 3]);
+    assert_eq!(runs.next(1), [(7, 4), (9, 3)]);
+    // One id many times holds `DEPTH` runs, the newest longest.
+    let mut runs = Runs::default();
+    (0..3000).for_each(|_| runs.push(4));
+    assert_eq!((runs.ends().len(), runs.next(1)), (DEPTH, vec![(4, 2999)]));
+}
+
+#[test]
+fn runs_fork() {
+    let mut noise = Noise(5);
+    let prompt: Vec<u32> = (0..2000)
+        .map(|_| (noise.draw() * 4.0 + 4.0) as u32)
+        .collect();
+    let mut runs = Runs::new(&prompt);
+    let mut fork = runs.clone();
+    let more = [1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3];
+    for &id in &more {
+        fork.push(id);
+    }
+    for &id in &more {
+        runs.push(id);
+    }
+    let whole = Runs::new(&[&prompt[..], &more].concat());
+    assert_eq!((runs.ends(), runs.next(1)), (fork.ends(), fork.next(1)));
+    assert_eq!(runs.next(1), whole.next(1));
+}
+
+#[test]
+fn sequence_edits() {
+    let program = Program {
+        moves: Vec::new(),
+        terms: vec![Term::Sequence {
+            mult: vec![1.0],
+            base: vec![2.0],
+            min: vec![3],
+            cap: vec![5.0],
+        }],
+    };
+    let mut g = Scoped::new(program, &[8, 1, 2, 3, 4, 1, 2, 3], 0);
+    let mut adds = vec![g.edits()];
+    for id in [4, 1, 2] {
+        g.accept(id).unwrap();
+        adds.push(g.edits());
+    }
+    let want = [
+        add(4, -1.0, 1.0),
+        add(1, -2.0, 1.0),
+        add(2, -4.0, 1.0),
+        add(3, -5.0, 1.0),
+    ];
+    assert_eq!(adds, want.map(|e| vec![e]));
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::api::Params;
-use crate::scopes::{Boost, Thinking, guide};
+use crate::scopes::{Boost, Curve, Sequence, Thinking, guide};
 use tessera_bundle::ResponseParser;
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_engine::{Edit, Penalties};
@@ -20,6 +20,44 @@ fn boost_specs() {
         "x=1",
     ] {
         assert!(Boost::parse(spec).is_err(), "{spec}");
+    }
+}
+
+#[test]
+fn sequence_specs() {
+    let s = Sequence::parse("thinking=1:1.5:8:10, answer = 0:2:4:5").unwrap();
+    let curve = Curve {
+        mult: 1.0,
+        base: 1.5,
+        min: 8,
+        cap: 10.0,
+    };
+    assert_eq!((s.thinking, s.answer), (Some(curve), None));
+    let thinking = Sequence {
+        thinking: Some(curve),
+        ..Sequence::default()
+    };
+    let refused = guide(
+        None,
+        &Hf::from_json(br#"{"model": {"type": "WordLevel", "unk_token": "a", "vocab": {"a": 0}}}"#)
+            .unwrap(),
+        &Params {
+            sequence: thinking,
+            ..Params::default()
+        },
+        &[],
+    );
+    assert_eq!(refused.err().unwrap().1, "sequence_penalty");
+    for spec in [
+        "guard=1:1:1:1",
+        "answer=1:1:1",
+        "answer=1:0.5:1:1",
+        "answer=1:1:0:1",
+        "answer=1:1:1:101",
+        "answer=1:1:1:1,answer=1:1:1:1",
+        "tool=1:1:1:1",
+    ] {
+        assert!(Sequence::parse(spec).is_err(), "{spec}");
     }
 }
 

@@ -5,7 +5,7 @@ mod common;
 use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
 use tessera_engine::{
     Allowed, BatchMtp, Drafter, Event, Fault, Guide, MtpDrafter, MtpSpeculate, Penalties, Place,
-    Prefix, Reason, Recipe, Request, SpecStats, Stacked, Steps,
+    Prefix, Program, Reason, Recipe, Request, Scoped, SpecStats, Stacked, Steps, Term,
 };
 use tessera_graph::DimName::{Context, Hidden, Rows, Segments, Seqs, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
@@ -599,6 +599,7 @@ fn guided_mtp_matches() {
             Stacked::of(vec![
                 Box::new(Prefix(vec![5, 0])),
                 penalties_guide(p).unwrap(),
+                Box::new(Scoped::new(sequence(), p, 0)),
             ])
         },
         |_| Some(Box::new(Unforked(Thirds(0)))),
@@ -645,6 +646,20 @@ fn guided_mtp_matches() {
                 }
             }
         }
+    }
+}
+
+/// A sequence penalty from runs of one id.
+fn sequence() -> Program {
+    let terms = vec![Term::Sequence {
+        mult: vec![2.0],
+        base: vec![2.0],
+        min: vec![1],
+        cap: vec![8.0],
+    }];
+    Program {
+        moves: Vec::new(),
+        terms,
     }
 }
 

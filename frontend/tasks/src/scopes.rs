@@ -118,6 +118,80 @@ impl Thinking {
     }
 }
 
+/// Penalty by run length: `mult:base:min:cap`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Curve {
+    pub mult: f32,
+    pub base: f32,
+    pub min: u32,
+    pub cap: f32,
+}
+
+/// Sequence penalties in the answer and thinking scopes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sequence {
+    pub answer: Option<Curve>,
+    pub thinking: Option<Curve>,
+}
+
+impl Sequence {
+    /// `thinking=M:B:N:C,answer=M:B:N:C`. A scope with 0 `mult` or `cap` is off.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut out = Sequence::default();
+        let mut given = [false; 2];
+        for part in s.split(',') {
+            let (key, value) = part
+                .split_once('=')
+                .ok_or_else(|| format!("{part:?}: want scope=mult:base:min:cap"))?;
+            let (slot, done) = match key.trim() {
+                "answer" => (&mut out.answer, &mut given[0]),
+                "thinking" => (&mut out.thinking, &mut given[1]),
+                "guard" => return Err("this build has no tool-repeat guard".into()),
+                key => return Err(format!("{key:?}: want answer or thinking")),
+            };
+            if std::mem::replace(done, true) {
+                return Err(format!("{} is given twice", key.trim()));
+            }
+            *slot = Curve::parse(value.trim()).map_err(|e| format!("{}={e}", key.trim()))?;
+        }
+        Ok(out)
+    }
+
+    /// The request key, if any scope is on.
+    pub fn key(&self) -> Option<&'static str> {
+        let on = self.answer.is_some() || self.thinking.is_some();
+        on.then_some("sequence_penalty")
+    }
+}
+
+impl Curve {
+    /// `mult:base:min:cap`. None when `mult` or `cap` is 0.
+    fn parse(s: &str) -> Result<Option<Self>, String> {
+        let want = || {
+            format!("{s:?}: want mult:base:min:cap, mult 0-100, base 1-10, min 1-4096, cap 0-100")
+        };
+        let parts: Vec<&str> = s.split(':').map(str::trim).collect();
+        let [mult, base, min, cap] = parts[..] else {
+            return Err(want());
+        };
+        let num = |v: &str, lo: f32, hi: f32| match v.parse::<f32>() {
+            Ok(v) if (lo..=hi).contains(&v) => Ok(v),
+            _ => Err(want()),
+        };
+        let min = match min.parse::<u32>() {
+            Ok(n) if (1..=4096).contains(&n) => n,
+            _ => return Err(want()),
+        };
+        let curve = Curve {
+            mult: num(mult, 0.0, 100.0)?,
+            base: num(base, 1.0, 10.0)?,
+            min,
+            cap: num(cap, 0.0, 100.0)?,
+        };
+        Ok((curve.mult > 0.0 && curve.cap > 0.0).then_some(curve))
+    }
+}
+
 /// The ids of markers short enough to match.
 type Marks = Markers<Option<Vec<u32>>>;
 
@@ -153,7 +227,9 @@ pub fn guide(
     prompt: &[u32],
 ) -> Result<Box<dyn Guide>, Refused> {
     let marks = parser.map_or_else(Marks::default, |p| marks(p, tokenizer));
-    if let Some(key) = params.thinking.key()
+    let thinking = params.thinking.key();
+    let thinking = thinking.or(params.sequence.thinking.and(params.sequence.key()));
+    if let Some(key) = thinking
         && marks.think_close.is_none()
     {
         let why =
@@ -164,8 +240,29 @@ pub fn guide(
         true => THINKING,
         false => ANSWER,
     };
-    let program = program(params.penalties, params.thinking, marks, params.max_tokens);
+    let mut program = program(params.penalties, params.thinking, marks, params.max_tokens);
+    if params.sequence.key().is_some() {
+        program.terms.push(sequence(params.sequence));
+    }
     Ok(Box::new(Scoped::new(program, prompt, start)))
+}
+
+/// The sequence term. The tool-call scope is always off.
+fn sequence(s: Sequence) -> Term {
+    let off = Curve {
+        mult: 0.0,
+        base: 1.0,
+        min: 1,
+        cap: 0.0,
+    };
+    let rows = [s.answer, s.thinking].map(|c| c.unwrap_or(off));
+    let rows = [rows[0], rows[1], off];
+    Term::Sequence {
+        mult: rows.iter().map(|c| c.mult).collect(),
+        base: rows.iter().map(|c| c.base).collect(),
+        min: rows.iter().map(|c| c.min).collect(),
+        cap: rows.iter().map(|c| c.cap).collect(),
+    }
 }
 
 /// The program for one answer of up to `max_tokens`.

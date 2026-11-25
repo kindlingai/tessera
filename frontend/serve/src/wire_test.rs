@@ -91,14 +91,19 @@ fn thinking_keys() {
     let mock = Arc::new(MockGenerator::default());
     let slot = loaded(&mock, true);
     let body = json!({"prompt": "a", "thinking_presence_penalty": 0.25,
-        "thinking_frequency_penalty": 0.5, "think_end_boost": "start=8|0.5x,per1k=2,max=10"});
+        "thinking_frequency_penalty": 0.5, "think_end_boost": "start=8|0.5x,per1k=2,max=10",
+        "sequence_penalty": "answer=1:1.5:8:10"});
     assert_eq!(json(&slot, "/v1/completions", Some(body)).0, 200);
-    let thinking = mock.asked.lock().unwrap().clone().unwrap().thinking;
+    let asked = mock.asked.lock().unwrap().clone().unwrap();
+    let thinking = asked.thinking;
     assert!(thinking.frequency == 0.5 && thinking.boost.is_some());
+    assert!(asked.sequence.answer.is_some());
     let bad = [
         ("thinking_frequency_penalty", json!(-2.5)),
         ("think_end_boost", json!(true)),
         ("think_end_boost", json!("start=1,per1k=1,max=101")),
+        ("sequence_penalty", json!(true)),
+        ("sequence_penalty", json!("guard=1:1.5:8:10")),
     ];
     for (key, value) in bad {
         let (status, error) = json(

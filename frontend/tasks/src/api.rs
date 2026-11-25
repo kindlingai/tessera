@@ -1,7 +1,7 @@
 //! Calls an HTTP front end makes on a loaded model.
 
 use crate::Error;
-use crate::scopes::Thinking;
+use crate::scopes::{Sequence, Thinking};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{Message, RenderOptions, ResponseParser};
@@ -67,6 +67,8 @@ pub struct Params {
     pub penalties: Penalties,
     /// Changes inside a think block. Default is none.
     pub thinking: Thinking,
+    /// Penalties for copies of earlier runs. Default is none.
+    pub sequence: Sequence,
     /// Whether the prompt leaves a think block open.
     pub starts_thinking: bool,
 }

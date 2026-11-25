@@ -3,6 +3,7 @@
 use crate::Reason;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub type Fault = Box<dyn std::error::Error + Send + Sync>;
 
@@ -456,6 +457,14 @@ pub enum Term {
     },
     /// Each id in the prompt or answer: `rep = repetition`.
     Repeat { repetition: Vec<f32> },
+    /// Ids extending `n`-id runs: `add = -min(cap, mult * base^(n - min))`.
+    Sequence {
+        mult: Vec<f32>,
+        base: Vec<f32>,
+        /// The shortest run penalized.
+        min: Vec<u32>,
+        cap: Vec<f32>,
+    },
 }
 
 /// Scope moves and terms, as plain data scripts can build.
@@ -466,7 +475,7 @@ pub struct Program {
 }
 
 /// Row value for `scope`. Missing values are `none`.
-fn at(row: &[f32], scope: u8, none: f32) -> f32 {
+fn at<T: Copy>(row: &[T], scope: u8, none: T) -> T {
     row.get(scope as usize).copied().unwrap_or(none)
 }
 
@@ -474,6 +483,26 @@ impl Program {
     /// Whether any term reads the prompt ids.
     fn repeats(&self) -> bool {
         let reads = |t: &Term| matches!(t, Term::Repeat { repetition } if repetition.iter().any(|&r| r != 1.0));
+        self.terms.iter().any(reads)
+    }
+
+    /// Whether a count or repeat term changes `scope`.
+    fn counts(&self, scope: u8) -> bool {
+        let on = |t: &Term| match t {
+            Term::Count {
+                presence,
+                frequency,
+            } => at(presence, scope, 0.0) != 0.0 || at(frequency, scope, 0.0) != 0.0,
+            Term::Repeat { repetition } => at(repetition, scope, 1.0) != 1.0,
+            _ => false,
+        };
+        self.terms.iter().any(on)
+    }
+
+    /// Whether any scope has a sequence term on.
+    fn copies(&self) -> bool {
+        let on = |m: &[f32], c: &[f32]| m.iter().zip(c).any(|(&m, &c)| m != 0.0 && c != 0.0);
+        let reads = |t: &Term| matches!(t, Term::Sequence { mult, cap, .. } if on(mult, cap));
         self.terms.iter().any(reads)
     }
 
@@ -485,8 +514,9 @@ impl Program {
     /// Non-neutral edits for the next pick.
     pub fn edits(&self, tally: &Tally) -> Vec<Edit> {
         let scope = tally.scope;
-        let mut out = Vec::with_capacity(tally.seen.len());
-        for &id in &tally.seen {
+        let seen: &[u32] = if self.counts(scope) { &tally.seen } else { &[] };
+        let mut out = Vec::with_capacity(seen.len());
+        for &id in seen {
             let uses = tally.counts[&id];
             let mut e = Edit {
                 id,
@@ -526,13 +556,44 @@ impl Program {
             if on != scope || n <= start {
                 continue;
             }
-            let add = max.min(slope * (n - start) as f32);
-            match out.iter_mut().find(|e| e.id == id) {
-                Some(e) => e.add += add,
-                None => out.push(Edit { id, add, rep: 1.0 }),
-            }
+            bump(&mut out, id, max.min(slope * (n - start) as f32));
+        }
+        if let Some(runs) = &tally.runs {
+            self.sequences(runs, scope, &mut out);
         }
         out
+    }
+
+    /// Edits for ids that extend a run.
+    fn sequences(&self, runs: &Runs, scope: u8, out: &mut Vec<Edit>) {
+        for term in &self.terms {
+            let Term::Sequence {
+                mult,
+                base,
+                min,
+                cap,
+            } = term
+            else {
+                continue;
+            };
+            let (mult, cap) = (at(mult, scope, 0.0), at(cap, scope, 0.0));
+            if mult == 0.0 || cap == 0.0 {
+                continue;
+            }
+            let (base, min) = (at(base, scope, 1.0), at(min, scope, 1));
+            for (id, n) in runs.next(min) {
+                let grow = base.powi((n - min).min(i32::MAX as u32) as i32);
+                bump(out, id, -cap.min(mult * grow));
+            }
+        }
+    }
+}
+
+/// Adds `add` to the edit for `id`.
+fn bump(out: &mut Vec<Edit>, id: u32, add: f32) {
+    match out.iter_mut().find(|e| e.id == id) {
+        Some(e) => e.add += add,
+        None => out.push(Edit { id, add, rep: 1.0 }),
     }
 }
 
@@ -549,6 +610,8 @@ pub struct Tally {
     /// The last answer ids, as many as the longest move.
     recent: Vec<u32>,
     reach: usize,
+    /// Prompt and answer runs, when a sequence term is on.
+    runs: Option<Runs>,
 }
 
 impl Tally {
@@ -557,6 +620,7 @@ impl Tally {
         let mut tally = Tally {
             scope,
             reach: program.reach(),
+            runs: program.copies().then(|| Runs::new(prompt)),
             ..Tally::default()
         };
         if program.repeats() {
@@ -580,6 +644,9 @@ impl Tally {
     pub fn step(&mut self, program: &Program, id: u32) {
         *self.see(id) += 1;
         self.since += 1;
+        if let Some(runs) = &mut self.runs {
+            runs.push(id);
+        }
         self.recent.push(id);
         if self.recent.len() > self.reach {
             self.recent.remove(0);
@@ -630,5 +697,145 @@ impl Guide for Scoped {
 
     fn fork(&self) -> Option<Box<dyn Guide>> {
         Some(Box::new(self.clone()))
+    }
+}
+
+/// Context ids, with links to each id's earlier position.
+#[derive(Clone, Debug, Default)]
+struct Log {
+    ids: Vec<u32>,
+    /// The previous position of the same id, or `u32::MAX`.
+    prev: Vec<u32>,
+    /// Each id's newest position.
+    last: HashMap<u32, u32>,
+}
+
+/// The newest positions of an id that `Runs` tracks.
+pub const DEPTH: usize = 128;
+/// Tail length that moves into the shared part.
+const TAIL: usize = 512;
+/// Prompt ids at the end that `Runs::new` tracks.
+const TRACK: usize = 1024;
+
+/// Earlier runs equal to the current suffix, sharing old ids.
+#[derive(Clone, Debug, Default)]
+pub struct Runs {
+    base: Arc<Log>,
+    /// Newer positions. Its `last` holds only ids seen here.
+    tail: Log,
+    /// Newest first: `(end, length)` of each earlier run.
+    ends: Vec<(u32, u32)>,
+}
+
+impl Runs {
+    /// Runs over `prompt`. Matches start `TRACK` ids from its end.
+    pub fn new(prompt: &[u32]) -> Self {
+        let mut runs = Runs::default();
+        let split = prompt.len().saturating_sub(TRACK);
+        for &id in &prompt[..split] {
+            runs.log(id);
+        }
+        for &id in &prompt[split..] {
+            runs.push(id);
+        }
+        runs
+    }
+
+    /// The context length.
+    pub fn len(&self) -> usize {
+        self.base.ids.len() + self.tail.ids.len()
+    }
+
+    /// Whether the context is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The id at position `at`.
+    pub fn at(&self, at: u32) -> u32 {
+        self.read(at, |log| &log.ids)
+    }
+
+    fn read(&self, at: u32, field: impl Fn(&Log) -> &Vec<u32>) -> u32 {
+        let split = self.base.ids.len();
+        match (at as usize).checked_sub(split) {
+            None => field(&self.base)[at as usize],
+            Some(i) => field(&self.tail)[i],
+        }
+    }
+
+    fn newest(&self, id: u32) -> Option<u32> {
+        let last = self.tail.last.get(&id).or_else(|| self.base.last.get(&id));
+        last.copied()
+    }
+
+    /// Adds `id` to the log only.
+    fn log(&mut self, id: u32) {
+        let at = self.len() as u32;
+        let prev = self.newest(id).unwrap_or(u32::MAX);
+        self.tail.ids.push(id);
+        self.tail.prev.push(prev);
+        self.tail.last.insert(id, at);
+        // Waits while a fork holds the base, unless long.
+        let unshared = Arc::get_mut(&mut self.base).is_some();
+        let n = self.tail.ids.len();
+        if n >= TAIL && (unshared || n >= 8 * TAIL) {
+            let base = Arc::make_mut(&mut self.base);
+            base.ids.append(&mut self.tail.ids);
+            base.prev.append(&mut self.tail.prev);
+            base.last.extend(self.tail.last.drain());
+        }
+    }
+
+    /// Adds an id. Extended runs stay, new ones fill `DEPTH`.
+    pub fn push(&mut self, id: u32) {
+        let mut grown = Vec::with_capacity(self.ends.len());
+        for &(end, n) in &self.ends {
+            if self.at(end + 1) == id {
+                grown.push((end + 1, n + 1));
+            }
+        }
+        let mut ends = Vec::with_capacity(DEPTH);
+        let (mut g, mut free) = (0, DEPTH - grown.len());
+        let mut at = self.newest(id);
+        for _ in 0..DEPTH {
+            let Some(p) = at.filter(|_| free > 0 || g < grown.len()) else {
+                break;
+            };
+            while g < grown.len() && grown[g].0 > p {
+                ends.push(grown[g]);
+                g += 1;
+            }
+            if g < grown.len() && grown[g].0 == p {
+                ends.push(grown[g]);
+                g += 1;
+            } else if free > 0 {
+                ends.push((p, 1));
+                free -= 1;
+            }
+            let prev = self.read(p, |log| &log.prev);
+            at = (prev != u32::MAX).then_some(prev);
+        }
+        ends.extend_from_slice(&grown[g..]);
+        self.ends = ends;
+        self.log(id);
+    }
+
+    /// Newest first `(end, length)`. The next id copies `at(end + 1)`.
+    pub fn ends(&self) -> &[(u32, u32)] {
+        &self.ends
+    }
+
+    /// Next ids extending runs of `min` or more, longest each.
+    pub fn next(&self, min: u32) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for &(end, n) in self.ends.iter().filter(|e| e.1 >= min) {
+            let id = self.at(end + 1);
+            match out.iter_mut().find(|c| c.0 == id) {
+                Some(c) => c.1 = c.1.max(n),
+                None => out.push((id, n)),
+            }
+        }
+        out
     }
 }

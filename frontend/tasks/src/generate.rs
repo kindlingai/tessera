@@ -96,7 +96,7 @@ impl Generator for Queued {
     fn generate(&self, prompt: Vec<u32>, params: Params, mut sink: Sink) -> Result<(), Error> {
         let mut guides = Vec::new();
         let key = match params.penalties.neutral() {
-            true => params.thinking.key(),
+            true => params.thinking.key().or(params.sequence.key()),
             false => Some("presence_penalty"),
         };
         let made = match &self.generate.steer {

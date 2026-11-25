@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_bundle::{FunctionCall, Message, ToolCall};
 use tessera_engine::{Penalties, Sampling};
 use tessera_tasks::api::Format;
-use tessera_tasks::scopes::{Boost, Thinking};
+use tessera_tasks::scopes::{Boost, Sequence, Thinking};
 
 /// Why a request was refused, in OpenAI's error format.
 #[derive(Debug)]
@@ -227,6 +227,7 @@ pub(crate) struct Common {
     pub(crate) thinking_presence_penalty: Option<f32>,
     pub(crate) thinking_frequency_penalty: Option<f32>,
     pub(crate) think_end_boost: Option<Switch>,
+    pub(crate) sequence_penalty: Option<Switch>,
 }
 
 /// A spec string, or `false` for off.
@@ -304,6 +305,21 @@ impl Common {
             )?,
             boost,
         })
+    }
+    /// Validated penalties for copies of earlier runs.
+    pub(crate) fn sequence(&self) -> Result<Sequence, Refusal> {
+        const KEY: &str = "sequence_penalty";
+        match &self.sequence_penalty {
+            None | Some(Switch::Flag(false)) => Ok(Sequence::default()),
+            Some(Switch::Spec(s)) if s.trim() == "off" => Ok(Sequence::default()),
+            Some(Switch::Spec(s)) => {
+                Sequence::parse(s).map_err(|e| bad(format!("{KEY}: {e}"), KEY))
+            }
+            Some(Switch::Flag(true)) => {
+                let why = r#"sequence_penalty must be a string like "thinking=1:1.5:8:10,answer=1:1.5:8:10", "off" or false"#;
+                Err(bad(why, KEY))
+            }
+        }
     }
 
     fn nested(&self) -> Vec<String> {
