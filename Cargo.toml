@@ -84,6 +84,14 @@ opt-level = 3
 [profile.dev.package.tessera-interp]
 opt-level = 3
 
+# Weight loads decode trellis codes and zero host buffers in this crate.
+[profile.dev.package.tessera-mem]
+opt-level = 3
+
+# Weight loads widen and narrow every small float through this crate.
+[profile.dev.package.tessera-graph]
+opt-level = 3
+
 # Host JIT compilation and helpers run inside every CPU test.
 [profile.dev.package.tessera-jit]
 opt-level = 3
