@@ -74,6 +74,8 @@ fn linear_mm_entries() {
         "tessera_mm_bf16(",
         "tessera_mm_bf16_ks2(",
         "tessera_mm_mxfp8_r8(",
+        "tessera_mm_mxfp8_r8_sk(",
+        "tessera_mm_reduce(",
         "tessera_mm_mxfp8_r16(",
         "tessera_mm_mxfp8_r32(",
         "DTR_DEF(dtr_k4_t4,",
@@ -95,9 +97,13 @@ fn fast_mm_selection() {
         mm_entry(&linear(&rows, 12288, 4096), 16, "bf16"),
         Some(("fast_mm_bf16", "tessera_mm_bf16_ks2", 2))
     );
-    // MXFP8 picks r8 for <= 8, r16 <= 16, r32 above.
+    // Narrow MXFP8 r8 uses split-K, wide N stays single-pass.
     assert_eq!(
         mm_entry(&linear(&rows, 6144, 576), 8, "mxfp8"),
+        Some(("fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r8_sk", 2))
+    );
+    assert_eq!(
+        mm_entry(&linear(&rows, 6144, 2048), 8, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r8", 2))
     );
     assert_eq!(

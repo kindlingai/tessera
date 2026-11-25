@@ -481,18 +481,24 @@ union alignas(16) fg_mx_smem {
     float red[4][32][17];
 };
 
-template <u32 NT>
+template <u32 NT, bool SPLIT>
 static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, const float* other,
                                                    float* out, u32 m, u32 n, u32 k, u32 mode,
-                                                   fg_mx_smem& sm) {
+                                                   u32 ks, fg_mx_smem& sm) {
     u32 warp = threadIdx.x >> 5;
     u32 lane = threadIdx.x & 31u;
     u32 g = lane >> 2;
     u32 t = lane & 3u;
     u32 r0 = blockIdx.y * (NT << 3);
-    u32 n0 = blockIdx.x << 4;
+    u32 nb = n >> 4;
+    u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x;
+    u32 p = SPLIT ? (blockIdx.x / nb) : 0u;
+    u32 n0 = ob << 4;
     u64 row_bytes = u64(k >> 5) * 33ull;
     u32 chunks = k >> 9;
+    u32 ch_per = SPLIT ? (chunks / ks) : chunks;
+    u32 ch0 = SPLIT ? (p * ch_per) : 0u;
+    u32 ch1 = ch0 + ch_per;
     u32 w_base = warp << 7;
     u32 shift = warp << 2;
     u32 x_off = warp << 7;
@@ -512,17 +518,18 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
         acc[ti][2] = 0.0f;
         acc[ti][3] = 0.0f;
     }
-    uint4 cur0 = fg_ld_nc4(wp0);
-    uint4 cur1 = fg_ld_nc4(wp1);
-    uint4 cur2 = fg_ld_nc4(wp2);
-    uint4 cur3 = fg_ld_nc4(wp3);
+    u64 off0 = u64(ch0) * 528ull;
+    uint4 cur0 = fg_ld_nc4(wp0 + off0);
+    uint4 cur1 = fg_ld_nc4(wp1 + off0);
+    uint4 cur2 = fg_ld_nc4(wp2 + off0);
+    uint4 cur3 = fg_ld_nc4(wp3 + off0);
     uint4 cur4;
-    if (lane < 16u) cur4 = fg_ld_nc4(wp4);
+    if (lane < 16u) cur4 = fg_ld_nc4(wp4 + off0);
     const u32* sw0 = sm.sw[warp][g];
     const u32* sw1 = sm.sw[warp][g + 8u];
     const u8* sb0 = reinterpret_cast<const u8*>(sw0);
     const u8* sb1 = reinterpret_cast<const u8*>(sw1);
-    for (u32 ch = 0u; ch < chunks; ch++) {
+    for (u32 ch = ch0; ch < ch1; ch++) {
         __syncwarp();
         *reinterpret_cast<uint4*>(&sm.sw[warp][lr][lc >> 2]) = cur0;
         *reinterpret_cast<uint4*>(&sm.sw[warp][lr + 4u][lc >> 2]) = cur1;
@@ -530,7 +537,7 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
         *reinterpret_cast<uint4*>(&sm.sw[warp][lr + 12u][lc >> 2]) = cur3;
         if (lane < 16u) *reinterpret_cast<uint4*>(&sm.sw[warp][lane][32u]) = cur4;
         __syncwarp();
-        if (ch + 1u < chunks) {
+        if (ch + 1u < ch1) {
             u64 next_off = u64(ch + 1u) * 528ull;
             cur0 = fg_ld_nc4(wp0 + next_off);
             cur1 = fg_ld_nc4(wp1 + next_off);
@@ -611,8 +618,12 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
         if (r0 + tr < m) {
             float v = sm.red[0][tr][col] + sm.red[1][tr][col] + sm.red[2][tr][col] +
                       sm.red[3][tr][col];
-            u64 off = u64(r0 + tr) * n + n0 + col;
-            out[off] = fg_epilogue(v, other, off, n0 + col, mode);
+            if constexpr (SPLIT) {
+                out[(u64(p) * m + (r0 + tr)) * n + n0 + col] = v;
+            } else {
+                u64 off = u64(r0 + tr) * n + n0 + col;
+                out[off] = fg_epilogue(v, other, off, n0 + col, mode);
+            }
         }
     }
 }
@@ -621,14 +632,35 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
-    fg_mxfp8_mm<1u>(x, w, other, out, m, n, k, mode, sm);
+    fg_mxfp8_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
+}
+
+// Split-K MXFP8 Tensor-Core matmul, up to 8 rows per block.
+extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_mxfp8_r8_sk(
+    const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    u32 ks) {
+    __shared__ fg_mx_smem sm;
+    fg_mxfp8_mm<1u, true>(x, w, other, out, m, n, k, mode, ks, sm);
+}
+
+// Sums split-K partials in order and applies matmul epilogue.
+extern "C" __global__ __launch_bounds__(256, 4) void tessera_mm_reduce(
+    const float* part, const float* other, float* out, u32 m, u32 n, u32 ks, u32 mode) {
+    u32 idx = blockIdx.x * 256u + threadIdx.x;
+    u32 mn = m * n;
+    if (idx >= mn) return;
+    float v = 0.0f;
+    for (u32 p = 0u; p < ks; p++) {
+        v += part[u64(p) * mn + idx];
+    }
+    out[idx] = fg_epilogue(v, other, u64(idx), idx % n, mode);
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
 extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
-    fg_mxfp8_mm<2u>(x, w, other, out, m, n, k, mode, sm);
+    fg_mxfp8_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, float b) {
@@ -641,7 +673,7 @@ static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, 
 extern "C" __global__ __launch_bounds__(128, 2) void tessera_mm_mxfp8_r32(
     const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
-    fg_mxfp8_mm<4u>(x, w, other, out, m, n, k, mode, sm);
+    fg_mxfp8_mm<4u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
