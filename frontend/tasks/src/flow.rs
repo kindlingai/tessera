@@ -5,6 +5,7 @@ use std::path::Path;
 use tessera_bundle::Overrides;
 use tessera_bundle::flux2::transformer;
 use tessera_engine::flux2::{AXES, LATENT, TIME};
+use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::{Model, Recipe, Settings, Tensor};
 
 pub struct Flow {
@@ -44,14 +45,16 @@ impl Flow {
         settings: &Settings,
         [seqs, text, rows]: [usize; 3],
         config: &Overrides,
+        progress: &Progress,
     ) -> Result<Self, Error> {
+        let reading = progress.step("read model", Unit::Items, None);
         let t = transformer(dir, [seqs as u64, text as u64, rows as u64], config)?;
+        reading.finish();
         let recipe = Recipe {
             pins: t.pins,
             ..Recipe::default()
         };
-        let mut model = Model::open(t.graph, &recipe, settings)?;
-        model.load(&t.weights)?;
+        let model = Model::open_loaded(t.graph, &recipe, settings, &t.weights, progress)?;
         Ok(Self { model, text })
     }
 

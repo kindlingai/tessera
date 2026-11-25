@@ -13,6 +13,7 @@ use tessera_bundle::Overrides;
 use tessera_bundle::tokenize::hf::Hf;
 use tessera_bundle::vae;
 use tessera_engine::Settings;
+use tessera_engine::progress::{Progress, Unit};
 
 /// Channels per latent token.
 const LATENT: usize = tessera_engine::flux2::LATENT as usize;
@@ -99,20 +100,26 @@ impl Klein {
         settings: Settings,
         largest: usize,
         config: Overrides,
+        progress: &Progress,
     ) -> Result<Self, Error> {
         let patch = vae::config(&dir, [1, 1], &config)?.scale() as usize;
         let largest = largest / patch;
         let pipeline = Pipeline::read(&config)?;
         let words = [dir.join("text_encoder"), dir.join("tokenizer")];
+        let encoding = progress.step("text encoder", Unit::Items, None);
         let features = Features::open(
             words.each_ref().map(|d| d.as_path()),
             &settings,
             &pipeline.layers,
             [1, pipeline.rows],
             &config.under("text_encoder"),
+            &encoding.progress(),
         )?;
+        encoding.finish();
         let sizes = [1, pipeline.rows, largest * largest];
-        let flow = Flow::open(&dir, &settings, sizes, &config)?;
+        let flowing = progress.step("transformer", Unit::Items, None);
+        let flow = Flow::open(&dir, &settings, sizes, &config, &flowing.progress())?;
+        flowing.finish();
         Ok(Self {
             dir,
             settings,
@@ -165,9 +172,10 @@ impl Worker<Klein> {
         settings: Settings,
         largest: usize,
         config: Overrides,
+        progress: Progress,
     ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let klein = Klein::open(dir, settings, largest, config)?;
+            let klein = Klein::open(dir, settings, largest, config, &progress)?;
             eprintln!("klein loaded");
             Ok(klein)
         })

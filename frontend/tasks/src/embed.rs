@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tessera_bundle::Overrides;
 use tessera_bundle::encoder::{self, Shape};
 use tessera_bundle::tokenize::hf::Hf;
+use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::{Model, Recipe, Settings, Tensor};
 
 pub struct Embedder {
@@ -48,12 +49,19 @@ fn unit(mut v: Vec<f32>) -> Vec<f32> {
 
 impl Embedder {
     /// Loads the model in `dir` where `settings` say.
-    pub fn open(dir: &Path, settings: &Settings, config: &Overrides) -> Result<Self, Error> {
+    pub fn open(
+        dir: &Path,
+        settings: &Settings,
+        config: &Overrides,
+        progress: &Progress,
+    ) -> Result<Self, Error> {
         // GPUs lack a fast kernel for listed keys.
         let padded = settings.gpu().is_none();
+        let reading = progress.step("read model", Unit::Items, None);
         let (shape, e) = encoder::open(dir, padded, config)?;
-        let mut model = Model::open(e.graph, &Recipe::default(), settings)?;
-        model.load(&e.weights)?;
+        reading.finish();
+        let recipe = Recipe::default();
+        let model = Model::open_loaded(e.graph, &recipe, settings, &e.weights, progress)?;
         Ok(Self {
             model,
             tokenizer: e.tokenizer,
@@ -158,9 +166,14 @@ pub type Threaded = Worker<Embedder>;
 
 impl Worker<Embedder> {
     /// Opens the model in `dir` on a new thread.
-    pub fn open(dir: PathBuf, settings: Settings, config: Overrides) -> Result<Self, Error> {
+    pub fn open(
+        dir: PathBuf,
+        settings: Settings,
+        config: Overrides,
+        progress: Progress,
+    ) -> Result<Self, Error> {
         Worker::spawn(move || {
-            let embedder = Embedder::open(&dir, &settings, &config)?;
+            let embedder = Embedder::open(&dir, &settings, &config, &progress)?;
             eprintln!("{}: embedder loaded", embedder.device());
             Ok(embedder)
         })

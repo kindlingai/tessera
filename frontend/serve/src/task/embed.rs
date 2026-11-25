@@ -15,7 +15,7 @@ pub static ENTRY: Entry = Entry {
 
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
-    let e = Threaded::open(o.model.clone(), settings, o.config.clone());
+    let e = Threaded::open(o.model.clone(), settings, o.config.clone(), o.progress.clone());
     let e = Arc::new(e.map_err(|e| e.to_string())?);
     load.fill(e.clone(), |m| m.embed = Some(e as Arc<dyn Embed>));
     Ok(())

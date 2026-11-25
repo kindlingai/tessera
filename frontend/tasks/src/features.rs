@@ -6,6 +6,7 @@ use tessera_bundle::Message;
 use tessera_bundle::Overrides;
 use tessera_bundle::taps::{Tapped, tapped};
 use tessera_bundle::tokenize::hf::Hf;
+use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::{Model, Recipe, Settings, Tensor};
 
 pub struct Features {
@@ -23,14 +24,17 @@ impl Features {
         layers: &[u64],
         [seqs, rows]: [usize; 2],
         config: &Overrides,
+        progress: &Progress,
     ) -> Result<Self, Error> {
+        let reading = progress.step("read model", Unit::Items, None);
         let t = tapped(dirs, [seqs as u64, rows as u64], layers, config)?;
+        reading.finish();
         let recipe = Recipe {
             pins: t.pins.clone(),
             ..Recipe::default()
         };
-        let mut model = Model::open(t.graph.clone(), &recipe, settings)?;
-        model.load(&t.weights)?;
+        let graph = t.graph.clone();
+        let model = Model::open_loaded(graph, &recipe, settings, &t.weights, progress)?;
         Ok(Self {
             model,
             tapped: t,

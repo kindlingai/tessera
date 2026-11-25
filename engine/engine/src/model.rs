@@ -1,5 +1,6 @@
 //! A forward graph with its weights, launched as a whole.
 
+use crate::progress::{Progress, Unit};
 use crate::{Error, Reads};
 use std::borrow::Cow;
 use tessera_graph::{DimExpr, DimName, Graph, Shape, Size};
@@ -143,6 +144,26 @@ impl Model {
     pub fn bucketed(mut self, dims: &[DimName]) -> Self {
         self.buckets = dims.to_vec();
         self
+    }
+
+    /// Opens `graph` and loads `weights`, reporting both as steps.
+    pub fn open_loaded(
+        graph: Graph,
+        recipe: &Recipe,
+        settings: &Settings,
+        weights: &[Weight],
+        progress: &Progress,
+    ) -> Result<Self, Error> {
+        let compiling = progress.step("compile", Unit::Items, None);
+        let mut model = Self::open(graph, recipe, settings)?;
+        compiling.finish();
+        let step = progress.step("weights", Unit::Items, Some(weights.len() as u64));
+        for (at, w) in weights.iter().enumerate() {
+            model.load_one(at as u32, w)?;
+            step.add(1);
+        }
+        step.finish();
+        Ok(model)
     }
 
     /// Takes the graph's weights, in its order.

@@ -18,6 +18,7 @@ fn main() -> Result<(), tessera_tasks::Error> {
         &tessera_frontend_settings::read(),
         [1, TEXT, side * side],
         &Default::default(),
+        &Default::default(),
     )?;
     eprintln!("opened in {:?}", started.elapsed());
     let mut x: Vec<f32> = (0..side * side * 128)

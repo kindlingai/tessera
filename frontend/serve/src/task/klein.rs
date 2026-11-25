@@ -15,7 +15,8 @@ pub static ENTRY: Entry = Entry {
 fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let o = load.options;
     let largest = load.count("--image-size", 512);
-    let klein = Worker::<Klein>::open(o.model.clone(), settings, largest, o.config.clone());
+    let (dir, config, progress) = (o.model.clone(), o.config.clone(), o.progress.clone());
+    let klein = Worker::<Klein>::open(dir, settings, largest, config, progress);
     load.picture(klein.map_err(|e| e.to_string())?);
     Ok(())
 }

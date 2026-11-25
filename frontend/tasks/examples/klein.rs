@@ -23,14 +23,11 @@ fn main() -> Result<(), tessera_tasks::Error> {
     let settings = tessera_frontend_settings::read();
     let (cache, token) = (settings.recipes.clone(), settings.hf_token.clone());
     let recipe = Recipe::open(recipe, cache.as_deref())?;
-    let dir = recipe.weights(
-        cache.as_deref(),
-        token.as_deref(),
-        &Progress::new(Arc::new(Log)),
-    )?;
+    let progress = Progress::new(Arc::new(Log));
+    let dir = recipe.weights(cache.as_deref(), token.as_deref(), &progress)?;
     let config = Overrides::new(recipe.overrides());
     let started = Instant::now();
-    let mut klein = Klein::open(dir, settings, side * 16, config)?;
+    let mut klein = Klein::open(dir, settings, side * 16, config, &progress)?;
     eprintln!("opened in {:?}", started.elapsed());
     let started = Instant::now();
     let picture = klein.paint(&prompt.join(" "), side, &start)?;

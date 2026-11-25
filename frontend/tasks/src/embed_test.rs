@@ -13,8 +13,13 @@ fn eg2_cases() {
     let mut settings = Settings::default();
     // The host takes minutes on the long case.
     settings.backend = tessera_engine::gpu().map_or(settings.backend, Pick::Gpu);
-    let mut embedder =
-        Embedder::open(&dir.join("exlr8"), &settings, &Overrides::default()).unwrap();
+    let mut embedder = Embedder::open(
+        &dir.join("exlr8"),
+        &settings,
+        &Overrides::default(),
+        &Default::default(),
+    )
+    .unwrap();
     for entry in std::fs::read_dir(dir.join("cases")).unwrap() {
         let case = entry.unwrap().path();
         let ids = std::fs::read_to_string(case.join("tokens.txt")).unwrap();
