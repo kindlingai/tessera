@@ -1,0 +1,33 @@
+{
+  "fields": {
+    "content": {
+      "close": "<｜end▁of▁sentence｜>",
+      "content": "text"
+    },
+    "thinking": {
+      "open": "<think>",
+      "close": "</think>",
+      "content": "text"
+    },
+    "tool_calls": {
+      "outer": [
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁calls▁end｜>"
+      ],
+      "open_pattern": "<｜tool▁call▁begin｜>(?:function<｜tool▁sep｜>)?(?P<name>[^\\n<]+)(?:\\n(?:```json\\n)?|<｜tool▁sep｜>)",
+      "close": [
+        "```<｜tool▁call▁end｜>",
+        "<｜tool▁call▁end｜>"
+      ],
+      "content": "json",
+      "transform": {
+        "type": "function",
+        "function": {
+          "name": "{name}",
+          "arguments": "{content}"
+        }
+      }
+    }
+  },
+  "tool_prompt": "## Tools\nYou have access to the following tools:\n{% for tool in tools %}\n\n### {{ tool.function.name }}\nDescription: {{ tool.function.description or '' }}\n\nParameters: {{ tool.function.parameters | tojson }}\n{% endfor %}\n\nIMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>tool_call_name\n```json\ntool_call_arguments\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\nWhere:\n\n- `tool_call_name` must be an exact match to one of the available tools\n- `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema\n- For multiple tool calls, put each one on a new line before <｜tool▁calls▁end｜>{{ '\\n' }}"
+}

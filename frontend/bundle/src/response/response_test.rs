@@ -126,3 +126,60 @@ fn strips_pattern_thinking_opener() {
         ("", "<think!</think>x")
     );
 }
+
+#[test]
+fn deepseek_family_default() {
+    let chat = "{% for m in messages %}{{ m['content'] or '' }}{% for tool in m['tool_calls'] or [] %}\
+{{ '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + tool['function']['arguments'] }}\
+{% endfor %}{% endfor %}";
+    let mut template = crate::Template::new(chat.into()).unwrap();
+    let json = include_str!("deepseek.json");
+    let parser = ResponseParser::fallback(json, &template).unwrap().unwrap();
+    template
+        .with_tool_prompt(parser.tool_prompt().unwrap())
+        .unwrap();
+    let call = crate::ToolCall {
+        function: crate::FunctionCall {
+            name: "ping".into(),
+            arguments: json!({"a": 1}),
+        },
+        kind: "function".into(),
+        id: None,
+    };
+    let reply = crate::Message {
+        role: "assistant".into(),
+        tool_calls: Some(vec![call]),
+        ..Default::default()
+    };
+    let tools = [json!({"type": "function", "function": {"name": "ping", "parameters": {}}})];
+    let options = crate::RenderOptions {
+        tools: &tools,
+        ..Default::default()
+    };
+    let text = template.render_options(&[reply], &options).unwrap();
+    assert!(text.starts_with("## Tools\n") && text.contains("\n### ping\n"));
+    assert!(text.ends_with("<｜tool▁call▁begin｜>function<｜tool▁sep｜>ping{\"a\":1}"));
+    let pieces = [
+        "Sure.",
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>",
+        "function<｜tool▁sep｜>get_",
+        "weather\n```json\n{\"city\": \"Paris\"}\n```",
+        "<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>ping\n```json\n{}\n```<｜tool▁call▁end｜>",
+        "<｜tool▁calls▁end｜>",
+    ];
+    let mut stream = parser.stream(true, false);
+    let mut events = Vec::new();
+    for piece in pieces {
+        stream.push(piece, &mut events);
+    }
+    stream.finish(&mut events);
+    let mut names = Vec::new();
+    for event in &events {
+        match event {
+            ResponseEvent::ToolCall(tc) => names.push(tc.function.name.as_str()),
+            other => assert_eq!(other, &ResponseEvent::Content("Sure.".into())),
+        }
+    }
+    assert_eq!(names, ["get_weather", "ping"]);
+}

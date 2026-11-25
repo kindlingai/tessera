@@ -72,6 +72,8 @@ pub(crate) struct Arch {
     pub part: Option<fn(&Arch, &Cut) -> Result<Part>>,
     pub embed: Option<Embeds>,
     pub ple: Option<Table>,
+    /// The `response_template` JSON a model's own config may lack.
+    pub response: Option<&'static str>,
 }
 
 impl Arch {
@@ -84,6 +86,7 @@ impl Arch {
         part: None,
         embed: None,
         ple: None,
+        response: None,
     };
 
     /// The weight name rules, or none.

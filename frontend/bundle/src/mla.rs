@@ -23,7 +23,7 @@ fn step(_: &Arch, ask: &Ask) -> Result<Built, Box<dyn Error + Send + Sync>> {
     Ok((graph, Weights::Streamed(Box::new(release)), pins))
 }
 
-arch!("mla", [Spot::Probe(probe)], step: step);
+arch!("mla", [Spot::Probe(probe)], step: step, response: include_str!("response/deepseek.json"));
 
 /// The `config.json` keys a DeepSeek-V3 release sets.
 #[derive(Deserialize)]
