@@ -9,6 +9,7 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, 
 enum MmKind {
     Bf16,
     Bf16Split,
+    Bf16SplitK,
     Mxfp8,
     Mxfp8Split,
     Mxfp8Wide,
@@ -20,6 +21,7 @@ impl MmKind {
     fn name(self) -> &'static str {
         match self {
             MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
+            MmKind::Bf16SplitK => "fast_mm_bf16_sk",
             MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => "fast_mm_mxfp8",
             MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => "fast_mm_mxfp8_sk",
         }
@@ -29,6 +31,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 => "tessera_mm_bf16",
             MmKind::Bf16Split => "tessera_mm_bf16_ks2",
+            MmKind::Bf16SplitK => "tessera_mm_bf16_sk",
             MmKind::Mxfp8 => "tessera_mm_mxfp8_r8",
             MmKind::Mxfp8Split => "tessera_mm_mxfp8_r8_sk",
             MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
@@ -40,7 +43,7 @@ impl MmKind {
     fn smem(self) -> usize {
         match self {
             MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Bf16Split => (4 * 16 * 36 + 4 * 8 * 36) * 4,
+            MmKind::Bf16Split | MmKind::Bf16SplitK => (4 * 16 * 36 + 4 * 8 * 36) * 4,
             MmKind::Mxfp8
             | MmKind::Mxfp8Split
             | MmKind::Mxfp8Wide
@@ -53,6 +56,7 @@ impl MmKind {
         match self {
             MmKind::Bf16 => (n / 32, m.div_ceil(16)),
             MmKind::Bf16Split | MmKind::Mxfp8Wide => (n / 16, m.div_ceil(16)),
+            MmKind::Bf16SplitK => ((n / 16) * ks, m.div_ceil(16)),
             MmKind::Mxfp8 => (n / 16, 1),
             MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => ((n / 16) * ks, 1),
             MmKind::Mxfp8Tall => (n / 16, m.div_ceil(32)),
@@ -62,7 +66,7 @@ impl MmKind {
     fn step(self) -> f64 {
         match self {
             MmKind::Bf16 => 64.0,
-            MmKind::Bf16Split => 128.0,
+            MmKind::Bf16Split | MmKind::Bf16SplitK => 128.0,
             MmKind::Mxfp8
             | MmKind::Mxfp8Split
             | MmKind::Mxfp8Wide
@@ -72,19 +76,14 @@ impl MmKind {
     }
 
     fn is_split(self) -> bool {
-        matches!(self, MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit)
+        matches!(
+            self,
+            MmKind::Bf16SplitK | MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit
+        )
     }
 }
 
-fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
-    let chunks = k / 512;
-    let nb = n / 16;
-    let max_nb = if wide { 112 } else { 256 };
-    if chunks <= 1 || nb >= max_nb {
-        return 1;
-    }
-    let cap = if nb >= 32 { 6 } else { 12 }.min(chunks);
-    let want = 320usize.div_ceil(nb).clamp(1, cap);
+fn pick_divisor(chunks: usize, want: usize, cap: usize) -> usize {
     for d in want..=cap {
         if chunks.is_multiple_of(d) {
             return d;
@@ -96,6 +95,29 @@ fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
         }
     }
     1
+}
+
+fn bf16_ks(m: usize, n: usize, k: usize) -> usize {
+    let chunks = k / 128;
+    let base = (n / 16) * m.div_ceil(16);
+    if chunks < 4 || base >= 192 {
+        return 1;
+    }
+    let cap = if base >= 48 { 6 } else { 16 }.min(chunks / 2);
+    let want = 320usize.div_ceil(base).clamp(1, cap);
+    pick_divisor(chunks, want, cap)
+}
+
+fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
+    let chunks = k / 512;
+    let nb = n / 16;
+    let max_nb = if wide { 112 } else { 256 };
+    if chunks <= 1 || nb >= max_nb {
+        return 1;
+    }
+    let cap = if nb >= 32 { 6 } else { 12 }.min(chunks);
+    let want = 320usize.div_ceil(nb).clamp(1, cap);
+    pick_divisor(chunks, want, cap)
 }
 
 /// Streaming BF16 and MXFP8 Tensor-Core small-batch matmul.
@@ -368,7 +390,12 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
                 && k.is_multiple_of(128)
                 && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < 144) =>
         {
-            (MmKind::Bf16Split, 1)
+            let ks = bf16_ks(m, n, k);
+            if ks > 1 {
+                (MmKind::Bf16SplitK, ks)
+            } else {
+                (MmKind::Bf16Split, 1)
+            }
         }
         "bf16" if n.is_multiple_of(32) && k.is_multiple_of(64) => (MmKind::Bf16, 1),
         "bf16" => {

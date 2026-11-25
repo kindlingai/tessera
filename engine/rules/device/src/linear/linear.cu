@@ -370,10 +370,10 @@ struct alignas(16) fg_bf16_smem {
     } u;
 };
 
-template <u32 KS>
+template <u32 KS, bool SPLIT>
 static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, const float* other,
                                                   float* out, u32 m, u32 n, u32 k, u32 mode,
-                                                  fg_bf16_smem<KS>& sm) {
+                                                  u32 ks, fg_bf16_smem<KS>& sm) {
     constexpr u32 NTILES = 4u / KS;
     constexpr u32 BN = 8u * NTILES;
     constexpr u32 BK = 64u * KS;
@@ -384,15 +384,22 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
     u32 wt = warp % NTILES;
     u32 kp = warp / NTILES;
     u32 r0 = blockIdx.y << 4;
-    u32 n0 = blockIdx.x * BN + (wt << 3);
+    u32 nb = n / BN;
+    u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x;
+    u32 p = SPLIT ? (blockIdx.x / nb) : 0u;
+    u32 n0 = ob * BN + (wt << 3);
+    u32 chunks = k / BK;
+    u32 ch_per = SPLIT ? (chunks / ks) : chunks;
+    u32 k_begin = SPLIT ? (p * ch_per * BK) : 0u;
+    u32 k_end = SPLIT ? (k_begin + ch_per * BK) : k;
     const u16* wr = w + u64(n0 + g) * k + (kp << 6);
     u32 xr = threadIdx.x >> 4;
     u32 xc = (threadIdx.x & 15u) << 2;
     u32 xw = (threadIdx.x & 15u) << 1;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    uint4 cur0 = fg_ld_nc4(wr + (t << 3));
-    uint4 cur1 = fg_ld_nc4(wr + 32u + (t << 3));
-    for (u32 k0 = 0u; k0 < k; k0 += BK) {
+    uint4 cur0 = fg_ld_nc4(wr + k_begin + (t << 3));
+    uint4 cur1 = fg_ld_nc4(wr + k_begin + 32u + (t << 3));
+    for (u32 k0 = k_begin; k0 < k_end; k0 += BK) {
 #pragma unroll
         for (u32 s = 0u; s < KS; s++) {
 #pragma unroll
@@ -418,14 +425,14 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
         *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2]) = cur0;
         *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][16u + (t << 2)]) = cur1;
         prim::block_sync();
-        if (k0 + BK < k) {
+        if (k0 + BK < k_end) {
             cur0 = fg_ld_nc4(wr + k0 + BK + (t << 3));
             cur1 = fg_ld_nc4(wr + k0 + BK + 32u + (t << 3));
         }
 #pragma unroll
-        for (u32 ks = 0u; ks < 4u; ks++) {
+        for (u32 ks_i = 0u; ks_i < 4u; ks_i++) {
             u32 ah[4], al[4], b[2];
-            u32 off = (ks << 3) + t;
+            u32 off = (ks_i << 3) + t;
             ah[0] = sm.sxh[kp][g][off];
             ah[1] = sm.sxh[kp][g + 8u][off];
             ah[2] = sm.sxh[kp][g][off + 4u];
@@ -445,20 +452,33 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
         if (kp == 1u) sm.u.red[wt][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
         prim::block_sync();
         if (kp != 0u) return;
-        float4 p = sm.u.red[wt][lane];
-        acc[0] += p.x;
-        acc[1] += p.y;
-        acc[2] += p.z;
-        acc[3] += p.w;
+        float4 pr = sm.u.red[wt][lane];
+        acc[0] += pr.x;
+        acc[1] += pr.y;
+        acc[2] += pr.z;
+        acc[3] += pr.w;
     }
     u32 col = n0 + (t << 1);
-    if (r0 + g < m) {
-        u64 off = u64(r0 + g) * n + col;
-        *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[0], acc[1], other, off, col, mode);
-    }
-    if (r0 + g + 8u < m) {
-        u64 off = u64(r0 + g + 8u) * n + col;
-        *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[2], acc[3], other, off, col, mode);
+    if constexpr (SPLIT) {
+        if (r0 + g < m) {
+            u64 off = (u64(p) * m + r0 + g) * n + col;
+            *reinterpret_cast<float2*>(out + off) = make_float2(acc[0], acc[1]);
+        }
+        if (r0 + g + 8u < m) {
+            u64 off = (u64(p) * m + r0 + g + 8u) * n + col;
+            *reinterpret_cast<float2*>(out + off) = make_float2(acc[2], acc[3]);
+        }
+    } else {
+        if (r0 + g < m) {
+            u64 off = u64(r0 + g) * n + col;
+            *reinterpret_cast<float2*>(out + off) =
+                fg_epilogue2(acc[0], acc[1], other, off, col, mode);
+        }
+        if (r0 + g + 8u < m) {
+            u64 off = u64(r0 + g + 8u) * n + col;
+            *reinterpret_cast<float2*>(out + off) =
+                fg_epilogue2(acc[2], acc[3], other, off, col, mode);
+        }
     }
 }
 
@@ -466,14 +486,22 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
-    fg_bf16_mm<1u>(x, w, other, out, m, n, k, mode, sm);
+    fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_ks2(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
-    fg_bf16_mm<2u>(x, w, other, out, m, n, k, mode, sm);
+    fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
+}
+
+// Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
+extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_sk(
+    const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
+    u32 ks) {
+    __shared__ fg_bf16_smem<2u> sm;
+    fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, mode, ks, sm);
 }
 
 union alignas(16) fg_mx_smem {
