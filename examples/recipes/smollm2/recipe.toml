@@ -45,13 +45,3 @@ The example format is as follows. Please make sure the parameter type is correct
 {%- endfor -%}
 {%- if add_generation_prompt -%}{{ '<|im_start|>assistant\n' }}{%- endif -%}
 '''
-
-[config."tokenizer_config.json".response_template.fields.content]
-close = "<|im_end|>"
-content = "text"
-
-# One block holds a JSON list of calls.
-[config."tokenizer_config.json".response_template.fields.tool_calls]
-open = "<tool_call>"
-close = "</tool_call>"
-content = "json"

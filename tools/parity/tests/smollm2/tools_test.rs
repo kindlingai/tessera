@@ -28,6 +28,7 @@ fn recipe_round_trips_calls() {
     assert!(prompt.contains(r#"<tools>[{"name": "add"}]</tools>"#));
     assert!(prompt.ends_with("<|im_start|>tool\n3<|im_end|>\n<|im_start|>assistant\n"));
     let reply = prompt.split("<|im_start|>assistant\n").nth(1).unwrap();
-    let parser = ResponseParser::from_config(&text).unwrap().unwrap();
+    let json = include_str!("../../../../frontend/bundle/src/response/smollm2.json");
+    let parser = ResponseParser::fallback(json, &template).unwrap().unwrap();
     assert_eq!(json!(parser.parse(reply, true, false).tool_calls), calls);
 }

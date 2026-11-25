@@ -1,0 +1,6 @@
+{
+  "fields": {
+    "content": {"close": "<|im_end|>", "content": "text"},
+    "tool_calls": {"open": "<tool_call>", "close": "</tool_call>", "content": "json"}
+  }
+}

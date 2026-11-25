@@ -59,6 +59,6 @@ macro_rules! decoders {
 
 decoders! {
     "qwen3": Norm, Swiglu, response: include_str!("response/qwen3.json");
-    "llama": (), Swiglu;
+    "llama": (), Swiglu, response: include_str!("response/smollm2.json");
     "granitemoe": (), Moe;
 }
