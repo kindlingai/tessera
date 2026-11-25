@@ -846,7 +846,7 @@ fn mla_narrow_kept() {
 /// Fast-path diagnostics report rule and hardware rejections accurately.
 #[test]
 fn lowering_report_diagnostics() {
-    let rows = [Dim::bounded(Rows, 128)];
+    let rows = [Dim::bounded(Rows, 600)];
     let cuda = Platform {
         backend: "cuda".into(),
         ..Platform::host(Limits::assumed())
@@ -885,12 +885,12 @@ fn lowering_report_diagnostics() {
     );
     assert!(warn.contains("--explain-lowering"), "{warn}");
 
-    // Oversized m=80 exceeds fast_mm's 64-row limit.
-    let r = explain(&g_ok, 0, &[(Rows, 80)], &dev).unwrap();
+    // Oversized m=520 exceeds fast_mm's 512-row limit.
+    let r = explain(&g_ok, 0, &[(Rows, 520)], &dev).unwrap();
     assert!(r.has_fallbacks());
     let msg = r.format(10);
     assert!(msg.contains("fast_mm"), "{msg}");
-    assert!(msg.contains("m=80 exceeds max 64"), "{msg}");
+    assert!(msg.contains("m=520 exceeds max 512"), "{msg}");
 
     // Missing bf16 tensor tiles reports hardware mismatch via Needs.
     let dev_no_tile = Device::default()
