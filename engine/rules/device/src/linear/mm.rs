@@ -380,8 +380,8 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
             tree.node(x).form.name()
         )));
     }
-    if m > 64 {
-        return Some(Err(format!("m={m} exceeds max 64")));
+    if m > 512 {
+        return Some(Err(format!("m={m} exceeds max 512")));
     }
     let form = tree.node(w).form;
     let (kind, ks) = match form.name() {

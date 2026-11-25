@@ -97,10 +97,14 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     match kind {
         AttendKind::Mla if groups <= 8 => 16,
         AttendKind::Mla if groups <= 16 => 8,
-        AttendKind::Mla => 4,
+        AttendKind::Mla if groups <= 64 => 4,
+        AttendKind::Mla if groups <= 128 => 2,
+        AttendKind::Mla => 1,
         AttendKind::Gqa if groups <= 16 => 16,
         AttendKind::Gqa if groups <= 32 => 8,
-        AttendKind::Gqa => 4,
+        AttendKind::Gqa if groups <= 128 => 4,
+        AttendKind::Gqa if groups <= 256 => 2,
+        AttendKind::Gqa => 1,
     }
 }
 
@@ -334,7 +338,7 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
     if width != kind.width() || kw != width || tree.node(v).shape.last() != Some(&width) {
         return None;
     }
-    if rows == 0 || rows > 32 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+    if rows == 0 || rows > 512 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
         return None;
     }
     let [slots, positions] = [node.args[3], node.args[4]];
