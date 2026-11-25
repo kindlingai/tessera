@@ -23,6 +23,10 @@ TESSERA_FN u64* size_of(u64 area, u64 seq, u32 src, u32 nr) {
     return tail_of(area, seq, src, nr) + 1;
 }
 
+TESSERA_FN u64* ag_tail_of(u64 area, u64 seq, u32 src, u32 nr) {
+    return tail_of(area, seq, src, nr) + 2;
+}
+
 TESSERA_FN u64* ack_of(u64 area, u32 nr, u32 peer) {
     return reinterpret_cast<u64*>(area + 2ull * nr * SLOT_BYTES) + peer;
 }
@@ -57,6 +61,20 @@ TESSERA_FN void store_u2(u32* p, uint2 v) {
     asm volatile("st.global.v2.u32 [%0], {%1, %2};" :: "l"(p), "r"(v.x), "r"(v.y) : "memory");
 }
 
+TESSERA_FN void store_u4(u32* p, uint4 v) {
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+}
+
+TESSERA_FN uint4 load_fresh_u4(const u32* p) {
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 #else
 
 TESSERA_FN void store_vec4(float* p, float4 v) {
@@ -65,6 +83,15 @@ TESSERA_FN void store_vec4(float* p, float4 v) {
 
 TESSERA_FN void store_u2(u32* p, uint2 v) {
     *reinterpret_cast<uint2*>(p) = v;
+}
+
+TESSERA_FN void store_u4(u32* p, uint4 v) {
+    *reinterpret_cast<uint4*>(p) = v;
+}
+
+TESSERA_FN uint4 load_fresh_u4(const u32* p) {
+    return make_uint4(prim::load_fresh(p + 0), prim::load_fresh(p + 1), prim::load_fresh(p + 2),
+                      prim::load_fresh(p + 3));
 }
 
 #endif
@@ -178,11 +205,46 @@ TESSERA_FN bool last_cta(u32* cnt) {
 }
 
 template <Wire W>
+TESSERA_FN uint2 pack_wire4(float4 v) {
+    if constexpr (W == Wire::Bf16) {
+        return pack_bf16x4(v);
+    } else {
+        return pack_fp16x4(v);
+    }
+}
+
+template <Wire W>
+TESSERA_FN float4 unpack_wire4(uint2 p) {
+    if constexpr (W == Wire::Bf16) {
+        return unpack_bf16x4(p);
+    } else {
+        return unpack_fp16x4(p);
+    }
+}
+
+template <Wire W>
 TESSERA_FN void write_slice(u64 area, u64 seq, u32 me, u32 nr, const float* src, u32 n, u32 lo4,
                             u32 hi4, bool aligned) {
     u64 dst = area + slot_off(seq, me, nr);
-    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
-        store_peer4<W>(dst, j, load_vec4(src, j, aligned));
+    if constexpr (W != Wire::F32) {
+        u32 p0 = (lo4 & 1u) ? (lo4 + 1u) : lo4;
+        u32 p1 = hi4 & ~1u;
+        if (lo4 < hi4 && (lo4 & 1u) != 0u && threadIdx.x == 0u) {
+            store_peer4<W>(dst, lo4, load_vec4(src, lo4, aligned));
+        }
+        for (u32 q = (p0 >> 1) + threadIdx.x; q < (p1 >> 1); q += blockDim.x) {
+            u32 j = q << 1;
+            uint2 a = pack_wire4<W>(load_vec4(src, j, aligned));
+            uint2 b = pack_wire4<W>(load_vec4(src, j + 1u, aligned));
+            store_u4(reinterpret_cast<u32*>(dst) + (q << 2), make_uint4(a.x, a.y, b.x, b.y));
+        }
+        if (p1 < hi4 && p1 >= p0 && threadIdx.x == 0u) {
+            store_peer4<W>(dst, p1, load_vec4(src, p1, aligned));
+        }
+    } else {
+        for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+            store_peer4<W>(dst, j, load_vec4(src, j, aligned));
+        }
     }
     if (prim::leader_block()) {
         u32 base = (n / 4) * 4;
@@ -225,29 +287,65 @@ TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float
 }
 
 template <Wire W, bool WRITE_REMOTE>
+TESSERA_FN void add_pair_one(u64 remote, u64 peer, const float* in_ptr, float* dst_buf, u32 j,
+                             bool aligned_in, bool aligned_dst) {
+    float4 a = round_wire4<W>(load_vec4(in_ptr, j, aligned_in));
+    float4 b = load_peer4<W>(peer, j);
+    float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+    if constexpr (WRITE_REMOTE) {
+        if constexpr (W != Wire::F32) {
+            uint2 p = pack_wire4<W>(s);
+            store_u2(reinterpret_cast<u32*>(remote) + j * 2, p);
+            s = unpack_wire4<W>(p);
+        } else {
+            store_vec4(reinterpret_cast<float*>(remote) + j * 4, s);
+        }
+    }
+    store_out4(dst_buf, j, s, aligned_dst);
+}
+
+template <Wire W, bool WRITE_REMOTE>
 TESSERA_FN void add_pair(u64 dst_area, u64 mine, u64 seq, u32 me, u32 prev, u32 nr,
                          const float* in_ptr, float* dst_buf, u32 n, u32 lo4, u32 hi4,
                          bool aligned_in, bool aligned_dst) {
     u64 remote = WRITE_REMOTE ? (dst_area + slot_off(seq, me, nr)) : 0ull;
     u64 peer = mine + slot_off(seq, prev, nr);
-    for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
-        float4 a = round_wire4<W>(load_vec4(in_ptr, j, aligned_in));
-        float4 b = load_peer4<W>(peer, j);
-        float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-        if constexpr (WRITE_REMOTE) {
-            if constexpr (W == Wire::Bf16) {
-                uint2 p = pack_bf16x4(s);
-                store_u2(reinterpret_cast<u32*>(remote) + j * 2, p);
-                s = unpack_bf16x4(p);
-            } else if constexpr (W == Wire::Fp16) {
-                uint2 p = pack_fp16x4(s);
-                store_u2(reinterpret_cast<u32*>(remote) + j * 2, p);
-                s = unpack_fp16x4(p);
-            } else {
-                store_vec4(reinterpret_cast<float*>(remote) + j * 4, s);
-            }
+    if constexpr (W != Wire::F32) {
+        u32 p0 = (lo4 & 1u) ? (lo4 + 1u) : lo4;
+        u32 p1 = hi4 & ~1u;
+        if (lo4 < hi4 && (lo4 & 1u) != 0u && threadIdx.x == 0u) {
+            add_pair_one<W, WRITE_REMOTE>(remote, peer, in_ptr, dst_buf, lo4, aligned_in,
+                                          aligned_dst);
         }
-        store_out4(dst_buf, j, s, aligned_dst);
+        for (u32 q = (p0 >> 1) + threadIdx.x; q < (p1 >> 1); q += blockDim.x) {
+            u32 j = q << 1;
+            float4 a0 = round_wire4<W>(load_vec4(in_ptr, j, aligned_in));
+            float4 a1 = round_wire4<W>(load_vec4(in_ptr, j + 1u, aligned_in));
+            uint4 raw = load_fresh_u4(reinterpret_cast<const u32*>(peer) + (q << 2));
+            float4 b0 = unpack_wire4<W>(make_uint2(raw.x, raw.y));
+            float4 b1 = unpack_wire4<W>(make_uint2(raw.z, raw.w));
+            float4 s0 = make_float4(a0.x + b0.x, a0.y + b0.y, a0.z + b0.z, a0.w + b0.w);
+            float4 s1 = make_float4(a1.x + b1.x, a1.y + b1.y, a1.z + b1.z, a1.w + b1.w);
+            if constexpr (WRITE_REMOTE) {
+                uint2 w0 = pack_wire4<W>(s0);
+                uint2 w1 = pack_wire4<W>(s1);
+                store_u4(reinterpret_cast<u32*>(remote) + (q << 2),
+                         make_uint4(w0.x, w0.y, w1.x, w1.y));
+                s0 = unpack_wire4<W>(w0);
+                s1 = unpack_wire4<W>(w1);
+            }
+            store_out4(dst_buf, j, s0, aligned_dst);
+            store_out4(dst_buf, j + 1u, s1, aligned_dst);
+        }
+        if (p1 < hi4 && p1 >= p0 && threadIdx.x == 0u) {
+            add_pair_one<W, WRITE_REMOTE>(remote, peer, in_ptr, dst_buf, p1, aligned_in,
+                                          aligned_dst);
+        }
+    } else {
+        for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+            add_pair_one<W, WRITE_REMOTE>(remote, peer, in_ptr, dst_buf, j, aligned_in,
+                                          aligned_dst);
+        }
     }
     if (prim::leader_block()) {
         u32 base = (n / 4) * 4;
@@ -316,6 +414,224 @@ TESSERA_FN void finish_chunk(const u64* areas, u32* ci, u64* seq_ptr, u64 seq, u
     }
 }
 
+TESSERA_FN void cta_slice(u32 seg_lo, u32 seg_hi, u32 blocks, u32& lo, u32& hi) {
+    u32 len = seg_hi - seg_lo;
+    u32 per = ((len + blocks - 1u) / blocks + 1u) & ~1u;
+    lo = seg_lo + blockIdx.x * per;
+    hi = lo + per;
+    if (lo > seg_hi) lo = seg_hi;
+    if (hi > seg_hi) hi = seg_hi;
+}
+
+template <Wire W>
+TESSERA_FN void rs_send_one(u64 remote, u64 peer, const float* src, u32 j, bool aligned_src) {
+    float4 a = round_wire4<W>(load_vec4(src, j, aligned_src));
+    float4 b = load_peer4<W>(peer, j);
+    float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+    store_peer4<W>(remote, j, s);
+}
+
+template <Wire W>
+TESSERA_FN void rs_send(u64 remote, u64 peer, const float* src, u32 lo4, u32 hi4,
+                        bool aligned_src) {
+    if constexpr (W != Wire::F32) {
+        u32 p0 = (lo4 & 1u) ? (lo4 + 1u) : lo4;
+        u32 p1 = hi4 & ~1u;
+        if (lo4 < hi4 && (lo4 & 1u) != 0u && threadIdx.x == 0u) {
+            rs_send_one<W>(remote, peer, src, lo4, aligned_src);
+        }
+        for (u32 q = (p0 >> 1) + threadIdx.x; q < (p1 >> 1); q += blockDim.x) {
+            u32 j = q << 1;
+            float4 a0 = round_wire4<W>(load_vec4(src, j, aligned_src));
+            float4 a1 = round_wire4<W>(load_vec4(src, j + 1u, aligned_src));
+            uint4 raw = load_fresh_u4(reinterpret_cast<const u32*>(peer) + (q << 2));
+            float4 b0 = unpack_wire4<W>(make_uint2(raw.x, raw.y));
+            float4 b1 = unpack_wire4<W>(make_uint2(raw.z, raw.w));
+            float4 s0 = make_float4(a0.x + b0.x, a0.y + b0.y, a0.z + b0.z, a0.w + b0.w);
+            float4 s1 = make_float4(a1.x + b1.x, a1.y + b1.y, a1.z + b1.z, a1.w + b1.w);
+            uint2 w0 = pack_wire4<W>(s0);
+            uint2 w1 = pack_wire4<W>(s1);
+            store_u4(reinterpret_cast<u32*>(remote) + (q << 2),
+                     make_uint4(w0.x, w0.y, w1.x, w1.y));
+        }
+        if (p1 < hi4 && p1 >= p0 && threadIdx.x == 0u) {
+            rs_send_one<W>(remote, peer, src, p1, aligned_src);
+        }
+    } else {
+        for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+            rs_send_one<W>(remote, peer, src, j, aligned_src);
+        }
+    }
+}
+
+template <Wire W>
+TESSERA_FN void rs_fin_one(u64 rem1, u64 p0, u64 p1, const float* src, float* dst, u32 j,
+                           bool aligned_src, bool aligned_dst) {
+    float4 a = round_wire4<W>(load_vec4(src, j, aligned_src));
+    float4 b = load_peer4<W>(p0, j);
+    float4 half = round_wire4<W>(make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w));
+    float4 c = load_peer4<W>(p1, j);
+    float4 fin = make_float4(half.x + c.x, half.y + c.y, half.z + c.z, half.w + c.w);
+    if constexpr (W != Wire::F32) {
+        uint2 w = pack_wire4<W>(fin);
+        store_u2(reinterpret_cast<u32*>(rem1) + j * 2, w);
+        fin = unpack_wire4<W>(w);
+    } else {
+        store_vec4(reinterpret_cast<float*>(rem1) + j * 4, fin);
+    }
+    store_out4(dst, j, fin, aligned_dst);
+}
+
+template <Wire W>
+TESSERA_FN void rs_finish(u64 rem1, u64 peer0, u64 peer1, const float* src, float* dst, u32 lo4,
+                          u32 hi4, bool aligned_src, bool aligned_dst) {
+    if constexpr (W != Wire::F32) {
+        u32 p0 = (lo4 & 1u) ? (lo4 + 1u) : lo4;
+        u32 p1 = hi4 & ~1u;
+        if (lo4 < hi4 && (lo4 & 1u) != 0u && threadIdx.x == 0u) {
+            rs_fin_one<W>(rem1, peer0, peer1, src, dst, lo4, aligned_src, aligned_dst);
+        }
+        for (u32 q = (p0 >> 1) + threadIdx.x; q < (p1 >> 1); q += blockDim.x) {
+            u32 j = q << 1;
+            float4 a0 = round_wire4<W>(load_vec4(src, j, aligned_src));
+            float4 a1 = round_wire4<W>(load_vec4(src, j + 1u, aligned_src));
+            uint4 r0 = load_fresh_u4(reinterpret_cast<const u32*>(peer0) + (q << 2));
+            uint4 r1 = load_fresh_u4(reinterpret_cast<const u32*>(peer1) + (q << 2));
+            float4 b0 = unpack_wire4<W>(make_uint2(r0.x, r0.y));
+            float4 b1 = unpack_wire4<W>(make_uint2(r0.z, r0.w));
+            float4 h0 = round_wire4<W>(make_float4(a0.x + b0.x, a0.y + b0.y, a0.z + b0.z,
+                                                   a0.w + b0.w));
+            float4 h1 = round_wire4<W>(make_float4(a1.x + b1.x, a1.y + b1.y, a1.z + b1.z,
+                                                   a1.w + b1.w));
+            float4 c0 = unpack_wire4<W>(make_uint2(r1.x, r1.y));
+            float4 c1 = unpack_wire4<W>(make_uint2(r1.z, r1.w));
+            float4 f0 = make_float4(h0.x + c0.x, h0.y + c0.y, h0.z + c0.z, h0.w + c0.w);
+            float4 f1 = make_float4(h1.x + c1.x, h1.y + c1.y, h1.z + c1.z, h1.w + c1.w);
+            uint2 w0 = pack_wire4<W>(f0);
+            uint2 w1 = pack_wire4<W>(f1);
+            store_u4(reinterpret_cast<u32*>(rem1) + (q << 2),
+                     make_uint4(w0.x, w0.y, w1.x, w1.y));
+            store_out4(dst, j, unpack_wire4<W>(w0), aligned_dst);
+            store_out4(dst, j + 1u, unpack_wire4<W>(w1), aligned_dst);
+        }
+        if (p1 < hi4 && p1 >= p0 && threadIdx.x == 0u) {
+            rs_fin_one<W>(rem1, peer0, peer1, src, dst, p1, aligned_src, aligned_dst);
+        }
+    } else {
+        for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+            rs_fin_one<W>(rem1, peer0, peer1, src, dst, j, aligned_src, aligned_dst);
+        }
+    }
+}
+
+template <Wire W, bool WRITE_REMOTE>
+TESSERA_FN void ag_one(u64 remote, u64 peer, float* dst, u32 j, bool aligned_dst) {
+    if constexpr (W != Wire::F32) {
+        uint2 raw = prim::load_fresh4(reinterpret_cast<const u16*>(peer) + j * 4);
+        if constexpr (WRITE_REMOTE) store_u2(reinterpret_cast<u32*>(remote) + j * 2, raw);
+        store_out4(dst, j, unpack_wire4<W>(raw), aligned_dst);
+    } else {
+        float4 v = prim::load_fresh4(reinterpret_cast<const float*>(peer) + j * 4);
+        if constexpr (WRITE_REMOTE) store_vec4(reinterpret_cast<float*>(remote) + j * 4, v);
+        store_out4(dst, j, v, aligned_dst);
+    }
+}
+
+template <Wire W, bool WRITE_REMOTE>
+TESSERA_FN void ag_copy(u64 remote, u64 peer, float* dst, u32 lo4, u32 hi4, bool aligned_dst) {
+    if constexpr (W != Wire::F32) {
+        u32 p0 = (lo4 & 1u) ? (lo4 + 1u) : lo4;
+        u32 p1 = hi4 & ~1u;
+        if (lo4 < hi4 && (lo4 & 1u) != 0u && threadIdx.x == 0u) {
+            ag_one<W, WRITE_REMOTE>(remote, peer, dst, lo4, aligned_dst);
+        }
+        for (u32 q = (p0 >> 1) + threadIdx.x; q < (p1 >> 1); q += blockDim.x) {
+            u32 j = q << 1;
+            uint4 raw = load_fresh_u4(reinterpret_cast<const u32*>(peer) + (q << 2));
+            if constexpr (WRITE_REMOTE) {
+                store_u4(reinterpret_cast<u32*>(remote) + (q << 2), raw);
+            }
+            store_out4(dst, j, unpack_wire4<W>(make_uint2(raw.x, raw.y)), aligned_dst);
+            store_out4(dst, j + 1u, unpack_wire4<W>(make_uint2(raw.z, raw.w)), aligned_dst);
+        }
+        if (p1 < hi4 && p1 >= p0 && threadIdx.x == 0u) {
+            ag_one<W, WRITE_REMOTE>(remote, peer, dst, p1, aligned_dst);
+        }
+    } else {
+        for (u32 j = lo4 + threadIdx.x; j < hi4; j += blockDim.x) {
+            ag_one<W, WRITE_REMOTE>(remote, peer, dst, j, aligned_dst);
+        }
+    }
+}
+
+template <Wire W>
+TESSERA_FN bool rs_ag_4(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u32 nr,
+                        const float* src, float* dst_buf, u32 n, u32 vec4s, u32 blocks,
+                        bool aligned_src, bool aligned_dst, u64 deadline, u32* fault, int* stop) {
+    u32 half = (vec4s >> 1u) & ~1u;
+    u32 q0 = 0u;
+    u32 q1 = (half >> 1u) & ~1u;
+    u32 q2 = half;
+    u32 q3 = half + (((vec4s - half) >> 1u) & ~1u);
+    u32 q4 = vec4s;
+
+    bool upper_half = (me & 1u) != 0u;
+    bool upper_q = (me & 2u) != 0u;
+    u32 oth_lo = upper_half ? q0 : q2;
+    u32 oth_hi = upper_half ? q2 : q4;
+    u32 h_lo = upper_half ? q2 : q0;
+    u32 h_mid = upper_half ? q3 : q1;
+    u32 h_hi = upper_half ? q4 : q2;
+    u32 my_lo = upper_q ? h_mid : h_lo;
+    u32 my_hi = upper_q ? h_hi : h_mid;
+    u32 p1_lo = upper_q ? h_lo : h_mid;
+    u32 p1_hi = upper_q ? h_mid : h_hi;
+
+    u32 peer0 = me ^ 1u;
+    u32 peer1 = me ^ 2u;
+    u32 lo, hi;
+
+    if (!spin_ge(ack_of(mine, nr, peer0), seq - 2, deadline, fault, stop)) return false;
+    cta_slice(oth_lo, oth_hi, blocks, lo, hi);
+    write_slice<W>(areas[peer0], seq, me, nr, src, n, lo, hi, aligned_src);
+    if (last_cta(ci + 2) && prim::leader_thread()) {
+        prim::store_release_sys(tail_of(areas[peer0], seq, me, nr), seq);
+    }
+    if (!spin_ge(tail_of(mine, seq, peer0, nr), seq, deadline, fault, stop)) return false;
+
+    if (!spin_ge(ack_of(mine, nr, peer1), seq - 2, deadline, fault, stop)) return false;
+    cta_slice(p1_lo, p1_hi, blocks, lo, hi);
+    rs_send<W>(areas[peer1] + slot_off(seq, me, nr), mine + slot_off(seq, peer0, nr), src, lo, hi,
+               aligned_src);
+    if (last_cta(ci + 3) && prim::leader_thread()) {
+        prim::store_release_sys(tail_of(areas[peer1], seq, me, nr), seq);
+    }
+    if (!spin_ge(tail_of(mine, seq, peer1, nr), seq, deadline, fault, stop)) return false;
+
+    u32 my_c_lo, my_c_hi;
+    cta_slice(my_lo, my_hi, blocks, my_c_lo, my_c_hi);
+    rs_finish<W>(areas[peer1] + slot_off(seq, me, nr), mine + slot_off(seq, peer0, nr),
+                 mine + slot_off(seq, peer1, nr), src, dst_buf, my_c_lo, my_c_hi, aligned_src,
+                 aligned_dst);
+    if (last_cta(ci + 4) && prim::leader_thread()) {
+        prim::store_release_sys(ag_tail_of(areas[peer1], seq, me, nr), seq);
+    }
+    if (!spin_ge(ag_tail_of(mine, seq, peer1, nr), seq, deadline, fault, stop)) return false;
+
+    write_slice<W>(areas[peer0], seq, me, nr, dst_buf, n, my_c_lo, my_c_hi, aligned_dst);
+    cta_slice(p1_lo, p1_hi, blocks, lo, hi);
+    ag_copy<W, true>(areas[peer0] + slot_off(seq, me, nr), mine + slot_off(seq, peer1, nr),
+                     dst_buf, lo, hi, aligned_dst);
+    if (last_cta(ci + 5) && prim::leader_thread()) {
+        prim::store_release_sys(ag_tail_of(areas[peer0], seq, me, nr), seq);
+    }
+    if (!spin_ge(ag_tail_of(mine, seq, peer0, nr), seq, deadline, fault, stop)) return false;
+
+    cta_slice(oth_lo, oth_hi, blocks, lo, hi);
+    ag_copy<W, false>(0ull, mine + slot_off(seq, peer0, nr), dst_buf, lo, hi, aligned_dst);
+    return true;
+}
+
 template <Wire W>
 TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr,
                          u64 to_ptr, u32 total, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
@@ -332,7 +648,8 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
 
     u64 mine = areas[me];
     bool pow2 = (nr & (nr - 1)) == 0;
-    bool butterfly = sched == 2 && pow2 && nr >= 4;
+    bool scatter = sched == 3 && nr == 4;
+    bool butterfly = (sched == 2 || sched == 3) && pow2 && nr >= 4;
     u64 seq = base_seq;
     for (u32 off = 0; off < total; off += MAX_FLOATS, seq++) {
         u32 n = total - off;
@@ -350,7 +667,11 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
         if (hi4 > vec4s) hi4 = vec4s;
         u32* ci = counters + u32(seq & (RING - 1)) * CNT_STRIDE;
 
-        if (butterfly) {
+        if (scatter && (n & 3u) == 0u && vec4s >= 8u) {
+            if (!rs_ag_4<W>(areas, ci, mine, seq, me, nr, src, dst_buf, n, vec4s, blocks,
+                            aligned_src, aligned_dst, deadline, fault, &stop))
+                return;
+        } else if (butterfly) {
             u32 peer0 = me ^ 1u;
             if (!spin_ge(ack_of(mine, nr, peer0), seq - 2, deadline, fault, &stop)) return;
             write_slice<W>(areas[peer0], seq, me, nr, src, n, lo4, hi4, aligned_src);

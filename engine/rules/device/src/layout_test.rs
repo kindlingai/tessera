@@ -128,10 +128,15 @@ fn p2p_layout_and_schedule() {
     assert_eq!(pick(CROSSOVER, 3, Schedule::Auto), (1, 4));
     assert_eq!(pick(CROSSOVER, 6, Schedule::Auto), (1, 4));
     assert_eq!(pick(CROSSOVER, 2, Schedule::Auto), (0, 4));
+    assert_eq!(pick(1 << 20, 4, Schedule::Auto), (3, 4));
+    assert_eq!(pick(1 << 20, 8, Schedule::Auto), (2, 4));
     assert_eq!(pick(1 << 20, 4, Schedule::Fanout), (0, 4));
+    assert_eq!(pick(128 << 10, 4, Schedule::Fanout), (0, 4));
     assert_eq!(pick(1024, 4, Schedule::Rounds), (1, 1));
     assert_eq!(pick(1024, 4, Schedule::Butterfly), (2, 1));
     assert_eq!(pick(1024, 8, Schedule::Butterfly), (2, 1));
+    assert_eq!(pick(1024, 4, Schedule::Scatter), (3, 1));
+    assert_eq!(pick(1024, 8, Schedule::Scatter), (2, 1));
     assert_eq!(pick(1024, 3, Schedule::Butterfly), (1, 1));
     assert_eq!(pick(1024, 2, Schedule::Butterfly), (0, 1));
 }
