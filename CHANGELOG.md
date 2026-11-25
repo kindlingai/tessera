@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.4.4](https://github.com/kindlingai/tessera/compare/v0.4.3...v0.4.4) (2026-11-25)
+
+
+### Features
+
+* **bundle:** pick built-in response templates by chat template, GGUF included ([#583](https://github.com/kindlingai/tessera/issues/583)) ([ff792a7](https://github.com/kindlingai/tessera/commit/ff792a7dd0f40640e3725a77f13d1fd33fc993eb))
+* **checkpoint:** support manifests on remote HTTP exlr8 releases ([#610](https://github.com/kindlingai/tessera/issues/610)) ([18b69a0](https://github.com/kindlingai/tessera/commit/18b69a0e653ce3a20a18167e46efc171142cb81f))
+* **cli:** serve the commands and tasks as MCP tools over stdio ([#617](https://github.com/kindlingai/tessera/issues/617)) ([209bc3c](https://github.com/kindlingai/tessera/commit/209bc3c4f049270d35831514471c3e77611716dd))
+* **device:** add grouped SYRK and BF16 routed-expert kernels ([#600](https://github.com/kindlingai/tessera/issues/600)) ([6bc90ba](https://github.com/kindlingai/tessera/commit/6bc90ba0b2c60668d68ed57952ac88b5374c91dc))
+* **engine:** interleave chunked prefill with active decode in BatchMtp ([#611](https://github.com/kindlingai/tessera/issues/611)) ([08c93bd](https://github.com/kindlingai/tessera/commit/08c93bd661c75de71f73da182218c734190e1329))
+* **graph:** add Role::Calib taps to MLA and Qwen4 MoE layers ([#598](https://github.com/kindlingai/tessera/issues/598)) ([2c909be](https://github.com/kindlingai/tessera/commit/2c909be730d513a329687324f8c6a2a9877d9608))
+* **hessians:** add Hessian file writers and the host calibration driver ([#601](https://github.com/kindlingai/tessera/issues/601)) ([47dcb31](https://github.com/kindlingai/tessera/commit/47dcb31698ff94b06b2ffd6f4c15a7b148d25d34))
+* **hessians:** add the CUDA runner, kernel bench and parity gate ([#590](https://github.com/kindlingai/tessera/issues/590)) ([7b6d470](https://github.com/kindlingai/tessera/commit/7b6d4700c140d1ef92974bfa19d554dad0d339fe))
+* **kv:** support shared paged KV pool capacity via --kv-cache-tokens ([#608](https://github.com/kindlingai/tessera/issues/608)) ([6009d0d](https://github.com/kindlingai/tessera/commit/6009d0df3fd89ec99e538465f61c1b110b523141))
+* **serve:** forward clear_thinking chat_template_kwargs ([#613](https://github.com/kindlingai/tessera/issues/613)) ([51ac85f](https://github.com/kindlingai/tessera/commit/51ac85f1a4ba867eac2d642af38208b90a8934b6))
+
+
+### Bug Fixes
+
+* **device:** keep NaN and one overflow rule for FP16 sum wires ([#616](https://github.com/kindlingai/tessera/issues/616)) ([8a69c2c](https://github.com/kindlingai/tessera/commit/8a69c2c2a07c2238960a1fcb88db32595c3e7087))
+* **docker:** install libibverbs runtime and providers in GPU images ([#609](https://github.com/kindlingai/tessera/issues/609)) ([4c679f5](https://github.com/kindlingai/tessera/commit/4c679f500e212158f823200acd963087e3bd058b))
+* **graph:** shard residual matmuls read through row gather after trim ([#615](https://github.com/kindlingai/tessera/issues/615)) ([ecd205a](https://github.com/kindlingai/tessera/commit/ecd205a2f8c175775548dc952123814359499781))
+* **lower:** keep MoE residual stages in the pinned router form ([#599](https://github.com/kindlingai/tessera/issues/599)) ([c3fbbaa](https://github.com/kindlingai/tessera/commit/c3fbbaa9867b79c9c0f15607dee852bee65ed3cc))
+* **recipe:** fetch exlr8 expert widths required by manifest ([#612](https://github.com/kindlingai/tessera/issues/612)) ([224b4fa](https://github.com/kindlingai/tessera/commit/224b4fae5271e7f62d5e1526339306b96b5d4995))
+
+
+### Performance
+
+* **device:** add cross-CTA split-K for narrow BF16 Tensor-Core matmuls ([#602](https://github.com/kindlingai/tessera/issues/602)) ([da9bea6](https://github.com/kindlingai/tessera/commit/da9bea63af09235238bc80a437430e0a0342efcd))
+* **device:** add FP16 wire transport for P2P all-reduce ([#595](https://github.com/kindlingai/tessera/issues/595)) ([fb0756c](https://github.com/kindlingai/tessera/commit/fb0756c92a84a9f1c48e1ab1988b1c08aef1c13a))
+* **device:** add opt-in BF16 wire transport for P2P all-reduce ([#592](https://github.com/kindlingai/tessera/issues/592)) ([7ef5bff](https://github.com/kindlingai/tessera/commit/7ef5bfff4711987533f16c186a2028e0559f9944))
+* **device:** add Tensor-Core grouped-Q split-K GQA attention for head_dim 128 ([#605](https://github.com/kindlingai/tessera/issues/605)) ([79341eb](https://github.com/kindlingai/tessera/commit/79341eb0d6199ed19c785e761a0cb15343bfd96a))
+* **device:** add Tensor-Core grouped-Q split-K MLA attention kernel ([#587](https://github.com/kindlingai/tessera/issues/587)) ([a1c59af](https://github.com/kindlingai/tessera/commit/a1c59afbf050e8328b615efa9a95996b8463150e))
+* **device:** use 16x16 BF16 Tensor-Core MMA for stacked_lanes ([#603](https://github.com/kindlingai/tessera/issues/603)) ([dc2113e](https://github.com/kindlingai/tessera/commit/dc2113eebf75f6b8684b483f796fabc9f70d7f1f))
+* **device:** use 16x32 BF16 Tensor-Core MMA for stacked_wide ([#594](https://github.com/kindlingai/tessera/issues/594)) ([b6ac50c](https://github.com/kindlingai/tessera/commit/b6ac50c858e5f65daa596b88c572cdeebdb4a32f))
+* **device:** vectorize MLA FP8 KV loads, use __expf, and cut barriers ([#597](https://github.com/kindlingai/tessera/issues/597)) ([7f68235](https://github.com/kindlingai/tessera/commit/7f68235dab4c68be34488faae2f3dcfacce12b0f))
+* **device:** widen MXFP8 split-K to N&lt;4096 and add r16 split-K ([#591](https://github.com/kindlingai/tessera/issues/591)) ([02a4074](https://github.com/kindlingai/tessera/commit/02a407451551ad4eeb9e698ed092ddf63153e0f3))
+* **engine:** wire DFlash selector log-probs into SpecLen confidence buckets ([#588](https://github.com/kindlingai/tessera/issues/588)) ([4416f68](https://github.com/kindlingai/tessera/commit/4416f68fecb917dda068d461a9a747cc60346192))
+* **glm53-moe:** use Tensor-Core split-K and register top-k in glm53_route ([#607](https://github.com/kindlingai/tessera/issues/607)) ([de386a0](https://github.com/kindlingai/tessera/commit/de386a0053b759c12c0ef0ca0ffad4f248d81e4d))
+* **kernels:** cache pass-1 sums in registers for add_rms_norm ([#604](https://github.com/kindlingai/tessera/issues/604)) ([c1e4ef8](https://github.com/kindlingai/tessera/commit/c1e4ef8f2c4be8df6e867653c05678400995c69d))
+* **kernels:** parallelize argmax reduction across 256 threads per row ([#589](https://github.com/kindlingai/tessera/issues/589)) ([3f70bb6](https://github.com/kindlingai/tessera/commit/3f70bb6aca3ac6b63213bb85cee46ca9bdd95407))
+* **kernels:** parallelize chunk_top across 128 threads and cache merge_top in shared memory ([#606](https://github.com/kindlingai/tessera/issues/606)) ([61c163a](https://github.com/kindlingai/tessera/commit/61c163ac80c15889246c19f8edb3a5ec1e693819))
+
 ## [0.4.3](https://github.com/kindlingai/tessera/compare/v0.4.2...v0.4.3) (2026-11-25)
 
 
