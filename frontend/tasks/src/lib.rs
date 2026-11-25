@@ -14,6 +14,8 @@ pub mod flow;
 #[cfg(test)]
 mod flow_test;
 pub mod generate;
+#[cfg(test)]
+mod generate_test;
 pub mod guided;
 pub mod klein;
 #[cfg(test)]

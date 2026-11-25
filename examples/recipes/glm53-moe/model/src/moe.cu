@@ -12,7 +12,8 @@ using trellis::word;
 typedef const u8* bytes;
 
 #define PICKS 8
-#define MAX_ROWS 64
+#define MAX_ROWS 256
+#define MAX_EXPERTS 256
 #define MAX_SLOTS 512
 #define ROUTE_SCALE 2.5f
 #define PLAN_WORDS (1u + MAX_SLOTS * 6u + MAX_ROWS * PICKS * 2u)
@@ -207,8 +208,8 @@ static __device__ inline float4 weights4(const void* router, u64 at, u32 bf16) {
 struct PlanSmem {
   u16 ids[MAX_ROWS][PICKS];
   float gates[MAX_ROWS][PICKS];
-  u32 emask[2][2048];
-  u16 slot_of[2048];
+  u32 emask[MAX_ROWS / 32][MAX_EXPERTS];
+  u16 slot_of[MAX_EXPERTS];
   u32 wsum[8];
   u32 total;
 };
@@ -265,62 +266,61 @@ static __device__ __noinline__ void route_tc(
   u32 xc = (tid & 15u) << 2u;
   u32 xw = (tid & 15u) << 1u;
   float* dst = scores + (u64)p * rows * experts;
-  for (u32 r0 = 0u; r0 < rows; r0 += 16u) {
-    if (r0 > 0u) prim::block_sync();
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    uint4 cur0 = load_bf16x8(wr + k_start + (t << 3u), aligned);
-    uint4 cur1 = load_bf16x8(wr + k_start + 32u + (t << 3u), aligned);
-    for (u32 k0 = k_start; k0 < k_end; k0 += 256u) {
+  u32 r0 = blockIdx.y << 4u;
+  if (r0 >= rows) return;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  uint4 cur0 = load_bf16x8(wr + k_start + (t << 3u), aligned);
+  uint4 cur1 = load_bf16x8(wr + k_start + 32u + (t << 3u), aligned);
+  for (u32 k0 = k_start; k0 < k_end; k0 += 256u) {
 #pragma unroll
-      for (u32 dr = 0u; dr < 16u; dr += 4u) {
-        u32 r = xr + dr;
-        stage_x_bf16(x, r0 + r, rows, hidden, k0 + (xs << 6u) + xc,
-                     &sm.sxh[xs][r][xw], &sm.sxl[xs][r][xw]);
-      }
-      *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2u]) = cur0;
-      *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][16u + (t << 2u)]) = cur1;
-      prim::block_sync();
-      if (k0 + 256u < k_end) {
-        cur0 = load_bf16x8(wr + k0 + 256u + (t << 3u), aligned);
-        cur1 = load_bf16x8(wr + k0 + 256u + 32u + (t << 3u), aligned);
-      }
-#pragma unroll
-      for (u32 ks = 0u; ks < 4u; ks++) {
-        u32 off = (ks << 3u) + t;
-        u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
-        u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off],
-                     sm.sxh[kp][g][off + 4u], sm.sxh[kp][g + 8u][off + 4u]};
-        u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off],
-                     sm.sxl[kp][g][off + 4u], sm.sxl[kp][g + 8u][off + 4u]};
-        mma_bf16_m16n8k16(acc, ah, b);
-        mma_bf16_m16n8k16(acc, al, b);
-      }
-      prim::block_sync();
+    for (u32 dr = 0u; dr < 16u; dr += 4u) {
+      u32 r = xr + dr;
+      stage_x_bf16(x, r0 + r, rows, hidden, k0 + (xs << 6u) + xc,
+                   &sm.sxh[xs][r][xw], &sm.sxl[xs][r][xw]);
     }
-    sm.u.red[kp][wt][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][t << 2u]) = cur0;
+    *reinterpret_cast<uint4*>(&sm.u.sw[warp][g][16u + (t << 2u)]) = cur1;
     prim::block_sync();
-    if (kp == 0u) {
-      float4 s = sm.u.red[0][wt][lane];
-      float4 q1 = sm.u.red[1][wt][lane];
-      float4 q2 = sm.u.red[2][wt][lane];
-      float4 q3 = sm.u.red[3][wt][lane];
-      float v0 = s.x + q1.x + q2.x + q3.x;
-      float v1 = s.y + q1.y + q2.y + q3.y;
-      float v2 = s.z + q1.z + q2.z + q3.z;
-      float v3 = s.w + q1.w + q2.w + q3.w;
-      if (rks == 1u) {
-        v0 = 1.0f / (1.0f + __expf(-v0));
-        v1 = 1.0f / (1.0f + __expf(-v1));
-        v2 = 1.0f / (1.0f + __expf(-v2));
-        v3 = 1.0f / (1.0f + __expf(-v3));
-      }
-      u32 col = n0 + (wt << 3u) + (t << 1u);
-      if (r0 + g < rows) {
-        *reinterpret_cast<float2*>(dst + (u64)(r0 + g) * experts + col) = make_float2(v0, v1);
-      }
-      if (r0 + g + 8u < rows) {
-        *reinterpret_cast<float2*>(dst + (u64)(r0 + g + 8u) * experts + col) = make_float2(v2, v3);
-      }
+    if (k0 + 256u < k_end) {
+      cur0 = load_bf16x8(wr + k0 + 256u + (t << 3u), aligned);
+      cur1 = load_bf16x8(wr + k0 + 256u + 32u + (t << 3u), aligned);
+    }
+#pragma unroll
+    for (u32 ks = 0u; ks < 4u; ks++) {
+      u32 off = (ks << 3u) + t;
+      u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
+      u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off],
+                   sm.sxh[kp][g][off + 4u], sm.sxh[kp][g + 8u][off + 4u]};
+      u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off],
+                   sm.sxl[kp][g][off + 4u], sm.sxl[kp][g + 8u][off + 4u]};
+      mma_bf16_m16n8k16(acc, ah, b);
+      mma_bf16_m16n8k16(acc, al, b);
+    }
+    prim::block_sync();
+  }
+  sm.u.red[kp][wt][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+  prim::block_sync();
+  if (kp == 0u) {
+    float4 s = sm.u.red[0][wt][lane];
+    float4 q1 = sm.u.red[1][wt][lane];
+    float4 q2 = sm.u.red[2][wt][lane];
+    float4 q3 = sm.u.red[3][wt][lane];
+    float v0 = s.x + q1.x + q2.x + q3.x;
+    float v1 = s.y + q1.y + q2.y + q3.y;
+    float v2 = s.z + q1.z + q2.z + q3.z;
+    float v3 = s.w + q1.w + q2.w + q3.w;
+    if (rks == 1u) {
+      v0 = 1.0f / (1.0f + __expf(-v0));
+      v1 = 1.0f / (1.0f + __expf(-v1));
+      v2 = 1.0f / (1.0f + __expf(-v2));
+      v3 = 1.0f / (1.0f + __expf(-v3));
+    }
+    u32 col = n0 + (wt << 3u) + (t << 1u);
+    if (r0 + g < rows) {
+      *reinterpret_cast<float2*>(dst + (u64)(r0 + g) * experts + col) = make_float2(v0, v1);
+    }
+    if (r0 + g + 8u < rows) {
+      *reinterpret_cast<float2*>(dst + (u64)(r0 + g + 8u) * experts + col) = make_float2(v2, v3);
     }
   }
 }
@@ -340,9 +340,9 @@ static __device__ __noinline__ void route_plan(
       route(scores + (u64)r * experts, bias, experts, picks, rks == 1u, sm.ids[r], sm.gates[r]);
     }
   }
-  for (u32 i = tid; i < count; i += 256u) {
-    sm.emask[0][i] = 0u;
-    sm.emask[1][i] = 0u;
+  if (tid < count) {
+#pragma unroll
+    for (u32 w = 0u; w < 8u; w++) sm.emask[w][tid] = 0u;
   }
   if (tid == 0u) sm.total = 0u;
   prim::block_sync();
@@ -355,60 +355,75 @@ static __device__ __noinline__ void route_plan(
     if (mine) atomicOr(&sm.emask[r >> 5u][e - first], 1u << (r & 31u));
   }
   prim::block_sync();
-  for (u32 base = 0u; base < count; base += 256u) {
-    u32 le = base + tid;
-    u64 m = le < count ? ((u64)sm.emask[0][le] | ((u64)sm.emask[1][le] << 32u)) : 0ull;
-    u32 cnt = __popcll(m);
-    u32 ns = (cnt + 7u) >> 3u;
-    u32 incl = ns;
+  u32 m[8];
+  u32 cnt = 0u;
+  if (tid < count) {
 #pragma unroll
-    for (u32 d = 1u; d < 32u; d <<= 1u) {
-      u32 v = __shfl_up_sync(0xFFFFFFFFu, incl, d);
-      if (lane >= d) incl += v;
+    for (u32 w = 0u; w < 8u; w++) {
+      m[w] = sm.emask[w][tid];
+      cnt += __popc(m[w]);
     }
-    if (lane == 31u) sm.wsum[warp] = incl;
-    prim::block_sync();
-    u32 chunk_base = sm.total;
-    if (warp == 0u) {
-      u32 wv = lane < 8u ? sm.wsum[lane] : 0u;
-      u32 wi = wv;
-#pragma unroll
-      for (u32 d = 1u; d < 8u; d <<= 1u) {
-        u32 v = __shfl_up_sync(0xFFFFFFFFu, wi, d);
-        if (lane >= d) wi += v;
-      }
-      if (lane < 8u) sm.wsum[lane] = wi - wv;
-      if (lane == 7u) sm.total = chunk_base + wi;
-    }
-    prim::block_sync();
-    if (ns > 0u) {
-      u32 s0 = chunk_base + sm.wsum[warp] + (incl - ns);
-      sm.slot_of[le] = (u16)s0;
-      u64 bits = m;
-      for (u32 sub = 0u; sub < ns; sub++) {
-        u32 s = s0 + sub;
-        u32 take = min(cnt - sub * 8u, 8u);
-        plan->slot_expert[s] = first + le;
-        plan->slot_count[s] = take;
-        u64 pack = 0ull;
-        for (u32 k = 0u; k < take; k++) {
-          u32 r = (u32)(__ffsll((long long)bits) - 1);
-          bits &= bits - 1ull;
-          pack |= (u64)r << (k << 3u);
-        }
-        plan->slot_tok[s][0] = (u32)pack;
-        plan->slot_tok[s][1] = (u32)(pack >> 32u);
-      }
-    }
-    prim::block_sync();
   }
+  u32 ns = (cnt + 7u) >> 3u;
+  u32 incl = ns;
+#pragma unroll
+  for (u32 d = 1u; d < 32u; d <<= 1u) {
+    u32 v = __shfl_up_sync(0xFFFFFFFFu, incl, d);
+    if (lane >= d) incl += v;
+  }
+  if (lane == 31u) sm.wsum[warp] = incl;
+  prim::block_sync();
+  if (warp == 0u) {
+    u32 wv = lane < 8u ? sm.wsum[lane] : 0u;
+    u32 wi = wv;
+#pragma unroll
+    for (u32 d = 1u; d < 8u; d <<= 1u) {
+      u32 v = __shfl_up_sync(0xFFFFFFFFu, wi, d);
+      if (lane >= d) wi += v;
+    }
+    if (lane < 8u) sm.wsum[lane] = wi - wv;
+    if (lane == 7u) sm.total = wi;
+  }
+  prim::block_sync();
+  if (ns > 0u) {
+    u32 s0 = sm.wsum[warp] + (incl - ns);
+    sm.slot_of[tid] = (u16)s0;
+    u32 s = s0, take = 0u;
+    u64 pack = 0ull;
+    for (u32 w = 0u; w < 8u; w++) {
+      u32 bits = m[w];
+      while (bits != 0u) {
+        u32 r = (w << 5u) | (u32)(__ffs((int)bits) - 1);
+        bits &= bits - 1u;
+        pack |= (u64)r << (take << 3u);
+        take++;
+        if (take == 8u) {
+          plan->slot_expert[s] = first + tid;
+          plan->slot_count[s] = 8u;
+          plan->slot_tok[s][0] = (u32)pack;
+          plan->slot_tok[s][1] = (u32)(pack >> 32u);
+          s++;
+          take = 0u;
+          pack = 0ull;
+        }
+      }
+    }
+    if (take > 0u) {
+      plan->slot_expert[s] = first + tid;
+      plan->slot_count[s] = take;
+      plan->slot_tok[s][0] = (u32)pack;
+      plan->slot_tok[s][1] = (u32)(pack >> 32u);
+    }
+  }
+  prim::block_sync();
   for (u32 i = tid; i < rows * picks; i += 256u) {
     u32 r = i / picks, p = i % picks;
     u32 e = sm.ids[r][p];
     if (e < first || e >= first + count) continue;
     u32 le = e - first;
-    u64 em = (u64)sm.emask[0][le] | ((u64)sm.emask[1][le] << 32u);
-    u32 rank = __popcll(em & ((1ull << r) - 1ull));
+    u32 rw = r >> 5u, rb = r & 31u;
+    u32 rank = __popc(sm.emask[rw][le] & ((1u << rb) - 1u));
+    for (u32 w = 0u; w < rw; w++) rank += __popc(sm.emask[w][le]);
     plan->slot_pick[(u32)sm.slot_of[le] + (rank >> 3u)][rank & 7u] = (u8)p;
   }
   if (tid == 0u) plan->n_slots = sm.total;
@@ -475,7 +490,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
   prim::block_sync();
   if (tid == 0u) {
     u32 done = prim::fetch_add_gpu(&route_done, 1u) + 1u;
-    is_last = done == gridDim.x ? 1u : 0u;
+    is_last = done == gridDim.x * gridDim.y ? 1u : 0u;
     if (is_last) prim::store_relaxed_gpu(&route_done, 0u);
   }
   prim::block_sync();

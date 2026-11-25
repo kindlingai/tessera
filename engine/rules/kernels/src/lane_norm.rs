@@ -15,8 +15,20 @@ pub(crate) const BLOCK_THREADS: u32 = WARPS * LANES as u32;
 /// Minimum width to split across a whole block.
 pub(crate) const BLOCK_MIN: usize = 512;
 
-/// Maximum rows where block-wide RMS norm wins.
+/// Minimum width that prefers block mode for prefill batches.
+const WIDE_BLOCK_MIN: usize = 2048;
+
+/// Maximum rows where narrow block-wide RMS norm wins.
 pub(crate) const BLOCK_ROWS: usize = 16;
+
+/// Maximum rows where wide block-wide RMS norm wins.
+const WIDE_BLOCK_ROWS: usize = 512;
+
+/// Whether `rows` of `width` should run one block per row.
+pub(crate) fn use_block(rows: usize, width: usize) -> bool {
+    (rows <= BLOCK_ROWS && width >= BLOCK_MIN)
+        || (rows <= WIDE_BLOCK_ROWS && width >= WIDE_BLOCK_MIN)
+}
 
 /// Sums a row's squares, then scales the row.
 #[kernel]
@@ -207,7 +219,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         .map_or(x_form, |(o, _)| plain(tree.node(o).form));
     let out_form = writable(tree.node(at).form);
     let rows = site.len / site.width;
-    let block = rows <= BLOCK_ROWS && site.width >= BLOCK_MIN;
+    let block = use_block(rows, site.width);
     let kernel = LaneNorm {
         rows,
         width: site.width,

@@ -1,6 +1,6 @@
 //! Fused residual add and RMS norm, per warp or block.
 
-use crate::lane_norm::{BLOCK_MIN, BLOCK_ROWS, BLOCK_THREADS, WARPS, row_needs, row_shape};
+use crate::lane_norm::{BLOCK_THREADS, WARPS, row_needs, row_shape, use_block};
 use crate::{AHEAD, WIDE};
 use tessera_codegen::prelude::*;
 use tessera_graph::{Order, Stage};
@@ -420,7 +420,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         .operand
         .map_or(F32_FORM, |(o, _)| plain(tree.node(o).form));
     let rows = site.len / site.width;
-    let block = rows <= BLOCK_ROWS && site.width >= BLOCK_MIN;
+    let block = use_block(rows, site.width);
     let make = |reads: Vec<T>, forms: [&'static dyn Stored; 3], add3: bool, choice: usize| {
         let kernel = AddLaneNorm {
             rows,

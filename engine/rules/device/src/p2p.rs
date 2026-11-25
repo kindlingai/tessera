@@ -25,6 +25,8 @@ const MAX_BYTES: usize = MAX_FLOATS * 4;
 pub(crate) const SLOT_BYTES: usize = MAX_BYTES + 4096;
 /// Byte threshold switching from fan-out to pairwise rounds.
 pub(crate) const CROSSOVER: usize = 24 << 10;
+/// Byte threshold switching four-rank sums to reduce-scatter and all-gather.
+const SCATTER_CROSSOVER: usize = 256 << 10;
 
 const BASE: u64 = 3;
 const RING: usize = 4;
@@ -37,7 +39,7 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// Schedule choice for P2P transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Schedule {
-    /// Fan-out below `CROSSOVER`, butterfly or rounds from `CROSSOVER` up.
+    /// Fan-out, butterfly, or halving-doubling by payload size.
     #[default]
     Auto,
     /// Every rank writes all peers at once.
@@ -46,6 +48,8 @@ pub enum Schedule {
     Rounds,
     /// Recursive doubling for power-of-two ranks, rounds otherwise.
     Butterfly,
+    /// Reduce-scatter and all-gather for four ranks, butterfly otherwise.
+    Scatter,
 }
 
 /// Bytes in one rank's IPC area.
@@ -61,6 +65,7 @@ pub(crate) const fn ack_offset(ranks: u32) -> usize {
 /// Picks `(sched_code, grid_blocks)` for `bytes` across `ranks`.
 pub(crate) const fn pick(bytes: usize, ranks: u32, schedule: Schedule) -> (u32, u32) {
     let large = bytes >= CROSSOVER;
+    let huge = bytes >= SCATTER_CROSSOVER;
     let pow2 = ranks.is_power_of_two();
     let sched = match schedule {
         Schedule::Fanout => 0,
@@ -80,8 +85,21 @@ pub(crate) const fn pick(bytes: usize, ranks: u32, schedule: Schedule) -> (u32, 
                 0
             }
         }
+        Schedule::Scatter => {
+            if ranks == 4 {
+                3
+            } else if ranks >= 4 && pow2 {
+                2
+            } else if ranks > 2 {
+                1
+            } else {
+                0
+            }
+        }
         Schedule::Auto => {
-            if large && ranks >= 4 && pow2 {
+            if huge && ranks == 4 {
+                3
+            } else if large && ranks >= 4 && pow2 {
                 2
             } else if large && ranks > 2 {
                 1

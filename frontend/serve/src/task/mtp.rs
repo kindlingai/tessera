@@ -89,6 +89,7 @@ fn run_batch_loop(load: &Load, mut batch: BatchMtp<'_>, target: Bundle) -> Resul
         stop: target.stop,
         guides: None,
         edits: false,
+        sampling: false,
     };
     let jobs = queue(load, generate, false);
     loop {

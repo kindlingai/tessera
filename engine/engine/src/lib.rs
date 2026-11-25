@@ -47,10 +47,10 @@ pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
 pub use ranks::Place;
-pub use sample::Sampling;
+pub use sample::{Sampling, Target, Weights, accept};
 pub use schedule::{Batch, Fair, Policy, Seq, Sink};
 pub use spec_len::{CostModel, SpecLen};
-pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample};
+pub use speculate::{Drafter, SpecStats, Speculate};
 
 // The front end reaches the engine crates only through these.
 pub use tessera_device::{p2p, sums, whole};

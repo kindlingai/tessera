@@ -172,6 +172,14 @@ impl Overrides {
         Self(files)
     }
 
+    /// Sets `key` in `file`'s table, over any value there.
+    pub fn set(&mut self, file: &str, key: &str, value: serde_json::Value) {
+        let table = self.0.entry(file).or_insert_with(|| serde_json::json!({}));
+        if let Some(table) = table.as_object_mut() {
+            table.insert(key.into(), value);
+        }
+    }
+
     /// The tables for files in `folder`, keyed from inside it.
     pub fn under(&self, folder: &str) -> Self {
         let prefix = format!("{folder}/");
