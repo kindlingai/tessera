@@ -97,14 +97,10 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     match kind {
         AttendKind::Mla if groups <= 8 => 16,
         AttendKind::Mla if groups <= 16 => 8,
-        AttendKind::Mla if groups <= 64 => 4,
-        AttendKind::Mla if groups <= 128 => 2,
-        AttendKind::Mla => 1,
+        AttendKind::Mla => 4,
         AttendKind::Gqa if groups <= 16 => 16,
         AttendKind::Gqa if groups <= 32 => 8,
-        AttendKind::Gqa if groups <= 128 => 4,
-        AttendKind::Gqa if groups <= 256 => 2,
-        AttendKind::Gqa => 1,
+        AttendKind::Gqa => 4,
     }
 }
 
