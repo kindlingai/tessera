@@ -61,7 +61,7 @@ fn renders_tools_and_dictsort() {
 {% for k, v in t.function.parameters.properties | dictsort %}{{ k }}={{ v.type }},{% endfor %}{% endfor %}\
 {% for m in messages %}{% if m.get('tool_calls') %}{% for tc in m.tool_calls %}\
 call:{{ tc.function.name }}({% for k, v in tc.function.arguments | dictsort %}{{ k }}={{ v }}{% endfor %})\
-{% endfor %}{% endif %}{% endfor %}";
+{% endfor %}{% endif %}{% endfor %}{{ tools[0].function.parameters | tojson(ensure_ascii=False) }}";
     let t = Template::new(source.into())
         .unwrap()
         .with_tokens(Some("<bos>".into()), None);
@@ -87,5 +87,9 @@ call:{{ tc.function.name }}({% for k, v in tc.function.arguments | dictsort %}{{
         ..Default::default()
     };
     let got = t.render_options(&[msg], &opts).unwrap();
-    assert_eq!(got, "<bos>weather:a=string,z=int,call:weather(city=Tokyo)");
+    let json = r#"{"properties": {"z": {"type": "int"}, "a": {"type": "string"}}}"#;
+    assert_eq!(
+        got,
+        format!("<bos>weather:a=string,z=int,call:weather(city=Tokyo){json}")
+    );
 }
