@@ -40,7 +40,7 @@ pub(crate) struct Part {
     pub held: bool,
 }
 
-/// What one layer collects.
+/// The sums one layer collects.
 pub(crate) struct Wants {
     pub experts: bool,
     pub dense: bool,

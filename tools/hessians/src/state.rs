@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use tessera_graph::Bf16;
 
-/// What a run's files depend on, checked again on `--resume`.
+/// The inputs a run's files depend on, checked on `--resume`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Stamp {
     pub weights_id: String,
