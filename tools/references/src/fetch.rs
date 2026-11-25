@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tessera_recipe::progress::{Log, Progress};
 use tessera_recipe::{Error, fetch_as, safe_path};
 
 /// The dataset, as a hub path.
@@ -41,8 +43,9 @@ struct Source {
 pub(crate) fn fetch(dir: &Path) -> Result<(), Error> {
     let settings = tessera_frontend_settings::read();
     let token = settings.hf_token.as_deref();
+    let progress = Progress::new(Arc::new(Log));
     let list = dir.join(MANIFEST);
-    fetch_as(DATASET, PINNED, MANIFEST, &list, token)?;
+    fetch_as(DATASET, PINNED, MANIFEST, &list, token, &progress)?;
     let text = std::fs::read_to_string(&list).map_err(|e| Error::Io(list.clone(), e))?;
     let manifest: Manifest = serde_json::from_str(&text)
         .map_err(|e| Error::Http(list.display().to_string(), e.to_string()))?;
@@ -62,7 +65,7 @@ pub(crate) fn fetch(dir: &Path) -> Result<(), Error> {
             Some(s) => (s.repo.as_str(), s.revision.as_str(), s.file.as_str()),
             None => (DATASET, PINNED, entry.path.as_str()),
         };
-        fetch_as(repo, revision, file, &path, token)?;
+        fetch_as(repo, revision, file, &path, token, &progress)?;
         if sha256(&path)? != entry.sha256 {
             std::fs::remove_file(&path).map_err(|e| Error::Io(path.clone(), e))?;
             return Err(Error::Source(entry.path.clone(), "SHA-256 differs"));

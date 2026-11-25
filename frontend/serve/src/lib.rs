@@ -32,6 +32,7 @@ pub use images::base64;
 use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use tessera_bundle::RenderOptions;
+use tessera_engine::progress::{Event, Open, Unit};
 pub use tessera_tasks::api::Model;
 use wire::{Detokenize, Embeddings, Messages, Refusal, Tokenize, bad, refuse};
 
@@ -85,14 +86,44 @@ fn reply(slot: &Slot, f: impl FnOnce(&Model) -> Result<Value, Refusal>) -> Respo
     }
 }
 
-/// Ready or loading, matching llama.cpp's status.
-fn health(slot: &Slot) -> Response {
-    match slot.get() {
-        Some(_) => Response::json(200, &json!({"status": "ok"})),
-        None => {
-            let error = json!({"code": 503, "message": "the model is loading", "type": "unavailable_error"});
-            Response::json(503, &json!({"error": error}))
-        }
+/// Paths that answer `health`.
+const HEALTH: [&str; 4] = ["/health", "/v1/health", "/v1/health/ready", "/ping"];
+
+/// Ready or loading, matching llama.cpp's status, with load steps.
+fn health(slot: &Slot, open: Option<&Open>) -> Response {
+    if slot.get().is_some() {
+        return Response::json(200, &json!({"status": "ok"}));
+    }
+    let error =
+        json!({"code": 503, "message": "the model is loading", "type": "unavailable_error"});
+    let mut body = json!({"error": error});
+    if let Some(open) = open {
+        body["progress"] = open.steps().iter().map(step).collect();
+    }
+    Response::json(503, &body)
+}
+
+/// One open load step as JSON.
+pub fn step(event: &Event) -> Value {
+    let unit = match event.unit {
+        Unit::Bytes => "bytes",
+        Unit::Items => "items",
+    };
+    json!({
+        "id": event.id,
+        "parent": event.parent,
+        "name": &*event.name,
+        "unit": unit,
+        "done": event.done,
+        "total": event.total,
+    })
+}
+
+/// As `route`. Health answers list the open load steps.
+pub(crate) fn route_open(slot: &Slot, open: &Open, request: &Request) -> Response {
+    match request.method == "GET" && HEALTH.contains(&request.path.as_str()) {
+        true => health(slot, Some(open)),
+        false => route(slot, request),
     }
 }
 
@@ -162,7 +193,7 @@ tessera_engine::metric!(IMAGES in API = Counter "tessera:image_requests_total", 
 pub fn route(slot: &Slot, request: &Request) -> Response {
     let body = request.body.as_slice();
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health" | "/v1/health" | "/v1/health/ready" | "/ping") => health(slot),
+        ("GET", path) if HEALTH.contains(&path) => health(slot, None),
         ("GET", "/version") => Response::json(200, &json!({"version": env!("CARGO_PKG_VERSION")})),
         ("GET", "/v1/models") => models(slot),
         ("GET", "/metrics") => metrics::metrics(),

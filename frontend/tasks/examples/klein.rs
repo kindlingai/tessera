@@ -1,9 +1,11 @@
 //! A FLUX.2 klein picture for a prompt, written to PNG.
 
+use std::sync::Arc;
 use std::time::Instant;
 use tessera_bundle::Overrides;
 use tessera_checkpoint::File;
 use tessera_recipe::Recipe;
+use tessera_recipe::progress::{Log, Progress};
 use tessera_tasks::klein::{Klein, noise};
 use tessera_tasks::png;
 
@@ -21,7 +23,11 @@ fn main() -> Result<(), tessera_tasks::Error> {
     let settings = tessera_frontend_settings::read();
     let (cache, token) = (settings.recipes.clone(), settings.hf_token.clone());
     let recipe = Recipe::open(recipe, cache.as_deref())?;
-    let dir = recipe.weights(cache.as_deref(), token.as_deref())?;
+    let dir = recipe.weights(
+        cache.as_deref(),
+        token.as_deref(),
+        &Progress::new(Arc::new(Log)),
+    )?;
     let config = Overrides::new(recipe.overrides());
     let started = Instant::now();
     let mut klein = Klein::open(dir, settings, side * 16, config)?;

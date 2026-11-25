@@ -1,4 +1,5 @@
 use crate::source::{Origin, Source, split};
+use tessera_engine::progress::Progress;
 
 fn origin(value: &str) -> Option<Origin> {
     let given = ["--model".to_string(), value.to_string()];
@@ -26,7 +27,7 @@ fn options_carry_rules() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/recipes/glm53-moe"
     );
-    let Ok(mut source) = Source::open(Some(Origin::Recipe(dir.into()))) else {
+    let Ok(mut source) = Source::open(Some(Origin::Recipe(dir.into())), Progress::default()) else {
         panic!("the recipe opens");
     };
     source.cache = Some(tessera_testkit::scratch("recipes"));
@@ -43,7 +44,7 @@ fn options_carry_rules() {
 /// The built-in recipe reads, with its weights and a manifest.
 #[test]
 fn default_recipe_reads() {
-    let Ok(source) = Source::open_or_kind(None, None) else {
+    let Ok(source) = Source::open_or_kind(None, None, Progress::default()) else {
         panic!("the default recipe opens");
     };
     let recipe = source.recipe.unwrap();

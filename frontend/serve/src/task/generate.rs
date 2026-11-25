@@ -4,6 +4,7 @@ use super::{Entry, Flag, Load, Pick};
 use crate::start::Options;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
+use tessera_engine::progress::Unit;
 use tessera_engine::{Batch, Engine, Fair, Pins, PleStore, Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
 use tessera_tasks::{Generate, Job, Queued};
@@ -130,12 +131,14 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     let at = [slots, context];
     let manifest = load.given("--manifest");
     let module = o.module.as_deref();
+    let reading = o.progress.step("read model", Unit::Items, None);
     let built = module.map(|m| tessera_bundle::load_module(&o.model, at, &rules, &o.config, m));
     let loaded = match built.transpose().map_err(|e| e.to_string())?.flatten() {
         Some(bundle) => bundle,
         None => tessera_bundle::load_named(&o.model, at, &rules, steps, &o.config, manifest)
             .map_err(|e| e.to_string())?,
     };
+    reading.finish();
     let scores = loaded.graph.entries.len() > 1;
     let mut recipe = lowering(o, loaded.pins);
     if recipe.config.is_none() {
@@ -143,14 +146,17 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     }
     let at = (&recipe, &settings);
     let count = loaded.graph.weights.len() as u32;
+    let compiling = o.progress.step("compile", Unit::Items, None);
     let mut engine = o.ranks.open(links, loaded.graph, o.max_model_len, at)?;
+    compiling.finish();
     if let Some(ple) = loaded.ple {
         let store = PleStore::open(ple).map_err(|e| format!("ple store: {e}"))?;
         engine.set_ple(store);
     }
     let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
     let shares = |at: u32| shares[at as usize];
-    let loading = (loaded.weights).each_share(shares, |at, w| engine.load_weight(at, w));
+    let take = |at, w: &_| engine.load_weight(at, w);
+    let loading = (loaded.weights).each_counted(&o.progress, count, shares, take);
     loading.map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("{}: loaded in {seconds:.1} s", engine.device());

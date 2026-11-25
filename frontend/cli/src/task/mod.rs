@@ -12,6 +12,7 @@ use crate::source::{Origin, Source, Stop};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
+use tessera_engine::progress::Progress;
 use tessera_serve::start::{self, Options};
 use tessera_serve::{Model, Slot};
 use tessera_tasks::task::{Ask, Chat, Embed, Image, Run, Sink, Tag, Task, Usage, Value};
@@ -184,7 +185,8 @@ fn call_entry<T: Task, O: Target<T>>(
 ) -> Result<(), Stop> {
     let task = T::parse(args, &O::takes);
     let task = task.map_err(|e| Stop::Tasks(Some(format!("{}: {e}", T::NAME))))?;
-    O::run(task, Source::open_or_kind(origin, T::KIND)?, sink).map_err(stop)
+    let source = Source::open_or_kind(origin, T::KIND, sink.progress())?;
+    O::run(task, source, sink).map_err(stop)
 }
 
 /// A task's error as a `Stop`.
@@ -301,6 +303,10 @@ impl Sink for Print {
             Ok(n) if n > 0 => Some(line),
             _ => None,
         }
+    }
+
+    fn progress(&self) -> Progress {
+        crate::progress::stderr()
     }
 }
 

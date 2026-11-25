@@ -4,6 +4,7 @@ mod fetch;
 mod mcp;
 #[cfg(test)]
 mod mcp_test;
+mod progress;
 mod serve;
 mod source;
 #[cfg(test)]

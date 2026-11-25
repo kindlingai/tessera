@@ -2,8 +2,9 @@
 
 use crate::start::Options;
 use crate::{Model, Slot};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tessera_engine::Settings;
+use tessera_engine::progress::Step;
 use tessera_tasks::api::{GenerateImage, Info, Tokens};
 
 /// Declares each entry's module and lists its `ENTRY`.
@@ -82,6 +83,8 @@ pub struct Load<'a> {
     pub options: &'a Options,
     pub info: Info,
     pub slot: &'a Slot,
+    /// The load's step, done when the slot fills.
+    pub step: Mutex<Option<Step>>,
 }
 
 impl Load<'_> {
@@ -115,6 +118,9 @@ impl Load<'_> {
         };
         with(&mut model);
         let _ = self.slot.set(model);
+        if let Some(step) = self.step.lock().ok().and_then(|mut s| s.take()) {
+            step.finish();
+        }
     }
 
     /// Fills the slot with one image model.

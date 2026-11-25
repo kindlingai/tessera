@@ -12,10 +12,12 @@ mod source_test;
 
 pub use hub::{check_hf, fetch as fetch_hf, fetch_as, safe_path, search_hf};
 pub use source::Source;
+pub use tessera_engine::progress;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tessera_engine::progress::Progress;
 
 /// Errors that stop a recipe from opening.
 #[derive(Debug, thiserror::Error)]
@@ -120,7 +122,12 @@ impl Recipe {
     }
 
     /// The weights directory, fetched into `cache` when remote.
-    pub fn weights(&self, cache: Option<&Path>, token: Option<&str>) -> Result<PathBuf, Error> {
+    pub fn weights(
+        &self,
+        cache: Option<&Path>,
+        token: Option<&str>,
+        progress: &Progress,
+    ) -> Result<PathBuf, Error> {
         match (&self.weights.path, &self.weights.hf) {
             (Some(path), None) => Ok(self.dir.join(path)),
             (None, Some(hf)) => {
@@ -129,6 +136,7 @@ impl Recipe {
                     hf,
                     cache.ok_or(Error::NoCache)?,
                     token,
+                    progress,
                     self.weights.width,
                     manifest,
                 )
@@ -142,10 +150,12 @@ impl Recipe {
         &self,
         cache: Option<&Path>,
         token: Option<&str>,
+        progress: &Progress,
     ) -> Result<Vec<(String, PathBuf)>, Error> {
         let mut flags = Vec::new();
         for (name, spec) in &self.weights.extra {
-            let dir = hub::snapshot(spec, cache.ok_or(Error::NoCache)?, token, None, None)?;
+            let cache = cache.ok_or(Error::NoCache)?;
+            let dir = hub::snapshot(spec, cache, token, progress, None, None)?;
             flags.push((format!("--{}", name.replace('_', "-")), dir));
         }
         Ok(flags)

@@ -21,8 +21,9 @@ impl Run<Source> for Fetch {
         let recipe = source.recipe.as_ref().ok_or(Stop::Usage)?;
         line("recipe", &recipe.dir);
         let (cache, token) = (source.cache.as_deref(), source.token.as_deref());
-        line("weights", &recipe.weights(cache, token)?);
-        for (flag, dir) in recipe.extras(cache, token)? {
+        let progress = &source.progress;
+        line("weights", &recipe.weights(cache, token, progress)?);
+        for (flag, dir) in recipe.extras(cache, token, progress)? {
             line(flag.trim_start_matches('-'), &dir);
         }
         Ok(())

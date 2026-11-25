@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tessera_engine::progress::Progress;
 use tessera_engine::wasm::{Module, Trace};
 use tessera_recipe::Recipe;
 use tessera_serve::start::Options;
@@ -145,11 +146,13 @@ pub struct Source {
     /// The snapshot directory, for a Hugging Face origin.
     pub fetched: Option<PathBuf>,
     dump_sites: Option<PathBuf>,
+    /// Where downloads and the model load report.
+    pub progress: Progress,
 }
 
 impl Source {
     /// Opens the recipe, if the origin is one.
-    pub fn open(origin: Option<Origin>) -> Result<Source, Stop> {
+    pub fn open(origin: Option<Origin>, progress: Progress) -> Result<Source, Stop> {
         let origin = origin.ok_or(Stop::Usage)?;
         let settings = tessera_frontend_settings::read();
         let (cache, token, dump_sites) = (settings.recipes, settings.hf_token, settings.dump_sites);
@@ -160,7 +163,8 @@ impl Source {
             Origin::Model(_) => None,
             Origin::Hub(spec) => {
                 let dir = cache.as_deref().ok_or(tessera_recipe::Error::NoCache)?;
-                fetched = Some(tessera_recipe::fetch_hf(spec, dir, token.as_deref())?);
+                let token = token.as_deref();
+                fetched = Some(tessera_recipe::fetch_hf(spec, dir, token, &progress)?);
                 None
             }
         };
@@ -171,20 +175,25 @@ impl Source {
             token,
             fetched,
             dump_sites,
+            progress,
         })
     }
 
     /// Opens `origin`, else the first catalog recipe of `of`.
-    pub fn open_or_kind(origin: Option<Origin>, of: Option<&str>) -> Result<Source, Stop> {
+    pub fn open_or_kind(
+        origin: Option<Origin>,
+        of: Option<&str>,
+        progress: Progress,
+    ) -> Result<Source, Stop> {
         if origin.is_some() {
-            return Self::open(origin);
+            return Self::open(origin, progress);
         }
         for (name, _) in CATALOG {
             let Some(Ok(recipe)) = builtin(name) else {
                 continue;
             };
             if of.is_none_or(|k| k == kind(&recipe)) {
-                return Self::open(Some(Origin::Builtin(name)));
+                return Self::open(Some(Origin::Builtin(name)), progress);
             }
         }
         let of = of.unwrap_or_default();
@@ -195,9 +204,10 @@ impl Source {
     /// Serve options from the recipe, then from `rest`.
     pub fn options(&self, rest: &[String]) -> Result<Options, Stop> {
         let mut options = Options::default();
+        options.progress = self.progress.clone();
         if let Some(r) = &self.recipe {
-            let cache = self.cache.as_deref();
-            options.model = r.weights(cache, self.token.as_deref())?;
+            let (cache, token) = (self.cache.as_deref(), self.token.as_deref());
+            options.model = r.weights(cache, token, &self.progress)?;
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
@@ -213,7 +223,7 @@ impl Source {
                 options.lower.get_or_insert_default().rules.extend(rules);
                 options.module = Some(Arc::new(module));
             }
-            for (flag, dir) in r.extras(cache, self.token.as_deref())? {
+            for (flag, dir) in r.extras(cache, token, &self.progress)? {
                 apply(&mut options, &flag, Some(dir.display().to_string()))?;
             }
             for (flag, value) in r.flags() {

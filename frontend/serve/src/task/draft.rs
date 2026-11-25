@@ -72,7 +72,7 @@ pub(super) fn open_target(
     let shares: Vec<_> = (0..count).map(|at| engine.share(at)).collect();
     let shares = |at: u32| shares[at as usize];
     (target.weights)
-        .each_share(shares, |at, w| engine.load_weight(at, w))
+        .each_counted(&o.progress, count, shares, |at, w| engine.load_weight(at, w))
         .map_err(|e| e.to_string())?;
     Ok((engine, target))
 }
@@ -165,8 +165,9 @@ pub(super) fn open_drafter(
     drafter.set_causal(pair.causal);
     let count = drafter.weight_count();
     let shares: Vec<_> = (0..count).map(|at| drafter.share(at)).collect();
+    let take = |at, w: &_| drafter.load_weight(at, w);
     pair.weights
-        .each_share(|at| shares[at as usize], |at, w| drafter.load_weight(at, w))
+        .each_counted(&o.progress, count, |at| shares[at as usize], take)
         .map_err(|e| e.to_string())?;
     Ok(drafter)
 }

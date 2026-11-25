@@ -254,7 +254,7 @@ struct Session {
 
 impl Session {
     fn open(max_tokens: Option<usize>, yes: bool) -> Result<Self, Stop> {
-        let source = Source::open_or_kind(None, None)?;
+        let source = Source::open_or_kind(None, None, Print::default().progress())?;
         let switches: &[String] = if GUIDED { &["--guided".into()] } else { &[] };
         let mut options = source.options(switches)?;
         options.slots = 1;

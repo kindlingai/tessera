@@ -1,12 +1,16 @@
 //! `mcp`: commands and tasks as MCP tools over stdio.
 
+use crate::progress::Notify;
 use crate::source::{CATALOG, Origin, Stop, split};
 use crate::task::{ENTRIES, Entry, describe};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use tessera_engine::progress::Progress;
 use tessera_tasks::Error;
 use tessera_tasks::task::{Chat, Collect, Run, Sink, Task};
 
@@ -62,7 +66,10 @@ impl Servers {
         let url = format!("http://127.0.0.1:{port}");
         self.running.insert(handle.clone(), child);
         sink.record(json!({"handle": handle, "url": format!("{url}/v1")}));
-        sink.note(&format!("the model is ready when {url}/health answers 200"));
+        let ready = format!("the model is ready when {url}/health answers 200");
+        sink.note(&format!(
+            "{ready}. Until then its body lists the load steps"
+        ));
         Ok(())
     }
 }
@@ -161,6 +168,38 @@ pub fn tools() -> Vec<Value> {
     out
 }
 
+/// A tool call's output. Progress goes out as notifications.
+struct Tool {
+    out: Collect,
+    /// The request's `_meta.progressToken`.
+    token: Option<Value>,
+}
+
+impl Sink for Tool {
+    fn text(&mut self, piece: &str) {
+        self.out.text(piece);
+    }
+
+    fn record(&mut self, record: Value) {
+        self.out.record(record);
+    }
+
+    fn file(&mut self, path: &Path) {
+        self.out.file(path);
+    }
+
+    fn note(&mut self, text: &str) {
+        self.out.note(text);
+    }
+
+    fn progress(&self) -> Progress {
+        match &self.token {
+            Some(token) => Progress::new(Arc::new(Notify::new(token.clone()))),
+            None => Progress::default(),
+        }
+    }
+}
+
 fn call(servers: &mut Servers, params: &Value) -> Result<Value, (i64, String)> {
     let name = params["name"].as_str().unwrap_or_default();
     let mut args = match params.get("arguments") {
@@ -174,7 +213,11 @@ fn call(servers: &mut Servers, params: &Value) -> Result<Value, (i64, String)> {
         }
     }
     let args = Value::Object(args);
-    let mut out = Collect::default();
+    let token = params["_meta"].get("progressToken").cloned();
+    let mut out = Tool {
+        out: Collect::default(),
+        token,
+    };
     let ran = if name == Halt::NAME {
         Halt::from_json(&args)
             .map_err(|e| Stop::Failed(e.0))
@@ -188,7 +231,7 @@ fn call(servers: &mut Servers, params: &Value) -> Result<Value, (i64, String)> {
         run_entry(entry, servers, &flags, &args, &mut out)
     };
     Ok(match ran {
-        Ok(()) => result(&out),
+        Ok(()) => result(&out.out),
         Err(stop) => json!({"content": [text(&describe(&stop))], "isError": true}),
     })
 }
@@ -198,7 +241,7 @@ fn run_entry(
     servers: &mut Servers,
     flags: &[String],
     args: &Value,
-    out: &mut Collect,
+    out: &mut Tool,
 ) -> Result<(), Stop> {
     let words = (entry.tool_args)(args).map_err(|e| Stop::Failed(e.0))?;
     let (origin, _) = split(flags)?;

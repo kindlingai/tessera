@@ -1,5 +1,6 @@
 use crate::{Error, Recipe};
 use std::path::{Path, PathBuf};
+use tessera_engine::progress::Progress;
 use tessera_engine::wasm::Module;
 use tessera_engine::{Compute, Site, sprite};
 
@@ -35,10 +36,14 @@ layers_per_block = 2
 fn reads_a_recipe() {
     let mut recipe: Recipe = toml::from_str(TEXT).unwrap();
     recipe.dir = PathBuf::from("/r");
-    assert_eq!(recipe.weights(None, None).unwrap(), Path::new("/r/weights"));
+    let p = &Progress::default();
+    assert_eq!(
+        recipe.weights(None, None, p).unwrap(),
+        Path::new("/r/weights")
+    );
     assert_eq!(recipe.names(), Some(PathBuf::from("/r/names.json")));
     assert_eq!(recipe.weights.extra["clip"], "a/b@main");
-    assert!(matches!(recipe.extras(None, None), Err(Error::NoCache)));
+    assert!(matches!(recipe.extras(None, None, p), Err(Error::NoCache)));
     let lower = recipe.lower.as_ref().unwrap();
     assert_eq!(lower.favor.as_deref(), Some("flash"));
     assert_eq!(lower.compute, Compute::Bf16);
@@ -63,7 +68,7 @@ fn reads_a_recipe() {
     assert_eq!(recipe.flags(), want);
     assert_eq!(recipe.overrides()["vae/config.json"]["layers_per_block"], 2);
     recipe.weights.hf = Some("a/b@main".into());
-    assert!(matches!(recipe.weights(None, None), Err(Error::Weights)));
+    assert!(matches!(recipe.weights(None, None, p), Err(Error::Weights)));
     assert!(toml::from_str::<Recipe>("name = \"x\"\nranks = 4\n[weights]").is_err());
 }
 

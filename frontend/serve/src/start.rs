@@ -5,9 +5,10 @@ use crate::task::{self, Load};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tessera_bundle::Overrides;
 use tessera_engine::Recipe;
+use tessera_engine::progress::{Open, Progress, Unit};
 use tessera_engine::wasm::Module;
 use tessera_tasks::api::Info;
 
@@ -55,6 +56,8 @@ pub struct Options {
     pub ranks: crate::ranks::Ranks,
     /// Config values the recipe sets, by file.
     pub config: Overrides,
+    /// Where the load reports its steps.
+    pub progress: Progress,
 }
 
 impl Default for Options {
@@ -80,6 +83,7 @@ impl Default for Options {
             names: None,
             ranks: Default::default(),
             config: Overrides::default(),
+            progress: Progress::default(),
         }
     }
 }
@@ -153,7 +157,7 @@ pub fn spawn(options: Options) -> Slot {
 }
 
 /// Loads the model, then answers requests until killed.
-pub fn run(options: Options) -> Result<(), String> {
+pub fn run(mut options: Options) -> Result<(), String> {
     let (host, port) = (options.host.clone(), options.port);
     let limits = crate::http::Limits {
         max_connections: options.max_connections,
@@ -163,17 +167,19 @@ pub fn run(options: Options) -> Result<(), String> {
         load(options, Slot::default());
         return Ok(());
     }
+    let open = Arc::new(Open::default());
+    options.progress = options.progress.also(open.clone());
     let slot = spawn(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
     crate::http::run(listener, limits, move |request| {
-        crate::route(&slot, request)
+        crate::route_open(&slot, &open, request)
     });
     Ok(())
 }
 
 /// Loads the model into `slot`. A failure ends the process.
-fn load(options: Options, slot: Slot) {
+fn load(mut options: Options, slot: Slot) {
     let mut settings = tessera_frontend_settings::read();
     settings.names = options.names.clone().or(settings.names);
     let info = Info {
@@ -183,10 +189,14 @@ fn load(options: Options, slot: Slot) {
             .unwrap_or_else(|| options.model.display().to_string()),
         context: options.max_model_len,
     };
+    let name = options.name.as_deref().unwrap_or("model");
+    let step = (options.progress).step(format!("load {name}"), Unit::Items, None);
+    options.progress = step.progress();
     let load = Load {
         options: &options,
         info,
         slot: &slot,
+        step: Mutex::new(Some(step)),
     };
     let failed = task::pick(&options).and_then(|entry| (entry.open)(&load, settings));
     if let Err(e) = failed {

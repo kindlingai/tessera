@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tessera_engine::progress::{Progress, Step, Unit};
 use tessera_frontend_settings::{HUB, resolve};
 
 /// File endings a model directory needs. Other files stay remote.
@@ -24,6 +25,16 @@ struct Info {
 #[derive(Deserialize)]
 struct Sibling {
     rfilename: String,
+    size: Option<u64>,
+}
+
+/// The token and progress each request uses.
+#[derive(Clone, Copy)]
+struct Get<'a> {
+    token: Option<&'a str>,
+    progress: &'a Progress,
+    /// The repository step that file bytes add to.
+    whole: Option<&'a Step>,
 }
 
 /// The file that marks an exlr8 release.
@@ -51,15 +62,27 @@ const FLOOR: u64 = 8 << 20;
 const LANES: usize = 4;
 
 /// `owner/name[@revision]`. A loose revision is pinned and printed.
-pub fn fetch(spec: &str, cache: &Path, token: Option<&str>) -> Result<PathBuf, Error> {
+pub fn fetch(
+    spec: &str,
+    cache: &Path,
+    token: Option<&str>,
+    progress: &Progress,
+) -> Result<PathBuf, Error> {
     let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
     if pinned(revision) {
-        return snapshot(&format!("{repo}@{revision}"), cache, token, None, None);
+        return snapshot(
+            &format!("{repo}@{revision}"),
+            cache,
+            token,
+            progress,
+            None,
+            None,
+        );
     }
     let info = lookup(repo, revision, token)?;
     let pinned = format!("{repo}@{}", info.sha);
     eprintln!("tesserax: model {pinned}");
-    snapshot(&pinned, cache, token, None, None)
+    snapshot(&pinned, cache, token, progress, None, None)
 }
 
 /// Whether `owner/name[@revision]` exists with safetensors files.
@@ -103,7 +126,7 @@ pub fn search_hf(words: &str, token: Option<&str>) -> Result<Option<String>, Err
 
 /// The repository's files at `revision`.
 fn lookup(repo: &str, revision: &str, token: Option<&str>) -> Result<Info, Error> {
-    let api = format!("https://{HUB}/api/models/{repo}/revision/{revision}");
+    let api = format!("https://{HUB}/api/models/{repo}/revision/{revision}?blobs=true");
     let response = get(&api, token).map_err(|e| match *e {
         ureq::Error::Status(401 | 404, _) => {
             let why = "not found, or gated: set HF_TOKEN";
@@ -147,6 +170,7 @@ pub(crate) fn snapshot(
     spec: &str,
     cache: &Path,
     token: Option<&str>,
+    progress: &Progress,
     width: Option<u32>,
     manifest: Option<&str>,
 ) -> Result<PathBuf, Error> {
@@ -171,16 +195,26 @@ pub(crate) fn snapshot(
     }
     let info = lookup(repo, commit, token)?;
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let names: Vec<String> = info.siblings.into_iter().map(|s| s.rfilename).collect();
+    let mut sizes = BTreeMap::new();
+    let mut names = Vec::new();
+    for sibling in info.siblings {
+        sizes.insert(sibling.rfilename.clone(), sibling.size);
+        names.push(sibling.rfilename);
+    }
+    let get = Get {
+        token,
+        progress,
+        whole: None,
+    };
     let index = dir.join("model_index.json");
     let folders = if names.iter().any(|n| n == "model_index.json") {
-        fetch_file(repo, commit, "model_index.json", &dir, token)?;
+        fetch_file(repo, commit, "model_index.json", &dir, get, None)?;
         Some(components(&index)?)
     } else {
         None
     };
     let layers = match manifest.filter(|_| names.iter().any(|n| n == EXLR8)) {
-        Some(name) => Some(read_manifest(repo, commit, name, &names, &dir, token)?),
+        Some(name) => Some(read_manifest(repo, commit, name, &names, &dir, get)?),
         None => None,
     };
     let files = match names.iter().any(|n| n == EXLR8) {
@@ -190,7 +224,23 @@ pub(crate) fn snapshot(
     if !files.iter().all(|name| safe_path(name)) {
         return Err(Error::Source(spec.into(), "unsafe file path in repository"));
     }
-    fetch_all(repo, commit, &files, &dir, token)?;
+    let mut left = 0;
+    for name in &files {
+        let size = sizes.get(*name).copied().flatten().unwrap_or(0);
+        if !dir.join(name).is_file() {
+            left += size.saturating_sub(held(&part_of(&dir.join(name))));
+        }
+    }
+    let whole = progress.step(format!("download {repo}"), Unit::Bytes, Some(left));
+    let inner = whole.progress();
+    let get = Get {
+        token,
+        progress: &inner,
+        whole: Some(&whole),
+    };
+    let sized: Vec<_> = files.iter().map(|n| (*n, sizes[*n])).collect();
+    fetch_all(repo, commit, &sized, &dir, get)?;
+    whole.finish();
     std::fs::write(&done, b"").map_err(io(&done))?;
     Ok(dir)
 }
@@ -199,14 +249,14 @@ pub(crate) fn snapshot(
 fn fetch_all(
     repo: &str,
     commit: &str,
-    names: &[&str],
+    names: &[(&str, Option<u64>)],
     dir: &Path,
-    token: Option<&str>,
+    get: Get,
 ) -> Result<(), Error> {
     let next = AtomicUsize::new(0);
     let lane = || {
-        while let Some(name) = names.get(next.fetch_add(1, Ordering::Relaxed)) {
-            if let Err(e) = fetch_file(repo, commit, name, dir, token) {
+        while let Some(&(name, size)) = names.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if let Err(e) = fetch_file(repo, commit, name, dir, get, size) {
                 next.store(names.len(), Ordering::Relaxed);
                 return Err(e);
             }
@@ -267,7 +317,7 @@ fn read_manifest(
     name: &str,
     names: &[String],
     dir: &Path,
-    token: Option<&str>,
+    get: Get,
 ) -> Result<BTreeMap<usize, BTreeSet<u32>>, Error> {
     let file = format!("manifests/exlr8-manifest-{name}.json");
     if !names.iter().any(|n| n == &file) {
@@ -276,7 +326,7 @@ fn read_manifest(
             "manifest not found in repository",
         ));
     }
-    fetch_file(repo, commit, &file, dir, token)?;
+    fetch_file(repo, commit, &file, dir, get, None)?;
     let path = dir.join(&file);
     let text = std::fs::read_to_string(&path).map_err(io(&path))?;
     manifest_widths(&text).map_err(|e| Error::Http(path.display().to_string(), e))
@@ -397,13 +447,22 @@ fn fetch_file(
     commit: &str,
     name: &str,
     dir: &Path,
-    token: Option<&str>,
+    get: Get,
+    size: Option<u64>,
 ) -> Result<(), Error> {
     let path = dir.join(name);
     if path.is_file() {
         return Ok(());
     }
-    fetch_as(repo, commit, name, &path, token)
+    make_parent(&path)?;
+    download(repo, commit, name, &path, get, size)
+}
+
+fn make_parent(path: &Path) -> Result<(), Error> {
+    match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent).map_err(io(parent)),
+        None => Ok(()),
+    }
 }
 
 /// `name` from `repo` at `revision`, saved as `path`.
@@ -413,24 +472,43 @@ pub fn fetch_as(
     name: &str,
     path: &Path,
     token: Option<&str>,
+    progress: &Progress,
 ) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io(parent))?;
-    }
-    download(&resolve(repo, revision, name), path, token)
+    make_parent(path)?;
+    let get = Get {
+        token,
+        progress,
+        whole: None,
+    };
+    download(repo, revision, name, path, get, None)
 }
 
-/// Streams `url` to `path` through a `.part` file.
-fn download(url: &str, path: &Path, token: Option<&str>) -> Result<(), Error> {
-    eprintln!("fetching {url}");
+fn part_of(path: &Path) -> PathBuf {
     let mut part = path.as_os_str().to_owned();
     part.push(".part");
-    let part = PathBuf::from(part);
+    PathBuf::from(part)
+}
+
+/// Streams `name` to `path` through a `.part` file.
+fn download(
+    repo: &str,
+    revision: &str,
+    name: &str,
+    path: &Path,
+    get: Get,
+    size: Option<u64>,
+) -> Result<(), Error> {
+    let url = resolve(repo, revision, name);
+    let part = part_of(path);
+    let file = get
+        .progress
+        .step(format!("{repo}/{name}"), Unit::Bytes, size);
+    file.set(held(&part));
     // Tries since the file last grew.
     let mut tries = 1;
     loop {
         let before = held(&part);
-        let Err(e) = resume(url, &part, token) else {
+        let Err(e) = resume(&url, &part, get, &file) else {
             break;
         };
         if held(&part) > before {
@@ -442,25 +520,30 @@ fn download(url: &str, path: &Path, token: Option<&str>) -> Result<(), Error> {
         std::thread::sleep(Duration::from_secs(tries.into()));
         tries += 1;
     }
-    std::fs::rename(&part, path).map_err(io(path))
+    std::fs::rename(&part, path).map_err(io(path))?;
+    file.finish();
+    Ok(())
 }
 
 fn held(part: &Path) -> u64 {
     std::fs::metadata(part).map_or(0, |m| m.len())
 }
 
-/// Adds the rest of `url` to `part`.
-fn resume(url: &str, part: &Path, token: Option<&str>) -> Result<(), Error> {
+/// Adds the rest of `url` to `part`, counting into `file`.
+fn resume(url: &str, part: &Path, get: Get, file: &Step) -> Result<(), Error> {
     let have = held(part);
-    let response = match get_from(url, token, have) {
+    let response = match get_from(url, get.token, have) {
         Err(e) if matches!(*e, ureq::Error::Status(416, _)) => return Ok(()),
         other => other.map_err(|e| http(url)(*e))?,
     };
-    let mut file = match response.status() {
+    let mut out = match response.status() {
         206 => std::fs::OpenOptions::new().append(true).open(part),
         _ => std::fs::File::create(part),
     }
     .map_err(io(part))?;
+    if response.status() != 206 {
+        file.set(0);
+    }
     let mut reader = response.into_reader();
     let mut buf = vec![0; 1 << 16];
     let (mut since, mut brought) = (Instant::now(), 0);
@@ -469,7 +552,11 @@ fn resume(url: &str, part: &Path, token: Option<&str>) -> Result<(), Error> {
         if n == 0 {
             return Ok(());
         }
-        file.write_all(&buf[..n]).map_err(io(part))?;
+        out.write_all(&buf[..n]).map_err(io(part))?;
+        file.add(n as u64);
+        if let Some(whole) = get.whole {
+            whole.add(n as u64);
+        }
         brought += n as u64;
         if since.elapsed() >= WINDOW {
             if brought < FLOOR {

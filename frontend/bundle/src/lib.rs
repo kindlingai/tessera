@@ -49,6 +49,7 @@ use tessera_checkpoint::{Offer, Stored};
 use tessera_engine::decoder::Config;
 use tessera_engine::form::{F32_FORM, Load, named};
 use tessera_engine::keys::{Keys, Offered};
+use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::wasm::Module;
 use tessera_engine::{DimName, Graph, Pins, PleConfig, Steps, Tensor, Weight};
 use tokenize::hf::Hf;
@@ -124,6 +125,24 @@ impl Weights {
                 stream.stream(&shares, &mut |at, w| take(at, &w).map_err(Into::into))
             }
         }
+    }
+
+    /// As `each_share`, as a step that counts `count` weights.
+    pub fn each_counted<E: Into<Box<dyn Error + Send + Sync>>>(
+        &self,
+        progress: &Progress,
+        count: u32,
+        shares: impl Fn(u32) -> Option<(u32, usize, usize)>,
+        mut take: impl FnMut(u32, &Weight) -> Result<(), E>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let step = progress.step("weights", Unit::Items, Some(count.into()));
+        self.each_share(shares, |at, w| {
+            take(at, w)?;
+            step.add(1);
+            Ok::<_, E>(())
+        })?;
+        step.finish();
+        Ok(())
     }
 }
 

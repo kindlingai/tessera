@@ -15,6 +15,7 @@ pub use text::{Embed, Tag};
 use crate::Error;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use tessera_engine::progress::Progress;
 
 /// A task's arguments, from flags or from a tool call.
 pub trait Task: Sized {
@@ -104,6 +105,10 @@ pub trait Sink {
     /// The next chat turn. `None` ends the chat.
     fn turn(&mut self) -> Option<String> {
         None
+    }
+    /// Where long steps, such as downloads and loads, report.
+    fn progress(&self) -> Progress {
+        Progress::default()
     }
 }
 

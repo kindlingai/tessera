@@ -66,8 +66,9 @@ pub(super) fn open_mtp(
     .map_err(|e| e.to_string())?;
     let count = drafter.weight_count();
     let shares: Vec<_> = (0..count).map(|at| drafter.share(at)).collect();
+    let take = |at, w: &_| drafter.load_weight(at, w);
     pair.weights
-        .each_share(|at| shares[at as usize], |at, w| drafter.load_weight(at, w))
+        .each_counted(&o.progress, count, |at| shares[at as usize], take)
         .map_err(|e| e.to_string())?;
     Ok(drafter)
 }

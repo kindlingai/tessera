@@ -24,6 +24,9 @@ mod metrics_test;
 mod model;
 mod mtp_draft;
 mod ple;
+pub mod progress;
+#[cfg(test)]
+mod progress_test;
 mod ranks;
 mod sample;
 #[cfg(test)]
