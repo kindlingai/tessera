@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
-use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
+use tessera_graph::DimName::{
+    Candidates, Context, EditWords, Picks, Rows, Segments, Seqs, VocabWords,
+};
 use tessera_graph::{EntryKind, Role};
 use tessera_lower::{Cache, Device, Report, Slot, Wants};
 use tessera_run::{Run, open};
@@ -211,6 +213,8 @@ pub struct Engine {
     lanes: Option<lanes::Lanes>,
     /// Mask words per pick, if the graph takes masks.
     words: Option<usize>,
+    /// The most edits per pick, if the graph takes edits.
+    edit_cap: Option<usize>,
     /// The step entry that reads every vocabulary row.
     full: usize,
     /// The step entry that picks among candidate ids, if any.
@@ -241,6 +245,24 @@ pub(crate) enum Head {
     Full(Option<Vec<u32>>),
     /// The sparse entry, with `k` candidate ids per pick.
     Sparse(Vec<u32>, usize),
+    /// Full entry: masks, and `k` edits per pick.
+    Edited(Vec<u32>, Vec<u32>, usize),
+}
+
+/// Packs `k` edits: ids, adds, reps. Pads are neutral.
+fn pack(edits: &[Edit], k: usize, out: &mut Vec<u32>) {
+    let sorted = guide::merged(edits.to_vec());
+    let pad = Edit {
+        id: u32::MAX,
+        add: 0.0,
+        rep: 1.0,
+    };
+    let all = sorted.iter().chain(std::iter::repeat(&pad)).take(k);
+    let at = out.len();
+    out.extend(all.clone().map(|e| e.id));
+    out.extend(all.clone().map(|e| e.add.to_bits()));
+    out.extend(all.map(|e| e.rep.to_bits()));
+    debug_assert_eq!(out.len(), at + 3 * k);
 }
 
 /// A token at a position, in a slot's sequence.
@@ -293,6 +315,8 @@ fn launch_of(
         (Context, context_bucket(furthest as usize + 1, max_context)),
         (Segments, seen.len() as u64),
         (Picks, wanted as u64),
+        // No edit words, until a launch packs edits.
+        (EditWords, 0),
     ];
     (sizes, [filled, wanted])
 }
@@ -364,6 +388,8 @@ impl Engine {
         let device = ranked(device);
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
+        let edit_cap = graph.dims.iter().find(|d| d.name == EditWords);
+        let edit_cap = edit_cap.map(|d| d.size.max() as usize / 3);
         let taps = width(&graph, full, Role::Taps);
         let vocab = width(&graph, full, Role::Logits);
         let stateful = graph.nodes.iter().any(|n| n.op.recurrent());
@@ -376,6 +402,7 @@ impl Engine {
             slots,
             lanes,
             words,
+            edit_cap,
             full,
             sparse,
             taps,
@@ -674,6 +701,36 @@ impl Engine {
         self.launch(rows, &picks, Head::Full(Some(bits)))
     }
 
+    /// Whether the device head takes `n` edits in one pick.
+    pub fn edits_fit(&self, n: usize) -> bool {
+        self.words.is_some() && self.edit_cap.is_some_and(|cap| n <= cap)
+    }
+
+    /// As `last_guided`, with each pick's logits changed by its edits.
+    pub fn last_edited(
+        &mut self,
+        rows: &[Row],
+        allowed: &[Allowed],
+        edits: &[&[Edit]],
+    ) -> Result<Vec<u32>, Error> {
+        let picks = ends(rows);
+        let most = edits.iter().map(|e| e.len()).max().unwrap_or(0);
+        if allowed.len() != picks.len() || edits.len() != picks.len() || !self.edits_fit(most) {
+            return Err(Error::Mask);
+        }
+        let words = self.words.ok_or(Error::Mask)?;
+        let bits = allowed.iter().flat_map(|a| a.bits(words)).collect();
+        let k = most
+            .max(1)
+            .next_power_of_two()
+            .min(self.edit_cap.unwrap_or(1));
+        let mut packed = Vec::with_capacity(edits.len() * 3 * k);
+        for e in edits {
+            pack(e, k, &mut packed);
+        }
+        self.launch(rows, &picks, Head::Edited(bits, packed, k))
+    }
+
     /// Each pick's logits over its `ids`, in one launch.
     pub fn scores(
         &mut self,
@@ -707,7 +764,7 @@ impl Engine {
     /// The entry `head` launches.
     fn entry(&self, head: &Head) -> Result<usize, Error> {
         match head {
-            Head::Full(_) => Ok(self.full),
+            Head::Full(_) | Head::Edited(..) => Ok(self.full),
             Head::Sparse(..) => self.sparse.ok_or(Error::Scores),
         }
     }
@@ -767,9 +824,10 @@ impl Engine {
             let values = rows.iter().chain(std::iter::repeat(&last));
             Tensor::u32(vec![filled], values.take(filled).map(of).collect())
         };
-        let (mut masks, mut listed) = match head {
-            Head::Full(masks) => (masks, None),
-            Head::Sparse(ids, k) => (None, Some((ids, k))),
+        let (mut masks, mut listed, mut edits) = match head {
+            Head::Full(masks) => (masks, None, None),
+            Head::Sparse(ids, k) => (None, Some((ids, k)), None),
+            Head::Edited(masks, packed, k) => (Some(masks), None, Some((packed, k))),
         };
         let mut feeds = Vec::new();
         for port in &self.graph.entries[entry].inputs {
@@ -787,7 +845,22 @@ impl Engine {
                     // Unmasked and filler picks allow everything.
                     let mut bits = masks.take().unwrap_or_default();
                     bits.resize(wanted * words, u32::MAX);
-                    Tensor::u32(vec![wanted, words], bits)
+                    let Some((packed, k)) = edits.take() else {
+                        feeds.push(Tensor::u32(vec![wanted, words], bits));
+                        continue;
+                    };
+                    // Each pick's edits follow its mask words.
+                    let mut row = Vec::with_capacity(wanted * (words + 3 * k));
+                    for p in 0..wanted {
+                        row.extend_from_slice(&bits[p * words..(p + 1) * words]);
+                        match packed.get(p * 3 * k..(p + 1) * 3 * k) {
+                            Some(mine) => row.extend_from_slice(mine),
+                            None => pack(&[], k, &mut row),
+                        }
+                    }
+                    sizes.retain(|(name, _)| *name != EditWords);
+                    sizes.push((EditWords, 3 * k as u64));
+                    Tensor::u32(vec![wanted, words + 3 * k], row)
                 }
                 Role::Candidates => {
                     let (mut ids, k) = listed.take().ok_or(Error::Scores)?;
@@ -811,7 +884,7 @@ impl Engine {
             };
             feeds.push(feed);
         }
-        if masks.is_some() {
+        if masks.is_some() || edits.is_some() {
             return Err(Error::Mask);
         }
         let start = Instant::now();

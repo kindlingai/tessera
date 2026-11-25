@@ -103,7 +103,8 @@ impl Seq {
                 _ => None,
             };
             let edits = match one.is_none() && !done {
-                true => guide.edits(),
+                // Host and device both see one edit per id.
+                true => crate::guide::merged(guide.edits()),
                 false => Vec::new(),
             };
             for id in forced.into_iter().chain(one) {
@@ -477,8 +478,12 @@ impl<'a> Batch<'a> {
         let edited = owners
             .iter()
             .any(|&(at, keep)| keep && !self.active[at].edits.is_empty());
-        let picked = match (sampling || edited, self.allowed(&owners)) {
-            (true, allowed) => {
+        // Edits the device head cannot hold go to the host.
+        let fits = owners
+            .iter()
+            .all(|&(at, keep)| !keep || self.engine.edits_fit(self.active[at].edits.len()));
+        let picked = match (sampling || (edited && !fits), edited, self.allowed(&owners)) {
+            (true, _, allowed) => {
                 let (mut logits, vocab) = self.engine.last_logits(&rows)?;
                 let mut weights = Vec::with_capacity(ends.len());
                 let mut units = Vec::with_capacity(ends.len());
@@ -492,8 +497,16 @@ impl<'a> Batch<'a> {
                 }
                 Picked::Drawn(weights, units)
             }
-            (false, Some(allowed)) => Picked::Ids(self.engine.last_guided(&rows, &allowed)?),
-            (false, None) => Picked::Ids(self.engine.last(&rows)?),
+            (false, true, allowed) => {
+                let allowed = allowed.unwrap_or_else(|| vec![Allowed::Any; ends.len()]);
+                let mut edits: Vec<&[Edit]> = Vec::with_capacity(ends.len());
+                for &(at, keep) in &owners {
+                    edits.push(if keep { &self.active[at].edits } else { &[] });
+                }
+                Picked::Ids(self.engine.last_edited(&rows, &allowed, &edits)?)
+            }
+            (false, false, Some(allowed)) => Picked::Ids(self.engine.last_guided(&rows, &allowed)?),
+            (false, false, None) => Picked::Ids(self.engine.last(&rows)?),
         };
         // Each answer takes its rows and its last pick.
         let mut i = 0;

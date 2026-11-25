@@ -11,11 +11,11 @@ use crate::shared::{
 };
 use serde_json::json;
 use tessera_trace::DimName::*;
-use tessera_trace::pick;
 use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear,
     Mask, Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
 };
+use tessera_trace::{mask_port, pick};
 
 const GDN_HIST: DimName = DimName::named("GdnHist");
 const HC: DimName = DimName::named("Hc");
@@ -684,10 +684,6 @@ pub fn stepper<R: Routed>(c: &Config) -> Graph {
     let ple_port = || Port {
         role: Role::Ple,
         ty: TensorType::new([Rows, PLE_DIM], DType::F32),
-    };
-    let mask_port = || Port {
-        role: Role::Allowed,
-        ty: TensorType::new([Rows, VocabWords], DType::U32),
     };
     let masked = c.stack.steps == Steps::Masked;
     let [t, p, s] = [Role::Tokens, Role::Positions, Role::Slots].map(row);

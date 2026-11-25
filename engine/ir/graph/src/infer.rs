@@ -502,6 +502,14 @@ fn positions(
     })
 }
 
+/// The mask words, without any trailing edit words.
+fn masked(words: &DimExpr) -> &DimExpr {
+    match words {
+        DimExpr::Add(mask, _) => mask,
+        whole => whole,
+    }
+}
+
 /// One `u32` word per 32 entries of each row.
 fn allowed(dims: &[Dim], x: &TensorType, bits: &TensorType) -> Result<(), TypeError> {
     let lead = x.rank() - 1;
@@ -509,7 +517,7 @@ fn allowed(dims: &[Dim], x: &TensorType, bits: &TensorType) -> Result<(), TypeEr
     let width = words(&x.shape.0[lead]);
     let fits = bits.rank() == x.rank()
         && same_shape(dims, &front(&x.shape, lead), &front(&bits.shape, lead))?
-        && words(&bits.shape.0[lead]) == width.map(|w| w.div_ceil(32));
+        && words(masked(&bits.shape.0[lead])) == width.map(|w| w.div_ceil(32));
     need(fits, ErrorKind::Shape, || {
         format!("mask {} does not cover {}", bits.shape, x.shape)
     })?;

@@ -248,22 +248,25 @@ impl Guide for Stacked {
         self.fault.is_none() && self.members.iter().any(|m| m.done())
     }
 
-    /// Edits of one id combine: `add` sums, `rep` multiplies.
     fn edits(&mut self) -> Vec<Edit> {
-        let mut all: Vec<Edit> = self.members.iter_mut().flat_map(|m| m.edits()).collect();
-        all.sort_by_key(|e| e.id);
-        let mut out: Vec<Edit> = Vec::with_capacity(all.len());
-        for e in all {
-            match out.last_mut() {
-                Some(last) if last.id == e.id => {
-                    last.add += e.add;
-                    last.rep *= e.rep;
-                }
-                _ => out.push(e),
-            }
-        }
-        out
+        merged(self.members.iter_mut().flat_map(|m| m.edits()).collect())
     }
+}
+
+/// One edit per id, sorted: adds sum, reps multiply.
+pub(crate) fn merged(mut all: Vec<Edit>) -> Vec<Edit> {
+    all.sort_by_key(|e| e.id);
+    let mut out: Vec<Edit> = Vec::with_capacity(all.len());
+    for e in all {
+        match out.last_mut() {
+            Some(last) if last.id == e.id => {
+                last.add += e.add;
+                last.rep *= e.rep;
+            }
+            _ => out.push(e),
+        }
+    }
+    out
 }
 
 /// Fixed tokens first, then any.

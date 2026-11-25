@@ -13,7 +13,7 @@ pub enum Takes {
     RowWeight,
     /// Integer positions that lead the rows.
     Positions,
-    /// One `u32` mask word per 32 row entries.
+    /// A `u32` mask word per 32 entries, then edits.
     Bits,
 }
 
@@ -157,7 +157,7 @@ macro_rules! stages {
             AllGather => Crossing { reduces: true, place: Gather }
             /// Entries past the position in the argument become -inf.
             Causal as causal => "causal" { operand: Positions, whole: true }
-            /// Entry `i` becomes -inf where mask bit `i` is clear.
+            /// Masks entries to -inf, then applies packed edits.
             Allow as allow => "allow" { operand: Bits, whole: true }
         }
     };

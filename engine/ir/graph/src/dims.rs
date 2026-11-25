@@ -56,6 +56,8 @@ dim_names! {
     VocabWords,
     /// Token ids one sparse pick chooses from.
     Candidates,
+    /// `u32` words of one pick's packed logit edits.
+    EditWords,
 }
 
 /// The spelling of a model's own dimension.

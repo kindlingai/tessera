@@ -35,19 +35,26 @@ pub fn ports(m: &Model, kind: EntryKind, rows: DimName) -> [Tensor; 2] {
     m.entry(kind, [port(Role::Tokens), port(Role::Positions)])
 }
 
+/// Each pick's mask words, then its packed logit edits.
+pub fn mask_port() -> Port {
+    let words = DimExpr::Add(Box::new(VocabWords.into()), Box::new(EditWords.into()));
+    Port {
+        role: Role::Allowed,
+        ty: TensorType::new(vec![Rows.into(), words], DType::U32),
+    }
+}
+
 /// A step entry's tokens, positions, slots and optional mask.
 pub fn step_ports(m: &Model, masked: bool) -> ([Tensor; 3], Option<Tensor>) {
-    let port = |role, ty| Port { role, ty };
-    let row = |role| port(role, TensorType::new([Rows], DType::U32));
+    let row = |role| Port {
+        role,
+        ty: TensorType::new([Rows], DType::U32),
+    };
     let [t, p, s] = [Role::Tokens, Role::Positions, Role::Slots].map(row);
     if !masked {
         return (m.entry(EntryKind::Step, [t, p, s]), None);
     }
-    let bits = port(
-        Role::Allowed,
-        TensorType::new([Rows, VocabWords], DType::U32),
-    );
-    let [t, p, s, bits] = m.entry(EntryKind::Step, [t, p, s, bits]);
+    let [t, p, s, bits] = m.entry(EntryKind::Step, [t, p, s, mask_port()]);
     ([t, p, s], Some(bits))
 }
 

@@ -282,14 +282,15 @@ const LAUNCH: u32 = 0;
 const PROFILE_ON: u32 = 1;
 const PROFILE_OFF: u32 = 2;
 
-/// A launch as words: head, wants, table, rows, picks, list.
+/// A launch as words: head, wants, table, rows, picks, lists.
 fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32]) -> Vec<u8> {
-    let (tag, k, list): (u32, usize, &[u32]) = match head {
-        Head::Full(None) => (0, 0, &[]),
-        Head::Full(Some(masks)) => (1, 0, masks),
-        Head::Sparse(ids, k) => (2, *k, ids),
+    let (tag, k, list, edits): (u32, usize, &[u32], &[u32]) = match head {
+        Head::Full(None) => (0, 0, &[], &[]),
+        Head::Full(Some(masks)) => (1, 0, masks, &[]),
+        Head::Sparse(ids, k) => (2, *k, ids, &[]),
+        Head::Edited(masks, edits, k) => (3, *k, masks, edits),
     };
-    let count = 7 + table.len() + rows.len() * 3 + picks.len() + list.len();
+    let count = 8 + table.len() + rows.len() * 3 + picks.len() + list.len() + edits.len();
     let mut words = Writer(Vec::with_capacity(count * 4));
     words
         .u32(tag)
@@ -300,7 +301,7 @@ fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32])
     for r in rows {
         words.u32(r.slot).u32(r.token).u32(r.position);
     }
-    words.u32s(picks).u32s(list);
+    words.u32s(picks).u32s(list).u32s(edits);
     words.0
 }
 
@@ -329,10 +330,11 @@ fn decode(bytes: &[u8]) -> Option<Told> {
             position: raw.u32()?,
         });
     }
-    let (picks, list) = (words.u32s()?, words.u32s()?);
+    let (picks, list, edits) = (words.u32s()?, words.u32s()?, words.u32s()?);
     let head = match tag {
         0 => Head::Full(None),
         1 => Head::Full(Some(list)),
+        3 => Head::Edited(list, edits, k as usize),
         _ => Head::Sparse(list, k as usize),
     };
     Some(Told {
