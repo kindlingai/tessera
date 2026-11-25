@@ -53,6 +53,15 @@ fn flattens_in_order() {
     }
     let sum = run("sum.cu", include_str!("sum.cu"), &[], Backend::Cuda).unwrap();
     assert!(sum.text.contains("stage_bf16") && sum.text.contains("cvt.rn.bf16x2.f32"));
+    let gqa = run("mla.cu", include_str!("attend/mla.cu"), &[], Backend::Cuda).unwrap();
+    for entry in [
+        "GQA_DEF(tessera_gqa_attend_fp8,",
+        "GQA_DEF(tessera_gqa_attend_bf16,",
+        "GQA_DEF(tessera_gqa_attend_f32,",
+        "tessera_gqa_reduce(",
+    ] {
+        assert!(gqa.text.contains(entry), "missing {entry}");
+    }
 }
 
 #[test]
