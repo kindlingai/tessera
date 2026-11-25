@@ -17,6 +17,7 @@ macro_rules! shared_api {
         function: ($func:ident, $func_label:literal),
         alloc: ($alloc:ident, $alloc_label:literal),
         free: $free:ident,
+        free_memory: ($info:ident, $info_label:literal),
         host_alloc: (
             $host:ident, $host_label:literal, $flags:expr,
             $map:ident, $map_label:literal
@@ -121,6 +122,12 @@ macro_rules! shared_api {
 
         fn free(&self, ptr: u64) {
             unsafe { (self.$free)(ptr) };
+        }
+
+        fn free_memory(&self) -> Result<u64, $crate::Error> {
+            let (mut free, mut total) = (0, 0);
+            self.check(unsafe { (self.$info)(&mut free, &mut total) }, $info_label)?;
+            Ok(free as u64)
         }
 
         fn host_alloc(&self, size: usize) -> Result<(u64, u64), $crate::Error> {

@@ -166,6 +166,7 @@ impl Api for Runtime {
         function: (hip_module_get_function, "hipModuleGetFunction"),
         alloc: (hip_malloc, "hipMalloc"),
         free: hip_free,
+        free_memory: (hip_mem_get_info, "hipMemGetInfo"),
         host_alloc: (
             hip_host_malloc, "hipHostMalloc", hip::HOST_MALLOC_MAPPED,
             hip_host_get_device_pointer, "hipHostGetDevicePointer"

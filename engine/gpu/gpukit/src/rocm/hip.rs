@@ -69,6 +69,7 @@ tessera_dl::library! {
         pub hip_module_unload: entry::OnHandle = "hipModuleUnload",
         pub hip_module_get_function: entry::Function = "hipModuleGetFunction",
         pub hip_malloc: entry::Alloc = "hipMalloc",
+        pub hip_mem_get_info: entry::MemInfo = "hipMemGetInfo",
         pub hip_free: entry::Free = "hipFree",
         pub hip_host_malloc: entry::HostAlloc = "hipHostMalloc",
         pub hip_host_get_device_pointer: entry::HostMap = "hipHostGetDevicePointer",

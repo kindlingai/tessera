@@ -52,6 +52,10 @@ pub trait Device: Clone + Send + Sync + 'static {
     fn alloc(&self, size: usize) -> Result<u64, Error>;
     /// Skipped when the context is already gone.
     fn free(&self, ptr: u64);
+    /// Device bytes free now, where the backend can tell.
+    fn free_memory(&self) -> Option<u64> {
+        None
+    }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;

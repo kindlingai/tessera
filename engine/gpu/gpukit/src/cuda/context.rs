@@ -182,6 +182,7 @@ impl Api for Driver {
         function: (cu_module_get_function, "cuModuleGetFunction"),
         alloc: (cu_mem_alloc, "cuMemAlloc"),
         free: cu_mem_free,
+        free_memory: (cu_mem_get_info, "cuMemGetInfo"),
         host_alloc: (
             cu_mem_host_alloc, "cuMemHostAlloc", driver::CU_MEMHOSTALLOC_DEVICEMAP,
             cu_mem_host_get_device_pointer, "cuMemHostGetDevicePointer"

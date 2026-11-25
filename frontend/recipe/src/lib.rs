@@ -10,7 +10,7 @@ mod source;
 #[cfg(test)]
 mod source_test;
 
-pub use hub::{check_hf, fetch as fetch_hf, fetch_as, safe_path, search_hf};
+pub use hub::{Files, check_hf, fetch as fetch_hf, fetch_as, safe_path, search_hf};
 pub use source::Source;
 pub use tessera_engine::progress;
 
@@ -128,6 +128,17 @@ impl Recipe {
         token: Option<&str>,
         progress: &Progress,
     ) -> Result<PathBuf, Error> {
+        self.weights_as(Files::Whole, cache, token, progress)
+    }
+
+    /// As `weights`, holding `files` of a remote repository.
+    pub fn weights_as(
+        &self,
+        files: Files,
+        cache: Option<&Path>,
+        token: Option<&str>,
+        progress: &Progress,
+    ) -> Result<PathBuf, Error> {
         match (&self.weights.path, &self.weights.hf) {
             (Some(path), None) => Ok(self.dir.join(path)),
             (None, Some(hf)) => {
@@ -139,6 +150,7 @@ impl Recipe {
                     progress,
                     self.weights.width,
                     manifest,
+                    files,
                 )
             }
             _ => Err(Error::Weights),
@@ -152,10 +164,21 @@ impl Recipe {
         token: Option<&str>,
         progress: &Progress,
     ) -> Result<Vec<(String, PathBuf)>, Error> {
+        self.extras_as(Files::Whole, cache, token, progress)
+    }
+
+    /// As `extras`, holding `files` of each repository.
+    pub fn extras_as(
+        &self,
+        files: Files,
+        cache: Option<&Path>,
+        token: Option<&str>,
+        progress: &Progress,
+    ) -> Result<Vec<(String, PathBuf)>, Error> {
         let mut flags = Vec::new();
         for (name, spec) in &self.weights.extra {
             let cache = cache.ok_or(Error::NoCache)?;
-            let dir = hub::snapshot(spec, cache, token, progress, None, None)?;
+            let dir = hub::snapshot(spec, cache, token, progress, None, None, files)?;
             flags.push((format!("--{}", name.replace('_', "-")), dir));
         }
         Ok(flags)

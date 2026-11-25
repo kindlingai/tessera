@@ -101,6 +101,7 @@ tessera_dl::library! {
         pub(crate) cu_module_get_function: entry::Function = "cuModuleGetFunction",
         pub(crate) cu_mem_alloc: entry::Alloc = "cuMemAlloc_v2",
         pub(crate) cu_mem_free: entry::Free = "cuMemFree_v2",
+        pub(crate) cu_mem_get_info: entry::MemInfo = "cuMemGetInfo_v2",
         pub(crate) cu_mem_host_alloc: entry::HostAlloc = "cuMemHostAlloc",
         pub(crate) cu_mem_host_get_device_pointer: entry::HostMap =
             "cuMemHostGetDevicePointer_v2",

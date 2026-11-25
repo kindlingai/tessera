@@ -6,6 +6,7 @@ mod mcp;
 mod mcp_test;
 mod progress;
 mod serve;
+mod size;
 mod source;
 #[cfg(test)]
 mod source_test;
@@ -27,6 +28,9 @@ const USAGE: &str = "usage: tesserax [--recipe <dir | git+<url>#<commit>> | --mo
   <command>      run one of the commands below
   task <task>    run one of the tasks below on the model
   mcp            serve the commands and tasks as MCP tools on stdin and stdout
+  size [--ctx <tokens>] [--slots <n>] [--boot]
+                 print the memory the model needs and this machine has, as
+                 JSON. --boot loads it and runs one step to measure
   teleport [--from <dir>] [--root <dir>] <user@host | local>...
                  copy this build to other machines over ssh
   --version      print version, commit, target and GPU features";
@@ -48,6 +52,7 @@ fn run(given: &[String]) -> Result<(), Stop> {
         ("task", _) => task::run(origin, rest),
         ("mcp", _) => mcp::run(origin, rest),
         ("teleport", _) => teleport::run(rest),
+        ("size", _) => size::run(origin, rest),
         ("-h" | "--help" | "help", _) => Err(Stop::Usage),
         // Other words are a prompt for the default model.
         _ if origin.is_none() => task::route(&args),

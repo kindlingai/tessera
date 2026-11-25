@@ -44,6 +44,8 @@ pub(crate) mod entry {
     pub(crate) type Attribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int;
     /// Writes a device's total memory in bytes.
     pub(crate) type Total = unsafe extern "C" fn(*mut usize, c_int) -> c_int;
+    /// Writes free, then total memory in bytes.
+    pub(crate) type MemInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> c_int;
     pub(crate) type Load = unsafe extern "C" fn(*mut Handle, *const c_void) -> c_int;
     pub(crate) type Function = unsafe extern "C" fn(*mut Handle, Handle, *const c_char) -> c_int;
     /// Unloads, destroys or synchronizes one handle.
@@ -157,6 +159,8 @@ pub trait Api: Sync + Sized + 'static {
     fn launch(&self, call: &Call) -> Result<(), Error>;
     fn alloc(&self, size: usize) -> Result<u64, Error>;
     fn free(&self, ptr: u64);
+    /// Device bytes free now.
+    fn free_memory(&self) -> Result<u64, Error>;
     /// Pinned host memory the device maps: (host, device).
     fn host_alloc(&self, size: usize) -> Result<(u64, u64), Error>;
     fn host_free(&self, host: u64);
@@ -818,6 +822,10 @@ impl<A: Api> Device for Context<A> {
 
     fn alloc(&self, size: usize) -> Result<u64, Error> {
         self.locked(|a| a.alloc(size))
+    }
+
+    fn free_memory(&self) -> Option<u64> {
+        self.locked(|a| a.free_memory()).ok()
     }
 
     fn free(&self, ptr: u64) {

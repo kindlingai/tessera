@@ -744,10 +744,27 @@ impl OnGpu for Asked {
     }
 }
 
+/// The shared context's free bytes.
+struct Free;
+
+impl OnGpu for Free {
+    type Out = Option<u64>;
+
+    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
+        cached_context::<D>().ok()?.free_memory()
+    }
+}
+
 /// The platform a runner for `settings` would report.
-fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
+pub(crate) fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
     crate::configure(settings);
     tessera_gpukit::backend::dispatch(settings.gpu(), Asked).ok()?
+}
+
+/// Free bytes on the GPU `settings` picks, if known.
+pub(crate) fn free(settings: &Settings) -> Option<u64> {
+    crate::configure(settings);
+    tessera_gpukit::backend::dispatch(settings.gpu(), Free).ok()?
 }
 
 tessera_lower::rule::scatter! {

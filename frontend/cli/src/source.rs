@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tessera_engine::progress::Progress;
 use tessera_engine::wasm::{Module, Trace};
-use tessera_recipe::Recipe;
+use tessera_recipe::{Files, Recipe};
 use tessera_serve::start::Options;
 
 /// Why a run stops early.
@@ -148,11 +148,22 @@ pub struct Source {
     dump_sites: Option<PathBuf>,
     /// Where downloads and the model load report.
     pub progress: Progress,
+    /// Which bytes of remote weights to fetch.
+    files: Files,
 }
 
 impl Source {
     /// Opens the recipe, if the origin is one.
     pub fn open(origin: Option<Origin>, progress: Progress) -> Result<Source, Stop> {
+        Self::open_as(origin, progress, (Files::Whole, None))
+    }
+
+    /// As `open`, fetching `files` of remote weights for `manifest`.
+    pub fn open_as(
+        origin: Option<Origin>,
+        progress: Progress,
+        (files, manifest): (Files, Option<&str>),
+    ) -> Result<Source, Stop> {
         let origin = origin.ok_or(Stop::Usage)?;
         let settings = tessera_frontend_settings::read();
         let (cache, token, dump_sites) = (settings.recipes, settings.hf_token, settings.dump_sites);
@@ -164,7 +175,13 @@ impl Source {
             Origin::Hub(spec) => {
                 let dir = cache.as_deref().ok_or(tessera_recipe::Error::NoCache)?;
                 let token = token.as_deref();
-                fetched = Some(tessera_recipe::fetch_hf(spec, dir, token, &progress)?);
+                fetched = Some(tessera_recipe::fetch_hf(
+                    spec,
+                    dir,
+                    token,
+                    &progress,
+                    (files, manifest),
+                )?);
                 None
             }
         };
@@ -176,6 +193,7 @@ impl Source {
             fetched,
             dump_sites,
             progress,
+            files,
         })
     }
 
@@ -207,7 +225,7 @@ impl Source {
         options.progress = self.progress.clone();
         if let Some(r) = &self.recipe {
             let (cache, token) = (self.cache.as_deref(), self.token.as_deref());
-            options.model = r.weights(cache, token, &self.progress)?;
+            options.model = r.weights_as(self.files, cache, token, &self.progress)?;
             options.name = Some(r.name.clone());
             options.lower = r.lower.clone();
             options.names = r.names();
@@ -223,7 +241,7 @@ impl Source {
                 options.lower.get_or_insert_default().rules.extend(rules);
                 options.module = Some(Arc::new(module));
             }
-            for (flag, dir) in r.extras(cache, token, &self.progress)? {
+            for (flag, dir) in r.extras_as(self.files, cache, token, &self.progress)? {
                 apply(&mut options, &flag, Some(dir.display().to_string()))?;
             }
             for (flag, value) in r.flags() {

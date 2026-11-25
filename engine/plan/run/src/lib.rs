@@ -19,6 +19,7 @@ mod paged_test;
 mod profile;
 mod rank;
 mod run;
+pub mod sizer;
 pub mod testing;
 
 pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
@@ -105,6 +106,8 @@ pub enum Error {
          TESSERA_MEMORY sets the budget in bytes, or `off`"
     )]
     OverBudget { planned: u64, budget: u64 },
+    #[error("a sizing runner runs nothing")]
+    Sizing,
     #[error("the input list does not match the plan")]
     InputCount,
     #[error("input {0} does not match the plan")]
@@ -151,6 +154,9 @@ pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
 /// A runner on the GPU `settings` picks, or the host.
 pub fn open(plan: Plan, settings: &Settings) -> Result<Box<dyn Run>, Error> {
     configure(settings);
+    if let Some(sizer) = sizer::Sizer::open(&plan, settings) {
+        return Ok(sizer);
+    }
     let open = tessera_gpukit::backend::dispatch(settings.gpu(), device::Open(plan, settings));
     let mut runner: Box<dyn Run> = match open {
         Ok(run) => run?,

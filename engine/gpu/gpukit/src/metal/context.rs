@@ -329,6 +329,12 @@ impl Device for Context {
         lock(&self.0.allocs).by_base.remove(&ptr);
     }
 
+    fn free_memory(&self) -> Option<u64> {
+        let device = &self.0.device;
+        let used = device.currentAllocatedSize() as u64;
+        Some(device.recommendedMaxWorkingSetSize().saturating_sub(used))
+    }
+
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
         self.finish()?;
         let at = self.span(ptr, bytes.len())?;

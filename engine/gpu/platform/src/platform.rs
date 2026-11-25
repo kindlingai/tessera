@@ -180,9 +180,9 @@ pub fn device_memory(total: u64, integrated: bool) -> u64 {
     }
 }
 
-/// Physical memory on this machine, or zero when unknown.
+/// One numeric sysctl, or zero when unknown.
 #[cfg(target_os = "macos")]
-fn host_memory() -> u64 {
+fn sysctl(name: &std::ffi::CStr) -> u64 {
     unsafe extern "C" {
         fn sysctlbyname(
             name: *const std::ffi::c_char,
@@ -192,20 +192,49 @@ fn host_memory() -> u64 {
             new_len: usize,
         ) -> std::ffi::c_int;
     }
-    let mut bytes: u64 = 0;
+    let mut value: u64 = 0;
     let mut len = size_of::<u64>();
-    let out = (&raw mut bytes).cast();
-    // SAFETY: `hw.memsize` writes one u64 into `bytes`.
-    let failed =
-        unsafe { sysctlbyname(c"hw.memsize".as_ptr(), out, &mut len, std::ptr::null(), 0) };
-    if failed != 0 { 0 } else { bytes }
+    let out = (&raw mut value).cast();
+    // SAFETY: writes at most `len` bytes, low bytes first.
+    let failed = unsafe { sysctlbyname(name.as_ptr(), out, &mut len, std::ptr::null(), 0) };
+    if failed != 0 { 0 } else { value }
+}
+
+/// Physical memory on this machine, or zero when unknown.
+#[cfg(target_os = "macos")]
+pub fn host_memory() -> u64 {
+    sysctl(c"hw.memsize")
+}
+
+/// Host memory free without swapping, or zero when unknown.
+#[cfg(target_os = "macos")]
+pub fn host_available() -> u64 {
+    let pages = [
+        c"vm.page_free_count",
+        c"vm.page_speculative_count",
+        c"vm.page_purgeable_count",
+        c"vm.page_pageable_external_count",
+    ];
+    pages.iter().map(|n| sysctl(n)).sum::<u64>() * sysctl(c"hw.pagesize")
+}
+
+/// One `/proc/meminfo` field in bytes, or zero when unknown.
+#[cfg(not(target_os = "macos"))]
+fn meminfo(field: &str) -> u64 {
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let line = info.lines().find_map(|l| l.strip_prefix(field));
+    let kib = line.and_then(|l| l.trim().trim_end_matches("kB").trim().parse::<u64>().ok());
+    kib.unwrap_or(0) * 1024
 }
 
 /// Physical memory on this machine, or zero when unknown.
 #[cfg(not(target_os = "macos"))]
-fn host_memory() -> u64 {
-    let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let line = info.lines().find_map(|l| l.strip_prefix("MemTotal:"));
-    let kib = line.and_then(|l| l.trim().trim_end_matches("kB").trim().parse::<u64>().ok());
-    kib.unwrap_or(0) * 1024
+pub fn host_memory() -> u64 {
+    meminfo("MemTotal:")
+}
+
+/// Host memory free without swapping, or zero when unknown.
+#[cfg(not(target_os = "macos"))]
+pub fn host_available() -> u64 {
+    meminfo("MemAvailable:")
 }

@@ -67,22 +67,18 @@ pub fn fetch(
     cache: &Path,
     token: Option<&str>,
     progress: &Progress,
+    (files, manifest): (Files, Option<&str>),
 ) -> Result<PathBuf, Error> {
     let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
-    if pinned(revision) {
-        return snapshot(
-            &format!("{repo}@{revision}"),
-            cache,
-            token,
-            progress,
-            None,
-            None,
-        );
-    }
-    let info = lookup(repo, revision, token)?;
-    let pinned = format!("{repo}@{}", info.sha);
-    eprintln!("tesserax: model {pinned}");
-    snapshot(&pinned, cache, token, progress, None, None)
+    let pinned = match pinned(revision) {
+        true => format!("{repo}@{revision}"),
+        false => {
+            let pinned = format!("{repo}@{}", lookup(repo, revision, token)?.sha);
+            eprintln!("tesserax: model {pinned}");
+            pinned
+        }
+    };
+    snapshot(&pinned, cache, token, progress, None, manifest, files)
 }
 
 /// Whether `owner/name[@revision]` exists with safetensors files.
@@ -154,15 +150,87 @@ fn get(url: &str, token: Option<&str>) -> Result<ureq::Response, Box<ureq::Error
 
 /// `url` from byte `from` on. A stalled read times out.
 fn get_from(url: &str, token: Option<&str>, from: u64) -> Result<ureq::Response, Box<ureq::Error>> {
+    let range = (from > 0).then(|| format!("bytes={from}-"));
+    get_range(url, token, range.as_deref())
+}
+
+/// `url`, or a `range` of its bytes, timing out stalls.
+fn get_range(
+    url: &str,
+    token: Option<&str>,
+    range: Option<&str>,
+) -> Result<ureq::Response, Box<ureq::Error>> {
     let agent = ureq::AgentBuilder::new().timeout_read(STALL).build();
     let mut request = agent.get(url);
     if let Some(t) = token {
         request = request.set("Authorization", &format!("Bearer {t}"));
     }
-    if from > 0 {
-        request = request.set("Range", &format!("bytes={from}-"));
+    if let Some(range) = range {
+        request = request.set("Range", range);
     }
     request.call().map_err(Box::new)
+}
+
+/// `len` bytes of `url` from byte `from`.
+fn read_range(url: &str, token: Option<&str>, from: u64, len: u64) -> Result<Vec<u8>, Error> {
+    let range = format!("bytes={from}-{}", from + len - 1);
+    let response = get_range(url, token, Some(&range)).map_err(|e| http(url)(*e))?;
+    if response.status() != 206 {
+        return Err(Error::Http(
+            url.into(),
+            "the server ignored the byte range".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let reader = response.into_reader().take(len);
+    std::io::BufReader::new(reader)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Http(url.into(), e.to_string()))?;
+    Ok(bytes)
+}
+
+/// The bytes of repository files in a snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Files {
+    #[default]
+    Whole,
+    /// Large safetensors files hold only headers, then zeros.
+    Headers,
+}
+
+/// Safetensors files at least this large keep only their header.
+const LARGE: u64 = 16 << 20;
+
+/// Whether `files` keeps only the header of `name`.
+fn header_only(files: Files, name: &str, size: u64) -> bool {
+    files == Files::Headers && name.ends_with(".safetensors") && size >= LARGE
+}
+
+/// `name`'s header at `path`, in a sparse file.
+fn fetch_header(
+    (repo, commit, name): (&str, &str, &str),
+    path: &Path,
+    token: Option<&str>,
+    size: u64,
+) -> Result<(), Error> {
+    let url = resolve(repo, commit, name);
+    let head = read_range(&url, token, 0, 8)?;
+    let len = u64::from_le_bytes(head.as_slice().try_into().map_err(|_| short(&url))?);
+    if 8 + len > size {
+        return Err(short(&url));
+    }
+    let header = read_range(&url, token, 8, len)?;
+    make_parent(path)?;
+    let part = part_of(path);
+    let mut file = std::fs::File::create(&part).map_err(io(&part))?;
+    file.write_all(&head).map_err(io(&part))?;
+    file.write_all(&header).map_err(io(&part))?;
+    file.set_len(size).map_err(io(&part))?;
+    std::fs::rename(&part, path).map_err(io(path))
+}
+
+fn short(url: &str) -> Error {
+    Error::Http(url.into(), "short safetensors header".into())
 }
 
 /// `owner/name@commit`, downloaded into `cache` per width or manifest.
@@ -173,6 +241,7 @@ pub(crate) fn snapshot(
     progress: &Progress,
     width: Option<u32>,
     manifest: Option<&str>,
+    files: Files,
 ) -> Result<PathBuf, Error> {
     let refuse = || Error::Source(spec.into(), "hf weights are owner/name@<commit>");
     let (repo, commit) = spec.split_once('@').ok_or_else(refuse)?;
@@ -184,12 +253,21 @@ pub(crate) fn snapshot(
     {
         return Err(Error::Source(spec.into(), "unsafe manifest name"));
     }
-    let dir = cache.join("hf").join(repo).join(commit);
-    let done = dir.join(match (manifest, width) {
+    let marker = match (manifest, width) {
         (Some(name), _) => format!(".complete.{name}"),
         (None, Some(k)) => format!(".complete.k{k}"),
         (None, None) => ".complete".into(),
-    });
+    };
+    let dir = cache.join("hf").join(repo).join(commit);
+    if dir.join(&marker).is_file() {
+        return Ok(dir);
+    }
+    // Apart, so header files never pass as whole.
+    let dir = match files {
+        Files::Whole => dir,
+        Files::Headers => cache.join("hf-headers").join(repo).join(commit),
+    };
+    let done = dir.join(&marker);
     if done.is_file() {
         return Ok(dir);
     }
@@ -217,17 +295,17 @@ pub(crate) fn snapshot(
         Some(name) => Some(read_manifest(repo, commit, name, &names, &dir, get)?),
         None => None,
     };
-    let files = match names.iter().any(|n| n == EXLR8) {
+    let want = match names.iter().any(|n| n == EXLR8) {
         true => exlr8_files(&names, width.unwrap_or(WIDTH), layers.as_ref()),
         false => wanted(&names, folders.as_deref()),
     };
-    if !files.iter().all(|name| safe_path(name)) {
+    if !want.iter().all(|name| safe_path(name)) {
         return Err(Error::Source(spec.into(), "unsafe file path in repository"));
     }
     let mut left = 0;
-    for name in &files {
+    for name in &want {
         let size = sizes.get(*name).copied().flatten().unwrap_or(0);
-        if !dir.join(name).is_file() {
+        if !dir.join(name).is_file() && !header_only(files, name, size) {
             left += size.saturating_sub(held(&part_of(&dir.join(name))));
         }
     }
@@ -238,8 +316,8 @@ pub(crate) fn snapshot(
         progress: &inner,
         whole: Some(&whole),
     };
-    let sized: Vec<_> = files.iter().map(|n| (*n, sizes[*n])).collect();
-    fetch_all(repo, commit, &sized, &dir, get)?;
+    let sized: Vec<_> = want.iter().map(|n| (*n, sizes[*n])).collect();
+    fetch_all((repo, commit), &sized, (&dir, files), get)?;
     whole.finish();
     std::fs::write(&done, b"").map_err(io(&done))?;
     Ok(dir)
@@ -247,16 +325,21 @@ pub(crate) fn snapshot(
 
 /// Each of `names` into `dir`, `LANES` at a time.
 fn fetch_all(
-    repo: &str,
-    commit: &str,
+    (repo, commit): (&str, &str),
     names: &[(&str, Option<u64>)],
-    dir: &Path,
+    (dir, files): (&Path, Files),
     get: Get,
 ) -> Result<(), Error> {
     let next = AtomicUsize::new(0);
+    let one = |name: &str, size: Option<u64>| match size {
+        Some(size) if header_only(files, name, size) && !dir.join(name).is_file() => {
+            fetch_header((repo, commit, name), &dir.join(name), get.token, size)
+        }
+        _ => fetch_file(repo, commit, name, dir, get, size),
+    };
     let lane = || {
         while let Some(&(name, size)) = names.get(next.fetch_add(1, Ordering::Relaxed)) {
-            if let Err(e) = fetch_file(repo, commit, name, dir, get, size) {
+            if let Err(e) = one(name, size) {
                 next.store(names.len(), Ordering::Relaxed);
                 return Err(e);
             }

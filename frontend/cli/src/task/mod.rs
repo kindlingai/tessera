@@ -239,7 +239,7 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
 }
 
 /// Starts the load and waits for the model.
-fn load(options: Options) -> Slot {
+pub(crate) fn load(options: Options) -> Slot {
     let slot = start::spawn(options);
     while slot.get().is_none() {
         std::thread::sleep(Duration::from_millis(20));
