@@ -5,6 +5,7 @@ use crate::{Backend, Options, flatten};
 use std::sync::OnceLock;
 use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;
+use tessera_lower::kept::{self, Layout};
 use tessera_lower::{
     Arg, ByBackend, Draft, Extent, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term,
     Tree,
@@ -23,8 +24,8 @@ enum AttendKind {
 impl AttendKind {
     fn width(self) -> usize {
         match self {
-            AttendKind::Mla => MLA_WIDTH,
-            AttendKind::Gqa => GQA_WIDTH,
+            Self::Mla => MLA_WIDTH,
+            Self::Gqa => GQA_WIDTH,
         }
     }
 
@@ -34,40 +35,26 @@ impl AttendKind {
 
     fn smem(self) -> usize {
         match self {
-            AttendKind::Mla => 42_240,
-            AttendKind::Gqa => 18_432,
+            Self::Mla => 42_240,
+            Self::Gqa => 18_432,
         }
     }
 
-    fn attend_name(self) -> &'static str {
+    fn names(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            AttendKind::Mla => "fast_mla_attend",
-            AttendKind::Gqa => "fast_gqa_attend",
-        }
-    }
-
-    fn reduce_name(self) -> &'static str {
-        match self {
-            AttendKind::Mla => "fast_mla_reduce",
-            AttendKind::Gqa => "fast_gqa_reduce",
-        }
-    }
-
-    fn reduce_entry(self) -> &'static str {
-        match self {
-            AttendKind::Mla => "tessera_mla_reduce",
-            AttendKind::Gqa => "tessera_gqa_reduce",
+            Self::Mla => ("fast_mla_attend", "fast_mla_reduce", "tessera_mla_reduce"),
+            Self::Gqa => ("fast_gqa_attend", "fast_gqa_reduce", "tessera_gqa_reduce"),
         }
     }
 
     fn kv_entry(self, kv: &str) -> Option<&'static str> {
         match (self, kv) {
-            (AttendKind::Mla, "fp8") => Some("tessera_mla_attend_fp8"),
-            (AttendKind::Mla, "bf16") => Some("tessera_mla_attend_bf16"),
-            (AttendKind::Mla, "f32") => Some("tessera_mla_attend_f32"),
-            (AttendKind::Gqa, "fp8") => Some("tessera_gqa_attend_fp8"),
-            (AttendKind::Gqa, "bf16") => Some("tessera_gqa_attend_bf16"),
-            (AttendKind::Gqa, "f32") => Some("tessera_gqa_attend_f32"),
+            (Self::Mla, "fp8") => Some("tessera_mla_attend_fp8"),
+            (Self::Mla, "bf16") => Some("tessera_mla_attend_bf16"),
+            (Self::Mla, "f32") => Some("tessera_mla_attend_f32"),
+            (Self::Gqa, "fp8") => Some("tessera_gqa_attend_fp8"),
+            (Self::Gqa, "bf16") => Some("tessera_gqa_attend_bf16"),
+            (Self::Gqa, "f32") => Some("tessera_gqa_attend_f32"),
             _ => None,
         }
     }
@@ -104,10 +91,10 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     }
 }
 
-/// Grouped-Q split-K MLA or GQA attention over dense KV.
+/// Grouped-Q split-K MLA or GQA over dense or paged KV.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = self.kind.attend_name(),
+    name = self.kind.names().0,
     sizes = [self.rows, self.heads, self.kv_heads, self.keys.most(), self.picks, self.splits],
     work = self.rows * self.heads * self.picks * self.kind.width(),
     accepts = attend_accepts,
@@ -126,6 +113,7 @@ struct SplitAttend {
     kv_heads: usize,
     keys: Extent,
     context: usize,
+    kept: &'static dyn Layout,
     picks: usize,
     from_list: bool,
     scale: f32,
@@ -212,10 +200,14 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         }
         AttendKind::Gqa => args.push(Arg::count(k.kv_heads)),
     }
+    let page_shift = k.kept.page().map_or(0, |p| p.trailing_zeros() as usize);
+    let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
     args.extend([
         Arg::count(k.window.0),
         Arg::count(k.window.1),
         Arg::count(k.splits),
+        table,
+        Arg::count(page_shift),
     ]);
     vec![Launch { args, shape }]
 }
@@ -223,14 +215,14 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
 /// Combines split-K MLA or GQA partials into final outputs.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
-    name = self.kind.reduce_name(),
+    name = self.kind.names().1,
     sizes = [self.lists, self.splits],
     work = self.lists * self.splits * self.kind.width(),
     accepts = red_accepts,
     emits = f32_only,
     needs = red_needs(self),
     order = Order::PerConfig,
-    source = attend_entry(self.kind.reduce_entry()),
+    source = attend_entry(self.kind.names().2),
     launches = red_launches,
     load = red_load,
     unproven,
@@ -295,17 +287,25 @@ fn red_launches(r: &SplitReduce, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn dense_context(tree: &Tree, k: T, v: T, most: usize) -> Option<usize> {
+fn kept_stride(kept: &'static dyn Layout, context: usize) -> Option<(usize, &'static dyn Layout)> {
+    if kept.name() == "dense" {
+        return Some((context, kept));
+    }
+    let page = kept.page()?;
+    Some((context.div_ceil(page), kept))
+}
+
+fn kept_context(tree: &Tree, k: T, v: T, most: usize) -> Option<(usize, &'static dyn Layout)> {
     match (&tree.node(k).term, &tree.node(v).term) {
         (Term::Op(Op::Append(ki)), Term::Op(Op::Append(vi))) => {
-            if tree.kept.name() != "dense" {
+            let ctx = tree.kept_rows(*ki)?.1;
+            if tree.kept_rows(*vi)?.1 != ctx {
                 return None;
             }
-            let ctx = tree.kept_rows(*ki)?.1;
-            (tree.kept_rows(*vi)?.1 == ctx).then_some(ctx)
+            kept_stride(tree.kept, ctx)
         }
         (Term::Op(Op::Append(_)), _) | (_, Term::Op(Op::Append(_))) => None,
-        _ => Some(most),
+        _ => Some((most, kept::DENSE)),
     }
 }
 
@@ -361,7 +361,7 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
             )
         }
     };
-    let context = dense_context(tree, k, v, most)?;
+    let (context, kept) = kept_context(tree, k, v, most)?;
     let splits = split_count(kind, rows, hgroups);
     let attend = SplitAttend {
         kind,
@@ -370,6 +370,7 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
         kv_heads,
         keys: tree.node(k).extents[1],
         context,
+        kept,
         picks,
         from_list: a.picked,
         scale: a.scale,
@@ -418,7 +419,7 @@ fn idx_tile_keys(rows: usize) -> usize {
     if rows <= 4 { 64 } else { 256 }
 }
 
-/// Tensor-Core Lightning Indexer over dense kept keys.
+/// Tensor-Core Lightning Indexer over dense or paged keys.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = "fast_indexer",
@@ -438,6 +439,7 @@ struct FastIndexer {
     out_keys: usize,
     keys: Extent,
     context: usize,
+    kept: &'static dyn Layout,
     heads: usize,
     dim: usize,
     masked: bool,
@@ -489,6 +491,8 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
         down: k.rows,
         threads: 128,
     };
+    let page_shift = k.kept.page().map_or(0, |p| p.trailing_zeros() as usize);
+    let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
     let args = vec![
         step.read(0),
         step.read(1),
@@ -504,13 +508,15 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
         Arg::count(k.dim),
         Arg::count(usize::from(k.masked)),
         Arg::count(tk),
+        table,
+        Arg::count(page_shift),
     ];
     vec![Launch { args, shape }]
 }
 
-/// Matches the stepped ragged Lightning Indexer over dense kept keys.
+/// Matches stepped ragged Lightning Indexer over dense or paged keys.
 fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if tree.kept.name() != "dense" {
+    if tree.kept.name() != "dense" && tree.kept.page().is_none() {
         return None;
     }
     let node = tree.node(at);
@@ -591,7 +597,8 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if tree.elements(slots) != rows || tree.node(slots).form.dtype() != DType::U32 {
         return None;
     }
-    let (_, context) = tree.kept_rows(ki)?;
+    let (_, raw_ctx) = tree.kept_rows(ki)?;
+    let (context, kept) = kept_stride(tree.kept, raw_ctx)?;
     let keys = k_node.extents[1];
     let (masked, positions) = match masked_pos {
         Some(pos) => {
@@ -608,6 +615,7 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         out_keys,
         keys,
         context,
+        kept,
         heads,
         dim,
         masked,

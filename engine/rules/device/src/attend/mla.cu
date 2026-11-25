@@ -159,6 +159,13 @@ static __device__ __forceinline__ void mla_load_ids(const u32* ids, u32 row, u32
     }
 }
 
+static __device__ __forceinline__ u64 kv_row_at(const u32* page_table, u32 slot, u32 pos,
+                                                u32 context, u32 page_shift) {
+    if (page_shift == 0u) return u64(slot) * context + pos;
+    u32 page = page_table[u64(slot) * context + (pos >> page_shift)];
+    return (u64(page) << page_shift) | u64(pos & ((1u << page_shift) - 1u));
+}
+
 template <u32 KV_FMT>
 static __device__ __forceinline__ void mla_attend_body(const float* q, const void* kv_ptr,
                                                        const u32* ids, const u32* slots,
@@ -166,7 +173,8 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
                                                        float scale, u32 rows, u32 keys,
                                                        u32 context, u32 heads, u32 picks,
                                                        u32 from_list, u32 before, u32 after,
-                                                       u32 splits, mla_smem& sm) {
+                                                       u32 splits, const u32* page_table,
+                                                       u32 page_shift, mla_smem& sm) {
     u32 tid = threadIdx.x;
     u32 warp = tid >> 5;
     u32 lane = tid & 31u;
@@ -264,7 +272,7 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
             u32 j = sm.j[tk];
             if constexpr (KV_FMT == 0u) {
                 if (j != 0xFFFFFFFFu) {
-                    const u8* row_u8 = kv_u8 + (u64(slot) * context + j) * 576ull;
+                    const u8* row_u8 = kv_u8 + kv_row_at(page_table, slot, j, context, page_shift) * 576ull;
                     for (u32 q16 = lane8; q16 < 36u; q16 += 8u) {
                         uint4 raw = *reinterpret_cast<const uint4*>(row_u8 + u64(q16) * 16ull);
                         u32 h0w = attn_e4m3_f16x2(static_cast<u16>(raw.x));
@@ -289,7 +297,9 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
                     }
                 }
             } else {
-                u64 row_base = (u64(slot) * context + j) * 576ull;
+                u64 row_base = (j != 0xFFFFFFFFu)
+                                   ? kv_row_at(page_table, slot, j, context, page_shift) * 576ull
+                                   : 0ull;
                 for (u32 q4 = lane8; q4 < 144u; q4 += 8u) {
                     u32 h0w = 0u;
                     u32 h1w = 0u;
@@ -332,35 +342,21 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
                                          d_base, g, t, tid);
 }
 
-// Grouped-Q split-K MLA attention over FP8 KV.
-extern "C" __global__ __launch_bounds__(128, 2) void tessera_mla_attend_fp8(
-    const float* q, const u8* kv, const u32* ids, const u32* slots, const u32* positions,
-    float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list,
-    u32 before, u32 after, u32 splits) {
-    __shared__ mla_smem sm;
-    mla_attend_body<0u>(q, kv, ids, slots, positions, part, scale, rows, keys, context, heads,
-                        picks, from_list, before, after, splits, sm);
-}
+#define MLA_DEF(NAME, T, FMT)                                                                 \
+    extern "C" __global__ __launch_bounds__(128, 2) void NAME(                                \
+        const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions,  \
+        float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks,      \
+        u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table,              \
+        u32 page_shift) {                                                                     \
+        __shared__ mla_smem sm;                                                               \
+        mla_attend_body<FMT>(q, kv, ids, slots, positions, part, scale, rows, keys, context,  \
+                             heads, picks, from_list, before, after, splits, page_table,      \
+                             page_shift, sm);                                                 \
+    }
 
-// Grouped-Q split-K MLA attention over BF16 KV.
-extern "C" __global__ __launch_bounds__(128, 2) void tessera_mla_attend_bf16(
-    const float* q, const u16* kv, const u32* ids, const u32* slots, const u32* positions,
-    float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list,
-    u32 before, u32 after, u32 splits) {
-    __shared__ mla_smem sm;
-    mla_attend_body<1u>(q, kv, ids, slots, positions, part, scale, rows, keys, context, heads,
-                        picks, from_list, before, after, splits, sm);
-}
-
-// Grouped-Q split-K MLA attention over F32 KV.
-extern "C" __global__ __launch_bounds__(128, 2) void tessera_mla_attend_f32(
-    const float* q, const float* kv, const u32* ids, const u32* slots, const u32* positions,
-    float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list,
-    u32 before, u32 after, u32 splits) {
-    __shared__ mla_smem sm;
-    mla_attend_body<2u>(q, kv, ids, slots, positions, part, scale, rows, keys, context, heads,
-                        picks, from_list, before, after, splits, sm);
-}
+MLA_DEF(tessera_mla_attend_fp8, u8, 0u)
+MLA_DEF(tessera_mla_attend_bf16, u16, 1u)
+MLA_DEF(tessera_mla_attend_f32, float, 2u)
 
 // Combines split-K MLA partials for one row and head.
 extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
@@ -475,6 +471,7 @@ static __device__ __forceinline__ void gqa_attend_body(const float* q, const voi
                                                        float scale, u32 rows, u32 keys,
                                                        u32 context, u32 heads, u32 kv_heads,
                                                        u32 before, u32 after, u32 splits,
+                                                       const u32* page_table, u32 page_shift,
                                                        gqa_smem& sm) {
     u32 tid = threadIdx.x;
     u32 warp = tid >> 5;
@@ -554,7 +551,11 @@ static __device__ __forceinline__ void gqa_attend_body(const float* q, const voi
     for (u32 j0 = p_begin; j0 < p_end; j0 += 16u) {
         u32 j = j0 + tk;
         bool valid = j < p_end;
-        u64 kv_base = ((u64(slot) * context + j) * kv_heads + kv_head) * 128ull;
+        u64 kv_base = valid
+                          ? (kv_row_at(page_table, slot, j, context, page_shift) * kv_heads +
+                             kv_head) *
+                                128ull
+                          : 0ull;
         gqa_stage_vec<KV_FMT>(k_ptr, kv_base, lane8, valid, sm.k[tk]);
         gqa_stage_vec<KV_FMT>(v_ptr, kv_base, lane8, valid, sm.v[tk]);
         prim::block_sync();
@@ -581,10 +582,11 @@ static __device__ __forceinline__ void gqa_attend_body(const float* q, const voi
     extern "C" __global__ __launch_bounds__(128, 4) void NAME(                                \
         const float* q, const T* k, const T* v, const u32* slots, const u32* positions,       \
         float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 kv_heads,   \
-        u32 before, u32 after, u32 splits) {                                                  \
+        u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift) {           \
         __shared__ gqa_smem sm;                                                               \
         gqa_attend_body<FMT>(q, k, v, slots, positions, part, scale, rows, keys, context,     \
-                             heads, kv_heads, before, after, splits, sm);                     \
+                             heads, kv_heads, before, after, splits, page_table, page_shift,  \
+                             sm);                                                             \
     }
 
 GQA_DEF(tessera_gqa_attend_fp8, u8, 0u)
@@ -652,7 +654,8 @@ static __device__ __forceinline__ void idx_mma_bf16(float d[4], const u32 a[4], 
 template <u32 KV_FMT>
 static __device__ __forceinline__ void idx_load_k16(const void* k_ptr, u32* sk, u32 slot,
                                                     u32 context, u32 dim, u32 stride, u32 j0,
-                                                    u32 to, u32 lane) {
+                                                    u32 to, const u32* page_table, u32 page_shift,
+                                                    u32 lane) {
     u32 q_words = dim >> 2;
     u32 total_k4 = q_words << 4;
     const u8* k_u8 = static_cast<const u8*>(k_ptr);
@@ -664,7 +667,7 @@ static __device__ __forceinline__ void idx_load_k16(const void* k_ptr, u32* sk, 
         u32 j = j0 + kr;
         uint2 pack = make_uint2(0u, 0u);
         if (j < to) {
-            u64 base = (u64(slot) * context + j) * dim + (u64(q4) << 2);
+            u64 base = kv_row_at(page_table, slot, j, context, page_shift) * dim + (u64(q4) << 2);
             if constexpr (KV_FMT == 0u) {
                 u32 raw = *reinterpret_cast<const u32*>(k_u8 + base);
                 pack = make_uint2(idx_e4m3x2_bf16x2(static_cast<u16>(raw)),
@@ -686,6 +689,7 @@ static __device__ __forceinline__ void idx_body(const float* q, const void* k_pt
                                                 const u32* positions, float* out, u32 rows,
                                                 u32 out_keys, u32 live_keys, u32 context,
                                                 u32 heads, u32 dim, u32 masked, u32 tile_keys,
+                                                const u32* page_table, u32 page_shift,
                                                 idx_smem& sm) {
     u32 row = blockIdx.y;
     if (row >= rows) return;
@@ -740,7 +744,8 @@ static __device__ __forceinline__ void idx_body(const float* q, const void* k_pt
             if (lane < 16u && j0 + lane < j_end) out_row[j0 + lane] = neg;
             continue;
         }
-        idx_load_k16<KV_FMT>(k_ptr, sk, slot, context, dim, stride, j0, to, lane);
+        idx_load_k16<KV_FMT>(k_ptr, sk, slot, context, dim, stride, j0, to, page_table,
+                             page_shift, lane);
         __syncwarp();
 
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -784,31 +789,19 @@ static __device__ __forceinline__ void idx_body(const float* q, const void* k_pt
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void tessera_indexer_fp8(
-    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
-    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
-    u32 tile_keys) {
-    __shared__ idx_smem sm;
-    idx_body<0u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
-                 dim, masked, tile_keys, sm);
-}
+#define IDX_DEF(NAME, FMT)                                                                    \
+    extern "C" __global__ __launch_bounds__(128) void NAME(                                   \
+        const float* q, const void* k, const float* weights, const u32* slots,                \
+        const u32* positions, float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, \
+        u32 heads, u32 dim, u32 masked, u32 tile_keys, const u32* page_table,                 \
+        u32 page_shift) {                                                                     \
+        __shared__ idx_smem sm;                                                               \
+        idx_body<FMT>(q, k, weights, slots, positions, out, rows, out_keys, live_keys,        \
+                      context, heads, dim, masked, tile_keys, page_table, page_shift, sm);    \
+    }
 
-extern "C" __global__ __launch_bounds__(128) void tessera_indexer_bf16(
-    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
-    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
-    u32 tile_keys) {
-    __shared__ idx_smem sm;
-    idx_body<1u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
-                 dim, masked, tile_keys, sm);
-}
-
-extern "C" __global__ __launch_bounds__(128) void tessera_indexer_f32(
-    const float* q, const void* k, const float* weights, const u32* slots, const u32* positions,
-    float* out, u32 rows, u32 out_keys, u32 live_keys, u32 context, u32 heads, u32 dim, u32 masked,
-    u32 tile_keys) {
-    __shared__ idx_smem sm;
-    idx_body<2u>(q, k, weights, slots, positions, out, rows, out_keys, live_keys, context, heads,
-                 dim, masked, tile_keys, sm);
-}
+IDX_DEF(tessera_indexer_fp8, 0u)
+IDX_DEF(tessera_indexer_bf16, 1u)
+IDX_DEF(tessera_indexer_f32, 2u)
 
 #endif
