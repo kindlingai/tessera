@@ -44,6 +44,15 @@ pub(crate) struct Peaks {
 /// Threads per row in the final argmax reduction.
 const ARGMAX_THREADS: u32 = 256;
 
+/// Threads per winning chunk in parallel `chunk_top`.
+const CHUNK_THREADS: u32 = 128;
+
+/// Threads per row in shared-memory `merge_top`.
+const MERGE_THREADS: u32 = 256;
+
+/// Maximum candidate list cached in shared memory by `merge_top`.
+const MERGE_MAX: u32 = 1024;
+
 /// The best of each row's peaks.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
@@ -99,7 +108,13 @@ pub(crate) struct TopK {
 
 /// Top `k` indices inside each winning chunk of each row.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(chunk_top, threads = self.rows * self.k, work = self.rows * self.width * self.k / self.parts.max(1))]
+#[launch(
+    chunk_top,
+    sizes = [self.rows, self.width, self.parts, self.k],
+    work = self.rows * self.width * self.k / self.parts.max(1),
+    needs = chunk_needs(),
+    launches = chunk_launches,
+)]
 pub(crate) struct ChunkTop {
     pub rows: usize,
     pub width: usize,
@@ -107,9 +122,32 @@ pub(crate) struct ChunkTop {
     pub k: usize,
 }
 
+fn chunk_needs() -> Needs {
+    Needs {
+        group_bytes: 8 * CHUNK_THREADS as usize,
+        group_threads: CHUNK_THREADS as usize,
+        ..Needs::default()
+    }
+}
+
+fn chunk_launches(c: &ChunkTop, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: c.rows * c.k,
+        down: 1,
+        threads: CHUNK_THREADS as usize,
+    };
+    vec![Launch::plain(step, &[c.rows, c.width, c.parts, c.k], shape)]
+}
+
 /// Selects top `k` from `total` distinct row candidates.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(merge_top, threads = self.rows * self.total, work = self.rows * self.total * self.total)]
+#[launch(
+    merge_top,
+    sizes = [self.rows, self.width, self.total, self.k],
+    work = self.rows * self.total * self.total,
+    needs = merge_needs(),
+    launches = merge_launches,
+)]
 pub(crate) struct MergeTop {
     pub rows: usize,
     pub width: usize,
@@ -117,6 +155,27 @@ pub(crate) struct MergeTop {
     pub k: usize,
     pub first: usize,
     pub whole: usize,
+}
+
+fn merge_needs() -> Needs {
+    Needs {
+        group_bytes: 8 * MERGE_MAX as usize,
+        group_threads: MERGE_THREADS as usize,
+        ..Needs::default()
+    }
+}
+
+fn merge_launches(m: &MergeTop, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: m.rows,
+        down: 1,
+        threads: MERGE_THREADS as usize,
+    };
+    vec![Launch::plain(
+        step,
+        &[m.rows, m.width, m.total, m.k, m.first, m.whole],
+        shape,
+    )]
 }
 
 /// Radix-select and bitonic-sort top `k`, one block per row.
@@ -322,14 +381,16 @@ fn chunk_top(
     parts: u32,
     k: u32,
 ) {
-    if gid() >= rows * k {
+    let item = gid() / CHUNK_THREADS;
+    if item >= rows * k {
         return;
     }
-    let row = gid() / k;
-    let win = winners[gid() as u64];
-    let dst = (gid() * k) as u64;
+    let l = lid();
+    let row = item / k;
+    let win = winners[item as u64];
+    let dst = (item * k) as u64;
     if win >= width {
-        for p in 0..k {
+        for p in (l..k).by(CHUNK_THREADS) {
             out[dst + p as u64] = width;
         }
         return;
@@ -342,13 +403,17 @@ fn chunk_top(
         width
     };
     let at = row as u64 * width as u64;
-    out[dst] = win;
+    let mut val_s = shared::<f32>(CHUNK_THREADS);
+    let mut idx_s = shared::<u32>(CHUNK_THREADS);
+    if l == 0 {
+        out[dst] = win;
+    }
     let mut cap = x[at + win as u64];
     let mut prev = win;
     for p in 1..k {
         let mut arg = width;
         let mut best = f32::NEG_INFINITY;
-        for i in from..to {
+        for i in (from + l..to).by(CHUNK_THREADS) {
             let v = x[at + i as u64];
             if v > f32::NEG_INFINITY {
                 let under = v < cap || (v == cap && i > prev);
@@ -358,9 +423,27 @@ fn chunk_top(
                 }
             }
         }
-        out[dst + p as u64] = arg;
-        cap = best;
-        prev = arg;
+        val_s[l] = best;
+        idx_s[l] = arg;
+        barrier();
+        for shift in 0..7 {
+            let s = 64u32 >> shift;
+            if l < s {
+                let ov = val_s[l + s];
+                let oi = idx_s[l + s];
+                if ov > val_s[l] || (ov == val_s[l] && oi < idx_s[l]) {
+                    val_s[l] = ov;
+                    idx_s[l] = oi;
+                }
+            }
+            barrier();
+        }
+        cap = val_s[0];
+        prev = idx_s[0];
+        if l == 0 {
+            out[dst + p as u64] = prev;
+        }
+        barrier();
     }
 }
 
@@ -377,40 +460,46 @@ fn merge_top(
     first: u32,
     whole: u32,
 ) {
-    if gid() >= rows * total {
+    let row = gid() / MERGE_THREADS;
+    if row >= rows {
         return;
     }
-    let row = gid() / total;
-    let t = gid() % total;
+    let l = lid();
     let at = row as u64 * width as u64;
     let base = (row * total) as u64;
-    let idx = cands[base + t as u64];
-    let val = if idx < width {
-        x[at + idx as u64]
-    } else {
-        f32::NEG_INFINITY
-    };
-    let mut rank = 0u32;
-    let mut seen = 0u32;
-    for m in 0..total {
-        let j = cands[base + m as u64];
-        let other = if j < width {
-            x[at + j as u64]
+    let mut vals = shared::<f32>(MERGE_MAX);
+    let mut idxs = shared::<u32>(MERGE_MAX);
+    for m in (l..total).by(MERGE_THREADS) {
+        let idx = cands[base + m as u64];
+        idxs[m] = idx;
+        vals[m] = if idx < width {
+            x[at + idx as u64]
         } else {
             f32::NEG_INFINITY
         };
-        if other > f32::NEG_INFINITY {
-            seen += 1;
-        }
-        if other > val || (other == val && j < idx) {
-            rank += 1;
-        }
     }
-    if val > f32::NEG_INFINITY && rank < k {
-        out[(row * k + rank) as u64] = first + idx;
-    }
-    if t >= seen && t < k {
-        out[(row * k + t) as u64] = whole;
+    barrier();
+    for t in (l..total).by(MERGE_THREADS) {
+        let idx = idxs[t];
+        let val = vals[t];
+        let mut rank = 0u32;
+        let mut seen = 0u32;
+        for m in 0..total {
+            let other = vals[m];
+            let j = idxs[m];
+            if other > f32::NEG_INFINITY {
+                seen += 1;
+            }
+            if other > val || (other == val && j < idx) {
+                rank += 1;
+            }
+        }
+        if val > f32::NEG_INFINITY && rank < k {
+            out[(row * k + rank) as u64] = first + idx;
+        }
+        if t >= seen && t < k {
+            out[(row * k + t) as u64] = whole;
+        }
     }
 }
 
