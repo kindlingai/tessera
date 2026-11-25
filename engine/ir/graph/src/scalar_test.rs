@@ -60,6 +60,9 @@ fn rounds_ties_even() {
     }
     assert!(f16(f32::NAN).is_nan() && bf16(f32::NAN).is_nan() && e4m3(f32::NAN).is_nan());
     assert_eq!(e2m1(f32::NAN), 6.0, "no NaN code, so it saturates");
+    let wire = |x| crate::types::DType::F16.round(x);
+    assert_eq!([wire(1e9), wire(f32::NEG_INFINITY)], [65504.0, -65504.0]);
+    assert!(wire(f32::NAN).is_nan());
     assert_eq!(Bf16::from(1.0).0, 0x3f80);
     assert_eq!(F16::from(1.0).0, 0x3c00);
     assert_eq!(E4M3::from(1.0).0, 0x38);

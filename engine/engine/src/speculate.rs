@@ -44,6 +44,10 @@ impl Sum for SharedSum {
         self.0.borrow().wire()
     }
 
+    fn carries(&self, wire: DType) -> bool {
+        self.0.borrow().carries(wire)
+    }
+
     fn gather(
         &mut self,
         from: u64,

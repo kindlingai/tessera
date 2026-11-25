@@ -361,7 +361,7 @@ where
         len: usize,
         wire: DType,
     ) -> Result<(), tessera_run::Error> {
-        if !matches!(wire, DType::F32 | DType::Bf16 | DType::F16) {
+        if !self.carries(wire) {
             return Err(tessera_run::Error::Wire(wire));
         }
         if self.broken {
@@ -375,6 +375,10 @@ where
         }
         self.launch_sum(from, to, n, wire)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn carries(&self, wire: DType) -> bool {
+        matches!(wire, DType::F32 | DType::Bf16 | DType::F16)
     }
 
     fn gather(

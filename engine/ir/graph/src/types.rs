@@ -32,11 +32,12 @@ impl DType {
         matches!(self, DType::I32 | DType::U32)
     }
 
-    /// `x` rounded to this float dtype, ties to even.
+    /// `x` as this float dtype: ties to even, F16 saturates.
     pub fn round(self, x: f32) -> f32 {
+        const TOP: f32 = 65504.0;
         match self {
             DType::Bf16 => f32::from(crate::scalar::Bf16::from(x)),
-            DType::F16 => f32::from(crate::scalar::F16::from(x)),
+            DType::F16 => f32::from(crate::scalar::F16::from(x.clamp(-TOP, TOP))),
             _ => x,
         }
     }

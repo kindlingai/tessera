@@ -662,7 +662,8 @@ fn open_rank(plan: Plan, grid: Option<(bool, bool)>) -> RankFixture {
     let mut rank =
         Rank::open_device::<MockDevice>(plan, &settings, MockTransport(exchanges.clone()))
             .unwrap()
-            .with_grid(sum);
+            .with_grid(sum)
+            .unwrap();
     rank.launching(Launching {
         graphs: true,
         pdl: false,
@@ -836,7 +837,8 @@ fn sums_split_fallbacks() {
                 MockTransport(Arc::new(Mutex::new(0))),
             )
             .unwrap()
-            .with_grid(Some(Box::new(Share(shared.clone()))));
+            .with_grid(Some(Box::new(Share(shared.clone()))))
+            .unwrap();
             r.launching(Launching {
                 graphs: true,
                 pdl: false,

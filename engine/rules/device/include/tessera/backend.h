@@ -179,10 +179,15 @@ TESSERA_FN float round_bf16(float x) {
     return from_bits(u32(to_bf16(x)) << 16);
 }
 
+// `x` within the finite FP16 range. NaN stays NaN.
+TESSERA_FN float clamp_fp16(float x) {
+    return x > 65504.0f ? 65504.0f : (x < -65504.0f ? -65504.0f : x);
+}
+
 // Packs `lo` then `hi` as FP16, clamped to finite range.
 TESSERA_FN u32 to_fp16x2(float lo, float hi) {
-    lo = fminf(fmaxf(lo, -65504.0f), 65504.0f);
-    hi = fminf(fmaxf(hi, -65504.0f), 65504.0f);
+    lo = clamp_fp16(lo);
+    hi = clamp_fp16(hi);
 #if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     u32 d;
     asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
@@ -196,7 +201,10 @@ TESSERA_FN u32 to_fp16x2(float lo, float hi) {
         int exp = int((b >> 23) & 0xFFu) - 112;
         u32 mant = b & 0x7FFFFFu;
         u32 h;
-        if (exp <= 0) {
+        if (exp > 30) {
+            // After the clamp, only NaN is this large.
+            h = sign | 0x7E00u;
+        } else if (exp <= 0) {
             if (exp < -10) {
                 h = sign;
             } else {

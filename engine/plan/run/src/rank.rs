@@ -23,6 +23,10 @@ pub trait Sum {
     fn wire(&self) -> DType {
         DType::F32
     }
+    /// Whether `sum` takes parts as `wire`.
+    fn carries(&self, wire: DType) -> bool {
+        matches!(wire, DType::F32 | DType::Bf16)
+    }
     /// Queues a gather of `part` floats over `rows` rows.
     fn gather(
         &mut self,
@@ -133,6 +137,21 @@ pub(crate) fn wire(step: &Step) -> DType {
     step.kernel
         .wire()
         .expect("an all-reduce step has a wire dtype")
+}
+
+/// Fails if `grid` cannot carry a wire of `plan`.
+fn carried(plan: &Plan, grid: Option<&dyn Sum>) -> Result<(), Error> {
+    let Some(grid) = grid else {
+        return Ok(());
+    };
+    for step in &plan.steps {
+        if let Some(wire) = step.kernel.wire()
+            && !grid.carries(wire)
+        {
+            return Err(Error::Wire(wire));
+        }
+    }
+    Ok(())
 }
 
 /// Queues one crossing step on `grid`. False means host fallback.
@@ -255,9 +274,10 @@ impl<T: Transport> Rank<T> {
     }
 
     /// Runs the sums through `grid` from now on.
-    pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
+    pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Result<Self, Error> {
+        carried(self.runner.run().plan(), grid.as_deref())?;
         self.grid = grid;
-        self
+        Ok(self)
     }
 
     /// Whether sums run on the device.
@@ -462,6 +482,7 @@ impl<T: Transport> Run for Rank<T> {
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
+        carried(plan, self.grid.as_deref())?;
         match &mut self.runner {
             Inner::Device(dev) => dev.replan_with(plan, self.grid.as_deref_mut()),
             Inner::Plain(r) => r.replan(plan),

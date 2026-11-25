@@ -103,7 +103,7 @@ pub(crate) fn open_rank<T: Transport + 'static>(
     sums: T,
     grid: Option<Box<dyn Sum>>,
 ) -> Result<Box<dyn Run>, Error> {
-    Ok(Box::new(Rank::open(plan, settings, sums)?.with_grid(grid)))
+    Ok(Box::new(Rank::open(plan, settings, sums)?.with_grid(grid)?))
 }
 
 impl Engine {

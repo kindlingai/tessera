@@ -344,7 +344,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         start.elapsed().as_secs_f64()
     );
 
-    let mut rank = Rank::open(plan, &settings, transport)?.with_grid(grid);
+    let mut rank = Rank::open(plan, &settings, transport)?.with_grid(grid)?;
     let sums = match rank.on_device() {
         true => "on the device",
         false => "on the host",

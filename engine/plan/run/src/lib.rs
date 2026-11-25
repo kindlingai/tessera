@@ -70,7 +70,7 @@ pub enum Error {
     Unaddressed(usize),
     #[error("a sum of {0} floats does not fit the device")]
     SumTooLong(usize),
-    #[error("these sums carry parts as F32 or Bf16, not {0:?}")]
+    #[error("the sum transport does not carry {0:?} parts")]
     Wire(tessera_mem::DType),
     #[error("a plan over several zones")]
     Zones,
