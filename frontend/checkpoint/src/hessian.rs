@@ -64,7 +64,7 @@ pub(crate) fn triu_index(d: usize, r: usize, c: usize) -> usize {
     r * (2 * d + 1 - r) / 2 + (c - r)
 }
 
-fn pack_tiles_into<T: Copy>(tiles: &[T], d: usize, tile: usize, out: &mut [T]) {
+pub(crate) fn pack_tiles_into<T: Copy>(tiles: &[T], d: usize, tile: usize, out: &mut [T]) {
     assert!(tile > 0 && d.is_multiple_of(tile));
     let blocks = d / tile;
     let total_tiles = blocks * (blocks + 1) / 2;
@@ -85,13 +85,6 @@ fn pack_tiles_into<T: Copy>(tiles: &[T], d: usize, tile: usize, out: &mut [T]) {
             tidx += 1;
         }
     }
-}
-
-/// Converts packed upper-triangle tiles into row-major upper triangle.
-pub fn pack_tiles(tiles: &[f32], d: usize, tile: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; triu_len(d)];
-    pack_tiles_into(tiles, d, tile, &mut out);
-    out
 }
 
 /// Packs little-endian FP32 upper-triangle tiles into row-major upper-triangle bytes.
@@ -126,46 +119,53 @@ pub fn route_name(layer: usize) -> String {
     format!("route-{layer:03}.safetensors")
 }
 
-/// Writes `hess-LLL-eAAA-BBB.safetensors` from little-endian FP32 buffers.
-#[allow(clippy::too_many_arguments)]
-pub fn write_experts_bytes(
+/// One file of routed expert Hessians as little-endian FP32 bytes.
+pub struct ExpertShard<'a> {
+    pub layer: usize,
+    pub first: usize,
+    /// Gate and up input triangles, one per expert.
+    pub gu: &'a [u8],
+    /// Packed upper triangles of the down input, one per expert.
+    pub down: &'a [u8],
+    pub counts: &'a [i64],
+    /// Hidden and expert inner widths.
+    pub dims: (usize, usize),
+}
+
+/// Writes `hess-LLL-eAAA-BBB.safetensors` matching `HESSIAN.md`.
+pub fn write_experts(
     path: &Path,
-    layer: usize,
-    first_expert: usize,
-    gu_bytes: &[u8],
-    down_bytes: &[u8],
-    counts: &[i64],
-    dims: (usize, usize),
+    shard: &ExpertShard<'_>,
     meta: &HessianMeta,
 ) -> Result<(), Error> {
-    let n = counts.len();
+    let n = shard.counts.len();
     if n == 0 {
         return Err(Error::Format(
             "expert shard requires at least 1 expert".into(),
         ));
     }
-    let (h, i) = dims;
+    let (h, i) = shard.dims;
     let (th, ti) = (triu_len(h), triu_len(i));
-    if h == 0 || i == 0 || gu_bytes.len() != n * th * 4 || down_bytes.len() != n * ti * 4 {
+    if h == 0 || i == 0 || shard.gu.len() != n * th * 4 || shard.down.len() != n * ti * 4 {
         return Err(Error::Format("expert tensor shape mismatch".into()));
     }
-    let mut m = meta.base(layer)?;
-    let last = first_expert + n - 1;
-    m.insert("experts".into(), format!("{first_expert}-{last}"));
+    let mut m = meta.base(shard.layer)?;
+    let last = shard.first + n - 1;
+    m.insert("experts".into(), format!("{}-{last}", shard.first));
     m.insert("layout".into(), EXPERT_LAYOUT.into());
-    let ct_b = le_bytes(counts, i64::to_le_bytes);
+    let ct_b = le_bytes(shard.counts, i64::to_le_bytes);
     let tensors = [
         StTensor {
             name: "gu",
             dtype: "F32",
             shape: vec![n, th],
-            data: gu_bytes,
+            data: shard.gu,
         },
         StTensor {
             name: "down",
             dtype: "F32",
             shape: vec![n, ti],
-            data: down_bytes,
+            data: shard.down,
         },
         StTensor {
             name: "count",
@@ -177,23 +177,6 @@ pub fn write_experts_bytes(
     write_file(path, &m, &tensors)
 }
 
-/// Writes `hess-LLL-eAAA-BBB.safetensors` matching `HESSIAN.md`.
-#[allow(clippy::too_many_arguments)]
-pub fn write_experts(
-    path: &Path,
-    layer: usize,
-    first_expert: usize,
-    gu: &[f32],
-    down: &[f32],
-    counts: &[i64],
-    dims: (usize, usize),
-    meta: &HessianMeta,
-) -> Result<(), Error> {
-    let gu_b = le_bytes(gu, f32::to_le_bytes);
-    let dn_b = le_bytes(down, f32::to_le_bytes);
-    write_experts_bytes(path, layer, first_expert, &gu_b, &dn_b, counts, dims, meta)
-}
-
 /// Writes `hess-LLL-dense.safetensors` or `-dense-heldout.safetensors`.
 pub fn write_dense(
     path: &Path,
@@ -202,10 +185,6 @@ pub fn write_dense(
     heldout: bool,
     meta: &HessianMeta,
 ) -> Result<(), Error> {
-    let has_mlp = entries.iter().any(|e| e.name == "mlp_in");
-    if !has_mlp {
-        return Err(Error::Format("dense file requires mlp_in".into()));
-    }
     let mut m = meta.base(layer)?;
     m.insert("layout".into(), DENSE_LAYOUT.into());
     let seqs = if heldout { "held out" } else { "calibration" };
@@ -244,34 +223,35 @@ pub fn write_dense(
     write_file(path, &m, &tensors)
 }
 
+/// Held-out MoE inputs and their routing for one layer.
+pub struct Inputs<'a> {
+    pub layer: usize,
+    pub heldout_seqs: usize,
+    pub x_bf16: &'a [u16],
+    pub topk_idx: &'a [i32],
+    pub topk_w: &'a [f32],
+    pub hidden: usize,
+    pub top_k: usize,
+}
+
 /// Writes `inputs-LLL.safetensors` matching `HESSIAN.md`.
-#[allow(clippy::too_many_arguments)]
-pub fn write_inputs(
-    path: &Path,
-    layer: usize,
-    heldout_seqs: usize,
-    x_bf16: &[u16],
-    topk_idx: &[i32],
-    topk_w: &[f32],
-    hidden: usize,
-    top_k: usize,
-    meta: &HessianMeta,
-) -> Result<(), Error> {
-    if heldout_seqs == 0 || hidden == 0 || top_k == 0 {
+pub fn write_inputs(path: &Path, inp: &Inputs<'_>, meta: &HessianMeta) -> Result<(), Error> {
+    let (hidden, top_k) = (inp.hidden, inp.top_k);
+    if inp.heldout_seqs == 0 || hidden == 0 || top_k == 0 {
         return Err(Error::Format("inputs require positive dimensions".into()));
     }
-    if !x_bf16.len().is_multiple_of(hidden) {
+    if !inp.x_bf16.len().is_multiple_of(hidden) {
         return Err(Error::Format("x length not divisible by hidden".into()));
     }
-    let n_tok = x_bf16.len() / hidden;
-    if n_tok == 0 || topk_idx.len() != n_tok * top_k || topk_w.len() != n_tok * top_k {
+    let n_tok = inp.x_bf16.len() / hidden;
+    if n_tok == 0 || inp.topk_idx.len() != n_tok * top_k || inp.topk_w.len() != n_tok * top_k {
         return Err(Error::Format("inputs tensor shape mismatch".into()));
     }
-    let mut m = meta.base(layer)?;
-    m.insert("heldout_sequences".into(), heldout_seqs.to_string());
-    let x_b = le_bytes(x_bf16, u16::to_le_bytes);
-    let idx_b = le_bytes(topk_idx, i32::to_le_bytes);
-    let w_b = le_bytes(topk_w, f32::to_le_bytes);
+    let mut m = meta.base(inp.layer)?;
+    m.insert("heldout_sequences".into(), inp.heldout_seqs.to_string());
+    let x_b = le_bytes(inp.x_bf16, u16::to_le_bytes);
+    let idx_b = le_bytes(inp.topk_idx, i32::to_le_bytes);
+    let w_b = le_bytes(inp.topk_w, f32::to_le_bytes);
     let tensors = [
         StTensor {
             name: "x",
@@ -295,7 +275,7 @@ pub fn write_inputs(
     write_file(path, &m, &tensors)
 }
 
-/// Writes optional `route-LLL.safetensors` matching `calib_forward.py`.
+/// Writes the optional per-token routing log `route-LLL.safetensors`.
 pub fn write_route(
     path: &Path,
     layer: usize,
@@ -339,115 +319,19 @@ pub fn weights_id(model_dir: &Path) -> Result<String, Error> {
 
 /// Computes `weights_id` directly from raw byte slices.
 pub(crate) fn weights_id_bytes(config: &[u8], index: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config);
-    hasher.update(index);
-    hasher.finish_hex()
+    sha256_hex(&[config, index])
 }
 
-/// Minimal FIPS 180-4 SHA-256 implementation with zero dependencies.
-struct Sha256 {
-    state: [u32; 8],
-    buf: [u8; 64],
-    len: usize,
-    total: u64,
-}
-
-const K256: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buf: [0; 64],
-            len: 0,
-            total: 0,
-        }
+/// Lowercase hex SHA-256 of `parts` read one after another.
+pub fn sha256_hex(parts: &[&[u8]]) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        ctx.update(part);
     }
-
-    fn compress(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for (i, slot) in w.iter_mut().enumerate().take(16) {
-            let at = i * 4;
-            *slot = u32::from_be_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K256[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        let add = [a, b, c, d, e, f, g, h];
-        for (dst, src) in self.state.iter_mut().zip(add) {
-            *dst = dst.wrapping_add(src);
-        }
+    let mut out = String::with_capacity(64);
+    for b in ctx.finish().as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
     }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.total += data.len() as u64;
-        while !data.is_empty() {
-            let take = (64 - self.len).min(data.len());
-            self.buf[self.len..self.len + take].copy_from_slice(&data[..take]);
-            self.len += take;
-            data = &data[take..];
-            if self.len == 64 {
-                let block = self.buf;
-                self.compress(&block);
-                self.len = 0;
-            }
-        }
-    }
-
-    fn finish_hex(mut self) -> String {
-        let bits = self.total * 8;
-        self.update(&[0x80]);
-        if self.len > 56 {
-            let pad = [0u8; 64];
-            self.update(&pad[..64 - self.len]);
-        }
-        let pad = [0u8; 56];
-        self.update(&pad[..56 - self.len]);
-        self.update(&bits.to_be_bytes());
-        let mut out = String::with_capacity(64);
-        for word in self.state {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{word:08x}");
-        }
-        out
-    }
+    out
 }

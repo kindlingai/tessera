@@ -6,58 +6,54 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
-use tessera_checkpoint::hessian::HessianMeta;
 use tessera_graph::Bf16;
 
-/// Persistent progress file (`calib-state.json`) for `--resume`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// What a run's files depend on, checked again on `--resume`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Stamp {
+    pub weights_id: String,
+    pub hessian_id: String,
+    /// SHA-256 of the tokens file.
+    pub tokens: String,
+    pub rows: usize,
+    pub seq_len: usize,
+    pub heldout: usize,
+    pub batch: usize,
+}
+
+/// Progress file (`calib-state.json`) for `--resume`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CalibState {
     pub done: Vec<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub weights_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hessian_id: Option<String>,
+    pub stamp: Stamp,
 }
 
 impl CalibState {
-    /// Loads existing state on resume or starts empty.
-    pub fn load(path: &Path, resume: bool) -> Result<Self, String> {
-        if !resume || !path.exists() {
-            return Ok(Self::default());
+    /// Loads earlier progress for `stamp`, refusing to mix two runs.
+    pub fn load(path: &Path, resume: bool, stamp: Stamp) -> Result<Self, String> {
+        let fresh = Self {
+            done: Vec::new(),
+            stamp,
+        };
+        if !path.exists() {
+            return Ok(fresh);
         }
-        let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-    }
-
-    /// Checks and stamps `weights_id` and `hessian_id` against mixing runs.
-    pub fn sync_meta(&mut self, meta: &HessianMeta, path: &Path) -> Result<(), String> {
-        if !self.done.is_empty() && self.weights_id.is_none() {
-            return Err(format!(
-                "{}: completed layers lack weights_id",
-                path.display()
+        let fail = |e: String| format!("{}: {e}", path.display());
+        let text = fs::read_to_string(path).map_err(|e| fail(e.to_string()))?;
+        let prev: Self = serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?;
+        if prev.done.is_empty() {
+            return Ok(fresh);
+        }
+        if !resume {
+            return Err(fail(
+                "has finished layers: pass --resume or remove it".into(),
             ));
         }
-        if let Some(prev) = &self.weights_id
-            && prev != &meta.weights_id
-        {
-            return Err(format!(
-                "{}: weights_id mismatch ({prev} vs {})",
-                path.display(),
-                meta.weights_id
-            ));
+        if prev.stamp != fresh.stamp {
+            let (was, now) = (prev.stamp, fresh.stamp);
+            return Err(fail(format!("run differs: {was:?} against {now:?}")));
         }
-        if let Some(prev) = &self.hessian_id
-            && prev != &meta.hessian_id
-        {
-            return Err(format!(
-                "{}: hessian_id mismatch ({prev} vs {})",
-                path.display(),
-                meta.hessian_id
-            ));
-        }
-        self.weights_id = Some(meta.weights_id.clone());
-        self.hessian_id = Some(meta.hessian_id.clone());
-        Ok(())
+        Ok(prev)
     }
 
     /// Atomically persists `calib-state.json`.
@@ -72,6 +68,15 @@ impl CalibState {
         fs::write(&tmp, text).map_err(|e| e.to_string())?;
         fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
+}
+
+/// `vals` rounded to BF16, as little-endian bytes.
+pub(crate) fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(vals.len() * 2);
+    for &v in vals {
+        raw.extend_from_slice(&Bf16::from(v).0.to_le_bytes());
+    }
+    raw
 }
 
 /// Path of layer `layer`'s BF16 hidden-state binary file.
@@ -238,47 +243,8 @@ impl HiddenWriter {
             .map_err(|_| "hidden writer exited".to_string())
     }
 
-    pub fn send_f32(&self, start: usize, count: usize, vals: &[f32]) -> Result<(), String> {
-        let mut raw = Vec::with_capacity(vals.len() * 2);
-        for &v in vals {
-            raw.extend_from_slice(&Bf16::from(v).0.to_le_bytes());
-        }
-        self.send_raw(start, count, raw)
-    }
-
     pub fn finish(mut self) -> Result<(), String> {
         join_worker(&mut self.tx, &mut self.handle, "hidden writer")
-    }
-}
-
-#[cfg(feature = "cuda")]
-/// Pinned host staging buffer for DMA hidden-state transfers.
-pub(crate) struct PinnedBuf {
-    ctx: &'static tessera_gpukit::cuda::Context,
-    host: u64,
-    len: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl PinnedBuf {
-    pub fn new(ctx: &'static tessera_gpukit::cuda::Context, len: usize) -> Result<Self, String> {
-        let (host, _) = ctx.pin(len.max(1)).map_err(|e| format!("pin: {e}"))?;
-        Ok(Self { ctx, host, len })
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.host as *mut u8, self.len) }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.host as *const u8, self.len) }
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for PinnedBuf {
-    fn drop(&mut self) {
-        self.ctx.unpin(self.host);
     }
 }
 
@@ -291,15 +257,12 @@ pub(crate) struct AsyncWriter {
 }
 
 impl AsyncWriter {
+    /// Starts two workers behind a queue of `depth` jobs.
     pub fn new(depth: usize) -> Self {
-        Self::with_workers(depth, 2)
-    }
-
-    pub fn with_workers(depth: usize, workers: usize) -> Self {
         let (tx, rx) = mpsc::sync_channel::<WriteTask>(depth.max(1));
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let mut handles = Vec::with_capacity(workers.max(1));
-        for _ in 0..workers.max(1) {
+        let mut handles = Vec::with_capacity(2);
+        for _ in 0..2 {
             let rx = std::sync::Arc::clone(&rx);
             handles.push(thread::spawn(move || {
                 loop {
@@ -331,6 +294,7 @@ impl AsyncWriter {
             .map_err(|_| "writer thread exited".to_string())
     }
 
+    /// Waits for every job and returns the first error.
     pub fn finish(mut self) -> Result<(), String> {
         self.tx.take();
         let mut first_err = None;

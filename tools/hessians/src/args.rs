@@ -1,10 +1,22 @@
-//! CLI argument parsing, layer-set ranges, and `.npy` token loader.
+//! Command line flags, layer sets and the `.npy` token reader.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use tessera_checkpoint::hessian::sha256_hex;
+use tessera_device::calib::TILE;
 
-/// Parsed calibration CLI options matching `calib_forward.py`.
+/// Layer sets as given, before the layer count is known.
+#[derive(Clone, Debug, Default)]
+pub struct LayerSpecs {
+    pub layers: Option<String>,
+    pub hess: Option<String>,
+    pub save: String,
+    pub route: String,
+}
+
+/// Calibration options.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub model: PathBuf,
@@ -14,6 +26,7 @@ pub struct Config {
     pub hess_layers: BTreeSet<usize>,
     pub save_inputs: BTreeSet<usize>,
     pub route_log: BTreeSet<usize>,
+    pub specs: LayerSpecs,
     pub hess_id: String,
     pub weights_id: Option<String>,
     pub batch: usize,
@@ -26,112 +39,118 @@ pub struct Config {
     pub resume: bool,
     pub state: Option<PathBuf>,
     pub keep_hidden: bool,
-    pub gpu: bool,
-    pub device: Option<usize>,
     pub tile: usize,
 }
 
-/// Top-level CLI mode: calibration, kernel bench, or parity check.
-#[derive(Clone, Debug)]
-pub enum Command {
-    Calib(Box<Config>),
-    BenchKernels {
-        device: Option<usize>,
-    },
-    VerifyParity {
-        got: PathBuf,
-        want: PathBuf,
-        layer: usize,
-        max_rel: f64,
-    },
+impl Config {
+    /// Fills the layer sets for a model of `count` layers.
+    pub fn resolve(&mut self, count: usize) -> Result<(), String> {
+        let last = count.checked_sub(1).ok_or("the model has no layers")?;
+        let set = |spec: &str| parse_set(spec, last);
+        self.layers = match &self.specs.layers {
+            Some(spec) => set(spec)?,
+            None => (0..count).collect(),
+        };
+        self.hess_layers = match &self.specs.hess {
+            Some(spec) => set(spec)?.into_iter().collect(),
+            None => self.layers.iter().copied().collect(),
+        };
+        self.save_inputs = set(&self.specs.save)?.into_iter().collect();
+        self.route_log = set(&self.specs.route)?.into_iter().collect();
+        Ok(())
+    }
 }
 
-/// Parses `'0-40,45,70-'` into a sorted deduplicated list.
+/// A tokens file: `rows` by `seq_len` ids, and its hash.
+pub struct Tokens {
+    pub rows: usize,
+    pub seq_len: usize,
+    pub ids: Vec<u32>,
+    pub hash: String,
+}
+
+/// Parses `'0-40,45,70-'` into sorted indices up to `last`.
 pub(crate) fn parse_set(spec: &str, last: usize) -> Result<Vec<usize>, String> {
     let mut out = BTreeSet::new();
     for part in spec.split(',').filter(|s| !s.is_empty()) {
-        if let Some((a, b)) = part.split_once('-') {
-            let start: usize = a.parse().map_err(|_| format!("bad range `{part}`"))?;
-            let end: usize = if b.is_empty() {
-                last
-            } else {
-                b.parse().map_err(|_| format!("bad range `{part}`"))?
-            };
-            if start > end {
-                return Err(format!("inverted range `{part}`"));
+        let bad = || format!("bad layer set `{part}`");
+        let (start, end) = match part.split_once('-') {
+            Some((a, "")) => (a.parse().map_err(|_| bad())?, last),
+            Some((a, b)) => (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?),
+            None => {
+                let v = part.parse().map_err(|_| bad())?;
+                (v, v)
             }
-            for x in start..=end {
-                out.insert(x);
-            }
-        } else {
-            let v: usize = part.parse().map_err(|_| format!("bad index `{part}`"))?;
-            out.insert(v);
+        };
+        if start > end {
+            return Err(format!("inverted range `{part}`"));
         }
+        if end > last {
+            return Err(format!("`{part}` is past the last layer {last}"));
+        }
+        out.extend(start..=end);
     }
     Ok(out.into_iter().collect())
 }
 
-/// Loads a 2D integer `.npy` matrix as `u32`.
-pub(crate) fn read_npy(path: &Path) -> Result<(usize, usize, Vec<u32>), String> {
+/// Reads a 2D C-order integer `.npy` matrix of token ids.
+pub(crate) fn read_npy(path: &Path) -> Result<Tokens, String> {
     let raw = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if raw.len() < 10 || &raw[..6] != b"\x93NUMPY" {
-        return Err(format!("{}: not a numpy .npy file", path.display()));
+    let fail = |what: &str| format!("{}: {what}", path.display());
+    if raw.len() < 12 || &raw[..6] != b"\x93NUMPY" {
+        return Err(fail("not a numpy .npy file"));
     }
-    let major = raw[6];
-    let (hdr_len, data_at) = if major == 1 {
-        let n = u16::from_le_bytes([raw[8], raw[9]]) as usize;
-        (n, 10 + n)
-    } else if major == 2 || major == 3 {
-        if raw.len() < 12 {
-            return Err("truncated npy header".into());
+    let (hdr_len, data_at) = match raw[6] {
+        1 => {
+            let n = u16::from_le_bytes([raw[8], raw[9]]) as usize;
+            (n, 10 + n)
         }
-        let n = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-        (n, 12 + n)
-    } else {
-        return Err(format!("unsupported npy version {major}"));
+        2 | 3 => {
+            let n = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+            (n, 12 + n)
+        }
+        v => return Err(fail(&format!("unsupported npy version {v}"))),
     };
     if data_at > raw.len() {
-        return Err("truncated npy payload".into());
+        return Err(fail("truncated npy header"));
     }
     let hdr = std::str::from_utf8(&raw[data_at - hdr_len..data_at])
-        .map_err(|e| format!("bad npy header utf8: {e}"))?;
-    let descr = extract_quoted(hdr, "'descr'").ok_or("missing npy descr")?;
-    let shape = extract_shape(hdr).ok_or("missing npy 2D shape")?;
-    let (n, s) = (shape.0, shape.1);
-    let data = &raw[data_at..];
-    let total = n * s;
-    let out = match descr.as_str() {
-        "<i4" | "|i4" => decode_ints(data, total, 4, |b| {
-            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32
-        })?,
-        "<u4" | "|u4" => decode_ints(data, total, 4, |b| {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        })?,
-        "<i8" | "|i8" => decode_ints(data, total, 8, |b| {
-            i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as u32
-        })?,
-        "<u8" | "|u8" => decode_ints(data, total, 8, |b| {
-            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as u32
-        })?,
-        other => return Err(format!("unsupported npy dtype `{other}`")),
+        .map_err(|_| fail("npy header is not UTF-8"))?;
+    if hdr.contains("'fortran_order': True") {
+        return Err(fail("Fortran-order arrays are not supported"));
+    }
+    let descr = extract_quoted(hdr, "'descr'").ok_or_else(|| fail("missing npy descr"))?;
+    let (rows, seq_len) = extract_shape(hdr).ok_or_else(|| fail("missing npy 2D shape"))?;
+    if rows == 0 || seq_len == 0 {
+        return Err(fail("no tokens"));
+    }
+    let (width, signed) = match descr.trim_start_matches(['<', '|']) {
+        "i4" => (4, true),
+        "u4" => (4, false),
+        "i8" => (8, true),
+        "u8" => (8, false),
+        other => return Err(fail(&format!("unsupported npy dtype `{other}`"))),
     };
-    Ok((n, s, out))
-}
-
-fn decode_ints(
-    data: &[u8],
-    count: usize,
-    width: usize,
-    parse: fn(&[u8]) -> u32,
-) -> Result<Vec<u32>, String> {
-    if data.len() < count * width {
-        return Err("truncated npy token array".into());
+    let data = &raw[data_at..];
+    let total = rows * seq_len;
+    if data.len() < total * width {
+        return Err(fail("truncated npy token array"));
     }
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        out.push(parse(&data[i * width..(i + 1) * width]));
+    let mut ids = Vec::with_capacity(total);
+    for c in data.chunks_exact(width).take(total) {
+        let mut b = [0u8; 8];
+        b[..width].copy_from_slice(c);
+        let negative = signed && c[width - 1] & 0x80 != 0;
+        let v = u64::from_le_bytes(b);
+        let id = u32::try_from(v).ok().filter(|_| !negative);
+        ids.push(id.ok_or_else(|| fail("token id outside u32"))?);
     }
-    Ok(out)
+    Ok(Tokens {
+        rows,
+        seq_len,
+        ids,
+        hash: sha256_hex(&[&raw]),
+    })
 }
 
 fn extract_quoted(hdr: &str, key: &str) -> Option<String> {
@@ -159,13 +178,13 @@ fn extract_shape(hdr: &str) -> Option<(usize, usize)> {
         .filter(|s| !s.is_empty())
         .map(|s| s.parse().ok())
         .collect::<Option<Vec<_>>>()?;
-    if dims.len() != 2 {
-        return None;
+    match dims[..] {
+        [a, b] => Some((a, b)),
+        _ => None,
     }
-    Some((dims[0], dims[1]))
 }
 
-/// Writes a 2D `<i4` `.npy` file for tests and tooling.
+/// Writes a 2D `<i4` `.npy` file.
 pub fn write_npy(path: &Path, rows: usize, cols: usize, tokens: &[u32]) -> Result<(), String> {
     assert_eq!(tokens.len(), rows * cols);
     let mut hdr =
@@ -186,154 +205,86 @@ pub fn write_npy(path: &Path, rows: usize, cols: usize, tokens: &[u32]) -> Resul
     fs::write(path, buf).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Parses CLI arguments into a `Config`.
-pub fn parse_args(args: &[String]) -> Result<Config, String> {
-    let mut model = None;
-    let mut tokens = None;
-    let mut work = None;
-    let mut out = None;
-    let mut hess_id = String::new();
-    let mut weights_id = None;
-    let mut heldout = 0usize;
-    let mut layers_spec = "0-77".to_string();
-    let mut hess_spec: Option<String> = None;
-    let mut save_spec = String::new();
-    let mut route_spec = String::new();
-    let mut batch = 2usize;
-    let mut experts_per_file = 32usize;
-    let mut dense_heldout = false;
-    let mut no_dense = false;
-    let mut no_experts = false;
-    let mut resume = false;
-    let mut state = None;
-    let mut keep_hidden = false;
-    let mut gpu = false;
-    let mut device = None;
+/// Calls `each` with every flag and a value reader.
+fn walk(
+    args: &[String],
+    mut each: impl FnMut(&str, &mut dyn FnMut() -> Result<String, String>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        let next = |idx: &mut usize| -> Result<String, String> {
-            *idx += 1;
-            args.get(*idx)
-                .cloned()
-                .ok_or_else(|| format!("missing value for {flag}"))
+        let mut value = || {
+            i += 1;
+            (args.get(i).cloned()).ok_or_else(|| format!("missing value for {flag}"))
         };
-        match flag {
-            "--model" => model = Some(PathBuf::from(next(&mut i)?)),
-            "--tokens" => tokens = Some(PathBuf::from(next(&mut i)?)),
-            "--work" => work = Some(PathBuf::from(next(&mut i)?)),
-            "--out" => out = Some(PathBuf::from(next(&mut i)?)),
-            "--hess-id" | "--hessian-id" => hess_id = next(&mut i)?,
-            "--weights-id" => weights_id = Some(next(&mut i)?),
-            "--heldout" => heldout = next(&mut i)?.parse().map_err(|_| "bad --heldout")?,
-            "--layers" => layers_spec = next(&mut i)?,
-            "--hess-layers" => hess_spec = Some(next(&mut i)?),
-            "--save-inputs" => save_spec = next(&mut i)?,
-            "--route-log" => route_spec = next(&mut i)?,
-            "--batch" => batch = next(&mut i)?.parse().map_err(|_| "bad --batch")?,
-            "--experts-per-file" => {
-                experts_per_file = next(&mut i)?
-                    .parse()
-                    .map_err(|_| "bad --experts-per-file")?;
-            }
-            "--state" => state = Some(PathBuf::from(next(&mut i)?)),
-            "--dense-heldout" => dense_heldout = true,
-            "--no-dense" => no_dense = true,
-            "--no-experts" => no_experts = true,
-            "--resume" => resume = true,
-            "--keep-hidden" => keep_hidden = true,
-            "--gpu" => gpu = true,
-            "--device" => device = Some(next(&mut i)?.parse().map_err(|_| "bad --device")?),
-            other => return Err(format!("unknown flag `{other}`")),
-        }
+        each(flag, &mut value)?;
         i += 1;
     }
-    let layers = parse_set(&layers_spec, 78)?;
-    let last = layers.last().copied().unwrap_or(0);
-    let hess_layers: BTreeSet<usize> = match hess_spec {
-        Some(s) => parse_set(&s, last)?.into_iter().collect(),
-        None => layers.iter().copied().collect(),
-    };
-    let save_inputs = parse_set(&save_spec, last)?.into_iter().collect();
-    let route_log = parse_set(&route_spec, last)?.into_iter().collect();
-    Ok(Config {
-        model: model.ok_or("missing --model")?,
-        tokens: tokens.ok_or("missing --tokens")?,
-        heldout,
-        layers,
-        hess_layers,
-        save_inputs,
-        route_log,
-        hess_id,
-        weights_id,
-        batch: batch.max(1),
-        experts_per_file: experts_per_file.max(1),
-        dense_heldout,
-        no_dense,
-        no_experts,
-        work: work.ok_or("missing --work")?,
-        out: out.ok_or("missing --out")?,
-        resume,
-        state,
-        keep_hidden,
-        gpu,
-        device,
-        tile: 128,
-    })
+    Ok(())
 }
 
-/// Parses CLI flags into calibration, microbench, or parity mode.
-pub fn parse_command(args: &[String]) -> Result<Command, String> {
-    if args.iter().any(|a| a == "--bench-kernels") {
-        let mut device = None;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--bench-kernels" => {}
-                "--device" => {
-                    i += 1;
-                    let v = args.get(i).ok_or("missing value for --device")?;
-                    device = Some(v.parse().map_err(|_| "bad --device")?);
-                }
-                other => return Err(format!("unknown flag `{other}`")),
-            }
-            i += 1;
+fn num<T: FromStr>(value: String, flag: &str) -> Result<T, String> {
+    value.parse().map_err(|_| format!("bad {flag} `{value}`"))
+}
+
+fn unknown(flag: &str) -> Result<(), String> {
+    Err(format!("unknown flag `{flag}`"))
+}
+
+/// Parses calibration flags into a `Config` with unresolved layer sets.
+pub fn parse_args(args: &[String]) -> Result<Config, String> {
+    let (mut model, mut tokens, mut work, mut out) = (None, None, None, None);
+    let mut cfg = Config {
+        model: PathBuf::new(),
+        tokens: PathBuf::new(),
+        heldout: 0,
+        layers: Vec::new(),
+        hess_layers: BTreeSet::new(),
+        save_inputs: BTreeSet::new(),
+        route_log: BTreeSet::new(),
+        specs: LayerSpecs::default(),
+        hess_id: String::new(),
+        weights_id: None,
+        batch: 2,
+        experts_per_file: 32,
+        dense_heldout: false,
+        no_dense: false,
+        no_experts: false,
+        work: PathBuf::new(),
+        out: PathBuf::new(),
+        resume: false,
+        state: None,
+        keep_hidden: false,
+        tile: TILE,
+    };
+    walk(args, |flag, value| {
+        match flag {
+            "--model" => model = Some(PathBuf::from(value()?)),
+            "--tokens" => tokens = Some(PathBuf::from(value()?)),
+            "--work" => work = Some(PathBuf::from(value()?)),
+            "--out" => out = Some(PathBuf::from(value()?)),
+            "--hess-id" | "--hessian-id" => cfg.hess_id = value()?,
+            "--weights-id" => cfg.weights_id = Some(value()?),
+            "--heldout" => cfg.heldout = num(value()?, flag)?,
+            "--layers" => cfg.specs.layers = Some(value()?),
+            "--hess-layers" => cfg.specs.hess = Some(value()?),
+            "--save-inputs" => cfg.specs.save = value()?,
+            "--route-log" => cfg.specs.route = value()?,
+            "--batch" => cfg.batch = num::<usize>(value()?, flag)?.max(1),
+            "--experts-per-file" => cfg.experts_per_file = num::<usize>(value()?, flag)?.max(1),
+            "--state" => cfg.state = Some(PathBuf::from(value()?)),
+            "--dense-heldout" => cfg.dense_heldout = true,
+            "--no-dense" => cfg.no_dense = true,
+            "--no-experts" => cfg.no_experts = true,
+            "--resume" => cfg.resume = true,
+            "--keep-hidden" => cfg.keep_hidden = true,
+            other => return unknown(other),
         }
-        return Ok(Command::BenchKernels { device });
-    }
-    if args.iter().any(|a| a == "--verify-parity") {
-        let mut got = None;
-        let mut want = None;
-        let mut layer = None;
-        let mut max_rel = 5e-3f64;
-        let mut i = 0;
-        while i < args.len() {
-            let f = args[i].as_str();
-            let next = |idx: &mut usize| -> Result<String, String> {
-                *idx += 1;
-                args.get(*idx)
-                    .cloned()
-                    .ok_or_else(|| format!("missing value for {f}"))
-            };
-            match f {
-                "--verify-parity" => {
-                    got = Some(PathBuf::from(next(&mut i)?));
-                    want = Some(PathBuf::from(next(&mut i)?));
-                }
-                "--layer" => layer = Some(next(&mut i)?.parse().map_err(|_| "bad --layer")?),
-                "--max-rel" | "--max-rel-frob" => {
-                    max_rel = next(&mut i)?.parse().map_err(|_| "bad --max-rel")?;
-                }
-                other => return Err(format!("unknown flag `{other}`")),
-            }
-            i += 1;
-        }
-        return Ok(Command::VerifyParity {
-            got: got.ok_or("missing --verify-parity <got> <want>")?,
-            want: want.ok_or("missing --verify-parity <got> <want>")?,
-            layer: layer.ok_or("missing --layer")?,
-            max_rel,
-        });
-    }
-    Ok(Command::Calib(Box::new(parse_args(args)?)))
+        Ok(())
+    })?;
+    cfg.model = model.ok_or("missing --model")?;
+    cfg.tokens = tokens.ok_or("missing --tokens")?;
+    cfg.work = work.ok_or("missing --work")?;
+    cfg.out = out.ok_or("missing --out")?;
+    Ok(cfg)
 }

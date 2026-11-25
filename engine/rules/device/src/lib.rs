@@ -2,6 +2,9 @@
 
 pub mod abi;
 mod attend;
+pub mod calib;
+#[cfg(test)]
+mod calib_test;
 mod flatten;
 #[cfg(test)]
 mod flatten_test;

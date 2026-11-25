@@ -10,25 +10,16 @@ description = "Layer-streaming BF16 Hessian calibration generator for exlr8"
 name = "tessera-hessians"
 path = "src/main.rs"
 
-[features]
-default = []
-cuda = ["tessera-run/cuda", "tessera-device/cuda", "tessera-gpukit/cuda"]
-
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tessera-bundle = { workspace = true }
 tessera-checkpoint = { workspace = true }
 tessera-device = { workspace = true }
-tessera-engine-settings = { workspace = true }
-tessera-gpukit = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-interp = { workspace = true }
 tessera-lower = { workspace = true }
-tessera-mem = { workspace = true }
 tessera-models = { workspace = true }
-tessera-rules = { workspace = true }
-tessera-run = { workspace = true }
 
 [dev-dependencies]
 tessera-testkit = { workspace = true }
