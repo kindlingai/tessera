@@ -2,7 +2,7 @@ use super::generate::lowering;
 use super::{Pick, pick};
 use crate::start::{Options, flags};
 use tessera_engine::form::{BF16_FORM, F32_FORM};
-use tessera_engine::{Pins, Recipe};
+use tessera_engine::{Compute, DType, Dtype, Pins, Recipe, Site};
 
 /// Owned flags parse, and the most given flags pick.
 #[test]
@@ -52,7 +52,26 @@ fn kv_cache_tokens_pages() {
     let mut opts = Options::default();
     assert!(opts.flag("--kv-cache-tokens", "0".into()).is_none());
     assert!(opts.flag("--kv-cache-tokens", "1024".into()).is_some());
-    let recipe = super::generate::lowering(&opts, None);
+    let recipe = lowering(&opts, None);
     assert_eq!(recipe.kept.name(), "paged");
     assert_eq!(recipe.kept_rows, Some(1024));
+}
+
+#[test]
+fn dtypes_fold() {
+    let mut lower = Recipe::default();
+    lower.dtype.push(Dtype::parse("@kept=bf16").unwrap());
+    let mut opts = Options::default();
+    opts.lower.replace(lower);
+    for flag in ["@kept=fp8", "@norm=f32", ":operand=bf16", "*.down@sum=f16"] {
+        assert!(opts.flag("--dtype", flag.into()).is_some());
+    }
+    let recipe = lowering(&opts, None);
+    let norm = recipe.pins.site_form(Site::Norm).map(|f| f.name());
+    assert_eq!((recipe.pins.kept.name(), norm), ("fp8", Some("f32")));
+    assert_eq!(recipe.sums.named, [("*.down".into(), DType::F16)]);
+    assert_eq!(recipe.compute, Compute::Bf16);
+    for bad in ["@sum=fp8", "@nowhere=bf16", "a.*@norm=bf16", "@kept"] {
+        assert!(opts.flag("--dtype", bad.into()).is_none(), "{bad}");
+    }
 }

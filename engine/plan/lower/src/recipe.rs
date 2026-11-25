@@ -1,6 +1,6 @@
 //! The choices lowering takes, as data a search can edit.
 
-use crate::form::{Pins, matches};
+use crate::form::{Load, Pins, Site, matches, named};
 use crate::rule::Rule;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
@@ -30,6 +30,9 @@ pub struct Recipe {
     /// Operand precision for matrix-unit kernels.
     #[serde(default)]
     pub compute: Compute,
+    /// Dtype overrides by spot. `settle` folds them in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dtype: Vec<Dtype>,
     /// A rule to pick wherever it applies, whatever it costs.
     #[serde(default)]
     pub favor: Option<String>,
@@ -142,6 +145,7 @@ impl Default for Recipe {
             pins: Pins::default(),
             sums: Wires::default(),
             compute: Compute::default(),
+            dtype: Vec::new(),
             favor: None,
             require_favored: false,
             barred: Vec::new(),
@@ -163,8 +167,155 @@ impl Recipe {
         }
     }
 
+    /// Folds the dtype rules into the pins, sums and compute.
+    pub fn settle(&mut self) {
+        for rule in std::mem::take(&mut self.dtype) {
+            rule.apply(self);
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text).map_err(std::io::Error::other)
+        let mut recipe: Self = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        recipe.settle();
+        Ok(recipe)
+    }
+}
+
+const SITES: [(&str, Site); 7] = [
+    ("norm", Site::Norm),
+    ("softmax", Site::Softmax),
+    ("logits", Site::Logits),
+    ("router", Site::Router),
+    ("residual", Site::Residual),
+    ("attention", Site::Attention),
+    ("matmul", Site::Matmul),
+];
+
+/// The setting one rule changes.
+#[derive(Clone, Debug, PartialEq)]
+enum Set {
+    Activations(&'static dyn Load),
+    Site(Site, &'static dyn Load),
+    Kept(&'static dyn Load),
+    Outputs(&'static dyn Load),
+    Wire(DType),
+    Operand(Compute),
+}
+
+/// One `[path][@spot][:property]=dtype` override.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "(String, String)", into = "(String, String)")]
+pub struct Dtype {
+    spot: String,
+    value: String,
+    /// A pattern over weight paths. Empty fits every spot.
+    path: String,
+    set: Set,
+}
+
+fn store(value: &str) -> Result<&'static dyn Load, String> {
+    match named(value) {
+        Some(f) if f.stores() && f.dtype().is_float() => Ok(f),
+        Some(_) => Err(format!("form {value} is not a writable float")),
+        None => Err(format!("no form called {value}")),
+    }
+}
+
+fn wire(value: &str) -> Result<DType, String> {
+    match value {
+        "f32" => Ok(DType::F32),
+        "bf16" => Ok(DType::Bf16),
+        "f16" => Ok(DType::F16),
+        _ => Err(format!("no wire dtype called {value}")),
+    }
+}
+
+fn operand(value: &str) -> Result<Compute, String> {
+    match value {
+        "f32" => Ok(Compute::Exact),
+        "bf16" => Ok(Compute::Bf16),
+        _ => Err(format!("no operand dtype called {value}")),
+    }
+}
+
+impl Dtype {
+    /// Parses a spot and its dtype.
+    pub fn new(spot: &str, value: &str) -> Result<Self, String> {
+        let (rest, property) = match spot.rsplit_once(':') {
+            Some((rest, property)) => (rest, Some(property)),
+            None => (spot, None),
+        };
+        let (path, kind) = match rest.rsplit_once('@') {
+            Some((path, kind)) => (path, Some(kind)),
+            None => (rest, None),
+        };
+        let site = |kind: &str| SITES.iter().find(|(name, _)| *name == kind).map(|s| s.1);
+        let set = match (kind, property) {
+            (Some("sum") | None, Some("wire")) | (Some("sum"), None) => Set::Wire(wire(value)?),
+            (Some("matmul") | None, Some("operand")) => Set::Operand(operand(value)?),
+            (Some("activation"), Some("store") | None) | (None, Some("store")) => {
+                Set::Activations(store(value)?)
+            }
+            (Some("kept"), Some("store") | None) => Set::Kept(store(value)?),
+            (Some("output"), Some("store") | None) => Set::Outputs(store(value)?),
+            (Some(kind), Some("store") | None) => match site(kind) {
+                Some(site) => Set::Site(site, store(value)?),
+                None => return Err(format!("no spot called {kind} in `{spot}`")),
+            },
+            _ => return Err(format!("`{spot}` names no dtype a rule can set")),
+        };
+        if !path.is_empty() && !matches!(set, Set::Wire(_)) {
+            return Err(format!("`{spot}`: only sum wires take a path"));
+        }
+        Ok(Self {
+            spot: spot.into(),
+            value: value.into(),
+            path: path.into(),
+            set,
+        })
+    }
+
+    /// Parses `spot=dtype`, the flag form.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.rsplit_once('=') {
+            Some((spot, value)) => Self::new(spot, value),
+            None => Err(format!("`{text}` is not spot=dtype")),
+        }
+    }
+
+    /// Sets this rule's dtype in `recipe`.
+    fn apply(&self, recipe: &mut Recipe) {
+        let pins = std::mem::take(&mut recipe.pins);
+        recipe.pins = match self.set {
+            Set::Activations(form) => pins.activations(form),
+            Set::Site(site, form) => pins.site(site, form),
+            Set::Kept(form) => pins.kept(form),
+            Set::Outputs(form) => pins.outputs(form),
+            Set::Wire(_) | Set::Operand(_) => pins,
+        };
+        match self.set {
+            Set::Wire(wire) if self.path.is_empty() => {
+                recipe.sums.all = Some(wire);
+                recipe.sums.named.push(("*".into(), wire));
+            }
+            Set::Wire(wire) => recipe.sums.named.push((self.path.clone(), wire)),
+            Set::Operand(compute) => recipe.compute = compute,
+            _ => {}
+        }
+    }
+}
+
+impl TryFrom<(String, String)> for Dtype {
+    type Error = String;
+
+    fn try_from((spot, value): (String, String)) -> Result<Self, String> {
+        Self::new(&spot, &value)
+    }
+}
+
+impl From<Dtype> for (String, String) {
+    fn from(d: Dtype) -> Self {
+        (d.spot, d.value)
     }
 }

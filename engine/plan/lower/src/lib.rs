@@ -30,7 +30,7 @@ pub use extent::Extent;
 pub use form::{Filed, Pins, Site, Weight};
 pub use kernel::{Collective, Kernel, KernelRef, Needs, Resident, UNPROVEN};
 pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
-pub use recipe::{Compute, Launching, Recipe, Wires};
+pub use recipe::{Compute, Dtype, Launching, Recipe, Wires};
 pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};
 pub use select::{Finding, Home, Op, Rejection, Report, Selected, Val, Value, select};
