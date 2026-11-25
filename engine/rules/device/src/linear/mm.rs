@@ -15,6 +15,7 @@ enum MmKind {
     Mxfp8Wide,
     Mxfp8WideSplit,
     Mxfp8Tall,
+    Mxfp8TallSplit,
 }
 
 impl MmKind {
@@ -23,7 +24,9 @@ impl MmKind {
             MmKind::Bf16 | MmKind::Bf16Split => "fast_mm_bf16",
             MmKind::Bf16SplitK => "fast_mm_bf16_sk",
             MmKind::Mxfp8 | MmKind::Mxfp8Wide | MmKind::Mxfp8Tall => "fast_mm_mxfp8",
-            MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => "fast_mm_mxfp8_sk",
+            MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit | MmKind::Mxfp8TallSplit => {
+                "fast_mm_mxfp8_sk"
+            }
         }
     }
 
@@ -36,7 +39,15 @@ impl MmKind {
             MmKind::Mxfp8Split => "tessera_mm_mxfp8_r8_sk",
             MmKind::Mxfp8Wide => "tessera_mm_mxfp8_r16",
             MmKind::Mxfp8WideSplit => "tessera_mm_mxfp8_r16_sk",
-            MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r32",
+            MmKind::Mxfp8Tall => "tessera_mm_mxfp8_r64",
+            MmKind::Mxfp8TallSplit => "tessera_mm_mxfp8_r64_sk",
+        }
+    }
+
+    fn threads(self) -> usize {
+        match self {
+            MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit => 256,
+            _ => 128,
         }
     }
 
@@ -44,11 +55,10 @@ impl MmKind {
         match self {
             MmKind::Bf16 => (2 * 16 * 36 + 4 * 8 * 36) * 4,
             MmKind::Bf16Split | MmKind::Bf16SplitK => (4 * 16 * 36 + 4 * 8 * 36) * 4,
-            MmKind::Mxfp8
-            | MmKind::Mxfp8Split
-            | MmKind::Mxfp8Wide
-            | MmKind::Mxfp8WideSplit
-            | MmKind::Mxfp8Tall => 4 * 16 * 36 * 4,
+            MmKind::Mxfp8 | MmKind::Mxfp8Split | MmKind::Mxfp8Wide | MmKind::Mxfp8WideSplit => {
+                4 * 16 * 36 * 4
+            }
+            MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit => (64 * 136 + 64 * 36) * 4,
         }
     }
 
@@ -59,7 +69,8 @@ impl MmKind {
             MmKind::Bf16SplitK => ((n / 16) * ks, m.div_ceil(16)),
             MmKind::Mxfp8 => (n / 16, 1),
             MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit => ((n / 16) * ks, 1),
-            MmKind::Mxfp8Tall => (n / 16, m.div_ceil(32)),
+            MmKind::Mxfp8Tall => (n.div_ceil(64), m.div_ceil(64)),
+            MmKind::Mxfp8TallSplit => (n.div_ceil(64) * ks, m.div_ceil(64)),
         }
     }
 
@@ -71,14 +82,18 @@ impl MmKind {
             | MmKind::Mxfp8Split
             | MmKind::Mxfp8Wide
             | MmKind::Mxfp8WideSplit
-            | MmKind::Mxfp8Tall => 512.0,
+            | MmKind::Mxfp8Tall
+            | MmKind::Mxfp8TallSplit => 512.0,
         }
     }
 
     fn is_split(self) -> bool {
         matches!(
             self,
-            MmKind::Bf16SplitK | MmKind::Mxfp8Split | MmKind::Mxfp8WideSplit
+            MmKind::Bf16SplitK
+                | MmKind::Mxfp8Split
+                | MmKind::Mxfp8WideSplit
+                | MmKind::Mxfp8TallSplit
         )
     }
 }
@@ -120,6 +135,17 @@ fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
     pick_divisor(chunks, want, cap)
 }
 
+fn mxfp8_tall_ks(m: usize, n: usize, k: usize) -> usize {
+    let chunks = k / 512;
+    let base = n.div_ceil(64) * m.div_ceil(64);
+    if chunks <= 1 || base >= 160 {
+        return 1;
+    }
+    let cap = if base >= 64 { 4 } else { 12 }.min(chunks);
+    let want = 192usize.div_ceil(base).clamp(1, cap);
+    pick_divisor(chunks, want, cap)
+}
+
 /// Streaming BF16 and MXFP8 Tensor-Core small-batch matmul.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
@@ -153,7 +179,7 @@ fn mm_needs(k: &FastMm) -> Needs {
     Needs {
         lanes: 32,
         group_bytes: k.kind.smem(),
-        group_threads: 128,
+        group_threads: k.kind.threads(),
         compiler: true,
         lacks: CUDA_LACKS,
         bf16_tile: true,
@@ -164,6 +190,7 @@ fn mm_needs(k: &FastMm) -> Needs {
 fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
     let (across, down) = k.kind.grid(k.m, k.n, k.ks);
     let groups = across * down;
+    let threads = k.kind.threads();
     let mut reads = vec![k.form.bytes(k.n * k.k) as f64, (4 * k.m * k.k) as f64];
     if matches!(k.mode, 1 | 3 | 4) {
         reads.push((4 * k.m * k.n) as f64);
@@ -171,8 +198,8 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
         reads.push((4 * k.n) as f64);
     }
     let mut load = Load {
-        threads: groups * 128,
-        group: 128,
+        threads: groups * threads,
+        group: threads,
         trips: k.k as f64 / (k.kind.step() * k.ks as f64),
         reads,
         written: (4 * k.ks * k.m * k.n) as f64,
@@ -188,7 +215,7 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across,
         down,
-        threads: 128,
+        threads: k.kind.threads(),
     };
     let other = if matches!(k.mode, 1..=4) {
         step.read(2)
@@ -419,7 +446,12 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
                     (MmKind::Mxfp8Wide, 1)
                 }
             } else {
-                (MmKind::Mxfp8Tall, 1)
+                let ks = mxfp8_tall_ks(m, n, k);
+                if ks > 1 {
+                    (MmKind::Mxfp8TallSplit, ks)
+                } else {
+                    (MmKind::Mxfp8Tall, 1)
+                }
             }
         }
         "mxfp8" if !n.is_multiple_of(16) => {

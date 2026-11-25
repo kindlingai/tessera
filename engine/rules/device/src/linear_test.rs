@@ -80,7 +80,8 @@ fn linear_mm_entries() {
         "tessera_mm_mxfp8_r16_sk(",
         "tessera_mm_reduce(",
         "tessera_mm_mxfp8_r16(",
-        "tessera_mm_mxfp8_r32(",
+        "tessera_mm_mxfp8_r64(",
+        "tessera_mm_mxfp8_r64_sk(",
         "DTR_DEF(dtr_k4_t4,",
         "dtr_gen4(",
     ] {
@@ -119,11 +120,15 @@ fn fast_mm_selection() {
     );
     assert_eq!(
         mm_entry(&linear(&rows, 12288, 6144), 24, "mxfp8"),
-        Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r32", 2))
+        Some(("fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r64_sk", 2))
     );
     assert_eq!(
         mm_entry(&linear(&rows, 6144, 576), 72, "mxfp8"),
-        Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r32", 2))
+        Some(("fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r64_sk", 2))
+    );
+    assert_eq!(
+        mm_entry(&linear(&rows, 2048, 4096), 256, "mxfp8"),
+        Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r64", 2))
     );
     // Out-of-range M and unaligned K are rejected.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
