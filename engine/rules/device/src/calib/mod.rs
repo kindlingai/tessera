@@ -333,16 +333,12 @@ fn scatter_launches(k: &SortScatter, step: &Step) -> Vec<Launch> {
     vec![Launch { args, shape }]
 }
 
-fn gemm_entry(x_f32: bool, out_f32: bool, fused: bool) -> &'static str {
-    match (fused, x_f32, out_f32) {
-        (false, false, false) => "pbf16_gemm_bf16_bf16",
-        (false, true, true) => "pbf16_gemm_f32_f32",
-        (false, false, true) => "pbf16_gemm_bf16_f32",
-        (false, true, false) => "pbf16_gemm_f32_bf16",
-        (true, false, false) => "pbf16_gu_bf16_bf16",
-        (true, true, true) => "pbf16_gu_f32_f32",
-        (true, false, true) => "pbf16_gu_bf16_f32",
-        (true, true, false) => "pbf16_gu_f32_bf16",
+fn gemm_entry(out_f32: bool, fused: bool) -> &'static str {
+    match (fused, out_f32) {
+        (false, false) => "pbf16_gemm_bf16_bf16",
+        (false, true) => "pbf16_gemm_bf16_f32",
+        (true, false) => "pbf16_gu_bf16_bf16",
+        (true, true) => "pbf16_gu_bf16_f32",
     }
 }
 
@@ -356,7 +352,7 @@ fn gemm_entry(x_f32: bool, out_f32: bool, fused: bool) -> &'static str {
     emits = gemm_emits,
     needs = bf16_needs(SMEM, THREADS),
     order = Order::PerConfig,
-    source = fixed_cuda(gemm_entry(self.x_form.name() == "f32", self.out_form.name() == "f32", self.fused)),
+    source = fixed_cuda(gemm_entry(self.out_form.name() == "f32", self.fused)),
     launches = gemm_launches,
     load = gemm_load,
     unproven,
@@ -371,15 +367,12 @@ struct PickedBf16 {
     repeat: usize,
     max_tiles: usize,
     fused: bool,
-    x_form: &'static dyn Stored,
     out_form: &'static dyn Stored,
 }
 
 fn gemm_accepts(k: &PickedBf16, input: usize, form: &dyn Stored) -> bool {
     let sort_idx = if k.fused { 3 } else { 2 };
-    if input == 0 {
-        form.name() == k.x_form.name()
-    } else if input < sort_idx {
+    if input < sort_idx {
         form.name() == "bf16"
     } else {
         form.name() == "u32"
@@ -398,7 +391,7 @@ fn gemm_load(k: &PickedBf16, _: usize) -> Option<Load> {
     let w_factor = if k.fused { 2 } else { 1 };
     let reads = vec![
         (w_factor * 2 * active * k.n * k.k) as f64,
-        k.x_form.bytes((k.rows / k.repeat) * k.k) as f64,
+        (2 * (k.rows / k.repeat) * k.k) as f64,
     ];
     let mut load = Load {
         threads: groups * THREADS,
@@ -463,7 +456,6 @@ struct PickSite {
     k: usize,
     count: usize,
     repeat: usize,
-    x_form: &'static dyn Stored,
 }
 
 fn match_bf16_pick(tree: &Tree, mat: T, n_align: usize) -> Option<PickSite> {
@@ -484,8 +476,8 @@ fn match_bf16_pick(tree: &Tree, mat: T, n_align: usize) -> Option<PickSite> {
     if tree.share(w).is_some() {
         return None;
     }
-    let x_form = tree.node(x).form;
-    if !is_plain_float(x_form) {
+    // The multiply rounds its rows to BF16.
+    if tree.node(x).form.name() != "bf16" {
         return None;
     }
     let &[count, n, k] = tree.node(w).shape.as_slice() else {
@@ -508,7 +500,6 @@ fn match_bf16_pick(tree: &Tree, mat: T, n_align: usize) -> Option<PickSite> {
         k,
         count,
         repeat: rows / x_rows,
-        x_form,
     })
 }
 
@@ -536,7 +527,6 @@ fn build_drafts(site: &PickSite, out_form: &'static dyn Stored, w_up: Option<T>)
         repeat: site.repeat,
         max_tiles,
         fused: w_up.is_some(),
-        x_form: site.x_form,
         out_form,
     };
     let prefix_len = SORT_BLOCKS * site.count + site.count + 1 + 1 + 2 * max_tiles;

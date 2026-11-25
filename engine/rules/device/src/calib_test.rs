@@ -26,9 +26,9 @@ fn calib_cuda_entries() {
         "calib_syrk_bf16(",
         "calib_syrk_f32(",
         "pbf16_gemm_bf16_bf16",
-        "pbf16_gemm_f32_f32",
+        "pbf16_gemm_bf16_f32",
         "pbf16_gu_bf16_bf16",
-        "pbf16_gu_f32_f32",
+        "pbf16_gu_bf16_f32",
     ] {
         assert!(src.contains(entry), "missing {entry}");
     }
@@ -198,10 +198,10 @@ fn moe_graph(fused: bool) -> Graph {
 #[test]
 fn picked_bf16_selection() {
     for (fused, act_form, want_entry) in [
-        (false, BF16_FORM, "pbf16_gemm_bf16_bf16"),
-        (false, F32_FORM, "pbf16_gemm_f32_f32"),
-        (true, BF16_FORM, "pbf16_gu_bf16_bf16"),
-        (true, F32_FORM, "pbf16_gu_f32_f32"),
+        (false, BF16_FORM, Some("pbf16_gemm_bf16_bf16")),
+        (true, BF16_FORM, Some("pbf16_gu_bf16_bf16")),
+        (false, F32_FORM, None),
+        (true, F32_FORM, None),
     ] {
         let g = moe_graph(fused);
         let pins = Pins::all(BF16_FORM).activations(act_form).outputs(act_form);
@@ -219,7 +219,12 @@ fn picked_bf16_selection() {
             0,
         )
         .expect("tree builds");
-        let drafts = propose_picked_bf16(&tree, tree.outputs[0].0).expect("matches picked_bf16");
+        let drafts = propose_picked_bf16(&tree, tree.outputs[0].0);
+        let Some(want_entry) = want_entry else {
+            assert!(drafts.is_none(), "F32 rows must not match");
+            continue;
+        };
+        let drafts = drafts.expect("matches picked_bf16");
         assert_eq!(drafts.len(), 4);
         let Source::Fixed { entry, .. } = drafts[3].kernel.source() else {
             panic!("fixed cuda source");

@@ -420,16 +420,15 @@ struct alignas(16) gemm_smem {
     u32 rows[CALIB_TILE];
 };
 
-template <bool X_F32>
 static __device__ __forceinline__ void pbf16_load_x(
-    const void* x_ptr, const u32 src_rows[CALIB_TILE], u32 k0, u32 k,
+    const u16* x_ptr, const u32 src_rows[CALIB_TILE], u32 k0, u32 k,
     u16 dst[CALIB_TILE][CALIB_GEMM_STRIDE]) {
     u32 r_base = threadIdx.x >> 2;
     u32 k_sub = (threadIdx.x & 3u) << 3;
 #pragma unroll
     for (u32 p = 0u; p < 2u; p++) {
         u32 lr = r_base + (p << 6);
-        calib_load8_bf16<X_F32>(x_ptr, src_rows[lr], k, k0 + k_sub, &dst[lr][k_sub]);
+        calib_load8_bf16<false>(x_ptr, src_rows[lr], k, k0 + k_sub, &dst[lr][k_sub]);
     }
 }
 
@@ -453,9 +452,9 @@ static __device__ __forceinline__ void pbf16_store2(
     }
 }
 
-template <bool X_F32, bool OUT_F32, bool FUSED>
+template <bool OUT_F32, bool FUSED>
 static __device__ __forceinline__ void pbf16_grouped_body(
-    const void* x_ptr, const u16* w0, const u16* w1, const u32* offsets, const u32* perm,
+    const u16* x_ptr, const u16* w0, const u16* w1, const u32* offsets, const u32* perm,
     const u32* tile_meta, void* out_ptr, u32 n, u32 k, u32 stride, u32 w_off, u32 repeat,
     gemm_smem& sm) {
     u32 total_m = tile_meta[0];
@@ -512,7 +511,7 @@ static __device__ __forceinline__ void pbf16_grouped_body(
     u32 b_ld_c = ((lane >> 3) & 1u) << 3;
 
     u32 stage = 0u;
-    pbf16_load_x<X_F32>(x_ptr, sm.rows, 0u, k, sm.a[0]);
+    pbf16_load_x(x_ptr, sm.rows, 0u, k, sm.a[0]);
     pbf16_load_w(wb0, wb1, 0u, k, FUSED, sm.b[0]);
     calib_cp_commit();
     calib_cp_wait<0>();
@@ -522,7 +521,7 @@ static __device__ __forceinline__ void pbf16_grouped_body(
         u32 next_stage = stage ^ 1u;
         bool has_next = (k0 + CALIB_BK < k);
         if (has_next) {
-            pbf16_load_x<X_F32>(x_ptr, sm.rows, k0 + CALIB_BK, k, sm.a[next_stage]);
+            pbf16_load_x(x_ptr, sm.rows, k0 + CALIB_BK, k, sm.a[next_stage]);
             pbf16_load_w(wb0, wb1, k0 + CALIB_BK, k, FUSED, sm.b[next_stage]);
             calib_cp_commit();
         }
@@ -596,32 +595,28 @@ static __device__ __forceinline__ void pbf16_grouped_body(
     }
 }
 
-#define PBF16_GEMM_DEF(NAME, XF, OF)                                                               \
+#define PBF16_GEMM_DEF(NAME, OF)                                                                   \
     extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                     \
-        const void* x, const u16* w, const u32* offsets, const u32* perm, const u32* tile_meta,    \
+        const u16* x, const u16* w, const u32* offsets, const u32* perm, const u32* tile_meta,     \
         void* out, u32 n, u32 k, u32 stride, u32 w_off, u32 repeat) {                              \
         __shared__ gemm_smem sm;                                                                   \
-        pbf16_grouped_body<XF, OF, false>(x, w, nullptr, offsets, perm, tile_meta, out, n, k,      \
-                                          stride, w_off, repeat, sm);                              \
+        pbf16_grouped_body<OF, false>(x, w, nullptr, offsets, perm, tile_meta, out, n, k, stride,  \
+                                      w_off, repeat, sm);                                          \
     }
 
-PBF16_GEMM_DEF(pbf16_gemm_bf16_bf16, false, false)
-PBF16_GEMM_DEF(pbf16_gemm_f32_f32, true, true)
-PBF16_GEMM_DEF(pbf16_gemm_bf16_f32, false, true)
-PBF16_GEMM_DEF(pbf16_gemm_f32_bf16, true, false)
+PBF16_GEMM_DEF(pbf16_gemm_bf16_bf16, false)
+PBF16_GEMM_DEF(pbf16_gemm_bf16_f32, true)
 
-#define PBF16_GU_DEF(NAME, XF, OF)                                                                 \
+#define PBF16_GU_DEF(NAME, OF)                                                                     \
     extern "C" __global__ __launch_bounds__(256, 2) void NAME(                                     \
-        const void* x, const u16* wg, const u16* wu, const u32* offsets, const u32* perm,          \
+        const u16* x, const u16* wg, const u16* wu, const u32* offsets, const u32* perm,           \
         const u32* tile_meta, void* out, u32 n, u32 k, u32 stride, u32 repeat) {                   \
         __shared__ gemm_smem sm;                                                                   \
-        pbf16_grouped_body<XF, OF, true>(x, wg, wu, offsets, perm, tile_meta, out, n, k, stride,   \
-                                         0u, repeat, sm);                                          \
+        pbf16_grouped_body<OF, true>(x, wg, wu, offsets, perm, tile_meta, out, n, k, stride, 0u,   \
+                                     repeat, sm);                                                  \
     }
 
-PBF16_GU_DEF(pbf16_gu_bf16_bf16, false, false)
-PBF16_GU_DEF(pbf16_gu_f32_f32, true, true)
-PBF16_GU_DEF(pbf16_gu_bf16_f32, false, true)
-PBF16_GU_DEF(pbf16_gu_f32_bf16, true, false)
+PBF16_GU_DEF(pbf16_gu_bf16_bf16, false)
+PBF16_GU_DEF(pbf16_gu_bf16_f32, true)
 
 #endif
