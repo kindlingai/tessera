@@ -1,27 +1,13 @@
 //! The exlr8 trellis form in kernel text: tiles and codebook.
 
 use crate as tessera_codegen;
-use crate::form::{Load, form, named};
+use crate::form::{Load, form, kernel_fns, named};
 use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, round_e4m3, round_f16};
 use tessera_mem::trellis::*;
 
 pub use tessera_mem::trellis::{INPUT_SIDE, packed};
-
-/// Each shared trellis function as a helper, `name::body`.
-macro_rules! kernel_fns {
-    ($($(#[$doc:meta])* $kernel:literal
-        fn $name:ident $(<const $c:ident: $ct:ty>)?
-            ($($(#[$build:meta])* $arg:ident: $ty:tt),*) -> $ret:tt $body:block)*) => {$(
-        $(#[$doc])*
-        pub mod $name {
-            use super::*;
-            #[helper($kernel)]
-            pub fn body $(<const $c: $ct>)? ($($(#[$build])* $arg: $ty),*) -> $ret $body
-        }
-    )*};
-}
 
 tessera_mem::trellis_fns!(kernel_fns);
 

@@ -1,7 +1,8 @@
 //! The exlr8 trellis form: K-bit codes in tiles.
 
 use crate::form::{Form, Read, form};
-use tessera_graph::{DType, E4M3, F16};
+use crate::ops::{Bits, host_fns, round_e4m3, round_f16};
+use tessera_graph::{DType, F16};
 
 /// The mcg codebook's multiplier.
 pub const MCG: u32 = 0xCBAC_1FED;
@@ -114,38 +115,7 @@ macro_rules! trellis_fns {
     };
 }
 
-macro_rules! host_fns {
-    ($($(#[$doc:meta])* $kernel:literal
-        fn $name:ident $(<const $c:ident: $ct:ty>)?
-            ($($(#[$build:meta])* $arg:ident: $ty:tt),*) -> $ret:tt $body:block)*) => {$(
-        $(#[$doc])*
-        fn $name $(<const $c: $ct>)? ($($arg: $ty),*) -> $ret $body
-    )*};
-}
-
 crate::trellis_fns!(host_fns);
-
-/// Kernel bit reads of a word, for the shared bodies.
-trait Bits {
-    /// The 16 bits from `low` read as an f16.
-    fn f16(self, low: u32) -> f32;
-}
-
-impl Bits for u32 {
-    fn f16(self, low: u32) -> f32 {
-        F16((self >> low) as u16).into()
-    }
-}
-
-/// `x` to f16, nearest even.
-fn round_f16(x: f32) -> f32 {
-    F16::from(x).into()
-}
-
-/// `x` to e4m3, nearest even, 448 at most.
-fn round_e4m3(x: f32) -> f32 {
-    E4M3::from(x.clamp(-448.0, 448.0)).into()
-}
 
 macro_rules! define_codebook {
     ($(($book:ident, $name:literal, $suffix:literal, $bits:literal, $pairs:literal,

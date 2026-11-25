@@ -4,6 +4,7 @@ pub mod block;
 mod buffer;
 pub mod form;
 mod layout;
+pub mod ops;
 mod tensor;
 pub mod trellis;
 mod view;

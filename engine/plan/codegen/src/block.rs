@@ -1,15 +1,15 @@
 //! Block forms in kernel text: helpers that decode a block.
 
 use crate as tessera_codegen;
-use crate::form::{Load, form};
+use crate::form::{Load, form, kernel_fns};
 use crate::inline::{Inline, Pass};
 use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, kernel};
 use tessera_graph::{E2M1, E4M3, E8M0, F16};
-use tessera_mem::block::{Block, Code, Crumb, I8, Nibble, Scale};
+use tessera_mem::block::{Block, Crumb, Encode, I8, Nibble, Scale};
 
 /// A code, typed for kernel text.
-pub trait LoadCode: Code {
+pub trait LoadCode: Encode {
     /// Code at bit `low` of `w`, as a float.
     fn field(_: u32, _: u32) -> f32 {
         device()
@@ -30,75 +30,30 @@ pub trait LoadScale: Scale {
     fn load_inline(p: impl Pass<Expr>) -> Inline;
 }
 
-/// An f16 scale: two bytes, low first.
-#[kernel]
-fn f16_scale(p: Buf<U8>) -> f32 {
-    (p[0] as u32 | ((p[1] as u32) << 8)).f16(0)
-}
+tessera_mem::block_fns!(kernel_fns);
 
-/// An e4m3 scale: one byte.
-#[kernel]
-fn e4m3_scale(p: Buf<U8>) -> f32 {
-    (p[0] as u32).e4m3(0)
-}
-
-/// An e8m0 scale: one byte, the f32 exponent.
-#[kernel]
-fn e8m0_scale(p: Buf<U8>) -> f32 {
-    f32::from_bits((p[0] as u32) << 23)
-}
-
-/// An e4m3 byte.
-#[kernel]
-fn e4m3_field(w: u32, low: u32) -> f32 {
-    w.e4m3(low)
-}
-
-/// An e2m1 nibble.
-#[kernel]
-fn e2m1_field(w: u32, low: u32) -> f32 {
-    w.e2m1(low)
-}
-
-/// A signed byte.
-#[kernel]
-fn i8_field(w: u32, low: u32) -> f32 {
-    w.signed(low, 8)
-}
-
-/// A nibble 8 below its value.
-#[kernel]
-fn nibble_field(w: u32, low: u32) -> f32 {
-    w.bits(low, 4) as f32 - 8.0
-}
-
-/// A 2-bit crumb centered at 1.5.
-#[kernel]
-fn crumb_field(w: u32, low: u32) -> f32 {
-    w.bits(low, 2) as f32 - 1.5
-}
-
-/// Each type's kernel reader, by its decode helper.
-macro_rules! reads {
-    ($($trait:ident :: $method:ident for $t:ident = $helper:ident($($arg:ident),*);)*) => {$(
-        impl $trait for $t {
-            fn $method($($arg: impl Pass<Expr>),*) -> Inline {
-                $helper($($arg),*)
+/// Each scale and code's kernel reader, by its shared body.
+macro_rules! kernel_reads {
+    (scales: $(($s:ident, $repr:ty, $smax:literal, $get:ident)),*;
+     codes: $(($c:ident, $bits:literal, $cmax:literal, $field:ident)),*;) => {
+        $(
+            impl LoadScale for $s {
+                fn load_inline(p: impl Pass<Expr>) -> Inline {
+                    $get::body_inline(p)
+                }
             }
-        }
-    )*};
+        )*
+        $(
+            impl LoadCode for $c {
+                fn field_inline(w: impl Pass<Expr>, low: impl Pass<Expr>) -> Inline {
+                    $field::body_inline(w, low)
+                }
+            }
+        )*
+    };
 }
 
-reads! {
-    LoadScale::load_inline for F16 = f16_scale_inline(p);
-    LoadScale::load_inline for E4M3 = e4m3_scale_inline(p);
-    LoadScale::load_inline for E8M0 = e8m0_scale_inline(p);
-    LoadCode::field_inline for E4M3 = e4m3_field_inline(w, low);
-    LoadCode::field_inline for E2M1 = e2m1_field_inline(w, low);
-    LoadCode::field_inline for I8 = i8_field_inline(w, low);
-    LoadCode::field_inline for Nibble = nibble_field_inline(w, low);
-    LoadCode::field_inline for Crumb = crumb_field_inline(w, low);
-}
+tessera_mem::block_reads!(kernel_reads);
 
 /// Element `i` of `p`: head, block scale and code.
 #[helper("form_{name}")]
@@ -109,25 +64,8 @@ fn element<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const 
 ) -> f32 {
     let j = i % B as u64;
     let b = p + (HEAD as u64 * 4 + (i / B as u64) * (S::BYTES + B * C::BITS as usize / 8) as u64);
-    // Code `j`'s byte and shift, paired by halves under `HALVES`.
-    let byte = if C::BITS == 8 {
-        j
-    } else if C::BITS == 2 {
-        j / 4
-    } else if HALVES {
-        j % (B / 2) as u64
-    } else {
-        j / 2
-    };
-    let shift = if C::BITS == 8 {
-        0
-    } else if C::BITS == 2 {
-        (2 * (j % 4)) as u32
-    } else if HALVES {
-        (4 * (j / (B / 2) as u64)) as u32
-    } else {
-        (4 * (j % 2)) as u32
-    };
+    let byte = code_byte::body(C::BITS, B as u64, HALVES, j);
+    let shift = code_shift::body(C::BITS, B as u64, HALVES, j);
     let head = if HEAD {
         f32::from_bits(
             p[0] as u32 | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24),
@@ -148,15 +86,7 @@ fn four<S: LoadScale, C: LoadCode, const B: usize, const HALVES: bool, const HEA
     let j = i % B as u64;
     let b = p + (HEAD as u64 * 4 + (i / B as u64) * (S::BYTES + B * C::BITS as usize / 8) as u64);
     // First byte of the codes, then each shift.
-    let at = if C::BITS == 8 {
-        j
-    } else if C::BITS == 2 {
-        j / 4
-    } else if HALVES {
-        j % (B / 2) as u64
-    } else {
-        j / 2
-    };
+    let at = code_byte::body(C::BITS, B as u64, HALVES, j);
     let step = if C::BITS == 2 {
         2
     } else if C::BITS == 8 || HALVES {

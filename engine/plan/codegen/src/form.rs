@@ -141,7 +141,28 @@ macro_rules! form {
     };
 }
 
-pub(crate) use form;
+/// Each shared form function as `name::body`.
+macro_rules! kernel_fns {
+    ($($(#[$doc:meta])* $($kernel:literal)?
+        fn $name:ident $(<const $c:ident: $ct:ty>)?
+            ($($(#[$build:meta])* $arg:ident: $ty:ident $(<$g:ident>)?),*) -> $ret:tt $body:block)*) => {$(
+        $(#[$doc])*
+        pub mod $name {
+            use super::*;
+            $crate::form::kernel_attr! { [$($kernel)?]
+                pub fn body $(<const $c: $ct>)? ($($(#[$build])* $arg: $ty $(<$g>)?),*) -> $ret $body
+            }
+        }
+    )*};
+}
+
+/// Named bodies become helpers. Others inline at each call.
+macro_rules! kernel_attr {
+    ([] $($f:tt)*) => { #[kernel] $($f)* };
+    ([$name:literal] $($f:tt)*) => { #[helper($name)] $($f)* };
+}
+
+pub(crate) use {form, kernel_attr, kernel_fns};
 
 /// The form that stores `dtype` as is.
 pub fn of(dtype: tessera_graph::DType) -> &'static dyn Load {

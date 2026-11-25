@@ -8,6 +8,8 @@ mod calib_test;
 mod flatten;
 #[cfg(test)]
 mod flatten_test;
+#[cfg(test)]
+mod forms_test;
 pub mod layout;
 #[cfg(test)]
 mod layout_test;
@@ -21,8 +23,6 @@ pub mod proxy;
 mod proxy_test;
 pub mod resident;
 pub mod sums;
-#[cfg(test)]
-mod trellis_test;
 pub mod whole;
 #[cfg(test)]
 mod whole_test;

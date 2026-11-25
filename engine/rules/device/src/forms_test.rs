@@ -1,12 +1,14 @@
 use crate::{Backend, Options, flatten};
+use tessera_codegen::block::{LoadCode, LoadScale};
 use tessera_codegen::prelude::*;
 use tessera_codegen::trellis::{LoadBook, book};
 use tessera_codegen::{Precision, form::F32_FORM};
 use tessera_gpukit::backend::{OnGpu, dispatch, picked};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
-use tessera_graph::F16;
+use tessera_graph::{E2M1, E4M3, E8M0, F16};
 use tessera_host::exec::{self, ArgVal, Grid};
+use tessera_mem::block::{Code, Crumb, I8, Nibble, Scale};
 use tessera_mem::trellis::Codebook;
 
 const HAND: &str = r#"#include <tessera/1/core>
@@ -111,4 +113,92 @@ fn trellis_states_match() {
         })*};
     }
     tessera_mem::codebooks!(each_book);
+}
+
+/// Each code at bit 4 of `s << 4 | 5`.
+#[kernel]
+fn codes<C: LoadCode>(mut out: BufMut<F32>, n: u32) {
+    let s = gid();
+    if s < n {
+        out[s as u64] = C::field((s << 4) | 5, 4);
+    }
+}
+
+/// Scale `s`, read from its bytes in `p`.
+#[kernel]
+fn scales<S: LoadScale>(mut out: BufMut<F32>, p: Buf<U8>, n: u32) {
+    let s = gid();
+    if s < n {
+        let at = p + s as u64 * S::BYTES as u64;
+        out[s as u64] = S::load(at);
+    }
+}
+
+/// `n` floats from `body` on the host, after `bytes`.
+fn host_run(body: &tessera_codegen::ir::Body, bytes: &mut [u8], n: u32) -> Vec<u32> {
+    let mut out = vec![0u8; 4 * n as usize];
+    let mut args = vec![
+        ArgVal::Buf {
+            at: 0,
+            skip: 0,
+            form: F32_FORM,
+        },
+        ArgVal::U32(n),
+    ];
+    if !bytes.is_empty() {
+        args.insert(
+            1,
+            ArgVal::Buf {
+                at: 1,
+                skip: 0,
+                form: <U8 as Form>::FORM,
+            },
+        );
+    }
+    let threads = (n as usize).min(4096);
+    let grid = Grid {
+        groups: n as usize / threads,
+        threads,
+    };
+    exec::run(
+        body,
+        &args,
+        &mut [&mut out, bytes],
+        grid,
+        LANES,
+        Precision::EXACT,
+    );
+    let (got, _) = out.as_chunks::<4>();
+    got.iter().map(|w| u32::from_le_bytes(*w)).collect()
+}
+
+/// Every code and scale word: kernel text matches the host.
+#[test]
+fn block_reads_match() {
+    macro_rules! each_read {
+        (scales: $(($s:ident, $repr:ty, $smax:literal, $get:ident)),*;
+         codes: $(($c:ident, $bits:literal, $cmax:literal, $field:ident)),*;) => {
+            $({
+                let n = 1u32 << (8 * <$s as Scale>::BYTES);
+                let mut bytes = Vec::new();
+                for s in 0..n {
+                    bytes.extend_from_slice(&s.to_le_bytes()[..<$s as Scale>::BYTES]);
+                }
+                let got = host_run(&scales_ir::<$s>(), &mut bytes, n);
+                for s in 0..n as usize {
+                    let at = s * <$s as Scale>::BYTES;
+                    let want = <$s as Scale>::get(&bytes[at..]).to_bits();
+                    assert_eq!(got[s], want, "{} {s:#x}", stringify!($s));
+                }
+            })*
+            $({
+                let got = host_run(&codes_ir::<$c>(), &mut [], 256);
+                for s in 0..256u32 {
+                    let want = <$c as Code>::decode((s << 4) | 5, 4).to_bits();
+                    assert_eq!(got[s as usize], want, "{} {s:#x}", stringify!($c));
+                }
+            })*
+        };
+    }
+    tessera_mem::block_reads!(each_read);
 }

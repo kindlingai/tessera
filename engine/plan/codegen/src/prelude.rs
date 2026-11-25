@@ -6,6 +6,7 @@ use std::ops::{Add, Index, IndexMut};
 
 pub use crate::LANES;
 pub use tessera_kernel_macro::{Group, helper, kernel};
+pub use tessera_mem::ops::Bits;
 
 /// The register type one element reads into.
 pub trait Elems {
@@ -135,38 +136,6 @@ impl<F: Elems> Buf<F> {
 
     /// The sum of `n` products with `b`, from each offset.
     pub fn dot<G: Elems>(&self, _: u64, _: Buf<G>, _: u64, _: u32) -> f32 {
-        device()
-    }
-}
-
-/// Bit fields of a word, below 32 bits wide.
-pub trait Bits {
-    /// The `n` bits from bit `low`.
-    fn bits(self, low: u32, n: u32) -> u32;
-    /// The same, sign-extended, as a float.
-    fn signed(self, low: u32, n: u32) -> f32;
-    /// The 16 bits from `low` read as an f16.
-    fn f16(self, low: u32) -> f32;
-    /// The 8 bits from `low` read as an e4m3.
-    fn e4m3(self, low: u32) -> f32;
-    /// The 4 bits from `low` read as an e2m1.
-    fn e2m1(self, low: u32) -> f32;
-}
-
-impl Bits for u32 {
-    fn bits(self, _: u32, _: u32) -> u32 {
-        device()
-    }
-    fn signed(self, _: u32, _: u32) -> f32 {
-        device()
-    }
-    fn f16(self, _: u32) -> f32 {
-        device()
-    }
-    fn e4m3(self, _: u32) -> f32 {
-        device()
-    }
-    fn e2m1(self, _: u32) -> f32 {
         device()
     }
 }
