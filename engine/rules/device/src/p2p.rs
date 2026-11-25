@@ -12,6 +12,7 @@ use tessera_run::Sum;
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
 const ENTRY: &str = "tessera_p2p_sum";
 const GATHER_ENTRY: &str = "tessera_p2p_gather";
+const BF16_ENTRY: &str = "tessera_p2p_sum_bf16";
 
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
@@ -110,6 +111,7 @@ pub struct P2p<D: Device> {
     ctx: D,
     kernel: D::Kernel,
     gather_kernel: D::Kernel,
+    bf16_kernel: D::Kernel,
     _peers: Peers<D>,
     _area: DeviceBuffer<D>,
     areas: DeviceBuffer<D>,
@@ -121,6 +123,7 @@ pub struct P2p<D: Device> {
     threads: u32,
     timeout_ticks: u64,
     schedule: Schedule,
+    bf16: bool,
     broken: bool,
 }
 
@@ -185,6 +188,7 @@ where
         let text = flatten("p2p.kernel", KERNEL, &|_| None, &options)?.text;
         let kernel = ctx.compile(&text, ENTRY)?;
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
+        let bf16_kernel = ctx.compile(&text, BF16_ENTRY)?;
 
         let area = DeviceBuffer::alloc(ctx, area_bytes(ranks))?;
         area.zero()?;
@@ -235,6 +239,7 @@ where
             ctx: ctx.clone(),
             kernel,
             gather_kernel,
+            bf16_kernel,
             _peers: peers,
             _area: area,
             areas,
@@ -246,6 +251,7 @@ where
             threads,
             timeout_ticks,
             schedule: Schedule::Auto,
+            bf16: false,
             broken: false,
         })
     }
@@ -253,6 +259,12 @@ where
     /// Overrides the schedule for tests and benchmarks.
     pub fn with_schedule(mut self, schedule: Schedule) -> Self {
         self.schedule = schedule;
+        self
+    }
+
+    /// Enables BF16 wire transport with FP32 accumulation.
+    pub fn with_bf16(mut self, bf16: bool) -> Self {
+        self.bf16 = bf16;
         self
     }
 
@@ -282,9 +294,12 @@ where
         self.ctx.programmatic(false);
         let blocks = (grid, 1, 1);
         let threads = (self.threads, 1, 1);
-        Ok(self
-            .ctx
-            .launch(&self.kernel, blocks, threads, 0, &mut args)?)
+        let kernel = if self.bf16 {
+            &self.bf16_kernel
+        } else {
+            &self.kernel
+        };
+        Ok(self.ctx.launch(kernel, blocks, threads, 0, &mut args)?)
     }
 
     fn launch_gather(
@@ -400,17 +415,24 @@ where
     }
 }
 
-struct Start<'a>(&'a mut dyn Transport);
+struct Start<'a>(&'a mut dyn Transport, bool);
 
 impl OnGpu for Start<'_> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Ok(Box::new(P2p::on(cached_context::<D>()?, self.0)?))
+        Ok(Box::new(
+            P2p::on(cached_context::<D>()?, self.0)?.with_bf16(self.1),
+        ))
     }
 }
 
 /// Direct P2P sums on the GPU `gpu` names.
 pub fn open(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot))
+    persistent(gpu, Start(boot, false))
+}
+
+/// Direct P2P sums with BF16 wire transport on `gpu`.
+pub fn open_bf16(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
+    persistent(gpu, Start(boot, true))
 }
