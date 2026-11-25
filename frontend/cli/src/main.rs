@@ -36,7 +36,10 @@ fn run(given: &[String]) -> Result<(), Stop> {
         return Err(Stop::Usage);
     };
     match (verb.as_str(), task::find("", verb)) {
-        (_, Some(command)) => (command.run)(origin, rest),
+        // Words a command refuses may still be a prompt.
+        (_, Some(command)) if origin.is_some() || (command.accepts)(rest) => {
+            (command.run)(origin, rest)
+        }
         ("task", _) => task::run(origin, rest),
         ("teleport", _) => teleport::run(rest),
         ("-h" | "--help" | "help", _) => Err(Stop::Usage),

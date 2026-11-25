@@ -36,6 +36,8 @@ pub struct Entry {
     /// A tool call's arguments as command-line words.
     pub tool_args: fn(&Value) -> Result<Vec<String>, Usage>,
     pub usage: fn() -> String,
+    /// Whether the arguments parse. Commands read no stdin.
+    pub accepts: fn(&[String]) -> bool,
     pub run: fn(Option<Origin>, &[String]) -> Result<(), Stop>,
 }
 
@@ -60,6 +62,7 @@ const fn entry<T: Task, O: Target<T>>(group: &'static str) -> Entry {
         example_args: T::example,
         tool_args: T::tool_args,
         usage: usage::<T, O>,
+        accepts: accepts::<T, O>,
         run: run_entry::<T, O>,
     }
 }
@@ -161,6 +164,10 @@ impl<T: Task + Run<Source>> Target<T> for OnSource {
 
 fn usage<T: Task, O: Target<T>>() -> String {
     T::usage(&O::extra())
+}
+
+fn accepts<T: Task, O: Target<T>>(args: &[String]) -> bool {
+    T::parse(args, &O::takes).is_ok()
 }
 
 fn run_entry<T: Task, O: Target<T>>(origin: Option<Origin>, args: &[String]) -> Result<(), Stop> {
