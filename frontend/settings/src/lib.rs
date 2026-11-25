@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
-use tessera_engine::{Backend, Memory, Pick, Reads, Settings};
+use tessera_engine::{Asks, Backend, Memory, Pick, Reads, Settings};
 
 /// The `TESSERA_` variables.
 #[derive(Deserialize)]
@@ -19,8 +19,8 @@ struct Env {
     memory: Option<String>,
     /// `cached` or `direct`.
     reads: Option<String>,
-    /// Launches per profile report.
-    profile: Option<u64>,
+    /// Launches per profile report, or `dynamic`.
+    profile: Option<String>,
     kernels: Option<PathBuf>,
     /// Compiled image cache directory, or `off`.
     kernel_cache: Option<String>,
@@ -59,6 +59,14 @@ pub fn read() -> Settings {
         .as_deref()
         .map(|s| s.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
+    let (profile, asks) = match env.profile.as_deref() {
+        None => (None, None),
+        Some("dynamic") => (None, Some(Asks::default())),
+        Some(n) => match n.parse::<u64>() {
+            Ok(n) => ((n > 0).then_some(n), None),
+            Err(e) => panic!("TESSERA_PROFILE={n}: want a count or dynamic: {e}"),
+        },
+    };
     let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let hub = (var("HF_HUB_CACHE"))
         .or_else(|| var("HF_HOME").map(|h| h.join("hub")))
@@ -76,7 +84,8 @@ pub fn read() -> Settings {
         reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
         hf_token: token(&var, std::env::home_dir()),
-        profile: env.profile.filter(|n| *n > 0),
+        profile,
+        asks,
         kernels: env.kernels,
         kernel_cache,
         nvrtc,

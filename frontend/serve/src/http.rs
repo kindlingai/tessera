@@ -20,7 +20,17 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: String,
+    /// Header names in lower case, and values.
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Request {
+    /// The value of header `name`, given in lower case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let mut found = self.headers.iter().filter(|(n, _)| n == name);
+        found.next().map(|(_, v)| v.as_str())
+    }
 }
 
 pub enum Body {
@@ -226,10 +236,12 @@ fn read(
         let mut close = parsed.version != Some(1);
         let mut length: Option<usize> = None;
         let mut expect = false;
+        let mut headers = Vec::with_capacity(parsed.headers.len());
         for header in parsed.headers.iter() {
             let value = std::str::from_utf8(header.value).map_err(|_| Fail::Status(400))?;
             let value = value.trim();
             let name = header.name;
+            headers.push((name.to_ascii_lowercase(), value.to_string()));
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 return Err(Fail::Status(501));
             } else if name.eq_ignore_ascii_case("content-length") {
@@ -258,6 +270,7 @@ fn read(
             method: parsed.method.unwrap_or("").to_string(),
             path: path.to_string(),
             query: query.to_string(),
+            headers,
             body: Vec::new(),
         };
         buffer.drain(..used);

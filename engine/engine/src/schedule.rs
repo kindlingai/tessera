@@ -404,12 +404,14 @@ impl<'a> Batch<'a> {
 
     /// One step of the policy's rows. False when nothing ran.
     pub fn step(&mut self) -> Result<bool, Error> {
+        self.engine.settle()?;
         let ran = self.turn();
         WAITING.set(self.waiting.len() as u64);
         RUNNING.set(self.active.len() as u64);
         if let Some(kept) = &self.kept {
             kept.publish();
         }
+        self.engine.settle()?;
         ran
     }
 

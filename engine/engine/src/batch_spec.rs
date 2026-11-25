@@ -3,7 +3,7 @@
 use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, SoloState, push_tail};
 use crate::mtp_draft::{MtpDrafter, MtpSpan};
 use crate::schedule::Sink;
-use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, tell_ranks};
+use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32};
 use crate::speculate::accept_greedy;
 use crate::{Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
@@ -193,14 +193,16 @@ impl<'a> BatchMtp<'a> {
         if !self.busy() {
             return Ok(false);
         }
+        self.target.settle()?;
         let cancelled = self.collect_cancelled();
         let admitted = self.admit_local();
         if self.target.control.is_some() {
             let msg = encode_round(self.hash, &cancelled, &admitted);
-            let _ = tell_ranks(self.target, &msg)?;
+            let _ = self.target.told(&msg)?;
         }
         self.retire_slots(&cancelled);
         self.run_round(admitted)?;
+        self.target.settle()?;
         Ok(true)
     }
 
@@ -212,7 +214,7 @@ impl<'a> BatchMtp<'a> {
                 .held
                 .take()
                 .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-            let Some(told) = tell_ranks(self.target, &mine)? else {
+            let Some(told) = self.target.told(&mine)? else {
                 return Ok(());
             };
             let Some((want_hash, cancelled, admitted)) = decode_round(&told) else {

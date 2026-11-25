@@ -42,6 +42,7 @@ pub(crate) fn loaded_with(
         image: Some(Arc::new(MockImage)),
         score: Some(generator.clone()),
         strict,
+        asks: None,
     });
     slot
 }
@@ -52,6 +53,7 @@ pub fn call(slot: &Slot, path: &str, body: Option<Value>) -> (u16, String) {
         method: if body.is_some() { "POST" } else { "GET" }.into(),
         path: path.into(),
         query: String::new(),
+        headers: Vec::new(),
         body: body.map_or_else(Vec::new, |b| b.to_string().into_bytes()),
     };
     let response = route(slot, &request);

@@ -55,7 +55,7 @@ pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample}
 // The front end reaches the engine crates only through these.
 pub use tessera_device::{p2p, sums, whole};
 pub use tessera_engine_comm as comm;
-pub use tessera_engine_settings::{Backend, Memory, Reads};
+pub use tessera_engine_settings::{Ask, Asks, Backend, Memory, Reads};
 pub use tessera_graph::{Bf16, DType, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
 pub use tessera_interp::{Tensor, bind, fold};
 pub use tessera_lower::{Compute, Filed, Pick, Pins, Recipe, Settings, Site, Weight, form};
@@ -223,6 +223,8 @@ pub struct Engine {
     control: Option<Box<dyn comm::Transport>>,
     /// Launches per profile report, and launches since the last.
     profile: Option<[u64; 2]>,
+    /// Requests that ask for a profile, under dynamic profiling.
+    asks: Option<Asks>,
     /// A ranked profile until the next control round carries it.
     held: Option<(u64, tessera_run::Profile)>,
     /// The last profiles rank 0 gathered from all ranks.
@@ -380,6 +382,7 @@ impl Engine {
             vocab,
             control: None,
             profile: settings.profile.map(|every| [every, 0]),
+            asks: settings.asks.clone(),
             held: None,
             ranks: None,
             ple: None,

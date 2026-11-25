@@ -2,8 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 use tessera_engine::{
-    Allowed, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason, Request, Row,
-    Site, Steps,
+    Allowed, Asks, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason,
+    Request, Row, Site, Steps,
 };
 use tessera_graph::{
     Dim,
@@ -157,11 +157,9 @@ fn answers_match(settings: &Settings) {
 /// Profiling names every step's kernel and every launch.
 #[test]
 fn profile_counts_launches() {
-    for settings in runs() {
-        let settings = Settings {
-            profile: Some(1000),
-            ..settings
-        };
+    for mut settings in runs() {
+        let asks = Asks::default();
+        settings.asks = Some(asks.clone());
         let (g, weights, mut engine) = open(17, 1, &settings);
         let prompt = [3u32, 9, 4];
         let want = reference(&g, &weights, &prompt, 3);
@@ -170,8 +168,12 @@ fn profile_counts_launches() {
             max_tokens: 3,
             ..Request::default()
         };
+        let ask = asks.hold();
         assert_eq!(ids(&events(&mut engine, request)), want);
         let profile = engine.take_profile().unwrap();
+        drop(ask);
+        engine.settle().unwrap();
+        assert!(engine.take_profile().is_none());
         assert_eq!(profile.spent["engine: launch"].count, 3);
         let kernels: f64 = engine
             .kernels()

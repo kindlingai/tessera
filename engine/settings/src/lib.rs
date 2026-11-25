@@ -4,6 +4,8 @@ mod backend;
 
 pub use backend::{Backend, ByBackend};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Where plans run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +38,33 @@ pub enum Reads {
     Direct,
 }
 
+/// Requests that want a profile now. Clones share one count.
+#[derive(Clone, Debug, Default)]
+pub struct Asks(Arc<AtomicUsize>);
+
+impl Asks {
+    /// Counts one request until the result drops.
+    pub fn hold(&self) -> Ask {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ask(self.0.clone())
+    }
+
+    /// Whether any request wants a profile.
+    pub fn wanted(&self) -> bool {
+        self.0.load(Ordering::Relaxed) > 0
+    }
+}
+
+/// One request's hold on an `Asks` count.
+#[derive(Debug)]
+pub struct Ask(Arc<AtomicUsize>);
+
+impl Drop for Ask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Settings for the planner, the runners and the tools.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -63,6 +92,8 @@ pub struct Settings {
     pub hf_token: Option<String>,
     /// Launches per profile report. `None` times nothing.
     pub profile: Option<u64>,
+    /// Profiles only while requests ask, then reports.
+    pub asks: Option<Asks>,
     /// Kernel files that replace planned kernels, named by entry.
     pub kernels: Option<PathBuf>,
     /// Directory for cached PTX and HSACO images.
@@ -91,6 +122,7 @@ impl Default for Settings {
             hub: None,
             hf_token: None,
             profile: None,
+            asks: None,
             kernels: None,
             kernel_cache: None,
             nvrtc: Vec::new(),

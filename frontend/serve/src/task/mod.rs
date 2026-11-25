@@ -85,6 +85,8 @@ pub struct Load<'a> {
     pub slot: &'a Slot,
     /// The load's step, done when the slot fills.
     pub step: Mutex<Option<Step>>,
+    /// Counts requests that ask for a profile, under `TESSERA_PROFILE=dynamic`.
+    pub asks: Option<tessera_engine::Asks>,
 }
 
 impl Load<'_> {
@@ -115,6 +117,7 @@ impl Load<'_> {
             image: None,
             score: None,
             strict: self.options.strict,
+            asks: self.asks.clone(),
         };
         with(&mut model);
         let _ = self.slot.set(model);

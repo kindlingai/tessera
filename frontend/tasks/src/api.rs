@@ -209,4 +209,6 @@ pub struct Model {
     pub score: Option<Arc<dyn Score>>,
     /// Unknown request fields refuse the request. Else they warn.
     pub strict: bool,
+    /// Counts requests that ask for a profile, when enabled.
+    pub asks: Option<tessera_engine::Asks>,
 }

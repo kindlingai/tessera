@@ -1,12 +1,13 @@
 //! Completions and chat completions, whole or streamed.
 
-use crate::http::{Body, Response};
+use crate::http::{Body, Request, Response};
 use crate::wire::{self, Chat, Common, Completion, Prompt, Refusal, ResponseFormat, bad, refuse};
 use crate::{Model, Slot, with_model};
 use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use tessera_bundle::{ResponseEvent, ResponseParser, ToolCall};
+use tessera_engine::Ask;
 use tessera_tasks::api::{Finish, Params, Refused, Step};
 
 /// An answer's OpenAI shape.
@@ -122,6 +123,7 @@ fn start(
     asked: Option<usize>,
     common: Common,
     parsing: Parsing,
+    ask: Option<Ask>,
 ) -> Result<Started, Refusal> {
     let generator = model
         .generator
@@ -142,12 +144,18 @@ fn start(
     };
     let (sink, steps) = mpsc::channel();
     let prompt_tokens = prompt.len();
+    let mut ask = ask;
+    let each = move |step: Step| {
+        let last = matches!(step, Step::Done { .. });
+        let sent = sink.send(step).is_ok();
+        // The answer ended, or the client left.
+        if last || !sent {
+            drop(ask.take());
+        }
+        sent
+    };
     generator
-        .generate(
-            prompt,
-            params,
-            Box::new(move |step| sink.send(step).is_ok()),
-        )
+        .generate(prompt, params, Box::new(each))
         .map_err(|e| match e.downcast_ref::<Refused>() {
             Some(why) => bad(why.0.clone(), why.1),
             None => refuse(503, e.to_string(), None),
@@ -164,7 +172,7 @@ fn start(
     })
 }
 
-fn complete(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
+fn complete(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal> {
     let c: Completion = wire::parse(model, body)?;
     let prompt = match c.prompt {
         Prompt::Ids(ids) => ids,
@@ -183,10 +191,11 @@ fn complete(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
         c.common.max_tokens,
         c.common,
         Parsing::plain(),
+        ask,
     )
 }
 
-fn chat(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
+fn chat(model: &Model, body: &[u8], ask: Option<Ask>) -> Result<Started, Refusal> {
     let c: Chat = wire::parse(model, body)?;
     let allow_tools = match &c.tool_choice {
         Some(choice) => choice.allow()?,
@@ -209,7 +218,7 @@ fn chat(model: &Model, body: &[u8]) -> Result<Started, Refusal> {
         tools,
         thinking,
     };
-    start(model, Kind::Chat, prompt, asked, c.common, parsing)
+    start(model, Kind::Chat, prompt, asked, c.common, parsing, ask)
 }
 
 impl Started {
@@ -430,15 +439,33 @@ impl Started {
     }
 }
 
-pub(crate) fn completions(slot: &Slot, body: &[u8]) -> Response {
-    match with_model(slot, |m| complete(m, body)) {
+/// Asks to profile launches while the answer runs.
+const PROFILE: &str = "x-tessera-profile";
+
+/// A hold on the profile count, if `request` asks.
+fn ask(model: &Model, request: &Request) -> Result<Option<Ask>, Refusal> {
+    let Some(value) = request.header(PROFILE).filter(|v| *v != "0") else {
+        return Ok(None);
+    };
+    match (&model.asks, value) {
+        (Some(asks), "1") => Ok(Some(asks.hold())),
+        (Some(_), _) => Err(bad(format!("{PROFILE} must be 0 or 1"), PROFILE)),
+        (None, _) => Err(bad(
+            "start the server with TESSERA_PROFILE=dynamic",
+            PROFILE,
+        )),
+    }
+}
+
+pub(crate) fn completions(slot: &Slot, request: &Request) -> Response {
+    match with_model(slot, |m| complete(m, &request.body, ask(m, request)?)) {
         Ok(started) => started.respond(),
         Err(refused) => refused.into(),
     }
 }
 
-pub(crate) fn chat_completions(slot: &Slot, body: &[u8]) -> Response {
-    match with_model(slot, |m| chat(m, body)) {
+pub(crate) fn chat_completions(slot: &Slot, request: &Request) -> Response {
+    match with_model(slot, |m| chat(m, &request.body, ask(m, request)?)) {
         Ok(started) => started.respond(),
         Err(refused) => refused.into(),
     }

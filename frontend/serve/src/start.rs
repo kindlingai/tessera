@@ -197,6 +197,7 @@ fn load(mut options: Options, slot: Slot) {
         info,
         slot: &slot,
         step: Mutex::new(Some(step)),
+        asks: settings.asks.clone(),
     };
     let failed = task::pick(&options).and_then(|entry| (entry.open)(&load, settings));
     if let Err(e) = failed {

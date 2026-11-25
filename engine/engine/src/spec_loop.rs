@@ -5,7 +5,7 @@ use crate::speculate::accept_greedy;
 use crate::{Engine, Error, Event, Reason, Request, Row};
 use tessera_engine_comm::{Reader, Writer};
 use tessera_lower::Slot;
-use tessera_run::{Error as RunError, Profile, Ranks, Run};
+use tessera_run::{Error as RunError, Profile, Run};
 
 /// Wire tag identifying an SPMD speculative request header.
 const SPEC_REQ_TAG: u32 = 1;
@@ -102,23 +102,6 @@ pub(crate) fn fnv_u32(h: &mut u32, v: u32) {
     }
 }
 
-/// Exchanges control bytes and gathers rank profiles on rank 0.
-pub(crate) fn tell_ranks(target: &mut Engine, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let Some(control) = &mut target.control else {
-        return Ok(None);
-    };
-    let lead = control.rank() == 0;
-    let mut parts = control.exchange(mine).map_err(RunError::from)?;
-    if lead && let Some((launches, own)) = target.held.take() {
-        let mut profiles = vec![Some(own)];
-        profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
-        let ranks = Ranks { launches, profiles };
-        eprintln!("profile of {launches} launches:\n{ranks}");
-        target.ranks = Some(ranks);
-    }
-    Ok(Some(parts.swap_remove(0)))
-}
-
 /// Checks FNV-1a determinism across ranks and propagates early stop.
 fn sync_ranks(target: &mut Engine, stopped: bool, hash: u32) -> Result<bool, Error> {
     let Some(control) = &mut target.control else {
@@ -143,12 +126,8 @@ fn sync_ranks(target: &mut Engine, stopped: bool, hash: u32) -> Result<bool, Err
             return Err(RunError::OutputsDisagree.into());
         }
     }
-    if lead && let Some((launches, own)) = target.held.take() {
-        let mut profiles = vec![Some(own)];
-        profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(&p[5..])));
-        let ranks = Ranks { launches, profiles };
-        eprintln!("profile of {launches} launches:\n{ranks}");
-        target.ranks = Some(ranks);
+    if lead {
+        target.gather(parts[1..].iter().map(|p| Profile::from_bytes(&p[5..])));
     }
     Ok(stop)
 }
@@ -189,7 +168,7 @@ pub(crate) fn start_req(
             .u32s(&request.stop)
             .u32s(table);
         extra(&mut w);
-        tell_ranks(target, &w.0)?;
+        target.told(&w.0)?;
     }
     Ok(true)
 }
@@ -231,7 +210,7 @@ pub(crate) fn follow_loop<T>(
             .held
             .take()
             .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-        let Some(told) = tell_ranks(target, &mine)? else {
+        let Some(told) = target.told(&mine)? else {
             return Ok(());
         };
         let Some((req, table, policy)) = decode_req(&told, &mut decode) else {
@@ -286,11 +265,15 @@ macro_rules! spec_entry {
                     request,
                     chunk: $this.prefill_chunk,
                 };
+                $this.target.settle()?;
                 if !$crate::spec_loop::start_req($this.target, &$req, emit, |w| $p.encode(w))? {
+                    $this.target.settle()?;
                     return Ok($crate::SpecStats::default());
                 }
                 let ($target, $emit) = (&mut *$this.target, emit);
-                $body
+                let stats = $body;
+                $target.settle()?;
+                stats
             }
         }
     };

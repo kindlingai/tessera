@@ -209,11 +209,11 @@ pub fn route(slot: &Slot, request: &Request) -> Response {
         }
         ("POST", "/v1/completions") => {
             COMPLETIONS.add(1);
-            answer::completions(slot, body)
+            answer::completions(slot, request)
         }
         ("POST", "/v1/chat/completions") => {
             CHATS.add(1);
-            answer::chat_completions(slot, body)
+            answer::chat_completions(slot, request)
         }
         ("POST", "/v1/systemone") => {
             DECISIONS.add(1);

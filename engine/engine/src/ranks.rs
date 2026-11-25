@@ -148,21 +148,106 @@ impl Engine {
         self.told(&[]).map(|_| ())
     }
 
-    /// Rank 0's bytes of one round. None without ranks.
-    fn told(&mut self, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        let Some(control) = &mut self.control else {
+    /// Rank 0's launch bytes of one round. None without ranks.
+    pub(crate) fn told(&mut self, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let Some(control) = &self.control else {
             return Ok(None);
         };
-        let lead = control.rank() == 0;
-        let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
-        if let (true, Some((launches, own))) = (lead, self.held.take()) {
-            let mut profiles = vec![Some(own)];
-            profiles.extend(parts[1..].iter().map(|p| Profile::from_bytes(p)));
-            let ranks = Ranks { launches, profiles };
-            eprintln!("profile of {launches} launches:\n{ranks}");
-            self.ranks = Some(ranks);
+        // Other ranks act on profile tags here. Empty bytes dismiss.
+        if control.rank() == 0 {
+            let mut tagged = Vec::with_capacity(mine.len() + 4);
+            if !mine.is_empty() {
+                tagged.extend_from_slice(&LAUNCH.to_le_bytes());
+                tagged.extend_from_slice(mine);
+            }
+            return self.round(&tagged).map(Some);
         }
-        Ok(Some(parts.swap_remove(0)))
+        let mut mine = mine.to_vec();
+        loop {
+            let told = self.round(&mine)?;
+            let Some((tag, rest)) = told.split_first_chunk::<4>() else {
+                return Ok(Some(told));
+            };
+            match u32::from_le_bytes(*tag) {
+                LAUNCH => return Ok(Some(rest.to_vec())),
+                tag => self.profile_ranked(tag == PROFILE_ON),
+            }
+            mine = self
+                .held
+                .take()
+                .map_or_else(Vec::new, |(_, p)| p.to_bytes());
+        }
+    }
+
+    /// One exchange. Rank 0 prints its held profile.
+    fn round(&mut self, mine: &[u8]) -> Result<Vec<u8>, Error> {
+        let Some(control) = &mut self.control else {
+            return Ok(Vec::new());
+        };
+        let mut parts = control.exchange(mine).map_err(tessera_run::Error::from)?;
+        if control.rank() == 0 {
+            self.gather(parts[1..].iter().map(|p| Profile::from_bytes(p)));
+        }
+        Ok(parts.swap_remove(0))
+    }
+
+    /// Prints rank 0's held profile with the other ranks'.
+    pub(crate) fn gather(&mut self, others: impl Iterator<Item = Option<Profile>>) {
+        let Some((launches, own)) = self.held.take() else {
+            return;
+        };
+        let profiles = std::iter::once(Some(own)).chain(others).collect();
+        let ranks = Ranks { launches, profiles };
+        eprintln!("profile of {launches} launches:\n{ranks}");
+        self.ranks = Some(ranks);
+    }
+
+    /// Starts or stops profiling. Stopping holds the profile.
+    fn profile_ranked(&mut self, on: bool) {
+        if on == self.profile.is_some() {
+            return;
+        }
+        let launches = self.profile.take().map_or(0, |[_, done]| done);
+        if let Some(profile) = self.take_profile().filter(|_| !on) {
+            self.held = Some((launches, profile));
+        }
+        self.runner.profiling(on);
+        self.profile = on.then_some([u64::MAX, 0]);
+    }
+
+    /// Profiles while requests ask. Stopping prints the profile.
+    pub fn settle(&mut self) -> Result<(), Error> {
+        let Some(asks) = &self.asks else {
+            return Ok(());
+        };
+        let on = asks.wanted();
+        let lead = self.control.as_ref().is_none_or(|c| c.rank() == 0);
+        if !lead || on == self.profile.is_some() {
+            return Ok(());
+        }
+        let tag = match on {
+            true => PROFILE_ON,
+            false => PROFILE_OFF,
+        };
+        let tag = tag.to_le_bytes();
+        self.profile_ranked(on);
+        if self.control.is_none() {
+            if let Some((launches, profile)) = self.held.take() {
+                eprintln!(
+                    "profile of {launches} launches:\n{}",
+                    profile.report(launches)
+                );
+            }
+            return Ok(());
+        }
+        // Other ranks send their profiles one round after the tag.
+        let held = self.held.take();
+        self.round(&tag)?;
+        if !on {
+            self.held = held;
+            self.round(&tag)?;
+        }
+        Ok(())
     }
 
     /// The last profiles rank 0 gathered, one per rank.
@@ -191,6 +276,11 @@ impl Engine {
         self.told(&bytes).map(|_| ())
     }
 }
+
+/// Tags on rank 0's control messages.
+const LAUNCH: u32 = 0;
+const PROFILE_ON: u32 = 1;
+const PROFILE_OFF: u32 = 2;
 
 /// A launch as words: head, wants, table, rows, picks, list.
 fn encode(rows: &[Row], picks: &[u32], head: &Head, wants: Wants, table: &[u32]) -> Vec<u8> {
