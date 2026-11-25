@@ -1,6 +1,6 @@
 //! The kernel trait: what a plan step launches.
 
-use crate::abi::{Launch, Source};
+use crate::abi::{Arg, Launch, Source};
 use crate::extent::Extent;
 use crate::plan::Step;
 use std::fmt;
@@ -92,7 +92,7 @@ pub trait Kernel: fmt::Debug + Send + Sync {
 pub enum Keeping {
     /// Stores the state after its last row.
     Stores,
-    /// Reads the state and leaves it unchanged.
+    /// Leaves the state unchanged and stores to a spare.
     Peeks,
     /// Replays the first `COMMIT` rows, then stores.
     Commits,
@@ -126,9 +126,12 @@ impl Keeping {
         }
     }
 
-    /// One when the kernel skips its store.
-    pub fn peeks(self) -> u32 {
-        u32::from(self == Keeping::Peeks)
+    /// Where a scan stores: its state, or the spare.
+    pub fn keep(self, step: &Step) -> Arg {
+        match self {
+            Keeping::Peeks => step.out_at(1),
+            _ => step.read(step.reads.len() - 1),
+        }
     }
 
     /// The committing twin `make` builds, for a peeking kernel.

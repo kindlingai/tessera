@@ -5,7 +5,7 @@ macro_rules! slot_scan {
     (
         $(#[$doc:meta])*
         fn $name:ident($($params:tt)*),
-        [$slots:ident, $positions:ident, $out:ident, $rows:ident, $peek:ident],
+        [$slots:ident, $positions:ident, $out:ident, $rows:ident],
         [$s:ident, $r:ident, $pos:ident, $at:ident, $last:ident],
         setup: {$($setup:tt)*},
         open: {$($open:tt)*},
@@ -47,7 +47,7 @@ macro_rules! slot_scan {
                     }
                 }
             }
-            if loaded != 0 && $peek == 0 {
+            if loaded != 0 {
                 $($store)*
             }
         }

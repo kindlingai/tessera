@@ -74,6 +74,7 @@ slot_scan!(
         positions: Buf<U32>,
         mut state: BufMut<F32>,
         mut out: BufMut<F32>,
+        mut keep: BufMut<F32>,
         scale: f32,
         jobs: u32,
         rows: u32,
@@ -81,9 +82,8 @@ slot_scan!(
         #[build] kv_heads: u32,
         #[build] key_width: u32,
         #[build] width: u32,
-        #[build] peek: u32,
     ),
-    [slots, positions, out, rows, peek],
+    [slots, positions, out, rows],
     [s, r, pos, o, last],
     setup: {
         if gid() >= jobs {
@@ -110,7 +110,7 @@ slot_scan!(
     },
     store: {
         for i in 0..key_width {
-            state[base + (i * width) as u64] = col[i as usize];
+            keep[base + (i * width) as u64] = col[i as usize];
         }
     },
     row: {
@@ -173,7 +173,7 @@ impl Delta {
         let [heads, kv_heads] = [d.heads, d.kv_heads].map(|n| n as u32);
         let [key_width, width] = [d.key_width, d.width].map(|n| n as u32);
         match d.state {
-            Some(_) => delta_rule_rows_ir(heads, kv_heads, key_width, width, self.keeping.peeks()),
+            Some(_) => delta_rule_rows_ir(heads, kv_heads, key_width, width),
             None => delta_rule_ir(heads, kv_heads, key_width, width),
         }
     }
@@ -191,6 +191,10 @@ fn launches(k: &Delta, step: &Step) -> Vec<Launch> {
         },
     };
     let mut launch = Launch::plain(step, &[jobs], shape);
+    let at = launch.args.len() - 1;
+    if k.site.state.is_some() {
+        launch.args.insert(at, k.keeping.keep(step));
+    }
     let at = launch.args.len() - 1;
     launch.args.insert(at, Arg::value(&k.site.scale));
     launch.args.push(Arg::size(k.keeping.rows(k.site.rows)));

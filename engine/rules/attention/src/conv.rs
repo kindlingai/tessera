@@ -47,14 +47,14 @@ slot_scan!(
         positions: Buf<U32>,
         mut state: BufMut<F32>,
         mut out: BufMut<F32>,
+        mut keep: BufMut<F32>,
         jobs: u32,
         rows: u32,
         #[build] width: u32,
         #[build] taps: u32,
         #[build] dilation: u32,
-        #[build] peek: u32,
     ),
-    [slots, positions, out, rows, peek],
+    [slots, positions, out, rows],
     [s, r, pos, at, last],
     setup: {
         if gid() >= jobs {
@@ -84,7 +84,7 @@ slot_scan!(
     },
     store: {
         for k in 0..hist_len {
-            state[base + (k * width) as u64] = hist[k as usize];
+            keep[base + (k * width) as u64] = hist[k as usize];
         }
     },
     row: {
@@ -129,7 +129,6 @@ pub(crate) struct Conv {
             self.width as u32,
             self.taps as u32,
             self.dilation as u32,
-            self.keeping.peeks(),
         )
     ),
     launches = rows_launches,
@@ -147,6 +146,8 @@ pub(crate) struct ConvRows {
 fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
     let jobs = k.seqs * k.width;
     let mut launch = Launch::plain(step, &[jobs], Shape::Line(jobs));
+    let at = launch.args.len() - 1;
+    launch.args.insert(at, k.keeping.keep(step));
     launch.args.push(Arg::size(k.keeping.rows(k.rows)));
     vec![launch]
 }

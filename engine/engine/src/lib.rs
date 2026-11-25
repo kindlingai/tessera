@@ -233,6 +233,8 @@ pub struct Engine {
     ple: Option<PleStore>,
     /// Whether slots carry state that a kept prefix cannot restore.
     stateful: bool,
+    /// Rows of the last verify, if all in slot 0.
+    verified: usize,
 }
 
 /// Inputs a launch feeds before its picks.
@@ -389,6 +391,7 @@ impl Engine {
             ranks: None,
             ple: None,
             stateful,
+            verified: 0,
         })
     }
 
@@ -489,7 +492,11 @@ impl Engine {
 
     /// Stores state after the last verify's first `rows` rows.
     pub fn commit(&mut self, rows: usize) -> Result<(), Error> {
-        let steps = self.runner.plan().commit();
+        let plan = self.runner.plan();
+        let steps = match rows == self.verified {
+            true => plan.promote(),
+            false => plan.commit(),
+        };
         if steps.is_empty() {
             return Ok(());
         }
@@ -600,6 +607,11 @@ impl Engine {
         let head = match peek {
             true => Head::Peek,
             false => Head::Full(None),
+        };
+        // A promotion copies slot 0 alone.
+        self.verified = match rows.iter().all(|r| r.slot == 0) {
+            true => rows.len(),
+            false => usize::MAX,
         };
         let outputs = self.run_local(rows, &all, head, wants)?;
         let mut ids = self.runner.ids(outputs[0])?;
