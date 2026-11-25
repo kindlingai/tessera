@@ -19,7 +19,7 @@ use tessera_testkit::{Noise, cosine_f32, max_abs_diff, weights};
 use tessera_trace::{DType, Dim, EntryKind, Graph, Model, Port, Role, TensorType, Weights};
 
 const NAME: &str = "glm53_moe";
-const KERNELS: [&str; 3] = ["glm53_route", "glm53_fc1", "glm53_fc2"];
+const KERNELS: [&str; 4] = ["glm53_route", "glm53_fc1", "glm53_fc2", "glm53_finish"];
 const TEXT: &str = include_str!("../../../../examples/recipes/glm53-moe/model/src/moe.cu");
 const ROWS: usize = 3;
 
@@ -334,7 +334,7 @@ fn matches_interp(book: &str, router_bf16: bool, tp: bool) {
                 let p = lower(&g, 0, &[(Rows, rows as u64)], &dev).unwrap();
                 assert_eq!(
                     p.steps.iter().map(|s| s.rule).collect::<Vec<_>>(),
-                    [NAME; 3]
+                    [NAME; 4]
                 );
                 plans.push(p);
             }

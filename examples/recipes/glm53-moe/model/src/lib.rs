@@ -6,6 +6,7 @@ const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
 const FC1: &str = "glm53_fc1";
 const FC2: &str = "glm53_fc2";
+const FINISH: &str = "glm53_finish";
 
 /// The routed weights, by field.
 const ROUTED: [&str; 13] = [
@@ -84,7 +85,7 @@ fn held(w: &Weights, experts: usize, ffn: usize) -> Option<[usize; 2]> {
     (whole_but(&INNER) && count == ffn && cut).then_some([0, experts])
 }
 
-/// Route+plan, fc1, then fc2+finish over a routed block.
+/// Route+plan, fc1, fc2, then finish over a routed block.
 fn offer(site: &Site) -> Option<Vec<Offer>> {
     let r = site.region(Kind::Moe)?;
     let [len] = r.outputs[..] else {
@@ -159,7 +160,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let [sh_k1, sh_book1] = width(&[shared_gate, shared_up])?;
     let [sh_k2, sh_book2] = width(&[shared_down])?;
     let picks = picks(experts)? as usize;
-    let [plan, gpart] = [0, 1].map(|draft| Place::Draft { draft });
+    let [plan, gpart, z] = [0, 1, 2].map(|draft| Place::Draft { draft });
     let chunks = ffn / 128;
     let ibs = hidden / 128;
     let ks1 = split_dim(ibs, if rows == 1 { 8 } else { 4 });
@@ -200,12 +201,10 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             .map(|f| [f.part(0), f.part(1)])
             .concat(),
     );
-    let gpart_len = total_slots * chunks * 2 * ks1 * max_col * 128;
-    let z_len = rows * (picks + 1) * chunks * hidden / 2;
     let fc1 = Offer {
         kernel: FC1,
         reads,
-        len: gpart_len + z_len,
+        len: total_slots * chunks * 2 * ks1 * max_col * 128,
         counts: fixed(&fc1_counts),
         shape: Shape::grid(chunks * 2 * ks1, total_slots, 256),
         work: (total_slots * 2 * hidden * ffn) as f64,
@@ -213,29 +212,40 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         ..Offer::default()
     };
     let mut reads = vec![plan, gpart];
-    reads.extend([gate_sv, up_sv, down_su, down, down_sv, signs_out].map(|f| f.read()));
+    reads.extend([gate_sv, up_sv, down_su, down].map(|f| f.read()));
     reads.extend([shared_gate.part(2), shared_up.part(2)]);
-    reads.extend([
-        shared_down.part(0),
-        shared_down.part(1),
-        shared_down.part(2),
-    ]);
+    reads.extend([shared_down.part(0), shared_down.part(1)]);
     let fc2 = Offer {
         kernel: FC2,
         reads,
-        len,
+        len: rows * (picks + 1) * chunks * hidden / 2,
         counts: fixed(&fc2_counts),
         shape: Shape::grid(chunks * ns2, total_slots, 256),
         work: (total_slots * hidden * ffn) as f64,
         guess: 1e-15,
         ..Offer::default()
     };
-    Some(vec![route, fc1, fc2])
+    let finish = Offer {
+        kernel: FINISH,
+        reads: vec![
+            plan,
+            down_sv.read(),
+            signs_out.read(),
+            shared_down.part(2),
+            z,
+        ],
+        len,
+        counts: fixed(&[rows, hidden, ffn, picks, wide]),
+        shape: Shape::grid(hidden / 128, rows, (picks + 1) * 32),
+        work: len as f64,
+        ..Offer::default()
+    };
+    Some(vec![route, fc1, fc2, finish])
 }
 
 tessera_guest::exports! {
     rules: { NAME => Kind::Moe },
-    kernels: { "moe.cu": [ROUTE, FC1, FC2] },
+    kernels: { "moe.cu": [ROUTE, FC1, FC2, FINISH] },
     propose: offer,
 }
 
