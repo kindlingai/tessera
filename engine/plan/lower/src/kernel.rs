@@ -1,11 +1,12 @@
 //! The kernel trait: what a plan step launches.
 
 use crate::abi::{Launch, Source};
+use crate::extent::Extent;
 use crate::plan::Step;
 use std::fmt;
 use std::sync::Arc;
 use tessera_engine_settings::Backend;
-use tessera_graph::{DType, Order};
+use tessera_graph::{DType, DimName, Order};
 use tessera_platform::Platform;
 use tessera_sim::ZoneKind;
 use tessera_work::Load;
@@ -79,6 +80,60 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     /// Set when one persistent grid runs the step.
     fn resident(&self) -> Option<Resident> {
         None
+    }
+    /// The twin that stores state this kernel leaves unchanged.
+    fn commit(&self) -> Option<KernelRef> {
+        None
+    }
+}
+
+/// A ragged kernel's treatment of its kept state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keeping {
+    /// Stores the state after its last row.
+    Stores,
+    /// Reads the state and leaves it unchanged.
+    Peeks,
+    /// Replays the first `COMMIT` rows, then stores.
+    Commits,
+}
+
+/// Sized when a launch leaves recurrent state unchanged.
+pub const PEEK: DimName = DimName::named("Peek");
+
+/// Rows a commit replays, bound at launch.
+pub const COMMIT: DimName = DimName::named("Commit");
+
+impl Keeping {
+    /// How `tree`'s launch treats recurrent state.
+    pub fn of(tree: &crate::Tree) -> Self {
+        match tree.size(PEEK) {
+            Some(_) => Keeping::Peeks,
+            None => Keeping::Stores,
+        }
+    }
+
+    /// The rows to scan, out of a launch's `rows`.
+    pub fn rows(self, rows: Extent) -> Extent {
+        match self {
+            Keeping::Commits => Extent::Dim {
+                name: COMMIT,
+                mul: 1,
+                add: 0,
+                most: rows.most(),
+            },
+            _ => rows,
+        }
+    }
+
+    /// One when the kernel skips its store.
+    pub fn peeks(self) -> u32 {
+        u32::from(self == Keeping::Peeks)
+    }
+
+    /// The committing twin `make` builds, for a peeking kernel.
+    pub fn twin<K: Kernel + 'static>(self, make: impl FnOnce(Keeping) -> K) -> Option<KernelRef> {
+        (self == Keeping::Peeks).then(|| KernelRef::new(make(Keeping::Commits)))
     }
 }
 

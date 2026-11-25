@@ -603,14 +603,6 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Whether any graph entry emits speculative taps.
-    pub fn has_taps(&self) -> bool {
-        self.g
-            .entries
-            .iter()
-            .any(|e| e.outputs.iter().any(|o| o.role == Role::Taps))
-    }
-
     /// This rank's part of a split weight.
     pub fn share(&self, t: T) -> Option<Share> {
         self.shares[t.0 as usize]

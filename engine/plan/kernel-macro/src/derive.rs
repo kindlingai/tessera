@@ -11,9 +11,9 @@ use syn::{
 };
 
 /// Keys that take `= expr`.
-const VALUES: [&str; 17] = [
+const VALUES: [&str; 18] = [
     "name", "threads", "sizes", "work", "needs", "order", "load", "accepts", "emits", "emits_at",
-    "guess", "runs_on", "source", "launches", "crate", "variant", "wire",
+    "guess", "runs_on", "source", "launches", "crate", "variant", "wire", "commit",
 ];
 
 /// Keys that stand alone.
@@ -269,6 +269,10 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
     let runs_on = line
         .expr("runs_on")
         .map(|e| quote!(fn runs_on(&self) -> #krate::ZoneKind { #e }));
+    let commit = line.expr("commit").map(|e| {
+        let call = applied(e, &[quote!(self)]);
+        quote!(fn commit(&self) -> Option<#krate::KernelRef> { #call })
+    });
     // An expression may read `body`, the kernel's tree.
     let load = line.expr("load").map(|e| {
         let call = applied(e, &[quote!(self), quote!(len)]);
@@ -314,6 +318,7 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
             #emits
             #emits_at
             #runs_on
+            #commit
             #shared
             #overwrite
         }

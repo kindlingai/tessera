@@ -423,14 +423,14 @@ pub(crate) fn run_speculate<D, S>(
         // A drafted round also reads taps.
         let (posterior, block_taps) = match drafts {
             Some(_) => {
-                let (ids, taps) = target.step_taps_local(&verify)?;
+                let (ids, taps) = target.verify_local(&verify)?;
                 (ids, Some(taps))
             }
             None => (target.step_local(&verify)?, None),
         };
         let (accepted, bonus) = accept(block, Target::Ids(&posterior));
-        if accepted < block.len() && target.stateful() && target.slots() > 1 {
-            target.restore_recurrent_slot(accepted + 1)?;
+        if drafts.is_some() {
+            target.commit(accepted + 1)?;
         }
         if drafts.is_some() && lead && !st.stopped {
             st.stats.steps += 1;

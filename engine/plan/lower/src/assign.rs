@@ -110,6 +110,12 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     for (v, _) in &s.outputs {
         last[v.0 as usize] = FOREVER;
     }
+    // A commit reads its step's inputs again.
+    for op in s.ops.iter().filter(|op| op.kernel.commit().is_some()) {
+        for v in &op.reads {
+            last[v.0 as usize] = FOREVER;
+        }
+    }
     let plan = Plan {
         id: Plan::fresh(),
         ranks: s.ranks,
@@ -132,6 +138,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     for (at, &i) in order.iter().enumerate() {
         b.step(at, i);
     }
+    b.commits();
     for (v, shape) in &s.outputs {
         let (slot, shape) = (b.slot(*v), shape.clone());
         b.plan.outputs.push(Output { slot, shape });
@@ -292,6 +299,22 @@ impl Buffers<'_> {
         };
         self.slots[v.0 as usize] = Some(slot);
         slot
+    }
+
+    /// Appends each peeking step's commit, writing spare scratch.
+    fn commits(&mut self) {
+        for at in 0..self.plan.steps.len() {
+            let Some(kernel) = self.plan.steps[at].kernel.commit() else {
+                continue;
+            };
+            let mut step = self.plan.steps[at].clone();
+            let zone = self.plan.zone(step.write.buffer);
+            let arena = self.scratch.get_mut(&zone).expect("written in scratch");
+            step.write.offset = arena.alloc(step.write.bytes());
+            step.kernel = kernel;
+            self.plan.steps.push(step);
+            self.plan.commits += 1;
+        }
     }
 
     fn free_scratch(&mut self, slot: Slot) {

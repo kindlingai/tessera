@@ -346,17 +346,9 @@ pub fn load(
     let draft_over = overrides.under("draft");
     let config = draft_over.config(draft_dir, |k| Config::read(k, &spec, slots, context))?;
     let tap_layers = config.tap_layers();
-    let stateful_target = std::fs::read_to_string(target_dir.join("config.json"))
-        .map(|s| s.contains("linear_attention") || s.contains("qwen4_exp") || s.contains("qwen3_5"))
-        .unwrap_or(false);
-    let target_slots = if stateful_target {
-        slots.max(config.block_size + 1)
-    } else {
-        slots
-    };
     let target = load_tapped(
         target_dir,
-        [target_slots, context],
+        [slots, context],
         user,
         Steps::Plain,
         overrides,

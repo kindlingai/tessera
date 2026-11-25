@@ -9,11 +9,14 @@ use tessera_engine::comm::Sockets;
 use tessera_engine::qwen4_exp::{Config, Moe, Ple, RotatedMoe, program, stepper};
 use tessera_engine::qwen35::{Mixing, Recurrent};
 use tessera_engine::{
-    Batch, Bf16, Engine, Event, Fair, Pick, PleConfig, PleStore, Recipe, Request, Row, Settings,
-    Stack, Tensor, Weight,
+    Batch, Bf16, Drafter, Engine, Event, Fair, Pick, PleConfig, PleStore, Recipe, Request, Row,
+    Settings, Speculate, Stack, Tensor, Weight,
 };
 use tessera_graph::Parts;
 use tessera_lower::Cluster;
+use tessera_models::dflash::{self, TargetSpec};
+use tessera_run::testing::runs;
+use tessera_testkit::{Noise, weights};
 
 fn tiny_config() -> Config {
     Config {
@@ -371,4 +374,82 @@ fn stateful_skips_no_prefix() {
     let mut fresh = ple_engine(None);
     let want = answer(&mut Batch::new(&mut fresh, Box::new(Fair)), longer);
     assert_eq!(collect_ids(&events), collect_ids(&want));
+}
+
+fn bits(floats: &[f32]) -> Vec<u32> {
+    floats.iter().map(|x| x.to_bits()).collect()
+}
+
+/// A tapped tiny model with its own PLE store.
+fn tapped_engine(g: &tessera_engine::Graph, settings: &Settings) -> Engine {
+    let mut engine = open_target(g, &weights(g, &mut Noise(3)), 16, settings);
+    engine.set_ple(PleStore::open(make_ple_table().1).unwrap());
+    engine
+}
+
+/// A verify then a commit store what plain steps store.
+#[test]
+fn commit_matches_steps() {
+    let mut c = tiny_config();
+    c.stack.taps = vec![1, 2];
+    let g = stepper::<Moe>(&c);
+    let (mut prompt, mut drafts) = (Vec::new(), Vec::new());
+    let seq = [1u32, 3, 5, 2, 7, 4, 9, 6];
+    push_rows(&mut prompt, 0, &seq, 0..4);
+    push_rows(&mut drafts, 0, &seq, 4..8);
+    for settings in runs() {
+        for kept in 1..=drafts.len() {
+            let mut spec = tapped_engine(&g, &settings);
+            let mut plain = tapped_engine(&g, &settings);
+            spec.step_taps(&prompt).unwrap();
+            plain.step_taps(&prompt).unwrap();
+            let before = spec.recurrent_state().unwrap();
+            let (ids, taps) = spec.verify(&drafts).unwrap();
+            assert_eq!(bits(&spec.recurrent_state().unwrap()), bits(&before));
+            spec.commit(kept).unwrap();
+            let (want_ids, want_taps) = plain.step_taps(&drafts[..kept]).unwrap();
+            assert_eq!(ids[..kept], want_ids);
+            assert_eq!(bits(&taps[..want_taps.len()]), bits(&want_taps));
+            let (got, want) = (spec.recurrent_state(), plain.recurrent_state());
+            assert_eq!(bits(&got.unwrap()), bits(&want.unwrap()));
+        }
+    }
+}
+
+/// DFlash over recurrent state decodes as greedy does.
+#[test]
+fn stateful_dflash_greedy() {
+    let mut c = tiny_config();
+    let spec = TargetSpec {
+        vocab: c.stack.vocab,
+        hidden: c.stack.hidden,
+        layers: c.stack.layers,
+        tied: c.tied,
+    };
+    let d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 16);
+    c.stack.taps = d_cfg.tap_layers();
+    let g = stepper::<Moe>(&c);
+    let d_graph = dflash::stepper::<()>(&d_cfg);
+    let request = || Request {
+        tokens: vec![1, 3, 5, 2],
+        max_tokens: 10,
+        ..Request::default()
+    };
+    for settings in runs() {
+        let mut baseline = tapped_engine(&g, &settings);
+        let mut target = tapped_engine(&g, &settings);
+        let recipe = Recipe::default();
+        let mut drafter = Drafter::open(d_graph.clone(), 16, 4, 0, &recipe, &settings).unwrap();
+        drafter.load(&float_weights(&d_graph, 23)).unwrap();
+        let (mut want, mut got) = (Vec::new(), Vec::new());
+        baseline.generate(request(), &mut |e| want.push(e)).unwrap();
+        let mut run = Speculate::new(&mut target, &mut drafter).unwrap();
+        let emit = &mut |e| {
+            got.push(e);
+            true
+        };
+        let stats = run.generate(request(), emit).unwrap();
+        assert_eq!(collect_ids(&got), collect_ids(&want));
+        assert!(stats.steps > 0);
+    }
 }

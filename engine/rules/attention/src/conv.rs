@@ -4,7 +4,8 @@ use crate::slots::slot_scan;
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
 use tessera_lower::{
-    Arg, Draft, Extent, GUESS, Kernel, Launch, Read, Shape, Step, T, Term, Tree, source,
+    Arg, Draft, Extent, GUESS, Keeping, Kernel, KernelRef, Launch, Read, Shape, Step, T, Term,
+    Tree, source,
 };
 
 /// Largest history depth held in thread registers.
@@ -51,10 +52,9 @@ slot_scan!(
         #[build] width: u32,
         #[build] taps: u32,
         #[build] dilation: u32,
-        #[build] seqs: u32,
-        #[build] snap: u32,
+        #[build] peek: u32,
     ),
-    [slots, positions, out, rows],
+    [slots, positions, out, rows, peek],
     [s, r, pos, at, last],
     setup: {
         if gid() >= jobs {
@@ -101,12 +101,6 @@ slot_scan!(
         }
         hist[(hist_len - 1) as usize] = cur;
         last = sum;
-        if snap != 0 && s == 0 && rows > 1 && rows < seqs {
-            let sb = ((r + 1) * hist_len) as u64 * width as u64 + c as u64;
-            for k in 0..hist_len {
-                state[sb + (k * width) as u64] = hist[k as usize];
-            }
-        }
     },
 );
 
@@ -135,11 +129,11 @@ pub(crate) struct Conv {
             self.width as u32,
             self.taps as u32,
             self.dilation as u32,
-            self.seqs as u32,
-            u32::from(self.snap),
+            self.keeping.peeks(),
         )
     ),
     launches = rows_launches,
+    commit = rows_commit,
 )]
 pub(crate) struct ConvRows {
     seqs: usize,
@@ -147,14 +141,18 @@ pub(crate) struct ConvRows {
     width: usize,
     taps: usize,
     dilation: usize,
-    snap: bool,
+    keeping: Keeping,
 }
 
 fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
     let jobs = k.seqs * k.width;
     let mut launch = Launch::plain(step, &[jobs], Shape::Line(jobs));
-    launch.args.push(Arg::size(k.rows));
+    launch.args.push(Arg::size(k.keeping.rows(k.rows)));
     vec![launch]
+}
+
+fn rows_commit(k: &ConvRows) -> Option<KernelRef> {
+    k.keeping.twin(|keeping| ConvRows { keeping, ..*k })
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
@@ -181,7 +179,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             width,
             taps,
             dilation,
-            snap: tree.has_taps() && seqs > 1,
+            keeping: Keeping::of(tree),
         };
         let reads = [
             Read::Node(x),

@@ -176,6 +176,8 @@ pub struct Plan {
     /// Which of them this plan is for.
     pub rank: u32,
     pub steps: Vec<Step>,
+    /// Trailing steps that only a commit runs.
+    pub commits: usize,
     /// Each used graph weight.
     pub weights: Vec<Loaded>,
     /// Each kept-row buffer, holding this launch's rows too.
@@ -210,6 +212,16 @@ impl Plan {
     pub fn rows(&self, weight: u32) -> Option<(usize, usize)> {
         let (axis, first, count) = self.share(weight)?;
         (axis == 0).then_some((first, count))
+    }
+
+    /// The steps every launch runs.
+    pub fn forward(&self) -> std::ops::Range<usize> {
+        0..self.steps.len() - self.commits
+    }
+
+    /// The steps a commit runs after them.
+    pub fn commit(&self) -> std::ops::Range<usize> {
+        self.forward().end..self.steps.len()
     }
 
     /// The weakest order any of its kernels sums in.

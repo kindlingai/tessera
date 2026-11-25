@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tessera_graph::DimName::{Candidates, Context, Picks, Rows, Segments, Seqs, VocabWords};
 use tessera_graph::{EntryKind, Role};
-use tessera_lower::{Cache, Device, Report, Slot, Wants};
+use tessera_lower::{COMMIT, Cache, Device, PEEK, Report, Slot, Wants};
 use tessera_run::{Run, open};
 
 mod batch_dual;
@@ -241,6 +241,8 @@ pub(crate) enum Head {
     Full(Option<Vec<u32>>),
     /// The sparse entry, with `k` candidate ids per pick.
     Sparse(Vec<u32>, usize),
+    /// The full entry, leaving recurrent state for a commit.
+    Peek,
 }
 
 /// A token at a position, in a slot's sequence.
@@ -451,14 +453,6 @@ impl Engine {
         self.taps.ok_or(Error::Taps)
     }
 
-    /// Tap width for DFlash, allowing stateful rollback slots.
-    pub(crate) fn dflash_taps(&self, block: usize) -> Result<usize, Error> {
-        if self.stateful && self.slots <= block {
-            return Err(Error::Stateful);
-        }
-        self.taps.ok_or(Error::Taps)
-    }
-
     /// Fast-path diagnostic report for a `rows`-row decode launch.
     pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
         let rows = rows.max(1);
@@ -493,29 +487,27 @@ impl Engine {
         self.words
     }
 
-    /// Restores slot 0 recurrent state from `from_slot`.
-    pub(crate) fn restore_recurrent_slot(&mut self, from_slot: usize) -> Result<(), Error> {
-        if from_slot == 0 || from_slot >= self.slots {
+    /// Stores state after the last verify's first `rows` rows.
+    pub fn commit(&mut self, rows: usize) -> Result<(), Error> {
+        let steps = self.runner.plan().commit();
+        if steps.is_empty() {
             return Ok(());
         }
+        self.runner.bind(COMMIT, rows as u32);
+        Ok(self.runner.submit(steps)?)
+    }
+
+    /// Every slot's recurrent state, one kept buffer after another.
+    pub fn recurrent_state(&self) -> Result<Vec<f32>, Error> {
         let plan = self.runner.plan();
-        let copies: Vec<(Slot, u64, usize)> = plan
-            .kept
-            .iter()
-            .zip(&plan.kept_info)
-            .filter_map(|(&(_, slot), info)| {
-                if info.context != 1 || (info.slots as usize) <= from_slot {
-                    return None;
-                }
-                let addr = self.runner.address(slot)?;
-                let per_slot = slot.bytes() / info.slots as usize;
-                Some((slot, addr + (from_slot * per_slot) as u64, per_slot))
-            })
-            .collect();
-        for (slot, src_addr, bytes) in copies {
-            self.runner.copy_from(slot, 0, src_addr, bytes)?;
+        let mut all = Vec::new();
+        for ((_, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+            if info.context == 1 {
+                let raw = self.runner.read(*slot)?;
+                all.extend_from_slice(raw.floats().map_err(tessera_run::Error::from)?);
+            }
         }
-        Ok(())
+        Ok(all)
     }
 
     /// Floats per tapped row, if the full entry emits taps.
@@ -579,10 +571,37 @@ impl Engine {
         &mut self,
         rows: &[Row],
     ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
+        self.tapped(rows, false)
+    }
+
+    /// As `step_taps_local`, leaving recurrent state for `commit`.
+    pub(crate) fn verify_local(
+        &mut self,
+        rows: &[Row],
+    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
+        self.tapped(rows, self.stateful)
+    }
+
+    /// A tapped launch that leaves recurrent state for `commit`.
+    pub fn verify(&mut self, rows: &[Row]) -> Result<(Vec<u32>, Vec<f32>), Error> {
+        let width = self.taps.ok_or(Error::Taps)?;
+        let (ids, taps) = self.verify_local(rows)?;
+        Ok((ids, taps.into_host(self.runner.as_ref(), width)?))
+    }
+
+    fn tapped(
+        &mut self,
+        rows: &[Row],
+        peek: bool,
+    ) -> Result<(Vec<u32>, spec_loop::TapsBuf), Error> {
         let width = self.taps.ok_or(Error::Taps)?;
         let all: Vec<u32> = (0..rows.len() as u32).collect();
         let wants = Wants::roles(&self.graph, 0, &[Role::Tokens, Role::Taps]);
-        let outputs = self.run_local(rows, &all, Head::Full(None), wants)?;
+        let head = match peek {
+            true => Head::Peek,
+            false => Head::Full(None),
+        };
+        let outputs = self.run_local(rows, &all, head, wants)?;
         let mut ids = self.runner.ids(outputs[0])?;
         ids.truncate(rows.len());
         let slot = outputs[1];
@@ -707,7 +726,7 @@ impl Engine {
     /// The entry `head` launches.
     fn entry(&self, head: &Head) -> Result<usize, Error> {
         match head {
-            Head::Full(_) => Ok(self.full),
+            Head::Full(_) | Head::Peek => Ok(self.full),
             Head::Sparse(..) => self.sparse.ok_or(Error::Scores),
         }
     }
@@ -770,6 +789,10 @@ impl Engine {
         let (mut masks, mut listed) = match head {
             Head::Full(masks) => (masks, None),
             Head::Sparse(ids, k) => (None, Some((ids, k))),
+            Head::Peek => {
+                sizes.push((PEEK, 1));
+                (None, None)
+            }
         };
         let mut feeds = Vec::new();
         for port in &self.graph.entries[entry].inputs {
@@ -834,7 +857,7 @@ impl Engine {
         let views: Vec<_> = feeds.iter().map(Tensor::view).collect();
         self.runner.feed(&views)?;
         let fed = Instant::now();
-        self.runner.submit(0..self.runner.plan().steps.len())?;
+        self.runner.submit(self.runner.plan().forward())?;
         let ran = Instant::now();
         let phases = [
             ("engine: plan", start, planned),
