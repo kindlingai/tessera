@@ -89,7 +89,7 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
 
     if (p_begin >= p_end) {
         if (tid < 16u) {
-            u64 out_base = (u64(row * heads + h0 + tid) * splits + split) * 578ull;
+            u64 out_base = (u64(row * heads + h0 + tid) * splits + split) * 580ull;
             part[out_base + 576ull] = mla_neg_inf();
             part[out_base + 577ull] = 0.0f;
         }
@@ -246,8 +246,8 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
         }
     }
 
-    float* p_g = part + (u64(row * heads + h0 + g) * splits + split) * 578ull;
-    float* p_g8 = part + (u64(row * heads + h0 + g + 8u) * splits + split) * 578ull;
+    float* p_g = part + (u64(row * heads + h0 + g) * splits + split) * 580ull;
+    float* p_g8 = part + (u64(row * heads + h0 + g + 8u) * splits + split) * 580ull;
 #pragma unroll
     for (u32 nt = 0u; nt < 18u; nt++) {
         u32 col2 = d_base + nt * 8u + (t << 1);
@@ -255,7 +255,7 @@ static __device__ __forceinline__ void mla_attend_body(const float* q, const voi
         *reinterpret_cast<float2*>(p_g8 + col2) = make_float2(o[nt][2], o[nt][3]);
     }
     if (tid < 16u) {
-        u64 out_base = (u64(row * heads + h0 + tid) * splits + split) * 578ull;
+        u64 out_base = (u64(row * heads + h0 + tid) * splits + split) * 580ull;
         part[out_base + 576ull] = sm.m[tid];
         part[out_base + 577ull] = sm.l[tid];
     }
@@ -292,19 +292,19 @@ extern "C" __global__ __launch_bounds__(128, 2) void tessera_mla_attend_f32(
 }
 
 // Combines split-K MLA partials for one row and head.
-extern "C" __global__ __launch_bounds__(256, 4) void tessera_mla_reduce(
+extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
     const float* part, float* out, u32 lists, u32 splits) {
     u32 list = blockIdx.x;
     if (list >= lists) return;
     u32 tid = threadIdx.x;
-    __shared__ float s_m[64];
-    __shared__ float s_l[64];
-    __shared__ float s_w[64];
+    __shared__ float s_m[32];
+    __shared__ float s_l[32];
+    __shared__ float s_w[32];
     __shared__ float s_inv;
-    const float* base = part + u64(list) * splits * 578ull;
+    const float* base = part + u64(list) * splits * 580ull;
     if (tid < splits) {
-        s_m[tid] = base[u64(tid) * 578ull + 576ull];
-        s_l[tid] = base[u64(tid) * 578ull + 577ull];
+        s_m[tid] = base[u64(tid) * 580ull + 576ull];
+        s_l[tid] = base[u64(tid) * 580ull + 577ull];
     }
     prim::block_sync();
     if (tid == 0u) {
@@ -321,15 +321,22 @@ extern "C" __global__ __launch_bounds__(256, 4) void tessera_mla_reduce(
         s_inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     }
     prim::block_sync();
-    float inv = s_inv;
-    float* dst = out + u64(list) * 576ull;
-    for (u32 d = tid; d < 576u; d += 256u) {
-        float sum = 0.0f;
+    if (tid < 144u) {
+        float inv = s_inv;
+        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        u32 d4 = tid << 2;
         for (u32 s = 0u; s < splits; s++) {
             float w = s_w[s];
-            if (w > 0.0f) sum += base[u64(s) * 578ull + d] * w;
+            if (w > 0.0f) {
+                float4 v = *reinterpret_cast<const float4*>(base + u64(s) * 580ull + d4);
+                sum.x = fmaf(v.x, w, sum.x);
+                sum.y = fmaf(v.y, w, sum.y);
+                sum.z = fmaf(v.z, w, sum.z);
+                sum.w = fmaf(v.w, w, sum.w);
+            }
         }
-        dst[d] = sum * inv;
+        *reinterpret_cast<float4*>(out + u64(list) * 576ull + d4) =
+            make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
     }
 }
 

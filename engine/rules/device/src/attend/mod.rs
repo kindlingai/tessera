@@ -12,7 +12,7 @@ use tessera_lower::{
 
 const KERNEL: &str = include_str!("mla.cu");
 const WIDTH: usize = 576;
-const PART_STRIDE: usize = WIDTH + 2;
+const PART_STRIDE: usize = WIDTH + 4;
 const SMEM_BYTES: usize = 42_240;
 
 fn mla_entry(entry: &'static str) -> Source {
@@ -46,13 +46,13 @@ fn entry_for(kv: &str) -> Option<&'static str> {
 fn mla_splits(rows: usize, hgroups: usize) -> usize {
     let groups = rows * hgroups;
     if groups <= 4 {
-        32
-    } else if groups <= 8 {
         16
-    } else if groups <= 16 {
+    } else if groups <= 8 {
         8
-    } else {
+    } else if groups <= 16 {
         4
+    } else {
+        2
     }
 }
 
@@ -178,8 +178,8 @@ fn red_accepts(_: &MlaReduce, _: usize, form: &dyn Stored) -> bool {
 fn red_needs() -> Needs {
     Needs {
         lanes: 32,
-        group_bytes: 4 * 64 * 3 + 4,
-        group_threads: 256,
+        group_bytes: 4 * 32 * 3 + 4,
+        group_threads: 160,
         compiler: true,
         lacks: CUDA_LACKS,
         ..Needs::default()
@@ -188,8 +188,8 @@ fn red_needs() -> Needs {
 
 fn red_load(r: &MlaReduce, _: usize) -> Option<Load> {
     Some(Load {
-        threads: r.lists * 256,
-        group: 256,
+        threads: r.lists * 160,
+        group: 160,
         trips: r.splits as f64,
         reads: vec![(4 * r.lists * r.splits * PART_STRIDE) as f64],
         written: (4 * r.lists * WIDTH) as f64,
@@ -202,7 +202,7 @@ fn red_launches(r: &MlaReduce, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: r.lists,
         down: 1,
-        threads: 256,
+        threads: 160,
     };
     let args = vec![
         step.read(0),
