@@ -197,12 +197,10 @@ impl Chip for Nvidia {
             true => peak.min(flight * busy / wait),
             false => peak,
         };
-        // A warp's load costs more the more lines it touches.
+        // Loads that walk a thread's own lines scatter.
         let apart = (l.threads.min(32) as f64 - 1.0) / 31.0;
-        let stall = match t.fresh < 1.0 {
-            true => s.gather.value + (s.scatter.value - s.gather.value) * apart,
-            false => s.gather.value,
-        };
+        let walked = (1.0 - t.fresh).clamp(0.0, 1.0);
+        let stall = s.gather.value + (s.scatter.value - s.gather.value) * apart * walked;
         let tiles = t.shared * s.staged.value + (t.tile_flops + t.bf16_flops / SPLIT) * s.mma.value;
         let waits = t.steps() * s.chain.value + t.loads * stall + tiles;
         let chain = rounds * l.trips * waits;

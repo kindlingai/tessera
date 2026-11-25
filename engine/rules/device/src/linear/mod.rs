@@ -10,7 +10,8 @@ use tessera_graph::{Op, Order, Stage, View};
 use tessera_lower::Backend as LowerBackend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
-    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
+    Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Term,
+    Tree,
 };
 
 pub(crate) const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBackend::Rocm];
@@ -391,6 +392,18 @@ fn why_trellis(tree: &Tree, at: T) -> Option<String> {
     eval_trellis(tree, at)?.err()
 }
 
+/// One thread's trip. Bf16 widens with one integer op.
+fn trip(float: usize, int: usize, loads: usize, bytes: usize) -> Ops {
+    Ops {
+        float: float as f64,
+        int: int as f64,
+        loads: loads as f64,
+        width: bytes as f64 / loads as f64,
+        fresh: 1.0,
+        ..Ops::default()
+    }
+}
+
 pub(crate) fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
     form.name() == "f32"
 }
@@ -475,15 +488,25 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
     } else {
         (k.batches * k.n).div_ceil(WARPS) * rtiles
     };
-    let trips = if k.wide {
-        k.k as f64 / WARPS as f64
+    // A trip reads weights and each row's x.
+    let (trips, trip) = if k.wide {
+        let r = k.rows.min(4);
+        // A warp shares each x, a quarter line a trip.
+        let trip = Ops {
+            width: (8.0 + r as f64 / 8.0) / (1 + r) as f64,
+            fresh: (1.0 + 0.25 * r as f64) / (1 + r) as f64,
+            ..trip(4 * r, 4, 1 + r, 0)
+        };
+        (k.k as f64 / WARPS as f64, trip)
     } else {
-        k.k as f64 / 256.0
+        let r = k.rows.min(8);
+        (k.k as f64 / 256.0, trip(8 * r, 8, 1 + 2 * r, 16 + 32 * r))
     };
     Some(Load {
         threads: groups * THREADS,
         group: THREADS,
         trips,
+        trip,
         reads: vec![
             (2 * k.batches * rtiles * k.n * k.k) as f64,
             (4 * k.batches * k.rows * k.k) as f64,
