@@ -62,14 +62,11 @@ where
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
     let wire = args.sum_wire.unwrap_or(DType::F32);
-    let bf16 = wire == DType::Bf16;
     let mut p2p = P2p::on(ctx, &mut *boot, &args.shape)?.with_schedule(args.sched);
-    let close = |got: f32, want: f32| {
-        if bf16 {
-            (got - want).abs() <= want.abs() * 0.02 + 1e-2
-        } else {
-            got == want
-        }
+    let close = |got: f32, want: f32| match wire {
+        DType::Bf16 => (got - want).abs() <= want.abs() * 0.02 + 1e-2,
+        DType::Fp8 => (got - want).abs() <= want.abs() * 0.12 + 2.0,
+        _ => got == want,
     };
     let bytes = n * 4;
     let from = DeviceBuffer::alloc(ctx, bytes)?;

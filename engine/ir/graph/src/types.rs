@@ -8,6 +8,7 @@ pub enum DType {
     F32,
     Bf16,
     F16,
+    Fp8,
     I32,
     U32,
     U8,
@@ -20,24 +21,25 @@ impl DType {
         match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::Bf16 | DType::F16 => 2,
-            DType::U8 | DType::Bool => 1,
+            DType::Fp8 | DType::U8 | DType::Bool => 1,
         }
     }
 
     pub fn is_float(self) -> bool {
-        matches!(self, DType::F32 | DType::Bf16 | DType::F16)
+        matches!(self, DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8)
     }
 
     pub fn is_int(self) -> bool {
         matches!(self, DType::I32 | DType::U32)
     }
 
-    /// `x` as this float dtype: ties to even, F16 saturates.
+    /// `x` as this float dtype: ties to even, narrow saturate.
     pub fn round(self, x: f32) -> f32 {
         const TOP: f32 = 65504.0;
         match self {
             DType::Bf16 => f32::from(crate::scalar::Bf16::from(x)),
             DType::F16 => f32::from(crate::scalar::F16::from(x.clamp(-TOP, TOP))),
+            DType::Fp8 => f32::from(crate::scalar::E4M3::from(x)),
             _ => x,
         }
     }

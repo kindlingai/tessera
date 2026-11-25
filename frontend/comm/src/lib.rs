@@ -89,12 +89,13 @@ pub fn sums_flag(value: &str) -> Option<Sums> {
     }
 }
 
-/// Parses `--sum-wire f32|bf16|f16`, the wire dtype for unpinned sums.
+/// Parses `--sum-wire f32|bf16|f16|fp8`, the unpinned sum wire dtype.
 pub fn sum_wire_flag(value: &str) -> Option<DType> {
     match value {
         "f32" => Some(DType::F32),
         "bf16" => Some(DType::Bf16),
         "f16" | "fp16" => Some(DType::F16),
+        "fp8" | "f8" => Some(DType::Fp8),
         _ => None,
     }
 }

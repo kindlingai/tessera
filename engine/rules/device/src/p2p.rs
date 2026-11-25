@@ -16,6 +16,7 @@ const ENTRY: &str = "tessera_p2p_sum";
 const GATHER_ENTRY: &str = "tessera_p2p_gather";
 const BF16_ENTRY: &str = "tessera_p2p_sum_bf16";
 const FP16_ENTRY: &str = "tessera_p2p_sum_fp16";
+const FP8_ENTRY: &str = "tessera_p2p_sum_fp8";
 
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
@@ -145,6 +146,7 @@ pub struct P2p<D: Device> {
     gather_kernel: D::Kernel,
     bf16_kernel: D::Kernel,
     fp16_kernel: D::Kernel,
+    fp8_kernel: D::Kernel,
     _peers: Peers<D>,
     _area: DeviceBuffer<D>,
     areas: DeviceBuffer<D>,
@@ -235,6 +237,7 @@ where
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
         let bf16_kernel = ctx.compile(&text, BF16_ENTRY)?;
         let fp16_kernel = ctx.compile(&text, FP16_ENTRY)?;
+        let fp8_kernel = ctx.compile(&text, FP8_ENTRY)?;
 
         let area = DeviceBuffer::alloc(ctx, area_bytes(ranks))?;
         area.zero()?;
@@ -286,6 +289,7 @@ where
             gather_kernel,
             bf16_kernel,
             fp16_kernel,
+            fp8_kernel,
             _peers: peers,
             _area: area,
             areas,
@@ -337,6 +341,7 @@ where
         let kernel = match wire {
             DType::Bf16 => &self.bf16_kernel,
             DType::F16 => &self.fp16_kernel,
+            DType::Fp8 => &self.fp8_kernel,
             _ => &self.kernel,
         };
         Ok(self.ctx.launch(kernel, blocks, threads, 0, &mut args)?)
@@ -421,7 +426,7 @@ where
     }
 
     fn carries(&self, wire: DType) -> bool {
-        matches!(wire, DType::F32 | DType::Bf16 | DType::F16)
+        matches!(wire, DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8)
     }
 
     fn gather(

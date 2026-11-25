@@ -25,7 +25,7 @@ const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH 
   [--model NAME] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
   [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--shape KERNEL:KNOB=N]... [--sums host|grid|p2p]
-  [--sum-wire f32|bf16|f16] [--recipe DIR] [--require-favored]
+  [--sum-wire f32|bf16|f16|fp8] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
   persistent grid per rank, over that fabric or the file. --sums p2p runs

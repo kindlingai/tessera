@@ -154,9 +154,11 @@ fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {
         format!("{op:?} {want} numerics")
     })?;
     let acc = n.map(|n| n.accumulate);
-    need(acc.is_none_or(DType::is_float), ErrorKind::Numerics, || {
-        format!("accumulator {acc:?} is not a float")
-    })?;
+    need(
+        acc.is_none_or(|a| matches!(a, DType::F32 | DType::Bf16 | DType::F16)),
+        ErrorKind::Numerics,
+        || format!("accumulator {acc:?} is not F32, Bf16 or F16"),
+    )?;
     let Some(Numerics {
         accumulate,
         wire: Some(wire),
@@ -168,10 +170,10 @@ fn numerics(op: &Op, n: Option<&Numerics>) -> Result<(), TypeError> {
     need(sums_ranks(op), ErrorKind::Numerics, || {
         format!("{op:?} sums on one rank but has a wire dtype")
     })?;
-    let carried =
-        matches!(wire, DType::F32 | DType::Bf16 | DType::F16) && wire.bytes() <= accumulate.bytes();
+    let carried = matches!(wire, DType::F32 | DType::Bf16 | DType::F16 | DType::Fp8)
+        && wire.bytes() <= accumulate.bytes();
     need(carried, ErrorKind::Numerics, || {
-        format!("wire {wire:?} must be F32, Bf16 or F16 and no wider than {accumulate:?}")
+        format!("wire {wire:?} must be F32, Bf16, F16 or Fp8 and no wider than {accumulate:?}")
     })
 }
 

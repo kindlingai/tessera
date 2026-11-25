@@ -12,7 +12,7 @@ use tessera_frontend_comm::{
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
 [--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|p2p|whole] \
-[--sum-wire f32|bf16|f16] [--moe ep|tp]]";
+[--sum-wire f32|bf16|f16|fp8] [--moe ep|tp]]";
 
 /// Sums and control transports, and any grid.
 pub(crate) type Links = ([Box<dyn Transport>; 2], Grids);

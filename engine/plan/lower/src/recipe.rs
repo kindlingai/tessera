@@ -231,6 +231,7 @@ fn wire(value: &str) -> Result<DType, String> {
         "f32" => Ok(DType::F32),
         "bf16" => Ok(DType::Bf16),
         "f16" => Ok(DType::F16),
+        "fp8" => Ok(DType::Fp8),
         _ => Err(format!("no wire dtype called {value}")),
     }
 }

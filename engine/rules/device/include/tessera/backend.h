@@ -174,9 +174,14 @@ TESSERA_FN u16 to_bf16(float x) {
     return static_cast<u16>(to_bf16x2(x, 0.0f));
 }
 
+// Widens one BF16 value to FP32.
+TESSERA_FN float from_bf16(u16 h) {
+    return from_bits(u32(h) << 16);
+}
+
 // `x` rounded to BF16 and back.
 TESSERA_FN float round_bf16(float x) {
-    return from_bits(u32(to_bf16(x)) << 16);
+    return from_bf16(to_bf16(x));
 }
 
 // `x` within the finite FP16 range. NaN stays NaN.
@@ -255,6 +260,110 @@ TESSERA_FN float from_fp16(u16 h) {
 // `x` rounded to FP16 and back.
 TESSERA_FN float round_fp16(float x) {
     return from_fp16(to_fp16(x));
+}
+
+// Packs one float as OCP E4M3, saturating at 448.
+TESSERA_FN u8 to_e4m3(float x) {
+    u32 bits = __float_as_uint(x);
+    u32 sign = (bits >> 24) & 0x80u;
+    u32 mag = bits & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) return static_cast<u8>(sign | 0x7Fu);
+    if (mag >= 0x43E00000u) return static_cast<u8>(sign | 0x7Eu);
+    if (mag < 0x3C800000u) {
+        float s = (from_bits(mag) * 512.0f + 8388608.0f) - 8388608.0f;
+        return static_cast<u8>(sign | static_cast<u32>(s));
+    }
+    u32 nudge = 0x7FFFFu + ((mag >> 20) & 1u);
+    u32 r = (mag + nudge) & ~0xFFFFFu;
+    if (r >= 0x43E00000u) return static_cast<u8>(sign | 0x7Eu);
+    return static_cast<u8>(sign | (((r >> 23) - 120u) << 3) | ((r >> 20) & 7u));
+}
+
+// Widens one OCP E4M3 byte to FP32.
+TESSERA_FN float from_e4m3(u8 b) {
+    u32 sign = u32(b & 0x80u) << 24;
+    u32 exp = (b >> 3) & 0xFu;
+    u32 man = b & 7u;
+    if (exp == 0u) {
+        if (man == 0u) return from_bits(sign);
+        float f = float(man) * (1.0f / 512.0f);
+        return sign ? -f : f;
+    }
+    if (exp == 15u && man == 7u) return from_bits(sign | 0x7FC00000u);
+    return from_bits(sign | ((exp + 120u) << 23) | (man << 20));
+}
+
+// Packs four floats into four OCP E4M3 bytes.
+TESSERA_FN u32 to_e4m3x4(float4 v) {
+#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    u16 lo, hi;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v.y), "f"(v.x));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(v.w), "f"(v.z));
+    return u32(lo) | (u32(hi) << 16);
+#else
+    return u32(to_e4m3(v.x)) | (u32(to_e4m3(v.y)) << 8) | (u32(to_e4m3(v.z)) << 16) |
+           (u32(to_e4m3(v.w)) << 24);
+#endif
+}
+
+// Widens four OCP E4M3 bytes into four floats.
+TESSERA_FN float4 from_e4m3x4(u32 p) {
+#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    u32 h0, h1;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h0) : "h"(static_cast<u16>(p)));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h1) : "h"(static_cast<u16>(p >> 16)));
+    return make_float4(from_fp16(static_cast<u16>(h0)), from_fp16(static_cast<u16>(h0 >> 16)),
+                       from_fp16(static_cast<u16>(h1)), from_fp16(static_cast<u16>(h1 >> 16)));
+#else
+    return make_float4(from_e4m3(static_cast<u8>(p)), from_e4m3(static_cast<u8>(p >> 8)),
+                       from_e4m3(static_cast<u8>(p >> 16)), from_e4m3(static_cast<u8>(p >> 24)));
+#endif
+}
+
+struct Fp8Blk {
+    uint4 q;
+    u16 s;
+};
+
+TESSERA_FN float4 add4(float4 a, float4 b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+TESSERA_FN float4 scale4(float4 v, float s) {
+    return make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+}
+
+TESSERA_FN float max4_abs(float4 v) {
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+}
+
+// Rounds `amax / 448` up to normal BF16 without clipping.
+TESSERA_FN u16 scale_bf16(float amax) {
+    if (amax == 0.0f) return 0u;
+    if (!(amax > 0.0f)) return 0x3F80u;
+    u32 bits = __float_as_uint(amax / 448.0f);
+    if (bits >= 0x7F7F0000u) return 0x7F7Fu;
+    u32 up = (bits + 0xFFFFu) >> 16;
+    return static_cast<u16>(up < 0x0080u ? 0x0080u : up);
+}
+
+// Packs sixteen floats as OCP E4M3 with one BF16 scale.
+TESSERA_FN Fp8Blk pack_fp8_blk(float4 v0, float4 v1, float4 v2, float4 v3) {
+    float amax = fmaxf(fmaxf(max4_abs(v0), max4_abs(v1)), fmaxf(max4_abs(v2), max4_abs(v3)));
+    u16 s = scale_bf16(amax);
+    float inv = (s == 0u) ? 0.0f : (1.0f / from_bf16(s));
+    uint4 q = make_uint4(to_e4m3x4(scale4(v0, inv)), to_e4m3x4(scale4(v1, inv)),
+                         to_e4m3x4(scale4(v2, inv)), to_e4m3x4(scale4(v3, inv)));
+    return {q, s};
+}
+
+// Unpacks sixteen OCP E4M3 values scaled by one BF16 scale.
+TESSERA_FN void unpack_fp8_blk(Fp8Blk blk, float4& v0, float4& v1, float4& v2, float4& v3) {
+    float s = from_bf16(blk.s);
+    v0 = scale4(from_e4m3x4(blk.q.x), s);
+    v1 = scale4(from_e4m3x4(blk.q.y), s);
+    v2 = scale4(from_e4m3x4(blk.q.z), s);
+    v3 = scale4(from_e4m3x4(blk.q.w), s);
 }
 
 TESSERA_FN void block_sync() {

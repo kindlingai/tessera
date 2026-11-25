@@ -63,15 +63,15 @@ fn dtypes_fold() {
     lower.dtype.push(Dtype::parse("@kept=bf16").unwrap());
     let mut opts = Options::default();
     opts.lower.replace(lower);
-    for flag in ["@kept=fp8", "@norm=f32", ":operand=bf16", "*.down@sum=f16"] {
+    for flag in ["@kept=fp8", "@norm=f32", ":operand=bf16", "*.down@sum=fp8"] {
         assert!(opts.flag("--dtype", flag.into()).is_some());
     }
     let recipe = lowering(&opts, None);
     let norm = recipe.pins.site_form(Site::Norm).map(|f| f.name());
     assert_eq!((recipe.pins.kept.name(), norm), ("fp8", Some("f32")));
-    assert_eq!(recipe.sums.named, [("*.down".into(), DType::F16)]);
+    assert_eq!(recipe.sums.named, [("*.down".into(), DType::Fp8)]);
     assert_eq!(recipe.compute, Compute::Bf16);
-    for bad in ["@sum=fp8", "@nowhere=bf16", "a.*@norm=bf16", "@kept"] {
+    for bad in ["@sum=u8", "@nowhere=bf16", "a.*@norm=bf16", "@kept"] {
         assert!(opts.flag("--dtype", bad.into()).is_none(), "{bad}");
     }
     assert!(opts.flag("--shape", "p2p_sum:threads=256".into()).is_some());
