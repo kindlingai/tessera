@@ -7,6 +7,7 @@ use crate::zip::{self, Entry};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use tessera_engine::storage::Form;
 use tessera_engine::{Bf16, F16};
 
 /// A `torch.save` file. Nested dict keys join with `.`.
@@ -47,6 +48,14 @@ fn stored(dtype: DType) -> Stored {
         DType::F16 => Stored::F16,
         DType::Bf16 => Stored::BF16,
         _ => Stored::Other,
+    }
+}
+
+/// The form of a two-byte float type.
+fn half(dtype: DType) -> Option<&'static dyn Form> {
+    match stored(dtype) {
+        Stored::Form(f) if f.dtype().bytes() == 2 => Some(f),
+        _ => None,
     }
 }
 
@@ -169,14 +178,10 @@ impl Offer for Torch {
             .views
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
-        if view.storage.dtype == DType::Bf16 {
-            return Ok(self
-                .floats(name)?
-                .iter()
-                .flat_map(crate::offer::narrow)
-                .collect());
+        match half(view.storage.dtype) {
+            Some(form) => Ok(form.pack(&self.floats(name)?)),
+            None => Err(Error::DType(format!("{name} holds floats, not a form"))),
         }
-        Err(Error::DType(format!("{name} holds floats, not a form")))
     }
 
     fn packed_rows(&self, name: &str, (first, count): (usize, usize)) -> Result<Vec<u8>, Error> {
@@ -184,7 +189,7 @@ impl Offer for Torch {
             .views
             .get(name)
             .ok_or_else(|| Error::Missing(name.into()))?;
-        if view.storage.dtype != DType::Bf16 {
+        if half(view.storage.dtype).is_none() {
             return Err(Error::DType(format!("{name} cannot be read in rows")));
         }
         let rows = *view.shape.first().unwrap_or(&0);

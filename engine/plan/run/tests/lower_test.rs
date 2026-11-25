@@ -110,7 +110,7 @@ fn maps_match_cpu() {
         .iter()
         .map(|p| fill(&g, &p.ty, &SIZES, &mut noise).unwrap())
         .collect();
-    let forms = [F32_FORM, BF16_FORM];
+    let forms = [F32_FORM, BF16_FORM, named("f16").unwrap()];
     for (settings, form) in runs().iter().flat_map(|s| forms.map(|f| (s, f))) {
         // The reference sees the weights in the plan's stored form.
         let kept: Vec<Tensor> = (weights.iter())

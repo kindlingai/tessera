@@ -3,15 +3,13 @@
 use crate::Error;
 use std::sync::Arc;
 use tessera_engine::Filed;
-use tessera_engine::storage::{Bf16, F32, Form};
+use tessera_engine::storage::{Bf16, F16, F32, Form};
 
 /// How a slice's elements lie in the file.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stored {
     /// A registered form's bytes, in `Form::pack` layout.
     Form(&'static dyn Form),
-    /// IEEE f16 bytes, widened to f32 on load.
-    F16,
     /// An element type without a widening reader here.
     Other,
 }
@@ -19,12 +17,12 @@ pub enum Stored {
 impl Stored {
     pub const F32: Self = Self::Form(&F32);
     pub const BF16: Self = Self::Form(&Bf16);
+    pub const F16: Self = Self::Form(&F16);
 
     /// The name manifests write.
     pub fn name(&self) -> &'static str {
         match self {
             Stored::Form(f) => f.name(),
-            Stored::F16 => "f16",
             Stored::Other => "other",
         }
     }
@@ -32,7 +30,6 @@ impl Stored {
     /// The type `name` stands for, in `Stored::name` spelling.
     pub fn parse(name: &str) -> Result<Stored, Error> {
         match name {
-            "f16" => Ok(Stored::F16),
             "other" => Ok(Stored::Other),
             _ => match tessera_engine::storage::named(name) {
                 Some(form) => Ok(Stored::Form(form)),

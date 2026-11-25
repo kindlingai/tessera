@@ -48,6 +48,12 @@ pub fn rd_bf16(bytes: &[u8], at: usize) -> f32 {
 }
 
 #[inline(always)]
+pub fn rd_f16(bytes: &[u8], at: usize) -> f32 {
+    let b = &bytes[at * 2..at * 2 + 2];
+    f32::from(F16(u16::from_le_bytes([b[0], b[1]])))
+}
+
+#[inline(always)]
 pub fn rd_fp8(bytes: &[u8], at: usize) -> f32 {
     f32::from(E4M3(bytes[at]))
 }
@@ -550,6 +556,11 @@ pub fn dots_form(form: &dyn Load, out: &mut [u8], x: &[u8], w: &[u8], d: &Dots, 
                 let h: &Vec<f32> = h;
                 h.as_slice()
             }
+            Read::F16 => {
+                h.extend((first..first + k).map(|i| rd_f16(w, i)));
+                let h: &Vec<f32> = h;
+                h.as_slice()
+            }
             Read::Fp8 => {
                 h.extend((first..first + k).map(|i| f32::from(E4M3(w[i]))));
                 let h: &Vec<f32> = h;
@@ -648,6 +659,6 @@ pub fn dot_form(form: &dyn Load, a: &[u8], a_at: usize, b: &[u8], b_at: usize, n
             dot(x, f32_row(b, b_at, n, &mut other))
         }
         Read::Bf16 => dot_bf16(x, &b[b_at * 2..(b_at + n) * 2]),
-        Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => form.dot(x, b, b_at),
+        Read::F16 | Read::Fp8 | Read::U32 | Read::U8 | Read::Decode => form.dot(x, b, b_at),
     }
 }

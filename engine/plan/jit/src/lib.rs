@@ -72,6 +72,7 @@ macro_rules! helpers {
 helpers! {
     rd_f32(P, P, P) -> F32;
     rd_bf16(P, P, P) -> F32;
+    rd_f16(P, P, P) -> F32;
     rd_fp8(P, P, P) -> F32;
     rd_u32(P, P, P) -> I32;
     rd_u8(P, P, P) -> I32;
