@@ -74,6 +74,7 @@ fn linear_mm_entries() {
         "tessera_mm_bf16(",
         "tessera_mm_bf16_ks2(",
         "tessera_mm_bf16_sk(",
+        "tessera_stacked_lanes_tc(",
         "tessera_mm_mxfp8_r8(",
         "tessera_mm_mxfp8_r8_sk(",
         "tessera_mm_mxfp8_r16_sk(",

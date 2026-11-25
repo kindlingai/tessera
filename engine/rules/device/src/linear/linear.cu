@@ -36,10 +36,7 @@ static __device__ __forceinline__ void dtr_body(const float* x, const u8* w, con
     float acc[NT][4];
 #pragma unroll
     for (u32 ti = 0u; ti < NT; ti++) {
-        acc[ti][0] = 0.0f;
-        acc[ti][1] = 0.0f;
-        acc[ti][2] = 0.0f;
-        acc[ti][3] = 0.0f;
+        acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.0f;
     }
     for (u32 c0 = 0u; c0 < blk_per; c0 += CHUNK) {
         u32 nb = min(CHUNK, blk_per - c0);
@@ -372,8 +369,8 @@ struct alignas(16) fg_bf16_smem {
 
 template <u32 KS, bool SPLIT>
 static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, const float* other,
-                                                  float* out, u32 m, u32 n, u32 k, u32 mode,
-                                                  u32 ks, fg_bf16_smem<KS>& sm) {
+                                                  float* out, u32 m, u32 n, u32 k, u32 w_stride,
+                                                  u32 r0, u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
     constexpr u32 NTILES = 4u / KS;
     constexpr u32 BN = 8u * NTILES;
     constexpr u32 BK = 64u * KS;
@@ -383,7 +380,6 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
     u32 t = lane & 3u;
     u32 wt = warp % NTILES;
     u32 kp = warp / NTILES;
-    u32 r0 = blockIdx.y << 4;
     u32 nb = n / BN;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x;
     u32 p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -392,7 +388,7 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
     u32 ch_per = SPLIT ? (chunks / ks) : chunks;
     u32 k_begin = SPLIT ? (p * ch_per * BK) : 0u;
     u32 k_end = SPLIT ? (k_begin + ch_per * BK) : k;
-    const u16* wr = w + u64(n0 + g) * k + (kp << 6);
+    const u16* wr = w + u64(n0 + g) * w_stride + (kp << 6);
     u32 xr = threadIdx.x >> 4;
     u32 xc = (threadIdx.x & 15u) << 2;
     u32 xw = (threadIdx.x & 15u) << 1;
@@ -431,18 +427,12 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
         }
 #pragma unroll
         for (u32 ks_i = 0u; ks_i < 4u; ks_i++) {
-            u32 ah[4], al[4], b[2];
             u32 off = (ks_i << 3) + t;
-            ah[0] = sm.sxh[kp][g][off];
-            ah[1] = sm.sxh[kp][g + 8u][off];
-            ah[2] = sm.sxh[kp][g][off + 4u];
-            ah[3] = sm.sxh[kp][g + 8u][off + 4u];
-            al[0] = sm.sxl[kp][g][off];
-            al[1] = sm.sxl[kp][g + 8u][off];
-            al[2] = sm.sxl[kp][g][off + 4u];
-            al[3] = sm.sxl[kp][g + 8u][off + 4u];
-            b[0] = sm.u.sw[warp][g][off];
-            b[1] = sm.u.sw[warp][g][off + 4u];
+            u32 ah[4] = {sm.sxh[kp][g][off], sm.sxh[kp][g + 8u][off], sm.sxh[kp][g][off + 4u],
+                         sm.sxh[kp][g + 8u][off + 4u]};
+            u32 al[4] = {sm.sxl[kp][g][off], sm.sxl[kp][g + 8u][off], sm.sxl[kp][g][off + 4u],
+                         sm.sxl[kp][g + 8u][off + 4u]};
+            u32 b[2] = {sm.u.sw[warp][g][off], sm.u.sw[warp][g][off + 4u]};
             fg_mma_bf16(acc, ah, b);
             fg_mma_bf16(acc, al, b);
         }
@@ -486,14 +476,14 @@ static __device__ __forceinline__ void fg_bf16_mm(const float* x, const u16* w, 
 extern "C" __global__ __launch_bounds__(128, 6) void tessera_mm_bf16(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
-    fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
+    fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_ks2(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
-    fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
+    fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
@@ -501,7 +491,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_bf16_sk(
     const float* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
     u32 ks) {
     __shared__ fg_bf16_smem<2u> sm;
-    fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, mode, ks, sm);
+    fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, k, blockIdx.y << 4, mode, ks, sm);
 }
 
 union alignas(16) fg_mx_smem {
@@ -541,10 +531,7 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
     float acc[NT][4];
 #pragma unroll
     for (u32 ti = 0u; ti < NT; ti++) {
-        acc[ti][0] = 0.0f;
-        acc[ti][1] = 0.0f;
-        acc[ti][2] = 0.0f;
-        acc[ti][3] = 0.0f;
+        acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.0f;
     }
     u64 off0 = u64(ch0) * 528ull;
     uint4 cur0 = fg_ld_nc4(wp0 + off0);
@@ -583,10 +570,7 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const float* x, const u8* w, 
             float tmp[NT][4];
 #pragma unroll
             for (u32 ti = 0u; ti < NT; ti++) {
-                tmp[ti][0] = 0.0f;
-                tmp[ti][1] = 0.0f;
-                tmp[ti][2] = 0.0f;
-                tmp[ti][3] = 0.0f;
+                tmp[ti][0] = tmp[ti][1] = tmp[ti][2] = tmp[ti][3] = 0.0f;
             }
 #pragma unroll
             for (u32 ks = 0u; ks < 2u; ks++) {
@@ -741,6 +725,21 @@ extern "C" __global__ __launch_bounds__(256, 2) void tessera_gemv_bf16_narrow(
     }
 }
 
+// Tensor-Core BF16 stacked matmul, 16x16 per block.
+extern "C" __global__ __launch_bounds__(128, 4) void tessera_stacked_lanes_tc(
+    const float* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
+    u32 col_step) {
+    __shared__ fg_bf16_smem<2u> sm;
+    u32 rtiles = (rows + 15u) >> 4u;
+    u32 batch = blockIdx.y / rtiles;
+    u32 r0 = (blockIdx.y % rtiles) << 4u;
+    const float* xb = x + (u64(batch) * rows + r0) * k;
+    const u16* wb = w + u64(batch) * block + first;
+    float* ob = out + (u64(batch) * rows + r0) * n;
+    u32 nr = min(rows - r0, 16u);
+    fg_bf16_mm<2u, false>(xb, wb, nullptr, ob, nr, n, k, col_step, 0u, 0u, 1u, sm);
+}
+
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.
 extern "C" __global__ __launch_bounds__(256, 2) void tessera_stacked_lanes(
     const float* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
@@ -841,20 +840,15 @@ extern "C" __global__ __launch_bounds__(128, 6) void tessera_stacked_wide(
         }
 #pragma unroll
         for (u32 ks = 0u; ks < 2u; ks++) {
-            u32 ah[4], al[4], b[2];
             u32 off = (ks << 3u) + t;
-            ah[0] = sm.sxh[g][off];
-            ah[1] = sm.sxh[g + 8u][off];
-            ah[2] = sm.sxh[g][off + 4u];
-            ah[3] = sm.sxh[g + 8u][off + 4u];
-            al[0] = sm.sxl[g][off];
-            al[1] = sm.sxl[g + 8u][off];
-            al[2] = sm.sxl[g][off + 4u];
-            al[3] = sm.sxl[g + 8u][off + 4u];
+            u32 ah[4] = {sm.sxh[g][off], sm.sxh[g + 8u][off], sm.sxh[g][off + 4u],
+                         sm.sxh[g + 8u][off + 4u]};
+            u32 al[4] = {sm.sxl[g][off], sm.sxl[g + 8u][off], sm.sxl[g][off + 4u],
+                         sm.sxl[g + 8u][off + 4u]};
             u32 wc0 = (wt << 3u) + g;
             u32 wk0 = (ks << 4u) + (t << 1u);
-            b[0] = *reinterpret_cast<const u32*>(&sm.sw[wc0][wk0]);
-            b[1] = *reinterpret_cast<const u32*>(&sm.sw[wc0][wk0 + 8u]);
+            u32 b[2] = {*reinterpret_cast<const u32*>(&sm.sw[wc0][wk0]),
+                        *reinterpret_cast<const u32*>(&sm.sw[wc0][wk0 + 8u])};
             fg_mma_bf16(acc, ah, b);
             fg_mma_bf16(acc, al, b);
         }

@@ -463,15 +463,25 @@ struct FastStacked {
     form: &'static dyn Stored,
 }
 
+impl FastStacked {
+    fn lanes_tc(&self) -> bool {
+        !self.wide && self.n.is_multiple_of(16) && self.k.is_multiple_of(128)
+    }
+}
+
 fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
     weight_accepts(input, k.form, form)
 }
 
 fn stacked_needs(k: &FastStacked) -> Needs {
-    if k.wide {
+    if k.wide || k.lanes_tc() {
         Needs {
             lanes: 32,
-            group_bytes: 16 * 18 * 4 * 2 + 32 * 34 * 2,
+            group_bytes: if k.wide {
+                16 * 18 * 4 * 2 + 32 * 34 * 2
+            } else {
+                (4 * 16 * 36 + 4 * 8 * 36) * 4
+            },
             group_threads: WIDE_THREADS,
             compiler: true,
             lacks: CUDA_LACKS,
@@ -486,12 +496,32 @@ fn stacked_needs(k: &FastStacked) -> Needs {
 fn stacked_source(k: &FastStacked) -> Source {
     cuda_source_entry(if k.wide {
         "tessera_stacked_wide"
+    } else if k.lanes_tc() {
+        "tessera_stacked_lanes_tc"
     } else {
         "tessera_stacked_lanes"
     })
 }
 
 fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
+    if k.lanes_tc() {
+        let rtiles = k.rows.div_ceil(16);
+        let groups = (k.n / 16) * k.batches * rtiles;
+        let mut load = Load {
+            threads: groups * 128,
+            group: 128,
+            trips: k.k as f64 / 128.0,
+            reads: vec![
+                (2 * k.batches * rtiles * k.n * k.k) as f64,
+                (4 * k.batches * k.rows * k.k) as f64,
+            ],
+            written: (4 * k.len) as f64,
+            flight: 1024.0,
+            ..Load::default()
+        };
+        load.trip.fresh = 1.0;
+        return Some(load);
+    }
     let rtiles = if k.wide {
         k.rows.div_ceil(16)
     } else {
@@ -525,9 +555,9 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
 }
 
 fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
-    if k.wide {
+    if k.wide || k.lanes_tc() {
         let shape = Shape::Grid {
-            across: k.n / WIDE_COLS,
+            across: k.n / if k.wide { WIDE_COLS } else { 16 },
             down: k.batches * k.rows.div_ceil(16),
             threads: WIDE_THREADS,
         };
