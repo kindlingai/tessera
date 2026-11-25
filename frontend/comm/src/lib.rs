@@ -77,14 +77,16 @@ pub enum Sums {
     Host,
     Grid,
     P2p,
+    P2pBf16,
 }
 
-/// Parses `--sums host|grid|p2p`.
+/// Parses `--sums host|grid|p2p|p2p-bf16`.
 pub fn sums_flag(value: &str) -> Option<Sums> {
     match value {
         "host" => Some(Sums::Host),
         "grid" => Some(Sums::Grid),
         "p2p" => Some(Sums::P2p),
+        "p2p-bf16" => Some(Sums::P2pBf16),
         _ => None,
     }
 }
@@ -94,11 +96,31 @@ pub fn p2p(
     met: &mut dyn Transport,
     settings: &Settings,
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    p2p_with(met, settings, false)
+}
+
+/// Direct GPU-to-GPU sums over IPC with BF16 wire transport.
+pub fn p2p_bf16(
+    met: &mut dyn Transport,
+    settings: &Settings,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    p2p_with(met, settings, true)
+}
+
+fn p2p_with(
+    met: &mut dyn Transport,
+    settings: &Settings,
+    bf16: bool,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let rank = met.rank();
     let device = settings.device.unwrap_or(rank as usize);
     tessera_engine::select(device);
-    let sums = p2p::open(settings.gpu(), met)?;
-    eprintln!("rank {rank}: sums over direct GPU P2P (device {device})");
+    let sums = match bf16 {
+        true => p2p::open_bf16(settings.gpu(), met)?,
+        false => p2p::open(settings.gpu(), met)?,
+    };
+    let kind = if bf16 { "bf16" } else { "f32" };
+    eprintln!("rank {rank}: sums over direct GPU P2P ({kind}, device {device})");
     Ok(sums)
 }
 

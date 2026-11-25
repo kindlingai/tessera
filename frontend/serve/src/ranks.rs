@@ -105,6 +105,9 @@ impl Ranks {
             }
             (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
             (false, Sums::P2p, _) => p2p(&mut *met, settings).map(Grids::Sums),
+            (false, Sums::P2pBf16, _) => {
+                tessera_frontend_comm::p2p_bf16(&mut *met, settings).map(Grids::Sums)
+            }
             (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
             (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());

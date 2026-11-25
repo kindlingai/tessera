@@ -28,7 +28,7 @@ type Outcome = Result<(), Box<dyn Error>>;
 /// Runs `rounds` sums on the GPU the settings pick.
 pub fn run(args: &Args, rounds: u32) -> Outcome {
     let settings = tessera_frontend_settings::read();
-    if args.sums == Sums::P2p {
+    if matches!(args.sums, Sums::P2p | Sums::P2pBf16) {
         tessera_run::select(settings.device.unwrap_or(args.rank as usize));
     }
     let stub = Stub(args, rounds);
@@ -44,7 +44,7 @@ impl OnGpu for Stub<'_> {
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Outcome {
         let ctx = cached_context::<D>()?;
         match self.0.sums {
-            Sums::P2p => p2p_stub(ctx, self.0, self.1),
+            Sums::P2p | Sums::P2pBf16 => p2p_stub(ctx, self.0, self.1),
             _ => on(ctx, self.0, self.1),
         }
     }
@@ -60,7 +60,17 @@ where
         Some(path) => Box::new(shm(path, rank, ranks, CAPACITY)?),
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
-    let mut p2p = P2p::on(ctx, &mut *boot)?.with_schedule(args.sched);
+    let bf16 = args.sums == Sums::P2pBf16;
+    let mut p2p = P2p::on(ctx, &mut *boot)?
+        .with_schedule(args.sched)
+        .with_bf16(bf16);
+    let close = |got: f32, want: f32| {
+        if bf16 {
+            (got - want).abs() <= want.abs() * 0.02 + 1e-2
+        } else {
+            got == want
+        }
+    };
     let bytes = n * 4;
     let from = DeviceBuffer::alloc(ctx, bytes)?;
     let to = DeviceBuffer::alloc(ctx, bytes)?;
@@ -86,7 +96,7 @@ where
     let mut wrong = 0usize;
     for (i, &v) in got.iter().enumerate() {
         let want = (i % 97) as f32 * triangle;
-        wrong += usize::from(v != want);
+        wrong += usize::from(!close(v, want));
     }
     // Verify in-place all-reduce.
     p2p.sum(to.device_ptr(), to.device_ptr(), n)?;
@@ -94,7 +104,7 @@ where
     to.read_f32(&mut got)?;
     for (i, &v) in got.iter().enumerate() {
         let want = (i % 97) as f32 * triangle * ranks as f32;
-        wrong += usize::from(v != want);
+        wrong += usize::from(!close(v, want));
     }
     // Verify CUDA/HIP graph capture and repeated replay.
     if ctx.graphs() && p2p.capturable() {
@@ -110,7 +120,7 @@ where
         to.read_f32(&mut got)?;
         for (i, &v) in got.iter().enumerate() {
             let want = (i % 97) as f32 * triangle * ranks as f32;
-            wrong += usize::from(v != want);
+            wrong += usize::from(!close(v, want));
         }
     }
     // Verify multi-row P2P all-gather (direct and graphed).

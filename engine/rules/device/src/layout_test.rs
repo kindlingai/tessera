@@ -109,8 +109,9 @@ fn p2p_kernel_flattens() {
         };
         let flat = flatten("p2p.kernel", source, &|_| None, &options).unwrap();
         assert!(flat.text.contains("tessera_p2p_sum"));
-        assert!(flat.text.contains("reduce_write"));
-        assert!(flat.text.contains("add_slice"));
+        assert!(flat.text.contains("tessera_p2p_sum_bf16"));
+        assert!(flat.text.contains("tessera_p2p_gather"));
+        assert!(flat.text.contains("add_pair"));
         assert!(flat.text.contains("seq_ptr"));
         assert!(flat.text.contains("timeout_ticks"));
     }
