@@ -315,6 +315,7 @@ impl Stack {
         dims.extend(shared.iter().chain(own).map(fixed));
         if self.steps == Steps::Masked {
             dims.push(Dim::fixed(VocabWords, self.vocab.div_ceil(32)));
+            dims.push(bounded(EditWords, 3 * self.vocab));
         }
         if self.steps != Steps::Plain {
             dims.push(bounded(Candidates, FEW));

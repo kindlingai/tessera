@@ -40,6 +40,7 @@ pub(super) fn open_mtp(
     let mut recipe = o.lower.clone().unwrap_or_default();
     recipe.pins = super::generate::kv_pin(o, pair.pins.clone());
     recipe.kept = Recipe::default().kept;
+    let mut recipe = super::generate::dtyped(o, recipe);
     if o.require_favored {
         recipe.require_favored = true;
     }

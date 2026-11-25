@@ -9,7 +9,7 @@ mod tensor;
 mod weights;
 
 pub use model::{Kept, Model};
-pub use ports::{FEW, listed, pick, ports, sparse_ports, step_ports, tokens};
+pub use ports::{FEW, listed, mask_port, pick, ports, sparse_ports, step_ports, tokens};
 pub use tensor::Tensor;
 pub use tessera_graph::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, EntryKind, Graph, Mask, Pairs, PathSeg,

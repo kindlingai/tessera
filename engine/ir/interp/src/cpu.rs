@@ -556,11 +556,22 @@ pub(crate) fn stage(
         Stage::Allow => {
             let bits = operand()?.indices()?;
             let words = width.div_ceil(32);
-            for (row, mask) in out.chunks_mut(width).zip(bits.chunks(words)) {
+            let stride = bits.len() / (out.len() / width).max(1);
+            let n = stride.saturating_sub(words) / 3;
+            for (row, mask) in out.chunks_mut(width).zip(bits.chunks(stride.max(1))) {
                 for (i, v) in row.iter_mut().enumerate() {
                     if mask[i / 32] >> (i % 32) & 1 == 0 {
                         *v = f32::NEG_INFINITY;
                     }
+                }
+                let packed = &mask[words..];
+                for j in 0..n {
+                    let Some(v) = row.get_mut(packed[j]) else {
+                        continue;
+                    };
+                    let bits = |at: usize| f32::from_bits(packed[at] as u32);
+                    let rep = bits(2 * n + j);
+                    *v = if *v > 0.0 { *v / rep } else { *v * rep } + bits(n + j);
                 }
             }
         }

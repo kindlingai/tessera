@@ -2,10 +2,11 @@
 
 use tessera_engine::{
     Allowed, Batch, Edit, Engine, Event, Fair, Fault, Guide, Move, Penalties, Prefix, Program,
-    Recipe, Request, Sampling, Scoped, Stacked, Tally, Term,
+    Recipe, Request, Sampling, Scoped, Stacked, Steps, Tally, Term,
 };
 use tessera_lower::{Settings, Weight};
 use tessera_models::decoder::{Config, Swiglu, stepper};
+use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
 
@@ -34,12 +35,18 @@ fn request(sampling: Sampling, guide: Option<Box<dyn Guide>>) -> Request {
 }
 
 fn engine() -> Engine {
-    let g = stepper::<Norm, Swiglu>(&Config::toy(2, 16));
+    engine_on(Steps::Plain, &Settings::default())
+}
+
+fn engine_on(steps: Steps, settings: &Settings) -> Engine {
+    let mut c = Config::toy(2, 16);
+    c.stack.steps = steps;
+    let g = stepper::<Norm, Swiglu>(&c);
     let stored: Vec<Weight> = weights(&g, &mut Noise(41))
         .into_iter()
         .map(Weight::Floats)
         .collect();
-    let mut engine = Engine::open(g, 16, &Recipe::default(), &Settings::default()).unwrap();
+    let mut engine = Engine::open(g, 16, &Recipe::default(), settings).unwrap();
     engine.load(&stored).unwrap();
     engine
 }
@@ -247,4 +254,26 @@ fn ramp_is_bounded() {
     }
     let want = [None, None, Some(0.5), Some(1.0), Some(1.0), None];
     assert_eq!(adds, want);
+}
+
+#[test]
+fn device_edits_match_host() {
+    let greedy = Sampling::default();
+    for s in runs() {
+        let (mut host, mut device) = (engine_on(Steps::Plain, &s), engine_on(Steps::Masked, &s));
+        let plain = answer(&mut host, request(greedy, None));
+        let mut ids = plain.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        // Unsorted, with each id twice.
+        let each = ids
+            .iter()
+            .rev()
+            .flat_map(|&id| [add(id, -0.5, 1.5), add(id, 0.25, 1.2)]);
+        let edits: Vec<Edit> = each.collect();
+        let guide = || Some(Box::new(Edits(edits.clone())) as Box<dyn Guide>);
+        let want = answer(&mut host, request(greedy, guide()));
+        assert_ne!(want, plain);
+        assert_eq!(answer(&mut device, request(greedy, guide())), want);
+    }
 }

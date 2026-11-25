@@ -156,15 +156,21 @@ pub fn blocks(bounded: &[Dim], [heads, key, value]: [u64; 3]) -> Graph {
     m.finish([(Role::Logits, &keys), (Role::Logits, &values)])
 }
 
-/// Norms, activations, centering, unit sum, softmax, mask, argmax, mean.
+/// Norms, activations, centering, unit sum, softmax, mask, edits,
+/// argmax, mean.
 pub fn rows(bounded: &[Dim], width: u64) -> Graph {
-    let m = model(
-        bounded,
-        &[(Hidden, width), (VocabWords, width.div_ceil(32))],
-    );
+    let fixed = [
+        (Hidden, width),
+        (VocabWords, width.div_ceil(32)),
+        (EditWords, 6),
+    ];
+    let m = model(bounded, &fixed);
     let w: Scale = declare(&m);
     let port = || rows_of(bounded, Hidden, DType::F32);
-    let bits = rows_of(bounded, VocabWords, DType::U32);
+    let mut bits = rows_of(bounded, VocabWords, DType::U32);
+    let words = bits.ty.shape.0.pop().expect("a row axis");
+    let edits = DimExpr::Add(Box::new(words), Box::new(EditWords.into()));
+    bits.ty.shape.0.push(edits);
     let [x, y, bits] = m.entry(EntryKind::Forward, [port(), port(), bits]);
     let gated = x.rms_norm(&w.norm, 1e-6).act(Act::Silu).mul(&y.rms(1e-6));
     let tail = gated.act(Act::Tanh);

@@ -31,7 +31,7 @@ const SCATTER_CROSSOVER: usize = 256 << 10;
 const BASE: u64 = 3;
 const RING: usize = 4;
 const CNT_STRIDE: usize = MAX_RANKS + 2;
-const MAX_THREADS: u32 = 1024;
+const MAX_THREADS: u32 = 512;
 const LARGE_GRID: u32 = 4;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);

@@ -131,11 +131,12 @@ pub(super) fn open_drafter(
     pair: &DFlash,
     settings: &Settings,
 ) -> Result<Drafter, String> {
-    let recipe = Recipe {
+    let base = Recipe {
         pins: super::generate::kv_pin(o, pair.pins.clone()),
         sums: o.lower.as_ref().map(|r| r.sums.clone()).unwrap_or_default(),
         ..Recipe::default()
     };
+    let recipe = super::generate::dtyped(o, base);
     let mut drafter = match links {
         Some((sums, grid)) => {
             let gpu = settings.gpu().is_some();

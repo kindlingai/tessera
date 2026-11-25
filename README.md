@@ -29,6 +29,22 @@ Join us on discord (https://discord.gg/8EAvYPV2rE) to discuss larger features to
  - EmbeddingGemma 2
  - spaCy
 
+## Development
+
+Run the `tesserax` binary from this repo to access the CLI. The codebase is 100% Rust and should
+compile on any platform.
+
+To profile, you can:
+
+ 1. set `TESSERA_PROFILE=1`, or
+ 2. use `TESSERA_PROFILE=dynamic` and send `X-Tessera-Profile: 1` during requests.
+
+Make use of `--explain-lowering` to understand how things fall of the fast path and
+`--layers` to microbenchmark.
+
+`TESSERA_DUMP_SITES` and `TESSERA_KERNEL_CACHE` can be used to dump kernels and plans
+for offline analysis.
+
 ## Crates
 
 <!-- crate table -->

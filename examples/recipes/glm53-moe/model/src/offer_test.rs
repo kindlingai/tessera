@@ -92,7 +92,7 @@ fn offer_row_bounds() {
             let Shape::Grid { down, .. } = got[1].shape else {
                 panic!("fc1 must be grid");
             };
-            assert!(down <= rows.div_ceil(8) + MAX_SLOTS);
+            assert!(down <= rows.div_ceil(16) + MAX_SLOTS);
         }
     }
     assert!(offer(&site(0, 256, 512, 256)).is_none());
@@ -101,11 +101,11 @@ fn offer_row_bounds() {
     let Shape::Grid { down: d256, .. } = offer(&site(256, 256, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d256, 32 + 480);
+    assert_eq!(d256, 16 + 368);
     let Shape::Grid { down: d32, .. } = offer(&site(256, 32, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d32, 32 + 92);
+    assert_eq!(d32, 16 + 62);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Plans for recipes whose step runs as one resident grid.
 
 use tessera_engine::Row;
-use tessera_graph::DimName::{Context, Picks, Rows, Segments, Seqs};
+use tessera_graph::DimName::{Context, EditWords, Picks, Rows, Segments, Seqs};
 use tessera_graph::{Graph, Parts, shard_aligned, trim};
 use tessera_lower::{Cluster, Device, Limits, Plan, Platform, Recipe, lower};
 
@@ -24,6 +24,7 @@ pub fn rank_plan(g: &Graph, recipe: &Recipe, ranks: u32, rank: u32) -> Plan {
         (Context, 16),
         (Segments, 1),
         (Picks, 2),
+        (EditWords, 0),
     ];
     lower(&g, 0, &sizes, &device).unwrap()
 }

@@ -1,5 +1,5 @@
 use crate::Noise;
-use tessera_graph::{DType, DimName, Graph, TensorType, Weight};
+use tessera_graph::{DType, DimExpr, DimName, Graph, TensorType, Weight};
 use tessera_mem::Tensor;
 
 /// The shape of `ty`, given `sizes`.
@@ -12,7 +12,28 @@ fn shape(g: &Graph, ty: &TensorType, sizes: &[(DimName, u64)]) -> Option<Vec<usi
     Some(out)
 }
 
-/// Noise for `ty`, or ids below 8. `None` if unsized.
+/// Mask words, then edits with sorted ids below 8.
+fn edits(shape: &[usize], words: usize, noise: &mut Noise) -> Tensor {
+    let k = (shape[shape.len() - 1] - words) / 3;
+    let rows: usize = shape[..shape.len() - 1].iter().product();
+    let mut out = Vec::with_capacity(rows * (words + 3 * k));
+    for _ in 0..rows {
+        for _ in 0..words {
+            out.push(((noise.draw() + 1.0) * 4.0) as u32);
+        }
+        let first = ((noise.draw() + 1.0) * 2.0) as u32;
+        out.extend((0..k as u32).map(|j| first + 2 * j));
+        for _ in 0..k {
+            out.push(noise.draw().to_bits());
+        }
+        for _ in 0..k {
+            out.push((1.5 + noise.draw() / 2.0).to_bits());
+        }
+    }
+    Tensor::u32(shape.to_vec(), out)
+}
+
+/// Noise, small ids or edits for `ty`. `None` if unsized.
 pub fn fill(
     g: &Graph,
     ty: &TensorType,
@@ -20,6 +41,13 @@ pub fn fill(
     noise: &mut Noise,
 ) -> Option<Tensor> {
     let shape = shape(g, ty, sizes)?;
+    if let Some(DimExpr::Add(mask, rest)) = ty.shape.0.last()
+        && **rest == DimExpr::Dim(DimName::EditWords)
+    {
+        let size = |name| sizes.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+        let words = mask.poly(&g.dims).ok()?.eval(&size)? as usize;
+        return Some(edits(&shape, words, noise));
+    }
     let mut values = (0..shape.iter().product()).map(|_| noise.draw());
     Some(match ty.dtype {
         DType::U32 => Tensor::u32(shape, values.map(|v| ((v + 1.0) * 4.0) as u32).collect()),

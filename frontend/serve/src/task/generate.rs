@@ -32,6 +32,14 @@ pub(super) fn kv_pin(options: &Options, pins: Pins) -> Pins {
     }
 }
 
+/// Folds the recipe's dtype rules, then the flags', into `recipe`.
+pub(super) fn dtyped(options: &Options, mut recipe: Recipe) -> Recipe {
+    let filed = options.lower.iter().flat_map(|r| r.dtype.iter());
+    recipe.dtype = filed.chain(&options.dtypes).cloned().collect();
+    recipe.settle();
+    recipe
+}
+
 /// The lowering choices, with the model's pins by default.
 pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     let mut recipe = options.lower.clone().unwrap_or_default();
@@ -62,7 +70,7 @@ pub(super) fn lowering(options: &Options, pins: Option<Pins>) -> Recipe {
     if options.require_favored {
         recipe.require_favored = true;
     }
-    recipe
+    dtyped(options, recipe)
 }
 
 /// Loads optional user weight-name rules from `settings`.
