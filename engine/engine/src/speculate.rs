@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
-use tessera_graph::{Graph, Role};
+use tessera_graph::{DType, Graph, Role};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Slot, Wants, Weight};
 use tessera_models::dflash;
@@ -36,8 +36,12 @@ impl Transport for SharedTransport {
 struct SharedSum(Rc<RefCell<Box<dyn Sum>>>);
 
 impl Sum for SharedSum {
-    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), RunError> {
-        self.0.borrow_mut().sum(from, to, len)
+    fn sum(&mut self, from: u64, to: u64, len: usize, wire: DType) -> Result<(), RunError> {
+        self.0.borrow_mut().sum(from, to, len, wire)
+    }
+
+    fn wire(&self) -> DType {
+        self.0.borrow().wire()
     }
 
     fn gather(
@@ -436,6 +440,7 @@ impl Drafter {
         grid: Option<Box<dyn Sum>>,
     ) -> Result<Self, Error> {
         place.rank = sums.rank();
+        place.settle(grid.as_deref());
         let run = |plan| open_rank(plan, settings, sums, grid);
         Self::placed(
             graph,
@@ -471,7 +476,7 @@ impl Drafter {
                     let path = &graph.weights[w.weight as usize].path;
                     eprintln!("tessera: drafter {path:?} stays whole: {}", w.why);
                 }
-                sharded.graph
+                place.resolve(sharded.graph, &recipe.sums)
             }
             None => graph,
         };

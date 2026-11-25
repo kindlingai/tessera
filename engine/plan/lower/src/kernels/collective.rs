@@ -2,6 +2,7 @@
 
 use crate::Kernel;
 use crate::kernels::Map;
+use tessera_graph::DType;
 
 /// Sums `len` partials across ranks. The runner's transport does it.
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -12,9 +13,12 @@ use crate::kernels::Map;
     source = Map::plain(Vec::new()).source(),
     launches = Vec::new(),
     work = self.len,
+    wire = self.wire,
 )]
 pub struct AllReduce {
     pub len: usize,
+    /// Each rank's part rounds to this before the add.
+    pub wire: DType,
 }
 
 impl AllReduce {
@@ -40,6 +44,11 @@ pub struct AllGather {
 impl AllGather {
     /// Its kernel name. Runners find gathers by it.
     pub const NAME: &'static str = "all_gather";
+}
+
+/// Bytes a crossing step moves, at any wire dtype.
+pub fn moved(kernel: &dyn Kernel, len: usize, stored: usize) -> usize {
+    kernel.wire().map_or(stored, |w| w.bytes() * len)
 }
 
 /// Whether a step of kernel `name` crosses ranks.

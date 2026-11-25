@@ -350,7 +350,10 @@ fn drawn(draws: &mut Noise, shape: Vec<usize>) -> Tensor {
 #[test]
 fn module_sums_shards() {
     let g = split_layer();
-    let sharded = shard(&g, &Parts::even(2)).unwrap().graph;
+    let sharded = shard(&g, &Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let rule = halves();
     for plan in ranks(&sharded, compiling(), rule) {
         assert!(rules(&plan).iter().all(|r| *r == "wasm_layer"));
@@ -376,7 +379,10 @@ fn module_sums_shards() {
 #[test]
 fn module_runs_resident() {
     let g = split_layer();
-    let sharded = shard(&g, &Parts::even(2)).unwrap().graph;
+    let sharded = shard(&g, &Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let text = "extern \"C\" __global__ void whole(const void* t) {}";
     let kernels = json!([{"name": "wasm_whole", "entry": "whole", "cuda": text}]);
     let whole = json!({

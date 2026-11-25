@@ -2,9 +2,9 @@
 
 use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::{Graph, Parts, shard_mode};
-use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, ZoneKind};
-use tessera_run::{Profile, Rank, Ranks, Run, Sum};
+use tessera_graph::{DType, Graph, Parts, shard_mode};
+use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, Wires, ZoneKind};
+use tessera_run::{Profile, Rank, Ranks, Run, Sum, sum_wire};
 
 /// A rank's zones and each rank's share of split weights.
 pub struct Place {
@@ -15,6 +15,8 @@ pub struct Place {
     pub(crate) grid: Option<Box<dyn Sum>>,
     /// Split routed experts along inner width, not experts.
     pub(crate) moe_tp: bool,
+    /// The wire dtype for sums the model leaves unpinned.
+    pub(crate) wire: Option<DType>,
 }
 
 impl Place {
@@ -27,6 +29,7 @@ impl Place {
             rank,
             grid: None,
             moe_tp: false,
+            wire: None,
         }
     }
 
@@ -34,6 +37,26 @@ impl Place {
     pub fn with_grid(mut self, grid: Option<Box<dyn Sum>>) -> Self {
         self.grid = grid;
         self
+    }
+
+    /// Sends unpinned sums' parts as `wire`. `None`: the transport's dtype.
+    pub fn with_wire(mut self, wire: Option<DType>) -> Self {
+        self.wire = wire;
+        self
+    }
+
+    /// Settles the wire dtype once the sums' transport is known.
+    pub(crate) fn settle(&mut self, grid: Option<&dyn Sum>) {
+        self.wire = Some(sum_wire(self.wire, grid));
+    }
+
+    /// Pins `g`'s sums: model pins, then `wires`, then setup.
+    pub(crate) fn resolve(&self, g: Graph, wires: &Wires) -> Graph {
+        let g = wires.pin(g);
+        match self.wire {
+            Some(wire) => g.wired(wire),
+            None => g,
+        }
     }
 
     /// Splits wide routed experts along inner width when `on`.
@@ -55,13 +78,13 @@ impl Place {
         Self::new(Cluster::mesh(ranks, kind), parts)
     }
 
-    pub(crate) fn split(&self, g: &Graph, pins: &Pins) -> Result<Graph, Error> {
+    pub(crate) fn split(&self, g: &Graph, (pins, wires): (&Pins, &Wires)) -> Result<Graph, Error> {
         let sharded = shard_mode(g, &self.parts, &pins.shares(g), self.moe_tp)?;
         for w in sharded.whole.iter().filter(|_| self.rank == 0) {
             let path = &g.weights[w.weight as usize].path;
             eprintln!("tessera: {path:?} stays whole: {}", w.why);
         }
-        Ok(sharded.graph)
+        Ok(self.resolve(sharded.graph, wires))
     }
 
     /// `device`, lowering this rank's copy of the plan.
@@ -95,6 +118,7 @@ impl Engine {
     ) -> Result<Self, Error> {
         place.rank = sums.rank();
         let grid = place.grid.take();
+        place.settle(grid.as_deref());
         let run = |plan| open_rank(plan, settings, sums, grid);
         let mut engine = Self::placed(graph, context, recipe, settings, Some(&place), run)?;
         engine.control = Some(control);

@@ -12,7 +12,7 @@ use tessera_gpukit::{Error as GpuError, Limits, Platform};
 use tessera_graph::DimName::Context;
 use tessera_lower::kernels::{AllGather, AllReduce, Map};
 use tessera_lower::{KernelRef, Launching, Plan, Slot, Step};
-use tessera_mem::Tensor;
+use tessera_mem::{DType, Tensor};
 use tessera_run::testing::{device, host};
 use tessera_run::{Error as RunError, Rank, Run, Sum};
 
@@ -527,7 +527,7 @@ impl Drop for MockSum {
 }
 
 impl Sum for MockSum {
-    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), RunError> {
+    fn sum(&mut self, from: u64, to: u64, len: usize, _: DType) -> Result<(), RunError> {
         if len == 0 {
             self.start();
             return Ok(());
@@ -605,14 +605,20 @@ fn ranked_plan(scratch_bytes: usize) -> Plan {
         steps: vec![
             copy_step(0, 4),
             step(
-                KernelRef::new(AllReduce { len: 4 }),
+                KernelRef::new(AllReduce {
+                    len: 4,
+                    wire: DType::F32,
+                }),
                 "all_reduce",
                 vec![a],
                 b,
             ),
             copy_step(1, 4),
             step(
-                KernelRef::new(AllReduce { len: 4 }),
+                KernelRef::new(AllReduce {
+                    len: 4,
+                    wire: DType::F32,
+                }),
                 "all_reduce",
                 vec![b],
                 a,
@@ -791,8 +797,8 @@ fn sums_split_fallbacks() {
     {
         struct Share(Rc<RefCell<MockSum>>);
         impl Sum for Share {
-            fn sum(&mut self, f: u64, t: u64, n: usize) -> Result<(), RunError> {
-                self.0.borrow_mut().sum(f, t, n)
+            fn sum(&mut self, f: u64, t: u64, n: usize, w: DType) -> Result<(), RunError> {
+                self.0.borrow_mut().sum(f, t, n, w)
             }
             fn gather(
                 &mut self,

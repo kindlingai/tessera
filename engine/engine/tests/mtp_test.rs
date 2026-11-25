@@ -233,7 +233,8 @@ fn verify_local_argmax(g: &Graph, seed: u64, moe_tp: bool) {
     let parts = Parts::even(2);
     let sharded = mtp::shard(g, &parts, &|_, _, _, _| true, moe_tp)
         .unwrap()
-        .graph;
+        .graph
+        .wired(tessera_graph::DType::F32);
     let dim = |name| g.dims.iter().find(|d| d.name == name).unwrap().size.max() as usize;
     let (vocab, hidden) = (dim(Vocab), dim(Hidden));
     let w = weights(g, &mut Noise(seed));

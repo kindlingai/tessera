@@ -51,7 +51,8 @@ pub(super) fn open_mtp(
             let gpu = settings.gpu().is_some();
             let place = Place::mesh(sums.ranks() as usize, o.ranks.parts().to_vec(), gpu)
                 .with_grid(grid)
-                .with_moe_tp(o.ranks.moe_tp());
+                .with_moe_tp(o.ranks.moe_tp())
+                .with_wire(o.ranks.sum_wire());
             MtpDrafter::open_ranked(
                 pair.graph.clone(),
                 o.max_model_len,

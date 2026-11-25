@@ -246,7 +246,7 @@ fn plans_collective_lanes() {
     assert_eq!(got, [(Op::Sum, F32), (Op::Sum, BF16)]);
     let sums = crate::sums::plan(4);
     let lanes: Vec<(Op, u32)> = sums.lanes.iter().map(|l| (l.op, l.elem)).collect();
-    assert_eq!(lanes, [(Op::Sum, BF16), (Op::Gather, F32)]);
+    assert_eq!(lanes, [(Op::Sum, BF16), (Op::Gather, F32), (Op::Sum, F32)]);
     assert_eq!(sums.pools[0].send_bytes as usize, crate::sums::RELAY);
 }
 

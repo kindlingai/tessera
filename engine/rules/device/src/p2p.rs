@@ -7,6 +7,7 @@ use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, IpcHandle, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_mem::DType;
 use tessera_run::Sum;
 
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
@@ -123,7 +124,6 @@ pub struct P2p<D: Device> {
     threads: u32,
     timeout_ticks: u64,
     schedule: Schedule,
-    bf16: bool,
     broken: bool,
 }
 
@@ -251,7 +251,6 @@ where
             threads,
             timeout_ticks,
             schedule: Schedule::Auto,
-            bf16: false,
             broken: false,
         })
     }
@@ -262,19 +261,13 @@ where
         self
     }
 
-    /// Enables BF16 wire transport with FP32 accumulation.
-    pub fn with_bf16(mut self, bf16: bool) -> Self {
-        self.bf16 = bf16;
-        self
-    }
-
     fn read_seq(&self) -> Result<u64, Error> {
         let mut raw = [0u8; 8];
         self.seq.read_bytes(&mut raw)?;
         Ok(u64::from_ne_bytes(raw))
     }
 
-    fn launch_sum(&mut self, from: u64, to: u64, n: u32) -> Result<(), Error> {
+    fn launch_sum(&mut self, from: u64, to: u64, n: u32, bf16: bool) -> Result<(), Error> {
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
@@ -294,10 +287,9 @@ where
         self.ctx.programmatic(false);
         let blocks = (grid, 1, 1);
         let threads = (self.threads, 1, 1);
-        let kernel = if self.bf16 {
-            &self.bf16_kernel
-        } else {
-            &self.kernel
+        let kernel = match bf16 {
+            true => &self.bf16_kernel,
+            false => &self.kernel,
         };
         Ok(self.ctx.launch(kernel, blocks, threads, 0, &mut args)?)
     }
@@ -357,7 +349,18 @@ impl<D> Sum for P2p<D>
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
-    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), tessera_run::Error> {
+    fn sum(
+        &mut self,
+        from: u64,
+        to: u64,
+        len: usize,
+        wire: DType,
+    ) -> Result<(), tessera_run::Error> {
+        let bf16 = match wire {
+            DType::F32 => false,
+            DType::Bf16 => true,
+            other => return Err(tessera_run::Error::Wire(other)),
+        };
         if self.broken {
             return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
                 "an earlier p2p sum failed".into(),
@@ -367,7 +370,7 @@ where
         if n == 0 {
             return Ok(());
         }
-        self.launch_sum(from, to, n)
+        self.launch_sum(from, to, n, bf16)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 
@@ -415,24 +418,17 @@ where
     }
 }
 
-struct Start<'a>(&'a mut dyn Transport, bool);
+struct Start<'a>(&'a mut dyn Transport);
 
 impl OnGpu for Start<'_> {
     type Out = Result<Box<dyn Sum>, Error>;
 
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Ok(Box::new(
-            P2p::on(cached_context::<D>()?, self.0)?.with_bf16(self.1),
-        ))
+        Ok(Box::new(P2p::on(cached_context::<D>()?, self.0)?))
     }
 }
 
 /// Direct P2P sums on the GPU `gpu` names.
 pub fn open(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot, false))
-}
-
-/// Direct P2P sums with BF16 wire transport on `gpu`.
-pub fn open_bf16(gpu: Option<Gpu>, boot: &mut dyn Transport) -> Result<Box<dyn Sum>, Error> {
-    persistent(gpu, Start(boot, true))
+    persistent(gpu, Start(boot))
 }

@@ -159,7 +159,7 @@ fn reduce_makes_partials_whole() {
         assert_eq!(verify(&bad).is_ok(), ok, "{wire:?} on node {at}");
     }
     g.nodes[sum].numerics = Some(Numerics::pinned(DType::F32));
-    g.resolve_wire(DType::Bf16);
+    let g = g.wired(DType::Bf16);
     assert_eq!(g.nodes[sum].numerics.unwrap().wire, Some(DType::F32));
     verify(&g).unwrap();
 }

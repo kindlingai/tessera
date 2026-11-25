@@ -46,7 +46,7 @@ pub use speculate::{Drafter, SpecStats, Speculate, accept_greedy, accept_sample}
 pub use tessera_device::{p2p, sums, whole};
 pub use tessera_engine_comm as comm;
 pub use tessera_engine_settings::{Backend, Memory, Reads};
-pub use tessera_graph::{Bf16, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
+pub use tessera_graph::{Bf16, DType, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
 pub use tessera_interp::{Tensor, bind, fold};
 pub use tessera_lower::{Compute, Filed, Pick, Pins, Recipe, Settings, Site, Weight, form};
 pub use tessera_mem::form as storage;
@@ -319,7 +319,7 @@ impl Engine {
             None => device,
         };
         if let Some(place) = place {
-            graph = place.split(&graph, &recipe.pins)?;
+            graph = place.split(&graph, (&recipe.pins, &recipe.sums))?;
         }
         let device = ranked(Device::guess(settings).with(recipe));
         let mut plans = Cache::default();

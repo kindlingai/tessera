@@ -14,7 +14,7 @@ pub fn rank_plan(g: &Graph, recipe: &Recipe, ranks: u32, rank: u32) -> Plan {
     if ranks > 1 {
         let parts = Parts::even(ranks as usize);
         let sharded = shard_aligned(&g, &parts, &recipe.pins.shares(&g));
-        g = sharded.unwrap().graph;
+        g = sharded.unwrap().graph.wired(tessera_graph::DType::F32);
         device = device.zoned(Cluster::two("a", "b"));
         device = device.ranked((0..ranks).collect()).as_rank(rank);
     }

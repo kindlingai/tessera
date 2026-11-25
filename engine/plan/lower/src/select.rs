@@ -365,7 +365,7 @@ mod report {
     use super::cover::{Cover, EDGE, fits, reads, writes};
     use super::{Home, Selected, Value};
     use crate::cost::Device;
-    use crate::kernels::AllReduce;
+    use crate::kernels::{AllReduce, moved};
     use crate::rule::{Draft, Rule, ways};
     use crate::tree::{T, Term, Tree};
     use std::collections::BTreeMap;
@@ -707,9 +707,8 @@ mod report {
         for op in &selected.ops {
             let out = &selected.values[op.write.0 as usize];
             if op.kernel.name() == AllReduce::NAME {
-                total += device
-                    .all_reduce(out.form.bytes(out.len))
-                    .unwrap_or_default();
+                let bytes = moved(&*op.kernel, out.len, out.form.bytes(out.len));
+                total += device.all_reduce(bytes).unwrap_or_default();
                 continue;
             }
             let reads_weight = op.reads.iter().any(|r| {

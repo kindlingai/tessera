@@ -133,12 +133,14 @@ pub(super) fn open_drafter(
 ) -> Result<Drafter, String> {
     let recipe = Recipe {
         pins: super::generate::kv_pin(o, pair.pins.clone()),
+        sums: o.lower.as_ref().map(|r| r.sums.clone()).unwrap_or_default(),
         ..Recipe::default()
     };
     let mut drafter = match links {
         Some((sums, grid)) => {
             let gpu = settings.gpu().is_some();
-            let place = Place::mesh(sums.ranks() as usize, o.ranks.parts().to_vec(), gpu);
+            let place = Place::mesh(sums.ranks() as usize, o.ranks.parts().to_vec(), gpu)
+                .with_wire(o.ranks.sum_wire());
             Drafter::open_ranked(
                 pair.graph.clone(),
                 o.max_model_len,

@@ -268,13 +268,24 @@ fn share<'w>(
     Ok(Cow::Owned(slice(w, axis as usize, first, count)))
 }
 
-/// The sum over ranks, in rank order.
+/// Sums parts in rank order, each rounded to any wire.
 fn all_reduce(num: &Numerics, parts: &[Tensor]) -> Result<Tensor, Error> {
-    let mut sum = parts[0].clone();
-    for p in &parts[1..] {
-        sum = cpu::stage(num, &Stage::Add, &sum, Some(p))?;
+    let wire = num.wire.unwrap_or(DType::F32);
+    let mut sum: Option<Tensor> = None;
+    for p in parts {
+        let p = match wire {
+            DType::F32 => p.clone(),
+            _ => Tensor::f32(
+                p.shape.clone(),
+                p.floats()?.iter().map(|&x| wire.round(x)).collect(),
+            ),
+        };
+        sum = Some(match sum {
+            None => p,
+            Some(s) => cpu::stage(num, &Stage::Add, &s, Some(&p))?,
+        });
     }
-    Ok(sum)
+    sum.ok_or_else(|| Error::Mismatch("a sum over no ranks".into()))
 }
 
 /// The parts joined on their last axis, in rank order.

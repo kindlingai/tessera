@@ -24,7 +24,10 @@ fn eg2_run() {
         .collect();
     let n = ids.len();
     let (g, weights, _) = model("eg2", &dir, n as u64).unwrap();
-    let sharded = shard(&g, &tessera_graph::Parts::even(2)).unwrap().graph;
+    let sharded = shard(&g, &tessera_graph::Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let settings = runs().pop().unwrap();
     let device = device(&settings, Default::default(), 2, settings.gpu().is_none());
     let sizes = [(Seqs, 1), (Context, n as u64)];

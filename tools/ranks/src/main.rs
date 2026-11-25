@@ -11,22 +11,26 @@ use tessera_bundle::Weights;
 use tessera_device::p2p::Schedule;
 use tessera_device::sums::{self, Sum};
 use tessera_engine_comm::{Fabric, ShmLink, Transport};
-use tessera_frontend_comm::{CAPACITY, Sums, meet, p2p, ports, shared, shm, sums_flag};
+use tessera_frontend_comm::{
+    CAPACITY, Sums, meet, p2p, ports, shared, shm, sum_wire_flag, sums_flag,
+};
 use tessera_graph::DimName::{Context, Seqs};
-use tessera_graph::shard_aligned;
+use tessera_graph::{DType, shard_aligned};
 use tessera_interp::Tensor;
 use tessera_lower::{Cluster, Device, Pick, ZoneKind, lower};
 use tessera_models::preset;
-use tessera_run::{Rank, Run};
+use tessera_run::{Rank, Run, sum_wire};
 
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model NAME] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--sums host|grid|p2p] [--recipe DIR] [--require-favored]
+  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--sums host|grid|p2p]
+  [--sum-wire f32|bf16] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
   persistent grid per rank, over that fabric or the file. --sums p2p runs
-  direct GPU-to-GPU SM-store sums over IPC.
+  direct GPU-to-GPU SM-store sums over IPC. --sum-wire sets the dtype
+  each rank's part crosses as; by default F32, or BF16 for --sums grid.
   The fixture holds model.safetensors, and tokens.txt with logits.f32,
   at its root or under cases/prompt. Its default is ~/.cache/tessera/references/<model>.
   --stub runs ROUNDS sums in one persistent grid per rank instead of a model.
@@ -59,6 +63,8 @@ struct Args {
     sched: Schedule,
     /// How the model's sums run across ranks.
     sums: Sums,
+    /// The dtype each part crosses as. `None`: the transport's.
+    sum_wire: Option<DType>,
     /// A recipe whose grid runs the small model.
     recipe: Option<PathBuf>,
     /// Fail lowering unless the favored rule covers a step.
@@ -93,6 +99,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
         size: 4096,
         sched: Schedule::Auto,
         sums: Sums::Host,
+        sum_wire: None,
         recipe: None,
         require_favored: false,
     };
@@ -117,6 +124,7 @@ fn parse(mut given: impl Iterator<Item = String>) -> Option<Args> {
             "--form" => args.form = Some(value),
             "--repeat" => args.repeat = value.parse().ok().filter(|n| *n > 0)?,
             "--sums" => args.sums = sums_flag(&value)?,
+            "--sum-wire" => args.sum_wire = Some(sum_wire_flag(&value)?),
             "--recipe" => args.recipe = Some(value.into()),
             "--stub" => args.stub = Some(value.parse().ok().filter(|n| *n > 0)?),
             "--size" => args.size = value.parse().ok().filter(|n| *n > 0)?,
@@ -239,11 +247,8 @@ fn join(
         Some(path) => Box::new(shm(path, args.rank, args.ranks as u32, CAPACITY)?),
         None => Box::new(meet(args.rank, &args.addrs, args.listen)?),
     };
-    if matches!(args.sums, Sums::P2p | Sums::P2pBf16) {
-        let sum = match args.sums {
-            Sums::P2pBf16 => tessera_frontend_comm::p2p_bf16(&mut *met, settings)?,
-            _ => p2p(&mut *met, settings)?,
-        };
+    if args.sums == Sums::P2p {
+        let sum = p2p(&mut *met, settings)?;
         return Ok((met, Some(sum)));
     }
     if args.sums == Sums::Grid {
@@ -321,6 +326,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let device = device(&settings, pins, ranks, args.host).as_rank(args.rank);
     let device = device.uneven(parts.0);
     let sizes = [(Seqs, 1), (Context, n as u64)];
+    let (transport, grid) = join(args, &settings)?;
+    let sharded = sharded.wired(sum_wire(args.sum_wire, grid.as_deref()));
     let start = Instant::now();
     let plan = lower(&sharded, 0, &sizes, &device)?;
     let sums = plan
@@ -337,7 +344,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         start.elapsed().as_secs_f64()
     );
 
-    let (transport, grid) = join(args, &settings)?;
     let mut rank = Rank::open(plan, &settings, transport)?.with_grid(grid);
     let sums = match rank.on_device() {
         true => "on the device",

@@ -47,31 +47,10 @@ TESSERA_FN void store_out4(float* p, u32 j, float4 v, bool aligned) {
 
 #if defined(TESSERA_CUDA)
 
-TESSERA_FN float4 load_fresh4(const float* p) {
-    float4 v;
-    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
-                 : "l"(p));
-    return v;
-}
-
 TESSERA_FN void store_vec4(float* p, float4 v) {
     asm volatile("st.global.v4.f32 [%0], {%1, %2, %3, %4};"
                  :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
                  : "memory");
-}
-
-TESSERA_FN uint2 pack_bf16x4(float4 v) {
-    u32 lo, hi;
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(lo) : "f"(v.x), "f"(v.y));
-    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(hi) : "f"(v.z), "f"(v.w));
-    return make_uint2(lo, hi);
-}
-
-TESSERA_FN uint2 load_fresh_u2(const u32* p) {
-    uint2 v;
-    asm volatile("ld.global.cv.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
-    return v;
 }
 
 TESSERA_FN void store_u2(u32* p, uint2 v) {
@@ -80,29 +59,8 @@ TESSERA_FN void store_u2(u32* p, uint2 v) {
 
 #else
 
-TESSERA_FN float4 load_fresh4(const float* p) {
-    return make_float4(prim::load_fresh(p + 0), prim::load_fresh(p + 1),
-                       prim::load_fresh(p + 2), prim::load_fresh(p + 3));
-}
-
 TESSERA_FN void store_vec4(float* p, float4 v) {
     *reinterpret_cast<float4*>(p) = v;
-}
-
-TESSERA_FN u16 to_bf16(float v) {
-    u32 b = __float_as_uint(v);
-    b += 0x7FFFu + ((b >> 16) & 1u);
-    return static_cast<u16>(b >> 16);
-}
-
-TESSERA_FN uint2 pack_bf16x4(float4 v) {
-    u32 lo = u32(to_bf16(v.x)) | (u32(to_bf16(v.y)) << 16);
-    u32 hi = u32(to_bf16(v.z)) | (u32(to_bf16(v.w)) << 16);
-    return make_uint2(lo, hi);
-}
-
-TESSERA_FN uint2 load_fresh_u2(const u32* p) {
-    return make_uint2(prim::load_fresh(p + 0), prim::load_fresh(p + 1));
 }
 
 TESSERA_FN void store_u2(u32* p, uint2 v) {
@@ -111,8 +69,12 @@ TESSERA_FN void store_u2(u32* p, uint2 v) {
 
 #endif
 
+TESSERA_FN uint2 pack_bf16x4(float4 v) {
+    return make_uint2(prim::to_bf16x2(v.x, v.y), prim::to_bf16x2(v.z, v.w));
+}
+
 TESSERA_FN float4 unpack_bf16x4(uint2 p) {
-    return make_float4(__uint_as_float(p.x << 16), __uint_as_float(p.x & 0xFFFF0000u),
+    return make_float4(prim::from_bits(p.x << 16), prim::from_bits(p.x & 0xFFFF0000u),
                        __uint_as_float(p.y << 16), __uint_as_float(p.y & 0xFFFF0000u));
 }
 
@@ -126,11 +88,16 @@ TESSERA_FN float4 round_wire4(float4 v) {
 }
 
 template <bool BF16>
+TESSERA_FN float round_wire(float v) {
+    return BF16 ? prim::round_bf16(v) : v;
+}
+
+template <bool BF16>
 TESSERA_FN float4 load_peer4(u64 slot_ptr, u32 j) {
     if constexpr (BF16) {
-        return unpack_bf16x4(load_fresh_u2(reinterpret_cast<const u32*>(slot_ptr) + j * 2));
+        return unpack_bf16x4(prim::load_fresh4(reinterpret_cast<const u16*>(slot_ptr) + j * 4));
     } else {
-        return load_fresh4(reinterpret_cast<const float*>(slot_ptr) + j * 4);
+        return prim::load_fresh4(reinterpret_cast<const float*>(slot_ptr) + j * 4);
     }
 }
 
@@ -195,7 +162,9 @@ TESSERA_FN void write_slice(u64 area, u64 seq, u32 me, u32 nr, const float* src,
     if (prim::leader_block()) {
         u32 base = (n / 4) * 4;
         u32 rem = n - base;
-        if (threadIdx.x < rem) tail_floats<BF16>(dst, base)[threadIdx.x] = src[base + threadIdx.x];
+        if (threadIdx.x < rem) {
+            tail_floats<BF16>(dst, base)[threadIdx.x] = round_wire<BF16>(src[base + threadIdx.x]);
+        }
     }
 }
 
@@ -223,7 +192,7 @@ TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float
             float acc = 0.0f;
             for (u32 r = 0; r < nr; r++) {
                 const float* peer = tail_floats<BF16>(mine + slot_off(seq, r, nr), base);
-                acc += (r == me) ? src[idx] : prim::load_fresh(peer + threadIdx.x);
+                acc += (r == me) ? round_wire<BF16>(src[idx]) : prim::load_fresh(peer + threadIdx.x);
             }
             dst[idx] = acc;
         }
@@ -256,8 +225,12 @@ TESSERA_FN void add_pair(u64 dst_area, u64 mine, u64 seq, u32 me, u32 prev, u32 
         u32 rem = n - base;
         if (threadIdx.x < rem) {
             u32 idx = base + threadIdx.x;
-            float s = in_ptr[idx] + prim::load_fresh(tail_floats<BF16>(peer, base) + threadIdx.x);
-            if (WRITE_REMOTE) tail_floats<BF16>(remote, base)[threadIdx.x] = s;
+            float s = round_wire<BF16>(in_ptr[idx]) +
+                      prim::load_fresh(tail_floats<BF16>(peer, base) + threadIdx.x);
+            if (WRITE_REMOTE) {
+                s = round_wire<BF16>(s);
+                tail_floats<BF16>(remote, base)[threadIdx.x] = s;
+            }
             dst_buf[idx] = s;
         }
     }
@@ -468,7 +441,7 @@ extern "C" __global__ void tessera_p2p_gather(const u64* areas, u32* counters, u
                     u32 c4 = (q % q_w) << 2;
                     const float* sp = src + u64(row) * rk_w + c4;
                     float4 v = (r == me) ? *reinterpret_cast<const float4*>(sp)
-                                         : p2p::load_fresh4(sp);
+                                         : prim::load_fresh4(sp);
                     *reinterpret_cast<float4*>(dst_base + u64(row) * cols + c4) = v;
                 }
             } else {

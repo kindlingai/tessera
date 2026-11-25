@@ -40,18 +40,19 @@ impl Numerics {
 }
 
 /// Whether `op` sums parts across ranks.
-pub(crate) fn sums_ranks(op: &Op) -> bool {
+pub fn sums_ranks(op: &Op) -> bool {
     matches!(op, Op::Row(r) if r.0.contains(&Stage::AllReduce))
 }
 
 impl Graph {
     /// Gives every cross-rank sum the model left unpinned `wire`.
-    pub fn resolve_wire(&mut self, wire: DType) {
+    pub fn wired(mut self, wire: DType) -> Self {
         for n in &mut self.nodes {
             if let (true, Some(num)) = (sums_ranks(&n.op), &mut n.numerics) {
                 num.wire.get_or_insert(wire);
             }
         }
+        self
     }
 }
 

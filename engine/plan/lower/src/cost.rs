@@ -2,7 +2,7 @@
 
 use crate::form::Pins;
 use crate::kernel::Kernel;
-use crate::kernels::crosses;
+use crate::kernels::{crosses, moved};
 use crate::plan::{Plan, Step};
 use crate::recipe::{Compute, Recipe};
 use crate::rule::{Rule, gather, rules_with};
@@ -456,7 +456,9 @@ impl Device {
         let cold = plan.reads_weight(step) && self.streams(plan.weight_bytes());
         match from.filter(|z| *z != step.zone) {
             Some(from) => self.transfer(from, step.zone, step.write.bytes()),
-            None if crosses(step.kernel.name()) => self.all_reduce(step.write.bytes()),
+            None if crosses(step.kernel.name()) => {
+                self.all_reduce(moved(&*step.kernel, step.write.len, step.write.bytes()))
+            }
             None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len, cold)),
         }
     }

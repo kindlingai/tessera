@@ -31,6 +31,15 @@ impl DType {
     pub fn is_int(self) -> bool {
         matches!(self, DType::I32 | DType::U32)
     }
+
+    /// `x` rounded to this float dtype, ties to even.
+    pub fn round(self, x: f32) -> f32 {
+        match self {
+            DType::Bf16 => f32::from(crate::scalar::Bf16::from(x)),
+            DType::F16 => f32::from(crate::scalar::F16::from(x)),
+            _ => x,
+        }
+    }
 }
 
 /// How a tensor lies across ranks after sharding.

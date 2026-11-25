@@ -22,31 +22,11 @@ struct job {
     // Nonzero: gather `rows` rows into `total` floats.
     u32 rows;
     u32 total;
+    // Nonzero: parts cross as F32, else as BF16.
+    u32 wide;
     u64 waited;
     u64 moved;
 };
-
-__device__ __forceinline__ u16 to_bf16(float x) {
-#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    u32 d;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(0.0f), "f"(x));
-    return static_cast<u16>(d);
-#else
-    u32 b = __float_as_uint(x);
-    if ((b & 0x7fffffffu) > 0x7f800000u) return static_cast<u16>((b >> 16) | 0x0040u);
-    return static_cast<u16>((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
-#endif
-}
-
-__device__ __forceinline__ u32 to_bf16x2(float lo, float hi) {
-#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    u32 d;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
-    return d;
-#else
-    return u32(to_bf16(lo)) | (u32(to_bf16(hi)) << 16);
-#endif
-}
 
 // Copies `len` floats into the send buffer.
 __device__ bool stage_send(const float* src, float* dst, u32 len, u32 first, u32 stride) {
@@ -69,26 +49,31 @@ __device__ bool stage_bf16(const float* src, u16* dst, u32 len, u32 first, u32 s
     if (vec4) {
         for (u32 i = first << 2; i < len; i += stride << 2) {
             float4 v = *reinterpret_cast<const float4*>(src + i);
-            uint2 h = make_uint2(to_bf16x2(v.x, v.y), to_bf16x2(v.z, v.w));
+            uint2 h = make_uint2(prim::to_bf16x2(v.x, v.y), prim::to_bf16x2(v.z, v.w));
             *reinterpret_cast<uint2*>(dst + i) = h;
         }
         return ((blockIdx.x * blockDim.x) << 2) < len;
     }
-    for (u32 i = first; i < len; i += stride) dst[i] = to_bf16(src[i]);
+    for (u32 i = first; i < len; i += stride) dst[i] = prim::to_bf16(src[i]);
     return (blockIdx.x * blockDim.x) < len;
 }
 
+// Lane 0 sums BF16 parts, lane 2 F32 parts.
+template <bool BF16>
 __device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first,
                         u32 stride) {
-    u32 sum_room = room << 1;
+    u32 sum_room = BF16 ? room << 1 : room;
     for (u32 done = 0; done < n; done += sum_room) {
         u32 len = min(sum_room, n - done);
-        ticket r = prepare(s, 0);
-        u16* part = send_buffer<u16>(r);
+        ticket r = prepare(s, BF16 ? 0 : 2);
+        void* part = BF16 ? static_cast<void*>(send_buffer<u16>(r))
+                          : static_cast<void*>(send_buffer<float>(r));
         if (part == nullptr) return false;
-        bool active = stage_bf16(from + done, part, len, first, stride);
+        bool active = BF16 ? stage_bf16(from + done, static_cast<u16*>(part), len, first, stride)
+                           : stage_send(from + done, static_cast<float*>(part), len, first, stride);
+        u64 align = BF16 ? 7ull : 15ull;
         bool vec4 = (len & 3u) == 0u && (reinterpret_cast<u64>(to + done) & 15ull) == 0ull
-                    && (reinterpret_cast<u64>(part) & 7ull) == 0ull;
+                    && (reinterpret_cast<u64>(part) & align) == 0ull;
         bool reads = vec4 ? ((blockIdx.x * blockDim.x) << 2) < len
                           : (blockIdx.x * blockDim.x) < len;
         if (!trigger(r, len, active)) return false;
@@ -176,6 +161,7 @@ extern "C" __global__ void tessera_sums(const table* t) {
             now.timed = j->timed;
             now.rows = j->rows;
             now.total = j->total;
+            now.wide = j->wide;
         }
         prim::block_sync();
         if (live == 0) return;
@@ -197,7 +183,8 @@ extern "C" __global__ void tessera_sums(const table* t) {
         float* to = reinterpret_cast<float*>(now.to);
         bool ok = now.rows > 0
                       ? run_gather(s, from, to, now.n, now.rows, now.total, room, first, stride)
-                      : run_sum(s, from, to, now.n, room, first, stride);
+                  : now.wide != 0 ? run_sum<false>(s, from, to, now.n, room, first, stride)
+                                  : run_sum<true>(s, from, to, now.n, room, first, stride);
         if (!ok) return;
         u64 summed = prim::clock_ticks();
         __threadfence();
@@ -215,7 +202,7 @@ extern "C" __global__ void tessera_sums(const table* t) {
 
 // On the main stream: passes one job, then waits.
 extern "C" __global__ void tessera_hand(const table* t, job* j, u64 from, u64 to, u32 n,
-                                        u32 timed, u32 rows, u32 total, u64 timeout) {
+                                        u32 timed, u32 rows, u32 total, u32 wide, u64 timeout) {
     u64 seq = prim::load_acquire_gpu64(&j->seq) + 1;
     j->from = from;
     j->to = to;
@@ -223,6 +210,7 @@ extern "C" __global__ void tessera_hand(const table* t, job* j, u64 from, u64 to
     j->timed = timed;
     j->rows = rows;
     j->total = total;
+    j->wide = wide;
     prim::store_release_gpu64(&j->seq, seq);
     if (n == 0) return;
     u64 deadline = prim::clock_ticks() + timeout;

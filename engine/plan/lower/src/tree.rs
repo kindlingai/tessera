@@ -445,6 +445,10 @@ impl<'a> Tree<'a> {
                     let crossing = |s: &Stage| s.facts().lower == Lower::Crossing;
                     let stages: Vec<&Stage> =
                         r.0.iter().filter(|s| ranks > 1 || !crossing(s)).collect();
+                    let wired = n.numerics.and_then(|num| num.wire).is_some();
+                    if stages.contains(&&Stage::AllReduce) && !wired {
+                        return Err(Unsupported::Wire { node: i }.into());
+                    }
                     let last = stages.len().saturating_sub(1);
                     for (idx, stage) in stages.into_iter().enumerate() {
                         let operand = (stage.operands() == 1).then(|| rest.next());
@@ -649,6 +653,11 @@ impl<'a> Tree<'a> {
 
     pub fn bytes(&self, t: T) -> usize {
         self.node(t).form.bytes(self.elements(t))
+    }
+
+    /// The wire dtype of the cross-rank sum at `t`.
+    pub fn wire(&self, t: T) -> Option<DType> {
+        self.g.node(self.node(t).from).numerics?.wire
     }
 
     pub fn leaf(&self, t: T) -> bool {

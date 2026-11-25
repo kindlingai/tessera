@@ -24,7 +24,7 @@ use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_lower::kernels::crosses;
 use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
-use tessera_mem::Buffer;
+use tessera_mem::{Buffer, DType};
 
 pub(crate) struct Runner<D: Device> {
     ctx: &'static D,
@@ -438,7 +438,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             }
         }
         if cross && let Some(grid) = sums {
-            grid.sum(0, 0, 0)?;
+            grid.sum(0, 0, 0, DType::F32)?;
         }
         let replay = |r: &Self| {
             let graph = &r.graphs.get(&key).expect("captured above").ranges[&range];

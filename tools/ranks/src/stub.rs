@@ -13,6 +13,7 @@ use tessera_frontend_comm::{CAPACITY, Sums, meet, shared, shm};
 use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::Launch;
+use tessera_graph::DType;
 use tessera_run::Sum;
 
 const STUB: &str = include_str!("all_reduce_stub.cu");
@@ -28,7 +29,7 @@ type Outcome = Result<(), Box<dyn Error>>;
 /// Runs `rounds` sums on the GPU the settings pick.
 pub fn run(args: &Args, rounds: u32) -> Outcome {
     let settings = tessera_frontend_settings::read();
-    if matches!(args.sums, Sums::P2p | Sums::P2pBf16) {
+    if args.sums == Sums::P2p {
         tessera_run::select(settings.device.unwrap_or(args.rank as usize));
     }
     let stub = Stub(args, rounds);
@@ -44,7 +45,7 @@ impl OnGpu for Stub<'_> {
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Outcome {
         let ctx = cached_context::<D>()?;
         match self.0.sums {
-            Sums::P2p | Sums::P2pBf16 => p2p_stub(ctx, self.0, self.1),
+            Sums::P2p => p2p_stub(ctx, self.0, self.1),
             _ => on(ctx, self.0, self.1),
         }
     }
@@ -60,10 +61,9 @@ where
         Some(path) => Box::new(shm(path, rank, ranks, CAPACITY)?),
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
-    let bf16 = args.sums == Sums::P2pBf16;
-    let mut p2p = P2p::on(ctx, &mut *boot)?
-        .with_schedule(args.sched)
-        .with_bf16(bf16);
+    let wire = args.sum_wire.unwrap_or(DType::F32);
+    let bf16 = wire == DType::Bf16;
+    let mut p2p = P2p::on(ctx, &mut *boot)?.with_schedule(args.sched);
     let close = |got: f32, want: f32| {
         if bf16 {
             (got - want).abs() <= want.abs() * 0.02 + 1e-2
@@ -80,26 +80,29 @@ where
     from.write_f32(&mine)?;
     to.zero()?;
     for _ in 0..5 {
-        p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
+        p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
     }
     p2p.check()?;
     boot.exchange(&[])?;
     let start = Instant::now();
     for _ in 0..rounds {
-        p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
+        p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
     }
     p2p.check()?;
     let elapsed = start.elapsed().as_secs_f64();
     let mut got = vec![0f32; n];
     to.read_f32(&mut got)?;
     let triangle = (ranks * (ranks + 1) / 2) as f32;
-    let mut wrong = 0usize;
+    // Every rank must hold the same bits.
+    let bits: Vec<u8> = got.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let sums = boot.exchange(&bits)?;
+    let mut wrong = sums.iter().filter(|s| **s != sums[0]).count();
     for (i, &v) in got.iter().enumerate() {
         let want = (i % 97) as f32 * triangle;
         wrong += usize::from(!close(v, want));
     }
     // Verify in-place all-reduce.
-    p2p.sum(to.device_ptr(), to.device_ptr(), n)?;
+    p2p.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
     p2p.check()?;
     to.read_f32(&mut got)?;
     for (i, &v) in got.iter().enumerate() {
@@ -109,8 +112,8 @@ where
     // Verify CUDA/HIP graph capture and repeated replay.
     if ctx.graphs() && p2p.capturable() {
         let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
-            p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
-            p2p.sum(to.device_ptr(), to.device_ptr(), n)?;
+            p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
+            p2p.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
             Ok(())
         })?;
         for _ in 0..4 {
@@ -148,7 +151,7 @@ where
         if ctx.graphs() && p2p.capturable() {
             g_out.zero()?;
             let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
-                p2p.sum(from.device_ptr(), to.device_ptr(), n)?;
+                p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
                 let ok = p2p.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
                 if !ok {
                     return Err("p2p gather declined inside graph".into());

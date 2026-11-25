@@ -93,7 +93,8 @@ fn glm53_and_qwen3_fuse() {
     let glm6 = mla::stepper::<mla::RotatedMoe>(&glm6_cfg);
     let glm6_tp = shard_mode(&glm6, &Parts::even(2), &bf16_pins.shares(&glm6), false)
         .unwrap()
-        .graph;
+        .graph
+        .wired(tessera_graph::DType::F32);
     let tp_sizes = [(Seqs, 1), (Rows, 1), (Context, 512)];
     let tp_fused = lower(&glm6_tp, 0, &tp_sizes, &tp_device).unwrap();
     let tp_unfused = lower(&glm6_tp, 0, &tp_sizes, &without_add_norm(tp_device.clone())).unwrap();
@@ -109,7 +110,8 @@ fn glm53_and_qwen3_fuse() {
     let qwen = stepper::<Norm, Swiglu>(&Config::qwen3(1, 256));
     let qwen_tp = shard_mode(&qwen, &Parts::even(2), &bf16_pins.shares(&qwen), false)
         .unwrap()
-        .graph;
+        .graph
+        .wired(tessera_graph::DType::F32);
     let q_sizes = [(Seqs, 1), (Rows, 1), (Context, 256)];
     let q_fused = lower(&qwen_tp, 0, &q_sizes, &tp_device).unwrap();
     let q_unfused = lower(&qwen_tp, 0, &q_sizes, &without_add_norm(tp_device.clone())).unwrap();

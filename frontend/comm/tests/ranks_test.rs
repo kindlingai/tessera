@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tessera_engine::comm::Transport;
 use tessera_frontend_comm::{shm, sockets_within};
 use tessera_frontend_settings::read as settings;
-use tessera_graph::{Graph, shard};
+use tessera_graph::{DType, Graph, Numerics, PathSeg, shard, sums_ranks};
 use tessera_interp::{Tensor, run};
-use tessera_lower::{Cluster, Device, Pick, Plan, Settings, View, lower};
+use tessera_lower::{Cluster, Device, Pick, Plan, Recipe, Settings, View, lower};
 use tessera_models::decoder::{Config, Swiglu, program};
 use tessera_run::{Rank, Run};
-use tessera_testkit::{Noise, TCP_TIMEOUT, fill, max_abs_diff, tcp_bind, tcp_pair};
+use tessera_testkit::{Noise, TCP_TIMEOUT, fill, max_abs_diff, stage, tcp_bind, tcp_pair};
 use tessera_trace::DimName::{self, Context, Seqs};
 use tessera_trace::{Norm, TensorType};
 
@@ -58,8 +58,53 @@ fn planned(g: &Graph, host: &Settings) -> [Plan; 2] {
     let device = Device::guess(host)
         .zoned(Cluster::two("a", "b"))
         .ranked(vec![0, 1]);
-    let sharded = shard(g, &tessera_graph::Parts::even(2)).unwrap().graph;
+    let sharded = shard(g, &tessera_graph::Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     [0, 1].map(|r| lower(&sharded, 0, &SIZES, &device.clone().as_rank(r)).unwrap())
+}
+
+/// Wires come from model pins, then the recipe, then setup.
+#[test]
+fn recipe_wires() {
+    let load = |name: &str, text: &str| Recipe::load(&stage(name, text.as_bytes())).unwrap();
+    assert_eq!(
+        load("old.json", r#"{"barred": []}"#).sums,
+        Default::default()
+    );
+    let text = r#"{"sums": {"all": "Bf16", "named": [["*.down", "F32"]]}}"#;
+    let recipe = load("wires.json", text);
+    let mut g = shard(&toy().0, &tessera_graph::Parts::even(2))
+        .unwrap()
+        .graph;
+    let sums: Vec<usize> = (0..g.nodes.len())
+        .filter(|&i| sums_ranks(&g.nodes[i].op))
+        .collect();
+    // The model pins the first sum.
+    g.nodes[sums[0]].numerics = Some(Numerics::pinned(DType::F32));
+    let g = recipe.sums.pin(g).wired(DType::F16);
+    let mut down = 0;
+    for &at in &sums[1..] {
+        let mut id = g.nodes[at].args[0];
+        while !matches!(g.node(id).op, tessera_graph::Op::Matmul) {
+            id = g.node(id).args[0];
+        }
+        let tessera_graph::Op::Weight(w) = g.node(g.node(id).args[1]).op else {
+            panic!("a weight product");
+        };
+        let is_down = PathSeg::dotted(&g.weights[w as usize].path).ends_with(".down");
+        down += usize::from(is_down);
+        let want = if is_down { DType::F32 } else { DType::Bf16 };
+        assert_eq!(g.nodes[at].numerics.unwrap().wire, Some(want));
+    }
+    assert_eq!(g.nodes[sums[0]].numerics.unwrap().wire, Some(DType::F32));
+    tessera_graph::verify(&g).unwrap();
+    assert!(
+        down > 0 && down < sums.len() - 1,
+        "{down} of {}",
+        sums.len()
+    );
 }
 
 /// One rank of `plan` over `transport`, run once.

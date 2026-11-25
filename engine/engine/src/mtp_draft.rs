@@ -51,6 +51,7 @@ impl MtpDrafter {
     ) -> Result<Self, Error> {
         place.rank = sums.rank();
         let grid = place.grid.take();
+        place.settle(grid.as_deref());
         let run = |plan| open_rank(plan, settings, sums, grid);
         Self::placed(graph, context, recipe, settings, Some(&place), run)
     }
@@ -75,7 +76,7 @@ impl MtpDrafter {
                     let path = &graph.weights[w.weight as usize].path;
                     eprintln!("tessera: mtp {path:?} stays whole: {}", w.why);
                 }
-                sharded.graph
+                place.resolve(sharded.graph, &recipe.sums)
             }
             None => graph,
         };

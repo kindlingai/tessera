@@ -25,7 +25,7 @@ pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
 pub use held::{Held, Holds};
 pub use loopback::Loopback;
 pub use profile::{Marks, Profile, Ranks, Region, Spent};
-pub use rank::{Rank, Sum};
+pub use rank::{Rank, Sum, sum_wire};
 pub use run::{Base, Outcome, Reload, Run};
 
 /// A failure while loading or running a plan.
@@ -70,6 +70,8 @@ pub enum Error {
     Unaddressed(usize),
     #[error("a sum of {0} floats does not fit the device")]
     SumTooLong(usize),
+    #[error("these sums carry parts as F32 or Bf16, not {0:?}")]
+    Wire(tessera_mem::DType),
     #[error("a plan over several zones")]
     Zones,
     #[error("kernel file {0}: {1}")]

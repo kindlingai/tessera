@@ -95,7 +95,9 @@ impl Loopback {
                     Tensor::from_bytes(vec![first.write.len], parts[0].dtype(), &joined)
                 }
                 false => {
-                    let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
+                    let wire = crate::rank::wire(first);
+                    let floats = parts.iter().map(|p| p.floats().expect("floats"));
+                    let sum = summed(floats, |x| wire.round(x));
                     Tensor::f32(vec![first.write.len], sum)
                 }
             };

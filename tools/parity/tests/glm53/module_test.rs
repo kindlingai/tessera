@@ -177,7 +177,8 @@ fn module_takes_shards() {
         let step = stepper::<RotatedMoe>(&c);
         let sharded = tessera_graph::shard_mode(&step, &Parts::even(2), &|_, _, _, _| true, tp)
             .unwrap()
-            .graph;
+            .graph
+            .wired(tessera_graph::DType::F32);
         let mut device = Device::default()
             .adding(rule())
             .pinned(pins("_mul1"))
@@ -303,6 +304,7 @@ fn matches_interp(book: &str, router_bf16: bool, tp: bool) {
         tessera_graph::shard_mode(&g, &Parts::even(2), &|_, _, _, _| true, true)
             .unwrap()
             .graph
+            .wired(tessera_graph::DType::F32)
     });
     for &rows in if tp {
         &[1usize, 8, 12][..]

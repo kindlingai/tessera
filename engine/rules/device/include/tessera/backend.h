@@ -151,6 +151,34 @@ TESSERA_FN float from_bits(u32 bits) {
     return __uint_as_float(bits);
 }
 
+// Packs `lo` then `hi` as BF16, ties to even.
+TESSERA_FN u32 to_bf16x2(float lo, float hi) {
+#if defined(TESSERA_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    u32 d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+#else
+    u32 out = 0;
+    float v[2] = {lo, hi};
+    for (u32 k = 0; k < 2; k++) {
+        u32 b = __float_as_uint(v[k]);
+        u32 h = (b & 0x7fffffffu) > 0x7f800000u ? (b >> 16) | 0x0040u
+                                                 : (b + 0x7fffu + ((b >> 16) & 1u)) >> 16;
+        out |= (h & 0xffffu) << (16 * k);
+    }
+    return out;
+#endif
+}
+
+TESSERA_FN u16 to_bf16(float x) {
+    return static_cast<u16>(to_bf16x2(x, 0.0f));
+}
+
+// `x` rounded to BF16 and back.
+TESSERA_FN float round_bf16(float x) {
+    return from_bits(u32(to_bf16(x)) << 16);
+}
+
 TESSERA_FN void block_sync() {
     __syncthreads();
 }

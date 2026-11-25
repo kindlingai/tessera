@@ -247,7 +247,7 @@ impl<'de> Deserialize<'de> for Pins {
 }
 
 /// Whether `name` fits `pattern`. A star stands for anything.
-fn matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn matches(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or("");
     let Some(mut rest) = name.strip_prefix(first) else {

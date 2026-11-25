@@ -17,8 +17,12 @@ use tessera_mem::{DType, Tensor};
 
 /// A sum or gather across ranks between two device addresses.
 pub trait Sum {
-    /// Queues a sum of `len` floats. Zero starts the grid.
-    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), Error>;
+    /// Queues `len` floats as `wire` parts. Zero starts the grid.
+    fn sum(&mut self, from: u64, to: u64, len: usize, wire: DType) -> Result<(), Error>;
+    /// The wire dtype for sums the model leaves unpinned.
+    fn wire(&self) -> DType {
+        DType::F32
+    }
     /// Queues a gather of `part` floats over `rows` rows.
     fn gather(
         &mut self,
@@ -119,6 +123,18 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> RankRun for crate::devi
     }
 }
 
+/// Unpinned sums' wire: `setting`, else `grid`'s, else F32 for host.
+pub fn sum_wire(setting: Option<DType>, grid: Option<&dyn Sum>) -> DType {
+    setting.unwrap_or_else(|| grid.map_or(DType::F32, |g| g.wire()))
+}
+
+/// The wire dtype of all-reduce `step`.
+pub(crate) fn wire(step: &Step) -> DType {
+    step.kernel
+        .wire()
+        .expect("an all-reduce step has a wire dtype")
+}
+
 /// Queues one crossing step on `grid`. False means host fallback.
 pub(crate) fn grid_cross(
     step: &Step,
@@ -127,7 +143,7 @@ pub(crate) fn grid_cross(
     grid: &mut dyn Sum,
 ) -> Result<bool, Error> {
     if step.kernel.name() != AllGather::NAME {
-        grid.sum(from, to, step.write.len)?;
+        grid.sum(from, to, step.write.len, wire(step))?;
         return Ok(true);
     }
     let (src, dst) = (step.reads[0], step.write);
@@ -353,7 +369,10 @@ impl<T: Transport> Rank<T> {
         at = self.lap("all_reduce: transfer", at);
         let floats = |p: &Vec<u8>| Tensor::from_bytes(vec![p.len() / 4], DType::F32, p);
         let parts: Vec<Tensor> = parts.iter().map(floats).collect();
-        let sum = summed(parts.iter().map(|p| p.floats().expect("floats")));
+        let wire = wire(step);
+        let sum = summed(parts.iter().map(|p| p.floats().expect("floats")), |x| {
+            wire.round(x)
+        });
         let sum = Tensor::f32(vec![step.write.len], sum);
         self.runner.run_mut().write(step.write, sum.view())?;
         self.lap("all_reduce: sum", at);

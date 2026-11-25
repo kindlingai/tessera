@@ -48,12 +48,12 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 }
 
 /// The parts summed in rank order. Every rank agrees.
-pub fn summed<'a>(parts: impl Iterator<Item = &'a [f32]>) -> Vec<f32> {
+pub fn summed<'a>(parts: impl Iterator<Item = &'a [f32]>, wire: impl Fn(f32) -> f32) -> Vec<f32> {
     let mut sum: Option<Vec<f32>> = None;
     for part in parts {
         sum = Some(match sum {
-            None => part.to_vec(),
-            Some(s) => s.iter().zip(part).map(|(a, b)| a + b).collect(),
+            None => part.iter().map(|&b| wire(b)).collect(),
+            Some(s) => s.iter().zip(part).map(|(a, &b)| a + wire(b)).collect(),
         });
     }
     sum.expect("a rank")

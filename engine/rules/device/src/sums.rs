@@ -8,6 +8,7 @@ use tessera_engine_comm::Link;
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
 use tessera_gpukit::launch::{KernelArgs, Launch};
+use tessera_mem::DType;
 
 pub use tessera_run::Sum;
 
@@ -20,9 +21,9 @@ const THREADS: u32 = 256;
 /// The grid stays up, so it keeps few blocks.
 const SHARE: u32 = 64;
 /// Bytes of the job the hand kernel passes.
-const JOB: usize = 64;
+const JOB: usize = 72;
 /// Where the job keeps its summed wait and move ticks.
-const TICKS: usize = 48;
+const TICKS: usize = 56;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -52,6 +53,12 @@ pub(crate) fn plan(ranks: u32) -> Plan {
             },
             LanePlan {
                 op: Op::Gather,
+                elem: crate::layout::F32,
+                pool: 0,
+                block: 0,
+            },
+            LanePlan {
+                op: Op::Sum,
                 elem: crate::layout::F32,
                 pool: 0,
                 block: 0,
@@ -93,7 +100,14 @@ where
     L: Link + 'static,
 {
     /// Queues the hand kernel. Zero floats stop the grid.
-    fn hand(&mut self, from: u64, to: u64, n: u32, rows: u32, total: u32) -> Result<(), Error> {
+    fn hand(
+        &mut self,
+        from: u64,
+        to: u64,
+        n: u32,
+        (rows, total): (u32, u32),
+        wide: bool,
+    ) -> Result<(), Error> {
         let timeout = (TIMEOUT.as_secs_f64() * self.ctx.ticks()) as u64;
         let mut args = KernelArgs::new();
         args.device_ptr(self.resident.table())
@@ -104,6 +118,7 @@ where
             .u32(self.timed as u32)
             .u32(rows)
             .u32(total)
+            .u32(wide as u32)
             .u64(timeout);
         self.ctx.programmatic(false);
         let one = (1, 1, 1);
@@ -133,7 +148,7 @@ where
         if !std::mem::take(&mut self.running) {
             return self.resident.status();
         }
-        self.hand(0, 0, 0, 0, 0)?;
+        self.hand(0, 0, 0, (0, 0), false)?;
         self.resident.join()
     }
 }
@@ -152,14 +167,29 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
-    fn sum(&mut self, from: u64, to: u64, len: usize) -> Result<(), tessera_run::Error> {
+    fn sum(
+        &mut self,
+        from: u64,
+        to: u64,
+        len: usize,
+        wire: DType,
+    ) -> Result<(), tessera_run::Error> {
+        let wide = match wire {
+            DType::F32 => true,
+            DType::Bf16 => false,
+            other => return Err(tessera_run::Error::Wire(other)),
+        };
         let n = u32::try_from(len).map_err(|_| tessera_run::Error::SumTooLong(len))?;
         let queued = match n {
             0 => self.start(),
-            n if self.ctx.capturing() => self.hand(from, to, n, 0, 0),
-            n => self.start().and_then(|_| self.hand(from, to, n, 0, 0)),
+            n if self.ctx.capturing() => self.hand(from, to, n, (0, 0), wide),
+            n => (self.start()).and_then(|_| self.hand(from, to, n, (0, 0), wide)),
         };
         queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn wire(&self) -> DType {
+        DType::Bf16
     }
 
     fn gather(
@@ -187,10 +217,10 @@ where
             return Ok(false);
         };
         let queued = match self.ctx.capturing() {
-            true => self.hand(from, to, n, rows, total),
+            true => self.hand(from, to, n, (rows, total), false),
             false => self
                 .start()
-                .and_then(|_| self.hand(from, to, n, rows, total)),
+                .and_then(|_| self.hand(from, to, n, (rows, total), false)),
         };
         queued.map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
         Ok(true)

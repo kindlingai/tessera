@@ -14,8 +14,8 @@ pub(crate) struct Reads {
     pub parts: Vec<(usize, [T; 2])>,
     /// Region outputs. Entries name the one they write.
     pub outputs: Vec<T>,
-    /// Elements of each all-reduce the offers must place.
-    pub sums: Vec<usize>,
+    /// Each all-reduce the offers must place.
+    pub sums: Vec<T>,
 }
 
 impl Reads {
@@ -57,7 +57,7 @@ pub(crate) fn find(tree: &Tree, at: T, kind: Kind) -> Option<(Site, Reads)> {
         inputs,
         outputs,
         kept,
-        sums: reads.sums.clone(),
+        sums: reads.sums.iter().map(|t| tree.elements(*t)).collect(),
         scalars,
     };
     Some((site, reads))
@@ -194,12 +194,14 @@ pub(crate) fn drafts(
             Entry::Sum(sum) => {
                 let len = drafts.get(sum.all_reduce)?.len;
                 // Ranks pair sums by order, so each length must match.
-                if from.sums.get(sums) != Some(&len) {
+                let at = *from.sums.get(sums)?;
+                if tree.elements(at) != len {
                     return None;
                 }
                 sums += 1;
                 let read = [Read::Draft(sum.all_reduce)];
-                (Draft::new(AllReduce { len }, read, len), sum.writes)
+                let wire = tree.wire(at)?;
+                (Draft::new(AllReduce { len, wire }, read, len), sum.writes)
             }
         };
         if let Some(o) = writes

@@ -46,7 +46,10 @@ fn close(label: &str, got: &Tensor, want: &Tensor) {
 pub fn shards(spec: &Spec) {
     let Some(small) = spec.small else { return };
     let g = small();
-    let sharded = shard(&g, &Parts::even(RANKS)).unwrap().graph;
+    let sharded = shard(&g, &Parts::even(RANKS))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let mut noise = Noise(5);
     let mut draw = |ty: &TensorType| fill(&g, ty, &SIZES, &mut noise).unwrap();
     // As bf16, so each rank can load its part packed.
@@ -107,7 +110,8 @@ fn launch(n: usize) -> [Tensor; 3] {
 
 /// A step graph over `parts` matches one rank's logits.
 pub fn step_ranks(g: &Graph, parts: &Parts) -> Sharded {
-    let sharded = shard(g, parts).unwrap();
+    let mut sharded = shard(g, parts).unwrap();
+    sharded.graph = sharded.graph.wired(tessera_graph::DType::F32);
     let mut noise = Noise(7);
     let sizes = [(Seqs, 1), (Context, 8)];
     let mut draw = |ty: &TensorType| fill(g, ty, &sizes, &mut noise).unwrap();

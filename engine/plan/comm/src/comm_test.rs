@@ -11,7 +11,7 @@ use tessera_testkit::{TCP_TIMEOUT, tcp_pair};
 #[test]
 fn rank_order() {
     let parts = [[1.0f32, 2.0], [10.0, 20.0], [100.0, 200.0]];
-    assert_eq!(summed(parts.iter().map(|p| &p[..])), [111.0, 222.0]);
+    assert_eq!(summed(parts.iter().map(|p| &p[..]), |x| x), [111.0, 222.0]);
 }
 
 /// A sized scratch file, open for reading and writing.

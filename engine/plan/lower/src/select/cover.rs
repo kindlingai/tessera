@@ -3,7 +3,7 @@
 use crate::abi::Source;
 use crate::cost::Device;
 use crate::form::F32_FORM;
-use crate::kernels::{AllGather, AllReduce, Narrow, Scatter, Widen};
+use crate::kernels::{AllGather, AllReduce, Narrow, Scatter, Widen, moved};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
@@ -148,19 +148,21 @@ impl Cover<'_> {
         }
         if let Term::Stage(stage @ (Stage::AllReduce | Stage::AllGather)) = &n.term {
             let len = self.tree.elements(t);
-            // A gather costs as a sum of its bytes.
-            let moved = self.device.all_reduce(self.tree.bytes(t))?;
             let (rule, draft) = match stage {
-                Stage::AllReduce => (
-                    AllReduce::NAME,
-                    Draft::new(AllReduce { len }, [n.args[0]], len),
-                ),
+                Stage::AllReduce => {
+                    let wire = self.tree.wire(t)?;
+                    let sum = AllReduce { len, wire };
+                    (AllReduce::NAME, Draft::new(sum, [n.args[0]], len))
+                }
                 _ => {
                     let rows = len / n.shape.last().copied().unwrap_or(1).max(1);
                     let gather = AllGather { len, rows };
                     (AllGather::NAME, Draft::new(gather, [n.args[0]], len))
                 }
             };
+            // A gather costs as a sum of its bytes.
+            let bytes = moved(&*draft.kernel, len, self.tree.bytes(t));
+            let moved = self.device.all_reduce(bytes)?;
             let drafts = vec![draft];
             let cast = self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
             let cost = moved + cast + self.need(n.args[0], zone)?;
@@ -299,7 +301,9 @@ impl Cover<'_> {
     pub(crate) fn seconds(&self, zone: u32, d: &Draft) -> Option<f64> {
         if d.kernel.name() == AllReduce::NAME {
             let form = d.writes.map_or(F32_FORM, |w| self.tree.node(w).form);
-            return self.device.all_reduce(form.bytes(d.len));
+            return self
+                .device
+                .all_reduce(moved(&*d.kernel, d.len, form.bytes(d.len)));
         }
         let weight = |r: &Read| matches!(r, Read::Node(t) if self.tree.weighed(*t));
         let cold = self.streams && d.reads.iter().any(weight);

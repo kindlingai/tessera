@@ -16,7 +16,10 @@ const SIZES: [(DimName, u64); 2] = [(Seqs, 1), (Context, 8)];
 /// The toy graph, sharded too, with faux weights and inputs.
 fn toy() -> (Graph, Graph, Vec<Tensor>, Vec<Tensor>) {
     let g = program::<Norm, Swiglu>(&Config::toy(2, 8));
-    let sharded = shard(&g, &Parts::even(2)).unwrap().graph;
+    let sharded = shard(&g, &Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let mut noise = Noise(5);
     let mut draw = |ty: &TensorType| fill(&g, ty, &SIZES, &mut noise).unwrap();
     let weights = g.weights.iter().map(|w| draw(&w.ty)).collect();

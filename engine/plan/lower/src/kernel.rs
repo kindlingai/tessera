@@ -5,7 +5,7 @@ use crate::plan::Step;
 use std::fmt;
 use std::sync::Arc;
 use tessera_engine_settings::Backend;
-use tessera_graph::Order;
+use tessera_graph::{DType, Order};
 use tessera_platform::Platform;
 use tessera_sim::ZoneKind;
 use tessera_work::Load;
@@ -35,6 +35,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     /// How firmly it orders its sums.
     fn order(&self) -> Order {
         Order::Fixed
+    }
+    /// A cross-rank sum's part dtype on the wire.
+    fn wire(&self) -> Option<DType> {
+        None
     }
     /// Its work and traffic when writing `len` elements.
     fn load(&self, _: usize) -> Option<Load> {

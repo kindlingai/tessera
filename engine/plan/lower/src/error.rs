@@ -20,6 +20,8 @@ pub enum Unsupported {
         form: &'static str,
         align: usize,
     },
+    #[error("node {node} sums across ranks with no wire dtype; resolve it first")]
+    Wire { node: usize },
     #[error("{0}")]
     Uncovered(Box<Uncovered>),
     #[error("any node: no rule crate is linked; add `use rules as _;`")]

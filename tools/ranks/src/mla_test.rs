@@ -96,7 +96,10 @@ fn mla_run() {
     let positions = Tensor::u32(vec![1, ROWS], (0..ROWS as u32).collect());
     let want = run(&g, &floats, 0, &[tokens.clone(), positions.clone()]).unwrap();
     let want = want[0].floats().unwrap();
-    let sharded = shard(&g, &tessera_graph::Parts::even(2)).unwrap().graph;
+    let sharded = shard(&g, &tessera_graph::Parts::even(2))
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let settings = runs().pop().unwrap();
     let device = device(&settings, pins, 2, settings.gpu().is_none());
     let sizes = [(Seqs, 1), (Context, ROWS as u64)];

@@ -54,7 +54,10 @@ fn quarters() -> Config {
 fn uneven_ranks() {
     let g = program::<(), Moe>(&quarters());
     let parts = Parts(vec![3, 1]);
-    let sharded = shard(&g, &parts).unwrap().graph;
+    let sharded = shard(&g, &parts)
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
     let mut noise = Noise(9);
     let mut draw = |ty: &TensorType| fill(&g, ty, &SIZES, &mut noise).unwrap();
     let weights: Vec<Tensor> = g.weights.iter().map(|w| draw(&w.ty)).collect();

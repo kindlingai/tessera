@@ -11,9 +11,9 @@ use syn::{
 };
 
 /// Keys that take `= expr`.
-const VALUES: [&str; 16] = [
+const VALUES: [&str; 17] = [
     "name", "threads", "sizes", "work", "needs", "order", "load", "accepts", "emits", "emits_at",
-    "guess", "runs_on", "source", "launches", "crate", "variant",
+    "guess", "runs_on", "source", "launches", "crate", "variant", "wire",
 ];
 
 /// Keys that stand alone.
@@ -262,6 +262,9 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
     let order = line
         .expr("order")
         .map(|e| quote!(fn order(&self) -> tessera_graph::Order { #e }));
+    let wire = line
+        .expr("wire")
+        .map(|e| quote!(fn wire(&self) -> Option<tessera_graph::DType> { Some(#e) }));
     let guess = guess(&line, &krate)?;
     let runs_on = line
         .expr("runs_on")
@@ -305,6 +308,7 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
             #guess
             #needs
             #order
+            #wire
             #load
             #accepts
             #emits

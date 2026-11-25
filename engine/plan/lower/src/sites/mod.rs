@@ -40,8 +40,8 @@ pub struct Region {
     pub kept: Vec<Appended>,
     /// Per rotated input: its place, then `suh` and `svh`.
     pub parts: Vec<(usize, [T; 2])>,
-    /// Elements of each sum across ranks inside it, in order.
-    pub sums: Vec<usize>,
+    /// Each sum across ranks inside it, in order.
+    pub sums: Vec<T>,
 }
 
 /// Kept rows a region appends to, in `Read::Kept` numbering.
@@ -90,7 +90,7 @@ impl Region {
         for n in inside {
             let node = tree.node(n);
             if node.term == Term::Stage(Step::AllReduce) {
-                sums.push(tree.elements(n));
+                sums.push(n);
             }
             // Gathers stay with the engine.
             if node.term == Term::Stage(Step::AllGather) {

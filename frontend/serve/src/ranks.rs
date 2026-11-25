@@ -1,14 +1,18 @@
 //! One served model over several ranks.
 
 use std::net::SocketAddr;
+use tessera_engine::DType;
 use tessera_engine::comm::{Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Grid, Place, Recipe, Settings};
-use tessera_frontend_comm::{Sums, grid, join, meet, p2p, ports, resident, sums_flag};
+use tessera_frontend_comm::{
+    Sums, grid, join, meet, p2p, ports, resident, sum_wire_flag, sums_flag,
+};
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
-[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|p2p|whole] [--moe ep|tp]]";
+[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|p2p|whole] \
+[--sum-wire f32|bf16] [--moe ep|tp]]";
 
 /// Sums and control transports, and any grid.
 pub(crate) type Links = ([Box<dyn Transport>; 2], Grids);
@@ -32,6 +36,8 @@ pub struct Ranks {
     fabric: Option<Fabric>,
     /// How sums run across ranks.
     sums: Sums,
+    /// The dtype unpinned sums' parts cross as. `None`: the transport's.
+    sum_wire: Option<DType>,
     /// The recipe's resident grid runs each step, sums inside.
     whole: bool,
     /// Split wide routed experts along inner width instead of experts.
@@ -53,6 +59,7 @@ impl Ranks {
             }
             "--sums" if value == "whole" => self.whole = true,
             "--sums" => self.sums = sums_flag(value)?,
+            "--sum-wire" => self.sum_wire = Some(sum_wire_flag(value)?),
             "--moe" => match value {
                 "ep" => self.moe_tp = false,
                 "tp" => self.moe_tp = true,
@@ -84,6 +91,11 @@ impl Ranks {
         self.moe_tp
     }
 
+    /// The dtype unpinned sums' parts cross as, from `--sum-wire`.
+    pub(crate) fn sum_wire(&self) -> Option<DType> {
+        self.sum_wire
+    }
+
     /// Each rank's share of split weights, from `--parts`.
     pub(crate) fn parts(&self) -> &[u32] {
         &self.parts
@@ -105,9 +117,6 @@ impl Ranks {
             }
             (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
             (false, Sums::P2p, _) => p2p(&mut *met, settings).map(Grids::Sums),
-            (false, Sums::P2pBf16, _) => {
-                tessera_frontend_comm::p2p_bf16(&mut *met, settings).map(Grids::Sums)
-            }
             (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
             (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());
@@ -139,7 +148,9 @@ impl Ranks {
                     Grids::Sums(s) => (Some(s), None),
                     Grids::Steps(g) => (None, Some(g)),
                 };
-                let place = place.with_grid(sums_grid).with_moe_tp(self.moe_tp);
+                let place = (place.with_grid(sums_grid))
+                    .with_moe_tp(self.moe_tp)
+                    .with_wire(self.sum_wire);
                 let opened =
                     Engine::open_ranked(graph, context, (recipe, settings), place, sums, control);
                 opened.and_then(|mut e| {

@@ -404,7 +404,8 @@ fn verify_tp_pair(
 
 fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
     let parts = Parts::even(2);
-    let sharded = dflash::shard(g, &parts, &|_, _, _, _| true).unwrap().graph;
+    let sharded = dflash::shard(g, &parts, &|_, _, _, _| true).unwrap();
+    let sharded = sharded.graph.wired(tessera_graph::DType::F32);
     let dim = |name| g.dims.iter().find(|d| d.name == name).unwrap().size.max() as usize;
     let (vocab, tap_w) = (dim(Vocab), dim(Embedding));
     let w = weights(g, &mut Noise(seed));
