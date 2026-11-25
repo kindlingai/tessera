@@ -1,11 +1,12 @@
 //! DFlash block-diffusion drafter conditioned on tapped target states.
 
-use crate::decoder::{HeadNorm, Layer, Mlp, Swiglu};
+use crate::decoder::{HeadNorm, Layer, Mlp, Swiglu, rope_theta};
 pub use crate::dflash_shard::shard;
-use crate::keys::Keys;
+use crate::keys::{At, Keys};
 use crate::shared::{Dense, PreRotated, Rotated, Stack, join_rows, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, Embed, EntryKind, Graph, Kept, Linear, Mask, Model, Norm,
     Pairs, PathSeg, Port, Role, Size, Tensor, TensorType, Vector, Weights,
@@ -122,19 +123,20 @@ pub fn default_layers(target_layers: u64, draft_layers: u64) -> Vec<u64> {
 impl Config {
     /// Reads a DFlash `config.json` against its `target`.
     pub fn read(k: &mut Keys, target: &TargetSpec, max_seqs: u64, max_context: u64) -> Self {
-        k.fixed("hidden_act", json!("silu"));
-        k.fixed("attention_bias", json!(false));
-        k.fixed("mlp_bias", json!(false));
-        let vocab = k.or(&["vocab_size"], target.vocab);
-        let hidden = k.or(&["hidden_size"], target.hidden);
-        let layers: u64 = k.need(&["num_hidden_layers"]);
-        let heads: u64 = k.need(&["num_attention_heads"]);
-        let head_dim = k.or(&["head_dim"], hidden.checked_div(heads).unwrap_or(0));
-        let ffn: u64 = k.need(&["intermediate_size"]);
-        let kv_heads: u64 = k.need(&["num_key_value_heads"]);
-        let rope_theta: f32 = k.need(&["rope_theta", "rope_parameters.rope_theta"]);
-        let eps: f32 = k.need(&["rms_norm_eps"]);
-        let tied = k.or(&["tie_word_embeddings"], target.tied);
+        let top = At::top();
+        k.fix(&top, HIDDEN_ACT.name, json!("silu"));
+        k.fix(&top, ATTENTION_BIAS.name, json!(false));
+        k.fix(&top, MLP_BIAS.name, json!(false));
+        let vocab = k.read_or(&top, VOCAB, target.vocab);
+        let hidden = k.read_or(&top, HIDDEN, target.hidden);
+        let layers = k.read(&top, LAYERS);
+        let heads = k.read(&top, HEADS);
+        let head_dim = k.read_or(&top, HEAD_DIM, hidden.checked_div(heads).unwrap_or(0));
+        let ffn = k.read(&top, FFN);
+        let kv_heads = k.read(&top, KV_HEADS);
+        let rope_theta = rope_theta(k);
+        let eps = k.read(&top, EPS);
+        let tied = k.read_or(&top, TIED, target.tied);
         let block_size = k.or(&["block_size", "dflash_config.block_size"], 16u64);
         if block_size < 2 {
             k.misfit("block_size", "block_size must be at least 2");
@@ -155,9 +157,10 @@ impl Config {
                 format!("layer id past target's {} layers", target.layers),
             );
         }
-        let use_window = k.or(&["use_sliding_window"], false);
+        let use_window = k.read_or(&top, USE_SLIDING_WINDOW, false);
         let sliding_window: Option<u64> = if use_window {
-            k.or(&["sliding_window"], None).filter(|&w| w > 1)
+            k.or(&top.paths(SLIDING_WINDOW.name), None)
+                .filter(|&w| w > 1)
         } else {
             None
         };

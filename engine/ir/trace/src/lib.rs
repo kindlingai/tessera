@@ -3,6 +3,7 @@
 // The derive names `::trace`, also inside this crate.
 extern crate self as tessera_trace;
 
+pub mod hf;
 mod model;
 mod ports;
 mod tensor;

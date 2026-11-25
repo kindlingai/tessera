@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Slice};
+use tessera_engine::hf::ROPE_THETA;
 use tessera_engine::mla::{Config, Index, Moe, RotatedMoe, program, stepper};
 use tessera_engine::{Graph, Pins, Stack, Steps, Weight};
 
@@ -80,7 +81,7 @@ pub fn config(json: &str, seqs: u64, context: u64) -> Result<Config, serde_json:
         _ => None,
     };
     let theta = h.rope_theta.or(h.rope_parameters.map(|r| r.rope_theta));
-    let theta = theta.ok_or_else(|| serde::de::Error::missing_field("rope_theta"))?;
+    let theta = theta.ok_or_else(|| serde::de::Error::missing_field(ROPE_THETA.name))?;
     Ok(Config {
         stack: Stack::sized(sizes, seqs, context),
         dense_layers: h.first_k_dense_replace,

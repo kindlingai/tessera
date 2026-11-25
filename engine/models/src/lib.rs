@@ -20,4 +20,4 @@ pub mod tagger;
 pub mod vae;
 
 pub use shared::{Attend, CalibTaps, Dense, Rotated, Side, Stack, Steps};
-pub use tessera_trace::FEW;
+pub use tessera_trace::{FEW, hf};

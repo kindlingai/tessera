@@ -6,6 +6,7 @@ use crate::parts::{Cut, Part};
 use crate::{Overrides, Weights};
 use std::error::Error;
 use std::path::Path;
+use tessera_engine::hf::MODEL_TYPE;
 use tessera_engine::{Graph, Pins, PleConfig, Steps};
 
 pub(crate) use scattered_collect::declarative::{gather, scatter};
@@ -96,7 +97,7 @@ impl Arch {
         let class = [&v["_class_name"], &v["architectures"][0]];
         for spot in self.spot {
             let hit = match spot {
-                Spot::Type(t) => v["model_type"].as_str() == Some(t),
+                Spot::Type(t) => v[MODEL_TYPE.name].as_str() == Some(t),
                 Spot::Class(c) => class.iter().any(|s| s.as_str() == Some(c)),
                 Spot::Probe(probe) => probe(json),
             };
@@ -162,7 +163,7 @@ pub(crate) fn spot(json: &str) -> Result<&'static Arch> {
     }
     match hits.as_slice() {
         [one] => Ok(one),
-        [] => Err(unknown(v["model_type"].as_str().unwrap_or("the config")).into()),
+        [] => Err(unknown(v[MODEL_TYPE.name].as_str().unwrap_or("the config")).into()),
         many => {
             let names: Vec<&str> = many.iter().map(|a| a.name).collect();
             Err(format!("the config matches {}", names.join(" and ")).into())

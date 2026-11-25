@@ -1,9 +1,9 @@
 //! Qwen3.8-Flash-Next (`qwen4_exp`): 4-stream HC, PLE, GDN, GQA and MoE.
 
-use crate::keys::Keys;
+use crate::keys::{At, Keys};
 use crate::qwen35::{
     DeltaNet, Full, KEY_DIM, KEY_HEADS, L2_EPS, Mixing, Recurrent, VALUE_DIM, VALUE_HEADS, WINDOW,
-    either, mixing, norm, rotary, text,
+    mixing, norm, rope_or, rotary,
 };
 use crate::shared::{
     Attend, CalibTaps, CodedExperts, ExpertSet, NOPE, PlainExperts, ROPE, Stack, Steps, TapSink,
@@ -11,6 +11,7 @@ use crate::shared::{
 };
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::{
     Act, CalibTap, Composite, DType, Dim, DimExpr, DimName, Embed, EntryKind, Graph, Kept, Linear,
     Mask, Model, Pairs, PathSeg, Port, Role, Size, Taps, Tensor, TensorType, Vector, Weights,
@@ -59,75 +60,57 @@ pub struct Config {
 
 impl Config {
     pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        let at = At::text_or_top();
         let fixed = [
-            ("hidden_act", json!("silu")),
-            ("attention_bias", json!(false)),
-            ("output_gate_type", json!("sigmoid")),
+            (HIDDEN_ACT.name, json!("silu")),
+            (ATTENTION_BIAS.name, json!(false)),
+            (OUTPUT_GATE_TYPE.name, json!("sigmoid")),
         ];
         for (key, want) in fixed {
-            k.fixed(&format!("text_config.{key}"), want.clone());
-            k.fixed(key, want);
+            k.fix(&at, key, want);
         }
-        let sizes = [
-            text::<u64>(k, "vocab_size"),
-            text(k, "hidden_size"),
-            text(k, "num_hidden_layers"),
-            text(k, "num_attention_heads"),
-            text(k, "head_dim"),
-            text(k, "moe_intermediate_size"),
-        ];
-        let layers = mixing(k, sizes[2]);
-        let rotary = rotary(k, sizes[4]);
-        let linear = Recurrent {
-            key_heads: text(k, "linear_num_key_heads"),
-            value_heads: text(k, "linear_num_value_heads"),
-            key_dim: text(k, "linear_key_head_dim"),
-            value_dim: text(k, "linear_value_head_dim"),
-            window: text(k, "linear_conv_kernel_dim"),
-        };
-        let ids = ["text_config.ple_layer_ids", "ple_layer_ids"];
+        let [vocab, hidden, layers, heads, head_dim] =
+            [VOCAB, HIDDEN, LAYERS, HEADS, HEAD_DIM].map(|key| k.read(&at, key));
+        let ffn = k.read(&at, "moe_intermediate_size");
+        let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
+        let layers = mixing(k, layers);
+        let rotary = rotary(k, head_dim);
+        let linear = Recurrent::read(k, &at);
+        let ids = at.paths("ple_layer_ids");
         let ple_ids: Vec<u64> = k.or(&ids, Vec::new());
         if ple_ids.len() > 1 {
             k.misfit(
-                ids[0],
+                &ids[0],
                 format!("one PLE layer is supported, not {ple_ids:?}"),
             );
         }
         let ple = ple_ids.first().map(|&id| {
-            let ngram: u32 = text(k, "ngram_size");
-            let per: u64 = text(k, "heads_per_ngram");
+            let ngram: u32 = k.read(&at, "ngram_size");
+            let per: u64 = k.read(&at, "heads_per_ngram");
             Ple {
                 layer: id.saturating_sub(1),
-                dim: text(k, "ple_embed_dim"),
-                window: text(k, "ple_conv_kernel_size"),
+                dim: k.read(&at, "ple_embed_dim"),
+                window: k.read(&at, "ple_conv_kernel_size"),
                 dilation: ngram,
                 heads: per * u64::from(ngram.saturating_sub(1)),
             }
         });
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
-            kv_heads: text(k, "num_key_value_heads"),
+            kv_heads: k.read(&at, KV_HEADS),
             rotary,
-            rope_theta: either(k, "rope_parameters.rope_theta", "rope_theta", 1e7),
-            eps: text(k, "rms_norm_eps"),
-            hc_count: text(k, "hc_count"),
-            hc_rank: text(k, "hc_lowrank"),
-            experts: text(k, "num_experts"),
-            top_k: text(k, "num_experts_per_tok"),
-            shared_ffn: either(
-                k,
-                "shared_expert_intermediate_size",
-                "shared_expert_intermediate_size",
-                sizes[5],
-            ),
+            rope_theta: rope_or(k, ROPE_THETA, 1e7),
+            eps: k.read(&at, EPS),
+            hc_count: k.read(&at, "hc_count"),
+            hc_rank: k.read(&at, "hc_lowrank"),
+            experts: k.read(&at, "num_experts"),
+            top_k: k.read(&at, TOP_K),
+            shared_ffn: k.read_or(&at, "shared_expert_intermediate_size", ffn),
             linear,
             layers,
             ple,
-            eos_token: text(k, "eos_token_id"),
-            tied: k.or(
-                &["text_config.tie_word_embeddings", "tie_word_embeddings"],
-                false,
-            ),
+            eos_token: k.read(&at, "eos_token_id"),
+            tied: k.read_or(&at, TIED, false),
         }
     }
 

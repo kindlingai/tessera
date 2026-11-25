@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tessera_bundle::Overrides;
 use tessera_engine::Recipe;
+use tessera_engine::hf::LAYERS;
 use tessera_engine::progress::{Open, Progress, Unit};
 use tessera_engine::wasm::Module;
 use tessera_tasks::api::Info;
@@ -151,8 +152,7 @@ impl Options {
             // Keeps the first n layers, for quick kernel timing.
             "--layers" => {
                 let n: u64 = value.parse().ok().filter(|n| *n > 0)?;
-                self.config
-                    .set("config.json", "num_hidden_layers", n.into());
+                self.config.set("config.json", LAYERS.name, n.into());
             }
             "--served-model-name" => self.name = Some(value),
             "--task" => self.task = task::names().into_iter().find(|t| *t == value)?,

@@ -1,9 +1,10 @@
 //! CLIP's text tower: learned positions, causal pre-norm blocks.
 
-use crate::keys::Keys;
+use crate::keys::{At, Keys};
 use crate::shared::{Attend, Dense, Stack};
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::tokens;
 use tessera_trace::{
     Act, Dim, Embed, Graph, Linear, Mask, Model, Norm, Role, Tensor, Vector, Weights,
@@ -18,34 +19,24 @@ pub struct Config {
 impl Config {
     /// The text tower `k` describes, cut to `context` tokens.
     pub fn read(k: &mut Keys, max_seqs: u64, context: u64) -> Self {
-        let mut text = |key: &str| -> u64 { k.need(&[&format!("text_config.{key}"), key]) };
-        let [vocab, hidden, layers, heads, ffn, positions] = [
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-            "max_position_embeddings",
-        ]
-        .map(&mut text);
+        let at = At::text_or_top();
+        let [vocab, hidden, layers, heads, ffn] =
+            [VOCAB, HIDDEN, LAYERS, HEADS, FFN].map(|key| k.read(&at, key));
+        let positions_at = "max_position_embeddings";
+        let positions: u64 = k.read(&at, positions_at);
         if heads == 0 || !hidden.is_multiple_of(heads) {
-            k.misfit(
-                "text_config.num_attention_heads",
-                "heads must split hidden_size",
-            );
+            k.misfit(&at.path(HEADS.name), "heads must split hidden_size");
         }
         if context > positions {
             let why = format!("{context} tokens exceed the {positions} positions");
-            k.misfit("text_config.max_position_embeddings", why);
+            k.misfit(&at.path(positions_at), why);
         }
-        for path in ["text_config.hidden_act", "hidden_act"] {
-            k.fixed(path, json!("quick_gelu"));
-        }
+        k.fix(&at, HIDDEN_ACT.name, json!("quick_gelu"));
         let head_dim = hidden.checked_div(heads).unwrap_or(0);
         let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
             stack: Stack::sized(sizes, max_seqs, context),
-            eps: k.need(&["text_config.layer_norm_eps", "layer_norm_eps"]),
+            eps: k.read(&at, "layer_norm_eps"),
         }
     }
 

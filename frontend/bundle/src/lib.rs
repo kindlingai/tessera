@@ -48,7 +48,8 @@ use std::path::Path;
 use tessera_checkpoint::{Offer, Stored};
 use tessera_engine::decoder::Config;
 use tessera_engine::form::{F32_FORM, Load, named};
-use tessera_engine::keys::{Keys, Offered};
+use tessera_engine::hf::MODEL_TYPE;
+use tessera_engine::keys::{At, Keys, Offered};
 use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::wasm::Module;
 use tessera_engine::{DimName, Graph, Pins, PleConfig, Steps, Tensor, Weight};
@@ -401,7 +402,10 @@ pub(crate) fn config(
     overrides: &Overrides,
 ) -> Result<(String, Config), Box<dyn Error + Send + Sync>> {
     overrides.config(dir, |k| {
-        (k.need(&["model_type"]), Config::read(k, slots, context))
+        (
+            k.read(&At::top(), MODEL_TYPE),
+            Config::read(k, slots, context),
+        )
     })
 }
 

@@ -1,11 +1,12 @@
 //! Qwen3.5: gated delta rule layers and gated full attention.
 
 use crate::decoder::{Mlp, Swiglu};
-use crate::keys::Keys;
-use crate::shared::{Attend, NOPE, ROPE, SIZES, Stack, part};
+use crate::keys::{At, Keys};
+use crate::shared::{Attend, NOPE, ROPE, Stack, part, sizes};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::tokens;
 use tessera_trace::{
     Act, Composite, Dim, DimExpr, DimName, Embed, Graph, Linear, Mask, Model, Norm, Pairs, PathSeg,
@@ -55,44 +56,49 @@ pub struct Recurrent {
     pub window: u64,
 }
 
+impl Recurrent {
+    /// The sizes `k` holds in `at`.
+    pub(crate) fn read(k: &mut Keys, at: &At) -> Self {
+        Self {
+            key_heads: k.read(at, LINEAR_KEY_HEADS),
+            value_heads: k.read(at, LINEAR_VALUE_HEADS),
+            key_dim: k.read(at, LINEAR_KEY_DIM),
+            value_dim: k.read(at, LINEAR_VALUE_DIM),
+            window: k.read(at, LINEAR_WINDOW),
+        }
+    }
+}
+
 impl Config {
     /// The model `k` describes, for these launch bounds.
     pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        let at = At::text_or_top();
         let fixed = [
-            ("hidden_act", json!("silu")),
-            ("attention_bias", json!(false)),
+            (HIDDEN_ACT.name, json!("silu")),
+            (ATTENTION_BIAS.name, json!(false)),
             ("attn_output_gate", json!(true)),
-            ("output_gate_type", json!("swish")),
-            ("rope_scaling", json!(null)),
-            ("rope_parameters.rope_type", json!("default")),
-            ("rope_parameters.type", json!("default")),
+            (OUTPUT_GATE_TYPE.name, json!("swish")),
+            (ROPE_SCALING.name, json!(null)),
         ];
         for (key, want) in fixed {
-            k.fixed(&format!("text_config.{key}"), want.clone());
-            k.fixed(key, want);
+            k.fix(&at, key, want);
         }
-        let sizes = SIZES.map(|key| text::<u64>(k, key));
+        for key in [ROPE_TYPE.name, "type"] {
+            k.fix(&at.under(ROPE_PARAMETERS), key, json!("default"));
+        }
+        let sizes = sizes(k, &at);
         let layers = mixing(k, sizes[2]);
         let rotary = rotary(k, sizes[4]);
-        let linear = Recurrent {
-            key_heads: text(k, "linear_num_key_heads"),
-            value_heads: text(k, "linear_num_value_heads"),
-            key_dim: text(k, "linear_key_head_dim"),
-            value_dim: text(k, "linear_value_head_dim"),
-            window: text(k, "linear_conv_kernel_dim"),
-        };
+        let linear = Recurrent::read(k, &at);
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
-            kv_heads: text(k, "num_key_value_heads"),
+            kv_heads: k.read(&at, KV_HEADS),
             rotary,
-            rope_theta: either(k, "rope_parameters.rope_theta", "rope_theta", 1e4),
-            eps: text(k, "rms_norm_eps"),
+            rope_theta: rope_or(k, ROPE_THETA, 1e4),
+            eps: k.read(&at, EPS),
             linear,
             layers,
-            tied: k.or(
-                &["text_config.tie_word_embeddings", "tie_word_embeddings"],
-                false,
-            ),
+            tied: k.read_or(&at, TIED, false),
         }
     }
 
@@ -247,37 +253,30 @@ impl DeltaNet {
 /// The epsilon under the unit norm of queries and keys.
 pub(crate) const L2_EPS: f32 = 1e-6;
 
-/// `key` under `text_config`, else at the top.
-pub(crate) fn text<T: DeserializeOwned + Default>(k: &mut Keys, key: &str) -> T {
-    k.need(&[&format!("text_config.{key}"), key])
-}
-
-/// `first`, else `then`, else `default`, as Hugging Face reads.
-pub(crate) fn either<T: DeserializeOwned>(k: &mut Keys, first: &str, then: &str, default: T) -> T {
-    let then = k.or(&[&format!("text_config.{then}"), then], default);
-    k.or(&[&format!("text_config.{first}"), first], then)
+/// `key` under `rope_parameters`, else beside it, else `default`.
+pub(crate) fn rope_or<T: DeserializeOwned>(k: &mut Keys, key: Key<T>, default: T) -> T {
+    let at = At::text_or_top();
+    let beside = k.read_or(&at, key, default);
+    k.read_or(&at.under(ROPE_PARAMETERS), key, beside)
 }
 
 /// The rotary width of a head `width` wide.
 pub(crate) fn rotary(k: &mut Keys, width: u64) -> u64 {
-    let path = "rope_parameters.partial_rotary_factor";
-    let factor: f64 = either(k, path, "partial_rotary_factor", 0.25);
+    let factor = rope_or(k, PARTIAL_ROTARY, 0.25);
     let turned = (width as f64 * factor) as u64;
     if turned > width || !turned.is_multiple_of(2) {
-        k.misfit(path, format!("{turned} of {width} cannot rotate in pairs"));
+        let path = At::top().under(ROPE_PARAMETERS).path(PARTIAL_ROTARY.name);
+        k.misfit(&path, format!("{turned} of {width} cannot rotate in pairs"));
     }
     turned
 }
 
 /// Each layer's mixer, from `layer_types` or the full-layer interval.
 pub(crate) fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
-    let types: Vec<String> = k.or(&["text_config.layer_types", "layer_types"], Vec::new());
+    let at = At::text_or_top();
+    let types = k.read_or(&at, LAYER_TYPES, Vec::new());
     if types.is_empty() {
-        let path = [
-            "text_config.full_attention_interval",
-            "full_attention_interval",
-        ];
-        let every: u64 = k.or(&path, 4);
+        let every: u64 = k.read_or(&at, "full_attention_interval", 4);
         let kind = |l: u64| match (l + 1).is_multiple_of(every.max(1)) {
             true => Mixing::Full,
             false => Mixing::Linear,
@@ -289,11 +288,11 @@ pub(crate) fn mixing(k: &mut Keys, layers: u64) -> Vec<Mixing> {
         match t.as_str() {
             "linear_attention" => out.push(Mixing::Linear),
             "full_attention" => out.push(Mixing::Full),
-            _ => k.misfit("layer_types", format!("no layer type {t}")),
+            _ => k.misfit(LAYER_TYPES.name, format!("no layer type {t}")),
         }
     }
     if out.len() as u64 != layers {
-        k.misfit("layer_types", "one type per layer");
+        k.misfit(LAYER_TYPES.name, "one type per layer");
     }
     out
 }

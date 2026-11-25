@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
+use tessera_trace::hf::{Key, Named, Object, TEXT_CONFIG};
 
 /// One source of config values, by name.
 pub struct Offered {
@@ -85,20 +86,37 @@ impl<'a> Keys<'a> {
     }
 
     /// The first of `paths` an offer holds, which must exist.
-    pub fn need<T: DeserializeOwned + Default>(&mut self, paths: &[&str]) -> T {
+    pub fn need<T: DeserializeOwned + Default>(&mut self, paths: &[impl AsRef<str>]) -> T {
         match self.find(paths) {
             Some(Some(value)) => value,
             Some(None) => T::default(),
             None => {
-                self.unresolved.missing.push(paths[0].into());
+                self.unresolved.missing.push(paths[0].as_ref().into());
                 T::default()
             }
         }
     }
 
     /// The first of `paths` an offer holds, else `default`.
-    pub fn or<T: DeserializeOwned>(&mut self, paths: &[&str], default: T) -> T {
+    pub fn or<T: DeserializeOwned>(&mut self, paths: &[impl AsRef<str>], default: T) -> T {
         self.find(paths).flatten().unwrap_or(default)
+    }
+
+    /// `key` from the first object in `at` holding it. Required.
+    pub fn read<T: DeserializeOwned + Default>(&mut self, at: &At, key: impl Named<T>) -> T {
+        self.need(&at.paths(key.name()))
+    }
+
+    /// As `read`, else `default` if `key` is absent.
+    pub fn read_or<T: DeserializeOwned>(&mut self, at: &At, key: impl Named<T>, default: T) -> T {
+        self.or(&at.paths(key.name()), default)
+    }
+
+    /// Checks `name` in each object of `at`, as `fixed` does.
+    pub fn fix(&mut self, at: &At, name: &str, want: Value) {
+        for path in at.paths(name) {
+            self.fixed(&path, want.clone());
+        }
     }
 
     /// Checks a value the graph fixes, if offered.
@@ -144,13 +162,14 @@ impl<'a> Keys<'a> {
     }
 
     /// `None` when absent. `Some(None)` on a misfit.
-    fn find<T: DeserializeOwned>(&mut self, paths: &[&str]) -> Option<Option<T>> {
+    fn find<T: DeserializeOwned>(&mut self, paths: &[impl AsRef<str>]) -> Option<Option<T>> {
         let offers = self.offers;
         for (i, offer) in offers.iter().enumerate() {
             let mut held = Vec::new();
             for path in paths {
+                let path = path.as_ref();
                 if let Some(value) = lookup(&offer.root, path) {
-                    held.push((*path, value));
+                    held.push((path, value));
                 }
             }
             let Some(&(first, value)) = held.first() else {
@@ -174,6 +193,60 @@ impl<'a> Keys<'a> {
             });
         }
         None
+    }
+}
+
+/// Objects that may hold a key, earlier first. Root is `""`.
+#[derive(Clone, Debug)]
+pub struct At(Vec<String>);
+
+impl At {
+    pub fn top() -> Self {
+        Self(vec![String::new()])
+    }
+
+    /// Under `text_config` only.
+    pub fn text() -> Self {
+        Self::top().under(TEXT_CONFIG)
+    }
+
+    /// Under `text_config`, else at the root.
+    pub fn text_or_top() -> Self {
+        Self::text().or(Self::top())
+    }
+
+    /// At the root, else under `text_config`.
+    pub fn top_or_text() -> Self {
+        Self::top().or(Self::text())
+    }
+
+    /// These objects, then `then`'s.
+    pub fn or(mut self, then: At) -> Self {
+        self.0.extend(then.0);
+        self
+    }
+
+    /// Each object's child `key`.
+    pub fn under(&self, key: Key<Object>) -> Self {
+        let mut out = Vec::new();
+        for at in &self.0 {
+            out.push(join(at, key.name));
+        }
+        Self(out)
+    }
+
+    /// `name` in each object.
+    pub fn paths(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for at in &self.0 {
+            out.push(join(at, name));
+        }
+        out
+    }
+
+    /// `name` in the first object.
+    pub fn path(&self, name: &str) -> String {
+        join(&self.0[0], name)
     }
 }
 

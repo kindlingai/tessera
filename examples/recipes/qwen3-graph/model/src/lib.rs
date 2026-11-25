@@ -2,6 +2,7 @@
 
 use tessera_guest::{Build, Table};
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, Embed, Graph, Linear, Mask, Model, Norm, Pairs, Tensor,
     TensorType, Weights, pick, step_ports,
@@ -52,14 +53,16 @@ struct Trunk {
 }
 
 /// `config`'s unsigned value at `key`.
-fn size(config: &serde_json::Value, key: &str) -> Result<u64, String> {
+fn size(config: &serde_json::Value, key: Key<u64>) -> Result<u64, String> {
+    let key = key.name;
     config[key]
         .as_u64()
         .ok_or(format!("config.json needs {key}"))
 }
 
 /// `config`'s number at `key`.
-fn number(config: &serde_json::Value, key: &str) -> Result<f32, String> {
+fn number(config: &serde_json::Value, key: Key<f32>) -> Result<f32, String> {
+    let key = key.name;
     let n = config[key]
         .as_f64()
         .ok_or(format!("config.json needs {key}"));
@@ -69,22 +72,22 @@ fn number(config: &serde_json::Value, key: &str) -> Result<f32, String> {
 /// One step entry over `seqs` lanes of `context` rows.
 fn program(config: &serde_json::Value, seqs: u64, context: u64) -> Result<Graph, String> {
     let fixed = [
-        (Vocab, "vocab_size"),
-        (Hidden, "hidden_size"),
-        (Layers, "num_hidden_layers"),
-        (Heads, "num_attention_heads"),
-        (HeadDim, "head_dim"),
-        (Ffn, "intermediate_size"),
-        (KvHeads, "num_key_value_heads"),
+        (Vocab, VOCAB),
+        (Hidden, HIDDEN),
+        (Layers, LAYERS),
+        (Heads, HEADS),
+        (HeadDim, HEAD_DIM),
+        (Ffn, FFN),
+        (KvHeads, KV_HEADS),
     ];
     let mut dims = vec![Dim::bounded(Seqs, seqs), Dim::bounded(Context, context)];
     for (name, key) in fixed {
         dims.push(Dim::fixed(name, size(config, key)?));
     }
     dims.push(Dim::bounded(Rows, context));
-    let theta = number(config, "rope_theta")?;
-    let eps = number(config, "rms_norm_eps")?;
-    let scale = 1.0 / (size(config, "head_dim")? as f32).sqrt();
+    let theta = number(config, ROPE_THETA)?;
+    let eps = number(config, EPS)?;
+    let scale = 1.0 / (size(config, HEAD_DIM)? as f32).sqrt();
 
     let m = Model::new(dims);
     let w: Trunk = tessera_trace::declare(&m);

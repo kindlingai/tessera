@@ -8,6 +8,8 @@ use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::{Offer, Slice, exlr8};
 use tessera_engine::dflash::{Config, DraftQuant, TargetSpec, stepper, stepper_rotated};
+use tessera_engine::hf::{HIDDEN, LAYERS, TIED, VOCAB};
+use tessera_engine::keys::At;
 use tessera_engine::{Graph, Norm, PathSeg, Pins, Steps, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -226,14 +228,12 @@ pub(crate) fn has_norms(slices: &[Slice]) -> bool {
 
 /// Reads the target's shared dimensions from `dir/config.json`.
 fn target_spec(dir: &Path, overrides: &Overrides) -> Result<TargetSpec> {
+    let at = At::top_or_text();
     overrides.config(dir, |k| TargetSpec {
-        vocab: k.need(&["vocab_size", "text_config.vocab_size"]),
-        hidden: k.need(&["hidden_size", "text_config.hidden_size"]),
-        layers: k.need(&["num_hidden_layers", "text_config.num_hidden_layers"]),
-        tied: k.or(
-            &["tie_word_embeddings", "text_config.tie_word_embeddings"],
-            false,
-        ),
+        vocab: k.read(&at, VOCAB),
+        hidden: k.read(&at, HIDDEN),
+        layers: k.read(&at, LAYERS),
+        tied: k.read_or(&at, TIED, false),
     })
 }
 

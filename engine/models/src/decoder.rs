@@ -1,10 +1,11 @@
 //! Decoders: grouped-query attention, RoPE, a dense or routed MLP.
 
-use crate::keys::Keys;
+use crate::keys::{At, Keys};
 pub use crate::shared::Swiglu;
 use crate::shared::{Attend, Dense, Side, Stack, Steps, TapSink, with_head};
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::*;
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, DimName, Embed, Graph, Kept, Linear, Linears, Mask, Model,
     Norm, Pairs, Role, Size, Tensor, TensorType, Weights, listed, pick, sparse_ports, step_ports,
@@ -106,45 +107,46 @@ pub struct Config {
     pub tied: bool,
 }
 
+/// `rope_theta` at the root, else under `rope_parameters`.
+pub(crate) fn rope_theta(k: &mut Keys) -> f32 {
+    let top = At::top();
+    k.read(&top.clone().or(top.under(ROPE_PARAMETERS)), ROPE_THETA)
+}
+
 impl Config {
     /// The decoder `k` describes, for these launch bounds.
     pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
-        k.fixed("hidden_act", json!("silu"));
-        k.fixed("attention_bias", json!(false));
-        k.fixed("mlp_bias", json!(false));
-        k.fixed("rope_scaling", json!(null));
-        k.fixed("use_sliding_window", json!(false));
-        let types: Vec<String> = k.or(&["layer_types"], Vec::new());
+        let top = At::top();
+        k.fix(&top, HIDDEN_ACT.name, json!("silu"));
+        k.fix(&top, ATTENTION_BIAS.name, json!(false));
+        k.fix(&top, MLP_BIAS.name, json!(false));
+        k.fix(&top, ROPE_SCALING.name, json!(null));
+        k.fix(&top, USE_SLIDING_WINDOW.name, json!(false));
+        let types = k.read_or(&top, LAYER_TYPES, Vec::new());
         if types.iter().any(|t| t != "full_attention") {
             k.misfit(
-                "layer_types",
+                LAYER_TYPES.name,
                 "the graph attends to every row in each layer",
             );
         }
-        let [vocab, hidden, layers, heads, ffn] = [
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "intermediate_size",
-        ]
-        .map(|key| k.need::<u64>(&[key]));
-        let head_dim = k.or(&["head_dim"], hidden.checked_div(heads).unwrap_or(0));
+        let [vocab, hidden, layers, heads, ffn] =
+            [VOCAB, HIDDEN, LAYERS, HEADS, FFN].map(|key| k.read(&top, key));
+        let head_dim = k.read_or(&top, HEAD_DIM, hidden.checked_div(heads).unwrap_or(0));
         let sizes = [vocab, hidden, layers, heads, head_dim, ffn];
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
-            kv_heads: k.need(&["num_key_value_heads"]),
-            rope_theta: k.need(&["rope_theta", "rope_parameters.rope_theta"]),
-            eps: k.need(&["rms_norm_eps"]),
+            kv_heads: k.read(&top, KV_HEADS),
+            rope_theta: rope_theta(k),
+            eps: k.read(&top, EPS),
             experts: k.or(&["num_local_experts"], 0),
-            top_k: k.or(&["num_experts_per_tok"], 0),
+            top_k: k.read_or(&top, TOP_K, 0),
             scales: Scales {
                 embed: k.or(&["embedding_multiplier"], 1.0),
                 attention: k.or(&["attention_multiplier"], None),
                 residual: k.or(&["residual_multiplier"], 1.0),
                 logits: 1.0 / k.or(&["logits_scaling"], 1.0),
             },
-            tied: k.or(&["tie_word_embeddings"], false),
+            tied: k.read_or(&top, TIED, false),
         }
     }
 

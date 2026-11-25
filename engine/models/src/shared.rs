@@ -1,7 +1,9 @@
 //! Pieces every token model's program uses.
 
+use crate::keys::{At, Keys};
 use std::cell::RefCell;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::{FFN, HEAD_DIM, HEADS, HIDDEN, LAYERS, VOCAB};
 use tessera_trace::{
     Act, CalibTap, Dim, DimExpr, DimName, Embed, FEW, Graph, Linear, Linears, Model, Pairs,
     PathSeg, Role, Tensor, Vector, Weights,
@@ -260,15 +262,10 @@ pub struct Stack {
     pub taps: Vec<u64>,
 }
 
-/// Config keys for `Stack::sized`'s sizes, in its order.
-pub(crate) const SIZES: [&str; 6] = [
-    "vocab_size",
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "head_dim",
-    "intermediate_size",
-];
+/// `Stack::sized`'s sizes under `at`, each required.
+pub(crate) fn sizes(k: &mut Keys, at: &At) -> [u64; 6] {
+    [VOCAB, HIDDEN, LAYERS, HEADS, HEAD_DIM, FFN].map(|key| k.read(at, key))
+}
 
 impl Stack {
     /// `[vocab, hidden, layers, heads, head_dim, ffn]`, then the launch bounds.

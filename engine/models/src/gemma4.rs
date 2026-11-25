@@ -1,10 +1,11 @@
 //! Gemma 4 text: a causal decoder with per-layer embeddings.
 
 use crate::eg2::{Attention, FULL_HEAD_DIM, Layer, PER_LAYER, after, context, full_layers};
-use crate::keys::Keys;
-use crate::shared::{Attend, Dense, Side, Stack};
+use crate::keys::{At, Keys};
+use crate::shared::{Attend, Dense, Side, Stack, sizes};
 use serde_json::json;
 use tessera_trace as trace;
+use tessera_trace::hf::*;
 use trace::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Seqs};
 use trace::{Act, Composite, Dim, DimExpr, Embed, Graph, Kept, Mask, Model, Norm, Pairs, PathSeg};
 use trace::{Role, Size, Tensor, TensorType, Weights};
@@ -33,55 +34,43 @@ pub struct Config {
 impl Config {
     /// The config `k` holds, for these launch bounds.
     pub fn read(k: &mut Keys, max_seqs: u64, max_context: u64) -> Self {
+        let text = At::text();
+        let rope = text.under(ROPE_PARAMETERS);
+        let [sliding, full] = [SLIDING_ATTENTION, FULL_ATTENTION].map(|key| rope.under(key));
         let fixed = [
-            ("model_type", json!("gemma4_text")),
-            ("hidden_activation", json!("gelu_pytorch_tanh")),
-            ("attention_bias", json!(false)),
+            (MODEL_TYPE.name, json!("gemma4_text")),
+            (HIDDEN_ACTIVATION.name, json!("gelu_pytorch_tanh")),
+            (ATTENTION_BIAS.name, json!(false)),
             ("attention_k_eq_v", json!(false)),
             ("enable_moe_block", json!(false)),
             ("use_double_wide_mlp", json!(false)),
-            ("tie_word_embeddings", json!(true)),
-            (
-                "rope_parameters.sliding_attention.rope_type",
-                json!("default"),
-            ),
-            (
-                "rope_parameters.full_attention.rope_type",
-                json!("proportional"),
-            ),
+            (TIED.name, json!(true)),
         ];
         for (key, want) in fixed {
-            k.fixed(&format!("text_config.{key}"), want);
+            k.fix(&text, key, want);
         }
-        let sizes = [
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "head_dim",
-            "intermediate_size",
-        ]
-        .map(|key| k.need(&[&format!("text_config.{key}")]));
+        k.fix(&sliding, ROPE_TYPE.name, json!("default"));
+        k.fix(&full, ROPE_TYPE.name, json!("proportional"));
+        let sizes = sizes(k, &text);
         let [vocab, _, layers, ..] = sizes;
-        k.fixed("text_config.vocab_size_per_layer_input", json!(vocab));
-        let kv_heads = k.need(&["text_config.num_key_value_heads"]);
-        let full_kv: Option<u64> = k.or(&["text_config.num_global_key_value_heads"], None);
-        if full_kv.is_some_and(|n| n != kv_heads) {
+        k.fix(&text, "vocab_size_per_layer_input", json!(vocab));
+        let kv_heads = k.read(&text, KV_HEADS);
+        let full_kv = "num_global_key_value_heads";
+        let held: Option<u64> = k.read_or(&text, full_kv, None);
+        if held.is_some_and(|n| n != kv_heads) {
             let why = "the graph gives full layers the sliding layers' key heads";
-            k.misfit("text_config.num_global_key_value_heads", why);
+            k.misfit(&text.path(full_kv), why);
         }
-        let full_head_dim: u64 = k.need(&["text_config.global_head_dim"]);
-        let part: f32 = k.or(
-            &["text_config.rope_parameters.full_attention.partial_rotary_factor"],
-            1.0,
-        );
-        let shared: u64 = k.need(&["text_config.num_kv_shared_layers"]);
+        let full_head_dim: u64 = k.read(&text, "global_head_dim");
+        let part = k.read_or(&full, PARTIAL_ROTARY, 1.0) as f32;
+        let shared_at = "num_kv_shared_layers";
+        let shared: u64 = k.read(&text, shared_at);
         let full_every = full_layers(k, layers);
         let first_shared = layers.saturating_sub(shared);
         // Each kind needs an own layer to keep its keys.
         if first_shared < full_every {
             let why = "a kind of layer has no earlier layer to read keys from";
-            k.misfit("text_config.num_kv_shared_layers", why);
+            k.misfit(&text.path(shared_at), why);
         }
         Self {
             stack: Stack::sized(sizes, max_seqs, max_context),
@@ -89,13 +78,13 @@ impl Config {
             full_every,
             full_head_dim,
             full_turned: (part * full_head_dim as f32) as u32 / 2,
-            per_layer: k.need(&["text_config.hidden_size_per_layer_input"]),
-            window: k.need(&["text_config.sliding_window"]),
-            theta: k.need(&["text_config.rope_parameters.sliding_attention.rope_theta"]),
-            full_theta: k.need(&["text_config.rope_parameters.full_attention.rope_theta"]),
+            per_layer: k.read(&text, PER_LAYER_INPUT),
+            window: k.read(&text, SLIDING_WINDOW),
+            theta: k.read(&sliding, ROPE_THETA),
+            full_theta: k.read(&full, ROPE_THETA),
             first_shared,
-            eps: k.need(&["text_config.rms_norm_eps"]),
-            cap: k.or(&["text_config.final_logit_softcapping"], None),
+            eps: k.read(&text, EPS),
+            cap: k.read_or(&text, "final_logit_softcapping", None),
         }
     }
 

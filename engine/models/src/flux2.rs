@@ -1,9 +1,10 @@
 //! FLUX.2's flow transformer: double-stream blocks, then single-stream.
 
-use crate::keys::Keys;
+use crate::keys::{At, Keys};
 use crate::shared::{join, spread};
 use serde_json::json;
 use tessera_trace::DimName::*;
+use tessera_trace::hf::{HEADS, ROPE_THETA};
 use tessera_trace::{
     Act, Composite, DType, Dim, DimExpr, EntryKind, Graph, Linear, Mask, Model, Norm, Pairs,
     PathSeg, Port, Role, Tensor, TensorType, Weights,
@@ -42,7 +43,7 @@ impl Config {
         k.fixed("patch_size", json!(1));
         k.fixed("guidance_embeds", json!(false));
         k.fixed("timestep_guidance_channels", json!(TIME));
-        let heads: u64 = k.need(&["num_attention_heads"]);
+        let heads = k.read(&At::top(), HEADS);
         let head_dim: u64 = k.need(&["attention_head_dim"]);
         let hidden = heads * head_dim;
         let ratio: f32 = k.need(&["mlp_ratio"]);
@@ -63,7 +64,7 @@ impl Config {
             text,
             double: k.need(&["num_layers"]),
             single: k.need(&["num_single_layers"]),
-            theta: k.need(&["rope_theta"]),
+            theta: k.read(&At::top(), ROPE_THETA),
             axes,
             eps: k.need(&["eps"]),
             max_seqs,
