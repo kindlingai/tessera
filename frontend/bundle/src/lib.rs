@@ -498,6 +498,22 @@ pub fn forward(
     forward(arch, &arch::Ask::plain(dir, sizes, overrides, &json))
 }
 
+/// `own`, else the built-in format `template` writes.
+pub(crate) fn respond(
+    template: &mut Option<Template>,
+    own: Option<ResponseParser>,
+) -> Result<Option<ResponseParser>, Box<dyn Error + Send + Sync>> {
+    let response = match (own, template.as_ref()) {
+        (None, Some(chat)) => ResponseParser::builtin(chat)?,
+        (own, _) => own,
+    };
+    if let (Some(chat), Some(prompt)) = (template, response.as_ref().and_then(|r| r.tool_prompt()))
+    {
+        chat.with_tool_prompt(prompt)?;
+    }
+    Ok(response)
+}
+
 /// The graph and weights with `dir`'s tokenizer, template, stops.
 fn dressed(
     dir: &Path,
@@ -509,18 +525,8 @@ fn dressed(
     let tokenizer = Hf::open(&dir.join("tokenizer.json"))?;
     let tok_cfg = overrides.merged("tokenizer_config.json", &dir.join("tokenizer_config.json"))?;
     let mut template = Template::from_config(dir, &tok_cfg)?;
-    let mut response = ResponseParser::from_config(&tok_cfg)?;
-    if response.is_none()
-        && let Some(chat) = &template
-    {
-        response = ResponseParser::builtin(chat)?;
-    }
-    if let (Some(chat), Some(prompt)) = (
-        &mut template,
-        response.as_ref().and_then(|r| r.tool_prompt()),
-    ) {
-        chat.with_tool_prompt(prompt)?;
-    }
+    let own = ResponseParser::from_config(&tok_cfg)?;
+    let response = respond(&mut template, own)?;
     let mut stop = match std::fs::read_to_string(dir.join("generation_config.json")) {
         Ok(text) => match serde_json::from_str::<Generation>(&text)?.eos_token_id {
             Some(Ids::One(id)) => vec![id],

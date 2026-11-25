@@ -23,6 +23,7 @@ macro_rules! formats {
 
 /// Most specific first: a longer marker set wins.
 const FORMATS: &[Format] = formats! {
+    "gemma4";
     "deepseek";
     "granite";
     "qwen35" also "<function=";

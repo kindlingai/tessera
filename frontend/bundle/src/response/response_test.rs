@@ -186,6 +186,7 @@ fn deepseek_family_default() {
 #[test]
 fn picks_builtin_format() {
     let cases = [
+        ("{{ '<|tool_call>call:' + name }}", Some("gemma4")),
         ("{{ '<｜tool▁call▁begin｜>' + name }}", Some("deepseek")),
         ("{{ '<|tool_call|>' }}", Some("granite")),
         ("{{ '<tool_call>\\n<function=' + name }}", Some("qwen35")),

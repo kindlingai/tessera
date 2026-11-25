@@ -177,10 +177,11 @@ pub(crate) fn load(
     let graph = (crate::decoder::family(arch)?.step)(&config);
     let layers = config.stack.layers;
     let (weights, pins) = crate::pull(&graph, &gguf, layers, &[user])?;
-    let template = gguf
+    let mut template = gguf
         .str("tokenizer.chat_template")
         .map(|s| Template::new(s.to_owned()))
         .transpose()?;
+    let response = crate::respond(&mut template, None)?;
     let mut stop = Vec::new();
     for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
         if let Some(id) = gguf.u64(key) {
@@ -196,7 +197,7 @@ pub(crate) fn load(
         pins: Some(pins),
         tokenizer: tokenizer(&gguf)?,
         template,
-        response: None,
+        response,
         stop,
         config: None,
         ple: None,
