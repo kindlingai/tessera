@@ -20,8 +20,10 @@ pub struct Config {
     pub client_id: String,
     pub client_secret: String,
     pub session_key: Vec<u8>,
-    /// Logins that may change tiers.
-    pub editors: Vec<String>,
+    /// GitHub user ids that may use the board.
+    pub editors: Vec<u64>,
+    /// The scheme and host that serve the board.
+    pub origin: String,
     pub api: String,
     pub web: String,
 }

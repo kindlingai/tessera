@@ -6,10 +6,10 @@ use std::cell::RefCell;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-const KEY: &[u8] = b"test key";
+const KEY: &[u8] = b"a test key of thirty-two bytes..";
 const HERE: &str = "https://tiers.test";
 
-/// #3 was labelled before #2. An agent labelled #4.
+/// #3 was labelled first. An agent labelled #4.
 const PULLS: &str = r#"{"data":{"repository":{"pullRequests":{
 "pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
 {"number":2,"title":"<script>alert(1)</script>","isDraft":true,
@@ -19,20 +19,21 @@ const PULLS: &str = r#"{"data":{"repository":{"pullRequests":{
  "timelineItems":{"nodes":[{"createdAt":"2026-11-02T00:00:00Z",
   "label":{"name":"priority"},"actor":{"login":"tiers","__typename":"Bot"}}]},
  "comments":{"nodes":[{"author":{"login":"github-actions","__typename":"Bot"},
-  "body":"<!-- pr-overlap -->\n- conflict #3: `a/<b>.rs`\n- shared #4: `c.rs`, `d.rs`"}]}},
+  "body":"<!-- conflict-notice -->\n### Overlap with other open pull requests\nThese open PRs conflict with this PR in the files listed.\nThe PR that merges second must rebase.\n\n- #3: `a/<b>.rs`\n\nThese open PRs change the same files as this PR, with no conflict.\n\n- #4: `c.rs` `d.rs`\n\nThis notice fails no check.\n"}]}},
 {"number":3,"title":"first","isDraft":false,"author":null,
  "labels":{"nodes":[{"name":"priority"}]},"commits":{"nodes":[]},
  "timelineItems":{"nodes":[{"createdAt":"2026-11-01T00:00:00Z",
   "label":{"name":"priority"},"actor":{"login":"tiers","__typename":"Bot"}}]},
  "comments":{"nodes":[{"author":{"login":"ann","__typename":"User"},
-  "body":"<!-- pr-overlap -->\n- conflict #9: `forged.rs`"}]}},
+  "body":"<!-- conflict-notice -->\nThese open PRs conflict with this PR\n\n- #9: `forged.rs`"}]}},
 {"number":4,"title":"agent","isDraft":false,"author":null,
  "labels":{"nodes":[{"name":"landing"}]},"commits":{"nodes":[]},
  "timelineItems":{"nodes":[{"createdAt":"2026-11-03T00:00:00Z",
   "label":{"name":"landing"},"actor":{"login":"mmastrac","__typename":"User"}}]},
- "comments":{"nodes":[]}}]}}}}"#;
+ "comments":{"nodes":[{"author":{"login":"github-actions","__typename":"Bot"},
+  "body":"<!-- conflict-notice -->\n### Overlap with other open pull requests\nNone found.\n"}]}}]}}}}"#;
 
-/// Records each call as `METHOD url authorization`.
+/// Records each call as `METHOD path authorization body`.
 #[derive(Default)]
 struct Fake {
     calls: RefCell<Vec<String>>,
@@ -49,13 +50,16 @@ impl Host for Fake {
             ("POST", "/graphql") => PULLS,
             ("GET", "/repos/o/r/pulls/5") => r#"{"state":"open","labels":[{"name":"landing"}]}"#,
             ("POST", "/login/oauth/access_token") => r#"{"access_token":"user"}"#,
-            ("GET", "/user") => r#"{"login":"Matt"}"#,
+            ("GET", "/user") => r#"{"login":"Matt","id":7}"#,
             _ => "[]",
         };
-        let line = format!("{} {path} {auth}", call.method);
+        let sent = call.body.unwrap_or_default();
+        let line = format!("{} {path} {auth} {sent}", call.method);
         self.calls.borrow_mut().push(line);
+        // The landing label is gone when the delete arrives.
+        let status = if call.method == "DELETE" { 404 } else { 200 };
         Ok(Reply {
-            status: 200,
+            status,
             body: body.into(),
         })
     }
@@ -89,7 +93,8 @@ fn send(fake: &Fake, request: &Request) -> Response {
         client_id: "id".into(),
         client_secret: "secret".into(),
         session_key: KEY.into(),
-        editors: vec!["matt".into()],
+        editors: vec![7],
+        origin: HERE.into(),
         api: "https://api.test".into(),
         web: "https://web.test".into(),
     };
@@ -100,6 +105,7 @@ fn send(fake: &Fake, request: &Request) -> Response {
 fn request(method: &str, path: &str, login: &str, body: &str) -> Request {
     let session = Session {
         login: login.into(),
+        id: if login == "Matt" { 7 } else { 9 },
         csrf: "token".into(),
         expires: 2000,
     };
@@ -112,7 +118,6 @@ fn request(method: &str, path: &str, login: &str, body: &str) -> Request {
         method: method.into(),
         path: path.into(),
         query: query.into(),
-        origin: HERE.into(),
         cookie,
         source: HERE.into(),
         body: body.into(),
@@ -126,6 +131,9 @@ fn ask(fake: &Fake, method: &str, path: &str, login: &str, body: &str) -> Respon
 #[test]
 fn editor_moves_tier() {
     let fake = Fake::default();
+    let page = ask(&fake, "GET", "/", "Matt", "").body;
+    assert!(page.contains(r#"<button name="tier" value="priority">to priority</button>"#));
+    fake.calls.borrow_mut().clear();
     let done = ask(
         &fake,
         "POST",
@@ -135,11 +143,12 @@ fn editor_moves_tier() {
     );
     assert_eq!(done.status, 303);
     let calls = fake.calls.borrow();
+    let labels = "/repos/o/r/issues/5/labels";
+    let added = format!(r#"POST {labels} Bearer app {{"labels":["priority"]}}"#);
     assert_eq!(
-        calls[3],
-        "DELETE /repos/o/r/issues/5/labels/landing Bearer app"
+        calls[3..],
+        [added, format!("DELETE {labels}/landing Bearer app ")]
     );
-    assert_eq!(calls[4], "POST /repos/o/r/issues/5/labels Bearer app");
 }
 
 #[test]
@@ -153,18 +162,20 @@ fn refuses_other_callers() {
     let mut foreign = request("POST", "/tier", "Matt", body);
     foreign.source = "https://evil.test".into();
     assert_eq!(send(&fake, &foreign).status, 403);
+    assert_eq!(ask(&fake, "GET", "/", "ann", "").status, 403);
+    assert!(ask(&fake, "GET", "/", "", "").body.contains("/login"));
     assert!(fake.calls.borrow().is_empty());
 }
 
 #[test]
 fn board_escapes_text() {
-    let page = ask(&Fake::default(), "GET", "/", "ann", "").body;
+    let page = ask(&Fake::default(), "GET", "/", "Matt", "").body;
     assert!(page.contains("&lt;script&gt;alert(1)") && !page.contains("<script>"));
     assert!(page.contains("conflicts with #3: a/&lt;b&gt;.rs"));
     assert!(page.contains("shares files with #4: c.rs, d.rs"));
     assert!(page.contains("label set by mmastrac") && !page.contains("forged.rs"));
+    assert!(page.contains("no overlap report") && page.contains("no overlaps"));
     assert!(page.find("#3 first").unwrap() < page.find("#2 ").unwrap());
-    assert!(!page.contains("action=\"/tier\""));
 }
 
 #[test]
@@ -179,6 +190,6 @@ fn sign_in_sets_session() {
     assert!(cookie.ends_with("; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"));
     let value = cookie.split_once(';').unwrap().0;
     let value = session::cookie(value, session::NAME).unwrap();
-    assert_eq!(session::open(KEY, value, 1000).unwrap().login, "Matt");
+    assert_eq!(session::open(KEY, value, 1000).unwrap().id, 7);
     assert!(session::open(b"other", value, 1000).is_none());
 }

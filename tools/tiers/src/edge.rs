@@ -6,14 +6,22 @@ use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::signature::{SignatureEncoding, Signer};
 use sha2::Sha256;
+use std::sync::OnceLock;
 use worker::{Context, Env, Fetch, Headers, Method, RequestInit, event};
 
 fn fault(error: worker::Error) -> Fault {
     Fault::new(502, error.to_string())
 }
 
+/// The app key, read once per Worker instance.
+static KEY: OnceLock<SigningKey<Sha256>> = OnceLock::new();
+
 struct Edge {
-    key: SigningKey<Sha256>,
+    key: &'static SigningKey<Sha256>,
+}
+
+fn bad(name: &str, error: impl std::fmt::Display) -> worker::Error {
+    worker::Error::RustError(format!("{name}: {error}"))
 }
 
 impl Host for Edge {
@@ -56,28 +64,32 @@ async fn fetch(
     _ctx: Context,
 ) -> worker::Result<worker::Response> {
     let secret = |name: &str| env.secret(name).map(|s| s.to_string());
-    let editors = env.var("EDITORS")?.to_string();
+    let mut editors = Vec::new();
+    for id in secret("EDITORS")?.split(',') {
+        editors.push(id.trim().parse().map_err(|e| bad("EDITORS", e))?);
+    }
     let config = Config {
         repo: env.var("REPO")?.to_string(),
         client_id: secret("CLIENT_ID")?,
         client_secret: secret("CLIENT_SECRET")?,
         session_key: secret("SESSION_KEY")?.into_bytes(),
-        editors: editors.split(',').map(|e| e.trim().to_string()).collect(),
+        editors,
+        origin: secret("ORIGIN")?,
         api: "https://api.github.com".into(),
         web: "https://github.com".into(),
     };
-    let key = PrivateKey::from_pkcs1_pem(&secret("APP_KEY")?)
-        .map_err(|e| worker::Error::RustError(format!("APP_KEY: {e}")))?;
-    let edge = Edge {
-        key: SigningKey::new(key),
-    };
+    if KEY.get().is_none() {
+        let key = PrivateKey::from_pkcs1_pem(&secret("APP_KEY")?);
+        let _ = KEY.set(SigningKey::new(key.map_err(|e| bad("APP_KEY", e))?));
+    }
+    let key = KEY.get().expect("the key was set above");
+    let edge = Edge { key };
     let url = req.url()?;
     let header = |name: &str| req.headers().get(name).map(Option::unwrap_or_default);
     let request = Request {
         method: req.method().to_string(),
         path: url.path().into(),
         query: url.query().unwrap_or_default().into(),
-        origin: url.origin().ascii_serialization(),
         cookie: header("cookie")?,
         source: header("origin")?,
         body: req.text().await?,

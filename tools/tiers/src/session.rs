@@ -9,8 +9,13 @@ pub const NAME: &str = "__Host-session";
 /// Seconds a sign-in lasts.
 pub(crate) const LIFE: u64 = 8 * 60 * 60;
 
+/// HMAC-SHA256 gains nothing from a shorter key.
+pub(crate) const KEY_MIN: usize = 32;
+
 pub struct Session {
     pub login: String,
+    /// The GitHub user id. A login can change owner.
+    pub id: u64,
     /// Each form of this session carries this token.
     pub csrf: String,
     pub expires: u64,
@@ -26,10 +31,11 @@ fn mac(key: &[u8], text: &str) -> Hmac<Sha256> {
 pub(crate) fn seal(key: &[u8], session: &Session) -> String {
     let Session {
         login,
+        id,
         csrf,
         expires,
     } = session;
-    let text = URL_SAFE_NO_PAD.encode(format!("{login}\n{csrf}\n{expires}"));
+    let text = URL_SAFE_NO_PAD.encode(format!("{login}\n{id}\n{csrf}\n{expires}"));
     let tag = URL_SAFE_NO_PAD.encode(mac(key, &text).finalize().into_bytes());
     format!("{text}.{tag}")
 }
@@ -43,6 +49,7 @@ pub fn open(key: &[u8], value: &str, now: u64) -> Option<Session> {
     let mut parts = text.split('\n');
     let session = Session {
         login: parts.next()?.into(),
+        id: parts.next()?.parse().ok()?,
         csrf: parts.next()?.into(),
         expires: parts.next()?.parse().ok()?,
     };

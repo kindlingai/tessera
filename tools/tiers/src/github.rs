@@ -125,7 +125,7 @@ fn pull(node: Node, slug: &str) -> Pull {
         since: String::new(),
         setter: String::new(),
         trusted: tier == Tier::Untagged,
-        overlaps: Vec::new(),
+        overlaps: None,
     };
     for tip in node.commits.nodes {
         pull.ci = tip
@@ -143,7 +143,7 @@ fn pull(node: Node, slug: &str) -> Pull {
     for comment in node.comments.nodes {
         let ours = comment.author.is_some_and(|a| a.is_app(overlap::AUTHOR));
         if ours && comment.body.starts_with(overlap::MARKER) {
-            pull.overlaps = overlap::read(&comment.body);
+            pull.overlaps = Some(overlap::read(&comment.body));
         }
     }
     pull
@@ -168,6 +168,18 @@ impl<H: Host> Client<'_, H> {
         auth: Option<&str>,
         body: Option<(&'static str, String)>,
     ) -> Result<Value, Fault> {
+        self.fetch(method, url, auth, body, &[]).await
+    }
+
+    /// Sends a call. Statuses in `passes` and 2xx are success.
+    async fn fetch(
+        &self,
+        method: &'static str,
+        url: String,
+        auth: Option<&str>,
+        body: Option<(&'static str, String)>,
+        passes: &[u16],
+    ) -> Result<Value, Fault> {
         let mut headers = vec![
             ("accept", "application/vnd.github+json".to_string()),
             ("user-agent", AGENT.to_string()),
@@ -187,6 +199,9 @@ impl<H: Host> Client<'_, H> {
             body,
         };
         let reply = self.host.fetch(call).await?;
+        if passes.contains(&reply.status) {
+            return Ok(Value::Null);
+        }
         if !(200..300).contains(&reply.status) {
             let text = format!("GitHub answered {} for {what}", reply.status);
             return Err(Fault::new(502, text));
@@ -271,7 +286,15 @@ impl<H: Host> Client<'_, H> {
         }
     }
 
-    /// Sets the label again. The app becomes its setter.
+    /// Removes a label. A label already gone is success.
+    async fn unlabel(&self, install: &Install, labels: &str, name: &str) -> Result<(), Fault> {
+        let url = format!("{}{labels}/{name}", self.config.api);
+        let token = Some(install.token.as_str());
+        self.fetch("DELETE", url, token, None, &[404]).await?;
+        Ok(())
+    }
+
+    /// Adds the new label first. A failure keeps a tier.
     pub async fn retier(&self, install: &Install, number: u64, tier: Tier) -> Result<(), Fault> {
         let repo = &self.config.repo;
         let token = &install.token;
@@ -281,22 +304,31 @@ impl<H: Host> Client<'_, H> {
             return Err(Fault::new(409, format!("#{number} is not open")));
         }
         let labels = format!("/repos/{repo}/issues/{number}/labels");
+        let mut old = Vec::new();
         for label in found["labels"].as_array().into_iter().flatten() {
             let name = label["name"].as_str().unwrap_or_default();
             if Tier::named(name).is_some_and(|t| t.label().is_some()) {
-                self.api("DELETE", &format!("{labels}/{name}"), token, None)
-                    .await?;
+                old.push(name);
             }
         }
         if let Some(label) = tier.label() {
+            // GitHub records a setter for a new label only.
+            if old.contains(&label) {
+                self.unlabel(install, &labels, label).await?;
+            }
             let body = json!({ "labels": [label] });
             self.api("POST", &labels, token, Some(body)).await?;
+        }
+        for name in old {
+            if Some(name) != tier.label() {
+                self.unlabel(install, &labels, name).await?;
+            }
         }
         Ok(())
     }
 
-    /// The login behind an OAuth `code`.
-    pub async fn login(&self, code: &str) -> Result<String, Fault> {
+    /// The login and user id behind an OAuth `code`.
+    pub async fn login(&self, code: &str) -> Result<(String, u64), Fault> {
         let form = form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", &self.config.client_id)
             .append_pair("client_secret", &self.config.client_secret)
@@ -309,9 +341,9 @@ impl<H: Host> Client<'_, H> {
             return Err(Fault::new(403, "GitHub refused the sign-in"));
         };
         let user = self.api("GET", "/user", token, None).await?;
-        match user["login"].as_str() {
-            Some(login) => Ok(login.into()),
-            None => Err(Fault::new(502, "The GitHub reply lacks a login")),
+        match (user["login"].as_str(), user["id"].as_u64()) {
+            (Some(login), Some(id)) => Ok((login.into(), id)),
+            _ => Err(Fault::new(502, "The GitHub reply lacks a login")),
         }
     }
 }

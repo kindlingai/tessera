@@ -45,7 +45,8 @@ pub struct Pull {
     pub setter: String,
     /// The app set the tier label.
     pub trusted: bool,
-    pub overlaps: Vec<Overlap>,
+    /// `None` when the pull request has no overlap report.
+    pub overlaps: Option<Vec<Overlap>>,
 }
 
 /// One tier's pull requests, first labelled first.

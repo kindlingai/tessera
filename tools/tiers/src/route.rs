@@ -16,8 +16,6 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: String,
-    /// The scheme and host the request came to.
-    pub origin: String,
     /// The `Cookie` header.
     pub cookie: String,
     /// The `Origin` header.
@@ -85,20 +83,28 @@ impl<H: Host> Site<'_, H> {
         }
     }
 
-    fn is_editor(&self, login: &str) -> bool {
-        let editors = &self.config.editors;
-        editors.iter().any(|e| e.eq_ignore_ascii_case(login))
+    /// Refuses a session whose user is off the allow list.
+    fn editor<'a>(&self, session: &'a Session) -> Result<&'a Session, Fault> {
+        if self.config.editors.contains(&session.id) {
+            return Ok(session);
+        }
+        let text = format!("{} may not use this board.", session.login);
+        Err(Fault::new(403, text))
     }
 
+    /// Calls GitHub for an editor. Other visitors cost nothing.
     async fn home(&self) -> Result<Response, Fault> {
+        let Some(session) = &self.session else {
+            let page = page::welcome(self.config);
+            return Ok(Response::new(200, "text/html", page));
+        };
+        let session = self.editor(session)?;
         let client = self.client();
         let install = client.install().await?;
         let pulls = client.pulls(&install).await?;
-        let session = self.session.as_ref();
         let view = View {
             config: self.config,
             session,
-            editor: session.is_some_and(|s| self.is_editor(&s.login)),
             pulls: &pulls,
         };
         Ok(Response::new(200, "text/html", page::board(&view)))
@@ -109,7 +115,7 @@ impl<H: Host> Site<'_, H> {
         let to = form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", &self.config.client_id)
             .append_pair("state", &state)
-            .append_pair("redirect_uri", &format!("{}/callback", self.req.origin))
+            .append_pair("redirect_uri", &format!("{}/callback", self.config.origin))
             .finish();
         let to = format!("{}/login/oauth/authorize?{to}", self.config.web);
         Response::redirect(to).with("set-cookie", session::bake(STATE, &state, STATE_LIFE))
@@ -121,8 +127,10 @@ impl<H: Host> Site<'_, H> {
         if sent.is_empty() || !session::same(sent, field(&query, "state")) {
             return Err(Fault::new(403, "The sign-in did not start here."));
         }
+        let (login, id) = self.client().login(field(&query, "code")).await?;
         let session = Session {
-            login: self.client().login(field(&query, "code")).await?,
+            login,
+            id,
             csrf: session::token(self.host.nonce()),
             expires: self.host.now() + session::LIFE,
         };
@@ -140,7 +148,7 @@ impl<H: Host> Site<'_, H> {
         let Some(session) = &self.session else {
             return Err(Fault::new(401, "Sign in first."));
         };
-        let ours = self.req.source == self.req.origin;
+        let ours = self.req.source == self.config.origin;
         if !ours || !session::same(field(form, "csrf"), &session.csrf) {
             return Err(Fault::new(403, "The request did not come from this page."));
         }
@@ -149,11 +157,7 @@ impl<H: Host> Site<'_, H> {
 
     async fn retier(&self) -> Result<Response, Fault> {
         let form = form(&self.req.body);
-        let session = self.guard(&form)?;
-        if !self.is_editor(&session.login) {
-            let text = format!("{} may not change tiers.", session.login);
-            return Err(Fault::new(403, text));
-        }
+        self.editor(self.guard(&form)?)?;
         let number = field(&form, "pr").parse();
         let (Ok(number), Some(tier)) = (number, Tier::named(field(&form, "tier"))) else {
             return Err(Fault::new(400, "Unknown pull request or tier."));
@@ -173,6 +177,10 @@ impl<H: Host> Site<'_, H> {
 
 /// Answers one request.
 pub async fn serve<H: Host>(host: &H, config: &Config, req: &Request) -> Response {
+    if config.session_key.len() < session::KEY_MIN {
+        let text = format!("The session key needs {} bytes.", session::KEY_MIN);
+        return Response::new(500, "text/plain", text);
+    }
     let sent = session::cookie(&req.cookie, session::NAME);
     let session = sent.and_then(|c| session::open(&config.session_key, c, host.now()));
     let site = Site {

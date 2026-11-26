@@ -15,9 +15,7 @@ form{display:inline}ul{margin:.3rem 0;padding-left:1.2rem}";
 
 pub struct View<'a> {
     pub config: &'a Config,
-    pub session: Option<&'a Session>,
-    /// The session may change tiers.
-    pub editor: bool,
+    pub session: &'a Session,
     pub pulls: &'a [Pull],
 }
 
@@ -53,7 +51,8 @@ fn tags(pull: &Pull) -> El {
 
 fn overlaps(pull: &Pull) -> El {
     let mut list = el("ul");
-    for overlap in &pull.overlaps {
+    let found = pull.overlaps.as_deref();
+    for overlap in found.unwrap_or_default() {
         let verb = match overlap.kind {
             Kind::Conflict => "conflicts with",
             Kind::Shared => "shares files with",
@@ -67,7 +66,11 @@ fn overlaps(pull: &Pull) -> El {
         };
         list = list.kid(text("li", line).attr("class", class));
     }
-    list
+    match found {
+        None => list.kid(text("li", "no overlap report")),
+        Some([]) => list.kid(text("li", "no overlaps")),
+        Some(_) => list,
+    }
 }
 
 /// Buttons that move a pull request to another tier.
@@ -94,28 +97,38 @@ fn card(view: &View, pull: &Pull) -> El {
     let link = text("a", format!("#{} {}", pull.number, pull.title))
         .attr("href", format!("{web}/{repo}/pull/{}", pull.number));
     let by = format!(" by {}", pull.author);
-    let mut card = el("article")
+    el("article")
         .kid(el("p").kid(link).text(by))
         .kid(tags(pull))
-        .kid(overlaps(pull));
-    if let Some(session) = view.session.filter(|_| view.editor) {
-        card = card.kid(controls(pull, session));
-    }
-    card
+        .kid(overlaps(pull))
+        .kid(controls(pull, view.session))
 }
 
-/// The sign-in link, or the login and a sign-out button.
-fn account(view: &View) -> El {
-    let Some(session) = view.session else {
-        return el("p").kid(text("a", "Sign in with GitHub").attr("href", "/login"));
-    };
-    let rights = if view.editor { "" } else { " (read only)" };
+/// The login and a sign-out button.
+fn account(session: &Session) -> El {
     let out = el("form")
         .attr("method", "post")
         .attr("action", "/logout")
         .kid(hidden("csrf", &session.csrf))
         .kid(text("button", "Sign out"));
-    el("p").text(format!("{}{rights} ", session.login)).kid(out)
+    el("p").text(format!("{} ", session.login)).kid(out)
+}
+
+/// A whole page with the repository's title.
+fn shell(config: &Config, parts: [El; 2]) -> String {
+    let title = format!("{} tiers", config.repo);
+    let head = el("head")
+        .kid(el("meta").attr("charset", "utf-8"))
+        .kid(text("title", title.clone()))
+        .kid(el("style").kid(Part::Raw(STYLE.into())));
+    let body = el("body").kid(text("h1", title)).kids(parts);
+    el("html").attr("lang", "en").kid(head).kid(body).page()
+}
+
+/// The page for a visitor with no session.
+pub(crate) fn welcome(config: &Config) -> String {
+    let link = text("a", "Sign in with GitHub").attr("href", "/login");
+    shell(config, [el("p").kid(link), el("main")])
 }
 
 pub(crate) fn board(view: &View) -> String {
@@ -127,14 +140,5 @@ pub(crate) fn board(view: &View) -> String {
         }
         main = main.kid(section);
     }
-    let title = format!("{} tiers", view.config.repo);
-    let head = el("head")
-        .kid(el("meta").attr("charset", "utf-8"))
-        .kid(text("title", title.clone()))
-        .kid(el("style").kid(Part::Raw(STYLE.into())));
-    let body = el("body")
-        .kid(text("h1", title))
-        .kid(account(view))
-        .kid(main);
-    el("html").attr("lang", "en").kid(head).kid(body).page()
+    shell(view.config, [account(view.session), main])
 }
