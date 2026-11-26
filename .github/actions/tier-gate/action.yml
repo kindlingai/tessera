@@ -1,0 +1,18 @@
+name: Tier gate
+description: >
+  Fails when the changes conflict with an open PR that has a higher rank
+  by label. See tools/scripts/tier-gate.sh. The label setters are in
+  .github/tier-setters.txt. A merge group tests only the changes of the
+  PR its head ref names. Needs a checkout with full history.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+        QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        BASE: ${{ github.event_name == 'merge_group' && format('{0}^1', github.sha) || format('origin/{0}', github.base_ref) }}
+        MAIN: ${{ github.base_ref || github.event.merge_group.base_ref }}
+      run: tools/scripts/tier-gate.sh

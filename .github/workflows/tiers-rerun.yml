@@ -1,0 +1,37 @@
+name: Tiers rerun
+
+# Reruns CI's success job on one PR head, or on every open PR when the
+# scope is "all". tiers.yml starts this file when a change can change
+# the tier gate result of PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: A head SHA, or "all".
+        required: true
+
+permissions:
+  actions: write
+  contents: read
+
+# A newer pending run of the same scope replaces an older one. A run
+# reads the open PRs when it starts, so the run that starts last sees
+# the newest state.
+concurrency:
+  group: tiers-${{ inputs.scope }}
+
+jobs:
+  rerun:
+    runs-on: ubuntu-slim
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SCOPE: ${{ inputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: env.SCOPE != 'all'
+        run: tools/scripts/rerun-success.sh "$SCOPE"
+      - if: env.SCOPE == 'all'
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '.[].head.sha' > "$RUNNER_TEMP/heads"
+          xargs tools/scripts/rerun-success.sh < "$RUNNER_TEMP/heads"

@@ -44,23 +44,16 @@ jobs:
           tools/scripts/tier-scope.sh > "$RUNNER_TEMP/scope"
           tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/scope"
 
+  # Reruns of one scope queue in one group, and GitHub cancels the
+  # waiting run when a newer one comes. A dispatched run is not linked
+  # to a PR, so these cancels do not show as checks on PRs.
   rerun:
     needs: scope
     if: needs.scope.outputs.rerun != ''
     runs-on: ubuntu-slim
-    # A newer pending rerun of the same scope replaces an older one.
-    concurrency:
-      group: tiers-${{ needs.scope.outputs.rerun }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RERUN: ${{ needs.scope.outputs.rerun }}
     steps:
-      - uses: actions/checkout@v4
-      - if: env.RERUN != 'all'
-        run: tools/scripts/rerun-success.sh "$RERUN"
-      # The open PR list is read when this job starts, not when it queued.
-      - if: env.RERUN == 'all'
-        run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
-            --jq '.[].head.sha' > "$RUNNER_TEMP/heads"
-          xargs tools/scripts/rerun-success.sh < "$RUNNER_TEMP/heads"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN: ${{ github.event.repository.default_branch }}
+          RERUN: ${{ needs.scope.outputs.rerun }}
+        run: gh workflow run tiers-rerun.yml --repo "$GITHUB_REPOSITORY" --ref "$MAIN" -f scope="$RERUN"
