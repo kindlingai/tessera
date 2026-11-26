@@ -173,6 +173,19 @@ impl<H: Host> Client<'_, H> {
         self.fetch(method, url, auth, body, &[]).await
     }
 
+    /// A call as the app. Statuses in `passes` give `Null`.
+    pub(crate) async fn app(
+        &self,
+        method: &'static str,
+        path: &str,
+        install: &Install,
+        passes: &[u16],
+    ) -> Result<Value, Fault> {
+        let url = format!("{}{path}", self.config.api);
+        let token = Some(install.token.as_str());
+        self.fetch(method, url, token, None, passes).await
+    }
+
     /// Sends a call. Statuses in `passes` and 2xx are success.
     async fn fetch(
         &self,
@@ -290,9 +303,8 @@ impl<H: Host> Client<'_, H> {
 
     /// Removes a label. A label already gone is success.
     async fn unlabel(&self, install: &Install, labels: &str, name: &str) -> Result<(), Fault> {
-        let url = format!("{}{labels}/{name}", self.config.api);
-        let token = Some(install.token.as_str());
-        self.fetch("DELETE", url, token, None, &[404]).await?;
+        let path = format!("{labels}/{name}");
+        self.app("DELETE", &path, install, &[404]).await?;
         Ok(())
     }
 

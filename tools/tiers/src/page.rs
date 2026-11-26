@@ -6,12 +6,18 @@ use crate::overlap::Kind;
 use crate::session::Session;
 use tessera_html::{El, Part, el, text};
 
+/// The percent of a limit the page marks as near.
+pub(crate) const NEAR: u64 = 90;
+/// Each tab's path and name.
+const TABS: [(&str, &str); 2] = [("/", "Tiers"), ("/cache", "Cache")];
+
 const STYLE: &str = "body{font:14px system-ui;margin:1rem}\
 main{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}\
 article{border:1px solid #888;border-radius:4px;padding:.5rem;margin:.5rem 0}\
 .tag{border:1px solid #888;border-radius:4px;padding:0 .3rem;margin-right:.3rem}\
 .bad{border-color:#c00;color:#c00}li.bad{border:0}\
-form{display:inline}ul{margin:.3rem 0;padding-left:1.2rem}";
+form{display:inline}nav a{margin-right:1rem}\
+td,th{text-align:left;padding:0 1rem 0 0}ul{margin:.3rem 0;padding-left:1.2rem}";
 
 pub struct View<'a> {
     pub config: &'a Config,
@@ -111,14 +117,23 @@ fn card(view: &View, pull: &Pull) -> El {
         .kid(controls(pull, view.session))
 }
 
-/// The login and a sign-out button.
+/// The tabs, the login and a sign-out button.
 fn account(session: &Session) -> El {
     let out = el("form")
         .attr("method", "post")
         .attr("action", "/logout")
         .kid(hidden("csrf", &session.csrf))
         .kid(text("button", "Sign out"));
-    el("p").text(format!("{} ", session.login)).kid(out)
+    let mut nav = el("nav");
+    for (path, name) in TABS {
+        nav = nav.kid(text("a", name).attr("href", path));
+    }
+    nav.text(format!("{} ", session.login)).kid(out)
+}
+
+/// A page for a signed-in editor.
+pub(crate) fn frame(config: &Config, session: &Session, main: El) -> String {
+    shell(config, [account(session), main])
 }
 
 /// A whole page with the repository's title.
@@ -147,5 +162,5 @@ pub(crate) fn board(view: &View) -> String {
         }
         main = main.kid(section);
     }
-    shell(view.config, [account(view.session), main])
+    frame(view.config, view.session, main)
 }

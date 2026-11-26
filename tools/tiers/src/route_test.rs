@@ -32,6 +32,13 @@ const PULLS: &str = r#"{"data":{"repository":{"pullRequests":{
   "label":{"name":"landing"},"actor":{"login":"mmastrac","__typename":"User"}}]},
  "comments":{"nodes":[]}}]}}}}"#;
 
+/// Usage at the default limit of 10 GiB.
+const USAGE: &str = r#"{"active_caches_size_in_bytes":10737418240,"active_caches_count":3}"#;
+const CACHES: &str = r#"{"actions_caches":[
+{"ref":"refs/pull/7/merge","size_in_bytes":1073741824,"last_accessed_at":"2026-11-02"},
+{"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-01"},
+{"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-03"}]}"#;
+
 /// Records each call as `METHOD path authorization body`.
 #[derive(Default)]
 struct Fake {
@@ -50,13 +57,19 @@ impl Host for Fake {
             ("GET", "/repos/o/r/pulls/5") => r#"{"state":"open","labels":[{"name":"landing"}]}"#,
             ("POST", "/login/oauth/access_token") => r#"{"access_token":"user"}"#,
             ("GET", "/user") => r#"{"login":"Matt","id":7}"#,
+            ("GET", "/repos/o/r/actions/cache/usage") => USAGE,
+            ("GET", "/repos/o/r/actions/caches?per_page=100&page=1") => CACHES,
             _ => "[]",
         };
         let sent = call.body.unwrap_or_default();
         let line = format!("{} {path} {auth} {sent}", call.method);
         self.calls.borrow_mut().push(line);
         // The landing label is gone when the delete arrives.
-        let status = if call.method == "DELETE" { 404 } else { 200 };
+        let status = match (call.method, path.ends_with("/storage-limit")) {
+            ("DELETE", _) => 404,
+            (_, true) => 402,
+            _ => 200,
+        };
         Ok(Reply {
             status,
             body: body.into(),
@@ -191,4 +204,13 @@ fn sign_in_sets_session() {
     let value = session::cookie(value, session::NAME).unwrap();
     assert_eq!(session::open(KEY, value, 1000).unwrap().id, 7);
     assert!(session::open(b"other", value, 1000).is_none());
+}
+
+#[test]
+fn cache_tab_sums_refs() {
+    let page = ask(&Fake::default(), "GET", "/cache", "Matt", "").body;
+    let usage = r#"<p class="bad">10.00 GiB of 10 GiB, GitHub default (100%), 3 caches."#;
+    assert!(page.contains(usage));
+    let main = "<td>refs/heads/main</td><td>2</td><td>2.00 GiB</td><td>2026-11-03</td>";
+    assert!(page.find(main).unwrap() < page.find("refs/pull/7/merge").unwrap());
 }

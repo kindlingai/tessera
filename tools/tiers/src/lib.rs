@@ -1,6 +1,7 @@
 //! A board that sets pull request tiers as an app.
 
 mod board;
+mod cache;
 #[cfg(target_arch = "wasm32")]
 mod edge;
 mod github;

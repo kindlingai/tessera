@@ -1,6 +1,7 @@
 //! Maps requests to pages and tier changes.
 
 use crate::board::Tier;
+use crate::cache;
 use crate::github::Client;
 use crate::page::{self, View};
 use crate::session::{self, Session};
@@ -90,6 +91,19 @@ impl<H: Host> Site<'_, H> {
         }
         let text = format!("{} may not use this board.", session.login);
         Err(Fault::new(403, text))
+    }
+
+    /// The cache tab, for an editor alone.
+    async fn cache(&self) -> Result<Response, Fault> {
+        let Some(session) = &self.session else {
+            return Ok(Response::redirect("/".into()));
+        };
+        let session = self.editor(session)?;
+        let client = self.client();
+        let install = client.install().await?;
+        let cache = cache::read(&client, &install).await?;
+        let page = cache::render(self.config, session, &cache);
+        Ok(Response::new(200, "text/html", page))
     }
 
     /// Calls GitHub for an editor. Other visitors cost nothing.
@@ -191,6 +205,7 @@ pub async fn serve<H: Host>(host: &H, config: &Config, req: &Request) -> Respons
     };
     let done = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => site.home().await,
+        ("GET", "/cache") => site.cache().await,
         ("GET", "/login") => Ok(site.login()),
         ("GET", "/callback") => site.callback().await,
         ("POST", "/tier") => site.retier().await,
