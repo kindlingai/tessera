@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::code::in_code;
 use crate::hunk::{Hunk, Part, Refusal, parts};
 use crate::names::{Side, join};
 
@@ -30,6 +31,7 @@ enum Joined<'a> {
 }
 const NOT_GROUP: &str = "the lines are not inside a `use` group";
 const NOT_TABLE: &str = "the lines are not inside a dependency table";
+const NOT_CODE: &str = "the conflict is inside a string or a comment";
 
 /// Resolves each hunk, or names the first refusal.
 pub fn resolve(path: &str, text: &str) -> Result<String, Refusal> {
@@ -48,6 +50,12 @@ pub fn resolve(path: &str, text: &str) -> Result<String, Refusal> {
             }
             Part::Hunk(hunk) => {
                 let line = hunk.line;
+                if !toml && !in_code(&before) {
+                    return Err(Refusal {
+                        line,
+                        why: NOT_CODE,
+                    });
+                }
                 match union(&hunk, &before, toml).map_err(|why| Refusal { line, why })? {
                     Joined::Text(text) => out.push_str(&text),
                     Joined::Lines(lines) => {
@@ -68,10 +76,7 @@ fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Joined<'a>,
     let (theirs_kind, theirs) = entries(&hunk.theirs, toml).ok_or(NOT_LIST)?;
     let mut kind = None;
     for found in [ours_kind, base_kind, theirs_kind].into_iter().flatten() {
-        if kind.is_some_and(|kind| kind != found) {
-            return Err(NOT_LIST);
-        }
-        kind = Some(found);
+        kind = Some(both(kind, found).ok_or(NOT_LIST)?);
     }
     let kind = kind.ok_or(NOT_LIST)?;
     match kind {
@@ -92,12 +97,12 @@ fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Joined<'a>,
     let mut seen: HashSet<Entry> = ours.iter().copied().collect();
     let mut out = Vec::new();
     for (i, (ours, theirs)) in ours_gaps.iter().zip(&theirs_gaps).enumerate() {
-        for entry in ours {
-            out.extend_from_slice(entry);
-        }
-        for entry in theirs {
+        let adds = ours.iter().map(|entry| (entry, true));
+        for (entry, ours) in adds.chain(theirs.iter().map(|entry| (entry, false))) {
             let blank = entry[0].trim().is_empty();
-            if blank || seen.insert(entry) {
+            let last: Option<&&str> = out.last().or(before.last());
+            let doubled = blank && last.is_none_or(|line| line.trim().is_empty());
+            if !doubled && (ours || blank || seen.insert(entry)) {
                 out.extend_from_slice(entry);
             }
         }
@@ -106,6 +111,16 @@ fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Joined<'a>,
         }
     }
     Ok(Joined::Lines(out))
+}
+
+/// The kind of two entries. `use` and `mod` mix.
+fn both(first: Option<Kind>, next: Kind) -> Option<Kind> {
+    match (first, next) {
+        (None, _) => Some(next),
+        (Some(first), _) if first == next => Some(next),
+        (Some(Kind::Use | Kind::Mod), Kind::Use | Kind::Mod) => Some(Kind::Mod),
+        _ => None,
+    }
 }
 
 /// A side's added entries around the base entries, else `None`.
@@ -131,17 +146,14 @@ fn entries<'s, 'a>(lines: &'s [&'a str], toml: bool) -> Option<(Option<Kind>, Ve
         let line = lines[next].trim();
         next += 1;
         if line.is_empty() {
-            if toml || start + 1 != next {
+            if start + 1 != next {
                 return None;
             }
         } else if prefix(line, toml) {
             continue;
         } else {
             let kind = kind(line, toml)?;
-            if found.is_some_and(|found| found != kind) {
-                return None;
-            }
-            found = Some(kind);
+            found = Some(both(found, kind)?);
             if matches!(kind, Kind::Use | Kind::Item) {
                 next = close(lines, next - 1, kind)?;
             }
@@ -165,6 +177,7 @@ fn kind(line: &str, toml: bool) -> Option<Kind> {
     if toml {
         return dep_line(line).then_some(Kind::Dep);
     }
+    let line = code_part(line);
     let rest = after_vis(line);
     if rest.starts_with("use ") {
         return Some(Kind::Use);
@@ -196,6 +209,11 @@ pub fn after_vis(line: &str) -> &str {
     }
 }
 
+/// The line without a trailing `//` comment.
+fn code_part(line: &str) -> &str {
+    line.split("//").next().unwrap_or_default().trim()
+}
+
 fn path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_:{},* \t".contains(c)
 }
@@ -205,7 +223,7 @@ fn close(lines: &[&str], first: usize, kind: Kind) -> Option<usize> {
     let end = if kind == Kind::Use { ';' } else { ',' };
     let mut depth = 0usize;
     for (i, line) in lines.iter().enumerate().skip(first) {
-        let mut body = line.trim();
+        let mut body = code_part(line);
         if i == first && kind == Kind::Use {
             body = after_vis(body).strip_prefix("use ")?;
         }

@@ -44,6 +44,10 @@ fn mod_lines_join() {
     );
     let joined = "#[cfg(test)]\nmod a_test;\n#[cfg(test)]\nmod b_test;\npub mod c;\n";
     assert_eq!(resolve("src/lib.rs", &hunk).unwrap(), joined);
+    let hunk = conflict("mod a;\n", "", "use b::B; // why\n");
+    let text = format!("const C: char = '\"';\n{hunk}");
+    let joined = "const C: char = '\"';\nmod a;\nuse b::B; // why\n";
+    assert_eq!(resolve("a.rs", &text).unwrap(), joined);
 }
 
 #[test]
@@ -60,6 +64,10 @@ fn dependencies_join() {
         resolve("x/Cargo.toml", &format!("{head}{hunk}")).unwrap(),
         format!("{head}{joined}")
     );
+    let blank = conflict("\nring = \"0.17\"\n", "", "\nureq = \"2\"\n");
+    let joined = "[dependencies]\na = \"1\"\n\nring = \"0.17\"\n\nureq = \"2\"\n";
+    let text = format!("[dependencies]\na = \"1\"\n{blank}");
+    assert_eq!(resolve("Cargo.toml", &text).unwrap(), joined);
     let text = format!("[features]\n{hunk}");
     assert_eq!(refusal("x/Cargo.toml", &text, "dependency table"), Some(2));
 }
@@ -71,8 +79,9 @@ fn mixed_hunk_refused() {
         refusal("a.rs", &format!("//! Doc.\n\n{hunk}"), "not a `use`"),
         Some(3)
     );
-    let hunk = conflict("mod a;\n", "", "use b::B;\n");
-    assert_eq!(refusal("a.rs", &hunk, "not a `use`"), Some(1));
+    let hunk = conflict("use a::A;\n", "", "use b::B;\n");
+    let text = format!("const S: &str = \"\n{hunk}\";\n/* a \" */\n");
+    assert_eq!(refusal("a.rs", &text, "string"), Some(2));
 }
 
 #[test]

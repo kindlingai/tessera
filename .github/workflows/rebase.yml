@@ -1,16 +1,17 @@
-name: List rebase
+name: Auto rebase
 
-# Rebases a pull request that conflicts with main only in lists:
-# `use` lines, `mod` lines and Cargo.toml dependencies. tools/rebase
-# decides. Other conflicts get one comment and no push.
+# Rebases a pull request with the priority or landing label that
+# conflicts with main, when its commits replay on main and each
+# conflict joins list entries: `use` lines, `mod` lines and Cargo.toml
+# dependencies. tools/rebase decides. Other conflicts get one comment.
 # push and pull_request_target run main's copy of this file, its
-# scripts and tools/rebase. The build job runs pull request code.
-# The plan and push jobs do not.
+# scripts and tools/rebase. The build job runs pull request code in a
+# container. The plan and push jobs do not run it.
 on:
   push:
     branches: [main]
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, unlabeled]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       pr:
@@ -28,7 +29,7 @@ env:
 
 jobs:
   plan:
-    # Lists the pull requests whose conflicts are all list conflicts.
+    # Lists the pull requests whose rebase needs only list joins.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,21 +38,24 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo build -q -p tessera-rebase
       - id: plan
+        # bash fails the step when the script before the pipe fails.
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number || inputs.pr }}
         run: tools/scripts/rebase-list.sh | tee -a "$GITHUB_OUTPUT"
 
   build:
-    # Runs pull request code: build scripts and proc macros. The token
-    # reads only and git does not keep it. This job does not get a
-    # secret or a cache. The push job checks what this job uploads.
+    # Runs pull request code: build scripts and proc macros. They run
+    # in a container that holds the work tree and nothing else, so they
+    # cannot reach the runner's cache and artifact token. The job token
+    # reads only, git does not keep it, and the job does not get secrets.
+    # The push job checks what this job uploads.
     needs: plan
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
@@ -61,33 +65,37 @@ jobs:
       fail-fast: false
       matrix:
         pull: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    env:
-      CARGO_INCREMENTAL: 0
-      RUSTFLAGS: -D warnings
-      HEAD: ${{ matrix.pull.head }}
-      BASE: ${{ matrix.pull.base }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
       - run: git fetch -q origin "$HEAD"
-      - uses: dtolnay/rust-toolchain@1.99.1
-        with:
-          components: rustfmt, clippy
+        env:
+          HEAD: ${{ matrix.pull.head }}
       - run: cargo build -q -p tessera-rebase
-      - run: |
-          "$TOOL" build "$BASE" "$HEAD" "$RUNNER_TEMP/rebase" "$RUNNER_TEMP/built" --all-features
-      - uses: actions/upload-artifact@v4
+      - env:
+          HEAD: ${{ matrix.pull.head }}
+          BASE: ${{ matrix.pull.base }}
+          WORK: ${{ runner.temp }}/rebase
+          OUT: ${{ runner.temp }}/built
+          SANDBOX: docker
+          FEATURES: --all-features
+          RUSTFLAGS: -D warnings
+          CARGO_INCREMENTAL: 0
+        run: tools/scripts/rebase-build.sh
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: list-rebase-${{ matrix.pull.pr }}
           path: ${{ runner.temp }}/built
+          if-no-files-found: ignore
 
   push:
-    # Does not run pull request code. tessera-rebase plans the rebase again
-    # here and takes from the build only the files that had a conflict.
+    # Does not run pull request code. tessera-rebase plans the rebase
+    # again here and takes from the build the files that had a conflict.
     needs: [plan, build]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]'
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -98,27 +106,26 @@ jobs:
       matrix:
         pull: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # The identity that pushes. With these two secrets a GitHub App
-      # pushes, and CI runs on the new head. Without them the workflow
-      # token pushes, and GitHub does not start CI for that push.
+      # The identity that pushes: a GitHub App for CI automation, with
+      # the two secrets below. With them the app pushes and CI runs on
+      # the new head. Without them the workflow token pushes, and
+      # GitHub does not start CI for that push.
       # This app is not the tiers app that sets the tier labels. The
       # key of the tiers app must not be an Actions secret.
-      APP_ID: ${{ secrets.REBASE_APP_ID }}
-      APP_KEY: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+      HAS_APP: ${{ secrets.REBASE_APP_ID != '' && secrets.REBASE_APP_PRIVATE_KEY != '' }}
     steps:
       - id: app
-        if: env.APP_ID != '' && env.APP_KEY != ''
+        if: env.HAS_APP == 'true'
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
-          client-id: ${{ env.APP_ID }}
-          private-key: ${{ env.APP_KEY }}
-      - uses: actions/checkout@v4
+          client-id: ${{ secrets.REBASE_APP_ID }}
+          private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token || github.token }}
-      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo build -q -p tessera-rebase
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         continue-on-error: true
         with:
           name: list-rebase-${{ matrix.pull.pr }}
@@ -128,6 +135,7 @@ jobs:
           PR: ${{ matrix.pull.pr }}
           HEAD: ${{ matrix.pull.head }}
           BASE: ${{ matrix.pull.base }}
+          KEY: ${{ matrix.pull.key }}
           BUILT: ${{ runner.temp }}/built
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BOT: ${{ steps.app.outputs.app-slug || 'github-actions' }}

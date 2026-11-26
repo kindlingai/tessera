@@ -1,9 +1,11 @@
 #!/bin/sh
 # Finds the open pull requests that conflict with MAIN and plans a
-# list rebase of each, see tools/rebase.
+# rebase of each, see tools/rebase.
 # Prints "matrix=<json>" with each pull request the plan resolves.
 # Comments on a pull request that the plan refuses.
-# Skips forks, drafts and the no-auto-rebase label.
+# Reads pull requests with the priority or landing label, and skips
+# forks, drafts and the no-auto-rebase label.
+# Skips a build that failed before for the same head and conflicts.
 # Does not run pull request code.
 # Needs GH_TOKEN, GITHUB_REPOSITORY, MAIN, TOOL and RUNNER_TEMP.
 # PR limits the run to one pull request.
@@ -14,6 +16,7 @@ tmp=$(mktemp -d)
 pick='select(.state == "open" and .draft == false
     and .base.ref == "'$MAIN'"
     and .head.repo.full_name == .base.repo.full_name
+    and (.labels | any(.name == "priority" or .name == "landing"))
     and (.labels | all(.name != "no-auto-rebase")))
     | "\(.number) \(.head.sha)"'
 if [ -n "$PR" ]; then
@@ -28,7 +31,7 @@ while read -r n sha; do
     git fetch -q origin "$sha"
     # merge-tree exits 1 on a conflict and above 1 on an error.
     code=0
-    git merge-tree --write-tree --no-messages "$base" "$sha" >/dev/null || code=$?
+    git merge-tree --write-tree --name-only --no-messages "$base" "$sha" >"$tmp/merge" || code=$?
     report=$tmp/report-$n.md
     echo '<!-- list-rebase -->' >"$report"
     if [ "$code" -eq 0 ]; then
@@ -38,10 +41,21 @@ while read -r n sha; do
         code=0
         out=$("$TOOL" plan "$base" "$sha" "$RUNNER_TEMP/rebase-$n") || code=$?
         if [ "$code" -eq 0 ]; then
-            found="$found{\"pr\":$n,\"head\":\"$sha\",\"base\":\"$base\"},"
+            # The key names the conflicting files and main's copy of each.
+            key=$(sed 1d "$tmp/merge" | while IFS= read -r path; do
+                git rev-parse -q --verify "$base:$path" || true
+                printf '%s\n' "$path"
+            done | git hash-object --stdin)
+            if gh api --paginate "$repo/issues/$n/comments" \
+                --jq '.[] | select(.body | startswith("<!-- list-rebase -->")) | .body' |
+                grep -q -F "<!-- failed $sha $key -->"; then
+                echo "#$n: this head failed to build on the same conflicts. Skipped." >&2
+            else
+                found="$found{\"pr\":$n,\"head\":\"$sha\",\"base\":\"$base\",\"key\":\"$key\"},"
+            fi
             continue
         fi
-        echo "This pull request conflicts with \`$MAIN\`. The list rebase changed nothing:" >>"$report"
+        echo "This pull request conflicts with \`$MAIN\`. The rebase bot changed nothing:" >>"$report"
         printf '%s\n' "$out" | sed -n 's/^refused //p' >>"$report"
     fi
     if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then

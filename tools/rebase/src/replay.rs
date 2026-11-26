@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use crate::code::{Pin, packages};
 use crate::git::{git, must};
 use crate::hunk::Refusal;
 use crate::lists::resolve;
@@ -13,6 +14,8 @@ pub struct Plan {
     pub tree: String,
     /// Files with resolved conflicts, and the lock files.
     pub paths: BTreeSet<String>,
+    /// Locked versions that the branch set.
+    pub pins: BTreeSet<Pin>,
 }
 
 pub enum Outcome {
@@ -40,6 +43,17 @@ pub fn replay(base: &str, head: &str, work: &Path) -> Result<Outcome, String> {
             "the branch changes `.gitattributes`".to_string(),
         ));
     }
+    // A rebase drops merge commits and their changes.
+    let span = format!("{base}..{head}");
+    if !must(here, &["rev-list", "--merges", "--max-count=1", &span])?.is_empty() {
+        return Ok(Outcome::Refused(
+            "the branch has a merge commit".to_string(),
+        ));
+    }
+    let pins = match pins(&base, &head)? {
+        Ok(pins) => pins,
+        Err(why) => return Ok(Outcome::Refused(why)),
+    };
     let dir = work.to_str().ok_or("the work path is not UTF-8")?;
     must(
         here,
@@ -96,7 +110,45 @@ pub fn replay(base: &str, head: &str, work: &Path) -> Result<Outcome, String> {
         tip,
         tree: must(work, &["rev-parse", "HEAD^{tree}"])?,
         paths,
+        pins,
     }))
+}
+
+/// The locked versions the branch set, or a refusal.
+fn pins(base: &str, head: &str) -> Result<Result<BTreeSet<Pin>, String>, String> {
+    let here = Path::new(".");
+    let fork = must(here, &["merge-base", base, head])?;
+    let mut locks = Vec::new();
+    for commit in [fork.as_str(), base, head] {
+        let lock = git(here, &["show", &format!("{commit}:{LOCK}")])?;
+        locks.push(packages(&lock.stdout));
+    }
+    let (fork, base, head) = (&locks[0], &locks[1], &locks[2]);
+    let plain = |text: &str| {
+        text.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.+-".contains(c))
+    };
+    let mut pins = BTreeSet::new();
+    for pin in head.difference(fork) {
+        let (name, version) = pin;
+        if !plain(name) || !plain(version) || name.starts_with('-') {
+            return Ok(Err(
+                "the lock file has an entry that is not plain".to_string()
+            ));
+        }
+        let versions = |lock: &BTreeSet<Pin>| {
+            let named = lock.iter().filter(|(other, _)| other == name);
+            named
+                .map(|(_, version)| version.clone())
+                .collect::<Vec<_>>()
+        };
+        if !base.contains(pin) && versions(fork) != versions(base) {
+            let why = format!("the branch and the base both change the locked version of `{name}`");
+            return Ok(Err(why));
+        }
+        pins.insert(pin.clone());
+    }
+    Ok(Ok(pins))
 }
 
 /// Each unmerged path with its stage file modes.

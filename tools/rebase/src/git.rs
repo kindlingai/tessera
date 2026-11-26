@@ -1,4 +1,4 @@
-//! Runs git and cargo in a work tree.
+//! Runs git in a work tree.
 
 use std::path::Path;
 use std::process::Command;
@@ -45,14 +45,5 @@ pub fn must(dir: &Path, args: &[&str]) -> Result<String, String> {
         Ok(out.stdout.trim().to_string())
     } else {
         Err(format!("git {}: {}", args.join(" "), out.stderr.trim()))
-    }
-}
-
-pub fn cargo(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let status = Command::new("cargo").current_dir(dir).args(args).status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err(format!("cargo {} failed", args.join(" "))),
-        Err(e) => Err(format!("cargo: {e}")),
     }
 }

@@ -1,41 +1,11 @@
-//! The files a build changes, and their commit.
+//! The commit that holds the files of a build.
 
 use std::fs;
 use std::path::Path;
 
-use crate::git::{cargo, git, must};
+use crate::code::packages;
+use crate::git::{git, must};
 use crate::replay::Plan;
-
-/// Formats and builds, then copies changed files to `out`.
-pub fn build(work: &Path, plan: &Plan, out: &Path, features: &[&str]) -> Result<(), String> {
-    cargo(work, &["fmt", "--all"])?;
-    for tool in ["check", "clippy"] {
-        let mut args = vec![tool, "--workspace", "--all-targets"];
-        args.extend_from_slice(features);
-        cargo(work, &args)?;
-    }
-    let status = git(work, &["status", "--porcelain", "--no-renames", "-z"])?;
-    let files = out.join("files");
-    for entry in status.stdout.split('\0').filter(|entry| !entry.is_empty()) {
-        let path = entry.get(3..).unwrap_or_default();
-        if !plan.paths.contains(path) {
-            return Err(format!(
-                "the build changed {path}, a file without a conflict"
-            ));
-        }
-        let to = files.join(path);
-        let copied = to
-            .parent()
-            .map(fs::create_dir_all)
-            .map(|made| made.and_then(|()| fs::copy(work.join(path), &to)));
-        if !matches!(copied, Some(Ok(_))) {
-            return Err(format!("cannot copy {path} to {}", to.display()));
-        }
-    }
-    fs::create_dir_all(out)
-        .and_then(|()| fs::write(out.join("tree"), &plan.tree))
-        .map_err(|e| format!("{}: {e}", out.display()))
-}
 
 /// Commits a build's files. Does not run work tree code.
 pub fn seal(work: &Path, plan: &Plan, from: &Path) -> Result<String, String> {
@@ -62,6 +32,10 @@ pub fn seal(work: &Path, plan: &Plan, from: &Path) -> Result<String, String> {
             work,
             &["update-index", "--add", "--cacheinfo", mode, &blob, path],
         )?;
+    }
+    let lock = packages(&must(work, &["show", ":Cargo.lock"])?);
+    if let Some((name, version)) = plan.pins.difference(&lock).next() {
+        return Err(format!("the lock lost {name} {version}, set by the branch"));
     }
     if git(work, &["diff", "--cached", "--quiet"])?.ok {
         return Ok(plan.tip.clone());

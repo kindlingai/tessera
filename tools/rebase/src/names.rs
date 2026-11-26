@@ -72,6 +72,9 @@ fn names(side: &Side) -> Option<Names> {
             .iter()
             .position(|line| !crate::lists::prefix(line.trim(), false))?;
         let attrs = entry[..start].concat();
+        if entry[start..].iter().any(|line| line.contains("//")) {
+            return None;
+        }
         let text = entry[start..]
             .iter()
             .flat_map(|line| line.split_whitespace());
