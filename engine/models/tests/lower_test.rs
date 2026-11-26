@@ -67,8 +67,15 @@ fn check_launch_drop(cfg: &mla::Config, rows: u64, device: &Device) {
         .without("join_rope");
     let unfused = lower(&g, 0, &sizes, &bare).unwrap();
     let layers = cfg.stack.layers as usize;
+    let indexing = (0..cfg.stack.layers).filter(|&l| cfg.indexes(l)).count();
+    let idx_joins = indexing
+        * if cfg.index.is_some_and(|i| 64 > i.keep) {
+            2
+        } else {
+            1
+        };
     assert_eq!(count(&fused, "mla_kv_scatter"), layers);
-    assert_eq!(count(&fused, "join_rope"), layers);
+    assert_eq!(count(&fused, "join_rope"), layers + idx_joins);
     assert_eq!(count(&fused, "rope_adjacent"), 0);
     assert_eq!(count(&fused, "join"), 0);
     // Saves 5 KV launches plus 2 or 3 Q launches.
@@ -165,6 +172,20 @@ fn mla_indexer_fused() {
     let plan = lower(&whole, 0, &[(Seqs, 1), (Context, 8)], &device).unwrap();
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert!(names.contains(&"indexer_warp"), "{names:?}");
+    let indexing = (0..cfg.stack.layers).filter(|&l| cfg.indexes(l)).count();
+    let ropes: usize = g
+        .nodes
+        .iter()
+        .map(|n| match &n.op {
+            Op::Row(row) => row
+                .0
+                .iter()
+                .filter(|s| matches!(s, tessera_graph::Stage::Rope { .. }))
+                .count(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(ropes, 2 * cfg.stack.layers as usize + 2 * indexing);
 }
 
 #[test]
@@ -178,7 +199,13 @@ fn mla_prep_launch_reduction() {
             check_launch_drop(&small, rows, &device);
         }
         let plan = lower(&fwd, 0, &[(Seqs, 1), (Context, 8)], &device).unwrap();
-        assert_eq!(count(&plan, "join_rope"), small.stack.layers as usize);
+        let indexing = (0..small.stack.layers)
+            .filter(|&l| small.indexes(l))
+            .count();
+        assert_eq!(
+            count(&plan, "join_rope"),
+            small.stack.layers as usize + 2 * indexing
+        );
     }
     let full = mla::Config::glm53(4, 512);
     let device = Device::guess(&host());

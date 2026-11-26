@@ -458,11 +458,23 @@ impl Pass<'_> {
     /// Each query's best `INDEX_KEEP` visible keys.
     fn pick_keys(&self, l: usize, w: &Indexer, qr: &Tensor, h: &Tensor) -> Tensor {
         let c = self.c;
-        let q = qr
-            .matmul(&w.wq)
-            .reshape(self.lead([INDEX_HEADS.into(), INDEX_DIM.into()]));
+        let idx = c.index.expect("indexer config");
+        let turn = |t: Tensor| {
+            let last = t.ty().rank() as u32 - 1;
+            let rot = t
+                .slice(last, 0u64, ROPE)
+                .rope(self.positions, c.rope_theta, Pairs::Adjacent);
+            match idx.dim.checked_sub(c.rope) {
+                Some(0) | None => rot,
+                Some(pass) => rot.concat(&t.slice(last, ROPE, pass)),
+            }
+        };
+        let q = turn(
+            qr.matmul(&w.wq)
+                .reshape(self.lead([INDEX_HEADS.into(), INDEX_DIM.into()])),
+        );
         let k = h.matmul(&w.wk).center().rms_norm(&w.k_norm, c.eps);
-        let k = k.add_vector(&w.k_bias);
+        let k = turn(k.add_vector(&w.k_bias));
         // A step reads its slot's kept keys.
         let k = match &self.step {
             None => k,
