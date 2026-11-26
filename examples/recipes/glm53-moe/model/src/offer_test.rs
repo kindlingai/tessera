@@ -82,31 +82,41 @@ fn plan_bytes(src: &str) -> usize {
 
 #[test]
 fn offer_row_bounds() {
-    for rows in [1, 8, 16, 32, 64, 128, 256, 512] {
+    for rows in [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
             assert_eq!(got.len(), 4);
-            let nb = experts / 16;
-            let rm = rows.div_ceil(16);
-            let rks = split_dim(512 / 256, 128usize.div_ceil(nb * rm).max(1));
+            let rks = if rows > 1 && !(rows >= 64 && experts % 64 == 0) {
+                let nb = experts / 16;
+                let rm = rows.div_ceil(16);
+                split_dim(512 / 256, 128usize.div_ceil(nb * rm).max(1))
+            } else {
+                1
+            };
             assert_eq!(got[0].len, SCORES_OFF + rows * experts * rks);
             let Shape::Grid { down, .. } = got[1].shape else {
                 panic!("fc1 must be grid");
             };
-            assert!(down <= rows.div_ceil(32) + MAX_SLOTS);
+            let cap = if rows > 32 { 64 } else { 8 };
+            assert!(down <= rows.div_ceil(cap) + MAX_SLOTS);
         }
     }
     assert!(offer(&site(0, 256, 512, 256)).is_none());
-    assert!(offer(&site(513, 256, 512, 256)).is_none());
-    assert!(offer(&site(513, 32, 512, 256)).is_none());
+    assert!(offer(&site(2049, 256, 512, 256)).is_none());
+    assert!(offer(&site(2049, 32, 512, 256)).is_none());
     let Shape::Grid { down: d512, .. } = offer(&site(512, 256, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d512, 16 + 376);
+    assert_eq!(d512, 8 + 316);
+    let Shape::Grid { down: d2048, .. } = offer(&site(2048, 256, 512, 256)).unwrap()[1].shape
+    else {
+        panic!("fc1 must be grid");
+    };
+    assert_eq!(d2048, 32 + 508);
     let Shape::Grid { down: d32, .. } = offer(&site(512, 32, 512, 256)).unwrap()[1].shape else {
         panic!("fc1 must be grid");
     };
-    assert_eq!(d32, 16 + 63);
+    assert_eq!(d32, 8 + 47);
 }
 
 #[test]
