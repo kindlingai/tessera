@@ -200,6 +200,17 @@ pub trait Run {
         }
         Ok(true)
     }
+
+    /// Opens a pinned device-mapped host KV pool of `pages`.
+    fn open_host_kv(&mut self, _pages: usize, _page: usize) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// Promotes or demotes `(vram_phys, host_phys)` sparse KV page pairs.
+    fn move_kv_pages(&mut self, _promote: bool, _pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Takes up another plan. Weights and kept rows stay loaded.
     fn replan(&mut self, plan: &Plan) -> Result<(), Error>;
     /// Gives a runtime dimension its value for the next launches.

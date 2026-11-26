@@ -239,9 +239,22 @@ impl Emit {
                 let node = tree.node(t);
                 let all = &node.shape;
                 let width: usize = all[2..].iter().product();
-                let (rows, pool_pages) = match (layout.page(), tree.kept_rows) {
+                let sparse = tree.is_sparse_kept(index);
+                let split = tree.index_rows.filter(|_| tree.has_sparse_kept());
+                let split_idx = !sparse && split.is_some();
+                let cap = match (split, sparse) {
+                    (Some((kv_cap, _)), true) => Some(kv_cap),
+                    (Some((_, idx_cap)), false) => Some(idx_cap),
+                    (None, _) => tree.kept_rows,
+                };
+                let min_rows = if split.is_some() && sparse {
+                    layout.page().unwrap_or(1) * 4
+                } else {
+                    context
+                };
+                let (rows, pool_pages) = match (layout.page(), cap) {
                     (Some(page), Some(cap)) => {
-                        let pages = cap.max(context).div_ceil(page);
+                        let pages = cap.max(min_rows).div_ceil(page);
                         (pages * page, pages)
                     }
                     (Some(page), None) => {
@@ -252,8 +265,13 @@ impl Emit {
                 };
                 let room = rows * width;
                 let entries = kept::entries(layout, all[0], context);
-                self.out.table = self.out.table.max(entries);
-                self.out.pool_pages = self.out.pool_pages.max(pool_pages);
+                if split_idx {
+                    self.out.index_table = self.out.index_table.max(entries);
+                    self.out.index_pool_pages = self.out.index_pool_pages.max(pool_pages);
+                } else {
+                    self.out.table = self.out.table.max(entries);
+                    self.out.pool_pages = self.out.pool_pages.max(pool_pages);
+                }
                 let len: usize = all.iter().product();
                 let interleaved = layout.name() == "interleaved";
                 let page_rows = match (layout.page(), interleaved) {
@@ -267,6 +285,7 @@ impl Emit {
                     width: width as u32,
                     page_rows,
                     interleaved,
+                    sparse,
                 };
                 (len, room, info, node.form, pack_shape(all, len))
             }
@@ -281,6 +300,7 @@ impl Emit {
                     width: width as u32,
                     page_rows: 1,
                     interleaved: false,
+                    sparse: false,
                 };
                 (len, len, info, form::F32_FORM, pack_shape(&all, len))
             }

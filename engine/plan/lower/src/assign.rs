@@ -311,7 +311,9 @@ impl Buffers<'_> {
             // One table beside kept rows names every lane's pages.
             if self.s.table > 0 && self.plan.table.is_none() {
                 let form = tessera_codegen::form::of(DType::U32);
-                let buffer = self.buffer(form.bytes(self.s.table), zone);
+                let split = self.s.index_table > 0;
+                let total = self.s.table + usize::from(split) * self.s.index_table;
+                let buffer = self.buffer(form.bytes(total), zone);
                 let (dims, shape) = pack_shape(&[self.s.table], self.s.table);
                 self.plan.table = Some(Slot {
                     buffer,
@@ -322,6 +324,18 @@ impl Buffers<'_> {
                     shape,
                 });
                 self.plan.pool_pages = self.s.pool_pages;
+                if split {
+                    let (idims, ishape) = pack_shape(&[self.s.index_table], self.s.index_table);
+                    self.plan.index_table = Some(Slot {
+                        buffer,
+                        offset: form.bytes(self.s.table),
+                        len: self.s.index_table,
+                        form,
+                        dims: idims,
+                        shape: ishape,
+                    });
+                    self.plan.index_pool_pages = self.s.index_pool_pages;
+                }
             }
         }
         for (buffer, size) in arenas.into_values() {
@@ -433,6 +447,7 @@ impl Buffers<'_> {
                     zone: op.zone,
                     lane: 0,
                     table: self.plan.table,
+                    index_table: self.plan.index_table,
                 });
                 reads[0] = copy;
             }
@@ -460,6 +475,7 @@ impl Buffers<'_> {
             zone: op.zone,
             lane: self.lanes[at],
             table: self.plan.table,
+            index_table: self.plan.index_table,
         });
         for (k, v) in op.reads.iter().enumerate() {
             let repeat = op.reads[..k].contains(v);

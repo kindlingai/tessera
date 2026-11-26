@@ -1,6 +1,8 @@
 //! Generation with a DFlash drafter, when `--draft` is given.
 
-use super::generate::{attach_kv, check_lowering, guides, lowering, queue, user_rules, wants_paged};
+use super::generate::{
+    apply_host_tier, attach_kv, check_lowering, guides, lowering, queue, user_rules, wants_paged,
+};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -63,6 +65,7 @@ pub(super) fn open_target(
     if wants_paged(o, settings) && recipe.kept.page().is_none() {
         recipe.kept = Engine::paged_layout();
     }
+    apply_host_tier(o, settings, &mut recipe, false);
     if recipe.config.is_none() {
         recipe.config = target.config.clone();
     }
@@ -314,8 +317,8 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.block,
         o.slots,
     );
-    check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)))?;
     let kv_on = attach_kv(o, &settings, &mut engine)?;
+    check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)))?;
     let generate = front(load, b.mode, &engine, target)?;
     let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
     if o.slots > 1 {

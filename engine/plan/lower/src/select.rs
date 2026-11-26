@@ -78,6 +78,10 @@ pub struct Selected {
     pub table: usize,
     /// Physical pages in the kept pool, when paged.
     pub pool_pages: usize,
+    /// Secondary page table entries for dense index keys.
+    pub index_table: usize,
+    /// Physical pages in the dense index pool.
+    pub index_pool_pages: usize,
     /// Rules that competed with another at some site.
     pub contested: BTreeSet<&'static str>,
     /// Each rule's runnable ways, as the kernels they launch.
@@ -164,6 +168,7 @@ fn select_with(
     tree.config = device.config.clone();
     tree.knobs = device.knobs.clone();
     tree.kept_rows = device.kept_rows;
+    tree.index_rows = device.index_rows;
     let whole: Vec<&Rule> = rules
         .iter()
         .copied()

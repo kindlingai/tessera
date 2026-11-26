@@ -341,6 +341,31 @@ impl Engine {
         self.runner.plan().ranks as usize
     }
 
+    /// Grows paged slots for `rows`, syncing any `TIER_HOST` KV pages.
+    pub(crate) fn grow_kept(
+        &mut self,
+        kept: &mut crate::kept::Kept,
+        rows: &[Row],
+    ) -> Result<(), Error> {
+        let Some(lanes) = &mut self.lanes else {
+            return Ok(());
+        };
+        let runner = &mut self.runner;
+        kept.grow_rows_tiered(rows, lanes, &mut |promote, pairs| {
+            Ok(runner.move_kv_pages(promote, pairs)?)
+        })
+    }
+
+    /// `(kv_vram_tokens, host_tokens, active_tokens)` when `TIER_HOST` is active.
+    pub fn host_tier_info(&self) -> Option<(usize, usize, usize)> {
+        let l = self.lanes.as_ref().filter(|l| l.tiered())?;
+        Some((
+            l.kv_pages() * l.page,
+            l.host_pages() * l.page,
+            l.pages() * l.page,
+        ))
+    }
+
     /// Attaches a tiered KV store from `cfg`.
     pub fn set_kv_store(&mut self, cfg: &KvConfig) -> Result<(), Error> {
         if cfg.disabled || cfg.tiers.is_empty() {
@@ -351,6 +376,32 @@ impl Engine {
             return Err(Error::Stateful);
         }
         let page = self.lanes.as_ref().map(|l| l.page).ok_or(Error::RowPlace)?;
+        if self.lanes.as_ref().is_some_and(crate::lanes::Lanes::split)
+            && cfg.tiers.len() == 1
+            && let tessera_kv::StoreKind::Ram { bytes } = cfg.tiers[0].store
+        {
+            let sparse_page_bytes: usize = self
+                .runner
+                .plan()
+                .kept
+                .iter()
+                .zip(&self.runner.plan().kept_info)
+                .filter(|(_, i)| i.sparse && i.context > 1 && i.page_rows as usize == page)
+                .map(|((_, slot), info)| slot.form.bytes(page * info.width as usize))
+                .sum();
+            let lanes = self.lanes.as_mut().expect("lanes");
+            let max_host = if sparse_page_bytes > 0 {
+                (bytes / sparse_page_bytes as u64) as usize
+            } else {
+                0
+            };
+            let host_pages = lanes.index_pages().min(max_host);
+            if host_pages > 0 && self.runner.open_host_kv(host_pages, page)? {
+                lanes.enable_tier(host_pages);
+                self.disk = None;
+                return Ok(());
+            }
+        }
         let (r, n) = (self.runner.plan().rank, self.runner.plan().ranks);
         let meta = self.runner.kept_page_meta(page).ok_or(Error::RowPlace)?;
         let d = DiskKv::open_config(cfg, r, n, page, &meta).ok_or(Error::RowPlace)?;

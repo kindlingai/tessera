@@ -33,3 +33,60 @@ fn grow_rows_matches_single() {
     assert_eq!(lanes_batched.pending(), lanes_one.pending());
     assert_eq!(batched.totals(), one.totals());
 }
+
+#[test]
+fn tier_host_demote_reuse() {
+    let (slots, context, page) = (2, 128, 16);
+    let (kv_pages, idx_pages) = (4, 16);
+    let mut lanes = Lanes::new_split(page, slots * (context / page), slots, kv_pages, idx_pages);
+    lanes.enable_tier(idx_pages);
+    assert!(lanes.tiered());
+    assert_eq!(lanes.pages(), idx_pages);
+    let mut kept = Kept::paged(slots, context, lanes.pages(), page);
+    let (mut demotes, mut promotes) = (Vec::new(), Vec::new());
+    let (s0, _) = kept.admit(&[1; 80], 0).unwrap();
+    let rows0: Vec<Row> = (0..80).map(|p| row(s0, p)).collect();
+    // Five pages exceed four VRAM pages, demoting older pages.
+    kept.grow_rows_tiered(&rows0[..64], &mut lanes, &mut |up, p| {
+        if up {
+            promotes.extend_from_slice(p);
+        } else {
+            demotes.extend_from_slice(p);
+        }
+        Ok(true)
+    })
+    .unwrap();
+    assert!(demotes.is_empty());
+    kept.grow_rows_tiered(&rows0[64..80], &mut lanes, &mut |up, p| {
+        if up {
+            promotes.extend_from_slice(p);
+        } else {
+            demotes.extend_from_slice(p);
+        }
+        Ok(true)
+    })
+    .unwrap();
+    assert!(!demotes.is_empty());
+    assert!(promotes.is_empty());
+    let kv_tbl = lanes.pending()[0].1.to_vec();
+    let host_bit = 1u32 << 30;
+    assert!(kv_tbl[..5].iter().any(|&e| (e & host_bit) != 0));
+    assert_eq!(kv_tbl[4] & host_bit, 0, "written tail page stays in VRAM");
+
+    // Prefix reuse keeps host pages in host RAM.
+    kept.finish(s0, (0..80).collect());
+    let prompt: Vec<u32> = (0..80).chain([99]).collect();
+    let (s1, skip) = kept.admit(&prompt, 80).unwrap();
+    assert_eq!(skip, 80);
+    let before_promotes = promotes.len();
+    kept.grow_rows_tiered(&[row(s1, 80)], &mut lanes, &mut |up, p| {
+        if up {
+            promotes.extend_from_slice(p);
+        } else {
+            demotes.extend_from_slice(p);
+        }
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(promotes.len(), before_promotes);
+}

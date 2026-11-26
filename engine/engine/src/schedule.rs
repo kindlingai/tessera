@@ -536,10 +536,10 @@ impl<'a> Batch<'a> {
 
     /// Gives each fed slot the pages its rows need.
     fn page(&mut self, rows: &[Row]) -> Result<(), Error> {
-        let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.engine.lanes) else {
+        let Some(kept) = &mut self.kept else {
             return Ok(());
         };
-        kept.grow_rows(rows, lanes)
+        self.engine.grow_kept(kept, rows)
     }
 
     fn finish(&mut self, i: usize) {

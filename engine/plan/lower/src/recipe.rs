@@ -54,6 +54,9 @@ pub struct Recipe {
     /// Shared paged KV row capacity across all slots.
     #[serde(default)]
     pub kept_rows: Option<usize>,
+    /// Split `(kv_vram_rows, index_vram_rows)` for sparse MLA models.
+    #[serde(default)]
+    pub index_rows: Option<(usize, usize)>,
     /// Rules made at run time, beside the linked ones.
     #[serde(skip)]
     pub rules: Vec<&'static Rule>,
@@ -156,6 +159,7 @@ impl Default for Recipe {
             launch: Launching::default(),
             kept: dense(),
             kept_rows: None,
+            index_rows: None,
             rules: Vec::new(),
             config: None,
         }
@@ -169,6 +173,11 @@ impl Recipe {
         if self.kept.page().is_none() {
             self.kept = kept::named("paged").expect("paged layout");
         }
+    }
+
+    /// Sizes sparse KV and dense index VRAM pools separately.
+    pub fn share_index(&mut self, kv_rows: usize, index_rows: usize) {
+        self.index_rows = Some((kv_rows, index_rows));
     }
 
     /// Folds the dtype rules into the pins, sums and compute.

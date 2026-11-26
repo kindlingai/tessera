@@ -113,7 +113,7 @@ fn kept_launches(k: &KeptGather, step: &Step) -> Vec<Launch> {
         .map(|v| Arg::count(v as usize));
     let args = [step.read(0), step.read(1), step.out()]
         .into_iter()
-        .chain(step.kept(k.kept))
+        .chain(step.kept_for(k.kept, true))
         .chain(sizes)
         .chain(kept)
         .collect();

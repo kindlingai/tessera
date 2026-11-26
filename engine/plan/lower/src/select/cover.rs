@@ -498,6 +498,7 @@ fn stand_in(d: &Draft) -> Step {
         zone: 0,
         lane: 0,
         table: Some(slot),
+        index_table: None,
     }
 }
 

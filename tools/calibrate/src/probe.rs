@@ -191,6 +191,7 @@ impl Probe {
             zone: 0,
             lane: 0,
             table: None,
+            index_table: None,
         };
         Plan {
             buffers: vec![4 * read, 4 * write],

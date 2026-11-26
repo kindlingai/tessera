@@ -14,6 +14,7 @@ fn dummy(lane: u8, reads: Vec<Slot>, write: Slot) -> Step {
         zone: 0,
         lane,
         table: None,
+        index_table: None,
     }
 }
 

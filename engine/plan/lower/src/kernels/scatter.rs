@@ -47,6 +47,7 @@ pub(crate) struct Scatter {
     pub slots: usize,
     pub context: usize,
     pub kept: &'static dyn Layout,
+    pub sparse: bool,
     pub input: &'static dyn Stored,
     pub output: &'static dyn Stored,
 }
@@ -65,6 +66,7 @@ impl Scatter {
             slots: all[0],
             context,
             kept,
+            sparse: tree.is_sparse_kept(index),
             input: plain(tree.node(src).form),
             output: writable(node.form),
         })
@@ -96,7 +98,7 @@ fn scatter_launches(k: &Scatter, step: &Step) -> Vec<Launch> {
     let values = k.kept.values(k.slots, k.context);
     let kept = values.into_iter().map(|v| Arg::count(v as usize));
     let args = [step.read(0), step.read(1), step.read(2), step.out()];
-    let table = step.kept(k.kept);
+    let table = step.kept_for(k.kept, !k.sparse);
     vec![Launch {
         args: args
             .into_iter()

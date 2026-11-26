@@ -37,6 +37,8 @@ pub enum Error {
     Retained(RunId),
     #[error("{0:?} is not a run")]
     Unknown(RunId),
+    #[error("pages do not fit the VRAM and host tiers")]
+    TierFull,
 }
 
 struct Run {
@@ -78,6 +80,7 @@ pub struct Pool {
     /// Pages held only by retained runs.
     reclaimable: usize,
     free: BTreeSet<u32>,
+    freed: Vec<u32>,
     slots: Vec<Slot>,
     retirements: u64,
 }
@@ -92,9 +95,15 @@ impl Pool {
             active: 0,
             reclaimable: 0,
             free: (0..pages as u32).collect(),
+            freed: Vec::new(),
             slots: Vec::new(),
             retirements: 0,
         }
+    }
+
+    /// Drains physical pages freed since the previous call.
+    pub fn take_freed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.freed)
     }
 
     pub fn pages(&self, run: RunId) -> Result<&[u32], Error> {
@@ -439,6 +448,7 @@ impl Pool {
             if self.live[at] == 0 && self.kept[at] == 0 {
                 self.reclaimable -= 1;
                 self.free.insert(page);
+                self.freed.push(page);
             }
             return;
         }
@@ -449,6 +459,7 @@ impl Pool {
                 self.reclaimable += 1;
             } else {
                 self.free.insert(page);
+                self.freed.push(page);
             }
         }
     }

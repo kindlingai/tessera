@@ -297,7 +297,7 @@ impl Sizes {
             .chain([step.out()])
             .collect();
         if self.ragged {
-            args.extend(step.kept(self.kept));
+            args.extend(step.kept_for(self.kept, true));
         }
         args
     }

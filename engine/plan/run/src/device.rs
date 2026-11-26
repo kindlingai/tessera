@@ -3,12 +3,12 @@
 use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
-use crate::held::{Holds, KvStage};
+use crate::held::Holds;
 use crate::kernels::{self, Kernels};
 use crate::lanes::LaneSync;
 use crate::marks;
 use crate::overrides::{self, Overrides};
-use crate::paged::{self, Pager};
+use crate::paged::{self, KvMem, Pager};
 use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
@@ -75,8 +75,8 @@ pub(crate) struct Runner<D: Device> {
     spills: HashSet<String>,
     /// Hot-cold expert weight pager, opened on VRAM overflow.
     pager: Option<Pager<D>>,
-    /// Pinned host staging buffer for batched KV transfers.
-    kv_stage: Option<KvStage<D>>,
+    /// Pinned host staging and `TIER_HOST` KV pool.
+    kv: KvMem<D>,
 }
 
 /// Launches a closed gate holds, under any driver queue.
@@ -94,16 +94,14 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let ctx = cached_context::<D>()?;
         ctx.bind_numa();
         let files = |dir: &PathBuf| Overrides::new(dir.clone(), Dialect::of(D::BACKEND));
+        let mut base = Base::new(settings.memory, &ctx.platform());
+        base.streams = settings.weight_streaming;
+        if settings.memory == Memory::Device {
+            base.extend_budget(tessera_gpukit::attic::available(settings));
+        }
         let mut runner = Self {
             ctx,
-            base: {
-                let mut base = Base::new(settings.memory, &ctx.platform());
-                base.streams = settings.weight_streaming;
-                if settings.memory == Memory::Device {
-                    base.extend_budget(tessera_gpukit::attic::available(settings));
-                }
-                base
-            },
+            base,
             kernels: Vec::new(),
             planned: Vec::new(),
             overrides: settings.kernels.as_ref().map(files),
@@ -128,7 +126,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             log_attrs: settings.profile.is_some() || settings.kernels.is_some(),
             spills: HashSet::new(),
             pager: None,
-            kv_stage: None,
+            kv: KvMem::default(),
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -198,6 +196,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     let at = slot.at(*skip) as u64;
                     bound.device_ptr(self.buffer(*slot).device_ptr() + at)
                 }
+                Arg::KeptHost(slot) => bound.device_ptr(self.kv.host_ptr(*slot)),
                 Arg::Value(bytes) => bound.bytes(bytes),
                 Arg::Size(_) | Arg::Buffer(..) => return Err(tessera_lower::Error::Unbound.into()),
             };
@@ -647,6 +646,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             self.clear_graphs();
         }
         self.ptrs = self.bound_ptrs();
+        self.kv.bind(plan);
         if plan.id != 0
             && let Some(cached) = self.plans.remove(&plan.id)
         {
@@ -874,13 +874,24 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn download_kept_pages(&mut self, p: &[u32], g: usize, dst: &mut [u8]) -> Result<bool, Error> {
-        let (ctx, stage, b) = (self.ctx, &mut self.kv_stage, &self.base);
-        b.held.download_pages(ctx, stage, &b.plan, p, g, dst)
+        let (ctx, st, b) = (self.ctx, &mut self.kv.stage, &self.base);
+        b.held.download_pages(ctx, st, &b.plan, p, g, dst)
     }
 
     fn upload_kept_pages(&mut self, p: &[u32], g: usize, src: &[u8]) -> Result<bool, Error> {
-        let (ctx, stage, b) = (self.ctx, &mut self.kv_stage, &mut self.base);
-        b.held.upload_pages(ctx, stage, &b.plan, p, g, src)
+        let (ctx, st, b) = (self.ctx, &mut self.kv.stage, &mut self.base);
+        b.held.upload_pages(ctx, st, &b.plan, p, g, src)
+    }
+
+    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+        let ok = self.kv.open_host(self.ctx, &self.base.plan, pages, page);
+        self.clear_graphs();
+        Ok(ok)
+    }
+
+    fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        self.kv
+            .move_pages(&self.base.held, &self.base.plan, promote, pairs)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

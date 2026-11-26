@@ -187,10 +187,21 @@ static __device__ __forceinline__ u64 kv_row_at(const u32* pt, u32 slot, u32 pos
     return (u64(pt[u64(slot) * ctx + (pos >> sh)]) << sh) | u64(pos & ((1u << sh) - 1u));
 }
 
-static __device__ __forceinline__ void mla_prefetch_fp8(const u8* kv, const u32* pt, u32 slot,
-                                                        u32 j, u32 ctx, u32 sh, u32 l8, uint4 p[5]) {
+static __device__ __forceinline__ const u8* kv_row_ptr(
+    const void* dev, const void* host, const u32* pt, u32 slot, u32 pos, u32 ctx, u32 sh,
+    u64 row_bytes) {
+    if (sh == 0u || sh == 32u) return static_cast<const u8*>(dev) + kv_row_at(pt, slot, pos, ctx, sh) * row_bytes;
+    u32 e = pt[u64(slot) * ctx + (pos >> sh)];
+    const u8* base = static_cast<const u8*>(((e >> 30) != 0u) ? host : dev);
+    u64 row = (u64(e & 0x3FFFFFFFu) << sh) | u64(pos & ((1u << sh) - 1u));
+    return base + row * row_bytes;
+}
+
+static __device__ __forceinline__ void mla_prefetch_fp8(const u8* kv, const u8* kv_host,
+                                                        const u32* pt, u32 slot, u32 j, u32 ctx,
+                                                        u32 sh, u32 l8, uint4 p[5]) {
     if (j != 0xFFFFFFFFu) {
-        const u8* r = kv + kv_row_at(pt, slot, j, ctx, sh) * 576ull;
+        const u8* r = kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull);
 #pragma unroll
         for (u32 i = 0u; i < 5u; i++)
             if (l8 + i * 8u < 36u) p[i] = *reinterpret_cast<const uint4*>(r + u64(l8 + i * 8u) * 16ull);
@@ -202,10 +213,10 @@ static __device__ __forceinline__ void mla_prefetch_fp8(const u8* kv, const u32*
 
 template <u32 KV_FMT>
 static __device__ __forceinline__ void mla_attend_body(
-    const float* q, const void* kv_ptr, const u32* ids, const u32* slots, const u32* positions,
-    const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads,
-    u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table,
-    u32 page_shift, u32 has_sinks, mla_smem& sm) {
+    const float* q, const void* kv_ptr, const void* kv_host, const u32* ids, const u32* slots,
+    const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys,
+    u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits,
+    const u32* page_table, u32 page_shift, u32 has_sinks, mla_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wg = warp >> 2, wl = warp & 3u, hgroups = heads >> 4;
     u32 split = blockIdx.x, rb = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
@@ -258,14 +269,13 @@ static __device__ __forceinline__ void mla_attend_body(
 #pragma unroll
     for (u32 nt = 0u; nt < 9u; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
     const u8* kv_u8 = static_cast<const u8*>(kv_ptr);
-    const u16* kv_u16 = static_cast<const u16*>(kv_ptr);
-    const float* kv_f32 = static_cast<const float*>(kv_ptr);
+    const u8* kv_host_u8 = static_cast<const u8*>(kv_host);
     u32 tk = tid >> 3, l8 = tid & 7u, d_base = warp * 72u;
     u32* dst32 = reinterpret_cast<u32*>(sm.kv[tk]);
     u32 krow = wg * 16u + ((lane >> 4) << 3) + (lane & 7u), kcol = ((lane >> 3) & 1u) * 8u, vrow = lane & 15u, vcol = (lane >> 4) << 3;
     u32 cur_j = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
     uint4 pref[5];
-    if constexpr (KV_FMT == 0u) mla_prefetch_fp8(kv_u8, page_table, slot, cur_j, context, page_shift, l8, pref);
+    if constexpr (KV_FMT == 0u) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, cur_j, context, page_shift, l8, pref);
     for (u32 p0 = p_begin; p0 < p_end; p0 += 32u) {
         if (tid < 32u) { u32 jw = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tid, p_end); u32 m = __ballot_sync(0xFFFFFFFFu, jw != 0xFFFFFFFFu); if (tid == 0u) sm.valid_mask = m; }
         bool has_next = (p0 + 32u < p_end);
@@ -273,16 +283,16 @@ static __device__ __forceinline__ void mla_attend_body(
         if constexpr (KV_FMT == 0u) {
 #pragma unroll
             for (u32 i = 0u; i < 5u; i++) if (l8 + i * 8u < 36u) attn_unpack_fp8(pref[i], dst32 + (l8 + i * 8u) * 8u);
-            if (has_next) mla_prefetch_fp8(kv_u8, page_table, slot, nj, context, page_shift, l8, pref);
+            if (has_next) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj, context, page_shift, l8, pref);
         } else if constexpr (KV_FMT == 1u) {
-            u64 rb = (cur_j != 0xFFFFFFFFu) ? kv_row_at(page_table, slot, cur_j, context, page_shift) * 576ull : 0ull;
-            for (u32 q8 = l8; q8 < 72u; q8 += 8u) *reinterpret_cast<uint4*>(dst32 + q8 * 4u) = (cur_j != 0xFFFFFFFFu) ? *reinterpret_cast<const uint4*>(kv_u16 + rb + u64(q8) * 8ull) : make_uint4(0u, 0u, 0u, 0u);
+            const u16* r16 = (cur_j != 0xFFFFFFFFu) ? reinterpret_cast<const u16*>(kv_row_ptr(kv_ptr, kv_host, page_table, slot, cur_j, context, page_shift, 576ull * 2ull)) : nullptr;
+            for (u32 q8 = l8; q8 < 72u; q8 += 8u) *reinterpret_cast<uint4*>(dst32 + q8 * 4u) = (r16 != nullptr) ? *reinterpret_cast<const uint4*>(r16 + u64(q8) * 8ull) : make_uint4(0u, 0u, 0u, 0u);
             cur_j = nj;
         } else {
-            u64 rb = (cur_j != 0xFFFFFFFFu) ? kv_row_at(page_table, slot, cur_j, context, page_shift) * 576ull : 0ull;
+            const float* rf = (cur_j != 0xFFFFFFFFu) ? reinterpret_cast<const float*>(kv_row_ptr(kv_ptr, kv_host, page_table, slot, cur_j, context, page_shift, 576ull * 4ull)) : nullptr;
             for (u32 q4 = l8; q4 < 144u; q4 += 8u) {
                 uint2 o2 = make_uint2(0u, 0u);
-                if (cur_j != 0xFFFFFFFFu) { float4 r = *reinterpret_cast<const float4*>(kv_f32 + rb + u64(q4) * 4ull); o2 = make_uint2(trellis::f32x2_to_f16x2(r.x, r.y), trellis::f32x2_to_f16x2(r.z, r.w)); }
+                if (rf != nullptr) { float4 r = *reinterpret_cast<const float4*>(rf + u64(q4) * 4ull); o2 = make_uint2(trellis::f32x2_to_f16x2(r.x, r.y), trellis::f32x2_to_f16x2(r.z, r.w)); }
                 *reinterpret_cast<uint2*>(dst32 + q4 * 2u) = o2;
             }
             cur_j = nj;
@@ -363,9 +373,9 @@ static __device__ __forceinline__ void mla_attend_body(
 }
 
 #define MLA_DEF(NAME, T, FMT) \
-    extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks) { \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
         __shared__ mla_smem sm; \
-        mla_attend_body<FMT>(q, kv, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
+        mla_attend_body<FMT>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
 
 MLA_DEF(tessera_mla_attend_fp8, u8, 0u)

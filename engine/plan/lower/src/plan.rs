@@ -82,6 +82,8 @@ pub struct Step {
     pub lane: u8,
     /// The plan's page table, when kept rows are paged.
     pub table: Option<Slot>,
+    /// Secondary page table for dense index keys, when split.
+    pub index_table: Option<Slot>,
 }
 
 impl Step {
@@ -114,8 +116,20 @@ impl Step {
 
     /// The page table, if `layout` reads one.
     pub fn kept(&self, layout: &dyn Layout) -> Option<Arg> {
-        let table = || self.table.expect("a paged plan has a table");
-        layout.page().map(|_| Arg::at(table(), 0))
+        self.kept_for(layout, false)
+    }
+
+    /// The page table for KV or dense index keys.
+    pub fn kept_for(&self, layout: &dyn Layout, is_index: bool) -> Option<Arg> {
+        let pick = || {
+            if is_index {
+                self.index_table.or(self.table)
+            } else {
+                self.table
+            }
+            .expect("a paged plan has a table")
+        };
+        layout.page().map(|_| Arg::at(pick(), 0))
     }
 }
 
@@ -161,6 +175,7 @@ pub struct KeptInfo {
     pub width: u32,
     pub page_rows: u32,
     pub interleaved: bool,
+    pub sparse: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -198,6 +213,10 @@ pub struct Plan {
     pub table: Option<Slot>,
     /// Physical pages in the kept pool, when paged.
     pub pool_pages: usize,
+    /// Secondary page table for dense index keys, when split.
+    pub index_table: Option<Slot>,
+    /// Physical pages in the index pool, when split.
+    pub index_pool_pages: usize,
     /// One per input port of the entry.
     pub inputs: Vec<Slot>,
     pub outputs: Vec<Output>,

@@ -521,6 +521,25 @@ impl<T: Transport> Run for Rank<T> {
         self.runner.run_mut().upload_weight(weight, slot, bytes)
     }
 
+    fn download_kept_pages(&mut self, p: &[u32], g: usize, dst: &mut [u8]) -> Result<bool, Error> {
+        self.runner.run_mut().download_kept_pages(p, g, dst)
+    }
+
+    fn upload_kept_pages(&mut self, p: &[u32], g: usize, src: &[u8]) -> Result<bool, Error> {
+        self.runner.run_mut().upload_kept_pages(p, g, src)
+    }
+
+    fn open_host_kv(&mut self, pages: usize, page: usize) -> Result<bool, Error> {
+        if let Some(grid) = &mut self.grid {
+            let _ = grid.pause();
+        }
+        self.runner.run_mut().open_host_kv(pages, page)
+    }
+
+    fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        self.runner.run_mut().move_kv_pages(promote, pairs)
+    }
+
     /// Runs these steps. Sums wait for every rank.
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {
         self.run_steps(steps, true)

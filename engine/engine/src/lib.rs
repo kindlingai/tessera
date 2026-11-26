@@ -421,10 +421,15 @@ impl Engine {
         let (sizes, _) = launch_of(&first, &[0], slots, context);
         let plan = plans.lower(&graph, full, &sizes, &device)?;
         let lanes = plan.table.zip(recipe.kept.page());
-        let pool = plan.pool_pages;
+        let (pool, idx_pool) = (plan.pool_pages, plan.index_pool_pages);
+        let split_idx = plan.index_table.is_some() && idx_pool > 0;
         let lanes = lanes.map(|(table, page)| {
             let pages = if pool > 0 { pool } else { table.len };
-            lanes::Lanes::new(page, table.len, slots, pages)
+            if split_idx {
+                lanes::Lanes::new_split(page, table.len, slots, pages, idx_pool)
+            } else {
+                lanes::Lanes::new(page, table.len, slots, pages)
+            }
         });
         let mut runner = run(plan)?;
         let device = ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
@@ -907,9 +912,16 @@ impl Engine {
         let outputs = plan.outputs.iter().map(|o| o.slot).collect();
         self.runner.replan(plan)?;
         let planned = Instant::now();
-        if let (Some(table), Some(lanes)) = (plan.table, self.lanes.as_mut()) {
-            for (offset, bytes) in lanes.take_dirty() {
-                self.runner.held_mut().upload_at(table, offset, &bytes)?;
+        if let Some(lanes) = &mut self.lanes {
+            if let Some(table) = plan.table {
+                for (offset, bytes) in lanes.take_dirty() {
+                    self.runner.held_mut().upload_at(table, offset, &bytes)?;
+                }
+            }
+            if let Some(idx) = plan.index_table {
+                for (offset, bytes) in lanes.take_index_dirty() {
+                    self.runner.held_mut().upload_at(idx, offset, &bytes)?;
+                }
             }
         }
         self.runner.bind_all(&bound);

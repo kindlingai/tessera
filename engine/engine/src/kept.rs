@@ -148,12 +148,13 @@ impl Kept {
     }
 
     /// Paged: grows each slot in `rows` once.
+    #[cfg(test)]
     pub fn grow_rows(
         &mut self,
         rows: &[crate::Row],
         lanes: &mut crate::lanes::Lanes,
     ) -> Result<(), Error> {
-        self.grow_rows_with(rows, |slot, pages| lanes.set(slot, pages))
+        self.grow_rows_tiered(rows, lanes, &mut |_, _| Ok(false))
     }
 
     /// Paged: grows each slot in `rows` and calls `on_set`.
@@ -162,6 +163,16 @@ impl Kept {
         rows: &[crate::Row],
         mut on_set: impl FnMut(u32, &[u32]),
     ) -> Result<(), Error> {
+        for (slot, _) in self.grow_peaks(rows)? {
+            if let Some(pages) = self.pages(slot) {
+                on_set(slot, pages);
+            }
+        }
+        Ok(())
+    }
+
+    /// Grows each slot once, returning old lane lengths.
+    fn grow_peaks(&mut self, rows: &[crate::Row]) -> Result<Vec<(u32, usize)>, Error> {
         let mut peaks: Vec<(u32, usize)> = Vec::new();
         for r in rows {
             let need = r.position as usize + 1;
@@ -173,9 +184,70 @@ impl Kept {
                 peaks.push((r.slot, need));
             }
         }
+        let mut grown_slots = Vec::new();
         for (slot, need) in peaks {
-            if let Some(pages) = self.grow(slot, need)? {
-                on_set(slot, pages);
+            let prev = self.laned.as_ref().map_or(0, |l| l[slot as usize]);
+            if self.grow(slot, need)?.is_some() {
+                grown_slots.push((slot, prev));
+            }
+        }
+        Ok(grown_slots)
+    }
+
+    /// Paged: grows slots for `rows`, syncing `TIER_HOST` KV pages.
+    pub fn grow_rows_tiered(
+        &mut self,
+        rows: &[crate::Row],
+        lanes: &mut crate::lanes::Lanes,
+        move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, Error>,
+    ) -> Result<(), Error> {
+        if !lanes.tiered() {
+            return self.grow_rows_with(rows, |slot, pages| lanes.set(slot, pages));
+        }
+        let grown_slots = self.grow_peaks(rows)?;
+        let freed = self.pool.take_freed();
+        lanes.release_freed(&freed);
+        let page = lanes.page;
+        let mut alloc_pages = Vec::new();
+        for &(slot, prev) in &grown_slots {
+            if let Some(pages) = self.pages(slot) {
+                alloc_pages.extend_from_slice(&pages[prev.min(pages.len())..]);
+            }
+        }
+        let mut write_pages = Vec::new();
+        let mut pinned = Vec::new();
+        for r in rows {
+            if let Some(pages) = self.pages(r.slot)
+                && let Some(&p) = pages.get(r.position as usize / page)
+            {
+                if !write_pages.contains(&p) {
+                    write_pages.push(p);
+                }
+                if !pinned.contains(&p) {
+                    pinned.push(p);
+                }
+            }
+        }
+        for slot in 0..self.runs.len() {
+            if let Some(pages) = self.pages(slot as u32)
+                && let Some(&last) = pages.last()
+                && !pinned.contains(&last)
+            {
+                pinned.push(last);
+            }
+        }
+        let moved = lanes.ensure_vram(&alloc_pages, &write_pages, &pinned, move_pages)?;
+        if moved {
+            for slot in 0..self.runs.len() {
+                if let Some(pages) = self.pages(slot as u32) {
+                    lanes.set(slot as u32, pages);
+                }
+            }
+        } else {
+            for (slot, _) in grown_slots {
+                if let Some(pages) = self.pages(slot) {
+                    lanes.set(slot, pages);
+                }
             }
         }
         Ok(())

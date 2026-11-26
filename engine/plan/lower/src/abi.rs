@@ -12,6 +12,8 @@ use tessera_graph::DimName;
 pub enum Arg {
     /// A slot's buffer, an extent of elements in.
     Buffer(Slot, Extent),
+    /// Device-mapped pinned host pointer for kept `Slot`, or zero.
+    KeptHost(Slot),
     /// A plain value by its bytes, any `repr(C)` type.
     Value(Vec<u8>),
     /// A u32 read from a dimension at launch.

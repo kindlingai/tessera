@@ -385,10 +385,10 @@ impl<'a> BatchDFlash<'a> {
     }
 
     fn ensure_pages(&mut self, rows: &[Row]) -> Result<(), Error> {
-        let (Some(kept), Some(lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
+        let Some(kept) = &mut self.core.kept else {
             return Ok(());
         };
-        kept.grow_rows(rows, lanes)
+        self.core.target.grow_kept(kept, rows)
     }
 
     fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {

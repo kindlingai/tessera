@@ -175,6 +175,7 @@ pub(crate) fn table(
                 });
                 buf_index += 1;
             }
+            Arg::KeptHost(_) => values.push(0),
             arg => values.push(arg.u32().ok_or(tessera_lower::Error::Unbound)?),
         }
     }

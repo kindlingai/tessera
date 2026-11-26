@@ -79,6 +79,9 @@ pub struct Device {
     /// Shared paged KV row capacity across all slots.
     #[serde(skip)]
     pub kept_rows: Option<usize>,
+    /// Split `(kv_vram_rows, index_vram_rows)` for sparse MLA models.
+    #[serde(skip)]
+    pub index_rows: Option<(usize, usize)>,
     /// Model config JSON for runtime rules.
     #[serde(skip)]
     pub config: Option<String>,
@@ -168,6 +171,7 @@ impl Default for Device {
             knobs: Knobs::default(),
             kept: dense(),
             kept_rows: None,
+            index_rows: None,
             config: None,
             generation: 0,
             memo: RefCell::default(),
@@ -258,6 +262,7 @@ impl Device {
         self.made = recipe.rules.clone();
         self.kept = recipe.kept;
         self.kept_rows = recipe.kept_rows;
+        self.index_rows = recipe.index_rows;
         self.config = recipe.config.clone();
         self.changed()
     }

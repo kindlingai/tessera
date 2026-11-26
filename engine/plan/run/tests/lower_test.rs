@@ -267,6 +267,7 @@ fn mapped(len: usize) -> Step {
         zone: 0,
         lane: 0,
         table: None,
+        index_table: None,
     }
 }
 
@@ -777,6 +778,7 @@ fn arenas_pack_zones() {
         width: 16,
         page_rows: 16,
         interleaved: false,
+        sparse: false,
     };
     let op = |reads, write, zone| Op {
         kernel: KernelRef::new(Map::plain(Vec::new())),
@@ -935,6 +937,7 @@ fn comm_overlaps_compute() {
             width: 1,
             page_rows: 0,
             interleaved: false,
+            sparse: false,
         },
     };
     let values = [Input(0), Temp, Temp, Temp, Input(1), Temp, Temp, Temp, kv].map(val);
@@ -952,12 +955,8 @@ fn comm_overlaps_compute() {
         ],
         inputs: vec![Val(0), Val(4)],
         outputs: vec![(Val(3), vec![16]), (Val(7), vec![16])],
-        table: 0,
-        pool_pages: 0,
-        contested: Default::default(),
-        ways: Default::default(),
         ranks: 2,
-        rank: 0,
+        ..Selected::default()
     };
     let order = schedule(&selected);
     let pos = |id| order.iter().position(|&x| x == id).unwrap();

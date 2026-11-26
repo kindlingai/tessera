@@ -211,7 +211,9 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         AttendKind::Gqa => args.push(Arg::count(k.kv_heads)),
     }
     let page_shift = page_shift(k.kept);
-    let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
+    let table = step
+        .kept_for(k.kept, k.kind == AttendKind::Gqa)
+        .unwrap_or_else(|| step.read(3));
     args.extend([
         Arg::count(k.window.0),
         Arg::count(k.window.1),
@@ -220,6 +222,9 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
         Arg::count(page_shift),
         Arg::count(usize::from(k.has_sinks)),
     ]);
+    if k.kind == AttendKind::Mla {
+        args.push(Arg::KeptHost(step.reads[1]));
+    }
     vec![Launch { args, shape }]
 }
 
@@ -566,7 +571,7 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
         threads: if k.qt { 256 } else { 128 },
     };
     let page_shift = page_shift(k.kept);
-    let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
+    let table = step.kept_for(k.kept, true).unwrap_or_else(|| step.read(3));
     let args = vec![
         step.read(0),
         step.read(1),

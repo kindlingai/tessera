@@ -399,6 +399,7 @@ fn copy_step(buffer: u32, len: usize) -> Step {
         zone: 0,
         lane: 0,
         table: None,
+        index_table: None,
     }
 }
 
@@ -673,6 +674,7 @@ fn ranked_plan(scratch_bytes: usize) -> Plan {
             zone: 0,
             lane,
             table: None,
+            index_table: None,
         }
     };
     Plan {

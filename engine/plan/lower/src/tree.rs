@@ -146,6 +146,8 @@ pub struct Tree<'a> {
     pub kept: &'static dyn Layout,
     /// Shared paged KV row capacity across all slots.
     pub kept_rows: Option<usize>,
+    /// Split `(kv_vram_rows, index_vram_rows)` for sparse MLA models.
+    pub index_rows: Option<(usize, usize)>,
     /// Operand precision for matrix-unit kernels.
     pub compute: Compute,
     /// Kernel shape values the recipe set.
@@ -401,6 +403,7 @@ impl<'a> Tree<'a> {
             sizes: sizes.to_vec(),
             kept,
             kept_rows: None,
+            index_rows: None,
             compute: Compute::default(),
             knobs: Knobs::default(),
             config: None,
@@ -861,6 +864,40 @@ impl<'a> Tree<'a> {
             Some(ring) => Some((t, kept::RING, ring)),
             None => Some((t, self.kept, context)),
         }
+    }
+
+    /// True if kept `index` feeds only picked attention.
+    pub fn is_sparse_kept(&self, index: u32) -> bool {
+        let mut stack: Vec<NodeId> = self
+            .g
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.op == Op::Append(index))
+            .map(|(i, _)| NodeId(i as u32))
+            .collect();
+        if stack.is_empty() {
+            return false;
+        }
+        let mut found = false;
+        while let Some(cur) = stack.pop() {
+            for (i, n) in self.g.nodes.iter().enumerate().skip(cur.0 as usize + 1) {
+                if !n.args.contains(&cur) {
+                    continue;
+                }
+                match &n.op {
+                    Op::View(_) => stack.push(NodeId(i as u32)),
+                    Op::Attend(a) if a.picked => found = true,
+                    _ => return false,
+                }
+            }
+        }
+        found
+    }
+
+    /// True if any kept tensor is sparse-read.
+    pub fn has_sparse_kept(&self) -> bool {
+        (0..self.g.kept.len() as u32).any(|i| self.is_sparse_kept(i))
     }
 
     /// Fixed shape of kept state `index`, split for this rank.

@@ -158,6 +158,7 @@ impl Layout {
             *s = move_slot(*s);
         }
         out.table = out.table.map(move_slot);
+        out.index_table = out.index_table.map(move_slot);
         for s in &mut out.inputs {
             *s = move_slot(*s);
         }
@@ -173,6 +174,7 @@ impl Layout {
                 *w = move_slot(*w);
             }
             step.table = step.table.map(move_slot);
+            step.index_table = step.index_table.map(move_slot);
         }
         out
     }
@@ -478,5 +480,247 @@ pub(crate) fn prepare<'a, D: Device>(
     match pager.as_ref() {
         Some(p) => Ok((std::borrow::Cow::Owned(p.rewrite(plan)), p.vram_bytes())),
         None => Ok((std::borrow::Cow::Borrowed(plan), 0)),
+    }
+}
+
+/// Pinned device-mapped host KV pool for `TIER_HOST` sparse reads.
+pub(crate) struct HostKv<D: Device> {
+    ctx: &'static D,
+    host: u64,
+    dev: u64,
+    pages: usize,
+    page_rows: usize,
+    by_index: HashMap<u32, (usize, usize)>,
+    by_slot: HashMap<(u32, usize), u64>,
+}
+
+impl<D: Device> Drop for HostKv<D> {
+    fn drop(&mut self) {
+        self.ctx.unpin(self.host);
+    }
+}
+
+fn pair_runs(pairs: &[(u32, u32)]) -> Vec<(u32, u32, usize)> {
+    let (mut out, mut i) = (Vec::new(), 0usize);
+    while i < pairs.len() {
+        let ((v0, h0), mut len) = (pairs[i], 1usize);
+        while i + len < pairs.len()
+            && pairs[i + len].0 == v0 + len as u32
+            && pairs[i + len].1 == h0 + len as u32
+        {
+            len += 1;
+        }
+        out.push((v0, h0, len));
+        i += len;
+    }
+    out
+}
+
+impl<D: Device> HostKv<D> {
+    /// Pins a host-RAM pool for sparse paged KV tensors.
+    pub(crate) fn open(
+        ctx: &'static D,
+        plan: &Plan,
+        pages: usize,
+        page_rows: usize,
+    ) -> Option<Self> {
+        if pages == 0 || page_rows == 0 || ctx.unified() {
+            return None;
+        }
+        let mut by_index = HashMap::new();
+        let mut total = 0usize;
+        for (&(index, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+            if !info.sparse || info.context <= 1 || info.page_rows as usize != page_rows {
+                continue;
+            }
+            let elems = page_rows * info.width as usize;
+            let pbytes = slot.form.bytes(elems);
+            if pbytes == 0 {
+                continue;
+            }
+            by_index.insert(index, (total, pbytes));
+            total += aligned(pages * pbytes);
+        }
+        if by_index.is_empty() || total == 0 {
+            return None;
+        }
+        let (host, dev) = ctx.pin(total).ok()?;
+        let mut out = Self {
+            ctx,
+            host,
+            dev,
+            pages,
+            page_rows,
+            by_index,
+            by_slot: HashMap::new(),
+        };
+        out.bind(plan);
+        Some(out)
+    }
+
+    /// Updates slot-to-device-pointer bindings for `plan`.
+    pub(crate) fn bind(&mut self, plan: &Plan) {
+        self.by_slot.clear();
+        for &(index, slot) in &plan.kept {
+            if let Some(&(off, _)) = self.by_index.get(&index) {
+                self.by_slot
+                    .insert((slot.buffer, slot.offset), self.dev + off as u64);
+            }
+        }
+    }
+
+    /// Pinned device-mapped pointer for `slot`, or zero.
+    pub(crate) fn ptr(&self, slot: Slot) -> u64 {
+        self.by_slot
+            .get(&(slot.buffer, slot.offset))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn spans(
+        &self,
+        held: &Held,
+        plan: &Plan,
+        pairs: &[(u32, u32)],
+    ) -> Option<Vec<(u64, *mut u8, usize)>> {
+        let runs = pair_runs(pairs);
+        let mut out = Vec::new();
+        for (&(index, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+            let Some(&(off, pbytes)) = self.by_index.get(&index) else {
+                continue;
+            };
+            let elems = self.page_rows * info.width as usize;
+            let linear = slot.form.offset(0) == 0 && slot.form.offset(elems) == pbytes;
+            let dev_base = held
+                .get(slot)
+                .backing()
+                .as_any()
+                .downcast_ref::<DeviceBuffer<D>>()
+                .expect("device runner holds device buffers")
+                .device_ptr()
+                + slot.start() as u64;
+            let span = held.span(slot);
+            let push =
+                |v0: u32, h0: u32, len: usize, out: &mut Vec<(u64, *mut u8, usize)>| -> bool {
+                    let v_off = slot.form.offset(v0 as usize * elems);
+                    if v_off + len * pbytes > span || h0 as usize + len > self.pages {
+                        return false;
+                    }
+                    let ptr = (self.host as usize + off + h0 as usize * pbytes) as *mut u8;
+                    out.push((dev_base + v_off as u64, ptr, len * pbytes));
+                    true
+                };
+            if linear {
+                for &(v0, h0, len) in &runs {
+                    if !push(v0, h0, len, &mut out) {
+                        return None;
+                    }
+                }
+            } else {
+                for &(v, h) in pairs {
+                    if !push(v, h, 1, &mut out) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Copies `(vram_phys, host_phys)` sparse KV pages from VRAM to host.
+    pub(crate) fn demote(
+        &mut self,
+        held: &Held,
+        plan: &Plan,
+        pairs: &[(u32, u32)],
+    ) -> Result<bool, Error> {
+        if pairs.is_empty() {
+            return Ok(true);
+        }
+        let Some(raw) = self.spans(held, plan, pairs) else {
+            return Ok(false);
+        };
+        let mut spans: Vec<(u64, &mut [u8])> = raw
+            .into_iter()
+            // SAFETY: distinct `host_phys` ranges inside live pinned allocation.
+            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts_mut(ptr, len) }))
+            .collect();
+        self.ctx.download_batch(&mut spans)?;
+        Ok(true)
+    }
+
+    /// Copies `(vram_phys, host_phys)` sparse KV pages from host to VRAM.
+    pub(crate) fn promote(
+        &self,
+        held: &Held,
+        plan: &Plan,
+        pairs: &[(u32, u32)],
+    ) -> Result<bool, Error> {
+        if pairs.is_empty() {
+            return Ok(true);
+        }
+        let Some(raw) = self.spans(held, plan, pairs) else {
+            return Ok(false);
+        };
+        let spans: Vec<(u64, &[u8])> = raw
+            .into_iter()
+            // SAFETY: valid range inside live pinned allocation.
+            .map(|(dev, ptr, len)| (dev, unsafe { std::slice::from_raw_parts(ptr, len) }))
+            .collect();
+        self.ctx.upload_batch(&spans)?;
+        Ok(true)
+    }
+}
+
+/// Pinned KV transfer state owned by one device runner.
+pub(crate) struct KvMem<D: Device> {
+    pub(crate) stage: Option<crate::held::KvStage<D>>,
+    pub(crate) host: Option<HostKv<D>>,
+}
+
+impl<D: Device> Default for KvMem<D> {
+    fn default() -> Self {
+        Self {
+            stage: None,
+            host: None,
+        }
+    }
+}
+
+impl<D: Device> KvMem<D> {
+    pub(crate) fn bind(&mut self, plan: &Plan) {
+        if let Some(h) = &mut self.host {
+            h.bind(plan);
+        }
+    }
+
+    pub(crate) fn open_host(
+        &mut self,
+        ctx: &'static D,
+        plan: &Plan,
+        pages: usize,
+        page: usize,
+    ) -> bool {
+        self.host = HostKv::open(ctx, plan, pages, page);
+        self.host.is_some()
+    }
+
+    /// Host pool device pointer for kept `slot`, or zero.
+    pub(crate) fn host_ptr(&self, slot: Slot) -> u64 {
+        self.host.as_ref().map_or(0, |h| h.ptr(slot))
+    }
+
+    pub(crate) fn move_pages(
+        &mut self,
+        held: &Held,
+        plan: &Plan,
+        promote: bool,
+        pairs: &[(u32, u32)],
+    ) -> Result<bool, Error> {
+        match &mut self.host {
+            Some(h) if promote => h.promote(held, plan, pairs),
+            Some(h) => h.demote(held, plan, pairs),
+            None => Ok(false),
+        }
     }
 }

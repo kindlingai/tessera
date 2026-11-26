@@ -438,7 +438,7 @@ impl Sizes {
         (0..step.reads.len())
             .map(|i| step.read(i))
             .chain([step.out()])
-            .chain(step.kept(self.kept))
+            .chain(step.kept_for(self.kept, !self.from_list))
             .collect()
     }
 

@@ -35,6 +35,50 @@ pub(super) fn wants_paged(o: &Options, settings: &Settings) -> bool {
     settings.gpu().is_some() && !tessera_engine::sizer::platform(settings).integrated
 }
 
+/// Whether sparse MLA models should enable the host tier.
+pub(super) fn wants_host_tier(o: &Options, settings: &Settings, multi_plain: bool) -> bool {
+    if multi_plain || o.kv_cache_tokens.is_none() || settings.gpu().is_none() {
+        return false;
+    }
+    if tessera_engine::sizer::platform(settings).integrated {
+        return false;
+    }
+    if o.kv_stores.is_empty() {
+        return true;
+    }
+    KvConfig::parse_all(&o.kv_stores, o.kv_keep).is_ok_and(|c| {
+        !c.disabled
+            && c.tiers.len() == 1
+            && matches!(c.tiers[0].store, tessera_engine::kv::StoreKind::Ram { .. })
+    })
+}
+
+/// Splits sparse MLA KV and index VRAM budgets.
+pub(super) fn apply_host_tier(
+    o: &Options,
+    settings: &Settings,
+    recipe: &mut Recipe,
+    multi_plain: bool,
+) {
+    if !wants_host_tier(o, settings, multi_plain) {
+        return;
+    }
+    let Some(tokens) = o.kv_cache_tokens else {
+        return;
+    };
+    let full = o.slots.saturating_mul(o.max_model_len);
+    if full <= tokens {
+        return;
+    }
+    let cap = full.min(tokens.saturating_mul(5) / 2);
+    let kv_vram = tokens
+        .saturating_mul(704)
+        .saturating_sub(cap.saturating_mul(128))
+        / 576;
+    let kv_vram = kv_vram.max(tokens / 2).min(tokens);
+    recipe.share_index(kv_vram, cap);
+}
+
 /// Resolves explicit `--kv-store` flags or default discrete-GPU RAM tier.
 pub(super) fn resolve_kv(
     o: &Options,
@@ -82,7 +126,13 @@ pub(super) fn attach_kv(
     match eng.set_kv_store(&cfg) {
         Ok(()) => {
             if !o.ranks.follows() {
-                eprintln!("kv store: {}", cfg.describe());
+                if let Some((vram, host, cap)) = eng.host_tier_info() {
+                    eprintln!(
+                        "kv host tier: {vram} vram + {host} pinned host ({cap} active tokens)"
+                    );
+                } else {
+                    eprintln!("kv store: {}", cfg.describe());
+                }
             }
             Ok(true)
         }
@@ -368,6 +418,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     if wants_paged(o, &settings) && recipe.kept.page().is_none() {
         recipe.kept = Engine::paged_layout();
     }
+    apply_host_tier(o, &settings, &mut recipe, !o.ranks.alone());
     if recipe.config.is_none() {
         recipe.config = loaded.config;
     }
@@ -381,8 +432,8 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     };
     let seat = load.seat();
     let mut engine = source.enter(&seat, links, &o.progress)?;
-    check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)))?;
     let kv_on = attach_kv(o, &settings, &mut engine)?;
+    check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)))?;
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
     }
