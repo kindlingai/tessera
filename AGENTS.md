@@ -36,7 +36,8 @@ No arbitrary limits. A size limit must come from a real constraint: an index
 width, a hardware limit, or a fixed device structure. Do not use "maximum size
 tested" as a limit. Compute a limit that depends on the machine or the model
 from the plan and the device. Crashing beyond a memory limit is not a reason
-to add a hardcoded limit - fix the memory allocation strategy instead.
+to add a hardcoded limit - fix the memory allocation strategy instead. Remove
+any arbitrary limits you find that do not represent physical constraints.
 
 ## Pull Requests
 
@@ -51,6 +52,10 @@ bodies. CI and the commit-msg hook reject those lines.
 https://huggingface.co/datasets/kindlingai/tessera-references contains the
 golden references for a number of models. Use these to validate PRs against
 golden runs when you work near code that may break them.
+
+This project moves quickly. When submitting PRs, you must watch them for
+conflicts and actively rebase. If you have permission to do so, mark your
+PRs to auto-merge.
 
 ### Process Self-Improvement
 
