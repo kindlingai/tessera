@@ -1875,7 +1875,6 @@ version = "0.1.0"
 name = "tessera-engine"
 version = "0.1.0"
 dependencies = [
- "scattered-collect",
  "serde",
  "tessera-device",
  "tessera-engine-comm",
@@ -1909,6 +1908,7 @@ name = "tessera-engine-settings"
 version = "0.1.0"
 dependencies = [
  "derive_more",
+ "scattered-collect",
  "serde",
 ]
 

@@ -104,9 +104,9 @@ pub fn text() -> String {
     out
 }
 
-/// Declares a registry: `metric_registry!(NAME = "name")`.
+/// Declares a registry: `declare_registry!(NAME = "name")`.
 #[macro_export]
-macro_rules! metric_registry {
+macro_rules! declare_registry {
     ($(#[$doc:meta])* $vis:vis $name:ident = $label:literal) => {
         $crate::metrics::gather! {
             #[gather]
@@ -127,9 +127,9 @@ macro_rules! metric_registry {
     };
 }
 
-/// Adds a metric: `metric!(NAME in REGISTRY = Gauge "name", "Help.")`.
+/// Adds a metric: `declare_metric!(NAME in REGISTRY = Gauge "name", "Help.")`.
 #[macro_export]
-macro_rules! metric {
+macro_rules! declare_metric {
     ($(#[$doc:meta])* $vis:vis $name:ident in $registry:ident = $kind:ident $metric:literal, $help:literal) => {
         $crate::metrics::scatter! {
             #[scatter($registry)]

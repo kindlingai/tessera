@@ -22,15 +22,9 @@ mod kept;
 #[cfg(test)]
 mod kept_test;
 mod lanes;
-pub mod metrics;
-#[cfg(test)]
-mod metrics_test;
 mod model;
 mod mtp_draft;
 mod ple;
-pub mod progress;
-#[cfg(test)]
-mod progress_test;
 mod ranks;
 mod sample;
 #[cfg(test)]
@@ -60,7 +54,25 @@ pub use speculate::{Drafter, SpecStats, Speculate};
 // The front end reaches the engine crates only through these.
 pub use tessera_device::{arx, p2p, sums, whole};
 pub use tessera_engine_comm as comm;
-pub use tessera_engine_settings::{Ask, Asks, Attic, Backend, Memory, Reads};
+#[doc(hidden)]
+pub use tessera_engine_settings as settings;
+pub use tessera_engine_settings::{Ask, Asks, Attic, Backend, Memory, Reads, metrics, progress};
+
+/// Declares a registry: `metric_registry!(NAME = "name")`.
+#[macro_export]
+macro_rules! metric_registry {
+    ($($tt:tt)*) => {
+        $crate::settings::declare_registry!($($tt)*);
+    };
+}
+
+/// Adds a metric: `metric!(NAME in REGISTRY = Gauge "name", "Help.")`.
+#[macro_export]
+macro_rules! metric {
+    ($($tt:tt)*) => {
+        $crate::settings::declare_metric!($($tt)*);
+    };
+}
 pub use tessera_graph::{Bf16, DType, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};
 pub use tessera_interp::{Tensor, bind, fold};
 pub use tessera_lower::{

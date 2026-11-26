@@ -25,7 +25,6 @@ tessera-lower = { workspace = true }
 tessera-mem = { workspace = true }
 tessera-models = { workspace = true }
 tessera-run = { workspace = true }
-scattered-collect = "0.22"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tessera-trace = { workspace = true }

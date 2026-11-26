@@ -1,6 +1,12 @@
 //! Knobs the front end sets once and the engine reads.
 
 mod backend;
+pub mod metrics;
+#[cfg(test)]
+mod metrics_test;
+pub mod progress;
+#[cfg(test)]
+mod progress_test;
 
 pub use backend::{Backend, ByBackend};
 use std::path::PathBuf;

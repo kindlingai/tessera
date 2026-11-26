@@ -8,4 +8,5 @@ description = "Knobs the front end sets once and the engine reads"
 
 [dependencies]
 derive_more = { version = "2.1", features = ["display"] }
+scattered-collect = "0.22"
 serde = { version = "1", features = ["derive"] }
