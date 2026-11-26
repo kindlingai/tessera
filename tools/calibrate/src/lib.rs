@@ -6,6 +6,7 @@ pub mod guided;
 pub mod kernels;
 pub mod plans;
 pub mod probe;
+pub mod sweep;
 pub mod watch;
 
 // Linking the crates registers their rules.

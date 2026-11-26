@@ -28,12 +28,12 @@ const MOST: f64 = 64.0;
 const WARM: Duration = Duration::from_millis(100);
 
 /// A graph at fixed sizes, with its weight forms.
-struct Subject {
-    g: Graph,
-    sizes: Vec<(DimName, u64)>,
-    pins: Pins,
+pub(crate) struct Subject {
+    pub(crate) g: Graph,
+    pub(crate) sizes: Vec<(DimName, u64)>,
+    pub(crate) pins: Pins,
     /// Weights from a checkpoint. Without them the run makes noise.
-    loads: Option<Vec<Weight>>,
+    pub(crate) loads: Option<Vec<Weight>>,
 }
 
 /// Numbers in `args`, or the usage.
@@ -158,7 +158,7 @@ fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
     }))
 }
 
-fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>> {
+pub(crate) fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>> {
     let (kind, rest) = args.split_first().ok_or(USAGE)?;
     if kind == "model" {
         return model(rest).map_err(|e| e as Box<dyn Error>);
@@ -228,7 +228,7 @@ fn rows(plan: &Plan, device: &Device) -> Vec<Row> {
 }
 
 /// A runner for `plan` with `loads` as its weights.
-fn opened(
+pub(crate) fn opened(
     plan: Plan,
     loads: &[Weight],
     settings: &Settings,

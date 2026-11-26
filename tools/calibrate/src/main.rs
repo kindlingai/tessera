@@ -189,6 +189,7 @@ fn main() -> ExitCode {
         Some("plans") => gpu_check(&settings, plans::check),
         Some("kernels") => gpu_check(&settings, kernels::check_all),
         Some("watch") => tessera_calibrate::watch::watch(&settings, &args[1..]),
+        Some("sweep") => tessera_calibrate::sweep::sweep(&settings, &args[1..]),
         Some("guided") => guided::report(
             &settings,
             args.get(1)

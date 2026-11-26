@@ -259,3 +259,18 @@ fn one_layer_plans() {
     let device = Device::guess(&settings()).pinned(s.pins.clone());
     lower(&g, 0, &crate::plans::sizes(8, 8), &device).unwrap();
 }
+
+/// A matmul's work grows with its rows, at any speed.
+#[test]
+fn sweep_follows_rows() {
+    let args = ["gemm", "4", "64", "64"].map(String::from);
+    let mut s = crate::watch::subject(&args).unwrap().unwrap();
+    let points = crate::sweep::points(&mut s, Rows, &[4, 16], &settings(), false).unwrap();
+    assert_eq!(points.len(), 2);
+    let work = |p: &crate::sweep::Point| p.kernels.values().map(|k| k.work).sum::<f64>();
+    let ends = ((4, work(&points[0])), (16, work(&points[1])));
+    assert_eq!(crate::sweep::growth(ends.0, ends.1), Some(1.0));
+    assert!(points.iter().all(|p| p.seconds > 0.0 && p.bytes > 0));
+    let table = crate::sweep::table(&points, Rows);
+    assert!(table.contains("least timed time per Rows"), "{table}");
+}
