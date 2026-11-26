@@ -6,9 +6,9 @@
 # Each push leaves a new comment with the old head, the new head and
 # the files. A failed build leaves one comment, with a line that
 # stops a repeat of the same build.
-# Needs GH_TOKEN, GITHUB_REPOSITORY, MAIN, TOOL, RUNNER_TEMP, PR, HEAD,
-# BASE, KEY, BUILT and RUN_URL. BOT is the login that commits, without
-# "[bot]". git pushes with the checkout's token.
+# Needs GH_TOKEN, GITHUB_REPOSITORY, MAIN, ANY_TIER, TOOL, RUNNER_TEMP,
+# PR, HEAD, BASE, KEY, BUILT and RUN_URL. BOT is the login that
+# commits, without "[bot]". git pushes with the checkout's token.
 set -e
 repo=repos/$GITHUB_REPOSITORY
 tmp=$(mktemp -d)
@@ -25,7 +25,7 @@ gh api "$repo/pulls/$PR" --jq '[.state, .draft, .head.sha, .head.repo.full_name,
 IFS='	' read -r state draft sha owner target skip tier encoded branch <"$tmp/pull"
 if [ "$state" != open ] || [ "$draft" != false ] || [ "$sha" != "$HEAD" ] ||
     [ "$owner" != "$GITHUB_REPOSITORY" ] || [ "$target" != "$MAIN" ] ||
-    [ "$skip" != false ] || [ "$tier" != true ]; then
+    [ "$skip" != false ] || { [ "$tier" != true ] && [ "$ANY_TIER" != true ]; }; then
     echo "#$PR changed after the plan. Skipped."
     exit 0
 fi
