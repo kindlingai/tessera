@@ -13,7 +13,7 @@ use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--m <list>] [--new <n>] \
+const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
 [--embed <texts.json> [--vectors <file>]] [--forward <texts.json>]";
 
@@ -53,6 +53,8 @@ struct Args {
     require_favored: bool,
     /// Print top slow or unfused lowering sites on boot.
     explain_lowering: bool,
+    /// Run although lowering fell off the fast path.
+    allow_failed_lowering: bool,
 }
 
 fn args() -> Option<Args> {
@@ -70,6 +72,7 @@ fn args() -> Option<Args> {
         forward: None,
         require_favored: false,
         explain_lowering: false,
+        allow_failed_lowering: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -79,6 +82,10 @@ fn args() -> Option<Args> {
         }
         if flag == "--explain-lowering" {
             args.explain_lowering = true;
+            continue;
+        }
+        if flag == "--allow-failed-lowering" {
+            args.allow_failed_lowering = true;
             continue;
         }
         let value = given.next()?;
@@ -225,10 +232,11 @@ fn evaluate(args: &Args) -> Result<Report, Failure> {
     let mut engine = Engine::open(loaded.graph, args.context, &recipe, &settings)?;
     (loaded.weights).each(|at, w| engine.load_weight(at, w))?;
     if let Ok(report) = engine.lowering_report(1) {
-        if args.explain_lowering {
-            eprintln!("{}", report.format(12));
-        } else if let Some(warning) = report.warning("--explain-lowering") {
-            eprintln!("{warning}");
+        if let Some(text) = report.notice(args.explain_lowering, "--explain-lowering") {
+            eprintln!("{text}");
+        }
+        if report.has_fallbacks() && !args.allow_failed_lowering {
+            return Err("lowering fell off fast path - pass --allow-failed-lowering to run".into());
         }
     }
     let (prompt, wanted) = match &args.reference {

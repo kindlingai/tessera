@@ -482,6 +482,14 @@ mod report {
             ))
         }
 
+        /// The detailed report under `explain`, else the warning.
+        pub fn notice(&self, explain: bool, flag: &str) -> Option<String> {
+            match explain {
+                true => Some(self.format(12)),
+                false => self.warning(flag),
+            }
+        }
+
         /// Detailed multi-line report showing up to `top` fallback site groups.
         pub fn format(&self, top: usize) -> String {
             let head = if self.label.is_empty() {

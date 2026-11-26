@@ -13,6 +13,8 @@ fn flags_pick_entries() {
     assert!(o.switch("--explain-lowering"));
     assert!(o.explain_lowering);
     assert!(flags().contains("--explain-lowering"));
+    assert!(o.switch("--allow-failed-lowering"));
+    assert!(o.allow_failed_lowering);
     assert!(flags().contains("--kv-dtype"));
     assert!(o.flag("--image-size", "big".into()).is_none());
     assert!(o.flag("--max-batch-rows", "0".into()).is_none());

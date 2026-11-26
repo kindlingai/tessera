@@ -135,7 +135,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.layer,
         o.slots,
     );
-    check_lowering(o, &mut engine, Some((o.slots * (depth + 1)).min(16)));
+    check_lowering(o, &mut engine, Some((o.slots * (depth + 1)).min(16)))?;
     let generate = front(load, b.mode, &engine, target)?;
     if o.slots > 1 {
         return serve_batch(load, &mut engine, &mut drafter, generate, depth);
@@ -226,7 +226,7 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
         engine.device(),
         o.slots,
     );
-    check_lowering(o, &mut engine, Some(dflash_block.min(16)));
+    check_lowering(o, &mut engine, Some(dflash_block.min(16)))?;
     let d_sl = spec_len(load, dflash_block - 1, CostModel::dual_dflash(), false);
     let m_sl = spec_len(load, depth, CostModel::dual_mtp(), true);
     let selector = DualSelector::new(d_sl, m_sl);

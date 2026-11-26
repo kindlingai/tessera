@@ -309,7 +309,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         pair.block,
         o.slots,
     );
-    check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)));
+    check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)))?;
     let generate = front(load, b.mode, &engine, target)?;
     let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
     if o.slots > 1 {

@@ -96,16 +96,21 @@ pub(super) fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::name
     }
 }
 
-/// Prints lowering details or a boot warning on rank 0.
-pub(super) fn check_lowering(o: &Options, engine: &mut Engine, extra_rows: Option<usize>) {
+/// Reports lowering on rank 0. A fallback refuses the boot.
+pub(super) fn check_lowering(
+    o: &Options,
+    engine: &mut Engine,
+    extra_rows: Option<usize>,
+) -> Result<(), String> {
     if o.ranks.follows() {
-        return;
+        return Ok(());
     }
+    let mut fell = false;
     match engine.lowering_report(1) {
-        Ok(report) if o.explain_lowering => eprintln!("{}", report.format(12)),
         Ok(report) => {
-            if let Some(warning) = report.warning("--explain-lowering") {
-                eprintln!("{warning}");
+            fell |= report.has_fallbacks();
+            if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
+                eprintln!("{text}");
             }
         }
         Err(e) => eprintln!("warning: lowering report failed: {e}"),
@@ -116,18 +121,23 @@ pub(super) fn check_lowering(o: &Options, engine: &mut Engine, extra_rows: Optio
         && let Ok(report) = engine.lowering_report(rows)
     {
         eprintln!("{}", report.format(12));
-    }    // A prefill step off the fast path runs far slower.
+    }
+    // A prefill step off the fast path runs far slower.
     let chunk = engine.chunk(o.max_batch_rows);
     match engine.prefill_report(chunk) {
         Ok(_) if chunk == 1 => {}
-        Ok(report) if o.explain_lowering => eprintln!("{}", report.format(12)),
         Ok(report) => {
-            if let Some(warning) = report.warning("--explain-lowering") {
-                eprintln!("{warning}");
+            fell |= report.has_fallbacks();
+            if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
+                eprintln!("{text}");
             }
         }
         Err(e) => eprintln!("warning: prefill lowering report failed: {e}"),
     }
+    if fell && !o.allow_failed_lowering {
+        return Err("lowering fell off fast path - pass --allow-failed-lowering to boot".into());
+    }
+    Ok(())
 }
 
 /// Guides under `--guided`, sized by the engine's mask port.
@@ -278,7 +288,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     };
     let seat = load.seat();
     let mut engine = source.enter(&seat, links, &o.progress)?;
-    check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)));
+    check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)))?;
     let attach_kv = |eng: &mut Engine| -> Result<(), String> {
         let Some(dir) = kv_dir else {
             return Ok(());

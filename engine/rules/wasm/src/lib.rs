@@ -7,6 +7,7 @@ mod text;
 
 use abi::{ABI, Answer, Ask, Kind, Manifest};
 use guest::{BUILD_FUEL, FUEL, Guest};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -42,6 +43,8 @@ struct Sink {
     dump: Option<PathBuf>,
     favor: Option<String>,
     file: Mutex<Option<File>>,
+    /// Each ask and message already printed.
+    warned: Mutex<BTreeSet<(Vec<u8>, String)>>,
 }
 
 impl Sink {
@@ -50,7 +53,14 @@ impl Sink {
             dump: trace.dump,
             favor: trace.favor,
             file: Mutex::new(None),
+            warned: Mutex::default(),
         }
+    }
+
+    /// Whether `msg` is new for `ask`. Later calls return `false`.
+    fn first(&self, ask: &[u8], msg: &str) -> bool {
+        let mut warned = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        warned.insert((ask.to_vec(), msg.to_string()))
     }
 
     fn path(&self) -> Option<PathBuf> {
@@ -145,7 +155,11 @@ impl Asking {
         self.sink.favor.as_deref() == Some(self.rule)
     }
 
-    fn warn(&self, msg: &str) {
+    /// Prints `msg` once for each distinct `ask`.
+    fn warn(&self, ask: &[u8], msg: &str) {
+        if !self.sink.first(ask, msg) {
+            return;
+        }
         match self.is_favored() {
             true => eprintln!("wasm rule {} (favored): {msg}", self.rule),
             false => eprintln!("wasm rule {}: {msg}", self.rule),
@@ -160,7 +174,7 @@ impl Asking {
             Err(e) => {
                 let msg = e.to_string();
                 if log {
-                    self.warn(&msg);
+                    self.warn(self.rule.as_bytes(), &msg);
                 }
                 return Some(Err(msg));
             }
@@ -174,7 +188,7 @@ impl Asking {
             Err(e) => {
                 let msg = e.to_string();
                 if log {
-                    self.warn(&msg);
+                    self.warn(self.rule.as_bytes(), &msg);
                 }
                 return Some(Err(msg));
             }
@@ -185,7 +199,7 @@ impl Asking {
                 let msg = e.to_string();
                 if log {
                     self.sink.record(&input, None, Some(&msg));
-                    self.warn(&msg);
+                    self.warn(&input, &msg);
                 }
                 return Some(Err(msg));
             }
@@ -196,7 +210,7 @@ impl Asking {
                 let msg = e.to_string();
                 if log {
                     self.sink.record(&input, Some(&output), Some(&msg));
-                    self.warn(&msg);
+                    self.warn(&input, &msg);
                 }
                 return Some(Err(msg));
             }
@@ -206,7 +220,7 @@ impl Asking {
                 let msg = Error::Unread(u.unread).to_string();
                 if log {
                     self.sink.record(&input, Some(&output), Some(&msg));
-                    self.warn(&msg);
+                    self.warn(&input, &msg);
                 }
                 Some(Err(msg))
             }
@@ -214,7 +228,7 @@ impl Asking {
                 if log {
                     self.sink.record(&input, Some(&output), None);
                     if self.is_favored() {
-                        self.warn("declined site");
+                        self.warn(&input, "declined site");
                     }
                 }
                 Some(Err("guest declined site".into()))
@@ -227,7 +241,7 @@ impl Asking {
                     if let Some(msg) = err
                         && self.is_favored()
                     {
-                        self.warn(msg);
+                        self.warn(&input, msg);
                     }
                 }
                 match made {
