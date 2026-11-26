@@ -6,9 +6,11 @@ const NAME: &str = "glm53_moe";
 const ROUTE: &str = "glm53_route";
 const FC1: &str = "glm53_fc1";
 const FC2: &str = "glm53_fc2";
+const FC1_TURN: &str = "glm53_fc1_turn";
 const FC1_PF: &str = "glm53_fc1_pf";
 const FC2_PF: &str = "glm53_fc2_pf";
 const FINISH: &str = "glm53_finish";
+const MX8_TILE: usize = 272;
 
 /// The routed weights, by field.
 const ROUTED: [&str; 13] = [
@@ -210,10 +212,21 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     };
     let codes1 = [k1, sh_k1, book1, sh_book1].map(|b| b as usize);
     let codes2 = [k2, sh_k2, book2, sh_book2].map(|b| b as usize);
-    let (fc1, fc2) = if prefill {
+    let mut steps = vec![route];
+    let z_src = if prefill {
+        let [x_turned, act_out, z_pf] = [1, 2, 3].map(|draft| Place::Draft { draft });
+        let r_turn = vec![
+            Place::Read(0),
+            plan,
+            signs_in.read(),
+            gate_su.read(),
+            up_su.read(),
+            shared_gate.part(1),
+            shared_up.part(1),
+        ];
         let c1 = [&[rows, hidden, ffn, picks][..], &codes1, &[first, wide]].concat();
         let c2 = [&[rows, hidden, ffn, picks][..], &codes2, &[first, wide]].concat();
-        let mut r1 = vec![Place::Read(0), plan];
+        let mut r1 = vec![Place::Read(0), plan, x_turned];
         r1.extend([signs_in, gate_su, gate, gate_sv, up_su, up, up_sv, down_su].map(|f| f.read()));
         r1.extend(
             [shared_gate, shared_up]
@@ -221,27 +234,33 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 .concat(),
         );
         r1.push(shared_down.part(1));
-        let fc1 = Offer {
-            kernel: FC1_PF,
-            reads: r1,
-            len: total_slots * chunks * 4096,
-            counts: fixed(&c1),
-            shape: Shape::grid(chunks, total_slots, 256),
-            work: (total_slots * 2 * hidden * ffn) as f64,
-            guess: 1e-15,
-            ..Offer::default()
-        };
-        let fc2 = Offer {
-            kernel: FC2_PF,
-            reads: vec![plan, gpart, down.read(), shared_down.part(0)],
-            len: rows * (picks + 1) * hidden / 2,
-            counts: fixed(&c2),
-            shape: Shape::grid(ibs, total_slots, 256),
-            work: (total_slots * hidden * ffn) as f64,
-            guess: 1e-15,
-            ..Offer::default()
-        };
-        (fc1, fc2)
+        steps.extend([
+            grid_offer(
+                FC1_TURN,
+                r_turn,
+                total_slots * ibs * 16 * MX8_TILE,
+                &[rows, hidden, first],
+                (ibs, total_slots),
+                total_slots * 64 * hidden,
+            ),
+            grid_offer(
+                FC1_PF,
+                r1,
+                total_slots * chunks * 4096,
+                &c1,
+                (chunks, total_slots),
+                total_slots * 2 * hidden * ffn,
+            ),
+            grid_offer(
+                FC2_PF,
+                vec![plan, act_out, down.read(), shared_down.part(0)],
+                rows * (picks + 1) * hidden / 2,
+                &c2,
+                (ibs, total_slots),
+                total_slots * hidden * ffn,
+            ),
+        ]);
+        z_pf
     } else {
         let c1 = [
             &[rows, hidden, ffn, picks][..],
@@ -262,53 +281,71 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
                 .map(|f| [f.part(0), f.part(1)])
                 .concat(),
         );
-        let fc1 = Offer {
-            kernel: FC1,
-            reads: r1,
-            len: total_slots * chunks * 2 * ks1 * max_col * 128,
-            counts: fixed(&c1),
-            shape: Shape::grid(chunks * 2 * ks1, total_slots, 256),
-            work: (total_slots * 2 * hidden * ffn) as f64,
-            guess: 1e-15,
-            ..Offer::default()
-        };
         let mut r2 = vec![plan, gpart];
         r2.extend([gate_sv, up_sv, down_su, down].map(|f| f.read()));
         r2.extend([shared_gate.part(2), shared_up.part(2)]);
         r2.extend([shared_down.part(0), shared_down.part(1)]);
-        let fc2 = Offer {
-            kernel: FC2,
-            reads: r2,
-            len: rows * (picks + 1) * chunks * hidden / 2,
-            counts: fixed(&c2),
-            shape: Shape::grid(chunks * ns2, total_slots, 256),
-            work: (total_slots * hidden * ffn) as f64,
-            guess: 1e-15,
-            ..Offer::default()
-        };
-        (fc1, fc2)
+        steps.extend([
+            grid_offer(
+                FC1,
+                r1,
+                total_slots * chunks * 2 * ks1 * max_col * 128,
+                &c1,
+                (chunks * 2 * ks1, total_slots),
+                total_slots * 2 * hidden * ffn,
+            ),
+            grid_offer(
+                FC2,
+                r2,
+                rows * (picks + 1) * chunks * hidden / 2,
+                &c2,
+                (chunks * ns2, total_slots),
+                total_slots * hidden * ffn,
+            ),
+        ]);
+        z
     };
-    let finish = Offer {
+    steps.push(Offer {
         kernel: FINISH,
         reads: vec![
             plan,
             down_sv.read(),
             signs_out.read(),
             shared_down.part(2),
-            z,
+            z_src,
         ],
         len,
         counts: fixed(&[rows, hidden, ffn, picks, wide, z_chunks]),
         shape: Shape::grid(hidden / 128, rows, (picks + 1) * 32),
         work: len as f64,
         ..Offer::default()
-    };
-    Some(vec![route, fc1, fc2, finish])
+    });
+    Some(steps)
+}
+
+fn grid_offer(
+    kernel: &'static str,
+    reads: Vec<Place>,
+    len: usize,
+    counts: &[usize],
+    (x, y): (usize, usize),
+    work: usize,
+) -> Offer {
+    Offer {
+        kernel,
+        reads,
+        len,
+        counts: fixed(counts),
+        shape: Shape::grid(x, y, 256),
+        work: work as f64,
+        guess: 1e-15,
+        ..Offer::default()
+    }
 }
 
 tessera_guest::exports! {
     rules: { NAME => Kind::Moe },
-    kernels: { "moe.cu": [ROUTE, FC1, FC2, FC1_PF, FC2_PF, FINISH] },
+    kernels: { "moe.cu": [ROUTE, FC1, FC2, FC1_TURN, FC1_PF, FC2_PF, FINISH] },
     files: ["mx8.cuh"],
     propose: offer,
 }

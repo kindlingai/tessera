@@ -720,36 +720,72 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
       sm, m, c, ns, ns2, slot, chunks, ks1, min(rows, 8u), hidden, n, z_off0, z_off1);
 }
 
-// Prefill fused single-pass-x gate, up, and SwiGLU into bfrag tiles.
+// Pre-turns routed and shared activations once per slot block.
+extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_turn(
+    const float* x, const float* plan_in, const float* signs_in, const float* gate_su,
+    const float* up_su, const float* sh_gate_su, const float* sh_up_su, float* x_out,
+    u32 rows, u32 hidden, u32 first) {
+  (void)first;
+#if GLM53_USE_MX8
+  const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
+  u32 n_sh = (rows + 63u) >> 6u, slot = blockIdx.y, c0 = blockIdx.x, nblk = hidden >> 7u;
+  bool is_sh = slot < n_sh;
+  if (!is_sh && slot - n_sh >= plan->n_slots) return;
+  __shared__ Pf1TurnSmem sm;
+  u32 r0_sh = slot * 64u, rs = is_sh ? 0u : (slot - n_sh), n;
+  const float *gsu, *usu, *signs;
+  if (is_sh) { n = min(rows - r0_sh, 64u); gsu = sh_gate_su; usu = sh_up_su; signs = 0; }
+  else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; gsu = gate_su + (u64)e * hidden; usu = up_su + (u64)e * hidden; signs = signs_in; }
+  u32* dst_blk = reinterpret_cast<u32*>(x_out) + ((u64)slot * nblk + c0) * (16u * MX8_TILE);
+  pf_turn_slot_blk(x, signs, gsu, usu, dst_blk, sm, c0, hidden, n,
+                   [&](u32 r) { return slot_tok_at(plan, is_sh, r0_sh, rs, r); });
+#else
+  (void)x; (void)plan_in; (void)signs_in; (void)gate_su; (void)up_su; (void)sh_gate_su; (void)sh_up_su; (void)x_out; (void)rows; (void)hidden;
+#endif
+}
+
+// Prefill fused gate, up, and SwiGLU into bfrag tiles.
 template <u32 K, u32 BOOK, u32 NT>
 static __device__ __forceinline__ void fc1_pf_body(
-    const float* x, const Plan* plan, const float* signs, const float* gsu, bytes gate,
+    const float* x, const Plan* plan, const u32* x_slot, const float* signs, const float* gsu, bytes gate,
     const float* gsv, const float* usu, bytes up, const float* usv, const float* dsu,
     u32* act_dst, Pf1Smem& sm, bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 c, u32 hidden, u32 n) {
   constexpr u32 TB = 32u * K;
   u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u, nblk = hidden >> 7u;
   Mat Wg = matrix(gate), Wu = matrix(up);
-  u64 sGg = (Wg.input_side ? u64(Wg.out >> 1u) : 64ull) * u64(TB);
-  u64 sGu = (Wu.input_side ? u64(Wu.out >> 1u) : 64ull) * u64(TB);
+  u64 sGg = (Wg.input_side ? u64(Wg.out >> 1u) : 64ull) * u64(TB), sGu = (Wu.input_side ? u64(Wu.out >> 1u) : 64ull) * u64(TB);
   bytes gbp = trellis::tile_ptr<K>(Wg.base, Wg.inp, Wg.out, m, 0u, c, Wg.input_side);
   bytes ubp = trellis::tile_ptr<K>(Wu.base, Wu.inp, Wu.out, m, 0u, c, Wu.input_side);
-  bool ga = (reinterpret_cast<u64>(gbp) & 15ull) == 0ull;
-  bool ua = (reinterpret_cast<u64>(ubp) & 15ull) == 0ull;
+  bool ga = (reinterpret_cast<u64>(gbp) & 15ull) == 0ull, ua = (reinterpret_cast<u64>(ubp) & 15ull) == 0ull;
   u32 nw[8];
   trellis::blk_load<K>(gbp, tid, ga, nw);
   trellis::word_map wm = trellis::map_word<K>(lane);
   float ag[NT][4], au[NT][4];
 #pragma unroll
-  for (u32 ti = 0u; ti < NT; ti++) {
-    ag[ti][0] = ag[ti][1] = ag[ti][2] = ag[ti][3] = 0.f;
-    au[ti][0] = au[ti][1] = au[ti][2] = au[ti][3] = 0.f;
+  for (u32 ti = 0u; ti < NT; ti++) { ag[ti][0] = ag[ti][1] = ag[ti][2] = ag[ti][3] = 0.f; au[ti][0] = au[ti][1] = au[ti][2] = au[ti][3] = 0.f; }
+#if GLM53_USE_MX8
+  (void)x; (void)plan; (void)signs; (void)gsu; (void)usu; (void)is_sh; (void)r0_sh; (void)rs;
+  u32 nv4 = ((n + 7u) >> 3u) * MX8_V4;
+  for (u32 c0 = 0u; c0 < nblk; c0++) {
+    pf_load_turned<NT>(x_slot + (u64)c0 * (16u * MX8_TILE), sm, tid, nv4);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]);
+    asm volatile("cp.async.wait_group 0;");
+    prim::block_sync();
+    trellis::blk_load<K>(ubp, tid, ua, nw);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_g, j, lane, wm, ag);
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles[1]);
+    prim::block_sync();
+    if (c0 + 1u < nblk) { gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw); }
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[1], sm.k.btab_u, j, lane, wm, au);
+    if (c0 + 1u < nblk) prim::block_sync();
   }
+#else
+  (void)x_slot;
   for (u32 c0 = 0u; c0 < nblk; c0++) {
     u32 at = (c0 << 7u) + (lane << 2u);
     float4 gsv4 = *(const float4*)(gsu + at), usv4 = *(const float4*)(usu + at);
     float4 sg = signs ? *(const float4*)(signs + at) : make_float4(1.f, 1.f, 1.f, 1.f);
-    float scg[4] = {gsv4.x * sg.x, gsv4.y * sg.y, gsv4.z * sg.z, gsv4.w * sg.w};
-    float scu[4] = {usv4.x * sg.x, usv4.y * sg.y, usv4.z * sg.z, usv4.w * sg.w};
+    float scg[4] = {gsv4.x * sg.x, gsv4.y * sg.y, gsv4.z * sg.z, gsv4.w * sg.w}, scu[4] = {usv4.x * sg.x, usv4.y * sg.y, usv4.z * sg.z, usv4.w * sg.w};
 #pragma unroll
     for (u32 ti = 0u; ti < NT; ti++) {
       u32 r = (ti << 3u) + j;
@@ -759,23 +795,19 @@ static __device__ __forceinline__ void fc1_pf_body(
         float4 xv = *(const float4*)(x + (u64)tok * hidden + at);
         vg[0] = xv.x * scg[0]; vg[1] = xv.y * scg[1]; vg[2] = xv.z * scg[2]; vg[3] = xv.w * scg[3];
         vu[0] = xv.x * scu[0]; vu[1] = xv.y * scu[1]; vu[2] = xv.z * scu[2]; vu[3] = xv.w * scu[3];
-        trellis::wht128(vg, trellis::INV_SQRT128);
-        trellis::wht128(vu, trellis::INV_SQRT128);
+        trellis::wht128(vg, trellis::INV_SQRT128); trellis::wht128(vu, trellis::INV_SQRT128);
       }
-      pf_store_bfrag(sm.k.btab_g, ti, j, lane, r < n, vg);
-      pf_store_bfrag(sm.k.btab_u, ti, j, lane, r < n, vu);
+      pf_store_bfrag(sm.k.btab_g, ti, j, lane, r < n, vg); pf_store_bfrag(sm.k.btab_u, ti, j, lane, r < n, vu);
     }
-    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
-    prim::block_sync();
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]); prim::block_sync();
     trellis::blk_load<K>(ubp, tid, ua, nw);
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_g, j, lane, wm, ag);
-    prim::block_sync();
-    trellis::blk_store<K>(nw, tid, sm.k.wtiles);
-    prim::block_sync();
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_g, j, lane, wm, ag); prim::block_sync();
+    trellis::blk_store<K>(nw, tid, sm.k.wtiles[0]); prim::block_sync();
     if (c0 + 1u < nblk) { gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw); }
-    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_u, j, lane, wm, au);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles[0], sm.k.btab_u, j, lane, wm, au);
     if (c0 + 1u < nblk) prim::block_sync();
   }
+#endif
   transpose_acc<NT>(ag, sm.out, ag, n);
   transpose_acc<NT>(au, sm.out, au, n);
   prim::block_sync();
@@ -786,8 +818,7 @@ static __device__ __forceinline__ void fc1_pf_body(
     u32 r = (ti << 3u) + j;
     float a[4] = {};
     if (r < n) {
-      trellis::wht128(ag[ti], trellis::INV_SQRT128);
-      trellis::wht128(au[ti], trellis::INV_SQRT128);
+      trellis::wht128(ag[ti], trellis::INV_SQRT128); trellis::wht128(au[ti], trellis::INV_SQRT128);
       float g0 = ag[ti][0] * sg.x, g1 = ag[ti][1] * sg.y, g2 = ag[ti][2] * sg.z, g3 = ag[ti][3] * sg.w;
       a[0] = (g0 / (1.0f + __expf(-g0))) * (au[ti][0] * su.x) * sd.x;
       a[1] = (g1 / (1.0f + __expf(-g1))) * (au[ti][1] * su.y) * sd.y;
@@ -804,32 +835,18 @@ static __device__ __forceinline__ void fc1_pf_body(
 }
 
 template <u32 K, u32 BOOK>
-static __device__ __noinline__ void fc1_pf_hot(
-    const float* x, const Plan* plan, const float* signs, const float* gsu, bytes gate,
-    const float* gsv, const float* usu, bytes up, const float* usv, const float* dsu,
-    u32* act_dst, Pf1Smem& sm, bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 c, u32 hidden, u32 n) {
-  if (n <= 8u) fc1_pf_body<K, BOOK, 1u>(x, plan, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else if (n <= 16u) fc1_pf_body<K, BOOK, 2u>(x, plan, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else if (n <= 32u) fc1_pf_body<K, BOOK, 4u>(x, plan, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else fc1_pf_body<K, BOOK, 8u>(x, plan, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+static __device__ __noinline__ void fc1_pf_hot(const float* x, const Plan* plan, const u32* xs, const float* signs, const float* gsu, bytes gate, const float* gsv, const float* usu, bytes up, const float* usv, const float* dsu, u32* act_dst, Pf1Smem& sm, bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 c, u32 hidden, u32 n) {
+  if (n <= 8u) fc1_pf_body<K, BOOK, 1u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else if (n <= 16u) fc1_pf_body<K, BOOK, 2u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else if (n <= 32u) fc1_pf_body<K, BOOK, 4u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else fc1_pf_body<K, BOOK, 8u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
-
 template <u32 K, u32 BOOK>
-static __device__ __noinline__ void fc1_pf_cold(
-    const float* x, const Plan* plan, const float* signs, const float* gsu, bytes gate, const float* gsv,
-    const float* usu, bytes up, const float* usv, const float* dsu, u32* act_dst, Pf1Smem& sm,
-    bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 c, u32 hidden, u32 n) {
-  fc1_pf_body<K, BOOK, 8u>(x, plan, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+static __device__ __noinline__ void fc1_pf_cold(const float* x, const Plan* plan, const u32* xs, const float* signs, const float* gsu, bytes gate, const float* gsv, const float* usu, bytes up, const float* usv, const float* dsu, u32* act_dst, Pf1Smem& sm, bool is_sh, u32 r0_sh, u32 rs, u32 m, u32 c, u32 hidden, u32 n) {
+  fc1_pf_body<K, BOOK, 8u>(x, plan, xs, signs, gsu, gate, gsv, usu, up, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
-
 // Prefill fused gate, up and SwiGLU for 64-token slots.
-extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(
-    const float* x, const float* plan_in, const float* signs_in, const float* gate_su, bytes gate,
-    const float* gate_sv, const float* up_su, bytes up, const float* up_sv, const float* down_su,
-    bytes sh_gate, const float* sh_gate_su, const float* sh_gate_sv, bytes sh_up,
-    const float* sh_up_su, const float* sh_up_sv, const float* sh_down_su, float* act_out,
-    u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book,
-    u32 first, u32 shared_ffn) {
+extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(const float* x, const float* plan_in, const float* x_turned, const float* signs_in, const float* gate_su, bytes gate, const float* gate_sv, const float* up_su, bytes up, const float* up_sv, const float* down_su, bytes sh_gate, const float* sh_gate_su, const float* sh_gate_sv, bytes sh_up, const float* sh_up_su, const float* sh_up_sv, const float* sh_down_su, float* act_out, u32 rows, u32 hidden, u32 ffn, u32 picks, u32 k, u32 shared_k, u32 book, u32 shared_book, u32 first, u32 shared_ffn) {
   (void)picks;
   const Plan* plan = reinterpret_cast<const Plan*>(plan_in);
   u32 n_sh = (rows + 63u) >> 6u, slot = blockIdx.y, c = blockIdx.x, chunks = ffn >> 7u;
@@ -841,11 +858,12 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(
   const float *gsu, *gsv, *usu, *usv, *dsu, *signs;
   if (is_sh) { n = min(rows - r0_sh, 64u); m = 0u; gb = sh_gate; gsu = sh_gate_su; gsv = sh_gate_sv; ub = sh_up; usu = sh_up_su; usv = sh_up_sv; dsu = sh_down_su; signs = 0; k = shared_k; book = shared_book; }
   else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; m = e - first; gb = gate; gsu = gate_su + (u64)e * hidden; gsv = gate_sv + (u64)e * ffn; ub = up; usu = up_su + (u64)e * hidden; usv = up_sv + (u64)e * ffn; dsu = down_su + (u64)e * ffn; signs = signs_in; if (c == 0u && threadIdx.x == 0u) { trellis::note_hit(gb, m); trellis::note_hit(ub, m); } }
+  const u32* xs = reinterpret_cast<const u32*>(x_turned) + (u64)slot * (hidden >> 7u) * (16u * MX8_TILE);
   u32* act_dst = reinterpret_cast<u32*>(act_out) + ((u64)slot * chunks + c) * 4096u;
-  if (book && k == 2u) fc1_pf_hot<2u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else if (book && k == 3u) fc1_pf_hot<3u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else if (book && k == 4u) fc1_pf_hot<4u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
-  else DISPATCH_KB(fc1_pf_cold, fc1_pf_cold, k, book, x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  if (book && k == 2u) fc1_pf_hot<2u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else if (book && k == 3u) fc1_pf_hot<3u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else if (book && k == 4u) fc1_pf_hot<4u, trellis::BOOK_MUL1>(x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else DISPATCH_KB(fc1_pf_cold, fc1_pf_cold, k, book, x, plan, xs, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
 
 // Prefill down projection across all ffn chunks per ob.

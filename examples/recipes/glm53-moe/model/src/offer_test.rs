@@ -85,7 +85,7 @@ fn offer_row_bounds() {
     for rows in [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
-            assert_eq!(got.len(), 4);
+            assert_eq!(got.len(), if rows > 32 { 5 } else { 4 });
             let rks = if rows >= 64 && experts == 256 {
                 1
             } else if rows >= 64 && experts % 64 == 0 {
