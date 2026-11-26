@@ -74,6 +74,10 @@ tessera-turns = { path = "engine/ir/turns" }
 tessera-wasm = { path = "engine/rules/wasm" }
 tessera-publish = { path = "tools/publish" }
 
+# Line tables keep backtraces readable and keep target/ small.
+[profile.dev]
+debug = "line-tables-only"
+
 # The host executor interprets whole kernels, so tests need it optimized.
 [profile.dev.package.tessera-host]
 opt-level = 3
