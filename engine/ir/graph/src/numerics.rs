@@ -41,7 +41,8 @@ impl Numerics {
 
 /// Whether `op` sums parts across ranks.
 pub fn sums_ranks(op: &Op) -> bool {
-    matches!(op, Op::Row(r) if r.0.contains(&Stage::AllReduce))
+    let sums = |s: &Stage| matches!(s, Stage::AllReduce | Stage::ReduceScatter);
+    matches!(op, Op::Row(r) if r.0.iter().any(sums))
 }
 
 impl Graph {

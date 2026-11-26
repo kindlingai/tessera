@@ -23,6 +23,16 @@ impl Parts {
         Some(self.0.iter().map(|w| *w as usize * unit).collect())
     }
 
+    /// Rank `rank`'s start and length of `whole` rows, any count.
+    pub fn rows(&self, whole: usize, rank: usize) -> (usize, usize) {
+        let sum: u64 = self.0.iter().map(|w| u64::from(*w)).sum();
+        let before = |r: usize| -> usize {
+            let held: u64 = self.0[..r].iter().map(|w| u64::from(*w)).sum();
+            (whole as u64 * held / sum.max(1)) as usize
+        };
+        (before(rank), before(rank + 1) - before(rank))
+    }
+
     /// Rank `rank`'s start and length along a `whole` axis.
     pub fn part(&self, whole: usize, rank: usize) -> Option<(usize, usize)> {
         let counts = self.counts(whole)?;

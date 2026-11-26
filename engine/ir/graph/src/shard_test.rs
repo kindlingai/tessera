@@ -169,3 +169,38 @@ fn gathered_residual_splits() {
     let sums = |n: &Node| n.op == Op::Row(Row(vec![Stage::AllReduce]));
     assert_eq!(sharded.graph.nodes.iter().filter(|n| sums(n)).count(), 1);
 }
+
+/// Two `mlp` layers with a norm between them.
+fn two_layers() -> Graph {
+    let mut g = graph(&[[Ffn, Hidden], [Hidden, Ffn], [Ffn, Hidden], [Hidden, Ffn]]);
+    let mut x = NodeId(0);
+    for layer in 0..2 {
+        let [w1, w2] = [1, 2].map(|w| NodeId(layer * 2 + w));
+        let normed = push(&mut g, Op::Row(Row(vec![Stage::Rms { eps: 1e-6 }])), &[x]);
+        let up = push(&mut g, Op::Matmul, &[normed, w1]);
+        let inner = push(&mut g, Op::Row(Row(vec![Stage::Act(Act::Silu)])), &[up]);
+        let down = push(&mut g, Op::Matmul, &[inner, w2]);
+        x = push(&mut g, Op::Row(Row(vec![Stage::Add])), &[x, down]);
+    }
+    finish(&mut g, x);
+    g
+}
+
+#[test]
+fn owned_rows_gather_late() {
+    let sharded = shard(&two_layers(), &Parts::even(2)).unwrap().graph;
+    let g = own_rows(&sharded).unwrap();
+    let count = |s: Stage| {
+        let op = Op::Row(Row(vec![s]));
+        g.nodes.iter().filter(|n| n.op == op).count()
+    };
+    assert_eq!(count(Stage::AllReduce), 0);
+    assert_eq!(count(Stage::ReduceScatter), 2);
+    // One before the second split matmul, one for the output.
+    assert_eq!(count(Stage::GatherRows), 2);
+    // The second layer's norm and add run on owned rows.
+    let owned = g.nodes.iter().filter(|n| n.ty.placement == Owned);
+    assert_eq!(owned.count(), 5);
+    let out = g.entries[0].outputs[0].node;
+    assert_eq!(g.node(out).ty.placement, Replicated);
+}

@@ -288,6 +288,51 @@ fn all_reduce(num: &Numerics, parts: &[Tensor]) -> Result<Tensor, Error> {
     sum.ok_or_else(|| Error::Mismatch("a sum over no ranks".into()))
 }
 
+/// Each rank's own rows of a whole `sum`.
+fn scatter(sum: &Tensor, parts: &Parts) -> Vec<Tensor> {
+    let rows = |r| parts.rows(sum.shape[0], r);
+    (0..parts.ranks())
+        .map(|r| slice(sum, 0, rows(r).0, rows(r).1))
+        .collect()
+}
+
+/// The ranks' own rows joined on the leading axis.
+fn gather_rows(parts: &[Tensor]) -> Result<Tensor, Error> {
+    let mut shape = parts[0].shape.clone();
+    shape[0] = parts.iter().map(|p| p.shape[0]).sum();
+    let mut all = Vec::new();
+    for p in parts {
+        all.extend_from_slice(p.floats()?);
+    }
+    Ok(Tensor::f32(shape, all))
+}
+
+/// `args`, with whole ones cut to rank `r`'s rows.
+fn own_args<'a>(
+    g: &Graph,
+    n: &Node,
+    args: Vec<&'a Tensor>,
+    parts: &Parts,
+    r: usize,
+) -> Vec<Cow<'a, Tensor>> {
+    let ty = |a: &NodeId| &g.node(*a).ty;
+    let owned = n.args.iter().find(|a| ty(a).placement == Placement::Owned);
+    let lead = owned.map(|a| (&ty(a).shape.0[0], n.args.iter().position(|b| b == a)));
+    let mut out = Vec::with_capacity(args.len());
+    for (at, (a, t)) in n.args.iter().zip(args).enumerate() {
+        let whole = ty(a).placement == Placement::Replicated;
+        let shared = lead.filter(|(rows, _)| whole && ty(a).shape.0.first() == Some(*rows));
+        out.push(match shared {
+            Some((_, Some(own))) if own != at => {
+                let (first, count) = parts.rows(t.shape[0], r);
+                Cow::Owned(slice(t, 0, first, count))
+            }
+            _ => Cow::Borrowed(t),
+        });
+    }
+    out
+}
+
 /// The parts joined on their last axis, in rank order.
 fn all_gather(parts: &[Tensor]) -> Result<Tensor, Error> {
     let mut whole = parts[0].clone();
@@ -381,6 +426,11 @@ fn run_on(
                 want[axis as usize] = part(parts, axis, whole[axis as usize], r)?.1;
             }
         }
+        if n.ty.placement == Placement::Owned {
+            for (r, want) in wants.iter_mut().enumerate() {
+                want[0] = parts.rows(whole[0], r).1;
+            }
+        }
         let mut outs: Vec<Tensor> = Vec::with_capacity(ranks);
         for (r, held) in values.iter().enumerate() {
             let value = |a: &NodeId| held[a.0 as usize].as_ref().expect("args come first");
@@ -394,6 +444,8 @@ fn run_on(
                 continue;
             }
             let args: Vec<&Tensor> = n.args.iter().map(value).collect();
+            let args = own_args(g, n, args, parts, r);
+            let args: Vec<&Tensor> = args.iter().map(|a| &**a).collect();
             let (first, whole_col) = split_range(g, n, &sizes, parts, r)?;
             outs.push(match &n.op {
                 Op::View(View::Reshape(_)) => args[0].reshaped(wants[r].clone()),
@@ -452,14 +504,16 @@ fn run_on(
         if let Op::Row(row) = &n.op
             && let Some(at) = joins(row)
         {
-            let sum = match row.0[at] {
-                Stage::AllReduce => all_reduce(&num, &outs)?,
-                _ => all_gather(&outs)?,
+            let sums = match row.0[at] {
+                Stage::AllReduce => vec![all_reduce(&num, &outs)?; ranks],
+                Stage::ReduceScatter => scatter(&all_reduce(&num, &outs)?, parts),
+                Stage::GatherRows => vec![gather_rows(&outs)?; ranks],
+                _ => vec![all_gather(&outs)?; ranks],
             };
             let rest = &row.0[at + 1..];
             // Stages past the sum are operand-free.
             outs = (0..ranks)
-                .map(|r| ctx(r, 0).stages(&num, rest, &[&sum]))
+                .map(|r| ctx(r, 0).stages(&num, rest, &[&sums[r]]))
                 .collect::<Result<_, _>>()?;
         }
         for (r, out) in outs.into_iter().enumerate() {

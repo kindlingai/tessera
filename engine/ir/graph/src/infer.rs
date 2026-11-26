@@ -224,6 +224,8 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
         (Replicated, Split { axis }) if axis == n => Split { axis: out_last },
         (Split { axis }, Replicated) if (n..last).contains(&axis) => Split { axis },
         (Partial, Replicated) => Partial,
+        // A whole weight serves any share of the rows.
+        (Owned, Replicated) if lead == 0 && x.rank() >= 2 => Owned,
         (Split { axis }, Split { axis: k }) if axis == last && k == n + 1 => Partial,
         // Both split along one shared batch axis: each part alone.
         (Split { axis }, Split { axis: k }) if axis == k && (axis as usize) < own => Split { axis },
@@ -655,6 +657,16 @@ fn place(
             || format!("{s:?} needs a split last axis, got {p:?}"),
         )
         .map(|()| Placement::Replicated),
+        Place::Scatter => need(
+            p == Placement::Partial && x.rank() >= 2,
+            ErrorKind::Placement,
+            || format!("{s:?} needs partial sums over rows, got {p:?}"),
+        )
+        .map(|()| Placement::Owned),
+        Place::Join => need(p == Placement::Owned, ErrorKind::Placement, || {
+            format!("{s:?} needs owned rows, got {p:?}")
+        })
+        .map(|()| Placement::Replicated),
     }
 }
 
@@ -684,6 +696,13 @@ fn combine(
         (Partial, Replicated) if !sum => Ok(Partial),
         (Routed, Routed) => Ok(Routed),
         (Routed, Replicated) | (Replicated, Routed) if !sum => Ok(Routed),
+        // A rank takes its own rows of a whole operand.
+        (Owned, Replicated) => Ok(Owned),
+        (Owned, Owned) | (Replicated, Owned) if lead == 0 => Ok(Owned),
+        (_, Owned) => Err(TypeError {
+            kind: ErrorKind::Placement,
+            message: format!("{s:?} cannot spread owned rows over {p:?}"),
+        }),
         (a, b) if shift(b, lead) == a && a != Partial => Ok(a),
         (Split { axis }, Replicated) if (axis as usize) < lead => Ok(p),
         _ => Err(TypeError {
@@ -721,6 +740,11 @@ fn collapse(axis: u32, x: &TensorType) -> Result<TensorType, TypeError> {
     need((axis as usize) < x.rank(), ErrorKind::Shape, || {
         format!("no axis {axis} in {}", x.shape)
     })?;
+    need(
+        x.placement != Placement::Owned,
+        ErrorKind::Placement,
+        || "a mean cannot read owned rows".into(),
+    )?;
     let mut shape = x.shape.0.clone();
     shape.remove(axis as usize);
     // Each rank sums its own rows.
@@ -769,7 +793,7 @@ fn blocks(dims: &[Dim], width: &DimExpr, block: u32) -> Result<bool, TypeError> 
 
 fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
     let ok = match p {
-        Placement::Replicated => true,
+        Placement::Replicated | Placement::Owned => true,
         Placement::Split { axis } => axis < last,
         Placement::Partial | Placement::Routed => false,
     };
@@ -780,6 +804,17 @@ fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
 
 fn view(dims: &[Dim], v: &View, x: &TensorType) -> Result<TensorType, TypeError> {
     let mut out = x.clone();
+    if x.placement == Placement::Owned {
+        let kept = match v {
+            View::Reshape(s) => same(dims, &x.shape.0[0], &s.0[0])?,
+            View::Slice { axis, .. } | View::Expand { axis, .. } => *axis != 0,
+            View::Permute(perm) => perm.first() == Some(&0),
+            View::Concat => true,
+        };
+        need(kept, ErrorKind::Placement, || {
+            format!("{v:?} moves the leading axis of owned rows")
+        })?;
+    }
     match v {
         View::Reshape(s) => {
             need(
@@ -935,7 +970,10 @@ fn append(dims: &[Dim], kept: &TensorType, a: &[&TensorType]) -> Result<TensorTy
     // Kept rows have one more leading axis than new rows.
     need(
         kept.placement == shift(rows.placement, 1)
-            && !matches!(rows.placement, Placement::Partial | Placement::Routed),
+            && !matches!(
+                rows.placement,
+                Placement::Partial | Placement::Routed | Placement::Owned
+            ),
         ErrorKind::Placement,
         || {
             let (r, k) = (rows.placement, kept.placement);

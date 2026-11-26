@@ -22,7 +22,7 @@ fn whole(t: &TensorType, axes: usize) -> bool {
     match t.placement {
         Placement::Replicated => true,
         Placement::Split { axis } => (axis as usize) + axes < t.rank(),
-        Placement::Partial | Placement::Routed => false,
+        Placement::Partial | Placement::Routed | Placement::Owned => false,
     }
 }
 
@@ -51,7 +51,7 @@ fn gather(table: &TensorType, ids: &TensorType) -> Result<TensorType, TypeError>
         Split { axis } => Split {
             axis: axis - 1 + lead,
         },
-        Partial | Routed => {
+        Partial | Routed | Owned => {
             return Err(TypeError {
                 kind: ErrorKind::Placement,
                 message: format!("gather cannot read a {:?} table", table.placement),

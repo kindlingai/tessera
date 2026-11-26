@@ -478,40 +478,45 @@ fn place(g: &mut Graph, weight: NodeId, axis: u32) {
     g.weights[w as usize].ty.placement = Placement::Split { axis };
 }
 
-/// Puts `node` after `at`. Reads of `at` move to it.
-fn insert(g: &mut Graph, at: NodeId, node: Node) {
-    let new = NodeId(at.0 + 1);
+/// Puts `node` at `new`. Later nodes move up by one.
+pub(crate) fn open(g: &mut Graph, new: NodeId, node: Node) {
     let shift = |n: &mut NodeId| {
         if *n >= new {
             n.0 += 1;
         }
     };
-    let redirect = |n: &mut NodeId| {
-        if *n == at {
-            *n = new;
-        }
-    };
     for n in &mut g.nodes[new.0 as usize..] {
-        n.args.iter_mut().for_each(|a| {
-            shift(a);
-            redirect(a);
-        });
+        n.args.iter_mut().for_each(shift);
     }
     g.nodes.insert(new.0 as usize, node);
     for e in &mut g.entries {
-        e.outputs.iter_mut().for_each(|o| {
-            shift(&mut o.node);
-            redirect(&mut o.node);
-        });
+        e.outputs.iter_mut().for_each(|o| shift(&mut o.node));
     }
     for r in &mut g.regions {
         shift(&mut r.start);
         // The end is past the last, so it moves.
         shift(&mut r.end);
-        for n in r.inputs.iter_mut().chain(&mut r.outputs) {
-            shift(n);
-            redirect(n);
+        r.inputs.iter_mut().chain(&mut r.outputs).for_each(shift);
+    }
+}
+
+/// Puts `node` after `at`. Reads of `at` move to it.
+fn insert(g: &mut Graph, at: NodeId, node: Node) {
+    let new = NodeId(at.0 + 1);
+    open(g, new, node);
+    let redirect = |n: &mut NodeId| {
+        if *n == at {
+            *n = new;
         }
+    };
+    for n in &mut g.nodes[new.0 as usize + 1..] {
+        n.args.iter_mut().for_each(redirect);
+    }
+    for e in &mut g.entries {
+        e.outputs.iter_mut().for_each(|o| redirect(&mut o.node));
+    }
+    for r in &mut g.regions {
+        r.inputs.iter_mut().chain(&mut r.outputs).for_each(redirect);
     }
 }
 
@@ -529,23 +534,31 @@ fn retype(g: &Graph) -> Result<Graph, crate::infer::TypeError> {
 fn typed(g: &Graph) -> Result<Graph, (usize, crate::infer::TypeError)> {
     let mut out = g.clone();
     for i in 0..out.nodes.len() {
-        if let Op::Append(k) = out.nodes[i].op {
-            let rows = out.node(out.nodes[i].args[0]).ty.placement;
-            out.kept[k as usize].placement = match rows {
-                Placement::Split { axis } => Placement::Split { axis: axis + 1 },
-                p => p,
-            };
-        } else if let Op::Delta(d) = out.nodes[i].op
-            && let Some(k) = d.state
-        {
-            out.kept[k as usize].placement = out.node(out.nodes[i].args[2]).ty.placement;
-        }
-        let args: Vec<_> = out.nodes[i]
-            .args
-            .iter()
-            .map(|a| &out.nodes[a.0 as usize].ty)
-            .collect();
-        out.nodes[i].ty = infer(&out, &out.nodes[i].op, &args).map_err(|e| (i, e))?;
+        retype_node(&mut out, i).map_err(|e| (i, e))?;
     }
     Ok(out)
+}
+
+/// Retypes op `i` from its arguments' types.
+pub(crate) fn retype_node(out: &mut Graph, i: usize) -> Result<(), crate::infer::TypeError> {
+    if let Op::Append(k) = out.nodes[i].op {
+        let rows = out.node(out.nodes[i].args[0]).ty.placement;
+        out.kept[k as usize].placement = match rows {
+            Placement::Split { axis } => Placement::Split { axis: axis + 1 },
+            // Kept rows never follow a share of the rows.
+            Placement::Owned => out.kept[k as usize].placement,
+            p => p,
+        };
+    } else if let Op::Delta(d) = out.nodes[i].op
+        && let Some(k) = d.state
+    {
+        out.kept[k as usize].placement = out.node(out.nodes[i].args[2]).ty.placement;
+    }
+    let args: Vec<_> = out.nodes[i]
+        .args
+        .iter()
+        .map(|a| &out.nodes[a.0 as usize].ty)
+        .collect();
+    out.nodes[i].ty = infer(out, &out.nodes[i].op, &args)?;
+    Ok(())
 }

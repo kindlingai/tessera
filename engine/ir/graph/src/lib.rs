@@ -6,6 +6,7 @@ mod json;
 mod node;
 mod numerics;
 mod ops;
+mod own;
 mod parts;
 mod regions;
 mod scalar;
@@ -25,6 +26,7 @@ pub use node::{
 };
 pub use numerics::{Math, Numerics, Order, sums_ranks};
 pub use ops::OpFacts;
+pub use own::own_rows;
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};

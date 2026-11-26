@@ -116,6 +116,7 @@ fn fill(ty: &TensorType, added: bool) -> &'static str {
         (_, Placement::Split { .. }) => "#a8d0f0",
         (_, Placement::Partial) => "#f6c88a",
         (_, Placement::Routed) => "#d4b3e8",
+        (_, Placement::Owned) => "#b8e0b0",
         (_, Placement::Replicated) => "#ffffff",
     }
 }

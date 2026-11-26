@@ -1,7 +1,7 @@
 //! The small graph over two ranks matches one rank.
 
 use super::{Spec, host, runs};
-use tessera_graph::{Graph, Parts, Placement, Sharded, shard};
+use tessera_graph::{Graph, Parts, Placement, Sharded, own_rows, shard};
 use tessera_interp::{Tensor, run, run_parts, run_ranks};
 use tessera_lower::form::BF16_FORM;
 use tessera_lower::{Cluster, Device, Link, View, Weight, lower};
@@ -121,6 +121,10 @@ pub fn step_ranks(g: &Graph, parts: &Parts) -> Sharded {
     let want = run(g, &weights, 0, &inputs).unwrap();
     let got = run_parts(&sharded.graph, &weights, 0, &inputs, parts).unwrap();
     close("step interpreted", &got[1], &want[1]);
+    // Owned rows sum in the same order, so nothing changes.
+    let owned = own_rows(&sharded.graph).unwrap();
+    let own = run_parts(&owned, &weights, 0, &inputs, parts).unwrap();
+    assert!(own == got, "owned rows differ");
     let ranks: Vec<u32> = (0..parts.ranks() as u32).collect();
     let host = host();
     let device = Device::guess(&host).zoned(mesh(ranks.len()));

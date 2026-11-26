@@ -33,6 +33,10 @@ pub enum Place {
     Reduce,
     /// A split last axis becomes replicated.
     Gather,
+    /// Partial sums become each rank's own rows.
+    Scatter,
+    /// Each rank's own rows become replicated.
+    Join,
 }
 
 /// A check on a stage's parameters.
@@ -155,6 +159,10 @@ macro_rules! stages {
             AllReduce => Crossing { reduces: true, place: Reduce }
             /// Joins each rank's part of the last axis.
             AllGather => Crossing { reduces: true, place: Gather }
+            /// Sums the ranks' parts. Each rank keeps its own rows.
+            ReduceScatter => Crossing { reduces: true, place: Scatter }
+            /// Joins each rank's own rows, in rank order.
+            GatherRows => Crossing { reduces: true, place: Join }
             /// Entries past the position in the argument become -inf.
             Causal as causal => "causal" { operand: Positions, whole: true }
             /// Masks entries to -inf, then applies packed edits.

@@ -526,7 +526,7 @@ pub(crate) fn stage(
         Stage::Cos => out.iter_mut().for_each(|v| *v = v.cos()),
         Stage::Softmax => out.chunks_mut(width).for_each(|r| softmax(acc, r)),
         // One rank holds the whole value already.
-        Stage::AllReduce | Stage::AllGather => {}
+        Stage::AllReduce | Stage::AllGather | Stage::ReduceScatter | Stage::GatherRows => {}
         Stage::Rope {
             theta,
             pairs,
