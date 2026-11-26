@@ -22,7 +22,7 @@ const WIDE_BLOCK_MIN: usize = 2048;
 pub(crate) const BLOCK_ROWS: usize = 16;
 
 /// Maximum rows where wide block-wide RMS norm wins.
-const WIDE_BLOCK_ROWS: usize = 512;
+const WIDE_BLOCK_ROWS: usize = 2048;
 
 /// Whether `rows` of `width` should run one block per row.
 pub(crate) fn use_block(rows: usize, width: usize) -> bool {
@@ -186,7 +186,8 @@ fn norm_load(k: &LaneNorm, _: usize) -> Option<Load> {
     let body = norm_body(k);
     let elems = k.rows * k.width;
     let x_bytes = k.x_form.bytes(elems) as f64;
-    let mut reads = vec![x_bytes];
+    // Pass 1 sums squares, pass 2 scales `x`.
+    let mut reads = vec![x_bytes, x_bytes];
     if k.weighted {
         reads.push(k.w_form.bytes(k.width) as f64);
     }
