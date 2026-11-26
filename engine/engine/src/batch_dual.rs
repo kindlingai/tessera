@@ -2,11 +2,12 @@
 
 use crate::batch_spec::{
     ActiveSeq, Admitted, BatchMtp, DEFAULT_CHUNK, DraftJob, RoundHost, batch_methods, drive_follow,
-    drive_step, keep_slots, queue_request, retire_from,
+    drive_step, keep_slots, queue_request, retire_from, verify_rows,
 };
 use crate::dual::{DualSelector, run_dflash, split_taps};
 use crate::kept::Kept;
 use crate::mtp_draft::MtpDrafter;
+use crate::sample::Sampler;
 use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
 use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span};
@@ -258,13 +259,14 @@ impl<'a> BatchMtp<'a> {
         let k = seq.drafts.len().min(seq.room(self.max_ctx));
         let mut rows = Vec::with_capacity(1 + k);
         seq.verify(&mut rows, k);
-        let (ids, taps) = self.target.step_taps_local(&rows)?;
+        let sampling = !self.active[0].sampler.greedy();
+        let (mut out, taps) = self.target.step_verify_local(&rows, sampling)?;
         let (d_all, m_all) = self.split_dual_taps(taps, rows.len())?;
         let d_width = self.dual.as_ref().expect("dual peer").d_width;
         let m_width = self.drafter.hidden();
         let ranked = self.target.control.is_some();
         let (accepted, committed, done) =
-            self.active[0].apply_verify(k, &ids, self.max_ctx, &mut self.hash);
+            self.active[0].apply_verify(k, 0, &mut out, self.max_ctx, &mut self.hash);
         self.active[0].history.extend_from_slice(&committed);
         let commit = committed.len();
         if done.is_some() || (!ranked && self.active[0].cancelled) {
@@ -291,7 +293,7 @@ impl<'a> BatchMtp<'a> {
                     solo.last_pred,
                     solo.last_lp.as_deref(),
                     solo.last_mtp_d1,
-                    ids[0],
+                    committed[0],
                 );
             }
         }
@@ -589,7 +591,10 @@ impl<'a> BatchDFlash<'a> {
         let mut seq = self.prefilling.pop_front().expect("prefill seq");
         let n = seq.request.tokens.len();
         let pos0 = seq.pos;
-        let len = (n - pos0).min(self.prefill_chunk);
+        let mut len = (n - pos0).min(self.prefill_chunk);
+        if !seq.request.sampling.greedy() && pos0 + len == n && len > 1 {
+            len = n - 1 - pos0;
+        }
         let end = pos0 + len;
         let mut rows = Vec::with_capacity(len);
         span(
@@ -599,10 +604,10 @@ impl<'a> BatchDFlash<'a> {
             seq.request.tokens[pos0..end].iter().copied(),
         );
         self.ensure_pages(&rows)?;
-        let (ids, taps) = self.target.step_taps_local(&rows)?;
         let wants = self.drafter.draft_wants();
         let d_pos0 = pos0 - seq.d_base;
         if end < n {
+            let (_, taps) = self.target.step_taps_local(&rows)?;
             if n - seq.d_base + self.block <= self.max_ctx {
                 self.drafter.run_taps(
                     seq.slot,
@@ -617,7 +622,8 @@ impl<'a> BatchDFlash<'a> {
             self.prefilling.push_front(seq);
             return Ok(());
         }
-        let anchor = *ids.last().expect("non-empty chunk");
+        let mut sampler = Sampler::new(seq.request.sampling);
+        let (anchor, taps) = self.target.prefill_pick(&rows, &mut sampler)?;
         fnv_u32(&mut self.hash, anchor);
         let history = seq.request.tokens.clone();
         let mut act = ActiveSeq {
@@ -633,6 +639,7 @@ impl<'a> BatchDFlash<'a> {
             d_tail: Vec::new(),
             history: Vec::new(),
             mtp_valid: 0,
+            sampler,
         };
         let done = act.commit(&[anchor], self.max_ctx);
         if done.is_some() || (self.target.control.is_none() && act.cancelled) {
@@ -669,27 +676,19 @@ impl<'a> BatchDFlash<'a> {
 
     fn verify_and_draft(&mut self) -> Result<(), Error> {
         let s_count = self.active.len();
-        let mut rows = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s_count);
-        for item in &self.active {
-            let k = item.seq.drafts.len().min(item.seq.room(self.max_ctx));
-            spans.push((rows.len(), k));
-            item.seq.verify(&mut rows, k);
-        }
+        let (rows, spans, sampling) = verify_rows(&self.active, self.max_ctx, |s| &s.seq);
         self.ensure_pages(&rows)?;
-        let (ids, raw_taps) = self.target.step_taps_local(&rows)?;
+        let (mut out, raw_taps) = self.target.step_verify_local(&rows, sampling)?;
         let ranked = self.target.control.is_some();
         let mut jobs: Vec<DFlashJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
             let old_start = self.active[i].seq.start;
             let old_anchor = self.active[i].seq.anchor;
-            let (accepted, committed, done) = self.active[i].seq.apply_verify(
-                k,
-                &ids[off..off + 1 + k],
-                self.max_ctx,
-                &mut self.hash,
-            );
+            let (accepted, committed, done) =
+                self.active[i]
+                    .seq
+                    .apply_verify(k, off, &mut out, self.max_ctx, &mut self.hash);
             let item = &mut self.active[i];
             item.history.push(old_anchor);
             item.history.extend_from_slice(&committed[..accepted]);
@@ -806,7 +805,8 @@ impl RoundHost for BatchDFlash<'_> {
                 (slot, 0)
             };
             self.admitted_skips.push_back(skip);
-            let (request, sink) = self.waiting.pop_front().expect("waiting request");
+            let (mut request, sink) = self.waiting.pop_front().expect("waiting request");
+            request.sampling = request.sampling.seeded();
             out.push(Admitted {
                 slot,
                 skip: 0,

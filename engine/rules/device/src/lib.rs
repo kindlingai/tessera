@@ -13,9 +13,6 @@ mod forms_test;
 pub mod layout;
 #[cfg(test)]
 mod layout_test;
-mod linear;
-#[cfg(test)]
-mod linear_test;
 mod moe;
 pub mod p2p;
 pub mod proxy;
@@ -36,8 +33,62 @@ pub(crate) use layout::EDITION;
 /// Default prefill step rows, and the end of fine buckets.
 pub const FAST_MAX_ROWS: usize = 2048;
 
+/// Non-CUDA backends skipped by CUDA-only rules.
+pub const CUDA_LACKS: &[tessera_lower::Backend] =
+    &[tessera_lower::Backend::Metal, tessera_lower::Backend::Rocm];
+
+#[doc(hidden)]
+pub use tessera_lower as __lower;
+
+/// Registers a CUDA rule, from a `check` or a proposer.
+#[macro_export]
+macro_rules! cuda_rule {
+    ($name:literal, $propose:path, why = $why:path) => {
+        $crate::__lower::rule!($name, $propose, why = $why, lacks = $crate::CUDA_LACKS);
+    };
+    ($name:literal, $propose:path) => {
+        const _: () = {
+            fn why(_: &$crate::__lower::Tree, _: $crate::__lower::T) -> Option<String> {
+                None
+            }
+            $crate::cuda_rule!($name, $propose, why = why);
+        };
+    };
+    ($name:literal, check = $check:path) => {
+        const _: () = {
+            use $crate::__lower::{Draft, T, Tree};
+            fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+                $check(tree, at)?.ok()
+            }
+            fn why(tree: &Tree, at: T) -> Option<String> {
+                $check(tree, at)?.err()
+            }
+            $crate::cuda_rule!($name, propose, why = why);
+        };
+    };
+}
+
+/// Accepts only f32 outputs.
+pub fn f32_only<K>(_: &K, form: &dyn tessera_lower::form::Load) -> bool {
+    form.name() == "f32"
+}
+
+/// Parses `trellis_k{2,3,4}[_{mul1,pmcgx}]` into `(bits, book)`.
+pub fn parse_trellis(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("trellis_k")?;
+    let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
+        (k, 2u32)
+    } else if let Some(k) = rest.strip_suffix("_mul1") {
+        (k, 1u32)
+    } else {
+        (rest, 0u32)
+    };
+    let bits: u32 = k.parse().ok()?;
+    (2..=4).contains(&bits).then_some((bits, book))
+}
+
 /// Flattens one built-in kernel source into a static string.
-pub(crate) fn flatten_for(backend: Backend, name: &str, kernel: &str) -> &'static str {
+pub fn flatten_for(backend: Backend, name: &str, kernel: &str) -> &'static str {
     let flat = flatten(name, kernel, &|_| None, &Options::plain(backend));
     Box::leak(
         flat.expect("built-in kernel flattens")

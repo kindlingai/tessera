@@ -92,23 +92,47 @@ static __device__ __forceinline__ void attn_pv_tile(float o[NT][4], const u32 p1
     }
 }
 
+template <bool BF16>
+static __device__ __forceinline__ u32 attn_pack2(float lo, float hi) {
+    if constexpr (BF16) { u32 o; asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o) : "f"(lo), "f"(hi)); return o; }
+    return trellis::f32x2_to_f16x2(lo, hi);
+}
+template <bool BF16>
+static __device__ __forceinline__ void attn_mma(float d[4], const u32 a[4], const u32 b[2]) {
+    if constexpr (BF16) {
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    } else { trellis::mma_m16n8k16(d, a, b); }
+}
 template <u32 NT, u32 WIDTH, u32 STRIDE>
 static __device__ __forceinline__ void attn_store_partials(
     float* part, const float o[NT][4], const float m[16], const float l[16], u32 row, u32 heads,
     u32 h0, u32 nh, u32 split, u32 splits, u32 d_base, u32 g, u32 t, u32 tid) {
-    if (g < nh) {
-        float* p = part + (u64(row * heads + h0 + g) * splits + split) * STRIDE + d_base + (t << 1);
 #pragma unroll
-        for (u32 nt = 0u; nt < NT; nt++) *reinterpret_cast<float2*>(p + nt * 8u) = make_float2(o[nt][0], o[nt][1]);
-    }
-    if (g + 8u < nh) {
-        float* p = part + (u64(row * heads + h0 + g + 8u) * splits + split) * STRIDE + d_base + (t << 1);
+    for (u32 h = 0u; h < 2u; h++) {
+        u32 gh = g + (h << 3u);
+        if (gh >= nh) continue;
+        float sc = (splits == 1u) ? ((l[gh] > 0.0f) ? (1.0f / l[gh]) : 0.0f) : 1.0f;
+        float* pg = part + ((splits == 1u) ? u64(row * heads + h0 + gh) * WIDTH
+                                           : (u64(row * heads + h0 + gh) * splits + split) * STRIDE);
 #pragma unroll
-        for (u32 nt = 0u; nt < NT; nt++) *reinterpret_cast<float2*>(p + nt * 8u) = make_float2(o[nt][2], o[nt][3]);
+        for (u32 nt = 0u; nt < NT; nt++)
+            *reinterpret_cast<float2*>(pg + d_base + nt * 8u + (t << 1)) = make_float2(o[nt][h * 2u] * sc, o[nt][h * 2u + 1u] * sc);
     }
-    if (tid < nh) {
-        u64 b = (u64(row * heads + h0 + tid) * splits + split) * STRIDE;
-        part[b + WIDTH] = m[tid]; part[b + WIDTH + 1u] = l[tid];
+    if (splits > 1u && tid < nh) {
+        u64 ob = (u64(row * heads + h0 + tid) * splits + split) * STRIDE;
+        part[ob + WIDTH] = m[tid]; part[ob + WIDTH + 1u] = l[tid];
+    }
+}
+template <u32 WIDTH, u32 STRIDE, u32 NTH>
+static __device__ __forceinline__ void attn_store_empty(
+    float* part, u32 row, u32 heads, u32 h0, u32 nh, u32 split, u32 splits, u32 tid) {
+    if (splits == 1u) {
+        float* base = part + u64(row * heads + h0) * WIDTH;
+        for (u32 q = tid; q < nh * (WIDTH >> 2); q += NTH) reinterpret_cast<float4*>(base)[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+    } else if (tid < nh) {
+        u64 ob = (u64(row * heads + h0 + tid) * splits + split) * STRIDE;
+        part[ob + WIDTH] = attn_neg_inf(); part[ob + WIDTH + 1u] = 0.0f;
     }
 }
 
@@ -168,9 +192,9 @@ static __device__ __forceinline__ void mla_attend_body(
     u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, mla_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wg = warp >> 2, wl = warp & 3u, hgroups = heads >> 4;
-    u32 split = blockIdx.x, row = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
-    if (row >= rows || split >= splits) return;
-    u32 h0 = hg << 4, slot = slots[row], pos = positions[row];
+    u32 split = blockIdx.x, rb = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
+    if (rb >= rows || split >= splits) return;
+    u32 row = (rows - 1u) - rb, h0 = hg << 4, slot = slots[row], pos = positions[row];
     u32 from = (pos > before) ? (pos - before) : 0u;
     u32 to = (pos + after < keys) ? (pos + after + 1u) : keys;
     u32 start = (from_list == 0u) ? from : 0u;
@@ -194,13 +218,11 @@ static __device__ __forceinline__ void mla_attend_body(
     if (p_begin > stop) p_begin = stop;
     if (p_end > stop) p_end = stop;
     if (p_begin >= p_end) {
-        if (tid < 16u) {
-            u64 ob = (u64(row * heads + h0 + tid) * splits + split) * 580ull;
-            part[ob + 576ull] = attn_neg_inf(); part[ob + 577ull] = 0.0f;
-        }
+        attn_store_empty<576u, 580u, 256u>(part, row, heads, h0, 16u, split, splits, tid);
         return;
     }
-    // Keep Q[16, 144] per warp in registers as f16x2.
+    constexpr bool USE_BF16 = (KV_FMT == 1u);
+    // Keep Q[16, 144] per warp in registers.
     u32 q_reg[9][4];
     const float* q0 = q + u64(row * heads + h0 + g) * 576ull;
     const float* q8 = q + u64(row * heads + h0 + g + 8u) * 576ull;
@@ -211,10 +233,10 @@ static __device__ __forceinline__ void mla_attend_body(
         float2 a1 = *reinterpret_cast<const float2*>(q8 + k0);
         float2 a2 = *reinterpret_cast<const float2*>(q0 + k0 + 8u);
         float2 a3 = *reinterpret_cast<const float2*>(q8 + k0 + 8u);
-        q_reg[s][0] = trellis::f32x2_to_f16x2(a0.x, a0.y);
-        q_reg[s][1] = trellis::f32x2_to_f16x2(a1.x, a1.y);
-        q_reg[s][2] = trellis::f32x2_to_f16x2(a2.x, a2.y);
-        q_reg[s][3] = trellis::f32x2_to_f16x2(a3.x, a3.y);
+        q_reg[s][0] = attn_pack2<USE_BF16>(a0.x, a0.y);
+        q_reg[s][1] = attn_pack2<USE_BF16>(a1.x, a1.y);
+        q_reg[s][2] = attn_pack2<USE_BF16>(a2.x, a2.y);
+        q_reg[s][3] = attn_pack2<USE_BF16>(a3.x, a3.y);
     }
     float o[9][4];
 #pragma unroll
@@ -224,40 +246,28 @@ static __device__ __forceinline__ void mla_attend_body(
     const float* kv_f32 = static_cast<const float*>(kv_ptr);
     u32 tk = tid >> 3, l8 = tid & 7u, d_base = warp * 72u;
     u32* dst32 = reinterpret_cast<u32*>(sm.kv[tk]);
-    u32 krow = wg * 16u + ((lane >> 4) << 3) + (lane & 7u), kcol = ((lane >> 3) & 1u) * 8u;
-    u32 vrow = lane & 15u, vcol = (lane >> 4) << 3;
+    u32 krow = wg * 16u + ((lane >> 4) << 3) + (lane & 7u), kcol = ((lane >> 3) & 1u) * 8u, vrow = lane & 15u, vcol = (lane >> 4) << 3;
     u32 cur_j = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
     uint4 pref[5];
     if constexpr (KV_FMT == 0u) mla_prefetch_fp8(kv_u8, page_table, slot, cur_j, context, page_shift, l8, pref);
     for (u32 p0 = p_begin; p0 < p_end; p0 += 32u) {
-        if (tid < 32u) {
-            u32 jw = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tid, p_end);
-            u32 m = __ballot_sync(0xFFFFFFFFu, jw != 0xFFFFFFFFu);
-            if (tid == 0u) sm.valid_mask = m;
-        }
+        if (tid < 32u) { u32 jw = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tid, p_end); u32 m = __ballot_sync(0xFFFFFFFFu, jw != 0xFFFFFFFFu); if (tid == 0u) sm.valid_mask = m; }
         bool has_next = (p0 + 32u < p_end);
         u32 nj = has_next ? mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end) : 0xFFFFFFFFu;
         if constexpr (KV_FMT == 0u) {
 #pragma unroll
-            for (u32 i = 0u; i < 5u; i++)
-                if (l8 + i * 8u < 36u) attn_unpack_fp8(pref[i], dst32 + (l8 + i * 8u) * 8u);
+            for (u32 i = 0u; i < 5u; i++) if (l8 + i * 8u < 36u) attn_unpack_fp8(pref[i], dst32 + (l8 + i * 8u) * 8u);
             if (has_next) mla_prefetch_fp8(kv_u8, page_table, slot, nj, context, page_shift, l8, pref);
+        } else if constexpr (KV_FMT == 1u) {
+            u64 rb = (cur_j != 0xFFFFFFFFu) ? kv_row_at(page_table, slot, cur_j, context, page_shift) * 576ull : 0ull;
+            for (u32 q8 = l8; q8 < 72u; q8 += 8u) *reinterpret_cast<uint4*>(dst32 + q8 * 4u) = (cur_j != 0xFFFFFFFFu) ? *reinterpret_cast<const uint4*>(kv_u16 + rb + u64(q8) * 8ull) : make_uint4(0u, 0u, 0u, 0u);
+            cur_j = nj;
         } else {
             u64 rb = (cur_j != 0xFFFFFFFFu) ? kv_row_at(page_table, slot, cur_j, context, page_shift) * 576ull : 0ull;
             for (u32 q4 = l8; q4 < 144u; q4 += 8u) {
-                u32 h0w = 0u, h1w = 0u;
-                if (cur_j != 0xFFFFFFFFu) {
-                    u64 b = rb + u64(q4) * 4ull;
-                    if constexpr (KV_FMT == 1u) {
-                        uint2 r = *reinterpret_cast<const uint2*>(kv_u16 + b);
-                        h0w = trellis::f32x2_to_f16x2(__uint_as_float(r.x << 16), __uint_as_float(r.x & 0xFFFF0000u));
-                        h1w = trellis::f32x2_to_f16x2(__uint_as_float(r.y << 16), __uint_as_float(r.y & 0xFFFF0000u));
-                    } else {
-                        float4 r = *reinterpret_cast<const float4*>(kv_f32 + b);
-                        h0w = trellis::f32x2_to_f16x2(r.x, r.y); h1w = trellis::f32x2_to_f16x2(r.z, r.w);
-                    }
-                }
-                *reinterpret_cast<uint2*>(dst32 + q4 * 2u) = make_uint2(h0w, h1w);
+                uint2 o2 = make_uint2(0u, 0u);
+                if (cur_j != 0xFFFFFFFFu) { float4 r = *reinterpret_cast<const float4*>(kv_f32 + rb + u64(q4) * 4ull); o2 = make_uint2(trellis::f32x2_to_f16x2(r.x, r.y), trellis::f32x2_to_f16x2(r.z, r.w)); }
+                *reinterpret_cast<uint2*>(dst32 + q4 * 2u) = o2;
             }
             cur_j = nj;
         }
@@ -270,8 +280,8 @@ static __device__ __forceinline__ void mla_attend_body(
                 u32 b[4];
                 attn_ldm_x4(b, &sm.kv[krow][(wl * 9u + s) * 16u + kcol]);
                 u32 b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
-                trellis::mma_m16n8k16(s0, q_reg[s], b0);
-                trellis::mma_m16n8k16(s1, q_reg[s], b1);
+                attn_mma<USE_BF16>(s0, q_reg[s], b0);
+                attn_mma<USE_BF16>(s1, q_reg[s], b1);
             }
             u32 cb = wg * 16u;
             sm.red[wl][g][cb + t * 2u] = s0[0]; sm.red[wl][g][cb + t * 2u + 1u] = s0[1];
@@ -298,8 +308,8 @@ static __device__ __forceinline__ void mla_attend_body(
                 float p1v = ((vmask >> (c0 + 1u)) & 1u) ? __expf(sc[1] - nm) : 0.0f;
                 float p2v = ((vmask >> (c0 + 2u)) & 1u) ? __expf(sc[2] - nm) : 0.0f;
                 float p3v = ((vmask >> (c0 + 3u)) & 1u) ? __expf(sc[3] - nm) : 0.0f;
-                sm.p16[h][seg * 2u] = trellis::f32x2_to_f16x2(p0v, p1v);
-                sm.p16[h][seg * 2u + 1u] = trellis::f32x2_to_f16x2(p2v, p3v);
+                sm.p16[h][seg * 2u] = attn_pack2<USE_BF16>(p0v, p1v);
+                sm.p16[h][seg * 2u + 1u] = attn_pack2<USE_BF16>(p2v, p3v);
                 float ps = p0v + p1v + p2v + p3v;
                 ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 1u);
                 ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 2u);
@@ -322,12 +332,12 @@ static __device__ __forceinline__ void mla_attend_body(
                     u32 bv[4];
                     attn_ldm_x4_t(bv, &sm.kv[vr][d_base + nt * 8u + vcol]);
                     u32 b0[2] = {bv[0], bv[1]}, b1[2] = {bv[2], bv[3]};
-                    trellis::mma_m16n8k16(o[nt], ap, b0);
-                    trellis::mma_m16n8k16(o[nt + 1u], ap, b1);
+                    attn_mma<USE_BF16>(o[nt], ap, b0);
+                    attn_mma<USE_BF16>(o[nt + 1u], ap, b1);
                 }
                 u32 b8[2];
                 attn_ldm_x2_t(b8, &sm.kv[vr][d_base + 64u]);
-                trellis::mma_m16n8k16(o[8], ap, b8);
+                attn_mma<USE_BF16>(o[8], ap, b8);
             }
         }
         if (has_next) prim::block_sync();
@@ -386,26 +396,19 @@ static __device__ __forceinline__ void gqa_stage_vec(const void* ptr, u64 rb, u3
     if constexpr (KV_FMT == 0u) {
         if (valid) attn_unpack_fp8(*reinterpret_cast<const uint4*>(static_cast<const u8*>(ptr) + rb + l8 * 16u), dst + l8 * 8u);
         else { *reinterpret_cast<uint4*>(dst + l8 * 8u) = make_uint4(0u, 0u, 0u, 0u); *reinterpret_cast<uint4*>(dst + l8 * 8u + 4u) = make_uint4(0u, 0u, 0u, 0u); }
-    } else if constexpr (KV_FMT == 1u) {
-        const u16* p16 = static_cast<const u16*>(ptr) + rb;
-#pragma unroll
-        for (u32 q4 = l8; q4 < 32u; q4 += 8u) {
-            u32 h0 = 0u, h1 = 0u;
-            if (valid) {
-                uint2 r = *reinterpret_cast<const uint2*>(p16 + u64(q4) * 4ull);
-                h0 = trellis::f32x2_to_f16x2(__uint_as_float(r.x << 16), __uint_as_float(r.x & 0xFFFF0000u));
-                h1 = trellis::f32x2_to_f16x2(__uint_as_float(r.y << 16), __uint_as_float(r.y & 0xFFFF0000u));
-            }
-            *reinterpret_cast<uint2*>(dst + q4 * 2u) = make_uint2(h0, h1);
-        }
     } else {
-        const float* pf = static_cast<const float*>(ptr) + rb;
 #pragma unroll
         for (u32 q4 = l8; q4 < 32u; q4 += 8u) {
             u32 h0 = 0u, h1 = 0u;
             if (valid) {
-                float4 r = *reinterpret_cast<const float4*>(pf + u64(q4) * 4ull);
-                h0 = trellis::f32x2_to_f16x2(r.x, r.y); h1 = trellis::f32x2_to_f16x2(r.z, r.w);
+                if constexpr (KV_FMT == 1u) {
+                    uint2 r = *reinterpret_cast<const uint2*>(static_cast<const u16*>(ptr) + rb + u64(q4) * 4ull);
+                    h0 = trellis::f32x2_to_f16x2(__uint_as_float(r.x << 16), __uint_as_float(r.x & 0xFFFF0000u));
+                    h1 = trellis::f32x2_to_f16x2(__uint_as_float(r.y << 16), __uint_as_float(r.y & 0xFFFF0000u));
+                } else {
+                    float4 r = *reinterpret_cast<const float4*>(static_cast<const float*>(ptr) + rb + u64(q4) * 4ull);
+                    h0 = trellis::f32x2_to_f16x2(r.x, r.y); h1 = trellis::f32x2_to_f16x2(r.z, r.w);
+                }
             }
             *reinterpret_cast<uint2*>(dst + q4 * 2u) = make_uint2(h0, h1);
         }
@@ -419,10 +422,9 @@ static __device__ __forceinline__ void gqa_attend_body(
     u32 after, u32 splits, const u32* page_table, u32 page_shift, gqa_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 gqa = heads / kv_heads, nh = (gqa < 16u) ? gqa : 16u, per_kv = (gqa + 15u) >> 4;
-    u32 kg_groups = kv_heads * per_kv, split = blockIdx.x;
-    u32 row = blockIdx.y / kg_groups, kg = blockIdx.y % kg_groups;
-    if (row >= rows || split >= splits) return;
-    u32 kv_head = kg / per_kv, h0 = kv_head * gqa + ((kg % per_kv) << 4);
+    u32 kg_groups = kv_heads * per_kv, split = blockIdx.x, rb = blockIdx.y / kg_groups, kg = blockIdx.y % kg_groups;
+    if (rb >= rows || split >= splits) return;
+    u32 row = (rows - 1u) - rb, kv_head = kg / per_kv, h0 = kv_head * gqa + ((kg % per_kv) << 4);
     u32 slot = slots[row], pos = positions[row];
     u32 from = (pos > before) ? (pos - before) : 0u;
     u32 to = (pos + after < keys) ? (pos + after + 1u) : keys;
@@ -432,10 +434,7 @@ static __device__ __forceinline__ void gqa_attend_body(
     if (p_begin > to) p_begin = to;
     if (p_end > to) p_end = to;
     if (p_begin >= p_end) {
-        if (tid < nh) {
-            u64 ob = (u64(row * heads + h0 + tid) * splits + split) * 132ull;
-            part[ob + 128ull] = attn_neg_inf(); part[ob + 129ull] = 0.0f;
-        }
+        attn_store_empty<128u, 132u, 128u>(part, row, heads, h0, nh, split, splits, tid);
         return;
     }
     u32 tk = tid >> 3, lane8 = tid & 7u;
@@ -515,16 +514,9 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_gqa_reduce(
 
 constexpr u32 IDX_SM_WORDS = 4608u;
 struct alignas(16) idx_smem { u32 q[IDX_SM_WORDS], k[IDX_SM_WORDS]; float w[128]; };
-static __device__ __forceinline__ u32 idx_f32x2_bf16x2(float lo, float hi) {
-    u32 o; asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(o) : "f"(lo), "f"(hi)); return o;
-}
 static __device__ __forceinline__ u32 idx_e4m3x2_bf16x2(u16 q) {
     u32 h = attn_e4m3_f16x2(q);
-    return idx_f32x2_bf16x2(trellis::f16_to_f32(h & 0xFFFFu), trellis::f16_to_f32(h >> 16u));
-}
-static __device__ __forceinline__ void idx_mma_bf16(float d[4], const u32 a[4], const u32 b[2]) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    return attn_pack2<true>(trellis::f16_to_f32(h & 0xFFFFu), trellis::f16_to_f32(h >> 16u));
 }
 
 template <u32 KV_FMT>
@@ -544,7 +536,7 @@ static __device__ __forceinline__ void idx_load_k16(
                 pk = *reinterpret_cast<const uint2*>(static_cast<const u16*>(kp) + b);
             } else {
                 float4 v = *reinterpret_cast<const float4*>(static_cast<const float*>(kp) + b);
-                pk = make_uint2(idx_f32x2_bf16x2(v.x, v.y), idx_f32x2_bf16x2(v.z, v.w));
+                pk = make_uint2(attn_pack2<true>(v.x, v.y), attn_pack2<true>(v.z, v.w));
             }
         }
         *reinterpret_cast<uint2*>(sk + kr * stride + (q4 << 1)) = pk;
@@ -575,7 +567,7 @@ static __device__ __forceinline__ void idx_body(
         u32 h = idx / q_words, q4 = idx % q_words;
         float4 v = *reinterpret_cast<const float4*>(q_base + u64(h) * dim + (u64(q4) << 2));
         *reinterpret_cast<uint2*>(sm.q + h * stride + (q4 << 1)) =
-            make_uint2(idx_f32x2_bf16x2(v.x, v.y), idx_f32x2_bf16x2(v.z, v.w));
+            make_uint2(attn_pack2<true>(v.x, v.y), attn_pack2<true>(v.z, v.w));
     }
     prim::block_sync();
     u32 warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u, d_steps = dim >> 4;
@@ -593,7 +585,7 @@ static __device__ __forceinline__ void idx_body(
                             sm.q[(h0 + g) * stride + k0 + t + 4u], sm.q[(h0 + g + 8u) * stride + k0 + t + 4u]};
                 u32 b0[2] = {sk[g * stride + k0 + t], sk[g * stride + k0 + t + 4u]};
                 u32 b1[2] = {sk[(g + 8u) * stride + k0 + t], sk[(g + 8u) * stride + k0 + t + 4u]};
-                idx_mma_bf16(s0, a, b0); idx_mma_bf16(s1, a, b1);
+                attn_mma<true>(s0, a, b0); attn_mma<true>(s1, a, b1);
             }
             float w0 = sm.w[h0 + g], w1 = sm.w[h0 + g + 8u];
             acc[0] += fmaxf(s0[0], 0.f) * w0 + fmaxf(s0[2], 0.f) * w1;
@@ -646,8 +638,8 @@ static __device__ __forceinline__ void idx_qt_load_k(
         const float* p = static_cast<const float*>(kp) + b;
         float4 v0 = *reinterpret_cast<const float4*>(p), v1 = *reinterpret_cast<const float4*>(p + 4u);
         float4 v2 = *reinterpret_cast<const float4*>(p + 8u), v3 = *reinterpret_cast<const float4*>(p + 12u);
-        *reinterpret_cast<uint4*>(d) = make_uint4(idx_f32x2_bf16x2(v0.x, v0.y), idx_f32x2_bf16x2(v0.z, v0.w), idx_f32x2_bf16x2(v1.x, v1.y), idx_f32x2_bf16x2(v1.z, v1.w));
-        *reinterpret_cast<uint4*>(d + 4u) = make_uint4(idx_f32x2_bf16x2(v2.x, v2.y), idx_f32x2_bf16x2(v2.z, v2.w), idx_f32x2_bf16x2(v3.x, v3.y), idx_f32x2_bf16x2(v3.z, v3.w));
+        *reinterpret_cast<uint4*>(d) = make_uint4(attn_pack2<true>(v0.x, v0.y), attn_pack2<true>(v0.z, v0.w), attn_pack2<true>(v1.x, v1.y), attn_pack2<true>(v1.z, v1.w));
+        *reinterpret_cast<uint4*>(d + 4u) = make_uint4(attn_pack2<true>(v2.x, v2.y), attn_pack2<true>(v2.z, v2.w), attn_pack2<true>(v3.x, v3.y), attn_pack2<true>(v3.z, v3.w));
     }
 }
 
@@ -699,8 +691,8 @@ static __device__ __forceinline__ void idx_qtile_body(
                 u32 k0 = ds * 16u + (t << 1);
                 float2 a0 = *reinterpret_cast<const float2*>(q0 + k0), a1 = *reinterpret_cast<const float2*>(q8 + k0);
                 float2 a2 = *reinterpret_cast<const float2*>(q0 + k0 + 8u), a3 = *reinterpret_cast<const float2*>(q8 + k0 + 8u);
-                q_reg[hi][ds][0] = idx_f32x2_bf16x2(a0.x, a0.y); q_reg[hi][ds][1] = idx_f32x2_bf16x2(a1.x, a1.y);
-                q_reg[hi][ds][2] = idx_f32x2_bf16x2(a2.x, a2.y); q_reg[hi][ds][3] = idx_f32x2_bf16x2(a3.x, a3.y);
+                q_reg[hi][ds][0] = attn_pack2<true>(a0.x, a0.y); q_reg[hi][ds][1] = attn_pack2<true>(a1.x, a1.y);
+                q_reg[hi][ds][2] = attn_pack2<true>(a2.x, a2.y); q_reg[hi][ds][3] = attn_pack2<true>(a3.x, a3.y);
             }
         }
     }
@@ -733,8 +725,8 @@ static __device__ __forceinline__ void idx_qtile_body(
                             attn_ldm_x4(b23, &sm.k[st][krow1][ds * 16u + kcol]);
                             u32 b0[2] = {b01[0], b01[1]}, b1[2] = {b01[2], b01[3]};
                             u32 b2[2] = {b23[0], b23[1]}, b3[2] = {b23[2], b23[3]};
-                            idx_mma_bf16(s0, q_reg[hi][ds], b0); idx_mma_bf16(s1, q_reg[hi][ds], b1);
-                            idx_mma_bf16(s2, q_reg[hi][ds], b2); idx_mma_bf16(s3, q_reg[hi][ds], b3);
+                            attn_mma<true>(s0, q_reg[hi][ds], b0); attn_mma<true>(s1, q_reg[hi][ds], b1);
+                            attn_mma<true>(s2, q_reg[hi][ds], b2); attn_mma<true>(s3, q_reg[hi][ds], b3);
                         }
                         float w0 = w_reg[hi][0], w1 = w_reg[hi][1];
                         acc[0] += fmaxf(s0[0], 0.f) * w0 + fmaxf(s0[2], 0.f) * w1; acc[1] += fmaxf(s0[1], 0.f) * w0 + fmaxf(s0[3], 0.f) * w1;

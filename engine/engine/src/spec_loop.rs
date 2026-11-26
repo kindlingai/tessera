@@ -143,10 +143,11 @@ pub(crate) struct SpecReq {
 /// Validates a request and broadcasts its header once to followers.
 pub(crate) fn start_req(
     target: &mut Engine,
-    spec_req: &SpecReq,
+    spec_req: &mut SpecReq,
     emit: &mut dyn FnMut(Event) -> bool,
     extra: impl FnOnce(&mut Writer),
 ) -> Result<bool, Error> {
+    spec_req.request.sampling = spec_req.request.sampling.seeded();
     let request = &spec_req.request;
     if (request.guide.is_some() || request.min_tokens > 0) && target.control.is_some() {
         return Err(Error::Guided);
@@ -172,6 +173,7 @@ pub(crate) fn start_req(
             .u32s(&request.tokens)
             .u32s(&request.stop)
             .u32s(table);
+        request.sampling.encode(&mut w);
         extra(&mut w);
         target.told(&w.0)?;
     }
@@ -191,12 +193,14 @@ fn decode_req<T>(
     let tokens = r.u32s()?;
     let stop = r.u32s()?;
     let table = r.u32s()?;
+    let sampling = Sampling::decode(&mut r)?;
     let policy = extra(&mut r)?;
     let req = SpecReq {
         request: Request {
             tokens,
             max_tokens,
             stop,
+            sampling,
             ..Request::default()
         },
         chunk: (chunk > 0).then_some(chunk),
@@ -266,12 +270,12 @@ macro_rules! spec_entry {
             ) -> Result<$crate::SpecStats, $crate::Error> {
                 let $this = self;
                 let $p = $this.$field.fresh();
-                let $req = $crate::spec_loop::SpecReq {
+                let mut $req = $crate::spec_loop::SpecReq {
                     request,
                     chunk: $this.prefill_chunk,
                 };
                 $this.target.settle()?;
-                if !$crate::spec_loop::start_req($this.target, &$req, emit, |w| $p.encode(w))? {
+                if !$crate::spec_loop::start_req($this.target, &mut $req, emit, |w| $p.encode(w))? {
                     $this.target.settle()?;
                     return Ok($crate::SpecStats::default());
                 }
@@ -372,6 +376,8 @@ pub(crate) fn run_speculate<D, S>(
         hash: 2166136261,
     };
     let mut request = spec_req.request;
+    let mut sampler = Sampler::new(request.sampling);
+    let sampling = !sampler.greedy();
     let mut prompt = std::mem::take(&mut request.tokens);
     let mut guide = request.guide.take();
     if request.min_tokens > 0 && !request.stop.is_empty() {
@@ -405,10 +411,10 @@ pub(crate) fn run_speculate<D, S>(
             .min(n)
             .max(1);
         let need_taps = request.max_tokens - st.sim_emitted > 1;
-        // Taps follow picks: a guided last chunk is one row.
-        let end = match guided {
-            Some(_) => n - 1,
-            None => (n - 1) / step * step,
+        // Guided or sampled last chunks hold one row.
+        let end = match guided.is_some() || sampling {
+            true => n - 1,
+            false => (n - 1) / step * step,
         };
         let mut pos = 0usize;
         while pos < end {
@@ -424,18 +430,32 @@ pub(crate) fn run_speculate<D, S>(
             pos += len;
         }
         let last_rows = prompt_rows(&prompt[pos..], pos);
-        let (mut anchor, taps) = match &guided {
-            Some(g) => target.pick_last(&last_rows, &g.next, need_taps)?,
-            None => {
-                let all: Vec<u32> = (0..last_rows.len() as u32).collect();
-                let picks = if need_taps {
-                    &all[..]
-                } else {
-                    &all[all.len() - 1..]
-                };
-                let (ids, taps) =
-                    target.launch_local(&last_rows, picks, Head::Full(None), need_taps, false)?;
-                (*ids.last().expect("non-empty prompt"), taps)
+        let (mut anchor, taps) = if sampling {
+            let (mut logits, _, taps) = target.logits_local(&last_rows, &[0], need_taps, false)?;
+            let (allowed, edits) = match &guided {
+                Some(g) => (Some(&g.next.0), g.next.1.as_slice()),
+                None => (None, &[][..]),
+            };
+            (sampler.draw_row(&mut logits, allowed, edits), taps)
+        } else {
+            match &guided {
+                Some(g) => target.pick_last(&last_rows, &g.next, need_taps)?,
+                None => {
+                    let all: Vec<u32> = (0..last_rows.len() as u32).collect();
+                    let picks = if need_taps {
+                        &all[..]
+                    } else {
+                        &all[all.len() - 1..]
+                    };
+                    let (ids, taps) = target.launch_local(
+                        &last_rows,
+                        picks,
+                        Head::Full(None),
+                        need_taps,
+                        false,
+                    )?;
+                    (*ids.last().expect("non-empty prompt"), taps)
+                }
             }
         };
         fnv_u32(&mut st.hash, anchor);
@@ -474,20 +494,44 @@ pub(crate) fn run_speculate<D, S>(
                 [anchor].into_iter().chain(block.iter().copied()),
             );
             // A drafted round also reads taps.
-            let (mut posterior, block_taps) = match &guided {
-                Some(g) if !drafted => {
-                    let (id, _) = target.pick_last(&verify, &g.next, false)?;
-                    (block.iter().copied().chain([id]).collect(), None)
+            let (accepted, bonus, posterior, block_taps) = if sampling {
+                match &guided {
+                    Some(g) if !drafted => {
+                        let last = [verify.len() as u32 - 1];
+                        let (mut logits, _, _) =
+                            target.logits_local(&verify, &last, false, false)?;
+                        let id = sampler.draw_row(&mut logits, Some(&g.next.0), &g.next.1);
+                        let post = block.iter().copied().chain([id]).collect();
+                        (block.len(), id, post, None)
+                    }
+                    _ => {
+                        let all: Vec<u32> = (0..verify.len() as u32).collect();
+                        // A drafted verify leaves its state for `commit`.
+                        let (mut logits, vocab, taps) =
+                            target.logits_local(&verify, &all, drafted, drafted)?;
+                        let (acc, bonus) =
+                            sampler.verify(&block, &mut logits, vocab, &rules, fixed);
+                        let post = block[..acc].iter().copied().chain([bonus]).collect();
+                        (acc, bonus, post, taps)
+                    }
                 }
-                _ => {
-                    let all: Vec<u32> = (0..verify.len() as u32).collect();
-                    let head = head(target, &rules)?;
-                    // A drafted verify leaves its state for `commit`.
-                    target.launch_local(&verify, &all, head, drafted, drafted)?
-                }
+            } else {
+                let (mut post, taps) = match &guided {
+                    Some(g) if !drafted => {
+                        let (id, _) = target.pick_last(&verify, &g.next, false)?;
+                        (block.iter().copied().chain([id]).collect(), None)
+                    }
+                    _ => {
+                        let all: Vec<u32> = (0..verify.len() as u32).collect();
+                        let head = head(target, &rules)?;
+                        // A drafted verify leaves its state for `commit`.
+                        target.launch_local(&verify, &all, head, drafted, drafted)?
+                    }
+                };
+                post[..fixed].copy_from_slice(&block[..fixed]);
+                let (acc, bonus) = accept(&block, Target::Ids(&post));
+                (acc, bonus, post, taps)
             };
-            posterior[..fixed].copy_from_slice(&block[..fixed]);
-            let (accepted, bonus) = accept(&block, Target::Ids(&posterior));
             if drafted {
                 target.commit(accepted + 1)?;
             }
@@ -657,12 +701,67 @@ fn head(target: &Engine, rules: &[Rules]) -> Result<Head, Error> {
     })
 }
 
+/// Batched verify outputs: device ids or host logits.
+pub(crate) enum VerifyOut {
+    Ids(Vec<u32>),
+    Logits(Vec<f32>, usize),
+}
+
 impl Engine {
     /// A local launch picking after every row, with taps.
     pub(crate) fn step_taps_local(&mut self, rows: &[Row]) -> Result<(Vec<u32>, TapsBuf), Error> {
         let all: Vec<u32> = (0..rows.len() as u32).collect();
         let (ids, taps) = self.launch_local(rows, &all, Head::Full(None), true, false)?;
         Ok((ids, taps.expect("taps were asked for")))
+    }
+
+    /// Runs batched verify, reading logits when sampling.
+    pub(crate) fn step_verify_local(
+        &mut self,
+        rows: &[Row],
+        sampling: bool,
+    ) -> Result<(VerifyOut, TapsBuf), Error> {
+        if !sampling {
+            let (ids, taps) = self.step_taps_local(rows)?;
+            return Ok((VerifyOut::Ids(ids), taps));
+        }
+        let all: Vec<u32> = (0..rows.len() as u32).collect();
+        let (logits, vocab, taps) = self.logits_local(rows, &all, true, false)?;
+        Ok((
+            VerifyOut::Logits(logits, vocab),
+            taps.expect("taps were asked for"),
+        ))
+    }
+
+    /// Picks the final prefill anchor and taps.
+    pub(crate) fn prefill_pick(
+        &mut self,
+        rows: &[Row],
+        sampler: &mut Sampler,
+    ) -> Result<(u32, TapsBuf), Error> {
+        if sampler.greedy() {
+            let (ids, taps) = self.step_taps_local(rows)?;
+            return Ok((*ids.last().expect("non-empty chunk"), taps));
+        }
+        let (mut logits, _, taps) = self.logits_local(rows, &[0], true, false)?;
+        let anchor = sampler.draw_row(&mut logits, None, &[]);
+        Ok((anchor, taps.expect("taps were asked for")))
+    }
+
+    /// Reads full logits for `picks` rows, with optional device taps.
+    pub(crate) fn logits_local(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        taps: bool,
+        peek: bool,
+    ) -> Result<(Vec<f32>, usize, Option<TapsBuf>), Error> {
+        let vocab = self.vocab.ok_or(Error::Scores)?;
+        let (out, taps) = self.tapped(rows, picks, (Head::Full(None), peek), Role::Logits, taps)?;
+        let raw = self.runner.read(out)?;
+        let logits = raw.floats().map_err(RunError::from)?[..picks.len() * vocab].to_vec();
+        self.report();
+        Ok((logits, vocab, taps))
     }
 
     /// The ids after `picks` rows. Taps and peek on request.
@@ -695,15 +794,9 @@ impl Engine {
             return Ok((ids[0], taps));
         }
         // Rules the device head cannot apply run on the host.
-        let vocab = self.vocab.ok_or(Error::Scores)?;
-        let head = (Head::Full(None), false);
-        let (out, taps) = self.tapped(rows, &last, head, Role::Logits, taps)?;
-        let raw = self.runner.read(out)?;
-        let mut row = raw.floats().map_err(RunError::from)?[..vocab].to_vec();
-        let sampler = Sampler::new(Sampling::default());
-        let weights = sampler.weights(&mut row, Some(&rules.0), &rules.1);
-        self.report();
-        Ok((weights.draw(0.0), taps))
+        let (mut row, _, taps) = self.logits_local(rows, &last, taps, false)?;
+        let mut sampler = Sampler::new(Sampling::default());
+        Ok((sampler.draw_row(&mut row, Some(&rules.0), &rules.1), taps))
     }
 
     /// Runs `rows` locally: the `first` output, and taps if asked.

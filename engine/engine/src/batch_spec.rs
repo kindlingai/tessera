@@ -3,9 +3,9 @@
 use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, SoloState, push_tail};
 use crate::kept::Kept;
 use crate::mtp_draft::{MtpDrafter, MtpSpan};
-use crate::sample::{Target, accept, take};
+use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::schedule::Sink;
-use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span};
+use crate::spec_loop::{TapsBuf, TapsIn, VerifyOut, fnv_u32, span};
 use crate::{Engine, Error, Event, Reason, Request, Row};
 use std::collections::VecDeque;
 use tessera_engine_comm::{Reader, Writer};
@@ -87,6 +87,25 @@ pub(crate) fn keep_slots(
     true
 }
 
+/// Builds verify rows, spans, and sampling flag.
+pub(crate) fn verify_rows<T>(
+    active: &[T],
+    max_ctx: usize,
+    seq_of: impl Fn(&T) -> &ActiveSeq,
+) -> (Vec<Row>, Vec<(usize, usize)>, bool) {
+    let mut rows = Vec::new();
+    let mut spans = Vec::with_capacity(active.len());
+    let mut sampling = false;
+    for item in active {
+        let seq = seq_of(item);
+        let k = seq.drafts.len().min(seq.room(max_ctx));
+        spans.push((rows.len(), k));
+        seq.verify(&mut rows, k);
+        sampling |= !seq.sampler.greedy();
+    }
+    (rows, spans, sampling)
+}
+
 /// Removes finished `slots` from `active` and notifies `on_free`.
 pub(crate) fn retire_from<T>(
     active: &mut Vec<T>,
@@ -147,6 +166,7 @@ pub(crate) struct ActiveSeq {
     pub(crate) history: Vec<u32>,
     /// Rows written into the MTP drafter KV cache.
     pub(crate) mtp_valid: usize,
+    pub(crate) sampler: Sampler,
 }
 
 impl ActiveSeq {
@@ -154,11 +174,20 @@ impl ActiveSeq {
     pub(crate) fn apply_verify(
         &mut self,
         k: usize,
-        ids: &[u32],
+        off: usize,
+        out: &mut VerifyOut,
         max_ctx: usize,
         hash: &mut u32,
     ) -> (usize, Vec<u32>, Option<Reason>) {
-        let (accepted, bonus) = accept(&self.drafts[..k], Target::Ids(&ids[..1 + k]));
+        let (accepted, bonus) = match out {
+            VerifyOut::Ids(ids) => accept(&self.drafts[..k], Target::Ids(&ids[off..off + 1 + k])),
+            VerifyOut::Logits(logits, vocab) => {
+                let lo = off * *vocab;
+                let hi = (off + 1 + k) * *vocab;
+                self.sampler
+                    .verify(&self.drafts[..k], &mut logits[lo..hi], *vocab, &[], 0)
+            }
+        };
         fnv_u32(hash, accepted as u32);
         fnv_u32(hash, bonus);
         let commit = 1 + accepted;
@@ -383,7 +412,8 @@ impl RoundHost for BatchMtp<'_> {
                     (slot, 0)
                 }
             };
-            let (request, sink) = self.waiting.pop_front().expect("waiting request");
+            let (mut request, sink) = self.waiting.pop_front().expect("waiting request");
+            request.sampling = request.sampling.seeded();
             out.push(Admitted {
                 slot,
                 skip,
@@ -466,14 +496,17 @@ impl BatchMtp<'_> {
         let mut seq = self.prefilling.pop_front().expect("prefill seq");
         let n = seq.request.tokens.len();
         let pos0 = seq.pos;
-        let len = (n - pos0).min(self.prefill_chunk);
+        let mut len = (n - pos0).min(self.prefill_chunk);
+        if !seq.request.sampling.greedy() && pos0 + len == n && len > 1 {
+            len = n - 1 - pos0;
+        }
         let wants = self.drafter.wants();
         let dual_widths = self.dual.as_ref().map(|p| (p.d_width, p.m_width));
         let mut rows = Vec::with_capacity(len);
         let chunk = &seq.request.tokens[pos0..pos0 + len];
         span(&mut rows, seq.slot, pos0, chunk.iter().copied());
-        let (ids, taps) = self.target.step_taps_local(&rows)?;
         if pos0 + len < n {
+            let (_, taps) = self.target.step_taps_local(&rows)?;
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
             if let Some((d_w, m_w)) = dual_widths {
                 if seq.solo_mode {
@@ -498,7 +531,8 @@ impl BatchMtp<'_> {
             self.prefilling.push_front(seq);
             return Ok(());
         }
-        let anchor = *ids.last().expect("non-empty chunk");
+        let mut sampler = Sampler::new(seq.request.sampling);
+        let (anchor, taps) = self.target.prefill_pick(&rows, &mut sampler)?;
         fnv_u32(&mut self.hash, anchor);
         let mut history = Vec::with_capacity(n + 1);
         history.extend_from_slice(&seq.request.tokens);
@@ -519,6 +553,7 @@ impl BatchMtp<'_> {
             d_tail: Vec::new(),
             history,
             mtp_valid: seq.mtp_valid,
+            sampler,
         };
         let done = act.commit(&[anchor], self.max_ctx);
         if done.is_some() || (self.target.control.is_none() && act.cancelled) {
@@ -582,26 +617,16 @@ impl BatchMtp<'_> {
 
     fn verify_and_draft(&mut self) -> Result<(), Error> {
         let s_count = self.active.len();
-        let mut rows = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s_count);
-        for seq in &self.active {
-            let k = seq.drafts.len().min(seq.room(self.max_ctx));
-            spans.push((rows.len(), k));
-            seq.verify(&mut rows, k);
-        }
-        let (ids, raw_taps) = self.target.step_taps_local(&rows)?;
+        let (rows, spans, sampling) = verify_rows(&self.active, self.max_ctx, |s| s);
+        let (mut out, raw_taps) = self.target.step_verify_local(&rows, sampling)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
         let ranked = self.target.control.is_some();
         let mut jobs: Vec<DraftJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
             let old_start = self.active[i].start as u32;
-            let (_, committed, done) = self.active[i].apply_verify(
-                k,
-                &ids[off..off + 1 + k],
-                self.max_ctx,
-                &mut self.hash,
-            );
+            let (_, committed, done) =
+                self.active[i].apply_verify(k, off, &mut out, self.max_ctx, &mut self.hash);
             let seq = &mut self.active[i];
             seq.history.extend_from_slice(&committed);
             if done.is_some() || (!ranked && seq.cancelled) {
@@ -893,6 +918,7 @@ pub(crate) fn encode_round(hash: u32, cancelled: &[u32], admitted: &[Admitted]) 
             .u32(a.request.max_tokens as u32)
             .u32s(&a.request.tokens)
             .u32s(&a.request.stop);
+        a.request.sampling.encode(&mut w);
     }
     w.0
 }
@@ -912,6 +938,7 @@ pub(crate) fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>
         let max_tokens = r.u32()? as usize;
         let tokens = r.u32s()?;
         let stop = r.u32s()?;
+        let sampling = Sampling::decode(&mut r)?;
         admitted.push(Admitted {
             slot,
             skip,
@@ -919,6 +946,7 @@ pub(crate) fn decode_round(bytes: &[u8]) -> Option<(u32, Vec<u32>, Vec<Admitted>
                 tokens,
                 max_tokens,
                 stop,
+                sampling,
                 ..Request::default()
             },
             sink: None,

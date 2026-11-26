@@ -1,84 +1,52 @@
 //! Device-accelerated trellis MMA, streaming decode GEMV, and small-batch matmul rules.
 
+#[cfg(test)]
+mod device_test;
 mod gemv;
 pub(crate) mod mm;
 
-use crate::{Backend, flatten_for};
 use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
+use tessera_device::{Backend, flatten_for, parse_trellis};
+pub(crate) use tessera_device::{CUDA_LACKS, cuda_rule, f32_only};
 use tessera_graph::{Op, Order, Stage, View};
-use tessera_lower::Backend as LowerBackend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Ops, Read, Shape, Source, Step, T, Term,
     Tree,
 };
 
-pub(crate) const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBackend::Rocm];
-
-/// Registers a CUDA rule, from a `check` or a proposer.
-macro_rules! cuda_rule {
-    ($name:literal, $propose:path, why = $why:path) => {
-        tessera_lower::rule!(
-            $name,
-            $propose,
-            why = $why,
-            lacks = $crate::linear::CUDA_LACKS
-        );
-    };
-    ($name:literal, $propose:path) => {
-        const _: () = {
-            fn why(_: &tessera_lower::Tree, _: tessera_lower::T) -> Option<String> {
-                None
-            }
-            $crate::linear::cuda_rule!($name, $propose, why = why);
-        };
-    };
-    ($name:literal, check = $check:path) => {
-        const _: () = {
-            use tessera_lower::{Draft, T, Tree};
-            fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-                $check(tree, at)?.ok()
-            }
-            fn why(tree: &Tree, at: T) -> Option<String> {
-                $check(tree, at)?.err()
-            }
-            $crate::linear::cuda_rule!($name, propose, why = why);
-        };
-    };
-}
-pub(crate) use cuda_rule;
-
 const KERNEL: &str = include_str!("linear.cu");
+const PREFILL: &str = include_str!("prefill.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
 const THREADS: usize = 256;
 const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
+const DTR_PRE_SMEM: usize = 40_960;
 
 pub(crate) fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "linear.kernel", KERNEL))
 }
 
+pub(crate) fn prefill_source() -> &'static str {
+    static CUDA: OnceLock<&'static str> = OnceLock::new();
+    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prefill.kernel", PREFILL))
+}
+
+pub(crate) fn prefill_source_entry(entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", prefill_source(), ""]),
+        entry,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
     HIP.get_or_init(|| flatten_for(Backend::Rocm, "linear.kernel", KERNEL))
-}
-
-pub(crate) fn parse_trellis(name: &str) -> Option<(u32, u32)> {
-    let rest = name.strip_prefix("trellis_k")?;
-    let (k, book) = if let Some(k) = rest.strip_suffix("_pmcgx") {
-        (k, 2u32)
-    } else if let Some(k) = rest.strip_suffix("_mul1") {
-        (k, 1u32)
-    } else {
-        (rest, 0u32)
-    };
-    let bits: u32 = k.parse().ok()?;
-    (2..=4).contains(&bits).then_some((bits, book))
 }
 
 fn dtr_ks(m: usize, n: usize, k: usize) -> usize {
@@ -163,24 +131,35 @@ fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
     weight_accepts(input, k.form, form)
 }
 
-fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
-    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(dtr_tile(t.m));
-    let mut reads = vec![t.form.bytes(t.n * t.k) as f64, (4 * t.m * t.k) as f64];
-    if t.turned {
-        reads.push((4 * t.k) as f64);
-        if t.ks == 1 {
-            reads.push((4 * t.n) as f64);
-        }
-    }
+fn trellis_mma_load(
+    form: &dyn Stored,
+    dims: [usize; 4],
+    tile: usize,
+    x_elem: usize,
+    scales: &[usize],
+) -> Option<Load> {
+    let [m, n, k, ks] = dims;
+    let groups = (n / BLOCK) * ks * m.div_ceil(tile);
+    let mut reads = vec![form.bytes(n * k) as f64, (x_elem * m * k) as f64];
+    reads.extend(scales.iter().map(|&len| (4 * len) as f64));
     Some(Load {
         threads: groups * THREADS,
         group: THREADS,
-        trips: (t.k / BLOCK / t.ks) as f64,
+        trips: (k / BLOCK / ks) as f64,
         reads,
-        written: (4 * t.ks * t.m * t.n) as f64,
+        written: (4 * ks * m * n) as f64,
         flight: 1024.0,
         ..Load::default()
     })
+}
+
+fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
+    let scales: &[usize] = match (t.turned, t.ks) {
+        (true, 1) => &[t.k, t.n],
+        (true, _) => &[t.k],
+        (false, _) => &[],
+    };
+    trellis_mma_load(t.form, [t.m, t.n, t.k, t.ks], dtr_tile(t.m), 4, scales)
 }
 
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
@@ -278,8 +257,173 @@ fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
     (node.term == term && !tree.root(t)).then_some(&node.args[..])
 }
 
+fn dtr_pre_tile(m: usize, n: usize) -> usize {
+    if m >= 128 && m.div_ceil(128) * (n / BLOCK) >= 96 {
+        128
+    } else {
+        64
+    }
+}
+
+fn dtr_pre_entry(t: &TrellisPreMma) -> &'static str {
+    match (dtr_pre_tile(t.m, t.n), t.bits, t.book, t.turned) {
+        (128, 4, 0, true) => "dtr_pre_k4_t16",
+        (64, 4, 0, true) => "dtr_pre_k4_t8",
+        (128, _, _, _) => "dtr_pre_gen16",
+        (_, _, _, _) => "dtr_pre_gen8",
+    }
+}
+
+/// Rotates and quantizes dense inputs once per 64x128 block.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "trellis_prep",
+    sizes = [self.m, self.k],
+    work = self.m * self.k,
+    accepts = prep_accepts,
+    emits = f32_only,
+    needs = dtr_needs(DTR_SMEM),
+    order = Order::PerConfig,
+    source = prefill_source_entry("dtr_prep"),
+    launches = prep_launches,
+    load = prep_load,
+    unproven,
+)]
+struct TrellisPrep {
+    m: usize,
+    k: usize,
+    turned: bool,
+}
+
+fn prep_accepts(_: &TrellisPrep, _: usize, form: &dyn Stored) -> bool {
+    form.name() == "f32"
+}
+
+fn prep_load(p: &TrellisPrep, _: usize) -> Option<Load> {
+    let groups = (p.k / BLOCK) * p.m.div_ceil(64);
+    let mut reads = vec![(4 * p.m * p.k) as f64];
+    if p.turned {
+        reads.push((4 * p.k) as f64);
+    }
+    Some(Load {
+        threads: groups * THREADS,
+        group: THREADS,
+        trips: 1.0,
+        reads,
+        written: (p.m * p.k) as f64,
+        flight: 512.0,
+        ..Load::default()
+    })
+}
+
+fn prep_launches(p: &TrellisPrep, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: p.k / BLOCK,
+        down: p.m.div_ceil(64),
+        threads: THREADS,
+    };
+    let suh = if p.turned { step.read(1) } else { step.read(0) };
+    let args = vec![
+        step.read(0),
+        suh,
+        step.out(),
+        Arg::count(p.m),
+        Arg::count(p.k),
+        Arg::count(usize::from(p.turned)),
+    ];
+    vec![Launch { args, shape }]
+}
+
+/// Prefill dense trellis matmul from pre-rotated input blocks.
+#[derive(Clone, Debug, Kernel)]
+#[launch(
+    name = self.form.suffixed(if self.turned { "trellis_turned_pf" } else { "trellis_mma_pf" }),
+    sizes = [self.m, self.n, self.k],
+    work = self.m * self.n * self.k,
+    accepts = pre_mma_accepts,
+    emits = f32_only,
+    needs = dtr_needs(DTR_PRE_SMEM),
+    order = Order::PerConfig,
+    source = prefill_source_entry(dtr_pre_entry(self)),
+    launches = pre_mma_launches,
+    load = pre_mma_load,
+    unproven,
+)]
+struct TrellisPreMma {
+    m: usize,
+    n: usize,
+    k: usize,
+    bits: u32,
+    book: u32,
+    turned: bool,
+    form: &'static dyn Stored,
+}
+
+fn pre_mma_accepts(k: &TrellisPreMma, input: usize, form: &dyn Stored) -> bool {
+    weight_accepts(input, k.form, form)
+}
+
+fn pre_mma_load(t: &TrellisPreMma, _: usize) -> Option<Load> {
+    let scales: &[usize] = if t.turned { &[t.n] } else { &[] };
+    trellis_mma_load(
+        t.form,
+        [t.m, t.n, t.k, 1],
+        dtr_pre_tile(t.m, t.n),
+        1,
+        scales,
+    )
+}
+
+fn pre_mma_launches(t: &TrellisPreMma, step: &Step) -> Vec<Launch> {
+    let tile = dtr_pre_tile(t.m, t.n);
+    let shape = Shape::Grid {
+        across: t.n / BLOCK,
+        down: t.m.div_ceil(tile),
+        threads: THREADS,
+    };
+    let svh = if t.turned { step.read(2) } else { step.read(0) };
+    let args = vec![
+        step.read(0),
+        step.read(1),
+        svh,
+        step.out(),
+        Arg::count(t.m),
+        Arg::count(t.n),
+        Arg::count(t.k),
+        Arg::value(&t.bits),
+        Arg::value(&t.book),
+        Arg::count(usize::from(t.turned)),
+    ];
+    vec![Launch { args, shape }]
+}
+
 fn trellis_drafts(t: TrellisMma, x: T, w: T, suh: Option<T>, svh: Option<T>) -> Vec<Draft> {
-    let (m, n, ks, turned) = (t.m, t.n, t.ks, t.turned);
+    let (m, n, k, ks, turned) = (t.m, t.n, t.k, t.ks, t.turned);
+    if ks == 1 && m >= 64 {
+        let mut p_reads = vec![Read::Node(x)];
+        if let Some(u) = suh {
+            p_reads.push(Read::Node(u));
+        }
+        let mut m_reads = vec![Read::Draft(0), Read::Node(w)];
+        if let Some(v) = svh {
+            m_reads.push(Read::Node(v));
+        }
+        let prep = TrellisPrep { m, k, turned };
+        let pre_len = m.div_ceil(64) * (k / BLOCK) * 8 * 512;
+        let mma = TrellisPreMma {
+            m,
+            n,
+            k,
+            bits: t.bits,
+            book: t.book,
+            turned,
+            form: t.form,
+        };
+        return vec![
+            Draft::new(prep, p_reads, pre_len),
+            Draft::new(mma, m_reads, m * n),
+        ];
+    }
     if ks == 1 {
         let mut reads = vec![x, w];
         if let (Some(u), Some(v)) = (suh, svh) {
@@ -419,10 +563,6 @@ fn trip(float: usize, int: usize, loads: usize, bytes: usize) -> Ops {
     }
 }
 
-pub(crate) fn f32_only<K>(_: &K, form: &dyn Stored) -> bool {
-    form.name() == "f32"
-}
-
 fn cuda_needs(group_bytes: usize) -> Needs {
     Needs {
         lanes: 32,
@@ -434,14 +574,14 @@ fn cuda_needs(group_bytes: usize) -> Needs {
     }
 }
 
-pub(super) fn cuda_source_entry(entry: &'static str) -> Source {
+pub(crate) fn cuda_source_entry(entry: &'static str) -> Source {
     Source::Fixed {
         text: ByBackend(["", cuda_source(), ""]),
         entry,
     }
 }
 
-pub(super) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
+pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Stored) -> bool {
     match input {
         1 => form.name() == expected.name(),
         _ => form.name() == "f32",

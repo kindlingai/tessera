@@ -137,7 +137,7 @@ pub(super) fn front(
         response: target.response,
         stop: target.stop,
         steer,
-        sampling: false,
+        sampling: true,
     })
 }
 

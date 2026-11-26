@@ -1,11 +1,13 @@
 //! Token choice: sampling from logits, draft acceptance and answer limits.
 
+use crate::guide::Rules;
 use crate::guide::{Edit, edit};
 use crate::{Allowed, Reason, Request};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tessera_engine_comm::{Reader, Writer};
 
 /// Sampling settings for one answer. Zero temperature is greedy.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -33,6 +35,47 @@ impl Sampling {
     /// Whether this request uses greedy argmax decoding.
     pub fn greedy(&self) -> bool {
         self.temperature <= 0.0
+    }
+
+    /// Resolves an omitted seed once so all ranks sample alike.
+    pub(crate) fn seeded(self) -> Self {
+        match self.greedy() || self.seed.is_some() {
+            true => self,
+            false => Self {
+                seed: Some(fresh_seed()),
+                ..self
+            },
+        }
+    }
+
+    /// Serializes sampling settings for cross-rank broadcast.
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        let seed = self.seed.unwrap_or(0);
+        w.u32(self.temperature.to_bits())
+            .u32(self.top_p.to_bits())
+            .u32(self.top_k as u32)
+            .u32(self.min_p.to_bits())
+            .u32(u32::from(self.seed.is_some()))
+            .u32(seed as u32)
+            .u32((seed >> 32) as u32);
+    }
+
+    /// Deserializes sampling settings from a rank broadcast.
+    pub(crate) fn decode(r: &mut Reader) -> Option<Self> {
+        let temperature = f32::from_bits(r.u32()?);
+        let top_p = f32::from_bits(r.u32()?);
+        let top_k = r.u32()? as usize;
+        let min_p = f32::from_bits(r.u32()?);
+        let has_seed = r.u32()? != 0;
+        let lo = r.u32()? as u64;
+        let hi = r.u32()? as u64;
+        Some(Self {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            seed: has_seed.then_some(lo | (hi << 32)),
+        })
     }
 }
 
@@ -92,6 +135,49 @@ impl Sampler {
             c.1 = ((c.1 - max) / temp).exp();
         }
         Weights::of(cands)
+    }
+
+    /// Whether this sampler uses greedy argmax decoding.
+    pub(crate) fn greedy(&self) -> bool {
+        self.cfg.greedy()
+    }
+
+    /// Draws one token from `logits` after optional guide rules.
+    pub(crate) fn draw_row(
+        &mut self,
+        logits: &mut [f32],
+        allowed: Option<&Allowed>,
+        edits: &[Edit],
+    ) -> u32 {
+        let u = self.unit();
+        self.weights(logits, allowed, edits).draw(u)
+    }
+
+    /// Verifies `drafts` against sampled target `logits`.
+    pub(crate) fn verify(
+        &mut self,
+        drafts: &[u32],
+        logits: &mut [f32],
+        vocab: usize,
+        rules: &[Rules],
+        fixed: usize,
+    ) -> (usize, u32) {
+        let n = drafts.len();
+        let mut rows = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            if i < fixed {
+                rows.push(Weights::one(drafts[i]));
+            } else {
+                let row = &mut logits[i * vocab..(i + 1) * vocab];
+                let (allowed, edits) = match rules.get(i) {
+                    Some((a, e)) => (Some(a), e.as_slice()),
+                    None => (None, &[][..]),
+                };
+                rows.push(self.weights(row, allowed, edits));
+            }
+        }
+        let units: Vec<f32> = (0..=n).map(|_| self.unit()).collect();
+        accept(drafts, Target::Drawn(&rows, &units))
     }
 
     /// A uniform in `[0, 1)`. Each row draws one.

@@ -3,5 +3,6 @@
 use tessera_attention as _;
 use tessera_cpu as _;
 use tessera_device as _;
+use tessera_device_linear as _;
 use tessera_kernels as _;
 use tessera_linear as _;

@@ -1,7 +1,7 @@
 [task.add-device-kernel]
 steps = [
-  { do = "place", at = "engine/rules/device/src/*/*.cu", like = "engine/rules/device/src/linear/mod.rs" },
-  { do = "implement", with = "tessera_lower::Kernel", like = "engine/rules/device/src/linear/mod.rs" },
-  { do = "register", with = "tessera_lower::rule!", like = "engine/rules/device/src/linear/mod.rs" },
+  { do = "place", at = "engine/rules/device/src/*/*.cu", like = "engine/rules/device/src/attend/mod.rs" },
+  { do = "implement", with = "tessera_lower::Kernel", like = "engine/rules/device/src/attend/mod.rs" },
+  { do = "register", with = "tessera_lower::rule!", like = "engine/rules/device/src/attend/mod.rs" },
   { do = "run", pkg = "tessera-device", mode = "test" },
 ]
