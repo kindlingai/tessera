@@ -87,6 +87,12 @@ impl Step {
         self.kernel.launches(self)
     }
 
+    /// Bytes it reads and writes.
+    pub fn bytes(&self) -> usize {
+        let read: usize = self.reads.iter().map(|r| r.bytes()).sum();
+        read + self.write.bytes() + self.also.iter().map(|w| w.bytes()).sum::<usize>()
+    }
+
     /// The `i`th input's buffer, from its start.
     pub fn read(&self, i: usize) -> Arg {
         Arg::at(self.reads[i], 0)

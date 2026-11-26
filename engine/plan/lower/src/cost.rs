@@ -477,11 +477,8 @@ impl Device {
     pub fn cost(&self, plan: &Plan) -> Cost {
         let mut total = Cost::default();
         for step in &plan.steps {
-            let moved: usize = step.reads.iter().map(|r| r.bytes()).sum();
-            let written: usize =
-                step.write.bytes() + step.also.iter().map(|w| w.bytes()).sum::<usize>();
             total.seconds += self.step_seconds(plan, step).unwrap_or(f64::INFINITY);
-            total.bytes += (moved + written) as u64;
+            total.bytes += step.bytes() as u64;
             total.launches += step.launches().len();
         }
         total

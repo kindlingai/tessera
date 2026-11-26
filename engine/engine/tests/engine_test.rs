@@ -175,11 +175,10 @@ fn profile_counts_launches() {
         engine.settle().unwrap();
         assert!(engine.take_profile().is_none());
         assert_eq!(profile.spent["engine: launch"].count, 3);
-        let kernels: f64 = engine
-            .kernels()
-            .keys()
-            .map(|k| profile.spent[*k].seconds)
-            .sum();
+        let names = engine.kernels();
+        let kernel = |row: &str| names.contains_key(row.split(' ').next().unwrap_or(row));
+        let rows = profile.spent.iter().filter(|(row, _)| kernel(row));
+        let kernels: f64 = rows.map(|(_, s)| s.seconds).sum();
         assert!(kernels > 0.0, "{}", engine.device());
     }
 }

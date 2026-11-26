@@ -3,25 +3,61 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use tessera_engine_comm::{Reader, Writer};
+use tessera_lower::Step;
 
-/// Seconds and count per name, since the last take.
+/// Rows past this many print as one "other" row.
+const SHOWN: usize = 40;
+
+/// Totals per name, since the last take.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Profile {
     pub spent: BTreeMap<String, Spent>,
 }
 
-/// One name's seconds and how often it ran.
+/// One name's seconds, count, work and bytes moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Spent {
     pub seconds: f64,
     pub count: u64,
+    /// Multiply-adds, or elements touched. Zero for phases.
+    pub work: f64,
+    pub bytes: f64,
+}
+
+impl Spent {
+    fn sum(&mut self, other: Spent) {
+        self.seconds += other.seconds;
+        self.count += other.count;
+        self.work += other.work;
+        self.bytes += other.bytes;
+    }
 }
 
 impl Profile {
     pub fn add(&mut self, name: &str, seconds: f64) {
-        let spent = self.spent.entry(name.to_string()).or_default();
-        spent.seconds += seconds;
-        spent.count += 1;
+        let one = Spent {
+            seconds,
+            count: 1,
+            ..Spent::default()
+        };
+        self.spent.entry(name.to_string()).or_default().sum(one);
+    }
+
+    /// Adds one run of `step`, by kernel name and sizes.
+    pub fn step(&mut self, step: &Step, seconds: f64) {
+        let kernel = &step.kernel;
+        let mut name = kernel.name().to_string();
+        for (i, size) in kernel.sizes().iter().enumerate() {
+            name.push(if i == 0 { ' ' } else { 'x' });
+            name.push_str(&size.to_string());
+        }
+        let one = Spent {
+            seconds,
+            count: 1,
+            work: kernel.work(step.write.len),
+            bytes: step.bytes() as f64,
+        };
+        self.spent.entry(name).or_default().sum(one);
     }
 
     /// Names by seconds, most first.
@@ -31,11 +67,12 @@ impl Profile {
         rows
     }
 
-    /// Each name, then its seconds and count.
+    /// Each name, then its seconds, count, work and bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut words = Writer::default();
         for (name, s) in &self.spent {
             words.bytes(name.as_bytes()).f64(s.seconds).u64(s.count);
+            words.f64(s.work).f64(s.bytes);
         }
         words.0
     }
@@ -46,7 +83,14 @@ impl Profile {
         while !words.is_empty() {
             let name = String::from_utf8(words.bytes()?.to_vec()).ok()?;
             let (seconds, count) = (words.f64()?, words.u64()?);
-            profile.spent.insert(name, Spent { seconds, count });
+            let (work, bytes) = (words.f64()?, words.f64()?);
+            let spent = Spent {
+                seconds,
+                count,
+                work,
+                bytes,
+            };
+            profile.spent.insert(name, spent);
         }
         (!profile.spent.is_empty()).then_some(profile)
     }
@@ -66,21 +110,43 @@ pub struct Report<'a> {
     launches: u64,
 }
 
+impl Report<'_> {
+    fn row(&self, f: &mut fmt::Formatter<'_>, name: &str, s: Spent) -> fmt::Result {
+        let per = self.launches as f64;
+        let ms = s.seconds * 1e3 / per;
+        let each = s.seconds * 1e6 / s.count.max(1) as f64;
+        let count = s.count as f64 / per;
+        write!(f, "{ms:>10.3} {count:>8.1} {each:>10.1}")?;
+        for amount in [s.work, s.bytes] {
+            match amount > 0.0 && s.seconds > 0.0 {
+                true => write!(f, " {:>8.1}", amount / s.seconds / 1e9)?,
+                false => write!(f, " {:>8}", "-")?,
+            }
+        }
+        writeln!(f, "  {name}")
+    }
+}
+
 impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let per = self.launches as f64;
         writeln!(
             f,
-            "{:>10} {:>8} {:>10}  name",
-            "ms/launch", "count", "us each"
+            "{:>10} {:>8} {:>10} {:>8} {:>8}  name",
+            "ms/launch", "count", "us each", "G/s", "GB/s"
         )?;
-        for (name, s) in self.profile.ranked() {
-            let ms = s.seconds * 1e3 / per;
-            let each = s.seconds * 1e6 / s.count.max(1) as f64;
-            let count = s.count as f64 / per;
-            writeln!(f, "{ms:>10.3} {count:>8.1} {each:>10.1}  {name}")?;
+        let rows = self.profile.ranked();
+        let (shown, rest) = rows.split_at(rows.len().min(SHOWN));
+        for (name, s) in shown {
+            self.row(f, name, *s)?;
         }
-        Ok(())
+        let mut other = Spent::default();
+        for (_, s) in rest {
+            other.sum(*s);
+        }
+        match rest.len() {
+            0 => Ok(()),
+            n => self.row(f, &format!("other ({n} rows)"), other),
+        }
     }
 }
 

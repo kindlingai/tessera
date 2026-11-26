@@ -17,6 +17,8 @@ mod paged;
 #[cfg(test)]
 mod paged_test;
 mod profile;
+#[cfg(test)]
+mod profile_test;
 mod rank;
 mod run;
 pub mod sizer;

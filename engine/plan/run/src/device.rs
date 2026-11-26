@@ -306,8 +306,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let walked = self.walk(steps.clone());
         let (waited, stamps) = self.opened(walked)?;
         for (i, s) in steps.zip(waited.unwrap_or(stamps)) {
-            let name = self.base.plan.steps[i].kernel.name();
-            self.note(name, s);
+            self.note_step(i, s);
         }
         for (entry, found) in self.grid_marks() {
             for region in &found.regions {

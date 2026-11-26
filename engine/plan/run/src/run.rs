@@ -206,6 +206,13 @@ pub trait Run {
             p.add(name, seconds);
         }
     }
+    /// Adds `seconds` to step `i`'s row, while profiling.
+    fn note_step(&mut self, i: usize, seconds: f64) {
+        let base = self.base_mut();
+        if let Some(p) = base.profile.as_mut() {
+            p.step(&base.plan.steps[i], seconds);
+        }
+    }
     /// Runs one step `times` over. Returns seconds per run.
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error>;
     /// The backend and the hardware it drives.
