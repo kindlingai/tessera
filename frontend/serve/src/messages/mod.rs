@@ -423,6 +423,7 @@ fn start(model: &Model, body: &[u8]) -> Result<Started, Fail> {
     }
     let params = Params {
         max_tokens: input.max_tokens,
+        min_tokens: 0,
         stop: input.stop_sequences,
         format: None,
         raw: parser.is_some(),
