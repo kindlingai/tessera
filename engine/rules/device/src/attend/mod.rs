@@ -411,19 +411,29 @@ tessera_lower::rule!("fast_gqa_attend", propose_gqa);
 
 const IDX_SM_WORDS: usize = 4608;
 const IDX_SMEM: usize = IDX_SM_WORDS * 8 + 128 * 4;
+const IDX_QT_SMEM: usize = 2 * 32 * 136 * 2 + 16;
 const IDX_MAX_HEADS: usize = 128;
 
-fn idx_kv_entry(kv: &str) -> Option<&'static str> {
-    match kv {
-        "fp8" => Some("tessera_indexer_fp8"),
-        "bf16" => Some("tessera_indexer_bf16"),
-        "f32" => Some("tessera_indexer_f32"),
+fn idx_kv_entry(kv: &str, qt: bool) -> Option<&'static str> {
+    match (kv, qt) {
+        ("fp8", false) => Some("tessera_indexer_fp8"),
+        ("bf16", false) => Some("tessera_indexer_bf16"),
+        ("f32", false) => Some("tessera_indexer_f32"),
+        ("fp8", true) => Some("tessera_indexer_qt_fp8"),
+        ("bf16", true) => Some("tessera_indexer_qt_bf16"),
+        ("f32", true) => Some("tessera_indexer_qt_f32"),
         _ => None,
     }
 }
 
-fn idx_tile_keys(rows: usize) -> usize {
-    if rows <= 4 { 64 } else { 256 }
+fn idx_tile_keys(rows: usize, qt: bool) -> usize {
+    if qt {
+        1024
+    } else if rows <= 4 {
+        64
+    } else {
+        256
+    }
 }
 
 /// Tensor-Core Lightning Indexer over dense or paged keys.
@@ -434,7 +444,7 @@ fn idx_tile_keys(rows: usize) -> usize {
     work = self.rows * self.out_keys * self.heads * self.dim,
     accepts = idx_accepts,
     emits = f32_only,
-    needs = idx_needs(),
+    needs = idx_needs(self),
     order = Order::PerConfig,
     source = attend_entry(self.entry),
     launches = idx_launches,
@@ -450,6 +460,7 @@ struct FastIndexer {
     heads: usize,
     dim: usize,
     masked: bool,
+    qt: bool,
     k_form: &'static dyn Stored,
     entry: &'static str,
 }
@@ -462,11 +473,11 @@ fn idx_accepts(k: &FastIndexer, input: usize, form: &dyn Stored) -> bool {
     }
 }
 
-fn idx_needs() -> Needs {
+fn idx_needs(k: &FastIndexer) -> Needs {
     Needs {
         lanes: 32,
-        group_bytes: IDX_SMEM,
-        group_threads: 128,
+        group_bytes: if k.qt { IDX_QT_SMEM } else { IDX_SMEM },
+        group_threads: if k.qt { 256 } else { 128 },
         compiler: true,
         lacks: CUDA_LACKS,
         bf16_tile: true,
@@ -475,15 +486,17 @@ fn idx_needs() -> Needs {
 }
 
 fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
-    let tk = idx_tile_keys(k.rows);
+    let tk = idx_tile_keys(k.rows, k.qt);
     let blocks_x = k.out_keys.div_ceil(tk);
+    let blocks_y = if k.qt { k.rows.div_ceil(8) } else { k.rows };
+    let group = if k.qt { 256 } else { 128 };
     let q_bytes = (4 * k.rows * k.heads * k.dim) as f64;
-    let k_bytes = k.k_form.bytes(k.rows * k.out_keys * k.dim) as f64;
+    let k_bytes = k.k_form.bytes(blocks_y * k.out_keys * k.dim) as f64;
     let out_bytes = (4 * k.rows * k.out_keys) as f64;
     Some(Load {
-        threads: blocks_x * k.rows * 128,
-        group: 128,
-        trips: tk.div_ceil(64) as f64 * (k.heads / 16) as f64,
+        threads: blocks_x * blocks_y * group,
+        group,
+        trips: tk.div_ceil(if k.qt { 32 } else { 64 }) as f64 * (k.heads / 16) as f64,
         reads: vec![k_bytes, q_bytes],
         written: out_bytes,
         flight: 1024.0,
@@ -492,11 +505,11 @@ fn idx_load(k: &FastIndexer, _: usize) -> Option<Load> {
 }
 
 fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
-    let tk = idx_tile_keys(k.rows);
+    let tk = idx_tile_keys(k.rows, k.qt);
     let shape = Shape::Grid {
         across: k.out_keys.div_ceil(tk),
-        down: k.rows,
-        threads: 128,
+        down: if k.qt { k.rows.div_ceil(8) } else { k.rows },
+        threads: if k.qt { 256 } else { 128 },
     };
     let page_shift = k.kept.page().map_or(0, |p| p.trailing_zeros() as usize);
     let table = step.kept(k.kept).unwrap_or_else(|| step.read(3));
@@ -600,7 +613,8 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     if k_keys != out_keys || k_dim != dim {
         return None;
     }
-    let entry = idx_kv_entry(k_node.form.name())?;
+    let qt = rows >= 8 && heads == 32 && dim == 128;
+    let entry = idx_kv_entry(k_node.form.name(), qt)?;
     if tree.elements(slots) != rows || tree.node(slots).form.dtype() != DType::U32 {
         return None;
     }
@@ -626,6 +640,7 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         heads,
         dim,
         masked,
+        qt,
         k_form: k_node.form,
         entry,
     };
