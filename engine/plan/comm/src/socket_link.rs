@@ -41,8 +41,14 @@ pub(crate) struct SocketLink {
 // Each rank owns its regions and streams.
 unsafe impl Send for SocketLink {}
 
+/// A reset or broken stream means the peer is gone.
 fn io(e: std::io::Error) -> Error {
-    Error::Io(e)
+    match e.kind() {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            Error::Link(format!("a peer dropped its stream: {e}"))
+        }
+        _ => Error::Io(e),
+    }
 }
 
 fn queue(out: &mut VecDeque<u8>, words: [u64; 3], bytes: &[u8]) {
