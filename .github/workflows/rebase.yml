@@ -101,8 +101,10 @@ jobs:
       # The identity that pushes. With these two secrets a GitHub App
       # pushes, and CI runs on the new head. Without them the workflow
       # token pushes, and GitHub does not start CI for that push.
-      APP_ID: ${{ secrets.TIERS_APP_ID }}
-      APP_KEY: ${{ secrets.TIERS_APP_PRIVATE_KEY }}
+      # This app is not the tiers app that sets the tier labels. The
+      # key of the tiers app must not be an Actions secret.
+      APP_ID: ${{ secrets.REBASE_APP_ID }}
+      APP_KEY: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
     steps:
       - id: app
         if: env.APP_ID != '' && env.APP_KEY != ''
