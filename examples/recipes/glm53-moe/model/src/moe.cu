@@ -1,6 +1,7 @@
 // GLM-5.3 routed block: route+plan, fc1, fc2, finish.
 #include <tessera/1/core>
 #include <tessera/1/trellis>
+#include "mx8.cuh"
 
 using tessera::u8; using tessera::u16; using tessera::u32; using tessera::u64;
 namespace prim = tessera::prim; namespace trellis = tessera::trellis;
@@ -512,8 +513,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
 
 struct alignas(16) Fc1Smem { u32 btab[2048], wtiles[2048]; };
 struct alignas(16) Fc2Smem { u32 btab[512], wtiles[2048]; };
-union alignas(16) Pf1Smem { struct { u32 btab_g[4096], btab_u[4096], wtiles[2048]; } k; float out[64][128]; };
-struct alignas(16) Pf2Smem { u32 btab[4096], wtiles[2048]; };
 
 static __device__ __forceinline__ u32 tok_at(uint4 t, u32 r) {
   u32 w = (r < 2u) ? t.x : (r < 4u) ? t.y : (r < 6u) ? t.z : t.w;
@@ -721,27 +720,6 @@ extern "C" __global__ __launch_bounds__(256, 4) void glm53_fc2(
       sm, m, c, ns, ns2, slot, chunks, ks1, min(rows, 8u), hidden, n, z_off0, z_off1);
 }
 
-// Transposes MMA accumulators via smem into per-warp row vectors.
-template <u32 NT>
-static __device__ __forceinline__ void transpose_acc(
-    const float acc[NT][4], float sm_out[64][128], float dst[NT][4], u32 n) {
-  u32 tid = threadIdx.x, j = tid >> 5u, lane = tid & 31u;
-  u32 col = (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
-  prim::block_sync();
-#pragma unroll
-  for (u32 ti = 0u; ti < NT; ti++) {
-    u32 lr = (ti << 3u) + rc;
-    if (lr < n) { sm_out[lr][col] = acc[ti][0]; sm_out[lr][col + 8u] = acc[ti][2]; }
-    if (lr + 1u < n) { sm_out[lr + 1u][col] = acc[ti][1]; sm_out[lr + 1u][col + 8u] = acc[ti][3]; }
-  }
-  prim::block_sync();
-#pragma unroll
-  for (u32 ti = 0u; ti < NT; ti++) {
-    u32 r = (ti << 3u) + j;
-    if (r < n) trellis::load4(&sm_out[r][lane << 2u], dst[ti]);
-  }
-}
-
 // Prefill fused single-pass-x gate, up, and SwiGLU into bfrag tiles.
 template <u32 K, u32 BOOK, u32 NT>
 static __device__ __forceinline__ void fc1_pf_body(
@@ -767,32 +745,35 @@ static __device__ __forceinline__ void fc1_pf_body(
     au[ti][0] = au[ti][1] = au[ti][2] = au[ti][3] = 0.f;
   }
   for (u32 c0 = 0u; c0 < nblk; c0++) {
-    if (j < n) {
-      u32 at = (c0 << 7u) + (lane << 2u);
-      float4 gsv4 = *(const float4*)(gsu + at), usv4 = *(const float4*)(usu + at);
-      float4 sg = signs ? *(const float4*)(signs + at) : make_float4(1.f, 1.f, 1.f, 1.f);
-      float scg[4] = {gsv4.x * sg.x, gsv4.y * sg.y, gsv4.z * sg.z, gsv4.w * sg.w};
-      float scu[4] = {usv4.x * sg.x, usv4.y * sg.y, usv4.z * sg.z, usv4.w * sg.w};
-      for (u32 r = j; r < n; r += 8u) {
+    u32 at = (c0 << 7u) + (lane << 2u);
+    float4 gsv4 = *(const float4*)(gsu + at), usv4 = *(const float4*)(usu + at);
+    float4 sg = signs ? *(const float4*)(signs + at) : make_float4(1.f, 1.f, 1.f, 1.f);
+    float scg[4] = {gsv4.x * sg.x, gsv4.y * sg.y, gsv4.z * sg.z, gsv4.w * sg.w};
+    float scu[4] = {usv4.x * sg.x, usv4.y * sg.y, usv4.z * sg.z, usv4.w * sg.w};
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+      u32 r = (ti << 3u) + j;
+      float vg[4] = {}, vu[4] = {};
+      if (r < n) {
         u32 tok = slot_tok_at(plan, is_sh, r0_sh, rs, r);
         float4 xv = *(const float4*)(x + (u64)tok * hidden + at);
-        float vg[4] = {xv.x * scg[0], xv.y * scg[1], xv.z * scg[2], xv.w * scg[3]};
-        float vu[4] = {xv.x * scu[0], xv.y * scu[1], xv.z * scu[2], xv.w * scu[3]};
+        vg[0] = xv.x * scg[0]; vg[1] = xv.y * scg[1]; vg[2] = xv.z * scg[2]; vg[3] = xv.w * scg[3];
+        vu[0] = xv.x * scu[0]; vu[1] = xv.y * scu[1]; vu[2] = xv.z * scu[2]; vu[3] = xv.w * scu[3];
         trellis::wht128(vg, trellis::INV_SQRT128);
         trellis::wht128(vu, trellis::INV_SQRT128);
-        trellis::store_bfrag(sm.k.btab_g + (r >> 3u) * 512u, r & 7u, lane, vg);
-        trellis::store_bfrag(sm.k.btab_u + (r >> 3u) * 512u, r & 7u, lane, vu);
       }
+      pf_store_bfrag(sm.k.btab_g, ti, j, lane, r < n, vg);
+      pf_store_bfrag(sm.k.btab_u, ti, j, lane, r < n, vu);
     }
     trellis::blk_store<K>(nw, tid, sm.k.wtiles);
     prim::block_sync();
     trellis::blk_load<K>(ubp, tid, ua, nw);
-    trellis::blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_g + (lane << 1u), NT > 1u ? 512u : 0u, j, lane, wm, ag);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_g, j, lane, wm, ag);
     prim::block_sync();
     trellis::blk_store<K>(nw, tid, sm.k.wtiles);
     prim::block_sync();
     if (c0 + 1u < nblk) { gbp += sGg; ubp += sGu; trellis::blk_load<K>(gbp, tid, ga, nw); }
-    trellis::blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_u + (lane << 1u), NT > 1u ? 512u : 0u, j, lane, wm, au);
+    pf_blk_mma<K, BOOK, NT>(sm.k.wtiles, sm.k.btab_u, j, lane, wm, au);
     if (c0 + 1u < nblk) prim::block_sync();
   }
   transpose_acc<NT>(ag, sm.out, ag, n);
@@ -814,12 +795,12 @@ static __device__ __forceinline__ void fc1_pf_body(
       a[3] = (g3 / (1.0f + __expf(-g3))) * (au[ti][3] * su.w) * sd.w;
       trellis::wht128(a, trellis::INV_SQRT128);
     }
-    trellis::store_bfrag(sm.k.btab_g + ti * 512u, j, lane, a);
+    pf_store_bfrag(sm.k.btab_g, ti, j, lane, true, a);
   }
   prim::block_sync();
   uint4* dst4 = reinterpret_cast<uint4*>(act_dst);
   const uint4* src4 = reinterpret_cast<const uint4*>(sm.k.btab_g);
-  for (u32 i = tid; i < NT * 128u; i += 256u) dst4[i] = src4[i];
+  for (u32 i = tid; i < NT * (MX8_TILE >> 2u); i += 256u) dst4[i] = src4[i];
 }
 
 template <u32 K, u32 BOOK>
@@ -888,11 +869,11 @@ static __device__ __forceinline__ void fc2_pf_body(
   for (u32 c = 0u; c < upto; c++) {
     if (c > 0u) prim::block_sync();
     const uint4* bsrc4 = reinterpret_cast<const uint4*>(act_slot + (u64)c * 4096u);
-    for (u32 i = tid; i < NT * 128u; i += 256u) bdst4[i] = bsrc4[i];
+    for (u32 i = tid; i < NT * (MX8_TILE >> 2u); i += 256u) bdst4[i] = bsrc4[i];
     trellis::blk_store<K>(nw, tid, sm.wtiles);
     prim::block_sync();
     if (c + 1u < upto) { gb += sG; trellis::blk_load<K>(gb, tid, aligned, nw); }
-    trellis::blk_mma<K, BOOK, NT>(sm.wtiles, sm.btab + (lane << 1u), 512u, j, lane, wm, acc);
+    pf_blk_mma<K, BOOK, NT>(sm.wtiles, sm.btab, j, lane, wm, acc);
   }
   u32 col = (ob << 7u) + (j << 4u) + (lane >> 2u), rc = (lane & 3u) << 1u;
 #pragma unroll

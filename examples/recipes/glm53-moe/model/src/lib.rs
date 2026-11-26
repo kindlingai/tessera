@@ -309,6 +309,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
 tessera_guest::exports! {
     rules: { NAME => Kind::Moe },
     kernels: { "moe.cu": [ROUTE, FC1, FC2, FC1_PF, FC2_PF, FINISH] },
+    files: ["mx8.cuh"],
     propose: offer,
 }
 

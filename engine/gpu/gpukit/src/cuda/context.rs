@@ -282,7 +282,9 @@ impl Api for Driver {
 
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {
         let (major, minor) = ctx.compute_capability();
-        let arch = format!("compute_{major}{minor}");
+        // Blackwell architecture-specific PTX (e.g., block-scaled MXFP8 MMA).
+        let suffix = if major >= 12 { "a" } else { "" };
+        let arch = format!("compute_{major}{minor}{suffix}");
         let gpu_arch = format!("--gpu-architecture={arch}");
         let base = [gpu_arch.as_str(), "--std=c++17", "--diag-suppress=177"];
         cache::current().load_or("cuda", &arch, "ptx", &base, source, |opts| {
