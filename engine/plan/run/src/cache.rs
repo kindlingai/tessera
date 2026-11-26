@@ -7,10 +7,10 @@ use tessera_graph::DimName;
 use tessera_lower::{Launch as Call, Plan};
 
 /// Most inactive plans kept ready for instant switching.
-pub(crate) const MAX_PLANS: usize = 32;
+pub(crate) const MAX_PLANS: usize = 64;
 
 /// Most `(plan, bound)` graph sets kept alive at once.
-pub(crate) const MAX_GRAPHS: usize = 32;
+pub(crate) const MAX_GRAPHS: usize = 64;
 
 /// Plan id and bound dims sharing one graph set.
 pub(crate) type GraphKey = (u64, Vec<(DimName, u32)>);

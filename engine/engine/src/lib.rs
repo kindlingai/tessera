@@ -299,6 +299,8 @@ pub(crate) fn row_bucket(n: usize) -> usize {
         n.max(1)
     } else if n <= 64 {
         n.div_ceil(8) * 8
+    } else if n <= tessera_device::FAST_MAX_ROWS {
+        n.div_ceil(64) * 64
     } else {
         n.next_power_of_two()
     }
