@@ -111,3 +111,11 @@ fn retrieve_model() {
     assert_eq!(missing["error"]["type"], "NotFoundError");
     assert_eq!(missing["error"]["param"], "model");
 }
+
+#[test]
+fn warm_rows_buckets() {
+    use crate::task::warm_rows;
+    assert_eq!(warm_rows(1, None), vec![1]);
+    assert_eq!(warm_rows(8, Some(4)), vec![1, 2, 4, 8]);
+    assert_eq!(warm_rows(6, Some(12)), vec![1, 2, 4, 6, 12]);
+}

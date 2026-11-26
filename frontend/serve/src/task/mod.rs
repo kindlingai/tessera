@@ -237,3 +237,6 @@ pub(crate) fn pick(options: &Options) -> Result<&'static Entry, String> {
         "{class} is not a --task {task} pipeline. This server runs: {runs}"
     ))
 }
+
+#[cfg(test)]
+pub(crate) use generate::warm_rows;

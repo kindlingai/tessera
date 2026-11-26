@@ -458,7 +458,12 @@ jobs:
     needs: [changes, commits, lint, linux, features, grammar, macos, arm64, similarity, platforms, docker, style]
     runs-on: ubuntu-slim
     steps:
+      # Full history without file contents, for merge bases. Test
+      # merges against ranked PRs fetch the contents they read.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
       # Skips come only from `changes`, so it must pass itself. A job
       # left without a hosted runner counts as skipped, so a runner
       # outage does not remove a merge queue entry.
@@ -489,3 +494,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha }}
         run: tools/scripts/protected-ran.sh
+      # Conflicts with PRs ranked by label: see tiers.yml. The label
+      # setters are in .github/tier-setters.txt. A merge group tests
+      # only the changes of the PR its head ref names.
+      - if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event_name == 'merge_group' && format('{0}^1', github.sha) || format('origin/{0}', github.base_ref) }}
+          MAIN: ${{ github.base_ref || github.event.merge_group.base_ref }}
+        run: tools/scripts/tier-gate.sh

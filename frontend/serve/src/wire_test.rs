@@ -203,3 +203,39 @@ fn caps_parallel_calls() {
     assert_eq!(s_status, 200);
     assert!(sse.contains(r#"\"one\""#) && !sse.contains(r#"\"two\""#));
 }
+
+#[test]
+fn openai_neutral_fields() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let ok = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "store": false,
+        "metadata": {},
+        "service_tier": "auto",
+        "prompt_cache_key": "session-1",
+        "safety_identifier": "acct-1",
+        "top_logprobs": null,
+        "modalities": ["text"],
+    });
+    assert_eq!(json(&slot, "/v1/chat/completions", Some(ok)).0, 200);
+    let default_tier = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "service_tier": "default",
+    });
+    assert_eq!(
+        json(&slot, "/v1/chat/completions", Some(default_tier)).0,
+        200
+    );
+    let bad = [
+        ("store", json!(true)),
+        ("metadata", json!({"k": "v"})),
+        ("service_tier", json!("priority")),
+        ("top_logprobs", json!(5)),
+        ("modalities", json!(["text", "audio"])),
+    ];
+    for (key, value) in bad {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], key: value});
+        let (status, error) = json(&slot, "/v1/chat/completions", Some(body));
+        assert_eq!((status, &error["error"]["param"]), (400, &json!(key)));
+    }
+}

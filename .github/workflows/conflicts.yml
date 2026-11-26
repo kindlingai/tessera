@@ -1,0 +1,39 @@
+name: Conflict notice
+
+# Each open, ready PR keeps one comment that lists the other open PRs
+# it conflicts with, and those that change the same files without a
+# conflict, see conflict-notice.sh. It never fails a check.
+# pull_request_target runs main's copy of this file and its scripts.
+# It only fetches PR commits as git objects and never runs PR code.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed]
+  push:
+    branches: [main]
+
+# pull-requests: write covers comments on pull requests.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Each run checks every pair. A run in progress finishes and writes
+# its notices. Then the newest waiting run starts, and GitHub drops
+# older waiting runs.
+concurrency:
+  group: conflict-notice
+  cancel-in-progress: false
+
+jobs:
+  notice:
+    runs-on: ubuntu-slim
+    steps:
+      # Full history without file contents, for merge bases. Test
+      # merges fetch the contents they read.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN: ${{ github.event.repository.default_branch }}
+        run: tools/scripts/conflict-notice.sh

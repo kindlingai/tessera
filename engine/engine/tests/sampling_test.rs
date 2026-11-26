@@ -360,6 +360,9 @@ fn prefill_report_fits_context() {
     let r = e.prefill_report(usize::MAX).unwrap();
     assert!(r.label.starts_with("prefill rows="), "{}", r.label);
     assert!(r.total_ops > 0);
+    e.warm(4, true).unwrap();
+    e.warm(1, false).unwrap();
+    e.warm(2, false).unwrap();
 }
 
 #[test]

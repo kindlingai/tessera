@@ -26,6 +26,8 @@ concurrency:
 env:
   MAIN: ${{ github.event.repository.default_branch }}
   TOOL: target/debug/tessera-rebase
+  # A dispatch names one pull request, so it skips the tier label check.
+  ANY_TIER: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   plan:
@@ -70,9 +72,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - run: git fetch -q origin "$HEAD"
+      - run: git fetch -q origin "refs/pull/$PR/head"
         env:
-          HEAD: ${{ matrix.pull.head }}
+          PR: ${{ matrix.pull.pr }}
       - run: cargo build -q -p tessera-rebase
       - env:
           HEAD: ${{ matrix.pull.head }}
@@ -120,6 +122,8 @@ jobs:
         with:
           client-id: ${{ secrets.REBASE_APP_ID }}
           private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+          # Limits the token to contents, the one permission the push needs.
+          permission-contents: write
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0

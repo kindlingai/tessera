@@ -63,15 +63,20 @@ pub(crate) fn now() -> u64 {
 /// Whether `value` changes nothing. `None`: an unknown field.
 fn neutral(key: &str, value: &Value) -> Option<bool> {
     let numbers: &[f64] = match key {
-        "user" => return Some(true),
+        "user" | "prompt_cache_key" | "safety_identifier" => return Some(true),
         "n" | "best_of" => &[1.0],
-        "logprobs" | "echo" => return Some(value.is_null() || *value == json!(false)),
+        "logprobs" | "echo" | "store" => return Some(value.is_null() || *value == json!(false)),
+        "metadata" => return Some(value.is_null() || *value == json!({})),
+        "service_tier" => {
+            return Some(value.is_null() || ["auto", "default"].map(Value::from).contains(value));
+        }
+        "modalities" => return Some(value.is_null() || *value == json!(["text"])),
         "tools" | "functions" => return Some(value.is_null() || *value == json!([])),
         "tool_choice" => {
             return Some(value.is_null() || ["none", "auto"].map(Value::from).contains(value));
         }
         "encoding_format" => return Some(value.is_null() || *value == json!("float")),
-        "dimensions" => return Some(value.is_null()),
+        "dimensions" | "top_logprobs" => return Some(value.is_null()),
         _ => return None,
     };
     Some(value.is_null() || value.as_f64().is_some_and(|v| numbers.contains(&v)))

@@ -96,46 +96,80 @@ pub(super) fn user_rules(settings: &Settings) -> Result<Vec<tessera_bundle::name
     }
 }
 
-/// Reports lowering on rank 0. A fallback refuses the boot.
+/// Distinct decode row buckets to warm at boot.
+pub(crate) fn warm_rows(slots: usize, extra_rows: Option<usize>) -> Vec<usize> {
+    let mut rows = vec![1];
+    let mut n = 2usize;
+    while n < slots {
+        rows.push(n);
+        n = n.saturating_mul(2);
+    }
+    if slots > 1 {
+        rows.push(slots);
+    }
+    if let Some(extra) = extra_rows.filter(|&r| r > 1)
+        && !rows.contains(&extra)
+    {
+        rows.push(extra);
+    }
+    rows
+}
+
+/// Reports lowering on rank 0 and warms plans.
 pub(super) fn check_lowering(
     o: &Options,
     engine: &mut Engine,
     extra_rows: Option<usize>,
 ) -> Result<(), String> {
-    if o.ranks.follows() {
-        return Ok(());
-    }
-    let mut fell = false;
-    match engine.lowering_report(1) {
-        Ok(report) => {
-            fell |= report.has_fallbacks();
-            if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
-                eprintln!("{text}");
-            }
-        }
-        Err(e) => eprintln!("warning: lowering report failed: {e}"),
-    }
-    if o.explain_lowering
-        && let Some(rows) = extra_rows
-        && rows > 1
-        && let Ok(report) = engine.lowering_report(rows)
-    {
-        eprintln!("{}", report.format(12));
-    }
-    // A prefill step off the fast path runs far slower.
+    let show = !o.ranks.follows();
     let chunk = engine.chunk(o.max_batch_rows);
-    match engine.prefill_report(chunk) {
-        Ok(_) if chunk == 1 => {}
-        Ok(report) => {
-            fell |= report.has_fallbacks();
-            if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
-                eprintln!("{text}");
+    if show {
+        let mut fell = false;
+        match engine.lowering_report(1) {
+            Ok(report) => {
+                fell |= report.has_fallbacks();
+                if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
+                    eprintln!("{text}");
+                }
             }
+            Err(e) => eprintln!("warning: lowering report failed: {e}"),
         }
-        Err(e) => eprintln!("warning: prefill lowering report failed: {e}"),
+        if o.explain_lowering
+            && let Some(rows) = extra_rows
+            && rows > 1
+            && let Ok(report) = engine.lowering_report(rows)
+        {
+            eprintln!("{}", report.format(12));
+        }
+        // A prefill step off the fast path runs far slower.
+        match engine.prefill_report(chunk) {
+            Ok(_) if chunk == 1 => {}
+            Ok(report) => {
+                fell |= report.has_fallbacks();
+                if let Some(text) = report.notice(o.explain_lowering, "--explain-lowering") {
+                    eprintln!("{text}");
+                }
+            }
+            Err(e) => eprintln!("warning: prefill lowering report failed: {e}"),
+        }
+        if fell && !o.allow_failed_lowering {
+            return Err(
+                "lowering fell off fast path - pass --allow-failed-lowering to boot".into(),
+            );
+        }
     }
-    if fell && !o.allow_failed_lowering {
-        return Err("lowering fell off fast path - pass --allow-failed-lowering to boot".into());
+    if chunk > 1
+        && let Err(e) = engine.warm(chunk, true)
+        && show
+    {
+        eprintln!("warning: prefill warm failed: {e}");
+    }
+    for rows in warm_rows(o.slots, extra_rows) {
+        if let Err(e) = engine.warm(rows, false)
+            && show
+        {
+            eprintln!("warning: decode warm ({rows}) failed: {e}");
+        }
     }
     Ok(())
 }

@@ -11,7 +11,7 @@ use tessera_graph::DimName::{
     Candidates, Context, EditWords, Picks, Rows, Segments, Seqs, VocabWords,
 };
 use tessera_graph::{EntryKind, Role};
-use tessera_lower::{COMMIT, Cache, Device, PEEK, Report, Slot, Wants};
+use tessera_lower::{COMMIT, Cache, Device, PEEK, Slot, Wants};
 use tessera_run::{Run, open};
 
 mod batch_dual;
@@ -344,7 +344,7 @@ pub(crate) fn row_bucket(n: usize) -> usize {
 }
 
 /// Sizes and padded counts for `rows` returning `picks`.
-fn launch_of(
+pub(crate) fn launch_of(
     rows: &[Row],
     picks: &[u32],
     slots: usize,
@@ -521,49 +521,6 @@ impl Engine {
         self.taps.ok_or(Error::Taps)
     }
 
-    /// Fast-path diagnostic report for a `rows`-row decode launch.
-    pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
-        let rows = rows.max(1);
-        let max_pos = self.context.saturating_sub(1);
-        let row = |i: usize| Row {
-            slot: (i % self.slots) as u32,
-            token: 0,
-            position: (i / self.slots).min(max_pos) as u32,
-        };
-        let sample: Vec<Row> = (0..rows).map(row).collect();
-        let picks: Vec<u32> = (0..rows as u32).collect();
-        self.explained(&sample, &picks)
-    }
-
-    /// The report for one prompt's prefill step of `rows`.
-    pub fn prefill_report(&mut self, rows: usize) -> Result<Report, Error> {
-        let rows = rows.clamp(1, self.context);
-        let row = |i: usize| Row {
-            slot: 0,
-            token: 0,
-            position: i as u32,
-        };
-        let sample: Vec<Row> = (0..rows).map(row).collect();
-        let mut report = self.explained(&sample, &[rows as u32 - 1])?;
-        report.label = format!("prefill {}", report.label);
-        Ok(report)
-    }
-
-    fn explained(&mut self, sample: &[Row], picks: &[u32]) -> Result<Report, Error> {
-        let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
-        let wants = match self.taps.is_some() {
-            true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
-            false => Wants::role(&self.graph, self.full, Role::Tokens),
-        };
-        let upto = &[Context, Segments];
-        let graph = ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
-        let mut report = self
-            .plans
-            .explain(graph, self.full, wants, &sizes, upto, &self.device)?;
-        report.label = format!("rows={filled}");
-        Ok(report)
-    }
-
     /// Mask words per pick, if the graph takes masks.
     pub fn words(&self) -> Option<usize> {
         self.words
@@ -680,7 +637,12 @@ impl Engine {
     }
 
     /// Steps in the plan for `rows`, `picks` and `wants`.
-    fn steps(&mut self, rows: &[Row], picks: &[u32], wants: Wants) -> Result<usize, Error> {
+    pub(crate) fn steps(
+        &mut self,
+        rows: &[Row],
+        picks: &[u32],
+        wants: Wants,
+    ) -> Result<usize, Error> {
         let (mut sizes, [filled, _]) = launch_of(rows, picks, self.slots, self.context);
         let upto = &[Context, Segments];
         let graph = ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);

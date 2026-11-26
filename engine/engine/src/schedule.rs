@@ -4,9 +4,12 @@ use crate::guide::{Edit, settle};
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
 use crate::sample::{Sampler, Target, Weights, accept, take};
-use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends};
+use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends, launch_of};
 use std::collections::VecDeque;
+use tessera_graph::DimName::{Context, Segments};
+use tessera_graph::Role;
 use tessera_kv::{DiskKv, DiskMsg};
+use tessera_lower::{Report, Wants};
 
 crate::metric_registry!(REQUESTS = "requests");
 crate::metric!(WAITING in REQUESTS = Gauge "tessera:requests_waiting", "Answers waiting for a slot.");
@@ -195,6 +198,90 @@ impl Engine {
     pub fn chunk(&self, asked: Option<usize>) -> usize {
         let rows = asked.unwrap_or(tessera_device::FAST_MAX_ROWS);
         rows.min(self.context).max(1)
+    }
+
+    fn sample_rows(&self, rows: usize, prefill: bool) -> (Vec<Row>, Vec<u32>) {
+        let rows = if prefill {
+            rows.clamp(1, self.context)
+        } else {
+            rows.max(1)
+        };
+        let max_pos = self.context.saturating_sub(1);
+        let sample = (0..rows)
+            .map(|i| Row {
+                slot: if prefill { 0 } else { (i % self.slots) as u32 },
+                token: 0,
+                position: if prefill {
+                    i
+                } else {
+                    (i / self.slots).min(max_pos)
+                } as u32,
+            })
+            .collect();
+        let picks = if prefill {
+            vec![rows as u32 - 1]
+        } else {
+            (0..rows as u32).collect()
+        };
+        (sample, picks)
+    }
+
+    fn wants_full(&self) -> Wants {
+        match self.taps.is_some() {
+            true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
+            false => Wants::role(&self.graph, self.full, Role::Tokens),
+        }
+    }
+
+    /// Fast-path diagnostic report for a `rows`-row decode launch.
+    pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
+        let (sample, picks) = self.sample_rows(rows, false);
+        self.explained(&sample, &picks)
+    }
+
+    /// The report for one prompt's prefill step of `rows`.
+    pub fn prefill_report(&mut self, rows: usize) -> Result<Report, Error> {
+        let (sample, picks) = self.sample_rows(rows, true);
+        let mut report = self.explained(&sample, &picks)?;
+        report.label = format!("prefill {}", report.label);
+        Ok(report)
+    }
+
+    fn explained(&mut self, sample: &[Row], picks: &[u32]) -> Result<Report, Error> {
+        let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
+        let wants = self.wants_full();
+        let upto = &[Context, Segments];
+        let graph = crate::ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let mut report = self
+            .plans
+            .explain(graph, self.full, wants, &sizes, upto, &self.device)?;
+        report.label = format!("rows={filled}");
+        Ok(report)
+    }
+
+    /// Lowers and compiles plans for `rows` rows.
+    pub fn warm(&mut self, rows: usize, prefill: bool) -> Result<(), Error> {
+        let (sample, picks) = self.sample_rows(rows, prefill);
+        let wants = self.wants_full();
+        self.replan_for(&sample, &picks, wants)?;
+        if prefill
+            && sample.len() > 1
+            && self.steps(&sample, &[], Wants::NONE)? <= self.steps(&sample, &picks, wants)?
+        {
+            self.replan_for(&sample, &[], Wants::NONE)?;
+        }
+        Ok(())
+    }
+
+    fn replan_for(&mut self, sample: &[Row], picks: &[u32], wants: Wants) -> Result<(), Error> {
+        let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
+        let upto = &[Context, Segments];
+        let graph = crate::ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let (plan, _) = self
+            .plans
+            .wanting(graph, self.full, wants, &sizes, upto, &self.device)?;
+        self.runner.replan(plan)?;
+        Ok(())
     }
 }
 
