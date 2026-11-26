@@ -51,17 +51,14 @@ static __device__ inline Mat matrix(bytes p) { return {p, word(p, 0), word(p, 4)
 static __device__ void route_256(
     const float* scores, const float* bias, u32 row, u32 rows, u32 rks, bool fused, u16* ids,
     float* gates) {
-  u32 lane = threadIdx.x & 31u;
-  u32 e0 = lane << 2u;
+  u32 lane = threadIdx.x & 31u, e0 = lane << 2u;
   float raw[8];
   if (fused) {
     u64 re = (u64)rows * 256ull;
-    float4 t0 = make_float4(0.f, 0.f, 0.f, 0.f);
-    float4 t1 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 t0 = make_float4(0.f, 0.f, 0.f, 0.f), t1 = t0;
     for (u32 sp = 0u; sp < rks; sp++) {
       const float* base = scores + (u64)sp * re + (u64)row * 256ull;
-      float4 v0 = prim::load_fresh4(base + e0);
-      float4 v1 = prim::load_fresh4(base + e0 + 128u);
+      float4 v0 = prim::load_fresh4(base + e0), v1 = prim::load_fresh4(base + e0 + 128u);
       t0.x += v0.x; t0.y += v0.y; t0.z += v0.z; t0.w += v0.w;
       t1.x += v1.x; t1.y += v1.y; t1.z += v1.z; t1.w += v1.w;
     }
@@ -76,36 +73,23 @@ static __device__ void route_256(
     raw[0] = v0.x; raw[1] = v0.y; raw[2] = v0.z; raw[3] = v0.w;
     raw[4] = v1.x; raw[5] = v1.y; raw[6] = v1.z; raw[7] = v1.w;
   }
-  float4 b0 = *reinterpret_cast<const float4*>(bias + e0);
-  float4 b1 = *reinterpret_cast<const float4*>(bias + e0 + 128u);
-  float biased[8] = {
-      raw[0] + b0.x, raw[1] + b0.y, raw[2] + b0.z, raw[3] + b0.w,
-      raw[4] + b1.x, raw[5] + b1.y, raw[6] + b1.z, raw[7] + b1.w,
-  };
+  float4 b0 = *reinterpret_cast<const float4*>(bias + e0), b1 = *reinterpret_cast<const float4*>(bias + e0 + 128u);
+  float biased[8] = {raw[0] + b0.x, raw[1] + b0.y, raw[2] + b0.z, raw[3] + b0.w,
+                     raw[4] + b1.x, raw[5] + b1.y, raw[6] + b1.z, raw[7] + b1.w};
   u32 taken = 0u;
   float sum = 0.0f;
   for (u32 p = 0u; p < PICKS; p++) {
-    u32 best = 256u;
-    float most = 0.0f;
-    float best_raw = 0.0f;
-#pragma unroll
+    u32 best = 256u; float most = 0.0f, best_raw = 0.0f;
     for (u32 i = 0u; i < 8u; i++) {
       u32 e = (i < 4u) ? (e0 + i) : (e0 + 124u + i);
-      if (!(taken & (1u << i)) && (best == 256u || biased[i] > most)) {
-        best = e; most = biased[i]; best_raw = raw[i];
-      }
+      if (!(taken & (1u << i)) && (best == 256u || biased[i] > most)) { best = e; most = biased[i]; best_raw = raw[i]; }
     }
-#pragma unroll
     for (u32 off = 16u; off > 0u; off >>= 1u) {
-      float v = __shfl_xor_sync(0xFFFFFFFFu, most, off);
+      float v = __shfl_xor_sync(0xFFFFFFFFu, most, off), r = __shfl_xor_sync(0xFFFFFFFFu, best_raw, off);
       u32 e = __shfl_xor_sync(0xFFFFFFFFu, best, off);
-      float r = __shfl_xor_sync(0xFFFFFFFFu, best_raw, off);
-      bool better = best == 256u || v > most || (v == most && e < best);
-      if (e < 256u && better) { best = e; most = v; best_raw = r; }
+      if (e < 256u && (best == 256u || v > most || (v == most && e < best))) { best = e; most = v; best_raw = r; }
     }
-    if (((best & 127u) >> 2u) == lane) {
-      taken |= 1u << (((best >> 7u) << 2u) | (best & 3u));
-    }
+    if (((best & 127u) >> 2u) == lane) taken |= 1u << (((best >> 7u) << 2u) | (best & 3u));
     if (lane == 0u) { ids[p] = (u16)best; gates[p] = best_raw; }
     sum += best_raw;
   }
@@ -149,7 +133,11 @@ static __device__ inline float4 weights4(const void* router, u64 at, u32 bf16) {
 struct PlanSmem { u16 ids[8][PICKS], slot_of[128]; float gates[8][PICKS]; u32 emask[ROW_WORDS][128], wsum[8], total; };
 struct RouteTcSmem { u32 sxh[4][16][36], sxl[4][16][36]; union { struct { u32 h[8][8][36], l[8][8][36]; } sw; float4 red[4][2][32]; } u; };
 struct RoutePfSmem { u32 sx[64][36], sw[64][36]; };
-union alignas(16) RouteSmem { float wsum[2][8][8]; RouteTcSmem tc; RoutePfSmem pf; PlanSmem plan; };
+union RouteBfSmem {
+  struct { u32 sxh[16][36], sxl[16][36], sw[128][36]; } k;
+  struct { float sc[16][256]; u16 ids[8][PICKS]; float gates[8][PICKS]; } p;
+};
+union alignas(16) RouteSmem { float wsum[2][8][8]; RouteTcSmem tc; RoutePfSmem pf; RouteBfSmem bf; PlanSmem plan; };
 
 static __device__ inline void split_f32x4(float4 v, uint2& hi, uint2& lo) {
   hi.x = f32x2_to_bf16x2(v.x, v.y); hi.y = f32x2_to_bf16x2(v.z, v.w);
@@ -211,23 +199,71 @@ static __device__ inline void load_w_tf32(
   w1 = make_uint4(f32_to_tf32(v1.x), f32_to_tf32(v1.y), f32_to_tf32(v1.z), f32_to_tf32(v1.w));
 }
 
-// TF32 Tensor-Core prefill router projection, RMx(64 or 256) per CTA.
-template <u32 RM, bool WIDE>
-static __device__ __noinline__ void route_pf(
-    const float* x, const void* router, const float* bias, float* scores, float* plan_out,
-    RouteSmem& sm_all, u32 rows, u32 hidden, u32 experts, u32 bf16, u32 picks, u32 first, u32 count) {
-  RoutePfSmem& sm = sm_all.pf;
-  constexpr u32 MT = RM / 32u, QB = WIDE ? 4u : 1u;
+// Fused 16x256 BF16 Tensor-Core router with in-smem parallel top-8.
+static __device__ __noinline__ void route_pf_bf16(
+    const float* x, const u16* router, const float* bias, float* plan_out,
+    RouteBfSmem& sm, u32 rows, u32 hidden, u32 picks, u32 first, u32 count) {
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
-  u32 wr = warp >> 2u, wn = warp & 3u, r0 = blockIdx.y * RM, n_base = WIDE ? 0u : (blockIdx.x << 6u);
-  u32 qb_cnt = WIDE ? (experts >> 6u) : 1u;
+  u32 r0 = blockIdx.y << 4u, xr = tid >> 4u, xc = (tid & 15u) << 2u, xw = (tid & 15u) << 1u;
+  u32 wr = (warp << 2u) + (lane >> 3u), wc = (lane & 7u) << 3u;
+  bool aligned = (reinterpret_cast<u64>(router) & 15ull) == 0ull;
+  float acc[4][4] = {};
+  uint4 nw[4];
+  for (u32 i = 0u; i < 4u; i++) nw[i] = load_bf16x8(router + (u64)(wr + (i << 5u)) * hidden + wc, aligned);
+  for (u32 k0 = 0u; k0 < hidden; k0 += 64u) {
+    stage_x_bf16(x, r0 + xr, rows, hidden, k0 + xc, &sm.k.sxh[xr][xw], &sm.k.sxl[xr][xw]);
+    for (u32 h = 0u; h < 2u; h++) {
+      for (u32 i = 0u; i < 4u; i++) *reinterpret_cast<uint4*>(&sm.k.sw[wr + (i << 5u)][wc >> 1u]) = nw[i];
+      prim::block_sync();
+      u32 nh = h ^ 1u, nk0 = h ? (k0 + 64u) : k0;
+      if (nk0 < hidden) for (u32 i = 0u; i < 4u; i++) nw[i] = load_bf16x8(router + (u64)((nh << 7u) + wr + (i << 5u)) * hidden + nk0 + wc, aligned);
+#pragma unroll
+      for (u32 ks = 0u; ks < 4u; ks++) {
+        u32 o = (ks << 3u) + t, e0 = (warp << 4u) + g;
+        u32 ah[4] = {sm.k.sxh[g][o], sm.k.sxh[g + 8u][o], sm.k.sxh[g][o + 4u], sm.k.sxh[g + 8u][o + 4u]};
+        u32 al[4] = {sm.k.sxl[g][o], sm.k.sxl[g + 8u][o], sm.k.sxl[g][o + 4u], sm.k.sxl[g + 8u][o + 4u]};
+        u32 b0[2] = {sm.k.sw[e0][o], sm.k.sw[e0][o + 4u]}, b1[2] = {sm.k.sw[e0 + 8u][o], sm.k.sw[e0 + 8u][o + 4u]};
+        mma_bf16_m16n8k16(acc[h * 2u], ah, b0); mma_bf16_m16n8k16(acc[h * 2u], al, b0);
+        mma_bf16_m16n8k16(acc[h * 2u + 1u], ah, b1); mma_bf16_m16n8k16(acc[h * 2u + 1u], al, b1);
+      }
+      prim::block_sync();
+    }
+  }
+  for (u32 h = 0u; h < 2u; h++) for (u32 nt = 0u; nt < 2u; nt++) {
+    u32 col = (h << 7u) + (warp << 4u) + (nt << 3u) + (t << 1u);
+    float* a = acc[h * 2u + nt];
+    *reinterpret_cast<float2*>(&sm.p.sc[g][col]) = make_float2(1.f / (1.f + __expf(-a[0])), 1.f / (1.f + __expf(-a[1])));
+    *reinterpret_cast<float2*>(&sm.p.sc[g + 8u][col]) = make_float2(1.f / (1.f + __expf(-a[2])), 1.f / (1.f + __expf(-a[3])));
+  }
+  prim::block_sync();
+  Plan* plan = reinterpret_cast<Plan*>(plan_out);
+  for (u32 dr = warp; dr < 16u && r0 + dr < rows; dr += 8u) {
+    route_256(&sm.p.sc[0][0], bias, dr, 16u, 0u, false, sm.p.ids[warp], sm.p.gates[warp]);
+    if (lane < picks) {
+      u32 e = sm.p.ids[warp][lane];
+      plan->tok_expert[r0 + dr][lane] = (e >= first && e < first + count) ? e : 0xFFFFFFFFu;
+      plan->tok_w[r0 + dr][lane] = sm.p.gates[warp][lane];
+    }
+    __syncwarp();
+  }
+}
+
+// TF32 Tensor-Core prefill router projection, RMx64 per CTA.
+template <u32 RM>
+static __device__ __noinline__ void route_pf(
+    const float* x, const void* router, float* scores, RoutePfSmem& sm,
+    u32 rows, u32 hidden, u32 experts, u32 bf16, u32 nb, u32 rks) {
+  constexpr u32 MT = RM / 32u;
+  u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
+  u32 wr = warp >> 2u, wn = warp & 3u, r0 = blockIdx.y * RM;
+  u32 ob = blockIdx.x % nb, sp = blockIdx.x / nb, n_base = ob << 6u;
+  u32 ch_per = (hidden >> 5u) / rks, k_start = (sp * ch_per) << 5u, k_end = k_start + (ch_per << 5u);
   u32 xr = tid >> 3u, xc = (tid & 7u) << 2u, wl = tid >> 2u, wc = (tid & 3u) << 3u;
   bool aligned = (reinterpret_cast<u64>(router) & 15ull) == 0ull;
-  float acc[QB][MT][2][4] = {};
+  float acc[MT][2][4] = {};
   uint4 w0, w1;
-  load_w_tf32(router, (u64)(n_base + wl) * hidden + wc, bf16, aligned, w0, w1);
-  for (u32 k0 = 0u; k0 < hidden; k0 += 32u) {
-#pragma unroll
+  load_w_tf32(router, (u64)(n_base + wl) * hidden + k_start + wc, bf16, aligned, w0, w1);
+  for (u32 k0 = k_start; k0 < k_end; k0 += 32u) {
     for (u32 dr = 0u; dr < RM; dr += 32u) {
       uint4 xv = make_uint4(0u, 0u, 0u, 0u);
       if (r0 + xr + dr < rows) {
@@ -238,54 +274,34 @@ static __device__ __noinline__ void route_pf(
       }
       *reinterpret_cast<uint4*>(&sm.sx[xr + dr][xc]) = xv;
     }
-    for (u32 qb = 0u; qb < qb_cnt; qb++) {
-      *reinterpret_cast<uint4*>(&sm.sw[wl][wc]) = w0;
-      *reinterpret_cast<uint4*>(&sm.sw[wl][wc + 4u]) = w1;
-      prim::block_sync();
-      u32 nqb = qb + 1u < qb_cnt ? qb + 1u : 0u;
-      u32 nk0 = qb + 1u < qb_cnt ? k0 : k0 + 32u;
-      if (nk0 < hidden) load_w_tf32(router, (u64)(n_base + (nqb << 6u) + wl) * hidden + nk0 + wc, bf16, aligned, w0, w1);
+    *reinterpret_cast<uint4*>(&sm.sw[wl][wc]) = w0;
+    *reinterpret_cast<uint4*>(&sm.sw[wl][wc + 4u]) = w1;
+    prim::block_sync();
+    if (k0 + 32u < k_end) load_w_tf32(router, (u64)(n_base + wl) * hidden + k0 + 32u + wc, bf16, aligned, w0, w1);
 #pragma unroll
-      for (u32 ks = 0u; ks < 4u; ks++) {
-        u32 o = (ks << 3u) + t, e0 = (wn << 4u) + g;
-        u32 b0[2] = {sm.sw[e0][o], sm.sw[e0][o + 4u]}, b1[2] = {sm.sw[e0 + 8u][o], sm.sw[e0 + 8u][o + 4u]};
-#pragma unroll
-        for (u32 mt = 0u; mt < MT; mt++) {
-          u32 rr = (wr * MT + mt) * 16u + g;
-          u32 a[4] = {sm.sx[rr][o], sm.sx[rr + 8u][o], sm.sx[rr][o + 4u], sm.sx[rr + 8u][o + 4u]};
-          mma_tf32_m16n8k8(acc[qb][mt][0], a, b0); mma_tf32_m16n8k8(acc[qb][mt][1], a, b1);
-        }
-      }
-      prim::block_sync();
-    }
-  }
-  for (u32 qb = 0u; qb < qb_cnt; qb++) {
-#pragma unroll
-    for (u32 mt = 0u; mt < MT; mt++) {
-      u32 rr = r0 + (wr * MT + mt) * 16u + g;
-#pragma unroll
-      for (u32 nt = 0u; nt < 2u; nt++) {
-        u32 col = n_base + (qb << 6u) + (wn << 4u) + (nt << 3u) + (t << 1u);
-        if (rr < rows) *reinterpret_cast<float2*>(scores + (u64)rr * experts + col) =
-            make_float2(1.0f / (1.0f + __expf(-acc[qb][mt][nt][0])), 1.0f / (1.0f + __expf(-acc[qb][mt][nt][1])));
-        if (rr + 8u < rows) *reinterpret_cast<float2*>(scores + (u64)(rr + 8u) * experts + col) =
-            make_float2(1.0f / (1.0f + __expf(-acc[qb][mt][nt][2])), 1.0f / (1.0f + __expf(-acc[qb][mt][nt][3])));
+    for (u32 ks = 0u; ks < 4u; ks++) {
+      u32 o = (ks << 3u) + t, e0 = (wn << 4u) + g;
+      u32 b0[2] = {sm.sw[e0][o], sm.sw[e0][o + 4u]}, b1[2] = {sm.sw[e0 + 8u][o], sm.sw[e0 + 8u][o + 4u]};
+      for (u32 mt = 0u; mt < MT; mt++) {
+        u32 rr = (wr * MT + mt) * 16u + g;
+        u32 a[4] = {sm.sx[rr][o], sm.sx[rr + 8u][o], sm.sx[rr][o + 4u], sm.sx[rr + 8u][o + 4u]};
+        mma_tf32_m16n8k8(acc[mt][0], a, b0); mma_tf32_m16n8k8(acc[mt][1], a, b1);
       }
     }
+    prim::block_sync();
   }
-  if constexpr (WIDE) {
-    if (experts == 256u && picks == PICKS) {
-      prim::block_sync();
-      Plan* plan = reinterpret_cast<Plan*>(plan_out);
-      for (u32 dr = warp; dr < RM && r0 + dr < rows; dr += 8u) {
-        route_256(scores, bias, r0 + dr, rows, 0u, false, sm_all.plan.ids[warp], sm_all.plan.gates[warp]);
-        if (lane < picks) {
-          u32 e = sm_all.plan.ids[warp][lane];
-          plan->tok_expert[r0 + dr][lane] = (e >= first && e < first + count) ? e : 0xFFFFFFFFu;
-          plan->tok_w[r0 + dr][lane] = sm_all.plan.gates[warp][lane];
-        }
-        __syncwarp();
+  float* dst = scores + (u64)sp * rows * experts;
+  for (u32 mt = 0u; mt < MT; mt++) {
+    u32 rr = r0 + (wr * MT + mt) * 16u + g;
+    for (u32 nt = 0u; nt < 2u; nt++) {
+      u32 col = n_base + (wn << 4u) + (nt << 3u) + (t << 1u);
+      float v0 = acc[mt][nt][0], v1 = acc[mt][nt][1], v2 = acc[mt][nt][2], v3 = acc[mt][nt][3];
+      if (rks == 1u) {
+        v0 = 1.f / (1.f + __expf(-v0)); v1 = 1.f / (1.f + __expf(-v1));
+        v2 = 1.f / (1.f + __expf(-v2)); v3 = 1.f / (1.f + __expf(-v3));
       }
+      if (rr < rows) *reinterpret_cast<float2*>(dst + (u64)rr * experts + col) = make_float2(v0, v1);
+      if (rr + 8u < rows) *reinterpret_cast<float2*>(dst + (u64)(rr + 8u) * experts + col) = make_float2(v2, v3);
     }
   }
 }
@@ -369,29 +385,25 @@ static __device__ __noinline__ void route_plan(
     prim::block_sync();
     if (le < chunk_n) for (u32 w = 0u; w < rw; w++) cnt += __popc(sm.emask[w][le]);
     u32 ns = (cnt + cap - 1u) >> cap_sh, incl = ns;
-#pragma unroll
     for (u32 d = 1u; d < 32u; d <<= 1u) { u32 v = __shfl_up_sync(0xFFFFFFFFu, incl, d); if (lane >= d) incl += v; }
     if (lane == 31u) sm.wsum[warp] = incl;
     prim::block_sync();
     u32 chunk_base = sm.total;
     if (warp == 0u) {
       u32 wv = lane < 8u ? sm.wsum[lane] : 0u, wi = wv;
-#pragma unroll
       for (u32 d = 1u; d < 8u; d <<= 1u) { u32 v = __shfl_up_sync(0xFFFFFFFFu, wi, d); if (lane >= d) wi += v; }
       if (lane < 8u) sm.wsum[lane] = wi - wv;
       if (lane == 7u) sm.total = chunk_base + wi;
     }
     prim::block_sync();
     if (ns > 0u) {
-      u32 s0 = chunk_base + sm.wsum[warp] + (incl - ns);
+      u32 s0 = chunk_base + sm.wsum[warp] + (incl - ns), sub = 0u, take = 0u, w = 0u, bits = sm.emask[0][le], pair = 0u;
       sm.slot_of[le] = (u16)s0;
-      u32 sub = 0u, take = 0u, w = 0u, bits = sm.emask[0][le], pair = 0u;
       while (w < rw) {
         if (bits == 0u) { if (++w < rw) bits = sm.emask[w][le]; continue; }
         u32 r = (w << 5u) + (u32)(__ffs((int)bits) - 1);
         bits &= bits - 1u;
-        if ((take & 1u) == 0u) pair = r;
-        else plan->slot_tok[s0 + sub][take >> 1u] = pair | (r << 16u);
+        if ((take & 1u) == 0u) pair = r; else plan->slot_tok[s0 + sub][take >> 1u] = pair | (r << 16u);
         if (++take == cap) { plan->slot_expert[s0 + sub] = first + base + le; plan->slot_count[s0 + sub] = cap; sub++; take = 0u; }
       }
       if (take > 0u) {
@@ -424,15 +436,15 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
   float* scores = plan_out + SCORES_OFF;
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
   bool use_gemv = rows == 1u && bf16 && (experts & 1u) == 0u && (hidden & 7u) == 0u;
-  bool use_pf_w = rows >= 2048u && experts <= 256u && (experts & 63u) == 0u && (hidden & 31u) == 0u;
-  bool use_pf = !use_pf_w && rows >= 64u && (experts & 63u) == 0u && (hidden & 31u) == 0u;
-  bool use_tc = !use_pf_w && !use_pf && rows > 1u && (experts & 15u) == 0u && (hidden & 255u) == 0u;
-  u32 nb = experts >> 4u;
-  u32 rks = use_tc ? (gridDim.x / nb) : 1u;
+  bool use_pf_bf = rows >= 64u && bf16 && experts == 256u && picks == PICKS && (hidden & 63u) == 0u;
+  bool use_pf = !use_pf_bf && rows >= 64u && (experts & 63u) == 0u && (hidden & 31u) == 0u;
+  bool use_tc = !use_pf_bf && !use_pf && rows > 1u && (experts & 15u) == 0u && (hidden & 255u) == 0u;
+  u32 nb = use_pf ? (experts >> 6u) : (experts >> 4u);
+  u32 rks = (use_tc || use_pf) ? (gridDim.x / nb) : 1u;
   if (use_gemv) route_gemv(x, reinterpret_cast<const u16*>(router), scores, sm.wsum, hidden, experts);
-  else if (use_pf_w) route_pf<64u, true>(x, router, bias, scores, plan_out, sm, rows, hidden, experts, bf16, picks, first, count);
-  else if (use_pf && rows >= 512u) route_pf<64u, false>(x, router, bias, scores, plan_out, sm, rows, hidden, experts, bf16, picks, first, count);
-  else if (use_pf) route_pf<32u, false>(x, router, bias, scores, plan_out, sm, rows, hidden, experts, bf16, picks, first, count);
+  else if (use_pf_bf) route_pf_bf16(x, reinterpret_cast<const u16*>(router), bias, plan_out, sm.bf, rows, hidden, picks, first, count);
+  else if (use_pf && rows >= 512u) route_pf<64u>(x, router, scores, sm.pf, rows, hidden, experts, bf16, nb, rks);
+  else if (use_pf) route_pf<32u>(x, router, scores, sm.pf, rows, hidden, experts, bf16, nb, rks);
   else if (use_tc) route_tc(x, router, scores, sm.tc, rows, hidden, experts, bf16, nb, rks);
   else if (blockIdx.x * 2u < experts) {
     u32 e0 = blockIdx.x * 2u;
@@ -478,8 +490,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
   }
   prim::block_sync();
   if (!is_last) return;
-  bool fused = use_tc && rks > 1u && experts == 256u && picks == PICKS;
-  if (use_tc && rks > 1u && !fused) {
+  bool split_k = (use_tc || use_pf) && rks > 1u;
+  bool fused = split_k && experts == 256u && picks == PICKS;
+  if (split_k && !fused) {
     u64 re = (u64)rows * experts;
     for (u64 idx = tid * 4ull; idx < re; idx += 1024ull) {
       float4 tot = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -494,7 +507,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_route(
     prim::block_sync();
   }
   route_plan(scores, bias, plan_out, sm.plan, rows, experts, picks, first, count, rks, fused,
-             use_pf_w && experts == 256u && picks == PICKS, rows > 32u ? 64u : 8u);
+             use_pf_bf, rows > 32u ? 64u : 8u);
 }
 
 struct alignas(16) Fc1Smem { u32 btab[2048], wtiles[2048]; };
@@ -848,7 +861,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void glm53_fc1_pf(
   if (is_sh) { n = min(rows - r0_sh, 64u); m = 0u; gb = sh_gate; gsu = sh_gate_su; gsv = sh_gate_sv; ub = sh_up; usu = sh_up_su; usv = sh_up_sv; dsu = sh_down_su; signs = 0; k = shared_k; book = shared_book; }
   else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; m = e - first; gb = gate; gsu = gate_su + (u64)e * hidden; gsv = gate_sv + (u64)e * ffn; ub = up; usu = up_su + (u64)e * hidden; usv = up_sv + (u64)e * ffn; dsu = down_su + (u64)e * ffn; signs = signs_in; if (c == 0u && threadIdx.x == 0u) { trellis::note_hit(gb, m); trellis::note_hit(ub, m); } }
   u32* act_dst = reinterpret_cast<u32*>(act_out) + ((u64)slot * chunks + c) * 4096u;
-  if (book && k == 3u) fc1_pf_hot<3u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  if (book && k == 2u) fc1_pf_hot<2u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
+  else if (book && k == 3u) fc1_pf_hot<3u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
   else if (book && k == 4u) fc1_pf_hot<4u, trellis::BOOK_MUL1>(x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
   else DISPATCH_KB(fc1_pf_cold, fc1_pf_cold, k, book, x, plan, signs, gsu, gb, gsv, usu, ub, usv, dsu, act_dst, sm, is_sh, r0_sh, rs, m, c, hidden, n);
 }
@@ -928,7 +942,8 @@ extern "C" __global__ __launch_bounds__(256, 3) void glm53_fc2_pf(
   else { u32 e = plan->slot_expert[rs]; n = plan->slot_count[rs]; m = e - first; upto = chunks; dbytes = down; if (ob == 0u && threadIdx.x == 0u) trellis::note_hit(dbytes, m); }
   const u32* act_slot = reinterpret_cast<const u32*>(act_in) + (u64)slot * chunks * 4096u;
   u16* z = reinterpret_cast<u16*>(z_out);
-  if (book && k == 3u) fc2_pf_hot<3u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
+  if (book && k == 2u) fc2_pf_hot<2u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
+  else if (book && k == 3u) fc2_pf_hot<3u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
   else if (book && k == 4u) fc2_pf_hot<4u, trellis::BOOK_MUL1>(plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
   else DISPATCH_KB(fc2_pf_cold, fc2_pf_cold, k, book, plan, act_slot, dbytes, z, sm, is_sh, r0_sh, rs, m, ob, upto, hidden, picks, n);
 }

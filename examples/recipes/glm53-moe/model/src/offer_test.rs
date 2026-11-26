@@ -86,7 +86,16 @@ fn offer_row_bounds() {
         for experts in [256, 32] {
             let got = offer(&site(rows, experts, 512, 256)).expect("must accept");
             assert_eq!(got.len(), 4);
-            let rks = if rows > 1 && !(rows >= 64 && experts % 64 == 0) {
+            let rks = if rows >= 64 && experts == 256 {
+                1
+            } else if rows >= 64 && experts % 64 == 0 {
+                let rm = if rows >= 512 { 64 } else { 32 };
+                let nb = experts / 64;
+                split_dim(
+                    512 / 32,
+                    192usize.div_ceil(nb * rows.div_ceil(rm)).clamp(1, 8),
+                )
+            } else if rows > 1 {
                 let nb = experts / 16;
                 let rm = rows.div_ceil(16);
                 split_dim(512 / 256, 128usize.div_ceil(nb * rm).max(1))

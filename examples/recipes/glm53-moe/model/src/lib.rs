@@ -183,11 +183,14 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let max_col = rows.min(8);
     let (route_x, route_y, rks) = if rows == 1 && bf16 == 1 && experts % 2 == 0 && hidden % 8 == 0 {
         (experts / 2, 1, 1)
-    } else if rows >= 2048 && experts <= 256 && experts % 64 == 0 && hidden % 32 == 0 {
-        (1, rows.div_ceil(64), 1)
+    } else if rows >= 64 && bf16 == 1 && experts == 256 && hidden % 64 == 0 {
+        (1, rows.div_ceil(16), 1)
     } else if rows >= 64 && experts % 64 == 0 && hidden % 32 == 0 {
         let rm = if rows >= 512 { 64 } else { 32 };
-        (experts / 64, rows.div_ceil(rm), 1)
+        let nb = experts / 64;
+        let rtiles = rows.div_ceil(rm);
+        let rks = split_dim(hidden / 32, 192usize.div_ceil(nb * rtiles).clamp(1, 8));
+        (nb * rks, rtiles, rks)
     } else if rows > 1 && experts % 16 == 0 && hidden % 256 == 0 {
         let nb = experts / 16;
         let rtiles = rows.div_ceil(16);
