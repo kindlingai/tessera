@@ -31,15 +31,18 @@ jobs:
   # In a merge group the tier gate runs before the build jobs, so a
   # group that conflicts with a ranked PR fails at once. A pull request
   # runs the gate in success, so its builds do not wait.
+  # The job runs on every event and skips its steps instead. A skipped
+  # job here would skip every job that needs `changes`.
   tiers:
-    if: github.event_name == 'merge_group'
     runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v4
+      - if: github.event_name == 'merge_group'
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           filter: blob:none
-      - uses: ./.github/actions/tier-gate
+      - if: github.event_name == 'merge_group'
+        uses: ./.github/actions/tier-gate
 
   changes:
     # Whether anything changed outside Markdown, lint code, maps and lint.toml.
