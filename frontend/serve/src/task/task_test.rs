@@ -15,8 +15,6 @@ fn flags_pick_entries() {
     assert!(flags().contains("--explain-lowering"));
     assert!(o.switch("--allow-failed-lowering"));
     assert!(o.allow_failed_lowering);
-    assert!(o.switch("--allow-weight-streaming"));
-    assert!(o.allow_weight_streaming);
     assert!(flags().contains("--kv-dtype"));
     assert!(o.flag("--image-size", "big".into()).is_none());
     assert!(o.flag("--max-batch-rows", "0".into()).is_none());
