@@ -12,26 +12,25 @@ const HERE: &str = "https://tiers.test";
 /// #3 was labelled first. An agent labelled #4.
 const PULLS: &str = r#"{"data":{"repository":{"pullRequests":{
 "pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-{"number":2,"title":"<script>alert(1)</script>","isDraft":true,
+{"number":2,"title":"<script>alert(1)</script>","isDraft":true,"mergeable":"MERGEABLE",
  "author":{"login":"ann","__typename":"User"},
  "labels":{"nodes":[{"name":"priority"},{"name":"needs-human-review"}]},
  "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]},
  "timelineItems":{"nodes":[{"createdAt":"2026-11-02T00:00:00Z",
   "label":{"name":"priority"},"actor":{"login":"tiers","__typename":"Bot"}}]},
  "comments":{"nodes":[{"author":{"login":"github-actions","__typename":"Bot"},
-  "body":"<!-- conflict-notice -->\n### Overlap with other open pull requests\nThese open PRs conflict with this PR in the files listed.\nThe PR that merges second must rebase.\n\n- #3: `a/<b>.rs`\n\nThese open PRs change the same files as this PR, with no conflict.\n\n- #4: `c.rs` `d.rs`\n\nThis notice fails no check.\n"}]}},
-{"number":3,"title":"first","isDraft":false,"author":null,
+  "body":"<!-- conflict-notice -->\n### Overlap with other open pull requests\nA conflict line names files that conflict with that PR.\nThe PR that merges second must rebase. A shared line names\nfiles both PRs change that merge cleanly. This notice fails no check.\n\n- conflict #3: `a/<b>.rs`\n- shared #4: `c.rs` `d.rs`\n"}]}},
+{"number":3,"title":"first","isDraft":false,"mergeable":"MERGEABLE","author":null,
  "labels":{"nodes":[{"name":"priority"}]},"commits":{"nodes":[]},
  "timelineItems":{"nodes":[{"createdAt":"2026-11-01T00:00:00Z",
   "label":{"name":"priority"},"actor":{"login":"tiers","__typename":"Bot"}}]},
  "comments":{"nodes":[{"author":{"login":"ann","__typename":"User"},
-  "body":"<!-- conflict-notice -->\nThese open PRs conflict with this PR\n\n- #9: `forged.rs`"}]}},
-{"number":4,"title":"agent","isDraft":false,"author":null,
+  "body":"<!-- conflict-notice -->\n- conflict #9: `forged.rs`"}]}},
+{"number":4,"title":"agent","isDraft":false,"mergeable":"CONFLICTING","author":null,
  "labels":{"nodes":[{"name":"landing"}]},"commits":{"nodes":[]},
  "timelineItems":{"nodes":[{"createdAt":"2026-11-03T00:00:00Z",
   "label":{"name":"landing"},"actor":{"login":"mmastrac","__typename":"User"}}]},
- "comments":{"nodes":[{"author":{"login":"github-actions","__typename":"Bot"},
-  "body":"<!-- conflict-notice -->\n### Overlap with other open pull requests\nNone found.\n"}]}}]}}}}"#;
+ "comments":{"nodes":[]}}]}}}}"#;
 
 /// Records each call as `METHOD path authorization body`.
 #[derive(Default)]
@@ -174,7 +173,7 @@ fn board_escapes_text() {
     assert!(page.contains("conflicts with #3: a/&lt;b&gt;.rs"));
     assert!(page.contains("shares files with #4: c.rs, d.rs"));
     assert!(page.contains("label set by mmastrac") && !page.contains("forged.rs"));
-    assert!(page.contains("no overlap report") && page.contains("no overlaps"));
+    assert!(page.contains("no overlaps") && page.contains("overlaps not checked"));
     assert!(page.find("#3 first").unwrap() < page.find("#2 ").unwrap());
 }
 

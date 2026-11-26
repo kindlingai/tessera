@@ -18,7 +18,7 @@ const QUERY: &str = "query($owner:String!,$name:String!,$after:String){\
 repository(owner:$owner,name:$name){\
 pullRequests(states:OPEN,first:50,after:$after){\
 pageInfo{hasNextPage endCursor}\
-nodes{number title isDraft author{login __typename}\
+nodes{number title isDraft mergeable author{login __typename}\
 labels(first:100){nodes{name}}\
 commits(last:1){nodes{commit{statusCheckRollup{state}}}}\
 timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{\
@@ -85,6 +85,7 @@ struct Node {
     number: u64,
     title: String,
     is_draft: bool,
+    mergeable: String,
     author: Option<Actor>,
     labels: Nodes<Named>,
     commits: Nodes<Tip>,
@@ -125,7 +126,8 @@ fn pull(node: Node, slug: &str) -> Pull {
         since: String::new(),
         setter: String::new(),
         trusted: tier == Tier::Untagged,
-        overlaps: None,
+        stuck: node.mergeable == "CONFLICTING",
+        overlaps: Vec::new(),
     };
     for tip in node.commits.nodes {
         pull.ci = tip
@@ -143,7 +145,7 @@ fn pull(node: Node, slug: &str) -> Pull {
     for comment in node.comments.nodes {
         let ours = comment.author.is_some_and(|a| a.is_app(overlap::AUTHOR));
         if ours && comment.body.starts_with(overlap::MARKER) {
-            pull.overlaps = Some(overlap::read(&comment.body));
+            pull.overlaps = overlap::read(&comment.body);
         }
     }
     pull

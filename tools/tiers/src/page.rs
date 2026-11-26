@@ -39,6 +39,9 @@ fn tags(pull: &Pull) -> El {
     if pull.draft {
         tags = tags.kid(tag("draft", false));
     }
+    if pull.stuck {
+        tags = tags.kid(tag("conflicts with main", true));
+    }
     if pull.waits {
         tags = tags.kid(tag("waits on a human", false));
     }
@@ -51,8 +54,7 @@ fn tags(pull: &Pull) -> El {
 
 fn overlaps(pull: &Pull) -> El {
     let mut list = el("ul");
-    let found = pull.overlaps.as_deref();
-    for overlap in found.unwrap_or_default() {
+    for overlap in &pull.overlaps {
         let verb = match overlap.kind {
             Kind::Conflict => "conflicts with",
             Kind::Shared => "shares files with",
@@ -66,11 +68,16 @@ fn overlaps(pull: &Pull) -> El {
         };
         list = list.kid(text("li", line).attr("class", class));
     }
-    match found {
-        None => list.kid(text("li", "no overlap report")),
-        Some([]) => list.kid(text("li", "no overlaps")),
-        Some(_) => list,
+    if !pull.overlaps.is_empty() {
+        return list;
     }
+    // The workflow compares only ready pull requests that merge.
+    let none = if pull.draft || pull.stuck {
+        "overlaps not checked"
+    } else {
+        "no overlaps"
+    };
+    list.kid(text("li", none))
 }
 
 /// Buttons that move a pull request to another tier.

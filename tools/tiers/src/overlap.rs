@@ -4,11 +4,6 @@
 pub(crate) const MARKER: &str = "<!-- conflict-notice -->";
 /// The bot that writes the comment.
 pub(crate) const AUTHOR: &str = "github-actions";
-/// A list of pull requests follows each of these lines.
-const HEADS: [(&str, Kind); 2] = [
-    ("These open PRs conflict with this PR", Kind::Conflict),
-    ("These open PRs change the same files", Kind::Shared),
-];
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Kind {
@@ -21,22 +16,21 @@ pub enum Kind {
 pub struct Overlap {
     pub kind: Kind,
     pub other: u64,
+    /// Untrusted file names, not escaped.
     pub files: Vec<String>,
 }
 
-/// Reads list lines such as ``- #12: `a.rs` `b.rs` ``.
+/// Reads lines such as ``- conflict #12: `a.rs` `b.rs` ``.
 pub fn read(body: &str) -> Vec<Overlap> {
     let mut found = Vec::new();
-    let mut kind = None;
     for line in body.lines() {
-        for (head, listed) in HEADS {
-            if line.starts_with(head) {
-                kind = Some(listed);
-            }
-        }
-        let item = line.strip_prefix("- #").and_then(|l| l.split_once(": "));
-        let (Some(kind), Some((other, files))) = (kind, item) else {
+        let Some((head, files)) = line.split_once(": ") else {
             continue;
+        };
+        let (kind, other) = match head.split_once(" #") {
+            Some(("- conflict", other)) => (Kind::Conflict, other),
+            Some(("- shared", other)) => (Kind::Shared, other),
+            _ => continue,
         };
         let Ok(other) = other.parse() else {
             continue;
