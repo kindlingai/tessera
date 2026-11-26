@@ -150,6 +150,10 @@ impl Kernel for Text {
         Source::Fixed { text, entry }
     }
 
+    fn shape(&self) -> Option<tessera_lower::Shape> {
+        Some(self.shape)
+    }
+
     fn launches(&self, step: &Step) -> Vec<Launch> {
         let mut args: Vec<Arg> = (0..step.reads.len()).map(|i| step.read(i)).collect();
         args.push(step.out());

@@ -79,6 +79,7 @@ fn linear<const WIDE: u32, const AHEAD: u32>(
     order = Order::PerConfig,
     source = self.product.source(self.tree(), "linear"),
     launches = lanes_launches,
+    shape = Shape::Line(self.product.n * LANES),
     load = lanes_load,
     unproven,
 )]
@@ -136,7 +137,8 @@ fn lanes_load(k: &Lanes, _: usize) -> Option<Load> {
 
 fn lanes_launches(k: &Lanes, step: &Step) -> Vec<Launch> {
     let Product { n, k: depth, .. } = k.product;
-    k.product.launch(step, &[n, depth], Shape::Line(n * LANES))
+    k.product
+        .launch(step, &[n, depth], k.shape().expect("a line"))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

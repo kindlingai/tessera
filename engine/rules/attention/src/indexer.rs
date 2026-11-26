@@ -336,6 +336,10 @@ impl Sizes {
     emits = warp_emits,
     source = warp_source,
     launches = warp_launches,
+    shape = Shape::grid(
+        ((self.0.rows * self.0.per_row()).div_ceil(WARPS as usize), 1),
+        THREADS as usize,
+    ),
 )]
 pub(crate) struct IndexerWarp(pub Sizes);
 
@@ -370,13 +374,7 @@ fn warp_source(k: &IndexerWarp) -> Source {
 
 fn warp_launches(k: &IndexerWarp, step: &Step) -> Vec<Launch> {
     let s = &k.0;
-    let per_row = s.per_row();
-    let total_warps = s.rows * per_row;
-    let shape = Shape::Grid {
-        across: total_warps.div_ceil(WARPS as usize),
-        down: 1,
-        threads: THREADS as usize,
-    };
+    let (per_row, shape) = (s.per_row(), k.shape().expect("a grid"));
     let mut args = s.buffers(step);
     let head = [
         s.rows,

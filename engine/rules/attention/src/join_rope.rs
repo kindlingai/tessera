@@ -88,6 +88,7 @@ fn join_rope(
     emits = jr_emits,
     source = jr_source,
     launches = jr_launches,
+    shape = Shape::Line(jr_threads(self)),
 )]
 pub(crate) struct JoinRope {
     pub positions: usize,
@@ -140,14 +141,16 @@ fn jr_source(k: &JoinRope) -> Source {
     Source::named(body, entry)
 }
 
-fn jr_launches(k: &JoinRope, step: &Step) -> Vec<Launch> {
+fn jr_threads(k: &JoinRope) -> usize {
     let plain_tasks = if k.wide {
         k.plain_w / WIDE as usize
     } else {
         k.plain_w
     };
-    let tasks = plain_tasks + k.rope_w / 2;
-    let threads = k.positions * k.heads * tasks;
+    k.positions * k.heads * (plain_tasks + k.rope_w / 2)
+}
+
+fn jr_launches(k: &JoinRope, step: &Step) -> Vec<Launch> {
     let mut args = vec![step.read(0), step.read(1), step.read(2), step.out()];
     let counts = [
         k.positions,
@@ -162,10 +165,8 @@ fn jr_launches(k: &JoinRope, step: &Step) -> Vec<Launch> {
     ];
     args.extend(counts.map(Arg::count));
     args.push(Arg::value(&k.theta));
-    vec![Launch {
-        args,
-        shape: Shape::Line(threads),
-    }]
+    let shape = k.shape().expect("a line");
+    vec![Launch { args, shape }]
 }
 
 /// Whether `t` is a non-weight, non-append float tensor.

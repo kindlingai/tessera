@@ -18,6 +18,7 @@ use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Shape, Step, T, Tree};
     emits = self.product.emits(form),
     source = self.product.source(self.tree(), "picked"),
     launches = picked_launches,
+    shape = Shape::Line(self.product.m * self.product.n),
     load = picked_load,
     unproven,
 )]
@@ -129,7 +130,7 @@ fn picked_launches(k: &Picked, step: &Step) -> Vec<Launch> {
         pick.offset,
         pick.repeat,
     ];
-    let mut launches = k.product.launch(step, &counts, Shape::Line(m * n));
+    let mut launches = k.product.launch(step, &counts, k.shape().expect("a line"));
     launches[0].args.push(Arg::count(pick.first.unwrap_or(0)));
     launches
 }

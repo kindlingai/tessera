@@ -79,6 +79,7 @@ impl GemvKind {
     order = Order::PerConfig,
     source = gemv_source(self),
     launches = gemv_launches,
+    shape = Shape::Grid { across: self.kind.groups(self.n), down: 1, threads: THREADS },
     load = gemv_load,
     unproven,
 )]
@@ -124,11 +125,7 @@ fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
 }
 
 fn gemv_launches(k: &FastGemv, step: &Step) -> Vec<Launch> {
-    let shape = Shape::Grid {
-        across: k.kind.groups(k.n),
-        down: 1,
-        threads: THREADS,
-    };
+    let shape = k.shape().expect("a grid");
     let mut args = vec![
         step.read(0),
         step.read(1),

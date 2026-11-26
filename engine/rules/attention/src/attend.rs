@@ -192,6 +192,7 @@ fn attend_rows(
     emits = rows_emits,
     source = rows_source,
     launches = rows_launches,
+    shape = Shape::grid((self.0.queries * self.0.heads, 1), THREADS as usize),
 )]
 pub(crate) struct AttendRows(pub Attn);
 
@@ -223,14 +224,8 @@ fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
     let mut args = a.rows_args(step);
     args.extend([Arg::count(a.width), a.back()]);
     args.extend(a.kept_args());
-    vec![Launch {
-        args,
-        shape: Shape::Grid {
-            across: a.queries * a.heads,
-            down: 1,
-            threads: THREADS as usize,
-        },
-    }]
+    let shape = k.shape().expect("a grid");
+    vec![Launch { args, shape }]
 }
 
 /// Reads scaled queries, and keys joined with values. Any mask.

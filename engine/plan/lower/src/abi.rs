@@ -99,6 +99,15 @@ impl Shape {
             e => Shape::Runtime(e),
         }
     }
+
+    /// Groups `(across, down)`, `threads` in each.
+    pub fn grid((across, down): (usize, usize), threads: usize) -> Shape {
+        Shape::Grid {
+            across,
+            down,
+            threads,
+        }
+    }
 }
 
 /// How threads are laid out over the work.

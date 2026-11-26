@@ -501,6 +501,7 @@ impl Sizes {
     emits = attend_emits,
     source = attend_source,
     launches = attend_launches,
+    shape = Shape::grid((self.0.lists(), 1), THREADS as usize),
 )]
 pub(crate) struct ListedAttend(pub Sizes);
 
@@ -541,12 +542,7 @@ fn attend_needs(k: &ListedAttend) -> Needs {
 
 fn attend_launches(k: &ListedAttend, step: &Step) -> Vec<Launch> {
     let s = k.0;
-    let lists = s.lists();
-    let shape = Shape::Grid {
-        across: lists,
-        down: 1,
-        threads: THREADS as usize,
-    };
+    let (lists, shape) = (s.lists(), k.shape().expect("a grid"));
     let mut args = s.buffers(step);
     args.push(Arg::value(&s.scale));
     args.push(Arg::count(lists));

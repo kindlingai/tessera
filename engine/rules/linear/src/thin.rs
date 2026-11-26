@@ -22,6 +22,7 @@ pub(crate) const THIN_ROWS: usize = 32;
     // The text holds the stages. The name hashes the text.
     source = self.product.source(self.tree(), "thin"),
     launches = thin_launches,
+    shape = Shape::Line(self.product.n),
     load = thin_load,
     unproven,
 )]
@@ -100,7 +101,8 @@ fn thin_load(k: &Thin, _: usize) -> Option<Load> {
 
 fn thin_launches(k: &Thin, step: &Step) -> Vec<Launch> {
     let Product { n, k: depth, .. } = k.product;
-    k.product.launch(step, &[n, depth], Shape::Line(n))
+    k.product
+        .launch(step, &[n, depth], k.shape().expect("a line"))
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

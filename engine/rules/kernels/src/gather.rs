@@ -79,6 +79,7 @@ fn gather_accepts(k: &Gather, input: usize, form: &dyn Stored) -> bool {
     accepts = kept_accepts,
     source = kept_source,
     launches = kept_launches,
+    shape = Shape::Line(self.rows * self.keys * self.feat),
 )]
 pub struct KeptGather {
     pub rows: usize,
@@ -104,7 +105,6 @@ fn kept_source(k: &KeptGather) -> Source {
 }
 
 fn kept_launches(k: &KeptGather, step: &Step) -> Vec<Launch> {
-    let total = k.rows * k.keys * k.feat;
     let sizes = [k.rows, k.keys, k.feat, k.slots].map(Arg::count);
     let kept = k
         .kept
@@ -117,10 +117,8 @@ fn kept_launches(k: &KeptGather, step: &Step) -> Vec<Launch> {
         .chain(sizes)
         .chain(kept)
         .collect();
-    vec![Launch {
-        args,
-        shape: Shape::Line(total),
-    }]
+    let shape = k.shape().expect("a line");
+    vec![Launch { args, shape }]
 }
 
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {

@@ -167,6 +167,7 @@ fn mxfp8_tall_ks(m: usize, n: usize, k: usize) -> usize {
     order = Order::PerConfig,
     source = cuda_source_entry(self.kind.entry()),
     launches = mm_launches,
+    shape = Shape::grid(self.kind.grid(self.m, self.n, self.ks), self.kind.threads()),
     load = mm_load,
     unproven,
 )]
@@ -220,12 +221,7 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
 }
 
 fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
-    let (across, down) = k.kind.grid(k.m, k.n, k.ks);
-    let shape = Shape::Grid {
-        across,
-        down,
-        threads: k.kind.threads(),
-    };
+    let shape = k.shape().expect("a grid");
     let other = if matches!(k.mode, 1..=4) {
         step.read(2)
     } else {

@@ -177,108 +177,123 @@ impl Cover<'_> {
             });
         }
         let kind = self.device.cluster.kind(zone as usize);
-        let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
-        let mut runnable = Vec::new();
-        let mut proposed = false;
-        // Default scatter cover for kept appends, competing with fused rules.
-        if let Some(index) = append {
-            proposed = true;
-            if let Some(below) = self.need(n.args[0], zone)
-                && let Some(scatter) = Scatter::at(self.tree, t, index)
-            {
-                let len = scatter.rows * scatter.width;
-                let cost = below + self.device.seconds_in(zone, &scatter, len, false);
-                offered.push("append");
-                best = Some(Choice {
-                    rule: "append",
-                    drafts: Vec::new(),
-                    cost,
-                    offered: Vec::new(),
-                    ways: Vec::new(),
-                });
-            }
-        }
-        for rule in self.rules.clone() {
-            let Some(drafts) = rule.propose.at(self.tree, t) else {
-                continue;
-            };
-            proposed = true;
-            if !drafts.iter().all(|d| fits(d, kind)) {
-                continue;
-            }
-            offered.push(rule.name);
-            for drafts in ways(drafts) {
-                // Kept state lives in EDGE so mutations stay in place.
-                let touches_kept = drafts
-                    .iter()
-                    .any(|d| d.reads.iter().any(|r| matches!(r, Read::Kept(_))));
-                if touches_kept && zone != EDGE {
-                    continue;
-                }
-                // Fused appends write kept rows directly in their form.
-                if append.is_some() {
-                    let Some(last) = drafts.last() else {
-                        continue;
-                    };
-                    if last.kernel.overwrites()
-                        || (n.form.narrow() && !last.kernel.emits_at(0, n.form))
-                        || !last.also.is_empty()
-                    {
-                        continue;
-                    }
-                }
-                // A kernel the device cannot run is not a way.
-                let platform = &self.device.platform;
-                let unfit = |d: &Draft| {
-                    !d.kernel.needs().fits(platform) || grid_mismatch(d, kind).is_some()
-                };
-                if drafts.iter().any(unfit) {
-                    continue;
-                }
-                if self.swallows(rule, t, &drafts, kind) {
-                    continue;
-                }
-                runnable.push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
-                let Some(mut cost) = drafts.iter().map(|d| self.seconds(zone, d)).sum() else {
-                    continue;
-                };
-                cost += self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
-                let below = reads(&drafts).into_iter().map(|r| self.need(r, zone));
-                let Some(below) = below.sum::<Option<f64>>() else {
-                    continue;
-                };
-                cost += below;
-                // Roots a cover absorbs no longer cost their own.
-                let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts), &writes(&drafts)) else {
-                    continue;
-                };
-                if !rule.propose.regions() && absorbed.iter().any(|r| self.tree.end(*r)) {
-                    continue;
-                }
-                // The zone must also cover each root the drafts absorb.
-                let own = absorbed.into_iter().map(|r| self.solve(r, zone));
-                let Some(own) = own.sum::<Option<f64>>() else {
-                    continue;
-                };
-                cost -= own;
-                // A favored rule wins here. Readers see its true cost.
-                let favored = self.device.favors(rule.name);
-                let beaten = |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {
-                    (true, _) => cost < b.cost,
-                    (false, true) => false,
-                    (false, false) => favored || cost < b.cost,
-                };
-                if best.as_ref().is_none_or(beaten) {
+        // The winning cover gets a grid check. Tall ones retry.
+        let mut skip = Vec::new();
+        let (best, offered, runnable, proposed) = loop {
+            let (mut best, mut offered): (Option<Choice>, _) = (None, Vec::new());
+            let mut runnable = Vec::new();
+            let mut proposed = false;
+            let mut won: Option<usize> = None;
+            let mut seen = 0;
+            // Default scatter cover for kept appends, competing with fused rules.
+            if let Some(index) = append {
+                proposed = true;
+                if let Some(below) = self.need(n.args[0], zone)
+                    && let Some(scatter) = Scatter::at(self.tree, t, index)
+                {
+                    let len = scatter.rows * scatter.width;
+                    let cost = below + self.device.seconds_in(zone, &scatter, len, false);
+                    offered.push("append");
                     best = Some(Choice {
-                        rule: rule.name,
-                        drafts,
+                        rule: "append",
+                        drafts: Vec::new(),
                         cost,
                         offered: Vec::new(),
                         ways: Vec::new(),
                     });
                 }
             }
-        }
+            for rule in self.rules.clone() {
+                let Some(drafts) = rule.propose.at(self.tree, t) else {
+                    continue;
+                };
+                proposed = true;
+                if !drafts.iter().all(|d| fits(d, kind)) {
+                    continue;
+                }
+                offered.push(rule.name);
+                for drafts in ways(drafts) {
+                    seen += 1;
+                    if skip.contains(&seen) {
+                        continue;
+                    }
+                    // Kept state lives in EDGE so mutations stay in place.
+                    let touches_kept = drafts
+                        .iter()
+                        .any(|d| d.reads.iter().any(|r| matches!(r, Read::Kept(_))));
+                    if touches_kept && zone != EDGE {
+                        continue;
+                    }
+                    // Fused appends write kept rows directly in their form.
+                    if append.is_some() {
+                        let Some(last) = drafts.last() else {
+                            continue;
+                        };
+                        if last.kernel.overwrites()
+                            || (n.form.narrow() && !last.kernel.emits_at(0, n.form))
+                            || !last.also.is_empty()
+                        {
+                            continue;
+                        }
+                    }
+                    // A kernel the device cannot run is not a way.
+                    let platform = &self.device.platform;
+                    if drafts.iter().any(|d| !d.kernel.needs().fits(platform)) {
+                        continue;
+                    }
+                    if self.swallows(rule, t, &drafts, kind) {
+                        continue;
+                    }
+                    runnable.push((rule.name, drafts.iter().map(|d| d.kernel.name()).collect()));
+                    let Some(mut cost) = drafts.iter().map(|d| self.seconds(zone, d)).sum() else {
+                        continue;
+                    };
+                    cost += self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
+                    let below = reads(&drafts).into_iter().map(|r| self.need(r, zone));
+                    let Some(below) = below.sum::<Option<f64>>() else {
+                        continue;
+                    };
+                    cost += below;
+                    // Roots a cover absorbs no longer cost their own.
+                    let Some(absorbed) = self.tree.absorbs(t, &reads(&drafts), &writes(&drafts))
+                    else {
+                        continue;
+                    };
+                    if !rule.propose.regions() && absorbed.iter().any(|r| self.tree.end(*r)) {
+                        continue;
+                    }
+                    // The zone must also cover each root the drafts absorb.
+                    let own = absorbed.into_iter().map(|r| self.solve(r, zone));
+                    let Some(own) = own.sum::<Option<f64>>() else {
+                        continue;
+                    };
+                    cost -= own;
+                    // A favored rule wins here. Readers see its true cost.
+                    let favored = self.device.favors(rule.name);
+                    let beaten =
+                        |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {
+                            (true, _) => cost < b.cost,
+                            (false, true) => false,
+                            (false, false) => favored || cost < b.cost,
+                        };
+                    if best.as_ref().is_none_or(beaten) {
+                        won = Some(seen);
+                        best = Some(Choice {
+                            rule: rule.name,
+                            drafts,
+                            cost,
+                            offered: Vec::new(),
+                            ways: Vec::new(),
+                        });
+                    }
+                }
+            }
+            let tall = |c: &Choice| c.drafts.iter().any(|d| grid_mismatch(d, kind).is_some());
+            match won {
+                Some(at) if best.as_ref().is_some_and(tall) => skip.push(at),
+                _ => break (best, offered, runnable, proposed),
+            }
+        };
         if !proposed && !self.bare.contains(&t) {
             self.bare.push(t);
         }

@@ -109,6 +109,7 @@ fn kv_scatter(
     emits = kv_emits,
     source = kv_source,
     launches = kv_launches,
+    shape = Shape::Line(if self.lanes { self.rows * LANES } else { self.rows }),
 )]
 pub(crate) struct KvScatter {
     pub rows: usize,
@@ -166,11 +167,8 @@ fn kv_launches(k: &KvScatter, step: &Step) -> Vec<Launch> {
     args.push(Arg::value(&k.theta));
     let kept = k.kept.values(k.slots, k.context);
     args.extend(kept.into_iter().map(|v| Arg::count(v as usize)));
-    let threads = if k.lanes { k.rows * LANES } else { k.rows };
-    vec![Launch {
-        args,
-        shape: Shape::Line(threads),
-    }]
+    let shape = k.shape().expect("a line");
+    vec![Launch { args, shape }]
 }
 
 /// Checks a last-axis slice of `parent` starting at `want_start`.
