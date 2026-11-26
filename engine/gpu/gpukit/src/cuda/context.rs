@@ -326,6 +326,21 @@ impl Api for Driver {
         self.check(code, "cuMemcpyDtoH")
     }
 
+    fn upload_async(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        let stream = std::ptr::null_mut();
+        let code =
+            unsafe { (self.cu_memcpy_htod_async)(ptr, bytes.as_ptr().cast(), bytes.len(), stream) };
+        self.check(code, "cuMemcpyHtoDAsync")
+    }
+
+    fn download_async(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        let stream = std::ptr::null_mut();
+        let code = unsafe {
+            (self.cu_memcpy_dtoh_async)(bytes.as_mut_ptr().cast(), ptr, bytes.len(), stream)
+        };
+        self.check(code, "cuMemcpyDtoHAsync")
+    }
+
     fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
         let stream = std::ptr::null_mut();
         let code = unsafe { (self.cu_memcpy_dtod_async)(dst, src, size, stream) };

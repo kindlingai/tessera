@@ -62,6 +62,20 @@ pub trait Device: Clone + Send + Sync + 'static {
     }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
+    /// Uploads spans in one async batch, then waits.
+    fn upload_batch(&self, spans: &[(u64, &[u8])]) -> Result<(), Error> {
+        for &(ptr, bytes) in spans {
+            self.upload(ptr, bytes)?;
+        }
+        Ok(())
+    }
+    /// Downloads spans in one async batch, then waits.
+    fn download_batch(&self, spans: &mut [(u64, &mut [u8])]) -> Result<(), Error> {
+        for (ptr, bytes) in spans {
+            self.download(*ptr, bytes)?;
+        }
+        Ok(())
+    }
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
     /// Copies `size` bytes from `src` to `dst` on device.
     fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {

@@ -365,9 +365,9 @@ impl Engine {
         let (disk, run) = (self.disk.as_mut().expect("disk"), &mut self.runner);
         let (mine, sync) = disk.exec(&msg, Error::Store, |up, p, g, b| {
             let ok = if up {
-                run.upload_kept_page(p, g, b)?
+                run.upload_kept_pages(p, g, b)?
             } else {
-                run.download_kept_page(p, g, b)?
+                run.download_kept_pages(p, g, b)?
             };
             ok.then_some(()).ok_or(Error::RowPlace)
         })?;

@@ -245,6 +245,22 @@ impl Api for Runtime {
         self.check(code, "hipMemcpy to host")
     }
 
+    fn upload_async(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        let (dst, src) = (ptr as *mut _, bytes.as_ptr().cast());
+        let to = hip::MEMCPY_HOST_TO_DEVICE;
+        let code =
+            unsafe { (self.hip_memcpy_async)(dst, src, bytes.len(), to, std::ptr::null_mut()) };
+        self.check(code, "hipMemcpyAsync to device")
+    }
+
+    fn download_async(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        let (dst, src) = (bytes.as_mut_ptr().cast(), ptr as *const _);
+        let to = hip::MEMCPY_DEVICE_TO_HOST;
+        let code =
+            unsafe { (self.hip_memcpy_async)(dst, src, bytes.len(), to, std::ptr::null_mut()) };
+        self.check(code, "hipMemcpyAsync to host")
+    }
+
     fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
         let (d, s) = (dst as *mut _, src as *const _);
         let kind = hip::MEMCPY_DEVICE_TO_DEVICE;

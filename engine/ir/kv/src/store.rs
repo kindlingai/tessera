@@ -439,6 +439,7 @@ pub struct DiskKv {
     pub seed: [u64; 2],
     pub page: usize,
     page_bytes: usize,
+    scratch: Vec<u8>,
 }
 
 impl DiskKv {
@@ -460,6 +461,7 @@ impl DiskKv {
                 seed,
                 page,
                 page_bytes,
+                scratch: Vec::new(),
             }),
         )
     }
@@ -539,7 +541,7 @@ impl DiskKv {
         &mut self,
         msg: &DiskMsg,
         io_err: impl FnMut(io::Error) -> E,
-        mut io: impl FnMut(bool, u32, usize, &mut [u8]) -> Result<(), E>,
+        mut io: impl FnMut(bool, &[u32], usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<(u32, bool), E> {
         match msg {
             DiskMsg::Prefix(k) => Ok((self.prefix(k) as u32, true)),
@@ -554,38 +556,78 @@ impl DiskKv {
         }
     }
 
-    /// Loads `pairs` from disk into `write`.
+    /// Loads `pairs` from disk into `write` in batches.
     pub fn load_pairs<E>(
         &mut self,
         pairs: &[(u32, PageKey)],
         mut io_err: impl FnMut(io::Error) -> E,
-        mut write: impl FnMut(u32, usize, &mut [u8]) -> Result<(), E>,
+        mut write: impl FnMut(&[u32], usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<usize, E> {
-        let (mut buf, mut done) = (vec![0u8; self.page_bytes], 0usize);
-        for &(phys, key) in pairs {
-            if !self.store.load(key, &mut buf).map_err(&mut io_err)? {
+        if pairs.is_empty() || self.page_bytes == 0 {
+            return Ok(0);
+        }
+        let batch = ((64 << 20) / self.page_bytes).max(1).min(pairs.len());
+        let need = batch * self.page_bytes;
+        if self.scratch.len() < need {
+            self.scratch.resize(need, 0);
+        }
+        let mut phys = Vec::with_capacity(batch);
+        let mut done = 0usize;
+        for chunk in pairs.chunks(batch) {
+            phys.clear();
+            let mut n = 0usize;
+            for &(p, key) in chunk {
+                let dst = &mut self.scratch[n * self.page_bytes..(n + 1) * self.page_bytes];
+                if !self.store.load(key, dst).map_err(&mut io_err)? {
+                    break;
+                }
+                phys.push(p);
+                n += 1;
+            }
+            if n > 0 {
+                write(&phys, self.page, &mut self.scratch[..n * self.page_bytes])?;
+                done += n;
+            }
+            if n < chunk.len() {
                 break;
             }
-            write(phys, self.page, &mut buf)?;
-            done += 1;
         }
         Ok(done)
     }
 
-    /// Spills missing pages read through `read` to the store.
+    /// Spills missing pages read through `read` in batches.
     pub fn save_pairs<E>(
         &mut self,
         pairs: &[(u32, PageKey)],
         mut io_err: impl FnMut(io::Error) -> E,
-        mut read: impl FnMut(u32, usize, &mut [u8]) -> Result<(), E>,
+        mut read: impl FnMut(&[u32], usize, &mut [u8]) -> Result<(), E>,
     ) -> Result<(), E> {
-        let mut buf = vec![0u8; self.page_bytes];
-        for &(phys, key) in pairs {
-            if !self.store.should_save(key) {
-                continue;
+        if pairs.is_empty() || self.page_bytes == 0 {
+            return Ok(());
+        }
+        let todo: Vec<(u32, PageKey)> = pairs
+            .iter()
+            .copied()
+            .filter(|&(_, key)| self.store.should_save(key))
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let batch = ((64 << 20) / self.page_bytes).max(1).min(todo.len());
+        let need = batch * self.page_bytes;
+        if self.scratch.len() < need {
+            self.scratch.resize(need, 0);
+        }
+        let mut phys = Vec::with_capacity(batch);
+        for chunk in todo.chunks(batch) {
+            phys.clear();
+            phys.extend(chunk.iter().map(|&(p, _)| p));
+            let slice = &mut self.scratch[..chunk.len() * self.page_bytes];
+            read(&phys, self.page, slice)?;
+            for (i, &(_, key)) in chunk.iter().enumerate() {
+                let page_buf = &slice[i * self.page_bytes..(i + 1) * self.page_bytes];
+                self.store.save_seen(key, page_buf).map_err(&mut io_err)?;
             }
-            read(phys, self.page, &mut buf)?;
-            self.store.save_seen(key, &buf).map_err(&mut io_err)?;
         }
         Ok(())
     }

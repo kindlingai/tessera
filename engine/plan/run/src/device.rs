@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
-use crate::held::Holds;
+use crate::held::{Holds, KvStage};
 use crate::kernels::Kernels;
 use crate::lanes::LaneSync;
 use crate::marks;
@@ -67,6 +67,8 @@ pub(crate) struct Runner<D: Device> {
     resident: Vec<bool>,
     /// Hot-cold expert weight pager, opened on VRAM overflow.
     pager: Option<Pager<D>>,
+    /// Pinned host staging buffer for batched KV transfers.
+    kv_stage: Option<KvStage<D>>,
 }
 
 /// Launches a closed gate holds, under any driver queue.
@@ -115,6 +117,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             grid: RefCell::new(None),
             resident: Vec::new(),
             pager: None,
+            kv_stage: None,
         };
         runner.replan(&plan)?;
         Ok(runner)
@@ -948,6 +951,16 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
             return Ok(());
         }
         self.held_mut().upload(slot, bytes)
+    }
+
+    fn download_kept_pages(&mut self, p: &[u32], g: usize, dst: &mut [u8]) -> Result<bool, Error> {
+        let (ctx, stage, b) = (self.ctx, &mut self.kv_stage, &self.base);
+        b.held.download_pages(ctx, stage, &b.plan, p, g, dst)
+    }
+
+    fn upload_kept_pages(&mut self, p: &[u32], g: usize, src: &[u8]) -> Result<bool, Error> {
+        let (ctx, stage, b) = (self.ctx, &mut self.kv_stage, &mut self.base);
+        b.held.upload_pages(ctx, stage, &b.plan, p, g, src)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

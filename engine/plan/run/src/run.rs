@@ -158,15 +158,47 @@ pub trait Run {
         Held::kept_page_meta(self.plan(), page)
     }
 
-    /// Downloads one physical KV page from device memory.
-    fn download_kept_page(&self, phys: u32, page: usize, dst: &mut [u8]) -> Result<bool, Error> {
-        self.held().download_page(self.plan(), phys, page, dst)
+    /// Downloads `phys` physical KV pages packed into `dst`.
+    fn download_kept_pages(
+        &mut self,
+        phys: &[u32],
+        page: usize,
+        dst: &mut [u8],
+    ) -> Result<bool, Error> {
+        if phys.is_empty() {
+            return Ok(true);
+        }
+        let page_bytes = dst.len() / phys.len();
+        if page_bytes * phys.len() != dst.len() {
+            return Ok(false);
+        }
+        let plan = self.plan().clone();
+        for (i, &p) in phys.iter().enumerate() {
+            let slice = &mut dst[i * page_bytes..(i + 1) * page_bytes];
+            if !self.held().download_page(&plan, p, page, slice)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
-    /// Uploads one physical KV page into device memory.
-    fn upload_kept_page(&mut self, phys: u32, page: usize, src: &[u8]) -> Result<bool, Error> {
+    /// Uploads `phys` physical KV pages packed in `src`.
+    fn upload_kept_pages(&mut self, phys: &[u32], page: usize, src: &[u8]) -> Result<bool, Error> {
+        if phys.is_empty() {
+            return Ok(true);
+        }
+        let page_bytes = src.len() / phys.len();
+        if page_bytes * phys.len() != src.len() {
+            return Ok(false);
+        }
         let plan = self.plan().clone();
-        self.held_mut().upload_page(&plan, phys, page, src)
+        for (i, &p) in phys.iter().enumerate() {
+            let slice = &src[i * page_bytes..(i + 1) * page_bytes];
+            if !self.held_mut().upload_page(&plan, p, page, slice)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// Takes up another plan. Weights and kept rows stay loaded.
     fn replan(&mut self, plan: &Plan) -> Result<(), Error>;

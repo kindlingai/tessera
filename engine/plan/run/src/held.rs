@@ -3,6 +3,8 @@
 use crate::Error;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_lower::form::Load;
 use tessera_lower::{Loaded, Plan, Slot};
 use tessera_mem::{Buffer, View, ViewMut};
 
@@ -609,4 +611,236 @@ fn kept_spans(items: &mut [(u32, usize)], total: usize) -> Vec<(u32, usize, usiz
         out.push((index, offset, end - offset));
     }
     out
+}
+
+/// Default pinned host staging buffer size per rank (64 MiB).
+const STAGE_BYTES: usize = 64 << 20;
+
+/// Reusable pinned host buffer for batched KV DMA transfers.
+pub(crate) struct KvStage<D: Device> {
+    ctx: &'static D,
+    host: u64,
+    cap: usize,
+}
+
+impl<D: Device> KvStage<D> {
+    fn open(ctx: &'static D, bytes: usize) -> Option<Self> {
+        let (host, _) = ctx.pin(bytes).ok()?;
+        Some(Self {
+            ctx,
+            host,
+            cap: bytes,
+        })
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `host` is a live `cap`-byte pinned allocation.
+        unsafe { std::slice::from_raw_parts_mut(self.host as *mut u8, self.cap) }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `host` is a live `cap`-byte pinned allocation.
+        unsafe { std::slice::from_raw_parts(self.host as *const u8, self.cap) }
+    }
+}
+
+impl<D: Device> Drop for KvStage<D> {
+    fn drop(&mut self) {
+        self.ctx.unpin(self.host);
+    }
+}
+
+struct KeptTensor {
+    dev_base: u64,
+    span: usize,
+    form: &'static dyn Load,
+    elems: usize,
+    page_off: usize,
+    len: usize,
+    linear: bool,
+}
+
+fn kept_tensors<D: Device>(held: &Held, plan: &Plan, page: usize) -> (Vec<KeptTensor>, usize) {
+    let (mut out, mut page_off) = (Vec::new(), 0usize);
+    for (&(_, slot), info) in plan.kept.iter().zip(&plan.kept_info) {
+        if info.context <= 1 || info.page_rows as usize != page {
+            continue;
+        }
+        let elems = page * info.width as usize;
+        let len = slot.form.bytes(elems);
+        let linear = slot.form.offset(0) == 0 && slot.form.offset(elems) == len;
+        let ptr = held
+            .get(slot)
+            .backing()
+            .as_any()
+            .downcast_ref::<DeviceBuffer<D>>()
+            .expect("device runner holds device buffers")
+            .device_ptr();
+        out.push(KeptTensor {
+            dev_base: ptr + slot.start() as u64,
+            span: held.span(slot),
+            form: slot.form,
+            elems,
+            page_off,
+            len,
+            linear,
+        });
+        page_off += len;
+    }
+    (out, page_off)
+}
+
+fn fits_all(tensors: &[KeptTensor], phys: &[u32]) -> bool {
+    phys.iter().all(|&p| {
+        tensors
+            .iter()
+            .all(|t| t.form.offset(p as usize * t.elems) + t.len <= t.span)
+    })
+}
+
+fn page_runs(phys: &[u32]) -> Vec<(usize, u32, usize)> {
+    let (mut out, mut i) = (Vec::new(), 0usize);
+    while i < phys.len() {
+        let (p0, mut len) = (phys[i], 1usize);
+        while i + len < phys.len() && phys[i + len] == p0 + len as u32 {
+            len += 1;
+        }
+        out.push((i, p0, len));
+        i += len;
+    }
+    out
+}
+
+fn ensure_stage<'a, D: Device>(
+    ctx: &'static D,
+    stage: &'a mut Option<KvStage<D>>,
+    page_bytes: usize,
+) -> Option<&'a mut KvStage<D>> {
+    if ctx.unified() {
+        return None;
+    }
+    if stage.as_ref().is_none_or(|s| s.cap < page_bytes) {
+        let want = STAGE_BYTES.max(page_bytes);
+        *stage = KvStage::open(ctx, want).or_else(|| KvStage::open(ctx, page_bytes));
+    }
+    stage.as_mut()
+}
+
+impl Held {
+    /// Uploads `phys` pages packed in `src` over pinned async DMA.
+    pub(crate) fn upload_pages<D: Device>(
+        &mut self,
+        ctx: &'static D,
+        stage: &mut Option<KvStage<D>>,
+        plan: &Plan,
+        phys: &[u32],
+        page: usize,
+        src: &[u8],
+    ) -> Result<bool, Error> {
+        if phys.is_empty() {
+            return Ok(true);
+        }
+        let (tensors, page_bytes) = kept_tensors::<D>(self, plan, page);
+        if page_bytes == 0 || src.len() != phys.len() * page_bytes || !fits_all(&tensors, phys) {
+            return Ok(false);
+        }
+        let Some(buf) = ensure_stage(ctx, stage, page_bytes) else {
+            for (i, &p) in phys.iter().enumerate() {
+                if !self.upload_page(plan, p, page, &src[i * page_bytes..(i + 1) * page_bytes])? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        };
+        let chunk = (buf.cap / page_bytes).max(1);
+        for (ci, p_chunk) in phys.chunks(chunk).enumerate() {
+            let base = ci * chunk * page_bytes;
+            let src_chunk = &src[base..base + p_chunk.len() * page_bytes];
+            let merged = page_runs(p_chunk);
+            let one: Vec<_> = p_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (i, p, 1))
+                .collect();
+            let (mut spans, mut rem) = (Vec::new(), buf.bytes_mut());
+            for t in &tensors {
+                for &(i0, p0, rlen) in if t.linear { &merged } else { &one } {
+                    let (dst, tail) = rem.split_at_mut(rlen * t.len);
+                    rem = tail;
+                    for k in 0..rlen {
+                        let at = (i0 + k) * page_bytes + t.page_off;
+                        dst[k * t.len..(k + 1) * t.len].copy_from_slice(&src_chunk[at..at + t.len]);
+                    }
+                    let dev = t.dev_base + t.form.offset(p0 as usize * t.elems) as u64;
+                    spans.push((dev, &*dst));
+                }
+            }
+            ctx.upload_batch(&spans)?;
+        }
+        Ok(true)
+    }
+
+    /// Downloads `phys` pages packed into `dst` over pinned async DMA.
+    pub(crate) fn download_pages<D: Device>(
+        &self,
+        ctx: &'static D,
+        stage: &mut Option<KvStage<D>>,
+        plan: &Plan,
+        phys: &[u32],
+        page: usize,
+        dst: &mut [u8],
+    ) -> Result<bool, Error> {
+        if phys.is_empty() {
+            return Ok(true);
+        }
+        let (tensors, page_bytes) = kept_tensors::<D>(self, plan, page);
+        if page_bytes == 0 || dst.len() != phys.len() * page_bytes || !fits_all(&tensors, phys) {
+            return Ok(false);
+        }
+        let Some(buf) = ensure_stage(ctx, stage, page_bytes) else {
+            for (i, &p) in phys.iter().enumerate() {
+                let s = &mut dst[i * page_bytes..(i + 1) * page_bytes];
+                if !self.download_page(plan, p, page, s)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        };
+        let chunk = (buf.cap / page_bytes).max(1);
+        for (ci, p_chunk) in phys.chunks(chunk).enumerate() {
+            let base = ci * chunk * page_bytes;
+            let dst_chunk = &mut dst[base..base + p_chunk.len() * page_bytes];
+            let merged = page_runs(p_chunk);
+            let one: Vec<_> = p_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (i, p, 1))
+                .collect();
+            {
+                let (mut spans, mut rem) = (Vec::new(), buf.bytes_mut());
+                for t in &tensors {
+                    for &(_, p0, rlen) in if t.linear { &merged } else { &one } {
+                        let (slot, tail) = rem.split_at_mut(rlen * t.len);
+                        rem = tail;
+                        let dev = t.dev_base + t.form.offset(p0 as usize * t.elems) as u64;
+                        spans.push((dev, slot));
+                    }
+                }
+                ctx.download_batch(&mut spans)?;
+            }
+            let (raw, mut cursor) = (buf.bytes(), 0usize);
+            for t in &tensors {
+                for &(i0, _, rlen) in if t.linear { &merged } else { &one } {
+                    let bytes = rlen * t.len;
+                    let src = &raw[cursor..cursor + bytes];
+                    cursor += bytes;
+                    for k in 0..rlen {
+                        let at = (i0 + k) * page_bytes + t.page_off;
+                        dst_chunk[at..at + t.len].copy_from_slice(&src[k * t.len..(k + 1) * t.len]);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::LocalKey;
 
 use crate::backend::Backend;
-use crate::device::{Caches, Device, IpcHandle, KernelStats};
+use crate::device::{Caches, IpcHandle, KernelStats};
 use crate::dl::image_hash;
 use crate::gate::Gate;
 use crate::launch::{self, KernelArgs, Launch};
@@ -195,6 +195,14 @@ pub trait Api: Sync + Sized + 'static {
     }
     fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error>;
     fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error>;
+    /// Queues an async H2D copy on the default stream.
+    fn upload_async(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.upload(ptr, bytes)
+    }
+    /// Queues an async D2H copy on the default stream.
+    fn download_async(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        self.download(ptr, bytes)
+    }
     fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error>;
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
     /// A timing event, recorded on the default stream.
@@ -787,207 +795,6 @@ impl<A: Api> Drop for Graph<A> {
                 self.api.destroy(kind, handle);
             }
         }
-    }
-}
-
-impl<A: Api> Device for Context<A> {
-    type Kernel = Kernel<A>;
-    type Graph = Graph<A>;
-
-    const BACKEND: Backend = A::BACKEND;
-
-    fn open() -> Result<Self, Error> {
-        A::open()
-    }
-
-    fn error(msg: String) -> Error {
-        A::error(msg)
-    }
-
-    fn caches() -> &'static Caches<Self> {
-        A::caches()
-    }
-
-    fn name(&self) -> String {
-        self.0.name.clone()
-    }
-
-    fn platform(&self) -> Platform {
-        A::describe(self)
-    }
-
-    fn finish(&self) -> Result<Option<f64>, Error> {
-        self.synchronize()?;
-        Ok(None)
-    }
-
-    fn stamp(&self) -> Result<bool, Error> {
-        Context::stamp(self).map(|_| true)
-    }
-
-    fn stamps(&self) -> Result<Vec<f64>, Error> {
-        Context::stamps(self)
-    }
-
-    fn gate(&self) -> Result<bool, Error> {
-        Context::gate(self).map(|_| true)
-    }
-
-    fn global(&self, kernel: &Kernel<A>, name: &str) -> Result<Option<u64>, Error> {
-        Context::global(self, kernel, name)
-    }
-
-    fn ticks(&self) -> f64 {
-        A::ticks(self)
-    }
-
-    fn release(&self) {
-        Context::release(self);
-    }
-
-    fn programmatic(&self, on: bool) {
-        A::programmatic(on);
-    }
-
-    fn pin(&self, size: usize) -> Result<(u64, u64), Error> {
-        Context::pin(self, size)
-    }
-
-    fn unpin(&self, host: u64) {
-        Context::unpin(self, host);
-    }
-
-    fn unified(&self) -> bool {
-        let platform = A::describe(self);
-        platform.integrated && platform.row.is_some_and(|r| r.pinned)
-    }
-
-    fn numa_node(&self) -> Option<u32> {
-        self.0.numa_node
-    }
-
-    fn bind_numa(&self) {
-        Context::bind_numa(self);
-    }
-
-    fn register(&self, host: *mut u8, size: usize) -> Result<u64, Error> {
-        Context::register(self, host, size)
-    }
-
-    fn unregister(&self, host: *mut u8) {
-        Context::unregister(self, host);
-    }
-
-    fn ipc_export(&self, ptr: u64) -> Result<IpcHandle, Error> {
-        Context::ipc_export(self, ptr)
-    }
-
-    fn ipc_open(&self, handle: IpcHandle) -> Result<u64, Error> {
-        Context::ipc_open(self, handle)
-    }
-
-    fn ipc_close(&self, ptr: u64) {
-        Context::ipc_close(self, ptr);
-    }
-
-    fn resident(&self, kernel: &Kernel<A>, threads: u32, shared: u32) -> Result<u32, Error> {
-        Context::resident(self, kernel, threads, shared)
-    }
-
-    fn stats(&self, kernel: &Kernel<A>) -> Option<KernelStats> {
-        Context::stats(self, kernel)
-    }
-
-    fn graphs(&self) -> bool {
-        true
-    }
-
-    fn has_lanes(&self) -> bool {
-        true
-    }
-
-    fn set_lane(&self, lane: u8) {
-        Context::set_lane(self, lane);
-    }
-
-    fn active_lane(&self) -> u8 {
-        Context::active_lane(self)
-    }
-
-    fn record_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
-        Context::record_lane(self, lane, slot)
-    }
-
-    fn wait_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
-        Context::wait_lane(self, lane, slot)
-    }
-
-    fn capturing(&self) -> bool {
-        !A::capturing().with(Cell::get).is_null()
-    }
-
-    fn capture<E: From<Error>>(
-        &self,
-        record: impl FnOnce() -> Result<(), E>,
-    ) -> Result<Graph<A>, E> {
-        Context::capture(self, record)
-    }
-
-    fn replay(&self, graph: &Graph<A>) -> Result<(), Error> {
-        Context::replay(self, graph)
-    }
-
-    fn alloc(&self, size: usize) -> Result<u64, Error> {
-        self.locked(|a| a.alloc(size))
-    }
-
-    fn alloc_kept(&self, size: usize) -> Result<u64, Error> {
-        self.locked(|a| a.alloc_kept(&self.0.own, self.0.device, size))
-    }
-
-    fn free_memory(&self) -> Option<u64> {
-        // Integrated devices count reclaimable host pages as used.
-        if A::describe(self).integrated {
-            return None;
-        }
-        self.locked(|a| a.free_memory()).ok()
-    }
-
-    fn free(&self, ptr: u64) {
-        let _hold = self.hold();
-        // At process exit the context may already be gone.
-        if self.set_current().is_ok() {
-            self.0.api.free_ptr(&self.0.own, self.0.device, ptr);
-        }
-    }
-
-    fn upload(&self, ptr: u64, bytes: &[u8]) -> Result<(), Error> {
-        self.locked(|a| a.upload(ptr, bytes))
-    }
-
-    fn download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
-        self.locked(|a| a.download(ptr, bytes))
-    }
-
-    fn copy_d2d(&self, dst: u64, src: u64, size: usize) -> Result<(), Error> {
-        if size == 0 || dst == src {
-            return Ok(());
-        }
-        let len = size as u64;
-        if src < dst + len && dst < src + len {
-            let mut tmp = vec![0u8; size];
-            self.download(src, &mut tmp)?;
-            return self.upload(dst, &tmp);
-        }
-        self.locked(|a| a.copy_d2d(dst, src, size))
-    }
-
-    fn zero(&self, ptr: u64, size: usize) -> Result<(), Error> {
-        self.locked(|a| a.zero(ptr, size))
-    }
-
-    fn compile(&self, source: &str, entry: &str) -> Result<Kernel<A>, Error> {
-        self.compile_kernel(source, entry)
     }
 }
 
