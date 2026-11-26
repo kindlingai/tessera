@@ -108,6 +108,11 @@ pub enum Error {
          TESSERA_MEMORY sets the budget in bytes, or `off`"
     )]
     OverBudget { planned: u64, budget: u64 },
+    #[error(
+        "the plan needs {planned} bytes, over the {budget} available. \
+         --allow-weight-streaming pages expert weights from host memory"
+    )]
+    Streaming { planned: u64, budget: u64 },
     #[error("a sizing runner runs nothing")]
     Sizing,
     #[error("the input list does not match the plan")]

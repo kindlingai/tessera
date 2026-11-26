@@ -17,6 +17,8 @@ struct Env {
     verbs: Option<String>,
     /// Bytes, maybe suffixed K, M, G or T, or `off`.
     memory: Option<String>,
+    /// `true` lets weights page or load by stage.
+    allow_weight_streaming: Option<bool>,
     /// `cached` or `direct`.
     reads: Option<String>,
     /// Launches per profile report, or `dynamic`.
@@ -85,6 +87,7 @@ pub fn read() -> Settings {
         emulate: env.emulate,
         verbs: env.verbs,
         memory: env.memory.map_or(Memory::Device, |m| memory(&m)),
+        weight_streaming: env.allow_weight_streaming.unwrap_or(false),
         reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
         hf_token: token(&var, std::env::home_dir()),

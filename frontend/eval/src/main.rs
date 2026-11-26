@@ -13,7 +13,7 @@ use tessera_engine::{Engine, Pins, Recipe, Row, Steps};
 /// Anything that stops a run.
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
-const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--m <list>] [--new <n>] \
+const USAGE: &str = "usage: tessera-eval --model <path> [--recipe <json>] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--allow-weight-streaming] [--m <list>] [--new <n>] \
 [--prompt <text>] [--reference <dir>] [--context <rows>] [--slices <json>] \
 [--embed <texts.json> [--vectors <file>]] [--forward <texts.json>]";
 
@@ -55,6 +55,8 @@ struct Args {
     explain_lowering: bool,
     /// Run although lowering fell off the fast path.
     allow_failed_lowering: bool,
+    /// Weights may page from the host.
+    allow_weight_streaming: bool,
 }
 
 fn args() -> Option<Args> {
@@ -73,6 +75,7 @@ fn args() -> Option<Args> {
         require_favored: false,
         explain_lowering: false,
         allow_failed_lowering: false,
+        allow_weight_streaming: false,
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
@@ -86,6 +89,10 @@ fn args() -> Option<Args> {
         }
         if flag == "--allow-failed-lowering" {
             args.allow_failed_lowering = true;
+            continue;
+        }
+        if flag == "--allow-weight-streaming" {
+            args.allow_weight_streaming = true;
             continue;
         }
         let value = given.next()?;
@@ -201,7 +208,8 @@ fn reference(dir: &Path) -> Result<(Vec<u32>, Vec<u32>), Failure> {
 
 fn evaluate(args: &Args) -> Result<Report, Failure> {
     let slots = args.m.iter().copied().max().unwrap_or(1) as u64;
-    let settings = tessera_frontend_settings::read();
+    let mut settings = tessera_frontend_settings::read();
+    settings.weight_streaming |= args.allow_weight_streaming;
     let rules = match &settings.names {
         Some(path) => tessera_bundle::names::rules(&std::fs::read_to_string(path)?)?,
         None => Vec::new(),

@@ -106,6 +106,8 @@ pub struct Settings {
     pub verbs: Option<String>,
     /// The plan size the runners refuse past.
     pub memory: Memory,
+    /// Weights may page from the host or load by stage.
+    pub weight_streaming: bool,
     pub reads: Reads,
     /// The Hugging Face hub cache.
     pub hub: Option<PathBuf>,
@@ -141,6 +143,7 @@ impl Default for Settings {
             emulate: None,
             verbs: None,
             memory: Memory::Device,
+            weight_streaming: false,
             reads: Reads::Cached,
             hub: None,
             hf_token: None,

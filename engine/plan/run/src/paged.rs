@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::held::Held;
+use crate::run::Base;
 use std::collections::{BTreeMap, HashMap};
 use tessera_gpukit::device::{Device, DeviceBuffer};
 use tessera_lower::{Loaded, Plan, Slot};
@@ -202,8 +203,13 @@ pub(crate) struct Pager<D: Device> {
 }
 
 impl<D: Device> Pager<D> {
-    /// Opens a pager when `plan` passes `budget`.
-    pub(crate) fn open(ctx: &D, plan: &Plan, budget: u64) -> Result<Option<Self>, Error> {
+    /// Opens a pager when `plan` passes `budget`. Fails unless `streams`.
+    pub(crate) fn open(
+        ctx: &D,
+        plan: &Plan,
+        budget: u64,
+        streams: bool,
+    ) -> Result<Option<Self>, Error> {
         let planned: u64 = plan.buffers.iter().map(|b| *b as u64).sum();
         if planned <= budget {
             return Ok(None);
@@ -216,6 +222,9 @@ impl<D: Device> Pager<D> {
         let reserve = RESERVE.min(budget / 8);
         if non_paged.saturating_add(reserve) >= budget {
             return Ok(None);
+        }
+        if !streams {
+            return Err(Error::Streaming { planned, budget });
         }
         let avail = (budget - non_paged - reserve) as usize;
         let total_paged: usize = layout.specs.iter().map(|s| s.experts * s.stride).sum();
@@ -458,13 +467,13 @@ pub(crate) fn prepare<'a, D: Device>(
     pager: &mut Option<Pager<D>>,
     ctx: &D,
     plan: &'a Plan,
-    budget: Option<u64>,
+    base: &Base,
 ) -> Result<(std::borrow::Cow<'a, Plan>, u64), Error> {
     if pager.is_none()
         && !ctx.unified()
-        && let Some(limit) = budget
+        && let Some(limit) = base.budget
     {
-        *pager = Pager::open(ctx, plan, limit)?;
+        *pager = Pager::open(ctx, plan, limit, base.streams)?;
     }
     match pager.as_ref() {
         Some(p) => Ok((std::borrow::Cow::Owned(p.rewrite(plan)), p.vram_bytes())),

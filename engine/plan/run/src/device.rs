@@ -86,6 +86,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             ctx,
             base: {
                 let mut base = Base::new(settings.memory, &ctx.platform());
+                base.streams = settings.weight_streaming;
                 if settings.memory == Memory::Device {
                     base.extend_budget(tessera_gpukit::attic::available(settings));
                 }
@@ -636,7 +637,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         {
             g.pause()?;
         }
-        let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, self.base.budget)?;
+        let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, &self.base)?;
         let pager = self.pager.as_ref();
         let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
         let plan = self.base.held.reuse_weights(plan.as_ref(), sized);

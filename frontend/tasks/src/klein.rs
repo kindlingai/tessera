@@ -146,6 +146,14 @@ impl Klein {
         let counting = tessera_engine::sizer::counting();
         let platform = tessera_engine::sizer::platform(&settings);
         let offload = platform.integrated && platform.memory <= OFFLOAD_LIMIT;
+        if offload && !settings.weight_streaming {
+            let memory = platform.memory;
+            let why = format!(
+                "klein keeps one stage loaded on a device with {memory} bytes. \
+                 --allow-weight-streaming loads each stage per picture"
+            );
+            return Err(why.into());
+        }
         let steps = pipeline.steps;
         let mut klein = Self {
             dir,

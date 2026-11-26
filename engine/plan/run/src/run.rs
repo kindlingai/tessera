@@ -27,6 +27,8 @@ pub struct Base {
     launches: Vec<OnceLock<Vec<Launch>>>,
     /// The most bytes a plan may use. `None` checks nothing.
     pub(crate) budget: Option<u64>,
+    /// Whether weights past the budget may page from the host.
+    pub(crate) streams: bool,
     /// Seconds per step kernel, while profiling.
     pub(crate) profile: Option<Profile>,
     pub(crate) reads: Reads,
