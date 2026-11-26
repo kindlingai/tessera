@@ -45,14 +45,14 @@ impl OnGpu for Stub<'_> {
     fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Outcome {
         let ctx = cached_context::<D>()?;
         match self.0.sums {
-            Sums::P2p => p2p_stub(ctx, self.0, self.1),
+            Sums::P2p | Sums::Arx => sum_stub(ctx, self.0, self.1),
             _ => on(ctx, self.0, self.1),
         }
     }
 }
 
-/// Runs `rounds` direct P2P sums of `args.size` floats.
-fn p2p_stub<D>(ctx: &D, args: &Args, rounds: u32) -> Outcome
+/// Runs `rounds` direct P2P or arx sums of `args.size` floats.
+fn sum_stub<D>(ctx: &D, args: &Args, rounds: u32) -> Outcome
 where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
 {
@@ -61,8 +61,19 @@ where
         Some(path) => Box::new(shm(path, rank, ranks, CAPACITY)?),
         None => Box::new(meet(rank, &args.addrs, args.listen)?),
     };
-    let wire = args.sum_wire.unwrap_or(DType::F32);
-    let mut p2p = P2p::on(ctx, &mut *boot, &args.shape)?.with_schedule(args.sched);
+    let mut sum: Box<dyn Sum> = match args.sums {
+        Sums::P2p => Box::new(P2p::on(ctx, &mut *boot, &args.shape)?.with_schedule(args.sched)),
+        Sums::Arx => {
+            let fabric = args
+                .fabric
+                .as_ref()
+                .ok_or("--sums arx needs --verbs or --ring")?;
+            let settings = tessera_frontend_settings::read();
+            tessera_frontend_comm::arx_sums(&mut *boot, fabric, &settings)?
+        }
+        _ => unreachable!(),
+    };
+    let wire = args.sum_wire.unwrap_or_else(|| sum.wire());
     let close = |got: f32, want: f32| match wire {
         DType::Bf16 => (got - want).abs() <= want.abs() * 0.02 + 1e-2,
         DType::Fp8 => (got - want).abs() <= want.abs() * 0.12 + 2.0,
@@ -77,15 +88,17 @@ where
     from.write_f32(&mine)?;
     to.zero()?;
     for _ in 0..5 {
-        p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
+        sum.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
     }
-    p2p.check()?;
+    ctx.finish()?;
+    sum.check()?;
     boot.exchange(&[])?;
     let start = Instant::now();
     for _ in 0..rounds {
-        p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
+        sum.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
     }
-    p2p.check()?;
+    ctx.finish()?;
+    sum.check()?;
     let elapsed = start.elapsed().as_secs_f64();
     let mut got = vec![0f32; n];
     to.read_f32(&mut got)?;
@@ -99,38 +112,41 @@ where
         wrong += usize::from(!close(v, want));
     }
     // Verify in-place all-reduce.
-    p2p.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
-    p2p.check()?;
+    sum.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
+    ctx.finish()?;
+    sum.check()?;
     to.read_f32(&mut got)?;
     for (i, &v) in got.iter().enumerate() {
         let want = (i % 97) as f32 * triangle * ranks as f32;
         wrong += usize::from(!close(v, want));
     }
     // Verify CUDA/HIP graph capture and repeated replay.
-    if ctx.graphs() && p2p.capturable() {
+    if ctx.graphs() && sum.capturable() {
         let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
-            p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
-            p2p.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
+            sum.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
+            sum.sum(to.device_ptr(), to.device_ptr(), n, wire)?;
             Ok(())
         })?;
         for _ in 0..4 {
             ctx.replay(&graph)?;
         }
-        p2p.check()?;
+        ctx.finish()?;
+        sum.check()?;
         to.read_f32(&mut got)?;
         for (i, &v) in got.iter().enumerate() {
             let want = (i % 97) as f32 * triangle * ranks as f32;
             wrong += usize::from(!close(v, want));
         }
     }
-    // Verify multi-row P2P all-gather (direct and graphed).
+    // Verify multi-row all-gather (direct and graphed).
     let rows = if n >= 4 && n.is_multiple_of(4) { 4 } else { 1 };
     let total = n * ranks as usize;
     let g_out = DeviceBuffer::alloc(ctx, total * 4)?;
     g_out.zero()?;
-    let g_ok = p2p.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
+    let g_ok = sum.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
     if g_ok {
-        p2p.check()?;
+        ctx.finish()?;
+        sum.check()?;
         let mut g_got = vec![0f32; total];
         g_out.read_f32(&mut g_got)?;
         let local_w = n / rows;
@@ -145,20 +161,21 @@ where
                 }
             }
         }
-        if ctx.graphs() && p2p.capturable() {
+        if ctx.graphs() && sum.capturable() {
             g_out.zero()?;
             let graph = ctx.capture(|| -> Result<(), Box<dyn Error>> {
-                p2p.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
-                let ok = p2p.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
+                sum.sum(from.device_ptr(), to.device_ptr(), n, wire)?;
+                let ok = sum.gather(from.device_ptr(), g_out.device_ptr(), n, total, rows)?;
                 if !ok {
-                    return Err("p2p gather declined inside graph".into());
+                    return Err("gather declined inside graph".into());
                 }
                 Ok(())
             })?;
             for _ in 0..4 {
                 ctx.replay(&graph)?;
             }
-            p2p.check()?;
+            ctx.finish()?;
+            sum.check()?;
             g_out.read_f32(&mut g_got)?;
             for r in 0..rows {
                 for k in 0..ranks as usize {
@@ -174,12 +191,16 @@ where
     }
     let us = elapsed * 1e6 / f64::from(rounds);
     let gbs = (bytes as f64 * f64::from(ranks - 1)) / (us * 1e3);
+    let kind = match args.sums {
+        Sums::Arx => "arx",
+        _ => "p2p",
+    };
     eprintln!(
-        "rank {rank}: p2p {rounds} sums of {n} floats ({bytes} B, {:?}), {wrong} wrong; \
+        "rank {rank}: {kind} {rounds} sums of {n} floats ({bytes} B, {:?}, {:?}), {wrong} wrong; \
          {us:.2} us/sum, {gbs:.2} GB/s out",
-        args.sched
+        wire, args.sched
     );
-    drop(p2p);
+    drop(sum);
     boot.exchange(&[])?;
     match wrong {
         0 => Ok(()),

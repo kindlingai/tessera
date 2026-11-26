@@ -14,7 +14,6 @@ use tessera_graph::{EntryKind, Role};
 use tessera_lower::{COMMIT, Cache, Device, PEEK, Report, Slot, Wants};
 use tessera_run::{Run, open};
 
-pub mod arx;
 mod batch_dual;
 mod batch_spec;
 mod dual;
@@ -59,7 +58,7 @@ pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate};
 
 // The front end reaches the engine crates only through these.
-pub use tessera_device::{p2p, sums, whole};
+pub use tessera_device::{arx, p2p, sums, whole};
 pub use tessera_engine_comm as comm;
 pub use tessera_engine_settings::{Ask, Asks, Backend, Memory, Reads};
 pub use tessera_graph::{Bf16, DType, DimExpr, DimName, E4M3, F16, Graph, PathSeg, Shape};

@@ -1,6 +1,7 @@
 //! Device headers for recipe kernels, and the import scanner.
 
 pub mod abi;
+pub mod arx;
 mod attend;
 pub mod calib;
 #[cfg(test)]

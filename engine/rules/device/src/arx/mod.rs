@@ -1,8 +1,8 @@
 //! Dual-root RoCE all-reduce over pinned memory and a host proxy.
 
+use crate::resident::{Error, backend, persistent};
+use crate::{Options, flatten};
 use std::time::Duration;
-use tessera_device::resident::{Error, backend, persistent};
-use tessera_device::{Options, flatten};
 use tessera_engine_comm::{ArxLink, ArxMem};
 use tessera_gpukit::backend::{Backend as Gpu, OnGpu};
 use tessera_gpukit::device::{Device, DeviceBuffer, cached_context};
@@ -24,8 +24,10 @@ pub struct Arx<D: Device> {
     mem: ArxMem,
     one_bf16: D::Kernel,
     one_f32: D::Kernel,
+    one_fp8: D::Kernel,
     two_bf16: D::Kernel,
     two_f32: D::Kernel,
+    two_fp8: D::Kernel,
     allgather: D::Kernel,
     state: DeviceBuffer<D>,
     blocks: DeviceBuffer<D>,
@@ -53,8 +55,10 @@ where
         let text = flatten("arx.cu", KERNEL, &|_| None, &options)?.text;
         let one_bf16 = ctx.compile(&text, "tessera_arx_one_bf16")?;
         let one_f32 = ctx.compile(&text, "tessera_arx_one_f32")?;
+        let one_fp8 = ctx.compile(&text, "tessera_arx_one_fp8")?;
         let two_bf16 = ctx.compile(&text, "tessera_arx_two_bf16")?;
         let two_f32 = ctx.compile(&text, "tessera_arx_two_f32")?;
+        let two_fp8 = ctx.compile(&text, "tessera_arx_two_fp8")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
         let state = DeviceBuffer::alloc(ctx, 32)?;
         let blocks = DeviceBuffer::alloc(ctx, 96)?;
@@ -69,8 +73,10 @@ where
             mem,
             one_bf16,
             one_f32,
+            one_fp8,
             two_bf16,
             two_f32,
+            two_fp8,
             allgather,
             state,
             blocks,
@@ -97,14 +103,30 @@ where
             .u64(self.timeout_ticks);
     }
 
-    fn launch_one(&mut self, from: u64, to: u64, n: u32, bf16: bool) -> Result<(), Error> {
+    fn launch_sum_kernel(
+        &mut self,
+        from: u64,
+        to: u64,
+        n: u32,
+        wire: DType,
+        two: bool,
+    ) -> Result<(), Error> {
         let mut args = self.base_args();
         args.u64(from).u64(to).u32(n);
         self.finish_args(&mut args);
-        let grid = (n / (THREADS * 8)).clamp(1, 32);
-        let kernel = match bf16 {
-            true => &self.one_bf16,
-            false => &self.one_f32,
+        let step = if wire == DType::Fp8 {
+            1024
+        } else {
+            THREADS * 8
+        };
+        let grid = n.div_ceil(step).clamp(1, 48);
+        let kernel = match (two, wire) {
+            (false, DType::Bf16) => &self.one_bf16,
+            (false, DType::Fp8) => &self.one_fp8,
+            (false, _) => &self.one_f32,
+            (true, DType::Bf16) => &self.two_bf16,
+            (true, DType::Fp8) => &self.two_fp8,
+            (true, _) => &self.two_f32,
         };
         self.ctx.programmatic(false);
         Ok(self
@@ -112,35 +134,36 @@ where
             .launch(kernel, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?)
     }
 
-    fn launch_two(&mut self, from: u64, to: u64, n: u32, bf16: bool) -> Result<(), Error> {
-        let mut args = self.base_args();
-        args.u64(from).u64(to).u32(n);
-        self.finish_args(&mut args);
-        let grid = (n / (THREADS * 8)).clamp(1, 32);
-        let kernel = match bf16 {
-            true => &self.two_bf16,
-            false => &self.two_f32,
-        };
-        self.ctx.programmatic(false);
-        Ok(self
-            .ctx
-            .launch(kernel, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?)
-    }
-
-    fn launch_sum(&mut self, from: u64, to: u64, len: usize, bf16: bool) -> Result<(), Error> {
-        let elem = if bf16 { 2 } else { 4 };
+    fn launch_sum(&mut self, from: u64, to: u64, len: usize, wire: DType) -> Result<(), Error> {
         let ranks = self.mem.ranks as usize;
-        let align = ranks * 8;
+        let wire_bytes = |elems: usize| match wire {
+            DType::Fp8 => (elems / 1024) * 1152 + (elems % 1024) * 4,
+            DType::Bf16 => elems * 2,
+            _ => elems * 4,
+        };
+        let align = match wire {
+            DType::Fp8 => ranks * 1024,
+            _ => ranks * 8,
+        };
         let aligned = (from & 15) == 0 && (to & 15) == 0;
-        let two_shot =
-            self.mem.mesh && aligned && len * elem > TWO_SHOT_BYTES && len.is_multiple_of(align);
-        let max_elems = match two_shot {
-            true => {
+        let two_shot = self.mem.mesh
+            && aligned
+            && wire_bytes(len) > TWO_SHOT_BYTES
+            && len.is_multiple_of(align);
+        let max_elems = match (two_shot, wire) {
+            (true, DType::Fp8) => {
+                let by_send = (ArxLink::SEND_BYTES / 1152) * 1024;
+                let by_slot = (ArxLink::SLOT_BYTES / 1152) * 1024 * ranks;
+                (by_send.min(by_slot) / align) * align
+            }
+            (false, DType::Fp8) => ((ArxLink::SLOT_BYTES - 4096) / 1152) * 1024,
+            (true, _) => {
+                let elem = if wire == DType::Bf16 { 2 } else { 4 };
                 let by_send = ArxLink::SEND_BYTES / elem;
                 let by_slot = (ArxLink::SLOT_BYTES / elem) * ranks;
                 (by_send.min(by_slot) / align) * align
             }
-            false => ArxLink::SLOT_BYTES / elem,
+            (false, _) => ArxLink::SLOT_BYTES / if wire == DType::Bf16 { 2 } else { 4 },
         };
         let mut off = 0usize;
         while off < len {
@@ -148,11 +171,9 @@ where
             let f = from + (off * 4) as u64;
             let t = to + (off * 4) as u64;
             let n = u32::try_from(step).map_err(|_| Error::Plan("arx sum too long".into()))?;
-            if two_shot && step * elem > TWO_SHOT_BYTES && step.is_multiple_of(align) {
-                self.launch_two(f, t, n, bf16)?;
-            } else {
-                self.launch_one(f, t, n, bf16)?;
-            }
+            let use_two =
+                two_shot && wire_bytes(step) > TWO_SHOT_BYTES && step.is_multiple_of(align);
+            self.launch_sum_kernel(f, t, n, wire, use_two)?;
             off += step;
         }
         Ok(())
@@ -208,6 +229,10 @@ where
         DType::Bf16
     }
 
+    fn carries(&self, wire: DType) -> bool {
+        matches!(wire, DType::F32 | DType::Bf16 | DType::Fp8)
+    }
+
     fn check(&mut self) -> Result<(), tessera_run::Error> {
         if let Err(e) = self.link.check() {
             self.broken = true;
@@ -223,11 +248,9 @@ where
         len: usize,
         wire: DType,
     ) -> Result<(), tessera_run::Error> {
-        let bf16 = match wire {
-            DType::Bf16 => true,
-            DType::F32 => false,
-            other => return Err(tessera_run::Error::Wire(other)),
-        };
+        if !self.carries(wire) {
+            return Err(tessera_run::Error::Wire(wire));
+        }
         if self.broken {
             return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
                 "an earlier arx sum failed".into(),
@@ -236,7 +259,7 @@ where
         if len == 0 {
             return Ok(());
         }
-        self.launch_sum(from, to, len, bf16)
+        self.launch_sum(from, to, len, wire)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 
