@@ -55,9 +55,9 @@ fn ring_wiring() {
 
 #[test]
 fn lanes_split_in_sixteens() {
-    assert_eq!(parts(100, 2), [(0, 64), (64, 36)]);
-    assert_eq!(parts(16, 2), [(0, 16), (16, 0)]);
-    assert_eq!(parts(0, 3), [(0, 0), (0, 0), (0, 0)]);
+    assert_eq!(parts(100, 2).collect::<Vec<_>>(), [(0, 64), (64, 36)]);
+    assert_eq!(parts(16, 2).collect::<Vec<_>>(), [(0, 16), (16, 0)]);
+    assert_eq!(parts(0, 3).collect::<Vec<_>>(), [(0, 0), (0, 0), (0, 0)]);
 }
 
 #[test]

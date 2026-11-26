@@ -24,7 +24,7 @@ use tessera_run::{Rank, Run, sum_wire};
 const USAGE: &str = "tessera-ranks --rank N (--addrs HOST:PORT,... | --shm PATH --ranks N)
   [--model NAME] [--fixture DIR] [--listen ADDR] [--backend host|gpu] [--parts 3,1]
   [--form q8_0] [--verbs DEV[:GID],... | --ring PREVDEV,.../NEXTDEV,...] [--repeat N]
-  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--shape KERNEL:KNOB=N]... [--sums host|grid|p2p]
+  [--stub ROUNDS] [--size FLOATS] [--sched auto|fanout|rounds|butterfly] [--shape KERNEL:KNOB=N]... [--sums host|grid|arx|p2p]
   [--sum-wire f32|bf16|f16|fp8] [--recipe DIR] [--require-favored]
   --verbs and --ring move the sums over RDMA, one lane per device, after the
   ranks meet over the sockets or the file. --sums grid runs them in a
@@ -252,6 +252,14 @@ fn join(
     };
     if args.sums == Sums::P2p {
         let sum = p2p(&mut *met, settings, &args.shape)?;
+        return Ok((met, Some(sum)));
+    }
+    if args.sums == Sums::Arx {
+        let fabric = args
+            .fabric
+            .as_ref()
+            .ok_or("--sums arx needs --verbs or --ring")?;
+        let sum = tessera_frontend_comm::arx_sums(&mut *met, fabric, settings)?;
         return Ok((met, Some(sum)));
     }
     if args.sums == Sums::Grid {

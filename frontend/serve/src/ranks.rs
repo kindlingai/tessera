@@ -6,12 +6,12 @@ use tessera_engine::comm::{Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Grid, Knobs, Place, Recipe, Settings};
 use tessera_frontend_comm::{
-    Sums, grid, join, meet, p2p, ports, resident, sum_wire_flag, sums_flag,
+    Sums, arx_sums, grid, join, meet, p2p, ports, resident, sum_wire_flag, sums_flag,
 };
 
 /// The flags for `Ranks::flag`.
 pub const FLAGS: &str = "[--rank <n> --peers <ip:port>,... [--parts <a>,<b>,...] \
-[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|p2p|whole] \
+[--verbs <dev>[:<gid>],... | --ring <prev>,.../<next>,...] [--sums host|grid|arx|p2p|whole] \
 [--sum-wire f32|bf16|f16|fp8] [--moe ep|tp]]";
 
 /// Sums and control transports, and any grid.
@@ -112,12 +112,15 @@ impl Ranks {
         let mut met: Box<dyn Transport> =
             Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
         let grids = match (self.whole, self.sums, &self.fabric) {
-            (true, _, None) | (false, Sums::Grid, None) => {
-                return Err("--sums grid or whole needs --verbs or --ring".into());
+            (true, _, None) | (false, Sums::Grid | Sums::Arx, None) => {
+                return Err("--sums grid, arx or whole needs --verbs or --ring".into());
             }
             (true, _, Some(fabric)) => resident(&mut *met, fabric, settings).map(Grids::Steps),
             (false, Sums::P2p, _) => p2p(&mut *met, settings, knobs).map(Grids::Sums),
             (false, Sums::Grid, Some(fabric)) => grid(&mut *met, fabric, settings).map(Grids::Sums),
+            (false, Sums::Arx, Some(fabric)) => {
+                arx_sums(&mut *met, fabric, settings).map(Grids::Sums)
+            }
             (false, Sums::Host, _) => {
                 let links = join(met, self.fabric.as_ref());
                 return links

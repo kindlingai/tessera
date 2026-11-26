@@ -58,7 +58,7 @@ impl Region {
         unsafe { self.base.add(offset) }
     }
 
-    fn word(&self, at: usize) -> &AtomicU64 {
+    pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
         unsafe { &*(self.at(8 * at) as *const AtomicU64) }
     }
 }
@@ -108,7 +108,7 @@ pub(crate) struct Engine {
     pub(crate) ranks: u32,
     pub(crate) lib: &'static Lib,
     pub(crate) wiring: Wiring,
-    lanes: usize,
+    pub(crate) lanes: usize,
     pub(crate) opened: Vec<Opened>,
     /// Per channel, per lane.
     pub(crate) links: Vec<Vec<Link>>,
@@ -294,7 +294,7 @@ impl Engine {
         self.modify(link.qp, &mut attr, bits)
     }
 
-    fn slot(&self, parity: usize, source: u32) -> usize {
+    pub(crate) fn slot(&self, parity: usize, source: u32) -> usize {
         (parity * self.ranks as usize + source as usize) * self.capacity
     }
 
@@ -303,7 +303,7 @@ impl Engine {
     }
 
     /// Every lane's flag from `source` reached `seq`.
-    fn arrived(&self, source: u32, seq: u64) -> bool {
+    pub(crate) fn arrived(&self, source: u32, seq: u64) -> bool {
         (0..self.lanes).all(|lane| self.flag(source, lane).load(Ordering::Acquire) >= seq)
     }
 
@@ -313,7 +313,7 @@ impl Engine {
     }
 
     /// Writes a region's bytes to the peer, then flags `seq`.
-    fn post(
+    pub(crate) fn post(
         &mut self,
         channel: usize,
         from: (usize, usize),
@@ -326,7 +326,7 @@ impl Engine {
         let region = &self.regions[which];
         let c = &self.wiring.channels[channel];
         let peer = &self.peers[c.peer as usize];
-        for (lane, (start, len)) in parts(total, self.lanes).into_iter().enumerate() {
+        for (lane, (start, len)) in parts(total, self.lanes).enumerate() {
             let link = &mut self.links[channel][lane];
             let far = &peer.channels[c.meets][lane];
             let lkey = unsafe { (*self.opened[link.port].mrs[which]).lkey };
@@ -385,7 +385,7 @@ impl Engine {
     }
 
     /// Completions with errors stop the round.
-    fn poll(&self) -> Result<(), Error> {
+    pub(crate) fn poll(&self) -> Result<(), Error> {
         let mut wc = [unsafe { std::mem::zeroed::<Wc>() }; BATCH];
         for opened in &self.opened {
             let n = unsafe { self.lib.poll_cq(opened.cq, &mut wc) };

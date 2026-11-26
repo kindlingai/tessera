@@ -1864,6 +1864,7 @@ dependencies = [
  "tessera-device",
  "tessera-engine-comm",
  "tessera-engine-settings",
+ "tessera-gpukit",
  "tessera-graph",
  "tessera-interp",
  "tessera-kv",

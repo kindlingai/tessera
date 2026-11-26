@@ -1,5 +1,6 @@
 //! Moves bytes between ranks over handles the front end opened.
 
+mod arx;
 mod fabric;
 mod ibv;
 mod link;
@@ -13,6 +14,7 @@ mod verbs;
 mod verbs_link;
 mod words;
 
+pub use arx::{ArxLink, ArxMem};
 pub use fabric::{Fabric, Port};
 pub use link::{Blocking, Link, Put, Span, exchange_regions};
 pub use memory::Memory;

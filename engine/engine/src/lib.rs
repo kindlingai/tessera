@@ -14,6 +14,7 @@ use tessera_graph::{EntryKind, Role};
 use tessera_lower::{COMMIT, Cache, Device, PEEK, Report, Slot, Wants};
 use tessera_run::{Run, open};
 
+pub mod arx;
 mod batch_dual;
 mod batch_spec;
 mod dual;

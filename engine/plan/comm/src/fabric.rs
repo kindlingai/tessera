@@ -109,14 +109,14 @@ impl Fabric {
 }
 
 /// `total` bytes over `lanes`, as (start, length) in 16s.
-pub(crate) fn parts(total: usize, lanes: usize) -> Vec<(usize, usize)> {
+pub(crate) fn parts(total: usize, lanes: usize) -> impl Iterator<Item = (usize, usize)> {
     let step = (total.div_ceil(lanes) + 15) & !15;
-    (0..lanes)
-        .map(|lane| {
-            let start = (lane * step).min(total);
-            (start, ((lane + 1) * step).min(total) - start)
-        })
-        .collect()
+    (0..lanes).map(move |lane| {
+        let start = (lane * step).min(total);
+        let end = ((lane + 1) * step).min(total);
+        let len = end - start;
+        (start, len)
+    })
 }
 
 /// A rank's message to the others about one queue pair.

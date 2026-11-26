@@ -14,7 +14,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use tessera_engine::comm::{Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
+use tessera_engine::arx;
+use tessera_engine::comm::{ArxLink, Error, Fabric, Shm, Sockets, Transport, Verbs, VerbsLink};
 use tessera_engine::p2p;
 use tessera_engine::sums::{self, Sum};
 use tessera_engine::whole;
@@ -76,14 +77,16 @@ pub enum Sums {
     #[default]
     Host,
     Grid,
+    Arx,
     P2p,
 }
 
-/// Parses `--sums host|grid|p2p`.
+/// Parses `--sums host|grid|arx|p2p`.
 pub fn sums_flag(value: &str) -> Option<Sums> {
     match value {
         "host" => Some(Sums::Host),
         "grid" => Some(Sums::Grid),
+        "arx" => Some(Sums::Arx),
         "p2p" => Some(Sums::P2p),
         _ => None,
     }
@@ -122,6 +125,23 @@ pub fn grid(
 ) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
     let link = link(met, fabric, settings, (sums::regions, sums::RELAY), "sums")?;
     Ok(sums::open(settings.gpu(), link)?)
+}
+
+/// Dual-root RoCE sums over `fabric`, met through `met`.
+pub fn arx_sums(
+    met: &mut dyn Transport,
+    fabric: &Fabric,
+    settings: &Settings,
+) -> Result<Box<dyn Sum>, Box<dyn std::error::Error>> {
+    let (rank, ranks) = (met.rank(), met.ranks());
+    let pinning = tessera_engine::pinning(settings);
+    let link = ArxLink::connect(rank, ranks, fabric, met, pinning)?;
+    eprintln!(
+        "rank {rank}: sums over arx ({} lanes): {}",
+        fabric.lanes(),
+        roce::describe(fabric)
+    );
+    Ok(arx::open(settings.gpu(), link)?)
 }
 
 /// A recipe's resident grid, its sums over `fabric`.

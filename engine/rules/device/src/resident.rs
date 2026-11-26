@@ -280,7 +280,7 @@ pub(crate) fn build_control(
     (block.0, places)
 }
 
-pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
+pub fn backend<D: Device>() -> Result<Backend, Error> {
     let backend = D::BACKEND;
     if !backend.persistent() {
         return Err(plan(format!("{backend} has no persistent grids")));
@@ -289,7 +289,7 @@ pub(crate) fn backend<D: Device>() -> Result<Backend, Error> {
 }
 
 /// Runs `work` on `gpu` when it keeps persistent grids.
-pub(crate) fn persistent<T, W>(gpu: Option<Backend>, work: W) -> Result<T, Error>
+pub fn persistent<T, W>(gpu: Option<Backend>, work: W) -> Result<T, Error>
 where
     W: OnGpu<Out = Result<T, Error>>,
 {
