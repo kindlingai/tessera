@@ -1,8 +1,9 @@
 //! Buffers a runner keeps across plans.
 
 use crate::Error;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use tessera_lower::{Plan, Slot};
+use tessera_lower::{Loaded, Plan, Slot};
 use tessera_mem::{Buffer, View, ViewMut};
 
 /// Bytes a buffer holds at least, as zero-byte allocations fail.
@@ -169,6 +170,72 @@ impl Held {
     pub fn view_mut(&mut self, slot: Slot) -> ViewMut<'_> {
         let at = self.bound[slot.buffer as usize];
         self.all[at].view_mut(slot.start(), slot.form.dtype(), vec![slot.len])
+    }
+
+    /// Remaps subset weight arenas to already-loaded offsets in place.
+    pub fn reuse_weights<'a>(
+        &self,
+        plan: &'a Plan,
+        sized: impl Fn(u32, Option<u8>) -> Option<usize>,
+    ) -> Cow<'a, Plan> {
+        let mut by_buf: HashMap<u32, Vec<&Loaded>> = HashMap::new();
+        for l in &plan.weights {
+            by_buf.entry(l.slot.buffer).or_default().push(l);
+        }
+        let mut remap: HashMap<(u32, usize), usize> = HashMap::new();
+        let mut sizes: HashMap<u32, usize> = HashMap::new();
+        for (&b, entries) in &by_buf {
+            let zone = plan.zone(b);
+            let first = (entries[0].weight, entries[0].part);
+            let Some(places) = self.weights.get(&first) else {
+                continue;
+            };
+            let hit = places.iter().find_map(|p| {
+                let buf = &self.all[p.buffer];
+                if buf.zone != zone {
+                    return None;
+                }
+                let mut moved = Vec::with_capacity(entries.len());
+                let mut shifted = false;
+                for l in entries {
+                    let bytes = sized(l.weight, l.part).unwrap_or_else(|| l.slot.bytes());
+                    let q = self
+                        .weights
+                        .get(&(l.weight, l.part))?
+                        .iter()
+                        .find(|q| q.buffer == p.buffer && q.bytes == bytes)?;
+                    shifted |= q.offset != l.slot.offset;
+                    moved.push((l.slot.offset, q.offset));
+                }
+                shifted.then_some((buf.bytes(), moved))
+            });
+            if let Some((buf_bytes, moved)) = hit {
+                sizes.insert(b, buf_bytes);
+                for (old_off, new_off) in moved {
+                    remap.insert((b, old_off), new_off);
+                }
+            }
+        }
+        if remap.is_empty() {
+            return Cow::Borrowed(plan);
+        }
+        let mut out = plan.clone();
+        for (&b, &bytes) in &sizes {
+            out.buffers[b as usize] = bytes;
+        }
+        for l in &mut out.weights {
+            if let Some(&off) = remap.get(&(l.slot.buffer, l.slot.offset)) {
+                l.slot.offset = off;
+            }
+        }
+        for step in &mut out.steps {
+            for r in &mut step.reads {
+                if let Some(&off) = remap.get(&(r.buffer, r.offset)) {
+                    r.offset = off;
+                }
+            }
+        }
+        Cow::Owned(out)
     }
 
     /// Binds `plan`'s buffers. Returns true if any buffer dropped.

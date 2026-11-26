@@ -631,6 +631,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             g.pause()?;
         }
         let (plan, extra) = paged::prepare(&mut self.pager, self.ctx, plan, self.base.budget)?;
+        let pager = self.pager.as_ref();
+        let sized = |w, p| pager.and_then(|g| g.slot_bytes(w, p));
+        let plan = self.base.held.reuse_weights(plan.as_ref(), sized);
         let plan = plan.as_ref();
         if !self.base.fresh_with(plan, extra)? {
             return Ok(());

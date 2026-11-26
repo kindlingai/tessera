@@ -415,5 +415,16 @@ impl Buffers<'_> {
                 self.free_scratch(self.slot(*v));
             }
         }
+        // Unread temporary outputs free immediately after this step.
+        if self.last[op.write.0 as usize] <= at
+            && self.s.values[op.write.0 as usize].home == Home::Temp
+        {
+            self.free_scratch(write);
+        }
+        for &v in &op.also {
+            if self.last[v.0 as usize] <= at && self.s.values[v.0 as usize].home == Home::Temp {
+                self.free_scratch(self.slot(v));
+            }
+        }
     }
 }

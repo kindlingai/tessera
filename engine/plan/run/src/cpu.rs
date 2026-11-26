@@ -135,6 +135,8 @@ impl Run for Runner {
     }
 
     fn replan(&mut self, plan: &Plan) -> Result<(), Error> {
+        let plan = self.base.held.reuse_weights(plan, |_, _| None);
+        let plan = plan.as_ref();
         if !self.base.fresh(plan)? {
             return Ok(());
         }
