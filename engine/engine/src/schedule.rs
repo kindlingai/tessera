@@ -424,7 +424,7 @@ impl<'a> Batch<'a> {
                     ids.push(r.ids.clone());
                 }
                 match picks.is_empty() {
-                    true => drop(self.engine.last(&rows)?),
+                    true => self.engine.fill(&rows)?,
                     false => scores.extend(self.engine.scores(&rows, &picks, &ids)?),
                 }
                 seq.history.extend(seq.pending.drain(..n));
@@ -462,6 +462,20 @@ impl<'a> Batch<'a> {
         let fits = owners
             .iter()
             .all(|&(at, keep)| !keep || self.engine.edits_fit(self.active[at].edits.len()));
+        // Every pick is dropped, so skip the head.
+        if owners.iter().all(|&(_, keep)| !keep) {
+            self.engine.fill(&rows)?;
+            for &(at, _) in &owners {
+                let seq = &mut self.active[at];
+                if sampling {
+                    // Draws stay in step with launches that pick.
+                    seq.sampler.unit();
+                }
+                let n = rows.iter().filter(|r| r.slot == seq.slot).count();
+                seq.advance(n, Target::Ids(&[]));
+            }
+            return Ok(true);
+        }
         let picked = match (sampling || (edited && !fits), edited, self.allowed(&owners)) {
             (true, _, allowed) => {
                 let (mut logits, vocab) = self.engine.last_logits(&rows)?;

@@ -618,6 +618,28 @@ impl Engine {
         self.launch(rows, &ends(rows), Head::Full(None))
     }
 
+    /// One launch of `rows` that only appends kept state.
+    pub fn fill(&mut self, rows: &[Row]) -> Result<(), Error> {
+        let tokens = Wants::role(&self.graph, self.full, Role::Tokens);
+        // A whole-step kernel declines a step without the head.
+        if self.steps(rows, &[], Wants::NONE)? > self.steps(rows, &ends(rows), tokens)? {
+            return self.last(rows).map(drop);
+        }
+        self.run(rows, &[], Head::Full(None), Wants::NONE)?;
+        self.report();
+        Ok(())
+    }
+
+    /// Steps in the plan for `rows`, `picks` and `wants`.
+    fn steps(&mut self, rows: &[Row], picks: &[u32], wants: Wants) -> Result<usize, Error> {
+        let (sizes, _) = launch_of(rows, picks, self.slots, self.context);
+        let upto = &[Context, Segments];
+        let (plan, _) =
+            self.plans
+                .wanting(&self.graph, self.full, wants, &sizes, upto, &self.device)?;
+        Ok(plan.steps.len())
+    }
+
     /// One launch: full logits after each slot's last row.
     pub fn last_logits(&mut self, rows: &[Row]) -> Result<(Vec<f32>, usize), Error> {
         let picks = ends(rows);

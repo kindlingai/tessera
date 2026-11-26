@@ -21,6 +21,8 @@ pub struct Wants(pub u32);
 
 impl Wants {
     pub const ALL: Self = Self(u32::MAX);
+    /// No outputs: the launch only appends kept rows and state.
+    pub const NONE: Self = Self(0);
 
     /// The outputs of `entry` with `role`.
     pub fn role(g: &Graph, entry: usize, role: Role) -> Self {
@@ -321,7 +323,16 @@ impl<'a> Tree<'a> {
         };
         let wanted = e.outputs.iter().enumerate().filter(|(i, _)| wants.has(*i));
         let outputs: Vec<usize> = wanted.map(|(_, o)| o.node.0 as usize).collect();
-        let needed = needed(g, &outputs);
+        let mut roots = outputs.clone();
+        if wants == Wants::NONE {
+            // The appends a launch of every output would make.
+            let all: Vec<usize> = e.outputs.iter().map(|o| o.node.0 as usize).collect();
+            let full = needed(g, &all);
+            roots = (0..g.nodes.len())
+                .filter(|&i| full[i] && g.nodes[i].op.keeps())
+                .collect();
+        }
+        let needed = needed(g, &roots);
         let roles = output_roles(g, entry);
         let in_moe = moe_nodes(g);
         let mut tree = Tree {
