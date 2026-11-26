@@ -50,14 +50,14 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
         "host": {"total": total, "available": available},
     });
     if boot {
-        out["boot"] = self::boot(options, &settings);
+        out["boot"] = self::boot(options, &settings)?;
     } else {
         let free = free.unwrap_or(platform.memory);
         plan(
             options,
             (free, platform.integrated, sizer::attic(&settings)),
             &mut out,
-        );
+        )?;
     }
     println!("{out}");
     Ok(())
@@ -68,9 +68,9 @@ fn plan(
     options: tessera_serve::start::Options,
     (free, integrated, attic): (u64, bool, u64),
     out: &mut Value,
-) {
+) -> Result<(), Stop> {
     sizer::sizing();
-    crate::task::load(options);
+    crate::task::load(options)?;
     let sizes = sizer::sized();
     // Integrated devices share host memory with load copies.
     let (free, copy) = match integrated {
@@ -90,6 +90,7 @@ fn plan(
     }
     out["fits"] = (need <= avail).into();
     out["headroom"] = (avail as i64 - need as i64).into();
+    Ok(())
 }
 
 /// A step's name, start and seconds once it ends.
@@ -137,7 +138,7 @@ impl Lows {
 }
 
 /// Loads, runs one step, and measures memory and time.
-fn boot(mut options: tessera_serve::start::Options, settings: &Settings) -> Value {
+fn boot(mut options: tessera_serve::start::Options, settings: &Settings) -> Result<Value, Stop> {
     let phases = Arc::new(Phases::default());
     options.progress = options.progress.also(phases.clone());
     let before = (sizer::host()[1], sizer::free(settings));
@@ -157,6 +158,7 @@ fn boot(mut options: tessera_serve::start::Options, settings: &Settings) -> Valu
     };
     let start = Instant::now();
     let slot = crate::task::load(options);
+    let slot = slot.inspect_err(|_| lows.done.store(true, Ordering::Relaxed))?;
     let loaded = start.elapsed().as_secs_f64();
     let model = slot.get().expect("the model loaded");
     let stepping = Instant::now();
@@ -173,7 +175,7 @@ fn boot(mut options: tessera_serve::start::Options, settings: &Settings) -> Valu
     let device = before
         .1
         .map(|b| b - lows.device.load(Ordering::Relaxed).min(b));
-    json!({
+    Ok(json!({
         "phases": steps,
         "load_seconds": loaded,
         "first_step_seconds": step,
@@ -181,7 +183,7 @@ fn boot(mut options: tessera_serve::start::Options, settings: &Settings) -> Valu
         "peak_rss": peak_rss(),
         "peak_host_used": before.0 - lows.host.load(Ordering::Relaxed).min(before.0),
         "peak_device_used": device,
-    })
+    }))
 }
 
 /// The kind of model step that ran, or its error.

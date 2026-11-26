@@ -11,7 +11,6 @@ use crate::serve::Serve;
 use crate::source::{Origin, Source, Stop};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
-use std::time::Duration;
 use tessera_engine::progress::Progress;
 use tessera_serve::start::{self, Options};
 use tessera_serve::{Model, Slot};
@@ -128,7 +127,7 @@ impl<T: Task + for<'a> Run<&'a Model>> Target<T> for OnModel {
             options.flag("--task", kind.into()).ok_or(Stop::Usage)?;
         }
         options.slots = 1;
-        let slot = load(options);
+        let slot = load(options)?;
         task.run(model(&slot), sink)
     }
 }
@@ -240,12 +239,8 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
 }
 
 /// Starts the load and waits for the model.
-pub(crate) fn load(options: Options) -> Slot {
-    let slot = start::spawn(options);
-    while slot.get().is_none() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    slot
+pub(crate) fn load(options: Options) -> Result<Slot, Stop> {
+    start::open(options).map_err(Stop::Failed)
 }
 
 fn model(slot: &Slot) -> &Model {

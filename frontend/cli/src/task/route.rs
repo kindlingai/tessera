@@ -259,7 +259,7 @@ impl Session {
         let mut options = source.options(switches)?;
         options.slots = 1;
         Ok(Session {
-            slot: load(options),
+            slot: load(options)?,
             max_tokens,
             yes,
             token: source.token.clone(),

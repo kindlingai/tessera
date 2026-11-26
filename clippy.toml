@@ -7,4 +7,5 @@ disallowed-methods = [
     { path = "std::env::vars_os", reason = "read it in frontend_settings::read" },
     { path = "std::env::home_dir", reason = "read it in frontend_settings::read" },
     { path = "std::env::temp_dir", reason = "read it in frontend_settings::read" },
+    { path = "std::process::exit", reason = "return an error so callers decide; exit skips destructors" },
 ]

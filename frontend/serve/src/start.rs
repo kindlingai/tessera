@@ -5,7 +5,9 @@ use crate::{Models, Slot};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tessera_bundle::Overrides;
 use tessera_engine::hf::LAYERS;
 use tessera_engine::progress::{Open, Progress, Unit};
@@ -232,23 +234,40 @@ impl Options {
     }
 }
 
-/// Loads the model on a thread. The slot fills after.
-pub fn spawn(options: Options) -> Slot {
-    spawn_all(options).named[0].1.clone()
+/// Loads the model on a thread and waits for it.
+pub fn open(options: Options) -> Result<Slot, String> {
+    let (models, failed) = spawn_all(options);
+    let slot = models.named[0].1.clone();
+    loop {
+        match failed.recv_timeout(Duration::from_millis(20)) {
+            Ok(e) => return Err(e),
+            Err(RecvTimeoutError::Timeout) if slot.get().is_none() => {}
+            Err(_) => break,
+        }
+    }
+    slot.get()
+        .is_some()
+        .then_some(slot)
+        .ok_or("no model".into())
 }
 
-/// Loads each model on a thread. Slots fill after.
-fn spawn_all(mut options: Options) -> Models {
+/// Loads each model on a thread and sends back failures.
+fn spawn_all(mut options: Options) -> (Models, Receiver<String>) {
     let turns = Turns::new(options.seating());
     let also = std::mem::take(&mut options.also);
+    let (failures, failed) = channel();
     let mut named = Vec::new();
     for options in std::iter::once(options).chain(also) {
         let slot = Slot::default();
         named.push((options.served(), slot.clone()));
-        let turns = turns.clone();
-        std::thread::spawn(move || load(options, slot, &turns));
+        let (turns, failures) = (turns.clone(), failures.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = load(options, slot, &turns) {
+                let _ = failures.send(e);
+            }
+        });
     }
-    Models { named, turns }
+    (Models { named, turns }, failed)
 }
 
 /// Loads the models, then answers requests until killed.
@@ -265,8 +284,7 @@ pub fn run(mut options: Options) -> Result<(), String> {
     }
     if options.ranks.follows() {
         let turns = Turns::new(options.seating());
-        load(options, Slot::default(), &turns);
-        return Ok(());
+        return load(options, Slot::default(), &turns);
     }
     let open = Arc::new(Open::default());
     options.progress = options.progress.also(open.clone());
@@ -274,18 +292,25 @@ pub fn run(mut options: Options) -> Result<(), String> {
         more.progress = more.progress.also(open.clone());
     }
     let key = options.api_key.take();
-    let models = spawn_all(options);
+    let (models, failed) = spawn_all(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
     eprintln!("listening on {host}:{port}");
-    crate::http::run(listener, limits, move |request| {
-        if let Some(expected) = key.as_deref()
-            && let Some(denied) = check_auth(expected, request)
-        {
-            return denied;
-        }
-        models.route(Some(&open), request)
+    let serving = std::thread::spawn(move || {
+        crate::http::run(listener, limits, move |request| {
+            if let Some(expected) = key.as_deref()
+                && let Some(denied) = check_auth(expected, request)
+            {
+                return denied;
+            }
+            models.route(Some(&open), request)
+        })
     });
-    Ok(())
+    if let Ok(e) = failed.recv() {
+        return Err(e);
+    }
+    serving
+        .join()
+        .map_err(|_| "the server thread panicked".into())
 }
 
 /// Constant-time equality over two byte slices.
@@ -335,8 +360,8 @@ pub(crate) fn check_auth(
     Some(crate::http::Response::json(401, &body))
 }
 
-/// Loads the model into `slot`. A failure ends the process.
-fn load(mut options: Options, slot: Slot, turns: &Arc<Turns>) {
+/// Loads the model into `slot`.
+fn load(mut options: Options, slot: Slot, turns: &Arc<Turns>) -> Result<(), String> {
     let mut settings = tessera_frontend_settings::read();
     settings.names = options.names.clone().or(settings.names);
     settings.weight_streaming |= options.allow_weight_streaming;
@@ -358,9 +383,5 @@ fn load(mut options: Options, slot: Slot, turns: &Arc<Turns>) {
         asks: settings.asks.clone(),
         turns,
     };
-    let failed = task::pick(&options).and_then(|entry| (entry.open)(&load, settings));
-    if let Err(e) = failed {
-        eprintln!("tesserax: {e}");
-        std::process::exit(1);
-    }
+    task::pick(&options).and_then(|entry| (entry.open)(&load, settings))
 }
