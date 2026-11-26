@@ -859,4 +859,10 @@ impl<'a> Tree<'a> {
         from.dedup();
         from
     }
+
+    /// Evaluates a dimension expression at this tree's concrete sizes.
+    pub fn eval(&self, expr: &tessera_graph::DimExpr) -> Option<u64> {
+        let lookup = |name| self.sizes.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
+        expr.value(&self.g.dims, &lookup)
+    }
 }

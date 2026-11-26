@@ -65,39 +65,53 @@ fn distinct(reads: &[Val]) -> impl Iterator<Item = Val> + '_ {
 
 /// Runs the ready op that grows live memory least.
 pub fn schedule(s: &Selected) -> Vec<usize> {
-    // Per op: its readers, and how many inputs are unwritten.
-    let mut writer = vec![None; s.values.len()];
-    for (i, op) in s.ops.iter().enumerate() {
-        writer[op.write.0 as usize] = Some(i);
-        for &v in &op.also {
-            writer[v.0 as usize] = Some(i);
-        }
-    }
+    // Track RAW, WAR, and WAW edges for shared kept buffers.
+    let mut last_writer = vec![None::<usize>; s.values.len()];
+    let mut readers_since = vec![Vec::<usize>::new(); s.values.len()];
     let mut after: Vec<Vec<usize>> = vec![Vec::new(); s.ops.len()];
-    let mut waiting = vec![0; s.ops.len()];
+    let mut waiting = vec![0usize; s.ops.len()];
+    let mut link = |from: usize, to: usize| {
+        if from != to && !after[from].contains(&to) {
+            after[from].push(to);
+            waiting[to] += 1;
+        }
+    };
     for (i, op) in s.ops.iter().enumerate() {
         for v in distinct(&op.reads) {
-            if let Some(w) = writer[v.0 as usize] {
-                after[w].push(i);
-                waiting[i] += 1;
+            if let Some(w) = last_writer[v.0 as usize] {
+                link(w, i);
             }
+            readers_since[v.0 as usize].push(i);
+        }
+        for v in std::iter::once(op.write).chain(op.also.iter().copied()) {
+            if let Some(prev_w) = last_writer[v.0 as usize] {
+                link(prev_w, i);
+            }
+            for prev_r in readers_since[v.0 as usize].drain(..) {
+                link(prev_r, i);
+            }
+            last_writer[v.0 as usize] = Some(i);
         }
     }
     let is_comm: Vec<bool> = s.ops.iter().map(|op| crosses(op.kernel.name())).collect();
-    let mut comm_live = vec![false; s.values.len()];
+    let mut comm_seq = vec![0u32; s.values.len()];
+    let mut next_seq = 0u32;
     let mut ready: Vec<usize> = (0..s.ops.len()).filter(|i| waiting[*i] == 0).collect();
     let mut lives = Lives::new(s);
     let mut order = Vec::with_capacity(s.ops.len());
     while !ready.is_empty() {
-        // Issue comm ops immediately, overlap independent compute, then join.
-        let tier = |idx: usize| -> u8 {
+        // Issue comm ops first, overlap independent compute, join oldest.
+        let tier = |idx: usize| -> u32 {
             if is_comm[idx] {
-                0
-            } else if s.ops[idx].reads.iter().any(|v| comm_live[v.0 as usize]) {
-                2
-            } else {
-                1
+                return 0;
             }
+            let age = s.ops[idx]
+                .reads
+                .iter()
+                .map(|v| comm_seq[v.0 as usize])
+                .max()
+                .unwrap_or(0);
+            1 + age
         };
         let best = (0..ready.len())
             .min_by_key(|at| (tier(ready[*at]), lives.growth(ready[*at]), ready[*at]))
@@ -105,13 +119,14 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
         let next = ready.swap_remove(best);
         lives.run(next);
         if is_comm[next] {
-            comm_live[s.ops[next].write.0 as usize] = true;
+            next_seq += 1;
+            comm_seq[s.ops[next].write.0 as usize] = next_seq;
             for &v in &s.ops[next].also {
-                comm_live[v.0 as usize] = true;
+                comm_seq[v.0 as usize] = next_seq;
             }
         } else {
             for &v in &s.ops[next].reads {
-                comm_live[v.0 as usize] = false;
+                comm_seq[v.0 as usize] = 0;
             }
         }
         order.push(next);

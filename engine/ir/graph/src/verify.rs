@@ -113,10 +113,11 @@ fn kept(g: &Graph, owners: &[Option<u32>], i: usize, k: &TensorType) -> Result<(
     for (n, own) in g.nodes.iter().zip(owners) {
         let is_state = n.op.facts().state == Some(idx);
         if n.op == Op::Append(idx) {
-            need(!appends.contains(own), ErrorKind::Reference, || {
+            let key = (*own, n.args.get(1).copied(), n.args.get(2).copied());
+            need(!appends.contains(&key), ErrorKind::Reference, || {
                 format!("kept rows {i} are appended to twice")
             })?;
-            appends.push(*own);
+            appends.push(key);
         } else if is_state {
             need(!states.contains(own), ErrorKind::Reference, || {
                 format!("kept state {i} is updated twice")

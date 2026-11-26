@@ -127,6 +127,8 @@ pub struct Settings {
     pub device: Option<usize>,
     /// Display-carveout lender settings. `None` turns borrowing off.
     pub attic: Option<Attic>,
+    /// Minimum batch rows for split-batch comm/compute overlap. `0` disables.
+    pub split_rows: usize,
 }
 
 impl Default for Settings {
@@ -152,6 +154,7 @@ impl Default for Settings {
             dump_sites: None,
             device: None,
             attic: None,
+            split_rows: 4096,
         }
     }
 }

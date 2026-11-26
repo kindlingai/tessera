@@ -183,6 +183,13 @@ impl Engine {
         self.told(&[]).map(|_| ())
     }
 
+    /// Sets the minimum row count for split-batch overlap.
+    pub fn set_split_rows(&mut self, rows: usize) {
+        if let Some((_, min)) = &mut self.split {
+            *min = rows;
+        }
+    }
+
     /// Rank 0's launch bytes of one round. None without ranks.
     pub(crate) fn told(&mut self, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let Some(control) = &self.control else {
@@ -429,4 +436,28 @@ fn decode(bytes: &[u8]) -> Option<Told> {
         wants,
         table,
     })
+}
+
+/// Builds the two-microbatch overlap graph and its row threshold.
+pub(crate) fn build_split(graph: &Graph, entry: usize, min: usize) -> Option<(Graph, usize)> {
+    tessera_graph::split_batch(graph, entry)
+        .ok()
+        .map(|g| (g, min))
+}
+
+/// Picks the split graph when `filled` meets the overlap threshold.
+pub(crate) fn pick_graph<'a>(
+    base: &'a Graph,
+    split: &'a Option<(Graph, usize)>,
+    allow: bool,
+    filled: usize,
+    sizes: &mut Vec<(tessera_graph::DimName, u64)>,
+) -> &'a Graph {
+    match split {
+        Some((g, min)) if allow && *min > 0 && filled >= *min && filled.is_multiple_of(2) => {
+            sizes.push((tessera_graph::HALF_ROWS, (filled / 2) as u64));
+            g
+        }
+        _ => base,
+    }
 }

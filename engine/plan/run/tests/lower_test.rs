@@ -897,7 +897,7 @@ fn router_pinned_adds() {
 #[test]
 fn comm_overlaps_compute() {
     use tessera_lower::kernels::AllReduce;
-    use tessera_lower::{Home, Op, Selected, Val, Value, assign, schedule};
+    use tessera_lower::{Home, KeptInfo, Op, Selected, Val, Value, assign, schedule};
     use tessera_mem::DType;
 
     let val = |home| Value {
@@ -925,22 +925,28 @@ fn comm_overlaps_compute() {
             wire: DType::F32,
         })
     };
+    use Home::{Input, Temp};
+    let kv = Home::Kept {
+        index: 0,
+        room: 16,
+        info: KeptInfo {
+            slots: 1,
+            context: 16,
+            width: 1,
+            page_rows: 0,
+            interleaved: false,
+        },
+    };
+    let values = [Input(0), Temp, Temp, Temp, Input(1), Temp, Temp, Temp, kv].map(val);
     let selected = Selected {
-        values: vec![
-            val(Home::Input(0)),
-            val(Home::Temp),
-            val(Home::Temp),
-            val(Home::Temp),
-            val(Home::Input(1)),
-            val(Home::Temp),
-            val(Home::Temp),
-            val(Home::Temp),
-        ],
+        values: values.to_vec(),
         ops: vec![
-            op(map(), vec![Val(0)], Val(1)),
+            op(map(), vec![Val(0)], Val(8)),
+            op(map(), vec![Val(0), Val(8)], Val(1)),
             op(ar(), vec![Val(1)], Val(2)),
             op(map(), vec![Val(2)], Val(3)),
-            op(map(), vec![Val(4)], Val(5)),
+            op(map(), vec![Val(4)], Val(8)),
+            op(map(), vec![Val(4), Val(8)], Val(5)),
             op(ar(), vec![Val(5)], Val(6)),
             op(map(), vec![Val(6)], Val(7)),
         ],
@@ -955,26 +961,29 @@ fn comm_overlaps_compute() {
     };
     let order = schedule(&selected);
     let pos = |id| order.iter().position(|&x| x == id).unwrap();
-    assert!(pos(0) < pos(1) && pos(1) < pos(3) && pos(3) < pos(2));
+    // Causal KV order: Append(A) -> Attend(A) -> Append(B) -> Attend(B).
+    assert!(pos(0) < pos(1) && pos(1) < pos(4) && pos(4) < pos(5));
+    // Ping-pong overlap: AR(A) || Attn(B), AR(B) || Tail(A).
+    assert!(pos(2) < pos(5) && pos(5) < pos(3) && pos(6) < pos(3) && pos(3) < pos(7));
     // Comm input slot must stay live past concurrent compute.
     let plan = assign(&selected, &order);
-    let (ar_a, comp_b) = (&plan.steps[pos(1)], &plan.steps[pos(3)]);
+    let (ar_a, comp_b) = (&plan.steps[pos(2)], &plan.steps[pos(5)]);
     assert_eq!((ar_a.lane, comp_b.lane), (1, 0));
     let (a_in, b_out) = (ar_a.reads[0], comp_b.write);
-    let overlap = a_in.buffer == b_out.buffer
-        && a_in.offset < b_out.offset + b_out.bytes()
-        && b_out.offset < a_in.offset + a_in.bytes();
-    assert!(!overlap, "comm input aliased concurrent compute output");
+    assert!(
+        a_in.buffer != b_out.buffer
+            || a_in.offset >= b_out.offset + b_out.bytes()
+            || b_out.offset >= a_in.offset + a_in.bytes()
+    );
     // Repeated comm layers must free inputs at join.
-    let mut vals = vec![val(Home::Input(0))];
+    let mut vals = vec![val(Input(0))];
     let mut ops = Vec::new();
     for k in 0..8u32 {
-        vals.push(val(Home::Temp));
-        vals.push(val(Home::Temp));
+        vals.extend([val(Temp), val(Temp)]);
         ops.push(op(map(), vec![Val(2 * k)], Val(2 * k + 1)));
         ops.push(op(ar(), vec![Val(2 * k + 1)], Val(2 * k + 2)));
     }
-    vals.push(val(Home::Temp));
+    vals.push(val(Temp));
     ops.push(op(map(), vec![Val(16)], Val(17)));
     let chain = Selected {
         values: vals,
@@ -984,9 +993,5 @@ fn comm_overlaps_compute() {
         ..selected
     };
     let chain_plan = assign(&chain, &schedule(&chain));
-    let scratch_bytes = chain_plan.buffers[chain_plan.steps[0].write.buffer as usize];
-    assert!(
-        scratch_bytes <= 1024,
-        "comm scratch leaked: {scratch_bytes}"
-    );
+    assert!(chain_plan.buffers[chain_plan.steps[0].write.buffer as usize] <= 1024);
 }

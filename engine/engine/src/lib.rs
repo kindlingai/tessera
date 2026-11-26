@@ -216,6 +216,7 @@ fn steps(g: &Graph) -> Result<(Option<usize>, Option<usize>), Error> {
 /// Rows in, picked rows' likeliest ids out, on one runner.
 pub struct Engine {
     graph: Graph,
+    pub(crate) split: Option<(Graph, usize)>,
     runner: Box<dyn Run>,
     device: Device,
     plans: Cache,
@@ -419,8 +420,10 @@ impl Engine {
         let taps = width(&graph, full, Role::Taps);
         let vocab = width(&graph, full, Role::Logits);
         let stateful = graph.nodes.iter().any(|n| n.op.recurrent());
+        let split = place.and_then(|_| ranks::build_split(&graph, full, settings.split_rows));
         Ok(Self {
             graph,
+            split,
             runner,
             device,
             plans,
@@ -535,16 +538,16 @@ impl Engine {
     }
 
     fn explained(&mut self, sample: &[Row], picks: &[u32]) -> Result<Report, Error> {
-        let (sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
+        let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
         let wants = match self.taps.is_some() {
             true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
             false => Wants::role(&self.graph, self.full, Role::Tokens),
         };
         let upto = &[Context, Segments];
-        let (graph, device) = (&self.graph, &self.device);
+        let graph = ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
         let mut report = self
             .plans
-            .explain(graph, self.full, wants, &sizes, upto, device)?;
+            .explain(graph, self.full, wants, &sizes, upto, &self.device)?;
         report.label = format!("rows={filled}");
         Ok(report)
     }
@@ -666,11 +669,12 @@ impl Engine {
 
     /// Steps in the plan for `rows`, `picks` and `wants`.
     fn steps(&mut self, rows: &[Row], picks: &[u32], wants: Wants) -> Result<usize, Error> {
-        let (sizes, _) = launch_of(rows, picks, self.slots, self.context);
+        let (mut sizes, [filled, _]) = launch_of(rows, picks, self.slots, self.context);
         let upto = &[Context, Segments];
-        let (plan, _) =
-            self.plans
-                .wanting(&self.graph, self.full, wants, &sizes, upto, &self.device)?;
+        let graph = ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let (plan, _) = self
+            .plans
+            .wanting(graph, self.full, wants, &sizes, upto, &self.device)?;
         Ok(plan.steps.len())
     }
 
@@ -910,9 +914,11 @@ impl Engine {
         if masks.is_some() || edits.is_some() {
             return Err(Error::Mask);
         }
+        let allow = entry == self.full && !peek;
+        let graph = ranks::pick_graph(&self.graph, &self.split, allow, filled, &mut sizes);
         let start = Instant::now();
         let (plan, bound) = self.plans.wanting(
-            &self.graph,
+            graph,
             entry,
             wants,
             &sizes,

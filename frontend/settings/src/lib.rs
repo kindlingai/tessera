@@ -32,6 +32,8 @@ struct Env {
     attic: Option<String>,
     /// Key file for the display-carveout lender.
     attic_key_file: Option<PathBuf>,
+    /// Minimum batch rows for split-batch overlap, or `0`.
+    split_rows: Option<usize>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -96,6 +98,7 @@ pub fn read() -> Settings {
         dump_sites: env.dump_sites,
         device: env.device,
         attic: parse_attic(env.attic.as_deref(), env.attic_key_file, &var),
+        split_rows: env.split_rows.unwrap_or(4096),
     }
 }
 

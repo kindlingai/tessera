@@ -2,7 +2,7 @@
 
 use tessera_codegen::kept::{self, Layout};
 use tessera_codegen::prelude::*;
-use tessera_graph::{Op, View};
+use tessera_graph::{DType, Op, View};
 use tessera_lower::form::{Load as Stored, plain, writable};
 use tessera_lower::kernels::Join;
 use tessera_lower::{Arg, Draft, Extent, Home, Kernel, Launch, Shape, Source, Step, T, Term, Tree};
@@ -178,8 +178,7 @@ fn strides(
     match view {
         View::Slice { axis, start, .. } => {
             let (a, inner) = (at(*axis), product(&shape[at(*axis) + 1..]));
-            // Starts are fixed sizes.
-            let start = start.value(&tree.g.dims, &|_| None)? as usize;
+            let start = tree.eval(start)? as usize;
             let mid = len / product(&shape[..a]) / inner;
             let runs = [(product(&shape[..a]), shape[a] * inner), (mid * inner, 1)];
             nested(&runs, len, start * inner, forms.0, forms.1)
@@ -305,12 +304,59 @@ fn kept_join_launches(k: &KeptJoin, step: &Step) -> Vec<Launch> {
     }]
 }
 
-/// Views of computed or fed float values.
+/// Copies a contiguous `u32` slice along axis zero.
+#[kernel]
+fn slice_u32(x: Buf<U32>, mut out: BufMut<U32>, len: u32, start: u32) {
+    if gid() >= len {
+        return;
+    }
+    out[gid() as u64] = x[(start + gid()) as u64];
+}
+
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    slice_u32(),
+    threads = self.len,
+    accepts = slice_u32_dtype,
+    emits = slice_u32_emit,
+    source = slice_u32_source,
+)]
+pub(crate) struct SliceU32 {
+    pub len: usize,
+    pub start: usize,
+}
+
+fn slice_u32_dtype(_: &SliceU32, _: usize, form: &dyn Stored) -> bool {
+    form.dtype() == DType::U32
+}
+
+fn slice_u32_emit(_: &SliceU32, form: &dyn Stored) -> bool {
+    form.dtype() == DType::U32
+}
+
+fn slice_u32_source(_: &SliceU32) -> Source {
+    Source::named(slice_u32_ir(), "plan_slice_u32")
+}
+
+/// Views of computed or fed values.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
     let Term::Op(Op::View(view)) = &node.term else {
         return None;
     };
+    if let View::Slice { axis: 0, start, .. } = view
+        && node.form.dtype() == DType::U32
+    {
+        let x = node.args[0];
+        let x_node = tree.node(x);
+        if x_node.form.dtype() != DType::U32 {
+            return None;
+        }
+        let inner: usize = x_node.shape[1..].iter().product();
+        let off = tree.eval(start)? as usize * inner;
+        let len = tree.elements(at);
+        return Some(vec![Draft::new(SliceU32 { len, start: off }, [x], len)]);
+    }
     // The rule reading a weight owns its views.
     let ours = |t: &T| {
         let n = tree.node(*t);
@@ -380,7 +426,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     {
         let parent = tree.node(x).args[0];
         if ours(&parent)
-            && let Some(off) = start.value(&tree.g.dims, &|_| None)
+            && let Some(off) = tree.eval(start)
         {
             let p_shape = &tree.node(parent).shape;
             let steps = dense_steps(p_shape);
