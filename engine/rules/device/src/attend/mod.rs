@@ -16,6 +16,7 @@ use tessera_lower::{
 
 const KERNEL: &str = include_str!("mla.cu");
 const MLA_WIDTH: usize = 576;
+const MLA_LATENT: usize = 512;
 const GQA_WIDTH: usize = 128;
 const RING_SHIFT: usize = 32;
 
@@ -33,12 +34,8 @@ impl AttendKind {
         }
     }
 
-    fn stride(self) -> usize {
-        self.width() + 4
-    }
-
     fn smem(self) -> usize {
-        if self == Self::Mla { 47_104 } else { 18_432 }
+        if self == Self::Mla { 43_008 } else { 18_432 }
     }
 
     fn threads(self) -> usize {
@@ -46,7 +43,7 @@ impl AttendKind {
     }
 
     fn tile_keys(self) -> usize {
-        if self == Self::Mla { 32 } else { 16 }
+        16
     }
 
     fn names(self) -> (&'static str, &'static str, &'static str) {
@@ -56,14 +53,17 @@ impl AttendKind {
         }
     }
 
-    fn kv_entry(self, kv: &str) -> Option<&'static str> {
-        match (self, kv) {
-            (Self::Mla, "fp8") => Some("tessera_mla_attend_fp8"),
-            (Self::Mla, "bf16") => Some("tessera_mla_attend_bf16"),
-            (Self::Mla, "f32") => Some("tessera_mla_attend_f32"),
-            (Self::Gqa, "fp8") => Some("tessera_gqa_attend_fp8"),
-            (Self::Gqa, "bf16") => Some("tessera_gqa_attend_bf16"),
-            (Self::Gqa, "f32") => Some("tessera_gqa_attend_f32"),
+    fn kv_entry(self, kv: &str, out_width: usize) -> Option<&'static str> {
+        match (self, kv, out_width) {
+            (Self::Mla, "fp8", MLA_LATENT) => Some("tessera_mla_attend_512_fp8"),
+            (Self::Mla, "bf16", MLA_LATENT) => Some("tessera_mla_attend_512_bf16"),
+            (Self::Mla, "f32", MLA_LATENT) => Some("tessera_mla_attend_512_f32"),
+            (Self::Mla, "fp8", _) => Some("tessera_mla_attend_fp8"),
+            (Self::Mla, "bf16", _) => Some("tessera_mla_attend_bf16"),
+            (Self::Mla, "f32", _) => Some("tessera_mla_attend_f32"),
+            (Self::Gqa, "fp8", _) => Some("tessera_gqa_attend_fp8"),
+            (Self::Gqa, "bf16", _) => Some("tessera_gqa_attend_bf16"),
+            (Self::Gqa, "f32", _) => Some("tessera_gqa_attend_f32"),
             _ => None,
         }
     }
@@ -114,6 +114,7 @@ struct SplitAttend {
     rows: usize,
     heads: usize,
     kv_heads: usize,
+    out_width: usize,
     keys: Extent,
     context: usize,
     kept: &'static dyn Layout,
@@ -133,6 +134,10 @@ impl SplitAttend {
             AttendKind::Mla => self.heads / 16,
             AttendKind::Gqa => self.kv_heads * (self.heads / self.kv_heads).div_ceil(16),
         }
+    }
+
+    fn stride(&self) -> usize {
+        self.out_width + 4
     }
 }
 
@@ -168,8 +173,8 @@ fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
     };
     let kv_bytes = (kv_mul * k.kv_form.bytes(k.rows * seen * k.kv_heads * w)) as f64;
     let out_stride = match k.splits {
-        1 => w,
-        s => s * k.kind.stride(),
+        1 => k.out_width,
+        s => s * k.stride(),
     };
     let out_bytes = (4 * k.rows * k.heads * out_stride) as f64;
     Some(Load {
@@ -232,8 +237,8 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     name = self.kind.names().1,
-    sizes = [self.lists, self.splits],
-    work = self.lists * self.splits * self.kind.width(),
+    sizes = [self.lists, self.splits, self.out_width],
+    work = self.lists * self.splits * self.out_width,
     accepts = red_accepts,
     emits = f32_only,
     needs = red_needs(self),
@@ -247,6 +252,7 @@ struct SplitReduce {
     kind: AttendKind,
     lists: usize,
     splits: usize,
+    out_width: usize,
 }
 
 fn red_accepts(_: &SplitReduce, _: usize, form: &dyn Stored) -> bool {
@@ -277,8 +283,8 @@ fn red_load(r: &SplitReduce, _: usize) -> Option<Load> {
         threads: blocks * group,
         group,
         trips: r.splits as f64,
-        reads: vec![(4 * r.lists * r.splits * r.kind.stride()) as f64],
-        written: (4 * r.lists * r.kind.width()) as f64,
+        reads: vec![(4 * r.lists * r.splits * (r.out_width + 4)) as f64],
+        written: (4 * r.lists * r.out_width) as f64,
         flight: 512.0,
         ..Load::default()
     })
@@ -294,12 +300,15 @@ fn red_launches(r: &SplitReduce, step: &Step) -> Vec<Launch> {
         down: 1,
         threads,
     };
-    let args = vec![
+    let mut args = vec![
         step.read(0),
         step.out(),
         Arg::count(r.lists),
         Arg::count(r.splits),
     ];
+    if r.kind == AttendKind::Mla {
+        args.push(Arg::count(r.out_width));
+    }
     vec![Launch { args, shape }]
 }
 
@@ -350,7 +359,19 @@ macro_rules! require {
 }
 
 fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, String>> {
-    let node = tree.node(at);
+    let outer = tree.node(at);
+    let (attend_t, out_width) = if kind == AttendKind::Mla
+        && let Term::Op(Op::View(View::Slice { axis: 2, start, .. })) = &outer.term
+        && outer.shape.last() == Some(&MLA_LATENT)
+        && start.value(&tree.g.dims, &|d| tree.size(d)) == Some(0)
+        && !tree.root(outer.args[0])
+        && matches!(tree.node(outer.args[0]).term, Term::Op(Op::Attend(_)))
+    {
+        (outer.args[0], MLA_LATENT)
+    } else {
+        (at, kind.width())
+    };
+    let node = tree.node(attend_t);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
     };
@@ -368,11 +389,11 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     if !a.ragged || !own {
         return None;
     }
-    require!(f32 tree, "output" at, "query" q);
+    require!(f32 tree, "output" at, "attend" attend_t, "query" q);
     let (kv_form, vf) = (tree.node(k).form, tree.node(v).form.name());
     let kv = kv_form.name();
     require!(vf == kv, "key form {kv} and value form {vf} differ");
-    let entry = kind.kv_entry(kv);
+    let entry = kind.kv_entry(kv, out_width);
     require!(entry.is_some(), "kv form {kv} (supports fp8, bf16, f32)");
     let want = kind.width();
     let v_width = tree.node(v).shape.last() == Some(&want);
@@ -430,6 +451,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         rows,
         heads,
         kv_heads,
+        out_width,
         keys: tree.node(k).extents[1],
         context,
         kept,
@@ -444,16 +466,18 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
     };
     let lists = rows * heads;
     if splits == 1 {
-        return Some(Ok(vec![Draft::new(attend, reads, lists * width)]));
+        return Some(Ok(vec![Draft::new(attend, reads, lists * out_width)]));
     }
+    let stride = attend.stride();
     let reduce = SplitReduce {
         kind,
         lists,
         splits,
+        out_width,
     };
     Some(Ok(vec![
-        Draft::new(attend, reads, lists * splits * kind.stride()),
-        Draft::new(reduce, [Read::Draft(0)], lists * width),
+        Draft::new(attend, reads, lists * splits * stride),
+        Draft::new(reduce, [Read::Draft(0)], lists * out_width),
     ]))
 }
 

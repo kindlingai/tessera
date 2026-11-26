@@ -150,6 +150,11 @@ static __device__ __forceinline__ void attn_store_empty(
     }
 }
 
+static __device__ __forceinline__ void attn_ldm_x2(u32 d[2], const void* s) {
+    u32 a = u32(__cvta_generic_to_shared(s));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(d[0]), "=r"(d[1]) : "r"(a));
+}
 static __device__ __forceinline__ void attn_ldm_x4(u32 d[4], const void* s) {
     u32 a = u32(__cvta_generic_to_shared(s));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -165,13 +170,24 @@ static __device__ __forceinline__ void attn_ldm_x4_t(u32 d[4], const void* s) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a));
 }
+static __device__ __forceinline__ void attn_cp_async16(void* dst, const void* src, u32 bytes) {
+    u32 a = u32(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(a), "l"(src), "r"(bytes) : "memory");
+}
+static __device__ __forceinline__ void attn_cp_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+static __device__ __forceinline__ void attn_cp_wait0() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
 
 struct alignas(16) mla_smem {
-    u16 kv[32][584];
-    float red[4][16][32];
-    u32 p16[16][16];
+    u16 kv[2][16][584];
+    float red[4][16][16];
+    u32 p16[16][8];
     float m[16], l[16], corr[16];
-    u32 stop, valid_mask;
+    u32 stop, valid_mask[2];
 };
 
 static __device__ __forceinline__ u32 mla_pick_id(const u32* ids, u32 row, u32 picks, u32 fl,
@@ -189,34 +205,94 @@ static __device__ __forceinline__ u64 kv_row_at(const u32* pt, u32 slot, u32 pos
 
 static __device__ __forceinline__ const u8* kv_row_ptr(
     const void* dev, const void* host, const u32* pt, u32 slot, u32 pos, u32 ctx, u32 sh,
-    u64 row_bytes) {
-    if (sh == 0u || sh == 32u) return static_cast<const u8*>(dev) + kv_row_at(pt, slot, pos, ctx, sh) * row_bytes;
+    u64 row_bytes, bool& is_host) {
+    if (sh == 0u || sh == 32u) {
+        is_host = false;
+        return static_cast<const u8*>(dev) + kv_row_at(pt, slot, pos, ctx, sh) * row_bytes;
+    }
     u32 e = pt[u64(slot) * ctx + (pos >> sh)];
-    const u8* base = static_cast<const u8*>(((e >> 30) != 0u) ? host : dev);
+    is_host = (e >> 30) != 0u;
+    const u8* base = static_cast<const u8*>(is_host ? host : dev);
     u64 row = (u64(e & 0x3FFFFFFFu) << sh) | u64(pos & ((1u << sh) - 1u));
     return base + row * row_bytes;
 }
 
 static __device__ __forceinline__ void mla_prefetch_fp8(const u8* kv, const u8* kv_host,
                                                         const u32* pt, u32 slot, u32 j, u32 ctx,
-                                                        u32 sh, u32 l8, uint4 p[5]) {
+                                                        u32 sh, u32 l16, uint4 p[3]) {
     if (j != 0xFFFFFFFFu) {
-        const u8* r = kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull);
-#pragma unroll
-        for (u32 i = 0u; i < 5u; i++)
-            if (l8 + i * 8u < 36u) p[i] = *reinterpret_cast<const uint4*>(r + u64(l8 + i * 8u) * 16ull);
+        bool is_host = false;
+        const u8* r = kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull, is_host);
+        p[0] = *reinterpret_cast<const uint4*>(r + u64(l16) * 16ull);
+        p[1] = *reinterpret_cast<const uint4*>(r + u64(l16 + 16u) * 16ull);
+        if (l16 < 4u) p[2] = *reinterpret_cast<const uint4*>(r + u64(l16 + 32u) * 16ull);
     } else {
-#pragma unroll
-        for (u32 i = 0u; i < 5u; i++) p[i] = make_uint4(0u, 0u, 0u, 0u);
+        p[0] = p[1] = p[2] = make_uint4(0u, 0u, 0u, 0u);
     }
 }
 
-template <u32 KV_FMT>
+static __device__ __forceinline__ void mla_unpack_fp8_row(const uint4 p[3], u32 l16, u32* dst32) {
+    attn_unpack_fp8(p[0], dst32 + l16 * 8u);
+    attn_unpack_fp8(p[1], dst32 + (l16 + 16u) * 8u);
+    if (l16 < 4u) attn_unpack_fp8(p[2], dst32 + (l16 + 32u) * 8u);
+}
+
+static __device__ __forceinline__ void mla_stage_bf16(const u16* kv, const u16* kv_host,
+                                                      const u32* pt, u32 slot, u32 j, u32 ctx,
+                                                      u32 sh, u32 l16, u16* dst) {
+    bool is_host = false;
+    const u16* row_p = (j != 0xFFFFFFFFu)
+        ? reinterpret_cast<const u16*>(kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull * 2ull, is_host))
+        : kv;
+    if (is_host) {
+#pragma unroll
+        for (u32 q8 = l16; q8 < 72u; q8 += 16u) {
+            *reinterpret_cast<uint4*>(dst + q8 * 8u) = *reinterpret_cast<const uint4*>(row_p + u64(q8) * 8ull);
+        }
+    } else {
+        u32 bytes = (j != 0xFFFFFFFFu) ? 16u : 0u;
+#pragma unroll
+        for (u32 q8 = l16; q8 < 72u; q8 += 16u) {
+            attn_cp_async16(dst + q8 * 8u, row_p + u64(q8) * 8ull, bytes);
+        }
+    }
+}
+
+static __device__ __forceinline__ void mla_stage_f32(const float* kv, const float* kv_host,
+                                                     const u32* pt, u32 slot, u32 j, u32 ctx,
+                                                     u32 sh, u32 l16, u32* dst32) {
+    bool is_host = false;
+    const float* rf = (j != 0xFFFFFFFFu)
+        ? reinterpret_cast<const float*>(kv_row_ptr(kv, kv_host, pt, slot, j, ctx, sh, 576ull * 4ull, is_host))
+        : nullptr;
+    for (u32 q4 = l16; q4 < 144u; q4 += 16u) {
+        uint2 o2 = make_uint2(0u, 0u);
+        if (rf != nullptr) {
+            float4 r = *reinterpret_cast<const float4*>(rf + u64(q4) * 4ull);
+            o2 = make_uint2(trellis::f32x2_to_f16x2(r.x, r.y), trellis::f32x2_to_f16x2(r.z, r.w));
+        }
+        *reinterpret_cast<uint2*>(dst32 + q4 * 2u) = o2;
+    }
+}
+
+static __device__ __forceinline__ void mla_set_mask(
+    const u32* ids, u32 row, u32 picks, u32 fl, u32 from, u32 to, u32 p0, u32 p_end, u32 tid,
+    u32* out_mask) {
+    if (tid < 32u) {
+        bool ok = (tid < 16u) && (mla_pick_id(ids, row, picks, fl, from, to, p0 + tid, p_end) != 0xFFFFFFFFu);
+        u32 m = __ballot_sync(0xFFFFFFFFu, ok);
+        if (tid == 0u) *out_mask = m;
+    }
+}
+
+template <u32 KV_FMT, u32 OUT_W>
 static __device__ __forceinline__ void mla_attend_body(
     const float* q, const void* kv_ptr, const void* kv_host, const u32* ids, const u32* slots,
     const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys,
     u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits,
     const u32* page_table, u32 page_shift, u32 has_sinks, mla_smem& sm) {
+    constexpr u32 NT = OUT_W >> 6u;
+    constexpr u32 OUT_STRIDE = OUT_W + 4u;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wg = warp >> 2, wl = warp & 3u, hgroups = heads >> 4;
     u32 split = blockIdx.x, rb = blockIdx.y / hgroups, hg = blockIdx.y % hgroups;
@@ -240,12 +316,12 @@ static __device__ __forceinline__ void mla_attend_body(
     if (tid < 16u) { attn_init_head_state(sm.m[tid], sm.l[tid], sinks, has_sinks, split, h0 + tid); }
     prim::block_sync();
     u32 stop = sm.stop, total_p = (stop > start) ? (stop - start) : 0u;
-    u32 per = ((((total_p + 31u) >> 5) + splits - 1u) / splits) << 5;
+    u32 per = ((((total_p + 15u) >> 4) + splits - 1u) / splits) << 4;
     u32 p_begin = start + split * per, p_end = p_begin + per;
     if (p_begin > stop) p_begin = stop;
     if (p_end > stop) p_end = stop;
     if (p_begin >= p_end) {
-        attn_store_empty<576u, 580u, 256u>(part, sinks, has_sinks, row, heads, h0, 16u, split, splits, tid);
+        attn_store_empty<OUT_W, OUT_STRIDE, 256u>(part, sinks, has_sinks, row, heads, h0, 16u, split, splits, tid);
         return;
     }
     constexpr bool USE_BF16 = (KV_FMT == 1u);
@@ -265,131 +341,138 @@ static __device__ __forceinline__ void mla_attend_body(
         q_reg[s][2] = attn_pack2<USE_BF16>(a2.x, a2.y);
         q_reg[s][3] = attn_pack2<USE_BF16>(a3.x, a3.y);
     }
-    float o[9][4];
+    float o[NT][4];
 #pragma unroll
-    for (u32 nt = 0u; nt < 9u; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
+    for (u32 nt = 0u; nt < NT; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
     const u8* kv_u8 = static_cast<const u8*>(kv_ptr);
     const u8* kv_host_u8 = static_cast<const u8*>(kv_host);
-    u32 tk = tid >> 3, l8 = tid & 7u, d_base = warp * 72u;
-    u32* dst32 = reinterpret_cast<u32*>(sm.kv[tk]);
-    u32 krow = wg * 16u + ((lane >> 4) << 3) + (lane & 7u), kcol = ((lane >> 3) & 1u) * 8u, vrow = lane & 15u, vcol = (lane >> 4) << 3;
-    u32 cur_j = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
-    uint4 pref[5];
-    if constexpr (KV_FMT == 0u) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, cur_j, context, page_shift, l8, pref);
-    for (u32 p0 = p_begin; p0 < p_end; p0 += 32u) {
-        if (tid < 32u) { u32 jw = mla_pick_id(ids, row, picks, from_list, from, to, p0 + tid, p_end); u32 m = __ballot_sync(0xFFFFFFFFu, jw != 0xFFFFFFFFu); if (tid == 0u) sm.valid_mask = m; }
-        bool has_next = (p0 + 32u < p_end);
-        u32 nj = has_next ? mla_pick_id(ids, row, picks, from_list, from, to, p0 + 32u + tk, p_end) : 0xFFFFFFFFu;
-        if constexpr (KV_FMT == 0u) {
-#pragma unroll
-            for (u32 i = 0u; i < 5u; i++) if (l8 + i * 8u < 36u) attn_unpack_fp8(pref[i], dst32 + (l8 + i * 8u) * 8u);
-            if (has_next) mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj, context, page_shift, l8, pref);
-        } else if constexpr (KV_FMT == 1u) {
-            const u16* r16 = (cur_j != 0xFFFFFFFFu) ? reinterpret_cast<const u16*>(kv_row_ptr(kv_ptr, kv_host, page_table, slot, cur_j, context, page_shift, 576ull * 2ull)) : nullptr;
-            for (u32 q8 = l8; q8 < 72u; q8 += 8u) *reinterpret_cast<uint4*>(dst32 + q8 * 4u) = (r16 != nullptr) ? *reinterpret_cast<const uint4*>(r16 + u64(q8) * 8ull) : make_uint4(0u, 0u, 0u, 0u);
-            cur_j = nj;
-        } else {
-            const float* rf = (cur_j != 0xFFFFFFFFu) ? reinterpret_cast<const float*>(kv_row_ptr(kv_ptr, kv_host, page_table, slot, cur_j, context, page_shift, 576ull * 4ull)) : nullptr;
-            for (u32 q4 = l8; q4 < 144u; q4 += 8u) {
-                uint2 o2 = make_uint2(0u, 0u);
-                if (rf != nullptr) { float4 r = *reinterpret_cast<const float4*>(rf + u64(q4) * 4ull); o2 = make_uint2(trellis::f32x2_to_f16x2(r.x, r.y), trellis::f32x2_to_f16x2(r.z, r.w)); }
-                *reinterpret_cast<uint2*>(dst32 + q4 * 2u) = o2;
+    const u16* kv_u16 = static_cast<const u16*>(kv_ptr);
+    const u16* kv_host_u16 = static_cast<const u16*>(kv_host);
+    const float* kv_f32 = static_cast<const float*>(kv_ptr);
+    const float* kv_host_f32 = static_cast<const float*>(kv_host);
+    u32 tk = tid >> 4u, l16 = tid & 15u, d_base = warp * (NT * 8u);
+    u32 krow = wg * 8u + (lane & 7u), kcol = ((lane >> 3u) & 1u) * 8u;
+    u32 vrow = lane & 15u, vcol = (lane >> 4u) << 3u;
+    u32 j0 = mla_pick_id(ids, row, picks, from_list, from, to, p_begin + tk, p_end);
+    uint4 pref[3];
+    mla_set_mask(ids, row, picks, from_list, from, to, p_begin, p_end, tid, &sm.valid_mask[0]);
+    if constexpr (KV_FMT == 0u) {
+        mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, j0, context, page_shift, l16, pref);
+        mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
+    } else if constexpr (KV_FMT == 1u) {
+        mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, j0, context, page_shift, l16, sm.kv[0][tk]);
+        attn_cp_commit();
+        attn_cp_wait0();
+    } else {
+        mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, j0, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[0][tk]));
+    }
+    prim::block_sync();
+    u32 st = 0u;
+    for (u32 p0 = p_begin; p0 < p_end; p0 += 16u) {
+        bool has_next = (p0 + 16u < p_end);
+        u32 nst = st ^ 1u;
+        if (has_next) {
+            u32 nj = mla_pick_id(ids, row, picks, from_list, from, to, p0 + 16u + tk, p_end);
+            mla_set_mask(ids, row, picks, from_list, from, to, p0 + 16u, p_end, tid, &sm.valid_mask[nst]);
+            if constexpr (KV_FMT == 0u) {
+                mla_prefetch_fp8(kv_u8, kv_host_u8, page_table, slot, nj, context, page_shift, l16, pref);
+            } else if constexpr (KV_FMT == 1u) {
+                mla_stage_bf16(kv_u16, kv_host_u16, page_table, slot, nj, context, page_shift, l16, sm.kv[nst][tk]);
+                attn_cp_commit();
+            } else {
+                mla_stage_f32(kv_f32, kv_host_f32, page_table, slot, nj, context, page_shift, l16, reinterpret_cast<u32*>(sm.kv[nst][tk]));
             }
-            cur_j = nj;
         }
-        prim::block_sync();
-        u32 vmask = sm.valid_mask;
+        u32 vmask = sm.valid_mask[st];
         if (vmask != 0u) {
-            float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
+            float s0[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (u32 s = 0u; s < 9u; s++) {
-                u32 b[4];
-                attn_ldm_x4(b, &sm.kv[krow][(wl * 9u + s) * 16u + kcol]);
-                u32 b0[2] = {b[0], b[1]}, b1[2] = {b[2], b[3]};
+                u32 b0[2];
+                attn_ldm_x2(b0, &sm.kv[st][krow][(wl * 9u + s) * 16u + kcol]);
                 attn_mma<USE_BF16>(s0, q_reg[s], b0);
-                attn_mma<USE_BF16>(s1, q_reg[s], b1);
             }
-            u32 cb = wg * 16u;
-            sm.red[wl][g][cb + t * 2u] = s0[0]; sm.red[wl][g][cb + t * 2u + 1u] = s0[1];
-            sm.red[wl][g + 8u][cb + t * 2u] = s0[2]; sm.red[wl][g + 8u][cb + t * 2u + 1u] = s0[3];
-            sm.red[wl][g][cb + 8u + t * 2u] = s1[0]; sm.red[wl][g][cb + 8u + t * 2u + 1u] = s1[1];
-            sm.red[wl][g + 8u][cb + 8u + t * 2u] = s1[2]; sm.red[wl][g + 8u][cb + 8u + t * 2u + 1u] = s1[3];
+            u32 cb = wg * 8u;
+            *reinterpret_cast<float2*>(&sm.red[wl][g][cb + t * 2u]) = make_float2(s0[0], s0[1]);
+            *reinterpret_cast<float2*>(&sm.red[wl][g + 8u][cb + t * 2u]) = make_float2(s0[2], s0[3]);
             prim::block_sync();
-            if (warp < 4u) {
-                u32 h = (warp << 2) | (lane >> 3), seg = lane & 7u, c0 = seg << 2;
-                float sc[4], tmax = attn_neg_inf();
-#pragma unroll
-                for (u32 c = 0u; c < 4u; c++) {
-                    float v = ((vmask >> (c0 + c)) & 1u)
-                        ? (sm.red[0][h][c0 + c] + sm.red[1][h][c0 + c] + sm.red[2][h][c0 + c] + sm.red[3][h][c0 + c]) * scale
-                        : attn_neg_inf();
-                    sc[c] = v; if (v > tmax) tmax = v;
-                }
-                tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 1u));
-                tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 2u));
-                tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 4u));
-                float om = sm.m[h], ol = sm.l[h], nm = (om > tmax) ? om : tmax;
-                float cv = (ol > 0.0f) ? __expf(om - nm) : 0.0f;
-                float p0v = ((vmask >> c0) & 1u) ? __expf(sc[0] - nm) : 0.0f;
-                float p1v = ((vmask >> (c0 + 1u)) & 1u) ? __expf(sc[1] - nm) : 0.0f;
-                float p2v = ((vmask >> (c0 + 2u)) & 1u) ? __expf(sc[2] - nm) : 0.0f;
-                float p3v = ((vmask >> (c0 + 3u)) & 1u) ? __expf(sc[3] - nm) : 0.0f;
-                sm.p16[h][seg * 2u] = attn_pack2<USE_BF16>(p0v, p1v);
-                sm.p16[h][seg * 2u + 1u] = attn_pack2<USE_BF16>(p2v, p3v);
-                float ps = p0v + p1v + p2v + p3v;
-                ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 1u);
-                ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 2u);
-                ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 4u);
-                if (seg == 0u) { sm.m[h] = nm; sm.l[h] = ol * cv + ps; sm.corr[h] = cv; }
-            }
+            u32 h = tid >> 4u, c = tid & 15u;
+            float v = ((vmask >> c) & 1u)
+                ? (sm.red[0][h][c] + sm.red[1][h][c] + sm.red[2][h][c] + sm.red[3][h][c]) * scale
+                : attn_neg_inf();
+            float tmax = v;
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 1u));
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 2u));
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 4u));
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 8u));
+            float om = sm.m[h], ol = sm.l[h], nm = (om > tmax) ? om : tmax;
+            float cv = (ol > 0.0f) ? __expf(om - nm) : 0.0f;
+            float pv = ((vmask >> c) & 1u) ? __expf(v - nm) : 0.0f;
+            float pv1 = __shfl_xor_sync(0xFFFFFFFFu, pv, 1u);
+            if ((c & 1u) == 0u) sm.p16[h][c >> 1u] = attn_pack2<USE_BF16>(pv, pv1);
+            float ps = pv;
+            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 1u);
+            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 2u);
+            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 4u);
+            ps += __shfl_xor_sync(0xFFFFFFFFu, ps, 8u);
+            if (c == 0u) { sm.m[h] = nm; sm.l[h] = ol * cv + ps; sm.corr[h] = cv; }
             prim::block_sync();
             float c0 = sm.corr[g], c1 = sm.corr[g + 8u];
 #pragma unroll
-            for (u32 nt = 0u; nt < 9u; nt++) {
+            for (u32 nt = 0u; nt < NT; nt++) {
                 o[nt][0] *= c0; o[nt][1] *= c0; o[nt][2] *= c1; o[nt][3] *= c1;
             }
+            u32 ap[4] = {sm.p16[g][t], sm.p16[g + 8u][t], sm.p16[g][t + 4u], sm.p16[g + 8u][t + 4u]};
 #pragma unroll
-            for (u32 kk = 0u; kk < 2u; kk++) {
-                u32 po = kk * 8u, vr = kk * 16u + vrow;
-                u32 ap[4] = {sm.p16[g][po + t], sm.p16[g + 8u][po + t],
-                             sm.p16[g][po + t + 4u], sm.p16[g + 8u][po + t + 4u]};
-#pragma unroll
-                for (u32 nt = 0u; nt < 8u; nt += 2u) {
-                    u32 bv[4];
-                    attn_ldm_x4_t(bv, &sm.kv[vr][d_base + nt * 8u + vcol]);
-                    u32 b0[2] = {bv[0], bv[1]}, b1[2] = {bv[2], bv[3]};
-                    attn_mma<USE_BF16>(o[nt], ap, b0);
-                    attn_mma<USE_BF16>(o[nt + 1u], ap, b1);
-                }
+            for (u32 nt = 0u; nt < 8u; nt += 2u) {
+                u32 bv[4];
+                attn_ldm_x4_t(bv, &sm.kv[st][vrow][d_base + nt * 8u + vcol]);
+                u32 b0[2] = {bv[0], bv[1]}, b1[2] = {bv[2], bv[3]};
+                attn_mma<USE_BF16>(o[nt], ap, b0);
+                attn_mma<USE_BF16>(o[nt + 1u], ap, b1);
+            }
+            if constexpr (NT == 9u) {
                 u32 b8[2];
-                attn_ldm_x2_t(b8, &sm.kv[vr][d_base + 64u]);
+                attn_ldm_x2_t(b8, &sm.kv[st][vrow][d_base + 64u]);
                 attn_mma<USE_BF16>(o[8], ap, b8);
             }
         }
-        if (has_next) prim::block_sync();
+        if (has_next) {
+            if constexpr (KV_FMT == 0u) {
+                mla_unpack_fp8_row(pref, l16, reinterpret_cast<u32*>(sm.kv[nst][tk]));
+            } else if constexpr (KV_FMT == 1u) {
+                attn_cp_wait0();
+            }
+            prim::block_sync();
+            st = nst;
+        }
     }
-    attn_store_partials<9u, 576u, 580u>(part, o, sm.m, sm.l, row, heads, h0, 16u, split, splits,
-                                        d_base, g, t, tid);
+    attn_store_partials<NT, OUT_W, OUT_STRIDE>(part, o, sm.m, sm.l, row, heads, h0, 16u, split, splits,
+                                               d_base, g, t, tid);
 }
 
-#define MLA_DEF(NAME, T, FMT) \
+#define MLA_DEF(NAME, NAME512, T, FMT) \
     extern "C" __global__ __launch_bounds__(256, 2) void NAME(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
         __shared__ mla_smem sm; \
-        mla_attend_body<FMT>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
+        mla_attend_body<FMT, 576u>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
+    } \
+    extern "C" __global__ __launch_bounds__(256, 2) void NAME512(const float* q, const T* kv, const u32* ids, const u32* slots, const u32* positions, const float* sinks, float* part, float scale, u32 rows, u32 keys, u32 context, u32 heads, u32 picks, u32 from_list, u32 before, u32 after, u32 splits, const u32* page_table, u32 page_shift, u32 has_sinks, const T* kv_host) { \
+        __shared__ mla_smem sm; \
+        mla_attend_body<FMT, 512u>(q, kv, kv_host, ids, slots, positions, sinks, part, scale, rows, keys, context, heads, picks, from_list, before, after, splits, page_table, page_shift, has_sinks, sm); \
     }
 
-MLA_DEF(tessera_mla_attend_fp8, u8, 0u)
-MLA_DEF(tessera_mla_attend_bf16, u16, 1u)
-MLA_DEF(tessera_mla_attend_f32, float, 2u)
+MLA_DEF(tessera_mla_attend_fp8, tessera_mla_attend_512_fp8, u8, 0u)
+MLA_DEF(tessera_mla_attend_bf16, tessera_mla_attend_512_bf16, u16, 1u)
+MLA_DEF(tessera_mla_attend_f32, tessera_mla_attend_512_f32, float, 2u)
 
 // Combines split-K MLA partials for one row and head.
 extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
-    const float* part, float* out, u32 lists, u32 splits) {
-    u32 list = blockIdx.x, tid = threadIdx.x;
+    const float* part, float* out, u32 lists, u32 splits, u32 out_w) {
+    u32 list = blockIdx.x, tid = threadIdx.x, stride = out_w + 4u;
     if (list >= lists) return;
     __shared__ float s_m[32], s_l[32], s_w[32], s_inv;
-    const float* base = part + u64(list) * splits * 580ull;
-    if (tid < splits) { s_m[tid] = base[u64(tid) * 580ull + 576ull]; s_l[tid] = base[u64(tid) * 580ull + 577ull]; }
+    const float* base = part + u64(list) * splits * stride;
+    if (tid < splits) { s_m[tid] = base[u64(tid) * stride + out_w]; s_l[tid] = base[u64(tid) * stride + out_w + 1u]; }
     prim::block_sync();
     if (tid == 0u) {
         float best = attn_neg_inf(), denom = 0.0f;
@@ -401,12 +484,12 @@ extern "C" __global__ __launch_bounds__(160, 4) void tessera_mla_reduce(
         s_inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     }
     prim::block_sync();
-    if (tid < 144u) {
+    if (tid < (out_w >> 2u)) {
         float inv = s_inv;
         float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
         u32 d4 = tid << 2;
-        for (u32 s = 0u; s < splits; s++) if (s_w[s] > 0.0f) attn_fma4(sum, base + u64(s) * 580ull + d4, s_w[s]);
-        *reinterpret_cast<float4*>(out + u64(list) * 576ull + d4) = make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
+        for (u32 s = 0u; s < splits; s++) if (s_w[s] > 0.0f) attn_fma4(sum, base + u64(s) * stride + d4, s_w[s]);
+        *reinterpret_cast<float4*>(out + u64(list) * out_w + d4) = make_float4(sum.x * inv, sum.y * inv, sum.z * inv, sum.w * inv);
     }
 }
 
