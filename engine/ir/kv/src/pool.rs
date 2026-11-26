@@ -106,6 +106,11 @@ impl Pool {
         std::mem::take(&mut self.freed)
     }
 
+    /// Live runs currently holding `page`.
+    pub fn live_holders(&self, page: u32) -> u32 {
+        self.live.get(page as usize).copied().unwrap_or(0)
+    }
+
     pub fn pages(&self, run: RunId) -> Result<&[u32], Error> {
         Ok(&self.run(run)?.pages)
     }

@@ -9,6 +9,15 @@ const TIER_HOST_BIT: u32 = 1 << 30;
 
 /// Minimum pages demoted per batch when VRAM runs low.
 const DEMOTE_BATCH: usize = 256;
+/// Maximum hot host pages promoted per step.
+const PROMOTE_HOT_BATCH: usize = 256;
+
+/// Eviction priority levels for `TIER_HOST` (lowest demotes first).
+pub const EVICT_COLD: u8 = 0;
+pub const EVICT_MIDDLE: u8 = 1;
+pub const EVICT_HOT: u8 = 2;
+pub const EVICT_SHARED: u8 = 3;
+pub const EVICT_PINNED: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loc {
@@ -55,6 +64,9 @@ impl TierMap {
     }
 
     fn release(&mut self, freed: &[u32]) {
+        if freed.is_empty() {
+            return;
+        }
         for &p in freed {
             if let Some(loc) = self.loc.get_mut(p as usize).and_then(Option::take) {
                 match loc {
@@ -63,6 +75,14 @@ impl TierMap {
                 }
             }
         }
+        self.retain_vram();
+    }
+
+    /// Drops order entries for pages no longer in VRAM.
+    fn retain_vram(&mut self) {
+        let loc = &self.loc;
+        self.order
+            .retain(|&p| matches!(loc.get(p as usize).copied().flatten(), Some(Loc::Vram(_))));
     }
 
     fn at(&self, p: u32) -> Option<Loc> {
@@ -73,11 +93,121 @@ impl TierMap {
         self.at(p).map_or(0, Loc::entry)
     }
 
+    fn pick_victims(
+        &mut self,
+        short: usize,
+        want: usize,
+        write_pages: &[u32],
+        fresh: &[u32],
+        priority: &[u8],
+    ) -> Vec<(u32, u32)> {
+        self.retain_vram();
+        let hot_cap = short.min(self.host_free.len());
+        let mut victims: Vec<(u32, u32)> = Vec::with_capacity(want);
+        let mut taken = vec![false; self.loc.len()];
+        for class in [EVICT_COLD, EVICT_MIDDLE, EVICT_HOT, EVICT_SHARED] {
+            if class > EVICT_COLD && victims.len() >= hot_cap {
+                break;
+            }
+            let target = if class < EVICT_HOT { want } else { hot_cap };
+            if victims.len() >= target {
+                continue;
+            }
+            for &p in &self.order {
+                if victims.len() >= target {
+                    break;
+                }
+                let idx = p as usize;
+                if taken[idx] || write_pages.contains(&p) || fresh.contains(&p) {
+                    continue;
+                }
+                let pr = priority.get(idx).copied().unwrap_or(EVICT_COLD);
+                if pr != class {
+                    continue;
+                }
+                if let Some(Loc::Vram(v)) = self.loc[idx] {
+                    taken[idx] = true;
+                    victims.push((p, v));
+                }
+            }
+        }
+        if !victims.is_empty() {
+            self.order.retain(|&p| !taken[p as usize]);
+        }
+        victims
+    }
+
+    fn pick_hot_promotes(
+        &self,
+        req_need: usize,
+        write_pages: &[u32],
+        fresh: &[u32],
+        priority: &[u8],
+        to_promote: &mut Vec<(u32, u32)>,
+    ) {
+        let mut cold_vram = 0usize;
+        let mut hot_vram = 0usize;
+        for &p in &self.order {
+            let idx = p as usize;
+            if !matches!(self.at(p), Some(Loc::Vram(_))) {
+                continue;
+            }
+            if write_pages.contains(&p) || fresh.contains(&p) {
+                continue;
+            }
+            let pr = priority.get(idx).copied().unwrap_or(EVICT_COLD);
+            if pr < EVICT_HOT {
+                cold_vram += 1;
+            } else if pr == EVICT_HOT {
+                hot_vram += 1;
+            }
+        }
+        let mut spare_hot = (self.vram_free.len() + cold_vram).saturating_sub(req_need);
+        let mut spare_shared =
+            (self.vram_free.len() + cold_vram + hot_vram).saturating_sub(req_need);
+        let req_evict = req_need.saturating_sub(self.vram_free.len());
+        let max_evict = self.host_free.len().saturating_sub(req_evict);
+        let mut budget =
+            (self.vram_free.len().saturating_sub(req_need) + max_evict).min(PROMOTE_HOT_BATCH);
+        for target_pr in [EVICT_SHARED, EVICT_HOT] {
+            for (idx, loc) in self.loc.iter().enumerate() {
+                if budget == 0 {
+                    return;
+                }
+                let Some(Loc::Host(h)) = *loc else {
+                    continue;
+                };
+                if priority.get(idx).copied().unwrap_or(EVICT_COLD) != target_pr {
+                    continue;
+                }
+                let p = idx as u32;
+                if to_promote.iter().any(|&(q, _)| q == p) {
+                    continue;
+                }
+                if target_pr == EVICT_SHARED {
+                    if spare_shared == 0 {
+                        break;
+                    }
+                    spare_shared -= 1;
+                    spare_hot = spare_hot.saturating_sub(1);
+                } else {
+                    if spare_hot == 0 {
+                        return;
+                    }
+                    spare_hot -= 1;
+                    spare_shared = spare_shared.saturating_sub(1);
+                }
+                budget -= 1;
+                to_promote.push((p, h));
+            }
+        }
+    }
+
     fn ensure_vram<E: From<Error>>(
         &mut self,
         alloc_pages: &[u32],
         write_pages: &[u32],
-        pinned: &[u32],
+        priority: &[u8],
         move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, E>,
     ) -> Result<bool, E> {
         let mut fresh = Vec::new();
@@ -94,6 +224,8 @@ impl TierMap {
                 to_promote.push((p, h));
             }
         }
+        let req_need = fresh.len() + to_promote.len();
+        self.pick_hot_promotes(req_need, write_pages, &fresh, priority, &mut to_promote);
         let need = fresh.len() + to_promote.len();
         if need == 0 {
             return Ok(false);
@@ -102,24 +234,7 @@ impl TierMap {
         if self.vram_free.len() < need {
             let short = need - self.vram_free.len();
             let want = short.max(DEMOTE_BATCH).min(self.host_free.len());
-            let mut victims: Vec<(u32, u32)> = Vec::with_capacity(want);
-            let mut keep = Vec::new();
-            while victims.len() < want {
-                let Some(p) = self.order.pop_front() else {
-                    break;
-                };
-                let Some(Loc::Vram(v)) = self.at(p) else {
-                    continue;
-                };
-                if pinned.contains(&p) || write_pages.contains(&p) || fresh.contains(&p) {
-                    keep.push(p);
-                    continue;
-                }
-                victims.push((p, v));
-            }
-            for p in keep.into_iter().rev() {
-                self.order.push_front(p);
-            }
+            let victims = self.pick_victims(short, want, write_pages, &fresh, priority);
             if self.vram_free.len() + victims.len() < need {
                 return Err(Error::TierFull.into());
             }
@@ -400,18 +515,18 @@ impl Lanes {
         }
     }
 
-    /// Ensures written pages live in VRAM, demoting older pages.
+    /// Ensures written pages live in VRAM, demoting lower-priority pages.
     pub fn ensure_vram<E: From<Error>>(
         &mut self,
         alloc_pages: &[u32],
         write_pages: &[u32],
-        pinned: &[u32],
+        priority: &[u8],
         move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, E>,
     ) -> Result<bool, E> {
         let Some(t) = &mut self.tier else {
             return Ok(false);
         };
-        t.ensure_vram(alloc_pages, write_pages, pinned, move_pages)
+        t.ensure_vram(alloc_pages, write_pages, priority, move_pages)
     }
 
     /// Writes a slot's pages into KV and index tables.

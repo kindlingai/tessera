@@ -8,7 +8,7 @@ mod spec;
 mod store;
 mod tier;
 
-pub use lanes::Lanes;
+pub use lanes::{EVICT_COLD, EVICT_HOT, EVICT_MIDDLE, EVICT_PINNED, EVICT_SHARED, Lanes};
 pub use pool::{Error, PageCopy, Pool, RunId, Stats, Tag};
 pub use prefix::Prefixes;
 pub use reuse::{Begin, Why, begin};
