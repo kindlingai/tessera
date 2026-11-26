@@ -253,7 +253,15 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
             ),
             grid_offer(
                 FC2_PF,
-                vec![plan, act_out, down.read(), shared_down.part(0)],
+                vec![
+                    plan,
+                    act_out,
+                    down.read(),
+                    shared_down.part(0),
+                    down_sv.read(),
+                    signs_out.read(),
+                    shared_down.part(2),
+                ],
                 rows * (picks + 1) * hidden / 2,
                 &c2,
                 (ibs, total_slots),
@@ -305,6 +313,11 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         ]);
         z
     };
+    let finish_shape = if prefill {
+        Shape::grid(hidden / 128, rows.div_ceil(8), 256)
+    } else {
+        Shape::grid(hidden / 128, rows, (picks + 1) * 32)
+    };
     steps.push(Offer {
         kernel: FINISH,
         reads: vec![
@@ -316,7 +329,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
         ],
         len,
         counts: fixed(&[rows, hidden, ffn, picks, wide, z_chunks]),
-        shape: Shape::grid(hidden / 128, rows, (picks + 1) * 32),
+        shape: finish_shape,
         work: len as f64,
         ..Offer::default()
     });
