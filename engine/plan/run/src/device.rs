@@ -852,7 +852,15 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
                             across,
                             down,
                             threads,
-                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, shared, a)?),
+                        } => Ok(launch_grid(
+                            ctx,
+                            k,
+                            across,
+                            down,
+                            threads as u32,
+                            shared,
+                            a,
+                        )?),
                         Shape::Runtime(_) => Err(tessera_lower::Error::Unbound.into()),
                     }
                 },
