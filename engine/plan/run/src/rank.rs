@@ -429,10 +429,17 @@ impl<T: Transport> Rank<T> {
         if let Some(grid) = &mut self.grid {
             grid.timing(timed);
         }
-        if !timed
-            && self.grid.as_ref().is_some_and(|g| g.capturable())
+        if self.grid.as_ref().is_some_and(|g| g.capturable())
             && self.submit_graphed(steps.clone(), wait)?
         {
+            if timed
+                && wait
+                && let Some(grid) = self.grid.as_mut()
+                && let Some([waited, moved]) = grid.spent()?
+            {
+                self.note("all_reduce: wait", waited);
+                self.note("all_reduce: transfer", moved);
+            }
             return Ok(());
         }
         let mut from = steps.start;
@@ -553,6 +560,10 @@ impl<T: Transport> Run for Rank<T> {
 
     fn profiling(&mut self, on: bool) {
         self.runner.run_mut().profiling(on)
+    }
+
+    fn take_profile(&mut self) -> Option<crate::Profile> {
+        self.runner.run_mut().take_profile()
     }
 
     fn repeat(&mut self, step: usize, times: usize) -> Result<f64, Error> {

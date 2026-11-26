@@ -35,9 +35,13 @@ impl Spent {
 
 impl Profile {
     pub fn add(&mut self, name: &str, seconds: f64) {
+        self.add_many(name, seconds, 1);
+    }
+
+    pub fn add_many(&mut self, name: &str, seconds: f64, count: u64) {
         let one = Spent {
             seconds,
-            count: 1,
+            count,
             ..Spent::default()
         };
         self.spent.entry(name.to_string()).or_default().sum(one);
@@ -45,6 +49,11 @@ impl Profile {
 
     /// Adds one run of `step`, by kernel name and sizes.
     pub fn step(&mut self, step: &Step, seconds: f64) {
+        self.step_many(step, seconds, 1);
+    }
+
+    /// Adds `count` runs of `step`, by kernel name and sizes.
+    pub fn step_many(&mut self, step: &Step, seconds: f64, count: u64) {
         let kernel = &step.kernel;
         let mut name = kernel.name().to_string();
         for (i, size) in kernel.sizes().iter().enumerate() {
@@ -53,9 +62,9 @@ impl Profile {
         }
         let one = Spent {
             seconds,
-            count: 1,
-            work: kernel.work(step.write.len),
-            bytes: step.bytes() as f64,
+            count,
+            work: kernel.work(step.write.len) * count as f64,
+            bytes: step.bytes() as f64 * count as f64,
         };
         self.spent.entry(name).or_default().sum(one);
     }

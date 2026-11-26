@@ -1,7 +1,7 @@
 //! Runners that count the bytes of plans, and allocate nothing.
 
+use crate::Error;
 use crate::run::{Base, Run};
-use crate::{Error, device};
 use std::collections::HashMap;
 use std::ops::{Add, Range};
 use std::sync::Mutex;
@@ -98,12 +98,12 @@ pub fn host() -> [u64; 2] {
 /// The platform a runner for `settings` would report.
 pub fn platform(settings: &Settings) -> Platform {
     let host = || Platform::host(Limits::host(settings.host_lanes));
-    device::asked(settings).unwrap_or_else(host)
+    crate::asked(settings).unwrap_or_else(host)
 }
 
 /// Free bytes on the GPU `settings` picks, if known.
 pub fn free(settings: &Settings) -> Option<u64> {
-    device::free(settings)
+    crate::free(settings)
 }
 
 /// Free display-carveout bytes `atticd` can lend now.

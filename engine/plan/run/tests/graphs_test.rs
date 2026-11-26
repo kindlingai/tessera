@@ -25,6 +25,14 @@ struct HandOp {
     gather: bool,
 }
 
+#[derive(Clone, Copy)]
+struct StampOp {
+    starts: u64,
+    accum: u64,
+    slot: usize,
+    mode: u32,
+}
+
 #[derive(Default)]
 struct State {
     next_ptr: u64,
@@ -35,7 +43,8 @@ struct State {
     captures: usize,
     replays: usize,
     d2d_copies: usize,
-    recording: Option<(Vec<u64>, Vec<HandOp>)>,
+    clock: u64,
+    recording: Option<(Vec<u64>, Vec<HandOp>, Vec<StampOp>)>,
     last_replayed: Vec<u64>,
     hand_job: u64,
     grid_running: bool,
@@ -48,6 +57,7 @@ struct MockGraph {
     state: Arc<Mutex<State>>,
     ptrs: Vec<u64>,
     hands: Vec<HandOp>,
+    stamps: Vec<StampOp>,
 }
 
 impl Drop for MockGraph {
@@ -95,6 +105,38 @@ fn run_hand(live: &mut HashMap<u64, Vec<u8>>, op: HandOp) {
             out.extend_from_slice(&v.to_le_bytes());
         }
         buf_slice_mut(live, op.to, out.len()).copy_from_slice(&out);
+    }
+}
+
+fn run_stamp(live: &mut HashMap<u64, Vec<u8>>, clock: &mut u64, op: StampOp) {
+    *clock += 1_000;
+    let now = *clock;
+    let rd = |l: &HashMap<u64, Vec<u8>>, p: u64, i: usize| {
+        u64::from_ne_bytes(buf_slice(l, p + (i * 8) as u64, 8).try_into().unwrap())
+    };
+    let wr = |l: &mut HashMap<u64, Vec<u8>>, p: u64, i: usize, v: u64| {
+        buf_slice_mut(l, p + (i * 8) as u64, 8).copy_from_slice(&v.to_ne_bytes());
+    };
+    let add = |l: &mut HashMap<u64, Vec<u8>>, i: usize, from: usize| {
+        let v = rd(l, op.accum, i) + now.wrapping_sub(rd(l, op.starts, from));
+        wr(l, op.accum, i, v);
+    };
+    match op.mode {
+        0 => {
+            wr(live, op.starts, 0, now);
+            wr(live, op.starts, op.slot, now);
+        }
+        1 => {
+            add(live, op.slot, 0);
+            wr(live, op.starts, 0, now);
+        }
+        2 | 4 => add(live, op.slot, op.slot),
+        3 => wr(live, op.starts, op.slot, now),
+        5 => {
+            add(live, op.slot, 0);
+            add(live, op.slot + 1, op.slot + 1);
+        }
+        _ => {}
     }
 }
 
@@ -164,13 +206,27 @@ impl Launch for MockDevice {
                     gather: vals[1] != 0,
                 }
             });
-        if let Some((rec_ptrs, rec_hands)) = &mut s.recording {
+        let stamp =
+            (ptrs.len() == 2 && vals.len() == 2 && ptrs[0] != s.hand_job).then(|| StampOp {
+                starts: ptrs[0],
+                accum: ptrs[1],
+                slot: vals[0] as usize,
+                mode: vals[1],
+            });
+        if let Some((rec_ptrs, rec_hands, rec_stamps)) = &mut s.recording {
             rec_ptrs.extend_from_slice(&ptrs);
             if let Some(op) = hand {
                 rec_hands.push(op);
             }
+            if let Some(op) = stamp {
+                rec_stamps.push(op);
+            }
         } else if let Some(op) = hand {
             run_hand(&mut s.live, op);
+        } else if let Some(op) = stamp {
+            let mut clock = s.clock;
+            run_stamp(&mut s.live, &mut clock, op);
+            s.clock = clock;
         }
         Ok(())
     }
@@ -279,16 +335,17 @@ impl Device for MockDevice {
         {
             let mut s = self.0.lock().unwrap();
             assert!(!s.grid_running, "capture while persistent grid ran");
-            s.recording = Some((Vec::new(), Vec::new()));
+            s.recording = Some((Vec::new(), Vec::new(), Vec::new()));
         }
         let done = record();
-        let (ptrs, hands) = self.0.lock().unwrap().recording.take().unwrap_or_default();
+        let (ptrs, hands, stamps) = self.0.lock().unwrap().recording.take().unwrap_or_default();
         done?;
         self.0.lock().unwrap().captures += 1;
         Ok(MockGraph {
             state: self.0.clone(),
             ptrs,
             hands,
+            stamps,
         })
     }
 
@@ -305,6 +362,11 @@ impl Device for MockDevice {
         for &op in &graph.hands {
             run_hand(&mut s.live, op);
         }
+        let mut clock = s.clock;
+        for &op in &graph.stamps {
+            run_stamp(&mut s.live, &mut clock, op);
+        }
+        s.clock = clock;
         s.replays += 1;
         s.last_replayed = graph.ptrs.clone();
         Ok(())
@@ -568,18 +630,16 @@ impl Sum for MockSum {
 
     fn check(&mut self) -> Result<(), RunError> {
         self.log.lock().unwrap().checks += 1;
-        if self.timed {
-            self.stop();
-        }
         Ok(())
     }
 
     fn timing(&mut self, on: bool) {
-        if self.timed != on {
-            self.stop();
-        }
         self.timed = on;
         self.log.lock().unwrap().timed = on;
+    }
+
+    fn spent(&mut self) -> Result<Option<[f64; 2]>, RunError> {
+        Ok(self.timed.then_some([0.001, 0.002]))
     }
 }
 
@@ -757,18 +817,31 @@ fn sums_split_fallbacks() {
         assert_eq!(sum_counts(&log), (3, 2, 2));
     }
 
-    // Switching to profiling stops the grid and disables capture.
+    // Profiling captures a stamped graph and keeps the grid warm.
     {
         let (_guard, mut rank, ctx, _, meta) = open_rank(plan.clone(), Some((true, true)));
-        let (log, job) = meta.unwrap();
-        rank.submit(0..plan.steps.len()).unwrap();
+        let (log, _) = meta.unwrap();
+        let range = 0..plan.steps.len();
+        rank.submit(range.clone()).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (1, 1));
         assert_eq!(sum_counts(&log), (1, 0, 1));
         rank.profiling(true);
-        rank.submit(0..plan.steps.len()).unwrap();
-        assert_eq!((ctx.counts().3, ctx.counts().4), (1, 1));
+        for _ in 0..3 {
+            rank.submit(range.clone()).unwrap();
+        }
+        assert_eq!((ctx.counts().3, ctx.counts().4), (2, 4));
         assert!(log.lock().unwrap().timed);
-        assert_eq!(sum_counts(&log), (2, 2, 2));
-        assert_eq!(ctx.read_u64(job), 8);
+        assert_eq!(sum_counts(&log), (2, 1, 4));
+        let prof = rank.take_profile().unwrap();
+        assert_eq!(prof.spent["gpu: graph"].count, 3);
+        assert!(prof.spent["gpu: graph"].seconds > 0.0);
+        assert_eq!(prof.spent["all_reduce: wait"].count, 3);
+        assert_eq!(prof.spent["all_reduce: transfer"].count, 3);
+        assert_eq!(prof.spent["all_reduce"].count, 6);
+        rank.profiling(false);
+        rank.submit(range).unwrap();
+        assert_eq!((ctx.counts().3, ctx.counts().4), (2, 5));
+        assert_eq!(sum_counts(&log), (2, 1, 5));
     }
 
     // Host-fallback AllGather splits while AllReduces capture together.

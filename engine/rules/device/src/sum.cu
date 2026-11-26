@@ -17,7 +17,7 @@ struct job {
     u64 seq;
     u64 done;
     u32 n;
-    // Nonzero: a barrier round first, and ticks summed below.
+    // Nonzero: record wait and move ticks below.
     u32 timed;
     // Nonzero: gather `rows` rows into `total` floats.
     u32 rows;
@@ -86,7 +86,8 @@ __device__ bool issue_sum(session& s, const float* from, const float* to, u32 do
 
 // Lane 0 sums BF16 parts, lane 2 F32 parts.
 template <bool BF16>
-__device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first, u32 stride) {
+__device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 room, u32 first,
+                        u32 stride, u64* met) {
     if (n == 0u) return true;
     u32 sum_room = BF16 ? room << 1 : room;
     sum_round cur, nxt;
@@ -96,6 +97,7 @@ __device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 roo
         bool has_next = nd < n;
         if (has_next && !issue_sum<BF16>(s, from, to, nd, min(sum_room, n - nd), first, stride, nxt)) return false;
         if (!wait(cur.r, cur.reads)) return false;
+        if (cur.done == 0u && met != nullptr && prim::leader()) *met = prim::clock_ticks();
         if (cur.reads) {
             parts got = received(cur.r);
             if (cur.shift == 3u) {
@@ -117,7 +119,7 @@ __device__ bool run_sum(session& s, const float* from, float* to, u32 n, u32 roo
 }
 
 __device__ bool run_gather(session& s, const float* from, float* to, u32 n, u32 rows, u32 total,
-                           u32 room, u32 first, u32 stride) {
+                           u32 room, u32 first, u32 stride, u64* met) {
     u32 cols = total / rows;
     u32 local_w = n / rows;
     u32 step_rows = max(1u, room / cols);
@@ -130,6 +132,7 @@ __device__ bool run_gather(session& s, const float* from, float* to, u32 n, u32 
         bool active = stage_send(from + u64(r0) * local_w, part, len, first, stride);
         if (!trigger(r, len, active)) return false;
         if (!wait(r, true)) return false;
+        if (r0 == 0u && met != nullptr && prim::leader()) *met = prim::clock_ticks();
         parts got = received(r);
         u32 off = 0;
         for (u32 k = 0; k < got.count; k++) {
@@ -182,7 +185,7 @@ extern "C" __global__ __launch_bounds__(512) void tessera_sums(const table* t) {
             now.from = j->from;
             now.to = j->to;
             now.n = j->n;
-            now.timed = j->timed;
+            now.timed = prim::load_fresh(&j->timed);
             now.rows = j->rows;
             now.total = j->total;
             now.wide = j->wide;
@@ -194,29 +197,25 @@ extern "C" __global__ __launch_bounds__(512) void tessera_sums(const table* t) {
             if (prim::leader()) prim::store_release_gpu64(&j->done, seq);
             break;
         }
-        if (now.timed != 0) {
-            ticket b = prepare(s, 0);
-            u16* part = send_buffer<u16>(b);
-            if (part == nullptr) return;
-            if (first == 0) part[0] = 0u;
-            if (!trigger(b, 1, first == 0)) return;
-            if (!wait(b, false)) return;
-        }
-        u64 met = prim::clock_ticks();
+        u64 met = 0ull;
+        u64* met_p = now.timed != 0 ? &met : nullptr;
         const float* from = reinterpret_cast<const float*>(now.from);
         float* to = reinterpret_cast<float*>(now.to);
         bool ok = now.rows > 0
-                      ? run_gather(s, from, to, now.n, now.rows, now.total, room, first, stride)
-                  : now.wide != 0 ? run_sum<false>(s, from, to, now.n, room, first, stride)
-                                  : run_sum<true>(s, from, to, now.n, room, first, stride);
+                      ? run_gather(s, from, to, now.n, now.rows, now.total, room, first, stride,
+                                   met_p)
+                  : now.wide != 0
+                      ? run_sum<false>(s, from, to, now.n, room, first, stride, met_p)
+                      : run_sum<true>(s, from, to, now.n, room, first, stride, met_p);
         if (!ok) return;
         u64 summed = prim::clock_ticks();
         __threadfence();
         if (!grid_sync(t)) return;
         if (prim::leader()) {
             if (now.timed != 0) {
-                j->waited += met - seen;
-                j->moved += summed - met;
+                u64 mid = met != 0ull ? met : seen;
+                j->waited += mid - seen;
+                j->moved += summed - mid;
             }
             prim::store_release_gpu64(&j->done, seq);
         }
@@ -226,12 +225,11 @@ extern "C" __global__ __launch_bounds__(512) void tessera_sums(const table* t) {
 
 // On the main stream: passes one job, then waits.
 extern "C" __global__ void tessera_hand(const table* t, job* j, u64 from, u64 to, u32 n,
-                                        u32 timed, u32 rows, u32 total, u32 wide, u64 timeout) {
+                                        u32 rows, u32 total, u32 wide, u64 timeout) {
     u64 seq = prim::load_acquire_gpu64(&j->seq) + 1;
     j->from = from;
     j->to = to;
     j->n = n;
-    j->timed = timed;
     j->rows = rows;
     j->total = total;
     j->wide = wide;

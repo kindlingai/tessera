@@ -6,13 +6,42 @@
 // Counts per block, then 16-byte records. Zero records nothing.
 __device__ unsigned long long tessera_marks;
 
-__device__ __forceinline__ void tessera_mark(unsigned line) {
-  unsigned long long now;
+__device__ __forceinline__ unsigned long long tessera_clock_ticks() {
 #if defined(__HIPCC_RTC__) || defined(__HIP__)
-  now = wall_clock64();
+  return wall_clock64();
 #else
+  unsigned long long now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  return now;
 #endif
+}
+
+__device__ __forceinline__ void tessera_stamp_step(
+    unsigned long long* starts,
+    unsigned long long* accum,
+    unsigned slot,
+    unsigned mode) {
+  unsigned long long now = tessera_clock_ticks();
+  if (mode == 0u) {
+    starts[0] = now;
+    starts[slot] = now;
+  } else if (mode == 1u) {
+    accum[slot] += now - starts[0];
+    starts[0] = now;
+  } else if (mode == 2u) {
+    accum[slot] += now - starts[slot];
+  } else if (mode == 3u) {
+    starts[slot] = now;
+  } else if (mode == 4u) {
+    accum[slot] += now - starts[slot];
+  } else if (mode == 5u) {
+    accum[slot] += now - starts[0];
+    accum[slot + 1u] += now - starts[slot + 1u];
+  }
+}
+
+__device__ __forceinline__ void tessera_mark(unsigned line) {
+  unsigned long long now = tessera_clock_ticks();
   if ((threadIdx.x | threadIdx.y | threadIdx.z) != 0 || tessera_marks == 0) {
     return;
   }

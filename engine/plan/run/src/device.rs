@@ -1,7 +1,7 @@
 //! Replays a plan on any GPU over the device traits.
 
 use crate::Error;
-use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared};
+use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
 use crate::held::Holds;
 use crate::kernels::Kernels;
@@ -16,7 +16,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
@@ -44,6 +43,8 @@ pub(crate) struct Runner<D: Device> {
     marked: HashMap<String, D::Kernel>,
     /// Where marked kernels write, made on first use.
     ledger: Option<DeviceBuffer<D>>,
+    /// In-graph GPU clock accumulators, made on first profiled graph.
+    stamps: Option<marks::Stamps<D>>,
     /// Reloads that launches applied, for the next `refresh`.
     missed: Vec<Reload>,
     compiled: Kernels<D::Kernel>,
@@ -100,6 +101,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             uses: Vec::new(),
             marked: HashMap::new(),
             ledger: None,
+            stamps: None,
             missed: Vec::new(),
             compiled: Kernels::default(),
             plans: Lru::new(MAX_PLANS),
@@ -359,11 +361,40 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     /// Whether `steps` can record into one device graph.
     pub(crate) fn can_record(&self, steps: &Range<usize>) -> bool {
         // A recorded graph cannot hold a grid that waits.
-        self.base.profile.is_none()
-            && self.launching.graphs
+        self.launching.graphs
             && self.ctx.graphs()
             && !self.resident[steps.clone()].contains(&true)
             && self.base.plan.id != 0
+    }
+
+    fn flush_stamps(&mut self) -> Result<(), Error> {
+        let Some(stamps) = &mut self.stamps else {
+            return Ok(());
+        };
+        stamps.flush(self.ctx, &self.base.plan, self.base.profile.as_mut())
+    }
+
+    fn ensure_stamps(
+        &mut self,
+        len: usize,
+        sums: &mut Option<&mut (dyn Sum + 'static)>,
+    ) -> Result<(), Error> {
+        let need = self.stamps.as_ref().is_none_or(|s| s.needs_grow(len));
+        if !need {
+            return Ok(());
+        }
+        self.flush_stamps()?;
+        if let Some(grid) = sums.as_deref_mut() {
+            grid.pause()?;
+        }
+        match &mut self.stamps {
+            Some(stamps) => {
+                stamps.grow(self.ctx, len)?;
+                self.clear_graphs();
+            }
+            None => self.stamps = Some(marks::Stamps::open(self.ctx, len)?),
+        }
+        Ok(())
     }
 
     /// Promotes hot experts after a completed full-plan step.
@@ -392,25 +423,41 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             grid.pause()?;
         }
         self.reread()?;
-        let end = steps.end;
-        if self.base.profile.is_some() {
-            self.profiled(steps)?;
-            self.maintain_pager(wait, end)?;
-            return Ok((None, None));
-        }
+        let (end, profiled) = (steps.end, self.base.profile.is_some());
         if steps.is_empty() {
             self.maintain_pager(wait, end)?;
             return Ok((None, None));
         }
         if !self.can_record(&steps) {
-            let plain = |r: &Self| r.launch_all(steps, None).map_err(Capture::into_error);
+            if profiled {
+                self.profiled(steps)?;
+                self.maintain_pager(wait, end)?;
+                return Ok((None, None));
+            }
+            let plain = |r: &Self| {
+                r.launch_all(steps, None, false)
+                    .map_err(Capture::into_error)
+            };
             let secs = self.waited(wait, timed, plain)?;
             self.maintain_pager(wait, end)?;
             return Ok((secs, None));
         }
+        if profiled {
+            self.ensure_stamps(steps.len(), &mut sums)?;
+            if self
+                .stamps
+                .as_ref()
+                .is_some_and(|s| s.differs(self.base.plan.id, steps.start, steps.end))
+            {
+                self.flush_stamps()?;
+            }
+        }
         let mut bound: Vec<_> = self.base.bound.iter().map(|(k, v)| (*k, *v)).collect();
         bound.sort_unstable();
-        let (key, range) = ((self.base.plan.id, bound), (steps.start, steps.end));
+        let (key, range) = (
+            (self.base.plan.id, bound),
+            (steps.start, steps.end, profiled),
+        );
         let hit = self
             .graphs
             .get_mut(&key)
@@ -421,29 +468,13 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             }
             let graph = match self.ctx.capture(|| {
                 let cap = if cross { sums.as_deref_mut() } else { None };
-                self.launch_all(steps.clone(), cap)
+                self.launch_all(steps.clone(), cap, profiled)
             }) {
                 Ok(graph) => graph,
                 Err(Capture::Split(at)) => return Ok((None, Some(at))),
                 Err(Capture::Err(e)) => return Err(e),
             };
-            let evicted = match self.graphs.get_mut(&key) {
-                Some(set) => {
-                    let stale = (set.ptrs != self.ptrs).then(|| {
-                        set.ptrs = self.ptrs.clone();
-                        std::mem::take(&mut set.ranges)
-                    });
-                    set.ranges.insert(range, graph);
-                    stale
-                }
-                None => {
-                    let set = GraphSet {
-                        ptrs: self.ptrs.clone(),
-                        ranges: HashMap::from([(range, graph)]),
-                    };
-                    self.graphs.insert(key.clone(), set).map(|old| old.ranges)
-                }
-            };
+            let evicted = store_graph(&mut self.graphs, key.clone(), range, &self.ptrs, graph);
             if evicted.is_some() {
                 self.ctx.finish()?;
                 drop(evicted);
@@ -457,6 +488,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             Ok(r.ctx.replay(graph)?)
         };
         let secs = self.waited(wait, timed, replay)?;
+        if profiled && let Some(stamps) = &mut self.stamps {
+            stamps.record(self.base.plan.id, steps.start, steps.end);
+        }
         self.maintain_pager(wait, end)?;
         Ok((secs, None))
     }
@@ -579,21 +613,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             grid.profiling(false);
         }
         ran?;
-        let mut merged = Marks::default();
-        for (_, found) in taken {
-            merged.lost += found.lost;
-            for region in found.regions {
-                match merged
-                    .regions
-                    .iter_mut()
-                    .find(|r| (r.from, r.to) == (region.from, region.to))
-                {
-                    Some(existing) => existing.seconds.extend(region.seconds),
-                    None => merged.regions.push(region),
-                }
-            }
-        }
-        Ok(Some(merged))
+        Ok(Some(marks::merge(taken.into_iter().map(|(_, m)| m))))
     }
 
     /// Every launch of `steps`, in order.
@@ -601,18 +621,28 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         &self,
         steps: Range<usize>,
         mut sums: Option<&mut (dyn Sum + 'static)>,
+        stamped: bool,
     ) -> Result<(), Capture> {
         let sync = match self.ctx.has_lanes() {
             true => LaneSync::plan(&self.base.plan.steps[steps.clone()]),
             false => LaneSync::default(),
         };
+        let stamps = stamped.then_some(self.stamps.as_ref()).flatten();
+        let (start, len) = (steps.start, steps.len());
+        if let Some(st) = stamps {
+            st.emit(self.ctx, len, marks::BEGIN)?;
+        }
         sync.begin(self.ctx)?;
-        let start = steps.start;
         let run = (|| -> Result<(), Capture> {
             for i in steps {
                 let step = &self.base.plan.steps[i];
                 let rel = i - start;
                 sync.before(self.ctx, rel, step.lane)?;
+                if sync.active
+                    && let Some(st) = stamps
+                {
+                    st.emit(self.ctx, rel, marks::LANE_BEGIN)?;
+                }
                 if crosses(step.kernel.name())
                     && let Some(grid) = sums.as_deref_mut()
                 {
@@ -625,9 +655,22 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                         self.launch(i, &launch)?;
                     }
                 }
+                if let Some(st) = stamps {
+                    let mode = match (sync.active, rel + 1 == len) {
+                        (true, _) => marks::LANE_END,
+                        (false, true) => marks::LAST_STEP,
+                        (false, false) => marks::STEP,
+                    };
+                    st.emit(self.ctx, rel, mode)?;
+                }
                 sync.after(self.ctx, rel, step.lane)?;
             }
             sync.finish(self.ctx)?;
+            if sync.active
+                && let Some(st) = stamps
+            {
+                st.emit(self.ctx, len, marks::END)?;
+            }
             Ok(())
         })();
         if sync.active {
@@ -645,6 +688,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         if plan.id != 0 && plan.id == self.base.plan.id {
             return Ok(());
         }
+        self.flush_stamps()?;
         if self.pager.is_none()
             && self
                 .base
@@ -754,77 +798,6 @@ impl OnGpu for Open<'_> {
     }
 }
 
-/// Pins host memory through the shared context.
-pub(crate) struct Pins;
-
-impl OnGpu for Pins {
-    type Out = Option<Arc<dyn tessera_engine_comm::Pinning>>;
-
-    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Some(Arc::new(Pin(cached_context::<D>().ok()?)))
-    }
-}
-
-/// The shared context's platform.
-struct Asked;
-
-impl OnGpu for Asked {
-    type Out = Option<tessera_gpukit::Platform>;
-
-    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        Some(cached_context::<D>().ok()?.platform())
-    }
-}
-
-/// The shared context's free bytes.
-struct Free;
-
-impl OnGpu for Free {
-    type Out = Option<u64>;
-
-    fn on<D: Device + Launch<Kernel = <D as Device>::Kernel>>(self) -> Self::Out {
-        cached_context::<D>().ok()?.free_memory()
-    }
-}
-
-/// The platform a runner for `settings` would report.
-pub(crate) fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
-    crate::configure(settings);
-    tessera_gpukit::backend::dispatch(settings.gpu(), Asked).ok()?
-}
-
-/// Free bytes on the GPU `settings` picks, if known.
-pub(crate) fn free(settings: &Settings) -> Option<u64> {
-    crate::configure(settings);
-    tessera_gpukit::backend::dispatch(settings.gpu(), Free).ok()?
-}
-
-tessera_lower::rule::scatter! {
-    #[scatter(tessera_lower::ASKERS)]
-    static ASK: tessera_lower::Ask = asked;
-}
-
-/// Pinned host memory from the shared context.
-struct Pin<D: Device>(&'static D);
-
-impl<D: Device> tessera_engine_comm::Pinning for Pin<D> {
-    fn pin(&self, len: usize) -> Result<tessera_engine_comm::Pinned, tessera_engine_comm::Error> {
-        let (host, device) = self
-            .0
-            .pin(len)
-            .map_err(|e| tessera_engine_comm::Error::Link(e.to_string()))?;
-        Ok(tessera_engine_comm::Pinned {
-            host: host as *mut u8,
-            device,
-            len,
-        })
-    }
-
-    fn unpin(&self, pinned: tessera_engine_comm::Pinned) {
-        self.0.unpin(pinned.host as u64);
-    }
-}
-
 impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     fn base(&self) -> &Base {
         &self.base
@@ -856,39 +829,39 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         let loaded = self.overrides.as_ref().and_then(|f| f.text(&entry));
         let planned = || overrides::text(&self.base.plan.steps[step], D::BACKEND);
         let text = loaded.map_or_else(planned, str::to_string);
-        if !text.contains("TS_MARK") {
-            return Ok(Some(Marks::default()));
-        }
-        let marked = format!("{}{text}", marks::ON);
-        let kernel = match self.marked.get(&marked) {
-            Some(kernel) => kernel.clone(),
-            None => {
-                let kernel = self.ctx.compile(&marked, &entry)?;
-                self.marked.insert(marked, kernel.clone());
-                kernel
-            }
-        };
-        let Some(at) = self.ctx.global(&kernel, "tessera_marks")? else {
-            return Ok(None);
-        };
-        if self.ledger.is_none() {
-            let bytes = marks::COUNTS + marks::records(marks::BLOCKS);
-            self.ledger = Some(DeviceBuffer::alloc(self.ctx, bytes)?);
-        }
-        let ledger = self.ledger.as_ref().map_or(0, DeviceBuffer::device_ptr);
-        self.ctx.finish()?;
-        self.ctx.upload(at, &ledger.to_ne_bytes())?;
+        let launches = self.base.launches(step)?;
+        let args: Result<Vec<_>, _> = launches.iter().map(|l| self.bound(&l.args)).collect();
+        let mut args = args?;
+        let ctx = self.ctx;
         let mut found = Marks::default();
-        // Counts restart per launch, so launches never mix.
-        for launch in self.base.launches(step)? {
-            self.ctx.zero(ledger, marks::COUNTS)?;
-            self.ctx.programmatic(false);
-            let mut args = self.bound(&launch.args)?;
-            self.fire(&kernel, launch.shape, &mut args)?;
-            self.ctx.finish()?;
-            marks::collect(self.ctx, ledger, &mut found)?;
+        let mut ran = false;
+        for (launch, a) in launches.iter().zip(&mut args) {
+            let one = marks::step_marks(
+                ctx,
+                &mut self.marked,
+                &mut self.ledger,
+                (&entry, &text),
+                |k| {
+                    ctx.programmatic(false);
+                    match launch.shape {
+                        Shape::Line(n) => Ok(launch_1d(ctx, k, n, a)?),
+                        Shape::Grid {
+                            across,
+                            down,
+                            threads,
+                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, a)?),
+                        Shape::Runtime(_) => Err(tessera_lower::Error::Unbound.into()),
+                    }
+                },
+            )?;
+            let Some(one) = one else {
+                return Ok(None);
+            };
+            ran = true;
+            found.lost += one.lost;
+            found.regions.extend(one.regions);
         }
-        Ok(Some(found))
+        Ok(ran.then_some(found).or_else(|| Some(Marks::default())))
     }
 
     fn dump(&self) -> Result<Vec<PathBuf>, Error> {
@@ -908,10 +881,18 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
     }
 
     fn profiling(&mut self, on: bool) {
+        if !on && let Some(stamps) = &mut self.stamps {
+            stamps.discard();
+        }
         self.base.profile = on.then(crate::Profile::default);
         if let Some(grid) = self.grid.get_mut().as_mut() {
             grid.profiling(on);
         }
+    }
+
+    fn take_profile(&mut self) -> Option<crate::Profile> {
+        let _ = self.flush_stamps();
+        self.base.profile.as_mut().map(std::mem::take)
     }
 
     fn address(&self, slot: Slot) -> Option<u64> {

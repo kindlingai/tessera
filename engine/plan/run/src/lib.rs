@@ -154,12 +154,90 @@ pub fn select(ordinal: usize) {
 /// Pinned memory on the GPU `settings` picks, if any.
 pub fn pinning(settings: &Settings) -> Option<Arc<dyn Pinning>> {
     configure(settings);
-    if let Ok(pins) =
-        tessera_gpukit::backend::dispatch(settings.gpu().filter(|b| b.pins()), device::Pins)
-    {
+    if let Ok(pins) = tessera_gpukit::backend::dispatch(settings.gpu().filter(|b| b.pins()), Pins) {
         return pins;
     }
     None
+}
+
+struct Pins;
+impl tessera_gpukit::backend::OnGpu for Pins {
+    type Out = Option<Arc<dyn Pinning>>;
+    fn on<D>(self) -> Self::Out
+    where
+        D: tessera_gpukit::device::Device
+            + tessera_gpukit::launch::Launch<Kernel = <D as tessera_gpukit::device::Device>::Kernel>,
+    {
+        Some(Arc::new(Pin(
+            tessera_gpukit::device::cached_context::<D>().ok()?
+        )))
+    }
+}
+
+struct Asked;
+impl tessera_gpukit::backend::OnGpu for Asked {
+    type Out = Option<tessera_gpukit::Platform>;
+    fn on<D>(self) -> Self::Out
+    where
+        D: tessera_gpukit::device::Device
+            + tessera_gpukit::launch::Launch<Kernel = <D as tessera_gpukit::device::Device>::Kernel>,
+    {
+        Some(
+            tessera_gpukit::device::cached_context::<D>()
+                .ok()?
+                .platform(),
+        )
+    }
+}
+
+struct Free;
+impl tessera_gpukit::backend::OnGpu for Free {
+    type Out = Option<u64>;
+    fn on<D>(self) -> Self::Out
+    where
+        D: tessera_gpukit::device::Device
+            + tessera_gpukit::launch::Launch<Kernel = <D as tessera_gpukit::device::Device>::Kernel>,
+    {
+        tessera_gpukit::device::cached_context::<D>()
+            .ok()?
+            .free_memory()
+    }
+}
+
+/// The platform a runner for `settings` would report.
+pub(crate) fn asked(settings: &Settings) -> Option<tessera_gpukit::Platform> {
+    configure(settings);
+    tessera_gpukit::backend::dispatch(settings.gpu(), Asked).ok()?
+}
+
+/// Free bytes on the GPU `settings` picks, if known.
+pub(crate) fn free(settings: &Settings) -> Option<u64> {
+    configure(settings);
+    tessera_gpukit::backend::dispatch(settings.gpu(), Free).ok()?
+}
+
+tessera_lower::rule::scatter! {
+    #[scatter(tessera_lower::ASKERS)]
+    static ASK: tessera_lower::Ask = asked;
+}
+
+struct Pin<D: tessera_gpukit::device::Device>(&'static D);
+impl<D: tessera_gpukit::device::Device> Pinning for Pin<D> {
+    fn pin(&self, len: usize) -> Result<tessera_engine_comm::Pinned, tessera_engine_comm::Error> {
+        let (host, device) = self
+            .0
+            .pin(len)
+            .map_err(|e| tessera_engine_comm::Error::Link(e.to_string()))?;
+        Ok(tessera_engine_comm::Pinned {
+            host: host as *mut u8,
+            device,
+            len,
+        })
+    }
+
+    fn unpin(&self, pinned: tessera_engine_comm::Pinned) {
+        self.0.unpin(pinned.host as u64);
+    }
 }
 
 /// A runner on the GPU `settings` picks, or the host.

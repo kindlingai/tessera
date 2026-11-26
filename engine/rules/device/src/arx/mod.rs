@@ -32,6 +32,8 @@ pub struct Arx<D: Device> {
     state: DeviceBuffer<D>,
     blocks: DeviceBuffer<D>,
     timeout_ticks: u64,
+    timed: bool,
+    last: [u64; 2],
     broken: bool,
 }
 
@@ -60,7 +62,7 @@ where
         let two_f32 = ctx.compile(&text, "tessera_arx_two_f32")?;
         let two_fp8 = ctx.compile(&text, "tessera_arx_two_fp8")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
-        let state = DeviceBuffer::alloc(ctx, 32)?;
+        let state = DeviceBuffer::alloc(ctx, 32 + crate::TIMING_BYTES)?;
         let blocks = DeviceBuffer::alloc(ctx, 96)?;
         state.zero()?;
         blocks.zero()?;
@@ -81,6 +83,8 @@ where
             state,
             blocks,
             timeout_ticks,
+            timed: false,
+            last: [0; 2],
             broken: false,
         })
     }
@@ -247,6 +251,22 @@ where
             return Err(tessera_run::Error::Sums(Box::new(Error::Comm(e))));
         }
         Ok(())
+    }
+
+    fn timing(&mut self, on: bool) {
+        if self.timed != on {
+            self.timed = on;
+            crate::write_timed(&self.ctx, self.state.device_ptr() + 32, on);
+        }
+    }
+
+    fn spent(&mut self) -> Result<Option<[f64; 2]>, tessera_run::Error> {
+        if !self.timed {
+            return Ok(None);
+        }
+        crate::read_ticks(&self.ctx, self.state.device_ptr() + 40, &mut self.last)
+            .map(Some)
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 
     fn sum(

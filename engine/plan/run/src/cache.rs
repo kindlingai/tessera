@@ -18,7 +18,34 @@ pub(crate) type GraphKey = (u64, Vec<(DimName, u32)>);
 /// Recorded step ranges for one binding and its addresses.
 pub(crate) struct GraphSet<G> {
     pub(crate) ptrs: Vec<u64>,
-    pub(crate) ranges: HashMap<(usize, usize), G>,
+    pub(crate) ranges: HashMap<(usize, usize, bool), G>,
+}
+
+/// Inserts `graph` into `graphs`, returning any evicted graph map.
+pub(crate) fn store_graph<G>(
+    graphs: &mut Lru<GraphKey, GraphSet<G>>,
+    key: GraphKey,
+    range: (usize, usize, bool),
+    ptrs: &[u64],
+    graph: G,
+) -> Option<HashMap<(usize, usize, bool), G>> {
+    match graphs.get_mut(&key) {
+        Some(set) => {
+            let stale = (set.ptrs != ptrs).then(|| {
+                set.ptrs = ptrs.to_vec();
+                std::mem::take(&mut set.ranges)
+            });
+            set.ranges.insert(range, graph);
+            stale
+        }
+        None => {
+            let set = GraphSet {
+                ptrs: ptrs.to_vec(),
+                ranges: HashMap::from([(range, graph)]),
+            };
+            graphs.insert(key, set).map(|old| old.ranges)
+        }
+    }
 }
 
 /// Compiled kernel and dispatch tables for one inactive plan.

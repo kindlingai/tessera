@@ -423,10 +423,17 @@ TESSERA_FN bool exchange_all(const u64* areas, u32* ci, u64 mine, u64 seq, u32 m
     return true;
 }
 
+TESSERA_FN prim::Timing* timing_of(u64* seq_ptr) {
+    return reinterpret_cast<prim::Timing*>(seq_ptr + 1);
+}
+
 TESSERA_FN void finish_chunk(const u64* areas, u32* ci, u64* seq_ptr, u64 seq, u32 me, u32 nr,
                              bool is_last_chunk) {
     if (last_cta<false>(ci + 1) && prim::leader_thread()) {
-        if (is_last_chunk) prim::store_release_sys(seq_ptr, seq + 1);
+        if (is_last_chunk) {
+            prim::timing_end(timing_of(seq_ptr));
+            prim::store_release_sys(seq_ptr, seq + 1);
+        }
         for (u32 k = 1; k < nr; k++) {
             u32 peer = (me + k) % nr;
             prim::store_release_sys(ack_of(areas[peer], nr, me), seq);
@@ -601,10 +608,19 @@ TESSERA_FN void ag_copy(u64 remote, u64 peer, float* dst, u32 lo4, u32 hi4, bool
     }
 }
 
+TESSERA_FN bool sync_peer(u32* cnt, u64* remote_flag, u64* local_flag, u64 seq, u64 deadline,
+                          u32* fault, int* stop) {
+    if (last_cta(cnt) && prim::leader_thread()) {
+        prim::store_release_sys(remote_flag, seq);
+    }
+    return spin_ge(local_flag, seq, deadline, fault, stop);
+}
+
 template <Wire W>
 TESSERA_FN bool rs_ag_4(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u32 nr,
                         const float* src, float* dst_buf, u32 n, u32 vec4s, u32 blocks,
-                        bool aligned_src, bool aligned_dst, u64 deadline, u32* fault, int* stop) {
+                        bool aligned_src, bool aligned_dst, u64 deadline, u32* fault, int* stop,
+                        prim::Timing* tm) {
     u32 al = (W == Wire::Fp8) ? ((vec4s >= 128u) ? 32u : 4u) : 2u;
     u32 mask = ~(al - 1u);
     u32 half = (vec4s >> 1u) & mask;
@@ -633,29 +649,27 @@ TESSERA_FN bool rs_ag_4(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u3
     if (!spin_ge(ack_of(mine, nr, peer0), seq - 2, deadline, fault, stop)) return false;
     cta_slice<W>(oth_lo, oth_hi, blocks, lo, hi);
     write_slice<W>(areas[peer0], seq, me, nr, src, n, lo, hi, aligned_src);
-    if (last_cta(ci + 2) && prim::leader_thread()) {
-        prim::store_release_sys(tail_of(areas[peer0], seq, me, nr), seq);
-    }
-    if (!spin_ge(tail_of(mine, seq, peer0, nr), seq, deadline, fault, stop)) return false;
+    if (!sync_peer(ci + 2, tail_of(areas[peer0], seq, me, nr), tail_of(mine, seq, peer0, nr), seq,
+                   deadline, fault, stop))
+        return false;
+    if (prim::leader()) prim::timing_mark(tm);
 
     if (!spin_ge(ack_of(mine, nr, peer1), seq - 2, deadline, fault, stop)) return false;
     cta_slice<W>(p1_lo, p1_hi, blocks, lo, hi);
     rs_send<W>(areas[peer1] + slot_off(seq, me, nr), mine + slot_off(seq, peer0, nr), src, lo, hi,
                aligned_src);
-    if (last_cta(ci + 3) && prim::leader_thread()) {
-        prim::store_release_sys(tail_of(areas[peer1], seq, me, nr), seq);
-    }
-    if (!spin_ge(tail_of(mine, seq, peer1, nr), seq, deadline, fault, stop)) return false;
+    if (!sync_peer(ci + 3, tail_of(areas[peer1], seq, me, nr), tail_of(mine, seq, peer1, nr), seq,
+                   deadline, fault, stop))
+        return false;
 
     u32 my_c_lo, my_c_hi;
     cta_slice<W>(my_lo, my_hi, blocks, my_c_lo, my_c_hi);
     rs_finish<W>(areas[peer1] + slot_off(seq, me, nr), mine + slot_off(seq, me, nr),
                  mine + slot_off(seq, peer0, nr), mine + slot_off(seq, peer1, nr), src, dst_buf,
                  my_c_lo, my_c_hi, aligned_src, aligned_dst);
-    if (last_cta(ci + 4) && prim::leader_thread()) {
-        prim::store_release_sys(ag_tail_of(areas[peer1], seq, me, nr), seq);
-    }
-    if (!spin_ge(ag_tail_of(mine, seq, peer1, nr), seq, deadline, fault, stop)) return false;
+    if (!sync_peer(ci + 4, ag_tail_of(areas[peer1], seq, me, nr), ag_tail_of(mine, seq, peer1, nr),
+                   seq, deadline, fault, stop))
+        return false;
 
     if constexpr (W == Wire::Fp8) {
         ag_copy<W, true, false, true>(areas[peer0] + slot_off(seq, me, nr),
@@ -667,10 +681,9 @@ TESSERA_FN bool rs_ag_4(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u3
     cta_slice<W>(p1_lo, p1_hi, blocks, lo, hi);
     ag_copy<W, true>(areas[peer0] + slot_off(seq, me, nr), mine + slot_off(seq, peer1, nr),
                      dst_buf, lo, hi, aligned_dst);
-    if (last_cta(ci + 5) && prim::leader_thread()) {
-        prim::store_release_sys(ag_tail_of(areas[peer0], seq, me, nr), seq);
-    }
-    if (!spin_ge(ag_tail_of(mine, seq, peer0, nr), seq, deadline, fault, stop)) return false;
+    if (!sync_peer(ci + 5, ag_tail_of(areas[peer0], seq, me, nr), ag_tail_of(mine, seq, peer0, nr),
+                   seq, deadline, fault, stop))
+        return false;
 
     cta_slice<W>(oth_lo, oth_hi, blocks, lo, hi);
     ag_copy<W, false>(0ull, mine + slot_off(seq, peer0, nr), dst_buf, lo, hi, aligned_dst);
@@ -690,6 +703,8 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
     }
     prim::block_sync();
     if (stop != 0) return;
+    prim::Timing* tm = timing_of(seq_ptr);
+    if (prim::leader()) prim::timing_begin(tm);
 
     u64 mine = areas[me];
     bool pow2 = (nr & (nr - 1)) == 0;
@@ -721,7 +736,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
         if (scatter && (n & (W == Wire::Fp8 ? 15u : 3u)) == 0u &&
             vec4s >= (W == Wire::Fp8 ? 16u : 8u)) {
             if (!rs_ag_4<W>(areas, ci, mine, seq, me, nr, src, dst_buf, n, vec4s, blocks,
-                            aligned_src, aligned_dst, deadline, fault, &stop))
+                            aligned_src, aligned_dst, deadline, fault, &stop, tm))
                 return;
         } else if (butterfly) {
             u32 peer0 = me ^ 1u;
@@ -731,6 +746,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
                 prim::store_release_sys(tail_of(areas[peer0], seq, me, nr), seq);
             }
             if (!spin_ge(tail_of(mine, seq, peer0, nr), seq, deadline, fault, &stop)) return;
+            if (prim::leader()) prim::timing_mark(tm);
             u32 prev = peer0;
             u32 ci_idx = 3;
             for (u32 step = 2u; step < nr; step <<= 1, ci_idx++) {
@@ -752,6 +768,7 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
             if (!exchange_all<W>(areas, ci, mine, seq, me, nr, sched, pow2, src, n, lo4, hi4,
                                  aligned_src, 0ull, deadline, fault, &stop))
                 return;
+            if (prim::leader()) prim::timing_mark(tm);
             sum_slice<W>(areas, seq, me, nr, src, dst_buf, n, lo4, hi4, aligned_src, aligned_dst);
         }
         finish_chunk(areas, ci, seq_ptr, seq, me, nr, total - off <= CHUNK);
@@ -807,6 +824,8 @@ extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather(con
     }
     prim::block_sync();
     if (stop != 0) return;
+    prim::Timing* tm = p2p::timing_of(seq_ptr);
+    if (prim::leader()) prim::timing_begin(tm);
 
     u64 mine = areas[me];
     bool pow2 = (nr & (nr - 1)) == 0;
@@ -839,6 +858,7 @@ extern "C" __global__ __launch_bounds__(P2P_THREADS) void tessera_p2p_gather(con
                                                src_chunk, n, lo4, hi4, aligned_src, u64(local_w),
                                                deadline, fault, &stop))
             return;
+        if (prim::leader()) prim::timing_mark(tm);
 
         u32 off = 0;
         for (u32 r = 0; r < nr; r++) {

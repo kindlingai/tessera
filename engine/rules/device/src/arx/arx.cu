@@ -29,11 +29,16 @@ constexpr u64 MODE_GATHER = 2;
 constexpr u64 MODE_SCATTER_PIECE = 3;
 constexpr u64 MODE_GATHER_PIECE = 4;
 
-// State buffer slots: 0=seq_dev, 1=go, 2=pub, 3=work_next.
+// State buffer slots: 0=seq_dev, 1=go, 2=pub, 3=work_next, 4..8=Timing.
 constexpr u32 ST_SEQ = 0;
 constexpr u32 ST_GO = 1;
 constexpr u32 ST_PUB = 2;
 constexpr u32 ST_WORK = 3;
+constexpr u32 ST_TIMING = 4;
+
+TESSERA_FN prim::Timing* timing_of(u64* state) {
+    return reinterpret_cast<prim::Timing*>(state + ST_TIMING);
+}
 
 // Block counters: RS stage, AG publish, one-shot, finish.
 constexpr u32 BLK_ONE = 16;
@@ -141,6 +146,7 @@ TESSERA_FN bool wait_flags(ctl* c, const u64* flag, u64* state, u64 want, u32 me
         }
         prim::block_sync();
         if (prim::leader_thread()) {
+            prim::timing_mark(timing_of(state));
             u64 val = bad != 0 ? (want | FAULT_BIT) : want;
             prim::store_release_gpu64(state + ST_GO, val);
         }
@@ -198,6 +204,7 @@ TESSERA_FN void finish_seq(ctl* c, u32* blocks, u64* state, u64 seq) {
     if (prim::leader_thread() &&
         prim::fetch_add_gpu(blocks + BLK_DONE, 1u) == prim::blocks() - 1u) {
         prim::store_relaxed_gpu(blocks + BLK_DONE, 0u);
+        prim::timing_end(timing_of(state));
         state[ST_SEQ] = seq;
         prim::store_release_sys(&c->done, seq);
     }
@@ -435,6 +442,7 @@ TESSERA_FN void reduce_range(const u8* mine, const u8* recv, u64 par, float* out
 template <Wire W>
 TESSERA_FN void one_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks,
                          u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {
+    if (prim::leader()) prim::timing_begin(timing_of(state));
     u64 seq = state[ST_SEQ] + 1ull;
     u64 par = seq & 1ull;
     u8* mine = reinterpret_cast<u8*>(send_p) + par * SEND_BYTES;
@@ -453,6 +461,7 @@ TESSERA_FN void one_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
 template <Wire W>
 TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks,
                          u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {
+    if (prim::leader()) prim::timing_begin(timing_of(state));
     u64 seq0 = state[ST_SEQ] + 1ull;
     u64 seq1 = seq0 + 1ull;
     u64 par0 = seq0 & 1ull;
@@ -616,6 +625,7 @@ extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 fla
                                                  u64* state, u32* blocks, u64 from_p, u64 to_p,
                                                  u32 rows, u32 width, u32 me, u32 nr, u32 lanes,
                                                  u64 timeout) {
+    if (prim::leader()) prim::timing_begin(arx::timing_of(state));
     u64 seq = state[arx::ST_SEQ] + 1ull;
     u64 par = seq & 1ull;
     u8* mine_b = reinterpret_cast<u8*>(send_p) + par * arx::SEND_BYTES;

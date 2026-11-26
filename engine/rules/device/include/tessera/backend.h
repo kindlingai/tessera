@@ -158,6 +158,41 @@ TESSERA_FN void fence_sys() {
     __threadfence_system();
 }
 
+// Flag-gated wait and move clock accumulators for collectives.
+struct Timing {
+    u64 enabled;
+    u64 waited;
+    u64 moved;
+    u64 t0;
+    u64 t1;
+};
+
+TESSERA_FN void timing_begin(Timing* t) {
+    if (t != nullptr && load_acquire_sys(&t->enabled) != 0ull) {
+        t->t0 = clock_ticks();
+        t->t1 = 0ull;
+    }
+}
+
+TESSERA_FN void timing_mark(Timing* t) {
+    if (t != nullptr && load_acquire_sys(&t->enabled) != 0ull && t->t1 == 0ull) {
+        t->t1 = clock_ticks();
+    }
+}
+
+TESSERA_FN void timing_end(Timing* t) {
+    if (t != nullptr && load_acquire_sys(&t->enabled) != 0ull) {
+        u64 t0 = t->t0;
+        if (t0 != 0ull) {
+            u64 t2 = clock_ticks();
+            u64 mid = t->t1 != 0ull ? t->t1 : t0;
+            t->waited += mid - t0;
+            t->moved += t2 - mid;
+            t->t0 = 0ull;
+        }
+    }
+}
+
 TESSERA_FN float from_bits(u32 bits) {
     return __uint_as_float(bits);
 }

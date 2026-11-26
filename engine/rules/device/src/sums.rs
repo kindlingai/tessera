@@ -22,6 +22,8 @@ const THREADS: u32 = 512;
 const SHARE: u32 = 64;
 /// Bytes of the job the hand kernel passes.
 const JOB: usize = 72;
+/// Where the job keeps its host-toggled timing flag.
+const TIMED: usize = 36;
 /// Where the job keeps its summed wait and move ticks.
 const TICKS: usize = 56;
 /// Ranks may still load when the first sum starts.
@@ -79,7 +81,7 @@ struct Grid<D: Device, L> {
     job: DeviceBuffer<D>,
     /// The grid stays running across unprofiled submits until drop.
     running: bool,
-    /// Whether sums take a barrier round and keep ticks.
+    /// Whether sums record wait and transfer ticks.
     timed: bool,
     /// Wait and move ticks at the last `spent`.
     last: [u64; 2],
@@ -106,7 +108,6 @@ where
             .u64(from)
             .u64(to)
             .u32(n)
-            .u32(self.timed as u32)
             .u32(rows)
             .u32(total)
             .u32(wide as u32)
@@ -230,10 +231,9 @@ where
     }
 
     fn check(&mut self) -> Result<(), tessera_run::Error> {
-        let status = match (self.running, self.timed) {
-            (false, _) => self.resident.status(),
-            (true, true) => self.stop(),
-            (true, false) => match self.resident.poll() {
+        let status = match self.running {
+            false => self.resident.status(),
+            true => match self.resident.poll() {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     self.running = false;
@@ -250,22 +250,21 @@ where
     }
 
     fn timing(&mut self, on: bool) {
-        if self.timed != on && self.running {
-            let _ = self.stop();
+        if self.timed != on {
+            self.timed = on;
+            let at = self.job.device_ptr() + TIMED as u64;
+            let _ = self.ctx.upload(at, &u32::from(on).to_ne_bytes());
         }
-        self.timed = on;
     }
 
     fn spent(&mut self) -> Result<Option<[f64; 2]>, tessera_run::Error> {
-        let mut bytes = [0u8; JOB];
-        let read = self.job.read_bytes(&mut bytes);
-        read.map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
-        let (words, _) = bytes[TICKS..].as_chunks::<8>();
-        let now = [u64::from_le_bytes(words[0]), u64::from_le_bytes(words[1])];
-        let ticks = self.ctx.ticks();
-        let spent = [0, 1].map(|i| now[i].wrapping_sub(self.last[i]) as f64 / ticks);
-        self.last = now;
-        Ok(self.timed.then_some(spent))
+        if !self.timed {
+            return Ok(None);
+        }
+        let at = self.job.device_ptr() + TICKS as u64;
+        crate::read_ticks(&self.ctx, at, &mut self.last)
+            .map(Some)
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 }
 

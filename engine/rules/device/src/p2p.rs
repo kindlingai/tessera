@@ -161,6 +161,8 @@ pub struct P2p<D: Device> {
     cross: [usize; 2],
     timeout_ticks: u64,
     schedule: Schedule,
+    timed: bool,
+    last: [u64; 2],
     broken: bool,
 }
 
@@ -278,8 +280,9 @@ where
         counters.zero()?;
         let fault = DeviceBuffer::alloc(ctx, size_of::<u32>())?;
         fault.zero()?;
-        let seq = DeviceBuffer::alloc(ctx, size_of::<u64>())?;
-        seq.write_bytes(&BASE.to_ne_bytes())?;
+        let seq = DeviceBuffer::alloc(ctx, size_of::<u64>() + crate::TIMING_BYTES)?;
+        seq.zero()?;
+        ctx.upload(seq.device_ptr(), &BASE.to_ne_bytes())?;
         let timeout_ticks = (TIMEOUT.as_secs_f64() * ctx.ticks()) as u64;
         // Wait until every peer opened all handles.
         boot.exchange(&[])?;
@@ -304,6 +307,8 @@ where
             cross,
             timeout_ticks,
             schedule: Schedule::Auto,
+            timed: false,
+            last: [0; 2],
             broken: false,
         })
     }
@@ -316,7 +321,7 @@ where
 
     fn read_seq(&self) -> Result<u64, Error> {
         let mut raw = [0u8; 8];
-        self.seq.read_bytes(&mut raw)?;
+        self.ctx.download(self.seq.device_ptr(), &mut raw)?;
         Ok(u64::from_ne_bytes(raw))
     }
 
@@ -479,6 +484,22 @@ where
 
     fn check(&mut self) -> Result<(), tessera_run::Error> {
         self.status()
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+    }
+
+    fn timing(&mut self, on: bool) {
+        if self.timed != on {
+            self.timed = on;
+            crate::write_timed(&self.ctx, self.seq.device_ptr() + 8, on);
+        }
+    }
+
+    fn spent(&mut self) -> Result<Option<[f64; 2]>, tessera_run::Error> {
+        if !self.timed {
+            return Ok(None);
+        }
+        crate::read_ticks(&self.ctx, self.seq.device_ptr() + 16, &mut self.last)
+            .map(Some)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
     }
 }
