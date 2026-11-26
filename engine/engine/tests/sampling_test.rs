@@ -367,3 +367,15 @@ fn device_edits_match_host() {
         assert_eq!(answer(&mut device, request(greedy, guide())), want);
     }
 }
+
+/// A prefill report covers one step, within the context.
+#[test]
+fn prefill_report_fits_context() {
+    let mut e = engine();
+    let most = e.chunk(None);
+    assert_eq!(e.chunk(Some(2)), 2);
+    assert_eq!(e.chunk(Some(usize::MAX)), most);
+    let r = e.prefill_report(usize::MAX).unwrap();
+    assert!(r.label.starts_with("prefill rows="), "{}", r.label);
+    assert!(r.total_ops > 0);
+}

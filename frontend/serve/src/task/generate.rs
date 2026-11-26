@@ -109,6 +109,17 @@ pub(super) fn check_lowering(o: &Options, engine: &mut Engine, extra_rows: Optio
         && let Ok(report) = engine.lowering_report(rows)
     {
         eprintln!("{}", report.format(12));
+    }    // A prefill step off the fast path runs far slower.
+    let chunk = engine.chunk(o.max_batch_rows);
+    match engine.prefill_report(chunk) {
+        Ok(_) if chunk == 1 => {}
+        Ok(report) if o.explain_lowering => eprintln!("{}", report.format(12)),
+        Ok(report) => {
+            if let Some(warning) = report.warning("--explain-lowering") {
+                eprintln!("{warning}");
+            }
+        }
+        Err(e) => eprintln!("warning: prefill lowering report failed: {e}"),
     }
 }
 

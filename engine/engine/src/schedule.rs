@@ -189,6 +189,14 @@ pub struct Batch<'a> {
     closed: bool,
 }
 
+impl Engine {
+    /// Rows one prefill step feeds: `asked`, else the default.
+    pub fn chunk(&self, asked: Option<usize>) -> usize {
+        let rows = asked.unwrap_or(tessera_device::FAST_MAX_ROWS);
+        rows.min(self.context).max(1)
+    }
+}
+
 impl<'a> Batch<'a> {
     pub fn new(engine: &'a mut Engine, policy: Box<dyn Policy>) -> Self {
         let free = (0..engine.slots as u32).rev().collect();
@@ -196,7 +204,7 @@ impl<'a> Batch<'a> {
         if let Some(lanes) = &mut engine.lanes {
             lanes.reset();
         }
-        let budget = engine.context.min(tessera_device::FAST_MAX_ROWS);
+        let budget = engine.chunk(None);
         let mut batch = Self {
             engine,
             policy,

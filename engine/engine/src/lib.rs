@@ -494,27 +494,41 @@ impl Engine {
     pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
         let rows = rows.max(1);
         let max_pos = self.context.saturating_sub(1);
-        let sample: Vec<Row> = (0..rows)
-            .map(|i| Row {
-                slot: (i % self.slots) as u32,
-                token: 0,
-                position: (i / self.slots).min(max_pos) as u32,
-            })
-            .collect();
+        let row = |i: usize| Row {
+            slot: (i % self.slots) as u32,
+            token: 0,
+            position: (i / self.slots).min(max_pos) as u32,
+        };
+        let sample: Vec<Row> = (0..rows).map(row).collect();
         let picks: Vec<u32> = (0..rows as u32).collect();
-        let (sizes, [filled, _]) = launch_of(&sample, &picks, self.slots, self.context);
+        self.explained(&sample, &picks)
+    }
+
+    /// The report for one prompt's prefill step of `rows`.
+    pub fn prefill_report(&mut self, rows: usize) -> Result<Report, Error> {
+        let rows = rows.clamp(1, self.context);
+        let row = |i: usize| Row {
+            slot: 0,
+            token: 0,
+            position: i as u32,
+        };
+        let sample: Vec<Row> = (0..rows).map(row).collect();
+        let mut report = self.explained(&sample, &[rows as u32 - 1])?;
+        report.label = format!("prefill {}", report.label);
+        Ok(report)
+    }
+
+    fn explained(&mut self, sample: &[Row], picks: &[u32]) -> Result<Report, Error> {
+        let (sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
         let wants = match self.taps.is_some() {
             true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
             false => Wants::role(&self.graph, self.full, Role::Tokens),
         };
-        let mut report = self.plans.explain(
-            &self.graph,
-            self.full,
-            wants,
-            &sizes,
-            &[Context, Segments],
-            &self.device,
-        )?;
+        let upto = &[Context, Segments];
+        let (graph, device) = (&self.graph, &self.device);
+        let mut report = self
+            .plans
+            .explain(graph, self.full, wants, &sizes, upto, device)?;
         report.label = format!("rows={filled}");
         Ok(report)
     }
