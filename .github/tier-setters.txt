@@ -1,0 +1,4 @@
+# The logins whose priority, landing and conflict-exempt label
+# changes count, one a line. tier-ranks.sh reads this file.
+# An app login ends in [bot].
+mmastrac

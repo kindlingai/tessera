@@ -1,0 +1,66 @@
+name: Tiers
+
+# Maintainers rank PRs with the `priority` and `landing` labels.
+# Then CI's success job fails on lower ranked open PRs whose changes
+# conflict with them, see tier-gate.sh. This file reruns those
+# success jobs when their result can change.
+# pull_request_target and workflow_run run main's copy of this file
+# and its scripts. They never run PR code.
+on:
+  pull_request_target:
+    types: [labeled, unlabeled, synchronize, opened, reopened, closed, converted_to_draft, ready_for_review]
+  # A ranked PR that starts to conflict with main drops out of the stack.
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  scope:
+    # A pull request run decides a ranked PR's health. The bot
+    # starts the reruns this file makes, so skip those, or each rerun
+    # starts more. A first attempt that passed blocked while it ran.
+    if: >
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.triggering_actor.login != 'github-actions[bot]' &&
+      !(github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-slim
+    outputs:
+      rerun: ${{ steps.scope.outputs.rerun }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN: ${{ github.event.repository.default_branch }}
+        run: |
+          tools/scripts/tier-scope.sh > "$RUNNER_TEMP/scope"
+          tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/scope"
+
+  rerun:
+    needs: scope
+    if: needs.scope.outputs.rerun != ''
+    runs-on: ubuntu-slim
+    # A newer pending rerun of the same scope replaces an older one.
+    concurrency:
+      group: tiers-${{ needs.scope.outputs.rerun }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RERUN: ${{ needs.scope.outputs.rerun }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: env.RERUN != 'all'
+        run: tools/scripts/rerun-success.sh "$RERUN"
+      # The open PR list is read when this job starts, not when it queued.
+      - if: env.RERUN == 'all'
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '.[].head.sha' > "$RUNNER_TEMP/heads"
+          xargs tools/scripts/rerun-success.sh < "$RUNNER_TEMP/heads"
