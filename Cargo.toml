@@ -12,6 +12,7 @@ members = [
     "frontend/*",
     "tools/calibrate",
     "tools/hessians",
+    "tools/html",
     "tools/inspect",
     "tools/load",
     "tools/parity",
@@ -19,6 +20,7 @@ members = [
     "tools/ranks",
     "tools/rebase",
     "tools/references",
+    "tools/tiers",
 ]
 
 [workspace.package]
@@ -45,6 +47,7 @@ tessera-graph = { path = "engine/ir/graph" }
 tessera-guest = { path = "engine/rules/guest" }
 tessera-interp = { path = "engine/ir/interp" }
 tessera-host = { path = "engine/plan/host" }
+tessera-html = { path = "tools/html" }
 tessera-jit = { path = "engine/plan/jit" }
 tessera-kernel-macro = { path = "engine/plan/kernel-macro" }
 tessera-kernels = { path = "engine/rules/kernels" }

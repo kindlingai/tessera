@@ -1,1 +1,4 @@
 /target
+# Wrangler state and local secrets for tools/tiers.
+.wrangler/
+.dev.vars
