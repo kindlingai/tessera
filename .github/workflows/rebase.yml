@@ -72,9 +72,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - run: git fetch -q origin "$HEAD"
+      - run: git fetch -q origin "refs/pull/$PR/head"
         env:
-          HEAD: ${{ matrix.pull.head }}
+          PR: ${{ matrix.pull.pr }}
       - run: cargo build -q -p tessera-rebase
       - env:
           HEAD: ${{ matrix.pull.head }}
