@@ -33,14 +33,15 @@ const SCATTER_CROSSOVER: usize = 256 << 10;
 const BASE: u64 = 3;
 const RING: usize = 4;
 const CNT_STRIDE: usize = MAX_RANKS + 2;
-const MAX_THREADS: u32 = 512;
+const MAX_THREADS: u32 = 256;
 /// Payload bytes where `Auto` leaves fan-out, then picks scatter.
 pub(crate) const CROSS: [usize; 2] = [CROSSOVER, SCATTER_CROSSOVER];
 
 tessera_lower::knob!("p2p_sum", "threads", 32, 1024);
+tessera_lower::knob!("p2p_sum", "grid", 1, 64);
 tessera_lower::knob!("p2p_sum", "crossover", 0, MAX_BYTES as u64);
 tessera_lower::knob!("p2p_sum", "scatter_crossover", 0, MAX_BYTES as u64);
-const LARGE_GRID: u32 = 4;
+pub(crate) const LARGE_GRID: u32 = 16;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -156,6 +157,7 @@ pub struct P2p<D: Device> {
     rank: u32,
     ranks: u32,
     threads: u32,
+    large_grid: u32,
     cross: [usize; 2],
     timeout_ticks: u64,
     schedule: Schedule,
@@ -225,6 +227,9 @@ where
             .map_or(MAX_THREADS, |t| t as u32);
         let limit = ctx.platform().limits.group_threads as u32;
         let threads = (limit.min(most) & !31).max(32);
+        let large_grid = knobs
+            .get("p2p_sum", "grid")
+            .map_or(LARGE_GRID, |g| g as u32);
         let cross = [
             knobs.get("p2p_sum", "crossover").unwrap_or(CROSS[0]),
             knobs
@@ -299,6 +304,7 @@ where
             rank,
             ranks,
             threads,
+            large_grid,
             cross,
             timeout_ticks,
             schedule: Schedule::Auto,
@@ -322,7 +328,10 @@ where
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
-        let (sched, grid) = pick(n as usize * 4, self.ranks, self.schedule, self.cross);
+        let (sched, mut grid) = pick(n as usize * 4, self.ranks, self.schedule, self.cross);
+        if grid > 1 {
+            grid = self.large_grid;
+        }
         let mut args = KernelArgs::new();
         args.device_ptr(self.areas.device_ptr())
             .device_ptr(self.counters.device_ptr())
