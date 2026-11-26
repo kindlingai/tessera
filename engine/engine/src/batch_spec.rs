@@ -121,7 +121,20 @@ impl<'a> BatchCore<'a> {
         true
     }
 
+    /// Restores extra prefix pages from the KV store past `skip`.
+    pub(crate) fn restore_store(
+        &mut self,
+        slot: u32,
+        tokens: &[u32],
+        skip: usize,
+    ) -> Result<usize, Error> {
+        self.target
+            .restore_kv(self.kept.as_mut(), slot, tokens, skip, false)
+    }
+
     pub(crate) fn retire(&mut self, slot: u32, history: Vec<u32>) {
+        self.target
+            .spill_kv(self.kept.as_ref(), slot, &history, false);
         match &mut self.kept {
             Some(kept) => kept.finish(slot, history),
             None => self.free.push(slot),

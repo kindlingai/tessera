@@ -100,15 +100,52 @@ pub struct StoreStats {
     pub evictions: u64,
 }
 
+/// Stamp-based LRU order shared by RAM and disk stores.
+#[derive(Default)]
+pub(crate) struct LruClock {
+    stamps: HashMap<PageKey, u64>,
+    order: VecDeque<(PageKey, u64)>,
+    tick: u64,
+}
+
+impl LruClock {
+    /// Marks `key` as most recently used.
+    pub(crate) fn touch(&mut self, key: PageKey) {
+        self.tick += 1;
+        let t = self.tick;
+        self.stamps.insert(key, t);
+        self.order.push_back((key, t));
+    }
+
+    /// Removes `key` from live tracking.
+    pub(crate) fn remove(&mut self, key: &PageKey) {
+        self.stamps.remove(key);
+    }
+
+    /// Pops the oldest live key.
+    pub(crate) fn pop_oldest(&mut self) -> Option<PageKey> {
+        while let Some((key, stamp)) = self.order.pop_front() {
+            if self.stamps.get(&key) == Some(&stamp) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// Clears all entries.
+    pub(crate) fn clear(&mut self) {
+        self.stamps.clear();
+        self.order.clear();
+    }
+}
+
 /// LRU-bounded directory of immutable KV page files.
 pub struct PageStore {
     dir: PathBuf,
     max_bytes: u64,
     used_bytes: u64,
     entries: HashMap<PageKey, u64>,
-    stamps: HashMap<PageKey, u64>,
-    order: VecDeque<(PageKey, u64)>,
-    tick: u64,
+    lru: LruClock,
     hits: u64,
     misses: u64,
     saves: u64,
@@ -116,8 +153,13 @@ pub struct PageStore {
 }
 
 impl PageStore {
-    /// Opens or creates a page store bounded to `max_bytes`.
+    /// Opens or creates a persistent page store bounded to `max_bytes`.
     pub fn open(dir: &Path, max_bytes: u64) -> io::Result<Self> {
+        Self::open_mode(dir, max_bytes, true)
+    }
+
+    /// Opens a page store, clearing existing pages when `!persist`.
+    pub fn open_mode(dir: &Path, max_bytes: u64, persist: bool) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let mut found: Vec<(SystemTime, PageKey, u64)> = Vec::new();
         for bucket in fs::read_dir(dir)? {
@@ -138,6 +180,10 @@ impl PageStore {
                 if !meta.is_file() {
                     continue;
                 }
+                if !persist {
+                    let _ = fs::remove_file(item.path());
+                    continue;
+                }
                 let when = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 found.push((when, key, meta.len()));
             }
@@ -148,9 +194,7 @@ impl PageStore {
             max_bytes,
             used_bytes: 0,
             entries: HashMap::new(),
-            stamps: HashMap::new(),
-            order: VecDeque::new(),
-            tick: 0,
+            lru: LruClock::default(),
             hits: 0,
             misses: 0,
             saves: 0,
@@ -196,7 +240,7 @@ impl PageStore {
             return Ok(false);
         }
         dst.copy_from_slice(&raw);
-        self.touch(key);
+        self.lru.touch(key);
         self.hits += 1;
         Ok(true)
     }
@@ -208,7 +252,7 @@ impl PageStore {
             return Ok(false);
         }
         if self.entries.get(&key) == Some(&len) {
-            self.touch(key);
+            self.lru.touch(key);
             return Ok(false);
         }
         self.evict_for(len);
@@ -246,32 +290,22 @@ impl PageStore {
             self.used_bytes = self.used_bytes.saturating_sub(prev);
         }
         self.used_bytes += len;
-        self.touch(key);
-    }
-
-    fn touch(&mut self, key: PageKey) {
-        self.tick += 1;
-        let t = self.tick;
-        self.stamps.insert(key, t);
-        self.order.push_back((key, t));
+        self.lru.touch(key);
     }
 
     fn drop_key(&mut self, key: PageKey) {
         if let Some(len) = self.entries.remove(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(len);
-            self.stamps.remove(&key);
+            self.lru.remove(&key);
             let _ = fs::remove_file(self.page_path(key));
         }
     }
 
     fn evict_for(&mut self, need: u64) {
         while self.used_bytes.saturating_add(need) > self.max_bytes {
-            let Some((key, stamp)) = self.order.pop_front() else {
+            let Some(key) = self.lru.pop_oldest() else {
                 break;
             };
-            if self.stamps.get(&key) != Some(&stamp) {
-                continue;
-            }
             self.drop_key(key);
             self.evictions += 1;
         }
@@ -399,16 +433,38 @@ pub fn decode_msg(mut bytes: &[u8]) -> Option<DiskMsg> {
     None
 }
 
-/// Open on-disk KV page cache bound to one engine layout.
+/// Open multi-tier KV page cache bound to one engine layout.
 pub struct DiskKv {
-    store: PageStore,
+    store: crate::tier::TieredStore,
     pub seed: [u64; 2],
     pub page: usize,
     page_bytes: usize,
 }
 
 impl DiskKv {
-    /// Opens a disk cache for `rank`/`ranks` and kept layout.
+    /// Opens a tiered cache from `cfg` for `rank`/`ranks` and layout.
+    pub fn open_config(
+        cfg: &crate::spec::KvConfig,
+        rank: u32,
+        ranks: u32,
+        page: usize,
+        meta: &[(u32, u32, usize, &str)],
+    ) -> Option<io::Result<Self>> {
+        if cfg.disabled || cfg.tiers.is_empty() {
+            return None;
+        }
+        let (seed, page_bytes) = layout_seed(rank, ranks, page, meta)?;
+        Some(
+            crate::tier::TieredStore::open(cfg, rank, ranks).map(|store| Self {
+                store,
+                seed,
+                page,
+                page_bytes,
+            }),
+        )
+    }
+
+    /// Opens a single persistent SSD cache under `dir`.
     pub fn open(
         dir: &Path,
         max_bytes: u64,
@@ -417,13 +473,20 @@ impl DiskKv {
         page: usize,
         meta: &[(u32, u32, usize, &str)],
     ) -> Option<io::Result<Self>> {
-        let (seed, page_bytes) = layout_seed(rank, ranks, page, meta)?;
-        Some(PageStore::open(dir, max_bytes).map(|store| Self {
-            store,
-            seed,
-            page,
-            page_bytes,
-        }))
+        let cfg = crate::spec::KvConfig {
+            tiers: vec![crate::spec::TierSpec {
+                name: "ssd".into(),
+                store: crate::spec::StoreKind::Ssd {
+                    path: dir.to_path_buf(),
+                    bytes: max_bytes,
+                    persist: true,
+                },
+                keep: Some(crate::spec::Keep::All),
+                spare_ram: None,
+            }],
+            ..crate::spec::KvConfig::default()
+        };
+        Self::open_config(&cfg, rank, ranks, page, meta)
     }
 
     /// Cache statistics snapshot.
@@ -509,7 +572,7 @@ impl DiskKv {
         Ok(done)
     }
 
-    /// Reads missing `pairs` via `read` and spills them to disk.
+    /// Spills missing pages read through `read` to the store.
     pub fn save_pairs<E>(
         &mut self,
         pairs: &[(u32, PageKey)],
@@ -518,11 +581,11 @@ impl DiskKv {
     ) -> Result<(), E> {
         let mut buf = vec![0u8; self.page_bytes];
         for &(phys, key) in pairs {
-            if self.store.has(key) {
+            if !self.store.should_save(key) {
                 continue;
             }
             read(phys, self.page, &mut buf)?;
-            self.store.save(key, &buf).map_err(&mut io_err)?;
+            self.store.save_seen(key, &buf).map_err(&mut io_err)?;
         }
         Ok(())
     }

@@ -17,7 +17,7 @@ use tessera_tasks::api::Info;
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
     let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
-[--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--served-model-name <name>]";
+[--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--kv-store <spec>]... [--kv-keep <system|sessions|all>] [--kv-system-after <n>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--api-key <key>] [--cors-origin <origin>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--allow-weight-streaming] [--attic] \
 [--priority <n>] [--swap-quantum <x>] [--also <model and its flags>]...";
     format!("{head} {} {tail}", task::usage())
@@ -41,6 +41,12 @@ pub struct Options {
     pub shapes: tessera_engine::Knobs,
     /// Optional shared paged KV row pool across all slots.
     pub kv_cache_tokens: Option<usize>,
+    /// Repeatable `--kv-store` tier specs, or `off`/`none`.
+    pub kv_stores: Vec<String>,
+    /// Default retention policy for tiers omitting `keep=`.
+    pub kv_keep: Option<tessera_engine::kv::Keep>,
+    /// Conversations before `keep=system` stores a prefix.
+    pub kv_system_after: Option<u32>,
     pub name: Option<String>,
     /// The `--task` value, one the registry lists.
     pub(crate) task: &'static str,
@@ -96,6 +102,9 @@ impl Default for Options {
             dtypes: Vec::new(),
             shapes: Default::default(),
             kv_cache_tokens: None,
+            kv_stores: Vec::new(),
+            kv_keep: None,
+            kv_system_after: None,
             name: None,
             task: "generate",
             given: BTreeMap::new(),
@@ -176,6 +185,19 @@ impl Options {
                     return None;
                 }
                 self.kv_cache_tokens = Some(n);
+            }
+            "--kv-store" => {
+                let mut trial = self.kv_stores.clone();
+                trial.push(value.clone());
+                tessera_engine::kv::KvConfig::parse_all(&trial, self.kv_keep).ok()?;
+                self.kv_stores.push(value);
+            }
+            "--kv-keep" => {
+                self.kv_keep = Some(tessera_engine::kv::Keep::parse(&value).ok()?);
+            }
+            "--kv-system-after" => {
+                let n: u32 = value.parse().ok().filter(|&n| n > 0)?;
+                self.kv_system_after = Some(n);
             }
             "--max-connections" => self.max_connections = value.parse().ok()?,
             "--api-key" => {

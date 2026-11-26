@@ -3,16 +3,16 @@
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::Links;
 use crate::start::Options;
-use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use tessera_bundle::Weights;
+use tessera_bundle::tokenize::hf::Hf;
+use tessera_engine::kv::KvConfig;
 use tessera_engine::progress::{Progress, Unit};
 use tessera_engine::turns::{Asker, Seated, Turn};
-use tessera_engine::{Batch, Engine, Fair, Graph, Parked, Pins, PleConfig, PleStore};
+use tessera_engine::{Batch, Engine, Error, Fair, Graph, Parked, Pins, PleConfig, PleStore};
 use tessera_engine::{Recipe, Settings, Steps};
 use tessera_tasks::api::Score;
-use tessera_bundle::tokenize::hf::Hf;
 use tessera_tasks::{Generate, Guides, Job, Queued, Steer};
 
 pub static ENTRY: Entry = Entry {
@@ -22,15 +22,74 @@ pub static ENTRY: Entry = Entry {
         Flag::switch("--guided"),
         Flag::switch("--reuse-prefix"),
         Flag::text("--manifest", "<name>"),
-        Flag::text("--kv-cache-dir", "<dir>"),
-        Flag {
-            name: "--kv-cache-disk-gb",
-            value: "<gb>",
-            check: |v| v.parse::<u64>().is_ok_and(|n| n > 0),
-        },
     ],
     open,
 };
+
+/// Whether KV store settings require the paged KV layout.
+pub(super) fn wants_paged(o: &Options, settings: &Settings) -> bool {
+    if !o.kv_stores.is_empty() {
+        return KvConfig::parse_all(&o.kv_stores, o.kv_keep)
+            .is_ok_and(|c| !c.disabled && !c.tiers.is_empty());
+    }
+    settings.gpu().is_some() && !tessera_engine::sizer::platform(settings).integrated
+}
+
+/// Resolves explicit `--kv-store` flags or default discrete-GPU RAM tier.
+pub(super) fn resolve_kv(
+    o: &Options,
+    settings: &Settings,
+    eng: &Engine,
+) -> Result<Option<KvConfig>, String> {
+    if !o.kv_stores.is_empty() {
+        let mut cfg = KvConfig::parse_all(&o.kv_stores, o.kv_keep)?;
+        if let Some(n) = o.kv_system_after {
+            cfg.system_after = n;
+        }
+        return Ok((!cfg.disabled && !cfg.tiers.is_empty()).then_some(cfg));
+    }
+    if settings.gpu().is_none() || eng.integrated() {
+        return Ok(None);
+    }
+    let [total, avail] = tessera_engine::sizer::host();
+    let floor = (8u64 << 30).min(total / 4);
+    let ranks = eng.rank_count().max(1) as u64;
+    let bytes = (avail.saturating_sub(floor) / (2 * ranks)).min(64u64 << 30);
+    if bytes < (256u64 << 20) {
+        return Ok(None);
+    }
+    let mut cfg = KvConfig::default_ram(bytes);
+    if let Some(keep) = o.kv_keep {
+        cfg.keep = keep;
+        cfg.tiers[0].keep = Some(keep);
+    }
+    if let Some(n) = o.kv_system_after {
+        cfg.system_after = n;
+    }
+    Ok(Some(cfg))
+}
+
+/// Attaches the resolved KV store to `eng`. Returns whether active.
+pub(super) fn attach_kv(
+    o: &Options,
+    settings: &Settings,
+    eng: &mut Engine,
+) -> Result<bool, String> {
+    let explicit = !o.kv_stores.is_empty();
+    let Some(cfg) = resolve_kv(o, settings, eng)? else {
+        return Ok(false);
+    };
+    match eng.set_kv_store(&cfg) {
+        Ok(()) => {
+            if !o.ranks.follows() {
+                eprintln!("kv store: {}", cfg.describe());
+            }
+            Ok(true)
+        }
+        Err(Error::Stateful) if !explicit => Ok(false),
+        Err(e) => Err(format!("kv store: {e}")),
+    }
+}
 
 /// Applies any `--kv-dtype` override to `pins`.
 pub(super) fn kv_pin(options: &Options, pins: Pins) -> Pins {
@@ -305,8 +364,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     reading.finish();
     let scores = loaded.graph.entries.len() > 1;
     let mut recipe = lowering(o, loaded.pins);
-    let kv_dir = load.given("--kv-cache-dir");
-    if kv_dir.is_some() && recipe.kept.page().is_none() {
+    if wants_paged(o, &settings) && recipe.kept.page().is_none() {
         recipe.kept = Engine::paged_layout();
     }
     if recipe.config.is_none() {
@@ -317,24 +375,13 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         graph: loaded.graph,
         weights: loaded.weights,
         recipe,
-        settings,
+        settings: settings.clone(),
         ple: loaded.ple,
     };
     let seat = load.seat();
     let mut engine = source.enter(&seat, links, &o.progress)?;
     check_lowering(o, &mut engine, (o.slots > 1).then(|| o.slots.min(4)))?;
-    let attach_kv = |eng: &mut Engine| -> Result<(), String> {
-        let Some(dir) = kv_dir else {
-            return Ok(());
-        };
-        let gb = load
-            .given("--kv-cache-disk-gb")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(64);
-        eng.set_kv_store(Path::new(dir), gb.saturating_mul(1 << 30))
-            .map_err(|e| format!("kv store: {e}"))
-    };
-    attach_kv(&mut engine)?;
+    let kv_on = attach_kv(o, &settings, &mut engine)?;
     if o.ranks.follows() {
         return engine.follow().map_err(|e| e.to_string());
     }
@@ -353,13 +400,13 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         if let Some(rows) = o.max_batch_rows {
             batch.budget(rows);
         }
-        if load.on("--reuse-prefix") || kv_dir.is_some() {
+        if load.on("--reuse-prefix") || kv_on {
             batch.reuse();
         }
         parked = serve(batch, &jobs, &seat)?;
         drop(engine);
         seat.left();
         engine = source.enter(&seat, None, &Progress::default())?;
-        attach_kv(&mut engine)?;
+        let _ = attach_kv(o, &settings, &mut engine)?;
     }
 }

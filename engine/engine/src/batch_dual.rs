@@ -354,7 +354,8 @@ impl<'a> BatchDFlash<'a> {
     }
 
     fn exec_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
-        for mut item in admitted {
+        let mut skips = Vec::with_capacity(admitted.len());
+        for item in &admitted {
             let limit = self.admit_limit(item.request.tokens.len());
             let skip = if follower {
                 if let Some(kept) = &mut self.core.kept {
@@ -369,6 +370,12 @@ impl<'a> BatchDFlash<'a> {
             } else {
                 self.admitted_skips.pop_front().unwrap_or(0)
             };
+            skips.push((limit, skip));
+        }
+        for (mut item, (limit, skip)) in admitted.into_iter().zip(skips) {
+            let skip = self
+                .core
+                .restore_store(item.slot, &item.request.tokens[..limit], skip)?;
             notify_kept(&mut item.sink, skip);
             let d_base = skip + self.initial_d_base(item.request.tokens.len() - skip);
             self.prefilling.push_back(DFlashPrefill {

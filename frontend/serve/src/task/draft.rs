@@ -1,6 +1,6 @@
 //! Generation with a DFlash drafter, when `--draft` is given.
 
-use super::generate::{check_lowering, guides, lowering, queue, user_rules};
+use super::generate::{attach_kv, check_lowering, guides, lowering, queue, user_rules, wants_paged};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::{Grids, Links};
 use crate::start::Options;
@@ -60,6 +60,9 @@ pub(super) fn open_target(
     settings: &Settings,
 ) -> Result<(Engine, Bundle), String> {
     let mut recipe = lowering(o, target.pins.clone());
+    if wants_paged(o, settings) && recipe.kept.page().is_none() {
+        recipe.kept = Engine::paged_layout();
+    }
     if recipe.config.is_none() {
         recipe.config = target.config.clone();
     }
@@ -269,6 +272,7 @@ fn serve_batch(
     drafter: &mut Drafter,
     generate: Generate,
     sl: SpecLen,
+    kv_on: bool,
 ) -> Result<(), String> {
     let mut batch = BatchDFlash::new(engine, drafter)
         .map_err(|e| e.to_string())?
@@ -276,7 +280,7 @@ fn serve_batch(
     if let Some(rows) = load.options.max_batch_rows {
         batch = batch.with_prefill_chunk(rows);
     }
-    if load.on("--reuse-prefix") {
+    if load.on("--reuse-prefix") || kv_on {
         batch.reuse();
     }
     drive_batch(load, &mut batch, generate)?;
@@ -310,10 +314,11 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         o.slots,
     );
     check_lowering(o, &mut engine, Some((o.slots * pair.block).min(16)))?;
+    let kv_on = attach_kv(o, &settings, &mut engine)?;
     let generate = front(load, b.mode, &engine, target)?;
     let sl = spec_len(load, pair.block - 1, CostModel::dflash(), false);
     if o.slots > 1 {
-        return serve_batch(load, &mut engine, &mut drafter, generate, sl);
+        return serve_batch(load, &mut engine, &mut drafter, generate, sl, kv_on);
     }
     let mut spec = Speculate::new(&mut engine, &mut drafter).map_err(|e| e.to_string())?;
     if let Some(rows) = o.max_batch_rows {

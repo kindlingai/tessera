@@ -8,7 +8,6 @@ use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends, launch_of
 use std::collections::VecDeque;
 use tessera_graph::DimName::{Context, Segments};
 use tessera_graph::Role;
-use tessera_kv::{DiskKv, DiskMsg};
 use tessera_lower::{Report, Wants};
 
 crate::metric_registry!(REQUESTS = "requests");
@@ -398,28 +397,10 @@ impl<'a> Batch<'a> {
         Some((slot, skip, limit))
     }
 
-    /// Restores extra prefix pages from the disk store past `skip`.
+    /// Restores extra prefix pages from the KV store past `skip`.
     fn restore_disk(&mut self, slot: u32, tokens: &[u32], skip: usize) -> Result<usize, Error> {
-        let Some(d) = self.engine.disk.as_ref() else {
-            return Ok(skip);
-        };
-        let (page, (vram, keys)) = (d.page, d.missing_keys(tokens, skip));
-        let hit = self.engine.disk_exec(DiskMsg::Prefix(keys.clone()), true)?;
-        let Some(kept) = self.kept.as_mut().filter(|_| hit > 0) else {
-            return Ok(skip);
-        };
-        if kept.grow(slot, (vram + hit) * page).is_err() {
-            return Ok(skip);
-        }
-        let Some(pages) = kept.pages(slot).map(<[u32]>::to_vec) else {
-            return Ok(skip);
-        };
-        let pairs = DiskKv::load_pairs_slice(&pages, keys, vram, hit);
-        let loaded = self.engine.disk_exec(DiskMsg::Load(pairs), true)?;
-        if let Some(lanes) = &mut self.engine.lanes {
-            lanes.set(slot, &pages);
-        }
-        Ok((vram + loaded) * page)
+        self.engine
+            .restore_kv(self.kept.as_mut(), slot, tokens, skip, true)
     }
 
     /// Resumes paused answers, then admits waiting ones.
@@ -563,6 +544,8 @@ impl<'a> Batch<'a> {
         let mut all = std::mem::take(&mut seq.history);
         let kept_tokens = all.clone();
         all.extend(seq.pending.drain(..));
+        self.engine
+            .spill_kv(self.kept.as_ref(), seq.slot, &kept_tokens, true);
         match &mut self.kept {
             Some(kept) => kept.finish(seq.slot, kept_tokens),
             None => self.free.push(seq.slot),
@@ -574,13 +557,8 @@ impl<'a> Batch<'a> {
 
     /// Frees an answer's slot, or keeps its rows.
     fn retire(&mut self, seq: Seq) {
-        if let (Some(d), Some(kept)) = (&self.engine.disk, &self.kept)
-            && let Some(pages) = kept.pages(seq.slot)
-        {
-            let _ = self
-                .engine
-                .disk_exec(DiskMsg::Save(d.spill_pairs(pages, &seq.history)), true);
-        }
+        self.engine
+            .spill_kv(self.kept.as_ref(), seq.slot, &seq.history, true);
         match &mut self.kept {
             Some(kept) => kept.finish(seq.slot, seq.history),
             None => self.free.push(seq.slot),

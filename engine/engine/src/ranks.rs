@@ -1,10 +1,9 @@
 //! An engine as one rank of several.
 
 use crate::{Engine, Error, Head, Row};
-use std::path::Path;
 use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::{DType, Graph, Parts, Whole, shard_mode};
-use tessera_kv::{DiskKv, DiskMsg, StoreStats, decode_msg};
+use tessera_kv::{DiskKv, DiskMsg, KvConfig, StoreStats, decode_msg};
 use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, Wires, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum, sum_wire};
 
@@ -323,15 +322,29 @@ impl Engine {
         tessera_lower::kept::named("paged").expect("paged layout")
     }
 
-    /// Attaches an on-disk page cache under `dir` bounded to `max_bytes`.
-    pub fn set_kv_store(&mut self, dir: &Path, max_bytes: u64) -> Result<(), Error> {
+    /// Whether this engine runs on unified host/device memory.
+    pub fn integrated(&self) -> bool {
+        self.runner.platform().integrated
+    }
+
+    /// Number of ranks participating in this engine.
+    pub fn rank_count(&self) -> usize {
+        self.runner.plan().ranks as usize
+    }
+
+    /// Attaches a tiered KV store from `cfg`.
+    pub fn set_kv_store(&mut self, cfg: &KvConfig) -> Result<(), Error> {
+        if cfg.disabled || cfg.tiers.is_empty() {
+            self.disk = None;
+            return Ok(());
+        }
         if self.stateful {
             return Err(Error::Stateful);
         }
         let page = self.lanes.as_ref().map(|l| l.page).ok_or(Error::RowPlace)?;
         let (r, n) = (self.runner.plan().rank, self.runner.plan().ranks);
         let meta = self.runner.kept_page_meta(page).ok_or(Error::RowPlace)?;
-        let d = DiskKv::open(dir, max_bytes, r, n, page, &meta).ok_or(Error::RowPlace)?;
+        let d = DiskKv::open_config(cfg, r, n, page, &meta).ok_or(Error::RowPlace)?;
         self.disk = Some(d.map_err(Error::Store)?);
         Ok(())
     }
@@ -366,6 +379,57 @@ impl Engine {
             .map_err(tessera_run::Error::from)?;
         let f = |p: Vec<u8>| p.try_into().ok().map(u32::from_le_bytes);
         Ok(parts.into_iter().filter_map(f).fold(mine, u32::min) as usize)
+    }
+
+    /// Restores extra prefix pages from the KV store past `skip`.
+    pub(crate) fn restore_kv(
+        &mut self,
+        kept: Option<&mut crate::kept::Kept>,
+        slot: u32,
+        tokens: &[u32],
+        skip: usize,
+        lead: bool,
+    ) -> Result<usize, Error> {
+        let Some(d) = self.disk.as_ref() else {
+            return Ok(skip);
+        };
+        let (page, (vram, keys)) = (d.page, d.missing_keys(tokens, skip));
+        let hit = self.disk_exec(DiskMsg::Prefix(keys.clone()), lead)?;
+        let Some(kept) = kept.filter(|_| hit > 0) else {
+            return Ok(skip);
+        };
+        if kept.grow(slot, (vram + hit) * page).is_err() {
+            return Ok(skip);
+        }
+        let Some(pages) = kept.pages(slot).map(<[u32]>::to_vec) else {
+            return Ok(skip);
+        };
+        let pairs = DiskKv::load_pairs_slice(&pages, keys, vram, hit);
+        let loaded = self.disk_exec(DiskMsg::Load(pairs), lead)?;
+        if let Some(lanes) = &mut self.lanes {
+            lanes.set(slot, &pages);
+        }
+        Ok((vram + loaded) * page)
+    }
+
+    /// Spills full pages of `slot` to the KV store.
+    pub(crate) fn spill_kv(
+        &mut self,
+        kept: Option<&crate::kept::Kept>,
+        slot: u32,
+        history: &[u32],
+        lead: bool,
+    ) {
+        if history.is_empty() {
+            return;
+        }
+        let (Some(d), Some(kept)) = (&self.disk, kept) else {
+            return;
+        };
+        if let Some(pages) = kept.pages(slot) {
+            let pairs = d.spill_pairs(pages, history);
+            let _ = self.disk_exec(DiskMsg::Save(pairs), lead);
+        }
     }
 }
 

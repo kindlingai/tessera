@@ -1,8 +1,9 @@
-//! Integration test for `--kv-cache-dir` and persistent SSD KV caching.
+//! Integration test for `--kv-store` host-RAM and SSD KV caching.
 
 use std::time::Duration;
 use tessera_engine::comm::{Sockets, Transport};
 use tessera_engine::decoder::{Swiglu, stepper};
+use tessera_engine::kv::{Keep, KvConfig, StoreKind, TierSpec};
 use tessera_engine::{
     Batch, Engine, Event, Fair, Norm, Pick, Place, Recipe, Request, Settings, Weight,
 };
@@ -35,15 +36,21 @@ fn open_disk_eng(links: Option<[Sockets; 2]>, recipe: &Recipe) -> Engine {
 #[test]
 fn disk_kv_restores() {
     let mut opts = Options::default();
-    assert!(opts.flag("--kv-cache-dir", "/tmp/kv".into()).is_some());
-    assert!(opts.flag("--kv-cache-disk-gb", "8".into()).is_some());
-    assert!(opts.flag("--kv-cache-disk-gb", "0".into()).is_none());
+    assert!(opts.flag("--kv-store", "ram:,size=4G".into()).is_some());
+    assert!(
+        opts.flag("--kv-store", "ssd:/tmp/kv,size=8G,persist=on".into())
+            .is_some()
+    );
+    assert!(opts.flag("--kv-keep", "sessions".into()).is_some());
+    assert!(opts.flag("--kv-system-after", "2".into()).is_some());
+    assert!(opts.flag("--kv-store", "ssd:/tmp/kv".into()).is_none());
+    assert!(opts.flag("--kv-keep", "bogus".into()).is_none());
+    assert!(opts.flag("--kv-cache-dir", "/tmp/kv".into()).is_none());
 
     let pid = std::process::id();
-    let (d, d0, d1) = (
+    let (d, d_tp) = (
         tessera_testkit::scratch(&format!("{pid}-dk")),
-        tessera_testkit::scratch(&format!("{pid}-dk0")),
-        tessera_testkit::scratch(&format!("{pid}-dk1")),
+        tessera_testkit::scratch(&format!("{pid}-dktp")),
     );
     let recipe = Recipe {
         kept: Engine::paged_layout(),
@@ -81,19 +88,48 @@ fn disk_kv_restores() {
         while batch.step().unwrap() {}
         rx.try_iter().collect()
     };
+    let ssd_cfg = |dir: &std::path::Path| KvConfig {
+        tiers: vec![TierSpec {
+            name: "ssd".into(),
+            store: StoreKind::Ssd {
+                path: dir.to_path_buf(),
+                bytes: 1 << 20,
+                persist: true,
+            },
+            keep: Some(Keep::All),
+            spare_ram: None,
+        }],
+        ..KvConfig::default()
+    };
     {
         let mut eng = open_disk_eng(None, &recipe);
-        eng.set_kv_store(&d, 1 << 20).unwrap();
+        eng.set_kv_store(&ssd_cfg(&d)).unwrap();
         let _ = run_one(&mut eng, p1.clone());
         assert_eq!(eng.kv_store_stats().unwrap().saves, 1);
     }
     let mut eng = open_disk_eng(None, &recipe);
-    eng.set_kv_store(&d, 1 << 20).unwrap();
+    eng.set_kv_store(&ssd_cfg(&d)).unwrap();
     let evs = run_one(&mut eng, p2.clone());
     assert_eq!(evs.first(), Some(&Event::Kept(64)));
     assert_eq!(ids(&evs), ids(&want));
     let st = eng.kv_store_stats().unwrap();
     assert_eq!((st.hits, st.saves), (1, 0));
+
+    // Host-RAM tier restores after VRAM eviction without touching disk.
+    let mut ram_recipe = recipe.clone();
+    ram_recipe.share_kept(128);
+    let mut ram_eng = open_disk_eng(None, &ram_recipe);
+    ram_eng
+        .set_kv_store(&KvConfig::default_ram(1 << 20))
+        .unwrap();
+    let _ = run_one(&mut ram_eng, p1.clone());
+    assert_eq!(ram_eng.kv_store_stats().unwrap().saves, 1);
+    let filler: Vec<u32> = (0..70).map(|i| (i * 7 + 3) % 32).collect();
+    let _ = run_one(&mut ram_eng, filler);
+    let ram_evs = run_one(&mut ram_eng, p2.clone());
+    assert_eq!(ram_evs.first(), Some(&Event::Kept(64)));
+    assert_eq!(ids(&ram_evs), ids(&want));
+    assert_eq!(ram_eng.kv_store_stats().unwrap().hits, 1);
 
     let make_links = || -> [Sockets; 2] {
         let (a, b) = tcp_pair().unwrap();
@@ -107,14 +143,14 @@ fn disk_kv_restores() {
     };
     let run_tp = |tokens: Vec<u32>| -> Vec<Event> {
         let ([sums, others], [control, told]) = (make_links(), make_links());
-        let (r1, fd) = (recipe.clone(), d1.clone());
+        let (r1, fd) = (recipe.clone(), d_tp.clone());
         let f = std::thread::spawn(move || {
             let mut e = open_disk_eng(Some([others, told]), &r1);
-            e.set_kv_store(&fd, 1 << 20).unwrap();
+            e.set_kv_store(&ssd_cfg(&fd)).unwrap();
             e.follow().unwrap();
         });
         let mut lead = open_disk_eng(Some([sums, control]), &recipe);
-        lead.set_kv_store(&d0, 1 << 20).unwrap();
+        lead.set_kv_store(&ssd_cfg(&d_tp)).unwrap();
         let evs = run_one(&mut lead, tokens);
         lead.dismiss().unwrap();
         f.join().unwrap();
@@ -124,7 +160,7 @@ fn disk_kv_restores() {
     let evs = run_tp(p2);
     assert_eq!(evs.first(), Some(&Event::Kept(64)));
     assert_eq!(ids(&evs), ids(&want));
-    for dir in [d, d0, d1] {
+    for dir in [d, d_tp] {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
