@@ -173,6 +173,34 @@ impl<H: Host> Client<'_, H> {
         self.fetch(method, url, auth, body, &[]).await
     }
 
+    /// An artifact archive. Its storage never sees the token.
+    pub(crate) async fn download(&self, path: &str, install: &Install) -> Result<Vec<u8>, Fault> {
+        let url = format!("{}{path}", self.config.api);
+        let auth = format!("Bearer {}", install.token);
+        let call = |url, auth: Option<String>| {
+            let mut headers = vec![("user-agent", AGENT.to_string())];
+            headers.extend(auth.map(|a| ("authorization", a)));
+            let body = None;
+            Call {
+                method: "GET",
+                url,
+                headers,
+                body,
+            }
+        };
+        let moved = self.host.fetch(call(url, Some(auth))).await?;
+        let Some(to) = moved.location.filter(|_| moved.status == 302) else {
+            let text = format!("GitHub answered {} for {path}", moved.status);
+            return Err(Fault::new(502, text));
+        };
+        let reply = self.host.fetch(call(to, None)).await?;
+        if reply.status != 200 {
+            let text = format!("Artifact storage answered {}", reply.status);
+            return Err(Fault::new(502, text));
+        }
+        Ok(reply.body)
+    }
+
     /// A call as the app. Statuses in `passes` give `Null`.
     pub(crate) async fn app(
         &self,
@@ -224,7 +252,7 @@ impl<H: Host> Client<'_, H> {
         if reply.body.is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&reply.body)
+        serde_json::from_slice(&reply.body)
             .map_err(|e| Fault::new(502, format!("GitHub sent bad JSON for {what}: {e}")))
     }
 

@@ -39,6 +39,66 @@ const CACHES: &str = r#"{"actions_caches":[
 {"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-01"},
 {"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-03"}]}"#;
 
+/// A lint report in the shape of `stickler lint --json`.
+const LINT: &str = r#"{"tool":"lint","findings":[],"measures":[
+{"rule":"file-lines","path":"a/src/<x>.rs","value":950,"max":1000},
+{"rule":"crate-lines","path":"a/Cargo.toml","value":12000,"max":15000},
+{"rule":"crate-files","path":"b/Cargo.toml","value":3,"max":25}]}"#;
+const RUNS: &str = r#"{"workflow_runs":[{"id":1,"head_sha":"aaaaaaaaaaaa"},
+{"id":2,"head_sha":"bbbbbbbbbbbb"}]}"#;
+
+/// An artifact zip: one deflated entry, with a descriptor.
+fn zip(name: &str, data: &[u8]) -> Vec<u8> {
+    let packed = miniz_oxide::deflate::compress_to_vec(data, 6);
+    let n = name.len() as u32;
+    let mut out = Vec::new();
+    let mut put = |fields: &[(u32, usize)], tail: &[u8]| {
+        for &(v, width) in fields {
+            let bytes = v.to_le_bytes();
+            out.extend((0..width).map(|i| bytes.get(i).copied().unwrap_or(0)));
+        }
+        out.extend_from_slice(tail);
+    };
+    let local = [
+        (0x0403_4b50, 4),
+        (20, 2),
+        (8, 2),
+        (8, 2),
+        (0, 16),
+        (n, 2),
+        (0, 2),
+    ];
+    put(&local, name.as_bytes());
+    put(&[], &packed);
+    let central = (30 + n as usize + packed.len()) as u32;
+    let size = packed.len() as u32;
+    let head = [
+        (0x0201_4b50, 4),
+        (20, 2),
+        (20, 2),
+        (8, 2),
+        (8, 2),
+        (0, 8),
+        (size, 4),
+    ];
+    put(&head, &[]);
+    put(
+        &[(data.len() as u32, 4), (n, 2), (0, 12), (0, 4)],
+        name.as_bytes(),
+    );
+    let count = [
+        (0x0605_4b50, 4),
+        (0, 4),
+        (1, 2),
+        (1, 2),
+        (46 + n, 4),
+        (central, 4),
+        (0, 2),
+    ];
+    put(&count, &[]);
+    out
+}
+
 /// Records each call as `METHOD path authorization body`.
 #[derive(Default)]
 struct Fake {
@@ -50,6 +110,8 @@ impl Host for Fake {
         let auth = call.headers.iter().find(|(key, _)| *key == "authorization");
         let auth = auth.map(|(_, value)| value.as_str()).unwrap_or_default();
         let path = call.url.split_once(".test").unwrap().1;
+        let zip =
+            (call.url == "https://store.test/blob").then(|| zip("lint.json", LINT.as_bytes()));
         let body = match (call.method, path) {
             ("GET", "/repos/o/r/installation") => r#"{"id":7,"app_slug":"tiers"}"#,
             ("POST", "/app/installations/7/access_tokens") => r#"{"token":"app"}"#,
@@ -59,20 +121,27 @@ impl Host for Fake {
             ("GET", "/user") => r#"{"login":"Matt","id":7}"#,
             ("GET", "/repos/o/r/actions/cache/usage") => USAGE,
             ("GET", "/repos/o/r/actions/caches?per_page=100&page=1") => CACHES,
+            ("GET", path) if path.contains("/runs?branch=main&event=push") => RUNS,
+            ("GET", "/repos/o/r/actions/runs/2/artifacts?name=checks-lint") => {
+                r#"{"artifacts":[{"id":5}]}"#
+            }
             _ => "[]",
         };
         let sent = call.body.unwrap_or_default();
         let line = format!("{} {path} {auth} {sent}", call.method);
         self.calls.borrow_mut().push(line);
         // The landing label is gone when the delete arrives.
+        let moved = path.ends_with("/artifacts/5/zip");
         let status = match (call.method, path.ends_with("/storage-limit")) {
+            _ if moved => 302,
             ("DELETE", _) => 404,
             (_, true) => 402,
             _ => 200,
         };
         Ok(Reply {
             status,
-            body: body.into(),
+            location: moved.then(|| "https://store.test/blob".into()),
+            body: zip.unwrap_or_else(|| body.into()),
         })
     }
 
@@ -146,13 +215,8 @@ fn editor_moves_tier() {
     let page = ask(&fake, "GET", "/", "Matt", "").body;
     assert!(page.contains(r#"<button name="tier" value="priority">to priority</button>"#));
     fake.calls.borrow_mut().clear();
-    let done = ask(
-        &fake,
-        "POST",
-        "/tier",
-        "Matt",
-        "pr=5&tier=priority&csrf=token",
-    );
+    let form = "pr=5&tier=priority&csrf=token";
+    let done = ask(&fake, "POST", "/tier", "Matt", form);
     assert_eq!(done.status, 303);
     let calls = fake.calls.borrow();
     let labels = "/repos/o/r/issues/5/labels";
@@ -193,10 +257,8 @@ fn board_escapes_text() {
 #[test]
 fn sign_in_sets_session() {
     let fake = Fake::default();
-    assert_eq!(
-        ask(&fake, "GET", "/callback?code=c&state=no", "", "").status,
-        403
-    );
+    let refused = ask(&fake, "GET", "/callback?code=c&state=no", "", "");
+    assert_eq!(refused.status, 403);
     let done = ask(&fake, "GET", "/callback?code=c&state=st", "", "");
     let cookie = &done.headers.last().unwrap().1;
     assert!(cookie.ends_with("; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"));
@@ -207,10 +269,14 @@ fn sign_in_sets_session() {
 }
 
 #[test]
-fn cache_tab_sums_refs() {
-    let page = ask(&Fake::default(), "GET", "/cache", "Matt", "").body;
-    let usage = r#"<p class="bad">10.00 GiB of 10 GiB, GitHub default (100%), 3 caches."#;
-    assert!(page.contains(usage));
+fn tabs_show_usage() {
+    let fake = Fake::default();
+    let cache = ask(&fake, "GET", "/cache", "Matt", "").body;
     let main = "<td>refs/heads/main</td><td>2</td><td>2.00 GiB</td><td>2026-11-03</td>";
-    assert!(page.find(main).unwrap() < page.find("refs/pull/7/merge").unwrap());
+    assert!(cache.contains("10.00 GiB of 10 GiB, GitHub default (100%)") && cache.contains(main));
+    let limits = ask(&fake, "GET", "/limits", "Matt", "").body;
+    let file = r#"<td>a/src/&lt;x&gt;.rs</td><td>950 of 1000</td><td><span class="bad">95%"#;
+    assert!(limits.contains(">bbbbbbbb</a>. 2 of 3 measures") && limits.contains(file));
+    let last = fake.calls.borrow().last().cloned().unwrap();
+    assert!(last.starts_with("GET /blob  "));
 }

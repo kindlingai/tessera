@@ -9,7 +9,7 @@ use tessera_html::{El, Part, el, text};
 /// The percent of a limit the page marks as near.
 pub(crate) const NEAR: u64 = 90;
 /// Each tab's path and name.
-const TABS: [(&str, &str); 2] = [("/", "Tiers"), ("/cache", "Cache")];
+const TABS: [(&str, &str); 3] = [("/", "Tiers"), ("/cache", "Cache"), ("/limits", "Limits")];
 
 const STYLE: &str = "body{font:14px system-ui;margin:1rem}\
 main{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}\

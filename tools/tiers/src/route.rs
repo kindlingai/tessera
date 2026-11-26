@@ -1,11 +1,11 @@
 //! Maps requests to pages and tier changes.
 
 use crate::board::Tier;
-use crate::cache;
 use crate::github::Client;
 use crate::page::{self, View};
 use crate::session::{self, Session};
 use crate::{Config, Fault, Host};
+use crate::{cache, limits};
 
 const STATE: &str = "__Host-state";
 /// Seconds to finish a sign-in.
@@ -93,35 +93,31 @@ impl<H: Host> Site<'_, H> {
         Err(Fault::new(403, text))
     }
 
-    /// The cache tab, for an editor alone.
-    async fn cache(&self) -> Result<Response, Fault> {
+    /// A tab. GitHub is called for editors alone.
+    async fn tab(&self, path: &str) -> Result<Response, Fault> {
         let Some(session) = &self.session else {
-            return Ok(Response::redirect("/".into()));
+            return Ok(match path {
+                "/" => Response::new(200, "text/html", page::welcome(self.config)),
+                _ => Response::redirect("/".into()),
+            });
         };
         let session = self.editor(session)?;
+        let config = self.config;
         let client = self.client();
         let install = client.install().await?;
-        let cache = cache::read(&client, &install).await?;
-        let page = cache::render(self.config, session, &cache);
+        let page = match path {
+            "/cache" => cache::render(config, session, &cache::read(&client, &install).await?),
+            "/limits" => limits::render(config, session, &limits::read(&client, &install).await?),
+            _ => {
+                let pulls = client.pulls(&install).await?;
+                page::board(&View {
+                    config,
+                    session,
+                    pulls: &pulls,
+                })
+            }
+        };
         Ok(Response::new(200, "text/html", page))
-    }
-
-    /// Calls GitHub for an editor. Other visitors cost nothing.
-    async fn home(&self) -> Result<Response, Fault> {
-        let Some(session) = &self.session else {
-            let page = page::welcome(self.config);
-            return Ok(Response::new(200, "text/html", page));
-        };
-        let session = self.editor(session)?;
-        let client = self.client();
-        let install = client.install().await?;
-        let pulls = client.pulls(&install).await?;
-        let view = View {
-            config: self.config,
-            session,
-            pulls: &pulls,
-        };
-        Ok(Response::new(200, "text/html", page::board(&view)))
     }
 
     fn login(&self) -> Response {
@@ -204,8 +200,7 @@ pub async fn serve<H: Host>(host: &H, config: &Config, req: &Request) -> Respons
         session,
     };
     let done = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => site.home().await,
-        ("GET", "/cache") => site.cache().await,
+        ("GET", path @ ("/" | "/cache" | "/limits")) => site.tab(path).await,
         ("GET", "/login") => Ok(site.login()),
         ("GET", "/callback") => site.callback().await,
         ("POST", "/tier") => site.retier().await,

@@ -2826,6 +2826,7 @@ dependencies = [
  "form_urlencoded",
  "getrandom 0.4.3",
  "hmac",
+ "miniz_oxide",
  "rsa",
  "serde",
  "serde_json",

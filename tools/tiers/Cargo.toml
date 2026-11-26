@@ -14,6 +14,7 @@ tessera-html = { workspace = true }
 base64 = "0.22"
 form_urlencoded = "1"
 hmac = "0.13"
+miniz_oxide = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

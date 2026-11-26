@@ -5,10 +5,12 @@ mod cache;
 #[cfg(target_arch = "wasm32")]
 mod edge;
 mod github;
+mod limits;
 mod overlap;
 mod page;
 mod route;
 mod session;
+mod unzip;
 
 #[cfg(test)]
 mod route_test;
@@ -39,7 +41,9 @@ pub struct Call {
 
 pub struct Reply {
     pub status: u16,
-    pub body: String,
+    /// The `Location` header of a redirect.
+    pub location: Option<String>,
+    pub body: Vec<u8>,
 }
 
 /// A failure, with the HTTP status to answer.

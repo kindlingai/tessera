@@ -7,7 +7,7 @@ use rsa::pkcs1v15::SigningKey;
 use rsa::signature::{SignatureEncoding, Signer};
 use sha2::Sha256;
 use std::sync::OnceLock;
-use worker::{Context, Env, Fetch, Headers, Method, RequestInit, event};
+use worker::{Context, Env, Fetch, Headers, Method, RequestInit, RequestRedirect, event};
 
 fn fault(error: worker::Error) -> Fault {
     Fault::new(502, error.to_string())
@@ -34,11 +34,14 @@ impl Host for Edge {
         init.with_method(Method::from(call.method.to_string()));
         init.with_headers(headers);
         init.with_body(call.body.map(Into::into));
+        // The client follows redirects, so storage never sees a token.
+        init.with_redirect(RequestRedirect::Manual);
         let request = worker::Request::new_with_init(&call.url, &init).map_err(fault)?;
         let mut reply = Fetch::Request(request).send().await.map_err(fault)?;
         Ok(Reply {
             status: reply.status_code(),
-            body: reply.text().await.map_err(fault)?,
+            location: reply.headers().get("location").map_err(fault)?,
+            body: reply.bytes().await.map_err(fault)?,
         })
     }
 
