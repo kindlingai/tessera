@@ -1,7 +1,7 @@
 //! Tensor-Core MLA, GQA, and Lightning Indexer rules for CUDA.
 
 use crate::flatten_cuda;
-use crate::linear::{CUDA_LACKS, cuda_rule, f32_only};
+use crate::{CUDA_LACKS, cuda_rule, f32_only};
 use std::sync::OnceLock;
 use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;

@@ -412,8 +412,11 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
             tree.node(x).form.name()
         )));
     }
-    if m > crate::FAST_MAX_ROWS {
-        return Some(Err(format!("m={m} exceeds max {}", crate::FAST_MAX_ROWS)));
+    if m > tessera_device::FAST_MAX_ROWS {
+        return Some(Err(format!(
+            "m={m} exceeds max {}",
+            tessera_device::FAST_MAX_ROWS
+        )));
     }
     let form = tree.node(w).form;
     let (kind, ks) = match form.name() {

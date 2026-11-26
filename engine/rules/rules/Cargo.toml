@@ -10,5 +10,6 @@ description = "Links every lowering rule crate"
 tessera-attention = { workspace = true }
 tessera-cpu = { workspace = true }
 tessera-device = { workspace = true }
+tessera-device-linear = { workspace = true }
 tessera-kernels = { workspace = true }
 tessera-linear = { workspace = true }

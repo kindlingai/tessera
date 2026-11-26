@@ -1852,6 +1852,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-device-linear"
+version = "0.1.0"
+dependencies = [
+ "tessera-device",
+ "tessera-graph",
+ "tessera-lower",
+ "tessera-testkit",
+]
+
+[[package]]
 name = "tessera-dl"
 version = "0.1.0"
 
@@ -2272,6 +2282,7 @@ dependencies = [
  "tessera-attention",
  "tessera-cpu",
  "tessera-device",
+ "tessera-device-linear",
  "tessera-kernels",
  "tessera-linear",
 ]

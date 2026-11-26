@@ -1,7 +1,7 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
 use crate::flatten_cuda;
-use crate::linear::{CUDA_LACKS, cuda_rule, parse_trellis};
+use crate::{CUDA_LACKS, cuda_rule, parse_trellis};
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;

@@ -1,7 +1,7 @@
 //! Grouped SYRK and deterministic expert sort kernels and CPU references.
 
 use crate::flatten_cuda;
-use crate::linear::{CUDA_LACKS, cuda_rule};
+use crate::{CUDA_LACKS, cuda_rule};
 use std::sync::OnceLock;
 use tessera_graph::Bf16;
 use tessera_graph::{Act, Op, Order, Select, Stage};

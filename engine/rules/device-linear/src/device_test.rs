@@ -1,5 +1,5 @@
-use crate::linear::mm::propose_mm;
-use crate::linear::{cuda_source, hip_source};
+use crate::mm::propose_mm;
+use crate::{cuda_source, hip_source, prefill_source};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
 use tessera_lower::form::named;
@@ -96,6 +96,15 @@ fn linear_mm_entries() {
         "dtr_gen4(",
     ] {
         assert!(cuda.contains(entry), "missing {entry}");
+    }
+    for entry in [
+        "dtr_prep(",
+        "dtr_pre_k4_t8(",
+        "dtr_pre_k4_t16(",
+        "dtr_pre_gen8(",
+        "dtr_pre_gen16(",
+    ] {
+        assert!(prefill_source().contains(entry), "missing {entry}");
     }
 }
 
