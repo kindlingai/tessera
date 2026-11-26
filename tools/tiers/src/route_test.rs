@@ -39,11 +39,12 @@ const CACHES: &str = r#"{"actions_caches":[
 {"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-01"},
 {"ref":"refs/heads/main","size_in_bytes":1073741824,"last_accessed_at":"2026-11-03"}]}"#;
 
-/// A lint report in the shape of `stickler lint --json`.
-const LINT: &str = r#"{"tool":"lint","findings":[],"measures":[
-{"rule":"file-lines","path":"a/src/<x>.rs","value":950,"max":1000},
-{"rule":"crate-lines","path":"a/Cargo.toml","value":12000,"max":15000},
-{"rule":"crate-files","path":"b/Cargo.toml","value":3,"max":25}]}"#;
+/// Entries from `stickler lint --json` run on tessera.
+const LINT: &str = r#"{"tool":"lint","title":"Code shape","rules":{},"findings":[],
+"skipped":null,"measures":[
+{"rule":"file-lines","path":"engine/models/src/dflash.rs","value":1000,"max":1000},
+{"rule":"crate-lines","path":"engine/engine/Cargo.toml","value":12723,"max":15000},
+{"rule":"crate-files","path":"engine/gpu/dl/Cargo.toml","value":1,"max":25}]}"#;
 const RUNS: &str = r#"{"workflow_runs":[{"id":1,"head_sha":"aaaaaaaaaaaa"},
 {"id":2,"head_sha":"bbbbbbbbbbbb"}]}"#;
 
@@ -275,7 +276,7 @@ fn tabs_show_usage() {
     let main = "<td>refs/heads/main</td><td>2</td><td>2.00 GiB</td><td>2026-11-03</td>";
     assert!(cache.contains("10.00 GiB of 10 GiB, GitHub default (100%)") && cache.contains(main));
     let limits = ask(&fake, "GET", "/limits", "Matt", "").body;
-    let file = r#"<td>a/src/&lt;x&gt;.rs</td><td>950 of 1000</td><td><span class="bad">95%"#;
+    let file = r#"dflash.rs</td><td>1000 of 1000</td><td><span class="bad">100%"#;
     assert!(limits.contains(">bbbbbbbb</a>. 2 of 3 measures") && limits.contains(file));
     let last = fake.calls.borrow().last().cloned().unwrap();
     assert!(last.starts_with("GET /blob  "));
