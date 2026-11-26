@@ -21,6 +21,8 @@ pub struct Ops {
     pub tile_flops: f64,
     /// Flops done on the matrix unit, in 1-pass bf16.
     pub bf16_flops: f64,
+    /// Flops done on the matrix unit, in block-scaled fp8.
+    pub fp8_flops: f64,
     /// Floats loaded from group memory into tiles.
     pub shared: f64,
     /// Registers each thread holds for tiles. Zero: unknown.

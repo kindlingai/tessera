@@ -1,9 +1,11 @@
 //! Streaming BF16 and MXFP8 Tensor-Core small-batch matmul rule.
 
-use super::{CUDA_LACKS, cuda_source_entry, f32_only, weight_accepts};
+use super::{CUDA_LACKS, cuda_source_entry, f32_only, prefill_source_entry, weight_accepts};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
+
+const MX8_SMEM: usize = 2 * (128 * 36 + 128 * 32 + 128) * 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MmKind {
@@ -144,14 +146,22 @@ fn mxfp8_ks(n: usize, k: usize, wide: bool) -> usize {
     pick_divisor(chunks, want, cap)
 }
 
-fn mxfp8_tall_ks(m: usize, n: usize, k: usize) -> usize {
+fn mxfp8_tile_ks(
+    m: usize,
+    n: usize,
+    k: usize,
+    tile: usize,
+    min_groups: usize,
+    mid_groups: usize,
+    target: usize,
+) -> usize {
     let chunks = k / 512;
-    let base = n.div_ceil(64) * m.div_ceil(64);
-    if chunks <= 1 || base >= 160 {
+    let base = n.div_ceil(tile) * m.div_ceil(tile);
+    if chunks <= 1 || base >= min_groups {
         return 1;
     }
-    let cap = if base >= 64 { 4 } else { 12 }.min(chunks);
-    let want = 192usize.div_ceil(base).clamp(1, cap);
+    let cap = if base >= mid_groups { 4 } else { 12 }.min(chunks);
+    let want = target.div_ceil(base).clamp(1, cap);
     pick_divisor(chunks, want, cap)
 }
 
@@ -217,7 +227,172 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
         ..Load::default()
     };
     load.trip.fresh = 1.0;
+    if matches!(k.kind, MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit) {
+        load.trip.bf16_flops = (2 * 64 * 64 * 512 / 256) as f64;
+        load.trip.loads = 40.25;
+        load.trip.width = 16.0;
+        load.trip.e4m3 = 256.0;
+    }
     Some(load)
+}
+
+fn mxfp8_pre_len(m: usize, k: usize) -> usize {
+    (m * k / 128) * 33
+}
+
+/// Quantizes activations once into packed E4M3 and UE8M0 scales.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "fast_mm_mxfp8_prep",
+    sizes = [self.m, self.k],
+    work = self.m * self.k,
+    accepts = mx8_prep_accepts,
+    emits = f32_only,
+    needs = mx8_prep_needs(),
+    order = Order::PerConfig,
+    source = prefill_source_entry("tessera_mm_mxfp8_prep"),
+    launches = mx8_prep_launches,
+    shape = Shape::grid(((self.k / 32).div_ceil(32), self.m), 256),
+    load = mx8_prep_load,
+    shared,
+    unproven,
+)]
+struct Mxfp8Prep {
+    m: usize,
+    k: usize,
+}
+
+fn mx8_prep_accepts(_: &Mxfp8Prep, _: usize, form: &dyn Stored) -> bool {
+    form.name() == "f32"
+}
+
+fn mx8_prep_needs() -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes: 0,
+        group_threads: 256,
+        compiler: true,
+        lacks: CUDA_LACKS,
+        mxfp8_tile: true,
+        ..Needs::default()
+    }
+}
+
+fn mx8_prep_load(p: &Mxfp8Prep, _: usize) -> Option<Load> {
+    let (across, down) = ((p.k / 32).div_ceil(32), p.m);
+    let mut load = Load {
+        threads: across * down * 256,
+        group: 256,
+        trips: 1.0,
+        reads: vec![(4 * p.m * p.k) as f64],
+        written: (4 * mxfp8_pre_len(p.m, p.k)) as f64,
+        flight: 512.0,
+        ..Load::default()
+    };
+    load.trip.fresh = 1.0;
+    Some(load)
+}
+
+fn mx8_prep_launches(p: &Mxfp8Prep, step: &Step) -> Vec<Launch> {
+    let shape = p.shape().expect("a grid");
+    let args = vec![step.read(0), step.out(), Arg::count(p.m), Arg::count(p.k)];
+    vec![Launch { args, shape }]
+}
+
+/// Blackwell native 128x128 block-scaled MXFP8 Tensor-Core matmul.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = if self.ks > 1 { "fast_mm_mxfp8_mx8_sk" } else { "fast_mm_mxfp8_mx8" },
+    sizes = [self.m, self.n, self.k],
+    work = self.m * self.n * self.k,
+    accepts = mx8_mm_accepts,
+    emits = f32_only,
+    needs = mx8_mm_needs(),
+    order = Order::PerConfig,
+    source = prefill_source_entry(if self.ks > 1 {
+        "tessera_mm_mxfp8_mx8_sk"
+    } else {
+        "tessera_mm_mxfp8_mx8"
+    }),
+    launches = mx8_mm_launches,
+    shape = Shape::grid((self.n.div_ceil(128) * self.ks, self.m.div_ceil(128)), 256),
+    load = mx8_mm_load,
+    unproven,
+)]
+struct Mxfp8Mx8 {
+    m: usize,
+    n: usize,
+    k: usize,
+    ks: usize,
+    mode: u32,
+    form: &'static dyn Stored,
+}
+
+fn mx8_mm_accepts(k: &Mxfp8Mx8, input: usize, form: &dyn Stored) -> bool {
+    weight_accepts(input, k.form, form)
+}
+
+fn mx8_mm_needs() -> Needs {
+    Needs {
+        lanes: 32,
+        group_bytes: 0,
+        dynamic_shared: MX8_SMEM,
+        group_threads: 256,
+        compiler: true,
+        lacks: CUDA_LACKS,
+        mxfp8_tile: true,
+        ..Needs::default()
+    }
+}
+
+fn mx8_mm_load(k: &Mxfp8Mx8, _: usize) -> Option<Load> {
+    let groups = k.n.div_ceil(128) * k.ks * k.m.div_ceil(128);
+    let mut reads = vec![
+        k.form.bytes(k.n * k.k) as f64,
+        (4 * mxfp8_pre_len(k.m, k.k)) as f64,
+    ];
+    if matches!(k.mode, 1 | 3 | 4) {
+        reads.push((4 * k.m * k.n) as f64);
+    } else if k.mode == 2 {
+        reads.push((4 * k.n) as f64);
+    }
+    let mut load = Load {
+        threads: groups * 256,
+        group: 256,
+        trips: k.k as f64 / (128.0 * k.ks as f64),
+        reads,
+        written: (4 * k.ks * k.m * k.n) as f64,
+        flight: 1024.0,
+        ..Load::default()
+    };
+    load.trip.fresh = 1.0;
+    load.trip.loads = 8.5;
+    load.trip.width = 16.0;
+    load.trip.fp8_flops = (2 * 128 * 128 * 128 / 256) as f64;
+    Some(load)
+}
+
+fn mx8_mm_launches(k: &Mxfp8Mx8, step: &Step) -> Vec<Launch> {
+    let shape = k.shape().expect("a grid");
+    let other = if matches!(k.mode, 1..=4) {
+        step.read(2)
+    } else {
+        step.read(0)
+    };
+    let mut args = vec![
+        step.read(0),
+        step.read(1),
+        other,
+        step.out(),
+        Arg::count(k.m),
+        Arg::count(k.n),
+        Arg::count(k.k),
+        Arg::value(&k.mode),
+    ];
+    if k.ks > 1 {
+        args.push(Arg::count(k.ks));
+    }
+    vec![Launch { args, shape }]
 }
 
 fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
@@ -374,6 +549,59 @@ impl MmSite {
         }
         vec![Draft::new(kernel, reads, self.m * self.n)]
     }
+
+    fn draft_mx8(self, mode: u32, other: Option<T>) -> Vec<Draft> {
+        let prep = Mxfp8Prep {
+            m: self.m,
+            k: self.k,
+        };
+        let pre_len = mxfp8_pre_len(self.m, self.k);
+        if self.ks > 1 {
+            let mm = Mxfp8Mx8 {
+                m: self.m,
+                n: self.n,
+                k: self.k,
+                ks: self.ks,
+                mode: 0,
+                form: self.form,
+            };
+            let red = FastMmReduce {
+                m: self.m,
+                n: self.n,
+                ks: self.ks,
+                mode,
+            };
+            let mut red_reads = vec![Read::Draft(1)];
+            if let Some(extra) = other {
+                red_reads.push(Read::Node(extra));
+            }
+            return vec![
+                Draft::new(prep, [Read::Node(self.x)], pre_len),
+                Draft::new(
+                    mm,
+                    [Read::Draft(0), Read::Node(self.w)],
+                    self.ks * self.m * self.n,
+                ),
+                Draft::new(red, red_reads, self.m * self.n),
+            ];
+        }
+        let mm = Mxfp8Mx8 {
+            m: self.m,
+            n: self.n,
+            k: self.k,
+            ks: 1,
+            mode,
+            form: self.form,
+        };
+        let mut reads = vec![Read::Draft(0), Read::Node(self.w)];
+        if let Some(extra) = other {
+            reads.push(Read::Node(extra));
+        }
+        vec![
+            Draft::new(prep, [Read::Node(self.x)], pre_len),
+            Draft::new(mm, reads, self.m * self.n),
+        ]
+    }
 }
 
 /// Validates a multi-row 2D matmul site or explains its rejection.
@@ -450,7 +678,7 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
                     (MmKind::Mxfp8Wide, 1)
                 }
             } else {
-                let ks = set.unwrap_or_else(|| mxfp8_tall_ks(m, n, k));
+                let ks = set.unwrap_or_else(|| mxfp8_tile_ks(m, n, k, 64, 160, 64, 192));
                 if ks > 1 {
                     (MmKind::Mxfp8TallSplit, ks)
                 } else {
@@ -484,7 +712,21 @@ fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
     check_mm(tree, mat)?.ok()
 }
 
-fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
+    let mut site = mm_site(tree, mat)?;
+    if site.form.name() != "mxfp8" || site.m < 64 {
+        return None;
+    }
+    let set = set_ks(tree, "fast_mm_mxfp8_sk", site.k / 512);
+    site.ks = set.unwrap_or_else(|| mxfp8_tile_ks(site.m, site.n, site.k, 128, 40, 24, 64));
+    Some(site)
+}
+
+fn match_mm_add(
+    tree: &Tree,
+    at: T,
+    pick: fn(&Tree, T) -> Option<MmSite>,
+) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
     if node.term != Term::Stage(Stage::Add) || node.form.name() != "f32" {
         return None;
@@ -494,7 +736,7 @@ fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         if mat == add || tree.root(mat) || tree.node(add).form.name() != "f32" {
             continue;
         }
-        let Some(site) = mm_site(tree, mat) else {
+        let Some(site) = pick(tree, mat) else {
             continue;
         };
         let add_node = tree.node(add);
@@ -506,12 +748,16 @@ fn propose_mm_add(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         } else {
             continue;
         };
-        return Some(site.draft(mode, Some(add)));
+        return Some((site, mode, Some(add)));
     }
     None
 }
 
-fn propose_mm_mul(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+fn match_mm_mul(
+    tree: &Tree,
+    at: T,
+    pick: fn(&Tree, T) -> Option<MmSite>,
+) -> Option<(MmSite, u32, Option<T>)> {
     let node = tree.node(at);
     if node.term != Term::Stage(Stage::Mul) || node.form.name() != "f32" {
         return None;
@@ -530,44 +776,58 @@ fn propose_mm_mul(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         if mat == other || tree.root(mat) {
             continue;
         }
-        let Some(site) = mm_site(tree, mat) else {
+        let Some(site) = pick(tree, mat) else {
             continue;
         };
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            return Some(site.draft(3, Some(other)));
+            return Some((site, 3, Some(other)));
         }
     }
     for (mat, other) in [(a, b), (b, a)] {
         if mat == other || tree.root(mat) || tree.node(other).form.name() != "f32" {
             continue;
         }
-        let Some(site) = mm_site(tree, mat) else {
+        let Some(site) = pick(tree, mat) else {
             continue;
         };
         if tree.elements(other) == site.m * site.n && tree.node(other).shape == node.shape {
-            return Some(site.draft(4, Some(other)));
+            return Some((site, 4, Some(other)));
         }
     }
     None
 }
 
-pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if let Some(drafts) = propose_mm_add(tree, at) {
-        return Some(drafts);
+fn match_mm_site(
+    tree: &Tree,
+    at: T,
+    pick: fn(&Tree, T) -> Option<MmSite>,
+) -> Option<(MmSite, u32, Option<T>)> {
+    if let Some(hit) = match_mm_add(tree, at, pick) {
+        return Some(hit);
     }
-    if let Some(drafts) = propose_mm_mul(tree, at) {
-        return Some(drafts);
+    if let Some(hit) = match_mm_mul(tree, at, pick) {
+        return Some(hit);
     }
     let node = tree.node(at);
     if node.term == Term::Stage(Stage::Act(Act::Silu)) && node.form.name() == "f32" {
         let mat = node.args[0];
         if !tree.root(mat)
-            && let Some(site) = mm_site(tree, mat)
+            && let Some(site) = pick(tree, mat)
         {
-            return Some(site.draft(5, None));
+            return Some((site, 5, None));
         }
     }
-    Some(mm_site(tree, at)?.draft(0, None))
+    Some((pick(tree, at)?, 0, None))
+}
+
+pub(crate) fn propose_mm(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (site, mode, other) = match_mm_site(tree, at, mm_site)?;
+    Some(site.draft(mode, other))
+}
+
+pub(crate) fn propose_mm_mx8(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (site, mode, other) = match_mm_site(tree, at, mx8_site)?;
+    Some(site.draft_mx8(mode, other))
 }
 
 fn why_mm(tree: &Tree, at: T) -> Option<String> {
@@ -575,3 +835,4 @@ fn why_mm(tree: &Tree, at: T) -> Option<String> {
 }
 
 super::cuda_rule!("fast_mm", propose_mm, why = why_mm);
+super::cuda_rule!("fast_mm_mx8", propose_mm_mx8);

@@ -9,6 +9,7 @@ use super::driver::{
     self, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
     CU_DEVICE_ATTRIBUTE_INTEGRATED, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
     CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -69,9 +70,14 @@ impl Context {
         };
         let major = attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let minor = attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let group_bytes = attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)? as usize;
+        let dynamic_group_bytes = attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .map(|v| v as usize)
+            .unwrap_or(group_bytes);
         let limits = Limits {
             lanes: attr(CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as usize,
-            group_bytes: attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)? as usize,
+            group_bytes,
+            dynamic_group_bytes,
             group_threads: attr(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as usize,
             compiler: true,
             pdl: false,

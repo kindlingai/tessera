@@ -111,6 +111,7 @@ impl Context {
         Limits {
             lanes,
             group_bytes: 64 * 1024,
+            dynamic_group_bytes: 0,
             group_threads: 1024,
             compiler: true,
             pdl: false,

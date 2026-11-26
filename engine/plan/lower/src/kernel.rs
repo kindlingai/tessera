@@ -168,6 +168,8 @@ pub struct Needs {
     /// Exactly this many lanes together, or zero for any.
     pub lanes: usize,
     pub group_bytes: usize,
+    /// Dynamic shared memory opted in per block.
+    pub dynamic_shared: usize,
     pub group_threads: usize,
     /// Hand-written text, for a backend with a compiler.
     pub compiler: bool,
@@ -177,6 +179,8 @@ pub struct Needs {
     pub tile: bool,
     /// bf16 tiles with f32 sums.
     pub bf16_tile: bool,
+    /// Block-scaled mxfp8 tiles with f32 sums.
+    pub mxfp8_tile: bool,
 }
 
 impl Needs {
@@ -199,13 +203,16 @@ impl Needs {
 
     pub fn fits(&self, platform: &Platform) -> bool {
         let limits = &platform.limits;
+        let max_dyn = limits.dynamic_group_bytes.max(limits.group_bytes);
         (self.lanes == 0 || self.lanes == limits.lanes)
             && self.group_bytes <= limits.group_bytes
+            && (self.dynamic_shared == 0 || self.dynamic_shared <= max_dyn)
             && self.group_threads <= limits.group_threads
             && (!self.compiler || limits.compiler)
             && !Backend::named(&platform.backend).is_some_and(|b| self.lacks.contains(&b))
             && (!self.tile || platform.tile().is_some())
             && (!self.bf16_tile || platform.bf16_tile().is_some())
+            && (!self.mxfp8_tile || platform.mxfp8_tile().is_some())
     }
 
     /// First unmet hardware requirement for `platform`, if any.
@@ -218,6 +225,9 @@ impl Needs {
         }
         if self.compiler && !limits.compiler {
             return Some("requires kernel compiler".into());
+        }
+        if self.mxfp8_tile && platform.mxfp8_tile().is_none() {
+            return Some("requires mxfp8 tensor tiles".into());
         }
         if self.bf16_tile && platform.bf16_tile().is_none() {
             return Some("requires bf16 tensor tiles".into());
@@ -235,6 +245,13 @@ impl Needs {
             return Some(format!(
                 "shared memory {} B exceeds {} B limit",
                 self.group_bytes, limits.group_bytes
+            ));
+        }
+        let max_dyn = limits.dynamic_group_bytes.max(limits.group_bytes);
+        if self.dynamic_shared > max_dyn {
+            return Some(format!(
+                "dynamic shared {} B exceeds {} B limit",
+                self.dynamic_shared, max_dyn
             ));
         }
         if self.group_threads > limits.group_threads {

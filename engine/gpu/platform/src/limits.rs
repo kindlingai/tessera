@@ -15,6 +15,9 @@ pub struct Limits {
     pub lanes: usize,
     /// The most group memory one group may use, in bytes.
     pub group_bytes: usize,
+    /// Dynamic shared memory opt-in limit per group, in bytes.
+    #[serde(default)]
+    pub dynamic_group_bytes: usize,
     /// The most threads in one group.
     pub group_threads: usize,
     /// Whether hand-written kernel text can be compiled here.
@@ -35,6 +38,7 @@ impl Limits {
         Self {
             lanes: 32,
             group_bytes: 32 * 1024,
+            dynamic_group_bytes: 0,
             group_threads: 1024,
             compiler: true,
             pdl: false,
@@ -46,6 +50,7 @@ impl Limits {
         Self {
             lanes,
             group_bytes: 64 * 1024,
+            dynamic_group_bytes: 0,
             group_threads: 1024,
             compiler: false,
             pdl: false,

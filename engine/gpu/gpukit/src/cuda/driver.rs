@@ -20,6 +20,7 @@ pub(crate) type CUgraphExec = *mut c_void;
 pub(crate) const CUDA_SUCCESS: CUresult = 0;
 pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
 pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 8;
+pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 pub(crate) const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;

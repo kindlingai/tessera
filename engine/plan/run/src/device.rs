@@ -193,6 +193,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         &self,
         kernel: &<D as Device>::Kernel,
         shape: Shape,
+        shared: u32,
         args: &mut KernelArgs,
     ) -> Result<(), Error> {
         match shape {
@@ -203,7 +204,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 threads,
             } => {
                 let threads = threads as u32;
-                launch_grid(self.ctx, kernel, across, down, threads, args)?
+                launch_grid(self.ctx, kernel, across, down, threads, shared, args)?
             }
             Shape::Runtime(_) => return Err(tessera_lower::Error::Unbound.into()),
         }
@@ -219,11 +220,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.gated.set(left.saturating_sub(1));
         let overlap = self.launching.pdl && self.overlaps && self.waits[step];
         self.ctx.programmatic(overlap && !self.resident[step]);
+        let shared = self.base.plan.steps[step].kernel.needs().dynamic_shared as u32;
         let fired = match self.resident[step] {
             true => self.persistent(step, launch),
             false => {
                 let mut args = self.bound(&launch.args)?;
-                self.fire(&self.kernels[step], launch.shape, &mut args)
+                self.fire(&self.kernels[step], launch.shape, shared, &mut args)
             }
         };
         fired.map_err(|e| {
@@ -834,6 +836,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         let mut args = args?;
         let ctx = self.ctx;
         let mut found = Marks::default();
+        let shared = self.base.plan.steps[step].kernel.needs().dynamic_shared as u32;
         let mut ran = false;
         for (launch, a) in launches.iter().zip(&mut args) {
             let one = marks::step_marks(
@@ -849,7 +852,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
                             across,
                             down,
                             threads,
-                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, a)?),
+                        } => Ok(launch_grid(ctx, k, across, down, threads as u32, shared, a)?),
                         Shape::Runtime(_) => Err(tessera_lower::Error::Unbound.into()),
                     }
                 },

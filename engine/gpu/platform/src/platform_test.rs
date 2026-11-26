@@ -25,6 +25,10 @@ fn table_resolves() {
     let bf16 = |id: &str| row_for(id).and_then(|r| r.bf16_tile);
     assert_eq!(bf16("cuda sm_121"), Some([16, 8, 16]));
     assert_eq!(bf16("rocm gfx11_5"), None);
+    let mxfp8 = |id: &str| row_for(id).and_then(|r| r.mxfp8_tile);
+    assert_eq!(mxfp8("cuda sm_121"), Some([16, 8, 32]));
+    assert_eq!(mxfp8("cuda sm_100"), None);
+    assert_eq!(mxfp8("cuda sm_90"), None);
     assert!(row_for("cuda sm_89").is_some_and(|r| !r.pdl));
     assert!(row_for("cuda sm_121").is_some_and(|r| !r.pinned));
     assert!(row_for("rocm gfx11_5").is_some_and(|r| !r.pinned));

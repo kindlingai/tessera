@@ -18,6 +18,9 @@ pub struct Row {
     /// The unit's bf16 tile with f32 sums, if any.
     #[serde(default)]
     pub bf16_tile: Option<[usize; 3]>,
+    /// The unit's block-scaled mxfp8 tile with f32 sums, if any.
+    #[serde(default)]
+    pub mxfp8_tile: Option<[usize; 3]>,
     /// Whether a launch may overlap the one before it.
     #[serde(default)]
     pub pdl: bool,
@@ -152,6 +155,11 @@ impl Platform {
     /// The bf16 tile, if the table lists one.
     pub fn bf16_tile(&self) -> Option<[usize; 3]> {
         self.row.as_ref()?.bf16_tile
+    }
+
+    /// The block-scaled mxfp8 tile, if the table lists one.
+    pub fn mxfp8_tile(&self) -> Option<[usize; 3]> {
+        self.row.as_ref()?.mxfp8_tile
     }
 }
 

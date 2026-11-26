@@ -283,7 +283,8 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
         quote!(fn load(&self, len: usize) -> Option<#krate::Load> {
             #body
             let mut load = #call?;
-            load.group_bytes = #krate::Kernel::needs(self).group_bytes as f64;
+            let needs = #krate::Kernel::needs(self);
+            load.group_bytes = (needs.group_bytes + needs.dynamic_shared) as f64;
             Some(load)
         })
     });

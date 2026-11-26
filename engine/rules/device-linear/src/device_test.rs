@@ -5,7 +5,7 @@ use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, S
 use tessera_kernels as _;
 use tessera_linear as _;
 use tessera_lower::form::{BF16_FORM, named};
-use tessera_lower::{Device, Knobs, Limits, Pins, Platform, Source, Tree, Wants, explain};
+use tessera_lower::{Device, Knobs, Limits, Pins, Platform, Source, Tree, Wants, explain, lower};
 use tessera_testkit::graphs::linear;
 
 fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static str, usize)> {
@@ -105,6 +105,9 @@ fn linear_mm_entries() {
         "dtr_pre_k4_t16(",
         "dtr_pre_gen8(",
         "dtr_pre_gen16(",
+        "tessera_mm_mxfp8_prep(",
+        "tessera_mm_mxfp8_mx8(",
+        "tessera_mm_mxfp8_mx8_sk(",
     ] {
         assert!(prefill_source().contains(entry), "missing {entry}");
     }
@@ -267,4 +270,91 @@ fn lowering_report_diagnostics() {
     let dev_metal = Device::default().on(metal).pinned(Pins::all(mxfp8));
     let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_metal).unwrap();
     assert!(!r.has_fallbacks(), "{}", r.format(10));
+
+    // Blackwell sm_121 picks native MXFP8 MMA, sm_90 stays on r64.
+    let g_mx = linear(&rows, 6144, 6144);
+    let dyn_limits = Limits {
+        group_bytes: 48 * 1024,
+        dynamic_group_bytes: 99 * 1024,
+        ..Limits::assumed()
+    };
+    let mut sm121 = Platform {
+        backend: "cuda".into(),
+        arch: "sm_121".into(),
+        name: "NVIDIA GB10".into(),
+        units: 48,
+        bandwidth: 273e9,
+        ..Platform::host(dyn_limits)
+    };
+    sm121.row.as_mut().unwrap().mxfp8_tile = Some([16, 8, 32]);
+    let sm90 = Platform {
+        backend: "cuda".into(),
+        arch: "sm_90".into(),
+        name: "NVIDIA H100".into(),
+        units: 132,
+        bandwidth: 3350e9,
+        ..Platform::host(dyn_limits)
+    };
+    let p121 = lower(
+        &g_mx,
+        0,
+        &[(Rows, 256)],
+        &Device::default().on(sm121.clone()).pinned(Pins::all(mxfp8)),
+    )
+    .unwrap();
+    let names121: Vec<&str> = p121.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(names121, ["fast_mm_mxfp8_prep", "fast_mm_mxfp8_mx8"]);
+    let g_kva = linear(&rows, 6144, 576);
+    let pkva = lower(
+        &g_kva,
+        0,
+        &[(Rows, 2048)],
+        &Device::default().on(sm121.clone()).pinned(Pins::all(mxfp8)),
+    )
+    .unwrap();
+    let kva_names: Vec<&str> = pkva.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(kva_names, ["fast_mm_mxfp8_prep", "fast_mm_mxfp8_mx8"]);
+    // Two MXFP8 projections share one prep via CSE.
+    let mut g_pair = linear(&rows, 6144, 2048);
+    let x = g_pair.nodes[g_pair.entries[0].outputs[0].node.0 as usize].args[0];
+    let mut w2 = g_pair.weights[0].clone();
+    w2.path.push(tessera_graph::PathSeg::Field("b".into()));
+    let w2_ty = w2.ty.clone();
+    let wid = g_pair.weights.len() as u32;
+    let w2_node = push_node(&mut g_pair, Op::Weight(wid), Vec::new(), w2_ty);
+    g_pair.weights.push(w2);
+    let y2_ty = g_pair.nodes[g_pair.entries[0].outputs[0].node.0 as usize]
+        .ty
+        .clone();
+    let y2 = push_node(&mut g_pair, Op::Matmul, vec![x, w2_node], y2_ty);
+    let mut out2 = g_pair.entries[0].outputs[0].clone();
+    out2.node = y2;
+    g_pair.entries[0].outputs.push(out2);
+    let ppair = lower(
+        &g_pair,
+        0,
+        &[(Rows, 2048)],
+        &Device::default().on(sm121).pinned(Pins::all(mxfp8)),
+    )
+    .unwrap();
+    let preps = ppair
+        .steps
+        .iter()
+        .filter(|s| s.kernel.name() == "fast_mm_mxfp8_prep")
+        .count();
+    let mx8s = ppair
+        .steps
+        .iter()
+        .filter(|s| s.kernel.name() == "fast_mm_mxfp8_mx8")
+        .count();
+    assert_eq!((preps, mx8s), (1, 2));
+    let p90 = lower(
+        &g_mx,
+        0,
+        &[(Rows, 256)],
+        &Device::default().on(sm90).pinned(Pins::all(mxfp8)),
+    )
+    .unwrap();
+    let names90: Vec<&str> = p90.steps.iter().map(|s| s.kernel.name()).collect();
+    assert_eq!(names90, ["fast_mm_mxfp8"]);
 }

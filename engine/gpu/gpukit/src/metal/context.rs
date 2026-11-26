@@ -134,6 +134,7 @@ impl Context {
         Limits {
             lanes: 32,
             group_bytes: device.maxThreadgroupMemoryLength(),
+            dynamic_group_bytes: 0,
             group_threads: device.maxThreadsPerThreadgroup().width,
             compiler: true,
             pdl: false,

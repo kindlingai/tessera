@@ -201,7 +201,8 @@ impl Chip for Nvidia {
         let apart = (l.threads.min(32) as f64 - 1.0) / 31.0;
         let walked = (1.0 - t.fresh).clamp(0.0, 1.0);
         let stall = s.gather.value + (s.scatter.value - s.gather.value) * apart * walked;
-        let tiles = t.shared * s.staged.value + (t.tile_flops + t.bf16_flops / SPLIT) * s.mma.value;
+        let tiles = t.shared * s.staged.value
+            + (t.tile_flops + (t.bf16_flops + t.fp8_flops) / SPLIT) * s.mma.value;
         let waits = t.steps() * s.chain.value + t.loads * stall + tiles;
         let chain = rounds * l.trips * waits;
         let cold = |bytes: &&f64| **bytes > s.cache.value;
@@ -216,10 +217,12 @@ impl Chip for Nvidia {
         let cached = l.loaded() / through(s.cached.value, s.near.value);
         let seconds = |cycles: f64| rounds * cycles / s.clock.value;
         let tiled = l.threads as f64 * l.trips * (t.tile_flops * SPLIT + t.bf16_flops);
+        let fp8 = l.threads as f64 * l.trips * t.fp8_flops;
+        let compute = tiled / s.fp16.value + fp8 / s.fp8.value;
         let limits = [
             (Limit::Issue, seconds(issue)),
             (Limit::Pipe, seconds(pipe)),
-            (Limit::Compute, tiled / s.fp16.value),
+            (Limit::Compute, compute),
             (Limit::Chain, chain),
             (Limit::Read, moved),
             (Limit::Cache, cached),

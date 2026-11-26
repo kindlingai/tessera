@@ -162,6 +162,7 @@ pub fn launch_grid<C: Launch>(
     width: usize,
     height: usize,
     block_width: u32,
+    shared_bytes: u32,
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
     assert!(
@@ -172,7 +173,7 @@ pub fn launch_grid<C: Launch>(
         kernel,
         (width as u32, height as u32, 1),
         (block_width, 1, 1),
-        0,
+        shared_bytes,
         args,
     )
 }
