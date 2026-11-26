@@ -34,10 +34,15 @@ impl AttendKind {
     }
 
     fn smem(self) -> usize {
-        match self {
-            Self::Mla => 42_240,
-            Self::Gqa => 18_432,
-        }
+        if self == Self::Mla { 47_104 } else { 18_432 }
+    }
+
+    fn threads(self) -> usize {
+        if self == Self::Mla { 256 } else { 128 }
+    }
+
+    fn tile_keys(self) -> usize {
+        if self == Self::Mla { 32 } else { 16 }
     }
 
     fn names(self) -> (&'static str, &'static str, &'static str) {
@@ -144,7 +149,7 @@ fn attend_needs(k: &SplitAttend) -> Needs {
     Needs {
         lanes: 32,
         group_bytes: k.kind.smem(),
-        group_threads: 128,
+        group_threads: k.kind.threads(),
         compiler: true,
         lacks: CUDA_LACKS,
         bf16_tile: true,
@@ -154,6 +159,7 @@ fn attend_needs(k: &SplitAttend) -> Needs {
 
 fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
     let w = k.kind.width();
+    let threads = k.kind.threads();
     let groups = k.rows * k.hgroups() * k.splits;
     let seen = k.picks.min(k.keys.most()).max(1);
     let q_bytes = (4 * k.rows * k.heads * w) as f64;
@@ -164,9 +170,9 @@ fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
     let kv_bytes = (kv_mul * k.kv_form.bytes(k.rows * seen * k.kv_heads * w)) as f64;
     let out_bytes = (4 * k.rows * k.heads * k.splits * k.kind.stride()) as f64;
     Some(Load {
-        threads: groups * 128,
-        group: 128,
-        trips: seen.div_ceil(16 * k.splits) as f64,
+        threads: groups * threads,
+        group: threads,
+        trips: seen.div_ceil(k.kind.tile_keys() * k.splits) as f64,
         reads: vec![kv_bytes, q_bytes],
         written: out_bytes,
         flight: 1024.0,
@@ -178,7 +184,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: k.splits,
         down: k.rows * k.hgroups(),
-        threads: 128,
+        threads: k.kind.threads(),
     };
     let mut args = vec![
         step.read(0),
