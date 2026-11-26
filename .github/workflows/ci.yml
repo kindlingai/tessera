@@ -100,6 +100,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       # Unused dependencies. It does not read dev-dependencies.
       - uses: taiki-e/install-action@v2
@@ -127,6 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.152
@@ -164,6 +166,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: features
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --features "${{ matrix.features }}"
       # The merged crates.io crates must build with each backend too.
       - run: cargo run -q -p tessera-publish
@@ -184,6 +187,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: grammar
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p tessera-grammar --all-targets --features llguidance
       - uses: taiki-e/install-action@v2
         with:
@@ -219,6 +223,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --target aarch64-apple-darwin -p tessera-gpukit -p tessera-platform --all-targets
       - uses: taiki-e/install-action@v2
         with:
@@ -231,6 +236,9 @@ jobs:
     # so the merge queue skips it.
     if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     env:
       SIMCHECK: tools/scripts/stickler.sh simcheck
       HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -255,13 +263,6 @@ jobs:
         with:
           path: ${{ runner.temp }}/eg2-text
           key: eg2-text-stickler-${{ steps.pin.outputs.stickler }}
-      # The older single-file cache. simcheck reads it when the shard
-      # folder fails to restore, and saves it as shards.
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/simcheck.bin
-          key: simcheck-${{ github.run_id }}
-          restore-keys: simcheck-
       # Embeddings keyed by window text, in shard files. Each run saves
       # a fresh copy.
       - uses: actions/cache/restore@v4
@@ -286,6 +287,20 @@ jobs:
         with:
           path: ${{ runner.temp }}/simcheck
           key: simcheck2-${{ github.run_id }}
+      # Each save is a new key. Older keys on this ref only take space
+      # and push other caches past the repository limit. A fork's token
+      # cannot delete caches.
+      - if: >
+          always() && (github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: simcheck2-${{ github.run_id }}
+        # Nothing goes unless this run's copy saved.
+        run: >
+          gh cache list --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" --key simcheck2- --limit 100
+          --json id,key --jq "if any(.[]; .key == \"$KEEP\") then .[] | select(.key != \"$KEEP\") | .id else empty end" |
+          xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
 
   style:
     # Comment and prose rules (stickler style) on a PR's added lines. The job
@@ -374,6 +389,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: platforms
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install nvcc, cuobjdump, nvdisasm and clang
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -438,7 +454,7 @@ jobs:
           tags: tesserax:ci
           build-args: BACKEND=${{ matrix.backend }}
           cache-from: type=gha,scope=docker-${{ matrix.backend }}
-          cache-to: type=gha,scope=docker-${{ matrix.backend }},mode=max
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,scope=docker-{0},mode=max', matrix.backend) || '' }}
       - run: docker image ls tesserax:ci --format 'image size {{.Size}}'
       - run: >
           docker run --rm -v "$PWD/tools/scripts:/scripts:ro" --entrypoint /bin/sh
