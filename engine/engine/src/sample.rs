@@ -340,7 +340,7 @@ fn each_allowed(logits: &[f32], allowed: Option<&Allowed>, mut f: impl FnMut(u32
 }
 
 /// Lowest-index argmax over allowed tokens.
-fn argmax(logits: &[f32], allowed: Option<&Allowed>) -> u32 {
+pub(crate) fn argmax(logits: &[f32], allowed: Option<&Allowed>) -> u32 {
     let mut best_id = 0u32;
     let mut best = f32::NEG_INFINITY;
     let mut found = false;
@@ -351,6 +351,9 @@ fn argmax(logits: &[f32], allowed: Option<&Allowed>) -> u32 {
             found = true;
         }
     });
+    if !found && allowed.is_some() {
+        return argmax(logits, None);
+    }
     best_id
 }
 

@@ -2,7 +2,7 @@
 
 use crate::{Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
-use tessera_graph::{DType, Graph, Parts, shard_mode};
+use tessera_graph::{DType, Graph, Parts, Whole, shard_mode};
 use tessera_lower::{Cluster, Device, Pins, Recipe, Settings, Wants, Wires, ZoneKind};
 use tessera_run::{Profile, Rank, Ranks, Run, Sum, sum_wire};
 
@@ -78,12 +78,20 @@ impl Place {
         Self::new(Cluster::mesh(ranks, kind), parts)
     }
 
+    /// Logs unsharded weights on rank 0.
+    pub(crate) fn log_whole(&self, g: &Graph, tag: &str, whole: &[Whole]) {
+        if self.rank != 0 {
+            return;
+        }
+        for w in whole {
+            let path = &g.weights[w.weight as usize].path;
+            eprintln!("tessera: {tag}{path:?} stays whole: {}", w.why);
+        }
+    }
+
     pub(crate) fn split(&self, g: &Graph, (pins, wires): (&Pins, &Wires)) -> Result<Graph, Error> {
         let sharded = shard_mode(g, &self.parts, &pins.shares(g), self.moe_tp)?;
-        for w in sharded.whole.iter().filter(|_| self.rank == 0) {
-            let path = &g.weights[w.weight as usize].path;
-            eprintln!("tessera: {path:?} stays whole: {}", w.why);
-        }
+        self.log_whole(g, "", &sharded.whole);
         Ok(self.resolve(sharded.graph, wires))
     }
 
@@ -104,6 +112,27 @@ pub(crate) fn open_rank<T: Transport + 'static>(
     grid: Option<Box<dyn Sum>>,
 ) -> Result<Box<dyn Run>, Error> {
     Ok(Box::new(Rank::open(plan, settings, sums)?.with_grid(grid)?))
+}
+
+/// Configures `runner` and loads its stored device model.
+pub(crate) fn stored_device(
+    runner: &mut dyn Run,
+    recipe: &Recipe,
+    settings: &Settings,
+    place: Option<&Place>,
+    profile: bool,
+) -> Result<Device, Error> {
+    runner.launching(recipe.launch);
+    if profile {
+        runner.profiling(settings.profile.is_some());
+    }
+    let mut device = Device::stored(runner.platform(), settings)
+        .map_err(tessera_lower::Error::from)?
+        .with(recipe);
+    if let Some(place) = place {
+        device = place.device(device);
+    }
+    Ok(device)
 }
 
 impl Engine {

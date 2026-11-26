@@ -42,7 +42,6 @@ pub(crate) struct SoloState {
     pub(crate) m_tokens: Vec<u32>,
     pub(crate) m_taps: Vec<f32>,
     pub(crate) round_mtp: bool,
-    pub(crate) last_pred: f64,
     pub(crate) last_lp: Option<Vec<f32>>,
     pub(crate) last_mtp_d1: Option<u32>,
 }
@@ -246,7 +245,6 @@ impl<'a> BatchMtp<'a> {
             m_tokens: job.committed,
             m_taps,
             round_mtp: false,
-            last_pred: 1.0,
             last_lp: None,
             last_mtp_d1: None,
         });
@@ -284,13 +282,11 @@ impl<'a> BatchMtp<'a> {
         let solo = seq.solo.as_mut().expect("solo state");
         if k > 0 {
             if solo.round_mtp {
-                solo.selector
-                    .observe_mtp(k, accepted, solo.last_pred, &committed);
+                solo.selector.observe_mtp(k, accepted, &committed);
             } else {
-                solo.selector.observe_dflash_lp(
+                solo.selector.observe_dflash(
                     k,
                     accepted,
-                    solo.last_pred,
                     solo.last_lp.as_deref(),
                     solo.last_mtp_d1,
                     committed[0],
@@ -352,16 +348,14 @@ impl<'a> BatchMtp<'a> {
             let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
             let (mut drafts, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
             let avail = drafts.len().min(room);
-            let (k, pred) = self.active[idx]
+            let k = self.active[idx]
                 .solo
                 .as_ref()
                 .expect("solo")
                 .selector
                 .dflash
                 .choose(lp.as_deref(), avail, drafts.len());
-            let solo = self.active[idx].solo.as_mut().expect("solo");
-            solo.last_pred = pred;
-            solo.last_lp = lp;
+            self.active[idx].solo.as_mut().expect("solo").last_lp = lp;
             drafts.truncate(k);
             self.active[idx].drafts = drafts;
             return Ok(());
@@ -380,7 +374,7 @@ impl<'a> BatchMtp<'a> {
                 .as_mut()
                 .expect("solo")
                 .selector
-                .start_probe_lp(probe, lp);
+                .start_probe(probe, lp);
         }
         let (m_start, m_toks, m_taps, avail) = {
             let solo = self.active[idx].solo.as_mut().expect("solo");
@@ -413,7 +407,7 @@ impl<'a> BatchMtp<'a> {
             .draft_batch(&[job], &tail_taps, false)?
             .pop()
             .unwrap_or_default();
-        let (k, pred) = self.active[idx]
+        let k = self.active[idx]
             .solo
             .as_ref()
             .expect("solo")
@@ -421,7 +415,6 @@ impl<'a> BatchMtp<'a> {
             .mtp
             .choose(None, drafts.len(), drafts.len());
         self.active[idx].mtp_valid = start;
-        self.active[idx].solo.as_mut().expect("solo").last_pred = pred;
         drafts.truncate(k);
         self.active[idx].drafts = drafts;
         Ok(())
@@ -442,7 +435,6 @@ struct DFlashPrefill {
 struct DFlashSeq {
     seq: ActiveSeq,
     spec: SpecLen,
-    last_pred: f64,
     last_lp: Option<Vec<f32>>,
     d_base: usize,
     history: Vec<u32>,
@@ -647,7 +639,6 @@ impl<'a> BatchDFlash<'a> {
             return Ok(());
         }
         let spec = self.spec_len.fresh();
-        let mut last_pred = 1.0;
         let mut last_lp = None;
         let room = act.room(self.max_ctx);
         let d_start = n - seq.d_base;
@@ -657,16 +648,14 @@ impl<'a> BatchDFlash<'a> {
                     .run_taps(act.slot, anchor, d_start, d_pos0, taps.as_in(), wants)?;
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
             let avail = drafts.len().min(room);
-            let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
+            let k = spec.choose(lp.as_deref(), avail, drafts.len());
             drafts.truncate(k);
             act.drafts = drafts;
-            last_pred = pred;
             last_lp = lp;
         }
         self.active.push(DFlashSeq {
             seq: act,
             spec,
-            last_pred,
             last_lp,
             d_base: seq.d_base,
             history,
@@ -693,8 +682,7 @@ impl<'a> BatchDFlash<'a> {
             item.history.push(old_anchor);
             item.history.extend_from_slice(&committed[..accepted]);
             if k > 0 {
-                item.spec
-                    .observe(k, accepted, item.last_lp.as_deref(), item.last_pred);
+                item.spec.observe(k, accepted, item.last_lp.as_deref());
             }
             if done.is_some() || (!ranked && item.seq.cancelled) {
                 finished[i] = true;
@@ -736,10 +724,9 @@ impl<'a> BatchDFlash<'a> {
             let (mut drafts, lp) = self.drafter.read_draft(&outs)?;
             let avail = drafts.len().min(job.avail);
             let item = &mut self.active[job.active_idx];
-            let (k, pred) = item.spec.choose(lp.as_deref(), avail, drafts.len());
+            let k = item.spec.choose(lp.as_deref(), avail, drafts.len());
             drafts.truncate(k);
             item.seq.drafts = drafts;
-            item.last_pred = pred;
             item.last_lp = lp;
         }
         let mut idx = 0usize;

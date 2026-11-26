@@ -8,7 +8,7 @@ use crate::{Engine, Error, Event, Place};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tessera_engine_comm::{Error as CommError, Transport};
-use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
+use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs};
 use tessera_graph::{DType, Graph, Role};
 use tessera_interp::Tensor;
 use tessera_lower::{Cache, Device, Recipe, Settings, Slot, Wants, Weight};
@@ -140,11 +140,10 @@ impl DraftCore {
             .iter()
             .find(|d| d.name == Seqs)
             .map_or(1, |d| d.size.max() as usize);
-        let ranked = |device: Device| match place {
-            Some(place) => place.device(device),
-            None => device,
-        };
-        let device = ranked(Device::guess(settings).with(recipe));
+        let mut device = Device::guess(settings).with(recipe);
+        if let Some(place) = place {
+            device = place.device(device);
+        }
         let mut plans = Cache::default();
         let first = [
             (Seqs, slots as u64),
@@ -154,13 +153,7 @@ impl DraftCore {
         ];
         let (plan, _) = plans.wanting(&graph, 0, wants, &first, &[Context, Segments], &device)?;
         let mut runner = run(plan.clone())?;
-        runner.launching(recipe.launch);
-        runner.profiling(settings.profile.is_some());
-        let device = ranked(
-            Device::stored(runner.platform(), settings)
-                .map_err(tessera_lower::Error::from)?
-                .with(recipe),
-        );
+        let device = crate::ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
         Ok(Self {
             graph,
             runner,
@@ -302,7 +295,6 @@ pub struct Drafter {
     core: DraftCore,
     block: usize,
     tap_width: usize,
-    vocab: usize,
     mask_token: u32,
     causal: bool,
     selector_k: Option<usize>,
@@ -408,23 +400,17 @@ impl Drafter {
         let graph = match place {
             Some(place) => {
                 let sharded = dflash::shard(&graph, &place.parts, &recipe.pins.shares(&graph))?;
-                for w in sharded.whole.iter().filter(|_| place.rank == 0) {
-                    let path = &graph.weights[w.weight as usize].path;
-                    eprintln!("tessera: drafter {path:?} stays whole: {}", w.why);
-                }
+                place.log_whole(&graph, "drafter ", &sharded.whole);
                 place.resolve(sharded.graph, &recipe.sums)
             }
             None => graph,
         };
-        let dim = |name| {
-            graph
-                .dims
-                .iter()
-                .find(|d| d.name == name)
-                .map(|d| d.size.max() as usize)
-        };
-        let tap_width = dim(Embedding).ok_or(Error::Taps)?;
-        let vocab = dim(Vocab).ok_or(Error::Scores)?;
+        let tap_width = graph
+            .dims
+            .iter()
+            .find(|d| d.name == Embedding)
+            .map(|d| d.size.max() as usize)
+            .ok_or(Error::Taps)?;
         let selector_k = selector_top_k(&graph, block);
         let wants = match selector_k {
             Some(_) => Wants::roles(&graph, 0, &[Role::Candidates, Role::Taps]),
@@ -445,7 +431,6 @@ impl Drafter {
             core,
             block,
             tap_width,
-            vocab,
             mask_token,
             causal: false,
             selector_k,
@@ -490,36 +475,6 @@ impl Drafter {
         let mut ids = self.core.runner.ids(outputs[0])?;
         ids.truncate(self.block - 1);
         Ok((ids, None))
-    }
-
-    /// Proposes `block - 1` greedy draft tokens after `anchor`.
-    pub fn draft(
-        &mut self,
-        slot: u32,
-        anchor: u32,
-        start: usize,
-        ctx_pos: usize,
-        taps: &[f32],
-    ) -> Result<Vec<u32>, Error> {
-        let wants = self.draft_wants();
-        let outputs = self.run_taps(slot, anchor, start, ctx_pos, TapsIn::Host(taps), wants)?;
-        Ok(self.read_draft(&outputs)?.0)
-    }
-
-    /// Computes `(block - 1) * vocab` draft logits after `anchor`.
-    pub fn draft_logits(
-        &mut self,
-        slot: u32,
-        anchor: u32,
-        start: usize,
-        ctx_pos: usize,
-        taps: &[f32],
-    ) -> Result<Vec<f32>, Error> {
-        let wants = Wants::role(&self.core.graph, 0, Role::Logits);
-        let outputs = self.run_taps(slot, anchor, start, ctx_pos, TapsIn::Host(taps), wants)?;
-        let raw = self.core.runner.read(outputs[0])?;
-        let logits = raw.floats().map_err(tessera_run::Error::from)?;
-        Ok(logits[..(self.block - 1) * self.vocab].to_vec())
     }
 
     pub(crate) fn run_taps(
@@ -681,8 +636,8 @@ fn run_dflash_req(
             }
             Ok(())
         },
-        |_, _, pos, _, _, taps| Ok((pos, taps, spec, 1.0f64, None::<Vec<f32>>)),
-        |_, drafter, (ctx_pos, pending, spec, last_pred, last_lp), start, anchor, remaining| {
+        |_, _, pos, _, _, taps| Ok((pos, taps, spec, None::<Vec<f32>>)),
+        |_, drafter, (ctx_pos, pending, spec, last_lp), start, anchor, remaining| {
             if remaining == 1 || start + block > max_ctx {
                 return Ok(None);
             }
@@ -696,22 +651,21 @@ fn run_dflash_req(
             if avail == 0 {
                 return Ok(None);
             }
-            let (k, pred) = spec.choose(lp.as_deref(), avail, drafts.len());
-            *last_pred = pred;
+            let k = spec.choose(lp.as_deref(), avail, drafts.len());
             *last_lp = lp;
             drafts.truncate(k);
             Ok(Some(drafts))
         },
         |_,
          _,
-         (ctx_pos, pending, spec, last_pred, last_lp),
+         (ctx_pos, pending, spec, last_lp),
          start,
          drafted,
          accepted,
          _,
          mut block_taps,
          stats| {
-            spec.observe(drafted, accepted, last_lp.as_deref(), *last_pred);
+            spec.observe(drafted, accepted, last_lp.as_deref());
             stats.dflash_steps += 1;
             let commit = 1 + accepted;
             *ctx_pos = start;

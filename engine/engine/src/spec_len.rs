@@ -133,10 +133,6 @@ pub struct SpecLen {
     pub pos_decay: f64,
     pub bucket_decay: f64,
     pub prior: f64,
-    rounds: u64,
-    chosen: [u64; MAX_K + 1],
-    pred_sum: f64,
-    got_sum: f64,
 }
 
 impl SpecLen {
@@ -156,10 +152,6 @@ impl SpecLen {
             pos_decay: 0.9,
             bucket_decay: 0.998,
             prior: 4.0,
-            rounds: 0,
-            chosen: [0; MAX_K + 1],
-            pred_sum: 0.0,
-            got_sum: 0.0,
         }
     }
 
@@ -194,41 +186,14 @@ impl SpecLen {
         self
     }
 
-    /// Sets allowed draft counts in `1..=max_k`.
-    pub fn with_levels(mut self, levels: &[usize]) -> Self {
-        let mut out: Vec<usize> = Vec::new();
-        for &k in levels {
-            if k >= 1 && k <= self.max_k {
-                out.push(k);
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        if !out.is_empty() {
-            self.levels = out;
-        }
-        self
-    }
-
     /// Returns a fresh estimator keeping policy and costs.
     pub fn fresh(&self) -> Self {
         Self {
-            adaptive: self.adaptive,
-            max_k: self.max_k,
-            levels: self.levels.clone(),
-            cost: self.cost,
-            seed: self.seed,
             pn: [0.0; MAX_K + 1],
             pk: [0.0; MAX_K + 1],
             bn: [[0.0; BUCKETS]; MAX_K + 1],
             bk: [[0.0; BUCKETS]; MAX_K + 1],
-            pos_decay: self.pos_decay,
-            bucket_decay: self.bucket_decay,
-            prior: self.prior,
-            rounds: 0,
-            chosen: [0; MAX_K + 1],
-            pred_sum: 0.0,
-            got_sum: 0.0,
+            ..self.clone()
         }
     }
 
@@ -242,14 +207,6 @@ impl SpecLen {
 
     pub fn levels(&self) -> &[usize] {
         &self.levels
-    }
-
-    pub fn rounds(&self) -> u64 {
-        self.rounds
-    }
-
-    pub fn chosen(&self) -> &[u64; MAX_K + 1] {
-        &self.chosen
     }
 
     /// Maps a draft log-probability to its confidence bucket.
@@ -306,59 +263,40 @@ impl SpecLen {
 
     /// Best expected tokens per ms across allowed levels.
     pub fn best_rate(&self, lp: Option<&[f32]>, n: usize, drafted: usize) -> f64 {
-        let limit = n.min(self.max_k);
-        if limit == 0 {
-            return 0.0;
-        }
-        if !self.adaptive {
-            return self.ratio(limit, lp, drafted.max(limit)).1;
-        }
-        let mut best = 0.0;
-        for &k in &self.levels {
-            if k > limit {
-                break;
-            }
-            let (_, r) = self.ratio(k, lp, drafted);
-            if r > best {
-                best = r;
-            }
-        }
-        if best == 0.0 {
-            self.ratio(limit, lp, drafted).1
-        } else {
-            best
-        }
+        self.pick(lp, n, drafted).1
     }
 
-    /// Picks `(k, expected_tokens)` to verify from `n` drafts.
-    pub fn choose(&self, lp: Option<&[f32]>, n: usize, drafted: usize) -> (usize, f64) {
+    /// Picks draft count `k` to verify from `n` drafts.
+    pub fn choose(&self, lp: Option<&[f32]>, n: usize, drafted: usize) -> usize {
+        self.pick(lp, n, drafted).0
+    }
+
+    /// Best `(k, tokens_per_ms)` across allowed levels up to `n`.
+    fn pick(&self, lp: Option<&[f32]>, n: usize, drafted: usize) -> (usize, f64) {
         let limit = n.min(self.max_k);
         if limit == 0 {
-            return (0, 1.0);
+            return (0, 0.0);
         }
         if !self.adaptive {
-            let (e, _) = self.ratio(limit, lp, drafted.max(limit));
-            return (limit, e);
+            return (limit, self.ratio(limit, lp, drafted.max(limit)).1);
         }
         let mut best_k = 0usize;
         let mut best_r = -1.0f64;
-        let mut best_e = 1.0f64;
         for &k in &self.levels {
             if k > limit {
                 break;
             }
-            let (e, r) = self.ratio(k, lp, drafted);
+            let r = self.ratio(k, lp, drafted).1;
             if r > best_r * (1.0 + 1e-9) {
                 best_r = r;
                 best_k = k;
-                best_e = e;
             }
         }
         if best_k == 0 {
-            let (e, _) = self.ratio(limit, lp, drafted);
-            return (limit, e);
+            (limit, self.ratio(limit, lp, drafted).1)
+        } else {
+            (best_k, best_r)
         }
-        (best_k, best_e)
     }
 
     /// Whether chaining another MTP draft past `n` improves rate.
@@ -366,42 +304,20 @@ impl SpecLen {
         if !self.adaptive {
             return n < self.max_k;
         }
-        let mut next = None;
-        for &k in &self.levels {
-            if k > n {
-                next = Some(k);
-                break;
-            }
-        }
-        let Some(next) = next else {
+        let Some(&next) = self.levels.iter().find(|&&k| k > n) else {
             return false;
         };
-        let mut now = 0.0f64;
-        for &k in &self.levels {
-            if k <= n {
-                let (_, r) = self.ratio(k, lp, n);
-                if r > now {
-                    now = r;
-                }
-            }
-        }
-        let mut e = 1.0;
-        let mut s = 1.0;
-        for j in 1..=next.min(MAX_K) {
-            let l = if j <= n {
-                lp.and_then(|arr| arr.get(j - 1).copied())
-            } else {
-                None
-            };
-            s *= self.cond(j, l);
-            e += s;
-        }
-        let ms = self.cost.verify_ms(next + 1) + self.cost.draft_ms(next);
-        e / ms > now
+        let now = if self.levels.iter().any(|&k| k <= n) {
+            self.best_rate(lp, n, n)
+        } else {
+            0.0
+        };
+        let known = lp.map(|arr| &arr[..arr.len().min(n)]);
+        self.ratio(next, known, next).1 > now
     }
 
     /// Updates estimates after verifying `k` drafts with `accepted` matches.
-    pub fn observe(&mut self, k: usize, accepted: usize, lp: Option<&[f32]>, predicted: f64) {
+    pub fn observe(&mut self, k: usize, accepted: usize, lp: Option<&[f32]>) {
         let k = k.min(MAX_K);
         if k == 0 {
             return;
@@ -428,10 +344,6 @@ impl SpecLen {
                 self.bk[j][b] += acc;
             }
         }
-        self.rounds += 1;
-        self.chosen[k] += 1;
-        self.pred_sum += predicted;
-        self.got_sum += (accepted + 1) as f64;
     }
 
     /// Encodes static policy settings for rank broadcast.
@@ -474,22 +386,5 @@ impl SpecLen {
         s.bucket_decay = bucket_decay;
         s.prior = prior;
         Some(s)
-    }
-
-    /// Deterministic FNV-1a decision hash for cross-rank verification.
-    pub fn decision_hash(lp: Option<&[f32]>, k: usize) -> u32 {
-        let mut h: u32 = 2166136261;
-        let mut add = |bytes: &[u8]| {
-            for &x in bytes {
-                h = (h ^ x as u32).wrapping_mul(16777619);
-            }
-        };
-        if let Some(lps) = lp {
-            for &v in lps {
-                add(&v.to_le_bytes());
-            }
-        }
-        add(&(k as u32).to_le_bytes());
-        h
     }
 }

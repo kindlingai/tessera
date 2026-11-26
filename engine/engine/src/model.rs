@@ -121,10 +121,8 @@ impl Model {
             Err(tessera_lower::Error::Unsupported(_)) => Executor::Interpreted(Vec::new()),
             planned => {
                 let mut runner = open(planned?, settings)?;
-                runner.launching(recipe.launch);
-                let device = Device::stored(runner.platform(), settings)
-                    .map_err(tessera_lower::Error::from)?
-                    .with(recipe);
+                let device =
+                    crate::ranks::stored_device(runner.as_mut(), recipe, settings, None, false)?;
                 Executor::Planned(Box::new(Planned {
                     runner,
                     device,

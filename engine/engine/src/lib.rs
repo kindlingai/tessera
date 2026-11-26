@@ -298,6 +298,22 @@ pub(crate) fn context_bucket(needed: usize, cap: usize) -> u64 {
     needed.max(256).next_power_of_two().min(cap) as u64
 }
 
+/// Pads each non-empty candidate list to power-of-two width `k`.
+fn pad_candidates(lists: &[Vec<u32>]) -> (Vec<u32>, usize) {
+    let k = lists
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .next_power_of_two();
+    let mut flat = Vec::with_capacity(lists.len() * k);
+    for list in lists {
+        // Repeats of the first id never win over it.
+        flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
+    }
+    (flat, k)
+}
+
 /// Rounds a launch row count up to compact buckets.
 pub(crate) fn row_bucket(n: usize) -> usize {
     if n <= 24 {
@@ -368,14 +384,11 @@ impl Engine {
         if let Some(at) = sparse {
             graph = tessera_graph::trim(&graph, at)?;
         }
-        let ranked = |device: Device| match place {
-            Some(place) => place.device(device),
-            None => device,
-        };
+        let mut device = Device::guess(settings).with(recipe);
         if let Some(place) = place {
             graph = place.split(&graph, (&recipe.pins, &recipe.sums))?;
+            device = place.device(device);
         }
-        let device = ranked(Device::guess(settings).with(recipe));
         let mut plans = Cache::default();
         let most = |name| graph.dims.iter().find(|d| d.name == name);
         let slots = most(Seqs).map_or(1, |d| d.size.max() as usize);
@@ -395,12 +408,7 @@ impl Engine {
             lanes::Lanes::new(page, table.len, slots, pages)
         });
         let mut runner = run(plan)?;
-        runner.launching(recipe.launch);
-        runner.profiling(settings.profile.is_some());
-        let device = Device::stored(runner.platform(), settings)
-            .map_err(tessera_lower::Error::from)?
-            .with(recipe);
-        let device = ranked(device);
+        let device = ranks::stored_device(runner.as_mut(), recipe, settings, place, true)?;
         let words = graph.dims.iter().find(|d| d.name == VocabWords);
         let words = words.map(|d| d.size.max() as usize);
         let edit_cap = graph.dims.iter().find(|d| d.name == EditWords);
@@ -593,6 +601,13 @@ impl Engine {
         self.launch(rows, &all, Head::Full(None))
     }
 
+    /// Reads `len` floats from `slot` on the active runner.
+    pub(crate) fn read_floats(&mut self, slot: Slot, len: usize) -> Result<Vec<f32>, Error> {
+        let raw = self.runner.read(slot)?;
+        let floats = raw.floats().map_err(tessera_run::Error::from)?;
+        Ok(floats[..len].to_vec())
+    }
+
     /// One launch of `rows`: likeliest tokens and tapped states.
     pub fn step_taps(&mut self, rows: &[Row]) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let width = self.taps.ok_or(Error::Taps)?;
@@ -601,9 +616,7 @@ impl Engine {
         let outputs = self.run(rows, &all, Head::Full(None), wants)?;
         let mut ids = self.runner.ids(outputs[0])?;
         ids.truncate(rows.len());
-        let raw = self.runner.read(outputs[1])?;
-        let taps = raw.floats().map_err(tessera_run::Error::from)?;
-        let taps = taps[..rows.len() * width].to_vec();
+        let taps = self.read_floats(outputs[1], rows.len() * width)?;
         self.report();
         Ok((ids, taps))
     }
@@ -624,12 +637,8 @@ impl Engine {
         let all: Vec<u32> = (0..rows.len() as u32).collect();
         let wants = Wants::roles(&self.graph, self.full, &[Role::Logits, Role::Taps]);
         let outputs = self.run(rows, &all, Head::Full(None), wants)?;
-        let raw_logits = self.runner.read(outputs[0])?;
-        let logits = raw_logits.floats().map_err(tessera_run::Error::from)?;
-        let logits = logits[..rows.len() * vocab].to_vec();
-        let raw_taps = self.runner.read(outputs[1])?;
-        let taps = raw_taps.floats().map_err(tessera_run::Error::from)?;
-        let taps = taps[..rows.len() * width].to_vec();
+        let logits = self.read_floats(outputs[0], rows.len() * vocab)?;
+        let taps = self.read_floats(outputs[1], rows.len() * width)?;
         self.report();
         Ok((logits, taps))
     }
@@ -667,9 +676,7 @@ impl Engine {
         let vocab = self.vocab.ok_or(Error::Scores)?;
         let wants = Wants::role(&self.graph, self.full, Role::Logits);
         let outputs = self.run(rows, &picks, Head::Full(None), wants)?;
-        let raw = self.runner.read(outputs[0])?;
-        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-        let logits = floats[..picks.len() * vocab].to_vec();
+        let logits = self.read_floats(outputs[0], picks.len() * vocab)?;
         self.report();
         Ok((logits, vocab))
     }
@@ -688,25 +695,16 @@ impl Engine {
                 _ => break,
             }
         }
-        let k = lists
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .next_power_of_two();
-        let gathered = picks.len().next_power_of_two() * k;
         let Some(words) = self.words else {
             return self.pick_unmasked(rows, &picks, allowed);
         };
-        // Past half the vocabulary, the full head reads less.
-        if self.sparse.is_some() && lists.len() == allowed.len() && 2 * gathered <= 32 * words {
-            let mut ids = Vec::with_capacity(lists.len() * k);
-            for list in &lists {
-                // Repeats of the first id never win over it.
-                ids.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
+        if self.sparse.is_some() && lists.len() == allowed.len() {
+            let (ids, k) = pad_candidates(&lists);
+            // Past half the vocabulary, the full head reads less.
+            if 2 * picks.len().next_power_of_two() * k <= 32 * words {
+                let at = self.launch(rows, &picks, Head::Sparse(ids, k))?;
+                return Ok(lists.iter().zip(at).map(|(l, i)| l[i as usize]).collect());
             }
-            let at = self.launch(rows, &picks, Head::Sparse(ids, k))?;
-            return Ok(lists.iter().zip(at).map(|(l, i)| l[i as usize]).collect());
         }
         let bits = allowed.iter().flat_map(|a| a.bits(words)).collect();
         self.launch(rows, &picks, Head::Full(Some(bits)))
@@ -763,21 +761,11 @@ impl Engine {
         if self.sparse.is_none() || ids.len() != picks.len() || !ids.iter().all(fits) {
             return Err(Error::Scores);
         }
-        let k = ids
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .next_power_of_two();
-        let mut flat = Vec::with_capacity(ids.len() * k);
-        for list in ids {
-            flat.extend(list.iter().chain(std::iter::repeat(&list[0])).take(k));
-        }
+        let (flat, k) = pad_candidates(ids);
         let head = Head::Sparse(flat, k);
         let wants = Wants::role(&self.graph, self.entry(&head)?, Role::Logits);
         let outputs = self.run(rows, picks, head, wants)?;
-        let all = self.runner.read(outputs[0])?;
-        let all = all.floats().map_err(tessera_run::Error::from)?;
+        let all = self.read_floats(outputs[0], ids.len() * k)?;
         let each = all.chunks(k).zip(ids);
         Ok(each.map(|(row, list)| row[..list.len()].to_vec()).collect())
     }

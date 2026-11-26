@@ -72,10 +72,7 @@ impl MtpDrafter {
             Some(place) => {
                 let shares = recipe.pins.shares(&graph);
                 let sharded = mtp::shard(&graph, &place.parts, &shares, place.moe_tp)?;
-                for w in sharded.whole.iter().filter(|_| place.rank == 0) {
-                    let path = &graph.weights[w.weight as usize].path;
-                    eprintln!("tessera: mtp {path:?} stays whole: {}", w.why);
-                }
+                place.log_whole(&graph, "mtp ", &sharded.whole);
                 place.resolve(sharded.graph, &recipe.sums)
             }
             None => graph,
@@ -447,7 +444,7 @@ pub(crate) fn draft_mtp(
     taps: &TapsBuf,
     start: usize,
     avail: usize,
-) -> Result<(Vec<u32>, f64), Error> {
+) -> Result<Vec<u32>, Error> {
     let chain_n = if !spec.is_adaptive() {
         avail
     } else {
@@ -483,9 +480,9 @@ pub(crate) fn draft_mtp(
         }
         out
     };
-    let (k, pred) = spec.choose(None, drafts.len(), drafts.len());
+    let k = spec.choose(None, drafts.len(), drafts.len());
     drafts.truncate(k);
-    Ok((drafts, pred))
+    Ok(drafts)
 }
 
 /// Native MTP speculative decoding over a target and MTP pair.
@@ -562,11 +559,11 @@ fn run_mtp_req(
         },
         |_, _, pos, prompt, anchor, taps| {
             let pending: Vec<u32> = prompt[pos + 1..].iter().copied().chain([anchor]).collect();
-            Ok((pos as u32, pending, taps, spec, 1.0f64))
+            Ok((pos as u32, pending, taps, spec))
         },
         |target,
          drafter,
-         (pending_start, pending_tokens, pending_taps, spec, last_pred),
+         (pending_start, pending_tokens, pending_taps, spec),
          start,
          _,
          remaining| {
@@ -577,7 +574,7 @@ fn run_mtp_req(
             if avail == 0 {
                 return Ok(None);
             }
-            let (drafts, pred) = draft_mtp(
+            let drafts = draft_mtp(
                 target,
                 drafter,
                 spec,
@@ -587,19 +584,18 @@ fn run_mtp_req(
                 start,
                 avail,
             )?;
-            *last_pred = pred;
             Ok(Some(drafts))
         },
         |_,
          _,
-         (pending_start, pending_tokens, pending_taps, spec, last_pred),
+         (pending_start, pending_tokens, pending_taps, spec),
          start,
          drafted,
          accepted,
          posterior,
          mut taps,
          stats| {
-            spec.observe(drafted, accepted, None, *last_pred);
+            spec.observe(drafted, accepted, None);
             stats.mtp_steps += 1;
             let commit = 1 + accepted;
             *pending_start = start as u32;

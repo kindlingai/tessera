@@ -758,8 +758,7 @@ impl Engine {
     ) -> Result<(Vec<f32>, usize, Option<TapsBuf>), Error> {
         let vocab = self.vocab.ok_or(Error::Scores)?;
         let (out, taps) = self.tapped(rows, picks, (Head::Full(None), peek), Role::Logits, taps)?;
-        let raw = self.runner.read(out)?;
-        let logits = raw.floats().map_err(RunError::from)?[..picks.len() * vocab].to_vec();
+        let logits = self.read_floats(out, picks.len() * vocab)?;
         self.report();
         Ok((logits, vocab, taps))
     }
@@ -834,9 +833,7 @@ impl Engine {
                 rows: rows.len(),
             }
         } else {
-            let raw = self.runner.read(slot)?;
-            let floats = raw.floats().map_err(RunError::from)?;
-            TapsBuf::Host(floats[..rows.len() * width].to_vec())
+            TapsBuf::Host(self.read_floats(slot, rows.len() * width)?)
         };
         Ok((out, Some(buf)))
     }

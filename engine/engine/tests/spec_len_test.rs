@@ -36,27 +36,23 @@ fn spec_len_policy() {
     let mut rank_b = SpecLen::adaptive(7, CostModel::dflash());
     let lps = [-0.01f32; 7];
     for _ in 0..40 {
-        high.observe(7, 7, Some(&lps), 8.0);
-        rank_b.observe(7, 7, Some(&lps), 8.0);
-        low.observe(7, 0, None, 1.0);
+        high.observe(7, 7, Some(&lps));
+        rank_b.observe(7, 7, Some(&lps));
+        low.observe(7, 0, None);
     }
-    let (kh, eh) = high.choose(Some(&lps), 7, 7);
-    let (kb, eb) = rank_b.choose(Some(&lps), 7, 7);
-    assert_eq!((kh, eh.to_bits()), (kb, eb.to_bits()));
-    assert_eq!(
-        SpecLen::decision_hash(Some(&lps), kh),
-        SpecLen::decision_hash(Some(&lps), kb)
-    );
+    let kh = high.choose(Some(&lps), 7, 7);
+    let kb = rank_b.choose(Some(&lps), 7, 7);
+    assert_eq!(kh, kb);
     assert_eq!(kh, 7);
-    assert_eq!(low.choose(None, 7, 7).0, 1);
+    assert_eq!(low.choose(None, 7, 7), 1);
 
     let trunc = SpecLen::fixed(3);
-    assert_eq!(trunc.choose(None, 7, 7).0, 3);
-    assert_eq!(trunc.choose(None, 2, 7).0, 2);
+    assert_eq!(trunc.choose(None, 7, 7), 3);
+    assert_eq!(trunc.choose(None, 2, 7), 2);
 
     let mut mtp_low = SpecLen::adaptive(3, CostModel::mtp()).with_mtp_seeds();
     for _ in 0..30 {
-        mtp_low.observe(2, 0, None, 1.0);
+        mtp_low.observe(2, 0, None);
     }
     assert!(!mtp_low.more(None, 1));
 }
@@ -70,9 +66,9 @@ fn dual_selector_switching() {
     for _ in 0..8 {
         let (use_mtp, _) = sel.decide_next(true);
         if !use_mtp {
-            sel.observe_dflash(7, 0, 1.0, Some(9), 9);
+            sel.observe_dflash(7, 0, None, Some(9), 9);
         } else {
-            sel.observe_mtp(3, 2, 3.0, &[9, 9, 9]);
+            sel.observe_mtp(3, 2, &[9, 9, 9]);
         }
     }
     assert!(sel.use_mtp(), "expected switch to MTP on prose");
@@ -82,12 +78,12 @@ fn dual_selector_switching() {
         let (use_mtp, _) = sel.decide_next(true);
         if use_mtp {
             if sel.should_probe(true) {
-                sel.start_probe(vec![7; 7]);
+                sel.start_probe(vec![7; 7], None);
                 probed = true;
             }
-            sel.observe_mtp(3, 0, 1.0, &[7]);
+            sel.observe_mtp(3, 0, &[7]);
         } else {
-            sel.observe_dflash(7, 7, 8.0, Some(1), 7);
+            sel.observe_dflash(7, 7, None, Some(1), 7);
         }
     }
     assert!(probed);
