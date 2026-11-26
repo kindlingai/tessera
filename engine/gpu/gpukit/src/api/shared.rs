@@ -11,7 +11,7 @@ macro_rules! shared_api {
         end_capture: ($end:ident, $end_label:literal),
         replay: ($replay:ident, $replay_label:literal),
         unload: ($module:ident, $exec:ident, $graph:ident, $stream:ident),
-        events: ($event:ident, $record:ident, $elapsed:ident, $unevent:ident),
+        events: ($event:ident, $record:ident, $wait_ev:ident, $elapsed:ident, $unevent:ident),
         global: $global:ident,
         load: ($load:ident, $load_label:literal),
         function: ($func:ident, $func_label:literal),
@@ -57,6 +57,13 @@ macro_rules! shared_api {
                     const { ::std::cell::Cell::new(::std::ptr::null_mut()) };
             }
             &CAPTURING
+        }
+
+        fn active_lane() -> &'static ::std::thread::LocalKey<::std::cell::Cell<u8>> {
+            ::std::thread_local! {
+                static LANE: ::std::cell::Cell<u8> = const { ::std::cell::Cell::new(0) };
+            }
+            &LANE
         }
 
         fn check(&self, code: ::std::ffi::c_int, what: &str) -> Result<(), $crate::Error> {
@@ -202,6 +209,28 @@ macro_rules! shared_api {
             let code = unsafe { (self.$record)(event, ::std::ptr::null_mut()) };
             self.check(code, stringify!($record))?;
             Ok(event)
+        }
+
+        fn sync_event(&self) -> Result<$crate::api::Handle, $crate::Error> {
+            self.out(stringify!($event), |e| unsafe { (self.$event)(e, 2) })
+        }
+
+        fn record_event(
+            &self,
+            event: $crate::api::Handle,
+            stream: $crate::api::Handle,
+        ) -> Result<(), $crate::Error> {
+            let code = unsafe { (self.$record)(event, stream) };
+            self.check(code, stringify!($record))
+        }
+
+        fn wait_event(
+            &self,
+            stream: $crate::api::Handle,
+            event: $crate::api::Handle,
+        ) -> Result<(), $crate::Error> {
+            let code = unsafe { (self.$wait_ev)(stream, event, 0) };
+            self.check(code, stringify!($wait_ev))
         }
 
         fn global(&self, module: $crate::api::Handle, name: &::std::ffi::CStr) -> Option<u64> {

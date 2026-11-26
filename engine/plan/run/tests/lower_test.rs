@@ -265,6 +265,7 @@ fn mapped(len: usize) -> Step {
         also: Vec::new(),
         covers: Vec::new(),
         zone: 0,
+        lane: 0,
         table: None,
     }
 }
@@ -891,4 +892,101 @@ fn router_pinned_adds() {
         .map(T)
         .find(|&t| tree.node(t).term == Term::Stage(Stage::Add));
     assert_eq!(tree.node(add.unwrap()).form, F32_FORM);
+}
+
+#[test]
+fn comm_overlaps_compute() {
+    use tessera_lower::kernels::AllReduce;
+    use tessera_lower::{Home, Op, Selected, Val, Value, assign, schedule};
+    use tessera_mem::DType;
+
+    let val = |home| Value {
+        len: 16,
+        home,
+        zone: 0,
+        form: F32_FORM,
+        dims: 1,
+        shape: [16, 0, 0, 0],
+        share: None,
+    };
+    let op = |kernel, reads, write| Op {
+        kernel,
+        rule: "test",
+        reads,
+        write,
+        also: Vec::new(),
+        covers: Vec::new(),
+        zone: 0,
+    };
+    let map = || KernelRef::new(Map::plain(Vec::new()));
+    let ar = || {
+        KernelRef::new(AllReduce {
+            len: 16,
+            wire: DType::F32,
+        })
+    };
+    let selected = Selected {
+        values: vec![
+            val(Home::Input(0)),
+            val(Home::Temp),
+            val(Home::Temp),
+            val(Home::Temp),
+            val(Home::Input(1)),
+            val(Home::Temp),
+            val(Home::Temp),
+            val(Home::Temp),
+        ],
+        ops: vec![
+            op(map(), vec![Val(0)], Val(1)),
+            op(ar(), vec![Val(1)], Val(2)),
+            op(map(), vec![Val(2)], Val(3)),
+            op(map(), vec![Val(4)], Val(5)),
+            op(ar(), vec![Val(5)], Val(6)),
+            op(map(), vec![Val(6)], Val(7)),
+        ],
+        inputs: vec![Val(0), Val(4)],
+        outputs: vec![(Val(3), vec![16]), (Val(7), vec![16])],
+        table: 0,
+        pool_pages: 0,
+        contested: Default::default(),
+        ways: Default::default(),
+        ranks: 2,
+        rank: 0,
+    };
+    let order = schedule(&selected);
+    let pos = |id| order.iter().position(|&x| x == id).unwrap();
+    assert!(pos(0) < pos(1) && pos(1) < pos(3) && pos(3) < pos(2));
+    // Comm input slot must stay live past concurrent compute.
+    let plan = assign(&selected, &order);
+    let (ar_a, comp_b) = (&plan.steps[pos(1)], &plan.steps[pos(3)]);
+    assert_eq!((ar_a.lane, comp_b.lane), (1, 0));
+    let (a_in, b_out) = (ar_a.reads[0], comp_b.write);
+    let overlap = a_in.buffer == b_out.buffer
+        && a_in.offset < b_out.offset + b_out.bytes()
+        && b_out.offset < a_in.offset + a_in.bytes();
+    assert!(!overlap, "comm input aliased concurrent compute output");
+    // Repeated comm layers must free inputs at join.
+    let mut vals = vec![val(Home::Input(0))];
+    let mut ops = Vec::new();
+    for k in 0..8u32 {
+        vals.push(val(Home::Temp));
+        vals.push(val(Home::Temp));
+        ops.push(op(map(), vec![Val(2 * k)], Val(2 * k + 1)));
+        ops.push(op(ar(), vec![Val(2 * k + 1)], Val(2 * k + 2)));
+    }
+    vals.push(val(Home::Temp));
+    ops.push(op(map(), vec![Val(16)], Val(17)));
+    let chain = Selected {
+        values: vals,
+        ops,
+        inputs: vec![Val(0)],
+        outputs: vec![(Val(17), vec![16])],
+        ..selected
+    };
+    let chain_plan = assign(&chain, &schedule(&chain));
+    let scratch_bytes = chain_plan.buffers[chain_plan.steps[0].write.buffer as usize];
+    assert!(
+        scratch_bytes <= 1024,
+        "comm scratch leaked: {scratch_bytes}"
+    );
 }

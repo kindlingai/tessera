@@ -86,5 +86,60 @@ fn dynamic_shared() {
     pool.release(out);
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn multi_lane_graph() {
+    use tessera_gpukit::cuda::{BufferPool, Context, ContextConfig, KernelArgs, launch_1d};
+
+    let ctx = match Context::new(ContextConfig::default()) {
+        Ok(ctx) => ctx,
+        Err(e) => return eprintln!("skipping cuda multi_lane_graph: {e}"),
+    };
+    let kernel = ctx.compile_kernel(SMOKE_CU, "saxpy").expect("compile");
+    let n = 1024usize;
+    let mut pool = BufferPool::new();
+    let dx = pool.allocate(&ctx, n * 4).expect("alloc x");
+    let da = pool.allocate(&ctx, n * 4).expect("alloc a");
+    let db = pool.allocate(&ctx, n * 4).expect("alloc b");
+    dx.write_f32(&vec![1.0f32; n]).expect("upload x");
+    da.write_f32(&vec![0.0f32; n]).expect("upload a");
+    db.write_f32(&vec![0.0f32; n]).expect("upload b");
+
+    let run_saxpy = |dst: u64, src: u64, alpha: f32| -> Result<(), tessera_gpukit::Error> {
+        let mut args = KernelArgs::new();
+        args.device_ptr(dst)
+            .device_ptr(src)
+            .f32(alpha)
+            .u32(n as u32);
+        launch_1d(&ctx, &kernel, n, &mut args)
+    };
+    // Fork lane 0 to 1, overlap work, then join.
+    let graph = ctx
+        .capture(|| -> Result<(), tessera_gpukit::Error> {
+            run_saxpy(da.device_ptr(), dx.device_ptr(), 2.0)?;
+            ctx.record_lane(0, 0)?;
+            ctx.wait_lane(1, 0)?;
+            ctx.set_lane(1);
+            run_saxpy(da.device_ptr(), dx.device_ptr(), 3.0)?;
+            ctx.record_lane(1, 1)?;
+            ctx.set_lane(0);
+            run_saxpy(db.device_ptr(), dx.device_ptr(), 7.0)?;
+            ctx.wait_lane(0, 1)?;
+            run_saxpy(da.device_ptr(), dx.device_ptr(), 4.0)?;
+            Ok(())
+        })
+        .expect("capture multi-lane graph");
+    ctx.replay(&graph).expect("replay");
+    ctx.synchronize().expect("sync");
+    let (mut ga, mut gb) = (vec![0.0f32; n], vec![0.0f32; n]);
+    da.read_f32(&mut ga).expect("read a");
+    db.read_f32(&mut gb).expect("read b");
+    assert!(ga.iter().all(|&v| (v - 9.0).abs() < 1e-6), "a[0]={}", ga[0]);
+    assert!(gb.iter().all(|&v| (v - 7.0).abs() < 1e-6), "b[0]={}", gb[0]);
+    pool.release(dx);
+    pool.release(da);
+    pool.release(db);
+}
+
 #[cfg(feature = "rocm")]
 smoke!(rocm);

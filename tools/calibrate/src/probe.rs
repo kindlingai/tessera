@@ -189,6 +189,7 @@ impl Probe {
             also: Vec::new(),
             covers: Vec::new(),
             zone: 0,
+            lane: 0,
             table: None,
         };
         Plan {

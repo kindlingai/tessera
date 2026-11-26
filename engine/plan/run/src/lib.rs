@@ -6,6 +6,9 @@ mod device;
 mod grid;
 mod held;
 mod kernels;
+mod lanes;
+#[cfg(test)]
+mod lanes_test;
 mod loopback;
 pub mod marks;
 #[cfg(test)]

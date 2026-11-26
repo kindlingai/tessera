@@ -160,7 +160,13 @@ impl Api for Runtime {
         end_capture: (hip_stream_end_capture, "hipStreamEndCapture"),
         replay: (hip_graph_launch, "hipGraphLaunch"),
         unload: (hip_module_unload, hip_graph_exec_destroy, hip_graph_destroy, hip_stream_destroy),
-        events: (hip_event_create, hip_event_record, hip_event_elapsed_time, hip_event_destroy),
+        events: (
+            hip_event_create,
+            hip_event_record,
+            hip_stream_wait_event,
+            hip_event_elapsed_time,
+            hip_event_destroy
+        ),
         global: hip_module_get_global,
         load: (hip_module_load_data, "hipModuleLoadData"),
         function: (hip_module_get_function, "hipModuleGetFunction"),
@@ -199,6 +205,17 @@ impl Api for Runtime {
         let flags = hip::HIP_STREAM_NON_BLOCKING;
         self.out("hipStreamCreateWithFlags", |s| unsafe {
             (self.hip_stream_create)(s, flags)
+        })
+    }
+
+    fn stream_high(&self) -> Result<Handle, Error> {
+        let (mut least, mut greatest) = (0, 0);
+        let rc = unsafe { (self.hip_stream_priority_range)(&mut least, &mut greatest) };
+        if rc != 0 {
+            return self.stream();
+        }
+        self.out("hipStreamCreateWithPriority", |s| unsafe {
+            (self.hip_stream_create_priority)(s, hip::HIP_STREAM_NON_BLOCKING, greatest)
         })
     }
 

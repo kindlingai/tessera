@@ -1,5 +1,6 @@
 //! Orders ops so the fewest temporary elements are live.
 
+use crate::kernels::crosses;
 use crate::select::{Home, Selected, Val};
 
 /// Facts an order needs about each value.
@@ -82,16 +83,37 @@ pub fn schedule(s: &Selected) -> Vec<usize> {
             }
         }
     }
+    let is_comm: Vec<bool> = s.ops.iter().map(|op| crosses(op.kernel.name())).collect();
+    let mut comm_live = vec![false; s.values.len()];
     let mut ready: Vec<usize> = (0..s.ops.len()).filter(|i| waiting[*i] == 0).collect();
     let mut lives = Lives::new(s);
     let mut order = Vec::with_capacity(s.ops.len());
     while !ready.is_empty() {
-        // Ties go to the op traced first.
+        // Issue comm ops immediately, overlap independent compute, then join.
+        let tier = |idx: usize| -> u8 {
+            if is_comm[idx] {
+                0
+            } else if s.ops[idx].reads.iter().any(|v| comm_live[v.0 as usize]) {
+                2
+            } else {
+                1
+            }
+        };
         let best = (0..ready.len())
-            .min_by_key(|at| (lives.growth(ready[*at]), ready[*at]))
+            .min_by_key(|at| (tier(ready[*at]), lives.growth(ready[*at]), ready[*at]))
             .expect("ready is not empty");
         let next = ready.swap_remove(best);
         lives.run(next);
+        if is_comm[next] {
+            comm_live[s.ops[next].write.0 as usize] = true;
+            for &v in &s.ops[next].also {
+                comm_live[v.0 as usize] = true;
+            }
+        } else {
+            for &v in &s.ops[next].reads {
+                comm_live[v.0 as usize] = false;
+            }
+        }
         order.push(next);
         for &r in &after[next] {
             waiting[r] -= 1;

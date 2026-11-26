@@ -59,6 +59,9 @@ pub(crate) mod entry {
     /// Blocks of a function one unit holds: threads, shared bytes.
     pub(crate) type Occupancy = unsafe extern "C" fn(*mut c_int, Handle, c_int, usize) -> c_int;
     pub(crate) type Stream = unsafe extern "C" fn(*mut Handle, u32) -> c_int;
+    pub(crate) type PriorityStream = unsafe extern "C" fn(*mut Handle, u32, c_int) -> c_int;
+    pub(crate) type PriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;
+    pub(crate) type StreamWait = unsafe extern "C" fn(Handle, Handle, u32) -> c_int;
     pub(crate) type Capture = unsafe extern "C" fn(Handle, c_int) -> c_int;
     pub(crate) type EndCapture = unsafe extern "C" fn(Handle, *mut Handle) -> c_int;
     pub(crate) type Replay = unsafe extern "C" fn(Handle, Handle) -> c_int;
@@ -135,6 +138,8 @@ pub trait Api: Sync + Sized + 'static {
     fn caches() -> &'static Caches<Context<Self>>;
     /// This thread's capture stream, or null.
     fn capturing() -> &'static LocalKey<Cell<Handle>>;
+    /// This thread's active execution lane.
+    fn active_lane() -> &'static LocalKey<Cell<u8>>;
     /// Lets this thread's launches overlap the one before.
     fn programmatic(_on: bool) {}
     /// Runs after the modules unload.
@@ -148,6 +153,9 @@ pub trait Api: Sync + Sized + 'static {
     }
     fn wait(&self, stream: Handle) -> Result<(), Error>;
     fn stream(&self) -> Result<Handle, Error>;
+    fn stream_high(&self) -> Result<Handle, Error> {
+        self.stream()
+    }
     fn begin_capture(&self, stream: Handle) -> Result<(), Error>;
     fn end_capture(&self, stream: Handle, graph: &mut Handle) -> Result<(), Error>;
     fn instantiate(&self, graph: Handle) -> Result<Handle, Error>;
@@ -191,6 +199,10 @@ pub trait Api: Sync + Sized + 'static {
     fn zero(&self, ptr: u64, size: usize) -> Result<(), Error>;
     /// A timing event, recorded on the default stream.
     fn event(&self) -> Result<Handle, Error>;
+    /// A non-timing event for cross-stream sync.
+    fn sync_event(&self) -> Result<Handle, Error>;
+    fn record_event(&self, event: Handle, stream: Handle) -> Result<(), Error>;
+    fn wait_event(&self, stream: Handle, event: Handle) -> Result<(), Error>;
     /// Milliseconds from `from` to `to`, once both are done.
     fn elapsed(&self, from: Handle, to: Handle) -> Result<f32, Error>;
     /// The address of `module`'s global `name`, if it has one.
@@ -256,6 +268,10 @@ struct Inner<A: Api> {
     exclusive: Mutex<()>,
     /// Events recorded since the last read, as addresses.
     stamps: Mutex<Vec<usize>>,
+    /// Secondary execution lane streams, as addresses.
+    lanes: Mutex<Vec<usize>>,
+    /// Reusable cross-lane sync events, as addresses.
+    lane_events: Mutex<Vec<usize>>,
     /// Made on first use.
     gate: Mutex<Option<Gate<A>>>,
 }
@@ -267,10 +283,20 @@ unsafe impl<A: Api> Sync for Inner<A> {}
 impl<A: Api> Drop for Inner<A> {
     fn drop(&mut self) {
         // Modules must unload before their context goes.
-        if let Ok(mut gate) = self.gate.lock()
-            && self.api.set_current(&self.own, self.device).is_ok()
-        {
-            gate.take();
+        if self.api.set_current(&self.own, self.device).is_ok() {
+            if let Ok(mut gate) = self.gate.lock() {
+                gate.take();
+            }
+            if let Ok(mut lanes) = self.lanes.lock() {
+                for s in lanes.drain(..) {
+                    self.api.destroy(Kind::Stream, s as Handle);
+                }
+            }
+            if let Ok(mut events) = self.lane_events.lock() {
+                for e in events.drain(..) {
+                    self.api.destroy(Kind::Event, e as Handle);
+                }
+            }
         }
         if let Ok(mut modules) = self.modules.lock() {
             modules.clear();
@@ -299,6 +325,8 @@ impl<A: Api> Context<A> {
             modules: Mutex::new(HashMap::new()),
             exclusive: Mutex::new(()),
             stamps: Mutex::new(Vec::new()),
+            lanes: Mutex::new(Vec::new()),
+            lane_events: Mutex::new(Vec::new()),
             gate: Mutex::new(None),
         }))
     }
@@ -351,9 +379,69 @@ impl<A: Api> Context<A> {
         f(self.0.api)
     }
 
-    /// Waits for the default stream, where all plain work runs.
+    /// Waits for the default stream and active lane streams.
     pub fn synchronize(&self) -> Result<(), Error> {
-        self.locked(|a| a.synchronize())
+        let extra: Vec<usize> = self
+            .0
+            .lanes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.locked(|a| {
+            a.synchronize()?;
+            for s in extra {
+                a.wait(s as Handle)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn stream_of(&self, api: &A, lane: u8) -> Result<Handle, Error> {
+        if lane == 0 {
+            return Ok(A::capturing().with(Cell::get));
+        }
+        let idx = (lane - 1) as usize;
+        let mut lanes = self.0.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        while lanes.len() <= idx {
+            lanes.push(api.stream_high()? as usize);
+        }
+        Ok(lanes[idx] as Handle)
+    }
+
+    fn event_of(&self, api: &A, slot: usize) -> Result<Handle, Error> {
+        let mut events = self.0.lane_events.lock().unwrap_or_else(|e| e.into_inner());
+        while events.len() <= slot {
+            events.push(api.sync_event()? as usize);
+        }
+        Ok(events[slot] as Handle)
+    }
+
+    /// Selects the active execution lane on this thread.
+    pub fn set_lane(&self, lane: u8) {
+        A::active_lane().with(|c| c.set(lane));
+    }
+
+    /// Active execution lane on this thread.
+    pub fn active_lane(&self) -> u8 {
+        A::active_lane().with(Cell::get)
+    }
+
+    /// Records sync event `slot` on `lane`.
+    pub fn record_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
+        self.locked(|a| {
+            let stream = self.stream_of(a, lane)?;
+            let ev = self.event_of(a, slot)?;
+            a.record_event(ev, stream)
+        })
+    }
+
+    /// Makes `lane` wait on sync event `slot`.
+    pub fn wait_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
+        self.locked(|a| {
+            let stream = self.stream_of(a, lane)?;
+            let ev = self.event_of(a, slot)?;
+            a.wait_event(stream, ev)
+        })
     }
 
     /// Records a timing event after the work queued so far.
@@ -422,7 +510,9 @@ impl<A: Api> Context<A> {
         };
         api.begin_capture(graph.stream)?;
         A::capturing().with(|c| c.set(graph.stream));
+        A::active_lane().with(|c| c.set(0));
         let recorded = record();
+        A::active_lane().with(|c| c.set(0));
         A::capturing().with(|c| c.set(std::ptr::null_mut()));
         // The capture ends either way, or the stream stays stuck.
         let ended = api.end_capture(graph.stream, &mut graph.graph);
@@ -539,12 +629,13 @@ impl<A: Api> Launch for Context<A> {
         self.locked(|api| {
             Self::opt_in(api, kernel, shared_bytes)?;
             let mut params = args.pointers();
+            let stream = self.stream_of(api, A::active_lane().with(Cell::get))?;
             api.launch(&Call {
                 kernel: kernel.raw,
                 grid: [grid.0, grid.1, grid.2],
                 block: [block.0, block.1, block.2],
                 shared_bytes,
-                stream: A::capturing().with(Cell::get),
+                stream,
                 params: params.as_mut_ptr(),
             })
         })
@@ -809,6 +900,26 @@ impl<A: Api> Device for Context<A> {
 
     fn graphs(&self) -> bool {
         true
+    }
+
+    fn has_lanes(&self) -> bool {
+        true
+    }
+
+    fn set_lane(&self, lane: u8) {
+        Context::set_lane(self, lane);
+    }
+
+    fn active_lane(&self) -> u8 {
+        Context::active_lane(self)
+    }
+
+    fn record_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
+        Context::record_lane(self, lane, slot)
+    }
+
+    fn wait_lane(&self, lane: u8, slot: usize) -> Result<(), Error> {
+        Context::wait_lane(self, lane, slot)
     }
 
     fn capturing(&self) -> bool {

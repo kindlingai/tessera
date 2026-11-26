@@ -167,6 +167,29 @@ pub trait Device: Clone + Send + Sync + 'static {
         false
     }
 
+    /// Whether this device supports concurrent execution lanes.
+    fn has_lanes(&self) -> bool {
+        false
+    }
+
+    /// Selects the active execution lane on this thread.
+    fn set_lane(&self, _lane: u8) {}
+
+    /// Active execution lane on this thread (`0` = default).
+    fn active_lane(&self) -> u8 {
+        0
+    }
+
+    /// Records sync event `slot` on `lane`.
+    fn record_lane(&self, _lane: u8, _slot: usize) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Makes `lane` wait on sync event `slot`.
+    fn wait_lane(&self, _lane: u8, _slot: usize) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Whether this thread is recording a device graph now.
     fn capturing(&self) -> bool {
         false

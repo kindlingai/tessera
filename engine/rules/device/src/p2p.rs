@@ -327,6 +327,10 @@ where
         let (sched, mut grid) = pick(n as usize * 4, self.ranks, self.schedule, self.cross);
         if grid > 1 {
             grid = self.large_grid;
+            if self.ctx.active_lane() != 0 {
+                let cap = (self.ctx.platform().units as u32 / 6).clamp(4, 16);
+                grid = grid.min(cap);
+            }
         }
         let mut args = KernelArgs::new();
         args.device_ptr(self.areas.device_ptr())

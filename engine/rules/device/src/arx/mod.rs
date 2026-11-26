@@ -119,7 +119,12 @@ where
         } else {
             THREADS * 8
         };
-        let grid = n.div_ceil(step).clamp(1, 48);
+        let max_grid = if self.ctx.active_lane() != 0 {
+            (self.ctx.platform().units as u32 / 6).clamp(4, 8)
+        } else {
+            48
+        };
+        let grid = n.div_ceil(step).clamp(1, max_grid);
         let kernel = match (two, wire) {
             (false, DType::Bf16) => &self.one_bf16,
             (false, DType::Fp8) => &self.one_fp8,

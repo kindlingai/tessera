@@ -5,6 +5,7 @@ use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared};
 use crate::grid::{self, Grid};
 use crate::held::Holds;
 use crate::kernels::Kernels;
+use crate::lanes::LaneSync;
 use crate::marks;
 use crate::overrides::{self, Overrides};
 use crate::paged::{self, Pager};
@@ -600,22 +601,38 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         steps: Range<usize>,
         mut sums: Option<&mut (dyn Sum + 'static)>,
     ) -> Result<(), Capture> {
-        for i in steps {
-            let step = &self.base.plan.steps[i];
-            if crosses(step.kernel.name())
-                && let Some(grid) = sums.as_deref_mut()
-            {
-                let at = |s: Slot| self.buffer(s).device_ptr() + s.at(0) as u64;
-                if !grid_cross(step, at(step.reads[0]), at(step.write), grid)? {
-                    return Err(Capture::Split(i));
+        let sync = match self.ctx.has_lanes() {
+            true => LaneSync::plan(&self.base.plan.steps[steps.clone()]),
+            false => LaneSync::default(),
+        };
+        sync.begin(self.ctx)?;
+        let start = steps.start;
+        let run = (|| -> Result<(), Capture> {
+            for i in steps {
+                let step = &self.base.plan.steps[i];
+                let rel = i - start;
+                sync.before(self.ctx, rel, step.lane)?;
+                if crosses(step.kernel.name())
+                    && let Some(grid) = sums.as_deref_mut()
+                {
+                    let at = |s: Slot| self.buffer(s).device_ptr() + s.at(0) as u64;
+                    if !grid_cross(step, at(step.reads[0]), at(step.write), grid)? {
+                        return Err(Capture::Split(i));
+                    }
+                } else {
+                    for launch in self.base.launches(i)? {
+                        self.launch(i, &launch)?;
+                    }
                 }
-                continue;
+                sync.after(self.ctx, rel, step.lane)?;
             }
-            for launch in self.base.launches(i)? {
-                self.launch(i, &launch)?;
-            }
+            sync.finish(self.ctx)?;
+            Ok(())
+        })();
+        if sync.active {
+            self.ctx.set_lane(0);
         }
-        Ok(())
+        run
     }
 
     /// Replans, pausing `sum` before any allocation or compilation.

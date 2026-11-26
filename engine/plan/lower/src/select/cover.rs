@@ -496,6 +496,7 @@ fn stand_in(d: &Draft) -> Step {
         also: vec![slot; d.also.len() + 1],
         covers: Vec::new(),
         zone: 0,
+        lane: 0,
         table: Some(slot),
     }
 }

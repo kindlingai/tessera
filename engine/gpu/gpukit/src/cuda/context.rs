@@ -184,7 +184,13 @@ impl Api for Driver {
         end_capture: (cu_stream_end_capture, "cuStreamEndCapture"),
         replay: (cu_graph_launch, "cuGraphLaunch"),
         unload: (cu_module_unload, cu_graph_exec_destroy, cu_graph_destroy, cu_stream_destroy),
-        events: (cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy),
+        events: (
+            cu_event_create,
+            cu_event_record,
+            cu_stream_wait_event,
+            cu_event_elapsed_time,
+            cu_event_destroy
+        ),
         global: cu_module_get_global,
         load: (cu_module_load_data, "cuModuleLoadData"),
         function: (cu_module_get_function, "cuModuleGetFunction"),
@@ -269,6 +275,17 @@ impl Api for Driver {
     fn stream(&self) -> Result<Handle, Error> {
         self.out("cuStreamCreate", |s| unsafe {
             (self.cu_stream_create)(s, CU_STREAM_NON_BLOCKING)
+        })
+    }
+
+    fn stream_high(&self) -> Result<Handle, Error> {
+        let (mut least, mut greatest) = (0, 0);
+        let rc = unsafe { (self.cu_ctx_stream_priority)(&mut least, &mut greatest) };
+        if rc != 0 {
+            return self.stream();
+        }
+        self.out("cuStreamCreateWithPriority", |s| unsafe {
+            (self.cu_stream_create_priority)(s, CU_STREAM_NON_BLOCKING, greatest)
         })
     }
 

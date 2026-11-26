@@ -1,7 +1,7 @@
 //! Packs values into contiguous arenas, for one op order.
 
 use crate::kernel::KernelRef;
-use crate::kernels::Map;
+use crate::kernels::{Map, crosses};
 use crate::plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step, pack_shape};
 use crate::select::{Home, Selected, Val, Value};
 use std::collections::BTreeMap;
@@ -97,6 +97,8 @@ struct Buffers<'a> {
     slots: Vec<Option<Slot>>,
     /// Per value: the position of its last reader.
     last: Vec<usize>,
+    /// Temp values freed at a later join step.
+    deferred: Vec<Vec<Val>>,
     /// One scratch arena per zone, made on first use.
     scratch: BTreeMap<u32, Scratch>,
 }
@@ -107,6 +109,30 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     for (at, &i) in order.iter().enumerate() {
         for v in &s.ops[i].reads {
             last[v.0 as usize] = at;
+        }
+    }
+    // Keep comm-lane inputs alive until compute joins on their output.
+    let mut extended = vec![false; s.values.len()];
+    for (at, &i) in order.iter().enumerate() {
+        let op = &s.ops[i];
+        if !crosses(op.kernel.name()) {
+            continue;
+        }
+        let join = order[at + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(d, &j)| {
+                let later = &s.ops[j];
+                let reads_out = later.reads.contains(&op.write)
+                    || op.also.iter().any(|w| later.reads.contains(w));
+                (!crosses(later.kernel.name()) && reads_out).then_some(at + 1 + d)
+            })
+            .unwrap_or(FOREVER);
+        for v in &op.reads {
+            if join > last[v.0 as usize] {
+                last[v.0 as usize] = join;
+                extended[v.0 as usize] = true;
+            }
         }
     }
     for (v, value) in s.values.iter().enumerate() {
@@ -123,6 +149,17 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
             last[v.0 as usize] = FOREVER;
         }
     }
+    let mut deferred = vec![Vec::new(); order.len()];
+    for (v, &end) in last.iter().enumerate() {
+        let val = Val(v as u32);
+        if extended[v]
+            && end < order.len()
+            && s.values[v].home == Home::Temp
+            && !s.ops[order[end]].reads.contains(&val)
+        {
+            deferred[end].push(val);
+        }
+    }
     let plan = Plan {
         id: Plan::fresh(),
         ranks: s.ranks,
@@ -134,6 +171,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
         plan,
         slots: vec![None; s.values.len()],
         last,
+        deferred,
         scratch: BTreeMap::new(),
     };
     b.pack_weights();
@@ -381,6 +419,7 @@ impl Buffers<'_> {
                     also: Vec::new(),
                     covers,
                     zone: op.zone,
+                    lane: 0,
                     table: self.plan.table,
                 });
                 reads[0] = copy;
@@ -407,6 +446,7 @@ impl Buffers<'_> {
             also,
             covers: op.covers.clone(),
             zone: op.zone,
+            lane: u8::from(crosses(op.kernel.name())),
             table: self.plan.table,
         });
         for (k, v) in op.reads.iter().enumerate() {
@@ -424,6 +464,12 @@ impl Buffers<'_> {
         for &v in &op.also {
             if self.last[v.0 as usize] <= at && self.s.values[v.0 as usize].home == Home::Temp {
                 self.free_scratch(self.slot(v));
+            }
+        }
+        let deferred = std::mem::take(&mut self.deferred[at]);
+        for v in deferred {
+            if let Some(slot) = self.slots[v.0 as usize] {
+                self.free_scratch(slot);
             }
         }
     }

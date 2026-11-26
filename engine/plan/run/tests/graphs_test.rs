@@ -321,6 +321,7 @@ fn copy_step(buffer: u32, len: usize) -> Step {
         also: Vec::new(),
         covers: Vec::new(),
         zone: 0,
+        lane: 0,
         table: None,
     }
 }
@@ -586,15 +587,19 @@ fn ranked_plan(scratch_bytes: usize) -> Plan {
     let a = Slot::floats(0, 4);
     let b = Slot::floats(1, 4);
     let c = Slot::floats(2, 8);
-    let step = |kernel, rule, reads, write| Step {
-        kernel,
-        rule,
-        reads,
-        write,
-        also: Vec::new(),
-        covers: Vec::new(),
-        zone: 0,
-        table: None,
+    let step = |kernel: KernelRef, rule, reads, write| {
+        let lane = u8::from(tessera_lower::kernels::crosses(kernel.name()));
+        Step {
+            kernel,
+            rule,
+            reads,
+            write,
+            also: Vec::new(),
+            covers: Vec::new(),
+            zone: 0,
+            lane,
+            table: None,
+        }
     };
     Plan {
         id: Plan::fresh(),

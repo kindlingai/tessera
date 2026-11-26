@@ -78,6 +78,8 @@ pub struct Step {
     pub covers: Vec<NodeId>,
     /// The zone it runs in.
     pub zone: u32,
+    /// Execution lane (`0` = compute, `1` = comm).
+    pub lane: u8,
     /// The plan's page table, when kept rows are paged.
     pub table: Option<Slot>,
 }
