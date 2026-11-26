@@ -50,16 +50,31 @@ macro_rules! cuda_rule {
 pub(crate) use cuda_rule;
 
 const KERNEL: &str = include_str!("linear.cu");
+const PF_KERNEL: &str = include_str!("trellis_pf.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
 const THREADS: usize = 256;
 const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
+const DTR_PF_SMEM: usize = 64 * 128 * 4;
+const DTR_PF_SCRATCH_TILE: usize = 512;
 
 pub(crate) fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "linear.kernel", KERNEL))
+}
+
+pub(crate) fn trellis_pf_source() -> &'static str {
+    static CUDA: OnceLock<&'static str> = OnceLock::new();
+    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "trellis_pf.kernel", PF_KERNEL))
+}
+
+fn trellis_pf_entry(entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", trellis_pf_source(), ""]),
+        entry,
+    }
 }
 
 #[cfg(test)]
@@ -101,18 +116,28 @@ fn dtr_ks(m: usize, n: usize, k: usize) -> usize {
     1
 }
 
-fn dtr_tile(m: usize) -> usize {
-    if m <= 8 {
+fn dtr_is_pf(t: &TrellisMma) -> bool {
+    t.ks == 1 && t.m > 32
+}
+
+fn dtr_tile(t: &TrellisMma) -> usize {
+    if t.m <= 8 {
         8
-    } else if m <= 16 {
+    } else if t.m <= 16 {
         16
+    } else if t.m <= 32 {
+        32
+    } else if t.ks == 1 && t.bits == 4 && t.book == 0 && t.turned && t.m > 512 {
+        128
+    } else if t.ks == 1 {
+        64
     } else {
         32
     }
 }
 
 fn dtr_entry(t: &TrellisMma) -> &'static str {
-    match (dtr_tile(t.m), t.bits, t.book, t.turned, t.ks > 1) {
+    match (dtr_tile(t), t.bits, t.book, t.turned, t.ks > 1) {
         (8, 4, 0, true, true) => "dtr_k4_t1s",
         (8, 4, 0, true, false) => "dtr_k4_t1",
         (8, 4, 0, false, true) => "dtr_k4_p1s",
@@ -120,9 +145,21 @@ fn dtr_entry(t: &TrellisMma) -> &'static str {
         (16, 4, 0, true, true) => "dtr_k4_t2s",
         (16, 4, 0, true, false) => "dtr_k4_t2",
         (32, 4, 0, true, false) => "dtr_k4_t4",
+        (64, 4, 0, true, false) => "dtr_k4_t8_mx",
+        (128, 4, 0, true, false) => "dtr_k4_t16_mx",
         (8, _, _, _, _) => "dtr_gen1",
         (16, _, _, _, _) => "dtr_gen2",
+        (64, _, _, _, _) => "dtr_gen8_mx",
         (_, _, _, _, _) => "dtr_gen4",
+    }
+}
+
+fn dtr_source(t: &TrellisMma) -> Source {
+    let entry = dtr_entry(t);
+    if dtr_is_pf(t) {
+        trellis_pf_entry(entry)
+    } else {
+        cuda_source_entry(entry)
     }
 }
 
@@ -141,9 +178,9 @@ fn dtr_needs(bytes: usize) -> Needs {
     work = self.m * self.n * self.k,
     accepts = mma_accepts,
     emits = f32_only,
-    needs = dtr_needs(DTR_SMEM),
+    needs = dtr_needs(if dtr_is_pf(self) { DTR_PF_SMEM } else { DTR_SMEM }),
     order = Order::PerConfig,
-    source = cuda_source_entry(dtr_entry(self)),
+    source = dtr_source(self),
     launches = mma_launches,
     load = mma_load,
     unproven,
@@ -164,10 +201,17 @@ fn mma_accepts(k: &TrellisMma, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
-    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(dtr_tile(t.m));
-    let mut reads = vec![t.form.bytes(t.n * t.k) as f64, (4 * t.m * t.k) as f64];
+    let groups = (t.n / BLOCK) * t.ks * t.m.div_ceil(dtr_tile(t));
+    let x_bytes = if dtr_is_pf(t) {
+        4 * (t.k / BLOCK) * t.m.div_ceil(8) * 272
+    } else {
+        4 * t.m * t.k
+    };
+    let mut reads = vec![t.form.bytes(t.n * t.k) as f64, x_bytes as f64];
     if t.turned {
-        reads.push((4 * t.k) as f64);
+        if !dtr_is_pf(t) {
+            reads.push((4 * t.k) as f64);
+        }
         if t.ks == 1 {
             reads.push((4 * t.n) as f64);
         }
@@ -186,9 +230,25 @@ fn mma_load(t: &TrellisMma, _: usize) -> Option<Load> {
 fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     let shape = Shape::Grid {
         across: (t.n / BLOCK) * t.ks,
-        down: t.m.div_ceil(dtr_tile(t.m)),
+        down: t.m.div_ceil(dtr_tile(t)),
         threads: THREADS,
     };
+    if dtr_is_pf(t) {
+        let svh = if t.turned { step.read(2) } else { step.read(0) };
+        let args = vec![
+            step.read(0),
+            step.read(1),
+            svh,
+            step.out(),
+            Arg::count(t.m),
+            Arg::count(t.n),
+            Arg::count(t.k),
+            Arg::value(&t.bits),
+            Arg::value(&t.book),
+            Arg::count(usize::from(t.turned)),
+        ];
+        return vec![Launch { args, shape }];
+    }
     let suh = if t.turned { step.read(2) } else { step.read(0) };
     let svh = if t.turned && t.ks == 1 {
         step.read(3)
@@ -278,8 +338,84 @@ fn step_args<'a>(tree: &'a Tree, t: T, term: Term) -> Option<&'a [T]> {
     (node.term == term && !tree.root(t)).then_some(&node.args[..])
 }
 
+/// Pre-rotates and packs activations for prefill trellis matmul.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "trellis_turn_x",
+    sizes = [self.m, self.k],
+    work = self.m * self.k,
+    accepts = turn_accepts,
+    emits = f32_only,
+    needs = dtr_needs(DTR_PF_SCRATCH_TILE * 4),
+    order = Order::PerConfig,
+    source = trellis_pf_entry("dtr_turn_x"),
+    launches = turn_launches,
+    load = turn_load,
+    unproven,
+)]
+struct TrellisTurnX {
+    m: usize,
+    k: usize,
+    turned: bool,
+}
+
+fn turn_accepts(_: &TrellisTurnX, _: usize, form: &dyn Stored) -> bool {
+    form.name() == "f32"
+}
+
+fn turn_load(t: &TrellisTurnX, _: usize) -> Option<Load> {
+    let groups = (t.k / BLOCK) * t.m.div_ceil(8);
+    let mut reads = vec![(4 * t.m * t.k) as f64];
+    if t.turned {
+        reads.push((4 * t.k) as f64);
+    }
+    Some(Load {
+        threads: groups * THREADS,
+        group: THREADS,
+        trips: 1.0,
+        reads,
+        written: (4 * groups * DTR_PF_SCRATCH_TILE) as f64,
+        flight: 512.0,
+        ..Load::default()
+    })
+}
+
+fn turn_launches(t: &TrellisTurnX, step: &Step) -> Vec<Launch> {
+    let shape = Shape::Grid {
+        across: t.k / BLOCK,
+        down: t.m.div_ceil(8),
+        threads: THREADS,
+    };
+    let suh = if t.turned { step.read(1) } else { step.read(0) };
+    let args = vec![
+        step.read(0),
+        suh,
+        step.out(),
+        Arg::count(t.m),
+        Arg::count(t.k),
+        Arg::count(usize::from(t.turned)),
+    ];
+    vec![Launch { args, shape }]
+}
+
 fn trellis_drafts(t: TrellisMma, x: T, w: T, suh: Option<T>, svh: Option<T>) -> Vec<Draft> {
-    let (m, n, ks, turned) = (t.m, t.n, t.ks, t.turned);
+    let (m, n, k, ks, turned) = (t.m, t.n, t.k, t.ks, t.turned);
+    if dtr_is_pf(&t) {
+        let mut t_reads = vec![Read::Node(x)];
+        if let Some(u) = suh {
+            t_reads.push(Read::Node(u));
+        }
+        let mut m_reads = vec![Read::Draft(0), Read::Node(w)];
+        if let Some(v) = svh {
+            m_reads.push(Read::Node(v));
+        }
+        let turn = TrellisTurnX { m, k, turned };
+        let scratch = (k / BLOCK) * m.div_ceil(8) * DTR_PF_SCRATCH_TILE;
+        return vec![
+            Draft::new(turn, t_reads, scratch),
+            Draft::new(t, m_reads, m * n),
+        ];
+    }
     if ks == 1 {
         let mut reads = vec![x, w];
         if let (Some(u), Some(v)) = (suh, svh) {

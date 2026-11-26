@@ -71,84 +71,19 @@ TESSERA_FN void note_hit(const u8* base, u32 m) {
 
 #if defined(TESSERA_CUDA)
 
-TESSERA_FN float f16_to_f32(u32 h) {
-    float out;
-    u16 bits = static_cast<u16>(h);
-    asm("{.reg .b16 tmp; mov.b16 tmp, %1; cvt.f32.f16 %0, tmp;}" : "=f"(out) : "h"(bits));
-    return out;
-}
-
-TESSERA_FN u32 f32x2_to_f16x2(float lo, float hi) {
-    u32 packed;
-    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(packed) : "f"(hi), "f"(lo));
-    return packed;
-}
-
+TESSERA_FN float f16_to_f32(u32 h) { float out; u16 bits = static_cast<u16>(h); asm("{.reg .b16 tmp; mov.b16 tmp, %1; cvt.f32.f16 %0, tmp;}" : "=f"(out) : "h"(bits)); return out; }
+TESSERA_FN u32 f32x2_to_f16x2(float lo, float hi) { u32 packed; asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(packed) : "f"(hi), "f"(lo)); return packed; }
 // Rounds two f16 values to E4M3, saturated at 448.
-TESSERA_FN u32 narrow_f16x2_e4m3(u32 h) {
-    u32 out;
-    asm("{.reg .b16 q; cvt.rn.satfinite.e4m3x2.f16x2 q, %1; cvt.rn.f16x2.e4m3x2 %0, q;}"
-        : "=r"(out)
-        : "r"(h));
-    return out;
-}
-
-TESSERA_FN float2 e4m3x2_to_f32x2(u32 packed) {
-    u32 h;
-    u16 q = static_cast<u16>(packed);
-    asm("{.reg .b16 tmp; mov.b16 tmp, %1; cvt.rn.f16x2.e4m3x2 %0, tmp;}" : "=r"(h) : "h"(q));
-    return make_float2(f16_to_f32(h & 0xFFFFu), f16_to_f32(h >> 16u));
-}
-
-TESSERA_FN float e4m3_to_f32(u32 byte) {
-    return e4m3x2_to_f32x2(byte & 0xFFu).x;
-}
-
-TESSERA_FN u8 f32_to_e4m3(float v) {
-    u16 out;
-    asm("{.reg .b16 tmp; cvt.rn.satfinite.e4m3x2.f32 tmp, %1, %1; mov.b16 %0, tmp;}"
-        : "=h"(out)
-        : "f"(v));
-    return static_cast<u8>(out & 0xFFu);
-}
-
-TESSERA_FN u16 f32_to_bf16(float v) {
-    u16 out;
-    asm("{.reg .b16 tmp; cvt.rn.bf16.f32 tmp, %1; mov.b16 %0, tmp;}" : "=h"(out) : "f"(v));
-    return out;
-}
-
-TESSERA_FN u32 shf_l(u32 lo, u32 hi, u32 shift) {
-    u32 out;
-    asm("shf.l.clamp.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(lo), "r"(hi), "r"(shift));
-    return out;
-}
-
-TESSERA_FN u32 prmt(u32 a, u32 b, u32 sel) {
-    u32 out;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(a), "r"(b), "r"(sel));
-    return out;
-}
-
-TESSERA_FN u32 ld_nc_u32(const u8* p) {
-    u32 out;
-    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(out) : "l"(p));
-    return out;
-}
-
-TESSERA_FN void ld_nc_v4(const u8* p, u32 dst[4]) {
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
-                 : "l"(p));
-}
-
-TESSERA_FN float4 ld_cg_f4(const float* p) {
-    float4 out;
-    asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];"
-                 : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w)
-                 : "l"(p));
-    return out;
-}
+TESSERA_FN u32 narrow_f16x2_e4m3(u32 h) { u32 out; asm("{.reg .b16 q; cvt.rn.satfinite.e4m3x2.f16x2 q, %1; cvt.rn.f16x2.e4m3x2 %0, q;}" : "=r"(out) : "r"(h)); return out; }
+TESSERA_FN float2 e4m3x2_to_f32x2(u32 packed) { u32 h; u16 q = static_cast<u16>(packed); asm("{.reg .b16 tmp; mov.b16 tmp, %1; cvt.rn.f16x2.e4m3x2 %0, tmp;}" : "=r"(h) : "h"(q)); return make_float2(f16_to_f32(h & 0xFFFFu), f16_to_f32(h >> 16u)); }
+TESSERA_FN float e4m3_to_f32(u32 byte) { return e4m3x2_to_f32x2(byte & 0xFFu).x; }
+TESSERA_FN u8 f32_to_e4m3(float v) { u16 out; asm("{.reg .b16 tmp; cvt.rn.satfinite.e4m3x2.f32 tmp, %1, %1; mov.b16 %0, tmp;}" : "=h"(out) : "f"(v)); return static_cast<u8>(out & 0xFFu); }
+TESSERA_FN u16 f32_to_bf16(float v) { u16 out; asm("{.reg .b16 tmp; cvt.rn.bf16.f32 tmp, %1; mov.b16 %0, tmp;}" : "=h"(out) : "f"(v)); return out; }
+TESSERA_FN u32 shf_l(u32 lo, u32 hi, u32 shift) { u32 out; asm("shf.l.clamp.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(lo), "r"(hi), "r"(shift)); return out; }
+TESSERA_FN u32 prmt(u32 a, u32 b, u32 sel) { u32 out; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(out) : "r"(a), "r"(b), "r"(sel)); return out; }
+TESSERA_FN u32 ld_nc_u32(const u8* p) { u32 out; asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(out) : "l"(p)); return out; }
+TESSERA_FN void ld_nc_v4(const u8* p, u32 dst[4]) { asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3]) : "l"(p)); }
+TESSERA_FN float4 ld_cg_f4(const float* p) { float4 out; asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w) : "l"(p)); return out; }
 
 // Register-only 128-point Walsh-Hadamard transform over one warp.
 TESSERA_FN void wht128(float v[4], float scale) {
@@ -219,50 +154,47 @@ TESSERA_FN lane_map map_lane(u32 lane) {
     return {q, (q + 1u) % words, (q + 2u) % words, start & 31u};
 }
 
-template <u32 BOOK>
+template <u32 BOOK, bool E4M3 = false>
 TESSERA_FN u32 decode_pair(u32 a, u32 b) {
+    u32 out;
     if constexpr (BOOK == BOOK_MUL1) {
-        u32 sx, sy, v;
-        asm("dp4a.u32.u32 %0, %1, %2, %3;"
-            : "=r"(sx)
-            : "r"(a * MUL1), "r"(0x01010101u), "r"(0x6400u));
-        asm("dp4a.u32.u32 %0, %1, %2, %3;"
-            : "=r"(sy)
-            : "r"(b * MUL1), "r"(0x01010101u), "r"(0x6400u));
+        u32 sx, sy;
+        asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sx) : "r"(a * MUL1), "r"(0x01010101u), "r"(0x6400u));
+        asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sy) : "r"(b * MUL1), "r"(0x01010101u), "r"(0x6400u));
         asm("fma.rn.f16x2 %0, %1, %2, %3;"
-            : "=r"(v)
+            : "=r"(out)
             : "r"(prmt(sx, sy, 0x5410u)), "r"(0x1EEE1EEEu), "r"(0xC931C931u));
-        return narrow_f16x2_e4m3(v);
     } else {
-        u32 x = a * MCG, y = b * MCG, sum;
-        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-            : "=r"(x)
-            : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-        asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-            : "=r"(y)
-            : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+        u32 x = a * MCG, y = b * MCG;
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;" : "=r"(x) : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+        asm("lop3.b32 %0, %1, %2, %3, 0x6A;" : "=r"(y) : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
         // Pair sums use FMA, not ALU: this decode is ALU-bound.
         asm("{.reg .b16 xl, xh, yl, yh; .reg .b32 xhh, yll, yhh;\n"
             " mov.b32 {xl, xh}, %1; mov.b32 {yl, yh}, %2;\n"
             " mov.b32 xhh, {xh, xh}; mov.b32 yll, {yl, yl}; mov.b32 yhh, {yh, yh};\n"
-            " fma.rn.f16x2 %0, xhh, %3, %1;\n"
-            " fma.rn.f16x2 %0, yll, %4, %0;\n"
-            " fma.rn.f16x2 %0, yhh, %4, %0;}"
-            : "=r"(sum)
+            " fma.rn.f16x2 %0, xhh, %3, %1; fma.rn.f16x2 %0, yll, %4, %0; fma.rn.f16x2 %0, yhh, %4, %0;}"
+            : "=r"(out)
             : "r"(x), "r"(y), "r"(0xBC003C00u), "r"(0x3C000000u));
-        return narrow_f16x2_e4m3(sum);
     }
+    if constexpr (E4M3) {
+        u32 r;
+        asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.u32.u16 %0, t;}" : "=r"(r) : "r"(out));
+        return r;
+    }
+    return narrow_f16x2_e4m3(out);
 }
 
+template <bool E4M3 = false>
 TESSERA_FN u32 decode_pmcgx(u32 w) {
     u32 x = w * MCG, y = w * PMCG2, sum;
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(x)
-        : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
-    asm("lop3.b32 %0, %1, %2, %3, 0x6A;"
-        : "=r"(y)
-        : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;" : "=r"(x) : "r"(x), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
+    asm("lop3.b32 %0, %1, %2, %3, 0x6A;" : "=r"(y) : "r"(y), "r"(0x8FFF8FFFu), "r"(0x3B603B60u));
     asm("add.rn.f16x2 %0, %1, %2;" : "=r"(sum) : "r"(x), "r"(prmt(y, y, 0x1032u)));
+    if constexpr (E4M3) {
+        u32 r;
+        asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.u32.u16 %0, t;}" : "=r"(r) : "r"(sum));
+        return r;
+    }
     return narrow_f16x2_e4m3(sum);
 }
 
@@ -446,6 +378,19 @@ TESSERA_FN void blk_stream(const u8*& gb, u64 sG, u32 c0, u32 nb, u32 total, u32
     }
 }
 
+// Stores unturned MMA accumulators directly to row-major output.
+template <u32 NT>
+TESSERA_FN void store_plain_acc(const float acc[NT][4], float* out, u32 m, u32 n, u32 r0, u32 ob,
+                                u32 j, u32 lane) {
+    u32 ob0 = ob << 7u, col = (j << 4u) + (lane >> 2u), c = lane & 3u;
+#pragma unroll
+    for (u32 ti = 0u; ti < NT; ti++) {
+        u32 r = r0 + (ti << 3u) + (c << 1u);
+        if (r < m) { out[u64(r) * n + ob0 + col] = acc[ti][0]; out[u64(r) * n + ob0 + col + 8u] = acc[ti][2]; }
+        if (r + 1u < m) { out[u64(r + 1u) * n + ob0 + col] = acc[ti][1]; out[u64(r + 1u) * n + ob0 + col + 8u] = acc[ti][3]; }
+    }
+}
+
 // Sums hi+lo accumulators for `n` rows into `buf`.
 TESSERA_FN void store_acc(const float acc[8][4], u32 n, u32 lane, float* buf) {
     u32 r = lane & 3u;
@@ -485,6 +430,89 @@ TESSERA_FN float half_to_f32(u32 h) {
 TESSERA_FN float narrow_f32(float v) {
     return f16_to_f32(narrow_f16x2_e4m3(f32x2_to_f16x2(v, v)) & 0xFFFFu);
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+constexpr u32 MX8_TILE = 272u;
+
+TESSERA_FN u32 mx_scale(float amax, float& inv) {
+    u32 u = __float_as_uint(__fmul_rn(amax, 0.002232142857f));
+    int e = (amax == 0.0f) ? 0 : (int(u >> 23u) - 127 + ((u & 0x7FFFFFu) != 0u ? 1 : 0));
+    e = e < -126 ? -126 : (e > 127 ? 127 : e);
+    inv = __uint_as_float(u32(127 - e) << 23u);
+    return u32(e + 127);
+}
+
+TESSERA_FN u16 f2_e4m3x2(float a, float b) {
+    u16 r;
+    asm("{.reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; mov.b16 %0, t;}" : "=h"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+TESSERA_FN void mma_mx8(float d[4], const u32 a[4], const u32 b[2], u32 sa, u32 sb) {
+    const u16 z = 0u;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "h"(z), "h"(z),
+          "r"(sb), "h"(z), "h"(z));
+}
+
+template <u32 K, u32 BOOK>
+TESSERA_FN void decode_word_e4m3(u32 raw, const word_map& wm, u32& r_lo, u32& r_hi) {
+    u32 a = __shfl_sync(0xFFFFFFFFu, raw, wm.i0);
+    u32 b = (K == 4u) ? raw : __shfl_sync(0xFFFFFFFFu, raw, wm.i1);
+    u32 s0 = (K == 4u) ? 20u : wm.sh;
+    if constexpr (BOOK == BOOK_PMCGX) {
+        u32 sp = s0 - (4u - K), hi = shf_l(b, a, sp), lo = b << sp;
+        r_lo = decode_pmcgx<true>(shf_l(lo, hi, 0u) >> 12u) | (decode_pmcgx<true>(shf_l(lo, hi, 2u * K) >> 12u) << 16u);
+        r_hi = decode_pmcgx<true>(shf_l(lo, hi, 4u * K) >> 12u) | (decode_pmcgx<true>(shf_l(lo, hi, 6u * K) >> 12u) << 16u);
+    } else {
+        u32 hi = shf_l(b, a, s0), lo = b << s0, st[8];
+#pragma unroll
+        for (u32 s = 0u; s < 8u; s++) st[s] = shf_l(lo, hi, K * s) >> 16u;
+        r_lo = decode_pair<BOOK, true>(st[0], st[1]) | (decode_pair<BOOK, true>(st[2], st[3]) << 16u);
+        r_hi = decode_pair<BOOK, true>(st[4], st[5]) | (decode_pair<BOOK, true>(st[6], st[7]) << 16u);
+    }
+}
+
+// Quantizes one 128-vector into permuted-K MXFP8 B-fragments.
+TESSERA_FN void store_bfrag_mx8(u32* tile, u32 row, u32 lane, const float v[4]) {
+    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+    for (u32 off = 4u; off > 0u; off >>= 1u) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off, 8));
+    float inv;
+    u32 sb = mx_scale(amax, inv), ks32 = lane >> 3u, sub = lane & 7u;
+    u32 reg = sub >> 2u, hi_half = (sub >> 1u) & 1u, t0 = (sub & 1u) << 1u;
+    u16* p = reinterpret_cast<u16*>(tile + ((ks32 * 32u + row * 4u + t0) * 2u + reg));
+    p[hi_half] = f2_e4m3x2(v[0] * inv, v[1] * inv);
+    p[4u + hi_half] = f2_e4m3x2(v[2] * inv, v[3] * inv);
+    if (sub == 0u) reinterpret_cast<u8*>(tile + 256u)[ks32 * 8u + row] = static_cast<u8>(sb);
+}
+
+// Decodes one staged 64-tile block with Blackwell m16n8k32 MXFP8 MMA.
+template <u32 K, u32 BOOK, u32 NT>
+TESSERA_FN void blk_mma_mx8(const u32* wtiles, const u32* btab, u32 j, u32 lane,
+                            const word_map& wm, float acc[NT][4]) {
+    constexpr u32 TW = 8u * K;
+    u32 g = lane >> 2u;
+#pragma unroll
+    for (u32 p = 0u; p < 4u; p++) {
+        u32 u0 = p << 1u, u1 = u0 + 1u, fa[4];
+        u32 raw0 = (K == 4u || lane < TW) ? wtiles[(u0 * 8u + j) * TW + lane] : 0u;
+        u32 raw1 = (K == 4u || lane < TW) ? wtiles[(u1 * 8u + j) * TW + lane] : 0u;
+        decode_word_e4m3<K, BOOK>(raw0, wm, fa[0], fa[1]);
+        decode_word_e4m3<K, BOOK>(raw1, wm, fa[2], fa[3]);
+#pragma unroll
+        for (u32 ti = 0u; ti < NT; ti++) {
+            const u32* tile = btab + ti * MX8_TILE;
+            uint2 b2 = *reinterpret_cast<const uint2*>(tile + p * 64u + (lane << 1u));
+            u32 fb[2] = {b2.x, b2.y}, sb = reinterpret_cast<const u8*>(tile + 256u)[p * 8u + g];
+            mma_mx8(acc[ti], fa, fb, 127u, sb);
+        }
+    }
+}
+#endif
 
 #else
 
