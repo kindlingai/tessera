@@ -1,18 +1,16 @@
 //! Multi-slot DFlash decoding and solo DFlash/MTP promotion.
 
 use crate::batch_spec::{
-    ActiveSeq, Admitted, BatchMtp, DEFAULT_CHUNK, DraftJob, RoundHost, batch_methods, drive_follow,
-    drive_step, keep_slots, queue_request, retire_from, verify_rows,
+    ActiveSeq, Admitted, BatchCore, BatchMtp, DraftJob, RoundHost, batch_methods, drive_follow,
+    drive_step, notify_kept, prefill_len, queue_request, retire_finished, retire_from, verify_rows,
 };
-use crate::dual::{DualSelector, run_dflash, split_taps};
-use crate::kept::Kept;
-use crate::mtp_draft::MtpDrafter;
-use crate::sample::Sampler;
+use crate::dual::{DualSelector, DualState, DualStep, split_taps};
+use crate::mtp_draft::{MtpDrafter, flush_mtp, take_cols};
 use crate::schedule::Sink;
 use crate::spec_len::{CostModel, SpecLen};
-use crate::spec_loop::{TapsBuf, TapsIn, fnv_u32, span};
+use crate::spec_loop::{TapsBuf, TapsIn, span};
 use crate::speculate::Drafter;
-use crate::{Engine, Error, Event, Request, Row};
+use crate::{Engine, Error, Request, Row};
 use std::collections::VecDeque;
 
 /// Context rows retained per slot for DFlash tail promotion.
@@ -28,22 +26,6 @@ pub(crate) struct DualPeer<'a> {
     pub(crate) d_width: usize,
     pub(crate) m_width: usize,
     pub(crate) block: usize,
-}
-
-/// Per-sequence state while decoding solo with DFlash and MTP.
-pub(crate) struct SoloState {
-    pub(crate) selector: DualSelector,
-    /// Target position mapped to DFlash KV position zero.
-    pub(crate) d_base: usize,
-    pub(crate) d_ctx_pos: usize,
-    pub(crate) d_pending: Vec<f32>,
-    /// Next target position not yet written into MTP KV.
-    pub(crate) m_start: u32,
-    pub(crate) m_tokens: Vec<u32>,
-    pub(crate) m_taps: Vec<f32>,
-    pub(crate) round_mtp: bool,
-    pub(crate) last_lp: Option<Vec<f32>>,
-    pub(crate) last_mtp_d1: Option<u32>,
 }
 
 /// Appends `src` rows to `buf`, keeping at most `DFLASH_TAIL_WIN` rows.
@@ -82,33 +64,19 @@ impl<'a> BatchMtp<'a> {
         if width != d_width + m_width {
             return Err(Error::Rows);
         }
-        let slots = target.slots().min(drafter.slots());
         let max_ctx = target
             .context()
             .min(drafter.context())
             .min(dflash.context());
         let block = dflash.block();
-        let free = (0..slots as u32).rev().collect();
-        Ok(Self {
-            target,
-            drafter,
-            dual: Some(DualPeer {
-                dflash,
-                selector,
-                d_width,
-                m_width,
-                block,
-            }),
-            depth,
-            prefill_chunk: crate::batch_spec::DEFAULT_CHUNK,
-            max_ctx,
-            waiting: VecDeque::new(),
-            prefilling: VecDeque::new(),
-            active: Vec::new(),
-            free,
-            kept: None,
-            hash: 2166136261,
-        })
+        let peer = DualPeer {
+            dflash,
+            selector,
+            d_width,
+            m_width,
+            block,
+        };
+        Ok(Self::init(target, drafter, Some(peer), depth, max_ctx))
     }
 
     /// Flushes deferred MTP rows and switches to shared MTP.
@@ -117,7 +85,14 @@ impl<'a> BatchMtp<'a> {
             return Ok(());
         };
         let slot = self.active[0].slot;
-        self.flush_mtp(slot, solo.m_start, &solo.m_tokens, &solo.m_taps)?;
+        flush_mtp(
+            self.drafter,
+            slot,
+            solo.m_start,
+            &solo.m_tokens,
+            &solo.m_taps,
+            self.core.prefill_chunk,
+        )?;
         self.active[0].mtp_valid = solo.m_start as usize + solo.m_tokens.len();
         self.active[0].drafts.truncate(self.depth);
         if let Some(peer) = &self.dual {
@@ -143,47 +118,18 @@ impl<'a> BatchMtp<'a> {
             let raw = std::mem::take(&mut p.d_buf);
             push_tail(&mut p.d_buf, &raw, peer.d_width);
         }
-        self.flush_mtp(slot, skip as u32, &m_toks, &m_taps)?;
+        flush_mtp(
+            self.drafter,
+            slot,
+            skip as u32,
+            &m_toks,
+            &m_taps,
+            self.core.prefill_chunk,
+        )?;
         if let Some(p) = self.prefilling.front_mut() {
             p.mtp_valid = skip + m_toks.len();
         }
         Ok(())
-    }
-
-    /// Feeds deferred `(tokens, taps)` chunks into `MtpDrafter` for `slot`.
-    pub(crate) fn flush_mtp(
-        &mut self,
-        slot: u32,
-        mut pos0: u32,
-        tokens: &[u32],
-        taps: &[f32],
-    ) -> Result<Option<u32>, Error> {
-        if tokens.is_empty() {
-            return Ok(None);
-        }
-        let m_width = self.drafter.hidden();
-        let wants = self.drafter.wants();
-        let mut off = 0usize;
-        let mut last_tok = None;
-        while off < tokens.len() {
-            let len = (tokens.len() - off).min(self.prefill_chunk);
-            let h = &taps[off * m_width..(off + len) * m_width];
-            let outs = self.drafter.run_taps(
-                slot,
-                pos0,
-                &tokens[off..off + len],
-                TapsIn::Host(h),
-                wants,
-                true,
-            )?;
-            if off + len == tokens.len() {
-                let ids = self.drafter.ids(outs[0])?;
-                last_tok = Some(ids[len - 1]);
-            }
-            pos0 += len as u32;
-            off += len;
-        }
-        Ok(last_tok)
     }
 
     /// Splits target taps into `(d_taps, m_taps)` for dual mode.
@@ -194,7 +140,7 @@ impl<'a> BatchMtp<'a> {
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let peer = self.dual.as_ref().expect("dual peer");
         let total = peer.d_width + peer.m_width;
-        let raw = taps.into_host(&*self.target.runner, total)?;
+        let raw = taps.into_host(&*self.core.target.runner, total)?;
         Ok(split_taps(&raw, rows, peer.d_width, peer.m_width))
     }
 
@@ -202,25 +148,14 @@ impl<'a> BatchMtp<'a> {
     pub(crate) fn read_dual_d_taps(&self, taps: &TapsBuf, rows: usize) -> Result<Vec<f32>, Error> {
         let peer = self.dual.as_ref().expect("dual peer");
         let total = peer.d_width + peer.m_width;
-        let d_width = peer.d_width;
-        let mut out = Vec::with_capacity(rows * d_width);
         match taps {
-            TapsBuf::Host(v) => {
-                for r in 0..rows {
-                    let base = r * total;
-                    out.extend_from_slice(&v[base..base + d_width]);
-                }
-            }
+            TapsBuf::Host(v) => Ok(take_cols(v, rows, total, 0, peer.d_width)),
             TapsBuf::Device { slot, .. } => {
-                let raw = self.target.runner.read(*slot)?;
+                let raw = self.core.target.runner.read(*slot)?;
                 let floats = raw.floats().map_err(tessera_run::Error::from)?;
-                for r in 0..rows {
-                    let base = r * total;
-                    out.extend_from_slice(&floats[base..base + d_width]);
-                }
+                Ok(take_cols(floats, rows, total, 0, peer.d_width))
             }
         }
-        Ok(out)
     }
 
     /// Promotes a lone surviving stream into solo DFlash mode.
@@ -236,43 +171,43 @@ impl<'a> BatchMtp<'a> {
         let seq = &mut self.active[job.active_idx];
         let d_pending = std::mem::take(&mut seq.d_tail);
         let w_rows = d_pending.len() / d_w;
-        seq.solo = Some(SoloState {
+        seq.solo = Some(DualState::new(
             selector,
-            d_base: seq.start - w_rows,
-            d_ctx_pos: 0,
-            d_pending,
-            m_start: job.old_start,
-            m_tokens: job.committed,
-            m_taps,
-            round_mtp: false,
-            last_lp: None,
-            last_mtp_d1: None,
-        });
+            (seq.start - w_rows, 0, d_pending),
+            (job.old_start, job.committed, m_taps),
+        ));
         self.solo_draft(job.active_idx)
     }
 
     /// Verifies and re-drafts one solo sequence using DFlash or MTP.
     pub(crate) fn verify_solo(&mut self) -> Result<(), Error> {
         let seq = &self.active[0];
-        let k = seq.drafts.len().min(seq.room(self.max_ctx));
+        let k = seq.drafts.len().min(seq.room(self.core.max_ctx));
         let mut rows = Vec::with_capacity(1 + k);
         seq.verify(&mut rows, k);
         let sampling = !self.active[0].sampler.greedy();
-        let (mut out, taps) = self.target.step_verify_local(&rows, sampling)?;
+        let (mut out, taps) = self.core.target.step_verify_local(&rows, sampling)?;
         let (d_all, m_all) = self.split_dual_taps(taps, rows.len())?;
         let d_width = self.dual.as_ref().expect("dual peer").d_width;
         let m_width = self.drafter.hidden();
-        let ranked = self.target.control.is_some();
+        let ranked = self.core.target.control.is_some();
         let (accepted, committed, done) =
-            self.active[0].apply_verify(k, 0, &mut out, self.max_ctx, &mut self.hash);
+            self.active[0].apply_verify(k, 0, &mut out, self.core.max_ctx, &mut self.core.hash);
         self.active[0].history.extend_from_slice(&committed);
         let commit = committed.len();
         if done.is_some() || (!ranked && self.active[0].cancelled) {
             let mut seq = self.active.remove(0);
-            if self.kept.is_some()
+            if self.core.kept.is_some()
                 && let Some(solo) = seq.solo.take()
             {
-                self.flush_mtp(seq.slot, solo.m_start, &solo.m_tokens, &solo.m_taps)?;
+                flush_mtp(
+                    self.drafter,
+                    seq.slot,
+                    solo.m_start,
+                    &solo.m_tokens,
+                    &solo.m_taps,
+                    self.core.prefill_chunk,
+                )?;
                 seq.mtp_valid = solo.m_start as usize + solo.m_tokens.len();
             }
             self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
@@ -280,143 +215,41 @@ impl<'a> BatchMtp<'a> {
         }
         let seq = &mut self.active[0];
         let solo = seq.solo.as_mut().expect("solo state");
-        if k > 0 {
-            if solo.round_mtp {
-                solo.selector.observe_mtp(k, accepted, &committed);
-            } else {
-                solo.selector.observe_dflash(
-                    k,
-                    accepted,
-                    solo.last_lp.as_deref(),
-                    solo.last_mtp_d1,
-                    committed[0],
-                );
-            }
-        }
-        solo.d_pending.extend_from_slice(&d_all[..commit * d_width]);
-        solo.m_tokens.extend_from_slice(&committed);
-        solo.m_taps.extend_from_slice(&m_all[..commit * m_width]);
+        solo.observe(
+            k,
+            accepted,
+            &committed,
+            &d_all[..commit * d_width],
+            &m_all[..commit * m_width],
+            None,
+        );
         self.solo_draft(0)
     }
 
     /// Proposes next drafts for solo sequence `idx` via `DualSelector`.
     pub(crate) fn solo_draft(&mut self, idx: usize) -> Result<(), Error> {
-        let block = self.dual.as_ref().expect("dual peer").block;
-        let room = self.active[idx].room(self.max_ctx);
+        let room = self.active[idx].room(self.core.max_ctx);
         if room == 0 {
             self.active[idx].drafts.clear();
             return Ok(());
         }
-        let slot = self.active[idx].slot;
-        let start = self.active[idx].start;
-        let anchor = self.active[idx].anchor;
-        let d_start = start - self.active[idx].solo.as_ref().expect("solo").d_base;
-        let can_dflash = start + block <= self.max_ctx && d_start + block <= self.max_ctx;
-        let (use_mtp, probe_mtp, probe_dflash) = {
-            let solo = self.active[idx].solo.as_mut().expect("solo");
-            let (use_mtp, _) = solo.selector.decide_next(can_dflash);
-            solo.round_mtp = use_mtp;
-            solo.last_mtp_d1 = None;
-            if !use_mtp {
-                (false, solo.selector.should_probe_mtp(), false)
-            } else {
-                (true, false, solo.selector.should_probe(can_dflash))
-            }
+        let seq = &mut self.active[idx];
+        let solo = seq.solo.as_mut().expect("solo");
+        let peer = self.dual.as_mut().expect("dual peer");
+        let step = DualStep {
+            slot: seq.slot,
+            start: seq.start,
+            anchor: seq.anchor,
+            room,
+            depth: self.depth,
+            max_ctx: self.core.max_ctx,
+            chunk: self.core.prefill_chunk,
         };
-        if !use_mtp {
-            if probe_mtp {
-                let (m_start, m_toks, m_taps) = {
-                    let solo = self.active[idx].solo.as_mut().expect("solo");
-                    let ms = solo.m_start;
-                    solo.m_start = start as u32;
-                    (
-                        ms,
-                        std::mem::take(&mut solo.m_tokens),
-                        std::mem::take(&mut solo.m_taps),
-                    )
-                };
-                let d1 = self.flush_mtp(slot, m_start, &m_toks, &m_taps)?;
-                self.active[idx].mtp_valid = m_start as usize + m_toks.len();
-                self.active[idx].solo.as_mut().expect("solo").last_mtp_d1 = d1;
-            }
-            let (d_ctx_pos, d_pending) = {
-                let solo = self.active[idx].solo.as_mut().expect("solo");
-                let cp = solo.d_ctx_pos;
-                solo.d_ctx_pos = d_start;
-                (cp, std::mem::take(&mut solo.d_pending))
-            };
-            let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
-            let (mut drafts, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
-            let avail = drafts.len().min(room);
-            let k = self.active[idx]
-                .solo
-                .as_ref()
-                .expect("solo")
-                .selector
-                .dflash
-                .choose(lp.as_deref(), avail, drafts.len());
-            self.active[idx].solo.as_mut().expect("solo").last_lp = lp;
-            drafts.truncate(k);
-            self.active[idx].drafts = drafts;
-            return Ok(());
+        let (drafts, mtp_valid) = solo.draft(self.core.target, peer.dflash, self.drafter, step)?;
+        seq.drafts = drafts;
+        if let Some(valid) = mtp_valid {
+            seq.mtp_valid = valid;
         }
-        if probe_dflash {
-            let (d_ctx_pos, d_pending) = {
-                let solo = self.active[idx].solo.as_mut().expect("solo");
-                let cp = solo.d_ctx_pos;
-                solo.d_ctx_pos = d_start;
-                (cp, std::mem::take(&mut solo.d_pending))
-            };
-            let dflash = &mut self.dual.as_mut().expect("dual peer").dflash;
-            let (probe, lp) = run_dflash(dflash, anchor, d_start, d_ctx_pos, &d_pending)?;
-            self.active[idx]
-                .solo
-                .as_mut()
-                .expect("solo")
-                .selector
-                .start_probe(probe, lp);
-        }
-        let (m_start, m_toks, m_taps, avail) = {
-            let solo = self.active[idx].solo.as_mut().expect("solo");
-            let ms = solo.m_start;
-            solo.m_start = start as u32;
-            let avail = self.depth.min(solo.selector.mtp.max_k()).min(room);
-            (
-                ms,
-                std::mem::take(&mut solo.m_tokens),
-                std::mem::take(&mut solo.m_taps),
-                avail,
-            )
-        };
-        let m_width = self.drafter.hidden();
-        let split = m_toks.len().saturating_sub(self.prefill_chunk);
-        if split > 0 {
-            self.flush_mtp(slot, m_start, &m_toks[..split], &m_taps[..split * m_width])?;
-        }
-        let job = DraftJob {
-            active_idx: idx,
-            slot,
-            old_start: m_start + split as u32,
-            new_start: start,
-            committed: m_toks[split..].to_vec(),
-            tap_row_off: 0,
-            avail,
-        };
-        let tail_taps = TapsBuf::Host(m_taps[split * m_width..].to_vec());
-        let mut drafts = self
-            .draft_batch(&[job], &tail_taps, false)?
-            .pop()
-            .unwrap_or_default();
-        let k = self.active[idx]
-            .solo
-            .as_ref()
-            .expect("solo")
-            .selector
-            .mtp
-            .choose(None, drafts.len(), drafts.len());
-        self.active[idx].mtp_valid = start;
-        drafts.truncate(k);
-        self.active[idx].drafts = drafts;
         Ok(())
     }
 }
@@ -437,7 +270,6 @@ struct DFlashSeq {
     spec: SpecLen,
     last_lp: Option<Vec<f32>>,
     d_base: usize,
-    history: Vec<u32>,
 }
 
 struct DFlashJob {
@@ -453,22 +285,16 @@ struct DFlashJob {
 
 /// Multi-slot continuous-batching DFlash decoder.
 pub struct BatchDFlash<'a> {
-    target: &'a mut Engine,
+    core: BatchCore<'a>,
     drafter: &'a mut Drafter,
     spec_len: SpecLen,
-    prefill_chunk: usize,
-    max_ctx: usize,
     draft_ctx: usize,
     block: usize,
     tap_width: usize,
-    kept: Option<Kept>,
     reuse: bool,
     admitted_skips: VecDeque<usize>,
-    waiting: VecDeque<(Request, Sink)>,
     prefilling: VecDeque<DFlashPrefill>,
     active: Vec<DFlashSeq>,
-    free: Vec<u32>,
-    hash: u32,
 }
 
 impl<'a> BatchDFlash<'a> {
@@ -481,37 +307,19 @@ impl<'a> BatchDFlash<'a> {
         let slots = target.slots().min(drafter.slots());
         let max_ctx = target.context();
         let draft_ctx = drafter.context();
-        if let Some(lanes) = &mut target.lanes {
-            lanes.reset();
-        }
-        let kept = target
-            .lanes
-            .as_ref()
-            .map(|l| Kept::paged(slots, max_ctx, l.pages(), l.page));
-        let free = if kept.is_some() {
-            Vec::new()
-        } else {
-            (0..slots as u32).rev().collect()
-        };
         let block = drafter.block();
         let spec_len = SpecLen::fixed(block - 1).with_cost(CostModel::dflash());
         Ok(Self {
-            target,
+            core: BatchCore::new(target, slots, max_ctx, true),
             drafter,
             spec_len,
-            prefill_chunk: DEFAULT_CHUNK,
-            max_ctx,
             draft_ctx,
             block,
             tap_width: width,
-            kept,
             reuse: false,
             admitted_skips: VecDeque::new(),
-            waiting: VecDeque::new(),
             prefilling: VecDeque::new(),
             active: Vec::new(),
-            free,
-            hash: 2166136261,
         })
     }
 
@@ -529,23 +337,21 @@ impl<'a> BatchDFlash<'a> {
         if prompt_len + self.block <= self.draft_ctx {
             return 0;
         }
+        let chunk = self.core.prefill_chunk;
         let keep = self
             .draft_ctx
-            .saturating_sub(self.block + self.prefill_chunk)
+            .saturating_sub(self.block + chunk)
             .min(self.draft_ctx / 2);
-        (prompt_len.saturating_sub(keep) / self.prefill_chunk) * self.prefill_chunk
+        (prompt_len.saturating_sub(keep) / chunk) * chunk
     }
 
     fn free_slot(&mut self, slot: u32, history: Vec<u32>) {
-        if let Some(kept) = &mut self.kept {
-            kept.finish(slot, if self.reuse { history } else { Vec::new() });
-        } else {
-            self.free.push(slot);
-        }
+        self.core
+            .retire(slot, if self.reuse { history } else { Vec::new() });
     }
 
     fn ensure_pages(&mut self, rows: &[Row]) -> Result<(), Error> {
-        let (Some(kept), Some(lanes)) = (&mut self.kept, &mut self.target.lanes) else {
+        let (Some(kept), Some(lanes)) = (&mut self.core.kept, &mut self.core.target.lanes) else {
             return Ok(());
         };
         kept.grow_rows(rows, lanes)
@@ -555,7 +361,7 @@ impl<'a> BatchDFlash<'a> {
         for mut item in admitted {
             let limit = self.admit_limit(item.request.tokens.len());
             let skip = if follower {
-                if let Some(kept) = &mut self.kept {
+                if let Some(kept) = &mut self.core.kept {
                     let Some((slot, skip)) = kept.admit(&item.request.tokens, limit) else {
                         return Err(Error::RowPlace);
                     };
@@ -567,11 +373,7 @@ impl<'a> BatchDFlash<'a> {
             } else {
                 self.admitted_skips.pop_front().unwrap_or(0)
             };
-            if skip > 0
-                && let Some(cb) = &mut item.sink
-            {
-                let _ = cb(Event::Kept(skip));
-            }
+            notify_kept(&mut item.sink, skip);
             let d_base = skip + self.initial_d_base(item.request.tokens.len() - skip);
             self.prefilling.push_back(DFlashPrefill {
                 slot: item.slot,
@@ -588,7 +390,7 @@ impl<'a> BatchDFlash<'a> {
         if !self.active.is_empty() {
             self.verify_and_draft()?;
         }
-        if let Some(kept) = &self.kept {
+        if let Some(kept) = &self.core.kept {
             kept.publish();
         }
         Ok(())
@@ -598,10 +400,12 @@ impl<'a> BatchDFlash<'a> {
         let mut seq = self.prefilling.pop_front().expect("prefill seq");
         let n = seq.request.tokens.len();
         let pos0 = seq.pos;
-        let mut len = (n - pos0).min(self.prefill_chunk);
-        if !seq.request.sampling.greedy() && pos0 + len == n && len > 1 {
-            len = n - 1 - pos0;
-        }
+        let len = prefill_len(
+            n,
+            pos0,
+            self.core.prefill_chunk,
+            seq.request.sampling.greedy(),
+        );
         let end = pos0 + len;
         let mut rows = Vec::with_capacity(len);
         span(
@@ -613,7 +417,7 @@ impl<'a> BatchDFlash<'a> {
         self.ensure_pages(&rows)?;
         let wants = self.drafter.draft_wants();
         if end < n {
-            let (_, taps) = self.target.step_taps_local(&rows)?;
+            let (_, taps) = self.core.target.step_taps_local(&rows)?;
             if pos0 >= seq.d_base && end - seq.d_base + self.block <= self.draft_ctx {
                 self.drafter.run_taps(
                     seq.slot,
@@ -628,33 +432,16 @@ impl<'a> BatchDFlash<'a> {
             self.prefilling.push_front(seq);
             return Ok(());
         }
-        let mut sampler = Sampler::new(seq.request.sampling);
-        let (anchor, taps) = self.target.prefill_pick(&rows, &mut sampler)?;
-        fnv_u32(&mut self.hash, anchor);
-        let history = seq.request.tokens.clone();
-        let mut act = ActiveSeq {
-            slot: seq.slot,
-            request: seq.request,
-            sink: seq.sink,
-            start: n,
-            anchor,
-            drafts: Vec::new(),
-            emitted: 0,
-            cancelled: false,
-            solo: None,
-            d_tail: Vec::new(),
-            history: Vec::new(),
-            mtp_valid: 0,
-            sampler,
-        };
-        let done = act.commit(&[anchor], self.max_ctx);
-        if done.is_some() || (self.target.control.is_none() && act.cancelled) {
-            self.free_slot(act.slot, history);
+        let (mut act, taps, ended) =
+            self.core
+                .finish_prefill(seq.slot, seq.request, seq.sink, &rows, 0, false)?;
+        if ended {
+            self.free_slot(act.slot, act.history);
             return Ok(());
         }
         let spec = self.spec_len.fresh();
         let mut last_lp = None;
-        let room = act.room(self.max_ctx);
+        let room = act.room(self.core.max_ctx);
         let mut d_base = seq.d_base.min(pos0);
         if n - d_base + self.block > self.draft_ctx {
             d_base = pos0;
@@ -662,7 +449,7 @@ impl<'a> BatchDFlash<'a> {
         if n - d_base + self.block <= self.draft_ctx && room > 0 {
             let outs = self.drafter.run_taps(
                 act.slot,
-                anchor,
+                act.anchor,
                 n - d_base,
                 pos0 - d_base,
                 taps.as_in(),
@@ -680,29 +467,31 @@ impl<'a> BatchDFlash<'a> {
             spec,
             last_lp,
             d_base,
-            history,
         });
         Ok(())
     }
 
     fn verify_and_draft(&mut self) -> Result<(), Error> {
         let s_count = self.active.len();
-        let (rows, spans, sampling) = verify_rows(&self.active, self.max_ctx, |s| &s.seq);
+        let (rows, spans, sampling) = verify_rows(&self.active, self.core.max_ctx, |s| &s.seq);
         self.ensure_pages(&rows)?;
-        let (mut out, raw_taps) = self.target.step_verify_local(&rows, sampling)?;
-        let ranked = self.target.control.is_some();
+        let (mut out, raw_taps) = self.core.target.step_verify_local(&rows, sampling)?;
+        let ranked = self.core.target.control.is_some();
         let mut jobs: Vec<DFlashJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
             let old_start = self.active[i].seq.start;
             let old_anchor = self.active[i].seq.anchor;
-            let (accepted, committed, done) =
-                self.active[i]
-                    .seq
-                    .apply_verify(k, off, &mut out, self.max_ctx, &mut self.hash);
+            let (accepted, committed, done) = self.active[i].seq.apply_verify(
+                k,
+                off,
+                &mut out,
+                self.core.max_ctx,
+                &mut self.core.hash,
+            );
             let item = &mut self.active[i];
-            item.history.push(old_anchor);
-            item.history.extend_from_slice(&committed[..accepted]);
+            item.seq.history.push(old_anchor);
+            item.seq.history.extend_from_slice(&committed[..accepted]);
             if k > 0 {
                 item.spec.observe(k, accepted, item.last_lp.as_deref());
             }
@@ -710,7 +499,7 @@ impl<'a> BatchDFlash<'a> {
                 finished[i] = true;
                 continue;
             }
-            let avail = item.seq.room(self.max_ctx);
+            let avail = item.seq.room(self.core.max_ctx);
             if item.seq.start - item.d_base + self.block > self.draft_ctx {
                 item.d_base = old_start;
             }
@@ -754,16 +543,8 @@ impl<'a> BatchDFlash<'a> {
             item.seq.drafts = drafts;
             item.last_lp = lp;
         }
-        let mut idx = 0usize;
-        let mut orig = 0usize;
-        while idx < self.active.len() {
-            if finished[orig] {
-                let item = self.active.remove(idx);
-                self.free_slot(item.seq.slot, item.history);
-            } else {
-                idx += 1;
-            }
-            orig += 1;
+        for item in retire_finished(&mut self.active, &finished) {
+            self.free_slot(item.seq.slot, item.seq.history);
         }
         Ok(())
     }
@@ -771,12 +552,9 @@ impl<'a> BatchDFlash<'a> {
 
 batch_methods!(BatchDFlash, reuse);
 
-impl RoundHost for BatchDFlash<'_> {
-    fn target(&mut self) -> &mut Engine {
-        self.target
-    }
-    fn hash(&self) -> u32 {
-        self.hash
+impl<'a> RoundHost<'a> for BatchDFlash<'a> {
+    fn core(&mut self) -> &mut BatchCore<'a> {
+        &mut self.core
     }
     fn is_busy(&self) -> bool {
         self.busy()
@@ -794,10 +572,10 @@ impl RoundHost for BatchDFlash<'_> {
             return Vec::new();
         }
         let mut out = Vec::new();
-        while let Some((req, _)) = self.waiting.front() {
+        while let Some((req, _)) = self.core.waiting.front() {
             let limit = self.admit_limit(req.tokens.len());
-            let (slot, skip) = if let Some(kept) = &mut self.kept {
-                if self.target.lanes.is_some() {
+            let (slot, skip) = if let Some(kept) = &mut self.core.kept {
+                if self.core.target.lanes.is_some() {
                     let busy =
                         !self.active.is_empty() || !self.prefilling.is_empty() || !out.is_empty();
                     let pool = kept.totals().pool;
@@ -811,34 +589,20 @@ impl RoundHost for BatchDFlash<'_> {
                 };
                 (slot, skip)
             } else {
-                let Some(slot) = self.free.pop() else {
+                let Some(slot) = self.core.free.pop() else {
                     break;
                 };
                 (slot, 0)
             };
             self.admitted_skips.push_back(skip);
-            let (mut request, sink) = self.waiting.pop_front().expect("waiting request");
-            request.sampling = request.sampling.seeded();
-            out.push(Admitted {
-                slot,
-                skip: 0,
-                request,
-                sink: Some(sink),
-            });
+            out.push(self.core.pop_admitted(slot, 0));
         }
         out
     }
     fn retire_slots(&mut self, slots: &[u32]) {
-        let (kept, free, reuse) = (&mut self.kept, &mut self.free, self.reuse);
-        retire_from(
-            &mut self.active,
-            slots,
-            |s| s.seq.slot,
-            |s| match kept {
-                Some(k) => k.finish(s.seq.slot, if reuse { s.history } else { Vec::new() }),
-                None => free.push(s.seq.slot),
-            },
-        );
+        for s in retire_from(&mut self.active, slots, |s| s.seq.slot) {
+            self.free_slot(s.seq.slot, s.seq.history);
+        }
     }
     fn run_round(&mut self, admitted: Vec<Admitted>, follower: bool) -> Result<(), Error> {
         self.exec_round(admitted, follower)

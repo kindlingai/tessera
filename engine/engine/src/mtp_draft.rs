@@ -21,6 +21,38 @@ pub(crate) struct MtpSpan<'a> {
     pub hidden: TapsIn<'a>,
 }
 
+/// One sequence job handed to batched MTP drafting.
+pub(crate) struct MtpJob<'a> {
+    pub slot: u32,
+    pub old_start: u32,
+    pub new_start: usize,
+    pub tokens: &'a [u32],
+    pub tap_row_off: usize,
+}
+
+/// Pads `v` to `filled` by repeating its last item.
+fn pad_tail<T: Copy>(v: &mut Vec<T>, filled: usize) {
+    if let Some(&last) = v.last() {
+        v.resize(filled, last);
+    }
+}
+
+/// Extracts `width` floats at `col_off` from each strided row.
+pub(crate) fn take_cols(
+    src: &[f32],
+    rows: usize,
+    stride: usize,
+    col_off: usize,
+    width: usize,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * width);
+    for r in 0..rows {
+        let lo = r * stride + col_off;
+        out.extend_from_slice(&src[lo..lo + width]);
+    }
+    out
+}
+
 /// Runs an MTP one-layer MLA drafter with kept KV caches.
 pub struct MtpDrafter {
     core: DraftCore,
@@ -103,38 +135,22 @@ impl MtpDrafter {
         Wants::roles(&self.core.graph, 0, &[Role::Tokens, Role::Taps])
     }
 
-    pub(crate) fn read_last(
+    fn exec_mtp(
         &mut self,
-        outputs: &[Slot],
-        rows: usize,
-        keep_hidden: bool,
-    ) -> Result<(u32, TapsBuf), Error> {
-        let ids = self.core.runner.ids(outputs[0])?;
-        let token = ids[rows - 1];
-        if !keep_hidden {
-            return Ok((token, TapsBuf::Host(Vec::new())));
-        }
-        let slot = outputs[1];
-        if slot.form.name() == "f32"
-            && let Some(base) = self.core.runner.address(slot)
-        {
-            let addr = base + ((rows - 1) * self.hidden * 4) as u64;
-            return Ok((
-                token,
-                TapsBuf::Device {
-                    slot,
-                    addr,
-                    rows: 1,
-                },
-            ));
-        }
-        let raw = self.core.runner.read(slot)?;
-        let floats = raw.floats().map_err(tessera_run::Error::from)?;
-        let from = (rows - 1) * self.hidden;
-        Ok((
-            token,
-            TapsBuf::Host(floats[from..from + self.hidden].to_vec()),
-        ))
+        dims: [usize; 3],
+        feeds: [Option<Tensor>; 5],
+        d2d: &[D2dCopy],
+        wants: Wants,
+        wait: bool,
+    ) -> Result<Vec<Slot>, Error> {
+        let [filled, max_end, segments] = dims;
+        let sizes = [
+            (Seqs, self.core.slots as u64),
+            (Rows, filled as u64),
+            (Context, crate::context_bucket(max_end, self.core.context)),
+            (Segments, segments as u64),
+        ];
+        self.core.exec_tap(&feeds, d2d, &sizes, wants, wait)
     }
 
     pub(crate) fn run_taps(
@@ -191,16 +207,10 @@ impl MtpDrafter {
                 scale_buf.push(if p == 0 { 0.0 } else { 1.0 });
             }
         }
-        let last_tok = *tok_buf.last().expect("non-empty");
-        let last_pos = *pos_buf.last().expect("non-empty");
-        let last_slot = *slot_buf.last().expect("non-empty");
-        let last_scale = *scale_buf.last().expect("non-empty");
-        for _ in m..filled {
-            tok_buf.push(last_tok);
-            pos_buf.push(last_pos);
-            slot_buf.push(last_slot);
-            scale_buf.push(last_scale);
-        }
+        pad_tail(&mut tok_buf, filled);
+        pad_tail(&mut pos_buf, filled);
+        pad_tail(&mut slot_buf, filled);
+        pad_tail(&mut scale_buf, filled);
         let all_dev = spans
             .iter()
             .all(|s| matches!(s.hidden, TapsIn::Device { .. }));
@@ -268,13 +278,7 @@ impl MtpDrafter {
             hid_tensor,
             Some(Tensor::f32(vec![filled, 1], scale_buf)),
         ];
-        let sizes = [
-            (Seqs, self.core.slots as u64),
-            (Rows, filled as u64),
-            (Context, crate::context_bucket(max_end, self.core.context)),
-            (Segments, spans.len() as u64),
-        ];
-        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
+        self.exec_mtp([filled, max_end, spans.len()], feeds, &d2d, wants, wait)
     }
 
     /// Runs one chained MTP step from device buffers.
@@ -326,14 +330,9 @@ impl MtpDrafter {
                 width: 1,
             });
         }
-        let last_pos = *pos_buf.last().expect("non-empty");
-        let last_slot = *slot_buf.last().expect("non-empty");
-        let last_scale = *scale_buf.last().expect("non-empty");
-        for _ in m..filled {
-            pos_buf.push(last_pos);
-            slot_buf.push(last_slot);
-            scale_buf.push(last_scale);
-        }
+        pad_tail(&mut pos_buf, filled);
+        pad_tail(&mut slot_buf, filled);
+        pad_tail(&mut scale_buf, filled);
         let feeds = [
             None,
             Some(Tensor::u32(vec![filled], pos_buf)),
@@ -341,26 +340,7 @@ impl MtpDrafter {
             None,
             Some(Tensor::f32(vec![filled, 1], scale_buf)),
         ];
-        let sizes = [
-            (Seqs, self.core.slots as u64),
-            (Rows, filled as u64),
-            (Context, crate::context_bucket(max_end, self.core.context)),
-            (Segments, m as u64),
-        ];
-        self.core.exec_tap(&feeds, &d2d, &sizes, wants, wait)
-    }
-
-    /// Runs one chained MTP step for one slot.
-    fn run_chain(
-        &mut self,
-        slot: u32,
-        pos: u32,
-        tok_addr: u64,
-        hid_addr: u64,
-        wants: Wants,
-        wait: bool,
-    ) -> Result<Vec<Slot>, Error> {
-        self.run_chain_batch(&[slot], &[pos], &[tok_addr], &[hid_addr], wants, wait)
+        self.exec_mtp([filled, max_end, m], feeds, &d2d, wants, wait)
     }
 
     pub(crate) fn ids(&self, slot: Slot) -> Result<Vec<u32>, Error> {
@@ -377,60 +357,241 @@ impl MtpDrafter {
     }
 }
 
-/// Runs one local MTP step, keeping output hidden when requested.
-pub(crate) fn run_mtp(
+/// Feeds deferred `(tokens, taps)` chunks into `drafter` for `slot`.
+pub(crate) fn flush_mtp(
     drafter: &mut MtpDrafter,
-    start_pos: u32,
+    slot: u32,
+    mut pos0: u32,
     tokens: &[u32],
-    hid: TapsIn<'_>,
-    keep: bool,
-) -> Result<(u32, TapsBuf), Error> {
+    taps: &[f32],
+    chunk: usize,
+) -> Result<Option<u32>, Error> {
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    let width = drafter.hidden();
     let wants = drafter.wants();
-    let outputs = drafter.run_taps(0, start_pos, tokens, hid, wants, true)?;
-    drafter.read_last(&outputs, tokens.len(), keep)
+    let mut off = 0usize;
+    let mut last_tok = None;
+    while off < tokens.len() {
+        let len = (tokens.len() - off).min(chunk);
+        let h = &taps[off * width..(off + len) * width];
+        let outs = drafter.run_taps(
+            slot,
+            pos0,
+            &tokens[off..off + len],
+            TapsIn::Host(h),
+            wants,
+            true,
+        )?;
+        if off + len == tokens.len() {
+            let ids = drafter.ids(outs[0])?;
+            last_tok = Some(ids[len - 1]);
+        }
+        pos0 += len as u32;
+        off += len;
+    }
+    Ok(last_tok)
 }
 
-/// Queues `chain_n` MTP steps on GPU with one trailing sync.
-#[allow(clippy::too_many_arguments)]
-fn chain_gpu(
-    target: &mut Engine,
-    drafter: &mut MtpDrafter,
-    start_pos: u32,
-    tokens: &[u32],
-    tap_slot: Slot,
-    tap_addr: u64,
-    start: usize,
-    chain_n: usize,
-) -> Result<Vec<u32>, Error> {
-    let wants = drafter.wants();
-    let m = tokens.len();
-    let hidden = drafter.hidden();
-    let first_in = TapsIn::Device {
-        addr: tap_addr,
-        rows: m,
-        stride: 0,
-    };
-    let outputs = drafter.run_taps(0, start_pos, tokens, first_in, wants, false)?;
-    let addr_of = |r: &dyn Run, s: Slot| r.address(s).ok_or(tessera_run::Error::Unaddressed(0));
-    let mut tok_addr = addr_of(&*drafter.core.runner, outputs[0])? + ((m - 1) * 4) as u64;
-    let mut hid_addr = addr_of(&*drafter.core.runner, outputs[1])? + ((m - 1) * hidden * 4) as u64;
-    let mut last_out = outputs[0];
-    for j in 1..chain_n {
-        let off = (j - 1) * 4;
-        target.runner.copy_from(tap_slot, off, tok_addr, 4)?;
-        let saved_tok = tap_addr + off as u64;
-        let pos = (start - 1 + j) as u32;
-        let wait = j + 1 == chain_n;
-        let outs = drafter.run_chain(0, pos, saved_tok, hid_addr, wants, wait)?;
-        last_out = outs[0];
-        if !wait {
-            tok_addr = addr_of(&*drafter.core.runner, outs[0])?;
-            hid_addr = addr_of(&*drafter.core.runner, outs[1])?;
+enum ChainHid {
+    Dev(Vec<u64>),
+    Host(Vec<Vec<f32>>),
+}
+
+impl ChainHid {
+    fn read(
+        drafter: &MtpDrafter,
+        slot: Slot,
+        rows: &[usize],
+        hidden: usize,
+    ) -> Result<Self, Error> {
+        if slot.form.name() == "f32"
+            && let Some(base) = drafter.address(slot)
+        {
+            return Ok(Self::Dev(
+                rows.iter()
+                    .map(|&r| base + (r * hidden * 4) as u64)
+                    .collect(),
+            ));
+        }
+        let floats = drafter.read_floats(slot)?;
+        Ok(Self::Host(
+            rows.iter()
+                .map(|&r| floats[r * hidden..(r + 1) * hidden].to_vec())
+                .collect(),
+        ))
+    }
+
+    fn at(&self, i: usize) -> TapsIn<'_> {
+        match self {
+            Self::Dev(addrs) => TapsIn::Device {
+                addr: addrs[i],
+                rows: 1,
+                stride: 0,
+            },
+            Self::Host(rows) => TapsIn::Host(&rows[i]),
         }
     }
-    let mut drafts = target.runner.held().read_u32s(tap_slot, chain_n - 1)?;
-    drafts.push(drafter.core.runner.ids(last_out)?[0]);
-    Ok(drafts)
+}
+
+/// Runs batched first-form MTP plus shared chain steps for `jobs`.
+pub(crate) fn draft_mtp_batch(
+    target: &mut Engine,
+    drafter: &mut MtpDrafter,
+    jobs: &[MtpJob<'_>],
+    taps: &TapsBuf,
+    dual_stride: Option<(usize, usize)>,
+    chain_n: usize,
+) -> Result<Vec<Vec<u32>>, Error> {
+    let n = jobs.len();
+    if n == 0 || chain_n == 0 {
+        return Ok(vec![Vec::new(); n]);
+    }
+    let hidden = drafter.hidden();
+    let wants = drafter.wants();
+    let (col_off, stride) = dual_stride.unwrap_or((0, hidden));
+    let mut end_rows = Vec::with_capacity(n);
+    let mut total_rows = 0usize;
+    for j in jobs {
+        total_rows += j.tokens.len();
+        end_rows.push(total_rows - 1);
+    }
+    let dev_taps = match *taps {
+        TapsBuf::Device { slot, addr, .. } => Some((slot, addr)),
+        TapsBuf::Host(_) => None,
+    };
+    let can_gpu_chain =
+        chain_n >= 2 && dev_taps.is_some_and(|(slot, _)| slot.bytes() >= n * (chain_n - 1) * 4);
+    let host_slices: Vec<Vec<f32>> = match taps {
+        TapsBuf::Host(v) if col_off > 0 => jobs
+            .iter()
+            .map(|j| {
+                take_cols(
+                    &v[j.tap_row_off * stride..],
+                    j.tokens.len(),
+                    stride,
+                    col_off,
+                    hidden,
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let spans: Vec<MtpSpan<'_>> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| {
+            let h = match taps {
+                TapsBuf::Device { addr, .. } => TapsIn::Device {
+                    addr: *addr + ((j.tap_row_off * stride + col_off) * 4) as u64,
+                    rows: j.tokens.len(),
+                    stride: if col_off > 0 { stride } else { 0 },
+                },
+                TapsBuf::Host(_) if col_off > 0 => TapsIn::Host(&host_slices[i]),
+                TapsBuf::Host(v) => {
+                    let lo = j.tap_row_off * hidden;
+                    let hi = lo + j.tokens.len() * hidden;
+                    TapsIn::Host(&v[lo..hi])
+                }
+            };
+            MtpSpan {
+                slot: j.slot,
+                start_pos: j.old_start,
+                tokens: j.tokens,
+                hidden: h,
+            }
+        })
+        .collect();
+    let first_out = drafter.run_batch(&spans, wants, !can_gpu_chain)?;
+    if can_gpu_chain
+        && let Some((tap_slot, tap_addr)) = dev_taps
+        && let (Some(o0), Some(o1)) = (drafter.address(first_out[0]), drafter.address(first_out[1]))
+    {
+        let slots: Vec<u32> = jobs.iter().map(|j| j.slot).collect();
+        let mut tok_addrs: Vec<u64> = end_rows.iter().map(|&r| o0 + (r * 4) as u64).collect();
+        let mut hid_addrs: Vec<u64> = end_rows
+            .iter()
+            .map(|&r| o1 + (r * hidden * 4) as u64)
+            .collect();
+        let mut last_out = first_out[0];
+        for step in 1..chain_n {
+            let mut saved_addrs = Vec::with_capacity(n);
+            let mut positions = Vec::with_capacity(n);
+            for (i, j) in jobs.iter().enumerate() {
+                let off = ((step - 1) * n + i) * 4;
+                target.runner.copy_from(tap_slot, off, tok_addrs[i], 4)?;
+                saved_addrs.push(tap_addr + off as u64);
+                positions.push((j.new_start - 1 + step) as u32);
+            }
+            let wait = step + 1 == chain_n;
+            let outs = drafter.run_chain_batch(
+                &slots,
+                &positions,
+                &saved_addrs,
+                &hid_addrs,
+                wants,
+                wait,
+            )?;
+            last_out = outs[0];
+            if !wait {
+                let next0 = drafter
+                    .address(outs[0])
+                    .ok_or(tessera_run::Error::Unaddressed(0))?;
+                let next1 = drafter
+                    .address(outs[1])
+                    .ok_or(tessera_run::Error::Unaddressed(0))?;
+                for i in 0..n {
+                    tok_addrs[i] = next0 + (i * 4) as u64;
+                    hid_addrs[i] = next1 + (i * hidden * 4) as u64;
+                }
+            }
+        }
+        let saved = target
+            .runner
+            .held()
+            .read_u32s(tap_slot, (chain_n - 1) * n)?;
+        let final_ids = drafter.ids(last_out)?;
+        let mut out = vec![Vec::with_capacity(chain_n); n];
+        for step in 0..chain_n - 1 {
+            for i in 0..n {
+                out[i].push(saved[step * n + i]);
+            }
+        }
+        for i in 0..n {
+            out[i].push(final_ids[i]);
+        }
+        return Ok(out);
+    }
+    let ids = drafter.ids(first_out[0])?;
+    let mut out: Vec<Vec<u32>> = end_rows.iter().map(|&r| vec![ids[r]]).collect();
+    if chain_n == 1 {
+        return Ok(out);
+    }
+    let seq_rows: Vec<usize> = (0..n).collect();
+    let mut hid = ChainHid::read(drafter, first_out[1], &end_rows, hidden)?;
+    for step in 1..chain_n {
+        let toks: Vec<[u32; 1]> = out.iter().map(|v| [*v.last().unwrap()]).collect();
+        let step_spans: Vec<MtpSpan<'_>> = jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| MtpSpan {
+                slot: j.slot,
+                start_pos: (j.new_start - 1 + step) as u32,
+                tokens: &toks[i],
+                hidden: hid.at(i),
+            })
+            .collect();
+        let outs = drafter.run_batch(&step_spans, wants, true)?;
+        let step_ids = drafter.ids(outs[0])?;
+        for i in 0..n {
+            out[i].push(step_ids[i]);
+        }
+        if step + 1 < chain_n {
+            hid = ChainHid::read(drafter, outs[1], &seq_rows, hidden)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Runs an MTP first-form pass plus adaptive chain steps.
@@ -439,6 +600,7 @@ pub(crate) fn draft_mtp(
     target: &mut Engine,
     drafter: &mut MtpDrafter,
     spec: &SpecLen,
+    slot: u32,
     start_pos: u32,
     tokens: &[u32],
     taps: &TapsBuf,
@@ -454,32 +616,16 @@ pub(crate) fn draft_mtp(
         }
         n
     };
-    let mut drafts = if chain_n >= 2
-        && let TapsBuf::Device { slot, addr, rows } = *taps
-        && rows == tokens.len()
-        && slot.bytes() >= chain_n * 4
-    {
-        chain_gpu(
-            target, drafter, start_pos, tokens, slot, addr, start, chain_n,
-        )?
-    } else {
-        let mut out = Vec::with_capacity(chain_n);
-        let (first, mut prev_hid) = run_mtp(drafter, start_pos, tokens, taps.as_in(), chain_n > 1)?;
-        out.push(first);
-        for j in 1..chain_n {
-            let pos = (start - 1 + j) as u32;
-            let (tok, next_hid) = run_mtp(
-                drafter,
-                pos,
-                &[out[j - 1]],
-                prev_hid.as_in(),
-                j + 1 < chain_n,
-            )?;
-            out.push(tok);
-            prev_hid = next_hid;
-        }
-        out
+    let job = MtpJob {
+        slot,
+        old_start: start_pos,
+        new_start: start,
+        tokens,
+        tap_row_off: 0,
     };
+    let mut drafts = draft_mtp_batch(target, drafter, &[job], taps, None, chain_n)?
+        .pop()
+        .unwrap_or_default();
     let k = spec.choose(None, drafts.len(), drafts.len());
     drafts.truncate(k);
     Ok(drafts)
@@ -578,6 +724,7 @@ fn run_mtp_req(
                 target,
                 drafter,
                 spec,
+                0,
                 *pending_start,
                 pending_tokens,
                 pending_taps,

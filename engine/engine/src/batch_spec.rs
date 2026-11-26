@@ -1,8 +1,9 @@
 //! Generic continuous-batching MTP and dual speculative decoding.
 
-use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, SoloState, push_tail};
+use crate::batch_dual::{DualPeer, PROMOTE_MIN_REM, push_tail};
+use crate::dual::DualState;
 use crate::kept::Kept;
-use crate::mtp_draft::{MtpDrafter, MtpSpan};
+use crate::mtp_draft::{MtpDrafter, MtpJob, draft_mtp_batch, take_cols};
 use crate::sample::{Sampler, Sampling, Target, accept, take};
 use crate::schedule::Sink;
 use crate::spec_loop::{TapsBuf, TapsIn, VerifyOut, fnv_u32, span};
@@ -18,9 +19,8 @@ const BATCH_STEP_TAG: u32 = 2;
 pub(crate) const DEFAULT_CHUNK: usize = tessera_device::FAST_MAX_ROWS;
 
 /// Shared coordinator and follower lifecycle for batched speculative loops.
-pub(crate) trait RoundHost {
-    fn target(&mut self) -> &mut Engine;
-    fn hash(&self) -> u32;
+pub(crate) trait RoundHost<'a> {
+    fn core(&mut self) -> &mut BatchCore<'a>;
     fn is_busy(&self) -> bool;
     fn collect_cancelled(&self) -> Vec<u32>;
     fn admit_local(&mut self) -> Vec<Admitted>;
@@ -29,39 +29,40 @@ pub(crate) trait RoundHost {
 }
 
 /// Executes one coordinator round on `host`.
-pub(crate) fn drive_step(host: &mut impl RoundHost) -> Result<bool, Error> {
+pub(crate) fn drive_step<'a>(host: &mut impl RoundHost<'a>) -> Result<bool, Error> {
     if !host.is_busy() {
         return Ok(false);
     }
-    host.target().settle()?;
+    host.core().target.settle()?;
     let cancelled = host.collect_cancelled();
     let admitted = host.admit_local();
-    let hash = host.hash();
-    if host.target().control.is_some() {
+    let hash = host.core().hash;
+    if host.core().target.control.is_some() {
         let msg = encode_round(hash, &cancelled, &admitted);
-        let _ = host.target().told(&msg)?;
+        let _ = host.core().target.told(&msg)?;
     }
     host.retire_slots(&cancelled);
     host.run_round(admitted, false)?;
-    host.target().settle()?;
+    host.core().target.settle()?;
     Ok(true)
 }
 
 /// Runs the follower rank loop on `host`.
-pub(crate) fn drive_follow(host: &mut impl RoundHost) -> Result<(), Error> {
+pub(crate) fn drive_follow<'a>(host: &mut impl RoundHost<'a>) -> Result<(), Error> {
     loop {
         let mine = host
-            .target()
+            .core()
+            .target
             .held
             .take()
             .map_or_else(Vec::new, |(_, p)| p.to_bytes());
-        let Some(told) = host.target().told(&mine)? else {
+        let Some(told) = host.core().target.told(&mine)? else {
             return Ok(());
         };
         let Some((want_hash, cancelled, admitted)) = decode_round(&told) else {
             return Ok(());
         };
-        if want_hash != host.hash() {
+        if want_hash != host.core().hash {
             return Err(RunError::OutputsDisagree.into());
         }
         host.retire_slots(&cancelled);
@@ -69,22 +70,113 @@ pub(crate) fn drive_follow(host: &mut impl RoundHost) -> Result<(), Error> {
     }
 }
 
-/// Turns on slot retention. Returns false for a stateful `target`.
-pub(crate) fn keep_slots(
-    target: &Engine,
-    slots: usize,
-    max_ctx: usize,
-    kept: &mut Option<Kept>,
-    free: &mut Vec<u32>,
-) -> bool {
-    if target.stateful() {
-        return false;
+/// Shared target, slot pool, and prefix state for batched decoders.
+pub(crate) struct BatchCore<'a> {
+    pub(crate) target: &'a mut Engine,
+    pub(crate) prefill_chunk: usize,
+    pub(crate) max_ctx: usize,
+    pub(crate) waiting: VecDeque<(Request, Sink)>,
+    pub(crate) free: Vec<u32>,
+    pub(crate) kept: Option<Kept>,
+    pub(crate) hash: u32,
+}
+
+impl<'a> BatchCore<'a> {
+    pub(crate) fn new(target: &'a mut Engine, slots: usize, max_ctx: usize, paged: bool) -> Self {
+        if paged && let Some(lanes) = &mut target.lanes {
+            lanes.reset();
+        }
+        let kept = paged
+            .then(|| {
+                target
+                    .lanes
+                    .as_ref()
+                    .map(|l| Kept::paged(slots, max_ctx, l.pages(), l.page))
+            })
+            .flatten();
+        let free = if kept.is_some() {
+            Vec::new()
+        } else {
+            (0..slots as u32).rev().collect()
+        };
+        Self {
+            target,
+            prefill_chunk: DEFAULT_CHUNK,
+            max_ctx,
+            waiting: VecDeque::new(),
+            free,
+            kept,
+            hash: 2166136261,
+        }
     }
-    if kept.is_none() {
-        *kept = Some(Kept::new(slots, max_ctx));
-        free.clear();
+
+    pub(crate) fn reuse(&mut self, slots: usize) -> bool {
+        if self.target.stateful() {
+            return false;
+        }
+        if self.kept.is_none() {
+            self.kept = Some(Kept::new(slots, self.max_ctx));
+            self.free.clear();
+        }
+        true
     }
-    true
+
+    pub(crate) fn retire(&mut self, slot: u32, history: Vec<u32>) {
+        match &mut self.kept {
+            Some(kept) => kept.finish(slot, history),
+            None => self.free.push(slot),
+        }
+    }
+
+    pub(crate) fn pop_admitted(&mut self, slot: u32, skip: usize) -> Admitted {
+        let (mut request, sink) = self.waiting.pop_front().expect("waiting request");
+        request.sampling = request.sampling.seeded();
+        Admitted {
+            slot,
+            skip,
+            request,
+            sink: Some(sink),
+        }
+    }
+
+    /// Runs the final prefill chunk and builds `ActiveSeq`.
+    pub(crate) fn finish_prefill(
+        &mut self,
+        slot: u32,
+        request: Request,
+        sink: Option<Sink>,
+        rows: &[Row],
+        mtp_valid: usize,
+        push_anchor: bool,
+    ) -> Result<(ActiveSeq, TapsBuf, bool), Error> {
+        let n = request.tokens.len();
+        let mut sampler = Sampler::new(request.sampling);
+        let (anchor, taps) = self.target.prefill_pick(rows, &mut sampler)?;
+        fnv_u32(&mut self.hash, anchor);
+        let mut history = Vec::with_capacity(n + usize::from(push_anchor));
+        history.extend_from_slice(&request.tokens);
+        if push_anchor {
+            history.push(anchor);
+        }
+        let mut act = ActiveSeq {
+            slot,
+            request,
+            sink,
+            start: n,
+            anchor,
+            drafts: Vec::new(),
+            emitted: 0,
+            cancelled: false,
+            solo: None,
+            d_tail: Vec::new(),
+            history,
+            mtp_valid,
+            sampler,
+        };
+        let done = act.commit(&[anchor], self.max_ctx);
+        let ended = done.is_some() || (self.target.control.is_none() && act.cancelled);
+        Ok((act, taps, ended))
+    }
 }
 
 /// Builds verify rows, spans, and sampling flag.
@@ -106,23 +198,58 @@ pub(crate) fn verify_rows<T>(
     (rows, spans, sampling)
 }
 
-/// Removes finished `slots` from `active` and notifies `on_free`.
+/// Removes finished `slots` from `active` and returns them.
 pub(crate) fn retire_from<T>(
     active: &mut Vec<T>,
     slots: &[u32],
     slot_of: impl Fn(&T) -> u32,
-    mut on_free: impl FnMut(T),
-) {
+) -> Vec<T> {
+    let mut gone = Vec::new();
     if slots.is_empty() {
-        return;
+        return gone;
     }
     let mut i = 0;
     while i < active.len() {
         if slots.contains(&slot_of(&active[i])) {
-            on_free(active.remove(i));
+            gone.push(active.remove(i));
         } else {
             i += 1;
         }
+    }
+    gone
+}
+
+/// Removes `active` entries marked true in `finished` and returns them.
+pub(crate) fn retire_finished<T>(active: &mut Vec<T>, finished: &[bool]) -> Vec<T> {
+    let mut gone = Vec::new();
+    let mut idx = 0usize;
+    let mut orig = 0usize;
+    while idx < active.len() {
+        if finished[orig] {
+            gone.push(active.remove(idx));
+        } else {
+            idx += 1;
+        }
+        orig += 1;
+    }
+    gone
+}
+
+/// Prefill chunk length, keeping sampled final chunks one row.
+pub(crate) fn prefill_len(n: usize, pos: usize, chunk: usize, greedy: bool) -> usize {
+    let mut len = (n - pos).min(chunk);
+    if !greedy && pos + len == n && len > 1 {
+        len = n - 1 - pos;
+    }
+    len
+}
+
+/// Emits a prefix-reuse event when `skip` rows were kept.
+pub(crate) fn notify_kept(sink: &mut Option<Sink>, skip: usize) {
+    if skip > 0
+        && let Some(cb) = sink
+    {
+        let _ = cb(Event::Kept(skip));
     }
 }
 
@@ -159,7 +286,7 @@ pub(crate) struct ActiveSeq {
     /// Set on rank 0 when client drops the stream.
     pub(crate) cancelled: bool,
     /// Active solo DFlash/MTP state when decoding alone.
-    pub(crate) solo: Option<SoloState>,
+    pub(crate) solo: Option<DualState>,
     /// Rolling recent DFlash taps for tail promotion.
     pub(crate) d_tail: Vec<f32>,
     /// Prompt plus emitted tokens for prefix reuse.
@@ -285,21 +412,33 @@ pub(crate) struct PrefillSeq {
 
 /// Multi-slot continuous-batching MTP and optional DFlash decoder.
 pub struct BatchMtp<'a> {
-    pub(crate) target: &'a mut Engine,
+    pub(crate) core: BatchCore<'a>,
     pub(crate) drafter: &'a mut MtpDrafter,
     pub(crate) dual: Option<DualPeer<'a>>,
     pub(crate) depth: usize,
-    pub(crate) prefill_chunk: usize,
-    pub(crate) max_ctx: usize,
-    pub(crate) waiting: VecDeque<(Request, Sink)>,
     pub(crate) prefilling: VecDeque<PrefillSeq>,
     pub(crate) active: Vec<ActiveSeq>,
-    pub(crate) free: Vec<u32>,
-    pub(crate) kept: Option<Kept>,
-    pub(crate) hash: u32,
 }
 
 impl<'a> BatchMtp<'a> {
+    pub(crate) fn init(
+        target: &'a mut Engine,
+        drafter: &'a mut MtpDrafter,
+        dual: Option<DualPeer<'a>>,
+        depth: usize,
+        max_ctx: usize,
+    ) -> Self {
+        let slots = target.slots().min(drafter.slots());
+        Self {
+            core: BatchCore::new(target, slots, max_ctx, false),
+            drafter,
+            dual,
+            depth,
+            prefilling: VecDeque::new(),
+            active: Vec::new(),
+        }
+    }
+
     /// Pairs a multi-slot tapped target engine with its MTP drafter.
     pub fn new(
         target: &'a mut Engine,
@@ -313,23 +452,8 @@ impl<'a> BatchMtp<'a> {
         if width != drafter.hidden() {
             return Err(Error::Rows);
         }
-        let slots = target.slots().min(drafter.slots());
         let max_ctx = target.context().min(drafter.context());
-        let free = (0..slots as u32).rev().collect();
-        Ok(Self {
-            target,
-            drafter,
-            dual: None,
-            depth,
-            prefill_chunk: DEFAULT_CHUNK,
-            max_ctx,
-            waiting: VecDeque::new(),
-            prefilling: VecDeque::new(),
-            active: Vec::new(),
-            free,
-            kept: None,
-            hash: 2166136261,
-        })
+        Ok(Self::init(target, drafter, None, depth, max_ctx))
     }
 }
 
@@ -339,25 +463,25 @@ macro_rules! batch_methods {
         impl $ty<'_> {
             /// Retains finished slots for prefix reuse.
             pub fn reuse(&mut self) {
-                let slots = self.target.slots().min(self.drafter.slots());
-                let _on = keep_slots(self.target, slots, self.max_ctx, &mut self.kept, &mut self.free);
+                let slots = self.core.target.slots().min(self.drafter.slots());
+                let _on = self.core.reuse(slots);
                 $(self.$flag = _on;)?
             }
 
             /// Sets the maximum prompt rows per prefill step.
             pub fn with_prefill_chunk(mut self, rows: usize) -> Self {
-                self.prefill_chunk = rows.max(1);
+                self.core.prefill_chunk = rows.max(1);
                 self
             }
 
             /// Queues an answer. Unfit requests finish at once.
             pub fn submit(&mut self, request: Request, sink: Sink) {
-                queue_request(&mut self.waiting, self.max_ctx, request, sink);
+                queue_request(&mut self.core.waiting, self.core.max_ctx, request, sink);
             }
 
             /// Whether any answer is waiting, prefilling, or decoding.
             pub fn busy(&self) -> bool {
-                !self.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
+                !self.core.waiting.is_empty() || !self.prefilling.is_empty() || !self.active.is_empty()
             }
 
             /// Runs one round: admit, prefill, verify, and draft.
@@ -376,12 +500,9 @@ pub(crate) use batch_methods;
 
 batch_methods!(BatchMtp);
 
-impl RoundHost for BatchMtp<'_> {
-    fn target(&mut self) -> &mut Engine {
-        self.target
-    }
-    fn hash(&self) -> u32 {
-        self.hash
+impl<'a> RoundHost<'a> for BatchMtp<'a> {
+    fn core(&mut self) -> &mut BatchCore<'a> {
+        &mut self.core
     }
     fn is_busy(&self) -> bool {
         self.busy()
@@ -395,8 +516,8 @@ impl RoundHost for BatchMtp<'_> {
     }
     fn admit_local(&mut self) -> Vec<Admitted> {
         let mut out = Vec::new();
-        while let Some((front, _)) = self.waiting.front() {
-            let (slot, skip) = match &mut self.kept {
+        while let Some((front, _)) = self.core.waiting.front() {
+            let (slot, skip) = match &mut self.core.kept {
                 Some(kept) => {
                     let limit = front.tokens.len().saturating_sub(1);
                     let Some((slot, hit)) = kept.admit(&front.tokens, limit) else {
@@ -406,27 +527,18 @@ impl RoundHost for BatchMtp<'_> {
                     (slot, hit.saturating_sub(1))
                 }
                 None => {
-                    let Some(slot) = self.free.pop() else {
+                    let Some(slot) = self.core.free.pop() else {
                         break;
                     };
                     (slot, 0)
                 }
             };
-            let (mut request, sink) = self.waiting.pop_front().expect("waiting request");
-            request.sampling = request.sampling.seeded();
-            out.push(Admitted {
-                slot,
-                skip,
-                request,
-                sink: Some(sink),
-            });
+            out.push(self.core.pop_admitted(slot, skip));
         }
         out
     }
     fn retire_slots(&mut self, slots: &[u32]) {
-        let mut gone = Vec::new();
-        retire_from(&mut self.active, slots, |s| s.slot, |s| gone.push(s));
-        for s in gone {
+        for s in retire_from(&mut self.active, slots, |s| s.slot) {
             self.retire_slot(s.slot, s.history, s.mtp_valid);
         }
     }
@@ -437,13 +549,8 @@ impl RoundHost for BatchMtp<'_> {
 
 impl BatchMtp<'_> {
     pub(crate) fn retire_slot(&mut self, slot: u32, mut history: Vec<u32>, mtp_valid: usize) {
-        match &mut self.kept {
-            Some(kept) => {
-                history.truncate(mtp_valid.min(self.max_ctx));
-                kept.finish(slot, history);
-            }
-            None => self.free.push(slot),
-        }
+        history.truncate(mtp_valid.min(self.core.max_ctx));
+        self.core.retire(slot, history);
     }
 
     fn exec_round(&mut self, admitted: Vec<Admitted>) -> Result<(), Error> {
@@ -459,11 +566,7 @@ impl BatchMtp<'_> {
                 && self.prefilling.is_empty()
                 && admitted.len() == 1;
             for mut item in admitted {
-                if item.skip > 0
-                    && let Some(cb) = &mut item.sink
-                {
-                    let _ = cb(Event::Kept(item.skip));
-                }
+                notify_kept(&mut item.sink, item.skip);
                 self.prefilling.push_back(PrefillSeq {
                     slot: item.slot,
                     skip: item.skip,
@@ -496,17 +599,19 @@ impl BatchMtp<'_> {
         let mut seq = self.prefilling.pop_front().expect("prefill seq");
         let n = seq.request.tokens.len();
         let pos0 = seq.pos;
-        let mut len = (n - pos0).min(self.prefill_chunk);
-        if !seq.request.sampling.greedy() && pos0 + len == n && len > 1 {
-            len = n - 1 - pos0;
-        }
+        let len = prefill_len(
+            n,
+            pos0,
+            self.core.prefill_chunk,
+            seq.request.sampling.greedy(),
+        );
         let wants = self.drafter.wants();
         let dual_widths = self.dual.as_ref().map(|p| (p.d_width, p.m_width));
         let mut rows = Vec::with_capacity(len);
         let chunk = &seq.request.tokens[pos0..pos0 + len];
         span(&mut rows, seq.slot, pos0, chunk.iter().copied());
         if pos0 + len < n {
-            let (_, taps) = self.target.step_taps_local(&rows)?;
+            let (_, taps) = self.core.target.step_taps_local(&rows)?;
             let shifted = &seq.request.tokens[pos0 + 1..pos0 + len + 1];
             if let Some((d_w, m_w)) = dual_widths {
                 if seq.solo_mode {
@@ -531,53 +636,32 @@ impl BatchMtp<'_> {
             self.prefilling.push_front(seq);
             return Ok(());
         }
-        let mut sampler = Sampler::new(seq.request.sampling);
-        let (anchor, taps) = self.target.prefill_pick(&rows, &mut sampler)?;
-        fnv_u32(&mut self.hash, anchor);
-        let mut history = Vec::with_capacity(n + 1);
-        history.extend_from_slice(&seq.request.tokens);
-        history.push(anchor);
-        let mut shifted = Vec::with_capacity(len);
-        shifted.extend_from_slice(&seq.request.tokens[pos0 + 1..]);
-        shifted.push(anchor);
-        let mut act = ActiveSeq {
-            slot: seq.slot,
-            request: seq.request,
-            sink: seq.sink,
-            start: n,
-            anchor,
-            drafts: Vec::new(),
-            emitted: 0,
-            cancelled: false,
-            solo: None,
-            d_tail: Vec::new(),
-            history,
-            mtp_valid: seq.mtp_valid,
-            sampler,
-        };
-        let done = act.commit(&[anchor], self.max_ctx);
-        if done.is_some() || (self.target.control.is_none() && act.cancelled) {
+        let (mut act, taps, ended) = self.core.finish_prefill(
+            seq.slot,
+            seq.request,
+            seq.sink,
+            &rows,
+            seq.mtp_valid,
+            true,
+        )?;
+        if ended {
             self.retire_slot(act.slot, act.history, act.mtp_valid);
             return Ok(());
         }
+        let mut shifted = Vec::with_capacity(len);
+        shifted.extend_from_slice(&act.request.tokens[pos0 + 1..]);
+        shifted.push(act.anchor);
         if seq.solo_mode {
             let (dt, mt) = self.split_dual_taps(taps, len)?;
             seq.d_buf.extend_from_slice(&dt);
             seq.m_tok_buf.extend_from_slice(&shifted);
             seq.m_tap_buf.extend_from_slice(&mt);
             let selector = self.dual.as_ref().expect("dual peer").selector.fresh();
-            act.solo = Some(SoloState {
+            act.solo = Some(DualState::new(
                 selector,
-                d_base: seq.skip,
-                d_ctx_pos: 0,
-                d_pending: seq.d_buf,
-                m_start: seq.skip as u32,
-                m_tokens: seq.m_tok_buf,
-                m_taps: seq.m_tap_buf,
-                round_mtp: false,
-                last_lp: None,
-                last_mtp_d1: None,
-            });
+                (seq.skip, 0, seq.d_buf),
+                (seq.skip as u32, seq.m_tok_buf, seq.m_tap_buf),
+            ));
             self.active.push(act);
             let idx = self.active.len() - 1;
             self.solo_draft(idx)?;
@@ -589,21 +673,26 @@ impl BatchMtp<'_> {
             let dt = self.read_dual_d_taps(&taps, len)?;
             push_tail(&mut seq.d_buf, &dt, d_w);
         }
-        let avail = self.depth.min(act.room(self.max_ctx));
+        let avail = self.depth.min(act.room(self.core.max_ctx));
         act.drafts = if avail > 0 {
-            let job = DraftJob {
-                active_idx: 0,
+            let dual_stride = dual_widths.map(|(d_w, m_w)| (d_w, d_w + m_w));
+            let job = MtpJob {
                 slot: act.slot,
                 old_start: pos0 as u32,
                 new_start: n,
-                committed: shifted,
+                tokens: &shifted,
                 tap_row_off: 0,
-                avail,
             };
-            let got = self
-                .draft_batch(&[job], &taps, dual_widths.is_some())?
-                .pop()
-                .unwrap_or_default();
+            let got = draft_mtp_batch(
+                self.core.target,
+                self.drafter,
+                &[job],
+                &taps,
+                dual_stride,
+                avail,
+            )?
+            .pop()
+            .unwrap_or_default();
             act.mtp_valid = n;
             got
         } else {
@@ -616,23 +705,28 @@ impl BatchMtp<'_> {
 
     fn verify_and_draft(&mut self) -> Result<(), Error> {
         let s_count = self.active.len();
-        let (rows, spans, sampling) = verify_rows(&self.active, self.max_ctx, |s| s);
-        let (mut out, raw_taps) = self.target.step_verify_local(&rows, sampling)?;
+        let (rows, spans, sampling) = verify_rows(&self.active, self.core.max_ctx, |s| s);
+        let (mut out, raw_taps) = self.core.target.step_verify_local(&rows, sampling)?;
         let dual_info = self.dual.as_ref().map(|p| (p.d_width, p.block));
-        let ranked = self.target.control.is_some();
+        let ranked = self.core.target.control.is_some();
         let mut jobs: Vec<DraftJob> = Vec::with_capacity(s_count);
         let mut finished: Vec<bool> = vec![false; s_count];
         for (i, &(off, k)) in spans.iter().enumerate() {
             let old_start = self.active[i].start as u32;
-            let (_, committed, done) =
-                self.active[i].apply_verify(k, off, &mut out, self.max_ctx, &mut self.hash);
+            let (_, committed, done) = self.active[i].apply_verify(
+                k,
+                off,
+                &mut out,
+                self.core.max_ctx,
+                &mut self.core.hash,
+            );
             let seq = &mut self.active[i];
             seq.history.extend_from_slice(&committed);
             if done.is_some() || (!ranked && seq.cancelled) {
                 finished[i] = true;
                 continue;
             }
-            let avail = self.depth.min(seq.room(self.max_ctx));
+            let avail = self.depth.min(seq.room(self.core.max_ctx));
             if avail > 0 {
                 jobs.push(DraftJob {
                     active_idx: i,
@@ -652,7 +746,7 @@ impl BatchMtp<'_> {
             && dual_info.is_some_and(|(_, block)| {
                 let seq = &self.active[jobs[0].active_idx];
                 let rem = seq.request.max_tokens.saturating_sub(seq.emitted);
-                seq.start + block <= self.max_ctx && rem >= PROMOTE_MIN_REM
+                seq.start + block <= self.core.max_ctx && rem >= PROMOTE_MIN_REM
             });
         if promote {
             let job = jobs.remove(0);
@@ -673,23 +767,37 @@ impl BatchMtp<'_> {
                     push_tail(&mut self.active[job.active_idx].d_tail, &d_all[lo..hi], d_w);
                 }
             }
-            let drafts_all = self.draft_batch(&jobs, &raw_taps, dual_info.is_some())?;
+            let chain_n = jobs.iter().map(|j| j.avail).min().unwrap_or(0);
+            let dual_stride = self
+                .dual
+                .as_ref()
+                .map(|p| (p.d_width, p.d_width + p.m_width));
+            let mtp_jobs: Vec<MtpJob<'_>> = jobs
+                .iter()
+                .map(|j| MtpJob {
+                    slot: j.slot,
+                    old_start: j.old_start,
+                    new_start: j.new_start,
+                    tokens: &j.committed,
+                    tap_row_off: j.tap_row_off,
+                })
+                .collect();
+            let drafts_all = draft_mtp_batch(
+                self.core.target,
+                self.drafter,
+                &mtp_jobs,
+                &raw_taps,
+                dual_stride,
+                chain_n,
+            )?;
             for (job, drafts) in jobs.into_iter().zip(drafts_all) {
                 let seq = &mut self.active[job.active_idx];
                 seq.drafts = drafts;
                 seq.mtp_valid = job.new_start;
             }
         }
-        let mut idx = 0usize;
-        let mut orig = 0usize;
-        while idx < self.active.len() {
-            if finished[orig] {
-                let seq = self.active.remove(idx);
-                self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
-            } else {
-                idx += 1;
-            }
-            orig += 1;
+        for seq in retire_finished(&mut self.active, &finished) {
+            self.retire_slot(seq.slot, seq.history, seq.mtp_valid);
         }
         Ok(())
     }
@@ -716,192 +824,12 @@ impl BatchMtp<'_> {
                 self.drafter.run_taps(slot, pos0, tokens, h, wants, true)?;
             }
             TapsBuf::Host(v) => {
-                let mut mt = Vec::with_capacity(tokens.len() * m_w);
-                for r in 0..tokens.len() {
-                    let lo = r * stride + d_w;
-                    mt.extend_from_slice(&v[lo..lo + m_w]);
-                }
+                let mt = take_cols(v, tokens.len(), stride, d_w, m_w);
                 self.drafter
                     .run_taps(slot, pos0, tokens, TapsIn::Host(&mt), wants, true)?;
             }
         }
         Ok(())
-    }
-
-    /// Runs batched first-form MTP plus shared chain steps for `jobs`.
-    pub(crate) fn draft_batch(
-        &mut self,
-        jobs: &[DraftJob],
-        taps: &TapsBuf,
-        strided: bool,
-    ) -> Result<Vec<Vec<u32>>, Error> {
-        let n = jobs.len();
-        let chain_n = jobs.iter().map(|j| j.avail).min().unwrap_or(0);
-        if chain_n == 0 {
-            return Ok(vec![Vec::new(); n]);
-        }
-        let hidden = self.drafter.hidden();
-        let wants = self.drafter.wants();
-        let (col_off, stride) = match (strided, self.dual.as_ref()) {
-            (true, Some(p)) => (p.d_width, p.d_width + p.m_width),
-            _ => (0, hidden),
-        };
-        let mut end_rows = Vec::with_capacity(n);
-        let mut total_rows = 0usize;
-        for j in jobs {
-            total_rows += j.committed.len();
-            end_rows.push(total_rows - 1);
-        }
-        let dev_taps = match *taps {
-            TapsBuf::Device { slot, addr, .. } => Some((slot, addr)),
-            TapsBuf::Host(_) => None,
-        };
-        let can_gpu_chain =
-            chain_n >= 2 && dev_taps.is_some_and(|(slot, _)| slot.bytes() >= n * (chain_n - 1) * 4);
-        let host_slices: Vec<Vec<f32>> = match taps {
-            TapsBuf::Host(v) if col_off > 0 => jobs
-                .iter()
-                .map(|j| {
-                    let mut buf = Vec::with_capacity(j.committed.len() * hidden);
-                    for r in 0..j.committed.len() {
-                        let lo = (j.tap_row_off + r) * stride + col_off;
-                        buf.extend_from_slice(&v[lo..lo + hidden]);
-                    }
-                    buf
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let spans: Vec<MtpSpan<'_>> = jobs
-            .iter()
-            .enumerate()
-            .map(|(i, j)| {
-                let h = match taps {
-                    TapsBuf::Device { addr, .. } => TapsIn::Device {
-                        addr: *addr + ((j.tap_row_off * stride + col_off) * 4) as u64,
-                        rows: j.committed.len(),
-                        stride: if col_off > 0 { stride } else { 0 },
-                    },
-                    TapsBuf::Host(_) if col_off > 0 => TapsIn::Host(&host_slices[i]),
-                    TapsBuf::Host(v) => {
-                        let lo = j.tap_row_off * hidden;
-                        let hi = lo + j.committed.len() * hidden;
-                        TapsIn::Host(&v[lo..hi])
-                    }
-                };
-                MtpSpan {
-                    slot: j.slot,
-                    start_pos: j.old_start,
-                    tokens: &j.committed,
-                    hidden: h,
-                }
-            })
-            .collect();
-        let first_wait = !can_gpu_chain;
-        let first_out = self.drafter.run_batch(&spans, wants, first_wait)?;
-        if can_gpu_chain
-            && let Some((tap_slot, tap_addr)) = dev_taps
-            && let (Some(o0), Some(o1)) = (
-                self.drafter.address(first_out[0]),
-                self.drafter.address(first_out[1]),
-            )
-        {
-            let slots: Vec<u32> = jobs.iter().map(|j| j.slot).collect();
-            let mut tok_addrs: Vec<u64> = end_rows.iter().map(|&r| o0 + (r * 4) as u64).collect();
-            let mut hid_addrs: Vec<u64> = end_rows
-                .iter()
-                .map(|&r| o1 + (r * hidden * 4) as u64)
-                .collect();
-            let mut last_out = first_out[0];
-            for step in 1..chain_n {
-                let mut saved_addrs = Vec::with_capacity(n);
-                let mut positions = Vec::with_capacity(n);
-                for (i, j) in jobs.iter().enumerate() {
-                    let off = ((step - 1) * n + i) * 4;
-                    self.target
-                        .runner
-                        .copy_from(tap_slot, off, tok_addrs[i], 4)?;
-                    saved_addrs.push(tap_addr + off as u64);
-                    positions.push((j.new_start - 1 + step) as u32);
-                }
-                let wait = step + 1 == chain_n;
-                let outs = self.drafter.run_chain_batch(
-                    &slots,
-                    &positions,
-                    &saved_addrs,
-                    &hid_addrs,
-                    wants,
-                    wait,
-                )?;
-                last_out = outs[0];
-                if !wait {
-                    let next0 = self
-                        .drafter
-                        .address(outs[0])
-                        .ok_or(RunError::Unaddressed(0))?;
-                    let next1 = self
-                        .drafter
-                        .address(outs[1])
-                        .ok_or(RunError::Unaddressed(0))?;
-                    for i in 0..n {
-                        tok_addrs[i] = next0 + (i * 4) as u64;
-                        hid_addrs[i] = next1 + (i * hidden * 4) as u64;
-                    }
-                }
-            }
-            let saved = self
-                .target
-                .runner
-                .held()
-                .read_u32s(tap_slot, (chain_n - 1) * n)?;
-            let final_ids = self.drafter.ids(last_out)?;
-            let mut out = vec![Vec::with_capacity(chain_n); n];
-            for step in 0..chain_n - 1 {
-                for i in 0..n {
-                    out[i].push(saved[step * n + i]);
-                }
-            }
-            for i in 0..n {
-                out[i].push(final_ids[i]);
-            }
-            return Ok(out);
-        }
-        // Host fallback path (CPU runners or chain_n == 1).
-        let ids = self.drafter.ids(first_out[0])?;
-        let mut out: Vec<Vec<u32>> = end_rows.iter().map(|&r| vec![ids[r]]).collect();
-        if chain_n == 1 {
-            return Ok(out);
-        }
-        let mut prev_hid = self.drafter.read_floats(first_out[1])?;
-        let mut cur_rows: Vec<Vec<f32>> = end_rows
-            .iter()
-            .map(|&r| prev_hid[r * hidden..(r + 1) * hidden].to_vec())
-            .collect();
-        for step in 1..chain_n {
-            let toks: Vec<[u32; 1]> = out.iter().map(|v| [*v.last().unwrap()]).collect();
-            let step_spans: Vec<MtpSpan<'_>> = jobs
-                .iter()
-                .enumerate()
-                .map(|(i, j)| MtpSpan {
-                    slot: j.slot,
-                    start_pos: (j.new_start - 1 + step) as u32,
-                    tokens: &toks[i],
-                    hidden: TapsIn::Host(&cur_rows[i]),
-                })
-                .collect();
-            let outs = self.drafter.run_batch(&step_spans, wants, true)?;
-            let step_ids = self.drafter.ids(outs[0])?;
-            for i in 0..n {
-                out[i].push(step_ids[i]);
-            }
-            if step + 1 < chain_n {
-                prev_hid = self.drafter.read_floats(outs[1])?;
-                for i in 0..n {
-                    cur_rows[i] = prev_hid[i * hidden..(i + 1) * hidden].to_vec();
-                }
-            }
-        }
-        Ok(out)
     }
 }
 
