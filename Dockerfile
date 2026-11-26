@@ -16,8 +16,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/tesserax /usr/local/bin/tesserax
 
 # tesserax loads the CUDA driver and NVRTC at runtime. The driver comes
-# from the host through the NVIDIA container runtime.
-FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04 AS runtime-cuda
+# from the host through the NVIDIA container runtime. The base image
+# has no CUDA libraries, so the image holds only NVRTC.
+FROM nvidia/cuda:13.0.1-base-ubuntu24.04 AS runtime-cuda
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates cuda-nvrtc-13-0 libibverbs1 ibverbs-providers \

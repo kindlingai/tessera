@@ -14,6 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Tested images by tree, and the layer cache of the docker job.
+  CI_IMAGE: ghcr.io/${{ github.repository }}-ci
 
 jobs:
   commits:
@@ -52,7 +54,8 @@ jobs:
       build: ${{ steps.reuse.outputs.build }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       macos: ${{ steps.reuse.outputs.macos }}
-      docker: ${{ steps.reuse.outputs.docker }}
+      docker: ${{ steps.image.outputs.docker || steps.reuse.outputs.docker }}
+      mounts: ${{ steps.mounts.outputs.key }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +104,36 @@ jobs:
           [ "$reuse" = false ] || BUILD=false
           [ "$reuse" = false ] || DOCKER=false
           printf 'build=%s\nreuse=%s\nmacos=%s\ndocker=%s\n' "$BUILD" "$reuse" "$macos" "$DOCKER" | tee -a "$GITHUB_OUTPUT"
+      # The docker job's Cargo cache mounts change only with these files.
+      - id: mounts
+        run: echo "key=${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'Dockerfile') }}" | tee -a "$GITHUB_OUTPUT"
+      # A push to main skips the image when its merge group built and
+      # checked the same tree, and main holds the cache mounts for it.
+      - if: github.event_name == 'push' && steps.reuse.outputs.docker == 'true'
+        id: mounts-cuda
+        uses: actions/cache/restore@v4
+        with:
+          path: cargo-mounts
+          key: docker-mounts-cuda-${{ steps.mounts.outputs.key }}
+          lookup-only: true
+      - if: github.event_name == 'push' && steps.reuse.outputs.docker == 'true'
+        id: mounts-rocm
+        uses: actions/cache/restore@v4
+        with:
+          path: cargo-mounts
+          key: docker-mounts-rocm-${{ steps.mounts.outputs.key }}
+          lookup-only: true
+      - if: >
+          github.event_name == 'push' &&
+          steps.mounts-cuda.outputs.cache-hit == 'true' &&
+          steps.mounts-rocm.outputs.cache-hit == 'true'
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker=true
+          if [ "$(tools/scripts/image-built.sh cuda rocm)" = true ]; then docker=false; fi
+          echo "docker=$docker" | tee -a "$GITHUB_OUTPUT"
 
   lint:
     # Code-shape rules and task maps (stickler lint), and formatting.
@@ -433,25 +466,39 @@ jobs:
             libs: libnvrtc.so.13
           - backend: rocm
             libs: libamdhip64.so.7 libhiprtc.so.7
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - run: >
           kubectl kustomize "deploy/k8s/${{ matrix.backend }}" |
           docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary -
       - uses: docker/setup-buildx-action@v3
-      # The Cargo registry and target/ cache mounts from the last push to
-      # main. Only pushes save them, so pull requests do not fill the cache.
+      # A fork's token may not read the registry. The build then runs
+      # without the layer cache.
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The Cargo registry and target/ cache mounts, from main. Only
+      # pushes save them, so pull requests do not fill the cache. The key
+      # changes only with the files that change the dependencies, so a
+      # push saves it once and later pushes may skip the image.
       - if: github.event_name == 'push'
+        id: mounts
         uses: actions/cache@v4
         with:
           path: cargo-mounts
-          key: docker-mounts-${{ matrix.backend }}-${{ github.sha }}
+          key: docker-mounts-${{ matrix.backend }}-${{ needs.changes.outputs.mounts }}
           restore-keys: docker-mounts-${{ matrix.backend }}-
       - if: github.event_name != 'push'
         uses: actions/cache/restore@v4
         with:
           path: cargo-mounts
-          key: docker-mounts-${{ matrix.backend }}-${{ github.sha }}
+          key: docker-mounts-${{ matrix.backend }}-${{ needs.changes.outputs.mounts }}
           restore-keys: docker-mounts-${{ matrix.backend }}-
       - uses: reproducible-containers/buildkit-cache-dance@v3
         with:
@@ -460,16 +507,21 @@ jobs:
               "cargo-mounts/registry": "/usr/local/cargo/registry",
               "cargo-mounts/target": "/src/target"
             }
-          skip-extraction: ${{ github.event_name != 'push' }}
+          skip-extraction: ${{ github.event_name != 'push' || steps.mounts.outputs.cache-hit == 'true' }}
       # Layers from earlier runs, so an unchanged tree skips the build.
+      # The registry cache is not tied to a branch, so the merge queue
+      # and main use the same cache. Pull requests do not write to the registry.
       - uses: docker/build-push-action@v6
         with:
           context: .
           load: true
           tags: tesserax:ci
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: BACKEND=${{ matrix.backend }}
-          cache-from: type=gha,scope=docker-${{ matrix.backend }}
-          cache-to: ${{ github.event_name == 'push' && format('type=gha,scope=docker-{0},mode=max', matrix.backend) || '' }}
+          cache-from: type=registry,ref=${{ env.CI_IMAGE }}:cache-${{ matrix.backend }}
+          cache-to: >-
+            ${{ github.event_name != 'pull_request' &&
+            format('type=registry,ref={0}:cache-{1},mode=max,ignore-error=true', env.CI_IMAGE, matrix.backend) || '' }}
       - run: docker image ls tesserax:ci --format 'image size {{.Size}}'
       - run: >
           docker run --rm -v "$PWD/tools/scripts:/scripts:ro" --entrypoint /bin/sh
@@ -481,6 +533,17 @@ jobs:
           cat "$RUNNER_TEMP/usage"
           [ "$code" -eq 2 ]
           grep -q '^usage: tesserax' "$RUNNER_TEMP/usage"
+      # The checked image, tagged by tree. A push to main with the same
+      # tree then skips the build: see tools/scripts/image-built.sh. A
+      # failed push only means that later build runs.
+      - if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          TAG: ${{ env.CI_IMAGE }}:${{ matrix.backend }}
+        run: |
+          tag="$TAG-$(git rev-parse 'HEAD^{tree}')"
+          docker tag tesserax:ci "$tag"
+          docker push "$tag"
 
   success:
     # The one check to require: every job above passed or was skipped
