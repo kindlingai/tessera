@@ -3,6 +3,7 @@
 mod git;
 mod hunk;
 mod lists;
+mod names;
 mod replay;
 mod seal;
 

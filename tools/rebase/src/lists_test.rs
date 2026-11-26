@@ -77,11 +77,7 @@ fn mixed_hunk_refused() {
 
 #[test]
 fn edited_line_refused() {
-    let hunk = conflict(
-        "use a::{B, C};\n",
-        "use a::{B};\n",
-        "use a::{B};\nuse d::D;\n",
-    );
+    let hunk = conflict("use a::{C};\n", "use a::{B};\n", "use a::{B};\nuse d::D;\n");
     assert_eq!(refusal("a.rs", &hunk, "changes or removes"), Some(1));
     let hunk = conflict(
         "ring = \"0.17\"\n",
@@ -90,4 +86,26 @@ fn edited_line_refused() {
     );
     let text = format!("[dependencies]\n{hunk}");
     assert_eq!(refusal("Cargo.toml", &text, "changes or removes"), Some(2));
+}
+
+#[test]
+fn edited_uses_join() {
+    let hunk = conflict(
+        "use a::B;\nuse a::c::D;\n",
+        "use a::B;\n",
+        "#[cfg(test)]\nuse t::T;\nuse a::{self, B, E as F};\npub use g::*;\n",
+    );
+    let joined =
+        "use a::{B, E as F, self};\nuse a::c::D;\npub use g::*;\n#[cfg(test)]\nuse t::T;\n";
+    assert_eq!(resolve("a.rs", &hunk).unwrap(), joined);
+    let hunk = conflict(
+        "    A, B, C,\n    D,\n",
+        "    A, B,\n    D,\n",
+        "    A, B, D,\n    x::{Y, Z},\n",
+    );
+    let text = format!("use m::{{\n{hunk}}};\n");
+    assert_eq!(
+        resolve("a.rs", &text).unwrap(),
+        "use m::{\n    A, B, C, D, x::{Y, Z},\n};\n"
+    );
 }

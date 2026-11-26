@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use crate::hunk::{Hunk, Part, Refusal, parts};
+use crate::names::{Side, join};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -19,7 +20,14 @@ enum Kind {
 type Entry<'s, 'a> = &'s [&'a str];
 
 const NOT_LIST: &str = "a line is not a `use`, `mod` or dependency entry";
-const EDITED: &str = "a side changes or removes an existing line";
+const EDITED: &str = "a side changes or removes an existing entry";
+
+enum Joined<'a> {
+    /// Lines of the two sides, as they were.
+    Lines(Vec<&'a str>),
+    /// New text for edited `use` lines.
+    Text(String),
+}
 const NOT_GROUP: &str = "the lines are not inside a `use` group";
 const NOT_TABLE: &str = "the lines are not inside a dependency table";
 
@@ -30,22 +38,31 @@ pub fn resolve(path: &str, text: &str) -> Result<String, Refusal> {
         let why = "the file is not Rust source or `Cargo.toml`";
         return Err(Refusal { line: 1, why });
     }
-    let mut out: Vec<&str> = Vec::new();
+    let mut out = String::new();
+    let mut before: Vec<&str> = Vec::new();
     for part in parts(text)? {
         match part {
-            Part::Line(line) => out.push(line),
+            Part::Line(line) => {
+                out.push_str(line);
+                before.push(line);
+            }
             Part::Hunk(hunk) => {
                 let line = hunk.line;
-                let lines = union(&hunk, &out, toml).map_err(|why| Refusal { line, why })?;
-                out.extend(lines);
+                match union(&hunk, &before, toml).map_err(|why| Refusal { line, why })? {
+                    Joined::Text(text) => out.push_str(&text),
+                    Joined::Lines(lines) => {
+                        out.push_str(&lines.concat());
+                        before.extend(lines);
+                    }
+                }
             }
         }
     }
-    Ok(out.concat())
+    Ok(out)
 }
 
 /// Both sides' entries, with the base entries in place.
-fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Vec<&'a str>, &'static str> {
+fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Joined<'a>, &'static str> {
     let (ours_kind, ours) = entries(&hunk.ours, toml).ok_or(NOT_LIST)?;
     let (base_kind, base) = entries(&hunk.base, toml).ok_or(NOT_LIST)?;
     let (theirs_kind, theirs) = entries(&hunk.theirs, toml).ok_or(NOT_LIST)?;
@@ -56,13 +73,22 @@ fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Vec<&'a str
         }
         kind = Some(found);
     }
-    match kind.ok_or(NOT_LIST)? {
+    let kind = kind.ok_or(NOT_LIST)?;
+    match kind {
         Kind::Item if !in_group(before) => return Err(NOT_GROUP),
         Kind::Dep if !in_table(before) => return Err(NOT_TABLE),
         _ => {}
     }
-    let ours_gaps = gaps(&ours, &base).ok_or(EDITED)?;
-    let theirs_gaps = gaps(&theirs, &base).ok_or(EDITED)?;
+    let (Some(ours_gaps), Some(theirs_gaps)) = (gaps(&ours, &base), gaps(&theirs, &base)) else {
+        // An edited `use` line can still keep each imported name.
+        if !matches!(kind, Kind::Use | Kind::Item) {
+            return Err(EDITED);
+        }
+        let items = kind == Kind::Item;
+        let side = |entries| Side { entries, items };
+        let text = join(&side(&ours), &side(&base), &side(&theirs));
+        return text.map(Joined::Text).ok_or(EDITED);
+    };
     let mut seen: HashSet<Entry> = ours.iter().copied().collect();
     let mut out = Vec::new();
     for (i, (ours, theirs)) in ours_gaps.iter().zip(&theirs_gaps).enumerate() {
@@ -79,7 +105,7 @@ fn union<'a>(hunk: &Hunk<'a>, before: &[&str], toml: bool) -> Result<Vec<&'a str
             out.extend_from_slice(entry);
         }
     }
-    Ok(out)
+    Ok(Joined::Lines(out))
 }
 
 /// A side's added entries around the base entries, else `None`.
@@ -127,7 +153,7 @@ fn entries<'s, 'a>(lines: &'s [&'a str], toml: bool) -> Option<(Option<Kind>, Ve
 }
 
 /// An attribute or comment line before an entry.
-fn prefix(line: &str, toml: bool) -> bool {
+pub fn prefix(line: &str, toml: bool) -> bool {
     if toml {
         return line.starts_with('#');
     }
@@ -152,7 +178,7 @@ fn kind(line: &str, toml: bool) -> Option<Kind> {
 }
 
 /// The line without `pub` or `pub(...)`.
-fn after_vis(line: &str) -> &str {
+pub fn after_vis(line: &str) -> &str {
     let Some(rest) = line.strip_prefix("pub") else {
         return line;
     };
