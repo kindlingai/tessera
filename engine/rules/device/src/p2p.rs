@@ -21,7 +21,7 @@ const FP8_ENTRY: &str = "tessera_p2p_sum_fp8";
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
 /// Floats per chunk. Larger sums loop over chunks.
-const MAX_FLOATS: usize = 2 << 20;
+const MAX_FLOATS: usize = 4 << 20;
 const MAX_BYTES: usize = MAX_FLOATS * 4;
 /// Slot stride: max payload plus a fixed tail page.
 pub(crate) const SLOT_BYTES: usize = MAX_BYTES + 4096;

@@ -5,9 +5,9 @@ using namespace tessera;
 namespace p2p {
 
 constexpr u32 MAX_RANKS = 8;
-constexpr u32 MAX_FLOATS = 2u << 20;
-constexpr u32 H16_MAX_FLOATS = (4u << 20) - 16u;
-constexpr u32 FP8_MAX_FLOATS = 6u << 20;
+constexpr u32 MAX_FLOATS = 4u << 20;
+constexpr u32 H16_MAX_FLOATS = (8u << 20) - 16u;
+constexpr u32 FP8_MAX_FLOATS = 14u << 20;
 constexpr u64 MAX_BYTES = u64(MAX_FLOATS) * 4ull;
 constexpr u64 FP8_SCALE_OFF = u64(FP8_MAX_FLOATS);
 constexpr u64 FP8_TAIL_OFF = FP8_SCALE_OFF + u64(FP8_MAX_FLOATS / 16u) * 2ull;
