@@ -159,9 +159,9 @@ fn fast_mm_selection() {
             Some((kind, entry, 2))
         );
     }
-    // Out-of-range M and unaligned K are rejected.
+    // One row and unaligned K decline. Tall M is accepted.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
-    assert_eq!(mm_entry(&linear(&rows, 6144, 576), 2049, "mxfp8"), None);
+    assert!(mm_entry(&linear(&rows, 6144, 576), 4096, "mxfp8").is_some());
     assert_eq!(mm_entry(&linear(&rows, 256, 64), 8, "mxfp8"), None);
     // Fused epilogues: residual, bias, SwiGLU, mul, silu.
     let base = linear(&rows, 4096, 12288);

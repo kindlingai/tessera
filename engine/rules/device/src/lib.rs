@@ -33,7 +33,7 @@ pub use tessera_gpukit::backend::Backend;
 
 pub(crate) use layout::EDITION;
 
-/// Maximum rows handled by built-in fast CUDA prefill kernels.
+/// Default prefill step rows, and the end of fine buckets.
 pub const FAST_MAX_ROWS: usize = 2048;
 
 /// Flattens one built-in kernel source into a static string.

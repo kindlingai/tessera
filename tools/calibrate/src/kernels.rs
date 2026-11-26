@@ -6,10 +6,15 @@ use tessera_engine::{Error, block, trellis};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, Graph};
 use tessera_lower::form::{BF16_FORM, Load};
-use tessera_lower::{Backend, Device, Pick, Pins, Plan, Settings, Tensor, View, lower, select};
+use tessera_lower::{
+    Backend, Device, Knobs, Pick, Pins, Plan, Settings, Tensor, View, lower, select,
+};
 use tessera_run::{Run, open};
 use tessera_testkit::graphs::{blocks, finished, linear, picked};
 use tessera_testkit::{Noise, max_abs_diff};
+
+/// Row counts from 16 up to twice the old cap.
+const TALL: &[u64] = &[16, 64, 256, 640, 1024, 2048, 4096];
 
 /// Launches of one step in each timed try.
 const REPS: usize = 100;
@@ -27,6 +32,8 @@ struct Case {
     g: Graph,
     pins: Pins,
     rows: &'static [u64],
+    /// Kernel shape values the device sets.
+    knobs: Knobs,
 }
 
 fn cases() -> Vec<Case> {
@@ -37,6 +44,7 @@ fn cases() -> Vec<Case> {
         g,
         pins: pins.clone(),
         rows,
+        knobs: Knobs::default(),
     };
     let bf16 = Pins::all(BF16_FORM);
     let mut all = Vec::new();
@@ -68,13 +76,23 @@ fn cases() -> Vec<Case> {
         ));
     }
     let g = linear(&one, 2560, 2560);
-    all.push(case(
-        "fast_mm",
-        "2560x2560".into(),
-        g.clone(),
-        &bf16,
-        &[16, 64, 256],
-    ));
+    let mxfp8 = Pins::all(&block::MXFP8);
+    all.push(case("fast_mm", "2560x2560".into(), g.clone(), &bf16, TALL));
+    let what = "2560x2560 mxfp8".into();
+    all.push(case("fast_mm", what, g.clone(), &mxfp8, TALL));
+    // Forced splits. bf16 splits need n%32 > 0.
+    for (spot, [k, n], pins) in [
+        ("fast_mm_bf16_sk", [2560, 2544], &bf16),
+        ("fast_mm_mxfp8_sk", [4096, 2560], &mxfp8),
+    ] {
+        let (g, what) = (linear(&one, k, n), format!("{k}x{n} {spot}=4"));
+        let mut split = case("fast_mm", what, g, pins, TALL);
+        split
+            .knobs
+            .set(&format!("{spot}:splits"), 4)
+            .expect("a knob");
+        all.push(split);
+    }
     let g3 = Pins::all(&trellis::TRELLIS_K3_PMCGX);
     all.push(case("trellis_mma", "2560x2560".into(), g, &g3, &[1, 16]));
     let g = blocks(&one, [8, 128, 128]);
@@ -269,13 +287,15 @@ pub fn check_all(settings: &Settings) -> Result<Vec<String>, Error> {
     let all = cases();
     for c in &all {
         let first = [(Rows, c.rows[0])];
-        let guess = Device::guess(settings).pinned(c.pins.clone());
+        let mut guess = Device::guess(settings).pinned(c.pins.clone());
+        guess.knobs = c.knobs.clone();
         let mut runner = open(lower(&c.g, 0, &first, &guess)?, settings)?;
         let host = load(&c.g, &mut *runner, &mut noise)?;
         let platform = runner.platform();
         backend = Backend::named(&platform.backend);
         let device = Device::stored(platform, settings).map_err(tessera_lower::Error::from)?;
-        let device = device.pinned(c.pins.clone());
+        let mut device = device.pinned(c.pins.clone());
+        device.knobs = c.knobs.clone();
         println!("{} {} on {}:", c.rule, c.what, device.name);
         for &rows in c.rows {
             let held = (&mut runner, &device);

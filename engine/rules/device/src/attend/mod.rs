@@ -351,11 +351,7 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         width == want && kw == want && v_width,
         "head width {width} (requires {want})"
     );
-    let most_rows = crate::FAST_MAX_ROWS;
-    require!(
-        (1..=most_rows).contains(&rows),
-        "rows={rows} (max {most_rows})"
-    );
+    require!(rows > 0, "rows={rows} (requires at least 1)");
     let groups = kv_heads > 0 && heads.is_multiple_of(kv_heads);
     require!(
         groups,
