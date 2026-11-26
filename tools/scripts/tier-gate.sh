@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fails when HEAD conflicts with a labelled PR of a higher tier.
 # Tiers, highest first: priority, landing, then PRs with neither label.
-# Inside a tier, the PR labelled first ranks first.
+# Inside a tier, the PR labelled first ranks first. Landing PRs do not
+# block each other: the first to merge wins, and the others rebase.
 # Reads labels and CI live, so a rerun sees changes.
 # Needs GH_TOKEN, GITHUB_REPOSITORY, HEAD, BASE, MAIN, and PR or
 # QUEUE_REF. BASE is the commit HEAD adds its changes to.
@@ -62,10 +63,12 @@ stack() {
 # Rank order. A PR that conflicts with main and the PRs ranked
 # before it loses. It drops out, so it does not break the base
 # for lower ranks.
+mine=$(awk -v pr="$PR" '$3 == pr { print $5 }' "$tmp/ranked")
 chain=origin/$main
 active=
 while read -r _ _ n sha label; do
     [ "$n" != "$PR" ] || break
+    [ "$mine" != landing ] || [ "$label" != landing ] || break
     code=0
     next=$(stack "$chain" "$sha") || code=$?
     [ "$code" -le 1 ] || fail "git merge-tree failed on #$n."
