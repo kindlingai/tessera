@@ -97,6 +97,8 @@ struct Buffers<'a> {
     slots: Vec<Option<Slot>>,
     /// Per value: the position of its last reader.
     last: Vec<usize>,
+    /// Execution lane for each step in `order`.
+    lanes: Vec<u8>,
     /// Temp values freed at a later join step.
     deferred: Vec<Vec<Val>>,
     /// One scratch arena per zone, made on first use.
@@ -111,7 +113,8 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
             last[v.0 as usize] = at;
         }
     }
-    // Keep comm-lane inputs alive until compute joins on their output.
+    // Keep overlapped comm inputs live until compute joins.
+    let mut lanes = vec![0u8; order.len()];
     let mut extended = vec![false; s.values.len()];
     for (at, &i) in order.iter().enumerate() {
         let op = &s.ops[i];
@@ -128,6 +131,14 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
                 (!crosses(later.kernel.name()) && reads_out).then_some(at + 1 + d)
             })
             .unwrap_or(FOREVER);
+        let end = join.min(order.len());
+        if !order[at + 1..end]
+            .iter()
+            .any(|&j| !crosses(s.ops[j].kernel.name()))
+        {
+            continue;
+        }
+        lanes[at] = 1;
         for v in &op.reads {
             if join > last[v.0 as usize] {
                 last[v.0 as usize] = join;
@@ -171,6 +182,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
         plan,
         slots: vec![None; s.values.len()],
         last,
+        lanes,
         deferred,
         scratch: BTreeMap::new(),
     };
@@ -446,7 +458,7 @@ impl Buffers<'_> {
             also,
             covers: op.covers.clone(),
             zone: op.zone,
-            lane: u8::from(crosses(op.kernel.name())),
+            lane: self.lanes[at],
             table: self.plan.table,
         });
         for (k, v) in op.reads.iter().enumerate() {

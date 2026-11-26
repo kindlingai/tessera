@@ -1,5 +1,6 @@
 use crate::lanes::LaneSync;
-use tessera_lower::kernels::Map;
+use tessera_graph::DType;
+use tessera_lower::kernels::{AllReduce, Map};
 use tessera_lower::{KernelRef, Slot, Step};
 
 fn dummy(lane: u8, reads: Vec<Slot>, write: Slot) -> Step {
@@ -50,4 +51,22 @@ fn leading_comm_forks() {
     assert_eq!(sync.forks.len(), 1);
     assert_eq!(sync.forks[0].0, 1);
     assert_eq!(sync.joins, vec![sync.records[0].unwrap()]);
+}
+
+#[test]
+fn collectives_serialize_across_lanes() {
+    let ar = |lane, r, w| Step {
+        kernel: KernelRef::new(AllReduce {
+            len: 4,
+            wire: DType::F32,
+        }),
+        ..dummy(lane, vec![r], w)
+    };
+    let steps = vec![
+        ar(1, Slot::floats(0, 4), Slot::floats(1, 4)),
+        ar(0, Slot::floats(2, 4), Slot::floats(3, 4)),
+    ];
+    let sync = LaneSync::plan(&steps);
+    assert_eq!(sync.waits[1], vec![sync.records[0].unwrap()]);
+    assert!(sync.joins.is_empty());
 }

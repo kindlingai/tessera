@@ -993,5 +993,6 @@ fn comm_overlaps_compute() {
         ..selected
     };
     let chain_plan = assign(&chain, &schedule(&chain));
+    assert!(chain_plan.steps.iter().all(|s| s.lane == 0));
     assert!(chain_plan.buffers[chain_plan.steps[0].write.buffer as usize] <= 1024);
 }

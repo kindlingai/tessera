@@ -103,6 +103,14 @@ where
             .u64(self.timeout_ticks);
     }
 
+    fn max_grid(&self, full: u32) -> u32 {
+        if self.ctx.active_lane() != 0 {
+            (self.ctx.platform().units as u32 / 6).clamp(4, 8)
+        } else {
+            full
+        }
+    }
+
     fn launch_sum_kernel(
         &mut self,
         from: u64,
@@ -119,12 +127,7 @@ where
         } else {
             THREADS * 8
         };
-        let max_grid = if self.ctx.active_lane() != 0 {
-            (self.ctx.platform().units as u32 / 6).clamp(4, 8)
-        } else {
-            48
-        };
-        let grid = n.div_ceil(step).clamp(1, max_grid);
+        let grid = n.div_ceil(step).clamp(1, self.max_grid(48));
         let kernel = match (two, wire) {
             (false, DType::Bf16) => &self.one_bf16,
             (false, DType::Fp8) => &self.one_fp8,
@@ -212,7 +215,7 @@ where
             let mut args = self.base_args();
             args.u64(f).u64(t).u32(r_cnt as u32).u32(width as u32);
             self.finish_args(&mut args);
-            let grid = ((r_cnt * cols) as u32 / (THREADS * 4)).clamp(1, 64);
+            let grid = ((r_cnt * cols) as u32 / (THREADS * 4)).clamp(1, self.max_grid(64));
             self.ctx.programmatic(false);
             self.ctx
                 .launch(&self.allgather, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?;

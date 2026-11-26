@@ -320,13 +320,19 @@ where
         Ok(u64::from_ne_bytes(raw))
     }
 
-    fn launch_sum(&mut self, from: u64, to: u64, n: u32, wire: DType) -> Result<(), Error> {
+    fn prepare(
+        &self,
+        bytes: usize,
+        from: u64,
+        to: u64,
+        large_grid: Option<u32>,
+    ) -> Result<(u32, u32, KernelArgs), Error> {
         if self.broken {
             return Err(Error::Plan("an earlier p2p sum failed".into()));
         }
-        let (sched, mut grid) = pick(n as usize * 4, self.ranks, self.schedule, self.cross);
+        let (sched, mut grid) = pick(bytes, self.ranks, self.schedule, self.cross);
         if grid > 1 {
-            grid = self.large_grid;
+            grid = large_grid.unwrap_or(grid);
             if self.ctx.active_lane() != 0 {
                 let cap = (self.ctx.platform().units as u32 / 6).clamp(4, 16);
                 grid = grid.min(cap);
@@ -338,22 +344,38 @@ where
             .device_ptr(self.fault.device_ptr())
             .device_ptr(self.seq.device_ptr())
             .u64(from)
-            .u64(to)
-            .u32(n)
-            .u32(self.ranks)
+            .u64(to);
+        Ok((sched, grid, args))
+    }
+
+    fn finish_launch(
+        &self,
+        kernel: &<D as Device>::Kernel,
+        sched: u32,
+        grid: u32,
+        mut args: KernelArgs,
+    ) -> Result<(), Error> {
+        args.u32(self.ranks)
             .u32(self.rank)
             .u32(sched)
             .u64(self.timeout_ticks);
         self.ctx.programmatic(false);
-        let blocks = (grid, 1, 1);
-        let threads = (self.threads, 1, 1);
+        Ok(self
+            .ctx
+            .launch(kernel, (grid, 1, 1), (self.threads, 1, 1), 0, &mut args)?)
+    }
+
+    fn launch_sum(&mut self, from: u64, to: u64, n: u32, wire: DType) -> Result<(), Error> {
+        let (sched, grid, mut args) =
+            self.prepare(n as usize * 4, from, to, Some(self.large_grid))?;
+        args.u32(n);
         let kernel = match wire {
             DType::Bf16 => &self.bf16_kernel,
             DType::F16 => &self.fp16_kernel,
             DType::Fp8 => &self.fp8_kernel,
             _ => &self.kernel,
         };
-        Ok(self.ctx.launch(kernel, blocks, threads, 0, &mut args)?)
+        self.finish_launch(kernel, sched, grid, args)
     }
 
     fn launch_gather(
@@ -364,30 +386,9 @@ where
         total: u32,
         rows: u32,
     ) -> Result<(), Error> {
-        if self.broken {
-            return Err(Error::Plan("an earlier p2p sum failed".into()));
-        }
-        let (sched, grid) = pick(total as usize * 4, self.ranks, self.schedule, self.cross);
-        let mut args = KernelArgs::new();
-        args.device_ptr(self.areas.device_ptr())
-            .device_ptr(self.counters.device_ptr())
-            .device_ptr(self.fault.device_ptr())
-            .device_ptr(self.seq.device_ptr())
-            .u64(from)
-            .u64(to)
-            .u32(part)
-            .u32(total)
-            .u32(rows)
-            .u32(self.ranks)
-            .u32(self.rank)
-            .u32(sched)
-            .u64(self.timeout_ticks);
-        self.ctx.programmatic(false);
-        let blocks = (grid, 1, 1);
-        let threads = (self.threads, 1, 1);
-        Ok(self
-            .ctx
-            .launch(&self.gather_kernel, blocks, threads, 0, &mut args)?)
+        let (sched, grid, mut args) = self.prepare(total as usize * 4, from, to, None)?;
+        args.u32(part).u32(total).u32(rows);
+        self.finish_launch(&self.gather_kernel, sched, grid, args)
     }
 
     fn status(&mut self) -> Result<(), Error> {

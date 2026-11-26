@@ -1,6 +1,7 @@
 //! Cross-lane hazard analysis and event synchronization for multi-stream plans.
 
 use tessera_gpukit::device::Device;
+use tessera_lower::kernels::crosses;
 use tessera_lower::{Slot, Step};
 
 /// Maximum distinct execution lanes tracked per plan.
@@ -34,6 +35,9 @@ fn writes(step: &Step) -> impl Iterator<Item = Slot> + '_ {
 }
 
 fn hazards(earlier: &Step, later: &Step) -> bool {
+    if crosses(earlier.kernel.name()) && crosses(later.kernel.name()) {
+        return true;
+    }
     let raw = writes(earlier).any(|w| later.reads.iter().any(|&r| overlaps(w, r)));
     let war = earlier
         .reads
