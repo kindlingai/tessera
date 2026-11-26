@@ -4,6 +4,8 @@
 mod device_test;
 mod gemv;
 pub(crate) mod mm;
+#[cfg(test)]
+mod stacked_test;
 
 use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
@@ -19,6 +21,7 @@ use tessera_lower::{
 
 const KERNEL: &str = include_str!("linear.cu");
 const PREFILL: &str = include_str!("prefill.cu");
+const STACKED: &str = include_str!("stacked.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
@@ -37,9 +40,21 @@ pub(crate) fn prefill_source() -> &'static str {
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prefill.kernel", PREFILL))
 }
 
-pub(crate) fn prefill_source_entry(entry: &'static str) -> Source {
+fn prefill_source_entry(entry: &'static str) -> Source {
     Source::Fixed {
         text: ByBackend(["", prefill_source(), ""]),
+        entry,
+    }
+}
+
+pub(crate) fn stacked_source() -> &'static str {
+    static CUDA: OnceLock<&'static str> = OnceLock::new();
+    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "stacked.kernel", STACKED))
+}
+
+fn stacked_source_entry(entry: &'static str) -> Source {
+    Source::Fixed {
+        text: ByBackend(["", stacked_source(), ""]),
         entry,
     }
 }
@@ -468,7 +483,7 @@ pub(crate) fn weight_accepts(input: usize, expected: &dyn Stored, form: &dyn Sto
     emits = f32_only,
     needs = stacked_needs(self),
     order = Order::PerConfig,
-    source = stacked_source(self),
+    source = stacked_source_for(self),
     launches = stacked_launches,
     load = stacked_load,
     unproven,
@@ -489,6 +504,18 @@ struct FastStacked {
 }
 
 impl FastStacked {
+    fn wide_64(&self) -> bool {
+        self.wide && self.rows >= 32 && self.n.is_multiple_of(64) && self.k.is_multiple_of(32)
+    }
+
+    fn lanes_64(&self) -> bool {
+        !self.wide && self.rows >= 32 && self.n.is_multiple_of(64) && self.k.is_multiple_of(32)
+    }
+
+    fn tiled_64(&self) -> bool {
+        self.wide_64() || self.lanes_64()
+    }
+
     fn lanes_tc(&self) -> bool {
         !self.wide && self.n.is_multiple_of(16) && self.k.is_multiple_of(128)
     }
@@ -499,6 +526,12 @@ fn stacked_accepts(k: &FastStacked, input: usize, form: &dyn Stored) -> bool {
 }
 
 fn stacked_needs(k: &FastStacked) -> Needs {
+    if k.tiled_64() {
+        return Needs {
+            bf16_tile: true,
+            ..cuda_needs(64 * 18 * 4 * 2 + 64 * 40 * 2)
+        };
+    }
     if !(k.wide || k.lanes_tc()) {
         return cuda_needs(0);
     }
@@ -514,19 +547,33 @@ fn stacked_needs(k: &FastStacked) -> Needs {
     }
 }
 
-fn stacked_source(k: &FastStacked) -> Source {
-    cuda_source_entry(match (k.wide, k.lanes_tc()) {
-        (true, _) => "tessera_stacked_wide",
-        (false, true) => "tessera_stacked_lanes_tc",
-        (false, false) => "tessera_stacked_lanes",
-    })
+fn stacked_source_for(k: &FastStacked) -> Source {
+    match (k.wide, k.tiled_64(), k.lanes_tc()) {
+        (true, true, _) => stacked_source_entry("tessera_stacked_wide_64"),
+        (false, true, _) => stacked_source_entry("tessera_stacked_lanes_64"),
+        (true, false, _) => stacked_source_entry("tessera_stacked_wide"),
+        (false, false, true) => cuda_source_entry("tessera_stacked_lanes_tc"),
+        (false, false, false) => cuda_source_entry("tessera_stacked_lanes"),
+    }
 }
 
 fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
-    let tc = k.lanes_tc();
-    let rtiles = k.rows.div_ceil(if k.wide || tc { 16 } else { 8 });
+    let (tiled, tc) = (k.tiled_64(), k.lanes_tc());
+    let rtiles = k.rows.div_ceil(match (tiled, k.wide || tc) {
+        (true, _) => 64,
+        (false, true) => 16,
+        (false, false) => 8,
+    });
     let r = k.rows.min(8);
-    let (groups, group, trips, mut trip_ops, flight) = if tc {
+    let (groups, group, trips, mut trip_ops, flight) = if tiled {
+        (
+            (k.n / 64) * k.batches * rtiles,
+            THREADS,
+            k.k as f64 / 32.0,
+            Ops::default(),
+            1024.0,
+        )
+    } else if tc {
         (
             (k.n / 16) * k.batches * rtiles,
             128,
@@ -551,7 +598,7 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
             512.0,
         )
     };
-    trip_ops.fresh = f64::from(u8::from(tc));
+    trip_ops.fresh = f64::from(u8::from(tiled || tc));
     let reads = vec![
         (2 * k.batches * rtiles * k.n * k.k) as f64,
         (4 * k.batches * k.rows * k.k) as f64,
@@ -569,9 +616,11 @@ fn stacked_load(k: &FastStacked, _: usize) -> Option<Load> {
 }
 
 fn stacked_launches(k: &FastStacked, step: &Step) -> Vec<Launch> {
-    let wide = k.wide || k.lanes_tc();
+    let wide = k.wide || k.lanes_tc() || k.tiled_64();
     let bn = k.batches * k.n;
-    let (across, down, threads) = if wide {
+    let (across, down, threads) = if k.tiled_64() {
+        (k.n / 64, k.batches * k.rows.div_ceil(64), THREADS)
+    } else if wide {
         (
             k.n / if k.wide { WIDE_COLS } else { 16 },
             k.batches * k.rows.div_ceil(16),
