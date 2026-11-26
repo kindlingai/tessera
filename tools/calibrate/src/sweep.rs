@@ -1,7 +1,7 @@
 //! Times a subject's plan across the sizes of one dimension.
 
-use crate::plans::feeds;
-use crate::watch::{Subject, opened, subject};
+use crate::routing::{extract_router, prefill_kept, routed_feeds};
+use crate::watch::{Subject, make_loads, opened, subject};
 use crate::{BURST, TRIES, bursts, low, measure};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -9,10 +9,13 @@ use tessera_graph::DimName::{self, Rows};
 use tessera_graph::Size;
 use tessera_lower::{Device, Plan, Settings, Tensor, View, Weight, lower};
 use tessera_run::Run;
-use tessera_testkit::{Noise, weights};
+use tessera_testkit::Noise;
 
-const USAGE: &str = "usage: tessera-calibrate sweep [--over <Dim>] [--sizes <n,n,..>] [--learn] \
-    gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
+const USAGE: &str = "usage: tessera-calibrate sweep [--over <Dim>] [--sizes <n,n,..>] \
+    [--skew <n>] [--learn] gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
+    mla <heads> <rows> <context> [--kv f32|bf16|fp8] | \
+    gqa <heads> <kv heads> <rows> <context> [--kv f32|bf16|fp8] | \
+    moe <experts> <top k> <hidden> <ffn> <rows> [--form <name>] [--skew <n>] [--plain] | \
     model <model dir> [<part>] [--region <kind>.<n>] [<Dim>=<n> ...]";
 /// The first size of a sweep with no sizes given.
 const FIRST: u64 = 16;
@@ -132,11 +135,9 @@ pub(crate) fn points(
     let mut noise = Noise(7);
     let loads: Vec<Weight> = match s.loads.take() {
         Some(loads) => loads,
-        None => weights(&s.g, &mut noise)
-            .into_iter()
-            .map(Weight::Floats)
-            .collect(),
+        None => make_loads(&s.g, &s.pins, &mut noise),
     };
+    let router = extract_router(&s.g, &loads);
     let at = |n: u64| -> Vec<(DimName, u64)> {
         let rest = s.sizes.iter().filter(|(d, _)| *d != over).copied();
         rest.chain([(over, n)]).collect()
@@ -150,7 +151,19 @@ pub(crate) fn points(
     let mut all = Vec::new();
     for &size in sizes {
         let dims = at(size);
-        let fed = feeds(&s.g, &dims, &mut noise)?;
+        let mut p_noise = Noise(19);
+        let pos_offset = prefill_kept(&mut *runner, &s.g, &dims, &device, &mut p_noise)?;
+        let (fed, route_stats) = routed_feeds(
+            &s.g,
+            &dims,
+            router.as_deref(),
+            s.skew,
+            pos_offset,
+            &mut noise,
+        )?;
+        if let Some(stats) = route_stats {
+            println!("routing ({over:?}={size}): {stats}");
+        }
         let views: Vec<View> = fed.iter().map(Tensor::view).collect();
         if learn {
             let graph = (&s.g, 0);
@@ -264,7 +277,7 @@ fn dim(name: &str) -> Option<DimName> {
 
 /// Sweeps the subject in `args` and prints the table.
 pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let (mut over, mut sizes, mut learn, mut at) = (Rows, None, false, 0);
+    let (mut over, mut sizes, mut learn, mut skew, mut at) = (Rows, None, false, None, 0);
     while let Some(arg) = args.get(at) {
         match arg.as_str() {
             "--over" => over = args.get(at + 1).and_then(|d| dim(d)).ok_or(USAGE)?,
@@ -272,6 +285,10 @@ pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
                 let given = args.get(at + 1).ok_or(USAGE)?.split(',');
                 let parsed: Result<Vec<u64>, _> = given.map(str::parse).collect();
                 sizes = Some(parsed.map_err(|_| USAGE)?);
+            }
+            "--skew" => {
+                let val = args.get(at + 1).ok_or(USAGE)?.parse::<f64>();
+                skew = Some(val.map_err(|_| USAGE)?);
             }
             "--learn" => learn = true,
             _ => break,
@@ -281,6 +298,9 @@ pub fn sweep(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
     let Some(mut s) = subject(&args[at..])? else {
         return Ok(());
     };
+    if let Some(alpha) = skew {
+        s.skew = alpha;
+    }
     let sizes = sizes.unwrap_or_else(|| doubling(&s, over));
     let points = points(&mut s, over, &sizes, settings, learn)?;
     print!("{}", table(&points, over));

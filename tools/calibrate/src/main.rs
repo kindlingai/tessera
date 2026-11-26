@@ -132,10 +132,11 @@ fn probe(settings: &Settings) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-type Check = fn(&Settings) -> Result<Vec<String>, tessera_engine::Error>;
-
 /// Runs `check` on the GPU. Fails if a check misses.
-fn gpu_check(settings: &Settings, check: Check) -> Result<(), Box<dyn Error>> {
+fn gpu_check(
+    settings: &Settings,
+    check: impl FnOnce(&Settings) -> Result<Vec<String>, tessera_engine::Error>,
+) -> Result<(), Box<dyn Error>> {
     if settings.gpu().is_none() {
         return Err("no GPU here; this check runs on one".into());
     }
@@ -187,7 +188,9 @@ fn main() -> ExitCode {
         Some("bench") => marks(&settings, &args[1..]),
         Some("probe") => probe(&settings),
         Some("plans") => gpu_check(&settings, plans::check),
-        Some("kernels") => gpu_check(&settings, kernels::check_all),
+        Some("kernels") => gpu_check(&settings, |s| {
+            kernels::check_filtered(s, args.get(1).map(String::as_str))
+        }),
         Some("watch") => tessera_calibrate::watch::watch(&settings, &args[1..]),
         Some("sweep") => tessera_calibrate::sweep::sweep(&settings, &args[1..]),
         Some("guided") => guided::report(

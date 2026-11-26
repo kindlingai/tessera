@@ -1,7 +1,7 @@
 //! Runs a plan again whenever a kernel file changes.
 
-use crate::grid::bounded;
-use crate::plans::feeds;
+use crate::grid::{bounded, codes};
+use crate::routing::{DEFAULT_SKEW, extract_router, prefill_kept, routed_feeds};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
@@ -9,16 +9,20 @@ use std::time::{Duration, Instant};
 use tessera_bundle::parts;
 use tessera_graph::DimName::{self, Context, Rows, Seqs};
 use tessera_graph::{Graph, Op, PathSeg, Region, Size};
+use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, Load, named};
 use tessera_lower::{
     Device, Pins, Plan, Settings, Source, Step, Tensor, View, Weight, cut_region, lower,
 };
 use tessera_run::{Outcome, Reload, Run, open};
-use tessera_testkit::graphs::{attention, linear};
+use tessera_testkit::graphs::{attention, gqa_attend_rows, linear, mla_attend_rows, moe_routed};
 use tessera_testkit::{Noise, weights};
 
 const USAGE: &str = "usage: tessera-calibrate watch <dir> \
     gemm <m> <k> <n> | attend <heads> <kv heads> <width> <queries> <keys> | \
-    model <model dir> [<part>] [--region <kind>.<n>] [--list] [<Dim>=<n> ...]";
+    mla <heads> <rows> <context> [--kv f32|bf16|fp8] | \
+    gqa <heads> <kv heads> <rows> <context> [--kv f32|bf16|fp8] | \
+    moe <experts> <top k> <hidden> <ffn> <rows> [--form <name>] [--skew <n>] [--plain] | \
+    model <model dir> [<part>] [--region <kind>.<n>] [--list] [--skew <n>] [<Dim>=<n> ...]";
 /// Time between checks for changed files.
 const POLL: Duration = Duration::from_millis(20);
 /// Device seconds to spend timing one step.
@@ -34,6 +38,8 @@ pub(crate) struct Subject {
     pub(crate) pins: Pins,
     /// Weights from a checkpoint. Without them the run makes noise.
     pub(crate) loads: Option<Vec<Weight>>,
+    /// Zipf skew exponent for MoE routing feeds.
+    pub(crate) skew: f64,
 }
 
 /// Numbers in `args`, or the usage.
@@ -113,11 +119,19 @@ fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
     let (dir, rest) = args.split_first().ok_or(USAGE)?;
     let dir = Path::new(dir);
     let (mut part, mut region, mut listed, mut given) = (None, None, false, Vec::new());
+    let mut skew = DEFAULT_SKEW;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--list" => listed = true,
             "--region" => region = Some(rest.next().ok_or(USAGE)?),
+            "--skew" => {
+                skew = rest
+                    .next()
+                    .ok_or(USAGE)?
+                    .parse::<f64>()
+                    .map_err(|_| USAGE)?
+            }
             _ if arg.contains('=') => given.push(sized(arg).ok_or(USAGE)?),
             _ if part.is_none() => part = Some(arg.clone()),
             _ => return Err(USAGE.into()),
@@ -155,13 +169,116 @@ fn model(args: &[String]) -> Result<Option<Subject>, Failed> {
         sizes,
         pins,
         loads: Some(loads),
+        skew,
     }))
+}
+
+fn kv_form(name: &str) -> Result<&'static dyn Load, Box<dyn Error>> {
+    match name {
+        "f32" => Ok(F32_FORM),
+        "bf16" => Ok(BF16_FORM),
+        "fp8" => Ok(FP8_FORM),
+        _ => Err(format!("unknown kv form `{name}` (use f32, bf16, fp8)").into()),
+    }
+}
+
+fn parse_kv_flag(rest: &[String]) -> Result<&'static dyn Load, Box<dyn Error>> {
+    match rest {
+        [] => Ok(BF16_FORM),
+        [flag, value] if flag == "--kv" => kv_form(value),
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn moe_subject(rest: &[String]) -> Result<Subject, Box<dyn Error>> {
+    if rest.len() < 5 {
+        return Err(USAGE.into());
+    }
+    let nums = numbers(&rest[..5])?;
+    let [experts, top_k, hidden, ffn, rows] = nums.as_slice() else {
+        return Err(USAGE.into());
+    };
+    let (mut form_name, mut skew, mut gated) = ("bf16".to_string(), DEFAULT_SKEW, true);
+    let mut it = rest[5..].iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--form" => form_name = it.next().ok_or(USAGE)?.clone(),
+            "--skew" => skew = it.next().ok_or(USAGE)?.parse::<f64>().map_err(|_| USAGE)?,
+            "--plain" => gated = false,
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let form = named(&form_name).ok_or_else(|| format!("unknown form `{form_name}`"))?;
+    let pins = match form.name() {
+        "bf16" => Pins::all(BF16_FORM)
+            .activations(BF16_FORM)
+            .outputs(BF16_FORM),
+        _ => Pins::all(form),
+    };
+    Ok(Subject {
+        g: moe_routed(&bounded(&[Rows]), [*experts, *top_k, *hidden, *ffn], gated),
+        sizes: vec![(Rows, *rows)],
+        pins,
+        loads: None,
+        skew,
+    })
+}
+
+/// Builds synthetic weights, packing forms as needed.
+pub(crate) fn make_loads(g: &Graph, pins: &Pins, noise: &mut Noise) -> Vec<Weight> {
+    let mut out = Vec::with_capacity(g.weights.len());
+    for (w, data) in g.weights.iter().zip(weights(g, noise)) {
+        let form = pins.form(&w.path);
+        match form.packs() {
+            true => out.push(Weight::Floats(data)),
+            false => out.push(Weight::Packed(form, codes(form, &data, noise))),
+        }
+    }
+    out
 }
 
 pub(crate) fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>> {
     let (kind, rest) = args.split_first().ok_or(USAGE)?;
-    if kind == "model" {
-        return model(rest).map_err(|e| e as Box<dyn Error>);
+    match kind.as_str() {
+        "model" => return model(rest).map_err(|e| e as Box<dyn Error>),
+        "moe" => return Ok(Some(moe_subject(rest)?)),
+        "mla" => {
+            if rest.len() < 3 {
+                return Err(USAGE.into());
+            }
+            let nums = numbers(&rest[..3])?;
+            let kv = parse_kv_flag(&rest[3..])?;
+            let pins = Pins {
+                kept: kv,
+                ..Pins::default()
+            };
+            return Ok(Some(Subject {
+                g: mla_attend_rows(&bounded(&[Rows]), nums[0], nums[2], 1),
+                sizes: vec![(Rows, nums[1]), (Context, nums[2])],
+                pins,
+                loads: None,
+                skew: DEFAULT_SKEW,
+            }));
+        }
+        "gqa" => {
+            if rest.len() < 4 {
+                return Err(USAGE.into());
+            }
+            let nums = numbers(&rest[..4])?;
+            let kv = parse_kv_flag(&rest[4..])?;
+            let pins = Pins {
+                kept: kv,
+                ..Pins::default()
+            };
+            return Ok(Some(Subject {
+                g: gqa_attend_rows(&bounded(&[Rows]), [nums[0], nums[1], 128], nums[3], 1),
+                sizes: vec![(Rows, nums[2]), (Context, nums[3])],
+                pins,
+                loads: None,
+                skew: DEFAULT_SKEW,
+            }));
+        }
+        _ => {}
     }
     let (default, matmul, attend) = (Pins::default(), [Rows], [Seqs, Rows, Context]);
     Ok(Some(match (kind.as_str(), numbers(rest)?.as_slice()) {
@@ -170,12 +287,14 @@ pub(crate) fn subject(args: &[String]) -> Result<Option<Subject>, Box<dyn Error>
             sizes: vec![(Rows, *m)],
             pins: default,
             loads: None,
+            skew: DEFAULT_SKEW,
         },
         ("attend", [heads, kv, width, queries, keys]) => Subject {
             g: attention(&bounded(&attend), [*heads, *kv, *width]),
             sizes: vec![(Seqs, 1), (Rows, *queries), (Context, *keys)],
             pins: default,
             loads: None,
+            skew: DEFAULT_SKEW,
         },
         _ => return Err(USAGE.into()),
     }))
@@ -391,13 +510,12 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
         return Ok(());
     };
     let mut noise = Noise(7);
-    let noisy = |noise: &mut Noise| weights(&s.g, noise).into_iter().map(Weight::Floats);
     let loads: Vec<Weight> = match s.loads.take() {
         Some(loads) => loads,
-        None => noisy(&mut noise).collect(),
+        None => make_loads(&s.g, &s.pins, &mut noise),
     };
-    let fed = feeds(&s.g, &s.sizes, &mut noise)?;
-    let views: Vec<View> = fed.iter().map(Tensor::view).collect();
+    let router = extract_router(&s.g, &loads);
+    let prefill_seed = 19u64;
     // The reference runs the plan's own kernels.
     let plain = Settings {
         kernels: None,
@@ -407,6 +525,20 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
     let mut runner = opened(lower(&s.g, 0, &s.sizes, &guess)?, &loads, &plain)?;
     let stored = Device::stored(runner.platform(), settings);
     let device = stored.map_or(guess, |d| d.pinned(s.pins.clone()));
+    let mut p_noise = Noise(prefill_seed);
+    let pos_offset = prefill_kept(&mut *runner, &s.g, &s.sizes, &device, &mut p_noise)?;
+    let (fed, route_stats) = routed_feeds(
+        &s.g,
+        &s.sizes,
+        router.as_deref(),
+        s.skew,
+        pos_offset,
+        &mut noise,
+    )?;
+    if let Some(stats) = route_stats {
+        println!("routing: {stats}");
+    }
+    let views: Vec<View> = fed.iter().map(Tensor::view).collect();
     let plan = lower(&s.g, 0, &s.sizes, &device)?;
     runner.replan(&plan)?;
     runner.feed(&views)?;
@@ -417,9 +549,12 @@ pub fn watch(settings: &Settings, args: &[String]) -> Result<(), Box<dyn Error>>
         kernels: Some(PathBuf::from(dir)),
         ..settings.clone()
     };
-    let runner = opened(plan.clone(), &loads, &files)?;
+    let mut runner = opened(plan.clone(), &loads, &files)?;
     // A checkpoint's weights now live on the device.
     drop(loads);
+    let mut p_noise = Noise(prefill_seed);
+    let _ = prefill_kept(&mut *runner, &s.g, &s.sizes, &device, &mut p_noise)?;
+    runner.replan(&plan)?;
     for path in runner.dump()? {
         println!("wrote {}", path.display());
     }

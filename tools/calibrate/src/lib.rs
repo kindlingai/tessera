@@ -6,6 +6,7 @@ pub mod guided;
 pub mod kernels;
 pub mod plans;
 pub mod probe;
+mod routing;
 pub mod sweep;
 pub mod watch;
 

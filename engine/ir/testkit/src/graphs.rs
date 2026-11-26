@@ -490,3 +490,107 @@ pub fn mla_prep(bounded: &[Dim], [heads, latent, rope]: [u64; 3]) -> Graph {
     );
     m.finish([(Role::Logits, &out)])
 }
+
+fn kept_attend_rows(
+    bounded: &[Dim],
+    [heads, kv_heads, width]: [u64; 3],
+    context: u64,
+    seqs: u64,
+    scale: f32,
+    shared_kv: bool,
+) -> Graph {
+    let mut dims: Vec<Dim> = bounded.iter().filter(|d| d.name == Rows).cloned().collect();
+    dims.push(Dim::bounded(Context, context));
+    let fixed = [
+        (Seqs, seqs),
+        (Heads, heads),
+        (KvHeads, kv_heads),
+        (HeadDim, width),
+    ];
+    let m = model(&dims, &fixed);
+    let port = |role, ty| Port { role, ty };
+    let u32_rows = TensorType::new([Rows], DType::U32);
+    let cache = TensorType::new([Seqs, Context, KvHeads, HeadDim], DType::F32);
+    let out = if shared_kv {
+        let [q, kv, slots, positions] = m.entry(
+            EntryKind::Step,
+            [
+                floats([Rows, Heads, HeadDim]),
+                floats([Rows, KvHeads, HeadDim]),
+                port(Role::Slots, u32_rows.clone()),
+                port(Role::Positions, u32_rows),
+            ],
+        );
+        let kept = m.kept(cache);
+        let by = [&slots, &positions];
+        let k = kv.append(&kept, by);
+        m.attend_rows(Mask::Causal, scale, [&q, &k, &k], by, None)
+    } else {
+        let [q, k, v, slots, positions] = m.entry(
+            EntryKind::Step,
+            [
+                floats([Rows, Heads, HeadDim]),
+                floats([Rows, KvHeads, HeadDim]),
+                floats([Rows, KvHeads, HeadDim]),
+                port(Role::Slots, u32_rows.clone()),
+                port(Role::Positions, u32_rows),
+            ],
+        );
+        let (keys, values) = (m.kept(cache.clone()), m.kept(cache));
+        let by = [&slots, &positions];
+        let (k, v) = (k.append(&keys, by), v.append(&values, by));
+        m.attend_rows(Mask::Causal, scale, [&q, &k, &v], by, None)
+    };
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Ragged kept-cache MLA matching `fast_mla_attend` (`HeadDim = 576`).
+pub fn mla_attend_rows(bounded: &[Dim], heads: u64, context: u64, seqs: u64) -> Graph {
+    kept_attend_rows(bounded, [heads, 1, 576], context, seqs, 0.04, true)
+}
+
+/// Ragged kept-cache GQA matching `fast_gqa_attend`.
+pub fn gqa_attend_rows(bounded: &[Dim], dims: [u64; 3], context: u64, seqs: u64) -> Graph {
+    kept_attend_rows(bounded, dims, context, seqs, 0.125, false)
+}
+
+/// Direct-routed MoE block with explicit `Role::Picks` expert ids.
+pub fn moe_routed(bounded: &[Dim], [experts, top_k, hidden, ffn]: [u64; 4], gated: bool) -> Graph {
+    let fixed = [
+        (Experts, experts),
+        (TopK, top_k),
+        (Hidden, hidden),
+        (Ffn, ffn),
+    ];
+    let m = model(bounded, &fixed);
+    let picks_port = Port {
+        role: Role::Picks,
+        ty: TensorType::new([Rows, TopK], DType::U32),
+    };
+    let [x_in, ids, gates] = m.entry(
+        EntryKind::Forward,
+        [
+            rows_of(bounded, Hidden, DType::F32),
+            picks_port,
+            floats([Rows, TopK]),
+        ],
+    );
+    // Stage op lets BF16 activation pins narrow `x` for `picked_bf16`.
+    let x = x_in.scale(1.0);
+    let decl = |name: &str, shape: [DimExpr; 3]| {
+        let mut path = vec![PathSeg::Field(name.into())];
+        Linears::declare(&m, &mut path, &shape)
+    };
+    let out = if gated {
+        let gate_w = decl("gate", [Experts.into(), Hidden.into(), Ffn.into()]);
+        let up_w = decl("up", [Experts.into(), Hidden.into(), Ffn.into()]);
+        let down_w = decl("down", [Experts.into(), Ffn.into(), Hidden.into()]);
+        let g = x.matmul_rows(&m.pick(&gate_w, &ids)).act(Act::Silu);
+        let u = x.matmul_rows(&m.pick(&up_w, &ids));
+        g.mul(&u).matmul_rows(&m.pick(&down_w, &ids))
+    } else {
+        let set = decl("set", [Experts.into(), Hidden.into(), Ffn.into()]);
+        x.matmul_rows(&m.pick(&set, &ids))
+    };
+    m.finish([(Role::Logits, &out.mix(bounded.len() as u32, &gates))])
+}

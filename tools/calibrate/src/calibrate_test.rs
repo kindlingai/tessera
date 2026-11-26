@@ -276,3 +276,91 @@ fn sweep_follows_rows() {
     let table = crate::sweep::table(&points, Rows);
     assert!(table.contains("least timed time per Rows"), "{table}");
 }
+
+/// Zipf routing yields distinct ids and higher skew than uniform.
+#[test]
+fn zipf_routing_skew() {
+    use crate::routing::{routed_feeds, summarize_ids, zipf_gates, zipf_ids};
+    use tessera_testkit::Noise;
+    let mut noise = Noise(42);
+    let uniform = zipf_ids(512, 64, 4, 0.0, &mut noise);
+    let skewed = zipf_ids(512, 64, 4, 1.2, &mut noise);
+    for row in skewed.chunks(4) {
+        let unique: BTreeSet<u32> = row.iter().copied().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(row.iter().all(|&id| id < 64));
+    }
+    let u = summarize_ids(&uniform, 64);
+    let s = summarize_ids(&skewed, 64);
+    assert!(u.active == 64 && s.active > 16);
+    assert!(s.max as f64 / s.mean > u.max as f64 / u.mean * 1.5);
+    let gates = zipf_gates(16, 4, &mut noise);
+    for row in gates.chunks(4) {
+        let sum: f32 = row.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4 && row.iter().all(|&g| g > 0.0));
+    }
+    let args = ["moe", "16", "4", "64", "64", "16", "--skew", "1.0"].map(String::from);
+    let s = crate::watch::subject(&args).unwrap().unwrap();
+    let (_, stats) = routed_feeds(&s.g, &s.sizes, None, s.skew, 0, &mut noise).unwrap();
+    assert!(stats.unwrap().active > 4);
+}
+
+/// Standalone MLA, GQA, and MoE subjects verify and sweep cleanly.
+#[test]
+fn sweep_mla_gqa_moe() {
+    let s_mla = ["mla", "16", "1", "32", "--kv", "bf16"].map(String::from);
+    let s_gqa = ["gqa", "16", "4", "1", "32", "--kv", "bf16"].map(String::from);
+    let s_moe = ["moe", "16", "4", "64", "64", "16", "--form", "bf16"].map(String::from);
+    let s_trellis = [
+        "moe",
+        "16",
+        "4",
+        "128",
+        "128",
+        "16",
+        "--form",
+        "trellis_k3_pmcgx",
+        "--plain",
+    ]
+    .map(String::from);
+    let cfg = settings();
+    let mut cuda_dev = Device::default();
+    cuda_dev.platform = Device::guess(&tessera_run::testing::host()).platform;
+    cuda_dev.platform.backend = "cuda".into();
+    cuda_dev.platform.arch = "sm_120".into();
+    cuda_dev.platform.limits.lanes = 32;
+    cuda_dev.platform.limits.group_bytes = 64 * 1024;
+    cuda_dev.platform.limits.group_threads = 1024;
+    cuda_dev.platform.limits.compiler = true;
+    for (args, want_rule, run_sweep) in [
+        (&s_mla[..], "fast_mla_attend", true),
+        (&s_gqa[..], "fast_gqa_attend", true),
+        (&s_moe[..], "picked_bf16", true),
+        (&s_trellis[..], "picked_trellis", false),
+    ] {
+        let mut sub = crate::watch::subject(args).unwrap().unwrap();
+        verify(&sub.g).unwrap();
+        let dev = cuda_dev.clone().pinned(sub.pins.clone());
+        let mut sel_sizes: Vec<_> = sub
+            .sizes
+            .iter()
+            .filter(|(d, _)| *d != Rows)
+            .copied()
+            .collect();
+        sel_sizes.push((Rows, 16));
+        let chosen = tessera_lower::select(&sub.g, 0, &sel_sizes, &dev).unwrap();
+        let hit =
+            chosen.ops.iter().any(|o| o.rule == want_rule) || chosen.contested.contains(&want_rule);
+        assert!(
+            hit,
+            "CUDA rule {want_rule} never proposed; ops={:?} contested={:?}",
+            chosen.ops.iter().map(|o| o.rule).collect::<Vec<_>>(),
+            chosen.contested
+        );
+        if run_sweep {
+            let pts = crate::sweep::points(&mut sub, Rows, &[1, 16], &cfg, false).unwrap();
+            assert_eq!(pts.len(), 2);
+            assert!(pts.iter().all(|p| p.seconds > 0.0));
+        }
+    }
+}

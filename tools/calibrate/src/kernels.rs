@@ -1,16 +1,19 @@
 //! Device kernels against the host and the rules they displace.
 
 use crate::grid::{bounded, codes, fill};
+use crate::routing::{DEFAULT_SKEW, prefill_kept, routed_feeds};
 use std::collections::BTreeSet;
 use tessera_engine::{Error, block, trellis};
-use tessera_graph::DimName::Rows;
-use tessera_graph::{Act, Graph};
-use tessera_lower::form::{BF16_FORM, Load};
+use tessera_graph::DimName::{self, Rows};
+use tessera_graph::{Act, Graph, Size};
+use tessera_lower::form::{BF16_FORM, FP8_FORM, Load};
 use tessera_lower::{
     Backend, Device, Knobs, Pick, Pins, Plan, Settings, Tensor, View, lower, select,
 };
 use tessera_run::{Run, open};
-use tessera_testkit::graphs::{blocks, finished, linear, picked};
+use tessera_testkit::graphs::{
+    blocks, finished, gqa_attend_rows, linear, mla_attend_rows, moe_routed, picked,
+};
 use tessera_testkit::{Noise, max_abs_diff};
 
 /// Row counts from 16 up to twice the old cap.
@@ -22,6 +25,8 @@ const REPS: usize = 100;
 const ROUNDS: usize = 7;
 /// Largest output error, over the largest host output.
 const OFF: f32 = 1e-2;
+/// Larger tolerance for FP8 KV cache against f32 reference.
+const OFF_FP8: f32 = 6e-2;
 /// The plan may trail a forced rule by this share.
 const SLACK: f64 = 0.1;
 
@@ -34,6 +39,8 @@ struct Case {
     rows: &'static [u64],
     /// Kernel shape values the device sets.
     knobs: Knobs,
+    /// Relative error tolerance against the host reference.
+    tol: f32,
 }
 
 fn cases() -> Vec<Case> {
@@ -45,6 +52,7 @@ fn cases() -> Vec<Case> {
         pins: pins.clone(),
         rows,
         knobs: Knobs::default(),
+        tol: OFF,
     };
     let bf16 = Pins::all(BF16_FORM);
     let mut all = Vec::new();
@@ -108,6 +116,50 @@ fn cases() -> Vec<Case> {
         let what = format!("16x2560x640 {}", book.name());
         all.push(case("picked_trellis", what, g, &pins, &[1, 4]));
     }
+    let trellis_skew = Pins::all(&trellis::TRELLIS_K3_PMCGX);
+    let g = moe_routed(&one, [64, 8, 2560, 640], false);
+    all.push(case(
+        "picked_trellis",
+        "64e top8 2560x640 skewed".into(),
+        g,
+        &trellis_skew,
+        &[1, 16],
+    ));
+    let bf16_moe = Pins::all(BF16_FORM)
+        .activations(BF16_FORM)
+        .outputs(BF16_FORM);
+    let g = moe_routed(&one, [64, 8, 1024, 512], true);
+    all.push(case(
+        "picked_bf16",
+        "64e top8 1024x512 swiglu".into(),
+        g,
+        &bf16_moe,
+        &[16, 64],
+    ));
+    for (kv_name, kv, tol) in [("bf16", BF16_FORM, OFF), ("fp8", FP8_FORM, OFF_FP8)] {
+        let pins = Pins {
+            kept: kv,
+            ..Pins::default()
+        };
+        let mut mla = case(
+            "fast_mla_attend",
+            format!("16h ctx512 {kv_name}"),
+            mla_attend_rows(&one, 16, 512, 1),
+            &pins,
+            &[1, 16],
+        );
+        mla.tol = tol;
+        all.push(mla);
+        let mut gqa = case(
+            "fast_gqa_attend",
+            format!("32h/4kv ctx512 {kv_name}"),
+            gqa_attend_rows(&one, [32, 4, 128], 512, 1),
+            &pins,
+            &[1, 16],
+        );
+        gqa.tol = tol;
+        all.push(gqa);
+    }
     all
 }
 
@@ -138,22 +190,43 @@ fn load(g: &Graph, runner: &mut dyn Run, noise: &mut Noise) -> Result<Vec<Tensor
     Ok(host)
 }
 
+/// Runtime sizes for `g` at `rows`, filling bounded dims.
+fn case_sizes(g: &Graph, rows: u64) -> Vec<(DimName, u64)> {
+    let mut sizes = vec![(Rows, rows)];
+    for d in &g.dims {
+        if d.name != Rows
+            && let Size::Bounded(n) = d.size
+        {
+            sizes.push((d.name, n));
+        }
+    }
+    sizes
+}
+
 /// The host's outputs for these weights and feeds.
 fn reference(
     g: &Graph,
     rows: u64,
     weights: &[Tensor],
     feeds: &[View],
+    prefill_seed: Option<u64>,
     settings: &Settings,
 ) -> Result<Vec<Tensor>, Error> {
     let cpu = Settings {
         backend: Pick::Cpu,
         ..settings.clone()
     };
-    let plan = lower(g, 0, &[(Rows, rows)], &Device::guess(&cpu))?;
-    let mut runner = open(plan, &cpu)?;
+    let cpu_device = Device::guess(&cpu);
+    let sizes = case_sizes(g, rows);
+    let plan = lower(g, 0, &sizes, &cpu_device)?;
+    let mut runner = open(plan.clone(), &cpu)?;
     for (at, w) in weights.iter().enumerate() {
         runner.load(at as u32, w.view())?;
+    }
+    if let Some(seed) = prefill_seed {
+        let mut p_noise = Noise(seed);
+        let _ = prefill_kept(&mut *runner, g, &sizes, &cpu_device, &mut p_noise)?;
+        runner.replan(&plan)?;
     }
     Ok(runner.run(feeds)?)
 }
@@ -182,7 +255,7 @@ struct Way {
 
 /// The plan as chosen, then one per rule that competed.
 fn ways(c: &Case, rows: u64, device: &Device, seen: &mut BTreeSet<&'static str>) -> Vec<Way> {
-    let sizes = [(Rows, rows)];
+    let sizes = case_sizes(&c.g, rows);
     let Ok(chosen) = select(&c.g, 0, &sizes, device) else {
         return Vec::new();
     };
@@ -240,19 +313,28 @@ fn check(
     (seen, misses): (&mut BTreeSet<&'static str>, &mut Vec<String>),
     settings: &Settings,
 ) -> Result<(), Error> {
-    let sizes = vec![(Rows, rows)];
-    let ports = c.g.entries[0].inputs.iter();
-    let fed: Result<Vec<Tensor>, Error> = ports.map(|p| fill(&c.g, &p.ty, &sizes, noise)).collect();
-    let fed = fed?;
+    let sizes = case_sizes(&c.g, rows);
+    let prefill_seed = (!c.g.kept.is_empty()).then_some(19 + rows);
+    let pos_offset = match prefill_seed {
+        Some(seed) => {
+            let mut p_noise = Noise(seed);
+            prefill_kept(&mut **runner, &c.g, &sizes, device, &mut p_noise)?
+        }
+        None => 0,
+    };
+    let (fed, route_stats) = routed_feeds(&c.g, &sizes, None, DEFAULT_SKEW, pos_offset, noise)?;
+    if let Some(stats) = route_stats {
+        println!("    routing: {stats}");
+    }
     let feeds: Vec<View> = fed.iter().map(Tensor::view).collect();
-    let want = reference(&c.g, rows, host, &feeds, settings)?;
+    let want = reference(&c.g, rows, host, &feeds, prefill_seed, settings)?;
     let mut ways = ways(c, rows, device, seen);
     let label = format!("{} {} rows={rows}", c.rule, c.what);
     for w in &ways {
         runner.replan(&w.plan)?;
         let off = error(&runner.run(&feeds)?, &want)?;
         println!("    {:24} error {off:.1e}  {}", w.label, names(&w.plan));
-        if off.is_nan() || off > OFF {
+        if off.is_nan() || off > c.tol {
             misses.push(format!("{label} {}: error {off:.1e}", w.label));
         }
     }
@@ -279,14 +361,23 @@ fn check(
     Ok(())
 }
 
-/// Checks every case. Returns what missed.
-pub fn check_all(settings: &Settings) -> Result<Vec<String>, Error> {
+/// Checks cases matching `filter` (or all when `None`).
+pub fn check_filtered(settings: &Settings, filter: Option<&str>) -> Result<Vec<String>, Error> {
     let mut noise = Noise(31);
     let (mut seen, mut misses) = (BTreeSet::new(), Vec::new());
     let mut backend = None;
-    let all = cases();
+    let all: Vec<Case> = cases()
+        .into_iter()
+        .filter(|c| filter.is_none_or(|f| c.rule.contains(f) || c.what.contains(f)))
+        .collect();
+    if all.is_empty()
+        && let Some(f) = filter
+    {
+        misses.push(format!("filter `{f}` matched 0 cases"));
+        return Ok(misses);
+    }
     for c in &all {
-        let first = [(Rows, c.rows[0])];
+        let first = case_sizes(&c.g, c.rows[0]);
         let mut guess = Device::guess(settings).pinned(c.pins.clone());
         guess.knobs = c.knobs.clone();
         let mut runner = open(lower(&c.g, 0, &first, &guess)?, settings)?;
