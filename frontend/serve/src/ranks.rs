@@ -1,12 +1,12 @@
 //! One served model over several ranks.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use tessera_engine::DType;
 use tessera_engine::comm::{Error as CommError, Fabric, Transport};
 use tessera_engine::sums::Sum;
 use tessera_engine::{Engine, Graph, Grid, Knobs, Place, Recipe, Settings};
 use tessera_frontend_comm::{
-    Sums, arx_sums, grid, join, meet, p2p, ports, resident, sum_wire_flag, sums_flag,
+    Sums, arx_sums, grid, join, meet, p2p, ports, resident, sockets, sum_wire_flag, sums_flag,
 };
 
 /// The flags for `Ranks::flag`.
@@ -42,6 +42,8 @@ pub struct Ranks {
     whole: bool,
     /// Split wide routed experts along inner width instead of experts.
     moe_tp: bool,
+    /// A bound listener for this rank. `None`: bind at join.
+    listener: Option<TcpListener>,
 }
 
 impl Ranks {
@@ -74,6 +76,12 @@ impl Ranks {
             _ => return None,
         }
         Some(())
+    }
+
+    /// Joins on `listener` instead of binding this rank's address.
+    #[cfg(test)]
+    pub(crate) fn listen(&mut self, listener: TcpListener) {
+        self.listener = Some(listener);
     }
 
     /// One engine, with no peers.
@@ -119,8 +127,12 @@ impl Ranks {
             };
             return Ok(Some(([dry(), dry()], Grids::None)));
         }
-        let mut met: Box<dyn Transport> =
-            Box::new(meet(self.rank, &self.peers, None).map_err(|e| e.to_string())?);
+        let met = match &self.listener {
+            Some(l) => (l.try_clone().map_err(|e| e.to_string()))
+                .and_then(|l| sockets(self.rank, l, &self.peers).map_err(|e| e.to_string())),
+            None => meet(self.rank, &self.peers, None).map_err(|e| e.to_string()),
+        };
+        let mut met: Box<dyn Transport> = Box::new(met?);
         let grids = match (self.whole, self.sums, &self.fabric) {
             (true, _, None) | (false, Sums::Grid | Sums::Arx, None) => {
                 return Err("--sums grid, arx or whole needs --verbs or --ring".into());

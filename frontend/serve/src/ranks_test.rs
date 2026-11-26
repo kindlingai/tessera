@@ -1,15 +1,17 @@
 use crate::ranks::Ranks;
+use std::net::TcpListener;
 use tessera_engine::decoder::{Swiglu, stepper};
 use tessera_engine::{Asks, Engine, Norm, Pick, Recipe, Row, Settings, Weight};
 use tessera_models::decoder;
 use tessera_testkit::{Noise, tcp_bind, tcp_pair, weights};
 
 /// A faux-weight engine as `rank` of `peers`, or alone.
-fn engine(place: Option<(u32, &str)>, asks: Option<Asks>) -> Engine {
+fn engine(place: Option<(u32, &str, TcpListener)>, asks: Option<Asks>) -> Engine {
     let mut ranks = Ranks::default();
-    if let Some((rank, peers)) = place {
+    if let Some((rank, peers, listener)) = place {
         ranks.flag("--rank", &rank.to_string()).unwrap();
         ranks.flag("--peers", peers).unwrap();
+        ranks.listen(listener);
     }
     let settings = Settings {
         backend: Pick::Host,
@@ -29,14 +31,17 @@ fn engine(place: Option<(u32, &str)>, asks: Option<Asks>) -> Engine {
 #[test]
 fn ranks_match() {
     tcp_pair().unwrap();
-    let free = || tcp_bind().unwrap().local_addr().unwrap().to_string();
-    let peers = format!("{},{}", free(), free());
-    let theirs = peers.clone();
+    let [mine, theirs] = [(); 2].map(|()| tcp_bind().unwrap());
+    let addr = |l: &TcpListener| l.local_addr().unwrap().to_string();
+    let peers = format!("{},{}", addr(&mine), addr(&theirs));
+    let their_peers = peers.clone();
     let follower = std::thread::spawn(move || {
-        engine(Some((1, &theirs)), None).follow().unwrap();
+        engine(Some((1, &their_peers, theirs)), None)
+            .follow()
+            .unwrap();
     });
     let asks = Asks::default();
-    let mut lead = engine(Some((0, &peers)), Some(asks.clone()));
+    let mut lead = engine(Some((0, &peers, mine)), Some(asks.clone()));
     let mut alone = engine(None, None);
     let row = |slot, token, position| Row {
         slot,
