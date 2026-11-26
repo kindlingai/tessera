@@ -13,9 +13,8 @@ use std::sync::mpsc;
 use tessera_bundle::{
     FunctionCall, Message, RenderOptions, ResponseEvent, ResponseParser, ToolCall,
 };
-use tessera_engine::{Penalties, Sampling};
+use tessera_engine::Sampling;
 use tessera_tasks::api::{Finish, Params, Refused, Step};
-use tessera_tasks::scopes::{Sequence, Thinking};
 
 /// Anthropic error payload with HTTP status.
 #[derive(Debug)]
@@ -320,8 +319,7 @@ fn sampling(input: &Input) -> Result<Sampling, Fail> {
         temperature,
         top_p,
         top_k,
-        min_p: 0.0,
-        seed: None,
+        ..Sampling::default()
     })
 }
 
@@ -423,15 +421,11 @@ fn start(model: &Model, body: &[u8]) -> Result<Started, Fail> {
     }
     let params = Params {
         max_tokens: input.max_tokens,
-        min_tokens: 0,
         stop: input.stop_sequences,
-        format: None,
         raw: parser.is_some(),
         sampling,
-        penalties: Penalties::default(),
-        thinking: Thinking::default(),
-        sequence: Sequence::default(),
         starts_thinking: thinking,
+        ..Params::default()
     };
     let (sink, steps) = mpsc::channel();
     let input_tokens = prompt.len();

@@ -29,7 +29,6 @@ impl Model {
             return Err("the prompt does not fit the context".into());
         }
         let params = Params {
-            min_tokens: 0,
             max_tokens: max_tokens.map_or(room, |n| n.min(room)),
             format,
             ..Params::default()

@@ -158,8 +158,8 @@ impl Generator for Queued {
             min_tokens: params.min_tokens,
             stop: self.generate.stop.clone(),
             guide: Stacked::of(guides),
-            reads: Vec::new(),
             sampling: params.sampling,
+            ..Request::default()
         };
         let generate = self.generate.clone();
         let raw = params.raw;
