@@ -197,6 +197,7 @@ fn add_norm_lanes<const WIDE: u32, const AHEAD: u32>(
 #[launch(
     name = add_norm_name(self),
     launches = add_norm_launches,
+    shape = row_shape(self.rows, self.block),
     work = self.rows * self.width,
     needs = row_needs(self.block),
     // Rows sum alike at any count. Other kernels differ.

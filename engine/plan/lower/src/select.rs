@@ -366,7 +366,7 @@ fn emit_choice(
 }
 
 mod report {
-    use super::cover::{Cover, EDGE, fits, reads, writes};
+    use super::cover::{Cover, EDGE, fits, grid_mismatch, reads, writes};
     use super::{Home, Selected, Value};
     use crate::cost::Device;
     use crate::kernels::{AllReduce, moved};
@@ -595,7 +595,11 @@ mod report {
         let mut leaked = false;
         let mut best_secs: Option<f64> = None;
         for way in ways(drafts) {
-            if let Some(err) = way.iter().find_map(|d| d.kernel.needs().mismatch(platform)) {
+            let mismatch = |d: &Draft| {
+                let needs = d.kernel.needs().mismatch(platform);
+                needs.or_else(|| grid_mismatch(d, kind))
+            };
+            if let Some(err) = way.iter().find_map(mismatch) {
                 if needs_err.is_none() {
                     needs_err = Some(err);
                 }

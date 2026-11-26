@@ -470,6 +470,7 @@ tiled_kernel!(
     order = Order::PerConfig,
     source = self.product.source(self.tree(), "tiled"),
     launches = tiled_launches,
+    shape = tiled_shape(self),
     load = tiled_load,
     unproven,
 )]
@@ -654,14 +655,18 @@ fn tiled_load(t: &Tiled, _: usize) -> Option<Load> {
     })
 }
 
-fn tiled_launches(t: &Tiled, step: &Step) -> Vec<Launch> {
-    let Product { m, n, k, .. } = t.product;
+fn tiled_shape(t: &Tiled) -> Shape {
     let (gm, gn) = t.groups();
-    let shape = Shape::Grid {
+    Shape::Grid {
         across: gm * gn,
         down: 1,
         threads: t.schedule.threads(),
-    };
+    }
+}
+
+fn tiled_launches(t: &Tiled, step: &Step) -> Vec<Launch> {
+    let Product { m, n, k, .. } = t.product;
+    let shape = tiled_shape(t);
     match t.product.near {
         Some(near) => t
             .product

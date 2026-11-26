@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The most thread groups down a launch grid.
+pub const GRID_DOWN: usize = 65535;
+
+/// The most thread groups across a launch grid.
+pub const GRID_ACROSS: usize = (1 << 31) - 1;
+
 /// The device's bounds on a kernel's schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {

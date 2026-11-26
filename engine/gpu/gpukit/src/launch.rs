@@ -1,6 +1,7 @@
 //! Kernel arguments and launch helpers shared by CUDA and ROCm.
 
 use crate::Error;
+use tessera_platform::limits::GRID_DOWN;
 
 fn div_up(value: usize, group: usize) -> usize {
     value.div_ceil(group)
@@ -154,8 +155,6 @@ pub fn launch_1d<C: Launch>(
     ctx.launch(kernel, (grid, 1, 1), (block, 1, 1), 0, args)
 }
 
-const MAX_GRID_Y: usize = 65535;
-
 /// 2D grid of blocks. Put the large axis on x.
 pub fn launch_grid<C: Launch>(
     ctx: &C,
@@ -166,8 +165,8 @@ pub fn launch_grid<C: Launch>(
     args: &mut KernelArgs,
 ) -> Result<(), Error> {
     assert!(
-        height <= MAX_GRID_Y,
-        "launch_grid height {height} exceeds the gridDim.y limit of {MAX_GRID_Y}"
+        height <= GRID_DOWN,
+        "launch_grid height {height} exceeds the gridDim.y limit of {GRID_DOWN}"
     );
     ctx.launch(
         kernel,

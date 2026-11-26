@@ -1,6 +1,6 @@
 //! The kernel trait: what a plan step launches.
 
-use crate::abi::{Arg, Launch, Source};
+use crate::abi::{Arg, Launch, Shape, Source};
 use crate::extent::Extent;
 use crate::plan::Step;
 use std::fmt;
@@ -21,6 +21,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn source(&self) -> Source;
     /// The launches that run `step`, usually one.
     fn launches(&self, step: &Step) -> Vec<Launch>;
+    /// Its one launch shape, when known without a step.
+    fn shape(&self) -> Option<Shape> {
+        None
+    }
     /// Multiply-adds, or elements touched, writing `len` elements.
     fn work(&self, len: usize) -> f64 {
         len as f64

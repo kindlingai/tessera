@@ -5,7 +5,8 @@ use tessera_graph::{Act, DType, Dim, Graph, TensorType};
 use tessera_lower::kernels::Map;
 use tessera_lower::sites;
 use tessera_lower::{
-    Device, Draft, Kernel, Limits, Needs, Plan, Platform, Propose, Rule, T, Tree, lower, select,
+    Device, Draft, Kernel, Launch, Limits, Needs, Plan, Platform, Propose, Rule, Shape, Step, T,
+    Tree, explain, lower, select,
 };
 use tessera_run::testing::host;
 use tessera_trace::{EntryKind, Model, Port, Role};
@@ -80,6 +81,44 @@ fn lanes(tree: &Tree, at: T) -> Option<Vec<Draft>> {
 struct Priced {
     len: usize,
     guess: f64,
+}
+
+/// The cheapest, with a grid that grows with its length.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "tall",
+    sizes = [],
+    source = Map::plain(Vec::new()).source(),
+    launches = tall_grid,
+    work = self.len,
+    guess = 1e-12,
+)]
+struct Tall {
+    len: usize,
+}
+
+fn tall_grid(k: &Tall, step: &Step) -> Vec<Launch> {
+    let (across, down) = (1, k.len * 400);
+    let shape = Shape::Grid {
+        across,
+        down,
+        threads: 256,
+    };
+    vec![Launch::plain(step, &[], shape)]
+}
+
+/// A fast rule for `Tall`.
+struct Towers;
+
+impl Propose for Towers {
+    fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+        let sites::Chain { reads, len, .. } = tree.site(at)?;
+        Some(vec![Draft::new(Tall { len }, reads, len)])
+    }
+
+    fn fast(&self) -> bool {
+        true
+    }
 }
 
 /// A rule made at run time, its price as data.
@@ -183,4 +222,26 @@ fn made_rules_compete() {
     let missing = pair().favoring("unused_rule").requiring_favored(true);
     let err = lower(&chain(), 0, &SIZES, &missing).unwrap_err();
     assert!(matches!(err, tessera_lower::Error::FavoredUnused(r) if r == "unused_rule"));
+}
+
+#[test]
+fn grids_bar_kernels() {
+    let cuda = Platform {
+        backend: "cuda".into(),
+        ..Platform::host(Limits::assumed())
+    };
+    let device = Device::default().without("map").without("lanes").on(cuda);
+    let device = device.adding(Rule::made("tall", module_path!(), Towers));
+    assert_eq!(names(&plan(&device)), ["tall"]);
+    // 512 elements need a grid 204800 high.
+    let big = [(Seqs, 4), (Rows, 8)];
+    assert_eq!(
+        names(&lower(&chain(), 0, &big, &device).unwrap()),
+        ["cheap"]
+    );
+    let report = explain(&chain(), 0, &big, &device).unwrap().format(10);
+    assert!(
+        report.contains("grid height 204800 exceeds 65535"),
+        "{report}"
+    );
 }

@@ -677,14 +677,14 @@ extern "C" __global__ __launch_bounds__(128, 4) void tessera_mm_mxfp8_r16_sk(
 // Sums split-K partials in order and applies matmul epilogue.
 extern "C" __global__ __launch_bounds__(256, 4) void tessera_mm_reduce(
     const float* part, const float* other, float* out, u32 m, u32 n, u32 ks, u32 mode) {
-    u32 idx = blockIdx.x * 256u + threadIdx.x;
-    u32 mn = m * n;
+    u64 idx = u64(blockIdx.x) * 256u + threadIdx.x;
+    u64 mn = u64(m) * n;
     if (idx >= mn) return;
     float v = 0.0f;
     for (u32 p = 0u; p < ks; p++) {
         v += part[u64(p) * mn + idx];
     }
-    out[idx] = fg_epilogue(v, other, u64(idx), idx % n, mode);
+    out[idx] = fg_epilogue(v, other, idx, u32(idx % n), mode);
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.

@@ -1,14 +1,16 @@
 //! Covers each tree node with the cheapest rule, per zone.
 
-use crate::abi::Source;
+use crate::abi::{Shape, Source};
 use crate::cost::Device;
 use crate::form::F32_FORM;
 use crate::kernels::{AllGather, AllReduce, Narrow, Scatter, Widen, moved};
+use crate::plan::{Slot, Step};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tessera_graph::{Op, Stage};
+use tessera_platform::limits::{GRID_ACROSS, GRID_DOWN};
 use tessera_sim::ZoneKind;
 
 /// The cheapest cover found at one node, in one zone.
@@ -227,7 +229,10 @@ impl Cover<'_> {
                 }
                 // A kernel the device cannot run is not a way.
                 let platform = &self.device.platform;
-                if drafts.iter().any(|d| !d.kernel.needs().fits(platform)) {
+                let unfit = |d: &Draft| {
+                    !d.kernel.needs().fits(platform) || grid_mismatch(d, kind).is_some()
+                };
+                if drafts.iter().any(unfit) {
                     continue;
                 }
                 if self.swallows(rule, t, &drafts, kind) {
@@ -375,10 +380,10 @@ impl Cover<'_> {
                 continue;
             };
             let platform = &self.device.platform;
-            if drafts
-                .iter()
-                .all(|d| fits(d, kind) && d.kernel.needs().fits(platform))
-            {
+            let runs = |d: &Draft| {
+                fits(d, kind) && d.kernel.needs().fits(platform) && grid_mismatch(d, kind).is_none()
+            };
+            if drafts.iter().all(runs) {
                 return true;
             }
         }
@@ -419,6 +424,55 @@ impl Cover<'_> {
 /// A tree runs on a CPU too, in lockstep.
 pub(crate) fn fits(d: &Draft, kind: ZoneKind) -> bool {
     d.kernel.runs_on() == kind || (kind == ZoneKind::Cpu && made(d))
+}
+
+/// Why a draft's grid is too large for a GPU.
+pub(crate) fn grid_mismatch(d: &Draft, kind: ZoneKind) -> Option<String> {
+    if kind != ZoneKind::Gpu {
+        return None;
+    }
+    let shapes = match d.kernel.shape() {
+        Some(shape) => vec![shape],
+        None => stand_in(d)
+            .launches()
+            .into_iter()
+            .map(|l| l.shape)
+            .collect(),
+    };
+    for shape in shapes {
+        let Shape::Grid { across, down, .. } = shape else {
+            continue;
+        };
+        if down > GRID_DOWN {
+            return Some(format!("grid height {down} exceeds {GRID_DOWN}"));
+        }
+        if across > GRID_ACROSS {
+            return Some(format!("grid width {across} exceeds {GRID_ACROSS}"));
+        }
+    }
+    None
+}
+
+/// A step whose shapes read sizes, not buffers.
+fn stand_in(d: &Draft) -> Step {
+    let slot = Slot {
+        buffer: 0,
+        offset: 0,
+        len: d.len,
+        form: F32_FORM,
+        dims: 0,
+        shape: [0; 4],
+    };
+    Step {
+        kernel: d.kernel.clone(),
+        rule: "",
+        reads: vec![slot; d.reads.len()],
+        write: slot,
+        also: vec![slot; d.also.len() + 1],
+        covers: Vec::new(),
+        zone: 0,
+        table: Some(slot),
+    }
 }
 
 /// Whether a kernel is a tree, asked once per name.
