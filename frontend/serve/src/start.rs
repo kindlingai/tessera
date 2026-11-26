@@ -4,7 +4,7 @@ use crate::task::{self, Load};
 use crate::{Models, Slot};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +18,7 @@ use tessera_tasks::api::Info;
 
 /// The flags for `Options::flag` and `Options::switch`.
 pub fn flags() -> String {
-    let head = "[--host <addr>] [--port <n>] [--max-model-len <tokens>] [--slots <n>] \
+    let head = "[--host <addr>] [--port <n>] [--port-file <path>] [--max-model-len <tokens>] [--slots <n>] \
 [--max-batch-rows <n>] [--layers <n>] [--kv-dtype <f32|bf16|fp8>] [--dtype <spot>=<dtype>]... [--shape <kernel>:<knob>=<n>]... [--kv-cache-tokens <tokens>] [--kv-store <spec>]... [--kv-keep <system|sessions|all>] [--kv-system-after <n>] [--served-model-name <name>]";
     let tail = "[--max-connections <n>] [--api-key <key>] [--cors-origin <origin>] [--reject-unknown-fields] [--require-favored] [--explain-lowering] [--allow-failed-lowering] [--allow-weight-streaming] [--attic] \
 [--priority <n>] [--swap-quantum <x>] [--also <model and its flags>]...";
@@ -29,6 +29,8 @@ pub struct Options {
     pub model: PathBuf,
     pub host: String,
     pub port: u16,
+    /// Gets the bound port once the server listens.
+    pub port_file: Option<PathBuf>,
     /// Tokens one answer holds, prompt included.
     pub max_model_len: usize,
     /// Answers in flight at once.
@@ -97,6 +99,7 @@ impl Default for Options {
             model: PathBuf::new(),
             host: "127.0.0.1".into(),
             port: 8080,
+            port_file: None,
             max_model_len: 4096,
             slots: 4,
             max_batch_rows: None,
@@ -163,6 +166,7 @@ impl Options {
         match flag {
             "--host" => self.host = value,
             "--port" => self.port = value.parse().ok()?,
+            "--port-file" => self.port_file = Some(value.into()),
             "--max-model-len" => self.max_model_len = value.parse().ok()?,
             "--slots" => self.slots = value.parse().ok()?,
             "--max-batch-rows" => {
@@ -295,6 +299,7 @@ fn spawn_all(mut options: Options) -> (Models, Receiver<String>) {
 /// Loads the models, then answers requests until killed.
 pub fn run(mut options: Options) -> Result<(), String> {
     let (host, port) = (options.host.clone(), options.port);
+    let port_file = options.port_file.take();
     let limits = crate::http::Limits {
         max_connections: options.max_connections,
         cors: options.cors_origin.clone(),
@@ -316,7 +321,11 @@ pub fn run(mut options: Options) -> Result<(), String> {
     let key = options.api_key.take();
     let (models, failed) = spawn_all(options);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-    eprintln!("listening on {host}:{port}");
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    if let Some(path) = &port_file {
+        write_port(path, bound.port()).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    eprintln!("listening on {bound}");
     let serving = std::thread::spawn(move || {
         crate::http::run(listener, limits, move |request| {
             if let Some(expected) = key.as_deref()
@@ -333,6 +342,14 @@ pub fn run(mut options: Options) -> Result<(), String> {
     serving
         .join()
         .map_err(|_| "the server thread panicked".into())
+}
+
+/// Writes `port` to `path` by rename, never in part.
+fn write_port(path: &Path, port: u16) -> std::io::Result<()> {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    std::fs::write(&part, format!("{port}\n"))?;
+    std::fs::rename(&part, path)
 }
 
 /// Constant-time equality over two byte slices.

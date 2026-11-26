@@ -92,6 +92,7 @@ pub fn read() -> Settings {
         weight_streaming: env.allow_weight_streaming.unwrap_or(false),
         reads: env.reads.map_or(Reads::Cached, |r| reads(&r)),
         hub,
+        temp: Some(std::env::temp_dir()),
         hf_token: token(&var, std::env::home_dir()),
         profile,
         asks,

@@ -6,10 +6,10 @@ use crate::task::{ENTRIES, Entry, describe};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use tessera_engine::progress::Progress;
 use tessera_tasks::Error;
 use tessera_tasks::task::{Chat, Collect, Run, Sink, Task};
@@ -38,6 +38,8 @@ pub struct Halt {
 #[derive(Default)]
 pub struct Servers {
     running: BTreeMap<String, Child>,
+    /// Servers started so far. Names each port file.
+    started: u32,
 }
 
 impl Run<&mut Servers> for Halt {
@@ -54,14 +56,27 @@ impl Run<&mut Servers> for Halt {
 impl Servers {
     /// Starts `tesserax serve` on a free local port.
     fn start(&mut self, flags: &[String], sink: &mut dyn Sink) -> Result<(), Error> {
-        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-        let local = ["serve", "--host", "127.0.0.1", "--port", &port.to_string()];
-        let child = Command::new(std::env::current_exe()?)
+        self.started += 1;
+        let name = format!("tesserax-{}-{}.port", std::process::id(), self.started);
+        let temp = tessera_frontend_settings::read().temp;
+        let port_file = temp.ok_or("no directory for the port file")?.join(name);
+        let _ = std::fs::remove_file(&port_file);
+        let local = ["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"];
+        let mut child = Command::new(std::env::current_exe()?)
             .args(flags)
             .args(local)
+            .arg(&port_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .spawn()?;
+        let port = match bound_port(&mut child, &port_file) {
+            Ok(port) => port,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         let handle = format!("serve-{}", child.id());
         let url = format!("http://127.0.0.1:{port}");
         self.running.insert(handle.clone(), child);
@@ -71,6 +86,21 @@ impl Servers {
             "{ready}. Until then its body lists the load steps"
         ));
         Ok(())
+    }
+}
+
+/// The port `child` writes to `port_file` once it listens.
+fn bound_port(child: &mut Child, port_file: &Path) -> Result<u16, Error> {
+    loop {
+        if let Ok(text) = std::fs::read_to_string(port_file) {
+            let _ = std::fs::remove_file(port_file);
+            let bad = || format!("{}: not a port: {text}", port_file.display());
+            return Ok(text.trim().parse().map_err(|_| bad())?);
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("serve exited before it listened: {status}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

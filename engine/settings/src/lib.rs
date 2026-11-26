@@ -117,6 +117,8 @@ pub struct Settings {
     pub reads: Reads,
     /// The Hugging Face hub cache.
     pub hub: Option<PathBuf>,
+    /// The directory for short-lived files.
+    pub temp: Option<PathBuf>,
     /// The Hugging Face access token, for gated repositories.
     pub hf_token: Option<String>,
     /// Launches per profile report. `None` times nothing.
@@ -154,6 +156,7 @@ impl Default for Settings {
             weight_streaming: false,
             reads: Reads::Cached,
             hub: None,
+            temp: None,
             hf_token: None,
             profile: None,
             asks: None,
