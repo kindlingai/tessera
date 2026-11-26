@@ -3,19 +3,23 @@
 mod common;
 mod dflash_batch;
 
-use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
+use common::{
+    check_sharded_head, check_spec, collect_ids, dim_max, gen_ids, host_settings, kept_count,
+    loopback_links, open_drafter, open_engine, open_target, open_tp_dflash, plan_gathers, req, row,
+    spec_events, step_feeds, zero_last,
+};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tessera_engine::comm::{Error as CommError, Sockets, Transport};
 use tessera_engine::{
-    BatchDFlash, Drafter, Engine, Event, Place, Reason, Recipe, Request, Row, SpecStats, Speculate,
+    BatchDFlash, Drafter, Engine, Event, Reason, Recipe, Request, SpecStats, Speculate,
 };
-use tessera_graph::DimName::{Context, Embedding, Rows, Segments, Seqs, Vocab};
+use tessera_graph::DimName::{Embedding, Vocab};
 use tessera_graph::{Graph, Parts, PathSeg, Role};
-use tessera_interp::{Store, Tensor, run, run_kept, run_ranks};
-use tessera_lower::{Cache, Cluster, Device, Pick, Settings, Wants, Weight};
+use tessera_interp::{Store, Tensor, run_kept};
+use tessera_lower::{Settings, Wants};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::dflash::{self, TargetSpec};
 use tessera_models::mla;
@@ -23,31 +27,45 @@ use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
 
-fn row(slot: u32, token: u32, position: u32) -> Row {
-    Row {
-        slot,
-        token,
-        position,
+fn target_spec(vocab: u64, hidden: u64, layers: u64, tied: bool) -> TargetSpec {
+    TargetSpec {
+        vocab,
+        hidden,
+        layers,
+        tied,
     }
 }
 
-fn step_feeds(rows: &[Row]) -> Vec<Tensor> {
-    let col = |of: fn(&Row) -> u32| Tensor::u32(vec![rows.len()], rows.iter().map(of).collect());
-    vec![col(|r| r.token), col(|r| r.position), col(|r| r.slot)]
+fn dflash2_cfg(spec: &TargetSpec, ctx: u64) -> dflash::Config {
+    let mut cfg = dflash::Config::toy(spec, 4, 0, 1, ctx);
+    cfg.sliding_window = Some(16);
+    cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    cfg.selector = Some(dflash::SelectorConfig {
+        rank: 8,
+        top_k: 4,
+        svd_rank: None,
+    });
+    cfg
 }
 
-fn open_drafter(
-    g: &Graph,
-    w: &[Tensor],
-    ctx: usize,
-    block: usize,
-    mask: u32,
-    s: &tessera_lower::Settings,
-) -> Drafter {
-    let mut drafter = Drafter::open(g.clone(), ctx, block, mask, &Recipe::default(), s).unwrap();
-    let stored: Vec<Weight> = w.iter().cloned().map(Weight::Floats).collect();
-    drafter.load(&stored).unwrap();
-    drafter
+fn dspine_cfg(spec: &TargetSpec, ctx: u64) -> dflash::Config {
+    let mut cfg = dflash::Config::toy(spec, 4, 0, 1, ctx);
+    cfg.stack.layers = 2;
+    cfg.causal = true;
+    cfg.conv = Some(dflash::ConvConfig {
+        taps: 2,
+        group_size: 4,
+    });
+    cfg.bridge = Some(dflash::BridgeConfig {
+        code_size: 16,
+        rank: 8,
+        top_k: 4,
+        eps: 1e-6,
+    });
+    cfg
 }
 
 #[test]
@@ -100,90 +118,35 @@ fn dflash_matches_greedy() {
     t_cfg.stack.taps = vec![1, 2];
     let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
     let t_weights = weights(&t_graph, &mut Noise(19));
-    let spec = TargetSpec {
-        vocab: t_cfg.stack.vocab,
-        hidden: t_cfg.stack.hidden,
-        layers: t_cfg.stack.layers,
-        tied: t_cfg.tied,
-    };
-    let d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 32);
-    let d_graph = dflash::stepper::<Norm>(&d_cfg);
+    let spec = target_spec(
+        t_cfg.stack.vocab,
+        t_cfg.stack.hidden,
+        t_cfg.stack.layers,
+        t_cfg.tied,
+    );
+    let d_graph = dflash::stepper::<Norm>(&dflash::Config::toy(&spec, 4, 0, 1, 32));
     let d_weights = weights(&d_graph, &mut Noise(23));
-    let prompt = vec![3u32, 9, 4, 11];
+    let prompt = [3u32, 9, 4, 11];
+    let long_prompt = [3u32, 9, 4, 11, 2, 7, 5, 1, 8, 6, 3, 10, 4];
     for settings in runs() {
         let mut baseline = open_target(&t_graph, &t_weights, 32, &settings);
         let mut target = open_target(&t_graph, &t_weights, 32, &settings);
         let mut drafter = open_drafter(&d_graph, &d_weights, 32, 4, 0, &settings);
-        let req = |max_tokens, stop| Request {
-            tokens: prompt.clone(),
-            max_tokens,
-            stop,
-            ..Request::default()
-        };
-        let mut want_ev = Vec::new();
-        baseline
-            .generate(req(12, Vec::new()), &mut |e| want_ev.push(e))
-            .unwrap();
-        let mut got_ev = Vec::new();
         let mut spec_run = Speculate::new(&mut target, &mut drafter).unwrap();
-        let stats = spec_run
-            .generate(req(12, Vec::new()), &mut |e| {
-                got_ev.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
-        assert_eq!(got_ev.last(), Some(&Event::Done(Reason::Length)));
-        assert!(stats.steps > 0);
-        // Stop token ends at the exact same offset.
-        let stop_id = collect_ids(&want_ev)[5];
-        let mut stop_want = Vec::new();
-        baseline
-            .generate(req(12, vec![stop_id]), &mut |e| stop_want.push(e))
-            .unwrap();
-        let mut stop_ev = Vec::new();
-        spec_run
-            .generate(req(12, vec![stop_id]), &mut |e| {
-                stop_ev.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&stop_ev), collect_ids(&stop_want));
-        assert_eq!(stop_ev.last(), Some(&Event::Done(Reason::Stop)));
-        // Context tail falls back cleanly past block_size.
-        let mut full_want = Vec::new();
-        baseline
-            .generate(req(40, Vec::new()), &mut |e| full_want.push(e))
-            .unwrap();
-        let mut full_got = Vec::new();
-        spec_run
-            .generate(req(40, Vec::new()), &mut |e| {
-                full_got.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&full_got), collect_ids(&full_want));
-        assert_eq!(full_got.last(), Some(&Event::Done(Reason::Context)));
+        check_spec(
+            &mut baseline,
+            |r| spec_events(|e| spec_run.generate(r, e)),
+            &prompt,
+            [12, 5, 40],
+        );
         // Chunked prefill matches baseline for single and multi-token runs.
-        let mut chunked = Speculate::new(&mut target, &mut drafter)
-            .unwrap()
-            .with_prefill_chunk(3);
-        let long_prompt = vec![3u32, 9, 4, 11, 2, 7, 5, 1, 8, 6, 3, 10, 4];
+        let mut chunked = spec_run.with_prefill_chunk(3);
         for max_tokens in [1, 8] {
-            let creq = || Request {
-                tokens: long_prompt.clone(),
-                max_tokens,
-                ..Request::default()
-            };
-            let (mut cw, mut cg) = (Vec::new(), Vec::new());
-            baseline.generate(creq(), &mut |e| cw.push(e)).unwrap();
-            chunked
-                .generate(creq(), &mut |e| {
-                    cg.push(e);
-                    true
-                })
-                .unwrap();
-            assert_eq!(collect_ids(&cg), collect_ids(&cw));
+            let (cg, _) = spec_events(|e| chunked.generate(req(&long_prompt, max_tokens), e));
+            assert_eq!(
+                collect_ids(&cg),
+                gen_ids(&mut baseline, req(&long_prompt, max_tokens))
+            );
         }
     }
 }
@@ -202,22 +165,16 @@ fn verify_pair(
         let mut target = open_target(t_graph, t_weights, 24, &settings);
         let mut drafter = open_drafter(d_graph, d_weights, 24, 4, 0, &settings);
         drafter.set_causal(causal);
-        let req = || Request {
-            tokens: vec![2, 6, 1],
-            max_tokens,
-            ..Request::default()
-        };
-        let mut want_ev = Vec::new();
-        baseline.generate(req(), &mut |e| want_ev.push(e)).unwrap();
-        let mut got_ev = Vec::new();
-        last = Speculate::new(&mut target, &mut drafter)
-            .unwrap()
-            .generate(req(), &mut |e| {
-                got_ev.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
+        let (got, stats) = spec_events(|e| {
+            Speculate::new(&mut target, &mut drafter)
+                .unwrap()
+                .generate(req(&[2, 6, 1], max_tokens), e)
+        });
+        assert_eq!(
+            collect_ids(&got),
+            gen_ids(&mut baseline, req(&[2, 6, 1], max_tokens))
+        );
+        last = stats;
     }
     last
 }
@@ -227,12 +184,12 @@ fn dflash_accepts_and_mla() {
     let mut mla_cfg = mla::Config::deepseek_small();
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 24;
-    let spec = TargetSpec {
-        vocab: mla_cfg.stack.vocab,
-        hidden: mla_cfg.stack.hidden,
-        layers: mla_cfg.stack.layers,
-        tied: false,
-    };
+    let spec = target_spec(
+        mla_cfg.stack.vocab,
+        mla_cfg.stack.hidden,
+        mla_cfg.stack.layers,
+        false,
+    );
     let d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
     mla_cfg.stack.taps = d_cfg.tap_layers();
     let t_graph = mla::stepper::<mla::Moe>(&mla_cfg);
@@ -240,13 +197,8 @@ fn dflash_accepts_and_mla() {
     let d_graph = dflash::stepper::<()>(&d_cfg);
     let mut d_weights = weights(&d_graph, &mut Noise(37));
     // Zero both output heads so both predict token 0.
-    let zero_head = |t: &mut Tensor| {
-        *t = Tensor::f32(t.shape.clone(), vec![0.0; t.len()]);
-    };
-    let last_t = t_weights.len() - 1;
-    let last_d = d_weights.len() - 1;
-    zero_head(&mut t_weights[last_t]);
-    zero_head(&mut d_weights[last_d]);
+    zero_last(&mut t_weights);
+    zero_last(&mut d_weights);
     let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 10, false);
     assert!(
         stats.accepted > 0,
@@ -261,23 +213,13 @@ fn dflash2_selector() {
     mla_cfg.stack.vocab = 600;
     mla_cfg.stack.max_seqs = 1;
     mla_cfg.stack.max_context = 24;
-    let spec = TargetSpec {
-        vocab: mla_cfg.stack.vocab,
-        hidden: mla_cfg.stack.hidden,
-        layers: mla_cfg.stack.layers,
-        tied: false,
-    };
-    let mut d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
-    d_cfg.sliding_window = Some(16);
-    d_cfg.conv = Some(dflash::ConvConfig {
-        taps: 2,
-        group_size: 4,
-    });
-    d_cfg.selector = Some(dflash::SelectorConfig {
-        rank: 8,
-        top_k: 4,
-        svd_rank: None,
-    });
+    let spec = target_spec(
+        mla_cfg.stack.vocab,
+        mla_cfg.stack.hidden,
+        mla_cfg.stack.layers,
+        false,
+    );
+    let d_cfg = dflash2_cfg(&spec, 24);
     mla_cfg.stack.taps = d_cfg.tap_layers();
     let t_graph = mla::stepper::<mla::Moe>(&mla_cfg);
     let t_weights = weights(&t_graph, &mut Noise(41));
@@ -293,26 +235,13 @@ fn dspine_bridge() {
     t_cfg.stack.taps = vec![1, 2];
     let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
     let t_weights = weights(&t_graph, &mut Noise(47));
-    let spec = TargetSpec {
-        vocab: t_cfg.stack.vocab,
-        hidden: t_cfg.stack.hidden,
-        layers: t_cfg.stack.layers,
-        tied: t_cfg.tied,
-    };
-    let mut d_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
-    d_cfg.stack.layers = 2;
-    d_cfg.causal = true;
-    d_cfg.conv = Some(dflash::ConvConfig {
-        taps: 2,
-        group_size: 4,
-    });
-    d_cfg.bridge = Some(dflash::BridgeConfig {
-        code_size: 16,
-        rank: 8,
-        top_k: 4,
-        eps: 1e-6,
-    });
-    let d_graph = dflash::stepper::<Norm>(&d_cfg);
+    let spec = target_spec(
+        t_cfg.stack.vocab,
+        t_cfg.stack.hidden,
+        t_cfg.stack.layers,
+        t_cfg.tied,
+    );
+    let d_graph = dflash::stepper::<Norm>(&dspine_cfg(&spec, 24));
     let d_weights = weights(&d_graph, &mut Noise(53));
     let stats = verify_pair(&t_graph, &t_weights, &d_graph, &d_weights, 8, true);
     assert!(stats.emitted == 8 && stats.steps > 0);
@@ -326,51 +255,28 @@ fn verify_tp_pair(
     causal: bool,
     expect_head_split: bool,
 ) {
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let [[s0, s1], [c0, c1]] = loopback_links();
     let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
     let follower = std::thread::spawn(move || {
-        let [ts1, ds1] = Drafter::share_transport(Box::new(s1));
-        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-        let (tw_f, dw_f) = (float_weights(&tg_f, t_seed), float_weights(&dg_f, d_seed));
-        let mut te = open_ranked_target(tg_f, 24, &s_f, place(), ts1, c1, &tw_f);
-        let mut dr = Drafter::open_ranked(
-            dg_f,
+        let (mut te, mut dr) = open_tp_dflash(
+            (&tg_f, t_seed),
+            (&dg_f, d_seed),
             24,
-            4,
-            0,
-            (&Recipe::default(), &s_f),
-            place(),
-            ds1,
-            None,
-        )
-        .unwrap();
-        dr.set_causal(causal);
-        dr.load(&dw_f).unwrap();
+            causal,
+            &s_f,
+            (Box::new(s1), c1),
+        );
         Speculate::new(&mut te, &mut dr).unwrap().follow().unwrap();
     });
-    let [ts0, ds0] = Drafter::share_transport(Box::new(s0));
-    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-    let t_weights = weights(t_graph, &mut Noise(t_seed));
-    let tw = float_weights(t_graph, t_seed);
-    let dw = float_weights(d_graph, d_seed);
-    let mut target = open_ranked_target(t_graph.clone(), 24, &settings, place(), ts0, c0, &tw);
-    let mut drafter = Drafter::open_ranked(
-        d_graph.clone(),
+    let (mut target, mut drafter) = open_tp_dflash(
+        (t_graph, t_seed),
+        (d_graph, d_seed),
         24,
-        4,
-        0,
-        (&Recipe::default(), &settings),
-        place(),
-        ds0,
-        None,
-    )
-    .unwrap();
-    drafter.set_causal(causal);
-    drafter.load(&dw).unwrap();
+        causal,
+        &settings,
+        (Box::new(s0), c0),
+    );
     assert!(drafter.has_kernel("all_reduce"), "missing all_reduce");
     assert!(drafter.has_kernel("all_gather"), "missing all_gather");
     let at = |tail: &str| {
@@ -384,25 +290,18 @@ fn verify_tp_pair(
         assert!(drafter.share(at(name)).is_some(), "{name} should shard");
     }
     assert_eq!(drafter.share(at("head")).is_some(), expect_head_split);
-    let mut baseline = open_target(t_graph, &t_weights, 24, &settings);
+    let mut baseline = open_target(
+        t_graph,
+        &weights(t_graph, &mut Noise(t_seed)),
+        24,
+        &settings,
+    );
     let mut spec = Speculate::new(&mut target, &mut drafter)
         .unwrap()
         .with_prefill_chunk(3);
-    for prompt in [vec![2u32, 6, 1], vec![4u32, 1, 5, 3, 7, 2, 8]] {
-        let req = || Request {
-            tokens: prompt.clone(),
-            max_tokens: 7,
-            ..Request::default()
-        };
-        let (mut want_ev, mut got_ev) = (Vec::new(), Vec::new());
-        baseline.generate(req(), &mut |e| want_ev.push(e)).unwrap();
-        let stats = spec
-            .generate(req(), &mut |e| {
-                got_ev.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got_ev), collect_ids(&want_ev));
+    for prompt in [&[2u32, 6, 1][..], &[4, 1, 5, 3, 7, 2, 8][..]] {
+        let (got, stats) = spec_events(|e| spec.generate(req(prompt, 7), e));
+        assert_eq!(collect_ids(&got), gen_ids(&mut baseline, req(prompt, 7)));
         assert!(stats.steps > 0);
     }
     target.dismiss().unwrap();
@@ -411,10 +310,11 @@ fn verify_tp_pair(
 
 fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
     let parts = Parts::even(2);
-    let sharded = dflash::shard(g, &parts, &|_, _, _, _| true).unwrap();
-    let sharded = sharded.graph.wired(tessera_graph::DType::F32);
-    let dim = |name| g.dims.iter().find(|d| d.name == name).unwrap().size.max() as usize;
-    let (vocab, tap_w) = (dim(Vocab), dim(Embedding));
+    let sharded = dflash::shard(g, &parts, &|_, _, _, _| true)
+        .unwrap()
+        .graph
+        .wired(tessera_graph::DType::F32);
+    let (vocab, tap_w) = (dim_max(g, Vocab), dim_max(g, Embedding));
     let w = weights(g, &mut Noise(seed));
     let feeds = vec![
         Tensor::u32(vec![4], vec![2, 0, 0, 0]),
@@ -425,9 +325,7 @@ fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
         Tensor::u32(vec![6], vec![0, 1, 2, 3, 4, 5]),
         Tensor::u32(vec![6], vec![0; 6]),
     ];
-    let want = run(g, &w, 0, &feeds).unwrap();
-    let got = run_ranks(&sharded, &w, 0, &feeds, 2).unwrap();
-    assert_eq!(got[0].indices().unwrap(), want[0].indices().unwrap());
+    let (want, got) = check_sharded_head(g, &sharded, &w, &feeds);
     for (a, b) in got[1]
         .floats()
         .unwrap()
@@ -436,44 +334,11 @@ fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
     {
         assert!((a - b).abs() < 1e-3 * b.abs().max(1.0), "{a} vs {b}");
     }
-    // Equal logits across ranks keep lower-index tie-breaking.
-    let mut tied = w.clone();
-    let head = g
-        .weights
-        .iter()
-        .position(|wt| matches!(wt.path.last(), Some(PathSeg::Field(f)) if f == "head"))
-        .unwrap();
-    tied[head] = Tensor::f32(tied[head].shape.clone(), vec![0.0; tied[head].len()]);
-    let want_tie = run(g, &tied, 0, &feeds).unwrap();
-    let got_tie = run_ranks(&sharded, &tied, 0, &feeds, 2).unwrap();
-    assert_eq!(
-        got_tie[0].indices().unwrap(),
-        want_tie[0].indices().unwrap()
-    );
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
-    let dev = Device::guess(&settings)
-        .zoned(Cluster::two("a", "b"))
-        .ranked(vec![0, 1])
-        .uneven(parts.0)
-        .as_rank(0);
-    let sizes = [(Seqs, 1), (Rows, 4), (Context, 4), (Segments, 1)];
     let wants = match selector {
         true => Wants::roles(&sharded, 0, &[Role::Candidates, Role::Taps]),
         false => Wants::role(&sharded, 0, Role::Tokens),
     };
-    let mut cache = Cache::default();
-    let (plan, _) = cache
-        .wanting(&sharded, 0, wants, &sizes, &[Context, Segments], &dev)
-        .unwrap();
-    let gathers: Vec<usize> = plan
-        .steps
-        .iter()
-        .filter(|s| s.kernel.name() == "all_gather")
-        .map(|s| s.write.len)
-        .collect();
+    let gathers = plan_gathers(&sharded, &parts, 4, wants);
     assert!(
         gathers.contains(&(2 * 3 * 2 * k)),
         "missing top-k gather: {gathers:?}"
@@ -482,22 +347,8 @@ fn verify_local_topk(g: &Graph, seed: u64, k: usize, selector: bool) {
         !gathers.contains(&(3 * vocab)),
         "full logits gather remained: {gathers:?}"
     );
-    let (logits_plan, _) = cache
-        .wanting(
-            &sharded,
-            0,
-            Wants::role(&sharded, 0, Role::Logits),
-            &sizes,
-            &[Context, Segments],
-            &dev,
-        )
-        .unwrap();
-    assert!(
-        logits_plan
-            .steps
-            .iter()
-            .any(|s| s.kernel.name() == "all_gather" && s.write.len == 3 * vocab)
-    );
+    let logits_gathers = plan_gathers(&sharded, &parts, 4, Wants::role(&sharded, 0, Role::Logits));
+    assert!(logits_gathers.contains(&(3 * vocab)));
 }
 
 #[test]
@@ -506,46 +357,22 @@ fn tp_drafter_matches_one() {
     t_cfg.tied = false;
     t_cfg.stack.taps = vec![1, 2];
     let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
-    let spec = TargetSpec {
-        vocab: t_cfg.stack.vocab,
-        hidden: t_cfg.stack.hidden,
-        layers: t_cfg.stack.layers,
-        tied: false,
-    };
-    let d1_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
-    let d1_g = dflash::stepper::<Norm>(&d1_cfg);
+    let spec = target_spec(
+        t_cfg.stack.vocab,
+        t_cfg.stack.hidden,
+        t_cfg.stack.layers,
+        false,
+    );
+
+    let d1_g = dflash::stepper::<Norm>(&dflash::Config::toy(&spec, 4, 0, 1, 24));
     verify_local_topk(&d1_g, 67, 1, false);
     verify_tp_pair(&t_graph, 61, &d1_g, 67, false, true);
 
-    let mut d2_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
-    d2_cfg.sliding_window = Some(16);
-    d2_cfg.conv = Some(dflash::ConvConfig {
-        taps: 2,
-        group_size: 4,
-    });
-    d2_cfg.selector = Some(dflash::SelectorConfig {
-        rank: 8,
-        top_k: 4,
-        svd_rank: None,
-    });
-    let d2_g = dflash::stepper::<Norm>(&d2_cfg);
+    let d2_g = dflash::stepper::<Norm>(&dflash2_cfg(&spec, 24));
     verify_local_topk(&d2_g, 71, 4, true);
     verify_tp_pair(&t_graph, 61, &d2_g, 71, false, true);
 
-    let mut d3_cfg = dflash::Config::toy(&spec, 4, 0, 1, 24);
-    d3_cfg.stack.layers = 2;
-    d3_cfg.causal = true;
-    d3_cfg.conv = Some(dflash::ConvConfig {
-        taps: 2,
-        group_size: 4,
-    });
-    d3_cfg.bridge = Some(dflash::BridgeConfig {
-        code_size: 16,
-        rank: 8,
-        top_k: 4,
-        eps: 1e-6,
-    });
-    let d3_g = dflash::stepper::<Norm>(&d3_cfg);
+    let d3_g = dflash::stepper::<Norm>(&dspine_cfg(&spec, 24));
     verify_tp_pair(&t_graph, 61, &d3_g, 73, true, false);
 }
 
@@ -572,118 +399,53 @@ fn tp_early_stop() {
     t_cfg.tied = false;
     t_cfg.stack.taps = vec![1, 2];
     let t_graph = stepper::<Norm, Swiglu>(&t_cfg);
-    let spec = TargetSpec {
-        vocab: t_cfg.stack.vocab,
-        hidden: t_cfg.stack.hidden,
-        layers: t_cfg.stack.layers,
-        tied: false,
-    };
+    let spec = target_spec(
+        t_cfg.stack.vocab,
+        t_cfg.stack.hidden,
+        t_cfg.stack.layers,
+        false,
+    );
     let d_graph = dflash::stepper::<Norm>(&dflash::Config::toy(&spec, 4, 0, 1, 24));
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let [[s0, s1], [c0, c1]] = loopback_links();
     let exchanges = Arc::new(AtomicUsize::new(0));
     let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
     let follower = std::thread::spawn(move || {
-        let [ts1, ds1] = Drafter::share_transport(Box::new(s1));
-        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-        let mut te = open_ranked_target(
-            tg_f.clone(),
+        let (mut te, mut dr) = open_tp_dflash(
+            (&tg_f, 61),
+            (&dg_f, 67),
             24,
+            false,
             &s_f,
-            place(),
-            ts1,
-            c1,
-            &float_weights(&tg_f, 61),
+            (Box::new(s1), c1),
         );
-        let mut dr = Drafter::open_ranked(
-            dg_f.clone(),
-            24,
-            4,
-            0,
-            (&Recipe::default(), &s_f),
-            place(),
-            ds1,
-            None,
-        )
-        .unwrap();
-        dr.load(&float_weights(&dg_f, 67)).unwrap();
         Speculate::new(&mut te, &mut dr).unwrap().follow().unwrap();
     });
-    let [ts0, ds0] = Drafter::share_transport(Box::new(s0));
-    let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-    let mut target = open_ranked_target(
-        t_graph.clone(),
+    let (mut target, mut drafter) = open_tp_dflash(
+        (&t_graph, 61),
+        (&d_graph, 67),
         24,
+        false,
         &settings,
-        place(),
-        ts0,
-        Counting(c0, exchanges.clone()),
-        &float_weights(&t_graph, 61),
+        (Box::new(s0), Counting(c0, exchanges.clone())),
     );
-    let mut drafter = Drafter::open_ranked(
-        d_graph.clone(),
-        24,
-        4,
-        0,
-        (&Recipe::default(), &settings),
-        place(),
-        ds0,
-        None,
-    )
-    .unwrap();
-    drafter.load(&float_weights(&d_graph, 67)).unwrap();
     let mut spec = Speculate::new(&mut target, &mut drafter).unwrap();
     // Normal multi-step request uses only request-start and end sync.
-    let mut full = Vec::new();
-    let stats = spec
-        .generate(
-            Request {
-                tokens: vec![2, 6, 1],
-                max_tokens: 7,
-                ..Request::default()
-            },
-            &mut |e| {
-                full.push(e);
-                true
-            },
-        )
-        .unwrap();
+    let (full, stats) = spec_events(|e| spec.generate(req(&[2, 6, 1], 7), e));
     assert!(stats.steps >= 2);
     assert_eq!(exchanges.load(Ordering::Relaxed), 2);
     // Early emit stop avoids hangs and allows later requests.
     let mut cut = Vec::new();
     let cut_stats = spec
-        .generate(
-            Request {
-                tokens: vec![2, 6, 1],
-                max_tokens: 7,
-                ..Request::default()
-            },
-            &mut |e| {
-                cut.push(e);
-                collect_ids(&cut).len() < 2
-            },
-        )
+        .generate(req(&[2, 6, 1], 7), &mut |e| {
+            cut.push(e);
+            collect_ids(&cut).len() < 2
+        })
         .unwrap();
     assert_eq!(cut_stats.emitted, 2);
     assert_eq!(collect_ids(&cut), collect_ids(&full)[..2]);
     assert_eq!(cut.last(), Some(&Event::Done(Reason::Stop)));
-    let mut after = Vec::new();
-    spec.generate(
-        Request {
-            tokens: vec![4, 1, 5],
-            max_tokens: 5,
-            ..Request::default()
-        },
-        &mut |e| {
-            after.push(e);
-            true
-        },
-    )
-    .unwrap();
+    let (after, _) = spec_events(|e| spec.generate(req(&[4, 1, 5], 5), e));
     assert_eq!(collect_ids(&after).len(), 5);
     target.dismiss().unwrap();
     follower.join().unwrap();

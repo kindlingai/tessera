@@ -311,7 +311,7 @@ fn ple_engine(links: Option<[Sockets; 2]>) -> Engine {
         Some([sums, control]) => {
             let place = Place::new(Cluster::two("a", "b"), Parts::even(2));
             let weights = float_weights(&g, 3);
-            open_ranked_target(g, 16, &host(), place, Box::new(sums), control, &weights)
+            open_ranked_target(g, 16, &host(), place, (Box::new(sums), control), &weights)
         }
         None => {
             let weights = tessera_testkit::weights(&g, &mut tessera_testkit::Noise(3));

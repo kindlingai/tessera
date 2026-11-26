@@ -1,34 +1,18 @@
 //! Two engines as ranks against one engine alone.
 
-use std::time::Duration;
+mod common;
+
+use common::{collect_ids, float_weights, host_settings, loopback_links, req, row, two_place};
 use tessera_engine::comm::{Sockets, Transport};
-use tessera_engine::{Batch, Engine, Event, Fair, Place, Request, Row};
-use tessera_graph::{Graph, Parts};
-use tessera_lower::{Cluster, Pick, Recipe, Settings, Weight, kept};
+use tessera_engine::{Batch, Engine, Fair};
+use tessera_graph::Graph;
+use tessera_lower::{Recipe, Settings, kept};
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::mla;
 use tessera_run::Profile;
-use tessera_testkit::{Noise, tcp_pair, tcp_timeouts, weights};
 use tessera_trace::Norm;
 
-/// Both ends of one loopback stream, as two ranks.
-fn pair() -> [Sockets; 2] {
-    let wait = Duration::from_secs(20);
-    let (caller, answer) = tcp_pair().unwrap();
-    tcp_timeouts(&caller, wait).unwrap();
-    tcp_timeouts(&answer, wait).unwrap();
-    [
-        Sockets::over(0, vec![None, Some(caller)]).unwrap(),
-        Sockets::over(1, vec![Some(answer), None]).unwrap(),
-    ]
-}
-
 /// A faux-weight engine, a rank over `links` if any.
-fn engine(graph: fn() -> Graph, links: Option<[Sockets; 2]>, moe_tp: bool) -> Engine {
-    opened(graph, links, &Recipe::default(), 16, moe_tp)
-}
-
-/// As `engine`, with a recipe and a context.
 fn opened(
     graph: fn() -> Graph,
     links: Option<[Sockets; 2]>,
@@ -37,18 +21,23 @@ fn opened(
     moe_tp: bool,
 ) -> Engine {
     let settings = Settings {
-        backend: Pick::Host,
         profile: Some(1),
-        ..Settings::default()
+        ..host_settings()
     };
     let g = graph();
-    let stored = weights(&g, &mut Noise(3)).into_iter().map(Weight::Floats);
-    let stored: Vec<Weight> = stored.collect();
+    let stored = float_weights(&g, 3);
     let mut engine = match links {
         Some([sums, control]) => {
-            let place = Place::new(Cluster::two("a", "b"), Parts::even(2)).with_moe_tp(moe_tp);
             let control: Box<dyn Transport> = Box::new(control);
-            Engine::open_ranked(g, context, (recipe, &settings), place, sums, control).unwrap()
+            Engine::open_ranked(
+                g,
+                context,
+                (recipe, &settings),
+                two_place(moe_tp),
+                sums,
+                control,
+            )
+            .unwrap()
         }
         None => Engine::open(g, context, recipe, &settings).unwrap(),
     };
@@ -56,24 +45,16 @@ fn opened(
     engine
 }
 
-fn row(slot: u32, token: u32, position: u32) -> Row {
-    Row {
-        slot,
-        token,
-        position,
-    }
-}
-
 /// Rank 0 leads, rank 1 follows on a thread.
 fn agree(graph: fn() -> Graph, moe_tp: bool) {
-    let ([sums, others], [control, told]) = (pair(), pair());
+    let [[s0, s1], [c0, c1]] = loopback_links();
     let follower = std::thread::spawn(move || {
-        engine(graph, Some([others, told]), moe_tp)
+        opened(graph, Some([s1, c1]), &Recipe::default(), 16, moe_tp)
             .follow()
             .unwrap();
     });
-    let mut lead = engine(graph, Some([sums, control]), moe_tp);
-    let mut alone = engine(graph, None, false);
+    let mut lead = opened(graph, Some([s0, c0]), &Recipe::default(), 16, moe_tp);
+    let mut alone = opened(graph, None, &Recipe::default(), 16, false);
     let launches = [
         vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0)],
         vec![row(0, 4, 1), row(1, 3, 2)],
@@ -124,21 +105,12 @@ fn continued(engine: &mut Engine) -> Vec<Vec<u32>> {
         let mut taken = Vec::new();
         for tokens in round {
             let (events, receiver) = std::sync::mpsc::channel();
-            let request = Request {
-                tokens,
-                max_tokens: 3,
-                ..Request::default()
-            };
-            batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+            batch.submit(req(&tokens, 3), Box::new(move |e| events.send(e).is_ok()));
             taken.push(receiver);
         }
         while batch.step().unwrap() {}
         for r in taken {
-            let id = |e: Event| match e {
-                Event::Token(id) => Some(id),
-                _ => None,
-            };
-            answers.push(r.try_iter().filter_map(id).collect());
+            answers.push(collect_ids(&r.try_iter().collect::<Vec<_>>()));
         }
     }
     answers
@@ -151,14 +123,14 @@ fn ranks_share_pages() {
         ..Recipe::default()
     };
     let graph = || stepper::<Norm, Swiglu>(&Config::toy(2, 64));
-    let ([sums, others], [control, told]) = (pair(), pair());
+    let [[s0, s1], [c0, c1]] = loopback_links();
     let theirs = recipe.clone();
     let follower = std::thread::spawn(move || {
-        opened(graph, Some([others, told]), &theirs, 64, false)
+        opened(graph, Some([s1, c1]), &theirs, 64, false)
             .follow()
             .unwrap();
     });
-    let mut lead = opened(graph, Some([sums, control]), &recipe, 64, false);
+    let mut lead = opened(graph, Some([s0, c0]), &recipe, 64, false);
     let mut alone = opened(graph, None, &recipe, 64, false);
     assert_eq!(continued(&mut lead), continued(&mut alone));
     lead.dismiss().unwrap();

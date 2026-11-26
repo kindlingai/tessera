@@ -16,16 +16,13 @@ fn batch_dflash_matches_single() {
     for settings in runs() {
         let want = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 32, &settings, prompts);
         for paged in [false, true] {
-            let mut recipe = Recipe::default();
-            if paged {
-                recipe.kept = &tessera_lower::kept::PAGED16;
-            }
-            let mut te = Engine::open(t_graph.clone(), 32, &recipe, &settings).unwrap();
-            let stored: Vec<Weight> = tw.iter().cloned().map(Weight::Floats).collect();
-            te.load(&stored).unwrap();
+            let mut te = open_engine(&t_graph, &tw, 32, &paged_recipe(paged), &settings);
             let mut dr = open_drafter(&d_graph, &dw, 32, 4, 0, &settings);
-            let got = run_batch_reqs(&mut te, &mut dr, prompts);
-            assert_eq!(got, want, "paged={paged}");
+            assert_eq!(
+                run_batch_reqs(&mut te, &mut dr, prompts),
+                want,
+                "paged={paged}"
+            );
         }
     }
 }
@@ -33,36 +30,30 @@ fn batch_dflash_matches_single() {
 #[test]
 fn batch_dflash_tp() {
     let (t_graph, d_graph) = toy_pair(24);
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let tw = weights(&t_graph, &mut Noise(97));
     let dw = weights(&d_graph, &mut Noise(101));
     let prompts: &[(&[u32], usize)] = &[(&[2, 5, 1, 4], 6), (&[6, 3, 2], 5), (&[1, 7, 3, 5, 2], 4)];
     let want = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 24, &settings, prompts);
-    let [[s0, s1], [c0, c1]] = loopback_links();
-    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
-    let follower = std::thread::spawn(move || {
-        let (mut te, mut dr) = open_tp_dflash(&tg_f, &dg_f, 24, &s_f, Box::new(s1), c1, (97, 101));
-        BatchDFlash::new(&mut te, &mut dr)
-            .unwrap()
-            .with_prefill_chunk(3)
-            .follow()
-            .unwrap();
-    });
-    let (mut te, mut dr) = open_tp_dflash(
-        &t_graph,
-        &d_graph,
+    let got = with_tp_batch(
+        (&t_graph, &d_graph),
         24,
-        &settings,
-        Box::new(s0),
-        c0,
         (97, 101),
+        Some(3),
+        false,
+        |batch| {
+            let mut rxs = Vec::new();
+            for &(p, max) in prompts {
+                let (tx, rx) = std::sync::mpsc::channel();
+                batch.submit(req(p, max), Box::new(move |e| tx.send(e).is_ok()));
+                rxs.push(rx);
+            }
+            while batch.step().unwrap() {}
+            rxs.into_iter()
+                .map(|r| collect_ids(&r.try_iter().collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        },
     );
-    let got = run_batch_reqs(&mut te, &mut dr, prompts);
-    te.dismiss().unwrap();
-    follower.join().unwrap();
     assert_eq!(got, want);
 }
 
@@ -75,19 +66,10 @@ fn batch_dflash_reuses_prefix() {
     let mut p2 = p1.clone();
     p2.extend_from_slice(&[6, 2, 5, 1]);
     let prompts: &[(&[u32], usize)] = &[(&p1, 6), (&p2, 6)];
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let want = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 48, &settings, prompts);
     for paged in [false, true] {
-        let mut recipe = Recipe::default();
-        if paged {
-            recipe.kept = &tessera_lower::kept::PAGED16;
-        }
-        let mut te = Engine::open(t_graph.clone(), 48, &recipe, &settings).unwrap();
-        let stored: Vec<Weight> = tw.iter().cloned().map(Weight::Floats).collect();
-        te.load(&stored).unwrap();
+        let mut te = open_engine(&t_graph, &tw, 48, &paged_recipe(paged), &settings);
         let mut dr = open_drafter(&d_graph, &dw, 48, 4, 0, &settings);
         let mut batch = BatchDFlash::new(&mut te, &mut dr)
             .unwrap()
@@ -97,32 +79,14 @@ fn batch_dflash_reuses_prefix() {
         assert_eq!(got, want, "paged={paged}");
         assert_eq!(kept, vec![0, if paged { 16 } else { 20 }], "paged={paged}");
     }
-    let [[s0, s1], [c0, c1]] = loopback_links();
-    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
-    let follower = std::thread::spawn(move || {
-        let (mut te, mut dr) = open_tp_dflash(&tg_f, &dg_f, 48, &s_f, Box::new(s1), c1, (103, 107));
-        let mut batch = BatchDFlash::new(&mut te, &mut dr)
-            .unwrap()
-            .with_prefill_chunk(6);
-        batch.reuse();
-        batch.follow().unwrap();
-    });
-    let (mut te, mut dr) = open_tp_dflash(
-        &t_graph,
-        &d_graph,
+    let (got, kept) = with_tp_batch(
+        (&t_graph, &d_graph),
         48,
-        &settings,
-        Box::new(s0),
-        c0,
         (103, 107),
+        Some(6),
+        true,
+        |batch| run_reuse_seq(batch, prompts),
     );
-    let mut batch = BatchDFlash::new(&mut te, &mut dr)
-        .unwrap()
-        .with_prefill_chunk(6);
-    batch.reuse();
-    let (got, kept) = run_reuse_seq(&mut batch, prompts);
-    te.dismiss().unwrap();
-    follower.join().unwrap();
     assert_eq!(got, want);
     assert_eq!(kept, vec![0, 20]);
 }
@@ -132,34 +96,19 @@ fn dflash_sampling_seeded() {
     let (t_graph, d_graph) = toy_pair(24);
     let tw = weights(&t_graph, &mut Noise(113));
     let dw = weights(&d_graph, &mut Noise(127));
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
-    let prompt = vec![2u32, 5, 1, 4, 3];
+    let settings = host_settings();
+    let prompt = [2u32, 5, 1, 4, 3];
     let greedy = run_solo_refs(&t_graph, &d_graph, &tw, &dw, 24, &settings, &[(&prompt, 8)])
         .pop()
         .unwrap();
     let run_solo = |sampling| {
         let mut te = open_target(&t_graph, &tw, 24, &settings);
         let mut dr = open_drafter(&d_graph, &dw, 24, 4, 0, &settings);
-        let mut evs = Vec::new();
-        Speculate::new(&mut te, &mut dr)
-            .unwrap()
-            .generate(
-                Request {
-                    tokens: prompt.clone(),
-                    max_tokens: 8,
-                    sampling,
-                    ..Request::default()
-                },
-                &mut |e| {
-                    evs.push(e);
-                    true
-                },
-            )
-            .unwrap();
-        collect_ids(&evs)
+        let r = Request {
+            sampling,
+            ..req(&prompt, 8)
+        };
+        collect_ids(&spec_events(|e| Speculate::new(&mut te, &mut dr).unwrap().generate(r, e)).0)
     };
     let top1 = tessera_engine::Sampling {
         temperature: 0.9,
@@ -175,43 +124,21 @@ fn dflash_sampling_seeded() {
         ..Default::default()
     };
     let a = run_solo(sampled);
-    let b = run_solo(sampled);
-    assert_eq!(a, b);
+    assert_eq!(a, run_solo(sampled));
     assert_eq!(a.len(), 8);
     // BatchDFlash with 2-rank TP agrees with single-rank sampled output.
-    let [[s0, s1], [c0, c1]] = loopback_links();
-    let (tg_f, dg_f, s_f) = (t_graph.clone(), d_graph.clone(), settings.clone());
-    let follower = std::thread::spawn(move || {
-        let (mut te, mut dr) = open_tp_dflash(&tg_f, &dg_f, 24, &s_f, Box::new(s1), c1, (113, 127));
-        BatchDFlash::new(&mut te, &mut dr)
-            .unwrap()
-            .follow()
-            .unwrap();
+    let got_tp = with_tp_batch((&t_graph, &d_graph), 24, (113, 127), None, false, |batch| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        batch.submit(
+            Request {
+                sampling: sampled,
+                ..req(&prompt, 8)
+            },
+            Box::new(move |e| tx.send(e).is_ok()),
+        );
+        while batch.step().unwrap() {}
+        collect_ids(&rx.try_iter().collect::<Vec<_>>())
     });
-    let (mut te, mut dr) = open_tp_dflash(
-        &t_graph,
-        &d_graph,
-        24,
-        &settings,
-        Box::new(s0),
-        c0,
-        (113, 127),
-    );
-    let mut batch = BatchDFlash::new(&mut te, &mut dr).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    batch.submit(
-        Request {
-            tokens: prompt,
-            max_tokens: 8,
-            sampling: sampled,
-            ..Request::default()
-        },
-        Box::new(move |e| tx.send(e).is_ok()),
-    );
-    while batch.step().unwrap() {}
-    te.dismiss().unwrap();
-    follower.join().unwrap();
-    let got_tp = collect_ids(&rx.try_iter().collect::<Vec<_>>());
     assert_eq!(got_tp, a);
 }
 
@@ -224,14 +151,10 @@ fn batch_dflash_rolls_window() {
     let p1: Vec<u32> = (0..22).map(|i| (i % 7) + 1).collect();
     let p2: Vec<u32> = (0..18).map(|i| ((i * 3) % 7) + 1).collect();
     let prompts: &[(&[u32], usize)] = &[(&p1, 14), (&p2, 12)];
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let (_, d_full) = toy_pair(48);
     let want = run_solo_refs(&t_graph, &d_full, &tw, &dw, 48, &settings, prompts);
     let mut te = open_target(&t_graph, &tw, 48, &settings);
     let mut dr = open_drafter(&d_graph, &dw, 16, 4, 0, &settings);
-    let got = run_batch_reqs(&mut te, &mut dr, prompts);
-    assert_eq!(got, want);
+    assert_eq!(run_batch_reqs(&mut te, &mut dr, prompts), want);
 }

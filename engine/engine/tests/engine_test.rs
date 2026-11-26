@@ -1,5 +1,11 @@
 //! The engine's decode loop against the interpreter.
 
+mod common;
+
+use common::{
+    collect_ids as ids, gen_events as events, open_engine, open_target, req, row,
+    step_feeds as feeds,
+};
 use std::sync::{Arc, Mutex};
 use tessera_engine::{
     Allowed, Asks, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason,
@@ -13,7 +19,7 @@ use tessera_graph::{
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
 use tessera_lower::{
-    Device, Limits, Pins, Platform, Recipe, Settings, Weight, explain, kept, lower, rules,
+    Device, Limits, Pins, Platform, Recipe, Settings, explain, kept, lower, rules,
 };
 use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
 use tessera_models::mla;
@@ -21,16 +27,6 @@ use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::DimName::Picks;
 use tessera_trace::Norm;
-
-/// Tokens, positions and slots of `rows`.
-fn feeds(rows: &[Row]) -> Vec<Tensor> {
-    let column = |of: fn(&Row) -> u32| Tensor::u32(vec![rows.len()], rows.iter().map(of).collect());
-    vec![
-        column(|r| r.token),
-        column(|r| r.position),
-        column(|r| r.slot),
-    ]
-}
 
 /// The interpreter's likeliest id per row of one launch.
 fn step(g: &Graph, weights: &[Tensor], store: &mut Store, rows: &[Row]) -> Vec<u32> {
@@ -48,12 +44,11 @@ fn reference(g: &Graph, weights: &[Tensor], prompt: &[u32], n: usize) -> Vec<u32
     let (mut store, mut out, mut next) = (Store::default(), Vec::new(), prompt.to_vec());
     for _ in 0..n {
         let past = out.len() + prompt.len() - next.len();
-        let row = |(i, t): (usize, &u32)| Row {
-            slot: 0,
-            token: *t,
-            position: (past + i) as u32,
-        };
-        let rows: Vec<Row> = next.iter().enumerate().map(row).collect();
+        let rows: Vec<Row> = next
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| row(0, t, (past + i) as u32))
+            .collect();
         next = vec![*step(g, weights, &mut store, &rows).last().unwrap()];
         out.push(next[0]);
     }
@@ -89,33 +84,8 @@ fn open_sized(
     let weights = weights(&g, &mut Noise(seed));
     c.stack.steps = steps;
     let graph = stepper::<Norm, Swiglu>(&c);
-    let mut engine = Engine::open(graph, context as usize, &recipe, settings).unwrap();
-    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
-    engine.load(&stored).unwrap();
+    let engine = open_engine(&graph, &weights, context as usize, &recipe, settings);
     (g, weights, engine)
-}
-
-/// The events of one answer to `request`.
-fn events(engine: &mut Engine, request: Request) -> Vec<Event> {
-    let mut events = Vec::new();
-    engine.generate(request, &mut |e| events.push(e)).unwrap();
-    events
-}
-
-fn ids(events: &[Event]) -> Vec<u32> {
-    let id = |e: &Event| match e {
-        Event::Token(id) => Some(*id),
-        _ => None,
-    };
-    events.iter().filter_map(id).collect()
-}
-
-fn row(slot: u32, token: u32, position: u32) -> Row {
-    Row {
-        slot,
-        token,
-        position,
-    }
 }
 
 #[test]
@@ -289,38 +259,44 @@ fn batch_matches_single() {
     }
 }
 
+fn solo_wants(
+    g: &Graph,
+    w: &[Tensor],
+    ctx: usize,
+    s: &Settings,
+    prompts: &[&[u32]],
+) -> Vec<Vec<u32>> {
+    let mut solo = open_target(g, w, ctx, s);
+    prompts
+        .iter()
+        .map(|p| {
+            let mut b = Batch::new(&mut solo, Box::new(Fair));
+            asked(&mut b, &[p]).0.pop().unwrap()
+        })
+        .collect()
+}
+
 /// Multi-slot MLA stays exact when context bucket < max_context.
 #[test]
 fn mla_multislot_bucketed() {
     let mut cfg = mla::Config::glm53_small();
     cfg.stack.max_context = 512;
     let g = mla::stepper::<mla::RotatedMoe>(&cfg);
-    let weights = weights(&g, &mut Noise(7));
-    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let w = weights(&g, &mut Noise(7));
     let prompts: [&[u32]; 4] = [&[3, 9, 4, 11], &[5, 2, 8], &[12, 1, 6, 7, 10], &[2, 14]];
     for settings in runs() {
-        let mut solo = Engine::open(g.clone(), 512, &Recipe::default(), &settings).unwrap();
-        solo.load(&stored).unwrap();
-        let want: Vec<Vec<u32>> = prompts
-            .iter()
-            .map(|p| {
-                let mut b = Batch::new(&mut solo, Box::new(Fair));
-                asked(&mut b, &[p]).0.pop().unwrap()
-            })
-            .collect();
+        let want = solo_wants(&g, &w, 512, &settings, &prompts);
         for paged in [false, true] {
             let mut recipe = Recipe::default();
             if paged {
                 recipe.kept = &kept::PAGED16;
             }
-            let mut multi = Engine::open(g.clone(), 512, &recipe, &settings).unwrap();
-            multi.load(&stored).unwrap();
+            let mut multi = open_engine(&g, &w, 512, &recipe, &settings);
             let mut batch = Batch::new(&mut multi, Box::new(Fair));
             if paged {
                 batch.reuse();
             }
-            let (got, _) = asked(&mut batch, &prompts);
-            assert_eq!(got, want, "paged={paged}");
+            assert_eq!(asked(&mut batch, &prompts).0, want, "paged={paged}");
         }
     }
 }
@@ -339,14 +315,11 @@ fn mla_matches_interpreter() {
     ];
     for settings in runs() {
         for g in &graphs {
-            let weights = weights(g, &mut Noise(3));
-            let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
-            let mut engine = Engine::open(g.clone(), 16, &Recipe::default(), &settings).unwrap();
-            engine.load(&stored).unwrap();
+            let w = weights(g, &mut Noise(3));
+            let mut engine = open_target(g, &w, 16, &settings);
             let mut store = Store::default();
             for rows in &launches {
-                let want = step(g, &weights, &mut store, rows);
-                assert_eq!(engine.step(rows).unwrap(), want);
+                assert_eq!(engine.step(rows).unwrap(), step(g, &w, &mut store, rows));
             }
         }
     }
@@ -398,17 +371,14 @@ fn mla_radix_index() {
     cfg.stack.max_context = 128;
     cfg.index.as_mut().unwrap().keep = 64;
     let g = mla::stepper::<mla::RotatedMoe>(&cfg);
-    let weights = weights(&g, &mut Noise(13));
-    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let w = weights(&g, &mut Noise(13));
     let prefill: Vec<Row> = (0..72u32).map(|p| row(0, (p * 7 + 3) % 64, p)).collect();
     let decode = [row(0, 11, 72)];
     for settings in runs() {
-        let mut engine = Engine::open(g.clone(), 128, &Recipe::default(), &settings).unwrap();
-        engine.load(&stored).unwrap();
+        let mut engine = open_target(&g, &w, 128, &settings);
         let mut store = Store::default();
         for rows in [&prefill[..], &decode[..]] {
-            let want = step(&g, &weights, &mut store, rows);
-            assert_eq!(engine.step(rows).unwrap(), want);
+            assert_eq!(engine.step(rows).unwrap(), step(&g, &w, &mut store, rows));
         }
     }
 }
@@ -418,12 +388,7 @@ fn asked(batch: &mut Batch, prompts: &[&[u32]]) -> (Vec<Vec<u32>>, usize) {
     let mut taken = Vec::new();
     for prompt in prompts {
         let (events, receiver) = std::sync::mpsc::channel();
-        let request = Request {
-            tokens: prompt.to_vec(),
-            max_tokens: 3,
-            ..Request::default()
-        };
-        batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+        batch.submit(req(prompt, 3), Box::new(move |e| events.send(e).is_ok()));
         taken.push(receiver);
     }
     let mut steps = 0;
@@ -787,7 +752,6 @@ fn mla_narrow_kept() {
     cfg.stack.taps = vec![1];
     let g = mla::stepper::<mla::RotatedMoe>(&cfg);
     let w = weights(&g, &mut Noise(53));
-    let stored: Vec<Weight> = w.iter().cloned().map(Weight::Floats).collect();
     let launches = [
         vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0), row(0, 3, 1)],
         vec![row(0, 4, 2), row(1, 3, 2)],
@@ -827,8 +791,7 @@ fn mla_narrow_kept() {
                 ..Recipe::default()
             };
             for settings in runs() {
-                let mut engine = Engine::open(g.clone(), 16, &recipe, &settings).unwrap();
-                engine.load(&stored).unwrap();
+                let mut engine = open_engine(&g, &w, 16, &recipe, &settings);
                 for (step_idx, (rows, ref_logits)) in launches.iter().zip(&want).enumerate() {
                     let (logits, _) = engine.step_logits(rows).unwrap();
                     let cos = cosine_f32(&logits, ref_logits);
@@ -968,8 +931,7 @@ fn shared_pool_preempts() {
     let mut cfg = mla::Config::glm53_small();
     cfg.stack.max_context = 32;
     let g = mla::stepper::<mla::RotatedMoe>(&cfg);
-    let weights = weights(&g, &mut Noise(11));
-    let stored: Vec<Weight> = weights.iter().cloned().map(Weight::Floats).collect();
+    let w = weights(&g, &mut Noise(11));
     let prompts: [&[u32]; 4] = [
         &[3, 9, 4, 11, 2, 7, 5, 1, 8, 6],
         &[5, 2, 8, 1, 9, 3, 4, 6, 7, 10],
@@ -977,24 +939,14 @@ fn shared_pool_preempts() {
         &[2, 14, 1, 5, 9, 4, 7, 3, 6, 8],
     ];
     let settings = Settings::default();
-    let mut solo = Engine::open(g.clone(), 32, &Recipe::default(), &settings).unwrap();
-    solo.load(&stored).unwrap();
-    let want: Vec<Vec<u32>> = prompts
-        .iter()
-        .map(|p| {
-            let mut b = Batch::new(&mut solo, Box::new(Fair));
-            asked(&mut b, &[p]).0.pop().unwrap()
-        })
-        .collect();
+    let want = solo_wants(&g, &w, 32, &settings, &prompts);
     let recipe = Recipe {
         kept: &kept::PAGED16,
         kept_rows: Some(32),
         ..Recipe::default()
     };
-    let mut shared = Engine::open(g, 32, &recipe, &settings).unwrap();
-    shared.load(&stored).unwrap();
+    let mut shared = open_engine(&g, &w, 32, &recipe, &settings);
     let mut batch = Batch::new(&mut shared, Box::new(Fair));
-    let (got, _) = asked(&mut batch, &prompts);
-    assert_eq!(got, want);
+    assert_eq!(asked(&mut batch, &prompts).0, want);
     assert_eq!(batch.totals().unwrap().pool.size, 32);
 }

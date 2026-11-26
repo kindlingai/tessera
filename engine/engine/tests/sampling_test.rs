@@ -1,36 +1,23 @@
 //! Sampling, guides and logit edits.
 
+mod common;
+
+use common::{gen_ids, host_settings, open_target, req, zero_last};
 use tessera_engine::{
-    Allowed, Batch, DEPTH, Edit, Engine, Event, Fair, Fault, Guide, Move, Penalties, Prefix,
-    Program, Recipe, Request, Runs, Sampling, Scoped, Stacked, Steps, Tally, Term,
+    Allowed, DEPTH, Edit, Engine, Fault, Guide, Move, Penalties, Prefix, Program, Request, Runs,
+    Sampling, Scoped, Stacked, Steps, Tally, Term,
 };
-use tessera_lower::{Settings, Weight};
+use tessera_lower::Settings;
 use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
 use tessera_trace::Norm;
 
-fn answer(engine: &mut Engine, req: Request) -> Vec<u32> {
-    let mut batch = Batch::new(engine, Box::new(Fair));
-    let (tx, rx) = std::sync::mpsc::channel();
-    batch.submit(req, Box::new(move |e| tx.send(e).is_ok()));
-    while batch.step().unwrap() {}
-    let mut ids = Vec::new();
-    for e in rx.try_iter() {
-        if let Event::Token(id) = e {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
 fn request(sampling: Sampling, guide: Option<Box<dyn Guide>>) -> Request {
     Request {
-        tokens: vec![3, 9, 4],
-        max_tokens: 6,
         sampling,
         guide,
-        ..Request::default()
+        ..req(&[3, 9, 4], 6)
     }
 }
 
@@ -42,13 +29,8 @@ fn engine_on(steps: Steps, settings: &Settings) -> Engine {
     let mut c = Config::toy(2, 16);
     c.stack.steps = steps;
     let g = stepper::<Norm, Swiglu>(&c);
-    let stored: Vec<Weight> = weights(&g, &mut Noise(41))
-        .into_iter()
-        .map(Weight::Floats)
-        .collect();
-    let mut engine = Engine::open(g, 16, &Recipe::default(), settings).unwrap();
-    engine.load(&stored).unwrap();
-    engine
+    let w = weights(&g, &mut Noise(41));
+    open_target(&g, &w, 16, settings)
 }
 
 /// Allows any token and makes fixed edits.
@@ -78,8 +60,8 @@ fn sampling_respects_seed() {
         min_p: 0.05,
         seed: Some(seed),
     };
-    let a = answer(&mut engine, request(sampling(42), None));
-    let b = answer(&mut engine, request(sampling(42), None));
+    let a = gen_ids(&mut engine, request(sampling(42), None));
+    let b = gen_ids(&mut engine, request(sampling(42), None));
     assert_eq!(a.len(), 6);
     assert_eq!(a, b);
 }
@@ -88,15 +70,15 @@ fn sampling_respects_seed() {
 fn edits_steer_greedy() {
     let mut engine = engine();
     let greedy = Sampling::default();
-    let plain = answer(&mut engine, request(greedy, None));
+    let plain = gen_ids(&mut engine, request(greedy, None));
     let none = Some(Box::new(Edits(Vec::new())) as Box<dyn Guide>);
-    assert_eq!(answer(&mut engine, request(greedy, none)), plain);
+    assert_eq!(gen_ids(&mut engine, request(greedy, none)), plain);
     let ban = Edit {
         id: plain[0],
         add: -1e9,
         rep: 1.0,
     };
-    let banned = answer(
+    let banned = gen_ids(
         &mut engine,
         request(greedy, Some(Box::new(Edits(vec![ban])))),
     );
@@ -105,7 +87,7 @@ fn edits_steer_greedy() {
         presence: 1e9,
         ..Penalties::default()
     };
-    let mut fresh = answer(&mut engine, request(greedy, once.guide(&[])));
+    let mut fresh = gen_ids(&mut engine, request(greedy, once.guide(&[])));
     fresh.sort_unstable();
     fresh.dedup();
     assert_eq!(fresh.len(), 6);
@@ -351,7 +333,7 @@ fn device_edits_match_host() {
     let greedy = Sampling::default();
     for s in runs() {
         let (mut host, mut device) = (engine_on(Steps::Plain, &s), engine_on(Steps::Masked, &s));
-        let plain = answer(&mut host, request(greedy, None));
+        let plain = gen_ids(&mut host, request(greedy, None));
         let mut ids = plain.clone();
         ids.sort_unstable();
         ids.dedup();
@@ -362,9 +344,9 @@ fn device_edits_match_host() {
             .flat_map(|&id| [add(id, -0.5, 1.5), add(id, 0.25, 1.2)]);
         let edits: Vec<Edit> = each.collect();
         let guide = || Some(Box::new(Edits(edits.clone())) as Box<dyn Guide>);
-        let want = answer(&mut host, request(greedy, guide()));
+        let want = gen_ids(&mut host, request(greedy, guide()));
         assert_ne!(want, plain);
-        assert_eq!(answer(&mut device, request(greedy, guide())), want);
+        assert_eq!(gen_ids(&mut device, request(greedy, guide())), want);
     }
 }
 
@@ -382,45 +364,24 @@ fn prefill_report_fits_context() {
 
 #[test]
 fn min_tokens_holds() {
-    for steps in [tessera_models::Steps::Plain, tessera_models::Steps::Masked] {
-        let mut cfg = tessera_models::decoder::Config::toy(1, 16);
+    let settings = host_settings();
+    for steps in [Steps::Plain, Steps::Masked] {
+        let mut cfg = Config::toy(1, 16);
         cfg.stack.steps = steps;
-        let g = tessera_models::decoder::stepper::<
-            tessera_trace::Norm,
-            tessera_models::decoder::Swiglu,
-        >(&cfg);
-        let mut w = tessera_testkit::weights(&g, &mut tessera_testkit::Noise(19));
-        let last = w.len() - 1;
+        let g = stepper::<Norm, Swiglu>(&cfg);
+        let mut w = weights(&g, &mut Noise(19));
         // Zero output head so greedy argmax picks stop token 0.
-        w[last] = tessera_interp::Tensor::f32(w[last].shape.clone(), vec![0.0; w[last].len()]);
-        let stored: Vec<tessera_lower::Weight> =
-            w.into_iter().map(tessera_lower::Weight::Floats).collect();
-        let settings = tessera_engine::Settings {
-            backend: tessera_engine::Pick::Host,
-            ..tessera_engine::Settings::default()
-        };
-        let mut engine =
-            tessera_engine::Engine::open(g, 16, &tessera_engine::Recipe::default(), &settings)
-                .unwrap();
-        engine.load(&stored).unwrap();
-
+        zero_last(&mut w);
+        let mut engine = open_target(&g, &w, 16, &settings);
         let mut run = |min_tokens| {
-            let mut ids = Vec::new();
-            let req = tessera_engine::Request {
-                tokens: vec![2, 3],
-                max_tokens: 4,
-                min_tokens,
-                stop: vec![0],
-                ..tessera_engine::Request::default()
-            };
-            engine
-                .generate(req, &mut |e| {
-                    if let tessera_engine::Event::Token(id) = e {
-                        ids.push(id);
-                    }
-                })
-                .unwrap();
-            ids
+            gen_ids(
+                &mut engine,
+                Request {
+                    min_tokens,
+                    stop: vec![0],
+                    ..req(&[2, 3], 4)
+                },
+            )
         };
         assert!(run(0).is_empty(), "steps={steps:?}");
         let held = run(3);

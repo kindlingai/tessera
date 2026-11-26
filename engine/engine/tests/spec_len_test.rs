@@ -2,21 +2,54 @@
 
 mod common;
 
-use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
-use tessera_engine::{
-    BatchMtp, CostModel, Drafter, DualSelector, DualSpeculate, Event, MtpDrafter, MtpSpeculate,
-    Place, Reason, Recipe, Request, SpecLen, Speculate,
+use common::{
+    collect_ids, gen_ids, host_settings, loopback_links, open_drafter, open_mtp, open_target,
+    open_tp_dual, req, spec_events, zero_last,
 };
-use tessera_graph::Parts;
-use tessera_interp::Tensor;
-use tessera_lower::{Cluster, Pick, Settings, Weight};
+use tessera_engine::{
+    BatchMtp, CostModel, DualSelector, DualSpeculate, Event, MtpSpeculate, Reason, SpecLen,
+    Speculate,
+};
+use tessera_graph::Graph;
 use tessera_models::dflash::{self, TargetSpec};
 use tessera_models::{mla, mtp};
 use tessera_testkit::{Noise, weights};
 
-fn zero_last(w: &mut [Tensor]) {
-    let last = w.last_mut().unwrap();
-    *last = Tensor::f32(last.shape.clone(), vec![0.0; last.len()]);
+fn toy_dual_cfgs(seqs: u64, ctx: u64) -> (mla::Config, dflash::Config) {
+    let mut t_cfg = mla::Config::deepseek_small();
+    t_cfg.stack.max_seqs = seqs;
+    t_cfg.stack.max_context = ctx;
+    let spec = TargetSpec {
+        vocab: t_cfg.stack.vocab,
+        hidden: t_cfg.stack.hidden,
+        layers: t_cfg.stack.layers,
+        tied: false,
+    };
+    let d_cfg = dflash::Config::toy(&spec, 4, 0, 1, ctx);
+    (t_cfg, d_cfg)
+}
+
+fn toy_dual_graphs(seqs: u64, ctx: u64) -> (Graph, Graph, Graph) {
+    let (mut t_cfg, d_cfg) = toy_dual_cfgs(seqs, ctx);
+    t_cfg.stack.taps = d_cfg
+        .tap_layers()
+        .into_iter()
+        .chain([mtp::tap_layer(&t_cfg)])
+        .collect();
+    (
+        mla::stepper::<mla::Moe>(&t_cfg),
+        dflash::stepper::<()>(&d_cfg),
+        mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, false)),
+    )
+}
+
+fn dual_sel() -> DualSelector {
+    DualSelector::new(
+        SpecLen::adaptive(3, CostModel::dual_dflash()),
+        SpecLen::adaptive(2, CostModel::dual_mtp()).with_mtp_seeds(),
+    )
+    .with_dwell(2)
+    .with_probe(2)
 }
 
 #[test]
@@ -41,8 +74,7 @@ fn spec_len_policy() {
         low.observe(7, 0, None);
     }
     let kh = high.choose(Some(&lps), 7, 7);
-    let kb = rank_b.choose(Some(&lps), 7, 7);
-    assert_eq!(kh, kb);
+    assert_eq!(kh, rank_b.choose(Some(&lps), 7, 7));
     assert_eq!(kh, 7);
     assert_eq!(low.choose(None, 7, 7), 1);
 
@@ -64,8 +96,7 @@ fn dual_selector_switching() {
     let mut sel = DualSelector::new(d, m).with_dwell(3).with_probe(2);
     // Prose regime: DFlash rejects, MTP accepts pos 1.
     for _ in 0..8 {
-        let (use_mtp, _) = sel.decide_next(true);
-        if !use_mtp {
+        if !sel.decide_next(true).0 {
             sel.observe_dflash(7, 0, None, Some(9), 9);
         } else {
             sel.observe_mtp(3, 2, &[9, 9, 9]);
@@ -75,8 +106,7 @@ fn dual_selector_switching() {
     // Code regime: MTP drops while DFlash probes match all 7.
     let mut probed = false;
     for _ in 0..24 {
-        let (use_mtp, _) = sel.decide_next(true);
-        if use_mtp {
+        if sel.decide_next(true).0 {
             if sel.should_probe(true) {
                 sel.start_probe(vec![7; 7], None);
                 probed = true;
@@ -90,30 +120,14 @@ fn dual_selector_switching() {
     assert!(!sel.use_mtp(), "expected switch back to DFlash on code");
 }
 
-fn toy_dual_cfgs(seqs: u64, ctx: u64) -> (mla::Config, dflash::Config) {
-    let mut t_cfg = mla::Config::deepseek_small();
-    t_cfg.stack.max_seqs = seqs;
-    t_cfg.stack.max_context = ctx;
-    let spec = TargetSpec {
-        vocab: t_cfg.stack.vocab,
-        hidden: t_cfg.stack.hidden,
-        layers: t_cfg.stack.layers,
-        tied: false,
-    };
-    let d_cfg = dflash::Config::toy(&spec, 4, 0, 1, ctx);
-    (t_cfg, d_cfg)
-}
-
 #[test]
 fn adaptive_and_dual_greedy() {
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
+    let settings = host_settings();
     let (t_cfg, d_cfg) = toy_dual_cfgs(1, 24);
     let m_cfg = mtp::config(&t_cfg, false);
     let d_graph = dflash::stepper::<()>(&d_cfg);
     let m_graph = mtp::stepper::<mla::Moe>(&m_cfg);
+    let prompt = [3u32, 9, 4, 11];
 
     // Truncated and adaptive DFlash plus adaptive MTP.
     let mut d_tcfg = t_cfg.clone();
@@ -121,34 +135,20 @@ fn adaptive_and_dual_greedy() {
     let dt_graph = mla::stepper::<mla::Moe>(&d_tcfg);
     let dt_w = weights(&dt_graph, &mut Noise(11));
     let d_w = weights(&d_graph, &mut Noise(13));
-    let d_stored: Vec<Weight> = d_w.iter().cloned().map(Weight::Floats).collect();
-    let prompt = vec![3u32, 9, 4, 11];
-    let req = |max_tokens, stop| Request {
-        tokens: prompt.clone(),
-        max_tokens,
-        stop,
-        ..Request::default()
-    };
-    let mut base_d = open_target(&dt_graph, &dt_w, 24, &settings);
-    let mut want_d = Vec::new();
-    base_d
-        .generate(req(10, Vec::new()), &mut |e| want_d.push(e))
-        .unwrap();
+    let want_d = gen_ids(
+        &mut open_target(&dt_graph, &dt_w, 24, &settings),
+        req(&prompt, 10),
+    );
     for sl in [SpecLen::fixed(2), SpecLen::adaptive(3, CostModel::dflash())] {
         let mut target = open_target(&dt_graph, &dt_w, 24, &settings);
-        let mut dr =
-            Drafter::open(d_graph.clone(), 24, 4, 0, &Recipe::default(), &settings).unwrap();
-        dr.load(&d_stored).unwrap();
-        let mut got = Vec::new();
-        let stats = Speculate::new(&mut target, &mut dr)
-            .unwrap()
-            .with_spec_len(sl)
-            .generate(req(10, Vec::new()), &mut |e| {
-                got.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got), collect_ids(&want_d));
+        let mut dr = open_drafter(&d_graph, &d_w, 24, 4, 0, &settings);
+        let (got, stats) = spec_events(|e| {
+            Speculate::new(&mut target, &mut dr)
+                .unwrap()
+                .with_spec_len(sl)
+                .generate(req(&prompt, 10), e)
+        });
+        assert_eq!(collect_ids(&got), want_d);
         assert!(stats.dflash_steps > 0);
     }
 
@@ -157,133 +157,50 @@ fn adaptive_and_dual_greedy() {
     let mt_graph = mla::stepper::<mla::Moe>(&m_tcfg);
     let mt_w = weights(&mt_graph, &mut Noise(17));
     let m_w = weights(&m_graph, &mut Noise(19));
-    let m_stored: Vec<Weight> = m_w.iter().cloned().map(Weight::Floats).collect();
-    let mut base_m = open_target(&mt_graph, &mt_w, 24, &settings);
-    let mut want_m = Vec::new();
-    base_m
-        .generate(req(10, Vec::new()), &mut |e| want_m.push(e))
-        .unwrap();
+    let want_m = gen_ids(
+        &mut open_target(&mt_graph, &mt_w, 24, &settings),
+        req(&prompt, 10),
+    );
     {
         let mut target = open_target(&mt_graph, &mt_w, 24, &settings);
-        let mut dr = MtpDrafter::open(m_graph.clone(), 24, &Recipe::default(), &settings).unwrap();
-        dr.load(&m_stored).unwrap();
-        let mut got = Vec::new();
+        let mut dr = open_mtp(&m_graph, &m_w, 24, &settings);
         let sl = SpecLen::adaptive(3, CostModel::mtp()).with_mtp_seeds();
-        let stats = MtpSpeculate::new(&mut target, &mut dr, 3)
-            .unwrap()
-            .with_spec_len(sl)
-            .generate(req(10, Vec::new()), &mut |e| {
-                got.push(e);
-                true
-            })
-            .unwrap();
-        assert_eq!(collect_ids(&got), collect_ids(&want_m));
-        assert!(stats.mtp_steps > 0);
-        assert!(dr.plan_hits() > 0);
+        let (got, stats) = spec_events(|e| {
+            MtpSpeculate::new(&mut target, &mut dr, 3)
+                .unwrap()
+                .with_spec_len(sl)
+                .generate(req(&prompt, 10), e)
+        });
+        assert_eq!(collect_ids(&got), want_m);
+        assert!(stats.mtp_steps > 0 && dr.plan_hits() > 0);
     }
 
     // Combined-tap target for single-rank DualSpeculate.
-    let mut dual_tcfg = t_cfg.clone();
-    dual_tcfg.stack.taps = d_cfg
-        .tap_layers()
-        .into_iter()
-        .chain([mtp::tap_layer(&t_cfg)])
-        .collect();
-    let dual_graph = mla::stepper::<mla::Moe>(&dual_tcfg);
+    let (dual_graph, _, _) = toy_dual_graphs(1, 24);
     let mut dual_tw = weights(&dual_graph, &mut Noise(23));
     let mut dual_mw = weights(&m_graph, &mut Noise(29));
     zero_last(&mut dual_tw);
     zero_last(&mut dual_mw);
-    let dual_ms: Vec<Weight> = dual_mw.iter().cloned().map(Weight::Floats).collect();
     let mut base = open_target(&dual_graph, &dual_tw, 24, &settings);
     let mut target = open_target(&dual_graph, &dual_tw, 24, &settings);
-    let mut dr = Drafter::open(d_graph.clone(), 24, 4, 0, &Recipe::default(), &settings).unwrap();
-    dr.load(&d_stored).unwrap();
-    let mut mtp_dr = MtpDrafter::open(m_graph.clone(), 24, &Recipe::default(), &settings).unwrap();
-    mtp_dr.load(&dual_ms).unwrap();
-    let sel = DualSelector::new(
-        SpecLen::adaptive(3, CostModel::dual_dflash()),
-        SpecLen::adaptive(2, CostModel::dual_mtp()).with_mtp_seeds(),
-    )
-    .with_dwell(2)
-    .with_probe(2);
+    let mut dr = open_drafter(&d_graph, &d_w, 24, 4, 0, &settings);
+    let mut mtp_dr = open_mtp(&m_graph, &dual_mw, 24, &settings);
     let mut dual = DualSpeculate::new(&mut target, &mut dr, &mut mtp_dr, 2)
         .unwrap()
-        .with_selector(sel);
-    let (mut want, mut got) = (Vec::new(), Vec::new());
-    base.generate(req(12, Vec::new()), &mut |e| want.push(e))
-        .unwrap();
-    let stats = dual
-        .generate(req(12, Vec::new()), &mut |e| {
-            got.push(e);
-            true
-        })
-        .unwrap();
-    assert_eq!(collect_ids(&got), collect_ids(&want));
+        .with_selector(dual_sel());
+    let (got, stats) = spec_events(|e| dual.generate(req(&prompt, 12), e));
+    assert_eq!(collect_ids(&got), gen_ids(&mut base, req(&prompt, 12)));
     assert_eq!(got.last(), Some(&Event::Done(Reason::Length)));
     assert!(stats.dflash_steps > 0 && stats.mtp_steps > 0 && stats.switches > 0);
-    // Context tail also matches baseline.
-    let (mut cw, mut cg) = (Vec::new(), Vec::new());
-    base.generate(req(30, Vec::new()), &mut |e| cw.push(e))
-        .unwrap();
-    dual.generate(req(30, Vec::new()), &mut |e| {
-        cg.push(e);
-        true
-    })
-    .unwrap();
-    assert_eq!(collect_ids(&cg), collect_ids(&cw));
+    let (cg, _) = spec_events(|e| dual.generate(req(&prompt, 30), e));
+    assert_eq!(collect_ids(&cg), gen_ids(&mut base, req(&prompt, 30)));
     assert_eq!(cg.last(), Some(&Event::Done(Reason::Context)));
 }
 
 #[test]
 fn dual_tp_matches_baseline() {
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
-    let (mut t_cfg, d_cfg) = toy_dual_cfgs(1, 24);
-    t_cfg.stack.taps = d_cfg
-        .tap_layers()
-        .into_iter()
-        .chain([mtp::tap_layer(&t_cfg)])
-        .collect();
-    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
-    let d_graph = dflash::stepper::<()>(&d_cfg);
-    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, false));
-    let open_rank_triple = |sums: tessera_engine::comm::Sockets,
-                            ctrl: tessera_engine::comm::Sockets,
-                            tg: &tessera_graph::Graph,
-                            dg: &tessera_graph::Graph,
-                            mg: &tessera_graph::Graph,
-                            st: &Settings| {
-        let [ts, ds, ms] = Drafter::share_transports(Box::new(sums));
-        let place = || Place::new(Cluster::two("a", "b"), Parts::even(2));
-        let te = open_ranked_target(
-            tg.clone(),
-            24,
-            st,
-            place(),
-            ts,
-            ctrl,
-            &float_weights(tg, 31),
-        );
-        let mut dr = Drafter::open_ranked(
-            dg.clone(),
-            24,
-            4,
-            0,
-            (&Recipe::default(), st),
-            place(),
-            ds,
-            None,
-        )
-        .unwrap();
-        dr.load(&float_weights(dg, 37)).unwrap();
-        let mut mtp_dr =
-            MtpDrafter::open_ranked(mg.clone(), 24, (&Recipe::default(), st), place(), ms).unwrap();
-        mtp_dr.load(&float_weights(mg, 41)).unwrap();
-        (te, dr, mtp_dr)
-    };
+    let settings = host_settings();
+    let (t_graph, d_graph, m_graph) = toy_dual_graphs(1, 24);
     let [[s0, s1], [c0, c1]] = loopback_links();
     let (tg_f, dg_f, mg_f, s_f) = (
         t_graph.clone(),
@@ -292,107 +209,61 @@ fn dual_tp_matches_baseline() {
         settings.clone(),
     );
     let follower = std::thread::spawn(move || {
-        let (mut te, mut dr, mut mtp_dr) = open_rank_triple(s1, c1, &tg_f, &dg_f, &mg_f, &s_f);
-        DualSpeculate::new(&mut te, &mut dr, &mut mtp_dr, 2)
+        let (mut te, mut dr, mut mtp) = open_tp_dual(
+            (&tg_f, &dg_f, &mg_f),
+            (31, 37, 41),
+            24,
+            &s_f,
+            (Box::new(s1), c1),
+        );
+        DualSpeculate::new(&mut te, &mut dr, &mut mtp, 2)
             .unwrap()
             .follow()
             .unwrap();
     });
-    let (mut target, mut dr, mut mtp_dr) =
-        open_rank_triple(s0, c0, &t_graph, &d_graph, &m_graph, &settings);
+    let (mut target, mut dr, mut mtp) = open_tp_dual(
+        (&t_graph, &d_graph, &m_graph),
+        (31, 37, 41),
+        24,
+        &settings,
+        (Box::new(s0), c0),
+    );
     let mut baseline = open_target(&t_graph, &weights(&t_graph, &mut Noise(31)), 24, &settings);
-    let sel = DualSelector::new(
-        SpecLen::adaptive(3, CostModel::dual_dflash()),
-        SpecLen::adaptive(2, CostModel::dual_mtp()).with_mtp_seeds(),
-    )
-    .with_dwell(2)
-    .with_probe(2);
-    let mut dual = DualSpeculate::new(&mut target, &mut dr, &mut mtp_dr, 2)
+    let mut dual = DualSpeculate::new(&mut target, &mut dr, &mut mtp, 2)
         .unwrap()
-        .with_selector(sel)
+        .with_selector(dual_sel())
         .with_prefill_chunk(3);
-    let check_prompt =
-        |tokens: Vec<u32>, base: &mut tessera_engine::Engine, d: &mut DualSpeculate| {
-            let mut want = Vec::new();
-            let mut got = Vec::new();
-            let r0 = Request {
-                tokens: tokens.clone(),
-                max_tokens: 10,
-                ..Request::default()
-            };
-            let r1 = Request {
-                tokens,
-                max_tokens: 10,
-                ..Request::default()
-            };
-            base.generate(r0, &mut |e| want.push(e)).unwrap();
-            let stats = d
-                .generate(r1, &mut |e| {
-                    got.push(e);
-                    true
-                })
-                .unwrap();
-            assert_eq!(collect_ids(&got), collect_ids(&want));
-            assert!(stats.steps > 0);
-        };
-    check_prompt(vec![2, 6, 1], &mut baseline, &mut dual);
-    check_prompt(vec![4, 1, 5, 3, 2, 7, 1], &mut baseline, &mut dual);
+    for prompt in [&[2u32, 6, 1][..], &[4, 1, 5, 3, 2, 7, 1][..]] {
+        let (got, stats) = spec_events(|e| dual.generate(req(prompt, 10), e));
+        assert_eq!(collect_ids(&got), gen_ids(&mut baseline, req(prompt, 10)));
+        assert!(stats.steps > 0);
+    }
     target.dismiss().unwrap();
     follower.join().unwrap();
 }
 
 #[test]
 fn batch_dual_matches_target() {
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
-    let (mut t_cfg, d_cfg) = toy_dual_cfgs(2, 32);
-    t_cfg.stack.taps = d_cfg
-        .tap_layers()
-        .into_iter()
-        .chain([mtp::tap_layer(&t_cfg)])
-        .collect();
-    let t_graph = mla::stepper::<mla::Moe>(&t_cfg);
-    let d_graph = dflash::stepper::<()>(&d_cfg);
-    let m_graph = mtp::stepper::<mla::Moe>(&mtp::config(&t_cfg, false));
+    let settings = host_settings();
+    let (t_graph, d_graph, m_graph) = toy_dual_graphs(2, 32);
     let t_w = weights(&t_graph, &mut Noise(53));
-    let d_w = float_weights(&d_graph, 59);
-    let m_w = float_weights(&m_graph, 61);
+    let d_w = weights(&d_graph, &mut Noise(59));
+    let m_w = weights(&m_graph, &mut Noise(61));
     let mut base = open_target(&t_graph, &t_w, 32, &settings);
-    let reqs = [(vec![2u32, 6, 1, 4], 6usize), (vec![7u32, 3, 5], 16usize)];
-    let mut wants = Vec::new();
-    for (toks, max_tokens) in &reqs {
-        let mut out = Vec::new();
-        let req = Request {
-            tokens: toks.clone(),
-            max_tokens: *max_tokens,
-            ..Request::default()
-        };
-        base.generate(req, &mut |e| out.push(e)).unwrap();
-        wants.push(collect_ids(&out));
-    }
+    let reqs: [(&[u32], usize); 2] = [(&[2, 6, 1, 4], 6), (&[7, 3, 5], 16)];
+    let wants: Vec<Vec<u32>> = reqs
+        .iter()
+        .map(|&(p, max)| gen_ids(&mut base, req(p, max)))
+        .collect();
     let mut target = open_target(&t_graph, &t_w, 32, &settings);
-    let mut dr = Drafter::open(d_graph, 32, 4, 0, &Recipe::default(), &settings).unwrap();
-    dr.load(&d_w).unwrap();
-    let mut mtp_dr = MtpDrafter::open(m_graph, 32, &Recipe::default(), &settings).unwrap();
-    mtp_dr.load(&m_w).unwrap();
-    let sel = DualSelector::new(
-        SpecLen::adaptive(3, CostModel::dual_dflash()),
-        SpecLen::adaptive(2, CostModel::dual_mtp()).with_mtp_seeds(),
-    )
-    .with_dwell(2)
-    .with_probe(2);
-    let mut batch = BatchMtp::new_dual(&mut target, &mut dr, &mut mtp_dr, 2, sel)
+    let mut dr = open_drafter(&d_graph, &d_w, 32, 4, 0, &settings);
+    let mut mtp_dr = open_mtp(&m_graph, &m_w, 32, &settings);
+    let mut batch = BatchMtp::new_dual(&mut target, &mut dr, &mut mtp_dr, 2, dual_sel())
         .unwrap()
         .with_prefill_chunk(3);
     let (tx0, rx0) = std::sync::mpsc::channel();
     batch.submit(
-        Request {
-            tokens: reqs[0].0.clone(),
-            max_tokens: reqs[0].1,
-            ..Request::default()
-        },
+        req(reqs[0].0, reqs[0].1),
         Box::new(move |e| tx0.send(e).is_ok()),
     );
     // Run solo DFlash rounds, then demote and promote tail.
@@ -400,11 +271,7 @@ fn batch_dual_matches_target() {
     assert!(batch.step().unwrap());
     let (tx1, rx1) = std::sync::mpsc::channel();
     batch.submit(
-        Request {
-            tokens: reqs[1].0.clone(),
-            max_tokens: reqs[1].1,
-            ..Request::default()
-        },
+        req(reqs[1].0, reqs[1].1),
         Box::new(move |e| tx1.send(e).is_ok()),
     );
     while batch.step().unwrap() {}
