@@ -79,10 +79,14 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
     match kind {
         AttendKind::Mla if groups <= 8 => 16,
         AttendKind::Mla if groups <= 16 => 8,
-        AttendKind::Mla => 4,
+        AttendKind::Mla if groups <= 64 => 4,
+        AttendKind::Mla if groups <= 128 => 2,
+        AttendKind::Mla => 1,
         AttendKind::Gqa if groups <= 16 => 16,
         AttendKind::Gqa if groups <= 32 => 8,
-        AttendKind::Gqa => 4,
+        AttendKind::Gqa if groups <= 64 => 4,
+        AttendKind::Gqa if groups <= 128 => 2,
+        AttendKind::Gqa => 1,
     }
 }
 
@@ -158,7 +162,11 @@ fn attend_load(k: &SplitAttend, _: usize) -> Option<Load> {
         AttendKind::Gqa => 2,
     };
     let kv_bytes = (kv_mul * k.kv_form.bytes(k.rows * seen * k.kv_heads * w)) as f64;
-    let out_bytes = (4 * k.rows * k.heads * k.splits * k.kind.stride()) as f64;
+    let out_stride = match k.splits {
+        1 => w,
+        s => s * k.kind.stride(),
+    };
+    let out_bytes = (4 * k.rows * k.heads * out_stride) as f64;
     Some(Load {
         threads: groups * threads,
         group: threads,
@@ -406,6 +414,9 @@ fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, Stri
         entry,
     };
     let lists = rows * heads;
+    if splits == 1 {
+        return Some(Ok(vec![Draft::new(attend, reads, lists * width)]));
+    }
     let reduce = SplitReduce {
         kind,
         lists,
