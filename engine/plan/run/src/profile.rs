@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use tessera_engine_comm::{Reader, Writer};
+use tessera_gpukit::device::KernelAttrs;
 use tessera_lower::Step;
 
 /// Rows past this many print as one "other" row.
@@ -14,7 +15,7 @@ pub struct Profile {
     pub spent: BTreeMap<String, Spent>,
 }
 
-/// One name's seconds, count, work and bytes moved.
+/// One name's seconds, count, work, bytes and kernel attributes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Spent {
     pub seconds: f64,
@@ -22,6 +23,8 @@ pub struct Spent {
     /// Multiply-adds, or elements touched. Zero for phases.
     pub work: f64,
     pub bytes: f64,
+    /// Compiled kernel resource counts, when reported by the device.
+    pub attrs: Option<KernelAttrs>,
 }
 
 impl Spent {
@@ -30,7 +33,38 @@ impl Spent {
         self.count += other.count;
         self.work += other.work;
         self.bytes += other.bytes;
+        if let Some(a) = other.attrs {
+            self.attrs = Some(match self.attrs {
+                Some(cur) if cur.local_bytes >= a.local_bytes => cur,
+                _ => a,
+            });
+        }
     }
+}
+
+/// Compact byte count for profile and load telemetry.
+pub(crate) fn format_bytes(bytes: u32) -> String {
+    if bytes == 0 {
+        "0".into()
+    } else if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes.is_multiple_of(1024) {
+        format!("{}K", bytes / 1024)
+    } else {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    }
+}
+
+/// One-line summary of compiled kernel attributes.
+pub(crate) fn format_attrs(a: KernelAttrs) -> String {
+    let spill = if a.local_bytes > 0 { " SPILL" } else { "" };
+    format!(
+        "regs={} smem={} lmem={} ctas/sm={}{spill}",
+        a.regs,
+        format_bytes(a.shared_bytes),
+        format_bytes(a.local_bytes),
+        a.ctas_per_sm
+    )
 }
 
 impl Profile {
@@ -49,11 +83,16 @@ impl Profile {
 
     /// Adds one run of `step`, by kernel name and sizes.
     pub fn step(&mut self, step: &Step, seconds: f64) {
-        self.step_many(step, seconds, 1);
+        self.step_with(step, seconds, 1, None);
     }
 
     /// Adds `count` runs of `step`, by kernel name and sizes.
     pub fn step_many(&mut self, step: &Step, seconds: f64, count: u64) {
+        self.step_with(step, seconds, count, None);
+    }
+
+    /// Adds `count` runs of `step` with optional device kernel attributes.
+    pub fn step_with(&mut self, step: &Step, seconds: f64, count: u64, attrs: Option<KernelAttrs>) {
         let kernel = &step.kernel;
         let mut name = kernel.name().to_string();
         for (i, size) in kernel.sizes().iter().enumerate() {
@@ -65,6 +104,7 @@ impl Profile {
             count,
             work: kernel.work(step.write.len) * count as f64,
             bytes: step.bytes() as f64 * count as f64,
+            attrs,
         };
         self.spent.entry(name).or_default().sum(one);
     }
@@ -76,12 +116,19 @@ impl Profile {
         rows
     }
 
-    /// Each name, then its seconds, count, work and bytes.
+    /// Each name, then its seconds, count, work, bytes and attributes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut words = Writer::default();
         for (name, s) in &self.spent {
             words.bytes(name.as_bytes()).f64(s.seconds).u64(s.count);
             words.f64(s.work).f64(s.bytes);
+            match s.attrs {
+                Some(a) => {
+                    words.u32(1).u32(a.regs).u32(a.local_bytes);
+                    words.u32(a.shared_bytes).u32(a.ctas_per_sm);
+                }
+                None => _ = words.u32(0),
+            }
         }
         words.0
     }
@@ -93,11 +140,22 @@ impl Profile {
             let name = String::from_utf8(words.bytes()?.to_vec()).ok()?;
             let (seconds, count) = (words.f64()?, words.u64()?);
             let (work, bytes) = (words.f64()?, words.f64()?);
+            let attrs = match words.u32()? {
+                0 => None,
+                1 => Some(KernelAttrs {
+                    regs: words.u32()?,
+                    local_bytes: words.u32()?,
+                    shared_bytes: words.u32()?,
+                    ctas_per_sm: words.u32()?,
+                }),
+                _ => return None,
+            };
             let spent = Spent {
                 seconds,
                 count,
                 work,
                 bytes,
+                attrs,
             };
             profile.spent.insert(name, spent);
         }
@@ -120,7 +178,14 @@ pub struct Report<'a> {
 }
 
 impl Report<'_> {
-    fn row(&self, f: &mut fmt::Formatter<'_>, name: &str, s: Spent) -> fmt::Result {
+    fn row(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        name: &str,
+        s: Spent,
+        show_attrs: bool,
+        spilled: bool,
+    ) -> fmt::Result {
         let per = self.launches as f64;
         let ms = s.seconds * 1e3 / per;
         let each = s.seconds * 1e6 / s.count.max(1) as f64;
@@ -132,29 +197,64 @@ impl Report<'_> {
                 false => write!(f, " {:>8}", "-")?,
             }
         }
-        writeln!(f, "  {name}")
+        if show_attrs {
+            match s.attrs {
+                Some(a) => {
+                    let smem = format_bytes(a.shared_bytes);
+                    let lmem = format_bytes(a.local_bytes);
+                    let cta = match a.ctas_per_sm > 0 {
+                        true => a.ctas_per_sm.to_string(),
+                        false => "-".into(),
+                    };
+                    write!(f, " {:>4} {:>6} {:>6} {:>3}", a.regs, smem, lmem, cta)?;
+                }
+                None => write!(f, " {:>4} {:>6} {:>6} {:>3}", "-", "-", "-", "-")?,
+            }
+        }
+        let spill = spilled || s.attrs.is_some_and(|a| a.local_bytes > 0);
+        match spill {
+            true => writeln!(f, "  {name}  SPILL"),
+            false => writeln!(f, "  {name}"),
+        }
     }
 }
 
 impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "{:>10} {:>8} {:>10} {:>8} {:>8}  name",
-            "ms/launch", "count", "us each", "G/s", "GB/s"
-        )?;
+        let show_attrs = self.profile.spent.values().any(|s| s.attrs.is_some());
+        match show_attrs {
+            true => writeln!(
+                f,
+                "{:>10} {:>8} {:>10} {:>8} {:>8} {:>4} {:>6} {:>6} {:>3}  name",
+                "ms/launch", "count", "us each", "G/s", "GB/s", "regs", "smem", "lmem", "cta"
+            )?,
+            false => writeln!(
+                f,
+                "{:>10} {:>8} {:>10} {:>8} {:>8}  name",
+                "ms/launch", "count", "us each", "G/s", "GB/s"
+            )?,
+        }
         let rows = self.profile.ranked();
         let (shown, rest) = rows.split_at(rows.len().min(SHOWN));
         for (name, s) in shown {
-            self.row(f, name, *s)?;
+            self.row(f, name, *s, show_attrs, false)?;
         }
         let mut other = Spent::default();
+        let mut other_spill = false;
         for (_, s) in rest {
+            other_spill |= s.attrs.is_some_and(|a| a.local_bytes > 0);
             other.sum(*s);
         }
+        other.attrs = None;
         match rest.len() {
             0 => Ok(()),
-            n => self.row(f, &format!("other ({n} rows)"), other),
+            n => self.row(
+                f,
+                &format!("other ({n} rows)"),
+                other,
+                show_attrs,
+                other_spill,
+            ),
         }
     }
 }

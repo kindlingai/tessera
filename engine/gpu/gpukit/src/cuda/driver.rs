@@ -28,10 +28,6 @@ pub(crate) const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub(crate) const CU_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 18;
 pub(crate) const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
 pub(crate) const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
-pub(crate) const CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 0;
-pub(crate) const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
-pub(crate) const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: c_int = 3;
-pub(crate) const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
 pub(crate) const CU_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
 pub(crate) const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 2;
@@ -83,7 +79,6 @@ type CuLaunchKernelEx = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> CUresult;
 type CuGraphInstantiate = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult;
-type CuFuncGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUfunction) -> CUresult;
 type CuGetErrorName = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 type CuGetErrorString = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
 
@@ -119,7 +114,7 @@ tessera_dl::library! {
         pub(crate) cu_occupancy: entry::Occupancy =
             "cuOccupancyMaxActiveBlocksPerMultiprocessor",
         pub(crate) cu_func_set_attribute: CuFuncSetAttribute = "cuFuncSetAttribute",
-        pub(crate) cu_func_get_attribute: CuFuncGetAttribute = "cuFuncGetAttribute",
+        pub(crate) cu_func_get_attribute: entry::FuncAttr = "cuFuncGetAttribute",
         pub(crate) cu_memcpy_htod: CuMemcpyHtoD = "cuMemcpyHtoD_v2",
         pub(crate) cu_memcpy_dtoh: CuMemcpyDtoH = "cuMemcpyDtoH_v2",
         pub(crate) cu_memcpy_htod_async: CuMemcpyHtoDAsync = "cuMemcpyHtoDAsync_v2",

@@ -126,10 +126,13 @@ pub(crate) fn format_summary(
     stats: Option<KernelStats>,
 ) -> String {
     match stats {
-        Some(s) => format!(
-            "tessera: resident {entry}: grid={grid} threads={threads} blocks/sm={fit} regs={} shared_bytes={} local_bytes={}",
-            s.regs, s.shared_bytes, s.local_bytes
-        ),
+        Some(s) => {
+            let spill = if s.local_bytes > 0 { " SPILL" } else { "" };
+            format!(
+                "tessera: resident {entry}: grid={grid} threads={threads} blocks/sm={fit} regs={} shared_bytes={} local_bytes={}{spill}",
+                s.regs, s.shared_bytes, s.local_bytes
+            )
+        }
         None => format!("tessera: resident {entry}: grid={grid} threads={threads} blocks/sm={fit}"),
     }
 }

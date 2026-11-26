@@ -189,6 +189,7 @@ impl Api for Runtime {
             hip_ipc_close_mem_handle
         ),
         occupancy: (hip_occupancy, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor"),
+        func_attr: (hip_func_get_attribute, "hipFuncGetAttribute"),
         zero: (hip_memset, "hipMemset"),
     }
 

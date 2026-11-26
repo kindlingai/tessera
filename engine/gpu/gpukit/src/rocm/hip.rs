@@ -80,6 +80,7 @@ tessera_dl::library! {
         pub hip_ipc_open_mem_handle: entry::IpcOpen = "hipIpcOpenMemHandle",
         pub hip_ipc_close_mem_handle: entry::IpcClose = "hipIpcCloseMemHandle",
         pub hip_occupancy: entry::Occupancy = "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+        pub hip_func_get_attribute: entry::FuncAttr = "hipFuncGetAttribute",
         pub hip_memcpy: HipMemcpy = "hipMemcpy",
         pub hip_memcpy_async: HipMemcpyAsync = "hipMemcpyAsync",
         pub hip_memset: HipMemset = "hipMemset",

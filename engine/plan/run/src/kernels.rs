@@ -1,11 +1,15 @@
 //! Compiled kernels, shared by the GPU runners.
 
 use crate::Error;
-use std::collections::HashMap;
+use crate::overrides;
+use crate::profile::format_attrs;
+use crate::run::{Outcome, Reload};
+use std::collections::{HashMap, HashSet};
 use tessera_codegen::Dialect;
 use tessera_gpukit::backend::Backend;
+use tessera_gpukit::device::{Device, KernelAttrs};
 use tessera_gpukit::launch::THREADS_PER_BLOCK;
-use tessera_lower::{Launch, Shape, Source, Step};
+use tessera_lower::{Launch, Plan, Shape, Source, Step};
 
 /// A fixed kernel's text for `backend`, and its entry.
 pub(crate) fn fixed_text(
@@ -25,6 +29,70 @@ pub(crate) fn group(step: &Step) -> usize {
         Shape::Line(_) | Shape::Runtime(_) => THREADS_PER_BLOCK as usize,
     };
     step.launches().into_iter().map(threads).max().unwrap_or(1)
+}
+
+/// Block width used when launching `step`.
+fn launch_threads(step: &Step) -> u32 {
+    let threads = |l: Launch| match l.shape {
+        Shape::Grid { threads, .. } => threads as u32,
+        Shape::Line(n) => THREADS_PER_BLOCK.min(n.max(1) as u32),
+        Shape::Runtime(_) => THREADS_PER_BLOCK,
+    };
+    step.launches().into_iter().map(threads).max().unwrap_or(1)
+}
+
+/// Resource counts and active CTAs/SM for each non-resident step.
+pub(crate) fn step_attrs<D: Device>(
+    ctx: &D,
+    plan: &Plan,
+    kernels: &[D::Kernel],
+    resident: &[bool],
+) -> Vec<Option<KernelAttrs>> {
+    let mut out = Vec::with_capacity(plan.steps.len());
+    for i in 0..plan.steps.len() {
+        let attr = match resident[i] {
+            true => None,
+            false => ctx.attrs(&kernels[i], launch_threads(&plan.steps[i]), 0),
+        };
+        out.push(attr);
+    }
+    out
+}
+
+/// Logs one notice per spilling kernel entry.
+pub(crate) fn log_spills(plan: &Plan, attrs: &[Option<KernelAttrs>], seen: &mut HashSet<String>) {
+    for (step, attr) in plan.steps.iter().zip(attrs) {
+        let Some(a) = attr.filter(|a| a.local_bytes > 0) else {
+            continue;
+        };
+        let source = step.kernel.source();
+        let entry = overrides::entry(&source);
+        if seen.insert(entry.to_string()) {
+            eprintln!("tessera: spill in {entry}: {}", format_attrs(a));
+        }
+    }
+}
+
+/// Logs a kernel reload, appending compiled attributes when available.
+pub(crate) fn log_reload(
+    reload: &Reload,
+    entries: &[(String, usize)],
+    attrs: &[Option<KernelAttrs>],
+) {
+    let active = matches!(reload.outcome, Outcome::Loaded | Outcome::Planned);
+    let stem = reload.path.file_stem().and_then(|s| s.to_str());
+    let attr = active
+        .then(|| {
+            entries
+                .iter()
+                .find(|(e, _)| Some(e.as_str()) == stem)
+                .and_then(|(_, step)| attrs.get(*step).copied().flatten())
+        })
+        .flatten();
+    match attr {
+        Some(a) => eprintln!("tessera: {reload} ({})", format_attrs(a)),
+        None => eprintln!("tessera: {reload}"),
+    }
 }
 
 /// Compiled kernels, by group size and entry.

@@ -58,6 +58,7 @@ pub(crate) mod entry {
     pub(crate) type Register = unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int;
     /// Blocks of a function one unit holds: threads, shared bytes.
     pub(crate) type Occupancy = unsafe extern "C" fn(*mut c_int, Handle, c_int, usize) -> c_int;
+    pub(crate) type FuncAttr = unsafe extern "C" fn(*mut c_int, c_int, Handle) -> c_int;
     pub(crate) type Stream = unsafe extern "C" fn(*mut Handle, u32) -> c_int;
     pub(crate) type PriorityStream = unsafe extern "C" fn(*mut Handle, u32, c_int) -> c_int;
     pub(crate) type PriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;

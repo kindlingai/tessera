@@ -4,7 +4,7 @@ use crate::Error;
 use crate::cache::{GraphKey, GraphSet, Lru, MAX_GRAPHS, MAX_PLANS, Prepared, store_graph};
 use crate::grid::{self, Grid};
 use crate::held::{Holds, KvStage};
-use crate::kernels::Kernels;
+use crate::kernels::{self, Kernels};
 use crate::lanes::LaneSync;
 use crate::marks;
 use crate::overrides::{self, Overrides};
@@ -13,14 +13,14 @@ use crate::profile::Marks;
 use crate::rank::{Capture, Sum, grid_cross};
 use crate::run::{Base, Reload, Run};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 use tessera_codegen::Dialect;
 use tessera_engine_settings::{Memory, Settings};
 use tessera_gpukit::backend::OnGpu;
-use tessera_gpukit::device::{Device, DeviceBuffer, cached_context, cached_source};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs, cached_context, cached_source};
 use tessera_gpukit::launch::{KernelArgs, Launch, launch_1d, launch_grid};
 use tessera_lower::kernels::crosses;
 use tessera_lower::{Arg, Extent, Launch as Call, Launching, Plan, Shape, Slot};
@@ -65,6 +65,12 @@ pub(crate) struct Runner<D: Device> {
     grid: RefCell<Option<Box<dyn Grid>>>,
     /// Which steps a persistent grid runs.
     resident: Vec<bool>,
+    /// Compiled resource counts and occupancy for each step.
+    attrs: Vec<Option<KernelAttrs>>,
+    /// Whether load-time spill notices print without active profiling.
+    log_attrs: bool,
+    /// Spilling kernel entries already reported on load.
+    spills: HashSet<String>,
     /// Hot-cold expert weight pager, opened on VRAM overflow.
     pager: Option<Pager<D>>,
     /// Pinned host staging buffer for batched KV transfers.
@@ -116,6 +122,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             gated: Cell::new(0),
             grid: RefCell::new(None),
             resident: Vec::new(),
+            attrs: Vec::new(),
+            log_attrs: settings.profile.is_some() || settings.kernels.is_some(),
+            spills: HashSet::new(),
             pager: None,
             kv_stage: None,
         };
@@ -161,6 +170,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             uses: std::mem::take(&mut self.uses),
             waits: std::mem::take(&mut self.waits),
             resident: std::mem::take(&mut self.resident),
+            attrs: std::mem::take(&mut self.attrs),
         };
         self.plans.insert(id, saved);
     }
@@ -174,6 +184,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.uses = cached.uses;
         self.waits = cached.waits;
         self.resident = cached.resident;
+        self.attrs = cached.attrs;
     }
 
     /// Each argument by position, in the device's form.
@@ -321,7 +332,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let walked = self.walk(steps.clone());
         let (waited, stamps) = self.opened(walked)?;
         for (i, s) in steps.zip(waited.unwrap_or(stamps)) {
-            self.note_step(i, s);
+            if let Some(p) = self.base.profile.as_mut() {
+                let attr = self.attrs.get(i).copied().flatten();
+                p.step_with(&self.base.plan.steps[i], s, 1, attr);
+            }
         }
         for (entry, found) in self.grid_marks() {
             for region in &found.regions {
@@ -376,7 +390,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         let Some(stamps) = &mut self.stamps else {
             return Ok(());
         };
-        stamps.flush(self.ctx, &self.base.plan, self.base.profile.as_mut())
+        stamps.flush(
+            self.ctx,
+            &self.base.plan,
+            &self.attrs,
+            self.base.profile.as_mut(),
+        )
     }
 
     fn ensure_stamps(
@@ -553,7 +572,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
     fn reread(&mut self) -> Result<(), Error> {
         let found = self.reload()?;
         for reload in &found {
-            eprintln!("tessera: {reload}");
+            kernels::log_reload(reload, &self.entries, &self.attrs);
         }
         self.missed.extend(found);
         Ok(())
@@ -575,6 +594,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             // Recorded launches name the kernels they replaced.
             self.clear_graphs();
             self.apply();
+            self.attrs = kernels::step_attrs(ctx, &self.base.plan, &self.kernels, &self.resident);
             self.sync_grid();
         }
         Ok(reloads)
@@ -751,6 +771,9 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             self.stash_plan();
             self.restore_plan(cached);
             self.apply();
+            if self.overrides.is_some() {
+                self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+            }
             self.sync_grid();
             self.ready(plan)?;
             return Ok(());
@@ -785,6 +808,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
         self.resident = resident;
         self.index(plan);
         self.apply();
+        self.attrs = kernels::step_attrs(ctx, plan, &self.kernels, &self.resident);
+        if self.log_attrs || self.base.profile.is_some() {
+            kernels::log_spills(plan, &self.attrs, &mut self.spills);
+        }
         self.sync_grid();
         self.ready(plan)?;
         self.base.adopt(plan);

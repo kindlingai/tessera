@@ -12,16 +12,13 @@ use super::driver::{
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
-    CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-    CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, CU_FUNC_ATTRIBUTE_NUM_REGS,
-    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
-    CU_STREAM_CAPTURE_MODE_RELAXED, CU_STREAM_NON_BLOCKING, CUcontext, Driver, LaunchAttribute,
-    LaunchConfig,
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, CU_STREAM_CAPTURE_MODE_RELAXED,
+    CU_STREAM_NON_BLOCKING, CUcontext, Driver, LaunchAttribute, LaunchConfig,
 };
 use crate::api::{self, Api, Call, Handle};
 use crate::backend::Backend;
 use crate::cache;
-use crate::device::KernelStats;
 use crate::platform::{self, Asked, Platform};
 use crate::{Error, Limits};
 
@@ -219,6 +216,7 @@ impl Api for Driver {
             cu_ipc_close_mem_handle
         ),
         occupancy: (cu_occupancy, "cuOccupancyMaxActiveBlocksPerMultiprocessor"),
+        func_attr: (cu_func_get_attribute, "cuFuncGetAttribute"),
         zero: (cu_memset_d8, "cuMemsetD8"),
     }
 
@@ -351,22 +349,6 @@ impl Api for Driver {
         let stream = std::ptr::null_mut();
         let code = unsafe { (self.cu_memcpy_dtod_async)(dst, src, size, stream) };
         self.check(code, "cuMemcpyDtoDAsync")
-    }
-
-    fn stats(&self, kernel: Handle) -> Option<KernelStats> {
-        let attr = |which| {
-            self.int("cuFuncGetAttribute", |v| unsafe {
-                (self.cu_func_get_attribute)(v, which, kernel)
-            })
-            .ok()
-            .map(|v| v.max(0) as u32)
-        };
-        Some(KernelStats {
-            regs: attr(CU_FUNC_ATTRIBUTE_NUM_REGS)?,
-            shared_bytes: attr(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
-            local_bytes: attr(CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
-            max_threads: attr(CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
-        })
     }
 
     fn compile(ctx: &Context, source: &str) -> Result<Vec<u8>, Error> {

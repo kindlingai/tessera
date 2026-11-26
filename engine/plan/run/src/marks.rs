@@ -2,7 +2,7 @@
 
 use crate::Error;
 use crate::profile::{Marks, Profile, Region};
-use tessera_gpukit::device::{Device, DeviceBuffer};
+use tessera_gpukit::device::{Device, DeviceBuffer, KernelAttrs};
 use tessera_gpukit::launch::{KernelArgs, Launch};
 use tessera_lower::Plan;
 
@@ -103,6 +103,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Stamps<D> {
         &mut self,
         ctx: &D,
         plan: &Plan,
+        attrs: &[Option<KernelAttrs>],
         profile: Option<&mut Profile>,
     ) -> Result<(), Error> {
         let Some((_, start, end, replays)) = self.active.take() else {
@@ -128,7 +129,8 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Stamps<D> {
             let now = u64::from_ne_bytes(*bytes);
             let secs = now.wrapping_sub(self.last[k]) as f64 / ticks;
             self.last[k] = now;
-            profile.step_many(&plan.steps[start + k], secs, replays);
+            let attr = attrs.get(start + k).copied().flatten();
+            profile.step_with(&plan.steps[start + k], secs, replays, attr);
         }
         let span_now = u64::from_ne_bytes(words[n]);
         let span = span_now.wrapping_sub(self.last[n]) as f64 / ticks;

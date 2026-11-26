@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::OnceLock;
+use tessera_gpukit::device::KernelAttrs;
 use tessera_graph::DimName;
 use tessera_lower::{Launch as Call, Plan};
 
@@ -58,6 +59,7 @@ pub(crate) struct Prepared<K> {
     pub(crate) uses: Vec<usize>,
     pub(crate) waits: Vec<bool>,
     pub(crate) resident: Vec<bool>,
+    pub(crate) attrs: Vec<Option<KernelAttrs>>,
 }
 
 /// Bounded map evicting the least recently used entry.

@@ -16,6 +16,15 @@ pub struct KernelStats {
     pub max_threads: u32,
 }
 
+/// Kernel resource usage and SM occupancy at one launch shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelAttrs {
+    pub regs: u32,
+    pub local_bytes: u32,
+    pub shared_bytes: u32,
+    pub ctas_per_sm: u32,
+}
+
 /// Opaque 64-byte handle for GPU IPC memory sharing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +183,18 @@ pub trait Device: Clone + Send + Sync + 'static {
     /// Static register and memory counts for `kernel`.
     fn stats(&self, _kernel: &Self::Kernel) -> Option<KernelStats> {
         None
+    }
+
+    /// Resource counts and active CTAs/SM for `kernel`.
+    fn attrs(&self, kernel: &Self::Kernel, threads: u32, shared: u32) -> Option<KernelAttrs> {
+        let s = self.stats(kernel)?;
+        let ctas_per_sm = self.resident(kernel, threads, shared).unwrap_or(0);
+        Some(KernelAttrs {
+            regs: s.regs,
+            local_bytes: s.local_bytes,
+            shared_bytes: s.shared_bytes.saturating_add(shared),
+            ctas_per_sm,
+        })
     }
 
     /// Whether `capture` records launches here.

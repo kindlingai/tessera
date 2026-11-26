@@ -30,6 +30,7 @@ macro_rules! shared_api {
             $ipc_close:ident
         ),
         occupancy: ($occ:ident, $occ_label:literal),
+        func_attr: ($func_attr:ident, $func_attr_label:literal),
         zero: ($zero:ident, $zero_label:literal) $(,)?
     ) => {
         fn error(msg: String) -> $crate::Error {
@@ -202,6 +203,23 @@ macro_rules! shared_api {
                 (self.$occ)(n, kernel, threads as ::std::ffi::c_int, shared as usize)
             })?;
             Ok(blocks.max(0) as u32)
+        }
+
+        fn stats(&self, kernel: $crate::api::Handle) -> Option<$crate::device::KernelStats> {
+            let attr = |which: ::std::ffi::c_int| {
+                self.int($func_attr_label, |v| unsafe {
+                    (self.$func_attr)(v, which, kernel)
+                })
+                .ok()
+                .map(|v| v.max(0) as u32)
+            };
+            // CUDA and HIP share function attribute codes.
+            Some($crate::device::KernelStats {
+                regs: attr(4)?,
+                shared_bytes: attr(1)?,
+                local_bytes: attr(3)?,
+                max_threads: attr(0)?,
+            })
         }
 
         fn event(&self) -> Result<$crate::api::Handle, $crate::Error> {

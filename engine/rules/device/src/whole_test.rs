@@ -37,7 +37,18 @@ fn formats_telemetry_lines() {
     };
     let with = format_summary("whole", 20, 256, 2, Some(stats));
     assert!(with.contains("grid=20 threads=256 blocks/sm=2"));
-    assert!(with.contains("regs=112 shared_bytes=16384 local_bytes=64"));
+    assert!(with.contains("regs=112 shared_bytes=16384 local_bytes=64 SPILL"));
+    let clean = format_summary(
+        "whole",
+        20,
+        256,
+        2,
+        Some(KernelStats {
+            local_bytes: 0,
+            ..stats
+        }),
+    );
+    assert!(!clean.contains("SPILL"));
     let without = format_summary("whole", 20, 256, 2, None);
     assert!(!without.contains("regs="));
 }

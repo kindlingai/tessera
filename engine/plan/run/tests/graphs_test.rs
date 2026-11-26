@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tessera_engine_comm::{Error as CommError, Transport};
 use tessera_engine_settings::{Backend, Settings};
-use tessera_gpukit::device::{Caches, Device};
+use tessera_gpukit::device::{Caches, Device, KernelAttrs, KernelStats};
 use tessera_gpukit::launch::{Bound, KernelArgs, Launch};
 use tessera_gpukit::{Error as GpuError, Limits, Platform};
 use tessera_graph::DimName::Context;
@@ -318,6 +318,20 @@ impl Device for MockDevice {
 
     fn finish(&self) -> Result<Option<f64>, GpuError> {
         Ok(None)
+    }
+
+    fn resident(&self, _: &(), _: u32, _: u32) -> Result<u32, GpuError> {
+        Ok(4)
+    }
+
+    fn stats(&self, _: &()) -> Option<KernelStats> {
+        let (regs, shared_bytes, max_threads) = (40, 2048, 512);
+        Some(KernelStats {
+            regs,
+            shared_bytes,
+            local_bytes: 0,
+            max_threads,
+        })
     }
 
     fn graphs(&self) -> bool {
@@ -838,6 +852,16 @@ fn sums_split_fallbacks() {
         assert_eq!(prof.spent["all_reduce: wait"].count, 3);
         assert_eq!(prof.spent["all_reduce: transfer"].count, 3);
         assert_eq!(prof.spent["all_reduce"].count, 6);
+        assert_eq!(prof.spent["gpu: graph"].attrs, None);
+        assert_eq!(
+            prof.spent["all_reduce"].attrs,
+            Some(KernelAttrs {
+                regs: 40,
+                local_bytes: 0,
+                shared_bytes: 2048,
+                ctas_per_sm: 4
+            })
+        );
         rank.profiling(false);
         rank.submit(range).unwrap();
         assert_eq!((ctx.counts().3, ctx.counts().4), (2, 5));
@@ -884,10 +908,10 @@ fn sums_split_fallbacks() {
                 f: u64,
                 t: u64,
                 p: usize,
-                tot: usize,
+                k: usize,
                 r: usize,
             ) -> Result<bool, RunError> {
-                self.0.borrow_mut().gather(f, t, p, tot, r)
+                self.0.borrow_mut().gather(f, t, p, k, r)
             }
             fn capturable(&self) -> bool {
                 self.0.borrow().capturable()
@@ -909,14 +933,9 @@ fn sums_split_fallbacks() {
             ..host()
         };
         let make = |p: Plan| {
-            let mut r = Rank::open_device::<MockDevice>(
-                p,
-                &settings,
-                MockTransport(Arc::new(Mutex::new(0))),
-            )
-            .unwrap()
-            .with_grid(Some(Box::new(Share(shared.clone()))))
-            .unwrap();
+            let t = MockTransport(Arc::new(Mutex::new(0)));
+            let mut r = Rank::open_device::<MockDevice>(p, &settings, t).unwrap();
+            r = r.with_grid(Some(Box::new(Share(shared.clone())))).unwrap();
             r.launching(Launching {
                 graphs: true,
                 pdl: false,
@@ -945,40 +964,33 @@ fn sums_split_fallbacks() {
 
 #[test]
 fn d2d_copy_keeps_graphs() {
-    let src_plan = scratch_plan(&[64]);
-    let dst_plan = scratch_plan(&[64]);
+    let (src_plan, dst_plan) = (scratch_plan(&[64]), scratch_plan(&[64]));
     let (_guard, mut dst, ctx) = open_mock(dst_plan.clone());
     let settings = Settings {
         memory: tessera_engine_settings::Memory::Off,
         ..host()
     };
     let mut src = device::<MockDevice>(src_plan.clone(), &settings).unwrap();
-    let src_slot = src_plan.steps[0].write;
-    let dst_slot = dst_plan.steps[0].write;
+    let (src_slot, dst_slot) = (src_plan.steps[0].write, dst_plan.steps[0].write);
     let vals: Vec<f32> = (0..16).map(|i| i as f32 + 1.0).collect();
-    src.write(
-        src_slot,
-        tessera_mem::Tensor::f32(vec![16], vals.clone()).view(),
-    )
-    .unwrap();
-    // Capture graph on dst before D2D copy.
-    dst.submit(0..1).unwrap();
-    assert_eq!(ctx.counts().3, 1);
-
-    let src_addr = src.address(src_slot).unwrap();
-    dst.copy_from(dst_slot, 0, src_addr, 8 * 4).unwrap();
-    dst.copy_from(dst_slot, 8 * 4, src_addr + 8 * 4, 8 * 4)
+    src.write(src_slot, Tensor::f32(vec![16], vals.clone()).view())
         .unwrap();
-    // Overlapping copy within dst works without error.
-    let dst_addr = dst.address(dst_slot).unwrap();
-    dst.copy_from(dst_slot, 4, dst_addr, 4 * 4).unwrap();
-    // Replaying graph after D2D copies needs zero re-captures.
     dst.submit(0..1).unwrap();
     assert_eq!(ctx.counts().3, 1);
-    assert_eq!(ctx.counts().4, 2);
-    assert_eq!(ctx.d2d_copies(), 3);
+    let src_addr = src.address(src_slot).unwrap();
+    dst.copy_from(dst_slot, 0, src_addr, 32).unwrap();
+    dst.copy_from(dst_slot, 32, src_addr + 32, 32).unwrap();
+    let dst_addr = dst.address(dst_slot).unwrap();
+    dst.copy_from(dst_slot, 4, dst_addr, 16).unwrap();
+    dst.submit(0..1).unwrap();
+    assert_eq!(
+        (ctx.counts().3, ctx.counts().4, ctx.d2d_copies()),
+        (1, 2, 3)
+    );
     let got = dst.read(dst_slot).unwrap();
     let floats = got.floats().unwrap();
-    assert_eq!(&floats[0..5], &[1.0, 1.0, 2.0, 3.0, 4.0]);
-    assert_eq!(&floats[8..16], &vals[8..16]);
+    assert_eq!(
+        (&floats[0..5], &floats[8..16]),
+        (&[1.0, 1.0, 2.0, 3.0, 4.0][..], &vals[8..16])
+    );
 }
