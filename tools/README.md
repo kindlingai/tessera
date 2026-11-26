@@ -12,5 +12,6 @@ Build tools that run as part of CI or pre-commit hooks.
 <tr><td><a href="parity">parity/</a></td><td>tessera-parity</td><td>Every model against its reference, the interpreter and the device</td></tr>
 <tr><td><a href="publish">publish/</a></td><td>tessera-publish</td><td>Merges the workspace crates into the crates that go to crates.io</td></tr>
 <tr><td><a href="ranks">ranks/</a></td><td>tessera-ranks</td><td>Runs one rank of a sharded Qwen3 forward pass, joined over TCP</td></tr>
+<tr><td><a href="rebase">rebase/</a></td><td>tessera-rebase</td><td>Rebases a branch when each conflict only adds list lines</td></tr>
 <tr><td><a href="references">references/</a></td><td>tessera-references</td><td>Fetches the reference files the parity tests read</td></tr>
 </table>

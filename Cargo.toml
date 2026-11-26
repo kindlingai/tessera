@@ -17,6 +17,7 @@ members = [
     "tools/parity",
     "tools/publish",
     "tools/ranks",
+    "tools/rebase",
     "tools/references",
 ]
 
