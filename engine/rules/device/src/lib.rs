@@ -36,17 +36,18 @@ pub(crate) use layout::EDITION;
 /// Maximum rows handled by built-in fast CUDA prefill kernels.
 pub const FAST_MAX_ROWS: usize = 512;
 
-/// Flattens one built-in CUDA kernel source into a static string.
+/// Flattens one built-in kernel source into a static string.
+pub(crate) fn flatten_for(backend: Backend, name: &str, kernel: &str) -> &'static str {
+    let flat = flatten(name, kernel, &|_| None, &Options::plain(backend));
+    Box::leak(
+        flat.expect("built-in kernel flattens")
+            .text
+            .into_boxed_str(),
+    )
+}
+
 pub(crate) fn flatten_cuda(name: &str, kernel: &str) -> &'static str {
-    let options = Options {
-        backend: Backend::Cuda,
-        remote_kv: false,
-        marks: false,
-    };
-    let text = flatten(name, kernel, &|_| None, &options)
-        .expect("cuda kernel flattens")
-        .text;
-    Box::leak(text.into_boxed_str())
+    flatten_for(Backend::Cuda, name, kernel)
 }
 
 /// A name a kernel may import after `<tessera/1/`.

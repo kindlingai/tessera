@@ -3,7 +3,7 @@
 mod gemv;
 pub(crate) mod mm;
 
-use crate::{Backend, Options, flatten};
+use crate::{Backend, flatten_for};
 use gemv::{propose_gemv, why_gemv};
 use std::sync::OnceLock;
 use tessera_graph::{Op, Order, Stage, View};
@@ -16,6 +16,39 @@ use tessera_lower::{
 
 pub(crate) const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBackend::Rocm];
 
+/// Registers a CUDA rule, from a `check` or a proposer.
+macro_rules! cuda_rule {
+    ($name:literal, $propose:path, why = $why:path) => {
+        tessera_lower::rule!(
+            $name,
+            $propose,
+            why = $why,
+            lacks = $crate::linear::CUDA_LACKS
+        );
+    };
+    ($name:literal, $propose:path) => {
+        const _: () = {
+            fn why(_: &tessera_lower::Tree, _: tessera_lower::T) -> Option<String> {
+                None
+            }
+            $crate::linear::cuda_rule!($name, $propose, why = why);
+        };
+    };
+    ($name:literal, check = $check:path) => {
+        const _: () = {
+            use tessera_lower::{Draft, T, Tree};
+            fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+                $check(tree, at)?.ok()
+            }
+            fn why(tree: &Tree, at: T) -> Option<String> {
+                $check(tree, at)?.err()
+            }
+            $crate::linear::cuda_rule!($name, propose, why = why);
+        };
+    };
+}
+pub(crate) use cuda_rule;
+
 const KERNEL: &str = include_str!("linear.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
@@ -24,27 +57,15 @@ const THREADS: usize = 256;
 const WARPS: usize = 8;
 const DTR_SMEM: usize = 4096 * 4;
 
-fn flat(backend: Backend) -> &'static str {
-    let options = Options {
-        backend,
-        remote_kv: false,
-        marks: false,
-    };
-    let text = flatten("linear.kernel", KERNEL, &|_| None, &options)
-        .expect("linear kernel flattens")
-        .text;
-    Box::leak(text.into_boxed_str())
-}
-
 pub(crate) fn cuda_source() -> &'static str {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flat(Backend::Cuda))
+    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "linear.kernel", KERNEL))
 }
 
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
     static HIP: OnceLock<&'static str> = OnceLock::new();
-    HIP.get_or_init(|| flat(Backend::Rocm))
+    HIP.get_or_init(|| flatten_for(Backend::Rocm, "linear.kernel", KERNEL))
 }
 
 pub(crate) fn parse_trellis(name: &str) -> Option<(u32, u32)> {
@@ -386,14 +407,6 @@ fn eval_trellis(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     None
 }
 
-fn propose_trellis(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    eval_trellis(tree, at)?.ok()
-}
-
-fn why_trellis(tree: &Tree, at: T) -> Option<String> {
-    eval_trellis(tree, at)?.err()
-}
-
 /// One thread's trip. Bf16 widens with one integer op.
 fn trip(float: usize, int: usize, loads: usize, bytes: usize) -> Ops {
     Ops {
@@ -695,29 +708,6 @@ fn check_stacked(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     Some(Ok(vec![Draft::new(kernel, [x, leaf], len)]))
 }
 
-fn propose_stacked(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    check_stacked(tree, at)?.ok()
-}
-
-fn why_stacked(tree: &Tree, at: T) -> Option<String> {
-    check_stacked(tree, at)?.err()
-}
-
-tessera_lower::rule!(
-    "trellis_mma",
-    propose_trellis,
-    why = why_trellis,
-    lacks = CUDA_LACKS
-);
-tessera_lower::rule!(
-    "fast_gemv",
-    propose_gemv,
-    why = why_gemv,
-    lacks = CUDA_LACKS
-);
-tessera_lower::rule!(
-    "fast_stacked",
-    propose_stacked,
-    why = why_stacked,
-    lacks = CUDA_LACKS
-);
+cuda_rule!("trellis_mma", check = eval_trellis);
+cuda_rule!("fast_stacked", check = check_stacked);
+cuda_rule!("fast_gemv", propose_gemv, why = why_gemv);

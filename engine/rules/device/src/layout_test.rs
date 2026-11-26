@@ -102,11 +102,7 @@ fn form_kinds_hold() {
 fn p2p_kernel_flattens() {
     let source = include_str!("p2p/p2p.kernel");
     for backend in [Backend::Cuda, Backend::Rocm] {
-        let options = Options {
-            backend,
-            remote_kv: false,
-            marks: false,
-        };
+        let options = Options::plain(backend);
         let flat = flatten("p2p.kernel", source, &|_| None, &options).unwrap();
         assert!(flat.text.contains("tessera_p2p_sum"));
         assert!(flat.text.contains("tessera_p2p_sum_bf16"));
@@ -122,11 +118,7 @@ fn p2p_kernel_flattens() {
 #[test]
 fn indexer_kernel_flattens() {
     let source = include_str!("attend/mla.cu");
-    let options = Options {
-        backend: Backend::Cuda,
-        remote_kv: false,
-        marks: false,
-    };
+    let options = Options::plain(Backend::Cuda);
     let flat = flatten("mla.kernel", source, &|_| None, &options).unwrap();
     for entry in [
         "tessera_indexer_fp8",

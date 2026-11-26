@@ -1,7 +1,7 @@
 //! Tensor-Core MLA, GQA, and Lightning Indexer rules for CUDA.
 
-use crate::linear::{CUDA_LACKS, f32_only};
-use crate::{Backend, Options, flatten};
+use crate::flatten_cuda;
+use crate::linear::{CUDA_LACKS, cuda_rule, f32_only};
 use std::sync::OnceLock;
 use tessera_graph::{Act, DType, Op, Order, Select, Stage, View};
 use tessera_lower::form::Load as Stored;
@@ -67,17 +67,7 @@ impl AttendKind {
 
 fn attend_entry(entry: &'static str) -> Source {
     static CUDA: OnceLock<&'static str> = OnceLock::new();
-    let text = *CUDA.get_or_init(|| {
-        let options = Options {
-            backend: Backend::Cuda,
-            remote_kv: false,
-            marks: false,
-        };
-        let flat = flatten("mla.kernel", KERNEL, &|_| None, &options)
-            .expect("attention kernel flattens")
-            .text;
-        Box::leak(flat.into_boxed_str())
-    });
+    let text = *CUDA.get_or_init(|| flatten_cuda("mla.kernel", KERNEL));
     Source::Fixed {
         text: ByBackend::from_fn(|_| text),
         entry,
@@ -315,41 +305,68 @@ fn kept_context(tree: &Tree, k: T, v: T, most: usize) -> Option<(usize, &'static
     }
 }
 
-fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
+/// Declines the site with a reason when `cond` is false.
+macro_rules! require {
+    (f32 $tree:expr, $($what:literal $t:expr),+) => {
+        $(
+            let form = $tree.node($t).form.name();
+            require!(form == "f32", "{} form {} (requires f32)", $what, form);
+        )+
+    };
+    ($cond:expr, $($why:tt)+) => {
+        if !$cond {
+            return Some(Err(format!($($why)+)));
+        }
+    };
+}
+
+fn check(tree: &Tree, at: T, kind: AttendKind) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(at);
     let Term::Op(Op::Attend(a)) = &node.term else {
         return None;
     };
-    if !a.ragged || node.form.name() != "f32" {
-        return None;
-    }
     let (q, k, v) = (node.args[0], node.args[1], node.args[2]);
-    if tree.node(q).form.name() != "f32" {
-        return None;
-    }
-    let kv_form = tree.node(k).form;
-    if tree.node(v).form.name() != kv_form.name() {
-        return None;
-    }
-    let entry = kind.kv_entry(kv_form.name())?;
+    // MLA reads one latent cache as keys and values.
+    let own = match kind {
+        AttendKind::Mla => k == v,
+        AttendKind::Gqa => !a.picked,
+    };
     let (&[rows, heads, width], &[_, most, kv_heads, kw]) =
         (&tree.node(q).shape[..], &tree.node(k).shape[..])
     else {
         return None;
     };
-    if width != kind.width() || kw != width || tree.node(v).shape.last() != Some(&width) {
+    if !a.ragged || !own {
         return None;
     }
-    if rows == 0 || rows > crate::FAST_MAX_ROWS || kv_heads == 0 || !heads.is_multiple_of(kv_heads)
-    {
-        return None;
-    }
+    require!(f32 tree, "output" at, "query" q);
+    let (kv_form, vf) = (tree.node(k).form, tree.node(v).form.name());
+    let kv = kv_form.name();
+    require!(vf == kv, "key form {kv} and value form {vf} differ");
+    let entry = kind.kv_entry(kv);
+    require!(entry.is_some(), "kv form {kv} (supports fp8, bf16, f32)");
+    let want = kind.width();
+    let v_width = tree.node(v).shape.last() == Some(&want);
+    require!(
+        width == want && kw == want && v_width,
+        "head width {width} (requires {want})"
+    );
+    let most_rows = crate::FAST_MAX_ROWS;
+    require!(
+        (1..=most_rows).contains(&rows),
+        "rows={rows} (max {most_rows})"
+    );
+    let groups = kv_heads > 0 && heads.is_multiple_of(kv_heads);
+    require!(
+        groups,
+        "heads={heads} not a multiple of kv_heads={kv_heads}"
+    );
     let [slots, positions] = [node.args[3], node.args[4]];
     let (reads, picks, hgroups) = match kind {
         AttendKind::Mla => {
-            if k != v || kv_heads != 1 || heads < 16 || !heads.is_multiple_of(16) {
-                return None;
-            }
+            require!(kv_heads == 1, "kv_heads={kv_heads} (requires 1)");
+            let fits = heads >= 16 && heads.is_multiple_of(16);
+            require!(fits, "heads={heads} (requires a multiple of 16)");
             let (ids, picks) = match node.args.get(5) {
                 Some(&ids) => (ids, *tree.node(ids).shape.last()?),
                 None => (positions, most),
@@ -358,17 +375,19 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
         }
         AttendKind::Gqa => {
             let gqa = heads / kv_heads;
-            if a.picked || gqa < 4 || (gqa > 16 && !gqa.is_multiple_of(16)) {
-                return None;
-            }
-            (
-                [q, k, v, slots, positions],
-                most,
-                kv_heads * gqa.div_ceil(16),
-            )
+            let fits = gqa >= 4 && (gqa <= 16 || gqa.is_multiple_of(16));
+            require!(fits, "{gqa} heads per kv head (requires 4..=16 or n*16)");
+            let hgroups = kv_heads * gqa.div_ceil(16);
+            ([q, k, v, slots, positions], most, hgroups)
         }
     };
-    let (context, kept) = kept_context(tree, k, v, most)?;
+    let cache = kept_context(tree, k, v, most);
+    require!(
+        cache.is_some(),
+        "keys and values share no dense or paged cache"
+    );
+    let (context, kept) = cache?;
+    let entry = entry?;
     let splits = split_count(kind, rows, hgroups);
     let attend = SplitAttend {
         kind,
@@ -392,22 +411,22 @@ fn propose(tree: &Tree, at: T, kind: AttendKind) -> Option<Vec<Draft>> {
         lists,
         splits,
     };
-    Some(vec![
+    Some(Ok(vec![
         Draft::new(attend, reads, lists * splits * kind.stride()),
         Draft::new(reduce, [Read::Draft(0)], lists * width),
-    ])
+    ]))
 }
 
-fn propose_mla(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    propose(tree, at, AttendKind::Mla)
+fn check_mla(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
+    check(tree, at, AttendKind::Mla)
 }
 
-fn propose_gqa(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    propose(tree, at, AttendKind::Gqa)
+fn check_gqa(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
+    check(tree, at, AttendKind::Gqa)
 }
 
-tessera_lower::rule!("fast_mla_attend", propose_mla);
-tessera_lower::rule!("fast_gqa_attend", propose_gqa);
+cuda_rule!("fast_mla_attend", check = check_mla);
+cuda_rule!("fast_gqa_attend", check = check_gqa);
 
 const IDX_SM_WORDS: usize = 4608;
 const IDX_SMEM: usize = IDX_SM_WORDS * 8 + 128 * 4;
@@ -535,10 +554,7 @@ fn idx_launches(k: &FastIndexer, step: &Step) -> Vec<Launch> {
 }
 
 /// Matches stepped ragged Lightning Indexer over dense or paged keys.
-fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if tree.kept.name() != "dense" && tree.kept.page().is_none() {
-        return None;
-    }
+fn check_indexer(tree: &Tree, at: T) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(at);
     let (masked_pos, mut cur) = match &node.term {
         Term::Stage(Stage::Causal) => (Some(node.args[1]), node.args[0]),
@@ -562,7 +578,7 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let (rows, out_keys, heads) = (perm_node.shape[0], perm_node.shape[1], perm_node.shape[2]);
     let w_node = tree.node(by_head);
-    if w_node.shape != [rows, 1, heads] || w_node.form.name() != "f32" {
+    if w_node.shape != [rows, 1, heads] || rows == 0 {
         return None;
     }
     let hits_relu = perm_node.args[0];
@@ -575,27 +591,10 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let (q, k_src) = (hits_node.args[0], hits_node.args[1]);
     let q_node = tree.node(q);
-    if q_node.shape.len() != 3
-        || q_node.shape[0] != rows
-        || q_node.shape[1] != heads
-        || q_node.form.name() != "f32"
-        || q_node.extents[0].runtime()
-    {
+    let &[q_rows, q_heads, dim] = &q_node.shape[..] else {
         return None;
-    }
-    let dim = q_node.shape[2];
-    if node.form.name() != "f32" || tree.elements(at) != rows * out_keys {
-        return None;
-    }
-    let stride = dim / 2 + 2;
-    if rows == 0
-        || !(16..=IDX_MAX_HEADS).contains(&heads)
-        || !heads.is_multiple_of(16)
-        || dim < 16
-        || !dim.is_multiple_of(16)
-        || heads * stride > IDX_SM_WORDS
-        || 64 * stride > IDX_SM_WORDS
-    {
+    };
+    if q_rows != rows || q_heads != heads || tree.elements(at) != rows * out_keys {
         return None;
     }
     let gather = tree.node(k_src);
@@ -610,26 +609,37 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let &[_, k_keys, k_dim] = &k_node.shape[..] else {
         return None;
     };
-    if k_keys != out_keys || k_dim != dim {
-        return None;
-    }
-    let qt = rows >= 8 && heads == 32 && dim == 128;
-    let entry = idx_kv_entry(k_node.form.name(), qt)?;
-    if tree.elements(slots) != rows || tree.node(slots).form.dtype() != DType::U32 {
+    let per_row = |t: T| tree.elements(t) == rows && tree.node(t).form.dtype() == DType::U32;
+    if k_keys != out_keys || k_dim != dim || !per_row(slots) || !masked_pos.is_none_or(per_row) {
         return None;
     }
     let (_, raw_ctx) = tree.kept_rows(ki)?;
-    let (context, kept) = kept_stride(tree.kept, raw_ctx)?;
+    require!(f32 tree, "output" at, "query" q, "head weight" by_head);
+    require!(!q_node.extents[0].runtime(), "query rows are runtime-sized");
+    let fits = (16..=IDX_MAX_HEADS).contains(&heads) && heads.is_multiple_of(16);
+    require!(fits, "heads={heads} (requires n*16, max {IDX_MAX_HEADS})");
+    let fits = dim >= 16 && dim.is_multiple_of(16);
+    require!(fits, "dim={dim} (requires a multiple of 16)");
+    let fits = heads.max(64) * (dim / 2 + 2) <= IDX_SM_WORDS;
+    require!(fits, "heads={heads}, dim={dim} exceed shared memory");
+    let kf = k_node.form.name();
+    let qt = rows >= 8 && heads == 32 && dim == 128;
+    let entry = idx_kv_entry(kf, qt);
+    require!(entry.is_some(), "key form {kf} (supports fp8, bf16, f32)");
+    let paged = kept_stride(tree.kept, raw_ctx);
+    let layout = tree.kept.name();
+    require!(
+        paged.is_some(),
+        "kv layout {layout} is neither dense nor paged"
+    );
+    let ((context, kept), entry) = (paged?, entry?);
     let keys = k_node.extents[1];
     let (masked, positions) = match masked_pos {
-        Some(pos) => {
-            if tree.elements(pos) != rows || tree.node(pos).form.dtype() != DType::U32 {
-                return None;
-            }
-            (true, pos)
+        Some(pos) => (true, pos),
+        None => {
+            require!(!keys.runtime(), "runtime key count needs a causal mask");
+            (false, slots)
         }
-        None if !keys.runtime() => (false, slots),
-        None => return None,
     };
     let kernel = FastIndexer {
         rows,
@@ -645,7 +655,7 @@ fn propose_indexer(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         entry,
     };
     let reads = [q, k_append, by_head, slots, positions];
-    Some(vec![Draft::new(kernel, reads, rows * out_keys)])
+    Some(Ok(vec![Draft::new(kernel, reads, rows * out_keys)]))
 }
 
-tessera_lower::rule!("fast_indexer", propose_indexer);
+cuda_rule!("fast_indexer", check = check_indexer);

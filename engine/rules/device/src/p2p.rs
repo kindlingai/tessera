@@ -215,11 +215,7 @@ where
             let what = format!("p2p rank {rank} of {ranks} (supports 2..={MAX_RANKS})");
             return Err(Error::Comm(CommError::Fit(what)));
         }
-        let options = Options {
-            backend: backend::<D>()?,
-            remote_kv: false,
-            marks: false,
-        };
+        let options = Options::plain(backend::<D>()?);
         let most = knobs
             .get("p2p_sum", "threads")
             .map_or(MAX_THREADS, |t| t as u32);

@@ -457,7 +457,7 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
                     (MmKind::Mxfp8Wide, 1)
                 }
             } else {
-                let ks = mxfp8_tall_ks(m, n, k);
+                let ks = set.unwrap_or_else(|| mxfp8_tall_ks(m, n, k));
                 if ks > 1 {
                     (MmKind::Mxfp8TallSplit, ks)
                 } else {
@@ -581,4 +581,4 @@ fn why_mm(tree: &Tree, at: T) -> Option<String> {
     check_mm(tree, at)?.err()
 }
 
-tessera_lower::rule!("fast_mm", propose_mm, why = why_mm, lacks = CUDA_LACKS);
+super::cuda_rule!("fast_mm", propose_mm, why = why_mm);

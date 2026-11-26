@@ -1,10 +1,10 @@
 //! Grouped SYRK and deterministic expert sort kernels and CPU references.
 
 use crate::flatten_cuda;
+use crate::linear::{CUDA_LACKS, cuda_rule};
 use std::sync::OnceLock;
 use tessera_graph::Bf16;
 use tessera_graph::{Act, Op, Order, Select, Stage};
-use tessera_lower::Backend as LowerBackend;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
     Arg, ByBackend, Draft, Kernel, Launch, Load, Needs, Read, Shape, Source, Step, T, Term, Tree,
@@ -123,7 +123,6 @@ pub fn syrk_dense_cpu(x: &[f32], rows: usize, dim: usize, acc: &mut [f64]) {
     }
 }
 
-const CUDA_LACKS: &[LowerBackend] = &[LowerBackend::Metal, LowerBackend::Rocm];
 const THREADS: usize = 256;
 const MIN_ROWS: usize = 16;
 /// `CALIB_BK` and `CALIB_GEMM_STRIDE` in `grouped.cu`.
@@ -593,4 +592,4 @@ pub(crate) fn propose_picked_bf16(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(build_drafts(&site, out_form, None))
 }
 
-tessera_lower::rule!("picked_bf16", propose_picked_bf16);
+cuda_rule!("picked_bf16", propose_picked_bf16);

@@ -65,11 +65,7 @@ impl OnGpu for Hand {
 /// Every state: kernel text and hand CUDA match the host.
 #[test]
 fn trellis_states_match() {
-    let options = Options {
-        backend: Backend::Cuda,
-        remote_kv: false,
-        marks: false,
-    };
+    let options = Options::plain(Backend::Cuda);
     let text = flatten("trellis_states.cu", HAND, &|_| None, &options)
         .expect("flattens")
         .text;

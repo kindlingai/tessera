@@ -1,7 +1,7 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
-use crate::linear::parse_trellis;
-use crate::{Backend, flatten_cuda};
+use crate::flatten_cuda;
+use crate::linear::{CUDA_LACKS, cuda_rule, parse_trellis};
 use std::sync::OnceLock;
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_lower::form::Load as Stored;
@@ -74,7 +74,7 @@ fn needs() -> Needs {
         group_threads: THREADS,
         compiler: true,
         bf16_tile: true,
-        lacks: &[Backend::Metal, Backend::Rocm],
+        lacks: CUDA_LACKS,
         ..Needs::default()
     }
 }
@@ -281,4 +281,4 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     None
 }
 
-tessera_lower::rule!("picked_trellis", propose);
+cuda_rule!("picked_trellis", propose);

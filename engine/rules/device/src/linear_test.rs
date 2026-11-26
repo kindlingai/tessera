@@ -146,6 +146,19 @@ fn fast_mm_selection() {
         mm_entry(&linear(&rows, 2048, 4096), 256, "mxfp8"),
         Some(("fast_mm_mxfp8", "tessera_mm_mxfp8_r64", 2))
     );
+    // The splits knob also sets r64 splits.
+    for (splits, rows_n, kind, entry) in [
+        (2, 256, "fast_mm_mxfp8_sk", "tessera_mm_mxfp8_r64_sk"),
+        (1, 24, "fast_mm_mxfp8", "tessera_mm_mxfp8_r64"),
+    ] {
+        let mut set = Knobs::default();
+        set.parse(&format!("fast_mm_mxfp8_sk:splits={splits}"))
+            .unwrap();
+        assert_eq!(
+            mm_shaped(&linear(&rows, 12288, 6144), rows_n, "mxfp8", set),
+            Some((kind, entry, 2))
+        );
+    }
     // Out-of-range M and unaligned K are rejected.
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 1, "mxfp8"), None);
     assert_eq!(mm_entry(&linear(&rows, 6144, 576), 513, "mxfp8"), None);

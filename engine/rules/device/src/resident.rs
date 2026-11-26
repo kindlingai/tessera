@@ -301,11 +301,7 @@ where
 pub(crate) fn clock<D: Device + Launch<Kernel = <D as Device>::Kernel>>(
     ctx: &D,
 ) -> Result<u64, Error> {
-    let options = Options {
-        backend: backend::<D>()?,
-        remote_kv: false,
-        marks: false,
-    };
+    let options = Options::plain(backend::<D>()?);
     let flat = flatten("clock.kernel", CLOCK, &|_| None, &options)?;
     let kernel = ctx.compile(&flat.text, "tessera_clock")?;
     let out = DeviceBuffer::alloc(ctx, 8)?;

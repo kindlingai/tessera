@@ -1,11 +1,7 @@
 use crate::flatten::scan;
 use crate::{Backend, Error, Flat, Import, Options, Problem, flatten};
 
-const CUDA: Options = Options {
-    backend: Backend::Cuda,
-    remote_kv: false,
-    marks: false,
-};
+const CUDA: Options = Options::plain(Backend::Cuda);
 
 const WHOLE: &str = "#include <tessera/1/whole>\nint body;\n";
 

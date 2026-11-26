@@ -14,6 +14,17 @@ pub struct Options {
     pub marks: bool,
 }
 
+impl Options {
+    /// Kept pages on the device, and no timing marks.
+    pub const fn plain(backend: Backend) -> Self {
+        Self {
+            backend,
+            remote_kv: false,
+            marks: false,
+        }
+    }
+}
+
 /// The text to compile, and what it imports.
 #[derive(Debug)]
 pub struct Flat {

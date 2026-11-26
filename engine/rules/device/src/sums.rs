@@ -284,11 +284,7 @@ where
     D: Device + Launch<Kernel = <D as Device>::Kernel>,
     L: Link + 'static,
 {
-    let options = Options {
-        backend: crate::resident::backend::<D>()?,
-        remote_kv: false,
-        marks: false,
-    };
+    let options = Options::plain(crate::resident::backend::<D>()?);
     let text = flatten("sum.cu", KERNEL, &|_| None, &options)?.text;
     let plan = plan(link.ranks());
     let hand = ctx.compile(&text, HAND)?;
