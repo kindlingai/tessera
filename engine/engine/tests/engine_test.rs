@@ -12,16 +12,13 @@ use tessera_engine::{
     Request, Row, Site, Steps,
 };
 use tessera_graph::{
-    Dim,
     DimName::{Context, Rows, Seqs},
-    Graph, Op, Role,
+    Graph, Role,
 };
 use tessera_interp::{Store, Tensor, run_kept};
-use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM, named};
-use tessera_lower::{
-    Device, Limits, Pins, Platform, Recipe, Settings, explain, kept, lower, rules,
-};
-use tessera_models::decoder::{Config, Moe, Swiglu, stepper};
+use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
+use tessera_lower::{Device, Pins, Recipe, Settings, kept, lower, rules};
+use tessera_models::decoder::{Config, Swiglu, stepper};
 use tessera_models::mla;
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
@@ -325,44 +322,6 @@ fn mla_matches_interpreter() {
     }
 }
 
-/// GLM-5.3 lowers its indexer to one fused kernel without gather.
-#[test]
-fn mla_indexer_fused() {
-    let mut cfg = mla::Config::glm53_small();
-    cfg.stack.max_context = 512;
-    let g = mla::stepper::<mla::RotatedMoe>(&cfg);
-    let sizes = [
-        (tessera_graph::DimName::Seqs, 4),
-        (tessera_graph::DimName::Rows, 4),
-        (tessera_graph::DimName::Context, 512),
-    ];
-    for settings in runs() {
-        let device = Device::guess(&settings);
-        let fused = tessera_lower::lower(&g, 0, &sizes, &device).unwrap();
-        let names: Vec<&str> = fused.steps.iter().map(|s| s.kernel.name()).collect();
-        assert!(names.contains(&"indexer_warp"), "{names:?}");
-        assert!(!names.contains(&"kept_gather"), "{names:?}");
-        let bare = device.without("indexer_warp").without("indexer");
-        let unfused = tessera_lower::lower(&g, 0, &sizes, &bare).unwrap();
-        assert!(fused.steps.len() < unfused.steps.len());
-        assert!(
-            fused.scratch() < unfused.scratch(),
-            "fused={} unfused={}",
-            fused.scratch(),
-            unfused.scratch()
-        );
-    }
-    let whole = mla::program::<mla::RotatedMoe>(&cfg);
-    let w_sizes = [
-        (tessera_graph::DimName::Seqs, 1),
-        (tessera_graph::DimName::Context, 8),
-    ];
-    let device = Device::guess(&Settings::default());
-    let plan = tessera_lower::lower(&whole, 0, &w_sizes, &device).unwrap();
-    let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
-    assert!(names.contains(&"indexer_warp"), "{names:?}");
-}
-
 /// Large `INDEX_KEEP` MLA uses `radix_top_k` and matches interpreter.
 #[test]
 fn mla_radix_index() {
@@ -451,41 +410,6 @@ fn paged_slots_share() {
         for (prompts, steps) in rounds {
             let want = prompts.iter().map(|p| reference(&g, &weights, p, 3));
             assert_eq!(asked(&mut batch, prompts), (want.collect(), steps));
-        }
-    }
-}
-
-/// Trimmed steps return the whole graph's rows at their picks.
-#[test]
-fn trim_keeps_picks() {
-    let graphs = [
-        stepper::<Norm, Swiglu>(&Config::qwen3_small()),
-        stepper::<(), Moe>(&Config::granite_small()),
-        mla::stepper::<mla::Moe>(&mla::Config::deepseek_small()),
-        mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
-    ];
-    let launches = [
-        (vec![row(1, 5, 0), row(1, 7, 1), row(0, 9, 0)], vec![1, 2]),
-        (vec![row(0, 4, 1), row(1, 3, 2)], vec![0, 1]),
-    ];
-    for g in graphs {
-        let trimmed = tessera_graph::trim(&g, 0).unwrap();
-        let picked =
-            |n: &tessera_graph::Node| n.op == Op::Matmul && n.ty.shape.0[0] == Picks.into();
-        assert!(trimmed.nodes.iter().any(picked));
-        let weights = weights(&g, &mut Noise(3));
-        let (mut whole, mut cut) = (Store::default(), Store::default());
-        for (rows, picks) in &launches {
-            let mut feeds = feeds(rows);
-            let want = run_kept(&g, &weights, &mut whole, 0, &feeds).unwrap();
-            feeds.push(Tensor::u32(vec![picks.len()], picks.clone()));
-            let got = run_kept(&trimmed, &weights, &mut cut, 0, &feeds).unwrap();
-            let (want, got) = (want[1].floats().unwrap(), got[1].floats().unwrap());
-            let width = got.len() / picks.len();
-            for (at, p) in picks.iter().enumerate() {
-                let p = *p as usize;
-                assert_eq!(got[at * width..][..width], want[p * width..][..width]);
-            }
         }
     }
 }
@@ -807,72 +731,9 @@ fn mla_narrow_kept() {
     }
 }
 
-/// Fast-path diagnostics report rule and hardware rejections accurately.
+/// `Engine::lowering_report` lowers and sets the row label.
 #[test]
-fn lowering_report_diagnostics() {
-    let rows = [Dim::bounded(Rows, 1 << 21)];
-    let cuda = Platform {
-        backend: "cuda".into(),
-        ..Platform::host(Limits::assumed())
-    };
-    let cuda_no_bf16 = Platform {
-        backend: "cuda".into(),
-        ..Platform::assumed(Limits::assumed())
-    };
-    let metal = Platform {
-        backend: "metal".into(),
-        ..Platform::assumed(Limits::assumed())
-    };
-    let mxfp8 = named("mxfp8").expect("mxfp8 form");
-
-    // Aligned m=1 bf16 hits fast_gemv with no warning.
-    let g_ok = tessera_testkit::graphs::linear(&rows, 512, 256);
-    let dev = Device::default()
-        .on(cuda.clone())
-        .pinned(Pins::all(BF16_FORM));
-    let r = explain(&g_ok, 0, &[(Rows, 1)], &dev).unwrap();
-    assert!(!r.has_fallbacks(), "{}", r.format(10));
-    assert!(r.warning("--explain-lowering").is_none());
-
-    // Unaligned k=768 mxfp8 misses fast_gemv and emits boot warning.
-    let g_unaligned = tessera_testkit::graphs::linear(&rows, 768, 256);
-    let dev_mxfp8 = Device::default().on(cuda.clone()).pinned(Pins::all(mxfp8));
-    let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_mxfp8).unwrap();
-    assert!(r.has_fallbacks());
-    let msg = r.format(10);
-    assert!(msg.contains("fast_gemv"), "{msg}");
-    assert!(msg.contains("k=768 is not a multiple of 1024"), "{msg}");
-    let warn = r.warning("--explain-lowering").expect("warning");
-    assert!(
-        warn.contains("warning: lowering fell off fast path"),
-        "{warn}"
-    );
-    assert!(warn.contains("--explain-lowering"), "{warn}");
-
-    // 4096 rows stay fast. The launch grid bounds fast_mm.
-    let r = explain(&g_ok, 0, &[(Rows, 4096)], &dev).unwrap();
-    assert!(!r.has_fallbacks(), "{}", r.format(10));
-    let msg = explain(&g_ok, 0, &[(Rows, 1 << 20)], &dev)
-        .unwrap()
-        .format(9);
-    assert!(msg.contains("grid height 65536 exceeds 65535"), "{msg}");
-
-    // Missing bf16 tensor tiles reports hardware mismatch via Needs.
-    let dev_no_tile = Device::default()
-        .on(cuda_no_bf16)
-        .pinned(Pins::all(BF16_FORM));
-    let r = explain(&g_ok, 0, &[(Rows, 8)], &dev_no_tile).unwrap();
-    assert!(r.has_fallbacks());
-    let msg = r.format(10);
-    assert!(msg.contains("fast_mm"), "{msg}");
-    assert!(msg.contains("requires bf16 tensor tiles"), "{msg}");
-
-    // Metal ignores CUDA-only fast_gemv to avoid false boot warnings.
-    let dev_metal = Device::default().on(metal).pinned(Pins::all(mxfp8));
-    let r = explain(&g_unaligned, 0, &[(Rows, 1)], &dev_metal).unwrap();
-    assert!(!r.has_fallbacks(), "{}", r.format(10));
-
-    // Engine::lowering_report works end to end and sets the row label.
+fn engine_lowering_report() {
     let g = stepper::<Norm, Swiglu>(&Config::toy(1, 16));
     let settings = Settings {
         backend: tessera_engine::Pick::Cpu,
@@ -882,48 +743,6 @@ fn lowering_report_diagnostics() {
     let r = engine.lowering_report(1).unwrap();
     assert_eq!(r.label, "rows=1");
     assert!(r.total_ops > 0);
-}
-
-/// CPU row stages after a product match the interpreter.
-#[test]
-fn cpu_row_stages() {
-    use tessera_graph::Act;
-    let settings = Settings {
-        backend: tessera_lower::Pick::Cpu,
-        ..tessera_run::testing::host()
-    };
-    let sizes = [(Rows, 3)];
-    let acts = [
-        Act::GeluTanh,
-        Act::Silu,
-        Act::Sigmoid,
-        Act::Relu,
-        Act::Softplus,
-        Act::Exp,
-        Act::Tanh,
-        Act::SignedSqrt,
-    ];
-    for act in acts {
-        let g = tessera_testkit::graphs::finished(&[Dim::bounded(Rows, 4)], [32, 32], act);
-        let mut noise = Noise(9);
-        let stored = weights(&g, &mut noise);
-        let ports = g.entries[0].inputs.iter();
-        let inputs: Vec<Tensor> = ports
-            .map(|p| tessera_testkit::fill(&g, &p.ty, &sizes, &mut noise).unwrap())
-            .collect();
-        let want = tessera_interp::run(&g, &stored, 0, &inputs).unwrap();
-        let device = Device::guess(&settings).favoring("cpu_tiled");
-        let plan = tessera_lower::lower(&g, 0, &sizes, &device).unwrap();
-        let mut runner = tessera_run::open(plan, &settings).unwrap();
-        for (at, w) in stored.iter().enumerate() {
-            runner.load(at as u32, w.view()).unwrap();
-        }
-        let feeds: Vec<_> = inputs.iter().map(Tensor::view).collect();
-        let got = runner.run(&feeds).unwrap().remove(0);
-        let pairs = got.floats().unwrap().iter().zip(want[0].floats().unwrap());
-        let off = pairs.map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(off < 1e-4, "{act:?}: off by {off:e}");
-    }
 }
 
 #[test]

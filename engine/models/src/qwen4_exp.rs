@@ -114,6 +114,39 @@ impl Config {
         }
     }
 
+    /// Small two-layer configuration with PLE for tests.
+    pub fn tiny() -> Self {
+        Self {
+            stack: Stack::sized([16, 16, 2, 2, 8, 8], 2, 16),
+            kv_heads: 1,
+            rotary: 4,
+            rope_theta: 1e4,
+            eps: 1e-6,
+            hc_count: 4,
+            hc_rank: 8,
+            experts: 4,
+            top_k: 2,
+            shared_ffn: 8,
+            linear: Recurrent {
+                key_heads: 2,
+                value_heads: 4,
+                key_dim: 4,
+                value_dim: 4,
+                window: 4,
+            },
+            layers: vec![Mixing::Linear, Mixing::Full],
+            ple: Some(Ple {
+                layer: 1,
+                dim: 16,
+                window: 4,
+                dilation: 3,
+                heads: 16,
+            }),
+            eos_token: 15,
+            tied: false,
+        }
+    }
+
     pub fn dims(&self) -> Vec<Dim> {
         let (width, l) = (self.stack.head_dim, &self.linear);
         let mut own = vec![

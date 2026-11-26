@@ -9,3 +9,9 @@ description = "CPU kernels for matmuls: short bodies over a dot primitive"
 [dependencies]
 tessera-codegen = { workspace = true }
 tessera-lower = { workspace = true }
+
+[dev-dependencies]
+tessera-graph = { workspace = true }
+tessera-interp = { workspace = true }
+tessera-run = { workspace = true }
+tessera-testkit = { workspace = true }

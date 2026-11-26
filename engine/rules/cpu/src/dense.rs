@@ -369,5 +369,8 @@ fn tiled(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     Some(vec![Draft::new(Tiled(dense), site.reads(), m * n)])
 }
 
+#[cfg(test)]
+pub(crate) const TILED_RULE: &str = "cpu_tiled";
+
 tessera_lower::rule!("cpu_dense", propose);
 tessera_lower::rule!("cpu_tiled", tiled);

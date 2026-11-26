@@ -16,5 +16,7 @@ serde_json = "1"
 [dev-dependencies]
 tessera-interp = { workspace = true }
 tessera-lower = { workspace = true }
+tessera-rules = { workspace = true }
+tessera-run = { workspace = true }
 tessera-testkit = { workspace = true }
 

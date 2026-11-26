@@ -2,76 +2,20 @@
 
 mod common;
 
-use common::{collect_ids, float_weights, loopback_links, open_ranked_target, open_target};
-use std::io::Write;
-use tessera_engine::Place;
-use tessera_engine::comm::Sockets;
-use tessera_engine::qwen4_exp::{Config, Moe, Ple, RotatedMoe, program, stepper};
-use tessera_engine::qwen35::{Mixing, Recurrent};
-use tessera_engine::{
-    Batch, Bf16, Drafter, Engine, Event, Fair, Penalties, Pick, PleConfig, PleStore, Recipe,
-    Request, Row, Settings, Speculate, Stack, Steps, Tensor, Weight,
+use common::{
+    collect_ids, float_weights, gen_ids, host_settings, loopback_links, open_drafter,
+    open_ranked_target, open_target, req, row, spec_events, two_place,
 };
-use tessera_graph::Parts;
-use tessera_lower::Cluster;
+use std::io::Write;
+use tessera_engine::comm::Sockets;
+use tessera_engine::qwen4_exp::{Config, Moe, program, stepper};
+use tessera_engine::{
+    Batch, Bf16, Engine, Event, Fair, Penalties, PleConfig, PleStore, Request, Row, Settings,
+    Speculate, Steps, Tensor,
+};
 use tessera_models::dflash::{self, TargetSpec};
 use tessera_run::testing::runs;
 use tessera_testkit::{Noise, weights};
-
-fn tiny_config() -> Config {
-    Config {
-        stack: Stack::sized([16, 16, 2, 2, 8, 8], 2, 16),
-        kv_heads: 1,
-        rotary: 4,
-        rope_theta: 1e4,
-        eps: 1e-6,
-        hc_count: 4,
-        hc_rank: 8,
-        experts: 4,
-        top_k: 2,
-        shared_ffn: 8,
-        linear: Recurrent {
-            key_heads: 2,
-            value_heads: 4,
-            key_dim: 4,
-            value_dim: 4,
-            window: 4,
-        },
-        layers: vec![Mixing::Linear, Mixing::Full],
-        ple: Some(Ple {
-            layer: 1,
-            dim: 16,
-            window: 4,
-            dilation: 3,
-            heads: 16,
-        }),
-        eos_token: 15,
-        tied: false,
-    }
-}
-
-fn fill_weights(g: &tessera_engine::Graph) -> Vec<Tensor> {
-    let mut seed = 0x1234_5678u64;
-    let mut next = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let u = ((seed >> 33) as f32) / (u32::MAX as f32 * 0.5) - 1.0;
-        u * 0.15
-    };
-    g.weights
-        .iter()
-        .map(|w| {
-            let shape: Vec<usize> =
-                w.ty.shape
-                    .0
-                    .iter()
-                    .map(|e| e.value(&g.dims, &|_| None).unwrap() as usize)
-                    .collect();
-            let len: usize = shape.iter().product();
-            let data: Vec<f32> = (0..len).map(|_| next()).collect();
-            Tensor::f32(shape, data)
-        })
-        .collect()
-}
 
 fn make_ple_table() -> (std::path::PathBuf, PleConfig) {
     let dir = tessera_testkit::scratch(&format!("{}-ple-test", std::process::id()));
@@ -100,20 +44,16 @@ fn make_ple_table() -> (std::path::PathBuf, PleConfig) {
 
 fn push_rows(out: &mut Vec<Row>, slot: u32, seq: &[u32], range: std::ops::Range<usize>) {
     for (t, &token) in seq[range.clone()].iter().enumerate() {
-        out.push(Row {
-            slot,
-            token,
-            position: (range.start + t) as u32,
-        });
+        out.push(row(slot, token, (range.start + t) as u32));
     }
 }
 
 #[test]
 fn step_matches_forward() {
-    let c = tiny_config();
+    let c = Config::tiny();
     let fwd = program::<Moe>(&c);
     let step = stepper::<Moe>(&c);
-    let weights = fill_weights(&fwd);
+    let w = weights(&fwd, &mut Noise(7));
     let (ple_path, ple_cfg) = make_ple_table();
 
     let seq0 = [1u32, 3, 5, 2, 7, 4, 9, 6, 15, 2, 8];
@@ -124,13 +64,7 @@ fn step_matches_forward() {
     let mut ref_ple = PleStore::open(ple_cfg.clone()).unwrap();
     let mut all_rows = Vec::new();
     for (s, seq) in [seq0, seq1].iter().enumerate() {
-        for (p, &tok) in seq.iter().enumerate() {
-            all_rows.push(Row {
-                slot: s as u32,
-                token: tok,
-                position: p as u32,
-            });
-        }
+        push_rows(&mut all_rows, s as u32, seq, 0..ctx);
     }
     let ple_flat = ref_ple.fill(&all_rows, all_rows.len()).unwrap();
     let ple_fwd = Tensor::f32(vec![2, ctx, 16], ple_flat.floats().unwrap().to_vec());
@@ -144,7 +78,7 @@ fn step_matches_forward() {
     }
     let fwd_out = tessera_interp::run(
         &fwd,
-        &weights,
+        &w,
         0,
         &[
             Tensor::u32(vec![2, ctx], toks),
@@ -165,14 +99,8 @@ fn step_matches_forward() {
     };
 
     // Run stepper on host runner with chunked prefill and decode.
-    let settings = Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    };
-    let mut engine = Engine::open(step, 16, &Recipe::default(), &settings).unwrap();
+    let mut engine = open_target(&step, &w, 16, &host_settings());
     engine.set_ple(PleStore::open(ple_cfg).unwrap());
-    let engine_w: Vec<Weight> = weights.into_iter().map(Weight::Floats).collect();
-    engine.load(&engine_w).unwrap();
 
     // Chunk 1: 5 rows slot 0, 3 rows slot 1.
     let mut chunk1 = Vec::new();
@@ -201,26 +129,13 @@ fn step_matches_forward() {
     // Single-token decode exercising dilated conv and EOS reset.
     for (i, &token) in seq0[9..ctx].iter().enumerate() {
         let t = 9 + i;
-        let got = engine
-            .step(&[Row {
-                slot: 0,
-                token,
-                position: t as u32,
-            }])
-            .unwrap();
+        let got = engine.step(&[row(0, token, t as u32)]).unwrap();
         assert_eq!(got[0], argmax(0, t), "slot 0 decode pos {t}");
     }
 
     // Slot reset at position zero matches reference.
-    let reset_rows: Vec<Row> = seq0
-        .iter()
-        .enumerate()
-        .map(|(t, &tok)| Row {
-            slot: 0,
-            token: tok,
-            position: t as u32,
-        })
-        .collect();
+    let mut reset_rows = Vec::new();
+    push_rows(&mut reset_rows, 0, &seq0, 0..ctx);
     let got_reset = engine.last(&reset_rows).unwrap();
     assert_eq!(got_reset[0], argmax(0, ctx - 1), "slot 0 reset parity");
 
@@ -230,41 +145,15 @@ fn step_matches_forward() {
 #[test]
 fn ple_slot_reuse() {
     let (_, cfg) = make_ple_table();
-    let row = |token, position| Row {
-        slot: 0,
-        token,
-        position,
-    };
-    let fresh = [row(5, 0), row(7, 1)];
+    let fresh = [row(0, 5, 0), row(0, 7, 1)];
     let want = PleStore::open(cfg.clone())
         .unwrap()
         .fill(&fresh, 2)
         .unwrap();
     let mut reused = PleStore::open(cfg).unwrap();
-    reused.fill(&[row(3, 0)], 1).unwrap();
+    reused.fill(&[row(0, 3, 0)], 1).unwrap();
     let got = reused.fill(&fresh, 2).unwrap();
     assert_eq!(got.floats().unwrap(), want.floats().unwrap());
-}
-
-#[test]
-fn rotated_trims() {
-    let tiny = tiny_config();
-    let c = Config {
-        stack: Stack::sized([256, 128, 2, 2, 64, 128], 2, 16),
-        rotary: 16,
-        hc_rank: 32,
-        shared_ffn: 128,
-        linear: Recurrent {
-            key_dim: 32,
-            value_dim: 32,
-            ..tiny.linear
-        },
-        ple: tiny.ple.map(|p| Ple { dim: 128, ..p }),
-        ..tiny
-    };
-    let g = stepper::<RotatedMoe>(&c);
-    let trimmed = tessera_graph::trim(&g, 0).unwrap();
-    assert!(!trimmed.nodes.is_empty());
 }
 
 #[test]
@@ -297,26 +186,22 @@ fn ple_hash_orders() {
     assert!(PleStore::open(uneven).is_err());
 }
 
-fn host() -> Settings {
-    Settings {
-        backend: Pick::Host,
-        ..Settings::default()
-    }
-}
-
 /// A tiny model rank with its own PLE store.
 fn ple_engine(links: Option<[Sockets; 2]>) -> Engine {
-    let g = stepper::<Moe>(&tiny_config());
+    let g = stepper::<Moe>(&Config::tiny());
     let mut engine = match links {
         Some([sums, control]) => {
-            let place = Place::new(Cluster::two("a", "b"), Parts::even(2));
             let weights = float_weights(&g, 3);
-            open_ranked_target(g, 16, &host(), place, (Box::new(sums), control), &weights)
+            open_ranked_target(
+                g,
+                16,
+                &host_settings(),
+                two_place(false),
+                (Box::new(sums), control),
+                &weights,
+            )
         }
-        None => {
-            let weights = tessera_testkit::weights(&g, &mut tessera_testkit::Noise(3));
-            open_target(&g, &weights, 16, &host())
-        }
+        None => open_target(&g, &weights(&g, &mut Noise(3)), 16, &host_settings()),
     };
     engine.set_ple(PleStore::open(make_ple_table().1).unwrap());
     engine
@@ -332,12 +217,7 @@ fn ranks_feed_ple() {
     let mut rows = Vec::new();
     push_rows(&mut rows, 0, &[1, 3, 5, 2], 0..4);
     push_rows(&mut rows, 1, &[4, 15, 11], 0..3);
-    let next = vec![Row {
-        slot: 0,
-        token: 7,
-        position: 4,
-    }];
-    for rows in [rows, next] {
+    for rows in [rows, vec![row(0, 7, 4)]] {
         assert_eq!(lead.step(&rows).unwrap(), alone.step(&rows).unwrap());
     }
     assert!(lead.kernels().contains_key("all_reduce"));
@@ -348,12 +228,7 @@ fn ranks_feed_ple() {
 /// The events of one answer.
 fn answer(batch: &mut Batch, tokens: Vec<u32>) -> Vec<Event> {
     let (events, taken) = std::sync::mpsc::channel();
-    let request = Request {
-        tokens,
-        max_tokens: 3,
-        ..Request::default()
-    };
-    batch.submit(request, Box::new(move |e| events.send(e).is_ok()));
+    batch.submit(req(&tokens, 3), Box::new(move |e| events.send(e).is_ok()));
     while batch.step().unwrap() {}
     taken.try_iter().collect()
 }
@@ -390,7 +265,7 @@ fn tapped_engine(g: &tessera_engine::Graph, settings: &Settings) -> Engine {
 /// A verify then a commit store what plain steps store.
 #[test]
 fn commit_matches_steps() {
-    let mut c = tiny_config();
+    let mut c = Config::tiny();
     c.stack.taps = vec![1, 2];
     let g = stepper::<Moe>(&c);
     let (mut prompt, mut drafts) = (Vec::new(), Vec::new());
@@ -424,7 +299,7 @@ fn commit_matches_steps() {
 /// Guided or not, stateful DFlash decodes as greedy does.
 #[test]
 fn stateful_dflash_greedy() {
-    let mut c = tiny_config();
+    let mut c = Config::tiny();
     c.stack.steps = Steps::Masked;
     let spec = TargetSpec {
         vocab: c.stack.vocab,
@@ -450,20 +325,12 @@ fn stateful_dflash_greedy() {
         for guided in [false, true] {
             let mut baseline = tapped_engine(&g, &settings);
             let mut target = tapped_engine(&g, &settings);
-            let recipe = Recipe::default();
-            let mut drafter = Drafter::open(d_graph.clone(), 16, 4, 0, &recipe, &settings).unwrap();
-            drafter.load(&float_weights(&d_graph, 23)).unwrap();
-            let (mut want, mut got) = (Vec::new(), Vec::new());
-            baseline
-                .generate(request(guided), &mut |e| want.push(e))
-                .unwrap();
+            let dw = weights(&d_graph, &mut Noise(23));
+            let mut drafter = open_drafter(&d_graph, &dw, 16, 4, 0, &settings);
+            let want = gen_ids(&mut baseline, request(guided));
             let mut run = Speculate::new(&mut target, &mut drafter).unwrap();
-            let emit = &mut |e| {
-                got.push(e);
-                true
-            };
-            let stats = run.generate(request(guided), emit).unwrap();
-            assert_eq!(collect_ids(&got), collect_ids(&want));
+            let (got, stats) = spec_events(|emit| run.generate(request(guided), emit));
+            assert_eq!(collect_ids(&got), want);
             assert!(stats.steps > 0);
         }
     }

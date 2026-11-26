@@ -1832,7 +1832,11 @@ name = "tessera-cpu"
 version = "0.1.0"
 dependencies = [
  "tessera-codegen",
+ "tessera-graph",
+ "tessera-interp",
  "tessera-lower",
+ "tessera-run",
+ "tessera-testkit",
 ]
 
 [[package]]
@@ -1857,6 +1861,8 @@ version = "0.1.0"
 dependencies = [
  "tessera-device",
  "tessera-graph",
+ "tessera-kernels",
+ "tessera-linear",
  "tessera-lower",
  "tessera-testkit",
 ]
@@ -2165,6 +2171,8 @@ dependencies = [
  "tessera-graph",
  "tessera-interp",
  "tessera-lower",
+ "tessera-rules",
+ "tessera-run",
  "tessera-testkit",
  "tessera-trace",
 ]
