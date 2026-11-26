@@ -135,8 +135,8 @@ struct PlanSmem { u16 ids[8][PICKS], slot_of[128]; float gates[8][PICKS]; u32 em
 struct RouteTcSmem { u32 sxh[4][16][36], sxl[4][16][36]; union { struct { u32 h[8][8][36], l[8][8][36]; } sw; float4 red[4][2][32]; } u; };
 struct RoutePfSmem { u32 sx[64][36], sw[64][36]; };
 union RouteBfSmem {
-  struct { u32 sxh[16][36], sxl[16][36], sw[128][36]; } k;
-  struct { float sc[16][256]; u16 ids[8][PICKS]; float gates[8][PICKS]; } p;
+  struct { u32 sxh[32][36], sxl[32][36], sw[64][36]; } k;
+  struct { float sc[32][256]; u16 ids[8][PICKS]; float gates[8][PICKS]; } p;
 };
 union alignas(16) RouteSmem { float wsum[2][8][8]; RouteTcSmem tc; RoutePfSmem pf; RouteBfSmem bf; PlanSmem plan; };
 
@@ -200,51 +200,49 @@ static __device__ inline void load_w_tf32(
   w1 = make_uint4(f32_to_tf32(v1.x), f32_to_tf32(v1.y), f32_to_tf32(v1.z), f32_to_tf32(v1.w));
 }
 
-// Fused 16x256 BF16 Tensor-Core router with in-smem parallel top-8.
+// Fused 32x256 BF16 Tensor-Core router with in-smem parallel top-8.
 static __device__ __noinline__ void route_pf_bf16(
     const float* x, const u16* router, const float* bias, float* plan_out,
     RouteBfSmem& sm, u32 rows, u32 hidden, u32 picks, u32 first, u32 count) {
   u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
-  u32 r0 = blockIdx.y << 4u, xr = tid >> 4u, xc = (tid & 15u) << 2u, xw = (tid & 15u) << 1u;
-  u32 wr = (warp << 2u) + (lane >> 3u), wc = (lane & 7u) << 3u;
+  u32 r0 = blockIdx.y << 5u, xr = tid >> 4u, xc = (tid & 15u) << 2u, xw = (tid & 15u) << 1u;
+  u32 wr = tid >> 3u, wc = (tid & 7u) << 3u;
   bool aligned = (reinterpret_cast<u64>(router) & 15ull) == 0ull;
-  float acc[4][4] = {};
-  uint4 nw[4];
-  for (u32 i = 0u; i < 4u; i++) nw[i] = load_bf16x8(router + (u64)(wr + (i << 5u)) * hidden + wc, aligned);
+  float acc[2][4][4] = {};
+  uint4 nw[2] = {load_bf16x8(router + (u64)wr * hidden + wc, aligned), load_bf16x8(router + (u64)(wr + 32u) * hidden + wc, aligned)};
   for (u32 k0 = 0u; k0 < hidden; k0 += 64u) {
     stage_x_bf16(x, r0 + xr, rows, hidden, k0 + xc, &sm.k.sxh[xr][xw], &sm.k.sxl[xr][xw]);
-    for (u32 h = 0u; h < 2u; h++) {
-      for (u32 i = 0u; i < 4u; i++) *reinterpret_cast<uint4*>(&sm.k.sw[wr + (i << 5u)][wc >> 1u]) = nw[i];
+    stage_x_bf16(x, r0 + xr + 16u, rows, hidden, k0 + xc, &sm.k.sxh[xr + 16u][xw], &sm.k.sxl[xr + 16u][xw]);
+    for (u32 h = 0u; h < 4u; h++) {
+      *reinterpret_cast<uint4*>(&sm.k.sw[wr][wc >> 1u]) = nw[0]; *reinterpret_cast<uint4*>(&sm.k.sw[wr + 32u][wc >> 1u]) = nw[1];
       prim::block_sync();
-      u32 nh = h ^ 1u, nk0 = h ? (k0 + 64u) : k0;
-      if (nk0 < hidden) for (u32 i = 0u; i < 4u; i++) nw[i] = load_bf16x8(router + (u64)((nh << 7u) + wr + (i << 5u)) * hidden + nk0 + wc, aligned);
+      u32 nh = (h + 1u) & 3u, nk0 = (h == 3u) ? (k0 + 64u) : k0;
+      if (nk0 < hidden) { u32 eb = (nh << 6u) + wr; nw[0] = load_bf16x8(router + (u64)eb * hidden + nk0 + wc, aligned); nw[1] = load_bf16x8(router + (u64)(eb + 32u) * hidden + nk0 + wc, aligned); }
 #pragma unroll
       for (u32 ks = 0u; ks < 4u; ks++) {
-        u32 o = (ks << 3u) + t, e0 = (warp << 4u) + g;
-        u32 ah[4] = {sm.k.sxh[g][o], sm.k.sxh[g + 8u][o], sm.k.sxh[g][o + 4u], sm.k.sxh[g + 8u][o + 4u]};
-        u32 al[4] = {sm.k.sxl[g][o], sm.k.sxl[g + 8u][o], sm.k.sxl[g][o + 4u], sm.k.sxl[g + 8u][o + 4u]};
-        u32 b0[2] = {sm.k.sw[e0][o], sm.k.sw[e0][o + 4u]}, b1[2] = {sm.k.sw[e0 + 8u][o], sm.k.sw[e0 + 8u][o + 4u]};
-        mma_bf16_m16n8k16(acc[h * 2u], ah, b0); mma_bf16_m16n8k16(acc[h * 2u], al, b0);
-        mma_bf16_m16n8k16(acc[h * 2u + 1u], ah, b1); mma_bf16_m16n8k16(acc[h * 2u + 1u], al, b1);
+        u32 o = (ks << 3u) + t, e0 = (warp << 3u) + g, b[2] = {sm.k.sw[e0][o], sm.k.sw[e0][o + 4u]};
+#pragma unroll
+        for (u32 mi = 0u; mi < 2u; mi++) {
+          u32 mr = mi << 4u;
+          u32 ah[4] = {sm.k.sxh[mr + g][o], sm.k.sxh[mr + g + 8u][o], sm.k.sxh[mr + g][o + 4u], sm.k.sxh[mr + g + 8u][o + 4u]};
+          u32 al[4] = {sm.k.sxl[mr + g][o], sm.k.sxl[mr + g + 8u][o], sm.k.sxl[mr + g][o + 4u], sm.k.sxl[mr + g + 8u][o + 4u]};
+          mma_bf16_m16n8k16(acc[mi][h], ah, b); mma_bf16_m16n8k16(acc[mi][h], al, b);
+        }
       }
       prim::block_sync();
     }
   }
-  for (u32 h = 0u; h < 2u; h++) for (u32 nt = 0u; nt < 2u; nt++) {
-    u32 col = (h << 7u) + (warp << 4u) + (nt << 3u) + (t << 1u);
-    float* a = acc[h * 2u + nt];
-    *reinterpret_cast<float2*>(&sm.p.sc[g][col]) = make_float2(1.f / (1.f + __expf(-a[0])), 1.f / (1.f + __expf(-a[1])));
-    *reinterpret_cast<float2*>(&sm.p.sc[g + 8u][col]) = make_float2(1.f / (1.f + __expf(-a[2])), 1.f / (1.f + __expf(-a[3])));
+  for (u32 mi = 0u; mi < 2u; mi++) for (u32 h = 0u; h < 4u; h++) {
+    u32 col = (h << 6u) + (warp << 3u) + (t << 1u), rr = (mi << 4u) + g;
+    float* a = acc[mi][h];
+    *reinterpret_cast<float2*>(&sm.p.sc[rr][col]) = make_float2(1.f / (1.f + __expf(-a[0])), 1.f / (1.f + __expf(-a[1])));
+    *reinterpret_cast<float2*>(&sm.p.sc[rr + 8u][col]) = make_float2(1.f / (1.f + __expf(-a[2])), 1.f / (1.f + __expf(-a[3])));
   }
   prim::block_sync();
   Plan* plan = reinterpret_cast<Plan*>(plan_out);
-  for (u32 dr = warp; dr < 16u && r0 + dr < rows; dr += 8u) {
-    route_256(&sm.p.sc[0][0], bias, dr, 16u, 0u, false, sm.p.ids[warp], sm.p.gates[warp]);
-    if (lane < picks) {
-      u32 e = sm.p.ids[warp][lane];
-      plan->tok_expert[r0 + dr][lane] = (e >= first && e < first + count) ? e : 0xFFFFFFFFu;
-      plan->tok_w[r0 + dr][lane] = sm.p.gates[warp][lane];
-    }
+  for (u32 dr = warp; dr < 32u && r0 + dr < rows; dr += 8u) {
+    route_256(&sm.p.sc[0][0], bias, dr, 32u, 0u, false, sm.p.ids[warp], sm.p.gates[warp]);
+    if (lane < picks) { u32 e = sm.p.ids[warp][lane]; plan->tok_expert[r0 + dr][lane] = (e >= first && e < first + count) ? e : 0xFFFFFFFFu; plan->tok_w[r0 + dr][lane] = sm.p.gates[warp][lane]; }
     __syncwarp();
   }
 }

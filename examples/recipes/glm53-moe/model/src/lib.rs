@@ -186,7 +186,7 @@ fn offer(site: &Site) -> Option<Vec<Offer>> {
     let (route_x, route_y, rks) = if rows == 1 && bf16 == 1 && experts % 2 == 0 && hidden % 8 == 0 {
         (experts / 2, 1, 1)
     } else if rows >= 64 && bf16 == 1 && experts == 256 && hidden % 64 == 0 {
-        (1, rows.div_ceil(16), 1)
+        (1, rows.div_ceil(32), 1)
     } else if rows >= 64 && experts % 64 == 0 && hidden % 32 == 0 {
         let rm = if rows >= 512 { 64 } else { 32 };
         let nb = experts / 64;
