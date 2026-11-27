@@ -2,9 +2,27 @@ use super::{
     ACTIVE, CheckConfig, PtxStats, TempDir, check_source, eval_entry, find_ptxas, parse_ptxas,
     ptx_entries, sm_target, start, target_platform,
 };
+use crate::Run;
 use std::collections::HashMap;
-use tessera_engine_settings::Settings;
+use tessera_engine_comm::{Error as CommError, Transport};
+use tessera_engine_settings::{Backend, Pick, Settings};
 use tessera_lower::Plan;
+
+struct DummyRank;
+
+impl Transport for DummyRank {
+    fn rank(&self) -> u32 {
+        0
+    }
+
+    fn ranks(&self) -> u32 {
+        2
+    }
+
+    fn exchange(&mut self, mine: &[u8]) -> Result<Vec<Vec<u8>>, CommError> {
+        Ok(vec![mine.to_vec(); 2])
+    }
+}
 
 #[test]
 fn parses_ptxas_states() {
@@ -94,6 +112,18 @@ fn isolates_sessions() {
         assert!(!runner.device().contains("offline check"));
     });
     other.join().unwrap();
+
+    let ranked_plan = Plan {
+        ranks: 2,
+        rank: 0,
+        ..Plan::default()
+    };
+    let gpu_settings = Settings {
+        backend: Pick::Gpu(Backend::Cuda),
+        ..Settings::default()
+    };
+    let ranked = crate::Rank::open(ranked_plan, &gpu_settings, DummyRank).unwrap();
+    assert!(ranked.device().contains("offline check"));
 
     let cfg = CheckConfig {
         run_ptxas: false,

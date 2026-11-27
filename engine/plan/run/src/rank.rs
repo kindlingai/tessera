@@ -290,11 +290,16 @@ impl<T: Transport> Rank<T> {
     pub fn open(plan: Plan, settings: &Settings, transport: T) -> Result<Self, Error> {
         check_rank(&plan, &transport)?;
         crate::configure(settings);
-        let runner =
+        let runner = if let Some(checker) = crate::check::open(&plan) {
+            Inner::Plain(checker)
+        } else if let Some(sizer) = crate::sizer::Sizer::open(&plan, settings) {
+            Inner::Plain(sizer)
+        } else {
             match tessera_gpukit::backend::dispatch(settings.gpu(), OpenRank(plan, settings)) {
                 Ok(run) => Inner::Device(run?),
                 Err(OpenRank(plan, _)) => Inner::Plain(open(plan, settings)?),
-            };
+            }
+        };
         Ok(Self {
             runner,
             transport,
