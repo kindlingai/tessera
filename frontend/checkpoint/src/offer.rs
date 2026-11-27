@@ -55,7 +55,7 @@ impl Slice {
 }
 
 /// A checkpoint: slices listed up front, bytes read on demand.
-pub trait Offer {
+pub trait Offer: Send + Sync {
     fn slices(&self) -> Vec<Slice>;
     /// Slice `name` widened to f32.
     fn floats(&self, name: &str) -> Result<Vec<f32>, Error>;
