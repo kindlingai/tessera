@@ -1,10 +1,9 @@
-//! Device CUDA rules for attention, MoE and calibration.
+//! Device CUDA rules for attention and calibration.
 
 mod attend;
 pub mod calib;
 #[cfg(test)]
 mod calib_test;
-mod moe;
 
 use tessera_device::{Backend, flatten_for};
 

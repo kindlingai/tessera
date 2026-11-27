@@ -4,6 +4,7 @@
 mod device_test;
 mod gemv;
 pub(crate) mod mm;
+mod moe;
 mod stacked;
 #[cfg(test)]
 mod stacked_test;
@@ -23,6 +24,7 @@ use tessera_lower::{
 const KERNEL: &str = include_str!("linear.cu");
 const PREFILL: &str = include_str!("prefill.cu");
 const INT4: &str = include_str!("int4.cu");
+const TRELLIS: &str = include_str!("trellis.cu");
 const BLOCK: usize = 128;
 const WIDE_COLS: usize = 32;
 const WIDE_THREADS: usize = 128;
@@ -36,29 +38,35 @@ pub(crate) fn cuda_source() -> &'static str {
     CUDA.get_or_init(|| flatten_for(Backend::Cuda, "linear.kernel", KERNEL))
 }
 
-pub(crate) fn prefill_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "prefill.kernel", PREFILL))
+macro_rules! flat_source {
+    ($source:ident, $with:ident, $name:literal, $text:ident) => {
+        pub(crate) fn $source() -> &'static str {
+            static CUDA: OnceLock<&'static str> = OnceLock::new();
+            CUDA.get_or_init(|| flatten_for(Backend::Cuda, $name, $text))
+        }
+
+        fn $with<'a>(
+            entry: &'static str,
+            defs: impl IntoIterator<Item = (&'a str, usize)>,
+        ) -> Source {
+            tessera_device::cuda_source_with($source(), entry, defs)
+        }
+    };
 }
 
-fn prefill_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(prefill_source(), entry, defs)
-}
-
-pub(crate) fn int4_source() -> &'static str {
-    static INT4_SRC: OnceLock<&'static str> = OnceLock::new();
-    INT4_SRC.get_or_init(|| flatten_for(Backend::Cuda, "int4.kernel", INT4))
-}
-
-fn int4_source_with<'a>(
-    entry: &'static str,
-    defs: impl IntoIterator<Item = (&'a str, usize)>,
-) -> Source {
-    tessera_device::cuda_source_with(int4_source(), entry, defs)
-}
+flat_source!(
+    prefill_source,
+    prefill_source_with,
+    "prefill.kernel",
+    PREFILL
+);
+flat_source!(
+    trellis_source,
+    trellis_source_with,
+    "trellis.kernel",
+    TRELLIS
+);
+flat_source!(int4_source, int4_source_with, "int4.kernel", INT4);
 
 #[cfg(test)]
 pub(crate) fn hip_source() -> &'static str {
@@ -159,7 +167,7 @@ fn dtr_source(t: &TrellisMma) -> Source {
         "dtr_k4_t4" => "DTR_T4_BLK",
         _ => "DTR_GEN_BLK",
     };
-    cuda_source_with(
+    trellis_source_with(
         entry,
         x_defs(t.min_blocks.map(|v| (def, v as usize)), t.x_bf16),
     )
@@ -288,7 +296,7 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     emits = f32_only,
     needs = dtr_needs(0),
     order = Order::PerConfig,
-    source = cuda_source_with(
+    source = trellis_source_with(
         "dtr_reduce",
         self.min_blocks.map(|v| ("DTR_RED_BLK", v as usize)),
     ),

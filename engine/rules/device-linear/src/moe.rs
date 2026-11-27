@@ -1,15 +1,12 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
-use crate::flatten_cuda;
-use std::sync::OnceLock;
-use tessera_device::{CUDA_LACKS, cuda_rule};
+use crate::{CUDA_LACKS, cuda_rule, trellis_source_with};
 use tessera_graph::Order;
 use tessera_lower::form::Load as Stored;
 use tessera_lower::sites::Coded;
 use tessera_lower::{Draft, Kernel, Launch, Load, Needs, Shape, Source, Step, T, Tree};
 use tessera_mem::trellis::parse_form;
 
-const KERNEL: &str = include_str!("trellis.cu");
 const BLOCK: usize = 128;
 const THREADS: usize = 256;
 const SMEM: usize = 4096 * 4;
@@ -17,11 +14,6 @@ const SMEM: usize = 4096 * 4;
 tessera_lower::knob!("picked_trellis", "chunk", 1, 4);
 tessera_lower::knob!("picked_trellis", "min_blocks", 1, 16);
 tessera_lower::knob!("picked_trellis", "gen_min_blocks", 1, 16);
-
-fn cuda_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_cuda("moe_trellis.kernel", KERNEL))
-}
 
 fn entry_name(k: &PickedTrellis) -> &'static str {
     if k.site.turned && k.bits == 3 && k.book == 2 {
@@ -31,7 +23,7 @@ fn entry_name(k: &PickedTrellis) -> &'static str {
     }
 }
 
-fn trellis_source(k: &PickedTrellis) -> Source {
+fn picked_source(k: &PickedTrellis) -> Source {
     let entry = entry_name(k);
     let mut defs = Vec::new();
     if let Some(c) = k.chunk {
@@ -47,7 +39,7 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     if k.site.x_bf16 {
         defs.push(("X_BF16", 1));
     }
-    tessera_device::cuda_source_with(cuda_source(), entry, defs)
+    trellis_source_with(entry, defs)
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -59,7 +51,7 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     emits = emits,
     needs = needs(),
     order = Order::PerConfig,
-    source = trellis_source(self),
+    source = picked_source(self),
     launches = launches,
     load = load,
     load_key = tessera_lower::load_key((

@@ -1,5 +1,5 @@
 use crate::mm::{propose_mm, propose_mm_mx8};
-use crate::{cuda_source, hip_source, prefill_source};
+use crate::{cuda_source, hip_source, prefill_source, trellis_source};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
 use tessera_kernels as _;
@@ -110,8 +110,6 @@ fn linear_mm_entries() {
         "tessera_mm_mxfp8_r16(",
         "tessera_mm_mxfp8_r64(",
         "tessera_mm_mxfp8_r64_sk(",
-        "DTR_DEF(dtr_k4_t4,",
-        "dtr_gen4(",
     ] {
         assert!(cuda.contains(entry), "missing {entry}");
     }
@@ -126,6 +124,9 @@ fn linear_mm_entries() {
         "tessera_mm_mxfp8_mx8_sk(",
     ] {
         assert!(prefill_source().contains(entry), "missing {entry}");
+    }
+    for entry in ["DTR_DEF(dtr_k4_t4,", "DTR_GEN_DEF(dtr_gen4,", "ptr_gen("] {
+        assert!(trellis_source().contains(entry), "missing {entry}");
     }
 }
 

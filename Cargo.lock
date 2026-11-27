@@ -1878,6 +1878,7 @@ dependencies = [
  "tessera-kernels",
  "tessera-linear",
  "tessera-lower",
+ "tessera-mem",
  "tessera-testkit",
 ]
 
@@ -1888,7 +1889,6 @@ dependencies = [
  "tessera-device",
  "tessera-graph",
  "tessera-lower",
- "tessera-mem",
  "tessera-testkit",
 ]
 
