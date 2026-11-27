@@ -34,7 +34,9 @@ pub use cut::{cut, cut_region};
 pub use error::{Size, Unsupported};
 pub use extent::Extent;
 pub use form::{Filed, Pins, Site, Weight};
-pub use kernel::{COMMIT, Collective, Keeping, Kernel, KernelRef, Needs, PEEK, Resident, UNPROVEN};
+pub use kernel::{
+    COMMIT, Collective, Keeping, Kernel, KernelRef, Needs, PEEK, Resident, UNPROVEN, load_key,
+};
 pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{
     Compute, Dtype, KNOBS, Knob, Knobs, Launching, Recipe, Scoped, Wires, find_knob, labels,

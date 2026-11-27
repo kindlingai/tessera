@@ -25,6 +25,7 @@ pub(super) fn mxfp8_pre_len(m: usize, k: usize) -> usize {
     launches = mx8_prep_launches,
     shape = Shape::grid(((self.k / 32).div_ceil(32), self.m), 256),
     load = mx8_prep_load,
+    load_key = tessera_lower::load_key((self.m, self.k, self.min_blocks)),
     shared,
     unproven,
 )]
@@ -99,6 +100,9 @@ fn mx8_prep_launches(p: &Mxfp8Prep, step: &Step) -> Vec<Launch> {
     launches = mx8_mm_launches,
     shape = Shape::grid((self.n.div_ceil(128) * self.ks, self.m.div_ceil(128)), 256),
     load = mx8_mm_load,
+    load_key = tessera_lower::load_key((
+        self.m, self.n, self.k, self.ks, self.mode, self.min_blocks, self.form.name(),
+    )),
     unproven,
 )]
 pub(super) struct Mxfp8Mx8 {

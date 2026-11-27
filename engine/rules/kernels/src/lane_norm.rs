@@ -401,6 +401,11 @@ fn rms_norm_lanes<const WIDE: u32>(
     emits = norm_emits,
     source = norm_source,
     load = norm_load,
+    load_key = tessera_lower::load_key((
+        self.rows, self.width, self.eps.to_bits(), self.weighted, self.block,
+        self.warps, self.cache_trips, self.ahead,
+        self.x_form.name(), self.w_form.name(), self.out_form.name(),
+    )),
     unproven,
 )]
 pub(crate) struct LaneNorm {

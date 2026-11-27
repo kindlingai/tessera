@@ -10,7 +10,7 @@ use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{Arg, Draft, Kernel, Launch, Load, Needs, Read, Shape, Step, T, Term, Tree};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MmKind {
     Bf16,
     Bf16Split,
@@ -274,6 +274,9 @@ fn mxfp8_tile_ks(
     launches = mm_launches,
     shape = Shape::grid(self.kind.grid(self.m, self.n, self.ks), self.kind.threads()),
     load = mm_load,
+    load_key = tessera_lower::load_key((
+        self.m, self.n, self.k, self.ks, self.mode, self.min_blocks, self.kind, self.form.name(),
+    )),
     unproven,
 )]
 struct FastMm {
@@ -405,6 +408,7 @@ fn mm_launches(k: &FastMm, step: &Step) -> Vec<Launch> {
     ),
     launches = mm_red_launches,
     load = mm_red_load,
+    load_key = tessera_lower::load_key((self.m, self.n, self.ks, self.mode, self.min_blocks)),
     unproven,
 )]
 struct FastMmReduce {

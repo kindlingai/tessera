@@ -3,7 +3,9 @@
 use crate::abi::{Arg, Launch, Shape, Source};
 use crate::extent::Extent;
 use crate::plan::Step;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 use tessera_engine_settings::Backend;
@@ -14,6 +16,13 @@ use tessera_work::Load;
 
 /// Seconds per unit of work for an unmeasured kernel.
 pub const UNPROVEN: f64 = 1e-9;
+
+/// Hashes explicit `load()` inputs into a cache key.
+pub fn load_key(inputs: impl Hash) -> u64 {
+    let mut h = DefaultHasher::new();
+    inputs.hash(&mut h);
+    h.finish()
+}
 
 /// One kernel with its sizes. Any crate may add one.
 pub trait Kernel: fmt::Debug + Send + Sync {

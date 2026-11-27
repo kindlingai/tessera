@@ -653,6 +653,7 @@ fn flash_rows(
     source = flash_source,
     launches = flash_launches,
     load = flash_load,
+    load_key = tessera_lower::load_key((self.0.load_key(), self.1, self.2)),
     unproven,
 )]
 pub(crate) struct Flash(pub Attn, pub u32, pub bool);
@@ -806,6 +807,7 @@ fn flash_needs(a: &Attn, bk: u32, held: bool) -> Needs {
     source = rows_source,
     launches = rows_launches,
     load = rows_load,
+    load_key = self.0.load_key(),
 )]
 pub(crate) struct FlashRows(pub Attn);
 

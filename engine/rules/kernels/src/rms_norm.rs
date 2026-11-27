@@ -46,6 +46,7 @@ fn rms_norm<const WEIGHTED: bool>(
         body.trip(),
         4.0 * self.width as f64 * f64::from(self.weighted),
     )),
+    load_key = tessera_lower::load_key((self.rows, self.width, self.eps.to_bits(), self.weighted)),
 )]
 pub struct RmsNorm {
     pub rows: usize,

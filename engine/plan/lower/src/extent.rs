@@ -2,7 +2,7 @@
 
 use tessera_graph::DimName;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Extent {
     Fixed(usize),
     /// `mul` times the dimension's value, plus `add`.

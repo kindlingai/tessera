@@ -58,6 +58,17 @@ pub(crate) struct RopeTail {
     source = stacked_source_for(self),
     launches = stacked_launches,
     load = stacked_load,
+    load_key = tessera_lower::load_key((
+        (self.len, self.batches, self.rows, self.n, self.k, self.block, self.first, self.step),
+        (self.x_stride, self.o_stride, self.wide, self.tiled64_min_rows, self.min_blocks),
+        (
+            self.rope.map(|r| (
+                r.width, r.rot_stride, r.rot_off, r.turned, r.adjacent,
+                r.rope_first, r.theta.to_bits(),
+            )),
+            self.form.name(),
+        ),
+    )),
     unproven,
 )]
 pub(crate) struct FastStacked {

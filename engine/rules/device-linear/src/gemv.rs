@@ -14,7 +14,7 @@ tessera_lower::knob!("fast_gemv_bf16", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_gemv_mxfp8", "min_blocks", 1, 16);
 tessera_lower::knob!("fast_gemv_int4_g32", "min_blocks", 1, 16);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum GemvKind {
     Bf16,
     Bf16Narrow,
@@ -100,6 +100,10 @@ impl GemvKind {
         threads: self.warps * 32,
     },
     load = gemv_load,
+    load_key = tessera_lower::load_key((
+        self.n, self.k, self.mode, self.a.to_bits(), self.b.to_bits(),
+        self.warps, self.custom_warps, self.min_blocks, self.kind, self.form.name(),
+    )),
     unproven,
 )]
 struct FastGemv {

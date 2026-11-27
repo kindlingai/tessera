@@ -28,6 +28,14 @@ norm_knobs!("add_rms_norm");
     emits_at = add_norm_emits_at,
     source = add_norm_source,
     load = add_norm_load,
+    load_key = tessera_lower::load_key((
+        (self.rows, self.width, self.eps.to_bits(), self.add3, self.weighted, self.save_sum),
+        (self.block, self.warps, self.cache_trips, self.ahead),
+        (
+            self.a_form.name(), self.b_form.name(), self.c_form.name(),
+            self.w_form.name(), self.out_form.name(),
+        ),
+    )),
     unproven,
 )]
 pub(crate) struct AddLaneNorm {

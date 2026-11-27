@@ -78,6 +78,7 @@ fn sum_lanes<const WIDE: u32, const DIVIDE: bool>(
     },
     threads = self.rows,
     load = Some(per_row(self.rows, self.width, body.trip(), 0.0)),
+    load_key = tessera_lower::load_key((self.rows, self.width, self.divide)),
 )]
 pub(crate) struct BySum {
     pub rows: usize,
@@ -100,6 +101,7 @@ pub(crate) struct BySum {
     // Rows sum alike at any count. Other kernels differ.
     order = Order::PerConfig,
     load = Some(per_lane_row(self.rows, self.width, body.trip(), 0.0)),
+    load_key = tessera_lower::load_key((self.rows, self.width, self.divide, self.ahead)),
     unproven,
 )]
 pub(crate) struct LaneSum {

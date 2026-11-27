@@ -583,3 +583,115 @@ fn unmeasured_map_order_independent() {
     assert_eq!(u_ba.seconds(&u_scale, len), fresh_u_scale);
     assert_eq!(u_ba.seconds(&u_add, len), fresh_u_add);
 }
+
+thread_local! {
+    static DERIVED_LOADS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Debug, Kernel)]
+#[launch(
+    name = "derived_keyed",
+    sizes = [16],
+    source = Map::plain(vec![MapStage::Add]).source(),
+    launches = Vec::new(),
+    load = derived_keyed_load,
+    load_key = tessera_lower::load_key(self.scale),
+)]
+struct DerivedKeyed {
+    scale: bool,
+}
+
+fn derived_keyed_load(k: &DerivedKeyed, len: usize) -> Option<tessera_lower::Load> {
+    DERIVED_LOADS.with(|n| n.set(n.get() + 1));
+    let stage = if k.scale {
+        MapStage::Scale(1.5)
+    } else {
+        MapStage::Add
+    };
+    Map::plain(vec![stage]).load(len)
+}
+
+struct LoadPolicy {
+    binary: bool,
+}
+
+impl std::fmt::Debug for LoadPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoadPolicy")
+    }
+}
+
+#[derive(Debug, Kernel)]
+#[launch(
+    name = "derived_policy",
+    sizes = [16],
+    source = self.map().source(),
+    launches = Vec::new(),
+    load = self.map().load(len),
+)]
+struct PolicyKernel {
+    policy: LoadPolicy,
+}
+
+impl PolicyKernel {
+    fn map(&self) -> Map {
+        let stage = if self.policy.binary {
+            MapStage::Add
+        } else {
+            MapStage::Scale(1.5)
+        };
+        Map::plain(vec![stage])
+    }
+}
+
+#[test]
+fn derived_load_key_explicit() {
+    let len = 16_777_216;
+    let a = DerivedKeyed { scale: false };
+    let b = DerivedKeyed { scale: true };
+    assert!(a.load_key().is_some());
+    assert!(b.load_key().is_some());
+    assert_ne!(a.load_key(), b.load_key());
+
+    let dev = gb10_device();
+    DERIVED_LOADS.with(|n| n.set(0));
+    let sa = dev.seconds(&a, len);
+    for _ in 0..100 {
+        assert_eq!(dev.seconds(&a, len), sa);
+    }
+    assert_eq!(DERIVED_LOADS.with(Cell::get), 1);
+
+    let sb = dev.seconds(&b, len);
+    assert_eq!(DERIVED_LOADS.with(Cell::get), 2);
+    assert_ne!(sa, sb);
+    assert_eq!(sa, gb10_device().seconds(&a, len));
+    assert_eq!(sb, gb10_device().seconds(&b, len));
+
+    // Order-independent across reversed evaluation order.
+    let rev = gb10_device();
+    assert_eq!(rev.seconds(&b, len), sb);
+    assert_eq!(rev.seconds(&a, len), sa);
+
+    // Missing load_key stays uncached even with equal Debug text.
+    let pa = PolicyKernel {
+        policy: LoadPolicy { binary: true },
+    };
+    let pb = PolicyKernel {
+        policy: LoadPolicy { binary: false },
+    };
+    assert_eq!(format!("{pa:?}"), format!("{pb:?}"));
+    assert_eq!(pa.load_key(), None);
+    assert_eq!(pb.load_key(), None);
+
+    let fa = gb10_device().seconds(&pa, len);
+    let fb = gb10_device().seconds(&pb, len);
+    assert_ne!(fa, fb);
+
+    let ab = gb10_device();
+    assert_eq!(ab.seconds(&pa, len), fa);
+    assert_eq!(ab.seconds(&pb, len), fb);
+
+    let ba = gb10_device();
+    assert_eq!(ba.seconds(&pb, len), fb);
+    assert_eq!(ba.seconds(&pa, len), fa);
+}

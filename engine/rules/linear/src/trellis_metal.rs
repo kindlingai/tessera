@@ -128,6 +128,9 @@ fn metal_needs(t: &TrellisMetal) -> Needs {
     source = fixed(entry(self)),
     launches = launches,
     load = load,
+    load_key = tessera_lower::load_key((
+        self.shape, self.splits, self.mid_rows, self.bits, self.book, self.turned, self.form.name(),
+    )),
 )]
 struct TrellisMetal {
     shape: [usize; 3],
@@ -198,6 +201,7 @@ fn launches(t: &TrellisMetal, step: &Step) -> Vec<Launch> {
     source = fixed("tm_reduce"),
     launches = reduce_launches,
     load = reduce_load,
+    load_key = tessera_lower::load_key((self.shape, self.splits, self.turned)),
 )]
 struct MetalReduce {
     shape: [usize; 2],

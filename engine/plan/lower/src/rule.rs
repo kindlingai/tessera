@@ -51,6 +51,22 @@ impl Attn {
         ]
     }
 
+    /// Hash of every field affecting attention `load()`.
+    pub fn load_key(&self) -> u64 {
+        crate::load_key((
+            (
+                self.seqs,
+                self.queries,
+                self.keys,
+                self.heads,
+                self.kv_heads,
+                self.width,
+            ),
+            (self.context, self.kept.name(), self.segments, self.mask),
+            (self.k_form.name(), self.v_form.name(), self.out_form.name()),
+        ))
+    }
+
     /// The most keys one query sees.
     pub fn seen(&self) -> usize {
         let keys = self.keys.most();

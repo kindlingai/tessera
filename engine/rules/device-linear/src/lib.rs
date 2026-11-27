@@ -193,7 +193,12 @@ macro_rules! dtr_mma_kernel {
             work = self.m * self.n * self.k,
             accepts = $accepts, emits = f32_only,
             needs = dtr_needs($smem), order = Order::PerConfig,
-            source = $source(self), launches = $launches, load = $load, unproven,
+            source = $source(self), launches = $launches, load = $load,
+            load_key = tessera_lower::load_key((
+                self.m, self.n, self.k, $(self.$extra,)? self.tile, self.min_blocks,
+                self.bits, self.book, self.turned, self.form.name(),
+            )),
+            unproven,
         )]
         struct $name {
             m: usize,
@@ -284,6 +289,7 @@ fn mma_launches(t: &TrellisMma, step: &Step) -> Vec<Launch> {
     ),
     launches = reduce_launches,
     load = reduce_load,
+    load_key = tessera_lower::load_key((self.m, self.n, self.ks, self.min_blocks, self.turned)),
     unproven,
 )]
 struct TrellisReduce {
@@ -369,6 +375,7 @@ fn dtr_pre_source(t: &TrellisPreMma) -> Source {
     ),
     launches = prep_launches,
     load = prep_load,
+    load_key = tessera_lower::load_key((self.m, self.k, self.min_blocks, self.turned)),
     shared,
     unproven,
 )]

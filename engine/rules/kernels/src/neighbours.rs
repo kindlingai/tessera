@@ -58,6 +58,7 @@ fn neighbours(
         flight: 4.0,
         ..Load::default()
     }),
+    load_key = tessera_lower::load_key((self.len, self.pixels, self.cin, self.cout)),
 )]
 pub(crate) struct Neighbours {
     pub len: usize,

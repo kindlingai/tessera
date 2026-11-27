@@ -159,7 +159,7 @@ pub struct Delta {
     pub state: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mask {
     /// Query and key ends align, so queries see earlier keys.
     Causal,

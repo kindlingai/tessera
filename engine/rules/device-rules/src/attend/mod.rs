@@ -20,7 +20,7 @@ const MLA_LATENT: usize = 512;
 const GQA_WIDTH: usize = 128;
 const RING_SHIFT: usize = 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AttendKind {
     Mla,
     Gqa,
@@ -135,7 +135,7 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
         }),
     ),
     launches = attend_launches,
-    load = attend_load,
+    load = attend_load, load_key = tessera_lower::load_key(((self.kind, self.rows, self.heads, self.kv_heads, self.out_width, self.keys), (self.context, self.kept.name(), self.picks, self.from_list, self.has_sinks), (self.scale.to_bits(), self.window, self.splits, self.min_blocks))),
     unproven,
 )]
 struct SplitAttend {
@@ -275,7 +275,7 @@ fn attend_launches(k: &SplitAttend, step: &Step) -> Vec<Launch> {
     order = Order::PerConfig,
     source = reduce_source(self),
     launches = red_launches,
-    load = red_load,
+    load = red_load, load_key = tessera_lower::load_key((self.kind, self.lists, self.splits, self.out_width, self.threads, self.custom_threads, self.min_blocks)),
     unproven,
 )]
 struct SplitReduce {
@@ -596,7 +596,7 @@ fn idx_kv_entry(kv: &str, qt: bool) -> Option<&'static str> {
         },
     ),
     launches = idx_launches,
-    load = idx_load,
+    load = idx_load, load_key = tessera_lower::load_key(((self.rows, self.out_keys, self.keys, self.context, self.kept.name(), self.heads), (self.dim, self.masked, self.qt, self.tile_keys, self.min_blocks, self.qt_min_blocks), (self.k_form.name(), self.entry))),
     unproven,
 )]
 struct FastIndexer {

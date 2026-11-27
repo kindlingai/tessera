@@ -98,6 +98,10 @@ fn stacked(
     needs = if self.mode == MODE_LANES { Needs::lanes() } else { Needs::default() },
     order = Order::PerConfig,
     load = stacked_load,
+    load_key = tessera_lower::load_key((
+        self.len, self.rows, self.n, self.k, self.block, self.first,
+        self.col_step, self.k_step, self.form.name(), self.mode, self.ahead,
+    )),
 )]
 pub(crate) struct Stacked {
     pub len: usize,
