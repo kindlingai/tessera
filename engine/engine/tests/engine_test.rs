@@ -8,7 +8,7 @@ use common::{
 };
 use std::sync::{Arc, Mutex};
 use tessera_engine::{
-    Allowed, Asks, Batch, Compute, Engine, Event, Fair, Fault, Guide, Prefix, Read, Reason,
+    Allowed, Asks, Batch, Compute, Engine, Event, Fair, Fault, Guide, Launch, Prefix, Read, Reason,
     Request, Row, Site, Steps,
 };
 use tessera_graph::{
@@ -731,7 +731,7 @@ fn mla_narrow_kept() {
     }
 }
 
-/// `Engine::lowering_report` lowers and sets the row label.
+/// `Engine::lowering_report` lowers and sets the row label. A probe agrees.
 #[test]
 fn engine_lowering_report() {
     let g = stepper::<Norm, Swiglu>(&Config::toy(1, 16));
@@ -743,6 +743,15 @@ fn engine_lowering_report() {
     let r = engine.lowering_report(1).unwrap();
     assert_eq!(r.label, "rows=1");
     assert!(r.total_ops > 0);
+    let probe = engine.probe();
+    let lowered = probe
+        .explain(&Recipe::default(), Launch::Decode(1))
+        .unwrap();
+    assert_eq!(
+        (lowered.report.label, lowered.report.total_ops),
+        (r.label, r.total_ops)
+    );
+    assert!(!lowered.plan.steps.is_empty());
 }
 
 #[test]

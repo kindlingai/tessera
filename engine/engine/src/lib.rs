@@ -25,6 +25,7 @@ mod lanes;
 mod model;
 mod mtp_draft;
 mod ple;
+mod probe;
 mod ranks;
 mod sample;
 #[cfg(test)]
@@ -45,6 +46,7 @@ pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
+pub use probe::{Launch, Lowered, Probe};
 pub use ranks::Place;
 pub use sample::{Sampling, Target, Weights, accept};
 pub use schedule::{Batch, Fair, Parked, Policy, Seq, Sink};

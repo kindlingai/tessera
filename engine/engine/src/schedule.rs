@@ -4,7 +4,7 @@ use crate::guide::{Edit, settle};
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
 use crate::sample::{Sampler, Target, Weights, accept, take};
-use crate::{Allowed, Engine, Error, Event, Reason, Request, Row, ends, launch_of};
+use crate::{Allowed, Engine, Error, Event, Launch, Reason, Request, Row, ends, launch_of};
 use std::collections::VecDeque;
 use tessera_graph::DimName::{Context, Segments};
 use tessera_graph::Role;
@@ -218,29 +218,7 @@ impl Engine {
     }
 
     fn sample_rows(&self, rows: usize, prefill: bool) -> (Vec<Row>, Vec<u32>) {
-        let rows = if prefill {
-            rows.clamp(1, self.context)
-        } else {
-            rows.max(1)
-        };
-        let max_pos = self.context.saturating_sub(1);
-        let sample = (0..rows)
-            .map(|i| Row {
-                slot: if prefill { 0 } else { (i % self.slots) as u32 },
-                token: 0,
-                position: if prefill {
-                    i
-                } else {
-                    (i / self.slots).min(max_pos)
-                } as u32,
-            })
-            .collect();
-        let picks = if prefill {
-            vec![rows as u32 - 1]
-        } else {
-            (0..rows as u32).collect()
-        };
-        (sample, picks)
+        crate::probe::sample(rows, prefill, self.slots, self.context)
     }
 
     fn wants_full(&self) -> Wants {
@@ -252,34 +230,24 @@ impl Engine {
 
     /// Fast-path diagnostic report for a `rows`-row decode launch.
     pub fn lowering_report(&mut self, rows: usize) -> Result<Report, Error> {
-        let (sample, picks) = self.sample_rows(rows, false);
-        self.explained(&sample, &picks)
+        self.explained(Launch::Decode(rows))
     }
 
     /// The report for one prompt's prefill step of `rows`.
     pub fn prefill_report(&mut self, rows: usize) -> Result<Report, Error> {
-        let (sample, picks) = self.sample_rows(rows, true);
-        let mut report = self.explained(&sample, &picks)?;
-        report.label = format!("prefill {}", report.label);
-        Ok(report)
+        self.explained(Launch::Prefill(rows))
     }
 
-    fn explained(&mut self, sample: &[Row], picks: &[u32]) -> Result<Report, Error> {
-        let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
-        let wants = self.wants_full();
-        let upto = &[Context, Segments];
-        let graph = crate::ranks::pick_graph(
-            (&self.graph, &self.owned, &self.split),
-            &self.device,
-            true,
-            filled,
-            &mut sizes,
-        );
-        let mut report = self
-            .plans
-            .explain(graph, self.full, wants, &sizes, upto, &self.device)?;
-        report.label = format!("rows={filled}");
-        Ok(report)
+    fn explained(&mut self, launch: Launch) -> Result<Report, Error> {
+        let view = crate::probe::Lowering {
+            graphs: (&self.graph, &self.owned, &self.split),
+            full: self.full,
+            taps: self.taps.is_some(),
+            slots: self.slots,
+            context: self.context,
+            device: &self.device,
+        };
+        Ok(view.explain(&mut self.plans, launch)?.report)
     }
 
     /// Lowers and compiles plans for `rows` rows.
