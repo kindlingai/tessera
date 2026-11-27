@@ -57,6 +57,7 @@ impl<'a> View<'a> {
         self.layout.len()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.layout.is_empty()
     }
@@ -231,6 +232,7 @@ impl ViewMut<'_> {
         self.layout.len()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.layout.is_empty()
     }

@@ -713,6 +713,7 @@ impl<'a> Tree<'a> {
         self.nodes.len()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

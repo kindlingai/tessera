@@ -262,6 +262,7 @@ impl<'a> Weights<'a> {
         self.at.len()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.at.is_empty()
     }

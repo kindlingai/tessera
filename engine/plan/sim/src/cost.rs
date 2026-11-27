@@ -78,6 +78,7 @@ impl Timings {
         self.0.values().map(Vec::len).sum()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

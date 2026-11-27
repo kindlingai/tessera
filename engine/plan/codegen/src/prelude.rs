@@ -342,6 +342,7 @@ impl Tiles {
 macro_rules! stub {
     (fn [$($doc:tt)*] $name:ident ($($arg:ident),*) -> $ret:ident) => {
         $($doc)*
+        #[allow(dead_code, reason = "kernel bodies call only some intrinsics")]
         pub fn $name($(_: $arg),*) -> $ret {
             device()
         }

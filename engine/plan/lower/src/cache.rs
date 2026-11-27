@@ -145,6 +145,7 @@ impl Cache {
         self.plans.len()
     }
 
+    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
     pub fn is_empty(&self) -> bool {
         self.plans.is_empty()
     }
