@@ -35,6 +35,9 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo clippy --workspace --all-targets
+      # Each GPU backend's code must also build without Linux-only parts.
+      - run: cargo clippy --workspace --all-targets --features cuda
+      - run: cargo clippy --workspace --all-targets --features rocm
       - if: ${{ !inputs.light }}
         run: cargo nextest run --workspace --profile ci
       - run: cargo nextest run -p tessera-linear --test platforms_test --profile ci --no-capture

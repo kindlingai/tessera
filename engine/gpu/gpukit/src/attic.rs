@@ -246,7 +246,7 @@ pub(crate) struct Info {
 
 /// Outcome of an `alloc` request to `atticd`.
 #[cfg_attr(
-    not(any(feature = "cuda", all(test, target_os = "linux"))),
+    not(all(target_os = "linux", any(feature = "cuda", test))),
     allow(dead_code)
 )]
 pub(crate) enum AllocReply {
