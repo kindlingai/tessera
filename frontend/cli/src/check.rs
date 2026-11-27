@@ -64,6 +64,10 @@ pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
         None => run_plan(origin, &parsed)?,
     };
     emit(&report, parsed.json);
+    finish_outcome(&report)
+}
+
+pub(crate) fn finish_outcome(report: &CheckReport) -> Result<(), Stop> {
     if report.kernels.is_empty() {
         return Err(Stop::Failed("empty plan: 0 CUDA kernels captured".into()));
     }
@@ -138,19 +142,22 @@ fn fmt_opt(v: Option<u32>, suffix: &str) -> String {
     }
 }
 
+pub(crate) fn report_json(report: &CheckReport) -> Value {
+    json!({
+        "arch": report.arch,
+        "nvrtc": report.nvrtc,
+        "ptxas": report.ptxas,
+        "ok": report.ok(),
+        "total": report.kernels.len(),
+        "failed": report.failed(),
+        "spilling": report.spilling(),
+        "kernels": report.kernels.iter().map(kernel_json).collect::<Vec<_>>(),
+    })
+}
+
 fn emit(report: &CheckReport, as_json: bool) {
     if as_json {
-        let out = json!({
-            "arch": report.arch,
-            "nvrtc": report.nvrtc,
-            "ptxas": report.ptxas,
-            "ok": report.ok(),
-            "total": report.kernels.len(),
-            "failed": report.failed(),
-            "spilling": report.spilling(),
-            "kernels": report.kernels.iter().map(kernel_json).collect::<Vec<_>>(),
-        });
-        println!("{out}");
+        println!("{}", report_json(report));
         return;
     }
     let nvrtc = report.nvrtc.as_deref().unwrap_or("none");

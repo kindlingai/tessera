@@ -11,11 +11,11 @@ use std::cell::RefCell;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
-use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tessera_engine_settings::{Backend, Settings};
 use tessera_gpukit::platform::{Asked, Platform};
@@ -97,9 +97,9 @@ pub struct CheckReport {
 }
 
 impl CheckReport {
-    /// True when every verified kernel succeeded within spill limits.
+    /// True when kernels ran and every kernel succeeded.
     pub fn ok(&self) -> bool {
-        self.kernels.iter().all(|k| k.error.is_none())
+        !self.kernels.is_empty() && self.kernels.iter().all(|k| k.error.is_none())
     }
 
     /// Count of kernels that failed compilation or spill checks.
@@ -167,7 +167,7 @@ struct Captured {
     id: u64,
     closed: bool,
     platform: Platform,
-    entries: BTreeMap<(String, u64), Collected>,
+    entries: BTreeMap<(String, String), Collected>,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -310,7 +310,7 @@ pub fn start(target: &str) -> Result<Session, Error> {
 }
 
 /// Whether offline kernel verification mode is active on this thread.
-pub(crate) fn active() -> bool {
+pub fn active() -> bool {
     ACTIVE.with(|cell| {
         cell.borrow()
             .as_ref()
@@ -356,13 +356,28 @@ pub(crate) fn open(plan: &Plan) -> Option<Box<dyn Run>> {
     ))
 }
 
-fn source_hash(source: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    source.hash(&mut h);
-    h.finish()
+/// Normalized compilation unit name passed to NVRTC.
+fn unit_key(name: &str) -> String {
+    match name.is_empty() {
+        true => "kernel.cu".into(),
+        false if name.contains('.') => name.to_string(),
+        false => format!("{name}.cu"),
+    }
 }
 
-fn collect_step(step: &Step, out: &mut BTreeMap<(String, u64), Collected>) {
+/// Groups entries by exact `(unit_name, source)` compile inputs.
+fn compile_groups(entries: &[Collected]) -> BTreeMap<(String, &str), Vec<usize>> {
+    let mut groups: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
+    for (idx, item) in entries.iter().enumerate() {
+        groups
+            .entry((unit_key(&item.entry), item.source.as_str()))
+            .or_default()
+            .push(idx);
+    }
+    groups
+}
+
+fn collect_step(step: &Step, out: &mut BTreeMap<(String, String), Collected>) {
     let src = step.kernel.source();
     let entry = overrides::entry(&src).to_string();
     let kind = match src {
@@ -373,7 +388,7 @@ fn collect_step(step: &Step, out: &mut BTreeMap<(String, u64), Collected>) {
     if entry.is_empty() && source.is_empty() {
         return;
     }
-    let key = (entry.clone(), source_hash(&source));
+    let key = (entry.clone(), source.clone());
     let dynamic_shared = step
         .kernel
         .resident()
@@ -397,7 +412,7 @@ fn collect_step(step: &Step, out: &mut BTreeMap<(String, u64), Collected>) {
         });
 }
 
-fn collect_plan(plan: &Plan, out: &mut BTreeMap<(String, u64), Collected>) {
+fn collect_plan(plan: &Plan, out: &mut BTreeMap<(String, String), Collected>) {
     for step in &plan.steps {
         collect_step(step, out);
     }
@@ -514,45 +529,83 @@ fn verify_collected(mut entries: Vec<Collected>, cfg: &CheckConfig) -> Result<Ch
             }
         }
     }
-    // Group entries sharing identical source text to compile once.
-    let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (idx, item) in entries.iter().enumerate() {
-        groups
-            .entry(source_hash(&item.source))
-            .or_default()
-            .push(idx);
-    }
-    let mut results: Vec<Option<KernelResult>> = vec![None; entries.len()];
-    for indices in groups.values() {
-        let first = &entries[indices[0]];
-        if first.source.is_empty() {
-            for &idx in indices {
-                let item = &entries[idx];
-                results[idx] = Some(KernelResult {
-                    entry: item.entry.clone(),
-                    rule: item.rule.clone(),
-                    kind: item.kind,
-                    dynamic_shared: item.dynamic_shared,
-                    threads: item.threads,
-                    ptx_bytes: 0,
-                    stats: None,
-                    error: Some(format!("kernel `{}` has empty CUDA source", item.entry)),
-                });
-            }
-            continue;
+    // Group entries by exact compile unit name and source text.
+    let groups: Vec<Vec<usize>> = compile_groups(&entries).into_values().collect();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+        .min(groups.len().max(1));
+    let next = AtomicUsize::new(0);
+    let batch = Mutex::new(Vec::with_capacity(entries.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= groups.len() {
+                        break;
+                    }
+                    let done = verify_group(&entries, &groups[idx], cfg, &sm, ptxas.as_deref());
+                    batch.lock().expect("check results").extend(done);
+                }
+            });
         }
-        let unit = nvrtc_compile(&cfg.arch, &first.entry, &first.source);
-        let (ptx_bytes, found, assembled, nvrtc_err) = match unit {
-            Ok(ptx) => {
-                let found = ptx_entries(&String::from_utf8_lossy(&ptx));
-                let asm = ptxas
-                    .as_deref()
-                    .map(|bin| run_ptxas(bin, &sm, &ptx, cfg.temp.as_deref()));
-                (ptx.len(), found, asm, None)
-            }
-            Err(e) => (0, Vec::new(), None, Some(e)),
-        };
-        for &idx in indices {
+    });
+    let mut results: Vec<Option<KernelResult>> = vec![None; entries.len()];
+    for (idx, res) in batch.into_inner().expect("check results") {
+        results[idx] = Some(res);
+    }
+    let kernels = results.into_iter().flatten().collect();
+    Ok(CheckReport {
+        arch: sm,
+        nvrtc,
+        ptxas: ptxas_str,
+        kernels,
+    })
+}
+
+fn verify_group(
+    entries: &[Collected],
+    indices: &[usize],
+    cfg: &CheckConfig,
+    sm: &str,
+    ptxas: Option<&Path>,
+) -> Vec<(usize, KernelResult)> {
+    let first = &entries[indices[0]];
+    if first.source.is_empty() {
+        return indices
+            .iter()
+            .map(|&idx| {
+                let item = &entries[idx];
+                (
+                    idx,
+                    KernelResult {
+                        entry: item.entry.clone(),
+                        rule: item.rule.clone(),
+                        kind: item.kind,
+                        dynamic_shared: item.dynamic_shared,
+                        threads: item.threads,
+                        ptx_bytes: 0,
+                        stats: None,
+                        error: Some(format!("kernel `{}` has empty CUDA source", item.entry)),
+                    },
+                )
+            })
+            .collect();
+    }
+    let unit = nvrtc_compile(&cfg.arch, &first.entry, &first.source);
+    let (ptx_bytes, found, assembled, nvrtc_err) = match unit {
+        Ok(ptx) => {
+            let found = ptx_entries(&String::from_utf8_lossy(&ptx));
+            let asm = ptxas.map(|bin| run_ptxas(bin, sm, &ptx, cfg.temp.as_deref()));
+            (ptx.len(), found, asm, None)
+        }
+        Err(e) => (0, Vec::new(), None, Some(e)),
+    };
+    indices
+        .iter()
+        .map(|&idx| {
             let item = &entries[idx];
             let (stats, error) = match &nvrtc_err {
                 Some(e) => (None, Some(e.clone())),
@@ -567,25 +620,21 @@ fn verify_collected(mut entries: Vec<Collected>, cfg: &CheckConfig) -> Result<Ch
                     )
                 }
             };
-            results[idx] = Some(KernelResult {
-                entry: item.entry.clone(),
-                rule: item.rule.clone(),
-                kind: item.kind,
-                dynamic_shared: item.dynamic_shared,
-                threads: item.threads,
-                ptx_bytes,
-                stats,
-                error,
-            });
-        }
-    }
-    let kernels = results.into_iter().flatten().collect();
-    Ok(CheckReport {
-        arch: sm,
-        nvrtc,
-        ptxas: ptxas_str,
-        kernels,
-    })
+            (
+                idx,
+                KernelResult {
+                    entry: item.entry.clone(),
+                    rule: item.rule.clone(),
+                    kind: item.kind,
+                    dynamic_shared: item.dynamic_shared,
+                    threads: item.threads,
+                    ptx_bytes,
+                    stats,
+                    error,
+                },
+            )
+        })
+        .collect()
 }
 
 fn eval_entry(

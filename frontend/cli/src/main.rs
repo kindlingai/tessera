@@ -1,6 +1,8 @@
 //! `tesserax [--recipe <src>] [--model <dir | hf:<owner>/<name>[@<revision>]>] <verb>`.
 
 mod check;
+#[cfg(test)]
+mod check_test;
 mod fetch;
 mod mcp;
 #[cfg(test)]

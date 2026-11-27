@@ -281,6 +281,15 @@ pub(super) fn check_lowering(
             eprintln!("warning: decode warm ({rows}) failed: {e}");
         }
     }
+    if tessera_engine::check::active() {
+        let deep = engine.context().min(chunk.saturating_mul(2).max(4096));
+        if deep > chunk {
+            let _ = engine.warm_at(chunk, true, deep);
+            for rows in warm_rows(o.slots, extra_rows) {
+                let _ = engine.warm_at(rows, false, deep);
+            }
+        }
+    }
     Ok(())
 }
 

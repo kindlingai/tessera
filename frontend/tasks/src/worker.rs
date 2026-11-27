@@ -15,12 +15,19 @@ impl<T: 'static> Worker<T> {
     pub fn spawn(open: impl FnOnce() -> Result<T, Error> + Send + 'static) -> Result<Self, Error> {
         let (work, queue) = mpsc::channel::<Work<T>>();
         let (ready, opened) = mpsc::channel();
-        std::thread::spawn(move || match open() {
-            Ok(mut model) => {
-                let _ = ready.send(Ok(()));
-                queue.iter().for_each(|w| w(&mut model));
+        let scope = tessera_engine::check::current_scope();
+        std::thread::spawn(move || {
+            let result = match scope {
+                Some(scope) => scope.run(open),
+                None => open(),
+            };
+            match result {
+                Ok(mut model) => {
+                    let _ = ready.send(Ok(()));
+                    queue.iter().for_each(|w| w(&mut model));
+                }
+                Err(e) => drop(ready.send(Err(e))),
             }
-            Err(e) => drop(ready.send(Err(e))),
         });
         opened.recv().map_err(|_| "the model thread stopped")??;
         Ok(Self {
@@ -34,9 +41,16 @@ impl<T: 'static> Worker<T> {
         f: impl FnOnce(&mut T) -> R + Send + 'static,
     ) -> Result<R, Error> {
         let (answer, answered) = mpsc::channel();
+        let scope = tessera_engine::check::current_scope();
         let work = self.work.lock().map_err(|_| "the model stopped")?;
-        work.send(Box::new(move |m| drop(answer.send(f(m)))))
-            .map_err(|_| "the model stopped")?;
+        work.send(Box::new(move |m| {
+            let out = match scope {
+                Some(scope) => scope.run(|| f(m)),
+                None => f(m),
+            };
+            drop(answer.send(out));
+        }))
+        .map_err(|_| "the model stopped")?;
         drop(work);
         Ok(answered.recv().map_err(|_| "the model stopped")?)
     }

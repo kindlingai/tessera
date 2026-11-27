@@ -24,23 +24,40 @@ pub(crate) fn sample(
     slots: usize,
     context: usize,
 ) -> (Vec<Row>, Vec<u32>) {
+    let at = if prefill { rows } else { 1 };
+    sample_at(rows, prefill, slots, context, at)
+}
+
+/// Rows and picks for `rows` reaching `at_context`.
+pub(crate) fn sample_at(
+    rows: usize,
+    prefill: bool,
+    slots: usize,
+    max_context: usize,
+    at_context: usize,
+) -> (Vec<Row>, Vec<u32>) {
     let rows = match prefill {
-        true => rows.clamp(1, context),
+        true => rows.clamp(1, max_context),
         false => rows.max(1),
     };
-    let last = context.saturating_sub(1);
+    let last = max_context.saturating_sub(1);
+    let end = at_context.clamp(1, max_context);
+    let base = match prefill {
+        true => end.saturating_sub(rows),
+        false => end.saturating_sub(1).saturating_sub((rows - 1) / slots),
+    };
     let mut sample = Vec::with_capacity(rows);
     for i in 0..rows {
         sample.push(match prefill {
             true => Row {
                 slot: 0,
                 token: 0,
-                position: i as u32,
+                position: (base + i).min(last) as u32,
             },
             false => Row {
                 slot: (i % slots) as u32,
                 token: 0,
-                position: (i / slots).min(last) as u32,
+                position: (base + i / slots).min(last) as u32,
             },
         });
     }

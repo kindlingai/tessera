@@ -1,6 +1,6 @@
 use super::{
-    ACTIVE, CheckConfig, PtxStats, TempDir, check_source, eval_entry, find_ptxas, parse_ptxas,
-    ptx_entries, sm_target, start, target_platform,
+    ACTIVE, CheckConfig, Collected, PtxStats, TempDir, check_source, compile_groups, eval_entry,
+    find_ptxas, parse_ptxas, ptx_entries, sm_target, start, target_platform, verify_collected,
 };
 use crate::Run;
 use std::collections::HashMap;
@@ -129,7 +129,8 @@ fn isolates_sessions() {
         run_ptxas: false,
         ..CheckConfig::default()
     };
-    assert!(s1.finish(&cfg).unwrap().kernels.is_empty());
+    let empty_plan = s1.finish(&cfg).unwrap();
+    assert!(empty_plan.kernels.is_empty() && !empty_plan.ok());
     assert!(!super::active());
 
     let lost = start("sm_121").unwrap();
@@ -200,4 +201,57 @@ fn checks_sources_offline() {
         let rep = check_source("spill_k.cu", Some("spill_k"), spill, &strict).unwrap();
         assert!(!rep.ok() && rep.spilling() == 1);
     }
+}
+
+fn collected(entry: &str, source: &str) -> Collected {
+    Collected {
+        entry: entry.into(),
+        rule: "test".into(),
+        kind: "fixed",
+        source: source.into(),
+        dynamic_shared: 0,
+        threads: 32,
+    }
+}
+
+#[test]
+fn distinguishes_unit_names() {
+    let shared = "\
+static_assert(__FILE__[0] == 'a', \"unit name mismatch\");
+extern \"C\" __global__ void alpha(float* y) { y[0] = 1.0f; }
+extern \"C\" __global__ void beta(float* y) { y[0] = 2.0f; }
+";
+    let items = vec![
+        collected("alpha", shared),
+        collected("alpha.cu", shared),
+        collected("beta", shared),
+    ];
+    let groups = compile_groups(&items);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[&("alpha.cu".into(), shared)], vec![0, 1]);
+    assert_eq!(groups[&("beta.cu".into(), shared)], vec![2]);
+
+    if !cfg!(feature = "cuda") {
+        return;
+    }
+    let cfg = CheckConfig {
+        run_ptxas: false,
+        ..CheckConfig::default()
+    };
+    let report = verify_collected(
+        vec![collected("alpha", shared), collected("beta", shared)],
+        &cfg,
+    )
+    .unwrap();
+    if report.nvrtc.is_none() {
+        return;
+    }
+    assert_eq!(report.kernels.len(), 2);
+    assert!(report.kernels[0].error.is_none(), "{:?}", report.kernels[0]);
+    let err = report.kernels[1].error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("beta.cu") && err.contains("unit name mismatch"),
+        "{err}"
+    );
+    assert!(!report.ok());
 }

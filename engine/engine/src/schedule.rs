@@ -222,10 +222,6 @@ impl Engine {
         rows.min(self.context).max(1)
     }
 
-    fn sample_rows(&self, rows: usize, prefill: bool) -> (Vec<Row>, Vec<u32>) {
-        crate::probe::sample(rows, prefill, self.slots, self.context)
-    }
-
     fn wants_full(&self) -> Wants {
         match self.taps.is_some() {
             true => Wants::roles(&self.graph, self.full, &[Role::Tokens, Role::Taps]),
@@ -257,7 +253,14 @@ impl Engine {
 
     /// Lowers and compiles plans for `rows` rows.
     pub fn warm(&mut self, rows: usize, prefill: bool) -> Result<(), Error> {
-        let (sample, picks) = self.sample_rows(rows, prefill);
+        let at = if prefill { rows } else { 1 };
+        self.warm_at(rows, prefill, at)
+    }
+
+    /// Lowers and compiles plans for `rows` rows at `context`.
+    pub fn warm_at(&mut self, rows: usize, prefill: bool, context: usize) -> Result<(), Error> {
+        let (sample, picks) =
+            crate::probe::sample_at(rows, prefill, self.slots, self.context, context);
         let wants = self.wants_full();
         self.replan_for(&sample, &picks, wants)?;
         if prefill
