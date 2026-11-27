@@ -1,10 +1,10 @@
-use crate::{Error, PageCopy, Pool, Tag};
+use crate::{Error, Evict, Oldest, PageCopy, Pool, Tag};
 
 const T: Tag = Tag(0);
 
 #[test]
 fn admission_counts_worst() {
-    let mut pool = Pool::new(4, 2);
+    let mut pool = Pool::new(4, 2, Box::new(Oldest::default()));
     let a = pool.reserve(T, 1, 6).unwrap();
     assert_eq!(pool.reserve(T, 1, 4), Err(Error::NoRoom(2)));
     let stats = pool.stats();
@@ -18,7 +18,7 @@ fn admission_counts_worst() {
 
 #[test]
 fn shared_writes_copy() {
-    let mut pool = Pool::new(8, 2);
+    let mut pool = Pool::new(8, 2, Box::new(Oldest::default()));
     let a = pool.reserve(T, 3, 6).unwrap();
     let b = pool.fork(a, 3, 6).unwrap();
     let [first, last] = pool.pages(a).unwrap()[..] else {
@@ -40,7 +40,7 @@ fn shared_writes_copy() {
 
 #[test]
 fn retained_rows_fork() {
-    let mut pool = Pool::new(4, 2);
+    let mut pool = Pool::new(4, 2, Box::new(Oldest::default()));
     let a = pool.reserve(T, 3, 8).unwrap();
     pool.grow(a, 8).unwrap();
     pool.truncate(a, 3).unwrap();
@@ -54,7 +54,7 @@ fn retained_rows_fork() {
 
 #[test]
 fn full_pool_adopts() {
-    let mut pool = Pool::new(2, 4);
+    let mut pool = Pool::new(2, 4, Box::new(Oldest::default()));
     let a = pool.reserve(T, 3, 4).unwrap();
     pool.reserve(T, 3, 4).unwrap();
     pool.retain(a).unwrap();
@@ -74,7 +74,7 @@ fn random_calls() {
         .into_iter()
         .flat_map(|n| (1..=4u64).map(move |s| (n, s)))
     {
-        let mut pool = Pool::new(pages, 4);
+        let mut pool = Pool::new(pages, 4, Box::new(Oldest::default()));
         let mut runs = Vec::new();
         for _ in 0..1000 {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -105,7 +105,7 @@ fn random_calls() {
 
 #[test]
 fn widen_shares_pool() {
-    let mut pool = Pool::new(3, 4);
+    let mut pool = Pool::new(3, 4, Box::new(Oldest::default()));
     let a = pool.reserve(T, 4, 4).unwrap();
     let b = pool.reserve(T, 4, 4).unwrap();
     pool.widen(a, 8).unwrap();
@@ -114,4 +114,16 @@ fn widen_shares_pool() {
     pool.release(a).unwrap();
     pool.widen(b, 12).unwrap();
     pool.grow(b, 12).unwrap();
+}
+
+#[test]
+fn oldest_ends_first() {
+    let mut policy = Oldest::default();
+    for at in [2, 0, 1] {
+        policy.retained(at);
+    }
+    policy.used(2);
+    assert_eq!(policy.victim(), Some(2));
+    policy.gone(2);
+    assert_eq!(policy.victim(), Some(0));
 }

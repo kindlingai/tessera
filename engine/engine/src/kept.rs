@@ -2,7 +2,7 @@
 
 use crate::Error;
 use crate::lanes::{EVICT_COLD, EVICT_PINNED};
-use tessera_kv::{Pool, Prefixes, RunId, Spot, Stats, Tag};
+use tessera_kv::{Oldest, Pool, Prefixes, RunId, Spot, Stats, Tag};
 
 const TAG: Tag = Tag(0);
 
@@ -45,7 +45,7 @@ pub(crate) struct Kept {
 impl Kept {
     pub fn new(slots: usize, context: usize) -> Self {
         Self {
-            pool: Pool::new(slots, context),
+            pool: Pool::new(slots, context, Box::new(Oldest::default())),
             index: Prefixes::new(0),
             context,
             runs: vec![None; slots],
@@ -60,7 +60,7 @@ impl Kept {
     /// Slots share whole pages of `page` rows.
     pub fn paged(slots: usize, context: usize, pages: usize, page: usize) -> Self {
         Self {
-            pool: Pool::new(pages, page),
+            pool: Pool::new(pages, page, Box::new(Oldest::default())),
             index: Prefixes::new(page),
             free: (0..slots as u32).rev().collect(),
             laned: Some(vec![0; slots]),

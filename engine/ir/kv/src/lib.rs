@@ -1,5 +1,6 @@
 //! Pages of kept rows, shared between runs by refcount.
 
+mod evict;
 mod lanes;
 mod pool;
 mod prefix;
@@ -9,6 +10,7 @@ mod store;
 mod tier;
 mod tiering;
 
+pub use evict::{Evict, Oldest};
 pub use lanes::Lanes;
 pub use pool::{Error, PageCopy, Pool, RunId, Stats, Tag};
 pub use prefix::Prefixes;

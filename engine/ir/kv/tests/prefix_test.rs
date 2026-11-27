@@ -1,8 +1,11 @@
-use tessera_kv::{Pool, Prefixes, Tag};
+use tessera_kv::{Oldest, Pool, Prefixes, Tag};
 
 #[test]
 fn longest_newest_wins() {
-    let (mut pool, mut index) = (Pool::new(8, 2), Prefixes::new(2));
+    let (mut pool, mut index) = (
+        Pool::new(8, 2, Box::new(Oldest::default())),
+        Prefixes::new(2),
+    );
     let mut runs = Vec::new();
     for history in [vec![1, 2, 3, 4], vec![1, 2, 3, 4, 5], vec![1, 2, 3, 4, 5]] {
         let run = pool.reserve(Tag(0), 4, 4).unwrap();
@@ -27,7 +30,7 @@ fn trie_matches_naive() {
         (state >> 33) as u32
     };
     for grid in [1usize, 4, 16] {
-        let mut pool = Pool::new(256, 4);
+        let mut pool = Pool::new(256, 4, Box::new(Oldest::default()));
         let mut index = Prefixes::new(grid);
         let mut naive: Vec<(tessera_kv::RunId, Vec<u32>, usize)> = Vec::new();
         let base: Vec<u32> = (0..64).map(|i| i % 5).collect();

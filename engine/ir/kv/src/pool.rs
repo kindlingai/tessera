@@ -1,5 +1,6 @@
 //! A pool of pages that runs of kept rows share.
 
+use crate::evict::Evict;
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -46,8 +47,8 @@ struct Run {
     pages: Vec<u32>,
     rows: usize,
     worst: usize,
-    /// Retirement number, if retained. Lowest goes first.
-    retired: Option<u64>,
+    /// Reclaimable. Forks may share its rows.
+    retained: bool,
 }
 
 #[derive(Default)]
@@ -82,12 +83,12 @@ pub struct Pool {
     free: BTreeSet<u32>,
     freed: Vec<u32>,
     slots: Vec<Slot>,
-    retirements: u64,
+    evict: Box<dyn Evict>,
 }
 
 impl Pool {
     /// `pages` pages of `page` rows each.
-    pub fn new(pages: usize, page: usize) -> Self {
+    pub fn new(pages: usize, page: usize, evict: Box<dyn Evict>) -> Self {
         Self {
             page,
             live: vec![0; pages],
@@ -97,7 +98,7 @@ impl Pool {
             free: (0..pages as u32).collect(),
             freed: Vec::new(),
             slots: Vec::new(),
-            retirements: 0,
+            evict,
         }
     }
 
@@ -131,9 +132,7 @@ impl Pool {
     /// Pages live runs may take before their worst case.
     pub fn promised(&self) -> usize {
         let live = self.slots.iter().filter_map(|s| s.run.as_ref());
-        live.filter(|r| r.retired.is_none())
-            .map(|r| self.need(r))
-            .sum()
+        live.filter(|r| !r.retained).map(|r| self.need(r)).sum()
     }
 
     pub fn stats(&self) -> Stats {
@@ -143,7 +142,7 @@ impl Pool {
             ..Stats::default()
         };
         for run in self.slots.iter().filter_map(|s| s.run.as_ref()) {
-            if run.retired.is_some() {
+            if run.retained {
                 stats.kept_runs += 1;
                 continue;
             }
@@ -165,7 +164,7 @@ impl Pool {
             pages,
             rows,
             worst,
-            retired: None,
+            retained: false,
         };
         Ok(self.add(run))
     }
@@ -186,13 +185,13 @@ impl Pool {
             .count();
         // A shared partial page costs each live holder one copy.
         let mine = !rows.is_multiple_of(self.page);
-        let theirs = src.retired.is_none()
+        let theirs = !src.retained
             && !src.rows.is_multiple_of(self.page)
             && shared.len() == src.pages.len()
             && shared.last().is_some_and(|p| self.holders(*p) == 1);
         let need = self.span(worst) - shared.len() + mine as usize + theirs as usize;
         self.fits(need, lost)?;
-        let (tag, pages) = (src.tag, shared.to_vec());
+        let (tag, pages, kept) = (src.tag, shared.to_vec(), src.retained);
         for &p in &pages {
             self.hold_live(p);
         }
@@ -201,8 +200,11 @@ impl Pool {
             pages,
             rows,
             worst,
-            retired: None,
+            retained: false,
         };
+        if kept {
+            self.evict.used(source.at as usize);
+        }
         Ok(self.add(run))
     }
 
@@ -281,9 +283,8 @@ impl Pool {
     /// Makes a live run reclaimable. Forks may share its rows.
     pub fn retain(&mut self, run: RunId) -> Result<(), Error> {
         let at = self.live_at(run)?;
-        self.retirements += 1;
-        let retired = self.retirements;
-        self.run_mut(at).retired = Some(retired);
+        self.run_mut(at).retained = true;
+        self.evict.retained(at);
         for i in 0..self.run_at(at).pages.len() {
             let p = self.run_at(at).pages[i];
             self.live_to_kept(p);
@@ -295,7 +296,7 @@ impl Pool {
     /// Makes a retained run live again, with its first `rows`.
     pub fn adopt(&mut self, run: RunId, rows: usize, worst: usize) -> Result<RunId, Error> {
         let r = self.run(run)?;
-        if r.retired.is_none() {
+        if !r.retained {
             return Err(Error::Live(run));
         }
         if rows > r.rows {
@@ -314,7 +315,8 @@ impl Pool {
             self.unhold(page, true);
         }
         let r = self.run_mut(at);
-        (r.rows, r.worst, r.retired) = (rows, worst, None);
+        (r.rows, r.worst, r.retained) = (rows, worst, false);
+        self.evict.gone(at);
         for i in 0..self.run_at(at).pages.len() {
             let p = self.run_at(at).pages[i];
             self.kept_to_live(p);
@@ -353,7 +355,7 @@ impl Pool {
             for x in [r.tag.0, r.rows as u64, r.worst as u64] {
                 eat(x);
             }
-            eat(r.retired.unwrap_or(0));
+            eat(u64::from(r.retained));
             r.pages.iter().for_each(|p| eat(u64::from(*p)));
         }
         hash
@@ -393,12 +395,8 @@ impl Pool {
             if let Some(page) = self.free.pop_first() {
                 break page;
             }
-            let retained = self.slots.iter().enumerate().filter_map(|(at, s)| {
-                let retired = s.run.as_ref()?.retired?;
-                Some((retired, at))
-            });
-            let (_, at) = retained.min().expect("the room check promised a page");
-            self.end(at);
+            let at = self.evict.victim();
+            self.end(at.expect("the room check promised a page"));
         };
         self.live[page as usize] = 1;
         self.active += 1;
@@ -410,7 +408,10 @@ impl Pool {
         slot.generation += 1;
         let r = slot.run.take().expect("a run to end");
         for page in r.pages {
-            self.unhold(page, r.retired.is_some());
+            self.unhold(page, r.retained);
+        }
+        if r.retained {
+            self.evict.gone(at);
         }
     }
 
@@ -492,9 +493,9 @@ impl Pool {
     }
 
     fn live_at(&self, id: RunId) -> Result<usize, Error> {
-        match self.run(id)?.retired {
-            Some(_) => Err(Error::Retained(id)),
-            None => Ok(id.at as usize),
+        match self.run(id)?.retained {
+            true => Err(Error::Retained(id)),
+            false => Ok(id.at as usize),
         }
     }
 
@@ -510,11 +511,7 @@ impl Pool {
     fn consistent(&self) -> bool {
         let (mut live, mut kept) = (vec![0; self.live.len()], vec![0; self.kept.len()]);
         for r in self.slots.iter().filter_map(|s| s.run.as_ref()) {
-            let counts = if r.retired.is_some() {
-                &mut kept
-            } else {
-                &mut live
-            };
+            let counts = if r.retained { &mut kept } else { &mut live };
             r.pages.iter().for_each(|p| counts[*p as usize] += 1);
         }
         let free =
