@@ -360,5 +360,14 @@ fn checks_override_headers_flags() {
             );
         }
     }
+    // Single-read I/O errors preserve exact KernelFile error.
+    let missing = dir.join("absent.cu");
+    assert!(matches!(
+        check_file(&missing, None, &cfg),
+        Err(crate::Error::KernelFile(p, io)) if p == missing && io.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert!(
+        matches!(check_file(&dir, None, &cfg), Err(crate::Error::KernelFile(p, _)) if p == dir)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

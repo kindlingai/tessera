@@ -476,13 +476,7 @@ pub fn check_file(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("kernel.cu");
-    if !path.exists() {
-        return Err(Error::KernelFile(
-            path.to_path_buf(),
-            std::fs::read_to_string(path).unwrap_err(),
-        ));
-    }
-    match overrides::load_file(path, Backend::Cuda) {
+    match overrides::load_file(path, Backend::Cuda)? {
         Ok((source, launch)) => {
             let flags = launch.as_ref().map_or_else(Vec::new, |l| l.flags());
             check_source(name, entry, &source, &flags, cfg)

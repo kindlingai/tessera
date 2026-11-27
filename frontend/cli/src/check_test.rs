@@ -90,6 +90,83 @@ fn agrees_on_outcomes() {
     assert!(finish_outcome(&fail).is_err());
 }
 
+fn assert_fresh_cli() {
+    let dir = tessera_testkit::scratch("cli-fresh-flat");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.cuh"),
+        "#pragma once\n#include <tessera/1/core>\nstatic __device__ tessera::u32 bump(tessera::u32 x) { return x + 1u; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("trans_k.cu"),
+        "#include \"helper.cuh\"\nextern \"C\" __global__ void trans_k(tessera::u32* y) { y[0] = bump(y[0]); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("direct_k.cu"),
+        "#include <tessera/1/core>\nextern \"C\" __global__ void direct_k(tessera::u32* y) { y[0] += 1u; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bad_imp.cu"),
+        "#include <tessera/1/no_such_hdr>\nextern \"C\" __global__ void bad_imp(int* y) { y[0] = 0; }\n",
+    )
+    .unwrap();
+    let exe = std::env::current_exe().expect("test exe");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", "check_test::fresh_cli_child", "--ignored"])
+        .output()
+        .expect("spawn child");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "fresh CLI child failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn run_fresh_case(cu: &std::path::Path, entry: &str, expect_missing: bool) {
+    let args: Vec<String> = [
+        "check-kernels",
+        "--file",
+        cu.to_str().unwrap(),
+        "--entry",
+        entry,
+        "--no-ptxas",
+        "--json",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let res = crate::run(&args);
+    let settings = tessera_frontend_settings::read();
+    let cfg = tessera_engine::check::CheckConfig {
+        run_ptxas: false,
+        temp: settings.temp,
+        ..tessera_engine::check::CheckConfig::default()
+    };
+    let rep = tessera_engine::check::check_file(cu, Some(entry), &cfg).unwrap();
+    let err = rep.kernels[0].error.as_deref().unwrap_or("");
+    assert!(!err.contains("no flattener is registered"), "{err}");
+    if expect_missing {
+        assert!(res.is_err() && err.contains("no_such_hdr"), "{err}");
+    } else if rep.nvrtc.is_some() {
+        assert!(res.is_ok() && rep.ok(), "{err}");
+    }
+}
+
+#[test]
+#[ignore = "spawned by rejects_bad_inputs for a fresh process"]
+fn fresh_cli_child() {
+    let dir = tessera_testkit::scratch("cli-fresh-flat");
+    run_fresh_case(&dir.join("trans_k.cu"), "trans_k", false);
+    run_fresh_case(&dir.join("direct_k.cu"), "direct_k", false);
+    run_fresh_case(&dir.join("bad_imp.cu"), "bad_imp", true);
+}
+
 #[test]
 fn rejects_bad_inputs() {
     let missing = tessera_testkit::scratch("cli-check-no-such.cu");
@@ -98,4 +175,5 @@ fn rejects_bad_inputs() {
     assert!(run_args(&["--file", &path, "--no-ptxas", "--max-spills", "0"]).is_err());
     assert!(run_args(&["--file", &path, "--arch", "sm_12é", "--no-ptxas"]).is_err());
     assert_file_checks();
+    assert_fresh_cli();
 }

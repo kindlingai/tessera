@@ -282,24 +282,32 @@ pub(crate) fn load_entry(
 pub(crate) fn load_file(
     path: &Path,
     backend: Backend,
+) -> Result<Result<(String, Option<LaunchOverride>), String>, Error> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| Error::KernelFile(path.to_path_buf(), e))?;
+    Ok(prepare_file(path, backend, &raw))
+}
+
+fn prepare_file(
+    path: &Path,
+    backend: Backend,
+    raw: &str,
 ) -> Result<(String, Option<LaunchOverride>), String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let root = path.parent().unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("kernel");
     let dialect = Dialect::of(backend);
-    let source = prepare_source(root, backend, dialect, stem, &raw).0?;
+    let source = prepare_source(root, backend, dialect, stem, raw).0?;
     let sidecar = root.join(format!("{stem}.launch.toml"));
-    let launch = match Version::of(&sidecar) {
-        Some(_) => {
-            let text =
-                std::fs::read_to_string(&sidecar).map_err(|e| format!("launch.toml: {e}"))?;
+    let launch = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => {
             let parsed = LaunchOverride::parse(&text)?;
             (!parsed.is_empty()).then_some(parsed)
         }
-        None => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("launch.toml: {e}")),
     };
     Ok((source, launch))
 }

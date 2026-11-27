@@ -52,6 +52,7 @@ fn parse(rest: &[String]) -> Result<Args, Stop> {
 }
 
 pub fn run(origin: Option<Origin>, rest: &[String]) -> Result<(), Stop> {
+    tessera_engine::flatten_overrides();
     let parsed = parse(rest)?;
     let report = match parsed.file.as_deref() {
         Some(path) => {
