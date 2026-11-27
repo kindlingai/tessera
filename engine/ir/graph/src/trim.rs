@@ -43,6 +43,9 @@ pub fn trim(g: &Graph, entry: usize) -> Result<Graph, VerifyError> {
         }
     }
     for o in &g.entries[entry].outputs {
+        if o.role == Role::Taps {
+            continue;
+        }
         let at = o.node.0 as usize;
         if need[at] == Need::All {
             if !gatherable(&g.node(o.node).ty) {
@@ -131,8 +134,12 @@ fn sweep(g: &Graph, entry: usize, forced: &[bool]) -> Vec<Need> {
         }
     }
     for (e, en) in g.entries.iter().enumerate() {
-        let want = if e == entry { Need::Picked } else { Need::All };
         for o in &en.outputs {
+            let want = if e == entry && o.role != Role::Taps {
+                Need::Picked
+            } else {
+                Need::All
+            };
             let at = &mut need[o.node.0 as usize];
             *at = (*at).max(want);
         }
@@ -282,7 +289,9 @@ fn rebuild(g: &Graph, entry: usize, need: &[Need], anchors: &[Option<usize>]) ->
     for (e, en) in out.entries.iter_mut().enumerate() {
         for o in &mut en.outputs {
             let was = o.node.0 as usize;
-            o.node = gathered[was].filter(|_| e == entry).unwrap_or(map[was]);
+            o.node = gathered[was]
+                .filter(|_| e == entry && o.role != Role::Taps)
+                .unwrap_or(map[was]);
         }
     }
     for r in &mut out.regions {
