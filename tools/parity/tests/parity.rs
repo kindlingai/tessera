@@ -11,5 +11,6 @@ mod nanogpt;
 mod qwen2;
 mod qwen3;
 mod qwen35;
+mod qwen3_vl;
 mod smollm2;
 mod tagger;
