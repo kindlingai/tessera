@@ -25,6 +25,8 @@ fn stacked_kernel(rows: usize, n: usize, k: usize, wide: bool) -> FastStacked {
         min_blocks: None,
         rope: None,
         x_bf16: false,
+        y_bf16: false,
+        o_bf16: false,
         form: BF16_FORM,
     }
 }

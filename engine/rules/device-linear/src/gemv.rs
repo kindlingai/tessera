@@ -1,6 +1,6 @@
 //! Streaming decode GEMV for BF16, MXFP8 and INT4 weights.
 
-use super::{WARPS, cuda_needs, cuda_source_with, f32_only, trip, weight_x_accepts};
+use super::{WARPS, cuda_needs, cuda_source_with, trip, weight_x_accepts, x_accepts};
 use tessera_graph::{Act, Op, Order, Stage};
 use tessera_lower::form::Load as Stored;
 use tessera_lower::{
@@ -89,7 +89,7 @@ impl GemvKind {
     sizes = [1, self.n, self.k],
     work = self.n * self.k,
     accepts = gemv_accepts,
-    emits = f32_only,
+    emits = gemv_emits,
     needs = gemv_needs(self),
     order = Order::PerConfig,
     source = gemv_source(self),
@@ -113,11 +113,16 @@ struct FastGemv {
     min_blocks: Option<u32>,
     kind: GemvKind,
     x_bf16: bool,
+    y_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn gemv_accepts(k: &FastGemv, input: usize, form: &dyn Stored) -> bool {
     weight_x_accepts(input, k.x_bf16, k.form, form)
+}
+
+fn gemv_emits(k: &FastGemv, form: &dyn Stored) -> bool {
+    x_accepts(k.y_bf16, form)
 }
 
 fn gemv_needs(k: &FastGemv) -> Needs {
@@ -138,6 +143,9 @@ fn gemv_source(k: &FastGemv) -> Source {
     if k.x_bf16 {
         defs.push(("X_BF16", 1));
     }
+    if k.y_bf16 {
+        defs.push(("Y_BF16", 1));
+    }
     cuda_source_with(k.kind.entry(), defs)
 }
 
@@ -145,6 +153,7 @@ fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
     let groups = k.kind.groups(k.n, k.warps);
     let threads = k.warps * 32;
     let x_elem = if k.x_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let step = match k.kind {
         GemvKind::Bf16 => 256.0,
         GemvKind::Bf16Narrow => (k.warps * 256) as f64,
@@ -156,7 +165,7 @@ fn gemv_load(k: &FastGemv, _: usize) -> Option<Load> {
         trips: k.k as f64 / step,
         trip: k.kind.trip(),
         reads: vec![k.form.bytes(k.n * k.k) as f64, (x_elem * k.k) as f64],
-        written: (4 * k.n) as f64,
+        written: (y_elem * k.n) as f64,
         flight: 512.0,
         ..Load::default()
     })
@@ -207,6 +216,7 @@ fn check_gemv(
     mode: u32,
     a: f32,
     b: f32,
+    y_bf16: bool,
 ) -> Option<Result<Vec<Draft>, String>> {
     let node = tree.node(mat);
     if node.term != Term::Op(Op::Matmul) {
@@ -219,9 +229,9 @@ fn check_gemv(
     if tree.elements(x) != k || n == 0 {
         return None;
     }
-    if node.form.name() != "f32" {
+    if !matches!(node.form.name(), "f32" | "bf16") {
         return Some(Err(format!(
-            "output form {} (requires f32)",
+            "output form {} (requires f32 or bf16)",
             node.form.name()
         )));
     }
@@ -282,19 +292,22 @@ fn check_gemv(
         min_blocks,
         kind,
         x_bf16,
+        y_bf16,
         form,
     };
     Some(Ok(vec![Draft::new(kernel, [x, w], n)]))
 }
 
 pub(super) fn propose_gemv(tree: &Tree, at: T) -> Option<Vec<Draft>> {
-    if tree.node(at).form.name() != "f32" {
+    let y_name = tree.node(at).form.name();
+    if !matches!(y_name, "f32" | "bf16") {
         return None;
     }
     let (mat, mode, a, b) = gemv_epilogue(tree, at)?;
-    check_gemv(tree, mat, mode, a, b)?.ok()
+    check_gemv(tree, mat, mode, a, b, y_name == "bf16")?.ok()
 }
 
 pub(super) fn why_gemv(tree: &Tree, at: T) -> Option<String> {
-    check_gemv(tree, at, 0, 1.0, 1.0)?.err()
+    let y_bf16 = tree.node(at).form.name() == "bf16";
+    check_gemv(tree, at, 0, 1.0, 1.0, y_bf16)?.err()
 }

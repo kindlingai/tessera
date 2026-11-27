@@ -1,8 +1,6 @@
 //! CUDA Tensor-Core picked trellis matmul for MoE experts.
 
-use super::{CUDA_LACKS, cuda_rule, x_defs};
-use std::sync::OnceLock;
-use tessera_device::{Backend, flatten_for};
+use super::{CUDA_LACKS, cuda_module, cuda_rule, io_defs, x_accepts};
 use tessera_graph::{Act, Op, Order, Select, Stage};
 use tessera_linear::parse_form;
 use tessera_lower::form::Load as Stored;
@@ -18,10 +16,7 @@ tessera_lower::knob!("picked_trellis", "chunk", 1, 4);
 tessera_lower::knob!("picked_trellis", "min_blocks", 1, 16);
 tessera_lower::knob!("picked_trellis", "gen_min_blocks", 1, 16);
 
-fn cuda_source() -> &'static str {
-    static CUDA: OnceLock<&'static str> = OnceLock::new();
-    CUDA.get_or_init(|| flatten_for(Backend::Cuda, "moe_trellis.kernel", KERNEL))
-}
+cuda_module!(cuda_source, moe_source_with, "moe_trellis.kernel", KERNEL);
 
 fn entry_name(k: &PickedTrellis) -> &'static str {
     if k.turned && k.bits == 3 && k.book == 2 {
@@ -44,7 +39,7 @@ fn trellis_source(k: &PickedTrellis) -> Source {
     } else if let Some(mb) = k.gen_min_blocks {
         base.push(("PTR_GEN_MIN_BLOCKS", mb as usize));
     }
-    tessera_device::cuda_source_with(cuda_source(), entry, x_defs(base, k.x_bf16))
+    moe_source_with(entry, io_defs(base, k.x_bf16, k.y_bf16, k.o_bf16))
 }
 
 #[derive(Clone, Copy, Debug, Kernel)]
@@ -76,20 +71,23 @@ struct PickedTrellis {
     min_blocks: Option<u32>,
     gen_min_blocks: Option<u32>,
     x_bf16: bool,
+    y_bf16: bool,
+    o_bf16: bool,
     form: &'static dyn Stored,
 }
 
 fn accepts(k: &PickedTrellis, input: usize, form: &dyn Stored) -> bool {
     match input {
-        0 => form.name() == if k.x_bf16 { "bf16" } else { "f32" },
+        0 => x_accepts(k.x_bf16, form),
         1 => form.name() == k.form.name(),
         2 => form.name() == "u32",
+        5 => x_accepts(k.o_bf16, form),
         _ => form.name() == "f32",
     }
 }
 
-fn emits(_: &PickedTrellis, form: &dyn Stored) -> bool {
-    form.name() == "f32"
+fn emits(k: &PickedTrellis, form: &dyn Stored) -> bool {
+    x_accepts(k.y_bf16, form)
 }
 
 fn needs() -> Needs {
@@ -107,6 +105,8 @@ fn needs() -> Needs {
 fn load(k: &PickedTrellis, _: usize) -> Option<Load> {
     let groups = (k.n / BLOCK) * k.rows;
     let x_elem = if k.x_bf16 { 2 } else { 4 };
+    let o_elem = if k.o_bf16 { 2 } else { 4 };
+    let y_elem = if k.y_bf16 { 2 } else { 4 };
     let mut reads = vec![
         k.form.bytes(k.rows * k.n * k.k) as f64,
         (x_elem * (k.rows / k.repeat) * k.k) as f64,
@@ -116,16 +116,16 @@ fn load(k: &PickedTrellis, _: usize) -> Option<Load> {
         reads.extend([(4 * k.rows * k.k) as f64, (4 * k.rows * k.n) as f64]);
     }
     if k.post == 1 {
-        reads.push((4 * k.n) as f64);
+        reads.push((o_elem * k.n) as f64);
     } else if k.post == 2 {
-        reads.push((4 * k.rows * k.n) as f64);
+        reads.push((o_elem * k.rows * k.n) as f64);
     }
     let mut load = Load {
         threads: groups * THREADS,
         group: THREADS,
         trips: (k.k / BLOCK) as f64,
         reads,
-        written: (4 * k.rows * k.n) as f64,
+        written: (y_elem * k.rows * k.n) as f64,
         flight: 1024.0,
         ..Load::default()
     };
@@ -222,13 +222,15 @@ fn match_pick(tree: &Tree, x: T, pick: T, turned: bool) -> Option<(PickedTrellis
             .get("picked_trellis", "gen_min_blocks")
             .map(|v| v as u32),
         x_bf16,
+        y_bf16: false,
+        o_bf16: false,
         form,
     };
     Some((kernel, codes, ids))
 }
 
 fn match_turned(tree: &Tree, at: T) -> Option<(PickedTrellis, [T; 5])> {
-    if tree.node(at).form.name() != "f32" {
+    if !matches!(tree.node(at).form.name(), "f32" | "bf16") {
         return None;
     }
     let r = tree
@@ -237,7 +239,8 @@ fn match_turned(tree: &Tree, at: T) -> Option<(PickedTrellis, [T; 5])> {
     let (x, pick, su_emb, sv_emb) = (r.x, r.w, r.suh, r.svh);
     let (su, su_ids) = gather_of(tree, su_emb)?;
     let (sv, sv_ids) = gather_of(tree, sv_emb)?;
-    let (kernel, codes, ids) = match_pick(tree, x, pick, true)?;
+    let (mut kernel, codes, ids) = match_pick(tree, x, pick, true)?;
+    kernel.y_bf16 = tree.node(at).form.name() == "bf16";
     let ok = su_ids == ids
         && sv_ids == ids
         && tree.leaf(su)
@@ -253,25 +256,33 @@ fn match_turned(tree: &Tree, at: T) -> Option<(PickedTrellis, [T; 5])> {
 /// Matches rotated or plain picked trellis MoE matmuls.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let node = tree.node(at);
-    if node.form.name() != "f32" {
+    if !matches!(node.form.name(), "f32" | "bf16") {
         return None;
     }
+    let y_bf16 = node.form.name() == "bf16";
     if node.term == Term::Stage(Stage::Mul) {
-        if let Some((kernel, reads)) = match_turned(tree, at) {
+        if let Some((mut kernel, reads)) = match_turned(tree, at) {
+            kernel.y_bf16 = y_bf16;
             return Some(vec![Draft::new(kernel, reads, kernel.rows * kernel.n)]);
         }
         let (a, b) = (node.args[0], *node.args.get(1)?);
         let silu = Term::Stage(Stage::Act(Act::Silu));
         for (cand, other) in [(a, b), (b, a)] {
-            if cand == other || tree.root(cand) || tree.node(other).form.name() != "f32" {
+            if cand == other
+                || tree.root(cand)
+                || !matches!(tree.node(other).form.name(), "f32" | "bf16")
+            {
                 continue;
             }
+            let o_bf16 = tree.node(other).form.name() == "bf16";
             if let Some(&[inner]) = tree.inner(cand, &silu)
                 && !tree.root(inner)
                 && let Some((mut k, [x, c, ids, su, sv])) = match_turned(tree, inner)
                 && tree.elements(other) == k.rows * k.n
             {
                 k.post = 2;
+                k.y_bf16 = y_bf16;
+                k.o_bf16 = o_bf16;
                 return Some(vec![Draft::new(
                     k,
                     [x, c, ids, su, sv, other],
@@ -282,6 +293,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
                 && tree.elements(other) == k.n
             {
                 k.post = 1;
+                k.y_bf16 = y_bf16;
+                k.o_bf16 = o_bf16;
                 return Some(vec![Draft::new(
                     k,
                     [x, c, ids, su, sv, other],
@@ -293,7 +306,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     if node.term == Term::Op(Op::Matmul) {
         let (x, pick) = (node.args[0], node.args[1]);
-        let (kernel, codes, ids) = match_pick(tree, x, pick, false)?;
+        let (mut kernel, codes, ids) = match_pick(tree, x, pick, false)?;
+        kernel.y_bf16 = y_bf16;
         let len = kernel.rows * kernel.n;
         return Some(vec![Draft::new(kernel, [x, codes, ids], len)]);
     }

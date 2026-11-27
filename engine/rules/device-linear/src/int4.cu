@@ -6,11 +6,11 @@ using namespace tessera;
 #if defined(TESSERA_CUDA)
 
 static __device__ __forceinline__ float i4_epilogue(
-    float v, const float* other, u64 off, u32 col, u32 mode) {
-    if (mode == 1u) return v + other[off];
-    if (mode == 2u) return v + other[col];
-    if (mode == 3u) return (v / (1.0f + expf(-v))) * other[off];
-    if (mode == 4u) return v * other[off];
+    float v, const trellis::o_t* other, u64 off, u32 col, u32 mode) {
+    if (mode == 1u) return v + trellis::load_o(other, off);
+    if (mode == 2u) return v + trellis::load_o(other, col);
+    if (mode == 3u) return (v / (1.0f + expf(-v))) * trellis::load_o(other, off);
+    if (mode == 4u) return v * trellis::load_o(other, off);
     if (mode == 5u) return v / (1.0f + expf(-v));
     return v;
 }
@@ -57,7 +57,7 @@ static __device__ __forceinline__ void i4_hilo_pair(const trellis::x_t* p, u32& 
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r16(
-    const trellis::x_t* x, const u8* w, const float* other, float* out,
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r16_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 r0 = blockIdx.y << 4u, nb = n >> 4u;
@@ -134,7 +134,7 @@ static __device__ __forceinline__ void fg_int4_r16(
         float v = sm.red[0][tr][col] + sm.red[1][tr][col] +
                   sm.red[2][tr][col] + sm.red[3][tr][col];
         u64 off = u64(SPLIT ? (p * m + r0 + tr) : (r0 + tr)) * n + n0 + col;
-        out[off] = SPLIT ? v : i4_epilogue(v, other, off, n0 + col, mode);
+        trellis::store_y(out, off, SPLIT ? v : i4_epilogue(v, other, off, n0 + col, mode));
     }
 }
 
@@ -167,7 +167,7 @@ static __device__ __forceinline__ void i4_load_x(
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r64(
-    const trellis::x_t* x, const u8* w, const float* other, float* out,
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
     u32 g = lane >> 2u, t = lane & 3u, wn = warp & 3u, wm = warp >> 2u;
@@ -283,7 +283,7 @@ static __device__ __forceinline__ void fg_int4_r64(
                 v.z = i4_epilogue(v.z, other, off + 2u, col + 2u, mode);
                 v.w = i4_epilogue(v.w, other, off + 3u, col + 3u, mode);
             }
-            *reinterpret_cast<float4*>(out + off) = v;
+            trellis::store_y4(out + off, v);
         }
         if (q == 0u) prim::block_sync();
     }
@@ -301,11 +301,11 @@ static __device__ __forceinline__ void fg_int4_r64(
 
 #define I4_PAIR(TAG, TH, BLK, SM, FN) \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG( \
-        const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) { \
+        const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode) { \
         I4_RUN(SM, FN, false, 1u); \
     } \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG##_sk( \
-        const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
+        const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
         (void)ks; \
         I4_RUN(SM, FN, true, ks); \
     }

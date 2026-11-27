@@ -1,5 +1,6 @@
 use crate::mm::{propose_mm, propose_mm_mx8};
-use crate::{cuda_source, hip_source, prefill_source};
+use crate::{KERNEL, cuda_source, prefill_source, trellis_source};
+use tessera_device::{Backend, flatten_for};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
 use tessera_kernels as _;
@@ -96,7 +97,7 @@ fn with_stage(mut g: Graph, stage: Stage, extra_ty: Option<TensorType>) -> Graph
 #[test]
 fn linear_mm_entries() {
     let cuda = cuda_source();
-    let hip = hip_source();
+    let hip = flatten_for(Backend::Rocm, "linear.kernel", KERNEL);
     assert!(!hip.is_empty());
     for entry in [
         "tessera_mm_bf16(",
@@ -110,10 +111,11 @@ fn linear_mm_entries() {
         "tessera_mm_mxfp8_r16(",
         "tessera_mm_mxfp8_r64(",
         "tessera_mm_mxfp8_r64_sk(",
-        "DTR_DEF(dtr_k4_t4,",
-        "dtr_gen4(",
     ] {
         assert!(cuda.contains(entry), "missing {entry}");
+    }
+    for entry in ["DTR_DEF(dtr_k4_t4,", "dtr_gen4(", "dtr_reduce("] {
+        assert!(trellis_source().contains(entry), "missing {entry}");
     }
     for entry in [
         "dtr_prep(",
@@ -503,23 +505,33 @@ fn bf16_inputs_skip_widen() {
         ("trellis_k4", 1),
         ("trellis_k4", 64),
     ] {
-        let pins = Pins::all(named(w_form).expect("form"));
+        let pins = Pins::all(named(w_form).expect("form"))
+            .site(tessera_lower::Site::Matmul, BF16_FORM)
+            .outputs(BF16_FORM);
         let dev = cuda.clone().pinned(pins);
         let plan = lower(&g, 0, &[(Rows, rows)], &dev).expect("lowers");
         let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
         assert!(
-            !names.iter().any(|n| n.contains("widen")),
-            "{w_form} rows={rows}: unexpected widen in {names:?}"
+            !names
+                .iter()
+                .any(|n| n.contains("widen") || n.contains("narrow")),
+            "{w_form} rows={rows}: unexpected cast in {names:?}"
         );
-        let has_x_bf16 = plan.steps.iter().any(|s| {
+        let has_x = plan.steps.iter().any(|s| {
             matches!(
                 s.kernel.source(),
                 Source::Fixed { text, .. } if text[tessera_lower::Backend::Cuda].contains("#define X_BF16 1")
             )
         });
+        let has_y = plan.steps.iter().any(|s| {
+            matches!(
+                s.kernel.source(),
+                Source::Fixed { text, .. } if text[tessera_lower::Backend::Cuda].contains("#define Y_BF16 1")
+            )
+        });
         assert!(
-            has_x_bf16,
-            "{w_form} rows={rows}: missing X_BF16 in {names:?}"
+            has_x && has_y,
+            "{w_form} rows={rows}: missing X/Y_BF16 in {names:?}"
         );
     }
 }

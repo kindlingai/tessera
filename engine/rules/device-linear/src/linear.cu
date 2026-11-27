@@ -9,21 +9,6 @@ using namespace tessera;
 #ifndef GEMV_BF16_WARPS
 #define GEMV_BF16_WARPS TM_WARPS
 #endif
-#ifndef DTR_T1_BLK
-#define DTR_T1_BLK 4
-#endif
-#ifndef DTR_T2_BLK
-#define DTR_T2_BLK 2
-#endif
-#ifndef DTR_T4_BLK
-#define DTR_T4_BLK 2
-#endif
-#ifndef DTR_GEN_BLK
-#define DTR_GEN_BLK 2
-#endif
-#ifndef DTR_RED_BLK
-#define DTR_RED_BLK 4
-#endif
 #ifndef MM_BF16_BLK
 #define MM_BF16_BLK 6
 #endif
@@ -71,207 +56,6 @@ using namespace tessera;
 #endif
 
 #if defined(TESSERA_CUDA)
-
-using dtr_smem = trellis::stage_smem<float[32][128]>;
-
-template <u32 K, u32 BOOK, u32 NT, bool TURNED, bool SPLIT>
-static __device__ __forceinline__ void dtr_body(const trellis::x_t* x, const u8* w, const float* suh,
-                                                const float* svh, float* out, u32 m, u32 n, u32 k,
-                                                u32 ks, dtr_smem& sm) {
-    constexpr u32 TB = 32u * K;
-    constexpr u32 CHUNK = 4u / NT;
-    u32 nblk = n >> 7u;
-    u32 ob = blockIdx.x % nblk;
-    u32 p = blockIdx.x / nblk;
-    u32 r0 = blockIdx.y * (8u * NT);
-    if (ob >= nblk || p >= ks || r0 >= m) return;
-    u32 nr = min(8u * NT, m - r0);
-    u32 tid = threadIdx.x;
-    u32 lane = tid & 31u;
-    u32 j = tid >> 5u;
-    u32 blk_per = (k >> 7u) / ks;
-    u32 ib0 = p * blk_per;
-    bool aligned = (reinterpret_cast<u64>(w + trellis::HEAD) & 15ull) == 0ull;
-    bool input_side = (*reinterpret_cast<const u32*>(w + 8u) & trellis::SIDE_MASK) == trellis::INPUT_SIDE;
-    u64 sG = (input_side ? u64(n >> 1u) : 64ull) * u64(TB);
-    const u8* gb = trellis::tile_ptr<K>(w, k, n, 0u, ib0 << 3u, ob, input_side);
-    u32 nw[8];
-    trellis::blk_load<K>(gb, tid, aligned, nw);
-    trellis::word_map wm = trellis::map_word<K>(lane);
-    float acc[NT][4];
-#pragma unroll
-    for (u32 ti = 0u; ti < NT; ti++) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.0f;
-    for (u32 c0 = 0u; c0 < blk_per; c0 += CHUNK) {
-        u32 nb = min(CHUNK, blk_per - c0);
-        if (c0 > 0u) prim::block_sync();
-        u32 wpb = (nb <= 2u) ? (8u / nb) : 2u, b = j / wpb, r_base = j - b * wpb;
-        if (b < nb && r_base < nr) {
-            u32 col = ((ib0 + c0 + b) << 7u) + (lane << 2u);
-            float sc[4];
-            if constexpr (TURNED) trellis::load4(suh + col, sc);
-            for (u32 r = r_base; r < nr; r += wpb) {
-                float v[4];
-                trellis::load_x4(x + u64(r0 + r) * k + col, v);
-                if constexpr (TURNED) {
-                    v[0] *= sc[0]; v[1] *= sc[1]; v[2] *= sc[2]; v[3] *= sc[3];
-                    trellis::wht128(v, trellis::INV_SQRT128);
-                }
-                trellis::store_bfrag(sm.k.btab + ((r >> 3u) * nb + b) * 512u, r & 7u, lane, v);
-            }
-        }
-        trellis::blk_stream<K, BOOK, NT>(gb, sG, c0, nb, blk_per, tid, j, lane, aligned, wm, nw,
-                                         sm.k.wtiles, sm.k.btab + (lane << 1u), nb * 512u, acc);
-    }
-    u32 col = (j << 4u) + (lane >> 2u), c = lane & 3u;
-    if constexpr (SPLIT) {
-        float* pp = out + (u64(ob) * ks + p) * m * 128u;
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 r = r0 + (ti << 3u) + (c << 1u);
-            if (r < m) { pp[u64(r) * 128u + col] = acc[ti][0]; pp[u64(r) * 128u + col + 8u] = acc[ti][2]; }
-            if (r + 1u < m) { pp[u64(r + 1u) * 128u + col] = acc[ti][1]; pp[u64(r + 1u) * 128u + col + 8u] = acc[ti][3]; }
-        }
-    } else if constexpr (!TURNED) {
-        u32 ob0 = ob << 7u;
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 r = r0 + (ti << 3u) + (c << 1u);
-            if (r < m) { out[u64(r) * n + ob0 + col] = acc[ti][0]; out[u64(r) * n + ob0 + col + 8u] = acc[ti][2]; }
-            if (r + 1u < m) { out[u64(r + 1u) * n + ob0 + col] = acc[ti][1]; out[u64(r + 1u) * n + ob0 + col + 8u] = acc[ti][3]; }
-        }
-    } else {
-        prim::block_sync();
-#pragma unroll
-        for (u32 ti = 0u; ti < NT; ti++) {
-            u32 lr = (ti << 3u) + (c << 1u);
-            if (lr < nr) { sm.out[lr][col] = acc[ti][0]; sm.out[lr][col + 8u] = acc[ti][2]; }
-            if (lr + 1u < nr) { sm.out[lr + 1u][col] = acc[ti][1]; sm.out[lr + 1u][col + 8u] = acc[ti][3]; }
-        }
-        prim::block_sync();
-        u32 base = (ob << 7u) + (lane << 2u);
-        float sc[4];
-        trellis::load4(svh + base, sc);
-        for (u32 r = j; r < nr; r += 8u) {
-            float v[4];
-            trellis::load4(&sm.out[r][lane << 2u], v);
-            trellis::wht128(v, trellis::INV_SQRT128);
-            *reinterpret_cast<float4*>(out + u64(r0 + r) * n + base) =
-                make_float4(v[0] * sc[0], v[1] * sc[1], v[2] * sc[2], v[3] * sc[3]);
-        }
-    }
-}
-
-template <u32 K, u32 BOOK, u32 NT>
-static __device__ __noinline__ void dtr_gen_k(const trellis::x_t* x, const u8* w, const float* suh,
-                                              const float* svh, float* out, u32 m, u32 n, u32 k,
-                                              u32 ks, u32 turned, dtr_smem& sm) {
-    if (ks > 1u) {
-        if (turned != 0u) dtr_body<K, BOOK, NT, true, true>(x, w, suh, svh, out, m, n, k, ks, sm);
-        else dtr_body<K, BOOK, NT, false, true>(x, w, suh, svh, out, m, n, k, ks, sm);
-    } else {
-        if (turned != 0u) dtr_body<K, BOOK, NT, true, false>(x, w, suh, svh, out, m, n, k, 1u, sm);
-        else dtr_body<K, BOOK, NT, false, false>(x, w, suh, svh, out, m, n, k, 1u, sm);
-    }
-}
-
-template <u32 BOOK, u32 NT>
-static __device__ void dtr_gen_book(const trellis::x_t* x, const u8* w, const float* suh,
-                                    const float* svh, float* out, u32 m, u32 n, u32 k, u32 ks,
-                                    u32 bits, u32 turned, dtr_smem& sm) {
-    if (bits == 2u) dtr_gen_k<2u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
-    else if (bits == 3u) dtr_gen_k<3u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
-    else dtr_gen_k<4u, BOOK, NT>(x, w, suh, svh, out, m, n, k, ks, turned, sm);
-}
-
-template <u32 NT>
-static __device__ void dtr_gen(const trellis::x_t* x, const u8* w, const float* suh,
-                               const float* svh, float* out, u32 m, u32 n, u32 k, u32 ks, u32 bits,
-                               u32 book, u32 turned, dtr_smem& sm) {
-    if (book == trellis::BOOK_PMCGX) {
-        dtr_gen_book<trellis::BOOK_PMCGX, NT>(x, w, suh, svh, out, m, n, k, ks, bits, turned, sm);
-    } else if (book == trellis::BOOK_MUL1) {
-        dtr_gen_book<trellis::BOOK_MUL1, NT>(x, w, suh, svh, out, m, n, k, ks, bits, turned, sm);
-    } else {
-        dtr_gen_book<trellis::BOOK_MCG, NT>(x, w, suh, svh, out, m, n, k, ks, bits, turned, sm);
-    }
-}
-
-#define DTR_DEF(NAME, K, BOOK, NT, TURNED, SPLIT, MIN_BLK)                                    \
-    extern "C" __global__ __launch_bounds__(256, MIN_BLK) void NAME(                          \
-        const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out,   \
-        u32 m, u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {                        \
-        (void)bits;                                                                           \
-        (void)book;                                                                           \
-        (void)turned;                                                                         \
-        __shared__ dtr_smem sm;                                                               \
-        dtr_body<K, BOOK, NT, TURNED, SPLIT>(x, w, suh, svh, out, m, n, k, ks, sm);           \
-    }
-
-DTR_DEF(dtr_k4_t1s, 4u, trellis::BOOK_MCG, 1u, true, true, DTR_T1_BLK)
-DTR_DEF(dtr_k4_t1, 4u, trellis::BOOK_MCG, 1u, true, false, DTR_T1_BLK)
-DTR_DEF(dtr_k4_p1s, 4u, trellis::BOOK_MCG, 1u, false, true, DTR_T1_BLK)
-DTR_DEF(dtr_k4_p1, 4u, trellis::BOOK_MCG, 1u, false, false, DTR_T1_BLK)
-DTR_DEF(dtr_k4_t2s, 4u, trellis::BOOK_MCG, 2u, true, true, DTR_T2_BLK)
-DTR_DEF(dtr_k4_t2, 4u, trellis::BOOK_MCG, 2u, true, false, DTR_T2_BLK)
-DTR_DEF(dtr_k4_t4, 4u, trellis::BOOK_MCG, 4u, true, false, DTR_T4_BLK)
-
-// Generic dense trellis matmul for up to 8 rows.
-extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen1(
-    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
-    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
-    __shared__ dtr_smem sm;
-    dtr_gen<1u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
-}
-
-// Generic dense trellis matmul for 16-row tiles.
-extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen2(
-    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
-    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
-    __shared__ dtr_smem sm;
-    dtr_gen<2u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
-}
-
-// Generic dense trellis matmul for 32-row tiles.
-extern "C" __global__ __launch_bounds__(256, DTR_GEN_BLK) void dtr_gen4(
-    const trellis::x_t* x, const u8* w, const float* suh, const float* svh, float* out, u32 m,
-    u32 n, u32 k, u32 ks, u32 bits, u32 book, u32 turned) {
-    __shared__ dtr_smem sm;
-    dtr_gen<4u>(x, w, suh, svh, out, m, n, k, ks, bits, book, turned, sm);
-}
-
-// Sums split-K partials in order and applies output rotation.
-extern "C" __global__ __launch_bounds__(256, DTR_RED_BLK) void dtr_reduce(
-    const float* part, const float* svh, float* out, u32 m, u32 n, u32 ks, u32 turned) {
-    u32 ob = blockIdx.x;
-    if (ob >= (n >> 7u)) return;
-    u32 warp = threadIdx.x >> 5u;
-    u32 lane = threadIdx.x & 31u;
-    u32 base = (ob << 7u) + (lane << 2u);
-    float sc[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    if (turned != 0u) trellis::load4(svh + base, sc);
-    for (u32 r = warp; r < m; r += 8u) {
-        const float* pb = part + u64(ob) * ks * m * 128u + u64(r) * 128u + (lane << 2u);
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        u32 p = 0u;
-        for (; p + 4u <= ks; p += 4u) {
-            float4 w0 = trellis::ld_cg_f4(pb + u64(p) * m * 128u);
-            float4 w1 = trellis::ld_cg_f4(pb + u64(p + 1u) * m * 128u);
-            float4 w2 = trellis::ld_cg_f4(pb + u64(p + 2u) * m * 128u);
-            float4 w3 = trellis::ld_cg_f4(pb + u64(p + 3u) * m * 128u);
-            v[0] += w0.x + w1.x + w2.x + w3.x; v[1] += w0.y + w1.y + w2.y + w3.y;
-            v[2] += w0.z + w1.z + w2.z + w3.z; v[3] += w0.w + w1.w + w2.w + w3.w;
-        }
-        for (; p < ks; p++) {
-            float4 w = trellis::ld_cg_f4(pb + u64(p) * m * 128u);
-            v[0] += w.x; v[1] += w.y; v[2] += w.z; v[3] += w.w;
-        }
-        if (turned != 0u) {
-            trellis::wht128(v, trellis::INV_SQRT128);
-            v[0] *= sc[0]; v[1] *= sc[1]; v[2] *= sc[2]; v[3] *= sc[3];
-        }
-        *reinterpret_cast<float4*>(out + u64(r) * n + base) = make_float4(v[0], v[1], v[2], v[3]);
-    }
-}
 
 static __device__ __forceinline__ float fg_warp_sum(float v) {
 #pragma unroll
@@ -348,21 +132,21 @@ static __device__ __forceinline__ float fg_silu(float v) {
     return v / (1.0f + expf(-v));
 }
 
-static __device__ __forceinline__ float fg_epilogue(float v, const float* other, u64 off, u32 col,
-                                                    u32 mode) {
-    if (mode == 1u) return v + other[off];
-    if (mode == 2u) return v + other[col];
-    if (mode == 3u) return fg_silu(v) * other[off];
-    if (mode == 4u) return v * other[off];
+static __device__ __forceinline__ float fg_epilogue(float v, const trellis::o_t* other, u64 off,
+                                                    u32 col, u32 mode) {
+    if (mode == 1u) return v + trellis::load_o(other, off);
+    if (mode == 2u) return v + trellis::load_o(other, col);
+    if (mode == 3u) return fg_silu(v) * trellis::load_o(other, off);
+    if (mode == 4u) return v * trellis::load_o(other, off);
     if (mode == 5u) return fg_silu(v);
     return v;
 }
 
-static __device__ __forceinline__ float2 fg_epilogue2(float v0, float v1, const float* other,
+static __device__ __forceinline__ float2 fg_epilogue2(float v0, float v1, const trellis::o_t* other,
                                                       u64 off, u32 col, u32 mode) {
     if (mode == 0u) return make_float2(v0, v1);
     if (mode == 5u) return make_float2(fg_silu(v0), fg_silu(v1));
-    float2 b = *reinterpret_cast<const float2*>(other + (mode == 2u ? u64(col) : off));
+    float2 b = trellis::load_o2(other + (mode == 2u ? u64(col) : off));
     if (mode == 1u || mode == 2u) return make_float2(v0 + b.x, v1 + b.y);
     if (mode == 3u) return make_float2(fg_silu(v0) * b.x, fg_silu(v1) * b.y);
     return make_float2(v0 * b.x, v1 * b.y);
@@ -397,9 +181,10 @@ struct alignas(16) fg_bf16_smem {
 
 template <u32 KS, bool SPLIT>
 static __device__ __forceinline__ void fg_bf16_mm(const trellis::x_t* x, const u16* w,
-                                                  const float* other, float* out, u32 m, u32 n,
-                                                  u32 k, u32 w_stride, u32 x_rs, u32 o_rs, u32 r0,
-                                                  u32 mode, u32 ks, fg_bf16_smem<KS>& sm) {
+                                                  const trellis::o_t* other, trellis::y_t* out,
+                                                  u32 m, u32 n, u32 k, u32 w_stride, u32 x_rs,
+                                                  u32 o_rs, u32 r0, u32 mode, u32 ks,
+                                                  fg_bf16_smem<KS>& sm) {
     constexpr u32 NTILES = 4u / KS;
     constexpr u32 BN = 8u * NTILES;
     constexpr u32 BK = 64u * KS;
@@ -470,38 +255,42 @@ static __device__ __forceinline__ void fg_bf16_mm(const trellis::x_t* x, const u
     }
     u32 col = n0 + (t << 1);
     if constexpr (SPLIT) {
-        if (r0 + g < m) *reinterpret_cast<float2*>(out + (u64(p) * m + r0 + g) * n + col) = make_float2(acc[0], acc[1]);
-        if (r0 + g + 8u < m) *reinterpret_cast<float2*>(out + (u64(p) * m + r0 + g + 8u) * n + col) = make_float2(acc[2], acc[3]);
+        if (r0 + g < m) trellis::store_y2(out + (u64(p) * m + r0 + g) * n + col, acc[0], acc[1]);
+        if (r0 + g + 8u < m) trellis::store_y2(out + (u64(p) * m + r0 + g + 8u) * n + col, acc[2], acc[3]);
     } else {
         if (r0 + g < m) {
             u64 off = u64(r0 + g) * o_rs + col;
-            *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[0], acc[1], other, off, col, mode);
+            float2 v = fg_epilogue2(acc[0], acc[1], other, off, col, mode);
+            trellis::store_y2(out + off, v.x, v.y);
         }
         if (r0 + g + 8u < m) {
             u64 off = u64(r0 + g + 8u) * o_rs + col;
-            *reinterpret_cast<float2*>(out + off) = fg_epilogue2(acc[2], acc[3], other, off, col, mode);
+            float2 v = fg_epilogue2(acc[2], acc[3], other, off, col, mode);
+            trellis::store_y2(out + off, v.x, v.y);
         }
     }
 }
 
 // Streaming BF16 Tensor-Core small-batch matmul, 16x32 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_BLK) void tessera_mm_bf16(
-    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u16* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<1u> sm;
     fg_bf16_mm<1u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Split-K BF16 Tensor-Core small-batch matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_KS2_BLK) void tessera_mm_bf16_ks2(
-    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u16* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode) {
     __shared__ fg_bf16_smem<2u> sm;
     fg_bf16_mm<2u, false>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, 1u, sm);
 }
 
 // Cross-CTA split-K BF16 Tensor-Core matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, MM_BF16_SK_BLK) void tessera_mm_bf16_sk(
-    const trellis::x_t* x, const u16* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
-    u32 ks) {
+    const trellis::x_t* x, const u16* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode, u32 ks) {
     __shared__ fg_bf16_smem<2u> sm;
     fg_bf16_mm<2u, true>(x, w, other, out, m, n, k, k, k, n, blockIdx.y << 4, mode, ks, sm);
 }
@@ -513,8 +302,9 @@ union alignas(16) fg_mx_smem {
 
 template <u32 NT, bool SPLIT>
 static __device__ __forceinline__ void fg_mxfp8_mm(const trellis::x_t* x, const u8* w,
-                                                   const float* other, float* out, u32 m, u32 n,
-                                                   u32 k, u32 mode, u32 ks, fg_mx_smem& sm) {
+                                                   const trellis::o_t* other, trellis::y_t* out,
+                                                   u32 m, u32 n, u32 k, u32 mode, u32 ks,
+                                                   fg_mx_smem& sm) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
     u32 r0 = blockIdx.y * (NT << 3), nb = n >> 4;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -613,10 +403,10 @@ static __device__ __forceinline__ void fg_mxfp8_mm(const trellis::x_t* x, const 
         if (r0 + tr < m) {
             float v = sm.red[0][tr][col] + sm.red[1][tr][col] + sm.red[2][tr][col] +
                       sm.red[3][tr][col];
-            if constexpr (SPLIT) out[(u64(p) * m + (r0 + tr)) * n + n0 + col] = v;
+            if constexpr (SPLIT) trellis::store_y(out, (u64(p) * m + (r0 + tr)) * n + n0 + col, v);
             else {
                 u64 off = u64(r0 + tr) * n + n0 + col;
-                out[off] = fg_epilogue(v, other, off, n0 + col, mode);
+                trellis::store_y(out, off, fg_epilogue(v, other, off, n0 + col, mode));
             }
         }
     }
@@ -635,8 +425,9 @@ static __device__ __forceinline__ u16 fg_u16_odd(const u32* s, u32 byte_off) {
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_mxfp8_r64(const trellis::x_t* x, const u8* w,
-                                                    const float* other, float* out, u32 m, u32 n,
-                                                    u32 k, u32 mode, u32 ks, fg_mx64_smem& sm) {
+                                                    const trellis::o_t* other, trellis::y_t* out,
+                                                    u32 m, u32 n, u32 k, u32 mode, u32 ks,
+                                                    fg_mx64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, g = lane >> 2, t = lane & 3u;
     u32 wm = warp >> 2, wn = warp & 3u, nb = (n + 63u) >> 6;
     u32 ob = SPLIT ? (blockIdx.x % nb) : blockIdx.x, p = SPLIT ? (blockIdx.x / nb) : 0u;
@@ -711,43 +502,45 @@ static __device__ __forceinline__ void fg_mxfp8_r64(const trellis::x_t* x, const
         u32 row0 = r0 + m_base + (ti << 3) + (t << 1);
         if (row0 < m) {
             u64 off0 = u64(SPLIT ? (p * m + row0) : row0) * n;
-            if (col0 < n) out[off0 + col0] = SPLIT ? acc[ti][0] : fg_epilogue(acc[ti][0], other, off0 + col0, col0, mode);
-            if (col1 < n) out[off0 + col1] = SPLIT ? acc[ti][2] : fg_epilogue(acc[ti][2], other, off0 + col1, col1, mode);
+            if (col0 < n) trellis::store_y(out, off0 + col0, SPLIT ? acc[ti][0] : fg_epilogue(acc[ti][0], other, off0 + col0, col0, mode));
+            if (col1 < n) trellis::store_y(out, off0 + col1, SPLIT ? acc[ti][2] : fg_epilogue(acc[ti][2], other, off0 + col1, col1, mode));
         }
         if (row0 + 1u < m) {
             u64 off1 = u64(SPLIT ? (p * m + row0 + 1u) : (row0 + 1u)) * n;
-            if (col0 < n) out[off1 + col0] = SPLIT ? acc[ti][1] : fg_epilogue(acc[ti][1], other, off1 + col0, col0, mode);
-            if (col1 < n) out[off1 + col1] = SPLIT ? acc[ti][3] : fg_epilogue(acc[ti][3], other, off1 + col1, col1, mode);
+            if (col0 < n) trellis::store_y(out, off1 + col0, SPLIT ? acc[ti][1] : fg_epilogue(acc[ti][1], other, off1 + col0, col0, mode));
+            if (col1 < n) trellis::store_y(out, off1 + col1, SPLIT ? acc[ti][3] : fg_epilogue(acc[ti][3], other, off1 + col1, col1, mode));
         }
     }
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 8 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R8_BLK) void tessera_mm_mxfp8_r8(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<1u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K MXFP8 Tensor-Core matmul, up to 8 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R8_SK_BLK) void tessera_mm_mxfp8_r8_sk(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
-    u32 ks) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode, u32 ks) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<1u, true>(x, w, other, out, m, n, k, mode, ks, sm);
 }
 
 // Split-K MXFP8 Tensor-Core matmul, up to 16 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R16_SK_BLK) void tessera_mm_mxfp8_r16_sk(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
-    u32 ks) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode, u32 ks) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<2u, true>(x, w, other, out, m, n, k, mode, ks, sm);
 }
 
 // Sums split-K partials in order and applies matmul epilogue.
 extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
-    const float* part, const float* other, float* out, u32 m, u32 n, u32 ks, u32 mode) {
+    const float* part, const trellis::o_t* other, trellis::y_t* out, u32 m, u32 n, u32 ks,
+    u32 mode) {
     u64 idx = u64(blockIdx.x) * 256u + threadIdx.x;
     u64 mn = u64(m) * n;
     if (idx >= mn) return;
@@ -755,12 +548,13 @@ extern "C" __global__ __launch_bounds__(256, MM_RED_BLK) void tessera_mm_reduce(
     for (u32 p = 0u; p < ks; p++) {
         v += part[u64(p) * mn + idx];
     }
-    out[idx] = fg_epilogue(v, other, idx, u32(idx % n), mode);
+    trellis::store_y(out, idx, fg_epilogue(v, other, idx, u32(idx % n), mode));
 }
 
 // Streaming MXFP8 Tensor-Core matmul, up to 16 rows per block.
 extern "C" __global__ __launch_bounds__(128, MM_MX_R16_BLK) void tessera_mm_mxfp8_r16(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode) {
     __shared__ fg_mx_smem sm;
     fg_mxfp8_mm<2u, false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
@@ -773,32 +567,35 @@ static __device__ __forceinline__ float fg_gemv_act(float s, u32 mode, float a, 
 
 // Staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX_R64_BLK) void tessera_mm_mxfp8_r64(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode) {
     __shared__ fg_mx64_smem sm;
     fg_mxfp8_r64<false>(x, w, other, out, m, n, k, mode, 1u, sm);
 }
 
 // Split-K staged-X MXFP8 Tensor-Core matmul, 64x64 per block.
 extern "C" __global__ __launch_bounds__(256, MM_MX_R64_SK_BLK) void tessera_mm_mxfp8_r64_sk(
-    const trellis::x_t* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode,
-    u32 ks) {
+    const trellis::x_t* x, const u8* w, const trellis::o_t* other, trellis::y_t* out, u32 m,
+    u32 n, u32 k, u32 mode, u32 ks) {
     __shared__ fg_mx64_smem sm;
     fg_mxfp8_r64<true>(x, w, other, out, m, n, k, mode, ks, sm);
 }
 
 // Streaming 8-BF16 decode GEMV, one warp per output row.
 extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16(
-    const trellis::x_t* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 n, u32 k, u32 mode, float a,
+    float b) {
     u32 row = blockIdx.x * GEMV_BF16_WARPS + (threadIdx.x >> 5);
     if (row >= n) return;
     u32 lane = threadIdx.x & 31u;
     float s = fg_dot8_bf16(x, w + u64(row) * k, k, lane);
-    if (lane == 0u) out[row] = fg_gemv_act(s, mode, a, b);
+    if (lane == 0u) trellis::store_y(out, row, fg_gemv_act(s, mode, a, b));
 }
 
 // Streaming 8-BF16 narrow decode GEMV, one block per output row.
 extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) void tessera_gemv_bf16_narrow(
-    const trellis::x_t* x, const u16* w, float* out, u32 n, u32 k, u32 mode, float a, float b) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 n, u32 k, u32 mode, float a,
+    float b) {
     __shared__ float part[GEMV_BF16_WARPS];
     u32 row = blockIdx.x;
     if (row >= n) return;
@@ -813,29 +610,29 @@ extern "C" __global__ __launch_bounds__(GEMV_BF16_WARPS * 32, GEMV_BF16_BLK) voi
         float s = 0.0f;
 #pragma unroll
         for (u32 wi = 0u; wi < GEMV_BF16_WARPS; wi++) s += part[wi];
-        out[row] = fg_gemv_act(s, mode, a, b);
+        trellis::store_y(out, row, fg_gemv_act(s, mode, a, b));
     }
 }
 
 // Tensor-Core BF16 stacked matmul, 16x16 per block.
 extern "C" __global__ __launch_bounds__(128, ST_TC_BLK) void tessera_stacked_lanes_tc(
-    const trellis::x_t* x, const u16* w, float* out, u32 rows, u32 n, u32 k, u32 block, u32 first,
-    u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 rows, u32 n, u32 k, u32 block,
+    u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     __shared__ fg_bf16_smem<2u> sm;
     u32 rtiles = (rows + 15u) >> 4u;
     u32 batch = blockIdx.y / rtiles;
     u32 r0 = (blockIdx.y % rtiles) << 4u;
     const trellis::x_t* xb = x + u64(batch) * x_bs + u64(r0) * x_rs;
     const u16* wb = w + u64(batch) * block + first;
-    float* ob = out + u64(batch) * o_bs + u64(r0) * o_rs;
+    trellis::y_t* ob = out + u64(batch) * o_bs + u64(r0) * o_rs;
     u32 nr = min(rows - r0, 16u);
     fg_bf16_mm<2u, false>(xb, wb, nullptr, ob, nr, n, k, col_step, x_rs, o_rs, 0u, 0u, 1u, sm);
 }
 
 // Streaming 8-BF16 stacked matmul, up to 8 rows per warp.
 extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_lanes(
-    const trellis::x_t* x, const u16* w, float* out, u32 len, u32 rows, u32 n, u32 k, u32 block,
-    u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
+    const trellis::x_t* x, const u16* w, trellis::y_t* out, u32 len, u32 rows, u32 n, u32 k,
+    u32 block, u32 first, u32 col_step, u32 x_bs, u32 x_rs, u32 o_bs, u32 o_rs) {
     u32 idx = blockIdx.x * TM_WARPS + (threadIdx.x >> 5);
     if (idx >= len) return;
     u32 lane = threadIdx.x & 31u;
@@ -865,13 +662,13 @@ extern "C" __global__ __launch_bounds__(256, ST_LANES_BLK) void tessera_stacked_
     for (u32 r = 0u; r < 8u; r++) {
         if (r >= nr) break;
         float s = fg_warp_sum(acc[r]);
-        if (lane == 0u) out[u64(batch) * o_bs + u64(r0 + r) * o_rs + col] = s;
+        if (lane == 0u) trellis::store_y(out, u64(batch) * o_bs + u64(r0 + r) * o_rs + col, s);
     }
 }
 
 // Streaming chunk-tiled MXFP8 decode GEMV, one warp per output.
 extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_mxfp8(
-    const trellis::x_t* x, const u8* w, float* out, u32 n, u32 k) {
+    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][268];
     u32 warp = threadIdx.x >> 5;
@@ -922,13 +719,13 @@ extern "C" __global__ __launch_bounds__(256, GEMV_MXFP8_BLK) void tessera_gemv_m
     }
     if (live) {
         float s = fg_warp_sum(acc);
-        if (lane == 0u) out[row] = s;
+        if (lane == 0u) trellis::store_y(out, row, s);
     }
 }
 
 // Streaming chunk-tiled 2-row INT4_G32 decode GEMV.
 extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_int4(
-    const trellis::x_t* x, const u8* w, float* out, u32 n, u32 k) {
+    const trellis::x_t* x, const u8* w, trellis::y_t* out, u32 n, u32 k) {
     __shared__ __align__(16) u32 x_h[512];
     __shared__ __align__(16) u32 sm_buf[TM_WARPS][296];
     u32 warp = threadIdx.x >> 5;
@@ -988,8 +785,8 @@ extern "C" __global__ __launch_bounds__(256, GEMV_INT4_BLK) void tessera_gemv_in
     if (live) {
         float s0 = fg_warp_sum(acc0), s1 = fg_warp_sum(acc1);
         if (lane == 0u) {
-            out[row0] = s0;
-            out[row0 + 1u] = s1;
+            trellis::store_y(out, row0, s0);
+            trellis::store_y(out, row0 + 1u, s1);
         }
     }
 }
