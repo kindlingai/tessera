@@ -1,9 +1,7 @@
 //! Page-table wire patch codec and `Lanes` re-export.
 
 use tessera_engine_comm::{Reader, Writer};
-pub(crate) use tessera_kv::{
-    EVICT_COLD, EVICT_HOT, EVICT_MIDDLE, EVICT_PINNED, EVICT_SHARED, Lanes,
-};
+pub(crate) use tessera_kv::{EVICT_COLD, EVICT_PINNED, Lanes};
 
 /// Writes dirty table patches to `w`.
 pub(crate) fn encode_patches(w: &mut Writer, patches: &[(u32, &[u32])]) {

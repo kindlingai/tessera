@@ -404,7 +404,7 @@ impl Engine {
             };
             let host_pages = lanes.index_pages().min(max_host);
             if host_pages > 0 && self.runner.open_host_kv(host_pages, page)? {
-                lanes.enable_tier(host_pages);
+                lanes.enable_tier(host_pages, Box::new(tessera_kv::Aged::default()));
                 self.disk = None;
                 return Ok(());
             }

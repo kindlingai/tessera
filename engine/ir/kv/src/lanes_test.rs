@@ -1,4 +1,5 @@
-use crate::{EVICT_COLD, EVICT_HOT, Error, Lanes};
+use crate::tiering::EVICT_HOT;
+use crate::{Aged, EVICT_COLD, Error, Lanes};
 
 const HOST: u32 = 1 << 30;
 
@@ -33,7 +34,7 @@ fn tracks_dirty_ranges() {
 /// A split table with 4 VRAM and 16 host pages.
 fn tiered() -> Lanes {
     let mut lanes = Lanes::new_split(16, 16, 2, 4, 16);
-    lanes.enable_tier(16);
+    lanes.enable_tier(16, Box::new(Aged::default()));
     lanes
 }
 

@@ -39,7 +39,7 @@ fn tier_host_demote_reuse() {
     let (slots, context, page) = (2, 128, 16);
     let (kv_pages, idx_pages) = (4, 16);
     let mut lanes = Lanes::new_split(page, slots * (context / page), slots, kv_pages, idx_pages);
-    lanes.enable_tier(idx_pages);
+    lanes.enable_tier(idx_pages, Box::new(tessera_kv::Aged::default()));
     assert!(lanes.tiered());
     assert_eq!(lanes.pages(), idx_pages);
     let mut kept = Kept::paged(slots, context, lanes.pages(), page);

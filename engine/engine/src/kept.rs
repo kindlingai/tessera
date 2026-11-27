@@ -1,14 +1,10 @@
 //! Finished answers' rows, kept for follow-up prompts to reuse.
 
 use crate::Error;
-use crate::lanes::{EVICT_COLD, EVICT_HOT, EVICT_MIDDLE, EVICT_PINNED, EVICT_SHARED};
-use tessera_kv::{Pool, Prefixes, RunId, Stats, Tag};
+use crate::lanes::{EVICT_COLD, EVICT_PINNED};
+use tessera_kv::{Pool, Prefixes, RunId, Spot, Stats, Tag};
 
 const TAG: Tag = Tag(0);
-/// Early prefix pages per slot kept hot in VRAM.
-const PREFIX_HOT_PAGES: usize = 32;
-/// Recent tail pages per slot kept hot in VRAM.
-const TAIL_HOT_PAGES: usize = 192;
 
 crate::metric_registry!(KV = "kv");
 crate::metric!(SIZE in KV = Gauge "vllm:kv_cache_size_tokens", "Rows in the kept-row pool.");
@@ -253,26 +249,15 @@ impl Kept {
     /// Classifies each pool page for `TIER_HOST` eviction priority.
     fn page_priorities(&self, lanes: &crate::lanes::Lanes) -> Vec<u8> {
         let mut priority = vec![EVICT_COLD; lanes.pages()];
-        let live_slots = self.runs.iter().filter(|r| r.is_some()).count().max(1);
-        let share = lanes.kv_pages() / (live_slots * 2);
-        let prefix_hot = PREFIX_HOT_PAGES.min(share / 4).max(1);
-        let tail_hot = TAIL_HOT_PAGES.min(share.saturating_sub(prefix_hot)).max(1);
+        let live = self.runs.iter().filter(|r| r.is_some()).count();
         for slot in 0..self.runs.len() {
             let Some(pages) = self.pages(slot as u32) else {
                 continue;
             };
             let len = pages.len();
-            let tail_start = len.saturating_sub(tail_hot);
-            for (i, &p) in pages.iter().enumerate() {
-                let cls = if i + 1 == len {
-                    EVICT_PINNED
-                } else if self.pool.live_holders(p) > 1 {
-                    EVICT_SHARED
-                } else if i < prefix_hot || i >= tail_start {
-                    EVICT_HOT
-                } else {
-                    EVICT_MIDDLE
-                };
+            for (at, &p) in pages.iter().enumerate() {
+                let holders = self.pool.live_holders(p);
+                let cls = lanes.class(Spot { at, len, holders }, live);
                 if let Some(pr) = priority.get_mut(p as usize) {
                     *pr = (*pr).max(cls);
                 }

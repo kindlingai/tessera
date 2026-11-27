@@ -1,23 +1,11 @@
 //! Host page tables and two-tier sparse KV mapping.
 
 use crate::Error;
-use std::collections::VecDeque;
+use crate::tiering::{EVICT_COLD, Load, Room, Spot, Tiering};
 use std::ops::Range;
 
 /// Page-table bit selecting pinned host RAM (`TIER_HOST = 1` in `kept.h`).
 const TIER_HOST_BIT: u32 = 1 << 30;
-
-/// Minimum pages demoted per batch when VRAM runs low.
-const DEMOTE_BATCH: usize = 256;
-/// Maximum hot host pages promoted per step.
-const PROMOTE_HOT_BATCH: usize = 256;
-
-/// Eviction priority levels for `TIER_HOST` (lowest demotes first).
-pub const EVICT_COLD: u8 = 0;
-pub const EVICT_MIDDLE: u8 = 1;
-pub const EVICT_HOT: u8 = 2;
-pub const EVICT_SHARED: u8 = 3;
-pub const EVICT_PINNED: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Loc {
@@ -39,18 +27,23 @@ struct TierMap {
     loc: Vec<Option<Loc>>,
     vram_free: Vec<u32>,
     host_free: Vec<u32>,
-    order: VecDeque<u32>,
+    policy: Box<dyn Tiering>,
     vram_cap: usize,
     host_cap: usize,
 }
 
 impl TierMap {
-    fn new(index_pages: usize, vram_pages: usize, host_pages: usize) -> Self {
+    fn new(
+        index_pages: usize,
+        vram_pages: usize,
+        host_pages: usize,
+        policy: Box<dyn Tiering>,
+    ) -> Self {
         Self {
             loc: vec![None; index_pages],
             vram_free: (0..vram_pages as u32).rev().collect(),
             host_free: (0..host_pages as u32).rev().collect(),
-            order: VecDeque::with_capacity(vram_pages),
+            policy,
             vram_cap: vram_pages,
             host_cap: host_pages,
         }
@@ -60,13 +53,10 @@ impl TierMap {
         self.loc.fill(None);
         self.vram_free = (0..self.vram_cap as u32).rev().collect();
         self.host_free = (0..self.host_cap as u32).rev().collect();
-        self.order.clear();
+        self.policy.clear();
     }
 
     fn release(&mut self, freed: &[u32]) {
-        if freed.is_empty() {
-            return;
-        }
         for &p in freed {
             if let Some(loc) = self.loc.get_mut(p as usize).and_then(Option::take) {
                 match loc {
@@ -75,14 +65,7 @@ impl TierMap {
                 }
             }
         }
-        self.retain_vram();
-    }
-
-    /// Drops order entries for pages no longer in VRAM.
-    fn retain_vram(&mut self) {
-        let loc = &self.loc;
-        self.order
-            .retain(|&p| matches!(loc.get(p as usize).copied().flatten(), Some(Loc::Vram(_))));
+        self.policy.freed(freed);
     }
 
     fn at(&self, p: u32) -> Option<Loc> {
@@ -91,116 +74,6 @@ impl TierMap {
 
     fn entry(&self, p: u32) -> u32 {
         self.at(p).map_or(0, Loc::entry)
-    }
-
-    fn pick_victims(
-        &mut self,
-        short: usize,
-        want: usize,
-        write_pages: &[u32],
-        fresh: &[u32],
-        priority: &[u8],
-    ) -> Vec<(u32, u32)> {
-        self.retain_vram();
-        let hot_cap = short.min(self.host_free.len());
-        let mut victims: Vec<(u32, u32)> = Vec::with_capacity(want);
-        let mut taken = vec![false; self.loc.len()];
-        for class in [EVICT_COLD, EVICT_MIDDLE, EVICT_HOT, EVICT_SHARED] {
-            if class > EVICT_COLD && victims.len() >= hot_cap {
-                break;
-            }
-            let target = if class < EVICT_HOT { want } else { hot_cap };
-            if victims.len() >= target {
-                continue;
-            }
-            for &p in &self.order {
-                if victims.len() >= target {
-                    break;
-                }
-                let idx = p as usize;
-                if taken[idx] || write_pages.contains(&p) || fresh.contains(&p) {
-                    continue;
-                }
-                let pr = priority.get(idx).copied().unwrap_or(EVICT_COLD);
-                if pr != class {
-                    continue;
-                }
-                if let Some(Loc::Vram(v)) = self.loc[idx] {
-                    taken[idx] = true;
-                    victims.push((p, v));
-                }
-            }
-        }
-        if !victims.is_empty() {
-            self.order.retain(|&p| !taken[p as usize]);
-        }
-        victims
-    }
-
-    fn pick_hot_promotes(
-        &self,
-        req_need: usize,
-        write_pages: &[u32],
-        fresh: &[u32],
-        priority: &[u8],
-        to_promote: &mut Vec<(u32, u32)>,
-    ) {
-        let mut cold_vram = 0usize;
-        let mut hot_vram = 0usize;
-        for &p in &self.order {
-            let idx = p as usize;
-            if !matches!(self.at(p), Some(Loc::Vram(_))) {
-                continue;
-            }
-            if write_pages.contains(&p) || fresh.contains(&p) {
-                continue;
-            }
-            let pr = priority.get(idx).copied().unwrap_or(EVICT_COLD);
-            if pr < EVICT_HOT {
-                cold_vram += 1;
-            } else if pr == EVICT_HOT {
-                hot_vram += 1;
-            }
-        }
-        let mut spare_hot = (self.vram_free.len() + cold_vram).saturating_sub(req_need);
-        let mut spare_shared =
-            (self.vram_free.len() + cold_vram + hot_vram).saturating_sub(req_need);
-        let req_evict = req_need.saturating_sub(self.vram_free.len());
-        let max_evict = self.host_free.len().saturating_sub(req_evict);
-        let mut budget =
-            (self.vram_free.len().saturating_sub(req_need) + max_evict).min(PROMOTE_HOT_BATCH);
-        for target_pr in [EVICT_SHARED, EVICT_HOT] {
-            for (idx, loc) in self.loc.iter().enumerate() {
-                if budget == 0 {
-                    return;
-                }
-                let Some(Loc::Host(h)) = *loc else {
-                    continue;
-                };
-                if priority.get(idx).copied().unwrap_or(EVICT_COLD) != target_pr {
-                    continue;
-                }
-                let p = idx as u32;
-                if to_promote.iter().any(|&(q, _)| q == p) {
-                    continue;
-                }
-                if target_pr == EVICT_SHARED {
-                    if spare_shared == 0 {
-                        break;
-                    }
-                    spare_shared -= 1;
-                    spare_hot = spare_hot.saturating_sub(1);
-                } else {
-                    if spare_hot == 0 {
-                        return;
-                    }
-                    spare_hot -= 1;
-                    spare_shared = spare_shared.saturating_sub(1);
-                }
-                budget -= 1;
-                to_promote.push((p, h));
-            }
-        }
     }
 
     fn ensure_vram<E: From<Error>>(
@@ -224,8 +97,29 @@ impl TierMap {
                 to_promote.push((p, h));
             }
         }
-        let req_need = fresh.len() + to_promote.len();
-        self.pick_hot_promotes(req_need, write_pages, &fresh, priority, &mut to_promote);
+        let loc = &self.loc;
+        let rank = |p: u32| priority.get(p as usize).copied().unwrap_or(EVICT_COLD);
+        let level = |p: u32| match loc.get(p as usize).copied().flatten() {
+            Some(Loc::Vram(_)) if !write_pages.contains(&p) => Some(rank(p)),
+            _ => None,
+        };
+        let mut host = Vec::new();
+        for (idx, at) in loc.iter().enumerate() {
+            let p = idx as u32;
+            if matches!(at, Some(Loc::Host(_))) && !write_pages.contains(&p) {
+                host.push((p, rank(p)));
+            }
+        }
+        let room = Room {
+            need: fresh.len() + to_promote.len(),
+            vram_free: self.vram_free.len(),
+            host_free: self.host_free.len(),
+        };
+        for p in self.policy.promotes(room, &level, &host) {
+            if let Some(Loc::Host(h)) = self.at(p) {
+                to_promote.push((p, h));
+            }
+        }
         let need = fresh.len() + to_promote.len();
         if need == 0 {
             return Ok(false);
@@ -233,8 +127,13 @@ impl TierMap {
         let mut moved = false;
         if self.vram_free.len() < need {
             let short = need - self.vram_free.len();
-            let want = short.max(DEMOTE_BATCH).min(self.host_free.len());
-            let victims = self.pick_victims(short, want, write_pages, &fresh, priority);
+            let picked = self.policy.victims(short, self.host_free.len(), &level);
+            let mut victims = Vec::with_capacity(picked.len());
+            for p in picked {
+                if let Some(Loc::Vram(v)) = self.at(p) {
+                    victims.push((p, v));
+                }
+            }
             if self.vram_free.len() + victims.len() < need {
                 return Err(Error::TierFull.into());
             }
@@ -257,7 +156,7 @@ impl TierMap {
         for p in fresh {
             let v = self.vram_free.pop().ok_or(Error::TierFull)?;
             self.loc[p as usize] = Some(Loc::Vram(v));
-            self.order.push_back(p);
+            self.policy.placed(p);
         }
         if !to_promote.is_empty() {
             let mut pairs = Vec::with_capacity(to_promote.len());
@@ -271,7 +170,7 @@ impl TierMap {
             for (&(p, h), &(v, _)) in to_promote.iter().zip(&pairs) {
                 self.loc[p as usize] = Some(Loc::Vram(v));
                 self.host_free.push(h);
-                self.order.push_back(p);
+                self.policy.placed(p);
             }
             moved = true;
         }
@@ -442,11 +341,22 @@ impl Lanes {
     }
 
     /// Enables `TIER_HOST` mapping backed by `host_pages` pinned host pages.
-    pub fn enable_tier(&mut self, host_pages: usize) {
+    pub fn enable_tier(&mut self, host_pages: usize, policy: Box<dyn Tiering>) {
         if self.index_pool > 0 && host_pages > 0 {
             let cap = self.tier_cap(host_pages);
-            self.tier = Some(TierMap::new(cap, self.pool, host_pages));
+            self.tier = Some(TierMap::new(cap, self.pool, host_pages, policy));
         }
+    }
+
+    /// The tier policy's level for a lane's page.
+    pub fn class(&self, spot: Spot, slots: usize) -> u8 {
+        let load = Load {
+            pages: self.pool,
+            slots,
+        };
+        self.tier
+            .as_ref()
+            .map_or(EVICT_COLD, |t| t.policy.class(spot, load))
     }
 
     fn tier_cap(&self, host_pages: usize) -> usize {
