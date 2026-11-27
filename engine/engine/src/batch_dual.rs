@@ -13,8 +13,13 @@ use crate::spec_len::{CostModel, SpecLen};
 use crate::spec_loop::{TapsBuf, TapsIn, span};
 use crate::speculate::Drafter;
 use crate::{Engine, Error, Head, Request, Row};
+use interleave::{Cooldown, Interleave, Work};
 use std::collections::VecDeque;
 use tessera_lower::Wants;
+
+mod interleave;
+#[cfg(test)]
+mod interleave_test;
 
 /// Context rows retained per slot for DFlash tail promotion.
 pub(crate) const DFLASH_TAIL_WIN: usize = 128;
@@ -292,10 +297,6 @@ impl<'a> BatchMtp<'a> {
 
 /// Headroom rows reserved before admitting another paged request.
 pub(crate) const PAGE_HEADROOM: usize = 2048;
-/// Suffix length that bypasses decode interleaving cooldown.
-const QUICK_PREFILL_ROWS: usize = 512;
-/// Maximum extra decode rounds run after a large prefill chunk.
-const MAX_DECODE_INTERLEAVE: usize = 4;
 
 fn taps_slice(buf: &TapsBuf, row_off: usize, rows: usize, width: usize) -> TapsIn<'_> {
     match buf {
@@ -365,7 +366,7 @@ pub struct BatchDFlash<'a> {
     reuse: bool,
     admitted_skips: VecDeque<usize>,
     prefilling: VecDeque<DFlashPrefill>,
-    prefill_cooldown: usize,
+    interleave: Box<dyn Interleave>,
     active: Vec<DFlashSeq>,
 }
 
@@ -391,7 +392,7 @@ impl<'a> BatchDFlash<'a> {
             reuse: false,
             admitted_skips: VecDeque::new(),
             prefilling: VecDeque::new(),
-            prefill_cooldown: 0,
+            interleave: Box::new(Cooldown::default()),
             active: Vec::new(),
         })
     }
@@ -463,22 +464,9 @@ impl<'a> BatchDFlash<'a> {
                 d_base,
             });
         }
-        let run_prefill = if self.prefilling.is_empty() {
-            self.prefill_cooldown = 0;
-            false
-        } else if self.active.is_empty() || self.prefill_cooldown == 0 || self.has_quick_prefill() {
-            true
-        } else {
-            self.prefill_cooldown -= 1;
-            false
-        };
-        if run_prefill {
+        if self.interleave.prefill(self.work()) {
             let rows = self.prefill_step()?;
-            self.prefill_cooldown = if !self.prefilling.is_empty() && !self.active.is_empty() {
-                (rows / 1024).min(MAX_DECODE_INTERLEAVE)
-            } else {
-                0
-            };
+            self.interleave.fed(rows, self.work());
         }
         self.active.sort_by_key(|s| s.seq.slot);
         if !self.active.is_empty() {
@@ -490,10 +478,13 @@ impl<'a> BatchDFlash<'a> {
         Ok(())
     }
 
-    fn has_quick_prefill(&self) -> bool {
-        self.prefilling
-            .iter()
-            .any(|s| s.rem() <= QUICK_PREFILL_ROWS)
+    fn work(&self) -> Work {
+        let least = self.prefilling.iter().map(|s| s.rem()).min();
+        Work {
+            prefilling: self.prefilling.len(),
+            active: self.active.len(),
+            least: least.unwrap_or(usize::MAX),
+        }
     }
 
     fn finish_dflash_prefill(
