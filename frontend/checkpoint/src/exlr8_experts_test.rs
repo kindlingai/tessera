@@ -1,5 +1,5 @@
 use crate::exlr8::Release;
-use crate::exlr8_test::{Tensor, floats, halves, ramp, write};
+use crate::exlr8_fixture::{Tensor, floats, halves, ramp, write};
 use crate::{Offer, Stored};
 use std::path::Path;
 use tessera_engine::storage::Form;
