@@ -1,19 +1,21 @@
 //! Inkling-2-Mini: a looped decoder with routed experts.
 
+mod looped_test;
+
 use tessera_models::Stack;
 use tessera_models::inkling2::{Config, Plain, program, stepper};
 use tessera_parity::{Spec, Stepper, suite};
 use tessera_trace::Composite::{Attention, Model, Moe};
 use tessera_trace::Graph;
 
-/// Three layers, global core twice, for fast rule sweeps.
+/// Two unlooped layers, local and global, for fast rule sweeps.
 fn compact() -> Config {
     Config {
-        stack: Stack::sized([64, 16, 3, 4, 4, 16], 2, 16),
-        global: vec![false, true, false],
-        loop_start: 1,
-        loop_end: 2,
-        loop_passes: 2,
+        stack: Stack::sized([64, 16, 2, 4, 4, 16], 2, 16),
+        global: vec![false, true],
+        n_experts: 2,
+        top_k: 2,
+        loop_passes: 1,
         ..Config::small()
     }
 }
