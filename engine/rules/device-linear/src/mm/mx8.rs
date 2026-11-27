@@ -177,3 +177,82 @@ fn mx8_mm_launches(k: &Mxfp8Mx8, step: &Step) -> Vec<Launch> {
     }
     vec![Launch { args, shape }]
 }
+
+fn draft_mx8(site: MmSite, mode: u32, other: Option<T>) -> Vec<Draft> {
+    let prep = Mxfp8Prep {
+        m: site.m,
+        k: site.k,
+        min_blocks: site.prep_min_blocks,
+    };
+    let pre_len = mxfp8_pre_len(site.m, site.k);
+    if site.ks > 1 {
+        let mm = Mxfp8Mx8 {
+            m: site.m,
+            n: site.n,
+            k: site.k,
+            ks: site.ks,
+            mode: 0,
+            min_blocks: site.min_blocks,
+            form: site.form,
+        };
+        return vec![
+            Draft::new(prep, [Read::Node(site.x)], pre_len),
+            Draft::new(
+                mm,
+                [Read::Draft(0), Read::Node(site.w)],
+                site.ks * site.m * site.n,
+            ),
+            site.reduce_draft(1, mode, other, None),
+        ];
+    }
+    let mm = Mxfp8Mx8 {
+        m: site.m,
+        n: site.n,
+        k: site.k,
+        ks: 1,
+        mode,
+        min_blocks: site.min_blocks,
+        form: site.form,
+    };
+    let mut reads = vec![Read::Draft(0), Read::Node(site.w)];
+    if let Some(extra) = other {
+        reads.push(Read::Node(extra));
+    }
+    vec![
+        Draft::new(prep, [Read::Node(site.x)], pre_len),
+        Draft::new(mm, reads, site.m * site.n),
+    ]
+}
+
+fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
+    let mut site = mm_site(tree, mat)?;
+    if site.form.name() != "mxfp8" || site.m < knob(tree, "fast_mm_mxfp8_mx8", "min_rows", 64) {
+        return None;
+    }
+    let chunks = site.k / 512;
+    let set = set_ks(tree, "fast_mm_mxfp8_mx8_sk", chunks)
+        .or_else(|| set_ks(tree, "fast_mm_mxfp8_sk", chunks));
+    let min_g = knob(tree, "fast_mm_mxfp8_mx8", "min_groups", 40);
+    let target = knob(tree, "fast_mm_mxfp8_mx8", "target_groups", 64);
+    site.ks = set.unwrap_or_else(|| mxfp8_tile_ks(site.m, site.n, site.k, 128, min_g, 24, target));
+    let mx_rule = if site.ks > 1 {
+        "fast_mm_mxfp8_mx8_sk"
+    } else {
+        "fast_mm_mxfp8_mx8"
+    };
+    site.min_blocks = tree.knobs.get(mx_rule, "min_blocks").map(|v| v as u32);
+    site.prep_min_blocks = tree
+        .knobs
+        .get("fast_mm_mxfp8_mx8", "prep_min_blocks")
+        .map(|v| v as u32);
+    site.reduce_min_blocks = tree
+        .knobs
+        .get("fast_mm_mxfp8_mx8_sk", "reduce_min_blocks")
+        .map(|v| v as u32);
+    Some(site)
+}
+
+pub(crate) fn propose_mm_mx8(tree: &Tree, at: T) -> Option<Vec<Draft>> {
+    let (site, mode, other) = match_mm_site(tree, at, mx8_site)?;
+    Some(draft_mx8(site, mode, other))
+}

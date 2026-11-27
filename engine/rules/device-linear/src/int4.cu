@@ -5,13 +5,29 @@ using namespace tessera;
 
 #if defined(TESSERA_CUDA)
 
+static __device__ __forceinline__ float i4_b1(const u8* p, u32 col, bool bf16) {
+    return bf16 ? __uint_as_float(u32(reinterpret_cast<const u16*>(p)[col]) << 16u)
+                : reinterpret_cast<const float*>(p)[col];
+}
+
 static __device__ __forceinline__ float i4_epilogue(
-    float v, const float* other, u64 off, u32 col, u32 mode) {
-    if (mode == 1u) return v + other[off];
-    if (mode == 2u) return v + other[col];
-    if (mode == 3u) return (v / (1.0f + expf(-v))) * other[off];
-    if (mode == 4u) return v * other[off];
-    if (mode == 5u) return v / (1.0f + expf(-v));
+    float v, const float* other, const u8* bias_p, u64 off, u32 col, u32 mode) {
+    u32 base = mode & 15u;
+    bool bf16 = (mode & 16u) != 0u;
+    if (base == 1u) return v + other[off];
+    if (base == 2u) return v + i4_b1(reinterpret_cast<const u8*>(other), col, bf16);
+    if (base == 3u) return (v / (1.0f + expf(-v))) * other[off];
+    if (base == 4u) return v * other[off];
+    if (base == 5u) return v / (1.0f + expf(-v));
+    if (base == 6u) {
+        float x = v + i4_b1(reinterpret_cast<const u8*>(other), col, bf16);
+        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    }
+    if (base == 7u) {
+        float x = v + i4_b1(reinterpret_cast<const u8*>(other), col, bf16);
+        return 0.5f * x * (1.0f + erff(x * 0.7071067811865475244f));
+    }
+    if (base == 8u) return v + i4_b1(bias_p, col, bf16) + other[off];
     return v;
 }
 
@@ -57,7 +73,7 @@ static __device__ __forceinline__ void i4_hilo_pair(const float* p, u32& hi, u32
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r16(
-    const float* x, const u8* w, const float* other, float* out,
+    const float* x, const u8* w, const float* other, const u8* bias_p, float* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r16_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u, g = lane >> 2u, t = lane & 3u;
     u32 r0 = blockIdx.y << 4u, nb = n >> 4u;
@@ -134,7 +150,7 @@ static __device__ __forceinline__ void fg_int4_r16(
         float v = sm.red[0][tr][col] + sm.red[1][tr][col] +
                   sm.red[2][tr][col] + sm.red[3][tr][col];
         u64 off = u64(SPLIT ? (p * m + r0 + tr) : (r0 + tr)) * n + n0 + col;
-        out[off] = SPLIT ? v : i4_epilogue(v, other, off, n0 + col, mode);
+        out[off] = SPLIT ? v : i4_epilogue(v, other, bias_p, off, n0 + col, mode);
     }
 }
 
@@ -167,7 +183,7 @@ static __device__ __forceinline__ void i4_load_x(
 
 template <bool SPLIT>
 static __device__ __forceinline__ void fg_int4_r64(
-    const float* x, const u8* w, const float* other, float* out,
+    const float* x, const u8* w, const float* other, const u8* bias_p, float* out,
     u32 m, u32 n, u32 k, u32 mode, u32 ks, i4_r64_smem& sm) {
     u32 tid = threadIdx.x, warp = tid >> 5u, lane = tid & 31u;
     u32 g = lane >> 2u, t = lane & 3u, wn = warp & 3u, wm = warp >> 2u;
@@ -278,10 +294,10 @@ static __device__ __forceinline__ void fg_int4_r64(
             float4 v = *reinterpret_cast<const float4*>(&sm.out[sr + dr][sc4]);
             u64 off = u64(SPLIT ? (p * m + row) : row) * n + col;
             if (!SPLIT && mode != 0u) {
-                v.x = i4_epilogue(v.x, other, off, col, mode);
-                v.y = i4_epilogue(v.y, other, off + 1u, col + 1u, mode);
-                v.z = i4_epilogue(v.z, other, off + 2u, col + 2u, mode);
-                v.w = i4_epilogue(v.w, other, off + 3u, col + 3u, mode);
+                v.x = i4_epilogue(v.x, other, bias_p, off, col, mode);
+                v.y = i4_epilogue(v.y, other, bias_p, off + 1u, col + 1u, mode);
+                v.z = i4_epilogue(v.z, other, bias_p, off + 2u, col + 2u, mode);
+                v.w = i4_epilogue(v.w, other, bias_p, off + 3u, col + 3u, mode);
             }
             *reinterpret_cast<float4*>(out + off) = v;
         }
@@ -293,19 +309,19 @@ static __device__ __forceinline__ void fg_int4_r64(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define I4_RUN(SM, FN, SPLIT, KS) \
     __shared__ SM sm; \
-    FN<SPLIT>(x, w, other, out, m, n, k, mode, KS, sm)
+    FN<SPLIT>(x, w, other, bias_p, out, m, n, k, mode, KS, sm)
 #else
 #define I4_RUN(SM, FN, SPLIT, KS) \
-    (void)x; (void)w; (void)other; (void)out; (void)m; (void)n; (void)k; (void)mode
+    (void)x; (void)w; (void)other; (void)bias_p; (void)out; (void)m; (void)n; (void)k; (void)mode
 #endif
 
 #define I4_PAIR(TAG, TH, BLK, SM, FN) \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG( \
-        const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode) { \
+        const float* x, const u8* w, const float* other, const u8* bias_p, float* out, u32 m, u32 n, u32 k, u32 mode) { \
         I4_RUN(SM, FN, false, 1u); \
     } \
     extern "C" __global__ __launch_bounds__(TH, BLK) void tessera_mm_int4_##TAG##_sk( \
-        const float* x, const u8* w, const float* other, float* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
+        const float* x, const u8* w, const float* other, const u8* bias_p, float* out, u32 m, u32 n, u32 k, u32 mode, u32 ks) { \
         (void)ks; \
         I4_RUN(SM, FN, true, ks); \
     }

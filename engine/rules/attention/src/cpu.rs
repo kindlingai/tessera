@@ -95,12 +95,16 @@ impl Attend {
     }
 }
 
-fn attend_launches(k: &Attend, step: &Step) -> Vec<Launch> {
-    let mut launches = vec![Launch::plain(step, &[k.jobs()], small(k.jobs()))];
+fn scaled_launch(step: &Step, jobs: usize, scale: f32) -> Vec<Launch> {
+    let mut launches = vec![Launch::plain(step, &[jobs], small(jobs))];
     // The scale sits before the counts.
     let at = launches[0].args.len() - 1;
-    launches[0].args.insert(at, Arg::value(&k.scale));
+    launches[0].args.insert(at, Arg::value(&scale));
     launches
+}
+
+fn attend_launches(k: &Attend, step: &Step) -> Vec<Launch> {
+    scaled_launch(step, k.jobs(), k.scale)
 }
 
 /// One launch over every row, then the kept layout sizes.
@@ -176,6 +180,96 @@ fn rows_launches(k: &AttendRows, step: &Step) -> Vec<Launch> {
     }]
 }
 
+/// One packed query row and head, over `[start, end)`.
+#[kernel]
+fn cpu_attend_packed<const CAUSAL: bool>(
+    q: Buf<F32>,
+    k: Buf<F32>,
+    v: Buf<F32>,
+    bounds: Buf<U32>,
+    mut out: BufMut<F32>,
+    scale: f32,
+    jobs: u32,
+    #[build] rows: u32,
+    #[build] heads: u32,
+    #[build] kv_heads: u32,
+    #[build] width: u32,
+) {
+    if gid() >= jobs {
+        return;
+    }
+    let row = gid() / heads;
+    let h = gid() % heads;
+    let qo = (gid() as u64) * width as u64;
+    let mut from = bounds[(row * 2) as u64];
+    let end = bounds[(row * 2 + 1) as u64];
+    let mut to = if CAUSAL && row + 1 < end {
+        row + 1
+    } else {
+        end
+    };
+    if to > rows {
+        to = rows;
+    }
+    if from > to {
+        from = to;
+    }
+    if to <= from {
+        for d in 0..width {
+            out[qo + d as u64] = 0.0;
+        }
+        return;
+    }
+    let kh = h / (heads / kv_heads);
+    let first = (kh * width) as u64;
+    let stride = kv_heads * width;
+    out.attend(
+        qo, q, k, v, first, stride, from, to, width, scale, bounds, 0, 0,
+    );
+}
+
+/// Packed softmax attention on CPU over `[Rows, Heads, width]`.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    crate = tessera_lower,
+    name = "cpu_attend_packed",
+    sizes = self.sizes.sizes(),
+    work = self.sizes.heads * self.sizes.queries * self.sizes.queries * self.sizes.width,
+    guess = GUESS,
+    runs_on = ZoneKind::Cpu,
+    source = source("cpu_attend_packed", self.body()),
+    launches = packed_launches,
+)]
+pub(crate) struct AttendPacked {
+    pub scale: f32,
+    pub sizes: Attn,
+}
+
+impl AttendPacked {
+    fn jobs(&self) -> usize {
+        self.sizes.queries * self.sizes.heads
+    }
+
+    fn body(&self) -> tessera_codegen::ir::Body {
+        let a = &self.sizes;
+        let (rows, heads, kv, width) = (
+            a.queries as u32,
+            a.heads as u32,
+            a.kv_heads as u32,
+            a.width as u32,
+        );
+        if a.mask.causal() {
+            cpu_attend_packed_ir::<true>(rows, heads, kv, width)
+        } else {
+            cpu_attend_packed_ir::<false>(rows, heads, kv, width)
+        }
+    }
+}
+
+fn packed_launches(k: &AttendPacked, step: &Step) -> Vec<Launch> {
+    scaled_launch(step, k.jobs(), k.scale)
+}
+
 /// Whole sequences: all keys, or the `ids` each query lists.
 fn whole(site: &sites::Attend, ids: T, picks: usize) -> Vec<Draft> {
     let out = site.sizes.seqs * site.out();
@@ -190,6 +284,17 @@ fn whole(site: &sites::Attend, ids: T, picks: usize) -> Vec<Draft> {
 /// Whole sequences with fixed keys, or rows over kept keys.
 fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     let site: sites::Attend = tree.site(at)?;
+    if let Some(bounds) = site.packed {
+        let kernel = AttendPacked {
+            scale: site.scale,
+            sizes: site.sizes,
+        };
+        return Some(vec![Draft::new(
+            kernel,
+            [site.q, site.k, site.v, bounds],
+            site.out(),
+        )]);
+    }
     if site.rows.is_some() {
         return site.ragged(AttendRows(site.sizes));
     }

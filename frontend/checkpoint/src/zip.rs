@@ -3,7 +3,7 @@
 use crate::Error;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 
 const MAX_ENTRIES: u64 = 1 << 20;
 const MAX_DIRECTORY: u64 = 64 << 20;
@@ -43,9 +43,7 @@ pub(crate) fn read_at(file: &fs::File, at: u64, len: u64, size: u64) -> Result<V
         return Err(bad("a range runs past the end"));
     }
     let mut out = vec![0u8; len as usize];
-    let mut file = file;
-    file.seek(SeekFrom::Start(at))?;
-    file.read_exact(&mut out)?;
+    file.read_exact_at(&mut out, at)?;
     Ok(out)
 }
 

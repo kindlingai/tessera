@@ -11,6 +11,7 @@ mod gather;
 mod hadamard;
 mod l2_clip;
 mod lane_norm;
+mod layer_norm;
 mod log_scale;
 mod mask;
 mod mean;
@@ -49,7 +50,7 @@ pub(crate) fn per_lane_row(rows: usize, width: usize, trip: Ops, shared: f64) ->
     }
 }
 
-/// One thread per row of `width`, along that row alone.
+/// One thread per row of `width`, reading each row twice.
 pub(crate) fn per_row(rows: usize, width: usize, trip: Ops, shared: f64) -> Load {
     let all = 4.0 * (rows * width) as f64;
     Load {
@@ -57,9 +58,9 @@ pub(crate) fn per_row(rows: usize, width: usize, trip: Ops, shared: f64) -> Load
         group: 256,
         trips: width as f64,
         trip,
-        reads: vec![all, shared],
+        reads: vec![2.0 * all, shared],
         written: all,
-        flight: 64.0,
+        flight: 4.0,
         ..Load::default()
     }
 }

@@ -79,6 +79,14 @@ fn both_spellings_resolve() {
         let want: Vec<String> = slices.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, want);
     }
+    let mut conv = offered(&g, false);
+    let q = conv
+        .iter_mut()
+        .find(|s| s.name.contains("0.self_attn.q_proj"))
+        .unwrap();
+    q.shape = vec![q.shape[0], 2, q.shape[1] / 2];
+    assert!(resolve(&g, &conv, &[]).is_ok());
+    assert!(rules(include_str!("../names/qwen3_vl.json")).unwrap().len() >= 40);
 }
 
 #[test]

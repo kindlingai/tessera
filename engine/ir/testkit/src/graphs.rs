@@ -208,6 +208,30 @@ pub fn clipped(bounded: &[Dim], width: u64) -> Graph {
     m.finish([(Role::Logits, &out)])
 }
 
+/// Centered RMS layer norm over `Hidden`.
+pub fn layer_norm(bounded: &[Dim], width: u64) -> Graph {
+    let m = model(bounded, &[(Hidden, width)]);
+    let w: Scale = declare(&m);
+    let [x] = m.entry(EntryKind::Forward, [rows_of(bounded, Hidden, DType::F32)]);
+    let out = x.center().rms_norm(&w.norm, 1e-6);
+    m.finish([(Role::Logits, &out)])
+}
+
+/// Packed variable-length attention over `Rows`.
+pub fn packed_attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
+    let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];
+    let m = model(bounded, &fixed);
+    let kv = || floats([Rows, KvHeads, HeadDim]);
+    let bounds = Port {
+        role: Role::Tokens,
+        ty: TensorType::new(vec![Rows.into(), 2u64.into()], DType::U32),
+    };
+    let ports = [floats([Rows, Heads, HeadDim]), kv(), kv(), bounds];
+    let [q, k, v, b] = m.entry(EntryKind::Forward, ports);
+    let out = m.attend_packed(false, 0.1, [&q, &k, &v], &b);
+    m.finish([(Role::Logits, &out)])
+}
+
 /// A rotation, then causal attention over `Seqs`, `Rows` and `Context`.
 pub fn attention(bounded: &[Dim], [heads, kv_heads, width]: [u64; 3]) -> Graph {
     let fixed = [(Heads, heads), (KvHeads, kv_heads), (HeadDim, width)];

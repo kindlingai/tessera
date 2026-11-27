@@ -8,8 +8,9 @@ use tessera_lower::{Device, Pins, Settings, Step, Tensor, View, lower};
 use tessera_run::{Run, open};
 use tessera_testkit::Noise;
 use tessera_testkit::graphs::{
-    attention, blocks, chain, clipped, delta, indexed, indexed_rows, indexer, linear, mla_prep,
-    neighbours, picked, residual_norm, rotation, routed, rows, table, turned,
+    attention, blocks, chain, clipped, delta, indexed, indexed_rows, indexer, layer_norm, linear,
+    mla_prep, neighbours, packed_attention, picked, residual_norm, rotation, routed, rows, table,
+    turned,
 };
 use tessera_trace::{Dim, Graph, TensorType};
 
@@ -292,8 +293,10 @@ impl Grid {
         for &width in &self.widths {
             cases.push(by_rows(residual_norm(&one, width)));
             cases.push(by_rows(clipped(&one, width)));
+            cases.push(by_rows(layer_norm(&one, width)));
         }
         for &heads in &self.heads {
+            cases.push(by_rows(packed_attention(&one, heads)));
             let span =
                 |[queries, keys]: &[u64; 2]| vec![(Seqs, 1), (Rows, *queries), (Context, *keys)];
             let sizes = self.spans.iter().map(span).collect();

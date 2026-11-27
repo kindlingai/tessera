@@ -120,3 +120,36 @@ fn capped_refuses_extra() {
     gate.leave(None);
     assert!(gate.enter(None));
 }
+
+#[test]
+fn large_body_reads() {
+    let listener = tcp_bind().unwrap();
+    let address = listener.local_addr().unwrap();
+    let limits = Limits {
+        max_body: 2 << 20,
+        head_timeout: TCP_TIMEOUT,
+        body_timeout: TCP_TIMEOUT,
+        write_timeout: TCP_TIMEOUT,
+        ..Limits::default()
+    };
+    std::thread::spawn(move || {
+        run(listener, limits, |r| {
+            crate::http::Response::json(200, &serde_json::json!({"len": r.body.len()}))
+        })
+    });
+    let mut stream = tcp_connect(address).unwrap();
+    let payload = vec![b'x'; 512 * 1024];
+    let head = format!(
+        "POST /big HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        payload.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(&payload).unwrap();
+    stream
+        .write_all(b"POST /next HTTP/1.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi")
+        .unwrap();
+    let mut out = String::new();
+    stream.read_to_string(&mut out).unwrap();
+    assert!(out.contains(r#"{"len":524288}"#), "{out}");
+    assert!(out.contains(r#"{"len":2}"#), "{out}");
+}

@@ -102,6 +102,26 @@ macro_rules! table {
                 host: |g, args, mask| g.unary(args, mask, f32::tanh),
                 count: |c, _| c.tally(special(1.0), true),
             }
+            Erf = fn erf(f32) -> f32 {
+                device: {
+                    let body = |exp: &str| format!(
+                        "f_fn float f_erf_val(float x) {{
+    float a = x < 0.0f ? -x : x;
+    float t = 1.0f / (1.0f + 0.3275911f * a);
+    float p = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+    float m = 1.0f - p * {exp}(-(a * a));
+    return x < 0.0f ? -m : m;
+}}
+#define f_erf(x) f_erf_val(x)
+"
+                    );
+                    [body("exp"), body("expf")]
+                },
+                text: |p, args| p.spell("f_erf", args),
+                wgsl: None,
+                host: |g, args, mask| g.unary(args, mask, tessera_codegen::stage::erf),
+                count: |c, _| c.tally(special(1.0), true),
+            }
             Max = fn max(f32, f32) -> f32 {
                 device: define("f_max(a, b)", "max(a, b)", "fmaxf(a, b)"),
                 text: |p, args| p.spell("f_max", args),
@@ -444,16 +464,27 @@ f_fn float f_e4m3(u32 w, u32 l) {{
         if (code == 0u) {{ v = v + b[i]; }}
         else if (code == 1u) {{ v = v * b[i]; }}
         else if (code == 2u) {{ v = v * s; }}
-        else if (code == 3u) {{
+        else if (code == 3u) {{ v = v + s; }}
+        else if (code == 4u) {{ v = fmin(v, s); }}
+        else if (code == 5u) {{ v = fmax(v, s); }}
+        else if (code == 6u) {{
+            float x = v * 0.70710678f;
+            float a = x < 0.0f ? -x : x;
+            float t = 1.0f / (1.0f + 0.3275911f * a);
+            float p = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+            float m = 1.0f - p * exp(-(a * a));
+            v = 0.5f * v * (1.0f + (x < 0.0f ? -m : m));
+        }}
+        else if (code == 7u) {{
             float u = fmin(fmax(0.7978846f * (v + 0.044715f * (v * v * v)), -8.0f), 8.0f);
             v = 0.5f * v * (1.0f + tanh(u));
         }}
-        else if (code == 4u) {{ v = v / (1.0f + exp(-v)); }}
-        else if (code == 5u) {{ v = 1.0f / (1.0f + exp(-v)); }}
-        else if (code == 6u) {{ v = fmax(v, 0.0f); }}
-        else if (code == 7u) {{ float m = fmax(v, -v); v = fmax(v, 0.0f) + log(1.0f + exp(-m)); }}
-        else if (code == 8u) {{ v = exp(v); }}
-        else if (code == 9u) {{ v = tanh(fmin(fmax(v, -8.0f), 8.0f)); }}
+        else if (code == 8u) {{ v = v / (1.0f + exp(-v)); }}
+        else if (code == 9u) {{ v = 1.0f / (1.0f + exp(-v)); }}
+        else if (code == 10u) {{ v = fmax(v, 0.0f); }}
+        else if (code == 11u) {{ float m = fmax(v, -v); v = fmax(v, 0.0f) + log(1.0f + exp(-m)); }}
+        else if (code == 12u) {{ v = exp(v); }}
+        else if (code == 13u) {{ v = tanh(fmin(fmax(v, -8.0f), 8.0f)); }}
         else {{ float a = fmax(fmax(v, -v), 1.0e-6f); v = (v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f)) * sqrt(a); }}
         o[i] = v;
     }}

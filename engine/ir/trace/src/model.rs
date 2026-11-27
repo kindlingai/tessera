@@ -59,6 +59,12 @@ impl Model {
 
     /// Adds an entry and returns its input ports as tensors.
     pub fn entry<const N: usize>(&self, kind: EntryKind, ports: [Port; N]) -> [Tensor; N] {
+        let outs = self.entry_many(kind, &ports);
+        outs.try_into().ok().expect("port count")
+    }
+
+    /// Adds an entry with a slice of input ports.
+    pub fn entry_many(&self, kind: EntryKind, ports: &[Port]) -> Vec<Tensor> {
         let entry = {
             let mut g = self.g.borrow_mut();
             g.entries.push(Entry {
@@ -68,10 +74,12 @@ impl Model {
             });
             g.entries.len() as u32 - 1
         };
-        std::array::from_fn(|i| {
-            let port = i as u32;
-            push(&self.g, Op::Input { entry, port }, &[])
-        })
+        (0..ports.len())
+            .map(|i| {
+                let port = i as u32;
+                push(&self.g, Op::Input { entry, port }, &[])
+            })
+            .collect()
     }
 
     pub fn embed(&self, ids: &Tensor, table: &Embed) -> Tensor {
@@ -203,6 +211,25 @@ impl Model {
         sinks: Option<&Tensor>,
     ) -> Tensor {
         self.attend_all(mask, scale, qkv, Some(by), [keys, sinks, None])
+    }
+
+    /// Packed variable-length attention over `[Rows, Heads, HeadDim]` and `bounds[Rows, 2]`.
+    pub fn attend_packed(
+        &self,
+        causal: bool,
+        scale: f32,
+        [q, k, v]: [&Tensor; 3],
+        bounds: &Tensor,
+    ) -> Tensor {
+        let op = Op::Attend(Attend {
+            mask: Mask::Packed { causal },
+            scale,
+            picked: false,
+            ragged: false,
+            sinks: false,
+            rel_bias: false,
+        });
+        push(&self.g, op, &[q, k, v, bounds])
     }
 
     /// The gated delta rule, with log decays and write rates.
