@@ -5,6 +5,7 @@ use std::fmt;
 use tessera_engine_comm::{Reader, Writer};
 use tessera_gpukit::device::KernelAttrs;
 use tessera_lower::Step;
+use tessera_lower::kernels::{GatherRows, ReduceScatter};
 
 /// Rows past this many print as one "other" row.
 const SHOWN: usize = 40;
@@ -92,7 +93,13 @@ impl Profile {
     pub fn key(step: &Step) -> String {
         let kernel = &step.kernel;
         let mut name = kernel.name().to_string();
-        for (i, size) in kernel.sizes().iter().enumerate() {
+        let sizes = kernel.sizes();
+        let display = match (kernel.name(), sizes.as_slice()) {
+            (ReduceScatter::NAME, [_, total]) => std::slice::from_ref(total),
+            (GatherRows::NAME, [_]) => std::slice::from_ref(&step.write.len),
+            _ => sizes.as_slice(),
+        };
+        for (i, size) in display.iter().enumerate() {
             name.push(if i == 0 { ' ' } else { 'x' });
             name.push_str(&size.to_string());
         }

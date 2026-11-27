@@ -78,10 +78,13 @@ impl ReduceScatter {
     source = Map::plain(Vec::new()).source(),
     launches = Vec::new(),
     work = self.len,
+    wire = self.wire,
 )]
 pub struct GatherRows {
     pub len: usize,
     pub start: usize,
+    /// Each rank's slice crosses at this wire dtype.
+    pub wire: DType,
 }
 
 impl GatherRows {

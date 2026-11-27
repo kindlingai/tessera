@@ -504,6 +504,60 @@ TESSERA_FN void stage_scatter(ctl* c, u32* blocks, u64* state, u8* send0, const 
     }
 }
 
+// Unpacks arrived 8-piece gather slices into rank-strided output rows.
+template <Wire W>
+TESSERA_FN bool unpack_gather(ctl* c, const u64* flag, u64* state, const u8* send, const u8* recv,
+                              float* dst, u64 seq, u64 par, u64 slice, u64 slice_chunks,
+                              u32 dst_v_stride, u32 me, u32 nr, u32 lanes, u64 timeout,
+                              Fp8Chunk& sm) {
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = gridDim.x * blockDim.x;
+    for (u32 p = 0u; p < PIECES; p++) {
+        u64 lo, hi;
+        if constexpr (W == Wire::Fp8) {
+            u64 p_lo, p_hi;
+            piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
+            if (!wait_flags(c, flag, state, flag_of(seq, p), me, nr, lanes, timeout)) return false;
+            u32 cnt = u32(p_hi - p_lo);
+            u32 total = cnt * nr;
+            for (u32 q = blockIdx.x; q < total; q += gridDim.x) {
+                u32 r = q / cnt;
+                u32 j = u32(p_lo) + (q - r * cnt);
+                const u8* rp = r == me ? send : recv + recv_off(par, r, nr);
+                float4 v = load_chunk_fp8(sm, rp, j, r == me);
+                reinterpret_cast<float4*>(dst)[u64(r) * dst_v_stride + (u64(j) << 8) +
+                                               threadIdx.x] = v;
+            }
+        } else {
+            piece_bounds(slice, p, lo, hi);
+            if (!wait_flags(c, flag, state, flag_of(seq, p), me, nr, lanes, timeout)) return false;
+            u32 v_lo = u32(lo >> 4);
+            u32 v_cnt = u32((hi - lo) >> 4);
+            u32 total = v_cnt * nr;
+            for (u32 q = tid; q < total; q += stride) {
+                u32 r = q / v_cnt;
+                u32 j = v_lo + (q - r * v_cnt);
+                u64 idx = u64(r) * dst_v_stride + j;
+                const u8* rp = r == me ? send : recv + recv_off(par, r, nr);
+                if constexpr (W == Wire::Bf16) {
+                    uint4 pk = r == me ? reinterpret_cast<const uint4*>(rp)[j]
+                                       : load_cv4(rp + u64(j) * 16ull);
+                    float4 a, b;
+                    unpack_bf16x8(pk, a, b);
+                    reinterpret_cast<float4*>(dst)[idx * 2ull] = a;
+                    reinterpret_cast<float4*>(dst)[idx * 2ull + 1ull] = b;
+                } else {
+                    const float* fp = reinterpret_cast<const float*>(rp);
+                    float4 v = r == me ? reinterpret_cast<const float4*>(fp)[j]
+                                       : prim::load_fresh4(fp + u64(j) * 4ull);
+                    reinterpret_cast<float4*>(dst)[idx] = v;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 // Pipelined reduce-scatter, optionally followed by all-gather.
 template <Wire W, bool GATHER>
 TESSERA_FN void scatter_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,
@@ -587,50 +641,67 @@ TESSERA_FN void scatter_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64*
         return;
     }
 
-    // Phase 3: unpack arrived AG pieces into output buffer.
+    if (!unpack_gather<W>(c, flag, state, send1, recv, dst, seq1, par1, slice, slice_chunks,
+                          v_per_chunk, me, nr, lanes, timeout, sm[0]))
+        return;
+    finish_seq(c, blocks, state, seq1);
+}
+
+// Pipelined 8-piece contiguous row gather over any wire dtype.
+template <Wire W>
+TESSERA_FN void gather_rows_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,
+                                 u32* blocks, u64 from_p, u64 to_p, u32 part_stride, u32 n,
+                                 u32 me, u32 nr, u32 lanes, u64 timeout) {
+    if (prim::leader()) prim::timing_begin(timing_of(state));
+    u64 seq = state[ST_SEQ] + 1ull;
+    u64 par = seq & 1ull;
+    u8* send = reinterpret_cast<u8*>(send_p) + par * SEND_BYTES;
+    const u8* recv = reinterpret_cast<const u8*>(recv_p);
+    const u64* flag = reinterpret_cast<const u64*>(flag_p);
+    ctl* c = reinterpret_cast<ctl*>(ctl_p);
+    const float* src = reinterpret_cast<const float*>(from_p);
+    float* dst = reinterpret_cast<float*>(to_p);
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = gridDim.x * blockDim.x;
+    u64 slice_chunks = u64(n >> 10);
+    u64 slice = (W == Wire::Fp8) ? (slice_chunks * FP8_CHUNK_BYTES)
+                                 : (u64(n) * (W == Wire::Bf16 ? 2ull : 4ull));
+    u32 dst_v_stride = (W == Wire::Bf16) ? (part_stride >> 3) : (part_stride >> 2);
+    __shared__ Fp8Chunk sm;
+
     for (u32 p = 0u; p < PIECES; p++) {
-        u64 lo, hi;
+        u64 lo = 0ull, hi = 0ull;
         if constexpr (W == Wire::Fp8) {
             u64 p_lo, p_hi;
             piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
-            if (!wait_flags(c, flag, state, flag_of(seq1, p), me, nr, lanes, timeout)) return;
-            u32 cnt = u32(p_hi - p_lo);
-            u32 total = cnt * nr;
-            for (u32 q = blockIdx.x; q < total; q += gridDim.x) {
-                u32 r = q / cnt;
-                u32 j = u32(p_lo) + (q - r * cnt);
-                const u8* rp = r == me ? send1 : recv + recv_off(par1, r, nr);
-                float4 v = load_chunk_fp8(sm[0], rp, j, r == me);
-                reinterpret_cast<float4*>(dst)[r * v_per_chunk + (j << 8) + threadIdx.x] = v;
+            lo = p_lo * FP8_CHUNK_BYTES;
+            hi = p_hi * FP8_CHUNK_BYTES;
+            for (u32 j = u32(p_lo) + blockIdx.x; j < u32(p_hi); j += gridDim.x) {
+                float4 v = reinterpret_cast<const float4*>(src)[(u64(j) << 8) + threadIdx.x];
+                store_chunk_fp8(sm, send, j, v);
             }
         } else {
             piece_bounds(slice, p, lo, hi);
-            if (!wait_flags(c, flag, state, flag_of(seq1, p), me, nr, lanes, timeout)) return;
             u32 v_lo = u32(lo >> 4);
-            u32 v_cnt = u32((hi - lo) >> 4);
-            u32 total = v_cnt * nr;
-            for (u32 q = tid; q < total; q += stride) {
-                u32 r = q / v_cnt;
-                u32 j = v_lo + (q - r * v_cnt);
-                u32 idx = r * v_per_chunk + j;
-                const u8* rp = r == me ? send1 : recv + recv_off(par1, r, nr);
+            u32 v_hi = u32(hi >> 4);
+            for (u32 j = v_lo + tid; j < v_hi; j += stride) {
                 if constexpr (W == Wire::Bf16) {
-                    uint4 pk = r == me ? reinterpret_cast<const uint4*>(rp)[j]
-                                       : load_cv4(rp + u64(j) * 16ull);
-                    float4 a, b;
-                    unpack_bf16x8(pk, a, b);
-                    reinterpret_cast<float4*>(dst)[idx * 2] = a;
-                    reinterpret_cast<float4*>(dst)[idx * 2 + 1] = b;
+                    float4 a = reinterpret_cast<const float4*>(src)[u64(j) * 2ull];
+                    float4 b = reinterpret_cast<const float4*>(src)[u64(j) * 2ull + 1ull];
+                    *reinterpret_cast<uint4*>(send + u64(j) * 16ull) = pack_bf16x8(a, b);
                 } else {
-                    const float* fp = reinterpret_cast<const float*>(rp);
-                    float4 v = r == me ? reinterpret_cast<const float4*>(fp)[j]
-                                       : prim::load_fresh4(fp + u64(j) * 4ull);
-                    reinterpret_cast<float4*>(dst)[idx] = v;
+                    *reinterpret_cast<float4*>(send + u64(j) * 16ull) =
+                        reinterpret_cast<const float4*>(src)[j];
                 }
             }
         }
+        publish_piece(c, blocks, state, p, MODE_GATHER_PIECE, seq, p, slice, lo, hi);
     }
-    finish_seq(c, blocks, state, seq1);
+
+    if (!unpack_gather<W>(c, flag, state, send, recv, dst, seq, par, slice, slice_chunks,
+                          dst_v_stride, me, nr, lanes, timeout, sm))
+        return;
+    finish_seq(c, blocks, state, seq);
 }
 
 template <Wire W>
@@ -672,6 +743,19 @@ ARX_DEF(tessera_arx_two_fp8, two_body, Fp8)
 ARX_DEF(tessera_arx_rs_bf16, rs_body, Bf16)
 ARX_DEF(tessera_arx_rs_f32, rs_body, F32)
 ARX_DEF(tessera_arx_rs_fp8, rs_body, Fp8)
+
+#define ARX_GR_DEF(NAME, WIRE)                                                                  \
+    extern "C" __global__ void NAME(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,  \
+                                    u32* blocks, u64 from_p, u64 to_p, u32 part_stride, u32 n,  \
+                                    u32 me, u32 nr, u32 lanes, u64 timeout) {                   \
+        arx::gather_rows_body<arx::Wire::WIRE>(send_p, recv_p, flag_p, ctl_p, state, blocks,    \
+                                               from_p, to_p, part_stride, n, me, nr, lanes,     \
+                                               timeout);                                        \
+    }
+
+ARX_GR_DEF(tessera_arx_gr_bf16, Bf16)
+ARX_GR_DEF(tessera_arx_gr_f32, F32)
+ARX_GR_DEF(tessera_arx_gr_fp8, Fp8)
 
 // Even-width row-major all-gather over F32.
 extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,

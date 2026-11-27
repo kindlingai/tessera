@@ -15,6 +15,8 @@ const KERNEL: &str = include_str!("arx.cu");
 const THREADS: u32 = 256;
 /// Byte threshold switching from one-shot to two-shot RS/AG.
 const TWO_SHOT_BYTES: usize = 256 << 10;
+/// Wire-byte threshold switching gather_rows to 8-piece pipelining.
+const PIPE_GATHER_BYTES: usize = 1 << 20;
 /// Ranks may still load when the first sum starts.
 const TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -37,6 +39,9 @@ pub struct Arx<D: Device> {
     rs_bf16: D::Kernel,
     rs_f32: D::Kernel,
     rs_fp8: D::Kernel,
+    gr_bf16: D::Kernel,
+    gr_f32: D::Kernel,
+    gr_fp8: D::Kernel,
     allgather: D::Kernel,
     gather_rows: D::Kernel,
     state: DeviceBuffer<D>,
@@ -90,6 +95,9 @@ where
         let rs_bf16 = ctx.compile(&text, "tessera_arx_rs_bf16")?;
         let rs_f32 = ctx.compile(&text, "tessera_arx_rs_f32")?;
         let rs_fp8 = ctx.compile(&text, "tessera_arx_rs_fp8")?;
+        let gr_bf16 = ctx.compile(&text, "tessera_arx_gr_bf16")?;
+        let gr_f32 = ctx.compile(&text, "tessera_arx_gr_f32")?;
+        let gr_fp8 = ctx.compile(&text, "tessera_arx_gr_fp8")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
         let gather_rows = ctx.compile(&text, "tessera_arx_gather_rows")?;
         let state = DeviceBuffer::alloc(ctx, 32 + crate::TIMING_BYTES)?;
@@ -112,6 +120,9 @@ where
             rs_bf16,
             rs_f32,
             rs_fp8,
+            gr_bf16,
+            gr_f32,
+            gr_fp8,
             allgather,
             gather_rows,
             state,
@@ -331,6 +342,7 @@ where
         start: usize,
         part: usize,
         total: usize,
+        wire: DType,
     ) -> Result<bool, Error> {
         let ranks = self.mem.ranks as usize;
         if self.broken
@@ -343,7 +355,23 @@ where
         let Ok(part_stride) = u32::try_from(part) else {
             return Ok(false);
         };
-        let max_part = ArxLink::SLOT_BYTES / 4;
+        let wire_bytes = |elems: usize| match wire {
+            DType::Fp8 => (elems / 1024) * 1152 + (elems % 1024) * 4,
+            DType::Bf16 => elems * 2,
+            _ => elems * 4,
+        };
+        let part_align = if wire == DType::Fp8 { 1024 } else { 8 };
+        let aligned = (from & 15) == 0 && (to & 15) == 0;
+        let pipelined = self.mem.mesh
+            && aligned
+            && part.is_multiple_of(part_align)
+            && wire_bytes(total) > PIPE_GATHER_BYTES;
+        let max_part = match (pipelined, wire) {
+            (true, DType::Fp8) => (ArxLink::SLOT_BYTES / 1152) * 1024,
+            (true, DType::Bf16) => (ArxLink::SLOT_BYTES / 2 / part_align) * part_align,
+            (true, _) => (ArxLink::SLOT_BYTES / 4 / part_align) * part_align,
+            (false, _) => ArxLink::SLOT_BYTES / 4,
+        };
         let mut off = 0usize;
         while off < part {
             let n = (part - off).min(max_part);
@@ -352,16 +380,32 @@ where
             let mut args = self.base_args();
             args.u64(f).u64(t).u32(part_stride).u32(n as u32);
             self.finish_args(&mut args);
-            let grid =
-                ((n * ranks) as u32 / (THREADS * 4)).clamp(1, self.max_grid(self.gather_max_grid));
+            let use_pipe = pipelined
+                && n.is_multiple_of(part_align)
+                && wire_bytes(n * ranks) > PIPE_GATHER_BYTES;
+            let (kernel, grid) = if use_pipe {
+                let step = if wire == DType::Fp8 {
+                    1024
+                } else {
+                    THREADS * 8
+                };
+                let g = ((n * ranks) as u32)
+                    .div_ceil(step)
+                    .clamp(1, self.max_grid(self.max_grid_cap));
+                let k = match wire {
+                    DType::Bf16 => &self.gr_bf16,
+                    DType::Fp8 => &self.gr_fp8,
+                    _ => &self.gr_f32,
+                };
+                (k, g)
+            } else {
+                let g = ((n * ranks) as u32 / (THREADS * 4))
+                    .clamp(1, self.max_grid(self.gather_max_grid));
+                (&self.gather_rows, g)
+            };
             self.ctx.programmatic(false);
-            self.ctx.launch(
-                &self.gather_rows,
-                (grid, 1, 1),
-                (THREADS, 1, 1),
-                0,
-                &mut args,
-            )?;
+            self.ctx
+                .launch(kernel, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?;
             off += n;
         }
         Ok(true)
@@ -448,8 +492,12 @@ where
         start: usize,
         part: usize,
         total: usize,
+        wire: DType,
     ) -> Result<bool, tessera_run::Error> {
-        arx_err(self.launch_gather_rows(from, to, start, part, total))
+        if !self.carries(wire) {
+            return Err(tessera_run::Error::Wire(wire));
+        }
+        arx_err(self.launch_gather_rows(from, to, start, part, total, wire))
     }
 
     fn reduce_scatter(

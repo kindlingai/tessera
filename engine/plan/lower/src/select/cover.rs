@@ -234,11 +234,12 @@ impl<'a> Cover<'a> {
                     (ReduceScatter::NAME, Draft::new(rs, [src], len), bytes)
                 }
                 Stage::GatherRows => {
+                    let wire = self.tree.wire(t)?;
                     let whole_rows = n.shape[0];
                     let width = n.shape[1..].iter().product::<usize>();
                     let start = self.tree.parts.rows(whole_rows, self.tree.rank as usize).0 * width;
-                    let gr = GatherRows { len, start };
-                    let bytes = self.tree.bytes(t);
+                    let gr = GatherRows { len, start, wire };
+                    let bytes = moved(&gr, len, self.tree.bytes(t));
                     (GatherRows::NAME, Draft::new(gr, [src], len), bytes)
                 }
                 _ => unreachable!(),
