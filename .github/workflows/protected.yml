@@ -31,11 +31,8 @@ jobs:
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
             | tools/scripts/review-paths.sh \
             | tools/scripts/protected.sh > "$RUNNER_TEMP/hits"
-          if [ -s "$RUNNER_TEMP/hits" ]; then
-            cat "$RUNNER_TEMP/hits"
-            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" \
-              -f 'labels[]=needs-human-review' >/dev/null
-          fi
+          cat "$RUNNER_TEMP/hits"
+          tools/scripts/protected-label.sh < "$RUNNER_TEMP/hits"
       - name: Rerun CI's success job
         # A finished success job read the old label or setting.
         if: contains(fromJSON('["edited", "unlabeled"]'), github.event.action)
