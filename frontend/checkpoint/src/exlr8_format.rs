@@ -1,6 +1,7 @@
 //! exlr8 matrix formats: records and their decoders.
 
 use crate::file::{Error, File};
+use std::ops::Range;
 use tessera_engine::storage::Form;
 use tessera_engine::trellis::{self, Codebook};
 use tessera_engine::{E4M3, F16, block};
@@ -226,11 +227,16 @@ pub(crate) fn turned(f: &File, name: &str, rows: Option<(usize, usize)>) -> Resu
     Ok(bytes)
 }
 
+/// Item range of rows `first..first + count`, each `width` long.
+pub(crate) fn bounds(len: usize, rows: Option<(usize, usize)>, width: usize) -> Range<usize> {
+    let Some((first, count)) = rows else {
+        return 0..len;
+    };
+    let end = ((first + count) * width).min(len);
+    (first * width).min(end)..end
+}
+
 /// Rows `first..first + count` of `all`, each `width` long.
 pub(crate) fn span<T>(all: &[T], rows: Option<(usize, usize)>, width: usize) -> &[T] {
-    let Some((first, count)) = rows else {
-        return all;
-    };
-    let end = ((first + count) * width).min(all.len());
-    &all[(first * width).min(end)..end]
+    &all[bounds(all.len(), rows, width)]
 }

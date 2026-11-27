@@ -3,8 +3,8 @@
 use crate::exlr8_experts as experts;
 pub use crate::exlr8_format::codes;
 use crate::exlr8_format::{
-    BF16, FP8_BLOCK, FP8_ROW, FP32, ROWS, TRELLIS, block_form, blocks, coded, codes_packed, halves,
-    matrix, plain, record, rows, span, turned,
+    BF16, FP8_BLOCK, FP8_ROW, FP32, ROWS, TRELLIS, block_form, blocks, bounds, coded, codes_packed,
+    halves, matrix, plain, record, rows, span, turned,
 };
 use crate::exlr8_shard::{Shard, layer_prefix, past};
 use crate::file::{Error, File};
@@ -456,8 +456,11 @@ impl Release {
                 }
             }
             Ok(r) if r.format == ROWS => {
-                let all = rows(f, &matrix, &r, narrow)?;
-                Ok(span(&all, range, r.inp).as_flattened().to_vec())
+                let mut all = rows(f, &matrix, &r, narrow)?;
+                let keep = bounds(all.len(), range, r.inp);
+                all.truncate(keep.end);
+                all.drain(..keep.start);
+                Ok(all.into_flattened())
             }
             Ok(r) if r.format == FP8_BLOCK || r.format == FP8_ROW => {
                 let floats = plain(f, &matrix, &r, r.format)?;
