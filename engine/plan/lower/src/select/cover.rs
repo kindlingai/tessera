@@ -291,7 +291,8 @@ impl<'a> Cover<'a> {
                     });
                 }
             }
-            for rule in self.rules.clone() {
+            for ri in 0..self.rules.len() {
+                let rule = self.rules[ri];
                 let Some(drafts) = rule.propose.at(self.tree, t) else {
                     continue;
                 };

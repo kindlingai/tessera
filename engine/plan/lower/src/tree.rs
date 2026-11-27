@@ -13,10 +13,10 @@ use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
 pub use own::sliding_ring;
 use std::collections::HashMap;
-use tessera_codegen::kept::{self, Layout};
+use tessera_codegen::kept::Layout;
 use tessera_graph::{
-    Composite, DType, DimExpr, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region,
-    Role, Shape, Stage, View,
+    Composite, DType, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region, Role,
+    Shape, Stage, View,
 };
 
 /// Max rows per launch a sliding ring reserves.
@@ -115,6 +115,12 @@ pub struct Tree<'a> {
     at: Vec<Option<T>>,
     /// Per node: a region output a region rule claims.
     ends: Vec<bool>,
+    /// First append node for each kept tensor.
+    kept_appends: Vec<Option<T>>,
+    /// Whether each kept tensor feeds only picked attention.
+    sparse_kept: Vec<bool>,
+    /// Sliding-window ring capacity for each kept tensor, if smaller.
+    kept_rings: Vec<Option<usize>>,
 }
 
 /// Rows that lower to `Map`. Other stages lower unfused.
@@ -363,6 +369,9 @@ impl<'a> Tree<'a> {
             shares: Vec::new(),
             at: Vec::new(),
             ends: Vec::new(),
+            kept_appends: Vec::new(),
+            sparse_kept: Vec::new(),
+            kept_rings: Vec::new(),
         };
         let ranks = parts.ranks();
         for port in &e.inputs {
@@ -551,6 +560,7 @@ impl<'a> Tree<'a> {
                 tree.readers[a.0 as usize] += 1;
             }
         }
+        tree.index_kept();
         for o in outputs {
             let t = tree.at[o].expect("outputs are needed");
             tree.readers[t.0 as usize] += 1;
@@ -837,63 +847,6 @@ impl<'a> Tree<'a> {
     /// The tree node holding graph node `id`'s value.
     pub fn of(&self, id: NodeId) -> Option<T> {
         self.at.get(id.0 as usize).copied().flatten()
-    }
-
-    /// The node appending to kept `index`, and rows per slot.
-    pub fn kept_rows(&self, index: u32) -> Option<(T, usize)> {
-        let append = Term::Op(Op::Append(index));
-        let t = (0..self.len() as u32)
-            .map(T)
-            .find(|t| self.node(*t).term == append)?;
-        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
-            return None;
-        };
-        // A slot holds the axis's bound, whatever this launch sees.
-        let most = self.g.dims.iter().find(|d| d.name == *axis);
-        Some((t, most.map_or(0, |d| d.size.max() as usize)))
-    }
-
-    /// Append node, layout, and rows per slot for kept `index`.
-    pub fn kept_layout(&self, index: u32) -> Option<(T, &'static dyn Layout, usize)> {
-        let (t, context) = self.kept_rows(index)?;
-        match sliding_ring(self.g, index) {
-            Some(ring) => Some((t, kept::RING, ring)),
-            None => Some((t, self.kept, context)),
-        }
-    }
-
-    /// True if kept `index` feeds only picked attention.
-    pub fn is_sparse_kept(&self, index: u32) -> bool {
-        let mut stack: Vec<NodeId> = self
-            .g
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.op == Op::Append(index))
-            .map(|(i, _)| NodeId(i as u32))
-            .collect();
-        if stack.is_empty() {
-            return false;
-        }
-        let mut found = false;
-        while let Some(cur) = stack.pop() {
-            for (i, n) in self.g.nodes.iter().enumerate().skip(cur.0 as usize + 1) {
-                if !n.args.contains(&cur) {
-                    continue;
-                }
-                match &n.op {
-                    Op::View(_) => stack.push(NodeId(i as u32)),
-                    Op::Attend(a) if a.picked => found = true,
-                    _ => return false,
-                }
-            }
-        }
-        found
-    }
-
-    /// True if any kept tensor is sparse-read.
-    pub fn has_sparse_kept(&self) -> bool {
-        (0..self.g.kept.len() as u32).any(|i| self.is_sparse_kept(i))
     }
 
     /// Fixed shape of kept state `index`, split for this rank.

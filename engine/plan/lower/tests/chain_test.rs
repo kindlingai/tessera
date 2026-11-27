@@ -348,6 +348,7 @@ fn timings_prefer_source() {
 
 struct CountingMade {
     calls: Arc<AtomicUsize>,
+    loads: Option<Arc<AtomicUsize>>,
 }
 
 impl std::fmt::Debug for CountingMade {
@@ -363,6 +364,11 @@ impl Kernel for CountingMade {
     fn source(&self) -> Source {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Map::plain(vec![MapStage::Add]).source()
+    }
+    fn load(&self, len: usize) -> Option<tessera_lower::Load> {
+        let loads = self.loads.as_ref()?;
+        loads.fetch_add(1, Ordering::Relaxed);
+        Map::plain(vec![MapStage::Add]).load(len)
     }
     fn launches(&self, _: &Step) -> Vec<Launch> {
         Vec::new()
@@ -392,6 +398,7 @@ fn made_identity_no_leak() {
     let step = step_of(
         CountingMade {
             calls: Arc::clone(&calls),
+            loads: None,
         },
         16,
     );
@@ -408,6 +415,7 @@ fn made_identity_no_leak() {
     let entry_calls = Arc::new(AtomicUsize::new(0));
     let k = KernelRef::new(CountingMade {
         calls: Arc::clone(&entry_calls),
+        loads: None,
     });
     let first = k.entry();
     for _ in 0..100 {
@@ -449,10 +457,12 @@ fn unmeasured_skips_source() {
     let calls = Arc::new(AtomicUsize::new(0));
     let k = CountingMade {
         calls: Arc::clone(&calls),
+        loads: None,
     };
     let step = step_of(
         CountingMade {
             calls: Arc::clone(&calls),
+            loads: None,
         },
         16,
     );
@@ -463,4 +473,29 @@ fn unmeasured_skips_source() {
     dev.fit([(&step, 2e-3)]);
     assert!((dev.seconds(&k, 16) - 2e-3).abs() < 1e-9);
     assert!(calls.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn unmeasured_caches_chip_model() {
+    let dev = Device::default().on(tessera_lower::Platform {
+        name: "NVIDIA GB10".into(),
+        backend: "cuda".into(),
+        units: 48,
+        bandwidth: 273e9,
+        limits: tessera_lower::Limits::assumed(),
+        ..tessera_lower::Platform::default()
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let loads = Arc::new(AtomicUsize::new(0));
+    let k = CountingMade {
+        calls: Arc::clone(&calls),
+        loads: Some(Arc::clone(&loads)),
+    };
+    let first = dev.seconds(&k, 256);
+    assert!(first > 0.0);
+    for _ in 0..100 {
+        assert_eq!(dev.seconds(&k, 256), first);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(loads.load(Ordering::Relaxed), 1);
 }

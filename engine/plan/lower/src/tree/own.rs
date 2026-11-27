@@ -4,6 +4,7 @@ use crate::extent::Extent;
 use crate::tree::{Node, RING_CHUNK, T, Term, Tree};
 use crate::{Error, Size};
 use std::collections::HashMap;
+use tessera_codegen::kept::{Layout, self};
 use tessera_graph::{DimExpr, DimName, Graph, Mask, NodeId, Op, Parts, Placement, Select, View};
 
 /// Ring capacity for sliding-window kept `index`, if smaller than context.
@@ -164,5 +165,135 @@ pub(crate) fn slice_owned_args(
             continue;
         }
         *slot = slice_axis0(tree, *slot, first, count, sliced);
+    }
+}
+
+/// Precomputes sparse-kept flags and sliding-ring capacities in one graph pass.
+pub(crate) fn kept_flags(g: &Graph) -> (Vec<bool>, Vec<Option<usize>>) {
+    let n_kept = g.kept.len();
+    if n_kept == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut append_of: Vec<Option<u32>> = vec![None; g.nodes.len()];
+    let mut kept_of: Vec<Option<u32>> = vec![None; g.nodes.len()];
+    let mut sparse_found = vec![false; n_kept];
+    let mut sparse_bad = vec![false; n_kept];
+    let mut ring_max: Vec<Option<usize>> = vec![None; n_kept];
+    let mut ring_bad = vec![false; n_kept];
+    for (i, n) in g.nodes.iter().enumerate() {
+        if let Op::Append(k) = n.op {
+            append_of[i] = Some(k);
+            kept_of[i] = Some(k);
+        }
+        for (pos, a) in n.args.iter().enumerate() {
+            if let Some(k) = kept_of[a.0 as usize]
+                && (k as usize) < n_kept
+            {
+                match &n.op {
+                    Op::View(_) => kept_of[i] = Some(k),
+                    Op::Attend(att) if att.picked => sparse_found[k as usize] = true,
+                    _ => sparse_bad[k as usize] = true,
+                }
+            }
+            if let Some(k) = append_of[a.0 as usize]
+                && (k as usize) < n_kept
+            {
+                if let Op::Attend(att) = &n.op
+                    && let Mask::Back(back) = att.mask
+                    && att.ragged
+                    && !att.picked
+                    && (pos == 1 || pos == 2)
+                {
+                    let b = back as usize;
+                    ring_max[k as usize] = Some(ring_max[k as usize].map_or(b, |m| m.max(b)));
+                } else {
+                    ring_bad[k as usize] = true;
+                }
+            }
+        }
+    }
+    let sparse_kept = sparse_found
+        .into_iter()
+        .zip(sparse_bad)
+        .map(|(f, b)| f && !b)
+        .collect();
+    let rows_max = g
+        .dims
+        .iter()
+        .find(|d| d.name == DimName::Rows)
+        .map_or(RING_CHUNK, |d| d.size.max() as usize);
+    let chunk = rows_max.min(RING_CHUNK);
+    let kept_rings = (0..n_kept)
+        .map(|index| {
+            if ring_bad[index] {
+                return None;
+            }
+            let back = ring_max[index]?;
+            let DimExpr::Dim(axis) = g.kept[index].shape.0.get(1)? else {
+                return None;
+            };
+            let context = g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
+            let raw = back + 1 + chunk;
+            let ring = if rows_max < 64 {
+                raw
+            } else {
+                raw.next_multiple_of(64)
+            };
+            (ring < context).then_some(ring)
+        })
+        .collect();
+    (sparse_kept, kept_rings)
+}
+
+impl<'a> Tree<'a> {
+    /// Indexes kept appends, sparsity, and sliding-window rings.
+    pub(crate) fn index_kept(&mut self) {
+        let n_kept = self.g.kept.len();
+        let mut kept_appends = vec![None; n_kept];
+        for (idx, n) in self.nodes.iter().enumerate() {
+            if let Term::Op(Op::Append(k)) = &n.term
+                && let Some(slot) = kept_appends.get_mut(*k as usize)
+                && slot.is_none()
+            {
+                *slot = Some(T(idx as u32));
+            }
+        }
+        self.kept_appends = kept_appends;
+        let (sparse_kept, kept_rings) = kept_flags(self.g);
+        self.sparse_kept = sparse_kept;
+        self.kept_rings = kept_rings;
+    }
+
+    /// The node appending to kept `index`, and rows per slot.
+    pub fn kept_rows(&self, index: u32) -> Option<(T, usize)> {
+        let t = (*self.kept_appends.get(index as usize)?)?;
+        let DimExpr::Dim(axis) = &self.g.kept[index as usize].shape.0[1] else {
+            return None;
+        };
+        // A slot holds the axis's bound, whatever this launch sees.
+        let most = self.g.dims.iter().find(|d| d.name == *axis);
+        Some((t, most.map_or(0, |d| d.size.max() as usize)))
+    }
+
+    /// Append node, layout, and rows per slot for kept `index`.
+    pub fn kept_layout(&self, index: u32) -> Option<(T, &'static dyn Layout, usize)> {
+        let (t, context) = self.kept_rows(index)?;
+        match self.kept_rings.get(index as usize).copied().flatten() {
+            Some(ring) => Some((t, kept::RING, ring)),
+            None => Some((t, self.kept, context)),
+        }
+    }
+
+    /// True if kept `index` feeds only picked attention.
+    pub fn is_sparse_kept(&self, index: u32) -> bool {
+        self.sparse_kept
+            .get(index as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// True if any kept tensor is sparse-read.
+    pub fn has_sparse_kept(&self) -> bool {
+        self.sparse_kept.iter().any(|&s| s)
     }
 }
