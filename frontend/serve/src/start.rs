@@ -301,7 +301,7 @@ pub fn run(mut options: Options) -> Result<(), String> {
     let (host, port) = (options.host.clone(), options.port);
     let port_file = options.port_file.take();
     let limits = crate::http::Limits {
-        gate: Arc::new(crate::gate::Capped::new(options.max_connections)),
+        gate: Arc::new(crate::http::Capped::new(options.max_connections)),
         cors: options.cors_origin.clone(),
         ..Default::default()
     };

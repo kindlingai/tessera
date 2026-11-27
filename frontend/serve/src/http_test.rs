@@ -1,4 +1,4 @@
-use crate::http::{Limits, run};
+use crate::http::{Capped, Gate, Limits, run};
 use crate::mocks::{MockGenerator, loaded};
 use crate::route;
 use std::io::{Read, Write};
@@ -110,4 +110,13 @@ fn cors_preflight() {
     assert!(out.contains("Vary: Origin\r\n"));
     assert!(out.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"));
     assert!(out.contains("HTTP/1.1 200 OK\r\n"));
+}
+
+#[test]
+fn capped_refuses_extra() {
+    let gate = Capped::new(2);
+    assert!(gate.enter(None) && gate.enter(None));
+    assert!(!gate.enter(None));
+    gate.leave(None);
+    assert!(gate.enter(None));
 }
