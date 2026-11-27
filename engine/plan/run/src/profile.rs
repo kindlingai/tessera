@@ -81,6 +81,17 @@ impl Profile {
         self.spent.entry(name.to_string()).or_default().sum(one);
     }
 
+    /// A step's row: its kernel name and sizes.
+    pub fn key(step: &Step) -> String {
+        let kernel = &step.kernel;
+        let mut name = kernel.name().to_string();
+        for (i, size) in kernel.sizes().iter().enumerate() {
+            name.push(if i == 0 { ' ' } else { 'x' });
+            name.push_str(&size.to_string());
+        }
+        name
+    }
+
     /// Adds one run of `step`, by kernel name and sizes.
     pub fn step(&mut self, step: &Step, seconds: f64) {
         self.step_with(step, seconds, 1, None);
@@ -94,11 +105,7 @@ impl Profile {
     /// Adds `count` runs of `step` with optional device kernel attributes.
     pub fn step_with(&mut self, step: &Step, seconds: f64, count: u64, attrs: Option<KernelAttrs>) {
         let kernel = &step.kernel;
-        let mut name = kernel.name().to_string();
-        for (i, size) in kernel.sizes().iter().enumerate() {
-            name.push(if i == 0 { ' ' } else { 'x' });
-            name.push_str(&size.to_string());
-        }
+        let name = Self::key(step);
         let one = Spent {
             seconds,
             count,

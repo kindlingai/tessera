@@ -1,7 +1,7 @@
 //! An engine as one rank of several.
 
 use crate::lanes::{decode_patches, encode_patches};
-use crate::{Engine, Error, Head, Row};
+use crate::{Asks, Engine, Error, Head, Row};
 use tessera_engine_comm::{Reader, Transport, Writer};
 use tessera_graph::{DType, Graph, Parts, Whole, shard_mode};
 use tessera_kv::{DiskKv, DiskMsg, KvConfig, StoreStats, decode_msg};
@@ -255,8 +255,55 @@ impl Engine {
         };
         let profiles = std::iter::once(Some(own)).chain(others).collect();
         let ranks = Ranks { launches, profiles };
-        eprintln!("profile of {launches} launches:\n{ranks}");
+        match &mut self.profiled {
+            Some(sink) => sink(ranks.clone()),
+            None => eprintln!("profile of {launches} launches:\n{ranks}"),
+        }
         self.ranks = Some(ranks);
+    }
+
+    /// Profiles while `asks` hold, and hands each profile to `sink`.
+    pub fn profile_into(&mut self, asks: Asks, sink: Box<dyn FnMut(Ranks) + Send>) {
+        self.asks = Some(asks);
+        self.profiled = Some(sink);
+    }
+
+    /// Seconds per kernel and phase since the last take.
+    pub fn take_profile(&mut self) -> Option<Profile> {
+        self.runner.take_profile()
+    }
+
+    /// Gives one rank's profile to the sink, else prints it.
+    fn hand(&mut self, launches: u64, profile: Profile) {
+        match &mut self.profiled {
+            Some(sink) => sink(Ranks {
+                launches,
+                profiles: vec![Some(profile)],
+            }),
+            None => eprintln!(
+                "profile of {launches} launches:\n{}",
+                profile.report(launches)
+            ),
+        }
+    }
+
+    /// Hands on the profile once every so many launches.
+    pub(crate) fn report(&mut self) {
+        let Some([every, done]) = &mut self.profile else {
+            return;
+        };
+        *done += 1;
+        if *done < *every {
+            return;
+        }
+        let launches = std::mem::take(done);
+        let Some(profile) = self.take_profile() else {
+            return;
+        };
+        match self.control {
+            Some(_) => self.held = Some((launches, profile)),
+            None => self.hand(launches, profile),
+        }
     }
 
     /// Starts or stops profiling. Stopping holds the profile.
@@ -290,10 +337,7 @@ impl Engine {
         self.profile_ranked(on);
         if self.control.is_none() {
             if let Some((launches, profile)) = self.held.take() {
-                eprintln!(
-                    "profile of {launches} launches:\n{}",
-                    profile.report(launches)
-                );
+                self.hand(launches, profile);
             }
             return Ok(());
         }

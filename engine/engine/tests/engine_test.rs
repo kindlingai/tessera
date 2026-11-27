@@ -150,6 +150,28 @@ fn profile_counts_launches() {
     }
 }
 
+/// A profile sink takes the profile that settling would print.
+#[test]
+fn profile_goes_to_sink() {
+    let (_, _, mut engine) = open(17, 1, &Settings::default());
+    let asks = Asks::default();
+    let (send, got) = std::sync::mpsc::channel();
+    let sink = move |ranks| send.send(ranks).unwrap();
+    engine.profile_into(asks.clone(), Box::new(sink));
+    let request = Request {
+        tokens: vec![3, 9, 4],
+        max_tokens: 3,
+        ..Request::default()
+    };
+    let ask = asks.hold();
+    events(&mut engine, request);
+    drop(ask);
+    engine.settle().unwrap();
+    let ranks: tessera_engine::Ranks = got.try_recv().unwrap();
+    let profile = ranks.profiles[0].as_ref().unwrap();
+    assert_eq!(profile.spent["engine: launch"].count, 3);
+}
+
 #[test]
 fn rows_mix_slots() {
     // The interpreter keeps rows densely. Layouts and rules must agree.

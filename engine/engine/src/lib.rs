@@ -84,7 +84,7 @@ pub use tessera_mem::{block, trellis};
 // The front end's name for `mtp`.
 pub use tessera_models::mtp as mtp_model;
 pub use tessera_models::*;
-pub use tessera_run::{Grid, gpu, pinning, select, sizer};
+pub use tessera_run::{Grid, Ranks, gpu, pinning, select, sizer};
 pub use tessera_trace::{Linear, Norm, Vector};
 pub use tessera_turns as turns;
 pub use tessera_wasm as wasm;
@@ -270,6 +270,8 @@ pub struct Engine {
     ring_chunk: usize,
     /// Rows a pending verify can promote, if any.
     verified: Option<usize>,
+    /// Takes each finished profile in place of printing it.
+    profiled: Option<Box<dyn FnMut(Ranks) + Send>>,
 }
 
 /// Inputs a launch feeds before its picks.
@@ -470,6 +472,7 @@ impl Engine {
             stateful,
             ring_chunk,
             verified: None,
+            profiled: None,
         })
     }
 
@@ -955,33 +958,6 @@ impl Engine {
             self.runner.note(name, (to - from).as_secs_f64());
         }
         Ok(outputs)
-    }
-
-    /// Seconds per kernel and phase since the last take.
-    pub fn take_profile(&mut self) -> Option<tessera_run::Profile> {
-        self.runner.take_profile()
-    }
-
-    /// Prints the profile once every so many launches.
-    fn report(&mut self) {
-        let Some([every, done]) = &mut self.profile else {
-            return;
-        };
-        *done += 1;
-        if *done < *every {
-            return;
-        }
-        let launches = std::mem::take(done);
-        let Some(profile) = self.take_profile() else {
-            return;
-        };
-        match self.control {
-            Some(_) => self.held = Some((launches, profile)),
-            None => eprintln!(
-                "profile of {launches} launches:\n{}",
-                profile.report(launches)
-            ),
-        }
     }
 
     /// Decodes greedily after `request.tokens`, one event per token.
