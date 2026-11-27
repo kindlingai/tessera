@@ -448,18 +448,9 @@ impl Engine {
         Ok(all)
     }
 
-    /// Floats per tapped row, if the full entry emits taps.
-    pub fn tap_width(&self) -> Option<usize> {
-        self.taps
-    }
-
     /// Maximum sequence length in tokens.
     pub fn context(&self) -> usize {
         self.context
-    }
-
-    pub fn slots(&self) -> usize {
-        self.slots
     }
 
     /// One launch of `rows`: the likeliest token after each.
