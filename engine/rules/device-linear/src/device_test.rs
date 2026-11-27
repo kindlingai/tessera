@@ -1,4 +1,4 @@
-use crate::mm::propose_mm;
+use crate::mm::{propose_mm, propose_mm_mx8};
 use crate::{cuda_source, hip_source, prefill_source};
 use tessera_graph::DimName::Rows;
 use tessera_graph::{Act, DType, Dim, Graph, Node, NodeId, Op, Port, Role, Row, Stage, TensorType};
@@ -12,12 +12,13 @@ fn mm_entry(g: &Graph, rows: u64, form: &str) -> Option<(&'static str, &'static 
     mm_shaped(g, rows, form, Knobs::default())
 }
 
-fn mm_shaped(
+fn mm_draft(
     g: &Graph,
     rows: u64,
     form: &str,
     knobs: Knobs,
-) -> Option<(&'static str, &'static str, usize)> {
+    mx8: bool,
+) -> Option<(&'static str, &'static str, usize, tessera_lower::Load)> {
     let form = named(form).expect("known form");
     let dev = Device::default().pinned(Pins::all(form));
     let parts = dev.division();
@@ -35,12 +36,27 @@ fn mm_shaped(
     .expect("tree builds");
     tree.knobs = knobs;
     let root = tree.outputs[0].0;
-    let drafts = propose_mm(&tree, root)?;
-    let d = &drafts[0];
+    let drafts = if mx8 {
+        propose_mm_mx8(&tree, root)?
+    } else {
+        propose_mm(&tree, root)?
+    };
+    let d = &drafts[usize::from(mx8)];
     let Source::Fixed { entry, .. } = d.kernel.source() else {
         panic!("fast_mm uses fixed source");
     };
-    Some((d.kernel.name(), entry, d.reads.len()))
+    let load = d.kernel.load(0).expect("load model");
+    Some((d.kernel.name(), entry, d.reads.len(), load))
+}
+
+fn mm_shaped(
+    g: &Graph,
+    rows: u64,
+    form: &str,
+    knobs: Knobs,
+) -> Option<(&'static str, &'static str, usize)> {
+    let (name, entry, reads, _) = mm_draft(g, rows, form, knobs, false)?;
+    Some((name, entry, reads))
 }
 
 fn push_node(g: &mut Graph, op: Op, args: Vec<NodeId>, ty: TensorType) -> NodeId {
@@ -357,4 +373,66 @@ fn lowering_report_diagnostics() {
     .unwrap();
     let names90: Vec<&str> = p90.steps.iter().map(|s| s.kernel.name()).collect();
     assert_eq!(names90, ["fast_mm_mxfp8"]);
+}
+
+#[test]
+fn fast_mm_loads() {
+    let rows = [Dim::bounded(Rows, 512)];
+    let cases = [
+        (4096, 12288, 16, "bf16", "tessera_mm_bf16", false),
+        (12288, 4096, 16, "bf16", "tessera_mm_bf16_ks2", false),
+        (36864, 1536, 8, "bf16", "tessera_mm_bf16_sk", false),
+        (6144, 4096, 8, "mxfp8", "tessera_mm_mxfp8_r8", true),
+        (6144, 576, 8, "mxfp8", "tessera_mm_mxfp8_r8_sk", true),
+        (12288, 6144, 16, "mxfp8", "tessera_mm_mxfp8_r16", true),
+        (6144, 576, 16, "mxfp8", "tessera_mm_mxfp8_r16_sk", true),
+        (2048, 4096, 256, "mxfp8", "tessera_mm_mxfp8_r64", true),
+        (12288, 6144, 24, "mxfp8", "tessera_mm_mxfp8_r64_sk", true),
+    ];
+    for (k, n, m, form, want_entry, want_e4m3) in cases {
+        let (_, entry, _, load) = mm_draft(&linear(&rows, k, n), m, form, Knobs::default(), false)
+            .expect("matched fast_mm");
+        assert_eq!(entry, want_entry);
+        assert!(load.trip.bf16_flops > 0.0, "{entry}");
+        assert!(load.trip.loads > 0.0 && load.trip.width > 0.0, "{entry}");
+        assert_eq!(load.trip.e4m3 > 0.0, want_e4m3, "{entry}");
+    }
+    let mut k_bf16_wide = Knobs::default();
+    k_bf16_wide.parse("fast_mm_bf16:split_groups=0").unwrap();
+    assert_eq!(
+        mm_shaped(&linear(&rows, 12288, 4096), 16, "bf16", k_bf16_wide),
+        Some(("fast_mm_bf16", "tessera_mm_bf16", 2))
+    );
+    let mut k_bf16_split = Knobs::default();
+    k_bf16_split
+        .parse("fast_mm_bf16:split_groups=2048")
+        .unwrap();
+    assert_eq!(
+        mm_shaped(&linear(&rows, 4096, 12288), 16, "bf16", k_bf16_split),
+        Some(("fast_mm_bf16", "tessera_mm_bf16_ks2", 2))
+    );
+    let g_mx = linear(&rows, 6144, 6144);
+    assert!(mm_draft(&g_mx, 32, "mxfp8", Knobs::default(), true).is_none());
+    let mut k_mx_low = Knobs::default();
+    k_mx_low.parse("fast_mm_mxfp8_mx8:min_rows=32").unwrap();
+    assert_eq!(
+        mm_draft(&g_mx, 32, "mxfp8", k_mx_low, true).map(|(n, e, _, _)| (n, e)),
+        Some(("fast_mm_mxfp8_mx8", "tessera_mm_mxfp8_mx8"))
+    );
+    let mut k_mx_high = Knobs::default();
+    k_mx_high.parse("fast_mm_mxfp8_mx8:min_rows=256").unwrap();
+    assert!(mm_draft(&g_mx, 128, "mxfp8", k_mx_high, true).is_none());
+    let mut k_mx_sk = Knobs::default();
+    k_mx_sk.parse("fast_mm_mxfp8_sk:splits=4").unwrap();
+    k_mx_sk.parse("fast_mm_mxfp8_mx8_sk:splits=1").unwrap();
+    assert_eq!(
+        mm_draft(&g_mx, 256, "mxfp8", k_mx_sk, true).map(|(n, e, _, _)| (n, e)),
+        Some(("fast_mm_mxfp8_mx8", "tessera_mm_mxfp8_mx8"))
+    );
+    let mut k_mx_sk2 = Knobs::default();
+    k_mx_sk2.parse("fast_mm_mxfp8_mx8_sk:splits=2").unwrap();
+    assert_eq!(
+        mm_draft(&g_mx, 256, "mxfp8", k_mx_sk2, true).map(|(n, e, _, _)| (n, e)),
+        Some(("fast_mm_mxfp8_mx8_sk", "tessera_mm_mxfp8_mx8_sk"))
+    );
 }

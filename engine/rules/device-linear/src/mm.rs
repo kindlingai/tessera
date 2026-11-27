@@ -114,8 +114,11 @@ fn pick_divisor(chunks: usize, want: usize, cap: usize) -> usize {
     1
 }
 
+tessera_lower::knob!("fast_mm_bf16", "split_groups", 0, 2048);
 tessera_lower::knob!("fast_mm_bf16_sk", "splits", 1, 16);
 tessera_lower::knob!("fast_mm_mxfp8_sk", "splits", 1, 16);
+tessera_lower::knob!("fast_mm_mxfp8_mx8", "min_rows", 16, 512);
+tessera_lower::knob!("fast_mm_mxfp8_mx8_sk", "splits", 1, 16);
 
 /// The split count a rule set, fitted to `chunks`.
 fn set_ks(tree: &Tree, kernel: &str, chunks: usize) -> Option<usize> {
@@ -227,11 +230,35 @@ fn mm_load(k: &FastMm, _: usize) -> Option<Load> {
         ..Load::default()
     };
     load.trip.fresh = 1.0;
-    if matches!(k.kind, MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit) {
-        load.trip.bf16_flops = (2 * 64 * 64 * 512 / 256) as f64;
-        load.trip.loads = 40.25;
-        load.trip.width = 16.0;
-        load.trip.e4m3 = 256.0;
+    match k.kind {
+        MmKind::Bf16 => {
+            load.trip.bf16_flops = (2 * 2 * 16 * 32 * 64 / 128) as f64;
+            load.trip.loads = 4.0;
+            load.trip.width = 16.0;
+        }
+        MmKind::Bf16Split | MmKind::Bf16SplitK => {
+            load.trip.bf16_flops = (2 * 2 * 16 * 16 * 128 / 128) as f64;
+            load.trip.loads = 6.0;
+            load.trip.width = 16.0;
+        }
+        MmKind::Mxfp8 | MmKind::Mxfp8Split => {
+            load.trip.bf16_flops = (2 * 2 * 16 * 8 * 512 / 128) as f64;
+            load.trip.loads = 20.5;
+            load.trip.width = 200.0 / 20.5;
+            load.trip.e4m3 = 64.0;
+        }
+        MmKind::Mxfp8Wide | MmKind::Mxfp8WideSplit => {
+            load.trip.bf16_flops = (2 * 2 * 16 * 16 * 512 / 128) as f64;
+            load.trip.loads = 36.5;
+            load.trip.width = 328.0 / 36.5;
+            load.trip.e4m3 = 64.0;
+        }
+        MmKind::Mxfp8Tall | MmKind::Mxfp8TallSplit => {
+            load.trip.bf16_flops = (2 * 64 * 64 * 512 / 256) as f64;
+            load.trip.loads = 40.25;
+            load.trip.width = 16.0;
+            load.trip.e4m3 = 256.0;
+        }
     }
     Some(load)
 }
@@ -641,11 +668,15 @@ fn check_mm(tree: &Tree, mat: T) -> Option<Result<MmSite, String>> {
         )));
     }
     let form = tree.node(w).form;
+    let split_groups = tree
+        .knobs
+        .get("fast_mm_bf16", "split_groups")
+        .unwrap_or(144);
     let (kind, ks) = match form.name() {
         "bf16"
             if n.is_multiple_of(16)
                 && k.is_multiple_of(128)
-                && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < 144) =>
+                && (!n.is_multiple_of(32) || (n / 32) * m.div_ceil(16) < split_groups) =>
         {
             let set = set_ks(tree, "fast_mm_bf16_sk", k / 128);
             let ks = set.unwrap_or_else(|| bf16_ks(m, n, k));
@@ -714,10 +745,16 @@ fn mm_site(tree: &Tree, mat: T) -> Option<MmSite> {
 
 fn mx8_site(tree: &Tree, mat: T) -> Option<MmSite> {
     let mut site = mm_site(tree, mat)?;
-    if site.form.name() != "mxfp8" || site.m < 64 {
+    let min_rows = tree
+        .knobs
+        .get("fast_mm_mxfp8_mx8", "min_rows")
+        .unwrap_or(64);
+    if site.form.name() != "mxfp8" || site.m < min_rows {
         return None;
     }
-    let set = set_ks(tree, "fast_mm_mxfp8_sk", site.k / 512);
+    let chunks = site.k / 512;
+    let set = set_ks(tree, "fast_mm_mxfp8_mx8_sk", chunks)
+        .or_else(|| set_ks(tree, "fast_mm_mxfp8_sk", chunks));
     site.ks = set.unwrap_or_else(|| mxfp8_tile_ks(site.m, site.n, site.k, 128, 40, 24, 64));
     Some(site)
 }
