@@ -66,7 +66,8 @@ async fn fetch(
     env: Env,
     _ctx: Context,
 ) -> worker::Result<worker::Response> {
-    let secret = |name: &str| env.secret(name).map(|s| s.to_string());
+    // A pasted secret often brings a stray space or newline.
+    let secret = |name: &str| env.secret(name).map(|s| s.to_string().trim().to_string());
     let mut editors = Vec::new();
     for id in secret("EDITORS")?.split(',') {
         editors.push(id.trim().parse().map_err(|e| bad("EDITORS", e))?);
