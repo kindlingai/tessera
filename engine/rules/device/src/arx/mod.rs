@@ -25,23 +25,61 @@ tessera_lower::knob!("arx_sum", "gather_max_grid", 1, 256);
 tessera_lower::knob!("arx_sum", "two_shot_bytes", 0, 128 << 20);
 tessera_lower::knob!("arx_sum", "min_blocks", 1, 16);
 
+/// Index of `wire` in a bf16, f32, fp8 kernel array.
+fn slot(wire: DType) -> usize {
+    match wire {
+        DType::Bf16 => 0,
+        DType::Fp8 => 2,
+        _ => 1,
+    }
+}
+
+/// Elements one pipelined block moves on `wire`.
+fn pipe_step(wire: DType) -> u32 {
+    if wire == DType::Fp8 {
+        1024
+    } else {
+        THREADS * 8
+    }
+}
+
+/// Element alignment a pipelined part needs on `wire`.
+fn pipe_align(wire: DType) -> usize {
+    if wire == DType::Fp8 { 1024 } else { 8 }
+}
+
+/// Bytes `elems` floats take on `wire`.
+fn wire_bytes(wire: DType, elems: usize) -> usize {
+    match wire {
+        DType::Fp8 => (elems / 1024) * 1152 + (elems % 1024) * 4,
+        DType::Bf16 => elems * 2,
+        _ => elems * 4,
+    }
+}
+
+/// Whole floats that `bytes` hold on `wire`.
+fn wire_elems(wire: DType, bytes: usize) -> usize {
+    match wire {
+        DType::Fp8 => (bytes / 1152) * 1024,
+        DType::Bf16 => bytes / 2,
+        _ => bytes / 4,
+    }
+}
+
+/// Floats that fit one send buffer and `ranks` slots.
+fn send_fit(wire: DType, ranks: usize) -> usize {
+    wire_elems(wire, ArxLink::SEND_BYTES).min(wire_elems(wire, ArxLink::SLOT_BYTES) * ranks)
+}
+
 /// GPU-side arx kernels paired with a host RDMA proxy link.
 pub struct Arx<D: Device> {
     ctx: D,
     link: ArxLink,
     mem: ArxMem,
-    one_bf16: D::Kernel,
-    one_f32: D::Kernel,
-    one_fp8: D::Kernel,
-    two_bf16: D::Kernel,
-    two_f32: D::Kernel,
-    two_fp8: D::Kernel,
-    rs_bf16: D::Kernel,
-    rs_f32: D::Kernel,
-    rs_fp8: D::Kernel,
-    gr_bf16: D::Kernel,
-    gr_f32: D::Kernel,
-    gr_fp8: D::Kernel,
+    one: [D::Kernel; 3],
+    two: [D::Kernel; 3],
+    rs: [D::Kernel; 3],
+    gr: [D::Kernel; 3],
     allgather: D::Kernel,
     gather_rows: D::Kernel,
     state: DeviceBuffer<D>,
@@ -86,18 +124,14 @@ where
         let two_shot_bytes = knobs
             .get("arx_sum", "two_shot_bytes")
             .unwrap_or(TWO_SHOT_BYTES);
-        let one_bf16 = ctx.compile(&text, "tessera_arx_one_bf16")?;
-        let one_f32 = ctx.compile(&text, "tessera_arx_one_f32")?;
-        let one_fp8 = ctx.compile(&text, "tessera_arx_one_fp8")?;
-        let two_bf16 = ctx.compile(&text, "tessera_arx_two_bf16")?;
-        let two_f32 = ctx.compile(&text, "tessera_arx_two_f32")?;
-        let two_fp8 = ctx.compile(&text, "tessera_arx_two_fp8")?;
-        let rs_bf16 = ctx.compile(&text, "tessera_arx_rs_bf16")?;
-        let rs_f32 = ctx.compile(&text, "tessera_arx_rs_f32")?;
-        let rs_fp8 = ctx.compile(&text, "tessera_arx_rs_fp8")?;
-        let gr_bf16 = ctx.compile(&text, "tessera_arx_gr_bf16")?;
-        let gr_f32 = ctx.compile(&text, "tessera_arx_gr_f32")?;
-        let gr_fp8 = ctx.compile(&text, "tessera_arx_gr_fp8")?;
+        let wired = |base: &str| -> Result<[<D as Device>::Kernel; 3], Error> {
+            let k = |w: &str| ctx.compile(&text, &format!("tessera_arx_{base}_{w}"));
+            Ok([k("bf16")?, k("f32")?, k("fp8")?])
+        };
+        let one = wired("one")?;
+        let two = wired("two")?;
+        let rs = wired("rs")?;
+        let gr = wired("gr")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
         let gather_rows = ctx.compile(&text, "tessera_arx_gather_rows")?;
         let state = DeviceBuffer::alloc(ctx, 32 + crate::TIMING_BYTES)?;
@@ -111,18 +145,10 @@ where
             ctx: ctx.clone(),
             link,
             mem,
-            one_bf16,
-            one_f32,
-            one_fp8,
-            two_bf16,
-            two_f32,
-            two_fp8,
-            rs_bf16,
-            rs_f32,
-            rs_fp8,
-            gr_bf16,
-            gr_f32,
-            gr_fp8,
+            one,
+            two,
+            rs,
+            gr,
             allgather,
             gather_rows,
             state,
@@ -155,12 +181,13 @@ where
             .u64(self.timeout_ticks);
     }
 
-    fn max_grid(&self, full: u32) -> u32 {
-        if self.ctx.active_lane() != 0 {
+    fn grid(&self, blocks: u32, full: u32) -> u32 {
+        let cap = if self.ctx.active_lane() != 0 {
             (self.ctx.platform().units as u32 / 6).clamp(4, 8)
         } else {
             full
-        }
+        };
+        blocks.clamp(1, cap)
     }
 
     fn launch_sum_kernel(
@@ -174,19 +201,11 @@ where
         let mut args = self.base_args();
         args.u64(from).u64(to).u32(n);
         self.finish_args(&mut args);
-        let step = if wire == DType::Fp8 {
-            1024
+        let grid = self.grid(n.div_ceil(pipe_step(wire)), self.max_grid_cap);
+        let kernel = if two {
+            &self.two[slot(wire)]
         } else {
-            THREADS * 8
-        };
-        let grid = n.div_ceil(step).clamp(1, self.max_grid(self.max_grid_cap));
-        let kernel = match (two, wire) {
-            (false, DType::Bf16) => &self.one_bf16,
-            (false, DType::Fp8) => &self.one_fp8,
-            (false, _) => &self.one_f32,
-            (true, DType::Bf16) => &self.two_bf16,
-            (true, DType::Fp8) => &self.two_fp8,
-            (true, _) => &self.two_f32,
+            &self.one[slot(wire)]
         };
         self.ctx.programmatic(false);
         Ok(self
@@ -196,11 +215,6 @@ where
 
     fn launch_sum(&mut self, from: u64, to: u64, len: usize, wire: DType) -> Result<(), Error> {
         let ranks = self.mem.ranks as usize;
-        let wire_bytes = |elems: usize| match wire {
-            DType::Fp8 => (elems / 1024) * 1152 + (elems % 1024) * 4,
-            DType::Bf16 => elems * 2,
-            _ => elems * 4,
-        };
         let align = match wire {
             DType::Fp8 => ranks * 1024,
             _ => ranks * 8,
@@ -208,32 +222,22 @@ where
         let aligned = (from & 15) == 0 && (to & 15) == 0;
         let two_shot = self.mem.mesh
             && aligned
-            && wire_bytes(len) > self.two_shot_bytes
+            && wire_bytes(wire, len) > self.two_shot_bytes
             && len.is_multiple_of(align);
         let max_elems = match (two_shot, wire) {
-            (true, DType::Fp8) => {
-                let by_send = (ArxLink::SEND_BYTES / 1152) * 1024;
-                let by_slot = (ArxLink::SLOT_BYTES / 1152) * 1024 * ranks;
-                (by_send.min(by_slot) / align) * align
-            }
-            (false, DType::Fp8) => ((ArxLink::SLOT_BYTES - 4096) / 1152) * 1024,
-            (true, _) => {
-                let elem = if wire == DType::Bf16 { 2 } else { 4 };
-                let by_send = ArxLink::SEND_BYTES / elem;
-                let by_slot = (ArxLink::SLOT_BYTES / elem) * ranks;
-                (by_send.min(by_slot) / align) * align
-            }
-            (false, _) => ArxLink::SLOT_BYTES / if wire == DType::Bf16 { 2 } else { 4 },
+            (true, _) => (send_fit(wire, ranks) / align) * align,
+            (false, DType::Fp8) => wire_elems(wire, ArxLink::SLOT_BYTES - 4096),
+            (false, _) => wire_elems(wire, ArxLink::SLOT_BYTES),
         };
         let mut off = 0usize;
         while off < len {
             let step = (len - off).min(max_elems);
-            let f = from + (off * 4) as u64;
-            let t = to + (off * 4) as u64;
+            let off4 = (off * 4) as u64;
             let n = u32::try_from(step).map_err(|_| Error::Plan("arx sum too long".into()))?;
-            let use_two =
-                two_shot && wire_bytes(step) > self.two_shot_bytes && step.is_multiple_of(align);
-            self.launch_sum_kernel(f, t, n, wire, use_two)?;
+            let use_two = two_shot
+                && wire_bytes(wire, step) > self.two_shot_bytes
+                && step.is_multiple_of(align);
+            self.launch_sum_kernel(from + off4, to + off4, n, wire, use_two)?;
             off += step;
         }
         Ok(())
@@ -267,7 +271,7 @@ where
             let mut args = self.base_args();
             args.u64(f).u64(t).u32(r_cnt as u32).u32(width as u32);
             self.finish_args(&mut args);
-            let grid = ((r_cnt * cols) as u32 / (THREADS * 4)).clamp(1, self.max_grid(64));
+            let grid = self.grid((r_cnt * cols) as u32 / (THREADS * 4), 64);
             self.ctx.programmatic(false);
             self.ctx
                 .launch(&self.allgather, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?;
@@ -286,7 +290,7 @@ where
         wire: DType,
     ) -> Result<bool, Error> {
         let ranks = self.mem.ranks as usize;
-        let part_align = if wire == DType::Fp8 { 1024 } else { 8 };
+        let part_align = pipe_align(wire);
         let aligned = (from & 15) == 0 && (to & 15) == 0;
         let fits = !self.broken
             && self.mem.mesh
@@ -298,18 +302,7 @@ where
         if !fits {
             return Ok(false);
         }
-        let max_total = match wire {
-            DType::Fp8 => {
-                let by_send = (ArxLink::SEND_BYTES / 1152) * 1024;
-                let by_slot = (ArxLink::SLOT_BYTES / 1152) * 1024 * ranks;
-                by_send.min(by_slot)
-            }
-            _ => {
-                let elem = if wire == DType::Bf16 { 2 } else { 4 };
-                (ArxLink::SEND_BYTES / elem).min((ArxLink::SLOT_BYTES / elem) * ranks)
-            }
-        };
-        if total > max_total {
+        if total > send_fit(wire, ranks) {
             return Ok(false);
         }
         let Ok(n) = u32::try_from(total) else {
@@ -318,17 +311,8 @@ where
         let mut args = self.base_args();
         args.u64(from).u64(to).u32(n);
         self.finish_args(&mut args);
-        let step = if wire == DType::Fp8 {
-            1024
-        } else {
-            THREADS * 8
-        };
-        let grid = n.div_ceil(step).clamp(1, self.max_grid(self.max_grid_cap));
-        let kernel = match wire {
-            DType::Bf16 => &self.rs_bf16,
-            DType::Fp8 => &self.rs_fp8,
-            _ => &self.rs_f32,
-        };
+        let grid = self.grid(n.div_ceil(pipe_step(wire)), self.max_grid_cap);
+        let kernel = &self.rs[slot(wire)];
         self.ctx.programmatic(false);
         self.ctx
             .launch(kernel, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?;
@@ -355,53 +339,38 @@ where
         let Ok(part_stride) = u32::try_from(part) else {
             return Ok(false);
         };
-        let wire_bytes = |elems: usize| match wire {
-            DType::Fp8 => (elems / 1024) * 1152 + (elems % 1024) * 4,
-            DType::Bf16 => elems * 2,
-            _ => elems * 4,
-        };
-        let part_align = if wire == DType::Fp8 { 1024 } else { 8 };
+        let part_align = pipe_align(wire);
         let aligned = (from & 15) == 0 && (to & 15) == 0;
         let pipelined = self.mem.mesh
             && aligned
             && part.is_multiple_of(part_align)
-            && wire_bytes(total) > PIPE_GATHER_BYTES;
-        let max_part = match (pipelined, wire) {
-            (true, DType::Fp8) => (ArxLink::SLOT_BYTES / 1152) * 1024,
-            (true, DType::Bf16) => (ArxLink::SLOT_BYTES / 2 / part_align) * part_align,
-            (true, _) => (ArxLink::SLOT_BYTES / 4 / part_align) * part_align,
-            (false, _) => ArxLink::SLOT_BYTES / 4,
+            && wire_bytes(wire, total) > PIPE_GATHER_BYTES;
+        let max_part = match pipelined {
+            true => (wire_elems(wire, ArxLink::SLOT_BYTES) / part_align) * part_align,
+            false => ArxLink::SLOT_BYTES / 4,
         };
         let mut off = 0usize;
         while off < part {
             let n = (part - off).min(max_part);
-            let f = from + (off * 4) as u64;
-            let t = to + (off * 4) as u64;
+            let off4 = (off * 4) as u64;
             let mut args = self.base_args();
-            args.u64(f).u64(t).u32(part_stride).u32(n as u32);
+            args.u64(from + off4)
+                .u64(to + off4)
+                .u32(part_stride)
+                .u32(n as u32);
             self.finish_args(&mut args);
             let use_pipe = pipelined
                 && n.is_multiple_of(part_align)
-                && wire_bytes(n * ranks) > PIPE_GATHER_BYTES;
-            let (kernel, grid) = if use_pipe {
-                let step = if wire == DType::Fp8 {
-                    1024
-                } else {
-                    THREADS * 8
-                };
-                let g = ((n * ranks) as u32)
-                    .div_ceil(step)
-                    .clamp(1, self.max_grid(self.max_grid_cap));
-                let k = match wire {
-                    DType::Bf16 => &self.gr_bf16,
-                    DType::Fp8 => &self.gr_fp8,
-                    _ => &self.gr_f32,
-                };
-                (k, g)
+                && wire_bytes(wire, n * ranks) > PIPE_GATHER_BYTES;
+            let elems = (n * ranks) as u32;
+            let grid = match use_pipe {
+                true => self.grid(elems.div_ceil(pipe_step(wire)), self.max_grid_cap),
+                false => self.grid(elems / (THREADS * 4), self.gather_max_grid),
+            };
+            let kernel = if use_pipe {
+                &self.gr[slot(wire)]
             } else {
-                let g = ((n * ranks) as u32 / (THREADS * 4))
-                    .clamp(1, self.max_grid(self.gather_max_grid));
-                (&self.gather_rows, g)
+                &self.gather_rows
             };
             self.ctx.programmatic(false);
             self.ctx
