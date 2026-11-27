@@ -69,6 +69,22 @@ pub(crate) struct Cover<'a> {
     pub(crate) streams: bool,
     /// Each graph node's region label, when the recipe scopes choices.
     pub(crate) labels: Option<Vec<String>>,
+    /// Each way's rule, kernels and seconds by node, when explaining.
+    pub(crate) priced: Option<HashMap<T, Vec<Priced>>>,
+}
+
+/// A way's rule, kernels and estimated cost.
+pub(crate) type Priced = (&'static str, Vec<&'static str>, f64, usize);
+
+/// The costed ways at one chosen node, cheapest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Variants {
+    pub node: tessera_graph::NodeId,
+    pub site: String,
+    /// The kernels the plan chose here.
+    pub chosen: Vec<&'static str>,
+    /// Each way's rule, kernels, estimated milliseconds and graph ops covered.
+    pub ways: Vec<Priced>,
 }
 
 impl<'a> Cover<'a> {
@@ -87,6 +103,23 @@ impl<'a> Cover<'a> {
             }
         }
         (favor, pick, barred)
+    }
+
+    /// The costed ways at `t`, when there are several.
+    pub(crate) fn variants(&self, t: T, choice: &Choice) -> Option<Variants> {
+        let mut ways = self.priced.as_ref()?.get(&t)?.clone();
+        if ways.len() < 2 {
+            return None;
+        }
+        ways.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let chosen = choice.drafts.iter().map(|d| d.kernel.name()).collect();
+        let node = self.tree.node(t).from;
+        Some(Variants {
+            node,
+            site: site_label(self.tree, t),
+            chosen,
+            ways,
+        })
     }
 
     fn zones(&self) -> std::ops::Range<u32> {
@@ -332,6 +365,18 @@ impl<'a> Cover<'a> {
                         continue;
                     };
                     cost -= own;
+                    let ops = self
+                        .priced
+                        .is_some()
+                        .then(|| self.tree.covered(t, &reads(&drafts)).len());
+                    if let (Some(priced), Some(ops)) = (&mut self.priced, ops) {
+                        let kernels: Vec<_> = drafts.iter().map(|d| d.kernel.name()).collect();
+                        let ways = priced.entry(t).or_default();
+                        match ways.iter_mut().find(|w| w.0 == rule.name && w.1 == kernels) {
+                            Some(w) => w.2 = w.2.min(cost * 1e3),
+                            None => ways.push((rule.name, kernels, cost * 1e3, ops)),
+                        }
+                    }
                     // A picked kernel wins, then a favored rule, then cost.
                     let (mine, favored) = (picked(&drafts), favors(rule.name));
                     let beaten = |b: &Choice| match (picked(&b.drafts), mine) {
@@ -577,4 +622,29 @@ fn made(d: &Draft) -> bool {
     *known
         .entry(name)
         .or_insert_with(|| matches!(d.kernel.source(), Source::Made(_)))
+}
+
+/// Concise human description of tree node `t`.
+pub(crate) fn site_label(tree: &Tree<'_>, t: T) -> String {
+    let n = tree.node(t);
+    match &n.term {
+        Term::Op(Op::Matmul) => {
+            let (x, w) = (tree.node(n.args[0]), tree.node(n.args[1]));
+            format!("matmul {:?} x {:?} ({})", x.shape, w.shape, w.form.name())
+        }
+        Term::Op(Op::Attend(a)) => {
+            let q = tree.node(n.args[0]);
+            let k = tree.node(n.args[1]);
+            let kind = match (a.ragged, a.picked) {
+                (true, true) => "attend ragged+listed",
+                (true, false) => "attend ragged",
+                (false, true) => "attend listed",
+                (false, false) => "attend",
+            };
+            format!("{kind} {:?} k={:?} ({})", q.shape, k.shape, k.form.name())
+        }
+        Term::Op(op) => format!("{op:?} {:?} ({})", n.shape, n.form.name()),
+        Term::Stage(s) => format!("{s:?} {:?} ({})", n.shape, n.form.name()),
+        Term::Leaf(_) => format!("leaf {:?} ({})", n.shape, n.form.name()),
+    }
 }

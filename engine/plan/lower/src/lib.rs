@@ -33,7 +33,7 @@ pub use plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step};
 pub use recipe::{Compute, Dtype, KNOBS, Knob, Knobs, Launching, Recipe, Scoped, Wires, labels};
 pub use rule::{Attn, Draft, Propose, RULES, Read, Rule, linked, rules};
 pub use schedule::{peak, schedule};
-pub use select::{Finding, Home, Op, Rejection, Report, Selected, Val, Value, select};
+pub use select::{Finding, Home, Op, Rejection, Report, Selected, Val, Value, Variants, select};
 pub use tessera_codegen::kept;
 pub use tessera_codegen::{Dialect, Terms, hip_tiles, terms};
 pub use tessera_engine_settings::{Backend, ByBackend, Pick, Reads, Settings};

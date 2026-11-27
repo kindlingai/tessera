@@ -3,6 +3,7 @@
 mod cover;
 mod emit;
 
+pub use cover::Variants;
 use cover::{Cover, EDGE, reads};
 use emit::Emit;
 pub use report::{Finding, Rejection, Report};
@@ -16,7 +17,7 @@ use crate::plan::{KeptInfo, Share, pack_shape};
 use crate::rule::{Read, Rule, linked};
 use crate::tree::{T, Term, Tree, Wants};
 use crate::{Error, Unsupported};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tessera_graph::{DimName, Graph, NodeId};
 
 /// A value some op writes, or the plan is given.
@@ -192,6 +193,7 @@ fn select_with(
         bare: Vec::new(),
         streams: device.streams(tree.weight_bytes()),
         labels,
+        priced: explain.then(HashMap::new),
     };
     for (t, _) in &tree.outputs {
         cover.wanted[t.0 as usize].push(EDGE);
@@ -376,16 +378,15 @@ fn emit_choice(
 }
 
 mod report {
-    use super::cover::{Cover, EDGE, fits, grid_mismatch, reads, writes};
+    use super::cover::{Cover, EDGE, Variants, fits, grid_mismatch, reads, site_label, writes};
     use super::{Home, Selected, Value};
     use crate::cost::Device;
     use crate::kernels::{AllReduce, GatherRows, ReduceScatter, moved};
     use crate::rule::{Draft, Rule, ways};
-    use crate::tree::{T, Term, Tree};
+    use crate::tree::T;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     use tessera_engine_settings::Backend;
-    use tessera_graph::Op;
     use tessera_platform::Platform;
     use tessera_sim::ZoneKind;
 
@@ -417,6 +418,10 @@ mod report {
         pub unused_favor: Option<String>,
         pub weight_widens: usize,
         pub findings: Vec<Finding>,
+        /// Rules that proposed at each chosen graph node.
+        pub offered: Vec<(tessera_graph::NodeId, Vec<&'static str>)>,
+        /// Costed ways at chosen nodes with more than one.
+        pub variants: Vec<Variants>,
     }
 
     impl Report {
@@ -666,31 +671,6 @@ mod report {
         })
     }
 
-    /// Concise human description of tree node `t`.
-    fn site_label(tree: &Tree<'_>, t: T) -> String {
-        let n = tree.node(t);
-        match &n.term {
-            Term::Op(Op::Matmul) => {
-                let (x, w) = (tree.node(n.args[0]), tree.node(n.args[1]));
-                format!("matmul {:?} x {:?} ({})", x.shape, w.shape, w.form.name())
-            }
-            Term::Op(Op::Attend(a)) => {
-                let q = tree.node(n.args[0]);
-                let k = tree.node(n.args[1]);
-                let kind = match (a.ragged, a.picked) {
-                    (true, true) => "attend ragged+listed",
-                    (true, false) => "attend ragged",
-                    (false, true) => "attend listed",
-                    (false, false) => "attend",
-                };
-                format!("{kind} {:?} k={:?} ({})", q.shape, k.shape, k.form.name())
-            }
-            Term::Op(op) => format!("{op:?} {:?} ({})", n.shape, n.form.name()),
-            Term::Stage(s) => format!("{s:?} {:?} ({})", n.shape, n.form.name()),
-            Term::Leaf(_) => format!("leaf {:?} ({})", n.shape, n.form.name()),
-        }
-    }
-
     /// Formats a `Value`'s packed shape as `[d0, d1, ...]`.
     fn value_shape(v: &Value) -> String {
         let dims = v.dims as usize;
@@ -881,6 +861,8 @@ mod report {
         groups: BTreeMap<GroupKey, (usize, f64)>,
         covered_by_region: Vec<bool>,
         node_secs: Vec<f64>,
+        offered: Vec<(tessera_graph::NodeId, Vec<&'static str>)>,
+        variants: Vec<Variants>,
     }
 
     /// Scans chosen covers before emit consumes `cover.best`.
@@ -888,6 +870,8 @@ mod report {
         let mut groups: BTreeMap<GroupKey, (usize, f64)> = BTreeMap::new();
         let mut covered_by_region = vec![false; cover.tree.len()];
         let mut node_secs = vec![0.0f64; cover.tree.len()];
+        let mut offered = Vec::new();
+        let mut variants = Vec::new();
         for (idx, zone) in own.iter().enumerate() {
             let Some(zone) = *zone else {
                 continue;
@@ -899,6 +883,8 @@ mod report {
             let Some(Some(choice)) = &cover.best[idx][zone as usize] else {
                 continue;
             };
+            offered.push((cover.tree.node(t).from, choice.offered.clone()));
+            variants.extend(cover.variants(t, choice));
             if choice.drafts.is_empty() {
                 continue;
             }
@@ -948,6 +934,8 @@ mod report {
             groups,
             covered_by_region,
             node_secs,
+            offered,
+            variants,
         }
     }
 
@@ -991,6 +979,8 @@ mod report {
             unused_favor,
             weight_widens,
             findings,
+            offered: scan.offered,
+            variants: scan.variants,
         }
     }
 }

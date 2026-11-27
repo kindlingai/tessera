@@ -465,3 +465,17 @@ fn spot_wires_stay() {
         assert_eq!(wire, first.then_some(DType::Bf16));
     }
 }
+
+/// Explain lists each costed way, the chosen one among them.
+#[test]
+fn variants_hold_chosen() {
+    let g = stepper::<Norm, Swiglu>(&Config::qwen3_small());
+    let sizes = [(Seqs, 4), (Rows, 64), (Context, 64)];
+    let device = Device::guess(&Settings::default());
+    let report = tessera_lower::explain(&g, 0, &sizes, &device).unwrap();
+    assert!(!report.variants.is_empty());
+    for v in &report.variants {
+        assert!(v.ways.len() > 1, "{v:?}");
+        assert!(v.ways.iter().any(|w| w.1 == v.chosen), "{v:?}");
+    }
+}
