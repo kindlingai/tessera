@@ -124,10 +124,10 @@ impl Config {
         }
     }
 
-    /// Eight small layers, a core of four run thrice.
+    /// Three small layers, a global core run twice.
     pub fn small() -> Self {
         Self {
-            stack: Stack::sized([64, 16, 8, 4, 4, 16], 2, 16),
+            stack: Stack::sized([64, 16, 3, 4, 4, 16], 2, 16),
             unpadded_vocab: 60,
             kv_heads: 2,
             d_rel: 4,
@@ -135,13 +135,14 @@ impl Config {
             log_scaling_n_floor: 4.0,
             qk_l2_clip: 4.0,
             rel_l2_clip: 4.0,
-            global: (0..8).map(|l| l % 2 == 1).collect(),
+            global: vec![false, true, false],
             sliding_window: 4,
             attn_res_block: 2,
             n_experts: 4,
             top_k: 2,
-            loop_start: 2,
-            loop_end: 6,
+            loop_start: 1,
+            loop_end: 2,
+            loop_passes: 2,
             gate_rank: 4,
             ..Self::mini(2, 16)
         }

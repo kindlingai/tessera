@@ -312,7 +312,7 @@ impl Ref {
             self.layer(l, &mut states, &mut h, None);
         }
         for _ in 1..c.loop_passes {
-            let prev = states.split_off(pre_states.len() + 1);
+            let prev = states.split_off((pre_states.len() + 1).min(states.len()));
             let prev_h = std::mem::replace(&mut h, pre_h.clone());
             states = pre_states.clone();
             for (j, l) in (start..end).enumerate() {
@@ -444,7 +444,7 @@ fn metal() -> Platform {
 fn graphs_lower() {
     let c = Config::small();
     let wide = Config {
-        stack: tessera_models::Stack::sized([64, 128, 8, 4, 4, 128], 2, 16),
+        stack: tessera_models::Stack::sized([64, 128, c.stack.layers, 4, 4, 128], 2, 16),
         ..Config::small()
     };
     let whole = [(Seqs, 2), (Context, 16)];
@@ -459,9 +459,10 @@ fn graphs_lower() {
 /// Experts at mixed widths take the fast Metal launch.
 #[test]
 fn metal_experts_fast() {
+    let small = Config::small();
     let wide = Config {
-        stack: tessera_models::Stack::sized([64, 128, 8, 4, 4, 128], 2, 16),
-        ..Config::small()
+        stack: tessera_models::Stack::sized([64, 128, small.stack.layers, 4, 4, 128], 2, 16),
+        ..small
     };
     let g = stepper::<Coded>(&wide);
     let mixed = tessera_lower::form::named("trellis_mix_pmcgx").unwrap();
