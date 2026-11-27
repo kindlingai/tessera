@@ -24,9 +24,6 @@ mod interleave_test;
 /// Context rows retained per slot for DFlash tail promotion.
 pub(crate) const DFLASH_TAIL_WIN: usize = 128;
 
-/// Minimum remaining tokens to promote a sole survivor to DFlash.
-pub(crate) const PROMOTE_MIN_REM: usize = 8;
-
 /// Optional DFlash peer for solo and tail acceleration.
 pub(crate) struct DualPeer<'a> {
     pub(crate) dflash: &'a mut Drafter,
