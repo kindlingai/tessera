@@ -12,6 +12,12 @@ use tessera_mem::DType;
 use tessera_run::Sum;
 
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
+const COLLECT: &str = include_str!("p2p/collect.kernel");
+
+/// Full P2P kernel source combining sum and collective kernels.
+pub(crate) fn source() -> String {
+    format!("{KERNEL}\n{COLLECT}")
+}
 const ENTRY: &str = "tessera_p2p_sum";
 const GATHER_ENTRY: &str = "tessera_p2p_gather";
 const GATHER_ROWS_ENTRY: &str = "tessera_p2p_gather_rows";
@@ -246,7 +252,8 @@ where
                 .unwrap_or(CROSS[1]),
         ];
         let min_blocks = knobs.get("p2p_sum", "min_blocks");
-        let text = flatten("p2p.kernel", KERNEL, &|_| None, &options)?.text;
+        let source = source();
+        let text = flatten("p2p.kernel", &source, &|_| None, &options)?.text;
         let text = match min_blocks {
             Some(mb) => {
                 format!("#define P2P_THREADS {threads}\n#define P2P_MIN_BLOCKS {mb}\n{text}")
@@ -423,10 +430,21 @@ where
         self.finish_launch(&self.gather_kernel, sched, grid, args)
     }
 
-    fn launch_rs(&mut self, from: u64, to: u64, part: u32, wire: DType) -> Result<(), Error> {
-        let (sched, grid, mut args) =
-            self.prepare(part as usize * 4, from, to, Some(self.large_grid))?;
-        args.u32(part);
+    fn launch_rs(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: u32,
+        len: u32,
+        total: u32,
+        wire: DType,
+    ) -> Result<(), Error> {
+        let even = len > 0
+            && u64::from(start) == u64::from(self.rank) * u64::from(len)
+            && u64::from(len) * u64::from(self.ranks) == u64::from(total);
+        let bytes = if even { len as usize } else { total as usize } * 4;
+        let (sched, grid, mut args) = self.prepare(bytes, from, to, Some(self.large_grid))?;
+        args.u32(start).u32(len).u32(total);
         let kernel = match wire {
             DType::Bf16 => &self.rs_bf16_kernel,
             DType::F16 => &self.rs_fp16_kernel,
@@ -549,14 +567,20 @@ where
                 "an earlier p2p sum failed".into(),
             ))));
         }
-        let ranks = self.ranks as usize;
-        if len == 0 || start != self.rank as usize * len || len * ranks != total {
+        if total == 0 {
+            return Ok(true);
+        }
+        if start > total || len > total - start {
             return Ok(false);
         }
-        let Ok(part) = u32::try_from(len) else {
+        let (Ok(start), Ok(len), Ok(total)) = (
+            u32::try_from(start),
+            u32::try_from(len),
+            u32::try_from(total),
+        ) else {
             return Ok(false);
         };
-        self.launch_rs(from, to, part, wire)
+        self.launch_rs(from, to, start, len, total, wire)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
         Ok(true)
     }

@@ -250,26 +250,35 @@ TESSERA_FN void write_slice(u64 area, u64 seq, u32 me, u32 nr, const float* src,
     }
 }
 
+TESSERA_FN void sum_fp8_blk(u64 mine, u64 seq, u32 me, u32 nr, const float* src, u32 b,
+                            bool aligned_src, float4& a0, float4& a1, float4& a2, float4& a3) {
+    a0 = make_float4(0, 0, 0, 0);
+    a1 = a0;
+    a2 = a0;
+    a3 = a0;
+    for (u32 r = 0; r < nr; r++) {
+        float4 v0, v1, v2, v3;
+        if (r == me) {
+            load_blk4(src, b, aligned_src, v0, v1, v2, v3);
+            unpack_fp8_blk(pack_fp8_blk(v0, v1, v2, v3), v0, v1, v2, v3);
+        } else {
+            unpack_fp8_blk(load_fp8_blk(mine + slot_off(seq, r, nr), b), v0, v1, v2, v3);
+        }
+        a0 = add4(a0, v0);
+        a1 = add4(a1, v1);
+        a2 = add4(a2, v2);
+        a3 = add4(a3, v3);
+    }
+}
+
 template <Wire W>
 TESSERA_FN void sum_slice(const u64* areas, u64 seq, u32 me, u32 nr, const float* src, float* dst,
                           u32 n, u32 lo4, u32 hi4, bool aligned_src, bool aligned_dst) {
     u64 mine = areas[me];
     if constexpr (W == Wire::Fp8) {
         for (u32 b = (lo4 >> 2) + threadIdx.x; b < (hi4 >> 2); b += blockDim.x) {
-            float4 a0 = make_float4(0, 0, 0, 0), a1 = a0, a2 = a0, a3 = a0;
-            for (u32 r = 0; r < nr; r++) {
-                float4 v0, v1, v2, v3;
-                if (r == me) {
-                    load_blk4(src, b, aligned_src, v0, v1, v2, v3);
-                    unpack_fp8_blk(pack_fp8_blk(v0, v1, v2, v3), v0, v1, v2, v3);
-                } else {
-                    unpack_fp8_blk(load_fp8_blk(mine + slot_off(seq, r, nr), b), v0, v1, v2, v3);
-                }
-                a0 = add4(a0, v0);
-                a1 = add4(a1, v1);
-                a2 = add4(a2, v2);
-                a3 = add4(a3, v3);
-            }
+            float4 a0, a1, a2, a3;
+            sum_fp8_blk(mine, seq, me, nr, src, b, aligned_src, a0, a1, a2, a3);
             store_blk4(dst, b, aligned_dst, a0, a1, a2, a3);
         }
     } else {
@@ -695,6 +704,18 @@ TESSERA_FN bool rs_ag_4(const u64* areas, u32* ci, u64 mine, u64 seq, u32 me, u3
     return true;
 }
 
+template <Wire W>
+TESSERA_FN void chunk_slice(u32 n, u32 blocks, u32& vec4s, u32& lo4, u32& hi4) {
+    vec4s = (W == Wire::Fp8) ? ((n / 16u) * 4u) : (n / 4u);
+    if constexpr (W == Wire::Fp8) {
+        cta_slice<W>(0u, vec4s, blocks, lo4, hi4);
+    } else {
+        u32 per = (vec4s + blocks - 1u) / blocks;
+        lo4 = min(blockIdx.x * per, vec4s);
+        hi4 = min(lo4 + per, vec4s);
+    }
+}
+
 TESSERA_FN bool p2p_begin(u32* fault, u64* seq_ptr, u64 timeout_ticks, u64& base_seq,
                           u64& deadline, prim::Timing*& tm) {
     __shared__ int stop;
@@ -735,18 +756,9 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
         float* dst_buf = reinterpret_cast<float*>(to_ptr) + off;
         bool aligned_src = (reinterpret_cast<u64>(src) & 15ull) == 0;
         bool aligned_dst = (reinterpret_cast<u64>(dst_buf) & 15ull) == 0;
-        u32 vec4s = (W == Wire::Fp8) ? ((n / 16u) * 4u) : (n / 4u);
         u32 blocks = prim::blocks();
-        u32 lo4, hi4;
-        if constexpr (W == Wire::Fp8) {
-            cta_slice<W>(0u, vec4s, blocks, lo4, hi4);
-        } else {
-            u32 per = (vec4s + blocks - 1) / blocks;
-            lo4 = blockIdx.x * per;
-            hi4 = lo4 + per;
-            if (lo4 > vec4s) lo4 = vec4s;
-            if (hi4 > vec4s) hi4 = vec4s;
-        }
+        u32 vec4s, lo4, hi4;
+        chunk_slice<W>(n, blocks, vec4s, lo4, hi4);
         u32* ci = counters + u32(seq & (RING - 1)) * CNT_STRIDE;
 
         if (scatter && (n & (W == Wire::Fp8 ? 15u : 3u)) == 0u &&
@@ -791,46 +803,6 @@ TESSERA_FN void sum_body(const u64* areas, u32* counters, u32* fault, u64* seq_p
     }
 }
 
-template <Wire W>
-TESSERA_FN void rs_body(const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr,
-                        u64 to_ptr, u32 part_len, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
-    __shared__ int stop;
-    if (prim::leader_thread()) stop = 0;
-    u64 base_seq = 0ull, deadline = 0ull;
-    prim::Timing* tm = nullptr;
-    if (!p2p_begin(fault, seq_ptr, timeout_ticks, base_seq, deadline, tm)) return;
-    u64 mine = areas[me];
-    bool pow2 = (nr & (nr - 1)) == 0;
-    u32 blocks = prim::blocks();
-    u64 seq = base_seq;
-    constexpr u32 CHUNK = chunk_floats<W>();
-    for (u32 off = 0; off < part_len; off += CHUNK, seq++) {
-        u32 n = part_len - off;
-        if (n > CHUNK) n = CHUNK;
-        const float* base_src = reinterpret_cast<const float*>(from_ptr) + off;
-        const float* my_src = base_src + u64(me) * part_len;
-        float* dst_buf = reinterpret_cast<float*>(to_ptr) + off;
-        bool al_src = (reinterpret_cast<u64>(my_src) & 15ull) == 0;
-        bool al_dst = (reinterpret_cast<u64>(dst_buf) & 15ull) == 0;
-        u32 vec4s = (W == Wire::Fp8) ? ((n / 16u) * 4u) : (n / 4u);
-        u32 lo4, hi4;
-        if constexpr (W == Wire::Fp8) {
-            cta_slice<W>(0u, vec4s, blocks, lo4, hi4);
-        } else {
-            u32 per = (vec4s + blocks - 1) / blocks;
-            lo4 = min(blockIdx.x * per, vec4s);
-            hi4 = min(lo4 + per, vec4s);
-        }
-        u32* ci = counters + u32(seq & (RING - 1)) * CNT_STRIDE;
-        if (!exchange_all<W>(areas, ci, mine, seq, me, nr, sched, pow2, base_src, n, lo4, hi4,
-                             false, 0ull, deadline, fault, &stop, u64(part_len)))
-            return;
-        if (prim::leader()) prim::timing_mark(tm);
-        sum_slice<W>(areas, seq, me, nr, my_src, dst_buf, n, lo4, hi4, al_src, al_dst);
-        finish_chunk(areas, ci, seq_ptr, seq, me, nr, part_len - off <= CHUNK);
-    }
-}
-
 }  // namespace p2p
 
 #ifdef P2P_MIN_BLOCKS
@@ -851,148 +823,3 @@ P2P_SUM_DEF(tessera_p2p_sum, sum_body, F32)
 P2P_SUM_DEF(tessera_p2p_sum_bf16, sum_body, Bf16)
 P2P_SUM_DEF(tessera_p2p_sum_fp16, sum_body, Fp16)
 P2P_SUM_DEF(tessera_p2p_sum_fp8, sum_body, Fp8)
-P2P_SUM_DEF(tessera_p2p_rs, rs_body, F32)
-P2P_SUM_DEF(tessera_p2p_rs_bf16, rs_body, Bf16)
-P2P_SUM_DEF(tessera_p2p_rs_fp16, rs_body, Fp16)
-P2P_SUM_DEF(tessera_p2p_rs_fp8, rs_body, Fp8)
-
-// Direct P2P all-gather: fan-out (0) or pairwise rounds (1+).
-extern "C" __global__ P2P_BOUNDS void tessera_p2p_gather(const u64* areas, u32* counters, u32* fault,
-                                              u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 part,
-                                              u32 total, u32 rows, u32 nr, u32 me, u32 sched,
-                                              u64 timeout_ticks) {
-    __shared__ int stop;
-    if (prim::leader_thread()) stop = 0;
-    u64 base_seq = 0ull, deadline = 0ull;
-    prim::Timing* tm = nullptr;
-    if (!p2p::p2p_begin(fault, seq_ptr, timeout_ticks, base_seq, deadline, tm)) return;
-
-    u64 mine = areas[me];
-    bool pow2 = (nr & (nr - 1)) == 0;
-    u32 cols = total / rows;
-    u32 local_w = part / rows;
-    u32 step_rows = p2p::MAX_FLOATS / cols;
-    if (step_rows == 0) step_rows = 1;
-    const float* from = reinterpret_cast<const float*>(from_ptr);
-    float* to = reinterpret_cast<float*>(to_ptr);
-    u32 blocks = prim::blocks();
-    u32 first = blockIdx.x * blockDim.x + threadIdx.x;
-    u32 stride = blockDim.x * blocks;
-    u64 seq = base_seq;
-
-    for (u32 r0 = 0; r0 < rows; r0 += step_rows, seq++) {
-        u32 r_cnt = rows - r0;
-        if (r_cnt > step_rows) r_cnt = step_rows;
-        u32 n = r_cnt * local_w;
-        const float* src_chunk = from + u64(r0) * local_w;
-        bool aligned_src = (reinterpret_cast<u64>(src_chunk) & 15ull) == 0;
-        u32 vec4s = n / 4;
-        u32 per = (vec4s + blocks - 1) / blocks;
-        u32 lo4 = blockIdx.x * per;
-        u32 hi4 = lo4 + per;
-        if (lo4 > vec4s) lo4 = vec4s;
-        if (hi4 > vec4s) hi4 = vec4s;
-        u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
-
-        if (!p2p::exchange_all<p2p::Wire::F32>(areas, ci, mine, seq, me, nr, sched, pow2,
-                                               src_chunk, n, lo4, hi4, aligned_src, u64(local_w),
-                                               deadline, fault, &stop))
-            return;
-        if (prim::leader()) prim::timing_mark(tm);
-
-        u32 off = 0;
-        for (u32 r = 0; r < nr; r++) {
-            u32 rk_w = (r == me) ? local_w
-                                 : u32(prim::load_acquire_sys(p2p::size_of(mine, seq, r, nr)));
-            const float* src = (r == me)
-                ? src_chunk
-                : reinterpret_cast<const float*>(mine + p2p::slot_off(seq, r, nr));
-            float* dst_base = to + u64(r0) * cols + off;
-            bool vec4 = (rk_w & 3u) == 0u && (cols & 3u) == 0u &&
-                        (reinterpret_cast<u64>(dst_base) & 15ull) == 0ull &&
-                        (reinterpret_cast<u64>(src) & 15ull) == 0ull;
-            if (vec4) {
-                u32 q_w = rk_w >> 2;
-                u32 q_tot = r_cnt * q_w;
-                for (u32 q = first; q < q_tot; q += stride) {
-                    u32 row = q / q_w;
-                    u32 c4 = (q % q_w) << 2;
-                    const float* sp = src + u64(row) * rk_w + c4;
-                    float4 v = (r == me) ? *reinterpret_cast<const float4*>(sp)
-                                         : prim::load_fresh4(sp);
-                    *reinterpret_cast<float4*>(dst_base + u64(row) * cols + c4) = v;
-                }
-            } else {
-                u32 e_tot = r_cnt * rk_w;
-                for (u32 e = first; e < e_tot; e += stride) {
-                    u32 row = e / rk_w;
-                    u32 c = e % rk_w;
-                    dst_base[u64(row) * cols + c] =
-                        (r == me) ? src[e] : prim::load_fresh(src + e);
-                }
-            }
-            off += rk_w;
-        }
-        p2p::finish_chunk(areas, ci, seq_ptr, seq, me, nr, r0 + step_rows >= rows);
-    }
-}
-
-// Direct P2P contiguous row gather (even chunked or uneven single-round).
-extern "C" __global__ P2P_BOUNDS void tessera_p2p_gather_rows(
-    const u64* areas, u32* counters, u32* fault, u64* seq_ptr, u64 from_ptr, u64 to_ptr, u32 start,
-    u32 part, u32 limit, u32 nr, u32 me, u32 sched, u64 timeout_ticks) {
-    __shared__ int stop;
-    if (prim::leader_thread()) stop = 0;
-    u64 base_seq = 0ull, deadline = 0ull;
-    prim::Timing* tm = nullptr;
-    if (!p2p::p2p_begin(fault, seq_ptr, timeout_ticks, base_seq, deadline, tm)) return;
-    u64 mine = areas[me];
-    bool pow2 = (nr & (nr - 1)) == 0;
-    const float* from = reinterpret_cast<const float*>(from_ptr);
-    float* to = reinterpret_cast<float*>(to_ptr);
-    u32 blocks = prim::blocks();
-    u32 first = blockIdx.x * blockDim.x + threadIdx.x;
-    u32 stride = blockDim.x * blocks;
-    u64 seq = base_seq;
-    for (u32 off = 0; off < limit; off += p2p::MAX_FLOATS, seq++) {
-        u32 n = (limit == 1u) ? part : min(p2p::MAX_FLOATS, part - off);
-        const float* src_chunk = from + off;
-        bool al_src = (reinterpret_cast<u64>(src_chunk) & 15ull) == 0;
-        u32 vec4s = n / 4;
-        u32 per = (vec4s + blocks - 1) / blocks;
-        u32 lo4 = min(blockIdx.x * per, vec4s);
-        u32 hi4 = min(lo4 + per, vec4s);
-        u32* ci = counters + u32(seq & (p2p::RING - 1)) * p2p::CNT_STRIDE;
-        u64 my_meta = u64(n) | (u64(start + off) << 32);
-        if (!p2p::exchange_all<p2p::Wire::F32>(areas, ci, mine, seq, me, nr, sched, pow2,
-                                               src_chunk, n, lo4, hi4, al_src, my_meta, deadline,
-                                               fault, &stop))
-            return;
-        if (prim::leader()) prim::timing_mark(tm);
-        for (u32 r = 0; r < nr; r++) {
-            u64 meta = (r == me) ? my_meta
-                                 : prim::load_acquire_sys(p2p::size_of(mine, seq, r, nr));
-            u32 rn = u32(meta);
-            u32 rdst = u32(meta >> 32);
-            const float* src = (r == me)
-                ? src_chunk
-                : reinterpret_cast<const float*>(mine + p2p::slot_off(seq, r, nr));
-            float* dst = to + rdst;
-            bool vec4 = (rn & 3u) == 0u && (reinterpret_cast<u64>(dst) & 15ull) == 0ull &&
-                        (reinterpret_cast<u64>(src) & 15ull) == 0ull;
-            if (vec4) {
-                for (u32 q = first; q < (rn >> 2); q += stride) {
-                    const float* sp = src + (q << 2);
-                    float4 v = (r == me) ? *reinterpret_cast<const float4*>(sp)
-                                         : prim::load_fresh4(sp);
-                    reinterpret_cast<float4*>(dst)[q] = v;
-                }
-            } else {
-                for (u32 e = first; e < rn; e += stride) {
-                    dst[e] = (r == me) ? src[e] : prim::load_fresh(src + e);
-                }
-            }
-        }
-        p2p::finish_chunk(areas, ci, seq_ptr, seq, me, nr, off + p2p::MAX_FLOATS >= limit);
-    }
-}
