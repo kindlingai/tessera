@@ -529,9 +529,7 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                     sync.after(self.ctx, at, step.lane)?;
                     continue;
                 };
-                if sync.active
-                    && let Some(st) = stamps
-                {
+                if let Some(st) = stamps.filter(|_| sync.active) {
                     st.emit(self.ctx, rel, marks::LANE_BEGIN)?;
                 }
                 let sp = crosses(step.kernel.name())
@@ -562,22 +560,21 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
                 }
                 sync.after(self.ctx, at, step.lane)?;
             }
-            bar(waves.active())?;
             sync.finish(self.ctx)?;
-            if sync.active
-                && let Some(st) = stamps
-            {
+            if let Some(st) = stamps.filter(|_| sync.active) {
                 st.emit(self.ctx, len, marks::END)?;
             }
             Ok(())
         })();
-        if waves.active() {
+        let end = waves.active().then(|| {
+            let b = self.ctx.barrier();
             self.ctx.set_concurrent(false);
-        }
+            b
+        });
         if sync.active {
             self.ctx.set_lane(0);
         }
-        run
+        run.and_then(|()| end.transpose().map(|_| ()).map_err(Capture::from))
     }
 }
 

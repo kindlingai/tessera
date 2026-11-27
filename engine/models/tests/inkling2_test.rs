@@ -483,3 +483,244 @@ fn metal_experts_fast() {
     let names: Vec<&str> = plan.steps.iter().map(|s| s.kernel.name()).collect();
     assert!(!names.iter().any(|n| n.ends_with("picked")), "{names:?}");
 }
+
+/// Metal lowering compacts independent ops into concurrent waves.
+#[test]
+fn metal_waves_compact() {
+    use tessera_lower::hazard::{hazards, overlaps};
+    use tessera_lower::{assign, assign_waves, schedule, schedule_waves, select};
+
+    let c = Config::mini(1, 4096);
+    let g = stepper::<Coded>(&c);
+    let mixed = tessera_lower::form::named("trellis_mix_pmcgx").unwrap();
+    let mut pins = tessera_lower::Pins::default();
+    for set in ["gate", "up", "down"] {
+        pins = pins.pin(&format!("*.{set}"), mixed);
+    }
+    let m4 = Platform::new(Asked {
+        backend: "metal",
+        arch: "apple9".into(),
+        name: "Apple M4 Pro".into(),
+        driver: String::new(),
+        limits: tessera_gpukit::Limits::assumed(),
+        units: 20,
+        bandwidth: 273.0,
+        integrated: true,
+        memory: 64 << 30,
+    });
+    let device = Device::guess(&host()).on(m4).pinned(pins);
+    let count_barriers = |plan: &tessera_lower::Plan| -> (usize, usize) {
+        let mut kept = vec![false; plan.buffers.len()];
+        for (_, slot) in &plan.kept {
+            kept[slot.buffer as usize] = true;
+        }
+        let step_haz = |a: &tessera_lower::Step, b: &tessera_lower::Step| {
+            hazards(a, b)
+                || a.reads
+                    .iter()
+                    .any(|&x| kept[x.buffer as usize] && b.reads.iter().any(|&y| overlaps(x, y)))
+        };
+        let mut ws = 0usize;
+        let mut barriers = 0usize;
+        let mut raw = 0usize;
+        for i in 1..plan.steps.len() {
+            if (ws..i).any(|j| step_haz(&plan.steps[j], &plan.steps[i])) {
+                let is_raw = (ws..i).any(|j| {
+                    let a = &plan.steps[j];
+                    let b = &plan.steps[i];
+                    std::iter::once(a.write)
+                        .chain(a.also.iter().copied())
+                        .any(|w| b.reads.iter().any(|&r| overlaps(w, r)))
+                });
+                raw += usize::from(is_raw);
+                barriers += 1;
+                ws = i;
+            }
+        }
+        (barriers, barriers - raw)
+    };
+    for rows in [1u64, 256] {
+        let picked = select(&g, 0, &[(Seqs, 1), (Rows, rows), (Context, 4096)], &device).unwrap();
+        let base = assign(&picked, &schedule(&picked));
+        let wave = assign_waves(&picked, &schedule_waves(&picked));
+        let (b_base, f_base) = count_barriers(&base);
+        let (b_wave, f_wave) = count_barriers(&wave);
+        eprintln!(
+            "MINI rows={rows}: base barriers={b_base} (non-raw={f_base}) scratch={}KB -> wave barriers={b_wave} (non-raw={f_wave}) scratch={}KB",
+            base.scratch() / 1024,
+            wave.scratch() / 1024,
+        );
+        assert!(
+            b_wave + 500 < b_base,
+            "expected large barrier drop: {b_base} -> {b_wave}"
+        );
+    }
+}
+
+#[test]
+fn wave_error_fences() {
+    use std::sync::{Arc, Mutex};
+    use tessera_gpukit::backend::Backend;
+    use tessera_gpukit::device::{Caches, Device as GpuDevice, cached_context};
+    use tessera_gpukit::launch::{KernelArgs, Launch};
+    use tessera_gpukit::{Error as GpuError, Limits, Platform};
+    use tessera_lower::{
+        Arg, ByBackend, Extent, Kernel, KernelRef, Launch as Call, Needs, Plan, Shape, Slot,
+        Source, Step,
+    };
+    use tessera_run::Error as RunError;
+    use tessera_run::testing::device as open_mock;
+
+    #[derive(Clone)]
+    struct MockDev(Arc<Mutex<(Vec<&'static str>, u64)>>);
+    #[derive(Clone)]
+    struct MockKernel;
+    type Dim3 = (u32, u32, u32);
+    impl Launch for MockDev {
+        type Kernel = MockKernel;
+        fn launch(
+            &self,
+            _: &MockKernel,
+            _: Dim3,
+            _: Dim3,
+            _: u32,
+            _: &mut KernelArgs,
+        ) -> Result<(), GpuError> {
+            self.0.lock().unwrap().0.push("launch");
+            Ok(())
+        }
+    }
+    impl GpuDevice for MockDev {
+        type Kernel = MockKernel;
+        type Graph = ();
+        const BACKEND: Backend = Backend::Metal;
+        fn compile(&self, _: &str, _: &str) -> Result<MockKernel, GpuError> {
+            Ok(MockKernel)
+        }
+        fn alloc(&self, size: usize) -> Result<u64, GpuError> {
+            let mut s = self.0.lock().unwrap();
+            let ptr = s.1.max(0x1000);
+            s.1 = ptr + (size as u64).max(64);
+            Ok(ptr)
+        }
+        fn free(&self, _: u64) {}
+        fn upload(&self, _: u64, _: &[u8]) -> Result<(), GpuError> {
+            Ok(())
+        }
+        fn download(&self, _: u64, bytes: &mut [u8]) -> Result<(), GpuError> {
+            bytes.fill(0);
+            Ok(())
+        }
+        fn zero(&self, _: u64, _: usize) -> Result<(), GpuError> {
+            Ok(())
+        }
+        fn finish(&self) -> Result<Option<f64>, GpuError> {
+            self.0.lock().unwrap().0.push("finish");
+            Ok(None)
+        }
+        fn has_barriers(&self) -> bool {
+            true
+        }
+        fn set_concurrent(&self, on: bool) {
+            self.0.lock().unwrap().0.push(if on {
+                "concurrent:true"
+            } else {
+                "concurrent:false"
+            });
+        }
+        fn barrier(&self) -> Result<(), GpuError> {
+            self.0.lock().unwrap().0.push("barrier");
+            Ok(())
+        }
+        fn platform(&self) -> Platform {
+            Platform::assumed(Limits::assumed())
+        }
+        fn name(&self) -> String {
+            "mock".into()
+        }
+        fn caches() -> &'static Caches<Self> {
+            static C: Caches<MockDev> = Caches::new();
+            &C
+        }
+        fn error(msg: String) -> GpuError {
+            GpuError::Cuda(msg)
+        }
+        fn open() -> Result<Self, GpuError> {
+            Ok(Self(Arc::new(Mutex::new((Vec::new(), 0)))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Stub(&'static str, Option<tessera_graph::DimName>);
+    impl Kernel for Stub {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn source(&self) -> Source {
+            Source::Fixed {
+                text: ByBackend::from_fn(|_| ""),
+                entry: self.0,
+            }
+        }
+        fn launches(&self, step: &Step) -> Vec<Call> {
+            let mut args = vec![step.read(0), step.out()];
+            if let Some(name) = self.1 {
+                args.push(Arg::size(Extent::Dim {
+                    name,
+                    mul: 1,
+                    add: 0,
+                    most: 64,
+                }));
+            }
+            vec![Call {
+                args,
+                shape: Shape::Grid {
+                    across: 1,
+                    down: 1,
+                    threads: 32,
+                },
+            }]
+        }
+        fn needs(&self) -> Needs {
+            Needs::text()
+        }
+    }
+    let mk = |name, dim, r, w| Step {
+        kernel: KernelRef::new(Stub(name, dim)),
+        rule: "stub",
+        site: None,
+        reads: vec![Slot::floats(r, 16)],
+        write: Slot::floats(w, 16),
+        also: Vec::new(),
+        covers: Vec::new(),
+        zone: 0,
+        lane: 0,
+        table: None,
+        index_table: None,
+    };
+
+    let ctx = cached_context::<MockDev>().unwrap();
+    let plan = Plan {
+        buffers: vec![64, 64, 64, 64],
+        steps: vec![mk("a", None, 0, 1), mk("b", Some(Context), 2, 3)],
+        ..Plan::default()
+    };
+    let mut runner = open_mock::<MockDev>(plan, &host()).unwrap();
+    ctx.0.lock().unwrap().0.clear();
+    assert!(matches!(runner.queue(0..2), Err(RunError::Lower(_))));
+    runner.queue(0..1).unwrap();
+    let events = ctx.0.lock().unwrap().0.clone();
+    assert_eq!(
+        events,
+        [
+            "concurrent:true",
+            "launch",
+            "barrier",
+            "concurrent:false",
+            "concurrent:true",
+            "launch",
+            "barrier",
+            "concurrent:false",
+        ]
+    );
+}

@@ -62,6 +62,7 @@ struct Pending {
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     concurrent: bool,
+    dirty: bool,
 }
 
 impl Pending {
@@ -256,6 +257,7 @@ impl Context {
                 })?;
                 p.enc = enc;
                 p.concurrent = want;
+                p.dirty = false;
                 return Ok(p.enc.clone());
             }
             // Another context's work ends before this one's starts.
@@ -277,8 +279,22 @@ impl Context {
             cmd,
             enc,
             concurrent: want,
+            dirty: false,
         });
         Ok(made.enc.clone())
+    }
+
+    fn fence_concurrent(&self) {
+        PENDING.with(|p| {
+            if let Some(pending) = p.borrow_mut().as_mut()
+                && pending.owner == self.id()
+                && pending.concurrent
+                && pending.dirty
+            {
+                pending.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                pending.dirty = false;
+            }
+        });
     }
 }
 
@@ -317,6 +333,13 @@ impl Launch for Context {
             depth: z as usize,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(size(grid), size(block));
+        PENDING.with(|p| {
+            if let Some(pending) = p.borrow_mut().as_mut()
+                && pending.owner == self.id()
+            {
+                pending.dirty = true;
+            }
+        });
         Ok(())
     }
 }
@@ -455,18 +478,14 @@ impl Device for Context {
     }
 
     fn set_concurrent(&self, on: bool) {
+        if !on {
+            self.fence_concurrent();
+        }
         CONCURRENT.with(|c| c.set(on));
     }
 
     fn barrier(&self) -> Result<(), Error> {
-        PENDING.with(|p| {
-            if let Some(pending) = &*p.borrow()
-                && pending.owner == self.id()
-                && pending.concurrent
-            {
-                pending.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-            }
-        });
+        self.fence_concurrent();
         Ok(())
     }
 }

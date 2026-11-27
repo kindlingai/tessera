@@ -1,6 +1,6 @@
 //! Packs values into contiguous arenas, for one op order.
 
-use crate::hazard::COMM_LANE;
+use crate::hazard::{COMM_LANE, overlaps};
 use crate::kernel::KernelRef;
 use crate::kernels::{Map, crosses};
 use crate::plan::{KeptInfo, Loaded, Output, Plan, Share, Slot, Step, pack_shape};
@@ -104,10 +104,27 @@ struct Buffers<'a> {
     deferred: Vec<Vec<Val>>,
     /// One scratch arena per zone, made on first use.
     scratch: BTreeMap<u32, Scratch>,
+    /// Defer scratch frees across concurrent wave steps.
+    waves: bool,
+    /// Buffer indices holding kept state.
+    kept_bufs: Vec<bool>,
+    /// First step index in the active concurrent wave.
+    wave_start: usize,
+    /// Scratch slots freed by steps in the active wave.
+    wave_freed: Vec<Slot>,
 }
 
 /// Buffers and steps for `s`, its ops in `order`.
 pub fn assign(s: &Selected, order: &[usize]) -> Plan {
+    assign_with(s, order, false)
+}
+
+/// Buffers and steps, deferring scratch reuse across wave steps.
+pub fn assign_waves(s: &Selected, order: &[usize]) -> Plan {
+    assign_with(s, order, true)
+}
+
+fn assign_with(s: &Selected, order: &[usize], waves: bool) -> Plan {
     let mut last = vec![0; s.values.len()];
     for (at, &i) in order.iter().enumerate() {
         for v in &s.ops[i].reads {
@@ -186,9 +203,19 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
         lanes,
         deferred,
         scratch: BTreeMap::new(),
+        waves,
+        kept_bufs: Vec::new(),
+        wave_start: 0,
+        wave_freed: Vec::new(),
     };
     b.pack_weights();
     b.pack_kept();
+    if waves {
+        b.kept_bufs.resize(b.plan.buffers.len(), false);
+        for (_, slot) in &b.plan.kept {
+            b.kept_bufs[slot.buffer as usize] = true;
+        }
+    }
     for v in &s.inputs {
         let slot = b.alloc_scratch(*v);
         b.plan.inputs.push(slot);
@@ -196,6 +223,7 @@ pub fn assign(s: &Selected, order: &[usize]) -> Plan {
     for (at, &i) in order.iter().enumerate() {
         b.step(at, i);
     }
+    b.flush_wave();
     b.commits();
     for (v, shape) in &s.outputs {
         let (slot, shape) = (b.slot(*v), shape.clone());
@@ -421,6 +449,77 @@ impl Buffers<'_> {
         arena.free(slot.offset, slot.bytes());
     }
 
+    fn release_scratch(&mut self, slot: Slot) {
+        if self.waves {
+            self.wave_freed.push(slot);
+        } else {
+            self.free_scratch(slot);
+        }
+    }
+
+    fn flush_wave(&mut self) {
+        for slot in std::mem::take(&mut self.wave_freed) {
+            self.free_scratch(slot);
+        }
+        self.wave_start = self.plan.steps.len();
+    }
+
+    fn is_kept_slot(&self, slot: Slot) -> bool {
+        self.kept_bufs
+            .get(slot.buffer as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// True when `op` cannot share the active wave.
+    fn breaks_wave(&self, at: usize, i: usize, reads: &[Slot], dying: &[bool]) -> bool {
+        if !self.waves || self.plan.steps.len() <= self.wave_start {
+            return false;
+        }
+        let op = &self.s.ops[i];
+        if self.lanes[at] != 0 || crosses(op.kernel.name()) {
+            return true;
+        }
+        let active = &self.plan.steps[self.wave_start..];
+        let raw = reads.iter().any(|&r| {
+            active
+                .iter()
+                .any(|s| overlaps(s.write, r) || s.also.iter().any(|&w| overlaps(w, r)))
+        });
+        if raw {
+            return true;
+        }
+        let kept_read = reads.iter().any(|&r| {
+            self.is_kept_slot(r)
+                && active
+                    .iter()
+                    .any(|s| s.reads.iter().any(|&prev| overlaps(prev, r)))
+        });
+        if kept_read {
+            return true;
+        }
+        // Overwriting a slot read in this wave creates WAR.
+        if op.kernel.overwrites()
+            && dying[0]
+            && active
+                .iter()
+                .any(|s| s.reads.iter().any(|&prev| overlaps(prev, reads[0])))
+        {
+            return true;
+        }
+        // Pre-assigned kept writes must serialize against overlapping wave steps.
+        let held_writes = std::iter::once(op.write)
+            .chain(op.also.iter().copied())
+            .filter_map(|v| self.slots[v.0 as usize]);
+        held_writes.into_iter().any(|w| {
+            active.iter().any(|s| {
+                overlaps(s.write, w)
+                    || s.also.iter().any(|&prev| overlaps(prev, w))
+                    || s.reads.iter().any(|&prev| overlaps(prev, w))
+            })
+        })
+    }
+
     fn step(&mut self, at: usize, i: usize) {
         let op = &self.s.ops[i];
         let mut reads: Vec<Slot> = op.reads.iter().map(|v| self.slot(*v)).collect();
@@ -429,6 +528,9 @@ impl Buffers<'_> {
             .iter()
             .map(|v| self.last[v.0 as usize] == at)
             .collect();
+        if self.breaks_wave(at, i, &reads, &dying) {
+            self.flush_wave();
+        }
         let mut kept = None;
         let write = if op.kernel.overwrites() {
             let first = op.reads[0];
@@ -452,6 +554,9 @@ impl Buffers<'_> {
                     table: self.plan.table,
                     index_table: self.plan.index_table,
                 });
+                if self.waves {
+                    self.flush_wave();
+                }
                 reads[0] = copy;
             }
             reads[0]
@@ -484,24 +589,24 @@ impl Buffers<'_> {
         for (k, v) in op.reads.iter().enumerate() {
             let repeat = op.reads[..k].contains(v);
             if dying[k] && Some(*v) != kept && !repeat {
-                self.free_scratch(self.slot(*v));
+                self.release_scratch(self.slot(*v));
             }
         }
         // Unread temporary outputs free immediately after this step.
         if self.last[op.write.0 as usize] <= at
             && self.s.values[op.write.0 as usize].home == Home::Temp
         {
-            self.free_scratch(write);
+            self.release_scratch(write);
         }
         for &v in &op.also {
             if self.last[v.0 as usize] <= at && self.s.values[v.0 as usize].home == Home::Temp {
-                self.free_scratch(self.slot(v));
+                self.release_scratch(self.slot(v));
             }
         }
         let deferred = std::mem::take(&mut self.deferred[at]);
         for v in deferred {
             if let Some(slot) = self.slots[v.0 as usize] {
-                self.free_scratch(slot);
+                self.release_scratch(slot);
             }
         }
     }
