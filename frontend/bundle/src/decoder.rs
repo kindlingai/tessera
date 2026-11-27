@@ -4,7 +4,6 @@ use crate::arch::{Arch, Ask, Built, Spot, arch, find, known, unknown};
 use crate::parts::{Cut, Part};
 use crate::{Overrides, config, held, pull};
 use std::error::Error;
-use tessera_checkpoint::Shards;
 use tessera_engine::decoder::{Config, Moe, Swiglu, stepper, taps};
 use tessera_engine::{Graph, Norm};
 
@@ -40,7 +39,8 @@ fn part(arch: &Arch, cut: &Cut) -> Result<Part> {
     let (_, c) = config(&cut.dir, cut.sized(256), &Overrides::default())?;
     let (dir, layers) = (cut.dir.clone(), c.stack.layers);
     Ok(Part::new((family(arch.name)?.step)(&c), move |g| {
-        pull(g, &Shards::open(&dir)?, layers, &[])
+        let offer = crate::offer(&dir, None)?;
+        pull(g, &*offer, layers, &[])
     }))
 }
 

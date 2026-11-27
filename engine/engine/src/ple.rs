@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use tessera_graph::Bf16;
+use tessera_graph::{Bf16, E4M3};
 use tessera_mem::Tensor;
 
 /// Number of n-gram heads (8 bigram + 8 trigram).
@@ -15,6 +15,10 @@ pub const HEADS: usize = 16;
 #[derive(Clone, Debug)]
 pub struct PleConfig {
     pub path: PathBuf,
+    /// Byte offset where table rows begin in `path`.
+    pub data_offset: u64,
+    /// Scale for FP8 E4M3 rows, or `None` for BF16.
+    pub fp8_scale: Option<f32>,
     pub eos_token: i32,
     pub multipliers: [i64; 3],
     pub offsets: [i64; HEADS],
@@ -32,7 +36,7 @@ impl PleConfig {
     }
 }
 
-/// Direct-mapped host cache and pread reader for BF16 PLE rows.
+/// Direct-mapped host cache and pread reader for PLE rows.
 pub struct PleStore {
     file: File,
     cfg: PleConfig,
@@ -50,7 +54,11 @@ impl PleStore {
     pub fn open(cfg: PleConfig) -> io::Result<Self> {
         let file = File::open(&cfg.path)?;
         let cap = cfg.cache_rows.max(1).next_power_of_two();
-        let row_bytes = cfg.row_dim * 2;
+        let row_bytes = if cfg.fp8_scale.is_some() {
+            cfg.row_dim
+        } else {
+            cfg.row_dim * 2
+        };
         Ok(Self {
             file,
             row_bytes,
@@ -85,21 +93,33 @@ impl PleStore {
         })
     }
 
-    fn fetch_bf16(&mut self, row_id: u64, dst: &mut [f32]) -> io::Result<()> {
+    fn fetch_row(&mut self, row_id: u64, dst: &mut [f32]) -> io::Result<()> {
         let dim = self.cfg.row_dim;
         let idx = (row_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & self.mask;
         let off = idx * dim;
         if self.tags[idx] != row_id {
-            self.file
-                .read_exact_at(&mut self.scratch, row_id * self.row_bytes as u64)?;
-            let (pairs, _) = self.scratch.as_chunks::<2>();
-            for (d, b) in self.data[off..off + dim].iter_mut().zip(pairs) {
-                *d = u16::from_le_bytes(*b);
+            let at = self.cfg.data_offset + row_id * self.row_bytes as u64;
+            self.file.read_exact_at(&mut self.scratch, at)?;
+            if self.cfg.fp8_scale.is_some() {
+                for (d, &b) in self.data[off..off + dim].iter_mut().zip(&self.scratch) {
+                    *d = u16::from(b);
+                }
+            } else {
+                let (pairs, _) = self.scratch.as_chunks::<2>();
+                for (d, b) in self.data[off..off + dim].iter_mut().zip(pairs) {
+                    *d = u16::from_le_bytes(*b);
+                }
             }
             self.tags[idx] = row_id;
         }
-        for (o, &bits) in dst.iter_mut().zip(&self.data[off..off + dim]) {
-            *o = f32::from(Bf16(bits));
+        if let Some(scale) = self.cfg.fp8_scale {
+            for (o, &bits) in dst.iter_mut().zip(&self.data[off..off + dim]) {
+                *o = f32::from(E4M3(bits as u8)) * scale;
+            }
+        } else {
+            for (o, &bits) in dst.iter_mut().zip(&self.data[off..off + dim]) {
+                *o = f32::from(Bf16(bits));
+            }
         }
         Ok(())
     }
@@ -155,7 +175,7 @@ impl PleStore {
             self.tokens[s][pos] = tok;
             let ids = self.hash_token(tok, ctx);
             for (h, &id) in ids.iter().enumerate() {
-                self.fetch_bf16(id, &mut row_buf[h * dim..(h + 1) * dim])?;
+                self.fetch_row(id, &mut row_buf[h * dim..(h + 1) * dim])?;
             }
             self.last_row[s].copy_from_slice(&row_buf);
             self.prev_pos[s] = row.position;

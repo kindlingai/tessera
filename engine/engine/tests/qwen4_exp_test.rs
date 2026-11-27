@@ -76,6 +76,8 @@ fn make_ple_table() -> (std::path::PathBuf, PleConfig) {
     f.write_all(&bytes).unwrap();
     let cfg = PleConfig {
         path: path.clone(),
+        data_offset: 0,
+        fp8_scale: None,
         eos_token: 15,
         multipliers: [100003, 200003, 300007],
         offsets: std::array::from_fn(|h| (h as i64) * 8),
@@ -228,10 +230,35 @@ fn ple_slot_reuse() {
         .unwrap()
         .fill(&fresh, 2)
         .unwrap();
-    let mut reused = PleStore::open(cfg).unwrap();
+    let mut reused = PleStore::open(cfg.clone()).unwrap();
     reused.fill(&[row(3, 0)], 1).unwrap();
     let got = reused.fill(&fresh, 2).unwrap();
     assert_eq!(got.floats().unwrap(), want.floats().unwrap());
+
+    // FP8 PLE table at a non-zero file offset.
+    let fp8_path = cfg.path.with_extension("fp8");
+    let scale = 0.5f32;
+    let offset = 16u64;
+    let mut raw = vec![0xAAu8; offset as usize];
+    let mut want_rows = Vec::new();
+    for r in 0..128usize {
+        let code = tessera_engine::E4M3::from(((r as f32) * 0.1).sin() * 2.0);
+        raw.push(code.0);
+        want_rows.push(f32::from(code) * scale);
+    }
+    std::fs::write(&fp8_path, &raw).unwrap();
+    let fp8_cfg = PleConfig {
+        path: fp8_path.clone(),
+        data_offset: offset,
+        fp8_scale: Some(scale),
+        ..cfg
+    };
+    let mut fp8_store = PleStore::open(fp8_cfg).unwrap();
+    let ids = fp8_store.hash_token(5, [15, 15]);
+    let fp8_out = fp8_store.fill(&[row(5, 0)], 1).unwrap();
+    let expected: Vec<f32> = ids.iter().map(|&id| want_rows[id as usize]).collect();
+    assert_eq!(fp8_out.floats().unwrap(), expected);
+    let _ = std::fs::remove_file(fp8_path);
 }
 
 #[test]

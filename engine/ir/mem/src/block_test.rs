@@ -1,4 +1,4 @@
-use crate::block::{INT2_G32, INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0};
+use crate::block::{INT2_G32, INT4_G32, INT4_G128, MXFP4, MXFP8, NVFP4, Q4_0, Q8_0, join_nvfp4};
 use crate::form::Form;
 
 /// Each form keeps `data` within a share of its largest.
@@ -83,5 +83,19 @@ fn shares_round_trip() {
         same_part(form, &bytes, [4, 2, 32], [1, 1]);
         // Half a block is no part.
         assert!(form.share(&bytes, [16, 2, 8], [1, 1]).is_none());
+    }
+    let a: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.05).collect();
+    let b: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.12).collect();
+    let (pa, pb) = (NVFP4.pack(&a), NVFP4.pack(&b));
+    let same = join_nvfp4(&[pa.clone(), pa.clone()]);
+    assert_eq!(&same[4..pa.len()], &pa[4..]);
+    let mixed = join_nvfp4(&[pa.clone(), pb.clone()]);
+    let want: Vec<f32> = NVFP4
+        .unpack_all(&pa)
+        .into_iter()
+        .chain(NVFP4.unpack_all(&pb))
+        .collect();
+    for (got, exp) in NVFP4.unpack_all(&mixed).into_iter().zip(want) {
+        assert!((got - exp).abs() <= 0.15, "{got} vs {exp}");
     }
 }

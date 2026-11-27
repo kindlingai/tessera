@@ -5,7 +5,6 @@ use crate::tokenize::hf::Hf;
 use crate::{Overrides, Template, config, pull};
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::Shards;
 use tessera_engine::{Graph, Pins, Weight};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -42,7 +41,8 @@ pub fn tapped(
     }
     config.stack.layers = deepest;
     let graph = (family(&arch)?.taps)(&config, layers);
-    let (weights, pins) = pull(&graph, &Shards::open(dir)?, deepest, &[])?;
+    let offer = crate::offer(dir, None)?;
+    let (weights, pins) = pull(&graph, &*offer, deepest, &[])?;
     let tokenizer = Hf::open(&words.join("tokenizer.json"))?;
     let template = Template::load(words)?.ok_or("no chat template")?;
     Ok(Tapped {

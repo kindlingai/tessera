@@ -148,6 +148,16 @@ pub(crate) fn attn_rules(
 
 /// Adds routed and shared expert rules for one MoE layer.
 pub(crate) fn moe_rules(layer: u64, moe_prefix: &str, rotated: bool, rules: &mut Vec<Rule>) {
+    moe_rules_for(layer, moe_prefix, rotated, false, rules);
+}
+
+fn moe_rules_for(
+    layer: u64,
+    moe_prefix: &str,
+    rotated: bool,
+    stacked: bool,
+    rules: &mut Vec<Rule>,
+) {
     let at = format!("model.layers.{layer}");
     rules.push((format!("{moe_prefix}.router"), format!("{at}.mlp.gate")));
     rules.push((
@@ -164,7 +174,11 @@ pub(crate) fn moe_rules(layer: u64, moe_prefix: &str, rotated: bool, rules: &mut
         let shared = format!("{at}.mlp.shared_experts.{stem}");
         rules.push((format!("{moe_prefix}.shared.{field}"), shared));
         if !rotated {
-            let experts = format!("{at}.mlp.experts.{{}}.{stem}");
+            let experts = if stacked {
+                format!("{at}.mlp.experts.{stem}")
+            } else {
+                format!("{at}.mlp.experts.{{}}.{stem}")
+            };
             rules.push((format!("{moe_prefix}.{field}"), experts));
             continue;
         }
@@ -181,6 +195,10 @@ pub(crate) fn moe_rules(layer: u64, moe_prefix: &str, rotated: bool, rules: &mut
 
 /// Each weight's HF slice. `rotated` names GLM's exlr8 experts.
 pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
+    rules_for(c, rotated, false)
+}
+
+fn rules_for(c: &Config, rotated: bool, stacked: bool) -> Vec<Rule> {
     let mut rules: Vec<Rule> = Vec::new();
     rules.push(("embed".into(), "model.embed_tokens".into()));
     rules.push(("norm".into(), "model.norm".into()));
@@ -207,7 +225,7 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
             }
             continue;
         };
-        moe_rules(l, &format!("moe.{m}"), rotated, &mut rules);
+        moe_rules_for(l, &format!("moe.{m}"), rotated, stacked, &mut rules);
     }
     rules
 }
@@ -248,6 +266,13 @@ pub(crate) fn has_rotated_experts(slices: &[Slice]) -> bool {
         .any(|s| s.name.ends_with(".mlp.experts.signs_in"))
 }
 
+/// Whether offered slices hold 3D stacked routed expert matrices.
+pub(crate) fn has_stacked_experts(slices: &[Slice]) -> bool {
+    slices
+        .iter()
+        .any(|s| s.name.ends_with(".mlp.experts.gate_proj.weight") && s.shape.len() == 3)
+}
+
 /// A `step` sets the graph's rules, mask and taps.
 fn open(
     dir: &Path,
@@ -272,8 +297,10 @@ fn open(
         }
         _ => crate::offer(dir, manifest)?,
     };
-    let rotated = has_rotated_experts(&offer.slices());
-    let mut rules = rules(&config, rotated);
+    let slices = offer.slices();
+    let rotated = has_rotated_experts(&slices);
+    let stacked = !rotated && has_stacked_experts(&slices);
+    let mut rules = rules_for(&config, rotated, stacked);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
         config.stack.taps = taps.to_vec();

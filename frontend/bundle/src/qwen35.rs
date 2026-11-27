@@ -6,7 +6,7 @@ use crate::parts::{Cut, Part};
 use crate::{Overrides, Stream, Weights, numbered, pins, pull};
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::Shards;
+use tessera_checkpoint::Offer;
 use tessera_engine::qwen35::{Config, program};
 use tessera_engine::{Graph, Pins, Weight};
 
@@ -48,7 +48,7 @@ arch!(
 pub struct Text {
     pub graph: Graph,
     pub pins: Pins,
-    shards: Shards,
+    offer: Box<dyn Offer>,
     rules: Vec<Rule>,
 }
 
@@ -65,7 +65,7 @@ impl Stream for Text {
         shares: &dyn Fn(u32) -> Option<(u32, usize, usize)>,
         take: &mut dyn FnMut(u32, Weight) -> Result<()>,
     ) -> Result<()> {
-        numbered(&self.graph, &self.shards, &[&self.rules], shares, take)
+        numbered(&self.graph, &*self.offer, &[&self.rules], shares, take)
     }
 }
 
@@ -73,12 +73,12 @@ impl Stream for Text {
 pub fn open(dir: &Path, sizes: [u64; 2], overrides: &Overrides) -> Result<Text> {
     let c = config(dir, sizes, overrides)?;
     let graph = program(&c);
-    let (shards, rules) = (Shards::open(dir)?, rules());
-    let pins = pins(&graph, &shards, c.stack.layers, &[&rules])?;
+    let (offer, rules) = (crate::offer(dir, None)?, rules());
+    let pins = pins(&graph, &*offer, c.stack.layers, &[&rules])?;
     Ok(Text {
         graph,
         pins,
-        shards,
+        offer,
         rules,
     })
 }
@@ -90,5 +90,6 @@ pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> R
 
 /// Every weight `graph` reads from `dir`, held, and their forms.
 pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<(Vec<Weight>, Pins)> {
-    pull(graph, &Shards::open(dir)?, layers, &[&rules()])
+    let offer = crate::offer(dir, None)?;
+    pull(graph, &*offer, layers, &[&rules()])
 }

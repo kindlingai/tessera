@@ -12,7 +12,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use tessera_codegen::ir::Body;
+use tessera_codegen::ir::{Body, Param};
 use tessera_codegen::{Dialect, hash};
 
 pub use runtime::{Arg, Buf, Ctx, Entry, failure};
@@ -155,7 +155,14 @@ fn module() -> Result<JITModule, String> {
 /// `body` as host code. Compiled once per distinct text.
 pub fn compile(body: &Body) -> Result<Entry, String> {
     static CACHE: OnceLock<Mutex<HashMap<u64, Result<Entry, String>>>> = OnceLock::new();
-    let key = hash(&body.text().render(Dialect::Cuda));
+    let mut rendered = body.text().render(Dialect::Cuda);
+    for p in &body.params {
+        if let Param::Buffer { form, .. } = p {
+            rendered.push(':');
+            rendered.push_str(form.name());
+        }
+    }
+    let key = hash(&rendered);
     let cache = CACHE.get_or_init(Mutex::default);
     if let Some(found) = cache.lock().expect("compile cache").get(&key) {
         return found.clone();

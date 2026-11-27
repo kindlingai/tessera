@@ -162,6 +162,24 @@ impl File {
         self.entries.get(name).map(|e| e.shape.as_slice())
     }
 
+    pub fn dtype(&self, name: &str) -> Option<&str> {
+        self.entries.get(name).map(|e| e.dtype.as_str())
+    }
+
+    /// Disk path, file byte offset and byte length of `name`.
+    pub fn location(&self, name: &str) -> Option<(&Path, u64, u64)> {
+        let e = self.entries.get(name)?;
+        let Backing::Disk(disk) = &self.backing else {
+            return None;
+        };
+        let [start, end] = e.data_offsets;
+        Some((disk.path(), self.data + start, end - start))
+    }
+
+    pub(crate) fn entry_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     pub fn is_bf16(&self, name: &str) -> bool {
         self.entries
             .get(name)
@@ -314,8 +332,30 @@ impl Shards {
         ))
     }
 
+    /// Wraps opened safetensors files as one shard set.
+    pub fn from_files(files: Vec<File>) -> Self {
+        Self(files)
+    }
+
+    pub fn files(&self) -> &[File] {
+        &self.0
+    }
+
+    pub fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.holding(name).ok()?.shape(name)
+    }
+
+    pub fn dtype(&self, name: &str) -> Option<&str> {
+        self.holding(name).ok()?.dtype(name)
+    }
+
+    /// Disk path, file byte offset and byte length of `name`.
+    pub fn location(&self, name: &str) -> Option<(&Path, u64, u64)> {
+        self.holding(name).ok()?.location(name)
+    }
+
     /// The file holding `name`.
-    fn holding(&self, name: &str) -> Result<&File, Error> {
+    pub(crate) fn holding(&self, name: &str) -> Result<&File, Error> {
         let found = self.0.iter().find(|f| f.shape(name).is_some());
         found.ok_or_else(|| Error::Missing(name.into()))
     }

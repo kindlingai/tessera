@@ -16,6 +16,9 @@ mod gguf;
 #[cfg(test)]
 mod gguf_test;
 mod gguf_write;
+mod modelopt;
+#[cfg(test)]
+mod modelopt_test;
 mod offer;
 #[cfg(test)]
 mod offer_test;
@@ -37,7 +40,14 @@ use std::path::Path;
 pub fn open(path: &Path, manifest: Option<&str>) -> Result<Box<dyn Offer>, Error> {
     if path.is_file() {
         return match path.extension().and_then(|e| e.to_str()) {
-            Some("safetensors") => Ok(Box::new(File::open(path)?)),
+            Some("safetensors") => {
+                let shards = Shards::from_files(vec![File::open(path)?]);
+                if modelopt::has_quantized(&shards) {
+                    Ok(Box::new(modelopt::ModelOpt::new(shards)))
+                } else {
+                    Ok(Box::new(shards))
+                }
+            }
             Some("pt" | "pth" | "bin") => Ok(Box::new(Torch::open(path)?)),
             _ => Ok(Box::new(Gguf::open(path)?)),
         };
@@ -45,5 +55,9 @@ pub fn open(path: &Path, manifest: Option<&str>) -> Result<Box<dyn Offer>, Error
     if exlr8::is_release(path) {
         return Ok(Box::new(exlr8::open_manifest(path, manifest)?));
     }
-    Ok(Box::new(Shards::open(path)?))
+    let shards = Shards::open(path)?;
+    if modelopt::has_quantized(&shards) {
+        return Ok(Box::new(modelopt::ModelOpt::new(shards)));
+    }
+    Ok(Box::new(shards))
 }

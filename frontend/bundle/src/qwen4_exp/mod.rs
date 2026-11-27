@@ -6,7 +6,7 @@ use crate::{Stream, Weights, numbered, pins};
 use serde::Deserialize;
 use std::error::Error;
 use std::path::Path;
-use tessera_checkpoint::Offer;
+use tessera_checkpoint::{Offer, Shards};
 use tessera_engine::qwen4_exp::{Config, Moe, RotatedMoe, program, stepper};
 use tessera_engine::qwen35::Mixing;
 use tessera_engine::{Graph, Pins, PleConfig, Steps, Weight};
@@ -37,6 +37,10 @@ arch!(
 
 /// Maps every `qwen4_exp` weight path to its HF tensor stem.
 pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
+    rules_for(c, rotated, false)
+}
+
+fn rules_for(c: &Config, rotated: bool, stacked: bool) -> Vec<Rule> {
     let mut rules = Vec::new();
     rules.push(("embed".into(), format!("{LM}.embed_tokens")));
     rules.push(("head".into(), "lm_head".into()));
@@ -133,6 +137,8 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
                     rules.push((format!("{mp}.{f}_{end}"), format!("{set}.{end}")));
                 }
                 rules.push((format!("{mp}.{f}"), set));
+            } else if stacked {
+                rules.push((format!("{mp}.{f}"), format!("{at}.mlp.experts.{s}")));
             } else {
                 rules.push((format!("{mp}.{f}"), format!("{at}.mlp.experts.{{}}.{s}")));
             }
@@ -181,8 +187,10 @@ fn open(
 ) -> Result<Release> {
     let mut config = parse_config(json, sizes)?;
     let offer = crate::offer(dir, manifest)?;
-    let rotated = crate::mla::has_rotated_experts(&offer.slices());
-    let mut rules = rules(&config, rotated);
+    let slices = offer.slices();
+    let rotated = crate::mla::has_rotated_experts(&slices);
+    let stacked = !rotated && crate::mla::has_stacked_experts(&slices);
+    let mut rules = rules_for(&config, rotated, stacked);
     if let Some((user, steps, taps)) = step {
         config.stack.steps = steps;
         config.stack.taps = taps.to_vec();
@@ -209,35 +217,72 @@ struct PleMeta {
     dim: usize,
 }
 
+/// Locates the on-disk PLE table from exlr8 or safetensors shards.
+fn ple_table(
+    dir: &Path,
+    ple: tessera_engine::qwen4_exp::Ple,
+    base: &str,
+) -> Result<(std::path::PathBuf, u64, Option<f32>, usize)> {
+    let stem = dir.join(format!("ple/exlr8-ple-L{:03}", ple.layer));
+    let bin = stem.with_extension("bin");
+    if bin.is_file() {
+        let meta = stem.with_extension("json");
+        let row_dim = match std::fs::read_to_string(&meta) {
+            Ok(text) => {
+                serde_json::from_str::<PleMeta>(&text)
+                    .map_err(|e| format!("{}: {e}", meta.display()))?
+                    .dim
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                ple.dim as usize / tessera_engine::ple_heads()
+            }
+            Err(e) => return Err(format!("{}: {e}", meta.display()).into()),
+        };
+        return Ok((bin, 0, None, row_dim));
+    }
+    let shards = Shards::open(dir)?;
+    let table = format!("{base}.ngram_embedding.weight");
+    let (path, offset, _) = shards
+        .location(&table)
+        .ok_or_else(|| format!("missing PLE table {} and {table}", bin.display()))?;
+    let shape = shards
+        .shape(&table)
+        .ok_or_else(|| format!("missing {table}"))?;
+    let row_dim = *shape.get(1).ok_or_else(|| format!("{table} is not 2D"))?;
+    let dtype = shards.dtype(&table).unwrap_or("");
+    let fp8_scale = match dtype {
+        "BF16" => None,
+        "F8_E4M3" => {
+            let scale_name = format!("{base}.ngram_embedding.weight_scale");
+            let inv_name = format!("{base}.ngram_embedding.weight_scale_inv");
+            let vals = shards
+                .floats(&scale_name)
+                .or_else(|_| shards.floats(&inv_name))?;
+            let &s = vals
+                .first()
+                .ok_or_else(|| format!("empty scale for {table}"))?;
+            Some(s)
+        }
+        other => return Err(format!("unsupported PLE dtype {other} for {table}").into()),
+    };
+    Ok((path.to_path_buf(), offset, fp8_scale, row_dim))
+}
+
 /// The config's host PLE table and hash parameters, if any.
 fn ple(ask: &Ask) -> Result<Option<PleConfig>> {
     let cfg = parse_config(ask.json, ask.sizes)?;
     let Some(ple) = cfg.ple else {
         return Ok(None);
     };
-    let stem = ask.dir.join(format!("ple/exlr8-ple-L{:03}", ple.layer));
-    let bin = stem.with_extension("bin");
-    if !bin.is_file() {
-        return Err(format!("missing PLE table {}", bin.display()).into());
-    }
-    let meta = stem.with_extension("json");
-    let row_dim = match std::fs::read_to_string(&meta) {
-        Ok(text) => {
-            serde_json::from_str::<PleMeta>(&text)
-                .map_err(|e| format!("{}: {e}", meta.display()))?
-                .dim
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            ple.dim as usize / tessera_engine::ple_heads()
-        }
-        Err(e) => return Err(format!("{}: {e}", meta.display()).into()),
-    };
-    let offer = crate::offer(ask.dir, ask.manifest)?;
     let base = format!("{LM}.layers.{}.ple.ple_embedding", ple.layer);
+    let (path, data_offset, fp8_scale, row_dim) = ple_table(ask.dir, ple, &base)?;
+    let offer = crate::offer(ask.dir, ask.manifest)?;
     let read = |field: &str| offer.i64s(&format!("{base}.{field}"));
     let fixed = |field: &str, v: Vec<i64>| format!("{field} has {} values", v.len());
     Ok(Some(PleConfig {
-        path: bin,
+        path,
+        data_offset,
+        fp8_scale,
         eos_token: cfg.eos_token,
         multipliers: (read("layer_multipliers")?.try_into())
             .map_err(|v| fixed("layer_multipliers", v))?,

@@ -285,6 +285,44 @@ block! {
     NVFP4 = "nvfp4", E4M3, E2M1, 16, halves = false, head = true
 }
 
+/// Joins packed `NVFP4` tensors under one shared `f32` head.
+pub fn join_nvfp4(parts: &[Vec<u8>]) -> Vec<u8> {
+    let Some(first) = parts.first() else {
+        return Vec::new();
+    };
+    let head = |p: &[u8]| f32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let body_bytes: usize = parts.iter().map(|p| p.len().saturating_sub(4)).sum();
+    let mut out = Vec::with_capacity(4 + body_bytes);
+    let first_head = head(first);
+    let same = parts
+        .iter()
+        .all(|p| head(p).to_bits() == first_head.to_bits());
+    if same {
+        out.extend_from_slice(&first[..4]);
+        for p in parts {
+            out.extend_from_slice(&p[4..]);
+        }
+        return out;
+    }
+    let top = parts.iter().map(|p| head(p).abs()).fold(0.0f32, f32::max);
+    let shared = if top > 0.0 { top } else { 1.0 };
+    out.extend_from_slice(&shared.to_le_bytes());
+    for p in parts {
+        let h = head(p);
+        if h.to_bits() == shared.to_bits() {
+            out.extend_from_slice(&p[4..]);
+            continue;
+        }
+        let ratio = h / shared;
+        for blk in p[4..].as_chunks::<9>().0 {
+            let scaled = f32::from(E4M3(blk[0])) * ratio;
+            out.push(E4M3::from(scaled).0);
+            out.extend_from_slice(&blk[1..]);
+        }
+    }
+    out
+}
+
 block! {
     /// OCP mxfp8: an e8m0 scale, then 32 e4m3 codes.
     MXFP8 = "mxfp8", E8M0, E4M3, 32, halves = false, head = false

@@ -256,8 +256,8 @@ pub(crate) fn form(
 ) -> Result<&'static dyn Load, Box<dyn Error + Send + Sync>> {
     match stored {
         Stored::Form(f) if f.name() == "f32" => Ok(F32_FORM),
-        // Only a form without a header joins byte for byte.
-        Stored::Form(f) if set && f.bytes(0) != 0 => {
+        // Headerless forms and nvfp4 join a set.
+        Stored::Form(f) if set && f.bytes(0) != 0 && f.name() != "nvfp4" => {
             Err(format!("a set of {} matrices, each with a header", f.name()).into())
         }
         Stored::Form(f) => {
@@ -324,6 +324,14 @@ fn stacked(
     shape: Option<Vec<usize>>,
 ) -> Result<Weight, Box<dyn Error + Send + Sync>> {
     match stored {
+        Stored::Form(src) if src.name() == "nvfp4" => {
+            let mut each = Vec::with_capacity(parts.len());
+            for p in parts {
+                each.push(offer.packed(p)?);
+            }
+            let joined = tessera_engine::block::join_nvfp4(&each);
+            Ok(Weight::Packed(form(stored, true)?, joined))
+        }
         Stored::Form(src) if src.name() != "f32" => {
             let mut all = Vec::new();
             for p in parts {

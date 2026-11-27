@@ -53,6 +53,10 @@ impl Disk {
         }
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Fills `into` from byte `at`. Long reads use several threads.
     pub(crate) fn read(&self, at: u64, into: &mut [u8], reads: Reads) -> io::Result<()> {
         let direct = match reads {
