@@ -198,6 +198,13 @@ impl Engine {
         }
     }
 
+    /// Sets the minimum row count for row ownership across ranks.
+    pub fn set_own_rows(&mut self, rows: usize) {
+        if let Some((_, min)) = &mut self.owned {
+            *min = rows;
+        }
+    }
+
     /// Rank 0's launch bytes of one round. None without ranks.
     pub(crate) fn told(&mut self, mine: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let Some(control) = &self.control else {
@@ -574,19 +581,48 @@ pub(crate) fn build_split(graph: &Graph, entry: usize, min: usize) -> Option<(Gr
         .map(|g| (g, min))
 }
 
-/// Picks the split graph when `filled` meets the overlap threshold.
+/// Builds the row-owned graph and its minimum row threshold.
+pub(crate) fn build_owned(graph: &Graph, min: usize) -> Option<(Graph, usize)> {
+    let has_sum = graph.nodes.iter().any(|n| {
+        matches!(
+            &n.op,
+            tessera_graph::Op::Row(r) if r.0.contains(&tessera_graph::Stage::AllReduce)
+        )
+    });
+    if !has_sum {
+        return None;
+    }
+    tessera_graph::own_rows(graph).ok().map(|g| (g, min))
+}
+
+/// Optional transformed graph paired with its minimum row count.
+pub(crate) type Variant = Option<(Graph, usize)>;
+
+/// Picks split, owned, or base graph for `filled` rows.
 pub(crate) fn pick_graph<'a>(
-    base: &'a Graph,
-    split: &'a Option<(Graph, usize)>,
-    allow: bool,
+    (base, owned, split): (&'a Graph, &'a Variant, &'a Variant),
+    device: &Device,
+    allow_split: bool,
     filled: usize,
     sizes: &mut Vec<(tessera_graph::DimName, u64)>,
 ) -> &'a Graph {
-    match split {
-        Some((g, min)) if allow && *min > 0 && filled >= *min && filled.is_multiple_of(2) => {
-            sizes.push((tessera_graph::HALF_ROWS, (filled / 2) as u64));
-            g
-        }
-        _ => base,
+    if let Some((g, min)) = split
+        && allow_split
+        && *min > 0
+        && filled >= *min
+        && filled.is_multiple_of(2)
+    {
+        sizes.push((tessera_graph::HALF_ROWS, (filled / 2) as u64));
+        return g;
     }
+    if let Some((g, min)) = owned
+        && *min > 0
+        && filled >= *min
+    {
+        let parts = device.division();
+        if parts.ranks() > 1 && (0..parts.ranks()).all(|r| parts.rows(filled, r).1 > 0) {
+            return g;
+        }
+    }
+    base
 }

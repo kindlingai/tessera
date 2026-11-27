@@ -46,6 +46,50 @@ impl AllGather {
     pub const NAME: &'static str = "all_gather";
 }
 
+/// Sums `total` partials across ranks, keeping `len` at `start`.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    crate = crate,
+    name = "reduce_scatter",
+    sizes = [self.start, self.total],
+    source = Map::plain(Vec::new()).source(),
+    launches = Vec::new(),
+    work = self.total,
+    wire = self.wire,
+)]
+pub struct ReduceScatter {
+    pub len: usize,
+    pub start: usize,
+    pub total: usize,
+    /// Each rank's part rounds to this before the add.
+    pub wire: DType,
+}
+
+impl ReduceScatter {
+    /// Its kernel name. Runners find reduce-scatters by it.
+    pub const NAME: &'static str = "reduce_scatter";
+}
+
+/// Joins each rank's contiguous rows into `len` values.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    crate = crate,
+    name = "gather_rows",
+    sizes = [self.start],
+    source = Map::plain(Vec::new()).source(),
+    launches = Vec::new(),
+    work = self.len,
+)]
+pub struct GatherRows {
+    pub len: usize,
+    pub start: usize,
+}
+
+impl GatherRows {
+    /// Its kernel name. Runners find row gathers by it.
+    pub const NAME: &'static str = "gather_rows";
+}
+
 /// Bytes a crossing step moves, at any wire dtype.
 pub fn moved(kernel: &dyn Kernel, len: usize, stored: usize) -> usize {
     kernel.wire().map_or(stored, |w| w.bytes() * len)
@@ -53,5 +97,8 @@ pub fn moved(kernel: &dyn Kernel, len: usize, stored: usize) -> usize {
 
 /// Whether a step of kernel `name` crosses ranks.
 pub fn crosses(name: &str) -> bool {
-    name == AllReduce::NAME || name == AllGather::NAME
+    matches!(
+        name,
+        AllReduce::NAME | AllGather::NAME | ReduceScatter::NAME | GatherRows::NAME
+    )
 }

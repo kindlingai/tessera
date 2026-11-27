@@ -61,6 +61,15 @@ pub fn summed<'a>(parts: impl Iterator<Item = &'a [f32]>, wire: impl Fn(f32) -> 
     sum.expect("a rank")
 }
 
+/// The slice `range` of parts summed in rank order.
+pub fn summed_slice<'a>(
+    parts: impl Iterator<Item = &'a [f32]>,
+    range: std::ops::Range<usize>,
+    wire: impl Fn(f32) -> f32,
+) -> Vec<f32> {
+    summed(parts.map(|p| &p[range.clone()]), wire)
+}
+
 /// The parts' `rows` rows, joined in rank order.
 pub fn gathered<P: AsRef<[u8]>>(parts: &[P], rows: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(parts.iter().map(|p| p.as_ref().len()).sum());
@@ -70,6 +79,15 @@ pub fn gathered<P: AsRef<[u8]>>(parts: &[P], rows: usize) -> Vec<u8> {
             let width = p.len() / rows;
             out.extend_from_slice(&p[r * width..(r + 1) * width]);
         }
+    }
+    out
+}
+
+/// Joins each rank's contiguous rows in rank order.
+pub fn gathered_rows<P: AsRef<[u8]>>(parts: &[P]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|p| p.as_ref().len()).sum());
+    for p in parts {
+        out.extend_from_slice(p.as_ref());
     }
     out
 }

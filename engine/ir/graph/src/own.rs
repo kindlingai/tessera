@@ -1,5 +1,6 @@
 //! Row ownership: each rank keeps its share of summed rows.
 
+use crate::dims::{DimExpr, DimName};
 use crate::infer::TypeError;
 use crate::node::{Composite, Graph, Node, NodeId, Op, Region, Row};
 use crate::numerics::Numerics;
@@ -83,6 +84,7 @@ pub fn own_rows(g: &Graph) -> Result<Graph, VerifyError> {
     for n in &mut out.nodes {
         if let Op::Row(r) = &mut n.op
             && n.ty.rank() == 2
+            && n.ty.shape.0[0] != DimExpr::Dim(DimName::Picks)
         {
             for s in r.0.iter_mut().filter(|s| **s == Stage::AllReduce) {
                 *s = Stage::ReduceScatter;

@@ -374,7 +374,7 @@ mod report {
     use super::cover::{Cover, EDGE, fits, grid_mismatch, reads, writes};
     use super::{Home, Selected, Value};
     use crate::cost::Device;
-    use crate::kernels::{AllReduce, moved};
+    use crate::kernels::{AllReduce, GatherRows, ReduceScatter, moved};
     use crate::rule::{Draft, Rule, ways};
     use crate::tree::{T, Term, Tree};
     use std::collections::BTreeMap;
@@ -727,10 +727,25 @@ mod report {
         let mut total = 0.0;
         for op in &selected.ops {
             let out = &selected.values[op.write.0 as usize];
-            if op.kernel.name() == AllReduce::NAME {
-                let bytes = moved(&*op.kernel, out.len, out.form.bytes(out.len));
-                total += device.all_reduce(bytes).unwrap_or_default();
-                continue;
+            match op.kernel.name() {
+                AllReduce::NAME => {
+                    let bytes = moved(&*op.kernel, out.len, out.form.bytes(out.len));
+                    total += device.all_reduce(bytes).unwrap_or_default();
+                    continue;
+                }
+                ReduceScatter::NAME => {
+                    let total_elems = op.kernel.sizes()[1];
+                    let bytes = moved(&*op.kernel, total_elems, out.form.bytes(total_elems));
+                    total += device.half_ring(bytes).unwrap_or_default();
+                    continue;
+                }
+                GatherRows::NAME => {
+                    total += device
+                        .half_ring(out.form.bytes(out.len))
+                        .unwrap_or_default();
+                    continue;
+                }
+                _ => {}
             }
             let reads_weight = op.reads.iter().any(|r| {
                 matches!(

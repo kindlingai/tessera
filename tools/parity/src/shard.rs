@@ -108,6 +108,41 @@ fn launch(n: usize) -> [Tensor; 3] {
     [column(|p| p * 7 % 32), column(|p| p), column(|_| 0)]
 }
 
+/// Lowers `g` across `parts`, runs loopback, and checks `want`.
+fn check_plans(
+    label: &str,
+    g: &Graph,
+    parts: &Parts,
+    weights: &[Tensor],
+    inputs: &[Tensor],
+    want: &Tensor,
+) {
+    let ranks: Vec<u32> = (0..parts.ranks() as u32).collect();
+    let host = host();
+    let device = Device::guess(&host)
+        .zoned(mesh(ranks.len()))
+        .ranked(ranks.clone())
+        .uneven(parts.0.clone());
+    let sizes = [(Seqs, 1), (Rows, inputs[0].shape[0] as u64), (Context, 8)];
+    let plans: Vec<_> = ranks
+        .iter()
+        .map(|r| lower(g, 0, &sizes, &device.clone().as_rank(*r)).unwrap())
+        .collect();
+    for settings in runs() {
+        let mut loop_ranks = Loopback::open(&plans, &settings).unwrap();
+        for (at, w) in weights.iter().enumerate() {
+            loop_ranks.load(at as u32, w.view()).unwrap();
+        }
+        let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
+        let got = loop_ranks.run(&feeds).unwrap();
+        close(
+            &format!("{label} on {}", loop_ranks.rank(0).device()),
+            &got[1],
+            want,
+        );
+    }
+}
+
 /// A step graph over `parts` matches one rank's logits.
 pub fn step_ranks(g: &Graph, parts: &Parts) -> Sharded {
     let mut sharded = shard(g, parts).unwrap();
@@ -125,26 +160,7 @@ pub fn step_ranks(g: &Graph, parts: &Parts) -> Sharded {
     let owned = own_rows(&sharded.graph).unwrap();
     let own = run_parts(&owned, &weights, 0, &inputs, parts).unwrap();
     assert!(own == got, "owned rows differ");
-    let ranks: Vec<u32> = (0..parts.ranks() as u32).collect();
-    let host = host();
-    let device = Device::guess(&host).zoned(mesh(ranks.len()));
-    let device = device.ranked(ranks.clone());
-    let device = device.uneven(parts.0.clone());
-    let sizes = [(Seqs, 1), (Rows, n as u64), (Context, 8)];
-    let lowered = |r: &u32| lower(&sharded.graph, 0, &sizes, &device.clone().as_rank(*r));
-    let plans: Vec<_> = ranks.iter().map(|r| lowered(r).unwrap()).collect();
-    for settings in runs() {
-        let mut ranks = Loopback::open(&plans, &settings).unwrap();
-        for (at, w) in weights.iter().enumerate() {
-            ranks.load(at as u32, w.view()).unwrap();
-        }
-        let feeds: Vec<View> = inputs.iter().map(Tensor::view).collect();
-        let got = ranks.run(&feeds).unwrap();
-        close(
-            &format!("step on {}", ranks.rank(0).device()),
-            &got[1],
-            &want[1],
-        );
-    }
+    check_plans("step", &sharded.graph, parts, &weights, &inputs, &want[1]);
+    check_plans("owned", &owned, parts, &weights, &inputs, &want[1]);
     sharded
 }

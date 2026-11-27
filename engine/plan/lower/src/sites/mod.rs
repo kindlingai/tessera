@@ -92,8 +92,11 @@ impl Region {
             if node.term == Term::Stage(Step::AllReduce) {
                 sums.push(n);
             }
-            // Gathers stay with the engine.
-            if node.term == Term::Stage(Step::AllGather) {
+            // Gathers and row-ownership crossings stay with the engine.
+            if matches!(
+                node.term,
+                Term::Stage(Step::AllGather | Step::ReduceScatter | Step::GatherRows)
+            ) {
                 return None;
             }
             for a in &node.args {

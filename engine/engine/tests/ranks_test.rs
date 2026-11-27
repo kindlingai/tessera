@@ -137,16 +137,23 @@ fn ranks_share_pages() {
     follower.join().unwrap();
 }
 
-/// Runs split-batch two-rank prefill against one unsplit rank.
-fn agree_split(graph: fn() -> Graph, moe_tp: bool) {
+/// Runs two-rank prefill (`owned` or `split_batch`) against one rank.
+fn agree_mode(graph: fn() -> Graph, moe_tp: bool, owned: bool) {
     let [[s0, s1], [c0, c1]] = loopback_links();
+    let tune = move |e: &mut Engine| {
+        if owned {
+            e.set_own_rows(4);
+        } else {
+            e.set_split_rows(4);
+        }
+    };
     let follower = std::thread::spawn(move || {
         let mut e = opened(graph, Some([s1, c1]), &Recipe::default(), 16, moe_tp);
-        e.set_split_rows(4);
+        tune(&mut e);
         e.follow().unwrap();
     });
     let mut lead = opened(graph, Some([s0, c0]), &Recipe::default(), 16, moe_tp);
-    lead.set_split_rows(4);
+    tune(&mut lead);
     let mut alone = opened(graph, None, &Recipe::default(), 16, false);
     let launches = [
         vec![row(0, 5, 0), row(0, 7, 1), row(0, 9, 2), row(0, 2, 3)],
@@ -157,23 +164,58 @@ fn agree_split(graph: fn() -> Graph, moe_tp: bool) {
         assert_eq!(lead.last(rows).unwrap(), alone.last(rows).unwrap());
     }
     let kernels = lead.kernels();
-    assert!(kernels.contains_key("all_reduce"), "missing all_reduce");
-    assert!(
-        kernels.get("slice_u32").copied().unwrap_or(0) >= 2,
-        "expected split_batch plan, got kernels: {kernels:?}"
-    );
+    if owned {
+        assert!(
+            kernels.contains_key("reduce_scatter"),
+            "missing RS: {kernels:?}"
+        );
+        assert!(
+            kernels.contains_key("gather_rows"),
+            "missing GR: {kernels:?}"
+        );
+        // A 1-row decode step drops back to plain all_reduce.
+        let decode = [row(0, 1, 6)];
+        assert_eq!(lead.step(&decode).unwrap(), alone.step(&decode).unwrap());
+        assert!(lead.kernels().contains_key("all_reduce"));
+    } else {
+        assert!(kernels.contains_key("all_reduce"), "missing all_reduce");
+        assert!(
+            kernels.get("slice_u32").copied().unwrap_or(0) >= 2,
+            "expected split_batch plan, got kernels: {kernels:?}"
+        );
+    }
     lead.dismiss().unwrap();
     follower.join().unwrap();
 }
 
 #[test]
 fn split_batch_matches_one() {
-    agree_split(|| stepper::<Norm, Swiglu>(&Config::qwen3_small()), false);
-    agree_split(
-        || mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+    agree_mode(
+        || stepper::<Norm, Swiglu>(&Config::qwen3_small()),
+        false,
         false,
     );
-    agree_split(wide_glm53, true);
+    agree_mode(
+        || mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+        false,
+        false,
+    );
+    agree_mode(wide_glm53, true, false);
+}
+
+#[test]
+fn own_rows_matches_one() {
+    agree_mode(
+        || stepper::<Norm, Swiglu>(&Config::qwen3_small()),
+        false,
+        true,
+    );
+    agree_mode(
+        || mla::stepper::<mla::RotatedMoe>(&mla::Config::glm53_small()),
+        false,
+        true,
+    );
+    agree_mode(wide_glm53, true, true);
 }
 
 #[test]

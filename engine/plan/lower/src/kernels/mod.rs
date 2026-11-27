@@ -7,7 +7,7 @@ mod moves;
 mod scatter;
 mod widen;
 
-pub use collective::{AllGather, AllReduce, crosses, moved};
+pub use collective::{AllGather, AllReduce, GatherRows, ReduceScatter, crosses, moved};
 pub use join::Join;
 pub use map::{Map, MapStage, add_operand_forms, add_operands, finish, operands};
 pub(crate) use moves::Move;

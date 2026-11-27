@@ -1,5 +1,7 @@
 //! An entry as trees: values with one reader join it.
 
+mod own;
+
 use crate::extent::Extent;
 use crate::form::{F32_FORM, Load, Pins, Site};
 use crate::kernels::MapStage;
@@ -9,68 +11,16 @@ use crate::rule::Rule;
 use crate::select::Home;
 use crate::sites::Pattern;
 use crate::{Error, Size, Unsupported};
+pub use own::sliding_ring;
+use std::collections::HashMap;
 use tessera_codegen::kept::{self, Layout};
 use tessera_graph::{
-    Composite, DType, DimExpr, DimName, Graph, Lower, Mask, NodeId, Op, Parts, Pin, Placement,
-    Region, Role, Shape, Stage, View,
+    Composite, DType, DimExpr, DimName, Graph, Lower, NodeId, Op, Parts, Pin, Placement, Region,
+    Role, Shape, Stage, View,
 };
 
 /// Max rows per launch a sliding ring reserves.
 pub const RING_CHUNK: usize = 2048;
-
-/// Ring capacity for sliding-window kept `index`, if smaller than context.
-pub fn sliding_ring(g: &Graph, index: u32) -> Option<usize> {
-    let k = g.kept.get(index as usize)?;
-    let DimExpr::Dim(axis) = k.shape.0.get(1)? else {
-        return None;
-    };
-    let context = g.dims.iter().find(|d| d.name == *axis)?.size.max() as usize;
-    let appends: Vec<NodeId> = g
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.op == Op::Append(index))
-        .map(|(i, _)| NodeId(i as u32))
-        .collect();
-    if appends.is_empty() {
-        return None;
-    }
-    let mut max_back: Option<usize> = None;
-    for n in &g.nodes {
-        let reads = n
-            .args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| appends.contains(a));
-        for (pos, _) in reads {
-            let Op::Attend(a) = &n.op else {
-                return None;
-            };
-            let Mask::Back(back) = a.mask else {
-                return None;
-            };
-            if !a.ragged || a.picked || (pos != 1 && pos != 2) {
-                return None;
-            }
-            let b = back as usize;
-            max_back = Some(max_back.map_or(b, |m| m.max(b)));
-        }
-    }
-    let back = max_back?;
-    let rows_max = g
-        .dims
-        .iter()
-        .find(|d| d.name == DimName::Rows)
-        .map_or(RING_CHUNK, |d| d.size.max() as usize);
-    let chunk = rows_max.min(RING_CHUNK);
-    let raw = back + 1 + chunk;
-    let ring = if rows_max < 64 {
-        raw
-    } else {
-        raw.next_multiple_of(64)
-    };
-    (ring < context).then_some(ring)
-}
 
 /// Entry outputs a launch reads, one bit each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -424,6 +374,8 @@ impl<'a> Tree<'a> {
         let mut at: Vec<Option<T>> = vec![None; g.nodes.len()];
         // A rotated weight's leaves: codes, `suh`, `svh`.
         let mut turned: Vec<Option<[T; 3]>> = vec![None; g.nodes.len()];
+        // Sliced views of replicated nodes for owned readers.
+        let mut sliced: HashMap<(T, usize, usize), T> = HashMap::new();
         for i in (0..g.nodes.len()).filter(|i| needed[*i]) {
             let n = &g.nodes[i];
             let mut extents = sized(g, sizes, upto, &n.ty.shape)?;
@@ -454,12 +406,14 @@ impl<'a> Tree<'a> {
                     inner,
                 });
             }
+            own::own_extents(n, &mut extents, parts, rank)?;
             let shape: Vec<usize> = extents.iter().map(Extent::most).collect();
             let from = NodeId(i as u32);
             let missing = || Error::from(Unsupported::Unread { node: i });
             let args: Result<Vec<T>, Error> =
                 (n.args.iter().map(|a| at[a.0 as usize].ok_or_else(missing))).collect();
-            let args = args?;
+            let mut args = args?;
+            own::slice_owned_args(&mut tree, g, n, &mut args, &mut sliced);
             let form = match &n.op {
                 Op::Weight(w) => pins.form(&g.weights[*w as usize].path),
                 Op::Input { .. } => tessera_codegen::form::of(n.ty.dtype),
@@ -524,20 +478,46 @@ impl<'a> Tree<'a> {
                     let stages: Vec<&Stage> =
                         r.0.iter().filter(|s| ranks > 1 || !crossing(s)).collect();
                     let wired = n.numerics.and_then(|num| num.wire).is_some();
-                    if stages.contains(&&Stage::AllReduce) && !wired {
+                    let needs_wire = stages
+                        .iter()
+                        .any(|s| matches!(s, Stage::AllReduce | Stage::ReduceScatter));
+                    if needs_wire && !wired {
                         return Err(Unsupported::Wire { node: i }.into());
                     }
+                    let has_cross = stages.iter().any(|s| crossing(s));
+                    let mut crossed = !has_cross;
+                    let (in_shape, in_extents) = (
+                        tree.node(args[0]).shape.clone(),
+                        tree.node(args[0]).extents.clone(),
+                    );
                     let last = stages.len().saturating_sub(1);
                     for (idx, stage) in stages.into_iter().enumerate() {
+                        if crossing(stage) {
+                            crossed = true;
+                        }
                         let operand = (stage.operands() == 1).then(|| rest.next());
                         let operand = operand.flatten().copied();
-                        let args = [cur].into_iter().chain(operand).collect();
+                        let stage_args = [cur].into_iter().chain(operand).collect();
                         let stage_role = (idx == last).then_some(roles[i]).flatten();
                         let stage_form = match n.ty.dtype.is_float() {
                             true => pinned_form(pins, &n.op, Some(stage), stage_role, in_moe[i]),
                             false => tessera_codegen::form::of(n.ty.dtype),
                         };
-                        cur = push(Term::Stage(stage.clone()), args, stage_form);
+                        let (sh, ex) = match crossed {
+                            true => (shape.clone(), extents.clone()),
+                            false => (in_shape.clone(), in_extents.clone()),
+                        };
+                        cur = tree.add(
+                            Node {
+                                term: Term::Stage(stage.clone()),
+                                args: stage_args,
+                                shape: sh,
+                                extents: ex,
+                                form: stage_form,
+                                from,
+                            },
+                            None,
+                        );
                     }
                     cur
                 }
@@ -577,7 +557,7 @@ impl<'a> Tree<'a> {
         self
     }
 
-    fn add(&mut self, node: Node, share: Option<Share>) -> T {
+    pub(crate) fn add(&mut self, node: Node, share: Option<Share>) -> T {
         self.nodes.push(node);
         self.shares.push(share);
         T(self.nodes.len() as u32 - 1)

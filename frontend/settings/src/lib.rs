@@ -36,6 +36,8 @@ struct Env {
     attic_key_file: Option<PathBuf>,
     /// Minimum batch rows for split-batch overlap, or `0`.
     split_rows: Option<usize>,
+    /// Minimum batch rows for row ownership, or `0`.
+    own_rows: Option<usize>,
 }
 
 /// Reads `TESSERA_` variables. Bad values panic, empty ones are unset.
@@ -103,6 +105,7 @@ pub fn read() -> Settings {
         device: env.device,
         attic: parse_attic(env.attic.as_deref(), env.attic_key_file, &var),
         split_rows: env.split_rows.unwrap_or(4096),
+        own_rows: env.own_rows.unwrap_or(16),
     }
 }
 

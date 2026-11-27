@@ -268,7 +268,13 @@ impl Engine {
         let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
         let wants = self.wants_full();
         let upto = &[Context, Segments];
-        let graph = crate::ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let graph = crate::ranks::pick_graph(
+            (&self.graph, &self.owned, &self.split),
+            &self.device,
+            true,
+            filled,
+            &mut sizes,
+        );
         let mut report = self
             .plans
             .explain(graph, self.full, wants, &sizes, upto, &self.device)?;
@@ -293,7 +299,13 @@ impl Engine {
     fn replan_for(&mut self, sample: &[Row], picks: &[u32], wants: Wants) -> Result<(), Error> {
         let (mut sizes, [filled, _]) = launch_of(sample, picks, self.slots, self.context);
         let upto = &[Context, Segments];
-        let graph = crate::ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let graph = crate::ranks::pick_graph(
+            (&self.graph, &self.owned, &self.split),
+            &self.device,
+            true,
+            filled,
+            &mut sizes,
+        );
         let (plan, _) = self
             .plans
             .wanting(graph, self.full, wants, &sizes, upto, &self.device)?;

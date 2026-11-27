@@ -229,6 +229,7 @@ fn steps(g: &Graph) -> Result<(Option<usize>, Option<usize>), Error> {
 /// Rows in, picked rows' likeliest ids out, on one runner.
 pub struct Engine {
     graph: Graph,
+    pub(crate) owned: Option<(Graph, usize)>,
     pub(crate) split: Option<(Graph, usize)>,
     runner: Box<dyn Run>,
     device: Device,
@@ -441,9 +442,11 @@ impl Engine {
         let vocab = width(&graph, full, Role::Logits);
         let ring_chunk = schedule::ring_chunk(&graph);
         let stateful = graph.nodes.iter().any(|n| n.op.recurrent()) || ring_chunk > 0;
+        let owned = place.and_then(|_| ranks::build_owned(&graph, settings.own_rows));
         let split = place.and_then(|_| ranks::build_split(&graph, full, settings.split_rows));
         Ok(Self {
             graph,
+            owned,
             split,
             runner,
             device,
@@ -655,7 +658,13 @@ impl Engine {
     ) -> Result<usize, Error> {
         let (mut sizes, [filled, _]) = launch_of(rows, picks, self.slots, self.context);
         let upto = &[Context, Segments];
-        let graph = ranks::pick_graph(&self.graph, &self.split, true, filled, &mut sizes);
+        let graph = ranks::pick_graph(
+            (&self.graph, &self.owned, &self.split),
+            &self.device,
+            true,
+            filled,
+            &mut sizes,
+        );
         let (plan, _) = self
             .plans
             .wanting(graph, self.full, wants, &sizes, upto, &self.device)?;
@@ -899,7 +908,13 @@ impl Engine {
             return Err(Error::Mask);
         }
         let allow = entry == self.full && !peek;
-        let graph = ranks::pick_graph(&self.graph, &self.split, allow, filled, &mut sizes);
+        let graph = ranks::pick_graph(
+            (&self.graph, &self.owned, &self.split),
+            &self.device,
+            allow,
+            filled,
+            &mut sizes,
+        );
         let start = Instant::now();
         let (plan, bound) = self.plans.wanting(
             graph,

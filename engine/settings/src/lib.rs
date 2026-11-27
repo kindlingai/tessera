@@ -139,6 +139,8 @@ pub struct Settings {
     pub attic: Option<Attic>,
     /// Minimum batch rows for split-batch comm/compute overlap. `0` disables.
     pub split_rows: usize,
+    /// Minimum batch rows for row ownership across ranks. `0` disables.
+    pub own_rows: usize,
 }
 
 impl Default for Settings {
@@ -167,6 +169,7 @@ impl Default for Settings {
             device: None,
             attic: None,
             split_rows: 4096,
+            own_rows: 16,
         }
     }
 }

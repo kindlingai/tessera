@@ -5,13 +5,13 @@ use crate::{Base, Error, Run};
 use std::ops::Range;
 use std::time::Instant;
 use tessera_codegen::Precision;
-use tessera_engine_comm::{Transport, gathered, summed};
+use tessera_engine_comm::{Transport, gathered, gathered_rows, summed, summed_slice};
 use tessera_engine_settings::Settings;
 use tessera_gpukit::Platform;
 use tessera_gpukit::backend::OnGpu;
 use tessera_gpukit::device::Device;
 use tessera_gpukit::launch::Launch;
-use tessera_lower::kernels::{AllGather, crosses};
+use tessera_lower::kernels::{AllGather, AllReduce, GatherRows, ReduceScatter, crosses};
 use tessera_lower::{Launching, Plan, Step};
 use tessera_mem::{DType, Tensor};
 
@@ -35,6 +35,29 @@ pub trait Sum {
         _part: usize,
         _total: usize,
         _rows: usize,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    /// Queues a reduce-scatter writing `len` floats at `start`.
+    fn reduce_scatter(
+        &mut self,
+        _from: u64,
+        _to: u64,
+        _start: usize,
+        _len: usize,
+        _total: usize,
+        _wire: DType,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    /// Queues a contiguous row gather landing at `start`.
+    fn gather_rows(
+        &mut self,
+        _from: u64,
+        _to: u64,
+        _start: usize,
+        _part: usize,
+        _total: usize,
     ) -> Result<bool, Error> {
         Ok(false)
     }
@@ -166,16 +189,35 @@ pub(crate) fn grid_cross(
     to: u64,
     grid: &mut dyn Sum,
 ) -> Result<bool, Error> {
-    if step.kernel.name() != AllGather::NAME {
-        grid.sum(from, to, step.write.len, wire(step))?;
-        return Ok(true);
-    }
     let (src, dst) = (step.reads[0], step.write);
-    if src.form.name() != "f32" || dst.form.name() != "f32" {
-        return Ok(false);
+    match step.kernel.name() {
+        AllReduce::NAME => {
+            grid.sum(from, to, dst.len, wire(step))?;
+            Ok(true)
+        }
+        AllGather::NAME => {
+            if src.form.name() != "f32" || dst.form.name() != "f32" {
+                return Ok(false);
+            }
+            let rows = step.kernel.sizes()[0];
+            grid.gather(from, to, src.len, dst.len, rows)
+        }
+        ReduceScatter::NAME => {
+            if src.form.name() != "f32" || dst.form.name() != "f32" {
+                return Ok(false);
+            }
+            let sizes = step.kernel.sizes();
+            grid.reduce_scatter(from, to, sizes[0], dst.len, sizes[1], wire(step))
+        }
+        GatherRows::NAME => {
+            if src.form.name() != "f32" || dst.form.name() != "f32" {
+                return Ok(false);
+            }
+            let start = step.kernel.sizes()[0];
+            grid.gather_rows(from, to, start, src.len, dst.len)
+        }
+        _ => Ok(false),
     }
-    let rows = step.kernel.sizes()[0];
-    grid.gather(from, to, src.len, dst.len, rows)
 }
 
 enum Inner {
@@ -349,7 +391,7 @@ impl<T: Transport> Rank<T> {
             }
             if let Some(at) = next_host {
                 let step = self.runner.run().plan().steps[at].clone();
-                if let Err(e) = self.gather(&step) {
+                if let Err(e) = self.host_cross(&step) {
                     if used_grid || std::mem::take(&mut self.queued_sums) {
                         let _ = self.grid.as_mut().expect("a grid").check();
                     }
@@ -381,27 +423,47 @@ impl<T: Transport> Rank<T> {
         }
     }
 
-    /// A host sum. Profiling first waits for all ranks.
-    fn exchange(&mut self, step: &Step) -> Result<(), Error> {
+    /// Runs one crossing step over host transport.
+    fn host_cross(&mut self, step: &Step) -> Result<(), Error> {
+        match step.kernel.name() {
+            AllGather::NAME => self.gather(step),
+            GatherRows::NAME => self.gather_rows(step),
+            ReduceScatter::NAME => {
+                let start = step.kernel.sizes()[0];
+                self.exchange_sum(step, "reduce_scatter", Some(start..start + step.write.len))
+            }
+            _ => self.exchange_sum(step, "all_reduce", None),
+        }
+    }
+
+    /// A host sum or reduce-scatter. Profiling waits first.
+    fn exchange_sum(
+        &mut self,
+        step: &Step,
+        tag: &str,
+        slice: Option<Range<usize>>,
+    ) -> Result<(), Error> {
         let start = Instant::now();
         let part = self.runner.run().read(step.reads[0])?;
-        let mut at = self.lap("all_reduce: read", start);
+        let mut at = self.lap(&format!("{tag}: read"), start);
         if self.base().profile.is_some() {
             self.transport.exchange(&[])?;
-            at = self.lap("all_reduce: wait", at);
+            at = self.lap(&format!("{tag}: wait"), at);
         }
         let parts = self.transport.exchange(part.bytes())?;
-        at = self.lap("all_reduce: transfer", at);
+        at = self.lap(&format!("{tag}: transfer"), at);
         let floats = |p: &Vec<u8>| Tensor::from_bytes(vec![p.len() / 4], DType::F32, p);
         let parts: Vec<Tensor> = parts.iter().map(floats).collect();
         let wire = wire(step);
-        let sum = summed(parts.iter().map(|p| p.floats().expect("floats")), |x| {
-            wire.round(x)
-        });
+        let iter = parts.iter().map(|p| p.floats().expect("floats"));
+        let sum = match slice {
+            Some(range) => summed_slice(iter, range, |x| wire.round(x)),
+            None => summed(iter, |x| wire.round(x)),
+        };
         let sum = Tensor::f32(vec![step.write.len], sum);
         self.runner.run_mut().write(step.write, sum.view())?;
-        self.lap("all_reduce: sum", at);
-        self.lap("all_reduce", start);
+        self.lap(&format!("{tag}: sum"), at);
+        self.lap(tag, start);
         Ok(())
     }
 
@@ -414,6 +476,17 @@ impl<T: Transport> Rank<T> {
         let whole = Tensor::from_bytes(vec![step.write.len], part.dtype(), &gathered(&parts, rows));
         self.runner.run_mut().write(step.write, whole.view())?;
         self.lap("all_gather", start);
+        Ok(())
+    }
+
+    /// A host gather joining contiguous owned rows.
+    fn gather_rows(&mut self, step: &Step) -> Result<(), Error> {
+        let start = Instant::now();
+        let part = self.runner.run().read(step.reads[0])?;
+        let parts = self.transport.exchange(part.bytes())?;
+        let whole = Tensor::from_bytes(vec![step.write.len], part.dtype(), &gathered_rows(&parts));
+        self.runner.run_mut().write(step.write, whole.view())?;
+        self.lap("gather_rows", start);
         Ok(())
     }
 
@@ -452,25 +525,23 @@ impl<T: Transport> Rank<T> {
             let step = step.clone();
             self.run_span(from..i, !(self.grid.is_some() && !timed))?;
             from = i + 1;
-            match (step.kernel.name() == AllGather::NAME, self.grid.is_some()) {
-                (true, true) => {
-                    if !self.grid_step(i, &step)? {
-                        self.gather(&step)?;
-                    }
+            let ran = if self.grid.is_some() {
+                let start = timed.then(Instant::now);
+                let ok = self.grid_step(i, &step)?;
+                if ok
+                    && let Some(t0) = start
+                    && self.grid.as_ref().is_some_and(|g| g.capturable())
+                    && let Inner::Device(dev) = &self.runner
+                {
+                    dev.finish_device()?;
+                    sum_secs += t0.elapsed().as_secs_f64();
                 }
-                (true, false) => self.gather(&step)?,
-                (false, true) => {
-                    let start = timed.then(Instant::now);
-                    self.grid_step(i, &step)?;
-                    if let Some(t0) = start
-                        && self.grid.as_ref().is_some_and(|g| g.capturable())
-                        && let Inner::Device(dev) = &self.runner
-                    {
-                        dev.finish_device()?;
-                        sum_secs += t0.elapsed().as_secs_f64();
-                    }
-                }
-                (false, false) => self.exchange(&step)?,
+                ok
+            } else {
+                false
+            };
+            if !ran {
+                self.host_cross(&step)?;
             }
         }
         let crossed = from > steps.start;

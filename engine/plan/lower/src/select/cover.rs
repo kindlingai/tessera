@@ -3,7 +3,9 @@
 use crate::abi::{Shape, Source};
 use crate::cost::Device;
 use crate::form::F32_FORM;
-use crate::kernels::{AllGather, AllReduce, Narrow, Scatter, Widen, moved};
+use crate::kernels::{
+    AllGather, AllReduce, GatherRows, Narrow, ReduceScatter, Scatter, Widen, moved,
+};
 use crate::plan::{Slot, Step};
 use crate::rule::{Draft, Read, Rule, ways};
 use crate::tree::{T, Term, Tree};
@@ -148,26 +150,58 @@ impl Cover<'_> {
         if append.is_some() && zone != EDGE {
             return None;
         }
-        if let Term::Stage(stage @ (Stage::AllReduce | Stage::AllGather)) = &n.term {
+        if let Term::Stage(
+            stage
+            @ (Stage::AllReduce | Stage::AllGather | Stage::ReduceScatter | Stage::GatherRows),
+        ) = &n.term
+        {
             let len = self.tree.elements(t);
-            let (rule, draft) = match stage {
+            let src = n.args[0];
+            let (rule, draft, moved_bytes) = match stage {
                 Stage::AllReduce => {
                     let wire = self.tree.wire(t)?;
                     let sum = AllReduce { len, wire };
-                    (AllReduce::NAME, Draft::new(sum, [n.args[0]], len))
+                    let bytes = moved(&sum, len, self.tree.bytes(t));
+                    (AllReduce::NAME, Draft::new(sum, [src], len), bytes)
                 }
-                _ => {
+                Stage::AllGather => {
                     let rows = len / n.shape.last().copied().unwrap_or(1).max(1);
                     let gather = AllGather { len, rows };
-                    (AllGather::NAME, Draft::new(gather, [n.args[0]], len))
+                    let bytes = moved(&gather, len, self.tree.bytes(t));
+                    (AllGather::NAME, Draft::new(gather, [src], len), bytes)
                 }
+                Stage::ReduceScatter => {
+                    let wire = self.tree.wire(t)?;
+                    let total = self.tree.elements(src);
+                    let whole_rows = self.tree.node(src).shape[0];
+                    let width = n.shape[1..].iter().product::<usize>();
+                    let start = self.tree.parts.rows(whole_rows, self.tree.rank as usize).0 * width;
+                    let rs = ReduceScatter {
+                        len,
+                        start,
+                        total,
+                        wire,
+                    };
+                    let bytes = moved(&rs, total, self.tree.bytes(src));
+                    (ReduceScatter::NAME, Draft::new(rs, [src], len), bytes)
+                }
+                Stage::GatherRows => {
+                    let whole_rows = n.shape[0];
+                    let width = n.shape[1..].iter().product::<usize>();
+                    let start = self.tree.parts.rows(whole_rows, self.tree.rank as usize).0 * width;
+                    let gr = GatherRows { len, start };
+                    let bytes = self.tree.bytes(t);
+                    (GatherRows::NAME, Draft::new(gr, [src], len), bytes)
+                }
+                _ => unreachable!(),
             };
-            // A gather costs as a sum of its bytes.
-            let bytes = moved(&*draft.kernel, len, self.tree.bytes(t));
-            let moved = self.device.all_reduce(bytes)?;
+            let moved = match stage {
+                Stage::ReduceScatter | Stage::GatherRows => self.device.half_ring(moved_bytes)?,
+                _ => self.device.all_reduce(moved_bytes)?,
+            };
             let drafts = vec![draft];
             let cast = self.widening(zone, &drafts) + self.narrowing(zone, t, &drafts);
-            let cost = moved + cast + self.need(n.args[0], zone)?;
+            let cost = moved + cast + self.need(src, zone)?;
             return Some(Choice {
                 rule,
                 drafts,

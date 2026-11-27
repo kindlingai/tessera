@@ -3,9 +3,9 @@
 use crate::Error;
 use crate::Run;
 use crate::open;
-use tessera_engine_comm::{gathered, summed};
+use tessera_engine_comm::{gathered, gathered_rows, summed};
 use tessera_engine_settings::Settings;
-use tessera_lower::kernels::{AllGather, crosses};
+use tessera_lower::kernels::{AllGather, GatherRows, ReduceScatter, crosses};
 use tessera_lower::{Plan, Weight};
 use tessera_mem::{Tensor, View};
 
@@ -86,24 +86,50 @@ impl Loopback {
                 parts.push(rank.read(step(r).reads[0])?);
             }
             let first = step(0);
-            let whole = match first.kernel.name() == AllGather::NAME {
-                true => {
-                    let joined = gathered(
-                        &parts.iter().map(Tensor::bytes).collect::<Vec<_>>(),
-                        first.kernel.sizes()[0],
-                    );
-                    Tensor::from_bytes(vec![first.write.len], parts[0].dtype(), &joined)
+            match first.kernel.name() {
+                AllGather::NAME => {
+                    let bytes: Vec<&[u8]> = parts.iter().map(Tensor::bytes).collect();
+                    let joined = gathered(&bytes, first.kernel.sizes()[0]);
+                    let whole =
+                        Tensor::from_bytes(vec![first.write.len], parts[0].dtype(), &joined);
+                    for (r, rank) in self.ranks.iter_mut().enumerate() {
+                        let write = rank.plan().steps[sums[r][at]].write;
+                        rank.write(write, whole.view())?;
+                    }
                 }
-                false => {
+                GatherRows::NAME => {
+                    let bytes: Vec<&[u8]> = parts.iter().map(Tensor::bytes).collect();
+                    let joined = gathered_rows(&bytes);
+                    let whole =
+                        Tensor::from_bytes(vec![first.write.len], parts[0].dtype(), &joined);
+                    for (r, rank) in self.ranks.iter_mut().enumerate() {
+                        let write = rank.plan().steps[sums[r][at]].write;
+                        rank.write(write, whole.view())?;
+                    }
+                }
+                ReduceScatter::NAME => {
                     let wire = crate::rank::wire(first);
                     let floats = parts.iter().map(|p| p.floats().expect("floats"));
                     let sum = summed(floats, |x| wire.round(x));
-                    Tensor::f32(vec![first.write.len], sum)
+                    for (r, rank) in self.ranks.iter_mut().enumerate() {
+                        let step = &rank.plan().steps[sums[r][at]];
+                        let start = step.kernel.sizes()[0];
+                        let write = step.write;
+                        let part =
+                            Tensor::f32(vec![write.len], sum[start..start + write.len].to_vec());
+                        rank.write(write, part.view())?;
+                    }
                 }
-            };
-            for (r, rank) in self.ranks.iter_mut().enumerate() {
-                let write = rank.plan().steps[sums[r][at]].write;
-                rank.write(write, whole.view())?;
+                _ => {
+                    let wire = crate::rank::wire(first);
+                    let floats = parts.iter().map(|p| p.floats().expect("floats"));
+                    let sum = summed(floats, |x| wire.round(x));
+                    let whole = Tensor::f32(vec![first.write.len], sum);
+                    for (r, rank) in self.ranks.iter_mut().enumerate() {
+                        let write = rank.plan().steps[sums[r][at]].write;
+                        rank.write(write, whole.view())?;
+                    }
+                }
             }
         }
         let outputs = self.ranks[0].plan().outputs.clone();

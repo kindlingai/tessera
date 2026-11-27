@@ -361,6 +361,12 @@ impl Device {
         self.cluster.all_reduce(&zones, bytes as f64)
     }
 
+    /// Seconds for a reduce-scatter or row gather of `bytes`.
+    pub fn half_ring(&self, bytes: usize) -> Option<f64> {
+        let zones: Vec<usize> = self.ranks.iter().map(|z| *z as usize).collect();
+        self.cluster.half_ring(&zones, bytes as f64)
+    }
+
     /// Seconds to move `bytes` between zones, if linked.
     pub fn transfer(&self, from: u32, to: u32, bytes: usize) -> Option<f64> {
         self.cluster
@@ -471,9 +477,15 @@ impl Device {
         let cold = plan.reads_weight(step) && self.streams(plan.weight_bytes());
         match from.filter(|z| *z != step.zone) {
             Some(from) => self.transfer(from, step.zone, step.write.bytes()),
-            None if crosses(step.kernel.name()) => {
-                self.all_reduce(moved(&*step.kernel, step.write.len, step.write.bytes()))
-            }
+            None if crosses(step.kernel.name()) => match step.kernel.name() {
+                "reduce_scatter" => {
+                    let total = step.kernel.sizes()[1];
+                    let stored = step.reads.first().map_or(step.write.bytes(), |r| r.bytes());
+                    self.half_ring(moved(&*step.kernel, total, stored))
+                }
+                "gather_rows" => self.half_ring(step.write.bytes()),
+                _ => self.all_reduce(moved(&*step.kernel, step.write.len, step.write.bytes())),
+            },
             None => Some(self.seconds_in(step.zone, &*step.kernel, step.write.len, cold)),
         }
     }

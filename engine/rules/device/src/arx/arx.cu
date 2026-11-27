@@ -457,32 +457,13 @@ TESSERA_FN void one_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
     finish_seq(c, blocks, state, seq);
 }
 
-// Pipelined two-shot reduce-scatter + all-gather.
+// Stages scatter pieces to send0 and publishes RS work.
 template <Wire W>
-TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks,
-                         u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {
-    if (prim::leader()) prim::timing_begin(timing_of(state));
-    u64 seq0 = state[ST_SEQ] + 1ull;
-    u64 seq1 = seq0 + 1ull;
-    u64 par0 = seq0 & 1ull;
-    u64 par1 = seq1 & 1ull;
-    u8* send0 = reinterpret_cast<u8*>(send_p) + par0 * SEND_BYTES;
-    u8* send1 = reinterpret_cast<u8*>(send_p) + par1 * SEND_BYTES;
-    const u8* recv = reinterpret_cast<const u8*>(recv_p);
-    const u64* flag = reinterpret_cast<const u64*>(flag_p);
-    ctl* c = reinterpret_cast<ctl*>(ctl_p);
-    const float* src = reinterpret_cast<const float*>(from_p);
-    float* dst = reinterpret_cast<float*>(to_p);
-    u32 chunk = n / nr;
+TESSERA_FN void stage_scatter(ctl* c, u32* blocks, u64* state, u8* send0, const float* src,
+                              u64 seq0, u64 slice, u64 slice_chunks, u32 v_per_chunk, u32 nr,
+                              Fp8Chunk& sm) {
     u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     u32 stride = gridDim.x * blockDim.x;
-    u64 slice_chunks = u64(chunk >> 10);
-    u64 slice = (W == Wire::Fp8) ? (slice_chunks * FP8_CHUNK_BYTES)
-                                 : (u64(chunk) * (W == Wire::Bf16 ? 2ull : 4ull));
-    u32 v_per_chunk = (W == Wire::Bf16) ? (chunk >> 3) : (chunk >> 2);
-    __shared__ Fp8Chunk sm[MAX_RANKS];
-
-    // Stage pieces to send0 and publish RS work.
     for (u32 p = 0u; p < PIECES; p++) {
         u64 lo, hi;
         if constexpr (W == Wire::Fp8) {
@@ -497,7 +478,7 @@ TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
                 u32 j = u32(p_lo) + (q - r * cnt);
                 float4 v = reinterpret_cast<const float4*>(src)[r * v_per_chunk + (j << 8) +
                                                                 threadIdx.x];
-                store_chunk_fp8(sm[0], send0 + u64(r) * slice, j, v);
+                store_chunk_fp8(sm, send0 + u64(r) * slice, j, v);
             }
         } else {
             piece_bounds(slice, p, lo, hi);
@@ -521,11 +502,40 @@ TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
         }
         publish_piece(c, blocks, state, p, MODE_SCATTER_PIECE, seq0, p, slice, lo, hi);
     }
+}
 
-    // Reduce arrived RS pieces into send1 and publish AG.
+// Pipelined reduce-scatter, optionally followed by all-gather.
+template <Wire W, bool GATHER>
+TESSERA_FN void scatter_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,
+                             u32* blocks, u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes,
+                             u64 timeout) {
+    if (prim::leader()) prim::timing_begin(timing_of(state));
+    u64 seq0 = state[ST_SEQ] + 1ull;
+    u64 seq1 = seq0 + 1ull;
+    u64 par0 = seq0 & 1ull;
+    u64 par1 = seq1 & 1ull;
+    u8* send0 = reinterpret_cast<u8*>(send_p) + par0 * SEND_BYTES;
+    u8* send1 = reinterpret_cast<u8*>(send_p) + par1 * SEND_BYTES;
+    const u8* recv = reinterpret_cast<const u8*>(recv_p);
+    const u64* flag = reinterpret_cast<const u64*>(flag_p);
+    ctl* c = reinterpret_cast<ctl*>(ctl_p);
+    const float* src = reinterpret_cast<const float*>(from_p);
+    float* dst = reinterpret_cast<float*>(to_p);
+    u32 chunk = n / nr;
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = gridDim.x * blockDim.x;
+    u64 slice_chunks = u64(chunk >> 10);
+    u64 slice = (W == Wire::Fp8) ? (slice_chunks * FP8_CHUNK_BYTES)
+                                 : (u64(chunk) * (W == Wire::Bf16 ? 2ull : 4ull));
+    u32 v_per_chunk = (W == Wire::Bf16) ? (chunk >> 3) : (chunk >> 2);
+    __shared__ Fp8Chunk sm[MAX_RANKS];
+
+    stage_scatter<W>(c, blocks, state, send0, src, seq0, slice, slice_chunks, v_per_chunk, nr,
+                     sm[0]);
+
     const u8* own_rs = send0 + u64(me) * slice;
     for (u32 p = 0u; p < PIECES; p++) {
-        u64 lo, hi;
+        u64 lo = 0ull, hi = 0ull;
         if constexpr (W == Wire::Fp8) {
             u64 p_lo, p_hi;
             piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
@@ -534,7 +544,11 @@ TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
             if (!wait_flags(c, flag, state, flag_of(seq0, p), me, nr, lanes, timeout)) return;
             for (u32 j = u32(p_lo) + blockIdx.x; j < u32(p_hi); j += gridDim.x) {
                 float4 acc = sum_chunk_fp8(sm, own_rs, recv, par0, j, me, nr);
-                store_chunk_fp8(sm[0], send1, j, acc);
+                if constexpr (GATHER) {
+                    store_chunk_fp8(sm[0], send1, j, acc);
+                } else {
+                    reinterpret_cast<float4*>(dst)[(j << 8) + threadIdx.x] = acc;
+                }
             }
         } else {
             piece_bounds(slice, p, lo, hi);
@@ -545,16 +559,32 @@ TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
                 if constexpr (W == Wire::Bf16) {
                     float acc[8];
                     sum_bf16x8(own_rs, recv, par0, j, me, nr, acc);
-                    *reinterpret_cast<uint4*>(send1 + u64(j) * 16ull) =
-                        pack_bf16x8(make_float4(acc[0], acc[1], acc[2], acc[3]),
-                                    make_float4(acc[4], acc[5], acc[6], acc[7]));
+                    float4 lo4 = make_float4(acc[0], acc[1], acc[2], acc[3]);
+                    float4 hi4 = make_float4(acc[4], acc[5], acc[6], acc[7]);
+                    if constexpr (GATHER) {
+                        *reinterpret_cast<uint4*>(send1 + u64(j) * 16ull) = pack_bf16x8(lo4, hi4);
+                    } else {
+                        reinterpret_cast<float4*>(dst)[j * 2] = lo4;
+                        reinterpret_cast<float4*>(dst)[j * 2 + 1] = hi4;
+                    }
                 } else {
-                    *reinterpret_cast<float4*>(send1 + u64(j) * 16ull) =
-                        sum_f32x4(own_rs, recv, par0, j, me, nr);
+                    float4 acc = sum_f32x4(own_rs, recv, par0, j, me, nr);
+                    if constexpr (GATHER) {
+                        *reinterpret_cast<float4*>(send1 + u64(j) * 16ull) = acc;
+                    } else {
+                        reinterpret_cast<float4*>(dst)[j] = acc;
+                    }
                 }
             }
         }
-        publish_piece(c, blocks, state, PIECES + p, MODE_GATHER_PIECE, seq1, p, slice, lo, hi);
+        if constexpr (GATHER) {
+            publish_piece(c, blocks, state, PIECES + p, MODE_GATHER_PIECE, seq1, p, slice, lo, hi);
+        }
+    }
+
+    if constexpr (!GATHER) {
+        finish_seq(c, blocks, state, seq0);
+        return;
     }
 
     // Phase 3: unpack arrived AG pieces into output buffer.
@@ -603,6 +633,20 @@ TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
     finish_seq(c, blocks, state, seq1);
 }
 
+template <Wire W>
+TESSERA_FN void two_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks,
+                         u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {
+    scatter_body<W, true>(send_p, recv_p, flag_p, ctl_p, state, blocks, from_p, to_p, n, me, nr,
+                          lanes, timeout);
+}
+
+template <Wire W>
+TESSERA_FN void rs_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks,
+                        u64 from_p, u64 to_p, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {
+    scatter_body<W, false>(send_p, recv_p, flag_p, ctl_p, state, blocks, from_p, to_p, n, me, nr,
+                           lanes, timeout);
+}
+
 }  // namespace arx
 
 #define ARX_DEF(NAME, BODY, WIRE)                                                              \
@@ -619,6 +663,9 @@ ARX_DEF(tessera_arx_one_fp8, one_body, Fp8)
 ARX_DEF(tessera_arx_two_bf16, two_body, Bf16)
 ARX_DEF(tessera_arx_two_f32, two_body, F32)
 ARX_DEF(tessera_arx_two_fp8, two_body, Fp8)
+ARX_DEF(tessera_arx_rs_bf16, rs_body, Bf16)
+ARX_DEF(tessera_arx_rs_f32, rs_body, F32)
+ARX_DEF(tessera_arx_rs_fp8, rs_body, Fp8)
 
 // Even-width row-major all-gather over F32.
 extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,
@@ -673,6 +720,56 @@ extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 fla
                                               recv + arx::recv_off(par, src, nr));
             u64 off = u64(row) * width + j;
             out[i] = src == me ? sp[off] : prim::load_fresh(sp + off);
+        }
+    }
+    arx::finish_seq(c, blocks, state, seq);
+}
+
+// Even contiguous row gather over F32.
+extern "C" __global__ void tessera_arx_gather_rows(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,
+                                                   u64* state, u32* blocks, u64 from_p, u64 to_p,
+                                                   u32 part_stride, u32 n, u32 me, u32 nr,
+                                                   u32 lanes, u64 timeout) {
+    if (prim::leader()) prim::timing_begin(arx::timing_of(state));
+    u64 seq = state[arx::ST_SEQ] + 1ull;
+    u64 par = seq & 1ull;
+    u8* mine_b = reinterpret_cast<u8*>(send_p) + par * arx::SEND_BYTES;
+    const u8* recv = reinterpret_cast<const u8*>(recv_p);
+    arx::ctl* c = reinterpret_cast<arx::ctl*>(ctl_p);
+    arx::stage_in<arx::Wire::F32>(reinterpret_cast<const float*>(from_p), mine_b, n);
+    arx::publish_piece(c, blocks, state, arx::BLK_ONE, arx::MODE_GATHER, seq, arx::PIECES - 1u,
+                       0ull, 0ull, u64(n) * 4ull);
+    if (!arx::wait_flags(c, reinterpret_cast<const u64*>(flag_p), state,
+                         arx::flag_of(seq, arx::PIECES - 1u), me, nr, lanes, timeout))
+        return;
+    const float* mine = reinterpret_cast<const float*>(mine_b);
+    float* out = reinterpret_cast<float*>(to_p);
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = gridDim.x * blockDim.x;
+    bool aligned = (n & 3u) == 0u && (part_stride & 3u) == 0u &&
+                   (reinterpret_cast<u64>(out) & 15ull) == 0ull;
+    if (aligned) {
+        u32 n4 = n >> 2;
+        u32 tot4 = n4 * nr;
+        for (u32 q = tid; q < tot4; q += stride) {
+            u32 src = q / n4;
+            u32 j = q - src * n4;
+            const float* sp = src == me ? mine
+                                        : reinterpret_cast<const float*>(
+                                              recv + arx::recv_off(par, src, nr));
+            float4 v = src == me ? reinterpret_cast<const float4*>(sp)[j]
+                                 : prim::load_fresh4(sp + u64(j) * 4ull);
+            *reinterpret_cast<float4*>(out + u64(src) * part_stride + u64(j) * 4ull) = v;
+        }
+    } else {
+        u32 tot = n * nr;
+        for (u32 i = tid; i < tot; i += stride) {
+            u32 src = i / n;
+            u32 j = i - src * n;
+            const float* sp = src == me ? mine
+                                        : reinterpret_cast<const float*>(
+                                              recv + arx::recv_off(par, src, nr));
+            out[u64(src) * part_stride + j] = src == me ? sp[j] : prim::load_fresh(sp + j);
         }
     }
     arx::finish_seq(c, blocks, state, seq);

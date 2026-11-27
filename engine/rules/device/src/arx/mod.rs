@@ -28,7 +28,11 @@ pub struct Arx<D: Device> {
     two_bf16: D::Kernel,
     two_f32: D::Kernel,
     two_fp8: D::Kernel,
+    rs_bf16: D::Kernel,
+    rs_f32: D::Kernel,
+    rs_fp8: D::Kernel,
     allgather: D::Kernel,
+    gather_rows: D::Kernel,
     state: DeviceBuffer<D>,
     blocks: DeviceBuffer<D>,
     timeout_ticks: u64,
@@ -61,7 +65,11 @@ where
         let two_bf16 = ctx.compile(&text, "tessera_arx_two_bf16")?;
         let two_f32 = ctx.compile(&text, "tessera_arx_two_f32")?;
         let two_fp8 = ctx.compile(&text, "tessera_arx_two_fp8")?;
+        let rs_bf16 = ctx.compile(&text, "tessera_arx_rs_bf16")?;
+        let rs_f32 = ctx.compile(&text, "tessera_arx_rs_f32")?;
+        let rs_fp8 = ctx.compile(&text, "tessera_arx_rs_fp8")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
+        let gather_rows = ctx.compile(&text, "tessera_arx_gather_rows")?;
         let state = DeviceBuffer::alloc(ctx, 32 + crate::TIMING_BYTES)?;
         let blocks = DeviceBuffer::alloc(ctx, 96)?;
         state.zero()?;
@@ -79,7 +87,11 @@ where
             two_bf16,
             two_f32,
             two_fp8,
+            rs_bf16,
+            rs_f32,
+            rs_fp8,
             allgather,
+            gather_rows,
             state,
             blocks,
             timeout_ticks,
@@ -227,6 +239,107 @@ where
         }
         Ok(true)
     }
+
+    fn launch_rs(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        len: usize,
+        total: usize,
+        wire: DType,
+    ) -> Result<bool, Error> {
+        let ranks = self.mem.ranks as usize;
+        let part_align = if wire == DType::Fp8 { 1024 } else { 8 };
+        let aligned = (from & 15) == 0 && (to & 15) == 0;
+        let fits = !self.broken
+            && self.mem.mesh
+            && aligned
+            && len > 0
+            && start == self.mem.rank as usize * len
+            && len * ranks == total
+            && len.is_multiple_of(part_align);
+        if !fits {
+            return Ok(false);
+        }
+        let max_total = match wire {
+            DType::Fp8 => {
+                let by_send = (ArxLink::SEND_BYTES / 1152) * 1024;
+                let by_slot = (ArxLink::SLOT_BYTES / 1152) * 1024 * ranks;
+                by_send.min(by_slot)
+            }
+            _ => {
+                let elem = if wire == DType::Bf16 { 2 } else { 4 };
+                (ArxLink::SEND_BYTES / elem).min((ArxLink::SLOT_BYTES / elem) * ranks)
+            }
+        };
+        if total > max_total {
+            return Ok(false);
+        }
+        let Ok(n) = u32::try_from(total) else {
+            return Ok(false);
+        };
+        let mut args = self.base_args();
+        args.u64(from).u64(to).u32(n);
+        self.finish_args(&mut args);
+        let step = if wire == DType::Fp8 {
+            1024
+        } else {
+            THREADS * 8
+        };
+        let grid = n.div_ceil(step).clamp(1, self.max_grid(48));
+        let kernel = match wire {
+            DType::Bf16 => &self.rs_bf16,
+            DType::Fp8 => &self.rs_fp8,
+            _ => &self.rs_f32,
+        };
+        self.ctx.programmatic(false);
+        self.ctx
+            .launch(kernel, (grid, 1, 1), (THREADS, 1, 1), 0, &mut args)?;
+        Ok(true)
+    }
+
+    fn launch_gather_rows(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        part: usize,
+        total: usize,
+    ) -> Result<bool, Error> {
+        let ranks = self.mem.ranks as usize;
+        if self.broken
+            || part == 0
+            || start != self.mem.rank as usize * part
+            || part * ranks != total
+        {
+            return Ok(false);
+        }
+        let Ok(part_stride) = u32::try_from(part) else {
+            return Ok(false);
+        };
+        let max_part = ArxLink::SLOT_BYTES / 4;
+        let mut off = 0usize;
+        while off < part {
+            let n = (part - off).min(max_part);
+            let f = from + (off * 4) as u64;
+            let t = to + (off * 4) as u64;
+            let mut args = self.base_args();
+            args.u64(f).u64(t).u32(part_stride).u32(n as u32);
+            self.finish_args(&mut args);
+            let grid = ((n * ranks) as u32 / (THREADS * 4)).clamp(1, self.max_grid(64));
+            self.ctx.programmatic(false);
+            self.ctx.launch(
+                &self.gather_rows,
+                (grid, 1, 1),
+                (THREADS, 1, 1),
+                0,
+                &mut args,
+            )?;
+            off += n;
+        }
+        Ok(true)
+    }
 }
 
 impl<D> Sum for Arx<D>
@@ -299,9 +412,38 @@ where
         total: usize,
         rows: usize,
     ) -> Result<bool, tessera_run::Error> {
-        self.launch_gather(from, to, part, total, rows)
-            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))
+        arx_err(self.launch_gather(from, to, part, total, rows))
     }
+
+    fn gather_rows(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        part: usize,
+        total: usize,
+    ) -> Result<bool, tessera_run::Error> {
+        arx_err(self.launch_gather_rows(from, to, start, part, total))
+    }
+
+    fn reduce_scatter(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        len: usize,
+        total: usize,
+        wire: DType,
+    ) -> Result<bool, tessera_run::Error> {
+        if !self.carries(wire) {
+            return Err(tessera_run::Error::Wire(wire));
+        }
+        arx_err(self.launch_rs(from, to, start, len, total, wire))
+    }
+}
+
+fn arx_err<T>(res: Result<T, Error>) -> Result<T, tessera_run::Error> {
+    res.map_err(|e| tessera_run::Error::Sums(Box::new(e)))
 }
 
 struct Start(ArxLink);

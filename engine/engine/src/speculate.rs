@@ -59,6 +59,33 @@ impl Sum for SharedSum {
         self.0.borrow_mut().gather(from, to, part, total, rows)
     }
 
+    fn reduce_scatter(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        len: usize,
+        total: usize,
+        wire: DType,
+    ) -> Result<bool, RunError> {
+        self.0
+            .borrow_mut()
+            .reduce_scatter(from, to, start, len, total, wire)
+    }
+
+    fn gather_rows(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        part: usize,
+        total: usize,
+    ) -> Result<bool, RunError> {
+        self.0
+            .borrow_mut()
+            .gather_rows(from, to, start, part, total)
+    }
+
     fn capturable(&self) -> bool {
         self.0.borrow().capturable()
     }

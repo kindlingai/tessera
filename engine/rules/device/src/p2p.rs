@@ -14,9 +14,14 @@ use tessera_run::Sum;
 const KERNEL: &str = include_str!("p2p/p2p.kernel");
 const ENTRY: &str = "tessera_p2p_sum";
 const GATHER_ENTRY: &str = "tessera_p2p_gather";
+const GATHER_ROWS_ENTRY: &str = "tessera_p2p_gather_rows";
 const BF16_ENTRY: &str = "tessera_p2p_sum_bf16";
 const FP16_ENTRY: &str = "tessera_p2p_sum_fp16";
 const FP8_ENTRY: &str = "tessera_p2p_sum_fp8";
+const RS_ENTRY: &str = "tessera_p2p_rs";
+const RS_BF16_ENTRY: &str = "tessera_p2p_rs_bf16";
+const RS_FP16_ENTRY: &str = "tessera_p2p_rs_fp16";
+const RS_FP8_ENTRY: &str = "tessera_p2p_rs_fp8";
 
 /// Maximum ranks in one P2P group.
 const MAX_RANKS: usize = 8;
@@ -145,9 +150,14 @@ pub struct P2p<D: Device> {
     ctx: D,
     kernel: D::Kernel,
     gather_kernel: D::Kernel,
+    gather_rows_kernel: D::Kernel,
     bf16_kernel: D::Kernel,
     fp16_kernel: D::Kernel,
     fp8_kernel: D::Kernel,
+    rs_kernel: D::Kernel,
+    rs_bf16_kernel: D::Kernel,
+    rs_fp16_kernel: D::Kernel,
+    rs_fp8_kernel: D::Kernel,
     _peers: Peers<D>,
     _area: DeviceBuffer<D>,
     areas: DeviceBuffer<D>,
@@ -238,9 +248,14 @@ where
         let text = format!("#define P2P_THREADS {threads}\n{text}");
         let kernel = ctx.compile(&text, ENTRY)?;
         let gather_kernel = ctx.compile(&text, GATHER_ENTRY)?;
+        let gather_rows_kernel = ctx.compile(&text, GATHER_ROWS_ENTRY)?;
         let bf16_kernel = ctx.compile(&text, BF16_ENTRY)?;
         let fp16_kernel = ctx.compile(&text, FP16_ENTRY)?;
         let fp8_kernel = ctx.compile(&text, FP8_ENTRY)?;
+        let rs_kernel = ctx.compile(&text, RS_ENTRY)?;
+        let rs_bf16_kernel = ctx.compile(&text, RS_BF16_ENTRY)?;
+        let rs_fp16_kernel = ctx.compile(&text, RS_FP16_ENTRY)?;
+        let rs_fp8_kernel = ctx.compile(&text, RS_FP8_ENTRY)?;
 
         let area = DeviceBuffer::alloc(ctx, area_bytes(ranks))?;
         area.zero()?;
@@ -291,9 +306,14 @@ where
             ctx: ctx.clone(),
             kernel,
             gather_kernel,
+            gather_rows_kernel,
             bf16_kernel,
             fp16_kernel,
             fp8_kernel,
+            rs_kernel,
+            rs_bf16_kernel,
+            rs_fp16_kernel,
+            rs_fp8_kernel,
             _peers: peers,
             _area: area,
             areas,
@@ -396,6 +416,33 @@ where
         self.finish_launch(&self.gather_kernel, sched, grid, args)
     }
 
+    fn launch_rs(&mut self, from: u64, to: u64, part: u32, wire: DType) -> Result<(), Error> {
+        let (sched, grid, mut args) =
+            self.prepare(part as usize * 4, from, to, Some(self.large_grid))?;
+        args.u32(part);
+        let kernel = match wire {
+            DType::Bf16 => &self.rs_bf16_kernel,
+            DType::F16 => &self.rs_fp16_kernel,
+            DType::Fp8 => &self.rs_fp8_kernel,
+            _ => &self.rs_kernel,
+        };
+        self.finish_launch(kernel, sched, grid, args)
+    }
+
+    fn launch_gather_rows(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: u32,
+        part: u32,
+        limit: u32,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        let (sched, grid, mut args) = self.prepare(bytes, from, to, Some(self.large_grid))?;
+        args.u32(start).u32(part).u32(limit);
+        self.finish_launch(&self.gather_rows_kernel, sched, grid, args)
+    }
+
     fn status(&mut self) -> Result<(), Error> {
         self.ctx.finish()?;
         let mut raw = [0u8; 4];
@@ -474,6 +521,69 @@ where
             return Ok(false);
         };
         self.launch_gather(from, to, part, total, rows)
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        Ok(true)
+    }
+
+    fn reduce_scatter(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        len: usize,
+        total: usize,
+        wire: DType,
+    ) -> Result<bool, tessera_run::Error> {
+        if !self.carries(wire) {
+            return Err(tessera_run::Error::Wire(wire));
+        }
+        if self.broken {
+            return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
+                "an earlier p2p sum failed".into(),
+            ))));
+        }
+        let ranks = self.ranks as usize;
+        if len == 0 || start != self.rank as usize * len || len * ranks != total {
+            return Ok(false);
+        }
+        let Ok(part) = u32::try_from(len) else {
+            return Ok(false);
+        };
+        self.launch_rs(from, to, part, wire)
+            .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
+        Ok(true)
+    }
+
+    fn gather_rows(
+        &mut self,
+        from: u64,
+        to: u64,
+        start: usize,
+        part: usize,
+        total: usize,
+    ) -> Result<bool, tessera_run::Error> {
+        if self.broken {
+            return Err(tessera_run::Error::Sums(Box::new(Error::Plan(
+                "an earlier p2p sum failed".into(),
+            ))));
+        }
+        if total == 0 {
+            return Ok(false);
+        }
+        let ranks = self.ranks as usize;
+        let even = part > 0 && start == self.rank as usize * part && part * ranks == total;
+        if !even && total > MAX_FLOATS {
+            return Ok(false);
+        }
+        let limit = if even { part } else { 1 };
+        let (Ok(start_u), Ok(part_u), Ok(limit_u)) = (
+            u32::try_from(start),
+            u32::try_from(part),
+            u32::try_from(limit),
+        ) else {
+            return Ok(false);
+        };
+        self.launch_gather_rows(from, to, start_u, part_u, limit_u, total * 4)
             .map_err(|e| tessera_run::Error::Sums(Box::new(e)))?;
         Ok(true)
     }
