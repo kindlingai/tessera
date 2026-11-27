@@ -77,7 +77,7 @@ async fn fetch(
         client_secret: secret("CLIENT_SECRET")?,
         session_key: secret("SESSION_KEY")?.into_bytes(),
         editors,
-        origin: secret("ORIGIN")?,
+        origin: env.var("ORIGIN")?.to_string(),
         api: "https://api.github.com".into(),
         web: "https://github.com".into(),
     };

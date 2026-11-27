@@ -125,13 +125,13 @@ impl<H: Host> Site<'_, H> {
         let to = form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", &self.config.client_id)
             .append_pair("state", &state)
-            .append_pair("redirect_uri", &format!("{}/callback", self.config.origin))
+            .append_pair("redirect_uri", &format!("{}/auth", self.config.origin))
             .finish();
         let to = format!("{}/login/oauth/authorize?{to}", self.config.web);
         Response::redirect(to).with("set-cookie", session::bake(STATE, &state, STATE_LIFE))
     }
 
-    async fn callback(&self) -> Result<Response, Fault> {
+    async fn auth(&self) -> Result<Response, Fault> {
         let query = form(&self.req.query);
         let sent = session::cookie(&self.req.cookie, STATE).unwrap_or_default();
         if sent.is_empty() || !session::same(sent, field(&query, "state")) {
@@ -202,7 +202,7 @@ pub async fn serve<H: Host>(host: &H, config: &Config, req: &Request) -> Respons
     let done = match (req.method.as_str(), req.path.as_str()) {
         ("GET", path @ ("/" | "/cache" | "/limits")) => site.tab(path).await,
         ("GET", "/login") => Ok(site.login()),
-        ("GET", "/callback") => site.callback().await,
+        ("GET", "/auth") => site.auth().await,
         ("POST", "/tier") => site.retier().await,
         ("POST", "/logout") => site.logout(),
         _ => Err(Fault::new(404, "Not found.")),

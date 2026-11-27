@@ -258,9 +258,9 @@ fn board_escapes_text() {
 #[test]
 fn sign_in_sets_session() {
     let fake = Fake::default();
-    let refused = ask(&fake, "GET", "/callback?code=c&state=no", "", "");
+    let refused = ask(&fake, "GET", "/auth?code=c&state=no", "", "");
     assert_eq!(refused.status, 403);
-    let done = ask(&fake, "GET", "/callback?code=c&state=st", "", "");
+    let done = ask(&fake, "GET", "/auth?code=c&state=st", "", "");
     let cookie = &done.headers.last().unwrap().1;
     assert!(cookie.ends_with("; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"));
     let value = cookie.split_once(';').unwrap().0;
