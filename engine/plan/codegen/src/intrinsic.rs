@@ -390,7 +390,7 @@ f_fn float f_e4m3(u32 w, u32 l) {{
 {soft}#endif
 "
                     );
-                    [format!("{bits}{soft}"), format!("{bits}{cuda}")]
+                    [METAL_E4M3.into(), format!("{bits}{cuda}")]
                 },
                 text: |p, args| p.spell("f_e4m3", args),
                 wgsl: None,
@@ -651,10 +651,13 @@ f_fn float f_e4m3(u32 w, u32 l) {{
             }
             /// `w.e2m1(low)`: 4 bits read as an e2m1.
             E2M1 = method e2m1(self, u32) -> f32 {
-                device: both(&format!(
-                    "{}#define f_e2m1(w, l) f_e2m1_bits(f_field(w, l, 4))\n",
-                    widen("f_e2m1_bits", 2, 1)
-                )),
+                device: spelled(
+                    METAL_E2M1,
+                    &format!(
+                        "{}#define f_e2m1(w, l) f_e2m1_bits(f_field(w, l, 4))\n",
+                        widen("f_e2m1_bits", 2, 1)
+                    ),
+                ),
                 text: |p, args| p.spell("f_e2m1", args),
                 wgsl: None,
                 host: |g, args, mask| g.narrow(args, mask, 4, |x| f32::from(E2M1(x as u8))),
@@ -692,12 +695,13 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
             }
             /// `round_f16(x)`: `x` to f16, nearest even, 65504 at most.
             RoundF16 = fn round_f16(f32) -> f32 {
-                device: rounded(
-                    "f16",
-                    [5, 10],
-                    65504.0,
-                    530,
-                    "f_fn float f_rounded_f16(float x) {
+                device: {
+                    let [_, cuda] = rounded(
+                        "f16",
+                        [5, 10],
+                        65504.0,
+                        530,
+                        "f_fn float f_rounded_f16(float x) {
     unsigned short h;
     float r;
     asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(fminf(fmaxf(x, -65504.0f), 65504.0f)));
@@ -705,7 +709,9 @@ f_fn u32 f_pair_bf16(float hi, float lo) {{
     return r;
 }
 ",
-                ),
+                    );
+                    [METAL_ROUND_F16.into(), cuda]
+                },
                 text: |p, args| p.spell("f_round_f16", args),
                 wgsl: None,
                 host: |g, args, mask| g.unary(args, mask, round_f16),

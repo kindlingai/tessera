@@ -586,7 +586,8 @@ jobs:
   # failure, so success reports at once and the queue drops the group.
   fail-fast:
     if: github.event_name == 'merge_group'
-    runs-on: ubuntu-slim
+    # It lives as long as the run. ubuntu-slim stops a job at 15 minutes.
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read

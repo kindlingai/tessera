@@ -163,6 +163,32 @@ fn rounder(name: &str, [e, m]: [u32; 2], top: f32, [from, to]: [&str; 2]) -> Str
     )
 }
 
+/// Metal branchless E4M3 decode via native `half`.
+const METAL_E4M3: &str = "f_fn float f_e4m3_bits(u32 x) {
+    u32 s = (x & 0x80u) << 8;
+    u32 m = x & 0x7fu;
+    half norm = as_type<half>((u16)(s | ((m << 7) + 0x2000u)));
+    half sub = as_type<half>((u16)(s | 0x1800u)) * (half)m;
+    return (float)select(norm, sub, m < 8u);
+}
+#define f_e4m3(w, l) f_e4m3_bits(f_field(w, l, 8))
+";
+
+/// Metal 16-entry constant table for E2M1 nibbles.
+const METAL_E2M1: &str = "constant float f_e2m1_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+#define f_e2m1(w, l) f_e2m1_lut[f_field(w, l, 4)]
+";
+
+/// Metal native `half` cast for `round_f16`.
+const METAL_ROUND_F16: &str = "f_fn float f_rounded_f16(float x) {
+    return (float)(half)clamp(x, -65504.0f, 65504.0f);
+}
+#define f_round_f16(x) f_rounded_f16(x)
+";
+
 /// `f_{call}(x)` by soft rounding, or CUDA's own text from `arch`.
 fn rounded(call: &str, eb: [u32; 2], top: f32, arch: u32, cuda: &str) -> [String; 2] {
     let name = format!("f_rounded_{call}");

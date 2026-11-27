@@ -60,4 +60,10 @@ fn every_intrinsic_spelled() {
             }
         }
     }
+    let e2m1 = call(Intrinsic::E2M1).text().render(Dialect::Metal);
+    assert!(e2m1.contains("f_e2m1_lut[16]"));
+    let e4m3 = call(Intrinsic::E4M3).text().render(Dialect::Metal);
+    assert!(e4m3.contains("as_type<half>"));
+    let round = call(Intrinsic::RoundF16).text().render(Dialect::Metal);
+    assert!(round.contains("(float)(half)clamp"));
 }
