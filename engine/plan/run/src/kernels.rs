@@ -41,7 +41,7 @@ fn launch_threads(step: &Step) -> u32 {
     step.launches().into_iter().map(threads).max().unwrap_or(1)
 }
 
-/// Resource counts and active CTAs/SM for each non-resident step.
+/// Resource counts and active CTAs/SM for each step.
 pub(crate) fn step_attrs<D: Device>(
     ctx: &D,
     plan: &Plan,
@@ -50,11 +50,15 @@ pub(crate) fn step_attrs<D: Device>(
 ) -> Vec<Option<KernelAttrs>> {
     let mut out = Vec::with_capacity(plan.steps.len());
     for i in 0..plan.steps.len() {
-        let attr = match resident[i] {
-            true => None,
-            false => ctx.attrs(&kernels[i], launch_threads(&plan.steps[i]), 0),
+        let step = &plan.steps[i];
+        let (threads, shared) = match step.kernel.resident().filter(|_| resident[i]) {
+            Some(r) => (r.threads, r.shared),
+            None => (
+                launch_threads(step),
+                u32::try_from(step.kernel.needs().dynamic_shared).unwrap_or(u32::MAX),
+            ),
         };
-        out.push(attr);
+        out.push(ctx.attrs(&kernels[i], threads, shared));
     }
     out
 }

@@ -13,7 +13,9 @@ use tessera_engine_settings::{Memory, Reads};
 use tessera_gpukit::{Limits, Platform};
 use tessera_graph::DimName;
 use tessera_lower::form::{F32_FORM, Load};
-use tessera_lower::{Filed, Launch, Launching, Loaded, Plan, Share, Slot, Weight};
+use tessera_lower::{
+    Arg, Extent, Filed, Launch, Launching, Loaded, Plan, Shape, Share, Slot, Weight,
+};
 use tessera_mem::{Tensor, View, copy};
 
 /// State every runner keeps: a plan, its buffers and sizes.
@@ -101,6 +103,29 @@ impl Base {
         };
         let unbound = self.launches[step].get_or_init(|| self.plan.steps[step].launches());
         unbound.iter().map(bound).collect()
+    }
+
+    /// Runtime dimensions referenced by `steps`, sorted and unique.
+    pub(crate) fn step_dims(&self, steps: Range<usize>) -> Vec<DimName> {
+        let mut dims = Vec::new();
+        for step in steps {
+            let unbound = self.launches[step].get_or_init(|| self.plan.steps[step].launches());
+            for launch in unbound {
+                for arg in &launch.args {
+                    if let Arg::Size(Extent::Dim { name, .. })
+                    | Arg::Buffer(_, Extent::Dim { name, .. }) = *arg
+                    {
+                        dims.push(name);
+                    }
+                }
+                if let Shape::Runtime(Extent::Dim { name, .. }) = launch.shape {
+                    dims.push(name);
+                }
+            }
+        }
+        dims.sort_unstable();
+        dims.dedup();
+        dims
     }
 }
 

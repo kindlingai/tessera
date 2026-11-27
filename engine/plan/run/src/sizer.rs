@@ -2,9 +2,10 @@
 
 use crate::Error;
 use crate::run::{Base, Run};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::{Add, Range};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tessera_codegen::Precision;
 use tessera_engine_settings::Settings;
 use tessera_gpukit::platform::{host_available, host_memory};
@@ -70,24 +71,64 @@ impl Tracked {
     }
 }
 
-/// Each sizing runner's sizes, once sizing is on.
-static SIZED: Mutex<Option<Tracked>> = Mutex::new(None);
+thread_local! {
+    static ACTIVE: RefCell<Option<Arc<Mutex<Tracked>>>> = const { RefCell::new(None) };
+}
 
-/// From now on, `open` gives runners that only count bytes.
-pub fn sizing() {
-    let mut sized = SIZED.lock().expect("sizes");
-    *sized = Some(Tracked::default());
+/// Active sizing tracker that worker threads may inherit.
+#[derive(Clone)]
+pub struct Scope(Arc<Mutex<Tracked>>);
+
+impl Scope {
+    /// Runs `f` with this sizing tracker active on this thread.
+    pub fn run<R>(self, f: impl FnOnce() -> R) -> R {
+        struct Reset(Option<Arc<Mutex<Tracked>>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACTIVE.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+        let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(self.0));
+        let _reset = Reset(prev);
+        f()
+    }
+}
+
+/// Active sizing scope on the current thread, if any.
+pub fn current_scope() -> Option<Scope> {
+    ACTIVE.with(|cell| cell.borrow().clone().map(Scope))
+}
+
+/// Guard keeping byte-counting sizing mode active on this thread.
+#[must_use]
+pub struct SizerGuard {
+    tracked: Arc<Mutex<Tracked>>,
+    prev: Option<Arc<Mutex<Tracked>>>,
+}
+
+impl SizerGuard {
+    /// Peak bytes of runners live together under this guard.
+    pub fn sized(&self) -> Sizes {
+        self.tracked.lock().expect("sizes").peak
+    }
+}
+
+impl Drop for SizerGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|cell| *cell.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Turns on byte-counting runners until the returned guard drops.
+pub fn sizing() -> SizerGuard {
+    let tracked = Arc::new(Mutex::new(Tracked::default()));
+    let prev = ACTIVE.with(|cell| cell.borrow_mut().replace(tracked.clone()));
+    SizerGuard { tracked, prev }
 }
 
 /// Whether `open` gives runners that only count bytes.
 pub fn counting() -> bool {
-    SIZED.lock().expect("sizes").is_some() || crate::check::active()
-}
-
-/// The peak bytes of runners live together since `sizing`.
-pub fn sized() -> Sizes {
-    let sized = SIZED.lock().expect("sizes");
-    sized.as_ref().map_or(Sizes::default(), |t| t.peak)
+    ACTIVE.with(|cell| cell.borrow().is_some()) || crate::check::active()
 }
 
 /// Host memory: total, then available without swapping.
@@ -151,6 +192,7 @@ where
 
 /// Byte counter dropped when its sizing runner closes.
 struct Counter {
+    tracked: Arc<Mutex<Tracked>>,
     at: usize,
     scratch: HashMap<u32, Vec<u64>>,
 }
@@ -190,17 +232,13 @@ impl Counter {
         sizes.scratch = self.scratch.values().flatten().sum();
         let largest = plan.weights.iter().map(|l| l.slot.bytes() as u64).max();
         sizes.largest = largest.unwrap_or(0);
-        let mut sized = SIZED.lock().expect("sizes");
-        if let Some(tracked) = sized.as_mut() {
-            tracked.record(self.at, sizes);
-        }
+        self.tracked.lock().expect("sizes").record(self.at, sizes);
     }
 }
 
 impl Drop for Counter {
     fn drop(&mut self) {
-        if let Ok(mut sized) = SIZED.lock()
-            && let Some(tracked) = sized.as_mut()
+        if let Ok(mut tracked) = self.tracked.lock()
             && let Some(entry) = tracked.live.get_mut(self.at)
         {
             *entry = None;
@@ -214,13 +252,14 @@ pub(crate) struct Sizer;
 impl Sizer {
     /// A sizer for `plan`, if sizing is on.
     pub(crate) fn open(plan: &Plan, settings: &Settings) -> Option<Box<dyn Run>> {
+        let tracked = ACTIVE.with(|cell| cell.borrow().clone())?;
         let at = {
-            let mut sized = SIZED.lock().expect("sizes");
-            let tracked = sized.as_mut()?;
-            tracked.live.push(None);
-            tracked.live.len() - 1
+            let mut guard = tracked.lock().expect("sizes");
+            guard.live.push(None);
+            guard.live.len() - 1
         };
         let mut counter = Counter {
+            tracked,
             at,
             scratch: HashMap::new(),
         };

@@ -6,6 +6,7 @@ use crate::marks;
 use crate::profile::Marks;
 use crate::rank::Sum;
 use crate::run::Run;
+use std::fmt;
 use std::ops::Range;
 use std::time::Instant;
 use tessera_gpukit::device::Device;
@@ -107,6 +108,12 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             &self.attrs,
             self.base.profile.as_mut(),
         )
+    }
+
+    pub(super) fn note_cold(&mut self, phase: &str, since: Instant, detail: impl fmt::Display) {
+        let secs = since.elapsed().as_secs_f64();
+        self.note(phase, secs);
+        eprintln!("tessera: cold {phase} ({detail}) {:.2}ms", secs * 1e3);
     }
 
     pub(super) fn ensure_stamps(

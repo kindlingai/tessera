@@ -245,7 +245,8 @@ pub trait Device: Clone + Send + Sync + 'static {
     }
 }
 
-type KernelMap<K> = OnceLock<Mutex<HashMap<(usize, &'static str), K>>>;
+type KernelKey = ((usize, usize), (usize, usize), &'static str);
+type KernelMap<K> = OnceLock<Mutex<HashMap<KernelKey, K>>>;
 
 /// One backend's context and kernels, made on first use.
 pub struct Caches<D: Device> {
@@ -279,7 +280,7 @@ pub fn cached_context<D: Device>() -> Result<&'static D, Error> {
 /// Keyed by address. Each embedded image builds once.
 fn lookup<D: Device>(
     map: &KernelMap<D::Kernel>,
-    key: (usize, &'static str),
+    key: KernelKey,
     build: impl FnOnce(&D) -> Result<D::Kernel, Error>,
 ) -> Result<D::Kernel, Error> {
     let map = map.get_or_init(Default::default);
@@ -296,8 +297,24 @@ pub fn cached_source<D: Device>(
     source: &'static str,
     entry: &'static str,
 ) -> Result<D::Kernel, Error> {
-    let key = (source.as_ptr() as usize, entry);
-    lookup(&D::caches().sources, key, |c: &D| c.compile(source, entry))
+    cached_prefixed::<D>("", source, entry)
+}
+
+/// Compile `prefix` before `source`, once per process.
+pub fn cached_prefixed<D: Device>(
+    prefix: &'static str,
+    source: &'static str,
+    entry: &'static str,
+) -> Result<D::Kernel, Error> {
+    let pkey = match prefix.is_empty() {
+        true => (0, 0),
+        false => (prefix.as_ptr() as usize, prefix.len()),
+    };
+    let key = (pkey, (source.as_ptr() as usize, source.len()), entry);
+    lookup(&D::caches().sources, key, |c: &D| match prefix.is_empty() {
+        true => c.compile(source, entry),
+        false => c.compile(&format!("{prefix}{source}"), entry),
+    })
 }
 
 /// A device allocation, freed on drop.

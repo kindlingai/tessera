@@ -71,7 +71,7 @@ fn ranks_match() {
 
 #[test]
 fn sizes_ranks_offline() {
-    tessera_engine::sizer::sizing();
+    let guard = tessera_engine::sizer::sizing();
     let mut ranks = Ranks::default();
     ranks.flag("--rank", "1").unwrap();
     ranks.flag("--peers", "127.0.0.1:1,127.0.0.2:1").unwrap();
@@ -85,5 +85,5 @@ fn sizes_ranks_offline() {
     let g = stepper::<Norm, Swiglu>(&decoder::Config::qwen3_small());
     let at = (&Recipe::default(), &settings);
     let _engine = ranks.open(links, g, 16, at).unwrap();
-    assert!(tessera_engine::sizer::sized().weights > 0);
+    assert!(guard.sized().weights > 0);
 }

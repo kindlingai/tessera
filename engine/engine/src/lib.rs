@@ -929,6 +929,7 @@ impl Engine {
             &[Context, Segments],
             &self.device,
         )?;
+        let lowered = Instant::now();
         let outputs = plan.outputs.iter().map(|o| o.slot).collect();
         self.runner.replan(plan)?;
         let planned = Instant::now();
@@ -952,6 +953,7 @@ impl Engine {
         let ran = Instant::now();
         let phases = [
             ("engine: plan", start, planned),
+            ("plan: lower", start, lowered),
             ("engine: feed", planned, fed),
             ("engine: steps", fed, ran),
             ("engine: launch", start, ran),

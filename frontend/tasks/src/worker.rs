@@ -15,9 +15,14 @@ impl<T: 'static> Worker<T> {
     pub fn spawn(open: impl FnOnce() -> Result<T, Error> + Send + 'static) -> Result<Self, Error> {
         let (work, queue) = mpsc::channel::<Work<T>>();
         let (ready, opened) = mpsc::channel();
-        let scope = tessera_engine::check::current_scope();
+        let check = tessera_engine::check::current_scope();
+        let sizer = tessera_engine::sizer::current_scope();
         std::thread::spawn(move || {
-            let result = match scope {
+            let open = || match sizer {
+                Some(scope) => scope.run(open),
+                None => open(),
+            };
+            let result = match check {
                 Some(scope) => scope.run(open),
                 None => open(),
             };

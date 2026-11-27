@@ -470,12 +470,12 @@ fn plan_graphs_stay() {
     runner.submit(0..1).unwrap();
     assert_eq!(ctx.counts(), (2, 0, compiles, 3, 6));
 
-    // A new runtime binding keeps the previous binding cached.
+    // Unreferenced runtime bindings keep reusing the cached graph.
     runner.bind(Context, 32);
     runner.submit(0..1).unwrap();
     runner.bind(Context, 16);
     runner.submit(0..1).unwrap();
-    assert_eq!(ctx.counts(), (2, 0, compiles, 4, 8));
+    assert_eq!(ctx.counts(), (2, 0, compiles, 3, 8));
 }
 
 #[test]

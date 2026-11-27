@@ -69,9 +69,9 @@ fn plan(
     (free, integrated, attic): (u64, bool, u64),
     out: &mut Value,
 ) -> Result<(), Stop> {
-    sizer::sizing();
+    let guard = sizer::sizing();
     crate::task::load(options)?;
-    let sizes = sizer::sized();
+    let sizes = guard.sized();
     // Integrated devices share host memory with load copies.
     let (free, copy) = match integrated {
         true => (free.min(sizer::host()[1]), sizes.largest),

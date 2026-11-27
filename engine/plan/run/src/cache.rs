@@ -11,7 +11,7 @@ use tessera_lower::{Launch as Call, Plan};
 pub(crate) const MAX_PLANS: usize = 64;
 
 /// Most `(plan, bound)` graph sets kept alive at once.
-pub(crate) const MAX_GRAPHS: usize = 64;
+pub(crate) const MAX_GRAPHS: usize = 256;
 
 /// Plan id and bound dims sharing one graph set.
 pub(crate) type GraphKey = (u64, Vec<(DimName, u32)>);
@@ -60,6 +60,7 @@ pub(crate) struct Prepared<K> {
     pub(crate) waits: Vec<bool>,
     pub(crate) resident: Vec<bool>,
     pub(crate) attrs: Vec<Option<KernelAttrs>>,
+    pub(crate) range_dims: HashMap<(usize, usize), Vec<DimName>>,
 }
 
 /// Bounded map evicting the least recently used entry.
@@ -113,6 +114,23 @@ impl<K: Eq + Hash + Clone, V> Lru<K, V> {
         self.touch(&key);
         self.entries.insert(key, value);
         evicted
+    }
+
+    /// Removes entries matching `drop_when` and returns them.
+    pub(crate) fn drain_if(&mut self, mut drop_when: impl FnMut(&V) -> bool) -> Vec<V> {
+        let mut dropped = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.order.len());
+        for key in std::mem::take(&mut self.order) {
+            if self.entries.get(&key).is_some_and(&mut drop_when) {
+                if let Some(value) = self.entries.remove(&key) {
+                    dropped.push(value);
+                }
+            } else {
+                kept.push_back(key);
+            }
+        }
+        self.order = kept;
+        dropped
     }
 
     pub(crate) fn clear(&mut self) {

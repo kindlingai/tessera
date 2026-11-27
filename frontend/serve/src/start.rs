@@ -283,18 +283,28 @@ fn spawn_all(mut options: Options) -> (Models, Receiver<String>) {
     let also = std::mem::take(&mut options.also);
     let (failures, failed) = channel();
     let mut named = Vec::new();
-    let scope = tessera_engine::check::current_scope();
+    let check = tessera_engine::check::current_scope();
+    let sizer = tessera_engine::sizer::current_scope();
     for options in std::iter::once(options).chain(also) {
         let slot = Slot::default();
         named.push((options.served(), slot.clone()));
-        let (turns, failures, scope) = (turns.clone(), failures.clone(), scope.clone());
+        let (turns, failures, check, sizer) = (
+            turns.clone(),
+            failures.clone(),
+            check.clone(),
+            sizer.clone(),
+        );
         std::thread::spawn(move || {
             let run = || {
                 if let Err(e) = load(options, slot, &turns) {
                     let _ = failures.send(e);
                 }
             };
-            match scope {
+            let run = || match sizer {
+                Some(scope) => scope.run(run),
+                None => run(),
+            };
+            match check {
                 Some(scope) => scope.run(run),
                 None => run(),
             }
