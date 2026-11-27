@@ -115,6 +115,12 @@ impl<T> Default for Kernels<T> {
     }
 }
 
+impl<T> Kernels<T> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.made.is_empty() && self.known.is_empty()
+    }
+}
+
 impl<T: Clone> Kernels<T> {
     /// `step`'s kernel, compiled once. True when generated.
     pub(crate) fn get(

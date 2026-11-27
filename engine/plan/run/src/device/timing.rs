@@ -22,6 +22,12 @@ impl<D: Device> Runner<D> {
         std::mem::forget(std::mem::replace(&mut self.graphs, Lru::new(0)));
         std::mem::forget(std::mem::take(&mut self.evicted));
         std::mem::forget(std::mem::take(&mut self.retired));
+        std::mem::forget(std::mem::take(&mut self.kernels));
+        std::mem::forget(std::mem::take(&mut self.planned));
+        std::mem::forget(self.overrides.take());
+        std::mem::forget(std::mem::take(&mut self.marked));
+        std::mem::forget(std::mem::take(&mut self.compiled));
+        std::mem::forget(std::mem::replace(&mut self.plans, Lru::new(0)));
         std::mem::forget(std::mem::take(&mut self.base.held));
         std::mem::forget(self.ledger.take());
         std::mem::forget(self.stamps.take());
@@ -36,6 +42,12 @@ impl<D: Device> Drop for Runner<D> {
         let live = !self.graphs.is_empty()
             || !self.evicted.is_empty()
             || !self.retired.is_empty()
+            || !self.kernels.is_empty()
+            || !self.planned.is_empty()
+            || self.overrides.is_some()
+            || !self.marked.is_empty()
+            || !self.compiled.is_empty()
+            || !self.plans.is_empty()
             || self.base.held.total() > 0
             || self.ledger.is_some()
             || self.stamps.is_some()
@@ -50,7 +62,7 @@ impl<D: Device> Drop for Runner<D> {
             self.retain();
             return;
         }
-        // Drop captured graphs and grid before buffers.
+        // Drop captured graphs and grid before buffers and kernels.
         self.graphs.clear();
         self.evicted.clear();
         self.retired.clear();
@@ -310,8 +322,15 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Runner<D> {
             }
         }
         if changed {
-            // Recorded launches name the kernels they replaced.
-            self.clear_graphs()?;
+            // Recorded launches and eager kernels must finish before unload.
+            if self.graphs.is_empty() && self.evicted.is_empty() {
+                if let Err(e) = self.ctx.finish() {
+                    self.dirty = true;
+                    return Err(e.into());
+                }
+            } else {
+                self.clear_graphs()?;
+            }
         }
         let files = self.overrides.as_mut().expect("checked above");
         let mut reloads = Vec::new();
