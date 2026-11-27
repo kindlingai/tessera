@@ -11,9 +11,10 @@ use syn::{
 };
 
 /// Keys that take `= expr`.
-const VALUES: [&str; 19] = [
-    "name", "threads", "sizes", "work", "needs", "order", "load", "accepts", "emits", "emits_at",
-    "guess", "runs_on", "source", "launches", "crate", "variant", "wire", "commit", "shape",
+const VALUES: [&str; 20] = [
+    "name", "threads", "sizes", "work", "needs", "order", "load", "load_key", "accepts", "emits",
+    "emits_at", "guess", "runs_on", "source", "launches", "crate", "variant", "wire", "commit",
+    "shape",
 ];
 
 /// Keys that stand alone.
@@ -288,6 +289,10 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
             Some(load)
         })
     });
+    let load_key = line.expr("load_key").map(|e| {
+        let call = applied(e, &[quote!(self)]);
+        quote!(fn load_key(&self) -> Option<u64> { Some(#call) })
+    });
     let accepts = line.expr("accepts").map(|e| {
         let call = applied(e, &[quote!(self), quote!(input), quote!(form)]);
         quote!(fn accepts(&self, input: usize, form: &dyn #krate::form::Load) -> bool { #call })
@@ -318,6 +323,7 @@ pub fn derive(input: DeriveInput) -> Result<Tokens, Error> {
             #order
             #wire
             #load
+            #load_key
             #accepts
             #emits
             #emits_at

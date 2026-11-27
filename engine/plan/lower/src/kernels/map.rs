@@ -9,6 +9,7 @@ use crate::sites;
 use crate::sites::After;
 use crate::tree::{T, Tree};
 use std::cmp::Ordering;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use tessera_codegen::ir::{BinOp, Body, Expr, Intrinsic, Param, Stmt};
 use tessera_codegen::prelude::*;
 use tessera_codegen::stage::Row;
@@ -71,6 +72,7 @@ pub enum MapStage {
     accepts = map_accepts,
     emits = map_emits,
     load = map_load,
+    load_key = map_load_key,
     source = map_source,
     launches = map_launches,
 )]
@@ -263,6 +265,59 @@ fn map_accepts(k: &Map, input: usize, form: &dyn Stored) -> bool {
 
 fn map_emits(k: &Map, form: &dyn Stored) -> bool {
     k.3.name() == form.name()
+}
+
+/// Hashes elementwise stages into `h` for unmeasured cost caching.
+pub fn hash_stages(stages: &[MapStage], h: &mut impl Hasher) {
+    stages.len().hash(h);
+    for stage in stages {
+        match *stage {
+            MapStage::Add => 0u8.hash(h),
+            MapStage::Mul => 1u8.hash(h),
+            MapStage::Scale(by) => {
+                2u8.hash(h);
+                by.to_bits().hash(h);
+            }
+            MapStage::Shift(by) => {
+                3u8.hash(h);
+                by.to_bits().hash(h);
+            }
+            MapStage::Min(hi) => {
+                4u8.hash(h);
+                hi.to_bits().hash(h);
+            }
+            MapStage::Max(lo) => {
+                5u8.hash(h);
+                lo.to_bits().hash(h);
+            }
+            MapStage::Act(act) => {
+                6u8.hash(h);
+                let tag: u8 = match act {
+                    Act::GeluTanh => 0,
+                    Act::Silu => 1,
+                    Act::Sigmoid => 2,
+                    Act::Relu => 3,
+                    Act::Softplus => 4,
+                    Act::Exp => 5,
+                    Act::Tanh => 6,
+                    Act::SignedSqrt => 7,
+                };
+                tag.hash(h);
+            }
+        }
+    }
+}
+
+fn map_load_key(k: &Map) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_stages(&k.0, &mut h);
+    k.1.hash(&mut h);
+    k.2.len().hash(&mut h);
+    for form in &k.2 {
+        form.name().hash(&mut h);
+    }
+    k.3.name().hash(&mut h);
+    h.finish()
 }
 
 /// One thread per element, each on its own lines.

@@ -2,10 +2,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use tessera_codegen::ir::{BinOp, Body, Expr, Stmt, Ty};
 use tessera_codegen::{Dialect, hash};
 use tessera_lower::form::{F32_FORM, Load as Stored, plain, writable};
-use tessera_lower::kernels::{add_operand_forms, finish};
+use tessera_lower::kernels::{add_operand_forms, finish, hash_stages};
 use tessera_lower::sites;
 use tessera_lower::sites::{After, Near, Picked};
 use tessera_lower::{Launch, Read, Shape, Source, Step, T, Tree};
@@ -135,6 +136,34 @@ impl Product {
 
     pub(crate) fn work(&self) -> f64 {
         (self.m * self.n * self.k) as f64
+    }
+
+    /// Hash of every product field affecting `load()`.
+    pub(crate) fn load_key(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        (self.m, self.n, self.k).hash(&mut h);
+        self.form.name().hash(&mut h);
+        self.x_form.name().hash(&mut h);
+        self.out_form.name().hash(&mut h);
+        self.other_forms.len().hash(&mut h);
+        for form in &self.other_forms {
+            form.name().hash(&mut h);
+        }
+        self.after.sum.hash(&mut h);
+        hash_stages(&self.after.stages, &mut h);
+        self.picked
+            .map(|p| (p.count, p.stride, p.offset, p.repeat, p.first))
+            .hash(&mut h);
+        self.near.map(|n| (n.pixels, n.cin, n.taps)).hash(&mut h);
+        h.finish()
+    }
+
+    /// Combines the product load key with kernel-specific fields.
+    pub(crate) fn key_with(&self, extra: impl Hash) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.load_key().hash(&mut h);
+        extra.hash(&mut h);
+        h.finish()
     }
 
     pub(crate) fn accepts(&self, input: usize, form: &dyn Stored) -> bool {

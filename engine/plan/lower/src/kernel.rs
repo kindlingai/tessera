@@ -50,6 +50,10 @@ pub trait Kernel: fmt::Debug + Send + Sync {
     fn load(&self, _: usize) -> Option<Load> {
         None
     }
+    /// Key over `load()` inputs, allowing unmeasured estimate caching.
+    fn load_key(&self) -> Option<u64> {
+        None
+    }
     /// Whether it writes over its first input.
     fn overwrites(&self) -> bool {
         false

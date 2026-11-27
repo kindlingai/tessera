@@ -349,6 +349,8 @@ fn timings_prefer_source() {
 struct CountingMade {
     calls: Arc<AtomicUsize>,
     loads: Option<Arc<AtomicUsize>>,
+    key: Option<u64>,
+    scale: bool,
 }
 
 impl std::fmt::Debug for CountingMade {
@@ -363,12 +365,25 @@ impl Kernel for CountingMade {
     }
     fn source(&self) -> Source {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Map::plain(vec![MapStage::Add]).source()
+        let stage = if self.scale {
+            MapStage::Scale(1.5)
+        } else {
+            MapStage::Add
+        };
+        Map::plain(vec![stage]).source()
     }
     fn load(&self, len: usize) -> Option<tessera_lower::Load> {
         let loads = self.loads.as_ref()?;
         loads.fetch_add(1, Ordering::Relaxed);
-        Map::plain(vec![MapStage::Add]).load(len)
+        let stage = if self.scale {
+            MapStage::Scale(1.5)
+        } else {
+            MapStage::Add
+        };
+        Map::plain(vec![stage]).load(len)
+    }
+    fn load_key(&self) -> Option<u64> {
+        self.key
     }
     fn launches(&self, _: &Step) -> Vec<Launch> {
         Vec::new()
@@ -399,6 +414,8 @@ fn made_identity_no_leak() {
         CountingMade {
             calls: Arc::clone(&calls),
             loads: None,
+            key: None,
+            scale: false,
         },
         16,
     );
@@ -416,6 +433,8 @@ fn made_identity_no_leak() {
     let k = KernelRef::new(CountingMade {
         calls: Arc::clone(&entry_calls),
         loads: None,
+        key: None,
+        scale: false,
     });
     let first = k.entry();
     for _ in 0..100 {
@@ -458,11 +477,15 @@ fn unmeasured_skips_source() {
     let k = CountingMade {
         calls: Arc::clone(&calls),
         loads: None,
+        key: None,
+        scale: false,
     };
     let step = step_of(
         CountingMade {
             calls: Arc::clone(&calls),
             loads: None,
+            key: None,
+            scale: false,
         },
         16,
     );
@@ -475,21 +498,27 @@ fn unmeasured_skips_source() {
     assert!(calls.load(Ordering::Relaxed) > 0);
 }
 
-#[test]
-fn unmeasured_caches_chip_model() {
-    let dev = Device::default().on(tessera_lower::Platform {
+fn gb10_device() -> Device {
+    Device::default().on(tessera_lower::Platform {
         name: "NVIDIA GB10".into(),
         backend: "cuda".into(),
         units: 48,
         bandwidth: 273e9,
         limits: tessera_lower::Limits::assumed(),
         ..tessera_lower::Platform::default()
-    });
+    })
+}
+
+#[test]
+fn unmeasured_caches_chip_model() {
+    let dev = gb10_device();
     let calls = Arc::new(AtomicUsize::new(0));
     let loads = Arc::new(AtomicUsize::new(0));
     let k = CountingMade {
         calls: Arc::clone(&calls),
         loads: Some(Arc::clone(&loads)),
+        key: Some(1),
+        scale: false,
     };
     let first = dev.seconds(&k, 256);
     assert!(first > 0.0);
@@ -498,4 +527,59 @@ fn unmeasured_caches_chip_model() {
     }
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert_eq!(loads.load(Ordering::Relaxed), 1);
+
+    // Distinct load keys never alias on the same device.
+    let other_loads = Arc::new(AtomicUsize::new(0));
+    let other = CountingMade {
+        calls: Arc::clone(&calls),
+        loads: Some(Arc::clone(&other_loads)),
+        key: Some(2),
+        scale: true,
+    };
+    assert_eq!(
+        dev.seconds(&other, 16_777_216),
+        gb10_device().seconds(&other, 16_777_216)
+    );
+    assert_eq!(other_loads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn unmeasured_map_order_independent() {
+    let len = 16_777_216;
+    let add = Map::plain(vec![MapStage::Add]);
+    let scale = Map::plain(vec![MapStage::Scale(1.5)]);
+    assert_eq!(add.sizes(), scale.sizes());
+    assert_eq!(add.work(len), scale.work(len));
+
+    let fresh_add = gb10_device().seconds(&add, len);
+    let fresh_scale = gb10_device().seconds(&scale, len);
+    assert_ne!(fresh_add, fresh_scale);
+
+    let ab = gb10_device();
+    assert_eq!(ab.seconds(&add, len), fresh_add);
+    assert_eq!(ab.seconds(&scale, len), fresh_scale);
+
+    let ba = gb10_device();
+    assert_eq!(ba.seconds(&scale, len), fresh_scale);
+    assert_eq!(ba.seconds(&add, len), fresh_add);
+
+    // Unkeyed kernels skip model_memo and never alias across orders.
+    let mk = |scale| CountingMade {
+        calls: Arc::new(AtomicUsize::new(0)),
+        loads: Some(Arc::new(AtomicUsize::new(0))),
+        key: None,
+        scale,
+    };
+    let (u_add, u_scale) = (mk(false), mk(true));
+    let fresh_u_add = gb10_device().seconds(&u_add, len);
+    let fresh_u_scale = gb10_device().seconds(&u_scale, len);
+    assert_ne!(fresh_u_add, fresh_u_scale);
+
+    let u_ab = gb10_device();
+    assert_eq!(u_ab.seconds(&u_add, len), fresh_u_add);
+    assert_eq!(u_ab.seconds(&u_scale, len), fresh_u_scale);
+
+    let u_ba = gb10_device();
+    assert_eq!(u_ba.seconds(&u_scale, len), fresh_u_scale);
+    assert_eq!(u_ba.seconds(&u_add, len), fresh_u_add);
 }

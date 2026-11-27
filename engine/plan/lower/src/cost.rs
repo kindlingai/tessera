@@ -148,8 +148,8 @@ fn sample(step: &Step, seconds: f64) -> Sample {
 /// Seconds by zone, name, entry, source, sizes, work, coldness.
 type Memo = HashMap<(ZoneKind, &'static str, Arc<str>, u64, Vec<usize>, u64, bool), f64>;
 
-/// Unmeasured chip-model estimates by zone, name, sizes, len and work.
-type ModelMemo = HashMap<(ZoneKind, &'static str, Vec<usize>, usize, u64), Option<f64>>;
+/// Unmeasured chip-model estimates by zone, name, key, sizes, len, work.
+type ModelMemo = HashMap<(ZoneKind, &'static str, u64, Vec<usize>, usize, u64), Option<f64>>;
 
 /// Each generation is handed out once per process.
 static GENERATIONS: AtomicU64 = AtomicU64::new(1);
@@ -520,20 +520,24 @@ impl Device {
         let timed = if own { &self.timed } else { &self.host };
         let chip = self.model.as_ref().filter(|_| own);
         let modelled = || Some(chip?.estimate(&k.load(len)?).seconds);
-        // Without samples, cache chip-model estimates without source hashing.
+        // Without samples, cache chip-model estimates only for keyed kernels.
         if !timed.has(k.name()) {
             let Some(chip) = chip else {
                 return FIXED + k.guess() * work;
             };
-            let key = (kind, k.name(), k.sizes(), len, work.to_bits());
-            let cached = if let Some(&hit) = self.model_memo.borrow().get(&key) {
-                hit
+            let est = if let Some(load_key) = k.load_key() {
+                let key = (kind, k.name(), load_key, k.sizes(), len, work.to_bits());
+                if let Some(&hit) = self.model_memo.borrow().get(&key) {
+                    hit
+                } else {
+                    let est = k.load(len).map(|l| chip.estimate(&l).seconds);
+                    self.model_memo.borrow_mut().insert(key, est);
+                    est
+                }
             } else {
-                let est = k.load(len).map(|l| chip.estimate(&l).seconds);
-                self.model_memo.borrow_mut().insert(key, est);
-                est
+                k.load(len).map(|l| chip.estimate(&l).seconds)
             };
-            return cached.unwrap_or(FIXED + k.guess() * work);
+            return est.unwrap_or(FIXED + k.guess() * work);
         }
         let (entry, source) = identity();
         let key = (
