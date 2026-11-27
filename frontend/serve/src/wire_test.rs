@@ -239,3 +239,34 @@ fn openai_neutral_fields() {
         assert_eq!((status, &error["error"]["param"]), (400, &json!(key)));
     }
 }
+
+#[test]
+fn embeddings_mrl_and_multimodal() {
+    let slot = loaded(&Arc::new(MockGenerator::default()), true);
+    let mrl = json!({"input": "abc", "dimensions": 2, "encoding_format": "base64"});
+    let (status, got) = json(&slot, "/v1/embeddings", Some(mrl));
+    assert_eq!(status, 200);
+    let raw = tessera_tasks::vision::decode_base64(got["data"][0]["embedding"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(raw.len(), 8);
+    let ids = json!({"input": [1, 2, 3]});
+    assert_eq!(json(&slot, "/v1/embeddings", Some(ids)).0, 200);
+    let png_b64 = crate::base64(b"imgbytes");
+    let mm = json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{png_b64}")}},
+                {"type": "text", "text": "hi"},
+            ],
+        }],
+        "dimensions": 3,
+    });
+    let (status, got) = json(&slot, "/v1/embeddings", Some(mm));
+    assert_eq!(status, 200);
+    assert_eq!(got["data"][0]["embedding"].as_array().unwrap().len(), 3);
+    let bad_dim = json!({"input": "a", "dimensions": 0});
+    assert_eq!(json(&slot, "/v1/embeddings", Some(bad_dim)).0, 400);
+    let bad_fmt = json!({"input": "a", "encoding_format": "int8"});
+    assert_eq!(json(&slot, "/v1/embeddings", Some(bad_fmt)).0, 400);
+}
