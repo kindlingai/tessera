@@ -246,6 +246,40 @@ impl<'de> Deserialize<'de> for Pins {
     }
 }
 
+/// Whether `label` fits `at`. Layer indices may be sets: `1-26`.
+pub(crate) fn in_scope(at: &str, label: &str) -> bool {
+    // The index after `layer.` and the rest, if any.
+    fn parts(text: &str) -> Option<(&str, Option<&str>)> {
+        let rest = text.strip_prefix("layer.")?;
+        Some(
+            rest.split_once('.')
+                .map_or((rest, None), |(k, tail)| (k, Some(tail))),
+        )
+    }
+    let (Some((set, at_tail)), Some((k, tail))) = (parts(at), parts(label)) else {
+        return matches(at, label);
+    };
+    let plain = |c: char| c.is_ascii_digit() || c == ',' || c == '-';
+    let Ok(k) = k.parse::<u32>() else {
+        return false;
+    };
+    if set.is_empty() || !set.chars().all(plain) {
+        return matches(at, label);
+    }
+    let holds = |part: &str| match part.split_once('-') {
+        Some((a, b)) => {
+            a.parse().is_ok_and(|a: u32| a <= k) && b.parse().is_ok_and(|b: u32| k <= b)
+        }
+        None => part.parse() == Ok(k),
+    };
+    let tails = match (at_tail, tail) {
+        (None, None) => true,
+        (Some(a), Some(t)) => matches(a, t),
+        _ => false,
+    };
+    set.split(',').any(holds) && tails
+}
+
 /// Whether `name` fits `pattern`. A star stands for anything.
 pub(crate) fn matches(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');

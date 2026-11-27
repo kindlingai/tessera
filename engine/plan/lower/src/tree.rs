@@ -100,6 +100,8 @@ pub struct Tree<'a> {
     pub index_rows: Option<(usize, usize)>,
     /// Operand precision for matrix-unit kernels.
     pub compute: Compute,
+    /// Spot precision per graph node, when any spot sets one.
+    pub(crate) computes: Vec<Option<Compute>>,
     /// Kernel shape values the recipe set.
     pub knobs: Knobs,
     /// Model config JSON for runtime rules.
@@ -355,6 +357,7 @@ impl<'a> Tree<'a> {
             kept_rows: None,
             index_rows: None,
             compute: Compute::default(),
+            computes: Vec::new(),
             knobs: Knobs::default(),
             config: None,
             parts: parts.clone(),
@@ -549,6 +552,16 @@ impl<'a> Tree<'a> {
                 .push((t, shape.iter().map(Extent::most).collect()));
         }
         Ok(tree)
+    }
+
+    /// Matrix-unit precision at `t`, with spot overrides.
+    pub fn compute_at(&self, t: T) -> Compute {
+        let from = self.node(t).from.0 as usize;
+        self.computes
+            .get(from)
+            .copied()
+            .flatten()
+            .unwrap_or(self.compute)
     }
 
     /// The same tree, with matrix-unit precision `compute`.

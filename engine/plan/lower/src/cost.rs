@@ -4,7 +4,7 @@ use crate::form::Pins;
 use crate::kernel::Kernel;
 use crate::kernels::{crosses, moved};
 use crate::plan::{Plan, Step};
-use crate::recipe::{Compute, Knobs, Recipe};
+use crate::recipe::{Compute, Knobs, Recipe, Scoped};
 use crate::rule::{Rule, gather, rules_with};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -61,6 +61,9 @@ pub struct Device {
     /// Kernels never to choose.
     #[serde(skip)]
     barred: Vec<String>,
+    /// Choices for the nodes of some regions.
+    #[serde(skip)]
+    pub(crate) scoped: Vec<Scoped>,
     /// Rules made at run time, beside the linked ones.
     #[serde(skip)]
     made: Vec<&'static Rule>,
@@ -165,6 +168,7 @@ impl Default for Device {
             favor: None,
             require_favored: false,
             barred: Vec::new(),
+            scoped: Vec::new(),
             made: Vec::new(),
             pins: Pins::default(),
             compute: Compute::default(),
@@ -259,6 +263,7 @@ impl Device {
         self.favor = recipe.favor.clone();
         self.require_favored = recipe.require_favored;
         self.barred = recipe.barred.clone();
+        self.scoped = recipe.scoped.clone();
         self.made = recipe.rules.clone();
         self.kept = recipe.kept;
         self.kept_rows = recipe.kept_rows;
@@ -400,6 +405,17 @@ impl Device {
     /// Linked and made rules, by name.
     pub fn rules(&self) -> Vec<&'static Rule> {
         rules_with(&self.made)
+    }
+
+    /// The spot precision for nodes labelled `label`.
+    pub(crate) fn compute_at(&self, label: &str) -> Option<Compute> {
+        let fits = |s: &&Scoped| s.compute.is_some() && crate::form::in_scope(&s.at, label);
+        self.scoped.iter().rev().find(fits).and_then(|s| s.compute)
+    }
+
+    /// Whether the recipe scopes choices to regions.
+    pub(crate) fn scoped(&self) -> bool {
+        !self.scoped.is_empty()
     }
 
     pub fn favors(&self, rule: &str) -> bool {

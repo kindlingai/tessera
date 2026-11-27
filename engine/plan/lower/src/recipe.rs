@@ -5,7 +5,7 @@ use crate::rule::{Rule, gather};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 use tessera_codegen::kept::{self, Layout};
-use tessera_graph::{DType, Graph, NodeId, Op, PathSeg, sums_ranks};
+use tessera_graph::{DType, Graph, NodeId, Op, PathSeg, Region, layers, sums_ranks};
 
 /// Operand precision a matrix unit may round to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +45,9 @@ pub struct Recipe {
     /// Kernels never to choose, by name.
     #[serde(default)]
     pub barred: Vec<String>,
+    /// Choices for the nodes of some regions only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<Scoped>,
     /// How launches go to the device.
     #[serde(default)]
     pub launch: Launching,
@@ -63,6 +66,65 @@ pub struct Recipe {
     /// Model config JSON passed to runtime rules.
     #[serde(skip)]
     pub config: Option<String>,
+}
+
+/// Kernel choices for the nodes of the regions `at` names.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scoped {
+    /// A pattern over labels such as `layer.3.attention`. `*` is any run.
+    pub at: String,
+    /// A rule that wins here wherever it applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favor: Option<String>,
+    /// Rules and kernels never chosen here, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub barred: Vec<String>,
+    /// A kernel whose way wins here wherever it is offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
+    /// Matrix-unit operand precision here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute: Option<Compute>,
+}
+
+/// Each node's label: `head`, `layer.<k>[.<kind>]` or `tail`.
+pub fn labels(g: &Graph) -> Vec<String> {
+    let layers = layers(g);
+    let first = layers
+        .iter()
+        .map(|(_, i)| g.regions[*i].start.0 as usize)
+        .min()
+        .unwrap_or(0);
+    let mut out: Vec<String> = (0..g.nodes.len())
+        .map(|i| if i < first { "head" } else { "tail" }.into())
+        .collect();
+    let mut set = |r: &Region, label: String| {
+        for at in &mut out[r.start.0 as usize..r.end.0 as usize] {
+            at.clone_from(&label);
+        }
+    };
+    let kind = |r: &Region| format!("{:?}", r.kind).to_lowercase();
+    let inside = |r: &Region, o: &Region| o.start <= r.start && r.end <= o.end && r != o;
+    for (k, i) in &layers {
+        let layer = &g.regions[*i];
+        set(layer, format!("layer.{k}"));
+        for r in g.regions.iter().filter(|r| inside(r, layer)) {
+            set(r, format!("layer.{k}.{}", kind(r)));
+        }
+    }
+    // A trimmed picking layer keeps only its blocks.
+    for r in g.regions.iter().filter(|r| r.kind.block()) {
+        let held = layers.iter().any(|(_, i)| inside(r, &g.regions[*i]));
+        let before = layers.iter().filter(|(_, i)| g.regions[*i].end <= r.start);
+        let last = before
+            .max_by_key(|(_, i)| g.regions[*i].end)
+            .map(|(k, _)| k + 1);
+        if let Some(k) = last.filter(|_| !held) {
+            set(r, format!("layer.{k}.{}", kind(r)));
+        }
+    }
+    out
 }
 
 /// Wire dtypes for cross-rank sums, below model pins.
@@ -156,6 +218,7 @@ impl Default for Recipe {
             favor: None,
             require_favored: false,
             barred: Vec::new(),
+            scoped: Vec::new(),
             launch: Launching::default(),
             kept: dense(),
             kept_rows: None,

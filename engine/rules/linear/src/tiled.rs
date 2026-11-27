@@ -730,7 +730,7 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     } else {
         product.k.is_multiple_of(WIDE as usize)
     };
-    if aligned && (tree.compute == Compute::Bf16 || (direct_x && direct_w)) {
+    if aligned && (tree.compute_at(at) == Compute::Bf16 || (direct_x && direct_w)) {
         let base = 2 * SCHEDULES.len() + PARTS.len();
         for (i, schedule) in BF16.iter().enumerate() {
             let tiled = Tiled {

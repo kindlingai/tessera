@@ -2,7 +2,7 @@
 
 use crate::abi::{Shape, Source};
 use crate::cost::Device;
-use crate::form::F32_FORM;
+use crate::form::{F32_FORM, in_scope};
 use crate::kernels::{
     AllGather, AllReduce, GatherRows, Narrow, ReduceScatter, Scatter, Widen, moved,
 };
@@ -67,9 +67,28 @@ pub(crate) struct Cover<'a> {
     pub(crate) bare: Vec<T>,
     /// Whether weights are too many for the cache.
     pub(crate) streams: bool,
+    /// Each graph node's region label, when the recipe scopes choices.
+    pub(crate) labels: Option<Vec<String>>,
 }
 
-impl Cover<'_> {
+impl<'a> Cover<'a> {
+    /// The rule and kernel favored at `t`, and names barred.
+    fn scope(&self, t: T) -> (Option<&'a str>, Option<&'a str>, Vec<&'a str>) {
+        let (mut favor, mut pick, mut barred) = (None, None, Vec::new());
+        let Some(labels) = &self.labels else {
+            return (favor, pick, barred);
+        };
+        let label = &labels[self.tree.node(t).from.0 as usize];
+        for s in &self.device.scoped {
+            if in_scope(&s.at, label) {
+                favor = s.favor.as_deref().or(favor);
+                pick = s.pick.as_deref().or(pick);
+                barred.extend(s.barred.iter().map(String::as_str));
+            }
+        }
+        (favor, pick, barred)
+    }
+
     fn zones(&self) -> std::ops::Range<u32> {
         0..self.device.zones()
     }
@@ -211,6 +230,11 @@ impl Cover<'_> {
             });
         }
         let kind = self.device.cluster.kind(zone as usize);
+        let (favor, pick, barred) = self.scope(t);
+        let device = self.device;
+        let picked =
+            |drafts: &[Draft]| pick.is_some_and(|p| drafts.iter().any(|d| d.kernel.name() == p));
+        let favors = |name: &str| device.favors(name) || favor == Some(name);
         // The winning cover gets a grid check. Tall ones retry.
         let mut skip = Vec::new();
         let (best, offered, runnable, proposed) = loop {
@@ -270,6 +294,11 @@ impl Cover<'_> {
                             continue;
                         }
                     }
+                    let names =
+                        std::iter::once(rule.name).chain(drafts.iter().map(|d| d.kernel.name()));
+                    if names.into_iter().any(|name| barred.contains(&name)) {
+                        continue;
+                    }
                     // A kernel the device cannot run is not a way.
                     let platform = &self.device.platform;
                     if drafts.iter().any(|d| !d.kernel.needs().fits(platform)) {
@@ -303,14 +332,17 @@ impl Cover<'_> {
                         continue;
                     };
                     cost -= own;
-                    // A favored rule wins here. Readers see its true cost.
-                    let favored = self.device.favors(rule.name);
-                    let beaten =
-                        |b: &Choice| match (b.rule == rule.name, self.device.favors(b.rule)) {
+                    // A picked kernel wins, then a favored rule, then cost.
+                    let (mine, favored) = (picked(&drafts), favors(rule.name));
+                    let beaten = |b: &Choice| match (picked(&b.drafts), mine) {
+                        (true, false) => false,
+                        (false, true) => true,
+                        _ => match (b.rule == rule.name, favors(b.rule)) {
                             (true, _) => cost < b.cost,
                             (false, true) => false,
                             (false, false) => favored || cost < b.cost,
-                        };
+                        },
+                    };
                     let (slot, tag) = if swallowed {
                         (&mut fallback, &mut fall_won)
                     } else {

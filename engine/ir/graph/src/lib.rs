@@ -1,5 +1,6 @@
 //! The model graph: typed nodes, symbolic shapes, a JSON form.
 
+mod chain;
 mod dims;
 mod infer;
 mod json;
@@ -18,6 +19,7 @@ mod trim;
 mod types;
 mod verify;
 
+pub use chain::layers;
 pub use dims::{Dim, DimExpr, DimName, Poly, Shape, Size};
 pub use infer::{ErrorKind, TypeError, infer};
 pub use json::{FormatError, VERSION};

@@ -367,3 +367,55 @@ fn glm53_small_parity() {
         assert_eq!(got[0].indices().unwrap(), want);
     }
 }
+
+/// Kernel names of the steps that start in region `label`.
+fn kernels_at<'a>(plan: &'a Plan, labels: &[String], label: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for s in &plan.steps {
+        if labels[s.covers[0].0 as usize] == label {
+            out.push(s.kernel.name());
+        }
+    }
+    out
+}
+
+/// A scoped bar changes one layer and leaves the rest.
+#[test]
+fn scoped_bar_stays() {
+    let g = stepper::<Norm, Swiglu>(&Config::qwen3_small());
+    let sizes = [(Seqs, 4), (Rows, 1), (Context, 64)];
+    let labels = tessera_lower::labels(&g);
+    let device = Device::guess(&Settings::default());
+    let plan = lower(&g, 0, &sizes, &device).unwrap();
+    let attend = kernels_at(&plan, &labels, "layer.0.attention");
+    let kernel = *attend
+        .iter()
+        .find(|k| k.contains("attend"))
+        .expect("an attention kernel");
+    let text = format!(r#"{{"scoped": [{{"at": "layer.0.attention", "barred": ["{kernel}"]}}]}}"#);
+    let recipe: Recipe = serde_json::from_str(&text).unwrap();
+    let barred = lower(&g, 0, &sizes, &device.clone().with(&recipe)).unwrap();
+    assert!(!kernels_at(&barred, &labels, "layer.0.attention").contains(&kernel));
+    assert!(kernels_at(&barred, &labels, "layer.1.attention").contains(&kernel));
+}
+
+/// A picked kernel wins at its spot only.
+#[test]
+fn picks_stay() {
+    let g = stepper::<Norm, Swiglu>(&Config::qwen3_small());
+    let sizes = [(Seqs, 4), (Rows, 64), (Context, 64)];
+    let labels = tessera_lower::labels(&g);
+    let device = Device::guess(&Settings::default());
+    let lowered = |text: &str| {
+        let recipe: Recipe = serde_json::from_str(text).unwrap();
+        lower(&g, 0, &sizes, &device.clone().with(&recipe)).unwrap()
+    };
+    let chosen = kernels_at(&lowered("{}"), &labels, "layer.0.mlp").join("\", \"");
+    let other = lowered(&format!(r#"{{"barred": ["{chosen}"]}}"#));
+    let pick = kernels_at(&other, &labels, "layer.0.mlp")[0].to_string();
+    let plan = lowered(&format!(
+        r#"{{"scoped": [{{"at": "layer.0.mlp", "pick": "{pick}"}}]}}"#
+    ));
+    assert!(kernels_at(&plan, &labels, "layer.0.mlp").contains(&pick.as_str()));
+    assert!(!kernels_at(&plan, &labels, "layer.1.mlp").contains(&pick.as_str()));
+}

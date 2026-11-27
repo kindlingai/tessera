@@ -169,6 +169,10 @@ fn select_with(
     tree.knobs = device.knobs.clone();
     tree.kept_rows = device.kept_rows;
     tree.index_rows = device.index_rows;
+    let labels = device.scoped().then(|| crate::recipe::labels(g));
+    if let Some(labels) = &labels {
+        tree.computes = labels.iter().map(|l| device.compute_at(l)).collect();
+    }
     let whole: Vec<&Rule> = rules
         .iter()
         .copied()
@@ -187,6 +191,7 @@ fn select_with(
         wanted: vec![Vec::new(); tree.len()],
         bare: Vec::new(),
         streams: device.streams(tree.weight_bytes()),
+        labels,
     };
     for (t, _) in &tree.outputs {
         cover.wanted[t.0 as usize].push(EDGE);
