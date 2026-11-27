@@ -1,0 +1,115 @@
+//! Which paged experts hold a VRAM slot.
+
+/// The policy's view of one paged weight.
+pub(crate) struct Paged<'a> {
+    /// Each expert's VRAM slot. `None`: host memory.
+    pub slots: &'a [Option<usize>],
+    /// Bytes per expert.
+    pub stride: usize,
+    /// Whether its experts may move now.
+    pub ready: bool,
+}
+
+/// Gives `hot`'s VRAM slot to `cold`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Swap {
+    pub weight: usize,
+    pub cold: usize,
+    pub hot: usize,
+}
+
+/// Chooses the experts that trade places after a step.
+pub(crate) trait Promote: Send {
+    /// Adds a step's hit count per expert of `weight`.
+    fn observe(&mut self, weight: usize, hits: &[u32]);
+    /// The swaps to make now, best first.
+    fn swaps(&mut self, weights: &[Paged]) -> Vec<Swap>;
+}
+
+/// Scores each expert by decayed hits.
+pub(crate) struct Decayed {
+    /// Share of a score kept per step.
+    pub decay: f32,
+    /// Steps between swaps.
+    pub every: u64,
+    /// A cold score must beat a hot one by this.
+    pub ratio: f32,
+    /// The least score that earns a slot.
+    pub floor: f32,
+    /// Most bytes moved per call.
+    pub bytes: usize,
+    step: u64,
+    scores: Vec<Vec<f32>>,
+}
+
+impl Default for Decayed {
+    fn default() -> Self {
+        Self {
+            decay: 0.96,
+            every: 2,
+            ratio: 1.2,
+            floor: 0.5,
+            bytes: 64 << 20,
+            step: 0,
+            scores: Vec::new(),
+        }
+    }
+}
+
+impl Decayed {
+    /// The best cold and worst hot expert of one weight.
+    fn pair(&self, scores: &[f32], slots: &[Option<usize>]) -> Option<(f32, usize, usize)> {
+        let mut cold: Option<(usize, f32)> = None;
+        let mut hot: Option<(usize, f32)> = None;
+        for (m, (&score, slot)) in scores.iter().zip(slots).enumerate() {
+            match slot {
+                None if cold.is_none_or(|(_, s)| score > s) => cold = Some((m, score)),
+                Some(_) if hot.is_none_or(|(_, s)| score < s) => hot = Some((m, score)),
+                _ => {}
+            }
+        }
+        let ((cold, cs), (hot, hs)) = (cold?, hot?);
+        (cs > self.floor && cs > hs * self.ratio).then_some((cs - hs, cold, hot))
+    }
+}
+
+impl Promote for Decayed {
+    fn observe(&mut self, weight: usize, hits: &[u32]) {
+        if self.scores.len() <= weight {
+            self.scores.resize(weight + 1, Vec::new());
+        }
+        let scores = &mut self.scores[weight];
+        scores.resize(hits.len(), 0.0);
+        for (score, &h) in scores.iter_mut().zip(hits) {
+            *score = *score * self.decay + h as f32;
+        }
+    }
+
+    fn swaps(&mut self, weights: &[Paged]) -> Vec<Swap> {
+        self.step += 1;
+        if self.step > 1 && !self.step.is_multiple_of(self.every) {
+            return Vec::new();
+        }
+        let mut ranked = Vec::new();
+        for (weight, (paged, scores)) in weights.iter().zip(&self.scores).enumerate() {
+            if !paged.ready {
+                continue;
+            }
+            if let Some((gain, cold, hot)) = self.pair(scores, paged.slots) {
+                ranked.push((gain, Swap { weight, cold, hot }));
+            }
+        }
+        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let mut moved = 0;
+        let mut out = Vec::new();
+        for (_, swap) in ranked {
+            let stride = weights[swap.weight].stride;
+            if moved + stride > self.bytes {
+                break;
+            }
+            moved += stride;
+            out.push(swap);
+        }
+        out
+    }
+}

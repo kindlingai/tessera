@@ -22,6 +22,9 @@ mod paged_test;
 mod profile;
 #[cfg(test)]
 mod profile_test;
+mod promote;
+#[cfg(test)]
+mod promote_test;
 mod rank;
 mod run;
 pub mod sizer;

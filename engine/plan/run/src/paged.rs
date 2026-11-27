@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::held::Held;
+use crate::promote::{Decayed, Paged, Promote};
 use crate::run::Base;
 use std::collections::{BTreeMap, HashMap};
 use tessera_gpukit::device::{Device, DeviceBuffer};
@@ -13,10 +14,6 @@ const TABLE: usize = 24;
 const PAGED_FLAG: u32 = 0x8000_0000;
 const ALIGN: usize = 256;
 const RESERVE: u64 = 512 << 20;
-const DECAY: f32 = 0.96;
-const PROMOTE_EVERY: u64 = 2;
-const PROMOTE_RATIO: f32 = 1.2;
-const MAX_PROMOTE_BYTES: usize = 64 << 20;
 
 fn aligned(bytes: usize) -> usize {
     bytes.div_ceil(ALIGN) * ALIGN
@@ -180,7 +177,7 @@ impl Layout {
     }
 }
 
-/// Per-weight backing store, VRAM hot slots and access scores.
+/// Per-weight backing store and VRAM hot slots.
 struct Entry<D: Device> {
     spec: Spec,
     host_buf: DeviceBuffer<D>,
@@ -190,7 +187,6 @@ struct Entry<D: Device> {
     hits_ptr: u64,
     desc_ptr: u64,
     slot_of: Vec<Option<usize>>,
-    scores: Vec<f32>,
 }
 
 /// Hot VRAM expert cache backed by pinned host memory.
@@ -201,7 +197,8 @@ pub(crate) struct Pager<D: Device> {
     hits_buf: DeviceBuffer<D>,
     raw_hits: Vec<u8>,
     entries: Vec<Entry<D>>,
-    step: u64,
+    hits: Vec<u32>,
+    policy: Box<dyn Promote>,
 }
 
 impl<D: Device> Pager<D> {
@@ -276,7 +273,6 @@ impl<D: Device> Pager<D> {
                 hits_ptr: hits_base + (hits_cur * 4) as u64,
                 desc_ptr: 0,
                 slot_of,
-                scores: vec![0.0; s.experts],
             });
             vram_cur += resident * s.stride;
             hits_cur += s.experts;
@@ -298,7 +294,8 @@ impl<D: Device> Pager<D> {
             hits_buf,
             raw_hits: vec![0u8; hits_bytes],
             entries,
-            step: 0,
+            hits: Vec::new(),
+            policy: Box::new(Decayed::default()),
         }))
     }
 
@@ -376,61 +373,34 @@ impl<D: Device> Pager<D> {
         Ok(true)
     }
 
-    /// Updates scores and promotes hot cold experts into VRAM.
+    /// Reports hits and makes the policy's swaps.
     pub(crate) fn maintain(&mut self, ctx: &D) -> Result<(), Error> {
         let Some(pool) = &self.vram_pool else {
             return Ok(());
         };
-        self.step += 1;
         self.hits_buf.read_bytes(&mut self.raw_hits)?;
         self.hits_buf.zero()?;
         let (words, _) = self.raw_hits.as_chunks::<4>();
-        for entry in &mut self.entries {
-            for m in 0..entry.spec.experts {
-                let h = u32::from_le_bytes(words[entry.hits_offset + m]);
-                entry.scores[m] = entry.scores[m] * DECAY + h as f32;
-            }
-        }
-        if self.step > 1 && !self.step.is_multiple_of(PROMOTE_EVERY) {
-            return Ok(());
-        }
-        // Rank cold-vs-hot swap candidates by score gain.
-        let mut cands: Vec<(f32, usize, usize, usize)> = Vec::new();
+        let mut weights = Vec::with_capacity(self.entries.len());
         for (idx, entry) in self.entries.iter().enumerate() {
-            if entry.resident == 0 || entry.resident >= entry.spec.experts || entry.desc_ptr == 0 {
-                continue;
-            }
-            let mut best_cold = None;
-            let mut worst_hot = None;
-            for (m, &score) in entry.scores.iter().enumerate() {
-                match entry.slot_of[m] {
-                    None => {
-                        if best_cold.is_none_or(|(_, s)| score > s) {
-                            best_cold = Some((m, score));
-                        }
-                    }
-                    Some(_) => {
-                        if worst_hot.is_none_or(|(_, s)| score < s) {
-                            worst_hot = Some((m, score));
-                        }
-                    }
-                }
-            }
-            if let (Some((cold, cs)), Some((hot, hs))) = (best_cold, worst_hot)
-                && cs > 0.5
-                && cs > hs * PROMOTE_RATIO
-            {
-                cands.push((cs - hs, idx, cold, hot));
-            }
+            let counts = &words[entry.hits_offset..][..entry.spec.experts];
+            self.hits.clear();
+            self.hits
+                .extend(counts.iter().map(|w| u32::from_le_bytes(*w)));
+            self.policy.observe(idx, &self.hits);
+            weights.push(Paged {
+                slots: &entry.slot_of,
+                stride: entry.spec.stride,
+                ready: entry.resident > 0
+                    && entry.resident < entry.spec.experts
+                    && entry.desc_ptr != 0,
+            });
         }
-        cands.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let swaps = self.policy.swaps(&weights);
         let pool_base = pool.device_ptr();
-        let mut moved = 0usize;
-        for (_, idx, cold, hot) in cands {
-            let entry = &mut self.entries[idx];
-            if moved + entry.spec.stride > MAX_PROMOTE_BYTES {
-                break;
-            }
+        for swap in swaps {
+            let (cold, hot) = (swap.cold, swap.hot);
+            let entry = &mut self.entries[swap.weight];
             let Some(slot) = entry.slot_of[hot].take() else {
                 continue;
             };
@@ -458,7 +428,6 @@ impl<D: Device> Pager<D> {
                 &hot_delta.to_le_bytes(),
             )?;
             entry.slot_of[cold] = Some(slot);
-            moved += stride;
         }
         Ok(())
     }
