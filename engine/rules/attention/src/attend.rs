@@ -147,16 +147,17 @@ fn attend(
     write_row(&state, &acc, out, q_off, width, out_form, threads);
 }
 
-/// A group per query row and head, within its slot.
+/// Attends rows over kept slots or packed bounds.
 #[kernel]
 #[allow(clippy::too_many_arguments)]
-fn attend_rows(
+fn attend_indexed<const KEPT: bool, const CAUSAL: bool>(
     q: Buf<F32>,
     #[form(k_form)] k: Buf<Dyn>,
     #[form(v_form)] v: Buf<Dyn>,
     #[form(out_form)] mut out: BufMut<Dyn>,
     slots: Buf<U32>,
     positions: Buf<U32>,
+    bounds: Buf<U32>,
     rows: u32,
     keys: u32,
     heads: u32,
@@ -176,29 +177,113 @@ fn attend_rows(
     if row >= rows {
         return;
     }
-    let slot = slots[row as u64];
-    let position = positions[row as u64];
     let kvh = qh / (heads / kv_heads);
     let q_off = ((row * heads + qh) * width) as u64;
     let mut red = shared::<f32>(threads);
     let mut state = [0.0f32; 2];
     state[0] = f32::NEG_INFINITY;
     let mut acc = [0.0f32; 2];
-    // The row sees its own key and `back` before it.
-    let last = if position + 1 < keys {
-        position + 1
+    let mut slot = 0u32;
+    let mut first = 0u32;
+    let mut last = 0u32;
+    if KEPT {
+        slot = slots[row as u64];
+        let position = positions[row as u64];
+        // The row sees its own key and `back` before it.
+        last = if position + 1 < keys {
+            position + 1
+        } else {
+            keys
+        };
+        first = if position > back { position - back } else { 0 };
     } else {
-        keys
-    };
-    let first = if position > back { position - back } else { 0 };
+        first = bounds[(row * 2) as u64];
+        let end = bounds[(row * 2 + 1) as u64];
+        last = if CAUSAL && row + 1 < end {
+            row + 1
+        } else {
+            end
+        };
+        if last > rows {
+            last = rows;
+        }
+        if first > last {
+            first = last;
+        }
+    }
     for t in first..last {
-        let kv_off = ((kept_row(slot, t) * kv_heads + kvh) * width) as u64;
+        let key_row = if KEPT { kept_row(slot, t) } else { t };
+        let kv_off = ((key_row * kv_heads + kvh) * width) as u64;
         let dot = group_dot(
             q, k, q_off, kv_off, width, &mut red, k_form, threads, steps, half,
         );
         take_key(&mut state, &mut acc, dot, v, kv_off, width, v_form, threads);
     }
     write_row(&state, &acc, out, q_off, width, out_form, threads);
+}
+
+/// Packed rows over variable-length segments.
+#[derive(Clone, Copy, Debug, Kernel)]
+#[launch(
+    name = "attend_packed",
+    order = Order::PerConfig,
+    sizes = self.0.sizes(),
+    work = self.0.heads * self.0.queries * self.0.queries * self.0.width,
+    needs = group_needs(THREADS),
+    accepts = packed_accepts,
+    emits = packed_emits,
+    source = packed_source,
+    launches = packed_launches,
+    shape = Shape::grid((self.0.queries * self.0.heads, 1), THREADS as usize),
+)]
+pub(crate) struct AttendPacked(pub Attn);
+
+fn packed_accepts(k: &AttendPacked, input: usize, form: &dyn Stored) -> bool {
+    match input {
+        1 => form.name() == k.0.k_form.name(),
+        2 => form.name() == k.0.v_form.name(),
+        _ => !form.narrow(),
+    }
+}
+
+fn packed_emits(k: &AttendPacked, form: &dyn Stored) -> bool {
+    form.name() == k.0.out_form.name()
+}
+
+fn packed_source(k: &AttendPacked) -> Source {
+    let a = &k.0;
+    let causal = a.mask.causal();
+    let (steps, half) = (THREADS.trailing_zeros(), THREADS / 2);
+    let mut body = if causal {
+        attend_indexed_ir::<false, true>(a.k_form, a.v_form, a.out_form, THREADS, steps, half)
+    } else {
+        attend_indexed_ir::<false, false>(a.k_form, a.v_form, a.out_form, THREADS, steps, half)
+    };
+    body.params
+        .retain(|p| !matches!(p.name(), "slots" | "positions" | "keys" | "back"));
+    let kind = if causal { "causal" } else { "full" };
+    let entry = match (a.k_form.name(), a.v_form.name(), a.out_form.name()) {
+        ("f32", "f32", "f32") => format!("plan_attend_packed_{kind}"),
+        (kf, vf, of) => format!("plan_attend_packed_{kind}_{kf}_{vf}_{of}"),
+    };
+    Source::named(body, entry)
+}
+
+fn packed_launches(k: &AttendPacked, step: &Step) -> Vec<Launch> {
+    let a = &k.0;
+    let args = vec![
+        step.read(0),
+        step.read(1),
+        step.read(2),
+        step.out(),
+        step.read(3),
+        Arg::count(a.queries),
+        Arg::count(a.heads),
+        Arg::count(a.kv_heads),
+        Arg::count(a.width),
+    ];
+    let shape = k.shape().expect("a grid");
+    vec![Launch { args, shape }]
 }
 
 /// Scaled query rows over kept keys, by slot and position.
@@ -231,17 +316,16 @@ fn rows_emits(k: &AttendRows, form: &dyn Stored) -> bool {
 
 fn rows_source(k: &AttendRows) -> Source {
     let (a, threads) = (&k.0, k.1);
-    let body = kept::attach(
-        attend_rows_ir(
-            a.k_form,
-            a.v_form,
-            a.out_form,
-            threads,
-            threads.trailing_zeros(),
-            threads / 2,
-        ),
-        a.kept,
+    let mut raw = attend_indexed_ir::<true, false>(
+        a.k_form,
+        a.v_form,
+        a.out_form,
+        threads,
+        threads.trailing_zeros(),
+        threads / 2,
     );
+    raw.params.retain(|p| p.name() != "bounds");
+    let body = kept::attach(raw, a.kept);
     let tag = if threads == THREADS {
         String::new()
     } else {
@@ -334,6 +418,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         .map_or(THREADS, |t| t as u32);
     if !threads.is_power_of_two() || site.sizes.width > 2 * threads as usize {
         return None;
+    }
+    if site.packed.is_some() {
+        return site.packed_draft(AttendPacked(site.sizes));
     }
     // Ragged rows read the kept keys and values in place.
     if site.rows.is_some() {

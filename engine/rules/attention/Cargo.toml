@@ -6,12 +6,19 @@ license.workspace = true
 publish.workspace = true
 description = "Attention kernels for the CPU and the GPU, registered as lowering rules"
 
+[features]
+default = []
+cuda = ["tessera-device/cuda"]
+rocm = ["tessera-device/rocm"]
+
 [dependencies]
 tessera-codegen = { workspace = true }
+tessera-device = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-lower = { workspace = true }
 
 [dev-dependencies]
+tessera-gpukit = { workspace = true }
 tessera-interp = { workspace = true }
 tessera-kernels = { workspace = true }
 tessera-run = { workspace = true }

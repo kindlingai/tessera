@@ -56,6 +56,30 @@ fn ours() -> Vec<&'static tessera_lower::Rule> {
         .collect()
 }
 
+/// Residual add, center, RMS norm and bias.
+fn layer_norm_graph(d: &[Dim], width: u64) -> Graph {
+    use tessera_graph::DimName::Hidden;
+    use tessera_trace::{Norm, Vector, Weights, declare};
+    #[derive(Weights)]
+    struct LnW {
+        #[shape(Hidden)]
+        w: Norm,
+        #[shape(Hidden)]
+        b: Vector,
+    }
+    let mut dims = d.to_vec();
+    dims.push(Dim::fixed(Hidden, width));
+    let m = Model::new(dims);
+    let lw: LnW = declare(&m);
+    let [a, b] = m.entry(
+        EntryKind::Forward,
+        [floats([Seqs, Rows, Hidden]), floats([Seqs, Rows, Hidden])],
+    );
+    let sum = a.add(&b);
+    let ln = sum.center().rms_norm(&lw.w, 1e-6).add_vector(&lw.b);
+    m.finish([(Role::Logits, &ln.add(&sum))])
+}
+
 /// Every rule's launches under `settings`. Returns the rules used.
 fn rules_match(settings: &Settings) -> Vec<&'static str> {
     let d = dims();
@@ -74,6 +98,8 @@ fn rules_match(settings: &Settings) -> Vec<&'static str> {
         graphs::residual_norm(&d, 32),
         graphs::residual_norm(&d, 600),
         clipped(),
+        layer_norm_graph(&d, 32),
+        layer_norm_graph(&d, 1024),
     ];
     let ours = ours();
     let mut used: Vec<&str> = Vec::new();
@@ -346,4 +372,261 @@ fn kernel_launch_knobs() {
         step.launches()[0].shape,
         tessera_lower::Shape::Grid { threads: 64, .. }
     ));
+}
+
+/// Exact GELU and 2D/3D M-RoPE match the interpreter.
+#[test]
+fn gelu_and_mrope() {
+    use tessera_graph::{Shape, TensorType};
+    use tessera_trace::Port;
+    let mut noise = Noise(19);
+    let cases = [
+        (72u64, 2u64, 10_000.0f32, [18u32, 18, 0], false),
+        (128u64, 3u64, 5_000_000.0f32, [24u32, 20, 20], true),
+    ];
+    for (width, axes, theta, sections, interleaved) in cases {
+        use tessera_trace::{Norm, Weights, declare};
+        #[derive(Weights)]
+        struct QkW {
+            #[shape(HeadDim)]
+            w: Norm,
+        }
+        let m = Model::new(vec![
+            Dim::bounded(Rows, 8),
+            Dim::fixed(Heads, 2),
+            Dim::fixed(HeadDim, width),
+        ]);
+        let qw: QkW = declare(&m);
+        let xport = Port {
+            role: Role::Tokens,
+            ty: TensorType::new([Rows, Heads, HeadDim], DType::F32),
+        };
+        let cport = Port {
+            role: Role::Positions,
+            ty: TensorType::new(Shape(vec![Rows.into(), axes.into()]), DType::U32),
+        };
+        let [x, coords] = m.entry(EntryKind::Forward, [xport, cport]);
+        let out =
+            x.act(Act::Gelu)
+                .rms_norm(&qw.w, 1e-6)
+                .mrope(&coords, theta, sections, interleaved);
+        let g = m.finish([(Role::Logits, &out)]);
+        let rows = 5usize;
+        let x_val = Tensor::f32(
+            vec![rows, 2, width as usize],
+            (0..rows * 2 * width as usize)
+                .map(|_| noise.draw())
+                .collect(),
+        );
+        let c_val = Tensor::u32(
+            vec![rows, axes as usize],
+            (0..rows * axes as usize)
+                .map(|i| (i * 3 % 17) as u32)
+                .collect(),
+        );
+        let w_val = Tensor::f32(
+            vec![width as usize],
+            (0..width as usize).map(|_| 0.5 + noise.draw()).collect(),
+        );
+        let weights = [w_val];
+        let want = run(&g, &weights, 0, &[x_val.clone(), c_val.clone()]).unwrap();
+        let views = [x_val.view(), c_val.view()];
+        for settings in runs() {
+            let device = Device::guess(&settings);
+            let plan = lower(&g, 0, &[(Rows, rows as u64)], &device).unwrap();
+            let want_norm = if width == 128 {
+                "norm_rope4"
+            } else {
+                "norm_rope"
+            };
+            assert!(
+                names(&plan).contains(&want_norm),
+                "expected fused {want_norm} in {:?}",
+                names(&plan)
+            );
+            let mut runner = open(plan, &settings).unwrap();
+            runner.load(0, weights[0].view()).unwrap();
+            let got = runner.run(&views).unwrap();
+            let off = max_abs_diff(got[0].floats().unwrap(), want[0].floats().unwrap());
+            assert!(
+                off < 1e-4,
+                "w={width} interleaved={interleaved} {:?}: {off:e}",
+                settings.backend
+            );
+        }
+    }
+}
+
+/// Fused layer norm and wide-row block norm match the interpreter.
+#[test]
+fn fused_layer_norm() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_trace::{Norm, Vector, Weights, declare};
+    #[derive(Weights)]
+    struct LnW {
+        #[shape(Hidden)]
+        w: Norm,
+        #[shape(Hidden)]
+        b: Vector,
+    }
+    let m = Model::new(vec![Dim::bounded(Rows, 4096), Dim::fixed(Hidden, 1152)]);
+    let lw: LnW = declare(&m);
+    let [a, b] = m.entry(
+        EntryKind::Forward,
+        [floats([Rows, Hidden]), floats([Rows, Hidden])],
+    );
+    let sum = a.add(&b);
+    let ln = sum.center().rms_norm(&lw.w, 1e-6).add_vector(&lw.b);
+    let g = m.finish([(Role::Logits, &ln), (Role::Logits, &sum)]);
+    let mut noise = Noise(29);
+    let rows = 3usize;
+    let width = 1152usize;
+    let a_val = Tensor::f32(
+        vec![rows, width],
+        (0..rows * width).map(|_| noise.draw()).collect(),
+    );
+    let b_val = Tensor::f32(
+        vec![rows, width],
+        (0..rows * width).map(|_| noise.draw()).collect(),
+    );
+    let w_val = Tensor::f32(
+        vec![width],
+        (0..width).map(|_| 0.5 + noise.draw()).collect(),
+    );
+    let bias_val = Tensor::f32(vec![width], (0..width).map(|_| noise.draw()).collect());
+    let weights = [w_val, bias_val];
+    let want = run(&g, &weights, 0, &[a_val.clone(), b_val.clone()]).unwrap();
+    let views = [a_val.view(), b_val.view()];
+    for settings in runs() {
+        let device = Device::guess(&settings);
+        let plan = lower(&g, 0, &[(Rows, rows as u64)], &device).unwrap();
+        assert_eq!(names(&plan), ["block_add_ln_bsave"]);
+        let mut runner = open(plan, &settings).unwrap();
+        runner.load(0, weights[0].view()).unwrap();
+        runner.load(1, weights[1].view()).unwrap();
+        let got = runner.run(&views).unwrap();
+        for idx in 0..2 {
+            let off = max_abs_diff(got[idx].floats().unwrap(), want[idx].floats().unwrap());
+            assert!(off < 1e-4, "out {idx} {:?}: {off:e}", settings.backend);
+        }
+    }
+    // Wide rows above 2048 still stay in single-pass block mode.
+    let gpu = Platform {
+        backend: "cuda".into(),
+        name: "Test GPU".into(),
+        units: 128,
+        bandwidth: 1e12,
+        ..Platform::assumed(Limits::assumed())
+    };
+    let big = lower(&g, 0, &[(Rows, 4096)], &Device::default().on(gpu)).unwrap();
+    assert_eq!(names(&big), ["block_add_ln_bsave"]);
+}
+
+/// Fused slice-rope and biased residual layer norm match the interpreter.
+#[test]
+fn fused_slice_ln() {
+    use tessera_graph::DimName::Hidden;
+    use tessera_trace::{DType, DimExpr, Norm, Port, Shape, TensorType, Vector, Weights, declare};
+    #[derive(Weights)]
+    struct W {
+        #[shape(Hidden)]
+        ib: Vector,
+        #[shape(Hidden)]
+        nw: Norm,
+        #[shape(Hidden)]
+        nb: Vector,
+    }
+    let qkv_dim = DimName::named("Qkv");
+    let m = Model::new(vec![
+        Dim::bounded(Rows, 16),
+        Dim::fixed(Hidden, 144),
+        Dim::fixed(Heads, 2),
+        Dim::fixed(HeadDim, 72),
+        Dim::fixed(qkv_dim, 432),
+    ]);
+    let w: W = declare(&m);
+    let [qkv, rot, res, raw] = m.entry(
+        EntryKind::Forward,
+        [
+            Port {
+                role: Role::Tokens,
+                ty: TensorType::new([Rows, qkv_dim], DType::F32),
+            },
+            Port {
+                role: Role::Positions,
+                ty: TensorType::new(Shape(vec![Rows.into(), 2u64.into()]), DType::U32),
+            },
+            floats([Rows, Hidden]),
+            floats([Rows, Hidden]),
+        ],
+    );
+    let q = qkv
+        .slice(1, 144u64, DimExpr::Dim(Hidden))
+        .reshape(vec![Rows.into(), Heads.into(), HeadDim.into()])
+        .mrope(&rot, 10_000.0, [18, 18, 0], false)
+        .reshape(vec![Rows.into(), Hidden.into()]);
+    let sum = res.add(&raw.add_vector(&w.ib));
+    let ln = sum.center().rms_norm(&w.nw, 1e-6).add_vector(&w.nb);
+    let g = m.finish([
+        (Role::Logits, &q),
+        (Role::Logits, &ln),
+        (Role::Logits, &sum),
+    ]);
+    let mut noise = Noise(41);
+    let rows = 5usize;
+    let qkv_v = Tensor::f32(
+        vec![rows, 432],
+        (0..rows * 432).map(|_| noise.draw()).collect(),
+    );
+    let rot_v = Tensor::u32(
+        vec![rows, 2],
+        (0..rows * 2).map(|i| (i % 7) as u32).collect(),
+    );
+    let res_v = Tensor::f32(
+        vec![rows, 144],
+        (0..rows * 144).map(|_| noise.draw()).collect(),
+    );
+    let raw_v = Tensor::f32(
+        vec![rows, 144],
+        (0..rows * 144).map(|_| noise.draw()).collect(),
+    );
+    let ws = [
+        Tensor::f32(vec![144], (0..144).map(|_| noise.draw()).collect()),
+        Tensor::f32(vec![144], (0..144).map(|_| 0.5 + noise.draw()).collect()),
+        Tensor::f32(vec![144], (0..144).map(|_| noise.draw()).collect()),
+    ];
+    let want = run(
+        &g,
+        &ws,
+        0,
+        &[qkv_v.clone(), rot_v.clone(), res_v.clone(), raw_v.clone()],
+    )
+    .unwrap();
+    let views = [qkv_v.view(), rot_v.view(), res_v.view(), raw_v.view()];
+    for settings in runs() {
+        let device = Device::guess(&settings);
+        let plan = lower(&g, 0, &[(Rows, rows as u64)], &device).unwrap();
+        let ns = names(&plan);
+        assert!(
+            ns.contains(&"slice_rope_x4"),
+            "expected slice_rope_x4 in {ns:?}"
+        );
+        assert!(
+            ns.contains(&"lane_add_ln_bsave"),
+            "expected fused biased ln in {ns:?}"
+        );
+        assert!(
+            !ns.contains(&"strided_x4"),
+            "strided_x4 should be fused in {ns:?}"
+        );
+        let mut runner = open(plan, &settings).unwrap();
+        for (i, t) in ws.iter().enumerate() {
+            runner.load(i as u32, t.view()).unwrap();
+        }
+        let got = runner.run(&views).unwrap();
+        for idx in 0..3 {
+            let off = max_abs_diff(got[idx].floats().unwrap(), want[idx].floats().unwrap());
+            assert!(off < 1e-4, "out {idx} {:?}: {off:e}", settings.backend);
+        }
+    }
 }
