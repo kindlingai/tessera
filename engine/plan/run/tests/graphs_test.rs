@@ -392,6 +392,7 @@ fn copy_step(buffer: u32, len: usize) -> Step {
     Step {
         kernel: KernelRef::new(Map::plain(Vec::new())),
         rule: "map",
+        site: None,
         reads: vec![slot],
         write: slot,
         also: Vec::new(),
@@ -669,12 +670,8 @@ fn ranked_plan(scratch_bytes: usize) -> Plan {
             rule,
             reads,
             write,
-            also: Vec::new(),
-            covers: Vec::new(),
-            zone: 0,
             lane,
-            table: None,
-            index_table: None,
+            ..copy_step(0, 1)
         }
     };
     Plan {
@@ -853,10 +850,12 @@ fn sums_split_fallbacks() {
         assert!(prof.spent["gpu: graph"].seconds > 0.0);
         assert_eq!(prof.spent["all_reduce: wait"].count, 3);
         assert_eq!(prof.spent["all_reduce: transfer"].count, 3);
-        assert_eq!(prof.spent["all_reduce"].count, 6);
+        let ar = tessera_run::Profile::key(&plan.steps[1]);
+        assert!(ar.starts_with("all_reduce ["), "{ar}");
+        assert_eq!(prof.spent[&ar].count, 6);
         assert_eq!(prof.spent["gpu: graph"].attrs, None);
         assert_eq!(
-            prof.spent["all_reduce"].attrs,
+            prof.spent[&ar].attrs,
             Some(KernelAttrs {
                 regs: 40,
                 local_bytes: 0,

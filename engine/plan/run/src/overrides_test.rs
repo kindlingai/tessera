@@ -367,6 +367,7 @@ fn single_step_plan(entry: &'static str, resident: Option<Resident>) -> Plan {
             covers: Vec::new(),
             kernel: KernelRef::new(TestKernel { entry, resident }),
             rule: "test",
+            site: None,
             lane: 0,
             table: None,
             index_table: None,

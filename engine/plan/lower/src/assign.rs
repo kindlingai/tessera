@@ -440,6 +440,7 @@ impl Buffers<'_> {
                 self.plan.steps.push(Step {
                     kernel: KernelRef::new(Map::copy(reads[0].form, copy.form)),
                     rule: op.rule,
+                    site: op.site.clone(),
                     reads: vec![reads[0]],
                     write: copy,
                     also: Vec::new(),
@@ -468,6 +469,7 @@ impl Buffers<'_> {
         self.plan.steps.push(Step {
             kernel: op.kernel.clone(),
             rule: op.rule,
+            site: op.site.clone(),
             reads,
             write,
             also,

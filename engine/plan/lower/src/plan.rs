@@ -70,6 +70,8 @@ pub struct Step {
     pub kernel: KernelRef,
     /// The proposing rule.
     pub rule: &'static str,
+    /// Lowered graph site description, when known.
+    pub site: Option<String>,
     pub reads: Vec<Slot>,
     pub write: Slot,
     /// Extra outputs this launch writes.

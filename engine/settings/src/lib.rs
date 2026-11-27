@@ -1,6 +1,8 @@
 //! Knobs the front end sets once and the engine reads.
 
 mod backend;
+#[cfg(test)]
+mod lib_test;
 pub mod metrics;
 #[cfg(test)]
 mod metrics_test;
@@ -9,9 +11,10 @@ pub mod progress;
 mod progress_test;
 
 pub use backend::{Backend, ByBackend};
+use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Where plans run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,30 +47,72 @@ pub enum Reads {
     Direct,
 }
 
+type WakeFn = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct AsksInner {
+    count: AtomicUsize,
+    on_empty: Mutex<Vec<WakeFn>>,
+}
+
 /// Requests that want a profile now. Clones share one count.
-#[derive(Clone, Debug, Default)]
-pub struct Asks(Arc<AtomicUsize>);
+#[derive(Clone, Default)]
+pub struct Asks(Arc<AsksInner>);
+
+impl fmt::Debug for Asks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Asks")
+            .field(&self.0.count.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 impl Asks {
     /// Counts one request until the result drops.
     pub fn hold(&self) -> Ask {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.0.count.fetch_add(1, Ordering::AcqRel);
         Ask(self.0.clone())
     }
 
     /// Whether any request wants a profile.
     pub fn wanted(&self) -> bool {
-        self.0.load(Ordering::Relaxed) > 0
+        self.0.count.load(Ordering::Acquire) > 0
+    }
+
+    /// Calls `wake` each time the last active `Ask` drops.
+    pub fn on_empty(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.0
+            .on_empty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(wake));
     }
 }
 
 /// One request's hold on an `Asks` count.
-#[derive(Debug)]
-pub struct Ask(Arc<AtomicUsize>);
+pub struct Ask(Arc<AsksInner>);
+
+impl fmt::Debug for Ask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Ask")
+            .field(&self.0.count.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 impl Drop for Ask {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let hooks = self
+                .0
+                .on_empty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for wake in hooks {
+                wake();
+            }
+        }
     }
 }
 

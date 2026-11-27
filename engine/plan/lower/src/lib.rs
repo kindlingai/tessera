@@ -23,7 +23,7 @@ pub use abi::{Arg, Launch, Shape, Source, ToArg};
 pub use assign::assign;
 pub use body::{GUESS, small, source};
 pub use cache::Cache;
-pub use cost::{ASKERS, Ask, Device};
+pub use cost::{ASKERS, Ask, Device, kernel_identity};
 pub use cut::{cut, cut_region};
 pub use error::{Size, Unsupported};
 pub use extent::Extent;

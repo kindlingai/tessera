@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use tessera_engine_comm::{Reader, Writer};
 use tessera_gpukit::device::KernelAttrs;
-use tessera_lower::Step;
+use tessera_lower::{Step, kernel_identity};
 
 /// Rows past this many print as one "other" row.
 const SHOWN: usize = 40;
@@ -81,13 +81,35 @@ impl Profile {
         self.spent.entry(name.to_string()).or_default().sum(one);
     }
 
-    /// A step's row: its kernel name and sizes.
+    /// Adds all rows from `other` into `self`.
+    pub fn merge(&mut self, other: Self) {
+        for (name, spent) in other.spent {
+            self.spent.entry(name).or_default().sum(spent);
+        }
+    }
+
+    /// A step's row: kernel name, sizes, and provenance.
     pub fn key(step: &Step) -> String {
         let kernel = &step.kernel;
         let mut name = kernel.name().to_string();
         for (i, size) in kernel.sizes().iter().enumerate() {
             name.push(if i == 0 { ' ' } else { 'x' });
             name.push_str(&size.to_string());
+        }
+        let (entry, _) = kernel_identity(&**kernel);
+        let parts = [
+            (!entry.is_empty()).then_some(entry.as_ref()),
+            (!step.rule.is_empty()).then_some(step.rule),
+            step.site.as_deref().filter(|s| !s.is_empty()),
+        ];
+        let mut first = true;
+        for part in parts.into_iter().flatten() {
+            name.push_str(if first { " [" } else { " | " });
+            name.push_str(part);
+            first = false;
+        }
+        if !first {
+            name.push(']');
         }
         name
     }
@@ -184,6 +206,31 @@ pub struct Report<'a> {
     launches: u64,
 }
 
+fn write_rates(f: &mut fmt::Formatter<'_>, work: f64, bytes: f64, seconds: f64) -> fmt::Result {
+    for amount in [work, bytes] {
+        match amount > 0.0 && seconds > 0.0 {
+            true => write!(f, " {:>8.1}", amount / seconds / 1e9)?,
+            false => write!(f, " {:>8}", "-")?,
+        }
+    }
+    Ok(())
+}
+
+fn write_attrs(f: &mut fmt::Formatter<'_>, attrs: Option<KernelAttrs>) -> fmt::Result {
+    match attrs {
+        Some(a) => {
+            let smem = format_bytes(a.shared_bytes);
+            let lmem = format_bytes(a.local_bytes);
+            let cta = match a.ctas_per_sm > 0 {
+                true => a.ctas_per_sm.to_string(),
+                false => "-".into(),
+            };
+            write!(f, " {:>4} {:>6} {:>6} {:>3}", a.regs, smem, lmem, cta)
+        }
+        None => write!(f, " {:>4} {:>6} {:>6} {:>3}", "-", "-", "-", "-"),
+    }
+}
+
 impl Report<'_> {
     fn row(
         &self,
@@ -198,25 +245,9 @@ impl Report<'_> {
         let each = s.seconds * 1e6 / s.count.max(1) as f64;
         let count = s.count as f64 / per;
         write!(f, "{ms:>10.3} {count:>8.1} {each:>10.1}")?;
-        for amount in [s.work, s.bytes] {
-            match amount > 0.0 && s.seconds > 0.0 {
-                true => write!(f, " {:>8.1}", amount / s.seconds / 1e9)?,
-                false => write!(f, " {:>8}", "-")?,
-            }
-        }
+        write_rates(f, s.work, s.bytes, s.seconds)?;
         if show_attrs {
-            match s.attrs {
-                Some(a) => {
-                    let smem = format_bytes(a.shared_bytes);
-                    let lmem = format_bytes(a.local_bytes);
-                    let cta = match a.ctas_per_sm > 0 {
-                        true => a.ctas_per_sm.to_string(),
-                        false => "-".into(),
-                    };
-                    write!(f, " {:>4} {:>6} {:>6} {:>3}", a.regs, smem, lmem, cta)?;
-                }
-                None => write!(f, " {:>4} {:>6} {:>6} {:>3}", "-", "-", "-", "-")?,
-            }
+            write_attrs(f, s.attrs)?;
         }
         let spill = spilled || s.attrs.is_some_and(|a| a.local_bytes > 0);
         match spill {
@@ -293,11 +324,27 @@ impl fmt::Display for Ranks {
             }
         }
         names.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let show_attrs = self
+            .profiles
+            .iter()
+            .flatten()
+            .any(|p| p.spent.values().any(|s| s.attrs.is_some()));
         writeln!(f, "ms/launch per rank")?;
         for rank in 0..self.profiles.len() {
             write!(f, "{:>10}", format!("rank {rank}"))?;
         }
-        writeln!(f, "{:>9}  name", "max/min")?;
+        match show_attrs {
+            true => writeln!(
+                f,
+                "{:>9} {:>8} {:>10} {:>8} {:>8} {:>4} {:>6} {:>6} {:>3}  name",
+                "max/min", "count", "us each", "G/s", "GB/s", "regs", "smem", "lmem", "cta"
+            )?,
+            false => writeln!(
+                f,
+                "{:>9} {:>8} {:>10} {:>8} {:>8}  name",
+                "max/min", "count", "us each", "G/s", "GB/s"
+            )?,
+        }
         let per = self.launches.max(1) as f64;
         for (name, _) in names {
             let (mut least, mut most) = (f64::MAX, 0.0f64);
@@ -310,8 +357,27 @@ impl fmt::Display for Ranks {
                 (least, most) = (least.min(s), most.max(s));
             }
             match least > 0.0 && least < f64::MAX {
-                true => writeln!(f, "{:>9.2}  {name}", most / least)?,
-                false => writeln!(f, "{:>9}  {name}", "-")?,
+                true => write!(f, "{:>9.2}", most / least)?,
+                false => write!(f, "{:>9}", "-")?,
+            }
+            let mut total = Spent::default();
+            let mut present = 0u64;
+            for p in self.profiles.iter().flatten() {
+                if let Some(&s) = p.spent.get(name) {
+                    total.sum(s);
+                    present += 1;
+                }
+            }
+            let count = total.count as f64 / (per * present.max(1) as f64);
+            let each = total.seconds * 1e6 / total.count.max(1) as f64;
+            write!(f, " {count:>8.1} {each:>10.1}")?;
+            write_rates(f, total.work, total.bytes, total.seconds)?;
+            if show_attrs {
+                write_attrs(f, total.attrs)?;
+            }
+            match total.attrs.is_some_and(|a| a.local_bytes > 0) {
+                true => writeln!(f, "  {name}  SPILL")?,
+                false => writeln!(f, "  {name}")?,
             }
         }
         Ok(())

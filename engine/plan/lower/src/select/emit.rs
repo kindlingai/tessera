@@ -8,7 +8,7 @@ use crate::kernel::{Kernel, KernelRef};
 use crate::kernels::{Move, Narrow, Scatter, Widen};
 use crate::plan::{KeptInfo, pack_shape};
 use crate::rule::Draft;
-use crate::select::cover::EDGE;
+use crate::select::cover::{EDGE, graph_site};
 use crate::select::{Home, Op, Selected, Val, Value};
 use crate::tree::{T, Tree};
 use std::collections::HashMap;
@@ -19,8 +19,9 @@ pub(crate) type OutputSpec = (usize, &'static dyn Load, (u8, [u32; 4]));
 
 /// The ops written, and the values they use.
 #[derive(Default)]
-pub(crate) struct Emit {
+pub(crate) struct Emit<'a> {
     pub(crate) out: Selected,
+    pub(crate) labels: Option<&'a [String]>,
     /// Results that later equal launches may reuse.
     shared: HashMap<(String, Vec<Val>), Val>,
     /// Each value's copy in another zone, once made.
@@ -31,7 +32,13 @@ pub(crate) struct Emit {
     kept: HashMap<u32, Val>,
 }
 
-impl Emit {
+impl<'a> Emit<'a> {
+    pub(crate) fn with_labels(labels: Option<&'a [String]>) -> Self {
+        Self {
+            labels,
+            ..Self::default()
+        }
+    }
     pub(crate) fn value(
         &mut self,
         len: usize,
@@ -65,6 +72,7 @@ impl Emit {
         self.out.ops.push(Op {
             kernel: KernelRef::new(Move),
             rule: "move",
+            site: None,
             reads: vec![v],
             write,
             also: Vec::new(),
@@ -104,6 +112,7 @@ impl Emit {
         self.out.ops.push(Op {
             kernel: KernelRef::new(Widen { len, form }),
             rule: "widen",
+            site: None,
             reads: vec![v],
             write,
             also: Vec::new(),
@@ -127,6 +136,7 @@ impl Emit {
         self.out.ops.push(Op {
             kernel: KernelRef::new(Narrow { len, form }),
             rule: "narrow",
+            site: None,
             reads: vec![v],
             write,
             also: Vec::new(),
@@ -155,6 +165,7 @@ impl Emit {
         &mut self,
         d: Draft,
         rule: &'static str,
+        site: Option<&str>,
         reads: Vec<Val>,
         covers: &[NodeId],
         zone: u32,
@@ -173,6 +184,7 @@ impl Emit {
             self.out.ops.push(Op {
                 kernel: d.kernel,
                 rule,
+                site: site.map(str::to_string),
                 reads,
                 write,
                 also: Vec::new(),
@@ -205,6 +217,7 @@ impl Emit {
         self.out.ops.push(Op {
             kernel: d.kernel,
             rule,
+            site: site.map(str::to_string),
             reads,
             write,
             also: also.clone(),
@@ -325,6 +338,7 @@ impl Emit {
         self.out.ops.push(Op {
             kernel: KernelRef::new(kernel),
             rule: "append",
+            site: Some(graph_site(tree, self.labels, t)),
             reads: vec![rows, slots, positions],
             write,
             also: Vec::new(),

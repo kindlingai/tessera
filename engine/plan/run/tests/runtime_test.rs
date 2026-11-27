@@ -466,6 +466,7 @@ fn step_of(kernel: KernelRef, rule: &'static str, read: Slot, write: Slot, lane:
     Step {
         kernel,
         rule,
+        site: None,
         reads: vec![read],
         write,
         also: Vec::new(),
@@ -555,26 +556,25 @@ fn attrs_use_shared() {
         }),
         ..plain_kernel("res_smem", "res_smem_k", None)
     };
-    let plan = make_plan(
-        vec![64],
-        vec![make_step(dyn_k, 0, 16), make_step(res_k, 0, 16)],
-    );
-    let mut runner = open_runner(plan, false);
+    let steps = vec![make_step(dyn_k, 0, 16), make_step(res_k, 0, 16)];
+    let mut runner = open_runner(make_plan(vec![64], steps), false);
     assert_eq!(ctx.state().attr_calls, [(256, 49_152), (128, 16_384)]);
     runner.persist(Box::new(NoopGrid)).unwrap();
     runner.profiling(true);
     runner.submit(0..2).unwrap();
     let prof = runner.take_profile().unwrap();
-    let want = |sh, ctas| {
-        Some(KernelAttrs {
+    for (k, shared_bytes, ctas_per_sm) in [
+        ("dyn_smem [dyn_smem_k | test]", 1024 + 49_152, 1),
+        ("res_smem [res_smem_k | test]", 1024 + 16_384, 5),
+    ] {
+        let want = KernelAttrs {
             regs: 32,
             local_bytes: 0,
-            shared_bytes: sh,
-            ctas_per_sm: ctas,
-        })
-    };
-    assert_eq!(prof.spent["dyn_smem"].attrs, want(1024 + 49_152, 1));
-    assert_eq!(prof.spent["res_smem"].attrs, want(1024 + 16_384, 5));
+            shared_bytes,
+            ctas_per_sm,
+        };
+        assert_eq!(prof.spent[k].attrs, Some(want));
+    }
 }
 
 #[test]

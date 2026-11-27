@@ -261,6 +261,7 @@ pub struct Engine {
     asks: Option<Asks>,
     /// A ranked profile until the next control round carries it.
     held: Option<(u64, tessera_run::Profile)>,
+    carried: Option<(u64, tessera_run::Profile)>,
     /// The last profiles rank 0 gathered from all ranks.
     ranks: Option<tessera_run::Ranks>,
     /// Host n-gram embedding table for models with a PLE port.
@@ -487,6 +488,7 @@ impl Engine {
             profile: settings.profile.map(|every| [every, 0]),
             asks: settings.asks.clone(),
             held: None,
+            carried: None,
             ranks: None,
             ple: None,
             disk: None,

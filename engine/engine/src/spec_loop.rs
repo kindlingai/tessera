@@ -269,6 +269,11 @@ macro_rules! spec_entry {
                 self
             }
 
+            /// Starts or flushes dynamic profiling on the target engine.
+            pub fn settle(&mut self) -> Result<(), $crate::Error> {
+                self.target.settle()
+            }
+
             /// Follows rank 0's speculative requests until dismissed.
             pub fn follow(&mut self) -> Result<(), $crate::Error> {
                 let $this = self;

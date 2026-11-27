@@ -8,10 +8,11 @@ use crate::kernels::{
 };
 use crate::plan::{Slot, Step};
 use crate::rule::{Draft, Read, Rule, ways};
+use crate::select::Home;
 use crate::tree::{T, Term, Tree};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use tessera_graph::{Op, Stage};
+use tessera_graph::{Op, PathSeg, Stage};
 use tessera_platform::limits::{GRID_ACROSS, GRID_DOWN};
 use tessera_sim::ZoneKind;
 
@@ -602,6 +603,7 @@ fn stand_in(d: &Draft) -> Step {
     Step {
         kernel: d.kernel.clone(),
         rule: "",
+        site: None,
         reads: vec![slot; d.reads.len()],
         write: slot,
         also: vec![slot; d.also.len() + 1],
@@ -646,5 +648,28 @@ pub(crate) fn site_label(tree: &Tree<'_>, t: T) -> String {
         Term::Op(op) => format!("{op:?} {:?} ({})", n.shape, n.form.name()),
         Term::Stage(s) => format!("{s:?} {:?} ({})", n.shape, n.form.name()),
         Term::Leaf(_) => format!("leaf {:?} ({})", n.shape, n.form.name()),
+    }
+}
+
+/// Stable graph location for `t`: region, weight, and node id.
+pub(crate) fn graph_site(tree: &Tree<'_>, labels: Option<&[String]>, t: T) -> String {
+    let n = tree.node(t);
+    let id = n.from.0;
+    let region = labels
+        .filter(|_| !tree.g.regions.is_empty())
+        .and_then(|l| l.get(id as usize))
+        .map(String::as_str);
+    let weight = n.args.iter().find_map(|&a| match tree.node(a).term {
+        Term::Leaf(Home::Weight(w) | Home::Part(w, _)) => {
+            let p = &tree.g.weights[w as usize].path;
+            (!p.is_empty()).then(|| PathSeg::dotted(p))
+        }
+        _ => None,
+    });
+    match (region, weight) {
+        (Some(r), Some(w)) => format!("{r}:{w}@n{id}"),
+        (Some(r), None) => format!("{r}@n{id}"),
+        (None, Some(w)) => format!("{w}@n{id}"),
+        (None, None) => format!("n{id}"),
     }
 }

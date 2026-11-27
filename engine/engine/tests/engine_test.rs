@@ -172,6 +172,135 @@ fn profile_goes_to_sink() {
     assert_eq!(profile.spent["engine: launch"].count, 3);
 }
 
+/// Dropping the last ask flushes profile on idle.
+#[test]
+fn profile_flushes_on_drop() {
+    let (_, _, mut engine) = open(17, 1, &Settings::default());
+    let asks = Asks::default();
+    let (send, got) = std::sync::mpsc::channel();
+    engine.profile_into(
+        asks.clone(),
+        Box::new(move |ranks| send.send(ranks).unwrap()),
+    );
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    asks.on_empty(move || _ = wake_tx.send(()));
+    let mut batch = Batch::new(&mut engine, Box::new(Fair));
+    let ask = asks.hold();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    batch.submit(
+        Request {
+            tokens: vec![3, 9, 4],
+            max_tokens: 2,
+            ..Request::default()
+        },
+        Box::new(move |ev| {
+            if matches!(ev, Event::Done(_)) {
+                let _ = done_tx.send(());
+            }
+            true
+        }),
+    );
+    while batch.step().unwrap() {}
+    done_rx.try_recv().unwrap();
+    assert!(got.try_recv().is_err());
+    drop(ask);
+    wake_rx.try_recv().unwrap();
+    assert!(!batch.step().unwrap());
+    let ranks = got.try_recv().unwrap();
+    let profile = ranks.profiles[0].as_ref().unwrap();
+    assert!(
+        profile
+            .spent
+            .keys()
+            .any(|k| k.contains('[') && k.contains('|'))
+    );
+}
+
+/// Parking mid-request preserves and flushes profile samples across eviction.
+#[test]
+fn profile_survives_park() {
+    let req4 = || Request {
+        tokens: vec![3, 9, 4],
+        max_tokens: 4,
+        ..Request::default()
+    };
+    let noop = || -> tessera_engine::Sink { Box::new(|_| true) };
+    let (_, _, mut eng1) = open(17, 1, &Settings::default());
+    let asks = Asks::default();
+    let (send, got) = std::sync::mpsc::channel();
+    eng1.profile_into(asks.clone(), Box::new(move |r| send.send(r).unwrap()));
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    asks.on_empty(move || _ = wake_tx.send(()));
+    let mut b1 = Batch::new(&mut eng1, Box::new(Fair));
+    let ask = asks.hold();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    b1.submit(
+        req4(),
+        Box::new(move |ev| {
+            if matches!(ev, Event::Done(_)) {
+                let _ = done_tx.send(());
+            }
+            true
+        }),
+    );
+    assert!(b1.step().unwrap());
+    assert!(b1.busy() && got.try_recv().is_err());
+    let parked = b1.park().unwrap();
+    drop(eng1);
+    assert!(got.try_recv().is_err());
+
+    let (_, _, mut eng2) = open(17, 1, &Settings::default());
+    let mut b2 = Batch::resumed(&mut eng2, Box::new(Fair), parked);
+    while b2.step().unwrap() {}
+    done_rx.try_recv().unwrap();
+    assert!(got.try_recv().is_err());
+    drop(ask);
+    wake_rx.try_recv().unwrap();
+    assert!(!b2.step().unwrap());
+    let ranks = got.try_recv().unwrap();
+    let prof = ranks.profiles[0].as_ref().unwrap();
+    assert_eq!(ranks.launches, 4);
+    assert_eq!(prof.spent["engine: launch"].count, 4);
+
+    // Ask dropped while parked still flushes on resume.
+    let ask2 = asks.hold();
+    b2.submit(req4(), noop());
+    assert!(b2.step().unwrap());
+    let parked2 = b2.park().unwrap();
+    drop(eng2);
+    drop(ask2);
+    assert!(got.try_recv().is_err());
+    let (_, _, mut eng3) = open(17, 1, &Settings::default());
+    let mut b3 = Batch::resumed(&mut eng3, Box::new(Fair), parked2);
+    assert!(b3.step().unwrap());
+    assert_eq!(got.try_recv().unwrap().launches, 1);
+    while b3.step().unwrap() {}
+
+    // Dropping parked state without resuming flushes preserved samples.
+    let ask3 = asks.hold();
+    b3.submit(req4(), noop());
+    assert!(b3.step().unwrap());
+    let parked3 = b3.park().unwrap();
+    drop(eng3);
+    assert!(got.try_recv().is_err());
+    drop(parked3);
+    drop(ask3);
+    assert_eq!(got.try_recv().unwrap().launches, 1);
+
+    // Parking after ask already dropped flushes immediately.
+    let (_, _, mut eng4) = open(17, 1, &Settings::default());
+    let (tx4, rx4) = std::sync::mpsc::channel();
+    let asks4 = Asks::default();
+    eng4.profile_into(asks4.clone(), Box::new(move |r| tx4.send(r).unwrap()));
+    let mut b4 = Batch::new(&mut eng4, Box::new(Fair));
+    let ask4 = asks4.hold();
+    b4.submit(req4(), noop());
+    assert!(b4.step().unwrap());
+    drop(ask4);
+    let _ = b4.park().unwrap();
+    assert_eq!(rx4.try_recv().unwrap().launches, 1);
+}
+
 #[test]
 fn rows_mix_slots() {
     // The interpreter keeps rows densely. Layouts and rules must agree.

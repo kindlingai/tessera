@@ -219,6 +219,21 @@ pub(super) fn open_drafter(
     Ok(drafter)
 }
 
+/// Drives a single-slot speculative decoder loop.
+pub(super) trait SpecRun {
+    fn generate(&mut self, request: Request, sink: &mut Sink) -> Result<SpecStats, tessera_engine::Error>;
+    fn settle(&mut self) -> Result<(), tessera_engine::Error>;
+}
+
+impl SpecRun for Speculate<'_> {
+    fn generate(&mut self, request: Request, sink: &mut Sink) -> Result<SpecStats, tessera_engine::Error> {
+        self.generate(request, sink)
+    }
+    fn settle(&mut self) -> Result<(), tessera_engine::Error> {
+        self.settle()
+    }
+}
+
 /// Drives a continuous-batching speculative decoder loop.
 pub(super) trait SpecBatch {
     fn busy(&self) -> bool;
@@ -324,9 +339,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
         return spec.follow().map_err(|e| e.to_string());
     }
     let mut spec = spec.with_spec_len(sl);
-    serve(load, &settings, generate, "dflash", |req, sink| {
-        spec.generate(req, sink).map_err(|e| e.to_string())
-    })?;
+    serve(load, &settings, generate, "dflash", &mut spec)?;
     let _ = engine.dismiss();
     Ok(())
 }
@@ -337,28 +350,32 @@ pub(super) fn serve(
     settings: &Settings,
     generate: Generate,
     label: &str,
-    mut run: impl FnMut(Request, &mut Sink) -> Result<SpecStats, String>,
+    spec: &mut impl SpecRun,
 ) -> Result<(), String> {
     let mut jobs = queue(load, generate, false);
     while let Some(started) = jobs.pull(false) {
-      for (request, mut sink) in started {
-        let t0 = Instant::now();
-        let stats = run(request, &mut sink)?;
-        if settings.profile.is_some() && stats.steps > 0 {
-            let ms = t0.elapsed().as_secs_f64() * 1e3;
-            eprintln!(
-                "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms, dflash {}, mtp {}, sw {})",
-                stats.emitted,
-                stats.steps,
-                stats.mean_step(),
-                ms / stats.steps as f64,
-                ms,
-                stats.dflash_steps,
-                stats.mtp_steps,
-                stats.switches,
-            );
+        if started.is_empty() {
+            spec.settle().map_err(|e| e.to_string())?;
+            continue;
         }
-      }
+        for (request, mut sink) in started {
+            let t0 = Instant::now();
+            let stats = spec.generate(request, &mut sink).map_err(|e| e.to_string())?;
+            if settings.profile.is_some() && stats.steps > 0 {
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "{label}: {} tok in {} steps ({:.2} tok/step, {:.1} ms/step, {:.1} ms, dflash {}, mtp {}, sw {})",
+                    stats.emitted,
+                    stats.steps,
+                    stats.mean_step(),
+                    ms / stats.steps as f64,
+                    ms,
+                    stats.dflash_steps,
+                    stats.mtp_steps,
+                    stats.switches,
+                );
+            }
+        }
     }
     Ok(())
 }

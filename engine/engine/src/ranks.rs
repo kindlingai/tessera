@@ -106,6 +106,47 @@ impl Place {
     }
 }
 
+/// Profile state preserved while an engine is evicted.
+pub(crate) struct ParkedProfile {
+    pub(crate) carried: Option<(u64, Profile)>,
+    pub(crate) asks: Option<Asks>,
+    pub(crate) sink: Option<Box<dyn FnMut(Ranks) + Send>>,
+}
+
+impl ParkedProfile {
+    /// Emits any carried profile if never resumed.
+    pub(crate) fn flush(&mut self) {
+        let Some((launches, profile)) = self.carried.take() else {
+            return;
+        };
+        match &mut self.sink {
+            Some(sink) => sink(Ranks {
+                launches,
+                profiles: vec![Some(profile)],
+            }),
+            None => eprintln!(
+                "profile of {launches} launches:\n{}",
+                profile.report(launches)
+            ),
+        }
+    }
+}
+
+fn merge_carried(
+    carried: Option<(u64, Profile)>,
+    now: Option<(u64, Profile)>,
+) -> Option<(u64, Profile)> {
+    match (carried, now) {
+        (Some((l0, mut p0)), Some((l1, p1))) => {
+            p0.merge(p1);
+            Some((l0 + l1, p0))
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// Opens a ranked runner with an optional persistent sum grid.
 pub(crate) fn open_rank<T: Transport + 'static>(
     plan: tessera_lower::Plan,
@@ -297,7 +338,8 @@ impl Engine {
             return;
         }
         let launches = std::mem::take(done);
-        let Some(profile) = self.take_profile() else {
+        let now = self.take_profile().map(|p| (launches, p));
+        let Some((launches, profile)) = merge_carried(self.carried.take(), now) else {
             return;
         };
         match self.control {
@@ -312,23 +354,15 @@ impl Engine {
             return;
         }
         let launches = self.profile.take().map_or(0, |[_, done]| done);
-        if let Some(profile) = self.take_profile().filter(|_| !on) {
-            self.held = Some((launches, profile));
+        if !on {
+            let now = self.take_profile().map(|p| (launches, p));
+            self.held = merge_carried(self.carried.take(), now);
         }
         self.runner.profiling(on);
         self.profile = on.then_some([u64::MAX, 0]);
     }
 
-    /// Profiles while requests ask. Stopping prints the profile.
-    pub fn settle(&mut self) -> Result<(), Error> {
-        let Some(asks) = &self.asks else {
-            return Ok(());
-        };
-        let on = asks.wanted();
-        let lead = self.control.as_ref().is_none_or(|c| c.rank() == 0);
-        if !lead || on == self.profile.is_some() {
-            return Ok(());
-        }
+    fn switch_profile(&mut self, on: bool) -> Result<(), Error> {
         let tag = match on {
             true => PROFILE_ON,
             false => PROFILE_OFF,
@@ -349,6 +383,69 @@ impl Engine {
             self.round(&tag)?;
         }
         Ok(())
+    }
+
+    /// Profiles while requests ask. Stopping prints the profile.
+    pub fn settle(&mut self) -> Result<(), Error> {
+        let Some(asks) = &self.asks else {
+            return Ok(());
+        };
+        let on = asks.wanted();
+        let lead = self.control.as_ref().is_none_or(|c| c.rank() == 0);
+        if !lead {
+            return Ok(());
+        }
+        if !on && self.profile.is_none() {
+            if let Some((launches, profile)) = self.carried.take() {
+                self.hand(launches, profile);
+            }
+            return Ok(());
+        }
+        if on == self.profile.is_some() {
+            return Ok(());
+        }
+        self.switch_profile(on)
+    }
+
+    /// Saves or flushes active profile data before eviction.
+    pub(crate) fn park_profile(&mut self) -> Result<Option<ParkedProfile>, Error> {
+        self.settle()?;
+        if self.control.is_some() {
+            let lead = self.control.as_ref().is_some_and(|c| c.rank() == 0);
+            if lead && self.profile.is_some() {
+                self.switch_profile(false)?;
+            }
+            return Ok(None);
+        }
+        let now = if let Some([_, done]) = self.profile.take() {
+            let taken = self.take_profile().map(|p| (done, p));
+            self.runner.profiling(false);
+            taken
+        } else {
+            None
+        };
+        let carried = merge_carried(self.carried.take(), now);
+        let asks = self.asks.clone();
+        let sink = self.profiled.take();
+        if carried.is_none() && sink.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ParkedProfile {
+            carried,
+            asks,
+            sink,
+        }))
+    }
+
+    /// Restores profile state preserved across eviction.
+    pub(crate) fn resume_profile(&mut self, parked: ParkedProfile) {
+        if self.asks.is_none() {
+            self.asks = parked.asks;
+        }
+        if self.profiled.is_none() {
+            self.profiled = parked.sink;
+        }
+        self.carried = merge_carried(self.carried.take(), parked.carried);
     }
 
     /// The last profiles rank 0 gathered, one per rank.

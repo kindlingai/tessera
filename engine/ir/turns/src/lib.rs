@@ -323,6 +323,14 @@ impl Table {
         s.asked = true;
     }
 
+    /// Wakes a resident seat without reloading an evicted one.
+    pub fn nudge(&mut self, at: usize) {
+        let s = &mut self.seats[at];
+        if matches!(s.place, Place::In(_) | Place::Draining(_)) {
+            s.asked = true;
+        }
+    }
+
     /// The seat ran its step. `running` answers hold slots.
     pub fn stepped(&mut self, at: usize, (busy, running): (bool, usize), bytes: u64, now: f64) {
         self.holder = None;
@@ -431,6 +439,11 @@ impl Asker {
     /// A job entered the model's queue.
     pub fn asked(&self) {
         self.turns.change(false, |t, now| t.asked(self.at, now));
+    }
+
+    /// Wakes the model if resident, without reloading it.
+    pub fn nudge(&self) {
+        self.turns.change(false, |t, _| t.nudge(self.at));
     }
 }
 

@@ -285,3 +285,221 @@ fn swallowed_fallback_works() {
     let split = pair().adding(inner).adding(outer).favoring("inner");
     assert_eq!(names(&plan(&split)), ["priced", "dear"]);
 }
+
+#[derive(Debug)]
+struct TagKernel(&'static str);
+
+impl Kernel for TagKernel {
+    fn name(&self) -> &'static str {
+        "fast_mm"
+    }
+    fn sizes(&self) -> Vec<usize> {
+        vec![8, 640]
+    }
+    fn source(&self) -> tessera_lower::Source {
+        tessera_lower::Source::Fixed {
+            text: tessera_lower::ByBackend::from_fn(|_| ""),
+            entry: self.0,
+        }
+    }
+    fn launches(&self, _: &Step) -> Vec<Launch> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn key_and_ranks_attrs() {
+    use tessera_gpukit::device::KernelAttrs;
+    use tessera_lower::{KernelRef, Slot};
+    use tessera_run::{Profile, Ranks, Spent};
+    let mk = |entry, rule, site: Option<&str>| Step {
+        kernel: KernelRef::new(TagKernel(entry)),
+        rule,
+        site: site.map(str::to_string),
+        reads: Vec::new(),
+        write: Slot::floats(0, 8),
+        also: Vec::new(),
+        covers: Vec::new(),
+        zone: 0,
+        lane: 0,
+        table: None,
+        index_table: None,
+    };
+    let k0 = Profile::key(&mk("mm_r8", "fast", Some("matmul [8]")));
+    let k1 = Profile::key(&mk("mm_r16", "fast", Some("matmul [8]")));
+    let k2 = Profile::key(&mk("mm_r8", "alt", Some("matmul [8]")));
+    let k3 = Profile::key(&mk("mm_r8", "fast", Some("matmul [16]")));
+    assert_eq!(k0.split(' ').next(), Some("fast_mm"));
+    assert!(k0 != k1 && k0 != k2 && k0 != k3);
+    assert!(k0.contains("mm_r8 | fast | matmul [8]"), "{k0}");
+    let mut r0 = Profile::default();
+    let mut r1 = Profile::default();
+    let spill = KernelAttrs {
+        regs: 96,
+        local_bytes: 32,
+        shared_bytes: 4096,
+        ctas_per_sm: 3,
+    };
+    let s = |sec, attrs| Spent {
+        seconds: sec,
+        count: 4,
+        work: 4e8,
+        bytes: 8e8,
+        attrs,
+    };
+    r0.spent.insert(k0.clone(), s(0.2, None));
+    r1.spent.insert(k0.clone(), s(0.2, Some(spill)));
+    let text = Ranks {
+        launches: 2,
+        profiles: vec![Some(r0), Some(r1)],
+    }
+    .to_string();
+    assert!(
+        text.contains("count    us each      G/s     GB/s regs   smem   lmem cta"),
+        "{text}"
+    );
+    assert!(
+        text.contains("2.0    50000.0      2.0      4.0   96     4K    32B   3"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("  {k0}  SPILL")), "{text}");
+}
+
+struct SameMadeTag(&'static str);
+
+impl std::fmt::Debug for SameMadeTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("same_made_tag")
+    }
+}
+
+impl Kernel for SameMadeTag {
+    fn name(&self) -> &'static str {
+        "made_mm"
+    }
+    fn sizes(&self) -> Vec<usize> {
+        vec![8, 640]
+    }
+    fn source(&self) -> tessera_lower::Source {
+        let tessera_lower::Source::Made(mut body) = Map::plain(Vec::new()).source() else {
+            unreachable!();
+        };
+        body.entry = self.0.into();
+        tessera_lower::Source::Made(body)
+    }
+    fn launches(&self, _: &Step) -> Vec<Launch> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn sites_separate_layers() {
+    use tessera_graph::{
+        Composite, Entry, Node, NodeId, Op, Output, Placement, Region, Shape, Weight,
+    };
+    use tessera_lower::{KernelRef, Slot, kernel_identity};
+    use tessera_run::Profile;
+
+    struct MmRule;
+    impl Propose for MmRule {
+        fn at(&self, tree: &Tree, at: T) -> Option<Vec<Draft>> {
+            let n = tree.node(at);
+            matches!(n.term, Term::Op(Op::Matmul)).then(|| {
+                vec![Draft::new(
+                    TagKernel("mm_entry"),
+                    n.args.clone(),
+                    tree.elements(at),
+                )]
+            })
+        }
+    }
+
+    let mut g = Graph::new(vec![Dim::bounded(Rows, 8)]);
+    let ty = |dims: Vec<tessera_graph::DimExpr>| TensorType {
+        dtype: DType::F32,
+        shape: Shape(dims),
+        placement: Placement::Replicated,
+    };
+    let x_ty = ty(vec![Rows.into(), 16u64.into()]);
+    let w_ty = ty(vec![16u64.into(), 16u64.into()]);
+    g.weights.push(Weight {
+        path: vec![],
+        ty: w_ty.clone(),
+    });
+    g.weights.push(Weight {
+        path: vec![],
+        ty: w_ty.clone(),
+    });
+    let mut push = |op: Op, args: Vec<NodeId>, t: TensorType| -> NodeId {
+        let id = NodeId(g.nodes.len() as u32);
+        g.nodes.push(Node {
+            op,
+            args,
+            ty: t,
+            numerics: None,
+        });
+        id
+    };
+    let x = push(Op::Input { entry: 0, port: 0 }, vec![], x_ty.clone());
+    let w0 = push(Op::Weight(0), vec![], w_ty.clone());
+    let mm0 = push(Op::Matmul, vec![x, w0], x_ty.clone());
+    g.regions.push(Region {
+        kind: Composite::Layer,
+        start: w0,
+        end: NodeId(mm0.0 + 1),
+        inputs: vec![x],
+        outputs: vec![mm0],
+    });
+    let w1 = push(Op::Weight(1), vec![], w_ty);
+    let mm1 = push(Op::Matmul, vec![mm0, w1], x_ty.clone());
+    g.regions.push(Region {
+        kind: Composite::Layer,
+        start: w1,
+        end: NodeId(mm1.0 + 1),
+        inputs: vec![mm0],
+        outputs: vec![mm1],
+    });
+    g.entries.push(Entry {
+        kind: EntryKind::Step,
+        inputs: vec![Port {
+            role: Role::Tokens,
+            ty: x_ty,
+        }],
+        outputs: vec![Output {
+            role: Role::Logits,
+            node: mm1,
+        }],
+    });
+    let rule = Rule::made("mm_rule", module_path!(), MmRule);
+    let plan = lower(&g, 0, &[(Rows, 1)], &Device::default().adding(rule)).unwrap();
+    let s0 = plan.steps.iter().find(|s| s.covers.contains(&mm0)).unwrap();
+    let s1 = plan.steps.iter().find(|s| s.covers.contains(&mm1)).unwrap();
+    assert_eq!(s0.kernel.name(), s1.kernel.name());
+    assert_eq!(s0.kernel.sizes(), s1.kernel.sizes());
+    assert_eq!(s0.rule, s1.rule);
+    assert_eq!(kernel_identity(&*s0.kernel), kernel_identity(&*s1.kernel));
+    let site0 = s0.site.as_deref().unwrap();
+    let site1 = s1.site.as_deref().unwrap();
+    assert!(site0.contains("layer.0"), "{site0}");
+    assert!(site1.contains("layer.1"), "{site1}");
+    assert_ne!(Profile::key(s0), Profile::key(s1));
+
+    // Identical-Debug Source::Made kernels still separate by entry.
+    let mk = |entry| Step {
+        kernel: KernelRef::new(SameMadeTag(entry)),
+        rule: "r",
+        site: Some("layer.0@n1".into()),
+        reads: Vec::new(),
+        write: Slot::floats(0, 8),
+        also: Vec::new(),
+        covers: Vec::new(),
+        zone: 0,
+        lane: 0,
+        table: None,
+        index_table: None,
+    };
+    let ka = Profile::key(&mk("made_a"));
+    let kb = Profile::key(&mk("made_b"));
+    assert_ne!(ka, kb);
+    assert!(ka.contains("made_a") && kb.contains("made_b"));
+}

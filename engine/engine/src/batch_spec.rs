@@ -38,10 +38,10 @@ pub(crate) trait RoundHost<'a> {
 
 /// Executes one coordinator round on `host`.
 pub(crate) fn drive_step<'a>(host: &mut impl RoundHost<'a>) -> Result<bool, Error> {
+    host.core().target.settle()?;
     if !host.is_busy() {
         return Ok(false);
     }
-    host.core().target.settle()?;
     let cancelled = host.collect_cancelled();
     let admitted = host.admit_local();
     let hash = host.core().hash;

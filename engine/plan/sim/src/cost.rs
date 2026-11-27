@@ -59,9 +59,9 @@ impl Sample {
         }
     }
 
-    /// The same kernel and sizes, whatever its source or time.
+    /// The same kernel, source and work, whatever its time.
     fn same(&self, other: &Sample) -> bool {
-        self.kernel == other.kernel && self.work == other.work
+        self.kernel == other.kernel && self.source == other.source && self.work == other.work
     }
 }
 
@@ -90,22 +90,33 @@ impl Timings {
     }
 
     fn fresh(&self, name: &str, now: &Sample, cold: bool) -> bool {
-        let fresh =
-            |s: &Sample| s.same(now) && s.source == now.source && (!cold || s.cold.is_some());
+        let fresh = |s: &Sample| s.same(now) && (!cold || s.cold.is_some());
         self.0.get(name).is_some_and(|t| t.iter().any(fresh))
     }
 
-    /// Seconds at `work`, cold ones scaled by the nearest ratio.
-    pub fn estimate(&self, name: &str, sizes: &[usize], work: f64, cold: bool) -> Option<f64> {
+    /// Seconds at `work`, preferring matching `source` samples when present.
+    pub fn estimate(
+        &self,
+        name: &str,
+        source: Option<u64>,
+        sizes: &[usize],
+        work: f64,
+        cold: bool,
+    ) -> Option<f64> {
         let (timed, at) = (self.0.get(name)?, place(sizes, work));
         let scaled = |s: &Sample| match s.work > 0.0 {
             true => Some(s.seconds * work / s.work),
             false => Some(s.seconds),
         };
-        let warm = estimate(timed, &at, scaled)?;
+        let pick = |val: &dyn Fn(&Sample) -> Option<f64>| {
+            source
+                .and_then(|src| estimate(timed, &at, |s| (s.source == src).then(|| val(s))?))
+                .or_else(|| estimate(timed, &at, val))
+        };
+        let warm = pick(&scaled)?;
         let ratio = |s: &Sample| Some(s.cold? / s.seconds);
         Some(match cold {
-            true => warm * estimate(timed, &at, ratio).unwrap_or(1.0),
+            true => warm * pick(&ratio).unwrap_or(1.0),
             false => warm,
         })
     }

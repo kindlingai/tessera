@@ -150,4 +150,11 @@ fn oversize_model_trims() {
     t.loaded(b, 70, 1.0, 0, 2.0);
     t.settle(2.0);
     assert_eq!(t.turn(a), Some(Turn::Leave));
+    t.left(a, 2.0);
+    t.nudge(a);
+    t.settle(2.0);
+    assert_eq!(t.turn(a), None);
+    t.nudge(b);
+    t.settle(2.0);
+    assert_eq!(t.turn(b), Some(Turn::Step { admit: true }));
 }

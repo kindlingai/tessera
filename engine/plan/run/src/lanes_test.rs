@@ -7,6 +7,7 @@ fn dummy(lane: u8, reads: Vec<Slot>, write: Slot) -> Step {
     Step {
         kernel: KernelRef::new(Map::plain(Vec::new())),
         rule: "test",
+        site: None,
         reads,
         write,
         also: Vec::new(),

@@ -60,6 +60,7 @@ pub struct Op {
     pub kernel: KernelRef,
     /// The proposing rule.
     pub rule: &'static str,
+    pub site: Option<String>,
     pub reads: Vec<Val>,
     pub write: Val,
     /// Extra values this launch also writes.
@@ -170,8 +171,10 @@ fn select_with(
     tree.knobs = device.knobs.clone();
     tree.kept_rows = device.kept_rows;
     tree.index_rows = device.index_rows;
-    let labels = device.scoped().then(|| crate::recipe::labels(g));
-    if let Some(labels) = &labels {
+    let labels = (device.scoped() || !g.regions.is_empty()).then(|| crate::recipe::labels(g));
+    if device.scoped()
+        && let Some(labels) = &labels
+    {
         tree.computes = labels.iter().map(|l| device.compute_at(l)).collect();
     }
     let whole: Vec<&Rule> = rules
@@ -230,7 +233,7 @@ fn select_with(
         }
     }
     let scan = explain.then(|| scan_cover(&cover, &own));
-    let mut e = Emit::default();
+    let mut e = Emit::with_labels(cover.labels.as_deref());
     for (port, (len, shape, dtype)) in tree.ports.iter().enumerate() {
         let val = e.value(
             *len,
@@ -297,7 +300,7 @@ fn select_with(
 
 /// Emits one chosen cover's drafts, optionally targeting kept rows.
 fn emit_choice(
-    e: &mut Emit,
+    e: &mut Emit<'_>,
     tree: &Tree,
     t: T,
     choice: cover::Choice,
@@ -317,6 +320,7 @@ fn emit_choice(
     let mut written = Vec::new();
     let last = choice.drafts.len() - 1;
     for (i, d) in choice.drafts.into_iter().enumerate() {
+        let site = cover::graph_site(tree, e.labels, d.writes.unwrap_or(t));
         let mut args = Vec::with_capacity(d.reads.len());
         for r in &d.reads {
             args.push(match r {
@@ -351,6 +355,7 @@ fn emit_choice(
         let (primary, extras) = e.op(
             d,
             choice.rule,
+            Some(site.as_str()),
             args,
             &covers,
             zone,

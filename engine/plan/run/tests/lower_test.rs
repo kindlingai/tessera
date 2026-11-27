@@ -260,6 +260,7 @@ fn mapped(len: usize) -> Step {
     Step {
         kernel: KernelRef::new(gate()),
         rule: "map",
+        site: None,
         reads: Vec::new(),
         write: Slot::floats(0, len),
         also: Vec::new(),
@@ -783,6 +784,7 @@ fn arenas_pack_zones() {
     let op = |reads, write, zone| Op {
         kernel: KernelRef::new(Map::plain(Vec::new())),
         rule: "map",
+        site: None,
         reads,
         write,
         also: Vec::new(),
@@ -914,6 +916,7 @@ fn comm_overlaps_compute() {
     let op = |kernel, reads, write| Op {
         kernel,
         rule: "test",
+        site: None,
         reads,
         write,
         also: Vec::new(),

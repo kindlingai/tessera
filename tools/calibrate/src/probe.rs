@@ -184,6 +184,7 @@ impl Probe {
         let step = Step {
             kernel: KernelRef::new(*self),
             rule: "probe",
+            site: None,
             reads: vec![input],
             write: slot(1, write),
             also: Vec::new(),

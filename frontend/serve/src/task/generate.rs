@@ -1,6 +1,6 @@
 //! Text generation, batched over slots and ranks.
 
-use super::intake::{Arrival, Feed};
+use super::intake::{Arrival, Feed, Wake};
 use super::{Entry, Flag, Load, Pick};
 use crate::ranks::Links;
 use crate::start::Options;
@@ -360,6 +360,15 @@ pub(super) fn guides(
     }
 }
 
+/// Notifies `Wake` when dropped so closing the queue wakes `pull`.
+struct WakeGuard(Wake);
+
+impl Drop for WakeGuard {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
+
 /// Fills the slot with `generate`. Returns the job queue.
 pub(super) fn queue(load: &Load, generate: Generate, score: bool) -> Feed<Job> {
     seated(load, generate, score, None)
@@ -374,7 +383,26 @@ fn seated(
 ) -> Feed<Job> {
     let generate = Arc::new(generate);
     let (queue, jobs) = mpsc::channel::<Job>();
-    let sent = seat.map(|s| Box::new(move || s.asked()) as Box<dyn Fn() + Send + Sync>);
+    let (sent, feed) = match seat {
+        Some(s) => {
+            if let Some(asks) = &load.asks {
+                let nudge = s.clone();
+                asks.on_empty(move || nudge.nudge());
+            }
+            let sent = Some(Box::new(move || s.asked()) as Box<dyn Fn() + Send + Sync>);
+            (sent, Feed::new(jobs, Box::new(Arrival::default())))
+        }
+        None => {
+            let wake = Wake::default();
+            if let Some(asks) = &load.asks {
+                let flush = wake.clone();
+                asks.on_empty(move || flush.notify());
+            }
+            let guard = WakeGuard(wake.clone());
+            let sent = Some(Box::new(move || guard.0.notify()) as Box<dyn Fn() + Send + Sync>);
+            (sent, Feed::with_wake(jobs, Box::new(Arrival::default()), wake))
+        }
+    };
     let queued = Arc::new(Queued {
         generate: generate.clone(),
         jobs: Mutex::new(queue),
@@ -385,7 +413,7 @@ fn seated(
         m.generator = Some(queued.clone());
         m.score = score.then_some(queued as Arc<dyn Score>);
     });
-    Feed::new(jobs, Box::new(Arrival::default()))
+    feed
 }
 
 /// A model's graph and weights, kept for each reload.
@@ -438,7 +466,7 @@ fn serve(mut batch: Batch, jobs: &mut Feed<Job>, seat: &Seated) -> Result<Parked
     loop {
         match seat.next() {
             Turn::Step { admit } => batch.admitting(admit),
-            Turn::Leave => return Ok(batch.park()),
+            Turn::Leave => return batch.park().map_err(|e| e.to_string()),
             Turn::Load => continue,
         }
         for (request, sink) in jobs.ready(batch.busy()) {

@@ -3,6 +3,7 @@
 use crate::guide::{Edit, settle};
 use crate::kept::{Kept, Totals};
 use crate::lanes::Lanes;
+use crate::ranks::ParkedProfile;
 use crate::sample::{Sampler, Target, Weights, accept, take};
 use crate::{Allowed, Engine, Error, Event, Launch, Reason, Request, Row, ends, launch_of};
 use std::collections::VecDeque;
@@ -191,6 +192,15 @@ impl Engine {
 pub struct Parked {
     waiting: VecDeque<(Request, Sink)>,
     paused: VecDeque<Seq>,
+    profile: Option<ParkedProfile>,
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if let Some(mut profile) = self.profile.take() {
+            profile.flush();
+        }
+    }
 }
 
 /// Many answers over one engine, a step at a time.
@@ -317,22 +327,27 @@ impl<'a> Batch<'a> {
     }
 
     /// As `new`, with the answers another batch parked.
-    pub fn resumed(engine: &'a mut Engine, policy: Box<dyn Policy>, parked: Parked) -> Self {
+    pub fn resumed(engine: &'a mut Engine, policy: Box<dyn Policy>, mut parked: Parked) -> Self {
+        if let Some(profile) = parked.profile.take() {
+            engine.resume_profile(profile);
+        }
         let mut batch = Self::new(engine, policy);
-        batch.waiting = parked.waiting;
-        batch.paused = parked.paused;
+        batch.waiting = std::mem::take(&mut parked.waiting);
+        batch.paused = std::mem::take(&mut parked.paused);
         batch
     }
 
     /// Pauses every answer. Gives them up with the queue.
-    pub fn park(mut self) -> Parked {
+    pub fn park(mut self) -> Result<Parked, Error> {
+        let profile = self.engine.park_profile()?;
         while let Some(seq) = self.active.pop() {
             self.pause(seq);
         }
-        Parked {
+        Ok(Parked {
             waiting: self.waiting,
             paused: self.paused,
-        }
+            profile,
+        })
     }
 
     /// Whether waiting answers may start.

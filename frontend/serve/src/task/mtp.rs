@@ -1,7 +1,7 @@
 //! MTP drafting, given `--mtp`. DFlash joins when `--draft` is given.
 
 use super::draft::{
-    ADAPTIVE, DraftLinks, SPEC_LEN, SpecBatch, begin, drive_batch, front, open_drafter,
+    ADAPTIVE, DraftLinks, SPEC_LEN, SpecBatch, SpecRun, begin, drive_batch, front, open_drafter,
     open_target, serve, spec_len, split_links,
 };
 use super::generate::check_lowering;
@@ -75,6 +75,32 @@ pub(super) fn open_mtp(
         .each_counted(&o.progress, count, |at| shares[at as usize], take)
         .map_err(|e| e.to_string())?;
     Ok(drafter)
+}
+
+impl SpecRun for MtpSpeculate<'_> {
+    fn generate(
+        &mut self,
+        request: tessera_engine::Request,
+        sink: &mut tessera_engine::Sink,
+    ) -> Result<tessera_engine::SpecStats, tessera_engine::Error> {
+        self.generate(request, sink)
+    }
+    fn settle(&mut self) -> Result<(), tessera_engine::Error> {
+        self.settle()
+    }
+}
+
+impl SpecRun for DualSpeculate<'_> {
+    fn generate(
+        &mut self,
+        request: tessera_engine::Request,
+        sink: &mut tessera_engine::Sink,
+    ) -> Result<tessera_engine::SpecStats, tessera_engine::Error> {
+        self.generate(request, sink)
+    }
+    fn settle(&mut self) -> Result<(), tessera_engine::Error> {
+        self.settle()
+    }
 }
 
 impl SpecBatch for BatchMtp<'_> {
@@ -152,9 +178,7 @@ fn open(load: &Load, settings: Settings) -> Result<(), String> {
     }
     let sl = spec_len(load, depth, CostModel::mtp(), true);
     let mut spec = spec.with_spec_len(sl);
-    serve(load, &settings, generate, "mtp", |req, sink| {
-        spec.generate(req, sink).map_err(|e| e.to_string())
-    })?;
+    serve(load, &settings, generate, "mtp", &mut spec)?;
     let _ = engine.dismiss();
     Ok(())
 }
@@ -249,9 +273,7 @@ fn open_dual(load: &Load, settings: Settings) -> Result<(), String> {
         return spec.follow().map_err(|e| e.to_string());
     }
     let mut spec = spec.with_selector(selector);
-    serve(load, &settings, generate, "dual", |req, sink| {
-        spec.generate(req, sink).map_err(|e| e.to_string())
-    })?;
+    serve(load, &settings, generate, "dual", &mut spec)?;
     let _ = engine.dismiss();
     Ok(())
 }

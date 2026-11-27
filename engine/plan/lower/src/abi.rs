@@ -204,6 +204,14 @@ impl Source {
         Source::Made(body)
     }
 
+    /// The kernel's entry symbol name.
+    pub fn entry(&self) -> &str {
+        match self {
+            Source::Fixed { entry, .. } => entry,
+            Source::Made(body) => &body.entry,
+        }
+    }
+
     /// Changes whenever the kernel's text does.
     pub fn hash(&self) -> u64 {
         match self {

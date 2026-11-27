@@ -120,10 +120,7 @@ fn inode(_: &Metadata) -> u64 {
 
 /// The name a kernel file takes, before its extension.
 pub(crate) fn entry(source: &Source) -> &str {
-    match source {
-        Source::Fixed { entry, .. } => entry,
-        Source::Made(body) => &body.entry,
-    }
+    source.entry()
 }
 
 /// The text a GPU runner compiles for `step` on `backend`.
