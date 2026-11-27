@@ -724,3 +724,27 @@ fn wave_error_fences() {
         ]
     );
 }
+
+/// Block states join once, not once per reader.
+#[test]
+fn states_join_once() {
+    let c = Config::mini(1, 4096);
+    let g = stepper::<Coded>(&c);
+    let mixed = tessera_lower::form::named("trellis_mix_pmcgx").unwrap();
+    let mut pins = tessera_lower::Pins::default();
+    for set in ["gate", "up", "down"] {
+        pins = pins.pin(&format!("*.{set}"), mixed);
+    }
+    let device = Device::guess(&host()).on(metal()).pinned(pins);
+    let plan = lower(&g, 0, &[(Seqs, 1), (Rows, 1), (Context, 4096)], &device).unwrap();
+    let joins = plan
+        .steps
+        .iter()
+        .filter(|s| s.kernel.name().starts_with("join"))
+        .count();
+    assert!(
+        joins < 250 && plan.steps.len() < 3900,
+        "joins={joins} steps={}",
+        plan.steps.len()
+    );
+}

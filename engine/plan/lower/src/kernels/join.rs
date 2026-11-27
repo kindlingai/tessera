@@ -29,11 +29,11 @@ fn join(
             return;
         }
         if col4 < left4 {
-            let v = a.load4((row * left + col4 * 4) as u64);
-            out.store4((gid() * 4) as u64, F32x4::new(v.x, v.y, v.z, v.w));
+            let v = a.load4(row as u64 * left as u64 + col4 as u64 * 4u64);
+            out.store4(gid() as u64 * 4u64, F32x4::new(v.x, v.y, v.z, v.w));
         } else {
-            let v = b.load4((row * right + (col4 - left4) * 4) as u64);
-            out.store4((gid() * 4) as u64, F32x4::new(v.x, v.y, v.z, v.w));
+            let v = b.load4(row as u64 * right as u64 + (col4 - left4) as u64 * 4u64);
+            out.store4(gid() as u64 * 4u64, F32x4::new(v.x, v.y, v.z, v.w));
         }
     } else {
         let width = left + right;
@@ -43,9 +43,9 @@ fn join(
             return;
         }
         let v = if col < left {
-            a[(row * left + col) as u64]
+            a[row as u64 * left as u64 + col as u64]
         } else {
-            b[(row * right + col - left) as u64]
+            b[row as u64 * right as u64 + (col - left) as u64]
         };
         out[gid() as u64] = v;
     }

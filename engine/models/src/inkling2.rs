@@ -427,16 +427,46 @@ struct Run<'a, E> {
     step: Option<(&'a Tensor, &'a [Virt])>,
 }
 
+/// Unit-RMS block states, and their join by depth.
+#[derive(Clone, Default)]
+struct States {
+    unit: Vec<Tensor>,
+    /// Every state so far, joined once.
+    joined: Option<Tensor>,
+}
+
+impl States {
+    fn push(&mut self, unit: Tensor) {
+        self.joined = Some(match &self.joined {
+            Some(joined) => joined.concat(&unit),
+            None => unit.clone(),
+        });
+        self.unit.push(unit);
+    }
+
+    /// The states from `at` on, joined afresh.
+    fn after(&self, at: usize) -> States {
+        let mut rest = States::default();
+        for unit in self.unit.iter().skip(at) {
+            rest.push(unit.clone());
+        }
+        rest
+    }
+}
+
 impl<E: ExpertSet> Run<'_, E> {
     fn shape<const N: usize>(&self, rest: [DimExpr; N]) -> Vec<DimExpr> {
         cat(&self.lead, rest)
     }
 
     /// Unit-RMS `states` and `partial`, stacked by depth.
-    fn stack(&self, states: &[Tensor], partial: &Tensor) -> Tensor {
-        let depth = DimExpr::Const(states.len() as u64 + 1);
-        let unit = states.iter().chain([partial]).map(|s| s.rms(self.c.eps));
-        let all = unit.reduce(|a, b| a.concat(&b)).expect("partial present");
+    fn stack(&self, states: &States, partial: &Tensor) -> Tensor {
+        let depth = DimExpr::Const(states.unit.len() as u64 + 1);
+        let last = partial.rms(self.c.eps);
+        let all = match &states.joined {
+            Some(joined) => joined.concat(&last),
+            None => last,
+        };
         all.reshape(self.shape([depth, Hidden.into()]))
     }
 
@@ -455,7 +485,7 @@ impl<E: ExpertSet> Run<'_, E> {
             .collect()
     }
 
-    fn attn_res(&self, states: &[Tensor], partial: &Tensor, query: &Linear, n: u64) -> Vec<Tensor> {
+    fn attn_res(&self, states: &States, partial: &Tensor, query: &Linear, n: u64) -> Vec<Tensor> {
         let u = self.stack(states, partial);
         self.blend(&u, &u.matmul(query), n)
     }
@@ -557,7 +587,7 @@ impl<E: ExpertSet> Run<'_, E> {
     fn inputs(
         &self,
         l: usize,
-        states: &[Tensor],
+        states: &States,
         h: &Tensor,
         msgs: Option<&[Tensor; 4]>,
     ) -> [Tensor; 3] {
@@ -586,7 +616,7 @@ impl<E: ExpertSet> Run<'_, E> {
     fn layer(
         &self,
         [v, l]: [usize; 2],
-        states: &mut Vec<Tensor>,
+        states: &mut States,
         h: &mut Tensor,
         msgs: Option<&[Tensor; 4]>,
     ) {
@@ -598,7 +628,7 @@ impl<E: ExpertSet> Run<'_, E> {
             [self.sconv(&w.attn_sconv, virt.map(|s| &s.hist_a), &out)]
         });
         let mid = if (l as u64).is_multiple_of(c.attn_res_block) {
-            states.push(h.clone());
+            states.push(h.rms(c.eps));
             a
         } else {
             h.add(&a)
@@ -616,7 +646,7 @@ impl<E: ExpertSet> Run<'_, E> {
     }
 
     /// Every core layer's messages from the last pass.
-    fn messages(&self, states: &[Tensor], h: &Tensor) -> Vec<[Tensor; 4]> {
+    fn messages(&self, states: &States, h: &Tensor) -> Vec<[Tensor; 4]> {
         let [main, kv] = self.w.cross_pass.as_ref().expect("looped");
         let u = self.stack(states, h);
         let n = 2 * self.c.core().len();
@@ -632,17 +662,16 @@ impl<E: ExpertSet> Run<'_, E> {
             .m
             .embed(tokens, &w.embed)
             .rms_norm(&w.embed_norm, c.eps);
-        let mut states = Vec::new();
+        let mut states = States::default();
         let core = c.core();
         let layers = c.stack.layers as usize;
         let mut v = 0;
-        let mut plain =
-            |range: std::ops::Range<usize>, states: &mut Vec<Tensor>, h: &mut Tensor| {
-                for l in range {
-                    self.layer([v, l], states, h, None);
-                    v += 1;
-                }
-            };
+        let mut plain = |range: std::ops::Range<usize>, states: &mut States, h: &mut Tensor| {
+            for l in range {
+                self.layer([v, l], states, h, None);
+                v += 1;
+            }
+        };
         if core.is_empty() {
             plain(0..layers, &mut states, &mut h);
         } else {
@@ -651,7 +680,7 @@ impl<E: ExpertSet> Run<'_, E> {
             plain(core.clone(), &mut states, &mut h);
             let mut v = core.end;
             for _ in 1..c.loop_passes {
-                let prev = states.split_off((pre_states.len() + 1).min(states.len()));
+                let prev = states.after(pre_states.unit.len() + 1);
                 let prev_h = std::mem::replace(&mut h, pre_h.clone());
                 states = pre_states.clone();
                 let msgs = self.messages(&prev, &prev_h);
