@@ -122,6 +122,7 @@ fn splits_sharded_step() {
             picked: false,
             ragged: true,
             sinks: false,
+            rel_bias: false,
         }),
         vec![qh, ka, va, slots, pos],
         qh_ty,

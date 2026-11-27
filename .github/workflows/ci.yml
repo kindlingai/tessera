@@ -581,6 +581,22 @@ jobs:
           docker tag tesserax:ci "$tag"
           docker push "$tag"
 
+  # In a merge group, success waits for every job it needs, the slowest
+  # too, even after one has failed. This job cancels the run at the first
+  # failure, so success reports at once and the queue drops the group.
+  fail-fast:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-slim
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SELF: fail-fast
+        run: tools/scripts/fail-fast.sh
+
   success:
     # The one check to require: every job above passed or was skipped
     # by `changes`, and no human step is pending. Skipped on a draft.

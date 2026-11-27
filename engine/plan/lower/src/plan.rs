@@ -50,6 +50,19 @@ impl Slot {
         }
     }
 
+    /// Packed tensor axes, or `[len]` when unset.
+    pub fn axes(&self) -> ([usize; 4], usize) {
+        if self.dims > 0 && (self.dims as usize) <= 4 {
+            let mut axes = [0usize; 4];
+            for (dst, &src) in axes.iter_mut().zip(&self.shape[..self.dims as usize]) {
+                *dst = src as usize;
+            }
+            (axes, self.dims as usize)
+        } else {
+            ([self.len, 0, 0, 0], 1)
+        }
+    }
+
     /// The first byte's offset.
     pub fn start(&self) -> usize {
         self.offset
@@ -147,9 +160,46 @@ pub struct Share {
 }
 
 impl Share {
+    /// Elements before the split axis for `slot_len`.
+    pub fn outer(&self, slot_len: usize) -> Option<usize> {
+        let step = self.count.checked_mul(self.inner)?;
+        (step > 0 && slot_len.is_multiple_of(step)).then(|| slot_len / step)
+    }
+
+    /// Whole-weight axes from a rank-local `slot`.
+    pub fn whole_axes(&self, slot: Slot) -> Option<([usize; 4], usize)> {
+        let (mut axes, dims) = slot.axes();
+        let axis = self.axis as usize;
+        if axis < dims && axes[axis] == self.count {
+            axes[axis] = self.whole;
+            return Some((axes, dims));
+        }
+        let whole_len = self
+            .outer(slot.len)?
+            .checked_mul(self.whole)?
+            .checked_mul(self.inner)?;
+        Some(([whole_len, 0, 0, 0], 1))
+    }
+
     /// This rank's part of `bytes`, packed as `form`.
     pub fn of(&self, form: &dyn tessera_mem::form::Form, bytes: &[u8]) -> Option<Vec<u8>> {
-        let outer = form.elements(bytes.len()) / (self.whole * self.inner).max(1);
+        let step = self.whole.checked_mul(self.inner)?.max(1);
+        let outer = form.count(bytes)? / step;
+        form.share(
+            bytes,
+            [outer, self.whole, self.inner],
+            [self.first, self.count],
+        )
+    }
+
+    /// This rank's part of `bytes`, sized by `slot_len`.
+    pub fn slice(
+        &self,
+        form: &dyn tessera_mem::form::Form,
+        bytes: &[u8],
+        slot_len: usize,
+    ) -> Option<Vec<u8>> {
+        let outer = self.outer(slot_len)?;
         form.share(
             bytes,
             [outer, self.whole, self.inner],

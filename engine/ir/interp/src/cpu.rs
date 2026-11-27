@@ -157,28 +157,61 @@ struct Keys<'a> {
 }
 
 impl Keys<'_> {
-    /// Adds query `q` over `at`, with optional sink.
+    /// Adds query `q` over biased `at`, with optional sink.
     fn row(
         &self,
         q: &[f32],
-        at: impl Iterator<Item = usize> + Clone,
+        at: impl Iterator<Item = (usize, f32)> + Clone,
         sink: Option<f32>,
         p: &mut Vec<f32>,
         o: &mut [f32],
     ) {
         let (d, dv) = (q.len(), o.len());
         p.clear();
-        for j in at.clone() {
-            p.push(self.acc.dot(q, &self.k[j * d..(j + 1) * d]) * self.scale);
+        for (j, bias) in at.clone() {
+            p.push(self.acc.dot(q, &self.k[j * d..(j + 1) * d]) * self.scale + bias);
         }
         if let Some(s) = sink {
             p.push(s);
         }
         softmax(self.acc, p);
-        for (j, &pj) in at.zip(p.iter()) {
+        for ((j, _), &pj) in at.zip(p.iter()) {
             for (oi, &vi) in o.iter_mut().zip(&self.v[j * dv..(j + 1) * dv]) {
                 *oi = self.acc.add(*oi, pj * vi);
             }
+        }
+    }
+}
+
+/// Sink logits and relative biases of one attention.
+struct Extras<'a> {
+    sinks: Option<&'a [f32]>,
+    per_token: bool,
+    rel: Option<&'a [f32]>,
+    win: usize,
+}
+
+impl<'a> Extras<'a> {
+    fn new([sinks, rel]: [Option<&'a Tensor>; 2]) -> Result<Self, Error> {
+        Ok(Self {
+            sinks: sinks.map(Tensor::floats).transpose()?,
+            per_token: sinks.is_some_and(|s| s.shape.len() > 1),
+            rel: rel.map(Tensor::floats).transpose()?,
+            win: rel.map_or(0, |r| r.shape[r.shape.len() - 1]),
+        })
+    }
+
+    /// The sink logit of query `row`, head `h`.
+    fn sink(&self, row: usize, h: usize) -> Option<f32> {
+        self.sinks
+            .map(|sv| sv[if self.per_token { row } else { h }])
+    }
+
+    /// The bias `row` at `pos` adds to key `j`.
+    fn bias(&self, row: usize, pos: usize, j: usize) -> f32 {
+        match self.rel {
+            Some(rel) if j <= pos && pos - j < self.win => rel[row * self.win + pos - j],
+            _ => 0.0,
         }
     }
 }
@@ -189,7 +222,7 @@ pub(crate) fn attend(
     a: &Attend,
     qkv: [&Tensor; 3],
     picked: Option<&Tensor>,
-    sinks: Option<&Tensor>,
+    extras: [Option<&Tensor>; 2],
 ) -> Result<Tensor, Error> {
     let acc = Acc::new(n.accumulate)?;
     let [q, k, v] = qkv;
@@ -201,7 +234,7 @@ pub(crate) fn attend(
     let past = past_keys(a, ctx, keys)?;
     let qs = q.floats()?;
     let (k, v) = (k.floats()?, v.floats()?);
-    let sink_vals = sinks.map(Tensor::floats).transpose()?;
+    let extras = Extras::new(extras)?;
     let kv = Keys {
         acc,
         scale: a.scale,
@@ -227,12 +260,15 @@ pub(crate) fn attend(
             };
             for h in 0..heads {
                 let row = (s * ctx + t) * heads + h;
-                let kv_at = |j: &usize| (s * keys + j) * kv_heads + h / group;
+                let kv_at = |j: &usize| {
+                    let bias = extras.bias(row, past + t, *j);
+                    ((s * keys + j) * kv_heads + h / group, bias)
+                };
                 let o = &mut out[row * dv..(row + 1) * dv];
                 kv.row(
                     &qs[row * d..(row + 1) * d],
                     all.iter().map(kv_at),
-                    sink_vals.map(|sv| sv[h]),
+                    extras.sink(row, h),
                     &mut p,
                     o,
                 );
@@ -247,18 +283,20 @@ pub(crate) fn conv(x: &Tensor, w: &Tensor, dilation: usize) -> Result<Tensor, Er
     let [seqs, ctx, width] = x.shape[..] else {
         return Err(Error::Mismatch("conv wants rank 3".into()));
     };
-    let taps = w.shape[1];
+    let (taps, dynamic) = (w.shape[w.shape.len() - 1], w.shape.len() > 2);
     let (xs, ws) = (x.floats()?, w.floats()?);
     let mut out = vec![0.0; xs.len()];
     for s in 0..seqs {
         for t in 0..ctx {
             let at = (s * ctx + t) * width;
             for c in 0..width {
+                // Dynamic taps differ at every row.
+                let wc = if dynamic { at + c } else { c };
                 let mut sum = 0.0;
                 for j in 0..taps {
                     let back = (taps - 1 - j) * dilation;
                     if t >= back {
-                        sum += ws[c * taps + j] * xs[at - back * width + c];
+                        sum += ws[wc * taps + j] * xs[at - back * width + c];
                     }
                 }
                 out[at + c] = sum;
@@ -279,7 +317,7 @@ pub(crate) fn conv_rows(
     let [rows, width] = x.shape[..] else {
         return Err(Error::Mismatch("ragged conv wants rank 2".into()));
     };
-    let taps = w.shape[1];
+    let (taps, dynamic) = (w.shape[w.shape.len() - 1], w.shape.len() > 2);
     let hist = (taps - 1) * dilation;
     let (xs, ws) = (x.floats()?, w.floats()?);
     let (slots, positions) = (slots.indices()?, positions.indices()?);
@@ -303,9 +341,10 @@ pub(crate) fn conv_rows(
         let row = &xs[r * width..(r + 1) * width];
         for c in 0..width {
             let cur = row[c];
-            let mut sum = cur * ws[c * taps + taps - 1];
+            let wc = if dynamic { r * width + c } else { c };
+            let mut sum = cur * ws[wc * taps + taps - 1];
             for j in 0..taps - 1 {
-                sum += st[j * dilation * width + c] * ws[c * taps + j];
+                sum += st[j * dilation * width + c] * ws[wc * taps + j];
             }
             for k in 0..hist - 1 {
                 st[k * width + c] = st[(k + 1) * width + c];
@@ -433,7 +472,7 @@ pub(crate) fn attend_rows(
     [q, k, v]: [&Tensor; 3],
     [slots, positions]: [&Tensor; 2],
     picked: Option<&Tensor>,
-    sinks: Option<&Tensor>,
+    extras: [Option<&Tensor>; 2],
 ) -> Result<Tensor, Error> {
     let acc = Acc::new(n.accumulate)?;
     let [rows, heads, d] = q.shape[..] else {
@@ -445,7 +484,7 @@ pub(crate) fn attend_rows(
     let group = heads / kv_heads;
     let qs = q.floats()?;
     let (k, v) = (k.floats()?, v.floats()?);
-    let sink_vals = sinks.map(Tensor::floats).transpose()?;
+    let extras = Extras::new(extras)?;
     let kv = Keys {
         acc,
         scale: a.scale,
@@ -476,12 +515,15 @@ pub(crate) fn attend_rows(
         };
         for h in 0..heads {
             let row = r * heads + h;
-            let kv_at = |j: &usize| (s * keys + j) * kv_heads + h / group;
+            let kv_at = |j: &usize| {
+                let bias = extras.bias(row, at, *j);
+                ((s * keys + j) * kv_heads + h / group, bias)
+            };
             let o = &mut out[row * dv..(row + 1) * dv];
             kv.row(
                 &qs[row * d..(row + 1) * d],
                 all.iter().map(kv_at),
-                sink_vals.map(|sv| sv[h]),
+                extras.sink(row, h),
                 &mut p,
                 o,
             );
@@ -532,6 +574,21 @@ pub(crate) fn stage(
             for row in out.chunks_mut(width) {
                 let inv = rms_inverse(acc, row, *eps);
                 row.iter_mut().for_each(|v| *v *= inv);
+            }
+        }
+        Stage::L2Clip { threshold, eps } => {
+            for row in out.chunks_mut(width) {
+                let norm = acc.sum(row.iter().map(|v| v * v)).sqrt();
+                let by = (threshold / (norm + eps)).min(1.0);
+                row.iter_mut().for_each(|v| *v *= by);
+            }
+        }
+        Stage::LogScale { floor, alpha } => {
+            let at = operand()?.indices()?;
+            let span = out.len() / at.len().max(1);
+            for (block, &pos) in out.chunks_mut(span.max(1)).zip(&at) {
+                let tau = 1.0 + alpha * ((pos + 1) as f32 / floor).max(1.0).ln();
+                block.iter_mut().for_each(|v| *v *= tau);
             }
         }
         Stage::Act(a) => out.iter_mut().for_each(|v| *v = act(*a, *v)),

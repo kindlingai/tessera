@@ -226,7 +226,7 @@ fn groups_pass_by_field() {
 #[test]
 fn helpers_read_exact_bytes() {
     use tessera_codegen::form::{LOADS, U8};
-    use tessera_codegen::trellis::{INPUT_SIDE, packed};
+    use tessera_codegen::trellis::{INPUT_SIDE, alloc_mixed, packed};
     let mut seed = 1u32;
     let mut draw = move || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -248,16 +248,23 @@ fn helpers_read_exact_bytes() {
         };
         for &(inp, out, side) in shapes {
             let n = inp * out;
+            let mixed = form.name().starts_with("trellis_mix");
             let mut bytes = if form.packs() {
                 let data: Vec<f32> = (0..n).map(|_| draw() as f32 / 4e9 - 0.5).collect();
                 form.pack(&data)
+            } else if mixed {
+                // Three matrices, each at its own width.
+                let (mut set, at) = alloc_mixed(inp, out, side, &[3, 2, 4]);
+                set[at[0]..].fill_with(|| draw() as u8);
+                set
             } else {
                 let entries: Vec<u8> = (form.bytes(0)..form.bytes(n))
                     .map(|_| draw() as u8)
                     .collect();
                 packed(inp, out, side, &entries)
             };
-            assert_eq!(bytes.len(), form.bytes(n), "{form:?}");
+            let n = if mixed { 3 * n } else { n };
+            assert!(bytes.len() == form.bytes(n) || mixed, "{form:?}");
             let want: Vec<f32> = (0..n).map(|i| form.unpack(&bytes, i)).collect();
             // Large shapes: every eighth element, and the last four.
             let step = (n / 2048).max(1);

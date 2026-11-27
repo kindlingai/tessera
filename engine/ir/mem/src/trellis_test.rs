@@ -1,6 +1,9 @@
 use crate::block_test::same_part;
 use crate::form::Form;
-use crate::trellis::{Codebook, INPUT_SIDE, TRELLIS_K2, TRELLIS_K2_ROT, form_for, packed, rotated};
+use crate::trellis::{
+    Codebook, HEAD, INPUT_SIDE, MIX_ROW, MIX_TABLE, TRELLIS_K2, TRELLIS_K2_ROT, TRELLIS_MIX_PMCGX,
+    alloc_mixed, form_for, mixed_for, packed, parse_form, parse_mix_form, rotated,
+};
 use tessera_graph::F16;
 
 /// Each side's cuts, and a set's, decode as the whole.
@@ -134,4 +137,119 @@ fn pmcgx_tiles() {
         let got = at.map(|(row, col)| t[col * 16 + row]);
         assert_eq!(got, values, "K{k}");
     }
+}
+
+/// A mixed set decodes as each matrix at its width.
+#[test]
+fn mixed_widths_match() {
+    let widths = [3u32, 2, 4, 2];
+    for (book, (inp, out, side)) in
+        Codebook::ALL
+            .into_iter()
+            .zip([(256, 128, 1), (128, 256, INPUT_SIDE), (256, 256, 1)])
+    {
+        let mix = mixed_for(book).unwrap();
+        let (mut set, at) = alloc_mixed(inp, out, side, &widths);
+        let mut want = Vec::new();
+        for (m, (k, at)) in widths.iter().zip(at).enumerate() {
+            let len = inp * out * *k as usize / 8;
+            let codes: Vec<u8> = (0..len).map(|i| (i * 31 + m * 7 + i / 251) as u8).collect();
+            set[at..at + len].copy_from_slice(&codes);
+            let one = form_for(*k, book).unwrap();
+            want.extend(one.unpack_all(&packed(inp, out, side, &codes)));
+        }
+        assert_eq!(mix.unpack_all(&set), want, "{book:?}");
+        for i in (0..want.len()).step_by(89) {
+            assert_eq!(mix.unpack(&set, i), want[i], "{book:?} element {i}");
+        }
+        same_part(mix, &set, [1, 4, inp * out], [1, 2]);
+        same_part(mix, &set, [4, out, inp], [0, 128]);
+        same_part(mix, &set, [4 * out, inp, 1], [0, 128]);
+    }
+}
+
+#[test]
+fn mix_names_parse() {
+    let books = [Codebook::Mcg, Codebook::Mul1, Codebook::Pmcgx];
+    for (book, codebook) in (0u32..).zip(books) {
+        let name = mixed_for(codebook).unwrap().name();
+        assert_eq!(parse_mix_form(name), Some(book));
+        assert_eq!(parse_form(name), None);
+    }
+    assert_eq!(parse_mix_form("trellis_k3_pmcgx"), None);
+    assert_eq!(parse_mix_form("trellis_mix_rot"), None);
+    assert_eq!(parse_form("trellis_k3_pmcgx"), Some((3, 2)));
+}
+
+/// Validates mixed-width bounds, widths, offsets, and geometry.
+#[test]
+fn mixed_fits_validation() {
+    let mix = &TRELLIS_MIX_PMCGX;
+    let elems = 2 * 128 * 128;
+    let (valid, offsets) = alloc_mixed(128, 128, 1, &[2, 4]);
+    assert!(mix.fits(elems, &valid));
+
+    let (valid_in, _) = alloc_mixed(128, 256, INPUT_SIDE, &[3, 2, 4]);
+    assert!(mix.fits(3 * 128 * 256, &valid_in));
+
+    // Truncated 4-bit matrix still above 2-bit lower bound.
+    let mut trunc = valid.clone();
+    trunc.truncate(valid.len() - 64);
+    assert!(mix.fits_size(elems, trunc.len()));
+    assert!(!mix.fits(elems, &trunc));
+
+    // Unsupported widths in table entries.
+    for bad_k in [0u32, 1, 5, u32::MAX] {
+        let mut buf = valid.clone();
+        buf[MIX_TABLE + 8..MIX_TABLE + 12].copy_from_slice(&bad_k.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted width {bad_k}");
+    }
+
+    // Offset inside header, misaligned, out-of-bounds, or overflowing.
+    let bad_offsets = [0u64, HEAD as u64, offsets[0] as u64 + 4, u64::MAX - 15];
+    for off in bad_offsets {
+        let mut buf = valid.clone();
+        buf[MIX_TABLE..MIX_TABLE + 8].copy_from_slice(&off.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted offset {off}");
+    }
+    let mut past = valid.clone();
+    let near_end = (past.len() - 64) as u64;
+    past[MIX_TABLE + MIX_ROW..MIX_TABLE + MIX_ROW + 8].copy_from_slice(&near_end.to_le_bytes());
+    assert!(!mix.fits(elems, &past));
+
+    // Bad header geometry and side values.
+    for (inp, out, side) in [
+        (0u32, 128u32, 1u32),
+        (15, 128, 1),
+        (32, 32, 1),
+        (16, 256, INPUT_SIDE),
+        (128, 128, 99),
+    ] {
+        let mut buf = valid.clone();
+        buf[0..4].copy_from_slice(&inp.to_le_bytes());
+        buf[4..8].copy_from_slice(&out.to_le_bytes());
+        buf[8..12].copy_from_slice(&side.to_le_bytes());
+        let target = 2usize.saturating_mul(inp as usize * out as usize);
+        assert!(
+            !mix.fits(target, &buf),
+            "accepted shape ({inp},{out},{side})"
+        );
+    }
+
+    // Zero or inflated matrix count.
+    for bad_count in [0u32, 3, u32::MAX] {
+        let mut buf = valid.clone();
+        buf[HEAD..HEAD + 4].copy_from_slice(&bad_count.to_le_bytes());
+        assert!(!mix.fits(elems, &buf), "accepted count {bad_count}");
+    }
+
+    // Shape-level checks reject same-total different-axes headers.
+    assert!(mix.fits_shape(&[2, 128, 128], &valid));
+    assert!(!mix.fits_shape(&[1, 256, 128], &valid));
+    assert!(!mix.fits_shape(&[4, 128, 64], &valid));
+    assert!(!mix.fits_shape(&[elems], &valid));
+    assert!(mix.fits_shape(&[3, 256, 128], &valid_in));
+    assert!(!mix.fits_shape(&[3, 128, 256], &valid_in));
+    assert_eq!(mix.count(&valid), Some(elems));
+    assert_eq!(mix.count(&trunc), None);
 }

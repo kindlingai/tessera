@@ -1,7 +1,8 @@
 //! Per-op typing rules: shapes, dtypes and placements.
 
+use crate::attend::{attend, heads_fit};
 use crate::dims::{Dim, DimExpr, DimName, Poly, Shape};
-use crate::node::{Attend, Graph, Op, View};
+use crate::node::{Graph, Op, View};
 use crate::select;
 use crate::stages::{Check, Place, Stage, Takes};
 use crate::types::{DType, Placement, TensorType};
@@ -235,118 +236,12 @@ fn matmul(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, Ty
     })
 }
 
-/// Keys match values, heads group, split by query head.
-fn heads_fit(
-    dims: &[Dim],
-    [q, k, v]: [&TensorType; 3],
-    q_heads: usize,
-    ragged: bool,
-) -> Result<(), TypeError> {
-    // Values may be narrower than keys, as in MLA.
-    need(
-        same_shape(dims, &front(&k.shape, 3), &front(&v.shape, 3))?,
-        ErrorKind::Shape,
-        || format!("keys {} and values {} differ", k.shape, v.shape),
-    )?;
-    let heads = poly(dims, &q.shape.0[q_heads])?.as_const();
-    let kv_heads = poly(dims, &k.shape.0[2])?.as_const();
-    if let (Some(h), Some(kv)) = (heads, kv_heads) {
-        need(kv != 0 && h % kv == 0, ErrorKind::Shape, || {
-            format!("{h} query heads do not group over {kv} key heads")
-        })?;
-    }
-    need(
-        q.dtype.is_float() && q.dtype == k.dtype && k.dtype == v.dtype,
-        ErrorKind::DType,
-        || "attention needs one float dtype".into(),
-    )?;
-    let p = [q.placement, k.placement, v.placement];
-    let split = [q_heads as u32, 2, 2].map(|axis| Placement::Split { axis });
-    // One key head serves query heads split any way.
-    let shared = kv_heads == Some(1) && p[1..] == [Placement::Replicated; 2] && p[0] == split[0];
-    // Replicated caches serve owned query rows directly.
-    let owned = ragged
-        && p == [
-            Placement::Owned { axis: 0 },
-            Placement::Replicated,
-            Placement::Replicated,
-        ];
-    need(
-        p == [Placement::Replicated; 3] || p == split || shared || owned,
-        ErrorKind::Placement,
-        || format!("attention needs whole or head-split tensors, got {p:?}"),
-    )
-}
-
-fn attend(dims: &[Dim], op: &Attend, a: &[&TensorType]) -> Result<TensorType, TypeError> {
-    let (q, k, v) = (a[0], a[1], a[2]);
-    let q_heads = if op.ragged {
-        need(
-            q.rank() == 3 && k.rank() == 4 && v.rank() == 4,
-            ErrorKind::Shape,
-            || "ragged attention takes [Rows, Heads, HeadDim] queries over kept rows".into(),
-        )?;
-        need(
-            same(dims, &q.shape.0[2], &k.shape.0[3])?,
-            ErrorKind::Shape,
-            || {
-                format!(
-                    "queries {} and keys {} differ in head width",
-                    q.shape, k.shape
-                )
-            },
-        )?;
-        row_ids(dims, &q.shape, a[3], a[4])?;
-        1
-    } else {
-        need(
-            a[..3].iter().all(|t| t.rank() == 4),
-            ErrorKind::Shape,
-            || "attention takes [Seqs, Context, Heads, HeadDim] tensors".into(),
-        )?;
-        for axis in [0, 3] {
-            need(
-                same(dims, &q.shape.0[axis], &k.shape.0[axis])?,
-                ErrorKind::Shape,
-                || {
-                    format!(
-                        "queries {} and keys {} differ on axis {axis}",
-                        q.shape, k.shape
-                    )
-                },
-            )?;
-        }
-        2
-    };
-    heads_fit(dims, [q, k, v], q_heads, op.ragged)?;
-    if let Some(i) = op.ids_arg() {
-        key_lists(dims, a[i], q, q_heads)?;
-    }
-    if let Some(i) = op.sinks_arg() {
-        let s = a[i];
-        let ok = s.rank() == 1 && same(dims, &s.shape.0[0], &q.shape.0[q_heads])?;
-        need(ok, ErrorKind::Shape, || {
-            format!("sinks {} vs {}", s.shape, q.shape)
-        })?;
-        let d_ok = s.dtype.is_float() && s.dtype == q.dtype;
-        need(d_ok, ErrorKind::DType, || "sink dtype mismatch".into())?;
-        let want = match q.placement {
-            Placement::Split { axis } if axis == q_heads as u32 => Placement::Split { axis: 0 },
-            _ => Placement::Replicated,
-        };
-        need(s.placement == want, ErrorKind::Placement, || {
-            format!("sinks {:?} want {want:?}", s.placement)
-        })?;
-    }
-    Ok(valued(q, v))
-}
-
 /// Rows `[Seqs, Context, C]` through taps `[C, K]`.
 fn conv(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<TensorType, TypeError> {
-    let fits = x.rank() == 3 && w.rank() == 2 && same(dims, &x.shape.0[2], &w.shape.0[0])?;
+    let fits = x.rank() == 3 && taps_fit(dims, x, w)?;
     need(fits, ErrorKind::Shape, || {
         format!(
-            "conv takes x [Seqs, Context, C] and w [C, K], got {} and {}",
+            "conv takes x [Seqs, Context, C] and w [C, K] or [Seqs, Context, C, K], got {} and {}",
             x.shape, w.shape
         )
     })?;
@@ -362,7 +257,10 @@ fn conv_rows(
     a: &[&TensorType],
 ) -> Result<TensorType, TypeError> {
     let (x, w, slots, positions) = (a[0], a[1], a[2], a[3]);
-    let taps = poly(dims, &w.shape.0[1])?.as_const();
+    let taps = match w.shape.0.last() {
+        Some(k) => poly(dims, k)?.as_const(),
+        None => None,
+    };
     let hist = kept
         .shape
         .0
@@ -372,14 +270,13 @@ fn conv_rows(
         .and_then(|k| k.checked_sub(1))
         .map(|k| k * u64::from(dilation));
     let fits = x.rank() == 2
-        && w.rank() == 2
         && kept.rank() == 3
-        && same(dims, &x.shape.0[1], &w.shape.0[0])?
+        && taps_fit(dims, x, w)?
         && same(dims, &x.shape.0[1], &kept.shape.0[2])?
         && want.is_some_and(|n| n > 0 && hist == Some(n));
     need(fits, ErrorKind::Shape, || {
         format!(
-            "ragged conv takes x [Rows, C], w [C, K] and state [Seqs, (K-1)*d, C], got {}, {}, {}",
+            "ragged conv takes x [Rows, C], w [C, K] or [Rows, C, K] and state [Seqs, (K-1)*d, C], got {}, {}, {}",
             x.shape, w.shape, kept.shape
         )
     })?;
@@ -394,6 +291,19 @@ fn conv_rows(
     )?;
     row_ids(dims, &x.shape, slots, positions)?;
     Ok(x.clone())
+}
+
+/// Whether `w` is `[C, K]` or per-row taps.
+fn taps_fit(dims: &[Dim], x: &TensorType, w: &TensorType) -> Result<bool, TypeError> {
+    let Some(c) = x.shape.0.last() else {
+        return Ok(false);
+    };
+    match w.rank() == 2 {
+        true => same(dims, c, &w.shape.0[0]),
+        false => {
+            Ok(w.rank() == x.rank() + 1 && same_shape(dims, &front(&w.shape, x.rank()), &x.shape)?)
+        }
+    }
 }
 
 fn conv_types(x: &TensorType, w: &TensorType) -> Result<(), TypeError> {
@@ -495,7 +405,12 @@ fn delta_gates(
 }
 
 /// One integer key list per query, over `lead` axes.
-fn key_lists(dims: &[Dim], ids: &TensorType, q: &TensorType, lead: usize) -> Result<(), TypeError> {
+pub(crate) fn key_lists(
+    dims: &[Dim],
+    ids: &TensorType,
+    q: &TensorType,
+    lead: usize,
+) -> Result<(), TypeError> {
     let fits = ids.rank() == lead + 1
         && same_shape(dims, &front(&ids.shape, lead), &front(&q.shape, lead))?;
     need(fits, ErrorKind::Shape, || {
@@ -522,7 +437,7 @@ fn key_lists(dims: &[Dim], ids: &TensorType, q: &TensorType, lead: usize) -> Res
 }
 
 /// Queries' type with the values' width.
-fn valued(q: &TensorType, v: &TensorType) -> TensorType {
+pub(crate) fn valued(q: &TensorType, v: &TensorType) -> TensorType {
     let mut out = q.clone();
     let width = v.shape.0.last().expect("rank checked").clone();
     *out.shape.0.last_mut().expect("rank checked") = width;
@@ -600,6 +515,15 @@ fn row(dims: &[Dim], stages: &[Stage], args: &[&TensorType]) -> Result<TensorTyp
     for s in stages {
         let f = s.facts();
         f.check.holds()?;
+        match *s {
+            Stage::L2Clip { eps, .. } => {
+                need(eps.is_finite() && eps >= 0.0, ErrorKind::Value, || {
+                    format!("l2 clip epsilon is {eps}")
+                })?
+            }
+            Stage::LogScale { alpha, .. } => finite(alpha, "log scale alpha")?,
+            _ => {}
+        }
         let operand = (f.operand != Takes::Nothing).then(|| *rest.next().expect("arity checked"));
         if let Some(o) = operand {
             takes(dims, f.operand, s, x, o, p)?;
@@ -861,7 +785,7 @@ fn whole(p: Placement, last: u32, s: &Stage) -> Result<(), TypeError> {
 }
 
 /// `slots` and `positions`: one integer each per row of `rows`.
-fn row_ids(
+pub(crate) fn row_ids(
     dims: &[Dim],
     rows: &Shape,
     slots: &TensorType,

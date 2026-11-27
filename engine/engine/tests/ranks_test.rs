@@ -294,6 +294,34 @@ fn split_owned_matches_one() {
 }
 
 #[test]
+fn zigzag_matches_one() {
+    let [[s0, s1], [c0, c1]] = loopback_links();
+    let tune = |e: &mut Engine| {
+        e.set_split_rows(8);
+        e.set_own_rows(4);
+    };
+    let follower = std::thread::spawn(move || {
+        let mut e = opened(wide_glm53, Some([s1, c1]), &Recipe::default(), 16, true);
+        tune(&mut e);
+        e.follow().unwrap();
+    });
+    let mut lead = opened(wide_glm53, Some([s0, c0]), &Recipe::default(), 16, true);
+    tune(&mut lead);
+    let mut alone = opened(wide_glm53, None, &Recipe::default(), 16, false);
+    // 8 rows activate zigzag across both halves and ranks.
+    let first: Vec<_> = (0..8).map(|i| row(0, (i * 3 + 1) % 32, i)).collect();
+    lead.fill(&first).unwrap();
+    alone.fill(&first).unwrap();
+    // 7 rows pad to 8 and remap every pick.
+    let next: Vec<_> = (8..15).map(|i| row(0, (i * 5 + 2) % 32, i)).collect();
+    assert_eq!(lead.step(&next).unwrap(), alone.step(&next).unwrap());
+    let decode = [row(0, 7, 15)];
+    assert_eq!(lead.last(&decode).unwrap(), alone.last(&decode).unwrap());
+    lead.dismiss().unwrap();
+    follower.join().unwrap();
+}
+
+#[test]
 fn own_rows_matches_one() {
     agree_mode(
         || stepper::<Norm, Swiglu>(&Config::qwen3_small()),

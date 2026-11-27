@@ -365,6 +365,56 @@ fn check_latent_moe(dir: &Path) {
     assert_eq!((svh.len(), svh[0], svh[1]), (256, -2.5, 2.5));
 }
 
+/// One whole-tensor file, and a width for each expert.
+fn check_mixed_widths(dir: &Path) {
+    let scale = "model.layers.0.attn.q_proj.scale";
+    write(
+        &dir.join("model-nonexperts.safetensors"),
+        &[(scale, "F32", vec![1], floats(&[7.0]))],
+    );
+    write_layer(dir, 0, &[2, 3, 4], "");
+    assert!(crate::exlr8::is_release(dir));
+    write_manifest(
+        dir,
+        "mix",
+        r#"{"layers": {"0": {
+            "gate": [[3, 3], [2, 2]],
+            "up": [[4, 4], [4, 4]],
+            "down": [3, 2]
+        }}}"#,
+    );
+    let r = Release::open(dir).manifest("mix").unwrap();
+    assert_eq!(r.floats(scale).unwrap(), [7.0]);
+    let at = "model.layers.0.mlp.experts.";
+    assert_eq!(form_name(&r, &format!("{at}up.weight")), "trellis_k4");
+    let su = r.floats(&format!("{at}gate.su")).unwrap();
+    assert_eq!((su[0], su[128]), (3.5, 2.5));
+    let sv = r.floats(&format!("{at}down.sv")).unwrap();
+    assert_eq!((sv[0], sv[128]), (4.5, 3.5));
+    let mix = trellis::mixed_for(trellis::Codebook::Mcg).unwrap();
+    for (p, shape) in [("gate", [2, 128, 128]), ("down", [2 * 128, 128, 1])] {
+        let name = format!("{at}{p}.weight");
+        assert_eq!(form_name(&r, &name), "trellis_mix");
+        let set = r.packed(&name, None).unwrap();
+        let mut want = Vec::new();
+        for (e, k) in [3, 2].into_iter().enumerate() {
+            let one = Release::open(dir).width(k).packed(&name, None).unwrap();
+            let form = trellis::form_for(k, trellis::Codebook::Mcg).unwrap();
+            let n = 128 * 128;
+            want.extend_from_slice(&form.unpack_all(&one)[e * n..(e + 1) * n]);
+        }
+        assert_eq!(mix.unpack_all(&set), want, "{p}");
+        let second = r.packed_share(&name, (1, 1)).unwrap();
+        assert_eq!(Some(second), mix.share(&set, [1, 2, 128 * 128], [1, 1]));
+        let axis = if p == "down" { 2 } else { 1 };
+        let inner = r.packed_axis(&name, axis, (0, 128)).unwrap();
+        assert_eq!(Some(inner), mix.share(&set, shape, [0, 128]), "{p}");
+    }
+    write_manifest(dir, "short", r#"{"layers": {"0": {"down": [3, 2, 4]}}}"#);
+    let short = Release::open(dir).manifest("short").unwrap();
+    assert!(short.packed(&format!("{at}down.weight"), None).is_err());
+}
+
 #[test]
 fn experts_and_manifests() {
     let dir = tessera_testkit::scratch(&format!("{}-exlr8-experts", std::process::id()));
@@ -372,6 +422,7 @@ fn experts_and_manifests() {
     check_axis_slicing(&dir.join("axis"));
     check_manifest_widths(&dir.join("manifest"));
     check_latent_moe(&dir.join("latent"));
+    check_mixed_widths(&dir.join("mixed"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

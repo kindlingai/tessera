@@ -33,7 +33,7 @@ impl Pattern for Attend {
             return None;
         }
         // Ragged kernels read every key, not a list.
-        if a.ragged && a.picked {
+        if a.sinks || a.rel_bias || a.ragged && a.picked {
             return None;
         }
         if a.ragged {
@@ -80,7 +80,7 @@ impl Pattern for Attend {
                 rows: Some([node.args[3], node.args[4]]),
             });
         }
-        if a.picked || a.sinks {
+        if a.picked {
             return None;
         }
         Self::whole(tree, at)
@@ -104,7 +104,7 @@ impl Attend {
         let Term::Op(Op::Attend(a)) = &node.term else {
             return None;
         };
-        if a.sinks {
+        if a.sinks || a.rel_bias {
             return None;
         }
         let wide = |t: T| &tree.node(t).shape;

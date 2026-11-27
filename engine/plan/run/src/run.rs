@@ -407,38 +407,51 @@ pub trait Run {
             // Bytes a reader already cut fill the slot.
             let cut = loaded
                 .first()
-                .is_some_and(|l| form.bytes(l.slot.len) == bytes.len());
-            let part = match loaded.first().and_then(|l| l.share).filter(|_| !cut) {
+                .is_some_and(|l| fits_slot(*form, l.slot, bytes));
+            let shared = loaded
+                .first()
+                .filter(|_| !cut)
+                .and_then(|l| l.share.map(|s| (l.slot, s)));
+            let part = match shared {
                 None => None,
-                Some(share) => match share.of(*form, bytes) {
-                    Some(part) => Some(part),
-                    // Decoding into the same form would round it twice.
-                    None if loaded.iter().any(|l| l.slot.form.name() == form.name()) => {
-                        let (form, why) = (form.name(), "a share cuts its blocks");
-                        return Err(Error::WeightParts { weight, form, why });
+                Some((slot, share)) => {
+                    if !whole && !fits_whole(*form, slot, share, bytes) {
+                        let form = form.name();
+                        return Err(Error::WeightSize { weight, form });
                     }
-                    None => {
-                        unpacked(self, weight, *form, bytes, share)?;
-                        if has_extra {
-                            load_extra_packed(self, weight, *form, bytes)?;
+                    match share.slice(*form, bytes, slot.len) {
+                        Some(part) => Some(part),
+                        // Decoding into the same form would round it twice.
+                        None if loaded.iter().any(|l| l.slot.form.name() == form.name()) => {
+                            let (form, why) = (form.name(), "a share cuts its blocks");
+                            return Err(Error::WeightParts { weight, form, why });
                         }
-                        return Ok(());
+                        None => {
+                            unpacked(self, weight, *form, bytes, share)?;
+                            if has_extra {
+                                load_extra_packed(self, weight, *form, bytes)?;
+                            }
+                            return Ok(());
+                        }
                     }
-                },
+                }
             };
             let slice_bytes = part.as_deref().unwrap_or(bytes);
-            for l in loaded {
+            for l in &loaded {
                 let slot = l.slot;
                 let same = slot.form.name() == form.name();
                 if !same && !slot.form.packs() {
                     let (form, into) = (form.name(), slot.form.name());
                     return Err(Error::WeightInto { weight, form, into });
                 }
-                if !whole && form.bytes(slot.len) != slice_bytes.len() {
+                if !whole && !fits_slot(*form, slot, slice_bytes) {
                     let form = form.name();
                     return Err(Error::WeightSize { weight, form });
                 }
-                if same {
+            }
+            for l in loaded {
+                let slot = l.slot;
+                if slot.form.name() == form.name() {
                     self.upload_weight(weight, slot, slice_bytes)?;
                     continue;
                 }
@@ -459,13 +472,15 @@ pub trait Run {
             .filter(|l| l.weight == weight)
             .map(|l| l.slot)
             .collect();
-        for slot in slots {
-            if slot.form.bytes(slot.len) != bytes.len() {
+        for slot in &slots {
+            if !fits_slot(slot.form, *slot, bytes) {
                 return Err(Error::WeightSize {
                     weight,
                     form: slot.form.name(),
                 });
             }
+        }
+        for slot in slots {
             self.upload_weight(weight, slot, bytes)?;
         }
         Ok(())
@@ -579,6 +594,19 @@ pub trait Run {
     }
 }
 
+/// Whether `bytes` match `slot`'s form and packed shape.
+fn fits_slot(form: &dyn Load, slot: Slot, bytes: &[u8]) -> bool {
+    let (axes, dims) = slot.axes();
+    form.fits_shape(&axes[..dims], bytes)
+}
+
+/// Whether `bytes` match the whole unsliced weight for `slot`.
+fn fits_whole(form: &dyn Load, slot: Slot, share: Share, bytes: &[u8]) -> bool {
+    share
+        .whole_axes(slot)
+        .is_some_and(|(axes, dims)| form.fits_shape(&axes[..dims], bytes))
+}
+
 /// Reads a file's bytes into slots of its form.
 fn filed<R: Run + ?Sized>(
     r: &mut R,
@@ -586,6 +614,9 @@ fn filed<R: Run + ?Sized>(
     form: &dyn Load,
     file: &dyn Filed,
 ) -> Result<bool, Error> {
+    if form.checks_bytes() {
+        return Ok(false);
+    }
     let loaded: Vec<Loaded> = (r.plan().weights.iter())
         .filter(|l| l.weight == weight)
         .copied()
@@ -593,7 +624,7 @@ fn filed<R: Run + ?Sized>(
     let plain = |l: &Loaded| {
         let slot = l.slot;
         let whole = l.part.is_none() && l.share.is_none();
-        whole && slot.form.name() == form.name() && slot.bytes() == file.bytes()
+        whole && slot.form.name() == form.name() && form.fits_size(slot.len, file.bytes())
     };
     let Some((first, rest)) = loaded.split_first() else {
         return Ok(true);
@@ -605,14 +636,15 @@ fn filed<R: Run + ?Sized>(
     let Some(into) = r.held_mut().mapped_slot(first.slot) else {
         return Ok(false);
     };
-    file.read(into, reads)
+    let len = file.bytes();
+    file.read(&mut into[..len], reads)
         .map_err(|e| Error::WeightRead(weight, e))?;
     if rest.is_empty() {
         return Ok(true);
     }
     let bytes = r.held().bytes(first.slot)?;
     for l in rest {
-        r.held_mut().upload(l.slot, &bytes)?;
+        r.held_mut().upload(l.slot, &bytes[..len])?;
     }
     Ok(true)
 }
@@ -723,11 +755,11 @@ fn parts<R: Run + ?Sized>(
         let into: &dyn Load = if at == 0 { codes } else { F32_FORM };
         let data = match l.share {
             Some(share) => share
-                .of(into, &split[at])
+                .slice(into, &split[at], l.slot.len)
                 .ok_or_else(|| what("an uneven cut"))?,
             None => split[at].clone(),
         };
-        if into.bytes(l.slot.len) != data.len() || l.slot.form.name() != into.name() {
+        if !fits_slot(into, l.slot, &data) || l.slot.form.name() != into.name() {
             let form = into.name();
             return Err(Error::WeightSize { weight, form });
         }

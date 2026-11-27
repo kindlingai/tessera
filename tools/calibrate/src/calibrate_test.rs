@@ -44,11 +44,15 @@ fn grid_reaches_rules() {
         "fast_gqa_attend",
         "fast_indexer",
         "picked_trellis",
+        "picked_trellis_metal",
         "picked_bf16",
     ];
-    // The grid's trellis experts reach picked trellis on CUDA.
+    // The grid reaches picked trellis on CUDA and Metal.
     let cuda = device.platform.backend == "cuda";
-    let device_only = |name| device_rules.contains(&name) && !(cuda && name == "picked_trellis");
+    let metal = device.platform.backend == "metal";
+    let picked_match =
+        |name| (cuda && name == "picked_trellis") || (metal && name == "picked_trellis_metal");
+    let device_only = |name| device_rules.contains(&name) && !picked_match(name);
     let skipped = |r: &&&tessera_lower::Rule| r.name.starts_with("cpu_") || device_only(r.name);
     for rule in rules().iter().filter(|r| !skipped(r)) {
         let ran = timed.iter().any(|(step, _)| step.rule == rule.name);

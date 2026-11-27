@@ -1,6 +1,7 @@
 //! exlr8 v2 to v4 releases: trellis, block and fp8 matrices.
 
 use crate::exlr8_experts as experts;
+use crate::exlr8_shard::{Shard, layer_prefix, past};
 use crate::file::{Error, File};
 use crate::offer::{Offer, Slice, Stored, narrow};
 use std::cell::RefCell;
@@ -240,6 +241,9 @@ pub struct Release {
 /// The `dense/` layout's vocabulary file. Its presence marks the layout.
 const VOCAB: &str = "dense/exlr8-vocab";
 
+/// Every tensor outside the routed experts, by HF name.
+const WHOLE: &str = "model-nonexperts";
+
 /// Names in the `dense/` layout.
 struct Dense {
     /// Before a layer's index, from the files' `tensor_prefix`.
@@ -252,6 +256,8 @@ struct Dense {
     single: Option<String>,
     /// Files that hold whole HF names.
     extras: Vec<String>,
+    /// Whether the extras hold plain tensors only.
+    plain: bool,
     /// The manifest's width for each `(layer, matrix)` stored at several.
     widths: HashMap<(usize, String), u32>,
     /// The manifest's expert widths, by layer and projection.
@@ -271,77 +277,6 @@ impl Dense {
     }
 }
 
-/// `name` past `stem`, where `stem` is a whole first part.
-fn past<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
-    let end = name.strip_prefix(stem)?;
-    (end.is_empty() || end.starts_with('.')).then_some(end)
-}
-
-/// The text before a layer index in `f`'s names.
-fn layer_prefix(f: &File) -> Option<String> {
-    if let Some(prefix) = f.meta("tensor_prefix") {
-        return Some(prefix.into());
-    }
-    // Else the most common `layers.` stem before a number.
-    let slices = f.slices();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for s in &slices {
-        for (at, stem) in s.name.match_indices("layers.") {
-            let end = at + stem.len();
-            if s.name[end..].starts_with(|c: char| c.is_ascii_digit()) {
-                *counts.entry(&s.name[..end]).or_default() += 1;
-                break;
-            }
-        }
-    }
-    let most = counts.into_iter().max_by_key(|&(stem, n)| (n, stem));
-    most.map(|(stem, _)| stem.into())
-}
-
-/// One file, and how its names become HF names.
-struct Shard {
-    file: String,
-    prefix: String,
-    /// Stems that take other HF names.
-    renames: Vec<(String, String)>,
-    /// Widths of matrices stored at several, by stem.
-    picked: Vec<(String, u32)>,
-}
-
-impl Shard {
-    fn new(file: String, prefix: String) -> Self {
-        Self {
-            file,
-            prefix,
-            renames: Vec::new(),
-            picked: Vec::new(),
-        }
-    }
-
-    fn name(&self, local: &str) -> String {
-        for (stem, hf) in &self.renames {
-            if let Some(end) = past(local, stem) {
-                return format!("{hf}{end}");
-            }
-        }
-        format!("{}{local}", self.prefix)
-    }
-
-    /// A stem's matrix, or `None` for an unpicked width.
-    fn matrix<'a>(&self, stem: &'a str) -> Option<&'a str> {
-        let Some((matrix, width)) = stem.rsplit_once(".k") else {
-            return Some(stem);
-        };
-        let Ok(k) = width.parse::<u32>() else {
-            return Some(stem);
-        };
-        self.picked
-            .iter()
-            .any(|(m, w)| m == matrix && *w == k)
-            .then_some(matrix)
-    }
-}
-
 enum Where {
     Dir(PathBuf),
     Url(String),
@@ -349,8 +284,8 @@ enum Where {
 
 /// Whether `dir` holds an exlr8 release directory.
 pub fn is_release(dir: &Path) -> bool {
-    dir.join("dense/exlr8-vocab.safetensors").is_file()
-        || dir.join("exlr8-vocab.safetensors").is_file()
+    let file = |stem: &str| dir.join(format!("{stem}.safetensors")).is_file();
+    file(VOCAB) || file("exlr8-vocab") || (file(WHOLE) && file(&experts::index_file(0)))
 }
 
 /// Opens an exlr8 release, picking `name` or its sole manifest.
@@ -402,8 +337,30 @@ impl Release {
         release
     }
 
+    /// The names of a release with one whole-tensor file.
+    fn read_whole(&self) -> Result<Dense, Error> {
+        let index = experts::index_file(0);
+        let named = self.with(&index, |f| Ok(f.meta("tensor_prefix").map(String::from)))?;
+        let found = self.with(WHOLE, |f| Ok(layer_prefix(f)))?;
+        Ok(Dense {
+            prefix: named.or(found).unwrap_or_else(|| "model.layers.".into()),
+            vocab_prefix: String::new(),
+            vocab: Vec::new(),
+            single: Some(WHOLE.into()),
+            extras: vec![WHOLE.into()],
+            plain: true,
+            widths: HashMap::new(),
+            experts: experts::Widths::default(),
+        })
+    }
+
     /// The `dense/` layout's names, if the release has that layout.
     fn read_dense(&self) -> Result<Dense, Error> {
+        if self.with(VOCAB, |_| Ok(())).is_err()
+            && let Ok(whole) = self.read_whole()
+        {
+            return Ok(whole);
+        }
         let glm = [
             ("embed_tokens", "model.embed_tokens"),
             ("norm", "model.norm"),
@@ -463,6 +420,7 @@ impl Release {
             vocab,
             single,
             extras,
+            plain: false,
             widths: HashMap::new(),
             experts: experts::Widths::default(),
         })
@@ -562,6 +520,11 @@ impl Release {
         }
     }
 
+    /// Each routed expert's width, where a projection mixes them.
+    fn expert_mix(&self, layer: usize, proj: experts::Proj) -> Option<&[u32]> {
+        self.dense.as_ref()?.experts.mixed(layer, proj)
+    }
+
     /// Trellis forms for one routed layer's projections.
     fn expert_forms(&self, layer: usize) -> Option<experts::Forms> {
         let mut routed = Vec::with_capacity(3);
@@ -569,12 +532,23 @@ impl Release {
         for p in experts::Proj::ALL {
             let kr = self.expert_width(layer, false, p);
             let ks = self.expert_width(layer, true, p);
-            let rbook = self
-                .with(&experts::codes_file(layer, kr), |f| {
-                    experts::codebook(f, false, p)
-                })
-                .ok()?;
-            routed.push(trellis::form_for(kr, rbook)?);
+            let book = |k: u32| {
+                let file = experts::codes_file(layer, k);
+                let book = self.with(&file, |f| experts::codebook(f, false, p)).ok()?;
+                trellis::form_for(k, book).map(|_| book)
+            };
+            let rbook = book(kr)?;
+            routed.push(match self.expert_mix(layer, p) {
+                // Every width's file must use one codebook.
+                Some(each) => {
+                    let all = experts::distinct(each);
+                    if all.iter().any(|k| book(*k) != Some(rbook)) {
+                        return None;
+                    }
+                    trellis::mixed_for(rbook)?
+                }
+                None => trellis::form_for(kr, rbook)?,
+            });
             let sform = self
                 .with(&experts::codes_file(layer, ks), |f| {
                     experts::codebook(f, true, p)
@@ -604,6 +578,13 @@ impl Release {
         let sizes = self.with(&experts::index_file(layer), |f| {
             experts::sizes(f, gate_k).ok_or_else(|| Error::Missing(local.into()))
         })?;
+        if let Some(each) = self.expert_mix(layer, proj).filter(|_| !shared) {
+            let mut set = experts::Mixed::new(local, sizes, each, slice)?;
+            for k in experts::distinct(each) {
+                self.with(&experts::codes_file(layer, k), |f| set.fill(f, k))?;
+            }
+            return Ok(set.bytes);
+        }
         let file = experts::codes_file(layer, width);
         let slice = slice.filter(|_| !shared);
         let read = |f: &File| experts::packed(f, local, sizes, width, slice);
@@ -716,11 +697,17 @@ impl Release {
     /// Tensor `name` as f32. `M.codes`, `M.suh`, `M.svh`: unrotated parts.
     pub fn read(&self, name: &str) -> Result<Vec<f32>, Error> {
         if let Some((layer, local)) = self.expert(name) {
-            let k = experts::target(local)
+            let target = experts::target(local);
+            let k = target
                 .map(|(shared, proj)| self.expert_width(layer, shared, proj))
                 .unwrap_or(self.width);
-            return self.with(&experts::index_file(layer), |f| {
-                experts::floats(f, local, k)
+            let mix = target.and_then(|(shared, proj)| match shared {
+                true => None,
+                false => self.expert_mix(layer, proj),
+            });
+            return self.with(&experts::index_file(layer), |f| match mix {
+                Some(each) => experts::mixed_floats(f, local, each),
+                None => experts::floats(f, local, k),
             });
         }
         let (file, local) = self.place(name);
@@ -789,7 +776,10 @@ impl Release {
                 };
                 let mut out = vec![vocab];
                 for extra in &d.extras {
-                    out.push(Shard::new(extra.clone(), String::new()));
+                    out.push(Shard {
+                        plain: d.plain,
+                        ..Shard::new(extra.clone(), String::new())
+                    });
                 }
                 (out, "dense/exlr8-dense-", d.prefix.as_str())
             }
@@ -896,7 +886,8 @@ impl Release {
                 || n.starts_with("__pad")
         };
         for s in raw {
-            if !part(&s.name) {
+            let kept = shard.plain && !s.name.starts_with("__pad");
+            if kept || !part(&s.name) {
                 out.push(Slice {
                     name: shard.name(&s.name),
                     ..s

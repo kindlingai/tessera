@@ -181,11 +181,22 @@ macro_rules! trellis_kinds {
     };
 }
 
+macro_rules! mix_kinds {
+    ($(($book:ident, $suffix:literal, $mix:ident, $kind:literal),)*) => {
+        const MIX_KINDS: &[Kind] = &[$((
+            concat!("FORM_", stringify!($mix)),
+            &tessera_mem::trellis::$mix,
+            $kind,
+        )),*];
+    };
+}
+
 tessera_mem::block_forms!(block_kinds);
+tessera_mem::trellis_mixes!(mix_kinds);
 tessera_mem::trellis_forms!(trellis_kinds);
 
 fn kinds() -> impl Iterator<Item = &'static Kind> {
-    BLOCK_KINDS.iter().chain(TRELLIS_KINDS)
+    BLOCK_KINDS.iter().chain(TRELLIS_KINDS).chain(MIX_KINDS)
 }
 
 /// `form_kind`, in code order. Zero is no packed form.

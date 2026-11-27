@@ -643,3 +643,64 @@ pub(crate) fn pick_graph<'a>(
     }
     base
 }
+
+/// Whether every wanted output of `entry` is indexed by `Picks`.
+pub(crate) fn order_free(graph: &Graph, entry: usize, wants: Wants) -> bool {
+    let e = &graph.entries[entry];
+    let has_picks = e
+        .inputs
+        .iter()
+        .any(|p| p.role == tessera_graph::Role::Picks);
+    let picks_dim = tessera_graph::DimExpr::Dim(tessera_graph::DimName::Picks);
+    e.outputs.iter().enumerate().all(|(i, o)| {
+        wants.0 >> i & 1 == 0
+            || (has_picks && graph.node(o.node).ty.shape.0.first() == Some(&picks_dim))
+    })
+}
+
+/// Block-zigzag permutation `(perm, inv)` balancing causal lengths across ranks.
+pub(crate) fn zigzag_order(
+    filled: usize,
+    chunks: usize,
+    ranks: usize,
+    page: usize,
+) -> Option<(Vec<usize>, Vec<u32>)> {
+    if ranks <= 1 || chunks == 0 || !filled.is_multiple_of(chunks) {
+        return None;
+    }
+    let len = filled / chunks;
+    if !len.is_multiple_of(ranks) {
+        return None;
+    }
+    let per = len / ranks;
+    if per < 2 || !per.is_multiple_of(2) {
+        return None;
+    }
+    let half_per = per / 2;
+    let mut block = 1usize;
+    while block * 2 <= page && half_per.is_multiple_of(block * 2) {
+        block *= 2;
+    }
+    let pairs = half_per / block;
+    let stride = 2 * ranks * block;
+    let mut perm = vec![0usize; filled];
+    let mut inv = vec![0u32; filled];
+    for c in 0..chunks {
+        let base = c * len;
+        for p in 0..pairs {
+            let cycle = base + p * stride;
+            for r in 0..ranks {
+                let dst = base + r * per + 2 * p * block;
+                let fwd = cycle + r * block;
+                let rev = cycle + (2 * ranks - 1 - r) * block;
+                for k in 0..block {
+                    perm[dst + k] = fwd + k;
+                    inv[fwd + k] = (dst + k) as u32;
+                    perm[dst + block + k] = rev + k;
+                    inv[rev + k] = (dst + block + k) as u32;
+                }
+            }
+        }
+    }
+    Some((perm, inv))
+}

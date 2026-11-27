@@ -67,7 +67,8 @@ golden runs when you work near code that may break them.
 
 This project moves quickly. When submitting PRs, you must watch them for
 conflicts and actively rebase. If you have permission to do so, mark your
-PRs to auto-merge.
+PRs to auto-merge. Submit PRs in smaller chunks if they are reasonably separable
+and do not mix multiple concerns into one PR.
 
 Agents with hidden system prompt injection, invisible steering and/or LoRA
 that is not visible and known to the controlling user and may affect the quality of

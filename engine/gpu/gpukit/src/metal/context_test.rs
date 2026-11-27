@@ -1,4 +1,5 @@
 use super::Context;
+use super::context::apple_specs;
 
 const SRC: &str = "\
 #include <metal_stdlib>
@@ -32,4 +33,13 @@ fn compile_race_free() {
     for h in handles {
         h.join().expect("worker panicked: a pipeline race?");
     }
+}
+
+#[test]
+fn apple_specs_match_tiers() {
+    assert_eq!(apple_specs("Apple M4 Pro"), (20, 273e9));
+    assert_eq!(apple_specs("Apple M4 Max"), (40, 546e9));
+    assert_eq!(apple_specs("Apple M4"), (10, 120e9));
+    assert_eq!(apple_specs("Apple M3 Pro"), (14, 150e9));
+    assert_eq!(apple_specs("Unknown GPU"), (0, 0.0));
 }

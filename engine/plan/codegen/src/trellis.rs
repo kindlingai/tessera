@@ -7,7 +7,7 @@ use crate::ir::{Expr, Helper};
 use crate::prelude::{Bits, Buf, F32x4, U8, device, helper, round_e4m3, round_f16};
 use tessera_mem::trellis::*;
 
-pub use tessera_mem::trellis::{INPUT_SIDE, packed};
+pub use tessera_mem::trellis::{INPUT_SIDE, alloc_mixed, packed};
 
 tessera_mem::trellis_fns!(kernel_fns);
 
@@ -56,6 +56,17 @@ macro_rules! kernel_books {
                 $(Codebook::$book => [
                     one_ir::<book::$book, K>(name),
                     four_ir::<book::$book, K>(name),
+                ],)*
+            }
+        }
+
+        /// A mixed form's helpers. `at` names each width's form.
+        fn mix_decoders(name: &'static str, codebook: Codebook) -> [Helper; 2] {
+            let at = [2, 3, 4].map(|k| form_for(k, codebook).expect("a width's form").name());
+            match codebook {
+                $(Codebook::$book => [
+                    mix_one_ir::<book::$book>(name, at[0], at[1], at[2]),
+                    mix_four_ir::<book::$book>(name, at[0], at[1], at[2]),
                 ],)*
             }
         }
@@ -162,22 +173,118 @@ fn four<B: LoadBook, const K: u32>(#[build] name: &'static str, p: Buf<U8>, i: u
     )
 }
 
+/// Code `j` of the tile at `t`.
+#[helper("form_{name}_code")]
+fn code<B: LoadBook, const K: u32>(#[build] name: &'static str, t: Buf<U8>, j: u32) -> f32 {
+    let odd = if B::PAIRS { j % 2 } else { 0 };
+    lane::<B, K>(
+        name,
+        win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j)),
+        odd,
+    )
+}
+
+/// Codes `j`, `j+1`, `j+8`, `j+9` of the tile at `t`.
+#[helper("form_{name}_quad")]
+fn quad<B: LoadBook, const K: u32>(#[build] name: &'static str, t: Buf<U8>, j: u32) -> F32x4 {
+    let a = win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j));
+    let b = win::<K>(name, t, start::body::<K>(B::BITS, B::PAIRS, j + 8));
+    F32x4::new(
+        lane::<B, K>(name, a, 0),
+        lane::<B, K>(name, a, 1),
+        lane::<B, K>(name, b, 0),
+        lane::<B, K>(name, b, 1),
+    )
+}
+
+/// The byte of the table row for column `at`.
+#[helper("form_{name}_row")]
+fn mix_row(#[build] name: &'static str, p: Buf<U8>, at: u32) -> u32 {
+    MIX_TABLE as u32 + MIX_ROW as u32 * (at / p.word(4))
+}
+
+/// The tile holding `T[row][col]` in a mixed set.
+#[helper("form_{name}_tile")]
+fn mix_tile(#[build] name: &'static str, p: Buf<U8>, row: u32, at: u32) -> Buf<U8> {
+    let out = p.word(4);
+    let e = mix_row(name, p, at);
+    let t = local::body(p.word(0), out, p.word(8), row, at % out);
+    let base = (p.word(e) as u64) | ((p.word(e + 4) as u64) << 32);
+    p + (base + t as u64 * (32 * p.word(e + 8)) as u64)
+}
+
+/// A mixed set's helpers: each picks its matrix's width.
+macro_rules! mix_helpers {
+    ($($(#[$doc:meta])* $text:literal fn $f:ident($name:ident) -> $ret:ty = $each:ident;)*) => {$(
+        $(#[$doc])*
+        #[helper($text)]
+        fn $f<B: LoadBook>(
+            #[build] $name: &'static str,
+            #[build] k2: &'static str,
+            #[build] k3: &'static str,
+            #[build] k4: &'static str,
+            p: Buf<U8>,
+            i: u64,
+        ) -> $ret {
+            let inp = p.word(0);
+            let n = i as u32;
+            let c = col($name, p, n, inp);
+            let row = n - c * inp;
+            let k = p.word(mix_row($name, p, c) + 8);
+            let t = mix_tile($name, p, row, c);
+            let j = slot::body(row % 16, c % 16);
+            if k == 2 {
+                $each::<B, 2>(k2, t, j)
+            } else if k == 3 {
+                $each::<B, 3>(k3, t, j)
+            } else {
+                $each::<B, 4>(k4, t, j)
+            }
+        }
+    )*};
+}
+
+mix_helpers! {
+    /// Element `i` of a mixed set at `p`.
+    "form_{name}" fn mix_one(name) -> f32 = code;
+    /// Four along a row of a mixed set.
+    "form_{name}_x4" fn mix_four(name) -> F32x4 = quad;
+}
+
+/// The `Load` methods every trellis form shares.
+macro_rules! coded_load {
+    () => {
+        fn ty(&self) -> &'static str {
+            "u8"
+        }
+        fn heavy(&self) -> bool {
+            true
+        }
+        fn load(&self, name: &str, index: &str) -> String {
+            format!("form_{}({name}, {index})", self.name)
+        }
+        /// Four along a row share one tile.
+        fn load4(&self, name: &str, index: &str) -> String {
+            format!("form_{}_x4({name}, {index})", self.name)
+        }
+    };
+}
+
+impl Load for TrellisMix {
+    coded_load!();
+    fn decoder(&self, wide: bool) -> Option<Helper> {
+        let [one, four] = mix_decoders(self.name, self.codebook);
+        Some(if wide { four } else { one })
+    }
+    fn header(&self) -> Vec<Helper> {
+        mix_decoders(self.name, self.codebook).into()
+    }
+}
+
 impl<const K: u32> Load for Trellis<K> {
+    coded_load!();
     fn codes(&self) -> Option<&'static dyn Load> {
         form_for(K, self.codebook).filter(|_| self.rotated)
-    }
-    fn ty(&self) -> &'static str {
-        "u8"
-    }
-    fn heavy(&self) -> bool {
-        true
-    }
-    fn load(&self, name: &str, index: &str) -> String {
-        format!("form_{}({name}, {index})", self.name)
-    }
-    /// Four along a row share one tile.
-    fn load4(&self, name: &str, index: &str) -> String {
-        format!("form_{}_x4({name}, {index})", self.name)
     }
     fn decoder(&self, wide: bool) -> Option<Helper> {
         let [one, four] = decoders::<K>(self.name, self.codebook);
@@ -203,3 +310,11 @@ macro_rules! register_trellis {
 }
 
 tessera_mem::trellis_forms!(register_trellis);
+
+macro_rules! register_mixes {
+    ($(($book:ident, $suffix:literal, $mix:ident, $kind:literal),)*) => {
+        $(form!(tessera_mem::trellis::$mix);)*
+    };
+}
+
+tessera_mem::trellis_mixes!(register_mixes);

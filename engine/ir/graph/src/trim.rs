@@ -188,7 +188,7 @@ fn rowwise(op: &Op, j: usize, arg: &TensorType) -> bool {
         Op::Select(Select::Take | Select::TopK { .. }) => true,
         Op::Select(Select::Gather) => j == 1,
         Op::Matmul => j == 0 || arg.rank() >= 3,
-        Op::Attend(a) => j != 1 && j != 2 && a.sinks_arg() != Some(j),
+        Op::Attend(a) => j != 1 && j != 2 && (a.sinks_arg() != Some(j) || arg.rank() > 1),
         Op::Mean(axis) | Op::Mix(axis) => *axis != 0,
         Op::Input { .. }
         | Op::Weight(_)

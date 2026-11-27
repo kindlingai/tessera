@@ -146,6 +146,30 @@ fn rms_divides_rows() {
     );
 }
 
+/// Lengths 5, 0.5 and 0. Positions straddle the floor.
+#[test]
+fn clip_scale_stages() {
+    let x = vec![3., 4., 0., 0., 0.5, 0., 0., 0., 0., 0., 0., 0.];
+    let x = Tensor::f32(vec![3, 4], x);
+    let at = Tensor::u32(vec![3], vec![1, 7, 2]);
+    let ports = [port([Rows, Hidden], F32), port([Rows], U32)];
+    let out = eval(ports, &[x, at], None, |_, [x, at]| {
+        [x.l2_clip(2.0, 1.0), x.log_scale(&at, 4.0, 0.5)]
+    });
+    let out = out.unwrap();
+    // The epsilon joins the root: 2 / (5 + 1).
+    let zeros = [0.; 4];
+    close(
+        &out[0],
+        &[[1., 4. / 3., 0., 0.], [0.5, 0., 0., 0.], zeros].concat(),
+    );
+    let tau = 1.0 + 0.5 * 2f32.ln();
+    close(
+        &out[1],
+        &[[3., 4., 0., 0.], [0.5 * tau, 0., 0., 0.], zeros].concat(),
+    );
+}
+
 #[test]
 fn hadamard_blocks() {
     let x = vec![1., 2., 3., 4., -1., 0., 2., 5.];
@@ -239,7 +263,8 @@ fn every_stage_runs() {
             }
             Takes::Positions => {
                 ports.push(port([Rows], U32));
-                inputs.push(Tensor::u32(vec![2], vec![1, 6]));
+                // The second lies past the default log-scale floor.
+                inputs.push(Tensor::u32(vec![2], vec![1, 16383]));
             }
             Takes::Bits => {
                 ports.push(port(Shape(vec![Rows.into(), 1u64.into()]), U32));

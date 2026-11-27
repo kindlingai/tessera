@@ -39,17 +39,27 @@ impl Tensor {
 
     /// Dilated causal filter over whole sequences.
     pub fn conv_dilated(&self, w: &Taps, dilation: u32) -> Tensor {
+        self.conv_dynamic(&w.0, dilation)
+    }
+
+    /// Ragged dilated causal filter updating kept state per slot.
+    pub fn conv_rows(&self, w: &Taps, dilation: u32, state: &Kept, by: [&Tensor; 2]) -> Tensor {
+        self.conv_rows_dynamic(&w.0, dilation, state, by)
+    }
+
+    /// `conv_dilated` with taps `w[.., C, K]` for every row.
+    pub fn conv_dynamic(&self, w: &Tensor, dilation: u32) -> Tensor {
         let op = Op::Conv(Conv {
             dilation,
             state: None,
         });
-        self.op(op, &[&w.0])
+        self.op(op, &[w])
     }
 
-    /// Ragged dilated causal filter updating kept state per slot.
-    pub fn conv_rows(
+    /// `conv_rows` with taps `w[Rows, C, K]` for every row.
+    pub fn conv_rows_dynamic(
         &self,
-        w: &Taps,
+        w: &Tensor,
         dilation: u32,
         state: &Kept,
         [slots, positions]: [&Tensor; 2],
@@ -58,7 +68,7 @@ impl Tensor {
             dilation,
             state: Some(state.0),
         });
-        self.op(op, &[&w.0, slots, positions])
+        self.op(op, &[w, slots, positions])
     }
 
     /// Logits over a table's rows, for tied embeddings.

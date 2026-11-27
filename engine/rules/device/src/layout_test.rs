@@ -86,7 +86,7 @@ fn form_kinds_hold() {
         assert_ne!(pair[0].1, pair[1].1, "{pair:?} share a code");
     }
     // `trellis.h` reads these nine as one range.
-    let trellis = |e: &&abi::Entry| e.0.starts_with("FORM_TRELLIS_");
+    let trellis = |e: &&abi::Entry| e.0.starts_with("FORM_TRELLIS_K");
     let codes: Vec<u32> = FORM_KINDS.iter().filter(trellis).map(|e| e.1).collect();
     assert_eq!(codes, (8..=16).collect::<Vec<u32>>());
     for f in tessera_lower::form::LOADS.iter() {

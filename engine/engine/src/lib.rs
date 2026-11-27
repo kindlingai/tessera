@@ -23,6 +23,8 @@ mod mtp_draft;
 mod ple;
 mod probe;
 mod ranks;
+#[cfg(test)]
+mod ranks_test;
 mod schedule;
 mod spec_len;
 mod spec_loop;
@@ -135,6 +137,7 @@ pub struct Engine {
     pub(crate) owned: Option<(Graph, usize)>,
     pub(crate) split: Option<(Graph, usize)>,
     pub(crate) split_owned: Option<(Graph, usize)>,
+    used_attn: bool,
     runner: Box<dyn Run>,
     device: Device,
     plans: Cache,
@@ -406,6 +409,7 @@ impl Engine {
             owned,
             split,
             split_owned,
+            used_attn,
             runner,
             device,
             plans,
@@ -779,11 +783,45 @@ impl Engine {
             sizes.push((PEEK, 1));
         }
         let entry = self.entry(&head)?;
+        let allow = entry == self.full && !peek;
+        let graph = ranks::pick_graph(
+            (&self.graph, &self.owned, &self.split, &self.split_owned),
+            &self.device,
+            allow,
+            filled,
+            &mut sizes,
+        );
+        let chunks = if !self.used_attn || self.stateful || peek {
+            0
+        } else if self
+            .split_owned
+            .as_ref()
+            .is_some_and(|(g, _)| std::ptr::eq(graph, g))
+        {
+            2
+        } else if self
+            .owned
+            .as_ref()
+            .is_some_and(|(g, _)| std::ptr::eq(graph, g))
+        {
+            1
+        } else {
+            0
+        };
+        let page = self.lanes.as_ref().map_or(8, |l| l.page);
+        let order = if chunks > 0 && ranks::order_free(graph, entry, wants) {
+            ranks::zigzag_order(filled, chunks, self.device.division().ranks(), page)
+        } else {
+            None
+        };
         // The last row fills out. Copies rewrite its kept row.
-        let last = rows[rows.len() - 1];
+        let row_at = |i: usize| rows[i.min(rows.len() - 1)];
         let column = |of: fn(&Row) -> u32| {
-            let values = rows.iter().chain(std::iter::repeat(&last));
-            Tensor::u32(vec![filled], values.take(filled).map(of).collect())
+            let data = match &order {
+                Some((perm, _)) => perm.iter().map(|&i| of(&row_at(i))).collect(),
+                None => (0..filled).map(|i| of(&row_at(i))).collect(),
+            };
+            Tensor::u32(vec![filled], data)
         };
         let (mut masks, mut listed, mut edits) = match head {
             Head::Full(masks) => (masks, None, None),
@@ -797,8 +835,16 @@ impl Engine {
                 Role::Positions => column(|r| r.position),
                 Role::Slots => column(|r| r.slot),
                 Role::Picks => {
-                    let tail = picks.last().copied().unwrap_or_default();
-                    let picked = picks.iter().copied().chain(std::iter::repeat(tail));
+                    let map = |p: u32| match &order {
+                        Some((_, inv)) => inv.get(p as usize).copied().unwrap_or(p),
+                        None => p,
+                    };
+                    let tail = picks.last().copied().map(map).unwrap_or_else(|| map(0));
+                    let picked = picks
+                        .iter()
+                        .copied()
+                        .map(map)
+                        .chain(std::iter::repeat(tail));
                     Tensor::u32(vec![wanted], picked.take(wanted).collect())
                 }
                 Role::Allowed => {
@@ -848,14 +894,6 @@ impl Engine {
         if masks.is_some() || edits.is_some() {
             return Err(Error::Mask);
         }
-        let allow = entry == self.full && !peek;
-        let graph = ranks::pick_graph(
-            (&self.graph, &self.owned, &self.split, &self.split_owned),
-            &self.device,
-            allow,
-            filled,
-            &mut sizes,
-        );
         let start = Instant::now();
         let (plan, bound) = self.plans.wanting(
             graph,

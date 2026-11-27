@@ -679,20 +679,20 @@ impl Context<'_> {
             Op::Matmul => cpu::matmul(num, args[0], args[1]),
             Op::Attend(a) if a.ragged => {
                 let keys = a.ids_arg().map(|i| args[i]);
-                let sinks = a.sinks_arg().map(|i| args[i]);
+                let extra = [a.sinks_arg(), a.rel_bias_arg()].map(|i| i.map(|i| args[i]));
                 cpu::attend_rows(
                     num,
                     a,
                     [args[0], args[1], args[2]],
                     [args[3], args[4]],
                     keys,
-                    sinks,
+                    extra,
                 )
             }
             Op::Attend(a) => {
                 let keys = a.ids_arg().map(|i| args[i]);
-                let sinks = a.sinks_arg().map(|i| args[i]);
-                cpu::attend(num, a, [args[0], args[1], args[2]], keys, sinks)
+                let extra = [a.sinks_arg(), a.rel_bias_arg()].map(|i| i.map(|i| args[i]));
+                cpu::attend(num, a, [args[0], args[1], args[2]], keys, extra)
             }
             Op::Conv(c) => cpu::conv(args[0], args[1], c.dilation as usize),
             Op::Delta(d) => cpu::delta(num, d, [args[0], args[1], args[2], args[3], args[4]]),

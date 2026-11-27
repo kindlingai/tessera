@@ -3,6 +3,7 @@
 use crate::slots::slot_scan;
 use tessera_codegen::prelude::*;
 use tessera_graph::Op;
+use tessera_lower::form::{Load as Stored, plain};
 use tessera_lower::{
     Arg, Draft, Extent, GUESS, Keeping, Kernel, KernelRef, Launch, Read, Shape, Step, T, Term,
     Tree, source,
@@ -13,26 +14,29 @@ const MAX_HIST: usize = 16;
 
 /// One thread per element: its channel's last `taps` rows.
 #[kernel]
-fn causal_conv(
+fn causal_conv<const DYNAMIC: bool>(
     x: Buf<F32>,
-    w: Buf<F32>,
+    #[form(w_form)] w: Buf<Dyn>,
     mut out: BufMut<F32>,
     len: u32,
     rows: u32,
     width: u32,
     taps: u32,
     dilation: u32,
+    #[build] w_form: &'static dyn Stored,
 ) {
     if gid() >= len {
         return;
     }
     let c = gid() % width;
     let t = gid() / width % rows;
+    // Dynamic taps differ at every row.
+    let wc = if DYNAMIC { gid() } else { c };
     let mut sum = 0.0f32;
     for j in 0..taps {
         let back = (taps - 1 - j) * dilation;
         if t >= back {
-            sum += w[(c * taps + j) as u64] * x[(gid() - back * width) as u64];
+            sum += w[(wc * taps + j) as u64] * x[(gid() - back * width) as u64];
         }
     }
     out[gid() as u64] = sum;
@@ -42,7 +46,7 @@ slot_scan!(
     /// One thread per `(slot, channel)`: updates kept history per row.
     fn causal_conv_rows(
         x: Buf<F32>,
-        w: Buf<F32>,
+        #[form(w_form)] w: Buf<Dyn>,
         slots: Buf<U32>,
         positions: Buf<U32>,
         mut state: BufMut<F32>,
@@ -53,6 +57,8 @@ slot_scan!(
         #[build] width: u32,
         #[build] taps: u32,
         #[build] dilation: u32,
+        #[build] dynamic: u32,
+        #[build] w_form: &'static dyn Stored,
     ),
     [slots, positions, out, rows],
     [s, r, pos, at, last],
@@ -68,8 +74,10 @@ slot_scan!(
         let base = (s * hist_len) as u64 * width as u64 + c as u64;
     },
     open: {
-        for j in 0..taps {
-            taps_w[j as usize] = w[(c * taps + j) as u64];
+        if dynamic == 0 {
+            for j in 0..taps {
+                taps_w[j as usize] = w[(c * taps + j) as u64];
+            }
         }
     },
     zero: {
@@ -91,6 +99,11 @@ slot_scan!(
         let at = (r * width + c) as u64;
     },
     step: {
+        if dynamic != 0 {
+            for j in 0..taps {
+                taps_w[j as usize] = w[at * taps as u64 + j as u64];
+            }
+        }
         let cur = x[at];
         let mut sum = cur * taps_w[(taps - 1) as usize];
         for j in 0..(taps - 1) {
@@ -106,29 +119,55 @@ slot_scan!(
 
 /// Whole sequences of `rows`, each `width` channels.
 #[derive(Clone, Copy, Debug, Kernel)]
-#[launch(causal_conv, name = "conv", threads = self.len)]
+#[launch(
+    causal_conv(self.w_form),
+    variant = self.dynamic,
+    name = self.w_form.suffixed(match self.dynamic {
+        true => "conv_dynamic",
+        false => "conv",
+    }),
+    threads = self.len,
+    accepts = conv_accepts,
+)]
 pub(crate) struct Conv {
     len: Extent,
     rows: Extent,
     width: usize,
     taps: usize,
     dilation: usize,
+    /// Whether every row has its own taps.
+    dynamic: bool,
+    w_form: &'static dyn Stored,
+}
+
+fn conv_accepts(k: &Conv, input: usize, form: &dyn Stored) -> bool {
+    k.w_form.taken(input, 1, form)
 }
 
 /// Ragged rows updating fixed per-slot history.
 #[derive(Clone, Copy, Debug, Kernel)]
 #[launch(
     crate = tessera_lower,
-    name = "conv_rows",
-    sizes = vec![self.seqs, self.rows.most(), self.width, self.taps, self.dilation],
+    name = self.w_form.suffixed("conv_rows"),
+    sizes = vec![
+        self.seqs,
+        self.rows.most(),
+        self.width,
+        self.taps,
+        self.dilation,
+        usize::from(self.dynamic),
+    ],
     work = self.rows.most() * self.width * self.taps * 2,
     guess = GUESS,
+    accepts = rows_accepts,
     source = source(
-        "conv_rows",
+        self.w_form.suffixed("conv_rows"),
         causal_conv_rows_ir(
             self.width as u32,
             self.taps as u32,
             self.dilation as u32,
+            u32::from(self.dynamic),
+            self.w_form,
         )
     ),
     launches = rows_launches,
@@ -140,7 +179,13 @@ pub(crate) struct ConvRows {
     width: usize,
     taps: usize,
     dilation: usize,
+    dynamic: bool,
     keeping: Keeping,
+    w_form: &'static dyn Stored,
+}
+
+fn rows_accepts(k: &ConvRows, input: usize, form: &dyn Stored) -> bool {
+    k.w_form.taken(input, 1, form)
 }
 
 fn rows_launches(k: &ConvRows, step: &Step) -> Vec<Launch> {
@@ -168,7 +213,8 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
         };
         let rows = tree.node(x).extents[0];
         let width = *node.shape.last()?;
-        let taps = tree.node(w).shape[1];
+        let taps = *tree.node(w).shape.last()?;
+        let dynamic = tree.node(w).shape.len() > 2;
         let hist = taps.checked_sub(1)? * dilation;
         if hist == 0 || hist > MAX_HIST || taps > MAX_HIST {
             return None;
@@ -180,7 +226,9 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
             width,
             taps,
             dilation,
+            dynamic,
             keeping: Keeping::of(tree),
+            w_form: plain(tree.node(w).form),
         };
         let reads = [
             Read::Node(x),
@@ -203,13 +251,15 @@ fn propose(tree: &Tree, at: T) -> Option<Vec<Draft>> {
     }
     let width = *node.shape.last()?;
     let len = rows.times(seqs.most() * width);
-    let taps = tree.node(w).shape[1];
+    let taps = *tree.node(w).shape.last()?;
     let conv = Conv {
         len,
         rows,
         width,
         taps,
         dilation,
+        dynamic: tree.node(w).shape.len() > 2,
+        w_form: plain(tree.node(w).form),
     };
     Some(vec![Draft::new(conv, [x, w], len.most())])
 }
