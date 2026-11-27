@@ -8,16 +8,13 @@ use crate::api::{self, Api, Call, Handle};
 use crate::backend::Backend;
 use crate::cache;
 use crate::device::Device;
-use crate::platform::{self, Asked, Platform};
+use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 
 pub use crate::api::ContextConfig;
 
 /// A HIP device plus a cache of loaded modules.
 pub type Context = api::Context<Runtime>;
-pub type Module = api::Module<Runtime>;
-pub type Kernel = api::Kernel<Runtime>;
-pub type Graph = api::Graph<Runtime>;
 
 /// `warpSize`, asked once, and the platform, built once.
 pub struct Own {
@@ -91,12 +88,12 @@ impl Context {
                     driver: format!("{}.{}", v / 10_000_000, (v / 100_000) % 100),
                     limits: self.limits(),
                     units: attr(hip::ATTR_MULTIPROCESSOR_COUNT) as usize,
-                    bandwidth: platform::bandwidth(
+                    bandwidth: api::bandwidth(
                         attr(hip::ATTR_MEMORY_CLOCK_RATE),
                         attr(hip::ATTR_MEMORY_BUS_WIDTH),
                     ),
                     integrated,
-                    memory: platform::device_memory(total as u64, integrated),
+                    memory: api::device_memory(total as u64, integrated),
                 })
             })
             .clone()

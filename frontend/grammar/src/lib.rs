@@ -6,6 +6,6 @@ mod guidance;
 mod guidance_test;
 
 #[cfg(feature = "llguidance")]
-pub use guidance::{Matcher, Vocab};
+pub use guidance::Vocab;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

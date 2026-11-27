@@ -585,11 +585,6 @@ pub fn program_with<N: HeadNorm, M: Mlp, B: QkvBias>(c: &Config) -> Graph {
     m.finish([(Role::Logits, &logits)])
 }
 
-/// Residual rows after `layers`, joined on the last axis.
-pub fn taps<N: HeadNorm, M: Mlp>(c: &Config, layers: &[u64]) -> Graph {
-    taps_with::<N, M, ()>(c, layers)
-}
-
 /// Residual taps parameterized by optional Q/K/V bias `B`.
 pub fn taps_with<N: HeadNorm, M: Mlp, B: QkvBias>(c: &Config, layers: &[u64]) -> Graph {
     let m = Model::new(c.dims());

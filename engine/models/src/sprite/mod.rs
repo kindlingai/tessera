@@ -4,7 +4,7 @@ mod tables;
 mod upstream;
 mod weights;
 
-pub use tables::{Constant, constants};
+pub use tables::constants;
 pub use weights::declare;
 
 use crate::shared::{Attend, Side, join, spread};
@@ -40,21 +40,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// tessera-small, from thejagstudio.
-    pub fn small(max_seqs: u64) -> Self {
-        Self {
-            grid: 16,
-            palette: 512,
-            hidden: 512,
-            heads: 8,
-            ffn: 1536,
-            text_dim: 512,
-            depth: [2, 8, 2],
-            max_seqs,
-            rope: 100.0,
-        }
-    }
-
     pub fn pixels(&self) -> u64 {
         self.grid * self.grid
     }

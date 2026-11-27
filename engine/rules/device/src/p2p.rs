@@ -334,6 +334,7 @@ where
     }
 
     /// Overrides the schedule for tests and benchmarks.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn with_schedule(mut self, schedule: Schedule) -> Self {
         self.schedule = schedule;
         self

@@ -17,7 +17,7 @@ mod watch_test;
 // Linking the crates registers their rules.
 use tessera_rules as _;
 
-pub use grid::{Grid, Timing};
+pub use grid::Grid;
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -79,11 +79,6 @@ fn time_steps(
         }
     }
     Ok(timed)
-}
-
-/// Times every launch of the plan, its inputs already fed.
-pub fn time(runner: &mut dyn Run) -> Result<Vec<(Step, f64)>, Error> {
-    time_steps(runner, None, (TRIES, BURST))
 }
 
 /// Each distinct launch's seconds with its weights read cold.

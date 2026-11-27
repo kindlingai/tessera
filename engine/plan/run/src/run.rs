@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tessera_codegen::Precision;
 use tessera_engine_settings::{Memory, Reads};
-use tessera_gpukit::{Limits, Platform};
+use tessera_gpukit::Platform;
 use tessera_graph::DimName;
 use tessera_lower::form::{F32_FORM, Load};
 use tessera_lower::{
@@ -325,10 +325,6 @@ pub trait Run {
     /// Steps running compiled host code, out of steps with trees.
     fn compiled(&self) -> (usize, usize) {
         (0, 0)
-    }
-    /// The hardware's limits for one group of threads.
-    fn limits(&self) -> Limits {
-        self.platform().limits
     }
     /// The hardware as asked, with its table row.
     fn platform(&self) -> Platform;

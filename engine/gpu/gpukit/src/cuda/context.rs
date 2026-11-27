@@ -19,23 +19,20 @@ use super::driver::{
 use crate::api::{self, Api, Call, Handle};
 use crate::backend::Backend;
 use crate::cache;
-use crate::platform::{self, Asked, Platform};
+use crate::platform::{Asked, Platform};
 use crate::{Error, Limits};
 
 pub use crate::api::ContextConfig;
 
 /// A CUDA context plus a cache of loaded modules.
 pub type Context = api::Context<Driver>;
-pub type Module = api::Module<Driver>;
 pub type Kernel = api::Kernel<Driver>;
-pub type Graph = api::Graph<Driver>;
 
 /// Driver context, capabilities and carveout state.
 pub struct Own {
     raw: CUcontext,
     device: c_int,
     compute_capability: (i32, i32),
-    limits: Limits,
     platform: Platform,
     attic: Mutex<crate::attic::Session>,
     attic_live: AtomicUsize,
@@ -94,19 +91,17 @@ impl Context {
             driver: version.map(|v| format!("{}.{}", v / 1000, (v % 1000) / 10))?,
             limits,
             units: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
-            bandwidth: platform::bandwidth(
+            bandwidth: api::bandwidth(
                 attr(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?,
                 attr(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?,
             ),
             integrated,
-            memory: platform::device_memory(total as u64, integrated),
+            memory: api::device_memory(total as u64, integrated),
         });
         let own = Own {
             raw,
             device,
             compute_capability: (major, minor),
-            // The table says whether launches may overlap.
-            limits: platform.limits,
             platform,
             attic: Mutex::new(crate::attic::Session::default()),
             attic_live: AtomicUsize::new(0),
@@ -122,11 +117,6 @@ impl Context {
         Ok(Self::made(driver, own, device, name, numa))
     }
 
-    /// Lanes, group memory and group size, from the device.
-    pub fn limits(&self) -> Limits {
-        self.own().limits
-    }
-
     /// The device as asked, with its table row.
     pub fn platform(&self) -> Platform {
         self.own().platform.clone()
@@ -135,10 +125,6 @@ impl Context {
     /// (major, minor), e.g. (12, 1) for sm_121.
     pub fn compute_capability(&self) -> (i32, i32) {
         self.own().compute_capability
-    }
-
-    pub fn driver(&self) -> &'static Driver {
-        self.api()
     }
 }
 

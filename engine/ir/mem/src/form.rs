@@ -25,8 +25,6 @@ pub trait Form: Sync {
     fn dtype(&self) -> DType;
     /// The host reader for an element.
     fn read(&self) -> Read;
-    /// Significant bits an element keeps.
-    fn bits(&self) -> u32;
     /// Element `index` of `bytes`, as a float.
     fn unpack(&self, bytes: &[u8], index: usize) -> f32;
     /// `data` as the bytes of this form.
@@ -204,7 +202,7 @@ pub struct U8;
 
 /// The methods naming a form and its element.
 macro_rules! element {
-    ($name:literal, $dtype:ident, $bits:literal) => {
+    ($name:literal, $dtype:ident) => {
         fn name(&self) -> &'static str {
             $name
         }
@@ -213,9 +211,6 @@ macro_rules! element {
         }
         fn read(&self) -> Read {
             Read::$dtype
-        }
-        fn bits(&self) -> u32 {
-            $bits
         }
     };
 }
@@ -226,7 +221,7 @@ fn word(bytes: &[u8], index: usize) -> u32 {
 }
 
 impl Form for F32 {
-    element!("f32", F32, 24);
+    element!("f32", F32);
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         f32::from_bits(word(bytes, index))
     }
@@ -237,9 +232,9 @@ impl Form for F32 {
 
 /// Half-width floats: two bytes each, low first.
 macro_rules! halves {
-    ($($form:ident = $name:literal, $bits:literal;)*) => {$(
+    ($($form:ident = $name:literal;)*) => {$(
         impl Form for $form {
-            element!($name, $form, $bits);
+            element!($name, $form);
             fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
                 let at = index * 2;
                 tessera_graph::$form(u16::from_le_bytes([bytes[at], bytes[at + 1]])).into()
@@ -253,7 +248,7 @@ macro_rules! halves {
     )*};
 }
 
-halves!(Bf16 = "bf16", 8; F16 = "f16", 11;);
+halves!(Bf16 = "bf16"; F16 = "f16";);
 
 impl Form for Fp8 {
     fn name(&self) -> &'static str {
@@ -264,9 +259,6 @@ impl Form for Fp8 {
     }
     fn read(&self) -> Read {
         Read::Fp8
-    }
-    fn bits(&self) -> u32 {
-        4
     }
     fn narrow(&self) -> bool {
         true
@@ -292,7 +284,7 @@ impl Form for Fp8 {
 }
 
 impl Form for U32 {
-    element!("u32", U32, 32);
+    element!("u32", U32);
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         word(bytes, index) as f32
     }
@@ -307,7 +299,7 @@ impl Form for U32 {
 }
 
 impl Form for U8 {
-    element!("u8", U8, 8);
+    element!("u8", U8);
     fn unpack(&self, bytes: &[u8], index: usize) -> f32 {
         f32::from(bytes[index])
     }

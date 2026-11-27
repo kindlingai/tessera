@@ -19,12 +19,8 @@ mod softmax;
 mod take;
 mod view;
 
-pub use gather::Gather;
-pub use hadamard::{BLOCK, Four, Hadamard, spin, spin_inline};
-pub use mean::Mean;
+pub use hadamard::{BLOCK, spin, spin_inline};
 pub use rms_norm::RmsNorm;
-pub use rope::Rope;
-pub use softmax::Softmax;
 
 use tessera_codegen::prelude::LANES;
 use tessera_work::{Load, Ops};

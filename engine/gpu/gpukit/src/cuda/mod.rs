@@ -5,7 +5,7 @@ mod context;
 mod context_test;
 pub mod driver;
 
-pub use crate::launch::{KernelArgs, Launch, launch_1d, launch_grid};
-pub use context::{Context, ContextConfig, Graph, Kernel, Module, compile_ptx_with, nvrtc_version};
+pub use crate::launch::{KernelArgs, launch_1d};
+pub use context::{Context, ContextConfig, Kernel, compile_ptx_with, nvrtc_version};
 
-crate::device::backend_api!(Context, Kernel);
+crate::device::backend_api!(Context);

@@ -9,9 +9,10 @@ use quote::{format_ident, quote};
 
 use crate::Result;
 use crate::dist::{Release, pyproject};
+use crate::lint;
 use crate::manifest::{Owners, manifest};
 use crate::meta::Meta;
-use crate::plan::{Kind, Member, Out};
+use crate::plan::{Kind, Member, Out, Role};
 use crate::rewrite::{Moves, exports, rewrite};
 
 /// Directories a published crate leaves out.
@@ -29,12 +30,21 @@ pub(crate) fn emit(
     for m in &out.members {
         let pkg = &meta.packages[m.pkg];
         let files = copy(meta, out, m, pkg.dir(), &dir)?;
-        if out.members.len() > 1 {
-            let lib = pkg.lib().ok_or(format!("{} has no library", pkg.name))?;
-            let rel = lib.src_path.strip_prefix(pkg.dir())?;
-            reexport(&dir.join(&m.to).join(rel), &files)?;
-            mods.push((m.module.clone(), m.to.strip_prefix("src")?.join(rel)));
+        if m.module.is_empty() {
+            continue;
         }
+        let root = m.to.join(&m.root);
+        match m.role {
+            Role::Lib => reexport(&dir.join(&root), &files)?,
+            Role::Main => lint::root(&dir.join(&root))?,
+            Role::Test => {}
+        }
+        let test = m.role == Role::Test;
+        mods.push((
+            m.module.clone(),
+            root.strip_prefix("src")?.to_path_buf(),
+            test,
+        ));
     }
     if out.kind == Kind::Bin {
         let pkg = &meta.packages[out.members[0].pkg];
@@ -48,7 +58,9 @@ pub(crate) fn emit(
             fs::rename(from, dir.join("src/main.rs"))?;
         }
     }
-    if !mods.is_empty() {
+    if out.kind == Kind::Lint {
+        lint::write(meta, &dir, &mod_items(&mods, lint::LIBS)?)?;
+    } else if !mods.is_empty() {
         write_root(out, &mods, &dir.join("src/lib.rs"))?;
     }
     if out.kind == Kind::Bin {
@@ -61,6 +73,15 @@ pub(crate) fn emit(
 
 /// Copies one member, rewriting its Rust files. Returns those files.
 fn copy(meta: &Meta, out: &Out, m: &Member, from: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    let module = match out.kind {
+        Kind::Lint => format!("{}::{}", lint::LIBS, m.module),
+        _ => m.module.clone(),
+    };
+    // Other targets may reach any file of the package.
+    let skip: &[&str] = match m.role {
+        Role::Lib => &SKIP,
+        _ => &SKIP[3..],
+    };
     let mut rust = Vec::new();
     let mut todo = vec![from.to_path_buf()];
     while let Some(d) = todo.pop() {
@@ -72,7 +93,7 @@ fn copy(meta: &Meta, out: &Out, m: &Member, from: &Path, dir: &Path) -> Result<V
                 .unwrap_or_default();
             let top = d == from;
             if path.is_dir() {
-                if !(top && SKIP.contains(&name)) {
+                if !(top && skip.contains(&name)) {
                     todo.push(path);
                 }
                 continue;
@@ -84,10 +105,10 @@ fn copy(meta: &Meta, out: &Out, m: &Member, from: &Path, dir: &Path) -> Result<V
             fs::create_dir_all(to.parent().ok_or("no parent")?)?;
             if path.extension().is_some_and(|x| x == "rs") {
                 let text = fs::read_to_string(&path)?;
-                let include = |old: &str| moved(meta, out, &path, &to, old, dir);
+                let include = |old: &str| moved(meta, out, m, &path, &to, old, dir);
                 let rel = m.to.to_string_lossy();
                 let moves = Moves {
-                    module: &m.module,
+                    module: &module,
                     names: &out.names,
                     dir: &rel,
                     include: &include,
@@ -104,29 +125,42 @@ fn copy(meta: &Meta, out: &Out, m: &Member, from: &Path, dir: &Path) -> Result<V
 }
 
 /// A new `include!` path for a file outside the crate.
-fn moved(meta: &Meta, out: &Out, file: &Path, to: &Path, old: &str, dir: &Path) -> Option<String> {
+fn moved(
+    meta: &Meta,
+    out: &Out,
+    m: &Member,
+    file: &Path,
+    to: &Path,
+    old: &str,
+    dir: &Path,
+) -> Option<String> {
     let target = clean(&file.parent()?.join(old));
-    if out
-        .members
-        .iter()
-        .any(|m| target.starts_with(meta.packages[m.pkg].dir()))
-    {
+    let inside = |p: usize| target.starts_with(meta.packages[p].dir());
+    // Lint members do not keep their workspace layout.
+    let stays = match out.kind {
+        Kind::Lint => inside(m.pkg),
+        _ => out.members.iter().any(|o| inside(o.pkg)),
+    };
+    if stays {
         return None;
     }
-    let copy = dir.join("src/included").join(target.file_name()?);
+    let copy = dir
+        .join("src/included")
+        .join(target.strip_prefix(&meta.workspace_root).ok()?);
     fs::create_dir_all(copy.parent()?).ok()?;
-    let none = |_: &str| None;
-    let moves = Moves {
-        module: "",
-        names: &out.names,
-        dir: "",
-        include: &none,
-    };
-    fs::write(
-        &copy,
-        rewrite(&fs::read_to_string(&target).ok()?, &moves).ok()?,
-    )
-    .ok()?;
+    if target.extension().is_some_and(|x| x == "rs") {
+        let none = |_: &str| None;
+        let moves = Moves {
+            module: "",
+            names: &out.names,
+            dir: "",
+            include: &none,
+        };
+        let text = rewrite(&fs::read_to_string(&target).ok()?, &moves).ok()?;
+        fs::write(&copy, text).ok()?;
+    } else {
+        fs::copy(&target, &copy).ok()?;
+    }
     Some(relative(to.parent()?, &copy))
 }
 
@@ -179,20 +213,29 @@ fn reexport(lib: &Path, files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn write_root(out: &Out, mods: &[(String, PathBuf)], at: &Path) -> Result<()> {
+/// A member's module name, root under `src`, and test-only flag.
+type Mod = (String, PathBuf, bool);
+
+/// One `pub mod` per member, with paths under `src/<under>`.
+fn mod_items(mods: &[Mod], under: &str) -> Result<Vec<TokenStream>> {
+    let mut items = Vec::new();
+    for (name, path, test) in mods {
+        let ident = format_ident!("{name}");
+        let path = path.strip_prefix(under)?.to_string_lossy().into_owned();
+        let cfg = test.then(|| quote! { #[cfg(test)] });
+        items.push(quote! {
+            #cfg
+            #[doc(hidden)]
+            #[path = #path]
+            pub mod #ident;
+        });
+    }
+    Ok(items)
+}
+
+fn write_root(out: &Out, mods: &[Mod], at: &Path) -> Result<()> {
     let doc = &out.description;
-    let items: Vec<TokenStream> = mods
-        .iter()
-        .map(|(name, path)| {
-            let ident = format_ident!("{name}");
-            let path = path.to_string_lossy();
-            quote! {
-                #[doc(hidden)]
-                #[path = #path]
-                pub mod #ident;
-            }
-        })
-        .collect();
+    let items = mod_items(mods, "")?;
     let crate_name = format_ident!("{}", out.name.replace('-', "_"));
     let glob = out.glob.as_ref().map(|g| {
         let g = format_ident!("{g}");

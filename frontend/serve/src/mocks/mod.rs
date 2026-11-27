@@ -52,7 +52,6 @@ pub fn call(slot: &Slot, path: &str, body: Option<Value>) -> (u16, String) {
     let request = Request {
         method: if body.is_some() { "POST" } else { "GET" }.into(),
         path: path.into(),
-        query: String::new(),
         headers: Vec::new(),
         body: body.map_or_else(Vec::new, |b| b.to_string().into_bytes()),
     };

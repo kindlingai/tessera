@@ -119,11 +119,6 @@ impl Profile {
         self.step_with(step, seconds, 1, None);
     }
 
-    /// Adds `count` runs of `step`, by kernel name and sizes.
-    pub fn step_many(&mut self, step: &Step, seconds: f64, count: u64) {
-        self.step_with(step, seconds, count, None);
-    }
-
     /// Adds `count` runs of `step` with optional device kernel attributes.
     pub fn step_with(&mut self, step: &Step, seconds: f64, count: u64, attrs: Option<KernelAttrs>) {
         let kernel = &step.kernel;

@@ -389,11 +389,6 @@ impl Text {
     }
 }
 
-/// A float buffer parameter.
-pub fn float(name: &str, writes: bool) -> (String, &'static str, bool) {
-    (name.into(), "float", writes)
-}
-
 /// FNV-1a, so equal bodies can share one entry name.
 pub fn hash(text: &str) -> u64 {
     let mix = |h: u64, b: u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);

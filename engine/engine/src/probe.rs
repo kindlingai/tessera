@@ -78,14 +78,6 @@ pub(crate) struct Lowering<'a> {
     pub device: &'a Device,
 }
 
-/// The graph a plan's nodes refer to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Picked {
-    Base,
-    Owned,
-    Split,
-}
-
 impl Lowering<'_> {
     /// Lowers `launch` through `plans` for a report.
     pub(crate) fn explain(&self, plans: &mut Cache, launch: Launch) -> Result<Lowered, Error> {
@@ -95,7 +87,7 @@ impl Lowering<'_> {
         };
         let (sample, picks) = sample(rows, prefill, self.slots, self.context);
         let (mut sizes, [filled, _]) = launch_of(&sample, &picks, self.slots, self.context);
-        let (base, owned, split) = self.graphs;
+        let (base, ..) = self.graphs;
         let wants = match self.taps {
             true => Wants::roles(base, self.full, &[Role::Tokens, Role::Taps]),
             false => Wants::role(base, self.full, Role::Tokens),
@@ -109,16 +101,9 @@ impl Lowering<'_> {
             true => format!("prefill rows={filled}"),
             false => format!("rows={filled}"),
         };
-        let is = |v: &Variant| v.as_ref().is_some_and(|(g, _)| std::ptr::eq(graph, g));
-        let picked = match (is(owned), is(split)) {
-            (true, _) => Picked::Owned,
-            (_, true) => Picked::Split,
-            _ => Picked::Base,
-        };
         Ok(Lowered {
             report,
             plan: plan.0.clone(),
-            picked,
         })
     }
 }
@@ -127,7 +112,6 @@ impl Lowering<'_> {
 pub struct Lowered {
     pub report: Report,
     pub plan: Plan,
-    picked: Picked,
 }
 
 /// An engine's graphs and device, held apart from its runner.
@@ -140,7 +124,6 @@ pub struct Probe {
     slots: usize,
     context: usize,
     device: Device,
-    name: String,
 }
 
 impl Probe {
@@ -157,26 +140,6 @@ impl Probe {
         };
         view.explain(&mut Cache::default(), launch)
     }
-
-    /// The device's name.
-    pub fn device(&self) -> &str {
-        &self.name
-    }
-
-    /// The graph lowering reads, before any row split.
-    pub fn graph(&self) -> &Graph {
-        &self.graph
-    }
-
-    /// The graph `lowered`'s plan nodes refer to.
-    pub fn graph_of(&self, lowered: &Lowered) -> &Graph {
-        let variant = match lowered.picked {
-            Picked::Base => &None,
-            Picked::Owned => &self.owned,
-            Picked::Split => &self.split,
-        };
-        variant.as_ref().map_or(&self.graph, |(g, _)| g)
-    }
 }
 
 impl Engine {
@@ -191,7 +154,6 @@ impl Engine {
             slots: self.slots,
             context: self.context,
             device: self.device.clone(),
-            name: self.runner.device(),
         }
     }
 }

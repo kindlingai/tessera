@@ -169,11 +169,6 @@ fn kind(dir: &Path, overrides: &Overrides) -> Option<&'static Arch> {
     arch::spot(&text).ok().filter(|a| a.part.is_some())
 }
 
-/// Each part's name: a pipeline's folders, or `WHOLE`.
-pub fn names(dir: &Path) -> Result<Vec<String>> {
-    names_with(dir, &Overrides::default(), None)
-}
-
 /// As `names`, honoring recipe config overrides and graph modules.
 pub fn names_with(
     dir: &Path,
@@ -199,22 +194,6 @@ pub fn names_with(
         }
     }
     Ok(names)
-}
-
-/// Part `name` of `dir`, at the bounds `size` gives.
-pub fn open(dir: &Path, name: &str, size: &dyn Fn(DimName) -> Option<u64>) -> Result<Part> {
-    let overrides = Overrides::default();
-    open_with(
-        dir,
-        name,
-        &Spec {
-            overrides: &overrides,
-            user: &[],
-            manifest: None,
-            module: None,
-            size,
-        },
-    )
 }
 
 /// Part `name` of `dir`, honoring recipe overrides and modules.

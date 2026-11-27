@@ -29,7 +29,6 @@ pub trait Pattern: Sized {
 /// A traced region, met at its last output.
 #[derive(Clone, Debug)]
 pub struct Region {
-    pub kind: Composite,
     /// The values it reads, weights included, in first-read order.
     pub inputs: Vec<T>,
     /// Its outputs in the order the composite returns them.
@@ -129,7 +128,6 @@ impl Region {
         kept.sort_by_key(|k| k.index);
         let len = tree.elements(at);
         Some(Self {
-            kind: region.kind,
             inputs,
             outputs,
             len,

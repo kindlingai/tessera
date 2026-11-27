@@ -180,7 +180,6 @@ pub(crate) fn pack_into(
         let kind = match p.kind {
             ItemKind::Input => INPUT,
             ItemKind::Output => OUTPUT,
-            ItemKind::Scratch => SCRATCH,
         };
         let (elem, form, forms) = match p.form {
             Some(meta) => {

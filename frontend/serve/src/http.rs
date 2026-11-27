@@ -19,7 +19,6 @@ tessera_engine::metric!(SERVER in HTTP = Counter "tessera:http_server_errors_tot
 pub struct Request {
     pub method: String,
     pub path: String,
-    pub query: String,
     /// Header names in lower case, and values.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -338,11 +337,10 @@ fn read(
             return Err(Fail::Status(413));
         }
         let target = parsed.path.unwrap_or("/");
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let path = target.split_once('?').map_or(target, |(path, _)| path);
         let mut request = Request {
             method: parsed.method.unwrap_or("").to_string(),
             path: path.to_string(),
-            query: query.to_string(),
             headers,
             body: Vec::new(),
         };

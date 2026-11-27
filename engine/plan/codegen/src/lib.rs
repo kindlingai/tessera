@@ -16,9 +16,8 @@ mod tile;
 pub mod trellis;
 pub mod wgsl;
 
-pub use dialect::{Dialect, Text, float, hash};
+pub use dialect::{Dialect, hash};
 pub use form::Load;
-pub use kept::Layout as Kept;
 pub use numerics::{Precision, Terms, terms};
 pub use tile::hip as hip_tiles;
 

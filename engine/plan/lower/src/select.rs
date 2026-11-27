@@ -3,10 +3,9 @@
 mod cover;
 mod emit;
 
-pub use cover::Variants;
 use cover::{Cover, EDGE, reads};
 use emit::Emit;
-pub use report::{Finding, Rejection, Report};
+pub use report::Report;
 use report::{finish_report, scan_cover};
 
 use crate::cost::Device;

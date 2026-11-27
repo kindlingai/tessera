@@ -8,5 +8,5 @@ mod expand;
 mod expand_test;
 mod pipeline_cache;
 
-pub use context::{ComputePipeline, Context};
+pub use context::Context;
 pub use expand::expand;

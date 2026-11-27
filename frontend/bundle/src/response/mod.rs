@@ -11,7 +11,6 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::path::Path;
 use stream::{StepOutcome, TagDelims, ToolState, parse_json};
 
 pub use formats::Markers;
@@ -236,15 +235,6 @@ pub struct ResponseParser {
 }
 
 impl ResponseParser {
-    /// Loads `response_template` from `dir/tokenizer_config.json`, if present.
-    pub fn load(dir: &Path) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        let text = match std::fs::read_to_string(dir.join("tokenizer_config.json")) {
-            Ok(text) => text,
-            Err(_) => return Ok(None),
-        };
-        Self::from_config(&text)
-    }
-
     /// Parses `response_template` from `tokenizer_config.json` text.
     pub fn from_config(text: &str) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let config: ConfigFile = serde_json::from_str(text)?;

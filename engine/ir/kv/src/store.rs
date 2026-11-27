@@ -466,31 +466,6 @@ impl DiskKv {
         )
     }
 
-    /// Opens a single persistent SSD cache under `dir`.
-    pub fn open(
-        dir: &Path,
-        max_bytes: u64,
-        rank: u32,
-        ranks: u32,
-        page: usize,
-        meta: &[(u32, u32, usize, &str)],
-    ) -> Option<io::Result<Self>> {
-        let cfg = crate::spec::KvConfig {
-            tiers: vec![crate::spec::TierSpec {
-                name: "ssd".into(),
-                store: crate::spec::StoreKind::Ssd {
-                    path: dir.to_path_buf(),
-                    bytes: max_bytes,
-                    persist: true,
-                },
-                keep: Some(crate::spec::Keep::All),
-                spare_ram: None,
-            }],
-            ..crate::spec::KvConfig::default()
-        };
-        Self::open_config(&cfg, rank, ranks, page, meta)
-    }
-
     /// Cache statistics snapshot.
     pub fn stats(&self) -> StoreStats {
         self.store.stats()

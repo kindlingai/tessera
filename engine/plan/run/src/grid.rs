@@ -10,7 +10,6 @@ use tessera_mem::form::Read;
 pub enum ItemKind {
     Input,
     Output,
-    Scratch,
 }
 
 /// Companion metadata for a packed storage form.

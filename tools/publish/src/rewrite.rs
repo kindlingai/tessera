@@ -131,9 +131,12 @@ fn in_dir(src: &str, t: &Cursor, i: usize, m: &Moves) -> Option<Edit> {
     None
 }
 
-/// `include!` files that move get their new path.
+/// Moved `include!`, `include_str!` and `include_bytes!` files get new paths.
 fn included(src: &str, t: &Cursor, i: usize, m: &Moves) -> Option<Edit> {
-    let call = t.is(i, "include") && t.punct(i + 1, '!') && t.tok(i + 2) == Some(&Tok::Open);
+    let named = ["include", "include_str", "include_bytes"]
+        .iter()
+        .any(|n| t.is(i, n));
+    let call = named && t.punct(i + 1, '!') && t.tok(i + 2) == Some(&Tok::Open);
     if !call || t.tok(i + 3) != Some(&Tok::Lit) {
         return None;
     }

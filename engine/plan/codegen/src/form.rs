@@ -98,11 +98,6 @@ pub trait Load: Form {
         !form.narrow() || (input == weight && form.name() == self.name())
     }
 
-    /// Bytes a matmul reads: the weight, then the rows.
-    fn matmul_bytes(&self, m: usize, n: usize, k: usize) -> Vec<f64> {
-        vec![self.bytes(n * k) as f64, (4 * m * k) as f64]
-    }
-
     /// `base` for f32, else `base` with the name appended.
     fn suffixed(&self, base: &'static str) -> &'static str {
         match self.name() {

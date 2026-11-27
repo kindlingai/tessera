@@ -1,6 +1,5 @@
 //! Calls for compiled lockstep kernels: reads, shuffles and tiles.
 
-use crate::exec::{ArgVal, Grid};
 use crate::simd::{Block, Level, WIDE, block_at, dot_at, mix_at, panel_at, reduce};
 use tessera_codegen::form::{Load, Read};
 use tessera_codegen::numerics::Precision;
@@ -9,31 +8,6 @@ use tessera_graph::{Bf16, E2M1, E4M3, F16};
 
 /// The most threads in one compiled group.
 pub const THREADS: usize = 256;
-
-/// A compiled body. False means the grid was too wide.
-pub type Kernel = fn(&[ArgVal], &mut [&mut [u8]], Grid, usize, Precision) -> bool;
-
-/// A buffer argument: launch index and elements to skip.
-pub fn buf(arg: &ArgVal) -> (usize, usize) {
-    match arg {
-        ArgVal::Buf { at, skip, .. } => (*at, *skip),
-        other => panic!("{other:?} where a buffer was due"),
-    }
-}
-
-pub fn u32(arg: &ArgVal) -> u32 {
-    match arg {
-        ArgVal::U32(v) => *v,
-        other => panic!("{other:?} where a u32 was due"),
-    }
-}
-
-pub fn f32(arg: &ArgVal) -> f32 {
-    match arg {
-        ArgVal::F32(v) => *v,
-        other => panic!("{other:?} where an f32 was due"),
-    }
-}
 
 #[inline(always)]
 pub fn rd_f32(bytes: &[u8], at: usize) -> f32 {
@@ -161,13 +135,6 @@ pub fn field(w: u32, low: u32, n: u32) -> u32 {
     (w >> low) & ((1u64 << n) - 1) as u32
 }
 
-/// An `n`-bit field as a signed value.
-#[inline(always)]
-pub fn signed(w: u32, low: u32, n: u32) -> f32 {
-    let shift = 32 - n;
-    (((field(w, low, n) << shift) as i32) >> shift) as f32
-}
-
 #[inline(always)]
 pub fn f16(w: u32, low: u32) -> f32 {
     f32::from(F16(field(w, low, 16) as u16))
@@ -217,17 +184,6 @@ pub fn bf16_pair(hi: f32, lo: f32) -> u32 {
     };
     round(hi) | (round(lo) >> 16)
 }
-
-macro_rules! wide {
-    ($($name:ident = $op:tt),*) => {$(
-        #[inline(always)]
-        pub fn $name(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-            [a[0] $op b[0], a[1] $op b[1], a[2] $op b[2], a[3] $op b[3]]
-        }
-    )*};
-}
-
-wide!(add4 = +, sub4 = -, mul4 = *, div4 = /);
 
 /// Each lane's value from lane `m` away in its group.
 pub fn shfl_xor(v: &[f32; THREADS], m: &[u32; THREADS], n: usize, lanes: usize) -> [f32; THREADS] {

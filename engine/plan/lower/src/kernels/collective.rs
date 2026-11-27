@@ -58,7 +58,6 @@ impl AllGather {
     wire = self.wire,
 )]
 pub struct ReduceScatter {
-    pub len: usize,
     pub start: usize,
     pub total: usize,
     /// Each rank's part rounds to this before the add.

@@ -49,10 +49,6 @@ impl Features {
         })
     }
 
-    pub fn tokenizer(&self) -> &Hf {
-        &self.tokenizer
-    }
-
     /// The prompt as a user turn, without thinking.
     pub fn ids(&self, prompt: &str) -> Result<Vec<u32>, Error> {
         let message = Message::text("user", prompt);

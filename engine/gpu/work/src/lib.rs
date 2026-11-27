@@ -85,11 +85,6 @@ pub struct Load {
 }
 
 impl Load {
-    /// Float ops every thread together runs.
-    pub fn floats(&self) -> f64 {
-        self.threads as f64 * self.trips * self.trip.float
-    }
-
     /// Bytes all loads bring. Shared buffers count per load.
     pub fn loaded(&self) -> f64 {
         self.threads as f64 * self.trips * self.trip.loads * self.trip.width()

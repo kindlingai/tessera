@@ -2,6 +2,7 @@
 
 mod dist;
 mod emit;
+mod lint;
 mod manifest;
 mod meta;
 mod plan;
@@ -18,35 +19,22 @@ use toml::{Table, Value};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Each merged library's member directories.
-pub fn merged(root: &Path) -> Result<Vec<Vec<PathBuf>>> {
-    let meta = meta::load(root)?;
-    let mut groups = Vec::new();
-    for o in plan::plan(&meta)? {
-        if o.members.len() > 1 {
-            let dirs = o
-                .members
-                .iter()
-                .map(|m| meta.packages[m.pkg].dir().to_path_buf());
-            groups.push(dirs.collect());
-        }
-    }
-    Ok(groups)
-}
-
-/// Writes the merged crates to `target/publish` or `[dir]`.
+/// Writes the crates.io crates, or with `--lint` the [`lint`] crate.
 pub fn run() -> Result<()> {
     let meta = meta::load(&std::env::current_dir()?)?;
-    let (version, dir) = args()?;
-    let base = dir.unwrap_or_else(|| meta.workspace_root.join("target/publish"));
-    let outs = plan::plan(&meta)?;
+    let a = args()?;
+    let (outs, default) = match a.lint {
+        true => (lint::plan(&meta)?, "target/publish-lint"),
+        false => (plan::plan(&meta)?, "target/publish"),
+    };
+    let base = a.dir.unwrap_or_else(|| meta.workspace_root.join(default));
     let engine = meta
         .packages
         .iter()
         .find(|p| p.name == plan::ENGINE)
         .ok_or("no engine")?;
     let rel = dist::Release {
-        version: version.unwrap_or_else(|| engine.version.clone()),
+        version: a.version.unwrap_or_else(|| engine.version.clone()),
         repository: repository(&meta.workspace_root)?,
     };
     let mut owners = manifest::Owners::new();
@@ -61,9 +49,10 @@ pub fn run() -> Result<()> {
     for o in &outs {
         emit::emit(&meta, o, &owners, &rel, &base)?;
     }
-    let cli = outs.iter().find(|o| o.name == plan::CLI).ok_or("no cli")?;
-    let launcher = meta.workspace_root.join("tools/publish/npm/tesserax.js");
-    dist::npm(cli, &rel, &launcher, &base.join("npm"))?;
+    if let Some(cli) = outs.iter().find(|o| o.name == plan::CLI) {
+        let launcher = meta.workspace_root.join("tools/publish/npm/tesserax.js");
+        dist::npm(cli, &rel, &launcher, &base.join("npm"))?;
+    }
     let mut workspace = Table::new();
     workspace.insert("resolver".into(), "3".into());
     let members = outs.iter().map(|o| Value::from(o.name.clone())).collect();
@@ -83,19 +72,26 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// `[--version <v>] [dir]`
-fn args() -> Result<(Option<String>, Option<PathBuf>)> {
-    let mut version = None;
-    let mut dir = None;
+#[derive(Default)]
+struct Args {
+    version: Option<String>,
+    dir: Option<PathBuf>,
+    lint: bool,
+}
+
+/// `[--version <v>] [--lint] [dir]`
+fn args() -> Result<Args> {
+    let mut out = Args::default();
     let mut given = std::env::args().skip(1);
     while let Some(a) = given.next() {
         match a.as_str() {
-            "--version" => version = Some(given.next().ok_or("--version needs a value")?),
-            _ if dir.is_none() => dir = Some(PathBuf::from(a)),
+            "--version" => out.version = Some(given.next().ok_or("--version needs a value")?),
+            "--lint" => out.lint = true,
+            _ if out.dir.is_none() => out.dir = Some(PathBuf::from(a)),
             _ => return Err(format!("unexpected argument {a}").into()),
         }
     }
-    Ok((version, dir))
+    Ok(out)
 }
 
 /// The workspace's `repository`, if it names one.

@@ -68,7 +68,6 @@ pub struct Painter {
 
 /// Text states `[TEXT, WIDTH]` and the pooled `[WIDTH]` row.
 pub struct Prompt {
-    pub ids: Vec<u32>,
     pub states: Vec<f32>,
     pub pooled: Vec<f32>,
 }
@@ -129,11 +128,7 @@ impl Painter {
         ];
         let states = self.clip.run(&inputs)?[0].floats()?.to_vec();
         let pooled = states[end * WIDTH..][..WIDTH].to_vec();
-        Ok(Prompt {
-            ids,
-            states,
-            pooled,
-        })
+        Ok(Prompt { states, pooled })
     }
 
     /// Denoiser logits for each canvas, conditioned then not.

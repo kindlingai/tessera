@@ -163,15 +163,6 @@ impl Context {
         self.pipeline(&library, entry, &label)
     }
 
-    /// As [`Self::compile_kernel`], for an already-compiled library.
-    pub fn compile_from_library(
-        &self,
-        library: &ProtocolObject<dyn MTLLibrary>,
-        entry: &str,
-    ) -> Result<ComputePipeline, Error> {
-        self.pipeline(library, entry, entry)
-    }
-
     /// `entry` in `library`, cached under `label`.
     fn pipeline(
         &self,

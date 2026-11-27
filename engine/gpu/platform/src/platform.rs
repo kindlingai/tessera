@@ -174,20 +174,6 @@ pub(crate) fn row_for(id: &str) -> Option<Row> {
         .find(|row| row.matches.iter().any(|p| fits(p)))
 }
 
-/// Bytes a second from clock in kHz and bus bits.
-pub fn bandwidth(clock_khz: i32, bus_bits: i32) -> f64 {
-    // Memory moves on both clock edges.
-    2.0 * clock_khz as f64 * 1e3 * bus_bits as f64 / 8.0
-}
-
-/// A device's memory. Integrated devices may use all host memory.
-pub fn device_memory(total: u64, integrated: bool) -> u64 {
-    match integrated {
-        true => total.max(host_memory()),
-        false => total,
-    }
-}
-
 /// One numeric sysctl, or zero when unknown.
 #[cfg(target_os = "macos")]
 fn sysctl(name: &std::ffi::CStr) -> u64 {

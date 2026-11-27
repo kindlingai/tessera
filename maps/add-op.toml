@@ -1,6 +1,6 @@
 [task.add-op]
 steps = [
-  { do = "define", with = "tessera_graph::OpFacts", like = "engine/ir/graph/src/ops.rs" },
+  { do = "define", with = "tessera_graph::ops::OpFacts", like = "engine/ir/graph/src/ops.rs" },
   { do = "define", with = "tessera_graph::infer", like = "engine/ir/graph/src/infer.rs" },
   { do = "define", with = "tessera_interp::run", like = "engine/ir/interp/src/run.rs" },
   { do = "run", pkg = "tessera-graph", mode = "test" },

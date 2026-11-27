@@ -36,13 +36,12 @@ pub use guide::{
     Allowed, DEPTH, Edit, FEW, Fault, Guide, Move, Penalties, Prefix, Program, Runs, Scoped,
     Stacked, Tally, Term,
 };
-pub use kept::Totals;
 pub use model::Model;
 pub use mtp_draft::{MtpDrafter, MtpSpeculate};
 pub use ple::{PleConfig, PleStore};
-pub use probe::{Launch, Lowered, Probe};
-pub use sample::{Sampling, Target, Weights, accept};
-pub use schedule::{Batch, Fair, Parked, Policy, Seq};
+pub use probe::Launch;
+pub use sample::Sampling;
+pub use schedule::{Batch, Fair, Parked};
 pub use spec_len::{CostModel, SpecLen};
 pub use speculate::{Drafter, SpecStats, Speculate};
 pub(crate) use tessera_engine_hooks::Hooks;
@@ -392,11 +391,6 @@ impl Engine {
     /// This rank's `(axis, first, count)` slice of `at`, if split.
     pub fn share(&self, at: u32) -> Option<(u32, usize, usize)> {
         self.runner.plan().share(at)
-    }
-
-    /// This rank's first-axis rows of weight `at`, if split.
-    pub fn rows(&self, at: u32) -> Option<(usize, usize)> {
-        self.runner.plan().rows(at)
     }
 
     /// Uploads weight `at` of the graph.

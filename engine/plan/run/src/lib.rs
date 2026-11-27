@@ -32,10 +32,10 @@ pub mod sizer;
 pub mod testing;
 
 pub use grid::{FormMeta, Grid, Item, ItemKind, KeptDesc, Layout};
-pub use held::{Held, Holds};
+pub use held::Held;
 pub use loopback::Loopback;
-pub use overrides::{Flattener, set_flattener, text as kernel_text};
-pub use profile::{Marks, Profile, Ranks, Region, Spent};
+pub use overrides::{set_flattener, text as kernel_text};
+pub use profile::{Marks, Profile, Ranks, Spent};
 pub use rank::{Rank, Sum, sum_wire};
 pub use run::{Base, Outcome, Reload, Run};
 pub use tessera_gpukit::device::KernelAttrs;
@@ -242,7 +242,6 @@ impl<D: tessera_gpukit::device::Device> Pinning for Pin<D> {
         Ok(tessera_engine_comm::Pinned {
             host: host as *mut u8,
             device,
-            len,
         })
     }
 

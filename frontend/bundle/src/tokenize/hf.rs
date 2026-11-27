@@ -1,6 +1,6 @@
 //! Hugging Face `tokenizer.json` files, through the `tokenizers` crate.
 
-use super::{Error, Token, Tokenizer};
+use super::Error;
 use std::path::Path;
 
 pub struct Hf(tokenizers::Tokenizer);
@@ -59,19 +59,5 @@ impl Hf {
     /// Ids made only of ASCII digits.
     pub fn digits(&self) -> Vec<u32> {
         self.matching(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
-    }
-}
-
-impl Tokenizer for Hf {
-    fn tokenize(&self, text: &str) -> Result<Vec<Token>, Error> {
-        let encoding = self.0.encode(text, false)?;
-        let mut out = Vec::new();
-        for (&id, &(start, end)) in encoding.get_ids().iter().zip(encoding.get_offsets()) {
-            out.push(Token {
-                span: start..end,
-                id: Some(id),
-            });
-        }
-        Ok(out)
     }
 }

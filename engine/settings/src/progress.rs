@@ -103,11 +103,6 @@ impl Progress {
         }
     }
 
-    /// Whether events go anywhere.
-    pub fn reports(&self) -> bool {
-        self.to.is_some()
-    }
-
     /// Starts a step under this one's parent.
     pub fn step(&self, name: impl Into<Arc<str>>, unit: Unit, total: Option<u64>) -> Step {
         let step = Step {

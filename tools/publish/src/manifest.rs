@@ -40,7 +40,7 @@ pub(crate) fn manifest(meta: &Meta, out: &Out, owners: &Owners, rel: &Release) -
     let mut doc = Table::new();
     doc.insert("package".into(), package.into());
     let mut target = Table::new();
-    if out.kind == Kind::Bin {
+    if matches!(out.kind, Kind::Bin | Kind::Lint) {
         let bins = [crate::plan::BIN].map(|name| {
             let mut target = Table::new();
             target.insert("name".into(), name.into());
@@ -98,7 +98,9 @@ fn dependencies(meta: &Meta, out: &Out, owners: &Owners, version: &str) -> Resul
     let mut all = Scoped::new();
     for m in &out.members {
         let pkg = &meta.packages[m.pkg];
-        for d in pkg.normal() {
+        // The lint binary builds tests too.
+        let dev = |d: &&Dep| out.kind == Kind::Lint && d.kind.as_deref() == Some("dev");
+        for d in pkg.normal().chain(pkg.dependencies.iter().filter(dev)) {
             let (key, want) = match meta.packages.iter().position(|q| q.name == d.name) {
                 Some(q) if owners.get(&q) == Some(&out.name.as_str()) => continue,
                 Some(q) => {

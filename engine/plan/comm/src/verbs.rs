@@ -69,7 +69,6 @@ impl Drop for Region {
             Some(pinning) => pinning.unpin(Pinned {
                 host: self.base,
                 device: self.device,
-                len: self.len,
             }),
             None => {
                 let layout = Layout::from_size_align(self.len.max(1), 4096).expect("a page");

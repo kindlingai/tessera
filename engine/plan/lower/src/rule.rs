@@ -172,12 +172,6 @@ impl Draft {
         }
     }
 
-    /// The same draft, writing region output `t`.
-    pub fn writes(mut self, t: T) -> Self {
-        self.writes = Some(t);
-        self
-    }
-
     /// The same draft, also writing node `t` (`len` elements).
     pub fn also(mut self, t: T, len: usize) -> Self {
         self.also.push((t, len));

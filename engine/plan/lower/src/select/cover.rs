@@ -229,12 +229,7 @@ impl<'a> Cover<'a> {
                     let whole_rows = self.tree.node(src).shape[0];
                     let width = n.shape[1..].iter().product::<usize>();
                     let start = self.tree.parts.rows(whole_rows, self.tree.rank as usize).0 * width;
-                    let rs = ReduceScatter {
-                        len,
-                        start,
-                        total,
-                        wire,
-                    };
+                    let rs = ReduceScatter { start, total, wire };
                     let bytes = moved(&rs, total, self.tree.bytes(src));
                     (ReduceScatter::NAME, Draft::new(rs, [src], len), bytes)
                 }

@@ -76,12 +76,7 @@ impl Site {
     }
 }
 
-impl Region<'_> {
-    /// The value of `op`, if present and unique.
-    pub fn scalar(&self, op: &str) -> Option<f32> {
-        crate::site::scalar(self.scalars, op)
-    }
-}
+impl Region<'_> {}
 
 impl Step<'_> {
     /// The value of `op`, if present and unique.

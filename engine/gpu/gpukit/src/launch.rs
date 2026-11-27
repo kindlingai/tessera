@@ -86,10 +86,7 @@ impl KernelArgs {
         self.word(v as u64, 4)
     }
 
-    pub fn i32(&mut self, v: i32) -> &mut Self {
-        self.word(v as u32 as u64, 4)
-    }
-
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn f32(&mut self, v: f32) -> &mut Self {
         self.word(v.to_bits() as u64, 4)
     }
@@ -102,11 +99,6 @@ impl KernelArgs {
     pub fn device_ptr(&mut self, p: u64) -> &mut Self {
         self.args.push(Arg::Pointer(p));
         self
-    }
-
-    /// Two consecutive u32s (a uint2 kernel parameter).
-    pub fn u32x2(&mut self, a: u32, b: u32) -> &mut Self {
-        self.word((a as u64) | ((b as u64) << 32), 8)
     }
 
     /// Bind a small value needing at most 8-byte alignment.

@@ -787,13 +787,8 @@ impl Runs {
     }
 
     /// The context length.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.base.ids.len() + self.tail.ids.len()
-    }
-
-    /// Whether the context is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// The id at position `at`.

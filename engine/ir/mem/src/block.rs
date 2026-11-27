@@ -258,9 +258,6 @@ impl<S: Scale, C: Encode, const B: usize, const HALVES: bool, const HEAD: bool> 
     fn read(&self) -> Read {
         Read::Decode
     }
-    fn bits(&self) -> u32 {
-        C::BITS
-    }
     fn narrow(&self) -> bool {
         true
     }

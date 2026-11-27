@@ -78,13 +78,6 @@ impl StoreKind {
             Self::Remote { .. } => "remote",
         }
     }
-
-    /// Capacity limit in bytes per rank.
-    pub fn bytes(&self) -> u64 {
-        match self {
-            Self::Ram { bytes } | Self::Ssd { bytes, .. } | Self::Remote { bytes, .. } => *bytes,
-        }
-    }
 }
 
 /// One ordered KV tier below the GPU pool.

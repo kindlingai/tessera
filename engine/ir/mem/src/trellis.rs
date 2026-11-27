@@ -393,9 +393,6 @@ impl<const K: u32> Form for Trellis<K> {
     fn read(&self) -> Read {
         Read::Decode
     }
-    fn bits(&self) -> u32 {
-        K
-    }
     fn narrow(&self) -> bool {
         true
     }

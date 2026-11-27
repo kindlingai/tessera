@@ -83,13 +83,6 @@ pub trait Task: Sized {
 /// A task's work on `On`, such as a loaded model.
 pub trait Run<On>: Task {
     fn run(self, on: On, sink: &mut dyn Sink) -> Result<(), Error>;
-
-    /// Runs, and returns what it made.
-    fn call(self, on: On) -> Result<Collect, Error> {
-        let mut out = Collect::default();
-        self.run(on, &mut out)?;
-        Ok(out)
-    }
 }
 
 /// Where a task's output goes.

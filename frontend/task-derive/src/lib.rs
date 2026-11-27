@@ -155,13 +155,13 @@ fn field(a: &Arg) -> Tokens {
         _ => (quote! { "array" }, quote! { false }),
     };
     let (key, flag, value, about) = (a.ident.to_string(), &a.flag, &a.value, &a.about);
-    let (tool, load) = (a.tool, a.load);
+    let tool = a.tool;
     let (min, max, example) = (some(&a.min), some(&a.max), some(&a.example));
     quote! {
         task::Field {
             key: #key, flag: #flag, value: #value, about: #about,
             kind: #kind, role: task::Role::#role, takes: #takes,
-            tool: #tool, load: #load, min: #min, max: #max, example: #example,
+            tool: #tool, min: #min, max: #max, example: #example,
         }
     }
 }

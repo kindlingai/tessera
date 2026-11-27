@@ -117,39 +117,6 @@ pub fn resolve(repo: &str, revision: &str, file: &str) -> String {
     format!("https://{HUB}/{repo}/resolve/{revision}/{file}")
 }
 
-/// The proxy for `host`, or `None` to fetch directly.
-#[allow(clippy::disallowed_methods, reason = "the one sanctioned reader")]
-pub fn proxy(host: &str) -> Option<String> {
-    let vars = |up: &str, low: &str| {
-        std::env::var(up)
-            .or_else(|_| std::env::var(low))
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-    };
-    let (https, http, no) = (
-        vars("HTTPS_PROXY", "https_proxy"),
-        vars("HTTP_PROXY", "http_proxy"),
-        vars("NO_PROXY", "no_proxy"),
-    );
-    select(&https, &http, &no, host).map(str::to_owned)
-}
-
-/// One of `https` or `http`, unless `no_proxy` exempts `host`.
-fn select<'a>(
-    https: &'a Option<String>,
-    http: &'a Option<String>,
-    no_proxy: &Option<String>,
-    host: &str,
-) -> Option<&'a str> {
-    for name in no_proxy.as_deref().unwrap_or_default().split(',') {
-        let name = name.trim().trim_start_matches('.');
-        if name == "*" || host == name || host.ends_with(&format!(".{name}")) {
-            return None;
-        }
-    }
-    https.as_deref().or(http.as_deref())
-}
-
 /// `HF_TOKEN`, else the token file the Hugging Face tools write.
 fn token(var: &dyn Fn(&str) -> Option<PathBuf>, home: Option<PathBuf>) -> Option<String> {
     let text = match var("HF_TOKEN") {

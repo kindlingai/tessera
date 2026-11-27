@@ -224,6 +224,9 @@ jobs:
       - run: cargo clippy --manifest-path target/publish/Cargo.toml --workspace --features "${{ matrix.features }}"
       - if: matrix.features == ''
         run: cargo package --manifest-path target/publish/Cargo.toml --workspace --allow-dirty --no-verify
+      # One binary holds every crate, so unused `pub` items fail.
+      - run: cargo run -q -p tessera-publish -- --lint
+      - run: cargo check --manifest-path target/publish-lint/Cargo.toml --workspace --tests --features "${{ matrix.features }}"
 
   grammar:
     # The llguidance guide, behind its off-by-default feature.

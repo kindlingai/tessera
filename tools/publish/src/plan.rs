@@ -20,6 +20,18 @@ pub(crate) enum Kind {
     Lib,
     Macro,
     Bin,
+    /// [`crate::lint`]: a binary with every crate as a private module.
+    Lint,
+}
+
+/// The kind of a member's root file.
+#[derive(PartialEq)]
+pub(crate) enum Role {
+    Lib,
+    /// A binary or example, whose `main` is a `dead_code` root.
+    Main,
+    /// An integration test, built only with `cfg(test)`.
+    Test,
 }
 
 /// One crate to publish.
@@ -41,6 +53,9 @@ pub(crate) struct Member {
     pub module: String,
     /// Its directory in the published crate.
     pub to: PathBuf,
+    /// Its root file, relative to its package.
+    pub root: PathBuf,
+    pub role: Role,
 }
 
 pub(crate) fn plan(meta: &Meta) -> Result<Vec<Out>> {
@@ -106,12 +121,12 @@ fn under(meta: &Meta, p: usize, top: &str) -> bool {
         .starts_with(meta.workspace_root.join(top))
 }
 
-fn lib_name(pkg: &Package) -> String {
+pub(crate) fn lib_name(pkg: &Package) -> String {
     pkg.lib()
         .map_or_else(|| pkg.name.replace('-', "_"), |t| t.name.clone())
 }
 
-fn module(pkg: &Package) -> String {
+pub(crate) fn module(pkg: &Package) -> String {
     let lib = lib_name(pkg);
     lib.strip_prefix("tessera_").unwrap_or(&lib).to_string()
 }
@@ -127,12 +142,14 @@ fn paths(meta: &Meta, pkgs: &[usize], to: impl Fn(&str) -> String) -> BTreeMap<S
     out
 }
 
-fn single(meta: &Meta, p: usize, kind: Kind, names: BTreeMap<String, String>) -> Out {
+pub(crate) fn single(meta: &Meta, p: usize, kind: Kind, names: BTreeMap<String, String>) -> Out {
     let pkg = &meta.packages[p];
     let member = Member {
         pkg: p,
         module: String::new(),
         to: PathBuf::new(),
+        root: PathBuf::new(),
+        role: Role::Lib,
     };
     let description = pkg.description.clone().unwrap_or_default();
     Out {
@@ -155,10 +172,13 @@ fn merged(meta: &Meta, name: &str, pkgs: &[usize], top: &str) -> Result<Out> {
             .dir()
             .strip_prefix(&base)
             .map_err(|_| format!("{} is not under {top}/", pkg.name))?;
+        let lib = pkg.lib().ok_or(format!("{} has no library", pkg.name))?;
         members.push(Member {
             pkg: p,
             module: module(pkg),
             to: PathBuf::from("src").join(rel),
+            root: lib.src_path.strip_prefix(pkg.dir())?.to_path_buf(),
+            role: Role::Lib,
         });
     }
     let mut names = paths(meta, pkgs, |m| format!("crate::{m}"));

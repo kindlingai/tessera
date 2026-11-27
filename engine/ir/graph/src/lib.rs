@@ -20,7 +20,7 @@ mod types;
 mod verify;
 
 pub use chain::layers;
-pub use dims::{Dim, DimExpr, DimName, Poly, Shape, Size};
+pub use dims::{Dim, DimExpr, DimName, Shape, Size};
 pub use infer::{ErrorKind, TypeError, infer};
 pub use json::{FormatError, VERSION};
 pub use node::{
@@ -28,13 +28,12 @@ pub use node::{
     Output, Pairs, PathSeg, Port, Region, Role, Row, Select, View, Weight,
 };
 pub use numerics::{Math, Numerics, Order, sums_ranks};
-pub use ops::OpFacts;
 pub use own::own_rows;
 pub use parts::Parts;
 pub use scalar::{Bf16, E2M1, E4M3, E8M0, F16};
 pub use shard::{Sharded, Shares, Whole, shard, shard_aligned, shard_mode};
 pub use split::{HALF_ROWS, split_batch};
-pub use stages::{Check, Facts, Lower, Pin, Place, STAGES, Stage, Takes};
+pub use stages::{Lower, Pin, STAGES, Stage, Takes};
 pub use trim::trim;
 pub use types::{DType, Placement, TensorType};
 pub use verify::{VerifyError, verify};

@@ -230,7 +230,6 @@ pub fn rules(c: &Config, rotated: bool) -> Vec<Rule> {
 }
 
 pub struct Release {
-    pub config: Config,
     pub graph: Graph,
     /// Forms packed in the file, when any are.
     pub pins: Pins,
@@ -304,7 +303,6 @@ fn open(
     };
     let pins = pins(&graph, &*offer, config.stack.layers, &[&rules])?;
     Ok(Release {
-        config,
         graph,
         pins,
         offer,

@@ -53,10 +53,6 @@ impl<'a> View<'a> {
         &self.layout.shape
     }
 
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
     pub fn len(&self) -> usize {
         self.layout.len()
     }
@@ -231,10 +227,6 @@ impl ViewMut<'_> {
         }
     }
 
-    pub fn dtype(&self) -> DType {
-        self.dtype
-    }
-
     pub fn len(&self) -> usize {
         self.layout.len()
     }
@@ -258,11 +250,6 @@ impl ViewMut<'_> {
 
     pub fn as_f32_mut(&mut self) -> Result<&mut [f32], Error> {
         self.view().expect(DType::F32)?;
-        typed_mut(self.mapped_mut()?)
-    }
-
-    pub fn as_u32_mut(&mut self) -> Result<&mut [u32], Error> {
-        self.view().expect(DType::U32)?;
         typed_mut(self.mapped_mut()?)
     }
 

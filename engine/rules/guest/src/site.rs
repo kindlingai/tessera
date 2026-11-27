@@ -1,6 +1,6 @@
 //! The module's side of its JSON exchange with the host.
 
-pub use crate::kit::{Found, Region, Step, Trellis, Weights, agreed, fixed, layer, same, trellis};
+pub use crate::kit::{Found, Weights, agreed, fixed, layer, same, trellis};
 use serde::{Deserialize, Serialize};
 
 /// The output of `manifest()`.
@@ -44,16 +44,6 @@ impl Kernel {
             name,
             entry,
             cuda: text,
-            ..BLANK
-        }
-    }
-
-    /// A kernel with Metal text alone.
-    pub fn metal(name: &'static str, entry: &'static str, text: &'static str) -> Self {
-        Kernel {
-            name,
-            entry,
-            metal: text,
             ..BLANK
         }
     }
@@ -233,25 +223,6 @@ pub enum Place {
 pub enum Count {
     Fixed(u32),
     Dim { dim: String, mul: usize },
-}
-
-/// One entry `propose` offers. `null` offers none.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub enum Entry {
-    Launch(Offer),
-    /// Sums an earlier draft across ranks. Later entries read it.
-    AllReduce {
-        all_reduce: usize,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        writes: Option<usize>,
-    },
-}
-
-impl From<Offer> for Entry {
-    fn from(offer: Offer) -> Self {
-        Entry::Launch(offer)
-    }
 }
 
 /// One launch. Its reads are all it depends on.

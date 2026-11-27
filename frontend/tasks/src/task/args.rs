@@ -45,8 +45,6 @@ pub struct Field {
     pub takes: bool,
     /// Whether tool calls see it.
     pub tool: bool,
-    /// Whether the model load takes the flag too.
-    pub load: bool,
     /// Bounds on a number, or on the length of text.
     pub min: Option<i64>,
     pub max: Option<i64>,

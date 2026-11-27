@@ -15,10 +15,10 @@ pub use lanes::Lanes;
 pub use pool::{Error, PageCopy, Pool, RunId, Stats, Tag};
 pub use prefix::Prefixes;
 pub use reuse::{Begin, Why, begin};
-pub use spec::{GroupSpec, Keep, KvConfig, StoreKind, TierSpec};
-pub use store::{DiskKv, DiskMsg, PageKey, PageStore, StoreStats, decode_msg, page_keys};
+pub use spec::{Keep, KvConfig, StoreKind, TierSpec};
+pub use store::{DiskKv, DiskMsg, PageStore, StoreStats, decode_msg, page_keys};
 pub use tier::{RamStore, TieredStore};
-pub use tiering::{Aged, EVICT_COLD, EVICT_PINNED, Level, Load, Room, Spot, Tiering};
+pub use tiering::{Aged, EVICT_COLD, EVICT_PINNED, Room, Spot, Tiering};
 
 #[cfg(test)]
 mod lanes_test;

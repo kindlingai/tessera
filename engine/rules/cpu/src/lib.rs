@@ -4,6 +4,3 @@ mod dense;
 #[cfg(test)]
 mod dense_test;
 mod norm;
-
-pub use dense::{Dense, Picked, Tiled};
-pub use norm::RmsNorm;

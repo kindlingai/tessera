@@ -38,6 +38,7 @@ pub fn select(ordinal: usize) {
 }
 
 /// The GPU ordinal selected for the process-wide context.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn ordinal() -> usize {
     ORDINAL.load(Ordering::Relaxed)
 }
@@ -405,6 +406,7 @@ impl<D: Device> DeviceBuffer<D> {
         self.ctx.download(self.ptr, bytes)
     }
 
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn write_f32(&self, data: &[f32]) -> Result<(), Error> {
         // The byte view is exact: f32 is plain data.
         let bytes =
@@ -412,6 +414,7 @@ impl<D: Device> DeviceBuffer<D> {
         self.write_bytes(bytes)
     }
 
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn read_f32(&self, out: &mut [f32]) -> Result<(), Error> {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 4) };
@@ -480,16 +483,19 @@ impl<D: Device> Drop for DeviceBuffer<D> {
 }
 
 /// Reusable device buffers. `allocate` zeroes each one it returns.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct BufferPool<D: Device> {
     free: Vec<DeviceBuffer<D>>,
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl<D: Device> Default for BufferPool<D> {
     fn default() -> Self {
         Self { free: Vec::new() }
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl<D: Device> BufferPool<D> {
     pub fn new() -> Self {
         Self::default()
@@ -507,35 +513,13 @@ impl<D: Device> BufferPool<D> {
     pub fn release(&mut self, buffer: DeviceBuffer<D>) {
         self.free.push(buffer);
     }
-
-    pub fn clear(&mut self) {
-        self.free.clear();
-    }
-
-    pub fn trim(&mut self, max_buffers: usize) {
-        self.free.truncate(max_buffers);
-    }
 }
 
 /// A backend module's buffer types and cached entry points.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 macro_rules! backend_api {
-    ($ctx:ty, $kernel:ty) => {
-        pub type DeviceBuffer = $crate::device::DeviceBuffer<$ctx>;
+    ($ctx:ty) => {
         pub type BufferPool = $crate::device::BufferPool<$ctx>;
-
-        /// The process-wide context, opened on first use.
-        pub fn cached_context() -> Result<&'static $ctx, $crate::Error> {
-            $crate::device::cached_context()
-        }
-
-        /// Compile `source` and resolve `entry`, once per process.
-        pub fn cached_source_kernel(
-            source: &'static str,
-            entry: &'static str,
-        ) -> Result<$kernel, $crate::Error> {
-            $crate::device::cached_source::<$ctx>(source, entry)
-        }
     };
 }
 #[cfg(any(feature = "cuda", feature = "rocm"))]

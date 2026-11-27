@@ -350,11 +350,6 @@ impl<A: Api> Context<A> {
         }))
     }
 
-    /// The device's NUMA node on multi-node hosts, if known.
-    pub fn numa_node(&self) -> Option<u32> {
-        self.0.numa_node
-    }
-
     /// Narrows the calling thread to the device's NUMA CPUs.
     pub fn bind_numa(&self) {
         if let Some(node) = self.0.numa_node {
@@ -374,6 +369,7 @@ impl<A: Api> Context<A> {
         &self.0.name
     }
 
+    #[cfg(feature = "rocm")]
     pub fn device(&self) -> c_int {
         self.0.device
     }
@@ -737,7 +733,9 @@ impl<A: Api> Module<A> {
             .map_err(|e| A::error(format!("kernel name {name:?} has a NUL: {e}")))?;
         let raw = self.api.function(self.raw, &c_name).map_err(|e| match e {
             // The bare driver error does not name the entry.
-            Error::Cuda(msg) | Error::Rocm(msg) => A::error(format!("{msg} for entry {name:?}")),
+            Error::Cuda(msg) => A::error(format!("{msg} for entry {name:?}")),
+            #[cfg(feature = "rocm")]
+            Error::Rocm(msg) => A::error(format!("{msg} for entry {name:?}")),
             other => other,
         })?;
         Ok(Kernel {
@@ -787,12 +785,6 @@ impl<A: Api> Clone for Kernel<A> {
 unsafe impl<A: Api> Send for Kernel<A> {}
 unsafe impl<A: Api> Sync for Kernel<A> {}
 
-impl<A: Api> Kernel<A> {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 /// Launches recorded once, replayed on their own stream.
 pub struct Graph<A: Api> {
     api: &'static A,
@@ -821,3 +813,17 @@ impl<A: Api> Drop for Graph<A> {
 
 mod shared;
 pub(crate) use shared::shared_api;
+
+/// Bytes a second from clock in kHz and bus bits.
+pub(crate) fn bandwidth(clock_khz: i32, bus_bits: i32) -> f64 {
+    // Memory moves on both clock edges.
+    2.0 * clock_khz as f64 * 1e3 * bus_bits as f64 / 8.0
+}
+
+/// A device's memory. Integrated devices may use all host memory.
+pub(crate) fn device_memory(total: u64, integrated: bool) -> u64 {
+    match integrated {
+        true => total.max(crate::platform::host_memory()),
+        false => total,
+    }
+}

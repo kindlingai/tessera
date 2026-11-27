@@ -433,9 +433,6 @@ pub trait Routed: Weights {
     /// The block's output, recording calibration taps in `taps`.
     fn apply_calib(&self, m: &Model, h: &Tensor, taps: &CalibTaps) -> Tensor;
 
-    fn apply(&self, m: &Model, h: &Tensor) -> Tensor {
-        self.apply_calib(m, h, &CalibTaps::default())
-    }
     /// Rotates a tap into this layer's input gauge, when present.
     fn tap_gauge(&self, h: &Tensor) -> Tensor {
         h.clone()

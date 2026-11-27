@@ -142,11 +142,6 @@ impl Matcher {
         self.inner.consume_ff_tokens()
     }
 
-    /// Takes back the last `n` accepted tokens.
-    pub fn rollback(&mut self, n: usize) -> Result<(), Error> {
-        Ok(self.inner.rollback(n)?)
-    }
-
     /// Whether the answer may end here.
     pub fn accepting(&mut self) -> bool {
         self.inner.is_accepting().unwrap_or(false)

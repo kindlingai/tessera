@@ -7,7 +7,7 @@
 mod spacy_test;
 mod special;
 
-use super::{Error, Token, Tokenizer};
+use super::Error;
 use fancy_regex::Regex;
 use serde::Deserialize;
 use special::Phrases;
@@ -276,18 +276,5 @@ impl Spacy {
             out.push(plain(base + start..span.end));
         }
         Ok(())
-    }
-}
-
-impl Tokenizer for Spacy {
-    fn tokenize(&self, text: &str) -> Result<Vec<Token>, Error> {
-        let words = self.words(text)?;
-        Ok(words
-            .into_iter()
-            .map(|w| Token {
-                span: w.span,
-                id: None,
-            })
-            .collect())
     }
 }

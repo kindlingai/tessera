@@ -8,7 +8,6 @@ fn auth_status(method: &str, path: &str, hdr: Option<(&str, &str)>) -> Option<u1
     let req = crate::http::Request {
         method: method.into(),
         path: path.into(),
-        query: String::new(),
         headers,
         body: Vec::new(),
     };

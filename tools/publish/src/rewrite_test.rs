@@ -7,7 +7,7 @@ fn moved(src: &str, module: &str, dir: &str) -> String {
         ("tessera_graph".to_string(), "crate::graph".to_string()),
         ("tessera_trace".to_string(), "crate::trace".to_string()),
     ]);
-    let include = |_: &str| None;
+    let include = |old: &str| Some(format!("up/{old}"));
     let moves = Moves {
         module,
         names: &names,
@@ -19,8 +19,8 @@ fn moved(src: &str, module: &str, dir: &str) -> String {
 
 #[test]
 fn paths_move_inside() {
-    let src = "use tessera_graph::{Graph, shard};\nfn f(x: ::tessera_graph::G) { crate::a(); quote!(#t ::tessera_trace::W); }";
-    let want = "use crate::graph::{Graph, shard};\nfn f(x: crate::graph::G) { crate::lower::a(); quote!(#t crate::trace::W); }";
+    let src = "use tessera_graph::{Graph, shard};\nfn f(x: ::tessera_graph::G) { crate::a(); quote!(#t ::tessera_trace::W); include_str!(\"k.cu\"); }";
+    let want = "use crate::graph::{Graph, shard};\nfn f(x: crate::graph::G) { crate::lower::a(); quote!(#t crate::trace::W); include_str!(\"up/k.cu\"); }";
     assert_eq!(moved(src, "lower", ""), want);
 }
 

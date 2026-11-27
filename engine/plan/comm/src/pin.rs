@@ -6,7 +6,6 @@ use crate::Error;
 pub struct Pinned {
     pub host: *mut u8,
     pub device: u64,
-    pub len: usize,
 }
 
 /// Allocates host memory the device maps.

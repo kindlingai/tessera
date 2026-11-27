@@ -3,7 +3,7 @@
 use crate::arch::{Arch, Ask, Built, Spot, arch};
 use crate::names::{Rule, repo};
 use crate::parts::{Cut, Part, from_offer};
-use crate::{Overrides, Stream, Weights, numbered, pins, pull};
+use crate::{Overrides, Stream, Weights, numbered, pins};
 use std::error::Error;
 use std::path::Path;
 use tessera_checkpoint::Shards;
@@ -107,9 +107,4 @@ pub fn open(dir: &Path, sizes: [u64; 2], overrides: &Overrides) -> Result<Text> 
 /// The text model `dir/config.json` describes.
 pub fn config(dir: &Path, [seqs, context]: [u64; 2], overrides: &Overrides) -> Result<Config> {
     overrides.config(dir, |k| Config::read(k, seqs, context))
-}
-
-/// Every weight `graph` reads from `dir`, held, and their forms.
-pub fn weights(dir: &Path, layers: u64, graph: &Graph) -> Result<(Vec<Weight>, Pins)> {
-    pull(graph, &Shards::open(dir)?, layers, &[&rules()])
 }

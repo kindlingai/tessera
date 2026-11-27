@@ -59,7 +59,6 @@ unsafe impl Send for ArxLink {}
 impl ArxLink {
     pub const SEND_BYTES: usize = SEND_BYTES;
     pub const SLOT_BYTES: usize = SLOT_BYTES;
-    pub const MAX_RANKS: usize = MAX_RANKS;
 
     /// Connects RDMA lanes over pinned memory and spawns the proxy.
     pub fn connect(
