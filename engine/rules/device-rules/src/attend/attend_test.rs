@@ -1,38 +1,19 @@
 use super::*;
 use tessera_graph::DimName::{Context, HeadDim, Heads, KvHeads, Rows, Seqs};
 use tessera_graph::{
-    Attend, Dim, Entry, EntryKind, Graph, Mask, Node, NodeId, Op, Output, Port, Role, Size,
-    TensorType,
+    Attend, Dim, Entry, EntryKind, Graph, Mask, Node, NodeId, Op, Output, Port, Role, TensorType,
 };
 use tessera_lower::form::{BF16_FORM, F32_FORM, FP8_FORM};
 use tessera_lower::{Device, Pins, Tree, Wants};
 
 fn ring_graph(heads: u64, kv_heads: u64, width: u64, mla: bool) -> Graph {
     let mut g = Graph::new(vec![
-        Dim {
-            name: Seqs,
-            size: Size::Bounded(2),
-        },
-        Dim {
-            name: Rows,
-            size: Size::Bounded(4),
-        },
-        Dim {
-            name: Context,
-            size: Size::Bounded(4096),
-        },
-        Dim {
-            name: Heads,
-            size: Size::Fixed(heads),
-        },
-        Dim {
-            name: KvHeads,
-            size: Size::Fixed(kv_heads),
-        },
-        Dim {
-            name: HeadDim,
-            size: Size::Fixed(width),
-        },
+        Dim::bounded(Seqs, 2),
+        Dim::bounded(Rows, 4),
+        Dim::bounded(Context, 4096),
+        Dim::fixed(Heads, heads),
+        Dim::fixed(KvHeads, kv_heads),
+        Dim::fixed(HeadDim, width),
     ]);
     let q_ty = TensorType::new([Rows, Heads, HeadDim], DType::F32);
     let kv_ty = TensorType::new([Rows, KvHeads, HeadDim], DType::F32);
@@ -131,22 +112,28 @@ fn ring_graph(heads: u64, kv_heads: u64, width: u64, mla: bool) -> Graph {
     g
 }
 
+fn ring_tree<'a>(g: &'a Graph, dev: &Device, rows: u64) -> Tree<'a> {
+    let mut tree = Tree::upto(
+        g,
+        0,
+        Wants::ALL,
+        &[(Rows, rows), (Seqs, 2), (Context, 4096)],
+        &[],
+        &dev.pins,
+        dev.kept,
+        &dev.division(),
+        0,
+    )
+    .unwrap();
+    tree.knobs = dev.knobs.clone();
+    tree
+}
+
 fn check_ring(g: &Graph, mla: bool, want: &str) {
+    let mut offers = Vec::new();
     for kv_form in [FP8_FORM, BF16_FORM, F32_FORM] {
         let dev = Device::default().pinned(Pins::default().kept(kv_form));
-        let parts = dev.division();
-        let tree = Tree::upto(
-            g,
-            0,
-            Wants::ALL,
-            &[(Rows, 1), (Seqs, 2), (Context, 4096)],
-            &[],
-            &dev.pins,
-            dev.kept,
-            &parts,
-            0,
-        );
-        let tree = tree.unwrap();
+        let tree = ring_tree(g, &dev, 4);
         let (_, layout, ring) = tree.kept_layout(0).unwrap();
         assert_eq!(layout.name(), "ring");
         assert!(ring < 4096);
@@ -155,9 +142,36 @@ fn check_ring(g: &Graph, mla: bool, want: &str) {
         } else {
             check_gqa(&tree, tree.outputs[0].0)
         };
-        let drafts = got.unwrap().unwrap();
+        let mut drafts = got.unwrap().unwrap();
         assert_eq!(drafts[0].kernel.name(), want);
+        offers.push(drafts.remove(0));
     }
+    let gpu = || {
+        Device::default().on(tessera_lower::Platform {
+            name: "NVIDIA GB10".into(),
+            backend: "cuda".into(),
+            units: 48,
+            bandwidth: 273e9,
+            limits: tessera_lower::Limits::assumed(),
+            ..Default::default()
+        })
+    };
+    let (a, b) = (&offers[0], &offers[2]);
+    let (x, y) = (
+        gpu().seconds(&*a.kernel, a.len),
+        gpu().seconds(&*b.kernel, b.len),
+    );
+    let (ab, ba) = (gpu(), gpu());
+    assert_ne!(x, y);
+    assert_eq!(
+        (
+            ab.seconds(&*a.kernel, a.len),
+            ab.seconds(&*b.kernel, b.len),
+            ba.seconds(&*b.kernel, b.len),
+            ba.seconds(&*a.kernel, a.len)
+        ),
+        (x, y, y, x),
+    );
 }
 
 #[test]
@@ -193,25 +207,7 @@ fn mla_attend_knobs() {
         .knobs
         .parse("fast_mla_attend:reduce_threads=128")
         .unwrap();
-    let tree_for = |dev: &Device| {
-        let parts = dev.division();
-        let mut tree = Tree::upto(
-            &g,
-            0,
-            Wants::ALL,
-            &[(Rows, 1), (Seqs, 2), (Context, 4096)],
-            &[],
-            &dev.pins,
-            dev.kept,
-            &parts,
-            0,
-        )
-        .unwrap();
-        tree.knobs = dev.knobs.clone();
-        tree
-    };
-    let t_base = tree_for(&base_dev);
-    let t_tuned = tree_for(&tuned_dev);
+    let (t_base, t_tuned) = (ring_tree(&g, &base_dev, 1), ring_tree(&g, &tuned_dev, 1));
     let d_base = check_mla(&t_base, t_base.outputs[0].0).unwrap().unwrap();
     let d_tuned = check_mla(&t_tuned, t_tuned.outputs[0].0).unwrap().unwrap();
     assert_eq!(d_base.len(), 2);

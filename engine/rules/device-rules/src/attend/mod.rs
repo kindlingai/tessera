@@ -135,7 +135,7 @@ fn split_count(kind: AttendKind, rows: usize, hgroups: usize) -> usize {
         }),
     ),
     launches = attend_launches,
-    load = attend_load, load_key = tessera_lower::load_key(((self.kind, self.rows, self.heads, self.kv_heads, self.out_width, self.keys), (self.context, self.kept.name(), self.picks, self.from_list, self.has_sinks), (self.scale.to_bits(), self.window, self.splits, self.min_blocks))),
+    load = attend_load, load_key = tessera_lower::load_key(((self.kind, self.rows, self.heads, self.kv_heads, self.out_width, self.keys), (self.context, self.kept.name(), self.picks, self.from_list, self.has_sinks), (self.scale.to_bits(), self.window, self.splits, self.min_blocks, self.kv_form.name(), self.entry))),
     unproven,
 )]
 struct SplitAttend {

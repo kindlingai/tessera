@@ -33,7 +33,7 @@ norm_knobs!("add_rms_norm");
         (self.block, self.warps, self.cache_trips, self.ahead),
         (
             self.a_form.name(), self.b_form.name(), self.c_form.name(),
-            self.w_form.name(), self.out_form.name(),
+            self.w_form.name(), self.out_form.name(), self.sum_form.name(),
         ),
     )),
     unproven,
