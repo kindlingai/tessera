@@ -57,11 +57,6 @@ impl<'a> View<'a> {
         self.layout.len()
     }
 
-    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
-    pub fn is_empty(&self) -> bool {
-        self.layout.is_empty()
-    }
-
     pub fn zone(&self) -> u32 {
         self.buffer.zone
     }
@@ -230,11 +225,6 @@ impl ViewMut<'_> {
 
     pub fn len(&self) -> usize {
         self.layout.len()
-    }
-
-    #[allow(dead_code, reason = "len_without_is_empty asks for is_empty")]
-    pub fn is_empty(&self) -> bool {
-        self.layout.is_empty()
     }
 
     fn mapped_mut(&mut self) -> Result<&mut [u8], Error> {

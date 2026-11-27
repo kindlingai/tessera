@@ -1,5 +1,10 @@
 //! The recipe module ABI: memory hand-off, the table format.
 
+#![allow(
+    clippy::len_without_is_empty,
+    reason = "the workspace dead code check removes unused is_empty"
+)]
+
 mod kit;
 pub mod site;
 

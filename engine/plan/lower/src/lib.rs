@@ -1,5 +1,10 @@
 //! Lowers a graph to kernel launches over device buffers.
 
+#![allow(
+    clippy::len_without_is_empty,
+    reason = "the workspace dead code check removes unused is_empty"
+)]
+
 mod abi;
 mod assign;
 mod body;

@@ -1,5 +1,10 @@
 //! Buffers in zones, typed views onto them, and storage forms.
 
+#![allow(
+    clippy::len_without_is_empty,
+    reason = "the workspace dead code check removes unused is_empty"
+)]
+
 pub mod block;
 mod buffer;
 pub mod form;

@@ -1,5 +1,10 @@
 //! Analytic models of GPUs: what a launch should cost.
 
+#![allow(
+    clippy::len_without_is_empty,
+    reason = "the workspace dead code check removes unused is_empty"
+)]
+
 mod cost;
 mod known;
 mod nvidia;
