@@ -45,6 +45,15 @@ Make use of `--explain-lowering` to understand how things fall of the fast path 
 `TESSERA_DUMP_SITES` and `TESSERA_KERNEL_CACHE` can be used to dump kernels and plans
 for offline analysis.
 
+## History
+
+Our team started optimizing vLLM on DGX Sparks in 2027 and took those learnings to make a
+GLM-specific engine named `gr8`. That engine quickly grew to support multiple models and more
+hardware.
+
+To support our goal of local AI on every platform, the Kindling AI team build tessera from
+what we learned in our `gr8` engine. The tessera code contains a lot of what made that engine fast.
+
 ## Crates
 
 <!-- crate table -->
