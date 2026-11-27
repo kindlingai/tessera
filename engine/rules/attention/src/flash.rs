@@ -12,6 +12,7 @@ use tessera_lower::{
 };
 
 mod sunk;
+mod sunk_metal;
 
 knob!("flash", "bk", 16, 32);
 knob!("flash", "held", 0, 1);

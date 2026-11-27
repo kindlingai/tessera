@@ -7,14 +7,16 @@ use tessera_graph::DimName::{self, Context, HeadDim, Heads, KvHeads, Rows, Segme
 use tessera_graph::{DType, Dim, Graph, Size, TensorType};
 use tessera_interp::{Store, Tensor, run_kept};
 use tessera_lower::{Device, Dialect, Limits, Platform, Source, lower};
-use tessera_run::testing::host;
+use tessera_run::testing::{host, runs};
 use tessera_run::{Run, open};
-use tessera_testkit::{Noise, max_abs_diff};
+use tessera_testkit::{Noise, cosine_f32, max_abs_diff};
 use tessera_trace::{EntryKind, Mask, Model, Port, Role};
 
 const RULE: &str = "flash_sunk";
 
 const SPLIT: &str = "listed_split";
+
+const METAL: &str = "flash_sunk_metal";
 
 /// One launch: runs of (slot, first position, count).
 type Runs = &'static [(u32, u32, u32)];
@@ -292,7 +294,9 @@ fn metal_takes_sunk() {
         let g = graph(c);
         let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &apple).unwrap();
         let names = kernels(&plan);
-        assert!(names.contains(&RULE), "{c:?}: {names:?}");
+        // Width 128 goes to the bf16 tiles.
+        let tiles = if c.width == 128 { METAL } else { RULE };
+        assert!(names.contains(&tiles), "{c:?}: {names:?}");
         assert!(!names.contains(&"listed_attend"), "{c:?}: {names:?}");
         // A decode step of a few rows stays split-K.
         let few = lower(&g, 0, &sizes(&[(0, 64, 4)]), &apple).unwrap();
@@ -301,6 +305,89 @@ fn metal_takes_sunk() {
             let other = Device::guess(&host()).on(platform(backend, arch));
             let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &other).unwrap();
             assert!(!kernels(&plan).contains(&RULE), "{c:?} on {backend}");
+        }
+    }
+}
+
+/// The units and bandwidth an M4 Pro reports.
+fn m4_pro() -> Platform {
+    Platform {
+        name: "Apple M4 Pro".into(),
+        units: 20,
+        bandwidth: 273e9,
+        ..platform("metal", "apple9")
+    }
+}
+
+/// Wide Metal prefill takes the bf16 tiles, unfavored.
+#[test]
+fn sunk_metal_is_picked() {
+    let apple = Device::guess(&host()).on(m4_pro());
+    // A window keeps a ring. Causal rows keep all.
+    for (c, kept) in [(CASES[2], "ring"), (CASES[5], "dense")] {
+        let g = graph(c);
+        let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &apple).unwrap();
+        assert!(kernels(&plan).contains(&METAL), "{kept}: {c:?}");
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| s.kernel.name() == METAL)
+            .unwrap();
+        assert_eq!(step.rule, RULE);
+        let Source::Fixed { entry, .. } = step.kernel.source() else {
+            panic!("a fixed kernel");
+        };
+        assert_eq!(entry, METAL);
+        assert_eq!(step.kernel.needs().group_bytes, 25_728);
+        let few = lower(&g, 0, &sizes(&[(0, 64, 4)]), &apple).unwrap();
+        assert!(!kernels(&few).contains(&METAL), "{c:?}");
+        for (backend, arch) in [("cuda", "sm_121"), ("rocm", "gfx11_5")] {
+            let other = Device::guess(&host()).on(platform(backend, arch));
+            let plan = lower(&g, 0, &sizes(LAUNCHES[0]), &other).unwrap();
+            assert!(!kernels(&plan).contains(&METAL), "{c:?} on {backend}");
+        }
+    }
+    // Narrower heads keep the f32 tiles.
+    let narrow = lower(&graph(CASES[0]), 0, &sizes(LAUNCHES[0]), &apple).unwrap();
+    assert!(kernels(&narrow).contains(&RULE) && !kernels(&narrow).contains(&METAL));
+}
+
+/// Runs on a Metal GPU alone: bf16 rounds each operand.
+#[test]
+fn sunk_metal_matches() {
+    let Some(settings) = runs().into_iter().find(|s| s.gpu().is_some()) else {
+        return;
+    };
+    if Device::guess(&settings).platform.backend != "metal" {
+        return;
+    }
+    let mut draws = Noise(73);
+    let wide = [
+        case(Mask::Back(20), [6, 2, 128, 0, 4]),
+        case(Mask::Causal, [3, 1, 128, 0, 0]),
+        case(Mask::Causal, [4, 2, 128, 1, 3]),
+        case(Mask::Back(37), [4, 4, 128, 2, 5]),
+    ];
+    for c in wide {
+        let g = graph(c);
+        let (mut store, mut runner): (Store, Option<Box<dyn Run>>) = (Store::default(), None);
+        for launch in LAUNCHES {
+            let inputs = feeds(c, launch, &mut draws);
+            let want = run_kept(&g, &[], &mut store, 0, &inputs).unwrap();
+            let device = Device::guess(&settings).favoring(RULE);
+            let plan = lower(&g, 0, &sizes(launch), &device).unwrap();
+            assert!(kernels(&plan).contains(&METAL), "{c:?}: {launch:?}");
+            let r = match runner.as_mut() {
+                Some(r) => {
+                    r.replan(&plan).unwrap();
+                    r
+                }
+                None => runner.insert(open(plan, &settings).unwrap()),
+            };
+            let views: Vec<_> = inputs.iter().map(Tensor::view).collect();
+            let got = r.run(&views).unwrap().remove(0);
+            let cos = cosine_f32(got.floats().unwrap(), want[0].floats().unwrap());
+            assert!(cos > 0.9999, "{c:?} on {launch:?}: cos {cos}");
         }
     }
 }
