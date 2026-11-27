@@ -1,12 +1,25 @@
 //! Inkling-2-Mini: a looped decoder with routed experts.
 
+use tessera_models::Stack;
 use tessera_models::inkling2::{Config, Plain, program, stepper};
 use tessera_parity::{Spec, Stepper, suite};
 use tessera_trace::Composite::{Attention, Model, Moe};
 use tessera_trace::Graph;
 
+/// Three layers, global core twice, for fast rule sweeps.
+fn compact() -> Config {
+    Config {
+        stack: Stack::sized([64, 16, 3, 4, 4, 16], 2, 16),
+        global: vec![false, true, false],
+        loop_start: 1,
+        loop_end: 2,
+        loop_passes: 2,
+        ..Config::small()
+    }
+}
+
 fn small() -> Graph {
-    program::<Plain>(&Config::small())
+    program::<Plain>(&compact())
 }
 
 pub fn release() -> Graph {
@@ -14,7 +27,7 @@ pub fn release() -> Graph {
 }
 
 const STEPPER: Stepper = Stepper {
-    small: || stepper::<Plain>(&Config::small()),
+    small: || stepper::<Plain>(&compact()),
     release: || stepper::<Plain>(&Config::mini(1, 1024)),
     drift: tessera_parity::MLA_DRIFT,
 };

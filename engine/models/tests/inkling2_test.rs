@@ -312,7 +312,8 @@ impl Ref {
             self.layer(l, &mut states, &mut h, None);
         }
         for _ in 1..c.loop_passes {
-            let prev = states.split_off((pre_states.len() + 1).min(states.len()));
+            let prev = states.split_off(pre_states.len() + 1);
+            assert!(!prev.is_empty(), "cross-pass needs multiple saved states");
             let prev_h = std::mem::replace(&mut h, pre_h.clone());
             states = pre_states.clone();
             for (j, l) in (start..end).enumerate() {
