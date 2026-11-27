@@ -9,20 +9,13 @@ constexpr u64 SLOT_BYTES = 16ull << 20;
 constexpr u32 MAX_RANKS = 8;
 constexpr u64 FAULT_BIT = 1ull << 63;
 constexpr u32 PIECES = 8;
+constexpr u64 ONE_PIECE_SLICE = 256ull << 10;
 constexpr u64 FLAG_STRIDE = 16;
 constexpr u32 RING_CAP = 64;
-constexpr u32 FP8_CHUNK_U4 = 72;
 constexpr u64 FP8_CHUNK_BYTES = 1152ull;
+constexpr u64 FP8_SCALE_OFF = 1024ull;
 
 enum class Wire { F32, Bf16, Fp8 };
-
-union Fp8Chunk {
-    uint4 u4[FP8_CHUNK_U4];
-    struct {
-        u32 q[256];
-        u16 s[64];
-    } f;
-};
 
 constexpr u64 MODE_FULL = 0;
 constexpr u64 MODE_GATHER = 2;
@@ -74,7 +67,11 @@ TESSERA_FN uint4 load_cv4(const void* p) {
                  : "l"(p));
     return v;
 }
-TESSERA_FN float shfl_xor_f32(float v, u32 mask) { return __shfl_xor_sync(0xFFFFFFFFu, v, mask); }
+TESSERA_FN float rcp_f32(float x) {
+    float y;
+    asm("rcp.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
 #else
 TESSERA_FN uint4 load_cv4(const void* p) {
     const u16* q = reinterpret_cast<const u16*>(p);
@@ -82,7 +79,7 @@ TESSERA_FN uint4 load_cv4(const void* p) {
     uint2 b = prim::load_fresh4(q + 4);
     return make_uint4(a.x, a.y, b.x, b.y);
 }
-TESSERA_FN float shfl_xor_f32(float v, u32 mask) { return __shfl_xor(v, mask); }
+TESSERA_FN float rcp_f32(float x) { return 1.0f / x; }
 #endif
 
 TESSERA_FN u64 recv_off(u64 par, u32 src, u32 nr) {
@@ -134,6 +131,7 @@ TESSERA_FN bool wait_flags(ctl* c, const u64* flag, u64* state, u64 want, u32 me
                     atomicExch(&bad, 1);
                     break;
                 }
+                prim::pause();
             }
         }
         if (prim::leader_thread()) {
@@ -142,6 +140,7 @@ TESSERA_FN bool wait_flags(ctl* c, const u64* flag, u64* state, u64 want, u32 me
                     atomicExch(&bad, 1);
                     break;
                 }
+                prim::pause();
             }
         }
         prim::block_sync();
@@ -163,6 +162,7 @@ TESSERA_FN bool wait_flags(ctl* c, const u64* flag, u64* state, u64 want, u32 me
                 bad = 1;
                 break;
             }
+            prim::pause();
         }
     }
     prim::block_sync();
@@ -173,6 +173,7 @@ TESSERA_FN bool wait_flags(ctl* c, const u64* flag, u64* state, u64 want, u32 me
                 atomicExch(&bad, 1);
                 break;
             }
+            prim::pause();
         }
     }
     prim::block_sync();
@@ -222,69 +223,113 @@ TESSERA_FN void unpack_bf16x8(uint4 pk, float4& a, float4& b) {
                     prim::from_bits(pk.w << 16), prim::from_bits(pk.w & 0xFFFF0000u));
 }
 
-TESSERA_FN float4 load_f32x4(const float* src, u32 j, bool aligned) {
-    if (aligned) return reinterpret_cast<const float4*>(src)[j];
-    const float* p = src + (j << 2);
-    return make_float4(p[0], p[1], p[2], p[3]);
-}
-
-TESSERA_FN void store_f32x4(float* dst, u32 j, bool aligned, float4 v) {
+TESSERA_FN void load_f32x16(const float* src, u64 blk, bool aligned, float4& v0, float4& v1,
+                            float4& v2, float4& v3) {
     if (aligned) {
-        reinterpret_cast<float4*>(dst)[j] = v;
+        const float4* p = reinterpret_cast<const float4*>(src) + (blk << 2);
+        v0 = p[0];
+        v1 = p[1];
+        v2 = p[2];
+        v3 = p[3];
     } else {
-        float* p = dst + (j << 2);
-        p[0] = v.x; p[1] = v.y; p[2] = v.z; p[3] = v.w;
+        const float* p = src + (blk << 4);
+        v0 = make_float4(p[0], p[1], p[2], p[3]);
+        v1 = make_float4(p[4], p[5], p[6], p[7]);
+        v2 = make_float4(p[8], p[9], p[10], p[11]);
+        v3 = make_float4(p[12], p[13], p[14], p[15]);
     }
 }
 
-// Packs 1024 floats via shared memory into 72 uint4s.
-TESSERA_FN void store_chunk_fp8(Fp8Chunk& sm, u8* base, u32 chunk_idx, float4 v) {
-    float amax = prim::max4_abs(v);
-    amax = fmaxf(amax, shfl_xor_f32(amax, 1u));
-    amax = fmaxf(amax, shfl_xor_f32(amax, 2u));
-    u16 s = prim::scale_bf16(amax);
-    float inv = (s == 0u) ? 0.0f : (1.0f / prim::from_bf16(s));
-    sm.f.q[threadIdx.x] = prim::to_e4m3x4(prim::scale4(v, inv));
-    if ((threadIdx.x & 3u) == 0u) sm.f.s[threadIdx.x >> 2] = s;
-    prim::block_sync();
-    uint4* dst = reinterpret_cast<uint4*>(base + u64(chunk_idx) * FP8_CHUNK_BYTES);
-    if (threadIdx.x < FP8_CHUNK_U4) dst[threadIdx.x] = sm.u4[threadIdx.x];
-    prim::block_sync();
+TESSERA_FN void store_f32x16(float* dst, u64 blk, bool aligned, float4 v0, float4 v1, float4 v2,
+                             float4 v3) {
+    if (aligned) {
+        float4* p = reinterpret_cast<float4*>(dst) + (blk << 2);
+        p[0] = v0;
+        p[1] = v1;
+        p[2] = v2;
+        p[3] = v3;
+    } else {
+        float* p = dst + (blk << 4);
+        p[0] = v0.x; p[1] = v0.y; p[2] = v0.z; p[3] = v0.w;
+        p[4] = v1.x; p[5] = v1.y; p[6] = v1.z; p[7] = v1.w;
+        p[8] = v2.x; p[9] = v2.y; p[10] = v2.z; p[11] = v2.w;
+        p[12] = v3.x; p[13] = v3.y; p[14] = v3.z; p[15] = v3.w;
+    }
 }
 
-// Unpacks 1024 floats across 256 threads from 72 coalesced uint4s.
-TESSERA_FN float4 load_chunk_fp8(Fp8Chunk& sm, const u8* base, u32 chunk_idx, bool is_me) {
-    const uint4* src = reinterpret_cast<const uint4*>(base + u64(chunk_idx) * FP8_CHUNK_BYTES);
-    if (threadIdx.x < FP8_CHUNK_U4) {
-        sm.u4[threadIdx.x] = is_me ? src[threadIdx.x] : load_cv4(src + threadIdx.x);
+TESSERA_FN prim::Fp8Blk pack_fp8_16(float4 v0, float4 v1, float4 v2, float4 v3) {
+    float amax = fmaxf(fmaxf(prim::max4_abs(v0), prim::max4_abs(v1)),
+                       fmaxf(prim::max4_abs(v2), prim::max4_abs(v3)));
+    u16 s = 0u;
+    if (amax != 0.0f) {
+        if (!(amax > 0.0f)) {
+            s = 0x3F80u;
+        } else {
+            // 0x3B124925 is ceil_f32(1/448) so multiplication never clips.
+            u32 bits = __float_as_uint(amax * __uint_as_float(0x3B124925u));
+            if (bits >= 0x7F7F0000u) {
+                s = 0x7F7Fu;
+            } else {
+                u32 up = (bits + 0xFFFFu) >> 16;
+                s = static_cast<u16>(up < 0x0080u ? 0x0080u : up);
+            }
+        }
     }
-    prim::block_sync();
-    float4 v = prim::scale4(prim::from_e4m3x4(sm.f.q[threadIdx.x]),
-                            prim::from_bf16(sm.f.s[threadIdx.x >> 2]));
-    prim::block_sync();
-    return v;
+    float inv = (s == 0u) ? 0.0f : rcp_f32(prim::from_bf16(s));
+    uint4 q = make_uint4(prim::to_e4m3x4(prim::scale4(v0, inv)),
+                         prim::to_e4m3x4(prim::scale4(v1, inv)),
+                         prim::to_e4m3x4(prim::scale4(v2, inv)),
+                         prim::to_e4m3x4(prim::scale4(v3, inv)));
+    return {q, s};
 }
 
-// Loads all ranks' 1024-float chunks and sums to FP32.
-TESSERA_FN float4 sum_chunk_fp8(Fp8Chunk sm[MAX_RANKS], const u8* mine, const u8* recv, u64 par,
-                                u32 chunk_idx, u32 me, u32 nr) {
-    u32 total = nr * FP8_CHUNK_U4;
-    for (u32 k = threadIdx.x; k < total; k += blockDim.x) {
-        u32 r = k / FP8_CHUNK_U4;
-        u32 w = k - r * FP8_CHUNK_U4;
-        const uint4* rp = reinterpret_cast<const uint4*>(
-            (r == me ? mine : recv + recv_off(par, r, nr)) + u64(chunk_idx) * FP8_CHUNK_BYTES);
-        sm[r].u4[w] = (r == me) ? rp[w] : load_cv4(rp + w);
+// Writes one 16-float FP8 block to a wire chunk.
+TESSERA_FN void store_fp8_blk(u8* base, u32 blk_idx, prim::Fp8Blk blk) {
+    u8* p = base + u64(blk_idx >> 6) * FP8_CHUNK_BYTES;
+    u32 b = blk_idx & 63u;
+    reinterpret_cast<uint4*>(p)[b] = blk.q;
+    reinterpret_cast<u16*>(p + FP8_SCALE_OFF)[b] = blk.s;
+}
+
+// Reads one 16-float FP8 block from a wire chunk.
+TESSERA_FN prim::Fp8Blk load_fp8_blk(const u8* base, u32 blk_idx, bool is_me) {
+    const u8* p = base + u64(blk_idx >> 6) * FP8_CHUNK_BYTES;
+    u32 b = blk_idx & 63u;
+    uint4 q = is_me ? reinterpret_cast<const uint4*>(p)[b] : load_cv4(p + u64(b) * 16ull);
+    const u16* sp = reinterpret_cast<const u16*>(p + FP8_SCALE_OFF) + b;
+    u16 s = is_me ? *sp : prim::load_fresh(sp);
+    return {q, s};
+}
+
+// Sums one 16-float FP8 block across ranks in 4-rank batches.
+TESSERA_FN void sum_fp8_blk(const u8* mine, const u8* recv, u64 par, u32 blk_idx, u32 me, u32 nr,
+                            float4& a0, float4& a1, float4& a2, float4& a3) {
+    a0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    a1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    a2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    a3 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (u32 r0 = 0u; r0 < nr; r0 += 4u) {
+        prim::Fp8Blk blk[4];
+#pragma unroll
+        for (u32 k = 0u; k < 4u; k++) {
+            u32 r = r0 + k;
+            if (r < nr) {
+                const u8* p = r == me ? mine : recv + recv_off(par, r, nr);
+                blk[k] = load_fp8_blk(p, blk_idx, r == me);
+            }
+        }
+#pragma unroll
+        for (u32 k = 0u; k < 4u; k++) {
+            if (r0 + k < nr) {
+                float4 v0, v1, v2, v3;
+                prim::unpack_fp8_blk(blk[k], v0, v1, v2, v3);
+                a0 = prim::add4(a0, v0);
+                a1 = prim::add4(a1, v1);
+                a2 = prim::add4(a2, v2);
+                a3 = prim::add4(a3, v3);
+            }
+        }
     }
-    prim::block_sync();
-    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    for (u32 r = 0; r < nr; r++) {
-        float4 v = prim::scale4(prim::from_e4m3x4(sm[r].f.q[threadIdx.x]),
-                                prim::from_bf16(sm[r].f.s[threadIdx.x >> 2]));
-        acc = prim::add4(acc, v);
-    }
-    prim::block_sync();
-    return acc;
 }
 
 template <Wire W>
@@ -293,11 +338,12 @@ TESSERA_FN u64 stage_in(const float* src, u8* dst, u32 n) {
     u32 stride = gridDim.x * blockDim.x;
     bool aligned = (reinterpret_cast<u64>(src) & 15ull) == 0ull;
     if constexpr (W == Wire::Fp8) {
-        __shared__ Fp8Chunk sm;
         u32 n_chunks = n >> 10;
-        for (u32 c = blockIdx.x; c < n_chunks; c += gridDim.x) {
-            float4 v = load_f32x4(src, (c << 8) + threadIdx.x, aligned);
-            store_chunk_fp8(sm, dst, c, v);
+        u32 n_blks = n_chunks << 6;
+        for (u32 i = tid; i < n_blks; i += stride) {
+            float4 v0, v1, v2, v3;
+            load_f32x16(src, i, aligned, v0, v1, v2, v3);
+            store_fp8_blk(dst, i, pack_fp8_16(v0, v1, v2, v3));
         }
         u32 base = n_chunks << 10;
         float* tail = reinterpret_cast<float*>(dst + u64(n_chunks) * FP8_CHUNK_BYTES);
@@ -387,11 +433,12 @@ TESSERA_FN void reduce_range(const u8* mine, const u8* recv, u64 par, float* out
     u32 stride = gridDim.x * blockDim.x;
     bool aligned = (reinterpret_cast<u64>(out) & 15ull) == 0ull;
     if constexpr (W == Wire::Fp8) {
-        __shared__ Fp8Chunk sm[MAX_RANKS];
         u32 n_chunks = n >> 10;
-        for (u32 c = blockIdx.x; c < n_chunks; c += gridDim.x) {
-            float4 acc = sum_chunk_fp8(sm, mine, recv, par, c, me, nr);
-            store_f32x4(out, (c << 8) + threadIdx.x, aligned, acc);
+        u32 n_blks = n_chunks << 6;
+        for (u32 i = tid; i < n_blks; i += stride) {
+            float4 a0, a1, a2, a3;
+            sum_fp8_blk(mine, recv, par, i, me, nr, a0, a1, a2, a3);
+            store_f32x16(out, i, aligned, a0, a1, a2, a3);
         }
         u32 base = n_chunks << 10;
         u64 tail_off = u64(n_chunks) * FP8_CHUNK_BYTES;
@@ -461,27 +508,32 @@ TESSERA_FN void one_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* sta
 template <Wire W>
 TESSERA_FN void stage_scatter(ctl* c, u32* blocks, u64* state, u8* send0, const float* src,
                               u64 seq0, u64 slice, u64 slice_chunks, u32 v_per_chunk, u32 nr,
-                              Fp8Chunk& sm) {
+                              bool single_piece) {
     u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     u32 stride = gridDim.x * blockDim.x;
-    for (u32 p = 0u; p < PIECES; p++) {
+    u32 n_pieces = single_piece ? 1u : PIECES;
+    for (u32 pi = 0u; pi < n_pieces; pi++) {
+        u32 p = single_piece ? (PIECES - 1u) : pi;
         u64 lo, hi;
         if constexpr (W == Wire::Fp8) {
-            u64 p_lo, p_hi;
-            piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
+            u64 p_lo = 0ull, p_hi = slice_chunks;
+            if (!single_piece) piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
             lo = p_lo * FP8_CHUNK_BYTES;
             hi = p_hi * FP8_CHUNK_BYTES;
-            u32 cnt = u32(p_hi - p_lo);
-            u32 total = cnt * nr;
-            for (u32 q = blockIdx.x; q < total; q += gridDim.x) {
-                u32 r = q / cnt;
-                u32 j = u32(p_lo) + (q - r * cnt);
-                float4 v = reinterpret_cast<const float4*>(src)[r * v_per_chunk + (j << 8) +
-                                                                threadIdx.x];
-                store_chunk_fp8(sm, send0 + u64(r) * slice, j, v);
+            u32 b_lo = u32(p_lo << 6);
+            u32 b_hi = u32(p_hi << 6);
+            for (u32 r = 0u; r < nr; r++) {
+                const float4* src_r = reinterpret_cast<const float4*>(src) + u64(r) * v_per_chunk;
+                u8* send_r = send0 + u64(r) * slice;
+                for (u32 j = b_lo + tid; j < b_hi; j += stride) {
+                    const float4* sp = src_r + (u64(j) << 2);
+                    store_fp8_blk(send_r, j, pack_fp8_16(sp[0], sp[1], sp[2], sp[3]));
+                }
             }
         } else {
-            piece_bounds(slice, p, lo, hi);
+            lo = 0ull;
+            hi = slice;
+            if (!single_piece) piece_bounds(slice, p, lo, hi);
             u32 v_lo = u32(lo >> 4);
             u32 v_cnt = u32((hi - lo) >> 4);
             u32 total = v_cnt * nr;
@@ -508,8 +560,7 @@ TESSERA_FN void stage_scatter(ctl* c, u32* blocks, u64* state, u8* send0, const 
 template <Wire W>
 TESSERA_FN bool unpack_gather(ctl* c, const u64* flag, u64* state, const u8* send, const u8* recv,
                               float* dst, u64 seq, u64 par, u64 slice, u64 slice_chunks,
-                              u32 dst_v_stride, u32 me, u32 nr, u32 lanes, u64 timeout,
-                              Fp8Chunk& sm) {
+                              u32 dst_v_stride, u32 me, u32 nr, u32 lanes, u64 timeout) {
     u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     u32 stride = gridDim.x * blockDim.x;
     for (u32 p = 0u; p < PIECES; p++) {
@@ -518,15 +569,21 @@ TESSERA_FN bool unpack_gather(ctl* c, const u64* flag, u64* state, const u8* sen
             u64 p_lo, p_hi;
             piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
             if (!wait_flags(c, flag, state, flag_of(seq, p), me, nr, lanes, timeout)) return false;
-            u32 cnt = u32(p_hi - p_lo);
-            u32 total = cnt * nr;
-            for (u32 q = blockIdx.x; q < total; q += gridDim.x) {
-                u32 r = q / cnt;
-                u32 j = u32(p_lo) + (q - r * cnt);
-                const u8* rp = r == me ? send : recv + recv_off(par, r, nr);
-                float4 v = load_chunk_fp8(sm, rp, j, r == me);
-                reinterpret_cast<float4*>(dst)[u64(r) * dst_v_stride + (u64(j) << 8) +
-                                               threadIdx.x] = v;
+            u32 b_lo = u32(p_lo << 6);
+            u32 b_hi = u32(p_hi << 6);
+            for (u32 r = 0u; r < nr; r++) {
+                bool is_me = (r == me);
+                const u8* rp = is_me ? send : recv + recv_off(par, r, nr);
+                float4* dst_r = reinterpret_cast<float4*>(dst) + u64(r) * dst_v_stride;
+                for (u32 j = b_lo + tid; j < b_hi; j += stride) {
+                    float4 v0, v1, v2, v3;
+                    prim::unpack_fp8_blk(load_fp8_blk(rp, j, is_me), v0, v1, v2, v3);
+                    float4* dp = dst_r + (u64(j) << 2);
+                    dp[0] = v0;
+                    dp[1] = v1;
+                    dp[2] = v2;
+                    dp[3] = v3;
+                }
             }
         } else {
             piece_bounds(slice, p, lo, hi);
@@ -582,30 +639,40 @@ TESSERA_FN void scatter_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64*
     u64 slice = (W == Wire::Fp8) ? (slice_chunks * FP8_CHUNK_BYTES)
                                  : (u64(chunk) * (W == Wire::Bf16 ? 2ull : 4ull));
     u32 v_per_chunk = (W == Wire::Bf16) ? (chunk >> 3) : (chunk >> 2);
-    __shared__ Fp8Chunk sm[MAX_RANKS];
-
+    bool single_piece = !GATHER && slice <= ONE_PIECE_SLICE;
     stage_scatter<W>(c, blocks, state, send0, src, seq0, slice, slice_chunks, v_per_chunk, nr,
-                     sm[0]);
+                     single_piece);
 
     const u8* own_rs = send0 + u64(me) * slice;
-    for (u32 p = 0u; p < PIECES; p++) {
+    u32 n_pieces = single_piece ? 1u : PIECES;
+    for (u32 pi = 0u; pi < n_pieces; pi++) {
+        u32 p = single_piece ? (PIECES - 1u) : pi;
         u64 lo = 0ull, hi = 0ull;
         if constexpr (W == Wire::Fp8) {
-            u64 p_lo, p_hi;
-            piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
+            u64 p_lo = 0ull, p_hi = slice_chunks;
+            if (!single_piece) piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
             lo = p_lo * FP8_CHUNK_BYTES;
             hi = p_hi * FP8_CHUNK_BYTES;
             if (!wait_flags(c, flag, state, flag_of(seq0, p), me, nr, lanes, timeout)) return;
-            for (u32 j = u32(p_lo) + blockIdx.x; j < u32(p_hi); j += gridDim.x) {
-                float4 acc = sum_chunk_fp8(sm, own_rs, recv, par0, j, me, nr);
+            u32 b_lo = u32(p_lo << 6);
+            u32 b_hi = u32(p_hi << 6);
+            for (u32 j = b_lo + tid; j < b_hi; j += stride) {
+                float4 a0, a1, a2, a3;
+                sum_fp8_blk(own_rs, recv, par0, j, me, nr, a0, a1, a2, a3);
                 if constexpr (GATHER) {
-                    store_chunk_fp8(sm[0], send1, j, acc);
+                    store_fp8_blk(send1, j, pack_fp8_16(a0, a1, a2, a3));
                 } else {
-                    reinterpret_cast<float4*>(dst)[(j << 8) + threadIdx.x] = acc;
+                    float4* dp = reinterpret_cast<float4*>(dst) + (u64(j) << 2);
+                    dp[0] = a0;
+                    dp[1] = a1;
+                    dp[2] = a2;
+                    dp[3] = a3;
                 }
             }
         } else {
-            piece_bounds(slice, p, lo, hi);
+            lo = 0ull;
+            hi = slice;
+            if (!single_piece) piece_bounds(slice, p, lo, hi);
             if (!wait_flags(c, flag, state, flag_of(seq0, p), me, nr, lanes, timeout)) return;
             u32 v_lo = u32(lo >> 4);
             u32 v_hi = u32(hi >> 4);
@@ -642,7 +709,7 @@ TESSERA_FN void scatter_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64*
     }
 
     if (!unpack_gather<W>(c, flag, state, send1, recv, dst, seq1, par1, slice, slice_chunks,
-                          v_per_chunk, me, nr, lanes, timeout, sm[0]))
+                          v_per_chunk, me, nr, lanes, timeout))
         return;
     finish_seq(c, blocks, state, seq1);
 }
@@ -667,7 +734,6 @@ TESSERA_FN void gather_rows_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, 
     u64 slice = (W == Wire::Fp8) ? (slice_chunks * FP8_CHUNK_BYTES)
                                  : (u64(n) * (W == Wire::Bf16 ? 2ull : 4ull));
     u32 dst_v_stride = (W == Wire::Bf16) ? (part_stride >> 3) : (part_stride >> 2);
-    __shared__ Fp8Chunk sm;
 
     for (u32 p = 0u; p < PIECES; p++) {
         u64 lo = 0ull, hi = 0ull;
@@ -676,9 +742,11 @@ TESSERA_FN void gather_rows_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, 
             piece_bounds_fp8(slice_chunks, p, p_lo, p_hi);
             lo = p_lo * FP8_CHUNK_BYTES;
             hi = p_hi * FP8_CHUNK_BYTES;
-            for (u32 j = u32(p_lo) + blockIdx.x; j < u32(p_hi); j += gridDim.x) {
-                float4 v = reinterpret_cast<const float4*>(src)[(u64(j) << 8) + threadIdx.x];
-                store_chunk_fp8(sm, send, j, v);
+            u32 b_lo = u32(p_lo << 6);
+            u32 b_hi = u32(p_hi << 6);
+            for (u32 j = b_lo + tid; j < b_hi; j += stride) {
+                const float4* sp = reinterpret_cast<const float4*>(src) + (u64(j) << 2);
+                store_fp8_blk(send, j, pack_fp8_16(sp[0], sp[1], sp[2], sp[3]));
             }
         } else {
             piece_bounds(slice, p, lo, hi);
@@ -699,8 +767,81 @@ TESSERA_FN void gather_rows_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, 
     }
 
     if (!unpack_gather<W>(c, flag, state, send, recv, dst, seq, par, slice, slice_chunks,
-                          dst_v_stride, me, nr, lanes, timeout, sm))
+                          dst_v_stride, me, nr, lanes, timeout))
         return;
+    finish_seq(c, blocks, state, seq);
+}
+
+// Unpacks one rank's wire buffer into a contiguous float destination.
+template <Wire W>
+TESSERA_FN void unpack_one_rank(const u8* rp, float* dst_r, u32 n, bool is_me, bool aligned) {
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    u32 stride = gridDim.x * blockDim.x;
+    if constexpr (W == Wire::Fp8) {
+        u32 n_chunks = n >> 10;
+        u32 n_blks = n_chunks << 6;
+        for (u32 j = tid; j < n_blks; j += stride) {
+            float4 v0, v1, v2, v3;
+            prim::unpack_fp8_blk(load_fp8_blk(rp, j, is_me), v0, v1, v2, v3);
+            store_f32x16(dst_r, j, aligned, v0, v1, v2, v3);
+        }
+        u32 base = n_chunks << 10;
+        const float* tail = reinterpret_cast<const float*>(rp + u64(n_chunks) * FP8_CHUNK_BYTES);
+        for (u32 i = tid; i < n - base; i += stride) {
+            dst_r[base + i] = is_me ? tail[i] : prim::load_fresh(tail + i);
+        }
+    } else if constexpr (W == Wire::Bf16) {
+        u32 v8 = aligned ? (n >> 3) : 0u;
+        for (u32 j = tid; j < v8; j += stride) {
+            uint4 pk = is_me ? reinterpret_cast<const uint4*>(rp)[j]
+                             : load_cv4(rp + u64(j) * 16ull);
+            float4 a, b;
+            unpack_bf16x8(pk, a, b);
+            reinterpret_cast<float4*>(dst_r)[u64(j) * 2ull] = a;
+            reinterpret_cast<float4*>(dst_r)[u64(j) * 2ull + 1ull] = b;
+        }
+        const u16* hp = reinterpret_cast<const u16*>(rp);
+        for (u32 i = (v8 << 3) + tid; i < n; i += stride) {
+            u16 h = is_me ? hp[i] : prim::load_fresh(hp + i);
+            dst_r[i] = prim::from_bits(u32(h) << 16);
+        }
+    } else {
+        const float* sp = reinterpret_cast<const float*>(rp);
+        u32 v4 = aligned ? (n >> 2) : 0u;
+        for (u32 j = tid; j < v4; j += stride) {
+            float4 v = is_me ? reinterpret_cast<const float4*>(sp)[j]
+                             : prim::load_fresh4(sp + u64(j) * 4ull);
+            reinterpret_cast<float4*>(dst_r)[j] = v;
+        }
+        for (u32 i = (v4 << 2) + tid; i < n; i += stride) {
+            dst_r[i] = is_me ? sp[i] : prim::load_fresh(sp + i);
+        }
+    }
+}
+
+// One-shot contiguous row gather over any wire dtype.
+template <Wire W>
+TESSERA_FN void gather_rows_one_body(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,
+                                     u32* blocks, u64 from_p, u64 to_p, u32 part_stride, u32 n,
+                                     u32 me, u32 nr, u32 lanes, u64 timeout) {
+    if (prim::leader()) prim::timing_begin(timing_of(state));
+    u64 seq = state[ST_SEQ] + 1ull;
+    u64 par = seq & 1ull;
+    u8* mine_b = reinterpret_cast<u8*>(send_p) + par * SEND_BYTES;
+    const u8* recv = reinterpret_cast<const u8*>(recv_p);
+    ctl* c = reinterpret_cast<ctl*>(ctl_p);
+    u64 bytes = stage_in<W>(reinterpret_cast<const float*>(from_p), mine_b, n);
+    publish_piece(c, blocks, state, BLK_ONE, MODE_GATHER, seq, PIECES - 1u, 0ull, 0ull, bytes);
+    if (!wait_flags(c, reinterpret_cast<const u64*>(flag_p), state, flag_of(seq, PIECES - 1u), me,
+                    nr, lanes, timeout))
+        return;
+    float* out = reinterpret_cast<float*>(to_p);
+    bool aligned = (part_stride & 3u) == 0u && (reinterpret_cast<u64>(out) & 15ull) == 0ull;
+    for (u32 r = 0u; r < nr; r++) {
+        bool is_me = (r == me);
+        const u8* rp = is_me ? mine_b : recv + recv_off(par, r, nr);
+        unpack_one_rank<W>(rp, out + u64(r) * part_stride, n, is_me, aligned);
+    }
     finish_seq(c, blocks, state, seq);
 }
 
@@ -744,18 +885,20 @@ ARX_DEF(tessera_arx_rs_bf16, rs_body, Bf16)
 ARX_DEF(tessera_arx_rs_f32, rs_body, F32)
 ARX_DEF(tessera_arx_rs_fp8, rs_body, Fp8)
 
-#define ARX_GR_DEF(NAME, WIRE)                                                                  \
-    extern "C" __global__ void NAME(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state,  \
-                                    u32* blocks, u64 from_p, u64 to_p, u32 part_stride, u32 n,  \
-                                    u32 me, u32 nr, u32 lanes, u64 timeout) {                   \
-        arx::gather_rows_body<arx::Wire::WIRE>(send_p, recv_p, flag_p, ctl_p, state, blocks,    \
-                                               from_p, to_p, part_stride, n, me, nr, lanes,     \
-                                               timeout);                                        \
+#define ARX_GR_DEF(NAME, BODY, WIRE)                                                            \
+    extern "C" __global__ ARX_BOUNDS void NAME(                                                 \
+        u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p, u64* state, u32* blocks, u64 from_p,     \
+        u64 to_p, u32 part_stride, u32 n, u32 me, u32 nr, u32 lanes, u64 timeout) {             \
+        arx::BODY<arx::Wire::WIRE>(send_p, recv_p, flag_p, ctl_p, state, blocks, from_p, to_p,  \
+                                   part_stride, n, me, nr, lanes, timeout);                     \
     }
 
-ARX_GR_DEF(tessera_arx_gr_bf16, Bf16)
-ARX_GR_DEF(tessera_arx_gr_f32, F32)
-ARX_GR_DEF(tessera_arx_gr_fp8, Fp8)
+ARX_GR_DEF(tessera_arx_gr_bf16, gather_rows_body, Bf16)
+ARX_GR_DEF(tessera_arx_gr_f32, gather_rows_body, F32)
+ARX_GR_DEF(tessera_arx_gr_fp8, gather_rows_body, Fp8)
+ARX_GR_DEF(tessera_arx_gr1_bf16, gather_rows_one_body, Bf16)
+ARX_GR_DEF(tessera_arx_gr1_f32, gather_rows_one_body, F32)
+ARX_GR_DEF(tessera_arx_gr1_fp8, gather_rows_one_body, Fp8)
 
 // Even-width row-major all-gather over F32.
 extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,
@@ -810,56 +953,6 @@ extern "C" __global__ void tessera_arx_allgather(u64 send_p, u64 recv_p, u64 fla
                                               recv + arx::recv_off(par, src, nr));
             u64 off = u64(row) * width + j;
             out[i] = src == me ? sp[off] : prim::load_fresh(sp + off);
-        }
-    }
-    arx::finish_seq(c, blocks, state, seq);
-}
-
-// Even contiguous row gather over F32.
-extern "C" __global__ void tessera_arx_gather_rows(u64 send_p, u64 recv_p, u64 flag_p, u64 ctl_p,
-                                                   u64* state, u32* blocks, u64 from_p, u64 to_p,
-                                                   u32 part_stride, u32 n, u32 me, u32 nr,
-                                                   u32 lanes, u64 timeout) {
-    if (prim::leader()) prim::timing_begin(arx::timing_of(state));
-    u64 seq = state[arx::ST_SEQ] + 1ull;
-    u64 par = seq & 1ull;
-    u8* mine_b = reinterpret_cast<u8*>(send_p) + par * arx::SEND_BYTES;
-    const u8* recv = reinterpret_cast<const u8*>(recv_p);
-    arx::ctl* c = reinterpret_cast<arx::ctl*>(ctl_p);
-    arx::stage_in<arx::Wire::F32>(reinterpret_cast<const float*>(from_p), mine_b, n);
-    arx::publish_piece(c, blocks, state, arx::BLK_ONE, arx::MODE_GATHER, seq, arx::PIECES - 1u,
-                       0ull, 0ull, u64(n) * 4ull);
-    if (!arx::wait_flags(c, reinterpret_cast<const u64*>(flag_p), state,
-                         arx::flag_of(seq, arx::PIECES - 1u), me, nr, lanes, timeout))
-        return;
-    const float* mine = reinterpret_cast<const float*>(mine_b);
-    float* out = reinterpret_cast<float*>(to_p);
-    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
-    u32 stride = gridDim.x * blockDim.x;
-    bool aligned = (n & 3u) == 0u && (part_stride & 3u) == 0u &&
-                   (reinterpret_cast<u64>(out) & 15ull) == 0ull;
-    if (aligned) {
-        u32 n4 = n >> 2;
-        u32 tot4 = n4 * nr;
-        for (u32 q = tid; q < tot4; q += stride) {
-            u32 src = q / n4;
-            u32 j = q - src * n4;
-            const float* sp = src == me ? mine
-                                        : reinterpret_cast<const float*>(
-                                              recv + arx::recv_off(par, src, nr));
-            float4 v = src == me ? reinterpret_cast<const float4*>(sp)[j]
-                                 : prim::load_fresh4(sp + u64(j) * 4ull);
-            *reinterpret_cast<float4*>(out + u64(src) * part_stride + u64(j) * 4ull) = v;
-        }
-    } else {
-        u32 tot = n * nr;
-        for (u32 i = tid; i < tot; i += stride) {
-            u32 src = i / n;
-            u32 j = i - src * n;
-            const float* sp = src == me ? mine
-                                        : reinterpret_cast<const float*>(
-                                              recv + arx::recv_off(par, src, nr));
-            out[u64(src) * part_stride + j] = src == me ? sp[j] : prim::load_fresh(sp + j);
         }
     }
     arx::finish_seq(c, blocks, state, seq);

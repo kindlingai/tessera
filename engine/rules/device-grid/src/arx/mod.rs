@@ -37,7 +37,7 @@ fn slot(wire: DType) -> usize {
 /// Elements one pipelined block moves on `wire`.
 fn pipe_step(wire: DType) -> u32 {
     if wire == DType::Fp8 {
-        1024
+        THREADS * 16
     } else {
         THREADS * 8
     }
@@ -80,8 +80,8 @@ pub struct Arx<D: Device> {
     two: [D::Kernel; 3],
     rs: [D::Kernel; 3],
     gr: [D::Kernel; 3],
+    gr1: [D::Kernel; 3],
     allgather: D::Kernel,
-    gather_rows: D::Kernel,
     state: DeviceBuffer<D>,
     blocks: DeviceBuffer<D>,
     max_grid_cap: u32,
@@ -117,7 +117,10 @@ where
                 .expect("valid cuda define");
             text = format!("{prefix}{text}");
         }
-        let max_grid_cap = knobs.get("arx_sum", "max_grid").map_or(48, |v| v as u32);
+        let default_grid = (ctx.platform().units as u32 / 3).clamp(16, 48);
+        let max_grid_cap = knobs
+            .get("arx_sum", "max_grid")
+            .map_or(default_grid, |v| v as u32);
         let gather_max_grid = knobs
             .get("arx_sum", "gather_max_grid")
             .map_or(64, |v| v as u32);
@@ -132,8 +135,8 @@ where
         let two = wired("two")?;
         let rs = wired("rs")?;
         let gr = wired("gr")?;
+        let gr1 = wired("gr1")?;
         let allgather = ctx.compile(&text, "tessera_arx_allgather")?;
-        let gather_rows = ctx.compile(&text, "tessera_arx_gather_rows")?;
         let state = DeviceBuffer::alloc(ctx, 32 + crate::TIMING_BYTES)?;
         let blocks = DeviceBuffer::alloc(ctx, 96)?;
         state.zero()?;
@@ -149,8 +152,8 @@ where
             two,
             rs,
             gr,
+            gr1,
             allgather,
-            gather_rows,
             state,
             blocks,
             max_grid_cap,
@@ -345,9 +348,10 @@ where
             && aligned
             && part.is_multiple_of(part_align)
             && wire_bytes(wire, total) > PIPE_GATHER_BYTES;
-        let max_part = match pipelined {
-            true => (wire_elems(wire, ArxLink::SLOT_BYTES) / part_align) * part_align,
-            false => ArxLink::SLOT_BYTES / 4,
+        let max_part = match (pipelined, wire) {
+            (true, _) => (wire_elems(wire, ArxLink::SLOT_BYTES) / part_align) * part_align,
+            (false, DType::Fp8) => wire_elems(wire, ArxLink::SLOT_BYTES - 4096),
+            (false, _) => wire_elems(wire, ArxLink::SLOT_BYTES),
         };
         let mut off = 0usize;
         while off < part {
@@ -365,12 +369,12 @@ where
             let elems = (n * ranks) as u32;
             let grid = match use_pipe {
                 true => self.grid(elems.div_ceil(pipe_step(wire)), self.max_grid_cap),
-                false => self.grid(elems / (THREADS * 4), self.gather_max_grid),
+                false => self.grid(elems.div_ceil(pipe_step(wire)), self.gather_max_grid),
             };
             let kernel = if use_pipe {
                 &self.gr[slot(wire)]
             } else {
-                &self.gather_rows
+                &self.gr1[slot(wire)]
             };
             self.ctx.programmatic(false);
             self.ctx
