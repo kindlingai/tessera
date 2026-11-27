@@ -1,6 +1,7 @@
 //! Host page tables and two-tier sparse KV mapping.
 
 use crate::Error;
+use crate::flight::{Flights, Move};
 use crate::tiering::{EVICT_COLD, Load, Room, Spot, Tiering};
 use std::ops::Range;
 
@@ -11,14 +12,30 @@ const TIER_HOST_BIT: u32 = 1 << 30;
 enum Loc {
     Vram(u32),
     Host(u32),
+    /// Reads use this VRAM page while it copies out.
+    Leaving(u32),
 }
 
 impl Loc {
     fn entry(self) -> u32 {
         match self {
-            Self::Vram(p) => p,
+            Self::Vram(p) | Self::Leaving(p) => p,
             Self::Host(p) => TIER_HOST_BIT | p,
         }
+    }
+}
+
+/// Levels of the VRAM pages outside `busy` that may leave.
+fn levels<'a>(
+    loc: &'a [Option<Loc>],
+    busy: [&'a [u32]; 2],
+    priority: &'a [u8],
+) -> impl Fn(u32) -> Option<u8> + 'a {
+    move |p| match loc.get(p as usize).copied().flatten() {
+        Some(Loc::Vram(_)) if !busy.iter().any(|b| b.contains(&p)) => {
+            Some(priority.get(p as usize).copied().unwrap_or(EVICT_COLD))
+        }
+        _ => None,
     }
 }
 
@@ -27,6 +44,7 @@ struct TierMap {
     loc: Vec<Option<Loc>>,
     vram_free: Vec<u32>,
     host_free: Vec<u32>,
+    flights: Flights,
     policy: Box<dyn Tiering>,
     vram_cap: usize,
     host_cap: usize,
@@ -43,6 +61,7 @@ impl TierMap {
             loc: vec![None; index_pages],
             vram_free: (0..vram_pages as u32).rev().collect(),
             host_free: (0..host_pages as u32).rev().collect(),
+            flights: Flights::default(),
             policy,
             vram_cap: vram_pages,
             host_cap: host_pages,
@@ -53,6 +72,7 @@ impl TierMap {
         self.loc.fill(None);
         self.vram_free = (0..self.vram_cap as u32).rev().collect();
         self.host_free = (0..self.host_cap as u32).rev().collect();
+        self.flights = Flights::default();
         self.policy.clear();
     }
 
@@ -62,6 +82,7 @@ impl TierMap {
                 match loc {
                     Loc::Vram(v) => self.vram_free.push(v),
                     Loc::Host(h) => self.host_free.push(h),
+                    Loc::Leaving(_) => self.flights.free(p),
                 }
             }
         }
@@ -76,13 +97,68 @@ impl TierMap {
         self.at(p).map_or(0, Loc::entry)
     }
 
+    /// Moves each copied page to its host page.
+    fn land<E: From<Error>>(
+        &mut self,
+        move_pages: &mut impl FnMut(Move, &[(u32, u32)]) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        if self.flights.is_empty() {
+            return Ok(false);
+        }
+        move_pages(Move::Settle, &[])?;
+        for leaving in self.flights.land() {
+            self.vram_free.push(leaving.vram);
+            match leaving.live {
+                true => self.loc[leaving.page as usize] = Some(Loc::Host(leaving.host)),
+                false => self.host_free.push(leaving.host),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The policy's victims among VRAM pages outside `busy`.
+    fn victims(&mut self, short: usize, busy: [&[u32]; 2], priority: &[u8]) -> Vec<u32> {
+        let level = levels(&self.loc, busy, priority);
+        self.policy.victims(short, self.host_free.len(), &level)
+    }
+
+    /// Starts demotes of `picked` pages beside the next step.
+    fn depart<E: From<Error>>(
+        &mut self,
+        picked: Vec<u32>,
+        move_pages: &mut impl FnMut(Move, &[(u32, u32)]) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let mut left = Vec::with_capacity(picked.len());
+        let mut pairs = Vec::with_capacity(picked.len());
+        for p in picked {
+            if let Some(Loc::Vram(v)) = self.at(p)
+                && let Some(h) = self.host_free.pop()
+            {
+                left.push(p);
+                pairs.push((v, h));
+            }
+        }
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        if !move_pages(Move::Depart, &pairs)? {
+            return Err(Error::TierFull.into());
+        }
+        for (&p, &(v, h)) in left.iter().zip(&pairs) {
+            self.loc[p as usize] = Some(Loc::Leaving(v));
+            self.flights.depart(p, v, h);
+        }
+        Ok(())
+    }
+
     fn ensure_vram<E: From<Error>>(
         &mut self,
         alloc_pages: &[u32],
         write_pages: &[u32],
         priority: &[u8],
-        move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, E>,
+        move_pages: &mut impl FnMut(Move, &[(u32, u32)]) -> Result<bool, E>,
     ) -> Result<bool, E> {
+        let mut moved = self.land(move_pages)?;
         let mut fresh = Vec::new();
         let mut to_promote = Vec::new();
         for &p in alloc_pages.iter().chain(write_pages) {
@@ -97,37 +173,34 @@ impl TierMap {
                 to_promote.push((p, h));
             }
         }
-        let loc = &self.loc;
+        let keep = self.policy.reserve(fresh.len() + to_promote.len());
         let rank = |p: u32| priority.get(p as usize).copied().unwrap_or(EVICT_COLD);
-        let level = |p: u32| match loc.get(p as usize).copied().flatten() {
-            Some(Loc::Vram(_)) if !write_pages.contains(&p) => Some(rank(p)),
-            _ => None,
-        };
         let mut host = Vec::new();
-        for (idx, at) in loc.iter().enumerate() {
+        for (idx, at) in self.loc.iter().enumerate() {
             let p = idx as u32;
             if matches!(at, Some(Loc::Host(_))) && !write_pages.contains(&p) {
                 host.push((p, rank(p)));
             }
         }
+        // Promoted pages leave the reserve free.
         let room = Room {
-            need: fresh.len() + to_promote.len(),
+            need: fresh.len() + to_promote.len() + keep,
             vram_free: self.vram_free.len(),
             host_free: self.host_free.len(),
         };
-        for p in self.policy.promotes(room, &level, &host) {
+        let promoted = {
+            let level = levels(&self.loc, [write_pages, &[]], priority);
+            self.policy.promotes(room, &level, &host)
+        };
+        for p in promoted {
             if let Some(Loc::Host(h)) = self.at(p) {
                 to_promote.push((p, h));
             }
         }
         let need = fresh.len() + to_promote.len();
-        if need == 0 {
-            return Ok(false);
-        }
-        let mut moved = false;
         if self.vram_free.len() < need {
             let short = need - self.vram_free.len();
-            let picked = self.policy.victims(short, self.host_free.len(), &level);
+            let picked = self.victims(short, [write_pages, &[]], priority);
             let mut victims = Vec::with_capacity(picked.len());
             for p in picked {
                 if let Some(Loc::Vram(v)) = self.at(p) {
@@ -143,7 +216,7 @@ impl TierMap {
                     let h = self.host_free.pop().ok_or(Error::TierFull)?;
                     pairs.push((v, h));
                 }
-                if !move_pages(false, &pairs)? {
+                if !move_pages(Move::Demote, &pairs)? {
                     return Err(Error::TierFull.into());
                 }
                 for (&(p, v), &(_, h)) in victims.iter().zip(&pairs) {
@@ -164,7 +237,7 @@ impl TierMap {
                 let v = self.vram_free.pop().ok_or(Error::TierFull)?;
                 pairs.push((v, h));
             }
-            if !move_pages(true, &pairs)? {
+            if !move_pages(Move::Promote, &pairs)? {
                 return Err(Error::TierFull.into());
             }
             for (&(p, h), &(v, _)) in to_promote.iter().zip(&pairs) {
@@ -173,6 +246,14 @@ impl TierMap {
                 self.policy.placed(p);
             }
             moved = true;
+        }
+        let short = keep.saturating_sub(self.vram_free.len());
+        if short > 0 {
+            // This step uses its new and promoted pages.
+            let mut placed = alloc_pages.to_vec();
+            placed.extend(to_promote.iter().map(|&(p, _)| p));
+            let picked = self.victims(short, [write_pages, &placed], priority);
+            self.depart(picked, move_pages)?;
         }
         Ok(moved)
     }
@@ -431,7 +512,7 @@ impl Lanes {
         alloc_pages: &[u32],
         write_pages: &[u32],
         priority: &[u8],
-        move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, E>,
+        move_pages: &mut impl FnMut(Move, &[(u32, u32)]) -> Result<bool, E>,
     ) -> Result<bool, E> {
         let Some(t) = &mut self.tier else {
             return Ok(false);

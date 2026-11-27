@@ -7,6 +7,7 @@ use crate::promote::{Decayed, Dense, Forecast, Moves, Paged, Promote, Unknown};
 use crate::run::Base;
 use std::collections::{BTreeMap, HashMap};
 use tessera_gpukit::device::{COPY_LANE, Device, DeviceBuffer};
+use tessera_kv::Move;
 use tessera_lower::kernels::{Ring, place};
 use tessera_lower::{Loaded, Plan, Slot};
 use tessera_mem::Backing;
@@ -593,10 +594,13 @@ pub(crate) struct HostKv<D: Device> {
     page_rows: usize,
     by_index: HashMap<u32, (usize, usize)>,
     by_slot: HashMap<(u32, usize), u64>,
+    /// Whether copies queued on the copy lane may still run.
+    busy: bool,
 }
 
 impl<D: Device> Drop for HostKv<D> {
     fn drop(&mut self) {
+        let _ = self.settle();
         self.ctx.unpin(self.host);
     }
 }
@@ -654,6 +658,7 @@ impl<D: Device> HostKv<D> {
             page_rows,
             by_index,
             by_slot: HashMap::new(),
+            busy: false,
         };
         out.bind(plan);
         Some(out)
@@ -741,6 +746,7 @@ impl<D: Device> HostKv<D> {
         let Some(raw) = self.spans(held, plan, pairs) else {
             return Ok(false);
         };
+        self.settle()?;
         let mut spans: Vec<(u64, &mut [u8])> = raw
             .into_iter()
             // SAFETY: distinct `host_phys` ranges inside live pinned allocation.
@@ -750,9 +756,40 @@ impl<D: Device> HostKv<D> {
         Ok(true)
     }
 
+    /// Starts copies of sparse KV pages from VRAM to host.
+    fn depart(&mut self, held: &Held, plan: &Plan, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        let Some(raw) = self.spans(held, plan, pairs) else {
+            return Ok(false);
+        };
+        // Queued steps may still write these pages.
+        self.ctx.finish()?;
+        let lane = self.ctx.active_lane();
+        self.ctx.set_lane(COPY_LANE);
+        self.busy = true;
+        let mut queued = Ok(());
+        for (dev, ptr, len) in raw {
+            // SAFETY: a distinct range of the live pinned pool.
+            let page = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            queued = self.ctx.queue_download(dev, page);
+            if queued.is_err() {
+                break;
+            }
+        }
+        self.ctx.set_lane(lane);
+        Ok(queued.map(|_| true)?)
+    }
+
+    /// Waits for every started copy.
+    fn settle(&mut self) -> Result<(), Error> {
+        if std::mem::take(&mut self.busy) {
+            self.ctx.finish()?;
+        }
+        Ok(())
+    }
+
     /// Copies `(vram_phys, host_phys)` sparse KV pages from host to VRAM.
     pub(crate) fn promote(
-        &self,
+        &mut self,
         held: &Held,
         plan: &Plan,
         pairs: &[(u32, u32)],
@@ -763,6 +800,7 @@ impl<D: Device> HostKv<D> {
         let Some(raw) = self.spans(held, plan, pairs) else {
             return Ok(false);
         };
+        self.settle()?;
         let spans: Vec<(u64, &[u8])> = raw
             .into_iter()
             // SAFETY: valid range inside live pinned allocation.
@@ -815,13 +853,17 @@ impl<D: Device> KvMem<D> {
         &mut self,
         held: &Held,
         plan: &Plan,
-        promote: bool,
+        kind: Move,
         pairs: &[(u32, u32)],
     ) -> Result<bool, Error> {
-        match &mut self.host {
-            Some(h) if promote => h.promote(held, plan, pairs),
-            Some(h) => h.demote(held, plan, pairs),
-            None => Ok(false),
+        let Some(host) = &mut self.host else {
+            return Ok(false);
+        };
+        match kind {
+            Move::Promote => host.promote(held, plan, pairs),
+            Move::Demote => host.demote(held, plan, pairs),
+            Move::Depart => host.depart(held, plan, pairs),
+            Move::Settle => host.settle().map(|_| true),
         }
     }
 }

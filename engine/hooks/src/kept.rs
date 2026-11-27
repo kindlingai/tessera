@@ -1,7 +1,7 @@
 //! Finished answers' rows, kept for follow-up prompts to reuse.
 
 use crate::Error;
-use tessera_kv::{EVICT_COLD, EVICT_PINNED, Oldest, Pool, Prefixes, RunId, Spot, Stats, Tag};
+use tessera_kv::{EVICT_COLD, EVICT_PINNED, Move, Oldest, Pool, Prefixes, RunId, Spot, Stats, Tag};
 
 const TAG: Tag = Tag(0);
 
@@ -199,7 +199,7 @@ impl Kept {
         &mut self,
         rows: &[crate::Row],
         lanes: &mut crate::lanes::Lanes,
-        move_pages: &mut impl FnMut(bool, &[(u32, u32)]) -> Result<bool, Error>,
+        move_pages: &mut impl FnMut(Move, &[(u32, u32)]) -> Result<bool, Error>,
     ) -> Result<(), Error> {
         if !lanes.tiered() {
             return self.grow_rows_with(rows, |slot, pages| lanes.set(slot, pages));

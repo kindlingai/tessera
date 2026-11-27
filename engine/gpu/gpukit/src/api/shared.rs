@@ -414,6 +414,10 @@ impl<A: Api> Device for Context<A> {
         Context::queue_upload(self, ptr, pinned)
     }
 
+    fn queue_download(&self, ptr: u64, pinned: &mut [u8]) -> Result<(), Error> {
+        Context::queue_download(self, ptr, pinned)
+    }
+
     fn capturing(&self) -> bool {
         !A::capturing().with(Cell::get).is_null()
     }

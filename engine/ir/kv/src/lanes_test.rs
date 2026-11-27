@@ -1,7 +1,8 @@
 use crate::tiering::EVICT_HOT;
-use crate::{Aged, EVICT_COLD, Error, Lanes};
+use crate::{Aged, EVICT_COLD, EVICT_PINNED, Error, Lanes, Move};
 
 const HOST: u32 = 1 << 30;
+const PAGES: usize = 16;
 
 #[test]
 fn tracks_dirty_ranges() {
@@ -31,10 +32,12 @@ fn tracks_dirty_ranges() {
     assert_eq!(leader.pending(), vec![(10, &[0][..])]);
 }
 
-/// A split table with 4 VRAM and 16 host pages.
-fn tiered() -> Lanes {
-    let mut lanes = Lanes::new_split(16, 16, 2, 4, 16);
-    lanes.enable_tier(16, Box::new(Aged::default()));
+/// A split table of `vram` pages, holding `ahead` steps free.
+fn tiered(vram: usize, ahead: usize) -> Lanes {
+    let mut lanes = Lanes::new_split(16, 2 * PAGES, 2, vram, PAGES);
+    let mut policy = Box::new(Aged::default());
+    policy.ahead = ahead;
+    lanes.enable_tier(PAGES, policy);
     lanes
 }
 
@@ -50,7 +53,7 @@ fn place(lanes: &mut Lanes, alloc: &[u32], priority: &[u8], lane: &[u32]) -> Vec
 
 #[test]
 fn tier_demotes_cold_first() {
-    let mut lanes = tiered();
+    let mut lanes = tiered(4, 0);
     let mut priority = vec![EVICT_COLD; lanes.pages()];
     priority[0] = EVICT_HOT;
     place(&mut lanes, &[0, 1, 2, 3], &priority, &[0, 1, 2, 3]);
@@ -63,4 +66,91 @@ fn tier_demotes_cold_first() {
     let lane = place(&mut lanes, &[], &priority, &[0, 1, 2, 3, 4]);
     assert_eq!(lane[1] & HOST, 0, "hot host page promotes");
     assert!(lane[2..4].iter().all(|&e| e & HOST != 0));
+}
+
+/// Each tier's page contents. Started copies run at the wait.
+#[derive(Default)]
+struct Memory {
+    vram: Vec<u32>,
+    host: Vec<u32>,
+    flying: Vec<(u32, u32)>,
+    departed: usize,
+}
+
+impl Memory {
+    fn act(&mut self, kind: Move, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+        match kind {
+            Move::Depart => self.flying.extend_from_slice(pairs),
+            Move::Settle => self.departed += self.flying.len(),
+            Move::Demote | Move::Promote => assert!(self.flying.is_empty()),
+        }
+        let copies = match kind {
+            Move::Settle => std::mem::take(&mut self.flying),
+            Move::Depart => Vec::new(),
+            Move::Demote | Move::Promote => pairs.to_vec(),
+        };
+        for (v, h) in copies {
+            match kind {
+                Move::Promote => self.vram[v as usize] = self.host[h as usize],
+                _ => self.host[h as usize] = self.vram[v as usize],
+            }
+        }
+        Ok(true)
+    }
+
+    fn read(&self, entry: u32) -> u32 {
+        match entry & HOST {
+            0 => self.vram[entry as usize],
+            _ => self.host[(entry & !HOST) as usize],
+        }
+    }
+}
+
+/// Writes one page per step, then reads all.
+fn evicting(ahead: usize) -> (Vec<u32>, usize) {
+    let mut lanes = tiered(4, ahead);
+    let mut memory = Memory {
+        vram: vec![0; 4],
+        host: vec![0; PAGES],
+        ..Memory::default()
+    };
+    let steps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 3, 4, 10, 11];
+    let mut lane: Vec<u32> = Vec::new();
+    for (step, &page) in steps.iter().enumerate() {
+        if step == 7 {
+            // Step 6 started the copies of both pages.
+            lanes.release_freed(&[3, 4]);
+            lane.retain(|p| ![3, 4].contains(p));
+        }
+        let mut priority = vec![EVICT_COLD; lanes.pages()];
+        priority[page as usize] = EVICT_PINNED;
+        let mut moves = |kind, pairs: &[(u32, u32)]| memory.act(kind, pairs);
+        lanes
+            .ensure_vram(&[page], &[page], &priority, &mut moves)
+            .unwrap();
+        lane.push(page);
+        lanes.set(0, &lane);
+        let entries = lanes.pending()[0].1[..lane.len()].to_vec();
+        let at = *entries.last().unwrap();
+        assert_eq!(at & HOST, 0, "a step writes VRAM");
+        let copying = memory.flying.iter().any(|&(v, _)| v == at);
+        assert!(!copying, "a copying page is not reused");
+        memory.vram[at as usize] = 100 + step as u32;
+        let read: Vec<u32> = entries.iter().map(|&e| memory.read(e)).collect();
+        let wrote = |p: &u32| 100 + steps[..=step].iter().rposition(|s| s == p).unwrap() as u32;
+        let want: Vec<u32> = lane.iter().map(wrote).collect();
+        assert_eq!(read[..lane.len() - 1], want[..lane.len() - 1]);
+    }
+    let entries = lanes.pending()[0].1[..lane.len()].to_vec();
+    let read = entries.iter().map(|&e| memory.read(e)).collect();
+    (read, memory.departed)
+}
+
+#[test]
+fn started_demotes_keep_rows() {
+    let (blocking, none) = evicting(0);
+    let (started, departed) = evicting(1);
+    assert_eq!(started, blocking);
+    assert_eq!(none, 0);
+    assert!(departed > 0, "copies ran beside steps");
 }

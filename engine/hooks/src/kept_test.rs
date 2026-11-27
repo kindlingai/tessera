@@ -1,6 +1,7 @@
 use crate::Row;
 use crate::kept::Kept;
 use crate::lanes::Lanes;
+use tessera_kv::Move;
 
 fn row(slot: u32, pos: u32) -> Row {
     Row {
@@ -43,31 +44,21 @@ fn tier_demote_reuse() {
     assert!(lanes.tiered());
     assert_eq!(lanes.pages(), idx_pages);
     let mut kept = Kept::paged(slots, context, lanes.pages(), page);
-    let (mut demotes, mut promotes) = (Vec::new(), Vec::new());
+    let moves = std::cell::RefCell::new(Vec::new());
+    let mut note = |kind, pairs: &[(u32, u32)]| {
+        moves.borrow_mut().push((kind, pairs.len()));
+        Ok(true)
+    };
     let (s0, _) = kept.admit(&[1; 80], 0).unwrap();
     let rows0: Vec<Row> = (0..80).map(|p| row(s0, p)).collect();
+    kept.grow_rows_tiered(&rows0[..64], &mut lanes, &mut note)
+        .unwrap();
+    assert!(moves.borrow().is_empty());
     // Five pages exceed four VRAM pages, demoting older pages.
-    kept.grow_rows_tiered(&rows0[..64], &mut lanes, &mut |up, p| {
-        if up {
-            promotes.extend_from_slice(p);
-        } else {
-            demotes.extend_from_slice(p);
-        }
-        Ok(true)
-    })
-    .unwrap();
-    assert!(demotes.is_empty());
-    kept.grow_rows_tiered(&rows0[64..80], &mut lanes, &mut |up, p| {
-        if up {
-            promotes.extend_from_slice(p);
-        } else {
-            demotes.extend_from_slice(p);
-        }
-        Ok(true)
-    })
-    .unwrap();
-    assert!(!demotes.is_empty());
-    assert!(promotes.is_empty());
+    kept.grow_rows_tiered(&rows0[64..80], &mut lanes, &mut note)
+        .unwrap();
+    // The tail page's reserve starts one more copy.
+    assert_eq!(*moves.borrow(), [(Move::Demote, 3), (Move::Depart, 1)]);
     let kv_tbl = lanes.pending()[0].1.to_vec();
     let host_bit = 1u32 << 30;
     assert!(kv_tbl[..5].iter().any(|&e| (e & host_bit) != 0));
@@ -78,15 +69,7 @@ fn tier_demote_reuse() {
     let prompt: Vec<u32> = (0..80).chain([99]).collect();
     let (s1, skip) = kept.admit(&prompt, 80).unwrap();
     assert_eq!(skip, 80);
-    let before_promotes = promotes.len();
-    kept.grow_rows_tiered(&[row(s1, 80)], &mut lanes, &mut |up, p| {
-        if up {
-            promotes.extend_from_slice(p);
-        } else {
-            demotes.extend_from_slice(p);
-        }
-        Ok(true)
-    })
-    .unwrap();
-    assert_eq!(promotes.len(), before_promotes);
+    kept.grow_rows_tiered(&[row(s1, 80)], &mut lanes, &mut note)
+        .unwrap();
+    assert_eq!(moves.borrow()[2..], [(Move::Settle, 0)]);
 }

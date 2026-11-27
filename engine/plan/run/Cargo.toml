@@ -20,6 +20,7 @@ tessera-engine-settings = { workspace = true }
 tessera-gpukit = { workspace = true }
 tessera-graph = { workspace = true }
 tessera-jit = { workspace = true }
+tessera-kv = { workspace = true }
 tessera-lower = { workspace = true }
 tessera-mem = { workspace = true }
 rayon = "1"

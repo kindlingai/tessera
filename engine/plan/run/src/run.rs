@@ -12,6 +12,7 @@ use tessera_codegen::Precision;
 use tessera_engine_settings::{Memory, Reads};
 use tessera_gpukit::Platform;
 use tessera_graph::DimName;
+use tessera_kv::Move;
 use tessera_lower::form::{F32_FORM, Load};
 use tessera_lower::{
     Arg, Extent, Filed, Launch, Launching, Loaded, Plan, Shape, Share, Slot, Weight,
@@ -268,8 +269,8 @@ pub trait Run {
         Ok(false)
     }
 
-    /// Promotes or demotes `(vram_phys, host_phys)` sparse KV page pairs.
-    fn move_kv_pages(&mut self, _promote: bool, _pairs: &[(u32, u32)]) -> Result<bool, Error> {
+    /// Moves `(vram_phys, host_phys)` sparse KV page pairs as `kind` says.
+    fn move_kv_pages(&mut self, _kind: Move, _pairs: &[(u32, u32)]) -> Result<bool, Error> {
         Ok(false)
     }
 

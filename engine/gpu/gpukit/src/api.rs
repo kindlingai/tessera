@@ -472,6 +472,14 @@ impl<A: Api> Context<A> {
         })
     }
 
+    /// Copies device bytes to pinned `bytes` on the active lane.
+    pub fn queue_download(&self, ptr: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        self.locked(|a| {
+            let stream = self.stream_of(a, A::active_lane().with(Cell::get))?;
+            a.download_async(ptr, bytes, stream)
+        })
+    }
+
     /// Records a timing event after the work queued so far.
     pub fn stamp(&self) -> Result<(), Error> {
         let event = self.locked(|a| a.event())?;

@@ -775,10 +775,10 @@ impl<D: Device + Launch<Kernel = <D as Device>::Kernel>> Run for Runner<D> {
         Ok(ok)
     }
 
-    fn move_kv_pages(&mut self, promote: bool, pairs: &[(u32, u32)]) -> Result<bool, Error> {
+    fn move_kv_pages(&mut self, kind: tessera_kv::Move, p: &[(u32, u32)]) -> Result<bool, Error> {
         self.check_ready()?;
         self.kv
-            .move_pages(&self.base.held, &self.base.plan, promote, pairs)
+            .move_pages(&self.base.held, &self.base.plan, kind, p)
     }
 
     fn submit(&mut self, steps: Range<usize>) -> Result<(), Error> {

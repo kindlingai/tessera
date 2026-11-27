@@ -244,6 +244,11 @@ pub trait Device: Clone + Send + Sync + 'static {
         self.upload(ptr, pinned)
     }
 
+    /// Queues a copy into `pinned` on the active lane.
+    fn queue_download(&self, ptr: u64, pinned: &mut [u8]) -> Result<(), Error> {
+        self.download(ptr, pinned)
+    }
+
     /// Whether this thread is recording a device graph now.
     fn capturing(&self) -> bool {
         false
