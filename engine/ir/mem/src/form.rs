@@ -117,6 +117,16 @@ pub trait Form: Sync {
         elements * self.dtype().bytes()
     }
 
+    /// Whether `bytes` bytes hold `elements` of this form.
+    fn fits_size(&self, elements: usize, bytes: usize) -> bool {
+        self.bytes(elements) == bytes
+    }
+
+    /// Whether `bytes` hold `elements` of this form.
+    fn fits(&self, elements: usize, bytes: &[u8]) -> bool {
+        self.fits_size(elements, bytes.len())
+    }
+
     /// `x` against the elements from `at`, one at a time.
     fn dot(&self, x: &[f32], bytes: &[u8], at: usize) -> f32 {
         let mut sum = 0.0;

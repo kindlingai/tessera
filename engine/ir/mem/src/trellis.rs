@@ -607,6 +607,22 @@ impl Form for TrellisMix {
     fn bytes(&self, elements: usize) -> usize {
         (MIX_TABLE + MIX_ROW * (elements / 256)).next_multiple_of(16) + elements / 2
     }
+    fn fits_size(&self, elements: usize, bytes: usize) -> bool {
+        let min = MIX_TABLE.next_multiple_of(16) + elements / 4;
+        bytes >= min && bytes <= self.bytes(elements)
+    }
+    fn fits(&self, elements: usize, bytes: &[u8]) -> bool {
+        if !self.fits_size(elements, bytes.len()) {
+            return false;
+        }
+        let shape = Shape::read(bytes);
+        let count = u32::from_le_bytes(bytes[HEAD..HEAD + 4].try_into().expect("4 bytes")) as usize;
+        let head = (MIX_TABLE + MIX_ROW * count).next_multiple_of(16);
+        let elems = count
+            .checked_mul(shape.inp)
+            .and_then(|n| n.checked_mul(shape.out));
+        elems == Some(elements) && bytes.len() >= head
+    }
     fn offset(&self, index: usize) -> usize {
         match index {
             0 => 0,

@@ -405,9 +405,7 @@ pub trait Run {
             // A file stored whole loads into other forms decoded.
             let whole = form.split(bytes).is_some();
             // Bytes a reader already cut fill the slot.
-            let cut = loaded
-                .first()
-                .is_some_and(|l| form.bytes(l.slot.len) == bytes.len());
+            let cut = loaded.first().is_some_and(|l| form.fits(l.slot.len, bytes));
             let part = match loaded.first().and_then(|l| l.share).filter(|_| !cut) {
                 None => None,
                 Some(share) => match share.of(*form, bytes) {
@@ -434,7 +432,7 @@ pub trait Run {
                     let (form, into) = (form.name(), slot.form.name());
                     return Err(Error::WeightInto { weight, form, into });
                 }
-                if !whole && form.bytes(slot.len) != slice_bytes.len() {
+                if !whole && !form.fits(slot.len, slice_bytes) {
                     let form = form.name();
                     return Err(Error::WeightSize { weight, form });
                 }
@@ -460,7 +458,7 @@ pub trait Run {
             .map(|l| l.slot)
             .collect();
         for slot in slots {
-            if slot.form.bytes(slot.len) != bytes.len() {
+            if !slot.form.fits(slot.len, bytes) {
                 return Err(Error::WeightSize {
                     weight,
                     form: slot.form.name(),
@@ -593,7 +591,7 @@ fn filed<R: Run + ?Sized>(
     let plain = |l: &Loaded| {
         let slot = l.slot;
         let whole = l.part.is_none() && l.share.is_none();
-        whole && slot.form.name() == form.name() && slot.bytes() == file.bytes()
+        whole && slot.form.name() == form.name() && form.fits_size(slot.len, file.bytes())
     };
     let Some((first, rest)) = loaded.split_first() else {
         return Ok(true);
@@ -605,14 +603,15 @@ fn filed<R: Run + ?Sized>(
     let Some(into) = r.held_mut().mapped_slot(first.slot) else {
         return Ok(false);
     };
-    file.read(into, reads)
+    let len = file.bytes();
+    file.read(&mut into[..len], reads)
         .map_err(|e| Error::WeightRead(weight, e))?;
     if rest.is_empty() {
         return Ok(true);
     }
     let bytes = r.held().bytes(first.slot)?;
     for l in rest {
-        r.held_mut().upload(l.slot, &bytes)?;
+        r.held_mut().upload(l.slot, &bytes[..len])?;
     }
     Ok(true)
 }
@@ -727,7 +726,7 @@ fn parts<R: Run + ?Sized>(
                 .ok_or_else(|| what("an uneven cut"))?,
             None => split[at].clone(),
         };
-        if into.bytes(l.slot.len) != data.len() || l.slot.form.name() != into.name() {
+        if !into.fits(l.slot.len, &data) || l.slot.form.name() != into.name() {
             let form = into.name();
             return Err(Error::WeightSize { weight, form });
         }
