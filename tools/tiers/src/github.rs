@@ -380,7 +380,11 @@ impl<H: Host> Client<'_, H> {
         let body = Some(("application/x-www-form-urlencoded", form));
         let made = self.send("POST", url, None, body).await?;
         let Some(token) = made["access_token"].as_str() else {
-            return Err(Fault::new(403, "GitHub refused the sign-in"));
+            let why = made["error"].as_str().unwrap_or("no reason given");
+            return Err(Fault::new(
+                403,
+                format!("GitHub refused the sign-in: {why}"),
+            ));
         };
         let user = self.api("GET", "/user", token, None).await?;
         match (user["login"].as_str(), user["id"].as_u64()) {
